@@ -133,11 +133,18 @@ export interface WorkerUpdateReport {
  * the very lease it needs to report the outcome on. So the work is fired and
  * forgotten, exactly as a pushed assignment is.
  *
- * At most **one** update runs at a time. A *different* request arriving while one is
- * being applied is ignored and logged as such, because two `applyUpdateTarget` calls
- * on one install root would interleave a checkout with a build; nothing is lost,
- * since the pending request is durable on the `workers` row and is pushed again on
- * the next connection.
+ * At most **one** update runs at a time, because two `applyUpdateTarget` calls on one
+ * install root would interleave a checkout with a build. A *different* request
+ * arriving while one is being applied is therefore not started — but it is **held**,
+ * and applied as soon as the one in flight finishes without restarting the daemon.
+ * Dropping it instead would strand it: the control plane pushes a request once per
+ * notification and otherwise only on a new connection, so a re-target received during
+ * an update that then reports `failed` or `refused` would sit `pending` on a machine
+ * that stayed connected and had nothing left to do. Only the newest held request is
+ * kept — an operator who re-targets twice means the last target, and the control plane
+ * is no longer waiting on the rows the earlier ones named. When the update in flight
+ * *does* apply, the held request is left for the re-push on the restarted daemon's
+ * next connection, since this process is on its way out.
  *
  * A repeat of a request already handled here is the ordinary reconnect re-push
  * (`../router/worker-update-dispatch.ts`), and what it does depends on whether the
@@ -156,8 +163,26 @@ export function createWorkerUpdateHandler(
 	/** Request id → the report still owed to the control plane, or `null` once delivered. */
 	const handled = new Map<string, WorkerUpdateReport | null>();
 	let active = false;
+	/** The newest distinct request that arrived mid-apply, waiting for the current one. */
+	let heldBack: WorkerUpdate | null = null;
 
-	return (update) => {
+	/**
+	 * Start the request held back during the update that just finished, if there is
+	 * one. Called only after a non-restarting outcome: a daemon that is exiting into a
+	 * new build gets the held request re-pushed on its next connection instead.
+	 */
+	function startHeldBack(): void {
+		const next = heldBack;
+		if (!next) return;
+		heldBack = null;
+		logger.info('taking up the worker update held while the previous one ran', {
+			requestId: next.requestId,
+			target: next.target,
+		});
+		handleUpdate(next);
+	}
+
+	function handleUpdate(update: WorkerUpdate): void {
 		const held = handled.get(update.requestId);
 		if (held !== undefined) {
 			if (!held) {
@@ -176,25 +201,39 @@ export function createWorkerUpdateHandler(
 			return;
 		}
 		if (active) {
-			// Deliberately not queued: the request stays pending on the control plane and
-			// is re-pushed on the next connection, which this machine is about to make if
-			// the update in flight applies.
-			logger.warn('ignoring a worker update — another one is already being applied here', {
+			// Held rather than dropped: an outcome that does not restart this daemon leaves
+			// it connected, and the control plane has no later push to make.
+			logger.warn('holding a worker update — another one is being applied here first', {
 				requestId: update.requestId,
 				target: update.target,
 			});
+			heldBack = update;
 			return;
 		}
 		// Recorded before the work starts, so a re-push arriving mid-apply is recognised
 		// as the repeat it is rather than starting a second one.
 		handled.set(update.requestId, null);
 		active = true;
-		void runUpdate(update, options, logger, (owed) => handled.set(update.requestId, owed)).finally(
-			() => {
+		void runUpdate(update, options, logger, (owed) => handled.set(update.requestId, owed)).then(
+			(restarting) => {
 				active = false;
+				if (!restarting) startHeldBack();
+			},
+			(err) => {
+				// `runUpdate` reports its own failures, so anything arriving here is a bug in
+				// this module — but it must still clear the flag, or every later request would
+				// queue behind an update that is no longer running.
+				logger.error('a worker update ended without reporting an outcome', {
+					requestId: update.requestId,
+					error: describeError(err),
+				});
+				active = false;
+				startHeldBack();
 			},
 		);
-	};
+	}
+
+	return handleUpdate;
 }
 
 /**
@@ -203,13 +242,17 @@ export function createWorkerUpdateHandler(
  * `owe` is how the outcome survives a report that did not land: it is called with the
  * report whenever the POST failed, so the handler above can re-send it on the next
  * push rather than redoing the work or losing the answer.
+ *
+ * Resolves `true` when this daemon is restarting into the new build and `false` when
+ * it stays on the one it has — which is what tells the handler whether a request held
+ * back during this one should be taken up here or left to the next connection.
  */
 async function runUpdate(
 	update: WorkerUpdate,
 	options: WorkerUpdateHandlerOptions,
 	logger: UpdateLogger,
 	owe: (report: WorkerUpdateReport) => void,
-): Promise<void> {
+): Promise<boolean> {
 	const enabled = options.enabled ?? selfUpdateEnabled();
 	if (!enabled) {
 		logger.info('declining a worker update — this machine has not opted in', {
@@ -225,7 +268,7 @@ async function runUpdate(
 				`${SELF_UPDATE_ENV}=true in the daemon's environment and restart it — but only if ` +
 				'its SWARM install root is not shared with another daemon.',
 		});
-		return;
+		return false;
 	}
 
 	const parsedTarget = WorkerUpdateTargetSchema.safeParse(update.target);
@@ -239,10 +282,10 @@ async function runUpdate(
 				'nothing was attempted. A target names a build — never a command, a script, a URL, ' +
 				'or a git option.',
 		});
-		return;
+		return false;
 	}
 
-	if (!(await waitUntilIdle(options, logger, update))) return;
+	if (!(await waitUntilIdle(options, logger, update))) return false;
 
 	logger.info('applying a requested worker update', {
 		requestId: update.requestId,
@@ -278,7 +321,7 @@ async function runUpdate(
 			target: parsedTarget.data,
 			status: outcome.status,
 		});
-		return;
+		return false;
 	}
 
 	// Reported *before* exiting, and its delivery logged rather than gated on: an
@@ -293,6 +336,7 @@ async function runUpdate(
 		reported: delivered,
 	});
 	await releaseAndExit(options, logger);
+	return true;
 }
 
 /**

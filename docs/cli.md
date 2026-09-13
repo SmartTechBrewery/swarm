@@ -636,7 +636,10 @@ unchanged.
   shown by `list` as `update <ref> pending` while it is outstanding and
   `update <ref> <outcome>` once answered — `applied`, `already-current`, `declined`,
   `refused`, or `failed`. Anything but `applied` leaves the machine working on the
-  build it has. Re-issuing replaces a request that has not been answered yet; there
+  build it has — except for the one `failed` case where the rollback failed too,
+  which leaves the install root on neither build and needs host-side repair; the
+  message beside the outcome says so, so read it rather than assuming a failure was
+  harmless. Re-issuing replaces a request that has not been answered yet; there
   is no cancel. Owner-only, exactly like `drain` and `remove` — this is the one
   command that changes *which code* runs on somebody's hardware, so an
   `instanceAdmin` who does not own the machine gets the same `NOT_FOUND` a stranger

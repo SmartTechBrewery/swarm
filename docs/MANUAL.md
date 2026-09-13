@@ -256,7 +256,11 @@ it again on the new build. That supervisor is a prerequisite: without one the ma
 simply stops. The request is refused while the machine is still in the pool, and with
 the opt-in flag off the machine reports `declined` and carries on working. `list`
 shows the outcome — `applied`, `already-current`, `declined`, `refused`, `failed` —
-and anything but `applied` leaves the machine on the build it had. **Until the
+and anything but `applied` leaves the machine working on the build it had, with the
+one exception `failed` carries: a step that failed *and* could not be rolled back
+leaves the install root on neither build, which the reported message says outright.
+Read that message before moving on — it names the step and, when the rollback failed
+too, is the signal to repair that install root by hand on the host. **Until the
 shared-install lock lands (issue #920 phase 4), a host whose SWARM install root is
 shared by several daemons must not opt in**: the update would swap the code under the
 others mid-phase.

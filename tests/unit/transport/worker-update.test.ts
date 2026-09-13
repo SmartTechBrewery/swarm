@@ -22,6 +22,9 @@ import type { UpdateOutcome } from '@/worker/self-update.js';
  */
 
 const REQUEST_ID = '66666666-6666-4666-8666-666666666666';
+/** A second and third request id, for the re-target cases below. */
+const RETARGET_ID = '77777777-7777-4777-8777-777777777777';
+const THIRD_ID = '88888888-8888-4888-8888-888888888888';
 
 const UPDATE: WorkerUpdate = { type: 'worker-update', requestId: REQUEST_ID, target: 'main' };
 
@@ -355,15 +358,16 @@ describe('createWorkerUpdateHandler — repeats', () => {
 	});
 
 	// Two `applyUpdateTarget` calls on one install root would interleave a checkout
-	// with a build, so a second request waits for the next connection instead.
-	it('ignores a different request while one is being applied', async () => {
+	// with a build, so a re-target never starts a second apply alongside the first.
+	// This one applies, so the held request rides the restarted daemon's re-push.
+	it('does not start a second apply while one is running', async () => {
 		vi.useFakeTimers();
 		const h = harness();
 		h.inFlight.add('dispatch-1');
 
 		h.handle(UPDATE);
 		await vi.advanceTimersByTimeAsync(20);
-		h.handle({ ...UPDATE, requestId: '77777777-7777-4777-8777-777777777777', target: 'v2' });
+		h.handle({ ...UPDATE, requestId: RETARGET_ID, target: 'v2' });
 		await vi.advanceTimersByTimeAsync(20);
 
 		h.inFlight.delete('dispatch-1');
@@ -371,6 +375,77 @@ describe('createWorkerUpdateHandler — repeats', () => {
 
 		expect(h.apply).toHaveBeenCalledTimes(1);
 		expect(h.apply).toHaveBeenCalledWith('main');
+		vi.useRealTimers();
+	});
+
+	// A re-target received mid-apply is the one case nothing else recovers: the
+	// notification fired once, and an outcome that keeps the daemon on its build
+	// leaves it connected, so there is no later push. It must be taken up here.
+	it.each([
+		'failed',
+		'refused',
+	] as const)('applies a request received while an update that %ss was running', async (status) => {
+		const outcome =
+			status === 'refused'
+				? ({ status: 'refused', reason: 'the install root has uncommitted changes' } as const)
+				: ({
+						status: 'failed',
+						stage: 'build',
+						reason: 'npm ci exited 1',
+						rolledBack: true,
+						previousCommit: 'def5678',
+						outputTail: '',
+					} as const);
+		const h = harness({
+			apply: vi
+				.fn<(target: string) => Promise<UpdateOutcome>>()
+				.mockResolvedValueOnce(outcome)
+				.mockResolvedValue(APPLIED),
+		});
+		vi.useFakeTimers();
+		h.inFlight.add('dispatch-1');
+
+		h.handle(UPDATE);
+		await vi.advanceTimersByTimeAsync(20);
+		h.handle({ ...UPDATE, requestId: RETARGET_ID, target: 'v2' });
+		await vi.advanceTimersByTimeAsync(20);
+
+		h.inFlight.delete('dispatch-1');
+		await vi.advanceTimersByTimeAsync(50);
+		await settle();
+
+		expect(h.apply.mock.calls.map(([target]) => target)).toEqual(['main', 'v2']);
+		const reports = h.report.mock.calls.map(([r]) => r as WorkerUpdateReport);
+		expect(reports.map((r) => r.requestId)).toEqual([REQUEST_ID, RETARGET_ID]);
+		expect(reports[1]?.status).toBe('applied');
+		// The second one applied, so this daemon does restart — on the newest target.
+		expect(h.exit).toHaveBeenCalledWith(0);
+		vi.useRealTimers();
+	});
+
+	// Only the newest survives: the control plane is waiting on the row the last
+	// request wrote, and reporting the ones it superseded would answer nobody.
+	it('keeps only the newest of several requests received during one update', async () => {
+		const h = harness({
+			apply: vi
+				.fn<(target: string) => Promise<UpdateOutcome>>()
+				.mockResolvedValueOnce({ status: 'refused', reason: 'no' })
+				.mockResolvedValue(APPLIED),
+		});
+		vi.useFakeTimers();
+		h.inFlight.add('dispatch-1');
+
+		h.handle(UPDATE);
+		await vi.advanceTimersByTimeAsync(20);
+		h.handle({ ...UPDATE, requestId: RETARGET_ID, target: 'v2' });
+		h.handle({ ...UPDATE, requestId: THIRD_ID, target: 'v3' });
+		await vi.advanceTimersByTimeAsync(20);
+
+		h.inFlight.delete('dispatch-1');
+		await vi.advanceTimersByTimeAsync(50);
+		await settle();
+
+		expect(h.apply.mock.calls.map(([target]) => target)).toEqual(['main', 'v3']);
 		vi.useRealTimers();
 	});
 });
