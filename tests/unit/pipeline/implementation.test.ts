@@ -200,6 +200,20 @@ describe('runImplementationPhase', () => {
 		expect(deps.runAgent).not.toHaveBeenCalled();
 	});
 
+	it('does not report the In progress pickup for a run already aborted (issue #912)', async () => {
+		// A cancellation that landed while the phase was doing its pre-agent work (the
+		// dependency gate above is a round trip). Reporting a pickup for a run that is
+		// already dying leaves the card in the phase's column with nothing to pick it
+		// up — dependency recheck skips a card whose status already matches the phase.
+		const deps = makeDeps();
+		const controller = new AbortController();
+		controller.abort();
+
+		await runImplementationPhase({ ...deps, signal: controller.signal });
+
+		expect(deps.pm.moveWorkItem).not.toHaveBeenCalledWith('PVTI_item19', 'inProgress');
+	});
+
 	it('proceeds normally when the item has only closed (satisfied) blockers', async () => {
 		const deps = makeDeps();
 		deps.pm.listBlockers.mockResolvedValueOnce([
@@ -261,6 +275,19 @@ describe('runImplementationPhase', () => {
 			commentId: 'comment-1',
 			movedTo: 'inReview',
 		});
+	});
+
+	it('does not report the In progress pickup for a run already aborted (issue #912)', async () => {
+		// A cancellation that landed while the phase was doing its pre-agent work (the
+		// dependency gate is a transported round trip on a federated worker). Reporting
+		// the pickup now would leave the card in this phase's column with no run behind
+		// it and nothing that would ever move it out.
+		const deps = makeDeps();
+		const signal = AbortSignal.abort();
+
+		await runImplementationPhase({ ...deps, signal });
+
+		expect(deps.pm.moveWorkItem).not.toHaveBeenCalledWith('PVTI_item19', 'inProgress');
 	});
 
 	it('names the worktree path in the prompt for Antigravity but not for Claude (issue #226)', async () => {
