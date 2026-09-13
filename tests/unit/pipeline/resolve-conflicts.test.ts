@@ -115,6 +115,16 @@ function corruptMigrationsWithPhantomEntry(worktreePath: string): void {
 	writeFileSync(journalPath, JSON.stringify(journal));
 }
 
+/**
+ * Rewrite the hand-off the way `buildMigrationJournalRepairPrompt`'s last
+ * paragraph tells the repair pass to when its fix changes `body` or
+ * `verification`.
+ */
+function rewriteHandoff(worktreePath: string, patch: Record<string, unknown>): void {
+	const path = join(worktreePath, HANDOFF_FILENAMES.resolveConflicts);
+	writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, 'utf8')), ...patch }));
+}
+
 /** Fix the phantom entry the way the repair pass is instructed to (drop it). */
 function repairPhantomEntry(worktreePath: string): void {
 	const journalPath = join(worktreePath, 'src/db/migrations/meta/_journal.json');
@@ -381,6 +391,57 @@ describe('runResolveConflictsPhase — verification outcomes (issue #924)', () =
 			/fails verification the agent attributes to the merge itself/,
 		);
 		expect(deps.runAgent).toHaveBeenCalledTimes(1);
+	});
+
+	// …and the other half of that placement: the repair pass runs *after* the gate
+	// and its own prompt lets it rewrite the hand-off, so the merge agent's
+	// `passed` cannot be the last word on a merge the repair pass then re-tested.
+	it('refuses a merge the migration repair pass rewrites as broken', async () => {
+		const worktreePath = makeWorktree();
+		writeCleanMigrations(worktreePath, ['0000_first', '0001_second']);
+		corruptMigrationsWithPhantomEntry(worktreePath);
+		const deps = makeDeps(worktreePath);
+		deps.runAgent.mockImplementationOnce(async () => agentResult({ sessionId: 'session-1' }));
+		deps.runAgent.mockImplementationOnce(async () => {
+			repairPhantomEntry(worktreePath);
+			rewriteHandoff(worktreePath, {
+				verification: [
+					{ command: 'npm test', outcome: 'failed', detail: 'four suites the merge broke' },
+				],
+			});
+			return agentResult({ sessionId: 'session-1' });
+		});
+
+		await expect(runResolveConflictsPhase(deps)).rejects.toThrow(
+			/fails verification the agent attributes to the merge itself — `npm test`: four suites the merge broke/,
+		);
+		expect(deps.runAgent).toHaveBeenCalledTimes(2);
+		expect(assertRemoteHead).not.toHaveBeenCalled();
+		expect(commitPreparedTree).not.toHaveBeenCalled();
+		expect(deps.delivery.pushBranch).not.toHaveBeenCalled();
+		expect(deps.delivery.postComment).not.toHaveBeenCalled();
+	});
+
+	// The mirror: the re-read is what delivery uses, so a repair pass that only
+	// corrected the result comment gets that comment posted rather than the stale one.
+	it('posts the body the migration repair pass left behind', async () => {
+		const worktreePath = makeWorktree();
+		writeCleanMigrations(worktreePath, ['0000_first', '0001_second']);
+		corruptMigrationsWithPhantomEntry(worktreePath);
+		const deps = makeDeps(worktreePath);
+		deps.runAgent.mockImplementationOnce(async () => agentResult({ sessionId: 'session-1' }));
+		deps.runAgent.mockImplementationOnce(async () => {
+			repairPhantomEntry(worktreePath);
+			rewriteHandoff(worktreePath, { body: 'Merged main; regenerated the migration.' });
+			return agentResult({ sessionId: 'session-1' });
+		});
+
+		const { outcome } = await runResolveConflictsPhase(deps);
+
+		expect(outcome.status).toBe('resolved');
+		expect(deps.delivery.postComment).toHaveBeenCalledWith(
+			expect.objectContaining({ body: 'Merged main; regenerated the migration.' }),
+		);
 	});
 });
 

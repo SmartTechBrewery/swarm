@@ -400,7 +400,6 @@ export const CiResponseHandoffSchema = z.object({
  *   establish otherwise. Refused by the phase, nothing committed or pushed.
  */
 export const CONFLICT_VERIFICATION_OUTCOMES = ['passed', 'pre-existing-failure', 'failed'] as const;
-export type ConflictVerificationOutcome = (typeof CONFLICT_VERIFICATION_OUTCOMES)[number];
 
 export const ConflictVerificationSchema = z.object({
 	command: z.string().min(1),
