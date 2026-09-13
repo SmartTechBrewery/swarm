@@ -35,6 +35,22 @@ export const PROPOSED_SCOPE_FILENAME = 'proposed_scope.json';
 export const PROPOSED_SPLIT_FILENAME = 'proposed_split.json';
 
 /**
+ * The largest number of `subTasks` one {@link PROPOSED_SPLIT_FILENAME} may name —
+ * the split's size contract, stated once here because every part that depends on it
+ * reads it from here: the prompt below tells the planner the limit, `ProposedSplitSchema`
+ * (`src/pipeline/planning.ts`) rejects a larger split *before* a single child card is
+ * created, and `recoverAdvancedSplitChildren` scans exactly this many child indices.
+ * Those last two must be one constant rather than two: a split the schema accepted but
+ * the recovery scan could not walk to the end of is precisely how an advanced child ends
+ * up sitting in "ToDo" with no job and no webhook (issue #911).
+ *
+ * Sixty-four is far above any split SWARM has produced. The cap exists to keep that
+ * recovery scan's request count bounded (the `PMProvider` lookup cost contract), not to
+ * ration phases.
+ */
+export const MAX_SPLIT_CHILDREN = 64;
+
+/**
  * Build the prompt handed to the planning agent. It's told to explore the repo
  * and write a step-by-step implementation plan to `proposed_plan.md` — and, since
  * this is a read-only phase, explicitly *not* to modify code or implement
@@ -150,6 +166,8 @@ export function buildPlanningPrompt(
 			'      * dependencies on the preceding split tasks (what must land first);',
 			'      * an ordered implementation outline;',
 			'      * focused verification guidance (the checks/tests to run).',
+			`  - Name AT MOST ${MAX_SPLIT_CHILDREN} "subTasks" entries — a split larger than that is a`,
+			'    milestone rather than one work item, and SWARM rejects the whole plan.',
 			`  - Do NOT write "${PROPOSED_SPLIT_FILENAME}" (or write it with an empty`,
 			'    "subTasks" array) when the item is already right-sized — then just write the',
 			`    single "${PROPOSED_PLAN_FILENAME}" as usual.`,

@@ -305,6 +305,10 @@ export function succeededResult(
 		// are persisted on its run row and gate merge automation. Absent for phases
 		// that produce none.
 		movedTo: result.movedTo,
+		// The split children that auto-advance moved along with the source task, so the
+		// control plane self-enqueues each one's next phase too (issue #911). Absent
+		// from every run that advanced nothing but its own item.
+		advancedItemIds: result.advancedItemIds,
 		verdict: result.verdict,
 		reviewOrdinal: result.reviewOrdinal,
 		reviewAutomationOutcome: result.automationOutcome,

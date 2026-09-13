@@ -44,6 +44,7 @@ vi.mock('node:fs', () => ({
 import type { AgentCliResult, RunAgentCliOptions } from '@/harness/agent-cli.js';
 import {
 	buildPlanningPrompt,
+	MAX_SPLIT_CHILDREN,
 	PLANNED_LABEL,
 	PREPLAN_COMMENT_MARKER_PREFIX,
 	PROPOSED_PLAN_FILENAME,
@@ -55,6 +56,7 @@ import {
 	runPlanningPhase,
 	SPLIT_CHILD_LABEL,
 	splitChildCommentBody,
+	splitChildMarker,
 } from '@/pipeline/planning.js';
 import {
 	buildPreplanContract,
@@ -496,7 +498,10 @@ describe('runPlanningPhase', () => {
 		expect(secondComment).toMatch(/Blocked by/);
 		expect(secondComment).toContain(`Phase 1: ${splitTitle(1, 3, 'First slice')}`);
 		expect(secondComment).not.toContain('Phase 2: ');
-		expect(secondComment).toContain('placed it in **Planning**');
+		// `autoAdvance` is on here, so the child's final column is ToDo and its note
+		// says so rather than telling the operator to move it themselves (issue #911).
+		expect(secondComment).toContain('moved it to **ToDo**');
+		expect(secondComment).not.toContain('placed it in **Planning**');
 
 		const thirdComment = childComment(deps, 'PVTI_Third slice', false);
 		// Phase 3 of 3, cumulatively blocked by BOTH earlier phases.
@@ -516,11 +521,92 @@ describe('runPlanningPhase', () => {
 			['PVTI_Third slice', 'PVTI_Second slice'],
 		]);
 
-		// The first task still auto-advances (autoAdvance on, not a split-child).
+		// The first task still auto-advances (autoAdvance on, not a split-child) — and
+		// so does every child the split prepared, which is the whole of issue #911:
+		// the `planned` label that saves each child a Planning run is also what leaves
+		// it parked in Planning with nothing able to dispatch it.
 		expect(deps.pm.moveWorkItem).toHaveBeenCalledWith('PVTI_item18', 'todo');
+		expect(deps.pm.moveWorkItem).toHaveBeenCalledWith('PVTI_Second slice', 'todo');
+		expect(deps.pm.moveWorkItem).toHaveBeenCalledWith('PVTI_Third slice', 'todo');
+		// Per child, the ToDo move comes *after* its blocked-by edges: this is the
+		// status the Implementation dispatch keys on, and the gate that defers it reads
+		// the card's recorded blockers, so advancing first is how phase 3 starts ahead
+		// of phase 1.
+		const callOrder = (mockFn: { mock: { calls: unknown[][]; invocationCallOrder: number[] } }) =>
+			mockFn.mock.calls.map((call, i) => ({
+				call,
+				order: mockFn.mock.invocationCallOrder[i],
+			}));
+		for (const childId of ['PVTI_Second slice', 'PVTI_Third slice']) {
+			const lastEdge = Math.max(
+				...callOrder(deps.pm.addBlockedBy)
+					.filter(({ call }) => call[0] === childId)
+					.map(({ order }) => order),
+			);
+			const advance = callOrder(deps.pm.moveWorkItem).find(
+				({ call }) => call[0] === childId && call[1] === 'todo',
+			)?.order;
+			expect(advance).toBeGreaterThan(lastEdge);
+		}
 		expect(result.split).toEqual({
 			subTaskItemIds: ['PVTI_Second slice', 'PVTI_Third slice'],
 			mainTaskUpdated: true,
+		});
+		// Reported up so the worker self-enqueues each child's next phase: the move is
+		// SWARM's own, so its board webhook is dropped by loop prevention.
+		expect(result.advancedItemIds).toEqual(['PVTI_Second slice', 'PVTI_Third slice']);
+	});
+
+	it('leaves every split child where it is when autoAdvance is off (issue #911)', async () => {
+		splitExists = true;
+		splitContents = JSON.stringify({
+			sharedName: SHARED_NAME,
+			subTasks: [
+				{ title: 'Second slice', description: 'The UI', plan: '# UI plan\n\n1. Build it.' },
+			],
+		});
+		const deps = makeDeps();
+		const result = await runPlanningPhase(deps);
+
+		// The advance is the auto-advance policy's decision, not the split's: with it
+		// off the children stay in Planning exactly as the source task stays put.
+		expect(deps.pm.moveWorkItem).toHaveBeenCalledWith('PVTI_Second slice', 'planning');
+		expect(deps.pm.moveWorkItem).not.toHaveBeenCalledWith('PVTI_Second slice', 'todo');
+		expect(deps.pm.moveWorkItem).not.toHaveBeenCalledWith('PVTI_item18', 'todo');
+		expect(result.advancedItemIds).toBeUndefined();
+		expect(childComment(deps, 'PVTI_Second slice', false)).toContain('placed it in **Planning**');
+	});
+
+	it('keeps the split going and reports Planning honestly when a child’s ToDo move fails', async () => {
+		splitExists = true;
+		splitContents = JSON.stringify({
+			sharedName: SHARED_NAME,
+			subTasks: [
+				{ title: 'Second slice', description: 'The UI', plan: '# UI plan\n\n1. Build it.' },
+				{ title: 'Third slice', description: 'The docs', plan: '# Docs plan\n\n1. Write it.' },
+			],
+		});
+		const deps = makeDeps();
+		// Best-effort, like the label and the blocked-by links: one child's refused
+		// advance must not fail an otherwise-complete parent run, nor stop the next
+		// child from advancing.
+		deps.pm.moveWorkItem = vi.fn<(id: string, status: string) => Promise<void>>(
+			async (id, status) => {
+				if (id === 'PVTI_Second slice' && status === 'todo') {
+					throw new Error('board rejected the move');
+				}
+			},
+		);
+		const result = await runPlanningPhase({ ...deps, autoAdvance: true });
+
+		// The child stays where a run with autoAdvance off would have left it, and its
+		// note says Planning rather than claiming a ToDo it never reached (issue #431).
+		const secondComment = childComment(deps, 'PVTI_Second slice', false);
+		expect(secondComment).toContain('placed it in **Planning**');
+		expect(secondComment).not.toContain('moved it to **ToDo**');
+		expect(result.advancedItemIds).toEqual(['PVTI_Third slice']);
+		expect(result.split).toMatchObject({
+			subTaskItemIds: ['PVTI_Second slice', 'PVTI_Third slice'],
 		});
 	});
 
@@ -799,6 +885,11 @@ describe('runPlanningPhase', () => {
 		// says exactly that, with no saved plan to point at.
 		expect(splitComment).toContain('with no saved plan');
 		expect(splitComment).toContain('run a Planning agent on it normally');
+		// A child deliberately left in Backlog is never auto-advanced (issue #911):
+		// it owes a full Planning run, and moving it to ToDo would dispatch
+		// Implementation on a card that was never planned.
+		expect(deps.pm.moveWorkItem).not.toHaveBeenCalledWith('PVTI_Second slice', 'todo');
+		expect(result.advancedItemIds).toBeUndefined();
 	});
 
 	it('posts a Backlog fallback comment when moving a prepared sibling to Planning throws', async () => {
@@ -812,7 +903,7 @@ describe('runPlanningPhase', () => {
 		deps.pm.moveWorkItem = vi.fn<(id: string, status: string) => Promise<void>>(async (id) => {
 			if (id === 'PVTI_Second slice') throw new Error('board rejected the move');
 		});
-		await runPlanningPhase({ ...deps, autoAdvance: true });
+		const result = await runPlanningPhase({ ...deps, autoAdvance: true });
 
 		// The marker write precedes the move, so this branch really does leave a valid
 		// embedded plan behind — the observable state the docs' "keeps its plan" claim
@@ -841,6 +932,10 @@ describe('runPlanningPhase', () => {
 		expect(splitComment).toContain('carrying the `planned` label');
 		expect(splitComment).toContain('nothing will re-plan it');
 		expect(splitComment).toContain('remove the `planned` label first');
+		// Preparation never reached Planning, so auto-advance skips this child too
+		// (issue #911) — there is no ToDo move to attempt from Backlog.
+		expect(deps.pm.moveWorkItem).not.toHaveBeenCalledWith('PVTI_Second slice', 'todo');
+		expect(result.advancedItemIds).toBeUndefined();
 	});
 
 	it('short-circuits and labels a dispatched preplanned child whatever status its card is in', async () => {
@@ -1943,6 +2038,200 @@ describe('runPlanningPhase', () => {
 			).toHaveLength(1);
 		});
 
+		// The plan comment is posted *before* the parent's own ToDo move and `planned`
+		// label, so a failure in either leaves children already advanced while the
+		// retry's short-circuit skips the split and would report none of them — advanced
+		// cards with no synthetic job and no webhook (the board move is SWARM's own, so
+		// loop prevention drops it). The retry recovers them instead.
+		describe('a retry recovers the children an earlier attempt advanced (issue #911)', () => {
+			const CHILD_IDS = ['PVTI_child1', 'PVTI_child2'];
+
+			/** Fail one of the parent's two post-comment writes, leaving the children advanced. */
+			function failingParentWrite(
+				deps: ReturnType<typeof makeDeps>,
+				write: 'move' | 'label',
+			): ReturnType<typeof makeDeps> {
+				if (write === 'move') {
+					deps.pm.moveWorkItem = vi.fn<(id: string, status: string) => Promise<void>>(
+						async (id, status) => {
+							if (id === 'PVTI_item18' && status === 'todo') {
+								throw new Error('board rejected the move');
+							}
+						},
+					);
+				} else {
+					deps.pm.addLabel = vi.fn<(id: string, name: string) => Promise<void>>(async (id) => {
+						if (id === 'PVTI_item18') throw new Error('label write failed: 502');
+					});
+				}
+				return deps;
+			}
+
+			it.each([
+				['the source task’s ToDo move', 'move' as const, 'board rejected the move'],
+				['the source task’s planned label', 'label' as const, 'label write failed: 502'],
+			])('when %s failed after the children moved', async (_name, write, message) => {
+				const first = failingParentWrite(onBoard(makeDeps(), board), write);
+				await expect(
+					runPlanningPhase({ ...first, runId: 'run-A', autoAdvance: true }),
+				).rejects.toThrow(message);
+				// The failed attempt really did leave both children in ToDo — the state
+				// the retry has to finish the job for.
+				for (const childId of CHILD_IDS) {
+					expect(first.pm.moveWorkItem).toHaveBeenCalledWith(childId, 'todo');
+				}
+
+				const retry = onBoard(makeDeps(), board);
+				const result = await runPlanningPhase({ ...retry, runId: 'run-A', autoAdvance: true });
+
+				// The retry short-circuits on its own plan comment, so it re-splits
+				// nothing and re-advances nothing — and still reports every child, which
+				// is the only thing that gets each one its synthetic next-phase job.
+				expect(retry.pm.createWorkItem).not.toHaveBeenCalled();
+				expect(result.split).toBeUndefined();
+				expect(result.advancedItemIds).toEqual(CHILD_IDS);
+				for (const childId of CHILD_IDS) {
+					expect(retry.pm.moveWorkItem).not.toHaveBeenCalledWith(childId, 'todo');
+				}
+				// And the write that failed is the one the retry completes.
+				expect(retry.pm.moveWorkItem).toHaveBeenCalledWith('PVTI_item18', 'todo');
+				expect(retry.pm.addLabel).toHaveBeenCalledWith('PVTI_item18', PLANNED_LABEL);
+			});
+
+			it('reports only the children whose advance really landed', async () => {
+				const first = onBoard(makeDeps(), board);
+				// Child 1's advance is refused — best-effort, so it stays in Planning with
+				// a `ready` note — and then the parent's move fails.
+				first.pm.moveWorkItem = vi.fn<(id: string, status: string) => Promise<void>>(
+					async (id, status) => {
+						if (status !== 'todo') return;
+						if (id === 'PVTI_child1') throw new Error('board rejected the move');
+						if (id === 'PVTI_item18') throw new Error('board rejected the move');
+					},
+				);
+				await expect(
+					runPlanningPhase({ ...first, runId: 'run-A', autoAdvance: true }),
+				).rejects.toThrow('board rejected the move');
+
+				const result = await runPlanningPhase({
+					...onBoard(makeDeps(), board),
+					runId: 'run-A',
+					autoAdvance: true,
+				});
+
+				// The advance is read off each child's split-note outcome token, written
+				// by the attempt that made the move and only where it landed — never off
+				// the card's status, which the DB-free path's narrow frame does not carry.
+				expect(result.advancedItemIds).toEqual(['PVTI_child2']);
+			});
+
+			it('recovers nothing, at one lookup, when the delivery advanced no children', async () => {
+				const first = failingParentWrite(onBoard(makeDeps(), board), 'label');
+				// `autoAdvance` off: the children stay in Planning, so there is nothing
+				// for the retry to recover — and it must not invent a card id. The label
+				// is the write that fails here, since with no auto-advance the source
+				// task has no move to fail on.
+				await expect(runPlanningPhase({ ...first, runId: 'run-A' })).rejects.toThrow(
+					'label write failed: 502',
+				);
+
+				const retry = onBoard(makeDeps(), board);
+				const result = await runPlanningPhase({ ...retry, runId: 'run-A', autoAdvance: true });
+
+				expect(result.advancedItemIds).toBeUndefined();
+				// The scan stops at the first child with no `advanced` note rather than
+				// walking the board: two children plus the gap that ends the split.
+				expect(retry.pm.findWorkItemByDescriptionMarker).toHaveBeenCalledTimes(3);
+			});
+
+			// The recovery scan covers a fixed number of child indices, so the split's
+			// own size is capped at that same number — one constant, enforced when the
+			// proposal is read, before a single card exists. These three cover the seam
+			// between the two: the cap refusing an over-sized proposal, the scan
+			// recovering a split that sits exactly on it, and the scan refusing to call
+			// a prefix a complete answer.
+			describe('the split size and the recovery scan share one bound', () => {
+				/** A proposed split naming `count` siblings, in the planner's own shape. */
+				const splitOf = (count: number) =>
+					JSON.stringify({
+						sharedName: SHARED_NAME,
+						mainTask: { title: 'First slice', description: 'The first slice' },
+						subTasks: Array.from({ length: count }, (_, index) => ({
+							title: `Slice ${index + 2}`,
+							description: `The slice ${index + 2}`,
+							plan: `# Plan ${index + 2}\n\nBuild it.`,
+						})),
+					});
+
+				/** Advance every child of a maximum-sized split, then fail the parent's label. */
+				async function advanceMaxSizedSplit(): Promise<string[]> {
+					splitContents = splitOf(MAX_SPLIT_CHILDREN);
+					const first = failingParentWrite(onBoard(makeDeps(), board), 'label');
+					await expect(
+						runPlanningPhase({ ...first, runId: 'run-A', autoAdvance: true }),
+					).rejects.toThrow('label write failed: 502');
+					const childIds = board.items.map((item) => item.id);
+					expect(childIds).toHaveLength(MAX_SPLIT_CHILDREN);
+					for (const childId of childIds) {
+						expect(first.pm.moveWorkItem).toHaveBeenCalledWith(childId, 'todo');
+					}
+					return childIds;
+				}
+
+				it('refuses a proposal naming more children than the scan covers, before any board write', async () => {
+					splitContents = splitOf(MAX_SPLIT_CHILDREN + 1);
+					const deps = onBoard(makeDeps(), board);
+
+					await expect(
+						runPlanningPhase({ ...deps, runId: 'run-A', autoAdvance: true }),
+					).rejects.toThrow(`at most ${MAX_SPLIT_CHILDREN} subTasks`);
+
+					// Rejected while it is still only a file: no card, no plan comment, and
+					// the source task neither advanced nor marked planned — so there is no
+					// half-applied split for a retry to have to reason about.
+					expect(deps.pm.createWorkItem).not.toHaveBeenCalled();
+					expect(deps.pm.addComment).not.toHaveBeenCalled();
+					expect(deps.pm.moveWorkItem).not.toHaveBeenCalled();
+					expect(deps.pm.addLabel).not.toHaveBeenCalled();
+				});
+
+				it('recovers every child of a split sitting exactly on the bound', async () => {
+					const childIds = await advanceMaxSizedSplit();
+
+					const retry = onBoard(makeDeps(), board);
+					const result = await runPlanningPhase({ ...retry, runId: 'run-A', autoAdvance: true });
+
+					// The largest split the cap allows is still recovered whole — the scan
+					// reaching its last legal index is the normal end of a maximum-sized
+					// split, not a truncation.
+					expect(result.advancedItemIds).toEqual(childIds);
+					expect(retry.pm.addLabel).toHaveBeenCalledWith('PVTI_item18', PLANNED_LABEL);
+				});
+
+				it('fails the phase rather than reporting a prefix when a delivery runs past the bound', async () => {
+					const childIds = await advanceMaxSizedSplit();
+					// A card one index past the last legal one — the state only a split that
+					// escaped the cap could leave. Reporting the 64 already read would tell
+					// the worker "this is all of them", stranding the last child for good;
+					// failing keeps the delivery retryable.
+					board.items.push(
+						createMockWorkItem({
+							id: 'PVTI_overflow',
+							title: 'One phase too many',
+							description: `A slice too far. ${splitChildMarker('run-A', MAX_SPLIT_CHILDREN)}`,
+							url: 'https://example.test/PVTI_overflow',
+						}),
+					);
+
+					const retry = onBoard(makeDeps(), board);
+					await expect(
+						runPlanningPhase({ ...retry, runId: 'run-A', autoAdvance: true }),
+					).rejects.toThrow(`more than ${MAX_SPLIT_CHILDREN} split children`);
+					expect(childIds).toHaveLength(MAX_SPLIT_CHILDREN);
+				});
+			});
+		});
+
 		it('still performs its own split for a genuine replan — a new run, hence a new identity', async () => {
 			await runPlanningPhase({ ...onBoard(makeDeps(), board), runId: 'run-A' });
 			expect(titlesOn(board)).toEqual(CHILD_TITLES);
@@ -2426,6 +2715,13 @@ describe('buildPlanningPrompt', () => {
 		expect(prompt).not.toContain('"Phase 1/3: <title>"');
 	});
 
+	it('states the split-size cap the split file is validated against', () => {
+		const prompt = buildPlanningPrompt(createMockWorkItem(), true);
+		// The planner is told the limit rather than discovering it as a failed run:
+		// the same constant rejects an over-sized split file when it is read.
+		expect(prompt).toContain(`Name AT MOST ${MAX_SPLIT_CHILDREN} "subTasks" entries`);
+	});
+
 	it('asks for a reusable per-child plan when splitting', () => {
 		const prompt = buildPlanningPrompt(createMockWorkItem(), true);
 		expect(prompt).toContain('"plan"');
@@ -2475,6 +2771,7 @@ describe('splitChildCommentBody', () => {
 					preplanPublished: true,
 					planned: true,
 					prepared: true,
+					advanced: false,
 				}),
 			),
 		).toBe(true);
@@ -2484,20 +2781,42 @@ describe('splitChildCommentBody', () => {
 					preplanPublished: false,
 					planned: false,
 					prepared: false,
+					advanced: false,
 				}),
 			),
 		).toBe(true);
 	});
 
-	// Three branches since issue #737, because a child stranded in Backlog now
+	// Four branches: three since issue #737, because a child stranded in Backlog
 	// behaves differently depending on which step stranded it — and "move it to
-	// Planning and SWARM will plan it" is true of only one of them.
+	// Planning and SWARM will plan it" is true of only one of them — plus the
+	// auto-advanced child (issue #911), for which the prepared branch's "it will not
+	// move to ToDo on its own" is a plain falsehood.
+	it('tells an auto-advanced child it is already in ToDo and still waits its turn', () => {
+		const parent = createMockWorkItem({ title: 'Big task', url: 'https://x/issues/1' });
+		const body = splitChildCommentBody(parent, [parent], 2, 3, {
+			preplanPublished: true,
+			planned: true,
+			prepared: true,
+			advanced: true,
+		});
+		expect(body).toContain('moved it to **ToDo**');
+		expect(body).toContain('stays blocked until the phases');
+		expect(body).toContain('remove the `planned` label');
+		// The card is already where the prepared branch tells the reader to put it, so
+		// that instruction must not survive onto this one (issue #431's honesty rule).
+		expect(body).not.toMatch(/move (the item|it) to \*\*ToDo\*\* when you are ready/);
+		expect(body).not.toContain('placed it in **Planning**');
+		expect(body).not.toContain('remains in **Backlog**');
+	});
+
 	it('tells a prepared child how to re-plan: remove `planned`, move Backlog → Planning', () => {
 		const parent = createMockWorkItem({ title: 'Big task', url: 'https://x/issues/1' });
 		const preparedBody = splitChildCommentBody(parent, [], 2, 3, {
 			preplanPublished: true,
 			planned: true,
 			prepared: true,
+			advanced: false,
 		});
 		expect(preparedBody).toMatch(/move (the item|it) to \*\*ToDo\*\*/);
 		expect(preparedBody).toContain('remove the `planned` label');
@@ -2513,6 +2832,7 @@ describe('splitChildCommentBody', () => {
 			preplanPublished: true,
 			planned: true,
 			prepared: false,
+			advanced: false,
 		});
 		expect(body).toContain('remains in **Backlog** carrying the `planned` label');
 		expect(body).toContain('nothing will re-plan it');
@@ -2526,6 +2846,7 @@ describe('splitChildCommentBody', () => {
 			preplanPublished: false,
 			planned: false,
 			prepared: false,
+			advanced: false,
 		});
 		expect(body).toContain('remains in **Backlog**');
 		expect(body).toContain('with no saved plan');

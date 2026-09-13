@@ -817,6 +817,40 @@ describe('runAssignmentDbFree', () => {
 		expect(sink.sent.at(-1)?.ciOutcome).toBeUndefined();
 	});
 
+	it('reports the split children a Planning run auto-advanced, so the control plane self-enqueues each (issue #911)', async () => {
+		const sink = recordingSink();
+		const runPhase = vi.fn(async () => ({
+			agent: agentResult(),
+			movedTo: 'todo' as const,
+			advancedItemIds: ['PVTI_child-one', 'PVTI_child-two'],
+		}));
+
+		await runAssignmentDbFree(
+			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'planning' })),
+			sink,
+			{ ...RUN_OPTIONS, deps: depsWith(runPhase) },
+		);
+
+		expect(sink.sent.at(-1)).toMatchObject({
+			status: 'succeeded',
+			movedTo: 'todo',
+			advancedItemIds: ['PVTI_child-one', 'PVTI_child-two'],
+		});
+	});
+
+	it('reports no advanced children for a run that advanced nothing but its own item', async () => {
+		const sink = recordingSink();
+		const runPhase = vi.fn(async () => ({ agent: agentResult(), movedTo: 'todo' as const }));
+
+		await runAssignmentDbFree(
+			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'planning' })),
+			sink,
+			{ ...RUN_OPTIONS, deps: depsWith(runPhase) },
+		);
+
+		expect(sink.sent.at(-1)?.advancedItemIds).toBeUndefined();
+	});
+
 	it("keeps implementation's dependency gate working through the blockers read route", async () => {
 		const sink = recordingSink();
 		const blockers = [

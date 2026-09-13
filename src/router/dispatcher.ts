@@ -299,6 +299,10 @@ export function adaptResultToPhaseRun(
 				timedOut: result.timedOut ?? false,
 			}),
 			movedTo: result.movedTo,
+			// Feeds the shared settle path's per-child self-enqueue (issue #911); absent
+			// from a run that advanced nothing but its own item, and from an older
+			// worker's frame.
+			advancedItemIds: result.advancedItemIds,
 			verdict: reportedVerdict(result.verdict),
 			reviewOrdinal: result.reviewOrdinal,
 			automationOutcome: result.reviewAutomationOutcome,
