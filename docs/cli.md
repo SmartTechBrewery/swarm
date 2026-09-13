@@ -426,6 +426,7 @@ swarm workers remove <worker-id>
 swarm workers drain <worker-id>
 swarm workers undrain <worker-id>
 swarm workers update <worker-id> <ref>
+swarm workers update --all <ref>
 swarm workers enroll <worker-id> <project-id> --cli <c1,c2,...> [--concurrency <n>] [--active] [--consent]
 swarm workers update-enrollment <worker-id> <project-id> [--cli <c1,c2,...>] [--concurrency <n>]
 swarm workers approve <worker-id> <project-id>
@@ -649,6 +650,35 @@ unchanged.
   command that changes *which code* runs on somebody's hardware, so an
   `instanceAdmin` who does not own the machine gets the same `NOT_FOUND` a stranger
   does. No dashboard equivalent yet; the CLI is the operator surface for now.
+- **`update --all <ref>`** — the same request, asked of **every machine you own
+  that is eligible for one**, in one action (issue #921), with one line per machine
+  saying what became of it — the machines it deliberately did not ask included. It
+  reaches only machines that are **already draining**, so it cannot take a fleet's
+  capacity down by itself: draining is still your own step, per machine. A worker id
+  alongside `--all` is a usage error naming both forms.
+  No machine's state refuses the call — one un-drained machine out of twelve would
+  otherwise abort the request and tell you nothing about the other eleven — so each
+  line carries a **disposition** instead:
+  `requested` (recorded, and the machine has a live session, so the push is on its
+  way), `queued-offline` (recorded; no live session, so the router states it again
+  on the machine's next connection), `in-pool` (not asked — the machine is not
+  draining; the line under the table names `swarm workers drain <worker-id>` for
+  each one), `already-asked` (an unanswered request for **this same ref** is
+  outstanding and is left exactly as it is, request id and all) and `answered` (the
+  machine already reported an outcome for this same ref, shown beside the
+  disposition rather than the machine being re-asked). A tally line counts them.
+  **Re-running it is the readout**: an answered machine is never asked twice, so no
+  machine is sent back through an apply it has already done, and an outstanding
+  request keeps its id so no second push is made. A pending request for a
+  *different* ref is overwritten and reported as `requested` — a stale request for
+  some other build must not survive a fleet action. Retrying one machine that
+  reported `failed` stays `swarm workers update <worker-id> <ref>`, which overwrites
+  unconditionally; there is no `--retry`. **Exit code 0 whenever the call
+  succeeded**, however many machines were skipped: this is a report, not a
+  pass/fail. Strictly owner-scoped, deliberately — it fans out over your own
+  machines and nothing wider, and whether an installation administrator may signal
+  machines they do not own is a separate question this does not answer. Waves,
+  staging and halting are not here: this asks, once, and reports.
 - **`enroll`** — enroll a worker into a project with allowed CLIs (`--cli`, a
   subset of the worker's capabilities) and `--concurrency`, this worker's share of
   the project. Omit `--concurrency` for `1` (the default): one of the project's

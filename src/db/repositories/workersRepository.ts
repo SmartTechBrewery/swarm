@@ -26,7 +26,7 @@
  * not-found, not an error (ai/CODING_STANDARDS.md "Error handling").
  */
 
-import { and, asc, eq, inArray, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNotNull, sql } from 'drizzle-orm';
 
 import type { AgentCli } from '../../harness/agent-cli.js';
 import {
@@ -461,8 +461,24 @@ export async function setWorkerDraining(
 }
 
 /**
+ * What became of a {@link requestWorkerUpdate} write. Three outcomes rather than a
+ * `Worker | undefined`, because the draining precondition is now part of the write
+ * itself (issue #921) and "declined" has to be tellable from "no such machine":
+ *
+ * - `requested` — the row now carries the request, and `worker` is it.
+ * - `in-pool` — the machine was not draining, so nothing was written; `worker` is the
+ *   row as it stands, for the refusal the caller words.
+ * - `not-found` — no worker has that id.
+ */
+export type WorkerUpdateRequestOutcome =
+	| { outcome: 'requested'; worker: Worker }
+	| { outcome: 'in-pool'; worker: Worker }
+	| { outcome: 'not-found' };
+
+/**
  * Record that an operator asked this machine to move its SWARM install root to
- * `target`, replacing any request already outstanding (issue #933).
+ * `target`, replacing any request already outstanding (issue #933) — **only while
+ * the machine is draining**.
  *
  * All six columns are written together, so a fresh request never shows the previous
  * one's verdict beside it: the outcome fields are reset to NULL in the same write
@@ -471,16 +487,26 @@ export async function setWorkerDraining(
  * longer the one the row is waiting on, and a report for it is recognised as stale
  * by {@link recordWorkerUpdateReport}'s id check.
  *
- * Returns the updated worker, or `undefined` if no worker has that id. No
- * transaction and no enrollment validation, exactly like {@link setWorkerDraining}:
- * it narrows nothing an enrollment depends on, and the machine-side safety — acting
- * only when it holds no in-flight phase — is the daemon's, not this write's.
+ * **`draining_since IS NOT NULL` is a predicate of the `WHERE`, not a check the
+ * caller makes first** (issue #921). The precondition is what makes the whole
+ * mechanism safe — the daemon waits for its in-flight phases to finish, and only
+ * draining stops new work being dispatched into that wait — so a caller that read
+ * the row, found it draining, and then wrote unconditionally would record and push a
+ * request onto a machine a concurrent `swarm workers undrain` had already returned
+ * to the pool. Deciding it here is what makes that impossible rather than unlikely,
+ * and it is the *one* place both the single-machine and the fleet caller decide it.
+ * No transaction is needed for that: the eligibility test and the write are the same
+ * statement, and `setWorkerDraining` is a single statement on the same row, so the
+ * two serialize on the row itself.
+ *
+ * The follow-up read on the declined path is not part of the guarantee — the
+ * predicate already is — and only decides which refusal the caller gets to name.
  */
 export async function requestWorkerUpdate(
 	id: string,
 	requestId: string,
 	target: string,
-): Promise<Worker | undefined> {
+): Promise<WorkerUpdateRequestOutcome> {
 	const [updatedRow] = await getDb()
 		.update(workers)
 		.set({
@@ -491,9 +517,11 @@ export async function requestWorkerUpdate(
 			updateMessage: null,
 			updateReportedAt: null,
 		})
-		.where(eq(workers.id, id))
+		.where(and(eq(workers.id, id), isNotNull(workers.drainingSince)))
 		.returning();
-	return updatedRow ? rowToWorker(updatedRow) : undefined;
+	if (updatedRow) return { outcome: 'requested', worker: rowToWorker(updatedRow) };
+	const existing = await getWorkerById(id);
+	return existing ? { outcome: 'in-pool', worker: existing } : { outcome: 'not-found' };
 }
 
 /**

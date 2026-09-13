@@ -21,11 +21,13 @@ import {
 	updateWorkerCapabilities,
 	updateWorkerDisplayName,
 	updateWorkerSupportedPhases,
+	type WorkerUpdateRequestOutcome,
 } from '../../../src/db/repositories/workersRepository.js';
 import { users } from '../../../src/db/schema/users.js';
 import { workerProjectEnrollments } from '../../../src/db/schema/workerProjectEnrollments.js';
 import type { AgentCli } from '../../../src/harness/agent-cli.js';
 import {
+	type Worker,
 	WorkerCapabilityNotProbedError,
 	WorkerCapabilityReductionError,
 } from '../../../src/identity/worker.js';
@@ -454,10 +456,24 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 	// Issue #933 — the self-update request and its report, which are six columns
 	// read back as one value. Only a real database catches the id-matched `WHERE`
 	// silently matching nothing, or a report clearing the target it describes.
+	//
+	// Since issue #921 the request write also carries the draining precondition in its
+	// own `WHERE`, which is the other thing only a real database settles: that the
+	// eligibility test and the write are one statement, so no caller can record a
+	// request onto a machine an `undrain` has returned to the dispatch pool.
 	describe('requestWorkerUpdate / recordWorkerUpdateReport', () => {
 		const REQUEST_ID = '66666666-6666-4666-8666-666666666666';
 		const OTHER_REQUEST_ID = '77777777-7777-4777-8777-777777777777';
 
+		/** Narrow an outcome to the row a *recorded* request wrote back. */
+		function recorded(result: WorkerUpdateRequestOutcome): Worker {
+			if (result.outcome !== 'requested') {
+				throw new Error(`expected a recorded request, got '${result.outcome}'`);
+			}
+			return result.worker;
+		}
+
+		/** A registered machine, drained — the only state the request write accepts. */
 		async function freshWorker(name: string): Promise<string> {
 			const created = await createWorker({
 				ownerUserId: adaId,
@@ -465,6 +481,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 				capabilities: ['claude'],
 				credentialHash: `hash-${name}`,
 			});
+			await setWorkerDraining(created.id, true);
 			return created.id;
 		}
 
@@ -476,17 +493,62 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 		it('records a request as pending, with no outcome yet', async () => {
 			const id = await freshWorker('ada-update');
 
-			const requested = await requestWorkerUpdate(id, REQUEST_ID, 'main');
+			const requested = recorded(await requestWorkerUpdate(id, REQUEST_ID, 'main'));
 
-			expect(requested?.update).toMatchObject({
+			expect(requested.update).toMatchObject({
 				requestId: REQUEST_ID,
 				target: 'main',
 				status: null,
 				message: null,
 				reportedAt: null,
 			});
-			expect(requested?.update?.requestedAt).toBeInstanceOf(Date);
-			expect((await getWorkerById(id))?.update).toEqual(requested?.update);
+			expect(requested.update?.requestedAt).toBeInstanceOf(Date);
+			expect((await getWorkerById(id))?.update).toEqual(requested.update);
+		});
+
+		// The precondition, decided by the write rather than by whoever called it: a
+		// machine in the dispatch pool would be given new work while it waited to
+		// restart, so nothing is recorded and the row is handed back untouched for the
+		// caller to word its own refusal from.
+		it('refuses a machine that is not draining, writing nothing', async () => {
+			const created = await createWorker({
+				ownerUserId: adaId,
+				displayName: 'ada-in-pool',
+				capabilities: ['claude'],
+				credentialHash: 'hash-ada-in-pool',
+			});
+
+			const result = await requestWorkerUpdate(created.id, REQUEST_ID, 'main');
+
+			expect(result.outcome).toBe('in-pool');
+			expect((await getWorkerById(created.id))?.update).toBeNull();
+		});
+
+		// The race the predicate closes: drained, read as eligible, then returned to the
+		// pool before the write. The request must not land.
+		it('refuses a machine undrained after it was read as eligible', async () => {
+			const id = await freshWorker('ada-undrained');
+			await setWorkerDraining(id, false);
+
+			const result = await requestWorkerUpdate(id, REQUEST_ID, 'main');
+
+			expect(result.outcome).toBe('in-pool');
+			expect((await getWorkerById(id))?.update).toBeNull();
+		});
+
+		// Undraining does not erase a request that was legitimately made while the
+		// machine was drained — only a *new* one is refused.
+		it('leaves a request already recorded standing when the machine is undrained', async () => {
+			const id = await freshWorker('ada-undrain-after');
+			await requestWorkerUpdate(id, REQUEST_ID, 'main');
+
+			await setWorkerDraining(id, false);
+
+			expect((await getWorkerById(id))?.update).toMatchObject({
+				requestId: REQUEST_ID,
+				target: 'main',
+			});
+			expect((await requestWorkerUpdate(id, OTHER_REQUEST_ID, 'v2')).outcome).toBe('in-pool');
 		});
 
 		// The report clears the pending marker and keeps the target: an outcome naming
@@ -544,9 +606,9 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 			await requestWorkerUpdate(id, REQUEST_ID, 'main');
 			await recordWorkerUpdateReport(id, REQUEST_ID, 'refused', 'The install root is dirty.');
 
-			const again = await requestWorkerUpdate(id, OTHER_REQUEST_ID, 'v2');
+			const again = recorded(await requestWorkerUpdate(id, OTHER_REQUEST_ID, 'v2'));
 
-			expect(again?.update).toMatchObject({
+			expect(again.update).toMatchObject({
 				requestId: OTHER_REQUEST_ID,
 				target: 'v2',
 				status: null,
@@ -555,9 +617,11 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 			});
 		});
 
-		it('returns undefined for an unknown worker — a not-found, not an error', async () => {
+		it('returns a not-found for an unknown worker — not an error', async () => {
 			const unknown = '99999999-9999-4999-8999-999999999999';
-			expect(await requestWorkerUpdate(unknown, REQUEST_ID, 'main')).toBeUndefined();
+			expect(await requestWorkerUpdate(unknown, REQUEST_ID, 'main')).toEqual({
+				outcome: 'not-found',
+			});
 			expect(
 				await recordWorkerUpdateReport(unknown, REQUEST_ID, 'applied', 'Applied.'),
 			).toBeUndefined();
@@ -567,11 +631,11 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 		// operator's request, not a fact the daemon re-declares on connect.
 		it('survives a handshake refreshing the daemon-declared columns', async () => {
 			const id = await freshWorker('ada-update-sticky');
-			const requested = await requestWorkerUpdate(id, REQUEST_ID, 'main');
+			const requested = recorded(await requestWorkerUpdate(id, REQUEST_ID, 'main'));
 
 			await updateWorkerCapabilities(id, ['claude'], [...ALL_TRIGGER_PHASES], 'acme/api');
 
-			expect((await getWorkerById(id))?.update).toEqual(requested?.update);
+			expect((await getWorkerById(id))?.update).toEqual(requested.update);
 		});
 	});
 
