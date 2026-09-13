@@ -1979,7 +1979,12 @@ describe('runsRouter', () => {
 
 			await caller.retryNow({ runId: 'run-1' });
 
-			expect(clearRunCancellation).toHaveBeenCalledWith('run-1');
+			expect(clearRunCancellation).toHaveBeenCalledWith('run-1', {
+				action: 'retry',
+				projectId: 'p1',
+				taskId: '103',
+				phase: 'implementation',
+			});
 		});
 	});
 
@@ -2022,6 +2027,9 @@ describe('runsRouter', () => {
 			expect(requestRunCancellation).toHaveBeenCalledWith(
 				'run-1',
 				expect.objectContaining({ source: 'dashboard', requestedAt: expect.any(String) }),
+				// Issue #913: the audit line's own fields — the run, its project, task
+				// and phase, and the operator action that asked.
+				{ action: 'terminate', projectId: 'p1', taskId: '103', phase: 'implementation' },
 			);
 			expect(vi.mocked(requestRunCancellation).mock.calls[0][1]).not.toHaveProperty('actor');
 			// The worker owns an in-flight run's terminal state — the mutation must not
@@ -2042,7 +2050,11 @@ describe('runsRouter', () => {
 
 			expect(result).toEqual({ runId: 'run-1', status: 'failed' });
 			const origin = expect.objectContaining({ source: 'dashboard' });
-			expect(requestRunCancellation).toHaveBeenCalledWith('run-1', origin);
+			expect(requestRunCancellation).toHaveBeenCalledWith(
+				'run-1',
+				origin,
+				expect.objectContaining({ action: 'terminate' }),
+			);
 			// The same origin just recorded in Redis is persisted on the row too.
 			expect(cancelDeferredRunInDb).toHaveBeenCalledWith('run-1', RUN_CANCELLED_MESSAGE, origin);
 			// Keep the marker until an explicit retry clears it: a wake-up that
@@ -2068,7 +2080,11 @@ describe('runsRouter', () => {
 				status: 'failed',
 			});
 			const origin = expect.objectContaining({ source: 'dashboard' });
-			expect(requestRunCancellation).toHaveBeenCalledWith('run-1', origin);
+			expect(requestRunCancellation).toHaveBeenCalledWith(
+				'run-1',
+				origin,
+				expect.objectContaining({ action: 'terminate' }),
+			);
 			expect(cancelDeferredRunInDb).toHaveBeenCalledWith('run-1', RUN_CANCELLED_MESSAGE, origin);
 		});
 
@@ -2209,6 +2225,7 @@ describe('runsRouter', () => {
 			expect(requestRunCancellation).toHaveBeenCalledWith(
 				'run-1',
 				expect.objectContaining({ source: 'dashboard' }),
+				expect.objectContaining({ action: 'terminate' }),
 			);
 			expect(clearRunCancellation).not.toHaveBeenCalled();
 		});

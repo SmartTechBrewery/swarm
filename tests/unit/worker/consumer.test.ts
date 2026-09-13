@@ -582,13 +582,18 @@ vi.mock('@/worker/project-concurrency.js', () => ({
 // controller is registered/unregistered around the phase. Mocked at the boundary
 // so these tests drive the "was this cancelled?" answer without Redis.
 const isRunCancellationRequested = vi.fn<(runId: string) => Promise<boolean>>(async () => false);
-const clearRunCancellation = vi.fn(async (_runId: string) => {});
+// The clear also carries the run's identity since issue #913: a clear that actually
+// removes a pending marker is the audit record that the cancellation took effect.
+const clearRunCancellation = vi.fn(
+	async (_runId: string, _context: { action: string; projectId: string }) => {},
+);
 const getRunCancellationOrigin = vi.fn<(runId: string) => Promise<CancellationOrigin | null>>(
 	async () => null,
 );
 vi.mock('@/queue/cancellation.js', () => ({
 	isRunCancellationRequested: (runId: string) => isRunCancellationRequested(runId),
-	clearRunCancellation: (runId: string) => clearRunCancellation(runId),
+	clearRunCancellation: (runId: string, context: { action: string; projectId: string }) =>
+		clearRunCancellation(runId, context),
 	getRunCancellationOrigin: (runId: string) => getRunCancellationOrigin(runId),
 	RUN_CANCELLED_MESSAGE: 'Run cancelled after a cancellation request.',
 }));
@@ -3487,7 +3492,7 @@ describe('processJob', () => {
 
 		if (outcome.status !== 'phase-deferred') throw new Error('expected phase-deferred');
 		expect(outcome.runId).toBe('run-1');
-		expect(clearRunCancellation).not.toHaveBeenCalledWith('run-1');
+		expect(clearRunCancellation).not.toHaveBeenCalledWith('run-1', expect.anything());
 	});
 
 	it('fails a rate-limited phase once the retry budget is exhausted', async () => {
@@ -3692,7 +3697,12 @@ describe('processJob', () => {
 		expect(seenSignal).toBeInstanceOf(AbortSignal);
 		// Cleanup: the controller is unregistered and the flag cleared on settle.
 		expect(unregisterRunController).toHaveBeenCalledWith('run-1');
-		expect(clearRunCancellation).toHaveBeenCalledWith('run-1');
+		expect(clearRunCancellation).toHaveBeenCalledWith('run-1', {
+			action: 'run-settled',
+			projectId: 'swarm',
+			taskId: '17',
+			phase: 'review',
+		});
 	});
 
 	it('settles a marker-only cancellation as a terminal failure, not a deferral', async () => {

@@ -4550,11 +4550,20 @@ export async function processJob(
 		// its marker until `reenqueueDeferred` observes it: a dashboard termination
 		// can land after `deferred` is persisted but before the retry is queued.
 		// Terminal outcomes clear it so a stale request cannot terminate a later
-		// re-run that reuses this run id.
+		// re-run that reuses this run id. A clear that actually removes a pending
+		// marker is the audit record that the cancellation took effect (issue #913),
+		// which is why this hands over the run's identity rather than only its id.
 		detach();
 		if (runId) {
 			unregisterRunController(runId);
-			if (!preserveCancellationMarker) await clearRunCancellation(runId);
+			if (!preserveCancellationMarker) {
+				await clearRunCancellation(runId, {
+					action: 'run-settled',
+					projectId: project.id,
+					taskId: trigger.taskId,
+					phase: trigger.phase,
+				});
+			}
 		}
 		// Release the slot once the run settles (success, failure, or deferral) so
 		// a later legitimate dispatch for the same task — a genuine retry, or a
