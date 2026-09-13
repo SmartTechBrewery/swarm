@@ -36,9 +36,27 @@
  * the daemon to. The participant record has no such problem — the daemon already
  * runs a refresh timer for its checkout lock — so it shares that lock's TTL and is
  * kept alive from there.
+ *
+ * **Reclaiming a lapsed lock is guarded**, which is the one place the shape above is
+ * not enough. "Read the stale record, remove it, create our own" is three steps, and
+ * two daemons that both read the *same* stale record both pass the reclaim test: the
+ * second one's remove deletes the first one's freshly created claim, and both come
+ * away believing they hold the install root — the precise moment two `git checkout`s
+ * and two `npm ci`s would interleave. So the replacement runs inside the atomic
+ * takeover guard `./host-local-runtime.ts` uses one scope down, and re-reads the owner
+ * under it: the observation that sent a daemon there predates the guard, and only what
+ * it sees while holding it may be removed.
  */
 
-import { mkdirSync, readdirSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import {
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	renameSync,
+	rmSync,
+	unlinkSync,
+	writeFileSync,
+} from 'node:fs';
 import { hostname } from 'node:os';
 import { resolve } from 'node:path';
 import { z } from 'zod';
@@ -55,6 +73,15 @@ export const INSTALL_LOCK_TTL_MS = 15 * 60 * 1000;
 
 /** Refresh cadence — a third of the TTL, so two refreshes may be lost before it lapses. */
 export const INSTALL_LOCK_REFRESH_MS = Math.floor(INSTALL_LOCK_TTL_MS / 3);
+
+/**
+ * How long a takeover guard may stand before it is debris rather than a contender.
+ * Reclaiming is a handful of syscalls, so anything older is a daemon that died inside
+ * one — the same bound, for the same reason, as the guard in `./host-local-runtime.ts`.
+ * Without it the guard would be the one artifact with no recovery: every later
+ * acquirer refuses on sight of it and none may re-create it.
+ */
+export const INSTALL_TAKEOVER_GUARD_TTL_MS = 5 * 60 * 1000;
 
 /**
  * How long a participant record survives without a refresh. Stated as the checkout
@@ -123,6 +150,16 @@ const InstallLockOwnerSchema = z.object({
 	refreshedAt: z.string().datetime(),
 });
 export type InstallLockOwner = z.infer<typeof InstallLockOwnerSchema>;
+
+/**
+ * Written inside the takeover guard directory, so a guard left by a daemon that died
+ * mid-reclaim is told apart from one a live daemon is inside right now.
+ */
+const TakeoverGuardHolderSchema = z.object({
+	pid: z.number().int().positive(),
+	hostname: z.string().min(1),
+	createdAt: z.string().datetime(),
+});
 
 /**
  * Another daemon on this machine is already moving the install root. A distinct class
@@ -199,6 +236,10 @@ export function acquireInstallLock(
 	const stateDir = installUpdateStateDir(installRoot, options.homeDir);
 	const lockDir = resolve(stateDir, 'update-lock');
 	const ownerPath = resolve(lockDir, 'owner.json');
+	// A sibling of the lock rather than a child of it, because the whole point is to
+	// outlive the `rmSync` of `lockDir` that it is serializing.
+	const guardDir = resolve(stateDir, 'update-lock.takeover');
+	const guardHolderPath = resolve(guardDir, 'holder.json');
 
 	/** Whether a record left in `lockDir` belongs to this very process. */
 	function isOurs(current: InstallLockOwner | null | undefined): boolean {
@@ -247,6 +288,80 @@ export function acquireInstallLock(
 		return created;
 	}
 
+	/** Whoever the lock says owns it now, for a refusal that names someone. */
+	function held(): InstallHeldError {
+		return new InstallHeldError({
+			holder: readJson(ownerPath, InstallLockOwnerSchema) ?? undefined,
+			installRoot,
+			lockDir,
+		});
+	}
+
+	/**
+	 * Drop a takeover guard whose holder is provably gone, so a daemon that died inside
+	 * a reclaim wedges nothing: the next acquirer performs the recovery, with no sweeper
+	 * and no operator.
+	 */
+	function reapStaleGuard(): void {
+		if (!existsSync(guardDir)) return;
+		const holder = readJson(guardHolderPath, TakeoverGuardHolderSchema);
+		if (holder) {
+			// A guard bearing *our* pid is always debris: `reclaim()` is synchronous and
+			// removes its own before returning, so this process cannot be inside one.
+			const ours = holder.pid === pid && holder.hostname === host;
+			if (
+				!ours &&
+				isLive(holder.pid) &&
+				!isExpired(holder.createdAt, INSTALL_TAKEOVER_GUARD_TTL_MS, now())
+			)
+				return;
+		} else if (!pathOlderThan(guardDir, INSTALL_TAKEOVER_GUARD_TTL_MS, now())) {
+			// No readable holder yet: either a guard mid-creation — a live race we must not
+			// disturb — or a crash between the `mkdir` and the write. Only age tells them
+			// apart, so wait the window out before deciding.
+			return;
+		}
+		rmSync(guardDir, { recursive: true, force: true });
+	}
+
+	/**
+	 * Replace a lock whose owner is gone, holding the takeover guard across the whole
+	 * read-remove-create so no second reclaimer can delete the claim this one just made.
+	 * A daemon that cannot take the guard has lost to one that can, and is refused like
+	 * any other loser rather than proceeding on an observation that is already stale.
+	 */
+	function reclaim(): InstallLockOwner {
+		reapStaleGuard();
+		try {
+			mkdirSync(guardDir);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+			throw held();
+		}
+		try {
+			writeFileSync(
+				guardHolderPath,
+				`${JSON.stringify({ pid, hostname: host, createdAt: new Date(now()).toISOString() })}\n`,
+				{ encoding: 'utf8', flag: 'wx' },
+			);
+			// The re-read is the whole fix: the record judged reclaimable above was read
+			// before the guard existed, and the daemon that held the guard in between may
+			// have left a live claim of its own in its place.
+			const current = readJson(ownerPath, InstallLockOwnerSchema);
+			if (current && isOurs(current)) return current;
+			if (!reclaimable(current)) throw held();
+			rmSync(lockDir, { recursive: true, force: true });
+			const reclaimed = tryCreate();
+			if (reclaimed) return reclaimed;
+			// A daemon that found no lock at all slipped in between the two calls above and
+			// created one outright — it never needed the guard. It legitimately owns the
+			// install root now, so report it as the holder rather than as a race.
+			throw held();
+		} finally {
+			rmSync(guardDir, { recursive: true, force: true });
+		}
+	}
+
 	function acquire(): InstallLockOwner {
 		mkdirSync(stateDir, { recursive: true });
 		const created = tryCreate();
@@ -259,16 +374,7 @@ export function acquireInstallLock(
 		if (!reclaimable(current)) {
 			throw new InstallHeldError({ holder: current ?? undefined, installRoot, lockDir });
 		}
-		rmSync(lockDir, { recursive: true, force: true });
-		const reclaimed = tryCreate();
-		if (reclaimed) return reclaimed;
-		// A concurrent attempt won the re-create. It legitimately owns the install root
-		// now, so report it as the holder rather than as a race.
-		throw new InstallHeldError({
-			holder: readJson(ownerPath, InstallLockOwnerSchema) ?? undefined,
-			installRoot,
-			lockDir,
-		});
+		return reclaim();
 	}
 
 	let owner = acquire();

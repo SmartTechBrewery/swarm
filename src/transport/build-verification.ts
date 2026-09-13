@@ -170,9 +170,10 @@ async function performReturn(
 ): Promise<boolean> {
 	const outcome = await returnToLastKnownGood(options);
 	if (outcome.status === 'nothing-pending') {
-		// Reachable only if the record was cleared between the read above and this call,
-		// which on a single-daemon install root means an operator cleared it. Their answer
-		// wins: carry on rather than rebuilding the machine out from under them.
+		// Reachable when the record stopped naming this build between the read above and
+		// the lock the return takes: an operator cleared it, or — on a shared install root
+		// — a peer daemon landed a newer build of its own (issue #935). Either answer wins
+		// over this one: carry on rather than rebuilding the machine out from under it.
 		logger.warn('nothing left to return from — carrying on', { commit: pending.commit });
 		return false;
 	}

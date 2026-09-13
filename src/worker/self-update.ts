@@ -826,6 +826,12 @@ export function recordSuccessfulHandshake(options: InstallStateOptions = {}): st
  * recover, and blocking that on a peer's phase would leave it down for good. The
  * daemon that loses the lock stays down and says so; by its next start the winner has
  * cleared the record, so it simply starts on the good build.
+ *
+ * Everything it acts on is read *after* the lock is held, for the same reason: a peer
+ * that lands a newer build while this daemon queues leaves the pre-lock reading
+ * describing an install root that no longer exists. When the build awaiting proof is no
+ * longer the one this daemon set out to abandon, that is `nothing-pending` — someone
+ * else's newer build is not this one's to roll back.
  */
 export async function returnToLastKnownGood(
 	options: ReturnToLastKnownGoodOptions = {},
@@ -842,9 +848,11 @@ export async function returnToLastKnownGood(
 	};
 	let lock: InstallLock | undefined;
 	try {
-		const state = readState(stateDir);
-		if (!state?.pendingVerification) return { status: 'nothing-pending' };
-		const { lastKnownGood, pendingVerification } = state;
+		// A cheap look before the lock, so the ordinary start — nothing pending, which is
+		// every start on a machine that has not just been updated — costs no lock at all.
+		// It decides nothing: what it saw is re-read below, under the lock.
+		const observed = readState(stateDir)?.pendingVerification;
+		if (!observed) return { status: 'nothing-pending' };
 		try {
 			lock = await takeInstallLock(ctx);
 		} catch (error) {
@@ -858,6 +866,27 @@ export async function returnToLastKnownGood(
 				outputTail: '',
 			};
 		}
+		// Re-read now that the install root is ours (issue #935). On a shared one the wait
+		// above may have been spent behind a peer that applied a *newer* build and released
+		// inside the window: acting on the pre-lock read would then check out a
+		// `lastKnownGood` that build already superseded and overwrite its pending record,
+		// rolling a good build back and erasing the note that it still needs proving.
+		const state = readState(stateDir);
+		const pendingVerification = state?.pendingVerification;
+		if (!state || pendingVerification?.commit !== observed.commit) {
+			// The build this daemon set out to abandon is no longer the one being proved, so
+			// there is nothing here that this daemon is entitled to undo.
+			logger.warn(
+				'the build awaiting proof changed while this daemon waited for the install lock',
+				{
+					installRoot,
+					expectedCommit: observed.commit,
+					pendingCommit: pendingVerification?.commit ?? null,
+				},
+			);
+			return { status: 'nothing-pending' };
+		}
+		const { lastKnownGood } = state;
 		logger.warn('returning the SWARM install root to its last known good build', {
 			installRoot,
 			commit: lastKnownGood,

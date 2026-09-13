@@ -80,6 +80,11 @@ describe('install lock and participants (several daemons, one install root)', ()
 		return resolve(stateDir(), 'update-lock');
 	}
 
+	/** Where a reclaim in progress leaves its guard — a sibling of the lock it replaces. */
+	function guardDir(): string {
+		return resolve(stateDir(), 'update-lock.takeover');
+	}
+
 	function participantPath(pid: number): string {
 		return resolve(stateDir(), 'participants', `${pid}.json`);
 	}
@@ -200,6 +205,62 @@ describe('install lock and participants (several daemons, one install root)', ()
 			lock(5001);
 
 			expect(holder.refresh()).toBe(false);
+		});
+
+		it('lets only one of two daemons reclaim the same lapsed lock', () => {
+			// The lock a departed daemon left behind — the one record both contenders read.
+			lock(5003);
+			live.delete(5003);
+
+			// The interleaving, made deterministic. The liveness answer is the last thing a
+			// reclaim reads before it commits, so the peer runs its *whole* reclaim from
+			// inside this daemon's: this one then arrives at the removal holding an
+			// observation that is already obsolete, which is the state a bare
+			// read-remove-create would delete a live claim from.
+			let peer: InstallLock | undefined;
+			expect(() =>
+				acquireInstallLock(INSTALL_ROOT, {
+					...hostOptions(5002),
+					isPidLive: (candidate: number) => {
+						if (candidate === 5003 && !peer) peer = lock(5001);
+						return live.has(candidate);
+					},
+				}),
+			).toThrow(InstallHeldError);
+
+			// The daemon that won still holds it, rather than having had it deleted out from
+			// under it — and it can still prove that by refreshing.
+			expect(peer?.holder.pid).toBe(5001);
+			expect(readOwner().pid).toBe(5001);
+			expect(peer?.refresh()).toBe(true);
+		});
+
+		it('recovers a takeover guard left behind by a daemon that died reclaiming', () => {
+			lock(5002);
+			live.delete(5002);
+			mkdirSync(guardDir(), { recursive: true });
+			writeFileSync(
+				resolve(guardDir(), 'holder.json'),
+				JSON.stringify({ pid: 5003, hostname: HOST, createdAt: new Date(clock).toISOString() }),
+			);
+			live.delete(5003);
+
+			// The guard's holder is gone, so it protects nothing and must not wedge the
+			// install root against every future update.
+			expect(lock(5001).holder.pid).toBe(5001);
+			expect(existsSync(guardDir())).toBe(false);
+		});
+
+		it('refuses a daemon while another is inside a takeover, rather than racing it', () => {
+			lock(5002);
+			live.delete(5002);
+			mkdirSync(guardDir(), { recursive: true });
+			writeFileSync(
+				resolve(guardDir(), 'holder.json'),
+				JSON.stringify({ pid: 5003, hostname: HOST, createdAt: new Date(clock).toISOString() }),
+			);
+
+			expect(() => lock(5001)).toThrow(InstallHeldError);
 		});
 	});
 

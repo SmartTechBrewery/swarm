@@ -967,5 +967,54 @@ describe('applyUpdateTarget — a shared install root', () => {
 
 			expect((await returnToLastKnownGood(returnOptions(home, run))).status).toBe('returned');
 		});
+
+		it('leaves a newer build a peer landed while it waited for the lock alone', async () => {
+			const home = makeHome();
+			writePending(home);
+			writePeerLock(home);
+			const NEWER = 'c'.repeat(40);
+			const { run, calls } = scriptedRunner();
+
+			// The peer finishing, made deterministic: the lock reads its holder's liveness
+			// last, so its apply — a newer build, recorded and released — lands from inside
+			// that answer. This daemon takes the lock a moment later holding a reading of
+			// the install root that is no longer true of it.
+			const outcome = await returnToLastKnownGood({
+				...returnOptions(home, run),
+				host: {
+					hostname: TEST_HOST,
+					pid: OUR_PID,
+					isPidLive: (pid: number) => {
+						if (pid === PEER_PID) {
+							writeStoredState(home, {
+								lastKnownGood: HEAD,
+								target: BRANCH,
+								targetCommit: NEWER,
+								appliedAt: NOW_ISO,
+								pendingVerification: {
+									commit: NEWER,
+									previousCommit: TARGET_COMMIT,
+									failedStarts: 0,
+									startedAt: NOW_ISO,
+								},
+							});
+							rmSync(lockDir(home), { recursive: true, force: true });
+							return false;
+						}
+						return live.has(pid);
+					},
+				},
+			});
+
+			// Nothing of the peer's is this daemon's to undo: it never ran the build now
+			// being proved, so it neither checks the old commit back out...
+			expect(outcome).toEqual({ status: 'nothing-pending' });
+			expect(calls).toHaveLength(0);
+			// ...nor erases the record that says the peer's build still needs proving.
+			expect(readState(home)).toMatchObject({
+				targetCommit: NEWER,
+				pendingVerification: { commit: NEWER },
+			});
+		});
 	});
 });
