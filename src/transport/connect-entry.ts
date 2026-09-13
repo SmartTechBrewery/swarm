@@ -44,6 +44,15 @@
  * its agent CLIs' remaining allowance (`./quota-reporting.ts`, issue #825). No
  * other process can — a snapshot describes this host's installation and logins —
  * and it is best-effort, so a failed probe or report never touches a run.
+ *
+ * It also answers one thing asked *of* its machine rather than of a dispatch: a
+ * pushed request to move the SWARM install root to a build and restart into it
+ * (`./worker-update.ts`, issue #933). It acts only if this host opted in
+ * (`SWARM_WORKER_SELF_UPDATE`), only once it holds no in-flight phase, and on
+ * success takes the same graceful teardown a SIGTERM does before exiting 0 — so
+ * launchd `KeepAlive` / systemd `Restart=always` starts it again on the new build,
+ * whose identity reaches the control plane through the `build` field above. Every
+ * other outcome is reported and the daemon keeps taking work on the build it has.
  */
 
 import { readFileSync } from 'node:fs';
@@ -81,6 +90,7 @@ import {
 	type WorkerQuotaReportingHandle,
 } from './quota-reporting.js';
 import { connectWorkerTransport } from './worker-client.js';
+import { createWorkerUpdateHandler, selfUpdateEnabled } from './worker-update.js';
 
 // Tag every line this process emits so it stays distinguishable from the router
 // and the API server in a shared log stream (ai/ARCHITECTURE.md "Observability").
@@ -224,6 +234,28 @@ async function main(): Promise<void> {
 	// any in-flight agent CLI on a graceful stop before the session is released.
 	const inFlight = new Set<string>();
 	const shutdownSignal = new AbortController();
+	// Declared up here rather than beside the signal handlers below, because a
+	// self-update restart (issue #933) takes the same teardown and must not race a
+	// SIGTERM arriving mid-way through it.
+	let shuttingDown = false;
+	/**
+	 * The graceful teardown both exits share: release the session so the control plane
+	 * frees the lease promptly instead of waiting out the TTL, stop reporting this
+	 * host's quota, then drop the checkout lock — last, so a departing daemon never
+	 * hands the checkout to another worker while its own aborted agent may still be
+	 * writing there, and at all so an operator (or a supervisor restarting this
+	 * process) can re-acquire it immediately.
+	 */
+	const releaseSessionAndResources = async (): Promise<void> => {
+		shuttingDown = true;
+		shutdownSignal.abort();
+		try {
+			await client.stop();
+		} finally {
+			stopQuotaReporting();
+			releaseCheckoutLock();
+		}
+	};
 	// Declare *which phases* this daemon can execute, not just which CLIs it has
 	// (issue #467). Since issue #536 that is every phase, but the declaration is not
 	// therefore redundant: the control plane cannot infer a daemon's repertoire, and a
@@ -265,6 +297,20 @@ async function main(): Promise<void> {
 		// dashboard writes — the control plane pushes the frame instead. The sink is
 		// what lets the handler *answer* a cancel it cannot apply (issue #724).
 		onCancel: (cancel, sink) => handleTaskCancel(cancel, sink, logger),
+		// The one pushed frame that concerns this *machine* rather than a dispatch
+		// (issue #933): move the SWARM install root to a build and restart into it. The
+		// handler declines outright unless this host opted in, waits until `inFlight` is
+		// empty so no run is ever disturbed, and on a successful apply takes the same
+		// graceful teardown a SIGTERM does before exiting 0 for the supervisor to
+		// restart. Always wired, even with the opt-in off: a machine that will not act
+		// still owes the operator the reason.
+		onUpdate: createWorkerUpdateHandler({
+			controlPlaneUrl,
+			workerCredential: credential,
+			inFlight,
+			shutdownSignal: shutdownSignal.signal,
+			shutdown: releaseSessionAndResources,
+		}),
 		// The handshake is the only place this daemon learns which worker it
 		// authenticates as, so it is where the checkout lock stops naming a bare pid:
 		// a second daemon's refusal can then name the *worker* holding it (issue #689).
@@ -295,36 +341,26 @@ async function main(): Promise<void> {
 		// Explicitly null for the same reason, and the field an operator reads first when
 		// asking whether this daemon carries a fix (issue #918).
 		build: build ?? null,
+		// Whether this host will act on a pushed update at all (issue #933). Logged at
+		// startup because the alternative is discovering it from a `declined` report
+		// after an operator has already asked.
+		selfUpdate: selfUpdateEnabled(),
 	});
 
 	// Graceful shutdown: abort any in-flight agent CLI, then release the session
 	// via a normal WS close so the control plane frees the lease promptly instead
 	// of waiting out the TTL, then drop the checkout lock and exit.
-	let shuttingDown = false;
 	for (const signal of ['SIGTERM', 'SIGINT'] as const) {
 		process.on(signal, () => {
 			if (shuttingDown) return;
-			shuttingDown = true;
 			logger.info(`received ${signal} — releasing worker session and exiting`);
-			shutdownSignal.abort();
-			void client
-				.stop()
-				.then(
-					() => 0,
-					(err) => {
-						logger.error('worker transport shutdown failed', { error: describeError(err) });
-						return 1;
-					},
-				)
-				.then((code) => {
-					// The checkout goes last: a departing daemon must not hand it to another
-					// worker while its own aborted agent may still be writing there. Releasing
-					// it at all is what lets an operator restart immediately rather than wait
-					// for the next daemon's liveness check.
-					stopQuotaReporting();
-					releaseCheckoutLock();
-					process.exit(code);
-				});
+			void releaseSessionAndResources().then(
+				() => process.exit(0),
+				(err) => {
+					logger.error('worker transport shutdown failed', { error: describeError(err) });
+					process.exit(1);
+				},
+			);
 		});
 	}
 

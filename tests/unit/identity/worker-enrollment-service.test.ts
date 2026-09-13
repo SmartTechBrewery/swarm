@@ -117,6 +117,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		repository: null,
 		// In the pool (issue #919) — every case here that says nothing about draining.
 		drainingSince: null,
+		update: null,
 		build: null,
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		updatedAt: new Date('2026-01-01T00:00:00Z'),
@@ -791,6 +792,9 @@ describe('listDashboardWorkers (issue #133)', () => {
 				'repository',
 				'build',
 				'buildIsCurrent',
+				// Non-secret in exactly the same way (issue #933): the ref an operator asked
+				// this machine to move to, and the machine's own words about what happened.
+				'update',
 				'supportedPhases',
 				'workerId',
 			].sort(),

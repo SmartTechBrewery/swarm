@@ -73,6 +73,7 @@ import {
 	TRANSPORT_PROTOCOL_VERSION,
 	type WorkerHealth,
 	type WorkerStreamMessage,
+	type WorkerUpdate,
 	WS_CLOSE,
 } from './protocol.js';
 
@@ -825,6 +826,18 @@ export interface WorkerTransportOptions {
 	 */
 	onCancel?: (cancel: TaskCancel, sink: AssignmentSink) => void;
 	/**
+	 * Called when the control plane pushes a `worker-update` frame (issue #933) —
+	 * an operator asking this *machine* to move its SWARM install root to a build and
+	 * restart into it. The only frame here that concerns no dispatch, so it is handed
+	 * no {@link AssignmentSink}: its answer goes up a delivery route rather than the
+	 * back-channel (`./worker-update.ts`).
+	 *
+	 * The handler decides whether to act at all — the machine must have opted in — and
+	 * when, since it must hold no in-flight phase. Left undefined the frame is logged
+	 * and ignored, which is exactly how a daemon predating the frame behaves.
+	 */
+	onUpdate?: (update: WorkerUpdate) => void;
+	/**
 	 * Called with each established session, before the stream opens — the only place
 	 * a daemon learns the `workerId` it authenticates as, since the credential does
 	 * not carry it (issue #689: the checkout lock records it so a second daemon's
@@ -1156,10 +1169,11 @@ function notifySession(
 }
 
 /**
- * Route the cloud→worker *work* frames — a pushed `TaskAssignment` (ADR-003 §2)
- * and the `TaskCancel` that stops one (issue #549) — to the executor's handlers.
- * Both handlers are optional, because a session-only client keeps its lease live
- * and runs nothing: an unhandled frame is logged and ignored, never an error.
+ * Route the cloud→worker *work* frames — a pushed `TaskAssignment` (ADR-003 §2),
+ * the `TaskCancel` that stops one (issue #549), and the `WorkerUpdate` that asks
+ * this machine to move to a build (issue #933) — to the executor's handlers. Every
+ * handler is optional, because a session-only client keeps its lease live and runs
+ * nothing: an unhandled frame is logged and ignored, never an error.
  * `heartbeat-ack` falls through with no action.
  *
  * Either frame is answered from the undelivered queue first when this daemon still
@@ -1225,6 +1239,19 @@ function routeWorkFrame(
 			return;
 		}
 		options.onCancel(frame, sink);
+		return;
+	}
+	if (frame.type === 'worker-update') {
+		// Nothing is consulted from the undelivered queue here, unlike the two frames
+		// above: this one names no dispatch, so there is no held result it could be the
+		// answer to (issue #933).
+		if (!options.onUpdate) {
+			logger.info('ignoring worker-update — this client applies no updates', {
+				requestId: frame.requestId,
+			});
+			return;
+		}
+		options.onUpdate(frame);
 	}
 }
 

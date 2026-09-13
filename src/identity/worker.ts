@@ -29,7 +29,11 @@
 
 import { z } from 'zod';
 import { type AgentCli, AgentCliSchema } from '../harness/agent-cli.js';
-import { WorkerBuildSchema } from '../lib/build-identity.js';
+import {
+	WorkerBuildSchema,
+	WorkerUpdateStatusSchema,
+	WorkerUpdateTargetSchema,
+} from '../lib/build-identity.js';
 import { RepoSlugSchema } from '../scm/repo-slug.js';
 import { ALL_TRIGGER_PHASES, type TriggerPhase, TriggerPhaseSchema } from '../triggers/types.js';
 
@@ -78,6 +82,31 @@ export const DEFAULT_WORKER_SUPPORTED_PHASES: readonly TriggerPhase[] = ALL_TRIG
 export const WorkerDisplayNameSchema = z.string().trim().min(1).max(80);
 
 /**
+ * The self-update an operator asked a machine for, and what came of it (issue
+ * #933) — one value rather than six loose fields, so a consumer cannot read an
+ * outcome without the target it concerns, the same reason `build` travels as a
+ * pair.
+ *
+ * `requestId` is the pending marker: non-null means a push is still owed an answer,
+ * `null` that the machine has reported (or that the request was superseded by a
+ * later one). `target` is always the build the request named and the outcome
+ * concerns; `status`/`message`/`reportedAt` are `null` until one is reported.
+ *
+ * The whole value is `null` on `Worker.update` when nobody has ever asked this
+ * machine to update — which, like `drainingSince`, is what every row says until an
+ * operator acts.
+ */
+export const WorkerUpdateStateSchema = z.object({
+	requestId: z.string().uuid().nullable(),
+	target: WorkerUpdateTargetSchema,
+	requestedAt: z.date(),
+	status: WorkerUpdateStatusSchema.nullable(),
+	message: z.string().nullable(),
+	reportedAt: z.date().nullable(),
+});
+export type WorkerUpdateState = z.infer<typeof WorkerUpdateStateSchema>;
+
+/**
  * A registered worker. `ownerUserId` is a `users.id` (`uuid`, the SWARM user who
  * operates the machine); `displayName` is its human-facing label, unique per
  * owner (`src/db/schema/workers.ts`); `capabilities` is the set of agent
@@ -119,6 +148,14 @@ export const WorkerDisplayNameSchema = z.string().trim().min(1).max(80);
  * exactly as the other declarations are — it guards against operator error (a stale
  * daemon), not against an attacker.
  *
+ * `update` (issue #933) is the second field that is the *operator's* statement
+ * rather than the daemon's, and it is the request half of what `build` reports: the
+ * build this machine was asked to move to, whether that request is still awaiting an
+ * answer, and the outcome the machine last reported. `null` until somebody asks. The
+ * handshake never rewrites it, exactly as it never rewrites `drainingSince` — a
+ * machine restarting into the requested build re-declares `build`, and that is how
+ * the control plane learns the move actually happened.
+ *
  * The CLI axis is **three** fields since issue #783, because the one field used to
  * collapse two facts that overwrite each other. `probedCapabilities` is the raw
  * `workers.capabilities` column — what the daemon currently operating the row last
@@ -154,6 +191,15 @@ export const WorkerSchema = z.object({
 	 */
 	drainingSince: z.date().nullable(),
 	build: WorkerBuildSchema.nullable(),
+	/**
+	 * The self-update an operator asked this machine for and what came of it (issue
+	 * #933), or `null` while nobody has asked. Like `drainingSince` it is the
+	 * operator's statement rather than the daemon's — the handshake never rewrites it
+	 * — and the machine's answer is reported on its own route, never re-declared on
+	 * connect. What a restarted machine *does* re-declare is `build` above, which is
+	 * how the control plane sees the new build arrive.
+	 */
+	update: WorkerUpdateStateSchema.nullable(),
 	createdAt: z.date(),
 	updatedAt: z.date(),
 });

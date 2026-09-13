@@ -88,7 +88,7 @@ import { resolveOwnBuildIdentity, type WorkerBuild } from '../lib/build-identity
 import { logger } from '../lib/logger.js';
 import { normalizeRepoSlug, repoSlugsMatch } from '../scm/repo-slug.js';
 import type { TriggerPhase } from '../triggers/types.js';
-import type { Worker } from './worker.js';
+import type { Worker, WorkerUpdateState } from './worker.js';
 import type { WorkerAvailability } from './worker-eligibility.js';
 import {
 	AllowedClisNotCapableError,
@@ -188,6 +188,14 @@ export interface OwnerWorkerView {
 	 * work is given, `runState.busy` whether the old work has finished.
 	 */
 	drainingSince: Date | null;
+	/**
+	 * The self-update this machine was last asked for and what came of it (issue
+	 * #933), or `null` while nobody has asked. Surfaced beside `drainingSince` for the
+	 * same reason it sits beside it on the row: draining is the precondition for
+	 * asking, and a request still awaiting an answer (`requestId` non-null) is the
+	 * other half of "why is this machine idle?".
+	 */
+	update: WorkerUpdateState | null;
 	runState: WorkerRunState;
 	enrollments: OwnerEnrollmentView[];
 }
@@ -382,6 +390,7 @@ export async function listOwnerWorkers(ownerUserId: string): Promise<OwnerWorker
 			displayName: worker.displayName,
 			capabilities: worker.capabilities,
 			drainingSince: worker.drainingSince,
+			update: worker.update,
 			runState,
 			enrollments: enrollments.map(assembleOwnerEnrollmentView),
 		});
@@ -502,6 +511,17 @@ export interface DashboardWorkerView {
 	 * differ.
 	 */
 	buildIsCurrent: boolean | null;
+	/**
+	 * The self-update this machine was last asked for and what came of it (issue
+	 * #933), or `null` while nobody has asked. Read alongside `build` above, which is
+	 * the *answer* to an applied one: the machine re-declares its build on the
+	 * handshake it makes after restarting, so a request that says `applied` and a
+	 * `build` that has moved are the same event seen from the two ends.
+	 *
+	 * Non-secret like every other field here: a ref, a status, and the machine's own
+	 * operator-facing prose about what happened.
+	 */
+	update: WorkerUpdateState | null;
 	connection: WorkerConnectionState;
 	/** When the worker was last heard from, or `null` if it never connected. */
 	lastSeenAt: Date | null;
@@ -772,6 +792,7 @@ async function assembleDashboardWorker(
 		drainingSince: worker.drainingSince,
 		build: worker.build,
 		buildIsCurrent: buildMatchesControlPlane(worker.build, controlPlaneBuild),
+		update: worker.update,
 		connection: liveSession ? 'online' : 'offline',
 		lastSeenAt: lastSeenSession?.lastHeartbeatAt ?? null,
 		currentRun: await resolveVisibleRun(worker.id, liveSession?.currentRunId ?? null, accessible),

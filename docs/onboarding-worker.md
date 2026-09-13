@@ -381,6 +381,62 @@ to expire after `heartbeatTtlMs`.
 
 ---
 
+## Optional — let the control plane update this machine (issue #933)
+
+A machine can be asked, from the control plane, to move its SWARM **install root**
+to a build and restart into it, instead of an operator going to every host and
+pulling by hand:
+
+```bash
+swarm workers drain <worker-id>            # required first — see below
+swarm workers update <worker-id> main      # a branch, a tag, or a commit id
+swarm workers list                         # read what it reported
+swarm workers undrain <worker-id>          # put it back in the pool
+```
+
+**It is off unless this host opts in.** Set `SWARM_WORKER_SELF_UPDATE=true` in the
+same `.env` the daemon already reads and restart it; with the flag off the machine
+reports `declined` to any such request and carries on working, which is what every
+existing machine keeps doing. Two things have to be true of the host before you set
+it:
+
+- **A process supervisor must be restarting the daemon.** On a successful update the
+  daemon releases its session and exits 0; launchd `KeepAlive`
+  ([`swarm-worker-agent`](./launchd-worker-autostart.md)) or systemd
+  `Restart=always` is what brings it back on the new build. Without one, the machine
+  simply stops.
+- **The install root must not be shared with another daemon.** That root is the SWARM
+  checkout this daemon's *own code* is loaded from — not `SWARM_WORKER_REPO_ROOT`,
+  which is the project checkout it works in. A host that runs several daemons from
+  one npm-linked SWARM checkout shares it between them, and an update would swap the
+  code under the others mid-phase. **Until the shared-install lock lands (issue #920
+  phase 4), such a host must not set the flag.** One daemon per install root is the
+  supported configuration for this feature.
+
+**Why the drain is required.** `swarm workers update` is refused unless the machine
+is already out of the dispatch pool, and names the drain as the remedy. The daemon
+waits for the phases it is already running to finish before it applies anything — no
+run is cancelled, deferred, or failed by an update — and draining is what stops new
+work arriving into that wait. Undraining is a separate step afterwards, on purpose:
+the machine stays out of the pool until you have read what it reported.
+
+**The rollout order is the same one the #765 note above states, for the same reason:
+control plane first, workers after.** An older control plane does not serve the
+report route, so a newer daemon's outcome reaches a 404 and is lost (the daemon
+itself survives and keeps working); an older daemon does not recognise the pushed
+frame and ignores it, so the request sits pending until that machine is upgraded by
+hand. Deploy the router and API server, then the workers.
+
+**What "it worked" looks like.** `swarm workers list` marks the machine
+`update <ref> pending` while the request is outstanding and `update <ref> <outcome>`
+once it has answered — `applied`, `already-current`, `declined`, `refused`, or
+`failed`, the last two carrying the machine's own words about why. Anything but
+`applied` leaves the machine working on the build it already had. After an `applied`
+restart the machine re-declares its build at handshake, so the `/workers` screen's
+build column is the independent confirmation that the new code is what is running.
+
+---
+
 ## Verify from the admin side
 
 - **Dashboard** — the new worker appears under `/workers`, and its detail page
@@ -414,6 +470,10 @@ to expire after `heartbeatTtlMs`.
 | Every dispatch to this worker fails at once with `No operator SCM credential stored for worker '<name>' … on provider '<id>'` | Part 1, step 5 was never run for that provider (issue #765). Run `swarm workers set-scm-credential <worker-id> <provider>`, or set it as the worker's owner at `/workers/<worker-id>` → **Operator source-control credential** (issue #766) — either takes effect on the next dispatch, with no worker restart. |
 | A run fails with `this worker's stored operator credential for provider '<id>' did not authenticate` | The stored credential was revoked or expired. Rotate it with the same command; the provider's own message is appended as the cause. |
 | A run fails with `this assignment carried no operator SCM credential` | The router predates issue #765 while the worker does not. Deploy the router (see the rollout order in Part 2). |
+| `swarm workers update` is refused with "still in the dispatch pool" | The machine has to be drained first (issue #933) — it would otherwise be given new work while it waits to restart. Run `swarm workers drain <worker-id>`, then request the update again, and `swarm workers undrain <worker-id>` once it has reported. |
+| `swarm workers list` shows `update <ref> declined` | That host has not opted in. Set `SWARM_WORKER_SELF_UPDATE=true` in its `.env` and restart the daemon — but only if its SWARM install root is not shared with another daemon (see "Optional — let the control plane update this machine"). |
+| `swarm workers list` shows `update <ref> failed` | The install root could not be moved. The message beside it names the step (`git checkout`, `npm ci`, `npm run build`) and whether the checkout was returned to the build it was on; a failure that could **not** be rolled back leaves the machine on neither build and needs an operator on that host. |
+| A requested update never reports anything | Nothing pushed it: the machine has no socket on the router. It is re-stated automatically the next time that daemon connects, so start it (or wait for the supervisor to), and re-read `swarm workers list`. |
 | Worker never appears as connected / dispatches stay pending | Enrollment isn't both `active` and `sharing_consent=true` (Part 1, steps 4 and 4b), or the worker process on the new machine isn't actually running / crashed on startup — check its terminal for the two success lines above. |
 | An enrollment went `suspended` on its own, right after the machine first connected | The machine declared a checkout of a different repository than the project's, so the control plane suspended the pairing (issue #690). `/workers/<id>` names both repositories on that enrollment block. Point `SWARM_WORKER_REPO_ROOT` at a checkout of the project's repository (or enroll the machine in the project that matches it), then have a project administrator re-activate the enrollment — a matching declaration never re-activates it by itself. |
 | `swarm workers enroll` exits 1 saying the worker's checkout is a different repository | Same mismatch, caught on the write path instead (issue #690) — the message names the machine's checkout and the project's repository. Enroll a worker whose checkout is that repository, or re-point this one. |

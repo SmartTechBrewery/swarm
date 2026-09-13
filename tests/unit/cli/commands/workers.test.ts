@@ -167,6 +167,14 @@ describe('swarm workers', () => {
 			busy: false,
 			currentRunId: null,
 		}));
+		answers.set('workers.requestUpdate', (input) => ({
+			workerId: input.workerId,
+			displayName: 'ada-laptop',
+			requestId: '66666666-6666-4666-8666-666666666666',
+			target: input.target,
+			requestedAt: '2026-09-13T10:05:00.000Z',
+			drainingSince: '2026-09-13T10:00:00.000Z',
+		}));
 		enrollmentRow = {
 			id: ENROLLMENT_ID,
 			status: 'pending',
@@ -811,6 +819,49 @@ describe('swarm workers', () => {
 			expect(printed.find((line) => line.includes('grace-desktop'))).not.toContain('draining');
 		});
 
+		// Issue #933: a machine that declined or failed an update carries on looking
+		// entirely normal, so the outcome has to be on the line or an operator never
+		// sees it; a request nobody has answered is the other half.
+		it('marks a pending update and a reported outcome', async () => {
+			answers.set('workers.list', () => [
+				{
+					workerId: WORKER_ID,
+					displayName: 'ada-laptop',
+					capabilities: ['claude'],
+					drainingSince: '2026-09-13T10:00:00.000Z',
+					update: {
+						requestId: '66666666-6666-4666-8666-666666666666',
+						target: 'main',
+						status: null,
+					},
+					owner: { identifier: IDENTIFIER },
+				},
+				{
+					workerId: '22222222-2222-4222-8222-222222222222',
+					displayName: 'grace-desktop',
+					capabilities: ['claude'],
+					drainingSince: null,
+					update: { requestId: null, target: 'v2', status: 'declined' },
+					owner: { identifier: 'grace@example.com' },
+				},
+				{
+					workerId: '33333333-3333-4333-8333-333333333333',
+					displayName: 'never-asked',
+					capabilities: ['claude'],
+					drainingSince: null,
+					owner: { identifier: 'lin@example.com' },
+				},
+			]);
+			expect(await run(['list'])).toBe(0);
+			const printed = lines();
+
+			expect(printed.find((line) => line.includes('ada-laptop'))).toContain('update main pending');
+			expect(printed.find((line) => line.includes('grace-desktop'))).toContain(
+				'update v2 declined',
+			);
+			expect(printed.find((line) => line.includes('never-asked'))).not.toContain('update');
+		});
+
 		it('reports an owner with no visible workers rather than failing', async () => {
 			const log = vi.spyOn(console, 'log');
 			expect(await run(['list', 'nobody@example.com'])).toBe(0);
@@ -1041,6 +1092,63 @@ describe('swarm workers', () => {
 			const error = vi.spyOn(console, 'error');
 			expect(await run(['drain', WORKER_ID])).toBe(1);
 			expect(error).toHaveBeenCalledWith(expect.stringContaining('not found'));
+		});
+	});
+
+	// Issue #933. The operator front door onto worker self-update: one mutation, and
+	// a printed acknowledgement that is careful not to read as an outcome — the
+	// machine may be offline, and even connected it waits to go idle first.
+	describe('update', () => {
+		it('requires a worker id and a ref', async () => {
+			const error = vi.spyOn(console, 'error');
+			expect(await run(['update', WORKER_ID])).toBe(1);
+			expect(error).toHaveBeenCalledWith(
+				expect.stringContaining('<worker-id> and a <ref> are required'),
+			);
+			expect(pathsCalled()).toEqual([]);
+		});
+
+		it('rejects a non-uuid worker id before calling', async () => {
+			const error = vi.spyOn(console, 'error');
+			expect(await run(['update', 'ada-laptop', 'main'])).toBe(1);
+			expect(error).toHaveBeenCalledWith(expect.stringContaining("no worker with id 'ada-laptop'"));
+			expect(pathsCalled()).toEqual([]);
+		});
+
+		it('sends the worker id and target, and acknowledges the request', async () => {
+			const log = vi.spyOn(console, 'log');
+			expect(await run(['update', WORKER_ID, 'main'])).toBe(0);
+			expect(inputFor('workers.requestUpdate')).toEqual({ workerId: WORKER_ID, target: 'main' });
+			expect(log).toHaveBeenCalledWith(expect.stringContaining("to move to 'main' and restart"));
+		});
+
+		// Both of the things an operator has to know next, because neither is visible
+		// from the acknowledgement itself: the host-side opt-in, and that the drain the
+		// mutation required is still in force afterwards.
+		it('names the opt-in flag and the undrain that follows', async () => {
+			expect(await run(['update', WORKER_ID, 'main'])).toBe(0);
+			const printed = lines().join('\n');
+			expect(printed).toContain('SWARM_WORKER_SELF_UPDATE=true');
+			expect(printed).toContain(`swarm workers undrain ${WORKER_ID}`);
+		});
+
+		// Both refusals are the control plane's own words, printed verbatim rather than
+		// re-derived here — otherwise the two grammars drift.
+		it('surfaces the not-draining refusal as the control plane words it', async () => {
+			refuse(
+				'workers.requestUpdate',
+				`Worker 'ada-laptop' is still in the dispatch pool. Run \`swarm workers drain ${WORKER_ID}\` first.`,
+			);
+			const error = vi.spyOn(console, 'error');
+			expect(await run(['update', WORKER_ID, 'main'])).toBe(1);
+			expect(error).toHaveBeenCalledWith(expect.stringContaining('swarm workers drain'));
+		});
+
+		it('surfaces a malformed target as the control plane words it', async () => {
+			refuse('workers.requestUpdate', 'must be a branch name, tag, or commit id');
+			const error = vi.spyOn(console, 'error');
+			expect(await run(['update', WORKER_ID, 'https://example.com/evil.git'])).toBe(1);
+			expect(error).toHaveBeenCalledWith(expect.stringContaining('branch name, tag, or commit id'));
 		});
 	});
 

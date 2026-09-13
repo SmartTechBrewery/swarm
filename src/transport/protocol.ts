@@ -31,7 +31,11 @@ import {
 	WorkerSessionInstanceIdSchema,
 	WorkerSessionReclaimSchema,
 } from '../identity/worker-session.js';
-import { WorkerBuildSchema } from '../lib/build-identity.js';
+import {
+	WorkerBuildSchema,
+	WorkerUpdateStatusSchema,
+	WorkerUpdateTargetSchema,
+} from '../lib/build-identity.js';
 import { CheckpointSchema } from '../pipeline/checkpoint.js';
 import { RecoveryIntentSchema } from '../queue/jobs.js';
 import { RepoSlugSchema } from '../scm/repo-slug.js';
@@ -428,6 +432,45 @@ export const TaskCancelSchema = z.object({
 export type TaskCancel = z.infer<typeof TaskCancelSchema>;
 
 /**
+ * Cloud→worker control frame asking a machine to move its SWARM **install root**
+ * to a build and restart into it (issue #933). The transport half of
+ * `workers.requestUpdate` (`../api/routers/workers.ts`), which records the request
+ * on the worker row and publishes it; the router turns that notification into this
+ * push, addressed to the worker the operator named
+ * (`../router/worker-update-dispatch.ts`).
+ *
+ * **The frame carries a target ref and nothing else that could act.** No command,
+ * no script, no URL, no path, no git option — `target` is
+ * {@link WorkerUpdateTargetSchema} (`../lib/build-identity.ts`), the *shared*
+ * definition rather than a re-declaration, so the grammar that makes it data
+ * instead of an instruction is the same one the daemon re-validates against before
+ * it runs anything (`../worker/self-update.ts`). A code-distribution channel is
+ * exactly the wrong place for the wire to widen quietly, which is why this schema
+ * imports rather than restates, the move `build` and `repository` already make.
+ *
+ * `requestId` is what the report comes back on
+ * ({@link ReportWorkerUpdateDeliveryRequestSchema}): the row keeps it while the
+ * request is outstanding, so a report for a *superseded* request — an operator
+ * re-targeted the machine while the first push was in flight — is recorded as
+ * history rather than mistaken for the answer to the request now pending. It is
+ * also how the daemon recognises the re-push it gets on reconnect as the request it
+ * is already working on.
+ *
+ * Additive, so `TRANSPORT_PROTOCOL_VERSION` is deliberately **not** bumped, on
+ * {@link TaskCancelSchema}'s exact reasoning: a daemon that predates the frame does
+ * not recognise it, and an unrecognised control frame is a logged no-op there
+ * rather than a closed socket (`./worker-client.ts`). A version skew therefore
+ * costs only this feature — the machine keeps taking work on the build it has —
+ * whereas a bump would reject every frame from an already-deployed worker.
+ */
+export const WorkerUpdateSchema = z.object({
+	type: z.literal('worker-update'),
+	requestId: z.string().uuid(),
+	target: WorkerUpdateTargetSchema,
+});
+export type WorkerUpdate = z.infer<typeof WorkerUpdateSchema>;
+
+/**
  * One captured agent-output line, the transport mirror of a `run_output_events`
  * row (`../worker/live-output.ts`): the `stream` it came from, its `content`
  * (newline-terminated, as the batcher stores it), and the ISO-8601 instant it
@@ -644,12 +687,18 @@ export type WorkerStreamMessage = z.infer<typeof WorkerStreamMessageSchema>;
  * the `TaskCancel` that stops one it already pushed. The back-channel frames they
  * pair with — `TaskExecutionResult`/`StreamLog`/`TaskProgress`/`TaskAssignmentAck`
  * on the worker→cloud union above — settle the dispatch on the control plane.
+ *
+ * `WorkerUpdate` is the one member that concerns no dispatch at all (issue #933):
+ * it asks the *machine* to move to a build. Its answer takes an HTTP delivery
+ * route rather than a member of the worker→cloud union above — see
+ * {@link ReportWorkerUpdateDeliveryRequestSchema} for why.
  */
 export const ControlPlaneMessageSchema = z.discriminatedUnion('type', [
 	HeartbeatAckSchema,
 	DisconnectSchema,
 	TaskAssignmentSchema,
 	TaskCancelSchema,
+	WorkerUpdateSchema,
 ]);
 export type ControlPlaneMessage = z.infer<typeof ControlPlaneMessageSchema>;
 
@@ -1223,3 +1272,65 @@ export const ReportCliQuotaDeliveryResponseSchema = z.object({
 	stored: z.number().int().nonnegative(),
 });
 export type ReportCliQuotaDeliveryResponse = z.infer<typeof ReportCliQuotaDeliveryResponseSchema>;
+
+/**
+ * Worker **self-update report** frame (issue #933) — what became of the
+ * {@link WorkerUpdateSchema} the control plane pushed, written back onto the
+ * `workers` row so an operator can read the answer where they made the request.
+ *
+ * Like the quota frame it names **no worker**: identity comes from the credential
+ * the request authenticates with, so a daemon can only ever report on itself. It
+ * fronts neither a credential nor a provider — what stays server-side is the
+ * **database** a DB-free worker holds no `DATABASE_URL` for.
+ *
+ * An HTTP request/response frame rather than a member of
+ * {@link WorkerStreamMessageSchema}, for the reason the quota frame states
+ * verbatim: `handleWorkerStreamFrame` closes the socket with
+ * `WS_CLOSE.MALFORMED_FRAME` on a frame it cannot parse, so a newer worker against
+ * an older router would put itself into a reconnect loop — where an unserved
+ * *route* is a 404 the client explains in one line and the daemon survives
+ * (`./delivery-client.ts`). That matters more here than anywhere else: this
+ * feature's whole rollout is control plane first, workers after, so a daemon that
+ * has just restarted into a newer build talking to an older router is the expected
+ * skew, not the exotic one. `TRANSPORT_PROTOCOL_VERSION` is therefore deliberately
+ * **not** bumped.
+ *
+ * `status` and `target` are the shared definitions (`../lib/build-identity.ts`),
+ * never re-declared. `message` is operator-facing prose — the refusal's reason, the
+ * failed step and whether the install root was rolled back — and carries no secret:
+ * `applyUpdateTarget` composes it from a target, a commit id, and a path it already
+ * logs.
+ */
+export const ReportWorkerUpdateDeliveryRequestSchema = z.object({
+	/** The request this answers ({@link WorkerUpdateSchema}). */
+	requestId: z.string().uuid(),
+	/** Echoed so the recorded outcome names the build it concerned, never a later one. */
+	target: WorkerUpdateTargetSchema,
+	status: WorkerUpdateStatusSchema,
+	/**
+	 * Bounded on the wire because it can carry a failed step's own words. The daemon
+	 * already truncates the failing command's output tail before composing this
+	 * (`../worker/self-update.ts`); the cap is the wire refusing to be a log sink.
+	 */
+	message: z.string().min(1).max(4000),
+	protocolVersion: z.number().int(),
+});
+export type ReportWorkerUpdateDeliveryRequest = z.infer<
+	typeof ReportWorkerUpdateDeliveryRequestSchema
+>;
+
+/**
+ * `POST /worker/delivery/update-report` success body — whether this report closed
+ * the request that is actually pending.
+ *
+ * `false` is not an error and never a refusal: the outcome is recorded either way.
+ * It says the row has since moved on — an operator re-targeted the machine, or this
+ * is a duplicate of a report already recorded — so the pending request was left
+ * standing for the push that will answer it.
+ */
+export const ReportWorkerUpdateDeliveryResponseSchema = z.object({
+	recorded: z.boolean(),
+});
+export type ReportWorkerUpdateDeliveryResponse = z.infer<
+	typeof ReportWorkerUpdateDeliveryResponseSchema
+>;

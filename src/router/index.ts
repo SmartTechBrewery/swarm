@@ -31,6 +31,7 @@ import { registerOperatorSession } from './operator-session.js';
 import { createWebhookApp } from './webhook-receiver.js';
 import { registerWorkerDelivery } from './worker-delivery.js';
 import { registerWorkerTransport } from './worker-transport.js';
+import { subscribeWorkerUpdateDispatch } from './worker-update-dispatch.js';
 
 // Tag every line this process emits so router and worker logs stay
 // distinguishable in a shared stream (ai/ARCHITECTURE.md "Observability").
@@ -69,6 +70,14 @@ const server = serve({ fetch: app.fetch, port }, () => {
 	logger.debug('swarm-router: listening', { port });
 });
 injectWebSocket(server);
+
+// Deliver operator-requested worker self-updates to the machine they name (issue
+// #933). This process is the one holding worker sockets, so the API server records
+// the request and publishes it and the push happens here. Subscribed beside the
+// transport rather than inside the dispatch consumer, because an update concerns the
+// *machine* rather than any dispatch — a router serving sockets must deliver it
+// whatever the consumer is doing.
+const workerUpdates = subscribeWorkerUpdateDispatch();
 
 // Control-plane dispatch (ADR-003 §2): host the BullMQ consumer + eligibility
 // gate here and push assignments to connected workers. There is no alternative
@@ -109,6 +118,11 @@ for (const signal of ['SIGTERM', 'SIGINT'] as const) {
 					await dispatchConsumer?.close();
 				} catch (err) {
 					logger.error('Dispatch consumer close failed', { error: describeError(err) });
+				}
+				try {
+					await workerUpdates.close();
+				} catch (err) {
+					logger.error('Worker-update subscriber close failed', { error: describeError(err) });
 				}
 				try {
 					await closeQueue();

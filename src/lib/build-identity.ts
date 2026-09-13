@@ -98,6 +98,33 @@ export const WorkerUpdateTargetSchema = z
 export type WorkerUpdateTarget = z.infer<typeof WorkerUpdateTargetSchema>;
 
 /**
+ * What became of a requested update, in the one vocabulary the daemon reports in,
+ * the `workers` row records, and the operator surfaces read (issue #933).
+ *
+ * The first four map onto `UpdateOutcome`'s members (`../worker/self-update.ts`),
+ * which is a plain union rather than a schema because nothing sent it anywhere; it
+ * cannot be the source of truth *here* either, since that module reaches for
+ * `node:fs` and `node:child_process` and this vocabulary has to be readable by the
+ * control plane, the wire, and the database. `declined` is the fifth and is the
+ * daemon's alone: the machine never opted in (`SWARM_WORKER_SELF_UPDATE`), so
+ * nothing was attempted and nothing could have been.
+ *
+ * It lives beside {@link WorkerUpdateTargetSchema} for the same reason that one
+ * lives beside {@link WorkerBuildSchema}: one names the build a machine is asked
+ * for, one what came of asking, and every consumer must import the definition
+ * rather than re-declare its own.
+ */
+export const WORKER_UPDATE_STATUSES = [
+	'applied',
+	'already-current',
+	'refused',
+	'failed',
+	'declined',
+] as const;
+export const WorkerUpdateStatusSchema = z.enum(WORKER_UPDATE_STATUSES);
+export type WorkerUpdateStatus = z.infer<typeof WorkerUpdateStatusSchema>;
+
+/**
  * The root of the SWARM install this module belongs to — `import.meta.url` two
  * levels up (`src/lib/` → the checkout, `dist/lib/` → the same checkout), never
  * `cwd` and never an env var. See the module header for why that distinction is

@@ -11,6 +11,8 @@ import {
 	HeartbeatAckSchema,
 	HeartbeatSchema,
 	PostCommentDeliveryRequestSchema,
+	ReportWorkerUpdateDeliveryRequestSchema,
+	ReportWorkerUpdateDeliveryResponseSchema,
 	StreamLogSchema,
 	TaskAssignmentAckSchema,
 	TaskAssignmentSchema,
@@ -20,6 +22,7 @@ import {
 	TaskProgressSchema,
 	TRANSPORT_PROTOCOL_VERSION,
 	WorkerStreamMessageSchema,
+	WorkerUpdateSchema,
 } from '@/transport/protocol.js';
 import { createMockProjectConfig } from '../../helpers/factories.js';
 
@@ -408,6 +411,59 @@ describe('transport protocol schemas', () => {
 			).toBe(false);
 		});
 
+		// Issue #933. The frame that asks a *machine* to move to a build carries a
+		// target ref and a request id and nothing else — the grammar is what makes it
+		// data rather than an instruction, so these are schema-level assertions and not
+		// a reviewer's promise.
+		describe('worker-update (issue #933)', () => {
+			const REQUEST_ID = '66666666-6666-4666-8666-666666666666';
+			const valid = { type: 'worker-update' as const, requestId: REQUEST_ID, target: 'main' };
+
+			it('round-trips through the cloud→worker union', () => {
+				expect(ControlPlaneMessageSchema.parse(valid)).toEqual(valid);
+			});
+
+			it('accepts the three things a target may be: a branch, a tag, a commit', () => {
+				for (const target of ['main', 'issue-933', 'release/1.2.3', 'v1.2.3', 'a1b2c3d']) {
+					expect(WorkerUpdateSchema.safeParse({ ...valid, target }).success).toBe(true);
+				}
+			});
+
+			// The exclusions that matter, stated one per class rather than exhaustively:
+			// nothing that could be read as a URL, a shell fragment, a git option, a
+			// refspec, or a revision expression can reach the daemon at all.
+			it.each([
+				['a URL', 'https://example.com/evil.git'],
+				['an scp-style remote', 'git@example.com:evil/repo.git'],
+				['a shell fragment', 'main; rm -rf /'],
+				['a command substitution', 'main$(id)'],
+				['a git option', '--upload-pack=curl'],
+				['a refspec', 'main:refs/heads/main'],
+				['a revision expression', 'main~2'],
+				['a path traversal', '../../etc/passwd'],
+				['an absolute path', '/usr/local/bin/swarm'],
+				['whitespace', 'main other'],
+			])('rejects %s as a target', (_what, target) => {
+				expect(WorkerUpdateSchema.safeParse({ ...valid, target }).success).toBe(false);
+			});
+
+			it('requires both fields — neither is correlation-only', () => {
+				expect(
+					WorkerUpdateSchema.safeParse({ type: 'worker-update', target: 'main' }).success,
+				).toBe(false);
+				expect(
+					WorkerUpdateSchema.safeParse({ type: 'worker-update', requestId: REQUEST_ID }).success,
+				).toBe(false);
+			});
+
+			// A frame carrying anything that could *act* is the failure this design exists
+			// to prevent, so the union must drop such a key rather than pass it through.
+			it('drops a command smuggled alongside the target', () => {
+				const parsed = ControlPlaneMessageSchema.parse({ ...valid, command: 'rm -rf /' });
+				expect(parsed).toEqual(valid);
+			});
+		});
+
 		it('discriminates a task-assignment frame to TaskAssignmentSchema', () => {
 			const parsed = ControlPlaneMessageSchema.parse(VALID_ASSIGNMENT);
 			expect(parsed.type).toBe('task-assignment');
@@ -646,6 +702,69 @@ describe('transport protocol schemas', () => {
 			expect(
 				PostCommentDeliveryRequestSchema.safeParse({ ...valid, persona: 'operator' }).success,
 			).toBe(false);
+		});
+	});
+
+	// Issue #933 — the answer to a `worker-update`, on a route rather than the stream
+	// (see the schema's own comment for why).
+	describe('ReportWorkerUpdateDeliveryRequestSchema', () => {
+		const valid = {
+			requestId: '66666666-6666-4666-8666-666666666666',
+			target: 'main',
+			status: 'applied' as const,
+			message: 'Applied: the SWARM install root moved to abc1234 and was rebuilt there.',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		};
+
+		it('round-trips every status the vocabulary admits', () => {
+			for (const status of ['applied', 'already-current', 'refused', 'failed', 'declined']) {
+				expect(
+					ReportWorkerUpdateDeliveryRequestSchema.safeParse({ ...valid, status }).success,
+				).toBe(true);
+			}
+		});
+
+		it('rejects a status outside the vocabulary', () => {
+			expect(
+				ReportWorkerUpdateDeliveryRequestSchema.safeParse({ ...valid, status: 'in-progress' })
+					.success,
+			).toBe(false);
+		});
+
+		// The echoed target is held to the same grammar the request frame is: a report
+		// is recorded and shown to an operator, and a value that could not have been
+		// asked for is not an answer to anything.
+		it('rejects an echoed target that is not a well-formed ref', () => {
+			expect(
+				ReportWorkerUpdateDeliveryRequestSchema.safeParse({
+					...valid,
+					target: 'https://example.com/evil.git',
+				}).success,
+			).toBe(false);
+		});
+
+		it('names no worker — identity is the credential the request authenticates with', () => {
+			const parsed = ReportWorkerUpdateDeliveryRequestSchema.parse({
+				...valid,
+				workerId: '11111111-1111-4111-8111-111111111111',
+			});
+			expect(parsed).not.toHaveProperty('workerId');
+		});
+
+		it('refuses to be a log sink', () => {
+			expect(
+				ReportWorkerUpdateDeliveryRequestSchema.safeParse({ ...valid, message: 'x'.repeat(4001) })
+					.success,
+			).toBe(false);
+			expect(
+				ReportWorkerUpdateDeliveryRequestSchema.safeParse({ ...valid, message: '' }).success,
+			).toBe(false);
+		});
+
+		it('answers with whether the report closed the request that was pending', () => {
+			expect(ReportWorkerUpdateDeliveryResponseSchema.parse({ recorded: false })).toEqual({
+				recorded: false,
+			});
 		});
 	});
 });

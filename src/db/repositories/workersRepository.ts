@@ -26,7 +26,7 @@
  * not-found, not an error (ai/CODING_STANDARDS.md "Error handling").
  */
 
-import { asc, eq, inArray, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 
 import type { AgentCli } from '../../harness/agent-cli.js';
 import {
@@ -35,8 +35,9 @@ import {
 	type Worker,
 	WorkerCapabilityNotProbedError,
 	WorkerCapabilityReductionError,
+	type WorkerUpdateState,
 } from '../../identity/worker.js';
-import type { WorkerBuild } from '../../lib/build-identity.js';
+import type { WorkerBuild, WorkerUpdateStatus } from '../../lib/build-identity.js';
 import type { TriggerPhase } from '../../triggers/types.js';
 import { getDb } from '../client.js';
 import { workerProjectEnrollments } from '../schema/workerProjectEnrollments.js';
@@ -84,8 +85,31 @@ function rowToWorker(row: WorkerRow): Worker {
 		// (issue #918). The pair is always written together, so a non-null commit with a
 		// null flag can only be a row hand-edited in `psql`; read that as not dirty.
 		build: row.buildCommit ? { commit: row.buildCommit, dirty: row.buildDirty ?? false } : null,
+		update: rowToUpdateState(row),
 		createdAt: row.createdAt,
 		updatedAt: row.updatedAt,
+	};
+}
+
+/**
+ * Re-assemble the six `update_*` columns into one {@link WorkerUpdateState}, or
+ * `null` when nobody has asked this machine to update (issue #933).
+ *
+ * Keyed on `update_target`/`update_requested_at` rather than on the pending marker,
+ * because the value outlives the request: the report clears `update_request_id` and
+ * leaves the target it concerned standing, so an operator reads the outcome beside
+ * the build it is about. A row with one of the pair hand-edited away in `psql`
+ * reads as "never asked" rather than as a state with no target.
+ */
+function rowToUpdateState(row: WorkerRow): WorkerUpdateState | null {
+	if (!row.updateTarget || !row.updateRequestedAt) return null;
+	return {
+		requestId: row.updateRequestId ?? null,
+		target: row.updateTarget,
+		requestedAt: row.updateRequestedAt,
+		status: row.updateStatus ?? null,
+		message: row.updateMessage ?? null,
+		reportedAt: row.updateReportedAt ?? null,
 	};
 }
 
@@ -432,6 +456,76 @@ export async function setWorkerDraining(
 			drainingSince: draining ? sql`coalesce(${workers.drainingSince}, now())` : null,
 		})
 		.where(eq(workers.id, id))
+		.returning();
+	return updatedRow ? rowToWorker(updatedRow) : undefined;
+}
+
+/**
+ * Record that an operator asked this machine to move its SWARM install root to
+ * `target`, replacing any request already outstanding (issue #933).
+ *
+ * All six columns are written together, so a fresh request never shows the previous
+ * one's verdict beside it: the outcome fields are reset to NULL in the same write
+ * that records the new target. Re-targeting is therefore a plain overwrite, which is
+ * the only form of "cancel" this phase has — the earlier request's push is simply no
+ * longer the one the row is waiting on, and a report for it is recognised as stale
+ * by {@link recordWorkerUpdateReport}'s id check.
+ *
+ * Returns the updated worker, or `undefined` if no worker has that id. No
+ * transaction and no enrollment validation, exactly like {@link setWorkerDraining}:
+ * it narrows nothing an enrollment depends on, and the machine-side safety — acting
+ * only when it holds no in-flight phase — is the daemon's, not this write's.
+ */
+export async function requestWorkerUpdate(
+	id: string,
+	requestId: string,
+	target: string,
+): Promise<Worker | undefined> {
+	const [updatedRow] = await getDb()
+		.update(workers)
+		.set({
+			updateRequestId: requestId,
+			updateTarget: target,
+			updateRequestedAt: new Date(),
+			updateStatus: null,
+			updateMessage: null,
+			updateReportedAt: null,
+		})
+		.where(eq(workers.id, id))
+		.returning();
+	return updatedRow ? rowToWorker(updatedRow) : undefined;
+}
+
+/**
+ * Record what a machine reported became of a requested update, and stop treating
+ * that request as outstanding (issue #933).
+ *
+ * The `update_request_id` match is the whole point of the `WHERE`: a report is only
+ * ever the answer to the request it names, so one arriving for a request an operator
+ * has since re-targeted must not clear the pending marker the *new* request set.
+ * That case returns `undefined`, which the route reports as `recorded: false` —
+ * not an error, since the outcome concerned a request nothing is waiting on any more.
+ * `undefined` also covers a duplicate report (the marker is already cleared) and an
+ * unknown worker.
+ *
+ * `update_target` is deliberately left standing: it is the build this outcome is
+ * about, and an outcome naming none answers nothing.
+ */
+export async function recordWorkerUpdateReport(
+	id: string,
+	requestId: string,
+	status: WorkerUpdateStatus,
+	message: string,
+): Promise<Worker | undefined> {
+	const [updatedRow] = await getDb()
+		.update(workers)
+		.set({
+			updateRequestId: null,
+			updateStatus: status,
+			updateMessage: message,
+			updateReportedAt: new Date(),
+		})
+		.where(and(eq(workers.id, id), eq(workers.updateRequestId, requestId)))
 		.returning();
 	return updatedRow ? rowToWorker(updatedRow) : undefined;
 }
