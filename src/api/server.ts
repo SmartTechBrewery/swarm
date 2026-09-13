@@ -178,7 +178,27 @@ export function createApiApp(
 	const staticRoot = options.staticRoot ?? './dashboard/dist';
 	if (existsSync(`${staticRoot}/index.html`)) {
 		app.use('/assets/*', serveStatic({ root: staticRoot }));
-		app.get('*', serveStatic({ root: staticRoot, rewriteRequestPath: () => '/index.html' }));
+		// A hashed asset that is not on disk is *gone*, and must say so. Without this
+		// the miss falls through to the SPA catch-all below and answers a request for
+		// JavaScript with `index.html` and a 200; the browser then fails to parse the
+		// module and renders nothing, with no failing request to point at. That is not
+		// hypothetical — after a dashboard rebuild changes the bundle hash, any client
+		// still holding the previous `index.html` requests exactly this, which is how
+		// a phone that "worked yesterday" ends up on a white screen (2026-09-13).
+		app.all('/assets/*', (c) => c.notFound());
+		app.get(
+			'*',
+			serveStatic({
+				root: staticRoot,
+				rewriteRequestPath: () => '/index.html',
+				// The shell names hashed assets that only exist for as long as the build
+				// that produced them, so it must never outlive that build in a cache. The
+				// assets themselves stay immutably cacheable — their hash is their version.
+				onFound: (_path, c) => {
+					c.header('Cache-Control', 'no-store, must-revalidate');
+				},
+			}),
+		);
 	}
 
 	return app;

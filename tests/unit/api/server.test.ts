@@ -430,6 +430,25 @@ describe('swarm-api', () => {
 			expect(await res.text()).toContain('Hello from web-dist fixture!');
 		});
 
+		it('404s a missing hashed asset instead of falling back to the SPA shell', async () => {
+			// The white-screen shape (2026-09-13): a client holding a stale index.html
+			// asks for a bundle that no longer exists. Answering with HTML and a 200
+			// leaves the browser unable to parse the module and nothing rendered, so
+			// the miss has to stay a miss.
+			const app = createApiApp({ staticRoot: 'tests/fixtures/dashboard-dist' });
+			const res = await app.request('/assets/index-StaleHash.js');
+
+			expect(res.status).toBe(404);
+			expect(res.headers.get('Content-Type') ?? '').not.toContain('html');
+		});
+
+		it('tells clients never to cache the SPA shell', async () => {
+			const app = createApiApp({ staticRoot: 'tests/fixtures/dashboard-dist' });
+			const res = await app.request('/login');
+
+			expect(res.headers.get('Cache-Control')).toContain('no-store');
+		});
+
 		it('returns 404 for unknown routes when no static assets exist', async () => {
 			const app = createApiApp({ staticRoot: './non-existent-dist' });
 			const res = await app.request('/nope');
