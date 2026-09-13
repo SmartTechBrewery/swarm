@@ -143,7 +143,7 @@ function makeMember(
 }
 
 /** The member patches one advance wrote, keyed by worker — what the next one would read. */
-const memberWrites = new Map<string, Record<string, unknown>>();
+const memberWrites = new Map<string, Partial<WorkerUpdateRolloutMember>>();
 /** The rollout status writes one advance made, in order. */
 const statusWrites: { status: string; haltReason?: string | null }[] = [];
 
@@ -159,7 +159,7 @@ function givenRollout(rollout: WorkerUpdateRollout, members: WorkerUpdateRollout
 			body: (
 				loaded: { rollout: WorkerUpdateRollout; members: WorkerUpdateRolloutMember[] },
 				write: {
-					setMember(workerId: string, patch: Record<string, unknown>): Promise<void>;
+					setMember(workerId: string, patch: Partial<WorkerUpdateRolloutMember>): Promise<void>;
 					setStatus(status: string, haltReason?: string | null): Promise<void>;
 				},
 			) => Promise<unknown>,
@@ -176,6 +176,16 @@ function givenRollout(rollout: WorkerUpdateRollout, members: WorkerUpdateRollout
 				},
 			),
 	);
+}
+
+/**
+ * The member rows a **later** advance would load: the state this one started from
+ * with only the patches that actually reached the row applied on top. Anything a
+ * pass decided and kept in its own working copy is gone here, which is exactly the
+ * difference these tests are for.
+ */
+function reloaded(members: WorkerUpdateRolloutMember[]): WorkerUpdateRolloutMember[] {
+	return members.map((member) => ({ ...member, ...memberWrites.get(member.workerId) }));
 }
 
 /** The machines the pass will resolve behind its members. */
@@ -338,6 +348,112 @@ describe('advanceRollout — taking a wave', () => {
 
 		expect(fanOutWorkerUpdate).not.toHaveBeenCalled();
 		expect(view?.members.map((member) => member.state)).toEqual(['signalled', 'queued']);
+	});
+});
+
+/**
+ * The rollout is advanced by the operator, one pass at a time, so the pass that
+ * takes a machine into a wave is almost never the pass that settles it. Everything a
+ * wave decides therefore has to survive being written down and read back — above all
+ * `drainedByRollout`, which can only be decided *before* the rollout drains the
+ * machine and can never be re-derived afterwards.
+ */
+describe('advanceRollout — what one advance leaves for the next', () => {
+	it('undrains a machine it took from the pool, settled by a later advance', async () => {
+		const queued = [makeMember(WORKER_A, 0)];
+		givenRollout(makeRollout(), queued);
+		givenWorkers(makeWorker(WORKER_A));
+		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry(WORKER_A, 'requested')]);
+
+		await advanceRollout(ROLLOUT_ID);
+
+		// The drain decision is on the row, not only in the pass that reached it.
+		expect(memberWrites.get(WORKER_A)).toMatchObject({
+			state: 'signalled',
+			drainedByRollout: true,
+		});
+
+		// Second advance: the machine has applied and is restarting.
+		const signalled = reloaded(queued);
+		givenRollout(makeRollout(), signalled);
+		givenWorkers(reported(WORKER_A, 'applied'));
+		expect(signalled[0]).toMatchObject({ state: 'signalled', drainedByRollout: true });
+
+		await advanceRollout(ROLLOUT_ID);
+
+		// Third advance: it is back, on a commit it was not on before.
+		const verifying = reloaded(signalled);
+		givenRollout(makeRollout(), verifying);
+		givenWorkers(reported(WORKER_A, 'applied', { build: { commit: 'bbbbbbb', dirty: false } }));
+		getLiveSessionForWorker.mockResolvedValue({ fencingToken: 8 });
+		expect(verifying[0]).toMatchObject({ state: 'verifying', drainedByRollout: true });
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0].state).toBe('done');
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_A, false);
+	});
+
+	// A busy machine is drained by one advance and asked by another, so the pass that
+	// signals it is already looking at a machine this rollout has drained — the only
+	// record of who drained it is the one the first pass wrote.
+	it('keeps the drain it owns over a machine that stays busy across advances', async () => {
+		const queued = [makeMember(WORKER_A, 0)];
+		givenRollout(makeRollout(), queued);
+		givenWorkers(makeWorker(WORKER_A));
+		deriveWorkerRunState.mockResolvedValue({ busy: true, currentRunId: 'run-1' });
+
+		await advanceRollout(ROLLOUT_ID);
+
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_A, true);
+		expect(fanOutWorkerUpdate).not.toHaveBeenCalled();
+		expect(memberWrites.get(WORKER_A)).toMatchObject({
+			state: 'draining',
+			drainedByRollout: true,
+		});
+
+		// Second advance: the run has finished, and the machine is drained — by this
+		// rollout, which is a fact no snapshot taken now could still tell it.
+		const draining = reloaded(queued);
+		givenRollout(makeRollout(), draining);
+		givenWorkers(makeWorker(WORKER_A, { drainingSince: NOW }));
+		deriveWorkerRunState.mockResolvedValue({ busy: false, currentRunId: null });
+		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry(WORKER_A, 'requested')]);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0]).toMatchObject({ state: 'signalled', drainedByRollout: true });
+
+		// Third advance: it had the build already, so it settles and goes back in the pool.
+		const signalled = reloaded(draining);
+		givenRollout(makeRollout(), signalled);
+		givenWorkers(reported(WORKER_A, 'already-current'));
+
+		await advanceRollout(ROLLOUT_ID);
+
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_A, false);
+	});
+
+	// The operator's own drain is theirs; the rollout borrowed the machine, it did not
+	// take it out of the pool, so no later advance may put it back.
+	it('never undrains a machine the operator had already drained', async () => {
+		const queued = [makeMember(WORKER_A, 0)];
+		givenRollout(makeRollout(), queued);
+		givenWorkers(makeWorker(WORKER_A, { drainingSince: new Date('2026-09-01T00:00:00Z') }));
+		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry(WORKER_A, 'requested')]);
+
+		await advanceRollout(ROLLOUT_ID);
+
+		expect(memberWrites.get(WORKER_A)).toMatchObject({ drainedByRollout: false });
+
+		const signalled = reloaded(queued);
+		givenRollout(makeRollout(), signalled);
+		givenWorkers(reported(WORKER_A, 'already-current'));
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0].state).toBe('done');
+		expect(setWorkerDraining).not.toHaveBeenCalledWith(WORKER_A, false);
 	});
 });
 

@@ -484,7 +484,7 @@ class AdvancePass {
 	/** Step 5 — take the next wave if nothing is in flight, then signal whatever has gone idle. */
 	private async advanceWave(): Promise<void> {
 		if (this.status !== 'in_progress') return;
-		const draining = this.takeNextWave();
+		const draining = await this.takeNextWave();
 		if (draining.length === 0) return;
 		const drained = await this.reassertDrain(draining);
 		const idle = await this.idleAmong(draining, drained);
@@ -497,8 +497,13 @@ class AdvancePass {
 	 * is in flight**. That is what bounds how much of the fleet is out of the pool at
 	 * any instant, and what makes "verified before the next wave moves" true rather
 	 * than hoped for.
+	 *
+	 * The transition it makes is **written**, not only staged: `drainedByRollout` is
+	 * decided here and nowhere else, and the advance that later settles a member is a
+	 * different pass reading the row back, so leaving the decision in memory would lose
+	 * it — and with it every successfully updated machine's way back into the pool.
 	 */
-	private takeNextWave(): WorkerUpdateRolloutMember[] {
+	private async takeNextWave(): Promise<WorkerUpdateRolloutMember[]> {
 		// "In flight" is the wave the rollout has actually committed to — a `queued`
 		// member is neither settled nor in flight, it is simply not reached yet, so it
 		// must not count as a reason to hold the next wave back.
@@ -514,8 +519,12 @@ class AdvancePass {
 			if (!worker) continue;
 			// `drainedByRollout` is decided once, here, from the snapshot taken before this
 			// pass drained anything: only a machine the rollout took out of the pool is put
-			// back into it afterwards.
-			this.stage(member, { state: 'draining', drainedByRollout: worker.drainingSince === null });
+			// back into it afterwards. Once this pass has drained it, the same question can
+			// never be asked again — the machine is draining now because *this* rollout
+			// drained it — so the answer has to be durable from the instant it is reached.
+			await this.apply(member, {
+				patch: { state: 'draining', drainedByRollout: worker.drainingSince === null },
+			});
 			draining.push(member);
 		}
 		return draining;
@@ -658,17 +667,20 @@ class AdvancePass {
 		await this.write.setStatus('completed');
 	}
 
-	/** Apply one verdict: write the patch, then the pool return and the halt it implies. */
+	/**
+	 * Apply one verdict: move the working copy on so later steps in this same pass see
+	 * the new state, write the same patch to the row so the *next* pass does too, then
+	 * the pool return and the halt it implies.
+	 *
+	 * Every member transition goes through here — there is no staging-only path — which
+	 * is what makes "each step is decided from durable state" true of a member taken
+	 * into a wave by one advance and settled by another.
+	 */
 	private async apply(member: WorkerUpdateRolloutMember, verdict: MemberVerdict): Promise<void> {
-		this.stage(member, verdict.patch);
+		Object.assign(member, verdict.patch);
 		await this.write.setMember(member.workerId, verdict.patch);
 		if (verdict.returnToPool) await this.returnToPool(member);
 		if (verdict.halt) await this.halt(verdict.halt);
-	}
-
-	/** Move the working copy on, so later steps in this same pass see the new state. */
-	private stage(member: WorkerUpdateRolloutMember, patch: MemberPatch): void {
-		Object.assign(member, patch);
 	}
 
 	/**
