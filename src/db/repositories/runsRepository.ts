@@ -67,10 +67,18 @@ export type RunRow = typeof runs.$inferSelect;
  * `agentSessionId` — so anything keying retry-pendingness on that column has to name
  * the status instead (see {@link hasResumableDeferredRun}).
  */
-type RunStatus = 'running' | 'completed' | 'failed' | 'deferred' | 'checkpointed';
+export type RunStatus = 'running' | 'completed' | 'failed' | 'deferred' | 'checkpointed';
 
 /** The retry-pending statuses: a run that has settled but is waiting on a scheduled continuation. */
 export const RETRY_PENDING_RUN_STATUSES = ['deferred', 'checkpointed'] as const;
+
+/**
+ * Every status a run can still be *moved off* — `running` plus the two
+ * retry-pending ones. The complement is `completed`/`failed`, the two a run only
+ * ever reaches once, so this is the guard a settle that must not rewrite a
+ * finished run keys on (issue #909's board-phase retirement).
+ */
+export const UNSETTLED_RUN_STATUSES = ['running', ...RETRY_PENDING_RUN_STATUSES] as const;
 
 /** Whether a stored status string is one of {@link RETRY_PENDING_RUN_STATUSES}. */
 export function isRetryPendingStatus(
@@ -337,6 +345,22 @@ export interface CompleteRunInput {
 	 * `checkpointed` settle, which is the one thing that spends the budget.
 	 */
 	continuationCount?: number;
+	/**
+	 * Atomic guard: apply this settle **only** while the row still holds this
+	 * status, exactly as {@link resetRunToRunning}'s `fromStatus` guards a retry.
+	 * Omitted (the usual case) the settle is unconditional.
+	 *
+	 * It exists for a settle that races another party's, where the other party's
+	 * verdict must win: the pre-run deferral (`deferBeforeRun`, `consumer.ts`)
+	 * hands its dispatch back to `pending` *before* writing `deferred` on the run
+	 * it just created, and board-phase retirement (issue #909) can cancel that
+	 * now-`pending` dispatch and settle its run in between. Guarding on `running`
+	 * — the status `createRun`/`resetRunToRunning` left the row in moments earlier
+	 * — makes the late `deferred` write a no-op instead of resurrecting a run the
+	 * card already retired, which the startup backfill
+	 * (`listDeferredRunsWithoutActiveDispatch`) would then re-dispatch.
+	 */
+	fromStatus?: RunStatus;
 }
 
 /**
@@ -346,9 +370,13 @@ export interface CompleteRunInput {
  * `engine` preserves the effective CLI recorded at creation/reset (issue #169)
  * rather than blanking it — e.g. a deferral before the agent ran keeps showing
  * the run's engine while it is retry-pending.
+ *
+ * Returns whether a row was written — always `true` for an unguarded settle,
+ * `false` when {@link CompleteRunInput.fromStatus} was supplied and the row has
+ * since moved off that status (someone else settled it first).
  */
-export async function completeRun(runId: string, input: CompleteRunInput): Promise<void> {
-	await getDb()
+export async function completeRun(runId: string, input: CompleteRunInput): Promise<boolean> {
+	const rows = await getDb()
 		.update(runs)
 		.set({
 			status: input.status,
@@ -375,7 +403,13 @@ export async function completeRun(runId: string, input: CompleteRunInput): Promi
 			continuationCount: input.continuationCount,
 			completedAt: new Date(),
 		})
-		.where(eq(runs.id, runId));
+		.where(
+			input.fromStatus
+				? and(eq(runs.id, runId), eq(runs.status, input.fromStatus))
+				: eq(runs.id, runId),
+		)
+		.returning({ id: runs.id });
+	return rows.length > 0;
 }
 
 /**

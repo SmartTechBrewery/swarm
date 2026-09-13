@@ -31,6 +31,7 @@ import {
 import type { AgentCli } from '../../harness/agent-cli.js';
 import { effectiveCapabilities } from '../../identity/worker.js';
 import { isSessionLive } from '../../identity/worker-session.js';
+import { BOARD_DRIVEN_PHASES } from '../../pm/pipeline.js';
 import type { SwarmJob } from '../../queue/jobs.js';
 import type { TriggerPhase } from '../../triggers/types.js';
 import { getDb } from '../client.js';
@@ -40,7 +41,7 @@ import { runs } from '../schema/runs.js';
 import { workerProjectEnrollments } from '../schema/workerProjectEnrollments.js';
 import { workerSessions } from '../schema/workerSessions.js';
 import { workers } from '../schema/workers.js';
-import { RETRY_PENDING_RUN_STATUSES } from './runsRepository.js';
+import { RETRY_PENDING_RUN_STATUSES, UNSETTLED_RUN_STATUSES } from './runsRepository.js';
 
 export type DispatchRow = typeof dispatches.$inferSelect;
 
@@ -707,6 +708,85 @@ export async function cancelWaitingDispatch(
 	return rows[0] ?? null;
 }
 
+/**
+ * Retire one **waiting board-driven dispatch together with its run row** — the
+ * settle behind a board move superseding the phase an earlier move left queued
+ * (issue #909), applied to each row {@link listRetirableBoardDispatchesForTask}
+ * returns.
+ *
+ * Both writes happen in one transaction, and that pairing is the acceptance
+ * criterion "a retired dispatch's run row is never left `deferred`": the
+ * reconciler's startup backfill re-dispatches every deferred run with no active
+ * dispatch (`listDeferredRunsWithoutActiveDispatch`), so a cancel that committed
+ * without the run settle would be resurrected at the next router start. Modelled
+ * on {@link cancelDeferredRunInDb}, which pairs the same two writes for
+ * Terminate.
+ *
+ * The run settle spans every {@link UNSETTLED_RUN_STATUSES} — `running` as well
+ * as the retry-pending pair — because a waiting dispatch and a `running` run is a
+ * real, reachable pairing rather than an inconsistency: `deferBeforeRun`
+ * (`src/worker/consumer.ts`) creates the run, hands its dispatch back to
+ * `pending`, and only *then* writes `deferred` on the run, so a retirement
+ * landing between those last two steps finds exactly that. Settling only the
+ * retry-pending pair would leave that row `running`, the worker would finish
+ * writing `deferred` over it, and the backfill would re-dispatch the phase the
+ * card had just retired. The other half of closing that window is the settle's
+ * own `fromStatus: 'running'` guard, which makes the worker's late write lose.
+ * Nothing is written over a `completed`/`failed` run: a run that already settled
+ * itself keeps its own outcome.
+ *
+ * The dispatch cancel is **conditional** on the row still waiting, which is what
+ * makes "only waiting dispatches are retired" free of extra locking: a dispatch a
+ * worker claimed in the meantime simply loses the update and survives, and the
+ * caller is told by the `null` return.
+ *
+ * Three things are deliberately *not* written on the run. `agentSessionId` and
+ * `recovery` are left as they are — unlike {@link failRunFromStatus}, which nulls
+ * the session — so a `retry-scheduled` board dispatch that held a preserved
+ * session stays resumable. `cancellation` is left unset because its origin
+ * vocabulary describes an operator acting through the dashboard or API, and this
+ * is the board's own bookkeeping. And no `failureDiagnosis` is recorded: no known
+ * failure condition describes "the card asks for something else now", and the
+ * reason string already says it — the automation-label gate settles without one
+ * for the same reason.
+ */
+export async function retireWaitingBoardDispatch(
+	id: string,
+	reason: string,
+): Promise<{ dispatch: DispatchRow; runSettled: boolean } | null> {
+	const db = getDb();
+	return await db.transaction(async (tx) => {
+		const now = new Date();
+		const cancelled = await tx
+			.update(dispatches)
+			.set({
+				state: 'cancelled',
+				lastError: reason,
+				waitReason: null,
+				completedAt: now,
+				updatedAt: now,
+			})
+			.where(and(eq(dispatches.id, id), inArray(dispatches.state, [...WAITING_DISPATCH_STATES])))
+			.returning();
+		const dispatch = cancelled[0];
+		if (!dispatch) return null;
+
+		if (!dispatch.runId) return { dispatch, runSettled: false };
+
+		const settled = await tx
+			.update(runs)
+			.set({
+				status: 'failed',
+				error: reason,
+				nextRetryAt: null,
+				completedAt: now,
+			})
+			.where(and(eq(runs.id, dispatch.runId), inArray(runs.status, [...UNSETTLED_RUN_STATUSES])))
+			.returning({ id: runs.id });
+		return { dispatch, runSettled: settled.length > 0 };
+	});
+}
+
 /** Settle a leased/running dispatch as `cancelled` (user terminated the run). */
 export async function cancelClaimedDispatch(id: string, reason: string): Promise<boolean> {
 	const now = new Date();
@@ -998,6 +1078,64 @@ export async function findActivePlanningDispatchForTask(
 		.orderBy(asc(dispatches.createdAt))
 		.limit(1);
 	return rows[0];
+}
+
+/**
+ * The **still-waiting board-driven dispatches this card's move supersedes**
+ * (issue #909) — the read behind "a card's current column is the single source
+ * of truth for which board-driven phase is queued for it". A board move creates
+ * a dispatch and, until this, nothing ever retired one, so a card moved twice
+ * accumulated one queued phase per move and issue #761 then made them queue
+ * behind each other.
+ *
+ * Four things the predicate is, deliberately:
+ *
+ * - **Only {@link WAITING_DISPATCH_STATES}.** A `leased`/`running` dispatch is
+ *   being executed against the task's checkout, and stopping one of those stays
+ *   Terminate's job — a board move must never discard work already under way.
+ * - **Only {@link BOARD_DRIVEN_PHASES}.** The load-bearing half of "SCM-driven
+ *   phases are never retired by a board move": it is not enough that the
+ *   PR-driven phases suffix their task ids, because a `review` uses the bare
+ *   `task-<pr>` id and would otherwise collide with a card whose `taskRef` is the
+ *   same number.
+ * - **Blind to a null `phase`** — a dispatch whose trigger has not run yet
+ *   (`src/db/schema/dispatches.ts`), exactly as
+ *   {@link findActivePlanningDispatchForTask} is. That is a queue hop rather than
+ *   a wait, it self-corrects at its own claim through the status-change gate, and
+ *   matching `phase IS NULL` instead would make the two deliveries of one drag
+ *   retire each other.
+ * - **`phase <> keepPhase`** (when the card's new column calls for a phase at
+ *   all). A *same-phase* waiting sibling is a duplicate delivery, which the
+ *   existing dedup and `skipped-duplicate` machinery already owns.
+ *
+ * `repository` is deliberately absent from the key: `recordDispatchResolution`
+ * writes that column only from a pull request, so it is null for every
+ * board-driven dispatch by construction. The key is `(project_id, task_id,
+ * phase, state)` — precisely the one the two task guards above already use.
+ *
+ * One indexed scan on `(project_id, state)`, the same read cost those guards
+ * pay, and paid only by a board dispatch whose card's status genuinely changed.
+ */
+export async function listRetirableBoardDispatchesForTask(
+	projectId: string,
+	taskId: string,
+	keepPhase: TriggerPhase | undefined,
+	excludeDispatchId: string,
+): Promise<DispatchRow[]> {
+	return getDb()
+		.select()
+		.from(dispatches)
+		.where(
+			and(
+				eq(dispatches.projectId, projectId),
+				eq(dispatches.taskId, taskId),
+				inArray(dispatches.state, [...WAITING_DISPATCH_STATES]),
+				inArray(dispatches.phase, [...BOARD_DRIVEN_PHASES]),
+				ne(dispatches.id, excludeDispatchId),
+				...(keepPhase ? [ne(dispatches.phase, keepPhase)] : []),
+			),
+		)
+		.orderBy(asc(dispatches.createdAt));
 }
 
 /**

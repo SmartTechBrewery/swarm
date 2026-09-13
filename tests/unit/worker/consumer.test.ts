@@ -1106,6 +1106,24 @@ describe('processJob', () => {
 			expect(scheduleDispatchRetry).not.toHaveBeenCalled();
 		});
 
+		// The dispatch goes `pending` before the run is settled, so board-phase
+		// retirement (issue #909) can cancel it and settle its run in between. The
+		// guard is what makes this write lose to that, instead of putting a
+		// `deferred` run back under a cancelled dispatch for the backfill to find.
+		it('guards the pre-run deferral’s run settle on the row still being `running`', async () => {
+			acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
+
+			await processJob(
+				createMockScmWebhookJob({ runId: undefined }),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(completeRun).toHaveBeenCalledWith(
+				'run-1',
+				expect.objectContaining({ status: 'deferred', fromStatus: 'running' }),
+			);
+		});
+
 		it.each([
 			REVIEW_TRIGGER,
 			RESPOND_TO_REVIEW_TRIGGER,

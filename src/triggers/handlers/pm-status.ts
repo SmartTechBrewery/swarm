@@ -25,14 +25,20 @@
  * repeated here.
  */
 
+import type { ProjectConfig } from '../../config/schema.js';
+import { retireSupersededBoardPhases } from '../../dispatch/board-phase-retirement.js';
 import { requireProjectPMAdapter } from '../../integrations/pm/registry.js';
 import { logger } from '../../lib/logger.js';
 import { PLANNED_LABEL } from '../../pipeline/preplan.js';
-import { type PipelinePhase, resolvePipelinePhaseForStatusKey } from '../../pm/pipeline.js';
+import {
+	isPhaseReportedStatusKey,
+	type PipelinePhase,
+	resolvePipelinePhaseForStatusKey,
+} from '../../pm/pipeline.js';
 import type { WorkItem } from '../../pm/types.js';
 import { repoSlugsMatch } from '../../scm/repo-slug.js';
 import { recordStatusAndDetectChange } from '../pm-status-dedup.js';
-import type { TriggerContext, TriggerHandler, TriggerResult } from '../types.js';
+import type { PmTriggerContext, TriggerContext, TriggerHandler, TriggerResult } from '../types.js';
 
 /**
  * The whole Planning gate (issue #737): a card entering Planning starts a Planning
@@ -84,6 +90,74 @@ function resolvePhaseForItem(workItem: WorkItem): PipelinePhase | undefined {
 }
 
 /**
+ * The worktree task id this card names, or `undefined` when it names none *for
+ * this run's repository*.
+ *
+ * The provider resolved the card's SCM artifact from its own linkage — both
+ * halves of it: the number (`WorkItem.taskRef`) and the repository that numbers
+ * it (`WorkItem.taskRepository`). Shared code never regexes a GitHub-shaped URL
+ * for either (ai/RULES.md §2, ai/ARCHITECTURE.md "Task identity").
+ *
+ * Deciding whether that repository is the one *this run* is for is this handler's
+ * job, not the provider's: a provider is built from a config scoped to one
+ * repository and so carries no list of the project's repositories (issue #710),
+ * while `project` is already scoped to the repository the job routed to (issue
+ * #686 phase 2). Compared through `repoSlugsMatch` rather than `===`, so a config
+ * entry's casing or a `.git` suffix cannot refuse a card that ingress routed on
+ * the same terms (issue #688).
+ *
+ * Logs nothing: it is resolved before the phase gate (issue #909, so the
+ * retirement below can key on it even for a column that starts no phase), and the
+ * operator-facing warning belongs on the dispatch path alone — otherwise a
+ * Backlog or Done move of a draft card would start warning.
+ */
+function resolveTaskIdForItem(workItem: WorkItem, project: ProjectConfig): string | undefined {
+	const artifactRepository = workItem.taskRepository;
+	return artifactRepository && repoSlugsMatch(artifactRepository, project.repo)
+		? workItem.taskRef
+		: undefined;
+}
+
+/**
+ * Make the card's current column the single source of truth for which
+ * board-driven phase is queued for it (issue #909): retire whatever board-driven
+ * phase an *earlier* move left waiting, so only the phase this column calls for
+ * — if it calls for one — is left queued.
+ *
+ * Four conditions each carry one acceptance criterion, and a handler reaching
+ * into the dispatch layer for this is precedented (`./review.ts` already imports
+ * `scheduleCoalescedDispatch`). The retirement itself fails open, so nothing here
+ * can fail an otherwise-good board dispatch.
+ */
+async function applyColumnToQueue(
+	ctx: PmTriggerContext,
+	workItem: WorkItem,
+	taskId: string | undefined,
+	statusChanged: boolean,
+	keepPhase: PipelinePhase | undefined,
+): Promise<void> {
+	// A deferred phase resuming from its original event is not a board move: it was
+	// dispatched once already and is retrying its own work.
+	if (ctx.resumePmPhase) return;
+	// A within-column reorder retires nothing, on the existing gate.
+	if (!statusChanged) return;
+	// Nothing to key on — a draft card, or one linked into a repository this run is
+	// not for.
+	if (!taskId) return;
+	// A phase's own status report retires nothing: Implementation moves its card to
+	// In progress to report the pickup, which says nothing about which phase an
+	// operator wants (`PM_PHASE_REPORTED_STATUS_KEYS`).
+	if (isPhaseReportedStatusKey(workItem.statusKey)) return;
+
+	await retireSupersededBoardPhases({
+		projectId: ctx.project.id,
+		taskId,
+		keepPhase,
+		excludeDispatchId: ctx.dispatchId,
+	});
+}
+
+/**
  * Build the PM status-change trigger handler.
  *
  * `matches` is a cheap synchronous shape gate (is this a state change on this
@@ -131,6 +205,18 @@ export function createPmStatusTrigger(): TriggerHandler {
 			const statusChanged = await recordStatusAndDetectChange(event.itemId, workItem.statusId);
 
 			const phase = ctx.resumePmPhase ?? resolvePhaseForItem(workItem);
+
+			// Resolved here rather than below the phase gate because the retirement is
+			// keyed on it even when the card's new column starts nothing at all.
+			const taskId = resolveTaskIdForItem(workItem, ctx.project);
+
+			// The card's current column is now the single source of truth for which
+			// board-driven phase is queued for it (issue #909). Applied before every
+			// gate below, so that a column starting no phase — and a Planning column
+			// whose card already carries `planned` — retire by the same rule rather
+			// than needing one of their own.
+			await applyColumnToQueue(ctx, workItem, taskId, statusChanged, phase);
+
 			if (!phase) {
 				// A valid board status that simply doesn't start a phase (backlog, todo,
 				// inReview, done) — a "not for me" miss, not an error.
@@ -154,24 +240,6 @@ export function createPmStatusTrigger(): TriggerHandler {
 				return null;
 			}
 
-			// The provider resolved the card's SCM artifact from its own linkage — both
-			// halves of it: the number (`WorkItem.taskRef`) and the repository that
-			// numbers it (`WorkItem.taskRepository`). Shared code never regexes a
-			// GitHub-shaped URL for either (ai/RULES.md §2, ai/ARCHITECTURE.md "Task
-			// identity").
-			//
-			// Deciding whether that repository is the one *this run* is for is this
-			// handler's job, not the provider's: a provider is built from a config scoped
-			// to one repository and so carries no list of the project's repositories
-			// (issue #710), while `ctx.project` is already scoped to the repository the
-			// job routed to (issue #686 phase 2). Compared through `repoSlugsMatch` rather
-			// than `===`, so a config entry's casing or a `.git` suffix cannot refuse a
-			// card that ingress routed on the same terms (issue #688).
-			const artifactRepository = workItem.taskRepository;
-			const taskId =
-				artifactRepository && repoSlugsMatch(artifactRepository, ctx.project.repo)
-					? workItem.taskRef
-					: undefined;
 			if (!taskId) {
 				// No backing SCM artifact *for this repository* to key the worktree on — a
 				// draft item, a board with no SCM linkage at all, or a card whose linkage
@@ -184,7 +252,7 @@ export function createPmStatusTrigger(): TriggerHandler {
 					url: workItem.url,
 					phase,
 					taskRef: workItem.taskRef,
-					artifactRepository,
+					artifactRepository: workItem.taskRepository,
 					repository: ctx.project.repo,
 				});
 				return null;
