@@ -79,6 +79,11 @@ logs/
 # definition, so it is never committed; a fresh clone simply has none.
 ai/LOCAL_CONFIG.md
 
+# Operator crib sheet for standing up a new project — local notes, not a
+# maintained reference (the sources of truth are docs/configuration.md,
+# docs/MANUAL.md and docs/github-projects-v2-api.md).
+docs/SETTING_UP_NEW_PROJECT.md
+
 # SWARM agent hand-off/scratch artifacts (src/scm/delivery.ts's `HANDOFF_FILENAMES`,
 # `PROGRESS_FILENAME`, and delegation scratch) — written at the worktree root by a
 # phase's agent, read by deterministic delivery, and never meant to be committed;
