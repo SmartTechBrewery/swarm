@@ -125,7 +125,7 @@ export type UpdateOutcome =
  * `~/.swarm/install-updates/<sha256(realpath(installRoot))>/state.json`.
  *
  * The tracked branch and its remote are here because an applied update leaves HEAD
- * **detached**, so `@{upstream}` answers nothing on the second run; they are
+ * **detached**, so git has no upstream to answer with on the second run; they are
  * recorded the first time an attached HEAD lets them be read. `lastKnownGood` is
  * written *before* a checkout, so a process killed mid-apply still leaves a readable
  * record of what to go back to.
@@ -302,14 +302,6 @@ async function update(ctx: UpdateContext): Promise<UpdateOutcome> {
 	return applyCommit(ctx, currentCommit, commit);
 }
 
-/** `<remote>/<branch>`, split at the first slash — a branch may contain more, a remote may not. */
-function parseUpstream(upstream: string | null): { remote: string; branch: string } | null {
-	if (!upstream) return null;
-	const slash = upstream.indexOf('/');
-	if (slash <= 0 || slash === upstream.length - 1) return null;
-	return { remote: upstream.slice(0, slash), branch: upstream.slice(slash + 1) };
-}
-
 /**
  * The branch this install follows: read from git while HEAD is attached, and from
  * the recorded state once an applied update has detached it. Git wins when both
@@ -320,15 +312,45 @@ async function resolveTracking(
 	ctx: UpdateContext,
 	stored: InstallUpdateState | null,
 ): Promise<{ remote: string; branch: string } | null> {
-	const upstream = await gitRead(
-		ctx,
-		['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'],
-		GIT_READ_TIMEOUT_MS,
-	);
 	return (
-		parseUpstream(upstream) ??
+		(await readUpstream(ctx)) ??
 		(stored ? { remote: stored.remote, branch: stored.trackedBranch } : null)
 	);
+}
+
+/**
+ * The upstream's two parts, one per line — git's own name for the remote, then the
+ * ref on it. `%0a` is git's newline escape, and neither field can contain one.
+ */
+const UPSTREAM_FORMAT = '%(upstream:remotename)%0a%(upstream:remoteref)';
+const BRANCH_REF_PREFIX = 'refs/heads/';
+
+/**
+ * The remote and branch an attached HEAD follows, asked of git **by field** rather
+ * than split out of its abbreviated `<remote>/<branch>` form. That form is ambiguous
+ * and splitting it at the first slash was wrong: git accepts a remote whose own name
+ * contains a slash, so a `team/origin` remote read back as remote `team` tracking
+ * branch `origin/main`, and the fetch then named a remote that does not exist.
+ * `%(upstream:remotename)` is git answering the same question unambiguously.
+ */
+async function readUpstream(
+	ctx: UpdateContext,
+): Promise<{ remote: string; branch: string } | null> {
+	// Detached — which is what an applied update leaves behind. The caller falls back
+	// to the recorded branch rather than guessing one.
+	const headRef = await gitRead(ctx, ['symbolic-ref', '--quiet', 'HEAD'], GIT_READ_TIMEOUT_MS);
+	if (!headRef) return null;
+	const fields = await gitRead(
+		ctx,
+		['for-each-ref', `--format=${UPSTREAM_FORMAT}`, headRef],
+		GIT_READ_TIMEOUT_MS,
+	);
+	const [remote, remoteRef] = (fields ?? '').split('\n');
+	// `.` is git's name for this repository as an upstream: a branch tracking a sibling
+	// local branch has no remote to fetch, so it is no more an answer than none at all.
+	if (!remote || remote === '.') return null;
+	if (!remoteRef?.startsWith(BRANCH_REF_PREFIX)) return null;
+	return { remote, branch: remoteRef.slice(BRANCH_REF_PREFIX.length) };
 }
 
 /** Persist a newly learned (or changed) tracked branch, so the next detached run has one. */

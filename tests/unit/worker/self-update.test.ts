@@ -26,6 +26,9 @@ const REMOTE = 'origin';
 const BRANCH = 'main';
 const HEAD = 'a'.repeat(40);
 const TARGET_COMMIT = 'b'.repeat(40);
+const HEAD_REF = `refs/heads/${BRANCH}`;
+/** The upstream read, as argv — one key, because every case shares the same local branch. */
+const UPSTREAM_ARGV = `git for-each-ref --format=%(upstream:remotename)%0a%(upstream:remoteref) ${HEAD_REF}`;
 
 const homes: string[] = [];
 afterEach(() => {
@@ -65,7 +68,8 @@ function scriptedRunner(
 	const defaults: Record<string, UpdateCommandResult> = {
 		'git rev-parse HEAD': ok(HEAD),
 		'git status --porcelain': ok(''),
-		'git rev-parse --abbrev-ref --symbolic-full-name @{upstream}': ok(`${REMOTE}/${BRANCH}`),
+		'git symbolic-ref --quiet HEAD': ok(HEAD_REF),
+		[UPSTREAM_ARGV]: ok(`${REMOTE}\n${HEAD_REF}`),
 		[`git fetch ${REMOTE}`]: ok(''),
 		[`git rev-parse --verify refs/remotes/${REMOTE}/${BRANCH}^{commit}`]: ok(TARGET_COMMIT),
 		[`git merge-base --is-ancestor ${TARGET_COMMIT} refs/remotes/${REMOTE}/${BRANCH}`]: ok(''),
@@ -365,11 +369,44 @@ describe('applyUpdateTarget — the tracked branch', () => {
 		});
 	});
 
+	// git accepts a remote whose own name contains a slash, so the abbreviated
+	// `<remote>/<branch>` form cannot be split — both halves have to come from git.
+	it('keeps a remote name that itself contains a slash whole', async () => {
+		const home = makeHome();
+		const remote = 'team/origin';
+		const { run, argv } = scriptedRunner({
+			[UPSTREAM_ARGV]: ok(`${remote}\n${HEAD_REF}`),
+			[`git rev-parse --verify refs/remotes/${remote}/${BRANCH}^{commit}`]: ok(TARGET_COMMIT),
+		});
+
+		const outcome = await apply(home, run);
+
+		expect(outcome.status).toBe('applied');
+		expect(argv()).toContain(`git fetch ${remote}`);
+		expect(argv()).toContain(
+			`git merge-base --is-ancestor ${TARGET_COMMIT} refs/remotes/${remote}/${BRANCH}`,
+		);
+		expect(readState(home)).toMatchObject({ remote, trackedBranch: BRANCH });
+	});
+
+	it('treats a branch tracking a local sibling as having no remote', async () => {
+		const home = makeHome();
+		// `.` is git's name for this repository as an upstream — nothing to fetch from.
+		const { run, argv } = scriptedRunner({ [UPSTREAM_ARGV]: ok(`.\n${HEAD_REF}`) });
+
+		const outcome = await apply(home, run);
+
+		expect(outcome.status).toBe('refused');
+		if (outcome.status !== 'refused') return;
+		expect(outcome.reason).toContain('Check out the branch this install should follow');
+		expect(argv().some((line) => line.startsWith('git fetch'))).toBe(false);
+	});
+
 	it('proceeds on a detached HEAD using the persisted remote and branch', async () => {
 		const home = makeHome();
 		writeStoredState(home, { lastKnownGood: 'c'.repeat(40) });
 		const { run, argv } = scriptedRunner({
-			'git rev-parse --abbrev-ref --symbolic-full-name @{upstream}': fail('HEAD is detached'),
+			'git symbolic-ref --quiet HEAD': fail('HEAD is detached'),
 		});
 
 		const outcome = await apply(home, run);
@@ -384,7 +421,7 @@ describe('applyUpdateTarget — the tracked branch', () => {
 	it('refuses a detached HEAD with nothing persisted, naming the remedy', async () => {
 		const home = makeHome();
 		const { run, argv } = scriptedRunner({
-			'git rev-parse --abbrev-ref --symbolic-full-name @{upstream}': fail('HEAD is detached'),
+			'git symbolic-ref --quiet HEAD': fail('HEAD is detached'),
 		});
 
 		const outcome = await apply(home, run);
