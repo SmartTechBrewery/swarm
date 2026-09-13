@@ -1582,8 +1582,8 @@ const MERGE_TERMINAL_LABELS: Record<string, string> = {
 	'not-eligible': 'No longer eligible for automatic merge',
 	'policy-blocked': 'Blocked by repository policy',
 	unsupported: 'Merge automation unsupported',
-	'provider-error': 'Merge automation hit a provider error',
 	'retry-exhausted': 'Automatic merge retry budget exhausted',
+	'provider-error-exhausted': 'The source-control provider kept failing the merge',
 };
 
 interface ReviewMergeCalloutProps {
@@ -1595,6 +1595,12 @@ interface ReviewMergeCalloutProps {
  * automation state (issue #278): merged automatically, waiting on a durable
  * retry, a terminal refusal, or retry exhaustion. A no-op when the run never
  * attempted a merge (automation disabled, or the verdict wasn't an approval).
+ *
+ * It reads the *last recorded* outcome, so `provider-error` — retried on the
+ * same bounded budget as `not-ready` since issue #923 — renders as waiting.
+ * A pre-#923 row stranded at `provider-error` therefore also reads as retrying;
+ * that is the same aliasing `not-ready` has always had, and telling them apart
+ * would mean handing this callout the dispatch state it is not given.
  */
 export function ReviewMergeCallout({ run }: ReviewMergeCalloutProps) {
 	if (run.phase !== 'review' || !run.reviewMergeOutcome) return null;
@@ -1628,14 +1634,16 @@ export function ReviewMergeCallout({ run }: ReviewMergeCalloutProps) {
 		);
 	}
 
-	if (run.reviewMergeOutcome === 'not-ready') {
+	if (run.reviewMergeOutcome === 'not-ready' || run.reviewMergeOutcome === 'provider-error') {
+		const waitingHeading =
+			run.reviewMergeOutcome === 'provider-error'
+				? 'Merge automation hit a provider error — retrying automatically'
+				: 'Merge automation waiting — retrying automatically';
 		return (
 			<div className="p-4 bg-amber-950/20 border border-amber-900/30 rounded flex items-start gap-3">
 				<AlertTriangle className="h-5 w-5 text-amber-500 shrink-0 mt-0.5" />
 				<div>
-					<h3 className="text-xs font-semibold text-amber-200">
-						Merge automation waiting — retrying automatically
-					</h3>
+					<h3 className="text-xs font-semibold text-amber-200">{waitingHeading}</h3>
 					{run.reviewMergeMessage && (
 						<p className="text-xs text-amber-200/70 mt-1 font-mono whitespace-pre-wrap">
 							{run.reviewMergeMessage}

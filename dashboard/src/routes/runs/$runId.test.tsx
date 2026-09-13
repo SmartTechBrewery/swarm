@@ -581,12 +581,32 @@ describe('ReviewMergeCallout (issue #278)', () => {
 		expect(screen.getByText('required checks are still pending')).toBeDefined();
 	});
 
+	// Issue #923: a provider error is retried on the same bounded budget, so it
+	// reads as waiting rather than as a terminal refusal.
+	it('shows a retrying callout for a provider-error outcome', () => {
+		render(
+			<ReviewMergeCallout
+				run={makeReviewRun({
+					reviewMergeOutcome: 'provider-error',
+					reviewMergeMessage: '502 Bad Gateway',
+				})}
+			/>,
+		);
+
+		expect(
+			screen.getByRole('heading', {
+				name: /provider error — retrying automatically/i,
+			}),
+		).toBeDefined();
+		expect(screen.getByText('502 Bad Gateway')).toBeDefined();
+	});
+
 	it.each([
 		['not-eligible', 'No longer eligible for automatic merge'],
 		['policy-blocked', 'Blocked by repository policy'],
 		['unsupported', 'Merge automation unsupported'],
-		['provider-error', 'Merge automation hit a provider error'],
 		['retry-exhausted', 'Automatic merge retry budget exhausted'],
+		['provider-error-exhausted', 'The source-control provider kept failing the merge'],
 	])('shows a terminal callout for %s', (outcome, heading) => {
 		render(
 			<ReviewMergeCallout
