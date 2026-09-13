@@ -16,7 +16,9 @@ import { logger } from '../lib/logger.js';
 import type { RecoveryMode } from '../queue/jobs.js';
 import {
 	assertRemoteHead,
+	type ConflictHandoff,
 	ConflictHandoffSchema,
+	type ConflictVerification,
 	commitPreparedTree,
 	DeliveryDeferredError,
 	deliveryIdentity,
@@ -124,12 +126,19 @@ interface GuardMigrationJournalOptions {
  * `commitPreparedTree`), so a still-broken journal after the repair pass fails
  * the phase with nothing delivered — never a broken migration state pushed to
  * the PR for a human or a future review pass to discover instead.
+ *
+ * Returns whether a repair pass was attempted, which is exactly the window in
+ * which the hand-off on disk can have changed under the caller: the repair
+ * prompt ends by telling that agent to rewrite the hand-off if its fix changes
+ * `body` or `verification` (`buildMigrationJournalRepairPrompt`). An attempt
+ * that exited non-zero or could not be run counts — it may still have written
+ * the file before it died.
  */
-async function guardMigrationJournal(options: GuardMigrationJournalOptions): Promise<void> {
+async function guardMigrationJournal(options: GuardMigrationJournalOptions): Promise<boolean> {
 	const { worktreePath, taskId, prNumber, headSha } = options;
 	const migrationsDir = join(worktreePath, 'src/db/migrations');
 	const issues = validateMigrationJournal(migrationsDir);
-	if (issues.length === 0) return;
+	if (issues.length === 0) return false;
 
 	logger.warn(
 		'resolve-conflicts: merged migration journal failed validation — running one repair pass',
@@ -176,6 +185,7 @@ async function guardMigrationJournal(options: GuardMigrationJournalOptions): Pro
 		prNumber,
 		headSha,
 	});
+	return true;
 }
 
 /**
@@ -208,6 +218,48 @@ async function settleResolvedPaths(
 			...context,
 			unresolved: settlement.unresolved,
 		});
+}
+
+/**
+ * The verification the agent reported, read for what it says about the merge
+ * (issue #924). A `pre-existing-failure` is delivered — refusing it would only
+ * teach the next agent to write `passed`, which is exactly what the old single
+ * literal did — but it is logged at `warn`, as `settleResolvedPaths` logs the
+ * drift it settles, so a merge delivered with failures stays attributable. A
+ * `failed` entry is the opposite claim — this merge broke it — so it stops the
+ * phase here: before the repair pass, the commit, the push and the comment.
+ *
+ * Called twice on a merge that needed a migration-journal repair pass, because
+ * the hand-off it gates is a file the repair prompt explicitly lets that pass
+ * rewrite. The first call is what saves the wasted agent run; the second reads
+ * what the pass actually left on disk, and is the one the commit, the push and
+ * the comment body are bound to. That path warns twice for a pre-existing
+ * failure both hand-offs report, which is the honest reading — two hand-offs
+ * were gated — and cheaper than teaching this to diff them.
+ *
+ * Deliberately a plain `Error`, not an `UnretryableDeliveryError`: that class is
+ * for refusals nothing between attempts can change, while a re-run resolves the
+ * merge from scratch and can genuinely produce a tree that builds. The message
+ * is what the phase-failure report posts, so it names the commands and the
+ * agent's own detail — a broken merge, not a schema complaint.
+ */
+function assertMergeVerified(
+	handoff: ConflictHandoff,
+	context: { taskId: string; prNumber: string; headSha: string },
+): void {
+	const describe = (entries: readonly ConflictVerification[]) =>
+		entries.map((entry) => `\`${entry.command}\`: ${entry.detail}`).join('; ');
+	const preExisting = handoff.verification.filter((e) => e.outcome === 'pre-existing-failure');
+	if (preExisting.length > 0)
+		logger.warn(
+			'resolve-conflicts: delivering a merge whose failures the agent reports as pre-existing',
+			{ ...context, verification: describe(preExisting) },
+		);
+	const failed = handoff.verification.filter((e) => e.outcome === 'failed');
+	if (failed.length > 0)
+		throw new Error(
+			`resolve-conflicts: the merge for PR #${context.prNumber} fails verification the agent attributes to the merge itself — ${describe(failed)}. Nothing was committed or pushed; the pull request is still conflicted.`,
+		);
 }
 
 export async function runResolveConflictsPhase(
@@ -307,18 +359,21 @@ export async function runResolveConflictsPhase(
 			);
 			throw error;
 		}
-		const handoff = readHandoff(
+		let handoff = readHandoff(
 			handle.path,
 			RESOLVE_CONFLICTS_OUTCOME_FILENAME,
 			ConflictHandoffSchema,
 		);
+		// Before the repair pass and every delivery step, so a merge we are going to
+		// refuse never spends an agent run or reaches the remote (issue #924).
+		assertMergeVerified(handoff, { taskId, prNumber, headSha });
 		// A resumed delivery already passed both gates in the attempt that first
 		// wrote `handoff` — delivery progress only exists past this point — so they
 		// are safe to skip here; only a fresh merge this call actually produced
 		// needs checking. See `validateMigrationJournal`'s own header (issue
 		// #503/#508) and `settleResolvedPaths` above (issue #844) for why each exists.
 		if (!shouldResumeDelivery) {
-			await guardMigrationJournal({
+			const repairPassRan = await guardMigrationJournal({
 				worktreePath: handle.path,
 				cli,
 				model,
@@ -334,6 +389,20 @@ export async function runResolveConflictsPhase(
 			});
 			// After the repair pass, which can still edit files.
 			await settleResolvedPaths(handle.path, { taskId, prNumber, headSha });
+			// The repair prompt tells that pass to rewrite the hand-off when its fix
+			// changes `body` or `verification`, so the gate above only ever covered what
+			// the merge agent wrote. Re-read and re-gate whatever it actually left, and
+			// bind the delivery steps to that: otherwise a repair pass that re-ran the
+			// suite and reported `failed` would be committed, pushed and commented on
+			// with the pre-repair body claiming success.
+			if (repairPassRan) {
+				handoff = readHandoff(
+					handle.path,
+					RESOLVE_CONFLICTS_OUTCOME_FILENAME,
+					ConflictHandoffSchema,
+				);
+				assertMergeVerified(handoff, { taskId, prNumber, headSha });
+			}
 		}
 		const delivery =
 			options.delivery ??

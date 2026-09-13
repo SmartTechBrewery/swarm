@@ -63,12 +63,26 @@ export function buildResolveConflictsPrompt(
 		...migrationConflictGuidance(input.baseBranch),
 		...INDEX_RESOLUTION_GUIDANCE,
 		'Run the relevant lint, type-check, and tests. Do not commit, push, comment, or perform any GitHub mutation; leave the fully resolved merge staged in the working tree for SWARM.',
-		`Write ${RESOLVE_CONFLICTS_OUTCOME_FILENAME} as JSON with status:"resolved", body (the concise result comment), and verification [{command,outcome:"passed"}].`,
+		`Write ${RESOLVE_CONFLICTS_OUTCOME_FILENAME} as JSON with status:"resolved", \`body\` (a single string — the concise result comment), and \`verification\`: an array of one \`{command, outcome, detail}\` object per command you actually ran, at least one. \`command\` is a single string, one command line; \`outcome\` is a single string, exactly one of \`passed\`, \`pre-existing-failure\` or \`failed\`; \`detail\` is a single string and is required for anything that is not \`passed\`.`,
+		...VERIFICATION_OUTCOME_GUIDANCE,
 		...checkpointInstructions('resolve-conflicts'),
 		...(input.checkpoint ? checkpointContinuationSection(input.checkpoint) : []),
 		...projectInstructionsParagraph(customPrompt),
 	].join('\n\n');
 }
+
+/**
+ * What the three verification outcomes mean, stated where the agent chooses one
+ * (issue #924). The schema used to accept only `passed`, so an agent that ran the
+ * suite, found failures and *proved* on a pristine unmerged head that they
+ * pre-existed could either claim a pass or lose its finished merge to a hand-off
+ * validation error — twice in one day it wrote the truth into `outcome` as prose
+ * and the whole run was discarded. The explanation now has a slot of its own, and
+ * this paragraph is what stops it going back into `outcome`.
+ */
+const VERIFICATION_OUTCOME_GUIDANCE = [
+	'Never put an explanation in `outcome` — it is one of those three words and nothing else; the explanation goes in `detail`. Use `pre-existing-failure` only for a failure you reproduced **without** this merge (re-run the same command on the unmerged branch head in a separate checkout) and say in `detail` how you established that: reporting one honestly does not fail the phase, and it must never be relabelled `passed`. Use `failed` for a failure this merge caused, or one you could not show pre-exists — SWARM then refuses the merge and delivers nothing.',
+];
 
 /**
  * Standing guidance for the one conflict shape a generic "preserve both
