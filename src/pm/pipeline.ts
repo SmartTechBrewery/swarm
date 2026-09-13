@@ -75,3 +75,48 @@ export function resolvePipelinePhaseForStatusKey(statusKey: string): PipelinePha
 	// a valid "not applicable" miss (returns `undefined`), not a type error.
 	return (PM_STATUS_TO_PHASE as Readonly<Record<string, PipelinePhase>>)[statusKey];
 }
+
+/**
+ * Every phase a board status can start — the runtime list behind
+ * {@link PM_STATUS_TO_PHASE}'s values, which {@link PipelinePhase} is the type
+ * of. Exists because a *query* needs the set as data (issue #909): the board
+ * move that retires a card's stale queued phase must ask the dispatch table for
+ * board-driven rows only, so an SCM-driven phase sharing the task id — a
+ * `review` keyed on `task-<pr>` — is never swept up by a card's move.
+ *
+ * Typed `satisfies readonly PipelinePhase[]` so adding a board-driven phase to
+ * the map above without adding it here fails to compile rather than silently
+ * leaving the new phase un-retirable.
+ */
+export const BOARD_DRIVEN_PHASES = [
+	'planning',
+	'implementation',
+] as const satisfies readonly PipelinePhase[];
+
+/**
+ * Statuses a *phase* writes about itself rather than an operator asking for one.
+ * Implementation reports `inProgress` when it picks the task up (see
+ * {@link PM_STATUS_TO_PHASE}'s own note), so a board event observing that status
+ * says nothing about which phase is wanted — and must never retire a queued
+ * phase (issue #909), in particular not the reporting phase's own deferred
+ * retry, which resumes from the very event that observes In progress.
+ *
+ * Deliberately *not* the complement of {@link PM_STATUS_TO_PHASE}: `backlog`,
+ * `inReview` and `done` also start no phase, but each of them is an operator
+ * instruction — "stop working on this" — and retires a queued phase like any
+ * other move.
+ */
+export const PM_PHASE_REPORTED_STATUS_KEYS = [
+	'inProgress',
+] as const satisfies readonly PmStatusKey[];
+
+/**
+ * Whether a status key is one a phase reports about itself
+ * ({@link PM_PHASE_REPORTED_STATUS_KEYS}). Widened past {@link PmStatusKey} for
+ * the same reason {@link resolvePipelinePhaseForStatusKey} is: the key comes
+ * from an opaque board option, so an unrecognized or absent one is a valid miss
+ * — and answers `false`, because it is not a phase's own report.
+ */
+export function isPhaseReportedStatusKey(statusKey: string | undefined): boolean {
+	return (PM_PHASE_REPORTED_STATUS_KEYS as readonly string[]).includes(statusKey ?? '');
+}

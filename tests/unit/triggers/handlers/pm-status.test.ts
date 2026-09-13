@@ -1,13 +1,18 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { retireSupersededBoardPhases as RetireSuperseded } from '@/dispatch/board-phase-retirement.js';
 import type { PmEvent } from '@/pm/events.js';
 import type { PMProvider, WorkItem } from '@/pm/types.js';
 
 vi.mock('@/triggers/pm-status-dedup.js', () => ({ recordStatusAndDetectChange: vi.fn() }));
+vi.mock('@/dispatch/board-phase-retirement.js', () => ({
+	retireSupersededBoardPhases: vi.fn<typeof RetireSuperseded>(),
+}));
 
 // The handler resolves the project's board adapter through the PM registry, which
 // is populated by the integrations entrypoint at module load — import it so the
 // `github-projects` manifest (and its real `isStatusChange`) is registered.
 import '@/integrations/entrypoint.js';
+import { retireSupersededBoardPhases } from '@/dispatch/board-phase-retirement.js';
 import { buildPreplanContract, embedPreplanMarker, PLANNED_LABEL } from '@/pipeline/preplan.js';
 import { createPmStatusTrigger } from '@/triggers/handlers/pm-status.js';
 import { recordStatusAndDetectChange } from '@/triggers/pm-status-dedup.js';
@@ -23,6 +28,8 @@ const PROJECT = createMockProjectConfig();
 beforeEach(() => {
 	vi.mocked(recordStatusAndDetectChange).mockReset();
 	vi.mocked(recordStatusAndDetectChange).mockResolvedValue(true);
+	vi.mocked(retireSupersededBoardPhases).mockReset();
+	vi.mocked(retireSupersededBoardPhases).mockResolvedValue(0);
 });
 
 /**
@@ -350,6 +357,124 @@ describe('pm-status trigger', () => {
 			const workItem = createMockWorkItem({ statusId: '61e4505c' });
 			await trigger.handle(ctx(workItem, { itemId: 'PVTI_specific' }, seen));
 			expect(seen).toEqual(['PVTI_specific']);
+		});
+	});
+
+	// Issue #909 — the card's current column is the single source of truth for which
+	// board-driven phase is queued for it. Every case here asserts on the call the
+	// handler makes into the dispatch layer; what that call then settles is the
+	// retirement module's own suite (unit + integration).
+	describe('retiring the board phase an earlier move left queued', () => {
+		it('Planning → ToDo: keeps Implementation and retires the rest', async () => {
+			const workItem = createMockWorkItem({
+				statusId: '3121a97d', // ToDo
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/12',
+			});
+
+			const result = await trigger.handle(ctx(workItem));
+
+			expect(retireSupersededBoardPhases).toHaveBeenCalledWith({
+				projectId: PROJECT.id,
+				taskId: '12',
+				keepPhase: 'implementation',
+				excludeDispatchId: 'dispatch-1',
+			});
+			expect(result).toEqual({ phase: 'implementation', taskId: '12', workItem });
+		});
+
+		it('ToDo → Planning: keeps Planning and retires the rest', async () => {
+			const workItem = createMockWorkItem({
+				statusId: '61e4505c', // Planning
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/10',
+			});
+
+			await trigger.handle(ctx(workItem));
+
+			expect(retireSupersededBoardPhases).toHaveBeenCalledWith(
+				expect.objectContaining({ taskId: '10', keepPhase: 'planning' }),
+			);
+		});
+
+		// The same rule, not a second one: a column that starts nothing retires the
+		// waiting dispatch and enqueues nothing.
+		it.each([
+			['Backlog', 'f75ad846'],
+			['In review', 'df73e18b'],
+			['Done', '98236657'],
+		])('%s retires with no phase to keep, and starts nothing', async (_name, statusId) => {
+			const workItem = createMockWorkItem({
+				statusId,
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/10',
+			});
+
+			expect(await trigger.handle(ctx(workItem))).toBeNull();
+			expect(retireSupersededBoardPhases).toHaveBeenCalledWith(
+				expect.objectContaining({ taskId: '10', keepPhase: undefined }),
+			);
+		});
+
+		// A phase's own status report retires nothing (`PM_PHASE_REPORTED_STATUS_KEYS`):
+		// Implementation moves its card here to report the pickup, and retiring on it
+		// would kill that very phase's own deferred retry.
+		it('In progress retires nothing', async () => {
+			const workItem = createMockWorkItem({
+				statusId: '47fc9ee4', // In progress
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/10',
+			});
+
+			expect(await trigger.handle(ctx(workItem))).toBeNull();
+			expect(retireSupersededBoardPhases).not.toHaveBeenCalled();
+		});
+
+		it('a deferred PM phase resuming from its original event retires nothing', async () => {
+			const workItem = createMockWorkItem({
+				statusId: '47fc9ee4', // In progress — where its own status report left it
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/138',
+			});
+
+			const result = await trigger.handle({ ...ctx(workItem), resumePmPhase: 'implementation' });
+
+			expect(retireSupersededBoardPhases).not.toHaveBeenCalled();
+			expect(result).toEqual({ phase: 'implementation', taskId: '138', workItem });
+		});
+
+		it('a within-column reorder retires nothing', async () => {
+			vi.mocked(recordStatusAndDetectChange).mockResolvedValue(false);
+			const workItem = createMockWorkItem({
+				statusId: '61e4505c', // Planning
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/10',
+			});
+
+			expect(await trigger.handle(ctx(workItem))).toBeNull();
+			expect(retireSupersededBoardPhases).not.toHaveBeenCalled();
+		});
+
+		// Nothing to key the retirement on — for a phase-starting column and a
+		// non-phase one alike.
+		it.each([
+			['a draft card', { taskRef: undefined }],
+			['a card linked in another repository', { taskRepository: 'acme/other' }],
+		])('%s retires nothing', async (_name, linkage) => {
+			for (const statusId of ['61e4505c', 'f75ad846']) {
+				const workItem = createMockWorkItem({ statusId, taskRef: '10', ...linkage });
+				expect(await trigger.handle(ctx(workItem))).toBeNull();
+			}
+			expect(retireSupersededBoardPhases).not.toHaveBeenCalled();
+		});
+
+		// The retirement runs before the `planned` gate on purpose: what the board says
+		// is what the queue holds, and dragging back to ToDo re-queues Implementation.
+		it('a `planned` card dragged to Planning retires the queued Implementation and starts nothing', async () => {
+			const workItem = createMockWorkItem({
+				statusId: '61e4505c', // Planning
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/10',
+				labels: [{ id: 'l1', name: PLANNED_LABEL }],
+			});
+
+			expect(await trigger.handle(ctx(workItem))).toBeNull();
+			expect(retireSupersededBoardPhases).toHaveBeenCalledWith(
+				expect.objectContaining({ taskId: '10', keepPhase: 'planning' }),
+			);
 		});
 	});
 });
