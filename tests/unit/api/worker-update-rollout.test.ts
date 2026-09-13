@@ -60,6 +60,8 @@ import type {
 } from '@/identity/worker-update-rollout.js';
 
 const OWNER_ID = '00000000-0000-4000-8000-0000000000aa';
+/** Who asked for the update on a machine's row (issue #922) — the rollout's own requester. */
+const REQUESTER_ID = OWNER_ID;
 const ROLLOUT_ID = '99999999-9999-4999-8999-999999999999';
 const WORKER_A = '11111111-1111-4111-8111-111111111111';
 const WORKER_B = '22222222-2222-4222-8222-222222222222';
@@ -99,6 +101,7 @@ function reported(
 			requestId: null,
 			target: 'main',
 			requestedAt: new Date('2026-09-13T11:05:00Z'),
+			requestedByUserId: REQUESTER_ID,
 			status,
 			message: status === 'failed' ? 'npm ci exited 1' : 'restarting',
 			reportedAt: new Date('2026-09-13T11:50:00Z'),
@@ -241,6 +244,7 @@ function fanoutEntry(
 					requestId: null,
 					target: 'main',
 					requestedAt: NOW,
+					requestedByUserId: REQUESTER_ID,
 					status: null,
 					message: null,
 					reportedAt: null,
@@ -274,6 +278,8 @@ describe('advanceRollout — taking a wave', () => {
 		expect(fanOutWorkerUpdate).toHaveBeenCalledExactlyOnceWith(
 			[expect.objectContaining({ id: WORKER_A }), expect.objectContaining({ id: WORKER_B })],
 			'main',
+			// Issue #922 — the rollout's own requester, not whoever's tick advanced it.
+			OWNER_ID,
 		);
 		expect(view?.members.map((member) => member.state)).toEqual([
 			'signalled',
@@ -302,6 +308,7 @@ describe('advanceRollout — taking a wave', () => {
 		expect(fanOutWorkerUpdate).toHaveBeenCalledExactlyOnceWith(
 			[expect.objectContaining({ id: WORKER_A })],
 			'main',
+			OWNER_ID,
 		);
 		expect(view?.members.map((member) => member.state)).toEqual(['signalled', 'draining']);
 	});
@@ -336,6 +343,7 @@ describe('advanceRollout — taking a wave', () => {
 					requestId: REQUEST_A,
 					target: 'main',
 					requestedAt: NOW,
+					requestedByUserId: REQUESTER_ID,
 					status: null,
 					message: null,
 					reportedAt: null,
@@ -539,6 +547,7 @@ describe('advanceRollout — settling what a machine reported', () => {
 					requestId: '77777777-7777-4777-8777-777777777777',
 					target: 'some-other-branch',
 					requestedAt: NOW,
+					requestedByUserId: REQUESTER_ID,
 					status: null,
 					message: null,
 					reportedAt: null,

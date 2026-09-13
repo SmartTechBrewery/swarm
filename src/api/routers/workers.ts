@@ -4,7 +4,7 @@ import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 
 import { findProjectByIdFromDb } from '../../db/repositories/projectsRepository.js';
-import { findUserByIdentifier } from '../../db/repositories/usersRepository.js';
+import { findUserByIdentifier, listUsers } from '../../db/repositories/usersRepository.js';
 import { removeWorker } from '../../db/repositories/workersRepository.js';
 import { AgentCliSchema } from '../../harness/agent-cli.js';
 import { isInstanceAdmin, type SwarmUser } from '../../identity/schema.js';
@@ -30,6 +30,7 @@ import {
 	listProjectRoster,
 	listProjectWorkerIdsInOrder,
 	moveProjectWorkerOrder,
+	type RosterOwner,
 	setEnrollmentStatus,
 	setSharingConsent,
 	updateEnrollmentConstraints,
@@ -38,6 +39,7 @@ import {
 import {
 	declareWorkerCapabilities,
 	getWorker,
+	listAllWorkers,
 	listWorkersForOwner,
 	registerWorker,
 	renameWorker,
@@ -48,6 +50,7 @@ import {
 import { RolloutWaveSizeSchema } from '../../identity/worker-update-rollout.js';
 import { requireProjectSCMProviderId } from '../../integrations/scm/registry.js';
 import { WorkerUpdateTargetSchema } from '../../lib/build-identity.js';
+import { logger } from '../../lib/logger.js';
 import { publishWorkerUpdateRequest } from '../../queue/worker-updates.js';
 import { TriggerPhaseSchema } from '../../triggers/types.js';
 import {
@@ -93,7 +96,15 @@ import { workerScmCredentialsRouter } from './workerScmCredentials.js';
  *   which is the comparand that verdict was reached against and is one value for
  *   the whole installation rather than a per-row fact. Every one of the three is
  *   three-valued: an undeclared build and an unresolvable comparand both read as
- *   "no answer", never as stale.
+ *   "no answer", never as stale. **One installation-wide *mutation* joins them**
+ *   (`requestUpdateForInstallation`, issue #922): an administrator asks every
+ *   machine on the installation to move to a build, including machines they do not
+ *   own. It is an administrator's call on #647's terms — `FORBIDDEN` for anybody
+ *   else, never narrowed to their own machines — because it only ever *asks*: the
+ *   host opt-in (`SWARM_WORKER_SELF_UPDATE`) and the drain that makes a machine
+ *   askable at all both stay the owner's, so nothing #800 reserved to them moves.
+ *   The procedure's own comment carries the full reasoning and
+ *   `docs/onboarding-worker.md` states it for operators.
  * - **Owner self-service**, scoped to `ctx.user`: an owner registers a new
  *   machine (`register`, issue #799 — the network equivalent of `swarm workers
  *   register`, and the only procedure here that returns a secret), lists *their
@@ -348,6 +359,26 @@ function serializeWorkerUpdate(update: WorkerUpdateState | null) {
 		requestedAt: update.requestedAt.toISOString(),
 		reportedAt: update.reportedAt?.toISOString() ?? null,
 	};
+}
+
+/**
+ * Every user on the installation, keyed by id, in the non-secret {@link RosterOwner}
+ * shape the rosters already report an owner in (issue #922).
+ *
+ * One read rather than a lookup per machine: an installation-wide fan-out labels
+ * every row, and a `listUsers()` on an installation that has a handful of operators
+ * is cheaper than N round trips. Nothing here decides visibility — the caller has
+ * already been established as an `instanceAdmin`, for whom every machine and its
+ * owner are visible anyway — and no credential material is in `SwarmUser` to leak.
+ */
+async function resolveWorkerOwners(): Promise<Map<string, RosterOwner>> {
+	const users = await listUsers();
+	return new Map(
+		users.map((user) => [
+			user.id,
+			{ userId: user.id, identifier: user.identifier, displayName: user.displayName },
+		]),
+	);
 }
 
 /**
@@ -726,7 +757,12 @@ export const workersRouter = router({
 		.mutation(async ({ ctx, input }) => {
 			await resolveStrictlyOwnedWorker(ctx.user, input.workerId);
 			const requestId = randomUUID();
-			const result = await requestWorkerUpdate(input.workerId, requestId, input.target);
+			const result = await requestWorkerUpdate(
+				input.workerId,
+				requestId,
+				input.target,
+				ctx.user.id,
+			);
 			if (result.outcome === 'not-found') throw workerNotFound(input.workerId);
 			if (result.outcome === 'in-pool') {
 				throw new TRPCError({
@@ -759,9 +795,11 @@ export const workersRouter = router({
 	// Strictly owner-scoped, and named for that scope: the set is
 	// `listWorkersForOwner(ctx.user.id)` and nothing else, which inherits
 	// `requestUpdate`'s owner-only rule rather than restating it. Whether an
-	// `instanceAdmin` may signal machines they do not own is issue #922's question,
-	// and this procedure must not answer it by accident — hence `ForMine` (mirroring
-	// `listMine`), which also leaves the admin-facing name free.
+	// `instanceAdmin` may signal machines they do not own was issue #922's question,
+	// and it is answered by `requestUpdateForInstallation` below rather than here —
+	// hence `ForMine` (mirroring `listMine`), which left the admin-facing name free.
+	// An `instanceAdmin` calling *this* one still gets their own machines and nobody
+	// else's, so the two selections stay separate procedures with separate rules.
 	//
 	// Unlike `requestUpdate` it refuses **no** machine for its state: a fleet action
 	// that aborted on one un-drained machine would tell the operator nothing about the
@@ -777,7 +815,7 @@ export const workersRouter = router({
 		.input(z.object({ target: WorkerUpdateTargetSchema }))
 		.mutation(async ({ ctx, input }) => {
 			const workers = await listWorkersForOwner(ctx.user.id);
-			const entries = await fanOutWorkerUpdate(workers, input.target);
+			const entries = await fanOutWorkerUpdate(workers, input.target, ctx.user.id);
 			return {
 				target: input.target,
 				workers: entries.map((entry) => ({
@@ -785,6 +823,109 @@ export const workersRouter = router({
 					update: serializeWorkerUpdate(entry.update),
 				})),
 			};
+		}),
+
+	// The same request, asked of **every machine on the installation** — the
+	// administrator-facing selection issue #922 settled, and the answer to the
+	// question `requestUpdateForMine` deliberately left open.
+	//
+	// **May an installation administrator ask a machine they do not own? Yes — ask,
+	// and nothing further.** The codebase already held both stances and neither
+	// generalises on its own: issue #800 made `set-scm-credential`, `remove`,
+	// `consent` and `update-enrollment` strictly the machine owner's, while issue
+	// #647 made the unfiltered roster an administrator's view. What settles this one
+	// is that each of #800's four *takes something of the owner's* and keeps it — a
+	// credential the administrator would then hold, the machine's existence, the
+	// owner's consent to share it, the constraints their machine runs under — whereas
+	// this takes nothing and decides nothing. Both of the switches that decide whether
+	// a machine actually moves stay the owner's, and neither needs the administrator's
+	// cooperation to work:
+	//
+	// - **The host opt-in** (`SWARM_WORKER_SELF_UPDATE`, issues #920/#933) is read
+	//   from the machine's own environment and never from the wire. With it unset the
+	//   daemon reports `declined` and carries on working, and unsetting it and
+	//   restarting revokes it outright.
+	// - **Draining** is still strictly the owner's (issue #919) and is *not* widened
+	//   here. The fan-out asks only machines already out of the dispatch pool, so a
+	//   machine its owner has not drained is reported `in-pool` and left untouched.
+	//   An administrator therefore cannot take the installation's capacity down with
+	//   this, and cannot move a machine whose owner has not made it askable.
+	//
+	// So the administrator may put the request; the owner keeps both vetoes. The rule
+	// is written down for operators in `docs/onboarding-worker.md` beside #800's.
+	//
+	// **A non-administrator is refused outright, never narrowed.** No fallback to the
+	// caller's own machines, and no per-worker filtering — an installation-wide action
+	// that silently became an owner-scoped one would be the worst of both, since the
+	// operator would read a partial report as the whole installation. `FORBIDDEN`
+	// rather than the owner-scoped commands' `NOT_FOUND` on #647's own reasoning:
+	// the caller named no worker id, so there is no existence to hide, and nothing
+	// about the installation leaks through the refusal.
+	//
+	// Every request records **who** made it on the machine's own row
+	// (`update_requested_by_user_id`, beside the build and the instant), which is what
+	// makes this auditable now that the requester and the owner can be different
+	// people; the log line below is the fleet-shaped view of the same act.
+	requestUpdateForInstallation: authedProcedure
+		.input(z.object({ target: WorkerUpdateTargetSchema }))
+		.mutation(async ({ ctx, input }) => {
+			if (!isInstanceAdmin(ctx.user)) {
+				throw new TRPCError({
+					code: 'FORBIDDEN',
+					message:
+						`Requesting an update across the installation is available to instance ` +
+						`administrators only. Run \`swarm workers update --all ${input.target}\` to move ` +
+						`the machines you own.`,
+				});
+			}
+			// Grouped by owner before the fan-out rather than after it: the fan-out
+			// preserves input order, so ordering the selection here is what makes the
+			// report read as one block per owner — which is the axis an administrator reads
+			// an installation-wide report along, and the one `listAllWorkers`' oldest-first
+			// order interleaves.
+			const owners = await resolveWorkerOwners();
+			const workers = (await listAllWorkers()).sort((a, b) =>
+				byIdentifier(
+					owners.get(a.ownerUserId)?.identifier ?? a.ownerUserId,
+					owners.get(b.ownerUserId)?.identifier ?? b.ownerUserId,
+				),
+			);
+			const entries = await fanOutWorkerUpdate(workers, input.target, ctx.user.id);
+			const ownerOf = new Map(workers.map((worker) => [worker.id, worker.ownerUserId]));
+			const reported = entries.map((entry) => {
+				const ownerUserId = ownerOf.get(entry.workerId);
+				return {
+					...entry,
+					// `null` rather than an omitted field for an owner the users read did not
+					// carry — a machine deregistered mid-fan-out, say. The roster reports an
+					// unresolvable owner the same way, and a reader must print "unknown" for it
+					// rather than silently attribute the machine to nobody in particular.
+					owner: ownerUserId === undefined ? null : (owners.get(ownerUserId) ?? null),
+					// The machine's own last word on its host opt-in (issue #933): `declined` is
+					// reported by nothing else, so it is the only signal the control plane has
+					// that this owner has opted out. Derived rather than stored, because it is
+					// only ever true of a machine that has *answered* — a machine nobody has
+					// asked yet has not opted out, it is simply unknown.
+					optedOut: entry.lastReportedStatus === 'declined',
+					update: serializeWorkerUpdate(entry.update),
+				};
+			});
+			// The audit line for the action as a whole — who asked, for which build, for
+			// which machines, and what became of each. The durable per-machine record is on
+			// the rows themselves; this is what an operator greps when they want the fleet
+			// action rather than one machine's history.
+			logger.info('installation-wide worker update requested', {
+				requestedBy: ctx.user.identifier,
+				requestedByUserId: ctx.user.id,
+				target: input.target,
+				workers: reported.map((entry) => ({
+					workerId: entry.workerId,
+					owner: entry.owner?.identifier ?? null,
+					disposition: entry.disposition,
+					optedOut: entry.optedOut,
+				})),
+			});
+			return { target: input.target, requestedBy: ctx.user.identifier, workers: reported };
 		}),
 
 	// Move **every machine the caller owns** to a build as a staged rollout (issue

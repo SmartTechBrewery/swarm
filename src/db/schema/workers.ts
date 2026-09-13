@@ -144,11 +144,11 @@ export const workers = pgTable(
 		 */
 		buildDirty: boolean('build_dirty'),
 		/**
-		 * The self-update an operator asked this machine for (issue #933), in six
+		 * The self-update an operator asked this machine for (issue #933), in seven
 		 * columns that split cleanly in two: the **request** still outstanding
-		 * (`update_request_id`, `update_target`, `update_requested_at`) and the **last
-		 * outcome** the machine reported (`update_status`, `update_message`,
-		 * `update_reported_at`).
+		 * (`update_request_id`, `update_target`, `update_requested_at`, and
+		 * `update_requested_by_user_id` since issue #922) and the **last outcome** the
+		 * machine reported (`update_status`, `update_message`, `update_reported_at`).
 		 *
 		 * `update_request_id` is the pending marker: non-null means a push is owed an
 		 * answer, and the report route clears it only when the id matches — so a report
@@ -157,7 +157,7 @@ export const workers = pgTable(
 		 *
 		 * `update_target` is deliberately **not** cleared by a report: it is the target
 		 * the outcome beside it concerns, and an outcome naming no build answers nothing.
-		 * Requesting again overwrites all six, so a fresh pending request never shows a
+		 * Requesting again overwrites all seven, so a fresh pending request never shows a
 		 * stale machine's verdict beside it.
 		 *
 		 * All nullable with no default and nothing backfilled, on `draining_since`'s
@@ -172,6 +172,27 @@ export const workers = pgTable(
 		updateRequestId: uuid('update_request_id'),
 		updateTarget: text('update_target'),
 		updateRequestedAt: timestamp('update_requested_at'),
+		/**
+		 * **Who** asked (issue #922) — the seventh column, and the one that stopped
+		 * being inferable when the request stopped always coming from the machine's
+		 * owner. `update_target` and `update_requested_at` above already say which
+		 * build and when; an installation administrator may now ask a machine they do
+		 * not own, so the row has to say on whose word its code was replaced.
+		 *
+		 * Part of the **request** half: written with the three columns above and reset
+		 * by the next request, never by a report — like `update_target`, it is a fact
+		 * about the request the outcome beside it concerns.
+		 *
+		 * `ON DELETE SET NULL` rather than the owner column's `CASCADE`: a worker must
+		 * outlive whoever asked it to update, so a deleted requester leaves the row
+		 * intact and the request unattributed. Nullable with no default and nothing
+		 * backfilled, on `draining_since`'s contract — NULL is what every row written
+		 * before this column says, and what a request whose requester has since been
+		 * deleted says.
+		 */
+		updateRequestedByUserId: uuid('update_requested_by_user_id').references(() => users.id, {
+			onDelete: 'set null',
+		}),
 		updateStatus: text('update_status').$type<WorkerUpdateStatus>(),
 		updateMessage: text('update_message'),
 		updateReportedAt: timestamp('update_reported_at'),

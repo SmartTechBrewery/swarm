@@ -607,6 +607,11 @@ class AdvancePass {
 		const entries = await fanOutWorkerUpdate(
 			idle.map((member) => drained.get(member.workerId) as Worker),
 			this.rollout.target,
+			// The operator who started the rollout, not whoever's tick is advancing it
+			// (issue #922): a rollout advances itself off reports, reconnects and a
+			// periodic sweep, so "who asked" is the row's own `requested_by_user_id` and
+			// never the caller of this pass.
+			this.rollout.requestedByUserId,
 		);
 		for (const entry of entries) {
 			const member = this.members.find((candidate) => candidate.workerId === entry.workerId);

@@ -38,6 +38,8 @@ const OPEN = 1;
 const WORKER_ID = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
 const OTHER_WORKER_ID = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
 const REQUEST_ID = '66666666-6666-4666-8666-666666666666';
+/** Who asked for the update (issue #922) — recorded on the row, never read by the push. */
+const REQUESTER_ID = '00000000-0000-4000-8000-0000000000cc';
 
 type FakeWs = WSContext & { send: ReturnType<typeof vi.fn>; readyState: number };
 
@@ -74,6 +76,7 @@ function pending(target = 'main'): Worker['update'] {
 		requestId: REQUEST_ID,
 		target,
 		requestedAt: new Date('2026-09-13T10:05:00Z'),
+		requestedByUserId: REQUESTER_ID,
 		status: null,
 		message: null,
 		reportedAt: null,
@@ -86,6 +89,7 @@ function reported(): Worker['update'] {
 		requestId: null,
 		target: 'main',
 		requestedAt: new Date('2026-09-13T10:05:00Z'),
+		requestedByUserId: REQUESTER_ID,
 		status: 'applied',
 		message: 'Applied.',
 		reportedAt: new Date('2026-09-13T10:09:00Z'),

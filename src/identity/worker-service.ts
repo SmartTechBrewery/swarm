@@ -28,6 +28,7 @@ import {
 	findWorkerByCredentialHash,
 	getWorkerById,
 	getWorkersByIds,
+	listAllWorkers as listAllWorkersRows,
 	listWorkersForOwner as listWorkersForOwnerRows,
 	recordWorkerUpdateReport as recordWorkerUpdateReportRow,
 	requestWorkerUpdate as requestWorkerUpdateRow,
@@ -248,6 +249,12 @@ export async function setWorkerDraining(
  * `requestId` is minted by the caller, which is also what publishes the
  * notification, so the id it pushes and the id the row waits on are the same value.
  *
+ * `requestedByUserId` is **required**, not optional (issue #922): every request now
+ * records who made it, because the requester stopped being derivable from the row
+ * once an installation administrator could ask a machine they do not own. Leaving it
+ * optional would have made the one caller that most needs attributing the one most
+ * likely to omit it.
+ *
  * **The draining precondition is decided by the write, not by the caller** (issue
  * #921): the row write's own `WHERE` carries it, so the returned
  * {@link WorkerUpdateRequestOutcome} tells `requested` from `in-pool` from
@@ -260,8 +267,14 @@ export async function requestWorkerUpdate(
 	id: string,
 	requestId: string,
 	target: string,
+	requestedByUserId: string,
 ): Promise<WorkerUpdateRequestOutcome> {
-	return requestWorkerUpdateRow(id, requestId, WorkerUpdateTargetSchema.parse(target));
+	return requestWorkerUpdateRow(
+		id,
+		requestId,
+		WorkerUpdateTargetSchema.parse(target),
+		requestedByUserId,
+	);
 }
 
 /**
@@ -312,6 +325,21 @@ export async function getWorkers(ids: string[]): Promise<Worker[]> {
 /** Every worker an owner operates (empty if they operate none). */
 export async function listWorkersForOwner(ownerUserId: string): Promise<Worker[]> {
 	return listWorkersForOwnerRows(ownerUserId);
+}
+
+/**
+ * Every registered worker on the installation, oldest first — the owner-blind twin of
+ * {@link listWorkersForOwner}, and the selection an installation-wide action runs
+ * over (issue #922).
+ *
+ * Exposed on the service seam rather than reached for in the repository so the
+ * installation-wide caller looks exactly like the owner-scoped one and the difference
+ * between them is visibly the *set*, not the layer it was read at. It carries no
+ * authorization of its own: whether a caller may have this set is the API layer's
+ * decision, as it is for every other read here.
+ */
+export async function listAllWorkers(): Promise<Worker[]> {
+	return listAllWorkersRows();
 }
 
 /**

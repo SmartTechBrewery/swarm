@@ -57,6 +57,7 @@ const {
 const {
 	declareWorkerCapabilities,
 	getWorker,
+	listAllWorkers,
 	listWorkersForOwner,
 	registerWorker,
 	renameWorker,
@@ -65,6 +66,9 @@ const {
 } = vi.hoisted(() => ({
 	declareWorkerCapabilities: vi.fn(),
 	getWorker: vi.fn(),
+	// Issue #922 — the installation-wide selection `requestUpdateForInstallation` fans
+	// out over, the owner-blind twin of the one below it.
+	listAllWorkers: vi.fn(),
 	// Issue #921 — the owner-scoped selection `requestUpdateForMine` fans out over.
 	listWorkersForOwner: vi.fn(),
 	registerWorker: vi.fn(),
@@ -94,7 +98,11 @@ const { getMembership, listAccessibleProjectIds } = vi.hoisted(() => ({
 }));
 // Issue #799 — `register` resolves its owner and `projectScmProvider` its project
 // and that project's SCM provider.
-const { findUserByIdentifier } = vi.hoisted(() => ({ findUserByIdentifier: vi.fn() }));
+const { findUserByIdentifier, listUsers } = vi.hoisted(() => ({
+	findUserByIdentifier: vi.fn(),
+	// Issue #922 — `requestUpdateForInstallation` labels every machine with its owner.
+	listUsers: vi.fn(),
+}));
 const { findProjectByIdFromDb } = vi.hoisted(() => ({ findProjectByIdFromDb: vi.fn() }));
 const { requireProjectSCMProviderId } = vi.hoisted(() => ({
 	requireProjectSCMProviderId: vi.fn(),
@@ -127,6 +135,7 @@ vi.mock('@/identity/worker-enrollment-service.js', async () => ({
 vi.mock('@/identity/worker-service.js', () => ({
 	declareWorkerCapabilities,
 	getWorker,
+	listAllWorkers,
 	listWorkersForOwner,
 	registerWorker,
 	renameWorker,
@@ -138,7 +147,7 @@ vi.mock('@/api/worker-update-fanout.js', () => ({ fanOutWorkerUpdate }));
 vi.mock('@/api/worker-update-rollout.js', () => ({ getRolloutForOwner, startRollout }));
 vi.mock('@/db/repositories/workersRepository.js', () => ({ removeWorker }));
 vi.mock('@/identity/membership-service.js', () => ({ getMembership, listAccessibleProjectIds }));
-vi.mock('@/db/repositories/usersRepository.js', () => ({ findUserByIdentifier }));
+vi.mock('@/db/repositories/usersRepository.js', () => ({ findUserByIdentifier, listUsers }));
 // Spread the real modules and override one export each: both are imported
 // elsewhere in this router's module graph (`identity/worker-scm-credential.ts`
 // reads `requireProjectSCMProviderId` and `findProjectByIdFromDb` too), so a
@@ -170,6 +179,8 @@ import { ALL_TRIGGER_PHASES } from '@/triggers/types.js';
 
 const OWNER_ID = '00000000-0000-4000-8000-0000000000aa';
 const OTHER_ID = '00000000-0000-4000-8000-0000000000bb';
+/** Who asked for an update on a machine's row (issue #922). */
+const REQUESTER_ID = OWNER_ID;
 const WORKER_ID = '11111111-1111-4111-8111-111111111111';
 const ENROLLMENT_ID = '44444444-4444-4444-8444-444444444444';
 
@@ -261,6 +272,8 @@ beforeEach(() => {
 		getMembership,
 		listAccessibleProjectIds,
 		findUserByIdentifier,
+		listUsers,
+		listAllWorkers,
 		findProjectByIdFromDb,
 		requireProjectSCMProviderId,
 	]) {
@@ -273,6 +286,9 @@ beforeEach(() => {
 	// decide whether the machine is mid-run (issue #789).
 	deriveWorkerRunState.mockResolvedValue({ busy: false, currentRunId: null });
 	removeWorker.mockResolvedValue(true);
+	// Nobody else on the installation unless a case seeds one (issue #922).
+	listUsers.mockResolvedValue([]);
+	listAllWorkers.mockResolvedValue([]);
 });
 
 describe('workers.list (installation roster, issue #133)', () => {
@@ -1515,6 +1531,7 @@ describe('workers.requestUpdate (owner-only, draining-only, issue #933)', () => 
 				requestId: '66666666-6666-4666-8666-666666666666',
 				target,
 				requestedAt: REQUESTED_AT,
+				requestedByUserId: REQUESTER_ID,
 				status: null,
 				message: null,
 				reportedAt: null,
@@ -1600,7 +1617,14 @@ describe('workers.requestUpdate (owner-only, draining-only, issue #933)', () => 
 
 		const result = await owner.requestUpdate({ workerId: WORKER_ID, target: 'main' });
 
-		expect(requestWorkerUpdate).toHaveBeenCalledWith(WORKER_ID, expect.any(String), 'main');
+		// Issue #922 — the fourth argument is who asked, which for this owner-scoped form
+		// is always the caller themselves.
+		expect(requestWorkerUpdate).toHaveBeenCalledWith(
+			WORKER_ID,
+			expect.any(String),
+			'main',
+			OWNER_ID,
+		);
 		expect(publishWorkerUpdateRequest).toHaveBeenCalledWith(WORKER_ID);
 		expect(result).toMatchObject({
 			workerId: WORKER_ID,
@@ -1656,7 +1680,12 @@ describe('workers.requestUpdate (owner-only, draining-only, issue #933)', () => 
 		const second = await owner.requestUpdate({ workerId: WORKER_ID, target: 'v2' });
 
 		expect(second.requestId).not.toBe(first.requestId);
-		expect(requestWorkerUpdate).toHaveBeenLastCalledWith(WORKER_ID, second.requestId, 'v2');
+		expect(requestWorkerUpdate).toHaveBeenLastCalledWith(
+			WORKER_ID,
+			second.requestId,
+			'v2',
+			OWNER_ID,
+		);
 	});
 });
 
@@ -1677,6 +1706,7 @@ describe('workers.requestUpdateForMine (owner-scoped fan-out, issue #921)', () =
 				requestId: '66666666-6666-4666-8666-666666666666',
 				target: 'main',
 				requestedAt: REQUESTED_AT,
+				requestedByUserId: REQUESTER_ID,
 				status: null,
 				message: null,
 				reportedAt: null,
@@ -1693,15 +1723,16 @@ describe('workers.requestUpdateForMine (owner-scoped fan-out, issue #921)', () =
 		const result = await owner.requestUpdateForMine({ target: 'main' });
 
 		expect(listWorkersForOwner).toHaveBeenCalledExactlyOnceWith(OWNER_ID);
-		expect(fanOutWorkerUpdate).toHaveBeenCalledWith(workers, 'main');
+		expect(fanOutWorkerUpdate).toHaveBeenCalledWith(workers, 'main', OWNER_ID);
 		expect(result.target).toBe('main');
 		expect(result.workers).toHaveLength(1);
 		// The installation roster is never read — this is owner self-service.
 		expect(listDashboardWorkers).not.toHaveBeenCalled();
 	});
 
-	// The guard against this phase answering issue #922 by accident: an installation
-	// administrator gets their *own* machines here, exactly like anybody else.
+	// Issue #922 is answered by `requestUpdateForInstallation`, not by this one: an
+	// installation administrator calling *this* gets their own machines, like anybody
+	// else, so the two selections stay separate rules rather than one that widens.
 	it('gives an instanceAdmin their own machines and nobody else’s', async () => {
 		const admin = workersRouter.createCaller({ user: ADMIN_USER });
 		listWorkersForOwner.mockResolvedValue([]);
@@ -1747,6 +1778,7 @@ describe('workers.requestUpdateForMine (owner-scoped fan-out, issue #921)', () =
 					requestId: null,
 					target: 'main',
 					requestedAt: REQUESTED_AT,
+					requestedByUserId: REQUESTER_ID,
 					status: 'applied',
 					message: 'restarting',
 					reportedAt: REPORTED_AT,
@@ -1775,6 +1807,171 @@ describe('workers.requestUpdateForMine (owner-scoped fan-out, issue #921)', () =
 		const result = await owner.requestUpdateForMine({ target: 'main' });
 
 		expect(result.workers[0]).toMatchObject({ disposition: 'in-pool', update: null });
+	});
+});
+
+describe('workers.requestUpdateForInstallation (installation-wide request, issue #922)', () => {
+	const admin = workersRouter.createCaller({ user: ADMIN_USER });
+	const OTHER_WORKER_ID = '22222222-2222-4222-8222-222222222222';
+	const DRAINED_AT = new Date('2026-09-13T10:00:00Z');
+
+	/** Two machines under two different owners — the case the whole issue is about. */
+	function twoOwners(): Worker[] {
+		return [
+			makeWorker({ drainingSince: DRAINED_AT }),
+			makeWorker({
+				id: OTHER_WORKER_ID,
+				ownerUserId: OTHER_ID,
+				displayName: 'root-box',
+				drainingSince: DRAINED_AT,
+			}),
+		];
+	}
+
+	function fanoutEntry(overrides: Record<string, unknown> = {}) {
+		return {
+			workerId: WORKER_ID,
+			displayName: 'ada-laptop',
+			disposition: 'requested',
+			lastReportedStatus: null,
+			update: null,
+			...overrides,
+		};
+	}
+
+	beforeEach(() => {
+		listUsers.mockResolvedValue([OWNER_USER, ADMIN_USER]);
+	});
+
+	// The answer this issue settled: an administrator may ask machines they do not own.
+	it('fans out over every machine on the installation, not the caller’s own', async () => {
+		const workers = twoOwners();
+		listAllWorkers.mockResolvedValue(workers);
+		fanOutWorkerUpdate.mockResolvedValue([
+			fanoutEntry(),
+			fanoutEntry({ workerId: OTHER_WORKER_ID, displayName: 'root-box' }),
+		]);
+
+		const result = await admin.requestUpdateForInstallation({ target: 'main' });
+
+		expect(listAllWorkers).toHaveBeenCalledOnce();
+		expect(listWorkersForOwner).not.toHaveBeenCalled();
+		expect(fanOutWorkerUpdate).toHaveBeenCalledWith(
+			expect.arrayContaining(workers),
+			'main',
+			ADMIN_USER.id,
+		);
+		expect(result.workers.map((worker) => worker.workerId)).toEqual([WORKER_ID, OTHER_WORKER_ID]);
+	});
+
+	// Every machine is labelled with the person who would have to act on it — the drain
+	// an administrator cannot run, or the opt-in they cannot set.
+	it('names each machine’s owner', async () => {
+		listAllWorkers.mockResolvedValue(twoOwners());
+		fanOutWorkerUpdate.mockResolvedValue([
+			fanoutEntry(),
+			fanoutEntry({ workerId: OTHER_WORKER_ID, displayName: 'root-box' }),
+		]);
+
+		const result = await admin.requestUpdateForInstallation({ target: 'main' });
+
+		expect(result.workers.map((worker) => worker.owner?.identifier)).toEqual([
+			OWNER_USER.identifier,
+			ADMIN_USER.identifier,
+		]);
+		expect(result.requestedBy).toBe(ADMIN_USER.identifier);
+	});
+
+	// The acceptance criterion the fan-out's `lastReportedStatus` exists for: an
+	// administrator has to be able to see which owners have opted out, and `declined`
+	// is the only evidence of that the control plane ever gets.
+	it('marks a machine whose owner has opted out', async () => {
+		listAllWorkers.mockResolvedValue([makeWorker({ drainingSince: DRAINED_AT })]);
+		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry({ lastReportedStatus: 'declined' })]);
+
+		const result = await admin.requestUpdateForInstallation({ target: 'main' });
+
+		expect(result.workers[0]).toMatchObject({ optedOut: true });
+	});
+
+	it('does not call any other outcome an opt-out', async () => {
+		listAllWorkers.mockResolvedValue([makeWorker({ drainingSince: DRAINED_AT })]);
+		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry({ lastReportedStatus: 'failed' })]);
+
+		const result = await admin.requestUpdateForInstallation({ target: 'main' });
+
+		expect(result.workers[0]).toMatchObject({ optedOut: false });
+	});
+
+	// The other half of the authorization decision: asking is an administrator's, but
+	// draining is still the owner's, so a machine in the pool comes back untouched.
+	it('reports a machine its owner has not drained rather than moving it', async () => {
+		listAllWorkers.mockResolvedValue([makeWorker()]);
+		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry({ disposition: 'in-pool' })]);
+
+		const result = await admin.requestUpdateForInstallation({ target: 'main' });
+
+		expect(result.workers[0]).toMatchObject({ disposition: 'in-pool' });
+	});
+
+	// Refused outright, never narrowed: an installation-wide action that quietly became
+	// an owner-scoped one would be read as the whole installation.
+	it('refuses a non-administrator with FORBIDDEN and reads nothing', async () => {
+		await expect(owner.requestUpdateForInstallation({ target: 'main' })).rejects.toThrowError(
+			expect.objectContaining({ code: 'FORBIDDEN' }),
+		);
+		expect(listAllWorkers).not.toHaveBeenCalled();
+		expect(listWorkersForOwner).not.toHaveBeenCalled();
+		expect(fanOutWorkerUpdate).not.toHaveBeenCalled();
+	});
+
+	// The grammar is the security boundary — the value ends up handed to `git` on
+	// unattended machines — so it is checked before the roster is read, and once.
+	it.each([
+		['a URL', 'https://example.com/evil.git'],
+		['a shell fragment', 'main; rm -rf /'],
+		['a git option', '--upload-pack=curl'],
+	])('rejects %s as a target with BAD_REQUEST, reading nothing', async (_what, target) => {
+		await expect(admin.requestUpdateForInstallation({ target })).rejects.toThrowError(
+			expect.objectContaining({ code: 'BAD_REQUEST' }),
+		);
+		expect(listAllWorkers).not.toHaveBeenCalled();
+		expect(fanOutWorkerUpdate).not.toHaveBeenCalled();
+	});
+
+	it('answers an installation with no machines honestly, not with an error', async () => {
+		fanOutWorkerUpdate.mockResolvedValue([]);
+
+		await expect(admin.requestUpdateForInstallation({ target: 'main' })).resolves.toMatchObject({
+			target: 'main',
+			workers: [],
+		});
+	});
+
+	// The same explicit ISO treatment every other timestamp on this router gets.
+	it('serialises the update state’s instants as ISO strings', async () => {
+		listAllWorkers.mockResolvedValue([makeWorker({ drainingSince: DRAINED_AT })]);
+		fanOutWorkerUpdate.mockResolvedValue([
+			fanoutEntry({
+				update: {
+					requestId: '66666666-6666-4666-8666-666666666666',
+					target: 'main',
+					requestedAt: DRAINED_AT,
+					requestedByUserId: ADMIN_USER.id,
+					status: null,
+					message: null,
+					reportedAt: null,
+				},
+			}),
+		]);
+
+		const result = await admin.requestUpdateForInstallation({ target: 'main' });
+
+		expect(result.workers[0]?.update).toMatchObject({
+			requestedByUserId: ADMIN_USER.id,
+			requestedAt: DRAINED_AT.toISOString(),
+			reportedAt: null,
+		});
 	});
 });
 

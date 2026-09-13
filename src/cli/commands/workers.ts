@@ -27,6 +27,16 @@
  * installation admin acting on somebody else's machine gets the same
  * `Enrollment … not found` a stranger does.
  *
+ * Exactly one subcommand goes the other way (issue #922): `request-update` is an
+ * **installation administrator's**, and asks every machine on the installation —
+ * other owners' included — to move to a build. It is not an exception to the rule
+ * above but the other side of it, and the reason is that it only ever *asks*: a
+ * machine acts solely if its own host set `SWARM_WORKER_SELF_UPDATE=true`, and one
+ * its owner has not drained is reported and left alone, so both of the switches that
+ * decide whether anything happens stay the owner's. `docs/onboarding-worker.md`
+ * states the rule beside #800's; a non-administrator running it is refused outright
+ * rather than quietly shown their own machines.
+ *
  * One thing also stopped being atomic: `--active` on `enroll` is a `projectAdmin`
  * call made *after* the create, so an owner who does not administer the project
  * gets a real, pending enrollment plus a refusal. Both paths report the created
@@ -82,6 +92,7 @@
  *   swarm workers update <worker-id> <ref>
  *   swarm workers update --all <ref> [--wave <n>]
  *   swarm workers update --status
+ *   swarm workers request-update <ref>
  *   swarm workers enroll <worker-id> <project-id> --cli <c1,c2,...> [--concurrency <n>] [--active] [--consent]
  *   swarm workers update-enrollment <worker-id> <project-id> [--cli <c1,c2,...>] [--concurrency <n>]
  *   swarm workers approve <worker-id> <project-id>
@@ -131,6 +142,7 @@ Usage:
   swarm workers update <worker-id> <ref>
   swarm workers update --all <ref> [--wave <n>]
   swarm workers update --status
+  swarm workers request-update <ref>
   swarm workers enroll <worker-id> <project-id> --cli <c1,c2,...> [--concurrency <n>] [--active] [--consent]
   swarm workers update-enrollment <worker-id> <project-id> [--cli <c1,c2,...>] [--concurrency <n>]
   swarm workers approve <worker-id> <project-id>
@@ -244,6 +256,20 @@ Usage:
              the same table without advancing anything. One rollout at a time per
              operator: asking for a different ref while one is under way is refused
              rather than re-targeting a fleet mid-move.
+  request-update
+             Ask EVERY machine on the installation — other people's included — to
+             move to <ref>, and print what became of each. An INSTALLATION
+             ADMINISTRATOR's command; anybody else is refused outright rather than
+             shown their own machines. It only ever ASKS: a machine acts solely if
+             its own host sets SWARM_WORKER_SELF_UPDATE=true, and a machine whose
+             owner has not drained it is reported 'in-pool' and left alone, because
+             draining stays the owner's own call. So its owner can refuse it, or
+             stop it later, without asking you. Each line carries the machine, its
+             owner, the disposition (requested | queued-offline | in-pool |
+             already-asked | answered) and 'owner opted out' for a machine that
+             last reported 'declined'. Every request records who made it, so
+             'swarm workers update <worker-id> <ref>' is what an owner runs for
+             their own machine and this is what an administrator runs for the fleet.
   enroll     Enroll a worker into a project with allowed CLIs (--cli, a subset of
              the worker's capabilities) and --concurrency, this worker's share of
              the project. Omit --concurrency for 1 (the default): one of the
@@ -288,6 +314,7 @@ const SUBCOMMANDS = [
 	'drain',
 	'undrain',
 	'update',
+	'request-update',
 	'enroll',
 	'update-enrollment',
 	'approve',
@@ -401,6 +428,31 @@ const RequestedUpdateSchema = z.object({
 	displayName: z.string().min(1),
 	target: z.string().min(1),
 });
+
+/**
+ * `workers.requestUpdateForInstallation` (issue #922) — the installation-wide
+ * request, one entry per machine on the installation.
+ *
+ * `disposition` is read as a plain string on this file's own rule: it is printed
+ * rather than acted on, so a word a newer control plane reports and this build has
+ * never heard of must not make the command fail. `owner` is nullable for the same
+ * tolerance the roster reads it with, and `optedOut` is the server's own derivation
+ * from the machine's last report — not re-derived here, so the two cannot drift.
+ */
+const InstallationUpdateRequestSchema = z.object({
+	target: z.string().min(1),
+	requestedBy: z.string().min(1),
+	workers: z.array(
+		z.object({
+			workerId: z.string().min(1),
+			displayName: z.string().min(1),
+			disposition: z.string().min(1),
+			optedOut: z.boolean(),
+			owner: z.object({ identifier: z.string().min(1) }).nullable(),
+		}),
+	),
+});
+type InstallationUpdateRequest = z.infer<typeof InstallationUpdateRequestSchema>;
 
 /**
  * `workers.startFleetUpdate` / `workers.fleetUpdateStatus` (issue #940) — the whole
@@ -1110,6 +1162,106 @@ async function rolloutCommand(
 	}
 	printRollout(result.rollout, result.action);
 	return 0;
+}
+
+/**
+ * `swarm workers request-update <ref>` (issue #922): ask **every machine on the
+ * installation** — other owners' included — to move to a build, and print what
+ * became of each.
+ *
+ * It is a separate subcommand rather than a flag on `update` because it is a
+ * different *authorization*, not a different scope of the same one. `update` and
+ * `update --all` are the machine owner's own calls about their own machines; this one
+ * is an installation administrator's, and burying that behind `--everyone` would make
+ * the most consequential form the least visible one. The two also answer in different
+ * shapes — this reports a disposition per machine, where `--all` reports a staged
+ * rollout's members — so they would have shared no output either.
+ *
+ * **A request, and only a request**, which is what the printed lines say out loud:
+ * a machine acts solely if its own host opted in, and one its owner has not drained
+ * comes back `in-pool` untouched. Both of those are the *owner's* switches and neither
+ * needs the administrator, so the machines that did not move are as much of the answer
+ * as the ones that did — which is why every machine gets a line and why the exit code
+ * is 0 whatever the dispositions say, exactly as `update --all` is a report rather
+ * than a pass/fail.
+ *
+ * The refusal for a non-administrator is the control plane's own words, printed
+ * verbatim like every other refusal in this file.
+ */
+async function requestUpdateForInstallationCommand(argv: string[]): Promise<number> {
+	const { positionals } = parseArgs({ args: argv, allowPositionals: true });
+	if (positionals.length !== 1) {
+		out.error(
+			'workers request-update: a single <ref> is required — it asks every machine on the installation, so it takes no worker id',
+		);
+		out.info(USAGE);
+		return 1;
+	}
+	const target = positionals[0] as string;
+
+	const operator = requireOperator();
+	if (!operator) return 1;
+
+	const result = await operator.client.mutate(
+		'workers.requestUpdateForInstallation',
+		{ target },
+		parseWith(InstallationUpdateRequestSchema),
+	);
+	printInstallationUpdateRequest(result);
+	return 0;
+}
+
+/**
+ * The installation-wide report: a heading naming who asked and for what, one line per
+ * machine with its owner, and the two lines that say what an administrator can and
+ * cannot do about the machines that did not move.
+ *
+ * Lines are printed in the order the control plane answered in — grouped by owner —
+ * so the machines an administrator would have to go and talk to one person about sit
+ * together.
+ */
+function printInstallationUpdateRequest(result: InstallationUpdateRequest): void {
+	if (result.workers.length === 0) {
+		out.info(
+			`no workers are registered on this installation — nothing to ask for '${result.target}'`,
+		);
+		return;
+	}
+	out.info(
+		`requested '${result.target}' from ${result.workers.length} machine${result.workers.length === 1 ? '' : 's'} on this installation, as ${result.requestedBy}`,
+	);
+	for (const worker of result.workers) {
+		const owner = worker.owner?.identifier ?? 'owner unknown';
+		const optedOut = worker.optedOut ? '\towner opted out' : '';
+		out.info(
+			`${worker.workerId}\t${worker.displayName}\t${owner}\t${worker.disposition}${optedOut}`,
+		);
+	}
+	// The two things an administrator cannot do anything about on their own, named
+	// rather than left to be inferred from a disposition — they are the machine
+	// owner's two switches, and the whole reason this command is allowed to be
+	// installation-wide.
+	const inPool = result.workers.filter((worker) => worker.disposition === 'in-pool');
+	if (inPool.length > 0) {
+		out.info(
+			`  ${inPool.length} still in the dispatch pool and so not asked — draining is the machine owner's own call, so ask ${ownersOf(inPool)} to run 'swarm workers drain <worker-id>', then run this again`,
+		);
+	}
+	const optedOut = result.workers.filter((worker) => worker.optedOut);
+	if (optedOut.length > 0) {
+		out.info(
+			`  ${optedOut.length} last reported 'declined' — ${ownersOf(optedOut)} have not set SWARM_WORKER_SELF_UPDATE=true on those hosts, and that is theirs to decide`,
+		);
+	}
+	out.info(
+		"  every machine asked applies this once it holds no in-flight phase; read what they reported with 'swarm workers list'",
+	);
+}
+
+/** The distinct owners named on a set of report lines, for a line that says who to go and ask. */
+function ownersOf(workers: InstallationUpdateRequest['workers']): string {
+	const owners = [...new Set(workers.map((worker) => worker.owner?.identifier ?? 'their owner'))];
+	return owners.join(', ');
 }
 
 /**
@@ -1894,6 +2046,8 @@ export async function run(argv: string[]): Promise<number> {
 				return await drainCommand(rest, false);
 			case 'update':
 				return await updateWorkerCommand(rest);
+			case 'request-update':
+				return await requestUpdateForInstallationCommand(rest);
 			case 'enroll':
 				return await enrollCommand(rest);
 			case 'update-enrollment':

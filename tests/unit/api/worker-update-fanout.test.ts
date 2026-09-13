@@ -17,8 +17,11 @@ vi.mock('@/queue/worker-updates.js', () => ({ publishWorkerUpdateRequest }));
 
 import { fanOutWorkerUpdate } from '@/api/worker-update-fanout.js';
 import { DEFAULT_WORKER_SUPPORTED_PHASES, type Worker } from '@/identity/worker.js';
+import type { WorkerUpdateStatus } from '@/lib/build-identity.js';
 
 const OWNER_ID = '00000000-0000-4000-8000-0000000000aa';
+/** Who asked (issue #922) — threaded through to the row write, never derived from the machine. */
+const REQUESTER_ID = '00000000-0000-4000-8000-0000000000cc';
 const WORKER_ID = '11111111-1111-4111-8111-111111111111';
 const OTHER_WORKER_ID = '22222222-2222-4222-8222-222222222222';
 const OUTSTANDING_REQUEST_ID = '66666666-6666-4666-8666-666666666666';
@@ -52,6 +55,7 @@ function pending(target: string, overrides: Partial<Worker> = {}): Worker {
 			requestId: OUTSTANDING_REQUEST_ID,
 			target,
 			requestedAt: REQUESTED_AT,
+			requestedByUserId: REQUESTER_ID,
 			status: null,
 			message: null,
 			reportedAt: null,
@@ -61,12 +65,13 @@ function pending(target: string, overrides: Partial<Worker> = {}): Worker {
 }
 
 /** A row whose machine has reported an outcome — `requestId` cleared by the report. */
-function reported(target: string, status: 'applied' | 'failed', overrides: Partial<Worker> = {}) {
+function reported(target: string, status: WorkerUpdateStatus, overrides: Partial<Worker> = {}) {
 	return makeWorker({
 		update: {
 			requestId: null,
 			target,
 			requestedAt: REQUESTED_AT,
+			requestedByUserId: REQUESTER_ID,
 			status,
 			message: status === 'failed' ? 'npm ci exited 1' : 'restarting',
 			reportedAt: new Date('2026-09-13T10:09:00Z'),
@@ -83,6 +88,7 @@ function afterWrite(worker: Worker, target: string): Worker {
 			requestId: 'written-request-id',
 			target,
 			requestedAt: REQUESTED_AT,
+			requestedByUserId: REQUESTER_ID,
 			status: null,
 			message: null,
 			reportedAt: null,
@@ -106,9 +112,14 @@ beforeEach(() => {
 
 describe('fanOutWorkerUpdate (issue #921)', () => {
 	it('records and publishes for a drained machine with a live session', async () => {
-		const entries = await fanOutWorkerUpdate([makeWorker()], 'main');
+		const entries = await fanOutWorkerUpdate([makeWorker()], 'main', REQUESTER_ID);
 
-		expect(requestWorkerUpdate).toHaveBeenCalledWith(WORKER_ID, expect.any(String), 'main');
+		expect(requestWorkerUpdate).toHaveBeenCalledWith(
+			WORKER_ID,
+			expect.any(String),
+			'main',
+			REQUESTER_ID,
+		);
 		expect(publishWorkerUpdateRequest).toHaveBeenCalledExactlyOnceWith(WORKER_ID);
 		expect(entries).toMatchObject([
 			{ workerId: WORKER_ID, displayName: 'ada-laptop', disposition: 'requested' },
@@ -121,16 +132,25 @@ describe('fanOutWorkerUpdate (issue #921)', () => {
 	it('still records and publishes for a machine with no live session', async () => {
 		getLiveSessionForWorker.mockResolvedValue(undefined);
 
-		const entries = await fanOutWorkerUpdate([makeWorker()], 'main');
+		const entries = await fanOutWorkerUpdate([makeWorker()], 'main', REQUESTER_ID);
 
 		expect(entries[0]?.disposition).toBe('queued-offline');
-		expect(requestWorkerUpdate).toHaveBeenCalledWith(WORKER_ID, expect.any(String), 'main');
+		expect(requestWorkerUpdate).toHaveBeenCalledWith(
+			WORKER_ID,
+			expect.any(String),
+			'main',
+			REQUESTER_ID,
+		);
 		expect(publishWorkerUpdateRequest).toHaveBeenCalledExactlyOnceWith(WORKER_ID);
 	});
 
 	// Issue #933's precondition, unrelaxed — but reported rather than thrown.
 	it('skips a machine still in the dispatch pool, writing and publishing nothing', async () => {
-		const entries = await fanOutWorkerUpdate([makeWorker({ drainingSince: null })], 'main');
+		const entries = await fanOutWorkerUpdate(
+			[makeWorker({ drainingSince: null })],
+			'main',
+			REQUESTER_ID,
+		);
 
 		expect(entries).toMatchObject([{ workerId: WORKER_ID, disposition: 'in-pool', update: null }]);
 		expect(requestWorkerUpdate).not.toHaveBeenCalled();
@@ -140,7 +160,7 @@ describe('fanOutWorkerUpdate (issue #921)', () => {
 	// Re-running the command must not cost a second push, and the id the row waits on
 	// has to survive — a report can only ever close the request it names.
 	it('leaves an outstanding request for the same target exactly as it is', async () => {
-		const entries = await fanOutWorkerUpdate([pending('main')], 'main');
+		const entries = await fanOutWorkerUpdate([pending('main')], 'main', REQUESTER_ID);
 
 		expect(entries[0]?.disposition).toBe('already-asked');
 		expect(entries[0]?.update).toMatchObject({
@@ -154,15 +174,20 @@ describe('fanOutWorkerUpdate (issue #921)', () => {
 	// `requestUpdate`'s documented re-issue semantics: a stale request for some other
 	// build must not survive a fleet action moving everything to `target`.
 	it('overwrites an outstanding request for a different target', async () => {
-		const entries = await fanOutWorkerUpdate([pending('v2')], 'main');
+		const entries = await fanOutWorkerUpdate([pending('v2')], 'main', REQUESTER_ID);
 
 		expect(entries[0]?.disposition).toBe('requested');
-		expect(requestWorkerUpdate).toHaveBeenCalledWith(WORKER_ID, expect.any(String), 'main');
+		expect(requestWorkerUpdate).toHaveBeenCalledWith(
+			WORKER_ID,
+			expect.any(String),
+			'main',
+			REQUESTER_ID,
+		);
 	});
 
 	// An `applied` machine is never sent back through an apply it has already done.
 	it('returns a reported outcome for the same target rather than re-asking', async () => {
-		const entries = await fanOutWorkerUpdate([reported('main', 'failed')], 'main');
+		const entries = await fanOutWorkerUpdate([reported('main', 'failed')], 'main', REQUESTER_ID);
 
 		expect(entries[0]?.disposition).toBe('answered');
 		expect(entries[0]?.update).toMatchObject({
@@ -176,10 +201,15 @@ describe('fanOutWorkerUpdate (issue #921)', () => {
 
 	// An outcome about some other build answers nothing about this one.
 	it('asks a machine whose reported outcome names a different target', async () => {
-		const entries = await fanOutWorkerUpdate([reported('v2', 'applied')], 'main');
+		const entries = await fanOutWorkerUpdate([reported('v2', 'applied')], 'main', REQUESTER_ID);
 
 		expect(entries[0]?.disposition).toBe('requested');
-		expect(requestWorkerUpdate).toHaveBeenCalledWith(WORKER_ID, expect.any(String), 'main');
+		expect(requestWorkerUpdate).toHaveBeenCalledWith(
+			WORKER_ID,
+			expect.any(String),
+			'main',
+			REQUESTER_ID,
+		);
 	});
 
 	// The headline: one machine's state never refuses the whole call.
@@ -191,7 +221,7 @@ describe('fanOutWorkerUpdate (issue #921)', () => {
 			pending('main', { id: third, displayName: 'ada-builder' }),
 		];
 
-		const entries = await fanOutWorkerUpdate(workers, 'main');
+		const entries = await fanOutWorkerUpdate(workers, 'main', REQUESTER_ID);
 
 		expect(entries.map((entry) => [entry.workerId, entry.disposition])).toEqual([
 			[WORKER_ID, 'in-pool'],
@@ -203,6 +233,7 @@ describe('fanOutWorkerUpdate (issue #921)', () => {
 			OTHER_WORKER_ID,
 			expect.any(String),
 			'main',
+			REQUESTER_ID,
 		);
 	});
 
@@ -213,6 +244,7 @@ describe('fanOutWorkerUpdate (issue #921)', () => {
 		await fanOutWorkerUpdate(
 			[makeWorker(), makeWorker({ id: OTHER_WORKER_ID, displayName: 'ada-desktop' })],
 			'main',
+			REQUESTER_ID,
 		);
 
 		const [first, second] = requestWorkerUpdate.mock.calls.map((call) => call[1]);
@@ -228,6 +260,7 @@ describe('fanOutWorkerUpdate (issue #921)', () => {
 		const entries = await fanOutWorkerUpdate(
 			[makeWorker(), makeWorker({ id: OTHER_WORKER_ID, displayName: 'ada-desktop' })],
 			'main',
+			REQUESTER_ID,
 		);
 
 		expect(entries.map((entry) => entry.workerId)).toEqual([OTHER_WORKER_ID]);
@@ -243,9 +276,14 @@ describe('fanOutWorkerUpdate (issue #921)', () => {
 		const stillInPool = makeWorker({ drainingSince: null });
 		requestWorkerUpdate.mockResolvedValueOnce({ outcome: 'in-pool', worker: stillInPool });
 
-		const entries = await fanOutWorkerUpdate([makeWorker()], 'main');
+		const entries = await fanOutWorkerUpdate([makeWorker()], 'main', REQUESTER_ID);
 
-		expect(requestWorkerUpdate).toHaveBeenCalledWith(WORKER_ID, expect.any(String), 'main');
+		expect(requestWorkerUpdate).toHaveBeenCalledWith(
+			WORKER_ID,
+			expect.any(String),
+			'main',
+			REQUESTER_ID,
+		);
 		expect(entries).toMatchObject([
 			{ workerId: WORKER_ID, displayName: 'ada-laptop', disposition: 'in-pool', update: null },
 		]);
@@ -265,6 +303,7 @@ describe('fanOutWorkerUpdate (issue #921)', () => {
 		const entries = await fanOutWorkerUpdate(
 			[makeWorker(), makeWorker({ id: OTHER_WORKER_ID, displayName: 'ada-desktop' })],
 			'main',
+			REQUESTER_ID,
 		);
 
 		expect(entries.map((entry) => [entry.workerId, entry.disposition])).toEqual([
@@ -277,13 +316,48 @@ describe('fanOutWorkerUpdate (issue #921)', () => {
 	// A machine that is not asked costs no session lookup — the liveness read decides
 	// only the *word* reported for a machine the write actually accepted.
 	it('reads no live session for a machine it does not ask', async () => {
-		await fanOutWorkerUpdate([makeWorker({ drainingSince: null })], 'main');
+		await fanOutWorkerUpdate([makeWorker({ drainingSince: null })], 'main', REQUESTER_ID);
 
 		expect(getLiveSessionForWorker).not.toHaveBeenCalled();
 	});
 
+	// Issue #922 — the requester is threaded to the durable write rather than inferred
+	// from the machine's owner, because the two are different people the moment an
+	// installation administrator asks.
+	it('records who asked on every machine it writes to', async () => {
+		await fanOutWorkerUpdate(
+			[makeWorker(), makeWorker({ id: OTHER_WORKER_ID, displayName: 'ada-desktop' })],
+			'main',
+			REQUESTER_ID,
+		);
+
+		expect(requestWorkerUpdate.mock.calls.map((call) => [call[0], call[3]])).toEqual([
+			[WORKER_ID, REQUESTER_ID],
+			[OTHER_WORKER_ID, REQUESTER_ID],
+		]);
+	});
+
+	// Issue #922 — a recorded request resets `update_status`, so the pre-request answer
+	// has to travel on the entry or it is gone. `declined` is the one that matters:
+	// it is the only evidence the control plane has that a host has not opted in.
+	it('carries the outcome a machine had reported before it was re-asked', async () => {
+		const entries = await fanOutWorkerUpdate([reported('v2', 'declined')], 'main', REQUESTER_ID);
+
+		expect(entries[0]).toMatchObject({ disposition: 'requested', lastReportedStatus: 'declined' });
+		// And the state it now carries is the *new* request, with no outcome beside it.
+		expect(entries[0]?.update).toMatchObject({ target: 'main', status: null });
+	});
+
+	// A machine that was never asked has not opted out — it is simply unknown, and the
+	// annotation must not invent an answer for it.
+	it('reports no prior outcome for a machine nobody has asked', async () => {
+		const entries = await fanOutWorkerUpdate([makeWorker()], 'main', REQUESTER_ID);
+
+		expect(entries[0]?.lastReportedStatus).toBeNull();
+	});
+
 	it('answers an empty fleet with an empty report', async () => {
-		expect(await fanOutWorkerUpdate([], 'main')).toEqual([]);
+		expect(await fanOutWorkerUpdate([], 'main', REQUESTER_ID)).toEqual([]);
 		expect(requestWorkerUpdate).not.toHaveBeenCalled();
 	});
 });

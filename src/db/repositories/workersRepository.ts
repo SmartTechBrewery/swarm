@@ -92,7 +92,7 @@ function rowToWorker(row: WorkerRow): Worker {
 }
 
 /**
- * Re-assemble the six `update_*` columns into one {@link WorkerUpdateState}, or
+ * Re-assemble the seven `update_*` columns into one {@link WorkerUpdateState}, or
  * `null` when nobody has asked this machine to update (issue #933).
  *
  * Keyed on `update_target`/`update_requested_at` rather than on the pending marker,
@@ -107,6 +107,10 @@ function rowToUpdateState(row: WorkerRow): WorkerUpdateState | null {
 		requestId: row.updateRequestId ?? null,
 		target: row.updateTarget,
 		requestedAt: row.updateRequestedAt,
+		// Who asked (issue #922). NULL for a request recorded before the column existed
+		// and for one whose requester has since been deleted (`ON DELETE SET NULL`), so
+		// a reader must render "unattributed" rather than assume the machine's owner.
+		requestedByUserId: row.updateRequestedByUserId ?? null,
 		status: row.updateStatus ?? null,
 		message: row.updateMessage ?? null,
 		reportedAt: row.updateReportedAt ?? null,
@@ -480,12 +484,17 @@ export type WorkerUpdateRequestOutcome =
  * `target`, replacing any request already outstanding (issue #933) — **only while
  * the machine is draining**.
  *
- * All six columns are written together, so a fresh request never shows the previous
+ * All seven columns are written together, so a fresh request never shows the previous
  * one's verdict beside it: the outcome fields are reset to NULL in the same write
  * that records the new target. Re-targeting is therefore a plain overwrite, which is
  * the only form of "cancel" this phase has — the earlier request's push is simply no
  * longer the one the row is waiting on, and a report for it is recognised as stale
  * by {@link recordWorkerUpdateReport}'s id check.
+ *
+ * `requestedByUserId` is the seventh (issue #922) and is written with the request
+ * rather than derived: the requester and the machine's owner are the same person for
+ * every owner-scoped caller and a different one for the installation-wide command, so
+ * the row records it instead of leaving a reader to assume.
  *
  * **`draining_since IS NOT NULL` is a predicate of the `WHERE`, not a check the
  * caller makes first** (issue #921). The precondition is what makes the whole
@@ -506,6 +515,7 @@ export async function requestWorkerUpdate(
 	id: string,
 	requestId: string,
 	target: string,
+	requestedByUserId: string,
 ): Promise<WorkerUpdateRequestOutcome> {
 	const [updatedRow] = await getDb()
 		.update(workers)
@@ -513,6 +523,7 @@ export async function requestWorkerUpdate(
 			updateRequestId: requestId,
 			updateTarget: target,
 			updateRequestedAt: new Date(),
+			updateRequestedByUserId: requestedByUserId,
 			updateStatus: null,
 			updateMessage: null,
 			updateReportedAt: null,

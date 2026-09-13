@@ -200,6 +200,21 @@ describe('swarm workers', () => {
 			},
 		}));
 		answers.set('workers.fleetUpdateStatus', () => ({ rollout: null }));
+		// Issue #922 — the installation-wide request. One machine per owner; a test that
+		// cares about the table replaces this wholesale through `installation()`.
+		answers.set('workers.requestUpdateForInstallation', (input) => ({
+			target: input.target,
+			requestedBy: IDENTIFIER,
+			workers: [
+				{
+					workerId: WORKER_ID,
+					displayName: 'ada-laptop',
+					disposition: 'requested',
+					optedOut: false,
+					owner: { identifier: IDENTIFIER },
+				},
+			],
+		}));
 		enrollmentRow = {
 			id: ENROLLMENT_ID,
 			status: 'pending',
@@ -1378,6 +1393,115 @@ describe('swarm workers', () => {
 			refuse('workers.startFleetUpdate', message);
 			const error = vi.spyOn(console, 'error');
 			expect(await run(['update', '--all', 'fix/hotfix'])).toBe(1);
+			expect(error).toHaveBeenCalledWith(expect.stringContaining(message));
+		});
+	});
+
+	// Issue #922 — the installation administrator's own command. What this suite owns
+	// is the argument handling and what the report says; the authorization itself is
+	// the control plane's and is asserted in `tests/unit/api/routers/workers.test.ts`.
+	describe('request-update', () => {
+		/** Replace the installation report with one of a given shape. */
+		function installation(workers: Record<string, unknown>[]): void {
+			answers.set('workers.requestUpdateForInstallation', (input) => ({
+				target: input.target,
+				requestedBy: IDENTIFIER,
+				workers,
+			}));
+		}
+
+		function line(overrides: Record<string, unknown> = {}) {
+			return {
+				workerId: WORKER_ID,
+				displayName: 'ada-laptop',
+				disposition: 'requested',
+				optedOut: false,
+				owner: { identifier: IDENTIFIER },
+				...overrides,
+			};
+		}
+
+		it('asks the installation-wide procedure, not the owner-scoped one', async () => {
+			expect(await run(['request-update', 'main'])).toBe(0);
+
+			expect(pathsCalled()).toEqual(['workers.requestUpdateForInstallation']);
+			expect(inputFor('workers.requestUpdateForInstallation')).toEqual({ target: 'main' });
+		});
+
+		// Every machine gets a line with the person who owns it — which is who an
+		// administrator has to go and talk to about the ones that did not move.
+		it('prints a line per machine naming its owner and disposition', async () => {
+			installation([
+				line(),
+				line({
+					workerId: OTHER_WORKER_ID,
+					displayName: 'root-box',
+					disposition: 'queued-offline',
+					owner: { identifier: 'root@example.com' },
+				}),
+			]);
+
+			expect(await run(['request-update', 'main'])).toBe(0);
+
+			const joined = lines().join('\n');
+			expect(joined).toContain(`${WORKER_ID}\tada-laptop\t${IDENTIFIER}\trequested`);
+			expect(joined).toContain(`${OTHER_WORKER_ID}\troot-box\troot@example.com\tqueued-offline`);
+			expect(joined).toContain(`requested 'main' from 2 machines`);
+		});
+
+		// The half of the answer an administrator cannot act on: draining is the owner's
+		// call, so the line names the owner rather than a command to run themselves.
+		it('names the owners of the machines it could not ask', async () => {
+			installation([
+				line({ disposition: 'in-pool', owner: { identifier: 'karolina@example.com' } }),
+			]);
+
+			expect(await run(['request-update', 'main'])).toBe(0);
+
+			const joined = lines().join('\n');
+			expect(joined).toContain('1 still in the dispatch pool');
+			expect(joined).toContain('karolina@example.com');
+			expect(joined).toContain("draining is the machine owner's own call");
+		});
+
+		// The acceptance criterion: an administrator has to be able to see which owners
+		// have opted out, and the only evidence is the machine's own `declined`.
+		it('marks and counts the machines whose owners have opted out', async () => {
+			installation([line({ optedOut: true, owner: { identifier: 'karolina@example.com' } })]);
+
+			expect(await run(['request-update', 'main'])).toBe(0);
+
+			const joined = lines().join('\n');
+			expect(joined).toContain('owner opted out');
+			expect(joined).toContain("1 last reported 'declined'");
+			expect(joined).toContain('SWARM_WORKER_SELF_UPDATE=true');
+		});
+
+		it('says so plainly when the installation has no machines, and exits 0', async () => {
+			installation([]);
+			expect(await run(['request-update', 'main'])).toBe(0);
+			expect(lines().join('\n')).toContain('no workers are registered on this installation');
+		});
+
+		it.each([
+			['no ref', ['request-update']],
+			['a worker id as well', ['request-update', WORKER_ID, 'main']],
+		])('refuses %s, without calling', async (_what, argv) => {
+			const error = vi.spyOn(console, 'error');
+			expect(await run(argv)).toBe(1);
+			expect(error).toHaveBeenCalledWith(expect.stringContaining('a single <ref> is required'));
+			expect(pathsCalled()).toEqual([]);
+		});
+
+		// The refusal a non-administrator meets is the control plane's own words, like
+		// every other refusal this CLI prints.
+		it('surfaces the administrator-only refusal as the control plane words it', async () => {
+			const message =
+				'Requesting an update across the installation is available to instance administrators only.';
+			refuse('workers.requestUpdateForInstallation', message);
+			const error = vi.spyOn(console, 'error');
+
+			expect(await run(['request-update', 'main'])).toBe(1);
 			expect(error).toHaveBeenCalledWith(expect.stringContaining(message));
 		});
 	});
