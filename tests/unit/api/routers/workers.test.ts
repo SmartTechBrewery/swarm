@@ -260,6 +260,28 @@ describe('workers.list (installation roster, issue #133)', () => {
 		expect(listAccessibleProjectIds).not.toHaveBeenCalled();
 	});
 
+	// Issue #925 — `list` spreads the assembled service view, so the build fields need
+	// no mapping here; what this pins is that nothing strips them on the way out, and
+	// that the roster payload stays free of the installation-wide comparand.
+	it('passes the declared build and the server’s verdict through, without the comparand', async () => {
+		const admin = workersRouter.createCaller({ user: ADMIN_USER });
+		listDashboardWorkers.mockResolvedValue([
+			{
+				workerId: WORKER_ID,
+				displayName: 'ada-laptop',
+				lastSeenAt: null,
+				build: { commit: 'b'.repeat(40), dirty: true },
+				buildIsCurrent: false,
+			},
+		]);
+
+		const [row] = await admin.list();
+
+		expect(row.build).toEqual({ commit: 'b'.repeat(40), dirty: true });
+		expect(row.buildIsCurrent).toBe(false);
+		expect(row).not.toHaveProperty('controlPlaneBuild');
+	});
+
 	it('serializes last-seen to an ISO string (and keeps null for a never-connected worker)', async () => {
 		const admin = workersRouter.createCaller({ user: ADMIN_USER });
 		// Named `a`/`b` so the ordering the unscoped list applies (issue #808) leaves
@@ -519,6 +541,26 @@ describe('workers.getById (worker detail, issue #477)', () => {
 
 		expect(getDashboardWorkerDetail).toHaveBeenCalledWith(WORKER_ID, ['p1'], OWNER_ID);
 		expect(detail.lastSeenAt).toBe('2026-07-01T12:00:00.000Z');
+	});
+
+	// Issue #925 — the detail procedure carries the comparand the roster row's verdict
+	// was reached against, which is the one build fact `list` deliberately omits.
+	it('carries the control plane’s own build beside the worker’s, unlike the list', async () => {
+		listAccessibleProjectIds.mockResolvedValue(['p1']);
+		getDashboardWorkerDetail.mockResolvedValue(
+			detailView({
+				build: { commit: 'b'.repeat(40), dirty: false },
+				buildIsCurrent: false,
+				controlPlaneBuild: { commit: 'a'.repeat(40), dirty: false },
+			}),
+		);
+		getMembership.mockResolvedValue(membershipFor('contributor'));
+
+		const detail = await owner.getById({ workerId: WORKER_ID });
+
+		expect(detail.build).toEqual({ commit: 'b'.repeat(40), dirty: false });
+		expect(detail.buildIsCurrent).toBe(false);
+		expect(detail.controlPlaneBuild).toEqual({ commit: 'a'.repeat(40), dirty: false });
 	});
 
 	it('is NOT_FOUND for a worker the viewer may not see, exactly like a missing one', async () => {

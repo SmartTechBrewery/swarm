@@ -72,7 +72,13 @@ import { workerScmCredentialsRouter } from './workerScmCredentials.js';
  *   detail and with what the *viewer* may change, so the detail screen offers only
  *   controls that would succeed. It stays bounded by `accessibleProjectScope` for
  *   non-owners, while a strict owner may also open their own un-enrolled worker to
- *   create its first enrollment.
+ *   create its first enrollment. Both rows carry the machine's declared SWARM
+ *   `build` and the server-derived `buildIsCurrent` verdict (issue #925), and
+ *   `getById` alone also carries `controlPlaneBuild` — the API server's own build,
+ *   which is the comparand that verdict was reached against and is one value for
+ *   the whole installation rather than a per-row fact. Every one of the three is
+ *   three-valued: an undeclared build and an unresolvable comparand both read as
+ *   "no answer", never as stale.
  * - **Owner self-service**, scoped to `ctx.user`: an owner registers a new
  *   machine (`register`, issue #799 — the network equivalent of `swarm workers
  *   register`, and the only procedure here that returns a secret), lists *their

@@ -28,6 +28,7 @@ import {
 } from '@/pipeline/resolve-conflicts.js';
 import {
 	assertRemoteHead,
+	CONFLICT_VERIFICATION_OUTCOMES,
 	commitPreparedTree,
 	HANDOFF_FILENAMES,
 	type ScmDeliveryProvider,
@@ -61,7 +62,9 @@ function agentResult(overrides: Partial<AgentCliResult> = {}): AgentCliResult {
 }
 
 /** A real temp worktree with a valid resolve-conflicts hand-off already written — the agent's "output". */
-function makeWorktree(): string {
+function makeWorktree(
+	verification: unknown = [{ command: 'npm test', outcome: 'passed' }],
+): string {
 	const root = mkdtempSync(join(tmpdir(), 'swarm-resolve-conflicts-'));
 	roots.push(root);
 	writeFileSync(
@@ -69,7 +72,7 @@ function makeWorktree(): string {
 		JSON.stringify({
 			status: 'resolved',
 			body: 'Merged main; resolved every conflict.',
-			verification: [{ command: 'npm test', outcome: 'passed' }],
+			verification,
 		}),
 	);
 	return root;
@@ -110,6 +113,16 @@ function corruptMigrationsWithPhantomEntry(worktreePath: string): void {
 		tag: '0099_phantom',
 	});
 	writeFileSync(journalPath, JSON.stringify(journal));
+}
+
+/**
+ * Rewrite the hand-off the way `buildMigrationJournalRepairPrompt`'s last
+ * paragraph tells the repair pass to when its fix changes `body` or
+ * `verification`.
+ */
+function rewriteHandoff(worktreePath: string, patch: Record<string, unknown>): void {
+	const path = join(worktreePath, HANDOFF_FILENAMES.resolveConflicts);
+	writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, 'utf8')), ...patch }));
 }
 
 /** Fix the phantom entry the way the repair pass is instructed to (drop it). */
@@ -320,6 +333,118 @@ describe('runResolveConflictsPhase — migration-journal gate (issue #503/#508)'
 	});
 });
 
+/**
+ * Issue #924. The schema now lets the agent say a command failed; this is the
+ * half that decides what SWARM does about it — deliver a merge whose failures
+ * predate it, refuse one it broke.
+ */
+describe('runResolveConflictsPhase — verification outcomes (issue #924)', () => {
+	const preExisting = [
+		{ command: 'npm run lint', outcome: 'passed' },
+		{
+			command: 'npm test',
+			outcome: 'pre-existing-failure',
+			detail: 'reproduced identically on the unmerged pristine head in a separate scratch clone',
+		},
+	];
+
+	it('delivers a merge whose only failures the agent proved are pre-existing', async () => {
+		const worktreePath = makeWorktree(preExisting);
+		writeCleanMigrations(worktreePath, ['0000_first', '0001_second']);
+		const deps = makeDeps(worktreePath);
+
+		const { outcome } = await runResolveConflictsPhase(deps);
+
+		expect(outcome.status).toBe('resolved');
+		expect(commitPreparedTree).toHaveBeenCalledTimes(1);
+		expect(deps.delivery.pushBranch).toHaveBeenCalledTimes(1);
+		expect(deps.delivery.postComment).toHaveBeenCalledTimes(1);
+	});
+
+	it('refuses a merge the agent reports it broke, delivering nothing', async () => {
+		const worktreePath = makeWorktree([
+			{ command: 'npm run build', outcome: 'failed', detail: 'the merged tree does not compile' },
+		]);
+		writeCleanMigrations(worktreePath, ['0000_first', '0001_second']);
+		const deps = makeDeps(worktreePath);
+
+		await expect(runResolveConflictsPhase(deps)).rejects.toThrow(
+			/fails verification the agent attributes to the merge itself — `npm run build`: the merged tree does not compile/,
+		);
+		expect(assertRemoteHead).not.toHaveBeenCalled();
+		expect(commitPreparedTree).not.toHaveBeenCalled();
+		expect(deps.delivery.pushBranch).not.toHaveBeenCalled();
+		expect(deps.delivery.postComment).not.toHaveBeenCalled();
+	});
+
+	// The only reason the gate's placement is observable: a refused merge must not
+	// spend the migration-journal guard's one repair pass either.
+	it('refuses it before the migration repair pass gets an agent run', async () => {
+		const worktreePath = makeWorktree([
+			{ command: 'npm test', outcome: 'failed', detail: 'four suites the merge broke' },
+		]);
+		writeCleanMigrations(worktreePath, ['0000_first', '0001_second']);
+		corruptMigrationsWithPhantomEntry(worktreePath);
+		const deps = makeDeps(worktreePath);
+
+		await expect(runResolveConflictsPhase(deps)).rejects.toThrow(
+			/fails verification the agent attributes to the merge itself/,
+		);
+		expect(deps.runAgent).toHaveBeenCalledTimes(1);
+	});
+
+	// …and the other half of that placement: the repair pass runs *after* the gate
+	// and its own prompt lets it rewrite the hand-off, so the merge agent's
+	// `passed` cannot be the last word on a merge the repair pass then re-tested.
+	it('refuses a merge the migration repair pass rewrites as broken', async () => {
+		const worktreePath = makeWorktree();
+		writeCleanMigrations(worktreePath, ['0000_first', '0001_second']);
+		corruptMigrationsWithPhantomEntry(worktreePath);
+		const deps = makeDeps(worktreePath);
+		deps.runAgent.mockImplementationOnce(async () => agentResult({ sessionId: 'session-1' }));
+		deps.runAgent.mockImplementationOnce(async () => {
+			repairPhantomEntry(worktreePath);
+			rewriteHandoff(worktreePath, {
+				verification: [
+					{ command: 'npm test', outcome: 'failed', detail: 'four suites the merge broke' },
+				],
+			});
+			return agentResult({ sessionId: 'session-1' });
+		});
+
+		await expect(runResolveConflictsPhase(deps)).rejects.toThrow(
+			/fails verification the agent attributes to the merge itself — `npm test`: four suites the merge broke/,
+		);
+		expect(deps.runAgent).toHaveBeenCalledTimes(2);
+		expect(assertRemoteHead).not.toHaveBeenCalled();
+		expect(commitPreparedTree).not.toHaveBeenCalled();
+		expect(deps.delivery.pushBranch).not.toHaveBeenCalled();
+		expect(deps.delivery.postComment).not.toHaveBeenCalled();
+	});
+
+	// The mirror: the re-read is what delivery uses, so a repair pass that only
+	// corrected the result comment gets that comment posted rather than the stale one.
+	it('posts the body the migration repair pass left behind', async () => {
+		const worktreePath = makeWorktree();
+		writeCleanMigrations(worktreePath, ['0000_first', '0001_second']);
+		corruptMigrationsWithPhantomEntry(worktreePath);
+		const deps = makeDeps(worktreePath);
+		deps.runAgent.mockImplementationOnce(async () => agentResult({ sessionId: 'session-1' }));
+		deps.runAgent.mockImplementationOnce(async () => {
+			repairPhantomEntry(worktreePath);
+			rewriteHandoff(worktreePath, { body: 'Merged main; regenerated the migration.' });
+			return agentResult({ sessionId: 'session-1' });
+		});
+
+		const { outcome } = await runResolveConflictsPhase(deps);
+
+		expect(outcome.status).toBe('resolved');
+		expect(deps.delivery.postComment).toHaveBeenCalledWith(
+			expect.objectContaining({ body: 'Merged main; regenerated the migration.' }),
+		);
+	});
+});
+
 describe('buildResolveConflictsPrompt — migration guidance (issue #885)', () => {
 	// The phase already interpolates the run's base branch two paragraphs earlier, so the
 	// migration paragraph's literal `main` was wrong copy on any project based elsewhere.
@@ -337,5 +462,34 @@ describe('buildResolveConflictsPrompt — migration guidance (issue #885)', () =
 		expect(prompt).toContain('do not renumber or edit any migration `develop` already has');
 		expect(prompt).toContain('beyond what `develop` already has');
 		expect(prompt).not.toContain('`main`');
+	});
+});
+
+/**
+ * The trap issue #861 named, held as a standing rule: a prompt that states a
+ * narrower shape than the schema accepts is what invites the violation. Derived
+ * from the schema's own constant, so an outcome added there fails this until the
+ * prompt names it.
+ */
+describe('buildResolveConflictsPrompt — verification contract (issue #924)', () => {
+	const prompt = buildResolveConflictsPrompt({
+		project: { repo: 'o/r' },
+		prNumber: '7',
+		prBranch: 'issue-7',
+		headSha: 'abc123',
+		baseBranch: 'develop',
+		baseSha: 'def456',
+	});
+
+	it.each(CONFLICT_VERIFICATION_OUTCOMES)('names `%s` as an outcome the agent may report', (o) => {
+		expect(prompt).toContain(`\`${o}\``);
+	});
+
+	it('sends the explanation to `detail` and no longer asks for outcome:"passed"', () => {
+		expect(prompt).toContain(
+			'`detail` is a single string and is required for anything that is not',
+		);
+		expect(prompt).toContain('Never put an explanation in `outcome`');
+		expect(prompt).not.toContain('outcome:"passed"');
 	});
 });

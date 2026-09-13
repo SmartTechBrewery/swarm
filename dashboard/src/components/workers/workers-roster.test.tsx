@@ -70,6 +70,9 @@ function makeWorker(overrides: Partial<WorkerRow> = {}): WorkerRow {
 		capabilities: ['claude'],
 		supportedPhases: ['planning', 'implementation'],
 		repository: 'acme/frontend',
+		// The daemon's declared SWARM build and the server's verdict on it (issue #925).
+		build: { commit: 'abc1234def5678', dirty: false },
+		buildIsCurrent: true,
 		connection: 'online',
 		lastSeenAt: '2026-07-01T12:00:00.000Z',
 		currentRun: null,

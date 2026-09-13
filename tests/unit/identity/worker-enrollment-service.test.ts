@@ -35,6 +35,10 @@ const { getActiveWorkerClaims, getWorkerDispatchClaimState } = vi.hoisted(() => 
 	getActiveWorkerClaims: vi.fn(),
 	getWorkerDispatchClaimState: vi.fn(),
 }));
+// Issue #925 — the assembler compares each worker's declared build against this
+// process's own. Mocked because the real one spawns `git`, which a unit test must
+// not do (and whose answer would differ per checkout anyway).
+const { resolveOwnBuildIdentity } = vi.hoisted(() => ({ resolveOwnBuildIdentity: vi.fn() }));
 
 vi.mock('@/db/repositories/workerEnrollmentsRepository.js', () => ({
 	createEnrollment,
@@ -62,6 +66,13 @@ vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
 	getActiveWorkerClaims,
 	getWorkerDispatchClaimState,
 }));
+// Spread the real module and override the one export: `WorkerBuildSchema` beside it
+// is what `@/identity/worker.js` parses rows with, so a factory returning only the
+// stub would leave that import undefined.
+vi.mock('@/lib/build-identity.js', async () => ({
+	...(await vi.importActual<typeof import('@/lib/build-identity.js')>('@/lib/build-identity.js')),
+	resolveOwnBuildIdentity,
+}));
 
 import type { SwarmUser } from '@/identity/schema.js';
 import { DEFAULT_WORKER_SUPPORTED_PHASES, type Worker } from '@/identity/worker.js';
@@ -69,6 +80,7 @@ import type { WorkerEnrollment } from '@/identity/worker-enrollment.js';
 import {
 	AllowedClisNotCapableError,
 	approveEnrollment,
+	buildMatchesControlPlane,
 	DEFAULT_CONCURRENCY_ALLOCATION,
 	DEFAULT_ENROLLMENT_ALLOWED_PHASES,
 	deriveWorkerRunState,
@@ -172,11 +184,15 @@ beforeEach(() => {
 		getLiveSessionForWorker,
 		getRetainedSessionForWorker,
 		findProjectByIdFromDb,
+		resolveOwnBuildIdentity,
 	]) {
 		m.mockReset();
 	}
 	getWorkerDispatchClaimState.mockResolvedValue({ activeRuns: 0, currentRunId: null });
 	getActiveWorkerClaims.mockResolvedValue([]);
+	// A control plane that cannot read its own build (issue #925), so no case is
+	// judged against a comparand it did not state.
+	resolveOwnBuildIdentity.mockResolvedValue(undefined);
 	// Every project resolves to the repository the default worker declares nothing
 	// about, so the repository check (issue #690) is inert unless a test opts in.
 	findProjectByIdFromDb.mockResolvedValue(makeProject());
@@ -594,6 +610,66 @@ describe('listDashboardWorkers (issue #133)', () => {
 		});
 	});
 
+	// Issue #925 — the build the machine declared, and the server's verdict on it.
+	describe('declared SWARM build', () => {
+		const CONTROL_PLANE = { commit: 'a'.repeat(40), dirty: false };
+
+		/** The default roster setup, reduced to what a build case needs. */
+		function rosterOf(worker: Worker) {
+			listAllWorkers.mockResolvedValue([worker]);
+			listEnrollmentsForWorker.mockResolvedValue([makeEnrollment()]);
+			getUserById.mockResolvedValue(makeOwner());
+			getLiveSessionForWorker.mockResolvedValue(undefined);
+			getRetainedSessionForWorker.mockResolvedValue(undefined);
+		}
+
+		it('carries the declared build through to the row, with the verdict beside it', async () => {
+			rosterOf(makeWorker({ build: { commit: 'b'.repeat(40), dirty: true } }));
+			resolveOwnBuildIdentity.mockResolvedValue(CONTROL_PLANE);
+
+			const [view] = await listDashboardWorkers(null);
+
+			expect(view.build).toEqual({ commit: 'b'.repeat(40), dirty: true });
+			expect(view.buildIsCurrent).toBe(false);
+		});
+
+		it('marks nothing when the control plane cannot resolve its own build', async () => {
+			rosterOf(makeWorker({ build: { commit: 'b'.repeat(40), dirty: false } }));
+			resolveOwnBuildIdentity.mockResolvedValue(undefined);
+
+			const [view] = await listDashboardWorkers(null);
+
+			expect(view.build).toEqual({ commit: 'b'.repeat(40), dirty: false });
+			expect(view.buildIsCurrent).toBeNull();
+		});
+
+		it('has no verdict for a machine that declared no build', async () => {
+			rosterOf(makeWorker({ build: null }));
+			resolveOwnBuildIdentity.mockResolvedValue(CONTROL_PLANE);
+
+			const [view] = await listDashboardWorkers(null);
+
+			expect(view.build).toBeNull();
+			expect(view.buildIsCurrent).toBeNull();
+		});
+
+		it('resolves the comparand once for the whole roster, not once per row', async () => {
+			listAllWorkers.mockResolvedValue([
+				makeWorker(),
+				makeWorker({ id: OTHER_WORKER_ID, displayName: 'grace-box' }),
+			]);
+			listEnrollmentsForWorker.mockResolvedValue([makeEnrollment()]);
+			getUserById.mockResolvedValue(makeOwner());
+			getLiveSessionForWorker.mockResolvedValue(undefined);
+			getRetainedSessionForWorker.mockResolvedValue(undefined);
+			resolveOwnBuildIdentity.mockResolvedValue(CONTROL_PLANE);
+
+			await listDashboardWorkers(null);
+
+			expect(resolveOwnBuildIdentity).toHaveBeenCalledTimes(1);
+		});
+	});
+
 	describe('authorization scope', () => {
 		it('gives an administrator every registered worker, including an un-enrolled one', async () => {
 			listAllWorkers.mockResolvedValue([
@@ -713,6 +789,8 @@ describe('listDashboardWorkers (issue #133)', () => {
 				'lastSeenAt',
 				'owner',
 				'repository',
+				'build',
+				'buildIsCurrent',
 				'supportedPhases',
 				'workerId',
 			].sort(),
@@ -1237,6 +1315,50 @@ describe('suspendEnrollmentsForMismatchedRepository (issue #690)', () => {
 	});
 });
 
+// The pure half of `buildIsCurrent` (issue #925) — no DB, no `git`, so the
+// three-valued contract is asserted directly rather than inferred from a row.
+describe('buildMatchesControlPlane (issue #925)', () => {
+	const COMMIT = 'a'.repeat(40);
+	const OTHER = 'b'.repeat(40);
+
+	it('is true only when both sides name the same commit and neither is dirty', () => {
+		expect(
+			buildMatchesControlPlane({ commit: COMMIT, dirty: false }, { commit: COMMIT, dirty: false }),
+		).toBe(true);
+	});
+
+	it('is false for different commits', () => {
+		expect(
+			buildMatchesControlPlane({ commit: OTHER, dirty: false }, { commit: COMMIT, dirty: false }),
+		).toBe(false);
+	});
+
+	// A dirty checkout is by definition not the commit it names, so the two are not
+	// the same build even when the commits agree — on either side.
+	it('is false when the worker is dirty, even on the same commit', () => {
+		expect(
+			buildMatchesControlPlane({ commit: COMMIT, dirty: true }, { commit: COMMIT, dirty: false }),
+		).toBe(false);
+	});
+
+	it('is false when the control plane is dirty, even on the same commit', () => {
+		expect(
+			buildMatchesControlPlane({ commit: COMMIT, dirty: false }, { commit: COMMIT, dirty: true }),
+		).toBe(false);
+	});
+
+	// Both `null`s are "no answer", never "stale": rendering either as a mismatch
+	// would mark a whole fleet outdated the moment a comparand went missing.
+	it('is null when the worker declared no build', () => {
+		expect(buildMatchesControlPlane(null, { commit: COMMIT, dirty: false })).toBeNull();
+	});
+
+	it('is null when the control plane cannot resolve its own', () => {
+		expect(buildMatchesControlPlane({ commit: COMMIT, dirty: false }, null)).toBeNull();
+		expect(buildMatchesControlPlane({ commit: COMMIT, dirty: false }, undefined)).toBeNull();
+	});
+});
+
 describe('getDashboardWorkerDetail (issue #477)', () => {
 	beforeEach(() => {
 		getLiveSessionForWorker.mockResolvedValue(undefined);
@@ -1274,6 +1396,35 @@ describe('getDashboardWorkerDetail (issue #477)', () => {
 		expect(detail?.capabilities).toEqual(['claude', 'codex']);
 		expect(detail?.supportedPhases.length).toBeGreaterThan(0);
 		expect(detail?.ownerUserId).toBe(OWNER_ID);
+	});
+
+	// Issue #925: the detail view is also the one read model naming the *comparand* —
+	// the roster row carries the verdict, which is all a badge needs.
+	it('names the control plane’s own build beside the worker’s', async () => {
+		getWorkerById.mockResolvedValue(
+			makeWorker({ build: { commit: 'b'.repeat(40), dirty: false } }),
+		);
+		listEnrollmentsForWorker.mockResolvedValue([makeEnrollment()]);
+		resolveOwnBuildIdentity.mockResolvedValue({ commit: 'a'.repeat(40), dirty: false });
+
+		const detail = await getDashboardWorkerDetail(WORKER_ID, null);
+
+		expect(detail?.build).toEqual({ commit: 'b'.repeat(40), dirty: false });
+		expect(detail?.buildIsCurrent).toBe(false);
+		expect(detail?.controlPlaneBuild).toEqual({ commit: 'a'.repeat(40), dirty: false });
+	});
+
+	it('reports an unresolvable control-plane build as null, so nothing is marked', async () => {
+		getWorkerById.mockResolvedValue(
+			makeWorker({ build: { commit: 'b'.repeat(40), dirty: false } }),
+		);
+		listEnrollmentsForWorker.mockResolvedValue([makeEnrollment()]);
+		resolveOwnBuildIdentity.mockResolvedValue(undefined);
+
+		const detail = await getDashboardWorkerDetail(WORKER_ID, null);
+
+		expect(detail?.controlPlaneBuild).toBeNull();
+		expect(detail?.buildIsCurrent).toBeNull();
 	});
 
 	// Issue #787: the detail view is the one read model carrying the two raw halves of

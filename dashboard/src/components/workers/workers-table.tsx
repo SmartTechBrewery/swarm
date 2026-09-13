@@ -5,6 +5,7 @@ import { WorkItemCell } from '@/components/runs/work-item-cell.js';
 import { Badge } from '@/components/ui/badge.js';
 import { Modal, ModalFooter } from '@/components/ui/modal.js';
 import { ToggleSwitch } from '@/components/ui/toggle-switch.js';
+import { WorkerBuildBadge } from '@/components/workers/worker-build.js';
 import { formatPhase, formatRelativeTime } from '@/lib/format.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
 import type {
@@ -42,6 +43,14 @@ import type {
  * **Capabilities** as a cross-project union ({@link effectiveClis}) rather than
  * broken out per project — a per-project breakdown is what the detail view is
  * for.
+ *
+ * The one *non*-operable addition since is the **build mark** (issue #925): a
+ * machine whose declared SWARM build is not the control plane's own carries an
+ * `Outdated` badge beside its name, so "which workers are behind?" is answerable by
+ * scanning this table rather than by asking each machine's operator. It is a mark
+ * and nothing more — dispatch is unaffected — and it earns no column of its own,
+ * because it is a rare per-row exception rather than a fact every row carries. Which
+ * build, and what it is being compared against, are on the detail view.
  *
  * Navigation to that detail view is the **row** plus a named control on the
  * Machine cell (issue #752). It used to be a trailing `ChevronRight` cell of its
@@ -603,21 +612,27 @@ export function WorkersTable({
 							}`}
 						>
 							<td className="px-3 py-3 align-top text-sm font-medium text-zinc-100 break-words">
-								{onSelectWorker ? (
-									<button
-										type="button"
-										onClick={(event) => {
-											event.stopPropagation();
-											onSelectWorker(worker.workerId);
-										}}
-										aria-label={`Open ${worker.displayName} details`}
-										className="text-left break-words rounded hover:text-white focus:outline-none focus:ring-1 focus:ring-violet-500 transition-colors"
-									>
-										{worker.displayName}
-									</button>
-								) : (
-									worker.displayName
-								)}
+								{/* The build mark sits beside the name rather than in a column of its
+								    own (issue #925): COLUMN_WIDTHS is a hand-tuned budget, and this is
+								    a rare per-row exception, not a fact every row carries. */}
+								<div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+									{onSelectWorker ? (
+										<button
+											type="button"
+											onClick={(event) => {
+												event.stopPropagation();
+												onSelectWorker(worker.workerId);
+											}}
+											aria-label={`Open ${worker.displayName} details`}
+											className="text-left break-words rounded hover:text-white focus:outline-none focus:ring-1 focus:ring-violet-500 transition-colors"
+										>
+											{worker.displayName}
+										</button>
+									) : (
+										worker.displayName
+									)}
+									<WorkerBuildBadge buildIsCurrent={worker.buildIsCurrent} />
+								</div>
 							</td>
 							<td className="px-3 py-3 align-top text-sm text-zinc-300 break-words">
 								{worker.owner ? (

@@ -23,10 +23,11 @@
  *   the dashboard's Workers screen renders (#133), scoped to what the viewer may
  *   see.
  * - `getDashboardWorkerDetail(workerId, projectScope)` — that same row for **one**
- *   worker (#477), widened with the full enrollment detail per visible project and
+ *   worker (#477), widened with the full enrollment detail per visible project,
  *   with the two raw halves of the CLI axis (issue #783: the owner's
- *   `declaredCapabilities` and the daemon's `probedCapabilities`), for the Workers
- *   screen's per-worker detail view.
+ *   `declaredCapabilities` and the daemon's `probedCapabilities`), and with the
+ *   control plane's own build (issue #925), for the Workers screen's per-worker
+ *   detail view.
  * - `listProjectDispatchCandidates(projectId)` — the same project scope in the
  *   shape the #130 dispatch gate judges (`src/worker/eligibility-gate.ts`):
  *   worker + enrollment + resolved availability, in the project's configured
@@ -83,6 +84,7 @@ import {
 	listWorkersForOwner,
 } from '../db/repositories/workersRepository.js';
 import type { AgentCli } from '../harness/agent-cli.js';
+import { resolveOwnBuildIdentity, type WorkerBuild } from '../lib/build-identity.js';
 import { logger } from '../lib/logger.js';
 import { normalizeRepoSlug, repoSlugsMatch } from '../scm/repo-slug.js';
 import type { TriggerPhase } from '../triggers/types.js';
@@ -477,6 +479,29 @@ export interface DashboardWorkerView {
 	 * reconnect does not clear this — only an operator does.
 	 */
 	drainingSince: Date | null;
+	/**
+	 * The SWARM build the machine's daemon declared it is running (issue #925) — the
+	 * commit its install root is on plus the dirty flag — or `null` when it declared
+	 * none (a machine that never connected, a daemon too old to send the field, or an
+	 * install root that is not a git checkout).
+	 *
+	 * Not a secret and not the machine's `repository` above: a commit id is public
+	 * coordinates, and one npm-linked SWARM checkout can serve daemons working in
+	 * several different project repositories.
+	 */
+	build: WorkerBuild | null;
+	/**
+	 * **Server-derived**, the same way {@link isRoutable} is: whether the declared
+	 * `build` above is the control plane's own ({@link buildMatchesControlPlane}).
+	 * `null` means the question has no answer — the worker declared no build, or this
+	 * process cannot resolve its own — and a reader must render *nothing* then rather
+	 * than treat an unknown comparand as a mismatch.
+	 *
+	 * The comparison is equality, never ancestry: the control plane may never have
+	 * fetched the worker's commit, so all it can honestly say is that the two builds
+	 * differ.
+	 */
+	buildIsCurrent: boolean | null;
 	connection: WorkerConnectionState;
 	/** When the worker was last heard from, or `null` if it never connected. */
 	lastSeenAt: Date | null;
@@ -558,7 +583,43 @@ export interface DashboardWorkerDetailView extends DashboardWorkerView {
 	 * server-side (`WorkerCapabilityNotProbedError`).
 	 */
 	probedCapabilities: AgentCli[];
+	/**
+	 * The build **this** process is running (issue #925), or `null` when it cannot
+	 * resolve its own — the comparand the row's `buildIsCurrent` verdict was reached
+	 * against, so the detail view can say "differs from *what*" instead of leaving
+	 * the operator to hold it in their head.
+	 *
+	 * Here rather than on the roster row because it is one value for the whole
+	 * installation: repeating it on N rows would say nothing the badge does not.
+	 */
+	controlPlaneBuild: WorkerBuild | null;
 	enrollments: DashboardWorkerEnrollmentDetail[];
+}
+
+/**
+ * Whether a worker's declared build is the control plane's own — the pure half of
+ * `DashboardWorkerView.buildIsCurrent`, kept free of the DB so it is testable on
+ * its own.
+ *
+ * Three-valued, and the `null`s are the point: an unknown on **either** side is
+ * "no answer", never "stale". A worker that declared no build and a control plane
+ * with no readable `.git` (the Compose router image has none) must both render no
+ * badge, rather than marking an entire fleet outdated because the comparand went
+ * missing.
+ *
+ * `dirty` on either side is a mismatch even when the commits agree: a dirty
+ * checkout is by definition not the commit it names, so the two are not the same
+ * build. Commits compare with plain equality — both sides come from `rev-parse
+ * HEAD`, so both are full ids — and never by ancestry, which the control plane
+ * cannot establish for a commit it may never have fetched.
+ */
+export function buildMatchesControlPlane(
+	declared: WorkerBuild | null,
+	controlPlane: WorkerBuild | null | undefined,
+): boolean | null {
+	if (!declared || !controlPlane) return null;
+	if (declared.dirty || controlPlane.dirty) return false;
+	return declared.commit === controlPlane.commit;
 }
 
 /**
@@ -590,6 +651,10 @@ export async function listDashboardWorkers(
 ): Promise<DashboardWorkerView[]> {
 	if (projectScope !== null && projectScope.length === 0) return [];
 	const accessible = projectScope === null ? null : new Set(projectScope);
+	// One comparand for the whole roster (issue #925), resolved before the loop: the
+	// build of the process serving this read is fixed for its life, and reading it
+	// per row would only invite N rows judged against two different answers.
+	const controlPlaneBuild = await resolveOwnBuildIdentity();
 	const views: DashboardWorkerView[] = [];
 	for (const worker of await listAllWorkers()) {
 		const enrollments = await listEnrollmentsForWorker(worker.id);
@@ -599,7 +664,7 @@ export async function listDashboardWorkers(
 		// A restricted viewer only sees a machine they share a project with; an
 		// administrator also sees a registered-but-never-enrolled one.
 		if (accessible && visible.length === 0) continue;
-		views.push(await assembleDashboardWorker(worker, visible, accessible));
+		views.push(await assembleDashboardWorker(worker, visible, accessible, controlPlaneBuild));
 	}
 	return views;
 }
@@ -619,7 +684,8 @@ export async function listDashboardWorkers(
  * explain routability without a roster query per project. It also carries the two
  * raw CLI facts the row's effective set is derived from (issue #783), which is what
  * lets the detail screen offer the owner's declaration as a control instead of a
- * badge.
+ * badge, and the control plane's own `controlPlaneBuild` (issue #925), which is
+ * what lets it name the build the row's verdict was reached against.
  */
 export async function getDashboardWorkerDetail(
 	workerId: string,
@@ -636,9 +702,10 @@ export async function getDashboardWorkerDetail(
 		? enrollments.filter((enrollment) => accessible.has(enrollment.projectId))
 		: enrollments;
 	if (accessible && visible.length === 0 && !viewerIsOwner) return null;
+	const controlPlaneBuild = await resolveOwnBuildIdentity();
 	// Spreading the *assembled view* (not a row) keeps the one place that names
 	// the safe worker fields — `assembleDashboardWorker` — as the only assembler.
-	const row = await assembleDashboardWorker(worker, visible, accessible);
+	const row = await assembleDashboardWorker(worker, visible, accessible, controlPlaneBuild);
 	return {
 		...row,
 		ownerUserId: worker.ownerUserId,
@@ -647,6 +714,10 @@ export async function getDashboardWorkerDetail(
 		// renders, and this is the pair the owner's declaration control reads.
 		declaredCapabilities: worker.declaredCapabilities,
 		probedCapabilities: worker.probedCapabilities,
+		// The comparand behind the row's verdict (issue #925), named on the detail view
+		// alone — `undefined` (this process has no readable checkout) reads as `null`,
+		// the same "no answer" the verdict itself carries.
+		controlPlaneBuild: controlPlaneBuild ?? null,
 		enrollments: await Promise.all(visible.map(assembleEnrollmentDetail)),
 	};
 }
@@ -678,6 +749,7 @@ async function assembleDashboardWorker(
 	worker: Worker,
 	enrollments: WorkerEnrollment[],
 	accessible: Set<string> | null,
+	controlPlaneBuild: WorkerBuild | undefined,
 ): Promise<DashboardWorkerView> {
 	const ownerUser = await getUserById(worker.ownerUserId);
 	const liveSession = await getLiveSessionForWorker(worker.id);
@@ -698,6 +770,8 @@ async function assembleDashboardWorker(
 		supportedPhases: worker.supportedPhases,
 		repository: worker.repository,
 		drainingSince: worker.drainingSince,
+		build: worker.build,
+		buildIsCurrent: buildMatchesControlPlane(worker.build, controlPlaneBuild),
 		connection: liveSession ? 'online' : 'offline',
 		lastSeenAt: lastSeenSession?.lastHeartbeatAt ?? null,
 		currentRun: await resolveVisibleRun(worker.id, liveSession?.currentRunId ?? null, accessible),
