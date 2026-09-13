@@ -65,6 +65,8 @@ function makeWorker(overrides: Partial<WorkerRow> = {}): WorkerRow {
 		buildIsCurrent: true,
 		connection: 'online',
 		lastSeenAt: NOW.toISOString(),
+		// In the dispatch pool; a drained machine is the marked exception (issue #926).
+		drainingSince: null,
 		currentRun: null,
 		enrollments: [{ projectId: 'proj-a', status: 'active', allowedClis: ['claude', 'codex'] }],
 		...overrides,
@@ -174,6 +176,36 @@ describe('WorkersTable connectivity (issue #133)', () => {
 		expect(screen.getByText('Offline')).toBeDefined();
 		const relative = screen.getByText('· 5m ago');
 		expect(relative.getAttribute('title')).toBe(new Date(lastSeenAt).toLocaleString());
+	});
+
+	// Issue #926: draining is an operator state, not a liveness one, so it is a second
+	// line under Online/Offline rather than a third value of it.
+	it('marks a machine an operator has taken out of the dispatch pool', () => {
+		const drainingSince = new Date(NOW.getTime() - 5 * 60_000).toISOString();
+		renderTable(<WorkersTable workers={[makeWorker({ drainingSince })]} />);
+
+		const marker = screen.getByText('Draining');
+		expect(marker.getAttribute('title')).toBe(
+			'Out of the dispatch pool since 5m ago — no new work is given to this machine',
+		);
+		// Still online: a drained machine is not an outage.
+		expect(screen.getByText('Online')).toBeDefined();
+	});
+
+	it('marks nothing for a machine that is in the pool', () => {
+		renderTable(<WorkersTable workers={[makeWorker()]} />);
+		expect(screen.queryByText('Draining')).toBeNull();
+	});
+
+	it('marks a drained machine that is also offline, without conflating the two', () => {
+		renderTable(
+			<WorkersTable
+				workers={[makeWorker({ connection: 'offline', drainingSince: NOW.toISOString() })]}
+			/>,
+		);
+
+		expect(screen.getByText('Offline')).toBeDefined();
+		expect(screen.getByText('Draining')).toBeDefined();
 	});
 
 	it('says a worker that never connected has no last-seen value', () => {

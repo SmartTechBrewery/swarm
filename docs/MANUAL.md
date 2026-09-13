@@ -225,6 +225,13 @@ at each handshake), nothing expires it, and only `undrain` ends it. It is the
 machine owner's own call, so sign in as them; `swarm workers list` marks every
 machine currently out of the pool.
 
+The same two steps are on the machine's own page in the dashboard
+(`/workers/<id>`), under **Pool membership**: **Drain worker** / **Return to the
+pool**, with the card saying whether the machine has gone idle and is therefore safe
+to restart right now. The Workers table marks every drained machine in its **Status**
+column, beside — never instead of — Online/Offline, since a drained machine that is
+online is still online.
+
 The **router** dequeues and dispatches; a project's **Maximum Concurrent Jobs**
 setting and each enrolled worker's **concurrency allocation** are what bound how
 many of its runs happen at once. Dispatch always runs on the control

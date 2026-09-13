@@ -15,6 +15,7 @@ const {
 	setDeclaredCapabilitiesMutate,
 	enrollMutate,
 	removeMutate,
+	setDrainingMutate,
 	projectsListQueryFn,
 	scmCredentialsListQueryFn,
 	scmCredentialsSetMutate,
@@ -27,6 +28,7 @@ const {
 	setDeclaredCapabilitiesMutate: vi.fn(),
 	enrollMutate: vi.fn(),
 	removeMutate: vi.fn(),
+	setDrainingMutate: vi.fn(),
 	projectsListQueryFn: vi.fn(),
 	scmCredentialsListQueryFn: vi.fn(),
 	scmCredentialsSetMutate: vi.fn(),
@@ -65,6 +67,7 @@ vi.mock('@/lib/trpc.js', () => ({
 			setDeclaredCapabilities: { mutate: setDeclaredCapabilitiesMutate },
 			enroll: { mutate: enrollMutate },
 			remove: { mutate: removeMutate },
+			setDraining: { mutate: setDrainingMutate },
 			scmCredentials: { set: { mutate: scmCredentialsSetMutate } },
 		},
 	},
@@ -114,6 +117,8 @@ function makeWorker(overrides: Partial<WorkerDetail> = {}): WorkerDetail {
 		buildIsCurrent: true,
 		connection: 'online',
 		lastSeenAt: NOW.toISOString(),
+		// In the dispatch pool — the Pool membership card offers the drain (issue #926).
+		drainingSince: null,
 		currentRun: null,
 		viewerIsOwner: true,
 		enrollments: [makeEnrollment()],
@@ -189,6 +194,14 @@ beforeEach(() => {
 	enrollMutate.mockReset();
 	removeMutate.mockReset();
 	removeMutate.mockResolvedValue({ workerId: 'worker-1' });
+	setDrainingMutate.mockReset();
+	setDrainingMutate.mockResolvedValue({
+		workerId: 'worker-1',
+		displayName: 'ada-laptop',
+		drainingSince: NOW.toISOString(),
+		busy: false,
+		currentRunId: null,
+	});
 	projectsListQueryFn.mockReset();
 	projectsListQueryFn.mockResolvedValue([]);
 	scmCredentialsListQueryFn.mockReset();
@@ -370,6 +383,52 @@ describe('WorkerDetailView enroll entry point (issue #764)', () => {
 	it('keeps offering it to an owner whose machine is enrolled nowhere', () => {
 		renderWorker({ enrollments: [] });
 		expect(screen.getByRole('button', { name: 'Enroll in a project' })).toBeDefined();
+	});
+});
+
+/**
+ * Draining is machine-scoped owner state, gated by the same strict `viewerIsOwner`
+ * flag as the delete card and the operator credential (issue #926). The card's own
+ * behaviour is covered in `worker-drain-card.test.tsx`; what matters here is the
+ * gate, and that the card reads the machine's *own* active job.
+ */
+describe('WorkerDetailView pool membership (issue #926)', () => {
+	it('renders the section for the worker’s owner', () => {
+		renderWorker();
+		expect(screen.getByRole('heading', { name: 'Pool membership' })).toBeDefined();
+		expect(
+			within(section('Pool membership')).getByRole('button', { name: 'Drain worker' }),
+		).toBeDefined();
+	});
+
+	it('omits it for a viewer who does not own the machine', () => {
+		renderWorker({ viewerIsOwner: false });
+		expect(screen.queryByRole('heading', { name: 'Pool membership' })).toBeNull();
+		expect(screen.queryByRole('button', { name: 'Drain worker' })).toBeNull();
+	});
+
+	it('drains the machine and reports it, so the view refetches', async () => {
+		renderWorker();
+
+		fireEvent.click(
+			within(section('Pool membership')).getByRole('button', { name: 'Drain worker' }),
+		);
+
+		await waitFor(() =>
+			expect(setDrainingMutate).toHaveBeenCalledWith({ workerId: 'worker-1', draining: true }),
+		);
+		await waitFor(() => expect(onChanged).toHaveBeenCalled());
+	});
+
+	// A drained machine is still Online — the two facts are independent, and the
+	// connectivity card must not start reading as an outage.
+	it('leaves the connection reading Online for a drained machine', () => {
+		renderWorker({ drainingSince: NOW.toISOString() });
+
+		expect(screen.getByText('Online')).toBeDefined();
+		expect(
+			within(section('Pool membership')).getByRole('button', { name: 'Return to the pool' }),
+		).toBeDefined();
 	});
 });
 

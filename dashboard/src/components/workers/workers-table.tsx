@@ -52,6 +52,13 @@ import type {
  * because it is a rare per-row exception rather than a fact every row carries. Which
  * build, and what it is being compared against, are on the detail view.
  *
+ * The **Draining marker** on the Status cell (issue #926) is the same kind of
+ * addition: a machine an operator has taken out of the dispatch pool (issue #919) is
+ * marked so "which machines are out of the pool?" is answerable by scanning this
+ * table. Draining *is* acted on by dispatch, but not by this table — the control
+ * that sets and clears it is the machine's own page, where machine-scoped controls
+ * live.
+ *
  * Navigation to that detail view is the **row** plus a named control on the
  * Machine cell (issue #752). It used to be a trailing `ChevronRight` cell of its
  * own, which spent a column on an arrow that only repeated what the whole
@@ -137,29 +144,48 @@ function enrollmentKey(workerId: string, projectId: string): string {
 	return `${workerId}::${projectId}`;
 }
 
-/** Online is a live status dot; offline stays neutral with its last-seen time beside it. */
+/**
+ * Two independent facts, stacked (issue #926). The first is heartbeat liveness:
+ * online is a live status dot, offline stays neutral with its last-seen time beside
+ * it. The second is whether an operator has taken the machine **out of the dispatch
+ * pool** so it can be restarted (issue #919) — which is not a liveness fact at all,
+ * so it is a marker *under* the first line rather than a third value of it: a
+ * draining machine that is online is still Online, and is merely given no new work.
+ * Amber, the tree's "operator attention, not an error" hue, for the same reason.
+ */
 function ConnectionCell({ worker }: { worker: WorkerRow }) {
-	if (worker.connection === 'online') {
-		return (
-			<span className="inline-flex items-center gap-2 text-sm text-zinc-200">
-				<span className="h-2 w-2 rounded-full bg-emerald-500 ring-4 ring-emerald-500/10" />
-				Online
-			</span>
-		);
-	}
 	return (
-		// Wrapping, not one line: the narrow Status column (see COLUMN_WIDTHS) fits
-		// the word and its dot, and drops the last-seen time onto a second line.
-		<span className="inline-flex flex-wrap items-center gap-x-2 gap-y-0.5 text-sm text-zinc-400">
-			<span className="h-2 w-2 rounded-full bg-zinc-600 ring-4 ring-zinc-600/10" />
-			Offline
-			<span
-				className="text-xs text-zinc-500"
-				title={worker.lastSeenAt ? new Date(worker.lastSeenAt).toLocaleString() : undefined}
-			>
-				{worker.lastSeenAt ? `· ${formatRelativeTime(worker.lastSeenAt)}` : '· Never connected'}
-			</span>
-		</span>
+		<div className="space-y-1.5">
+			{worker.connection === 'online' ? (
+				<span className="inline-flex items-center gap-2 text-sm text-zinc-200">
+					<span className="h-2 w-2 rounded-full bg-emerald-500 ring-4 ring-emerald-500/10" />
+					Online
+				</span>
+			) : (
+				// Wrapping, not one line: the narrow Status column (see COLUMN_WIDTHS) fits
+				// the word and its dot, and drops the last-seen time onto a second line.
+				<span className="inline-flex flex-wrap items-center gap-x-2 gap-y-0.5 text-sm text-zinc-400">
+					<span className="h-2 w-2 rounded-full bg-zinc-600 ring-4 ring-zinc-600/10" />
+					Offline
+					<span
+						className="text-xs text-zinc-500"
+						title={worker.lastSeenAt ? new Date(worker.lastSeenAt).toLocaleString() : undefined}
+					>
+						{worker.lastSeenAt ? `· ${formatRelativeTime(worker.lastSeenAt)}` : '· Never connected'}
+					</span>
+				</span>
+			)}
+			{worker.drainingSince ? (
+				<div>
+					<Badge
+						tone="caution"
+						title={`Out of the dispatch pool since ${formatRelativeTime(worker.drainingSince)} — no new work is given to this machine`}
+					>
+						Draining
+					</Badge>
+				</div>
+			) : null}
+		</div>
 	);
 }
 

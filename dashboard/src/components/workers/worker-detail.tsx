@@ -4,6 +4,7 @@ import { WorkItemCell } from '@/components/runs/work-item-cell.js';
 import { Badge } from '@/components/ui/badge.js';
 import { formatWorkerBuild, WorkerBuildBadge } from '@/components/workers/worker-build.js';
 import { WorkerDeleteCard } from '@/components/workers/worker-delete-card.js';
+import { WorkerDrainCard } from '@/components/workers/worker-drain-card.js';
 import { WorkerEnrollDialog } from '@/components/workers/worker-enroll-dialog.js';
 import { WorkerEnrollmentCard } from '@/components/workers/worker-enrollment-card.js';
 import { WorkerOperatorCredentialsCard } from '@/components/workers/worker-operator-credentials-card.js';
@@ -77,6 +78,19 @@ import type { AgentCli } from '../../../../src/harness/agent-cli.js';
  * the operator up for a new machine/repository pairing means removing this
  * registration — owner-only behind a confirmation that names everything the
  * removal cascades to.
+ *
+ * **Taking the machine out of the dispatch pool lives here too**
+ * ({@link WorkerDrainCard}, issue #926 over issue #919's state), because draining is
+ * machine-scoped exactly like the two cards above: it is one operator's statement
+ * about one machine of theirs — usually so they can restart it — not a decision
+ * about any project that happens to be enrolled on it, which is why the project
+ * Workers tab has no such control. It sits right after **Active job** since it reads
+ * that same fact: draining alone means no *new* work, and what the machine is still
+ * running is what says whether restarting is safe yet. It is deliberately the one
+ * owner action here with **no confirmation** — reversible, effective only from the
+ * next dispatch, and undone by the button that replaces it — and a drained machine
+ * that is online still reads as Online, here and in the table's Status column: this
+ * is an operator state, never an error or an outage.
  */
 
 const CARD_CLASS = 'border border-zinc-800 rounded-lg bg-panel/40 p-6 shadow-sm';
@@ -585,6 +599,21 @@ export function WorkerDetailView({
 					<p className="text-sm text-zinc-400">Idle — no run assigned right now.</p>
 				)}
 			</div>
+
+			{/* Directly after Active job, which is the other half of "is it safe to restart
+			    this machine yet?" (issue #926). Owner-only behind the same strict flag as
+			    the cards below, and the server re-checks it on `workers.setDraining`. */}
+			{worker.viewerIsOwner ? (
+				<div className={CARD_CLASS}>
+					<h2 className={SECTION_HEADING_CLASS}>Pool membership</h2>
+					<WorkerDrainCard
+						workerId={worker.workerId}
+						drainingSince={worker.drainingSince}
+						currentRunTitle={worker.currentRun?.workItemTitle ?? null}
+						onChanged={onChanged}
+					/>
+				</div>
+			) : null}
 
 			{/* Worker-scoped state, so it sits above the per-project blocks — which are also
 			    what decide which providers it lists. Owner-only, the same strict flag that

@@ -610,7 +610,10 @@ unchanged.
   **machine-wide and sticky across the restart it was taken for**: a reconnecting
   daemon does not rejoin the pool (the router logs that it is draining at every
   handshake), nothing expires it, and only `undrain` ends it. Owner-only, exactly
-  like `remove` — sign in as the machine's owner.
+  like `remove` — sign in as the machine's owner. The same two actions are on the
+  machine's own page in the dashboard since issue #926 (`/workers/<worker-id>` →
+  **Pool membership** → **Drain worker** / **Return to the pool**), which states the
+  same "still running …" / "idle — safe to restart now" answer this command prints.
 - **`enroll`** — enroll a worker into a project with allowed CLIs (`--cli`, a
   subset of the worker's capabilities) and `--concurrency`, this worker's share of
   the project. Omit `--concurrency` for `1` (the default): one of the project's
