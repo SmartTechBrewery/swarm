@@ -54,7 +54,7 @@ describe('SWARM-origin markers', () => {
 			[],
 			2,
 			3,
-			{ preplanPublished: true, planned: true, prepared: true },
+			{ preplanPublished: true, planned: true, prepared: true, advanced: false },
 		);
 		expect(isSwarmGeneratedBody(child)).toBe(true);
 

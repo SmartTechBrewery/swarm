@@ -1943,6 +1943,15 @@ export interface PhaseRunResult {
 	 */
 	movedTo?: PmStatusKey;
 	split?: { subTaskItemIds: string[]; mainTaskUpdated: boolean };
+	/**
+	 * The *other* board items this phase moved to {@link movedTo}: the split
+	 * children a Planning run's `autoAdvance` took along with the source task
+	 * (issue #911). Each needs its own {@link selfEnqueueNextPhase} for the same
+	 * reason the source task does — the move is SWARM's own, so its webhook is
+	 * dropped by loop prevention and nothing else would ever start it. Absent when
+	 * the phase advanced nothing but its own item.
+	 */
+	advancedItemIds?: string[];
 	/** Validated Planning scope, available only after a successful normal Planning run. */
 	planningScope?: ProposedScope;
 	/** The submitted verdict of a Review run — persisted onto its history row (issue #218). */
@@ -2880,7 +2889,7 @@ function agentColumns(agent: ReportedAgentResult | undefined): Partial<CompleteR
  */
 async function selfEnqueueNextPhase(
 	project: ProjectConfig,
-	workItem: WorkItem,
+	itemId: string,
 	movedTo: PmStatusKey | undefined,
 ): Promise<void> {
 	if (!movedTo) return;
@@ -2895,7 +2904,7 @@ async function selfEnqueueNextPhase(
 			type: 'pm',
 			providerId: project.pm.type,
 			projectId: project.id,
-			event: requireProjectPMAdapter(project).synthesizeStateChange(project, workItem.id),
+			event: requireProjectPMAdapter(project).synthesizeStateChange(project, itemId),
 			// The repository the *completed* phase ran in, carried rather than re-derived
 			// (issue #686 phase 2). Load-bearing: without it an auto-advanced next phase
 			// would silently jump back to the project's default entry. This path needs no
@@ -2910,14 +2919,14 @@ async function selfEnqueueNextPhase(
 		});
 		logger.debug('pm-status: self-enqueued next phase after auto-advance', {
 			projectId: project.id,
-			itemId: workItem.id,
+			itemId,
 			movedTo,
 			nextPhase,
 		});
 	} catch (err) {
 		logger.error('Failed to self-enqueue next phase after auto-advance', {
 			projectId: project.id,
-			itemId: workItem.id,
+			itemId,
 			movedTo,
 			nextPhase,
 			error: err instanceof Error ? err.message : String(err),
@@ -4491,7 +4500,17 @@ export async function processJob(
 		);
 		await tryCompleteDispatch(dispatch.id, 'phase-succeeded');
 		if (trigger.phase === 'planning' || trigger.phase === 'implementation') {
-			await selfEnqueueNextPhase(project, trigger.workItem, result.movedTo);
+			await selfEnqueueNextPhase(project, trigger.workItem.id, result.movedTo);
+			// Every other card this phase advanced to the same status — a split's
+			// prepared children under `autoAdvance` (issue #911). They need their own
+			// synthetic job for the same reason the source task does: the move is
+			// SWARM's own, so the webhook for it is dropped, and nothing else would ever
+			// start them. Each is re-read authoritatively by `pm-status`, so the phase it
+			// starts is resolved in one place and the dependency gate still defers a
+			// child whose predecessors are open.
+			for (const advancedItemId of result.advancedItemIds ?? []) {
+				await selfEnqueueNextPhase(project, advancedItemId, result.movedTo);
+			}
 		}
 		// Ordering matters: this must run *after* `tryCompleteDispatch` above. The
 		// merge dispatch it persists is linked to this same `runId`, and the

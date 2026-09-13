@@ -105,6 +105,24 @@ describe('adaptResultToPhaseRun', () => {
 		expect(run.prUrl).toBeUndefined();
 	});
 
+	it('maps the split children auto-advance took along, so each gets its own self-enqueue (issue #911)', () => {
+		const run = adaptResultToPhaseRun(
+			base({
+				status: 'succeeded',
+				exitCode: 0,
+				movedTo: 'todo',
+				advancedItemIds: ['PVTI_child-one', 'PVTI_child-two'],
+			}),
+			SELECTION,
+		);
+		expect(run.advancedItemIds).toEqual(['PVTI_child-one', 'PVTI_child-two']);
+	});
+
+	it('tolerates a result frame from an older worker that reports no advanced children', () => {
+		const run = adaptResultToPhaseRun(base({ status: 'succeeded', exitCode: 0 }), SELECTION);
+		expect(run.advancedItemIds).toBeUndefined();
+	});
+
 	it('maps the reported CI outcome so the settle path can hand a no-fix back to Review (issue #841)', () => {
 		const run = adaptResultToPhaseRun(
 			base({ status: 'succeeded', exitCode: 0, ciOutcome: 'no-fix' }),

@@ -102,6 +102,7 @@ type StubPhaseResult = {
 	agent: AgentCliResult;
 	movedTo?: string;
 	split?: { subTaskItemIds: string[]; mainTaskUpdated: boolean };
+	advancedItemIds?: string[];
 	verdict?: string;
 	reviewOrdinal?: number;
 	automationOutcome?: string;
@@ -1925,6 +1926,57 @@ describe('processJob', () => {
 					repository: PROJECT.repo,
 				},
 			});
+		});
+
+		it('self-enqueues every split child auto-advance took along with the source task', async () => {
+			const workItem = createMockWorkItem({ statusId: '3fe662f4' });
+			const trigger: TriggerResult = { phase: 'planning', taskId: '10', workItem };
+			// A split whose children were advanced to the same status as the source
+			// task (issue #911). Each needs its own synthetic job for the same reason
+			// the source task does: the move is SWARM's own, so its board webhook is
+			// dropped by loop prevention and nothing else would ever start it.
+			phaseImpl = async () => ({
+				agent: agentResult(),
+				movedTo: 'todo',
+				split: { subTaskItemIds: ['PVTI_child-one', 'PVTI_child-two'], mainTaskUpdated: true },
+				advancedItemIds: ['PVTI_child-one', 'PVTI_child-two'],
+			});
+
+			await processJob(createMockPmWebhookJob(), registryReturning(trigger));
+
+			expect(createAndPublishDispatch).toHaveBeenCalledTimes(3);
+			const payloads = createAndPublishDispatch.mock.calls.map(
+				([input]) => (input as { jobPayload: { event: { itemId: string } } }).jobPayload,
+			);
+			expect(payloads.map((payload) => payload.event.itemId)).toEqual([
+				workItem.id,
+				'PVTI_child-one',
+				'PVTI_child-two',
+			]);
+			// Every one carries the repository the *completed* phase ran in, so an
+			// advanced child's next phase cannot jump back to the project's default.
+			for (const payload of payloads) {
+				expect(payload).toMatchObject({
+					type: 'pm',
+					providerId: 'github-projects',
+					projectId: PROJECT.id,
+					repository: PROJECT.repo,
+				});
+			}
+		});
+
+		it('does not self-enqueue advanced children when the phase made no move', async () => {
+			const trigger: TriggerResult = {
+				phase: 'planning',
+				taskId: '10',
+				workItem: createMockWorkItem(),
+			};
+			// `autoAdvance` off: the source task did not move, so neither did any child.
+			phaseImpl = async () => ({ agent: agentResult(), advancedItemIds: ['PVTI_child-one'] });
+
+			await processJob(createMockPmWebhookJob(), registryReturning(trigger));
+
+			expect(createAndPublishDispatch).not.toHaveBeenCalled();
 		});
 
 		it('does not self-enqueue when the phase made no move (autoAdvance off)', async () => {

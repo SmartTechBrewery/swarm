@@ -120,7 +120,11 @@ so the child reads no repository and spends no agent, and gating it would defer 
 that repairs a `planned` label whose write failed.
 
 SWARM creates the card in Backlog only long enough to write that marker **and apply the `planned`
-label**, then moves it to Planning. That ordering means both the Planning-move webhook and a delayed
+label**, then moves it to Planning — and on to ToDo with the re-scoped first task when the project
+sets `pipeline.planning.autoAdvance` (issue #911), since the label that saves the agent run is also
+what leaves a card parked in Planning with nothing to dispatch it. Either way the child spends no
+Planning agent; where it comes to rest is the auto-advance policy's decision, not the split's. That
+ordering means both the Planning-move webhook and a delayed
 creation webhook find a card that is already labelled: the trigger skips it, so no worktree or agent
 CLI is launched. Labelling before the move is what makes that true — the move is the event that
 dispatches, so a label applied afterwards would race every child into the very dispatch it exists to

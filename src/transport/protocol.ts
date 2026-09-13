@@ -557,6 +557,14 @@ export const TaskExecutionResultSchema = z.object({
 	// `PM_STATUS_KEYS` (`../pm/pipeline.ts`) and `REVIEW_VERDICTS` /
 	// `REVIEW_AUTOMATION_OUTCOMES` (`../pipeline/review.ts`).
 	movedTo: z.enum(['backlog', 'planning', 'todo', 'inProgress', 'inReview', 'done']).optional(),
+	// `succeeded` — the *other* board items the phase moved to `movedTo`: the split
+	// children a Planning run's `autoAdvance` took along with the source task (issue
+	// #911). The control plane self-enqueues the next phase for each, because a
+	// SWARM-authored board move is dropped by loop prevention and no webhook for it
+	// ever arrives. Mirrors `PhaseRunResult.advancedItemIds`. Optional and additive in
+	// both directions, so `TRANSPORT_PROTOCOL_VERSION` is deliberately **not** bumped:
+	// an older worker simply omits it and its splits behave exactly as they do today.
+	advancedItemIds: z.array(z.string().min(1)).optional(),
 	// `comment` is retired (issue #470) but stays accepted here: this is a terminal
 	// result frame, so rejecting it would fail the whole settle — losing the run's
 	// outcome — over one optional telemetry field an older worker might still send.

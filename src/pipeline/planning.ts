@@ -10,7 +10,11 @@
  * item then moves itself to "ToDo" is a per-project setting
  * (`project.pipeline.planning.autoAdvance`, `src/config/schema.ts`) —
  * defaulting to `false`: a human reviews the plan, then moves the item
- * themselves to greenlight Implementation. The plan is a review artefact, not
+ * themselves to greenlight Implementation. When the run ends in a split, that
+ * setting governs every card the run produced, not only the source task: each
+ * prepared child is moved on with it (issue #911), since the `planned` label
+ * that keeps a child from costing a Planning agent is also what leaves it
+ * parked with nothing to dispatch it. The plan is a review artefact, not
  * code — it's delivered as a comment and the worktree is thrown away, so the
  * checkout is detached and never commits.
  *
@@ -305,6 +309,12 @@ export interface RunPlanningPhaseOptions {
 	 * `false` — a human reviews the plan and moves the item themselves. Always
 	 * forced off for a spawned split-child item (see {@link SPLIT_CHILD_LABEL}),
 	 * regardless of this value.
+	 *
+	 * When the run splits, this is the policy for **every** card it produced, not
+	 * just the source task: each child the split prepared is moved to "ToDo" too
+	 * (issue #911), reported on {@link PlanningPhaseResult.advancedItemIds}. That is
+	 * the parent run advancing its children, which is a different question from the
+	 * child's *own* Planning run never advancing itself (issue #178).
 	 */
 	autoAdvance?: boolean;
 	/**
@@ -368,6 +378,14 @@ export interface PlanningPhaseResult {
 		subTaskItemIds: string[];
 		mainTaskUpdated: boolean;
 	};
+	/**
+	 * The other board items this run moved to {@link movedTo}: the split children
+	 * `autoAdvance` took along with the source task (issue #911). The worker
+	 * self-enqueues the next phase for each, because a SWARM-authored board move is
+	 * dropped by loop prevention and no webhook for it ever arrives. Absent when the
+	 * run advanced nothing but its own item.
+	 */
+	advancedItemIds?: string[];
 	/**
 	 * True when this run reused a preplanned split-child plan and skipped the
 	 * agent CLI entirely (docs/OPTIMIZATION.md §3). The `agent` result is then a
@@ -468,10 +486,11 @@ function enforceSingleTaskBudget(
 
 /**
  * What automatic preparation of a split child actually achieved, so its split
- * comment reports the real state rather than a hopeful one (issue #431). Two
+ * comment reports the real state rather than a hopeful one (issue #431). Three
  * independent facts: whether the child's plan was published as a visible comment,
- * and whether preparation got all the way to Planning. A struct rather than two
- * positional booleans so the call site stays readable.
+ * whether preparation got all the way to Planning, and whether the run's
+ * `autoAdvance` then took it on to "ToDo". A struct rather than positional
+ * booleans so the call site stays readable.
  */
 interface ChildPreparation {
 	/** The preplan was posted as a human-readable comment on the child. */
@@ -485,6 +504,20 @@ interface ChildPreparation {
 	planned: boolean;
 	/** The marker was embedded and the child reached Planning. */
 	prepared: boolean;
+	/**
+	 * The child was moved on to {@link NEXT_STATUS} with the source task, because
+	 * the run's `autoAdvance` is on (issue #911). Implies {@link prepared} — a
+	 * child left in Backlog by a failed preparation is never advanced.
+	 */
+	advanced: boolean;
+}
+
+/** Where a split child's preparation left it, as the split note reports it. */
+type SplitChildOutcome = 'advanced' | 'ready' | 'backlog';
+
+function splitChildOutcome(preparation: ChildPreparation): SplitChildOutcome {
+	if (preparation.advanced) return 'advanced';
+	return preparation.prepared ? 'ready' : 'backlog';
 }
 
 /**
@@ -508,7 +541,10 @@ interface ChildPreparation {
  * stranded it — one already holds its plan and will never be re-planned, the other
  * holds nothing and gets a full agent run the moment it reaches Planning. Telling
  * an operator to "move it to Planning and SWARM will plan it" is true of only one
- * of them, so the note says which.
+ * of them, so the note says which. A fourth branch arrived with issue #911: under
+ * `autoAdvance` a prepared child is moved on to "ToDo" with the source task, which
+ * makes the prepared branch's "it will **not** move to **ToDo** on its own — move
+ * it when you are ready" a plain falsehood on that card.
  *
  * Carries the {@link SWARM_GENERATED_FOOTER} like every other SWARM comment, so
  * comment loop prevention never reads it back as human input — it used to be the one
@@ -546,7 +582,16 @@ export function splitChildCommentBody(
 			'',
 		);
 	}
-	if (preparation.prepared) {
+	if (preparation.advanced) {
+		lines.push(
+			"SWARM has already prepared this task's plan and moved it to **ToDo** — this project",
+			'advances a finished plan automatically. It carries the `planned` label, so no',
+			'Planning-agent run is spent on it. Its implementation stays blocked until the phases',
+			'above are done, so SWARM starts this phase in order rather than early. To throw the',
+			'saved plan away and have SWARM plan this task from scratch, remove the `planned` label',
+			'and move the card **Backlog → Planning**.',
+		);
+	} else if (preparation.prepared) {
 		lines.push(
 			"SWARM has already prepared this task's plan and placed it in **Planning**. It carries the",
 			'`planned` label, so no Planning-agent run is spent on it, and it will **not** move to',
@@ -644,20 +689,20 @@ export function splitChildMarker(splitId: string, childIndex: number): string {
  * The child's *outcome* is deliberately part of the marker. The note reports what
  * preparation actually achieved, and a retry can legitimately achieve more than the
  * attempt it resumes (a child left in Backlog by a failed marker embed can reach
- * Planning the second time). Keying on the outcome makes a repeat of the *same*
- * report a no-op while letting a genuinely different one post — the second note then
- * corrects the first, which is the honest board state rather than a stale claim
- * nothing may contradict.
+ * Planning the second time; one left in Planning by a refused auto-advance can reach
+ * ToDo the second time, issue #911). Keying on the outcome makes a repeat of the
+ * *same* report a no-op while letting a genuinely different one post — the second
+ * note then corrects the first, which is the honest board state rather than a stale
+ * claim nothing may contradict. The `ready`/`backlog` spellings predate the third
+ * outcome and are kept, so an in-flight retry of a pre-#911 delivery still matches
+ * the note it already posted.
  */
 export function splitChildNoteMarker(
 	splitId: string,
 	childIndex: number,
-	prepared: boolean,
+	outcome: SplitChildOutcome,
 ): string {
-	return swarmMarker(
-		'split-child-note',
-		`${splitId}:${childIndex}:${prepared ? 'ready' : 'backlog'}`,
-	);
+	return swarmMarker('split-child-note', `${splitId}:${childIndex}:${outcome}`);
 }
 
 /**
@@ -916,6 +961,18 @@ function readPlanOrThrow(
  * ({@link readSplitDependents}) and handed an edge on every spawned child once the
  * last one does ({@link carryDependentsForward}), on the same best-effort
  * swallow-and-log contract as the inward half.
+ *
+ * **Auto-advance reaches the children too (issue #911).** With `autoAdvance` on, a
+ * child that really holds its plan is moved on to {@link NEXT_STATUS} with the source
+ * task — per child, after its `blocked-by` edges are written and before its note is
+ * posted ({@link advanceSplitChild}) — and the ids that moved are returned so the
+ * worker can self-enqueue each one's next phase. Doing it here rather than beside the
+ * parent's own move inherits this function's replay protection: `applySplit` runs
+ * *before* the plan comment whose {@link planDeliveryMarker} short-circuits a replayed
+ * delivery, so "the plan comment exists" already implies "every child was processed",
+ * where advancing next to the parent's move would be skipped on a retry that had
+ * already posted the comment. With `autoAdvance` off nothing changes: the children
+ * stay in Planning, exactly as the source task stays where it is.
  */
 async function applySplit(
 	pm: PMProvider,
@@ -923,7 +980,8 @@ async function applySplit(
 	split: ProposedSplit,
 	automationLabel: string | undefined,
 	deliveryId: string | undefined,
-): Promise<{ subTaskItemIds: string[]; mainTaskUpdated: boolean }> {
+	autoAdvance: boolean,
+): Promise<{ subTaskItemIds: string[]; mainTaskUpdated: boolean; advancedItemIds: string[] }> {
 	// One shared name for the whole split, applied to the original and every child
 	// (issue #594), so the phases of one issue are recognisable as a set on the board.
 	const naming = resolveSplitNaming({
@@ -946,6 +1004,9 @@ async function applySplit(
 	const splitId = deliveryId ?? randomUUID();
 	const generatedAt = new Date().toISOString();
 	const subTaskItemIds: string[] = [];
+	// The children `autoAdvance` really took to NEXT_STATUS, reported up so the
+	// worker self-enqueues each one's next phase (issue #911).
+	const advancedItemIds: string[] = [];
 	// Phase 1 is the re-scoped original (with whatever rename patch just applied);
 	// each sibling is the next phase. `predecessors` accumulates them so phase N is
 	// chained behind phases 1..N-1 — the cumulative blocked-by the issue requires.
@@ -956,7 +1017,7 @@ async function applySplit(
 	// this split is about to chain behind the parent (guard 3, issue #890).
 	const incomingDependents = await readSplitDependents(pm, parent);
 	for (const [childIndex, sub] of split.subTasks.entries()) {
-		const sibling = await spawnSplitChild(pm, {
+		const { sibling, advanced } = await spawnSplitChild(pm, {
 			parent,
 			firstTask,
 			predecessors,
@@ -968,8 +1029,10 @@ async function applySplit(
 			generatedAt,
 			labels: childLabels,
 			deliveryId,
+			autoAdvance,
 		});
 		subTaskItemIds.push(sibling.id);
+		if (advanced) advancedItemIds.push(sibling.id);
 		predecessors.push(sibling);
 	}
 	// `predecessors` is now every phase in order — phase 1 plus each spawned child —
@@ -980,7 +1043,7 @@ async function applySplit(
 		dependents: incomingDependents,
 		splitId,
 	});
-	return { subTaskItemIds, mainTaskUpdated: mainPatch !== undefined };
+	return { subTaskItemIds, mainTaskUpdated: mainPatch !== undefined, advancedItemIds };
 }
 
 /** One child's slice of {@link applySplit}'s state, for {@link spawnSplitChild}. */
@@ -1001,6 +1064,11 @@ interface SpawnSplitChildOptions {
 	labels: readonly string[];
 	/** This delivery's id, or `undefined` when the run has no run row to key markers on. */
 	deliveryId: string | undefined;
+	/**
+	 * The run's effective `autoAdvance`. When on, a *prepared* child is moved on to
+	 * {@link NEXT_STATUS} with the source task ({@link advanceSplitChild}, issue #911).
+	 */
+	autoAdvance: boolean;
 }
 
 /**
@@ -1016,7 +1084,10 @@ interface SpawnSplitChildOptions {
  * a retry would have to clean up. The find-or-create ahead of it is not — see
  * {@link acquireSplitChild}.
  */
-async function spawnSplitChild(pm: PMProvider, options: SpawnSplitChildOptions): Promise<WorkItem> {
+async function spawnSplitChild(
+	pm: PMProvider,
+	options: SpawnSplitChildOptions,
+): Promise<{ sibling: WorkItem; advanced: boolean }> {
 	const {
 		parent,
 		firstTask,
@@ -1029,6 +1100,7 @@ async function spawnSplitChild(pm: PMProvider, options: SpawnSplitChildOptions):
 		generatedAt,
 		labels,
 		deliveryId,
+		autoAdvance,
 	} = options;
 	// Only a delivery with an identity can be replayed, so only one stamps its
 	// children — and `description` is the human description *plus* that stamp, the
@@ -1086,16 +1158,28 @@ async function spawnSplitChild(pm: PMProvider, options: SpawnSplitChildOptions):
 	// transient API failure, must not fail the whole split; the note below (guard 1)
 	// still names the blockers.
 	await linkBlockedBy(pm, sibling, predecessors, splitId, childIndex);
+	// Auto-advance is the run's policy, applied to every card the run produced and
+	// not just the source task (issue #911) — but only to a child that really holds
+	// its plan: one deliberately left in Backlog by a failed preparation owes a
+	// Planning run, and advancing it would dispatch Implementation on an unplanned
+	// card. After `linkBlockedBy`, so its blockers are recorded before the status the
+	// Implementation dispatch keys on; before the note, so the note reports the
+	// child's real final state instead of predicting one.
+	const advanced =
+		prepared && autoAdvance ? await advanceSplitChild(pm, sibling, splitId, childIndex) : false;
+	const preparation: ChildPreparation = { prepared, preplanPublished, planned, advanced };
 	await postSplitChildNote(pm, sibling, {
 		firstTask,
 		predecessors,
 		phaseNumber: childIndex + 2,
 		totalPhases,
-		preparation: { prepared, preplanPublished, planned },
-		marker: deliveryId ? splitChildNoteMarker(splitId, childIndex, prepared) : undefined,
+		preparation,
+		marker: deliveryId
+			? splitChildNoteMarker(splitId, childIndex, splitChildOutcome(preparation))
+			: undefined,
 		resumed,
 	});
-	return sibling;
+	return { sibling, advanced };
 }
 
 /** What {@link acquireSplitChild} needs to find-or-create one child. */
@@ -1273,6 +1357,50 @@ async function markSplitChildPlanned(
 			childIndex,
 			error: error instanceof Error ? error.message : String(error),
 		});
+		return false;
+	}
+}
+
+/**
+ * Move a prepared split child on to {@link NEXT_STATUS} — the status the run's
+ * `autoAdvance` sends the source task to (issue #911). Without it the children of
+ * an auto-advancing split are the only cards the phase produces that nothing ever
+ * picks up: the `planned` label is exactly what stops a card entering Planning from
+ * dispatching a Planning run (issue #737), so a child parked there has no run, no
+ * outstanding plan work, and no path forward but an operator dragging it to ToDo.
+ *
+ * **Written after {@link linkBlockedBy}, and that order is the point.** This is the
+ * status the Implementation dispatch keys on, and the gate that defers it reads the
+ * card's *recorded* blockers — so advancing before the edges exist is how a phase 3
+ * card starts ahead of phase 1. Advancing after them means the dispatch defers on its
+ * prerequisites and re-checks token-free until they close, which is what an advanced
+ * child is supposed to do.
+ *
+ * Best-effort like {@link markSplitChildPlanned}: a refused move is logged and
+ * swallowed, leaving the child exactly where a run with `autoAdvance` off leaves it —
+ * in Planning, holding its plan — and the split note then reports Planning rather
+ * than ToDo. Failing an otherwise-complete parent Planning run over one child's
+ * status write would cost a retry of the whole split.
+ */
+async function advanceSplitChild(
+	pm: PMProvider,
+	item: WorkItem,
+	splitId: string,
+	childIndex: number,
+): Promise<boolean> {
+	try {
+		await pm.moveWorkItem(item.id, NEXT_STATUS);
+		return true;
+	} catch (error) {
+		logger.warn(
+			'Planning — failed to auto-advance a prepared split child; leaving it in Planning',
+			{
+				itemId: item.id,
+				splitId,
+				childIndex,
+				error: error instanceof Error ? error.message : String(error),
+			},
+		);
 		return false;
 	}
 }
@@ -2132,6 +2260,9 @@ async function verifyAndApplyPlanningResult(options: VerifyAndApplyPlanningResul
 					// The delivery's own identity, threaded in so the split's per-child
 					// markers match again on a retry that got this far (issue #543).
 					deliveryId,
+					// The same auto-advance policy the source task's move below obeys,
+					// applied to every child the split prepared (issue #911).
+					effectiveAutoAdvance,
 				)
 			: undefined;
 		commentId = await pm.addComment(
@@ -2150,7 +2281,20 @@ async function verifyAndApplyPlanningResult(options: VerifyAndApplyPlanningResul
 	// remains marked as failed, and subsequent retries find this delivery's comment via its marker.
 	await applyPlannedLabel(pm, workItem, taskId);
 
-	return { commentId, movedTo, split: splitResult, planningScope };
+	return {
+		commentId,
+		movedTo,
+		// Kept to its existing shape: `advancedItemIds` is reported separately rather
+		// than widened into `split`, which `PhaseRunResult` and the wire frame mirror.
+		split: splitResult && {
+			subTaskItemIds: splitResult.subTaskItemIds,
+			mainTaskUpdated: splitResult.mainTaskUpdated,
+		},
+		// Only when non-empty, so a run that advanced nothing but its own item reports
+		// nothing rather than an empty array on the wire.
+		advancedItemIds: splitResult?.advancedItemIds.length ? splitResult.advancedItemIds : undefined,
+		planningScope,
+	};
 }
 
 export async function runPlanningPhase(
@@ -2310,6 +2454,7 @@ export async function runPlanningPhase(
 			commentId: result.commentId,
 			movedTo: result.movedTo,
 			splitInto: result.split?.subTaskItemIds.length,
+			advancedItemIds: result.advancedItemIds,
 			verified: verified?.verification.ran,
 			corrected: verified?.verification.corrected,
 		});
@@ -2320,6 +2465,7 @@ export async function runPlanningPhase(
 			agent,
 			movedTo: result.movedTo,
 			split: result.split,
+			advancedItemIds: result.advancedItemIds,
 			planningScope: result.planningScope,
 			verification: verified?.verification,
 		};
