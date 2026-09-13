@@ -1093,7 +1093,12 @@ export const runsRouter = router({
 			// terminated while deferred keeps its cancellation entry (issue #166), and
 			// re-running reuses the same immutable run id — without this the worker's
 			// start-check would instantly terminate the fresh attempt.
-			await clearRunCancellation(input.runId);
+			await clearRunCancellation(input.runId, {
+				action: 'retry',
+				projectId: run.projectId,
+				taskId: run.taskId,
+				phase: run.phase,
+			});
 
 			const isRecovery = run.recovery?.state === 'preserved';
 			const applyingOverride =
@@ -1273,7 +1278,12 @@ export const runsRouter = router({
 				source: 'dashboard',
 				requestedAt: new Date().toISOString(),
 			};
-			await requestRunCancellation(run.id, origin);
+			await requestRunCancellation(run.id, origin, {
+				action: 'terminate',
+				projectId: run.projectId,
+				taskId: run.taskId,
+				phase: run.phase,
+			});
 
 			// Both retry-pending statuses settle the same way (issue #503): a `checkpointed`
 			// run has a waiting dispatch and no live agent, exactly like a `deferred` one.
