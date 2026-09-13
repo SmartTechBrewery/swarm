@@ -277,6 +277,19 @@ describe('runImplementationPhase', () => {
 		});
 	});
 
+	it('does not report the In progress pickup for a run already aborted (issue #912)', async () => {
+		// A cancellation that landed while the phase was doing its pre-agent work (the
+		// dependency gate is a transported round trip on a federated worker). Reporting
+		// the pickup now would leave the card in this phase's column with no run behind
+		// it and nothing that would ever move it out.
+		const deps = makeDeps();
+		const signal = AbortSignal.abort();
+
+		await runImplementationPhase({ ...deps, signal });
+
+		expect(deps.pm.moveWorkItem).not.toHaveBeenCalledWith('PVTI_item19', 'inProgress');
+	});
+
 	it('names the worktree path in the prompt for Antigravity but not for Claude (issue #226)', async () => {
 		// agy --print runs from its own scratch dir, not the worktree cwd, so the
 		// Antigravity prompt must name the absolute path; Claude inherits cwd and
