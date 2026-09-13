@@ -19,6 +19,9 @@ const validWorker = {
 	declaredCapabilities: null,
 	supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 	repository: null,
+	// In the pool (issue #919) — nullable, not optional, for the same reason
+	// `repository` is: no reader gets an "absent" case to interpret.
+	drainingSince: null,
 	build: null,
 	createdAt: new Date('2026-01-01T00:00:00Z'),
 	updatedAt: new Date('2026-01-01T00:00:00Z'),

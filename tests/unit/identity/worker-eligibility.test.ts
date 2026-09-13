@@ -28,11 +28,14 @@ const TASK_REPOSITORY = 'smarttechbrewery/swarm';
 
 function makeWorker(
 	overrides: Partial<Worker> = {},
-): Pick<Worker, 'capabilities' | 'supportedPhases' | 'repository'> {
+): Pick<Worker, 'capabilities' | 'supportedPhases' | 'repository' | 'drainingSince'> {
 	return {
 		capabilities: ['claude', 'codex'],
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 		repository: TASK_REPOSITORY,
+		// In the pool (issue #919), which is what every case that says nothing about
+		// draining assumes.
+		drainingSince: null,
 		...overrides,
 	};
 }
@@ -73,10 +76,11 @@ function evaluate(overrides: Partial<WorkerEligibilityInput> = {}): EligibilityR
 }
 
 describe('IneligibilityReasonSchema', () => {
-	it('covers exactly the seven predicate reasons', () => {
+	it('covers exactly the eight predicate reasons, in check order', () => {
 		expect(INELIGIBILITY_REASONS).toEqual([
 			'missing-enrollment',
 			'missing-consent',
+			'worker-draining',
 			'worker-unavailable',
 			'repository-mismatch',
 			'missing-phase-capability',
@@ -128,6 +132,43 @@ describe('evaluateWorkerEligibility', () => {
 		expect(evaluate({ enrollment: makeEnrollment({ sharingConsent: false }) })).toEqual({
 			eligible: false,
 			reason: 'missing-consent',
+		});
+	});
+
+	// Issue #919. A drained machine is one an operator took out of the pool so it can
+	// be restarted: a standing statement about routability, judged beside sharing
+	// consent and deliberately *ahead* of connectivity.
+	describe('draining (issue #919)', () => {
+		it('worker-draining when the machine has been taken out of the pool', () => {
+			const worker = makeWorker({ drainingSince: new Date('2026-09-13T10:00:00Z') });
+			expect(evaluate({ worker })).toEqual({ eligible: false, reason: 'worker-draining' });
+		});
+
+		// The ordering decision, and the regression that would silently undo it: a
+		// machine drained *in order to* be restarted is usually also offline, and
+		// reporting `worker-unavailable` for it would tell an operator to wait for
+		// something waiting cannot fix.
+		it('reports worker-draining, not worker-unavailable, for a drained machine that is also offline', () => {
+			const worker = makeWorker({ drainingSince: new Date('2026-09-13T10:00:00Z') });
+			expect(evaluate({ worker, availability: { connected: false, activeRuns: 0 } })).toEqual({
+				eligible: false,
+				reason: 'worker-draining',
+			});
+		});
+
+		it('still reports missing-consent first — consent is judged before draining', () => {
+			const worker = makeWorker({ drainingSince: new Date('2026-09-13T10:00:00Z') });
+			const enrollment = makeEnrollment({ sharingConsent: false });
+			expect(evaluate({ worker, enrollment })).toEqual({
+				eligible: false,
+				reason: 'missing-consent',
+			});
+		});
+
+		it('changes nothing while the machine is in the pool', () => {
+			expect(evaluate({ worker: makeWorker({ drainingSince: null }) })).toEqual({
+				eligible: true,
+			});
 		});
 	});
 

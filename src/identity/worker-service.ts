@@ -30,6 +30,7 @@ import {
 	getWorkersByIds,
 	listWorkersForOwner as listWorkersForOwnerRows,
 	setWorkerDeclaredCapabilities,
+	setWorkerDraining as setWorkerDrainingRow,
 	updateWorkerCapabilities,
 	updateWorkerDisplayName,
 	updateWorkerSupportedPhases,
@@ -206,6 +207,21 @@ export async function declareWorkerSupportedPhases(
 ): Promise<Worker | undefined> {
 	const validated = WorkerSupportedPhasesSchema.parse(supportedPhases);
 	return updateWorkerSupportedPhases(id, validated);
+}
+
+/**
+ * Take a worker out of the dispatch pool, or return it to it (issue #919) — the
+ * service seam the API layer programs against, exactly as `renameWorker` and
+ * {@link declareWorkerCapabilities} are. Nothing to validate beyond the boolean:
+ * the instant is the server's, and a re-drain keeps the one already recorded.
+ *
+ * Returns the updated worker, or `undefined` if no worker has that id.
+ */
+export async function setWorkerDraining(
+	id: string,
+	draining: boolean,
+): Promise<Worker | undefined> {
+	return setWorkerDrainingRow(id, draining);
 }
 
 /**

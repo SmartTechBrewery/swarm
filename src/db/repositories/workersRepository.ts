@@ -26,7 +26,7 @@
  * not-found, not an error (ai/CODING_STANDARDS.md "Error handling").
  */
 
-import { asc, eq, inArray } from 'drizzle-orm';
+import { asc, eq, inArray, sql } from 'drizzle-orm';
 
 import type { AgentCli } from '../../harness/agent-cli.js';
 import {
@@ -79,6 +79,7 @@ function rowToWorker(row: WorkerRow): Worker {
 		declaredCapabilities,
 		supportedPhases: row.supportedPhases as TriggerPhase[],
 		repository: row.repository ?? null,
+		drainingSince: row.drainingSince ?? null,
 		// Reassembled as one value so a consumer cannot read a commit without its flag
 		// (issue #918). The pair is always written together, so a non-null commit with a
 		// null flag can only be a row hand-edited in `psql`; read that as not dirty.
@@ -403,6 +404,33 @@ export async function updateWorkerSupportedPhases(
 	const [updatedRow] = await getDb()
 		.update(workers)
 		.set({ supportedPhases })
+		.where(eq(workers.id, id))
+		.returning();
+	return updatedRow ? rowToWorker(updatedRow) : undefined;
+}
+
+/**
+ * Take a worker **out of the dispatch pool**, or return it to it (issue #919).
+ * Idempotent by construction: draining an already-draining worker keeps the
+ * original instant (`coalesce`), so an operator re-running the command to check
+ * whether the machine has gone idle does not restart its own "draining since"
+ * clock. Returns the updated worker, or `undefined` if no worker has that id.
+ *
+ * No enrollment validation and no transaction of its own, unlike the two
+ * capability writes: draining narrows nothing an enrollment depends on, and the
+ * one place the write must be ordered against — a concurrent claim — takes the
+ * `workers` row `FOR UPDATE` on its side (`claimWorkerForDispatch`,
+ * `./dispatchesRepository.ts`), so the two serialize on that row either way.
+ */
+export async function setWorkerDraining(
+	id: string,
+	draining: boolean,
+): Promise<Worker | undefined> {
+	const [updatedRow] = await getDb()
+		.update(workers)
+		.set({
+			drainingSince: draining ? sql`coalesce(${workers.drainingSince}, now())` : null,
+		})
 		.where(eq(workers.id, id))
 		.returning();
 	return updatedRow ? rowToWorker(updatedRow) : undefined;

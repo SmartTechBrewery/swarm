@@ -54,12 +54,14 @@ const {
 		updateEnrollmentConstraints: vi.fn(),
 	};
 });
-const { declareWorkerCapabilities, getWorker, registerWorker, renameWorker } = vi.hoisted(() => ({
-	declareWorkerCapabilities: vi.fn(),
-	getWorker: vi.fn(),
-	registerWorker: vi.fn(),
-	renameWorker: vi.fn(),
-}));
+const { declareWorkerCapabilities, getWorker, registerWorker, renameWorker, setWorkerDraining } =
+	vi.hoisted(() => ({
+		declareWorkerCapabilities: vi.fn(),
+		getWorker: vi.fn(),
+		registerWorker: vi.fn(),
+		renameWorker: vi.fn(),
+		setWorkerDraining: vi.fn(),
+	}));
 const { removeWorker } = vi.hoisted(() => ({ removeWorker: vi.fn() }));
 const { getMembership, listAccessibleProjectIds } = vi.hoisted(() => ({
 	getMembership: vi.fn(),
@@ -102,6 +104,7 @@ vi.mock('@/identity/worker-service.js', () => ({
 	getWorker,
 	registerWorker,
 	renameWorker,
+	setWorkerDraining,
 }));
 vi.mock('@/db/repositories/workersRepository.js', () => ({ removeWorker }));
 vi.mock('@/identity/membership-service.js', () => ({ getMembership, listAccessibleProjectIds }));
@@ -162,6 +165,8 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		declaredCapabilities: null,
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 		repository: null,
+		// In the pool (issue #919) unless a case overrides it.
+		drainingSince: null,
 		build: null,
 		createdAt: new Date(0),
 		updatedAt: new Date(0),
@@ -213,6 +218,7 @@ beforeEach(() => {
 		getWorker,
 		registerWorker,
 		renameWorker,
+		setWorkerDraining,
 		removeWorker,
 		getMembership,
 		listAccessibleProjectIds,
@@ -497,7 +503,9 @@ describe('workers.list scoped to one project (issue #574)', () => {
 
 		const rows = await owner.list({ projectId: 'p1' });
 
-		expect(rows).toEqual([{ workerId: WORKER_ID, lastSeenAt: '2026-07-01T12:00:00.000Z' }]);
+		expect(rows).toEqual([
+			{ workerId: WORKER_ID, lastSeenAt: '2026-07-01T12:00:00.000Z', drainingSince: null },
+		]);
 	});
 
 	it('scopes an instanceAdmin too, so un-enrolled machines stay off a project tab', async () => {
@@ -1348,6 +1356,101 @@ describe('workers.setConsent (owner controls sharing consent)', () => {
 		const result = await owner.setConsent({ enrollmentId: ENROLLMENT_ID, sharingConsent: false });
 		expect(result.sharingConsent).toBe(false);
 		expect(setSharingConsent).toHaveBeenCalledWith(ENROLLMENT_ID, false);
+	});
+});
+
+// Issue #919. Taking your own machine out of the dispatch pool so you can restart
+// it is the machine operator's call, so the procedure is strictly owner-only and
+// answers with the machine's server-derived run state — which is what makes it the
+// "is it safe to restart yet?" check as well as the write.
+describe('workers.setDraining (owner-only, no instanceAdmin override, issue #919)', () => {
+	const DRAINED_AT = new Date('2026-09-13T10:00:00Z');
+
+	it('is NOT_FOUND for an unknown worker', async () => {
+		getWorker.mockResolvedValue(undefined);
+
+		await expect(owner.setDraining({ workerId: WORKER_ID, draining: true })).rejects.toThrowError(
+			expect.objectContaining({ code: 'NOT_FOUND' }),
+		);
+		expect(setWorkerDraining).not.toHaveBeenCalled();
+	});
+
+	it('hides a worker the caller does not own (NOT_FOUND)', async () => {
+		getWorker.mockResolvedValue(makeWorker({ ownerUserId: OTHER_ID }));
+
+		await expect(owner.setDraining({ workerId: WORKER_ID, draining: true })).rejects.toThrowError(
+			expect.objectContaining({ code: 'NOT_FOUND' }),
+		);
+		expect(setWorkerDraining).not.toHaveBeenCalled();
+	});
+
+	it('hides another owner’s worker from an instanceAdmin too', async () => {
+		const admin = workersRouter.createCaller({ user: ADMIN_USER });
+		getWorker.mockResolvedValue(makeWorker({ ownerUserId: OWNER_ID }));
+
+		await expect(admin.setDraining({ workerId: WORKER_ID, draining: true })).rejects.toThrowError(
+			expect.objectContaining({ code: 'NOT_FOUND' }),
+		);
+		expect(setWorkerDraining).not.toHaveBeenCalled();
+	});
+
+	it('returns the drain instant beside the derived busy state', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		setWorkerDraining.mockResolvedValue(makeWorker({ drainingSince: DRAINED_AT }));
+		deriveWorkerRunState.mockResolvedValue({ busy: true, currentRunId: 'run-7' });
+
+		const result = await owner.setDraining({ workerId: WORKER_ID, draining: true });
+
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_ID, true);
+		expect(result).toMatchObject({
+			workerId: WORKER_ID,
+			drainingSince: DRAINED_AT.toISOString(),
+			busy: true,
+			currentRunId: 'run-7',
+		});
+	});
+
+	// Being busy is the normal reason to drain, so — unlike `remove` — this is never
+	// refused for it. The run state is reported, not enforced.
+	it('drains a machine that is mid-run rather than refusing', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		setWorkerDraining.mockResolvedValue(makeWorker({ drainingSince: DRAINED_AT }));
+		deriveWorkerRunState.mockResolvedValue({ busy: true, currentRunId: 'run-7' });
+
+		await expect(owner.setDraining({ workerId: WORKER_ID, draining: true })).resolves.toMatchObject(
+			{ busy: true },
+		);
+	});
+
+	// The idempotence the repository's `coalesce` provides, asserted at the seam an
+	// operator polls through: re-running the command must not restart the clock.
+	it('keeps the first instant when the machine is drained twice', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		setWorkerDraining.mockResolvedValue(makeWorker({ drainingSince: DRAINED_AT }));
+
+		const first = await owner.setDraining({ workerId: WORKER_ID, draining: true });
+		const second = await owner.setDraining({ workerId: WORKER_ID, draining: true });
+
+		expect(second.drainingSince).toBe(first.drainingSince);
+	});
+
+	it('clears the flag when draining is false', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		setWorkerDraining.mockResolvedValue(makeWorker({ drainingSince: null }));
+
+		const result = await owner.setDraining({ workerId: WORKER_ID, draining: false });
+
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_ID, false);
+		expect(result.drainingSince).toBeNull();
+	});
+
+	it('is NOT_FOUND when the worker disappears between the check and the write', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		setWorkerDraining.mockResolvedValue(undefined);
+
+		await expect(owner.setDraining({ workerId: WORKER_ID, draining: true })).rejects.toThrowError(
+			expect.objectContaining({ code: 'NOT_FOUND' }),
+		);
 	});
 });
 

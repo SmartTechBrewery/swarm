@@ -405,6 +405,7 @@ export type WorkerDispatchClaimRefusal =
 	| 'worker-unavailable'
 	| 'missing-enrollment'
 	| 'missing-consent'
+	| 'worker-draining'
 	| 'missing-cli-capability';
 
 export type WorkerDispatchClaimResult =
@@ -470,6 +471,15 @@ function eligibilityClaimRefusal(
 ): WorkerDispatchClaimRefusal | undefined {
 	if (!worker || !enrollment || enrollment.status !== 'active') return 'missing-enrollment';
 	if (!enrollment.sharingConsent) return 'missing-consent';
+	// The exact opposite case to the `supportedPhases` note above, and the reason
+	// this re-check exists at all (issue #919): a phase set changes only through a
+	// re-handshake, while a drain is a value a human flips *while* dispatches are
+	// being selected. The `workers` row is taken FOR UPDATE by the caller, so the
+	// drain write and this claim are totally ordered — either the drain commits
+	// first and the claim is refused, or the claim commits first and the drain
+	// applies from the next dispatch. An assignment already in flight is never
+	// disturbed either way.
+	if (worker.drainingSince) return 'worker-draining';
 	// The row's `capabilities` column is only the daemon's last probe; the gate this
 	// re-checks routes on the *effective* set an owner's declaration resolves to
 	// (issue #783), so this must resolve it the same way rather than read the column.
@@ -531,10 +541,18 @@ export async function claimWorkerForDispatch(
 		const sessionRefusal = sessionClaimRefusal(session, input, now);
 		if (sessionRefusal) return { claimed: false, reason: sessionRefusal };
 
+		// FOR UPDATE rather than a plain read (issue #919): a drain write and this
+		// claim must serialize on the worker row, so the drain re-check below can
+		// never observe a half-state. Lock order stays acyclic — this transaction
+		// takes dispatches → projects → worker_sessions → workers → enrollments, and
+		// the only other `workers`-locking writers (`updateWorkerCapabilities`,
+		// `setWorkerDeclaredCapabilities`) take `workers` first and never lock an
+		// enrollment.
 		const [worker] = await tx
 			.select()
 			.from(workers)
 			.where(eq(workers.id, input.selectedWorkerId))
+			.for('update')
 			.limit(1);
 		const [enrollment] = await tx
 			.select()

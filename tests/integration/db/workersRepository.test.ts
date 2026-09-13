@@ -15,6 +15,7 @@ import {
 	listWorkersForOwner,
 	removeWorker,
 	setWorkerDeclaredCapabilities,
+	setWorkerDraining,
 	updateWorkerCapabilities,
 	updateWorkerDisplayName,
 	updateWorkerSupportedPhases,
@@ -367,6 +368,84 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 			).rejects.toThrow(WorkerCapabilityReductionError);
 
 			expect((await getWorkerById(worker.id))?.repository).toBeNull();
+		});
+	});
+
+	// Issue #919 — the draining flag against real Postgres. The unit tests mock the
+	// repository, so only these can catch the `coalesce` not being idempotent, the
+	// column not being nullable, or `now()` not landing at all.
+	describe('setWorkerDraining', () => {
+		async function freshWorker(name: string): Promise<string> {
+			const created = await createWorker({
+				ownerUserId: adaId,
+				displayName: name,
+				capabilities: ['claude'],
+				credentialHash: `hash-${name}`,
+			});
+			return created.id;
+		}
+
+		it('leaves a newly registered worker in the pool', async () => {
+			const id = await freshWorker('ada-pool');
+			expect((await getWorkerById(id))?.drainingSince).toBeNull();
+		});
+
+		it('records the instant a machine was taken out of the pool', async () => {
+			const id = await freshWorker('ada-drain');
+
+			const drained = await setWorkerDraining(id, true);
+
+			expect(drained?.drainingSince).toBeInstanceOf(Date);
+			expect((await getWorkerById(id))?.drainingSince).toEqual(drained?.drainingSince);
+		});
+
+		// The idempotence an operator polling with `swarm workers drain` depends on:
+		// re-running it must not restart the "draining since" clock.
+		it('keeps the original instant when a draining machine is drained again', async () => {
+			const id = await freshWorker('ada-redrain');
+			const first = await setWorkerDraining(id, true);
+
+			const second = await setWorkerDraining(id, true);
+
+			expect(second?.drainingSince).toEqual(first?.drainingSince);
+		});
+
+		it('clears the flag, returning the machine to the pool', async () => {
+			const id = await freshWorker('ada-undrain');
+			await setWorkerDraining(id, true);
+
+			const undrained = await setWorkerDraining(id, false);
+
+			expect(undrained?.drainingSince).toBeNull();
+			expect((await getWorkerById(id))?.drainingSince).toBeNull();
+		});
+
+		// A drain taken after an undrain is a *new* statement, so it starts a new clock.
+		it('starts a fresh clock when a machine is drained again after an undrain', async () => {
+			const id = await freshWorker('ada-recycle');
+			const first = await setWorkerDraining(id, true);
+			await setWorkerDraining(id, false);
+
+			const second = await setWorkerDraining(id, true);
+
+			expect(second?.drainingSince).not.toEqual(first?.drainingSince);
+		});
+
+		it('returns undefined for an unknown worker — a not-found, not an error', async () => {
+			expect(await setWorkerDraining('99999999-9999-4999-8999-999999999999', true)).toBeUndefined();
+		});
+
+		// The handshake path writes only the daemon-declared columns, which is what makes
+		// a drain sticky across the restart it was taken for.
+		it('survives a handshake refreshing the daemon-declared columns', async () => {
+			const id = await freshWorker('ada-sticky');
+			const drained = await setWorkerDraining(id, true);
+
+			await updateWorkerCapabilities(id, ['claude'], [...ALL_TRIGGER_PHASES], 'acme/api');
+
+			const after = await getWorkerById(id);
+			expect(after?.drainingSince).toEqual(drained?.drainingSince);
+			expect(after?.repository).toBe('acme/api');
 		});
 	});
 

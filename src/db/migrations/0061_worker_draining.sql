@@ -1,0 +1,14 @@
+-- Issue #919: a worker can now be taken out of the dispatch pool without stopping
+-- what it is already running, so its machine can be restarted without the
+-- superseded-session reap failing a live phase.
+--
+-- NULL means "in the pool" — what every existing row already behaves like, so
+-- nothing is backfilled and an unmigrated installation is indistinguishable from a
+-- migrated one nobody has drained. A non-null value is the instant an operator
+-- drained the machine: the drain write preserves it (`coalesce`), so re-running the
+-- command to check whether the machine has gone idle does not restart that clock.
+--
+-- Machine-wide rather than per-enrollment, and deliberately untouched by the
+-- handshake: it is the operator's statement, not the daemon's, so a reconnecting
+-- machine does not quietly rejoin the pool.
+ALTER TABLE "workers" ADD COLUMN "draining_since" timestamp;

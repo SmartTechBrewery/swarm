@@ -104,6 +104,24 @@ export const workers = pgTable(
 		 */
 		repository: text('repository'),
 		/**
+		 * When an operator took this machine **out of the pool** (issue #919), or NULL
+		 * while it is in it. A draining worker finishes what it is already running and
+		 * is given no new work, so it can be restarted without a superseded-session
+		 * reap failing a live phase.
+		 *
+		 * Machine-wide rather than per-enrollment, because what it exists to make safe
+		 * — restarting the daemon — is machine-wide. Nullable with no default and
+		 * nothing backfilled: NULL is what every row written before this column says,
+		 * and is verbatim the pre-existing behaviour. The stored instant is also what
+		 * the surfaces display and what makes a re-drain idempotent without resetting
+		 * the clock.
+		 *
+		 * Deliberately **not** rewritten by the handshake, unlike the three
+		 * self-declared facts above it: this one is the operator's statement, not the
+		 * daemon's, so a reconnecting machine does not quietly rejoin the pool.
+		 */
+		drainingSince: timestamp('draining_since'),
+		/**
 		 * The commit the **SWARM install root** of the daemon currently operating this
 		 * row is on (issue #918), declared at handshake. It answers what
 		 * `HandshakeRequestSchema.daemonVersion` cannot: that resolves to
