@@ -105,8 +105,13 @@ function makeWorker(overrides: Partial<WorkerDetail> = {}): WorkerDetail {
 		capabilities: ['claude', 'codex'],
 		declaredCapabilities: null,
 		probedCapabilities: ['claude', 'codex'],
+		// The comparand the row's `buildIsCurrent` was judged against (issue #925).
+		controlPlaneBuild: { commit: 'abc1234def5678', dirty: false },
 		supportedPhases: ['planning', 'implementation', 'review'],
 		repository: 'acme/frontend',
+		// The daemon's declared SWARM build and the server's verdict on it (issue #925).
+		build: { commit: 'abc1234def5678', dirty: false },
+		buildIsCurrent: true,
 		connection: 'online',
 		lastSeenAt: NOW.toISOString(),
 		currentRun: null,
@@ -471,6 +476,79 @@ describe('WorkerDetailView enrollment blocks', () => {
 			const declared = within(section('Declared by the daemon'));
 			expect(declared.getByText('Checkout repository')).toBeDefined();
 			expect(declared.getByText('acme/frontend')).toBeDefined();
+		});
+	});
+
+	// Issue #925 — the fact that answers "is this machine running the fix?".
+	describe('the declared SWARM build', () => {
+		const CONTROL_PLANE = { commit: 'abc1234def5678', dirty: false };
+
+		/**
+		 * One labelled field's rendered value in the daemon card — the field itself,
+		 * never the card's prose, which names the control plane's build too.
+		 */
+		function declaredFieldValue(label: string): string {
+			const field = within(section('Declared by the daemon')).getByText(label).parentElement;
+			return (field?.textContent ?? '').replace(label, '').trim();
+		}
+
+		it('renders the short commit the daemon declared', () => {
+			renderWorker({ build: { commit: 'fedcba9876543210', dirty: false }, enrollments: [] });
+
+			expect(declaredFieldValue('SWARM build')).toBe('fedcba9');
+		});
+
+		it('marks a dirty checkout, because the running code is not that commit', () => {
+			renderWorker({ build: { commit: 'fedcba9876543210', dirty: true }, enrollments: [] });
+
+			expect(declaredFieldValue('SWARM build')).toBe('fedcba9+dirty');
+		});
+
+		it('renders an em dash for a machine that declared no build', () => {
+			renderWorker({ build: null, buildIsCurrent: null, enrollments: [] });
+
+			expect(declaredFieldValue('SWARM build')).toBe('—');
+		});
+
+		it('shows the mark when the build is not the control plane’s, naming what it differs from', () => {
+			renderWorker({
+				build: { commit: 'fedcba9876543210', dirty: false },
+				buildIsCurrent: false,
+				controlPlaneBuild: CONTROL_PLANE,
+				enrollments: [],
+			});
+
+			// By its tooltip rather than its word: the card's own prose names the mark too,
+			// and this assertion is about the badge.
+			const badge = screen.getByTitle(/differs from the control plane/);
+			expect(badge.textContent).toBe('Outdated');
+			expect(badge.getAttribute('title')).toContain('abc1234');
+		});
+
+		it('shows no mark when the build is the control plane’s own', () => {
+			renderWorker({
+				build: CONTROL_PLANE,
+				buildIsCurrent: true,
+				controlPlaneBuild: CONTROL_PLANE,
+				enrollments: [],
+			});
+
+			expect(screen.queryByTitle(/differs from the control plane/)).toBeNull();
+		});
+
+		// The case a regression gets wrong: an unknown comparand is "no answer", not
+		// "stale" — the Compose router image has no `.git` to resolve one from.
+		it('shows no mark when the control plane cannot resolve its own build', () => {
+			renderWorker({
+				build: { commit: 'fedcba9876543210', dirty: false },
+				buildIsCurrent: null,
+				controlPlaneBuild: null,
+				enrollments: [],
+			});
+
+			expect(screen.queryByTitle(/differs from the control plane/)).toBeNull();
+			// …and the card says so, rather than silently comparing nothing.
+			expect(screen.getByText(/cannot read its own build/)).toBeDefined();
 		});
 	});
 

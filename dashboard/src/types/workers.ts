@@ -12,7 +12,8 @@
  * constraints (owner) and its approval/suspension (project administrator), each
  * offered only where the server-declared capability flag says the viewer may
  * change it. Facts a daemon states at handshake stay read-only everywhere —
- * `supportedPhases` and the checkout `repository` — but the CLI axis is no longer
+ * `supportedPhases`, the checkout `repository`, and the SWARM `build` (issue #925)
+ * — but the CLI axis is no longer
  * one of them: since issue #787 the worker's *owner* may declare which of the CLIs
  * their machine reported it should run (`declaredCapabilities` on
  * {@link WorkerDetail}, written by `workers.setDeclaredCapabilities`), and
@@ -89,6 +90,28 @@ export interface WorkerRow {
 	 * suspended enrollment (issue #690).
 	 */
 	repository: string | null;
+	/**
+	 * The SWARM build the machine's daemon declared (issue #925): the commit its
+	 * install root is on, plus a flag for a checkout that is dirty or whose `dist/`
+	 * build predates it. `null` when it declared none — a machine that never
+	 * connected, a daemon on a build that predates the field, or an install root
+	 * that is not a git checkout. Not a path and not a secret: a commit id is public
+	 * coordinates.
+	 *
+	 * Not the same thing as `repository` above: one npm-linked SWARM checkout can
+	 * serve daemons working in several different project repositories.
+	 */
+	build: { commit: string; dirty: boolean } | null;
+	/**
+	 * Server-derived: whether the `build` above is the control plane's own. `false`
+	 * is what the `OUTDATED` mark renders for.
+	 *
+	 * **Three-valued, and `null` must render nothing.** It means the question has no
+	 * answer — the machine declared no build, or the server cannot resolve its own —
+	 * so treating `null` as a mismatch would mark an entire fleet outdated the moment
+	 * the comparand went missing. Test `=== false`, never falsiness.
+	 */
+	buildIsCurrent: boolean | null;
 	connection: WorkerConnectionState;
 	/** ISO 8601 — when the worker was last heard from; null if it never connected. */
 	lastSeenAt: string | null;
@@ -172,6 +195,16 @@ export interface WorkerDetail extends Omit<WorkerRow, 'enrollments'> {
 	 * these as options, since the server refuses a declaration naming anything else.
 	 */
 	probedCapabilities: string[];
+	/**
+	 * The build the **control plane** is running (issue #925) — the comparand the
+	 * row's `buildIsCurrent` verdict was reached against, so the detail view can say
+	 * "differs from *what*". `null` when the server cannot resolve its own, which is
+	 * also when every `buildIsCurrent` is `null`.
+	 *
+	 * On the detail view alone: it is one value for the whole installation, so
+	 * repeating it per roster row would say nothing the mark does not.
+	 */
+	controlPlaneBuild: { commit: string; dirty: boolean } | null;
 	enrollments: WorkerDetailEnrollment[];
 }
 

@@ -230,6 +230,30 @@ provider-oriented diagnosis. Quota, model-capacity, launch/authentication,
 worker-shutdown, and user-termination conditions take precedence and retain
 their specific recovery guidance in both the board comment and run detail.
 
+**Is this worker running the fix?** The dashboard's **Workers** screen answers it.
+Each machine's daemon declares the SWARM build it is actually running — the commit
+its SWARM install root is on — and the per-worker detail view shows it, beside the
+build the control plane itself is on. A machine whose build is not the control
+plane's carries an `OUTDATED` badge, on its detail view and beside its name in the
+roster, so "which workers are behind?" is one glance rather than a question per
+machine. The badge says the builds *differ*, not that the machine is behind: the
+control plane compares the two commits for equality, and cannot prove a commit it
+may never have fetched is an ancestor of its own.
+
+A `+dirty` marker on a build means the running code is not exactly the commit it
+names — the checkout has uncommitted changes, or its `dist/` build predates HEAD —
+so that machine counts as a different build even on the same commit. No badge at
+all means there is nothing to compare: the machine declared no build (it has never
+connected, or its daemon predates the field), or this control plane cannot read its
+own (an install root with no `.git`). An unknown is never reported as stale.
+
+Nothing is gated on the badge — a machine on a different build is still dispatched
+to. **A worker keeps running whatever its checkout held when its process last
+started**, so the remedy is to update that machine's checkout and restart its
+daemon; see [`docs/launchd-worker-autostart.md`](./launchd-worker-autostart.md).
+On the machine itself, the daemon's `worker transport client starting` log line
+reports the same build at startup.
+
 **A renamed repository produces no failure at all.** Cards stop dispatching and
 nothing is marked failed: the router logs `pm-status: work item has no backing SCM
 artifact reference` and completes the job as a no-op, because the card's repository

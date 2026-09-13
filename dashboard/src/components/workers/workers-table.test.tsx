@@ -60,6 +60,9 @@ function makeWorker(overrides: Partial<WorkerRow> = {}): WorkerRow {
 		capabilities: ['claude', 'codex'],
 		supportedPhases: ['planning', 'implementation', 'review'],
 		repository: 'acme/frontend',
+		// The daemon's declared SWARM build and the server's verdict on it (issue #925).
+		build: { commit: 'abc1234def5678', dirty: false },
+		buildIsCurrent: true,
 		connection: 'online',
 		lastSeenAt: NOW.toISOString(),
 		currentRun: null,
@@ -729,6 +732,49 @@ describe('WorkersTable read-only surface for non-owners', () => {
 				.getAllByRole('link')
 				.map((link) => link.getAttribute('href')),
 		).toEqual(['/runs/run-7', 'https://github.com/acme/widgets/issues/42']);
+	});
+});
+
+// Issue #925 — the mark, and only the mark: which build, and what it was compared
+// against, are the detail view's.
+describe('WorkersTable build mark (issue #925)', () => {
+	/** The `Outdated` badge, found by its own tooltip rather than by its word. */
+	const BADGE = /differs from the control plane/;
+
+	it('marks a machine whose build is not the control plane’s, beside its name', () => {
+		renderTable(<WorkersTable workers={[makeWorker({ buildIsCurrent: false })]} />);
+
+		const badge = screen.getByTitle(BADGE);
+		expect(badge.textContent).toBe('Outdated');
+		// In the Machine cell, next to the name — not a cell of its own.
+		expect(badge.closest('td')?.textContent).toContain('ada-laptop');
+	});
+
+	it('marks no one else: not a current machine, and not one whose verdict is unknown', () => {
+		renderTable(
+			<WorkersTable
+				workers={[
+					makeWorker({ buildIsCurrent: true }),
+					makeWorker({ workerId: 'worker-2', displayName: 'grace-box', buildIsCurrent: null }),
+					// A machine that declared no build at all — the server has no verdict either.
+					makeWorker({
+						workerId: 'worker-3',
+						displayName: 'linux-box',
+						build: null,
+						buildIsCurrent: null,
+					}),
+				]}
+			/>,
+		);
+
+		expect(screen.queryAllByTitle(BADGE)).toHaveLength(0);
+	});
+
+	it('adds no column — the mark rides in the Machine cell', () => {
+		renderTable(<WorkersTable workers={[makeWorker({ buildIsCurrent: false })]} />);
+
+		expect(screen.getAllByRole('columnheader')).toHaveLength(6);
+		expect(screen.getAllByRole('row')[1].querySelectorAll('td')).toHaveLength(6);
 	});
 });
 

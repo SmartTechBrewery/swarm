@@ -117,6 +117,9 @@ function makeRow(overrides: Partial<WorkerRow> = {}): WorkerRow {
 		capabilities: ['claude'],
 		supportedPhases: ['planning'],
 		repository: 'acme/frontend',
+		// The daemon's declared SWARM build and the server's verdict on it (issue #925).
+		build: { commit: 'abc1234def5678', dirty: false },
+		buildIsCurrent: true,
 		connection: 'online',
 		lastSeenAt: '2026-07-01T12:00:00.000Z',
 		currentRun: null,
@@ -134,6 +137,7 @@ function makeDetail(overrides: Partial<WorkerDetail> = {}): WorkerDetail {
 		// reads (issue #787): nothing declared, so the effective set is the probe.
 		declaredCapabilities: null,
 		probedCapabilities: ['claude'],
+		controlPlaneBuild: { commit: 'abc1234def5678', dirty: false },
 		enrollments: [
 			{
 				enrollmentId: 'enr-1',
