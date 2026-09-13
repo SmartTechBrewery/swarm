@@ -1397,22 +1397,22 @@ describe('cancelling an in-flight assignment', () => {
 	});
 
 	it('never runs the phase for an assignment cancelled before it started (issue #912)', async () => {
-		// The `Cancelling a just-pushed assignment` path: the router re-reads the
-		// cancellation marker straight after pushing, and `trackAssignment` runs before
-		// the executor's first `await`, so the cancel lands while the plumbing is still
-		// being resolved. Aborting the controller alone was not enough — the signal only
-		// reaches the agent subprocess, so the phase still did its pre-agent work,
-		// including the board pickup that stranded the card in the phase's column.
+		// `trackAssignment` runs synchronously before the executor's first await, so a
+		// cancel issued on the very next line lands in the window this guard closes:
+		// before the phase — and so before the board move that used to report a pickup
+		// for a run that never ran.
 		const sink = recordingSink();
-		const runPhase = vi.fn(async () => ({ agent: agentResult() }));
+		const runPhase = vi.fn(async () => ({ agent: agentResult() }) as PhaseRunResult);
 		const frame = ciAssignment();
 		const run = runAssignmentDbFree(frame, sink, { ...RUN_OPTIONS, deps: depsWith(runPhase) });
+
 		expect(cancelAssignment(frame.dispatchId)).toBe(true);
 		await run;
 
 		expect(runPhase).not.toHaveBeenCalled();
-		// Never claimed to be running it, either.
-		expect(sink.sent).not.toContainEqual(expect.objectContaining({ state: 'running' }));
+		// The worker never claimed to be running what it refused to start.
+		expect(sink.sent.some((frame) => frame.state === 'running')).toBe(false);
+		// …and settles the same terminal frame an in-flight cancellation produces.
 		expect(sink.sent.at(-1)).toMatchObject({
 			type: 'task-execution-result',
 			status: 'failed',

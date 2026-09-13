@@ -4409,22 +4409,20 @@ export async function processJob(
 
 		// Make this run cancellable by id and honour a cancellation that already
 		// landed (a deferred run terminated as its retry was dequeued).
-		//
-		// A cancellation found here means the run must not start at all (issue #912).
-		// Handing the executor an already-aborted signal — which is what this used to
-		// do — still pushed the assignment, and the phase then did everything that
-		// precedes spawning the agent, including reporting its board pickup: the card
-		// landed in the phase's column seconds *after* the dispatch had settled
-		// `phase-failed`/`cancelled`, with no run left to move it out again and no
-		// dependency recheck to notice (the card's status already matched the phase).
-		// So refuse before `executePhase` instead. The settlement is unchanged —
-		// `handlePhaseFailure`'s first branch turns this into the same terminal
-		// user-termination outcome the marker check below produces — only the work
-		// that outlives it is gone. The *returned* flag is the test, not
-		// `runAbort.signal.aborted`: the controller is also linked to the process's
-		// shutdown signal, which must keep deferring.
-		if (await beginRunCancellationTracking(runId, runAbort)) {
-			logger.info('Refusing to start a phase whose run was already cancelled', {
+		const cancelledBeforeStart = await beginRunCancellationTracking(runId, runAbort);
+		// …and then don't run it at all (issue #912). This used to fall straight
+		// through to `executePhase` with an already-aborted signal, which only ever
+		// reached the *agent*: everything the phase does before spawning one — the
+		// dependency gate, worktree provisioning, and the board move reporting the
+		// pickup — ran regardless. So a run killed before it started still moved its
+		// card into the phase's own column and then settled, leaving the card in "In
+		// progress" with no run and nothing that would ever pick it up (dependency
+		// recheck skips a card whose status already matches the phase). Throwing here
+		// pushes no assignment and touches no board; `handlePhaseFailure`'s
+		// `RunTerminatedError` branch settles exactly the outcome this path produced
+		// before — `phase-failed` + `cancelled` + a `user-terminated` diagnosis.
+		if (cancelledBeforeStart) {
+			logger.info('Refusing to start a phase whose cancellation was already recorded', {
 				projectId: project.id,
 				dispatchId: dispatch.id,
 				phase: trigger.phase,

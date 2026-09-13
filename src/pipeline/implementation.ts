@@ -3,9 +3,9 @@
  *
  * An item moves to "ToDo" on the board → the worker runs this: move the item to
  * "In progress" to report that the agent has picked up the task (a status
- * report, not a trigger — see `src/pm/pipeline.ts`; this move is unconditional
- * bar one exception — a run already cancelled before it started reports no
- * pickup, so it leaves no card stranded in this phase's column, issue #912),
+ * report, not a trigger — see `src/pm/pipeline.ts`; the move is made for every
+ * run bar one already aborted, which must not report a pickup it will never
+ * honour — issue #912),
  * provision a worktree on the task branch (not detached — unlike Planning, this
  * phase commits and pushes), graft the environment, spin up Claude Code as the
  * implementer to implement the plan / run tests / commit / push / open a PR,
@@ -455,17 +455,15 @@ export async function runImplementationPhase(
 	// so a human watching the board sees "In progress" as soon as the worker
 	// commits to this task, not only once the (possibly long) agent run finishes.
 	//
-	// Skipped for a run already aborted (issue #912): a card moved into this phase's
-	// own column by a run that then never ran is a card nothing will ever move out
-	// again — dependency recheck won't fire, because the status already matches the
-	// phase that was supposed to be running. The gate above is a transported round
-	// trip on a federated worker, so a cancellation can land inside it even though
-	// the worker refused every assignment it knew was cancelled before starting.
-	// Skip only, never throw: the run is already dying, `runAgentCli` returns at once
-	// on an aborted signal, and the existing failure path settles it.
-	if (!signal?.aborted) {
-		await pm.moveWorkItem(workItem.id, START_STATUS);
-	}
+	// Skipped for a run that was already aborted (issue #912): a cancellation can
+	// still land between the worker's pre-phase guard and here, since the dependency
+	// gate above is a round trip. Reporting a pickup for a run that is dying leaves
+	// the card in "In progress" with nothing to pick it up — dependency recheck skips
+	// a card whose status already matches the phase. Skip only, never throw: the run
+	// is already settling through the existing failure path (`runAgentCli` returns
+	// immediately on an aborted signal), and a shutdown abort simply re-makes the
+	// move on the deferred run's retry.
+	if (!signal?.aborted) await pm.moveWorkItem(workItem.id, START_STATUS);
 
 	// Task-branch checkout (createBranch defaults to true): the agent commits and
 	// pushes here, so — unlike Planning — this is not a detached, throwaway HEAD.

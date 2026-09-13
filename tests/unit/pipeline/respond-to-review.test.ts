@@ -669,13 +669,15 @@ describe('runRespondToReviewPhase', () => {
 		});
 
 		it('does not report the In progress pickup for a run already aborted (issue #912)', async () => {
-			// Same guard as Implementation's pickup (issue #912): a card moved into this
-			// phase's column by a run that never worked on it is a card nothing moves
-			// out again.
+			// The Implementation mirror: a run cancelled before it started must not
+			// report itself into the phase's column, where the card would sit with no
+			// run behind it (issue #912).
 			const deps = makeDeps();
 			const pm = makePm();
+			const controller = new AbortController();
+			controller.abort();
 
-			await runRespondToReviewPhase({ ...deps, pm, signal: AbortSignal.abort() });
+			await runRespondToReviewPhase({ ...deps, pm, signal: controller.signal });
 
 			expect(pm.moveWorkItem).not.toHaveBeenCalledWith('ITEM_21', 'inProgress');
 		});

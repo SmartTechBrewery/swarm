@@ -953,10 +953,11 @@ export async function runAssignmentDbFree(
 
 	const { controller, detach } = linkRunAbortController(options.shutdownSignal);
 	// Registered synchronously, before the first await, so a `task-cancel` pushed
-	// straight after the assignment can never arrive ahead of the registration. The
-	// cancel it records is honoured twice: by the pre-phase refusal below, which
-	// stops the run before any of the phase's pre-agent work (issue #912), and by the
-	// controller, which kills an agent already spawned.
+	// straight after the assignment can never arrive ahead of the registration.
+	// What that registration buys is read by the pre-phase guard below, not by the
+	// abort alone: until issue #912 a cancel landing here aborted a controller whose
+	// signal nothing consulted before the agent, so the phase still ran its pre-agent
+	// work — board move included — on a run that was already dead.
 	trackAssignment(dispatchId, controller);
 	// Resolved as soon as the project is, so the failure path below can read the Tier 2
 	// checkpoint out of this host's checkout (issue #503). Still unset for a failure
@@ -1065,23 +1066,23 @@ export async function runAssignmentDbFree(
 		};
 
 		// A `task-cancel` that landed while the plumbing above was being resolved kills
-		// the run before it does anything, so don't enter the phase (issue #912).
-		// Aborting the controller alone was not enough: the signal only ever reaches
-		// the agent subprocess, so everything the phase does *before* spawning it —
-		// the dependency gate, the "In progress" board pickup — still ran, and that
-		// pickup left the card in the phase's column with no run behind it. This is
-		// the `Cancelling a just-pushed assignment` path in particular: the router
-		// re-reads the marker straight after the push, and `trackAssignment` above runs
-		// before the first `await`, so the cancel is already recorded by the time we
-		// get here.
+		// the run before it starts, so don't enter the phase at all (issue #912).
+		// Aborting the controller alone is not enough: the abort only reaches the
+		// agent subprocess, while the phase's own pre-agent work — the dependency
+		// gate, worktree provisioning, and the board move reporting the pickup — runs
+		// regardless, leaving the card in the phase's column for a run that never ran.
+		// Checked as late as possible (the cancel arrives moments behind the push on
+		// the `Cancelling a just-pushed assignment` path) and *before* the `running`
+		// progress send, so the worker never claims to be running what it refused.
 		//
-		// `isAssignmentCancelled` rather than `controller.signal.aborted`, the mirror
-		// of the control plane's test: the controller is also linked to
-		// `options.shutdownSignal`, and a shutdown abort must keep deferring. The frame
-		// is the one `settleAssignmentFailure` sends for an in-flight cancel, so the
-		// control plane settles it through exactly the same path.
+		// `isAssignmentCancelled` rather than `controller.signal.aborted`, for the
+		// mirror of the control plane's reason: the controller is also linked to
+		// `options.shutdownSignal`, and a shutdown abort must keep its deferral.
+		//
+		// The frame is the one `settleAssignmentFailure` already sends for an in-flight
+		// cancel, so the control plane's settle path is unchanged.
 		if (isAssignmentCancelled(dispatchId)) {
-			deps.logger.info('refusing to start an assignment already cancelled', {
+			deps.logger.info('assignment cancelled before its phase started — settling as cancelled', {
 				dispatchId,
 				runId,
 				phase,
