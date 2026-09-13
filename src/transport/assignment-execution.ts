@@ -954,6 +954,10 @@ export async function runAssignmentDbFree(
 	const { controller, detach } = linkRunAbortController(options.shutdownSignal);
 	// Registered synchronously, before the first await, so a `task-cancel` pushed
 	// straight after the assignment can never arrive ahead of the registration.
+	// What that registration buys is read by the pre-phase guard below, not by the
+	// abort alone: until issue #912 a cancel landing here aborted a controller whose
+	// signal nothing consulted before the agent, so the phase still ran its pre-agent
+	// work — board move included — on a run that was already dead.
 	trackAssignment(dispatchId, controller);
 	// Resolved as soon as the project is, so the failure path below can read the Tier 2
 	// checkpoint out of this host's checkout (issue #503). Still unset for a failure
@@ -1060,6 +1064,33 @@ export async function runAssignmentDbFree(
 			workerCredential: options.workerCredential,
 			fetchImpl: deps.fetchImpl,
 		};
+
+		// A `task-cancel` that landed while the plumbing above was being resolved kills
+		// the run before it starts, so don't enter the phase at all (issue #912).
+		// Aborting the controller alone is not enough: the abort only reaches the
+		// agent subprocess, while the phase's own pre-agent work — the dependency
+		// gate, worktree provisioning, and the board move reporting the pickup — runs
+		// regardless, leaving the card in the phase's column for a run that never ran.
+		// Checked as late as possible (the cancel arrives moments behind the push on
+		// the `Cancelling a just-pushed assignment` path) and *before* the `running`
+		// progress send, so the worker never claims to be running what it refused.
+		//
+		// `isAssignmentCancelled` rather than `controller.signal.aborted`, for the
+		// mirror of the control plane's reason: the controller is also linked to
+		// `options.shutdownSignal`, and a shutdown abort must keep its deferral.
+		//
+		// The frame is the one `settleAssignmentFailure` already sends for an in-flight
+		// cancel, so the control plane's settle path is unchanged.
+		if (isAssignmentCancelled(dispatchId)) {
+			deps.logger.info('assignment cancelled before its phase started — settling as cancelled', {
+				dispatchId,
+				runId,
+				phase,
+				taskId,
+			});
+			sink.send(cancelledResult(assignment));
+			return;
+		}
 
 		sink.send({ type: 'task-progress', dispatchId, runId, phase, taskId, state: 'running' });
 

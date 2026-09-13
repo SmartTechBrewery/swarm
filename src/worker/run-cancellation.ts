@@ -73,15 +73,24 @@ export function linkRunAbortController(signal?: AbortSignal): {
 /**
  * Register a run's abort controller and immediately abort if a user cancellation
  * was already requested (e.g. while the run was deferred).
+ *
+ * Returns whether it aborted *because of a cancellation* — the caller's cue to
+ * settle the run without ever entering the phase (issue #912). That is the
+ * return value rather than `controller.signal.aborted` deliberately: the same
+ * controller is also linked to the process's shutdown signal
+ * ({@link linkRunAbortController}), so reading the raw signal would misclassify a
+ * shutdown abort — which must keep deferring — as a user termination.
  */
 export async function beginRunCancellationTracking(
 	runId: string | undefined,
 	controller: AbortController,
-): Promise<void> {
-	if (!runId) return;
+): Promise<boolean> {
+	if (!runId) return false;
 	registerRunController(runId, controller);
 	if (await isRunCancellationRequested(runId)) {
 		logger.info('Run cancellation requested before start, aborting immediately', { runId });
 		controller.abort();
+		return true;
 	}
+	return false;
 }

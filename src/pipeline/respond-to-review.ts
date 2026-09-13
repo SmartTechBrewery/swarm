@@ -473,7 +473,10 @@ export async function runRespondToReviewPhase(
 	const boardItemId = pm
 		? await resolveBoardItemId(pm, issueNumber, taskId, options.boardItemId)
 		: undefined;
-	if (pm && boardItemId) {
+	// `!signal?.aborted` for the same reason as the Implementation pickup (issue
+	// #912): a run already cancelled must not report itself into the phase's column,
+	// where the card would sit with no run behind it.
+	if (pm && boardItemId && !signal?.aborted) {
 		await reportBoardStatus(pm, boardItemId, PICKUP_STATUS, taskId);
 	}
 
