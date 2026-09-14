@@ -20,6 +20,17 @@ Usage:
 <checkout> is the repository checkout the worker was registered for, and defaults
 to the current directory. Each checkout gets its own agent, so a machine running
 workers for several repositories installs one per checkout.
+
+install options:
+  --self-update      let this machine act on a control-plane update request
+  --no-self-update   decline them (the default for a machine that never opted in)
+
+SWARM_WORKER_SELF_UPDATE is read from the daemon's own environment and never from
+the wire, so it is this host's veto over an installation administrator's
+`swarm workers request-update`. launchd gives a job none of the login shell's
+environment, which is why the opt-in has to be written into the plist rather than
+exported in a shell profile. With neither flag the current plist's setting is
+carried over, so a reinstall never silently revokes -- or grants -- the opt-in.
 EOF
 }
 
@@ -60,6 +71,17 @@ agent_path() {
 	printf '%s' "$seen"
 }
 
+# The opt-in already written into this checkout's plist, if any. Read back rather
+# than assumed, because `install` rewrites the plist wholesale: without this a
+# reinstall (a moved node, a new agent CLI on PATH) would silently revoke an opt-in
+# the operator made deliberately, and the machine would start declining updates
+# with nothing in the output saying so.
+self_update_installed() {
+	[ -f "$PLIST" ] || return 1
+	/usr/libexec/PlistBuddy -c \
+		'Print :EnvironmentVariables:SWARM_WORKER_SELF_UPDATE' "$PLIST" 2>/dev/null
+}
+
 cmd_install() {
 	# A worker checkout is a git checkout of the *project* repository (the daemon
 	# declares its `origin` at handshake); it is not necessarily a Node project, so
@@ -74,6 +96,19 @@ cmd_install() {
 	local node swarm
 	node=$(command -v node) || die 'node not found on PATH'
 	swarm=$(command -v swarm) || die 'swarm not found on PATH'
+
+	# Only the literal `true` opts in (src/transport/worker-update.ts), so an
+	# inherited value that is anything else is the same as absent and the key is
+	# simply left out -- the plist states the opt-in or states nothing.
+	local self_update=''
+	case "$SELF_UPDATE" in
+		on) self_update=true ;;
+		off) self_update='' ;;
+		*) [ "$(self_update_installed || true)" = 'true' ] && self_update=true ;;
+	esac
+	local self_update_entry=''
+	[ "$self_update" = true ] &&
+		self_update_entry=$'\n\t\t<key>SWARM_WORKER_SELF_UPDATE</key>\n\t\t<string>true</string>'
 
 	# A worker already running by hand holds the checkout lock; a second one would
 	# lose the race and then crash-loop under KeepAlive.
@@ -108,7 +143,7 @@ cmd_install() {
 		<key>PATH</key>
 		<string>$(agent_path)</string>
 		<key>LANG</key>
-		<string>en_US.UTF-8</string>
+		<string>en_US.UTF-8</string>$self_update_entry
 	</dict>
 
 	<key>RunAtLoad</key>
@@ -131,7 +166,9 @@ EOF
 
 	launchctl bootout "$TARGET" 2>/dev/null || true
 	launchctl bootstrap "gui/$(id -u)" "$PLIST"
-	printf 'swarm-worker-agent: installed %s\n  checkout: %s\n  log:      %s\n' "$LABEL" "$CHECKOUT" "$LOG"
+	printf 'swarm-worker-agent: installed %s\n  checkout:    %s\n  log:         %s\n  self-update: %s\n' \
+		"$LABEL" "$CHECKOUT" "$LOG" \
+		"$([ "$self_update" = true ] && echo 'on -- acts on a control-plane update request' || echo 'off -- declines update requests (--self-update to opt in)')"
 }
 
 cmd_uninstall() {
@@ -159,7 +196,24 @@ case "${1:-}" in
 	install | uninstall | status | logs)
 		action=$1
 		shift
-		resolve "${1:-$PWD}"
+		# Parsed here rather than in cmd_install so the flag may sit on either side of
+		# <checkout>, and so a flag aimed at the wrong subcommand is a clear error
+		# instead of being silently read as a directory name.
+		SELF_UPDATE='' checkout=''
+		for arg in "$@"; do
+			case "$arg" in
+				--self-update) SELF_UPDATE=on ;;
+				--no-self-update) SELF_UPDATE=off ;;
+				-*) die "unknown option: $arg" ;;
+				*)
+					[ -z "$checkout" ] || die "only one <checkout> may be given"
+					checkout=$arg
+					;;
+			esac
+		done
+		[ "$action" = install ] || [ -z "$SELF_UPDATE" ] ||
+			die "--self-update/--no-self-update apply to 'install' only"
+		resolve "${checkout:-$PWD}"
 		"cmd_$action"
 		;;
 	-h | --help | help | '') usage ;;
