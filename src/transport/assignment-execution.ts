@@ -321,6 +321,11 @@ export function succeededResult(
 		// the `no-fix` hand-back to Review this worker has no queue to enqueue onto
 		// (issue #841). Absent for every other phase.
 		ciOutcome: result.ciOutcome,
+		// A Review run's fold-in declaration, so the control plane can record it on
+		// the run row this worker may have no DB to write (issue #953). Absent for
+		// every other phase, and for the reviews — essentially all of them — that
+		// declared nothing.
+		absorbed: result.absorbed,
 	};
 }
 

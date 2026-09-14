@@ -149,7 +149,11 @@ import {
 	SwarmJobSchema,
 } from '../queue/jobs.js';
 import { priorityFor } from '../queue/producer.js';
-import { DeliveryDeferredError, type ScmDeliveryProvider } from '../scm/delivery.js';
+import {
+	DeliveryDeferredError,
+	type ReviewAbsorbed,
+	type ScmDeliveryProvider,
+} from '../scm/delivery.js';
 import { SWARM_GENERATED_FOOTER } from '../scm/swarm-origin.js';
 import type { TriggerRegistry } from '../triggers/registry.js';
 import {
@@ -1974,6 +1978,14 @@ export interface PhaseRunResult {
 	 * already uses that name for a different union.
 	 */
 	ciOutcome?: RespondCiOutcome;
+	/**
+	 * A Review run's fold-in declaration (issue #953): the split siblings whose
+	 * whole scope the reviewer traced through this pull request's diff. Persisted
+	 * onto the run's history row, where a later merge reads it; nothing acts on it
+	 * at settle. Absent for every other phase, and for the reviews — essentially
+	 * all of them — that declared none.
+	 */
+	absorbed?: ReviewAbsorbed[];
 }
 
 /**
@@ -4495,6 +4507,9 @@ export async function processJob(
 				// (issue #235).
 				reviewOrdinal: result.reviewOrdinal,
 				reviewAutomationOutcome: result.automationOutcome,
+				// Same again: only a Review run that declared a fold-in carries one
+				// (issue #953).
+				reviewAbsorbed: result.absorbed,
 				// Only a PR-producing phase (Implementation) reports one; every other
 				// phase leaves the attribution column untouched (ADR-004 §4, issue #398).
 				producedPrUrl: result.prUrl,

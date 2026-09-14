@@ -409,6 +409,57 @@ describe('runReviewPhase', () => {
 		});
 	});
 
+	/**
+	 * The fold-in declaration's durable half (issue #953): the phase carries what the
+	 * hand-off declared out to the settle, which is what writes `runs.review_absorbed`.
+	 */
+	describe('absorbed declaration (issue #953)', () => {
+		const ABSORBED = [
+			{
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/947',
+				reference: '#947',
+				evidence: 'Its criteria 1-3 are met by `src/pipeline/review-body.ts`.',
+			},
+			{
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/948',
+				reference: '#948',
+				evidence: 'Its sole criterion is met by `src/scm/delivery.ts`.',
+			},
+		];
+
+		it('carries every declared sibling out of the phase', async () => {
+			const deps = makeDeps();
+			writeHandoff(deps.path, approval({ absorbed: ABSORBED }));
+
+			const result = await runReviewPhase(deps);
+
+			expect(result.absorbed).toEqual(ABSORBED);
+		});
+
+		// `undefined` rather than `[]`, so the settle leaves the run's column
+		// untouched for the reviews — essentially all of them — that declare nothing.
+		it('reports undefined, not an empty array, when the reviewer declared none', async () => {
+			const deps = makeDeps();
+			writeHandoff(deps.path, approval());
+
+			const result = await runReviewPhase(deps);
+
+			expect(result.absorbed).toBeUndefined();
+		});
+
+		// Deliberate: a re-review is scoped to the previously requested changes, so a
+		// declaration gated on the verdict would simply be lost.
+		it('carries a declaration made alongside a request-changes verdict', async () => {
+			const deps = makeDeps();
+			writeHandoff(deps.path, handoff({ absorbed: ABSORBED.slice(0, 1) }));
+
+			const result = await runReviewPhase(deps);
+
+			expect(result.verdict).toBe('request-changes');
+			expect(result.absorbed).toEqual(ABSORBED.slice(0, 1));
+		});
+	});
+
 	describe('re-review scoping (issue #328)', () => {
 		const priorRequestChanges: ReviewVerdictRecord = {
 			ordinal: 1,

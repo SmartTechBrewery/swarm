@@ -93,6 +93,7 @@ import {
 	type LegacyReviewHandoff,
 	LegacyReviewHandoffSchema,
 	loadDeliveryProgress,
+	type ReviewAbsorbed,
 	ReviewHandoffSchema,
 	readHandoff,
 	resumedDeliveryAgent,
@@ -276,6 +277,13 @@ export interface ReviewPhaseResult {
 	 * verdict/ordinal.
 	 */
 	automationOutcome?: ReviewAutomationOutcome;
+	/**
+	 * The split siblings this review declared the pull request also delivers in
+	 * full (issue #953), read off its hand-off's `absorbed`. `undefined` — not an
+	 * empty array — when it declared none, which is essentially every review, so
+	 * the settle leaves the run's column untouched for an ordinary pass.
+	 */
+	absorbed?: ReviewAbsorbed[];
 }
 
 /**
@@ -543,14 +551,26 @@ interface ReviewSubmissionContext {
 	repairResumesSession?: boolean;
 }
 
+/**
+ * What one run submits, plus whatever the hand-off declared alongside it.
+ * `absorbed` is carried out of the phase rather than only rendered, because the
+ * run row is what a later merge reads; the legacy path below reports none.
+ */
+interface ReviewSubmission {
+	verdict: ReviewVerdict;
+	body: string;
+	absorbed?: ReviewAbsorbed[];
+}
+
 /** Parse the structured hand-off and render the body SWARM will post. Throws if it doesn't validate. */
 function renderSubmission(
 	worktreePath: string,
 	context: ReviewSubmissionContext,
-): { verdict: ReviewVerdict; body: string } {
+): ReviewSubmission {
 	const handoff = readHandoff(worktreePath, REVIEW_VERDICT_FILENAME, ReviewHandoffSchema);
 	return {
 		verdict: handoff.verdict,
+		absorbed: handoff.absorbed.length > 0 ? handoff.absorbed : undefined,
 		body: renderReviewBody({
 			handoff,
 			headSha: context.headSha,
@@ -583,7 +603,7 @@ function legacySubmission(
 	worktreePath: string,
 	context: ReviewSubmissionContext,
 	structuredError: unknown,
-): { verdict: ReviewVerdict; body: string } {
+): ReviewSubmission {
 	let legacy: LegacyReviewHandoff;
 	try {
 		legacy = readHandoff(worktreePath, REVIEW_VERDICT_FILENAME, LegacyReviewHandoffSchema);
@@ -643,7 +663,7 @@ function repairFailureError(original: unknown, outcome: ReviewRepairOutcome): Er
 async function readReviewSubmission(
 	worktreePath: string,
 	context: ReviewSubmissionContext,
-): Promise<{ verdict: ReviewVerdict; body: string }> {
+): Promise<ReviewSubmission> {
 	try {
 		return renderSubmission(worktreePath, context);
 	} catch (error) {
@@ -850,9 +870,10 @@ export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<Re
 			reviewOrdinal,
 			automationOutcome,
 			isReReview,
+			absorbed: submission.absorbed?.map((a) => a.reference),
 		});
 
-		return { verdict, agent, reviewOrdinal, automationOutcome };
+		return { verdict, agent, reviewOrdinal, automationOutcome, absorbed: submission.absorbed };
 	} catch (error) {
 		if (hasDeliveryProgress(handle.path)) {
 			preserveForResume = true;

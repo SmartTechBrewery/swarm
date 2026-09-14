@@ -192,6 +192,27 @@ const ReviewCarriedSchema = z.object({
 
 export type ReviewCarriedFinding = z.infer<typeof ReviewCarriedSchema>;
 
+/**
+ * One split sibling whose whole scope this pull request delivers in addition to
+ * its own (issue #953) — the reviewer's fold-in declaration, stated as data
+ * rather than left to be pattern-matched out of prose.
+ *
+ * Declared only after tracing that sibling's acceptance criteria through *this*
+ * diff; two tasks merely looking related is not a declaration. Nothing acts on it
+ * in this phase — it is rendered into the posted review and persisted on the
+ * Review run row, so the decision is auditable at the moment it is taken.
+ */
+export const ReviewAbsorbedSchema = z.object({
+	/** The sibling card's issue URL, exactly as the board shows it. */
+	url: z.string().min(1),
+	/** Human reference for logs, comments and the rendered body — e.g. `#947`. */
+	reference: z.string().min(1),
+	/** Which of that task's acceptance criteria this pull request delivers, and where. */
+	evidence: textSlot(),
+});
+
+export type ReviewAbsorbed = z.infer<typeof ReviewAbsorbedSchema>;
+
 /** Which slots each severity tier must fill, and which it must leave empty. */
 const BLOCKING_SLOTS = ['failureScenario', 'impact', 'fixPlan', 'tests'] as const;
 const COMPACT_SLOTS = ['suggestion', 'downgradeRationale'] as const;
@@ -262,6 +283,27 @@ function checkCarriedItemsAreReported(
 			path: ['carried', index, 'status'],
 			message: `${item.id} is ${item.status}, so it must also appear in findings under the same id`,
 		});
+	}
+}
+
+/**
+ * A card may be declared absorbed at most once.
+ *
+ * Enforced rather than instructed, for the same reason
+ * {@link checkVerdictMatchesSeverities} is: two entries naming the same sibling
+ * would have the code that eventually acts on the declaration settle that card
+ * twice, and a duplicate is a JSON slip no reviewer intends.
+ */
+function checkAbsorbedAreDistinct(absorbed: readonly ReviewAbsorbed[], ctx: z.RefinementCtx): void {
+	const seen = new Set<string>();
+	for (const [index, entry] of absorbed.entries()) {
+		if (seen.has(entry.url))
+			ctx.addIssue({
+				code: 'custom',
+				path: ['absorbed', index, 'url'],
+				message: `duplicate absorbed task ${entry.reference} (${entry.url})`,
+			});
+		seen.add(entry.url);
 	}
 }
 
@@ -338,11 +380,20 @@ export const ReviewHandoffSchema = z
 		 * table and the verdict from contradicting each other.
 		 */
 		carried: z.preprocess(asList, z.array(ReviewCarriedSchema)).default([]),
+		/**
+		 * The split siblings this pull request also delivers in full (issue #953).
+		 * Empty on essentially every review, and deliberately **not** gated on the
+		 * verdict: a fold-in noticed alongside a `request-changes` pass would
+		 * otherwise be lost, because a re-review is scoped to the previously
+		 * requested changes and would never restate it.
+		 */
+		absorbed: z.preprocess(asList, z.array(ReviewAbsorbedSchema)).default([]),
 	})
 	.superRefine((handoff, ctx) => {
 		checkFindingTiers(handoff.findings, ctx);
 		checkCarriedItemsAreReported(handoff.carried, handoff.findings, ctx);
 		checkVerdictMatchesSeverities(handoff.verdict, handoff.findings, ctx);
+		checkAbsorbedAreDistinct(handoff.absorbed, ctx);
 	});
 
 export type ReviewHandoff = z.infer<typeof ReviewHandoffSchema>;

@@ -39,6 +39,7 @@ import type { ProposedScope } from '../../pipeline/planning.js';
 import type { ReviewAutomationOutcome, ReviewVerdict } from '../../pipeline/review.js';
 import type { CancellationOrigin } from '../../queue/cancellation.js';
 import type { SwarmJob } from '../../queue/jobs.js';
+import type { ReviewAbsorbed } from '../../scm/delivery.js';
 import type { TriggerPhase } from '../../triggers/types.js';
 import { diagnoseFailure, type FailureDiagnosis } from '../../worker/failure-diagnosis.js';
 import { getDb } from '../client.js';
@@ -316,6 +317,13 @@ export interface CompleteRunInput {
 	 */
 	reviewAutomationOutcome?: ReviewAutomationOutcome;
 	/**
+	 * This Review run's fold-in declaration (issue #953) — the split siblings whose
+	 * whole scope the reviewer traced through the reviewed diff. Set only alongside
+	 * `reviewVerdict`, and only by the reviews that declared one; omitted (left
+	 * as-is) for every other phase and every ordinary review.
+	 */
+	reviewAbsorbed?: ReviewAbsorbed[];
+	/**
 	 * The PR this run *produced*, as reported in its phase result — the PR half of
 	 * the worker→PR attribution record (ADR-004 §4, issue #398). Set only by a
 	 * PR-producing phase (Implementation); omitted (left as-is) for every other
@@ -391,6 +399,7 @@ export async function completeRun(runId: string, input: CompleteRunInput): Promi
 			reviewVerdict: input.reviewVerdict,
 			reviewOrdinal: input.reviewOrdinal,
 			reviewAutomationOutcome: input.reviewAutomationOutcome,
+			reviewAbsorbed: input.reviewAbsorbed,
 			producedPrUrl: input.producedPrUrl,
 			// Spread rather than assigned so an omitted `recovery` still leaves the
 			// column untouched, while a supplied one goes through the sticky-key merge
@@ -473,6 +482,10 @@ export async function resetRunToRunning(
 			// re-marks them once it re-submits.
 			reviewOrdinal: null,
 			reviewAutomationOutcome: null,
+			// Same for the fold-in declaration (issue #953): the fresh pass restates
+			// it or it is not claimed, so a retry must never leave a stale one behind
+			// for a later merge to act on.
+			reviewAbsorbed: null,
 			// Same for merge-automation state (issue #278): a re-run Review that
 			// approves again starts a fresh outcome generation rather than showing
 			// a previous attempt's stale merge status while it re-submits.

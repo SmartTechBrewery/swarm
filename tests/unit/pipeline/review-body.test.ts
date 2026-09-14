@@ -217,6 +217,69 @@ describe('renderReviewBody', () => {
 		});
 	});
 
+	/**
+	 * The fold-in declaration's human-facing record (issue #953): a human audits the
+	 * decision on the pull request, at the moment it is taken, rather than in a
+	 * database column nobody reads.
+	 */
+	describe('absorbed scope', () => {
+		const absorbed = [
+			{
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/947',
+				reference: '#947',
+				evidence: 'Its criteria 1-3 are met by `src/pipeline/review-body.ts`.',
+			},
+		];
+
+		// The overwhelmingly common body must be exactly what it was before this
+		// section existed.
+		it('renders nothing when the reviewer declared none', () => {
+			expect(renderReviewBody(context())).not.toContain('Scope absorbed from another task');
+			expect(renderReviewBody(context({ handoff: handoff({ absorbed: [] }) }))).toEqual(
+				renderReviewBody(context()),
+			);
+		});
+
+		it('links each declared task and states the evidence beside it', () => {
+			const body = renderReviewBody(context({ handoff: handoff({ absorbed }) }));
+			expect(body).toContain('## Scope absorbed from another task');
+			expect(body).toContain(
+				'| [#947](https://github.com/SmartTechBrewery/swarm/issues/947) | Its criteria 1-3 are met by `src/pipeline/review-body.ts`. |',
+			);
+		});
+
+		// The section is carried on either verdict, because a re-review is scoped to
+		// the previously requested changes and would never restate the declaration.
+		it('is rendered on a request-changes review too', () => {
+			const body = renderReviewBody(
+				context({
+					handoff: handoff({ verdict: 'request-changes', findings: [blocker], absorbed }),
+				}),
+			);
+			expect(body).toContain('## Scope absorbed from another task');
+		});
+
+		// `evidence` is agent-authored prose; a raw `|` would open a third column and
+		// a newline would end the row.
+		it('escapes a pipe and a newline in the agent-authored evidence', () => {
+			const body = renderReviewBody(
+				context({
+					handoff: handoff({
+						absorbed: [
+							{
+								...absorbed[0],
+								evidence: 'Criterion 2:\n`a.ts` | `b.ts` both land here.',
+							},
+						],
+					}),
+				}),
+			);
+			expect(body).toContain(
+				'| [#947](https://github.com/SmartTechBrewery/swarm/issues/947) | Criterion 2: `a.ts` \\| `b.ts` both land here. |',
+			);
+		});
+	});
+
 	describe('re-review disposition', () => {
 		// An unresolved carried item is re-reported as a finding under the same id
 		// (the schema rejects a hand-off where it isn't), so `F1` appears in both
