@@ -199,6 +199,77 @@ function normalizePath(path: string): string {
 }
 
 /**
+ * The two metacharacters that make a recorded entry a *candidate* pattern.
+ * Deliberately narrow, and deliberately consulted only after exact membership has
+ * already failed (see {@link accountsForRecordedEntry}): `*` and `?` are legal bytes
+ * in a filename, so a real `src/a*.ts` the tree still changes is reported by
+ * `git status` under that name, matches literally, and never reaches this branch.
+ */
+const GLOB_METACHARACTERS = /[*?]/;
+
+/** Escape every RegExp metacharacter, so a literal glob segment matches itself. */
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * `pattern` as an anchored RegExp over repository-relative paths, with a glob's own
+ * segment semantics: `**` crosses `/`, a single `*`/`?` does not. Tokenised rather
+ * than chained-replaced so an escaped literal can never be re-read as a
+ * metacharacter, and with no ambiguous nested quantifier — `(?:[^/]+/)*` is
+ * terminated by a `/` each iteration, so it cannot backtrack catastrophically.
+ */
+function globToRegExp(pattern: string): RegExp {
+	const source = pattern.replace(/\*\*\/|\*\*|\*|\?|[^*?]+/g, (token) => {
+		switch (token) {
+			case '**/':
+				return '(?:[^/]+/)*';
+			case '**':
+				return '.*';
+			case '*':
+				return '[^/]*';
+			case '?':
+				return '[^/]';
+			default:
+				return escapeRegExp(token);
+		}
+	});
+	return new RegExp(`^${source}$`);
+}
+
+/** Whether one recorded entry describes `path` — literally, or as a glob (issue #949). */
+function recordedEntryMatchesPath(entry: string, path: string): boolean {
+	if (entry === path) return true;
+	if (!GLOB_METACHARACTERS.test(entry)) return false;
+	return globToRegExp(entry).test(path);
+}
+
+/**
+ * Whether `entry` still describes something `paths` changes.
+ *
+ * Exact membership first — the whole comparison for a well-written checkpoint, and
+ * unchanged in cost. A checkpoint that compressed a hundreds-of-files change into
+ * globs (issue #949) is then satisfied by *any* present path the pattern matches:
+ * the original file list is not recoverable, so "this entry still describes work in
+ * the tree" is the strongest thing the recorded form can assert. A pattern matching
+ * nothing is still divergence, which is what keeps the one-sided rule intact.
+ */
+function accountsForRecordedEntry(entry: string, paths: ReadonlySet<string>): boolean {
+	if (paths.has(entry)) return true;
+	if (!GLOB_METACHARACTERS.test(entry)) return false;
+	const matcher = globToRegExp(entry);
+	for (const path of paths) if (matcher.test(path)) return true;
+	return false;
+}
+
+/** A missing entry, saying so when it is a pattern rather than a path (issue #949). */
+function describeMissingEntry(entry: string): string {
+	return GLOB_METACHARACTERS.test(entry)
+		? `${entry} (a pattern matching nothing the tree changes)`
+		: entry;
+}
+
+/**
  * How many `refs/stash` entries the divergence diagnosis reads a path list for.
  * Bounded because each one costs its own `git stash show`; branch attribution
  * comes from the single `git stash list` and is never capped.
@@ -278,11 +349,13 @@ function describeStashBranch(entry: StashEntry, branch: string): string {
 function describeStashEntry(
 	entry: StashEntry,
 	branch: string,
-	unaccounted: ReadonlySet<string>,
+	unaccounted: readonly string[],
 ): string {
 	const head = `${entry.ref} ("${entry.subject}", ${describeStashBranch(entry, branch)})`;
 	if (!entry.paths) return `${head} — its path list could not be read`;
-	const overlap = entry.paths.filter((path) => unaccounted.has(normalizePath(path))).length;
+	const overlap = entry.paths.filter((path) =>
+		unaccounted.some((recorded) => recordedEntryMatchesPath(recorded, normalizePath(path))),
+	).length;
 	return `${head} holds ${entry.paths.length} path(s), ${overlap} of which this checkpoint records`;
 }
 
@@ -325,11 +398,15 @@ async function describeUnaccountedWork(
 	if (entries.length === 0)
 		return 'No git stash exists in this repository, so the missing work is not stashed';
 
-	const recorded = new Set(unaccounted.map(normalizePath));
+	const recorded = unaccounted.map(normalizePath);
 	const matches = entries.filter(
 		(entry) =>
 			entry.branch === branch ||
-			(entry.paths ?? []).some((path) => recorded.has(normalizePath(path))),
+			(entry.paths ?? []).some((path) =>
+				recorded.some((recordedEntry) =>
+					recordedEntryMatchesPath(recordedEntry, normalizePath(path)),
+				),
+			),
 	);
 
 	if (matches.length === 0) {
@@ -377,7 +454,12 @@ async function describeUnaccountedWork(
  * 2. It names `phase`. A task's checkout is reused across phases, so a stale
  *    Implementation checkpoint must never be adopted by a later Respond-to-CI run
  *    in the same path.
- * 3. Every path it records is still reported changed by `git status --porcelain`.
+ * 3. Every entry it records still describes something `git status --porcelain`
+ *    reports as changed. Exact set membership first; an entry that fails it *and*
+ *    carries a glob metacharacter is matched as a pattern instead (issue #949), so a
+ *    checkpoint that compressed a hundreds-of-files change into globs is not read as
+ *    work that vanished. A pattern matching *nothing* the tree changes is still
+ *    divergence, and the guard logs a `warn` naming any entry the fallback accepted.
  *
  * **The divergence rule for (3) is deliberately one-sided.** A recorded path that
  * is *absent* from `git status` is divergence, and so is a clean tree (the schema
@@ -457,13 +539,24 @@ export async function validateCheckpointForContinuation(
 			detail: `the working tree in ${cwd} is clean, but ${CHECKPOINT_FILENAME} records ${recorded.length} changed path(s). ${await describeUnaccountedWork(cwd, branch, recorded)}`,
 		};
 
-	const missing = recorded.filter((path) => !present.has(path));
+	const missing = recorded.filter((entry) => !accountsForRecordedEntry(entry, present));
 	if (missing.length > 0)
 		return {
 			valid: false,
 			reason: 'checkpoint-divergent',
-			detail: `${CHECKPOINT_FILENAME} records path(s) the working tree no longer changes: ${missing.join(', ')}. ${await describeUnaccountedWork(cwd, branch, missing)}`,
+			detail: `${CHECKPOINT_FILENAME} records path(s) the working tree no longer changes: ${missing.map(describeMissingEntry).join(', ')}. ${await describeUnaccountedWork(cwd, branch, missing)}`,
 		};
+
+	// `missing` is empty here, so these are exactly the entries the glob fallback
+	// accepted — a continuation that only worked because of the tolerance is visible.
+	const tolerated = recorded.filter(
+		(entry) => !present.has(entry) && GLOB_METACHARACTERS.test(entry),
+	);
+	if (tolerated.length > 0)
+		logger.warn(
+			`${CHECKPOINT_FILENAME} describes the working tree with pattern(s) rather than literal paths`,
+			{ cwd, phase, patterns: tolerated },
+		);
 
 	return { valid: true, checkpoint };
 }

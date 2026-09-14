@@ -18,13 +18,18 @@
  * arrives without warning, so the file has to be current *before* it does; don't
  * "improve" this into a wind-down decision the agent has to make.
  *
- * {@link checkpointInstructions} also carries the *worktree-state* directive
- * (issue #705): don't leave the worktree's changes stashed. It lives here rather
- * than beside `GH_IDENTITY_GUARD` (`src/pipeline/agent-auth.ts`) because its
- * reason *is* the checkpoint — a stash that outlives the run turns the next
- * continuation into a `checkpoint-divergent` block — and because this block is
- * spliced by exactly the four phases that write a checkpoint, including
- * `resolve-conflicts`, which deliberately carries no identity guard.
+ * {@link checkpointInstructions} also carries two directives whose reason *is* the
+ * checkpoint, which is why they live here rather than beside `GH_IDENTITY_GUARD`
+ * (`src/pipeline/agent-auth.ts`) — and why they reach exactly the four phases that
+ * write a checkpoint, including `resolve-conflicts`, which deliberately carries no
+ * identity guard. The *worktree-state* directive (issue #705): don't leave the
+ * worktree's changes stashed, because a stash that outlives the run turns the next
+ * continuation into a `checkpoint-divergent` block. And the *literal-path* directive
+ * (issue #949): `workingTree` names one literal path per changed file, never a glob
+ * or a directory, because the continuation gate compares those entries against the
+ * real tree — it tolerates a glob rather than reporting intact work as lost, but the
+ * tolerance is a backstop, and only the prompt reaches the agent while it can still
+ * write the file correctly.
  *
  * Every returned element is a self-contained paragraph with no internal
  * newlines, so a call site can spread it into a `'\n'`-joined line array
@@ -44,6 +49,7 @@ export function checkpointInstructions(phase: TriggerPhase): readonly string[] {
 	return [
 		`Throughout the work above, keep a rolling progress checkpoint in "${CHECKPOINT_FILENAME}" at the worktree root. After each completed step — and, once at least one repository path has changed, before starting any long operation — rewrite the whole file (never append) so it always describes where you actually are. Do not create one before a completed step.`,
 		`Write it as JSON with: phase (exactly "${phase}"), completed (a non-empty array of the steps already done), remaining (a non-empty array of what is still left, in order), decisions (an array of choices or caveats worth not re-deriving; may be empty), and workingTree ({"modified":[…],"added":[…],"deleted":[…]} — the repository paths you have changed so far, naming at least one path).`,
+		'Every workingTree entry must be a literal repository path, relative to the worktree root and exactly as `git status --porcelain` prints it — one entry per changed file. Never a glob, a wildcard, a directory, or any other summary ("src/**/*.ts", "apps/backend/", "the contracts package"), even when the change touches hundreds of files: a continuation checks these entries against the real working tree, and an entry it cannot find there is read as work that went missing. List the files.',
 		'It exists so that if this run is stopped involuntarily — a usage limit, a wall-clock timeout, an interruption — SWARM can continue from the recorded remainder instead of re-doing your work. Update it only at a safe boundary: never mid-edit and never mid-command.',
 		"Because that stop arrives without warning and the continuation is a fresh session in this same worktree, never leave this worktree's changes stashed. Do not `git stash` your work aside — not even briefly, and not to check whether a failure predates your change — unless you restore it before the same step ends. A continuation that finds a clean tree while the checkpoint records changed paths is refused outright, and your work then sits in a stash nobody is looking for.",
 		'To check whether something also fails without your changes, compare against a separate checkout (or the base branch in a scratch clone) rather than mutating this worktree.',
