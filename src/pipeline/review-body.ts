@@ -56,10 +56,10 @@ export interface ReviewBodyContext {
 
 /**
  * Markdown table cells can carry neither a raw `|` (it opens a new column) nor a
- * newline (it ends the row). Agent-authored text reaches three of them —
- * a verification command, a carried finding's id and title — and a piped command
- * like `npx vitest run | tail -20` is ordinary enough to break the table in
- * practice.
+ * newline (it ends the row). Agent-authored text reaches all of them — a
+ * verification command, a carried finding's id and title, an absorbed task's
+ * reference, URL and evidence — and a piped command like
+ * `npx vitest run | tail -20` is ordinary enough to break the table in practice.
  */
 function cell(text: string): string {
 	return text.replace(/\|/g, '\\|').replace(/\s*\r?\n\s*/g, ' ');
@@ -201,6 +201,33 @@ function verification(handoff: ReviewHandoff): string[] {
 	];
 }
 
+/**
+ * The reviewer's fold-in declaration (issue #953), rendered so a human can audit
+ * the decision on the pull request at the moment it is taken — next to the
+ * verdict that accompanied it, rather than only in a database column. Empty on
+ * essentially every review, in which case the body is byte-identical to what it
+ * was before this section existed.
+ */
+function absorbedSection(handoff: ReviewHandoff): string[] {
+	if (handoff.absorbed.length === 0) return [];
+	return [
+		'## Scope absorbed from another task',
+		'',
+		'The reviewer traced the whole scope of the task(s) below through this diff, so this pull',
+		'request delivers them too. Nothing is closed by this review: the declaration is recorded',
+		'here and on the run, for the merge that settles them.',
+		'',
+		'| Task | What this PR delivers for it |',
+		'| --- | --- |',
+		// Both cells are agent-authored, and `evidence` in particular is prose that
+		// may carry a `|` or a newline.
+		...handoff.absorbed.map(
+			(a) => `| [${cell(a.reference)}](${cell(a.url)}) | ${cell(a.evidence)} |`,
+		),
+		'',
+	];
+}
+
 /** The blocking tier: full slots, because a blocker has to be demonstrable to act on. */
 function blockingFinding(finding: ReviewFinding): string[] {
 	return [
@@ -288,6 +315,7 @@ export function renderReviewBody(context: ReviewBodyContext): string {
 		'',
 		...disposition(handoff.carried),
 		...verification(handoff),
+		...absorbedSection(handoff),
 		...(blocking.length > 0 ? ['---', '', ...blocking.flatMap(blockingFinding)] : []),
 		...(nonBlocking.length > 0 ? nonBlockingSection(context, nonBlocking) : []),
 		// An approval with nothing to report still carries the section, so every

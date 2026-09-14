@@ -554,6 +554,20 @@ export const TaskAssignmentAckSchema = z.object({
 export type TaskAssignmentAck = z.infer<typeof TaskAssignmentAckSchema>;
 
 /**
+ * A Review run's fold-in declaration, on the wire (issue #953) — one split
+ * sibling whose whole scope the reviewed pull request also delivers, with the
+ * evidence the reviewer traced for it. Provider-neutral: a card is named by its
+ * own URL and human reference, never by a board id or a URL shape shared code
+ * would have to parse (ai/RULES.md §2).
+ */
+export const ReviewAbsorbedFrameSchema = z.object({
+	url: z.string().min(1),
+	reference: z.string().min(1),
+	evidence: z.string().min(1),
+});
+export type ReviewAbsorbedFrame = z.infer<typeof ReviewAbsorbedFrameSchema>;
+
+/**
  * Worker→cloud terminal frame settling a pushed {@link TaskAssignmentSchema}. It
  * mirrors the fields the in-process `JobOutcome` (`../worker/consumer.ts`) carries
  * so the control plane can settle the dispatch exactly as `processJob` does
@@ -661,6 +675,16 @@ export const TaskExecutionResultSchema = z.object({
 	// `TRANSPORT_PROTOCOL_VERSION` is deliberately **not** bumped: an older worker
 	// simply omits it and its `no-fix` runs behave exactly as they do today.
 	ciOutcome: z.enum(['fixed', 'no-fix']).optional(),
+	// `succeeded` — a Review run's fold-in declaration (issue #953): the split
+	// siblings whose whole scope the reviewer traced through this pull request's
+	// diff. The control plane records it on the run row, where a merge later reads
+	// it; nothing else acts on it. Mirrors `PhaseRunResult.absorbed`, and the frame
+	// shape is declared here rather than imported from `../scm/delivery.js` for the
+	// same reason `WorkItemBlockerFrameSchema` is — this is the wire shape, not the
+	// hand-off's. Optional and additive in both directions, so
+	// `TRANSPORT_PROTOCOL_VERSION` is deliberately **not** bumped: an older worker
+	// simply omits it and the control plane records nothing, exactly as today.
+	absorbed: z.array(ReviewAbsorbedFrameSchema).optional(),
 });
 export type TaskExecutionResult = z.infer<typeof TaskExecutionResultSchema>;
 

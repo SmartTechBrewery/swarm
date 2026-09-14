@@ -89,6 +89,7 @@ function makeCappedReviewRun(overrides: Partial<RunRow> = {}): RunRow {
 		reviewVerdict: 'request-changes',
 		reviewOrdinal: REVIEW_VERDICT_CAP,
 		reviewAutomationOutcome: 'manual-intervention-required',
+		reviewAbsorbed: null,
 		reviewMergeOutcome: null,
 		reviewMergeMessage: null,
 		reviewMergeAttempt: null,

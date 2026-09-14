@@ -123,6 +123,26 @@ describe('adaptResultToPhaseRun', () => {
 		expect(run.advancedItemIds).toBeUndefined();
 	});
 
+	it('maps a Review run’s fold-in declaration onto the run the settle writes (issue #953)', () => {
+		const absorbed = [
+			{
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/947',
+				reference: '#947',
+				evidence: 'Its criteria 1-3 are met by this diff.',
+			},
+		];
+		const run = adaptResultToPhaseRun(
+			base({ status: 'succeeded', exitCode: 0, verdict: 'approve', absorbed }),
+			SELECTION,
+		);
+		expect(run.absorbed).toEqual(absorbed);
+	});
+
+	it('tolerates a result frame from an older worker that declares no absorbed scope', () => {
+		const run = adaptResultToPhaseRun(base({ status: 'succeeded', exitCode: 0 }), SELECTION);
+		expect(run.absorbed).toBeUndefined();
+	});
+
 	it('maps the reported CI outcome so the settle path can hand a no-fix back to Review (issue #841)', () => {
 		const run = adaptResultToPhaseRun(
 			base({ status: 'succeeded', exitCode: 0, ciOutcome: 'no-fix' }),

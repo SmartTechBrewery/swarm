@@ -312,6 +312,9 @@ export function adaptResultToPhaseRun(
 			// Feeds the shared settle path's `no-fix` hand-back to Review (issue #841);
 			// absent from every phase but Respond-to-CI, and from an older worker's frame.
 			ciOutcome: result.ciOutcome,
+			// Feeds the shared settle path's `runs.review_absorbed` write (issue #953);
+			// absent from a review that declared nothing, and from an older worker's frame.
+			absorbed: result.absorbed,
 		};
 	}
 	if (result.status === 'failed') {
