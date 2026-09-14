@@ -184,7 +184,11 @@ an existing enrollment a reconnecting daemon's declaration contradicts is
 sharing consent stay human decisions, so nothing is ever enrolled or re-activated
 from a declaration alone. A project owning several repositories accepts a worker
 for **any** of them (issue #946), which is how one project holds one worker per
-repository.
+repository. The Workers screen has not caught up with that yet (issue #947): it
+still explains a mismatch against the project's *default* repository, so on a
+multi-repository project it shows a worker enrolled on one of the others a
+mismatch it does not have. Read the enrollment's own status, not that banner,
+until #947 lands — routing itself is unaffected.
 
 **How work is split.** Source-carrying delivery (commit / push / create-PR) runs
 on the worker under the operator credential the assignment carried. Everything needing something the worker
