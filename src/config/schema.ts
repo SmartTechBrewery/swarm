@@ -93,6 +93,8 @@ export const PROJECT_DEFAULTS = {
 	/** Relative to `repoRoot`; matches the worktree lifecycle in ai/ARCHITECTURE.md. */
 	worktreeRoot: '.swarm-workspaces',
 	maxWorktrees: 10,
+	/** Days a `task-<id>` checkout may go untouched before the abandoned sweep removes it (issue #951). */
+	abandonedAfterDays: 10,
 } as const;
 
 /**
@@ -573,6 +575,14 @@ export const WorktreeRetentionConfigSchema = z
 		 * uncommitted-changes safety checks — see src/worktree/retention.ts).
 		 */
 		maxWorktrees: z.number().int().positive().default(PROJECT_DEFAULTS.maxWorktrees),
+		/**
+		 * How long a task-<id> checkout may go untouched before the age-based
+		 * abandoned sweep removes it **regardless of uncommitted or unpushed work**
+		 * — the checkouts the maxWorktrees sweep above refuses forever (issue #951,
+		 * src/worktree/abandoned.ts). A checkout something is still using (leased by
+		 * a live run, or pinned by a resumable one) is exempt at any age.
+		 */
+		abandonedAfterDays: z.number().int().positive().default(PROJECT_DEFAULTS.abandonedAfterDays),
 	})
 	.describe('Retention policy for stale per-task worktrees under worktreeRoot');
 

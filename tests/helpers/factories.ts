@@ -8,6 +8,7 @@
  * directly instead.
  */
 
+import type { z } from 'zod';
 import { scopeProjectToRepository } from '@/config/project-repository.js';
 import {
 	type ProjectConfig,
@@ -753,7 +754,15 @@ export function createMockPhaseRecovery(overrides: Partial<PhaseRecovery> = {}):
 	return { resumeDelivery: false, resumeExistingBranch: false, ...overrides };
 }
 
-export function createMockProjectConfig(overrides: Partial<ProjectConfig> = {}): ProjectConfig {
+/**
+ * Overrides are `ProjectConfigSchema`'s **input**, not its output: they are handed
+ * straight to `.parse()`, so a fixture may state just the part it cares about of a
+ * block whose other members the schema defaults (`worktreeRetention`'s pair, for
+ * one) instead of restating every defaulted field.
+ */
+export function createMockProjectConfig(
+	overrides: Partial<z.input<typeof ProjectConfigSchema>> = {},
+): ProjectConfig {
 	return ProjectConfigSchema.parse({
 		id: 'swarm',
 		name: 'swarm',
