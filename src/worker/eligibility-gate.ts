@@ -35,7 +35,10 @@
  *    (`preserved-worker-unavailable`) is the one wait with **no budget**: a
  *    continuation is never started over on another machine, because doing so
  *    silently discards the earlier attempt's work. Giving that work up is an
- *    operator action ("Reset & restart"), never a timer.
+ *    operator action ("Reset & restart"), never a timer. A continuation whose
+ *    machine was never recorded is refused too (`preserved-worker-unknown`, issue
+ *    #954) — on the ordinary bounded budget, since no machine coming online can
+ *    supply a record nobody wrote.
  * 3. **Eligibility** — `evaluateWorkerEligibility` (#338 Phase 2) judges one
  *    worker against one target: active enrollment → sharing consent → draining
  *    (issue #919) → connection/health → free capacity → the repository its checkout
@@ -110,6 +113,10 @@ import { type PoolDemand, selectPooledWorker } from './pool-scheduling.js';
  *   holding its preserved checkout cannot take it (issue #567). Named separately
  *   from "no capable worker" on purpose: every other worker in the project may be
  *   idle and eligible and it changes nothing, because the state is not there.
+ * - `preserved-worker-unknown` — this is a continuation and SWARM holds no record
+ *   of *which* machine its checkout is on (issue #954). Distinct from the reason
+ *   above in the only way that matters: there, the machine is known and merely
+ *   unavailable, so waiting works; here, nothing can name it, so waiting cannot.
  *
  * Structural reasons stay per-worker so the message names the thing an operator
  * must fix.
@@ -121,7 +128,8 @@ import { type PoolDemand, selectPooledWorker } from './pool-scheduling.js';
 export type DispatchIneligibilityReason =
 	| IneligibilityReason
 	| 'assignee-worker-unavailable'
-	| 'preserved-worker-unavailable';
+	| 'preserved-worker-unavailable'
+	| 'preserved-worker-unknown';
 
 /** The worker + target a gated dispatch resolved to. */
 export interface DispatchSelection {
@@ -265,6 +273,20 @@ export interface DispatchGateInput {
 	 * (unenrolled since, or never enrolled in this project); the id is the fallback.
 	 */
 	preservedWorker?: { id: string; name?: string };
+	/**
+	 * This dispatch continues a preserved checkout and the run records **no**
+	 * machine for it (issue #954) — the case {@link preservedWorker} cannot
+	 * express, since "nothing to pin" and "a checkout whose machine nobody
+	 * recorded" both read as an absent pin at the call site.
+	 *
+	 * The gate refuses it (`preserved-worker-unknown`) instead of routing it
+	 * unpinned, because a continuation that runs anywhere but the machine holding
+	 * its state silently redoes the work. It is decided *here* rather than by the
+	 * caller for one reason: an **unfederated** project has no other machine to
+	 * mis-route to, and only the roster read below knows that — which is why this
+	 * is checked after the `unfederated` verdict and not before it.
+	 */
+	preservedWorkerUnknown?: boolean;
 }
 
 /** Per-call tuning for {@link evaluateDispatchEligibility}. */
@@ -410,6 +432,14 @@ const AVAILABILITY_REFUSAL: Record<DispatchIneligibilityReason, boolean> = {
 	// spend the dispatch's re-check budget faster while changing nothing. The next
 	// timed re-check is what picks an undrain up.
 	'worker-draining': false,
+	// Classified opposite to its `preserved-worker-unavailable` sibling (issue #954),
+	// and deliberately so: no machine coming online can supply a record nobody wrote,
+	// so promoting this wait would only spend its budget faster. That is also what
+	// keeps the budget *bounded* — the pin's own wait is unbounded because the machine
+	// really will come back, while here there is nothing to wait for, so the ordinary
+	// `workerEligibilityRecheckAttempt` allowance ends in an actionable terminal
+	// failure rather than a permanent wait.
+	'preserved-worker-unknown': false,
 };
 
 /** Every reason the gate can refuse with — the domain of {@link isAvailabilityRefusal}. */
@@ -454,6 +484,12 @@ function ineligibilityMessage(
 		// rather than from this string.
 		case 'preserved-worker-unavailable':
 			return `This run continues work preserved on worker '${context.preservedWorker ?? 'unknown'}', so it can only run there. That machine is not currently available to take it. Waiting for it — this wait does not time out and nothing is started over on another machine. To give up the preserved work and restart this phase from scratch on any worker, use "Reset & restart".`;
+		// Same shape as the case above — name the condition, say what it means, name the
+		// one action — but the opposite ending (issue #954): the machine is not named,
+		// because naming it is exactly what is missing, and the wait is bounded, because
+		// no machine coming online can supply a record nobody wrote.
+		case 'preserved-worker-unknown':
+			return `This run continues work preserved in a checkout on one specific machine, but SWARM has no record of which machine holds this checkout. It cannot be routed there, and it is not started over on another machine — that would silently redo the work. Nothing a machine does clears this: the record was never written. To give up the preserved work and restart this phase from scratch on any worker, use "Reset & restart".`;
 		case 'assignee-worker-unavailable':
 			return `No eligible worker is free for ${owner} — an assigned item waits for its assignee's own worker and is never routed to another user's. Waiting for one to become available.`;
 		case 'worker-unavailable':
@@ -641,6 +677,32 @@ export async function evaluateDispatchEligibility(
 	// machine to gate. The local worker runs it, exactly as before #130.
 	if (candidates.length === 0) return { status: 'unfederated' };
 
+	const clis = [
+		...new Set(input.targets.map((target) => resolveTargetCli(target, input.phaseDefaultCli))),
+	];
+	// A continuation whose machine nobody recorded (issue #954). Refused here rather
+	// than routed unpinned: the checkout is machine-local, so handing it to whichever
+	// worker is free re-runs the phase from scratch at full cost with nothing saying
+	// so — the same defect the pin itself exists to prevent, and one no amount of
+	// waiting fixes, since the record was never written.
+	//
+	// Its position is the whole unfederated carve-out: a project with no enrolled
+	// workers returned above, so its continuations keep running exactly as they do
+	// today. That makes the exemption structural rather than a special case, and it
+	// is why this sits ahead of affinity resolution but behind the roster read.
+	if (input.preservedWorkerUnknown) {
+		return {
+			status: 'ineligible',
+			reason: 'preserved-worker-unknown',
+			message: ineligibilityMessage('preserved-worker-unknown', {
+				projectId: input.projectId,
+				clis,
+				phase: input.phase,
+				repository: input.repository,
+			}),
+		};
+	}
+
 	// Resolving the assignee is what *applies* affinity, so a phase that is not
 	// affinity-gated skips it entirely rather than resolving and then ignoring the
 	// answer (issue #469). That keeps every downstream consequence consistent: no
@@ -664,9 +726,6 @@ export async function evaluateDispatchEligibility(
 		: assigned
 			? candidates.filter((c) => c.worker.ownerUserId === assigned.user.id)
 			: candidates;
-	const clis = [
-		...new Set(input.targets.map((target) => resolveTargetCli(target, input.phaseDefaultCli))),
-	];
 	const messageContext = {
 		projectId: input.projectId,
 		assignee: assigned?.assignee.handle,

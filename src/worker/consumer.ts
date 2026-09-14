@@ -3689,16 +3689,48 @@ async function handlePhaseFailure(
 }
 
 /**
+ * Where this dispatch's preserved checkout is — a **tri-state** (issue #954),
+ * because "there is nothing to pin" and "this is a continuation and no machine
+ * was recorded for it" are different answers and only the first may route
+ * unpinned.
+ */
+interface PreservedWorkerPin {
+	/** The machine that holds the checkout, when the run records one. */
+	worker?: { id: string; name?: string };
+	/**
+	 * This dispatch continues a preserved checkout, the run records no machine for
+	 * it, and an earlier attempt nevertheless bound one — so the checkout exists on
+	 * a machine nothing here can name. The gate refuses such a dispatch rather than
+	 * handing it to an arbitrary worker (`./eligibility-gate.ts`).
+	 */
+	machineUnknown: boolean;
+}
+
+/**
  * The machine this dispatch must run on because it holds the run's preserved
- * checkout (issue #567), or `undefined` when this dispatch is not a continuation
- * or the run recorded no machine.
+ * checkout (issue #567), or the verdict that this continuation's machine cannot
+ * be determined at all (issue #954).
  *
- * Two conditions, both required: the payload means to adopt a preserved checkout
- * ({@link jobContinuesPreservedCheckout}), and the run row records where that
- * checkout is (`recovery.preservedWorkerId`). A run with no recorded machine —
- * every row settled before this existed, and every unfederated run — resolves no
- * pin and routes exactly as it did before, so the fix never wedges history it
- * cannot place.
+ * Two conditions, both required for a pin: the payload means to adopt a preserved
+ * checkout ({@link jobContinuesPreservedCheckout}), and the run row records where
+ * that checkout is (`recovery.preservedWorkerId`).
+ *
+ * **The "no recorded machine routes unpinned" carve-out is narrowed, not gone**
+ * (issue #954). It was written blanket, for rows predating #567, and in that shape
+ * it did precisely what the unreadable-row branch below calls the defect: a
+ * continuation whose machine nobody recorded was handed to whichever worker was
+ * free, where it found nothing to adopt and silently redid the work. What survives
+ * is the half that is genuinely safe — a run whose `worker_id` is `NULL` never
+ * bound a machine, so there is no machine that *could* have been recorded and
+ * nothing to have lost. A run whose last attempt did bind one, and yet records no
+ * pin, is a continuation nobody can place: `machineUnknown`.
+ *
+ * That case is deliberately reported rather than thrown. Only the gate knows
+ * whether the project is federated at all, and an unfederated project has no other
+ * machine to mis-route to — its continuations must keep running exactly as today,
+ * which is what keeping the decision there buys. `runs.worker_id` is likewise not
+ * used as a substitute pin: it is the *last bind's* worker, so an already
+ * mis-routed continuation would name the wrong machine.
  *
  * **Fails closed on an unreadable run row.** Dispatching a continuation without
  * its pin is the defect itself, so an unreadable row refuses the dispatch rather
@@ -3707,29 +3739,31 @@ async function handlePhaseFailure(
  * run in an unbounded wait. The display name is the one part allowed to fail
  * softly: it only shapes the message, and the id is a usable fallback.
  */
-async function resolvePreservedWorkerPin(
-	job: SwarmJob,
-): Promise<{ id: string; name?: string } | undefined> {
-	if (!job.runId || !jobContinuesPreservedCheckout(job)) return undefined;
-	let workerId: string | null | undefined;
+async function resolvePreservedWorkerPin(job: SwarmJob): Promise<PreservedWorkerPin> {
+	if (!job.runId || !jobContinuesPreservedCheckout(job)) return { machineUnknown: false };
+	let run: Awaited<ReturnType<typeof getRunByIdFromDb>>;
 	try {
-		workerId = (await getRunByIdFromDb(job.runId))?.recovery?.preservedWorkerId;
+		run = await getRunByIdFromDb(job.runId);
 	} catch (err) {
 		throw new WorkerIneligibleError(
 			'worker-unavailable',
 			`Could not read run '${job.runId}' to find the machine holding its preserved checkout, and a continuation must not be dispatched without it: ${describeError(err)}`,
 		);
 	}
-	if (!workerId) return undefined;
+	const workerId = run?.recovery?.preservedWorkerId;
+	if (!workerId) return { machineUnknown: run?.workerId != null };
 	try {
-		return { id: workerId, name: (await getWorker(workerId))?.displayName };
+		return {
+			worker: { id: workerId, name: (await getWorker(workerId))?.displayName },
+			machineUnknown: false,
+		};
 	} catch (err) {
 		logger.warn('Preserved-worker pin: name lookup failed; naming the machine by id', {
 			runId: job.runId,
 			workerId,
 			error: describeError(err),
 		});
-		return { id: workerId };
+		return { worker: { id: workerId }, machineUnknown: false };
 	}
 }
 
@@ -3767,7 +3801,7 @@ async function gateDispatch(
 	const phaseConfig = phaseAgentConfig(project, trigger.phase, implementationUnplanned);
 	// PR-driven phases carry no board item, so they take the unassigned path.
 	const workItem = 'workItem' in trigger ? trigger.workItem : undefined;
-	const preservedWorker = await resolvePreservedWorkerPin(job);
+	const preservedPin = await resolvePreservedWorkerPin(job);
 	let decision: GateDecision;
 	try {
 		decision = await evaluateDispatchEligibility(
@@ -3795,7 +3829,11 @@ async function gateDispatch(
 				pm: workItem?.assignees.length ? requireProjectPMProvider(project) : undefined,
 				// The machine holding this continuation's preserved checkout, when there
 				// is one (issue #567) — the hardest narrowing the gate applies.
-				preservedWorker,
+				preservedWorker: preservedPin.worker,
+				// …and the case where there is a checkout to continue but no machine
+				// recorded for it (issue #954). The gate refuses that rather than routing
+				// it, but only once it knows the project is federated at all.
+				preservedWorkerUnknown: preservedPin.machineUnknown,
 			},
 			{
 				...gateOptions,

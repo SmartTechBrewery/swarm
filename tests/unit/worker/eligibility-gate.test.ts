@@ -196,6 +196,10 @@ describe('isAvailabilityRefusal', () => {
 		// Issue #919: reconnecting does not undrain, so a machine coming back must not
 		// wake a dispatch a drain refused — only an operator's undrain clears it.
 		'worker-draining',
+		// Issue #954: no machine coming online can supply a record nobody wrote, so this
+		// is classified opposite to its `preserved-worker-unavailable` sibling — which is
+		// what gives it the ordinary bounded budget instead of the pin's endless wait.
+		'preserved-worker-unknown',
 	];
 
 	it('classifies every reason in the union, and no reason twice', () => {
@@ -684,6 +688,45 @@ describe('evaluateDispatchEligibility', () => {
 			expect(await evaluateDispatchEligibility(gateInput())).toMatchObject({
 				status: 'selected',
 				selection: { workerId: 'w-1', pinnedToPreservedWorker: false },
+			});
+		});
+
+		// Issue #954. The other half of the pin: a continuation whose machine nobody
+		// recorded used to route unpinned, which is the same silent start-over the pin
+		// exists to prevent. It is refused instead — but only where there is another
+		// machine it could have been mis-routed to.
+		describe('a continuation whose machine is unknown (issue #954)', () => {
+			it('refuses rather than routing it to a free worker', async () => {
+				listProjectDispatchCandidates.mockResolvedValue([makeCandidate('w-free')]);
+
+				const decision = await evaluateDispatchEligibility(
+					gateInput({ preservedWorkerUnknown: true }),
+				);
+
+				expect(decision).toMatchObject({
+					status: 'ineligible',
+					reason: 'preserved-worker-unknown',
+				});
+				if (decision.status !== 'ineligible') throw new Error('unreachable');
+				// Names the reason, and the one action that ends it.
+				expect(decision.message).toContain('SWARM has no record of which machine holds this');
+				expect(decision.message).toContain('Reset & restart');
+			});
+
+			it('leaves an unfederated project running it exactly as today', async () => {
+				// The carve-out that must not regress: with nothing enrolled there is no
+				// other machine to mis-route to, so the refusal has nothing to protect.
+				listProjectDispatchCandidates.mockResolvedValue([]);
+
+				expect(
+					await evaluateDispatchEligibility(gateInput({ preservedWorkerUnknown: true })),
+				).toEqual({ status: 'unfederated' });
+			});
+
+			it('is a refusal no machine coming online can clear, so its wait is bounded', async () => {
+				// Unlike `preserved-worker-unavailable`, which waits forever for a machine
+				// that really will come back.
+				expect(isAvailabilityRefusal('preserved-worker-unknown')).toBe(false);
 			});
 		});
 	});

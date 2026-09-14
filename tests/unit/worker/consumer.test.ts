@@ -444,6 +444,9 @@ const getRunByIdFromDb = vi.fn(
 					agentSessionId?: string | null;
 					continuationCount?: number;
 					recovery?: { preservedWorkerId?: string | null } | null;
+					// The *last bind's* worker (issue #954) — read only to tell a run that
+					// never bound a machine from one whose recorded machine went missing.
+					workerId?: string | null;
 					// Read by the no-trigger settle (issue #815) to establish that the
 					// redelivered run really is the Review the ledger slot belongs to.
 					phase?: string;
@@ -3053,6 +3056,90 @@ describe('processJob', () => {
 					preservedWorkerWait: false,
 				});
 				expect(phaseCalls).toEqual([]);
+			});
+
+			// Issue #954. The other half of the read: a continuation whose machine nobody
+			// recorded used to route unpinned — the silent start-over the pin exists to
+			// prevent — and is now refused, bounded, wherever there is another machine it
+			// could have been handed to.
+			describe('a continuation whose machine is unknown (issue #954)', () => {
+				/** A run that bound a machine on its last attempt but records no pin. */
+				const boundButUnrecorded = () =>
+					getRunByIdFromDb.mockResolvedValue({ workerId: 'w-bound', recovery: {} });
+
+				it('refuses it on the ordinary bounded budget rather than routing it', async () => {
+					boundButUnrecorded();
+					listProjectDispatchCandidates.mockResolvedValue([candidate('w-free')]);
+
+					const outcome = await processJob(
+						continuation(),
+						registryReturning(planningTrigger()),
+						undefined,
+						executionIdentity('w-free'),
+					);
+
+					expect(outcome).toMatchObject({
+						status: 'phase-deferred',
+						workerEligibilityRecheck: true,
+						// Not the pin's own endless wait: no machine coming online can supply
+						// a record nobody wrote.
+						preservedWorkerWait: false,
+					});
+					expect(phaseCalls).toEqual([]);
+					const [, input] = scheduleDispatchRetry.mock.calls[0] as [
+						string,
+						Record<string, unknown>,
+					];
+					// The existing non-availability wait reason — no new one, so the queue read
+					// model and the dashboard render it already.
+					expect(input.waitReason).toBe('worker-authorization');
+				});
+
+				it('ends in an actionable terminal failure once that budget is spent', async () => {
+					boundButUnrecorded();
+					listProjectDispatchCandidates.mockResolvedValue([candidate('w-free')]);
+
+					const outcome = await processJob(
+						createMockPmWebhookJob({
+							runId: 'run-1',
+							recoveryMode: 'checkpoint',
+							workerEligibilityRecheckAttempt: 1_000_000,
+						}),
+						registryReturning(planningTrigger()),
+						undefined,
+						executionIdentity('w-free'),
+					);
+
+					expect(outcome.status).toBe('phase-failed');
+					expect(addComment).toHaveBeenCalledOnce();
+					const [, body] = addComment.mock.calls[0];
+					expect(body).toContain('Reset & restart');
+				});
+
+				it('still runs it on an unfederated project, where nothing could be mis-routed', async () => {
+					boundButUnrecorded();
+					listProjectDispatchCandidates.mockResolvedValue([]);
+
+					const outcome = await processJob(continuation(), registryReturning(planningTrigger()));
+
+					expect(outcome.status).toBe('phase-succeeded');
+				});
+
+				it('still routes a run that never bound a machine at all', async () => {
+					// `runs.worker_id IS NULL`: no attempt ever bound one, so there is no
+					// machine that could have been recorded and nothing to have lost.
+					getRunByIdFromDb.mockResolvedValue({ workerId: null, recovery: {} });
+					listProjectDispatchCandidates.mockResolvedValue([candidate('w-free')]);
+
+					const outcome = await processJob(
+						continuation(),
+						registryReturning(planningTrigger()),
+						undefined,
+						executionIdentity('w-free'),
+					);
+
+					expect(outcome.status).toBe('phase-succeeded');
+				});
 			});
 
 			// Issue #780. The one wait with no budget must not be the one that lets a
