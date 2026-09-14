@@ -9,6 +9,7 @@ import {
 	uuid,
 } from 'drizzle-orm/pg-core';
 import type { AgentCli } from '../../harness/agent-cli.js';
+import type { WorktreeSweepResult, WorktreeSweepStatus } from '../../identity/worker.js';
 import type { WorkerUpdateStatus } from '../../lib/build-identity.js';
 import { ALL_TRIGGER_PHASES, type TriggerPhase } from '../../triggers/types.js';
 import { users } from './users.js';
@@ -196,6 +197,43 @@ export const workers = pgTable(
 		updateStatus: text('update_status').$type<WorkerUpdateStatus>(),
 		updateMessage: text('update_message'),
 		updateReportedAt: timestamp('update_reported_at'),
+		/**
+		 * The abandoned-worktree sweep an operator asked this machine for (issue #955),
+		 * in five columns that split the same way the `update_*` block above does: the
+		 * **request** still outstanding (`worktree_sweep_request_id`,
+		 * `worktree_sweep_requested_at`) and the **last outcome** the machine reported
+		 * (`worktree_sweep_status`, `worktree_sweep_reported_at`,
+		 * `worktree_sweep_result`).
+		 *
+		 * `worktree_sweep_request_id` is the pending marker, exactly as
+		 * `update_request_id` is: non-null means a push is owed an answer, and the report
+		 * route clears it only when the reported id matches — so a report for a request
+		 * an operator has since re-issued is recorded without un-pending the one now
+		 * outstanding.
+		 *
+		 * `worktree_sweep_result` is a `jsonb` `WorktreeSweepResult` (`src/identity/worker.ts`,
+		 * the source of truth for the shape): the paths removed, each with its age and
+		 * the uncommitted/unpushed work the removal destroyed, plus the true totals. That
+		 * last part is why the record is durable at all — an age-based sweep removes a
+		 * checkout holding real work by design, so an operator must be able to read
+		 * afterwards that it did.
+		 *
+		 * **Only the most recent sweep per machine is retained**: asking again overwrites
+		 * all five. This is deliberately *not* a history table — with phase 3's weekly
+		 * cadence the one sweep kept is precisely "last week's", which is the question
+		 * the record exists to answer.
+		 *
+		 * All nullable with no default and nothing backfilled, on `draining_since`'s
+		 * contract: NULL is what every row written before these columns says, and is
+		 * verbatim the pre-existing behaviour. Deliberately **not** rewritten by the
+		 * handshake, for that column's reason too — this is the operator's request and
+		 * the machine's answer to it, not a fact the daemon re-declares on connect.
+		 */
+		worktreeSweepRequestId: uuid('worktree_sweep_request_id'),
+		worktreeSweepRequestedAt: timestamp('worktree_sweep_requested_at'),
+		worktreeSweepStatus: text('worktree_sweep_status').$type<WorktreeSweepStatus>(),
+		worktreeSweepReportedAt: timestamp('worktree_sweep_reported_at'),
+		worktreeSweepResult: jsonb('worktree_sweep_result').$type<WorktreeSweepResult>(),
 		/** SHA-256 of the worker credential — never the raw token; dropped by `rowToWorker`. */
 		credentialHash: text('credential_hash').notNull().unique(),
 		createdAt: timestamp('created_at').notNull().defaultNow(),

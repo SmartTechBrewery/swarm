@@ -74,6 +74,7 @@ import {
 	type WorkerHealth,
 	type WorkerStreamMessage,
 	type WorkerUpdate,
+	type WorktreeSweep,
 	WS_CLOSE,
 } from './protocol.js';
 
@@ -838,6 +839,19 @@ export interface WorkerTransportOptions {
 	 */
 	onUpdate?: (update: WorkerUpdate) => void;
 	/**
+	 * Called when the control plane pushes a `worktree-sweep` frame (issue #955) —
+	 * an operator asking this *machine* to remove its own long-abandoned `task-<id>`
+	 * checkouts. The second frame here that concerns no dispatch, so it is handed no
+	 * {@link AssignmentSink} either: its answer goes up a delivery route rather than
+	 * the back-channel (`./worktree-sweep.ts`).
+	 *
+	 * Unlike `onUpdate` the handler has nothing to decide about *whether* to act —
+	 * there is no host opt-in and no wait, because a checkout a phase here still
+	 * holds reads as leased and is skipped. Left undefined the frame is logged and
+	 * ignored, which is exactly how a daemon predating the frame behaves.
+	 */
+	onWorktreeSweep?: (sweep: WorktreeSweep) => void;
+	/**
 	 * Called with each established session, before the stream opens — the only place
 	 * a daemon learns the `workerId` it authenticates as, since the credential does
 	 * not carry it (issue #689: the checkout lock records it so a second daemon's
@@ -1188,8 +1202,9 @@ function notifySession(
 
 /**
  * Route the cloud→worker *work* frames — a pushed `TaskAssignment` (ADR-003 §2),
- * the `TaskCancel` that stops one (issue #549), and the `WorkerUpdate` that asks
- * this machine to move to a build (issue #933) — to the executor's handlers. Every
+ * the `TaskCancel` that stops one (issue #549), the `WorkerUpdate` that asks this
+ * machine to move to a build (issue #933), and the `WorktreeSweep` that asks it to
+ * remove its own abandoned checkouts (issue #955) — to the executor's handlers. Every
  * handler is optional, because a session-only client keeps its lease live and runs
  * nothing: an unhandled frame is logged and ignored, never an error.
  * `heartbeat-ack` falls through with no action.
@@ -1270,6 +1285,17 @@ function routeWorkFrame(
 			return;
 		}
 		options.onUpdate(frame);
+		return;
+	}
+	if (frame.type === 'worktree-sweep') {
+		// Names no dispatch either (issue #955), so there is nothing held it could answer.
+		if (!options.onWorktreeSweep) {
+			logger.info('ignoring worktree-sweep — this client sweeps no worktrees', {
+				requestId: frame.requestId,
+			});
+			return;
+		}
+		options.onWorktreeSweep(frame);
 	}
 }
 

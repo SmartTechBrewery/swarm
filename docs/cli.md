@@ -435,6 +435,7 @@ swarm workers update <worker-id> <ref>
 swarm workers update --all <ref> [--wave <n>]
 swarm workers update --status
 swarm workers request-update <ref>
+swarm workers sweep-worktrees <worker-id>
 swarm workers enroll <worker-id> <project-id> --cli <c1,c2,...> [--concurrency <n>] [--active] [--consent]
 swarm workers update-enrollment <worker-id> <project-id> [--cli <c1,c2,...>] [--concurrency <n>]
 swarm workers approve <worker-id> <project-id>
@@ -762,6 +763,36 @@ unchanged.
   see [`docs/onboarding-worker.md`](./onboarding-worker.md) for both reads. This is
   the one-shot request, not the staged rollout: waves, drains and halting stay
   `update --all`, which is each owner's own.
+- **`sweep-worktrees <worker-id>`** — ask a machine to remove its own `task-<id>`
+  checkouts that nothing has touched for the project's
+  `worktreeRetention.abandonedAfterDays` (10 by default), across every project it
+  holds an **active** enrollment for (issue #955). A `pending` or `suspended`
+  enrollment is skipped — that project never accepted the machine — while a project
+  whose *sharing consent* was withdrawn is still swept: consent decides whether it
+  may be given work there, and a sweep gives it none. This is the age-based sweep
+  phase 1 of issue #951 built,
+  reaching the checkouts the ordinary retention sweep keeps forever: it removes them
+  **including** the ones holding uncommitted changes or unpushed commits, and
+  *records* that rather than being stopped by it. A checkout something is still
+  using — leased by a live run, or pinned by a resumable one — is exempt at any age,
+  and on the machine doing the sweeping its own in-flight set is what answers that,
+  so a phase running right now is never disturbed; the sweep also *holds* each
+  checkout's lease across its removal, so one dispatched mid-sweep cannot be given
+  the directory about to go.
+  **It prints the machine's last sweep, then asks for a new one.** Each removed path
+  comes with how many days it had gone untouched and whether it held uncommitted or
+  unpushed work, under a line counting what was removed, kept live, and failed. Both
+  halves are in one command because the request is what *destroys* the previous
+  record — a machine keeps only its most recent sweep — so this print is the last
+  moment it is readable. The new answer lands on the row later and is printed by the
+  next run, exactly as `update`'s outcome is read back through `list`.
+  **No drain and no host opt-in**, unlike `update`: a sweep disturbs no in-flight run,
+  and it removes only `task-<id>` checkouts under a project's own `worktreeRoot`, so
+  `worktreeRetention.abandonedAfterDays` is the whole of the opt-out. A machine that
+  is offline when you ask keeps the request on its row and is handed it on its next
+  connection; one project failing is counted and reported and the rest are still
+  swept. Owner-only, like `drain` and `update`. There is no schedule and no
+  fleet-wide form — phase 3 of issue #951 adds both.
 - **`enroll`** — enroll a worker into a project with allowed CLIs (`--cli`, a
   subset of the worker's capabilities) and `--concurrency`, this worker's share of
   the project. Omit `--concurrency` for `1` (the default): one of the project's

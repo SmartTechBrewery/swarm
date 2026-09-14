@@ -42,20 +42,28 @@
  * never removed, matching how `pruneStaleWorktrees` treats an unstattable path.
  *
  * **Liveness is never overridden by age.** A leased or resumable-pinned checkout
- * is kept whatever its age, decided by {@link GitWorktreeManager.evaluateLiveness}
- * — the same code the hourly sweep's gate runs, not a second opinion. The two
+ * is kept whatever its age, decided by {@link GitWorktreeManager.claimForSweep} —
+ * the same code the hourly sweep's gate runs, not a second opinion. What that
+ * method adds over a plain read is the half this sweep cannot do without: it
+ * *takes* the task lease, through the very gate a provision takes it through, and
+ * the removal happens under it. A read alone would be true only at the instant it
+ * was taken — and this sweep force-removes, so a provisioner arriving in the gap
+ * would have had its fresh checkout deleted out from under a running phase. The two
  * sweeps also resolve candidates through the same `matchTaskWorktrees`, read the
- * same lease runtime, and call the same idempotent `cleanup`, so a checkout one
- * removed a moment earlier costs the other a log line rather than a failure.
+ * same lease runtime, and force-remove through the same idempotent path, so a
+ * checkout one removed a moment earlier costs the other a log line rather than a
+ * failure.
  *
  * `.swarm-state` is left alone: `sweepStaleHostLocalState` is `pruneStaleWorktrees`'
  * own. Every artifact there is already TTL-bounded at 4h/24h, so nothing it holds
  * is still standing at ten days — and removing one would only take the liveness
  * answer away from the gate above.
  *
- * **Nothing calls this yet.** It is the mechanism only, in the shape
- * `src/worker/self-update.ts` took before issue #933 gave it a signal path; the
- * scheduler and the fleet transport are phases 2 and 3 of issue #951.
+ * **One caller so far: an operator asking one machine** (issue #955). The control
+ * plane pushes a `worktree-sweep` frame and the daemon runs this against its own
+ * checkout root (`../transport/worktree-sweep.ts`) — the signal path issue #933
+ * gave `src/worker/self-update.ts`, copied. Still nothing *schedules* it and there
+ * is no fleet-wide form; both are phase 3 of issue #951.
  */
 
 import { readFileSync, statSync } from 'node:fs';
@@ -155,6 +163,85 @@ export function resolveLastTouchedMs(worktreePath: string): number | undefined {
 	return found.length > 0 ? Math.max(...found) : undefined;
 }
 
+/** One aged-out candidate, and what the sweep did about it. */
+type CandidateOutcome =
+	| { outcome: 'removed'; removal: AbandonedWorktreeRemoval }
+	| { outcome: 'kept-live'; reason: LiveBlockedReason }
+	| { outcome: 'failed'; error: string };
+
+/**
+ * Deal with one candidate old enough to qualify: claim it, record what removing it
+ * destroys, remove it, give the claim back.
+ *
+ * Split out of {@link sweepAbandonedWorktrees} so the function holding the claim
+ * holds nothing else — the release has to happen on *every* exit from it, which is
+ * far easier to keep true when the `finally` is the whole shape of the function.
+ */
+async function sweepCandidate(
+	worktrees: GitWorktreeManager,
+	project: ProjectConfig,
+	candidate: { path: string; taskId: string; lastTouchedMs: number; ageMs: number },
+	options: SweepAbandonedWorktreesOptions,
+	thresholdDays: number,
+): Promise<CandidateOutcome> {
+	const { path, taskId, lastTouchedMs, ageMs } = candidate;
+
+	// Liveness is *taken*, not read: this sweep force-removes, so the answer has to
+	// still be true when the removal happens (see `GitWorktreeManager.claimForSweep`).
+	const claim = await worktrees.claimForSweep(taskId, options.isResumablePinned);
+	if (!claim.safe) return { outcome: 'kept-live', reason: claim.reason };
+
+	try {
+		// Recorded, not obeyed. Both fail closed toward "there is work here", which is
+		// the right direction for a record, and both are paid for only by a checkout
+		// actually being removed. Read under the claim, so what is recorded is the state
+		// of the checkout this call removes.
+		const hadUncommittedChanges = !(await worktrees.isClean(taskId));
+		const hadUnpushedCommits = await worktrees.hasUnpushedWork(taskId);
+
+		if (!options.dryRun) {
+			try {
+				// Deliberately not `cleanup`: that releases the lease first, and the freed
+				// lease is exactly what a provisioner needs to put a live checkout at this
+				// path a moment before the force-remove reaches it.
+				await worktrees.removeCheckoutUnderLease(taskId);
+			} catch (err) {
+				logger.warn('abandoned worktree removal failed', {
+					projectId: project.id,
+					taskId,
+					path,
+					error: describeError(err),
+				});
+				return { outcome: 'failed', error: describeError(err) };
+			}
+		}
+
+		const removal: AbandonedWorktreeRemoval = {
+			taskId,
+			path,
+			lastTouchedAt: new Date(lastTouchedMs).toISOString(),
+			ageDays: ageMs / MS_PER_DAY,
+			hadUncommittedChanges,
+			hadUnpushedCommits,
+		};
+
+		// `warn`, not `info`: this is the one sweep that can delete unpushed work, so
+		// what it destroyed is stated rather than counted.
+		logger.warn('abandoned worktree removed', {
+			projectId: project.id,
+			...removal,
+			thresholdDays,
+			dryRun: options.dryRun === true,
+		});
+		return { outcome: 'removed', removal };
+	} finally {
+		// Held no longer than the removal it guards — including on the failure and
+		// dry-run paths, where the checkout is still there and the next dispatch for the
+		// task must find its lease free.
+		await worktrees.releaseSweepClaim(taskId, claim.token);
+	}
+}
+
 /**
  * Remove every `task-<id>` checkout under this project's `worktreeRoot` that has
  * gone untouched for `worktreeRetention.abandonedAfterDays`, **including** ones
@@ -195,59 +282,24 @@ export async function sweepAbandonedWorktrees(
 			continue;
 		}
 
+		// Cheapest first: the age came off a stat already taken, so the claim — which
+		// writes to the lease store — is only made for a checkout old enough to matter.
 		const ageMs = now - lastTouchedMs;
 		if (ageMs < thresholdMs) {
 			keptRecent.push(path);
 			continue;
 		}
 
-		// Cheapest first: the age came off a stat already taken, so liveness — which
-		// reads the lease store — is only asked about a checkout old enough to matter.
-		const liveness = await worktrees.evaluateLiveness(taskId, options.isResumablePinned);
-		if (!liveness.safe) {
-			keptLive.push({ path, reason: liveness.reason });
-			continue;
-		}
-
-		// Recorded, not obeyed. Both fail closed toward "there is work here", which is
-		// the right direction for a record, and both are paid for only by a checkout
-		// actually being removed.
-		const hadUncommittedChanges = !(await worktrees.isClean(taskId));
-		const hadUnpushedCommits = await worktrees.hasUnpushedWork(taskId);
-
-		if (!options.dryRun) {
-			try {
-				await worktrees.cleanup(taskId);
-			} catch (err) {
-				failed.push({ path, taskId, error: describeError(err) });
-				logger.warn('abandoned worktree removal failed', {
-					projectId: project.id,
-					taskId,
-					path,
-					error: describeError(err),
-				});
-				continue;
-			}
-		}
-
-		const removal: AbandonedWorktreeRemoval = {
-			taskId,
-			path,
-			lastTouchedAt: new Date(lastTouchedMs).toISOString(),
-			ageDays: ageMs / MS_PER_DAY,
-			hadUncommittedChanges,
-			hadUnpushedCommits,
-		};
-		removed.push(removal);
-
-		// `warn`, not `info`: this is the one sweep that can delete unpushed work, so
-		// what it destroyed is stated rather than counted.
-		logger.warn('abandoned worktree removed', {
-			projectId: project.id,
-			...removal,
+		const result = await sweepCandidate(
+			worktrees,
+			project,
+			{ path, taskId, lastTouchedMs, ageMs },
+			options,
 			thresholdDays,
-			dryRun: options.dryRun === true,
-		});
+		);
+		if (result.outcome === 'removed') removed.push(result.removal);
+		else if (result.outcome === 'kept-live') keptLive.push({ path, reason: result.reason });
+		else failed.push({ path, taskId, error: result.error });
 	}
 
 	logger.debug('abandoned worktree sweep complete', {

@@ -123,6 +123,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		// In the pool (issue #919) — every case here that says nothing about draining.
 		drainingSince: null,
 		update: null,
+		worktreeSweep: null,
 		build: null,
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		updatedAt: new Date('2026-01-01T00:00:00Z'),

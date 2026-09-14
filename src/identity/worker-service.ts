@@ -31,7 +31,9 @@ import {
 	listAllWorkers as listAllWorkersRows,
 	listWorkersForOwner as listWorkersForOwnerRows,
 	recordWorkerUpdateReport as recordWorkerUpdateReportRow,
+	recordWorktreeSweepReport as recordWorktreeSweepReportRow,
 	requestWorkerUpdate as requestWorkerUpdateRow,
+	requestWorktreeSweep as requestWorktreeSweepRow,
 	setWorkerDeclaredCapabilities,
 	setWorkerDraining as setWorkerDrainingRow,
 	updateWorkerCapabilities,
@@ -48,7 +50,7 @@ import {
 } from '../lib/build-identity.js';
 import { RepoSlugSchema } from '../scm/repo-slug.js';
 import type { TriggerPhase } from '../triggers/types.js';
-import type { Worker } from './worker.js';
+import type { Worker, WorktreeSweepResult, WorktreeSweepStatus } from './worker.js';
 import {
 	WorkerCapabilitiesSchema,
 	WorkerDisplayNameSchema,
@@ -293,6 +295,41 @@ export async function recordWorkerUpdateReport(
 	message: string,
 ): Promise<Worker | undefined> {
 	return recordWorkerUpdateReportRow(id, requestId, status, message);
+}
+
+/**
+ * Record that an operator asked this machine to sweep its abandoned worktrees
+ * (issue #955), replacing any request not yet answered. Returns the updated
+ * worker, or `undefined` when no worker has that id.
+ *
+ * Nothing to validate beyond the caller's own id: unlike a self-update this
+ * request names no target — what each project's checkouts are swept against is
+ * read from that project's own configuration when the frame is built
+ * (`../router/worktree-sweep-dispatch.ts`).
+ */
+export async function requestWorktreeSweep(
+	id: string,
+	requestId: string,
+): Promise<Worker | undefined> {
+	return requestWorktreeSweepRow(id, requestId);
+}
+
+/**
+ * Record what a machine reported became of the sweep it was asked for (issue
+ * #955). Returns the updated worker, or `undefined` when the report answers no
+ * outstanding request — a superseded request, a duplicate report, or an unknown
+ * worker (see {@link recordWorktreeSweepReportRow} for why those collapse).
+ *
+ * Nothing to validate beyond what the wire schema already did: the status is a
+ * closed vocabulary and the result is the machine's own record of what it removed.
+ */
+export async function recordWorktreeSweepReport(
+	id: string,
+	requestId: string,
+	status: WorktreeSweepStatus,
+	result: WorktreeSweepResult,
+): Promise<Worker | undefined> {
+	return recordWorktreeSweepReportRow(id, requestId, status, result);
 }
 
 /**

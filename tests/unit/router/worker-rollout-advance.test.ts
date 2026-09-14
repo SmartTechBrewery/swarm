@@ -57,6 +57,7 @@ function makeWorker(): Worker {
 		repository: null,
 		drainingSince: new Date('2026-09-13T10:00:00Z'),
 		update: null,
+		worktreeSweep: null,
 		build: null,
 		createdAt: new Date(0),
 		updatedAt: new Date(0),

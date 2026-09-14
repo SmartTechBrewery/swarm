@@ -97,6 +97,7 @@ vi.mock('node:fs', () => ({
 
 import { GitWorktreeManager } from '@/worker/git-worktree-manager.js';
 import { BlockedRecoveryError } from '@/worktree/reclaim.js';
+import type { WorktreeRuntime } from '@/worktree/worktree-runtime.js';
 
 const REPO_ROOT = '/Users/dev/swarm/swarm';
 const WORKTREE_14 = `${REPO_ROOT}/.swarm-workspaces/task-14`;
@@ -1008,6 +1009,162 @@ describe('GitWorktreeManager', () => {
 			releaseWorktreeLeaseMock.mockClear();
 			await manager.cleanup('14');
 			expect(releaseWorktreeLeaseMock).toHaveBeenCalledWith('project-1', '14');
+		});
+	});
+
+	/**
+	 * The abandoned sweep's half of the lease lifecycle (issue #955). It force-removes
+	 * checkouts holding real work, so "nothing is using this" has to still be true at
+	 * the removal — which is why it *takes* the lease rather than reading it, and keeps
+	 * holding it across the removal. The runtime is a fake here rather than the mocked
+	 * store-backed one, because what is under test is which runtime operations the
+	 * manager performs, and in what order.
+	 */
+	describe('claimForSweep', () => {
+		function fakeRuntime(overrides: Partial<WorktreeRuntime> = {}) {
+			const order: string[] = [];
+			const runtime: WorktreeRuntime = {
+				claim: vi.fn(async () => {}),
+				tryClaim: vi.fn(async () => {
+					order.push('tryClaim');
+					return true;
+				}),
+				release: vi.fn(async () => {
+					order.push('release');
+				}),
+				read: vi.fn(async () => null),
+				takeOver: vi.fn(async () => true),
+				isLeased: vi.fn(async () => false),
+				hasLiveOwner: vi.fn(async () => false),
+				isResumablePinned: vi.fn(async () => false),
+				isCancellationRequested: vi.fn(async () => false),
+				preserve: vi.fn(async () => {}),
+				clearPreservation: vi.fn(async () => {}),
+				...overrides,
+			};
+			const manager = new GitWorktreeManager(
+				createMockProjectConfig({ id: 'project-1', repoRoot: REPO_ROOT }),
+				runtime,
+			);
+			return { manager, runtime, order };
+		}
+
+		it('claims the lease and hands back the token the removal must be released under', async () => {
+			const { manager, runtime } = fakeRuntime();
+
+			const claim = await manager.claimForSweep('14');
+
+			expect(claim.safe).toBe(true);
+			expect(runtime.tryClaim).toHaveBeenCalledWith(
+				'project-1',
+				'14',
+				claim.safe ? claim.token : undefined,
+			);
+			expect(runtime.release).not.toHaveBeenCalled();
+		});
+
+		it('blocks as live-leased when the lease has a live owner, and releases nothing', async () => {
+			const { manager, runtime } = fakeRuntime({
+				tryClaim: vi.fn(async () => false),
+				read: vi.fn(async () => 'someone-elses-token'),
+				hasLiveOwner: vi.fn(async () => true),
+			});
+
+			const claim = await manager.claimForSweep('14');
+
+			expect(claim).toMatchObject({ safe: false, reason: 'live-leased' });
+			expect(runtime.takeOver).not.toHaveBeenCalled();
+			// Never ours, so releasing it would be handing away someone else's lease.
+			expect(runtime.release).not.toHaveBeenCalled();
+		});
+
+		// Without the take-over an age-based sweep could never do its job: a checkout
+		// untouched for ten days is one whose lease lapsed nine and a half days ago.
+		it('takes over an orphaned lease, so a long-abandoned checkout is still sweepable', async () => {
+			const { manager, runtime } = fakeRuntime({
+				tryClaim: vi.fn(async () => false),
+				read: vi.fn(async () => 'orphan-token'),
+				hasLiveOwner: vi.fn(async () => false),
+			});
+
+			const claim = await manager.claimForSweep('14');
+
+			expect(claim.safe).toBe(true);
+			expect(runtime.takeOver).toHaveBeenCalledWith(
+				'project-1',
+				'14',
+				'orphan-token',
+				claim.safe ? claim.token : undefined,
+			);
+		});
+
+		// The race F1 named, at the moment it is decided: the provisioner got there
+		// first, so the sweep is told the checkout is live instead of deleting it.
+		it('blocks when another provisioner won the race for the same lease', async () => {
+			const { manager, runtime } = fakeRuntime({
+				tryClaim: vi.fn(async () => false),
+				read: vi.fn(async () => 'orphan-token'),
+				hasLiveOwner: vi.fn(async () => false),
+				takeOver: vi.fn(async () => false),
+			});
+
+			expect(await manager.claimForSweep('14')).toMatchObject({
+				safe: false,
+				reason: 'live-leased',
+			});
+			expect(runtime.release).not.toHaveBeenCalled();
+		});
+
+		it('gives the lease back when a resumable run pins the checkout', async () => {
+			const { manager, runtime } = fakeRuntime({
+				isResumablePinned: vi.fn(async () => true),
+			});
+
+			expect(await manager.claimForSweep('14')).toMatchObject({
+				safe: false,
+				reason: 'resumable-owner',
+			});
+			// Under our own token: a lease another provisioner has since taken over is
+			// not this sweep's to drop.
+			expect(runtime.release).toHaveBeenCalledWith('project-1', '14', expect.any(String));
+		});
+
+		it('honours an injected pin lookup, as the sweep passes one', async () => {
+			const { manager } = fakeRuntime();
+			const isResumablePinned = vi.fn(async () => true);
+
+			expect(await manager.claimForSweep('14', isResumablePinned)).toMatchObject({
+				safe: false,
+				reason: 'resumable-owner',
+			});
+			expect(isResumablePinned).toHaveBeenCalledWith('project-1', '14');
+		});
+
+		// The whole point of the split from `cleanup`: releasing first would hand the
+		// lease to a provisioner whose fresh checkout this removal would then destroy.
+		it('removeCheckoutUnderLease force-removes without releasing the lease', async () => {
+			const { manager, runtime, order } = fakeRuntime();
+			existingPaths.add(WORKTREE_14);
+			gitHandler = (args) => {
+				if (args[0] === 'worktree' && args[1] === 'remove') order.push('remove');
+				return { stdout: '' };
+			};
+
+			const claim = await manager.claimForSweep('14');
+			await manager.removeCheckoutUnderLease('14');
+			await manager.releaseSweepClaim('14', claim.safe ? claim.token : '');
+
+			expect(gitCalls).toContainEqual(['worktree', 'remove', '--force', WORKTREE_14]);
+			expect(order).toEqual(['tryClaim', 'remove', 'release']);
+			expect(runtime.clearPreservation).toHaveBeenCalledWith('project-1', '14');
+		});
+
+		it('removeCheckoutUnderLease is a no-op for a checkout already gone', async () => {
+			const { manager } = fakeRuntime();
+
+			await manager.removeCheckoutUnderLease('14');
+
+			expect(gitCalls).toHaveLength(0);
 		});
 	});
 

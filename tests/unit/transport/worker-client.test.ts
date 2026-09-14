@@ -45,6 +45,7 @@ const DISPATCH_ID = '44444444-4444-4444-8444-444444444444';
 const RUN_ID = '55555555-5555-4555-8555-555555555555';
 /** The self-update request the `worker-update` frames below name (issue #933). */
 const UPDATE_REQUEST_ID = '66666666-6666-4666-8666-666666666666';
+const SWEEP_REQUEST_ID = '77777777-7777-4777-8777-777777777777';
 const OTHER_DISPATCH_ID = '66666666-6666-4666-8666-666666666666';
 
 /** A recorded log line, so the abandonment/eviction levels can be asserted. */
@@ -1331,6 +1332,47 @@ describe('connectWorkerTransport (reconnect loop)', () => {
 		await flush();
 
 		expect(onUpdate).not.toHaveBeenCalled();
+		expect(sockets[0].closedWith).toBeUndefined();
+		await client.stop();
+	});
+
+	// Issue #955: the second frame that concerns the machine rather than a dispatch,
+	// handed no sink for the same reason.
+	it('hands a worktree-sweep frame to the registered onWorktreeSweep handler', async () => {
+		fetch.mockResolvedValueOnce(jsonResponse(200, handshakeResponseBody(4)));
+		const onWorktreeSweep = vi.fn();
+		const client = connectWorkerTransport(
+			{ ...options, capabilities: ['claude'], onWorktreeSweep },
+			overrides(),
+		);
+		await flush();
+		sockets[0].emitOpen();
+
+		const frame = {
+			type: 'worktree-sweep',
+			requestId: SWEEP_REQUEST_ID,
+			projects: [{ projectId: 'swarm', worktreeRoot: '.swarm-workspaces', abandonedAfterDays: 10 }],
+		};
+		sockets[0].emitMessage(frame);
+
+		expect(onWorktreeSweep).toHaveBeenCalledTimes(1);
+		expect(onWorktreeSweep).toHaveBeenCalledWith(frame);
+		await client.stop();
+	});
+
+	it('ignores a worktree-sweep when no handler is registered, keeping the session live', async () => {
+		fetch.mockResolvedValueOnce(jsonResponse(200, handshakeResponseBody(4)));
+		const client = connectWorkerTransport({ ...options, capabilities: ['claude'] }, overrides());
+		await flush();
+		sockets[0].emitOpen();
+
+		sockets[0].emitMessage({
+			type: 'worktree-sweep',
+			requestId: SWEEP_REQUEST_ID,
+			projects: [{ projectId: 'swarm', worktreeRoot: '.swarm-workspaces', abandonedAfterDays: 10 }],
+		});
+		await flush();
+
 		expect(sockets[0].closedWith).toBeUndefined();
 		await client.stop();
 	});

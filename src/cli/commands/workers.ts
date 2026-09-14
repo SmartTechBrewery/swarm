@@ -98,6 +98,7 @@
  *   swarm workers update --all <ref> [--wave <n>]
  *   swarm workers update --status
  *   swarm workers request-update <ref>
+ *   swarm workers sweep-worktrees <worker-id>
  *   swarm workers enroll <worker-id> <project-id> --cli <c1,c2,...> [--concurrency <n>] [--active] [--consent]
  *   swarm workers update-enrollment <worker-id> <project-id> [--cli <c1,c2,...>] [--concurrency <n>]
  *   swarm workers approve <worker-id> <project-id>
@@ -149,6 +150,7 @@ Usage:
   swarm workers update --all <ref> [--wave <n>]
   swarm workers update --status
   swarm workers request-update <ref>
+  swarm workers sweep-worktrees <worker-id>
   swarm workers enroll <worker-id> <project-id> --cli <c1,c2,...> [--concurrency <n>] [--active] [--consent]
   swarm workers update-enrollment <worker-id> <project-id> [--cli <c1,c2,...>] [--concurrency <n>]
   swarm workers approve <worker-id> <project-id>
@@ -283,6 +285,18 @@ Usage:
              last reported 'declined'. Every request records who made it, so
              'swarm workers update <worker-id> <ref>' is what an owner runs for
              their own machine and this is what an administrator runs for the fleet.
+  sweep-worktrees
+             Ask a machine to remove its own task-<id> checkouts that nothing has
+             touched for the project's abandonedAfterDays (10 by default), across
+             every project it is enrolled in — INCLUDING ones holding uncommitted
+             or unpushed work, which the ordinary retention sweep keeps forever. A
+             checkout something is still using is never removed at any age, so the
+             machine needs no draining and no run is disturbed. It prints what that
+             machine's LAST sweep removed — each path with its age and whether it
+             held uncommitted or unpushed work — and then asks for a new one, which
+             is also the moment that previous record is replaced: a machine keeps
+             only its most recent sweep. The new answer lands later and is printed
+             by the next run of this command. The machine's owner alone may do it.
   enroll     Enroll a worker into a project with allowed CLIs (--cli, a subset of
              the worker's capabilities) and --concurrency, this worker's share of
              the project. Omit --concurrency for 1 (the default): one of the
@@ -328,6 +342,7 @@ const SUBCOMMANDS = [
 	'undrain',
 	'update',
 	'request-update',
+	'sweep-worktrees',
 	'enroll',
 	'update-enrollment',
 	'approve',
@@ -441,6 +456,44 @@ const RequestedUpdateSchema = z.object({
 	displayName: z.string().min(1),
 	target: z.string().min(1),
 });
+
+/**
+ * `workers.requestWorktreeSweep` (issue #955) — the acknowledgement plus the sweep
+ * this request replaced, which is the only moment that previous record is still
+ * readable (a machine keeps one sweep).
+ *
+ * Optional and loosely typed on this file's own rule: an older control plane simply
+ * answers without `previousSweep`, and `status` is read as a plain string because it
+ * is printed rather than acted on.
+ */
+const RequestedWorktreeSweepSchema = z.object({
+	workerId: z.string().min(1),
+	displayName: z.string().min(1),
+	previousSweep: z
+		.object({
+			reportedAt: z.string().min(1),
+			status: z.string().min(1),
+			result: z.object({
+				removed: z.array(
+					z.object({
+						projectId: z.string().min(1),
+						taskId: z.string().min(1),
+						path: z.string().min(1),
+						ageDays: z.number(),
+						hadUncommittedChanges: z.boolean(),
+						hadUnpushedCommits: z.boolean(),
+					}),
+				),
+				removedCount: z.number(),
+				keptLiveCount: z.number(),
+				failedCount: z.number(),
+				message: z.string().min(1),
+			}),
+		})
+		.nullable()
+		.optional(),
+});
+type RequestedWorktreeSweep = z.infer<typeof RequestedWorktreeSweepSchema>;
 
 /**
  * `workers.requestUpdateForInstallation` (issue #922) — the installation-wide
@@ -1093,6 +1146,78 @@ async function updateWorkerCommand(argv: string[]): Promise<number> {
 		`  run 'swarm workers list' to read what it reported, then 'swarm workers undrain ${workerId}' to put it back in the pool`,
 	);
 	return 0;
+}
+
+/**
+ * `swarm workers sweep-worktrees <worker-id>` (issue #955): ask one machine to remove
+ * its own long-abandoned `task-<id>` checkouts, and print what its last sweep removed.
+ *
+ * Both halves in one command because the request is what destroys the previous
+ * record: a machine keeps only its most recent sweep, so the control plane answers
+ * the mutation with the one it is replacing. What is printed is therefore *last
+ * time's* outcome, and the sweep just asked for is read by the next run — the same
+ * "acknowledgement, not an outcome" shape `update` has, for the same reason (the
+ * machine may be offline, and the request waits on the row until it reconnects).
+ *
+ * The removed paths are printed individually rather than counted, because the count
+ * alone hides the fact this feature exists to make visible: a removal that destroyed
+ * uncommitted or unpushed work.
+ */
+async function sweepWorktreesCommand(argv: string[]): Promise<number> {
+	const { positionals } = parseArgs({ args: argv, allowPositionals: true });
+	const workerId = positionals[0];
+	if (!workerId) {
+		out.error('workers sweep-worktrees: a <worker-id> is required');
+		out.info(USAGE);
+		return 1;
+	}
+	if (!requireWorkerId(workerId)) return 1;
+
+	const operator = requireOperator();
+	if (!operator) return 1;
+
+	const requested = await operator.client.mutate(
+		'workers.requestWorktreeSweep',
+		{ workerId },
+		parseWith(RequestedWorktreeSweepSchema),
+	);
+	printLastSweep(requested);
+	out.info(
+		`asked worker '${requested.displayName}' (${workerId}) to sweep its abandoned worktrees`,
+	);
+	out.info(
+		'  it sweeps every project it is enrolled in, skipping any checkout still in use; run this command again to read what it removed',
+	);
+	return 0;
+}
+
+/** The previous sweep's own report, or one line saying there is none yet. */
+function printLastSweep(requested: RequestedWorktreeSweep): void {
+	const previous = requested.previousSweep;
+	if (!previous) {
+		out.info(`worker '${requested.displayName}' has no recorded sweep yet`);
+		return;
+	}
+	const { result } = previous;
+	out.info(
+		`last sweep (${previous.reportedAt}, ${previous.status}): removed ${result.removedCount}, kept ${result.keptLiveCount} still in use, ${result.failedCount} failed`,
+	);
+	for (const removal of result.removed) {
+		// The two flags are the whole point of the record — an age-based sweep removes
+		// work by design — so a removal that destroyed some says so on its own line.
+		const lost = [
+			removal.hadUncommittedChanges ? 'uncommitted changes' : undefined,
+			removal.hadUnpushedCommits ? 'unpushed commits' : undefined,
+		].filter((entry): entry is string => entry !== undefined);
+		const suffix = lost.length > 0 ? ` — held ${lost.join(' and ')}` : '';
+		out.info(
+			`  ${removal.path} (${removal.projectId}, ${Math.round(removal.ageDays)}d untouched)${suffix}`,
+		);
+	}
+	if (result.removedCount > result.removed.length) {
+		out.info(`  … and ${result.removedCount - result.removed.length} more not listed`);
+	}
+	if (result.failedCount > 0) out.info(`  ${result.message}`);
 }
 
 /**
@@ -2071,6 +2196,8 @@ export async function run(argv: string[]): Promise<number> {
 				return await updateWorkerCommand(rest);
 			case 'request-update':
 				return await requestUpdateForInstallationCommand(rest);
+			case 'sweep-worktrees':
+				return await sweepWorktreesCommand(rest);
 			case 'enroll':
 				return await enrollCommand(rest);
 			case 'update-enrollment':

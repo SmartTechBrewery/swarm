@@ -73,6 +73,26 @@ describe('host-local worktree runtime', () => {
 		expect(await second.read('swarm', '535')).toBe('token-b');
 	});
 
+	// The abandoned sweep takes this same lease before it force-removes a checkout
+	// (issue #955 review F1), and it runs inside the daemon — so the lease it writes
+	// carries this process's own pid and is resolved through `isOwnerLive` rather than
+	// a pid check. That is why the daemon registers the sweep in its in-flight set for
+	// the duration: unregistered, its lease is an orphan a dispatch takes over while
+	// the removal is still running.
+	it('protects a sweep holding a lease only while the sweep is registered live', async () => {
+		const live = new Set(['dispatch-a']);
+		const sweep = runtime('worktree-sweep:1234', live);
+		const provisioner = runtime('dispatch-a', live);
+
+		expect(await sweep.tryClaim('swarm', '955', 'sweep-token')).toBe(true);
+		expect(await provisioner.tryClaim('swarm', '955', 'token-a')).toBe(false);
+		expect(await provisioner.hasLiveOwner('swarm', '955')).toBe(false);
+
+		live.add('worktree-sweep:1234');
+		expect(await provisioner.hasLiveOwner('swarm', '955')).toBe(true);
+		expect(await provisioner.tryClaim('swarm', '955', 'token-a')).toBe(false);
+	});
+
 	it('pins a preserved checkout against other runs while allowing its own retry', async () => {
 		const live = new Set(['dispatch-a']);
 		const first = runtime('dispatch-a', live, 'run-a');

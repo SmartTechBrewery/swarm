@@ -33,6 +33,7 @@ import { registerWorkerDelivery } from './worker-delivery.js';
 import { startRolloutAdvanceTicker } from './worker-rollout-advance.js';
 import { registerWorkerTransport } from './worker-transport.js';
 import { subscribeWorkerUpdateDispatch } from './worker-update-dispatch.js';
+import { subscribeWorktreeSweepDispatch } from './worktree-sweep-dispatch.js';
 
 // Tag every line this process emits so router and worker logs stay
 // distinguishable in a shared stream (ai/ARCHITECTURE.md "Observability").
@@ -79,6 +80,11 @@ injectWebSocket(server);
 // *machine* rather than any dispatch — a router serving sockets must deliver it
 // whatever the consumer is doing.
 const workerUpdates = subscribeWorkerUpdateDispatch();
+
+// The same bridge for the abandoned-worktree sweep (issue #955), subscribed beside
+// it for the same reason: a sweep concerns the *machine* rather than any dispatch,
+// and only this process can push the frame to it.
+const worktreeSweeps = subscribeWorktreeSweepDispatch();
 
 // Keep a staged fleet update moving with nobody watching (issue #941). The report
 // route and the socket-open hook cover every move a machine announces; this timer
@@ -138,6 +144,11 @@ for (const signal of ['SIGTERM', 'SIGINT'] as const) {
 					await workerUpdates.close();
 				} catch (err) {
 					logger.error('Worker-update subscriber close failed', { error: describeError(err) });
+				}
+				try {
+					await worktreeSweeps.close();
+				} catch (err) {
+					logger.error('Worktree-sweep subscriber close failed', { error: describeError(err) });
 				}
 				try {
 					await closeQueue();

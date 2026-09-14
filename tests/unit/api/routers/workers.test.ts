@@ -62,6 +62,7 @@ const {
 	registerWorker,
 	renameWorker,
 	requestWorkerUpdate,
+	requestWorktreeSweep,
 	setWorkerDraining,
 } = vi.hoisted(() => ({
 	declareWorkerCapabilities: vi.fn(),
@@ -74,11 +75,18 @@ const {
 	registerWorker: vi.fn(),
 	renameWorker: vi.fn(),
 	requestWorkerUpdate: vi.fn(),
+	// Issue #955 — the sweep twin of the request above, and the one with no draining
+	// precondition to enforce.
+	requestWorktreeSweep: vi.fn(),
 	setWorkerDraining: vi.fn(),
 }));
 // Issue #933 — the API server publishes; only the router holds worker sockets.
 const { publishWorkerUpdateRequest } = vi.hoisted(() => ({
 	publishWorkerUpdateRequest: vi.fn(),
+}));
+// Issue #955 — the same split for the sweep, on its own channel.
+const { publishWorktreeSweepRequest } = vi.hoisted(() => ({
+	publishWorktreeSweepRequest: vi.fn(),
 }));
 // Issue #921 — the fan-out is its own module with its own suite
 // (`tests/unit/api/worker-update-fanout.test.ts`); what this suite owns is the
@@ -140,9 +148,11 @@ vi.mock('@/identity/worker-service.js', () => ({
 	registerWorker,
 	renameWorker,
 	requestWorkerUpdate,
+	requestWorktreeSweep,
 	setWorkerDraining,
 }));
 vi.mock('@/queue/worker-updates.js', () => ({ publishWorkerUpdateRequest }));
+vi.mock('@/queue/worker-sweeps.js', () => ({ publishWorktreeSweepRequest }));
 vi.mock('@/api/worker-update-fanout.js', () => ({ fanOutWorkerUpdate }));
 vi.mock('@/api/worker-update-rollout.js', () => ({ getRolloutForOwner, startRollout }));
 vi.mock('@/db/repositories/workersRepository.js', () => ({ removeWorker }));
@@ -210,6 +220,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		drainingSince: null,
 		// Nobody has asked this machine to update (issue #933).
 		update: null,
+		worktreeSweep: null,
 		build: null,
 		createdAt: new Date(0),
 		updatedAt: new Date(0),
@@ -262,12 +273,14 @@ beforeEach(() => {
 		registerWorker,
 		renameWorker,
 		requestWorkerUpdate,
+		requestWorktreeSweep,
 		setWorkerDraining,
 		listWorkersForOwner,
 		fanOutWorkerUpdate,
 		startRollout,
 		getRolloutForOwner,
 		publishWorkerUpdateRequest,
+		publishWorktreeSweepRequest,
 		removeWorker,
 		getMembership,
 		listAccessibleProjectIds,
@@ -1687,6 +1700,144 @@ describe('workers.requestUpdate (owner-only, draining-only, issue #933)', () => 
 			'v2',
 			OWNER_ID,
 		);
+	});
+});
+
+// Issue #955. The per-machine worktree sweep: the same owner-only rule as the update
+// request, and deliberately none of its draining precondition.
+describe('workers.requestWorktreeSweep (owner-only, no drain, issue #955)', () => {
+	const REQUESTED_AT = new Date('2026-09-14T09:00:00Z');
+	const REPORTED_AT = new Date('2026-09-07T09:05:00Z');
+
+	/** The sweep a machine last reported — the record asking again destroys. */
+	function lastSweep(): Worker['worktreeSweep'] {
+		return {
+			requestId: null,
+			requestedAt: new Date('2026-09-07T09:00:00Z'),
+			status: 'swept',
+			reportedAt: REPORTED_AT,
+			result: {
+				removed: [
+					{
+						projectId: 'swarm',
+						taskId: '900',
+						path: '/home/ada/swarm/.swarm-workspaces/task-900',
+						lastTouchedAt: '2026-08-20T09:00:00.000Z',
+						ageDays: 18,
+						hadUncommittedChanges: true,
+						hadUnpushedCommits: false,
+					},
+				],
+				removedCount: 1,
+				keptLiveCount: 0,
+				failedCount: 0,
+				message: 'Swept 1 project(s): removed 1 abandoned checkout(s), kept 0 still in use.',
+			},
+		};
+	}
+
+	/** The row after the write: the request pending, the previous outcome cleared. */
+	function requested(): Worker {
+		return makeWorker({
+			worktreeSweep: {
+				requestId: '77777777-7777-4777-8777-777777777777',
+				requestedAt: REQUESTED_AT,
+				status: null,
+				reportedAt: null,
+				result: null,
+			},
+		});
+	}
+
+	it('is NOT_FOUND for an unknown worker', async () => {
+		getWorker.mockResolvedValue(undefined);
+
+		await expect(owner.requestWorktreeSweep({ workerId: WORKER_ID })).rejects.toThrowError(
+			expect.objectContaining({ code: 'NOT_FOUND' }),
+		);
+		expect(requestWorktreeSweep).not.toHaveBeenCalled();
+	});
+
+	it('hides a worker the caller does not own (NOT_FOUND)', async () => {
+		getWorker.mockResolvedValue(makeWorker({ ownerUserId: OTHER_ID }));
+
+		await expect(owner.requestWorktreeSweep({ workerId: WORKER_ID })).rejects.toThrowError(
+			expect.objectContaining({ code: 'NOT_FOUND' }),
+		);
+		expect(requestWorktreeSweep).not.toHaveBeenCalled();
+	});
+
+	// Strictly the machine owner's, exactly like `requestUpdate`: an administrator
+	// gets the same NOT_FOUND a stranger does.
+	it('admits no instanceAdmin override', async () => {
+		const admin = workersRouter.createCaller({ user: ADMIN_USER });
+		getWorker.mockResolvedValue(makeWorker());
+
+		await expect(admin.requestWorktreeSweep({ workerId: WORKER_ID })).rejects.toThrowError(
+			expect.objectContaining({ code: 'NOT_FOUND' }),
+		);
+		expect(requestWorktreeSweep).not.toHaveBeenCalled();
+	});
+
+	// The deviation from `requestUpdate` that matters: a sweep disturbs no in-flight
+	// run, so a machine in the pool is asked rather than refused.
+	it('asks a machine that is still in the dispatch pool', async () => {
+		getWorker.mockResolvedValue(makeWorker({ drainingSince: null }));
+		requestWorktreeSweep.mockResolvedValue(requested());
+
+		const result = await owner.requestWorktreeSweep({ workerId: WORKER_ID });
+
+		expect(requestWorktreeSweep).toHaveBeenCalledWith(WORKER_ID, expect.any(String));
+		expect(publishWorktreeSweepRequest).toHaveBeenCalledWith(WORKER_ID);
+		expect(result).toMatchObject({
+			workerId: WORKER_ID,
+			requestedAt: REQUESTED_AT.toISOString(),
+		});
+	});
+
+	// The id the row waits on is the id the push carries, so the report can only ever
+	// close the request it actually answers.
+	it('mints the request id server-side and answers with it', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		requestWorktreeSweep.mockResolvedValue(requested());
+
+		const result = await owner.requestWorktreeSweep({ workerId: WORKER_ID });
+
+		expect(result.requestId).toBe(requestWorktreeSweep.mock.calls[0]?.[1]);
+	});
+
+	// The write is what destroys the previous sweep, so the answer carries it: this is
+	// the last moment that record is readable.
+	it('answers with the sweep this request replaces', async () => {
+		getWorker.mockResolvedValue(makeWorker({ worktreeSweep: lastSweep() }));
+		requestWorktreeSweep.mockResolvedValue(requested());
+
+		const result = await owner.requestWorktreeSweep({ workerId: WORKER_ID });
+
+		expect(result.previousSweep).toMatchObject({
+			reportedAt: REPORTED_AT.toISOString(),
+			status: 'swept',
+			result: { removedCount: 1 },
+		});
+	});
+
+	it('answers with no previous sweep for a machine that has never been asked', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		requestWorktreeSweep.mockResolvedValue(requested());
+
+		const result = await owner.requestWorktreeSweep({ workerId: WORKER_ID });
+
+		expect(result.previousSweep).toBeNull();
+	});
+
+	it('is NOT_FOUND when the worker disappears between the check and the write', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		requestWorktreeSweep.mockResolvedValue(undefined);
+
+		await expect(owner.requestWorktreeSweep({ workerId: WORKER_ID })).rejects.toThrowError(
+			expect.objectContaining({ code: 'NOT_FOUND' }),
+		);
+		expect(publishWorktreeSweepRequest).not.toHaveBeenCalled();
 	});
 });
 
