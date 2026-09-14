@@ -19,6 +19,14 @@ vi.mock('@/db/repositories/runsRepository.js', () => ({
 		updateReviewMergeOutcome(runId, input),
 }));
 
+// The board work a merged pull request triggers (issue #959). Mocked here so this
+// suite keeps knowing only the DB and the merge capability, exactly as the module
+// under test does — the settle's own guards are asserted in its own suite.
+const settleAbsorbedChildren = vi.fn(async (_input: unknown): Promise<string[]> => []);
+vi.mock('@/dispatch/absorbed-child-settle.js', () => ({
+	settleAbsorbedChildren: (input: unknown) => settleAbsorbedChildren(input),
+}));
+
 const createAndPublishDispatch = vi.fn(async (_input: unknown) => ({
 	dispatch: mockDispatchRow(),
 	created: true,
@@ -123,6 +131,8 @@ beforeEach(() => {
 	claimReviewDispatch.mockClear();
 	claimReviewDispatch.mockResolvedValue(true);
 	refreshReviewDispatchClaim.mockClear();
+	settleAbsorbedChildren.mockClear();
+	settleAbsorbedChildren.mockResolvedValue([]);
 });
 
 /** The stale-base answer the merge capability gives for a head behind its base. */
@@ -859,5 +869,56 @@ describe('processMergeAutomationDispatch: a stale approved head', () => {
 
 		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-unsupported');
 		expect(outcome.result).toBe('unsupported');
+	});
+});
+
+describe('processMergeAutomationDispatch: settling what the merge absorbed', () => {
+	it('settles the declared split siblings once, after the dispatch completes', async () => {
+		settleAbsorbedChildren.mockResolvedValue(['#947']);
+
+		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning({ status: 'merged', message: 'merged', sha: 'abc' }),
+		});
+
+		expect(settleAbsorbedChildren).toHaveBeenCalledExactlyOnceWith({
+			project,
+			dispatchId: 'dispatch-1',
+			reviewRunId: 'run-1',
+			repository: project.repo,
+			prNumber: '17',
+		});
+		// The merge is the fact the settle is licensed by, so it can never run first.
+		expect(settleAbsorbedChildren.mock.invocationCallOrder[0]).toBeGreaterThan(
+			completeDispatch.mock.invocationCallOrder[0] as number,
+		);
+		expect(outcome.result).toBe('merged');
+	});
+
+	it.each([
+		['not-ready', { status: 'not-ready', message: 'checks pending' }],
+		['not-eligible', { status: 'not-eligible', message: 'head moved' }],
+		['provider-error', { status: 'provider-error', message: '502' }],
+	] as [string, MergePullRequestOutcome][])('settles nothing on a %s outcome', async (_l, o) => {
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning(o),
+		});
+
+		expect(settleAbsorbedChildren).not.toHaveBeenCalled();
+	});
+
+	// The merge has happened and cannot be undone by a board error.
+	it('still reports the merge when the settle throws', async () => {
+		settleAbsorbedChildren.mockRejectedValue(new Error('board unreachable'));
+
+		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning({ status: 'merged', message: 'merged', sha: 'abc' }),
+		});
+
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merged');
+		expect(outcome).toEqual({
+			status: 'merge-automation-settled',
+			result: 'merged',
+			prNumber: '17',
+		});
 	});
 });

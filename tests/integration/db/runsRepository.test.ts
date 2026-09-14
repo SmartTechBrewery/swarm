@@ -23,6 +23,7 @@ import {
 	getLatestCompletedPlanningScope,
 	getLatestRunForTask,
 	getPendingReviewMergeFollowUps,
+	getReviewAbsorbedForPullRequest,
 	getRunByIdFromDb,
 	getRunLogsFromDb,
 	getRunOutputEvents,
@@ -1352,6 +1353,87 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 				independentConcerns: ['worker change', 'dashboard change'],
 			});
 			expect(await getLatestCompletedPlanningScope(PROJECT_ID, 'missing')).toBeUndefined();
+		});
+	});
+
+	describe('getReviewAbsorbedForPullRequest (issue #959)', () => {
+		const absorbed = (reference: string, evidence: string) => [
+			{ url: `https://github.com/${REPO}/issues/${reference.slice(1)}`, reference, evidence },
+		];
+
+		/** A completed Review run for `prNumber` carrying `reviewAbsorbed`. */
+		async function reviewRun(
+			prNumber: string,
+			entries: { url: string; reference: string; evidence: string }[],
+			overrides: {
+				repository?: string;
+				phase?: 'review' | 'implementation';
+				status?: 'completed' | 'failed';
+			} = {},
+		): Promise<string> {
+			const id = await createRun({
+				projectId: PROJECT_ID,
+				repository: overrides.repository ?? REPO,
+				taskId: 'absorbed',
+				phase: overrides.phase ?? 'review',
+				prNumber,
+			});
+			await completeRun(id, { status: overrides.status ?? 'completed', reviewAbsorbed: entries });
+			return id;
+		}
+
+		it('merges the declarations of every completed Review run for the pull request, newest first', async () => {
+			// The fold-in that matters is routinely one a `request-changes` pass made:
+			// the scoped re-review that follows never restates it.
+			const earlier = await reviewRun('42', [
+				...absorbed('#947', 'first pass evidence'),
+				...absorbed('#948', 'only this pass named it'),
+			]);
+			const later = await reviewRun('42', absorbed('#947', 'approving pass evidence'));
+			await getDb()
+				.update(runs)
+				.set({ completedAt: new Date('2026-01-01T00:00:00.000Z') })
+				.where(eq(runs.id, earlier));
+			await getDb()
+				.update(runs)
+				.set({ completedAt: new Date('2026-01-02T00:00:00.000Z') })
+				.where(eq(runs.id, later));
+
+			expect(await getReviewAbsorbedForPullRequest(PROJECT_ID, REPO, '42')).toEqual([
+				{
+					url: `https://github.com/${REPO}/issues/947`,
+					reference: '#947',
+					evidence: 'approving pass evidence',
+				},
+				{
+					url: `https://github.com/${REPO}/issues/948`,
+					reference: '#948',
+					evidence: 'only this pass named it',
+				},
+			]);
+		});
+
+		it('ignores non-review, non-completed, other-PR and other-repository rows', async () => {
+			await reviewRun('42', absorbed('#947', 'wrong phase'), { phase: 'implementation' });
+			await reviewRun('42', absorbed('#947', 'not completed'), { status: 'failed' });
+			await reviewRun('43', absorbed('#947', 'another pull request'));
+			await reviewRun('42', absorbed('#947', 'another repository'), {
+				repository: 'jkwiecien/other-repo',
+			});
+
+			expect(await getReviewAbsorbedForPullRequest(PROJECT_ID, REPO, '42')).toEqual([]);
+		});
+
+		it('is empty for a pull request whose reviews declared nothing', async () => {
+			const id = await createRun({
+				projectId: PROJECT_ID,
+				taskId: 'absorbed',
+				phase: 'review',
+				prNumber: '44',
+			});
+			await completeRun(id, { status: 'completed' });
+
+			expect(await getReviewAbsorbedForPullRequest(PROJECT_ID, REPO, '44')).toEqual([]);
 		});
 	});
 

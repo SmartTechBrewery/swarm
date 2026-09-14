@@ -47,6 +47,12 @@
  *    refused rather than merged on stale evidence;
  *  - the head the update produces pre-claims its own PR+SHA review-dispatch slot
  *    so re-verification costs no `REVIEW_VERDICT_CAP` slot.
+ *
+ * **A `merged` outcome also settles what the merge absorbed (issue #959).** When
+ * this pull request's Review runs declared they traced a split sibling's whole
+ * scope through its diff, that sibling is closed as part of the same merge —
+ * `src/dispatch/absorbed-child-settle.ts` owns the decision and every guard on
+ * it; this module only tells it a merge happened.
  */
 
 import type { ProjectConfig } from '../config/schema.js';
@@ -57,6 +63,7 @@ import {
 	scheduleDispatchRetry,
 } from '../db/repositories/dispatchesRepository.js';
 import { updateReviewMergeOutcome } from '../db/repositories/runsRepository.js';
+import { settleAbsorbedChildren } from '../dispatch/absorbed-child-settle.js';
 import { createAndPublishDispatch, publishDispatchWakeUp } from '../dispatch/dispatcher.js';
 import { requireProjectSCMProvider } from '../integrations/scm/registry.js';
 import { describeError } from '../lib/errors.js';
@@ -766,6 +773,41 @@ async function attemptMerge(
 }
 
 /**
+ * Settle the split siblings this pull request's Review runs declared it absorbed
+ * (issue #959) — the only board work a merge dispatch does, and the reason it is
+ * delegated rather than inlined: this module deliberately knows the DB and the
+ * SCM merge capability, not a PM provider.
+ *
+ * Runs after `completeDispatch`, never before: the merge is the fact the settle
+ * is licensed by, and the dispatch's own outcome must not depend on it. Wrapped
+ * even though {@link settleAbsorbedChildren} already fails open, because the
+ * guarantee being kept here is this executor's — a merge that has happened is
+ * never reported as anything else on account of a board error.
+ */
+async function settleChildrenThisMergeAbsorbed(
+	dispatch: DispatchRow,
+	job: MergeAutomationJob,
+	project: ProjectConfig,
+): Promise<void> {
+	try {
+		await settleAbsorbedChildren({
+			project,
+			dispatchId: dispatch.id,
+			reviewRunId: job.reviewRunId,
+			repository: job.repo,
+			prNumber: job.prNumber,
+		});
+	} catch (err) {
+		logger.error('Merge automation: settling the absorbed split siblings failed', {
+			dispatchId: dispatch.id,
+			runId: job.reviewRunId,
+			prNumber: job.prNumber,
+			error: describeError(err),
+		});
+	}
+}
+
+/**
  * Execute one claimed merge-automation dispatch: invoke the provider-neutral
  * merge capability (fresh PR state and approval re-checked from scratch),
  * persist the outcome on the originating Review run, and settle the dispatch —
@@ -850,6 +892,7 @@ export async function processMergeAutomationDispatch(
 			attempt,
 		});
 		await completeDispatch(dispatch.id, 'merged');
+		await settleChildrenThisMergeAbsorbed(dispatch, job, project);
 		return { status: 'merge-automation-settled', result: 'merged', prNumber: job.prNumber };
 	}
 
