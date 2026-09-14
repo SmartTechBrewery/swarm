@@ -46,24 +46,39 @@ describe('routabilityBlockers (issue #477)', () => {
 	});
 });
 
-describe('repositoryMismatch (issue #690)', () => {
+describe('repositoryMismatch (issue #690, widened by #946)', () => {
 	it('returns the two repositories that disagree', () => {
-		expect(repositoryMismatch('acme/frontend', 'acme/backend')).toEqual({
+		expect(repositoryMismatch('acme/frontend', ['acme/backend'])).toEqual({
 			declaredRepository: 'acme/frontend',
-			projectRepository: 'acme/backend',
+			projectRepositories: ['acme/backend'],
 		});
 	});
 
 	it('is null when the machine’s checkout is the project’s repository', () => {
-		expect(repositoryMismatch('acme/frontend', 'acme/frontend')).toBeNull();
+		expect(repositoryMismatch('acme/frontend', ['acme/frontend'])).toBeNull();
+	});
+
+	// The case issue #946 made reachable: one worker per repository, several per
+	// project — a machine on the project's *second* repository is correctly enrolled.
+	it('is null when the project declares the machine’s checkout anywhere in its list', () => {
+		expect(repositoryMismatch('acme/frontend', ['acme/backend', 'acme/frontend'])).toBeNull();
+	});
+
+	// So an operator can tell a typo from a repository the project simply does not own.
+	it('names every repository the project declares when none of them matches', () => {
+		expect(repositoryMismatch('acme/docs', ['acme/backend', 'acme/frontend'])).toEqual({
+			declaredRepository: 'acme/docs',
+			projectRepositories: ['acme/backend', 'acme/frontend'],
+		});
 	});
 
 	// Unknown is not wrong: a machine that declared nothing must not read as one that
-	// declared the wrong thing — the rule the server's own checks apply.
+	// declared the wrong thing — the rule the server's own checks apply. An empty list
+	// is the same kind of unknown: the project no longer resolves.
 	it('is null when either side is unknown', () => {
-		expect(repositoryMismatch(null, 'acme/backend')).toBeNull();
-		expect(repositoryMismatch('acme/frontend', null)).toBeNull();
-		expect(repositoryMismatch(null, null)).toBeNull();
+		expect(repositoryMismatch(null, ['acme/backend'])).toBeNull();
+		expect(repositoryMismatch('acme/frontend', [])).toBeNull();
+		expect(repositoryMismatch(null, [])).toBeNull();
 	});
 });
 

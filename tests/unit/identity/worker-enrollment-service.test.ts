@@ -25,8 +25,7 @@ const { getWorkerById, listAllWorkers, listWorkersForOwner } = vi.hoisted(() => 
 	listWorkersForOwner: vi.fn(),
 }));
 const { getUserById } = vi.hoisted(() => ({ getUserById: vi.fn() }));
-const { findProjectByIdFromDb, findProjectRecordByIdFromDb } = vi.hoisted(() => ({
-	findProjectByIdFromDb: vi.fn(),
+const { findProjectRecordByIdFromDb } = vi.hoisted(() => ({
 	findProjectRecordByIdFromDb: vi.fn(),
 }));
 const { getRunByIdFromDb } = vi.hoisted(() => ({ getRunByIdFromDb: vi.fn() }));
@@ -60,7 +59,6 @@ vi.mock('@/db/repositories/workersRepository.js', () => ({
 }));
 vi.mock('@/db/repositories/usersRepository.js', () => ({ getUserById }));
 vi.mock('@/db/repositories/projectsRepository.js', () => ({
-	findProjectByIdFromDb,
 	findProjectRecordByIdFromDb,
 }));
 vi.mock('@/db/repositories/runsRepository.js', () => ({ getRunByIdFromDb }));
@@ -164,18 +162,11 @@ function makeEnrollment(overrides: Partial<WorkerEnrollment> = {}): WorkerEnroll
 }
 
 /**
- * A project as `findProjectByIdFromDb` answers it — scoped to its default repository.
- * Only `repo` is set, because that is the only field the detail assembler reads from
- * a project; a whole `ProjectConfig` fixture would hide how narrow the coupling is.
- */
-function makeProject(repo = 'SmartTechBrewery/swarm') {
-	return { id: 'proj-a', repo };
-}
-
-/**
  * A project **record** as `findProjectRecordByIdFromDb` answers it — the un-scoped
- * row the two repository checks read (issue #946), so entries 1..n are visible.
- * Only `id` and `repositories` are set, for the same reason `makeProject` is narrow.
+ * row the two repository checks and the detail assembler read (issue #946), so
+ * entries 1..n are visible. Only `id` and `repositories` are set, because those are
+ * the only fields any of them touch; a whole `ProjectConfig` fixture would hide how
+ * narrow the coupling is.
  */
 function makeProjectRecord(...repos: string[]) {
 	const declared = repos.length > 0 ? repos : ['SmartTechBrewery/swarm'];
@@ -201,7 +192,6 @@ beforeEach(() => {
 		getActiveWorkerClaims,
 		getLiveSessionForWorker,
 		getRetainedSessionForWorker,
-		findProjectByIdFromDb,
 		findProjectRecordByIdFromDb,
 		resolveOwnBuildIdentity,
 	]) {
@@ -214,8 +204,7 @@ beforeEach(() => {
 	resolveOwnBuildIdentity.mockResolvedValue(undefined);
 	// Every project resolves to the repository the default worker declares nothing
 	// about, so the repository check (issue #690) is inert unless a test opts in.
-	// The scoped read serves `assembleEnrollmentDetail`, the record read the two checks.
-	findProjectByIdFromDb.mockResolvedValue(makeProject());
+	// The same record read serves the two checks and `assembleEnrollmentDetail`.
 	findProjectRecordByIdFromDb.mockResolvedValue(makeProjectRecord());
 });
 
@@ -1520,9 +1509,9 @@ describe('getDashboardWorkerDetail (issue #477)', () => {
 				concurrencyAllocation: 2,
 				sharingConsent: true,
 				isRoutable: true,
-				// Normalised, so the screen can compare it with the worker's own declaration
-				// by plain equality — the same comparison the write path makes (issue #690).
-				projectRepo: 'smarttechbrewery/swarm',
+				// Normalised, so the screen can compare the worker's own declaration against
+				// this list by plain equality — the comparison the write path makes (#690).
+				projectRepos: ['smarttechbrewery/swarm'],
 			},
 		]);
 		// The roster row's own fields come along unchanged, so the detail view needs
@@ -1532,6 +1521,37 @@ describe('getDashboardWorkerDetail (issue #477)', () => {
 		expect(detail?.capabilities).toEqual(['claude', 'codex']);
 		expect(detail?.supportedPhases.length).toBeGreaterThan(0);
 		expect(detail?.ownerUserId).toBe(OWNER_ID);
+	});
+
+	// Issue #946 — the roster phase 1 unlocked: one worker per repository, several per
+	// project. The detail read model must carry the whole list, or the screen would tell
+	// a correctly enrolled worker on the project's *second* repository that it cannot
+	// run the project's work.
+	it('carries every repository the project declares, not just its default entry', async () => {
+		getWorkerById.mockResolvedValue(makeWorker({ repository: 'acme/frontend' }));
+		listEnrollmentsForWorker.mockResolvedValue([makeEnrollment()]);
+		findProjectRecordByIdFromDb.mockResolvedValue(
+			makeProjectRecord('acme/backend', 'Acme/Frontend.git'),
+		);
+
+		const detail = await getDashboardWorkerDetail(WORKER_ID, null);
+
+		// Normalised on both sides, so the worker's declaration is a member of this list
+		// by plain equality — no mismatch for the screen to report.
+		expect(detail?.enrollments[0]?.projectRepos).toEqual(['acme/backend', 'acme/frontend']);
+		expect(detail?.enrollments[0]?.projectRepos).toContain(detail?.repository);
+	});
+
+	// The honest successor to the old `null`: nothing to disagree with, so the screen
+	// renders no banner — the same outcome as before, in the list's own terms.
+	it('carries an empty list when the project no longer resolves', async () => {
+		getWorkerById.mockResolvedValue(makeWorker());
+		listEnrollmentsForWorker.mockResolvedValue([makeEnrollment()]);
+		findProjectRecordByIdFromDb.mockResolvedValue(undefined);
+
+		const detail = await getDashboardWorkerDetail(WORKER_ID, null);
+
+		expect(detail?.enrollments[0]?.projectRepos).toEqual([]);
 	});
 
 	// Issue #925: the detail view is also the one read model naming the *comparand* —

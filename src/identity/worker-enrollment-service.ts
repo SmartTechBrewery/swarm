@@ -68,10 +68,7 @@ import {
 	getActiveWorkerClaims,
 	getWorkerDispatchClaimState,
 } from '../db/repositories/dispatchesRepository.js';
-import {
-	findProjectByIdFromDb,
-	findProjectRecordByIdFromDb,
-} from '../db/repositories/projectsRepository.js';
+import { findProjectRecordByIdFromDb } from '../db/repositories/projectsRepository.js';
 import { getRunByIdFromDb } from '../db/repositories/runsRepository.js';
 import { getUserById } from '../db/repositories/usersRepository.js';
 import {
@@ -480,7 +477,7 @@ export interface DashboardWorkerView {
 	 * shared normalised `owner/repo` form, or `null` when it declared none. Read by
 	 * the Workers screen as one half of the reason a mismatched enrollment was
 	 * refused or suspended (issue #690) — the other half being each enrollment's own
-	 * `projectRepo` below.
+	 * `projectRepos` below.
 	 *
 	 * Non-secret and named explicitly, like every other field here: a repository slug
 	 * is not the machine's path (`SWARM_WORKER_REPO_ROOT` stays host-local and never
@@ -562,17 +559,25 @@ export interface DashboardWorkerEnrollmentDetail {
 	sharingConsent: boolean;
 	isRoutable: boolean;
 	/**
-	 * This enrollment's project repository (issue #690), in the **same normalised
-	 * form** as the surrounding view's `repository`, so comparing the two on the
-	 * screen is the same comparison the write path makes (`repoSlugsMatch`) — the
-	 * dashboard deliberately does not import `../scm/repo-slug.ts`, whose slug reader
-	 * spawns `git`. `null` only when the project no longer resolves.
+	 * **Every** repository this enrollment's project declares (issue #690, widened
+	 * by #946 from its default entry alone), in the **same normalised form** as the
+	 * surrounding view's `repository`, so the comparison the screen makes —
+	 * membership in this list, by plain equality — is the comparison the write path
+	 * makes (`repoSlugsMatch`); the dashboard deliberately does not import
+	 * `../scm/repo-slug.ts`, whose slug reader spawns `git`.
 	 *
-	 * The reason for a mismatched enrollment is these two live facts rather than a
+	 * A list rather than the default entry because a project may hold one worker per
+	 * repository: a machine checked out from the project's *second* repository is
+	 * correctly enrolled, and comparing it against the default alone would tell its
+	 * operator work cannot run there when it can. `[]` when the project no longer
+	 * resolves — the same "no answer" the previous `null` carried, and the value
+	 * that makes "no project" and "declares it nowhere we can see" read alike.
+	 *
+	 * The reason for a mismatched enrollment is these live facts rather than a
 	 * sentence stored when it was refused or suspended: repositories change, and a
-	 * stored sentence would go stale where the pair cannot.
+	 * stored sentence would go stale where the facts cannot.
 	 */
-	projectRepo: string | null;
+	projectRepos: string[];
 }
 
 /**
@@ -750,13 +755,19 @@ export async function getDashboardWorkerDetail(
 
 /**
  * Assemble one detail-view enrollment by naming each safe field explicitly. The
- * project is read for its repository alone (issue #690) — the enrollment's own
+ * project is read for its repositories alone (issue #690) — the enrollment's own
  * fields are never taken from it.
+ *
+ * Reads the project **record** (`findProjectRecordByIdFromDb`) for the same reason
+ * {@link assertProjectIsWorkersRepository} does (issue #946): `findProjectByIdFromDb`
+ * narrows to the project's default repository, so entries 1..n would be invisible
+ * here and a worker legitimately holding one of them would be shown a mismatch it
+ * does not have.
  */
 async function assembleEnrollmentDetail(
 	enrollment: WorkerEnrollment,
 ): Promise<DashboardWorkerEnrollmentDetail> {
-	const project = await findProjectByIdFromDb(enrollment.projectId);
+	const project = await findProjectRecordByIdFromDb(enrollment.projectId);
 	return {
 		enrollmentId: enrollment.id,
 		projectId: enrollment.projectId,
@@ -766,7 +777,7 @@ async function assembleEnrollmentDetail(
 		concurrencyAllocation: enrollment.concurrencyAllocation,
 		sharingConsent: enrollment.sharingConsent,
 		isRoutable: isRoutable(enrollment),
-		projectRepo: project ? normalizeRepoSlug(project.repo) : null,
+		projectRepos: project ? projectRepositorySlugs(project) : [],
 	};
 }
 
@@ -951,7 +962,11 @@ function projectDeclaresRepository(record: ProjectRecord, declared: string): boo
 	return record.repositories.some((entry) => repoSlugsMatch(entry.repo, declared));
 }
 
-/** The project's repositories, normalised — the project's half of a mismatch report. */
+/**
+ * The project's repositories, normalised — the project's half of a mismatch
+ * report, and of the detail read model's `projectRepos`
+ * ({@link assembleEnrollmentDetail}).
+ */
 function projectRepositorySlugs(record: ProjectRecord): string[] {
 	return record.repositories.map((entry) => normalizeRepoSlug(entry.repo));
 }

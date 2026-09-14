@@ -86,7 +86,7 @@ export interface WorkerRow {
 	 * a daemon on a build that predates the field, or a checkout with no readable
 	 * `origin`. Not a path: `SWARM_WORKER_REPO_ROOT` stays on the machine.
 	 *
-	 * Read against an enrollment's own `projectRepo` to explain a refused or
+	 * Read against an enrollment's own `projectRepos` to explain a refused or
 	 * suspended enrollment (issue #690).
 	 */
 	repository: string | null;
@@ -159,13 +159,15 @@ export interface WorkerDetailEnrollment {
 	/** Server-derived: `active` **and** consented. The only field the dispatch gate reads. */
 	isRoutable: boolean;
 	/**
-	 * This enrollment's project repository (issue #690), in the **same normalised
-	 * form** as the worker's own `repository`, so plain equality between the two is
-	 * the comparison the server makes (`repoSlugsMatch`, `src/scm/repo-slug.ts` —
-	 * not imported here, since its slug reader spawns `git`). `null` only when the
-	 * project no longer resolves.
+	 * **Every** repository this enrollment's project declares (issue #690, widened
+	 * by #946), in the **same normalised form** as the worker's own `repository`, so
+	 * membership in this list by plain equality is the comparison the server makes
+	 * (`repoSlugsMatch`, `src/scm/repo-slug.ts` — not imported here, since its slug
+	 * reader spawns `git`). A list because a project may hold one worker per
+	 * repository: a machine on the project's second repository is correctly
+	 * enrolled. `[]` only when the project no longer resolves.
 	 */
-	projectRepo: string | null;
+	projectRepos: string[];
 	/**
 	 * Whether the viewer administers this enrollment's project, so approval and
 	 * suspend/reactivate may be offered. Declared by the server — the same check
