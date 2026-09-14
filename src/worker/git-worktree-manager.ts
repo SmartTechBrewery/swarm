@@ -169,6 +169,14 @@ export interface ProvisionOptions {
  */
 type ProvisionLeaseOutcome = 'acquired' | 'live-owner' | 'contended';
 
+/**
+ * What {@link GitWorktreeManager.claimForSweep} found: either the sweep now *holds*
+ * the task lease — `token` is what it releases under, and what it must keep holding
+ * across the removal — or the checkout is in use, reported with the same reasons
+ * {@link LivenessDecision} carries so a caller need not learn a second vocabulary.
+ */
+export type SweepClaim = { safe: true; token: string } | Extract<LivenessDecision, { safe: false }>;
+
 /** Manages the git-worktree lifecycle for one SWARM project. Construct one per project. */
 export class GitWorktreeManager {
 	constructor(
@@ -227,19 +235,63 @@ export class GitWorktreeManager {
 	}
 
 	/**
-	 * Just the "is anything using this right now" half of {@link evaluateReclaim} —
-	 * the gate the age-based abandoned sweep applies (`../worktree/abandoned.ts`,
-	 * issue #951), which records the dirty/unpushed state it destroys rather than
-	 * being stopped by it.
+	 * Take the task lease *for* the age-based abandoned sweep
+	 * (`../worktree/abandoned.ts`, issue #951), and answer the "is anything using
+	 * this right now" half of {@link evaluateReclaim} from under it.
+	 *
+	 * Asking and then removing is not enough here, and that is the whole reason this
+	 * is a claim rather than a read: the sweep force-removes a checkout — dirty and
+	 * unpushed work included — so a provisioner that claims the task between the
+	 * answer and the removal would have its brand-new checkout deleted underneath a
+	 * running phase. The lease is acquired through the very same gate a provision
+	 * uses ({@link acquireProvisionLease}), so the two contend by compare-and-set:
+	 * whichever gets there first wins, and the loser is told the checkout is live.
+	 * Acquiring it through *that* gate rather than a bare `tryClaim` also keeps the
+	 * sweep able to do its job at all — a ten-day-old checkout's lease is long past
+	 * its expiry, and an orphan with no live owner is taken over rather than treated
+	 * as an owner.
+	 *
+	 * The pin check runs after the claim, for the same reason and in the gate's own
+	 * order: a resumable run pins a checkout it is not currently leasing, so that
+	 * answer must also be taken while nothing else can start. The lease is released
+	 * again when it blocks, so a kept checkout is left exactly as it was found.
 	 */
-	async evaluateLiveness(
+	async claimForSweep(
 		taskId: string,
 		isResumablePinned = this.runtime.isResumablePinned,
-	): Promise<LivenessDecision> {
-		return evaluateWorktreeLiveness(this.project.id, taskId, {
-			isLeased: this.runtime.isLeased,
+	): Promise<SweepClaim> {
+		const token = randomUUID();
+		const acquired = await this.acquireProvisionLease(taskId, token);
+		if (acquired !== 'acquired') {
+			return {
+				safe: false,
+				reason: 'live-leased',
+				detail:
+					acquired === 'live-owner'
+						? 'is leased by a live run'
+						: 'is leased, and the lease was claimed by another provisioner first or could not be verified',
+			};
+		}
+		// `isLeased: false` because the only lease there can be now is the one just
+		// taken — the same substitution the provision-time reclaim gate makes below.
+		const liveness = await evaluateWorktreeLiveness(this.project.id, taskId, {
+			isLeased: async () => false,
 			isResumablePinned,
 		});
+		if (!liveness.safe) {
+			await this.releaseSweepClaim(taskId, token);
+			return liveness;
+		}
+		return { safe: true, token };
+	}
+
+	/**
+	 * Give back a claim taken by {@link claimForSweep} — under its own token, so a
+	 * lease another provisioner has since legitimately taken over is never released
+	 * by the sweep that used to hold it.
+	 */
+	async releaseSweepClaim(taskId: string, token: string): Promise<void> {
+		await this.runtime.release(this.project.id, taskId, token);
 	}
 
 	/**
@@ -634,8 +686,22 @@ export class GitWorktreeManager {
 	 * keeping before cleanup runs.
 	 */
 	async cleanup(taskId: string): Promise<void> {
-		const path = this.worktreePath(taskId);
 		await this.runtime.release(this.project.id, taskId);
+		await this.removeCheckoutUnderLease(taskId);
+	}
+
+	/**
+	 * The destructive half of {@link cleanup}, for a caller that already holds the
+	 * task lease and must **keep** holding it across the removal — the abandoned
+	 * sweep under a {@link claimForSweep} claim (`../worktree/abandoned.ts`).
+	 * Releasing first, as {@link cleanup} does, would reopen the window that claim
+	 * exists to close: a provisioner claiming the freed lease and creating a fresh
+	 * checkout at the very path about to be force-removed.
+	 *
+	 * Idempotent in exactly the same way: a missing worktree is a logged no-op.
+	 */
+	async removeCheckoutUnderLease(taskId: string): Promise<void> {
+		const path = this.worktreePath(taskId);
 		if (!existsSync(path)) {
 			await this.runtime.clearPreservation(this.project.id, taskId);
 			logger.warn('Worktree cleanup skipped — path does not exist', { taskId, path });
@@ -648,8 +714,10 @@ export class GitWorktreeManager {
 
 	/**
 	 * Force-remove just the worktree checkout, without touching the lease. Shared
-	 * by {@link cleanup} (which releases the lease first) and the collision-reclaim
-	 * path (which must *keep* the lease held across removal and re-provisioning).
+	 * by {@link removeCheckoutUnderLease} — which {@link cleanup} reaches after
+	 * releasing the lease, and the abandoned sweep while still holding it — and the
+	 * collision-reclaim path (which must *keep* the lease held across removal and
+	 * re-provisioning).
 	 * `--force` because the agent's uncommitted scratch or a running process's open
 	 * files would otherwise block removal; the reclaim gate has already verified
 	 * there is nothing worth keeping.

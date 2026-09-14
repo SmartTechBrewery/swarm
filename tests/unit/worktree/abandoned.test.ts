@@ -1,5 +1,6 @@
 import type { Stats } from 'node:fs';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { SweepClaim } from '@/worker/git-worktree-manager.js';
 import { GitWorktreeManager } from '@/worker/git-worktree-manager.js';
 import type { LivenessDecision } from '@/worktree/reclaim.js';
 import { createMockProjectConfig } from '../../helpers/factories.js';
@@ -42,6 +43,8 @@ class FakeGitWorktreeManager extends GitWorktreeManager {
 	private livenessMap = new Map<string, LivenessDecision>();
 	private throwOnCleanup = new Set<string>();
 	public cleanedUpTasks: string[] = [];
+	/** Every lease operation, in order — the claim is only worth anything if it brackets the removal. */
+	public leaseLog: string[] = [];
 
 	setWorktreesList(paths: string[]) {
 		this.mockList = paths;
@@ -75,12 +78,26 @@ class FakeGitWorktreeManager extends GitWorktreeManager {
 		return this.unpushedMap.get(taskId) ?? false;
 	}
 
-	override async evaluateLiveness(taskId: string): Promise<LivenessDecision> {
-		return this.livenessMap.get(taskId) ?? { safe: true };
+	override async claimForSweep(taskId: string): Promise<SweepClaim> {
+		const liveness = this.livenessMap.get(taskId) ?? { safe: true };
+		if (!liveness.safe) return liveness;
+		this.leaseLog.push(`claim:${taskId}`);
+		return { safe: true, token: `token-${taskId}` };
 	}
 
-	override async cleanup(taskId: string): Promise<void> {
+	override async releaseSweepClaim(taskId: string, token: string): Promise<void> {
+		this.leaseLog.push(`release:${taskId}:${token}`);
+	}
+
+	override async removeCheckoutUnderLease(taskId: string): Promise<void> {
 		if (this.throwOnCleanup.has(taskId)) throw new Error(`git worktree remove failed: ${taskId}`);
+		this.leaseLog.push(`remove:${taskId}`);
+		this.cleanedUpTasks.push(taskId);
+	}
+
+	/** The lease-releasing removal, which this sweep must never reach for. */
+	override async cleanup(taskId: string): Promise<void> {
+		this.leaseLog.push(`cleanup:${taskId}`);
 		this.cleanedUpTasks.push(taskId);
 	}
 }
@@ -127,6 +144,60 @@ describe('sweepAbandonedWorktrees', () => {
 				hadUnpushedCommits: false,
 			},
 		]);
+	});
+
+	// The F1 regression (issue #955 review): the sweep force-removes, so the lease it
+	// took has to still be held when the removal happens. Releasing first — which is
+	// what `cleanup` does — hands a provisioner the very checkout about to be deleted.
+	it('holds the claim across the removal and gives it back only afterwards', async () => {
+		const project = createMockProjectConfig({ repoRoot: REPO_ROOT });
+		const manager = new FakeGitWorktreeManager(project);
+		manager.setWorktreesList([`${ROOT}/task-131`]);
+		stubDirectoryMtimes({ [`${ROOT}/task-131`]: daysAgo(14) });
+
+		await sweepAbandonedWorktrees(project, { worktrees: manager, now });
+
+		expect(manager.leaseLog).toEqual(['claim:131', 'remove:131', 'release:131:token-131']);
+	});
+
+	// A checkout a provisioner claimed first is reported live, not removed — the
+	// answer the claim exists to make true at the moment of the removal rather than
+	// only at the moment it was asked for.
+	it('keeps a checkout whose lease another provisioner claimed first', async () => {
+		const project = createMockProjectConfig({ repoRoot: REPO_ROOT });
+		const manager = new FakeGitWorktreeManager(project);
+		manager.setWorktreesList([`${ROOT}/task-132`]);
+		manager.setTaskLiveness('132', {
+			safe: false,
+			reason: 'live-leased',
+			detail: 'is leased, and the lease was claimed by another provisioner first',
+		});
+		stubDirectoryMtimes({ [`${ROOT}/task-132`]: daysAgo(40) });
+
+		const result = await sweepAbandonedWorktrees(project, { worktrees: manager, now });
+
+		expect(result.keptLive).toEqual([{ path: `${ROOT}/task-132`, reason: 'live-leased' }]);
+		expect(manager.cleanedUpTasks).toEqual([]);
+		expect(manager.leaseLog).toEqual([]);
+	});
+
+	it.each([
+		['a removal that failed', { failed: true, dryRun: false }],
+		['a dry run', { failed: false, dryRun: true }],
+	])('gives the claim back after %s, so the next dispatch finds its lease free', async (_name, mode) => {
+		const project = createMockProjectConfig({ repoRoot: REPO_ROOT });
+		const manager = new FakeGitWorktreeManager(project);
+		manager.setWorktreesList([`${ROOT}/task-133`]);
+		if (mode.failed) manager.failCleanupFor('133');
+		stubDirectoryMtimes({ [`${ROOT}/task-133`]: daysAgo(14) });
+
+		await sweepAbandonedWorktrees(project, {
+			worktrees: manager,
+			now,
+			dryRun: mode.dryRun,
+		});
+
+		expect(manager.leaseLog.at(-1)).toBe('release:133:token-133');
 	});
 
 	it('removes a checkout carrying unpushed commits and records them', async () => {

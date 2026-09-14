@@ -75,6 +75,7 @@ interface Harness {
 	sweep: ReturnType<typeof vi.fn>;
 	report: ReturnType<typeof vi.fn>;
 	inFlight: Set<string>;
+	onInFlightChange: ReturnType<typeof vi.fn>;
 	shutdownSignal: AbortController;
 	logger: ReturnType<typeof silentLogger>;
 	/** Every report this handler sent, oldest first. */
@@ -89,17 +90,19 @@ function harness(overrides: Partial<WorktreeSweepHandlerOptions> = {}): Harness 
 	const report = (overrides.report ?? vi.fn().mockResolvedValue({ recorded: true })) as ReturnType<
 		typeof vi.fn
 	>;
-	const inFlight = new Set<string>();
+	const inFlight = overrides.inFlight ?? new Set<string>();
+	const onInFlightChange = (overrides.onInFlightChange ?? vi.fn()) as ReturnType<typeof vi.fn>;
 	const shutdownSignal = new AbortController();
 	const logger = silentLogger();
 	const handle = createWorktreeSweepHandler({
 		repoRoot: '/home/ada/swarm',
 		controlPlaneUrl: 'https://swarm.example',
 		workerCredential: 'worker-credential',
-		inFlight,
 		shutdownSignal: shutdownSignal.signal,
 		logger,
 		...overrides,
+		inFlight,
+		onInFlightChange,
 		sweep,
 		report,
 	});
@@ -108,6 +111,7 @@ function harness(overrides: Partial<WorktreeSweepHandlerOptions> = {}): Harness 
 		sweep,
 		report,
 		inFlight,
+		onInFlightChange,
 		shutdownSignal,
 		logger,
 		reports: () => report.mock.calls.map((call) => call[0] as WorktreeSweepReport),
@@ -360,5 +364,75 @@ describe('createWorktreeSweepHandler — shutdown', () => {
 
 		expect(h.sweep).toHaveBeenCalledTimes(1);
 		expect(h.reports()[0]).toMatchObject({ requestId: REQUEST_ID });
+	});
+});
+
+describe('createWorktreeSweepHandler — a running sweep is a live owner', () => {
+	const SWEEP_OWNER = `worktree-sweep:${process.pid}`;
+
+	// Phase 1 takes each checkout's task lease before it force-removes it, and that
+	// lease is written with this daemon's pid — so a dispatch provisioning here reads
+	// its liveness off this very set. Unregistered, the sweep's lease reads as an
+	// orphan and is taken over mid-removal, and the fresh checkout the provisioner
+	// then creates is what gets deleted (issue #955 review F1).
+	it('registers its own owner id for the duration of the sweep', async () => {
+		const inFlight = new Set<string>();
+		const duringSweep: string[][] = [];
+		const h = harness({
+			inFlight,
+			sweep: vi.fn(async () => {
+				duringSweep.push([...inFlight]);
+				return sweptOne();
+			}),
+		});
+
+		h.handle(frame({ projects: [PROJECT, OTHER_PROJECT] }));
+		await settle();
+
+		expect(duringSweep).toEqual([[SWEEP_OWNER], [SWEEP_OWNER]]);
+	});
+
+	it('gives the entry back when the sweep finishes, and publishes both edges', async () => {
+		const h = harness();
+
+		h.handle(frame());
+		await settle();
+
+		expect([...h.inFlight]).toEqual([]);
+		expect(h.onInFlightChange).toHaveBeenCalledTimes(2);
+	});
+
+	// Every exit takes the entry with it, or one abandoned sweep would leave this
+	// daemon reporting a phase it is not running — and the busy flag derived from the
+	// set stuck with it.
+	it.each([
+		[
+			'a project that threw',
+			() => harness({ sweep: vi.fn().mockRejectedValue(new Error('boom')) }),
+		],
+		[
+			'a report that never landed',
+			() => harness({ report: vi.fn().mockRejectedValue(new Error('unreachable')) }),
+		],
+	])('gives the entry back after %s', async (_name, build) => {
+		const h = build();
+
+		h.handle(frame());
+		await settle();
+
+		expect([...h.inFlight]).toEqual([]);
+	});
+
+	it('gives the entry back when a shutdown abandons the sweep mid-way', async () => {
+		const h = harness();
+		h.sweep.mockImplementation(async () => {
+			h.shutdownSignal.abort();
+			return sweptOne();
+		});
+
+		h.handle(frame({ projects: [PROJECT, OTHER_PROJECT] }));
+		await settle();
+
+		expect([...h.inFlight]).toEqual([]);
 	});
 });

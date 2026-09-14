@@ -361,12 +361,19 @@ async function main(): Promise<void> {
 		// has touched for the project's configured threshold. Wired unconditionally and
 		// with no precondition: unlike an update it disturbs no run, because the same
 		// `inFlight` set makes a checkout this daemon is using read as leased and be
-		// skipped, and it never restarts anything.
+		// skipped, and it never restarts anything. The sweep also *joins* that set for
+		// its duration, so the lease it holds across a removal is not mistaken for an
+		// orphan by a dispatch starting here — hence `publishBusy` on both edges, as
+		// with an assignment, so the flag this machine's peers read stays derived from
+		// the set rather than from the last dispatch alone. A machine therefore reads
+		// busy while it sweeps, which is the right answer for what that flag guards: a
+		// peer must not swap the install root under a daemon that is mid-removal.
 		onWorktreeSweep: createWorktreeSweepHandler({
 			repoRoot,
 			controlPlaneUrl,
 			workerCredential: credential,
 			inFlight,
+			onInFlightChange: publishBusy,
 			shutdownSignal: shutdownSignal.signal,
 		}),
 		// The handshake is the only place this daemon learns which worker it

@@ -18,7 +18,8 @@
  *   a phase on this daemon currently holds reads as *leased* — `isOwnerLive` is
  *   answered from this process's own in-flight set — so it is skipped by
  *   construction rather than by timing. Waiting would buy nothing and would make
- *   phase 3's unattended weekly sweep impossible.
+ *   phase 3's unattended weekly sweep impossible. The same set carries the answer
+ *   back the other way while a sweep runs; see {@link runSweep}.
  * - **No exit.** Unlike an applied update, nothing about the running daemon changed:
  *   it keeps its session and carries on taking work.
  *
@@ -85,12 +86,21 @@ export interface WorktreeSweepHandlerOptions {
 	/** Raw registered-worker credential: the only thing that names the reporting worker. */
 	workerCredential: string;
 	/**
-	 * The daemon's live in-flight dispatch set (`./assignment-execution.ts`). Read,
-	 * never written, and it is the whole of this feature's safety: it is the
+	 * The daemon's live in-flight dispatch set (`./assignment-execution.ts`). It is
+	 * the whole of this feature's safety, in both directions: it is the
 	 * `isOwnerLive` answer the host-local runtime gives, so a checkout a phase here
-	 * still holds reads as leased and is never removed whatever its age.
+	 * still holds reads as leased and is never removed whatever its age — and a
+	 * running sweep **adds its own owner id** to it for the same reason, so the lease
+	 * it takes over a removal reads as live to a provisioner in this process instead
+	 * of as an orphan that one would take over mid-removal (see {@link runSweep}).
 	 */
-	inFlight: ReadonlySet<string>;
+	inFlight: Set<string>;
+	/**
+	 * Called whenever the sweep adds or removes its entry above, so anything derived
+	 * from that set stays accurate — the daemon publishes its busy flag from it
+	 * (`./worker-main.ts`), and it recomputes only when told to.
+	 */
+	onInFlightChange?: () => void;
 	/** The daemon's graceful-shutdown signal — abandons the sweep rather than racing it. */
 	shutdownSignal: AbortSignal;
 	/** Sweep one project; defaults to phase 1's {@link sweepAbandonedWorktrees}. Injected in tests. */
@@ -230,6 +240,33 @@ async function runSweep(
 	logger: SweepLogger,
 	owe: (report: WorktreeSweepReport) => void,
 ): Promise<boolean> {
+	// The sweep announces *itself* as live for as long as it runs, and that is what
+	// gives the lease phase 1 takes before a removal any force in this process. A
+	// lease is only as strong as the liveness answer behind it, and this daemon's own
+	// provisioner resolves one written by this same pid through `isOwnerLive` — this
+	// very set (`../worktree/host-local-runtime.ts`). Unregistered, the sweep's lease
+	// would read as an orphan and be taken over mid-removal, putting a fresh checkout
+	// at the path about to be force-removed; cross-process, the pid check already
+	// answers for it. Held for the whole sweep rather than per removal: it costs one
+	// entry, and anything narrower is another window to get wrong.
+	const sweepOwner = sweepOwnerId();
+	options.inFlight.add(sweepOwner);
+	options.onInFlightChange?.();
+	try {
+		return await sweepProjectsAndReport(frame, options, logger, owe);
+	} finally {
+		options.inFlight.delete(sweepOwner);
+		options.onInFlightChange?.();
+	}
+}
+
+/** The sweep itself, run with {@link runSweep}'s live-owner registration in place. */
+async function sweepProjectsAndReport(
+	frame: WorktreeSweep,
+	options: WorktreeSweepHandlerOptions,
+	logger: SweepLogger,
+	owe: (report: WorktreeSweepReport) => void,
+): Promise<boolean> {
 	const sweep = options.sweep ?? ((entry: WorktreeSweepProject) => sweepProject(options, entry));
 	const removed: WorktreeSweepRemoval[] = [];
 	const failures: string[] = [];
@@ -315,13 +352,24 @@ function composeMessage(
 }
 
 /**
+ * The owner id every lease a sweep on this daemon takes is written under, and the
+ * one {@link runSweep} registers as live for its duration. One definition because
+ * the two must be the same string — a sweep registering an id its own leases are not
+ * written under would protect nothing.
+ */
+function sweepOwnerId(): string {
+	return `worktree-sweep:${process.pid}`;
+}
+
+/**
  * Sweep one project the frame named, against **this machine's own** checkout root.
  *
  * `isOwnerLive` is the daemon's in-flight set, which is what makes a checkout a
  * phase here currently holds read as leased and be skipped — the acceptance
- * criterion this whole feature turns on. `ownerId` names the sweep itself so a lease
- * this call were ever to take is attributable, though it takes none: it only reads
- * liveness and removes.
+ * criterion this whole feature turns on. `ownerId` names the sweep itself, and it is
+ * load-bearing rather than cosmetic: phase 1 *takes* the task lease across a removal
+ * (`../worktree/abandoned.ts`), so this is the id {@link runSweep} puts in the
+ * in-flight set to keep a provisioner in this process from taking that lease over.
  *
  * The project value carries the three fields a sweep reads and nothing else. A
  * `worktree-sweep` frame deliberately carries no repository, board mapping or
@@ -347,7 +395,7 @@ function sweepProject(
 			createHostLocalWorktreeRuntime({
 				repoRoot: options.repoRoot,
 				worktreeRoot: entry.worktreeRoot,
-				ownerId: `worktree-sweep:${process.pid}`,
+				ownerId: sweepOwnerId(),
 				isOwnerLive: (ownerId) => options.inFlight.has(ownerId),
 			}),
 		),

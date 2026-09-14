@@ -367,15 +367,22 @@ new one; the fresh answer lands on the row later and is printed by the next run 
 command. A machine keeps only its most recent sweep, so that first print is also the
 last moment the previous one is readable.
 
-The machine sweeps every project it is enrolled in, removing each `task-<id>`
-checkout directly under that project's `worktreeRoot` that has gone untouched for its
-`worktreeRetention.abandonedAfterDays` (10 by default —
+The machine sweeps every project it has an **active** enrollment for, removing each
+`task-<id>` checkout directly under that project's `worktreeRoot` that has gone
+untouched for its `worktreeRetention.abandonedAfterDays` (10 by default —
 [`docs/configuration.md`](./configuration.md)) — **including** the ones holding
 uncommitted or unpushed work, which is exactly the case the retention sweep cannot
 reach. That is why what each removal destroyed is recorded rather than only logged on
-the machine. A checkout something is still **using** is never removed at any age: a
-run leasing it, or a resumable deferred/failed run pinning it, exempts it, and the
-daemon's own in-flight set is what answers that for the machine it is running on.
+the machine. An enrollment still `pending`, or one `suspended`, is skipped: that
+project never accepted this machine. Withdrawn *sharing consent* is not the same
+thing and does not exempt a project — consent governs whether it may be given work
+here, and a sweep gives it none; a machine whose owner has stopped offering it is
+precisely where these checkouts are most worth removing. A checkout something is
+still **using** is never removed at any age: a run leasing it, or a resumable
+deferred/failed run pinning it, exempts it, the daemon's own in-flight set is what
+answers that for the machine it is running on, and the sweep holds the task's own
+lease across each removal so a dispatch arriving mid-sweep cannot land in the
+checkout being deleted.
 
 Unlike an update this needs **no drain and no host opt-in**: a sweep disturbs no
 in-flight run, and it removes only `task-<id>` checkouts under a project's own

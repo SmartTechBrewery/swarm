@@ -765,14 +765,20 @@ unchanged.
   `update --all`, which is each owner's own.
 - **`sweep-worktrees <worker-id>`** — ask a machine to remove its own `task-<id>`
   checkouts that nothing has touched for the project's
-  `worktreeRetention.abandonedAfterDays` (10 by default), across every project it is
-  enrolled in (issue #955). This is the age-based sweep phase 1 of issue #951 built,
+  `worktreeRetention.abandonedAfterDays` (10 by default), across every project it
+  holds an **active** enrollment for (issue #955). A `pending` or `suspended`
+  enrollment is skipped — that project never accepted the machine — while a project
+  whose *sharing consent* was withdrawn is still swept: consent decides whether it
+  may be given work there, and a sweep gives it none. This is the age-based sweep
+  phase 1 of issue #951 built,
   reaching the checkouts the ordinary retention sweep keeps forever: it removes them
   **including** the ones holding uncommitted changes or unpushed commits, and
   *records* that rather than being stopped by it. A checkout something is still
   using — leased by a live run, or pinned by a resumable one — is exempt at any age,
   and on the machine doing the sweeping its own in-flight set is what answers that,
-  so a phase running right now is never disturbed.
+  so a phase running right now is never disturbed; the sweep also *holds* each
+  checkout's lease across its removal, so one dispatched mid-sweep cannot be given
+  the directory about to go.
   **It prints the machine's last sweep, then asks for a new one.** Each removed path
   comes with how many days it had gone untouched and whether it held uncommitted or
   unpushed work, under a line counting what was removed, kept live, and failed. Both
