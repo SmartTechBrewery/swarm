@@ -26,6 +26,7 @@ const validWorker = {
 	// Nobody has asked this machine to update (issue #933) — nullable for the same
 	// reason `build` is, so no reader gets an "absent" case to interpret.
 	update: null,
+	worktreeSweep: null,
 	createdAt: new Date('2026-01-01T00:00:00Z'),
 	updatedAt: new Date('2026-01-01T00:00:00Z'),
 };

@@ -22,6 +22,7 @@ import {
 	handlePriorReview,
 	handleReportCliQuota,
 	handleReportWorkerUpdate,
+	handleReportWorktreeSweep,
 	handleScheduleFollowUpReview,
 	handleSubmitReview,
 	handleUpdateWorkItem,
@@ -51,6 +52,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		repository: null,
 		drainingSince: null,
 		update: null,
+		worktreeSweep: null,
 		build: null,
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		updatedAt: new Date('2026-01-01T00:00:00Z'),
@@ -123,6 +125,7 @@ function makeDeps(overrides: Partial<WorkerDeliveryDeps> = {}): WorkerDeliveryDe
 		scheduleFollowUpReview: vi.fn().mockResolvedValue(undefined),
 		persistCliQuota: vi.fn().mockResolvedValue(undefined),
 		recordWorkerUpdateReport: vi.fn().mockResolvedValue(makeWorker()),
+		recordWorktreeSweepReport: vi.fn().mockResolvedValue(makeWorker()),
 		advanceWorkerRollout: vi.fn(),
 		...overrides,
 	};
@@ -1737,5 +1740,131 @@ describe('handleReportWorkerUpdate', () => {
 				`reported ${status}`,
 			);
 		}
+	});
+});
+
+// Issue #955 — the answer to a pushed `worktree-sweep`. The same attribution
+// contract as the two routes above, and the same `recorded` semantics; what it does
+// *not* do is advance a rollout, because a sweep has none.
+describe('handleReportWorktreeSweep', () => {
+	const REQUEST_ID = '77777777-7777-4777-8777-777777777777';
+
+	const REMOVAL = {
+		projectId: 'swarm',
+		taskId: '955',
+		path: '/home/ada/swarm/.swarm-workspaces/task-955',
+		lastTouchedAt: '2026-08-30T09:00:00.000Z',
+		ageDays: 15,
+		hadUncommittedChanges: true,
+		hadUnpushedCommits: false,
+	};
+
+	function sweepBody(overrides: Record<string, unknown> = {}) {
+		return {
+			requestId: REQUEST_ID,
+			status: 'swept',
+			removed: [REMOVAL],
+			removedCount: 1,
+			keptLiveCount: 2,
+			failedCount: 0,
+			message: 'Swept 1 project(s): removed 1 abandoned checkout(s), kept 2 still in use.',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+			...overrides,
+		};
+	}
+
+	// The whole record, not a summary of it: the paths and the work each removal
+	// destroyed are what this feature exists to make readable afterwards.
+	it('records what was removed against the authenticated worker', async () => {
+		const deps = makeDeps();
+
+		const result = await handleReportWorktreeSweep(deps, CREDENTIAL, sweepBody());
+
+		expect(result).toEqual({ status: 200, json: { recorded: true } });
+		expect(deps.recordWorktreeSweepReport).toHaveBeenCalledWith(WORKER_ID, REQUEST_ID, 'swept', {
+			removed: [REMOVAL],
+			removedCount: 1,
+			keptLiveCount: 2,
+			failedCount: 0,
+			message: expect.stringContaining('removed 1'),
+		});
+	});
+
+	it('keys the row on the credential rather than on any worker the body names', async () => {
+		const deps = makeDeps();
+
+		await handleReportWorktreeSweep(
+			deps,
+			CREDENTIAL,
+			sweepBody({ workerId: '99999999-9999-4999-8999-999999999999' }),
+		);
+
+		expect(deps.recordWorktreeSweepReport).toHaveBeenCalledWith(
+			WORKER_ID,
+			REQUEST_ID,
+			'swept',
+			expect.anything(),
+		);
+	});
+
+	// `recorded: false` is a success, not a refusal: the outcome is still written, but
+	// the row has moved on to a request this report does not answer.
+	it('answers recorded:false when the report closes no pending request', async () => {
+		const deps = makeDeps({ recordWorktreeSweepReport: vi.fn().mockResolvedValue(undefined) });
+
+		const result = await handleReportWorktreeSweep(deps, CREDENTIAL, sweepBody());
+
+		expect(result).toEqual({ status: 200, json: { recorded: false } });
+	});
+
+	it('is 401 and records nothing for an unknown credential', async () => {
+		const deps = makeDeps({ resolveWorkerByCredential: vi.fn().mockResolvedValue(undefined) });
+
+		const result = await handleReportWorktreeSweep(deps, 'bogus', sweepBody());
+
+		expect(result).toEqual({ status: 401, json: { authenticated: false } });
+		expect(deps.recordWorktreeSweepReport).not.toHaveBeenCalled();
+	});
+
+	it('needs no project enrollment — one report spans every project swept', async () => {
+		const deps = makeDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+
+		expect((await handleReportWorktreeSweep(deps, CREDENTIAL, sweepBody())).status).toBe(200);
+		expect(deps.isWorkerEnrolled).not.toHaveBeenCalled();
+	});
+
+	it('returns 400 for a malformed body, an unknown status, or a protocol mismatch', async () => {
+		const deps = makeDeps();
+
+		expect((await handleReportWorktreeSweep(deps, CREDENTIAL, { requestId: 'nope' })).status).toBe(
+			400,
+		);
+		expect(
+			(await handleReportWorktreeSweep(deps, CREDENTIAL, sweepBody({ status: 'partial' }))).status,
+		).toBe(400);
+		expect(
+			(
+				await handleReportWorktreeSweep(
+					deps,
+					CREDENTIAL,
+					sweepBody({ protocolVersion: TRANSPORT_PROTOCOL_VERSION + 1 }),
+				)
+			).status,
+		).toBe(400);
+		expect(deps.recordWorktreeSweepReport).not.toHaveBeenCalled();
+	});
+
+	// A sweep is not a code distribution, so there is nothing to stage and nothing
+	// waiting on the answer — the update report's rollout hook has no twin here.
+	it('advances no rollout', async () => {
+		const deps = makeDeps();
+
+		await handleReportWorktreeSweep(
+			deps,
+			CREDENTIAL,
+			sweepBody({ status: 'failed', failedCount: 1 }),
+		);
+
+		expect(deps.advanceWorkerRollout).not.toHaveBeenCalled();
 	});
 });

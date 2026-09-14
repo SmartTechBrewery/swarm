@@ -110,6 +110,7 @@ import {
 } from './quota-reporting.js';
 import { connectWorkerTransport } from './worker-client.js';
 import { createWorkerUpdateHandler, selfUpdateEnabled } from './worker-update.js';
+import { createWorktreeSweepHandler } from './worktree-sweep.js';
 
 /**
  * The two host-local records this process leaves on its own machine: the checkout
@@ -354,6 +355,19 @@ async function main(): Promise<void> {
 			inFlight,
 			shutdownSignal: shutdownSignal.signal,
 			shutdown: releaseSessionAndResources,
+		}),
+		// The second frame about this *machine* rather than a dispatch (issue #955):
+		// remove the `task-<id>` checkouts under this host's own repo root that nothing
+		// has touched for the project's configured threshold. Wired unconditionally and
+		// with no precondition: unlike an update it disturbs no run, because the same
+		// `inFlight` set makes a checkout this daemon is using read as leased and be
+		// skipped, and it never restarts anything.
+		onWorktreeSweep: createWorktreeSweepHandler({
+			repoRoot,
+			controlPlaneUrl,
+			workerCredential: credential,
+			inFlight,
+			shutdownSignal: shutdownSignal.signal,
 		}),
 		// The handshake is the only place this daemon learns which worker it
 		// authenticates as, so it is where the checkout lock stops naming a bare pid:

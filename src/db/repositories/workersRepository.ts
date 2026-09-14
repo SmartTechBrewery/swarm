@@ -36,6 +36,9 @@ import {
 	WorkerCapabilityNotProbedError,
 	WorkerCapabilityReductionError,
 	type WorkerUpdateState,
+	type WorkerWorktreeSweepState,
+	type WorktreeSweepResult,
+	type WorktreeSweepStatus,
 } from '../../identity/worker.js';
 import type { WorkerBuild, WorkerUpdateStatus } from '../../lib/build-identity.js';
 import type { TriggerPhase } from '../../triggers/types.js';
@@ -86,6 +89,7 @@ function rowToWorker(row: WorkerRow): Worker {
 		// null flag can only be a row hand-edited in `psql`; read that as not dirty.
 		build: row.buildCommit ? { commit: row.buildCommit, dirty: row.buildDirty ?? false } : null,
 		update: rowToUpdateState(row),
+		worktreeSweep: rowToWorktreeSweepState(row),
 		createdAt: row.createdAt,
 		updatedAt: row.updatedAt,
 	};
@@ -114,6 +118,26 @@ function rowToUpdateState(row: WorkerRow): WorkerUpdateState | null {
 		status: row.updateStatus ?? null,
 		message: row.updateMessage ?? null,
 		reportedAt: row.updateReportedAt ?? null,
+	};
+}
+
+/**
+ * Re-assemble the five `worktree_sweep_*` columns into one
+ * {@link WorkerWorktreeSweepState}, or `null` when nobody has asked this machine to
+ * sweep (issue #955).
+ *
+ * Keyed on `worktree_sweep_requested_at` rather than on the pending marker, for
+ * {@link rowToUpdateState}'s reason: the value outlives the request, since a report
+ * clears `worktree_sweep_request_id` and leaves the outcome standing to be read.
+ */
+function rowToWorktreeSweepState(row: WorkerRow): WorkerWorktreeSweepState | null {
+	if (!row.worktreeSweepRequestedAt) return null;
+	return {
+		requestId: row.worktreeSweepRequestId ?? null,
+		requestedAt: row.worktreeSweepRequestedAt,
+		status: row.worktreeSweepStatus ?? null,
+		reportedAt: row.worktreeSweepReportedAt ?? null,
+		result: row.worktreeSweepResult ?? null,
 	};
 }
 
@@ -565,6 +589,75 @@ export async function recordWorkerUpdateReport(
 			updateReportedAt: new Date(),
 		})
 		.where(and(eq(workers.id, id), eq(workers.updateRequestId, requestId)))
+		.returning();
+	return updatedRow ? rowToWorker(updatedRow) : undefined;
+}
+
+/**
+ * Record that an operator asked this machine to sweep its abandoned worktrees,
+ * replacing any request already outstanding (issue #955). Returns the updated
+ * worker, or `undefined` if no worker has that id.
+ *
+ * All five columns are written together, so a fresh request never shows the
+ * previous sweep's outcome beside it — and only the most recent sweep is retained,
+ * which is the contract stated on the columns themselves (`../schema/workers.ts`).
+ * Asking again is therefore a plain overwrite, the only form of "cancel" there is:
+ * the earlier request's push is no longer the one the row waits on, and a report
+ * for it is recognised as stale by {@link recordWorktreeSweepReport}'s id check.
+ *
+ * **Deliberately carries no `draining_since IS NOT NULL` predicate**, which is the
+ * one way this diverges from {@link requestWorkerUpdate}. An update replaces the
+ * code under a running daemon and therefore needs a machine no new work is
+ * dispatched to; a sweep disturbs no in-flight run, because a checkout a phase
+ * still holds reads as leased and is skipped. Requiring a drain would also make
+ * phase 3's unattended weekly sweep impossible — so there is no `in-pool`
+ * disposition here and nothing for a caller to word a refusal about.
+ */
+export async function requestWorktreeSweep(
+	id: string,
+	requestId: string,
+): Promise<Worker | undefined> {
+	const [updatedRow] = await getDb()
+		.update(workers)
+		.set({
+			worktreeSweepRequestId: requestId,
+			worktreeSweepRequestedAt: new Date(),
+			worktreeSweepStatus: null,
+			worktreeSweepReportedAt: null,
+			worktreeSweepResult: null,
+		})
+		.where(eq(workers.id, id))
+		.returning();
+	return updatedRow ? rowToWorker(updatedRow) : undefined;
+}
+
+/**
+ * Record what a machine reported became of a requested sweep, and stop treating
+ * that request as outstanding (issue #955).
+ *
+ * The `worktree_sweep_request_id` match is the whole point of the `WHERE`, exactly
+ * as it is for {@link recordWorkerUpdateReport}: a report is only ever the answer
+ * to the request it names, so one arriving for a request an operator has since
+ * re-issued must not clear the pending marker the *new* request set. That case
+ * returns `undefined`, which the route reports as `recorded: false` — not an error,
+ * since the outcome concerned a request nothing is waiting on any more.
+ * `undefined` also covers a duplicate report and an unknown worker.
+ */
+export async function recordWorktreeSweepReport(
+	id: string,
+	requestId: string,
+	status: WorktreeSweepStatus,
+	result: WorktreeSweepResult,
+): Promise<Worker | undefined> {
+	const [updatedRow] = await getDb()
+		.update(workers)
+		.set({
+			worktreeSweepRequestId: null,
+			worktreeSweepStatus: status,
+			worktreeSweepReportedAt: new Date(),
+			worktreeSweepResult: result,
+		})
+		.where(and(eq(workers.id, id), eq(workers.worktreeSweepRequestId, requestId)))
 		.returning();
 	return updatedRow ? rowToWorker(updatedRow) : undefined;
 }

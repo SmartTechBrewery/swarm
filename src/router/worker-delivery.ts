@@ -81,7 +81,7 @@
  * unserved route is a 404 the daemon survives where an unparseable stream frame
  * closes the socket (`../transport/protocol.ts`).
  *
- * Twenty routes, all under `/worker/delivery`:
+ * Twenty-one routes, all under `/worker/delivery`:
  *   - `POST /worker/delivery/review` — submit a review (verdict + body).
  *   - `POST /worker/delivery/pr-comment` — post a top-level PR comment.
  *   - `POST /worker/delivery/pm/move` — move a board card to a canonical status.
@@ -103,6 +103,8 @@
  *   - `POST /worker/delivery/quota` — store this worker's own host's CLI quota snapshots.
  *   - `POST /worker/delivery/update-report` — record what became of a requested
  *     self-update, and advance the fleet rollout that was waiting for the answer.
+ *   - `POST /worker/delivery/worktree-sweep-report` — record what a machine removed
+ *     when it was asked to sweep its own abandoned checkouts.
  *
  * Mirrors `./worker-transport.ts`: the request logic is factored out of the HTTP
  * glue into pure, injectable functions (`handleSubmitReview`,
@@ -111,7 +113,8 @@
  * `handleFindWorkItemForArtifact`, `handleFindPmComment`, `handleCreateWorkItem`, `handleUpdateWorkItem`,
  * `handleAddPmLabel`, `handleAddBlockedBy`, `handleScheduleFollowUpReview`,
  * `handlePriorReview`, `handleMarkReviewVerdict`, `handleAbandonReviewVerdict`,
- * `handleReportCliQuota`, `handleReportWorkerUpdate`) so tests drive them with fake deps and never need a live
+ * `handleReportCliQuota`, `handleReportWorkerUpdate`, `handleReportWorktreeSweep`) so tests drive them with fake
+ * deps and never need a live
  * router; collaborators default to the real services and are overridden in tests.
  * Credential handling matches the handshake's contract — the raw credential
  * appears only in the `Authorization: Bearer` header, is never logged, never
@@ -131,7 +134,11 @@ import {
 import { listEnrollmentsForWorker } from '../db/repositories/workerEnrollmentsRepository.js';
 import type { Worker } from '../identity/worker.js';
 import { isRoutable } from '../identity/worker-enrollment.js';
-import { recordWorkerUpdateReport, resolveWorkerByCredential } from '../identity/worker-service.js';
+import {
+	recordWorkerUpdateReport,
+	recordWorktreeSweepReport,
+	resolveWorkerByCredential,
+} from '../identity/worker-service.js';
 // Side-effect import: registers every PM and SCM provider manifest into its
 // registry before defaultDeps() resolves the project's SCM provider below. This
 // module reads the registry at request time, so it must not rely on a sibling
@@ -168,6 +175,7 @@ import {
 	PriorReviewLedgerRequestSchema,
 	ReportCliQuotaDeliveryRequestSchema,
 	ReportWorkerUpdateDeliveryRequestSchema,
+	ReportWorktreeSweepDeliveryRequestSchema,
 	SubmitReviewDeliveryRequestSchema,
 	TRANSPORT_PROTOCOL_VERSION,
 	UpdateWorkItemDeliveryRequestSchema,
@@ -215,6 +223,13 @@ export interface WorkerDeliveryDeps {
 	 */
 	recordWorkerUpdateReport: typeof recordWorkerUpdateReport;
 	/**
+	 * Record what a machine reported it removed when asked to sweep its abandoned
+	 * worktrees (issue #955), defaulted to the service seam this process reaches over
+	 * `DATABASE_URL` — the write a DB-free worker cannot perform itself. `undefined`
+	 * back means the report answers no outstanding request.
+	 */
+	recordWorktreeSweepReport: typeof recordWorktreeSweepReport;
+	/**
 	 * Move on the fleet rollout the reporting machine belongs to, if its operator has
 	 * one under way (issue #941, `./worker-rollout-advance.ts`). A report *is* the
 	 * answer the advance's first step reads off the `workers` row, so it landing here
@@ -248,6 +263,7 @@ function defaultDeps(): WorkerDeliveryDeps {
 		scheduleFollowUpReview: scheduleFollowUpReviewDefault,
 		persistCliQuota: upsertCliQuota,
 		recordWorkerUpdateReport,
+		recordWorktreeSweepReport,
 		advanceWorkerRollout,
 	};
 }
@@ -1096,6 +1112,61 @@ export async function handleReportWorkerUpdate(
 	return { status: 200, json: { recorded: updated !== undefined } };
 }
 
+/**
+ * Record what a machine removed when it was asked to sweep its own abandoned
+ * worktrees (issue #955).
+ *
+ * Attribution works exactly as the update and quota routes' does, and for the same
+ * reason: the row written is the one the *credential* resolved to, and the request
+ * carries no worker id to honour or ignore (`../transport/protocol.ts`), so a daemon
+ * can only ever report on itself. Not project-scoped either — the report spans every
+ * project the machine was asked about — so it runs {@link authenticateWorker}.
+ *
+ * `recorded: false` is a **success**, not a refusal, exactly as it is above: the
+ * outcome named a request the row is no longer waiting on, so the pending request
+ * was left standing for the push that will answer it.
+ *
+ * No rollout is advanced here, unlike the update report: there is no staged rollout
+ * for a sweep, because a sweep has no bad-build risk to stage against.
+ */
+export async function handleReportWorktreeSweep(
+	deps: WorkerDeliveryDeps,
+	credential: string | undefined,
+	body: unknown,
+): Promise<DeliveryResult> {
+	const parsed = ReportWorktreeSweepDeliveryRequestSchema.safeParse(body);
+	if (!parsed.success) return { status: 400, json: { reason: 'invalid delivery request' } };
+	const { requestId, status, protocolVersion, ...result } = parsed.data;
+
+	if (protocolVersion !== TRANSPORT_PROTOCOL_VERSION)
+		return {
+			status: 400,
+			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
+		};
+
+	const authed = await authenticateWorker(deps, credential);
+	if ('status' in authed) return authed;
+
+	const updated = await deps.recordWorktreeSweepReport(authed.worker.id, requestId, status, result);
+	// Logged at `warn` when anything was actually removed, on the mechanism's own
+	// reasoning (`../worktree/abandoned.ts`): an age-based sweep destroys uncommitted
+	// and unpushed work by design, so the control plane's own record of it must not be
+	// the quietest line in the log either.
+	const line = 'worktree sweep: a machine reported what it removed';
+	const meta = {
+		workerId: authed.worker.id,
+		requestId,
+		status,
+		removedCount: result.removedCount,
+		keptLiveCount: result.keptLiveCount,
+		failedCount: result.failedCount,
+		recorded: updated !== undefined,
+	};
+	if (result.removedCount > 0) logger.warn(line, meta);
+	else logger.info(line, meta);
+	return { status: 200, json: { recorded: updated !== undefined } };
+}
+
 /** Extract the raw credential from an `Authorization: Bearer <credential>` header. */
 function extractBearerCredential(authorization: string | undefined): string | undefined {
 	if (!authorization) return undefined;
@@ -1239,6 +1310,12 @@ export function registerWorkerDelivery(
 	app.post('/worker/delivery/update-report', async (c) => {
 		const credential = extractBearerCredential(c.req.header('authorization'));
 		const result = await handleReportWorkerUpdate(deps, credential, await parseBody(c));
+		return c.json(result.json, result.status);
+	});
+
+	app.post('/worker/delivery/worktree-sweep-report', async (c) => {
+		const credential = extractBearerCredential(c.req.header('authorization'));
+		const result = await handleReportWorktreeSweep(deps, credential, await parseBody(c));
 		return c.json(result.json, result.status);
 	});
 }

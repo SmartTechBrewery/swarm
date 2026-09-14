@@ -13,6 +13,8 @@ import {
 	PostCommentDeliveryRequestSchema,
 	ReportWorkerUpdateDeliveryRequestSchema,
 	ReportWorkerUpdateDeliveryResponseSchema,
+	ReportWorktreeSweepDeliveryRequestSchema,
+	ReportWorktreeSweepDeliveryResponseSchema,
 	StreamLogSchema,
 	TaskAssignmentAckSchema,
 	TaskAssignmentSchema,
@@ -23,6 +25,7 @@ import {
 	TRANSPORT_PROTOCOL_VERSION,
 	WorkerStreamMessageSchema,
 	WorkerUpdateSchema,
+	WorktreeSweepSchema,
 } from '@/transport/protocol.js';
 import { createMockProjectConfig } from '../../helpers/factories.js';
 
@@ -511,6 +514,53 @@ describe('transport protocol schemas', () => {
 			});
 		});
 
+		// Issue #955. The frame that asks a *machine* to tidy its own checkouts carries
+		// per project an id, a relative worktree root and an age — and nothing that could
+		// name a directory on its own, since the machine's own repo root is what the root
+		// is resolved against.
+		describe('worktree-sweep (issue #955)', () => {
+			const REQUEST_ID = '77777777-7777-4777-8777-777777777777';
+			const valid = {
+				type: 'worktree-sweep' as const,
+				requestId: REQUEST_ID,
+				projects: [
+					{ projectId: 'swarm', worktreeRoot: '.swarm-workspaces', abandonedAfterDays: 10 },
+				],
+			};
+
+			it('round-trips through the cloud→worker union', () => {
+				expect(ControlPlaneMessageSchema.parse(valid)).toEqual(valid);
+			});
+
+			// A frame naming nothing asks for nothing: the dispatcher logs a machine with no
+			// approved enrollment and leaves it alone rather than pushing an empty sweep.
+			it('rejects a frame that names no project', () => {
+				expect(WorktreeSweepSchema.safeParse({ ...valid, projects: [] }).success).toBe(false);
+			});
+
+			it('requires a whole-day, positive threshold', () => {
+				for (const abandonedAfterDays of [0, -1, 1.5]) {
+					expect(
+						WorktreeSweepSchema.safeParse({
+							...valid,
+							projects: [{ ...valid.projects[0], abandonedAfterDays }],
+						}).success,
+					).toBe(false);
+				}
+			});
+
+			// The daemon resolves `worktreeRoot` against its own `SWARM_WORKER_REPO_ROOT`,
+			// so a frame carrying a path of its own would be the one way the wire could
+			// point a sweep somewhere the machine does not already own.
+			it('drops an absolute root smuggled alongside the relative one', () => {
+				const parsed = ControlPlaneMessageSchema.parse({
+					...valid,
+					projects: [{ ...valid.projects[0], repoRoot: '/etc' }],
+				});
+				expect(parsed).toEqual(valid);
+			});
+		});
+
 		it('discriminates a task-assignment frame to TaskAssignmentSchema', () => {
 			const parsed = ControlPlaneMessageSchema.parse(VALID_ASSIGNMENT);
 			expect(parsed.type).toBe('task-assignment');
@@ -810,6 +860,86 @@ describe('transport protocol schemas', () => {
 
 		it('answers with whether the report closed the request that was pending', () => {
 			expect(ReportWorkerUpdateDeliveryResponseSchema.parse({ recorded: false })).toEqual({
+				recorded: false,
+			});
+		});
+	});
+
+	// Issue #955 — the answer to a `worktree-sweep`, on a route rather than the stream
+	// for the reason the update report already states.
+	describe('ReportWorktreeSweepDeliveryRequestSchema', () => {
+		const removal = {
+			projectId: 'swarm',
+			taskId: '955',
+			path: '/home/ada/swarm/.swarm-workspaces/task-955',
+			lastTouchedAt: '2026-08-30T09:00:00.000Z',
+			ageDays: 15,
+			hadUncommittedChanges: true,
+			hadUnpushedCommits: false,
+		};
+		const valid = {
+			requestId: '77777777-7777-4777-8777-777777777777',
+			status: 'swept' as const,
+			removed: [removal],
+			removedCount: 1,
+			keptLiveCount: 2,
+			failedCount: 0,
+			message: 'Swept 1 project(s): removed 1 abandoned checkout(s), kept 2 still in use.',
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		};
+
+		it('round-trips a report of what one machine removed', () => {
+			expect(ReportWorktreeSweepDeliveryRequestSchema.parse(valid)).toEqual(valid);
+		});
+
+		it('rejects a status outside the vocabulary', () => {
+			expect(
+				ReportWorktreeSweepDeliveryRequestSchema.safeParse({ ...valid, status: 'partial' }).success,
+			).toBe(false);
+		});
+
+		// The dirty/unpushed pair is the whole reason the record is durable, so a removal
+		// that omits either is not a removal this wire accepts.
+		it('requires every removal to say what work it destroyed', () => {
+			const { hadUnpushedCommits: _omitted, ...incomplete } = removal;
+			expect(
+				ReportWorktreeSweepDeliveryRequestSchema.safeParse({ ...valid, removed: [incomplete] })
+					.success,
+			).toBe(false);
+		});
+
+		it('names no worker — identity is the credential the request authenticates with', () => {
+			const parsed = ReportWorktreeSweepDeliveryRequestSchema.parse({
+				...valid,
+				workerId: '11111111-1111-4111-8111-111111111111',
+			});
+			expect(parsed).not.toHaveProperty('workerId');
+		});
+
+		// Capped detail, uncapped count: a machine that removed hundreds still reports
+		// how many, and the wire still refuses to be a log sink.
+		it('caps the removals it carries while leaving the true total unbounded', () => {
+			expect(
+				ReportWorktreeSweepDeliveryRequestSchema.safeParse({
+					...valid,
+					removed: Array.from({ length: 201 }, () => removal),
+				}).success,
+			).toBe(false);
+			expect(
+				ReportWorktreeSweepDeliveryRequestSchema.safeParse({
+					...valid,
+					removed: [removal],
+					removedCount: 4096,
+				}).success,
+			).toBe(true);
+			expect(
+				ReportWorktreeSweepDeliveryRequestSchema.safeParse({ ...valid, message: 'x'.repeat(4001) })
+					.success,
+			).toBe(false);
+		});
+
+		it('answers with whether the report closed the request that was pending', () => {
+			expect(ReportWorktreeSweepDeliveryResponseSchema.parse({ recorded: false })).toEqual({
 				recorded: false,
 			});
 		});

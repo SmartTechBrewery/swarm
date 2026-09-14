@@ -27,6 +27,7 @@ import { NonSecretProjectConfigSchema } from '../config/project-config-slice.js'
 import { AgentTargetSchema } from '../config/schema.js';
 import { AgentCliSchema } from '../harness/agent-cli.js';
 import { CliQuotaSnapshotSchema } from '../harness/quota.js';
+import { WorktreeSweepResultSchema, WorktreeSweepStatusSchema } from '../identity/worker.js';
 import {
 	WorkerSessionInstanceIdSchema,
 	WorkerSessionReclaimSchema,
@@ -471,6 +472,65 @@ export const WorkerUpdateSchema = z.object({
 export type WorkerUpdate = z.infer<typeof WorkerUpdateSchema>;
 
 /**
+ * One project a {@link WorktreeSweepSchema} asks about: the checkouts under
+ * `worktreeRoot` that have gone untouched for `abandonedAfterDays` days.
+ *
+ * `worktreeRoot` is the project's own *relative* root (`ProjectConfig.worktreeRoot`,
+ * `.swarm-workspaces` by default) — never an absolute path from the control plane.
+ * The machine resolves it against its **own** `SWARM_WORKER_REPO_ROOT`, which is
+ * host-local and never travels, so nothing on the wire can point a sweep at a
+ * directory the daemon does not already own. That is the same boundary
+ * `TaskAssignment` holds for `repoRoot`.
+ */
+export const WorktreeSweepProjectSchema = z.object({
+	projectId: z.string().min(1),
+	worktreeRoot: z.string().min(1),
+	abandonedAfterDays: z.number().int().positive(),
+});
+export type WorktreeSweepProject = z.infer<typeof WorktreeSweepProjectSchema>;
+
+/**
+ * Cloud→worker control frame asking a machine to sweep its **own** abandoned
+ * `task-<id>` checkouts (issue #955). The transport half of
+ * `workers.requestWorktreeSweep` (`../api/routers/workers.ts`), which records the
+ * request on the worker row and publishes it; the router turns that notification
+ * into this push (`../router/worktree-sweep-dispatch.ts`).
+ *
+ * **The frame carries no path that could act.** Per project it names an id, the
+ * project's relative `worktreeRoot`, and an age in days — the machine's own
+ * checkout root supplies the rest, and the mechanism it drives removes only a
+ * direct `task-<id>` child of that root (`../worktree/abandoned.ts`). `projects`
+ * is non-empty because a frame naming nothing asks for nothing: a machine with no
+ * approved enrollment is logged and left alone rather than pushed an empty one.
+ *
+ * **No draining precondition, unlike {@link WorkerUpdateSchema}.** An update
+ * replaces the code under a running daemon and so needs a drained machine; a sweep
+ * disturbs no in-flight run, because a checkout a phase still holds reads as leased
+ * and is skipped by construction — the daemon's own in-flight set is the liveness
+ * answer. Requiring a drain would also make phase 3's unattended weekly sweep
+ * impossible.
+ *
+ * `requestId` is what the report comes back on
+ * ({@link ReportWorktreeSweepDeliveryRequestSchema}): the row keeps it while the
+ * request is outstanding, so a report for a *superseded* request is recorded as
+ * history rather than mistaken for the answer to the one now pending. It is also
+ * how the daemon recognises the re-push it gets on reconnect as a request it has
+ * already handled.
+ *
+ * Additive, so `TRANSPORT_PROTOCOL_VERSION` is deliberately **not** bumped, on
+ * {@link TaskCancelSchema}'s and {@link WorkerUpdateSchema}'s exact reasoning: an
+ * unrecognised control frame is a logged no-op on an older daemon
+ * (`./worker-client.ts`), where a bump would reject every frame from every
+ * already-deployed worker.
+ */
+export const WorktreeSweepSchema = z.object({
+	type: z.literal('worktree-sweep'),
+	requestId: z.string().uuid(),
+	projects: z.array(WorktreeSweepProjectSchema).nonempty(),
+});
+export type WorktreeSweep = z.infer<typeof WorktreeSweepSchema>;
+
+/**
  * One captured agent-output line, the transport mirror of a `run_output_events`
  * row (`../worker/live-output.ts`): the `stream` it came from, its `content`
  * (newline-terminated, as the batcher stores it), and the ISO-8601 instant it
@@ -702,7 +762,9 @@ export type WorkerStreamMessage = z.infer<typeof WorkerStreamMessageSchema>;
  * `WorkerUpdate` is the one member that concerns no dispatch at all (issue #933):
  * it asks the *machine* to move to a build. Its answer takes an HTTP delivery
  * route rather than a member of the worker→cloud union above — see
- * {@link ReportWorkerUpdateDeliveryRequestSchema} for why.
+ * {@link ReportWorkerUpdateDeliveryRequestSchema} for why. `WorktreeSweep` (issue
+ * #955) is the second of that kind — it asks the machine about its own checkouts
+ * — and its answer takes a route for the same reason.
  */
 export const ControlPlaneMessageSchema = z.discriminatedUnion('type', [
 	HeartbeatAckSchema,
@@ -710,6 +772,7 @@ export const ControlPlaneMessageSchema = z.discriminatedUnion('type', [
 	TaskAssignmentSchema,
 	TaskCancelSchema,
 	WorkerUpdateSchema,
+	WorktreeSweepSchema,
 ]);
 export type ControlPlaneMessage = z.infer<typeof ControlPlaneMessageSchema>;
 
@@ -1344,4 +1407,53 @@ export const ReportWorkerUpdateDeliveryResponseSchema = z.object({
 });
 export type ReportWorkerUpdateDeliveryResponse = z.infer<
 	typeof ReportWorkerUpdateDeliveryResponseSchema
+>;
+
+/**
+ * Worktree-sweep **report** frame (issue #955) — what became of the
+ * {@link WorktreeSweepSchema} the control plane pushed, written back onto the
+ * `workers` row so an operator reads the answer where they made the request.
+ *
+ * Like the update and quota frames it names **no worker**: identity comes from the
+ * credential the request authenticates with, so a daemon can only ever report on
+ * itself. And like them it is an HTTP request/response frame rather than a member
+ * of {@link WorkerStreamMessageSchema}, for the reason they both state verbatim:
+ * `handleWorkerStreamFrame` closes the socket with `WS_CLOSE.MALFORMED_FRAME` on a
+ * frame it cannot parse, so a newer daemon against an older router would
+ * reconnect-loop, where an unserved *route* is a 404 the client explains in one
+ * line (`./delivery-client.ts`). `TRANSPORT_PROTOCOL_VERSION` is therefore
+ * deliberately **not** bumped.
+ *
+ * The body is the durable record itself ({@link WorktreeSweepResultSchema},
+ * `../identity/worker.ts`) plus the request it answers and the outcome vocabulary
+ * — imported rather than re-declared, the move `WorkerUpdateTargetSchema` and
+ * `CliQuotaSnapshotSchema` already make, so the shape stored and the shape sent
+ * cannot drift. `removed` is capped and `removedCount` carries the true total, and
+ * `message` is bounded operator-facing prose carrying no secret: the machine
+ * composes it from its own paths and a failing sweep's error text.
+ */
+export const ReportWorktreeSweepDeliveryRequestSchema = WorktreeSweepResultSchema.extend({
+	/** The request this answers ({@link WorktreeSweepSchema}). */
+	requestId: z.string().uuid(),
+	status: WorktreeSweepStatusSchema,
+	protocolVersion: z.number().int(),
+});
+export type ReportWorktreeSweepDeliveryRequest = z.infer<
+	typeof ReportWorktreeSweepDeliveryRequestSchema
+>;
+
+/**
+ * `POST /worker/delivery/worktree-sweep-report` success body — whether this report
+ * closed the request that is actually pending.
+ *
+ * `false` is not an error and never a refusal, exactly as it is not for the update
+ * report: the outcome is recorded either way. It says the row has since moved on —
+ * an operator asked again, or this is a duplicate of a report already recorded — so
+ * the pending request was left standing for the push that will answer it.
+ */
+export const ReportWorktreeSweepDeliveryResponseSchema = z.object({
+	recorded: z.boolean(),
+});
+export type ReportWorktreeSweepDeliveryResponse = z.infer<
+	typeof ReportWorktreeSweepDeliveryResponseSchema
 >;

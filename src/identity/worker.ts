@@ -117,6 +117,94 @@ export const WorkerUpdateStateSchema = z.object({
 export type WorkerUpdateState = z.infer<typeof WorkerUpdateStateSchema>;
 
 /**
+ * How many removals one report carries at most (issue #955). The true total
+ * travels beside the list as `removedCount`, so the cap costs detail and never
+ * the count — the wire refusing to be a log sink, exactly as the update report's
+ * `message` bound does.
+ */
+export const WORKTREE_SWEEP_REMOVAL_CAP = 200;
+
+/**
+ * What became of a worktree sweep a machine was asked for (issue #955): `swept`
+ * when every named project was swept, `failed` when at least one threw. A
+ * project-level failure is *counted* rather than fatal — the rest are still swept
+ * — so `failed` means "this report is incomplete", never "nothing happened".
+ */
+export const WorktreeSweepStatusSchema = z.enum(['swept', 'failed']);
+export type WorktreeSweepStatus = z.infer<typeof WorktreeSweepStatusSchema>;
+
+/**
+ * One checkout a machine removed, and the work that removal destroyed — phase
+ * 1's `AbandonedWorktreeRemoval` (`../worktree/abandoned.ts`) plus the
+ * `projectId` it was swept under, since one report covers several projects.
+ *
+ * `hadUncommittedChanges` / `hadUnpushedCommits` are the whole reason the record
+ * is durable rather than a log line on the machine: an age-based sweep removes a
+ * checkout holding real work *by design*, and the operator has to be able to read
+ * afterwards that it did.
+ */
+export const WorktreeSweepRemovalSchema = z.object({
+	projectId: z.string().min(1),
+	taskId: z.string().min(1),
+	path: z.string().min(1),
+	/** ISO-8601 — the newest "touched" signal the sweep found for this checkout. */
+	lastTouchedAt: z.string().min(1),
+	ageDays: z.number().nonnegative(),
+	hadUncommittedChanges: z.boolean(),
+	hadUnpushedCommits: z.boolean(),
+});
+export type WorktreeSweepRemoval = z.infer<typeof WorktreeSweepRemovalSchema>;
+
+/**
+ * The outcome of one sweep across every project a machine was asked about —
+ * stored verbatim on the row (`workers.worktree_sweep_result`) and carried
+ * verbatim on the wire ({@link ReportWorktreeSweepDeliveryRequestSchema},
+ * `../transport/protocol.ts`), so the record an operator reads is the machine's
+ * own answer rather than a re-derivation of it.
+ *
+ * `removedCount` is the true total and `removed` the capped detail, so a machine
+ * that removed more than {@link WORKTREE_SWEEP_REMOVAL_CAP} checkouts still
+ * reports how many. `keptLiveCount` is the count that age alone did not remove
+ * because something still holds them, which is the number that says the liveness
+ * gate is working rather than that nothing was old enough.
+ */
+export const WorktreeSweepResultSchema = z.object({
+	removed: z.array(WorktreeSweepRemovalSchema).max(WORKTREE_SWEEP_REMOVAL_CAP),
+	removedCount: z.number().int().nonnegative(),
+	keptLiveCount: z.number().int().nonnegative(),
+	failedCount: z.number().int().nonnegative(),
+	message: z.string().min(1).max(4000),
+});
+export type WorktreeSweepResult = z.infer<typeof WorktreeSweepResultSchema>;
+
+/**
+ * The abandoned-worktree sweep an operator asked a machine for, and what came of
+ * it (issue #955) — one value rather than five loose columns, on
+ * {@link WorkerUpdateStateSchema}'s reasoning: a consumer must not be able to read
+ * an outcome without the request it answers.
+ *
+ * `requestId` is the pending marker: non-null means a push is still owed an
+ * answer, `null` that the machine has reported (or that a later request
+ * superseded this one). `status`/`reportedAt`/`result` are `null` until one is
+ * reported.
+ *
+ * **Only the most recent sweep per machine is kept.** This is deliberately not a
+ * history table: with phase 3's weekly cadence the one retained sweep is
+ * precisely "last week's", which is the question the record exists to answer.
+ *
+ * The whole value is `null` on `Worker.worktreeSweep` until somebody asks — which,
+ * like `drainingSince` and `update`, is what every row says until an operator acts.
+ */
+export const WorkerWorktreeSweepStateSchema = z.object({
+	requestId: z.string().uuid().nullable(),
+	requestedAt: z.date(),
+	status: WorktreeSweepStatusSchema.nullable(),
+	reportedAt: z.date().nullable(),
+	result: WorktreeSweepResultSchema.nullable(),
+});
+export type WorkerWorktreeSweepState = z.infer<typeof WorkerWorktreeSweepStateSchema>;
+
+/**
  * A registered worker. `ownerUserId` is a `users.id` (`uuid`, the SWARM user who
  * operates the machine); `displayName` is its human-facing label, unique per
  * owner (`src/db/schema/workers.ts`); `capabilities` is the set of agent
@@ -210,6 +298,16 @@ export const WorkerSchema = z.object({
 	 * how the control plane sees the new build arrive.
 	 */
 	update: WorkerUpdateStateSchema.nullable(),
+	/**
+	 * The abandoned-worktree sweep an operator asked this machine for and what came
+	 * of it (issue #955), or `null` while nobody has asked. The operator's statement
+	 * and the machine's answer to it, exactly like `update` above: the handshake
+	 * never rewrites it, and only the machine's own report on its own delivery route
+	 * fills the outcome in. Unlike `update` it has no draining precondition — a sweep
+	 * disturbs no in-flight run, because a checkout a phase still holds reads as
+	 * leased and is skipped.
+	 */
+	worktreeSweep: WorkerWorktreeSweepStateSchema.nullable(),
 	createdAt: z.date(),
 	updatedAt: z.date(),
 });

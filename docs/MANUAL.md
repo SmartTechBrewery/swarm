@@ -344,6 +344,40 @@ pairing is what says the update was tried and did not hold. It has to work this 
 because a build that cannot connect has taken away the only channel that could have
 told it to go back.
 
+**Clearing its abandoned checkouts.** A machine accumulates `task-<id>` worktrees
+that nothing will adopt again — an interrupted agent leaves a stray file behind and
+the ordinary retention sweep then keeps that checkout forever, because its reclaim
+gate refuses anything dirty or carrying unpushed commits. The age-based sweep is the
+second entry point, and an operator asks one machine for it (issue #955):
+
+```bash
+swarm workers sweep-worktrees <worker-id>
+```
+
+It prints what that machine's **last** sweep removed — each path with how long it had
+gone untouched and whether it held uncommitted or unpushed work — and then asks for a
+new one; the fresh answer lands on the row later and is printed by the next run of the
+command. A machine keeps only its most recent sweep, so that first print is also the
+last moment the previous one is readable.
+
+The machine sweeps every project it is enrolled in, removing each `task-<id>`
+checkout directly under that project's `worktreeRoot` that has gone untouched for its
+`worktreeRetention.abandonedAfterDays` (10 by default —
+[`docs/configuration.md`](./configuration.md)) — **including** the ones holding
+uncommitted or unpushed work, which is exactly the case the retention sweep cannot
+reach. That is why what each removal destroyed is recorded rather than only logged on
+the machine. A checkout something is still **using** is never removed at any age: a
+run leasing it, or a resumable deferred/failed run pinning it, exempts it, and the
+daemon's own in-flight set is what answers that for the machine it is running on.
+
+Unlike an update this needs **no drain and no host opt-in**: a sweep disturbs no
+in-flight run, and it removes only `task-<id>` checkouts under a project's own
+worktree root, so `abandonedAfterDays` is the whole of the opt-out. A machine that is
+offline when you ask keeps the request on its row and is handed it on its next
+connection. One project failing is counted and reported and the rest are still swept.
+It is the machine owner's own call, so sign in as them. There is no schedule and no
+fleet-wide form yet — phase 3 of issue #951 adds both.
+
 The **router** dequeues and dispatches; a project's **Maximum Concurrent Jobs**
 setting and each enrolled worker's **concurrency allocation** are what bound how
 many of its runs happen at once. Dispatch always runs on the control

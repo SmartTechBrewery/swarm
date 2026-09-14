@@ -105,6 +105,7 @@ import {
 } from './worker-connections.js';
 import { advanceWorkerRollout } from './worker-rollout-advance.js';
 import { resendPendingWorkerUpdateToWorker } from './worker-update-dispatch.js';
+import { resendPendingWorktreeSweepToWorker } from './worktree-sweep-dispatch.js';
 
 // The application-defined WebSocket close codes are part of the wire contract, so
 // they live in the protocol module (the single source of truth for every frame)
@@ -244,6 +245,15 @@ export interface WorkerTransportDeps {
 	 */
 	resendPendingWorkerUpdate: (workerId: string) => void;
 	/**
+	 * And the same for a worktree sweep requested while the socket was down (issue
+	 * #955). More load-bearing here than for an update: a sweep has no draining
+	 * precondition, so the request can be made at any time — and phase 3 will make it
+	 * on a schedule nobody is watching, where a machine that happened to be offline
+	 * would otherwise simply never be swept. Fire-and-forget by contract, like the
+	 * hooks above.
+	 */
+	resendPendingWorktreeSweep: (workerId: string) => void;
+	/**
 	 * A machine coming back is the event a fleet rollout's come-back verdict waits for
 	 * (issue #941, `./worker-rollout-advance.ts`): by the time this fires the daemon
 	 * has already taken its fenced lease and declared the build it is running, which
@@ -288,6 +298,7 @@ function defaultDeps(): WorkerTransportDeps {
 		},
 		resendRunCancellations: resendRunCancellationsToWorker,
 		resendPendingWorkerUpdate: resendPendingWorkerUpdateToWorker,
+		resendPendingWorktreeSweep: resendPendingWorktreeSweepToWorker,
 		advanceWorkerRollout,
 	};
 }
@@ -812,6 +823,13 @@ export function handleWorkerStreamOpen(
 	// away reaches it here or not at all, since its notification fired once.
 	runConnectionHook('re-pushing a self-update recorded while the worker was away', workerId, () =>
 		deps.resendPendingWorkerUpdate(workerId),
+	);
+	// Same window again (issue #955), and the request is durable on the row for
+	// exactly this: a sweep asked of a machine that was offline reaches it here.
+	runConnectionHook(
+		're-pushing a worktree sweep recorded while the worker was away',
+		workerId,
+		() => deps.resendPendingWorktreeSweep(workerId),
 	);
 	// A machine that applied an update comes back through exactly this handshake, so
 	// this is where a fleet rollout waiting on it learns that it did (issue #941).

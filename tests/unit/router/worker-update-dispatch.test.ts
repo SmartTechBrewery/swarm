@@ -65,6 +65,7 @@ function workerWith(update: Worker['update']): Worker {
 		drainingSince: new Date('2026-09-13T10:00:00Z'),
 		build: null,
 		update,
+		worktreeSweep: null,
 		createdAt: new Date(0),
 		updatedAt: new Date(0),
 	};

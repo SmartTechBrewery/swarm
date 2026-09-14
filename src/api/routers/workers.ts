@@ -14,6 +14,8 @@ import {
 	WorkerCapabilityReductionError,
 	WorkerDisplayNameSchema,
 	type WorkerUpdateState,
+	type WorktreeSweepResult,
+	type WorktreeSweepStatus,
 } from '../../identity/worker.js';
 import {
 	AllowedClisNotCapableError,
@@ -44,6 +46,7 @@ import {
 	registerWorker,
 	renameWorker,
 	requestWorkerUpdate,
+	requestWorktreeSweep,
 	setWorkerDraining,
 	type Worker,
 } from '../../identity/worker-service.js';
@@ -51,6 +54,7 @@ import { RolloutWaveSizeSchema } from '../../identity/worker-update-rollout.js';
 import { requireProjectSCMProviderId } from '../../integrations/scm/registry.js';
 import { WorkerUpdateTargetSchema } from '../../lib/build-identity.js';
 import { logger } from '../../lib/logger.js';
+import { publishWorktreeSweepRequest } from '../../queue/worker-sweeps.js';
 import { publishWorkerUpdateRequest } from '../../queue/worker-updates.js';
 import { TriggerPhaseSchema } from '../../triggers/types.js';
 import {
@@ -136,7 +140,8 @@ import { workerScmCredentialsRouter } from './workerScmCredentials.js';
  *   (layer-1 override, `resolveOwnedWorker`) — offering a worker to a project
  *   reads as administering the project side of that offer; `rename`,
  *   `setDeclaredCapabilities`, `remove`, `setDraining`, `requestUpdate`,
- *   `requestUpdateForMine`, `startFleetUpdate`, `fleetUpdateStatus`, `setConsent`,
+ *   `requestUpdateForMine`, `startFleetUpdate`, `fleetUpdateStatus`,
+ *   `requestWorktreeSweep`, `setConsent`,
  *   and `updateConstraints`
  *   are the machine owner's own call about their own machine and admit no such
  *   override (`resolveStrictlyOwnedWorker`/`resolveOwnedEnrollment`). Either
@@ -417,6 +422,24 @@ const AllowedClisInput = z.array(AgentCliSchema).min(1);
  */
 const AllowedPhasesInput = z.array(TriggerPhaseSchema).min(1);
 const ConcurrencyInput = z.number().int().positive();
+
+/**
+ * The wire form of the sweep a machine last reported (issue #955), or `null` when it
+ * has never been asked or has not answered yet. A pending request with no outcome
+ * reads as `null` too: there is nothing to report about a sweep that has not happened.
+ */
+function previousSweepView(sweep: Worker['worktreeSweep']): {
+	reportedAt: string;
+	status: WorktreeSweepStatus;
+	result: WorktreeSweepResult;
+} | null {
+	if (!sweep?.reportedAt || !sweep.status || !sweep.result) return null;
+	return {
+		reportedAt: sweep.reportedAt.toISOString(),
+		status: sweep.status,
+		result: sweep.result,
+	};
+}
 
 export const workersRouter = router({
 	// The worker owner's own operator SCM credential per provider (issue #766),
@@ -785,6 +808,58 @@ export const workersRouter = router({
 				target: input.target,
 				requestedAt: updated.update?.requestedAt.toISOString() ?? null,
 				drainingSince: updated.drainingSince?.toISOString() ?? null,
+			};
+		}),
+
+	// Ask one of the caller's own machines to sweep its abandoned `task-<id>`
+	// checkouts (issue #955). The request is recorded on the worker row and published;
+	// the router — the process that holds worker sockets — turns that into the push
+	// (`../../router/worktree-sweep-dispatch.ts`), and the machine reports back on its
+	// own delivery route.
+	//
+	// Strictly owner-only, exactly like `requestUpdate`: removing directories from
+	// somebody's hardware is the machine operator's call, so an `instanceAdmin` who
+	// does not own it gets the same NOT_FOUND a stranger does.
+	//
+	// **Deliberately no draining precondition**, which is where this parts company
+	// with `requestUpdate`. An update replaces the code under a running daemon and so
+	// needs a machine no new work is dispatched to; a sweep disturbs no in-flight run,
+	// because the daemon's own in-flight set is what makes a leased checkout read as
+	// live and be skipped. Requiring a drain would also make phase 3's unattended
+	// weekly sweep impossible — so there is no `in-pool` refusal to word here, and the
+	// answer is simply the request the row now carries.
+	//
+	// Nothing about *what* to sweep is decided here: the projects and their thresholds
+	// are read off the machine's approved enrollments when the frame is built, which is
+	// what keeps a request made today from sweeping a project the machine left before
+	// it next connects. Re-issuing overwrites an unanswered request, and there is no
+	// cancel — a machine that has not acted is left with a request nothing pushes again
+	// until it reconnects.
+	requestWorktreeSweep: authedProcedure
+		.input(z.object({ workerId: z.string().uuid() }))
+		.mutation(async ({ ctx, input }) => {
+			// Read before the write, because the write is what destroys it: a machine keeps
+			// only its most recent sweep, so asking again is also the moment the previous
+			// answer stops being readable. Returning it here is what lets one command both
+			// ask and report — the operator sees what the last sweep removed, and that is
+			// the record they would otherwise have lost by asking.
+			const previous = await resolveStrictlyOwnedWorker(ctx.user, input.workerId);
+			const requestId = randomUUID();
+			const updated = await requestWorktreeSweep(input.workerId, requestId);
+			if (!updated) throw workerNotFound(input.workerId);
+			// After the durable write, and never awaited for correctness: the request lives
+			// on the row, so a router that misses this notification pushes it the moment the
+			// machine next connects. The publish swallows its own failures for that reason.
+			await publishWorktreeSweepRequest(input.workerId);
+			return {
+				workerId: updated.id,
+				displayName: updated.displayName,
+				requestId,
+				requestedAt: updated.worktreeSweep?.requestedAt.toISOString() ?? null,
+				// The sweep this request replaced, or `null` when the machine has never been
+				// asked or never answered. Serialised rather than returned as the domain value,
+				// like every other date on this router.
+				previousSweep: previousSweepView(previous.worktreeSweep),
 			};
 		}),
 

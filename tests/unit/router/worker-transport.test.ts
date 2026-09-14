@@ -56,6 +56,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		// In the pool (issue #919) unless a case overrides it.
 		drainingSince: null,
 		update: null,
+		worktreeSweep: null,
 		build: null,
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		updatedAt: new Date('2026-01-01T00:00:00Z'),
@@ -109,6 +110,7 @@ function makeDeps(overrides: Partial<WorkerTransportDeps> = {}): WorkerTransport
 		onWorkerTransportRestored: vi.fn(),
 		resendRunCancellations: vi.fn(),
 		resendPendingWorkerUpdate: vi.fn(),
+		resendPendingWorktreeSweep: vi.fn(),
 		advanceWorkerRollout: vi.fn(),
 		...overrides,
 	};
@@ -1429,6 +1431,7 @@ describe('GET /worker/stream cancellation re-push on reconnect', () => {
 
 		expect(deps.resendRunCancellations).not.toHaveBeenCalled();
 		expect(deps.resendPendingWorkerUpdate).not.toHaveBeenCalled();
+		expect(deps.resendPendingWorktreeSweep).not.toHaveBeenCalled();
 		expect(deps.advanceWorkerRollout).not.toHaveBeenCalled();
 	});
 
@@ -1441,6 +1444,18 @@ describe('GET /worker/stream cancellation re-push on reconnect', () => {
 		const { handlers, ws } = await connect(deps);
 
 		expect(deps.resendPendingWorkerUpdate).toHaveBeenCalledWith(WORKER_ID);
+		await handlers.onClose?.({}, ws);
+	});
+
+	// Issue #955 — the same window again, and the request that most needs it: a sweep
+	// has no draining precondition, so it can be asked of a machine that simply happens
+	// to be offline, and phase 3 will ask on a schedule nobody is watching.
+	it('re-states a pending worktree sweep when the worker reconnects', async () => {
+		const deps = makeDeps();
+
+		const { handlers, ws } = await connect(deps);
+
+		expect(deps.resendPendingWorktreeSweep).toHaveBeenCalledWith(WORKER_ID);
 		await handlers.onClose?.({}, ws);
 	});
 
