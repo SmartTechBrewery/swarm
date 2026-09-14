@@ -218,10 +218,18 @@ export const workers = pgTable(
 		 * checkout holding real work by design, so an operator must be able to read
 		 * afterwards that it did.
 		 *
-		 * **Only the most recent sweep per machine is retained**: asking again overwrites
-		 * all five. This is deliberately *not* a history table — with phase 3's weekly
-		 * cadence the one sweep kept is precisely "last week's", which is the question
-		 * the record exists to answer.
+		 * **Only the most recent *reported* sweep per machine is retained**: a new report
+		 * overwrites the outcome triple. This is deliberately *not* a history table —
+		 * with the weekly cadence of issue #956 the one sweep kept is precisely "last
+		 * week's", which is the question the record exists to answer.
+		 *
+		 * **Asking again overwrites the request pair only** (issue #956): the outcome
+		 * triple survives an unanswered question, so a machine that has not yet answered
+		 * the latest weekly ask still reads as what it last swept rather than as never
+		 * swept. That means `worktree_sweep_reported_at` may predate
+		 * `worktree_sweep_requested_at`, and comparing the two is how a reader tells
+		 * "this outcome answers the request on the row" from "this outcome answers an
+		 * earlier one, and the current request is still outstanding".
 		 *
 		 * All nullable with no default and nothing backfilled, on `draining_since`'s
 		 * contract: NULL is what every row written before these columns says, and is

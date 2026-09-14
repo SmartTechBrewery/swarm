@@ -364,8 +364,9 @@ swarm workers sweep-worktrees <worker-id>
 It prints what that machine's **last** sweep removed — each path with how long it had
 gone untouched and whether it held uncommitted or unpushed work — and then asks for a
 new one; the fresh answer lands on the row later and is printed by the next run of the
-command. A machine keeps only its most recent sweep, so that first print is also the
-last moment the previous one is readable.
+command. A machine keeps only its most recent sweep, and that one record is replaced
+when the next answer arrives rather than when the question is asked — so a machine
+asked and not yet heard from still reads as what it last swept.
 
 The machine sweeps every project it has an **active** enrollment for, removing each
 `task-<id>` checkout directly under that project's `worktreeRoot` that has gone
@@ -389,8 +390,30 @@ in-flight run, and it removes only `task-<id>` checkouts under a project's own
 worktree root, so `abandonedAfterDays` is the whole of the opt-out. A machine that is
 offline when you ask keeps the request on its row and is handed it on its next
 connection. One project failing is counted and reported and the rest are still swept.
-It is the machine owner's own call, so sign in as them. There is no schedule and no
-fleet-wide form yet — phase 3 of issue #951 adds both.
+It is the machine owner's own call, so sign in as them.
+
+**You do not have to ask.** The API server asks the **whole installation** once a
+week on its own clock (issue #956), so every machine clears its own abandoned
+checkouts with no operator action. The cadence is
+`SWARM_WORKTREE_ABANDONED_SWEEP_INTERVAL_MS`
+([`docs/configuration.md`](./configuration.md), default 7d) and it is the interval
+after which a sweep falls **due**, not a timer period: an hourly tick compares it
+against a durable marker, so restarting the API server does not re-trigger one, and a
+machine that was offline when the signal went out is handed its request on the next
+connection — or, failing that, asked again the following week. Read back what the
+fleet deleted from any one machine:
+
+```bash
+swarm workers sweeps
+```
+
+One block per machine with its last recorded sweep and every path that sweep removed;
+a machine that has never reported prints "never swept", and one that has been asked
+but not yet heard from says so beneath the sweep it did report. Unlike
+`sweep-worktrees` it asks for nothing, which is what makes it the right command once
+nobody is doing the asking, and the weekly ask leaves every machine's stored answer
+standing — so "never swept" is never an artefact of the schedule. It reads every
+owner's machines, so it is an installation administrator's.
 
 The **router** dequeues and dispatches; a project's **Maximum Concurrent Jobs**
 setting and each enrolled worker's **concurrency allocation** are what bound how
@@ -442,6 +465,27 @@ started**, so the remedy is to update that machine's checkout and restart its
 daemon; see [`docs/launchd-worker-autostart.md`](./launchd-worker-autostart.md).
 On the machine itself, the daemon's `worker transport client starting` log line
 reports the same build at startup.
+
+**A task checkout vanished — where to look.** Two sweeps remove `task-<id>`
+worktrees and they remove different things. The hourly retention sweep keeps the
+project's most-recently-active `worktreeRetention.maxWorktrees` and *never* removes a
+checkout holding uncommitted changes or unpushed commits. The age-based abandoned
+sweep does remove those, by design, once nothing has touched the checkout for
+`worktreeRetention.abandonedAfterDays` — and since issue #956 it runs unattended
+across the whole installation once a week, so a checkout can disappear with nobody
+having asked. Every such removal is recorded rather than only logged:
+
+```bash
+swarm workers sweeps          # every machine's last sweep, path by path
+```
+
+Each removed path comes with how long it had gone untouched and whether it held
+uncommitted or unpushed work. On the machine itself the same removals are logged at
+`warn`. A checkout something was still *using* — leased by a live run, or pinned by a
+resumable deferred/failed one — is exempt at any age, so neither sweep is the
+explanation for one that vanished mid-run. Raise `abandonedAfterDays` for a project
+whose checkouts are meant to sit untouched for longer, or lengthen
+`SWARM_WORKTREE_ABANDONED_SWEEP_INTERVAL_MS` to sweep the fleet less often.
 
 **A renamed repository produces no failure at all.** Cards stop dispatching and
 nothing is marked failed: the router logs `pm-status: work item has no backing SCM

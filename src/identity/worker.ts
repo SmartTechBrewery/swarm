@@ -181,15 +181,26 @@ export type WorktreeSweepResult = z.infer<typeof WorktreeSweepResultSchema>;
  * The abandoned-worktree sweep an operator asked a machine for, and what came of
  * it (issue #955) — one value rather than five loose columns, on
  * {@link WorkerUpdateStateSchema}'s reasoning: a consumer must not be able to read
- * an outcome without the request it answers.
+ * an outcome without the request it answers — and, since issue #956 made the
+ * questions unattended and weekly, without the instant that outcome was reported
+ * at, which is what says whether it answers the request now outstanding.
  *
  * `requestId` is the pending marker: non-null means a push is still owed an
  * answer, `null` that the machine has reported (or that a later request
  * superseded this one). `status`/`reportedAt`/`result` are `null` until one is
  * reported.
  *
+ * **The outcome answers `requestedAt` only when `reportedAt` is at or after it**
+ * (issue #956). Asking again replaces `requestId`/`requestedAt` and leaves the
+ * outcome standing, so a non-null `requestId` beside an earlier `reportedAt` is a
+ * machine that swept once and has not yet answered the question now outstanding —
+ * the ordinary state of a laptop asleep when the weekly signal went out. Erasing
+ * the outcome at ask time instead would make the fleet readout say "never swept"
+ * for a machine that swept last week, which is the one thing the record exists to
+ * deny.
+ *
  * **Only the most recent sweep per machine is kept.** This is deliberately not a
- * history table: with phase 3's weekly cadence the one retained sweep is
+ * history table: with the weekly cadence of issue #956 the one retained sweep is
  * precisely "last week's", which is the question the record exists to answer.
  *
  * The whole value is `null` on `Worker.worktreeSweep` until somebody asks — which,

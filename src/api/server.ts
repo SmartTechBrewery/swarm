@@ -211,10 +211,11 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 	configureLogger({ component: 'api' });
 	const port = Number(process.env.API_PORT ?? 3101);
 	const app = createApiApp();
-	// Control-plane host maintenance (issue #550): the orphaned-run reap, CLI quota
-	// discovery, and the worktree retention sweep. This process is the one on the
-	// control-plane host that has all three of `DATABASE_URL`, the operator's PATH,
-	// and the repository checkout (`src/api/maintenance.ts`).
+	// Control-plane host maintenance (issue #550): the orphaned-run reap, the worktree
+	// retention sweep, and the weekly fleet abandoned-worktree sweep (issue #956).
+	// This process owns them because it is the one on the control-plane host with
+	// `DATABASE_URL`, the operator's PATH, and the repository checkout — which of the
+	// three each chore actually needs is stated in `src/api/maintenance.ts`.
 	const maintenance = startHostMaintenance();
 	const server = serve({ fetch: app.fetch, port, hostname: '127.0.0.1' }, () => {
 		logger.debug('swarm-api: listening', { port, hostname: '127.0.0.1' });

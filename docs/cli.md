@@ -436,6 +436,7 @@ swarm workers update --all <ref> [--wave <n>]
 swarm workers update --status
 swarm workers request-update <ref>
 swarm workers sweep-worktrees <worker-id>
+swarm workers sweeps
 swarm workers enroll <worker-id> <project-id> --cli <c1,c2,...> [--concurrency <n>] [--active] [--consent]
 swarm workers update-enrollment <worker-id> <project-id> [--cli <c1,c2,...>] [--concurrency <n>]
 swarm workers approve <worker-id> <project-id>
@@ -499,6 +500,9 @@ whether a machine moves stay the owner's (the host `SWARM_WORKER_SELF_UPDATE` op
 and the drain, which this command never performs). A non-administrator running it is
 refused outright rather than shown their own machines.
 [`docs/onboarding-worker.md`](./onboarding-worker.md) states the rule beside #800's.
+**`sweeps` is installation-wide for the same reason narrowing 3 makes `list` one**
+(issue #956): it is a *read* across every owner's machines, so it is an
+administrator's on #647's terms and is likewise refused rather than narrowed.
 
 One thing also stopped being **atomic**: `enroll`'s `--active` and `--consent` are
 applied as separate calls after the create (issue #784), so a refusal of either
@@ -782,17 +786,38 @@ unchanged.
   **It prints the machine's last sweep, then asks for a new one.** Each removed path
   comes with how many days it had gone untouched and whether it held uncommitted or
   unpushed work, under a line counting what was removed, kept live, and failed. Both
-  halves are in one command because the request is what *destroys* the previous
-  record — a machine keeps only its most recent sweep — so this print is the last
-  moment it is readable. The new answer lands on the row later and is printed by the
-  next run, exactly as `update`'s outcome is read back through `list`.
+  halves are in one command because a machine keeps only its most recent sweep, so an
+  operator asking for another wants to see the one it stands to replace. Asking does
+  not itself erase it (issue #956) — the stored record is replaced by the machine's
+  next *report* — so a machine asked and not yet heard from still reads as what it
+  last swept, here and in `sweeps`. The new answer lands on the row later and is
+  printed by the next run, exactly as `update`'s outcome is read back through `list`.
   **No drain and no host opt-in**, unlike `update`: a sweep disturbs no in-flight run,
   and it removes only `task-<id>` checkouts under a project's own `worktreeRoot`, so
   `worktreeRetention.abandonedAfterDays` is the whole of the opt-out. A machine that
   is offline when you ask keeps the request on its row and is handed it on its next
   connection; one project failing is counted and reported and the rest are still
-  swept. Owner-only, like `drain` and `update`. There is no schedule and no
-  fleet-wide form — phase 3 of issue #951 adds both.
+  swept. Owner-only, like `drain` and `update`. **You do not have to ask**: the API
+  server asks every machine on the installation once a week on its own clock
+  (`SWARM_WORKTREE_ABANDONED_SWEEP_INTERVAL_MS`, issue #956), and `sweeps` below is
+  how those answers are read.
+- **`sweeps`** — what the **fleet** last deleted (issue #956): one block per machine
+  on the installation with its last recorded sweep and every path that sweep removed,
+  each with its age and whether it held uncommitted or unpushed work. A machine that
+  has never reported prints "never swept"; one that has been asked and not yet
+  answered — typically offline since the weekly signal went out — says so, and is
+  handed the request on its next connection.
+  **It asks for nothing**, which is exactly what `sweep-worktrees` cannot do: before
+  this existed, reading a machine's sweep cost that machine another sweep. Once
+  sweeps are requested by a schedule rather than by the operator reading them, this is
+  the ordinary way to read them. "Never swept" means the machine has never reported
+  one — an unanswered weekly ask never blanks the record, so the last sweep and the
+  outstanding request are printed together.
+  An **installation administrator's** read, like the unfiltered `list` (issue #647):
+  it reads across every owner's machines. A caller who is not one is refused outright
+  rather than shown their own, for the same reason `request-update` is. Exit code 0
+  whatever it prints, a fleet that has never swept included — a report, not a
+  pass/fail. It takes no arguments.
 - **`enroll`** — enroll a worker into a project with allowed CLIs (`--cli`, a
   subset of the worker's capabilities) and `--concurrency`, this worker's share of
   the project. Omit `--concurrency` for `1` (the default): one of the project's

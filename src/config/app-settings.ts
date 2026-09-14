@@ -19,6 +19,8 @@
  * added `appearance.theme`, the dashboard's persisted theme choice — unlike
  * `agents`, it defaults *within the schema* (`.default('dark')`) rather than
  * downstream, since there's no coded fallback layer for it to fall through to.
+ * Issue #956 added `maintenance`, which is the first key here that is **not** a
+ * setting at all but machine-written state (see its own comment).
  * The top-level object shape is deliberate so future global settings (host
  * URL, worker concurrency, …) drop in as sibling keys without a migration (the
  * blob is extensible).
@@ -58,10 +60,40 @@ export const AppAppearanceSettingsSchema = z
 export type AppAppearanceSettings = z.infer<typeof AppAppearanceSettingsSchema>;
 
 /**
+ * Installation-wide **maintenance markers** — machine-written state rather than
+ * an operator setting, and the one key here that nobody is meant to edit
+ * (issue #956).
+ *
+ * `lastFleetWorktreeSweepAt` (ISO-8601) is when the API server last asked the
+ * whole installation to sweep its abandoned worktrees. It is durable precisely
+ * because the cadence has to survive a restart: an API server restarted daily
+ * must not fan out daily, so `SWARM_WORKTREE_ABANDONED_SWEEP_INTERVAL_MS` is
+ * compared against this marker (`src/api/maintenance.ts`) rather than being a
+ * timer period. Absent until the first fan-out, which is what makes a fresh
+ * installation due immediately.
+ *
+ * It lives in this blob rather than in a table of its own for the reason the
+ * header already states — the blob is extensible, and this is one instant — and
+ * it is deliberately **not** surfaced on the settings tRPC router's vocabulary or
+ * on the dashboard: editing it would only move a sweep. It rides `settings.update`
+ * untouched because both dashboard writers merge onto the settings they loaded.
+ */
+export const AppMaintenanceSettingsSchema = z
+	.object({
+		lastFleetWorktreeSweepAt: z.string().datetime().optional(),
+	})
+	.describe('Machine-written maintenance markers — never edited by an operator');
+
+export type AppMaintenanceSettings = z.infer<typeof AppMaintenanceSettingsSchema>;
+
+/**
  * The whole global-settings blob. `agents` is optional so an empty `{}` is a
  * valid (all-defaults) settings object; `appearance` always materializes (with
  * its own defaulted `theme`) so every parse — including of `{}` — yields an
  * effective theme rather than requiring every caller to fall back manually.
+ * `maintenance` is optional and never defaulted: an absent marker is the honest
+ * "this has not happened yet", and materializing an empty object would say the
+ * same thing in more bytes.
  * New global settings can be added as sibling keys later without reshaping
  * what's stored.
  */
@@ -69,6 +101,7 @@ export const AppSettingsSchema = z
 	.object({
 		agents: AppAgentsSettingsSchema.optional(),
 		appearance: AppAppearanceSettingsSchema.default({ theme: 'dark' }),
+		maintenance: AppMaintenanceSettingsSchema.optional(),
 	})
 	.describe('SWARM global (app-wide) settings, persisted as one jsonb blob');
 

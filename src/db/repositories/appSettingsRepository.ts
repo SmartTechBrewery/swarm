@@ -60,3 +60,38 @@ export async function updateAppSettings(settings: AppSettings): Promise<AppSetti
 		});
 	return settings;
 }
+
+/**
+ * When the installation last had an abandoned-worktree sweep fanned out across
+ * it, or `null` when none ever has (issue #956) — the durable marker the API
+ * server's weekly fleet sweep decides due-ness against, so a restart cannot
+ * re-trigger one.
+ *
+ * `null` for an unparseable instant as well as an absent one, which makes a
+ * corrupted marker read as "never swept" — due now — rather than as a date
+ * arithmetic on `NaN` would silently make never due again.
+ */
+export async function getLastFleetWorktreeSweepAt(): Promise<Date | null> {
+	const marker = (await getAppSettings()).maintenance?.lastFleetWorktreeSweepAt;
+	if (!marker) return null;
+	const at = new Date(marker);
+	return Number.isNaN(at.getTime()) ? null : at;
+}
+
+/**
+ * Record that the installation was swept at `at`, leaving every other key in the
+ * blob alone.
+ *
+ * Read-modify-write rather than a column update, because the marker shares one
+ * jsonb value with the operator's own settings. The lost-update window that opens
+ * is the same one `settings.update` already has with itself, and costs at most one
+ * extra fan-out a week later — never a lost setting, since both dashboard writers
+ * merge onto the settings they loaded.
+ */
+export async function recordFleetWorktreeSweepAt(at: Date): Promise<void> {
+	const settings = await getAppSettings();
+	await updateAppSettings({
+		...settings,
+		maintenance: { ...settings.maintenance, lastFleetWorktreeSweepAt: at.toISOString() },
+	});
+}

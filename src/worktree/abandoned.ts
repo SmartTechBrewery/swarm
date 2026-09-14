@@ -59,11 +59,12 @@
  * is still standing at ten days — and removing one would only take the liveness
  * answer away from the gate above.
  *
- * **One caller so far: an operator asking one machine** (issue #955). The control
- * plane pushes a `worktree-sweep` frame and the daemon runs this against its own
- * checkout root (`../transport/worktree-sweep.ts`) — the signal path issue #933
- * gave `src/worker/self-update.ts`, copied. Still nothing *schedules* it and there
- * is no fleet-wide form; both are phase 3 of issue #951.
+ * **Two callers, one signal path.** An operator asks one machine (issue #955) and
+ * the API server asks the whole installation once a week on its own clock (issue
+ * #956, `src/api/maintenance.ts` → `src/api/worktree-sweep-fanout.ts`); either way
+ * the control plane pushes a `worktree-sweep` frame and the daemon runs this against
+ * its own checkout root (`../transport/worktree-sweep.ts`) — the signal path issue
+ * #933 gave `src/worker/self-update.ts`, copied.
  */
 
 import { readFileSync, statSync } from 'node:fs';

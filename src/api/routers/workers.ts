@@ -108,7 +108,14 @@ import { workerScmCredentialsRouter } from './workerScmCredentials.js';
  *   host opt-in (`SWARM_WORKER_SELF_UPDATE`) and the drain that makes a machine
  *   askable at all both stay the owner's, so nothing #800 reserved to them moves.
  *   The procedure's own comment carries the full reasoning and
- *   `docs/onboarding-worker.md` states it for operators.
+ *   `docs/onboarding-worker.md` states it for operators. **A second
+ *   installation-wide read joins them** (`listSweeps`, issue #956): every machine's
+ *   last recorded abandoned-worktree sweep and what it removed — the readout behind
+ *   `swarm workers sweeps`, and the only way to see a sweep without replacing it,
+ *   which matters once the sweeps are requested by a weekly schedule rather than by
+ *   the operator reading them. An administrator's on the same #647 terms, and kept
+ *   off the roster rows deliberately: one report carries up to 200 removed paths,
+ *   which no roster wants to be.
  * - **Owner self-service**, scoped to `ctx.user`: an owner registers a new
  *   machine (`register`, issue #799 — the network equivalent of `swarm workers
  *   register`, and the only procedure here that returns a secret), lists *their
@@ -425,8 +432,12 @@ const ConcurrencyInput = z.number().int().positive();
 
 /**
  * The wire form of the sweep a machine last reported (issue #955), or `null` when it
- * has never been asked or has not answered yet. A pending request with no outcome
- * reads as `null` too: there is nothing to report about a sweep that has not happened.
+ * has never answered one — which is the only thing that reads as `null` since issue
+ * #956: a request outstanding beside an older outcome still answers with that
+ * outcome, because asking no longer erases it (`../../db/repositories/workersRepository.ts`).
+ * The caller states the outstanding request separately (`pendingRequestedAt`), so
+ * "swept last week, asked again this morning, not heard from" is legible as both
+ * facts rather than collapsing into "never swept".
  */
 function previousSweepView(sweep: Worker['worktreeSweep']): {
 	reportedAt: string;
@@ -838,11 +849,12 @@ export const workersRouter = router({
 	requestWorktreeSweep: authedProcedure
 		.input(z.object({ workerId: z.string().uuid() }))
 		.mutation(async ({ ctx, input }) => {
-			// Read before the write, because the write is what destroys it: a machine keeps
-			// only its most recent sweep, so asking again is also the moment the previous
-			// answer stops being readable. Returning it here is what lets one command both
-			// ask and report — the operator sees what the last sweep removed, and that is
-			// the record they would otherwise have lost by asking.
+			// Read before the write, so the answer is the record as it stood when the
+			// question was asked. Since issue #956 the write no longer destroys it — a new
+			// request replaces the request pair alone and the reported outcome stands until
+			// the *next report* overwrites it — so this is a convenience rather than the
+			// last chance to read it: one command both asks and reports, and `sweeps` reads
+			// the same record without asking for anything.
 			const previous = await resolveStrictlyOwnedWorker(ctx.user, input.workerId);
 			const requestId = randomUUID();
 			const updated = await requestWorktreeSweep(input.workerId, requestId);
@@ -856,12 +868,64 @@ export const workersRouter = router({
 				displayName: updated.displayName,
 				requestId,
 				requestedAt: updated.worktreeSweep?.requestedAt.toISOString() ?? null,
-				// The sweep this request replaced, or `null` when the machine has never been
-				// asked or never answered. Serialised rather than returned as the domain value,
+				// The sweep on record when this request was made, or `null` when the machine
+				// has never answered one. Serialised rather than returned as the domain value,
 				// like every other date on this router.
 				previousSweep: previousSweepView(previous.worktreeSweep),
 			};
 		}),
+
+	// What the **fleet** last deleted — every machine's most recent recorded sweep
+	// (issue #956), which is the question the weekly schedule exists to make
+	// answerable from one place: `swarm workers sweeps`.
+	//
+	// A read rather than a request: before this existed the only way to see a
+	// machine's sweep was to ask it for another one, which is fine for one machine an
+	// operator is standing at and wrong for a fleet nobody asked to sweep in the first
+	// place. It reads the same record the weekly fan-out leaves standing — asking no
+	// longer erases the answer (`../../db/repositories/workersRepository.ts`), so a
+	// machine that swept last week and has not yet answered this week's ask reports
+	// both facts here rather than reading as never swept.
+	//
+	// **Installation-wide, so an instance administrator's**, on issue #647's rule for
+	// the unscoped roster: it reads across every owner's machines, which is an
+	// operator's view of the installation rather than a member's view of their own
+	// work. Refused outright rather than narrowed to the caller's own machines, for
+	// the reason `requestUpdateForInstallation` states: a partial answer read as the
+	// whole installation is worse than no answer. `FORBIDDEN` rather than
+	// `NOT_FOUND` — the caller named no worker id, so there is no existence to hide.
+	//
+	// Ordering is `listAllWorkers`' own (oldest first) and nothing here re-sorts:
+	// unlike the installation-wide *update* report there is no per-owner action to
+	// take from this, so there is no owner axis to group along.
+	listSweeps: authedProcedure.query(async ({ ctx }) => {
+		if (!isInstanceAdmin(ctx.user)) {
+			throw new TRPCError({
+				code: 'FORBIDDEN',
+				message:
+					`Reading the installation's worktree sweeps is available to instance ` +
+					`administrators only. Run \`swarm workers sweep-worktrees <worker-id>\` to ` +
+					`read and refresh the sweep on a machine you own.`,
+			});
+		}
+		const workers = await listAllWorkers();
+		return {
+			workers: workers.map((worker) => ({
+				workerId: worker.id,
+				displayName: worker.displayName,
+				// The outstanding request, if any — a machine asked but not yet heard from,
+				// which on a weekly unattended schedule is the ordinary state of one that has
+				// been offline since the signal went out rather than an anomaly.
+				pendingRequestedAt: worker.worktreeSweep?.requestId
+					? (worker.worktreeSweep.requestedAt.toISOString() ?? null)
+					: null,
+				// The same shape `requestWorktreeSweep` returns as `previousSweep`, so one
+				// reader serves both; `null` only for a machine that has never reported one,
+				// never merely because the request above is still outstanding.
+				lastSweep: previousSweepView(worker.worktreeSweep),
+			})),
+		};
+	}),
 
 	// The same request, asked of **every machine the caller owns** in one action
 	// (issue #921), with a per-machine disposition saying what became of each —

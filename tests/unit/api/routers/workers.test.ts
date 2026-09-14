@@ -1706,10 +1706,11 @@ describe('workers.requestUpdate (owner-only, draining-only, issue #933)', () => 
 // Issue #955. The per-machine worktree sweep: the same owner-only rule as the update
 // request, and deliberately none of its draining precondition.
 describe('workers.requestWorktreeSweep (owner-only, no drain, issue #955)', () => {
+	const SECOND_WORKER_ID = '22222222-2222-4222-8222-222222222222';
 	const REQUESTED_AT = new Date('2026-09-14T09:00:00Z');
 	const REPORTED_AT = new Date('2026-09-07T09:05:00Z');
 
-	/** The sweep a machine last reported — the record asking again destroys. */
+	/** The sweep a machine last reported — the record asking again leaves standing. */
 	function lastSweep(): Worker['worktreeSweep'] {
 		return {
 			requestId: null,
@@ -1736,15 +1737,19 @@ describe('workers.requestWorktreeSweep (owner-only, no drain, issue #955)', () =
 		};
 	}
 
-	/** The row after the write: the request pending, the previous outcome cleared. */
-	function requested(): Worker {
+	/**
+	 * The row after the write: the request pending, and whatever outcome the machine
+	 * had already reported still standing — the write replaces the request pair only
+	 * (issue #956).
+	 */
+	function requested(previous: Worker['worktreeSweep'] = null): Worker {
 		return makeWorker({
 			worktreeSweep: {
 				requestId: '77777777-7777-4777-8777-777777777777',
 				requestedAt: REQUESTED_AT,
-				status: null,
-				reportedAt: null,
-				result: null,
+				status: previous?.status ?? null,
+				reportedAt: previous?.reportedAt ?? null,
+				result: previous?.result ?? null,
 			},
 		});
 	}
@@ -1806,9 +1811,9 @@ describe('workers.requestWorktreeSweep (owner-only, no drain, issue #955)', () =
 		expect(result.requestId).toBe(requestWorktreeSweep.mock.calls[0]?.[1]);
 	});
 
-	// The write is what destroys the previous sweep, so the answer carries it: this is
-	// the last moment that record is readable.
-	it('answers with the sweep this request replaces', async () => {
+	// The answer carries the record as it stood when the question was asked, so one
+	// command both asks and reports.
+	it('answers with the sweep on record when the request was made', async () => {
 		getWorker.mockResolvedValue(makeWorker({ worktreeSweep: lastSweep() }));
 		requestWorktreeSweep.mockResolvedValue(requested());
 
@@ -1838,6 +1843,76 @@ describe('workers.requestWorktreeSweep (owner-only, no drain, issue #955)', () =
 			expect.objectContaining({ code: 'NOT_FOUND' }),
 		);
 		expect(publishWorktreeSweepRequest).not.toHaveBeenCalled();
+	});
+
+	// Issue #956. The read half: every machine's last recorded sweep, asking for
+	// nothing and replacing nothing — which is what the mutation above cannot do.
+	describe('workers.listSweeps (installation-wide read, issue #956)', () => {
+		it('is FORBIDDEN for a non-administrator, and never narrowed to their own machines', async () => {
+			await expect(owner.listSweeps()).rejects.toThrowError(
+				expect.objectContaining({ code: 'FORBIDDEN' }),
+			);
+			expect(listAllWorkers).not.toHaveBeenCalled();
+		});
+
+		it('reports every machine on the installation with its last sweep', async () => {
+			const admin = workersRouter.createCaller({ user: ADMIN_USER });
+			listAllWorkers.mockResolvedValue([
+				makeWorker({ worktreeSweep: lastSweep() }),
+				makeWorker({ id: SECOND_WORKER_ID, displayName: 'ada-desktop', ownerUserId: OTHER_ID }),
+			]);
+
+			const result = await admin.listSweeps();
+
+			expect(result.workers).toMatchObject([
+				{
+					workerId: WORKER_ID,
+					displayName: 'ada-laptop',
+					pendingRequestedAt: null,
+					lastSweep: {
+						reportedAt: REPORTED_AT.toISOString(),
+						status: 'swept',
+						result: { removedCount: 1 },
+					},
+				},
+				// A machine nobody has ever asked — "never swept" for the reader.
+				{ workerId: SECOND_WORKER_ID, pendingRequestedAt: null, lastSweep: null },
+			]);
+		});
+
+		// The ordinary state of a machine offline since the weekly signal went out:
+		// asked, not yet heard from, and handed the request on its next connection.
+		it('names an outstanding request nobody has answered yet', async () => {
+			const admin = workersRouter.createCaller({ user: ADMIN_USER });
+			listAllWorkers.mockResolvedValue([requested()]);
+
+			const result = await admin.listSweeps();
+
+			expect(result.workers[0]).toMatchObject({
+				pendingRequestedAt: REQUESTED_AT.toISOString(),
+				lastSweep: null,
+			});
+		});
+
+		// The readout's whole reason for existing (issue #956): the unattended weekly
+		// ask must not turn a machine that swept last week into one that has "never
+		// swept" merely because it was asleep when this week's signal went out. Both
+		// facts are reported — what it last removed, and that it owes an answer.
+		it('keeps the last reported sweep beside an outstanding request', async () => {
+			const admin = workersRouter.createCaller({ user: ADMIN_USER });
+			listAllWorkers.mockResolvedValue([requested(lastSweep())]);
+
+			const result = await admin.listSweeps();
+
+			expect(result.workers[0]).toMatchObject({
+				pendingRequestedAt: REQUESTED_AT.toISOString(),
+				lastSweep: {
+					reportedAt: REPORTED_AT.toISOString(),
+					status: 'swept',
+					result: { removedCount: 1 },
+				},
+			});
+		});
 	});
 });
 
