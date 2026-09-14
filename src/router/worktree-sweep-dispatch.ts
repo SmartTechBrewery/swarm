@@ -137,9 +137,9 @@ export async function pushPendingWorktreeSweep(workerId: string): Promise<boolea
  * Hand a reconnected worker the sweep request it missed while its socket was down.
  *
  * The case this exists for is the ordinary one rather than an edge — and more so
- * than for a self-update, since phase 3 will ask on a schedule nobody is watching:
- * a machine that happens to be offline when the sweep is requested would otherwise
- * never be asked again, the notification having fired once.
+ * than for a self-update, since issue #956 asks on a weekly schedule nobody is
+ * watching: a machine that happens to be offline when the sweep is requested would
+ * otherwise never be asked again, the notification having fired once.
  *
  * Fire-and-forget: it returns `void` so the transport's connection hooks stay
  * synchronous (`./worker-transport.ts`), and every failure is caught and logged so

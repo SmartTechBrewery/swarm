@@ -1449,7 +1449,7 @@ describe('GET /worker/stream cancellation re-push on reconnect', () => {
 
 	// Issue #955 — the same window again, and the request that most needs it: a sweep
 	// has no draining precondition, so it can be asked of a machine that simply happens
-	// to be offline, and phase 3 will ask on a schedule nobody is watching.
+	// to be offline, and issue #956 asks on a weekly schedule nobody is watching.
 	it('re-states a pending worktree sweep when the worker reconnects', async () => {
 		const deps = makeDeps();
 

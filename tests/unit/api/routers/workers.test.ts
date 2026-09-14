@@ -1706,6 +1706,7 @@ describe('workers.requestUpdate (owner-only, draining-only, issue #933)', () => 
 // Issue #955. The per-machine worktree sweep: the same owner-only rule as the update
 // request, and deliberately none of its draining precondition.
 describe('workers.requestWorktreeSweep (owner-only, no drain, issue #955)', () => {
+	const SECOND_WORKER_ID = '22222222-2222-4222-8222-222222222222';
 	const REQUESTED_AT = new Date('2026-09-14T09:00:00Z');
 	const REPORTED_AT = new Date('2026-09-07T09:05:00Z');
 
@@ -1838,6 +1839,56 @@ describe('workers.requestWorktreeSweep (owner-only, no drain, issue #955)', () =
 			expect.objectContaining({ code: 'NOT_FOUND' }),
 		);
 		expect(publishWorktreeSweepRequest).not.toHaveBeenCalled();
+	});
+
+	// Issue #956. The read half: every machine's last recorded sweep, asking for
+	// nothing and replacing nothing — which is what the mutation above cannot do.
+	describe('workers.listSweeps (installation-wide read, issue #956)', () => {
+		it('is FORBIDDEN for a non-administrator, and never narrowed to their own machines', async () => {
+			await expect(owner.listSweeps()).rejects.toThrowError(
+				expect.objectContaining({ code: 'FORBIDDEN' }),
+			);
+			expect(listAllWorkers).not.toHaveBeenCalled();
+		});
+
+		it('reports every machine on the installation with its last sweep', async () => {
+			const admin = workersRouter.createCaller({ user: ADMIN_USER });
+			listAllWorkers.mockResolvedValue([
+				makeWorker({ worktreeSweep: lastSweep() }),
+				makeWorker({ id: SECOND_WORKER_ID, displayName: 'ada-desktop', ownerUserId: OTHER_ID }),
+			]);
+
+			const result = await admin.listSweeps();
+
+			expect(result.workers).toMatchObject([
+				{
+					workerId: WORKER_ID,
+					displayName: 'ada-laptop',
+					pendingRequestedAt: null,
+					lastSweep: {
+						reportedAt: REPORTED_AT.toISOString(),
+						status: 'swept',
+						result: { removedCount: 1 },
+					},
+				},
+				// A machine nobody has ever asked — "never swept" for the reader.
+				{ workerId: SECOND_WORKER_ID, pendingRequestedAt: null, lastSweep: null },
+			]);
+		});
+
+		// The ordinary state of a machine offline since the weekly signal went out:
+		// asked, not yet heard from, and handed the request on its next connection.
+		it('names an outstanding request nobody has answered yet', async () => {
+			const admin = workersRouter.createCaller({ user: ADMIN_USER });
+			listAllWorkers.mockResolvedValue([requested()]);
+
+			const result = await admin.listSweeps();
+
+			expect(result.workers[0]).toMatchObject({
+				pendingRequestedAt: REQUESTED_AT.toISOString(),
+				lastSweep: null,
+			});
+		});
 	});
 });
 

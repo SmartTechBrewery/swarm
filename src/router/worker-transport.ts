@@ -247,10 +247,10 @@ export interface WorkerTransportDeps {
 	/**
 	 * And the same for a worktree sweep requested while the socket was down (issue
 	 * #955). More load-bearing here than for an update: a sweep has no draining
-	 * precondition, so the request can be made at any time — and phase 3 will make it
-	 * on a schedule nobody is watching, where a machine that happened to be offline
-	 * would otherwise simply never be swept. Fire-and-forget by contract, like the
-	 * hooks above.
+	 * precondition, so the request can be made at any time — and since issue #956 it
+	 * is made on a weekly schedule nobody is watching, where a machine that happened
+	 * to be offline would otherwise simply never be swept. Fire-and-forget by
+	 * contract, like the hooks above.
 	 */
 	resendPendingWorktreeSweep: (workerId: string) => void;
 	/**

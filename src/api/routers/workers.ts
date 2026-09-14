@@ -108,7 +108,14 @@ import { workerScmCredentialsRouter } from './workerScmCredentials.js';
  *   host opt-in (`SWARM_WORKER_SELF_UPDATE`) and the drain that makes a machine
  *   askable at all both stay the owner's, so nothing #800 reserved to them moves.
  *   The procedure's own comment carries the full reasoning and
- *   `docs/onboarding-worker.md` states it for operators.
+ *   `docs/onboarding-worker.md` states it for operators. **A second
+ *   installation-wide read joins them** (`listSweeps`, issue #956): every machine's
+ *   last recorded abandoned-worktree sweep and what it removed — the readout behind
+ *   `swarm workers sweeps`, and the only way to see a sweep without replacing it,
+ *   which matters once the sweeps are requested by a weekly schedule rather than by
+ *   the operator reading them. An administrator's on the same #647 terms, and kept
+ *   off the roster rows deliberately: one report carries up to 200 removed paths,
+ *   which no roster wants to be.
  * - **Owner self-service**, scoped to `ctx.user`: an owner registers a new
  *   machine (`register`, issue #799 — the network equivalent of `swarm workers
  *   register`, and the only procedure here that returns a secret), lists *their
@@ -862,6 +869,56 @@ export const workersRouter = router({
 				previousSweep: previousSweepView(previous.worktreeSweep),
 			};
 		}),
+
+	// What the **fleet** last deleted — every machine's most recent recorded sweep
+	// (issue #956), which is the question the weekly schedule exists to make
+	// answerable from one place: `swarm workers sweeps`.
+	//
+	// A read rather than a request, and the only way to see a sweep without
+	// destroying it. `requestWorktreeSweep` above answers with the record it is
+	// replacing precisely because asking is what replaces it, so before this existed
+	// the only way to read a machine's sweep was to ask it for another one — which is
+	// fine for one machine an operator is standing at, and wrong for a fleet nobody
+	// asked to sweep in the first place.
+	//
+	// **Installation-wide, so an instance administrator's**, on issue #647's rule for
+	// the unscoped roster: it reads across every owner's machines, which is an
+	// operator's view of the installation rather than a member's view of their own
+	// work. Refused outright rather than narrowed to the caller's own machines, for
+	// the reason `requestUpdateForInstallation` states: a partial answer read as the
+	// whole installation is worse than no answer. `FORBIDDEN` rather than
+	// `NOT_FOUND` — the caller named no worker id, so there is no existence to hide.
+	//
+	// Ordering is `listAllWorkers`' own (oldest first) and nothing here re-sorts:
+	// unlike the installation-wide *update* report there is no per-owner action to
+	// take from this, so there is no owner axis to group along.
+	listSweeps: authedProcedure.query(async ({ ctx }) => {
+		if (!isInstanceAdmin(ctx.user)) {
+			throw new TRPCError({
+				code: 'FORBIDDEN',
+				message:
+					`Reading the installation's worktree sweeps is available to instance ` +
+					`administrators only. Run \`swarm workers sweep-worktrees <worker-id>\` to ` +
+					`read and refresh the sweep on a machine you own.`,
+			});
+		}
+		const workers = await listAllWorkers();
+		return {
+			workers: workers.map((worker) => ({
+				workerId: worker.id,
+				displayName: worker.displayName,
+				// The outstanding request, if any — a machine asked but not yet heard from,
+				// which on a weekly unattended schedule is the ordinary state of one that has
+				// been offline since the signal went out rather than an anomaly.
+				pendingRequestedAt: worker.worktreeSweep?.requestId
+					? (worker.worktreeSweep.requestedAt.toISOString() ?? null)
+					: null,
+				// The same shape `requestWorktreeSweep` returns as `previousSweep`, so one
+				// reader serves both; `null` for a machine that has never reported one.
+				lastSweep: previousSweepView(worker.worktreeSweep),
+			})),
+		};
+	}),
 
 	// The same request, asked of **every machine the caller owns** in one action
 	// (issue #921), with a per-machine disposition saying what became of each —
