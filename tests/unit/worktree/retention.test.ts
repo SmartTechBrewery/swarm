@@ -337,6 +337,37 @@ describe('pruneStaleWorktrees', () => {
 		expect(manager.cleanedUpTasks).toEqual([]); // Did NOT clean up
 	});
 
+	// Same candidate boundary the abandoned sweep holds: only a *direct* task-<id>
+	// child is a candidate, because `cleanup(taskId)` can only ever remove the
+	// direct path — a nested namesake would be pruned by destroying the other one.
+	it('ignores a nested task-<id> path rather than pruning the direct checkout sharing its id', async () => {
+		const project = createMockProjectConfig({
+			repoRoot: '/Users/dev/swarm/swarm',
+			worktreeRoot: '.swarm-workspaces',
+			worktreeRetention: { maxWorktrees: 1 },
+		});
+
+		const manager = new FakeGitWorktreeManager(project);
+		manager.setWorktreesList([
+			'/Users/dev/swarm/swarm/.swarm-workspaces/archive/task-1',
+			'/Users/dev/swarm/swarm/.swarm-workspaces/task-1',
+		]);
+
+		statSyncMock.mockImplementation((path: string) => {
+			if (path === '/Users/dev/swarm/swarm/.swarm-workspaces/task-1') {
+				return { mtimeMs: 1000 } as unknown as Stats;
+			}
+			throw new Error('Should not stat nested task directory');
+		});
+
+		const result = await pruneStaleWorktrees(project, { worktrees: manager });
+
+		expect(result.ignored).toEqual(['/Users/dev/swarm/swarm/.swarm-workspaces/archive/task-1']);
+		expect(result.kept).toEqual(['/Users/dev/swarm/swarm/.swarm-workspaces/task-1']);
+		expect(result.pruned).toEqual([]);
+		expect(manager.cleanedUpTasks).toEqual([]);
+	});
+
 	it('filters out any git-reported worktree path outside repoRoot/worktreeRoot', async () => {
 		const project = createMockProjectConfig({
 			repoRoot: '/Users/dev/swarm/swarm',

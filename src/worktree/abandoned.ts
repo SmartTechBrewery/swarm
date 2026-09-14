@@ -104,7 +104,7 @@ export interface SweepAbandonedWorktreesResult {
 	keptLive: { path: string; reason: LiveBlockedReason }[];
 	/** A removal that threw. One checkout must not end the sweep. */
 	failed: { path: string; taskId: string; error: string }[];
-	/** Not a `task-<id>` path under the worktree root, or nothing could be stat'ed for it. */
+	/** Not a direct `task-<id>` child of the worktree root, or nothing could be stat'ed for it. */
 	ignored: string[];
 }
 

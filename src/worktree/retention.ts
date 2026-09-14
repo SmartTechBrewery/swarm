@@ -59,7 +59,7 @@ export interface PruneStaleWorktreesResult {
 	/** Worktrees left alone because they carry local commits never pushed to origin (issue #367). */
 	skippedUnpushed: string[];
 	skippedDeferred: string[];
-	/** Worktrees under worktreeRoot that don't match `task-<id>` — left alone entirely (see plan's scope note on legacy worktrees). */
+	/** Paths that are not a direct `task-<id>` child of worktreeRoot — left alone entirely (see plan's scope note on legacy worktrees). */
 	ignored: string[];
 	/** Expired host-local coordination artifacts removed from `.swarm-state` (issue #721). */
 	sweptState: string[];

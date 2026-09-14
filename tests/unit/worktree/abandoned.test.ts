@@ -256,6 +256,27 @@ describe('sweepAbandonedWorktrees', () => {
 		expect(manager.cleanedUpTasks).toEqual([]);
 	});
 
+	// The candidate the sweep ages must be the checkout `cleanup(taskId)` removes.
+	// A nested `archive/task-123` shares the id of the live direct checkout, so
+	// admitting it would have destroyed the recent dirty one in its place.
+	it('ignores a nested task-<id> path rather than cleaning up the direct checkout sharing its id', async () => {
+		const project = createMockProjectConfig({ repoRoot: REPO_ROOT });
+		const manager = new FakeGitWorktreeManager(project);
+		manager.setWorktreesList([`${ROOT}/archive/task-123`, `${ROOT}/task-123`]);
+		manager.setTaskCleanliness('123', false);
+		stubDirectoryMtimes({
+			[`${ROOT}/archive/task-123`]: daysAgo(40),
+			[`${ROOT}/task-123`]: daysAgo(1),
+		});
+
+		const result = await sweepAbandonedWorktrees(project, { worktrees: manager, now });
+
+		expect(result.ignored).toEqual([`${ROOT}/archive/task-123`]);
+		expect(result.keptRecent).toEqual([`${ROOT}/task-123`]);
+		expect(result.removed).toEqual([]);
+		expect(manager.cleanedUpTasks).toEqual([]);
+	});
+
 	it('fails closed on a candidate nothing can be stat-ed for', async () => {
 		const project = createMockProjectConfig({ repoRoot: REPO_ROOT });
 		const manager = new FakeGitWorktreeManager(project);
