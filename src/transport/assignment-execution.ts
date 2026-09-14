@@ -89,6 +89,7 @@ import { GitWorktreeManager } from '../worker/git-worktree-manager.js';
 import { HEARTBEAT_MS, stillRunningLine } from '../worker/live-output.js';
 import { linkRunAbortController } from '../worker/run-cancellation.js';
 import { createHostLocalWorktreeRuntime } from '../worktree/host-local-runtime.js';
+import { BlockedRecoveryError } from '../worktree/reclaim.js';
 import { reconstructProjectConfig } from './db-free-project.js';
 import type { DeliveryClientOptions, FetchLike } from './delivery-client.js';
 import { createTransportFollowUpReviewScheduler } from './follow-up-review-delivery.js';
@@ -502,7 +503,9 @@ export function settleAssignmentFailure(
  *
  * Every frame this builds also reports the exit metadata of the agent run the failure
  * carried, when it carried one ({@link reportedAgentExit}, issue #596), so the run row
- * records the same stop the `error` describes.
+ * records the same stop the `error` describes. A terminal failure additionally reports
+ * the recovery gate's refusal when it was one (issue #952), so the control plane can
+ * rebuild the `BlockedRecoveryError` its settle already knows how to record.
  */
 export function deferrableOrFailedResult(
 	err: unknown,
@@ -554,7 +557,18 @@ export function deferrableOrFailedResult(
 			checkpoint: resumable && worktreePath ? tryReadCheckpoint(worktreePath) : undefined,
 		};
 	}
-	return { ...terminal, status: 'failed', error };
+	return {
+		...terminal,
+		status: 'failed',
+		error,
+		// The recovery gate's own refusal, when that is what stopped this assignment
+		// (issue #952). The checkout is still on this host, so the control-plane settle
+		// must record a recovery state rather than the null write that means "this
+		// attempt gave the checkout up" — which is what un-pinned the retry from the one
+		// machine able to continue it. Absent for every other terminal failure, which
+		// keeps its plain-error settle verbatim.
+		blockedReason: err instanceof BlockedRecoveryError ? err.reason : undefined,
+	};
 }
 
 /**

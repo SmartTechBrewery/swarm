@@ -939,6 +939,49 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			});
 		});
 
+		// Issue #952: the federated settle for a refused adoption. The worker now reports
+		// the recovery gate's refusal on its terminal frame and the control plane rebuilds
+		// a `BlockedRecoveryError` from it, so `finalizeFailedRun` writes this record
+		// instead of the `recovery: null` that erased the pin — a refused adoption never
+		// gave the checkout up, and it is still on disk on the machine that wrote it.
+		it('keeps the machine through a terminal failure that refused to adopt the checkout', async () => {
+			const { worker, owner } = await seedWorker('pin-h');
+			const id = await pinnedRun('952a', worker.id, owner.id);
+
+			await completeRun(id, {
+				status: 'failed',
+				error: 'Checkpoint no longer matches the working tree',
+				recovery: { state: 'blocked', blockedReason: 'checkpoint-divergent' },
+			});
+
+			const row = await getRunByIdFromDb(id);
+			expect(row?.status).toBe('failed');
+			// The non-null write is the whole point: the sticky merge carries the machine
+			// onto it, so "Retry now" on this row is still pinned to the holder.
+			expect(row?.recovery).toEqual({
+				state: 'blocked',
+				blockedReason: 'checkpoint-divergent',
+				preservedWorkerId: worker.id,
+			});
+		});
+
+		it('still has a pin to convert into an abandonment after a refused adoption', async () => {
+			// The provenance lost for run `06e71e23-2508-4aef-9e0d-61e133c11833` (task
+			// 131): with the pin already erased, "Reset & restart" had no machine left to
+			// record as abandoned.
+			const { worker, owner } = await seedWorker('pin-i');
+			const id = await pinnedRun('952b', worker.id, owner.id);
+			await completeRun(id, {
+				status: 'failed',
+				error: 'Checkout has uncommitted changes',
+				recovery: { state: 'blocked', blockedReason: 'dirty' },
+			});
+
+			await clearRunRecovery(id);
+
+			expect((await getRunByIdFromDb(id))?.recovery).toEqual({ abandonedWorkerId: worker.id });
+		});
+
 		it('turns the pin into an abandonment on "Reset & restart", and keeps it thereafter', async () => {
 			const { worker, owner } = await seedWorker('pin-g');
 			const id = await pinnedRun('567g', worker.id, owner.id);

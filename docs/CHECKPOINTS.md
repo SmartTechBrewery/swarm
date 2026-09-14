@@ -448,6 +448,15 @@ phase from scratch, silently. "Reset & restart" is the deliberate way out: it di
 checkpoint and the continuation budget as it always did, and now also releases the pin, recording
 on the run that the preserved work was abandoned.
 
+A continuation the recovery gate **refuses to adopt** — its checkpoint no longer describes a state
+the phase can continue from, or the checkout is otherwise protected — keeps that pin rather than
+dropping it (issue #952). The refusal is a terminal failure, but it is not the run giving the
+checkout up: the directory is still on the machine that wrote it, so the worker reports the
+refusal on its result frame and the settle records `{ state: 'blocked', blockedReason }` instead of
+erasing where the checkpoint is. The operator's "Retry now" on that failed run therefore still
+lands on the machine holding it, and "Reset & restart" still has a pin to convert into an
+abandonment.
+
 A phase that reaches `provisionFresh()` while a preserved checkout — or a checkpoint inside it —
 still exists logs a `warn` naming the task, phase and run. That is the backstop for both halves
 above: starting over is sometimes legitimate; being unable to tell that it happened is not.

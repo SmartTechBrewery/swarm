@@ -359,6 +359,53 @@ describe('transport protocol schemas', () => {
 			expect(TaskExecutionResultSchema.parse(frame)).toEqual(frame);
 		});
 
+		// Issue #952: the refused adoption the control plane rebuilds a
+		// `BlockedRecoveryError` from, so the settle writes a recovery record instead of
+		// the null write that erases `runs.recovery.preservedWorkerId`.
+		it('round-trips a failed task-execution-result carrying the recovery gate’s refusal', () => {
+			const frame = {
+				type: 'task-execution-result' as const,
+				dispatchId: DISPATCH_ID,
+				status: 'failed' as const,
+				phase: 'implementation' as const,
+				taskId: '17',
+				error: 'Checkpoint no longer matches the working tree',
+				blockedReason: 'checkpoint-divergent',
+			};
+			expect(TaskExecutionResultSchema.parse(frame)).toEqual(frame);
+		});
+
+		// The field is additive in both directions, which is why
+		// `TRANSPORT_PROTOCOL_VERSION` is not bumped: an older worker simply omits it and
+		// its terminal failures settle exactly as they do today.
+		it('accepts a failed task-execution-result from a worker that reports no refusal', () => {
+			const older = {
+				type: 'task-execution-result' as const,
+				dispatchId: DISPATCH_ID,
+				status: 'failed' as const,
+				phase: 'implementation' as const,
+				taskId: '17',
+				error: 'worktree setup failed',
+			};
+			expect(TaskExecutionResultSchema.parse(older)).toEqual(older);
+		});
+
+		// A vocabulary this control plane does not model must still parse: rejecting the
+		// frame would lose the whole settle over one field, which is the same reasoning
+		// `failureKind` records.
+		it('accepts a refusal reason newer than this control plane', () => {
+			const parsed = TaskExecutionResultSchema.parse({
+				type: 'task-execution-result',
+				dispatchId: DISPATCH_ID,
+				status: 'failed',
+				phase: 'implementation',
+				taskId: '17',
+				error: 'blocked',
+				blockedReason: 'lease-contested',
+			});
+			expect(parsed.blockedReason).toBe('lease-contested');
+		});
+
 		it('rejects an unknown execution-result status', () => {
 			expect(
 				TaskExecutionResultSchema.safeParse({
