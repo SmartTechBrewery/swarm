@@ -108,6 +108,7 @@ function makePm() {
 			async () => undefined,
 		),
 		moveWorkItem: vi.fn<(id: string, status: string) => Promise<void>>(async () => {}),
+		closeWorkItem: vi.fn<(id: string) => Promise<void>>(async () => {}),
 		createWorkItem: vi.fn(async () => createMockWorkItem()),
 		updateWorkItem: vi.fn(async () => {}),
 		addLabel: vi.fn(async () => {}),

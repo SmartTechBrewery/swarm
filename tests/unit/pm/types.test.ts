@@ -79,6 +79,15 @@ class InMemoryPMProvider implements PMProvider {
 		this.items.set(id, { ...item, statusId: this.statusOptions[status] });
 	}
 
+	/**
+	 * A fake whose `open` is derived from the status alone, so — like Linear, Jira
+	 * and Trello, and unlike GitHub Projects — the `done` move *is* the whole
+	 * settle. Idempotent because re-writing the same option is a no-op.
+	 */
+	async closeWorkItem(id: string): Promise<void> {
+		await this.moveWorkItem(id, 'done');
+	}
+
 	async addComment(id: string, text: string): Promise<string> {
 		// Presence check mirrors the real adapter resolving the backing Issue/PR.
 		await this.getWorkItem(id);
@@ -227,6 +236,34 @@ describe('PMProvider contract', () => {
 		const item = createMockWorkItem({ statusId: STATUS_OPTIONS.inProgress });
 		const provider = new InMemoryPMProvider([item], STATUS_OPTIONS);
 		await provider.moveWorkItem(item.id, 'done');
+		await expect(provider.getWorkItem(item.id)).resolves.toMatchObject({
+			statusId: STATUS_OPTIONS.done,
+		});
+	});
+
+	// The two obligations `closeWorkItem` states (`src/pm/types.ts`), asserted on the
+	// contract itself rather than on one provider: whoever settles an item must be
+	// able to rely on it both leaving `done` and stopping the gate it held.
+	it('closeWorkItem settles the item into done and stops it blocking its dependents', async () => {
+		const blocker = createMockWorkItem({ id: 'PVTI_blocker', statusId: STATUS_OPTIONS.inProgress });
+		const dependent = createMockWorkItem({ id: 'PVTI_dependent' });
+		const provider = new InMemoryPMProvider([blocker, dependent], STATUS_OPTIONS);
+		await provider.addBlockedBy(dependent.id, blocker.id);
+		expect(await provider.listBlockers(dependent.id)).toMatchObject([{ open: true }]);
+
+		await provider.closeWorkItem(blocker.id);
+
+		await expect(provider.getWorkItem(blocker.id)).resolves.toMatchObject({
+			statusId: STATUS_OPTIONS.done,
+		});
+		expect(await provider.listBlockers(dependent.id)).toMatchObject([{ open: false }]);
+	});
+
+	it('closeWorkItem is a no-op on an already-settled item rather than an error', async () => {
+		const item = createMockWorkItem({ statusId: STATUS_OPTIONS.done });
+		const provider = new InMemoryPMProvider([item], STATUS_OPTIONS);
+		await provider.closeWorkItem(item.id);
+		await expect(provider.closeWorkItem(item.id)).resolves.toBeUndefined();
 		await expect(provider.getWorkItem(item.id)).resolves.toMatchObject({
 			statusId: STATUS_OPTIONS.done,
 		});

@@ -47,6 +47,7 @@ import {
 	GitHubProjectsPMProvider,
 } from '@/integrations/pm/github-projects/provider.js';
 import {
+	createMockGitHubProjectsConfig,
 	createMockProjectConfig,
 	createMockProjectRepositoryPair,
 } from '../../../../helpers/factories.js';
@@ -801,6 +802,100 @@ describe('GitHubProjectsPMProvider', () => {
 				"status 'nonsense' has no option ID",
 			);
 			expect(graphql).not.toHaveBeenCalled();
+		});
+	});
+
+	describe('closeWorkItem', () => {
+		it('closes the backing Issue as completed *and* writes the done option', async () => {
+			// The item read, then the `done` write `moveWorkItem` makes.
+			graphql.mockResolvedValueOnce({ node: ITEM_NODE }).mockResolvedValueOnce({
+				updateProjectV2ItemFieldValue: { projectV2Item: { id: 'PVTI_x' } },
+			});
+			updateIssue.mockResolvedValue({ data: {} });
+
+			await provider.closeWorkItem('PVTI_x');
+
+			// Both halves of the contract's end state: a blocker's `open` is read off
+			// the Issue's state, the pipeline phase off the card's Status option — so
+			// either write alone would leave the item half-settled (`src/pm/types.ts`).
+			expect(updateIssue).toHaveBeenCalledWith({
+				owner: 'SmartTechBrewery',
+				repo: 'swarm',
+				issue_number: 10,
+				state: 'closed',
+				state_reason: 'completed',
+			});
+			expect(graphql).toHaveBeenLastCalledWith(
+				expect.stringContaining('updateProjectV2ItemFieldValue'),
+				{
+					projectId: PROJECT_PM.projectId,
+					itemId: 'PVTI_x',
+					fieldId: PROJECT_PM.statusFieldId,
+					optionId: PROJECT_PM.statusOptions.done,
+				},
+			);
+		});
+
+		it('closes the Issue before moving the card, so a failed move leaves it non-blocking', async () => {
+			const order: string[] = [];
+			graphql.mockImplementation(async (query: string) => {
+				if (!query.includes('updateProjectV2ItemFieldValue')) return { node: ITEM_NODE };
+				order.push('move');
+				return { updateProjectV2ItemFieldValue: { projectV2Item: { id: 'PVTI_x' } } };
+			});
+			updateIssue.mockImplementation(async () => {
+				order.push('close');
+				return { data: {} };
+			});
+
+			await provider.closeWorkItem('PVTI_x');
+
+			expect(order).toEqual(['close', 'move']);
+		});
+
+		it('is harmless on a second call — GitHub accepts re-closing a closed Issue', async () => {
+			graphql.mockImplementation(async (query: string) =>
+				query.includes('updateProjectV2ItemFieldValue')
+					? { updateProjectV2ItemFieldValue: { projectV2Item: { id: 'PVTI_x' } } }
+					: { node: ITEM_NODE },
+			);
+			updateIssue.mockResolvedValue({ data: {} });
+
+			await provider.closeWorkItem('PVTI_x');
+			await expect(provider.closeWorkItem('PVTI_x')).resolves.toBeUndefined();
+
+			expect(updateIssue).toHaveBeenCalledTimes(2);
+			expect(updateIssue).toHaveBeenLastCalledWith(
+				expect.objectContaining({ state: 'closed', state_reason: 'completed' }),
+			);
+		});
+
+		it('throws when the item has no backing Issue (draft)', async () => {
+			graphql.mockResolvedValue({
+				node: { id: 'PVTI_draft', content: { __typename: 'DraftIssue' }, fieldValueByName: null },
+			});
+
+			await expect(provider.closeWorkItem('PVTI_draft')).rejects.toThrow('no backing Issue');
+			expect(updateIssue).not.toHaveBeenCalled();
+		});
+
+		it('refuses an unmapped done status before closing anything', async () => {
+			const unmapped = new GitHubProjectsPMProvider(
+				createMockProjectConfig({
+					pm: {
+						type: 'github-projects',
+						...createMockGitHubProjectsConfig({ statusOptions: { inProgress: '47fc9ee4' } }),
+					},
+				}),
+			);
+			graphql.mockResolvedValue({ node: ITEM_NODE });
+
+			await expect(unmapped.closeWorkItem('PVTI_x')).rejects.toThrow(
+				"status 'done' has no option ID",
+			);
+			// Checked up front rather than left to the move: discovering it afterwards
+			// would leave a closed Issue parked in an active column.
+			expect(updateIssue).not.toHaveBeenCalled();
 		});
 	});
 

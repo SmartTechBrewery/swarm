@@ -85,6 +85,7 @@ function makePmProvider(overrides: Partial<PMProvider> = {}): PMProvider {
 		findWorkItemForArtifact: vi.fn().mockResolvedValue(undefined),
 		findWorkItemByDescriptionMarker: vi.fn().mockResolvedValue(undefined),
 		moveWorkItem: vi.fn().mockResolvedValue(undefined),
+		closeWorkItem: vi.fn().mockResolvedValue(undefined),
 		addComment: vi.fn().mockResolvedValue('IC_kwComment'),
 		findComment: vi.fn(),
 		createWorkItem: vi.fn(),

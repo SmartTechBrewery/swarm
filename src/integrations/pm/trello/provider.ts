@@ -511,6 +511,23 @@ export class TrelloPMProvider implements PMProvider {
 		logger.debug('pm: moved work item', { itemId: id, status });
 	}
 
+	/**
+	 * One write is the whole settle here, unlike GitHub Projects' two: a Trello
+	 * card's status *is* which list holds it, so moving it into the list the mapping
+	 * names for `done` puts it in a status that starts no pipeline phase — the half
+	 * of the contract's end state (`src/pm/types.ts`) that applies to this board.
+	 *
+	 * The blocker half applies to nothing here: this provider declares
+	 * `supportsDependencies: false` and answers {@link listBlockers} with `[]`, so
+	 * no card it reports ever gates another and there is no `open` for a second
+	 * write to flip. Archiving the card would be the nearest Trello has to a closed
+	 * flag, and it is deliberately not done — it hides the card from the board the
+	 * operator reads, which the contract never asks for.
+	 */
+	async closeWorkItem(id: string): Promise<void> {
+		await this.moveWorkItem(id, 'done');
+	}
+
 	async addComment(id: string, text: string): Promise<string> {
 		// Unlike GitHub Projects — whose board card has no comment thread, so the
 		// comment is redirected onto the backing Issue — a Trello card *is* the work

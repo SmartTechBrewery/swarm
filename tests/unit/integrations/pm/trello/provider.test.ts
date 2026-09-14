@@ -731,6 +731,23 @@ describe('TrelloPMProvider', () => {
 		});
 	});
 
+	describe('closeWorkItem', () => {
+		it("settles the card into its mapped 'done' list and archives nothing", async () => {
+			mockTrello({ [`cards/${CARD_ID}`]: undefined });
+
+			await provider.closeWorkItem(CARD_ID);
+
+			// A card's status *is* its list, so the one move settles the only half of
+			// the end state that applies here — this provider declares
+			// `supportsDependencies: false`, so no card it reports ever gates another.
+			// Archiving (`closed: true`) would hide the card from the operator's board,
+			// which the contract never asks for.
+			const [settle] = callsTo(`cards/${CARD_ID}`);
+			expect(settle?.method).toBe('PUT');
+			expect(settle?.body).toEqual({ idList: CONFIG.statusOptions.done });
+		});
+	});
+
 	describe('addComment', () => {
 		const COMMENTS_PATH = `cards/${CARD_ID}/actions/comments`;
 

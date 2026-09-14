@@ -25,6 +25,7 @@ function pmWith(overrides: PmOverrides): PMProvider {
 		findWorkItemForArtifact: vi.fn(async () => undefined),
 		findWorkItemByDescriptionMarker: vi.fn(async () => undefined),
 		moveWorkItem: vi.fn(async () => {}),
+		closeWorkItem: vi.fn(async () => {}),
 		addComment: overrides.addComment ?? vi.fn(async () => 'c1'),
 		findComment: overrides.findComment ?? vi.fn(async () => undefined),
 		createWorkItem: vi.fn(async () => createMockWorkItem()),

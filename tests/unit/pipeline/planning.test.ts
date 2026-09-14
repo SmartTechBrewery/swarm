@@ -181,6 +181,7 @@ function makeDeps() {
 			async () => undefined,
 		),
 		moveWorkItem: vi.fn(async () => {}),
+		closeWorkItem: vi.fn(async () => {}),
 		createWorkItem: vi.fn(async (input) => {
 			// Key the fake id/url on the phase-specific half of the title, so a card
 			// stays addressable as `PVTI_Second slice` now that SWARM prefixes every

@@ -128,6 +128,17 @@ interface JiraTransition {
 	to?: { id?: string; name?: string } | null;
 }
 
+/**
+ * `GET /rest/api/3/status/{id}` — one status on its own, read for the
+ * {@link DONE_STATUS_CATEGORY} membership a board mapping cannot be trusted to have
+ * picked. The issue reads elsewhere carry the same nesting under `fields.status`.
+ */
+interface JiraStatusDetail {
+	id?: string;
+	name?: string;
+	statusCategory?: { key?: string } | null;
+}
+
 /** `GET /rest/api/3/issue/{key}/transitions` — a bare object, not a page. */
 interface JiraTransitionsResponse {
 	transitions?: Array<JiraTransition | null> | null;
@@ -841,6 +852,65 @@ export class JiraPMProvider implements PMProvider {
 			});
 			logger.debug('pm: moved work item', { itemId: id, status, transition: transition.id });
 		});
+	}
+
+	/**
+	 * One *board* write is the whole settle here, unlike GitHub Projects' two: a Jira
+	 * issue carries no closed flag beside its status, so the status is both what the
+	 * board shows and what this provider derives a blocker's `open` from. Transition
+	 * the issue into a {@link DONE_STATUS_CATEGORY} status and both halves of the
+	 * contract's end state (`src/pm/types.ts`) hold at once, with nothing left for a
+	 * second write to set.
+	 *
+	 * That equivalence holds only while the mapping's `done` actually names such a
+	 * status, and nothing else in SWARM makes it: `statusOptions` stores opaque
+	 * status ids, and the board-mapping screen accepts any of the project's statuses
+	 * for the key. So the target status's own category is read and checked **before**
+	 * the transition — a `done` mapped to a `new`/`indeterminate` status fails loudly
+	 * and writes nothing, rather than reporting a settle that silently leaves the
+	 * item gating its dependents forever. The check is against the same constant
+	 * {@link toBlocker} reads, so the invariant is verified against its own reader
+	 * and cannot drift from it.
+	 *
+	 * The rest is `moveWorkItem`'s workflow negotiation, which is the part that is
+	 * genuinely Jira's: an issue already in the `done` status is a no-op, and one
+	 * whose workflow offers no transition there fails loudly naming the transitions
+	 * it does offer, rather than reporting a settle that did not happen.
+	 */
+	async closeWorkItem(id: string): Promise<void> {
+		const targetStatusId = requireStatusIdForStatusKey(this.config, 'done');
+		await this.run(async () => {
+			// `GET status/{id}` rather than the issue's transitions: the already-in-done
+			// case has no transition to read a category off, and this one is answered
+			// under the same *Browse projects* permission the rest of the provider
+			// needs (`statuses?id=` would demand a project admin).
+			const status = await jiraRequest<JiraStatusDetail | undefined>(
+				`status/${encodeURIComponent(targetStatusId)}`,
+			).catch((error: unknown) => {
+				// Jira 404s a status that no longer exists *or* that no active workflow
+				// uses — both are the same stale mapping, said in SWARM's own terms
+				// rather than as a bare REST failure.
+				if (error instanceof JiraApiError && error.status === 404) return undefined;
+				throw error;
+			});
+			if (!status?.id) {
+				throw new Error(
+					`Cannot close item '${id}': the board mapping's 'done' status (id ${targetStatusId}) does not resolve to a status on an active Jira workflow. ` +
+						'Re-run board discovery and remap statusOptions.done.',
+				);
+			}
+			const category = status.statusCategory?.key;
+			if (category !== DONE_STATUS_CATEGORY) {
+				throw new Error(
+					`Cannot close item '${id}': the board mapping's 'done' status ${describeStatus(status)} belongs to the ` +
+						`'${category ?? '<unknown>'}' category, not '${DONE_STATUS_CATEGORY}'. ` +
+						'Settling into it would leave the item reported as still open and gating its dependents — ' +
+						`remap statusOptions.done to a status in the '${DONE_STATUS_CATEGORY}' category.`,
+				);
+			}
+		});
+		await this.moveWorkItem(id, 'done');
+		logger.debug('pm: closed work item', { itemId: id });
 	}
 
 	async addComment(id: string, text: string): Promise<string> {

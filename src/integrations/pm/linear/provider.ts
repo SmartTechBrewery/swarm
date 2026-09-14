@@ -148,6 +148,16 @@ const TEAM_STATES_QUERY = /* GraphQL */ `
 `;
 
 /**
+ * One workflow state read on its own, for the `type` a mapping cannot be trusted
+ * to have picked. `workflowState(id:)` takes a `String!`, like `issue(id:)`.
+ */
+const WORKFLOW_STATE_QUERY = /* GraphQL */ `
+	query WorkflowState($id: String!) {
+		workflowState(id: $id) { id name type }
+	}
+`;
+
+/**
  * The fields a {@link WorkItemBlocker} is built from — a much narrower selection
  * than {@link ISSUE_FIELDS}, because a blocker only has to be named in a message
  * and answered "still open?".
@@ -361,6 +371,11 @@ interface StateNode {
 
 interface TeamStatesResponse {
 	team?: { id?: string; states?: LinearConnection<StateNode> | null } | null;
+}
+
+/** The single state {@link WORKFLOW_STATE_QUERY} selects, `type` included. */
+interface WorkflowStateResponse {
+	workflowState?: { id?: string; name?: string; type?: string } | null;
 }
 
 /** The blocker-shaped subset of an issue that {@link BLOCKER_ISSUE_FIELDS} selects. */
@@ -859,6 +874,55 @@ export class LinearPMProvider implements PMProvider {
 			requireMutationSuccess(data.issueUpdate?.success, `move item '${id}' to '${status}'`);
 		});
 		logger.debug('pm: moved work item', { itemId: id, status });
+	}
+
+	/**
+	 * One *board* write is the whole settle here, unlike GitHub Projects' two: a
+	 * Linear issue carries no closed flag beside its workflow state, so that state
+	 * is both what the board shows and what this provider derives a blocker's
+	 * `open` from ({@link CLOSED_STATE_TYPES}). Move the issue into a finished-type
+	 * state and both halves of the contract's end state (`src/pm/types.ts`) hold at
+	 * once, with nothing left for a second write to set.
+	 *
+	 * That equivalence holds only while the mapping's `done` actually names such a
+	 * state, and nothing else in SWARM makes it: `statusOptions` stores opaque state
+	 * UUIDs, and the board-mapping screen accepts any of the team's states for the
+	 * key. So the state's own `type` is read and checked **before** the move — a
+	 * `done` mapped to an `unstarted`/`started` state fails loudly and writes
+	 * nothing, rather than reporting a settle that silently leaves the item gating
+	 * its dependents forever. The check is against {@link CLOSED_STATE_TYPES} rather
+	 * than `completed` alone on purpose: that set is the very thing `listBlockers`
+	 * reads, so the invariant is verified against its own reader and cannot drift
+	 * from it.
+	 *
+	 * One extra read per settle, on a call made once per landed run — the cheapest
+	 * place to catch a misconfiguration whose only other symptom is dependent work
+	 * that never ungates.
+	 */
+	async closeWorkItem(id: string): Promise<void> {
+		const stateId = requireStateIdForStatusKey(this.config, 'done');
+		await this.run(async () => {
+			const data = await linearGraphQL<WorkflowStateResponse>(WORKFLOW_STATE_QUERY, {
+				id: stateId,
+			});
+			const state = data.workflowState;
+			if (!state?.id) {
+				throw new Error(
+					`Cannot close item '${id}': the board mapping's 'done' workflow state (${stateId}) does not resolve in Linear. ` +
+						'Re-run board discovery and remap statusOptions.done.',
+				);
+			}
+			if (!CLOSED_STATE_TYPES.has(state.type ?? '')) {
+				throw new Error(
+					`Cannot close item '${id}': the board mapping's 'done' workflow state '${state.name ?? '<unnamed>'}' (${stateId}) is of type ` +
+						`'${state.type ?? '<unknown>'}', which Linear does not count as finished. ` +
+						'Settling into it would leave the item reported as still open and gating its dependents — ' +
+						`remap statusOptions.done to a state of type ${[...CLOSED_STATE_TYPES].join(' or ')}.`,
+				);
+			}
+		});
+		await this.moveWorkItem(id, 'done');
+		logger.debug('pm: closed work item', { itemId: id });
 	}
 
 	async addComment(id: string, text: string): Promise<string> {
