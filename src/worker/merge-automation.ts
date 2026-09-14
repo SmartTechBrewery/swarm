@@ -52,7 +52,9 @@
  * this pull request's Review runs declared they traced a split sibling's whole
  * scope through its diff, that sibling is closed as part of the same merge —
  * `src/dispatch/absorbed-child-settle.ts` owns the decision and every guard on
- * it; this module only tells it a merge happened.
+ * it; this module only tells it a merge happened, plus the one source-control
+ * fact those guards need and cannot read for themselves: the task the pull
+ * request was written for, decoded from its head branch.
  */
 
 import type { ProjectConfig } from '../config/schema.js';
@@ -68,6 +70,7 @@ import { createAndPublishDispatch, publishDispatchWakeUp } from '../dispatch/dis
 import { requireProjectSCMProvider } from '../integrations/scm/registry.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
+import { issueNumberFromBranch } from '../pipeline/task-branch.js';
 import type { MergeAutomationJob } from '../queue/jobs.js';
 import type {
 	MergePullRequest,
@@ -330,6 +333,7 @@ export interface MergeAutomationCapabilities {
 	updatePullRequestBranch?: UpdatePullRequestBranch;
 	getAggregateCheckStatus?: SCMProvider['getAggregateCheckStatus'];
 	commentOnPullRequest?: SCMProvider['commentOnPullRequest'];
+	getPullRequest?: SCMProvider['getPullRequest'];
 }
 
 /**
@@ -773,10 +777,49 @@ async function attemptMerge(
 }
 
 /**
+ * The task the merged pull request was written for, decoded from its head branch
+ * — the one input the settle's own-task guard cannot recover for itself (issue
+ * #959).
+ *
+ * Read here rather than passed down from the Review run row, because a Review
+ * run's `taskId` is the *pull request's* number rather than the issue's
+ * (`src/triggers/handlers/review.ts`), so the two are never comparable. SWARM
+ * names every task branch `<branchPrefix><taskId>` (`GitWorktreeManager.provision`),
+ * which is the same provider-agnostic derivation the PR-ownership gate
+ * (`isSwarmManagedPullRequest`) and the PR-driven phases'
+ * board-card lookup (`resolveBoardItemIdForPrBranch`) already answer from.
+ *
+ * `undefined` when the read failed or the head branch encodes no task; the settle
+ * then does nothing, which is the safe direction — see its module header.
+ */
+async function resolveOwnTaskId(
+	job: MergeAutomationJob,
+	project: ProjectConfig,
+	capabilities: MergeAutomationCapabilities,
+): Promise<string | undefined> {
+	try {
+		const read = capabilities.getPullRequest ?? scmCapability(project, 'getPullRequest');
+		// Implementer: the persona this dispatch merges as, so one attempt does not
+		// speak as two different accounts.
+		const details = await read(project, Number(job.prNumber), 'implementer');
+		return issueNumberFromBranch(details.headBranch, project.branchPrefix, { strict: true });
+	} catch (err) {
+		logger.warn('Merge automation: could not resolve the pull request’s own task', {
+			projectId: project.id,
+			prNumber: job.prNumber,
+			error: describeError(err),
+		});
+		return undefined;
+	}
+}
+
+/**
  * Settle the split siblings this pull request's Review runs declared it absorbed
  * (issue #959) — the only board work a merge dispatch does, and the reason it is
  * delegated rather than inlined: this module deliberately knows the DB and the
- * SCM merge capability, not a PM provider.
+ * SCM merge capability, not a PM provider. Resolving `ownTaskId` here is the same
+ * split: the branch behind a pull request is an SCM fact, and the settle stays
+ * free of the source-control contract.
  *
  * Runs after `completeDispatch`, never before: the merge is the fact the settle
  * is licensed by, and the dispatch's own outcome must not depend on it. Wrapped
@@ -788,14 +831,16 @@ async function settleChildrenThisMergeAbsorbed(
 	dispatch: DispatchRow,
 	job: MergeAutomationJob,
 	project: ProjectConfig,
+	capabilities: MergeAutomationCapabilities,
 ): Promise<void> {
 	try {
 		await settleAbsorbedChildren({
 			project,
 			dispatchId: dispatch.id,
-			reviewRunId: job.reviewRunId,
 			repository: job.repo,
 			prNumber: job.prNumber,
+			// Lazy: only a pull request that actually declared a fold-in pays the read.
+			resolveOwnTaskId: () => resolveOwnTaskId(job, project, capabilities),
 		});
 	} catch (err) {
 		logger.error('Merge automation: settling the absorbed split siblings failed', {
@@ -892,7 +937,7 @@ export async function processMergeAutomationDispatch(
 			attempt,
 		});
 		await completeDispatch(dispatch.id, 'merged');
-		await settleChildrenThisMergeAbsorbed(dispatch, job, project);
+		await settleChildrenThisMergeAbsorbed(dispatch, job, project, capabilities);
 		return { status: 'merge-automation-settled', result: 'merged', prNumber: job.prNumber };
 	}
 

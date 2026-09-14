@@ -739,11 +739,25 @@ describes — a waiting Implementation dispatch is cancelled and its `deferred` 
 row settled in the same transaction, with no new lifecycle — and closing the card
 is what makes `WorkItemBlocker.open` false, so a dependent stops being blocked at
 its next dependency re-check instead of burning its seven-day budget. **A
-declaration alone settles nothing:** the card must not be the pull request's own
-task (compared on `taskRef`/`taskRepository` through `repoSlugsMatch`, never a URL
-shape), must carry `swarm:split-child` — the mechanical proof SWARM created it, so
-a reviewer naming an unrelated issue closes nothing — and must not already be
-settled, which makes a re-run a no-op. Every guard is a skip-with-warn and every
+declaration alone settles nothing:** the card must be neither the merged pull
+request itself nor the task it was written for, must carry `swarm:split-child` —
+the mechanical proof SWARM created it, so a reviewer naming an unrelated issue
+closes nothing — must **still** carry the project's `pipeline.automationLabel`,
+since removing that label is the documented way to take an item off automation
+(ai/RULES.md §5) and closing a card plus retiring its queued phases is a heavier
+write than the comments SWARM posts on third-party cards, and must not already be
+settled, which makes a re-run a no-op. **The own-task comparison is on task
+identities, not artifact numbers:** a Review run's own `taskId` is the *pull
+request's* number, while a card's `taskRef` is the issue number behind it — one
+forge-wide sequence, two disjoint slices of it, so comparing the two could only
+ever be false. The merge dispatch therefore decodes the pull request's backing
+task from its head branch (`<branchPrefix><taskId>`, the derivation
+`isSwarmManagedPullRequest` and `resolveBoardItemIdForPrBranch` already share) and
+hands it in; `taskRef`/`taskRepository` are then compared through `repoSlugsMatch`,
+never a URL shape, against that task *and* against the pull request's own number.
+If that branch read fails, or the head branch encodes no task, the settle refuses
+every entry rather than guessing — the guard's input is missing, and closing the
+pull request's own card is the one mistake it exists to prevent. Every guard is a skip-with-warn and every
 provider failure is that entry's alone: the merge has already happened and cannot
 be undone by a board error, so nothing here can fail the dispatch. **Known
 limitation:** a pull request merged by a human outside SWARM's merge automation

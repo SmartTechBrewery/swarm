@@ -1,13 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { RunRow } from '@/db/repositories/runsRepository.js';
 import type { retireSupersededBoardPhases as RetireSuperseded } from '@/dispatch/board-phase-retirement.js';
 import type { PMProvider, WorkItem } from '@/pm/types.js';
 import type { ReviewAbsorbed } from '@/scm/delivery.js';
 
 vi.mock('@/db/repositories/runsRepository.js', () => ({
 	getReviewAbsorbedForPullRequest: vi.fn<() => Promise<ReviewAbsorbed[]>>(),
-	getRunByIdFromDb: vi.fn<() => Promise<RunRow | undefined>>(),
 }));
 
 // Partial: `createMockProjectConfig` parses a config whose credential refinement
@@ -22,10 +20,7 @@ vi.mock('@/dispatch/board-phase-retirement.js', () => ({
 	retireSupersededBoardPhases: vi.fn<typeof RetireSuperseded>(),
 }));
 
-import {
-	getReviewAbsorbedForPullRequest,
-	getRunByIdFromDb,
-} from '@/db/repositories/runsRepository.js';
+import { getReviewAbsorbedForPullRequest } from '@/db/repositories/runsRepository.js';
 import { absorbedChildMarker, settleAbsorbedChildren } from '@/dispatch/absorbed-child-settle.js';
 import { retireSupersededBoardPhases } from '@/dispatch/board-phase-retirement.js';
 import { requireProjectPMProvider } from '@/integrations/pm/registry.js';
@@ -34,16 +29,25 @@ import { createMockProjectConfig, createMockWorkItem } from '../../helpers/facto
 
 const PROJECT = createMockProjectConfig();
 const REPOSITORY = PROJECT.repo;
-const PR_NUMBER = '965';
+/**
+ * The pull request and the task it was written for, as the forge numbers them:
+ * one shared sequence, so they can never coincide. The Review run behind this
+ * merge records `taskId: PR_NUMBER` (`src/triggers/handlers/review.ts`), which is
+ * exactly why the own-task guard is handed the branch-decoded `OWN_TASK_ID`
+ * instead.
+ */
+const PR_NUMBER = '966';
 /** The task the merged pull request itself delivers — never settled by this. */
 const OWN_TASK_ID = '959';
+/** The automation opt-in label `createMockProjectConfig` leaves in force. */
+const AUTOMATION_LABEL = 'swarm';
 
 const INPUT = {
 	project: PROJECT,
 	dispatchId: 'dispatch-merge',
-	reviewRunId: 'run-review',
 	repository: REPOSITORY,
 	prNumber: PR_NUMBER,
+	resolveOwnTaskId: async () => OWN_TASK_ID,
 };
 
 const DECLARED: ReviewAbsorbed = {
@@ -59,7 +63,10 @@ function child(overrides: Partial<WorkItem> = {}): WorkItem {
 		url: DECLARED.url,
 		status: 'Ready',
 		statusId: '61e4505c',
-		labels: [{ id: 'LA_split', name: SPLIT_CHILD_LABEL }],
+		labels: [
+			{ id: 'LA_split', name: SPLIT_CHILD_LABEL },
+			{ id: 'LA_swarm', name: AUTOMATION_LABEL },
+		],
 		...overrides,
 	});
 }
@@ -98,21 +105,15 @@ function board(overrides: Partial<PMProvider> = {}): PMProvider {
 	};
 }
 
-/** Stage the declarations and the board, and answer the run read with the PR's own task. */
+/** Stage the declarations and the board. */
 function stage(declared: ReviewAbsorbed[], pm: PMProvider): PMProvider {
 	vi.mocked(getReviewAbsorbedForPullRequest).mockResolvedValue(declared);
-	vi.mocked(getRunByIdFromDb).mockResolvedValue({
-		id: INPUT.reviewRunId,
-		taskId: OWN_TASK_ID,
-		repository: REPOSITORY,
-	} as RunRow);
 	vi.mocked(requireProjectPMProvider).mockReturnValue(pm);
 	return pm;
 }
 
 beforeEach(() => {
 	vi.mocked(getReviewAbsorbedForPullRequest).mockReset();
-	vi.mocked(getRunByIdFromDb).mockReset();
 	vi.mocked(requireProjectPMProvider).mockReset();
 	vi.mocked(retireSupersededBoardPhases).mockReset().mockResolvedValue(0);
 });
@@ -161,6 +162,8 @@ describe('settleAbsorbedChildren', () => {
 		expect(retireSupersededBoardPhases).not.toHaveBeenCalled();
 	});
 
+	// The card the pull request was written for: a full split child in every other
+	// respect, which is precisely why nothing but the own-task guard stops it.
 	it("leaves the pull request's own task alone", async () => {
 		const pm = stage(
 			[DECLARED],
@@ -172,7 +175,67 @@ describe('settleAbsorbedChildren', () => {
 		);
 
 		expect(await settleAbsorbedChildren(INPUT)).toEqual([]);
+		expect(pm.addComment).not.toHaveBeenCalled();
 		expect(pm.closeWorkItem).not.toHaveBeenCalled();
+		expect(retireSupersededBoardPhases).not.toHaveBeenCalled();
+	});
+
+	// A board that tracks the pull request itself as a card: the merged artifact
+	// is not something a merge settles either.
+	it('leaves a card wrapping the merged pull request itself alone', async () => {
+		const pm = stage(
+			[DECLARED],
+			board({
+				findWorkItemByUrlSuffix: vi.fn(async () =>
+					child({ url: `https://github.com/${REPOSITORY}/pull/${PR_NUMBER}` }),
+				),
+			}),
+		);
+
+		expect(await settleAbsorbedChildren(INPUT)).toEqual([]);
+		expect(pm.addComment).not.toHaveBeenCalled();
+		expect(pm.closeWorkItem).not.toHaveBeenCalled();
+		expect(retireSupersededBoardPhases).not.toHaveBeenCalled();
+	});
+
+	// The guard's input, not a guess: without it the pull request's own card
+	// cannot be told apart from a sibling, so nothing is touched at all.
+	it('settles nothing when the pull request’s own task could not be resolved', async () => {
+		const pm = stage([DECLARED], board());
+
+		expect(
+			await settleAbsorbedChildren({ ...INPUT, resolveOwnTaskId: async () => undefined }),
+		).toEqual([]);
+		expect(pm.findWorkItemByUrlSuffix).not.toHaveBeenCalled();
+		expect(pm.closeWorkItem).not.toHaveBeenCalled();
+	});
+
+	// The resolution costs the caller a forge read, and essentially every merge
+	// declares nothing — so an undeclared merge must never pay for it.
+	it('never resolves the own task when nothing was declared', async () => {
+		const resolveOwnTaskId = vi.fn(async () => OWN_TASK_ID);
+		stage([], board());
+
+		expect(await settleAbsorbedChildren({ ...INPUT, resolveOwnTaskId })).toEqual([]);
+		expect(resolveOwnTaskId).not.toHaveBeenCalled();
+	});
+
+	// The documented opt-out (ai/RULES.md §5) is honoured here exactly as it is
+	// before a phase starts — closing a card is a heavier write than a comment.
+	it('leaves a split child whose automation label was removed alone', async () => {
+		const pm = stage(
+			[DECLARED],
+			board({
+				findWorkItemByUrlSuffix: vi.fn(async () =>
+					child({ labels: [{ id: 'LA_split', name: SPLIT_CHILD_LABEL }] }),
+				),
+			}),
+		);
+
+		expect(await settleAbsorbedChildren(INPUT)).toEqual([]);
+		expect(pm.addComment).not.toHaveBeenCalled();
+		expect(pm.closeWorkItem).not.toHaveBeenCalled();
+		expect(retireSupersededBoardPhases).not.toHaveBeenCalled();
 	});
 
 	it('settles a same-numbered card in another repository, which is not its own task', async () => {
@@ -259,16 +322,6 @@ describe('settleAbsorbedChildren', () => {
 
 		expect(await settleAbsorbedChildren(INPUT)).toEqual(['#948']);
 		expect(pm.closeWorkItem).toHaveBeenCalledTimes(2);
-	});
-
-	it('settles nothing when the Review run row is gone', async () => {
-		const pm = board();
-		vi.mocked(getReviewAbsorbedForPullRequest).mockResolvedValue([DECLARED]);
-		vi.mocked(getRunByIdFromDb).mockResolvedValue(undefined);
-		vi.mocked(requireProjectPMProvider).mockReturnValue(pm);
-
-		expect(await settleAbsorbedChildren(INPUT)).toEqual([]);
-		expect(pm.findWorkItemByUrlSuffix).not.toHaveBeenCalled();
 	});
 
 	it('answers [] rather than throwing when the declaration read fails', async () => {

@@ -13,21 +13,36 @@
  * when the pull request that made it actually merges.
  *
  * **A declaration is necessary but never sufficient.** The reviewer names a card;
- * three mechanical guards decide whether SWARM may touch it. It must resolve on
+ * four mechanical guards decide whether SWARM may touch it. It must resolve on
  * this project's board through the provider-agnostic one-card lookup; it must not
- * be the pull request's own task; and it must carry {@link SPLIT_CHILD_LABEL},
- * which is the proof that SWARM created it as a split child rather than a human
- * filing live work the reviewer happened to name. A card failing any of them is
- * left completely untouched, and so is a card already settled — which is what
+ * be the pull request itself or the task the pull request was written for
+ * ({@link SettleAbsorbedChildrenInput.resolveOwnTaskId}); it must carry
+ * {@link SPLIT_CHILD_LABEL}, which is the proof that SWARM created it as a split
+ * child rather than a human filing live work the reviewer happened to name; and it
+ * must still carry the project's `pipeline.automationLabel`, the documented
+ * opt-out an operator uses to take an item off automation (ai/RULES.md §5) —
+ * closing a card and retiring its queued phases is a heavier write than the
+ * comments SWARM posts on third-party cards, so the opt-out is honoured here as it
+ * is before a phase starts (`src/worker/consumer.ts`). A card failing any of them
+ * is left completely untouched, and so is a card already settled — which is what
  * makes a re-run of the merge dispatch a no-op.
+ *
+ * **The own-task guard compares task identities, not artifact numbers.** A Review
+ * run's own `taskId` is the *pull request's* number (`src/triggers/handlers/review.ts`),
+ * while a card's `taskRef` is the issue number behind it — two disjoint slices of
+ * one forge-wide sequence, so comparing them can only ever be false. The pull
+ * request's backing task is instead resolved by the caller from the head branch
+ * SWARM itself named (`<branchPrefix><taskId>`, the same derivation
+ * `isSwarmManagedPullRequest` and `resolveBoardItemIdForPrBranch` use) and handed
+ * in as {@link SettleAbsorbedChildrenInput.resolveOwnTaskId}.
  *
  * **It fails open, per item**, on {@link retireSupersededBoardPhases}' posture and
  * for a sharper reason: the merge has already happened and cannot be undone by a
  * board error, so a provider failure settles fewer cards rather than failing the
  * dispatch, and one entry's failure never stops the next. The one thing it fails
- * *closed* on is a missing Review run row, because that row supplies the own-task
- * guard's input — settling without it would risk closing the card the pull
- * request was written for.
+ * *closed* on is an own task it could not resolve, because that is the own-task
+ * guard's input — settling without it would risk closing the card the pull request was
+ * written for.
  *
  * **Known limitation: only SWARM's own merge automation settles anything.** A
  * pull request a human merges in the forge produces no merge dispatch, so its
@@ -38,14 +53,12 @@
  */
 
 import type { ProjectConfig } from '../config/schema.js';
-import {
-	getReviewAbsorbedForPullRequest,
-	getRunByIdFromDb,
-} from '../db/repositories/runsRepository.js';
+import { getReviewAbsorbedForPullRequest } from '../db/repositories/runsRepository.js';
 import { requireProjectPMProvider } from '../integrations/pm/registry.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { SPLIT_CHILD_LABEL } from '../pipeline/preplan.js';
+import { hasAutomationLabel, resolveAutomationLabel } from '../pm/automation-label.js';
 import type { PmStatusKey } from '../pm/pipeline.js';
 import type { PMProvider, WorkItem } from '../pm/types.js';
 import type { ReviewAbsorbed } from '../scm/delivery.js';
@@ -61,11 +74,24 @@ export interface SettleAbsorbedChildrenInput {
 	project: ProjectConfig;
 	/** This merge dispatch — excluded from retirement so it can never retire itself. */
 	dispatchId: string;
-	/** The approving Review run, whose own task is the pull request's. */
-	reviewRunId: string;
 	/** `owner/repo` of the merged pull request. */
 	repository: string;
 	prNumber: string;
+	/**
+	 * The task the merged pull request was written for — the card this must never
+	 * settle, decoded by the caller from the pull request's head branch (see the
+	 * module header on why a Review run's own `taskId` cannot answer this).
+	 *
+	 * A thunk rather than a value because resolving it costs the caller a forge
+	 * read, and essentially every merge declares nothing at all: it is invoked only
+	 * once this pull request is known to have a declaration to act on.
+	 *
+	 * Answers `undefined` when the caller could not resolve it — a read that
+	 * failed, or a head branch outside SWARM's naming convention. Nothing is
+	 * settled at all in that case: the guard's input is missing, and closing the
+	 * pull request's own card is the one mistake it exists to prevent.
+	 */
+	resolveOwnTaskId: () => Promise<string | undefined>;
 }
 
 /**
@@ -120,15 +146,20 @@ interface SettleContext {
 	prNumber: string;
 	/** The pull request's own task — the card this must never settle. */
 	ownTaskId: string;
+	/** This project's automation opt-in label, or `undefined` when the gate is off. */
+	automationLabel: string | undefined;
 }
 
-/** Whether the card is the very task the merged pull request was written for. */
+/**
+ * Whether the card is the merged pull request itself, or the task it was written
+ * for. Both are compared inside the pull request's own repository: a card in
+ * another of the project's repositories can carry the same number without being
+ * the same artifact.
+ */
 function isOwnTask(item: WorkItem, ctx: SettleContext): boolean {
-	return (
-		item.taskRef === ctx.ownTaskId &&
-		item.taskRepository !== undefined &&
-		repoSlugsMatch(item.taskRepository, ctx.repository)
-	);
+	if (item.taskRepository === undefined || !repoSlugsMatch(item.taskRepository, ctx.repository))
+		return false;
+	return item.taskRef === ctx.ownTaskId || item.taskRef === ctx.prNumber;
 }
 
 /**
@@ -160,6 +191,13 @@ async function settleOne(entry: ReviewAbsorbed, ctx: SettleContext): Promise<boo
 		if (isOwnTask(item, ctx)) return skip('it is the pull request’s own task');
 		if (!item.labels.some((label) => label.name === SPLIT_CHILD_LABEL))
 			return skip(`the card does not carry '${SPLIT_CHILD_LABEL}', so SWARM did not create it`);
+		// Every split child is born carrying the automation label beside
+		// `swarm:split-child` (`src/pipeline/planning.ts`), so its absence is an
+		// operator having deliberately taken the item off automation.
+		if (ctx.automationLabel && !hasAutomationLabel(item, ctx.automationLabel))
+			return skip(
+				`the card no longer carries the '${ctx.automationLabel}' automation label, so it is opted out`,
+			);
 		if (item.statusKey === SETTLED_STATUS_KEY) return skip('the card is already settled');
 
 		if (!(await ctx.pm.findComment(item.id, absorbedChildMarker(ctx.repository, ctx.prNumber)))) {
@@ -204,16 +242,16 @@ async function settleOne(entry: ReviewAbsorbed, ctx: SettleContext): Promise<boo
 export async function settleAbsorbedChildren(
 	input: SettleAbsorbedChildrenInput,
 ): Promise<string[]> {
-	const { project, dispatchId, reviewRunId, repository, prNumber } = input;
+	const { project, dispatchId, repository, prNumber } = input;
 	try {
 		const declared = await getReviewAbsorbedForPullRequest(project.id, repository, prNumber);
 		if (declared.length === 0) return [];
 
-		const run = await getRunByIdFromDb(reviewRunId);
-		if (!run) {
+		const ownTaskId = await input.resolveOwnTaskId();
+		if (!ownTaskId) {
 			logger.warn(
-				'absorbed-child settle: the Review run is gone, so the declared tasks cannot be told apart from the pull request’s own',
-				{ projectId: project.id, repository, prNumber, reviewRunId },
+				'absorbed-child settle: the pull request’s own task is unknown, so the declared tasks cannot be told apart from it',
+				{ projectId: project.id, repository, prNumber },
 			);
 			return [];
 		}
@@ -224,7 +262,8 @@ export async function settleAbsorbedChildren(
 			dispatchId,
 			repository,
 			prNumber,
-			ownTaskId: run.taskId,
+			ownTaskId,
+			automationLabel: resolveAutomationLabel(project.pipeline),
 		};
 
 		const settled: string[] = [];
