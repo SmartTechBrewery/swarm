@@ -404,6 +404,13 @@ vi.mock('@/triggers/review-dispatch-dedup.js', () => ({
 // finalize against.
 const createRun = vi.fn(async (_input: unknown) => 'run-1');
 const completeRun = vi.fn(async (_id: string, _input: unknown) => {});
+/**
+ * Issue #954 — the terminal settle of the row a *continuation* carries, which the
+ * gate's refusal reaches through no run of its own.
+ */
+const failRunFromStatus = vi.fn(
+	async (_id: string, _reason: string, _fromStatus?: string, _diagnosis?: unknown) => true,
+);
 const storeRunLogs = vi.fn(async (_id: string, _stdout: string, _stderr: string) => {});
 const updateRunJobPayload = vi.fn(async (_id: string, _job: unknown) => {});
 const getLatestRunForTask = vi.fn(
@@ -460,6 +467,8 @@ const recordRunPreservedWorker = vi.fn(async (_runId: string) => {});
 vi.mock('@/db/repositories/runsRepository.js', () => ({
 	createRun: (input: unknown) => createRun(input),
 	completeRun: (id: string, input: unknown) => completeRun(id, input),
+	failRunFromStatus: (id: string, reason: string, fromStatus?: string, diagnosis?: unknown) =>
+		failRunFromStatus(id, reason, fromStatus, diagnosis),
 	storeRunLogs: (id: string, stdout: string, stderr: string) => storeRunLogs(id, stdout, stderr),
 	updateRunJobPayload: (id: string, job: unknown) => updateRunJobPayload(id, job),
 	getLatestRunForTask: (projectId: string, taskId: string, phase: string) =>
@@ -864,6 +873,8 @@ describe('processJob', () => {
 		createRun.mockResolvedValue('run-1');
 		completeRun.mockClear();
 		completeRun.mockResolvedValue(undefined);
+		failRunFromStatus.mockClear();
+		failRunFromStatus.mockResolvedValue(true);
 		storeRunLogs.mockClear();
 		storeRunLogs.mockResolvedValue(undefined);
 		updateRunJobPayload.mockClear();
@@ -3114,6 +3125,33 @@ describe('processJob', () => {
 					expect(addComment).toHaveBeenCalledOnce();
 					const [, body] = addComment.mock.calls[0];
 					expect(body).toContain('Reset & restart');
+					// The ending has to reach the *carried* row, not only the dispatch and the
+					// board: the gate refuses before this dispatch creates a run of its own, so
+					// without this the continuation stays retry-pending forever — and the
+					// reconciler's orphan backfill re-dispatches exactly that shape.
+					expect(failRunFromStatus).toHaveBeenCalledOnce();
+					const [settledRunId, reason] = failRunFromStatus.mock.calls[0];
+					expect(settledRunId).toBe('run-1');
+					expect(reason).toContain('no record of which machine holds this checkout');
+					// Failed, not deferred: nothing may leave it in a retry-pending status.
+					expect(completeRun).not.toHaveBeenCalled();
+					expect(failDispatch).toHaveBeenCalledOnce();
+				});
+
+				it('settles no run row while the wait is still within budget', async () => {
+					boundButUnrecorded();
+					listProjectDispatchCandidates.mockResolvedValue([candidate('w-free')]);
+
+					await processJob(
+						continuation(),
+						registryReturning(planningTrigger()),
+						undefined,
+						executionIdentity('w-free'),
+					);
+
+					// The deferral is the one case that must *not* write the carried row: its
+					// `checkpointed` status and session id are what the retry continues from.
+					expect(failRunFromStatus).not.toHaveBeenCalled();
 				});
 
 				it('still runs it on an unfederated project, where nothing could be mis-routed', async () => {

@@ -55,6 +55,7 @@ import {
 	type CompleteRunInput,
 	completeRun,
 	createRun,
+	failRunFromStatus,
 	getLatestCompletedPlanningScope,
 	getLatestRunForTask,
 	getRunByIdFromDb,
@@ -2842,6 +2843,56 @@ async function recordPreservedWorker(runId: string | undefined): Promise<void> {
 }
 
 /**
+ * Settle the run a **continuation** carries when the eligibility gate's bounded
+ * budget runs out on `preserved-worker-unknown` (issue #954).
+ *
+ * The gate refuses before {@link tryCreateRun}, so this dispatch has no run row
+ * of its own and {@link finalizeFailedRun} above is handed `undefined` and
+ * no-ops. That is right for the *wait* — writing onto the carried row would
+ * clobber the `checkpointed` status and session id it exists to hold — but the
+ * exhausted budget is that row's ending, and leaving it retry-pending is not a
+ * cosmetic gap: a retry-pending run with no active dispatch is precisely what
+ * the reconciler's orphan backfill repairs, so the row it left behind is
+ * re-dispatched and refused again, for good.
+ *
+ * Scoped to this one reason deliberately. It is the only refusal whose premise
+ * is that the record needed to continue was never written, so clearing the
+ * retry-shaped columns ({@link failRunFromStatus} nulls `nextRetryAt` and
+ * `agentSessionId`) gives up nothing that could have been used — where an
+ * exhausted *structural* refusal (consent revoked, enrollment suspended) is
+ * about a machine an operator can still fix, and its row must stay resumable.
+ * `recovery` is left untouched for the same reason it is on the board-retirement
+ * path: this settle gives no checkout up, so it must not erase what the row
+ * records about one — an `abandonedWorkerId` a later "Reset & restart" reads, or
+ * a pin some other attempt manages to write.
+ *
+ * Best-effort like every other run-tracking write here: the dispatch has already
+ * failed and the board comment is already posted, so a DB hiccup logs rather
+ * than rethrowing into a BullMQ retry.
+ */
+async function failCarriedRunAfterGateRefusal(
+	runId: string | undefined,
+	job: SwarmJob,
+	outcome: JobOutcome,
+	err: unknown,
+): Promise<void> {
+	if (runId || !job.runId || outcome.status !== 'phase-failed') return;
+	if (!(err instanceof WorkerIneligibleError) || err.reason !== 'preserved-worker-unknown') return;
+	try {
+		await failRunFromStatus(job.runId, outcome.error, undefined, outcome.failureDiagnosis);
+	} catch (dbErr) {
+		logger.error(
+			'Failed to settle the continuation run refused by the dispatch gate (continuing)',
+			{
+				runId: job.runId,
+				reason: err.reason,
+				error: describeError(dbErr),
+			},
+		);
+	}
+}
+
+/**
  * The run's engine/exit/timing columns, pulled from a captured agent result — or from
  * the stand-in a control-plane settle rebuilt out of a worker's terminal frame.
  *
@@ -4582,6 +4633,9 @@ export async function processJob(
 		// Reconcile the terminated run's checkout before the `finally` clears
 		// cancellation tracking and releases the project slot.
 		await finalizeFailedRun(runId, outcome, err, { project, taskId: trigger.taskId });
+		// …and the row a continuation *carries*, which the settle above cannot reach
+		// because the gate refuses before this dispatch has a run of its own (#954).
+		await failCarriedRunAfterGateRefusal(runId, job, outcome, err);
 		// Settle the durable dispatch to match: a deferral persists its derived
 		// retry intent *before* any wake-up is queued (crash-safe — issue #284); a
 		// user termination cancels rather than fails, so nothing resurrects it.
