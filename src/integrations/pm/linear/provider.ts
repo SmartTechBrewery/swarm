@@ -861,6 +861,19 @@ export class LinearPMProvider implements PMProvider {
 		logger.debug('pm: moved work item', { itemId: id, status });
 	}
 
+	/**
+	 * One write is the whole settle here, unlike GitHub Projects' two: a Linear
+	 * issue carries no closed flag beside its workflow state — the mapping's `done`
+	 * state is a *completed*-type state, and that state is both what the board shows
+	 * and what this provider derives a blocker's `open` from
+	 * ({@link CLOSED_STATE_TYPES}). So moving the issue into it satisfies both halves
+	 * of the contract's end state (`src/pm/types.ts`), and any second write would
+	 * have nothing left to set.
+	 */
+	async closeWorkItem(id: string): Promise<void> {
+		await this.moveWorkItem(id, 'done');
+	}
+
 	async addComment(id: string, text: string): Promise<string> {
 		// Unlike GitHub Projects — whose board card has no comment thread, so the
 		// comment is redirected onto the backing Issue — a Linear issue *is* the

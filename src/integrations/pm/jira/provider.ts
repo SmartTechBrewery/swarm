@@ -843,6 +843,23 @@ export class JiraPMProvider implements PMProvider {
 		});
 	}
 
+	/**
+	 * One write is the whole settle here, unlike GitHub Projects' two: a Jira issue
+	 * carries no closed flag beside its status — the mapping's `done` status belongs
+	 * to the {@link DONE_STATUS_CATEGORY} category, which is both what the board
+	 * shows and what this provider derives a blocker's `open` from. So transitioning
+	 * the issue into it satisfies both halves of the contract's end state
+	 * (`src/pm/types.ts`), and any second write would have nothing left to set.
+	 *
+	 * It inherits `moveWorkItem`'s workflow negotiation with it, which is the part
+	 * that is genuinely Jira's: an issue already in the `done` status is a no-op, and
+	 * one whose workflow offers no transition there fails loudly naming the
+	 * transitions it does offer, rather than reporting a settle that did not happen.
+	 */
+	async closeWorkItem(id: string): Promise<void> {
+		await this.moveWorkItem(id, 'done');
+	}
+
 	async addComment(id: string, text: string): Promise<string> {
 		// Unlike GitHub Projects — whose board card has no comment thread, so the
 		// comment is redirected onto the backing Issue — a Jira issue *is* the card,

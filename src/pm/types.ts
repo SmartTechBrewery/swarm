@@ -546,6 +546,36 @@ export interface PMProvider {
 	moveWorkItem(id: string, status: string): Promise<void>;
 
 	/**
+	 * Settle a work item as **completed** — the board's end state for work that
+	 * landed. Two things must hold once this resolves, on any later read of the
+	 * item: a {@link listBlockers} entry naming it reports `open: false`, so it
+	 * stops gating whatever it blocks; and its card sits in a status that starts no
+	 * pipeline phase (the canonical `done` key, which
+	 * `resolvePipelinePhaseForStatusKey` in `src/pm/pipeline.ts` maps to none), so
+	 * settling it cannot re-trigger the pipeline.
+	 *
+	 * **Not a synonym for `moveWorkItem(id, 'done')`.** A provider owes whatever
+	 * writes its own model needs to reach *both* halves of that end state. Where
+	 * `open` is derived from something other than the board column — GitHub
+	 * Projects reads it off the backing Issue's state — the column write alone
+	 * leaves a done-looking card still gating its dependents, and the state write
+	 * alone leaves the card parked in an active column. A provider whose status
+	 * *is* its open/closed state (a Linear completed-type state, a Jira `done`
+	 * status category, a Trello list) owes exactly the one write, and says so in
+	 * its own module rather than leaving the reader to assume it.
+	 *
+	 * Idempotent — settling an already-settled item is a no-op rather than an
+	 * error, so a retried delivery can re-assert the end state safely.
+	 *
+	 * A method on the contract rather than a sequence assembled at the call site
+	 * (`moveWorkItem` plus a provider-specific state write) precisely because that
+	 * sequence differs per provider: assembling it at the call site would mean
+	 * branching on a concrete provider there, which is the special-case ai/RULES.md
+	 * §2 requires widening the interface instead of.
+	 */
+	closeWorkItem(id: string): Promise<void>;
+
+	/**
 	 * Post a comment carrying agent output (a plan, review notes) and return the
 	 * created comment's ID.
 	 *

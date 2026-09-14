@@ -819,6 +819,52 @@ export class GitHubProjectsPMProvider implements PMProvider {
 		logger.debug('pm: moved work item', { itemId: id, status });
 	}
 
+	/**
+	 * Two writes, not one, because this board splits the end state across two
+	 * places: a blocker's `open` is read off the backing Issue's state
+	 * (`fetchNativeBlockers`), while the phase a card starts is read off its Status
+	 * option. Closing the Issue alone would leave the card in an active column; the
+	 * `done` move alone would leave the Issue open and still gating its dependents —
+	 * and a board with no *item closed → Done* workflow configured does not make the
+	 * move for us.
+	 *
+	 * The Issue is closed **first** so that a failure of the board write still leaves
+	 * the item non-blocking; the `done` option is checked before either write, since
+	 * discovering it unmapped afterwards would leave a closed Issue parked in an
+	 * active column.
+	 */
+	async closeWorkItem(id: string): Promise<void> {
+		// The state lives on the backing Issue, not the board card — resolve it first
+		// (its own scoped run), mirroring addComment/updateWorkItem's two-step shape.
+		const { owner, repo, contentNumber } = await this.resolveItem(id);
+		if (!owner || !repo || contentNumber == null) {
+			throw new Error(
+				`Cannot close item '${id}': it has no backing Issue to close (likely a draft item)`,
+			);
+		}
+		if (!this.config.statusOptions.done) {
+			// The same fail-loud contract moveWorkItem keeps, asserted up front rather
+			// than left to the move below (ai/CODING_STANDARDS.md "Error handling").
+			throw new Error(
+				`Cannot close item '${id}': status 'done' has no option ID in the project's statusOptions map`,
+			);
+		}
+		await this.run(async () => {
+			// `completed` rather than the default reason: a settled item is finished, not
+			// abandoned, and GitHub renders the two differently. Re-closing an Issue that
+			// is already closed is accepted, which is what makes a repeat call a no-op.
+			await getScopedClient().issues.update({
+				owner,
+				repo,
+				issue_number: contentNumber,
+				state: 'closed',
+				state_reason: 'completed',
+			});
+		});
+		await this.moveWorkItem(id, 'done');
+		logger.debug('pm: closed work item', { itemId: id, issueNumber: contentNumber });
+	}
+
 	async addComment(id: string, text: string): Promise<string> {
 		const resolved = await this.resolveItem(id);
 		const { owner, repo, contentNumber } = resolved;

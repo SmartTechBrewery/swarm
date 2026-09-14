@@ -140,6 +140,7 @@ function makeDeps() {
 		addComment: vi.fn<(id: string, text: string) => Promise<string>>(async () => 'comment-1'),
 		findComment: vi.fn(async () => undefined),
 		moveWorkItem: vi.fn(async () => {}),
+		closeWorkItem: vi.fn(async () => {}),
 		createWorkItem: vi.fn(async () => createMockWorkItem({ id: 'PVTI_sibling' })),
 		updateWorkItem: vi.fn(async () => {}),
 		addLabel: vi.fn(async () => {}),

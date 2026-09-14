@@ -91,6 +91,18 @@ describe('createWriteOnlyTransportPmProvider', () => {
 		expect(fetchImpl).not.toHaveBeenCalled();
 	});
 
+	it('refuses the one write that is a control-plane action, naming the operation', async () => {
+		const fetchImpl = vi.fn<FetchLike>();
+
+		// Settling a work item happens control-plane side after a run lands, so no
+		// phase a worker runs performs one and there is no delivery route for it —
+		// refusing beats a silent no-op that would report a settle that never happened.
+		await expect(writeOnly(fetchImpl).closeWorkItem('PVTI_item1')).rejects.toThrow(
+			/PM write 'closeWorkItem' is not available on a DB-free worker/i,
+		);
+		expect(fetchImpl).not.toHaveBeenCalled();
+	});
+
 	it('serves listBlockers over the transport so the dependency gate keeps gating', async () => {
 		const blockers = [
 			{

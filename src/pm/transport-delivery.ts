@@ -101,6 +101,21 @@ async function unavailableRead(operation: string): Promise<never> {
 }
 
 /**
+ * A board **write** a DB-free worker has no route for, and needs none: settling a
+ * work item is a control-plane action taken after a run lands, not a step in any
+ * phase a worker runs. The sibling of {@link unavailableRead}, and refusing for the
+ * same reason — a silent no-op here would report a settle that never happened.
+ *
+ * Rejects rather than throwing synchronously, so it fails exactly where a real
+ * provider's failed call would — inside the caller's `await`.
+ */
+async function unavailableWrite(operation: string): Promise<never> {
+	throw new Error(
+		`PM write '${operation}' is not available on a DB-free worker — it is a control-plane action, and no phase a worker runs performs one`,
+	);
+}
+
+/**
  * Hydrate the narrow card frame the three card-returning routes answer with
  * (`FoundWorkItemSchema`) into the `WorkItem` the interface returns. The three
  * omitted fields take the interface's own "nothing here" values rather than being
@@ -176,6 +191,11 @@ function hydrateWorkItem(item: FoundWorkItem): WorkItem {
  * have). No phase a DB-free worker runs calls any of them. Assignees are unreadable
  * here too — only the server-side eligibility gate reads that flag, and it never
  * runs on a worker.
+ *
+ * One **write** refuses for the same shape of reason: `closeWorkItem` (issue #958).
+ * Settling a work item happens control-plane side, after a run lands, so no phase a
+ * worker runs performs one and there is no `/worker/delivery/pm/*` route to carry it
+ * ({@link unavailableWrite}).
  */
 export function createWriteOnlyTransportPmProvider(
 	options: WriteOnlyTransportPmDeliveryOptions,
@@ -187,6 +207,7 @@ export function createWriteOnlyTransportPmProvider(
 		getWorkItem: () => unavailableRead('getWorkItem'),
 		listWorkItems: () => unavailableRead('listWorkItems'),
 		resolveItemRepository: () => unavailableRead('resolveItemRepository'),
+		closeWorkItem: () => unavailableWrite('closeWorkItem'),
 		listBlockers: (id) =>
 			postDelivery(
 				options,

@@ -709,6 +709,21 @@ describe('LinearPMProvider', () => {
 		});
 	});
 
+	describe('closeWorkItem', () => {
+		it("settles the issue with its own mapped 'done' state and no second write", async () => {
+			mockGraphQL({ UpdateIssue: { issueUpdate: { success: true } } });
+
+			await provider.closeWorkItem(ISSUE_NODE.id);
+
+			// A Linear issue has no closed flag beside its workflow state: the mapped
+			// `done` state is a completed-type one, which is what `listBlockers` reads
+			// `open` from — so the one write settles both halves (`src/pm/types.ts`).
+			expect(variablesSentTo('UpdateIssue')).toEqual([
+				{ id: ISSUE_NODE.id, input: { stateId: CONFIG.statusOptions.done } },
+			]);
+		});
+	});
+
 	describe('addComment', () => {
 		it('posts natively on the Linear issue and returns the new comment id', async () => {
 			mockGraphQL({

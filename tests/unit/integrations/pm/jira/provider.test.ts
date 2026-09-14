@@ -739,6 +739,40 @@ describe('JiraPMProvider', () => {
 		});
 	});
 
+	describe('closeWorkItem', () => {
+		it("settles the issue through the transition into its mapped 'done' status", async () => {
+			mockJira({
+				'issue/SWARM-42': { fields: { status: { id: '3', name: 'In Progress' } } },
+				'issue/SWARM-42/transitions': {
+					transitions: [{ id: '51', name: 'Done', to: { id: CONFIG.statusOptions.done } }],
+				},
+			});
+
+			await provider.closeWorkItem('SWARM-42');
+
+			// A Jira issue has no closed flag beside its status: the mapped `done`
+			// status sits in the `done` category, which is what `listBlockers` reads
+			// `open` from — so the one transition settles both halves.
+			expect(writeTo('issue/SWARM-42/transitions', 'POST').body).toEqual({
+				transition: { id: '51' },
+			});
+		});
+
+		it('is a no-op on an issue already in the done status', async () => {
+			mockJira({
+				'issue/SWARM-42': {
+					fields: { status: { id: CONFIG.statusOptions.done, name: 'Done' } },
+				},
+			});
+
+			await provider.closeWorkItem('SWARM-42');
+
+			// Settling an already-settled item is a no-op by contract, and the workflow
+			// is never even consulted — there is no transition *to* the current status.
+			expect(fetchMock).toHaveBeenCalledTimes(1);
+		});
+	});
+
 	describe('addComment', () => {
 		it('posts the body as ADF on the issue itself and returns the comment id', async () => {
 			mockJira({ 'issue/SWARM-42/comment': { id: '10500' } });
