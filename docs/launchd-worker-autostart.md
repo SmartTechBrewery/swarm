@@ -101,8 +101,12 @@ sharing a basename (`~/work/api` and `~/oss/api`) still get distinct labels.
   directory: `swarm run:worker` runs the daemon out of the npm-linked SWARM
   checkout, so every worker on the machine reports *that* directory as its `cwd`
   whichever repository it serves (issue #969). Two consequences worth knowing. A
-  lock left behind by a crashed daemon refuses nothing, because it is reclaimable
-  and the next daemon reclaims it. And reinstalling over this checkout's *own*
+  lock left behind by a crashed daemon refuses nothing, because `install` applies
+  the same reclaim rule the daemon does: at once when the recorded pid is gone, and
+  — for the pid the OS has since recycled to some *other* checkout's worker, which
+  is the one case liveness alone gets wrong — once the record's `refreshedAt` is
+  more than fifteen minutes old (`CHECKOUT_LOCK_TTL_MS`, the TTL the next daemon
+  reclaims on). And reinstalling over this checkout's *own*
   running agent is not refused either, since `install` boots that job out before
   bootstrapping the new one — which is what makes `install --self-update` on a live
   agent work. A fleet-wide restart therefore needs no particular order between

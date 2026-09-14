@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { WorkerUpdate } from '@/transport/protocol.js';
 import {
 	createWorkerUpdateHandler,
@@ -107,6 +107,19 @@ beforeEach(() => {
 });
 
 describe('selfUpdateEnabled', () => {
+	// The `undefined` case exercises the default argument, which reads the *real*
+	// environment — and the machine running this suite may well be one an operator
+	// opted in with `swarm-worker-agent install --self-update`, which exports this
+	// very variable into the daemon's environment. Stub it absent so the case asserts
+	// the default rather than the host.
+	beforeEach(() => {
+		vi.stubEnv(SELF_UPDATE_ENV, undefined);
+	});
+
+	afterEach(() => {
+		vi.unstubAllEnvs();
+	});
+
 	// Only the literal `true`, like `SWARM_SINGLE_USER_MODE`: opting a machine's
 	// install root into being rewritten must be an explicit act.
 	it.each([

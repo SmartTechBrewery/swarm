@@ -95,6 +95,31 @@ agent_running() {
 	launchctl print "$TARGET" 2>/dev/null | grep -qE '^[[:space:]]+pid = [0-9]+'
 }
 
+# Whether the lock's own `refreshedAt` has lapsed -- the freshness half of the
+# daemon's reclaim rule (CHECKOUT_LOCK_TTL_MS, src/worktree/checkout-lock.ts, kept
+# in step with this literal by tests/unit/worker/worker-agent-lock-guard.test.ts).
+# The holder rewrites that stamp every five minutes, so a lapsed one means a
+# departed daemon whose pid the OS has since handed to *another* worker -- the one
+# case liveness alone gets wrong, and a real one on a machine running a worker per
+# checkout. The daemon reclaims such a lock instead of refusing to start, so the
+# installer has to agree or it refuses an install the very daemon it is installing
+# would then complete. An unreadable stamp counts as lapsed, exactly as `isExpired`
+# (src/worktree/local-lock.ts) treats an unparseable one: a record that cannot be
+# trusted to bound anything must not block an operator either.
+#
+# `-v-15M` is BSD date's arithmetic and `-d` GNU's; both are kept so the guard can
+# be exercised off a Mac. Both stamps are `toISOString` output -- fixed width, UTC,
+# zero-padded -- so comparing the first 19 characters as plain strings orders them
+# correctly without parsing a date in shell.
+lock_lapsed() {
+	local refreshed cutoff
+	refreshed=$(sed -n 's/.*"refreshedAt":[[:space:]]*"\([^"]*\)".*/\1/p' "$LOCK" 2>/dev/null | head -1 || true)
+	[ -n "$refreshed" ] || return 0
+	cutoff=$(date -u -v-15M +%Y-%m-%dT%H:%M:%S 2>/dev/null ||
+		date -u -d '15 minutes ago' +%Y-%m-%dT%H:%M:%S)
+	[[ "${refreshed:0:19}" < "$cutoff" ]]
+}
+
 # A worker already running by hand holds the checkout lock; a second one would lose
 # the race and then crash-loop under KeepAlive.
 #
@@ -106,15 +131,18 @@ agent_running() {
 # at all (issue #969). `ps` rather than `pgrep` for liveness for a second reason
 # found there: macOS pgrep excludes its own ancestors, so a daemon that spawned the
 # session running this command is invisible to it -- and one `ps` call answers both
-# halves at once, since a pid that is live *and* a worker is not a recycled pid. A
-# lock left behind by a crashed daemon refuses nothing, exactly as the next daemon
-# reclaims it rather than refusing to start.
+# halves of the liveness question at once, since a pid running something that is not
+# a worker cannot be this lock's holder. A lock left behind by a crashed daemon
+# refuses nothing, exactly as the next daemon reclaims it rather than refusing to
+# start -- at once when its pid is gone, and once the record lapses when that pid has
+# been recycled to another worker.
 refuse_if_worker_running() {
 	[ -f "$LOCK" ] || return 0
 	local holder who
 	holder=$(sed -n 's/.*"pid":[[:space:]]*\([0-9]\{1,\}\).*/\1/p' "$LOCK" 2>/dev/null | head -1 || true)
 	[ -n "$holder" ] || return 0
 	ps -ww -p "$holder" -o command= 2>/dev/null | grep -q 'src/transport/connect-entry' || return 0
+	lock_lapsed && return 0
 	agent_running && return 0
 	# Named the way the daemon's own refusal names a holder (`describeHolder`,
 	# src/worktree/checkout-lock.ts): by worker id when the lock has one, since that
