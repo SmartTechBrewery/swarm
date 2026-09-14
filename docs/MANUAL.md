@@ -178,11 +178,13 @@ routes a phase to a worker that cannot run it; the work waits for one that can.
 checkout for its whole life, so a second worker pointed at the same path refuses
 to start instead of driving Git in the same repository (give a second worker on
 the machine its own checkout). The control plane polices the same pairing:
-enrolling a worker in a project for another repository is refused, and an
-existing enrollment a reconnecting daemon's declaration contradicts is
+enrolling a worker in a project that does not own its repository is refused, and
+an existing enrollment a reconnecting daemon's declaration contradicts is
 *suspended*, with both repositories shown on the Workers screen — approval and
 sharing consent stay human decisions, so nothing is ever enrolled or re-activated
-from a declaration alone.
+from a declaration alone. A project owning several repositories accepts a worker
+for **any** of them (issue #946), which is how one project holds one worker per
+repository.
 
 **How work is split.** Source-carrying delivery (commit / push / create-PR) runs
 on the worker under the operator credential the assignment carried. Everything needing something the worker

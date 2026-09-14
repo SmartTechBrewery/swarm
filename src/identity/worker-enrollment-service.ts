@@ -37,9 +37,11 @@
  * - `listProjectWorkerIdsInOrder(projectId)` — that same order as bare worker
  *   ids, for a caller that already holds the rows and only needs to sort them.
  *
- * **A worker is only ever enrolled in a project for the repository its own
- * checkout is** (issue #690). Both moments the pairing becomes knowable are
- * policed here: `enrollWorker` refuses a mismatched write
+ * **A worker is only ever enrolled in a project for one of the repositories the
+ * project declares** (issue #690, widened by #946 from the project's default
+ * entry to its whole list — the "one worker per repository, several per project"
+ * roster a multi-repository project needs). Both moments the pairing becomes
+ * knowable are policed here: `enrollWorker` refuses a mismatched write
  * (`EnrollmentRepositoryMismatchError`), and
  * `suspendEnrollmentsForMismatchedRepository` suspends an existing enrollment when
  * a reconnecting daemon declares a repository that contradicts it. Neither ever
@@ -61,11 +63,15 @@
  * `current_run_id` left over from a completed/failed run reads as idle.
  */
 
+import type { ProjectRecord } from '../config/schema.js';
 import {
 	getActiveWorkerClaims,
 	getWorkerDispatchClaimState,
 } from '../db/repositories/dispatchesRepository.js';
-import { findProjectByIdFromDb } from '../db/repositories/projectsRepository.js';
+import {
+	findProjectByIdFromDb,
+	findProjectRecordByIdFromDb,
+} from '../db/repositories/projectsRepository.js';
 import { getRunByIdFromDb } from '../db/repositories/runsRepository.js';
 import { getUserById } from '../db/repositories/usersRepository.js';
 import {
@@ -884,13 +890,18 @@ export interface EnrollWorkerInput {
  * de-duplicated) and enforces that it is a **subset of the worker's declared
  * capabilities** — throwing {@link AllowedClisNotCapableError} otherwise —
  * validates `allowedPhases` (non-empty, de-duplicated, defaulting to
- * {@link DEFAULT_ENROLLMENT_ALLOWED_PHASES}), refuses a project whose repository
- * is not the worker's declared one ({@link EnrollmentRepositoryMismatchError},
- * issue #690), then persists a `pending` enrollment (unless a status is given)
- * with sharing consent off by default and, unless the caller names one, a
- * concurrency allocation of {@link DEFAULT_CONCURRENCY_ALLOCATION}. A duplicate
- * `(worker, project)` surfaces the repository's pg `23505` for the caller to
- * translate.
+ * {@link DEFAULT_ENROLLMENT_ALLOWED_PHASES}), refuses a project that declares
+ * none of its repositories as the worker's declared one
+ * ({@link EnrollmentRepositoryMismatchError}, issue #690 widened by #946), then
+ * persists a `pending` enrollment (unless a status is given) with sharing consent
+ * off by default and, unless the caller names one, a concurrency allocation of
+ * {@link DEFAULT_CONCURRENCY_ALLOCATION}. A duplicate `(worker, project)`
+ * surfaces the repository's pg `23505` for the caller to translate.
+ *
+ * A multi-repository project holding several workers this way remains a *single*
+ * project in every other respect: one SCM provider (issue #727), one credential
+ * set, one `pipeline`/`agents` config and one `maxConcurrentJobs` across its
+ * repositories. Those are existing deliberate properties, not gaps this opens.
  */
 export async function enrollWorker(input: EnrollWorkerInput): Promise<WorkerEnrollment> {
 	const allowedClis = EnrollmentAllowedClisSchema.parse(input.allowedClis);
@@ -923,10 +934,39 @@ function assertClisWithinCapabilities(worker: Worker, allowedClis: AgentCli[]): 
 }
 
 /**
- * Throw {@link EnrollmentRepositoryMismatchError} unless the project is for the
- * repository the worker's own checkout is (issue #690) — the first of the two
- * moments the pairing becomes knowable, the other being a reconnecting daemon's
- * declaration ({@link suspendEnrollmentsForMismatchedRepository}).
+ * Whether the project declares `declared` **anywhere** in its repository list
+ * (issue #946) — the widened form of the pairing issue #690 policed against the
+ * project's default entry alone, which made the "one worker per repository,
+ * several per project" roster unreachable.
+ *
+ * `findProjectRepository` (`../config/project-repository.ts`) answers the same
+ * question for a repository the *project itself* already named and compares with
+ * `===` for that reason. This side of the pairing keeps the shared
+ * `repoSlugsMatch` (`../scm/repo-slug.ts`), which normalises the *config* side
+ * too: a declaration is normalised at the handshake boundary
+ * (`Worker.repository`), a `ProjectRepository.repo` is whatever the operator
+ * wrote.
+ */
+function projectDeclaresRepository(record: ProjectRecord, declared: string): boolean {
+	return record.repositories.some((entry) => repoSlugsMatch(entry.repo, declared));
+}
+
+/** The project's repositories, normalised — the project's half of a mismatch report. */
+function projectRepositorySlugs(record: ProjectRecord): string[] {
+	return record.repositories.map((entry) => normalizeRepoSlug(entry.repo));
+}
+
+/**
+ * Throw {@link EnrollmentRepositoryMismatchError} unless the project declares the
+ * repository the worker's own checkout is (issue #690, widened by #946 from the
+ * default entry to the whole list) — the first of the two moments the pairing
+ * becomes knowable, the other being a reconnecting daemon's declaration
+ * ({@link suspendEnrollmentsForMismatchedRepository}).
+ *
+ * Reads the project **record** (`findProjectRecordByIdFromDb`) rather than the
+ * scoped config every other caller takes: `findProjectByIdFromDb` narrows to the
+ * project's default repository, so entries 1..n are invisible to it and a worker
+ * holding one of them could never enroll.
  *
  * Two cases are deliberately *not* refused:
  *
@@ -938,36 +978,36 @@ function assertClisWithinCapabilities(worker: Worker, allowedClis: AgentCli[]): 
  *   path, and inventing one here would answer "does this project exist?" ahead of
  *   the caller's own authorization check. The existing FK on `createEnrollment`
  *   remains what refuses it.
- *
- * The comparison runs through the shared `repoSlugsMatch` (`../scm/repo-slug.ts`),
- * which normalises the *config* side too — a stored declaration is already
- * normalised, a `ProjectConfig.repo` is whatever the operator wrote.
  */
 async function assertProjectIsWorkersRepository(worker: Worker, projectId: string): Promise<void> {
 	const declared = worker.repository;
 	if (!declared) return;
-	const project = await findProjectByIdFromDb(projectId);
-	if (!project) return;
-	if (repoSlugsMatch(project.repo, declared)) return;
-	throw new EnrollmentRepositoryMismatchError(worker.id, declared, project.repo);
+	const record = await findProjectRecordByIdFromDb(projectId);
+	if (!record) return;
+	if (projectDeclaresRepository(record, declared)) return;
+	throw new EnrollmentRepositoryMismatchError(worker.id, declared, projectRepositorySlugs(record));
 }
 
 /** One enrollment {@link suspendEnrollmentsForMismatchedRepository} suspended. */
 export interface SuspendedMismatchedEnrollment {
 	enrollmentId: string;
 	projectId: string;
-	/** The project's repository, normalised — the half of the reason that is not the declaration. */
-	projectRepository: string;
+	/**
+	 * The repositories the project owns, normalised (issue #946) — the half of the
+	 * reason that is not the declaration.
+	 */
+	projectRepositories: string[];
 }
 
 /**
- * Suspend every enrollment of `workerId` whose project is **not** for
- * `declaredRepository` (issue #690) — the second moment the pairing becomes
- * knowable, when a reconnecting daemon declares a repository that contradicts an
- * enrollment written before it (or written while the machine declared nothing).
- * Returns what it suspended, so a caller can report it; each suspension is also
- * logged with both repositories, since the daemon's handshake has no operator
- * watching it.
+ * Suspend every enrollment of `workerId` whose project declares
+ * `declaredRepository` **nowhere** in its repository list (issue #690, widened by
+ * #946 from the project's default entry alone) — the second moment the pairing
+ * becomes knowable, when a reconnecting daemon declares a repository that
+ * contradicts an enrollment written before it (or written while the machine
+ * declared nothing). Returns what it suspended, so a caller can report it; each
+ * suspension is also logged with both sides, since the daemon's handshake has no
+ * operator watching it.
  *
  * It only ever **suspends**. Nothing here creates an enrollment, approves one, or
  * reactivates one — a declaration is the machine's own statement, and enrollment
@@ -996,24 +1036,24 @@ export async function suspendEnrollmentsForMismatchedRepository(
 	const suspended: SuspendedMismatchedEnrollment[] = [];
 	for (const enrollment of await listEnrollmentsForWorker(workerId)) {
 		if (enrollment.status === 'suspended') continue;
-		const project = await findProjectByIdFromDb(enrollment.projectId);
-		if (!project) continue;
-		if (repoSlugsMatch(project.repo, declared)) continue;
+		const record = await findProjectRecordByIdFromDb(enrollment.projectId);
+		if (!record) continue;
+		if (projectDeclaresRepository(record, declared)) continue;
 		await setEnrollmentStatus(enrollment.id, 'suspended');
-		const projectRepository = normalizeRepoSlug(project.repo);
+		const projectRepositories = projectRepositorySlugs(record);
 		suspended.push({
 			enrollmentId: enrollment.id,
 			projectId: enrollment.projectId,
-			projectRepository,
+			projectRepositories,
 		});
 		logger.warn(
-			'suspended worker enrollment: the declared checkout is not this project’s repository',
+			'suspended worker enrollment: the declared checkout is not a repository this project owns',
 			{
 				workerId,
 				enrollmentId: enrollment.id,
 				projectId: enrollment.projectId,
 				declaredRepository: declared,
-				projectRepository,
+				projectRepositories,
 			},
 		);
 	}

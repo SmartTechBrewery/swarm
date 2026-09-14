@@ -30,9 +30,9 @@ const {
 		constructor(
 			public workerId: string,
 			public declaredRepository: string,
-			public projectRepository: string,
+			public projectRepositories: string[],
 		) {
-			super(`checkout is ${declaredRepository}, project is ${projectRepository}`);
+			super(`checkout is ${declaredRepository}, project owns ${projectRepositories.join(', ')}`);
 			this.name = 'EnrollmentRepositoryMismatchError';
 		}
 	}
@@ -1111,14 +1111,15 @@ describe('workers.enroll (owner offers a worker to a project)', () => {
 		).rejects.toThrowError(expect.objectContaining({ code: 'BAD_REQUEST' }));
 	});
 
-	// Issue #690: the machine's checkout is not this project's repository. A rejection
+	// Issues #690/#946: the project declares the machine's checkout nowhere. A rejection
 	// the caller can act on, so `BAD_REQUEST` with the service's own message — which
-	// already names both repositories — rather than an unexpected failure.
-	it('translates a repository mismatch to BAD_REQUEST naming both repositories', async () => {
+	// already names the checkout and every repository the project owns — rather than an
+	// unexpected failure.
+	it('translates a repository mismatch to BAD_REQUEST naming both sides', async () => {
 		getWorker.mockResolvedValue(makeWorker());
 		getMembership.mockResolvedValue(membershipFor('contributor'));
 		enrollWorker.mockRejectedValue(
-			new EnrollmentRepositoryMismatchError(WORKER_ID, 'acme/frontend', 'acme/backend'),
+			new EnrollmentRepositoryMismatchError(WORKER_ID, 'acme/frontend', ['acme/backend']),
 		);
 
 		await expect(
