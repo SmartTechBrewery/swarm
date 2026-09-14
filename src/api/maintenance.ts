@@ -231,7 +231,9 @@ export function startHostMaintenance(options: HostMaintenanceOptions = {}): Host
 	 *
 	 * The whole body is in a `try`, like every other chore here: a failure must never
 	 * stop the API server, and the fan-out itself already refuses to let one machine's
-	 * failure cost the rest of the fleet its sweep.
+	 * failure cost the rest of the fleet its sweep. What the marker records is that
+	 * the fleet **was asked** — so a fan-out that asked nobody leaves it where it was
+	 * and the next hourly tick tries again, exactly as one that threw does.
 	 */
 	async function runFleetWorktreeSweepIfDue(): Promise<void> {
 		try {
@@ -241,8 +243,26 @@ export function startHostMaintenance(options: HostMaintenanceOptions = {}): Host
 
 			const workers = await listWorkers();
 			const entries = await fanOutSweep(workers);
-			// Written after the fan-out, so a fan-out that threw outright is retried on
-			// the next tick rather than skipped for a whole interval.
+			// The marker says "the fleet was asked", not "the chore ran", so a fan-out
+			// that asked nobody must not advance it. A fan-out that threw outright is
+			// already retried on the next tick because the write below never runs; this
+			// is the same rule for the case the fan-out swallows by design — it logs each
+			// machine it could not ask and returns normally, so a database hiccup that hit
+			// every per-machine write returns an empty report with nothing else to signal
+			// it. Advancing the marker there would skip the whole fleet for an interval on
+			// the strength of a failure. A *genuinely* empty fleet (no machines at all) is
+			// not that case and does advance it: there was nothing to ask.
+			if (workers.length > 0 && entries.length === 0) {
+				logger.warn(
+					'Asked no machine to sweep its abandoned worktrees; retrying on the next tick',
+					{
+						machines: workers.length,
+						intervalMs: fleetSweepIntervalMs,
+						previousSweepAt: lastSweptAt?.toISOString() ?? null,
+					},
+				);
+				return;
+			}
 			await writeMarker(new Date(now));
 			logger.info('Requested an abandoned-worktree sweep across the installation', {
 				machines: workers.length,

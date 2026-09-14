@@ -786,10 +786,12 @@ unchanged.
   **It prints the machine's last sweep, then asks for a new one.** Each removed path
   comes with how many days it had gone untouched and whether it held uncommitted or
   unpushed work, under a line counting what was removed, kept live, and failed. Both
-  halves are in one command because the request is what *destroys* the previous
-  record — a machine keeps only its most recent sweep — so this print is the last
-  moment it is readable. The new answer lands on the row later and is printed by the
-  next run, exactly as `update`'s outcome is read back through `list`.
+  halves are in one command because a machine keeps only its most recent sweep, so an
+  operator asking for another wants to see the one it stands to replace. Asking does
+  not itself erase it (issue #956) — the stored record is replaced by the machine's
+  next *report* — so a machine asked and not yet heard from still reads as what it
+  last swept, here and in `sweeps`. The new answer lands on the row later and is
+  printed by the next run, exactly as `update`'s outcome is read back through `list`.
   **No drain and no host opt-in**, unlike `update`: a sweep disturbs no in-flight run,
   and it removes only `task-<id>` checkouts under a project's own `worktreeRoot`, so
   `worktreeRetention.abandonedAfterDays` is the whole of the opt-out. A machine that
@@ -805,11 +807,12 @@ unchanged.
   has never reported prints "never swept"; one that has been asked and not yet
   answered — typically offline since the weekly signal went out — says so, and is
   handed the request on its next connection.
-  **It asks for nothing and replaces nothing**, which is exactly what
-  `sweep-worktrees` cannot do: that one prints the record and destroys it in the same
-  breath, so before this existed reading a machine's sweep cost that machine another.
-  Once sweeps are requested by a schedule rather than by the operator reading them,
-  this is the ordinary way to read them.
+  **It asks for nothing**, which is exactly what `sweep-worktrees` cannot do: before
+  this existed, reading a machine's sweep cost that machine another sweep. Once
+  sweeps are requested by a schedule rather than by the operator reading them, this is
+  the ordinary way to read them. "Never swept" means the machine has never reported
+  one — an unanswered weekly ask never blanks the record, so the last sweep and the
+  outstanding request are printed together.
   An **installation administrator's** read, like the unfiltered `list` (issue #647):
   it reads across every owner's machines. A caller who is not one is refused outright
   rather than shown their own, for the same reason `request-update` is. Exit code 0

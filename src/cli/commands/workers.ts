@@ -295,21 +295,20 @@ Usage:
              checkout something is still using is never removed at any age, so the
              machine needs no draining and no run is disturbed. It prints what that
              machine's LAST sweep removed — each path with its age and whether it
-             held uncommitted or unpushed work — and then asks for a new one, which
-             is also the moment that previous record is replaced: a machine keeps
-             only its most recent sweep. The new answer lands later and is printed
-             by the next run of this command. The machine's owner alone may do it.
+             held uncommitted or unpushed work — and then asks for a new one. A
+             machine keeps only its most recent sweep, but asking does not erase it:
+             the new answer replaces it when it lands, and is printed by the next run
+             of this command or by 'sweeps'. The machine's owner alone may do it.
   sweeps     What the FLEET last deleted: one block per machine on the
              installation with its last recorded sweep and every path that sweep
              removed, each with its age and whether it held uncommitted or
              unpushed work; a machine that has never reported prints "never
-             swept". It asks for nothing and replaces nothing, which is what
-             sweep-worktrees cannot do — that one prints the record and destroys
-             it in the same breath. Sweeps are requested across the whole
-             installation once a week by the API server itself
-             (SWARM_WORKTREE_ABANDONED_SWEEP_INTERVAL_MS), so this is the ordinary
-             way to read what came back. A machine asked but not yet heard from —
-             typically one offline since the signal went out — says so; it is
+             swept". It asks for nothing, which is what sweep-worktrees cannot do.
+             Sweeps are requested across the whole installation once a week by the
+             API server itself (SWARM_WORKTREE_ABANDONED_SWEEP_INTERVAL_MS), so
+             this is the ordinary way to read what came back. A machine asked but
+             not yet heard from — typically one offline since the signal went out —
+             says so beneath its last sweep, which that ask leaves standing; it is
              handed the request on its next connection. An INSTALLATION
              ADMINISTRATOR's read, like the unfiltered list.
   enroll     Enroll a worker into a project with allowed CLIs (--cli, a subset of
@@ -506,8 +505,8 @@ type WorktreeSweepReport = z.infer<typeof WorktreeSweepReportSchema>;
 
 /**
  * `workers.requestWorktreeSweep` (issue #955) — the acknowledgement plus the sweep
- * this request replaced, which is the only moment that previous record is still
- * readable (a machine keeps one sweep).
+ * on record when the request was made (a machine keeps one sweep, replaced by its
+ * next report rather than by this request).
  *
  * Optional on this file's own rule: an older control plane simply answers without
  * `previousSweep`.
@@ -1193,16 +1192,19 @@ async function updateWorkerCommand(argv: string[]): Promise<number> {
  * `swarm workers sweep-worktrees <worker-id>` (issue #955): ask one machine to remove
  * its own long-abandoned `task-<id>` checkouts, and print what its last sweep removed.
  *
- * Both halves in one command because the request is what destroys the previous
- * record: a machine keeps only its most recent sweep, so the control plane answers
- * the mutation with the one it is replacing. What is printed is therefore *last
- * time's* outcome, and the sweep just asked for is read by the next run — the same
- * "acknowledgement, not an outcome" shape `update` has, for the same reason (the
- * machine may be offline, and the request waits on the row until it reconnects).
+ * Both halves in one command because a machine keeps only its most recent sweep, so
+ * the control plane answers the mutation with the record as it stood when the
+ * question was asked. What is printed is therefore *last time's* outcome, and the
+ * sweep just asked for is read by the next run — the same "acknowledgement, not an
+ * outcome" shape `update` has, for the same reason (the machine may be offline, and
+ * the request waits on the row until it reconnects).
  *
- * Since issue #956 this is no longer the only way to read a machine's sweep —
- * `swarm workers sweeps` reads the whole fleet's without replacing any of them —
- * and this stays what an operator runs to ask one machine *now*.
+ * Asking does **not** destroy that record (issue #956): the stored outcome is
+ * replaced by the machine's next *report*, not by the next question, so a machine
+ * asked and not yet heard from still reads as what it last swept. Since the same
+ * issue this is also no longer the only way to read one — `swarm workers sweeps`
+ * reads the whole fleet's without asking anything — and this stays what an operator
+ * runs to ask one machine *now*.
  */
 async function sweepWorktreesCommand(argv: string[]): Promise<number> {
 	const { positionals } = parseArgs({ args: argv, allowPositionals: true });
@@ -1278,10 +1280,15 @@ function printSweepReport(sweep: WorktreeSweepReport, indent: string): void {
  * per machine, with its last recorded sweep and every path that sweep removed.
  *
  * The read half of the weekly schedule. Once sweeps are requested by the API
- * server's own clock rather than by an operator, `sweep-worktrees` is no longer a
- * way to read one: it prints the record and *replaces* it in the same breath, so
- * reading a machine's sweep used to cost that machine another. This asks for
- * nothing and replaces nothing.
+ * server's own clock rather than by an operator, `sweep-worktrees` is no longer the
+ * way to read one: reading a machine's sweep through it costs that machine another
+ * sweep, which is not something to do to a fleet nobody asked to sweep. This asks
+ * for nothing.
+ *
+ * `never swept` means exactly that. A machine that swept last week and has not yet
+ * answered this week's unattended ask prints its last sweep *and* the outstanding
+ * request beneath it, because asking no longer erases the answer (issue #956) — the
+ * reason this readout can be trusted to say what the fleet actually deleted.
  *
  * An installation administrator's command, like `request-update` and the unfiltered
  * `list`: it reads every owner's machines. The control plane's own refusal is
@@ -1306,9 +1313,10 @@ async function sweepsCommand(): Promise<number> {
 	for (const worker of workers) {
 		out.info(`${worker.displayName} (${worker.workerId})`);
 		if (worker.lastSweep) printSweepReport(worker.lastSweep, '  ');
-		// "Never swept" and "asked but not heard from" are different states and are
-		// both worth saying: the second is what a machine offline since the weekly
-		// signal went out looks like, and it resolves itself on that machine's next
+		// "Never swept" and "asked but not heard from" are different states, are worth
+		// saying separately, and are not alternatives: a machine can print a sweep and
+		// an outstanding request together, which is what one offline since the weekly
+		// signal went out looks like. That resolves itself on the machine's next
 		// connection rather than needing anything from the operator.
 		else out.info('  never swept');
 		if (worker.pendingRequestedAt) {

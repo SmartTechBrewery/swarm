@@ -14,8 +14,10 @@ import {
 	listAllWorkers,
 	listWorkersForOwner,
 	recordWorkerUpdateReport,
+	recordWorktreeSweepReport,
 	removeWorker,
 	requestWorkerUpdate,
+	requestWorktreeSweep,
 	setWorkerDeclaredCapabilities,
 	setWorkerDraining,
 	updateWorkerCapabilities,
@@ -30,6 +32,7 @@ import {
 	type Worker,
 	WorkerCapabilityNotProbedError,
 	WorkerCapabilityReductionError,
+	type WorktreeSweepResult,
 } from '../../../src/identity/worker.js';
 import { AllowedClisNotCapableError } from '../../../src/identity/worker-enrollment.js';
 import { ALL_TRIGGER_PHASES, type TriggerPhase } from '../../../src/triggers/types.js';
@@ -672,6 +675,159 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 			await updateWorkerCapabilities(id, ['claude'], [...ALL_TRIGGER_PHASES], 'acme/api');
 
 			expect((await getWorkerById(id))?.update).toEqual(requested.update);
+		});
+	});
+
+	// Issue #955/#956 — the abandoned-worktree sweep's own five columns. What only a
+	// real database settles is which of them a *request* writes: since the fleet is
+	// asked weekly by a timer nobody is watching, a request that cleared the reported
+	// outcome would blank `swarm workers sweeps` for every machine that had not
+	// answered the latest ask.
+	describe('requestWorktreeSweep / recordWorktreeSweepReport', () => {
+		const REQUEST_ID = '66666666-6666-4666-8666-666666666666';
+		const OTHER_REQUEST_ID = '77777777-7777-4777-8777-777777777777';
+
+		function sweepResult(overrides: Partial<WorktreeSweepResult> = {}): WorktreeSweepResult {
+			return {
+				removed: [
+					{
+						projectId: 'swarm',
+						taskId: '901',
+						path: '/home/ada/swarm/.swarm-workspaces/task-901',
+						lastTouchedAt: '2026-08-20T09:00:00.000Z',
+						ageDays: 18,
+						hadUncommittedChanges: false,
+						hadUnpushedCommits: true,
+					},
+				],
+				removedCount: 1,
+				keptLiveCount: 0,
+				failedCount: 0,
+				message: 'Swept 1 project(s): removed 1 abandoned checkout(s), kept 0 still in use.',
+				...overrides,
+			};
+		}
+
+		/**
+		 * A registered machine. No draining here, unlike the update request above: a
+		 * sweep disturbs no in-flight run, which is what makes the weekly schedule
+		 * possible at all.
+		 */
+		async function freshWorker(name: string): Promise<string> {
+			const created = await createWorker({
+				ownerUserId: adaId,
+				displayName: name,
+				capabilities: ['claude'],
+				credentialHash: `hash-${name}`,
+			});
+			return created.id;
+		}
+
+		it('leaves a newly registered worker with no request and no outcome', async () => {
+			const id = await freshWorker('ada-no-sweep');
+			expect((await getWorkerById(id))?.worktreeSweep).toBeNull();
+		});
+
+		it('records a request as pending, with no outcome yet', async () => {
+			const id = await freshWorker('ada-sweep');
+
+			const requested = await requestWorktreeSweep(id, REQUEST_ID);
+
+			expect(requested?.worktreeSweep).toMatchObject({
+				requestId: REQUEST_ID,
+				status: null,
+				reportedAt: null,
+				result: null,
+			});
+			expect((await getWorkerById(id))?.worktreeSweep).toEqual(requested?.worktreeSweep);
+		});
+
+		it('records an outcome and clears the pending marker', async () => {
+			const id = await freshWorker('ada-sweep-report');
+			await requestWorktreeSweep(id, REQUEST_ID);
+
+			const reported = await recordWorktreeSweepReport(id, REQUEST_ID, 'swept', sweepResult());
+
+			expect(reported?.worktreeSweep).toMatchObject({
+				requestId: null,
+				status: 'swept',
+				result: { removedCount: 1 },
+			});
+			expect(reported?.worktreeSweep?.reportedAt).toBeInstanceOf(Date);
+		});
+
+		// The property the weekly schedule depends on (issue #956): asking replaces the
+		// request pair and nothing else, so a machine asleep when the signal went out
+		// still reads as what it last swept rather than as never swept.
+		it('keeps the reported outcome when the machine is asked again', async () => {
+			const id = await freshWorker('ada-sweep-again');
+			await requestWorktreeSweep(id, REQUEST_ID);
+			const answered = await recordWorktreeSweepReport(id, REQUEST_ID, 'swept', sweepResult());
+
+			const again = await requestWorktreeSweep(id, OTHER_REQUEST_ID);
+
+			expect(again?.worktreeSweep).toMatchObject({
+				requestId: OTHER_REQUEST_ID,
+				status: 'swept',
+				reportedAt: answered?.worktreeSweep?.reportedAt,
+				result: { removedCount: 1 },
+			});
+			// …and the retained outcome answers the *earlier* request, which is what the
+			// two instants say when read together.
+			const sweep = (await getWorkerById(id))?.worktreeSweep;
+			expect(sweep?.reportedAt?.getTime()).toBeLessThanOrEqual(sweep?.requestedAt.getTime() ?? 0);
+		});
+
+		// The new answer is what replaces the retained one — the question never does.
+		it('replaces the retained outcome when the next report lands', async () => {
+			const id = await freshWorker('ada-sweep-replaced');
+			await requestWorktreeSweep(id, REQUEST_ID);
+			await recordWorktreeSweepReport(id, REQUEST_ID, 'swept', sweepResult());
+			await requestWorktreeSweep(id, OTHER_REQUEST_ID);
+
+			await recordWorktreeSweepReport(
+				id,
+				OTHER_REQUEST_ID,
+				'swept',
+				sweepResult({ removed: [], removedCount: 0, message: 'nothing was old enough' }),
+			);
+
+			expect((await getWorkerById(id))?.worktreeSweep).toMatchObject({
+				requestId: null,
+				result: { removedCount: 0, message: 'nothing was old enough' },
+			});
+		});
+
+		// The id match, as on the update side: a report for a request the row has moved
+		// on from must not un-pend the one now outstanding — nor overwrite the outcome
+		// standing beside it.
+		it('ignores a report naming a request the row has moved on from', async () => {
+			const id = await freshWorker('ada-sweep-superseded');
+			await requestWorktreeSweep(id, REQUEST_ID);
+			await recordWorktreeSweepReport(id, REQUEST_ID, 'swept', sweepResult());
+			await requestWorktreeSweep(id, OTHER_REQUEST_ID);
+
+			const stale = await recordWorktreeSweepReport(
+				id,
+				REQUEST_ID,
+				'failed',
+				sweepResult({ failedCount: 1, message: 'the worktree root was unreadable' }),
+			);
+
+			expect(stale).toBeUndefined();
+			expect((await getWorkerById(id))?.worktreeSweep).toMatchObject({
+				requestId: OTHER_REQUEST_ID,
+				status: 'swept',
+				result: { removedCount: 1 },
+			});
+		});
+
+		it('returns a not-found for an unknown worker — not an error', async () => {
+			const unknown = '99999999-9999-4999-8999-999999999999';
+			expect(await requestWorktreeSweep(unknown, REQUEST_ID)).toBeUndefined();
+			expect(
+				await recordWorktreeSweepReport(unknown, REQUEST_ID, 'swept', sweepResult()),
+			).toBeUndefined();
 		});
 	});
 

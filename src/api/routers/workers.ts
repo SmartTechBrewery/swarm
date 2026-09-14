@@ -432,8 +432,12 @@ const ConcurrencyInput = z.number().int().positive();
 
 /**
  * The wire form of the sweep a machine last reported (issue #955), or `null` when it
- * has never been asked or has not answered yet. A pending request with no outcome
- * reads as `null` too: there is nothing to report about a sweep that has not happened.
+ * has never answered one — which is the only thing that reads as `null` since issue
+ * #956: a request outstanding beside an older outcome still answers with that
+ * outcome, because asking no longer erases it (`../../db/repositories/workersRepository.ts`).
+ * The caller states the outstanding request separately (`pendingRequestedAt`), so
+ * "swept last week, asked again this morning, not heard from" is legible as both
+ * facts rather than collapsing into "never swept".
  */
 function previousSweepView(sweep: Worker['worktreeSweep']): {
 	reportedAt: string;
@@ -845,11 +849,12 @@ export const workersRouter = router({
 	requestWorktreeSweep: authedProcedure
 		.input(z.object({ workerId: z.string().uuid() }))
 		.mutation(async ({ ctx, input }) => {
-			// Read before the write, because the write is what destroys it: a machine keeps
-			// only its most recent sweep, so asking again is also the moment the previous
-			// answer stops being readable. Returning it here is what lets one command both
-			// ask and report — the operator sees what the last sweep removed, and that is
-			// the record they would otherwise have lost by asking.
+			// Read before the write, so the answer is the record as it stood when the
+			// question was asked. Since issue #956 the write no longer destroys it — a new
+			// request replaces the request pair alone and the reported outcome stands until
+			// the *next report* overwrites it — so this is a convenience rather than the
+			// last chance to read it: one command both asks and reports, and `sweeps` reads
+			// the same record without asking for anything.
 			const previous = await resolveStrictlyOwnedWorker(ctx.user, input.workerId);
 			const requestId = randomUUID();
 			const updated = await requestWorktreeSweep(input.workerId, requestId);
@@ -863,8 +868,8 @@ export const workersRouter = router({
 				displayName: updated.displayName,
 				requestId,
 				requestedAt: updated.worktreeSweep?.requestedAt.toISOString() ?? null,
-				// The sweep this request replaced, or `null` when the machine has never been
-				// asked or never answered. Serialised rather than returned as the domain value,
+				// The sweep on record when this request was made, or `null` when the machine
+				// has never answered one. Serialised rather than returned as the domain value,
 				// like every other date on this router.
 				previousSweep: previousSweepView(previous.worktreeSweep),
 			};
@@ -874,12 +879,13 @@ export const workersRouter = router({
 	// (issue #956), which is the question the weekly schedule exists to make
 	// answerable from one place: `swarm workers sweeps`.
 	//
-	// A read rather than a request, and the only way to see a sweep without
-	// destroying it. `requestWorktreeSweep` above answers with the record it is
-	// replacing precisely because asking is what replaces it, so before this existed
-	// the only way to read a machine's sweep was to ask it for another one — which is
-	// fine for one machine an operator is standing at, and wrong for a fleet nobody
-	// asked to sweep in the first place.
+	// A read rather than a request: before this existed the only way to see a
+	// machine's sweep was to ask it for another one, which is fine for one machine an
+	// operator is standing at and wrong for a fleet nobody asked to sweep in the first
+	// place. It reads the same record the weekly fan-out leaves standing — asking no
+	// longer erases the answer (`../../db/repositories/workersRepository.ts`), so a
+	// machine that swept last week and has not yet answered this week's ask reports
+	// both facts here rather than reading as never swept.
 	//
 	// **Installation-wide, so an instance administrator's**, on issue #647's rule for
 	// the unscoped roster: it reads across every owner's machines, which is an
@@ -914,7 +920,8 @@ export const workersRouter = router({
 					? (worker.worktreeSweep.requestedAt.toISOString() ?? null)
 					: null,
 				// The same shape `requestWorktreeSweep` returns as `previousSweep`, so one
-				// reader serves both; `null` for a machine that has never reported one.
+				// reader serves both; `null` only for a machine that has never reported one,
+				// never merely because the request above is still outstanding.
 				lastSweep: previousSweepView(worker.worktreeSweep),
 			})),
 		};

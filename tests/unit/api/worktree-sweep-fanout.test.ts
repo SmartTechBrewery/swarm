@@ -63,16 +63,21 @@ function pending(overrides: Partial<Worker> = {}): Worker {
 	});
 }
 
-/** What the row looks like after this fan-out's own write landed. */
+/**
+ * What the row looks like after this fan-out's own write landed: a fresh request
+ * pair, with whatever outcome the machine had already reported left standing —
+ * which is what `requestWorktreeSweep` writes since issue #956, and the reason the
+ * entries here need no `lastReportedStatus` twin of the update fan-out's.
+ */
 function afterWrite(worker: Worker): Worker {
 	return {
 		...worker,
 		worktreeSweep: {
 			requestId: 'written-request-id',
 			requestedAt: REQUESTED_AT,
-			status: null,
-			reportedAt: null,
-			result: null,
+			status: worker.worktreeSweep?.status ?? null,
+			reportedAt: worker.worktreeSweep?.reportedAt ?? null,
+			result: worker.worktreeSweep?.result ?? null,
 		},
 	};
 }
@@ -124,14 +129,17 @@ describe('fanOutWorktreeSweep (issue #956)', () => {
 	});
 
 	// A machine that has *answered* carries no outstanding request, so next week's
-	// fan-out asks it again — which is the point of a weekly schedule.
-	it('asks a machine that already reported a previous sweep', async () => {
+	// fan-out asks it again — which is the point of a weekly schedule. Asking must
+	// not cost the answer: the entry still carries last week's sweep beside the
+	// request just recorded, which is what `swarm workers sweeps` reads.
+	it('asks a machine that already reported a previous sweep, and keeps that report', async () => {
+		const reportedAt = new Date('2026-09-07T03:04:00Z');
 		const answered = makeWorker({
 			worktreeSweep: {
 				requestId: null,
 				requestedAt: REQUESTED_AT,
 				status: 'swept',
-				reportedAt: new Date('2026-09-07T03:04:00Z'),
+				reportedAt,
 				result: {
 					removed: [],
 					removedCount: 0,
@@ -141,11 +149,17 @@ describe('fanOutWorktreeSweep (issue #956)', () => {
 				},
 			},
 		});
+		requestWorktreeSweep.mockImplementation(async () => afterWrite(answered));
 
 		const entries = await fanOutWorktreeSweep([answered]);
 
 		expect(entries[0]?.disposition).toBe('requested');
 		expect(requestWorktreeSweep).toHaveBeenCalledWith(WORKER_ID, expect.any(String));
+		expect(entries[0]?.worktreeSweep).toMatchObject({
+			requestId: 'written-request-id',
+			status: 'swept',
+			reportedAt,
+		});
 	});
 
 	// The headline: one machine's state never refuses the whole call, and the report

@@ -129,6 +129,11 @@ function rowToUpdateState(row: WorkerRow): WorkerUpdateState | null {
  * Keyed on `worktree_sweep_requested_at` rather than on the pending marker, for
  * {@link rowToUpdateState}'s reason: the value outlives the request, since a report
  * clears `worktree_sweep_request_id` and leaves the outcome standing to be read.
+ *
+ * The outcome outlives the *next question* too (issue #956): `requestedAt` is the
+ * latest request's instant, while `status`/`reportedAt`/`result` are the last sweep
+ * actually reported, which may answer an earlier one. `reportedAt` is what tells the
+ * two apart — see {@link WorkerWorktreeSweepState}.
  */
 function rowToWorktreeSweepState(row: WorkerRow): WorkerWorktreeSweepState | null {
 	if (!row.worktreeSweepRequestedAt) return null;
@@ -598,12 +603,19 @@ export async function recordWorkerUpdateReport(
  * replacing any request already outstanding (issue #955). Returns the updated
  * worker, or `undefined` if no worker has that id.
  *
- * All five columns are written together, so a fresh request never shows the
- * previous sweep's outcome beside it — and only the most recent sweep is retained,
- * which is the contract stated on the columns themselves (`../schema/workers.ts`).
- * Asking again is therefore a plain overwrite, the only form of "cancel" there is:
- * the earlier request's push is no longer the one the row waits on, and a report
- * for it is recognised as stale by {@link recordWorktreeSweepReport}'s id check.
+ * **Only the request pair is written; the reported outcome beside it is left
+ * standing** (issue #956). Asking is a plain overwrite of
+ * `worktree_sweep_request_id`/`worktree_sweep_requested_at` — the only form of
+ * "cancel" there is, since the earlier request's push is no longer the one the row
+ * waits on and a report for it is recognised as stale by
+ * {@link recordWorktreeSweepReport}'s id check — but it must not also erase the
+ * last sweep the machine reported, which is the record `swarm workers sweeps`
+ * exists to read. Once the fleet is asked weekly by a timer nobody is watching
+ * (`src/api/maintenance.ts`), a request that cleared the answer would blank the
+ * readout for every machine that had not answered the latest ask yet: the ordinary
+ * state of a laptop asleep at 03:00, and the permanent state of a retired one. The
+ * outcome is replaced by the next *report*, not by the next question, which is what
+ * the columns themselves now say (`../schema/workers.ts`).
  *
  * **Deliberately carries no `draining_since IS NOT NULL` predicate**, which is the
  * one way this diverges from {@link requestWorkerUpdate}. An update replaces the
@@ -622,9 +634,6 @@ export async function requestWorktreeSweep(
 		.set({
 			worktreeSweepRequestId: requestId,
 			worktreeSweepRequestedAt: new Date(),
-			worktreeSweepStatus: null,
-			worktreeSweepReportedAt: null,
-			worktreeSweepResult: null,
 		})
 		.where(eq(workers.id, id))
 		.returning();

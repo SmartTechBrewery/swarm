@@ -1533,6 +1533,130 @@ describe('swarm workers', () => {
 		});
 	});
 
+	// Issue #956 — the fleet-wide readout. The procedure's own authorization and shape
+	// are `tests/unit/api/routers/workers.test.ts`'; what this suite owns is what an
+	// operator actually reads, which is the whole point of the command.
+	describe('sweeps', () => {
+		const REPORTED_AT = '2026-09-07T03:04:00.000Z';
+		const REQUESTED_AT = '2026-09-14T03:00:00.000Z';
+
+		/** Replace the fleet readout with one of a given shape. */
+		function fleetSweeps(workers: Record<string, unknown>[]): void {
+			answers.set('workers.listSweeps', () => ({ workers }));
+		}
+
+		function sweep(
+			removed: Record<string, unknown>[] = [],
+			overrides: Record<string, unknown> = {},
+		) {
+			return {
+				reportedAt: REPORTED_AT,
+				status: 'swept',
+				result: {
+					removed,
+					removedCount: removed.length,
+					keptLiveCount: 2,
+					failedCount: 0,
+					message: 'Swept 1 project(s).',
+					...overrides,
+				},
+			};
+		}
+
+		function removal(overrides: Record<string, unknown> = {}) {
+			return {
+				projectId: 'swarm',
+				taskId: '901',
+				path: '/home/ada/swarm/.swarm-workspaces/task-901',
+				ageDays: 18.4,
+				hadUncommittedChanges: true,
+				hadUnpushedCommits: true,
+				...overrides,
+			};
+		}
+
+		it('reads the fleet and asks for nothing', async () => {
+			fleetSweeps([]);
+
+			expect(await run(['sweeps'])).toBe(0);
+
+			expect(pathsCalled()).toEqual(['workers.listSweeps']);
+			expect(pathsCalled()).not.toContain('workers.requestWorktreeSweep');
+		});
+
+		// Each path individually, because the count alone hides what this feature exists
+		// to make visible: a removal that destroyed work nobody had pushed.
+		it('prints every removed path under its own machine, naming the work it destroyed', async () => {
+			fleetSweeps([
+				{
+					workerId: WORKER_ID,
+					displayName: 'ada-laptop',
+					pendingRequestedAt: null,
+					lastSweep: sweep([removal()]),
+				},
+				{
+					workerId: OTHER_WORKER_ID,
+					displayName: 'ada-desktop',
+					pendingRequestedAt: null,
+					lastSweep: null,
+				},
+			]);
+
+			expect(await run(['sweeps'])).toBe(0);
+
+			const joined = lines().join('\n');
+			expect(joined).toContain(`ada-laptop (${WORKER_ID})`);
+			expect(joined).toContain(
+				`last sweep (${REPORTED_AT}, swept): removed 1, kept 2 still in use, 0 failed`,
+			);
+			expect(joined).toContain(
+				'/home/ada/swarm/.swarm-workspaces/task-901 (swarm, 18d untouched) — held uncommitted changes and unpushed commits',
+			);
+			expect(joined).toContain(`ada-desktop (${OTHER_WORKER_ID})`);
+			expect(joined).toContain('never swept');
+		});
+
+		// The readout's reason for existing: the weekly ask leaves the record standing,
+		// so a machine asleep when the signal went out reads as what it last swept *and*
+		// as owing an answer — never as "never swept".
+		it('prints the last sweep beside an unanswered request', async () => {
+			fleetSweeps([
+				{
+					workerId: WORKER_ID,
+					displayName: 'ada-laptop',
+					pendingRequestedAt: REQUESTED_AT,
+					lastSweep: sweep([removal()]),
+				},
+			]);
+
+			expect(await run(['sweeps'])).toBe(0);
+
+			const joined = lines().join('\n');
+			expect(joined).toContain('/home/ada/swarm/.swarm-workspaces/task-901');
+			expect(joined).toContain(`a sweep requested ${REQUESTED_AT} has not been answered yet`);
+			expect(joined).not.toContain('never swept');
+		});
+
+		it('says so plainly when the installation has no machines, and exits 0', async () => {
+			fleetSweeps([]);
+
+			expect(await run(['sweeps'])).toBe(0);
+			expect(lines().join('\n')).toContain('no workers are registered on this installation');
+		});
+
+		// The refusal a non-administrator meets is the control plane's own words, like
+		// every other refusal this CLI prints.
+		it('surfaces the administrator-only refusal as the control plane words it', async () => {
+			const message =
+				"Reading the installation's worktree sweeps is available to instance administrators only.";
+			refuse('workers.listSweeps', message);
+			const error = vi.spyOn(console, 'error');
+
+			expect(await run(['sweeps'])).toBe(1);
+			expect(error).toHaveBeenCalledWith(expect.stringContaining(message));
+		});
+	});
+
 	describe('update --status', () => {
 		it('reads the rollout without advancing anything', async () => {
 			answers.set('workers.fleetUpdateStatus', () => ({

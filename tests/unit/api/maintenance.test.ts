@@ -298,6 +298,49 @@ describe('startHostMaintenance — the weekly fleet worktree sweep (issue #956)'
 		await handle.close();
 	});
 
+	// The other half of the same rule: the fan-out swallows each
+	// machine's own failure by design and returns normally, so "asked nobody" is
+	// indistinguishable from "threw" as far as the fleet is concerned — and must not
+	// buy a whole interval of silence.
+	it('leaves the marker alone when a non-empty fleet produced no entries', async () => {
+		const collaborators = createCollaborators([], [makeWorker('worker-a'), makeWorker('worker-b')]);
+		collaborators.fanOutSweep.mockResolvedValue([]);
+
+		const handle = startHostMaintenance({ ...collaborators });
+		await vi.advanceTimersByTimeAsync(0);
+
+		expect(collaborators.fanOutSweep).toHaveBeenCalledTimes(1);
+		expect(collaborators.writeMarker).not.toHaveBeenCalled();
+
+		// Still due on the next hourly tick, rather than a week from now.
+		await vi.advanceTimersByTimeAsync(FLEET_DUE_CHECK_INTERVAL_MS);
+		expect(collaborators.fanOutSweep).toHaveBeenCalledTimes(2);
+
+		await handle.close();
+	});
+
+	// A machine that *was* asked is an entry, whatever its disposition — including
+	// one already carrying an unanswered request — so a fleet nobody had to ask
+	// again still advances the marker.
+	it('advances the marker when every machine was already asked', async () => {
+		const collaborators = createCollaborators([], [makeWorker('worker-a')]);
+		collaborators.fanOutSweep.mockResolvedValue([
+			{
+				workerId: 'worker-a',
+				displayName: 'worker-a',
+				disposition: 'already-asked',
+				worktreeSweep: null,
+			},
+		]);
+
+		const handle = startHostMaintenance({ ...collaborators });
+		await vi.advanceTimersByTimeAsync(0);
+
+		expect(collaborators.writeMarker).toHaveBeenCalledTimes(1);
+
+		await handle.close();
+	});
+
 	it('keeps the schedule moving for an installation with no workers', async () => {
 		const collaborators = createCollaborators([], []);
 
