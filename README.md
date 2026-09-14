@@ -115,7 +115,10 @@ registration and approval, and each of your own workers' live CLI quota.
 | **Resolve conflicts** | A PR is confirmed conflicting with its base | Merges the current base and resolves | Commits and pushes; rechecks are coalesced, bounded, and deduplicated |
 
 All six run on any worker, over the same transport — which machine a worker
-happens to be is not a factor.
+happens to be is not a factor. One deliberate exception: a phase *continuing*
+work already on disk — a preserved checkout, which is machine-local and has no
+server-side copy — is offered only to the worker that holds it, rather than
+being silently started over somewhere else.
 
 ## What it plugs into
 
