@@ -24,6 +24,147 @@ which is also where Part 2 runs.
 
 ---
 
+## The whole thing, end to end
+
+One worked example, start to finish, for the common case: **a teammate's machine
+joining an existing installation.** Everything below uses placeholder values —
+substitute your own.
+
+| Placeholder | Stands for |
+| --- | --- |
+| `ada@example.com` | the teammate, as a SWARM login handle |
+| `example-project` | the project id (`swarm.config.json` → `projects[].id`) |
+| `https://swarm.example.com` | this installation's control-plane base URL |
+| `ada_example_project` | the worker's display name, unique installation-wide |
+| `claude,codex` | the agent CLIs installed **and authenticated** on that machine |
+| `~/code/swarm` | that machine's checkout of SWARM itself |
+| `~/code/example-project` | that machine's checkout of the project's repository |
+
+A worker is permanently paired with one repository checkout, so a teammate who
+works on two repositories gets **two workers**, each registered from its own
+project checkout. Naming them after the person and the project
+(`ada_example_project`, `ada_example_mobile`) is a convention, not a rule — the
+pairing SWARM enforces is the checkout's `origin`, never the name.
+
+### Step 1 — on the admin machine (the one with `DATABASE_URL`)
+
+Create the person, give them a dashboard password, and put them in the project.
+Skip any part already done; `users add` refuses a handle that exists.
+
+```bash
+npm run swarm -- users add ada@example.com --name "Ada Lovelace"
+npm run swarm -- users set-password ada@example.com   # prompts, no echo
+npm run swarm -- members add example-project ada@example.com --role member
+```
+
+Membership is not optional: the next step asks the control plane which SCM
+provider the project runs on, and that read is refused for a non-member — with
+`You are not a member of project "example-project"`, distinct from
+`Project with ID "example-project" not found`, so the two are told apart.
+
+### Step 2 — on the teammate's machine, in the SWARM checkout
+
+```bash
+git clone <this installation's swarm repo> ~/code/swarm
+cd ~/code/swarm
+npm install
+```
+
+Nothing has to be put in `.env` by hand — the next command writes the one line a
+worker needs.
+
+### Step 3 — sign in, as the worker's owner
+
+```bash
+npm run swarm -- login --identifier ada@example.com \
+  --control-plane-url https://swarm.example.com
+```
+
+`--control-plane-url` writes `SWARM_CONTROL_PLANE_URL` into `~/code/swarm/.env`,
+which is where the daemon reads it from later. It is needed **once per machine**:
+an assignment already in the file is reported and kept, so every later command
+omits the flag. Sign in as the teammate themselves, not as an admin on their
+behalf — storing a machine's operator credential in step 4 is strictly the owner's
+own call.
+
+Sessions last `SWARM_SESSION_TTL_HOURS` (7 days by default); re-running this
+command is the renewal.
+
+### Step 4 — register and enroll the worker
+
+Run this **from the project's checkout**, or name it with `--repo-root`:
+
+```bash
+npm run swarm -- workers register-and-enroll ada@example.com example-project \
+  --name ada_example_project --cli claude,codex \
+  --repo-root ~/code/example-project
+```
+
+It asks once, without echo, for the **operator source-control credential** — the
+account this machine's commits, pushes, pull requests and implementer comments
+are authored as. For GitHub that is a personal access token needing `repo` (push,
+pull requests, comments, and the CI reads `respond-to-ci` makes) plus `workflow`
+if agents may touch `.github/workflows/**`, since GitHub rejects a push that
+changes a workflow file without it. The value is verified against the provider
+before anything is stored, and never printed back.
+
+Its **last line** carries the worker credential, shown exactly once:
+
+```
+swarm: SWARM_WORKER_CREDENTIAL=<credential> SWARM_WORKER_REPO_ROOT=<checkout> npm run dev:worker
+```
+
+Copy it before the terminal scrolls — though on this machine you will not need to,
+since step 6 reads it from the local cache this command just wrote.
+
+### Step 5 — approve the enrollment (a project administrator)
+
+Skipped when the owner administers the project themselves — the enrollment then
+already arrives active, and step 4 says so. Otherwise, from any machine with a
+session:
+
+```bash
+npm run swarm -- login --identifier <a project administrator>
+npm run swarm -- workers approve <worker-id> example-project
+```
+
+The worker id is in step 4's output, and `swarm workers list ada@example.com`
+prints it again. Sharing consent was already recorded in step 4 — it is the
+machine owner's decision and is kept even while approval is pending — so approval
+is genuinely the only thing left.
+
+### Step 6 — start the daemon
+
+```bash
+cd ~/code/example-project
+swarm run:worker
+```
+
+Foreground, and it holds the terminal for as long as the machine should accept
+work. `swarm run:worker` needs the global binary (`npm run build && npm link` in
+the SWARM checkout); without it, use the explicit form from step 4's last line,
+run in `~/code/swarm`. On macOS,
+[`launchd-worker-autostart.md`](./launchd-worker-autostart.md) runs it at login
+instead of from a terminal tab.
+
+### Adding a second worker later
+
+Steps 2, 3 and 5 are already done for that machine and that person. Only step 4
+repeats, against the other project and its own checkout, with a new name:
+
+```bash
+npm run swarm -- workers register-and-enroll ada@example.com example-mobile \
+  --name ada_example_mobile --cli claude,codex \
+  --repo-root ~/code/example-mobile
+```
+
+No `--control-plane-url`: the machine is already pointed at the installation, and
+the flag would only be refused if it named a different one. The operator
+credential is asked for again — it is stored per `(worker, provider)`, so the
+second worker has its own, even when the value is the same.
+
+---
+
 ## Part 1 — register the user + worker
 
 For a **single-user install**, skip the user and membership steps and pass

@@ -30,6 +30,7 @@
 import { createInterface } from 'node:readline/promises';
 import { parseArgs } from 'node:util';
 import { z } from 'zod';
+import { ensureControlPlaneUrl } from '../_shared/control-plane-env.js';
 import {
 	clearOperatorSessionCache,
 	type OperatorSessionCache,
@@ -48,12 +49,17 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const USAGE = `swarm login — sign this CLI in to the control plane
 
 Usage:
-  swarm login [--identifier <id>]
+  swarm login [--identifier <id>] [--control-plane-url <url>]
   swarm login --status
   swarm login --logout
 
   --identifier <id>  The login handle to authenticate as. Prompted for on a TTY;
                      required when stdin is a pipe (which carries the password).
+  --control-plane-url <url>
+                     The installation to sign in to, written to this checkout's
+                     .env when it carries no ${CONTROL_PLANE_ENV}. An
+                     existing assignment is kept and never rewritten, so this is
+                     only needed once per machine.
   --status           Report who the cached session resolves to, by asking the
                      control plane. Exits non-zero when there is no live session.
   --logout           Revoke the session on the control plane and delete the local
@@ -349,6 +355,7 @@ export async function run(argv: string[]): Promise<number> {
 		args: argv,
 		options: {
 			identifier: { type: 'string' },
+			'control-plane-url': { type: 'string' },
 			status: { type: 'boolean' },
 			logout: { type: 'boolean' },
 			help: { type: 'boolean', short: 'h' },
@@ -363,6 +370,13 @@ export async function run(argv: string[]): Promise<number> {
 		out.error('login: --status and --logout are mutually exclusive');
 		return 1;
 	}
+
+	// This is the *first* command run on a machine being onboarded, so it is also
+	// the first to need the URL — before `workers register-and-enroll`, which does
+	// the same bootstrap, has run at all. Same helper, same idempotence: an
+	// existing assignment is kept and reported, so signing in again on an onboarded
+	// machine writes nothing (`../_shared/control-plane-env.ts`).
+	if (!(await ensureControlPlaneUrl(values['control-plane-url']))) return 1;
 
 	const endpoint = resolveSessionEndpoint();
 	if ('error' in endpoint) {

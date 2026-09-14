@@ -16,6 +16,12 @@ const {
 	operatorSessionCachePath: vi.fn(),
 }));
 
+// `login` bootstraps the checkout's `.env` before resolving its endpoint, so the
+// suite drives that seam rather than the developer's own `.env` — its behaviour is
+// covered by tests/unit/cli/control-plane-env.test.ts.
+const { ensureControlPlaneUrl } = vi.hoisted(() => ({ ensureControlPlaneUrl: vi.fn() }));
+
+vi.mock('@/cli/_shared/control-plane-env.js', () => ({ ensureControlPlaneUrl }));
 vi.mock('@/cli/_shared/secret-input.js', () => ({ promptHidden, readStdin }));
 vi.mock('@/cli/_shared/operator-session-cache.js', () => ({
 	readOperatorSessionCache,
@@ -76,6 +82,7 @@ describe('swarm login', () => {
 		vi.spyOn(console, 'error').mockImplementation(() => {});
 		vi.spyOn(console, 'warn').mockImplementation(() => {});
 		process.env.SWARM_CONTROL_PLANE_URL = CONTROL_PLANE;
+		ensureControlPlaneUrl.mockReset().mockResolvedValue(CONTROL_PLANE);
 		// Not a TTY by default: the password comes from stdin and `--identifier`
 		// supplies the handle, which is the scriptable path.
 		Object.defineProperty(process.stdin, 'isTTY', { value: false, configurable: true });
@@ -219,6 +226,25 @@ describe('swarm login', () => {
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
+	// This is the first command a machine being onboarded runs, so it is also the
+	// first to need the URL — before `workers register-and-enroll` has bootstrapped
+	// anything.
+	it("points the checkout's .env at the installation named by --control-plane-url", async () => {
+		stubFetch({ status: 200, body: { token: TOKEN, expiresAt: EXPIRES_AT, user: USER } });
+
+		await run(['--identifier', USER.identifier, '--control-plane-url', CONTROL_PLANE]);
+		expect(ensureControlPlaneUrl).toHaveBeenCalledWith(CONTROL_PLANE);
+	});
+
+	it('signs in to nothing when the checkout cannot be pointed at a control plane', async () => {
+		ensureControlPlaneUrl.mockResolvedValue(undefined);
+		const fetchMock = stubFetch();
+
+		expect(await run(['--identifier', USER.identifier])).toBe(1);
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(readStdin).not.toHaveBeenCalled();
+	});
+
 	it('fails when SWARM_CONTROL_PLANE_URL is not an http(s) URL', async () => {
 		process.env.SWARM_CONTROL_PLANE_URL = 'ws://swarm.example.com';
 		const fetchMock = stubFetch();
@@ -262,6 +288,7 @@ describe('swarm login --status', () => {
 		vi.spyOn(console, 'error').mockImplementation(() => {});
 		vi.spyOn(console, 'warn').mockImplementation(() => {});
 		process.env.SWARM_CONTROL_PLANE_URL = CONTROL_PLANE;
+		ensureControlPlaneUrl.mockReset().mockResolvedValue(CONTROL_PLANE);
 		Object.defineProperty(process.stdin, 'isTTY', { value: false, configurable: true });
 		readOperatorSessionCache.mockReset().mockReturnValue(null);
 		operatorSessionCachePath.mockReset().mockReturnValue(CACHE_PATH);
@@ -332,6 +359,7 @@ describe('swarm login --logout', () => {
 		vi.spyOn(console, 'error').mockImplementation(() => {});
 		vi.spyOn(console, 'warn').mockImplementation(() => {});
 		process.env.SWARM_CONTROL_PLANE_URL = CONTROL_PLANE;
+		ensureControlPlaneUrl.mockReset().mockResolvedValue(CONTROL_PLANE);
 		Object.defineProperty(process.stdin, 'isTTY', { value: false, configurable: true });
 		readOperatorSessionCache.mockReset().mockReturnValue(cachedSession());
 		clearOperatorSessionCache.mockReset().mockReturnValue(true);

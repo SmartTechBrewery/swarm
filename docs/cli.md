@@ -288,7 +288,7 @@ any stale copies of them there.
 ### `swarm login`
 
 ```bash
-swarm login [--identifier <id>]
+swarm login [--identifier <id>] [--control-plane-url <url>]
 swarm login --status
 swarm login --logout
 ```
@@ -303,7 +303,13 @@ plane.
 
 - **`swarm login`** — prompts for an identifier (echoed; it is not a secret) and a
   password (never echoed), authenticates against the control plane, verifies the
-  session it was issued, and caches the opaque token locally. When stdin is a
+  session it was issued, and caches the opaque token locally. `--control-plane-url
+  <url>` names the installation and writes `SWARM_CONTROL_PLANE_URL` into this
+  checkout's `.env` when it carries none — the same idempotent bootstrap
+  [`workers register-and-enroll`](#swarm-workers) performs, and needed here because
+  this is the *first* command a machine being onboarded runs, before that one has
+  written anything. An existing assignment is kept and reported rather than
+  rewritten, so the flag is a once-per-machine affair. When stdin is a
   **pipe** the password is read from it, so `--identifier <id>` is then required —
   stdin is already spoken for.
 - **`--status`** — reports who the cached token resolves to by *asking* the control
