@@ -200,7 +200,10 @@ export type ReviewCarriedFinding = z.infer<typeof ReviewCarriedSchema>;
  * Declared only after tracing that sibling's acceptance criteria through *this*
  * diff; two tasks merely looking related is not a declaration. Nothing acts on it
  * in this phase — it is rendered into the posted review and persisted on the
- * Review run row, so the decision is auditable at the moment it is taken.
+ * Review run row, so the decision is auditable at the moment it is taken. What
+ * acts on it is the merge of this very pull request
+ * (`src/dispatch/absorbed-child-settle.ts`, issue #959), which settles each
+ * declared card only after re-proving it is a split child SWARM created.
  */
 export const ReviewAbsorbedSchema = z.object({
 	/** The sibling card's issue URL, exactly as the board shows it. */

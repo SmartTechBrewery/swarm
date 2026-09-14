@@ -19,6 +19,14 @@ vi.mock('@/db/repositories/runsRepository.js', () => ({
 		updateReviewMergeOutcome(runId, input),
 }));
 
+// The board work a merged pull request triggers (issue #959). Mocked here so this
+// suite keeps knowing only the DB and the merge capability, exactly as the module
+// under test does — the settle's own guards are asserted in its own suite.
+const settleAbsorbedChildren = vi.fn(async (_input: unknown): Promise<string[]> => []);
+vi.mock('@/dispatch/absorbed-child-settle.js', () => ({
+	settleAbsorbedChildren: (input: unknown) => settleAbsorbedChildren(input),
+}));
+
 const createAndPublishDispatch = vi.fn(async (_input: unknown) => ({
 	dispatch: mockDispatchRow(),
 	created: true,
@@ -49,7 +57,7 @@ import {
 } from '@/integrations/scm/registry.js';
 import type { MergeAutomationJob } from '@/queue/jobs.js';
 import type { MergePullRequestOutcome, UpdatePullRequestBranchOutcome } from '@/scm/merge.js';
-import type { AggregateCheckStatus } from '@/scm/types.js';
+import type { AggregateCheckStatus, PullRequestDetails } from '@/scm/types.js';
 import {
 	MAX_BASE_UPDATES,
 	MAX_MERGE_RETRIES,
@@ -101,15 +109,28 @@ const registeredMergePullRequest = vi.fn(async (_p: unknown, _n: number, _sha: s
 	sha: 'abc',
 }));
 
+/**
+ * The same registry's pull-request read, which the `merged` path resolves the
+ * absorbed settle's own-task identity through (issue #959). On the project's
+ * default `issue-` prefix this branch decodes to task 12.
+ */
+const registeredGetPullRequest = vi.fn(
+	async (_p: unknown, _n: number) => ({ number: 17, headBranch: 'issue-12' }) as PullRequestDetails,
+);
+
 beforeEach(() => {
 	_resetSCMProviderRegistryForTesting();
 	registeredMergePullRequest.mockClear();
+	registeredGetPullRequest.mockClear();
 	registerSCMProvider({
 		id: 'github',
 		label: 'GitHub',
 		category: 'scm',
 		webhookRoute: '/github/webhook',
-		provider: { mergePullRequest: registeredMergePullRequest },
+		provider: {
+			mergePullRequest: registeredMergePullRequest,
+			getPullRequest: registeredGetPullRequest,
+		},
 	} as unknown as SCMProviderManifest);
 	completeDispatch.mockClear();
 	failDispatch.mockClear();
@@ -123,6 +144,8 @@ beforeEach(() => {
 	claimReviewDispatch.mockClear();
 	claimReviewDispatch.mockResolvedValue(true);
 	refreshReviewDispatchClaim.mockClear();
+	settleAbsorbedChildren.mockClear();
+	settleAbsorbedChildren.mockResolvedValue([]);
 });
 
 /** The stale-base answer the merge capability gives for a head behind its base. */
@@ -859,5 +882,101 @@ describe('processMergeAutomationDispatch: a stale approved head', () => {
 
 		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-unsupported');
 		expect(outcome.result).toBe('unsupported');
+	});
+});
+
+describe('processMergeAutomationDispatch: settling what the merge absorbed', () => {
+	/** The pull request read the own-task resolution goes through. */
+	function prOnBranch(headBranch: string) {
+		return vi.fn(async () => ({ number: 17, headBranch }) as PullRequestDetails);
+	}
+
+	/**
+	 * The lazy own-task resolver the settle was last handed. Lazy because resolving
+	 * it costs a forge read and essentially every merge declares nothing — so the
+	 * settle invokes it only once it has a declaration to act on, and these cases
+	 * invoke it the same way.
+	 */
+	function lastResolveOwnTaskId(): () => Promise<string | undefined> {
+		const calls = settleAbsorbedChildren.mock.calls;
+		return (calls[calls.length - 1]?.[0] as { resolveOwnTaskId: () => Promise<string | undefined> })
+			.resolveOwnTaskId;
+	}
+
+	it('settles the declared split siblings once, after the dispatch completes', async () => {
+		settleAbsorbedChildren.mockResolvedValue(['#947']);
+		const getPullRequest = prOnBranch(`${project.branchPrefix}12`);
+
+		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning({ status: 'merged', message: 'merged', sha: 'abc' }),
+			getPullRequest,
+		});
+
+		expect(settleAbsorbedChildren).toHaveBeenCalledExactlyOnceWith({
+			project,
+			dispatchId: 'dispatch-1',
+			repository: project.repo,
+			prNumber: '17',
+			resolveOwnTaskId: expect.any(Function),
+		});
+		// The pull request's own task is the number its head branch encodes — never
+		// the Review run's `taskId`, which is the pull request's own number.
+		expect(await lastResolveOwnTaskId()()).toBe('12');
+		expect(getPullRequest).toHaveBeenCalledExactlyOnceWith(project, 17, 'implementer');
+		// The merge is the fact the settle is licensed by, so it can never run first.
+		expect(settleAbsorbedChildren.mock.invocationCallOrder[0]).toBeGreaterThan(
+			completeDispatch.mock.invocationCallOrder[0] as number,
+		);
+		expect(outcome.result).toBe('merged');
+	});
+
+	it.each([
+		['not-ready', { status: 'not-ready', message: 'checks pending' }],
+		['not-eligible', { status: 'not-eligible', message: 'head moved' }],
+		['provider-error', { status: 'provider-error', message: '502' }],
+	] as [string, MergePullRequestOutcome][])('settles nothing on a %s outcome', async (_l, o) => {
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning(o),
+		});
+
+		expect(settleAbsorbedChildren).not.toHaveBeenCalled();
+	});
+
+	// Fail closed on the guard's input: the settle is told it has none rather than
+	// being handed an identity nothing verified.
+	it.each([
+		['the pull request read fails', undefined],
+		['the head branch encodes no task', 'hotfix/manual'],
+	] as [
+		string,
+		string | undefined,
+	][])('hands the settle no own task when %s', async (_label, headBranch) => {
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning({ status: 'merged', message: 'merged', sha: 'abc' }),
+			getPullRequest: headBranch
+				? prOnBranch(headBranch)
+				: vi.fn(async () => {
+						throw new Error('provider unreachable');
+					}),
+		});
+
+		expect(await lastResolveOwnTaskId()()).toBeUndefined();
+	});
+
+	// The merge has happened and cannot be undone by a board error.
+	it('still reports the merge when the settle throws', async () => {
+		settleAbsorbedChildren.mockRejectedValue(new Error('board unreachable'));
+
+		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning({ status: 'merged', message: 'merged', sha: 'abc' }),
+			getPullRequest: prOnBranch(`${project.branchPrefix}12`),
+		});
+
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merged');
+		expect(outcome).toEqual({
+			status: 'merge-automation-settled',
+			result: 'merged',
+			prNumber: '17',
+		});
 	});
 });

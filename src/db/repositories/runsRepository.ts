@@ -928,6 +928,54 @@ export async function getLatestCompletedPlanningScope(
 }
 
 /**
+ * Every fold-in declaration the completed Review runs of one pull request
+ * recorded (issue #953) — the input the merge dispatch settles from
+ * (`src/dispatch/absorbed-child-settle.ts`), newest run first and de-duplicated
+ * by `url`.
+ *
+ * **Across runs, not the latest run only.** A fold-in is allowed on either
+ * verdict precisely because a re-review is *scoped to the previously requested
+ * changes* and would never restate it (ai/ARCHITECTURE.md, Review phase), so the
+ * declaration that reaches the merge is routinely one an earlier
+ * `request-changes` pass made. Reading only the approving run would silently drop
+ * exactly those. Newest-first ordering makes the freshest wording of a card the
+ * one that survives de-duplication, which is the same "a later report corrects an
+ * earlier one" rule the split note's marker follows.
+ *
+ * Scoped by repository as well as project: `runs.repository` and `runs.pr_number`
+ * together name a pull request, while a project id and a number alone do not once
+ * a project spans several repositories (issue #683).
+ */
+export async function getReviewAbsorbedForPullRequest(
+	projectId: string,
+	repository: string,
+	prNumber: string,
+): Promise<ReviewAbsorbed[]> {
+	const rows = await getDb()
+		.select({ reviewAbsorbed: runs.reviewAbsorbed })
+		.from(runs)
+		.where(
+			and(
+				eq(runs.projectId, projectId),
+				eq(runs.repository, repository),
+				eq(runs.prNumber, prNumber),
+				eq(runs.phase, 'review'),
+				eq(runs.status, 'completed'),
+				isNotNull(runs.reviewAbsorbed),
+			),
+		)
+		.orderBy(desc(runs.completedAt), desc(runs.startedAt));
+
+	const byUrl = new Map<string, ReviewAbsorbed>();
+	for (const row of rows) {
+		for (const entry of row.reviewAbsorbed ?? []) {
+			if (!byUrl.has(entry.url)) byUrl.set(entry.url, entry);
+		}
+	}
+	return [...byUrl.values()];
+}
+
+/**
  * Whether this project's task has a *completed* run for the given phase — a
  * failed or deferred attempt does not count (issue #247). Implementation's
  * planned/unplanned config selection uses this so a merely-attempted Planning
