@@ -42,6 +42,7 @@ The command ships in this package's `bin`, so a machine that has SWARM installed
 | Agent | `~/Library/LaunchAgents/pl.smarttechbrewery.swarm.worker.<basename>.<hash8>.plist` |
 | Logs | `~/Library/Logs/pl.smarttechbrewery.swarm.worker.<basename>.<hash8>.log` (+ `.error.log`) |
 | Credential | `~/.swarm/worker-credentials/<sha256 of the checkout realpath>/credential.json` |
+| Checkout lock | `~/.swarm/checkout-locks/<that same sha256>/owner.json` — the running daemon's own record of which checkout it serves |
 
 `<hash8>` is the first eight characters of that same sha256, so two checkouts
 sharing a basename (`~/work/api` and `~/oss/api`) still get distinct labels.
@@ -94,8 +95,19 @@ sharing a basename (`~/work/api` and `~/oss/api`) still get distinct labels.
 - **One worker per checkout.** The daemon takes the checkout lock itself, so a
   second one in the same checkout is refused — and under `KeepAlive` it would be
   refused every thirty seconds forever. `install` therefore refuses while a worker
-  is already running for that checkout, naming the pid; stop it first. Starting and
-  stopping the daemon otherwise stays the operator's own call.
+  is already running **by hand** for that checkout, naming that worker and its pid;
+  stop it first. It reads the holder from the lock
+  (`~/.swarm/checkout-locks/<hash>/owner.json`), never from the process's working
+  directory: `swarm run:worker` runs the daemon out of the npm-linked SWARM
+  checkout, so every worker on the machine reports *that* directory as its `cwd`
+  whichever repository it serves (issue #969). Two consequences worth knowing. A
+  lock left behind by a crashed daemon refuses nothing, because it is reclaimable
+  and the next daemon reclaims it. And reinstalling over this checkout's *own*
+  running agent is not refused either, since `install` boots that job out before
+  bootstrapping the new one — which is what makes `install --self-update` on a live
+  agent work. A fleet-wide restart therefore needs no particular order between
+  checkouts. Starting and stopping the daemon otherwise stays the operator's own
+  call.
 - **A running daemon keeps the credential it started with.** It is read once, at
   startup. Re-registering a worker in a checkout whose daemon is already running
   therefore leaves the *new* worker permanently disconnected — the old process is

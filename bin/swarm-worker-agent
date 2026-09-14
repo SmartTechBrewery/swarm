@@ -36,14 +36,19 @@ EOF
 
 die() { printf 'swarm-worker-agent: %s\n' "$1" >&2; exit 1; }
 
-# The checkout's realpath is the credential cache's key, the plist's
-# WorkingDirectory, and the seed for a label unique per checkout.
+# The checkout's realpath is the credential cache's key, the daemon's checkout-lock
+# key, the plist's WorkingDirectory, and the seed for a label unique per checkout.
 resolve() {
 	[ -d "${1:-$PWD}" ] || die "no such directory: ${1:-$PWD}"
 	CHECKOUT=$(cd "${1:-$PWD}" && pwd -P)
 	local hash
 	hash=$(printf '%s' "$CHECKOUT" | shasum -a 256 | cut -d' ' -f1)
 	CACHE="$HOME/.swarm/worker-credentials/$hash/credential.json"
+	# The daemon's own lock on the checkout it serves (src/worktree/checkout-lock.ts,
+	# issue #689) -- the credential cache's sibling, keyed by that same hash
+	# (src/worktree/checkout-key.ts states the convention once for both), and the only
+	# host-local record of which repository a running daemon actually serves.
+	LOCK="$HOME/.swarm/checkout-locks/$hash/owner.json"
 	LABEL="pl.smarttechbrewery.swarm.worker.$(basename "$CHECKOUT").${hash:0:8}"
 	PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 	LOG="$HOME/Library/Logs/$LABEL.log"
@@ -82,6 +87,45 @@ self_update_installed() {
 		'Print :EnvironmentVariables:SWARM_WORKER_SELF_UPDATE' "$PLIST" 2>/dev/null
 }
 
+# Whether this checkout's own agent is currently running. `install` boots that job
+# out below before bootstrapping the new one, so its daemon is never the second
+# worker the guard is about -- and reinstalling over a live agent is the routine way
+# the plist is changed (a moved node, a new agent CLI on PATH, --self-update).
+agent_running() {
+	launchctl print "$TARGET" 2>/dev/null | grep -qE '^[[:space:]]+pid = [0-9]+'
+}
+
+# A worker already running by hand holds the checkout lock; a second one would lose
+# the race and then crash-loop under KeepAlive.
+#
+# The lock is what says which checkout a daemon serves, and it is the only thing
+# that does: `swarm run:worker` spawns the daemon in the npm-linked SWARM checkout,
+# so every worker on the machine reports *that* directory as its cwd whichever
+# repository it serves. Comparing cwd therefore refused the SWARM checkout's own
+# install by naming an unrelated repository's daemon, and guarded no other checkout
+# at all (issue #969). `ps` rather than `pgrep` for liveness for a second reason
+# found there: macOS pgrep excludes its own ancestors, so a daemon that spawned the
+# session running this command is invisible to it -- and one `ps` call answers both
+# halves at once, since a pid that is live *and* a worker is not a recycled pid. A
+# lock left behind by a crashed daemon refuses nothing, exactly as the next daemon
+# reclaims it rather than refusing to start.
+refuse_if_worker_running() {
+	[ -f "$LOCK" ] || return 0
+	local holder who
+	holder=$(sed -n 's/.*"pid":[[:space:]]*\([0-9]\{1,\}\).*/\1/p' "$LOCK" 2>/dev/null | head -1 || true)
+	[ -n "$holder" ] || return 0
+	ps -ww -p "$holder" -o command= 2>/dev/null | grep -q 'src/transport/connect-entry' || return 0
+	agent_running && return 0
+	# Named the way the daemon's own refusal names a holder (`describeHolder`,
+	# src/worktree/checkout-lock.ts): by worker id when the lock has one, since that
+	# is what an operator can act on; by pid alone before its first handshake.
+	# `"workerId":null` leaves this empty (the pattern requires the opening quote), so
+	# a daemon that has not handshaked yet keeps the wording the cwd guard used.
+	who=$(sed -n 's/.*"workerId":"\([^"]*\)".*/\1/p' "$LOCK" 2>/dev/null | head -1 || true)
+	who="${who:+worker $who}"
+	die "${who:-a worker} (pid $holder) is already running for $CHECKOUT -- stop it first, then re-run install"
+}
+
 cmd_install() {
 	# A worker checkout is a git checkout of the *project* repository (the daemon
 	# declares its `origin` at handshake); it is not necessarily a Node project, so
@@ -110,14 +154,7 @@ cmd_install() {
 	[ "$self_update" = true ] &&
 		self_update_entry=$'\n\t\t<key>SWARM_WORKER_SELF_UPDATE</key>\n\t\t<string>true</string>'
 
-	# A worker already running by hand holds the checkout lock; a second one would
-	# lose the race and then crash-loop under KeepAlive.
-	local pid cwd
-	for pid in $(pgrep -f 'src/transport/connect-entry' 2>/dev/null || true); do
-		cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' || true)
-		[ "$cwd" = "$CHECKOUT" ] || continue
-		die "a worker (pid $pid) is already running for $CHECKOUT -- stop it first, then re-run install"
-	done
+	refuse_if_worker_running
 
 	mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
 	cat >"$PLIST" <<EOF
