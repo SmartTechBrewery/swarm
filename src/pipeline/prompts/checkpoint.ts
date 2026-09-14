@@ -18,13 +18,18 @@
  * arrives without warning, so the file has to be current *before* it does; don't
  * "improve" this into a wind-down decision the agent has to make.
  *
- * {@link checkpointInstructions} also carries the *worktree-state* directive
- * (issue #705): don't leave the worktree's changes stashed. It lives here rather
- * than beside `GH_IDENTITY_GUARD` (`src/pipeline/agent-auth.ts`) because its
- * reason *is* the checkpoint — a stash that outlives the run turns the next
- * continuation into a `checkpoint-divergent` block — and because this block is
- * spliced by exactly the four phases that write a checkpoint, including
- * `resolve-conflicts`, which deliberately carries no identity guard.
+ * {@link checkpointInstructions} also carries two directives whose reason *is* the
+ * checkpoint, which is why they live here rather than beside `GH_IDENTITY_GUARD`
+ * (`src/pipeline/agent-auth.ts`) — and why they reach exactly the four phases that
+ * write a checkpoint, including `resolve-conflicts`, which deliberately carries no
+ * identity guard. The *worktree-state* directive (issue #705): don't leave the
+ * worktree's changes stashed, because a stash that outlives the run turns the next
+ * continuation into a `checkpoint-divergent` block. And the *literal-path* directive
+ * (issue #949): `workingTree` names one literal path per changed file, never a glob
+ * or a directory, because the continuation gate compares those entries against the
+ * real tree — it tolerates a glob rather than reporting intact work as lost, but the
+ * tolerance is a backstop, and only the prompt reaches the agent while it can still
+ * write the file correctly.
  *
  * Every returned element is a self-contained paragraph with no internal
  * newlines, so a call site can spread it into a `'\n'`-joined line array
@@ -32,7 +37,11 @@
  * paragraph array (resolve-conflicts) unchanged.
  */
 
-import { CHECKPOINT_FILENAME, type Checkpoint } from '@/pipeline/checkpoint.js';
+import {
+	CHECKPOINT_FILENAME,
+	type Checkpoint,
+	GLOB_METACHARACTERS,
+} from '@/pipeline/checkpoint.js';
 import type { TriggerPhase } from '@/triggers/types.js';
 
 /**
@@ -44,6 +53,7 @@ export function checkpointInstructions(phase: TriggerPhase): readonly string[] {
 	return [
 		`Throughout the work above, keep a rolling progress checkpoint in "${CHECKPOINT_FILENAME}" at the worktree root. After each completed step — and, once at least one repository path has changed, before starting any long operation — rewrite the whole file (never append) so it always describes where you actually are. Do not create one before a completed step.`,
 		`Write it as JSON with: phase (exactly "${phase}"), completed (a non-empty array of the steps already done), remaining (a non-empty array of what is still left, in order), decisions (an array of choices or caveats worth not re-deriving; may be empty), and workingTree ({"modified":[…],"added":[…],"deleted":[…]} — the repository paths you have changed so far, naming at least one path).`,
+		'Every workingTree entry must be a literal repository path, relative to the worktree root and exactly as `git status --porcelain` prints it — one entry per changed file. Never a glob, a wildcard, a directory, or any other summary ("src/**/*.ts", "apps/backend/", "the contracts package"), even when the change touches hundreds of files: a continuation checks these entries against the real working tree, and an entry it cannot find there is read as work that went missing. List the files.',
 		'It exists so that if this run is stopped involuntarily — a usage limit, a wall-clock timeout, an interruption — SWARM can continue from the recorded remainder instead of re-doing your work. Update it only at a safe boundary: never mid-edit and never mid-command.',
 		"Because that stop arrives without warning and the continuation is a fresh session in this same worktree, never leave this worktree's changes stashed. Do not `git stash` your work aside — not even briefly, and not to check whether a failure predates your change — unless you restore it before the same step ends. A continuation that finds a clean tree while the checkpoint records changed paths is refused outright, and your work then sits in a stash nobody is looking for.",
 		'To check whether something also fails without your changes, compare against a separate checkout (or the base branch in a scratch clone) rather than mutating this worktree.',
@@ -67,6 +77,31 @@ function workingTreeSummary(workingTree: Checkpoint['workingTree']): string {
 }
 
 /**
+ * The one clause that keeps the working-tree paragraph factual when an entry is not
+ * a path (issue #949).
+ *
+ * `validateCheckpointForContinuation` tolerates a `workingTree` written as globs
+ * rather than failing the phase over it, so a continuation can be seeded from a
+ * checkpoint whose entries name a *shape* — and an unhedged "read those files"
+ * then points the session at `src/**` and a trailing filename glob. The entries are
+ * still rendered as recorded: the pattern is what the stopped run actually wrote,
+ * and expanding it to the paths it matched would splice an unbounded file list (199,
+ * in the incident that prompted the tolerance) into what is otherwise a summary. The
+ * session is pointed at `git status` for the real list instead, which is where the
+ * authoritative one lives anyway.
+ *
+ * Hedged rather than asserted, on the same {@link GLOB_METACHARACTERS} test and for
+ * the same reason the guard's own missing-entry message is: a real filename may
+ * legally contain `*` or `?`, so "may be patterns" is the true statement.
+ */
+function patternCaveat(workingTree: Checkpoint['workingTree']): string {
+	const entries = [...workingTree.modified, ...workingTree.added, ...workingTree.deleted];
+	return entries.some((entry) => GLOB_METACHARACTERS.test(entry))
+		? ' Entries containing `*` or `?` may be patterns rather than literal paths, so run `git status --porcelain` for the authoritative list of changed files.'
+		: '';
+}
+
+/**
  * The hand-off block for a Tier 2 continuation: the checkpoint an involuntarily
  * stopped run of *this* phase left in *this* worktree, plus the instruction that
  * gives it force — finish only the recorded remainder.
@@ -74,7 +109,9 @@ function workingTreeSummary(workingTree: Checkpoint['workingTree']): string {
  * Only reached once `validateCheckpointForContinuation`
  * (`src/pipeline/checkpoint.ts`) has confirmed the checkpoint names this phase and
  * matches the tree on disk, so the prompt can state the completed work and the
- * working tree as fact rather than hedging. The continuation runs on a **fresh**
+ * working tree as fact rather than hedging — with the single exception the guard's
+ * glob tolerance creates, which {@link patternCaveat} carries and nothing else
+ * does. The continuation runs on a **fresh**
  * session — possibly a different CLI — so this text is the only context it has;
  * everything the remainder depends on has to be in it.
  *
@@ -93,7 +130,7 @@ export function checkpointContinuationSection(checkpoint: Checkpoint): readonly 
 					`Decisions and caveats already settled — carry them rather than re-deciding: ${inlineList(checkpoint.decisions)}`,
 				]
 			: []),
-		`Changes already in this worktree, as the checkpoint recorded them — ${workingTreeSummary(checkpoint.workingTree)}. Read those files before changing them; they are the earlier run's work, not yours to start over.`,
+		`Changes already in this worktree, as the checkpoint recorded them — ${workingTreeSummary(checkpoint.workingTree)}. Read those files before changing them; they are the earlier run's work, not yours to start over.${patternCaveat(checkpoint.workingTree)}`,
 		"Complete only the remainder. Do not re-explore settled work unless verification requires it — for example a listed step fails, or a completed change is provably wrong or missing. Then finish the phase normally: run the verification the steps above call for, and write this phase's hand-off file exactly as instructed. Keep the checkpoint current as you go, so a further stop can continue from where you get to.",
 	];
 }

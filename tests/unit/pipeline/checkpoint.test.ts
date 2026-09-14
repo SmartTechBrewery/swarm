@@ -2,7 +2,15 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+/** The level the glob-tolerance signal is asserted on (issue #949). */
+const { warn } = vi.hoisted(() => ({ warn: vi.fn() }));
+vi.mock('@/lib/logger.js', async (importOriginal) => {
+	const actual = await importOriginal<typeof import('@/lib/logger.js')>();
+	return { ...actual, logger: { ...actual.logger, warn } };
+});
+
 import {
 	CHECKPOINT_FILENAME,
 	type Checkpoint,
@@ -119,9 +127,20 @@ const VALID = {
 	workingTree: { modified: ['src/pipeline/checkpoint.ts'], added: [], deleted: [] },
 };
 
+beforeEach(() => {
+	warn.mockClear();
+});
+
 afterEach(() => {
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
+
+/** The `warn` calls announcing that the glob fallback accepted a checkpoint (issue #949). */
+function toleranceWarnings(): unknown[][] {
+	return warn.mock.calls.filter(([message]) =>
+		String(message).includes('describes the working tree with pattern(s)'),
+	);
+}
 
 describe('CheckpointSchema (issue #299)', () => {
 	it('is the filename registered as a delivery scratch artifact', () => {
@@ -519,6 +538,274 @@ describe('the stash diagnosis on a divergence (issue #705)', () => {
 	});
 });
 
+/**
+ * The glob tolerance (issue #949). A checkpoint that compresses a
+ * hundreds-of-files change into patterns used to fail every entry of the exact set
+ * test at once, killing the phase terminally and reporting 199 intact files as
+ * missing work. The comparison is literal-first and only falls back to matching a
+ * pattern, so the divergence rule itself is unchanged.
+ */
+describe('a checkpoint that records patterns rather than paths (issue #949)', () => {
+	it('accepts the live incident’s checkpoint — three patterns and one literal path', async () => {
+		const files = {
+			'packages/contracts/src/index.ts': 'a\n',
+			'apps/backend/src/routes/health.ts': 'b\n',
+			'apps/backend/tests/health.test.ts': 'c\n',
+			'apps/backend/drizzle.config.ts': 'd\n',
+		};
+		const root = gitFixture({
+			tracked: files,
+			dirty: Object.fromEntries(Object.keys(files).map((path) => [path, 'translated\n'])),
+			checkpoint: {
+				...VALID,
+				workingTree: {
+					modified: [
+						'packages/contracts/src/*.ts',
+						'apps/backend/src/**/*.ts',
+						'apps/backend/tests/**/*.ts',
+						'apps/backend/drizzle.config.ts',
+					],
+				},
+			},
+		});
+		await expect(
+			validateCheckpointForContinuation(root, 'implementation', BRANCH),
+		).resolves.toMatchObject({ valid: true });
+	});
+
+	it('lets `**` cross a directory separator', async () => {
+		const root = gitFixture({
+			dirty: { 'apps/backend/src/a.ts': 'x\n', 'apps/backend/src/deep/nested/b.ts': 'y\n' },
+			checkpoint: { ...VALID, workingTree: { modified: ['apps/backend/src/**/*.ts'] } },
+		});
+		await expect(
+			validateCheckpointForContinuation(root, 'implementation', BRANCH),
+		).resolves.toMatchObject({ valid: true });
+	});
+
+	it('does not let a single `*` cross one', async () => {
+		const root = gitFixture({
+			dirty: { 'packages/contracts/src/deep/b.ts': 'y\n' },
+			checkpoint: { ...VALID, workingTree: { modified: ['packages/contracts/src/*.ts'] } },
+		});
+		await expect(
+			validateCheckpointForContinuation(root, 'implementation', BRANCH),
+		).resolves.toMatchObject({ valid: false, reason: 'checkpoint-divergent' });
+	});
+
+	it('still diverges on a pattern nothing the tree changes matches, and says how it looked', async () => {
+		const root = gitFixture({
+			tracked: { 'src/a.ts': 'a\n' },
+			dirty: { 'src/a.ts': 'edited\n' },
+			checkpoint: {
+				...VALID,
+				workingTree: { modified: ['src/a.ts'], added: ['src/generated/**/*.ts'] },
+			},
+		});
+		const result = await validateCheckpointForContinuation(root, 'implementation', BRANCH);
+		expect(result).toMatchObject({ valid: false, reason: 'checkpoint-divergent' });
+		if (result.valid) return;
+		expect(result.detail).toContain(
+			'src/generated/**/*.ts (no changed path matches it, as a path or as a pattern)',
+		);
+	});
+
+	it('does not call a missing entry a pattern — it may be a real filename', async () => {
+		const root = gitFixture({
+			tracked: { 'src/a.ts': 'a\n' },
+			dirty: { 'src/a.ts': 'edited\n' },
+			checkpoint: {
+				...VALID,
+				workingTree: { modified: ['src/a.ts', 'docs/what-if-*.md'] },
+			},
+		});
+		const result = await validateCheckpointForContinuation(root, 'implementation', BRANCH);
+		expect(result).toMatchObject({ valid: false, reason: 'checkpoint-divergent' });
+		if (result.valid) return;
+		expect(result.detail).toContain(
+			'docs/what-if-*.md (no changed path matches it, as a path or as a pattern)',
+		);
+		expect(result.detail).not.toContain('a pattern matching nothing');
+	});
+
+	/** 24 segments — deep enough that ambiguous groups would have to search it. */
+	const DEEP_PATH = `${Array.from({ length: 24 }, (_, index) => `d${index}`).join('/')}/a.ts`;
+
+	it('reads a run of `**/` as one cross-directory token', async () => {
+		const root = gitFixture({
+			dirty: { [DEEP_PATH]: 'x\n' },
+			checkpoint: { ...VALID, workingTree: { modified: [`${'**/'.repeat(20)}a.ts`] } },
+		});
+		await expect(
+			validateCheckpointForContinuation(root, 'implementation', BRANCH),
+		).resolves.toMatchObject({ valid: true });
+	});
+
+	it('cannot be made to backtrack on a run of `**/` that matches nothing', async () => {
+		// Uncollapsed, 20 consecutive `**/` compile to 20 mutually ambiguous
+		// `(?:[^/]+/)*` groups; against a deep path that does *not* match, that is not
+		// a test that finishes. Collapsed they are one group, and this returns at once.
+		const root = gitFixture({
+			dirty: { [DEEP_PATH]: 'x\n' },
+			checkpoint: { ...VALID, workingTree: { modified: [`${'**/'.repeat(20)}b.ts`] } },
+		});
+		await expect(
+			validateCheckpointForContinuation(root, 'implementation', BRANCH),
+		).resolves.toMatchObject({ valid: false, reason: 'checkpoint-divergent' });
+	});
+
+	it('still diverges on a literal recorded path the tree no longer changes', async () => {
+		const root = gitFixture({
+			tracked: { 'src/a.ts': 'a\n' },
+			dirty: { 'src/a.ts': 'edited\n' },
+			checkpoint: {
+				...VALID,
+				workingTree: { modified: ['src/a.ts'], added: ['src/lost.ts'] },
+			},
+		});
+		const result = await validateCheckpointForContinuation(root, 'implementation', BRANCH);
+		expect(result).toMatchObject({ valid: false, reason: 'checkpoint-divergent' });
+		if (result.valid) return;
+		expect(result.detail).toContain('no longer changes: src/lost.ts');
+		expect(result.detail).not.toContain('a pattern matching nothing');
+	});
+
+	it('matches a real filename containing `*` literally, and does not call it a pattern', async () => {
+		const root = gitFixture({
+			dirty: { 'src/we*rd.ts': 'x\n' },
+			checkpoint: { ...VALID, workingTree: { added: ['src/we*rd.ts'] } },
+		});
+		await expect(
+			validateCheckpointForContinuation(root, 'implementation', BRANCH),
+		).resolves.toMatchObject({ valid: true });
+		expect(toleranceWarnings()).toHaveLength(0);
+	});
+
+	it('logs the entries the fallback accepted, so the tolerance is never silent', async () => {
+		const root = gitFixture({
+			tracked: { 'src/a.ts': 'a\n' },
+			dirty: { 'src/a.ts': 'edited\n', 'src/b.ts': 'new\n' },
+			checkpoint: { ...VALID, workingTree: { modified: ['src/*.ts'] } },
+		});
+		await expect(
+			validateCheckpointForContinuation(root, 'implementation', BRANCH),
+		).resolves.toMatchObject({ valid: true });
+		expect(toleranceWarnings()).toHaveLength(1);
+		expect(toleranceWarnings()[0]?.[1]).toMatchObject({ patterns: ['src/*.ts'] });
+	});
+
+	it('still attributes the stash holding work an unaccounted pattern stands for', async () => {
+		const root = gitFixture({
+			tracked: {
+				'.gitignore': `${CHECKPOINT_FILENAME}\n`,
+				'src/kept.ts': 'a\n',
+				'src/lost/a.ts': 'b\n',
+			},
+			dirty: { 'src/kept.ts': 'edited\n', 'src/lost/a.ts': 'edited\n' },
+			stash: { message: 'wip', paths: ['src/lost/a.ts'] },
+			checkpoint: {
+				...VALID,
+				workingTree: { modified: ['src/kept.ts', 'src/lost/**/*.ts'], added: [], deleted: [] },
+			},
+		});
+		const before = fixtureGit(root, ['stash', 'list']);
+		const result = await validateCheckpointForContinuation(root, 'implementation', BRANCH);
+		expect(result).toMatchObject({ valid: false, reason: 'checkpoint-divergent' });
+		if (result.valid) return;
+		expect(result.detail).toContain('stash@{0}');
+		expect(result.detail).toContain('holds 1 path(s), 1 of which this checkpoint records');
+		expect(result.detail).toContain(`git -C ${root} stash apply 'stash@{0}'`);
+		// Reporting only, exactly as on a literal divergence.
+		expect(fixtureGit(root, ['stash', 'list'])).toBe(before);
+	});
+
+	it('reports the stash even when the pattern still matches a surviving path', async () => {
+		const root = gitFixture({
+			tracked: {
+				'.gitignore': `${CHECKPOINT_FILENAME}\n`,
+				'src/lost/a.ts': 'a\n',
+				'src/lost/b.ts': 'b\n',
+			},
+			dirty: { 'src/lost/a.ts': 'edited\n', 'src/lost/b.ts': 'edited\n' },
+			stash: { message: 'wip', paths: ['src/lost/a.ts'] },
+			checkpoint: { ...VALID, workingTree: { modified: ['src/lost/**/*.ts'] } },
+		});
+		const result = await validateCheckpointForContinuation(root, 'implementation', BRANCH);
+		expect(result).toMatchObject({ valid: false, reason: 'checkpoint-divergent' });
+		if (result.valid) return;
+		expect(result.detail).toContain('stash@{0}');
+		expect(result.detail).toContain(`git -C ${root} stash apply 'stash@{0}'`);
+		// The tolerance must not be what carried it: no acceptance was logged.
+		expect(toleranceWarnings()).toHaveLength(0);
+	});
+
+	it('refuses a glob-recorded checkpoint whose tracked work is stashed behind one untracked match', async () => {
+		const root = gitFixture({
+			tracked: {
+				'.gitignore': `${CHECKPOINT_FILENAME}\n`,
+				'src/a.ts': 'a\n',
+				'src/b.ts': 'b\n',
+				'src/c.ts': 'c\n',
+			},
+			dirty: {
+				'src/a.ts': 'edited\n',
+				'src/b.ts': 'edited\n',
+				'src/c.ts': 'edited\n',
+				'src/new.ts': 'added\n',
+			},
+			// `git stash push` without `-u` takes the three tracked edits and leaves
+			// the untracked `src/new.ts` — the one path the pattern then matches.
+			stash: { message: 'wip check', paths: ['src/a.ts', 'src/b.ts', 'src/c.ts'] },
+			checkpoint: { ...VALID, workingTree: { modified: ['src/**/*.ts'] } },
+		});
+		const before = fixtureGit(root, ['stash', 'list']);
+		const result = await validateCheckpointForContinuation(root, 'implementation', BRANCH);
+		expect(result).toMatchObject({ valid: false, reason: 'checkpoint-divergent' });
+		if (result.valid) return;
+		expect(result.detail).toContain('a git stash holds work they also describe: src/**/*.ts');
+		expect(result.detail).toContain('stash@{0}');
+		expect(result.detail).toContain('holds 3 path(s), 3 of which this checkpoint records');
+		expect(result.detail).toContain(`git -C ${root} stash apply 'stash@{0}'`);
+		// Still reporting only, exactly as on a literal divergence.
+		expect(fixtureGit(root, ['stash', 'list'])).toBe(before);
+		expect(toleranceWarnings()).toHaveLength(0);
+	});
+
+	it('keeps accepting the same checkpoint when no stash holds the pattern’s work', async () => {
+		const root = gitFixture({
+			tracked: { 'src/a.ts': 'a\n', 'src/b.ts': 'b\n', 'src/c.ts': 'c\n' },
+			dirty: {
+				'src/a.ts': 'edited\n',
+				'src/b.ts': 'edited\n',
+				'src/c.ts': 'edited\n',
+				'src/new.ts': 'added\n',
+			},
+			checkpoint: { ...VALID, workingTree: { modified: ['src/**/*.ts'] } },
+		});
+		await expect(
+			validateCheckpointForContinuation(root, 'implementation', BRANCH),
+		).resolves.toMatchObject({ valid: true });
+		expect(toleranceWarnings()).toHaveLength(1);
+	});
+
+	it('does not refuse over a stash on this branch holding nothing the pattern describes', async () => {
+		const root = gitFixture({
+			tracked: {
+				'.gitignore': `${CHECKPOINT_FILENAME}\n`,
+				'docs/notes.md': 'notes\n',
+				'src/a.ts': 'a\n',
+			},
+			dirty: { 'docs/notes.md': 'edited\n', 'src/a.ts': 'edited\n', 'src/b.ts': 'added\n' },
+			stash: { message: 'unrelated', paths: ['docs/notes.md'] },
+			checkpoint: { ...VALID, workingTree: { modified: ['src/**/*.ts'] } },
+		});
+		await expect(
+			validateCheckpointForContinuation(root, 'implementation', BRANCH),
+		).resolves.toMatchObject({ valid: true });
+		expect(toleranceWarnings()).toHaveLength(1);
+	});
+});
+
 /** A validated checkpoint a continuation would be seeded from. */
 const CONTINUATION: Checkpoint = CheckpointSchema.parse({
 	phase: 'implementation',
@@ -561,6 +848,26 @@ describe('checkpointContinuationSection (issue #502)', () => {
 	it('emits newline-free paragraphs, so both prompt join styles can splice it', () => {
 		for (const paragraph of checkpointContinuationSection(checkpoint))
 			expect(paragraph).not.toContain('\n');
+	});
+
+	it('states the working tree flatly when every entry is a literal path (issue #949)', () => {
+		const rendered = checkpointContinuationSection(checkpoint).join('\n');
+		expect(rendered).not.toContain('may be patterns');
+		expect(rendered).not.toContain('git status --porcelain');
+	});
+
+	it('sends the session to `git status` when the guard tolerated a pattern (issue #949)', () => {
+		const rendered = checkpointContinuationSection(
+			CheckpointSchema.parse({
+				...checkpoint,
+				workingTree: { modified: ['apps/backend/src/**/*.ts'], added: [], deleted: [] },
+			}),
+		).join('\n');
+		// The pattern is still what the stopped run recorded, so it is still shown …
+		expect(rendered).toContain('apps/backend/src/**/*.ts');
+		// … but "read those files" is no longer left standing over a shape.
+		expect(rendered).toContain('may be patterns rather than literal paths');
+		expect(rendered).toContain('run `git status --porcelain`');
 	});
 });
 
@@ -633,6 +940,14 @@ describe.each(IMPLEMENTER_BUILDERS)('$name prompt asks for a checkpoint', ({ nam
 		expect(prompt).toContain('Do not create one before a completed step.');
 		expect(prompt).toContain('completed (a non-empty array');
 		expect(prompt).toContain('remaining (a non-empty array');
+	});
+
+	it('requires literal working-tree paths, and says why (issue #949)', () => {
+		const prompt = build();
+		expect(prompt).toContain('must be a literal repository path');
+		expect(prompt).toContain('Never a glob');
+		// The consequence an agent compressing hundreds of files cannot infer.
+		expect(prompt).toContain('read as work that went missing');
 	});
 
 	it('forbids leaving the worktree stashed, and says why (issue #705)', () => {
