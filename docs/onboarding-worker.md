@@ -36,16 +36,25 @@ no password until you give it one, and `swarm login` needs one, so run
 ### The three-command path (recommended)
 
 Run this **on the machine being onboarded, from inside its checkout of the
-project's repository**, with `SWARM_CONTROL_PLANE_URL` in its `.env` and nothing
-else — no `DATABASE_URL`, no Postgres reachability (issue #800). The user must
-already exist and belong to the project (steps 1–2 below), which is the admin
-machine's part.
+project's repository** — no `DATABASE_URL`, no Postgres reachability (issue #800),
+and nothing to put in a file by hand. The user must already exist and belong to the
+project (steps 1–2 below), which is the admin machine's part.
 
 ```bash
 swarm login                                                                        # once per machine
-swarm workers register-and-enroll <email> swarm --name "<Display Name>" --cli <clis>
+swarm workers register-and-enroll <email> swarm --name "<Display Name>" --cli <clis> \
+  --control-plane-url <the control-plane base URL, e.g. https://swarm.example.com>
 swarm run:worker
 ```
+
+`--control-plane-url` is what points the SWARM checkout's `.env` at this
+installation, which is the one thing the daemon reads from it. It is needed only on
+a machine whose `.env` does not carry `SWARM_CONTROL_PLANE_URL` yet: an existing
+assignment is reported and **left untouched**, so a second worker on the same
+machine omits the flag and changes nothing. On a TTY the command asks for the URL
+rather than failing when it is missing and no flag was passed. `swarm init` is
+deliberately *not* the command for this: it copies the whole stack `.env.docker.example`,
+and a worker must hold no `DATABASE_URL`.
 
 Sign in as **the worker's owner** — `<email>` — not as an installation admin on
 somebody else's behalf: storing a machine's operator source-control credential is
@@ -287,8 +296,10 @@ npm ci
 ```
 
 Since issue #800 this same checkout is where Part 1 is run from — `swarm login` and
-`swarm workers register-and-enroll` need only `SWARM_CONTROL_PLANE_URL`, which the
-`.env` below already carries — so on a machine onboarded that way
+`swarm workers register-and-enroll` need only `SWARM_CONTROL_PLANE_URL`, and
+`register-and-enroll --control-plane-url <url>` writes that line into the `.env`
+below itself when it is absent, so a fresh clone needs no hand-edited file at all —
+so on a machine onboarded that way
 `SWARM_WORKER_CREDENTIAL` never has to be written here at all, and
 [`swarm run:worker`](./cli.md#swarm-runworker) below is the whole of Part 2. The
 explicit form stays for a machine somebody else onboarded, and for a process
@@ -584,7 +595,9 @@ stays each owner's own `swarm workers update --all <ref>`.
 | --- | --- |
 | A `swarm workers` command says "not signed in — run `swarm login`" or "your control-plane session has expired" | Since issue #800 the whole command group authenticates over the network instead of holding `DATABASE_URL`. Run `swarm login` on that machine (`swarm login --status` says who the cached session is); the session lasts `SWARM_SESSION_TTL_HOURS`. |
 | `swarm login` says `the control plane refused the login (HTTP 404)` | `SWARM_CONTROL_PLANE_URL` is reachable but its tunnel has no rule for `/operator/*` yet — an admin-side prerequisite this doc doesn't cover; see [`docs/cloudflare-tunnel.md`](./cloudflare-tunnel.md#the-operator-cli-operator). |
-| A `swarm workers` command says `SWARM_CONTROL_PLANE_URL is unset` | Same cause: the command group needs the router base URL, not a database. Put it in this machine's `.env` (the same value the daemon uses) and re-run. |
+| A `swarm workers` command says `SWARM_CONTROL_PLANE_URL is unset` | Same cause: the command group needs the router base URL, not a database. `workers register-and-enroll --control-plane-url <url>` writes it into this checkout's `.env` for you; any other subcommand wants it there (the same value the daemon uses) before you re-run. |
+| `register-and-enroll` says `.env already points at <url>, not the requested <other>` | This machine is already onboarded against a different installation, and the command never rewrites a line it did not write. If the machine really is moving, edit `.env` by hand; otherwise drop the flag — an existing assignment is what a second worker on this machine should keep. |
+| `register-and-enroll` says `.env assigns SWARM_CONTROL_PLANE_URL no value` | The key is there with an empty value, which is neither a URL to keep nor an absence to fill. Put the URL in, or delete the line and re-run with `--control-plane-url`. |
 | `workers set-scm-credential`, `workers remove`, `workers consent` or `workers update-enrollment` says `Worker with ID "…" not found` / `Enrollment with ID "…" not found` for one that exists | All four are strictly the machine owner's since issue #800 — an installation admin gets the same `NOT_FOUND` a stranger does. Sign in as the worker's owner on that machine. |
 | `register-and-enroll` says `You are not a member of project "…"` | The project id is **right** and the enrollment has nothing to do with it — the calling operator simply has no membership row for that project (issue #899; before it, this arrived as an indistinguishable `Project with ID "…" not found` and read as a typo). An instance administrator runs `swarm members add <project-id> <your login handle>` on the control-plane host — that command needs `DATABASE_URL` — then re-run. |
 | `register-and-enroll` says `Project with ID "…" not found` | Since issue #899 this one means what it says: no project on this control plane carries that id. Check it against the dashboard's Projects list — a project id is not the repository name. |

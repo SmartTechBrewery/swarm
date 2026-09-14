@@ -418,7 +418,7 @@ pair is a no-op; a handle already linked to a different user is rejected. Requir
 
 ```bash
 swarm workers register <owner-identifier> --name <displayName> --cli <c1,c2,...>
-swarm workers register-and-enroll <owner-identifier> <project-id> --name <displayName> --cli <c1,c2,...> [--repo-root <path>]
+swarm workers register-and-enroll <owner-identifier> <project-id> --name <displayName> --cli <c1,c2,...> [--control-plane-url <url>] [--repo-root <path>]
 swarm workers list [<owner-identifier>]
 swarm workers set-cli <worker-id> (--cli <c1,c2,...> | --auto)
 swarm workers set-scm-credential <worker-id> <scm-provider-id>
@@ -533,7 +533,27 @@ unchanged.
 - **`register-and-enroll`** — the **recommended one-command path for a new machine**
   (issue #786): `register` + `set-scm-credential` + `enroll` in one invocation,
   ending with the exact command that starts the daemon. It composes those three and
-  relaxes none of their checks. The **SCM provider is resolved from the target
+  relaxes none of their checks. **It also bootstraps the checkout it runs in**,
+  which is what makes "one command for a new machine" true of a *fresh clone*: the
+  SWARM checkout's `.env` must carry `SWARM_CONTROL_PLANE_URL` — the only value the
+  daemon reads from it, since the worker holds no `DATABASE_URL`/`REDIS_URL` — and
+  until now nothing wrote it, leaving an `echo` in a runbook as the last hand step
+  of onboarding. `swarm init` cannot serve that machine: it copies
+  `.env.docker.example` wholesale, `DATABASE_URL` included. So this command resolves
+  the URL from `--control-plane-url`, else the environment, else a prompt on a TTY,
+  and appends the assignment — **before** anything else, because every step after it
+  needs that URL (`requireOperator` included) and because the start line it prints
+  at the end names a daemon that reads the same file. Two rules make it safe on a
+  machine that is already onboarded, which is the normal case for a second worker:
+  an existing assignment is **left untouched** and reported (so a re-run is a check,
+  not an edit), and the file is only ever **appended** to — never parsed and
+  rewritten, so nothing it does not understand can be lost. The two states it cannot
+  settle by appending are refused for a human rather than guessed at: a
+  `--control-plane-url` that disagrees with the stored one (it names both, and says
+  to edit `.env` by hand if the machine is genuinely moving installation) and a key
+  present with an empty value. It writes a file and contacts nothing — a URL that
+  parses is not yet a URL that answers, which is what the session below finds out.
+  The **SCM provider is resolved from the target
   project** server-side (`workers.projectScmProvider`, which resolves it through the
   same lookup the dispatcher uses — never assumed to be GitHub), so the
   credential prompt names the provider that project actually runs on and any of

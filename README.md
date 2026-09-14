@@ -173,8 +173,13 @@ enrolled worker or it waits:
 ```bash
 npm run swarm -- login --identifier localhost-admin
 npm run swarm -- workers register-and-enroll localhost-admin <project-id> \
-  --name "this machine" --cli claude
+  --name "this machine" --cli claude --control-plane-url http://localhost:3100
 ```
+
+`--control-plane-url` is the router base URL this machine's worker talks to —
+loopback here, the tunnel URL on a remote machine. The command writes it into
+`.env` when that file does not already name one, so nothing has to be edited by
+hand; pass it only on a machine that has not been pointed at an installation yet.
 
 Then start the processes and open <http://localhost:5173>:
 
