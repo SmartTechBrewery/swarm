@@ -560,9 +560,20 @@ export interface PMProvider {
 	 * Projects reads it off the backing Issue's state — the column write alone
 	 * leaves a done-looking card still gating its dependents, and the state write
 	 * alone leaves the card parked in an active column. A provider whose status
-	 * *is* its open/closed state (a Linear completed-type state, a Jira `done`
+	 * *is* its open/closed state (a Linear finished-type state, a Jira `done`
 	 * status category, a Trello list) owes exactly the one write, and says so in
 	 * its own module rather than leaving the reader to assume it.
+	 *
+	 * **The end state is the provider's to verify, not the operator's to get
+	 * right.** Nothing validates a board mapping's `done` against the native
+	 * semantics a provider's own `listBlockers` reads — `statusOptions` holds
+	 * opaque provider ids, and the board-mapping screen accepts any of the board's
+	 * states for the key — so a provider whose settle *depends* on that mapping
+	 * being terminal must check it rather than assume it, and refuse loudly when it
+	 * is not. Refusing is the contract-honest outcome: a settle that returns
+	 * normally while a later `listBlockers` still reports `open: true` would gate
+	 * the item's dependents indefinitely with nothing to point at. Prefer checking
+	 * before any write, so an invalid mapping leaves the board untouched.
 	 *
 	 * Idempotent — settling an already-settled item is a no-op rather than an
 	 * error, so a retried delivery can re-assert the end state safely.

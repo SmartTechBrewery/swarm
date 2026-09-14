@@ -710,8 +710,16 @@ describe('LinearPMProvider', () => {
 	});
 
 	describe('closeWorkItem', () => {
+		/** The mapped `done` state as the pre-write category check reads it back. */
+		function doneState(type: string) {
+			return { workflowState: { id: CONFIG.statusOptions.done, name: 'Done', type } };
+		}
+
 		it("settles the issue with its own mapped 'done' state and no second write", async () => {
-			mockGraphQL({ UpdateIssue: { issueUpdate: { success: true } } });
+			mockGraphQL({
+				WorkflowState: doneState('completed'),
+				UpdateIssue: { issueUpdate: { success: true } },
+			});
 
 			await provider.closeWorkItem(ISSUE_NODE.id);
 
@@ -721,6 +729,28 @@ describe('LinearPMProvider', () => {
 			expect(variablesSentTo('UpdateIssue')).toEqual([
 				{ id: ISSUE_NODE.id, input: { stateId: CONFIG.statusOptions.done } },
 			]);
+		});
+
+		it("refuses, without writing, when the mapped 'done' state is not a finished one", async () => {
+			mockGraphQL({
+				WorkflowState: {
+					workflowState: { id: CONFIG.statusOptions.done, name: 'QA', type: 'started' },
+				},
+				UpdateIssue: { issueUpdate: { success: true } },
+			});
+
+			// Settling into a `started` state would return normally while `listBlockers`
+			// kept reporting `open: true`, gating the item's dependents forever — so the
+			// mapping is checked first and the board is left untouched.
+			await expect(provider.closeWorkItem(ISSUE_NODE.id)).rejects.toThrow(/'started'/);
+			expect(variablesSentTo('UpdateIssue')).toEqual([]);
+		});
+
+		it("refuses when the mapped 'done' state does not resolve at all", async () => {
+			mockGraphQL({ WorkflowState: { workflowState: null } });
+
+			await expect(provider.closeWorkItem(ISSUE_NODE.id)).rejects.toThrow(/does not resolve/);
+			expect(variablesSentTo('UpdateIssue')).toEqual([]);
 		});
 	});
 

@@ -740,8 +740,18 @@ describe('JiraPMProvider', () => {
 	});
 
 	describe('closeWorkItem', () => {
+		/** The mapped `done` status as the pre-transition category check reads it back. */
+		function doneStatus(categoryKey: string) {
+			return {
+				id: CONFIG.statusOptions.done,
+				name: 'Done',
+				statusCategory: { key: categoryKey },
+			};
+		}
+
 		it("settles the issue through the transition into its mapped 'done' status", async () => {
 			mockJira({
+				[`status/${CONFIG.statusOptions.done}`]: doneStatus('done'),
 				'issue/SWARM-42': { fields: { status: { id: '3', name: 'In Progress' } } },
 				'issue/SWARM-42/transitions': {
 					transitions: [{ id: '51', name: 'Done', to: { id: CONFIG.statusOptions.done } }],
@@ -760,6 +770,7 @@ describe('JiraPMProvider', () => {
 
 		it('is a no-op on an issue already in the done status', async () => {
 			mockJira({
+				[`status/${CONFIG.statusOptions.done}`]: doneStatus('done'),
 				'issue/SWARM-42': {
 					fields: { status: { id: CONFIG.statusOptions.done, name: 'Done' } },
 				},
@@ -769,7 +780,40 @@ describe('JiraPMProvider', () => {
 
 			// Settling an already-settled item is a no-op by contract, and the workflow
 			// is never even consulted — there is no transition *to* the current status.
-			expect(fetchMock).toHaveBeenCalledTimes(1);
+			// The two reads are the mapping check and that current-status read.
+			expect(requestsTo('issue/SWARM-42/transitions', 'POST')).toEqual([]);
+			expect(fetchMock).toHaveBeenCalledTimes(2);
+		});
+
+		it("refuses, without transitioning, when the mapped 'done' status is not in the done category", async () => {
+			mockJira({
+				[`status/${CONFIG.statusOptions.done}`]: {
+					...doneStatus('indeterminate'),
+					name: 'Ready for QA',
+				},
+				'issue/SWARM-42': { fields: { status: { id: '3', name: 'In Progress' } } },
+				'issue/SWARM-42/transitions': {
+					transitions: [{ id: '51', name: 'Done', to: { id: CONFIG.statusOptions.done } }],
+				},
+			});
+
+			// An `indeterminate` status would return normally while `listBlockers` kept
+			// reporting `open: true`, gating the item's dependents forever — so the
+			// mapping is checked first and the workflow is never touched.
+			await expect(provider.closeWorkItem('SWARM-42')).rejects.toThrow(/'indeterminate'/);
+			expect(requestsTo('issue/SWARM-42/transitions', 'POST')).toEqual([]);
+		});
+
+		it("refuses in SWARM's own terms when the mapped 'done' status 404s", async () => {
+			// Jira 404s a status that was deleted *or* that no active workflow uses —
+			// both are one stale mapping, and the bare REST failure would name neither.
+			mockJira({
+				[`status/${CONFIG.statusOptions.done}`]: new Response(null, { status: 404 }),
+			});
+
+			await expect(provider.closeWorkItem('SWARM-42')).rejects.toThrow(
+				/does not resolve to a status on an active Jira workflow/,
+			);
 		});
 	});
 
