@@ -17,6 +17,7 @@ import { deferrableOrFailedResult } from '@/transport/assignment-execution.js';
 import type { TaskExecutionResult } from '@/transport/protocol.js';
 import type { DispatchSelection } from '@/worker/eligibility-gate.js';
 import { RunTerminatedError } from '@/worker/run-cancellation.js';
+import { BlockedRecoveryError } from '@/worktree/reclaim.js';
 import { createMockTaskAssignmentInput, createMockWorkItem } from '../../helpers/factories.js';
 
 const SELECTION: DispatchSelection = {
@@ -494,6 +495,106 @@ describe('adaptResultToPhaseRun exit metadata', () => {
 		expect(() =>
 			adaptResultToPhaseRun(
 				base({ status: 'failed', cancelled: true, error: 'Run cancelled by user' }),
+				SELECTION,
+			),
+		).toThrow(RunTerminatedError);
+	});
+});
+
+/**
+ * The refused adoption crossing the wire (issue #952). A federated terminal failure used
+ * to rebuild as a plain `AgentRunError`, so the settle wrote `recovery: null` — the one
+ * write that erases `runs.recovery.preservedWorkerId` and un-pins the retry from the
+ * machine that still holds the checkout. As above, the frames come from the worker's own
+ * `deferrableOrFailedResult` so both halves of the seam are asserted against each other.
+ */
+describe('adaptResultToPhaseRun blocked recovery', () => {
+	const ASSIGNMENT = () =>
+		buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'implementation' }));
+
+	it('re-raises the recovery gate’s refusal so the settle records a recovery state', () => {
+		const frame = deferrableOrFailedResult(
+			new BlockedRecoveryError(
+				'checkpoint-divergent',
+				'Checkpoint no longer matches the working tree',
+			),
+			ASSIGNMENT(),
+		);
+		expect(frame).toMatchObject({ status: 'failed', blockedReason: 'checkpoint-divergent' });
+
+		try {
+			adaptResultToPhaseRun(frame, SELECTION);
+			throw new Error('expected a throw');
+		} catch (err) {
+			expect(err).toBeInstanceOf(BlockedRecoveryError);
+			const blocked = err as BlockedRecoveryError;
+			// This is what `finalizeFailedRun` persists as `recovery.blockedReason`, and
+			// what the dashboard renders its recovery guidance from.
+			expect(blocked.reason).toBe('checkpoint-divergent');
+			expect(blocked.message).toBe('Checkpoint no longer matches the working tree');
+			// Not an `AgentRunError`, so `isDeferrable` still leaves it terminal.
+			expect(blocked).not.toBeInstanceOf(AgentRunError);
+		}
+	});
+
+	// The wire carries a string precisely so a worker that learns a seventh reason first
+	// does not lose its whole settle to a parse failure — and the pin survives either way.
+	it('keeps a reason this control plane does not model', () => {
+		try {
+			adaptResultToPhaseRun(
+				base({ status: 'failed', error: 'blocked', blockedReason: 'lease-contested' }),
+				SELECTION,
+			);
+			throw new Error('expected a throw');
+		} catch (err) {
+			expect(err).toBeInstanceOf(BlockedRecoveryError);
+			expect((err as BlockedRecoveryError).reason).toBe('lease-contested');
+		}
+	});
+
+	// The #596 regression bar: a terminal failure naming no reason is untouched.
+	it('still rebuilds a reason-less terminal failure as an inert AgentRunError', () => {
+		const frame = deferrableOrFailedResult(
+			new AgentRunError(
+				'Review agent (claude) exited with code 1 (authentication failed)',
+				{ kind: 'auth' },
+				{
+					cli: 'claude',
+					exitCode: 1,
+					signal: null,
+					stdout: '',
+					stderr: '',
+					durationMs: 3_400,
+					timedOut: false,
+					aborted: false,
+					outputTruncated: false,
+				},
+			),
+			ASSIGNMENT(),
+		);
+		expect(frame.blockedReason).toBeUndefined();
+
+		try {
+			adaptResultToPhaseRun(frame, SELECTION);
+			throw new Error('expected a throw');
+		} catch (err) {
+			expect(err).toBeInstanceOf(AgentRunError);
+			expect((err as AgentRunError).failure.kind).toBe('error');
+			expect((err as AgentRunError).agent).toMatchObject({ exitCode: 1, durationMs: 3_400 });
+		}
+	});
+
+	// Cancellation is checked first: a user termination cancels the dispatch rather than
+	// recording a recovery state, whatever else the frame happens to carry.
+	it('still raises RunTerminatedError for a cancelled frame naming a reason', () => {
+		expect(() =>
+			adaptResultToPhaseRun(
+				base({
+					status: 'failed',
+					cancelled: true,
+					error: 'Run cancelled by user',
+					blockedReason: 'dirty',
+				}),
 				SELECTION,
 			),
 		).toThrow(RunTerminatedError);

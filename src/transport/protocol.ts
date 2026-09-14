@@ -603,6 +603,17 @@ export const TaskExecutionResultSchema = z.object({
 	// One of the `AgentFailureKind`s, `delivery`, or `dependency` — the last being a
 	// wait on an external condition rather than a failure of the run itself.
 	failureKind: z.string().optional(),
+	// `failed` — why the recovery gate refused to adopt this run's preserved checkout
+	// (a `BlockedRecoveryReason`, `../worktree/reclaim.ts`). The worker is the only side
+	// that can see that checkout, and without this the control plane rebuilt every
+	// terminal failure as a plain error and wrote `recovery: null` — the one write that
+	// erases `runs.recovery.preservedWorkerId`, so the next "Retry now" was dispatched to
+	// a machine that never held the checkout (issue #952). A plain string rather than an
+	// enum, for the same reason `failureKind` above is one: a terminal result frame must
+	// never fail to parse, so a worker that learns a new reason before this control plane
+	// does must not lose its whole settle over it. Optional and additive in both
+	// directions, so `TRANSPORT_PROTOCOL_VERSION` is deliberately **not** bumped.
+	blockedReason: z.string().min(1).optional(),
 	// `deferred` with `failureKind: 'dependency'` — the still-**open** prerequisites
 	// gating the run (issue #438). The control plane rebuilds a
 	// `DependencyBlockedError` from these, so its bounded token-free recheck
