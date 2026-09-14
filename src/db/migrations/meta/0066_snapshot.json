@@ -1,6 +1,6 @@
 {
-  "id": "54aea459-9e62-4197-81c3-538f82fd78fd",
-  "prevId": "6d5e0b88-77b0-4f74-9770-01726503aabe",
+  "id": "d882a32d-11a8-406b-a02e-02b11e3290c5",
+  "prevId": "54aea459-9e62-4197-81c3-538f82fd78fd",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -2190,6 +2190,36 @@
         "update_reported_at": {
           "name": "update_reported_at",
           "type": "timestamp",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "worktree_sweep_request_id": {
+          "name": "worktree_sweep_request_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "worktree_sweep_requested_at": {
+          "name": "worktree_sweep_requested_at",
+          "type": "timestamp",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "worktree_sweep_status": {
+          "name": "worktree_sweep_status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "worktree_sweep_reported_at": {
+          "name": "worktree_sweep_reported_at",
+          "type": "timestamp",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "worktree_sweep_result": {
+          "name": "worktree_sweep_result",
+          "type": "jsonb",
           "primaryKey": false,
           "notNull": false
         },

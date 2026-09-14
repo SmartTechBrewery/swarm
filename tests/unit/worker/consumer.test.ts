@@ -108,6 +108,7 @@ type StubPhaseResult = {
 	reviewOrdinal?: number;
 	automationOutcome?: string;
 	ciOutcome?: string;
+	absorbed?: Array<{ url: string; reference: string; evidence: string }>;
 };
 
 /**
@@ -5502,6 +5503,45 @@ describe('processJob', () => {
 					reviewAutomationOutcome: 'manual-intervention-required',
 				}),
 			);
+		});
+
+		// The fold-in declaration is recorded and acted on nowhere yet (issue #953),
+		// so the settle is the whole of its durable half.
+		describe('the review’s fold-in declaration (issue #953)', () => {
+			const ABSORBED = [
+				{
+					url: 'https://github.com/SmartTechBrewery/swarm/issues/947',
+					reference: '#947',
+					evidence: 'Its criteria 1-3 are met by this diff.',
+				},
+			];
+
+			it('persists a Review run’s declaration on its own row', async () => {
+				phaseImpl = async () => ({ agent: agentResult(), verdict: 'approve', absorbed: ABSORBED });
+
+				await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
+
+				expect(completeRun).toHaveBeenCalledExactlyOnceWith(
+					'run-1',
+					expect.objectContaining({ status: 'completed', reviewAbsorbed: ABSORBED }),
+				);
+			});
+
+			// Omitted rather than emptied, so `completeRun` leaves the column as it is
+			// for every phase that has no declaration to make.
+			it('leaves the column untouched for a phase that declared none', async () => {
+				const workItem = createMockWorkItem({ statusId: '61e4505c' });
+				phaseImpl = async () => ({ agent: agentResult() });
+
+				await processJob(
+					createMockPmWebhookJob(),
+					registryReturning({ phase: 'implementation', taskId: '100', workItem }),
+				);
+
+				const [, input] = completeRun.mock.calls.at(-1) as [string, Record<string, unknown>];
+				expect(input.status).toBe('completed');
+				expect(input.reviewAbsorbed).toBeUndefined();
+			});
 		});
 
 		describe('durable merge dispatch after an eligible approval (issue #292)', () => {

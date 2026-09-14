@@ -818,6 +818,43 @@ describe('runAssignmentDbFree', () => {
 		expect(sink.sent.at(-1)?.ciOutcome).toBeUndefined();
 	});
 
+	it('reports a Review run’s fold-in declaration so the control plane can record it (issue #953)', async () => {
+		const sink = recordingSink();
+		const absorbed = [
+			{
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/947',
+				reference: '#947',
+				evidence: 'Its criteria 1-3 are met by this diff.',
+			},
+		];
+		const runPhase = vi.fn(async () => ({
+			agent: agentResult(),
+			verdict: 'approve' as const,
+			absorbed,
+		}));
+
+		await runAssignmentDbFree(
+			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'review' })),
+			sink,
+			{ ...RUN_OPTIONS, deps: depsWith(runPhase) },
+		);
+
+		expect(sink.sent.at(-1)).toMatchObject({ status: 'succeeded', absorbed });
+	});
+
+	it('reports no fold-in declaration for the reviews that declare none', async () => {
+		const sink = recordingSink();
+		const runPhase = vi.fn(async () => ({ agent: agentResult(), verdict: 'approve' as const }));
+
+		await runAssignmentDbFree(
+			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'review' })),
+			sink,
+			{ ...RUN_OPTIONS, deps: depsWith(runPhase) },
+		);
+
+		expect(sink.sent.at(-1)?.absorbed).toBeUndefined();
+	});
+
 	it('reports the split children a Planning run auto-advanced, so the control plane self-enqueues each (issue #911)', async () => {
 		const sink = recordingSink();
 		const runPhase = vi.fn(async () => ({

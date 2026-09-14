@@ -401,9 +401,12 @@ describe('review body rendering', () => {
 		// Seed the delivery progress a half-failed submission would have left behind.
 		writeFileSync(join(path, 'review_handoff.json'), JSON.stringify(legacy));
 
-		await runReviewPhase({ ...options, resumeDelivery: true });
+		const result = await runReviewPhase({ ...options, resumeDelivery: true });
 
 		expect(submitReview.mock.calls[0][0].body).toBe('Looks good');
+		// A legacy hand-off has no `absorbed` to report, exactly as it has no
+		// findings — the resume finishes the submission, it does not re-judge (issue #953).
+		expect(result.absorbed).toBeUndefined();
 	});
 
 	it('refuses a resumed legacy hand-off carrying the removed comment verdict', async () => {

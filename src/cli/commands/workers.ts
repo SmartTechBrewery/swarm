@@ -75,14 +75,19 @@
  * `register-and-enroll` (issue #786) is the recommended path for a *new* machine
  * and the third write surface onto that per-`(worker, provider)` store: it
  * composes `register` + `set-scm-credential` + `enroll` and ends with the exact
- * command that starts the daemon. It may prompt where `register` may not,
+ * command that starts the daemon. It also bootstraps the checkout it runs in,
+ * leaving `.env` pointed at the control plane (`_shared/control-plane-env.ts`)
+ * before it needs the URL itself — the last onboarding step that was still prose
+ * rather than a command, and one `swarm init` must not serve, since that scaffolds
+ * a stack `.env` with a `DATABASE_URL` no worker may hold. It may prompt where
+ * `register` may not,
  * precisely because it is handed the target project and therefore *resolves* the
  * provider (`workers.projectScmProvider`) instead of guessing one — the condition
  * #767 recorded as missing at registration time.
  *
  * Subcommands:
  *   swarm workers register <owner-identifier> --name <displayName> --cli <c1,c2,...>
- *   swarm workers register-and-enroll <owner-identifier> <project-id> --name <displayName> --cli <c1,c2,...> [--repo-root <path>]
+ *   swarm workers register-and-enroll <owner-identifier> <project-id> --name <displayName> --cli <c1,c2,...> [--control-plane-url <url>] [--repo-root <path>]
  *   swarm workers list [<owner-identifier>]
  *   swarm workers set-cli <worker-id> (--cli <c1,c2,...> | --auto)
  *   swarm workers set-scm-credential <worker-id> <scm-provider-id>
@@ -107,6 +112,7 @@ import { type AgentCli, AgentCliSchema } from '../../harness/agent-cli.js';
 import { describeError } from '../../lib/errors.js';
 import { operatorCredentialCopyFor } from '../../scm/operator-credential-copy.js';
 import { SCM_TYPES } from '../../scm/types.js';
+import { ensureControlPlaneUrl } from '../_shared/control-plane-env.js';
 import {
 	createOperatorClient,
 	OperatorApiError,
@@ -133,7 +139,7 @@ const USAGE = `swarm workers — register and manage local workers (identity + d
 
 Usage:
   swarm workers register <owner-identifier> --name <displayName> --cli <c1,c2,...>
-  swarm workers register-and-enroll <owner-identifier> <project-id> --name <displayName> --cli <c1,c2,...> [--repo-root <path>]
+  swarm workers register-and-enroll <owner-identifier> <project-id> --name <displayName> --cli <c1,c2,...> [--control-plane-url <url>] [--repo-root <path>]
   swarm workers list [<owner-identifier>]
   swarm workers set-cli <worker-id> (--cli <c1,c2,...> | --auto)
   swarm workers set-scm-credential <worker-id> <scm-provider-id>
@@ -165,9 +171,16 @@ Usage:
              this worker from here with nothing to paste. Registering for
              somebody else is an installation-admin act.
   register-and-enroll
-             The one-command path for a NEW machine: registers the worker,
-             stores its operator source-control credential, and enrolls it in
-             <project-id> — then prints the exact command that starts it. The
+             The one-command path for a NEW machine: points this checkout's .env
+             at the control plane, registers the worker, stores its operator
+             source-control credential, and enrolls it in <project-id> — then
+             prints the exact command that starts it. SWARM_CONTROL_PLANE_URL is
+             taken from .env when it is already there (left untouched, so a
+             second worker on this machine changes nothing), otherwise from
+             --control-plane-url, the environment, or a prompt on a TTY, and
+             written to .env for the daemon to read. Nothing else is scaffolded:
+             a worker holds no DATABASE_URL, which is why \`swarm init\` is the
+             wrong command for this machine. The
              provider is resolved from the target project, so the credential
              prompt names the provider that project actually runs on
              (${SCM_PROVIDER_IDS.join(' | ')}); prompts without echo on a TTY and
@@ -1809,6 +1822,7 @@ async function planRegisterAndEnroll(
 		options: {
 			name: { type: 'string' },
 			cli: { type: 'string' },
+			'control-plane-url': { type: 'string' },
 			'repo-root': { type: 'string' },
 			help: { type: 'boolean', short: 'h' },
 		},
@@ -1829,6 +1843,15 @@ async function planRegisterAndEnroll(
 
 	const capabilities = parseClis(cli);
 	if (!capabilities) return { ok: false, code: 1 };
+
+	// Before `requireOperator`, which reads SWARM_CONTROL_PLANE_URL: on a machine
+	// being onboarded for its first worker nothing has ever written it, and the
+	// daemon this command ends by printing a start line for reads it from the same
+	// `.env`. Idempotent by construction (`../_shared/control-plane-env.ts`), so a
+	// second worker on an onboarded machine passes straight through. It is the one
+	// write that precedes the plan-then-act ordering below, and deliberately: it
+	// touches nothing on the control plane, and every step after it needs the URL.
+	if (!(await ensureControlPlaneUrl(values['control-plane-url']))) return { ok: false, code: 1 };
 
 	const operator = requireOperator();
 	if (!operator) return { ok: false, code: 1 };

@@ -127,6 +127,13 @@ SWARM_WORKER_CREDENTIAL=<from `swarm workers register`>
 SWARM_WORKER_REPO_ROOT=/path/to/this-hosts/checkout  # optional; defaults to cwd
 ```
 
+Only the first line has to be there before onboarding, and it need not be typed:
+`swarm workers register-and-enroll --control-plane-url <url>` writes it into this
+checkout's `.env` when it is absent, and leaves an existing assignment alone — so a
+fresh clone is bootstrapped by the same command that registers the machine. (`swarm
+init` is for the *stack*, not for a worker: it copies `.env.docker.example`,
+`DATABASE_URL` and all, onto a machine that must hold neither that nor `REDIS_URL`.)
+
 **On the machine that registered it, there is a shorter way to start it.** Both
 registration commands also write the freshly issued credential to a per-checkout
 cache in the operator's home directory (`~/.swarm/worker-credentials/<hash>/`,

@@ -29,6 +29,10 @@ const { promptHidden, readStdin } = vi.hoisted(() => ({
 	readStdin: vi.fn(),
 }));
 const { writeWorkerCredentialCache } = vi.hoisted(() => ({ writeWorkerCredentialCache: vi.fn() }));
+// `register-and-enroll` bootstraps the checkout's `.env` before it needs the URL
+// itself. Mocked here so the suite drives that seam rather than the developer's
+// own `.env` — its behaviour is covered by tests/unit/cli/control-plane-env.test.ts.
+const { ensureControlPlaneUrl } = vi.hoisted(() => ({ ensureControlPlaneUrl: vi.fn() }));
 
 vi.mock('@/cli/_shared/operator-client.js', () => ({
 	createOperatorClient,
@@ -37,6 +41,7 @@ vi.mock('@/cli/_shared/operator-client.js', () => ({
 }));
 vi.mock('@/cli/_shared/secret-input.js', () => ({ promptHidden, readStdin }));
 vi.mock('@/cli/_shared/worker-credential-cache.js', () => ({ writeWorkerCredentialCache }));
+vi.mock('@/cli/_shared/control-plane-env.js', () => ({ ensureControlPlaneUrl }));
 
 import { run } from '@/cli/commands/workers.js';
 
@@ -132,6 +137,8 @@ describe('swarm workers', () => {
 				identifier: IDENTIFIER,
 			},
 		});
+
+		ensureControlPlaneUrl.mockReset().mockResolvedValue('https://swarm.example.com');
 
 		// Non-TTY is the shape a test process actually has, so the command reads stdin.
 		promptHidden.mockReset().mockResolvedValue('typed-secret');
@@ -626,6 +633,26 @@ describe('swarm workers', () => {
 			expect(
 				await run(['register-and-enroll', IDENTIFIER, PROJECT_ID, '--name', 'ada-laptop']),
 			).toBe(1);
+			expect(calls).toHaveLength(0);
+			expect(readStdin).not.toHaveBeenCalled();
+		});
+
+		// The `.env` bootstrap: a machine being onboarded for its first worker has
+		// never had SWARM_CONTROL_PLANE_URL written anywhere, and `requireOperator`
+		// reads it — so this runs before the control plane is touched at all.
+		it("points the checkout's .env at the control plane before anything else", async () => {
+			expect(await run([...ARGV, '--control-plane-url', 'https://swarm.example.com'])).toBe(0);
+			expect(ensureControlPlaneUrl).toHaveBeenCalledWith('https://swarm.example.com');
+		});
+
+		it('passes no URL when none was given, leaving an onboarded machine untouched', async () => {
+			expect(await run(ARGV)).toBe(0);
+			expect(ensureControlPlaneUrl).toHaveBeenCalledWith(undefined);
+		});
+
+		it('registers nothing when the checkout cannot be pointed at a control plane', async () => {
+			ensureControlPlaneUrl.mockResolvedValue(undefined);
+			expect(await run(ARGV)).toBe(1);
 			expect(calls).toHaveLength(0);
 			expect(readStdin).not.toHaveBeenCalled();
 		});
