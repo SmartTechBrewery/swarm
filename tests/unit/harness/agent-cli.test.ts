@@ -24,6 +24,12 @@ vi.mock('@/harness/antigravity-capabilities.js', () => ({
 import { type AgentCliResult, describeAgent, runAgentCli } from '@/harness/agent-cli.js';
 import { classifyAgentFailure } from '@/harness/agent-failure.js';
 import { logger } from '@/lib/logger.js';
+import {
+	CODEX_USAGE_LIMIT_LOG_TEXT,
+	CODEX_USAGE_LIMIT_MESSAGE,
+	CODEX_USAGE_LIMIT_TRANSCRIPT,
+	CODEX_USAGE_LIMIT_TURN_FAILED_LINE,
+} from '../../helpers/codex-usage-limit.js';
 import { createMockRunAgentCliOptions } from '../../helpers/factories.js';
 
 class FakeStream extends EventEmitter {
@@ -1281,6 +1287,43 @@ describe('runAgentCli', () => {
 			expect(result.stdout).toBe('I completed useful analysis.');
 			expect(result.rawStdout).toContain('"type":"turn.failed"');
 			expect(classifyAgentFailure(result)).toEqual({ kind: 'capacity' });
+		});
+
+		it('carries the observed Codex usage-limit failure through to a rate-limit verdict', async () => {
+			// The end-to-end reproduction of run e5c74d0d-de8b-4b74-8f15-dafe09a02882
+			// (issue #963): two agent messages, then the quota banner. `stdout` keeps
+			// only the messages, so the banner has to travel structurally.
+			const promise = runAgentCli(createMockRunAgentCliOptions({ cli: 'codex' }));
+			const child = lastChild();
+			child.stdout.emit('data', CODEX_USAGE_LIMIT_TRANSCRIPT);
+			child.emit('close', 1, null);
+
+			const result = await promise;
+			expect(result.stdout).toBe(CODEX_USAGE_LIMIT_LOG_TEXT);
+			expect(result.codexFailure).toEqual({ message: CODEX_USAGE_LIMIT_MESSAGE });
+			expect(classifyAgentFailure(result).kind).toBe('rate-limit');
+		});
+
+		it('still carries the Codex failure record when the run flooded the output cap', async () => {
+			// `codexFailure` is parsed from the retained *tail*, which is the case
+			// `rawStdout`'s latched head would miss — and the reason the new field is
+			// not sourced from `rawStdout`.
+			const promise = runAgentCli(
+				createMockRunAgentCliOptions({ cli: 'codex', maxOutputBytes: 200 }),
+			);
+			const child = lastChild();
+			child.stdout.emit(
+				'data',
+				`{"type":"item.completed","item":{"type":"agent_message","text":"${'x'.repeat(400)}"}}\n`,
+			);
+			child.stdout.emit('data', `${CODEX_USAGE_LIMIT_TURN_FAILED_LINE}\n`);
+			child.emit('close', 1, null);
+
+			const result = await promise;
+			expect(result.outputTruncated).toBe(true);
+			expect(result.rawStdout).not.toContain('turn.failed');
+			expect(result.codexFailure).toEqual({ message: CODEX_USAGE_LIMIT_MESSAGE });
+			expect(classifyAgentFailure(result).kind).toBe('rate-limit');
 		});
 
 		it('leaves usage undefined and keeps plain, non-protocol stdout for Claude', async () => {
