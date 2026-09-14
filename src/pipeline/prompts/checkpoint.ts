@@ -37,7 +37,11 @@
  * paragraph array (resolve-conflicts) unchanged.
  */
 
-import { CHECKPOINT_FILENAME, type Checkpoint } from '@/pipeline/checkpoint.js';
+import {
+	CHECKPOINT_FILENAME,
+	type Checkpoint,
+	GLOB_METACHARACTERS,
+} from '@/pipeline/checkpoint.js';
 import type { TriggerPhase } from '@/triggers/types.js';
 
 /**
@@ -73,6 +77,31 @@ function workingTreeSummary(workingTree: Checkpoint['workingTree']): string {
 }
 
 /**
+ * The one clause that keeps the working-tree paragraph factual when an entry is not
+ * a path (issue #949).
+ *
+ * `validateCheckpointForContinuation` tolerates a `workingTree` written as globs
+ * rather than failing the phase over it, so a continuation can be seeded from a
+ * checkpoint whose entries name a *shape* — and an unhedged "read those files"
+ * then points the session at `src/**` and a trailing filename glob. The entries are
+ * still rendered as recorded: the pattern is what the stopped run actually wrote,
+ * and expanding it to the paths it matched would splice an unbounded file list (199,
+ * in the incident that prompted the tolerance) into what is otherwise a summary. The
+ * session is pointed at `git status` for the real list instead, which is where the
+ * authoritative one lives anyway.
+ *
+ * Hedged rather than asserted, on the same {@link GLOB_METACHARACTERS} test and for
+ * the same reason the guard's own missing-entry message is: a real filename may
+ * legally contain `*` or `?`, so "may be patterns" is the true statement.
+ */
+function patternCaveat(workingTree: Checkpoint['workingTree']): string {
+	const entries = [...workingTree.modified, ...workingTree.added, ...workingTree.deleted];
+	return entries.some((entry) => GLOB_METACHARACTERS.test(entry))
+		? ' Entries containing `*` or `?` may be patterns rather than literal paths, so run `git status --porcelain` for the authoritative list of changed files.'
+		: '';
+}
+
+/**
  * The hand-off block for a Tier 2 continuation: the checkpoint an involuntarily
  * stopped run of *this* phase left in *this* worktree, plus the instruction that
  * gives it force — finish only the recorded remainder.
@@ -80,7 +109,9 @@ function workingTreeSummary(workingTree: Checkpoint['workingTree']): string {
  * Only reached once `validateCheckpointForContinuation`
  * (`src/pipeline/checkpoint.ts`) has confirmed the checkpoint names this phase and
  * matches the tree on disk, so the prompt can state the completed work and the
- * working tree as fact rather than hedging. The continuation runs on a **fresh**
+ * working tree as fact rather than hedging — with the single exception the guard's
+ * glob tolerance creates, which {@link patternCaveat} carries and nothing else
+ * does. The continuation runs on a **fresh**
  * session — possibly a different CLI — so this text is the only context it has;
  * everything the remainder depends on has to be in it.
  *
@@ -99,7 +130,7 @@ export function checkpointContinuationSection(checkpoint: Checkpoint): readonly 
 					`Decisions and caveats already settled — carry them rather than re-deciding: ${inlineList(checkpoint.decisions)}`,
 				]
 			: []),
-		`Changes already in this worktree, as the checkpoint recorded them — ${workingTreeSummary(checkpoint.workingTree)}. Read those files before changing them; they are the earlier run's work, not yours to start over.`,
+		`Changes already in this worktree, as the checkpoint recorded them — ${workingTreeSummary(checkpoint.workingTree)}. Read those files before changing them; they are the earlier run's work, not yours to start over.${patternCaveat(checkpoint.workingTree)}`,
 		"Complete only the remainder. Do not re-explore settled work unless verification requires it — for example a listed step fails, or a completed change is provably wrong or missing. Then finish the phase normally: run the verification the steps above call for, and write this phase's hand-off file exactly as instructed. Keep the checkpoint current as you go, so a further stop can continue from where you get to.",
 	];
 }

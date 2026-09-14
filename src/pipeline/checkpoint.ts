@@ -204,8 +204,12 @@ function normalizePath(path: string): string {
  * already failed (see {@link accountsForRecordedEntry}): `*` and `?` are legal bytes
  * in a filename, so a real `src/a*.ts` the tree still changes is reported by
  * `git status` under that name, matches literally, and never reaches this branch.
+ *
+ * Exported for the continuation prompt (`src/pipeline/prompts/checkpoint.ts`), which
+ * has to hedge the same way over the same entries and must not invent a second,
+ * drifting definition of what looks like a pattern.
  */
-const GLOB_METACHARACTERS = /[*?]/;
+export const GLOB_METACHARACTERS = /[*?]/;
 
 /** Escape every RegExp metacharacter, so a literal glob segment matches itself. */
 function escapeRegExp(value: string): string {
@@ -216,11 +220,18 @@ function escapeRegExp(value: string): string {
  * `pattern` as an anchored RegExp over repository-relative paths, with a glob's own
  * segment semantics: `**` crosses `/`, a single `*`/`?` does not. Tokenised rather
  * than chained-replaced so an escaped literal can never be re-read as a
- * metacharacter, and with no ambiguous nested quantifier — `(?:[^/]+/)*` is
- * terminated by a `/` each iteration, so it cannot backtrack catastrophically.
+ * metacharacter, and runs of `*` collapsed *first* so no two cross-directory tokens
+ * are ever adjacent. That last step is what makes the no-catastrophic-backtracking
+ * claim hold: one `(?:[^/]+/)*` group is terminated by a `/` each iteration and
+ * cannot blow up on its own, but consecutive copies are mutually ambiguous and
+ * degrade polynomially in their number (seven of them measured at 32 ms against a
+ * 20-segment non-match, against 0.5 ms for one). Both collapses are exact
+ * identities — three or more `*` describe the same set as two, and a repeated
+ * cross-directory token the same set as one — so the bound costs no expressiveness.
  */
 function globToRegExp(pattern: string): RegExp {
-	const source = pattern.replace(/\*\*\/|\*\*|\*|\?|[^*?]+/g, (token) => {
+	const collapsed = pattern.replace(/\*{3,}/g, '**').replace(/(?:\*\*\/)+/g, '**/');
+	const source = collapsed.replace(/\*\*\/|\*\*|\*|\?|[^*?]+/g, (token) => {
 		switch (token) {
 			case '**/':
 				return '(?:[^/]+/)*';
@@ -253,6 +264,10 @@ function recordedEntryMatchesPath(entry: string, path: string): boolean {
  * the original file list is not recoverable, so "this entry still describes work in
  * the tree" is the strongest thing the recorded form can assert. A pattern matching
  * nothing is still divergence, which is what keeps the one-sided rule intact.
+ *
+ * Accounted-for is therefore not the whole verdict: because one surviving match
+ * satisfies an entry that stood for hundreds, the caller re-tests a tolerated entry
+ * against the stash ({@link stashedToleratedWork}) before accepting the checkpoint.
  */
 function accountsForRecordedEntry(entry: string, paths: ReadonlySet<string>): boolean {
 	if (paths.has(entry)) return true;
@@ -262,10 +277,21 @@ function accountsForRecordedEntry(entry: string, paths: ReadonlySet<string>): bo
 	return false;
 }
 
-/** A missing entry, saying so when it is a pattern rather than a path (issue #949). */
+/**
+ * A missing entry, saying *how* it was looked for when it carries `*` or `?`
+ * (issue #949).
+ *
+ * Deliberately does not call such an entry a pattern. Literal-first only settles
+ * the path-or-glob question for an entry the tree still changes; for one it does
+ * not, both readings failed and neither is disproved — a checkpoint that recorded
+ * a real file named `docs/what-if-*.md` (the legal filename {@link
+ * GLOB_METACHARACTERS} exists to protect) and whose tree no longer changes it
+ * would otherwise be told its path is a glob. The message states what is actually
+ * known, which is true either way and costs the same line.
+ */
 function describeMissingEntry(entry: string): string {
 	return GLOB_METACHARACTERS.test(entry)
-		? `${entry} (a pattern matching nothing the tree changes)`
+		? `${entry} (no changed path matches it, as a path or as a pattern)`
 		: entry;
 }
 
@@ -360,6 +386,23 @@ function describeStashEntry(
 }
 
 /**
+ * The clause for a repository that has stashes, none of which is this work — said
+ * plainly, so a stale unrelated stash is never presented as "your work is over
+ * here", and never silently truncated: the {@link STASH_INSPECTION_LIMIT} is
+ * disclosed whenever it actually bit.
+ */
+function describeNoMatchingStash(entries: readonly StashEntry[], branch: string): string {
+	const inspected = Math.min(entries.length, STASH_INSPECTION_LIMIT);
+	const capped =
+		entries.length > inspected
+			? ` (paths compared for the newest ${inspected} of ${entries.length} entries)`
+			: '';
+	const count =
+		entries.length === 1 ? '1 git stash entry exists' : `${entries.length} git stash entries exist`;
+	return `${count} in this repository, but none is on branch '${branch}' or holds a path this checkpoint records, so the missing work is not stashed${capped}`;
+}
+
+/**
  * The self-diagnosing half of a divergence (issue #705): say whether the recorded
  * work that is no longer in the tree is sitting in a git stash, and if so how to
  * get it back.
@@ -387,12 +430,17 @@ async function describeUnaccountedWork(
 	cwd: string,
 	branch: string,
 	unaccounted: readonly string[],
+	known?: readonly StashEntry[],
 ): Promise<string> {
-	let entries: StashEntry[];
-	try {
-		entries = await readStashEntries(cwd);
-	} catch (error) {
-		return `Could not check whether that work is in a git stash: ${error instanceof Error ? error.message : String(error)}`;
+	// `known` is the list a caller has already read — {@link stashedToleratedWork}'s
+	// path check — so the refusal it decided on does not pay for a second probe.
+	let entries: readonly StashEntry[] = known ?? [];
+	if (!known) {
+		try {
+			entries = await readStashEntries(cwd);
+		} catch (error) {
+			return `Could not check whether that work is in a git stash: ${error instanceof Error ? error.message : String(error)}`;
+		}
 	}
 
 	if (entries.length === 0)
@@ -409,19 +457,7 @@ async function describeUnaccountedWork(
 			),
 	);
 
-	if (matches.length === 0) {
-		const inspected = Math.min(entries.length, STASH_INSPECTION_LIMIT);
-		// No silent truncation: say so whenever the cap actually bit.
-		const capped =
-			entries.length > inspected
-				? ` (paths compared for the newest ${inspected} of ${entries.length} entries)`
-				: '';
-		const count =
-			entries.length === 1
-				? '1 git stash entry exists'
-				: `${entries.length} git stash entries exist`;
-		return `${count} in this repository, but none is on branch '${branch}' or holds a path this checkpoint records, so the missing work is not stashed${capped}`;
-	}
+	if (matches.length === 0) return describeNoMatchingStash(entries, branch);
 
 	const named = matches
 		.slice(0, STASH_NAMED_LIMIT)
@@ -446,6 +482,39 @@ async function describeUnaccountedWork(
 }
 
 /**
+ * Whether a stash holds work one of the *tolerated* patterns describes — the one
+ * thing {@link accountsForRecordedEntry}'s ≥1-match rule cannot see (issue #949).
+ *
+ * A glob cannot say how many files it stood for, so one surviving match satisfies an
+ * entry that stood for hundreds. An agent that stashed its tracked edits and left a
+ * single untracked file behind — `git stash` without `-u` takes no untracked file —
+ * would otherwise be accepted on a tree that has lost nearly all of the recorded
+ * work, with the #705 diagnosis never running because `missing` was empty. A stash
+ * *holding* paths the pattern also describes is positive evidence the work left the
+ * tree, so it is the only signal consulted here:
+ *
+ * - **Not branch attribution**, which {@link describeUnaccountedWork} matches on as
+ *   well. There it is a report over an already-decided divergence; here it would
+ *   *make* one, and an unrelated stash taken on the task's branch would turn a good
+ *   continuation into a terminal refusal. The blind spot branch attribution covers
+ *   there — a stash holding none of the recorded `added` paths — cannot arise here
+ *   either, because a stash that took no tracked path holds nothing at all.
+ * - **Not an unreadable path list.** Absence of evidence is not evidence, and the
+ *   probe stays fail-soft in the same direction as everything else on this path: a
+ *   git failure must never turn an acceptance into a refusal.
+ */
+function stashedToleratedWork(
+	entries: readonly StashEntry[],
+	tolerated: readonly string[],
+): boolean {
+	return entries.some((entry) =>
+		(entry.paths ?? []).some((path) =>
+			tolerated.some((pattern) => recordedEntryMatchesPath(pattern, normalizePath(path))),
+		),
+	);
+}
+
+/**
  * Decide whether the preserved checkout at `cwd` may be continued from its
  * checkpoint by `phase`. Three things must hold, in this order:
  *
@@ -459,7 +528,11 @@ async function describeUnaccountedWork(
  *    carries a glob metacharacter is matched as a pattern instead (issue #949), so a
  *    checkpoint that compressed a hundreds-of-files change into globs is not read as
  *    work that vanished. A pattern matching *nothing* the tree changes is still
- *    divergence, and the guard logs a `warn` naming any entry the fallback accepted.
+ *    divergence — and so is one that still matches a changed path while a git stash
+ *    holds work it also describes, because a single surviving match cannot tell a
+ *    whole recorded change from what is left of one ({@link stashedToleratedWork}).
+ *    Where the tolerance does carry a checkpoint, the guard logs a `warn` naming the
+ *    entries it accepted.
  *
  * **The divergence rule for (3) is deliberately one-sided.** A recorded path that
  * is *absent* from `git status` is divergence, and so is a clean tree (the schema
@@ -471,9 +544,10 @@ async function describeUnaccountedWork(
  * an honest under-report. Failures (2) and (3) both report
  * `checkpoint-divergent`, whose message names the specific mismatch.
  *
- * **A divergence also says where the missing work went** (issue #705). The two
- * failures that mean "the recorded work is not in the tree" — a clean tree, and
- * recorded paths the tree no longer changes — append
+ * **A divergence also says where the missing work went** (issue #705). The three
+ * failures that mean "the recorded work is not in the tree" — a clean tree,
+ * recorded paths the tree no longer changes, and a tolerated pattern the stash
+ * holds work for — append
  * {@link describeUnaccountedWork}'s diagnosis, which reports whether a git stash
  * holds that work and names the command that restores it. The other failures do
  * not: a parse failure and a wrong-phase checkpoint say nothing about missing
@@ -552,11 +626,24 @@ export async function validateCheckpointForContinuation(
 	const tolerated = recorded.filter(
 		(entry) => !present.has(entry) && GLOB_METACHARACTERS.test(entry),
 	);
-	if (tolerated.length > 0)
+	if (tolerated.length > 0) {
+		let stashed: readonly StashEntry[] = [];
+		try {
+			stashed = await readStashEntries(cwd);
+		} catch {
+			// Fail-soft: an unreadable stash is not evidence the work went anywhere.
+		}
+		if (stashedToleratedWork(stashed, tolerated))
+			return {
+				valid: false,
+				reason: 'checkpoint-divergent',
+				detail: `${CHECKPOINT_FILENAME} records pattern(s) the working tree still matches, but a git stash holds work they also describe: ${tolerated.join(', ')}. ${await describeUnaccountedWork(cwd, branch, tolerated, stashed)}`,
+			};
 		logger.warn(
 			`${CHECKPOINT_FILENAME} describes the working tree with pattern(s) rather than literal paths`,
 			{ cwd, phase, patterns: tolerated },
 		);
+	}
 
 	return { valid: true, checkpoint };
 }

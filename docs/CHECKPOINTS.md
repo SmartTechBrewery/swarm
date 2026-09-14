@@ -207,6 +207,7 @@ a `BlockedRecoveryError`, having released the worktree lease first:
 | The file does not parse against `CheckpointSchema` | `checkpoint-divergent` |
 | It names another phase (a task's checkout is reused across phases) | `checkpoint-divergent` |
 | It records a path `git status --porcelain` no longer reports as changed, or a pattern nothing it reports matches | `checkpoint-divergent` |
+| It records a pattern the tree still matches, but a git stash holds work that pattern also describes | `checkpoint-divergent` |
 
 **The working-tree rule is deliberately one-sided.** A *recorded* path missing from
 `git status` blocks (as does a clean tree — the schema guarantees a checkpoint records at least
@@ -225,13 +226,30 @@ the section above requires. Only an entry that fails that test *and* carries `*`
 compiled to a glob and tried against the changed paths; it is accounted for when at least one of
 them matches (the original file list a glob stood for is not recoverable, so "this entry still
 describes work in the tree" is the strongest claim the recorded form supports). `**` crosses `/`,
-a single `*` or `?` does not. A pattern matching *nothing* is still divergence, and the message
-names it as a pattern rather than calling a glob a path. Literal-first is what gives "looks like a
+a single `*` or `?` does not. A pattern matching *nothing* is still divergence; the message for a
+missing entry carrying `*` or `?` says it matched nothing *as a path or as a pattern*, rather than
+telling an operator their real filename is a glob. Literal-first is what gives "looks like a
 pattern" a definition that cannot misread a real filename: a file genuinely named `src/a*.ts` that
 the tree still changes is reported by `git status` under that exact name, matches literally, and
-never reaches the glob branch. When the fallback does fire, the guard logs a `warn` naming the
-entries, so a continuation that only worked because of the tolerance is visible rather than
-silent. Before this, every glob entry failed the set test outright: a run translating a monorepo
+never reaches the glob branch.
+
+**One match is not proof the recorded work survived, so the stash is consulted before the
+tolerance is allowed to carry a checkpoint.** A glob cannot say how many files it stood for, so a
+single surviving match satisfies an entry that stood for hundreds — an agent that stashed its
+tracked edits and left one untracked file behind (`git stash` without `-u` takes no untracked
+file) would be accepted onto a tree that has lost nearly all of it, with the #705 diagnosis below
+never running. So when the fallback accepts an entry, the guard reads the stash and refuses with
+that diagnosis if any entry *holds* a path the tolerated pattern also describes. Only held paths
+count: unlike the diagnosis itself, branch attribution is not consulted here, because here it
+would *make* the divergence rather than report one, and an unrelated stash on the task's branch
+would turn a good continuation into a terminal refusal. The probe is fail-soft in the same
+direction as the rest of this path — an unreadable stash never costs a continuation. Where no such
+stash exists the entry is accepted as before, and the guard logs a `warn` naming the entries, so a
+continuation that only worked because of the tolerance is visible rather than silent; the
+continuation prompt adds one clause telling the fresh session that entries containing `*` or `?`
+may be patterns and to run `git status --porcelain` for the real file list, rather than asking it
+to read a shape as if it were a filename. Before all this, every glob entry failed the set test
+outright: a run translating a monorepo
 recorded three patterns plus one literal path, timed out, and its continuation was refused
 terminally with "the missing work is not stashed" over 199 intact files, the checkpoint's only
 literal entry being the only one the message did not name (run
@@ -255,12 +273,13 @@ refusal itself:
   separate checkout rather than mutating this one. It rides with the checkpoint block, so it
   reaches exactly the four phases that write a checkpoint (including `resolve-conflicts`, which
   carries no `GH_IDENTITY_GUARD`) and no phase that does not.
-- **The guard diagnoses it.** The two divergences that mean *the recorded work is not in the
-  tree* — a clean tree, and recorded paths the tree no longer changes — append a stash report:
-  which `refs/stash` entries could hold that work, how many of the checkpoint's paths each
-  holds, and the exact `git -C <worktree> stash apply '<ref>'` that restores it. When nothing
+- **The guard diagnoses it.** The three divergences that mean *the recorded work is not in the
+  tree* — a clean tree, recorded paths the tree no longer changes, and a tolerated pattern the
+  stash holds work for (above) — append a stash report: which `refs/stash` entries could hold
+  that work, how many of the checkpoint's paths each holds, and the exact
+  `git -C <worktree> stash apply '<ref>'` that restores it. When nothing
   matches it says so plainly, so a stale unrelated stash is never presented as "your work is
-  over here". The same finding is logged at `warn`. It runs only on those two branches: a parse
+  over here". The same finding is logged at `warn`. It runs only on those branches: a parse
   failure and a wrong-phase checkpoint say nothing about missing work, and an unreadable
   `git status` means git is already broken, so that branch returns before the probe.
 
