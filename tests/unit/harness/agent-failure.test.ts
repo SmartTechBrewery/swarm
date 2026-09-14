@@ -2,6 +2,12 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import type { AgentCliResult } from '@/harness/agent-cli.js';
 import { AgentRunError, agentRunError, classifyAgentFailure } from '@/harness/agent-failure.js';
+import {
+	CODEX_USAGE_LIMIT_ERROR_LINE,
+	CODEX_USAGE_LIMIT_LOG_TEXT,
+	CODEX_USAGE_LIMIT_MESSAGE,
+	CODEX_USAGE_LIMIT_TURN_FAILED_LINE,
+} from '../../helpers/codex-usage-limit.js';
 
 function result(overrides: Partial<AgentCliResult> = {}): AgentCliResult {
 	return {
@@ -127,6 +133,22 @@ describe('classifyAgentFailure', () => {
 			NOW,
 		);
 		expect(failure.kind).toBe('error');
+
+		// Same for Codex, whose structural channel (issue #963) must not loosen the
+		// free-text guard: a review of 429 handling, or a quoted CI log, carries no
+		// `codexFailure` and so stays terminal.
+		expect(
+			classifyAgentFailure(
+				result({
+					cli: 'codex',
+					stdout:
+						'Reviewed the usage-limit retry path.\n' +
+						'CI log: HTTP 429 Too Many Requests from the registry.\n' +
+						'The rate limit handling looks correct.',
+				}),
+				NOW,
+			).kind,
+		).toBe('error');
 	});
 
 	it('classifies a terminal Codex capacity error despite borrowed rate-limit text', () => {
@@ -456,6 +478,102 @@ describe('classifyAgentFailure', () => {
 		).toEqual({ kind: 'aborted' });
 	});
 
+	// Codex's own terminal failure record — a top-level `error` event, or the
+	// `turn.failed` ending a failed turn. Structural like Claude's failed `result`
+	// and agy's non-SUCCESS `status`, so a quota token inside it is trusted with no
+	// "resets …" co-occurrence. Before issue #963 Codex had no such channel and a
+	// live quota hit settled as a terminal `error` with no retry.
+	it.each([
+		['the error event', CODEX_USAGE_LIMIT_ERROR_LINE],
+		['the turn.failed event', CODEX_USAGE_LIMIT_TURN_FAILED_LINE],
+	])('classifies the observed Codex usage limit from %s as rate-limit', (_label, line) => {
+		const failure = classifyAgentFailure(
+			result({
+				cli: 'codex',
+				// What the run actually stored as its log: the agent messages alone.
+				stdout: CODEX_USAGE_LIMIT_LOG_TEXT,
+				rawStdout: line,
+				codexFailure: { message: CODEX_USAGE_LIMIT_MESSAGE },
+			}),
+			NOW,
+		);
+		// Codex names its reset without a timezone, so the hint is kept but cannot
+		// resolve to an instant — the consumer falls back to its default backoff.
+		expect(failure).toEqual({ kind: 'rate-limit', resetHint: '8:44 PM', retryAfter: undefined });
+	});
+
+	it('classifies a Codex usage limit hit before the first agent message identically', () => {
+		// Acceptance criterion 2: with no `agent_message` to normalize, `logText` is
+		// undefined and the harness keeps the raw JSONL as stdout. The verdict must
+		// not depend on whether the agent happened to speak first.
+		const spoke = classifyAgentFailure(
+			result({
+				cli: 'codex',
+				stdout: CODEX_USAGE_LIMIT_LOG_TEXT,
+				codexFailure: { message: CODEX_USAGE_LIMIT_MESSAGE },
+			}),
+			NOW,
+		);
+		const silent = classifyAgentFailure(
+			result({
+				cli: 'codex',
+				stdout: `${CODEX_USAGE_LIMIT_ERROR_LINE}\n${CODEX_USAGE_LIMIT_TURN_FAILED_LINE}`,
+				codexFailure: { message: CODEX_USAGE_LIMIT_MESSAGE },
+			}),
+			NOW,
+		);
+		expect(silent).toEqual(spoke);
+		expect(silent.kind).toBe('rate-limit');
+	});
+
+	it('marks the observed Codex review failure as rate limited in its headline', () => {
+		// The live run settled with this exact message and no marker (issue #963).
+		expect(
+			agentRunError(
+				result({
+					cli: 'codex',
+					stdout: CODEX_USAGE_LIMIT_LOG_TEXT,
+					codexFailure: { message: CODEX_USAGE_LIMIT_MESSAGE },
+				}),
+				'Review agent (codex) exited with code 1',
+				' for PR #962',
+				NOW,
+			).message,
+		).toBe('Review agent (codex) exited with code 1 (rate limited) for PR #962');
+	});
+
+	it('keeps a Codex capacity failure a capacity failure, not a rate limit', () => {
+		// Issue #142's split survives: the same parser now populates `codexFailure`
+		// for a capacity error too, and the capacity branch must still win.
+		const failure = classifyAgentFailure(
+			result({
+				cli: 'codex',
+				stdout: CAPACITY_TRANSCRIPT,
+				codexFailure: { message: 'Selected model is at capacity. Please try a different model.' },
+			}),
+			NOW,
+		);
+		expect(failure).toEqual({ kind: 'capacity' });
+	});
+
+	it('leaves an ordinary structural Codex failure a plain error', () => {
+		const failure = classifyAgentFailure(
+			result({ cli: 'codex', codexFailure: { message: 'Connection closed unexpectedly.' } }),
+			NOW,
+		);
+		expect(failure).toEqual({ kind: 'error' });
+	});
+
+	it('keeps timeout and abort ahead of a structural Codex rate limit', () => {
+		const codexFailure = { message: CODEX_USAGE_LIMIT_MESSAGE };
+		expect(
+			classifyAgentFailure(result({ cli: 'codex', codexFailure, timedOut: true }), NOW),
+		).toEqual({ kind: 'timeout' });
+		expect(
+			classifyAgentFailure(result({ cli: 'codex', codexFailure, aborted: true }), NOW),
+		).toEqual({ kind: 'aborted' });
+	});
+
 	it('does not let one CLI structural failure fire on another CLI', () => {
 		// Each structural matcher is gated on its own `cli`, so a claude run can't
 		// be classified by an antigravity field and vice versa.
@@ -475,6 +593,16 @@ describe('classifyAgentFailure', () => {
 					cli: 'antigravity',
 					stdout: 'something went wrong',
 					claudeFailure: { subtype: 'error', message: 'API Error: 429 rate_limit_error' },
+				}),
+				NOW,
+			).kind,
+		).toBe('error');
+		expect(
+			classifyAgentFailure(
+				result({
+					cli: 'claude',
+					stdout: 'something went wrong',
+					codexFailure: { message: CODEX_USAGE_LIMIT_MESSAGE },
 				}),
 				NOW,
 			).kind,

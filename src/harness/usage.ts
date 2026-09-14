@@ -76,13 +76,37 @@ function codexThreadId(event: Record<string, unknown>): string | undefined {
 		: undefined;
 }
 
+/**
+ * The failure message a Codex terminal failure record carries, or `undefined`
+ * for any other event. `codex exec --json` reports an exhausted account quota
+ * (and any other turn-ending failure) as a top-level
+ * `{"type":"error","message":"…"}` followed by
+ * `{"type":"turn.failed","error":{"message":"…"}}` — both shapes captured live
+ * from run `e5c74d0d-de8b-4b74-8f15-dafe09a02882`
+ * (`tests/fixtures/agent-failure/codex-usage-limit-transcript.txt`). Neither
+ * survives into `logText`, which keeps only `agent_message` items, so failure
+ * classification ({@link ./agent-failure.ts}) needs them carried separately.
+ */
+function codexFailureMessage(event: Record<string, unknown>): string | undefined {
+	if (event.type === 'error') {
+		return typeof event.message === 'string' ? event.message : undefined;
+	}
+	if (event.type !== 'turn.failed') return undefined;
+	const error = event.error;
+	const message =
+		error && typeof error === 'object' ? (error as Record<string, unknown>).message : undefined;
+	return typeof message === 'string' ? message : undefined;
+}
+
 function collectCodexEvents(stdout: string): {
 	rawUsage?: z.infer<typeof CodexUsageSchema>;
 	messages: string[];
 	sessionId?: string;
+	failureMessage?: string;
 } {
 	let rawUsage: z.infer<typeof CodexUsageSchema> | undefined;
 	let sessionId: string | undefined;
+	let failureMessage: string | undefined;
 	const messages: string[] = [];
 	for (const line of stdout.split('\n')) {
 		const event = parseJsonLine(line);
@@ -92,10 +116,14 @@ function collectCodexEvents(stdout: string): {
 			const parsedUsage = CodexUsageSchema.safeParse(event.usage);
 			if (parsedUsage.success) rawUsage = parsedUsage.data;
 		}
+		// Last non-empty wins, like `rawUsage`: the observed run emits `error` and
+		// then `turn.failed` carrying the same text, and a run emitting only one of
+		// the two still reports it.
+		failureMessage = codexFailureMessage(event) ?? failureMessage;
 		const message = codexAgentMessage(event);
 		if (message !== undefined) messages.push(message);
 	}
-	return { rawUsage, messages, sessionId };
+	return { rawUsage, messages, sessionId, failureMessage };
 }
 
 export interface ParsedAgentOutput {
@@ -135,6 +163,18 @@ export interface ParsedAgentOutput {
 	 */
 	antigravityFailure?: {
 		status?: string;
+		message?: string;
+	};
+	/**
+	 * For Codex: the same signal from its own terminal failure record — a
+	 * top-level `error` event, or the `turn.failed` that ends a failed turn
+	 * ({@link codexFailureMessage}). A third field rather than a merge with its
+	 * two siblings for the same reason they are separate: the three CLIs'
+	 * failure vocabularies differ (a `subtype`, a `status`, and here a bare
+	 * message) and classification trusts different tokens in each. Codex has no
+	 * `subtype`/`status` analogue, so this carries a message alone.
+	 */
+	codexFailure?: {
 		message?: string;
 	};
 }
@@ -234,11 +274,12 @@ function parseAntigravityOutput(stdout: string): ParsedAgentOutput {
 
 /** Parse the JSONL event stream emitted by `codex exec --json`. */
 function parseCodexOutput(stdout: string): ParsedAgentOutput {
-	const { rawUsage, messages, sessionId } = collectCodexEvents(stdout);
+	const { rawUsage, messages, sessionId, failureMessage } = collectCodexEvents(stdout);
 	const logText = messages.length > 0 ? messages.join('\n') : undefined;
 	const base = {
 		...(logText === undefined ? {} : { logText }),
 		...(sessionId === undefined ? {} : { sessionId }),
+		...(failureMessage === undefined ? {} : { codexFailure: { message: failureMessage } }),
 	};
 	if (!rawUsage) return base;
 

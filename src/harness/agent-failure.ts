@@ -40,8 +40,10 @@ export type AgentFailureKind =
 export interface AgentFailure {
 	kind: AgentFailureKind;
 	/**
-	 * The CLI's verbatim "resets …" text (e.g. `1:40pm (Europe/Warsaw)`), kept
-	 * for logs/PR comments even when {@link retryAfter} can't be resolved.
+	 * The CLI's verbatim reset text, in whichever phrasing it used — `resets …`
+	 * for most (e.g. `1:40pm (Europe/Warsaw)`), `try again at …` for Codex (e.g.
+	 * `8:44 PM`) — kept for logs/PR comments even when {@link retryAfter} can't be
+	 * resolved, which for a zone-less hint like Codex's is always.
 	 */
 	resetHint?: string;
 	/**
@@ -114,6 +116,12 @@ const LIMIT_BANNER_RE = /(?:you've|you have)\s+hit\s+your\s+(?:session|usage|rat
 const USAGE_LIMIT_RE = /\b(?:session|usage|rate)[\s-]?limit\b/i;
 const RATE_HTTP_RE = /\b(?:429|too many requests)\b/i;
 const RESET_RE = /resets?\s+([^\n]+)/i;
+// Codex names its reset in its own phrasing — `try again at 8:44 PM`, not
+// "resets …" — so RESET_RE never sees it. Read only out of Codex's structural
+// failure record (below), never out of free text, and captured even though the
+// observed wording carries no timezone for parseRetryAfter to resolve: the hint
+// still reaches logs and PR comments, and resolves the day Codex names a zone.
+const CODEX_RESET_RE = /try\s+again\s+at\s+([^\n]+)/i;
 // Codex reports selected-model saturation separately from account quota.
 const CODEX_CAPACITY_RE = /selected model is at capacity/i;
 // Claude / Claude Code surface Anthropic's transient 529 overload — a documented
@@ -179,6 +187,13 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
  * Codex emits newline-delimited JSON events. Unlike a human-readable capacity
  * banner, these records remain trustworthy even when later stream messages
  * push them out of the terminal-output window.
+ *
+ * This decodes the same `error` / `turn.failed` events `codexFailureMessage`
+ * ({@link ./usage.ts}) does, deliberately: the two read different **windows**.
+ * This scans {@link AgentCliResult.rawStdout} — the latched *head* — while
+ * `codexFailure` is parsed from the same captured text usage is, which on a
+ * truncated run is the rolling *tail*. Collapsing them would silently move
+ * issue #142's capacity detection to a different input.
  */
 function hasCodexCapacityEvent(output: string): boolean {
 	return output.split('\n').some((line) => {
@@ -232,6 +247,40 @@ function zonedWallTimeToUtc(
 ): Date {
 	const naiveUtc = Date.UTC(year, month1 - 1, day, hour24, minute, 0);
 	return new Date(naiveUtc - tzOffsetMs(new Date(naiveUtc), timeZone));
+}
+
+/**
+ * The quota message in Codex's own terminal failure record — a top-level `error`
+ * event, or the `turn.failed` that ends a failed turn ({@link ./usage.ts}) — or
+ * `undefined` when this run has no such record or it names no limit.
+ *
+ * Like Claude's failed `result` and agy's non-`SUCCESS` `status`, that record
+ * exists only because the CLI itself reported the run as failed, so a quota
+ * signal inside it is trusted without the "resets …" co-occurrence free text
+ * needs; the same {@link USAGE_LIMIT_RE}/{@link RATE_HTTP_RE} tokens are safe
+ * here because the structure is the gate. Confirmed live on run
+ * e5c74d0d-de8b-4b74-8f15-dafe09a02882: "You've hit your usage limit. … try
+ * again at 8:44 PM." Before issue #963 Codex had no such channel, so whether a
+ * quota hit was recognised at all depended on whether the agent happened to
+ * speak first — its `error` events never reach the terminal tail, which for
+ * Codex reads the normalized `logText` rather than the raw stream.
+ *
+ * Returns the message rather than a boolean so the caller can lift Codex's own
+ * reset hint out of the same text it just trusted.
+ */
+function codexRateLimitMessage(result: AgentCliResult): string | undefined {
+	if (result.cli !== 'codex') return undefined;
+	const message = result.codexFailure?.message;
+	if (message === undefined) return undefined;
+	return USAGE_LIMIT_RE.test(message) || RATE_HTTP_RE.test(message) ? message : undefined;
+}
+
+/**
+ * Codex's own reset phrasing, trimmed of the sentence's trailing period. Read
+ * only from its structural failure record, never from free text.
+ */
+function codexResetHint(message: string): string | undefined {
+	return CODEX_RESET_RE.exec(message)?.[1]?.trim().replace(/\.$/, '') || undefined;
 }
 
 /**
@@ -298,8 +347,9 @@ function parseRetryAfter(hint: string, now: Date): Date | undefined {
  * output, or its terminal `selected model is at capacity` banner; and Claude's
  * terminal `529 Overloaded` / `overloaded_error` banner. A recognisable terminal
  * limit banner is then a `rate-limit` — as is a quota signal reported by a CLI's
- * own structural terminal failure record (Claude's failed `result` event, or
- * Antigravity's non-`SUCCESS` `status`), which needs no reset hint to be trusted.
+ * own structural terminal failure record (Claude's failed `result` event,
+ * Antigravity's non-`SUCCESS` `status`, or Codex's `error`/`turn.failed`
+ * record), which needs no reset hint to be trusted.
  * Then a CLI's own "not authenticated" banner is `auth` — recognised for its
  * message, not to retry, and checked before the trailing stall marker so an
  * unauthenticated run cannot be deferred and resumed onto a login only a human
@@ -331,15 +381,23 @@ export function classifyAgentFailure(result: AgentCliResult, now: Date = new Dat
 		result.antigravityFailure !== undefined &&
 		(ANTIGRAVITY_RATE_LIMIT_ERROR_RE.test(result.antigravityFailure.status ?? '') ||
 			ANTIGRAVITY_RATE_LIMIT_ERROR_RE.test(result.antigravityFailure.message ?? ''));
+	const codexLimitMessage = codexRateLimitMessage(result);
 	const resetMatch = RESET_RE.exec(tail);
 	const isRateLimited =
 		LIMIT_BANNER_RE.test(tail) ||
 		hasClaudeRateLimit ||
 		hasAntigravityRateLimit ||
+		codexLimitMessage !== undefined ||
 		((USAGE_LIMIT_RE.test(tail) || RATE_HTTP_RE.test(tail)) && resetMatch !== null);
 
 	if (isRateLimited) {
-		const resetHint = resetMatch?.[1]?.trim() || undefined;
+		// The shared "resets …" match still wins for every other CLI; Codex's own
+		// `try again at …` phrasing is the fallback, and resolves to an instant only
+		// when it names a zone — a missing one leaves `retryAfter` undefined and the
+		// consumer on its default backoff, never a downgraded classification.
+		const resetHint =
+			resetMatch?.[1]?.trim() ||
+			(codexLimitMessage ? codexResetHint(codexLimitMessage) : undefined);
 		return {
 			kind: 'rate-limit',
 			resetHint,

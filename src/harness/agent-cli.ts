@@ -352,6 +352,19 @@ export interface AgentCliResult {
 		status?: string;
 		message?: string;
 	};
+	/**
+	 * For Codex: its own terminal failure record — a top-level `error` event, or
+	 * the `turn.failed` that ends a failed turn ({@link ./usage.ts}). Kept
+	 * because Codex's `stdout` here is the normalized `logText`, which holds only
+	 * `agent_message` items: without this field, whether a quota failure reached
+	 * the classifier depended on whether the agent happened to speak first
+	 * (issue #963). Sourced from the same `captured` text usage is, so a
+	 * truncated run's retained *tail* still carries the terminal event that
+	 * {@link rawStdout}'s latched head would have lost.
+	 */
+	codexFailure?: {
+		message?: string;
+	};
 }
 
 /**
@@ -792,6 +805,7 @@ export async function runAgentCli(options: RunAgentCliOptions): Promise<AgentCli
 				...(cli === 'antigravity' && parsed.antigravityFailure
 					? { antigravityFailure: parsed.antigravityFailure }
 					: {}),
+				...(cli === 'codex' && parsed.codexFailure ? { codexFailure: parsed.codexFailure } : {}),
 			};
 			logger.debug('agent run finished', {
 				...options.logContext,

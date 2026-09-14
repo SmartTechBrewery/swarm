@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { parseAgentOutput, sessionIdFromLine } from '@/harness/usage.js';
+import {
+	CODEX_USAGE_LIMIT_ERROR_LINE,
+	CODEX_USAGE_LIMIT_LOG_TEXT,
+	CODEX_USAGE_LIMIT_MESSAGE,
+	CODEX_USAGE_LIMIT_TRANSCRIPT,
+	CODEX_USAGE_LIMIT_TURN_FAILED_LINE,
+} from '../../helpers/codex-usage-limit.js';
 
 /** One `claude -p --output-format stream-json` transcript. */
 const claudeStream = (...events: unknown[]): string =>
@@ -213,6 +220,49 @@ describe('parseAgentOutput', () => {
 				usage: { inputTokens: 3, outputTokens: 4 },
 				logText: 'first\nsecond',
 			});
+		});
+
+		// Codex's terminal failure record is dropped from `logText` (only
+		// `agent_message` items survive), so it is carried separately for failure
+		// classification — issue #963, where a quota hit read as a terminal error.
+		it('reports a top-level error event as codexFailure', () => {
+			expect(parseAgentOutput('codex', CODEX_USAGE_LIMIT_ERROR_LINE).codexFailure).toEqual({
+				message: CODEX_USAGE_LIMIT_MESSAGE,
+			});
+		});
+
+		it('reports a turn.failed event as codexFailure on its own', () => {
+			expect(parseAgentOutput('codex', CODEX_USAGE_LIMIT_TURN_FAILED_LINE).codexFailure).toEqual({
+				message: CODEX_USAGE_LIMIT_MESSAGE,
+			});
+		});
+
+		it('keeps the captured quota failure while logText stays the agent messages', () => {
+			// The regression pin: the observed run's banner must survive the same
+			// parse that discards it from the log.
+			expect(parseAgentOutput('codex', CODEX_USAGE_LIMIT_TRANSCRIPT)).toEqual({
+				logText: CODEX_USAGE_LIMIT_LOG_TEXT,
+				codexFailure: { message: CODEX_USAGE_LIMIT_MESSAGE },
+			});
+		});
+
+		it('leaves codexFailure undefined for a clean run', () => {
+			const stdout = [
+				'{"type":"item.completed","item":{"type":"agent_message","text":"pong"}}',
+				'{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2}}',
+			].join('\n');
+			expect(parseAgentOutput('codex', stdout).codexFailure).toBeUndefined();
+		});
+
+		it.each([
+			'{"type":"turn.failed"}',
+			'{"type":"turn.failed","error":null}',
+			'{"type":"turn.failed","error":"boom"}',
+			'{"type":"turn.failed","error":{"message":42}}',
+			'{"type":"error"}',
+			'{"type":"error","message":{"detail":"boom"}}',
+		])('leaves codexFailure undefined for the malformed record %s', (line) => {
+			expect(parseAgentOutput('codex', line).codexFailure).toBeUndefined();
 		});
 	});
 
