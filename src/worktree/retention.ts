@@ -1,10 +1,10 @@
-import { realpathSync, statSync } from 'node:fs';
-import { basename, resolve, sep } from 'node:path';
+import { statSync } from 'node:fs';
 import type { ProjectConfig } from '../config/schema.js';
 import { PROJECT_DEFAULTS } from '../config/schema.js';
 import { logger } from '../lib/logger.js';
 import { GitWorktreeManager } from '../worker/git-worktree-manager.js';
 import { createHostLocalWorktreeRuntime, sweepStaleHostLocalState } from './host-local-runtime.js';
+import { canonicalizeWorktreePath, matchTaskWorktrees } from './task-worktrees.js';
 import type { WorktreeRuntime } from './worktree-runtime.js';
 
 /**
@@ -35,7 +35,7 @@ export function retentionWorktreeRuntime(project: ProjectConfig): WorktreeRuntim
 		// derives the same `.swarm-state` path the worker itself writes to
 		// (`../transport/assignment-execution.ts`, issue #551 F5) — `resolve()` alone
 		// normalizes relative segments and trailing separators, not symlinks.
-		repoRoot: canonicalize(project.repoRoot),
+		repoRoot: canonicalizeWorktreePath(project.repoRoot),
 		worktreeRoot: project.worktreeRoot,
 		ownerId: `worktree-retention-sweep:${process.pid}`,
 		isOwnerLive: () => true,
@@ -65,53 +65,36 @@ export interface PruneStaleWorktreesResult {
 	sweptState: string[];
 }
 
-const TASK_DIR_PATTERN = /^task-(.+)$/;
-
 interface MatchedEntry {
 	path: string;
 	taskId: string;
 	mtimeMs: number;
 }
 
-function canonicalize(p: string): string {
-	try {
-		return realpathSync(p);
-	} catch {
-		return resolve(p);
-	}
-}
-
+/**
+ * Rank the project's `task-<id>` checkouts by how recently their directory was
+ * touched. The candidate set itself comes from `matchTaskWorktrees` (issue #951),
+ * shared with the abandoned sweep; the directory mtime is this sweep's own —
+ * `maxWorktrees` is a *rank*, not an age, so the cheapest signal is enough and an
+ * unstattable path is ignored rather than ranked.
+ */
 function getMatchedEntries(
 	paths: string[],
-	normalizedRoot: string,
+	repoRoot: string,
+	worktreeRoot: string,
 	ignored: string[],
 ): MatchedEntry[] {
+	const scan = matchTaskWorktrees(paths, repoRoot, worktreeRoot);
+	ignored.push(...scan.ignored);
+
 	const matchedEntries: MatchedEntry[] = [];
-	for (const p of paths) {
-		const canonicalPath = canonicalize(p);
-		if (!canonicalPath.startsWith(normalizedRoot)) {
-			ignored.push(p);
-			continue;
-		}
-
-		const baseName = basename(canonicalPath);
-		const match = baseName.match(TASK_DIR_PATTERN);
-		if (!match) {
-			ignored.push(p);
-			continue;
-		}
-
-		const taskId = match[1];
+	for (const { path, canonicalPath, taskId } of scan.matched) {
 		try {
 			const stat = statSync(canonicalPath);
-			matchedEntries.push({
-				path: p,
-				taskId,
-				mtimeMs: stat.mtimeMs,
-			});
+			matchedEntries.push({ path, taskId, mtimeMs: stat.mtimeMs });
 		} catch (err) {
-			logger.warn('Failed to stat worktree path, ignoring', { path: p, error: String(err) });
-			ignored.push(p);
+			logger.warn('Failed to stat worktree path, ignoring', { path, error: String(err) });
+			ignored.push(path);
 		}
 	}
 	return matchedEntries;
@@ -168,7 +151,7 @@ export async function pruneStaleWorktrees(
 	// and so the artifacts of a task nothing dispatches again get swept at all, which
 	// no per-task reaper can do (issue #721).
 	const sweptState = sweepStaleHostLocalState({
-		repoRoot: canonicalize(project.repoRoot),
+		repoRoot: canonicalizeWorktreePath(project.repoRoot),
 		worktreeRoot: project.worktreeRoot,
 		dryRun: options.dryRun,
 	});
@@ -183,12 +166,7 @@ export async function pruneStaleWorktrees(
 	const skippedDeferred: string[] = [];
 	const ignored: string[] = [];
 
-	const worktreeRootCanonical = canonicalize(resolve(project.repoRoot, project.worktreeRoot));
-	const normalizedRoot = worktreeRootCanonical.endsWith(sep)
-		? worktreeRootCanonical
-		: worktreeRootCanonical + sep;
-
-	const matchedEntries = getMatchedEntries(paths, normalizedRoot, ignored);
+	const matchedEntries = getMatchedEntries(paths, project.repoRoot, project.worktreeRoot, ignored);
 
 	// Sort matched entries by mtimeMs descending (most recently touched first)
 	matchedEntries.sort((a, b) => b.mtimeMs - a.mtimeMs);
