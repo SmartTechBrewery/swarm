@@ -358,6 +358,66 @@ describe('ReviewHandoffSchema', () => {
 		});
 	});
 
+	/**
+	 * The fold-in declaration (issue #953). It is the one hand-off slot whose
+	 * failure mode is settling work that is still live, so what is pinned here is
+	 * that empty is the default, that an incomplete entry cannot get through, and
+	 * that a verdict never suppresses one.
+	 */
+	describe('absorbed', () => {
+		const ABSORBED = {
+			url: 'https://github.com/SmartTechBrewery/swarm/issues/947',
+			reference: '#947',
+			evidence: 'Its criteria 1-3 are met by `src/pipeline/review-body.ts`.',
+		};
+
+		// The default is what keeps every hand-off an existing agent writes valid.
+		it('defaults to empty when the key is absent', () => {
+			const result = parse({});
+			expect(result.success).toBe(true);
+			if (!result.success) return;
+			expect(result.data.absorbed).toEqual([]);
+		});
+
+		it('reads a single entry written bare as a one-element list', () => {
+			const result = parse({ absorbed: ABSORBED });
+			expect(result.success).toBe(true);
+			if (!result.success) return;
+			expect(result.data.absorbed).toEqual([ABSORBED]);
+		});
+
+		it.each(['url', 'reference', 'evidence'] as const)('rejects an entry missing %s', (field) => {
+			const { [field]: _omitted, ...rest } = ABSORBED;
+			expect(parse({ absorbed: [rest] }).success).toBe(false);
+			expect(parse({ absorbed: [{ ...ABSORBED, [field]: '' }] }).success).toBe(false);
+		});
+
+		// Two entries for one card would have whatever acts on the declaration
+		// settle it twice.
+		it('rejects two entries naming the same card', () => {
+			const result = parse({
+				absorbed: [ABSORBED, { ...ABSORBED, evidence: 'Restated.' }],
+			});
+			expect(result.success).toBe(false);
+			expect(result.error?.issues[0].path).toEqual(['absorbed', 1, 'url']);
+			expect(errorFor(result)).toContain('duplicate absorbed task #947');
+		});
+
+		// Deliberate, not an oversight: a re-review is scoped to the previously
+		// requested changes, so a fold-in noticed on a `request-changes` pass would
+		// never be restated and would simply be lost.
+		it('is allowed on a request-changes verdict', () => {
+			const result = parse({
+				verdict: 'request-changes',
+				findings: [finding()],
+				absorbed: [ABSORBED],
+			});
+			expect(result.success).toBe(true);
+			if (!result.success) return;
+			expect(result.data.absorbed).toEqual([ABSORBED]);
+		});
+	});
+
 	it('accepts a failing verification command as evidence', () => {
 		const result = parse({
 			verdict: 'request-changes',

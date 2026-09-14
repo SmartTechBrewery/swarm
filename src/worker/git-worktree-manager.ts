@@ -24,7 +24,9 @@ import { SCRATCH_PATHSPECS } from '../scm/delivery.js';
 import { normalizeRepoSlug, resolveOriginRepoSlug } from '../scm/repo-slug.js';
 import {
 	BlockedRecoveryError,
+	evaluateWorktreeLiveness,
 	evaluateWorktreeReclaim,
+	type LivenessDecision,
 	type ReclaimDecision,
 } from '../worktree/reclaim.js';
 import { storeBackedWorktreeRuntime, type WorktreeRuntime } from '../worktree/worktree-runtime.js';
@@ -219,6 +221,22 @@ export class GitWorktreeManager {
 		isResumablePinned = this.runtime.isResumablePinned,
 	): Promise<ReclaimDecision> {
 		return evaluateWorktreeReclaim(this, this.project.id, taskId, {
+			isLeased: this.runtime.isLeased,
+			isResumablePinned,
+		});
+	}
+
+	/**
+	 * Just the "is anything using this right now" half of {@link evaluateReclaim} —
+	 * the gate the age-based abandoned sweep applies (`../worktree/abandoned.ts`,
+	 * issue #951), which records the dirty/unpushed state it destroys rather than
+	 * being stopped by it.
+	 */
+	async evaluateLiveness(
+		taskId: string,
+		isResumablePinned = this.runtime.isResumablePinned,
+	): Promise<LivenessDecision> {
+		return evaluateWorktreeLiveness(this.project.id, taskId, {
 			isLeased: this.runtime.isLeased,
 			isResumablePinned,
 		});

@@ -1,6 +1,6 @@
 import { useMutation } from '@tanstack/react-query';
 import { CheckCircle2, Loader2 } from 'lucide-react';
-import { useState } from 'react';
+import { Fragment, useState } from 'react';
 import { Badge, type BadgeTone } from '@/components/ui/badge.js';
 import { Modal, ModalFooter } from '@/components/ui/modal.js';
 import { ToggleSwitch } from '@/components/ui/toggle-switch.js';
@@ -141,7 +141,7 @@ interface WorkerEnrollmentCardProps {
 	supportedPhases: string[];
 	/**
 	 * The repository the machine's checkout is (issue #687), or `null` when it
-	 * declared none — read against this enrollment's `projectRepo` to state the
+	 * declared none — read against this enrollment's `projectRepos` to state the
 	 * mismatch that refused or suspended it (issue #690).
 	 */
 	declaredRepository: string | null;
@@ -182,10 +182,16 @@ function consentSwitchText(
 }
 
 /**
- * Why this enrollment was refused or suspended: the machine's checkout is not this
- * project's repository (issue #690). Stated as the two repositories themselves —
- * derived from the live facts on every render rather than from a sentence stored
- * when the mismatch was detected, so it cannot go stale if either side changes.
+ * Why this enrollment was refused or suspended: the machine's checkout is not one
+ * of this project's repositories (issue #690, widened by #946). Stated as the
+ * repositories themselves — derived from the live facts on every render rather than
+ * from a sentence stored when the mismatch was detected, so it cannot go stale if
+ * either side changes.
+ *
+ * A multi-repository project names **every** repository it owns, not just its
+ * default entry: the project may legitimately hold one worker per repository, so
+ * the operator's question is which of several this machine should have been checked
+ * out from. A single-repository project reads exactly as it always has.
  *
  * Rendered whatever the enrollment's status is. A mismatch normally *is* a
  * suspension (the handshake's policing pass suspends one it finds), but an active
@@ -194,16 +200,25 @@ function consentSwitchText(
  */
 function RepositoryMismatch({
 	declaredRepository,
-	projectRepository,
+	projectRepositories,
 }: {
 	declaredRepository: string;
-	projectRepository: string;
+	projectRepositories: string[];
 }) {
+	const several = projectRepositories.length > 1;
 	return (
 		<p className="p-3 bg-amber-950/20 border border-amber-900/30 text-xs text-amber-200 rounded leading-relaxed">
 			This machine's checkout is <span className="font-mono">{declaredRepository}</span>, but this
-			project is <span className="font-mono">{projectRepository}</span>. Work for this project
-			cannot run here — enroll a machine checked out from that repository, or point this one at it.
+			project is{' '}
+			{projectRepositories.map((repo, index) => (
+				<Fragment key={repo}>
+					{index > 0 ? ', ' : null}
+					<span className="font-mono">{repo}</span>
+				</Fragment>
+			))}
+			. Work for this project cannot run here — enroll a machine checked out from{' '}
+			{several ? 'one of those repositories' : 'that repository'}, or point this one at{' '}
+			{several ? 'one of them' : 'it'}.
 		</p>
 	);
 }
@@ -378,7 +393,7 @@ export function WorkerEnrollmentCard({
 	});
 
 	const blockers = routabilityBlockers(enrollment);
-	const mismatch = repositoryMismatch(declaredRepository, enrollment.projectRepo);
+	const mismatch = repositoryMismatch(declaredRepository, enrollment.projectRepos);
 	// A confirmation dialog shows its own action's error; the inline feedback for
 	// that control stays quiet meanwhile so the message isn't stated twice.
 	const confirmOpen = confirm !== null;

@@ -209,16 +209,21 @@ Notes:
   consenting half immediately and the pending approval is the only thing left
   (issue #901). Use the composable path above when you want the two approvals
   kept as separate human decisions.
-- **Enroll the machine in a project for the repository its checkout actually is.**
-  Step 4 is refused (naming both repositories) when the worker has already declared
-  a checkout of a different one — a worker holds a single checkout, so work for any
-  other repository would only be refused when it got there (issue #690). A worker
-  that has not connected yet has declared nothing and is enrolled as before; if its
-  first handshake then contradicts this enrollment, the control plane **suspends**
-  it, and `/workers/<id>` says which two repositories disagree. Fixing the pairing
-  is an operator action — point the machine at the right checkout, or enroll it in
-  the right project — and re-activating a suspended enrollment stays the project
-  administrator's call (`swarm workers approve`).
+- **Enroll the machine in a project that owns the repository its checkout actually
+  is.** Step 4 is refused (naming the machine's checkout and every repository the
+  project owns) when the worker has already declared a checkout of a repository the
+  project declares nowhere — a worker holds a single checkout, so work for any other
+  repository would only be refused when it got there (issue #690). A project owning
+  several repositories accepts a worker for **any** of them (issue #946), so one
+  project can hold one worker per repository. A worker that has not connected yet has
+  declared nothing and is enrolled as before; if its first handshake then contradicts
+  this enrollment, the control plane **suspends** it, and `/workers/<id>` says which
+  repositories disagree — the machine's checkout on one side, every repository the
+  project declares on the other, so a multi-repository project shows no banner for a
+  worker correctly enrolled on any of them. Fixing the pairing is an operator action —
+  point the machine at the right checkout, or enroll it in the right project — and
+  re-activating a suspended enrollment stays the project administrator's call
+  (`swarm workers approve`).
 - **Step 5 is what the machine actually runs as** (issue #765). One credential per
   `(worker, SCM provider)`, stored encrypted server-side and resolved at dispatch —
   so a worker enrolled in projects on two providers needs one command per provider
@@ -365,10 +370,13 @@ remote and declared at handshake (issue #687) — the control plane learns which
 repository the machine holds no other way, since `repoRoot` is host-local. It prints
 `null` when the checkout has no identifiable `origin` (a local-only clone); that is
 not an error, the daemon simply declares nothing. Once it *is* declared, the
-handshake also **suspends any enrollment of this worker in a project for another
-repository** (issue #690) — the pairing was impossible, and the Workers screen now
-says so instead of leaving it to be inferred from refused assignments. A daemon that
-declares nothing suspends nothing.
+handshake also **suspends any enrollment of this worker in a project that does not
+own that repository** (issue #690, widened by #946 from the project's default
+repository to every repository it declares) — the pairing was impossible, and the
+Workers screen says so instead of leaving it to be inferred from refused
+assignments — naming every repository the project declares, so an enrollment the
+handshake deliberately left alone gets no banner. A daemon that declares nothing
+suspends nothing.
 
 **One worker per checkout** (issue #689). Before it handshakes, the daemon takes a
 lock on the checkout it was pointed at, recorded under
@@ -627,7 +635,7 @@ stays each owner's own `swarm workers update --all <ref>`.
 | A machine is down and its log says `returning to the last known good SWARM build failed` | The return could not be completed, so the install root is on neither build and needs an operator on that host: check out the commit the line names, then run `npm ci && npm run build` there. The daemon stays down on purpose rather than crash-looping; later starts retry the return, so fix the checkout rather than restarting the daemon at it. |
 | A requested update never reports anything | Nothing pushed it: the machine has no socket on the router. It is re-stated automatically the next time that daemon connects, so start it (or wait for the supervisor to), and re-read `swarm workers list`. |
 | Worker never appears as connected / dispatches stay pending | Enrollment isn't both `active` and `sharing_consent=true` (Part 1, steps 4 and 4b), or the worker process on the new machine isn't actually running / crashed on startup — check its terminal for the two success lines above. |
-| An enrollment went `suspended` on its own, right after the machine first connected | The machine declared a checkout of a different repository than the project's, so the control plane suspended the pairing (issue #690). `/workers/<id>` names both repositories on that enrollment block. Point `SWARM_WORKER_REPO_ROOT` at a checkout of the project's repository (or enroll the machine in the project that matches it), then have a project administrator re-activate the enrollment — a matching declaration never re-activates it by itself. |
-| `swarm workers enroll` exits 1 saying the worker's checkout is a different repository | Same mismatch, caught on the write path instead (issue #690) — the message names the machine's checkout and the project's repository. Enroll a worker whose checkout is that repository, or re-point this one. |
+| An enrollment went `suspended` on its own, right after the machine first connected | The machine declared a checkout of a repository the project does not own — none of its declared repositories, not just its default one (issues #690, #946) — so the control plane suspended the pairing. `/workers/<id>` names both sides on that enrollment block — the machine's checkout, and every repository the project declares. Point `SWARM_WORKER_REPO_ROOT` at a checkout of a repository the project owns (or enroll the machine in the project that matches it), then have a project administrator re-activate the enrollment — a matching declaration never re-activates it by itself. |
+| `swarm workers enroll` exits 1 saying the worker's checkout is a different repository | Same mismatch, caught on the write path instead (issues #690, #946) — the message names the machine's checkout and every repository the project owns. Enroll a worker whose checkout is one of those repositories, or re-point this one. |
 | `refusing to start — another worker already holds this checkout` | Another daemon on this machine is already running against the same `SWARM_WORKER_REPO_ROOT` (issue #689) — the line names its worker id, or its pid when it has not handshaked yet. Stop that process, or give this worker its own checkout and point `SWARM_WORKER_REPO_ROOT` at it. A lock left by a crashed daemon is reclaimed automatically, so this message always means a live holder — unless its `owner.json` is unreadable, which resolves itself once the lock ages out (15 minutes). |
 | Handshake repeatedly logs `worker session already held` | Another daemon really is connected as this worker — two machines were given the same `SWARM_WORKER_CREDENTIAL`, or a stale process is still running on this one. A daemon *reconnecting* after a control-plane restart takes its own lease straight back (it presents the session it holds, and logs `reclaimed=true` on the next `worker transport session established`), so a repeating refusal means a second holder rather than a slow expiry. |

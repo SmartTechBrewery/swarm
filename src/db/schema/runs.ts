@@ -15,6 +15,7 @@ import type { Checkpoint } from '../../pipeline/checkpoint.js';
 import type { ProposedScope } from '../../pipeline/planning.js';
 import type { CancellationOrigin } from '../../queue/cancellation.js';
 import type { SwarmJob } from '../../queue/jobs.js';
+import type { ReviewAbsorbed } from '../../scm/delivery.js';
 import type { FailureDiagnosis } from '../../worker/failure-diagnosis.js';
 import { projects } from './projects.js';
 import { users } from './users.js';
@@ -122,6 +123,17 @@ export const runs = pgTable(
 		 * null. Cleared on a retry alongside `reviewVerdict`.
 		 */
 		reviewAutomationOutcome: text('review_automation_outcome'),
+		/**
+		 * The fold-in declaration a completed Review run made (issue #953) — the
+		 * split siblings whose whole scope the reviewer traced through the reviewed
+		 * pull request's diff, each with its issue URL, human reference, and the
+		 * evidence for the claim. Nullable: only a Review run that declared one sets
+		 * it, which is essentially never; every other phase, every ordinary review,
+		 * and every pre-existing row leaves it null. Cleared on a retry alongside
+		 * `reviewVerdict` ({@link resetRunToRunning}), so a re-running review never
+		 * shows a declaration the fresh pass has not (yet) restated.
+		 */
+		reviewAbsorbed: jsonb('review_absorbed').$type<ReviewAbsorbed[]>(),
 		/**
 		 * Provider-neutral merge-automation outcome for this Review run's approval
 		 * (`src/scm/merge.ts`; written by the durable merge dispatch,

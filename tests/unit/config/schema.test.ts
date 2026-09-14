@@ -897,6 +897,7 @@ describe('ProjectRecordSchema', () => {
 		});
 		expect(project.worktreeRetention).toEqual({
 			maxWorktrees: PROJECT_DEFAULTS.maxWorktrees,
+			abandonedAfterDays: PROJECT_DEFAULTS.abandonedAfterDays,
 		});
 	});
 
@@ -905,6 +906,19 @@ describe('ProjectRecordSchema', () => {
 			worktreeRetention: { maxWorktrees: 5 },
 		});
 		expect(project.worktreeRetention?.maxWorktrees).toBe(5);
+		// A config predating the abandoned sweep (issue #951) still parses, and picks
+		// up the new threshold's default rather than needing a migration.
+		expect(project.worktreeRetention?.abandonedAfterDays).toBe(PROJECT_DEFAULTS.abandonedAfterDays);
+	});
+
+	it('rejects a non-positive or non-integer abandonedAfterDays', () => {
+		for (const abandonedAfterDays of [0, -3, 5.5]) {
+			expect(() =>
+				createMockProjectConfig({
+					worktreeRetention: { abandonedAfterDays },
+				}),
+			).toThrow();
+		}
 	});
 
 	it('rejects a non-positive or non-integer maxWorktrees', () => {

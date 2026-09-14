@@ -101,6 +101,7 @@ import { isJobStale, resolveMaxJobAgeMs } from '../worker/job-freshness.js';
 import { RunTerminatedError } from '../worker/run-cancellation.js';
 import { resolveWorkerLockOptions } from '../worker/runtime-options.js';
 import { phaseAgentConfig } from '../worker/target-policy.js';
+import { BlockedRecoveryError, type BlockedRecoveryReason } from '../worktree/reclaim.js';
 import { composeSystemPrompt, resolveTargetBranch } from './assignment-composition.js';
 import { cancelRunOnWorker, subscribeDispatchCancellations } from './dispatch-cancellation.js';
 import { awaitDispatchResult, type TransportInterruptions } from './dispatch-results.js';
@@ -278,8 +279,10 @@ function reportedVerdict(verdict: TaskExecutionResult['verdict']): ReviewVerdict
  * a throw that the shared `handlePhaseFailure` classifies exactly as an in-process
  * failure would — `RunTerminatedError` for a user cancellation, `DependencyBlockedError`,
  * `DeliveryDeferredError` or an `AgentRunError` (with the reported failure kind) for a
- * deferral, and an `AgentRunError` carrying the reported exit metadata otherwise. The
- * synthetic agent result carries what the frame *reported* rather than a stand-in
+ * deferral, `BlockedRecoveryError` for a terminal failure whose frame names the recovery
+ * gate's refusal (issue #952, so the settle records where the preserved checkout is
+ * rather than erasing it), and an `AgentRunError` carrying the reported exit metadata
+ * otherwise. The synthetic agent result carries what the frame *reported* rather than a stand-in
  * default (issue #596), so the run row records the same stop its `error` describes and
  * a frame that reported nothing records "unknown"; its non-zero exit keeps a
  * genuinely-interrupted `timeout` deferrable, matching the in-process rule.
@@ -312,10 +315,33 @@ export function adaptResultToPhaseRun(
 			// Feeds the shared settle path's `no-fix` hand-back to Review (issue #841);
 			// absent from every phase but Respond-to-CI, and from an older worker's frame.
 			ciOutcome: result.ciOutcome,
+			// Feeds the shared settle path's `runs.review_absorbed` write (issue #953);
+			// absent from a review that declared nothing, and from an older worker's frame.
+			absorbed: result.absorbed,
 		};
 	}
 	if (result.status === 'failed') {
 		if (result.cancelled) throw new RunTerminatedError(result.error || RUN_CANCELLED_MESSAGE);
+		// The recovery gate on the worker refused to adopt this run's preserved checkout
+		// (issue #952). Raised as the error the settle path already knows, so
+		// `finalizeFailedRun` (`../worker/consumer.ts`) writes the same
+		// `{ state: 'blocked', blockedReason }` record its in-process twin wrote — a
+		// *non-null* recovery write, so `recoveryWriteSql`'s sticky merge keeps
+		// `preservedWorkerId` and the next "Retry now" is still pinned to the machine
+		// actually holding that checkout. Cast like `failureKind` below: the wire
+		// deliberately carries a string so a newer worker's reason cannot fail the whole
+		// settle, and `runs.recovery` is free-form jsonb whose union widens without a
+		// migration. Still terminal — `handlePhaseFailure` classifies this as
+		// `blocked-recovery` and `isDeferrable` requires an `AgentRunError` — so nothing
+		// the worker settled for good is retried, and no exit metadata is lost: a blocked
+		// adoption ran no agent, which is exactly what such a frame reports (issue #596 is
+		// unaffected).
+		if (result.blockedReason) {
+			throw new BlockedRecoveryError(
+				result.blockedReason as BlockedRecoveryReason,
+				result.error || result.reason || 'Phase blocked adopting its preserved checkout',
+			);
+		}
 		// An `AgentRunError` rather than a plain `Error` purely so the reported exit
 		// metadata reaches the run row: `finalizeFailedRun` (`../worker/consumer.ts`)
 		// records the columns only from `AgentRunError.agent`, and a plain throw is why

@@ -29,6 +29,7 @@ import { TRANSPORT_PROTOCOL_VERSION } from '@/transport/protocol.js';
 import type { AssignmentSink } from '@/transport/worker-client.js';
 import { ALL_TRIGGER_PHASES } from '@/triggers/types.js';
 import type { AssignedPhaseInputs, PhaseRunResult } from '@/worker/consumer.js';
+import { BlockedRecoveryError } from '@/worktree/reclaim.js';
 import { createMockTaskAssignmentInput, createMockWorkItem } from '../../helpers/factories.js';
 
 /** The operator credential the assignment factory puts on every built frame. */
@@ -817,6 +818,43 @@ describe('runAssignmentDbFree', () => {
 		expect(sink.sent.at(-1)?.ciOutcome).toBeUndefined();
 	});
 
+	it('reports a Review run’s fold-in declaration so the control plane can record it (issue #953)', async () => {
+		const sink = recordingSink();
+		const absorbed = [
+			{
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/947',
+				reference: '#947',
+				evidence: 'Its criteria 1-3 are met by this diff.',
+			},
+		];
+		const runPhase = vi.fn(async () => ({
+			agent: agentResult(),
+			verdict: 'approve' as const,
+			absorbed,
+		}));
+
+		await runAssignmentDbFree(
+			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'review' })),
+			sink,
+			{ ...RUN_OPTIONS, deps: depsWith(runPhase) },
+		);
+
+		expect(sink.sent.at(-1)).toMatchObject({ status: 'succeeded', absorbed });
+	});
+
+	it('reports no fold-in declaration for the reviews that declare none', async () => {
+		const sink = recordingSink();
+		const runPhase = vi.fn(async () => ({ agent: agentResult(), verdict: 'approve' as const }));
+
+		await runAssignmentDbFree(
+			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'review' })),
+			sink,
+			{ ...RUN_OPTIONS, deps: depsWith(runPhase) },
+		);
+
+		expect(sink.sent.at(-1)?.absorbed).toBeUndefined();
+	});
+
 	it('reports the split children a Planning run auto-advanced, so the control plane self-enqueues each (issue #911)', async () => {
 		const sink = recordingSink();
 		const runPhase = vi.fn(async () => ({
@@ -1240,6 +1278,54 @@ describe('runAssignmentDbFree', () => {
 			status: 'failed',
 			error: 'Review agent (claude) exited with code 1 (authentication failed)',
 		});
+	});
+
+	// Issue #952: the recovery gate is on this host, so its refusal is something only the
+	// worker can see. Reporting it is what lets the control plane write a recovery record
+	// instead of the null write that erases where the still-present checkout lives.
+	it('reports the recovery gate’s refusal on the terminal failed frame', async () => {
+		const sink = recordingSink();
+		const runPhase = vi.fn(async () => {
+			throw new BlockedRecoveryError(
+				'checkpoint-divergent',
+				'Checkpoint no longer matches the working tree',
+			);
+		});
+		await runAssignmentDbFree(ciAssignment(), sink, { ...RUN_OPTIONS, deps: depsWith(runPhase) });
+
+		expect(sink.sent.at(-1)).toMatchObject({
+			// Terminal, never `deferred`: `classifyDeferrable` does not recognise this
+			// error, so retrying would only loop on the same protected checkout.
+			status: 'failed',
+			blockedReason: 'checkpoint-divergent',
+			error: 'Checkpoint no longer matches the working tree',
+		});
+	});
+
+	// A blocked adoption ran no agent, so there is no exit metadata to report and none
+	// may be invented (issue #596's bar, unchanged by the field above).
+	it('invents no exit metadata for a blocked adoption', () => {
+		const frame = deferrableOrFailedResult(
+			new BlockedRecoveryError('dirty', 'Checkout has uncommitted changes'),
+			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'implementation' })),
+		);
+
+		expect(frame).toMatchObject({ status: 'failed', blockedReason: 'dirty' });
+		expect(frame.exitCode).toBeUndefined();
+		expect(frame.timedOut).toBeUndefined();
+		expect(frame.durationMs).toBeUndefined();
+	});
+
+	// Every other terminal failure keeps today's settle verbatim, so the control plane's
+	// plain-`AgentRunError` path is entered exactly when it was before.
+	it('leaves the blocked reason unset for a terminal failure that is not a refused adoption', () => {
+		const frame = deferrableOrFailedResult(
+			new Error('worktree setup failed'),
+			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'implementation' })),
+		);
+
+		expect(frame.status).toBe('failed');
+		expect(frame.blockedReason).toBeUndefined();
 	});
 
 	it('reports the implementation branch checkpoint as a task-progress frame', async () => {

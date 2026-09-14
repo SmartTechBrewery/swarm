@@ -9,9 +9,9 @@ import type { WorkerEnrollmentStatus } from '@/types/workers.js';
  * project administrator approves, the worker's owner shares.
  *
  * One reason sits outside that predicate and is answered here too: the machine's
- * checkout not being this project's repository (issue #690, {@link
- * repositoryMismatch}), which is why the enrollment was refused or suspended in the
- * first place.
+ * checkout not being one of this project's repositories (issue #690, widened by
+ * #946, {@link repositoryMismatch}), which is why the enrollment was refused or
+ * suspended in the first place.
  */
 
 /** The enrollment fields routability is derived from — narrower than the read model. */
@@ -51,12 +51,20 @@ export function routabilityBlockers(enrollment: RoutabilityInput): string[] {
 }
 
 /**
- * The two repositories that disagree when the machine's declared checkout is not
- * this enrollment's project repository (issue #690) — the reason an enrollment was
+ * The repositories that disagree when the machine's declared checkout is not one
+ * this enrollment's project declares (issue #690, widened by #946 from the
+ * project's default entry to its whole list) — the reason an enrollment was
  * refused at enrollment time, or suspended when the declaration arrived later — or
- * `null` when they agree or either is unknown. Returning the pair rather than a
- * boolean keeps the rule in one place and gives the caller the two non-null values
- * to render.
+ * `null` when they agree or either side is unknown. Returning the two non-null
+ * sides rather than a boolean keeps the rule in one place and gives the caller
+ * exactly what it has to render.
+ *
+ * The project side is a **list**, and agreement is membership in it: a project may
+ * declare several repositories and hold one worker per repository, so a machine
+ * checked out from the project's second repository is correctly enrolled and must
+ * not be told otherwise. A genuine mismatch names every repository the project
+ * owns, which is what lets an operator tell a typo from a repository the project
+ * simply does not have.
  *
  * Both sides reach the browser in the shared normalised `owner/repo` form, so plain
  * equality here is the same comparison the server makes (`repoSlugsMatch`,
@@ -66,7 +74,9 @@ export function routabilityBlockers(enrollment: RoutabilityInput): string[] {
  * Unknown on either side is **not** a mismatch: a machine that declared nothing —
  * one that never connected, a daemon on an older build, a checkout with no readable
  * `origin` — must not read as one that declared the wrong thing, which is exactly
- * the rule the server's write path and suspension pass apply.
+ * the rule the server's write path and suspension pass apply. An empty project list
+ * is the same kind of unknown: the project no longer resolves, so there is nothing
+ * to disagree with.
  *
  * Deliberately separate from {@link routabilityBlockers}: that answers the
  * two-condition routability predicate the dispatch gate reads, while this is a fact
@@ -75,9 +85,9 @@ export function routabilityBlockers(enrollment: RoutabilityInput): string[] {
  */
 export function repositoryMismatch(
 	declaredRepository: string | null,
-	projectRepository: string | null,
-): { declaredRepository: string; projectRepository: string } | null {
-	if (!declaredRepository || !projectRepository) return null;
-	if (declaredRepository === projectRepository) return null;
-	return { declaredRepository, projectRepository };
+	projectRepositories: string[],
+): { declaredRepository: string; projectRepositories: string[] } | null {
+	if (!declaredRepository || projectRepositories.length === 0) return null;
+	if (projectRepositories.includes(declaredRepository)) return null;
+	return { declaredRepository, projectRepositories };
 }
