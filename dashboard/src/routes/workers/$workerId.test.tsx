@@ -149,7 +149,7 @@ function makeDetail(overrides: Partial<WorkerDetail> = {}): WorkerDetail {
 				concurrencyAllocation: 1,
 				sharingConsent: true,
 				isRoutable: true,
-				projectRepo: 'acme/frontend',
+				projectRepos: ['acme/frontend'],
 				viewerCanAdminister: false,
 			},
 		],

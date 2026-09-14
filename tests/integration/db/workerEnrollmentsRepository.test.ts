@@ -2,6 +2,7 @@ import { eq } from 'drizzle-orm';
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { getDb } from '../../../src/db/client.js';
+import { createProjectInDb } from '../../../src/db/repositories/projectsRepository.js';
 import { createRun } from '../../../src/db/repositories/runsRepository.js';
 import { createUser } from '../../../src/db/repositories/usersRepository.js';
 import {
@@ -22,6 +23,7 @@ import {
 } from '../../../src/db/repositories/workerSessionsRepository.js';
 import {
 	createWorker,
+	getWorkerById,
 	setWorkerDeclaredCapabilities,
 	updateWorkerCapabilities,
 } from '../../../src/db/repositories/workersRepository.js';
@@ -32,15 +34,24 @@ import {
 	AllowedClisNotCapableError,
 	DEFAULT_ENROLLMENT_ALLOWED_PHASES,
 	DEFAULT_ENROLLMENT_ORDER_INDEX,
+	EnrollmentRepositoryMismatchError,
 	isRoutable,
 } from '../../../src/identity/worker-enrollment.js';
-import { suspendEnrollmentsForMismatchedRepository } from '../../../src/identity/worker-enrollment-service.js';
+import {
+	enrollWorker,
+	suspendEnrollmentsForMismatchedRepository,
+} from '../../../src/identity/worker-enrollment-service.js';
+import { createMockProjectRecord } from '../../helpers/factories.js';
 import { truncateAll } from '../helpers/db.js';
 import { seedProject } from '../helpers/seed.js';
 
 const TTL = 60_000;
 const PROJECT_A = 'proj-enroll-a';
 const PROJECT_B = 'proj-enroll-b';
+/** A project owning two repositories (issue #946) — the roster a multi-repo project needs. */
+const PROJECT_MULTI = 'proj-enroll-multi';
+const MULTI_REPO_A = 'jkwiecien/enroll-multi-a';
+const MULTI_REPO_B = 'jkwiecien/enroll-multi-b';
 
 describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 	'workerEnrollmentsRepository (integration)',
@@ -53,6 +64,15 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 			await truncateAll();
 			await seedProject({ id: PROJECT_A, repo: 'jkwiecien/enroll-a' });
 			await seedProject({ id: PROJECT_B, repo: 'jkwiecien/enroll-b' });
+			// `seedProject` persists a one-entry list by design, so the two-repository
+			// project goes through the record write instead.
+			await createProjectInDb(
+				createMockProjectRecord({
+					id: PROJECT_MULTI,
+					name: PROJECT_MULTI,
+					repositories: [{ repo: MULTI_REPO_A }, { repo: MULTI_REPO_B }],
+				}),
+			);
 			adaId = (await createUser({ identifier: 'ada@example.com', displayName: 'Ada' })).id;
 			workerA = (
 				await createWorker({
@@ -343,7 +363,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 					{
 						enrollmentId: mismatched.id,
 						projectId: PROJECT_B,
-						projectRepository: 'jkwiecien/enroll-b',
+						projectRepositories: ['jkwiecien/enroll-b'],
 					},
 				]);
 				// Suspension, not deletion: the row keeps every constraint for the operator
@@ -374,6 +394,50 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 				// its own routability by re-pointing a checkout (ADR-001).
 				expect(await getEnrollmentById(created.id)).toMatchObject({ status: 'suspended' });
 				expect(await listEnrollmentsForWorker(workerA)).toHaveLength(1);
+			});
+
+			// Issue #946 — the handshake must leave an enrollment alone when the project
+			// declares the checkout anywhere, not only as its default entry.
+			it('leaves an enrollment for a project’s second repository active', async () => {
+				const enrolled = await enroll(workerA, PROJECT_MULTI);
+				await updateWorkerCapabilities(workerA, ['claude', 'codex'], undefined, MULTI_REPO_B);
+
+				const suspended = await suspendEnrollmentsForMismatchedRepository(workerA, MULTI_REPO_B);
+
+				expect(suspended).toEqual([]);
+				expect(await getEnrollmentById(enrolled.id)).toMatchObject({ status: 'active' });
+			});
+		});
+
+		// Issue #946 — the write path, against a real two-repository `projects` row, so
+		// the record read itself is exercised rather than mocked.
+		describe('enrollWorker against a multi-repository project', () => {
+			it('enrolls a worker whose checkout is the project’s second repository', async () => {
+				await updateWorkerCapabilities(workerA, ['claude', 'codex'], undefined, MULTI_REPO_B);
+				const worker = await getWorkerById(workerA);
+				if (!worker) throw new Error('expected the worker to exist');
+
+				const created = await enrollWorker({
+					worker,
+					projectId: PROJECT_MULTI,
+					allowedClis: ['claude'],
+				});
+
+				expect(await getEnrollmentById(created.id)).toMatchObject({
+					projectId: PROJECT_MULTI,
+					workerId: workerA,
+				});
+			});
+
+			it('still refuses a worker whose checkout the project declares nowhere', async () => {
+				await updateWorkerCapabilities(workerA, ['claude', 'codex'], undefined, 'jkwiecien/other');
+				const worker = await getWorkerById(workerA);
+				if (!worker) throw new Error('expected the worker to exist');
+
+				await expect(
+					enrollWorker({ worker, projectId: PROJECT_MULTI, allowedClis: ['claude'] }),
+				).rejects.toBeInstanceOf(EnrollmentRepositoryMismatchError);
+				expect(await listEnrollmentsForWorker(workerA)).toEqual([]);
 			});
 		});
 
