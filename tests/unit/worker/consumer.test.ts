@@ -2906,6 +2906,8 @@ describe('processJob', () => {
 					updatedAt: new Date('2026-01-01T00:00:00Z'),
 				},
 				availability: { connected: true, activeRuns: overrides.activeRuns ?? 0 },
+				// Cooling on nothing (issue #981) — the regression bar for every case here.
+				rateLimitedClis: new Map(),
 			};
 		}
 

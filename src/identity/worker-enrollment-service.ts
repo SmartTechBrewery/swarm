@@ -76,6 +76,7 @@ import {
 	type WorkerUpdateRunRow,
 } from '../db/repositories/runsRepository.js';
 import { getUserById } from '../db/repositories/usersRepository.js';
+import { listActiveWorkerCliRateLimits } from '../db/repositories/workerCliRateLimitsRepository.js';
 import {
 	createEnrollment,
 	getEnrollmentById,
@@ -325,6 +326,13 @@ export interface WorkerDispatchCandidate {
 	worker: Worker;
 	enrollment: WorkerEnrollment;
 	availability: WorkerAvailability;
+	/**
+	 * The machine's **live** CLI cool-downs, each mapped to the instant its limit is
+	 * expected back (issue #981) — the fourth DB-resolved signal the pure predicate
+	 * cannot fetch for itself, carried here beside {@link WorkerAvailability} for the
+	 * same reason. Empty for a machine cooling on nothing, which is the ordinary case.
+	 */
+	rateLimitedClis: ReadonlyMap<AgentCli, Date>;
 }
 
 /**
@@ -347,11 +355,19 @@ export interface WorkerDispatchCandidate {
  * listing. Project isolation falls out of the query being keyed on `projectId`.
  * An enrollment whose worker vanished is skipped defensively, exactly as
  * {@link listProjectRoster} does.
+ *
+ * Each candidate also carries the machine's live CLI cool-downs (issue #981),
+ * resolved in **one batched read** before the loop rather than as a fourth
+ * per-worker query — and still filtering nothing: a cooling machine is a candidate
+ * the predicate refuses for a named reason, not one this listing hides.
  */
 export async function listProjectDispatchCandidates(
 	projectId: string,
 ): Promise<WorkerDispatchCandidate[]> {
 	const enrollments = await listEnrollmentsForProject(projectId);
+	const rateLimits = await listActiveWorkerCliRateLimits(
+		enrollments.map((enrollment) => enrollment.workerId),
+	);
 	const candidates: WorkerDispatchCandidate[] = [];
 	for (const enrollment of enrollments) {
 		const worker = await getWorkerById(enrollment.workerId);
@@ -361,6 +377,7 @@ export async function listProjectDispatchCandidates(
 			worker,
 			enrollment,
 			availability: { connected, activeRuns },
+			rateLimitedClis: rateLimits.get(worker.id) ?? new Map<AgentCli, Date>(),
 		});
 	}
 	return candidates;

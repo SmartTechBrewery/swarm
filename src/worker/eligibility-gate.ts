@@ -43,7 +43,9 @@
  *    worker against one target: active enrollment → sharing consent → draining
  *    (issue #919) → connection/health → free capacity → the repository its checkout
  *    is (issue #714) → declared phase support (issue #467) → the enrollment's
- *    allowed phases (issue #509) → declared/allowed CLI.
+ *    allowed phases (issue #509) → declared/allowed CLI → that CLI's own cool-down
+ *    (issue #981: a machine whose CLI reported a usage limit is given no more work
+ *    on *that* CLI until the recorded instant, and keeps taking work on its others).
  *
  * **Selection is target-priority-first, worker-order-second.** The gate walks
  * `agents.<phase>.targets` in configured order and, for each, takes an
@@ -365,6 +367,13 @@ export function isAffinityGatedPhase(phase: TriggerPhase): boolean {
  */
 const REASON_PRIORITY: readonly IneligibilityReason[] = [
 	'worker-unavailable',
+	// Directly below `worker-unavailable` and above every structural reason (issue
+	// #981), by the same "closer to eligible wins" rule: the predicate judges a
+	// cool-down *after* the CLI check, so a candidate reporting it cleared every other
+	// condition and came nearer to eligible than any of them. `worker-unavailable`
+	// stays pinned on top because it remains the best news available — a machine that
+	// is merely busy will free up without any allowance having to refill.
+	'cli-rate-limited',
 	'missing-cli-capability',
 	// The two phase reasons sit below `missing-cli-capability` by the same "closer to
 	// eligible wins" rule: the predicate checks both phase conditions *before* the
@@ -421,6 +430,15 @@ const AVAILABILITY_REFUSAL: Record<DispatchIneligibilityReason, boolean> = {
 	'missing-phase-capability': false,
 	'phase-not-permitted': false,
 	'missing-cli-capability': false,
+	// Time alone clears it (issue #981) — the record carries the instant its limit is
+	// expected back and lapses there by itself, so this is an availability wait in
+	// exactly the sense this flag means, unlike `worker-draining`, which a human
+	// reverses. Classifying it `true` keeps its wait reason at the existing
+	// `worker-eligibility` and lets `promoteAvailabilityWaitsForWorker` (issue #610)
+	// wake the row when *another* machine connects — which, for an aggregate "every
+	// permitted worker is cooling" refusal, is precisely the event that can clear it.
+	// A wake that finds the records still live simply re-refuses, token-free.
+	'cli-rate-limited': true,
 	// A machine coming online cannot clear this (issue #714): a checkout is re-declared
 	// only at handshake, and what ends the wait is a human pointing a worker at this
 	// repository or enrolling one that already holds it. A machine that *does* hold it
@@ -470,6 +488,12 @@ function ineligibilityMessage(
 		phase: TriggerPhase;
 		repository: string;
 		preservedWorker?: string;
+		/**
+		 * The soonest instant any refused candidate's cool-down lapses (issue #981) —
+		 * collected during the target walk so the refusal can name when work resumes.
+		 * Absent when no candidate reported `cli-rate-limited`.
+		 */
+		coolingUntil?: Date;
 	},
 ): string {
 	const owner = context.assignee
@@ -504,6 +528,12 @@ function ineligibilityMessage(
 			return `No worker for ${owner} has an active enrollment in this project. A project admin must approve the worker's enrollment before it can take work.`;
 		case 'missing-cli-capability':
 			return `No enrolled worker for ${owner} can run any configured model target for this phase (${context.clis.join(', ')}). Enroll a worker that declares and is allowed one of those CLIs, or configure a target this project's workers can run.`;
+		// Phase-generic and deliberately not worded as a fault: a spent allowance is the
+		// ordinary consequence of the machines having done work, and it needs no
+		// operator action at all. Naming the expected reset is the whole point — it is
+		// the difference between "something is wrong" and "this resumes at 14:20".
+		case 'cli-rate-limited':
+			return `No enrolled worker for ${owner} can run any configured model target for this phase (${context.clis.join(', ')}) right now — every machine that could has hit its usage limit on that CLI. Nothing needs to be fixed: each machine is expected back${context.coolingUntil ? ` by ${context.coolingUntil.toISOString()}` : ''}, and this work runs on the next re-check after that. Other CLIs on the same machines are unaffected.`;
 		// Phase-generic on purpose: this text is posted on the board item once the
 		// recheck budget is spent, and a daemon may declare any subset — naming
 		// `planning`/DB-free specifically would hand the operator a wrong diagnosis for
@@ -585,6 +615,12 @@ function eligibleWorkersForDemand(
 						phaseDefaultCli: demand.phaseDefaultCli,
 						phase: demand.phase,
 						repository: repositoryForDemand(demand, candidate),
+						// The same constraint this gate applies to its own dispatch (issue
+						// #981): a machine cooling on a contender's CLI is not an option that
+						// contender has, so counting it would make the contender look less
+						// constrained than it is and could divert this dispatch for contention
+						// that cannot happen.
+						rateLimitedClis: candidate.rateLimitedClis,
 					}).eligible,
 			)
 			.map((candidate) => candidate.worker.id);
@@ -611,6 +647,17 @@ function freeSlotsByWorker(
 		if (free > 0) slots.set(candidate.worker.id, free);
 	}
 	return slots;
+}
+
+/**
+ * The soonest of two cool-down expiries, either of which may be absent (issue
+ * #981). Soonest rather than latest because the first record to lapse is the first
+ * re-check that can select somebody, so it is the instant the refusal message
+ * should name.
+ */
+function earlierCoolDown(current: Date | undefined, next: Date | undefined): Date | undefined {
+	if (!next) return current;
+	return !current || next < current ? next : current;
 }
 
 /**
@@ -726,7 +773,7 @@ export async function evaluateDispatchEligibility(
 		: assigned
 			? candidates.filter((c) => c.worker.ownerUserId === assigned.user.id)
 			: candidates;
-	const messageContext = {
+	const messageContext: Parameters<typeof ineligibilityMessage>[1] = {
 		projectId: input.projectId,
 		assignee: assigned?.assignee.handle,
 		clis,
@@ -756,6 +803,11 @@ export async function evaluateDispatchEligibility(
 	const availabilityOf = (candidate: WorkerDispatchCandidate): WorkerAvailability =>
 		resolveAvailability(candidate, options.isWorkerConnected);
 	const reported = new Set<IneligibilityReason>();
+	// The soonest instant any cool-down refusal lapses (issue #981), so an aggregated
+	// `cli-rate-limited` message can say when the work actually resumes rather than
+	// only that it is waiting. Soonest rather than latest: the first record to lapse
+	// is the first re-check that can select somebody.
+	let coolingUntil: Date | undefined;
 	for (const [targetIndex, target] of input.targets.entries()) {
 		const eligible: WorkerDispatchCandidate[] = [];
 		for (const candidate of permitted) {
@@ -767,9 +819,19 @@ export async function evaluateDispatchEligibility(
 				phaseDefaultCli: input.phaseDefaultCli,
 				phase: input.phase,
 				repository: input.repository,
+				rateLimitedClis: candidate.rateLimitedClis,
 			});
-			if (verdict.eligible) eligible.push(candidate);
-			else reported.add(verdict.reason);
+			if (verdict.eligible) {
+				eligible.push(candidate);
+				continue;
+			}
+			reported.add(verdict.reason);
+			if (verdict.reason === 'cli-rate-limited') {
+				coolingUntil = earlierCoolDown(
+					coolingUntil,
+					candidate.rateLimitedClis.get(resolveTargetCli(target, input.phaseDefaultCli)),
+				);
+			}
 		}
 		const [firstEligible, ...alternatives] = eligible;
 		if (!firstEligible) continue;
@@ -806,7 +868,10 @@ export async function evaluateDispatchEligibility(
 	// machine (consent revoked, enrollment suspended, the phase no longer permitted
 	// there) keeps its own actionable text and its own bounded budget: those name
 	// something only an operator can fix and will not resolve on their own, so waiting
-	// on them forever would be the wrong answer.
+	// on them forever would be the wrong answer. A pinned continuation whose machine
+	// is cooling aggregates to `cli-rate-limited` rather than `worker-unavailable`
+	// (issue #981), so it too keeps its own text and its own bounded budget — which is
+	// correct, because that wait really does end by itself at a named instant.
 	const aggregated = aggregateReason(reported);
 	const reason: DispatchIneligibilityReason =
 		aggregated !== 'worker-unavailable'
@@ -819,6 +884,6 @@ export async function evaluateDispatchEligibility(
 	return {
 		status: 'ineligible',
 		reason,
-		message: ineligibilityMessage(reason, messageContext),
+		message: ineligibilityMessage(reason, { ...messageContext, coolingUntil }),
 	};
 }

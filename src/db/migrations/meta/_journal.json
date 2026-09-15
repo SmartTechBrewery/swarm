@@ -484,6 +484,13 @@
       "when": 1789450469337,
       "tag": "0068_worker_update_run_machine",
       "breakpoints": true
+    },
+    {
+      "idx": 69,
+      "version": "7",
+      "when": 1789468605124,
+      "tag": "0069_worker_cli_rate_limits",
+      "breakpoints": true
     }
   ]
 }

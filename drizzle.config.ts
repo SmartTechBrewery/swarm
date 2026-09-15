@@ -19,6 +19,7 @@ export default defineConfig({
 		'./src/db/schema/workers.ts',
 		'./src/db/schema/workerSessions.ts',
 		'./src/db/schema/workerProjectEnrollments.ts',
+		'./src/db/schema/workerCliRateLimits.ts',
 		'./src/db/schema/workerScmCredentials.ts',
 		'./src/db/schema/workerUpdateRollouts.ts',
 	],

@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import type { AgentCli } from '@/harness/agent-cli.js';
+
 const {
 	createEnrollment,
 	getEnrollmentById,
@@ -81,6 +83,15 @@ vi.mock('@/identity/worker-session-service.js', () => ({
 vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
 	getActiveWorkerClaims,
 	getWorkerDispatchClaimState,
+}));
+// The candidate listing's batched cool-down read (issue #981) — no machine is
+// cooling unless a case says so.
+const listActiveWorkerCliRateLimits = vi.fn<
+	(workerIds: string[], asOf?: Date) => Promise<Map<string, Map<AgentCli, Date>>>
+>(async () => new Map());
+vi.mock('@/db/repositories/workerCliRateLimitsRepository.js', () => ({
+	listActiveWorkerCliRateLimits: (...args: [string[], (Date | undefined)?]) =>
+		listActiveWorkerCliRateLimits(...args),
 }));
 // Spread the real module and override the one export: `WorkerBuildSchema` beside it
 // is what `@/identity/worker.js` parses rows with, so a factory returning only the
@@ -1306,6 +1317,30 @@ describe('the project worker order (issue #750)', () => {
 			SECOND_WORKER_ID,
 			WORKER_ID,
 		]);
+	});
+
+	// Issue #981: the fourth DB-resolved signal the pure predicate cannot fetch, read
+	// once for the whole roster rather than per worker.
+	it('listProjectDispatchCandidates carries each machine’s live CLI cool-downs', async () => {
+		listEnrollmentsForProject.mockResolvedValue([
+			makeEnrollment({ id: 'e1', workerId: WORKER_ID, orderIndex: 0 }),
+			makeEnrollment({ id: 'e2', workerId: SECOND_WORKER_ID, orderIndex: 1 }),
+		]);
+		getWorkerById.mockImplementation(async (id: string) => makeWorker({ id }));
+		getLiveSessionForWorker.mockResolvedValue(undefined);
+		const resetAt = new Date('2026-09-15T14:20:00Z');
+		listActiveWorkerCliRateLimits.mockResolvedValue(
+			new Map([[WORKER_ID, new Map<AgentCli, Date>([['claude', resetAt]])]]),
+		);
+
+		const candidates = await listProjectDispatchCandidates('proj-a');
+
+		// One batched query for the whole roster, not one per worker.
+		expect(listActiveWorkerCliRateLimits).toHaveBeenCalledTimes(1);
+		expect(listActiveWorkerCliRateLimits).toHaveBeenCalledWith([WORKER_ID, SECOND_WORKER_ID]);
+		expect(candidates[0]?.rateLimitedClis.get('claude')).toEqual(resetAt);
+		// A machine with no record reads as an empty map, never `undefined`.
+		expect(candidates[1]?.rateLimitedClis.size).toBe(0);
 	});
 
 	it('moveProjectWorkerOrder delegates the move and returns the new order', async () => {
