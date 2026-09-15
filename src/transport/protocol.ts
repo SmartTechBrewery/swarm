@@ -711,6 +711,15 @@ export const TaskExecutionResultSchema = z.object({
 	// omits both and the control plane falls back to `retryDelayMs`.
 	retryAfter: z.string().min(1).optional(),
 	resetHint: z.string().min(1).optional(),
+	// `deferred` — the CLI's own self-timeout notice (issue #1000). The worker holds
+	// the real `AgentFailure`; without this the control plane rebuilds a kind-only
+	// `timeout`, sees the frame's `exitCode: 0`, and re-judges as terminal a deferral
+	// the worker already classified as resumable — and the operator-facing message
+	// loses the cause on the way across. Optional and additive in both directions,
+	// the same reasoning `retryAfter`/`resetHint` record above, so
+	// `TRANSPORT_PROTOCOL_VERSION` is deliberately **not** bumped: an older worker
+	// omits it and behaves exactly as it does today.
+	cliSelfTimeout: z.string().min(1).optional(),
 	// `deferred` — the Tier 2 checkpoint the stopped run left in its worktree
 	// (`docs/CHECKPOINTS.md`, issue #503), parsed by the worker because only the
 	// worker's host holds that worktree: the control plane cannot read the file, so it

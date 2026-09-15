@@ -243,8 +243,9 @@ export type DeferrableAssignmentFailure =
  * wait on, or `undefined` for a terminal failure — the exact rule the in-process
  * `handlePhaseFailure` applies (`../worker/consumer.ts`): a dependency block, a
  * rate-limit, capacity, aborted, or stalled agent error, a genuinely-interrupted
- * timeout (non-zero/absent exit — a clean SIGTERM exit already cleaned up), or a
- * deterministic-delivery deferral.
+ * timeout (non-zero/absent exit — a clean SIGTERM exit already cleaned up — or a
+ * timeout the CLI imposed on itself, which exits 0 and so is recognised by its own
+ * notice instead, issue #1000), or a deterministic-delivery deferral.
  *
  * An `auth` failure is deliberately absent (issue #343): the remote CLI is logged
  * out, so it settles terminal-`failed` carrying the already-suffixed
@@ -261,7 +262,15 @@ export function classifyDeferrable(err: unknown): DeferrableAssignmentFailure | 
 		if (kind === 'rate-limit' || kind === 'capacity' || kind === 'aborted' || kind === 'stalled') {
 			return err.failure;
 		}
-		if (kind === 'timeout' && err.agent !== undefined && err.agent.exitCode !== 0) {
+		// A CLI that ended its own turn (issue #1000) exits 0 by construction, so the
+		// "genuinely interrupted" exit-code proxy cannot see it — the notice itself is
+		// the evidence that the run was cut short, and it defers exactly as any other
+		// interrupted timeout does.
+		if (
+			kind === 'timeout' &&
+			(err.failure.cliSelfTimeout !== undefined ||
+				(err.agent !== undefined && err.agent.exitCode !== 0))
+		) {
 			return err.failure;
 		}
 	}
@@ -558,6 +567,11 @@ export function deferrableOrFailedResult(
 			// above stays on the frame as the older-control-plane reading of the same fact.
 			retryAfter: 'retryAfter' in failure ? failure.retryAfter?.toISOString() : undefined,
 			resetHint: 'resetHint' in failure ? failure.resetHint : undefined,
+			// The CLI's own self-timeout notice (issue #1000), for the same reason: the
+			// control plane re-applies the deferral rule to the error it rebuilds, and
+			// this run's exit code is 0, so without the notice the rebuild reads as
+			// #165's clean-exit case and settles terminally.
+			cliSelfTimeout: 'cliSelfTimeout' in failure ? failure.cliSelfTimeout : undefined,
 			resumable,
 			resumeDelivery: failure.kind === 'delivery' || undefined,
 			failureKind: failure.kind,

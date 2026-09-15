@@ -8,7 +8,7 @@ import {
 	describeAgent,
 	runAgentCli,
 } from '../harness/agent-cli.js';
-import { agentRunError } from '../harness/agent-failure.js';
+import { agentRunError, agentRunFailed } from '../harness/agent-failure.js';
 import type { ReasoningLevel } from '../harness/models.js';
 import { requireProjectSCMProvider } from '../integrations/scm/registry.js';
 import { describeError } from '../lib/errors.js';
@@ -490,7 +490,7 @@ async function deliverMergeAgainstCurrentBase(
 			timeoutMs: ctx.timeoutMs,
 			signal: ctx.signal,
 		});
-		if (pass.exitCode !== 0)
+		if (agentRunFailed(pass))
 			throw agentRunError(
 				pass,
 				`Resolve-conflicts re-merge agent (${ctx.cli}) exited with code ${pass.exitCode}`,
@@ -589,7 +589,7 @@ export async function runResolveConflictsPhase(
 					timeoutMs,
 					signal,
 				});
-		if (agent.exitCode !== 0) {
+		if (agentRunFailed(agent)) {
 			const error = agentRunError(
 				agent,
 				`Resolve-conflicts agent (${cli}) exited with code ${agent.exitCode}`,

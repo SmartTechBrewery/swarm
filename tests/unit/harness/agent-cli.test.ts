@@ -1570,6 +1570,103 @@ describe('runAgentCli', () => {
 		});
 	});
 
+	describe('CLI self-timeout capture (issue #1000)', () => {
+		// The live shape, verbatim from the four `under-control-platform` runs this
+		// issue was opened on: agy caps its own print-mode turn, prints whatever the
+		// turn produced, writes the notice on **stderr**, and exits **0**. That exit
+		// code is why the phases used to walk on and report the hand-off the agent
+		// never got to write instead of the timeout that stopped it.
+		const AGY_PRINT_TIMEOUT =
+			'[agy] print timeout after 5m0s with turn in progress; returning partial output';
+
+		it('latches an Antigravity self-timeout written on stderr beside an exit-0 partial turn', async () => {
+			const promise = runAgentCli(createMockRunAgentCliOptions({ cli: 'antigravity' }));
+			const child = await spawnedChild(0);
+			child.stdout.emit('data', agyStream(agyTextDelta(1, 'partial work')));
+			child.stderr.emit('data', `${AGY_PRINT_TIMEOUT}\n`);
+			child.emit('close', 0, null);
+
+			const result = await promise;
+			expect(result.exitCode).toBe(0);
+			expect(result.cliSelfTimeout).toBe(AGY_PRINT_TIMEOUT);
+			// End to end: the notice is what turns an exit-0 run into a classified
+			// timeout carrying its own cause, which is the whole point of the field.
+			expect(classifyAgentFailure(result)).toEqual({
+				kind: 'timeout',
+				cliSelfTimeout: AGY_PRINT_TIMEOUT,
+			});
+		});
+
+		it('latches the notice when it arrives without a trailing newline', async () => {
+			// Recovered by `forwardStderr.flush()`, which runs before the result is
+			// built — a CLI dying at its cap need not terminate its last line.
+			const promise = runAgentCli(createMockRunAgentCliOptions({ cli: 'antigravity' }));
+			const child = await spawnedChild(0);
+			child.stderr.emit('data', AGY_PRINT_TIMEOUT);
+			child.emit('close', 0, null);
+
+			const result = await promise;
+			expect(result.cliSelfTimeout).toBe(AGY_PRINT_TIMEOUT);
+		});
+
+		it('latches the notice even when earlier chatter flooded the capture buffer', async () => {
+			// The reason it is sniffed off the *live* line stream rather than read back
+			// out of `result.stderr`, exactly as the session id above: a noisy run
+			// latches the head buffer, and the notice written at the end of the run
+			// falls outside it.
+			const promise = runAgentCli(
+				createMockRunAgentCliOptions({ cli: 'antigravity', maxOutputBytes: 100 }),
+			);
+			const child = await spawnedChild(0);
+			child.stderr.emit('data', `${'x'.repeat(400)}\n`); // floods the head cap
+			child.stderr.emit('data', `${AGY_PRINT_TIMEOUT}\n`);
+			child.emit('close', 0, null);
+
+			const result = await promise;
+			expect(result.stderr).not.toContain('print timeout after');
+			expect(result.cliSelfTimeout).toBe(AGY_PRINT_TIMEOUT);
+			expect(classifyAgentFailure(result).kind).toBe('timeout');
+		});
+
+		it('does not latch the phrase when the agent merely printed it on stdout', async () => {
+			// stderr-only is a guard, not an accident: an agent quoting the notice in
+			// its own transcript must not be able to self-report a timeout.
+			const promise = runAgentCli(createMockRunAgentCliOptions({ cli: 'antigravity' }));
+			const child = await spawnedChild(0);
+			child.stdout.emit('data', agyStream(agyTextDelta(1, AGY_PRINT_TIMEOUT)));
+			child.emit('close', 0, null);
+
+			const result = await promise;
+			expect(result.cliSelfTimeout).toBeUndefined();
+			expect(classifyAgentFailure(result).kind).not.toBe('timeout');
+		});
+
+		it.each([
+			'claude',
+			'codex',
+		] as const)("does not latch agy's wording from a %s run", async (cli) => {
+			// The classification is matched per CLI so one CLI's phrasing cannot
+			// classify another's run — neither of these declares a self-timeout.
+			const promise = runAgentCli(createMockRunAgentCliOptions({ cli }));
+			const child = await spawnedChild(0);
+			child.stderr.emit('data', `${AGY_PRINT_TIMEOUT}\n`);
+			child.emit('close', 0, null);
+
+			const result = await promise;
+			expect(result.cliSelfTimeout).toBeUndefined();
+		});
+
+		it('leaves the field undefined for a clean Antigravity run', async () => {
+			const promise = runAgentCli(createMockRunAgentCliOptions({ cli: 'antigravity' }));
+			const child = await spawnedChild(0);
+			child.stdout.emit('data', agyStream(agyTextDelta(1, 'all done')));
+			child.emit('close', 0, null);
+
+			const result = await promise;
+			expect(result.cliSelfTimeout).toBeUndefined();
+		});
+	});
+
 	it('does not echo output lines to the logger by default, but does when logLines is set', async () => {
 		const debugSpy = vi.spyOn(logger, 'debug').mockImplementation(() => {});
 		try {

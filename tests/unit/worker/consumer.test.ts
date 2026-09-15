@@ -2708,6 +2708,52 @@ describe('processJob', () => {
 		expect(addComment).not.toHaveBeenCalled();
 	});
 
+	// Issue #1000: the one timeout that exits 0 and must still defer. Its twin below
+	// — an exit-0 timeout with no such notice — is issue #165's clean-exit case and
+	// must stay terminal, which is what makes the exit-code proxy insufficient rather
+	// than simply wrong.
+	it('defers a timeout whose CLI ended its own turn, despite its exit 0', async () => {
+		const AGY_PRINT_TIMEOUT =
+			'[agy] print timeout after 5m0s with turn in progress; returning partial output';
+		const workItem = createMockWorkItem({ statusId: '61e4505c' });
+		phaseImpl = async () => {
+			throw new AgentRunError(
+				`Implementation agent (antigravity) exited with code 0 (CLI timed out: ${AGY_PRINT_TIMEOUT})`,
+				{ kind: 'timeout', cliSelfTimeout: AGY_PRINT_TIMEOUT },
+				agentResult({ cli: 'antigravity', exitCode: 0, sessionId: 'conversation-1' }),
+			);
+		};
+
+		const outcome = await processJob(
+			createMockPmWebhookJob(),
+			registryReturning({ phase: 'implementation', taskId: '100', workItem }),
+		);
+
+		expect(outcome.status).toBe('phase-deferred');
+		expect(outcome).toMatchObject({ resumable: true });
+		expect(addComment).not.toHaveBeenCalled();
+	});
+
+	it('still fails a timeout that exited 0 with no self-timeout notice (issue #165)', async () => {
+		const workItem = createMockWorkItem({ statusId: '61e4505c' });
+		phaseImpl = async () => {
+			// A run that trapped SIGTERM and exited cleanly: it already finished and
+			// cleaned up its worktree, so there is nothing to resume onto.
+			throw new AgentRunError(
+				'Implementation agent (claude) exited with code 0 (timed out)',
+				{ kind: 'timeout' },
+				agentResult({ exitCode: 0, timedOut: true }),
+			);
+		};
+
+		const outcome = await processJob(
+			createMockPmWebhookJob(),
+			registryReturning({ phase: 'implementation', taskId: '100', workItem }),
+		);
+
+		expect(outcome.status).toBe('phase-failed');
+	});
+
 	// Issue #596: the run row's exit metadata must agree with the reason the same settle
 	// writes into `error`, and must stay silent when nothing reported it.
 	it('records the timed-out run’s own exit metadata on the deferred row', async () => {

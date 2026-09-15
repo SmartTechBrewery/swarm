@@ -342,3 +342,41 @@ export function sessionIdFromLine(cli: AgentCli, line: string): string | undefin
 		}
 	}
 }
+
+// agy's own print-mode cap: when it fires, the CLI prints whatever the turn
+// produced so far, writes this notice on stderr, and exits 0 (issue #999's
+// finding, ai/RULES.md §6). Deliberately narrow — both halves of the phrase must
+// be present — so an agent transcript or a CI log that merely mentions a print
+// timeout is not mistaken for the CLI's own notice. A miss then degrades to the
+// pre-#1000 behaviour (a terminal missing-hand-off failure) rather than to a
+// false timeout deferral, the same fail-safe direction the rate-limit patterns
+// in `./agent-failure.ts` document for themselves.
+const ANTIGRAVITY_PRINT_TIMEOUT_RE = /\bprint timeout after\b.*\bwith turn in progress\b/i;
+
+/**
+ * The CLI's own "I ended this turn myself" notice on a *single* raw stderr line,
+ * verbatim, or `undefined` when the line carries none (issue #1000).
+ *
+ * Read off the live stderr line stream for the same reason
+ * {@link sessionIdFromLine} is read off stdout's (issue #867): a run that floods
+ * `maxOutputBytes` latches its head buffer, so a marker written at the very end
+ * of a chatty run falls outside it. The *line* is returned rather than a boolean
+ * because the verbatim text is what has to reach `runs.error` and the PR comment
+ * — the whole point being that the operator sees the cause without opening the
+ * database.
+ *
+ * Matched only for `antigravity`: issue #999 checked `claude --help` and
+ * `codex exec --help` and neither declares a self-timeout of its own, so there
+ * is nothing to recognise for them — and matching per CLI is also what keeps one
+ * CLI's wording from classifying another's run. A fourth CLI adds a case here,
+ * not a new mechanism.
+ */
+export function selfTimeoutFromLine(cli: AgentCli, line: string): string | undefined {
+	switch (cli) {
+		case 'claude':
+		case 'codex':
+			return undefined;
+		case 'antigravity':
+			return ANTIGRAVITY_PRINT_TIMEOUT_RE.test(line) ? line.trim() : undefined;
+	}
+}

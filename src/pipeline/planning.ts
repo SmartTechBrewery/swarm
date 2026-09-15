@@ -58,7 +58,7 @@ import {
 	describeAgent,
 	runAgentCli,
 } from '@/harness/agent-cli.js';
-import { agentRunError } from '@/harness/agent-failure.js';
+import { agentRunError, agentRunFailed } from '@/harness/agent-failure.js';
 import type { ReasoningLevel } from '@/harness/models.js';
 import { logger } from '@/lib/logger.js';
 import { assertDependenciesSatisfied } from '@/pipeline/dependency-guard.js';
@@ -2544,7 +2544,7 @@ export async function runPlanningPhase(
 			signal,
 		});
 
-		if (agent.exitCode !== 0) {
+		if (agentRunFailed(agent)) {
 			logAgentFailure(taskId, workItem.id, agent);
 			const error = agentRunError(
 				agent,

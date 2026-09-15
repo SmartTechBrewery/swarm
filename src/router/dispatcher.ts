@@ -506,7 +506,11 @@ export function adaptResultToPhaseRun(
 		result.reason ?? `Phase deferred (${kind}) on the worker`,
 		// The whole classified failure, not the kind alone (issue #980) — which is what
 		// the comment above this block has always claimed and, until now, did not do.
-		{ kind, ...reportedRetryHint(result, kind) },
+		// `cliSelfTimeout` rides along for issue #1000: the worker classified a CLI
+		// that ended its own turn, and the shared deferral rule needs the notice here
+		// because the frame's own `exitCode: 0` cannot tell that run apart from a clean
+		// one. An older worker omits it and its frames behave exactly as before.
+		{ kind, cliSelfTimeout: result.cliSelfTimeout, ...reportedRetryHint(result, kind) },
 		// The frame's own reported metadata, not a `?? 1 / 0 ms / false` stand-in
 		// (issue #596). A frame that reports no exit code leaves `exitCode: null`, which
 		// still satisfies the shared "genuinely interrupted" timeout rule

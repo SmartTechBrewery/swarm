@@ -577,6 +577,50 @@ describe('adaptResultToPhaseRun exit metadata', () => {
 		expect(err.agent?.exitCode).not.toBe(0);
 	});
 
+	// Issue #1000: the frame's own `exitCode: 0` cannot tell a self-timed-out run apart
+	// from a clean one, so without the notice crossing the wire the control plane
+	// re-judges the worker's deferral into a terminal failure — the exact disposition
+	// the issue is about — and the operator-facing message loses the cause too.
+	it('keeps a self-timeout deferral deferrable across the wire, despite its exit 0', () => {
+		const AGY_PRINT_TIMEOUT =
+			'[agy] print timeout after 5m0s with turn in progress; returning partial output';
+		const frame = deferrableOrFailedResult(
+			new AgentRunError(
+				`Implementation agent (antigravity) exited with code 0 (CLI timed out: ${AGY_PRINT_TIMEOUT})`,
+				{ kind: 'timeout', cliSelfTimeout: AGY_PRINT_TIMEOUT },
+				{
+					cli: 'antigravity',
+					exitCode: 0,
+					signal: null,
+					stdout: '',
+					stderr: `${AGY_PRINT_TIMEOUT}\n`,
+					durationMs: 300_000,
+					timedOut: false,
+					aborted: false,
+					outputTruncated: false,
+				},
+			),
+			ASSIGNMENT(),
+		);
+		expect(frame).toMatchObject({ status: 'deferred', cliSelfTimeout: AGY_PRINT_TIMEOUT });
+
+		const err = thrownAgent(frame);
+		expect(err.failure).toMatchObject({ kind: 'timeout', cliSelfTimeout: AGY_PRINT_TIMEOUT });
+		expect(err.agent?.exitCode).toBe(0);
+		expect(err.message).toContain(AGY_PRINT_TIMEOUT);
+	});
+
+	it('leaves an older worker’s exit-0 timeout frame terminal, field absent', () => {
+		// Back-compat in the direction that matters: a worker that predates the field
+		// omits it, and its frames behave exactly as they do today.
+		const err = thrownAgent(
+			base({ status: 'deferred', failureKind: 'timeout', reason: 'stop', exitCode: 0 }),
+		);
+
+		expect(err.failure.cliSelfTimeout).toBeUndefined();
+		expect(err.agent?.exitCode).toBe(0);
+	});
+
 	// A terminal `failed` used to throw a plain `Error`, so `finalizeFailedRun` — which
 	// reads the columns off `AgentRunError.agent` — recorded nothing at all.
 	it('rebuilds a terminal failed frame as an inert AgentRunError carrying its metadata', () => {

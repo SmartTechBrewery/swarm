@@ -68,7 +68,7 @@ import {
 	describeAgent,
 	runAgentCli,
 } from '@/harness/agent-cli.js';
-import { agentRunError } from '@/harness/agent-failure.js';
+import { agentRunError, agentRunFailed } from '@/harness/agent-failure.js';
 import type { ReasoningLevel } from '@/harness/models.js';
 import { requireProjectSCMProvider } from '@/integrations/scm/registry.js';
 import { logger } from '@/lib/logger.js';
@@ -567,7 +567,7 @@ export async function runImplementationPhase(
 					env: { GH_TOKEN: agentToken },
 				});
 
-		if (agent.exitCode !== 0) {
+		if (agentRunFailed(agent)) {
 			logAgentFailure(taskId, workItem.id, agent);
 			const error = agentRunError(
 				agent,

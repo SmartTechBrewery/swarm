@@ -1,7 +1,12 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import type { AgentCliResult } from '@/harness/agent-cli.js';
-import { AgentRunError, agentRunError, classifyAgentFailure } from '@/harness/agent-failure.js';
+import {
+	AgentRunError,
+	agentRunError,
+	agentRunFailed,
+	classifyAgentFailure,
+} from '@/harness/agent-failure.js';
 import {
 	CODEX_USAGE_LIMIT_ERROR_LINE,
 	CODEX_USAGE_LIMIT_LOG_TEXT,
@@ -931,5 +936,74 @@ describe('agentRunError', () => {
 	it('leaves .agent undefined when the error is constructed directly', () => {
 		const err = new AgentRunError('synthetic', { kind: 'error' });
 		expect(err.agent).toBeUndefined();
+	});
+});
+
+describe('a CLI that timed itself out (issue #1000)', () => {
+	// The live notice, verbatim, from the `under-control-platform` runs: agy prints
+	// the partial turn, writes this on stderr, and exits **0**.
+	const AGY_PRINT_TIMEOUT =
+		'[agy] print timeout after 5m0s with turn in progress; returning partial output';
+	const selfTimedOut = (overrides: Partial<AgentCliResult> = {}): AgentCliResult =>
+		result({ cli: 'antigravity', exitCode: 0, cliSelfTimeout: AGY_PRINT_TIMEOUT, ...overrides });
+
+	it("classifies it as a timeout carrying the CLI's own notice", () => {
+		expect(classifyAgentFailure(selfTimedOut(), NOW)).toEqual({
+			kind: 'timeout',
+			cliSelfTimeout: AGY_PRINT_TIMEOUT,
+		});
+	});
+
+	it('names the cause in the message instead of the bare timeout marker', () => {
+		// What `runs.error`, the dashboard run row and the PR comment now carry — the
+		// cause used to be reachable only by reading `run_output_events` out of
+		// Postgres, while the operator was told a hand-off was missing.
+		const err = agentRunError(
+			selfTimedOut(),
+			'Resolve-conflicts agent (antigravity) exited with code 0',
+			' for PR #162',
+			NOW,
+		);
+		expect(err.message).toBe(
+			`Resolve-conflicts agent (antigravity) exited with code 0 (CLI timed out: ${AGY_PRINT_TIMEOUT}) for PR #162`,
+		);
+		expect(err.failure.kind).toBe('timeout');
+		expect(err.message).not.toMatch(/did not write required hand-off/);
+	});
+
+	it("lets SWARM's own kill win over the CLI's notice", () => {
+		// Ordering is deliberate: when SWARM's `timeoutMs` fired or the caller
+		// cancelled, that is the cause and the CLI's own cap never got to.
+		expect(classifyAgentFailure(selfTimedOut({ timedOut: true }), NOW)).toEqual({
+			kind: 'timeout',
+		});
+		expect(classifyAgentFailure(selfTimedOut({ aborted: true }), NOW)).toEqual({
+			kind: 'aborted',
+		});
+	});
+
+	it("does not let another CLI's output classify the run", () => {
+		// The notice is structural — it is set only by the per-CLI stderr sniff — so
+		// an agent transcript merely containing the phrase changes nothing.
+		expect(classifyAgentFailure(result({ exitCode: 1, stdout: AGY_PRINT_TIMEOUT }), NOW)).toEqual({
+			kind: 'error',
+		});
+	});
+
+	describe('agentRunFailed', () => {
+		it('fails a non-zero exit, as it always has', () => {
+			expect(agentRunFailed(result({ exitCode: 1 }))).toBe(true);
+			expect(agentRunFailed(result({ exitCode: null }))).toBe(true);
+		});
+
+		it('fails an exit-0 run whose CLI said it cut the turn', () => {
+			// The gate the phases apply before reading any hand-off: exit 0 alone used
+			// to pass this run through to `readHandoff`.
+			expect(agentRunFailed(selfTimedOut())).toBe(true);
+		});
+
+		it('passes a clean exit-0 run', () => {
+			expect(agentRunFailed(result({ exitCode: 0 }))).toBe(false);
+		});
 	});
 });
