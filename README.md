@@ -198,7 +198,7 @@ work. **On macOS** it can run from a launchd agent instead, started at login —
 from the checkout it was registered for:
 
 ```bash
-swarm-worker-agent install        # then: status · logs · uninstall
+swarm-worker-agent install        # then: status · logs · update · uninstall
 ```
 
 A local install is single-user by default: no account to create, no password, no

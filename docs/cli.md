@@ -986,12 +986,13 @@ half-working.)
 | `swarm-api-agent uninstall` | Stop the agent and remove it (logs are kept). |
 | `swarm-api-agent status` | Loaded? pid? last exit code? plus a live `/health` answer, which `launchctl` alone cannot distinguish from a `KeepAlive` restart loop. |
 | `swarm-api-agent restart` | `launchctl kickstart -k`, then wait for `/health`. For an `.env` change, a migration, or a wedged server — pulled *source* changes are already picked up by `dev:api`'s `--watch`. |
-| `swarm-api-agent reload [--all]` | Run [`npm run reload`](#services) (`--all`: `reload:all`) in the foreground, then restart and wait for `/health`. A failed migration or build stops the chain before the restart. Workers are still yours to restart. |
+| `swarm-api-agent reload [--all]` | Run [`npm run reload`](#services) (`--all`: `reload:all`) in the foreground, then restart and wait for `/health`. A failed migration or build stops the chain before the restart. Workers are still yours to restart (`swarm-worker-agent update`). |
 | `swarm-api-agent logs` | Tail this installation's stdout + stderr logs. |
 | `swarm-worker-agent install` | Write and start the worker's LaunchAgent for a registered worker checkout — a wrapper around [`swarm run:worker`](#swarm-runworker). Refuses while a worker is already running for that checkout. |
 | `swarm-worker-agent uninstall` | Stop that agent and remove it (logs are kept). |
 | `swarm-worker-agent status` | Show whether that checkout's agent is loaded and running. |
 | `swarm-worker-agent logs` | Tail that checkout's worker logs. |
+| `swarm-worker-agent update [<checkout>]` | The emergency update, run on the machine itself: `git pull --ff-only` + `npm ci` + `npm run build` in **this SWARM installation** (the checkout the agents' `swarm` launcher resolves into, not the worker checkout), then restart every worker agent running it. All three steps run in the foreground and a failure stops the chain before anything restarts, so a failed pull or build leaves every daemon on the build it already had. With a `<checkout>` it restarts only that agent; the installation is pulled and rebuilt either way, since there is one build behind all of them. `kickstart -k` kills a daemon outright, so a phase in flight is lost. |
 | `swarm-repo-renamed <old> <new> [--dry-run]` | Re-point every worker checkout on this machine whose `origin` is `<old-owner/repo>`, then restart its agent. Run it **after** the control plane knows the new name. |
 
 Full detail, including what the generated plists do and why:

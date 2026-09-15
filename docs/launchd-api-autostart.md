@@ -74,8 +74,10 @@ swarm-api-agent reload --all     # npm run reload:all, then restart, then wait f
   running it anyway costs a few seconds.
 - **Workers are never restarted for you.** They run phase code from their own
   checkouts, on their own machines — `reload:all` only reminds you, and so does
-  this. Restart them yourself (`swarm-worker-agent`, or however that host starts
-  its daemon).
+  this. Restart them yourself — on a launchd host that is
+  [`swarm-worker-agent update`](./launchd-worker-autostart.md#after-a-git-pull--the-update-flow),
+  which pulls and rebuilds that machine's SWARM installation before restarting its
+  agents; otherwise however that host starts its daemon.
 
 ## What the generated agent does, and why
 
