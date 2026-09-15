@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
 	canRecoverRun,
+	type OverrideSelection,
+	overrideSelectionChanged,
 	recoverButtonLabel,
 	recoveryChoices,
 	recoveryOverrideSubmitLabel,
+	recoveryRetryChoiceLabel,
 } from './run-recovery.js';
 import { retryButtonLabel } from './run-retry.js';
 
@@ -92,15 +95,71 @@ describe('recoverButtonLabel', () => {
 	});
 });
 
+describe('overrideSelectionChanged', () => {
+	const seeded: OverrideSelection = {
+		cli: 'antigravity',
+		model: 'gemini-3.8-flash',
+		reasoning: 'high',
+	};
+
+	it('reports nothing changed while the fields still hold the run’s own settings', () => {
+		expect(overrideSelectionChanged(seeded, { ...seeded })).toBe(false);
+	});
+
+	// The reported defect: only the model moved, within the same CLI (issue #989).
+	it('reports a model-only edit, so a same-CLI downgrade still submits an override', () => {
+		expect(overrideSelectionChanged(seeded, { ...seeded, model: 'gemini-3.7-flash' })).toBe(true);
+	});
+
+	it.each([
+		['cli', { cli: 'claude' }],
+		['reasoning', { reasoning: 'low' }],
+	] as const)('reports a %s edit', (_field, patch) => {
+		expect(overrideSelectionChanged(seeded, { ...seeded, ...patch })).toBe(true);
+	});
+
+	it('treats a run with no reasoning of its own as unchanged until one is picked', () => {
+		const none: OverrideSelection = { cli: 'claude', model: 'opus', reasoning: '' };
+		expect(overrideSelectionChanged(none, { ...none })).toBe(false);
+		expect(overrideSelectionChanged(none, { ...none, reasoning: 'xhigh' })).toBe(true);
+	});
+});
+
+describe('recoveryRetryChoiceLabel', () => {
+	it.each([
+		['retry', 'Retry now'],
+		['resume', 'Resume'],
+		['recheck', 'Recheck and retry'],
+		['continue', 'Continue now'],
+	] as const)('keeps the %s run’s own server semantics while the fields are untouched', (kind, label) => {
+		expect(recoveryRetryChoiceLabel(kind, false)).toBe(label);
+		// …which is the same wording the side-by-side buttons use for that kind.
+		expect(recoveryRetryChoiceLabel(kind, false)).toBe(retryButtonLabel(kind, false));
+	});
+
+	it.each([
+		['retry', 'Retry with these settings'],
+		['resume', 'Retry with these settings'],
+		['recheck', 'Recheck with these settings'],
+		['continue', 'Continue with these settings'],
+	] as const)('becomes the override submit for a %s run once a field is edited', (kind, label) => {
+		expect(recoveryRetryChoiceLabel(kind, true)).toBe(label);
+		expect(recoveryRetryChoiceLabel(kind, true)).toBe(recoveryOverrideSubmitLabel(kind));
+	});
+});
+
 describe('recoveryOverrideSubmitLabel', () => {
-	it('distinguishes the override submit from the plain retry choice beside it', () => {
+	it('distinguishes the override submit from the plain retry choice it replaces', () => {
 		for (const kind of ['retry', 'resume', 'recheck', 'continue'] as const) {
 			expect(recoveryOverrideSubmitLabel(kind)).not.toBe(retryButtonLabel(kind, false));
 		}
 	});
 
-	it('keeps a continuation reading as a continuation', () => {
+	// An override changes which agent runs, never what the server does around it —
+	// except for a resume, which it really does abandon.
+	it('keeps each kind’s own verb, and drops it only for a resume', () => {
 		expect(recoveryOverrideSubmitLabel('continue')).toBe('Continue with these settings');
+		expect(recoveryOverrideSubmitLabel('recheck')).toBe('Recheck with these settings');
 		expect(recoveryOverrideSubmitLabel('resume')).toBe('Retry with these settings');
 		expect(recoveryOverrideSubmitLabel('retry')).toBe('Retry with these settings');
 	});

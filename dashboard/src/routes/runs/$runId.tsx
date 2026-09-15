@@ -36,11 +36,13 @@ import { resolveRunDurationMs, useNow } from '@/lib/run-duration.js';
 import { isMaintenanceRun } from '@/lib/run-kind.js';
 import {
 	canRecoverRun,
+	type OverrideSelection,
+	overrideSelectionChanged,
 	type RecoveryChoices,
 	type RecoveryPending,
 	recoverButtonLabel,
 	recoveryChoices,
-	recoveryOverrideSubmitLabel,
+	recoveryRetryChoiceLabel,
 } from '@/lib/run-recovery.js';
 import {
 	canResetRun,
@@ -109,6 +111,23 @@ function capitalizeLevel(value: string): string {
  */
 function continuesPriorWork(kind: RetryActionKind): boolean {
 	return kind === 'resume' || kind === 'continue';
+}
+
+/**
+ * The same question for the Recover popup's single button, which also has to
+ * account for the override fields below it (issue #989): an edited selection makes
+ * the server start a fresh session, so a "Resume" stops carrying prior work the
+ * moment one is changed — while a checkpoint continuation does not, because it
+ * runs a fresh session seeded from the recorded remainder either way and is
+ * CLI-agnostic by construction.
+ *
+ * That `'continue'` arm is unreachable from today's only caller — the Recover
+ * control is scoped to the error states, and only a `checkpointed` run resolves
+ * `'continue'` — but it is stated rather than omitted so the function is total
+ * over `RetryActionKind`, which is what `recoveryChoices` can return.
+ */
+function carriesPriorWorkWith(kind: RetryActionKind, selectionChanged: boolean): boolean {
+	return kind === 'continue' || (continuesPriorWork(kind) && !selectionChanged);
 }
 
 /**
@@ -240,29 +259,28 @@ interface RetryOverrides {
 	reasoning?: ReasoningLevel;
 }
 
+/** The override selects' own state, plus how it compares to the run's settings. */
+interface OverrideSelectionState {
+	/** What the fields currently hold. */
+	selection: OverrideSelection;
+	/** Whether the operator moved any field off the run's own settings. */
+	changed: boolean;
+	selectCli: (cli: RunAgent) => void;
+	selectModel: (model: string) => void;
+	selectReasoning: (reasoning: ReasoningLevel | '') => void;
+}
+
 /**
- * The agent-CLI / model / reasoning selects a manual retry can override, plus the
- * footer that submits them. Extracted from `RetryNowButton` (issue #593) so the
- * unified Recover popup offers the same overrides rather than a second copy of
- * them; the caller owns the mutation, the popup's open state, and the heading.
+ * The override selects' state, seeded from the run's own engine/model (decomposing
+ * a legacy combined antigravity string, issue #180) and resynced when the run row
+ * changes underneath it, so a background refetch never leaves a stale selection
+ * armed.
  *
- * The selects seed from the run's own engine/model (decomposing a legacy combined
- * antigravity string, issue #180) and resync when the run row changes underneath
- * them, so a background refetch never leaves a stale selection armed.
+ * Held in a hook rather than inside the fields (issue #989) because the Recover
+ * popup's *action button* has to read it: it submits the selection only when the
+ * operator actually edited one, and names itself accordingly.
  */
-function RetryOverridePanel({
-	run,
-	submitLabel,
-	onSubmit,
-	onCancel,
-	disabled = false,
-}: {
-	run: RunRow;
-	submitLabel: string;
-	onSubmit: (overrides: RetryOverrides) => void;
-	onCancel?: () => void;
-	disabled?: boolean;
-}) {
+function useOverrideSelection(run: RunRow): OverrideSelectionState {
 	const currentCli = (
 		run.engine && (RUN_AGENTS as readonly string[]).includes(run.engine)
 			? (run.engine as RunAgent)
@@ -293,6 +311,60 @@ function RetryOverridePanel({
 		setSelectedReasoning(currentReasoning ?? '');
 	}, [currentCli, currentModel, currentReasoning]);
 
+	const seeded: OverrideSelection = {
+		cli: currentCli,
+		model: currentModel,
+		reasoning: currentReasoning ?? '',
+	};
+	const selection: OverrideSelection = {
+		cli: selectedCli,
+		model: selectedModel,
+		reasoning: selectedReasoning,
+	};
+
+	return {
+		selection,
+		changed: overrideSelectionChanged(seeded, selection),
+		selectCli: (cli) => {
+			setSelectedCli(cli);
+			setSelectedModel(MODEL_CAPABILITIES[cli][0].id);
+			// Reasoning is model-specific — clear it on any CLI change.
+			setSelectedReasoning('');
+		},
+		selectModel: (model) => {
+			setSelectedModel(model);
+			// Drop the reasoning if the new model doesn't support it.
+			const stillValid =
+				selectedReasoning &&
+				(reasoningChoicesFor(selectedCli, model) as readonly string[]).includes(selectedReasoning);
+			if (!stillValid) setSelectedReasoning('');
+		},
+		selectReasoning: setSelectedReasoning,
+	};
+}
+
+/** The `runs.retryNow` overrides a selection stands for. */
+function overridesFrom(selection: OverrideSelection): RetryOverrides {
+	return {
+		cli: selection.cli,
+		model: selection.model,
+		reasoning: selection.reasoning || undefined,
+	};
+}
+
+/**
+ * The agent-CLI / model / reasoning selects a manual retry can override. The
+ * caller owns the state ({@link useOverrideSelection}) and whatever submits it, so
+ * the same three fields serve the split button's popup — which submits them from
+ * its own footer — and the Recover popup, whose single action button does.
+ */
+function RetryOverrideFields({
+	selection,
+	selectCli,
+	selectModel,
+	selectReasoning,
+}: Pick<OverrideSelectionState, 'selection' | 'selectCli' | 'selectModel' | 'selectReasoning'>) {
+	const { cli: selectedCli, model: selectedModel, reasoning: selectedReasoning } = selection;
 	const reasoningOptions = reasoningChoicesFor(selectedCli, selectedModel);
 
 	return (
@@ -307,13 +379,7 @@ function RetryOverridePanel({
 				<select
 					id="agent-cli-select"
 					value={selectedCli}
-					onChange={(e) => {
-						const newCli = e.target.value as RunAgent;
-						setSelectedCli(newCli);
-						setSelectedModel(MODEL_CAPABILITIES[newCli][0].id);
-						// Reasoning is model-specific — clear it on any CLI change.
-						setSelectedReasoning('');
-					}}
+					onChange={(e) => selectCli(e.target.value as RunAgent)}
 					className="w-full bg-zinc-950 border border-zinc-850 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:ring-1 focus:ring-violet-500"
 				>
 					{RUN_AGENTS.map((cli) => (
@@ -334,17 +400,7 @@ function RetryOverridePanel({
 				<select
 					id="model-select"
 					value={selectedModel}
-					onChange={(e) => {
-						const newModel = e.target.value;
-						setSelectedModel(newModel);
-						// Drop the reasoning if the new model doesn't support it.
-						const stillValid =
-							selectedReasoning &&
-							(reasoningChoicesFor(selectedCli, newModel) as readonly string[]).includes(
-								selectedReasoning,
-							);
-						if (!stillValid) setSelectedReasoning('');
-					}}
+					onChange={(e) => selectModel(e.target.value)}
 					className="w-full bg-zinc-950 border border-zinc-850 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:ring-1 focus:ring-violet-500"
 				>
 					{MODEL_CAPABILITIES[selectedCli].map((m) => (
@@ -365,7 +421,7 @@ function RetryOverridePanel({
 				<select
 					id="reasoning-select"
 					value={selectedReasoning}
-					onChange={(e) => setSelectedReasoning(e.target.value as ReasoningLevel | '')}
+					onChange={(e) => selectReasoning(e.target.value as ReasoningLevel | '')}
 					disabled={reasoningOptions.length === 0}
 					className="w-full bg-zinc-950 border border-zinc-850 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:ring-1 focus:ring-violet-500 disabled:opacity-50 disabled:text-zinc-500"
 				>
@@ -386,6 +442,40 @@ function RetryOverridePanel({
 					))}
 				</select>
 			</div>
+		</div>
+	);
+}
+
+/**
+ * The override fields plus the footer that submits them — the split retry
+ * button's popup, which offers the plain action as its own separate main button
+ * outside this popup.
+ *
+ * The Recover popup deliberately does *not* use this: there the plain action lives
+ * inside the same popup, so a second submit button would be the trap issue #989
+ * removed (see {@link recoveryRetryChoiceLabel}).
+ */
+function RetryOverridePanel({
+	run,
+	submitLabel,
+	onSubmit,
+	onCancel,
+}: {
+	run: RunRow;
+	submitLabel: string;
+	onSubmit: (overrides: RetryOverrides) => void;
+	onCancel?: () => void;
+}) {
+	const { selection, selectCli, selectModel, selectReasoning } = useOverrideSelection(run);
+
+	return (
+		<div className="space-y-3 text-left">
+			<RetryOverrideFields
+				selection={selection}
+				selectCli={selectCli}
+				selectModel={selectModel}
+				selectReasoning={selectReasoning}
+			/>
 
 			<div className="pt-2 flex justify-end gap-2">
 				{onCancel && (
@@ -399,15 +489,8 @@ function RetryOverridePanel({
 				)}
 				<button
 					type="button"
-					onClick={() =>
-						onSubmit({
-							cli: selectedCli,
-							model: selectedModel,
-							reasoning: selectedReasoning || undefined,
-						})
-					}
-					disabled={disabled}
-					className="px-3 py-1.5 text-xs font-semibold text-white bg-violet-600 rounded hover:bg-violet-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+					onClick={() => onSubmit(overridesFrom(selection))}
+					className="px-3 py-1.5 text-xs font-semibold text-white bg-violet-600 rounded hover:bg-violet-500 transition-colors cursor-pointer"
 				>
 					{submitLabel}
 				</button>
@@ -830,6 +913,16 @@ export function ResetRunButton({
  * and hue, and "Reset & restart", which picks up its existing confirmation
  * instead of submitting here — followed by the override fields a retry can carry.
  *
+ * The retry entry *is* the override fields' submit (issue #989). It used to be a
+ * plain retry with its own quiet "Retry with these settings" button under the
+ * fields, which meant the popup's one prominent button silently discarded a
+ * selection the operator had just made: run 9865ce7a-… was re-dispatched on the
+ * very model it had just failed on, its rebuilt payload carrying no
+ * `modelOverride` at all. So the fields now drive the button — it submits them
+ * once one is edited, and names itself so before it is clicked — and there is no
+ * second button to miss. Untouched fields still submit *nothing*, which is what
+ * keeps "Resume" a resume rather than a fresh start.
+ *
  * Every submit is guarded by `blocked`, so a popup left open across a background
  * refetch that surfaces an accepted request cannot fire the alternate action.
  */
@@ -849,6 +942,7 @@ function RecoveryOptionsPopup({
 	onClose: () => void;
 }) {
 	const kind = choices.retry;
+	const { selection, changed, selectCli, selectModel, selectReasoning } = useOverrideSelection(run);
 
 	return (
 		<>
@@ -870,16 +964,19 @@ function RecoveryOptionsPopup({
 					{kind && (
 						<button
 							type="button"
-							onClick={() => onRetry({})}
+							// An untouched selection submits no overrides at all: the server reads
+							// any of the three as "start fresh", which would quietly turn a
+							// resume or a preserved-checkout adoption into a restart.
+							onClick={() => onRetry(changed ? overridesFrom(selection) : {})}
 							disabled={blocked}
-							className={`w-full inline-flex items-center gap-2 px-3 py-2 text-sm font-semibold text-white rounded-md focus:outline-none focus:ring-1 focus:ring-offset-1 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer ${retrySplitPalette(kind).main}`}
+							className={`w-full inline-flex items-center gap-2 px-3 py-2 text-sm font-semibold text-white rounded-md focus:outline-none focus:ring-1 focus:ring-offset-1 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer ${retrySplitPalette(carriesPriorWorkWith(kind, changed) ? kind : 'retry').main}`}
 						>
-							{continuesPriorWork(kind) ? (
+							{carriesPriorWorkWith(kind, changed) ? (
 								<Play className="h-4 w-4" />
 							) : (
 								<RefreshCw className="h-4 w-4" />
 							)}
-							{retryButtonLabel(kind, false)}
+							{recoveryRetryChoiceLabel(kind, changed)}
 						</button>
 					)}
 
@@ -901,11 +998,11 @@ function RecoveryOptionsPopup({
 				{kind && (
 					<div className="mt-4 pt-4 border-t border-zinc-850">
 						<RetryOverrideHeading kind={kind} />
-						<RetryOverridePanel
-							run={run}
-							submitLabel={recoveryOverrideSubmitLabel(kind)}
-							disabled={blocked}
-							onSubmit={onRetry}
+						<RetryOverrideFields
+							selection={selection}
+							selectCli={selectCli}
+							selectModel={selectModel}
+							selectReasoning={selectReasoning}
 						/>
 					</div>
 				)}
