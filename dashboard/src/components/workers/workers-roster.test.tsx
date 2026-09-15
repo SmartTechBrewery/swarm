@@ -12,6 +12,7 @@ const {
 	listMineQueryFn,
 	rosterQueryFn,
 	workersQueryOptions,
+	meQueryFn,
 	reorderMutate,
 	navigate,
 } = vi.hoisted(() => ({
@@ -20,6 +21,7 @@ const {
 	listMineQueryFn: vi.fn(),
 	rosterQueryFn: vi.fn(),
 	workersQueryOptions: vi.fn(),
+	meQueryFn: vi.fn(),
 	reorderMutate: vi.fn(),
 	navigate: vi.fn(),
 }));
@@ -46,6 +48,9 @@ vi.mock('@/lib/trpc.js', () => ({
 			list: {
 				queryOptions: () => ({ queryKey: ['projects.list'], queryFn: projectsListQueryFn }),
 			},
+		},
+		auth: {
+			me: { queryOptions: () => ({ queryKey: ['auth.me'], queryFn: meQueryFn }) },
 		},
 	},
 	trpcClient: {
@@ -99,6 +104,7 @@ beforeEach(() => {
 		workersQueryOptions,
 		listMineQueryFn,
 		rosterQueryFn,
+		meQueryFn,
 		reorderMutate,
 		navigate,
 	]) {
@@ -113,6 +119,10 @@ beforeEach(() => {
 	// consent control renders unless a test opts in.
 	listMineQueryFn.mockResolvedValue([]);
 	rosterQueryFn.mockResolvedValue([]);
+	// Most of this file predates the toolbar's viewer read, so leave the viewer
+	// unresolved by default: no test gets the fleet action unless it asks for one,
+	// and the tests that never mention a viewer settle no extra query behind them.
+	meQueryFn.mockReturnValue(new Promise(() => {}));
 });
 
 describe('WorkersRoster scoping (issue #574)', () => {
@@ -350,5 +360,77 @@ describe('WorkersRoster search (issue #897)', () => {
 
 		fireEvent.change(searchBox(), { target: { value: '' } });
 		expect(screen.getAllByRole('button', { name: /^Move / }).length).toBeGreaterThan(0);
+	});
+});
+
+/**
+ * The fleet action in the roster's toolbar: installation-wide, so it is offered
+ * only on the unscoped roster and only to an instance administrator. Both halves
+ * are asserted because either one alone would put it in front of a viewer the
+ * `/workers` gate exists to keep it from.
+ */
+describe('WorkersRoster fleet update action', () => {
+	const FLEET_BUTTON = { name: 'Update all workers' } as const;
+
+	function asInstanceAdmin() {
+		meQueryFn.mockResolvedValue({
+			id: 'u1',
+			identifier: 'ada@example.com',
+			displayName: 'Ada Lovelace',
+			instanceAdmin: true,
+		});
+	}
+
+	it('offers it on the installation-wide roster to an instance administrator', async () => {
+		asInstanceAdmin();
+		workersListQueryFn.mockResolvedValue([makeWorker()]);
+		renderRoster(<WorkersRoster />);
+
+		expect(await screen.findByRole('button', FLEET_BUTTON)).toBeDefined();
+	});
+
+	it('withholds it from a viewer without the installation role', async () => {
+		meQueryFn.mockResolvedValue({
+			id: 'u1',
+			identifier: 'ada@example.com',
+			displayName: 'Ada Lovelace',
+			instanceAdmin: false,
+		});
+		workersListQueryFn.mockResolvedValue([makeWorker()]);
+		renderRoster(<WorkersRoster />);
+
+		await screen.findByText('ada-laptop');
+		expect(screen.queryByRole('button', FLEET_BUTTON)).toBeNull();
+	});
+
+	it('withholds it on a project tab even from an administrator', async () => {
+		// "All workers" there would read as that project's, which is not what it does.
+		asInstanceAdmin();
+		workersListQueryFn.mockResolvedValue([makeWorker()]);
+		renderRoster(<WorkersRoster projectId="proj-a" />);
+
+		await screen.findByText('ada-laptop');
+		expect(screen.queryByRole('button', FLEET_BUTTON)).toBeNull();
+	});
+
+	it('withholds it while the viewer is still unresolved', async () => {
+		// `canViewInstanceWide`'s own contract: absent or unresolved denies, so the
+		// button never flashes in before the role is known.
+		meQueryFn.mockReturnValue(new Promise(() => {}));
+		workersListQueryFn.mockResolvedValue([makeWorker()]);
+		renderRoster(<WorkersRoster />);
+
+		await screen.findByText('ada-laptop');
+		expect(screen.queryByRole('button', FLEET_BUTTON)).toBeNull();
+	});
+
+	it('renders it inert until it is wired up, rather than as a live control', async () => {
+		asInstanceAdmin();
+		workersListQueryFn.mockResolvedValue([makeWorker()]);
+		renderRoster(<WorkersRoster />);
+
+		const button = (await screen.findByRole('button', FLEET_BUTTON)) as HTMLButtonElement;
+		expect(button.disabled).toBe(true);
+		expect(button.title).toContain('Not wired up yet');
 	});
 });

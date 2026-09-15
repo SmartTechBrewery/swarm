@@ -1,9 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from '@tanstack/react-router';
-import { Search, SearchX, Server } from 'lucide-react';
+import { RefreshCw, Search, SearchX, Server } from 'lucide-react';
 import { useState } from 'react';
 import { WorkersTable } from '@/components/workers/workers-table.js';
+import { canViewInstanceWide } from '@/lib/instance-admin.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
+import { useCurrentUser } from '@/lib/use-current-user.js';
 import { filterWorkersBySearch } from '@/lib/worker-search.js';
 import { WORKERS_REFETCH_MS } from '@/lib/workers-refresh.js';
 import type { WorkerRow } from '@/types/workers.js';
@@ -125,7 +127,7 @@ export function WorkersRoster({ projectId, canReorder = false }: WorkersRosterPr
 		const visible = filterWorkersBySearch(workers, query);
 		return (
 			<div className="space-y-4">
-				<WorkersSearchBox value={search} onChange={setSearch} />
+				<RosterToolbar projectId={projectId} search={search} onSearchChange={setSearch} />
 				{visible.length > 0 ? (
 					<WorkersTable
 						workers={visible}
@@ -153,6 +155,45 @@ export function WorkersRoster({ projectId, canReorder = false }: WorkersRosterPr
 }
 
 /**
+ * The row above the table: narrowing the list on the left, acting on the fleet on
+ * the right, wrapping to two rows on a phone rather than crushing either.
+ *
+ * It decides what it offers rather than being told, which is why it reads the
+ * viewer itself. The fleet action turns on two conditions, and neither is
+ * redundant. It is installation-wide — every registered machine, not the rows in
+ * front of you — so it belongs only on the unscoped roster: on a project's Workers
+ * tab "all workers" would read as that project's, which is not what it does. And it
+ * is an instance administrator's act, asked here rather than inferred from the fact
+ * that `/workers` already renders behind that gate, so mounting the roster anywhere
+ * else can never hand the button to a viewer the gate would have refused. An
+ * unresolved viewer offers nothing, which is `canViewInstanceWide`'s own contract.
+ * The server stays the enforcement point either way, exactly as it is for the
+ * roster read itself.
+ */
+function RosterToolbar({
+	projectId,
+	search,
+	onSearchChange,
+}: {
+	projectId?: string;
+	search: string;
+	onSearchChange: (next: string) => void;
+}) {
+	const currentUser = useCurrentUser();
+	const canRequestFleetUpdate = !projectId && canViewInstanceWide(currentUser.data);
+
+	// One line: the search field grows into the space up to `max-w-sm`, the action is
+	// pushed to the right edge, and only a window too narrow for both drops the button
+	// to a second row rather than squeezing the input below readable.
+	return (
+		<div className="flex flex-wrap items-center justify-between gap-3">
+			<WorkersSearchBox value={search} onChange={onSearchChange} />
+			{canRequestFleetUpdate ? <FleetUpdateButton /> : null}
+		</div>
+	);
+}
+
+/**
  * The roster's search box (issue #897) — rendered only once the roster has rows,
  * so the "no workers at all" state stays a plain explanation with nothing to type
  * into. The query is component state rather than a route search param: it is
@@ -167,7 +208,7 @@ function WorkersSearchBox({
 	onChange: (next: string) => void;
 }) {
 	return (
-		<div className="relative max-w-sm">
+		<div className="relative flex-1 min-w-[12rem] max-w-sm">
 			<Search
 				className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500"
 				aria-hidden="true"
@@ -182,6 +223,48 @@ function WorkersSearchBox({
 				className="block w-full py-2 pl-9 pr-3 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500"
 			/>
 		</div>
+	);
+}
+
+/**
+ * The roster's one fleet-wide action: ask **every** registered machine to move to
+ * the build the control plane is running.
+ *
+ * It sits in the toolbar rather than on the page header because it acts on the
+ * thing below it, and it reads as one of the list's controls — the counterpart to
+ * the search box, which narrows the same roster.
+ *
+ * **The design system's two button recipes are split here on purpose**: the
+ * *hue* is the secondary one — the screen's subject is the roster, and a filled
+ * violet button would read as the reason the page exists — while the *geometry* is
+ * the primary one (`gap-2 px-4 py-2 text-sm font-semibold`) rather than secondary's
+ * smaller `px-3 py-1.5 text-xs`. An action button is sized by what it stands next
+ * to, and this one stands next to two things that are both primary-sized: the
+ * other screens' violet actions, and — in its own row — the search input, whose
+ * `py-2 text-sm` gives exactly this height. At the smaller recipe it sat visibly
+ * short against both.
+ *
+ * **The label says `all`, and it means it** — every machine on the installation,
+ * not the rows a search has left visible. Scoping it to the filter would make an
+ * action with fleet-wide consequences depend on a transient text box, so the copy
+ * names the whole set and the filter is left to do only what it looks like it does.
+ *
+ * Deliberately inert for now: nothing is wired to it, so it renders `disabled`
+ * with a title saying so, rather than as a live-looking control that silently
+ * swallows a click. Wiring it is this component's job alone — the roster passes it
+ * nothing.
+ */
+function FleetUpdateButton() {
+	return (
+		<button
+			type="button"
+			disabled
+			title="Not wired up yet — this will ask every registered machine to update to the control plane's build."
+			className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors cursor-pointer disabled:opacity-55 disabled:cursor-not-allowed"
+		>
+			<RefreshCw className="h-4 w-4" aria-hidden="true" />
+			Update all workers
+		</button>
 	);
 }
 
