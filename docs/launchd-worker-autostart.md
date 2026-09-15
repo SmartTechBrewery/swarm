@@ -22,6 +22,7 @@ swarm-worker-agent install   [<checkout>]   # write the agent and start it
 swarm-worker-agent uninstall [<checkout>]   # stop it and remove the agent
 swarm-worker-agent status    [<checkout>]   # loaded? pid? last exit code?
 swarm-worker-agent logs      [<checkout>]   # tail this checkout's stdout + stderr
+swarm-worker-agent update    [<checkout>]   # pull + rebuild this install, restart its agents
 ```
 
 `<checkout>` is the repository checkout the worker was registered for and defaults
@@ -43,6 +44,46 @@ The command ships in this package's `bin`, so a machine that has SWARM installed
 
 `<hash8>` is the first eight characters of that same sha256, so two checkouts
 sharing a basename (`~/work/api` and `~/oss/api`) still get distinct labels.
+
+## After a `git pull` — the update flow
+
+A worker normally updates because the installation asked it to
+([`ADR-006`](./decisions/ADR-006-unconditional-worker-updates.md)). `update` is that
+same chain run by hand, on the machine itself, for when that route is unavailable or
+is not trusted to have worked:
+
+```bash
+swarm-worker-agent update             # every worker agent running this installation
+swarm-worker-agent update ~/work/api  # only that checkout's agent
+```
+
+- **It updates the *installation*, not the checkout you are standing in.** A daemon
+  runs SWARM's build, and the worker checkout the plist names is a project repository
+  holding none of it — so the command resolves the installation it was itself shipped
+  from (through the `swarm-worker-agent` → `bin/` symlink chain that put it on
+  `PATH`), runs `git pull --ff-only`, `npm ci` and `npm run build` there, and restarts
+  the agents afterwards. `<checkout>` narrows *which agents restart*, never which
+  installation is pulled: there is one build behind all of them.
+- **Which agents count is read off each plist, not assumed.** Every worker agent whose
+  launcher resolves into this installation is restarted; a second SWARM clone's agents
+  on the same Mac are left alone, because nothing pulled *their* build. A `<checkout>`
+  whose agent belongs to another installation is refused rather than restarted onto a
+  build this run never touched.
+- **All three steps run in the foreground, before any restart.** A failed pull,
+  install or build stops the chain with its own output on screen and leaves every
+  daemon running the build it already has — restarting onto a half-written tree is the
+  state ADR-006 has the asked-for route refuse outright, and this must not create it
+  by hand.
+- **Both `npm` steps run even when the pull moved nothing.** That is the recovery
+  case: an installation whose `node_modules` or `dist` never finished being written is
+  on the right commit and still unrunnable.
+- **A phase in flight is lost.** The restart is `launchctl kickstart -k`, which kills
+  the daemon outright; the command names each agent as it takes it down. Check
+  `swarm workers list` first if the machine may be mid-run.
+- **The API server is not restarted for you** — it has its own chain (migrations, the
+  dashboard build) that this one deliberately omits, so an installation that also
+  serves the API is told to run
+  [`swarm-api-agent reload`](./launchd-api-autostart.md) as well.
 
 ## What the generated agent does, and why
 

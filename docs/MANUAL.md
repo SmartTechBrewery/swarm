@@ -646,6 +646,11 @@ swarm-api-agent reload --all
 # (restart each worker yourself — see the script's own reminder)
 npm run reload:all
 
+# The worker half of that pull, on a launchd host (macOS): pull and rebuild this
+# SWARM installation, then restart every worker agent running it
+# — see docs/launchd-worker-autostart.md
+swarm-worker-agent update
+
 # Operator identity — sign this CLI in to the control plane over the network
 # (needs SWARM_CONTROL_PLANE_URL, not DATABASE_URL, so it works off the host)
 npm run swarm -- login

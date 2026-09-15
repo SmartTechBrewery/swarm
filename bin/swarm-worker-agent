@@ -16,10 +16,16 @@ Usage:
   swarm-worker-agent uninstall [<checkout>]   stop it and remove the agent
   swarm-worker-agent status    [<checkout>]   show whether it is loaded/running
   swarm-worker-agent logs      [<checkout>]   tail this checkout's worker log
+  swarm-worker-agent update    [<checkout>]   update this SWARM install, restart its agents
 
 <checkout> is the repository checkout the worker was registered for, and defaults
 to the current directory. Each checkout gets its own agent, so a machine running
 workers for several repositories installs one per checkout.
+
+`update` is the exception, and the reason is where the code lives: a worker runs the
+*SWARM installation's* build, not its checkout's, so one pull updates every daemon on
+the machine at once. With no argument it pulls this installation, rebuilds it, and
+restarts every worker agent running it; pass a <checkout> to restart only that one.
 EOF
 }
 
@@ -42,6 +48,52 @@ resolve() {
 	PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 	LOG="$HOME/Library/Logs/$LABEL.log"
 	TARGET="gui/$(id -u)/$LABEL"
+}
+
+# Follow a symlink chain to the file it ends at, without `readlink -f` (BSD gained it
+# only in macOS 13, and this has to answer the same on an older Mac). Both callers
+# below resolve an npm-link chain -- `/opt/homebrew/bin/swarm` -> a relative
+# `../lib/node_modules/swarm/bin/swarm.js` -> the checkout -- which is what ties a
+# LaunchAgent to the installation whose code it actually runs.
+resolve_symlink() {
+	local path=$1 target
+	while [ -L "$path" ]; do
+		target=$(readlink "$path")
+		case "$target" in
+			/*) path=$(cd "$(dirname "$target")" && pwd -P)/$(basename "$target") ;;
+			*) path=$(cd "$(dirname "$path")" && cd "$(dirname "$target")" && pwd -P)/$(basename "$target") ;;
+		esac
+	done
+	# `pwd -P` on the way out too, because the last component is often not the link: an
+	# npm-linked install is reached through a symlinked *directory*
+	# (`node_modules/swarm` -> the checkout), and the file at the end of it is real.
+	printf '%s' "$(cd "$(dirname "$path")" && pwd -P)/$(basename "$path")"
+}
+
+# The SWARM installation this script was shipped from, resolved through whatever PATH
+# symlink invoked it. `update` pulls *that* checkout rather than the current directory:
+# the operator running it is typically standing in a worker checkout, which is a
+# project repository and holds none of SWARM's own code.
+install_root() {
+	local self
+	self=$(resolve_symlink "${BASH_SOURCE[0]}")
+	(cd "$(dirname "$self")/.." && pwd -P)
+}
+
+# Every worker agent on this machine that runs *this* installation, as `<label> TAB
+# <checkout>` lines. The plist names the launcher by its PATH location, so resolving
+# that symlink is what tells a peer agent apart from one belonging to a second SWARM
+# clone on the same Mac -- and a second clone must not be restarted onto a build
+# nobody updated.
+agents_of_install_root() {
+	local plist launcher checkout
+	for plist in "$HOME"/Library/LaunchAgents/pl.smarttechbrewery.swarm.worker.*.plist; do
+		[ -f "$plist" ] || continue
+		launcher=$(plutil -extract ProgramArguments.1 raw "$plist" 2>/dev/null) || continue
+		case "$(resolve_symlink "$launcher")" in "$ROOT"/*) ;; *) continue ;; esac
+		checkout=$(plutil -extract WorkingDirectory raw "$plist" 2>/dev/null) || continue
+		printf '%s\t%s\n' "$(basename "$plist" .plist)" "$checkout"
+	done
 }
 
 # launchd starts a job with a minimal PATH and none of the login shell's rc files,
@@ -219,10 +271,77 @@ cmd_logs() {
 	tail -f "$LOG" "${LOG%.log}.error.log"
 }
 
+# The emergency twin of `swarm-api-agent reload`, and of the update a worker is asked
+# to apply over the control plane (ADR-006): pull the installation, rebuild it, and
+# restart the daemons running it -- run by hand, on the machine itself, when the
+# asked-for route is not available or not trusted to have worked.
+cmd_update() {
+	[ -e "$ROOT/.git" ] || die "the SWARM installation at $ROOT is not a git checkout
+  there is nothing to pull; an install from the npm registry updates with npm"
+
+	# Collected before the pull so an installation with nothing to restart says so in a
+	# second, rather than after a cold `npm ci`.
+	local agents
+	agents=$(agents_of_install_root)
+	if [ -n "$ONE_CHECKOUT" ]; then
+		[ -f "$PLIST" ] || die "no agent installed for $CHECKOUT"
+		printf '%s\n' "$agents" | grep -q "^$LABEL	" ||
+			die "$LABEL does not run the SWARM installation at $ROOT -- update it from its own installation"
+		agents=$(printf '%s\t%s' "$LABEL" "$CHECKOUT")
+	fi
+	[ -n "$agents" ] || die "no worker agent on this machine runs the SWARM installation at $ROOT"
+
+	local before after
+	before=$(git -C "$ROOT" rev-parse --short HEAD) || die "git could not read $ROOT"
+	printf 'swarm-worker-agent: updating %s (at %s)\n' "$ROOT" "$before"
+	# Deliberately in the foreground, and deliberately all of it before a single
+	# restart: a failed pull, install or build must leave every daemon running the build
+	# it already has rather than restart one onto a half-written tree -- the state
+	# ADR-006 has the control-plane route refuse outright.
+	git -C "$ROOT" pull --ff-only || die "git pull failed -- the workers were left on $before"
+	after=$(git -C "$ROOT" rev-parse --short HEAD)
+	# Both run even when HEAD did not move: `update` is also how an operator recovers an
+	# installation whose `node_modules` or `dist` never finished being written.
+	(cd "$ROOT" && npm ci) || die "npm ci failed -- the workers were left running the old build"
+	(cd "$ROOT" && npm run build) || die "npm run build failed -- the workers were left running the old build"
+
+	if [ "$before" = "$after" ]; then
+		printf 'swarm-worker-agent: already at %s, rebuilt anyway\n' "$after"
+	else
+		printf 'swarm-worker-agent: %s -> %s\n' "$before" "$after"
+	fi
+
+	local label checkout restarted=0 failed=0
+	while IFS=$'\t' read -r label checkout; do
+		[ -n "$label" ] || continue
+		# `kickstart -k` kills the daemon outright, so a phase in flight is lost. That is
+		# the price of an emergency update and the reason each one is named as it goes.
+		if launchctl kickstart -k "gui/$(id -u)/$label" >/dev/null 2>&1; then
+			restarted=$((restarted + 1))
+			printf '  restarted %s (%s)\n' "$label" "$checkout"
+		else
+			failed=$((failed + 1))
+			printf '  FAILED to restart %s (%s) -- not loaded? re-run: swarm-worker-agent install %s\n' \
+				"$label" "$checkout" "$checkout" >&2
+		fi
+	done <<<"$agents"
+
+	# The API server runs from this same checkout and is *not* restarted here: its
+	# update chain owns migrations and the dashboard build, which this one deliberately
+	# omits because no worker needs either.
+	local api_hash
+	api_hash=$(printf '%s' "$ROOT" | shasum -a 256 | cut -d' ' -f1)
+	[ ! -f "$HOME/Library/LaunchAgents/pl.smarttechbrewery.swarm.api.$(basename "$ROOT").${api_hash:0:8}.plist" ] ||
+		printf 'swarm-worker-agent: this installation also serves the API -- run `swarm-api-agent reload` for its migrations and dashboard build\n'
+
+	printf 'swarm-worker-agent: %d agent(s) restarted on %s\n' "$restarted" "$after"
+	[ "$failed" -eq 0 ] || exit 1
+}
+
 [ "$(uname -s)" = 'Darwin' ] || die 'launchd is macOS-only; on Linux use a systemd --user unit running `swarm run:worker`'
 
 case "${1:-}" in
-	install | uninstall | status | logs)
+	install | uninstall | status | logs | update)
 		action=$1
 		shift
 		checkout=''
@@ -235,8 +354,17 @@ case "${1:-}" in
 					;;
 			esac
 		done
-		resolve "${checkout:-$PWD}"
-		"cmd_$action"
+		if [ "$action" = 'update' ]; then
+			# The one action that is not about a single checkout: an omitted argument means
+			# every agent running this installation, not the current directory's.
+			ROOT=$(install_root)
+			ONE_CHECKOUT=$checkout
+			[ -z "$checkout" ] || resolve "$checkout"
+			cmd_update
+		else
+			resolve "${checkout:-$PWD}"
+			"cmd_$action"
+		fi
 		;;
 	-h | --help | help | '') usage ;;
 	*)
