@@ -816,6 +816,15 @@ export const workersRouter = router({
 	// for. This handler only words the refusal; the fleet form words the same outcome
 	// as an `in-pool` disposition over the same single eligibility boundary.
 	//
+	// **And refused for a machine that would not come back from it** (issue #997,
+	// phase 2/2): the daemon applies an update by exiting, so a machine whose own
+	// handshake declared that no process supervisor will start it again is told so
+	// here instead of being asked and lost. Decided by the same write, for the same
+	// reason the drain is, and worded below. `unknown` is never refused — it is what a
+	// machine that has never connected, a daemon predating the declaration, and a
+	// platform the detection cannot read all say, so treating it as a refusal would
+	// let a missing fact block an operator who knows better.
+	//
 	// The target is validated against the shared grammar before anything is written,
 	// so a malformed one is `BAD_REQUEST` here rather than a `refused` report minutes
 	// later from a machine that had to be woken to say so.
@@ -843,6 +852,26 @@ export const workersRouter = router({
 						`Worker '${result.worker.displayName}' is still in the dispatch pool, so it cannot be ` +
 						`asked to update: it would be given new work while it waits to restart. Run ` +
 						`\`swarm workers drain ${input.workerId}\` first, then request the update.`,
+				});
+			}
+			// The third precondition of the mechanism (issue #997, phase 2/2), beside the
+			// drain above and the ancestor check the daemon makes — not a host setting of
+			// the kind ADR-006 removed, and not something this machine's owner can turn
+			// off: the daemon *applies* an update by exiting, so on a machine no supervisor
+			// will start again that leaves the machine gone rather than restarted. Refused
+			// on the daemon's own `unsupervised` declaration alone; a machine declaring
+			// `unknown` is asked exactly as a supervised one is, so a missing declaration
+			// never blocks an operator who knows better.
+			if (result.outcome === 'unsupervised') {
+				throw new TRPCError({
+					code: 'CONFLICT',
+					message:
+						`Worker '${result.worker.displayName}' declared that no process supervisor will ` +
+						`start its daemon again after it exits, so an update applied there would leave the ` +
+						`machine gone until somebody started it by hand. Install it under launchd with ` +
+						`\`swarm-worker-agent install\` (see docs/launchd-worker-autostart.md), then request ` +
+						`the update — or update it by hand on the machine itself ` +
+						`(\`git pull && npm ci && npm run build\`, then restart it).`,
 				});
 			}
 			// The boundary that comes with recording an update as a run (issue #971): the
@@ -1045,6 +1074,12 @@ export const workersRouter = router({
 	//   another repository or at a side branch they pushed — only along the branch it
 	//   already follows. Moving it *backwards* along that branch is what remains, and
 	//   that is visible, bounded, and reversible.
+	// - **A machine that would not come back is not asked either** (issue #997), which
+	//   is a precondition of that same mechanism rather than a second veto: the daemon
+	//   applies an update by exiting, so a machine whose daemon declared it runs under
+	//   no process supervisor is reported `unsupervised` and left untouched. It is not
+	//   an owner *switch* — nothing turns it off, here or on the host — and a machine
+	//   declaring `unknown` is asked exactly as a supervised one is.
 	//
 	// Issue #975 removed the per-host opt-in that used to sit beside the drain: it
 	// defaulted to off, so a host that had never been told about it declined every

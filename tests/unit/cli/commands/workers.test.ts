@@ -1523,6 +1523,24 @@ describe('swarm workers', () => {
 			expect(joined).toContain("draining is the machine owner's own call");
 		});
 
+		// Issue #997 — the third "what an administrator cannot fix from here" line, and
+		// the one that takes a change on the machine itself. The per-machine disposition
+		// prints unchanged: it is read as a plain string, so a new word needs no schema
+		// change here.
+		it('reports the machines that would not come back from an update, and who to ask', async () => {
+			installation([
+				line({ disposition: 'unsupervised', owner: { identifier: 'karolina@example.com' } }),
+			]);
+
+			expect(await run(['request-update', 'main'])).toBe(0);
+
+			const joined = lines().join('\n');
+			expect(joined).toContain(`${WORKER_ID}\tada-laptop\tkarolina@example.com\tunsupervised`);
+			expect(joined).toContain('1 not under a process supervisor');
+			expect(joined).toContain('karolina@example.com');
+			expect(joined).toContain('swarm-worker-agent install');
+		});
+
 		it('says so plainly when the installation has no machines, and exits 0', async () => {
 			installation([]);
 			expect(await run(['request-update', 'main'])).toBe(0);

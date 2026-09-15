@@ -613,7 +613,21 @@ One thing still has to be true of the host:
   daemon releases its session and exits 0; launchd `KeepAlive`
   ([`swarm-worker-agent`](./launchd-worker-autostart.md)) or systemd
   `Restart=always` is what brings it back on the new build. Without one, the machine
-  simply stops.
+  simply stops — **and since issue #997 it is refused rather than left to do that**.
+  The daemon works out at startup whether launchd or systemd started it and declares
+  that at handshake, so a machine that declared `unsupervised` is told no and nothing
+  is written: `swarm workers update` refuses it naming the remedy, the fleet forms
+  report it `unsupervised`, and a staged rollout skips it and returns it to the pool.
+  Install it with `swarm-worker-agent install` and ask again, or update that machine
+  by hand (`git pull && npm ci && npm run build`, then restart it). This is a
+  precondition of the update *mechanism*, like the drain and the ancestor check above,
+  not a per-host setting of the kind ADR-006 removed — nothing turns it off. A machine
+  whose supervision is **unknown** — an older daemon, one that has never connected, a
+  platform the reads cannot answer for — is never refused. Read the macOS caveat in
+  [`docs/MANUAL.md`](./MANUAL.md) first: a LaunchAgent that starts the daemon through
+  `swarm run:worker` currently declares `unsupervised`, so such a host is refused
+  although launchd would restart it, and updates by hand until the detection reads
+  that shape.
 
 **Why the drain is required.** `swarm workers update` is refused unless the machine
 is already out of the dispatch pool, and names the drain as the remedy. The daemon

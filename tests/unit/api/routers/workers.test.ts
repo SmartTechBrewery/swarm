@@ -1683,6 +1683,42 @@ describe('workers.requestUpdate (owner-only, draining-only, issue #933)', () => 
 		expect(publishWorkerUpdateWakeUp).not.toHaveBeenCalled();
 	});
 
+	// Issue #997, phase 2/2 — the third precondition of the mechanism: the daemon
+	// applies an update by exiting, so a machine whose own handshake declared that
+	// nothing will start it again is refused rather than asked and lost. Worded from
+	// the write's own outcome, like the two above, so the row is never asked twice.
+	it('refuses a machine that declared it is unsupervised, naming it and the remedy', async () => {
+		const unsupervised = drained({ supervision: 'unsupervised' });
+		getWorker.mockResolvedValue(unsupervised);
+		requestWorkerUpdate.mockResolvedValue({ outcome: 'unsupervised', worker: unsupervised });
+
+		await expect(owner.requestUpdate({ workerId: WORKER_ID, target: 'main' })).rejects.toThrowError(
+			expect.objectContaining({
+				code: 'CONFLICT',
+				message: expect.stringContaining(unsupervised.displayName),
+			}),
+		);
+		await expect(owner.requestUpdate({ workerId: WORKER_ID, target: 'main' })).rejects.toThrowError(
+			expect.objectContaining({
+				message: expect.stringContaining('swarm-worker-agent install'),
+			}),
+		);
+		expect(publishWorkerUpdateWakeUp).not.toHaveBeenCalled();
+	});
+
+	// `unknown` is never refused, anywhere: it is what a machine that has never
+	// connected, a daemon predating the declaration, and a platform the reads cannot
+	// answer for all say, so refusing on it would let a fact SWARM could not establish
+	// block an operator who knows better.
+	it('does not refuse a machine whose supervision is unknown', async () => {
+		getWorker.mockResolvedValue(drained({ supervision: 'unknown' }));
+		requestWorkerUpdate.mockResolvedValue(accepted('main'));
+
+		await expect(
+			owner.requestUpdate({ workerId: WORKER_ID, target: 'main' }),
+		).resolves.toMatchObject({ workerId: WORKER_ID, target: 'main' });
+	});
+
 	it('records the request and publishes it for the router to push', async () => {
 		getWorker.mockResolvedValue(drained());
 		requestWorkerUpdate.mockResolvedValue(accepted('main'));

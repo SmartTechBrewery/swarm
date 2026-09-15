@@ -525,7 +525,7 @@ export async function setWorkerDraining(
 }
 
 /**
- * What became of a {@link requestWorkerUpdate} write. Four outcomes rather than a
+ * What became of a {@link requestWorkerUpdate} write. Five outcomes rather than a
  * `Worker | undefined`, because the draining precondition is part of the write
  * itself (issue #921) and "declined" has to be tellable from "no such machine":
  *
@@ -538,12 +538,18 @@ export async function setWorkerDraining(
  * - `no-project` — the machine is enrolled in no project (issue #971), so there is no
  *   project for its run to hang off and nothing was written; `worker` is the row, for
  *   the refusal the caller words.
+ * - `unsupervised` — the machine's daemon declared that no process supervisor will
+ *   start it again after it exits (issue #997), so an update applied there would
+ *   leave the machine gone rather than restarted; nothing was written and `worker` is
+ *   the row, for the refusal the caller words. Answered for `unsupervised` **alone** —
+ *   a machine declaring `unknown` is asked exactly as a supervised one is.
  * - `not-found` — no worker has that id.
  */
 export type WorkerUpdateRequestOutcome =
 	| { outcome: 'requested'; worker: Worker; runId: string; dispatch: DispatchRow }
 	| { outcome: 'in-pool'; worker: Worker }
 	| { outcome: 'no-project'; worker: Worker }
+	| { outcome: 'unsupervised'; worker: Worker }
 	| { outcome: 'not-found' };
 
 /**
@@ -631,6 +637,35 @@ async function oldestEnrollment(
  * answered `no-project` and nothing at all is written; that boundary is decided
  * before the row write, in the same statement-order as the draining predicate, so
  * this can never record a request it cannot record a run for.
+ *
+ * **A machine whose daemon declared it is `unsupervised` is answered `unsupervised`
+ * and nothing is written either** (issue #997, phase 2/2) — the third precondition
+ * of the mechanism, beside the drain and the ancestor check, rather than a host
+ * setting of the kind ADR-006 removed: the daemon applies an update by *exiting*, so
+ * on a machine no supervisor will start again that leaves the machine gone until
+ * somebody starts it by hand. It fires on `unsupervised` **alone** and never on
+ * `unknown`: `unknown` is a real answer meaning the declaration could not be read —
+ * an older daemon, a machine that has never connected, a platform these reads do not
+ * cover — and refusing on it would let a missing declaration block an operator who
+ * knows better.
+ *
+ * It is a **read** in this transaction rather than a `WHERE` predicate beside
+ * `draining_since IS NOT NULL`, and the difference between the two facts is what
+ * decides that. Draining is an operator switch a concurrent session can flip between
+ * a fleet action's read and its write, which is the race that predicate exists to
+ * close. Supervision is a fact a machine states once per connection and can only
+ * change by restarting — and a machine that restarts unsupervised a second after the
+ * write is not a window a predicate closes either, so a predicate would buy nothing
+ * and cost the caller the row it needs to word the refusal from.
+ *
+ * That read is ordered **behind** the draining snapshot rather than in front of it,
+ * so a machine that is both still answers `in-pool`: draining is the remedy the
+ * operator has to reach for either way, and the fan-out's own snapshot check
+ * (`../../api/worker-update-fanout.ts`) reports the pair in that same order, so the
+ * two forms never word one machine's state differently. It relaxes nothing — the
+ * predicate below is still the only thing that decides whether the write lands, and
+ * this read, like the follow-up read on the declined path, only decides which refusal
+ * the caller gets to name.
  */
 export async function requestWorkerUpdate(
 	id: string,
@@ -643,6 +678,10 @@ export async function requestWorkerUpdate(
 		if (!enrollment) {
 			const existing = await getWorkerById(id);
 			return existing ? { outcome: 'no-project', worker: existing } : { outcome: 'not-found' };
+		}
+		const declared = await getWorkerById(id);
+		if (declared?.drainingSince && declared.supervision === 'unsupervised') {
+			return { outcome: 'unsupervised', worker: declared };
 		}
 
 		const [updatedRow] = await tx

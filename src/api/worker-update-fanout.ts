@@ -98,8 +98,8 @@ export async function publishWorkerUpdateWakeUp(dispatch: DispatchRow): Promise<
 }
 
 /**
- * What became of one machine in a fan-out. Two of the six record a request
- * (`requested`, `queued-offline`); the other four name a state that was left
+ * What became of one machine in a fan-out. Two of the seven record a request
+ * (`requested`, `queued-offline`); the other five name a state that was left
  * exactly as it was:
  *
  * - `requested` — recorded, and the machine has a live session, so the push is on
@@ -113,6 +113,12 @@ export async function publishWorkerUpdateWakeUp(dispatch: DispatchRow): Promise<
  * - `no-project` — skipped: the machine is enrolled in no project (issue #971), so
  *   the `runs` row that records an update has no project to hang off. The remedy is
  *   `swarm workers enroll <worker-id> <project-id>`.
+ * - `unsupervised` — skipped: the machine's daemon declared that no process
+ *   supervisor will start it again after it exits (issue #997), and the daemon
+ *   applies an update by exiting, so asking it would leave the machine gone. The
+ *   remedy is `swarm-worker-agent install` on the machine, exactly as
+ *   `requestUpdate`'s own refusal names it. Never reported for a machine declaring
+ *   `unknown`, which is asked as a supervised one is.
  * - `already-asked` — an unanswered request for **this same target** is already
  *   outstanding; left as it is, request id and all.
  * - `answered` — the machine already reported an outcome for **this exact
@@ -123,6 +129,7 @@ export const WORKER_UPDATE_FANOUT_DISPOSITIONS = [
 	'queued-offline',
 	'in-pool',
 	'no-project',
+	'unsupervised',
 	'already-asked',
 	'answered',
 ] as const;
@@ -214,6 +221,20 @@ export async function fanOutWorkerUpdate(
 			});
 			continue;
 		}
+		// Declared `unsupervised`, so the write recorded nothing (issue #997): the daemon
+		// applies an update by exiting, and nothing would start this one again. Reported
+		// like `in-pool` and `no-project` rather than thrown for — one machine's state
+		// never refuses the whole call — which is what the single-machine form does with
+		// the same outcome.
+		if (result.outcome === 'unsupervised') {
+			entries.push({
+				workerId: result.worker.id,
+				displayName: result.worker.displayName,
+				disposition: 'unsupervised',
+				update: result.worker.update,
+			});
+			continue;
+		}
 		const updated = result.worker;
 		// Connectivity is `getLiveSessionForWorker` — the same definition the rosters
 		// and the dispatch gate read, never `isWorkerConnected`, whose map is local to
@@ -246,7 +267,15 @@ export async function fanOutWorkerUpdate(
  * the write and the session lookup for a machine already known to be in the pool —
  * the *enforcing* copy is the `draining_since IS NOT NULL` predicate on
  * `requestWorkerUpdate`'s own `WHERE`, which is the only one a concurrent undrain
- * cannot get in front of. The other two turn on the row
+ * cannot get in front of. The supervision check beside it is the same kind of
+ * optimisation for the same kind of precondition (issue #997) — the *enforcing* copy
+ * again lives in `requestWorkerUpdate`, which decides it from a read in its own
+ * transaction — and it is ordered **after** the draining check on purpose: a machine
+ * that is both reads `in-pool` first, because the drain is the remedy the operator
+ * has to reach for either way, and the repository orders the pair the same way so the
+ * two can never disagree. It fires on `unsupervised` alone; `unknown` is a machine
+ * whose declaration could not be read, not one that would be lost, so it is asked.
+ * The other two turn on the row
  * already naming this exact target — `requestId` is the outstanding marker
  * (`recordWorkerUpdateReport` clears it), so a non-null one is a request nobody has
  * answered and a reported `status` beside a null one is an answer already given.
@@ -257,6 +286,7 @@ function dispositionWithoutAsking(
 	target: string,
 ): WorkerUpdateFanoutDisposition | undefined {
 	if (!worker.drainingSince) return 'in-pool';
+	if (worker.supervision === 'unsupervised') return 'unsupervised';
 	const current = worker.update;
 	if (!current || current.target !== target) return undefined;
 	if (current.requestId) return 'already-asked';

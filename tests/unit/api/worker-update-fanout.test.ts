@@ -331,6 +331,86 @@ describe('fanOutWorkerUpdate (issue #921)', () => {
 		expect(publishDispatchWakeUp).not.toHaveBeenCalled();
 	});
 
+	// Issue #997 — the daemon applies an update by exiting, so a machine that declared
+	// nothing will start it again is reported rather than asked and lost. Reported like
+	// `no-project`: one machine's state never refuses the whole call.
+	it('reports a machine that declared it is unsupervised, writing and publishing nothing', async () => {
+		const entries = await fanOutWorkerUpdate(
+			[makeWorker({ supervision: 'unsupervised' })],
+			'main',
+			REQUESTER_ID,
+		);
+
+		expect(entries).toMatchObject([
+			{ workerId: WORKER_ID, displayName: 'ada-laptop', disposition: 'unsupervised' },
+		]);
+		// Not asked at all: the snapshot already knows the answer, so there is no write
+		// to decline and nothing to wake the machine for.
+		expect(requestWorkerUpdate).not.toHaveBeenCalled();
+		expect(publishDispatchWakeUp).not.toHaveBeenCalled();
+	});
+
+	// The same disposition when the declaration only comes back from the write — a
+	// machine that reconnected unsupervised between the caller's read and this write.
+	it('reports a machine the write declined as unsupervised', async () => {
+		requestWorkerUpdate.mockResolvedValueOnce({
+			outcome: 'unsupervised',
+			worker: makeWorker({ supervision: 'unsupervised' }),
+		});
+
+		const entries = await fanOutWorkerUpdate([makeWorker()], 'main', REQUESTER_ID);
+
+		expect(entries).toMatchObject([
+			{ workerId: WORKER_ID, disposition: 'unsupervised', update: null },
+		]);
+		expect(publishDispatchWakeUp).not.toHaveBeenCalled();
+	});
+
+	// `unknown` is a real answer meaning the declaration could not be read — an older
+	// daemon, a machine that has never connected, a platform these reads do not cover —
+	// so it must never be refused, or a missing fact would block an operator who knows
+	// better. `makeWorker` already declares `unknown`, which is why every other case
+	// above is asked.
+	it('asks a machine declaring unknown supervision exactly as a supervised one', async () => {
+		const entries = await fanOutWorkerUpdate(
+			[makeWorker({ supervision: 'unknown' }), makeWorker({ id: OTHER_WORKER_ID })],
+			'main',
+			REQUESTER_ID,
+		);
+
+		expect(entries.map((entry) => entry.disposition)).toEqual(['requested', 'requested']);
+		expect(requestWorkerUpdate).toHaveBeenCalledTimes(2);
+	});
+
+	// Ordered behind the draining check, and the repository orders the pair the same
+	// way: the drain is the remedy the operator has to reach for either way.
+	it('reports a machine that is both in the pool and unsupervised as in-pool', async () => {
+		const entries = await fanOutWorkerUpdate(
+			[makeWorker({ drainingSince: null, supervision: 'unsupervised' })],
+			'main',
+			REQUESTER_ID,
+		);
+
+		expect(entries.map((entry) => entry.disposition)).toEqual(['in-pool']);
+	});
+
+	it('carries on past a machine that declared it is unsupervised', async () => {
+		const entries = await fanOutWorkerUpdate(
+			[
+				makeWorker({ supervision: 'unsupervised' }),
+				makeWorker({ id: OTHER_WORKER_ID, displayName: 'ada-desktop' }),
+			],
+			'main',
+			REQUESTER_ID,
+		);
+
+		expect(entries.map((entry) => [entry.workerId, entry.disposition])).toEqual([
+			[WORKER_ID, 'unsupervised'],
+			[OTHER_WORKER_ID, 'requested'],
+		]);
+		expect(publishDispatchWakeUp).toHaveBeenCalledExactlyOnceWith(dispatchFor(OTHER_WORKER_ID));
+	});
+
 	it('carries on past a machine enrolled in no project', async () => {
 		requestWorkerUpdate.mockResolvedValueOnce({ outcome: 'no-project', worker: makeWorker() });
 

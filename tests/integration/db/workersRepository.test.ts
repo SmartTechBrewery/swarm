@@ -39,6 +39,7 @@ import {
 	type WorktreeSweepResult,
 } from '../../../src/identity/worker.js';
 import { AllowedClisNotCapableError } from '../../../src/identity/worker-enrollment.js';
+import type { WorkerSupervision } from '../../../src/lib/worker-supervision.js';
 import { ALL_TRIGGER_PHASES, type TriggerPhase } from '../../../src/triggers/types.js';
 import { truncateAll } from '../helpers/db.js';
 import { seedProject } from '../helpers/seed.js';
@@ -509,6 +510,26 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 			return created.id;
 		}
 
+		/**
+		 * Re-declare how a machine is supervised (issue #997), the one way it ever
+		 * changes: the daemon states it at handshake, which is the same write that
+		 * re-declares its CLIs. A machine that has never connected stays `unknown`, which
+		 * is what {@link freshWorker} leaves behind.
+		 */
+		async function declareSupervision(
+			workerId: string,
+			supervision: WorkerSupervision,
+		): Promise<void> {
+			await updateWorkerCapabilities(
+				workerId,
+				['claude'],
+				undefined,
+				undefined,
+				undefined,
+				supervision,
+			);
+		}
+
 		/** The `worker-update` dispatch rows this machine has, oldest first. */
 		async function updateDispatchesFor(workerId: string) {
 			return await getDb()
@@ -832,6 +853,52 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 				expect(result.outcome).toBe('no-project');
 				expect((await getWorkerById(created.id))?.update).toBeNull();
 				expect(await updateRunsFor(created.id)).toHaveLength(0);
+			});
+
+			// Issue #997, phase 2/2 — the third precondition, and the same all-or-nothing
+			// boundary: the daemon applies an update by exiting, so a machine that declared
+			// nothing will start it again is answered before the row write and nothing at
+			// all is created for it.
+			it('refuses a machine that declared it is unsupervised, writing nothing', async () => {
+				const id = await freshWorker('ada-unsupervised');
+				await declareSupervision(id, 'unsupervised');
+
+				const result = await requestWorkerUpdate(id, REQUEST_ID, 'main', adaId);
+
+				expect(result.outcome).toBe('unsupervised');
+				expect((await getWorkerById(id))?.update).toBeNull();
+				expect(await updateRunsFor(id)).toHaveLength(0);
+				expect(await updateDispatchesFor(id)).toHaveLength(0);
+			});
+
+			// Never refused, anywhere: `unknown` is what a daemon predating the declaration
+			// and a machine that has never connected both say, so treating it as a refusal
+			// would let a fact SWARM could not establish block an operator who knows better.
+			// A freshly registered machine is already `unknown`, which is why every other
+			// case in this block is accepted.
+			it.each([
+				'unknown',
+				'supervised',
+			] as const)('asks a machine declaring %s exactly as before', async (supervision) => {
+				const id = await freshWorker(`ada-${supervision}`);
+				await declareSupervision(id, supervision);
+
+				const result = await requestWorkerUpdate(id, REQUEST_ID, 'main', adaId);
+
+				expect(result.outcome).toBe('requested');
+				expect((await getWorkerById(id))?.update).toMatchObject({ requestId: REQUEST_ID });
+			});
+
+			// Ordered behind the draining snapshot, exactly as the fan-out's own snapshot
+			// check orders the pair: the drain is the remedy the operator has to reach for
+			// either way, so the two forms never word one machine's state differently.
+			it('answers in-pool for a machine that is both in the pool and unsupervised', async () => {
+				const id = await freshWorker('ada-both');
+				await declareSupervision(id, 'unsupervised');
+				await setWorkerDraining(id, false);
+
+				expect((await requestWorkerUpdate(id, REQUEST_ID, 'main', adaId)).outcome).toBe('in-pool');
+				expect((await getWorkerById(id))?.update).toBeNull();
 			});
 
 			// The machine is this run's whole subject, and `runs.worker_id` is
