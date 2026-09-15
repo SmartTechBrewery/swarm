@@ -319,6 +319,34 @@ describe('transport protocol schemas', () => {
 				resumable: true,
 				failureKind: 'rate-limit',
 				reason: 'rate limited',
+				// The reset the CLI actually reported (issue #980), which is what the
+				// control plane schedules the retry from.
+				retryAfter: '2026-09-15T11:40:00.000Z',
+				resetHint: '1:40pm (Europe/Warsaw)',
+			};
+			expect(TaskExecutionResultSchema.parse(frame)).toEqual(frame);
+			// Both fields are optional, so an older worker's frame — which omits them —
+			// still parses: no protocol-version bump was needed, and its `retryDelayMs`
+			// is the fallback the control plane reads instead.
+			const { retryAfter, resetHint, ...older } = frame;
+			expect(TaskExecutionResultSchema.parse(older)).toEqual(older);
+		});
+
+		// Validated as a loose string rather than `z.string().datetime()` on purpose: a
+		// terminal result frame must never lose its whole settle over one optional field,
+		// so an unparseable reset reaches the control plane and is handled there.
+		it('accepts a non-ISO retryAfter rather than failing the whole deferred frame', () => {
+			const frame = {
+				type: 'task-execution-result' as const,
+				dispatchId: DISPATCH_ID,
+				status: 'deferred' as const,
+				phase: 'implementation' as const,
+				taskId: '17',
+				retryDelayMs: 360_000,
+				resumable: true,
+				failureKind: 'rate-limit',
+				reason: 'rate limited',
+				retryAfter: 'tomorrow-ish',
 			};
 			expect(TaskExecutionResultSchema.parse(frame)).toEqual(frame);
 		});

@@ -3787,6 +3787,27 @@ describe('processJob', () => {
 		expect(outcome.retryDelayMs).toBeLessThan(92 * 60 * 1000);
 	});
 
+	// The operator-facing half of the same fact. This is the one line that names the
+	// reset, and it is the line a federated deferral now also reaches with a hint in
+	// hand (issue #980) instead of the `undefined` a kind-only rebuild left it.
+	it('names the reported reset hint on the deferral log line', async () => {
+		const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+		phaseImpl = async () => {
+			throw new AgentRunError('Review agent (claude) exited with code 1 (rate limited)', {
+				kind: 'rate-limit',
+				resetHint: '1:40pm (Europe/Warsaw)',
+				retryAfter: new Date(Date.now() + 90 * 60 * 1000),
+			});
+		};
+
+		await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
+
+		expect(warn).toHaveBeenCalledWith(
+			expect.stringContaining('rate-limited'),
+			expect.objectContaining({ resetHint: '1:40pm (Europe/Warsaw)' }),
+		);
+	});
+
 	it('floors the retry delay above the review-dispatch-dedup TTL even for an imminent reset', async () => {
 		phaseImpl = async () => {
 			throw new AgentRunError('rate limited', {

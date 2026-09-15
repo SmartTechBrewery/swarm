@@ -1191,6 +1191,50 @@ describe('runAssignmentDbFree', () => {
 		expect(result.retryDelayMs as number).toBeGreaterThan(0);
 	});
 
+	// The reset the classification resolved travels too (issue #980), so the control
+	// plane rebuilds the whole `AgentFailure` instead of only its kind. `retryDelayMs`
+	// stays beside it as the reading an older control plane still takes.
+	it('reports the resolved reset instant and hint on a rate-limit deferral', () => {
+		const retryAfter = new Date(Date.now() + 5 * 60 * 60 * 1000);
+		const frame = deferrableOrFailedResult(
+			new AgentRunError(
+				'rate limited',
+				{ kind: 'rate-limit', resetHint: '1:40pm (Europe/Warsaw)', retryAfter },
+				agentResult({ exitCode: 1 }),
+			),
+			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'implementation' })),
+		);
+
+		expect(frame.retryAfter).toBe(retryAfter.toISOString());
+		expect(frame.resetHint).toBe('1:40pm (Europe/Warsaw)');
+		expect(frame.retryDelayMs as number).toBeGreaterThan(0);
+	});
+
+	// A hint the CLI never gave — Codex's zone-less phrasing, or no banner at all —
+	// must stay absent rather than be invented.
+	it('reports neither field for a rate-limit failure that resolved no reset', () => {
+		const frame = deferrableOrFailedResult(
+			new AgentRunError('rate limited', { kind: 'rate-limit' }, agentResult({ exitCode: 1 })),
+			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'implementation' })),
+		);
+
+		expect(frame.retryAfter).toBeUndefined();
+		expect(frame.resetHint).toBeUndefined();
+	});
+
+	// A delivery deferral carries no `AgentFailure` at all — this guards the `in`
+	// narrowing that reads the two fields.
+	it('reports neither field for a delivery deferral, which holds no failure', () => {
+		const frame = deferrableOrFailedResult(
+			new DeliveryDeferredError('push failed'),
+			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'implementation' })),
+		);
+
+		expect(frame).toMatchObject({ status: 'deferred', failureKind: 'delivery' });
+		expect(frame.retryAfter).toBeUndefined();
+		expect(frame.resetHint).toBeUndefined();
+	});
+
 	// Tier 2 across the wire (issue #503): only this host holds the worktree, so the
 	// worker parses the checkpoint the stopped agent left in it and attaches it to the
 	// deferral. The control plane owns the policy and the budget; this reports evidence.
