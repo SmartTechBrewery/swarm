@@ -21,7 +21,7 @@ vi.mock('node:child_process', () => ({
 }));
 
 import { getDb } from '@/db/client.js';
-import { resetOutputFormatProbeCache } from '@/harness/antigravity-capabilities.js';
+import { resetAntigravityCapabilityCache } from '@/harness/antigravity-capabilities.js';
 import type { QuotaDiscoveryOptions } from '@/harness/quota-discovery.js';
 import {
 	discoverCliQuotas,
@@ -227,7 +227,7 @@ describe('quota-discovery', () => {
 	beforeEach(() => {
 		mockSpawn.mockReset();
 		mockExecFile.mockReset();
-		resetOutputFormatProbeCache();
+		resetAntigravityCapabilityCache();
 	});
 
 	describe('isBinaryRunnable', () => {

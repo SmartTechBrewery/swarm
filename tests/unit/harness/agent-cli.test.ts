@@ -12,13 +12,17 @@ vi.mock('node:child_process', () => ({
 	spawn: (...args: unknown[]) => spawnMock(...args),
 }));
 
-// The `agy --help` capability probe (issue #465) is mocked at the module rather
-// than the process boundary: the real module calls `promisify(execFile)` at load
-// time, which the `node:child_process` mock above doesn't provide. Its own
-// behavior is covered in antigravity-capabilities.test.ts.
+// The `agy --help` capability probe (issues #465, #999) is mocked at the module
+// rather than the process boundary: the real module calls `promisify(execFile)`
+// at load time, which the `node:child_process` mock above doesn't provide. Its
+// own behavior is covered in antigravity-capabilities.test.ts.
 const supportsOutputFormatMock = vi.fn<() => Promise<boolean>>();
+const supportsPrintTimeoutMock = vi.fn<() => Promise<boolean>>();
 vi.mock('@/harness/antigravity-capabilities.js', () => ({
-	supportsOutputFormat: () => supportsOutputFormatMock(),
+	antigravityCapabilities: async () => ({
+		outputFormat: await supportsOutputFormatMock(),
+		printTimeout: await supportsPrintTimeoutMock(),
+	}),
 }));
 
 import { type AgentCliResult, describeAgent, runAgentCli } from '@/harness/agent-cli.js';
@@ -119,10 +123,12 @@ function track(promise: Promise<unknown>): { settled: boolean } {
 
 beforeEach(() => {
 	children = [];
-	// Default to an `agy` that supports --output-format; the older-binary path is
-	// exercised explicitly by the tests that override this.
+	// Default to an `agy` that supports --output-format and --print-timeout; the
+	// older-binary paths are exercised explicitly by the tests that override these.
 	supportsOutputFormatMock.mockReset();
 	supportsOutputFormatMock.mockResolvedValue(true);
+	supportsPrintTimeoutMock.mockReset();
+	supportsPrintTimeoutMock.mockResolvedValue(true);
 	spawnMock.mockReset();
 	spawnMock.mockImplementation(() => {
 		const child = new FakeChild();
@@ -452,6 +458,75 @@ describe('runAgentCli', () => {
 			],
 			expect.anything(),
 		);
+	});
+
+	it('raises agy --print-timeout to the run budget, and never hands the flag to claude or codex', async () => {
+		// agy caps its own print-mode run at 5m0s and reports the cut as partial
+		// output with exit 0, so a phase configured for longer silently became a
+		// 5-minute phase (issue #999). The flag carries the run's own budget plus a
+		// minute of slack, so SWARM's SIGTERM — not agy's self-cap — is what ends an
+		// over-budget run. Position is load-bearing: among the leading flags, never
+		// between -p and the prompt.
+		const agy = runAgentCli(
+			createMockRunAgentCliOptions({
+				cli: 'antigravity',
+				timeoutMs: 45 * 60 * 1000,
+				args: ['resolve the conflicts'],
+			}),
+		);
+		(await spawnedChild(0)).emit('close', 0, null);
+		await agy;
+		expect(spawnMock.mock.calls[0][1]).toEqual([
+			'--dangerously-skip-permissions',
+			'--add-dir',
+			'/wt',
+			'--print-timeout',
+			'2760000ms',
+			'--output-format',
+			'stream-json',
+			'-p',
+			'resolve the conflicts',
+		]);
+
+		const claude = runAgentCli(
+			createMockRunAgentCliOptions({ cli: 'claude', timeoutMs: 45 * 60 * 1000 }),
+		);
+		lastChild().emit('close', 0, null);
+		await claude;
+		expect(spawnMock.mock.calls[1][1]).not.toContain('--print-timeout');
+
+		const codex = runAgentCli(
+			createMockRunAgentCliOptions({ cli: 'codex', timeoutMs: 45 * 60 * 1000 }),
+		);
+		lastChild().emit('close', 0, null);
+		await codex;
+		expect(spawnMock.mock.calls[2][1]).not.toContain('--print-timeout');
+	});
+
+	it('omits --print-timeout for an agy that does not advertise it, and when no budget is set', async () => {
+		// Same rule as --output-format: a build that doesn't declare the flag must
+		// keep working rather than be handed an unknown one (ai/RULES.md §6).
+		supportsPrintTimeoutMock.mockResolvedValue(false);
+		const older = runAgentCli(
+			createMockRunAgentCliOptions({
+				cli: 'antigravity',
+				timeoutMs: 20 * 60 * 1000,
+				args: ['do the thing'],
+			}),
+		);
+		(await spawnedChild(0)).emit('close', 0, null);
+		await older;
+		expect(spawnMock.mock.calls[0][1]).not.toContain('--print-timeout');
+
+		// And a caller that set no budget gives the harness nothing to derive a
+		// duration from, so agy keeps its own default.
+		supportsPrintTimeoutMock.mockResolvedValue(true);
+		const unbounded = runAgentCli(
+			createMockRunAgentCliOptions({ cli: 'antigravity', args: ['do the thing'] }),
+		);
+		(await spawnedChild(1)).emit('close', 0, null);
+		await unbounded;
+		expect(spawnMock.mock.calls[1][1]).not.toContain('--print-timeout');
 	});
 
 	it('grants antigravity access to the worktree via --add-dir, and never for claude or codex', async () => {
