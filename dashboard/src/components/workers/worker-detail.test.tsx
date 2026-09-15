@@ -124,7 +124,6 @@ function makeWorker(overrides: Partial<WorkerDetail> = {}): WorkerDetail {
 		rateLimits: [],
 		// Never asked to update: no pending request (issue #978) and no history (#977).
 		update: null,
-		updateHistory: [],
 		currentRun: null,
 		viewerIsOwner: true,
 		enrollments: [makeEnrollment()],
@@ -345,49 +344,30 @@ describe('WorkerDetailView sections (issue #477)', () => {
 	});
 });
 
-// Issue #977 — the machine's own update history, mounted between the build the
-// daemon declares (what it is *on*) and the active job (what it is doing *now*).
-describe('WorkerDetailView update history (issue #977)', () => {
-	/** The section headings in the order they render, so placement is asserted, not just presence. */
-	function headings(): string[] {
-		return screen.getAllByRole('heading').map((heading) => heading.textContent ?? '');
-	}
-
-	it('mounts the card directly after Declared by the daemon and before Active job', () => {
+/**
+ * The machine-scoped update action, in Connectivity. Its gate is the strict
+ * `viewerIsOwner` every other machine-scoped control on this screen uses, so a
+ * viewer who may not restart someone else's daemon is never offered the button
+ * that would.
+ */
+describe('WorkerDetailView update action', () => {
+	it('offers the machine’s owner an Update worker action in Connectivity', () => {
 		renderWorker();
 
-		const order = headings();
-		expect(order).toContain('Update history');
-		expect(order.indexOf('Update history')).toBe(order.indexOf('Declared by the daemon') + 1);
-		expect(order.indexOf('Update history')).toBeLessThan(order.indexOf('Active job'));
+		const button = within(section('Connectivity')).getByRole('button', {
+			name: 'Update worker',
+		}) as HTMLButtonElement;
+		// Inert until it is wired, rather than a live control that swallows a click.
+		expect(button.disabled).toBe(true);
+		expect(button.title).toContain('Not wired up yet');
 	});
 
-	it('renders the machine’s requests in the card, each linking to its run', () => {
-		renderWorker({
-			updateHistory: [
-				{
-					runId: 'run-9',
-					projectId: 'proj-a',
-					target: 'v3',
-					status: 'completed',
-					startedAt: new Date(NOW.getTime() - 60 * 60_000).toISOString(),
-					completedAt: new Date(NOW.getTime() - 59 * 60_000).toISOString(),
-					durationMs: 60_000,
-					error: null,
-				},
-			],
-		});
+	it('withholds it from a viewer who does not own the machine', () => {
+		// An administrator reaching someone else's machine keeps the CLI, exactly as
+		// drain, delete, and the operator credential say on this same screen.
+		renderWorker({ viewerIsOwner: false });
 
-		const card = within(section('Update history'));
-		expect(card.getByRole('link', { name: 'v3' }).getAttribute('href')).toBe('/runs/run-9');
-	});
-
-	it('says a machine nobody has asked has never been asked', () => {
-		renderWorker();
-
-		expect(
-			within(section('Update history')).getByText('This machine has never been asked to update.'),
-		).toBeDefined();
+		expect(screen.queryByRole('button', { name: 'Update worker' })).toBeNull();
 	});
 });
 

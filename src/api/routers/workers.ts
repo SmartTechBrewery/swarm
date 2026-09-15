@@ -4,7 +4,6 @@ import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 
 import { findProjectByIdFromDb } from '../../db/repositories/projectsRepository.js';
-import type { WorkerUpdateRunRow } from '../../db/repositories/runsRepository.js';
 import { findUserByIdentifier, listUsers } from '../../db/repositories/usersRepository.js';
 import type { WorkerCliRateLimit } from '../../db/repositories/workerCliRateLimitsRepository.js';
 import { removeWorker } from '../../db/repositories/workersRepository.js';
@@ -92,10 +91,8 @@ import { workerScmCredentialsRouter } from './workerScmCredentials.js';
  *   project's configured worker order, the unscoped one still lists the caller's
  *   own machines first (#657) and groups the rest by owner (#808). `getById` (#477)
  *   returns that same row for one worker, widened with per-project enrollment
- *   detail, with the machine's recent update runs (`updateHistory`, issue #977 —
- *   the durable record of every request, where the row's own `update` keeps only
- *   the latest outcome), and with what the *viewer* may change, so the detail
- *   screen offers only controls that would succeed. It stays bounded by
+ *   detail and with what the *viewer* may change, so the detail screen offers only
+ *   controls that would succeed. It stays bounded by
  *   `accessibleProjectScope` for non-owners, while a strict owner may also open
  *   their own un-enrolled worker to create its first enrollment. Both rows carry the machine's declared SWARM
  *   `build` and the server-derived `buildIsCurrent` verdict (issue #925), and
@@ -398,19 +395,6 @@ function serializeWorkerRateLimits(rateLimits: WorkerCliRateLimit[]) {
 }
 
 /**
- * The wire form of a machine's update history (issue #977) — the same explicit
- * ISO-timestamp treatment {@link serializeWorkerUpdate} applies, over each entry's
- * two instants. Ordering is the service's (newest first) and is not re-sorted here.
- */
-function serializeWorkerUpdateHistory(entries: WorkerUpdateRunRow[]) {
-	return entries.map((entry) => ({
-		...entry,
-		startedAt: entry.startedAt.toISOString(),
-		completedAt: entry.completedAt?.toISOString() ?? null,
-	}));
-}
-
-/**
  * Every user on the installation, keyed by id, in the non-secret {@link RosterOwner}
  * shape the rosters already report an owner in (issue #922).
  *
@@ -568,7 +552,6 @@ export const workersRouter = router({
 				drainingSince: detail.drainingSince?.toISOString() ?? null,
 				rateLimits: serializeWorkerRateLimits(detail.rateLimits),
 				update: serializeWorkerUpdate(detail.update),
-				updateHistory: serializeWorkerUpdateHistory(detail.updateHistory),
 				viewerIsOwner,
 				enrollments,
 			};
