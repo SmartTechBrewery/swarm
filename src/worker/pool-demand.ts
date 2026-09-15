@@ -20,9 +20,13 @@
  *   and resolving it would mean a board read per waiting dispatch on the dispatch
  *   path.
  * - **Implementation is read as planned.** `implementationUnplanned` selects a
- *   different `agents.*` block for an item that never went through Planning, which a
- *   project may point at different targets; establishing it costs another query per
- *   contender (`wasPrecededByPlanning`), so the planned block is used.
+ *   different `agents.*` block for an item that holds no plan at all, which a
+ *   project may point at different targets; establishing it costs a board read plus
+ *   a query per contender (`isPlannedForImplementation`, `./consumer.ts` — the
+ *   dispatch row carries no work item, and the card answers the first two of its
+ *   three signals), so the planned block is used. The approximation only got safer
+ *   with issue #992: a planned split child now resolves the planned block on the
+ *   dispatch path too, which is the block assumed here.
  * - **A payload that names no repository is not narrowed by one** (issue #714). Its
  *   `undefined` means the project's *default* entry, and the project a gate scoped is
  *   not necessarily that entry — so the gate skips its repository check for that

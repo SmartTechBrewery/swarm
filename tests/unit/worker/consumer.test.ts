@@ -17,6 +17,7 @@ import { describeError } from '@/lib/errors.js';
 import { logger } from '@/lib/logger.js';
 import { DependencyBlockedError } from '@/pipeline/dependency-guard.js';
 import type { ProposedScope } from '@/pipeline/planning.js';
+import { buildPreplanContract, embedPreplanMarker } from '@/pipeline/preplan.js';
 import { BlockedRecoveryError } from '@/pipeline/resume.js';
 import type { PMProvider, WorkItem, WorkItemAssignee } from '@/pm/types.js';
 import type { CancellationOrigin } from '@/queue/cancellation.js';
@@ -2245,6 +2246,121 @@ describe('processJob', () => {
 			await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 			expect(hasCompletedRunForTask).not.toHaveBeenCalledWith(PROJECT.id, '17', 'planning');
+		});
+
+		// A card planned by its *parent's* Planning run (issue #992). It carries the
+		// `planned` label and its plan as a validated preplan marker, and has no
+		// `runs` row of its own — the run-history probe alone read that as "never
+		// planned" and spent the unplanned config on every split child.
+		describe('a preplanned split child (issue #992)', () => {
+			/** The project both split-child paths below are dispatched under. */
+			const withBothConfigs = () =>
+				createMockProjectConfig({
+					agents: {
+						implementation: { cli: 'claude', model: 'opus' },
+						implementationUnplanned: { cli: 'codex', model: 'gpt-5.6-terra' },
+					},
+				});
+
+			/** The child's own backing issue — the URL a valid marker has to bind to. */
+			const CHILD_URL = 'https://github.com/SmartTechBrewery/swarm/issues/10';
+			/** What the split creates the child with: the automation opt-in and the child marker. */
+			const SPLIT_CHILD_LABELS = [
+				{ id: 'LA_swarm', name: 'swarm' },
+				{ id: 'LA_child', name: 'swarm:split-child' },
+			];
+
+			/** A child's body with its parent's plan embedded, exactly as the split writes it. */
+			function withPreplanMarker(humanDescription: string, itemUrl = CHILD_URL): string {
+				return embedPreplanMarker(
+					humanDescription,
+					buildPreplanContract({
+						splitId: 'split-1',
+						childIndex: 1,
+						parentUrl: 'https://github.com/SmartTechBrewery/swarm/issues/9',
+						itemUrl,
+						humanDescription,
+						plan: 'Phase 2: wire the dispatch seam.',
+						generatedAt: '2026-09-15T11:00:00.000Z',
+					}),
+				);
+			}
+
+			/** A fully prepared child: labelled `planned`, holding its parent's plan. */
+			function preparedChild(overrides: Partial<WorkItem> = {}): WorkItem {
+				return createMockWorkItem({
+					url: CHILD_URL,
+					labels: [...SPLIT_CHILD_LABELS, { id: 'LA_planned', name: 'planned' }],
+					description: withPreplanMarker('Phase 2 scope.'),
+					...overrides,
+				});
+			}
+
+			function triggerFor(workItem: WorkItem): TriggerResult {
+				return { phase: 'implementation', taskId: '10', workItem };
+			}
+
+			beforeEach(() => {
+				projectLookup = withBothConfigs;
+			});
+
+			it('resolves the planned config from the label, without reading run history', async () => {
+				// The child's plan rides in its body; no Planning run was ever spent on it.
+				await processJob(createMockPmWebhookJob(), registryReturning(triggerFor(preparedChild())));
+
+				expect(resolvedTarget()).toMatchObject({ engine: 'claude', model: 'opus' });
+				// The board card already answered, so the dispatch pays no extra DB read.
+				expect(hasCompletedRunForTask).not.toHaveBeenCalled();
+			});
+
+			it('resolves the planned config from the marker when the planned label never landed', async () => {
+				// `markSplitChildPlanned` swallows a refused `addLabel`, so a child can hold
+				// its parent's plan with no label on the card.
+				const child = preparedChild({ labels: SPLIT_CHILD_LABELS });
+
+				await processJob(createMockPmWebhookJob(), registryReturning(triggerFor(child)));
+
+				expect(resolvedTarget()).toMatchObject({ engine: 'claude', model: 'opus' });
+			});
+
+			it('resolves the same config whether the label landed or a Planning run healed it', async () => {
+				await processJob(createMockPmWebhookJob(), registryReturning(triggerFor(preparedChild())));
+				const labelledTarget = resolvedTarget();
+
+				phaseCalls.length = 0;
+				// The label failed, so the child was dispatched to Planning, which reused the
+				// marker and left a completed `planning` run behind (`completePreplannedRun`).
+				const healed = preparedChild({
+					labels: SPLIT_CHILD_LABELS,
+					description: 'Phase 2 scope, with the marker since edited away.',
+				});
+				hasCompletedRunForTask.mockResolvedValueOnce(true);
+				await processJob(createMockPmWebhookJob(), registryReturning(triggerFor(healed)));
+
+				expect(resolvedTarget()).toMatchObject({
+					engine: labelledTarget.engine,
+					model: labelledTarget.model,
+				});
+				expect(resolvedTarget()).toMatchObject({ engine: 'claude', model: 'opus' });
+			});
+
+			it('keeps the unplanned config when the marker belongs to another item', async () => {
+				// A copied or stale marker is no plan at all: `evaluatePreplan` rejects it and
+				// the run-history fallback then answers for a child that really is unplanned.
+				const child = preparedChild({
+					labels: SPLIT_CHILD_LABELS,
+					description: withPreplanMarker(
+						'Phase 2 scope.',
+						'https://github.com/SmartTechBrewery/swarm/issues/999',
+					),
+				});
+				hasCompletedRunForTask.mockResolvedValueOnce(false);
+
+				await processJob(createMockPmWebhookJob(), registryReturning(triggerFor(child)));
+
+				expect(hasCompletedRunForTask).toHaveBeenCalledWith(PROJECT.id, '10', 'planning');
+				expect(resolvedTarget()).toMatchObject({ engine: 'codex', model: 'gpt-5.6-terra' });
+			});
 		});
 	});
 
