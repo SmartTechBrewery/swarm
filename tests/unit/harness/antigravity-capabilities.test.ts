@@ -34,8 +34,9 @@ const failsWith = (err: unknown) => {
 };
 
 import {
-	resetOutputFormatProbeCache,
+	resetAntigravityCapabilityCache,
 	supportsOutputFormat,
+	supportsPrintTimeout,
 } from '@/harness/antigravity-capabilities.js';
 
 /** The real `agy --help` output, trimmed to the lines that matter (1.1.10). */
@@ -45,18 +46,31 @@ const AGY_1_1_10_HELP = [
 	'  --conversation                  Resume a previous conversation by ID',
 	'  --output-format                 Output format for print mode (text, json, stream-json) (default text)',
 	'  -p                              Short alias for --print',
+	'  --print-timeout                 Timeout for print mode wait (default 5m0s)',
 ].join('\n');
 
-/** The same help without the flag — how agy 1.1.3 presented itself. */
+/** The same help without either flag — how agy 1.1.3 presented itself. */
 const AGY_OLD_HELP = [
 	'Usage of agy:',
 	'  --add-dir                       Add a directory to the workspace (repeatable) (default [])',
 	'  -p                              Short alias for --print',
 ].join('\n');
 
+/**
+ * agy 1.1.5, verbatim in the lines that matter: it declares `--print-timeout`
+ * but *not* `--output-format`, so the two capabilities are genuinely
+ * independent and neither may be inferred from the other.
+ */
+const AGY_1_1_5_HELP = [
+	'Usage of agy:',
+	'  --add-dir                       Add a directory to the workspace (repeatable) (default [])',
+	'  -p                              Short alias for --print',
+	'  --print-timeout                 Timeout for print mode wait (default 5m0s)',
+].join('\n');
+
 beforeEach(() => {
 	execFileMock.mockClear();
-	resetOutputFormatProbeCache();
+	resetAntigravityCapabilityCache();
 	succeedsWith('');
 });
 
@@ -102,7 +116,7 @@ describe('supportsOutputFormat', () => {
 		failsWith(Object.assign(new Error('spawn agy ENOENT'), { code: 'ENOENT' }));
 		await expect(supportsOutputFormat('agy')).resolves.toBe(false);
 
-		resetOutputFormatProbeCache();
+		resetAntigravityCapabilityCache();
 		failsWith(Object.assign(new Error('timed out'), { killed: true, signal: 'SIGTERM' }));
 		await expect(supportsOutputFormat('agy')).resolves.toBe(false);
 	});
@@ -124,5 +138,54 @@ describe('supportsOutputFormat', () => {
 		succeedsWith(AGY_OLD_HELP);
 		await expect(supportsOutputFormat('/opt/old/agy')).resolves.toBe(false);
 		expect(execFileMock).toHaveBeenCalledTimes(2);
+	});
+});
+
+describe('supportsPrintTimeout', () => {
+	it('detects the flag in a help listing that declares it', async () => {
+		succeedsWith(AGY_1_1_5_HELP);
+		await expect(supportsPrintTimeout('agy')).resolves.toBe(true);
+		expect(execFileMock).toHaveBeenCalledWith('agy', ['--help'], expect.anything());
+	});
+
+	it('reports false for a binary whose help lacks the flag', async () => {
+		succeedsWith(AGY_OLD_HELP);
+		await expect(supportsPrintTimeout('agy')).resolves.toBe(false);
+	});
+
+	it('ignores another flag merely mentioning print timeouts in its prose', async () => {
+		succeedsWith(
+			[
+				'Usage of agy:',
+				'  --print          Run a single prompt non-interactively',
+				'                   Waits up to the --print-timeout default before returning',
+			].join('\n'),
+		);
+		await expect(supportsPrintTimeout('agy')).resolves.toBe(false);
+	});
+
+	it('reports false — never throws — for a missing binary or a timed-out probe', async () => {
+		failsWith(Object.assign(new Error('spawn agy ENOENT'), { code: 'ENOENT' }));
+		await expect(supportsPrintTimeout('agy')).resolves.toBe(false);
+	});
+
+	it('is answered by the same single probe as --output-format', async () => {
+		// One `agy --help` answers both questions, so gating a second flag on
+		// observed capability costs no extra process.
+		succeedsWith(AGY_1_1_10_HELP);
+		const [outputFormat, printTimeout] = await Promise.all([
+			supportsOutputFormat('agy'),
+			supportsPrintTimeout('agy'),
+		]);
+		expect([outputFormat, printTimeout]).toEqual([true, true]);
+		expect(execFileMock).toHaveBeenCalledTimes(1);
+	});
+
+	it('answers the two flags independently', async () => {
+		// agy 1.1.5 has --print-timeout and no --output-format; neither capability
+		// may be inferred from the other.
+		succeedsWith(AGY_1_1_5_HELP);
+		await expect(supportsPrintTimeout('agy')).resolves.toBe(true);
+		await expect(supportsOutputFormat('agy')).resolves.toBe(false);
 	});
 });

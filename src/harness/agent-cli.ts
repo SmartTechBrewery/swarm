@@ -17,7 +17,7 @@ import { spawn } from 'node:child_process';
 import { z } from 'zod';
 
 import { logger } from '@/lib/logger.js';
-import { supportsOutputFormat } from './antigravity-capabilities.js';
+import { antigravityCapabilities } from './antigravity-capabilities.js';
 import { detectNewConversationId, snapshotConversationIds } from './antigravity-session.js';
 import { createAntigravityStreamNormalizer } from './antigravity-stream.js';
 import { createClaudeStreamNormalizer, findClaudeRateLimitReset } from './claude-stream.js';
@@ -160,6 +160,36 @@ const OUTPUT_FORMAT_ARGS: Record<AgentCli, string[]> = {
  * flush/clean up; SIGKILL is the backstop if they ignore SIGTERM.
  */
 const KILL_GRACE_MS = 5_000;
+
+/**
+ * How much slack `agy --print-timeout` gets over SWARM's own `timeoutMs`, so
+ * the harness's timer is the one that fires (issue #999).
+ *
+ * `agy --help`: `--print-timeout  Timeout for print mode wait (default 5m0s)`.
+ * That self-cap is applied whether or not SWARM sets a budget, and it is *not*
+ * an error: agy prints whatever the turn produced so far, emits
+ * `print timeout after 5m0s with turn in progress; returning partial output` on
+ * stderr, and exits 0. Confirmed live on 2026-09-15 — four `resolve-conflicts`
+ * runs configured for far longer all died at exactly 5 minutes on work that
+ * takes ~4.3 minutes, while the same phase on `claude` (which declares no
+ * timeout flag of its own, nor does `codex exec`) finished.
+ *
+ * Passing the budget *exactly* would leave two deadlines racing at the same
+ * instant, and agy winning that race reports a truncated run as a success. A
+ * minute of slack makes SWARM's SIGTERM authoritative, so an over-budget run
+ * settles through {@link AgentCliResult.timedOut} — deferred and resumable —
+ * instead of being mistaken for a finished one.
+ */
+const PRINT_TIMEOUT_MARGIN_MS = 60_000;
+
+/**
+ * SWARM's millisecond budget as a Go `time.ParseDuration` string, which is what
+ * `agy --print-timeout` parses (verified against agy 1.1.5: a bad value is
+ * rejected with `time: invalid duration "…"`, Go's own message). Milliseconds
+ * are a valid unit there, so the budget is passed through exactly rather than
+ * rounded into minutes.
+ */
+const goDuration = (ms: number): string => `${ms}ms`;
 
 export interface RunAgentCliOptions {
 	/** Which agent CLI to launch. */
@@ -554,6 +584,34 @@ export function acceptsAssignedSessionId(cli: AgentCli): boolean {
 	return cli === 'claude';
 }
 
+/**
+ * The two `agy` flags SWARM has to *ask* for rather than assume, resolved from
+ * one `agy --help` probe (`./antigravity-capabilities.ts`):
+ *
+ *  - `--output-format` — absent on 1.1.3 (issue #465), so an older binary keeps
+ *    the plain-text path instead of being handed an unknown flag;
+ *  - `--print-timeout` — raises agy's own 5-minute print-mode cap to this run's
+ *    budget, so the phase's configured timeout is what bounds an Antigravity run
+ *    (issue #999). Omitted when the caller set no budget: there is nothing to
+ *    derive a duration from, and inventing one is not this harness's policy.
+ *
+ * Both land among the leading flags, never between `-p` and the prompt — the one
+ * position that is load-bearing for agy (see SUBCOMMAND_ARGS/PRINT_FLAG above).
+ */
+async function resolveAntigravityArgs(
+	command: string,
+	timeoutMs: number | undefined,
+): Promise<{ outputFormatArgs: string[]; printTimeoutArgs: string[] }> {
+	const caps = await antigravityCapabilities(command);
+	return {
+		outputFormatArgs: caps.outputFormat ? OUTPUT_FORMAT_ARGS.antigravity : [],
+		printTimeoutArgs:
+			caps.printTimeout && timeoutMs !== undefined
+				? ['--print-timeout', goDuration(timeoutMs + PRINT_TIMEOUT_MARGIN_MS)]
+				: [],
+	};
+}
+
 export async function runAgentCli(options: RunAgentCliOptions): Promise<AgentCliResult> {
 	const cli = AgentCliSchema.parse(options.cli);
 	const command = options.command ?? DEFAULT_COMMAND[cli];
@@ -606,12 +664,13 @@ export async function runAgentCli(options: RunAgentCliOptions): Promise<AgentCli
 	// leading flags — never between `-p` and the prompt, the one position that is
 	// load-bearing for agy (see SUBCOMMAND_ARGS/PRINT_FLAG above).
 	const addDirArgs = cli === 'antigravity' ? ['--add-dir', options.cwd] : [];
-	// agy is the one CLI whose structured-output flag has to be asked for: 1.1.3
-	// has no `--output-format`, and passing it there would hand an unknown flag to
-	// the binary (issue #465). claude/codex are never probed, so their path stays
-	// synchronous through to `spawn`.
-	const outputFormatArgs =
-		cli === 'antigravity' && !(await supportsOutputFormat(command)) ? [] : OUTPUT_FORMAT_ARGS[cli];
+	// agy is the one CLI whose flags have to be asked for rather than assumed (see
+	// {@link resolveAntigravityArgs}); claude/codex are never probed, so their path
+	// stays synchronous through to `spawn`.
+	const { outputFormatArgs, printTimeoutArgs } =
+		cli === 'antigravity'
+			? await resolveAntigravityArgs(command, options.timeoutMs)
+			: { outputFormatArgs: OUTPUT_FORMAT_ARGS[cli], printTimeoutArgs: [] };
 	// Empty only for an agy that didn't advertise the flag — that run prints plain
 	// text and keeps every pre-#465 behavior below.
 	const agyStreams = cli === 'antigravity' && outputFormatArgs.length > 0;
@@ -619,6 +678,7 @@ export async function runAgentCli(options: RunAgentCliOptions): Promise<AgentCli
 		...baseArgs,
 		...containment.args,
 		...addDirArgs,
+		...printTimeoutArgs,
 		...modelArgs,
 		...launch.providerArgs,
 		...(options.providerArgs ?? []),
