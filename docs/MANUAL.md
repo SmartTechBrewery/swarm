@@ -284,10 +284,16 @@ machine and the build it was asked to move to, and, when it failed, the machine'
 reason — which already names the install root, the step that failed, and whether the
 checkout was returned to the build it was on — together with the command that asks
 again. A failed update is **re-asked, never retried from the run page**: drain the
-machine, fix the cause, then `swarm workers update <worker-id> <ref>`. The page
-deliberately offers no **Terminate** and no **Recover**; both are refused for a
-maintenance run server-side, and nothing in the dashboard can stop an update already
-in flight — asking again with a different build supersedes the request instead.
+machine, address whatever the machine's reason names, then `swarm workers update
+<worker-id> <ref>`. Read that reason first, because not every `failed` update is a
+machine-side failure — re-targeting a machine settles the previous request's run as
+*superseded*, and re-asking for the build **that** run names would move the machine
+back off the build you just chose and supersede the newer request still in flight,
+which is why the page states the command on a condition rather than as an
+instruction. The page deliberately offers no **Terminate** and no **Recover**; both
+are refused for a maintenance run server-side, and nothing in the dashboard can stop
+an update already in flight — asking again with a different build supersedes the
+request instead.
 
 **The machine must be enrolled in a project.** That run has to hang off one, so a
 worker enrolled in **no** project is refused rather than silently asked: `swarm

@@ -1677,10 +1677,10 @@ export function ReviewMergeCallout({ run }: ReviewMergeCalloutProps) {
 
 /**
  * The build a maintenance run is moving its machine to, and the machine's own id —
- * the two halves of the `swarm workers update` command the failure callout tells the
- * operator to re-issue. Both fall back to a placeholder rather than printing a
- * literal `null`: a half-formed command an operator can paste is worse than one they
- * can see they have to complete.
+ * the two halves of the `swarm workers update` command the failure callout offers the
+ * operator. Both fall back to a placeholder rather than printing a literal `null`: a
+ * half-formed command an operator can paste is worse than one they can see they have
+ * to complete.
  */
 function maintenanceCommandParts(run: RunRow): { workerId: string; target: string } {
 	return {
@@ -1724,6 +1724,20 @@ function MaintenanceRunningCallout({ run }: { run: RunRow }) {
  * how to ask again. There is no dashboard control for that today, and the run is a
  * record of one request rather than something retried from here, so the guidance is
  * the CLI command and no `Recover` button.
+ *
+ * **The guidance is deliberately conditional, and asserts no machine-side cause.**
+ * `failed` is not only a machine-reported failure: `supersedeWorkerUpdateRun`
+ * (`src/db/repositories/runsRepository.ts`) fails a still-`running` request when the
+ * operator re-targets the same machine, which is a routine action this page's own
+ * `running` callout advertises. Telling *that* run's reader to fix the machine and
+ * re-issue `swarm workers update <id> <this run's target>` would have them supersede
+ * their own newer, in-flight request and send the machine back to the build they
+ * moved off. Nothing on `RunRow` tells the two apart — the superseded case is carried
+ * only in the `error` prose, and the run carries no discriminator column — and
+ * matching that prose would key the copy on a server-side message string, so the copy
+ * states the condition instead of asserting it and names the supersede consequence
+ * beside the command. A durable discriminator is a server-side change, outside this
+ * issue's no-server-change boundary; it is noted on #974 rather than taken here.
  */
 function MaintenanceFailureCallout({ run, error }: { run: RunRow; error: string }) {
 	const { workerId, target } = maintenanceCommandParts(run);
@@ -1736,16 +1750,165 @@ function MaintenanceFailureCallout({ run, error }: { run: RunRow; error: string 
 					{normalizeRunError(error)}
 				</p>
 				<p className="text-xs text-red-400/60 mt-2">
-					Fix the cause on the machine, then ask it again:{' '}
+					This run is a record of one request and is not retried from here. If this machine still
+					needs that build, and the message above is addressed, ask for it again:{' '}
 					<span className="font-mono text-red-300">
 						swarm workers update {workerId} {target}
 					</span>{' '}
-					(the machine must be drained first). This run is a record of one request and is not
-					retried from here.
+					(the machine must be drained first). Asking again supersedes any request for this machine
+					still in flight.
 				</p>
 			</div>
 		</div>
 	);
+}
+
+/** The `running` callout for pipeline work, which is the only kind that has an agent to stop. */
+function PipelineRunningCallout({ run }: { run: RunRow }) {
+	return (
+		<div className="p-4 bg-violet-950/20 border border-violet-900/30 rounded flex items-start gap-3">
+			<Loader2 className="h-5 w-5 text-violet-400 shrink-0 mt-0.5 animate-spin" />
+			<div>
+				<h3 className="text-xs font-semibold text-violet-200">Running</h3>
+				<p className="text-xs text-violet-200/70 mt-1">
+					This run is in progress. Terminating it stops the agent and frees its project slot.
+				</p>
+				{canTerminateRun(run.status) && <TerminateRunButton run={run} />}
+			</div>
+		</div>
+	);
+}
+
+interface DeferredCalloutProps {
+	run: RunRow;
+	/** Forwarded to {@link ResetRunButton}, which reports its reset back to the header. */
+	onResetSuccess: (report: ResetRunReport) => void;
+	/** This run's scheduled retry, already narrowed non-null by the caller. */
+	nextRetryAt: string;
+}
+
+/** The `deferred` callout: the reason, when the automatic retry lands, and the controls. */
+function DeferredCallout({ run, onResetSuccess, nextRetryAt }: DeferredCalloutProps) {
+	return (
+		<div className="p-4 bg-amber-950/20 border border-amber-900/30 rounded flex items-start gap-3">
+			<AlertTriangle className="h-5 w-5 text-amber-500 shrink-0 mt-0.5" />
+			<div>
+				<h3 className="text-xs font-semibold text-amber-200">
+					Deferred — automatic retry scheduled
+				</h3>
+				{run.error && (
+					<p className="text-xs text-amber-200/70 mt-1 font-mono whitespace-pre-wrap">
+						{normalizeRunError(run.error)}
+					</p>
+				)}
+				<p className="text-xs text-amber-200/70 mt-2 font-mono">
+					{new Date(nextRetryAt).toLocaleString()} ({formatTimeUntil(nextRetryAt)})
+				</p>
+				<p className="text-xs text-amber-200/70 mt-1 font-mono">
+					UTC: {new Date(nextRetryAt).toISOString()}
+				</p>
+				<div className="flex flex-wrap items-start gap-3">
+					{canRetryRun(run.status) && <RetryNowButton run={run} />}
+					{canTerminateRun(run.status) && <TerminateRunButton run={run} />}
+					{canResetRun(run.status) && <ResetRunButton run={run} onResetSuccess={onResetSuccess} />}
+				</div>
+			</div>
+		</div>
+	);
+}
+
+interface PipelineFailureCalloutProps {
+	run: RunRow;
+	error: string;
+	/** Forwarded to {@link RecoverRunButton}, which reports its reset back to the header. */
+	onResetSuccess: (report: ResetRunReport) => void;
+}
+
+/**
+ * The `failed` callout for pipeline work — the counterpart of
+ * {@link MaintenanceFailureCallout}, which is what a maintenance run reads instead.
+ */
+function PipelineFailureCallout({ run, error, onResetSuccess }: PipelineFailureCalloutProps) {
+	const heading = run.cancellation
+		? 'Run Cancelled'
+		: run.timedOut
+			? 'Run Timed Out'
+			: 'Run Failure Error';
+	return (
+		<div className="p-4 bg-red-950/20 border border-red-900/30 rounded flex items-start gap-3">
+			<AlertTriangle className="h-5 w-5 text-red-400 shrink-0 mt-0.5" />
+			<div>
+				<h3 className="text-xs font-semibold text-red-200">{heading}</h3>
+				<p className="text-xs text-red-400/80 mt-1 font-mono whitespace-pre-wrap">
+					{normalizeRunError(error)}
+				</p>
+				{run.cancellation && (
+					<p className="text-xs text-red-400/60 mt-1 font-mono">
+						{describeCancellationOrigin(run.cancellation)}
+					</p>
+				)}
+				{/*
+				 * One control for every eligible recovery choice (issue #593): the
+				 * component computes them itself and renders nothing when none
+				 * applies, so the choice rules can't drift from a call-site guard.
+				 */}
+				<div className="flex flex-wrap items-start gap-3">
+					<RecoverRunButton run={run} onResetSuccess={onResetSuccess} />
+				</div>
+			</div>
+		</div>
+	);
+}
+
+interface RunStatusCalloutProps {
+	run: RunRow;
+	/** Forwarded to the recovery controls, which report their reset back to the header. */
+	onResetSuccess: (report: ResetRunReport) => void;
+}
+
+/**
+ * The one callout this run's `status` calls for, lifted out of {@link RunDetailHeader}
+ * (issue #974). The four status blocks became eight conditions on two axes once the
+ * kind axis arrived, which is both what pushed the header past the cognitive-complexity
+ * threshold and what made it hard to scan. The header now renders this once, this
+ * function is the dispatch alone, and each branch's markup is its own component.
+ * Rendered output is unchanged.
+ *
+ * `deferred` and `checkpointed` stay on the pipeline shape deliberately: a maintenance
+ * run creates no dispatch, no session and no checkpoint, so neither status is reachable
+ * for one and neither needs a kind guard.
+ */
+function RunStatusCallout({ run, onResetSuccess }: RunStatusCalloutProps) {
+	// Issue #974 — asked once, of the `kind` discriminator, and used to swap the two
+	// status callouts a maintenance run reads wrongly through.
+	const maintenance = isMaintenanceRun(run);
+
+	switch (run.status) {
+		case 'running':
+			return maintenance ? (
+				<MaintenanceRunningCallout run={run} />
+			) : (
+				<PipelineRunningCallout run={run} />
+			);
+		case 'deferred':
+			return run.nextRetryAt ? (
+				<DeferredCallout run={run} onResetSuccess={onResetSuccess} nextRetryAt={run.nextRetryAt} />
+			) : null;
+		case 'checkpointed':
+			return <CheckpointedCallout run={run} onResetSuccess={onResetSuccess} />;
+		case 'failed':
+			return (
+				<>
+					<FailureDiagnosisCallout diagnosis={run.failureDiagnosis} />
+					{run.error && maintenance && <MaintenanceFailureCallout run={run} error={run.error} />}
+					{run.error && !maintenance && (
+						<PipelineFailureCallout run={run} error={run.error} onResetSuccess={onResetSuccess} />
+					)}
+				</>
+			);
+		default:
+			return null;
+	}
 }
 
 interface RunDetailHeaderProps {
@@ -1757,11 +1920,6 @@ interface RunDetailHeaderProps {
 export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
 	const [resetReport, setResetReport] = useState<ResetRunReport | null>(null);
 	const prevRunIdRef = useRef(run.id);
-	// Issue #974 — asked once, of the `kind` discriminator, and used to swap the two
-	// status callouts a maintenance run reads wrongly through. The `deferred` and
-	// `checkpointed` blocks are deliberately untouched: a maintenance run has no
-	// dispatch, no session and no checkpoint, so neither status is reachable for one.
-	const maintenance = isMaintenanceRun(run);
 
 	useEffect(() => {
 		if (prevRunIdRef.current !== run.id) {
@@ -1817,90 +1975,7 @@ export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
 				</div>
 			)}
 
-			{run.status === 'running' && maintenance && <MaintenanceRunningCallout run={run} />}
-
-			{run.status === 'running' && !maintenance && (
-				<div className="p-4 bg-violet-950/20 border border-violet-900/30 rounded flex items-start gap-3">
-					<Loader2 className="h-5 w-5 text-violet-400 shrink-0 mt-0.5 animate-spin" />
-					<div>
-						<h3 className="text-xs font-semibold text-violet-200">Running</h3>
-						<p className="text-xs text-violet-200/70 mt-1">
-							This run is in progress. Terminating it stops the agent and frees its project slot.
-						</p>
-						{canTerminateRun(run.status) && <TerminateRunButton run={run} />}
-					</div>
-				</div>
-			)}
-
-			{run.status === 'deferred' && run.nextRetryAt && (
-				<div className="p-4 bg-amber-950/20 border border-amber-900/30 rounded flex items-start gap-3">
-					<AlertTriangle className="h-5 w-5 text-amber-500 shrink-0 mt-0.5" />
-					<div>
-						<h3 className="text-xs font-semibold text-amber-200">
-							Deferred — automatic retry scheduled
-						</h3>
-						{run.error && (
-							<p className="text-xs text-amber-200/70 mt-1 font-mono whitespace-pre-wrap">
-								{normalizeRunError(run.error)}
-							</p>
-						)}
-						<p className="text-xs text-amber-200/70 mt-2 font-mono">
-							{new Date(run.nextRetryAt).toLocaleString()} ({formatTimeUntil(run.nextRetryAt)})
-						</p>
-						<p className="text-xs text-amber-200/70 mt-1 font-mono">
-							UTC: {new Date(run.nextRetryAt).toISOString()}
-						</p>
-						<div className="flex flex-wrap items-start gap-3">
-							{canRetryRun(run.status) && <RetryNowButton run={run} />}
-							{canTerminateRun(run.status) && <TerminateRunButton run={run} />}
-							{canResetRun(run.status) && (
-								<ResetRunButton run={run} onResetSuccess={setResetReport} />
-							)}
-						</div>
-					</div>
-				</div>
-			)}
-
-			{run.status === 'checkpointed' && (
-				<CheckpointedCallout run={run} onResetSuccess={setResetReport} />
-			)}
-
-			{run.status === 'failed' && <FailureDiagnosisCallout diagnosis={run.failureDiagnosis} />}
-
-			{run.status === 'failed' && run.error && maintenance && (
-				<MaintenanceFailureCallout run={run} error={run.error} />
-			)}
-
-			{run.status === 'failed' && run.error && !maintenance && (
-				<div className="p-4 bg-red-950/20 border border-red-900/30 rounded flex items-start gap-3">
-					<AlertTriangle className="h-5 w-5 text-red-400 shrink-0 mt-0.5" />
-					<div>
-						<h3 className="text-xs font-semibold text-red-200">
-							{run.cancellation
-								? 'Run Cancelled'
-								: run.timedOut
-									? 'Run Timed Out'
-									: 'Run Failure Error'}
-						</h3>
-						<p className="text-xs text-red-400/80 mt-1 font-mono whitespace-pre-wrap">
-							{normalizeRunError(run.error)}
-						</p>
-						{run.cancellation && (
-							<p className="text-xs text-red-400/60 mt-1 font-mono">
-								{describeCancellationOrigin(run.cancellation)}
-							</p>
-						)}
-						{/*
-						 * One control for every eligible recovery choice (issue #593): the
-						 * component computes them itself and renders nothing when none
-						 * applies, so the choice rules can't drift from a call-site guard.
-						 */}
-						<div className="flex flex-wrap items-start gap-3">
-							<RecoverRunButton run={run} onResetSuccess={setResetReport} />
-						</div>
-					</div>
-				</div>
-			)}
+			<RunStatusCallout run={run} onResetSuccess={setResetReport} />
 
 			<PreservedWorkerCallout run={run} />
 			<CheckpointPanel run={run} />
@@ -1922,11 +1997,14 @@ export function GitHubReferences({ run }: GitHubReferencesProps) {
 
 	// A maintenance run references neither a pull request nor a board card (issue
 	// #971) — the build it is moving its machine to is what it has to say, and the
-	// machine itself is the Execution Environment cell below.
-	if (run.maintenanceTarget) {
+	// machine itself is the Execution Environment cell below. Asked of the `kind`
+	// discriminator, like every other reader on this page (issue #974): the null
+	// `repository`/`taskId` and the present `maintenanceTarget` are the consequence
+	// of the kind, so the target is the value here, never the question.
+	if (isMaintenanceRun(run)) {
 		return (
 			<span className="text-zinc-300 font-mono">
-				Moving this machine to <span className="text-zinc-100">{run.maintenanceTarget}</span>
+				Moving this machine to <span className="text-zinc-100">{run.maintenanceTarget ?? '—'}</span>
 			</span>
 		);
 	}
@@ -2116,14 +2194,16 @@ function RunOverview({ run, project }: RunOverviewProps) {
 					{/*
 					 * A maintenance run names no task (issue #971): it acts on no repository
 					 * and provisions no worktree, so the field states the build it is moving
-					 * its machine to instead of rendering blank.
+					 * its machine to instead of rendering blank. Keyed on the `kind`
+					 * discriminator rather than on the null `taskId` that kind implies
+					 * (issue #974), so the label and the value agree on one question.
 					 */}
 					<div>
 						<span className="block text-xs font-medium text-zinc-400">
-							{run.taskId ? 'Task ID' : 'Target build'}
+							{isMaintenanceRun(run) ? 'Target build' : 'Task ID'}
 						</span>
 						<span className="text-sm text-zinc-200 mt-1 block font-mono">
-							{run.taskId ?? run.maintenanceTarget ?? '—'}
+							{(isMaintenanceRun(run) ? run.maintenanceTarget : run.taskId) ?? '—'}
 						</span>
 					</div>
 
