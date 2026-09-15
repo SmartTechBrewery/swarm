@@ -1058,6 +1058,13 @@ export async function assertRemoteFastForwardable(cwd: string, branch: string): 
  * holds the base tip merges into it as a fast-forward, so it cannot conflict,
  * whichever base snapshot the agent happened to fetch for itself.
  *
+ * Deliberately takes a `deliveredSha` rather than reading HEAD, because the
+ * caller asks this on **both** sides of its push: before, to avoid delivering a
+ * merge already known to be stale, and again afterwards, because nothing
+ * constrains `origin/<base>` while the pull request's own branch is updated, so
+ * only a read taken with the commit already on the remote can say the pull
+ * request was mergeable at an instant that actually happened.
+ *
  * Fails **open** when git cannot read the remote at all — a fetch blip must not
  * fail a phase whose merge is otherwise good, the rule {@link
  * assertRemoteFastForwardable} and {@link assertCheckoutHoldsHead} already

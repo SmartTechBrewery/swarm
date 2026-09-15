@@ -74,6 +74,12 @@ export const DEFAULT_RESOLVE_CONFLICTS_CLI: AgentCli = 'claude';
  * gained since the last pass can conflict. Losing it repeatedly means the base is
  * moving faster than the phase can resolve, which more agent runs do not fix, so
  * the bound is small and the run then says so and delivers nothing.
+ *
+ * It is one budget across both reads {@link deliverMergeAgainstCurrentBase}
+ * makes, the one before a push and the one confirming it afterwards, because they
+ * are the same race caught at two points; the confirming read's window is the
+ * push itself, so it is the narrower of the two and rarely the one that spends a
+ * pass.
  */
 const MAX_BASE_ADVANCE_REMERGES = 2;
 
@@ -333,60 +339,118 @@ async function gatePreparedMerge(ctx: MergePassContext): Promise<ConflictHandoff
  * The report for a run the base branch simply outran (issue #1001). The error
  * class does not survive the federated wire, so this message is the whole thing
  * an operator gets (see {@link UnretryableDeliveryError}): it names the branch
- * that moved, where it moved to, how much was spent chasing it, and the fact that
- * nothing was delivered. `Stale merge:` is the greppable prefix, deliberately
+ * that moved, where it moved to, how much was spent chasing it, and what is on
+ * the remote as a result. `Stale merge:` is the greppable prefix, deliberately
  * distinct from `validatePreparedTree`'s `Unsafe delivery:` — this refusal is
  * about the remote, not about the tree.
+ *
+ * The branch state is *not* always "untouched": the base is re-read after the
+ * push as well as before it ({@link deliverMergeAgainstCurrentBase}), so the run
+ * that exhausts the bound may already have pushed a catch-up merge. Saying
+ * otherwise would send an operator looking for a branch that had in fact moved.
  */
-function staleMergeMessage(ctx: MergePassContext, advancedTo: string, remerges: number): string {
+function staleMergeMessage(
+	ctx: MergePassContext,
+	advancedTo: string,
+	remerges: number,
+	pushedSha: string | null,
+): string {
+	const remote = pushedSha
+		? `Merge ${pushedSha} had already been pushed to '${ctx.prBranch}' when the base moved again, so ` +
+			`the branch carries it; no comment was posted and this run reports no resolution.`
+		: `Nothing was pushed or commented and the branch is untouched on the remote.`;
 	return (
 		`Stale merge: base branch '${ctx.baseBranch}' advanced to ${advancedTo} while PR #${ctx.prNumber}'s ` +
 		`conflicts were being resolved, and kept advancing through ${remerges} re-merge ` +
-		`${remerges === 1 ? 'pass' : 'passes'}, so the merge built here would land on a pull request that ` +
-		`is conflicted again. Nothing was pushed or commented and the branch is untouched on the remote. ` +
-		`Re-run this phase once '${ctx.baseBranch}' has settled.`
+		`${remerges === 1 ? 'pass' : 'passes'}, so the pull request is conflicted against it again. ` +
+		`${remote} Re-run this phase once '${ctx.baseBranch}' has settled.`
 	);
 }
 
 /**
- * Prove the merge about to be pushed still contains the base branch **as it
- * stands now**, and merge the base in again — bounded by
- * {@link MAX_BASE_ADVANCE_REMERGES} — when it does not (issue #1001).
+ * Where a delivery got to, written down as it happens so a crashed run resumes
+ * against what the remote actually holds (issue #1001). `committed` records a
+ * catch-up commit that still has to be pushed; `pushed` performs the push and
+ * records it.
+ */
+interface MergeDeliveryRecord {
+	/** A catch-up commit that still has to be pushed. */
+	committed(commitSha: string): void;
+	/** Push this commit to the pull request's branch, and record that it is there. */
+	pushed(commitSha: string): Promise<void>;
+}
+
+/**
+ * Push the resolved merge, and keep pushing catch-up merges — bounded by
+ * {@link MAX_BASE_ADVANCE_REMERGES} — until the commit on the branch contains the
+ * base branch **as an observation made after that push** (issue #1001).
  *
  * This is the other end of the staleness `GitWorktreeManager.provision()` guards
  * at the start of a phase. The resolution is built against one read of
  * `origin/<base>` and delivered minutes later; a merge landing in between makes
  * the pull request conflicting again the instant the push lands, and the run
- * still settles `phase-succeeded` over it. Asked here — after the commit, before
- * the push, the comment and the outcome — so a resolution that lost the race
- * costs an extra pass rather than a green run over a conflicted pull request.
+ * still settles `phase-succeeded` over it.
+ *
+ * **The check has to outlive the push, not precede it.** Nothing SWARM can ask
+ * for constrains `origin/<base>` while it updates the pull request's own branch —
+ * the push is a write to a different ref, so no provider offers an atomic
+ * condition on the base — which means a base read taken *before* the push proves
+ * only that the base had not moved by then, and the same merge can still land in
+ * the interval that is left. So the loop re-reads the base **after** each push
+ * too, and the run only comments and reports `resolved` once a read taken with
+ * the commit already on the remote finds the base contained in it: at that
+ * instant the pull request really was mergeable. A base that advances later is
+ * ordinary — it is what re-dispatches this phase — and no check placed anywhere
+ * inside the run could speak for it.
+ *
+ * The cost of that is one extra `git fetch` of the base on the ordinary path (the
+ * read before the push, then the read confirming it), which is the price of the
+ * claim the comment makes.
  *
  * A catch-up pass is a *second merge on top of the first*, not a redo: the
  * previous commit stays, only what the base gained is merged again, and each pass
  * goes through {@link gatePreparedMerge} and {@link commitPreparedTree} exactly as
- * the first did. That also means a pass with nothing to merge is refused by
- * `validatePreparedTree` rather than silently pushed.
+ * the first did — then the push that follows fast-forwards the branch over the
+ * commit already delivered. That also means a pass with nothing to merge is
+ * refused by `validatePreparedTree` rather than silently pushed.
  *
  * Exhausting the bound throws an {@link UnretryableDeliveryError} rather than a
  * plain error, because deferring is the one thing that must not happen: a
  * deferred delivery resumes *without* re-running the agent
  * ({@link resumedDeliveryAgent}), which is precisely a push of the stale merge
- * this exists to stop.
+ * this exists to stop. It can now throw with a merge already pushed — the
+ * post-push read is where the bound is most likely to bite — so the branch is
+ * left carrying that commit and {@link staleMergeMessage} says so rather than
+ * claiming the remote is untouched.
+ *
+ * Returns the hand-off the last delivered pass left, which is what the comment
+ * body and the outcome are bound to; the commit itself reaches the caller through
+ * `record`, which has already written it to the delivery progress.
  */
-async function catchUpWithAdvancedBase(
+async function deliverMergeAgainstCurrentBase(
 	ctx: MergePassContext,
 	state: { commitSha: string; handoff: ConflictHandoff },
 	commitIdentity: { name: string; email: string },
-): Promise<{ commitSha: string; handoff: ConflictHandoff }> {
+	record: MergeDeliveryRecord,
+): Promise<ConflictHandoff> {
 	let { commitSha, handoff } = state;
 	// A fresh pass mints its own session on a self-minting CLI, so the id the next
 	// one may resume is the one the last pass actually reported.
 	let resumeSessionId = ctx.resumeSessionId;
-	for (let remerges = 0; ; remerges++) {
+	/** The commit the branch is known to carry, so the confirming read costs no second push. */
+	let pushedSha: string | null = null;
+	let remerges = 0;
+	for (;;) {
 		const advancedTo = await advancedBaseHead(ctx.worktreePath, ctx.baseBranch, commitSha);
-		if (!advancedTo) return { commitSha, handoff };
+		if (!advancedTo) {
+			if (pushedSha === commitSha) return handoff;
+			await record.pushed(commitSha);
+			pushedSha = commitSha;
+			continue;
+		}
 		if (remerges >= MAX_BASE_ADVANCE_REMERGES)
-			throw new UnretryableDeliveryError(staleMergeMessage(ctx, advancedTo, remerges));
+			throw new UnretryableDeliveryError(staleMergeMessage(ctx, advancedTo, remerges, pushedSha));
+		remerges += 1;
 		logger.warn(
 			'resolve-conflicts: the base advanced while the conflicts were being resolved — merging it again',
 			{
@@ -395,7 +459,8 @@ async function catchUpWithAdvancedBase(
 				baseBranch: ctx.baseBranch,
 				advancedTo,
 				mergeCommitSha: commitSha,
-				remerge: remerges + 1,
+				pushedSha,
+				remerge: remerges,
 			},
 		);
 		const pass = await ctx.runAgent({
@@ -411,6 +476,7 @@ async function catchUpWithAdvancedBase(
 					baseBranch: ctx.baseBranch,
 					baseSha: advancedTo,
 					deliveredSha: commitSha,
+					pushed: pushedSha === commitSha,
 				}),
 			],
 			maxOutputBytes: 1_000_000,
@@ -438,6 +504,7 @@ async function catchUpWithAdvancedBase(
 			mergeCommitSubject(ctx.baseBranch, ctx.prBranch),
 			commitIdentity,
 		);
+		record.committed(commitSha);
 	}
 }
 
@@ -592,20 +659,32 @@ export async function runResolveConflictsPhase(
 		if (!progress.pushed) {
 			// The base can advance between the read this resolution was built on and
 			// this push — on a repository SWARM itself merges into, well within the
-			// phase's own runtime (issue #1001). Prove it has not before the branch, the
-			// run row and the posted comment all say the conflict is resolved.
-			const caughtUp = await catchUpWithAdvancedBase(
+			// phase's own runtime (issue #1001). The push itself is where that window
+			// closes, so the push lives inside the catch-up loop: it is only left once
+			// a base read taken *after* a push finds it contained in what the branch
+			// now carries, which is what the comment and the outcome below then claim.
+			// Bind them to whatever the last delivered pass actually left.
+			handoff = await deliverMergeAgainstCurrentBase(
 				mergeContext,
 				{ commitSha: progress.commitSha, handoff },
 				delivery.commitIdentity,
+				{
+					committed: (commitSha) => {
+						progress.commitSha = commitSha;
+						saveDeliveryProgress(handle.path, progress);
+					},
+					pushed: async (commitSha) => {
+						await pushDeliveredBranch(delivery, handle.path, prBranch, commitSha);
+						progress.commitSha = commitSha;
+						saveDeliveryProgress(handle.path, progress);
+					},
+				},
 			);
-			if (caughtUp.commitSha !== progress.commitSha) {
-				progress.commitSha = caughtUp.commitSha;
-				saveDeliveryProgress(handle.path, progress);
-			}
-			// Bound the comment and the outcome to whatever the last pass actually left.
-			handoff = caughtUp.handoff;
-			await pushDeliveredBranch(delivery, handle.path, prBranch, progress.commitSha);
+			// `pushed` is written only here, so it means "pushed *and* confirmed
+			// against a base read taken afterwards" — the precondition the comment
+			// below claims. A run that died between the push and that read resumes
+			// with it still `false` and re-enters the loop, where re-pushing the same
+			// commit is the no-op `git push` already makes it.
 			progress.pushed = true;
 			saveDeliveryProgress(handle.path, progress);
 		}

@@ -328,6 +328,58 @@ describe('resolve-conflicts when the base advances mid-run', () => {
 		RACE_CASE_TIMEOUT_MS,
 	);
 
+	// The other half of the race, and the one no pre-push check can reach: nothing
+	// constrains `origin/main` while the *pull request's* branch is being updated,
+	// so a merge landing in the push's own window leaves the branch stale again. The
+	// run must not comment or report `resolved` until a base read taken with the
+	// commit already on the remote finds it contained.
+	it(
+		'merges again when the base advances during the push, and comments only after',
+		async () => {
+			const { worktreePath, seed, headSha, baseSha } = makeConflictedCheckout();
+			const options = makeOptions(worktreePath, headSha, baseSha);
+			let advancedTo = '';
+			const pushed: string[] = [];
+			// The push is where the window is: `main` moves while this very call runs.
+			(options.delivery as { pushBranch: unknown }).pushBranch = vi.fn(
+				async (_cwd: string, _branch: string, sha: string) => {
+					pushed.push(sha);
+					if (pushed.length === 1) advancedTo = advanceBase(seed, 'main moved on again\n');
+				},
+			);
+			let passes = 0;
+			options.runAgent = vi.fn(async () => {
+				passes += 1;
+				if (passes === 1) stageResolution(worktreePath, 'resolved by hand\n');
+				else mergeAdvancedBase(worktreePath, 'resolved against the newer main\n');
+				// Nothing has been commented yet — the first push's merge is already stale.
+				expect(options.postComment).not.toHaveBeenCalled();
+				return agentResult();
+			});
+
+			const { outcome } = await runResolveConflictsPhase(options);
+
+			expect(outcome.status).toBe('resolved');
+			// One resolution, one catch-up pass for the advance the first push raced.
+			expect(options.runAgent).toHaveBeenCalledTimes(2);
+			// Two pushes: the stale one, then the merge that caught up with it.
+			expect(pushed).toHaveLength(2);
+			expect(pushed[1]).toBe(outcome.mergeCommitSha);
+			expect(pushed[0]).not.toBe(outcome.mergeCommitSha);
+			expect(options.postComment).toHaveBeenCalledTimes(1);
+			// The claim the comment makes: the commit on the branch contains the base as
+			// it stood once that commit was already there.
+			expect(() =>
+				git(worktreePath, 'merge-base', '--is-ancestor', advancedTo, outcome.mergeCommitSha),
+			).not.toThrow();
+			// ...which the commit the first push delivered did not.
+			expect(() =>
+				git(worktreePath, 'merge-base', '--is-ancestor', advancedTo, pushed[0]),
+			).toThrow();
+		},
+		RACE_CASE_TIMEOUT_MS,
+	);
+
 	// A base merging continuously must not spin forever, and must not report success
 	// either: the run says what happened and delivers nothing.
 	it(

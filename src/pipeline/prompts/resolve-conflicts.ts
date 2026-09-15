@@ -78,8 +78,16 @@ export interface BaseAdvancedRemergeInput {
 	baseBranch: string;
 	/** Where `origin/<baseBranch>` has got to since the merge below was built. */
 	baseSha: string;
-	/** The merge SWARM already committed locally on the branch, and has not pushed. */
+	/** The merge SWARM already committed locally on the branch. */
 	deliveredSha: string;
+	/**
+	 * Whether that commit is already on origin. The base is re-read after a push
+	 * as well as before one (issue #1001), so a catch-up pass can be standing on a
+	 * commit the pull request's branch already carries — and telling an agent that
+	 * work "exists nowhere else" when it does not is the kind of detail that makes
+	 * the rest of the paragraph easy to discount. Defaults to the unpushed case.
+	 */
+	pushed?: boolean;
 }
 
 /**
@@ -96,15 +104,19 @@ export interface BaseAdvancedRemergeInput {
  *
  * The paragraph about the local commit is load-bearing. SWARM commits each pass's
  * merge before checking the base, so the branch this pass starts on already holds
- * work that exists nowhere else — an agent that "cleaned up" with a reset or a
- * rebase would throw away the resolution it is being asked to build on.
+ * the resolution it is being asked to build on — an agent that "cleaned up" with
+ * a reset or a rebase would throw it away. `pushed` picks which half of that is
+ * true: unpushed, the commit exists nowhere else; pushed, the pull request's
+ * branch is already built on it.
  */
 export function buildBaseAdvancedRemergePrompt(input: BaseAdvancedRemergeInput): string {
 	return [
 		'You are the implementer assigned only to SWARM’s Resolve Conflicts phase.',
 		...pipelinePhaseGuard(),
 		`The merge you just produced for PR #${input.prNumber} is already stale: \`origin/${input.baseBranch}\` advanced to ${input.baseSha} while you were resolving, so pushing it would leave the pull request conflicted again.`,
-		`SWARM has committed your resolved merge locally on "${input.prBranch}" as ${input.deliveredSha}, and has not pushed it. Keep it: never reset, rebase, amend or force-push it away — it exists nowhere else.`,
+		input.pushed
+			? `SWARM has committed your resolved merge locally on "${input.prBranch}" as ${input.deliveredSha} and already pushed it to origin. Keep it: never reset, rebase, amend or force-push it away — the pull request's branch is built on it.`
+			: `SWARM has committed your resolved merge locally on "${input.prBranch}" as ${input.deliveredSha}, and has not pushed it. Keep it: never reset, rebase, amend or force-push it away — it exists nowhere else.`,
 		`Fetch origin, then merge \`origin/${input.baseBranch}\` into the checked-out branch again, on top of that commit, with a normal merge (never rebase and never force-push). Resolve every conflict while preserving both changes' intent. Only what "${input.baseBranch}" gained since your last merge is new, so this is normally a much smaller job than the first pass.`,
 		...migrationConflictGuidance(input.baseBranch),
 		...INDEX_RESOLUTION_GUIDANCE,
