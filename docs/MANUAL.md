@@ -438,6 +438,11 @@ shipping a fix is not the person who owns the machines that have to run it, an
 swarm workers request-update main        # every machine on the installation
 ```
 
+The same ask is in the dashboard (issue #1009), in the `/workers` toolbar above the
+roster: **Update all workers**, which asks for the build the control plane itself is
+running rather than taking a ref, confirms what it is about to touch first, and then
+shows the same per-machine report — dispositions, owners and all — in the modal.
+
 This is the one worker *write* that spans owners, and it is allowed to only because
 it asks and nothing more, and asks for something bounded. The switch that decides
 whether a machine is asked at all stays with whoever owns it and needs no cooperation

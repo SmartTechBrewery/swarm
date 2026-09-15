@@ -33,6 +33,15 @@ vi.mock('@/lib/trpc.js', () => ({
 					queryFn: () => rosterQueryFn(input),
 				}),
 			},
+			// The roster toolbar's installation-wide update action reads the control
+			// plane's own build (issue #1009); left unresolved here, since what this
+			// suite is about is the screen around it.
+			controlPlaneBuild: {
+				queryOptions: () => ({
+					queryKey: ['workers.controlPlaneBuild'],
+					queryFn: () => new Promise(() => {}),
+				}),
+			},
 		},
 		projects: {
 			list: {

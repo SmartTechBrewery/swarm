@@ -13,6 +13,8 @@ const {
 	rosterQueryFn,
 	workersQueryOptions,
 	meQueryFn,
+	controlPlaneBuildQueryFn,
+	requestUpdateForInstallationMutate,
 	reorderMutate,
 	navigate,
 } = vi.hoisted(() => ({
@@ -22,6 +24,10 @@ const {
 	rosterQueryFn: vi.fn(),
 	workersQueryOptions: vi.fn(),
 	meQueryFn: vi.fn(),
+	// Issue #1009 — the build the toolbar's installation-wide action asks every
+	// machine for, read from the server rather than invented in the browser.
+	controlPlaneBuildQueryFn: vi.fn(),
+	requestUpdateForInstallationMutate: vi.fn(),
 	reorderMutate: vi.fn(),
 	navigate: vi.fn(),
 }));
@@ -43,6 +49,12 @@ vi.mock('@/lib/trpc.js', () => ({
 					queryFn: () => rosterQueryFn(input),
 				}),
 			},
+			controlPlaneBuild: {
+				queryOptions: () => ({
+					queryKey: ['workers.controlPlaneBuild'],
+					queryFn: controlPlaneBuildQueryFn,
+				}),
+			},
 		},
 		projects: {
 			list: {
@@ -57,11 +69,19 @@ vi.mock('@/lib/trpc.js', () => ({
 		workers: {
 			setConsent: { mutate: vi.fn() },
 			reorderProjectWorker: { mutate: reorderMutate },
+			requestUpdateForInstallation: { mutate: requestUpdateForInstallationMutate },
 		},
 	},
 }));
 
 import { WorkersRoster } from './workers-roster.js';
+
+/**
+ * The build this control plane is running (issue #1009) — the commit the toolbar's
+ * installation-wide action asks every machine for, and never a ref the browser
+ * invents.
+ */
+const CONTROL_PLANE_COMMIT = 'abc1234def5678901234567890123456789abcde';
 
 function makeWorker(overrides: Partial<WorkerRow> = {}): WorkerRow {
 	return {
@@ -106,6 +126,8 @@ beforeEach(() => {
 		listMineQueryFn,
 		rosterQueryFn,
 		meQueryFn,
+		controlPlaneBuildQueryFn,
+		requestUpdateForInstallationMutate,
 		reorderMutate,
 		navigate,
 	]) {
@@ -124,6 +146,11 @@ beforeEach(() => {
 	// unresolved by default: no test gets the fleet action unless it asks for one,
 	// and the tests that never mention a viewer settle no extra query behind them.
 	meQueryFn.mockReturnValue(new Promise(() => {}));
+	// A control plane that knows its own build, which is the ordinary case; the
+	// unreadable one is a case of its own.
+	controlPlaneBuildQueryFn.mockResolvedValue({
+		build: { commit: CONTROL_PLANE_COMMIT, dirty: false },
+	});
 });
 
 describe('WorkersRoster scoping (issue #574)', () => {
@@ -428,14 +455,119 @@ describe('WorkersRoster update actions', () => {
 		expect(screen.queryByRole('button', FLEET_BUTTON)).toBeNull();
 	});
 
-	it('renders it inert until it is wired up, rather than as a live control', async () => {
+	/** The report `requestUpdateForInstallation` answers with — one machine, asked. */
+	function installationReport() {
+		return {
+			target: CONTROL_PLANE_COMMIT,
+			requestedBy: 'ada@example.com',
+			workers: [
+				{
+					workerId: 'worker-1',
+					displayName: 'ada-laptop',
+					disposition: 'requested',
+					owner: { userId: 'u1', identifier: 'ada@example.com', displayName: 'Ada Lovelace' },
+					update: null,
+				},
+			],
+		};
+	}
+
+	/** Open the roster as an administrator and wait for its fleet action to be live. */
+	async function openFleetAction(): Promise<HTMLButtonElement> {
+		asInstanceAdmin();
+		workersListQueryFn.mockResolvedValue([makeWorker()]);
+		renderRoster(<WorkersRoster />);
+		const button = (await screen.findByRole('button', FLEET_BUTTON)) as HTMLButtonElement;
+		await vi.waitFor(() => expect(button.disabled).toBe(false));
+		return button;
+	}
+
+	it('opens the confirmation rather than mutating on the click (issue #1009)', async () => {
+		const button = await openFleetAction();
+
+		fireEvent.click(button);
+
+		expect(await screen.findByText(/Update every worker on this installation/)).toBeDefined();
+		// It never fires on a single click — the modal is the whole point of the action.
+		expect(requestUpdateForInstallationMutate).not.toHaveBeenCalled();
+	});
+
+	it('names the build and the set it is about to touch', async () => {
+		fireEvent.click(await openFleetAction());
+
+		await screen.findByText(/Update every worker on this installation/);
+		expect(
+			screen.getByText(
+				/every registered machine on this installation, including machines you do not own/,
+			),
+		).toBeDefined();
+		// The control plane's own commit, abbreviated the way every Workers surface does.
+		expect(screen.getByText(CONTROL_PLANE_COMMIT.slice(0, 7))).toBeDefined();
+		expect(screen.getByText(/already drained/)).toBeDefined();
+	});
+
+	it('asks the installation once, for the commit `controlPlaneBuild` answered with', async () => {
+		requestUpdateForInstallationMutate.mockResolvedValue(installationReport());
+		fireEvent.click(await openFleetAction());
+
+		fireEvent.click(await screen.findByRole('button', { name: 'Ask them to update' }));
+
+		await vi.waitFor(() =>
+			expect(requestUpdateForInstallationMutate).toHaveBeenCalledWith({
+				target: CONTROL_PLANE_COMMIT,
+			}),
+		);
+		expect(requestUpdateForInstallationMutate).toHaveBeenCalledTimes(1);
+	});
+
+	it('renders the per-machine report the request answers with', async () => {
+		requestUpdateForInstallationMutate.mockResolvedValue(installationReport());
+		fireEvent.click(await openFleetAction());
+
+		fireEvent.click(await screen.findByRole('button', { name: 'Ask them to update' }));
+
+		expect(await screen.findByText('Requested')).toBeDefined();
+		expect(screen.getByText('ada@example.com')).toBeDefined();
+	});
+
+	it('renders the FORBIDDEN a non-administrator gets verbatim', async () => {
+		// The client gate is a decision about what to *offer*; the server re-checks,
+		// and its refusal names the command that moves the caller's own machines.
+		const forbidden =
+			'Requesting an update across the installation is available to instance administrators only.';
+		requestUpdateForInstallationMutate.mockRejectedValue(new Error(forbidden));
+		fireEvent.click(await openFleetAction());
+
+		fireEvent.click(await screen.findByRole('button', { name: 'Ask them to update' }));
+
+		expect(await screen.findByText(forbidden)).toBeDefined();
+	});
+
+	it('leaves the action disabled, explaining why, when the control plane cannot read its own build', async () => {
+		// Falling back to a ref would move every machine on a guess, so there is
+		// nothing to offer — the same stance the one-machine button takes.
+		controlPlaneBuildQueryFn.mockResolvedValue({ build: null });
+		asInstanceAdmin();
+		workersListQueryFn.mockResolvedValue([makeWorker()]);
+		renderRoster(<WorkersRoster />);
+
+		const button = (await screen.findByRole('button', FLEET_BUTTON)) as HTMLButtonElement;
+		await vi.waitFor(() => expect(button.title).toContain('cannot read its own build'));
+		expect(button.disabled).toBe(true);
+
+		fireEvent.click(button);
+		expect(screen.queryByText(/Update every worker on this installation\?/)).toBeNull();
+	});
+
+	it('withholds the action while that build is still being read', async () => {
+		controlPlaneBuildQueryFn.mockReturnValue(new Promise(() => {}));
 		asInstanceAdmin();
 		workersListQueryFn.mockResolvedValue([makeWorker()]);
 		renderRoster(<WorkersRoster />);
 
 		const button = (await screen.findByRole('button', FLEET_BUTTON)) as HTMLButtonElement;
 		expect(button.disabled).toBe(true);
-		expect(button.title).toContain('Not wired up yet');
+		expect(button.title).toContain('Reading the build');
 	});
 
 	it('offers the scoped action to a project administrator, naming its own set', async () => {
@@ -445,7 +577,11 @@ describe('WorkersRoster update actions', () => {
 		const button = (await screen.findByRole('button', PROJECT_BUTTON)) as HTMLButtonElement;
 		// The set it names is this project's machines, never the installation's.
 		expect(button.title).toContain('every machine enrolled in this project');
+		// Still placed rather than wired — phase 3 of issue #998.
 		expect(button.disabled).toBe(true);
+		expect(button.title).toContain('Not wired up yet');
+		// And it reads nothing it does not need: the build query is the wired action's.
+		expect(controlPlaneBuildQueryFn).not.toHaveBeenCalled();
 	});
 
 	it('withholds the scoped action from a member who does not administer the project', async () => {

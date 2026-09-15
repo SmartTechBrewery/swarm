@@ -100,6 +100,10 @@ const { getRolloutForOwner, startRollout } = vi.hoisted(() => ({
 	getRolloutForOwner: vi.fn(),
 	startRollout: vi.fn(),
 }));
+// Issue #1009 — `controlPlaneBuild` serves this process's own build identity to the
+// roster's installation-wide update action; the resolver itself memoizes, so the
+// suite stubs it rather than driving a real checkout.
+const { resolveOwnBuildIdentity } = vi.hoisted(() => ({ resolveOwnBuildIdentity: vi.fn() }));
 const { removeWorker } = vi.hoisted(() => ({ removeWorker: vi.fn() }));
 const { getMembership, listAccessibleProjectIds } = vi.hoisted(() => ({
 	getMembership: vi.fn(),
@@ -173,6 +177,13 @@ vi.mock('@/integrations/scm/registry.js', async () => ({
 		'@/integrations/scm/registry.js',
 	)),
 	requireProjectSCMProviderId,
+}));
+// Spread-and-override for the same reason as the two above: the router validates
+// every update target with this module's real `WorkerUpdateTargetSchema`, so only
+// the build resolver is stubbed.
+vi.mock('@/lib/build-identity.js', async () => ({
+	...(await vi.importActual<typeof import('@/lib/build-identity.js')>('@/lib/build-identity.js')),
+	resolveOwnBuildIdentity,
 }));
 
 import { workersRouter } from '@/api/routers/workers.js';
@@ -290,6 +301,7 @@ beforeEach(() => {
 		listAllWorkers,
 		findProjectByIdFromDb,
 		requireProjectSCMProviderId,
+		resolveOwnBuildIdentity,
 	]) {
 		m.mockReset();
 	}
@@ -714,6 +726,37 @@ describe('workers.getById (worker detail, issue #477)', () => {
 			true,
 			false,
 		]);
+	});
+});
+
+// Issue #1009 — the same value `getById` carries per worker, served on its own for a
+// surface that holds a roster rather than one machine.
+describe('workers.controlPlaneBuild (issue #1009)', () => {
+	it('answers this process’s own build', async () => {
+		resolveOwnBuildIdentity.mockResolvedValue({ commit: 'a'.repeat(40), dirty: false });
+
+		await expect(owner.controlPlaneBuild()).resolves.toEqual({
+			build: { commit: 'a'.repeat(40), dirty: false },
+		});
+	});
+
+	// The same "no answer" every other reader of this build takes — never a guessed
+	// ref, which would move a machine on a guess.
+	it('answers null when the control plane cannot read its own build', async () => {
+		resolveOwnBuildIdentity.mockResolvedValue(undefined);
+
+		await expect(owner.controlPlaneBuild()).resolves.toEqual({ build: null });
+	});
+
+	// A commit id rather than a secret, and already served to any viewer of any
+	// worker detail page — so a session is the whole gate.
+	it('needs no installation role', async () => {
+		resolveOwnBuildIdentity.mockResolvedValue({ commit: 'c'.repeat(40), dirty: true });
+		const nonAdmin = workersRouter.createCaller({ user: { ...OWNER_USER, instanceAdmin: false } });
+
+		await expect(nonAdmin.controlPlaneBuild()).resolves.toEqual({
+			build: { commit: 'c'.repeat(40), dirty: true },
+		});
 	});
 });
 
