@@ -76,6 +76,7 @@ function makeCappedReviewRun(overrides: Partial<RunRow> = {}): RunRow {
 		projectId: 'p1',
 		maintenanceTarget: null,
 		maintenanceRequestId: null,
+		maintenanceMachine: null,
 		kind: 'pipeline',
 		repository: 'SmartTechBrewery/swarm',
 		taskId: '508',

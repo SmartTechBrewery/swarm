@@ -655,7 +655,10 @@ export const workersRouter = router({
 	//
 	// Everything else the worker carries goes with it through existing FK constraints —
 	// its enrollments, its operator SCM credentials, and its session — while its runs
-	// stay in history with `worker_user_id` preserving the attribution.
+	// stay in history with `worker_user_id` preserving the attribution, and a
+	// maintenance run (issue #971) additionally keeping the `maintenance_machine` name
+	// it recorded: a run whose whole subject is a machine has to go on naming it once
+	// that machine is retired, which is exactly when it gets read.
 	remove: authedProcedure
 		.input(z.object({ workerId: z.string().uuid() }))
 		.mutation(async ({ ctx, input }) => {

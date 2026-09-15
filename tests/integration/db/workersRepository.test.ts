@@ -818,6 +818,41 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 				expect(await updateRunsFor(created.id)).toHaveLength(0);
 			});
 
+			// The machine is this run's whole subject, and `runs.worker_id` is
+			// ON DELETE SET NULL — so retiring the machine, which is exactly when its update
+			// history gets read, must not be what erases which machine each row was about.
+			it('goes on naming its machine after that machine is removed', async () => {
+				const id = await freshWorker('ada-run-retired');
+				await requestWorkerUpdate(id, REQUEST_ID, 'main', adaId);
+				await recordWorkerUpdateReport(id, REQUEST_ID, 'applied', 'Applied.');
+
+				expect(await removeWorker(id)).toBe(true);
+
+				const [run] = await getDb()
+					.select()
+					.from(runs)
+					.where(eq(runs.maintenanceRequestId, REQUEST_ID));
+				expect(run.workerId).toBeNull();
+				expect(run.maintenanceMachine).toBe('ada-run-retired');
+				// The rest of what it says is untouched, so the row still reads as a whole.
+				expect(run).toMatchObject({
+					status: 'completed',
+					maintenanceTarget: 'main',
+					workerUserId: adaId,
+				});
+			});
+
+			// A rename is not backfilled: the row names the machine as it was when asked.
+			it('names the machine as it stood when it was asked, not as renamed since', async () => {
+				const id = await freshWorker('ada-run-renamed');
+				await requestWorkerUpdate(id, REQUEST_ID, 'main', adaId);
+
+				await updateWorkerDisplayName(id, 'ada-run-renamed-later');
+
+				const [run] = await updateRunsFor(id);
+				expect(run.maintenanceMachine).toBe('ada-run-renamed');
+			});
+
 			// Deleting the project cascades the run away; the machine's later report must
 			// still be recorded rather than throwing on a row that is gone.
 			it('survives its project being deleted, and still records the report', async () => {

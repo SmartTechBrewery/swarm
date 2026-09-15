@@ -282,6 +282,12 @@ export interface CreateWorkerUpdateRunInput {
 	requestId: string;
 	/** The build this run is moving its machine to. */
 	target: string;
+	/**
+	 * The machine's display name as it stands now, stored on the row so the run still
+	 * says which machine it was about once that machine is retired
+	 * (`runs.maintenance_machine`).
+	 */
+	machine: string;
 }
 
 /**
@@ -298,6 +304,12 @@ export interface CreateWorkerUpdateRunInput {
  *
  * `timeout_ms` is {@link WORKER_UPDATE_RUN_TIMEOUT_MS} so the existing stale sweep
  * is what settles a machine that never answers.
+ *
+ * The machine is recorded **twice**, deliberately: `worker_id` as the live link, and
+ * `maintenance_machine` as the name it carried when it was asked. `worker_id` is
+ * `ON DELETE SET NULL`, and a machine being retired is exactly when an operator asks
+ * what it last did — so without the second the delete would empty the one coordinate
+ * this run exists to state.
  */
 export async function createWorkerUpdateRun(
 	input: CreateWorkerUpdateRunInput,
@@ -314,6 +326,7 @@ export async function createWorkerUpdateRun(
 			workerUserId: input.workerUserId,
 			maintenanceRequestId: input.requestId,
 			maintenanceTarget: input.target,
+			maintenanceMachine: input.machine,
 			timeoutMs: WORKER_UPDATE_RUN_TIMEOUT_MS,
 		})
 		.returning({ id: runs.id });

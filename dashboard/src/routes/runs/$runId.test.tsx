@@ -648,6 +648,35 @@ describe('RunAttributionFields (issue #446)', () => {
 		expect(screen.queryByText('user-1')).toBeNull();
 	});
 
+	// Issue #971 — deleting a worker nulls the run's `worker_id`, and the machine is a
+	// maintenance run's whole subject. The server resolves the name the run itself
+	// recorded into this same `workerName`, so the cell names the retired machine rather
+	// than falling through to the neutral dash.
+	it('names a retired machine on a maintenance run, with no id to fall back to', () => {
+		render(
+			<RunAttributionFields
+				run={makeReviewRun({
+					kind: 'worker-update',
+					phase: 'worker-update',
+					repository: null,
+					taskId: null,
+					maintenanceTarget: 'main',
+					workerId: null,
+					workerUserId: 'user-1',
+					attribution: {
+						workerId: null,
+						workerName: 'studio-mac',
+						userId: 'user-1',
+						userDisplayName: 'Alice Example',
+					},
+				})}
+			/>,
+		);
+
+		expect(screen.getByText('studio-mac')).toBeDefined();
+		expect(screen.queryByText('—')).toBeNull();
+	});
+
 	it('renders the neutral dash — never an id — for a run with no recorded worker', () => {
 		render(<RunAttributionFields run={makeReviewRun({ attribution: null })} />);
 

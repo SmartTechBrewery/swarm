@@ -1852,7 +1852,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			label: string,
 			requestId = REQUEST_ID,
 			target = 'main',
-		): Promise<{ runId: string; workerId: string; ownerUserId: string }> {
+		): Promise<{ runId: string; workerId: string; ownerUserId: string; machine: string }> {
 			const { worker, owner } = await seedWorker(label);
 			const runId = await createWorkerUpdateRun({
 				projectId: PROJECT_ID,
@@ -1860,8 +1860,9 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 				workerUserId: owner.id,
 				requestId,
 				target,
+				machine: worker.displayName,
 			});
-			return { runId, workerId: worker.id, ownerUserId: owner.id };
+			return { runId, workerId: worker.id, ownerUserId: owner.id, machine: worker.displayName };
 		}
 
 		describe('createWorkerUpdateRun', () => {
@@ -1878,6 +1879,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 					workerUserId: ownerUserId,
 					maintenanceRequestId: REQUEST_ID,
 					maintenanceTarget: 'main',
+					maintenanceMachine: 'worker-create',
 					timeoutMs: WORKER_UPDATE_RUN_TIMEOUT_MS,
 				});
 				expect(row?.repository).toBeNull();
@@ -1899,6 +1901,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 						workerUserId: ownerUserId,
 						requestId: REQUEST_ID,
 						target: 'v2',
+						machine: 'worker-unique',
 					}),
 				).rejects.toThrow();
 			});
@@ -1980,6 +1983,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 					workerUserId: ownerUserId,
 					requestId: OTHER_REQUEST_ID,
 					target: 'v2',
+					machine: 'worker-supersede',
 				});
 
 				await supersedeWorkerUpdateRun(workerId, 'v3');

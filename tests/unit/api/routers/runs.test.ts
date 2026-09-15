@@ -226,6 +226,7 @@ function makeRun(overrides: Partial<RunRow> = {}): RunRow {
 		projectId: 'p1',
 		maintenanceTarget: null,
 		maintenanceRequestId: null,
+		maintenanceMachine: null,
 		kind: 'pipeline',
 		repository: 'SmartTechBrewery/swarm',
 		taskId: '103',
@@ -491,6 +492,33 @@ describe('runsRouter', () => {
 
 			expect(result.data[0].workerName).toBeNull();
 			expect(result.data[0].workerId).toBe('worker-gone');
+		});
+
+		// Issue #971 — same fallback in the list, for the same reason: a maintenance row
+		// whose machine has been retired still names it, while an ordinary pipeline row
+		// with a gone worker keeps showing no machine rather than an invented one.
+		it('names a retired machine from the maintenance run itself', async () => {
+			vi.mocked(listRunsFromDb).mockResolvedValue({
+				data: [
+					makeRun({
+						id: 'run-update',
+						kind: 'worker-update',
+						phase: 'worker-update',
+						repository: null,
+						taskId: null,
+						workerId: null,
+						maintenanceMachine: 'studio-mac',
+						maintenanceTarget: 'main',
+					}),
+					makeRun({ id: 'run-pipeline', workerId: 'worker-gone' }),
+				],
+				total: 2,
+			});
+			vi.mocked(getWorkers).mockResolvedValue([]);
+
+			const result = await caller.list({});
+
+			expect(result.data.map((run) => run.workerName)).toEqual(['studio-mac', null]);
 		});
 
 		it('degrades to unnamed machines when the lookup itself fails', async () => {
@@ -1348,6 +1376,54 @@ describe('runsRouter', () => {
 					userId: 'user-gone',
 					userDisplayName: null,
 				});
+			});
+
+			// Issue #971 — the machine is a maintenance run's whole subject, and deleting a
+			// worker nulls `worker_id`. Retiring a machine is exactly when its update history
+			// is read, so the name the run recorded is what the detail page falls back to.
+			it('names a retired machine from the maintenance run itself', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({
+						id: 'run-1',
+						kind: 'worker-update',
+						phase: 'worker-update',
+						repository: null,
+						taskId: null,
+						workerId: null,
+						workerUserId: 'user-1',
+						maintenanceMachine: 'studio-mac',
+						maintenanceTarget: 'main',
+					}),
+				);
+				vi.mocked(getUserById).mockResolvedValue(OWNER);
+
+				const result = await caller.getById({ id: 'run-1' });
+				expect(result.attribution).toEqual({
+					workerId: null,
+					workerName: 'studio-mac',
+					userId: 'user-1',
+					userDisplayName: 'Alice Example',
+				});
+				expect(getWorker).not.toHaveBeenCalled();
+			});
+
+			// The live row wins where it resolves, so a rename shows through; the recorded
+			// name is the fallback, never the override.
+			it('prefers the live machine name over the one the run recorded', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({
+						id: 'run-1',
+						kind: 'worker-update',
+						workerId: 'worker-1',
+						workerUserId: 'user-1',
+						maintenanceMachine: 'studio-mac-as-named-then',
+					}),
+				);
+				vi.mocked(getWorker).mockResolvedValue(WORKER);
+				vi.mocked(getUserById).mockResolvedValue(OWNER);
+
+				const result = await caller.getById({ id: 'run-1' });
+				expect(result.attribution?.workerName).toBe('alice-macbook');
 			});
 
 			it('degrades to the recorded ids instead of failing the page when a lookup throws', async () => {

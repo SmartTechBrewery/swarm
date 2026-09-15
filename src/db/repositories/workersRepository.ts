@@ -611,6 +611,7 @@ export async function requestWorkerUpdate(
 				workerUserId: updatedRow.ownerUserId,
 				requestId,
 				target,
+				machine: updatedRow.displayName,
 			},
 			tx,
 		);
@@ -757,6 +758,11 @@ export async function updateWorkerDisplayName(
 /**
  * Remove a worker (owner deregistration). Returns `true` if a worker was removed,
  * `false` if none had that id (a no-op, not an error).
+ *
+ * The worker's runs stay: `runs.worker_id` is `ON DELETE SET NULL`, and what keeps
+ * each one readable afterwards is the denormalized column beside it — `worker_user_id`
+ * for the attribution, and `maintenance_machine` for a maintenance run's machine
+ * (issue #971), whose subject the link itself was.
  */
 export async function removeWorker(id: string): Promise<boolean> {
 	const rows = await getDb()

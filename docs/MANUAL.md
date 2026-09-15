@@ -272,6 +272,9 @@ where you read when a machine was last updated and what happened, after the fact
 while `swarm workers list` shows only its latest outcome. The run names the machine
 and the build it was moving to, and nothing else — it references no pull request and
 no board item, produces none, and does not count against the project's concurrency.
+It goes on naming that machine after the machine itself is gone: deleting a worker
+removes it from the roster, and its update history stays readable, still saying which
+machine each row was about.
 
 **The machine must be enrolled in a project.** That run has to hang off one, so a
 worker enrolled in **no** project is refused rather than silently asked: `swarm

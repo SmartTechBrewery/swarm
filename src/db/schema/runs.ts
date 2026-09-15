@@ -127,6 +127,22 @@ export const runs = pgTable(
 		 * was actually for.
 		 */
 		maintenanceTarget: text('maintenance_target'),
+		/**
+		 * The display name the machine carried when this maintenance run was created
+		 * (issue #971) — the run's own record of *which machine* it is about, and the
+		 * only one that outlives the machine.
+		 *
+		 * Denormalized for exactly the reason {@link runs.workerUserId} is, and the
+		 * case is sharper here: `worker_id` is `ON DELETE SET NULL`, so retiring a
+		 * machine would otherwise erase the single coordinate a maintenance run exists
+		 * to state — and retirement is precisely when "what did this machine last do?"
+		 * gets asked. A later rename is not backfilled either: the row names the
+		 * machine as it was when it was asked.
+		 *
+		 * Null for a pipeline run, which states its repository and task instead and
+		 * reads perfectly well with no machine named at all.
+		 */
+		maintenanceMachine: text('maintenance_machine'),
 		/** Registered worker that was authenticated and capacity-claimed for this attempt. */
 		workerId: uuid('worker_id').references(() => workers.id, { onDelete: 'set null' }),
 		/**

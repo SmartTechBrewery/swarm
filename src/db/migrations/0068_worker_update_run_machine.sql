@@ -1,0 +1,1 @@
+ALTER TABLE "runs" ADD COLUMN "maintenance_machine" text;

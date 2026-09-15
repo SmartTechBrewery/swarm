@@ -195,11 +195,15 @@ describe('db schema', () => {
 			expect(columns.get('kind')?.default).toBe('pipeline');
 		});
 
-		it('carries a maintenance run’s request id and target, uniquely (issue #971)', () => {
+		it('carries a maintenance run’s request id, target and machine, uniquely (issue #971)', () => {
 			expect(columns.get('maintenance_request_id')?.getSQLType()).toBe('uuid');
 			expect(columns.get('maintenance_request_id')?.notNull).toBe(false);
 			expect(columns.get('maintenance_target')?.getSQLType()).toBe('text');
 			expect(columns.get('maintenance_target')?.notNull).toBe(false);
+			// The machine's name as it stood when it was asked: `worker_id` is
+			// ON DELETE SET NULL, so this is the only coordinate that outlives the machine.
+			expect(columns.get('maintenance_machine')?.getSQLType()).toBe('text');
+			expect(columns.get('maintenance_machine')?.notNull).toBe(false);
 			// Partial and unique: a request id names at most one run, which is what lets the
 			// settle key on it alone, while a pipeline row's NULL is not constrained at all.
 			const index = table.indexes.find((i) => i.config.name === 'idx_runs_maintenance_request');

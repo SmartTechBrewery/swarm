@@ -461,6 +461,27 @@ describe('RunsTable', () => {
 			expect((row as HTMLElement).textContent).not.toContain('Issue:');
 		});
 
+		// Issue #971 — the machine is this row's whole subject, and deleting a worker nulls
+		// the run's `worker_id`. The server resolves the name the run itself recorded into
+		// the same `workerName`, so a retired machine is still named here.
+		it('still names its machine once that machine has been removed', () => {
+			const { container } = renderTable(
+				<RunsTable
+					runs={[{ ...maintenanceRun, workerId: null, workerName: 'studio-mac' }]}
+					totalCount={1}
+					currentPage={1}
+					pageSize={25}
+					onPageChange={vi.fn()}
+				/>,
+			);
+
+			const table = container.querySelector('table') as HTMLElement;
+			const phaseCell = within(table).getAllByRole('row')[1].querySelectorAll('td')[0];
+			expect(within(phaseCell as HTMLElement).getByTestId('run-worker-name').textContent).toBe(
+				'studio-mac',
+			);
+		});
+
 		it('still names the machine, which is the other half of what it says', () => {
 			const { container } = renderTable(
 				<RunsTable

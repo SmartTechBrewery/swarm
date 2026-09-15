@@ -322,7 +322,9 @@ export interface AgentUsage {
  * display labels for the worker that executed a run and the SWARM user who owns
  * it, resolved server-side from the row's `workerId`/`workerUserId`. A name is
  * null when the worker/user row no longer resolves; the ids ride along so the UI
- * can fall back to one instead of showing nothing.
+ * can fall back to one instead of showing nothing — except on a maintenance run,
+ * whose `workerName` falls back server-side to the machine name the run itself
+ * recorded (issue #971).
  */
 export interface RunAttribution {
 	workerId: string | null;
@@ -432,6 +434,12 @@ export interface RunRow {
 	 * the recorded worker's row no longer resolves — the list then shows no machine
 	 * rather than a stale or invented one. Optional because `runs.getById` carries
 	 * the richer {@link RunAttribution} instead.
+	 *
+	 * A **maintenance run is the exception**: the server falls back to the machine
+	 * name that run recorded when it was asked (issue #971), so a run whose whole
+	 * subject is a machine still names it after that machine has been retired. Nothing
+	 * here reads that column directly — the fallback is resolved into this same field,
+	 * so every surface that already renders a machine name keeps working unchanged.
 	 */
 	workerName?: string | null;
 	/** The SWARM user owning `workerId`, denormalized at dispatch so it survives the worker row's removal. */

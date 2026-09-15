@@ -501,6 +501,12 @@ export interface RunAttribution {
  *
  * A failed lookup degrades to null names rather than throwing — a deleted worker
  * or user must not turn the run detail page into an error.
+ *
+ * `workerName` falls back to a maintenance run's recorded `maintenance_machine`
+ * when the worker row no longer resolves (issue #971) — the same fallback
+ * {@link withWorkerNames} applies to the list, for the same reason: a run whose
+ * subject *is* a machine has to keep naming it after that machine is retired. A row
+ * carrying only that name still resolves an attribution rather than `null`.
  */
 /**
  * Narrow a run to pipeline work, refusing a maintenance run in the operator's own
@@ -530,15 +536,16 @@ function requirePipelineRun(run: RunRow, runId: string): asserts run is Pipeline
 async function resolveRunAttribution(run: {
 	workerId: string | null;
 	workerUserId: string | null;
+	maintenanceMachine: string | null;
 }): Promise<RunAttribution | null> {
-	if (!run.workerId && !run.workerUserId) return null;
+	if (!run.workerId && !run.workerUserId && !run.maintenanceMachine) return null;
 	try {
 		const worker = run.workerId ? await getWorker(run.workerId) : undefined;
 		const userId = run.workerUserId ?? worker?.ownerUserId ?? null;
 		const user = userId ? await getUserById(userId) : undefined;
 		return {
 			workerId: run.workerId,
-			workerName: worker?.displayName ?? null,
+			workerName: worker?.displayName ?? run.maintenanceMachine ?? null,
 			userId,
 			userDisplayName: user?.displayName ?? null,
 		};
@@ -550,7 +557,7 @@ async function resolveRunAttribution(run: {
 		});
 		return {
 			workerId: run.workerId,
-			workerName: null,
+			workerName: run.maintenanceMachine ?? null,
 			userId: run.workerUserId,
 			userDisplayName: null,
 		};
@@ -637,10 +644,18 @@ async function resolveRunPreservedWorker(run: {
  * (unfederated, and every row predating the columns), a worker whose row no
  * longer resolves, and a failed lookup all yield `null`: the UI then shows no
  * machine at all rather than a stale or invented one.
+ *
+ * With one exception, and it is the whole reason the column exists: a maintenance
+ * run falls back to the `maintenance_machine` name it recorded when it was asked
+ * (issue #971). Retiring a machine nulls `worker_id` (`ON DELETE SET NULL`) and is
+ * exactly when "what did that machine last do?" gets asked, so a run whose entire
+ * subject is a machine must keep naming it. The live row still wins where it
+ * resolves, so a rename shows through; the snapshot is the fallback, never the
+ * override.
  */
-async function withWorkerNames<T extends { workerId: string | null }>(
-	rows: T[],
-): Promise<(T & { workerName: string | null })[]> {
+async function withWorkerNames<
+	T extends { workerId: string | null; maintenanceMachine: string | null },
+>(rows: T[]): Promise<(T & { workerName: string | null })[]> {
 	const ids = [...new Set(rows.map((row) => row.workerId).filter((id) => id !== null))];
 	let names = new Map<string, string>();
 	if (ids.length > 0) {
@@ -654,7 +669,8 @@ async function withWorkerNames<T extends { workerId: string | null }>(
 	}
 	return rows.map((row) => ({
 		...row,
-		workerName: row.workerId ? (names.get(row.workerId) ?? null) : null,
+		workerName:
+			(row.workerId ? (names.get(row.workerId) ?? null) : null) ?? row.maintenanceMachine ?? null,
 	}));
 }
 
