@@ -814,7 +814,14 @@ describe('transport protocol schemas', () => {
 		};
 
 		it('round-trips every status the vocabulary admits', () => {
-			for (const status of ['applied', 'already-current', 'refused', 'failed', 'declined']) {
+			for (const status of [
+				'applied',
+				'adopted',
+				'already-current',
+				'refused',
+				'failed',
+				'declined',
+			]) {
 				expect(
 					ReportWorkerUpdateDeliveryRequestSchema.safeParse({ ...valid, status }).success,
 				).toBe(true);

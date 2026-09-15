@@ -59,6 +59,7 @@ import { getLiveSessionForWorker, type WorkerSession } from '../identity/worker-
 import {
 	DEFAULT_ROLLOUT_WAVE_SIZE,
 	isHaltingUpdateStatus,
+	isRestartingUpdateStatus,
 	isSettledMemberState,
 	type WorkerUpdateRollout,
 	type WorkerUpdateRolloutMember,
@@ -299,14 +300,16 @@ function decideSettlement(
 
 /**
  * What one reported outcome means for the member that reported it — the one place
- * the five-word vocabulary is turned into a member state, shared by the machine that
- * answered this rollout's own request and the one that had already answered for this
- * same build before the rollout reached it.
+ * the vocabulary is turned into a member state, shared by the machine that answered
+ * this rollout's own request and the one that had already answered for this same build
+ * before the rollout reached it.
  *
- * `applied` is deliberately **not** settled: the machine has done the work, but a
- * build only counts once a daemon running it has come back, which is the next step's
- * question. `already-current` settles at once, because nothing was installed and
- * nothing restarted, so there is nothing to wait for.
+ * `applied` and `adopted` are deliberately **not** settled: the machine has done the
+ * work (or a peer on it has, and this daemon is restarting onto the result — issue
+ * #973), but a build only counts once a daemon running it has come back, which is the
+ * next step's question. Which of the two it was makes no difference here, so the test
+ * asks the vocabulary rather than naming them. `already-current` settles at once,
+ * because nothing was installed and nothing restarted, so there is nothing to wait for.
  */
 function decideReportedOutcome(
 	worker: Worker,
@@ -314,15 +317,19 @@ function decideReportedOutcome(
 	message: string | null,
 	now: Date,
 ): MemberVerdict {
-	if (outcome === 'applied') return { patch: { state: 'verifying', outcome, message } };
+	if (outcome && isRestartingUpdateStatus(outcome)) {
+		return { patch: { state: 'verifying', outcome, message } };
+	}
 	if (outcome && isHaltingUpdateStatus(outcome)) {
 		return {
 			patch: { state: 'failed', outcome, message, settledAt: now },
 			halt: `worker '${worker.displayName}' reported ${outcome}${message ? `: ${message}` : ''}`,
 		};
 	}
-	// `already-current`, or an outcome vocabulary this build has never heard of: the
-	// machine answered for this build and nothing in the answer said it went badly.
+	// `already-current` — the install root was on the target and the daemon reporting it
+	// was already running that build, so nothing moved and nothing restarted — or an
+	// outcome vocabulary this build has never heard of: the machine answered for this
+	// build and nothing in the answer said it went badly.
 	return { patch: { state: 'done', outcome, message, settledAt: now }, returnToPool: true };
 }
 

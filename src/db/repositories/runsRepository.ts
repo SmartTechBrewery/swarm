@@ -34,6 +34,7 @@ import {
 } from 'drizzle-orm';
 import type { AgentCli } from '../../harness/agent-cli.js';
 import type { AgentUsage } from '../../harness/usage.js';
+import { isRestartingUpdateStatus } from '../../identity/worker-update-rollout.js';
 import type { WorkerUpdateStatus } from '../../lib/build-identity.js';
 import type { Checkpoint } from '../../pipeline/checkpoint.js';
 import type { ProposedScope } from '../../pipeline/planning.js';
@@ -373,9 +374,14 @@ export async function supersedeWorkerUpdateRun(
 
 /**
  * Settle the worker-update run the machine's report answers (issue #971), mapping
- * the machine's own vocabulary onto the run's: `applied`/`already-current` complete
- * it, and `declined`/`refused`/`failed` fail it carrying the machine's prose as the
- * run's `error` — which is where the run detail page already shows a failure.
+ * the machine's own vocabulary onto the run's: `applied`/`adopted`/`already-current`
+ * complete it, and `declined`/`refused`/`failed` fail it carrying the machine's prose
+ * as the run's `error` — which is where the run detail page already shows a failure.
+ *
+ * `adopted` completes it for the same reason `applied` does (issue #973): the machine
+ * this run names ends up on the build it was asked for. That its peer paid for the
+ * fetch is a distinction the *status* carries; it is not a difference in whether the
+ * unit of work succeeded.
  *
  * `declined` fails rather than completes on purpose: "this host has not opted in to
  * self-update" is an actionable reason an operator can do something about, and a
@@ -398,7 +404,7 @@ export async function settleWorkerUpdateRun(
 	message: string,
 	db: RunWriteExecutor = getDb(),
 ): Promise<boolean> {
-	const applied = status === 'applied' || status === 'already-current';
+	const applied = isRestartingUpdateStatus(status) || status === 'already-current';
 	const rows = await db
 		.update(runs)
 		.set({

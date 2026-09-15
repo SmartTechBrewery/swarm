@@ -1723,8 +1723,11 @@ describe('handleReportWorkerUpdate', () => {
 		expect(deps.advanceWorkerRollout).not.toHaveBeenCalled();
 	});
 
+	// `adopted` is in here rather than beside `applied` above even though it is the
+	// *second* restarting status (issue #973): this route has no notion of restarting,
+	// and what it is asserted on is that it records whatever word the daemon sends.
 	it('records every outcome the daemon can report, not only the applied one', async () => {
-		for (const status of ['already-current', 'refused', 'failed', 'declined']) {
+		for (const status of ['adopted', 'already-current', 'refused', 'failed', 'declined']) {
 			const deps = makeDeps();
 
 			const result = await handleReportWorkerUpdate(

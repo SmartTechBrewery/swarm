@@ -20,9 +20,12 @@
  *   forcing it: no run is cancelled, deferred or failed by an update. The control
  *   plane's own precondition — the machine is already draining (issue #919) — is what
  *   makes the wait terminate, since no *new* work is dispatched while it waits. It
- *   waits only for *its own* runs: a **peer** daemon sharing this install root is not
- *   waited for but refused, because nothing here can drain somebody else's machine
- *   role and a wait on it would not terminate (issue #935, in the mechanism).
+ *   waits only for *its own* runs, and what it does about a **peer** daemon sharing
+ *   this install root depends on what that peer is doing: one **mid-phase** is refused
+ *   rather than waited for, because nothing here can drain somebody else's machine role
+ *   and a wait on it would not terminate (issue #935); one **updating** *is* waited for,
+ *   because its finish is exactly what makes this daemon's own restart safe (issue #973).
+ *   Both decisions live in the mechanism.
  * - A **shutdown** abandons the attempt silently. The request is durable on the
  *   `workers` row, so the next connection is pushed it again; reporting a refusal
  *   nobody asked for would instead leave an operator reading "refused" for a machine
@@ -30,14 +33,17 @@
  *
  * **Every outcome is reported** — `POST /worker/delivery/update-report`, an HTTP
  * route rather than a stream frame for the reason the frame's own schema states
- * (`./protocol.ts`) — and only one of them ends the process. On `applied` the daemon
- * releases its session and exits 0, so launchd `KeepAlive` / systemd
- * `Restart=always` starts it again on the code that is now in the install root; the
- * new build's identity reaches the control plane on the next handshake through the
- * existing `build` field (issue #918), with no extra wiring. On `declined`,
- * `refused`, `failed` or `already-current` it reports and **keeps taking work** on
- * the build it has: nothing about the running process changed, because its modules
- * were loaded at startup.
+ * (`./protocol.ts`) — and two of them end the process. On `applied` — this daemon did
+ * the fetch and the build — and on `adopted` — a peer on the same machine did, and the
+ * install root is on a build this process is not running (issue #973) — the daemon
+ * releases its session and exits 0, so launchd `KeepAlive` / systemd `Restart=always`
+ * starts it again on the code that is now in the install root; the new build's identity
+ * reaches the control plane on the next handshake through the existing `build` field
+ * (issue #918), with no extra wiring. Both are successes, and they are distinguishable
+ * precisely so an operator can tell which machine paid for the fetch. On `declined`,
+ * `refused`, `failed` or `already-current` it reports and **keeps taking work** on the
+ * build it has: nothing about the running process changed, because its modules were
+ * loaded at startup.
  *
  * The exit deliberately goes through the daemon's own graceful path rather than a
  * bare `process.exit`: the session is released so the control plane frees the lease
@@ -46,7 +52,11 @@
  * check.
  */
 
-import { type WorkerUpdateStatus, WorkerUpdateTargetSchema } from '../lib/build-identity.js';
+import {
+	type WorkerBuild,
+	type WorkerUpdateStatus,
+	WorkerUpdateTargetSchema,
+} from '../lib/build-identity.js';
 import { describeError } from '../lib/errors.js';
 import { logger as defaultLogger } from '../lib/logger.js';
 import { applyUpdateTarget, type UpdateOutcome } from '../worker/self-update.js';
@@ -110,6 +120,14 @@ export interface WorkerUpdateHandlerOptions {
 	enabled?: boolean;
 	/** Move the install root; defaults to phase 1's {@link applyUpdateTarget}. */
 	apply?: (target: string) => Promise<UpdateOutcome>;
+	/**
+	 * The build this daemon is *running*, resolved once at startup
+	 * (`../lib/build-identity.ts`). It is what tells an install root already on the
+	 * target apart from one a peer moved there while this process went on executing the
+	 * modules it loaded at start — the difference between nothing to do and a restart
+	 * (issue #973).
+	 */
+	build?: WorkerBuild;
 	/** Deliver one report; defaults to a `postDelivery` call. Injected in tests. */
 	report?: (report: WorkerUpdateReport) => Promise<ReportWorkerUpdateDeliveryResponse>;
 	/** Ends the process after a successful apply; defaults to `process.exit`. */
@@ -311,17 +329,21 @@ async function runUpdate(
 		};
 	}
 
-	const delivered = await reportOrOwe(options, logger, update, owe, {
+	// The *reported* status, not the mechanism's, is what decides the restart: the two
+	// readings of `already-current` are only told apart here, against this daemon's own
+	// build (issue #973).
+	const reported: WorkerUpdateReport = {
 		requestId: update.requestId,
 		target: parsedTarget.data,
-		...describeOutcome(outcome),
-	});
+		...describeOutcome(outcome, options.build),
+	};
+	const delivered = await reportOrOwe(options, logger, update, owe, reported);
 
-	if (outcome.status !== 'applied') {
+	if (!RESTARTING_STATUSES.has(reported.status)) {
 		logger.info('keeping this machine on the build it has', {
 			requestId: update.requestId,
 			target: parsedTarget.data,
-			status: outcome.status,
+			status: reported.status,
 		});
 		return false;
 	}
@@ -329,16 +351,38 @@ async function runUpdate(
 	// Reported *before* exiting, and its delivery logged rather than gated on: an
 	// install root already moved to the new build must restart into it whether or not
 	// the control plane heard about it, since the alternative is a daemon running code
-	// that no longer matches the files under it.
+	// that no longer matches the files under it. That holds for `adopted` too, which is
+	// why a report the control plane rejected — an older router that has never heard the
+	// word — still restarts this daemon rather than stranding it on stale code; the run
+	// it leaves behind is settled by the control plane's own stale sweep.
 	logger.info('restarting into the updated build', {
 		requestId: update.requestId,
 		target: parsedTarget.data,
-		commit: outcome.commit,
-		previousCommit: outcome.previousCommit,
+		status: reported.status,
+		commit: restartCommit(outcome),
+		// Only an apply knows what it moved off; an adopting daemon knows only what it
+		// was itself running, which is the same fact from its own side.
+		previousCommit:
+			outcome.status === 'applied' ? outcome.previousCommit : (options.build?.commit ?? null),
+		fetchedHere: reported.status === 'applied',
 		reported: delivered,
 	});
 	await releaseAndExit(options, logger);
 	return true;
+}
+
+/** The two reported outcomes that end with this process exiting into a new build. */
+const RESTARTING_STATUSES = new Set<WorkerUpdateStatus>(['applied', 'adopted']);
+
+/**
+ * The commit a restart is going *to*. Narrowed rather than cast: only the two
+ * commit-carrying members of {@link UpdateOutcome} can reach a restart, and spelling
+ * that out here is what keeps a third one from silently logging `undefined`.
+ */
+function restartCommit(outcome: UpdateOutcome): string | null {
+	return outcome.status === 'applied' || outcome.status === 'already-current'
+		? outcome.commit
+		: null;
 }
 
 /**
@@ -421,11 +465,21 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 /**
  * The reported form of an {@link UpdateOutcome}: its status in the shared
  * vocabulary, plus the machine's own words for what happened. The prose is phase
- * 1's — it already names the install root, the step that failed, and whether the
- * checkout was returned to the build it was on — so re-wording it here would only
- * let the operator-facing message and the daemon's log drift apart.
+ * 1's wherever phase 1 has any — it already names the install root, the step that
+ * failed, and whether the checkout was returned to the build it was on — so
+ * re-wording it here would only let the operator-facing message and the daemon's log
+ * drift apart.
+ *
+ * The one place this module has words of its own is the split below, and it has to:
+ * the mechanism answers about the *install root*, so both readings of
+ * `already-current` reach it as the same value, and only `build` — this daemon's own
+ * startup commit — tells "nothing to do" from "a peer moved the files and I am the
+ * process still running the old ones" (issue #973).
  */
-function describeOutcome(outcome: UpdateOutcome): { status: WorkerUpdateStatus; message: string } {
+function describeOutcome(
+	outcome: UpdateOutcome,
+	build: WorkerBuild | undefined,
+): { status: WorkerUpdateStatus; message: string } {
 	switch (outcome.status) {
 		case 'applied':
 			return {
@@ -434,11 +488,34 @@ function describeOutcome(outcome: UpdateOutcome): { status: WorkerUpdateStatus; 
 					`Applied: the SWARM install root moved from ${outcome.previousCommit} to ` +
 					`${outcome.commit} and was rebuilt there. The daemon is restarting into it.`,
 			};
-		case 'already-current':
+		case 'already-current': {
+			// The files are on the target; whether *this* process is running them is a
+			// different question, and the only one that decides a restart. Its own commit was
+			// resolved before the transport opened, so a peer's checkout since cannot have
+			// moved it (issue #973).
+			if (build?.commit === outcome.commit) {
+				return {
+					status: 'already-current',
+					message: `Already on ${outcome.commit} — nothing to do, and nothing was restarted.`,
+				};
+			}
+			// A build this daemon could not identify biases to `adopted`: the failure this
+			// path exists to fix is a daemon that did *not* restart, and one extra supervisor
+			// restart costs seconds. (Unreachable in practice — an install root that is not a
+			// readable git checkout is refused by the mechanism long before. Such a daemon also
+			// comes back unidentifiable, so a rollout's come-back verdict falls back to the
+			// fresh lease alone, which is the same position issue #940 already puts it in.)
+			// `dirty` is deliberately not consulted: it would make a machine genuinely on the
+			// target report `adopted`, come back on the same commit, and be read as "came back
+			// still on the build it was asked to move off".
 			return {
-				status: 'already-current',
-				message: `Already on ${outcome.commit} — nothing to do, and nothing was restarted.`,
+				status: 'adopted',
+				message:
+					`The SWARM install root is on ${outcome.commit}, fetched and built by another ` +
+					`daemon on this machine; this one was still running ` +
+					`${build?.commit ?? 'a build it could not identify'} and is restarting into it.`,
 			};
+		}
 		case 'refused':
 			return { status: 'refused', message: outcome.reason };
 		case 'failed':

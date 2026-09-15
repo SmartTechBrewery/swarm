@@ -355,6 +355,13 @@ async function main(): Promise<void> {
 			inFlight,
 			shutdownSignal: shutdownSignal.signal,
 			shutdown: releaseSessionAndResources,
+			// The build resolved above, which is the *startup* commit — and that is the
+			// point (issue #973): a peer daemon on this shared install root can move the
+			// files under this process at any time, and the only thing that still names
+			// the code this process is actually executing is what it read before it
+			// connected. Comparing that against the install root is how an update that
+			// found the files already moved decides whether it has anything to restart for.
+			build,
 		}),
 		// The second frame about this *machine* rather than a dispatch (issue #955):
 		// remove the `task-<id>` checkouts under this host's own repo root that nothing

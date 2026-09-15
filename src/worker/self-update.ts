@@ -10,10 +10,17 @@
  * What it *does* decide is whether the update is safe for the **machine** (issue
  * #935), because that question belongs to the install root rather than to any one
  * daemon. Several daemons sharing one npm-linked checkout is the control-plane
- * host's real shape, so before it fetches, this module takes the machine-local
- * exclusive lock on the install root and refuses outright while a peer daemon is
- * mid-phase (`../worktree/install-lock.ts`). A daemon that cannot take the lock
- * re-reads the commit: the winner may have landed the very build it was asked for.
+ * host's real shape, so this module takes the machine-local exclusive lock on the
+ * install root before it fetches (`../worktree/install-lock.ts`), and refuses outright
+ * — just before the checkout, where code is actually replaced — while a peer daemon is
+ * mid-phase.
+ *
+ * **A daemon that loses that lock waits for the holder** (issue #973), because holding
+ * it afterwards is the only proof the holder's fetch and build are over. It then
+ * answers `already-current` for the build the holder landed, with no fetch of its own,
+ * so one machine fetches and builds exactly once however many daemons were asked. That
+ * answer is a promise its caller acts on: the install root is on the target *and* this
+ * machine finished putting it there — never that HEAD merely moved.
  *
  * **What it operates on.** `swarmInstallRoot()` (`../lib/build-identity.ts`) —
  * never `process.cwd()` and never `SWARM_WORKER_REPO_ROOT`. On the control-plane
@@ -220,13 +227,32 @@ export const InstallUpdateStateSchema = z.object({
 export type InstallUpdateState = z.infer<typeof InstallUpdateStateSchema>;
 
 /**
- * How long a daemon that cannot take the install lock waits before it gives up and
- * re-reads the commit. Brief on purpose: the point of the wait is to let a *just*
- * finishing update land, not to queue behind a thirty-minute `npm ci` — the loser has
- * an answer for the control plane either way, and an operator who wants it applied
- * re-issues.
+ * How long a daemon on its way *down* waits for the install lock before it gives up.
+ * Brief on purpose: a {@link returnToLastKnownGood} is a daemon abandoning a build it
+ * cannot run, so a longer wait only lengthens an outage — the loser stays down, says
+ * so, and by its next start the winner has cleared the record (issue #934).
  */
 export const INSTALL_LOCK_WAIT_MS = 5_000;
+
+/**
+ * How long a daemon waits for the peer that is moving the install root, before it
+ * gives up and refuses.
+ *
+ * Long, where the return path's wait above is brief, because the two want opposite
+ * things: a return is a daemon on its way down, while an *apply* on a shared install
+ * root wants the loser to still be here when the winner finishes — holding this lock
+ * afterwards is the only proof the `npm ci` and the build are over, and that proof is
+ * what lets a peer restart onto the build rather than onto a half-written tree
+ * (issue #973).
+ *
+ * Derived from this module's own step timeouts rather than picked: one fetch, one
+ * checkout and the two `npm` steps is the longest apply it can run. A holder that
+ * *died* never costs this — the lock is reclaimable on liveness — and a holder still
+ * going after it has left the install root on neither this daemon's target nor
+ * anything else, which waiting longer cannot improve.
+ */
+export const INSTALL_LOCK_FOLLOW_WAIT_MS =
+	GIT_FETCH_TIMEOUT_MS + GIT_CHECKOUT_TIMEOUT_MS + 2 * NPM_TIMEOUT_MS;
 
 /** How often that wait re-tries the lock. */
 const INSTALL_LOCK_POLL_MS = 500;
@@ -249,7 +275,7 @@ export interface ApplyUpdateTargetOptions {
 	now?: () => Date;
 	/** Injectable so a test can stand in for a second daemon sharing this install root. */
 	host?: InstallHostIdentity;
-	/** Defaults to {@link INSTALL_LOCK_WAIT_MS}; `0` concedes the lock immediately. */
+	/** Defaults to {@link INSTALL_LOCK_FOLLOW_WAIT_MS}; `0` refuses to a holder immediately. */
 	lockWaitMs?: number;
 }
 
@@ -292,7 +318,7 @@ export async function applyUpdateTarget(options: ApplyUpdateTargetOptions): Prom
 		run: options.run ?? runCommand,
 		now,
 		host: hostOptionsFor({ homeDir: options.homeDir, host: options.host, now }),
-		lockWaitMs: options.lockWaitMs ?? INSTALL_LOCK_WAIT_MS,
+		lockWaitMs: options.lockWaitMs ?? INSTALL_LOCK_FOLLOW_WAIT_MS,
 	};
 	try {
 		return await update(ctx);
@@ -350,6 +376,12 @@ async function update(ctx: UpdateContext): Promise<UpdateOutcome> {
 		);
 	}
 
+	// Read while HEAD is still attached, which is the only window git can answer it in
+	// — a peer's apply leaves HEAD detached, so re-reading this under the lock below
+	// would fall back to the recorded state and learn strictly less. That is the one
+	// deliberate exemption from "re-read everything under the lock": the tracked branch
+	// is not something a peer's apply can change, since the only writer of the record
+	// is `recordTracking`, which writes back what it read from this same checkout.
 	const tracking = await resolveTracking(ctx, stored);
 	if (!tracking) {
 		return refuse(
@@ -358,63 +390,65 @@ async function update(ctx: UpdateContext): Promise<UpdateOutcome> {
 				'branch this install should follow, then retry.',
 		);
 	}
-	recordTracking(ctx, stored, tracking, currentCommit);
 
 	// From here on this daemon is about to touch the install root itself, which on a
 	// shared install is the machine's rather than its own (issue #935). Everything
 	// above was a read.
-	let lock: InstallLock;
+	let acquired: { lock: InstallLock; followedPeer: boolean };
 	try {
-		lock = await takeInstallLock(ctx);
+		acquired = await takeInstallLock(ctx);
 	} catch (error) {
 		if (!(error instanceof InstallHeldError)) throw error;
-		return await concedeToHolder(ctx, tracking, target, error);
+		return refuseToHolder(ctx, target, error);
 	}
 	try {
-		return await updateLocked(ctx, tracking, target, currentCommit);
+		return await updateLocked(ctx, tracking, target, acquired.followedPeer);
 	} finally {
-		lock.release();
+		acquired.lock.release();
 	}
 }
 
 /**
  * Take the machine-local lock, re-trying for {@link InstallContext.lockWaitMs} before
- * conceding. The wait is what turns "two operators asked at the same second" into one
- * update rather than into a refusal nobody expected.
+ * giving up, and say whether the wait was actually spent behind somebody.
+ *
+ * The wait is not a tie-break between two operators asking at the same second: it is
+ * how a daemon lets the peer that is moving *its own* install root finish, so that it
+ * can then see what that peer landed (issue #973). `followedPeer` is that fact, and it
+ * is what tells the locked half below that the tree it now owns may have moved under
+ * it while it queued.
  */
-async function takeInstallLock(ctx: InstallContext): Promise<InstallLock> {
+async function takeInstallLock(
+	ctx: InstallContext,
+): Promise<{ lock: InstallLock; followedPeer: boolean }> {
 	// Wall clock, not the injected one: this is a real pause, not a judgement about a
 	// record's age.
 	const deadline = Date.now() + ctx.lockWaitMs;
+	let followedPeer = false;
 	for (;;) {
 		try {
-			return acquireInstallLock(ctx.installRoot, ctx.host);
+			return { lock: acquireInstallLock(ctx.installRoot, ctx.host), followedPeer };
 		} catch (error) {
 			if (!(error instanceof InstallHeldError) || Date.now() >= deadline) throw error;
+			followedPeer = true;
 			await sleep(INSTALL_LOCK_POLL_MS);
 		}
 	}
 }
 
 /**
- * What a daemon that lost the lock answers: `already-current` when the holder has
- * already landed the build this one was asked for, and the holder's own refusal
- * otherwise.
+ * What a daemon that waited out {@link ApplyUpdateTargetOptions.lockWaitMs} and still
+ * could not get in answers: the holder's own refusal, naming that daemon.
  *
- * The target resolves with **no fetch of our own** — the holder's fetch already
- * updated this checkout's remote-tracking refs, since it is the same checkout — so
- * this costs two reads and cannot race the holder's network access.
+ * It does **not** re-read the commit and call that `already-current`, which is what it
+ * used to do. That reading proved nothing: `buildAt` checks out *first*, so HEAD reaches
+ * the target while `node_modules` and `dist` are still half-written, and a peer restarting
+ * on the strength of it would restart onto a tree nobody has finished building. Since
+ * `already-current` is now a peer's licence to restart (issue #973), the only honest answer
+ * from outside the lock is "this machine could not bring me over — here is who has it".
  */
-async function concedeToHolder(
-	ctx: UpdateContext,
-	tracking: { remote: string; branch: string },
-	target: string,
-	held: InstallHeldError,
-): Promise<UpdateOutcome> {
-	const head = await gitRead(ctx, ['rev-parse', 'HEAD'], GIT_READ_TIMEOUT_MS);
-	const commit = head ? await resolveTargetCommit(ctx, tracking.remote, target) : null;
-	if (head && commit === head) return { status: 'already-current', commit: head };
-	logger.warn('conceding a SWARM install update to the daemon holding the install root', {
+function refuseToHolder(ctx: UpdateContext, target: string, held: InstallHeldError): UpdateOutcome {
+	logger.warn('refusing a SWARM install update to the daemon holding the install root', {
 		installRoot: ctx.installRoot,
 		target,
 		lockDir: held.lockDir,
@@ -429,21 +463,38 @@ async function updateLocked(
 	ctx: UpdateContext,
 	tracking: { remote: string; branch: string },
 	target: string,
-	currentCommit: string,
+	followedPeer: boolean,
 ): Promise<UpdateOutcome> {
-	// Before anything is fetched, let alone checked out: a peer daemon loaded from this
-	// same install root and running a phase would have its code swapped underneath it.
-	// The remedy is an operator act by design (`swarm workers drain`), so the refusal
-	// names the worker to drain rather than waiting for it.
-	const busy = findBusyInstallPeer(ctx.installRoot, ctx.host);
-	if (busy) {
+	// Everything this half acts on is read *now*, with the install root ours: the
+	// pre-lock reading describes a tree a peer may have moved through a whole apply
+	// while this daemon waited, and acting on it would fetch and build a second time
+	// what the machine already has (issue #973). It is the rule
+	// `returnToLastKnownGood` already states for itself, for the same reason.
+	const head = await gitRead(ctx, ['rev-parse', 'HEAD'], GIT_READ_TIMEOUT_MS);
+	if (!head) {
 		return refuse(
-			`${describeInstallParticipant(busy)} is running a phase from the SWARM install root ` +
-				`'${ctx.installRoot}', which this daemon shares with it, so nothing was changed. ` +
-				'Updating it now would swap the code under that run. Drain that worker, wait for it ' +
-				'to go idle, and re-issue this update.',
+			`The SWARM install root '${ctx.installRoot}' stopped answering as a git checkout while ` +
+				'this daemon held the machine-local update lock, so nothing was changed. Inspect the ' +
+				'checkout by hand.',
 		);
 	}
+	const state = readState(ctx.stateDir);
+	if (state === undefined) {
+		return refuse(
+			`The update state for the SWARM install root '${ctx.installRoot}' became unreadable ` +
+				`(${join(ctx.stateDir, STATE_FILE)}), so the last known good commit cannot be ` +
+				'established. Inspect or remove that file before updating.',
+		);
+	}
+	// Written here rather than before the lock, because it *is* a write to the record
+	// the holder mutates across its whole apply: a daemon that recorded the tracked
+	// branch on its way to a lock it then waited minutes for would be writing over
+	// whatever the holder had reached.
+	recordTracking(ctx, state, tracking, head);
+
+	if (followedPeer) return adoptPeerBuild(ctx, state, tracking, target, head);
+
+	// --- nothing else was moving this install root ---
 
 	// No refspec and no URL: what is fetched is whatever this remote's own config
 	// already says, which is the literal form of "only its own configured remote".
@@ -477,7 +528,26 @@ async function updateLocked(
 		);
 	}
 
-	if (commit === currentCommit) return { status: 'already-current', commit };
+	if (commit === head) return { status: 'already-current', commit };
+
+	// Only now, and for the first time, is this daemon about to replace code a peer may
+	// be executing: a peer loaded from this same install root and running a phase would
+	// have it swapped underneath it. The remedy is an operator act by design (`swarm
+	// workers drain`), so the refusal names the worker to drain rather than waiting.
+	//
+	// The guard sits *here* rather than in front of the fetch (issue #973) because a
+	// fetch writes remote-tracking refs and swaps nothing, while refusing above the
+	// short-circuit would refuse a daemon that needed only to notice the machine is
+	// already on the target — which is the whole of a peer's update.
+	const busy = findBusyInstallPeer(ctx.installRoot, ctx.host);
+	if (busy) {
+		return refuse(
+			`${describeInstallParticipant(busy)} is running a phase from the SWARM install root ` +
+				`'${ctx.installRoot}', which this daemon shares with it, so nothing was changed. ` +
+				'Updating it now would swap the code under that run. Drain that worker, wait for it ' +
+				'to go idle, and re-issue this update.',
+		);
+	}
 
 	// Written before the checkout on purpose: a process killed mid-apply must still
 	// leave behind the commit to go back to.
@@ -485,7 +555,7 @@ async function updateLocked(
 		installRoot: ctx.installRoot,
 		remote: tracking.remote,
 		trackedBranch: tracking.branch,
-		lastKnownGood: currentCommit,
+		lastKnownGood: head,
 		target,
 		targetCommit: commit,
 		appliedAt: ctx.now().toISOString(),
@@ -500,9 +570,9 @@ async function updateLocked(
 		installRoot: ctx.installRoot,
 		target,
 		commit,
-		previousCommit: currentCommit,
+		previousCommit: head,
 	});
-	const outcome = await applyCommit(ctx, currentCommit, commit);
+	const outcome = await applyCommit(ctx, head, commit);
 	if (outcome.status === 'applied') {
 		// The build is on disk but unproved: the daemon that will run it has not started
 		// yet, let alone handshaked. Recorded now so the *next* process finds the question
@@ -511,13 +581,66 @@ async function updateLocked(
 			...applying,
 			pendingVerification: {
 				commit,
-				previousCommit: currentCommit,
+				previousCommit: head,
 				failedStarts: 0,
 				startedAt: ctx.now().toISOString(),
 			},
 		});
 	}
 	return outcome;
+}
+
+/**
+ * What a daemon answers once the peer that was moving this install root has finished
+ * (issue #973).
+ *
+ * It does **not** fetch. That peer's own `git fetch` ran in this very checkout, so its
+ * remote-tracking refs are this daemon's too — which is what makes "an update fetches
+ * and builds exactly once on a machine" literally true for the daemons asked together,
+ * rather than once for the build and N times for the network.
+ *
+ * Two facts are required before this answers `already-current`, because that answer is
+ * now a peer's licence to restart: the install root is **on** the target, and this
+ * machine's own record says that build was *completed* here — it is the one awaiting
+ * proof, or the one already promoted to last known good. A checkout that reached the
+ * target and then failed its `npm ci` is on neither (the holder writes `applying` with
+ * `pendingVerification: null` before it checks anything out, and only a successful
+ * `applyCommit` fills it in), and is exactly the half-written tree nothing may restart
+ * onto.
+ *
+ * Anything else is a refusal naming what the install root is actually on: the machine
+ * moved and did not land what this daemon was asked for, and re-running the same fetch
+ * and build behind a peer that just failed is how one broken build becomes four. The
+ * operator reads that peer's own outcome and re-issues.
+ *
+ * No ancestry check: nothing is being moved. The code is already on disk and this
+ * daemon's supervisor will load it whenever it next restarts, so re-asking
+ * `merge-base` here could refuse nothing it has not already lost.
+ */
+async function adoptPeerBuild(
+	ctx: UpdateContext,
+	state: InstallUpdateState | null,
+	tracking: { remote: string; branch: string },
+	target: string,
+	head: string,
+): Promise<UpdateOutcome> {
+	const landed = await resolveTargetCommit(ctx, tracking.remote, target);
+	const completedHere =
+		state?.pendingVerification?.commit === head || state?.lastKnownGood === head;
+	if (landed === head && completedHere) {
+		logger.info('adopting the build a peer daemon landed in this SWARM install root', {
+			installRoot: ctx.installRoot,
+			target,
+			commit: head,
+		});
+		return { status: 'already-current', commit: head };
+	}
+	return refuse(
+		`The SWARM install root '${ctx.installRoot}' is on ${head}, not on a finished build of ` +
+			`the target this daemon was asked for ('${target}'), after the daemon that was moving ` +
+			"it finished. Nothing was changed here. Read that daemon's own outcome, then re-issue " +
+			'this update.',
+	);
 }
 
 /**
@@ -854,7 +977,9 @@ export async function returnToLastKnownGood(
 		const observed = readState(stateDir)?.pendingVerification;
 		if (!observed) return { status: 'nothing-pending' };
 		try {
-			lock = await takeInstallLock(ctx);
+			// The flag is an apply's business: a return is not following anybody, it is
+			// declining to rebuild under them.
+			lock = (await takeInstallLock(ctx)).lock;
 		} catch (error) {
 			if (!(error instanceof InstallHeldError)) throw error;
 			return {

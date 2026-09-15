@@ -795,6 +795,44 @@ describe('applyUpdateTarget — a shared install root', () => {
 		);
 	}
 
+	/**
+	 * A peer that is holding the update lock when this daemon arrives and has released
+	 * it by the time it looks again — the sequence a follower actually meets, since the
+	 * holder releases in a `finally` on every path.
+	 *
+	 * The release is hung off the liveness probe because that is the one injected call
+	 * `acquireInstallLock` makes while it is deciding, and nothing else a test owns runs
+	 * between two attempts. The probe still answers `true`, so the lock is *released*
+	 * rather than reclaimed from a corpse — which is the case under test.
+	 */
+	function peerReleasesWhileWeWait(home: string): Partial<ApplyUpdateTargetOptions> {
+		writePeerLock(home);
+		return {
+			host: {
+				hostname: TEST_HOST,
+				pid: OUR_PID,
+				isPidLive: (pid: number) => {
+					if (pid === PEER_PID) rmSync(lockDir(home), { recursive: true, force: true });
+					return live.has(pid);
+				},
+			},
+			// Long enough for one poll of the module's own interval, which is what the wait
+			// costs here. The production default is measured in tens of minutes.
+			lockWaitMs: 5_000,
+		};
+	}
+
+	/** What a holder leaves behind once its apply succeeded: the target, proved or awaiting proof. */
+	function writeLandedByPeer(home: string, pendingVerification: unknown): void {
+		writeStoredState(home, {
+			lastKnownGood: HEAD,
+			target: BRANCH,
+			targetCommit: TARGET_COMMIT,
+			appliedAt: NOW_ISO,
+			pendingVerification,
+		});
+	}
+
 	/** A peer daemon running from the same install root. */
 	function writePeerParticipant(home: string, overrides: Record<string, unknown> = {}): void {
 		const dir = join(installUpdateStateDir(INSTALL_ROOT, home), 'participants');
@@ -829,17 +867,106 @@ describe('applyUpdateTarget — a shared install root', () => {
 			expect(argv()).not.toContain(`git fetch ${REMOTE}`);
 		});
 
-		it('reports already-current once the holder has landed the target', async () => {
+		// The reading this used to answer `already-current` on proves nothing: `buildAt`
+		// checks out *before* it installs, so HEAD reaches the target while `node_modules`
+		// and `dist` are half-written. Now that `already-current` is a peer's licence to
+		// restart (issue #973), the only honest answer from outside the lock is a refusal.
+		it('refuses rather than reading a build the holder may be mid-way through', async () => {
 			const home = makeHome();
 			writePeerLock(home);
-			// What the holder's own checkout left behind — the target, on this same tree.
 			const { run, argv } = scriptedRunner({ 'git rev-parse HEAD': ok(TARGET_COMMIT) });
 
 			const outcome = await apply(home, run, BRANCH, sharedHost());
 
-			expect(outcome).toEqual({ status: 'already-current', commit: TARGET_COMMIT });
-			// Resolved off the refs the holder's own fetch already updated.
+			expect(outcome.status).toBe('refused');
+			if (outcome.status !== 'refused') return;
+			expect(outcome.reason).toContain(PEER_WORKER);
 			expect(argv()).not.toContain(`git fetch ${REMOTE}`);
+		});
+
+		it('waits for the holder, then adopts what it landed without fetching', async () => {
+			const home = makeHome();
+			writeLandedByPeer(home, {
+				commit: TARGET_COMMIT,
+				previousCommit: HEAD,
+				failedStarts: 0,
+				startedAt: NOW_ISO,
+			});
+			const { run, argv } = scriptedRunner({ 'git rev-parse HEAD': ok(TARGET_COMMIT) });
+
+			const outcome = await apply(home, run, BRANCH, peerReleasesWhileWeWait(home));
+
+			expect(outcome).toEqual({ status: 'already-current', commit: TARGET_COMMIT });
+			// One machine, one fetch and one build: the holder's own already moved these
+			// remote-tracking refs, and the tree it left is the one this daemon restarts onto.
+			expect(argv()).not.toContain(`git fetch ${REMOTE}`);
+			expect(argv()).not.toContain('npm ci');
+			expect(argv()).not.toContain('npm run build');
+		});
+
+		// Equally good proof: the build was promoted to last known good before this daemon
+		// got in, which is what a peer that already handshaked leaves behind.
+		it('adopts a build the machine has already proved', async () => {
+			const home = makeHome();
+			writeLandedByPeer(home, null);
+			writeStoredState(home, {
+				lastKnownGood: TARGET_COMMIT,
+				target: BRANCH,
+				targetCommit: TARGET_COMMIT,
+				appliedAt: NOW_ISO,
+				pendingVerification: null,
+			});
+			const { run } = scriptedRunner({ 'git rev-parse HEAD': ok(TARGET_COMMIT) });
+
+			const outcome = await apply(home, run, BRANCH, peerReleasesWhileWeWait(home));
+
+			expect(outcome).toEqual({ status: 'already-current', commit: TARGET_COMMIT });
+		});
+
+		it('refuses when the daemon that was moving it did not land this target', async () => {
+			const home = makeHome();
+			// HEAD is left on the old commit: whatever that peer was doing, it was not this.
+			const { run, argv } = scriptedRunner();
+
+			const outcome = await apply(home, run, BRANCH, peerReleasesWhileWeWait(home));
+
+			expect(outcome.status).toBe('refused');
+			if (outcome.status !== 'refused') return;
+			expect(outcome.reason).toContain(HEAD);
+			expect(outcome.reason).toContain(BRANCH);
+			// Re-running the same fetch and build behind a peer that just failed is how one
+			// broken build becomes four.
+			expect(argv()).not.toContain(`git fetch ${REMOTE}`);
+			expect(argv()).not.toContain(`git checkout --detach ${TARGET_COMMIT}`);
+			expect(argv()).not.toContain('npm ci');
+		});
+
+		// The half-written tree itself: `applying` is written with no pending verification
+		// *before* the checkout, so HEAD reaches the target with `npm ci` still to run.
+		it('refuses a target the install root reached but never finished building', async () => {
+			const home = makeHome();
+			writeLandedByPeer(home, null);
+			const { run, argv } = scriptedRunner({ 'git rev-parse HEAD': ok(TARGET_COMMIT) });
+
+			const outcome = await apply(home, run, BRANCH, peerReleasesWhileWeWait(home));
+
+			expect(outcome.status).toBe('refused');
+			expect(argv()).not.toContain('npm ci');
+			expect(argv()).not.toContain('npm run build');
+		});
+
+		// A peer can land a whole apply between this daemon's first read and its lock, so
+		// the pre-lock reading is never what the locked half acts on.
+		it('re-reads HEAD under the lock rather than acting on the pre-lock reading', async () => {
+			const home = makeHome();
+			const { run, argv } = scriptedRunner({
+				'git rev-parse HEAD': [ok(HEAD), ok(TARGET_COMMIT)],
+			});
+
+			const outcome = await apply(home, run, BRANCH, sharedHost());
+
+			expect(outcome).toEqual({ status: 'already-current', commit: TARGET_COMMIT });
+			expect(argv()).not.toContain('npm ci');
 		});
 
 		it('takes over a lock left behind by a daemon that is gone', async () => {
@@ -881,7 +1008,7 @@ describe('applyUpdateTarget — a shared install root', () => {
 	});
 
 	describe('a peer daemon mid-phase', () => {
-		it('refuses before anything is fetched, naming the worker to drain', async () => {
+		it('refuses before anything is checked out, naming the worker to drain', async () => {
 			const home = makeHome();
 			writePeerParticipant(home, { busy: true });
 			const { run, argv } = scriptedRunner();
@@ -892,7 +1019,23 @@ describe('applyUpdateTarget — a shared install root', () => {
 			if (outcome.status !== 'refused') return;
 			expect(outcome.reason).toContain(PEER_WORKER);
 			expect(outcome.reason).toContain('Drain that worker');
-			expect(argv()).not.toContain(`git fetch ${REMOTE}`);
+			// The guard is about replacing code a peer is executing, and only these do that.
+			// The fetch ahead of it writes remote-tracking refs and swaps nothing (issue #973).
+			expect(argv()).not.toContain(`git checkout --detach ${TARGET_COMMIT}`);
+			expect(argv()).not.toContain('npm ci');
+			expect(argv()).not.toContain('npm run build');
+		});
+
+		// The whole of a peer's own update, and the reason the guard moved below the
+		// short-circuit: this daemon writes nothing, so a busy peer is no reason to refuse it.
+		it('lets a daemon that only needs to notice the machine is already there through', async () => {
+			const home = makeHome();
+			writePeerParticipant(home, { busy: true });
+			const { run, argv } = scriptedRunner({ 'git rev-parse HEAD': ok(TARGET_COMMIT) });
+
+			const outcome = await apply(home, run, BRANCH, sharedHost());
+
+			expect(outcome).toEqual({ status: 'already-current', commit: TARGET_COMMIT });
 			expect(argv()).not.toContain(`git checkout --detach ${TARGET_COMMIT}`);
 		});
 

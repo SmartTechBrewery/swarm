@@ -93,7 +93,7 @@ function makeWorker(id: string, overrides: Partial<Worker> = {}): Worker {
 /** A `workers` row carrying the answer a machine gave to the rollout's own request. */
 function reported(
 	id: string,
-	status: 'applied' | 'already-current' | 'failed' | 'refused' | 'declined',
+	status: 'applied' | 'adopted' | 'already-current' | 'failed' | 'refused' | 'declined',
 	overrides: Partial<Worker> = {},
 ): Worker {
 	return makeWorker(id, {
@@ -528,6 +528,19 @@ describe('advanceRollout — settling what a machine reported', () => {
 		expect(view?.members[1].state).toBe('queued');
 	});
 
+	// A peer on the same machine did the fetch and this daemon is restarting onto what
+	// it landed (issue #973) — a success, and one that still has to come back.
+	it('moves a machine that adopted a peer build on to verification too', async () => {
+		givenRollout(makeRollout(), [signalled(), makeMember(WORKER_B, 1)]);
+		givenWorkers(reported(WORKER_A, 'adopted'), makeWorker(WORKER_B));
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0]).toMatchObject({ state: 'verifying', outcome: 'adopted' });
+		expect(setWorkerDraining).not.toHaveBeenCalled();
+		expect(view?.members[1].state).toBe('queued');
+	});
+
 	// Nothing was installed and nothing restarted, so there is nothing to come back from.
 	it('settles already-current at once and returns the machine to the pool', async () => {
 		givenRollout(makeRollout(), [signalled()]);
@@ -617,6 +630,20 @@ describe('advanceRollout — verifying that a machine came back on the new build
 	it('settles a machine whose daemon took a fresh lease on a new commit, and undrains it', async () => {
 		givenRollout(makeRollout(), [verifying()]);
 		givenWorkers(reported(WORKER_A, 'applied', { build: { commit: 'bbbbbbb', dirty: false } }));
+		getLiveSessionForWorker.mockResolvedValue({ fencingToken: 8 });
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0].state).toBe('done');
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_A, false);
+		expect(view?.rollout.status).toBe('completed');
+	});
+
+	// The come-back verdict is about the machine, not about which daemon on it paid for
+	// the fetch, so an adopting one settles by exactly the same two facts.
+	it('settles a machine that adopted a peer build once it comes back on it', async () => {
+		givenRollout(makeRollout(), [verifying({ outcome: 'adopted' })]);
+		givenWorkers(reported(WORKER_A, 'adopted', { build: { commit: 'bbbbbbb', dirty: false } }));
 		getLiveSessionForWorker.mockResolvedValue({ fencingToken: 8 });
 
 		const view = await advanceRollout(ROLLOUT_ID);

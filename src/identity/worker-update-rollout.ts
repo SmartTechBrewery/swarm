@@ -55,10 +55,12 @@ export type WorkerUpdateRolloutStatus = z.infer<typeof WorkerUpdateRolloutStatus
  *   and is signalled on a later advance.
  * - `signalled` — idle, and asked to move through the same per-machine request
  *   phase 1 sends (`fanOutWorkerUpdate`). Waiting for the machine's own report.
- * - `verifying` — the machine reported `applied`; waiting for a daemon on the new
- *   build to take a fresh lease. This is the state the come-back window bounds.
+ * - `verifying` — the machine reported `applied` or `adopted`; waiting for a daemon
+ *   on the new build to take a fresh lease. This is the state the come-back window
+ *   bounds.
  * - `done` — settled good: it came back on the new build, or reported
- *   `already-current` and needed no restart at all.
+ *   `already-current` — the install root was on the target and the daemon was already
+ *   running it — and so needed no restart at all.
  * - `skipped` — settled without being moved, and **not** a failure: the rollout
  *   halted before this machine's wave came up, or another session re-targeted the
  *   machine so there is nothing left for this rollout to verify.
@@ -98,8 +100,8 @@ export function isSettledMemberState(state: WorkerUpdateRolloutMemberState): boo
  * rollout cannot finish, and carrying on would drain machine after machine only to
  * be declined by each in turn. Halting says so once, on the first one.
  *
- * `applied` and `already-current` are the two that do not halt — the first moves the
- * member to `verifying`, the second settles it on the spot.
+ * `applied`, `adopted` and `already-current` are the three that do not halt — the
+ * first two move the member to `verifying`, the third settles it on the spot.
  */
 export const HALTING_WORKER_UPDATE_STATUSES = ['failed', 'refused', 'declined'] as const;
 const HALTING_STATUSES = new Set<string>(HALTING_WORKER_UPDATE_STATUSES);
@@ -107,6 +109,25 @@ const HALTING_STATUSES = new Set<string>(HALTING_WORKER_UPDATE_STATUSES);
 /** Whether a machine's reported outcome is one that stops the rollout. */
 export function isHaltingUpdateStatus(status: string): boolean {
 	return HALTING_STATUSES.has(status);
+}
+
+/**
+ * The other half of that vocabulary: the reported outcomes that end with the machine
+ * restarting, so a rollout waits for it to come back before settling the member.
+ *
+ * `applied` is the daemon that did the fetch and the build; `adopted` is one that
+ * restarted onto a build a peer on the same machine fetched (issue #973). Both are
+ * successes and both restart, which is the only thing this distinction is asked for
+ * here — it lives in this module rather than in the control-plane policy that reads it
+ * because this is where the domain words are defined, so the policy asks rather than
+ * hard-codes.
+ */
+export const RESTARTING_WORKER_UPDATE_STATUSES = ['applied', 'adopted'] as const;
+const RESTARTING_STATUSES = new Set<string>(RESTARTING_WORKER_UPDATE_STATUSES);
+
+/** Whether a machine's reported outcome is one it restarts into a new build on. */
+export function isRestartingUpdateStatus(status: string): boolean {
+	return RESTARTING_STATUSES.has(status);
 }
 
 /**
