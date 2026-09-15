@@ -10,6 +10,7 @@ import { resolveRunDurationMs, useNow } from '@/lib/run-duration.js';
 import { runTableColumnWidths } from '@/lib/run-table-layout.js';
 import { trpc } from '@/lib/trpc.js';
 import type { RunRow } from '@/types/runs.js';
+import { MaintenanceRunBadge } from './maintenance-run-badge.js';
 import { RunStatusBadge } from './run-status-badge.js';
 import { WorkItemCell } from './work-item-cell.js';
 
@@ -98,6 +99,9 @@ export function RunsTable({
 								/>
 							</div>
 							<div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-zinc-400">
+								{/* Issue #974 — the kind leads the metadata line, before the phase
+								    word, so a maintenance card reads as maintenance at a glance. */}
+								<MaintenanceRunBadge run={run} />
 								<span className="font-semibold capitalize text-zinc-300">
 									{formatPhase(run.phase)}
 								</span>
@@ -194,7 +198,16 @@ export function RunsTable({
 								className="hover:bg-zinc-800/40 transition-colors cursor-pointer"
 							>
 								<td className="px-2 py-3 text-sm font-semibold text-zinc-100 capitalize">
-									{formatPhase(run.phase)}
+									{/* Issue #974 — the mark sits beside the phase word rather than in a
+									    column of its own: the Phase cell is the leftmost scan column and
+									    already carries the machine below it, and this is a rare per-row
+									    exception, not a fact every row states. The Phase column is
+									    width-constrained (`run-table-layout.ts`), so the pill wraps to a
+									    second line on a maintenance row — which is the intended cost. */}
+									<div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+										{formatPhase(run.phase)}
+										<MaintenanceRunBadge run={run} />
+									</div>
 									{run.workerName ? (
 										<span
 											data-testid="run-worker-name"

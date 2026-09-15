@@ -499,6 +499,72 @@ describe('RunsTable', () => {
 				'studio-mac',
 			);
 		});
+
+		// Issue #974 — the row is marked as machine maintenance at a glance, on the
+		// kind axis rather than the status one, without displacing anything it said.
+		it('marks the desktop Phase cell as maintenance, beside the phase and the machine', () => {
+			const { container } = renderTable(
+				<RunsTable
+					runs={[maintenanceRun]}
+					totalCount={1}
+					currentPage={1}
+					pageSize={25}
+					onPageChange={vi.fn()}
+				/>,
+			);
+
+			const table = container.querySelector('table') as HTMLElement;
+			const row = within(table).getAllByRole('row')[1];
+			const phaseCell = row.querySelectorAll('td')[0];
+			const mark = within(phaseCell as HTMLElement).getByTestId('run-maintenance-mark');
+			expect(mark.textContent).toBe('Maintenance');
+			// The shared caution badge, not a hand-rolled pill of its own.
+			const pill = mark.querySelector('span') as HTMLElement;
+			expect(pill.className).toContain('bg-amber-950/20');
+			expect(pill.className).toContain('text-amber-200');
+			// Never a status word: the Status column keeps that axis to itself.
+			expect((row as HTMLElement).textContent).not.toContain('Updating');
+			// Everything the row already said is still there.
+			expect(phaseCell.textContent).toContain('worker update');
+			expect(within(phaseCell as HTMLElement).getByTestId('run-worker-name').textContent).toBe(
+				'studio-mac',
+			);
+			expect(within(row as HTMLElement).getByText('→ main')).not.toBeNull();
+		});
+
+		it('leaves a pipeline row unmarked', () => {
+			const { container } = renderTable(
+				<RunsTable
+					runs={[baseRun]}
+					totalCount={1}
+					currentPage={1}
+					pageSize={25}
+					onPageChange={vi.fn()}
+				/>,
+			);
+
+			const table = container.querySelector('table') as HTMLElement;
+			const row = within(table).getAllByRole('row')[1];
+			expect(within(row as HTMLElement).queryByTestId('run-maintenance-mark')).toBeNull();
+		});
+
+		it('marks the mobile card too', () => {
+			renderTable(
+				<RunsTable
+					runs={[maintenanceRun, { ...baseRun, id: 'run-2' }]}
+					totalCount={2}
+					currentPage={1}
+					pageSize={25}
+					onPageChange={vi.fn()}
+				/>,
+			);
+
+			const [maintenanceCard, pipelineCard] = screen.getAllByTestId('run-card');
+			expect(within(maintenanceCard).getByTestId('run-maintenance-mark').textContent).toBe(
+				'Maintenance',
+			);
+			expect(within(pipelineCard).queryByTestId('run-maintenance-mark')).toBeNull();
+		});
 	});
 
 	// issue #523 — the machine a run is executing on, alongside its phase.

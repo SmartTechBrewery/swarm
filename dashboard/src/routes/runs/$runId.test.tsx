@@ -533,6 +533,114 @@ describe('RunDetailHeader for a checkpointed run (issue #504)', () => {
 	});
 });
 
+// Issue #974 — a `kind = 'worker-update'` run is machine maintenance, so the header
+// marks it as such and replaces the two pipeline callouts it would otherwise read
+// through with maintenance-shaped ones. Neither offers a control `requirePipelineRun`
+// already refuses server-side.
+describe('RunDetailHeader for a maintenance run (issue #974)', () => {
+	function makeMaintenanceRun(overrides: Partial<RunRow> = {}): RunRow {
+		return makeReviewRun({
+			kind: 'worker-update',
+			phase: 'worker-update',
+			repository: null,
+			taskId: null,
+			prNumber: null,
+			prTitle: null,
+			reviewVerdict: null,
+			reviewAutomationOutcome: null,
+			maintenanceTarget: 'main',
+			maintenanceRequestId: '11111111-1111-4111-8111-111111111111',
+			workerId: 'worker-a',
+			attribution: {
+				workerId: 'worker-a',
+				workerName: 'studio-mac',
+				userId: 'user-1',
+				userDisplayName: 'Alice Example',
+			},
+			...overrides,
+		});
+	}
+
+	function renderHeader(run: RunRow) {
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		return render(
+			<QueryClientProvider client={queryClient}>
+				<RunDetailHeader run={run} />
+			</QueryClientProvider>,
+		);
+	}
+
+	it('marks the header as maintenance, beside the status rather than instead of it', () => {
+		renderHeader(makeMaintenanceRun({ status: 'running' }));
+
+		expect(screen.getByTestId('run-maintenance-mark').textContent).toBe('Maintenance');
+		// The status axis is untouched: the badge still says what the run is doing.
+		expect(screen.getByText('Running')).toBeDefined();
+	});
+
+	it('leaves a pipeline run unmarked', () => {
+		renderHeader(makeReviewRun({ status: 'running', phase: 'implementation' }));
+
+		expect(screen.queryByTestId('run-maintenance-mark')).toBeNull();
+	});
+
+	it('explains a running update in the machine’s terms and offers no Terminate', () => {
+		renderHeader(makeMaintenanceRun({ status: 'running' }));
+
+		expect(screen.getByRole('heading', { name: /update in progress/i })).toBeDefined();
+		expect(screen.getByText(/studio-mac was asked to move to/i)).toBeDefined();
+		expect(screen.getByText(/asking again with a different build supersedes/i)).toBeDefined();
+		// The pipeline copy claims an agent and a project slot a maintenance run has neither of.
+		expect(screen.queryByText(/frees its project slot/i)).toBeNull();
+		expect(screen.queryByRole('button', { name: /terminate/i })).toBeNull();
+	});
+
+	it('still offers Terminate for an otherwise identical running pipeline run', () => {
+		renderHeader(makeReviewRun({ status: 'running', phase: 'implementation' }));
+
+		expect(screen.getByRole('button', { name: /^terminate$/i })).toBeDefined();
+		expect(screen.queryByRole('heading', { name: /update in progress/i })).toBeNull();
+	});
+
+	it("shows the machine's own failure prose plus how to ask again, and no Recover", () => {
+		renderHeader(
+			makeMaintenanceRun({
+				status: 'failed',
+				error: 'Update failed while building /opt/swarm: `npm run build` exited 1.',
+			}),
+		);
+
+		expect(screen.getByRole('heading', { name: /update failed/i })).toBeDefined();
+		expect(screen.getByText(/`npm run build` exited 1/)).toBeDefined();
+		expect(screen.getByText('swarm workers update worker-a main')).toBeDefined();
+		expect(screen.queryByRole('button', { name: /recover/i })).toBeNull();
+		// Never the pipeline failure headings, which name a run rather than an update.
+		expect(screen.queryByRole('heading', { name: /run failure error/i })).toBeNull();
+	});
+
+	it('never prints a half-formed command when the machine or the build is unknown', () => {
+		renderHeader(
+			makeMaintenanceRun({
+				status: 'failed',
+				error: 'The machine never answered.',
+				workerId: null,
+				maintenanceTarget: null,
+				attribution: null,
+			}),
+		);
+
+		expect(screen.getByText('swarm workers update <worker-id> <ref>')).toBeDefined();
+	});
+
+	it('keeps the pipeline failure callout, with Recover, for a failed pipeline run', () => {
+		renderHeader(makeReviewRun({ status: 'failed', phase: 'implementation', error: 'some error' }));
+
+		expect(screen.getByRole('heading', { name: /run failure error/i })).toBeDefined();
+		expect(screen.getByRole('button', { name: 'Recover' })).toBeDefined();
+		expect(screen.queryByRole('heading', { name: /update failed/i })).toBeNull();
+	});
+});
+
 describe('ReviewMergeCallout (issue #278)', () => {
 	it('renders nothing when no merge automation ran', () => {
 		const { container } = render(

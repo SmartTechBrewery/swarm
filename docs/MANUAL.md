@@ -276,6 +276,19 @@ It goes on naming that machine after the machine itself is gone: deleting a work
 removes it from the roster, and its update history stays readable, still saying which
 machine each row was about.
 
+**How it reads there** (issue #974). The row carries an amber `Maintenance` mark
+beside the phase word, so it is never mistaken for pipeline work at a glance — the
+mark says what *kind* of run it is, while the status badge beside it still says
+whether it is running, completed or failed. Opening it shows the same mark, the
+machine and the build it was asked to move to, and, when it failed, the machine's own
+reason — which already names the install root, the step that failed, and whether the
+checkout was returned to the build it was on — together with the command that asks
+again. A failed update is **re-asked, never retried from the run page**: drain the
+machine, fix the cause, then `swarm workers update <worker-id> <ref>`. The page
+deliberately offers no **Terminate** and no **Recover**; both are refused for a
+maintenance run server-side, and nothing in the dashboard can stop an update already
+in flight — asking again with a different build supersedes the request instead.
+
 **The machine must be enrolled in a project.** That run has to hang off one, so a
 worker enrolled in **no** project is refused rather than silently asked: `swarm
 workers update` says so and writes nothing, the fleet forms report the machine as

@@ -13,6 +13,12 @@ import type { ReactNode } from 'react';
  * as that for the `planning` phase, which is how Planning came to read as a
  * special, differently-trusted thing on two screens (issue #542). Reach for a new
  * tone here rather than hand-rolling a second pill.
+ *
+ * The runs list's `Maintenance` mark (`runs/maintenance-run-badge.tsx`, issue #974)
+ * is the one use worth reading against that rule rather than as a repeat of it: it
+ * marks the row that is *not* a member of the set — machine maintenance among
+ * pipeline runs — and the state its `caution` carries is the one an operator acts
+ * on, that none of the pipeline recovery actions apply to it.
  */
 
 const BADGE_BASE =

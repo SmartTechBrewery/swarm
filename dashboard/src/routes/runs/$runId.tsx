@@ -20,6 +20,7 @@ import {
 import { useEffect, useRef, useState } from 'react';
 import { type LiveOutputEvent, LiveOutputViewer } from '@/components/runs/live-output-viewer.js';
 import { LogViewer } from '@/components/runs/log-viewer.js';
+import { MaintenanceRunBadge } from '@/components/runs/maintenance-run-badge.js';
 import { RunStatusBadge } from '@/components/runs/run-status-badge.js';
 import { Modal, ModalFooter } from '@/components/ui/modal.js';
 import {
@@ -32,6 +33,7 @@ import { formatDuration, formatPhase, formatTimeUntil, formatTokenCount } from '
 import { describePreservedWorker, preservedWorkerLabel } from '@/lib/preserved-worker.js';
 import { describeCancellationOrigin, normalizeRunError } from '@/lib/run-cancellation.js';
 import { resolveRunDurationMs, useNow } from '@/lib/run-duration.js';
+import { isMaintenanceRun } from '@/lib/run-kind.js';
 import {
 	canRecoverRun,
 	type RecoveryChoices,
@@ -1673,6 +1675,79 @@ export function ReviewMergeCallout({ run }: ReviewMergeCalloutProps) {
 	);
 }
 
+/**
+ * The build a maintenance run is moving its machine to, and the machine's own id —
+ * the two halves of the `swarm workers update` command the failure callout tells the
+ * operator to re-issue. Both fall back to a placeholder rather than printing a
+ * literal `null`: a half-formed command an operator can paste is worse than one they
+ * can see they have to complete.
+ */
+function maintenanceCommandParts(run: RunRow): { workerId: string; target: string } {
+	return {
+		workerId: run.attribution?.workerId ?? run.workerId ?? '<worker-id>',
+		target: run.maintenanceTarget ?? '<ref>',
+	};
+}
+
+/**
+ * What a `running` maintenance run says in place of the pipeline "Running" callout
+ * (issue #974). The pipeline copy is wrong here in every clause — there is no agent
+ * to stop and no project slot to free (a maintenance run creates no dispatch) — and
+ * its Terminate control offers an action `runs.terminate` refuses outright
+ * (`requirePipelineRun`). Same violet "in progress" panel, no buttons: the only way
+ * to change an outstanding request is to make another one.
+ */
+function MaintenanceRunningCallout({ run }: { run: RunRow }) {
+	const { target } = maintenanceCommandParts(run);
+	const machine = run.attribution?.workerName ?? run.workerName ?? 'This machine';
+	return (
+		<div className="p-4 bg-violet-950/20 border border-violet-900/30 rounded flex items-start gap-3">
+			<Loader2 className="h-5 w-5 text-violet-400 shrink-0 mt-0.5 animate-spin" />
+			<div>
+				<h3 className="text-xs font-semibold text-violet-200">Update in progress</h3>
+				<p className="text-xs text-violet-200/70 mt-1">
+					{machine} was asked to move to <span className="font-mono">{target}</span>. It finishes
+					any phases already in flight, applies the update, restarts into the new build and reports
+					back. Nothing here can stop it; asking again with a different build supersedes this
+					request.
+				</p>
+			</div>
+		</div>
+	);
+}
+
+/**
+ * What a `failed` maintenance run says in place of the pipeline failure callout
+ * (issue #974). The machine's own prose is the whole diagnosis — it already names
+ * the install root, the step that failed, and whether the checkout was returned to
+ * the build it was on — so this adds only the one thing the page can't get from it:
+ * how to ask again. There is no dashboard control for that today, and the run is a
+ * record of one request rather than something retried from here, so the guidance is
+ * the CLI command and no `Recover` button.
+ */
+function MaintenanceFailureCallout({ run, error }: { run: RunRow; error: string }) {
+	const { workerId, target } = maintenanceCommandParts(run);
+	return (
+		<div className="p-4 bg-red-950/20 border border-red-900/30 rounded flex items-start gap-3">
+			<AlertTriangle className="h-5 w-5 text-red-400 shrink-0 mt-0.5" />
+			<div>
+				<h3 className="text-xs font-semibold text-red-200">Update failed</h3>
+				<p className="text-xs text-red-400/80 mt-1 font-mono whitespace-pre-wrap">
+					{normalizeRunError(error)}
+				</p>
+				<p className="text-xs text-red-400/60 mt-2">
+					Fix the cause on the machine, then ask it again:{' '}
+					<span className="font-mono text-red-300">
+						swarm workers update {workerId} {target}
+					</span>{' '}
+					(the machine must be drained first). This run is a record of one request and is not
+					retried from here.
+				</p>
+			</div>
+		</div>
+	);
+}
+
 interface RunDetailHeaderProps {
 	run: RunRow;
 	/** Forwarded to {@link ReviewCapCallout}, which is the header's only use for it. */
@@ -1682,6 +1757,11 @@ interface RunDetailHeaderProps {
 export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
 	const [resetReport, setResetReport] = useState<ResetRunReport | null>(null);
 	const prevRunIdRef = useRef(run.id);
+	// Issue #974 — asked once, of the `kind` discriminator, and used to swap the two
+	// status callouts a maintenance run reads wrongly through. The `deferred` and
+	// `checkpointed` blocks are deliberately untouched: a maintenance run has no
+	// dispatch, no session and no checkpoint, so neither status is reachable for one.
+	const maintenance = isMaintenanceRun(run);
 
 	useEffect(() => {
 		if (prevRunIdRef.current !== run.id) {
@@ -1708,14 +1788,19 @@ export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
 					</h1>
 					<p className="text-xs text-zinc-500 mt-1 font-mono">{run.id}</p>
 				</div>
-				<RunStatusBadge
-					status={run.status as RunStatus}
-					timedOut={run.timedOut}
-					phase={run.phase}
-					reviewVerdict={run.reviewVerdict}
-					reviewAutomationOutcome={run.reviewAutomationOutcome}
-					className="text-sm px-3 py-1"
-				/>
+				<div className="flex flex-wrap items-center gap-2">
+					{/* The page states the same kind the list did (issue #974), beside — never
+					    instead of — the status, which is the other axis. */}
+					<MaintenanceRunBadge run={run} />
+					<RunStatusBadge
+						status={run.status as RunStatus}
+						timedOut={run.timedOut}
+						phase={run.phase}
+						reviewVerdict={run.reviewVerdict}
+						reviewAutomationOutcome={run.reviewAutomationOutcome}
+						className="text-sm px-3 py-1"
+					/>
+				</div>
 			</div>
 
 			{resetReport && (
@@ -1732,7 +1817,9 @@ export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
 				</div>
 			)}
 
-			{run.status === 'running' && (
+			{run.status === 'running' && maintenance && <MaintenanceRunningCallout run={run} />}
+
+			{run.status === 'running' && !maintenance && (
 				<div className="p-4 bg-violet-950/20 border border-violet-900/30 rounded flex items-start gap-3">
 					<Loader2 className="h-5 w-5 text-violet-400 shrink-0 mt-0.5 animate-spin" />
 					<div>
@@ -1780,7 +1867,11 @@ export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
 
 			{run.status === 'failed' && <FailureDiagnosisCallout diagnosis={run.failureDiagnosis} />}
 
-			{run.status === 'failed' && run.error && (
+			{run.status === 'failed' && run.error && maintenance && (
+				<MaintenanceFailureCallout run={run} error={run.error} />
+			)}
+
+			{run.status === 'failed' && run.error && !maintenance && (
 				<div className="p-4 bg-red-950/20 border border-red-900/30 rounded flex items-start gap-3">
 					<AlertTriangle className="h-5 w-5 text-red-400 shrink-0 mt-0.5" />
 					<div>
