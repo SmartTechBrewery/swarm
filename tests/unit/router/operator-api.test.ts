@@ -83,6 +83,8 @@ beforeEach(() => {
 		displayName: 'ada-laptop',
 		ownerUserId: USER_ID,
 		lastSeenAt: null,
+		// Issue #977 — `getById` shapes this for the wire, so the stub must carry it.
+		updateHistory: [],
 		enrollments: [],
 	});
 	getWorker.mockReset();

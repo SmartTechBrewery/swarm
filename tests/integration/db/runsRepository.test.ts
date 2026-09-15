@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { eq, inArray } from 'drizzle-orm';
 import { beforeEach, describe, expect, it } from 'vitest';
 
@@ -35,6 +36,7 @@ import {
 	hasRunForTask,
 	listRunsFromDb,
 	listTaskActivitySince,
+	listWorkerUpdateRunsForWorker,
 	MAX_RUN_OUTPUT_BYTES,
 	markRunUserTerminated,
 	recordRunCleanupBlocked,
@@ -44,6 +46,7 @@ import {
 	storeRunLogs,
 	supersedeWorkerUpdateRun,
 	updateReviewMergeOutcome,
+	WORKER_UPDATE_HISTORY_LIMIT,
 	WORKER_UPDATE_RUN_KIND,
 	WORKER_UPDATE_RUN_PHASE,
 	WORKER_UPDATE_RUN_TIMEOUT_MS,
@@ -2001,6 +2004,95 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 				await supersedeWorkerUpdateRun(mine.workerId, 'v3');
 
 				expect((await getRunByIdFromDb(theirs.runId))?.status).toBe('running');
+			});
+		});
+
+		// Issue #977 — the machine's own page reads its update history from these rows.
+		describe('listWorkerUpdateRunsForWorker', () => {
+			/** Move a run's `started_at`, so ordering is asserted against instants chosen here. */
+			async function backdate(runId: string, minutesAgo: number): Promise<void> {
+				await getDb()
+					.update(runs)
+					.set({ startedAt: new Date(Date.now() - minutesAgo * 60_000) })
+					.where(eq(runs.id, runId));
+			}
+
+			/** A further request for an already-seeded machine, with its own request id. */
+			async function askAgain(
+				machine: { workerId: string; ownerUserId: string; machine: string },
+				target: string,
+			): Promise<string> {
+				return createWorkerUpdateRun({
+					projectId: PROJECT_ID,
+					workerId: machine.workerId,
+					workerUserId: machine.ownerUserId,
+					requestId: randomUUID(),
+					target,
+					machine: machine.machine,
+				});
+			}
+
+			it('answers this machine’s requests newest first, each still naming its own build', async () => {
+				const mine = await seedUpdateRun('history', REQUEST_ID, 'v1');
+				await backdate(mine.runId, 30);
+				const newest = await askAgain(mine, 'v2');
+				await backdate(newest, 5);
+				const theirs = await seedUpdateRun('history-theirs', OTHER_REQUEST_ID, 'v9');
+
+				const history = await listWorkerUpdateRunsForWorker(mine.workerId);
+
+				expect(history.map((entry) => entry.runId)).toEqual([newest, mine.runId]);
+				// The whole point of `maintenance_target`: the earlier request goes on naming
+				// the build it was for, where `workers.update_target` has been overwritten.
+				expect(history.map((entry) => entry.target)).toEqual(['v2', 'v1']);
+				expect(history.map((entry) => entry.runId)).not.toContain(theirs.runId);
+			});
+
+			it('is bounded, dropping the oldest requests rather than the newest', async () => {
+				const machine = await seedUpdateRun('bounded', REQUEST_ID, 'v0');
+				await backdate(machine.runId, 100);
+				for (let index = 1; index <= WORKER_UPDATE_HISTORY_LIMIT; index += 1) {
+					await backdate(await askAgain(machine, `v${index}`), 100 - index);
+				}
+
+				const history = await listWorkerUpdateRunsForWorker(machine.workerId);
+
+				expect(history).toHaveLength(WORKER_UPDATE_HISTORY_LIMIT);
+				expect(history[0].target).toBe(`v${WORKER_UPDATE_HISTORY_LIMIT}`);
+				expect(history.map((entry) => entry.runId)).not.toContain(machine.runId);
+			});
+
+			it('excludes a pipeline run the same machine executed', async () => {
+				const machine = await seedUpdateRun('kind-filter');
+				const pipelineRun = await createRun({
+					projectId: PROJECT_ID,
+					taskId: 'pipeline',
+					phase: 'review',
+					workerId: machine.workerId,
+				});
+
+				const history = await listWorkerUpdateRunsForWorker(machine.workerId);
+
+				expect(history.map((entry) => entry.runId)).toEqual([machine.runId]);
+				expect(history.map((entry) => entry.runId)).not.toContain(pipelineRun);
+			});
+
+			// Keyed on the live link, which is why phase 1's runs list keeps the
+			// `maintenance_machine` fallback and this read needs none: a retired machine has
+			// no page for its history to appear on.
+			it('answers nothing for a machine whose deletion nulled the link', async () => {
+				const machine = await seedUpdateRun('deleted');
+				await removeWorker(machine.workerId);
+
+				expect(await listWorkerUpdateRunsForWorker(machine.workerId)).toEqual([]);
+				// The row itself survives, still saying which machine it was about.
+				expect((await getRunByIdFromDb(machine.runId))?.maintenanceMachine).toBe('worker-deleted');
+			});
+
+			it('answers nothing for a machine nobody has asked', async () => {
+				const { worker } = await seedWorker('never-asked');
+
+				expect(await listWorkerUpdateRunsForWorker(worker.id)).toEqual([]);
 			});
 		});
 

@@ -25,9 +25,9 @@
  * - `getDashboardWorkerDetail(workerId, projectScope)` — that same row for **one**
  *   worker (#477), widened with the full enrollment detail per visible project,
  *   with the two raw halves of the CLI axis (issue #783: the owner's
- *   `declaredCapabilities` and the daemon's `probedCapabilities`), and with the
- *   control plane's own build (issue #925), for the Workers screen's per-worker
- *   detail view.
+ *   `declaredCapabilities` and the daemon's `probedCapabilities`), with the
+ *   control plane's own build (issue #925), and with the machine's recent update
+ *   runs (issue #977), for the Workers screen's per-worker detail view.
  * - `listProjectDispatchCandidates(projectId)` — the same project scope in the
  *   shape the #130 dispatch gate judges (`src/worker/eligibility-gate.ts`):
  *   worker + enrollment + resolved availability, in the project's configured
@@ -69,7 +69,12 @@ import {
 	getWorkerDispatchClaimState,
 } from '../db/repositories/dispatchesRepository.js';
 import { findProjectRecordByIdFromDb } from '../db/repositories/projectsRepository.js';
-import { getRunByIdFromDb, isPipelineRun } from '../db/repositories/runsRepository.js';
+import {
+	getRunByIdFromDb,
+	isPipelineRun,
+	listWorkerUpdateRunsForWorker,
+	type WorkerUpdateRunRow,
+} from '../db/repositories/runsRepository.js';
 import { getUserById } from '../db/repositories/usersRepository.js';
 import {
 	createEnrollment,
@@ -624,6 +629,24 @@ export interface DashboardWorkerDetailView extends DashboardWorkerView {
 	 * installation: repeating it on N rows would say nothing the badge does not.
 	 */
 	controlPlaneBuild: WorkerBuild | null;
+	/**
+	 * This machine's recent update runs (issue #977), newest first and bounded by
+	 * `WORKER_UPDATE_HISTORY_LIMIT`; empty for a machine nobody has asked.
+	 *
+	 * Read from `runs`, so it is the durable record **every** request leaves — unlike
+	 * {@link DashboardWorkerView.update}, which the next request overwrites and which
+	 * names only the latest outcome. Here rather than on the roster row because it is
+	 * per-machine detail: N rows each carrying a history would be a read per row for a
+	 * fact nothing on the index shows.
+	 *
+	 * **Scoped exactly as `currentRun` is**: an entry whose project is outside a
+	 * restricted viewer's scope is withheld. An update run hangs off the machine's
+	 * *oldest* enrollment, so a viewer who reached this page through some other
+	 * enrollment they can access, but cannot access that one, sees no history rather
+	 * than a run they would be refused at `/runs/<id>` — one visibility rule on this
+	 * screen instead of two.
+	 */
+	updateHistory: WorkerUpdateRunRow[];
 	enrollments: DashboardWorkerEnrollmentDetail[];
 }
 
@@ -737,6 +760,7 @@ export async function getDashboardWorkerDetail(
 	// Spreading the *assembled view* (not a row) keeps the one place that names
 	// the safe worker fields — `assembleDashboardWorker` — as the only assembler.
 	const row = await assembleDashboardWorker(worker, visible, accessible, controlPlaneBuild);
+	const updateHistory = await listWorkerUpdateRunsForWorker(worker.id);
 	return {
 		...row,
 		ownerUserId: worker.ownerUserId,
@@ -749,6 +773,12 @@ export async function getDashboardWorkerDetail(
 		// alone — `undefined` (this process has no readable checkout) reads as `null`,
 		// the same "no answer" the verdict itself carries.
 		controlPlaneBuild: controlPlaneBuild ?? null,
+		// The machine's own update history (issue #977), withheld per entry for a
+		// project outside a restricted viewer's scope — the rule `resolveVisibleRun`
+		// already applies to the active job, so this screen keeps one of them.
+		updateHistory: accessible
+			? updateHistory.filter((entry) => accessible.has(entry.projectId))
+			: updateHistory,
 		enrollments: await Promise.all(visible.map(assembleEnrollmentDetail)),
 	};
 }

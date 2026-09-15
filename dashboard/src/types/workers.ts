@@ -61,6 +61,35 @@ export interface WorkerActiveRun {
 	prTitle: string | null;
 }
 
+/**
+ * One row of a machine's update history (`workers.getById`, issue #977, mirroring
+ * the service's `WorkerUpdateRunRow`) — one `runs` row of `kind = 'worker-update'`,
+ * which is what an update request has been recorded as since issue #971.
+ *
+ * Secret-free like everything else here: a build ref, a run status, two instants,
+ * and the machine's own operator-facing prose about a failure.
+ */
+export interface WorkerUpdateHistoryEntry {
+	/** The run this request was recorded as — the `/runs/<runId>` each entry links to. */
+	runId: string;
+	/** The run's project. An entry outside the viewer's scope is withheld server-side. */
+	projectId: string;
+	/** The build the machine was asked to move to; `null` only for a row that names none. */
+	target: string | null;
+	/**
+	 * The run's own lifecycle status, verbatim — `running`, `completed` or `failed`
+	 * for a worker-update run — so the outcome reads identically here and in `/runs`.
+	 */
+	status: string;
+	/** ISO 8601 — when the machine was asked (a worker-update run starts at the request). */
+	startedAt: string;
+	/** ISO 8601 — when the run settled; `null` while it is still running. */
+	completedAt: string | null;
+	durationMs: number | null;
+	/** The machine's own reason, for a `failed` entry; `null` for one that completed. */
+	error: string | null;
+}
+
 export interface WorkerRow {
 	workerId: string;
 	displayName: string;
@@ -218,6 +247,16 @@ export interface WorkerDetail extends Omit<WorkerRow, 'enrollments'> {
 	 * repeating it per roster row would say nothing the mark does not.
 	 */
 	controlPlaneBuild: { commit: string; dirty: boolean } | null;
+	/**
+	 * This machine's most recent update runs (issue #977), newest first and bounded
+	 * server-side; `[]` for a machine nobody has ever asked to update. Read from
+	 * `runs`, so it is the durable record of **every** request rather than the single
+	 * latest outcome `swarm workers list` reports.
+	 *
+	 * On the detail view alone, because it is per-machine detail: a history on every
+	 * roster row would be a read per row for a fact the index does not show.
+	 */
+	updateHistory: WorkerUpdateHistoryEntry[];
 	enrollments: WorkerDetailEnrollment[];
 }
 
