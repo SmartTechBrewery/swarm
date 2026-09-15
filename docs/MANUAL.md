@@ -264,7 +264,7 @@ swarm workers undrain <worker-id>        # back in the pool
 **Each request is a run, in the runs list** (issue #971). Asking a machine to move
 creates one run per machine asked, scoped to that machine's project, which starts,
 is visible in the project's Runs list while it is happening, and settles —
-`completed` for `applied`/`already-current`, `failed` for `declined`/`refused`/
+`completed` for `applied`/`adopted`/`already-current`, `failed` for `declined`/`refused`/
 `failed` carrying the machine's own reason, or `failed` after six hours for a machine
 that never answers (one that answers later corrects the row). So a failed update is
 diagnosable where every other failure is, and the history survives: the runs list is
@@ -380,25 +380,33 @@ the host's process supervisor (launchd `KeepAlive` / systemd `Restart=always`) s
 it again on the new build. That supervisor is a prerequisite: without one the machine
 simply stops. The request is refused while the machine is still in the pool, and with
 the opt-in flag off the machine reports `declined` and carries on working. `list`
-shows the outcome — `applied`, `already-current`, `declined`, `refused`, `failed` —
-and anything but `applied` leaves the machine working on the build it had, with the
-one exception `failed` carries: a step that failed *and* could not be rolled back
-leaves the install root on neither build, which the reported message says outright.
-Read that message before moving on — it names the step and, when the rollback failed
-too, is the signal to repair that install root by hand on the host. **A host whose
-SWARM install root is shared by several daemons may opt in (issue #935)**: the first
-daemon to act takes a machine-local lock on that root and does the fetch and build,
-the rest re-read the commit and report `already-current` once it has landed, and an
-update is refused before anything is checked out while a peer daemon there is
-mid-phase, naming the worker to drain. Drain every daemon on such a machine before
-updating it, and restart the peers afterwards — `already-current` says the files
-moved, not that the daemon reporting it is running them.
+shows the outcome — `applied`, `adopted`, `already-current`, `declined`, `refused`,
+`failed` — and anything but `applied` or `adopted` leaves the machine working on the
+build it had, with the one exception `failed` carries: a step that failed *and* could
+not be rolled back leaves the install root on neither build, which the reported message
+says outright. Read that message before moving on — it names the step and, when the
+rollback failed too, is the signal to repair that install root by hand on the host.
+**A host whose SWARM install root is shared by several daemons may opt in (issue
+#935)**, and since issue #973 asking it moves *every* daemon on it: the first to act
+takes a machine-local lock on that root and does the fetch and build, the rest wait for
+it to finish, then restart onto exactly what it landed and report `adopted` — so one
+machine fetches and builds once and nobody logs in afterwards. A waiting daemon adopts
+what the install root's own record says was *applied*, never merely that somebody held
+the lock: if the daemon it queued behind landed nothing — it refused, or its own fetch
+failed — the waiting one fetches and builds for itself rather than reporting a success
+the machine did not earn. An update is still
+refused, just before anything is checked out, while a peer daemon there is mid-phase,
+naming the worker to drain, so drain every daemon on such a machine before updating it.
+A daemon comes over on **its own** request: `swarm workers update <worker-id> <ref>`
+moves one, while `update --all`, `request-update` and the staged rollout ask every
+machine and are what bring a shared install root's daemons all the way over.
 
 An `applied` update that then cannot connect is recovered **by the machine**, not
 from here (issue #934): the build is only trusted once a daemon running it has
-handshaked once, so a machine that has started three times without once connecting
-— or that is rejected outright at the handshake — checks its last known good commit
-back out, rebuilds, and restarts on it. The start is counted before a line of the
+handshaked once, so a machine that has spent its whole failed-start budget without
+once connecting — three starts, plus one for each peer daemon that adopted the build,
+since those peers restart into it too — or that is rejected outright at the handshake,
+checks its last known good commit back out, rebuilds, and restarts on it. The start is counted before a line of the
 new build's own worker code is even loaded, so a build that dies on the way up —
 not only one that starts and then cannot connect — is counted and recovered too. It comes back reporting its *previous* build, which the
 Workers screen marks `OUTDATED` while `list` still reads `update <ref> applied`; that

@@ -264,19 +264,22 @@ describe('createWorkerUpdateHandler — restarting, or not', () => {
 		);
 	});
 
-	// A machine already on the requested build has nothing to restart into, and one
-	// that refused or failed is still running the code it was: in every case it keeps
-	// taking work.
+	// A daemon already *running* the requested build has nothing to restart into, and
+	// one that refused or failed is still running the code it was: in every case it
+	// keeps taking work. The first row carries the build that makes it so — without one
+	// the same outcome is `adopted`, which is the case below.
 	it.each([
 		[
 			'already-current',
 			{ status: 'already-current', commit: 'abc1234' } satisfies UpdateOutcome,
 			'already-current',
+			{ commit: 'abc1234', dirty: false },
 		],
 		[
 			'refused',
 			{ status: 'refused', reason: 'the install root has uncommitted changes' } as UpdateOutcome,
 			'refused',
+			undefined,
 		],
 		[
 			'failed',
@@ -289,9 +292,10 @@ describe('createWorkerUpdateHandler — restarting, or not', () => {
 				outputTail: 'TS2304: Cannot find name',
 			} satisfies UpdateOutcome,
 			'failed',
+			undefined,
 		],
-	])('reports %s and keeps the daemon running', async (_name, outcome, status) => {
-		const h = harness({ apply: vi.fn().mockResolvedValue(outcome) });
+	])('reports %s and keeps the daemon running', async (_name, outcome, status, build) => {
+		const h = harness({ apply: vi.fn().mockResolvedValue(outcome), build });
 
 		h.handle(UPDATE);
 		await settle();
@@ -299,6 +303,63 @@ describe('createWorkerUpdateHandler — restarting, or not', () => {
 		expect(h.reported()?.status).toBe(status);
 		expect(h.exit).not.toHaveBeenCalled();
 		expect(h.shutdown).not.toHaveBeenCalled();
+	});
+
+	/**
+	 * The peer path (issue #973). The mechanism answers about the install *root*, so
+	 * "the files are on the target" reaches this module as one value; only the build
+	 * this process started on says whether it is the daemon running them.
+	 */
+	describe('a build a peer on this machine fetched', () => {
+		const PEER_LANDED: UpdateOutcome = { status: 'already-current', commit: 'abc1234' };
+
+		it('restarts onto it, and reports it as adopted', async () => {
+			const h = harness({
+				apply: vi.fn().mockResolvedValue(PEER_LANDED),
+				build: { commit: 'def5678', dirty: false },
+			});
+
+			h.handle(UPDATE);
+			await settle();
+
+			expect(h.reported()).toMatchObject({ status: 'adopted', target: 'main' });
+			expect(h.reported()?.message).toContain('abc1234');
+			expect(h.shutdown).toHaveBeenCalledTimes(1);
+			expect(h.exit).toHaveBeenCalledWith(0);
+			// Reported before the process is ended, exactly as an apply is.
+			expect(h.report.mock.invocationCallOrder[0]).toBeLessThan(
+				h.exit.mock.invocationCallOrder[0] as number,
+			);
+		});
+
+		// Pinned to the commit alone: a dirty flag on a machine genuinely on the target
+		// would make it report `adopted`, come back on the same commit, and be read by the
+		// rollout as "came back still on the build it was asked to move off".
+		it('reports already-current when it is running that build, dirty or not', async () => {
+			for (const dirty of [false, true]) {
+				const h = harness({
+					apply: vi.fn().mockResolvedValue(PEER_LANDED),
+					build: { commit: 'abc1234', dirty },
+				});
+
+				h.handle(UPDATE);
+				await settle();
+
+				expect(h.reported()?.status).toBe('already-current');
+				expect(h.exit).not.toHaveBeenCalled();
+			}
+		});
+
+		// Biased to restarting: the failure this exists to fix is a daemon that did not.
+		it('restarts when it cannot identify its own build', async () => {
+			const h = harness({ apply: vi.fn().mockResolvedValue(PEER_LANDED), build: undefined });
+
+			h.handle(UPDATE);
+			await settle();
+
+			expect(h.reported()?.status).toBe('adopted');
+			expect(h.exit).toHaveBeenCalledWith(0);
+		});
 	});
 
 	it("carries the mechanism's own words, including a failed step's output tail", async () => {

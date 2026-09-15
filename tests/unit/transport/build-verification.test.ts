@@ -62,7 +62,10 @@ function statePath(home: string): string {
 }
 
 /** A state file for an install root that was updated `failedStarts` starts ago. */
-function writeState(home: string, pending: { failedStarts: number } | null): void {
+function writeState(
+	home: string,
+	pending: { failedStarts: number; adoptingPeers?: number } | null,
+): void {
 	mkdirSync(installUpdateStateDir(INSTALL_ROOT, home), { recursive: true });
 	writeFileSync(
 		statePath(home),
@@ -78,6 +81,7 @@ function writeState(home: string, pending: { failedStarts: number } | null): voi
 				commit: APPLIED,
 				previousCommit: GOOD,
 				failedStarts: pending.failedStarts,
+				adoptingPeers: pending.adoptingPeers ?? 0,
 				startedAt: '2026-02-01T00:00:00.000Z',
 			},
 		}),
@@ -221,6 +225,48 @@ describe('verifyStartupBuild', () => {
 		expect(options.shutdown.mock.invocationCallOrder[0]).toBeLessThan(
 			options.exit.mock.invocationCallOrder[0],
 		);
+	});
+
+	// The record is keyed on the install root, so on a shared one every peer's ordinary
+	// restart lands on the same counter (issue #973). Three daemons coming up healthily
+	// would otherwise spend a three-start budget between them and roll the machine back
+	// off a build that was working.
+	it('does not return the install root when the peers that adopted this build restart', async () => {
+		const home = makeHome();
+		// One applier plus three adopters: the applier's own restart is the first start,
+		// and each adopter contributes one more.
+		writeState(home, { failedStarts: 0, adoptingPeers: 3 });
+
+		for (let start = 1; start <= 4; start += 1) {
+			const options = harness(home);
+			expect(await verifyStartupBuild(options)).toBe(false);
+			expect(options.argv()).toEqual([]);
+			expect(options.exit).not.toHaveBeenCalled();
+			expect(readState(home).pendingVerification).toMatchObject({ failedStarts: start });
+		}
+	});
+
+	// The guarantee the budget exists for, unchanged: a machine's worth of adopters buys
+	// a start each and nothing more, so a build nothing can run is still abandoned.
+	it('still returns the install root once the whole budget is spent', async () => {
+		const home = makeHome();
+		writeState(home, { failedStarts: MAX_FAILED_STARTS + 2, adoptingPeers: 3 });
+		const options = harness(home);
+
+		expect(await verifyStartupBuild(options)).toBe(true);
+		expect(options.argv()).toEqual(RETURN_ARGV);
+		expect(options.exit).toHaveBeenCalledWith(0);
+	});
+
+	// Nobody adopted, so the budget is the constant it always was — one daemon failing
+	// three starts in a row returns the install root even while peers are running.
+	it('returns on the third failed start of a machine no peer adopted from', async () => {
+		const home = makeHome();
+		writeState(home, { failedStarts: MAX_FAILED_STARTS - 1, adoptingPeers: 0 });
+		const options = harness(home);
+
+		expect(await verifyStartupBuild(options)).toBe(true);
+		expect(options.argv()).toEqual(RETURN_ARGV);
 	});
 
 	it('honours a cap of its own', async () => {

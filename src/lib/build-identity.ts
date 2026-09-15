@@ -99,13 +99,23 @@ export type WorkerUpdateTarget = z.infer<typeof WorkerUpdateTargetSchema>;
  * What became of a requested update, in the one vocabulary the daemon reports in,
  * the `workers` row records, and the operator surfaces read (issue #933).
  *
- * The first four map onto `UpdateOutcome`'s members (`../worker/self-update.ts`),
+ * Four of the six map onto `UpdateOutcome`'s members (`../worker/self-update.ts`),
  * which is a plain union rather than a schema because nothing sent it anywhere; it
  * cannot be the source of truth *here* either, since that module reaches for
  * `node:fs` and `node:child_process` and this vocabulary has to be readable by the
- * control plane, the wire, and the database. `declined` is the fifth and is the
- * daemon's alone: the machine never opted in (`SWARM_WORKER_SELF_UPDATE`), so
- * nothing was attempted and nothing could have been.
+ * control plane, the wire, and the database. `declined` is the daemon's alone: the
+ * machine never opted in (`SWARM_WORKER_SELF_UPDATE`), so nothing was attempted and
+ * nothing could have been.
+ *
+ * `adopted` is the daemon's alone too, and for a subtler reason (issue #973). Two
+ * words here mean "this daemon is restarting": `applied` — it did the fetch and the
+ * build — and `adopted` — another daemon on the same machine did, and this one is
+ * restarting onto what that peer landed. The mechanism cannot tell them apart,
+ * because it answers about the *install root* and both readings sit on its one
+ * `already-current`; only the daemon can, by comparing that commit against the build
+ * it is itself running (`../transport/worker-update.ts`). So `adopted` maps onto no
+ * `UpdateOutcome` member by design, and `already-current` keeps its literal meaning:
+ * nothing moved and nothing restarted.
  *
  * It lives beside {@link WorkerUpdateTargetSchema} for the same reason that one
  * lives beside {@link WorkerBuildSchema}: one names the build a machine is asked
@@ -114,6 +124,7 @@ export type WorkerUpdateTarget = z.infer<typeof WorkerUpdateTargetSchema>;
  */
 export const WORKER_UPDATE_STATUSES = [
 	'applied',
+	'adopted',
 	'already-current',
 	'refused',
 	'failed',

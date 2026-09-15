@@ -1913,6 +1913,10 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 		describe('settleWorkerUpdateRun', () => {
 			it.each([
 				['applied', 'completed'],
+				// A peer on the same machine did the fetch and this daemon restarted onto what
+				// it landed (issue #973): the machine this run names ends up on the build it
+				// was asked for, which is the same success.
+				['adopted', 'completed'],
 				['already-current', 'completed'],
 			] as const)('completes the run for a reported %s', async (reported, expected) => {
 				const { runId } = await seedUpdateRun(`settle-${reported}`);

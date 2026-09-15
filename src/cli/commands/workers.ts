@@ -247,11 +247,13 @@ Usage:
              arriving into that wait. The machine acts only if its host opted in
              with SWARM_WORKER_SELF_UPDATE=true. On a host where several daemons
              share one SWARM install root, the first to act does the fetch and
-             build and the rest report already-current; an update is refused
-             outright while a peer daemon there is mid-phase, naming the worker
-             to drain. Every
-             outcome — applied, already-current, declined, refused, failed — is
-             reported back and shown by 'list'; anything but 'applied' leaves the
+             build and the rest wait for it, then restart onto what it landed and
+             report adopted — so one machine fetches once and every daemon asked
+             ends up on the new build. An update is refused while a peer daemon
+             there is mid-phase, naming the worker to drain. Every
+             outcome — applied, adopted, already-current, declined, refused,
+             failed — is reported back and shown by 'list'; 'applied' and
+             'adopted' both restart the daemon, and anything else leaves the
              machine working on the build it has. Each request also appears in the
              project's RUNS LIST as a run of its own, which starts, is visible while
              it happens, and settles — so a failed update is diagnosable where every
