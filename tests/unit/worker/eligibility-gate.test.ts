@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AgentTarget } from '@/config/schema.js';
+import type { AgentCli } from '@/harness/agent-cli.js';
 import type { ResolvedAssignee } from '@/identity/assignee-resolver.js';
 import type { SwarmUser } from '@/identity/schema.js';
 import { DEFAULT_WORKER_SUPPORTED_PHASES, type Worker } from '@/identity/worker.js';
@@ -63,6 +64,8 @@ function makeCandidate(
 		enrollment?: Partial<WorkerEnrollment>;
 		connected?: boolean;
 		activeRuns?: number;
+		/** Live CLI cool-downs (issue #981) — empty unless a case is about one. */
+		rateLimitedClis?: ReadonlyMap<AgentCli, Date>;
 	} = {},
 ): WorkerDispatchCandidate {
 	return {
@@ -108,6 +111,9 @@ function makeCandidate(
 			connected: overrides.connected ?? true,
 			activeRuns: overrides.activeRuns ?? 0,
 		},
+		// Cooling on nothing (issue #981), which is what every case that says nothing
+		// about a usage limit assumes.
+		rateLimitedClis: overrides.rateLimitedClis ?? new Map(),
 	};
 }
 
@@ -183,6 +189,10 @@ describe('isAvailabilityRefusal', () => {
 		'worker-unavailable',
 		'assignee-worker-unavailable',
 		'preserved-worker-unavailable',
+		// Issue #981: the record carries the instant its limit is expected back and
+		// lapses there by itself, so time alone really does clear this — unlike
+		// `worker-draining` below, which a human reverses.
+		'cli-rate-limited',
 	];
 	/** Nothing a connecting machine can change — a human must act. */
 	const AUTHORIZATION: readonly DispatchIneligibilityReason[] = [
@@ -856,6 +866,169 @@ describe('evaluateDispatchEligibility', () => {
 			const decision = await evaluateDispatchEligibility(gateInput());
 
 			expect(decision).toMatchObject({ status: 'ineligible', reason: 'worker-unavailable' });
+		});
+	});
+
+	// Issue #981. A machine whose CLI reported a usage limit on a real run is given no
+	// more work on *that* CLI until the recorded instant — and keeps taking work on its
+	// others. These pin the gate's half of that; the record itself is written from the
+	// control-plane settle and expires by construction.
+	describe('a CLI cool-down (issue #981)', () => {
+		const RESET_AT = new Date('2026-09-15T14:20:00Z');
+		const LATER = new Date('2026-09-15T18:00:00Z');
+
+		/** Criterion 1: the pair is not selected again until the expiry passes. */
+		it('refuses the only machine while it is cooling on the target’s CLI', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-1', { rateLimitedClis: new Map([['claude', RESET_AT]]) }),
+			]);
+
+			const decision = await evaluateDispatchEligibility(
+				gateInput({ targets: [{ cli: 'claude' }] }),
+			);
+
+			expect(decision).toMatchObject({ status: 'ineligible', reason: 'cli-rate-limited' });
+			if (decision.status !== 'ineligible') throw new Error('unreachable');
+			// The CLI and the instant work resumes — the difference between "something is
+			// wrong" and "this runs again at 14:20".
+			expect(decision.message).toContain('claude');
+			expect(decision.message).toContain(RESET_AT.toISOString());
+			// Time alone clears it, so the deferral records the self-clearing wait.
+			expect(isAvailabilityRefusal(decision.reason)).toBe(true);
+		});
+
+		/** Criterion 2, at gate level: worker order is a preference, not a filter. */
+		it('selects a healthy machine below the cooling one in the worker order', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-cooling', {
+					capabilities: ['claude', 'codex'],
+					rateLimitedClis: new Map([['claude', RESET_AT]]),
+				}),
+				makeCandidate('w-healthy'),
+			]);
+
+			expect(
+				await evaluateDispatchEligibility(gateInput({ targets: [{ cli: 'claude' }] })),
+			).toMatchObject({ status: 'selected', selection: { workerId: 'w-healthy' } });
+		});
+
+		/** Criterion 3: fall through to the next target whose CLI somebody can still serve. */
+		it('falls to the next configured target when every machine is cooling on the preferred CLI', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-1', {
+					capabilities: ['claude', 'codex'],
+					rateLimitedClis: new Map([['claude', RESET_AT]]),
+				}),
+				makeCandidate('w-2', {
+					capabilities: ['claude', 'codex'],
+					rateLimitedClis: new Map([['claude', LATER]]),
+				}),
+			]);
+
+			expect(
+				await evaluateDispatchEligibility(
+					gateInput({ targets: [{ cli: 'claude' }, { cli: 'codex' }] }),
+				),
+			).toMatchObject({
+				status: 'selected',
+				selection: { workerId: 'w-1', targetIndex: 1, cli: 'codex', skippedClis: ['claude'] },
+			});
+		});
+
+		/** Criterion 4: no target serveable at all defers on the token-free path. */
+		it('refuses when every machine is cooling on every configured target’s CLI', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-1', {
+					capabilities: ['claude', 'codex'],
+					rateLimitedClis: new Map([
+						['claude', LATER],
+						['codex', RESET_AT],
+					]),
+				}),
+			]);
+
+			const decision = await evaluateDispatchEligibility(
+				gateInput({ targets: [{ cli: 'claude' }, { cli: 'codex' }] }),
+			);
+
+			expect(decision).toMatchObject({ status: 'ineligible', reason: 'cli-rate-limited' });
+			if (decision.status !== 'ineligible') throw new Error('unreachable');
+			// The *soonest* expiry, because the first record to lapse is the first
+			// re-check that can select somebody.
+			expect(decision.message).toContain(RESET_AT.toISOString());
+			expect(decision.message).not.toContain(LATER.toISOString());
+		});
+
+		// A cool-down is the nearest miss of every structural reason — the predicate
+		// judges it last — so it outranks one in the aggregate.
+		it('aggregates above a structural refusal from another machine', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-unenrolled', { enrollment: { status: 'suspended' } }),
+				makeCandidate('w-cooling', { rateLimitedClis: new Map([['claude', RESET_AT]]) }),
+			]);
+
+			expect(await evaluateDispatchEligibility(gateInput())).toMatchObject({
+				status: 'ineligible',
+				reason: 'cli-rate-limited',
+			});
+		});
+
+		// …but not above `worker-unavailable`: a busy machine frees up without any
+		// allowance having to refill, which stays the best news available.
+		it('still reports worker-unavailable while another machine is merely busy', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-cooling', { rateLimitedClis: new Map([['claude', RESET_AT]]) }),
+				makeCandidate('w-busy', { activeRuns: 1 }),
+			]);
+
+			expect(await evaluateDispatchEligibility(gateInput())).toMatchObject({
+				status: 'ineligible',
+				reason: 'worker-unavailable',
+			});
+		});
+
+		// The same constraint in pool-demand reconstruction (issue #533): a cooling
+		// machine is not an option a contender has, so it must not be counted as one.
+		it('does not count a cooling machine among a contender’s eligible workers', async () => {
+			// This Planning dispatch runs on claude and either machine can serve it. The
+			// Review contender runs on codex, and `w-b` is cooling on codex — so `w-a` is
+			// the only machine Review can use, and Planning must step aside onto `w-b`.
+			// Counted as one of Review's options, `w-b` makes Review look like it has an
+			// alternative it does not have, and Planning keeps `w-a` instead.
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-a', { capabilities: ['claude', 'codex'] }),
+				makeCandidate('w-b', {
+					capabilities: ['claude', 'codex'],
+					rateLimitedClis: new Map([['codex', RESET_AT]]),
+				}),
+			]);
+			const loadPoolDemands = vi.fn(async () => [
+				{
+					dispatchId: 'd-planning',
+					phase: 'planning' as const,
+					targets: [{ cli: 'claude' as const }],
+					phaseDefaultCli: 'claude' as const,
+					repository: REPOSITORY,
+				},
+				{
+					dispatchId: 'd-review',
+					phase: 'review' as const,
+					targets: [{ cli: 'codex' as const }],
+					phaseDefaultCli: 'codex' as const,
+					repository: REPOSITORY,
+				},
+			]);
+
+			expect(
+				await evaluateDispatchEligibility(
+					gateInput({
+						dispatchId: 'd-planning',
+						phase: 'planning',
+						targets: [{ cli: 'claude' }],
+					}),
+					{ loadPoolDemands },
+				),
+			).toMatchObject({ status: 'selected', selection: { workerId: 'w-b' } });
 		});
 	});
 

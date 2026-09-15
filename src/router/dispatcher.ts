@@ -43,6 +43,7 @@
 import { Worker } from 'bullmq';
 import { listAllProjectsFromDb } from '../db/repositories/projectsRepository.js';
 import { failStaleRunningRuns, updateRunJobPayload } from '../db/repositories/runsRepository.js';
+import { recordWorkerCliRateLimit } from '../db/repositories/workerCliRateLimitsRepository.js';
 import {
 	BASE_BRANCH_HEALTH_SWEEP_INTERVAL_MS,
 	sweepBaseBranchHealth,
@@ -99,6 +100,7 @@ import {
 	RETRY_BUFFER_MS,
 	reportInterruptedJobToBoard,
 	resolveAgentTimeoutMs,
+	retryDelayForFailure,
 } from '../worker/consumer.js';
 import type { DispatchSelection } from '../worker/eligibility-gate.js';
 import type { WorkerExecutionIdentity } from '../worker/execution-identity.js';
@@ -296,6 +298,69 @@ function reportedRetryHint(
 		return { retryAfter: new Date(Date.now() + result.retryDelayMs - RETRY_BUFFER_MS), resetHint };
 	}
 	return { resetHint };
+}
+
+/**
+ * Record an observed rate limit against the machine that reported it (issue #981),
+ * so the federated eligibility gate stops selecting that `(worker, CLI)` pair until
+ * the limit is expected back.
+ *
+ * This is the one place SWARM learns the fact. Since issue #553 there is no
+ * in-process executor, so every phase runs on a connected worker and every
+ * `rate-limit` deferral arrives here as a terminal frame with both the selected
+ * worker and the CLI it ran on in hand — the DB-free daemon could not write the
+ * record if it wanted to, and the pure result adapter below must not, since it is
+ * unit-tested as a pure adapter.
+ *
+ * The expiry is `retryDelayForFailure`'s own answer for this failure rather than a
+ * number of its own, which is what makes the three properties that matter
+ * structural: the record lapses at exactly the instant the deferred retry is
+ * scheduled for, a missing or unparseable reset degrades to the shared default
+ * backoff rather than to "forever", and `MAX_RETRY_DELAY_MS` caps a mis-parsed one
+ * so no sequence of observations can hold a machine back indefinitely.
+ *
+ * Best-effort and fully swallowed, like `tryCompleteDispatch`: bookkeeping must
+ * never fail a settle. A lost record costs one avoidable bounce, not a dropped job.
+ */
+export async function recordReportedRateLimit(
+	result: TaskExecutionResult,
+	selection: DispatchSelection,
+): Promise<void> {
+	if (result.status !== 'deferred') return;
+	// The same defaulted reading {@link adaptResultToPhaseRun} applies to the very
+	// same frame, so the record can never disagree about the kind with the retry the
+	// settle schedules moments later.
+	const kind = (result.failureKind ?? 'rate-limit') as AgentFailureKind;
+	if (kind !== 'rate-limit') return;
+
+	const now = Date.now();
+	const failure: AgentFailure = { kind: 'rate-limit', ...reportedRetryHint(result, 'rate-limit') };
+	const expiresAt = new Date(now + retryDelayForFailure(failure, now));
+	try {
+		await recordWorkerCliRateLimit({
+			workerId: selection.workerId,
+			cli: selection.cli,
+			expiresAt,
+			observedAt: new Date(now),
+			resetHint: failure.resetHint,
+		});
+		// The operator's whole trace until the Workers screen renders these (task 2/2).
+		logger.info('Recorded a reported CLI rate limit against the worker that hit it', {
+			dispatchId: result.dispatchId,
+			workerId: selection.workerId,
+			worker: selection.workerName,
+			cli: selection.cli,
+			expiresAt: expiresAt.toISOString(),
+			resetHint: failure.resetHint,
+		});
+	} catch (err) {
+		logger.error('Failed to record a reported CLI rate limit (dispatch settles regardless)', {
+			dispatchId: result.dispatchId,
+			workerId: selection.workerId,
+			cli: selection.cli,
+			error: describeError(err),
+		});
+	}
 }
 
 /**
@@ -731,6 +796,9 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 			dispatch.id,
 			awaiting.interruptions,
 		);
+		// Learn the machine's spent allowance before the settle re-routes anything
+		// (issue #981). Best-effort, so the adapter below runs either way.
+		await recordReportedRateLimit(result, selection);
 		return adaptResultToPhaseRun(
 			result,
 			selection,

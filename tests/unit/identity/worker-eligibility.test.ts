@@ -67,6 +67,8 @@ function makeInput(overrides: Partial<WorkerEligibilityInput> = {}): WorkerEligi
 		phaseDefaultCli: 'claude',
 		phase: 'implementation',
 		repository: TASK_REPOSITORY,
+		// Cooling on nothing (issue #981) — the regression bar for every other case.
+		rateLimitedClis: new Map(),
 		...overrides,
 	};
 }
@@ -76,7 +78,7 @@ function evaluate(overrides: Partial<WorkerEligibilityInput> = {}): EligibilityR
 }
 
 describe('IneligibilityReasonSchema', () => {
-	it('covers exactly the eight predicate reasons, in check order', () => {
+	it('covers exactly the nine predicate reasons, in check order', () => {
 		expect(INELIGIBILITY_REASONS).toEqual([
 			'missing-enrollment',
 			'missing-consent',
@@ -86,6 +88,7 @@ describe('IneligibilityReasonSchema', () => {
 			'missing-phase-capability',
 			'phase-not-permitted',
 			'missing-cli-capability',
+			'cli-rate-limited',
 		]);
 	});
 
@@ -372,6 +375,59 @@ describe('evaluateWorkerEligibility', () => {
 				eligible: false,
 				reason: 'missing-cli-capability',
 			});
+		});
+	});
+
+	// Issue #981: a usage limit this machine's own CLI reported on a real run, held as
+	// the instant it is expected back. The map the caller passes holds *live* records
+	// only, so the predicate never compares instants.
+	describe('cli-rate-limited (issue #981)', () => {
+		const RESET_AT = new Date('2026-01-01T14:20:00Z');
+
+		it("refuses a target on a CLI the machine's allowance is spent on", () => {
+			expect(
+				evaluate({
+					target: { cli: 'claude' },
+					rateLimitedClis: new Map([['claude', RESET_AT]]),
+				}),
+			).toEqual({ eligible: false, reason: 'cli-rate-limited' });
+		});
+
+		// The whole point of keying the record on the pair rather than on the machine.
+		it('still allows the same machine a target on one of its other CLIs', () => {
+			expect(
+				evaluate({
+					target: { cli: 'codex' },
+					rateLimitedClis: new Map([['claude', RESET_AT]]),
+				}),
+			).toEqual({ eligible: true });
+		});
+
+		it("resolves a target with no cli through the phase's default before the lookup", () => {
+			expect(
+				evaluate({
+					target: { model: 'sonnet' },
+					phaseDefaultCli: 'codex',
+					rateLimitedClis: new Map([['codex', RESET_AT]]),
+				}),
+			).toEqual({ eligible: false, reason: 'cli-rate-limited' });
+		});
+
+		// The order the two checks read in: a machine that lacks the CLI reports the
+		// more fundamental reason, so a stale record for a CLI it no longer declares
+		// cannot dress a capability problem up as a wait.
+		it('reports missing-cli-capability first for a CLI the worker does not declare', () => {
+			expect(
+				evaluate({
+					worker: makeWorker({ capabilities: ['claude'] }),
+					target: { cli: 'codex' },
+					rateLimitedClis: new Map([['codex', RESET_AT]]),
+				}),
+			).toEqual({ eligible: false, reason: 'missing-cli-capability' });
+		});
+
+		it('changes nothing when the machine is cooling on nothing', () => {
+			expect(evaluate({ rateLimitedClis: new Map() })).toEqual({ eligible: true });
 		});
 	});
 

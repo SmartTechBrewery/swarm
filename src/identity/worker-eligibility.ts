@@ -11,7 +11,8 @@
  * active sharing consent → draining (issue #919) → connection/health → free
  * capacity → the repository the machine's checkout is (issue #714) → declared
  * phase support (issue #467) → the enrollment's own allowed phases (issue #509) →
- * declared CLI capability. The first missing signal wins, so a caller always gets
+ * declared CLI capability → that CLI's own cool-down (issue #981). The first
+ * missing signal wins, so a caller always gets
  * *the* reason to show rather than a set to prioritize itself. The first two
  * checks together are exactly `isRoutable` (`./worker-enrollment.ts`, #337's named seam); they are
  * evaluated separately only so a revoked consent is reported as `missing-consent`
@@ -91,6 +92,15 @@ import { permitsPhase, type WorkerEnrollment } from './worker-enrollment.js';
  * - `missing-cli-capability` — the candidate target's effective CLI is not among
  *   the worker's declared capabilities, or the enrollment does not allow it on
  *   this project.
+ * - `cli-rate-limited` — this machine's own CLI reported a usage limit on a real
+ *   run, recorded per `(worker, CLI)` with the instant it is expected back (issue
+ *   #981), and that instant has not passed. Distinct from `missing-cli-capability`
+ *   because the machine *has* the CLI and *is* allowed it — only its allowance is
+ *   spent — and distinct from `worker-unavailable` because freeing a slot or
+ *   reconnecting restores no quota. It is judged last because it is the narrowest
+ *   statement of the set: everything above it is true of the pairing regardless of
+ *   what any run observed. The record releases itself at the recorded instant, so
+ *   this is the one structural-looking reason that really is only a wait.
  *
  * The scheduler-only `assignee-worker-unavailable` value is deliberately **not**
  * here: it is a verdict about *the assignee's whole set of workers* (ADR-001's
@@ -106,6 +116,7 @@ export const IneligibilityReasonSchema = z.enum([
 	'missing-phase-capability',
 	'phase-not-permitted',
 	'missing-cli-capability',
+	'cli-rate-limited',
 ]);
 
 export type IneligibilityReason = z.infer<typeof IneligibilityReasonSchema>;
@@ -174,6 +185,19 @@ export interface WorkerEligibilityInput {
 	 * every call site name its phase.
 	 */
 	phase: TriggerPhase;
+	/**
+	 * The CLIs this worker is currently cooling down on, each mapped to the instant
+	 * its limit is expected back (issue #981) — resolved by the caller from the
+	 * `(worker, CLI)` cool-down records, exactly as {@link WorkerAvailability} is, so
+	 * this module stays pure and holds no notion of "now". A lapsed record is simply
+	 * absent from the map, so the predicate never compares instants itself.
+	 *
+	 * Required rather than optional, for the same reason `repository` and `phase`
+	 * are: an optional field is one a call site can silently forget, which would
+	 * reopen the very hole this closes. An empty map is the ordinary case and means
+	 * "this machine is cooling on nothing".
+	 */
+	rateLimitedClis: ReadonlyMap<AgentCli, Date>;
 }
 
 /**
@@ -188,8 +212,8 @@ export function resolveTargetCli(target: AgentTarget, phaseDefaultCli: AgentCli)
 /**
  * Judge one worker against one candidate target, returning the first missing
  * signal in ADR-001's order (enrollment → consent → draining → connection →
- * capacity → repository → phase capability → phase permission → CLI capability).
- * Pure: it reads only what it is given.
+ * capacity → repository → phase capability → phase permission → CLI capability →
+ * CLI cool-down). Pure: it reads only what it is given.
  */
 export function evaluateWorkerEligibility(input: WorkerEligibilityInput): EligibilityResult {
 	const { worker, enrollment, availability, target, phaseDefaultCli, phase, repository } = input;
@@ -250,6 +274,15 @@ export function evaluateWorkerEligibility(input: WorkerEligibilityInput): Eligib
 	// capabilities, so a project may narrow what an otherwise capable worker runs).
 	if (!worker.capabilities.includes(cli) || !enrollment.allowedClis.includes(cli)) {
 		return { eligible: false, reason: 'missing-cli-capability' };
+	}
+	// The machine has the CLI and is allowed it — but its own allowance on that CLI
+	// is spent until the recorded instant (issue #981). Judged immediately *after*
+	// the capability check so the two read in the right order: a machine that lacks
+	// the CLI reports the more fundamental reason, and a cool-down is only meaningful
+	// for a CLI the pairing could otherwise have run. The map holds live records
+	// only, so membership alone is the verdict.
+	if (input.rateLimitedClis.has(cli)) {
+		return { eligible: false, reason: 'cli-rate-limited' };
 	}
 	return { eligible: true };
 }
