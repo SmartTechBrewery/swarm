@@ -285,6 +285,9 @@ function WorkersSearchBox({
  * where `main` would land the machine on whatever was on it at apply time. A
  * control plane that cannot read its own build therefore has nothing to offer, so
  * the button is `disabled` and its title says so rather than falling back to a ref.
+ * That read is on the roster's polling cadence, so the commit the action names is
+ * the one the live control plane is running now and not the one it was running
+ * when the page was opened.
  *
  * It calls `requestUpdateForInstallation` rather than `startFleetUpdate`: that one
  * is **owner-scoped** (`listWorkersForOwner`), so it cannot serve a button labelled
@@ -330,7 +333,17 @@ function UpdateAllWorkersButton() {
 	// One value for the whole installation, so it is its own query rather than a
 	// roster row field: `workers.list` answers with a bare array, and repeating the
 	// comparand on every row would say nothing the `Outdated` mark does not.
-	const buildQuery = useQuery(trpc.workers.controlPlaneBuild.queryOptions());
+	//
+	// On the roster's own cadence, because the control plane resolves this from the
+	// process it is running in: redeploy it and a page left open would otherwise
+	// keep offering — and name — the build it read at mount, rolling every machine
+	// onto a commit the live server has already moved off. The one-machine button
+	// reads the same value off `workers.getById`, which polls at this interval too, so
+	// both surfaces answer with the same build at the same age.
+	const buildQuery = useQuery({
+		...trpc.workers.controlPlaneBuild.queryOptions(),
+		refetchInterval: WORKERS_REFETCH_MS,
+	});
 	const target = buildQuery.data?.build?.commit ?? null;
 
 	return (

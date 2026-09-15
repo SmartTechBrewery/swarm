@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import type { ReactElement } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { WORKERS_REFETCH_MS } from '@/lib/workers-refresh.js';
 import type { WorkerRow } from '@/types/workers.js';
 
 const {
@@ -82,6 +83,9 @@ import { WorkersRoster } from './workers-roster.js';
  * invents.
  */
 const CONTROL_PLANE_COMMIT = 'abc1234def5678901234567890123456789abcde';
+
+/** What that same control plane answers with after it is redeployed. */
+const REDEPLOYED_COMMIT = 'f00ba12345678901234567890123456789abcdef';
 
 function makeWorker(overrides: Partial<WorkerRow> = {}): WorkerRow {
 	return {
@@ -518,6 +522,54 @@ describe('WorkersRoster update actions', () => {
 			}),
 		);
 		expect(requestUpdateForInstallationMutate).toHaveBeenCalledTimes(1);
+	});
+
+	it('asks for the build the control plane is running now, not the one it was running at mount', async () => {
+		// The control plane resolves this from its own process, so a redeploy moves it
+		// under an open page; rolling the installation onto the commit that page read at
+		// mount would put every machine on a build the live server has left behind.
+		controlPlaneBuildQueryFn
+			.mockResolvedValueOnce({ build: { commit: CONTROL_PLANE_COMMIT, dirty: false } })
+			.mockResolvedValue({ build: { commit: REDEPLOYED_COMMIT, dirty: false } });
+		requestUpdateForInstallationMutate.mockResolvedValue({
+			...installationReport(),
+			target: REDEPLOYED_COMMIT,
+		});
+		asInstanceAdmin();
+		workersListQueryFn.mockResolvedValue([makeWorker()]);
+
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+		try {
+			renderRoster(<WorkersRoster />);
+			// `vi.waitFor` throughout: only vitest's own advances its fake timers.
+			await vi.waitFor(() => {
+				const button = screen.getByRole('button', FLEET_BUTTON) as HTMLButtonElement;
+				expect(button.disabled).toBe(false);
+				expect(button.title).toContain(CONTROL_PLANE_COMMIT.slice(0, 7));
+			});
+
+			await act(async () => {
+				await vi.advanceTimersByTimeAsync(WORKERS_REFETCH_MS + 100);
+			});
+
+			// The title — the promise the operator reads before clicking — moved with it.
+			await vi.waitFor(() =>
+				expect((screen.getByRole('button', FLEET_BUTTON) as HTMLButtonElement).title).toContain(
+					REDEPLOYED_COMMIT.slice(0, 7),
+				),
+			);
+			fireEvent.click(screen.getByRole('button', FLEET_BUTTON));
+			await vi.waitFor(() => expect(screen.getByText(REDEPLOYED_COMMIT.slice(0, 7))).toBeDefined());
+			fireEvent.click(screen.getByRole('button', { name: 'Ask them to update' }));
+
+			await vi.waitFor(() =>
+				expect(requestUpdateForInstallationMutate).toHaveBeenCalledWith({
+					target: REDEPLOYED_COMMIT,
+				}),
+			);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it('renders the per-machine report the request answers with', async () => {
