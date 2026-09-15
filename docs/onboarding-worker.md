@@ -598,6 +598,17 @@ the machine stays out of the pool until you have read what it reported. The stag
 `--all` form does not relax that precondition, it *satisfies* it — it drains each
 machine itself before asking it, and undrains the ones that came back cleanly.
 
+**Why an enrollment is required (issue #971).** A request is also recorded as a
+**run**, in the runs list of the project the machine is enrolled in — so an update
+starts, is visible while it happens, settles, and stays readable afterwards, like any
+other run. That run needs a project to hang off, so a machine enrolled in **no**
+project cannot be updated this way: `swarm workers update` refuses it and writes
+nothing, the installation-wide form reports it `no-project`, and a staged rollout
+skips it. `swarm workers enroll <worker-id> <project-id>` first. A machine that
+somehow holds several enrollments uses its oldest, deterministically — the run is a
+record of what happened to the machine, not a routing decision, so a `pending` or
+`suspended` enrollment names its project just as an `active` one does.
+
 **A host that runs several daemons from one SWARM checkout is supported (issue
 #935).** The install root is the SWARM checkout a daemon's *own code* is loaded from,
 which is not `SWARM_WORKER_REPO_ROOT` — that is the project checkout it works in — and
@@ -688,7 +699,8 @@ administrator's cooperation:
   any time, with nothing to ask anybody.
 - **Draining is still strictly the owner's** (issue #919) and is *not* widened by
   this command. It asks only machines already out of the dispatch pool, so a machine
-  its owner has not drained comes back `in-pool` and untouched. An administrator
+  its owner has not drained comes back `in-pool` and untouched, and one enrolled in no
+  project comes back `no-project`. An administrator
   therefore cannot take the installation's capacity down with this, and cannot move a
   machine whose owner has not made it askable in the first place.
 

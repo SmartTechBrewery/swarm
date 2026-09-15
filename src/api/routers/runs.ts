@@ -19,11 +19,15 @@ import {
 	getRunByIdFromDb,
 	getRunLogsFromDb,
 	getRunOutputEvents,
+	isPipelineRun,
 	isRetryPendingStatus,
 	type ListRunsFilter,
 	listRunsFromDb,
 	listTaskActivitySince,
+	type PipelineRunRow,
+	type RunRow,
 	recordRunCleanupBlocked,
+	WORKER_UPDATE_RUN_PHASE,
 } from '../../db/repositories/runsRepository.js';
 import {
 	listStalledDismissals,
@@ -329,6 +333,9 @@ function partitionQueuedRuns(items: QueuedRun[]): QueuedRunsPage {
 // router declares its own filter enums — keeping Zod the source of truth for the
 // API boundary and rejecting garbage filter values before they reach the DB.
 const RunStatusEnum = z.enum(['running', 'completed', 'failed', 'deferred', 'checkpointed']);
+// `WORKER_UPDATE_RUN_PHASE` sits beside the six `TriggerPhase`s (issue #971) so the
+// list's existing phase filter can isolate maintenance runs; `kind`, not this, is
+// what tells the two apart for anything that reasons about them.
 const RunPhaseEnum = z.enum([
 	'planning',
 	'implementation',
@@ -336,6 +343,7 @@ const RunPhaseEnum = z.enum([
 	'respond-to-review',
 	'respond-to-ci',
 	'resolve-conflicts',
+	WORKER_UPDATE_RUN_PHASE,
 ]);
 
 const ListRunsInputSchema = z.object({
@@ -351,13 +359,16 @@ function wakeJobId(dispatch: { id: string; wakeSeq: number }): string {
 }
 
 /**
- * How each reset refusal (`src/dispatch/run-reset.ts`) surfaces over tRPC. Only
- * two exist since issue #744 — nothing to reset, and a reset already under way —
- * because no other state may leave a run un-reset.
+ * How each reset refusal (`src/dispatch/run-reset.ts`) surfaces over tRPC. Two
+ * come from issue #744 — nothing to reset, and a reset already under way — because
+ * no other *pipeline* state may leave a run un-reset; the third is the maintenance
+ * run this procedure has already refused above (issue #971), carried here so the
+ * service's own refusal maps if it is ever reached another way.
  */
 const RESET_REFUSAL_CODES: Record<RunResetRefusal, TRPCError['code']> = {
 	'run-not-found': 'NOT_FOUND',
 	'already-resetting': 'CONFLICT',
+	'not-pipeline-work': 'PRECONDITION_FAILED',
 };
 
 /** How each force refusal (`src/dispatch/force-re-review.ts`) surfaces over tRPC. */
@@ -491,6 +502,31 @@ export interface RunAttribution {
  * A failed lookup degrades to null names rather than throwing — a deleted worker
  * or user must not turn the run detail page into an error.
  */
+/**
+ * Narrow a run to pipeline work, refusing a maintenance run in the operator's own
+ * words (issue #971).
+ *
+ * An **assertion signature**, not a returning one: a function that merely *returns*
+ * a `PipelineRunRow` does not narrow the caller's own `run` variable, so the
+ * mutations below would still see `string | null` where they pass `run.taskId` into
+ * a dispatch. Called at the top of each mutation that drives a
+ * phase-against-a-worktree, so the refusal is the *same* refusal in four places and
+ * the rest of each one compiles unchanged.
+ *
+ * `getById`, `getLogs`, `getOutput` and `list` are deliberately left alone: reading
+ * a maintenance run is the whole point of recording it.
+ */
+function requirePipelineRun(run: RunRow, runId: string): asserts run is PipelineRunRow {
+	if (isPipelineRun(run)) return;
+	throw new TRPCError({
+		code: 'PRECONDITION_FAILED',
+		message:
+			`Run "${runId}" is machine maintenance, not pipeline work, so it cannot be retried, ` +
+			`reset, or terminated from here. Ask the machine again with ` +
+			`\`swarm workers update <worker-id> <ref>\`.`,
+	});
+}
+
 async function resolveRunAttribution(run: {
 	workerId: string | null;
 	workerUserId: string | null;
@@ -1082,6 +1118,7 @@ export const runsRouter = router({
 				'member',
 				`Run with ID "${input.runId}" not found`,
 			);
+			requirePipelineRun(run, input.runId);
 			if (run.status !== 'deferred' && run.status !== 'failed' && run.status !== 'checkpointed') {
 				throw new TRPCError({
 					code: 'PRECONDITION_FAILED',
@@ -1261,6 +1298,8 @@ export const runsRouter = router({
 				`Run with ID "${input.runId}" not found`,
 			);
 
+			requirePipelineRun(run, input.runId);
+
 			// Already terminal — nothing to terminate; report its settled state so a
 			// second click (or a run that finished as we clicked) is a no-op, not an
 			// error. Only `running`/`deferred` runs are actionable.
@@ -1366,6 +1405,8 @@ export const runsRouter = router({
 				`Run with ID "${input.runId}" not found`,
 			);
 
+			requirePipelineRun(run, input.runId);
+
 			try {
 				return await resetRun(input.runId);
 			} catch (error) {
@@ -1414,6 +1455,8 @@ export const runsRouter = router({
 				'member',
 				`Run with ID "${input.runId}" not found`,
 			);
+
+			requirePipelineRun(run, input.runId);
 
 			try {
 				return await forceReReview(input.runId);

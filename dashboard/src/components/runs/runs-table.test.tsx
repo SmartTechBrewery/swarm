@@ -30,6 +30,9 @@ import { RunsTable } from './runs-table.js';
 const baseRun: RunRow = {
 	id: 'run-1',
 	projectId: 'proj-a',
+	kind: 'pipeline',
+	maintenanceTarget: null,
+	maintenanceRequestId: null,
 	repository: 'acme/widgets',
 	taskId: '42',
 	workItemId: 'issue-42',
@@ -416,6 +419,64 @@ describe('RunsTable', () => {
 			const card = screen.getByTestId('run-card');
 			expect(within(card).getByText('Deferred')).not.toBeNull();
 			expect(within(card).queryByText(/Timed out/)).toBeNull();
+		});
+	});
+
+	// Issue #971 — a worker-update run has no work item and no PR to reference, so the
+	// Task cell reads as the build it is moving its machine to. The machine itself is
+	// the worker-name line the Phase cell already carries beside it.
+	describe('a maintenance run', () => {
+		const maintenanceRun: RunRow = {
+			...baseRun,
+			id: 'run-mx',
+			kind: 'worker-update',
+			phase: 'worker-update',
+			repository: null,
+			taskId: null,
+			workItemId: null,
+			workItemTitle: null,
+			workItemUrl: null,
+			maintenanceTarget: 'main',
+			maintenanceRequestId: '11111111-1111-4111-8111-111111111111',
+			workerId: 'worker-a',
+			workerName: 'studio-mac',
+		};
+
+		it('references the build it is moving to, and links to no PR or issue', () => {
+			const { container } = renderTable(
+				<RunsTable
+					runs={[maintenanceRun]}
+					totalCount={1}
+					currentPage={1}
+					pageSize={25}
+					onPageChange={vi.fn()}
+				/>,
+			);
+
+			const table = container.querySelector('table') as HTMLElement;
+			const row = within(table).getAllByRole('row')[1];
+			expect(within(row as HTMLElement).getByText('→ main')).not.toBeNull();
+			// No provider link at all: it names no pull request and no board card.
+			expect((row as HTMLElement).querySelectorAll('a')).toHaveLength(0);
+			expect((row as HTMLElement).textContent).not.toContain('Issue:');
+		});
+
+		it('still names the machine, which is the other half of what it says', () => {
+			const { container } = renderTable(
+				<RunsTable
+					runs={[maintenanceRun]}
+					totalCount={1}
+					currentPage={1}
+					pageSize={25}
+					onPageChange={vi.fn()}
+				/>,
+			);
+
+			const table = container.querySelector('table') as HTMLElement;
+			const phaseCell = within(table).getAllByRole('row')[1].querySelectorAll('td')[0];
+			expect(within(phaseCell as HTMLElement).getByTestId('run-worker-name').textContent).toBe(
+				'studio-mac',
+			);
 		});
 	});
 

@@ -60,6 +60,7 @@ import {
 	getLatestRunForTask,
 	getRunByIdFromDb,
 	hasCompletedRunForTask,
+	isPipelineRun,
 	isRetryPendingStatus,
 	type RunStatus,
 	recordRunPreservedWorker,
@@ -3162,7 +3163,12 @@ async function resolveCompletedNoTriggerOutcome(
 		// The phase check is what stops a Respond-to-review / Respond-to-CI
 		// continuation for the *same* PR+head from adopting the Review's verdict —
 		// the ledger slot exists for that head too, but it is not their record.
-		if (!run || run.phase !== 'review' || run.prNumber !== prNumber) return undefined;
+		// `isPipelineRun` (issue #971) beside the phase check: a maintenance run carries
+		// no task id for the outcome below to name, and the phase check already excludes
+		// it — this is what makes that a fact the compiler knows.
+		if (!run || !isPipelineRun(run) || run.phase !== 'review' || run.prNumber !== prNumber) {
+			return undefined;
+		}
 		// `project` is already scoped to the job's repository (`repositoryForJob`),
 		// so this is the same `(repo, PR, head)` triple the dedup key in
 		// {@link settleNoTriggerDelivery} is built from — two repositories of one

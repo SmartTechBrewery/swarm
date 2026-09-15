@@ -314,6 +314,43 @@ describe('advanceRollout — taking a wave', () => {
 		expect(view?.members.map((member) => member.state)).toEqual(['signalled', 'draining']);
 	});
 
+	// Issue #971 — a machine enrolled in no project settles rather than waits. Unlike
+	// `in-pool`, which `reassertDrain` makes all but unreachable and which is therefore
+	// left to be re-asked, nothing about advancing the rollout would ever change this
+	// answer, so a waiting member would hold the wave open forever.
+	it('settles a member enrolled in no project as skipped, and completes', async () => {
+		givenRollout(makeRollout(), [makeMember(WORKER_A, 0)]);
+		givenWorkers(makeWorker(WORKER_A));
+		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry(WORKER_A, 'no-project', null)]);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0]).toMatchObject({
+			state: 'skipped',
+			message: 'the machine is enrolled in no project',
+		});
+		expect(view?.members[0].settledAt).toBeInstanceOf(Date);
+		// The rollout drained it and is not going to move it, so it goes back in the pool.
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_A, false);
+		expect(view?.rollout.status).toBe('completed');
+	});
+
+	// It settles well, not badly: a machine that cannot be recorded against a project is
+	// not a bad build, so it must not halt the rollout for everybody else.
+	it('does not halt the rollout for a member enrolled in no project', async () => {
+		givenRollout(makeRollout({ waveSize: 2 }), [makeMember(WORKER_A, 0), makeMember(WORKER_B, 1)]);
+		givenWorkers(makeWorker(WORKER_A), makeWorker(WORKER_B));
+		fanOutWorkerUpdate.mockResolvedValue([
+			fanoutEntry(WORKER_A, 'no-project', null),
+			fanoutEntry(WORKER_B, 'requested'),
+		]);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.rollout.status).toBe('in_progress');
+		expect(view?.members.map((member) => member.state)).toEqual(['skipped', 'signalled']);
+	});
+
 	// The rollout borrows a drain; it does not create one it will later undo.
 	it('records that it drained a machine only when that machine was in the pool', async () => {
 		givenRollout(makeRollout({ waveSize: 2 }), [makeMember(WORKER_A, 0), makeMember(WORKER_B, 1)]);

@@ -224,6 +224,9 @@ function makeRun(overrides: Partial<RunRow> = {}): RunRow {
 	return {
 		id: 'run-1',
 		projectId: 'p1',
+		maintenanceTarget: null,
+		maintenanceRequestId: null,
+		kind: 'pipeline',
 		repository: 'SmartTechBrewery/swarm',
 		taskId: '103',
 		workItemId: null,
@@ -2419,6 +2422,67 @@ describe('runsRouter', () => {
 	});
 
 	// issue #880 — the operator's forced age-out of one stalled liveness unit.
+	// Issue #971 — an update is a run, and the acceptance criterion is that nothing
+	// reasoning about a phase-against-a-worktree treats it as one. These four mutations
+	// are that boundary at the API: reading it is the whole point, driving it is not.
+	describe('a maintenance run (issue #971)', () => {
+		const maintenanceRun = () =>
+			makeRun({
+				id: 'run-mx',
+				kind: 'worker-update',
+				phase: 'worker-update',
+				status: 'running',
+				repository: null,
+				taskId: null,
+				maintenanceRequestId: '11111111-1111-4111-8111-111111111111',
+				maintenanceTarget: 'main',
+			});
+
+		it.each([
+			['retryNow', () => caller.retryNow({ runId: 'run-mx' })],
+			['terminate', () => caller.terminate({ runId: 'run-mx' })],
+			['reset', () => caller.reset({ runId: 'run-mx' })],
+			['forceReReview', () => caller.forceReReview({ runId: 'run-mx' })],
+		] as const)('refuses %s with PRECONDITION_FAILED', async (_name, invoke) => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(maintenanceRun());
+
+			await expect(invoke()).rejects.toMatchObject({
+				code: 'PRECONDITION_FAILED',
+				message: expect.stringContaining('machine maintenance'),
+			});
+			// Refused before anything is driven: no dispatch, no cancellation marker, no
+			// service call.
+			expect(createAndPublishDispatch).not.toHaveBeenCalled();
+			expect(requestRunCancellation).not.toHaveBeenCalled();
+			expect(resetRun).not.toHaveBeenCalled();
+			expect(forceReReview).not.toHaveBeenCalled();
+		});
+
+		it('is returned by getById, because reading it is the point', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(maintenanceRun());
+
+			const run = await caller.getById({ id: 'run-mx' });
+
+			expect(run).toMatchObject({
+				id: 'run-mx',
+				kind: 'worker-update',
+				maintenanceTarget: 'main',
+				repository: null,
+				taskId: null,
+			});
+		});
+
+		it('is listed, and can be isolated by its phase', async () => {
+			vi.mocked(listRunsFromDb).mockResolvedValue({ data: [maintenanceRun()], total: 1 });
+
+			const page = await caller.list({ phase: 'worker-update' });
+
+			expect(page.data.map((row) => row.id)).toEqual(['run-mx']);
+			expect(listRunsFromDb).toHaveBeenCalledWith(
+				expect.objectContaining({ phase: 'worker-update' }),
+			);
+		});
+	});
 	describe('dismissStalled', () => {
 		const DISMISSAL = {
 			projectId: 'p1',

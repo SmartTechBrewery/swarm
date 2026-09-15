@@ -807,6 +807,19 @@ export const workersRouter = router({
 						`\`swarm workers drain ${input.workerId}\` first, then request the update.`,
 				});
 			}
+			// The boundary that comes with recording an update as a run (issue #971): the
+			// run is scoped to the machine's own project, so a machine enrolled in none has
+			// nothing for it to hang off and nothing was written.
+			if (result.outcome === 'no-project') {
+				throw new TRPCError({
+					code: 'PRECONDITION_FAILED',
+					message:
+						`Worker '${result.worker.displayName}' is enrolled in no project, so an update for ` +
+						`it has no project to be recorded against and nothing was requested. Enroll the ` +
+						`machine in a project first (\`swarm workers enroll ${input.workerId} <project-id>\`), ` +
+						`then request the update.`,
+				});
+			}
 			const updated = result.worker;
 			// After the durable write, and never awaited for correctness: the request lives
 			// on the row, so a router that misses this notification pushes it the moment the

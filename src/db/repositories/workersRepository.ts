@@ -45,6 +45,11 @@ import type { TriggerPhase } from '../../triggers/types.js';
 import { getDb } from '../client.js';
 import { workerProjectEnrollments } from '../schema/workerProjectEnrollments.js';
 import { workers } from '../schema/workers.js';
+import {
+	createWorkerUpdateRun,
+	settleWorkerUpdateRun,
+	supersedeWorkerUpdateRun,
+} from './runsRepository.js';
 
 type WorkerRow = typeof workers.$inferSelect;
 
@@ -494,18 +499,23 @@ export async function setWorkerDraining(
 }
 
 /**
- * What became of a {@link requestWorkerUpdate} write. Three outcomes rather than a
- * `Worker | undefined`, because the draining precondition is now part of the write
+ * What became of a {@link requestWorkerUpdate} write. Four outcomes rather than a
+ * `Worker | undefined`, because the draining precondition is part of the write
  * itself (issue #921) and "declined" has to be tellable from "no such machine":
  *
- * - `requested` — the row now carries the request, and `worker` is it.
+ * - `requested` — the row now carries the request, and `worker` is it. `runId` is the
+ *   `runs` row that records the update (issue #971).
  * - `in-pool` — the machine was not draining, so nothing was written; `worker` is the
  *   row as it stands, for the refusal the caller words.
+ * - `no-project` — the machine is enrolled in no project (issue #971), so there is no
+ *   project for its run to hang off and nothing was written; `worker` is the row, for
+ *   the refusal the caller words.
  * - `not-found` — no worker has that id.
  */
 export type WorkerUpdateRequestOutcome =
-	| { outcome: 'requested'; worker: Worker }
+	| { outcome: 'requested'; worker: Worker; runId: string }
 	| { outcome: 'in-pool'; worker: Worker }
+	| { outcome: 'no-project'; worker: Worker }
 	| { outcome: 'not-found' };
 
 /**
@@ -539,6 +549,20 @@ export type WorkerUpdateRequestOutcome =
  *
  * The follow-up read on the declined path is not part of the guarantee — the
  * predicate already is — and only decides which refusal the caller gets to name.
+ *
+ * **Transactional since issue #971**, because the request now also creates the
+ * `runs` row that makes the update visible: the two must exist or not exist
+ * together, since a recorded request with no run is the invisibility that issue
+ * exists to remove, and a run with no request is a row nothing will ever settle.
+ *
+ * The machine's **project** is resolved first, from its oldest enrollment — the
+ * order {@link listEnrollmentsForWorker} already reads in, and deliberately not
+ * filtered by enrollment status: the run is a *record* of what happened to a
+ * machine, not a routing decision, so a `pending` or `suspended` enrollment still
+ * names the project the machine belongs to. A machine enrolled in **no** project is
+ * answered `no-project` and nothing at all is written; that boundary is decided
+ * before the row write, in the same statement-order as the draining predicate, so
+ * this can never record a request it cannot record a run for.
  */
 export async function requestWorkerUpdate(
 	id: string,
@@ -546,22 +570,52 @@ export async function requestWorkerUpdate(
 	target: string,
 	requestedByUserId: string,
 ): Promise<WorkerUpdateRequestOutcome> {
-	const [updatedRow] = await getDb()
-		.update(workers)
-		.set({
-			updateRequestId: requestId,
-			updateTarget: target,
-			updateRequestedAt: new Date(),
-			updateRequestedByUserId: requestedByUserId,
-			updateStatus: null,
-			updateMessage: null,
-			updateReportedAt: null,
-		})
-		.where(and(eq(workers.id, id), isNotNull(workers.drainingSince)))
-		.returning();
-	if (updatedRow) return { outcome: 'requested', worker: rowToWorker(updatedRow) };
-	const existing = await getWorkerById(id);
-	return existing ? { outcome: 'in-pool', worker: existing } : { outcome: 'not-found' };
+	return await getDb().transaction(async (tx) => {
+		const [enrollment] = await tx
+			.select({ projectId: workerProjectEnrollments.projectId })
+			.from(workerProjectEnrollments)
+			.where(eq(workerProjectEnrollments.workerId, id))
+			.orderBy(asc(workerProjectEnrollments.createdAt), asc(workerProjectEnrollments.id))
+			.limit(1);
+		if (!enrollment) {
+			const existing = await getWorkerById(id);
+			return existing ? { outcome: 'no-project', worker: existing } : { outcome: 'not-found' };
+		}
+
+		const [updatedRow] = await tx
+			.update(workers)
+			.set({
+				updateRequestId: requestId,
+				updateTarget: target,
+				updateRequestedAt: new Date(),
+				updateRequestedByUserId: requestedByUserId,
+				updateStatus: null,
+				updateMessage: null,
+				updateReportedAt: null,
+			})
+			.where(and(eq(workers.id, id), isNotNull(workers.drainingSince)))
+			.returning();
+		if (!updatedRow) {
+			const existing = await getWorkerById(id);
+			return existing ? { outcome: 'in-pool', worker: existing } : { outcome: 'not-found' };
+		}
+
+		// Re-targeting overwrites the row's one request, so the run the previous request
+		// created is settled here rather than left `running` with nothing coming to close
+		// it — its own report will answer `recorded: false`.
+		await supersedeWorkerUpdateRun(id, target, tx);
+		const runId = await createWorkerUpdateRun(
+			{
+				projectId: enrollment.projectId,
+				workerId: id,
+				workerUserId: updatedRow.ownerUserId,
+				requestId,
+				target,
+			},
+			tx,
+		);
+		return { outcome: 'requested', worker: rowToWorker(updatedRow), runId };
+	});
 }
 
 /**
@@ -578,6 +632,13 @@ export async function requestWorkerUpdate(
  *
  * `update_target` is deliberately left standing: it is the build this outcome is
  * about, and an outcome naming none answers nothing.
+ *
+ * **Transactional since issue #971**, because the report also settles the `runs` row
+ * the request created — and it does so **unconditionally**, not gated on the
+ * `workers` write above matching. A report whose request the row has moved on from
+ * still answers *that request's* run, which is the row the operator is looking at;
+ * this mirrors the choice `handleReportWorkerUpdate` already makes for
+ * `advanceWorkerRollout` — the outcome is written either way.
  */
 export async function recordWorkerUpdateReport(
 	id: string,
@@ -585,17 +646,20 @@ export async function recordWorkerUpdateReport(
 	status: WorkerUpdateStatus,
 	message: string,
 ): Promise<Worker | undefined> {
-	const [updatedRow] = await getDb()
-		.update(workers)
-		.set({
-			updateRequestId: null,
-			updateStatus: status,
-			updateMessage: message,
-			updateReportedAt: new Date(),
-		})
-		.where(and(eq(workers.id, id), eq(workers.updateRequestId, requestId)))
-		.returning();
-	return updatedRow ? rowToWorker(updatedRow) : undefined;
+	return await getDb().transaction(async (tx) => {
+		const [updatedRow] = await tx
+			.update(workers)
+			.set({
+				updateRequestId: null,
+				updateStatus: status,
+				updateMessage: message,
+				updateReportedAt: new Date(),
+			})
+			.where(and(eq(workers.id, id), eq(workers.updateRequestId, requestId)))
+			.returning();
+		await settleWorkerUpdateRun(requestId, status, message, tx);
+		return updatedRow ? rowToWorker(updatedRow) : undefined;
+	});
 }
 
 /**

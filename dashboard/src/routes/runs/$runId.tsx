@@ -1825,9 +1825,20 @@ interface GitHubReferencesProps {
 }
 
 export function GitHubReferences({ run }: GitHubReferencesProps) {
-	const hasWorkItem = !!run.workItemId;
+	const hasWorkItem = !!run.workItemId && !!run.taskId;
 	const hasPR = !!run.prNumber;
 	const workItemRef = parseWorkItemRef(run.workItemUrl);
+
+	// A maintenance run references neither a pull request nor a board card (issue
+	// #971) — the build it is moving its machine to is what it has to say, and the
+	// machine itself is the Execution Environment cell below.
+	if (run.maintenanceTarget) {
+		return (
+			<span className="text-zinc-300 font-mono">
+				Moving this machine to <span className="text-zinc-100">{run.maintenanceTarget}</span>
+			</span>
+		);
+	}
 
 	if (!hasWorkItem && !hasPR && !run.producedPrUrl) {
 		return <span className="text-zinc-500 font-mono">—</span>;
@@ -2011,9 +2022,18 @@ function RunOverview({ run, project }: RunOverviewProps) {
 						</span>
 					</div>
 
+					{/*
+					 * A maintenance run names no task (issue #971): it acts on no repository
+					 * and provisions no worktree, so the field states the build it is moving
+					 * its machine to instead of rendering blank.
+					 */}
 					<div>
-						<span className="block text-xs font-medium text-zinc-400">Task ID</span>
-						<span className="text-sm text-zinc-200 mt-1 block font-mono">{run.taskId}</span>
+						<span className="block text-xs font-medium text-zinc-400">
+							{run.taskId ? 'Task ID' : 'Target build'}
+						</span>
+						<span className="text-sm text-zinc-200 mt-1 block font-mono">
+							{run.taskId ?? run.maintenanceTarget ?? '—'}
+						</span>
 					</div>
 
 					<div>

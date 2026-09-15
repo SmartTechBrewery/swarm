@@ -175,13 +175,36 @@ describe('db schema', () => {
 			expect(names).toContain('idx_runs_started_at');
 		});
 
-		it('requires the repository the run acted on (issue #683)', () => {
-			// NOT NULL rather than nullable-for-back-compat: migration 0047 backfills
-			// every existing row from its project before adding the constraint, which is
-			// total because `project_id` is NOT NULL with an FK and `projects.repo` is
-			// NOT NULL. Unlike `projects.scm_type`, "no repository" is not a state.
+		it('leaves the pipeline coordinates nullable for a maintenance run (issue #971)', () => {
+			// They were NOT NULL from issue #683 until a run stopped always being pipeline
+			// work: a `worker-update` run acts on no repository and provisions no worktree,
+			// and the nullability is what makes the type-checker — rather than each
+			// reader's memory — keep one out of every phase-against-a-worktree path.
 			expect(columns.get('repository')?.getSQLType()).toBe('text');
-			expect(columns.get('repository')?.notNull).toBe(true);
+			expect(columns.get('repository')?.notNull).toBe(false);
+			expect(columns.get('task_id')?.getSQLType()).toBe('text');
+			expect(columns.get('task_id')?.notNull).toBe(false);
+		});
+
+		it('discriminates its kind, defaulting to pipeline (issue #971)', () => {
+			// The default is load-bearing: every row written before the column existed is
+			// pipeline work, so nothing is backfilled and an unstated kind means verbatim
+			// the pre-existing behaviour.
+			expect(columns.get('kind')?.getSQLType()).toBe('text');
+			expect(columns.get('kind')?.notNull).toBe(true);
+			expect(columns.get('kind')?.default).toBe('pipeline');
+		});
+
+		it('carries a maintenance run’s request id and target, uniquely (issue #971)', () => {
+			expect(columns.get('maintenance_request_id')?.getSQLType()).toBe('uuid');
+			expect(columns.get('maintenance_request_id')?.notNull).toBe(false);
+			expect(columns.get('maintenance_target')?.getSQLType()).toBe('text');
+			expect(columns.get('maintenance_target')?.notNull).toBe(false);
+			// Partial and unique: a request id names at most one run, which is what lets the
+			// settle key on it alone, while a pipeline row's NULL is not constrained at all.
+			const index = table.indexes.find((i) => i.config.name === 'idx_runs_maintenance_request');
+			expect(index?.config.unique).toBe(true);
+			expect(index?.config.where).toBeDefined();
 		});
 
 		it('carries a nullable review safety-cap slot and automation outcome (issue #235)', () => {

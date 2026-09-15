@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('@/db/repositories/runsRepository.js', () => ({
+// `isPipelineRun` is a pure predicate over the row's own columns (issue #971), so
+// the real one is kept: stubbing it would let the service and the repository
+// disagree about what counts as pipeline work.
+vi.mock('@/db/repositories/runsRepository.js', async (importOriginal) => ({
+	...(await importOriginal<typeof import('@/db/repositories/runsRepository.js')>()),
 	getRunByIdFromDb: vi.fn(),
 	clearRunRecovery: vi.fn(),
 	failRunFromStatus: vi.fn(),
@@ -97,6 +101,9 @@ function makeRun(overrides: Partial<RunRow> = {}): RunRow {
 	return {
 		id: 'run-1',
 		projectId: 'p1',
+		maintenanceTarget: null,
+		maintenanceRequestId: null,
+		kind: 'pipeline',
 		repository: 'SmartTechBrewery/swarm',
 		taskId: '424',
 		workItemId: null,
@@ -380,6 +387,29 @@ describe('resetRun', () => {
 		await expect(resetRun('missing')).rejects.toThrowError(
 			expect.objectContaining({ reason: 'run-not-found' }),
 		);
+		expect(cancelDispatchAndWake).not.toHaveBeenCalled();
+		expect(clearRunCancellation).not.toHaveBeenCalled();
+	});
+
+	// Issue #971 — and not merely defensive: this service settles a run that cannot
+	// produce a dispatch *terminally* rather than refusing it, so without the refusal a
+	// reset would fail a live worker-update run — a machine genuinely mid-restart.
+	it('refuses a maintenance run rather than settling it terminally', async () => {
+		vi.mocked(getRunByIdFromDb).mockResolvedValue(
+			makeRun({
+				kind: 'worker-update',
+				phase: 'worker-update',
+				status: 'running',
+				repository: null,
+				taskId: null,
+				jobPayload: null,
+			}),
+		);
+
+		await expect(resetRun('run-1')).rejects.toThrowError(
+			expect.objectContaining({ reason: 'not-pipeline-work' }),
+		);
+		expect(failRunFromStatus).not.toHaveBeenCalled();
 		expect(cancelDispatchAndWake).not.toHaveBeenCalled();
 		expect(clearRunCancellation).not.toHaveBeenCalled();
 	});

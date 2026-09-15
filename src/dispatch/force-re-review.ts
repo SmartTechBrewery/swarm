@@ -69,7 +69,7 @@ import {
 	grantReviewCapOverride,
 	isCapReachingRequestChanges,
 } from '../db/repositories/reviewVerdictsRepository.js';
-import { getRunByIdFromDb } from '../db/repositories/runsRepository.js';
+import { getRunByIdFromDb, isPipelineRun } from '../db/repositories/runsRepository.js';
 import { requireProjectSCMProvider } from '../integrations/scm/registry.js';
 import { logger } from '../lib/logger.js';
 import { normalizeStoredJobPayload, type SwarmJob } from '../queue/jobs.js';
@@ -238,7 +238,14 @@ export async function forceReReview(runId: string): Promise<ForceReReviewResult>
 	// The exact state the run-detail view renders as "Manual action required" —
 	// the only state a forced continuation makes sense from. Anything else either
 	// never stopped (so nothing needs forcing) or is not a Review run at all.
+	//
+	// `isPipelineRun` (issue #971) is stated here rather than left to ride on the
+	// `missing-coordinates` refusal below: a maintenance run does trip that one, but
+	// only through `prNumber`/`workItemId`, whereas `run.repository` is consumed by
+	// the project read further down — so this is the site that has to decide, and a
+	// machine-maintenance run is exactly "not a Review run at all".
 	if (
+		!isPipelineRun(run) ||
 		run.status !== 'completed' ||
 		run.phase !== 'review' ||
 		run.reviewVerdict !== 'request-changes' ||

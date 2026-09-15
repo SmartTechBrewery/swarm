@@ -105,6 +105,8 @@ import {
 	failRunFromStatus,
 	getRunByIdFromDb,
 	hasLiveRunForTask,
+	isPipelineRun,
+	type PipelineRunRow,
 	updateRunJobPayload,
 } from '../db/repositories/runsRepository.js';
 import { describeError } from '../lib/errors.js';
@@ -144,13 +146,19 @@ export type ResetAgentStop = 'not-running' | 'stopped' | 'timed-out';
 
 /**
  * Why a reset was refused, machine-readable so each surface maps it to its own
- * error shape. Only two survive (issue #744), and neither leaves a run un-reset:
+ * error shape. Two survive from issue #744, and neither leaves a run un-reset:
  * there is nothing to reset, or a reset *is* already happening. Every former
  * refusal that could strand a wedged run — a live `running` row, a dispatch a
  * worker claimed first, a checkout teardown that threw, a missing payload, a
  * deleted project — is now an outcome instead.
+ *
+ * `not-pipeline-work` (issue #971) is the third, and it is not merely defensive:
+ * this service documents that a run which cannot produce a dispatch is settled
+ * *terminally* rather than refused, so without it a reset would fail a live
+ * worker-update run — a machine genuinely mid-restart — on the strength of a
+ * payload it was never meant to carry.
  */
-export type RunResetRefusal = 'run-not-found' | 'already-resetting';
+export type RunResetRefusal = 'run-not-found' | 'already-resetting' | 'not-pipeline-work';
 
 /** A refused reset. Its `message` is already operator-facing; surfaces re-use it verbatim. */
 export class RunResetError extends Error {
@@ -417,8 +425,12 @@ async function createReplacementDispatch(
 	}
 }
 
-/** The run row a reset works from, named so the steps below can take it verbatim. */
-type ResetTargetRun = NonNullable<Awaited<ReturnType<typeof getRunByIdFromDb>>>;
+/**
+ * The run row a reset works from, named so the steps below can take it verbatim.
+ * Pipeline work by construction: {@link resetRun} refuses a maintenance run before
+ * it reaches any of them (issue #971).
+ */
+type ResetTargetRun = PipelineRunRow;
 
 /**
  * Every step of a reset after its run row has been read. It reports into
@@ -556,6 +568,16 @@ export async function resetRun(runId: string): Promise<ResetRunResult> {
 	const run = await getRunByIdFromDb(runId);
 	if (!run) {
 		throw new RunResetError('run-not-found', `Run with ID "${runId}" not found`);
+	}
+	// Refused before anything is recorded, and before the terminal-settle path below
+	// could reach it (issue #971): a maintenance run holds no checkout to discard and
+	// no phase to re-dispatch, so there is nothing a reset could restart it as.
+	if (!isPipelineRun(run)) {
+		throw new RunResetError(
+			'not-pipeline-work',
+			`Run with ID "${runId}" is machine maintenance, not pipeline work, so there is no ` +
+				`phase to reset. Ask the machine again with \`swarm workers update <worker-id> <ref>\`.`,
+		);
 	}
 
 	const progress: ResetRunSteps = {

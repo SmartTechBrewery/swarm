@@ -1,6 +1,7 @@
-import { eq } from 'drizzle-orm';
+import { and, desc, eq } from 'drizzle-orm';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { getDb } from '../../../src/db/client.js';
+import { deleteProjectFromDb } from '../../../src/db/repositories/projectsRepository.js';
 import { createUser } from '../../../src/db/repositories/usersRepository.js';
 import {
 	createEnrollment,
@@ -25,6 +26,7 @@ import {
 	updateWorkerSupportedPhases,
 	type WorkerUpdateRequestOutcome,
 } from '../../../src/db/repositories/workersRepository.js';
+import { runs } from '../../../src/db/schema/runs.js';
 import { users } from '../../../src/db/schema/users.js';
 import { workerProjectEnrollments } from '../../../src/db/schema/workerProjectEnrollments.js';
 import type { AgentCli } from '../../../src/harness/agent-cli.js';
@@ -476,7 +478,15 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 			return result.worker;
 		}
 
-		/** A registered machine, drained — the only state the request write accepts. */
+		/** The project every machine below is enrolled in — what its update run hangs off. */
+		const UPDATE_PROJECT_ID = 'proj-worker-update';
+
+		/**
+		 * A registered machine, drained **and enrolled** — the only state the request
+		 * write accepts. The enrollment is the second half since issue #971: the request
+		 * also creates a `runs` row scoped to the machine's project, so a machine holding
+		 * none is refused before anything is written.
+		 */
 		async function freshWorker(name: string): Promise<string> {
 			const created = await createWorker({
 				ownerUserId: adaId,
@@ -484,9 +494,31 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 				capabilities: ['claude'],
 				credentialHash: `hash-${name}`,
 			});
+			await createEnrollment({
+				workerId: created.id,
+				projectId: UPDATE_PROJECT_ID,
+				status: 'active',
+				allowedClis: ['claude'],
+				allowedPhases: [...ALL_TRIGGER_PHASES],
+				concurrencyAllocation: 1,
+				sharingConsent: true,
+			});
 			await setWorkerDraining(created.id, true);
 			return created.id;
 		}
+
+		/** The `worker-update` run rows this machine has, newest first. */
+		async function updateRunsFor(workerId: string) {
+			return await getDb()
+				.select()
+				.from(runs)
+				.where(and(eq(runs.workerId, workerId), eq(runs.kind, 'worker-update')))
+				.orderBy(desc(runs.startedAt));
+		}
+
+		beforeEach(async () => {
+			await seedProject({ id: UPDATE_PROJECT_ID, repo: 'jkwiecien/worker-update' });
+		});
 
 		it('leaves a newly registered worker with no request and no outcome', async () => {
 			const id = await freshWorker('ada-no-update');
@@ -520,11 +552,22 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 				capabilities: ['claude'],
 				credentialHash: 'hash-ada-in-pool',
 			});
+			// Enrolled, so the refusal under test is the draining one and not issue #971's.
+			await createEnrollment({
+				workerId: created.id,
+				projectId: UPDATE_PROJECT_ID,
+				status: 'active',
+				allowedClis: ['claude'],
+				allowedPhases: [...ALL_TRIGGER_PHASES],
+				concurrencyAllocation: 1,
+				sharingConsent: true,
+			});
 
 			const result = await requestWorkerUpdate(created.id, REQUEST_ID, 'main', adaId);
 
 			expect(result.outcome).toBe('in-pool');
 			expect((await getWorkerById(created.id))?.update).toBeNull();
+			expect(await updateRunsFor(created.id)).toHaveLength(0);
 		});
 
 		// The race the predicate closes: drained, read as eligible, then returned to the
@@ -675,6 +718,118 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 			await updateWorkerCapabilities(id, ['claude'], [...ALL_TRIGGER_PHASES], 'acme/api');
 
 			expect((await getWorkerById(id))?.update).toEqual(requested.update);
+		});
+
+		// Issue #971 — the request and its run are one transaction, so only a real
+		// database settles that the row lands beside the request, scoped to the machine's
+		// own project and naming the machine and the build.
+		describe('the run it records (issue #971)', () => {
+			it('creates one running run for the machine, naming its project and target', async () => {
+				const id = await freshWorker('ada-run');
+
+				const result = await requestWorkerUpdate(id, REQUEST_ID, 'main', adaId);
+
+				if (result.outcome !== 'requested') throw new Error(`got '${result.outcome}'`);
+				const [run] = await updateRunsFor(id);
+				expect(run.id).toBe(result.runId);
+				expect(run).toMatchObject({
+					kind: 'worker-update',
+					phase: 'worker-update',
+					status: 'running',
+					projectId: UPDATE_PROJECT_ID,
+					workerId: id,
+					workerUserId: adaId,
+					maintenanceRequestId: REQUEST_ID,
+					maintenanceTarget: 'main',
+				});
+				// None of the pipeline coordinates: it acts on no repository, provisions no
+				// worktree, and has no session to resume.
+				expect(run.repository).toBeNull();
+				expect(run.taskId).toBeNull();
+				expect(run.agentSessionId).toBeNull();
+				expect(run.jobPayload).toBeNull();
+				expect(run.workItemId).toBeNull();
+				expect(run.prNumber).toBeNull();
+			});
+
+			// Without this the previous request's run would stay `running` forever: its own
+			// report answers `recorded: false` and never closes it.
+			it('settles the previous run as superseded when the machine is re-targeted', async () => {
+				const id = await freshWorker('ada-run-retarget');
+				await requestWorkerUpdate(id, REQUEST_ID, 'main', adaId);
+
+				await requestWorkerUpdate(id, OTHER_REQUEST_ID, 'v2', adaId);
+
+				const rows = await updateRunsFor(id);
+				expect(rows).toHaveLength(2);
+				const byRequest = Object.fromEntries(rows.map((row) => [row.maintenanceRequestId, row]));
+				expect(byRequest[REQUEST_ID]).toMatchObject({ status: 'failed' });
+				expect(byRequest[REQUEST_ID].error).toContain('Superseded');
+				expect(byRequest[OTHER_REQUEST_ID]).toMatchObject({ status: 'running' });
+			});
+
+			it('settles the run the report names, keeping the machine and the build on it', async () => {
+				const id = await freshWorker('ada-run-report');
+				await requestWorkerUpdate(id, REQUEST_ID, 'main', adaId);
+
+				await recordWorkerUpdateReport(id, REQUEST_ID, 'applied', 'Applied.');
+
+				const [run] = await updateRunsFor(id);
+				expect(run).toMatchObject({
+					status: 'completed',
+					error: null,
+					maintenanceTarget: 'main',
+					workerId: id,
+				});
+				expect(run.completedAt).toBeInstanceOf(Date);
+			});
+
+			// The report is authoritative for the request it names, so the run is settled
+			// even when the `workers` row has moved on and answers `recorded: false`.
+			it('settles a superseded request’s run even though the worker row ignores it', async () => {
+				const id = await freshWorker('ada-run-stale');
+				await requestWorkerUpdate(id, REQUEST_ID, 'main', adaId);
+				await requestWorkerUpdate(id, OTHER_REQUEST_ID, 'v2', adaId);
+
+				const stale = await recordWorkerUpdateReport(id, REQUEST_ID, 'failed', "'npm ci' failed.");
+
+				expect(stale).toBeUndefined();
+				const rows = await updateRunsFor(id);
+				const superseded = rows.find((row) => row.maintenanceRequestId === REQUEST_ID);
+				// Corrected, not left saying it was superseded: the machine did answer.
+				expect(superseded).toMatchObject({ status: 'failed', error: "'npm ci' failed." });
+			});
+
+			// The boundary the issue states outright: nothing at all is written, because
+			// there is no project for the run to hang off.
+			it('refuses a machine enrolled in no project, writing neither request nor run', async () => {
+				const created = await createWorker({
+					ownerUserId: adaId,
+					displayName: 'ada-orphan',
+					capabilities: ['claude'],
+					credentialHash: 'hash-ada-orphan',
+				});
+				await setWorkerDraining(created.id, true);
+
+				const result = await requestWorkerUpdate(created.id, REQUEST_ID, 'main', adaId);
+
+				expect(result.outcome).toBe('no-project');
+				expect((await getWorkerById(created.id))?.update).toBeNull();
+				expect(await updateRunsFor(created.id)).toHaveLength(0);
+			});
+
+			// Deleting the project cascades the run away; the machine's later report must
+			// still be recorded rather than throwing on a row that is gone.
+			it('survives its project being deleted, and still records the report', async () => {
+				const id = await freshWorker('ada-run-cascade');
+				await requestWorkerUpdate(id, REQUEST_ID, 'main', adaId);
+
+				await deleteProjectFromDb(UPDATE_PROJECT_ID);
+
+				expect(await updateRunsFor(id)).toHaveLength(0);
+				const reported = await recordWorkerUpdateReport(id, REQUEST_ID, 'applied', 'Applied.');
+				expect(reported?.update).toMatchObject({ status: 'applied' });
+			});
 		});
 	});
 

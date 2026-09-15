@@ -14,13 +14,25 @@ import { parseWorkItemRef, workItemLabel } from '@/lib/work-item.js';
  * (`WorkerActiveRun`) — can render the same cell.
  */
 export interface WorkItemCellRun {
-	taskId: string;
+	/**
+	 * Null for a maintenance run (issue #971), which names no task — see
+	 * {@link WorkItemCellRun.maintenanceTarget}.
+	 */
+	taskId: string | null;
 	/**
 	 * The repository the run acted on (`owner/repo`) — read straight off the run
 	 * (issue #691) rather than passed in from the caller's project lookup, so the PR
-	 * reference stays right for a project spanning several repositories.
+	 * reference stays right for a project spanning several repositories. Null for a
+	 * maintenance run, which acts on no repository.
 	 */
-	repository: string;
+	repository: string | null;
+	/**
+	 * The build a maintenance run is moving its machine to (issue #971) — the
+	 * reference line a `'worker-update'` run renders in place of a PR or a card.
+	 * Optional so a caller whose read model does not carry it (the Workers screen's
+	 * `currentRun`, which is only ever pipeline work) needs no edit.
+	 */
+	maintenanceTarget?: string | null;
 	phase: string;
 	workItemId: string | null;
 	workItemTitle: string | null;
@@ -114,6 +126,13 @@ function WorkItemReference({ run, isPrDriven }: { run: WorkItemCellRun; isPrDriv
 	};
 	const workItemRef = parseWorkItemRef(run.workItemUrl);
 
+	// A maintenance run's reference is the build it is moving its machine to (issue
+	// #971) — checked first, because it has none of the coordinates the branches below
+	// key on. The machine itself is the `run-worker-name` cell the table already
+	// renders beside this one.
+	if (run.maintenanceTarget) {
+		return <span className="text-zinc-400 font-mono">&rarr; {run.maintenanceTarget}</span>;
+	}
 	if (isPrDriven && run.prNumber) {
 		// Prefer the provider-resolved URL; the GitHub derivation is only the
 		// fallback for a caller whose read model does not carry one yet (see
@@ -132,7 +151,7 @@ function WorkItemReference({ run, isPrDriven }: { run: WorkItemCellRun; isPrDriv
 			</a>
 		);
 	}
-	if (!run.workItemId) return null;
+	if (!run.workItemId || !run.taskId) return null;
 	if (workItemRef) {
 		return (
 			<a
@@ -182,8 +201,10 @@ export function WorkItemCell({
 	const isPrDriven = PR_DRIVEN_PHASES.has(run.phase);
 	const title = resolveRunTitle(run);
 	// The reference line needs the run's repository to build a PR URL, and something
-	// to point at; without both there is nothing to reference.
-	const hasReference = !!run.repository && !!(run.workItemId || run.prNumber);
+	// to point at; without both there is nothing to reference. A maintenance run
+	// (issue #971) has neither and references its build instead.
+	const hasReference =
+		!!run.maintenanceTarget || (!!run.repository && !!(run.workItemId || run.prNumber));
 
 	// Nothing to say at all — the runs list's long-standing behaviour, which drops
 	// even a resolved title when the reference is unavailable.

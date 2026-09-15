@@ -59,6 +59,9 @@ function makeReviewRun(overrides: Partial<RunRow> = {}): RunRow {
 	return {
 		id: 'run-1',
 		projectId: 'project-1',
+		kind: 'pipeline',
+		maintenanceTarget: null,
+		maintenanceRequestId: null,
 		repository: 'acme/demo',
 		taskId: 'task-1',
 		workItemId: null,
@@ -716,6 +719,29 @@ describe('GitHubReferences produced-PR link (issue #446)', () => {
 		);
 
 		expect(container.textContent).toBe('—');
+	});
+
+	// Issue #971 — a maintenance run references neither a pull request nor a board
+	// card, so it states the build instead of rendering the neutral dash of a run that
+	// simply has nothing to say.
+	it('names the build a maintenance run is moving its machine to', () => {
+		const { container } = render(
+			<GitHubReferences
+				run={makeReviewRun({
+					kind: 'worker-update',
+					phase: 'worker-update',
+					repository: null,
+					taskId: null,
+					prNumber: null,
+					prTitle: null,
+					maintenanceTarget: 'main',
+				})}
+			/>,
+		);
+
+		expect(container.textContent).toContain('main');
+		expect(container.textContent).not.toBe('—');
+		expect(container.querySelectorAll('a')).toHaveLength(0);
 	});
 });
 
