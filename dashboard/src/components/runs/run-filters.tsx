@@ -1,5 +1,6 @@
 import { useQuery } from '@tanstack/react-query';
 import { X } from 'lucide-react';
+import { buttonClass } from '@/components/ui/button.js';
 import { sortPipelinePhases } from '@/lib/pipeline-phases.js';
 import { trpc } from '@/lib/trpc.js';
 import { type RunPhaseFilter, runPhaseFilterSchema } from '@/types/runs.js';
@@ -132,7 +133,7 @@ export function RunFilters({
 				<button
 					type="button"
 					onClick={onClear}
-					className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-zinc-400 hover:text-zinc-200 bg-zinc-900/50 border border-zinc-800 rounded hover:bg-zinc-800/60 transition-colors cursor-pointer h-[38px]"
+					className={`${buttonClass('secondary', 'sm')} h-[38px]`}
 				>
 					<X className="h-3.5 w-3.5" />
 					Clear Filters

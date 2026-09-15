@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Trash2, Users } from 'lucide-react';
 import type React from 'react';
 import { useRef, useState } from 'react';
+import { buttonClass } from '@/components/ui/button.js';
 import { PROJECT_ROLE_COPY, PROJECT_ROLE_OPTIONS } from '@/lib/project-roles.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
 import type { ProjectRole } from '../../../../src/identity/membership.js';
@@ -45,12 +46,6 @@ const INPUT_CLASS =
 
 const SELECT_CLASS =
 	'block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 disabled:opacity-50 disabled:bg-zinc-950 disabled:border-zinc-800 disabled:text-zinc-500';
-
-const PRIMARY_BUTTON_CLASS =
-	'inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-violet-600 rounded-md hover:bg-violet-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-violet-500 transition-colors shadow-lg shadow-violet-650/10 disabled:opacity-55 disabled:cursor-not-allowed';
-
-const SECONDARY_BUTTON_CLASS =
-	'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors disabled:opacity-55 disabled:cursor-not-allowed';
 
 const ERROR_BANNER_CLASS =
 	'p-2.5 bg-red-950/30 border border-red-900/30 text-xs text-red-400 rounded';
@@ -301,7 +296,7 @@ export function MembersPanel({ projectId }: { projectId: string }) {
 				<button
 					type="submit"
 					disabled={addMutation.isPending || identifier.trim().length === 0}
-					className={PRIMARY_BUTTON_CLASS}
+					className={buttonClass('primary')}
 				>
 					{addMutation.isPending ? 'Adding…' : 'Add member'}
 				</button>
@@ -329,7 +324,7 @@ export function MembersPanel({ projectId }: { projectId: string }) {
 									removeTarget && removeMutation.mutate({ userId: removeTarget.userId })
 								}
 								disabled={removeMutation.isPending}
-								className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-red-600 rounded-md hover:bg-red-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500 transition-colors disabled:opacity-55 disabled:cursor-not-allowed"
+								className={buttonClass('danger')}
 							>
 								{removeMutation.isPending ? 'Removing…' : 'Remove'}
 							</button>
@@ -339,7 +334,7 @@ export function MembersPanel({ projectId }: { projectId: string }) {
 								type="button"
 								onClick={closeRemoveDialog}
 								disabled={removeMutation.isPending}
-								className={SECONDARY_BUTTON_CLASS}
+								className={buttonClass('secondary')}
 							>
 								Cancel
 							</button>

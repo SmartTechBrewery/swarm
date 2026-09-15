@@ -2,6 +2,7 @@ import { useMutation } from '@tanstack/react-query';
 import { CheckCircle2, Loader2 } from 'lucide-react';
 import { Fragment, useState } from 'react';
 import { Badge, type BadgeTone } from '@/components/ui/badge.js';
+import { buttonClass } from '@/components/ui/button.js';
 import { Modal, ModalFooter } from '@/components/ui/modal.js';
 import { ToggleSwitch } from '@/components/ui/toggle-switch.js';
 import { formatPhase } from '@/lib/format.js';
@@ -53,8 +54,6 @@ const SUBPANEL_CLASS = 'border border-zinc-800 rounded-lg bg-panel/20 p-4 shadow
 const LABEL_CLASS = 'block text-xs font-medium text-zinc-400';
 const FIELD_CLASS =
 	'block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 disabled:opacity-50 disabled:bg-zinc-950 disabled:border-zinc-800 disabled:text-zinc-500';
-const SECONDARY_BUTTON_CLASS =
-	'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed';
 
 /** The approval axis in the shared badge's status hues: approved / awaiting / revoked. */
 const STATUS_TONES: Record<WorkerDetailEnrollment['status'], BadgeTone> = {
@@ -306,7 +305,7 @@ function ReduceAvailabilityConfirm({
 							type="button"
 							onClick={onConfirm}
 							disabled={pending}
-							className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-red-600 rounded-md hover:bg-red-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+							className={buttonClass('danger')}
 						>
 							{suspending ? 'Suspend enrollment' : 'Stop sharing'}
 						</button>
@@ -316,7 +315,7 @@ function ReduceAvailabilityConfirm({
 							type="button"
 							onClick={onCancel}
 							disabled={pending}
-							className={SECONDARY_BUTTON_CLASS}
+							className={buttonClass('secondary')}
 						>
 							Cancel
 						</button>
@@ -580,7 +579,7 @@ function ApprovalControls({
 					type="button"
 					onClick={onApprove}
 					disabled={pending}
-					className={SECONDARY_BUTTON_CLASS}
+					className={buttonClass('secondary', 'sm')}
 				>
 					Approve enrollment
 				</button>
@@ -590,7 +589,7 @@ function ApprovalControls({
 					type="button"
 					onClick={onReactivate}
 					disabled={pending}
-					className={SECONDARY_BUTTON_CLASS}
+					className={buttonClass('secondary', 'sm')}
 				>
 					Reactivate enrollment
 				</button>
@@ -599,7 +598,7 @@ function ApprovalControls({
 					type="button"
 					onClick={onSuspend}
 					disabled={pending}
-					className={SECONDARY_BUTTON_CLASS}
+					className={buttonClass('secondary', 'sm')}
 				>
 					Suspend enrollment
 				</button>
@@ -847,7 +846,7 @@ function ConcurrencyControl({
 					type="button"
 					onClick={() => onApply(parseConcurrencyDraft(draft))}
 					disabled={pending || unchanged || draftError !== null}
-					className={SECONDARY_BUTTON_CLASS}
+					className={buttonClass('secondary', 'sm')}
 				>
 					Apply
 				</button>

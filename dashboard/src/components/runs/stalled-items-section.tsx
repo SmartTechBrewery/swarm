@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, ChevronDown, ChevronRight, X } from 'lucide-react';
 import { useState } from 'react';
+import { buttonClass } from '@/components/ui/button.js';
 import { formatRelativeTime } from '@/lib/format.js';
 import { runTableColumnWidths } from '@/lib/run-table-layout.js';
 import {
@@ -202,7 +203,7 @@ export function StalledItemsSection({ items, showProject = true }: StalledItemsS
 										type="button"
 										onClick={() => handleDismiss(item)}
 										disabled={dismissingKey === stalledItemKey(item)}
-										className="inline-flex min-h-[40px] items-center gap-1.5 rounded-md border border-zinc-800 bg-zinc-900 px-3 text-xs font-medium text-zinc-300 hover:bg-zinc-800 hover:text-white focus:outline-none focus:ring-1 focus:ring-violet-500 transition-colors disabled:opacity-55 disabled:cursor-not-allowed"
+										className={`${buttonClass('secondary', 'sm')} min-h-[40px]`}
 									>
 										<X className="h-3.5 w-3.5" />
 										Dismiss
@@ -267,7 +268,7 @@ export function StalledItemsSection({ items, showProject = true }: StalledItemsS
 												type="button"
 												onClick={() => handleDismiss(item)}
 												disabled={dismissingKey === stalledItemKey(item)}
-												className="inline-flex items-center gap-1.5 px-2 py-1 text-[11px] font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded hover:bg-zinc-800 hover:text-white focus:outline-none focus:ring-1 focus:ring-violet-500 transition-colors disabled:opacity-55 disabled:cursor-not-allowed"
+												className={buttonClass('secondary', 'xs')}
 											>
 												<X className="w-3.5 h-3.5" />
 												Dismiss

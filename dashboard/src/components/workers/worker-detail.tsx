@@ -2,6 +2,7 @@ import { useMutation } from '@tanstack/react-query';
 import { type ReactNode, useState } from 'react';
 import { resolveRunTitle, WorkItemCell } from '@/components/runs/work-item-cell.js';
 import { Badge } from '@/components/ui/badge.js';
+import { buttonClass } from '@/components/ui/button.js';
 import {
 	formatWorkerBuild,
 	WorkerBuildBadge,
@@ -109,8 +110,6 @@ const SECTION_HEADING_CLASS =
 const LABEL_CLASS = 'block text-xs font-medium text-zinc-400';
 const FIELD_CLASS =
 	'block w-full max-w-xs px-3 py-1.5 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 disabled:opacity-50 disabled:bg-zinc-950 disabled:border-zinc-800 disabled:text-zinc-500';
-const SECONDARY_BUTTON_CLASS =
-	'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed';
 
 /** One labelled read-only field of the identity/connectivity grids. */
 function Field({ label, children, mono }: { label: string; children: ReactNode; mono?: boolean }) {
@@ -179,7 +178,7 @@ function WorkerNameField({
 					type="button"
 					onClick={() => renameMutation.mutate(trimmed)}
 					disabled={renameMutation.isPending || unchanged || invalid}
-					className={SECONDARY_BUTTON_CLASS}
+					className={buttonClass('secondary', 'sm')}
 				>
 					Save
 				</button>
@@ -322,7 +321,7 @@ function DeclaredClisControl({
 					// re-validates them against `AgentCliSchema` server-side regardless.
 					onClick={() => declareMutation.mutate(draft as AgentCli[])}
 					disabled={declareMutation.isPending || unchanged || draft.length === 0}
-					className={SECONDARY_BUTTON_CLASS}
+					className={buttonClass('secondary', 'sm')}
 				>
 					{declareMutation.isPending ? 'Saving…' : 'Save CLIs'}
 				</button>
@@ -333,7 +332,7 @@ function DeclaredClisControl({
 						type="button"
 						onClick={() => declareMutation.mutate(null)}
 						disabled={declareMutation.isPending}
-						className={SECONDARY_BUTTON_CLASS}
+						className={buttonClass('secondary', 'sm')}
 					>
 						Use auto-detected CLIs
 					</button>
@@ -729,7 +728,7 @@ export function WorkerDetailView({
 						<button
 							type="button"
 							onClick={() => setEnrollOpen(true)}
-							className={SECONDARY_BUTTON_CLASS}
+							className={buttonClass('secondary', 'sm')}
 						>
 							Enroll in a project
 						</button>

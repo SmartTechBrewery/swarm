@@ -1,4 +1,5 @@
 import { useMutation } from '@tanstack/react-query';
+import { buttonClass } from '@/components/ui/button.js';
 import { formatRelativeTime } from '@/lib/format.js';
 import { trpcClient } from '@/lib/trpc.js';
 
@@ -36,9 +37,6 @@ import { trpcClient } from '@/lib/trpc.js';
 
 const DRAIN_PANEL_CLASS =
 	'p-3 bg-amber-950/20 border border-amber-900/30 text-xs text-amber-200 rounded space-y-1';
-
-const SECONDARY_BUTTON_CLASS =
-	'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed';
 
 /**
  * What the draining panel says about the work the machine started before the drain.
@@ -102,7 +100,7 @@ export function WorkerDrainCard({
 						type="button"
 						onClick={() => drainMutation.mutate(false)}
 						disabled={drainMutation.isPending}
-						className={SECONDARY_BUTTON_CLASS}
+						className={buttonClass('secondary', 'sm')}
 					>
 						{drainMutation.isPending ? 'Returning…' : 'Return to the pool'}
 					</button>
@@ -119,7 +117,7 @@ export function WorkerDrainCard({
 						type="button"
 						onClick={() => drainMutation.mutate(true)}
 						disabled={drainMutation.isPending}
-						className={SECONDARY_BUTTON_CLASS}
+						className={buttonClass('secondary', 'sm')}
 					>
 						{drainMutation.isPending ? 'Draining…' : 'Drain worker'}
 					</button>

@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ChevronDown, ChevronRight, ExternalLink, RotateCcw } from 'lucide-react';
 import { useState } from 'react';
+import { buttonClass } from '@/components/ui/button.js';
 import { formatRelativeTime, formatTimeUntil } from '@/lib/format.js';
 import type { QueuedDisplayRow } from '@/lib/queued-runs.js';
 import {
@@ -380,7 +381,9 @@ export function QueuedRunsSection({
 									{item.runId && (
 										<a
 											href={`/runs/${item.runId}`}
-											className="inline-flex min-h-[40px] items-center gap-1 rounded-md border border-zinc-800 bg-zinc-900 px-3 text-xs font-medium text-violet-300 hover:bg-zinc-800 hover:text-violet-200"
+											// A link dressed as the button it shares a row with, so the two
+											// keep one height; only the hue is the link's own.
+											className={`${buttonClass('secondary', 'sm')} min-h-[40px] text-violet-300 hover:text-violet-200`}
 										>
 											View run
 										</a>
@@ -389,7 +392,7 @@ export function QueuedRunsSection({
 										<button
 											type="button"
 											onClick={() => handleOpenConfirm(item)}
-											className="inline-flex min-h-[40px] items-center gap-1.5 rounded-md border border-zinc-800 bg-zinc-900 px-3 text-xs font-medium text-zinc-300 hover:bg-zinc-800 hover:text-white focus:outline-none focus:ring-1 focus:ring-violet-500 transition-colors disabled:opacity-55 disabled:cursor-not-allowed"
+											className={`${buttonClass('secondary', 'sm')} min-h-[40px]`}
 										>
 											<RotateCcw className="w-3.5 h-3.5" />
 											Put back
@@ -480,7 +483,7 @@ export function QueuedRunsSection({
 												<button
 													type="button"
 													onClick={() => handleOpenConfirm(item)}
-													className="inline-flex items-center gap-1.5 px-2 py-1 text-[11px] font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded hover:bg-zinc-800 hover:text-white focus:outline-none focus:ring-1 focus:ring-violet-500 transition-colors disabled:opacity-55 disabled:cursor-not-allowed"
+													className={buttonClass('secondary', 'xs')}
 												>
 													<RotateCcw className="w-3 h-3" />
 													Put back
@@ -526,7 +529,7 @@ export function QueuedRunsSection({
 								type="button"
 								disabled={putBackMutation.isPending}
 								onClick={() => selectedItem && putBackMutation.mutate(selectedItem)}
-								className="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-semibold text-white bg-violet-600 rounded-md hover:bg-violet-500 focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors disabled:opacity-55"
+								className={buttonClass('primary', 'sm')}
 							>
 								{putBackMutation.isPending ? 'Putting back...' : 'Confirm'}
 							</button>
@@ -536,7 +539,7 @@ export function QueuedRunsSection({
 								type="button"
 								disabled={putBackMutation.isPending}
 								onClick={handleCloseConfirm}
-								className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-350 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-white transition-colors"
+								className={buttonClass('secondary', 'sm')}
 							>
 								Cancel
 							</button>

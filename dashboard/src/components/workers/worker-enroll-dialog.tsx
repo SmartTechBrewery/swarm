@@ -1,6 +1,7 @@
 import { useMutation, useQuery } from '@tanstack/react-query';
 import type React from 'react';
 import { useState } from 'react';
+import { buttonClass } from '@/components/ui/button.js';
 import { Modal, ModalFooter } from '@/components/ui/modal.js';
 import { projectRepo } from '@/lib/project-repository.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
@@ -44,10 +45,6 @@ import type { AgentCli } from '../../../../src/harness/agent-cli.js';
 const LABEL_CLASS = 'block text-xs font-medium text-zinc-400 mb-1';
 const FIELD_CLASS =
 	'block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 disabled:opacity-50 disabled:bg-zinc-950 disabled:border-zinc-800 disabled:text-zinc-500';
-const SECONDARY_BUTTON_CLASS =
-	'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed';
-const PRIMARY_BUTTON_CLASS =
-	'inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-violet-600 rounded-md hover:bg-violet-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-violet-500 transition-colors shadow-lg shadow-violet-650/10 disabled:opacity-50 disabled:cursor-not-allowed';
 
 /**
  * `null` when the text stands for a valid allocation, else the reason. Unlike the
@@ -364,7 +361,7 @@ export function WorkerEnrollDialog({
 
 				<ModalFooter
 					primary={
-						<button type="submit" disabled={!canSubmit} className={PRIMARY_BUTTON_CLASS}>
+						<button type="submit" disabled={!canSubmit} className={buttonClass('primary')}>
 							{mutation.isPending ? 'Enrolling…' : 'Enroll worker'}
 						</button>
 					}
@@ -373,7 +370,7 @@ export function WorkerEnrollDialog({
 							type="button"
 							onClick={handleClose}
 							disabled={mutation.isPending}
-							className={SECONDARY_BUTTON_CLASS}
+							className={buttonClass('secondary')}
 						>
 							Cancel
 						</button>

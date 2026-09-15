@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from '@tanstack/react-router';
 import { RefreshCw, Search, SearchX, Server } from 'lucide-react';
 import { useState } from 'react';
+import { buttonClass } from '@/components/ui/button.js';
 import { WorkersTable } from '@/components/workers/workers-table.js';
 import { canViewInstanceWide } from '@/lib/instance-admin.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
@@ -234,15 +235,10 @@ function WorkersSearchBox({
  * thing below it, and it reads as one of the list's controls — the counterpart to
  * the search box, which narrows the same roster.
  *
- * **The design system's two button recipes are split here on purpose**: the
- * *hue* is the secondary one — the screen's subject is the roster, and a filled
- * violet button would read as the reason the page exists — while the *geometry* is
- * the primary one (`gap-2 px-4 py-2 text-sm font-semibold`) rather than secondary's
- * smaller `px-3 py-1.5 text-xs`. An action button is sized by what it stands next
- * to, and this one stands next to two things that are both primary-sized: the
- * other screens' violet actions, and — in its own row — the search input, whose
- * `py-2 text-sm` gives exactly this height. At the smaller recipe it sat visibly
- * short against both.
+ * `secondary` because the screen's subject is the roster, and a filled violet
+ * button would read as the reason the page exists — at the default `md`, because a
+ * button is sized by what it stands next to and this one shares its row with the
+ * search input, whose `py-2 text-sm` is exactly that height.
  *
  * **The label says `all`, and it means it** — every machine on the installation,
  * not the rows a search has left visible. Scoping it to the filter would make an
@@ -260,7 +256,7 @@ function FleetUpdateButton() {
 			type="button"
 			disabled
 			title="Not wired up yet — this will ask every registered machine to update to the control plane's build."
-			className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors cursor-pointer disabled:opacity-55 disabled:cursor-not-allowed"
+			className={buttonClass('secondary')}
 		>
 			<RefreshCw className="h-4 w-4" aria-hidden="true" />
 			Update all workers
@@ -283,11 +279,7 @@ function NoMatchingWorkers({ query, onClear }: { query: string; onClear: () => v
 			<p className="text-xs text-zinc-500">
 				Search matches a machine’s name, its owner, and the repository it declared.
 			</p>
-			<button
-				type="button"
-				onClick={onClear}
-				className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors mt-2 cursor-pointer"
-			>
+			<button type="button" onClick={onClear} className={`${buttonClass('secondary', 'sm')} mt-2`}>
 				Clear search
 			</button>
 		</div>

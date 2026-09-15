@@ -4,6 +4,7 @@ import { FolderGit2, Plus } from 'lucide-react';
 import { useState } from 'react';
 import { ProjectCreateDialog } from '@/components/projects/project-create-dialog.js';
 import { ProjectsTable } from '@/components/projects/projects-table.js';
+import { buttonClass } from '@/components/ui/button.js';
 import { trpc } from '@/lib/trpc.js';
 import { rootRoute } from '../__root.js';
 
@@ -18,7 +19,7 @@ function ProjectsRouteComponent() {
 				<button
 					type="button"
 					onClick={() => setCreateOpen(true)}
-					className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-violet-600 rounded-md hover:bg-violet-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-violet-500 transition-colors shadow-lg shadow-violet-650/10"
+					className={buttonClass('primary')}
 				>
 					<Plus className="h-4 w-4" />
 					New Project
@@ -42,7 +43,7 @@ function ProjectsRouteComponent() {
 					<button
 						type="button"
 						onClick={() => setCreateOpen(true)}
-						className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors mt-2"
+						className={`${buttonClass('secondary', 'sm')} mt-2`}
 					>
 						New Project
 					</button>

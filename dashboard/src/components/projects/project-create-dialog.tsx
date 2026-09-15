@@ -2,6 +2,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Info, RefreshCw } from 'lucide-react';
 import type React from 'react';
 import { useEffect, useRef, useState } from 'react';
+import { buttonClass } from '@/components/ui/button.js';
 import { DEFAULT_SCM_PROVIDER_ID, SCM_PROVIDERS, type ScmProviderId } from '@/lib/credentials.js';
 import { parseRepoUrl } from '@/lib/parse-repo-url.js';
 import { DEFAULT_BASE_BRANCH } from '@/lib/project-repository.js';
@@ -417,20 +418,12 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 
 				<ModalFooter
 					primary={
-						<button
-							type="submit"
-							disabled={mutation.isPending}
-							className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-violet-600 rounded-md hover:bg-violet-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-violet-500 transition-colors shadow-lg shadow-violet-650/10 disabled:opacity-50 disabled:cursor-not-allowed"
-						>
+						<button type="submit" disabled={mutation.isPending} className={buttonClass('primary')}>
 							{mutation.isPending ? 'Creating…' : 'Create Project'}
 						</button>
 					}
 					secondary={
-						<button
-							type="button"
-							onClick={handleClose}
-							className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors"
-						>
+						<button type="button" onClick={handleClose} className={buttonClass('secondary')}>
 							Cancel
 						</button>
 					}

@@ -1,3 +1,4 @@
+import { buttonClass } from '@/components/ui/button.js';
 import { getPmMappingProvider } from '@/lib/board-mapping.js';
 import { Modal, ModalFooter } from '../ui/modal.js';
 
@@ -23,12 +24,6 @@ import { Modal, ModalFooter } from '../ui/modal.js';
  * Both provider names come from the mapping catalogue, so this names no provider of its
  * own.
  */
-
-const CONFIRM_BUTTON_CLASS =
-	'inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-violet-600 rounded-md hover:bg-violet-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-violet-500 transition-colors shadow-lg shadow-violet-650/10 disabled:opacity-55 disabled:cursor-not-allowed';
-
-const CANCEL_BUTTON_CLASS =
-	'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors disabled:opacity-55 disabled:cursor-not-allowed';
 
 interface PmProviderSwitchDialogProps {
 	open: boolean;
@@ -77,7 +72,7 @@ export function PmProviderSwitchDialog({
 							type="button"
 							onClick={onConfirm}
 							disabled={isPending}
-							className={CONFIRM_BUTTON_CLASS}
+							className={buttonClass('primary')}
 						>
 							{isPending ? 'Saving…' : `Switch to ${to.label}`}
 						</button>
@@ -87,7 +82,7 @@ export function PmProviderSwitchDialog({
 							type="button"
 							onClick={onCancel}
 							disabled={isPending}
-							className={CANCEL_BUTTON_CLASS}
+							className={buttonClass('secondary')}
 						>
 							Cancel
 						</button>

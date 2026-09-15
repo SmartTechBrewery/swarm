@@ -30,6 +30,7 @@ import { ProjectAdminOnly } from '@/components/projects/project-admin-only.js';
 import { ProjectDeleteCard } from '@/components/projects/project-delete-card.js';
 import { RepositoriesPanel } from '@/components/projects/repositories-panel.js';
 import { ProjectRunsPanel } from '@/components/runs/project-runs-panel.js';
+import { buttonClass } from '@/components/ui/button.js';
 import { ToggleSwitch } from '@/components/ui/toggle-switch.js';
 import { WorkersRoster } from '@/components/workers/workers-roster.js';
 import {
@@ -474,18 +475,14 @@ export function GeneralSettingsForm({
 
 				{/* Action Buttons */}
 				<div className="flex items-center gap-2 border-t border-zinc-800 pt-4">
-					<button
-						type="submit"
-						disabled={isPending || !isDirty}
-						className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-violet-600 rounded-md hover:bg-violet-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-violet-500 transition-colors shadow-lg shadow-violet-650/10 disabled:opacity-55 disabled:cursor-not-allowed"
-					>
+					<button type="submit" disabled={isPending || !isDirty} className={buttonClass('primary')}>
 						{isPending ? 'Saving…' : 'Save Changes'}
 					</button>
 					<button
 						type="button"
 						onClick={handleReset}
 						disabled={isPending || !isDirty}
-						className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-white focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors disabled:opacity-55 disabled:cursor-not-allowed"
+						className={buttonClass('secondary')}
 					>
 						Reset
 					</button>
@@ -1328,7 +1325,7 @@ function AgentConfigurationActions({
 			<button
 				type="submit"
 				disabled={isPending || !isDirty || hasValidationError}
-				className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-violet-600 rounded-md hover:bg-violet-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-violet-500 transition-colors shadow-lg shadow-violet-650/10 disabled:opacity-55 disabled:cursor-not-allowed"
+				className={buttonClass('primary')}
 			>
 				{isPending ? 'Saving…' : 'Save Changes'}
 			</button>
@@ -1336,7 +1333,7 @@ function AgentConfigurationActions({
 				type="button"
 				onClick={handleReset}
 				disabled={isPending || !isDirty}
-				className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-white focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors disabled:opacity-55 disabled:cursor-not-allowed"
+				className={buttonClass('secondary')}
 			>
 				Reset
 			</button>
@@ -1706,18 +1703,14 @@ export function PipelineSettingsForm({
 				)}
 
 				<div className="flex items-center gap-2 border-t border-zinc-800 pt-4">
-					<button
-						type="submit"
-						disabled={isPending || !isDirty}
-						className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-violet-600 rounded-md hover:bg-violet-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-violet-500 transition-colors shadow-lg shadow-violet-650/10 disabled:opacity-55 disabled:cursor-not-allowed"
-					>
+					<button type="submit" disabled={isPending || !isDirty} className={buttonClass('primary')}>
 						{isPending ? 'Saving…' : 'Save Changes'}
 					</button>
 					<button
 						type="button"
 						onClick={handleReset}
 						disabled={isPending || !isDirty}
-						className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-white focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors disabled:opacity-55 disabled:cursor-not-allowed"
+						className={buttonClass('secondary')}
 					>
 						Reset
 					</button>

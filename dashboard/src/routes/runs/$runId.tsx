@@ -22,6 +22,7 @@ import { type LiveOutputEvent, LiveOutputViewer } from '@/components/runs/live-o
 import { LogViewer } from '@/components/runs/log-viewer.js';
 import { MaintenanceRunBadge } from '@/components/runs/maintenance-run-badge.js';
 import { RunStatusBadge } from '@/components/runs/run-status-badge.js';
+import { buttonClass } from '@/components/ui/button.js';
 import { Modal, ModalFooter } from '@/components/ui/modal.js';
 import {
 	canForceReReview,
@@ -490,7 +491,7 @@ function RetryOverridePanel({
 				<button
 					type="button"
 					onClick={() => onSubmit(overridesFrom(selection))}
-					className="px-3 py-1.5 text-xs font-semibold text-white bg-violet-600 rounded hover:bg-violet-500 transition-colors cursor-pointer"
+					className={buttonClass('primary', 'sm')}
 				>
 					{submitLabel}
 				</button>
@@ -662,7 +663,7 @@ function TerminateRunButton({ run }: { run: RunRow }) {
 				type="button"
 				onClick={() => setConfirmOpen(true)}
 				disabled={blocked}
-				className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-red-200 bg-red-950/40 border border-red-900/50 rounded-md hover:bg-red-900/40 focus:outline-none focus:ring-1 focus:ring-red-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+				className={buttonClass('dangerOutline')}
 			>
 				{outstanding ? (
 					<Loader2 className="h-4 w-4 animate-spin" />
@@ -700,7 +701,7 @@ function TerminateRunButton({ run }: { run: RunRow }) {
 							type="button"
 							onClick={() => mutation.mutate()}
 							disabled={blocked}
-							className="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-semibold text-white bg-red-600 rounded hover:bg-red-500 focus:outline-none focus:ring-1 focus:ring-red-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+							className={buttonClass('danger', 'sm')}
 						>
 							{blocked && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
 							{terminateButtonLabel(mutation.isPending, outstanding !== null)}
@@ -789,7 +790,7 @@ function ResetConfirmModal({
 						type="button"
 						onClick={onConfirm}
 						disabled={blocked}
-						className="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-semibold text-white bg-red-600 rounded hover:bg-red-500 focus:outline-none focus:ring-1 focus:ring-red-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+						className={buttonClass('danger', 'sm')}
 					>
 						{blocked && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
 						{confirmLabel}
@@ -866,7 +867,7 @@ export function ResetRunButton({
 					setConfirmOpen(true);
 				}}
 				disabled={blocked}
-				className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-red-200 bg-red-950/40 border border-red-900/50 rounded-md hover:bg-red-900/40 focus:outline-none focus:ring-1 focus:ring-red-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+				className={buttonClass('dangerOutline')}
 			>
 				<RotateCcw className={`h-4 w-4 ${blocked ? 'animate-spin' : ''}`} />
 				{resetButtonLabel(mutation.isPending, outstanding !== null)}
@@ -987,7 +988,7 @@ function RecoveryOptionsPopup({
 							type="button"
 							onClick={onReset}
 							disabled={blocked}
-							className="w-full inline-flex items-center gap-2 px-3 py-2 text-sm font-semibold text-red-200 bg-red-950/40 border border-red-900/50 rounded-md hover:bg-red-900/40 focus:outline-none focus:ring-1 focus:ring-red-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+							className={`${buttonClass('dangerOutline')} w-full justify-center`}
 						>
 							<RotateCcw className="h-4 w-4" />
 							{resetButtonLabel(false)}
@@ -1116,7 +1117,7 @@ export function RecoverRunButton({
 						setIsOpen(!isOpen);
 					}}
 					disabled={blocked}
-					className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-violet-600 rounded-md shadow-lg shadow-violet-950/10 hover:bg-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:ring-offset-1 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+					className={buttonClass('primary')}
 				>
 					{blocked ? (
 						<Loader2 className="h-4 w-4 animate-spin" />
@@ -1228,7 +1229,7 @@ export function ForceReReviewButton({ run }: { run: RunRow }) {
 					setConfirmOpen(true);
 				}}
 				disabled={mutation.isPending}
-				className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-red-200 bg-red-950/40 border border-red-900/50 rounded-md hover:bg-red-900/40 focus:outline-none focus:ring-1 focus:ring-red-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+				className={buttonClass('dangerOutline')}
 			>
 				<RefreshCw className={`h-4 w-4 ${mutation.isPending ? 'animate-spin' : ''}`} />
 				{forceReReviewButtonLabel(mutation.isPending)}
@@ -1270,7 +1271,7 @@ export function ForceReReviewButton({ run }: { run: RunRow }) {
 							type="button"
 							onClick={() => mutation.mutate()}
 							disabled={mutation.isPending}
-							className="inline-flex items-center gap-2 px-3 py-1.5 text-xs font-semibold text-white bg-red-600 rounded hover:bg-red-500 focus:outline-none focus:ring-1 focus:ring-red-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+							className={buttonClass('danger', 'sm')}
 						>
 							{mutation.isPending && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
 							{forceReReviewButtonLabel(mutation.isPending)}

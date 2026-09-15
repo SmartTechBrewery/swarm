@@ -1,4 +1,5 @@
 import { Play } from 'lucide-react';
+import { buttonClass } from '@/components/ui/button.js';
 
 interface EmptyRunsStateProps {
 	hasFilters: boolean;
@@ -19,7 +20,7 @@ export function EmptyRunsState({ hasFilters, onClear }: EmptyRunsStateProps) {
 				<button
 					type="button"
 					onClick={onClear}
-					className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors mt-2 cursor-pointer"
+					className={`${buttonClass('secondary', 'sm')} mt-2`}
 				>
 					Clear Filters
 				</button>

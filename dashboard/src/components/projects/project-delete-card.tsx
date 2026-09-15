@@ -1,5 +1,6 @@
 import { useMutation } from '@tanstack/react-query';
 import { useState } from 'react';
+import { buttonClass } from '@/components/ui/button.js';
 import { Modal, ModalFooter } from '@/components/ui/modal.js';
 import { trpcClient } from '@/lib/trpc.js';
 
@@ -30,15 +31,6 @@ import { trpcClient } from '@/lib/trpc.js';
  * it answers a project with work in flight (a dispatch a worker is executing, or a
  * run row still `running`), which the server decides under a lock rather than here.
  */
-
-const DANGER_ENTRY_BUTTON_CLASS =
-	'inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-red-200 bg-red-950/40 border border-red-900/50 rounded-md hover:bg-red-900/40 focus:outline-none focus:ring-1 focus:ring-red-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed';
-
-const DANGER_PRIMARY_BUTTON_CLASS =
-	'inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-red-600 rounded-md hover:bg-red-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed';
-
-const SECONDARY_BUTTON_CLASS =
-	'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed';
 
 const CONFIRM_FIELD_CLASS =
 	'block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 font-mono focus:outline-none focus:ring-1 focus:ring-red-500 focus:border-red-500 transition-shadow disabled:opacity-50 disabled:cursor-not-allowed';
@@ -78,7 +70,7 @@ export function ProjectDeleteCard({ projectId, projectName, onDeleted }: Project
 			<button
 				type="button"
 				onClick={() => setConfirming(true)}
-				className={DANGER_ENTRY_BUTTON_CLASS}
+				className={buttonClass('dangerOutline')}
 			>
 				Delete project
 			</button>
@@ -143,7 +135,7 @@ export function ProjectDeleteCard({ projectId, projectName, onDeleted }: Project
 								type="button"
 								onClick={() => deleteMutation.mutate()}
 								disabled={deleteMutation.isPending || !idConfirmed}
-								className={DANGER_PRIMARY_BUTTON_CLASS}
+								className={buttonClass('danger')}
 							>
 								{deleteMutation.isPending ? 'Deleting…' : 'Delete project'}
 							</button>
@@ -153,7 +145,7 @@ export function ProjectDeleteCard({ projectId, projectName, onDeleted }: Project
 								type="button"
 								onClick={close}
 								disabled={deleteMutation.isPending}
-								className={SECONDARY_BUTTON_CLASS}
+								className={buttonClass('secondary')}
 							>
 								Cancel
 							</button>
