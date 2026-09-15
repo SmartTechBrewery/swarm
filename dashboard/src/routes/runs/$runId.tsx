@@ -37,6 +37,7 @@ import { resolveRunDurationMs, useNow } from '@/lib/run-duration.js';
 import { isMaintenanceRun } from '@/lib/run-kind.js';
 import {
 	canRecoverRun,
+	defaultOverrideModel,
 	type OverrideSelection,
 	overrideSelectionChanged,
 	type RecoveryChoices,
@@ -44,6 +45,7 @@ import {
 	recoverButtonLabel,
 	recoveryChoices,
 	recoveryRetryChoiceLabel,
+	seedOverrideSelection,
 } from '@/lib/run-recovery.js';
 import {
 	canResetRun,
@@ -75,7 +77,6 @@ import type { AgentCli } from '../../../../src/harness/agent-cli.js';
 import {
 	capabilityFor,
 	MODEL_CAPABILITIES,
-	normalizeModelSelection,
 	type ReasoningLevel,
 	reasoningChoicesFor,
 } from '../../../../src/harness/models.js';
@@ -272,51 +273,31 @@ interface OverrideSelectionState {
 }
 
 /**
- * The override selects' state, seeded from the run's own engine/model (decomposing
- * a legacy combined antigravity string, issue #180) and resynced when the run row
- * changes underneath it, so a background refetch never leaves a stale selection
- * armed.
+ * The override selects' state, seeded from the run's own engine/model
+ * (`seedOverrideSelection`, which owns the seeding rules) and resynced when the
+ * run row changes underneath it, so a background refetch never leaves a stale
+ * selection armed.
  *
  * Held in a hook rather than inside the fields (issue #989) because the Recover
  * popup's *action button* has to read it: it submits the selection only when the
  * operator actually edited one, and names itself accordingly.
  */
 function useOverrideSelection(run: RunRow): OverrideSelectionState {
-	const currentCli = (
-		run.engine && (RUN_AGENTS as readonly string[]).includes(run.engine)
-			? (run.engine as RunAgent)
-			: 'claude'
-	) as RunAgent;
-
-	// A prior run's model may be a legacy combined antigravity string; decompose it
-	// into the logical id (+ reasoning) the dropdowns now speak (issue #180).
-	const normalizedCurrent = run.model ? normalizeModelSelection(currentCli, run.model) : undefined;
-	const modelIds = MODEL_CAPABILITIES[currentCli].map((m) => m.id);
-	const currentModel =
-		normalizedCurrent?.model && modelIds.includes(normalizedCurrent.model)
-			? normalizedCurrent.model
-			: modelIds[0];
-	const currentReasoning = (run.reasoning ?? normalizedCurrent?.reasoning) as
-		| ReasoningLevel
-		| undefined;
+	const seeded = seedOverrideSelection(run);
+	// Destructured because the resync effect depends on the three values, not on
+	// the fresh object literal each render produces.
+	const { cli: currentCli, model: currentModel, reasoning: currentReasoning } = seeded;
 
 	const [selectedCli, setSelectedCli] = useState<RunAgent>(currentCli);
 	const [selectedModel, setSelectedModel] = useState<string>(currentModel);
-	const [selectedReasoning, setSelectedReasoning] = useState<ReasoningLevel | ''>(
-		currentReasoning ?? '',
-	);
+	const [selectedReasoning, setSelectedReasoning] = useState<ReasoningLevel | ''>(currentReasoning);
 
 	useEffect(() => {
 		setSelectedCli(currentCli);
 		setSelectedModel(currentModel);
-		setSelectedReasoning(currentReasoning ?? '');
+		setSelectedReasoning(currentReasoning);
 	}, [currentCli, currentModel, currentReasoning]);
 
-	const seeded: OverrideSelection = {
-		cli: currentCli,
-		model: currentModel,
-		reasoning: currentReasoning ?? '',
-	};
 	const selection: OverrideSelection = {
 		cli: selectedCli,
 		model: selectedModel,
@@ -328,7 +309,7 @@ function useOverrideSelection(run: RunRow): OverrideSelectionState {
 		changed: overrideSelectionChanged(seeded, selection),
 		selectCli: (cli) => {
 			setSelectedCli(cli);
-			setSelectedModel(MODEL_CAPABILITIES[cli][0].id);
+			setSelectedModel(defaultOverrideModel(cli));
 			// Reasoning is model-specific — clear it on any CLI change.
 			setSelectedReasoning('');
 		},

@@ -18,7 +18,12 @@
  */
 
 import type { AgentCli } from '../../../src/harness/agent-cli.js';
-import type { ReasoningLevel } from '../../../src/harness/models.js';
+import {
+	capabilityFor,
+	MODEL_CAPABILITIES,
+	normalizeModelSelection,
+	type ReasoningLevel,
+} from '../../../src/harness/models.js';
 import { canResetRun, resetButtonLabel } from './run-reset.js';
 import {
 	canRetryRun,
@@ -123,6 +128,87 @@ export interface OverrideSelection {
 }
 
 /**
+ * The model a CLI's Model select pre-selects when the popup has nothing else to
+ * go on — stated per CLI, and only where the catalogue's own order doesn't
+ * already state it (issue #994).
+ *
+ * The popup used to take `MODEL_CAPABILITIES[cli][0]`, which made list order do
+ * double duty: it is the order the Model dropdown *offers*, and it was also the
+ * pre-selection. `CLAUDE_CAPABILITIES` leads with Fable, so picking `claude` in
+ * the Agent CLI field snapped the Model field to Fable — while every claude-run
+ * phase in this installation's agent config is `claude/opus`. An operator who
+ * didn't notice re-ran the phase on a model they never chose.
+ *
+ * The codex and antigravity catalogues are ordered newest-first *on purpose*
+ * (see their comments in `src/harness/models.ts`), so their first entry really
+ * is the preference and they state nothing here — a newer model landing at the
+ * top of either list should keep moving their default with it. Claude's order
+ * carries no such meaning, so it is the one entry.
+ *
+ * Deliberately **not** `DEFAULT_MODEL_PER_CLI`, which is the coded fallback every
+ * unconfigured *phase* inherits (`claude: 'sonnet'`) — a much wider decision the
+ * two are not being unified on. This is the Recover popup's pre-selection alone;
+ * every model in the catalogue stays selectable.
+ */
+const PREFERRED_OVERRIDE_MODEL: Partial<Record<AgentCli, string>> = {
+	claude: 'opus',
+};
+
+/**
+ * The Model select's pre-selection for `cli` — its stated preference, or the
+ * first model its catalogue lists when it states none.
+ *
+ * A stated preference the live catalogue no longer offers falls back the same
+ * way rather than arming a selection the dropdown can't render; the unit test
+ * asserts every stated preference is a real catalogue entry, so a retirement
+ * fails there instead of degrading quietly here.
+ */
+export function defaultOverrideModel(cli: AgentCli): string {
+	const preferred = PREFERRED_OVERRIDE_MODEL[cli];
+	if (preferred && capabilityFor(cli, preferred)) return preferred;
+	return MODEL_CAPABILITIES[cli][0].id;
+}
+
+/** The run fields the override fields seed from — the `RunRow` subset they read. */
+export interface OverrideSeedRun {
+	engine: string | null;
+	model: string | null;
+	reasoning: string | null;
+}
+
+/** Whether a stored `engine` names a CLI the model catalogue knows. */
+function isAgentCli(engine: string | null): engine is AgentCli {
+	return engine !== null && Object.hasOwn(MODEL_CAPABILITIES, engine);
+}
+
+/**
+ * What the popup's three override fields hold before the operator touches them:
+ * the run's own engine/model/reasoning, decomposing a legacy combined antigravity
+ * model string into the logical id (+ reasoning) the dropdowns now speak
+ * (issue #180).
+ *
+ * A model the live catalogue doesn't recognise — a run that stored none, or one
+ * whose model has since been retired — is the same "pick a model with nothing to
+ * go on" case as a CLI switch, so it lands on {@link defaultOverrideModel} rather
+ * than on the first listed entry (issue #994). A run that *does* name a
+ * recognised model still seeds from that model: this changes the default, not the
+ * seed.
+ */
+export function seedOverrideSelection(run: OverrideSeedRun): OverrideSelection {
+	const cli = isAgentCli(run.engine) ? run.engine : 'claude';
+	const normalized = run.model ? normalizeModelSelection(cli, run.model) : undefined;
+	const model =
+		normalized?.model && capabilityFor(cli, normalized.model)
+			? normalized.model
+			: defaultOverrideModel(cli);
+	return {
+		cli,
+		model,
+		reasoning: (run.reasoning ?? normalized?.reasoning ?? '') as ReasoningLevel | '',
+	};
+}
+
+/**
  * Whether the operator actually moved the override fields off the run's own
  * settings.
  *
@@ -135,8 +221,9 @@ export interface OverrideSelection {
  * perform.
  *
  * The seed is the baseline rather than the run row's raw `engine`/`model`: a run
- * whose stored model is not in the live catalogue seeds the first listed one, and
- * an operator who did not touch that field asked for nothing.
+ * whose stored model is not in the live catalogue seeds its CLI's default
+ * ({@link seedOverrideSelection}), and an operator who did not touch that field
+ * asked for nothing.
  */
 export function overrideSelectionChanged(
 	seeded: OverrideSelection,

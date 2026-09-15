@@ -1,14 +1,20 @@
 import { describe, expect, it } from 'vitest';
+import type { AgentCli } from '../../../src/harness/agent-cli.js';
+import { capabilityFor, MODEL_CAPABILITIES } from '../../../src/harness/models.js';
 import {
 	canRecoverRun,
+	defaultOverrideModel,
 	type OverrideSelection,
 	overrideSelectionChanged,
 	recoverButtonLabel,
 	recoveryChoices,
 	recoveryOverrideSubmitLabel,
 	recoveryRetryChoiceLabel,
+	seedOverrideSelection,
 } from './run-recovery.js';
 import { retryButtonLabel } from './run-retry.js';
+
+const AGENT_CLIS = ['claude', 'antigravity', 'codex'] as const satisfies readonly AgentCli[];
 
 describe('recoveryChoices', () => {
 	it('offers both a fresh retry and a reset for a plain failed run', () => {
@@ -162,5 +168,100 @@ describe('recoveryOverrideSubmitLabel', () => {
 		expect(recoveryOverrideSubmitLabel('recheck')).toBe('Recheck with these settings');
 		expect(recoveryOverrideSubmitLabel('resume')).toBe('Retry with these settings');
 		expect(recoveryOverrideSubmitLabel('retry')).toBe('Retry with these settings');
+	});
+});
+
+describe('defaultOverrideModel', () => {
+	// The reported defect (issue #994): the popup took `MODEL_CAPABILITIES[cli][0]`,
+	// and the claude catalogue leads with Fable — so reaching for the Agent CLI
+	// select armed a retry on a model the operator never chose. Asserting the id
+	// rather than a list position is the point: reordering the catalogue (which is
+	// the Model dropdown's display order) must not move this back.
+	it('pre-selects Opus for claude, whatever order the catalogue lists', () => {
+		expect(defaultOverrideModel('claude')).toBe('opus');
+	});
+
+	it('leaves the newest-first catalogues on their first entry', () => {
+		expect(defaultOverrideModel('antigravity')).toBe(MODEL_CAPABILITIES.antigravity[0].id);
+		expect(defaultOverrideModel('codex')).toBe(MODEL_CAPABILITIES.codex[0].id);
+	});
+
+	// A default the dropdown can't offer would render a select with no matching
+	// option, so a retirement has to fail here rather than in the browser.
+	it('names a model the live catalogue actually offers, for every CLI', () => {
+		for (const cli of AGENT_CLIS) {
+			expect(capabilityFor(cli, defaultOverrideModel(cli))).toBeDefined();
+		}
+	});
+});
+
+describe('seedOverrideSelection', () => {
+	it('seeds from the run’s own engine/model/reasoning', () => {
+		expect(seedOverrideSelection({ engine: 'claude', model: 'haiku', reasoning: null })).toEqual({
+			cli: 'claude',
+			model: 'haiku',
+			reasoning: '',
+		});
+		expect(seedOverrideSelection({ engine: 'codex', model: 'gpt-5.5', reasoning: 'high' })).toEqual(
+			{
+				cli: 'codex',
+				model: 'gpt-5.5',
+				reasoning: 'high',
+			},
+		);
+	});
+
+	// A recognised claude model is still the run's own — this changed the default,
+	// not the seed.
+	it('keeps a recognised claude model rather than snapping it to the default', () => {
+		expect(seedOverrideSelection({ engine: 'claude', model: 'fable', reasoning: null }).model).toBe(
+			'fable',
+		);
+		expect(
+			seedOverrideSelection({ engine: 'claude', model: 'sonnet', reasoning: null }).model,
+		).toBe('sonnet');
+	});
+
+	it('decomposes a legacy combined antigravity model string (issue #180)', () => {
+		expect(
+			seedOverrideSelection({
+				engine: 'antigravity',
+				model: 'gemini-3.6-flash-high',
+				reasoning: null,
+			}),
+		).toEqual({ cli: 'antigravity', model: 'gemini-3.6-flash', reasoning: 'high' });
+	});
+
+	// The second place the popup had to pick a claude model with nothing to go on,
+	// which fell through to the first listed entry the same way (issue #994).
+	it('falls back to the CLI’s default when the stored model isn’t in the catalogue', () => {
+		expect(
+			seedOverrideSelection({ engine: 'claude', model: 'claude-3-opus-20240229', reasoning: null })
+				.model,
+		).toBe('opus');
+	});
+
+	it('falls back to the CLI’s default when the run stored no model at all', () => {
+		expect(seedOverrideSelection({ engine: 'claude', model: null, reasoning: null }).model).toBe(
+			'opus',
+		);
+	});
+
+	it('treats a missing or unrecognised engine as claude', () => {
+		expect(seedOverrideSelection({ engine: null, model: null, reasoning: null })).toEqual({
+			cli: 'claude',
+			model: 'opus',
+			reasoning: '',
+		});
+		expect(seedOverrideSelection({ engine: 'gemini', model: null, reasoning: null }).cli).toBe(
+			'claude',
+		);
+	});
+
+	// The seed is what `overrideSelectionChanged` compares against, so an operator
+	// who opened the popup and touched nothing must submit no override.
+	it('is unchanged against itself, so an untouched popup submits a plain retry', () => {
+		const seeded = seedOverrideSelection({ engine: 'claude', model: null, reasoning: null });
+		expect(overrideSelectionChanged(seeded, { ...seeded })).toBe(false);
 	});
 });
