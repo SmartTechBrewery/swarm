@@ -12,6 +12,7 @@ const {
 	listMineQueryFn,
 	rosterQueryFn,
 	workersQueryOptions,
+	meQueryFn,
 	reorderMutate,
 	navigate,
 } = vi.hoisted(() => ({
@@ -20,6 +21,7 @@ const {
 	listMineQueryFn: vi.fn(),
 	rosterQueryFn: vi.fn(),
 	workersQueryOptions: vi.fn(),
+	meQueryFn: vi.fn(),
 	reorderMutate: vi.fn(),
 	navigate: vi.fn(),
 }));
@@ -46,6 +48,9 @@ vi.mock('@/lib/trpc.js', () => ({
 			list: {
 				queryOptions: () => ({ queryKey: ['projects.list'], queryFn: projectsListQueryFn }),
 			},
+		},
+		auth: {
+			me: { queryOptions: () => ({ queryKey: ['auth.me'], queryFn: meQueryFn }) },
 		},
 	},
 	trpcClient: {
@@ -99,6 +104,7 @@ beforeEach(() => {
 		workersQueryOptions,
 		listMineQueryFn,
 		rosterQueryFn,
+		meQueryFn,
 		reorderMutate,
 		navigate,
 	]) {
@@ -113,6 +119,10 @@ beforeEach(() => {
 	// consent control renders unless a test opts in.
 	listMineQueryFn.mockResolvedValue([]);
 	rosterQueryFn.mockResolvedValue([]);
+	// Most of this file predates the toolbar's viewer read, so leave the viewer
+	// unresolved by default: no test gets the fleet action unless it asks for one,
+	// and the tests that never mention a viewer settle no extra query behind them.
+	meQueryFn.mockReturnValue(new Promise(() => {}));
 });
 
 describe('WorkersRoster scoping (issue #574)', () => {
@@ -201,7 +211,7 @@ describe('WorkersRoster reorder controls (issue #750 phase 2)', () => {
 
 	it('offers none on the global screen either, whatever the caller asks for', async () => {
 		workersListQueryFn.mockResolvedValue(PAIR);
-		renderRoster(<WorkersRoster canReorder />);
+		renderRoster(<WorkersRoster canAdminister />);
 
 		await screen.findByText('ada-laptop');
 		expect(screen.queryByRole('button', { name: /^Move / })).toBeNull();
@@ -215,7 +225,7 @@ describe('WorkersRoster reorder controls (issue #750 phase 2)', () => {
 			projectId: 'proj-a',
 			workerIds: ['worker-2', 'worker-1'],
 		});
-		renderRoster(<WorkersRoster projectId="proj-a" canReorder />);
+		renderRoster(<WorkersRoster projectId="proj-a" canAdminister />);
 
 		fireEvent.click(await screen.findByRole('button', { name: 'Move grace-box up' }));
 
@@ -237,7 +247,7 @@ describe('WorkersRoster reorder controls (issue #750 phase 2)', () => {
 	it('surfaces a rejected move and leaves the order alone', async () => {
 		workersListQueryFn.mockResolvedValueOnce(PAIR).mockReturnValue(new Promise(() => {}));
 		reorderMutate.mockRejectedValue(new Error('Worker with ID "worker-2" not found'));
-		renderRoster(<WorkersRoster projectId="proj-a" canReorder />);
+		renderRoster(<WorkersRoster projectId="proj-a" canAdminister />);
 
 		fireEvent.click(await screen.findByRole('button', { name: 'Move grace-box up' }));
 
@@ -339,7 +349,7 @@ describe('WorkersRoster search (issue #897)', () => {
 
 	it('withholds the reorder controls while a search narrows the list', async () => {
 		workersListQueryFn.mockResolvedValue([ADA, GRACE]);
-		renderRoster(<WorkersRoster projectId="proj-a" canReorder />);
+		renderRoster(<WorkersRoster projectId="proj-a" canAdminister />);
 		await screen.findByText('ada-laptop');
 		expect(screen.getAllByRole('button', { name: /^Move / }).length).toBeGreaterThan(0);
 
@@ -350,5 +360,119 @@ describe('WorkersRoster search (issue #897)', () => {
 
 		fireEvent.change(searchBox(), { target: { value: '' } });
 		expect(screen.getAllByRole('button', { name: /^Move / }).length).toBeGreaterThan(0);
+	});
+});
+
+/**
+ * The toolbar's update action, which is two actions: installation-wide on the
+ * unscoped roster, for an instance administrator, and project-wide on a project's
+ * Workers tab, for that project's administrator. Both directions are asserted —
+ * that each is offered where it belongs, and that neither ever stands in for the
+ * other — because a viewer holding one of those roles must not be handed the
+ * button belonging to the other.
+ */
+describe('WorkersRoster update actions', () => {
+	const FLEET_BUTTON = { name: 'Update all workers' } as const;
+	const PROJECT_BUTTON = { name: 'Update project workers' } as const;
+
+	function asInstanceAdmin() {
+		meQueryFn.mockResolvedValue({
+			id: 'u1',
+			identifier: 'ada@example.com',
+			displayName: 'Ada Lovelace',
+			instanceAdmin: true,
+		});
+	}
+
+	it('offers it on the installation-wide roster to an instance administrator', async () => {
+		asInstanceAdmin();
+		workersListQueryFn.mockResolvedValue([makeWorker()]);
+		renderRoster(<WorkersRoster />);
+
+		expect(await screen.findByRole('button', FLEET_BUTTON)).toBeDefined();
+	});
+
+	it('withholds it from a viewer without the installation role', async () => {
+		meQueryFn.mockResolvedValue({
+			id: 'u1',
+			identifier: 'ada@example.com',
+			displayName: 'Ada Lovelace',
+			instanceAdmin: false,
+		});
+		workersListQueryFn.mockResolvedValue([makeWorker()]);
+		renderRoster(<WorkersRoster />);
+
+		await screen.findByText('ada-laptop');
+		expect(screen.queryByRole('button', FLEET_BUTTON)).toBeNull();
+	});
+
+	it('withholds it on a project tab even from an administrator', async () => {
+		// "All workers" there would read as that project's, which is not what it does.
+		asInstanceAdmin();
+		workersListQueryFn.mockResolvedValue([makeWorker()]);
+		renderRoster(<WorkersRoster projectId="proj-a" />);
+
+		await screen.findByText('ada-laptop');
+		expect(screen.queryByRole('button', FLEET_BUTTON)).toBeNull();
+	});
+
+	it('withholds it while the viewer is still unresolved', async () => {
+		// `canViewInstanceWide`'s own contract: absent or unresolved denies, so the
+		// button never flashes in before the role is known.
+		meQueryFn.mockReturnValue(new Promise(() => {}));
+		workersListQueryFn.mockResolvedValue([makeWorker()]);
+		renderRoster(<WorkersRoster />);
+
+		await screen.findByText('ada-laptop');
+		expect(screen.queryByRole('button', FLEET_BUTTON)).toBeNull();
+	});
+
+	it('renders it inert until it is wired up, rather than as a live control', async () => {
+		asInstanceAdmin();
+		workersListQueryFn.mockResolvedValue([makeWorker()]);
+		renderRoster(<WorkersRoster />);
+
+		const button = (await screen.findByRole('button', FLEET_BUTTON)) as HTMLButtonElement;
+		expect(button.disabled).toBe(true);
+		expect(button.title).toContain('Not wired up yet');
+	});
+
+	it('offers the scoped action to a project administrator, naming its own set', async () => {
+		workersListQueryFn.mockResolvedValue([makeWorker()]);
+		renderRoster(<WorkersRoster projectId="proj-a" canAdminister />);
+
+		const button = (await screen.findByRole('button', PROJECT_BUTTON)) as HTMLButtonElement;
+		// The set it names is this project's machines, never the installation's.
+		expect(button.title).toContain('every machine enrolled in this project');
+		expect(button.disabled).toBe(true);
+	});
+
+	it('withholds the scoped action from a member who does not administer the project', async () => {
+		// `canAdminister` also fails closed while `projects.viewerAccess` is loading,
+		// which is the same absent value.
+		workersListQueryFn.mockResolvedValue([makeWorker()]);
+		renderRoster(<WorkersRoster projectId="proj-a" />);
+
+		await screen.findByText('ada-laptop');
+		expect(screen.queryByRole('button', PROJECT_BUTTON)).toBeNull();
+	});
+
+	it('does not let a project administrator reach the installation-wide action', async () => {
+		workersListQueryFn.mockResolvedValue([makeWorker()]);
+		renderRoster(<WorkersRoster projectId="proj-a" canAdminister />);
+
+		await screen.findByRole('button', PROJECT_BUTTON);
+		expect(screen.queryByRole('button', FLEET_BUTTON)).toBeNull();
+	});
+
+	it('does not offer the scoped action on the installation-wide roster', async () => {
+		// "This project" names nothing there, and an instance administrator already
+		// has the wider action.
+		asInstanceAdmin();
+		workersListQueryFn.mockResolvedValue([makeWorker()]);
+		renderRoster(<WorkersRoster />);
+
+		await screen.findByRole('button', FLEET_BUTTON);
+		expect(screen.queryByRole('button', PROJECT_BUTTON)).toBeNull();
 	});
 });

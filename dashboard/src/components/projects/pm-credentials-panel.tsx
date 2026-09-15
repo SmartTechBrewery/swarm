@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Pencil, Trash2, X } from 'lucide-react';
 import type React from 'react';
 import { useState } from 'react';
+import { buttonClass } from '@/components/ui/button.js';
 import type { PmProviderId } from '@/lib/board-mapping.js';
 import { maskedPreview } from '@/lib/credentials.js';
 import {
@@ -49,12 +50,6 @@ import { Modal, ModalFooter } from '../ui/modal.js';
 const INPUT_CLASS =
 	'block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 font-mono transition-shadow disabled:opacity-50 disabled:cursor-not-allowed';
 
-const SECONDARY_BUTTON_CLASS =
-	'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors disabled:opacity-55 disabled:cursor-not-allowed';
-
-const PRIMARY_BUTTON_CLASS =
-	'inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-violet-600 rounded-md hover:bg-violet-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-violet-500 transition-colors shadow-lg shadow-violet-650/10 disabled:opacity-55 disabled:cursor-not-allowed';
-
 interface PmCredentialEditorProps {
 	entry: PmCredentialEntry;
 	value: string;
@@ -95,7 +90,7 @@ function PmCredentialEditor({
 					type="button"
 					onClick={onSave}
 					disabled={isSaving || value.trim().length === 0}
-					className={PRIMARY_BUTTON_CLASS}
+					className={buttonClass('primary')}
 				>
 					{isSaving ? 'Saving…' : 'Save'}
 				</button>
@@ -105,7 +100,7 @@ function PmCredentialEditor({
 							type="button"
 							onClick={onCancel}
 							disabled={isSaving}
-							className={SECONDARY_BUTTON_CLASS}
+							className={buttonClass('secondary')}
 						>
 							<X className="w-3.5 h-3.5" />
 							Cancel
@@ -140,7 +135,7 @@ function PmCredentialPreview({ entry, onEdit, onRequestRemove }: PmCredentialPre
 			<div className="flex-1 px-3 py-2 border border-zinc-800/85 bg-zinc-900/40 rounded text-sm font-mono text-zinc-400">
 				{maskedPreview(entry.maskedValue)}
 			</div>
-			<button type="button" onClick={onEdit} className={SECONDARY_BUTTON_CLASS}>
+			<button type="button" onClick={onEdit} className={buttonClass('secondary', 'sm')}>
 				<Pencil className="w-3.5 h-3.5" />
 				Edit
 			</button>
@@ -395,7 +390,7 @@ export function PmCredentialsPanel({
 								type="button"
 								onClick={() => removeTarget && removeMutation.mutate(removeTarget)}
 								disabled={removeMutation.isPending}
-								className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-red-600 rounded-md hover:bg-red-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500 transition-colors disabled:opacity-55 disabled:cursor-not-allowed"
+								className={buttonClass('danger')}
 							>
 								{removeMutation.isPending ? 'Removing…' : 'Remove'}
 							</button>
@@ -408,7 +403,7 @@ export function PmCredentialsPanel({
 									removeMutation.reset();
 								}}
 								disabled={removeMutation.isPending}
-								className={SECONDARY_BUTTON_CLASS}
+								className={buttonClass('secondary')}
 							>
 								Cancel
 							</button>

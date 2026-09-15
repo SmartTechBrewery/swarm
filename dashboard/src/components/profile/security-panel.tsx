@@ -1,6 +1,7 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import type React from 'react';
 import { useState } from 'react';
+import { buttonClass } from '@/components/ui/button.js';
 import {
 	canSaveDisplayName,
 	DISPLAY_NAME_MAX_LENGTH,
@@ -39,10 +40,6 @@ const SECTION_HEADING_CLASS =
 const LABEL_CLASS = 'block text-xs font-medium text-zinc-400 mb-1';
 const INPUT_CLASS =
 	'block w-full max-w-sm px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 transition-shadow disabled:opacity-50 disabled:cursor-not-allowed';
-const SECONDARY_BUTTON_CLASS =
-	'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors disabled:opacity-55 disabled:cursor-not-allowed';
-const PRIMARY_BUTTON_CLASS =
-	'inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-violet-600 rounded-md hover:bg-violet-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-violet-500 transition-colors shadow-lg shadow-violet-650/10 disabled:opacity-55 disabled:cursor-not-allowed';
 const ERROR_CLASS = 'p-2.5 bg-red-950/30 border border-red-900/30 text-xs text-red-400 rounded';
 const SUCCESS_CLASS =
 	'p-2.5 bg-emerald-950/30 border border-emerald-900/30 text-xs text-emerald-400 rounded';
@@ -105,7 +102,7 @@ function DisplayNameSection({ displayName }: { displayName: string }) {
 					type="button"
 					onClick={() => renameMutation.mutate(draft.trim())}
 					disabled={renameMutation.isPending || !canSave}
-					className={SECONDARY_BUTTON_CLASS}
+					className={buttonClass('secondary', 'sm')}
 				>
 					{renameMutation.isPending ? 'Saving…' : 'Save'}
 				</button>
@@ -214,7 +211,11 @@ function PasswordSection() {
 				) : null}
 				{changeMutation.isSuccess ? <p className={SUCCESS_CLASS}>Password changed.</p> : null}
 
-				<button type="submit" disabled={changeMutation.isPending} className={PRIMARY_BUTTON_CLASS}>
+				<button
+					type="submit"
+					disabled={changeMutation.isPending}
+					className={buttonClass('primary')}
+				>
 					{changeMutation.isPending ? 'Changing…' : 'Change password'}
 				</button>
 			</form>

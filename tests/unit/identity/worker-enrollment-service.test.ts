@@ -32,10 +32,6 @@ const { findProjectRecordByIdFromDb } = vi.hoisted(() => ({
 	findProjectRecordByIdFromDb: vi.fn(),
 }));
 const { getRunByIdFromDb } = vi.hoisted(() => ({ getRunByIdFromDb: vi.fn() }));
-// Issue #977 — the detail view's update history, read per machine from `runs`.
-const { listWorkerUpdateRunsForWorker } = vi.hoisted(() => ({
-	listWorkerUpdateRunsForWorker: vi.fn(),
-}));
 const { getLiveSessionForWorker, getRetainedSessionForWorker } = vi.hoisted(() => ({
 	getLiveSessionForWorker: vi.fn(),
 	getRetainedSessionForWorker: vi.fn(),
@@ -75,7 +71,6 @@ vi.mock('@/db/repositories/runsRepository.js', () => ({
 	getRunByIdFromDb,
 	isPipelineRun: (run: { kind?: string; repository?: string | null; taskId?: string | null }) =>
 		run.kind === 'pipeline' && run.repository !== null && run.taskId !== null,
-	listWorkerUpdateRunsForWorker,
 }));
 vi.mock('@/identity/worker-session-service.js', () => ({
 	getLiveSessionForWorker,
@@ -1598,22 +1593,7 @@ describe('getDashboardWorkerDetail (issue #477)', () => {
 		getLiveSessionForWorker.mockResolvedValue(undefined);
 		getRetainedSessionForWorker.mockResolvedValue(undefined);
 		getUserById.mockResolvedValue(makeOwner());
-		listWorkerUpdateRunsForWorker.mockResolvedValue([]);
 	});
-
-	/** One update run as `listWorkerUpdateRunsForWorker` answers it (issue #977). */
-	function updateRun(runId: string, projectId: string) {
-		return {
-			runId,
-			projectId,
-			target: 'main',
-			status: 'completed',
-			startedAt: new Date('2026-07-01T09:00:00.000Z'),
-			completedAt: new Date('2026-07-01T09:00:30.000Z'),
-			durationMs: 30_000,
-			error: null,
-		};
-	}
 
 	it('carries the full enrollment detail per project, not just project + status', async () => {
 		getWorkerById.mockResolvedValue(makeWorker());
@@ -1758,46 +1738,6 @@ describe('getDashboardWorkerDetail (issue #477)', () => {
 		const detail = await getDashboardWorkerDetail(WORKER_ID, ['proj-a']);
 
 		expect(detail?.enrollments.map((e) => e.projectId)).toEqual(['proj-a']);
-	});
-
-	// Issue #977 — the machine's own update history, read from `runs` rather than from
-	// `workers.update_*`, which the next request overwrites.
-	it('carries the machine’s update runs, newest first as the repository answers them', async () => {
-		getWorkerById.mockResolvedValue(makeWorker());
-		listEnrollmentsForWorker.mockResolvedValue([makeEnrollment()]);
-		listWorkerUpdateRunsForWorker.mockResolvedValue([
-			updateRun('run-2', 'proj-a'),
-			updateRun('run-1', 'proj-a'),
-		]);
-
-		const detail = await getDashboardWorkerDetail(WORKER_ID, null);
-
-		expect(listWorkerUpdateRunsForWorker).toHaveBeenCalledWith(WORKER_ID);
-		expect(detail?.updateHistory.map((entry) => entry.runId)).toEqual(['run-2', 'run-1']);
-	});
-
-	// The same rule `currentRun` applies: a run the viewer would be refused at
-	// `/runs/<id>` is withheld rather than linked to from this page.
-	it('withholds an update run whose project a restricted viewer may not access', async () => {
-		getWorkerById.mockResolvedValue(makeWorker());
-		listEnrollmentsForWorker.mockResolvedValue([makeEnrollment({ projectId: 'proj-a' })]);
-		listWorkerUpdateRunsForWorker.mockResolvedValue([
-			updateRun('run-visible', 'proj-a'),
-			updateRun('run-secret', 'proj-secret'),
-		]);
-
-		const detail = await getDashboardWorkerDetail(WORKER_ID, ['proj-a']);
-
-		expect(detail?.updateHistory.map((entry) => entry.runId)).toEqual(['run-visible']);
-	});
-
-	it('is empty for a machine nobody has asked to update', async () => {
-		getWorkerById.mockResolvedValue(makeWorker());
-		listEnrollmentsForWorker.mockResolvedValue([makeEnrollment()]);
-
-		const detail = await getDashboardWorkerDetail(WORKER_ID, null);
-
-		expect(detail?.updateHistory).toEqual([]);
 	});
 
 	it('hides a worker a restricted viewer shares no project with', async () => {

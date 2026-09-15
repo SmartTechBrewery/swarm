@@ -1,4 +1,5 @@
 import type React from 'react';
+import { buttonClass } from '@/components/ui/button.js';
 import type { RepositoryForm } from '@/lib/project-repository.js';
 import { RepositoryList } from './repository-list.js';
 
@@ -93,7 +94,7 @@ export function RepositoriesPanel({
 					<button
 						type="submit"
 						disabled={isPending || !isDirty || duplicates.length > 0}
-						className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-violet-600 rounded-md hover:bg-violet-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-violet-500 transition-colors shadow-lg shadow-violet-650/10 disabled:opacity-55 disabled:cursor-not-allowed"
+						className={buttonClass('primary')}
 					>
 						{isPending ? 'Saving…' : 'Save Changes'}
 					</button>
@@ -101,7 +102,7 @@ export function RepositoriesPanel({
 						type="button"
 						onClick={handleReset}
 						disabled={isPending || !isDirty}
-						className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-white focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors disabled:opacity-55 disabled:cursor-not-allowed"
+						className={buttonClass('secondary')}
 					>
 						Reset
 					</button>

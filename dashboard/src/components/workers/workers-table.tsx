@@ -3,6 +3,7 @@ import { ChevronDown, ChevronUp } from 'lucide-react';
 import { useState } from 'react';
 import { WorkItemCell } from '@/components/runs/work-item-cell.js';
 import { Badge } from '@/components/ui/badge.js';
+import { buttonClass } from '@/components/ui/button.js';
 import { Modal, ModalFooter } from '@/components/ui/modal.js';
 import { ToggleSwitch } from '@/components/ui/toggle-switch.js';
 import { WorkerBuildBadge, WorkerUpdatingBadge } from '@/components/workers/worker-build.js';
@@ -754,7 +755,7 @@ export function WorkersTable({
 								type="button"
 								onClick={confirmDisable}
 								disabled={consentMutation.isPending}
-								className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-red-600 rounded-md hover:bg-red-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+								className={buttonClass('danger')}
 							>
 								{consentMutation.isPending ? 'Stopping…' : 'Stop sharing'}
 							</button>
@@ -764,7 +765,7 @@ export function WorkersTable({
 								type="button"
 								onClick={() => setConfirmTarget(null)}
 								disabled={consentMutation.isPending}
-								className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+								className={buttonClass('secondary')}
 							>
 								Cancel
 							</button>

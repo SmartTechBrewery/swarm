@@ -1,5 +1,6 @@
 import { useQuery } from '@tanstack/react-query';
 import { useNavigate } from '@tanstack/react-router';
+import { buttonClass } from '@/components/ui/button.js';
 import {
 	formatDuration,
 	formatPhase,
@@ -271,7 +272,7 @@ export function RunsTable({
 							type="button"
 							onClick={() => onPageChange(currentPage - 1)}
 							disabled={currentPage === 1}
-							className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+							className={buttonClass('secondary', 'sm')}
 						>
 							Previous
 						</button>
@@ -282,7 +283,7 @@ export function RunsTable({
 							type="button"
 							onClick={() => onPageChange(currentPage + 1)}
 							disabled={currentPage === totalPages}
-							className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+							className={buttonClass('secondary', 'sm')}
 						>
 							Next
 						</button>

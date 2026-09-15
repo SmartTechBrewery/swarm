@@ -71,7 +71,8 @@ export interface WorkerActiveRun {
  * answer — and it is the only field the build marks read (issue #978). `target`
  * goes on naming the build the *latest* request concerned long after that request
  * was answered, so presence of a value here says nothing about whether one is in
- * flight; the durable per-request record is {@link WorkerUpdateHistoryEntry}.
+ * flight; the durable per-request record is the `runs` row, read on the runs
+ * surfaces.
  */
 export interface WorkerUpdate {
 	requestId: string | null;
@@ -81,35 +82,6 @@ export interface WorkerUpdate {
 	status: string | null;
 	message: string | null;
 	reportedAt: string | null;
-}
-
-/**
- * One row of a machine's update history (`workers.getById`, issue #977, mirroring
- * the service's `WorkerUpdateRunRow`) — one `runs` row of `kind = 'worker-update'`,
- * which is what an update request has been recorded as since issue #971.
- *
- * Secret-free like everything else here: a build ref, a run status, two instants,
- * and the machine's own operator-facing prose about a failure.
- */
-export interface WorkerUpdateHistoryEntry {
-	/** The run this request was recorded as — the `/runs/<runId>` each entry links to. */
-	runId: string;
-	/** The run's project. An entry outside the viewer's scope is withheld server-side. */
-	projectId: string;
-	/** The build the machine was asked to move to; `null` only for a row that names none. */
-	target: string | null;
-	/**
-	 * The run's own lifecycle status, verbatim — `running`, `completed` or `failed`
-	 * for a worker-update run — so the outcome reads identically here and in `/runs`.
-	 */
-	status: string;
-	/** ISO 8601 — when the machine was asked (a worker-update run starts at the request). */
-	startedAt: string;
-	/** ISO 8601 — when the run settled; `null` while it is still running. */
-	completedAt: string | null;
-	durationMs: number | null;
-	/** The machine's own reason, for a `failed` entry; `null` for one that completed. */
-	error: string | null;
 }
 
 /**
@@ -223,7 +195,7 @@ export interface WorkerRow {
 	 * the Workers screen marks them separately (issue #978).
 	 *
 	 * The dashboard reads only the pending marker off it; what a machine *reported*
-	 * is `swarm workers list`'s and the detail view's `updateHistory`'s to tell.
+	 * is `swarm workers list`'s to tell, and the runs surfaces'.
 	 */
 	update: WorkerUpdate | null;
 	/** The job it is executing right now; null when idle or the run is out of scope. */
@@ -318,16 +290,6 @@ export interface WorkerDetail extends Omit<WorkerRow, 'enrollments'> {
 	 * repeating it per roster row would say nothing the mark does not.
 	 */
 	controlPlaneBuild: { commit: string; dirty: boolean } | null;
-	/**
-	 * This machine's most recent update runs (issue #977), newest first and bounded
-	 * server-side; `[]` for a machine nobody has ever asked to update. Read from
-	 * `runs`, so it is the durable record of **every** request rather than the single
-	 * latest outcome `swarm workers list` reports.
-	 *
-	 * On the detail view alone, because it is per-machine detail: a history on every
-	 * roster row would be a read per row for a fact the index does not show.
-	 */
-	updateHistory: WorkerUpdateHistoryEntry[];
 	enrollments: WorkerDetailEnrollment[];
 }
 

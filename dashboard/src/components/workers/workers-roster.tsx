@@ -1,9 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from '@tanstack/react-router';
-import { Search, SearchX, Server } from 'lucide-react';
+import { RefreshCw, Search, SearchX, Server } from 'lucide-react';
 import { useState } from 'react';
+import { buttonClass } from '@/components/ui/button.js';
 import { WorkersTable } from '@/components/workers/workers-table.js';
+import { canViewInstanceWide } from '@/lib/instance-admin.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
+import { useCurrentUser } from '@/lib/use-current-user.js';
 import { filterWorkersBySearch } from '@/lib/worker-search.js';
 import { WORKERS_REFETCH_MS } from '@/lib/workers-refresh.js';
 import type { WorkerRow } from '@/types/workers.js';
@@ -19,13 +22,19 @@ interface WorkersRosterProps {
 	 */
 	projectId?: string;
 	/**
-	 * Offer the project's worker-order controls (issue #750 phase 2). The route
-	 * passes the server-declared `projects.viewerAccess` capability, which fails
-	 * closed while it loads, so the controls never flash in for a non-administrator;
-	 * `workers.reorderProjectWorker` re-checks `projectAdmin` regardless. Ignored
-	 * without a `projectId`: there is no order to change on the global screen.
+	 * Whether the viewer administers the scoped project — the server-declared
+	 * `projects.viewerAccess` capability, passed by the route, which fails closed
+	 * while it loads so nothing it gates ever flashes in for a non-administrator.
+	 * Two offers turn on it: the project's worker-order controls (issue #750 phase
+	 * 2) and the scoped update action. Both re-check `projectAdmin` server-side
+	 * regardless. Ignored without a `projectId` — neither offer exists on the global
+	 * screen, where the installation role decides instead.
+	 *
+	 * Named after the capability rather than after either use: it arrived as
+	 * `canReorder`, which stopped being true of it the moment a second thing
+	 * depended on it.
 	 */
-	canReorder?: boolean;
+	canAdminister?: boolean;
 }
 
 /**
@@ -36,10 +45,14 @@ interface WorkersRosterProps {
  * job, capabilities, row navigation, poll cadence) rather than a re-implementation
  * of it that can drift.
  *
- * The one thing the scoped view has that the global one does not is the reorder
- * mutation (issue #750 phase 2), which lives here rather than in the table
- * because this is the component that already knows the project and owns the
- * `workers.list` cache the new order lands in.
+ * What the two views do *not* share is what a project administrator may do to the
+ * project: the reorder mutation (issue #750 phase 2), which lives here rather than
+ * in the table because this is the component that already knows the project and
+ * owns the `workers.list` cache the new order lands in, and the scoped update
+ * action in the toolbar. Both hang off one server-declared capability
+ * (`canAdminister`), and the global screen answers to the installation role
+ * instead — so the surfaces diverge exactly where the permissions do, and nowhere
+ * else.
  *
  * The search box (issue #897) lives here for the same reason: this is the
  * component holding the rows, so both surfaces get it from one place and the
@@ -52,7 +65,7 @@ interface WorkersRosterProps {
  * (`workers.list`/`roster`/`listMine`/`setConsent`/`reorderProjectWorker`); this
  * renders and mutates only what those procedures allow.
  */
-export function WorkersRoster({ projectId, canReorder = false }: WorkersRosterProps) {
+export function WorkersRoster({ projectId, canAdminister = false }: WorkersRosterProps) {
 	const navigate = useNavigate();
 	const queryClient = useQueryClient();
 	const [search, setSearch] = useState('');
@@ -93,7 +106,7 @@ export function WorkersRoster({ projectId, canReorder = false }: WorkersRosterPr
 	// so on a narrowed list the boundary arrows would disable against the wrong
 	// rows and a move would step over a machine the viewer cannot see.
 	const reorder =
-		canReorder && projectId && query === ''
+		canAdminister && projectId && query === ''
 			? {
 					onMove: (workerId: string, direction: 'up' | 'down') =>
 						reorderMutation.mutate({ workerId, direction }),
@@ -125,7 +138,12 @@ export function WorkersRoster({ projectId, canReorder = false }: WorkersRosterPr
 		const visible = filterWorkersBySearch(workers, query);
 		return (
 			<div className="space-y-4">
-				<WorkersSearchBox value={search} onChange={setSearch} />
+				<RosterToolbar
+					projectId={projectId}
+					canAdminister={canAdminister}
+					search={search}
+					onSearchChange={setSearch}
+				/>
 				{visible.length > 0 ? (
 					<WorkersTable
 						workers={visible}
@@ -153,6 +171,59 @@ export function WorkersRoster({ projectId, canReorder = false }: WorkersRosterPr
 }
 
 /**
+ * The row above the table: narrowing the list on the left, acting on the machines
+ * it lists on the right, wrapping to two rows on a phone rather than crushing
+ * either.
+ *
+ * It decides what it offers rather than being told. The update action exists on
+ * both rosters, but they are **two different actions and two different
+ * permissions**, which is why this is a branch rather than one button with a
+ * flag threaded through:
+ *
+ * - Unscoped, it is installation-wide — every registered machine, including ones
+ *   enrolled in no project at all — so it is an instance administrator's act. Asked
+ *   for here rather than inferred from `/workers` already rendering behind that
+ *   gate, so mounting the roster anywhere else can never hand the button to a
+ *   viewer the gate would have refused. An unresolved viewer offers nothing, which
+ *   is `canViewInstanceWide`'s own contract.
+ * - Scoped, it reaches only the machines enrolled in *this* project, so the
+ *   project's own administrator may ask for it — a narrower act, on machines they
+ *   already administer here, needing no installation role. `canAdminister` is the
+ *   server-declared capability and fails closed while it loads.
+ *
+ * Neither is ever offered in the other's place: a project administrator gets no
+ * installation-wide button, and the scoped one never appears on `/workers`, where
+ * "this project" names nothing. The server stays the enforcement point for both,
+ * exactly as it is for the roster read itself.
+ */
+function RosterToolbar({
+	projectId,
+	canAdminister,
+	search,
+	onSearchChange,
+}: {
+	projectId?: string;
+	canAdminister: boolean;
+	search: string;
+	onSearchChange: (next: string) => void;
+}) {
+	const currentUser = useCurrentUser();
+	const canRequestFleetUpdate = !projectId && canViewInstanceWide(currentUser.data);
+	const canRequestProjectUpdate = Boolean(projectId) && canAdminister;
+
+	// One line: the search field grows into the space up to `max-w-sm`, the action is
+	// pushed to the right edge, and only a window too narrow for both drops the button
+	// to a second row rather than squeezing the input below readable.
+	return (
+		<div className="flex flex-wrap items-center justify-between gap-3">
+			<WorkersSearchBox value={search} onChange={onSearchChange} />
+			{canRequestFleetUpdate ? <UpdateWorkersButton scope="installation" /> : null}
+			{canRequestProjectUpdate ? <UpdateWorkersButton scope="project" /> : null}
+		</div>
+	);
+}
+
+/**
  * The roster's search box (issue #897) — rendered only once the roster has rows,
  * so the "no workers at all" state stays a plain explanation with nothing to type
  * into. The query is component state rather than a route search param: it is
@@ -167,7 +238,7 @@ function WorkersSearchBox({
 	onChange: (next: string) => void;
 }) {
 	return (
-		<div className="relative max-w-sm">
+		<div className="relative flex-1 min-w-[12rem] max-w-sm">
 			<Search
 				className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500"
 				aria-hidden="true"
@@ -186,6 +257,48 @@ function WorkersSearchBox({
 }
 
 /**
+ * The roster's update action: ask the machines this roster lists to move to the
+ * build the control plane is running.
+ *
+ * It sits in the toolbar rather than on the page header because it acts on the
+ * thing below it, and it reads as one of the list's controls — the counterpart to
+ * the search box, which narrows the same roster. `secondary` because the screen's
+ * subject is the roster, and a filled violet button would read as the reason the
+ * page exists — at the default `md`, because a button is sized by what it stands
+ * next to and this one shares its row with the search input.
+ *
+ * **The label names the set, and the two sets are genuinely different**: every
+ * registered machine on the installation, or only the ones enrolled in this
+ * project. Neither is the *filtered* list — scoping an action with these
+ * consequences to a transient text box would make the search mean two things — so
+ * the copy names the whole set and the filter is left to do only what it looks
+ * like it does.
+ *
+ * Deliberately inert for now: nothing is wired to either, so both render
+ * `disabled` with a title saying so, rather than as live-looking controls that
+ * silently swallow a click. Wiring them is this component's job alone — the
+ * toolbar passes it nothing but the scope.
+ */
+function UpdateWorkersButton({ scope }: { scope: 'installation' | 'project' }) {
+	const { label, machines } =
+		scope === 'installation'
+			? { label: 'Update all workers', machines: 'every registered machine' }
+			: { label: 'Update project workers', machines: 'every machine enrolled in this project' };
+
+	return (
+		<button
+			type="button"
+			disabled
+			title={`Not wired up yet — this will ask ${machines} to update to the control plane's build.`}
+			className={buttonClass('secondary')}
+		>
+			<RefreshCw className="h-4 w-4" aria-hidden="true" />
+			{label}
+		</button>
+	);
+}
+
+/**
  * A search that matched nothing, deliberately distinct from the empty-roster
  * state above: that one means no machine is enrolled and tells the operator how
  * one gets here, while this one means the roster is populated and the query is
@@ -200,11 +313,7 @@ function NoMatchingWorkers({ query, onClear }: { query: string; onClear: () => v
 			<p className="text-xs text-zinc-500">
 				Search matches a machine’s name, its owner, and the repository it declared.
 			</p>
-			<button
-				type="button"
-				onClick={onClear}
-				className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors mt-2 cursor-pointer"
-			>
+			<button type="button" onClick={onClear} className={`${buttonClass('secondary', 'sm')} mt-2`}>
 				Clear search
 			</button>
 		</div>

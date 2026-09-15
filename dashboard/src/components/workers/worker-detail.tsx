@@ -1,7 +1,9 @@
 import { useMutation } from '@tanstack/react-query';
+import { RefreshCw } from 'lucide-react';
 import { type ReactNode, useState } from 'react';
 import { resolveRunTitle, WorkItemCell } from '@/components/runs/work-item-cell.js';
 import { Badge } from '@/components/ui/badge.js';
+import { buttonClass } from '@/components/ui/button.js';
 import {
 	formatWorkerBuild,
 	WorkerBuildBadge,
@@ -13,7 +15,6 @@ import { WorkerEnrollDialog } from '@/components/workers/worker-enroll-dialog.js
 import { WorkerEnrollmentCard } from '@/components/workers/worker-enrollment-card.js';
 import { WorkerOperatorCredentialsCard } from '@/components/workers/worker-operator-credentials-card.js';
 import { WorkerRateLimitCard } from '@/components/workers/worker-rate-limit-card.js';
-import { WorkerUpdateHistoryCard } from '@/components/workers/worker-update-history-card.js';
 import { formatPhase, formatRelativeTime } from '@/lib/format.js';
 import { sortPipelinePhases } from '@/lib/pipeline-phases.js';
 import { trpcClient } from '@/lib/trpc.js';
@@ -25,10 +26,10 @@ import type { AgentCli } from '../../../../src/harness/agent-cli.js';
  * One machine in full (issue #477) — where the Workers table is the scannable
  * index, this is where an operator understands and administers a single worker.
  * It is grouped into sections rather than a field dump: identity and owner,
- * connectivity, what the daemon declares, what it has been asked to move to
- * ({@link WorkerUpdateHistoryCard}), the active job, and one block per project the
- * machine is enrolled in ({@link WorkerEnrollmentCard}, which owns the editable
- * values and their authorization).
+ * connectivity — including asking this machine to update — what the daemon
+ * declares, the active job, and one block per project the machine is enrolled in
+ * ({@link WorkerEnrollmentCard}, which owns the editable values and their
+ * authorization).
  *
  * **The daemon's `supportedPhases`, `repository` and `build` are read-only; its CLI
  * set is not.** A daemon declares them all at handshake and re-declares them on every
@@ -109,8 +110,6 @@ const SECTION_HEADING_CLASS =
 const LABEL_CLASS = 'block text-xs font-medium text-zinc-400';
 const FIELD_CLASS =
 	'block w-full max-w-xs px-3 py-1.5 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 disabled:opacity-50 disabled:bg-zinc-950 disabled:border-zinc-800 disabled:text-zinc-500';
-const SECONDARY_BUTTON_CLASS =
-	'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed';
 
 /** One labelled read-only field of the identity/connectivity grids. */
 function Field({ label, children, mono }: { label: string; children: ReactNode; mono?: boolean }) {
@@ -179,7 +178,7 @@ function WorkerNameField({
 					type="button"
 					onClick={() => renameMutation.mutate(trimmed)}
 					disabled={renameMutation.isPending || unchanged || invalid}
-					className={SECONDARY_BUTTON_CLASS}
+					className={buttonClass('secondary', 'sm')}
 				>
 					Save
 				</button>
@@ -322,7 +321,7 @@ function DeclaredClisControl({
 					// re-validates them against `AgentCliSchema` server-side regardless.
 					onClick={() => declareMutation.mutate(draft as AgentCli[])}
 					disabled={declareMutation.isPending || unchanged || draft.length === 0}
-					className={SECONDARY_BUTTON_CLASS}
+					className={buttonClass('secondary', 'sm')}
 				>
 					{declareMutation.isPending ? 'Saving…' : 'Save CLIs'}
 				</button>
@@ -333,7 +332,7 @@ function DeclaredClisControl({
 						type="button"
 						onClick={() => declareMutation.mutate(null)}
 						disabled={declareMutation.isPending}
-						className={SECONDARY_BUTTON_CLASS}
+						className={buttonClass('secondary', 'sm')}
 					>
 						Use auto-detected CLIs
 					</button>
@@ -362,6 +361,49 @@ function DriftedClisNote({ drifted }: { drifted: string[] }) {
 			{drifted.length === 1 ? 'it' : 'them'} is not routed here until the machine reports{' '}
 			{drifted.length === 1 ? 'it' : 'them'} again.
 		</p>
+	);
+}
+
+/**
+ * Ask **this one machine** to move to the build the control plane is running — the
+ * third and narrowest of the update actions, after the roster toolbars' fleet-wide
+ * and project-wide ones.
+ *
+ * Offered to the machine's **owner** alone, on the strict `viewerIsOwner` every
+ * other machine-scoped control on this screen uses (drain, delete, the operator
+ * credential, the declared CLI set). An update ends in the daemon restarting, which
+ * is the machine operator's call rather than an administrative one; an
+ * administrator reaching someone else's machine keeps the CLI, exactly as those
+ * controls say. The wider actions remain where they belong: an instance
+ * administrator asks the whole installation from `/workers`, a project
+ * administrator asks their project's machines from its Workers tab.
+ *
+ * `secondary`, because Connectivity is a card of facts and this is not the reason
+ * the screen exists — and inert for now, rendered `disabled` with a title saying
+ * so rather than as a live control that swallows a click.
+ */
+function UpdateWorkerAction({ worker }: { worker: WorkerDetail }) {
+	// The gate lives here rather than at the call site: `viewerIsOwner` is this
+	// action's own precondition, and asking it there would put a seventh branch in a
+	// view that is already one long list of sections.
+	if (!worker.viewerIsOwner) return null;
+
+	return (
+		<div className="mt-4 border-t border-zinc-800 pt-4">
+			<button
+				type="button"
+				disabled
+				title="Not wired up yet — this will ask this machine to update to the control plane's build and restart its daemon."
+				className={buttonClass('secondary')}
+			>
+				<RefreshCw className="h-4 w-4" aria-hidden="true" />
+				Update worker
+			</button>
+			<p className="text-xs text-zinc-500 mt-2">
+				Moves this machine's SWARM installation to the control plane's build and restarts its
+				daemon. Drain it first if it may be running a job.
+			</p>
+		</div>
 	);
 }
 
@@ -633,6 +675,11 @@ export function WorkerDetailView({
 					Derived from the machine's heartbeat lease — the one liveness rule the dispatch gate
 					reads. This screen polls, so the state stays current while it is open.
 				</p>
+				{/* The machine-scoped twin of the roster toolbars' update actions, in
+				    Connectivity because that is the card about this machine's relationship
+				    with the control plane — and because an update ends in a restart, which
+				    is the one thing on this screen that interrupts that relationship. */}
+				<UpdateWorkerAction worker={worker} />
 			</div>
 
 			<div className={CARD_CLASS}>
@@ -685,14 +732,6 @@ export function WorkerDetailView({
 				</p>
 			</div>
 
-			{/* Directly after the card that names the build this machine is *on*, so what
-			    it was asked to move to reads beside it — and before Active job, which is
-			    about right now rather than about history (issue #977). */}
-			<div className={CARD_CLASS}>
-				<h2 className={SECTION_HEADING_CLASS}>Update history</h2>
-				<WorkerUpdateHistoryCard entries={worker.updateHistory} />
-			</div>
-
 			<div className={CARD_CLASS}>
 				<h2 className={SECTION_HEADING_CLASS}>Active job</h2>
 				{worker.currentRun ? (
@@ -729,7 +768,7 @@ export function WorkerDetailView({
 						<button
 							type="button"
 							onClick={() => setEnrollOpen(true)}
-							className={SECONDARY_BUTTON_CLASS}
+							className={buttonClass('secondary', 'sm')}
 						>
 							Enroll in a project
 						</button>

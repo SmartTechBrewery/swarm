@@ -73,11 +73,11 @@ New component work should default to the existing named-shade recipes below; rea
 
 Each entry is the Tailwind "recipe" to reuse — treat these as the contract, not a suggestion, so screens stay visually consistent without a component library existing yet.
 
-**Button — primary**
-`inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-violet-600 rounded-md hover:bg-violet-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-violet-500 transition-colors shadow-lg shadow-violet-650/10`
+**Button** — there is exactly one recipe: `buttonClass(variant, size)` (`dashboard/src/components/ui/button.tsx`). Call it for **every** action button and for any link dressed as one; never write button classes into a `className`, and never keep a file-local `PRIMARY_BUTTON_CLASS` copy of them. This is enforced, not merely asked: `button.test.ts` sweeps every `.tsx` under `dashboard/src` and fails on a hand-rolled action-button fill, with two named toggle exceptions. A genuinely new button is a new **variant or size here**, not a string at the call site — the rule that already governs `Badge` and `ToggleSwitch`.
 
-**Button — secondary**
-`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-md hover:bg-zinc-800 hover:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-violet-500 transition-colors` — `hover:text-zinc-100` (not `hover:text-white`), so hover text stays theme-aware rather than pinned white in Light.
+- **Variant says what it does**, and only that: `primary` (the screen's affirmative action), `secondary` (everything beside a primary — Cancel, Reset, Clear search, a row's inline action; `hover:text-zinc-100` rather than `hover:text-white`, so hover stays theme-aware in Light), `danger` (the filled confirm inside a modal), `dangerOutline` (the danger card's entry button, which only *opens* that modal), `success` (a Verify that has verified and stays pressable).
+- **Size says what it stands next to**, and is independent of the variant: `md` (`px-4 py-2 text-sm`) matches the Input/Select recipe below, so a button sharing a row with a field lines up with it; `sm` (`px-3 py-1.5 text-xs`) is the table-and-toolbar default; `xs` (`px-2 py-1 text-[11px]`) is for a dense row of chips in a card. **A secondary standing beside a primary takes the primary's size** — a Save/Reset pair, a modal's confirm and its Cancel. Sizing the pair apart was the original mistake: these two recipes each used to carry a size, so every Reset in the app was visibly shorter than the Save it belonged to.
+- **Appending to the result is for layout only** — `w-full`, a margin, `h-[38px]` to match a neighbouring select. A colour, a weight, or a padding appended there is the drift starting again.
 
 **Button — icon/ghost** (e.g. table row delete)
 `text-zinc-500 hover:text-red-400 p-1.5 rounded hover:bg-zinc-800/60 transition-colors`

@@ -1,6 +1,7 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { createRoute } from '@tanstack/react-router';
 import { AlertCircle, Calendar, Gauge, Info, RefreshCw, Server, ShieldAlert } from 'lucide-react';
+import { buttonClass } from '@/components/ui/button.js';
 import { trpc } from '@/lib/trpc.js';
 import type { WorkerCliQuotaSnapshot } from '../../../src/db/repositories/cliQuotasRepository.js';
 import { rootRoute } from './__root.js';
@@ -183,7 +184,7 @@ export function QuotaRouteComponent() {
 						type="button"
 						onClick={handleRefresh}
 						disabled={quotasQuery.isFetching}
-						className="inline-flex items-center gap-2 px-3.5 py-2 text-sm font-semibold text-zinc-200 bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 rounded-md transition-colors disabled:opacity-50"
+						className={buttonClass('secondary')}
 					>
 						<RefreshCw
 							className={`h-4 w-4 ${quotasQuery.isFetching ? 'animate-spin text-violet-400' : ''}`}

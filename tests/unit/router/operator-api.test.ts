@@ -84,7 +84,6 @@ beforeEach(() => {
 		ownerUserId: USER_ID,
 		lastSeenAt: null,
 		// Issue #977 — `getById` shapes this for the wire, so the stub must carry it.
-		updateHistory: [],
 		// Issue #988 — likewise: the cool-down list is shaped for the wire, so a stub
 		// omitting it would be a view the service never produces.
 		rateLimits: [],
