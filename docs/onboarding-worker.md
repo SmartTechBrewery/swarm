@@ -554,6 +554,19 @@ swarm workers list                         # read what it reported
 swarm workers undrain <worker-id>          # put it back in the pool
 ```
 
+- **This has a dashboard equivalent** (issue #998): the machine's owner can ask for
+  the same thing at `/workers/<worker-id>` → **Connectivity** → *Update worker*,
+  which calls the same `workers.requestUpdate` this command does — no CLI or DB
+  access needed, and the owner's alone, with no installation-admin override. It always
+  asks for **the build the control plane itself is running**, rather than taking a ref:
+  that is the build a machine's *Outdated* mark is judged against, so the update clears
+  the mark, and a control plane that cannot read its own build offers no button rather
+  than guessing one. Both refusals below reach the screen in the server's own words —
+  the drain-first one naming `swarm workers drain`, and the enrollment one naming
+  `swarm workers enroll` — as does the unsupervised refusal, so nothing is hidden by a
+  greyed-out button. Draining and undraining stay the **Pool membership** card on the
+  same screen.
+
 Once you operate more than one machine, `--all` moves all of them as a **staged
 rollout** (issue #940) and prints where each one stands:
 

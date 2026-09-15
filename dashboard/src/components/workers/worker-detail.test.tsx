@@ -16,6 +16,7 @@ const {
 	enrollMutate,
 	removeMutate,
 	setDrainingMutate,
+	requestUpdateMutate,
 	projectsListQueryFn,
 	scmCredentialsListQueryFn,
 	scmCredentialsSetMutate,
@@ -29,6 +30,7 @@ const {
 	enrollMutate: vi.fn(),
 	removeMutate: vi.fn(),
 	setDrainingMutate: vi.fn(),
+	requestUpdateMutate: vi.fn(),
 	projectsListQueryFn: vi.fn(),
 	scmCredentialsListQueryFn: vi.fn(),
 	scmCredentialsSetMutate: vi.fn(),
@@ -68,6 +70,7 @@ vi.mock('@/lib/trpc.js', () => ({
 			enroll: { mutate: enrollMutate },
 			remove: { mutate: removeMutate },
 			setDraining: { mutate: setDrainingMutate },
+			requestUpdate: { mutate: requestUpdateMutate },
 			scmCredentials: { set: { mutate: scmCredentialsSetMutate } },
 		},
 	},
@@ -76,6 +79,14 @@ vi.mock('@/lib/trpc.js', () => ({
 import { WorkerDetailView } from './worker-detail.js';
 
 const NOW = new Date('2026-07-01T12:00:00.000Z');
+
+/**
+ * The control plane's own build, as the server resolved it — the comparand the
+ * `Outdated` mark is reached against, and (issue #998) the exact value the update
+ * action sends as its target. Named here so the assertion on what was sent reads it
+ * off the fixture rather than re-typing the commit.
+ */
+const CONTROL_PLANE_COMMIT = 'abc1234def5678';
 
 function makeEnrollment(overrides: Partial<WorkerDetailEnrollment> = {}): WorkerDetailEnrollment {
 	return {
@@ -109,7 +120,7 @@ function makeWorker(overrides: Partial<WorkerDetail> = {}): WorkerDetail {
 		declaredCapabilities: null,
 		probedCapabilities: ['claude', 'codex'],
 		// The comparand the row's `buildIsCurrent` was judged against (issue #925).
-		controlPlaneBuild: { commit: 'abc1234def5678', dirty: false },
+		controlPlaneBuild: { commit: CONTROL_PLANE_COMMIT, dirty: false },
 		supportedPhases: ['planning', 'implementation', 'review'],
 		repository: 'acme/frontend',
 		// The daemon's declared SWARM build and the server's verdict on it (issue #925).
@@ -207,6 +218,15 @@ beforeEach(() => {
 		drainingSince: NOW.toISOString(),
 		busy: false,
 		currentRunId: null,
+	});
+	requestUpdateMutate.mockReset();
+	requestUpdateMutate.mockResolvedValue({
+		workerId: 'worker-1',
+		displayName: 'ada-laptop',
+		requestId: 'req-1',
+		target: CONTROL_PLANE_COMMIT,
+		requestedAt: NOW.toISOString(),
+		drainingSince: NOW.toISOString(),
 	});
 	projectsListQueryFn.mockReset();
 	projectsListQueryFn.mockResolvedValue([]);
@@ -352,15 +372,93 @@ describe('WorkerDetailView sections (issue #477)', () => {
  * that would.
  */
 describe('WorkerDetailView update action', () => {
-	it('offers the machine’s owner an Update worker action in Connectivity', () => {
+	/** The action's own button, scoped to the card it lives in. */
+	function updateButton(): HTMLButtonElement {
+		return within(section('Connectivity')).getByRole('button', {
+			name: /Update worker|Asking…/,
+		}) as HTMLButtonElement;
+	}
+
+	it('offers the machine’s owner a live Update worker action in Connectivity', () => {
 		renderWorker();
 
-		const button = within(section('Connectivity')).getByRole('button', {
-			name: 'Update worker',
-		}) as HTMLButtonElement;
-		// Inert until it is wired, rather than a live control that swallows a click.
+		const button = updateButton();
+		expect(button.disabled).toBe(false);
+		expect(button.title).toContain('abc1234');
+	});
+
+	// Issue #998's build-ref decision: the server-resolved comparand the `Outdated`
+	// badge is reached against, never a branch name the browser invents.
+	it('asks for the control plane’s own commit', async () => {
+		renderWorker();
+
+		fireEvent.click(updateButton());
+
+		await waitFor(() => expect(requestUpdateMutate).toHaveBeenCalledTimes(1));
+		expect(requestUpdateMutate).toHaveBeenCalledWith({
+			workerId: 'worker-1',
+			target: CONTROL_PLANE_COMMIT,
+		});
+	});
+
+	// What makes the `Updating` mark appear on the SWARM build field: the badge is
+	// already mounted, so the refetch is the whole of the wiring.
+	it('refetches the authoritative view once the request lands', async () => {
+		renderWorker();
+
+		fireEvent.click(updateButton());
+
+		await waitFor(() => expect(onChanged).toHaveBeenCalled());
+	});
+
+	it('surfaces the drain-first refusal verbatim, naming its own remedy', async () => {
+		requestUpdateMutate.mockRejectedValue(
+			new Error(
+				"Worker 'ada-laptop' is still in the dispatch pool, so it cannot be asked to update: it " +
+					'would be given new work while it waits to restart. Run `swarm workers drain worker-1` ' +
+					'first, then request the update.',
+			),
+		);
+		renderWorker();
+
+		fireEvent.click(updateButton());
+
+		expect(await screen.findByText(/swarm workers drain worker-1/)).toBeDefined();
+	});
+
+	it('surfaces the no-project refusal verbatim, naming its own remedy', async () => {
+		requestUpdateMutate.mockRejectedValue(
+			new Error(
+				"Worker 'ada-laptop' is enrolled in no project, so an update for it has no project to be " +
+					'recorded against and nothing was requested. Enroll the machine in a project first ' +
+					'(`swarm workers enroll worker-1 <project-id>`), then request the update.',
+			),
+		);
+		renderWorker();
+
+		fireEvent.click(updateButton());
+
+		expect(await screen.findByText(/swarm workers enroll worker-1/)).toBeDefined();
+	});
+
+	// The regression guard for "refusals are surfaced, never pre-empted": a machine
+	// the server would refuse twice over still gets a live button, because replacing
+	// those messages with a silent disabled state hides the remedy.
+	it('stays live for an undrained, unsupervised machine rather than pre-empting the refusal', () => {
+		renderWorker({ drainingSince: null, supervision: 'unsupervised' });
+
+		expect(updateButton().disabled).toBe(false);
+	});
+
+	it('offers nothing when the control plane cannot read its own build, and says why', () => {
+		renderWorker({ controlPlaneBuild: null });
+
+		const button = updateButton();
 		expect(button.disabled).toBe(true);
-		expect(button.title).toContain('Not wired up yet');
+		expect(button.title).toContain('cannot read its own build');
+
+		fireEvent.click(button);
+		expect(requestUpdateMutate).not.toHaveBeenCalled();
 	});
 
 	it('withholds it from a viewer who does not own the machine', () => {
@@ -733,8 +831,12 @@ describe('WorkerDetailView enrollment blocks', () => {
 			});
 
 			expect(screen.queryByTitle(/differs from the control plane/)).toBeNull();
-			// …and the card says so, rather than silently comparing nothing.
-			expect(screen.getByText(/cannot read its own build/)).toBeDefined();
+			// …and the card says so, rather than silently comparing nothing. Scoped to
+			// this card: the update action in Connectivity states the same absence for
+			// its own reason (issue #998).
+			expect(
+				within(section('Declared by the daemon')).getByText(/cannot read its own build/),
+			).toBeDefined();
 		});
 
 		// Issue #978 — the second mark on the same field. It answers "somebody has
