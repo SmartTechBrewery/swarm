@@ -35,6 +35,7 @@ import {
 	HANDOFF_FILENAMES,
 	type ScmDeliveryProvider,
 } from '@/scm/delivery.js';
+import { RETRY_BUFFER_MS, retryDelayForFailure } from '@/worker/consumer.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
 import {
 	ANTIGRAVITY_QUOTA_FAILURE,
@@ -570,6 +571,15 @@ describe('runResolveConflictsPhase — an exhausted account quota (issue #1013)'
 		expect(failure.retryAfter).toBeInstanceOf(Date);
 		expect((error as AgentRunError).message).toContain('(rate limited)');
 		expect((error as AgentRunError).message).not.toMatch(/did not write required hand-off/);
+		// The reset agy named survives into the shared deferral policy rather than
+		// being clamped back under it: the retry — and the `(worker, CLI)` cool-down
+		// derived from the same answer — lands after the account actually refills.
+		const observed = 16 * 60 * 60 * 1000 + 39 * 60 * 1000 + 20 * 1000;
+		const now = Date.now();
+		expect((failure.retryAfter as Date).getTime() - now).toBeGreaterThan(observed - 5_000);
+		const delay = retryDelayForFailure(failure, now);
+		expect(delay).toBeGreaterThan(observed - 5_000);
+		expect(delay).toBeLessThanOrEqual(observed + RETRY_BUFFER_MS);
 		// Deferred and resumable, like every other rate limit: keep the checkout.
 		expect(deps.worktrees.preserve).toHaveBeenCalled();
 		expect(deps.worktrees.cleanup).not.toHaveBeenCalled();

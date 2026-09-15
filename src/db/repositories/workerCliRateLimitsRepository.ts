@@ -21,8 +21,9 @@ export interface WorkerCliRateLimit {
  *
  * A re-record replaces the row rather than extending or merging it: the newest
  * deferral is the best evidence about the machine's current allowance, and the
- * expiry it carries is already bounded by the shared retry policy's six-hour
- * ceiling, so nothing a bad observation writes can outlive that. Two CLIs on one
+ * expiry it carries is already bounded by the shared retry policy's ceiling (the
+ * longest wait a deferred wake-up survives for, ~24 h by default), so nothing a
+ * bad observation writes can outlive that. Two CLIs on one
  * machine are two rows, and two machines on one CLI are two rows — the key is the
  * pair (the lesson of issue #703, which `cli_quotas` learned the hard way).
  */

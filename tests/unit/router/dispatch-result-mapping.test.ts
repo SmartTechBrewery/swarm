@@ -15,7 +15,7 @@ import { DeliveryDeferredError } from '@/scm/delivery.js';
 import { buildTaskAssignment } from '@/transport/assignment.js';
 import { deferrableOrFailedResult } from '@/transport/assignment-execution.js';
 import type { TaskExecutionResult } from '@/transport/protocol.js';
-import { retryDelayForFailure } from '@/worker/consumer.js';
+import { RETRY_BUFFER_MS, retryDelayForFailure } from '@/worker/consumer.js';
 import type { DispatchSelection } from '@/worker/eligibility-gate.js';
 import { RunTerminatedError } from '@/worker/run-cancellation.js';
 import { BlockedRecoveryError } from '@/worktree/reclaim.js';
@@ -419,8 +419,10 @@ describe('adaptResultToPhaseRun', () => {
 	describe('reported rate-limit reset', () => {
 		const RESET_HINT = '1:40pm (Europe/Warsaw)';
 		const MIN_RETRY_DELAY_MS = 6 * 60 * 1000;
-		const MAX_RETRY_DELAY_MS = 6 * 60 * 60 * 1000;
 		const DEFAULT_RETRY_DELAY_MS = 30 * 60 * 1000;
+		// `SWARM_MAX_JOB_AGE_MS` (24 h by default) less the dequeue margin — the longest
+		// wait a deferred wake-up survives the job-freshness gate for (issue #1013).
+		const MAX_RETRY_DELAY_MS = 24 * 60 * 60 * 1000 - 15 * 60 * 1000;
 
 		/** The failure `adaptResultToPhaseRun` rebuilt from a deferral frame. */
 		function rebuiltFailure(overrides: Partial<TaskExecutionResult>) {
@@ -491,11 +493,28 @@ describe('adaptResultToPhaseRun', () => {
 			warn.mockRestore();
 		});
 
+		// A reported reset inside the believed horizon is scheduled as reported — a
+		// clamp here used to turn agy's observed `Resets in 16h39m20s` into a six-hour
+		// wait, retrying the run (and lapsing the machine's cool-down, which is this
+		// same policy's answer) ten hours before the account had anything left.
+		it('schedules a reported reset well past the old six-hour ceiling as reported', () => {
+			const observed = 16 * 60 * 60 * 1000 + 39 * 60 * 1000 + 20 * 1000;
+			const reset = new Date(Date.now() + observed).toISOString();
+
+			const delay = retryDelayForFailure(rebuiltFailure({ retryAfter: reset }), Date.now());
+
+			expect(delay).toBeGreaterThan(observed);
+			expect(delay).toBeLessThanOrEqual(observed + RETRY_BUFFER_MS);
+		});
+
 		it('keeps the MIN/MAX clamps bounding the delay', () => {
-			const far = new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString();
+			// Further out than a deferred wake-up can be scheduled at all: the control
+			// plane discards one it dequeues more than `SWARM_MAX_JOB_AGE_MS` (24 h)
+			// after it was published, so the wait stops a dequeue margin short of that.
+			const absurd = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
 			const near = new Date(Date.now() + 1_000).toISOString();
 
-			expect(retryDelayForFailure(rebuiltFailure({ retryAfter: far }), Date.now())).toBe(
+			expect(retryDelayForFailure(rebuiltFailure({ retryAfter: absurd }), Date.now())).toBe(
 				MAX_RETRY_DELAY_MS,
 			);
 			expect(retryDelayForFailure(rebuiltFailure({ retryAfter: near }), Date.now())).toBe(

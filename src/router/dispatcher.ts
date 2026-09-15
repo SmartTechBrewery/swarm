@@ -316,8 +316,8 @@ function reportedRetryHint(
  * number of its own, which is what makes the three properties that matter
  * structural: the record lapses at exactly the instant the deferred retry is
  * scheduled for, a missing or unparseable reset degrades to the shared default
- * backoff rather than to "forever", and `MAX_RETRY_DELAY_MS` caps a mis-parsed one
- * so no sequence of observations can hold a machine back indefinitely.
+ * backoff rather than to "forever", and `MAX_RETRY_DELAY_MS` bounds a mis-parsed
+ * one so no sequence of observations can hold a machine back indefinitely.
  *
  * Best-effort and fully swallowed, like `tryCompleteDispatch`: bookkeeping must
  * never fail a settle. A lost record costs one avoidable bounce, not a dropped job.

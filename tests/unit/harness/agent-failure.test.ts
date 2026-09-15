@@ -823,6 +823,13 @@ describe('classifyAgentFailure', () => {
 		expect(failure.kind).toBe('aborted');
 	});
 
+	// The one thing an abort does *not* outrank, and deliberately so: the flags
+	// co-occur only in the narrow race where the wall clock fires and the worker
+	// starts shutting down inside the SIGTERM grace, and only a `timeout` deferral is
+	// `resumable` (`src/worker/consumer.ts`) — so reading that race as an abort would
+	// throw away the interrupted run's session. What an abort does outrank is every
+	// signal read out of the run's *output*, the structural quota verdict included
+	// (the three per-CLI cases above).
 	it('prioritizes timeout over aborted when both are somehow set', () => {
 		expect(classifyAgentFailure(result({ timedOut: true, aborted: true }), NOW).kind).toBe(
 			'timeout',

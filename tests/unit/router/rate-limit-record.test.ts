@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AgentCli } from '@/harness/agent-cli.js';
 import type { TaskExecutionResult } from '@/transport/protocol.js';
-import { retryDelayForFailure } from '@/worker/consumer.js';
+import { RETRY_BUFFER_MS, retryDelayForFailure } from '@/worker/consumer.js';
 import type { DispatchSelection } from '@/worker/eligibility-gate.js';
 
 // The one DB collaborator, mocked at its module boundary (ai/TESTING.md). Everything
@@ -99,9 +99,10 @@ describe('recordReportedRateLimit (issue #981)', () => {
 	});
 
 	// Criterion 5: no sequence of events can hold a machine back indefinitely. The
-	// ceiling is structural because the expiry goes through the shared clamp rather
-	// than being stored raw.
-	it('caps a reset far in the future at the shared six-hour ceiling', async () => {
+	// ceiling is structural because the expiry goes through the shared policy rather
+	// than being stored raw — it is the longest wait a deferred wake-up survives the
+	// job-freshness gate for (`SWARM_MAX_JOB_AGE_MS`, 24 h, less a dequeue margin).
+	it('caps a reset far in the future at the shared ceiling', async () => {
 		const retryAfter = new Date(NOW.getTime() + 30 * 24 * 60 * 60 * 1000);
 		await recordReportedRateLimit(
 			frame({ failureKind: 'rate-limit', retryAfter: retryAfter.toISOString() }),
@@ -110,7 +111,31 @@ describe('recordReportedRateLimit (issue #981)', () => {
 
 		const [input] = recordWorkerCliRateLimit.mock.calls[0] ?? [];
 		expect(input?.expiresAt.getTime()).toBe(expiryFor(retryAfter));
-		expect((input?.expiresAt.getTime() ?? 0) - NOW.getTime()).toBe(6 * 60 * 60 * 1000);
+		expect((input?.expiresAt.getTime() ?? 0) - NOW.getTime()).toBe(
+			24 * 60 * 60 * 1000 - 15 * 60 * 1000,
+		);
+	});
+
+	// The observed agy exhaustion (issue #1013). A six-hour ceiling used to expire this
+	// machine's Antigravity cool-down ten hours before the account had anything left,
+	// so routing resumed sending it work — and the deferred run retried into the same
+	// empty account, since the retry delay is this same answer.
+	it('records the full reset an exhausted Antigravity account reported', async () => {
+		const observed = 16 * 60 * 60 * 1000 + 39 * 60 * 1000 + 20 * 1000;
+		const retryAfter = new Date(NOW.getTime() + observed);
+		await recordReportedRateLimit(
+			frame({
+				failureKind: 'rate-limit',
+				retryAfter: retryAfter.toISOString(),
+				resetHint: 'in 16h39m20s',
+			}),
+			{ ...SELECTION, cli: 'antigravity', target: { cli: 'antigravity' } },
+		);
+
+		const [input] = recordWorkerCliRateLimit.mock.calls[0] ?? [];
+		expect(input?.expiresAt.getTime()).toBe(expiryFor(retryAfter));
+		// Past the reset by the shared buffer, never short of it.
+		expect(input?.expiresAt.getTime()).toBe(retryAfter.getTime() + RETRY_BUFFER_MS);
 	});
 
 	it('floors a reset already in the past rather than recording a lapsed row', async () => {

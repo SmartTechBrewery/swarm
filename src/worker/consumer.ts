@@ -205,6 +205,7 @@ import {
 	type KnownFailureCondition,
 } from './failure-diagnosis.js';
 import { GitWorktreeManager } from './git-worktree-manager.js';
+import { resolveMaxJobAgeMs } from './job-freshness.js';
 import {
 	type MergeAutomationSettledOutcome,
 	processMergeAutomationDispatch,
@@ -434,8 +435,33 @@ const MAX_ELIGIBILITY_RECHECKS = MAX_DEPENDENCY_RECHECKS;
  * {@link retryDelayForFailure}), which has no reset time to compute from.
  */
 const MIN_RETRY_DELAY_MS = 6 * 60 * 1000;
-/** Ceiling, so a mis-parsed reset time can't defer a job for an absurd span. */
-const MAX_RETRY_DELAY_MS = 6 * 60 * 60 * 1000;
+/**
+ * Slack between the longest wait this policy will schedule and the age at which a
+ * wake-up is discarded — the lag between a delayed job firing and the consumer
+ * actually dequeuing it.
+ */
+const WAKE_UP_FRESHNESS_MARGIN_MS = 15 * 60 * 1000;
+/**
+ * Ceiling on the wait a *reported* reset can buy, and the one bound the rest of
+ * the machinery imposes rather than this policy choosing a number: a deferred
+ * retry is published as a fresh wake-up job, and the control plane **discards** a
+ * job it dequeues later than `SWARM_MAX_JOB_AGE_MS` (24 h by default) after that
+ * job was published — cancelling its dispatch with it ({@link resolveMaxJobAgeMs},
+ * `startControlPlaneDispatch`). Scheduling past that window would park a run on a
+ * wake-up nothing will honour, so a reset beyond it is waited out as far as it
+ * *can* be and the retry budget covers the rest — six attempts, each with a fresh
+ * window, span a weekly allowance.
+ *
+ * Deliberately no longer the flat six hours it was: agy's observed `Resets in
+ * 16h39m20s` was clamped to six, which retried the run — and lapsed that machine's
+ * `(worker, CLI)` cool-down, computed from this same answer — ten hours before the
+ * account had anything left (issue #1013). It is still a ceiling, so a mis-parsed
+ * reset cannot hold a machine back indefinitely (issue #981).
+ */
+const MAX_RETRY_DELAY_MS = Math.max(
+	MIN_RETRY_DELAY_MS,
+	resolveMaxJobAgeMs() - WAKE_UP_FRESHNESS_MARGIN_MS,
+);
 /** Backoff when the CLI gave no parseable reset time — likely lands past reset. */
 const DEFAULT_RETRY_DELAY_MS = 30 * 60 * 1000;
 /**
@@ -536,6 +562,11 @@ export type DeferrableFailure = AgentFailure | { kind: 'delivery' };
  * by the time a re-enqueued job is dequeued, the worker that killed it has
  * already finished restarting, so the only reason to wait at all is the same
  * dedup-claim floor a rate-limit retry respects.
+ *
+ * A `rate-limit` that carries the CLI's own reset instant is scheduled *through*
+ * it — the whole point of parsing one — floored at the dedup-claim minimum and
+ * bounded by {@link MAX_RETRY_DELAY_MS}, the longest wait a wake-up survives. With
+ * no instant at all it takes the flat {@link DEFAULT_RETRY_DELAY_MS} backoff.
  */
 export function retryDelayForFailure(failure: DeferrableFailure, now: number): number {
 	if (
