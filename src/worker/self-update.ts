@@ -16,11 +16,16 @@
  * mid-phase.
  *
  * **A daemon that loses that lock waits for the holder** (issue #973), because holding
- * it afterwards is the only proof the holder's fetch and build are over. It then
- * answers `already-current` for the build the holder landed, with no fetch of its own,
- * so one machine fetches and builds exactly once however many daemons were asked. That
- * answer is a promise its caller acts on: the install root is on the target *and* this
- * machine finished putting it there — never that HEAD merely moved.
+ * it afterwards is the only proof the holder's fetch and build are over. When the
+ * install root's own record shows a *completed* apply landed the target it was asked
+ * for, it answers `already-current` for that build with no fetch of its own, so one
+ * machine fetches and builds exactly once however many daemons were asked. That answer
+ * is a promise its caller acts on: the install root is on the target *and* this machine
+ * finished putting it there — never that HEAD merely moved, and never that somebody
+ * simply held the lock. A holder that landed nothing — one that refused, one whose own
+ * fetch failed, one returning the machine to its last known good build — leaves the
+ * follower to run the ordinary fetching update for itself rather than to report a
+ * success the machine did not earn.
  *
  * **What it operates on.** `swarmInstallRoot()` (`../lib/build-identity.ts`) —
  * never `process.cwd()` and never `SWARM_WORKER_REPO_ROOT`. On the control-plane
@@ -190,6 +195,23 @@ export const PendingVerificationSchema = z.object({
 	 * guards against can be a build that never reaches any code of its own.
 	 */
 	failedStarts: z.number().int().min(0),
+	/**
+	 * How many *peer* daemons on this install root adopted this build and are each
+	 * about to restart into it once (issue #973).
+	 *
+	 * It is here because the counter above is a fact about the install root while the
+	 * budget it is judged against is a fact about a daemon: the state directory is keyed
+	 * on the install root alone, so on a shared one every peer's ordinary restart lands
+	 * on the same `failedStarts`, and three daemons coming up healthily would spend a
+	 * three-start budget between them and roll the machine back off a build that was
+	 * working. Each adopter records itself here as it takes its licence to restart, so
+	 * it buys exactly the one start it is about to make and the budget keeps measuring
+	 * what it was written to measure — one daemon failing N starts in a row.
+	 *
+	 * Defaulted rather than required, so a record written before issue #973 parses as
+	 * "nobody adopted this", which is what a single-daemon machine always reports.
+	 */
+	adoptingPeers: z.number().int().min(0).default(0),
 	startedAt: z.string().datetime(),
 });
 export type PendingVerification = z.infer<typeof PendingVerificationSchema>;
@@ -414,9 +436,10 @@ async function update(ctx: UpdateContext): Promise<UpdateOutcome> {
  *
  * The wait is not a tie-break between two operators asking at the same second: it is
  * how a daemon lets the peer that is moving *its own* install root finish, so that it
- * can then see what that peer landed (issue #973). `followedPeer` is that fact, and it
- * is what tells the locked half below that the tree it now owns may have moved under
- * it while it queued.
+ * can then see what that peer landed (issue #973). `followedPeer` is that fact and
+ * only that fact — the tree this daemon now owns *may* have moved under it while it
+ * queued. What actually moved is a question for the install root's own record, which
+ * is why {@link adoptPeerBuild} asks that rather than this flag.
  */
 async function takeInstallLock(
 	ctx: InstallContext,
@@ -492,9 +515,17 @@ async function updateLocked(
 	// whatever the holder had reached.
 	recordTracking(ctx, state, tracking, head);
 
-	if (followedPeer) return adoptPeerBuild(ctx, state, tracking, target, head);
+	if (followedPeer) {
+		// `null` is "the daemon I queued behind landed nothing here" — it refused, it was
+		// returning the install root to its last known good build, or it found the machine
+		// already where it was asked to put it. None of those moved the tree, and none of
+		// them fetched anything this daemon may rely on, so the only honest thing left is
+		// to do the ordinary update below for itself (issue #973).
+		const adopted = await adoptPeerBuild(ctx, state, tracking, target, head);
+		if (adopted) return adopted;
+	}
 
-	// --- nothing else was moving this install root ---
+	// --- nothing landed a build on this install root while this daemon waited ---
 
 	// No refspec and no URL: what is fetched is whatever this remote's own config
 	// already says, which is the literal form of "only its own configured remote".
@@ -583,6 +614,7 @@ async function updateLocked(
 				commit,
 				previousCommit: head,
 				failedStarts: 0,
+				adoptingPeers: 0,
 				startedAt: ctx.now().toISOString(),
 			},
 		});
@@ -592,30 +624,50 @@ async function updateLocked(
 
 /**
  * What a daemon answers once the peer that was moving this install root has finished
- * (issue #973).
+ * (issue #973) — or `null` when that peer landed nothing here, in which case the
+ * caller does the ordinary fetching update for itself.
  *
- * It does **not** fetch. That peer's own `git fetch` ran in this very checkout, so its
- * remote-tracking refs are this daemon's too — which is what makes "an update fetches
- * and builds exactly once on a machine" literally true for the daemons asked together,
- * rather than once for the build and N times for the network.
+ * **The question is what the install root's own record says, never that somebody held
+ * the lock.** Waiting proves only that a peer was *in* here; it says nothing about
+ * what that peer did, and the three things it most often did — refuse, return the
+ * machine to its last known good build, or find it already where it was asked to put
+ * it — leave the tree exactly as this daemon found it and leave the remote-tracking
+ * refs exactly as stale as they were. Adopting on the wait alone would report success
+ * for a machine that never moved: a holder whose `git fetch` failed refuses without
+ * refreshing a ref, and a follower resolving `refs/remotes/<remote>/<target>` off
+ * disk would then find HEAD, call it the target, and settle a rollout member as done
+ * on a build the machine is not running.
  *
- * Two facts are required before this answers `already-current`, because that answer is
- * now a peer's licence to restart: the install root is **on** the target, and this
- * machine's own record says that build was *completed* here — it is the one awaiting
- * proof, or the one already promoted to last known good. A checkout that reached the
- * target and then failed its `npm ci` is on neither (the holder writes `applying` with
- * `pendingVerification: null` before it checks anything out, and only a successful
- * `applyCommit` fills it in), and is exactly the half-written tree nothing may restart
- * onto.
+ * So the evidence is `pendingVerification` naming HEAD: the holder writes `applying`
+ * with `pendingVerification: null` *before* it checks anything out and only a
+ * successful `applyCommit` fills it in, so a record naming the commit HEAD is on is
+ * the one thing that says "a completed apply put this here". It is also necessarily
+ * *recent* — an update request arrives over a socket this daemon handshaked on, and a
+ * handshake is what clears the record — so it cannot be an old apply's leftovers.
  *
- * Anything else is a refusal naming what the install root is actually on: the machine
- * moved and did not land what this daemon was asked for, and re-running the same fetch
- * and build behind a peer that just failed is how one broken build becomes four. The
- * operator reads that peer's own outcome and re-issues.
+ * On that evidence, and only then, this does **not** fetch: the holder's own `git
+ * fetch` ran in this very checkout, so its remote-tracking refs are this daemon's
+ * too, which is what makes "an update fetches and builds exactly once on a machine"
+ * literally true for the daemons asked together.
  *
- * No ancestry check: nothing is being moved. The code is already on disk and this
- * daemon's supervisor will load it whenever it next restarts, so re-asking
- * `merge-base` here could refuse nothing it has not already lost.
+ * The two answers that are not an adoption:
+ *
+ * - **Refused**, when a completed apply landed something *else* — a peer asked for a
+ *   different ref. Re-running the same fetch and build behind it would fight it.
+ * - **Refused**, when HEAD is on neither the build awaiting proof nor the one last
+ *   proved. That is the half-written tree — a holder that died between its `git
+ *   checkout` and its `npm ci` — and it is exactly what nothing may restart onto.
+ *
+ * Everything else falls through to the ordinary update. That is deliberately the
+ * safe direction for the case this cannot tell apart: a peer whose apply *failed* has
+ * rolled the tree back to the commit it was on, which is indistinguishable on disk
+ * from a peer that returned the machine to its last known good build, and refusing
+ * both would refuse a daemon that could have applied. One wasted rebuild behind a
+ * broken build is cheaper than a machine left behind, and the lock serializes them.
+ *
+ * No ancestry check on the adopting path: nothing is being moved. The code is already
+ * on disk and this daemon's supervisor will load it whenever it next restarts, so
+ * re-asking `merge-base` here could refuse nothing it has not already lost.
  */
 async function adoptPeerBuild(
 	ctx: UpdateContext,
@@ -623,23 +675,45 @@ async function adoptPeerBuild(
 	tracking: { remote: string; branch: string },
 	target: string,
 	head: string,
-): Promise<UpdateOutcome> {
-	const landed = await resolveTargetCommit(ctx, tracking.remote, target);
-	const completedHere =
-		state?.pendingVerification?.commit === head || state?.lastKnownGood === head;
-	if (landed === head && completedHere) {
+): Promise<UpdateOutcome | null> {
+	if (state?.pendingVerification && state.pendingVerification.commit === head) {
+		const awaiting = state.pendingVerification;
+		const landed = await resolveTargetCommit(ctx, tracking.remote, target);
+		if (landed !== head) {
+			return refuse(
+				`The SWARM install root '${ctx.installRoot}' is on ${head}, not on a finished build ` +
+					`of the target this daemon was asked for ('${target}'), after the daemon that was ` +
+					"moving it finished. Nothing was changed here. Read that daemon's own outcome, " +
+					'then re-issue this update.',
+			);
+		}
 		logger.info('adopting the build a peer daemon landed in this SWARM install root', {
 			installRoot: ctx.installRoot,
 			target,
 			commit: head,
 		});
+		// Taken here, under the lock, because this *is* the licence to restart: the start
+		// this daemon is about to make lands on the same install-root-keyed record the
+		// applier's own restart does, and counting it against the applier's budget is what
+		// would roll a healthy machine back (see `adoptingPeers`). Best-effort, like every
+		// other write to this record — a machine that cannot write its state should not
+		// fail an update over it.
+		tryWriteState(ctx.stateDir, {
+			...state,
+			pendingVerification: { ...awaiting, adoptingPeers: awaiting.adoptingPeers + 1 },
+		});
 		return { status: 'already-current', commit: head };
 	}
+	// Nothing on this machine is awaiting proof, so no apply completed here while this
+	// daemon queued. The install root is then either on the build this machine last
+	// proved — nothing moved, decide for ourselves below — or on something no daemon
+	// here ever finished putting there, which is the half-written tree.
+	if ((state?.lastKnownGood ?? head) === head) return null;
 	return refuse(
-		`The SWARM install root '${ctx.installRoot}' is on ${head}, not on a finished build of ` +
-			`the target this daemon was asked for ('${target}'), after the daemon that was moving ` +
-			"it finished. Nothing was changed here. Read that daemon's own outcome, then re-issue " +
-			'this update.',
+		`The SWARM install root '${ctx.installRoot}' is on ${head}, which is neither the build ` +
+			'this machine last proved nor one a daemon here finished applying, after the daemon ' +
+			'that was moving it finished — so it may be a tree that was checked out and never ' +
+			'built. Nothing was changed here. Inspect the install root, then re-issue this update.',
 	);
 }
 
@@ -1064,14 +1138,19 @@ function stateDirFor(options: InstallStateOptions): string {
  * `null` when there is no record yet, `undefined` when there is one and it is
  * unreadable — {@link readJson}'s two answers.
  *
- * The `pendingVerification` fallback restates the schema's own default for the type
- * system rather than for the data: `readJson` takes its shape from the schema's
- * *input* side, where a defaulted field is still optional, while the `parse` it just
- * ran has already filled it in.
+ * The two fallbacks restate the schema's own defaults for the type system rather than
+ * for the data: `readJson` takes its shape from the schema's *input* side, where a
+ * defaulted field is still optional, while the `parse` it just ran has already filled
+ * both in.
  */
 function readState(stateDir: string): InstallUpdateState | null | undefined {
 	const stored = readJson(join(stateDir, STATE_FILE), InstallUpdateStateSchema);
-	return stored ? { ...stored, pendingVerification: stored.pendingVerification ?? null } : stored;
+	if (!stored) return stored;
+	const pending = stored.pendingVerification;
+	return {
+		...stored,
+		pendingVerification: pending ? { ...pending, adoptingPeers: pending.adoptingPeers ?? 0 } : null,
+	};
 }
 
 /** {@link writeState}, for the callers that answer a failed write rather than raise it. */

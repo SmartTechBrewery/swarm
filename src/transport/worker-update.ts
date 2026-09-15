@@ -52,6 +52,7 @@
  * check.
  */
 
+import { isRestartingUpdateStatus } from '../identity/worker-update-rollout.js';
 import {
 	type WorkerBuild,
 	type WorkerUpdateStatus,
@@ -339,7 +340,7 @@ async function runUpdate(
 	};
 	const delivered = await reportOrOwe(options, logger, update, owe, reported);
 
-	if (!RESTARTING_STATUSES.has(reported.status)) {
+	if (!isRestartingUpdateStatus(reported.status)) {
 		logger.info('keeping this machine on the build it has', {
 			requestId: update.requestId,
 			target: parsedTarget.data,
@@ -370,9 +371,6 @@ async function runUpdate(
 	await releaseAndExit(options, logger);
 	return true;
 }
-
-/** The two reported outcomes that end with this process exiting into a new build. */
-const RESTARTING_STATUSES = new Set<WorkerUpdateStatus>(['applied', 'adopted']);
 
 /**
  * The commit a restart is going *to*. Narrowed rather than cast: only the two

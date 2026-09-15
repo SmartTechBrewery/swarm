@@ -623,6 +623,12 @@ control-plane host one npm-linked install root serves several daemons at once. D
   build of their own — and report `adopted`. So a machine fetches and builds **once**,
   however many daemons it runs, and every one of them ends up on the new build with
   nobody logging in.
+- What a waiting daemon adopts is **what the machine's own record says was applied**,
+  not simply the fact that somebody held the lock. If the daemon it queued behind
+  landed nothing — it refused, its own fetch failed, or it was returning the machine to
+  its last known good build — the waiting one does the ordinary fetch and build for
+  itself. That is why a network blip on the first daemon costs you a slower update
+  rather than a fleet of machines reporting success on code they are not running.
 - `applied` and `adopted` are both successes, and they are distinguishable on purpose:
   `applied` is the daemon that paid for the fetch, `adopted` one that restarted onto a
   peer's. Both restart the daemon, so both need the process supervisor.
@@ -639,10 +645,10 @@ control-plane host one npm-linked install root serves several daemons at once. D
   moment the update asked, and nothing stops an undrained peer taking work a second
   later.
 - A machine that cannot bring a daemon over says so rather than reporting a success
-  covering one process. A daemon that waits the holder out and still cannot get in, or
-  that finds the install root on something other than a *finished* build of the target,
-  reports `refused` naming what it found. Read the other daemon's own outcome, fix what
-  it reported, and re-issue.
+  covering one process. A daemon that waits the holder out and still cannot get in,
+  that finds a completed apply landed a *different* ref, or that finds the install root
+  on a commit no daemon here finished putting it there, reports `refused` naming what
+  it found. Read the other daemon's own outcome, fix what it reported, and re-issue.
 - The lock is host-local and needs no cleanup: it is reclaimed once its holder's
   process is gone (or its refresh has lapsed for 15 minutes), and every exit path
   drops it.
@@ -671,8 +677,10 @@ left to push a correction down. So the machine judges the new build itself. It c
 every start on an unproved build before it loads a line of that build's own worker
 code — so a build that dies while it is still starting up is counted exactly like one
 that starts and then cannot connect — the first successful
-handshake promotes that build to *last known good*, and a machine that has started
-three times without once connecting — or that the control plane rejects outright at
+handshake promotes that build to *last known good*, and a machine that has spent its
+whole failed-start budget without once connecting — three starts, plus one for each
+peer daemon that adopted the build, since those peers' own healthy restarts land on
+the same counter and must not spend it — or that the control plane rejects outright at
 the handshake, which is the "this build cannot talk to this control plane" case and
 does not wait the count out — checks the last known good commit back out,
 reinstalls, rebuilds, and exits 0 for the supervisor to start it there. Nothing has to be asked of
@@ -797,11 +805,12 @@ stays each owner's own `swarm workers update --all <ref>`.
 | `swarm workers update` is refused with "still in the dispatch pool" | The machine has to be drained first (issue #933) — it would otherwise be given new work while it waits to restart. Run `swarm workers drain <worker-id>`, then request the update again, and `swarm workers undrain <worker-id>` once it has reported. |
 | `swarm workers list` shows `update <ref> declined` | That host has not opted in. Set `SWARM_WORKER_SELF_UPDATE=true` in its `.env` and restart the daemon (see "Optional — let the control plane update this machine"). |
 | `swarm workers list` shows `update <ref> refused` with "is already updating the SWARM install root" | A peer daemon holds the install-root lock and was still holding it after this one had waited the whole window out (issue #973) — an apply that ran past its own step timeouts, or one whose daemon is wedged. Read *that* daemon's outcome, sort out what it reports, then re-issue this one. Nothing was changed on this machine. |
-| `swarm workers list` shows `update <ref> refused` with "is on … not on a finished build of the target" | The peer that was moving the install root finished and did not land what this daemon was asked for — its own apply failed, or it was asked for a different ref. Deliberate: re-running the same fetch and build behind a peer that just failed is how one broken build becomes four. Read that daemon's outcome, fix it, and re-issue. |
+| `swarm workers list` shows `update <ref> refused` with "is on … not on a finished build of the target" | The peer that was moving the install root finished a build of a *different* ref than this daemon was asked for — two requests crossed. Deliberate: re-running the same fetch and build behind it would fight it. Read that daemon's outcome, then re-issue this one for the ref you want. |
+| `swarm workers list` shows `update <ref> refused` with "neither the build this machine last proved nor one a daemon here finished applying" | The install root is on a commit nothing here finished putting it there — a daemon that died between its `git checkout` and its `npm ci` leaves exactly that, and restarting onto it would restart onto a tree with no `node_modules` or `dist` (issue #973). Nothing was changed. Check the install root out by hand and run `npm ci && npm run build` there, then re-issue. |
 | `swarm workers list` shows `update <ref> refused` with "is running a phase from the SWARM install root" | A peer daemon on that machine is mid-phase, and updating would swap the code under its run. The message names the worker: `swarm workers drain <that-worker-id>`, wait for it to go idle, then re-issue. Nothing was fetched or checked out. |
 | Several daemons share one install root and only one of them came back on the new build | Not expected since issue #973 — the peers restart themselves and report `adopted`. Check that each daemon was actually *asked*: one comes over on its own update request, so `swarm workers update <worker-id>` moves that daemon alone, while `update --all` / `request-update` / the staged rollout ask every machine. Then check the ones that were asked: a peer that reported `refused` says in its message what it found, and one that reported `adopted` and did not come back has no process supervisor (launchd `KeepAlive` / systemd `Restart=always`). |
 | `swarm workers list` shows `update <ref> failed` | The install root could not be moved. The message beside it names the step (`git checkout`, `npm ci`, `npm run build`) and whether the checkout was returned to the build it was on; a failure that could **not** be rolled back leaves the machine on neither build and needs an operator on that host. |
-| A machine reports `update <ref> applied` but `/workers` shows its **old** build | It could not handshake on the new one and returned itself to its last known good build (issue #934) — three starts without once connecting, or a handshake the control plane rejected outright. Its log says which, on the line before `returned to the last known good SWARM build`. The build is what needs fixing; re-requesting the same ref repeats the cycle. |
+| A machine reports `update <ref> applied` (or `adopted`) but `/workers` shows its **old** build | It could not handshake on the new one and returned itself to its last known good build (issue #934) — the failed-start budget spent without once connecting, or a handshake the control plane rejected outright. Its log says which, on the line before `returned to the last known good SWARM build`; `failedStartBudget` on that line is three plus one per peer that adopted the build, so several healthy daemons restarting together never reach it. The build is what needs fixing; re-requesting the same ref repeats the cycle. |
 | A machine is down and its log says `returning to the last known good SWARM build failed` | The return could not be completed, so the install root is on neither build and needs an operator on that host: check out the commit the line names, then run `npm ci && npm run build` there. The daemon stays down on purpose rather than crash-looping; later starts retry the return, so fix the checkout rather than restarting the daemon at it. |
 | A requested update never reports anything | Nothing pushed it: the machine has no socket on the router. It is re-stated automatically the next time that daemon connects, so start it (or wait for the supervisor to), and re-read `swarm workers list`. |
 | Worker never appears as connected / dispatches stay pending | Enrollment isn't both `active` and `sharing_consent=true` (Part 1, steps 4 and 4b), or the worker process on the new machine isn't actually running / crashed on startup — check its terminal for the two success lines above. |

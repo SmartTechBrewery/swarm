@@ -460,6 +460,9 @@ describe('applyUpdateTarget — the state file', () => {
 				commit: TARGET_COMMIT,
 				previousCommit: HEAD,
 				failedStarts: 0,
+				// Nobody has adopted it yet: the daemon that applied it is the only one that
+				// will restart into it until a peer asks for the same target (issue #973).
+				adoptingPeers: 0,
 				startedAt: '2026-02-01T00:00:00.000Z',
 			},
 		});
@@ -904,45 +907,122 @@ describe('applyUpdateTarget — a shared install root', () => {
 			expect(argv()).not.toContain('npm run build');
 		});
 
-		// Equally good proof: the build was promoted to last known good before this daemon
-		// got in, which is what a peer that already handshaked leaves behind.
-		it('adopts a build the machine has already proved', async () => {
+		// Every peer that adopts restarts, and every one of those restarts lands on the
+		// same install-root-keyed counter, so each one records the start it is about to
+		// make (issue #973) — otherwise three healthy daemons spend a three-start budget
+		// between them and the machine rolls back off a build that was working.
+		it('records itself as a starter on the build it adopts', async () => {
 			const home = makeHome();
-			writeLandedByPeer(home, null);
-			writeStoredState(home, {
-				lastKnownGood: TARGET_COMMIT,
-				target: BRANCH,
-				targetCommit: TARGET_COMMIT,
-				appliedAt: NOW_ISO,
-				pendingVerification: null,
+			writeLandedByPeer(home, {
+				commit: TARGET_COMMIT,
+				previousCommit: HEAD,
+				failedStarts: 0,
+				startedAt: NOW_ISO,
 			});
 			const { run } = scriptedRunner({ 'git rev-parse HEAD': ok(TARGET_COMMIT) });
 
-			const outcome = await apply(home, run, BRANCH, peerReleasesWhileWeWait(home));
+			await apply(home, run, BRANCH, peerReleasesWhileWeWait(home));
 
-			expect(outcome).toEqual({ status: 'already-current', commit: TARGET_COMMIT });
+			expect(readState(home)).toMatchObject({
+				pendingVerification: { commit: TARGET_COMMIT, failedStarts: 0, adoptingPeers: 1 },
+			});
 		});
 
-		it('refuses when the daemon that was moving it did not land this target', async () => {
+		it('refuses when the daemon that was moving it landed a different target', async () => {
 			const home = makeHome();
-			// HEAD is left on the old commit: whatever that peer was doing, it was not this.
-			const { run, argv } = scriptedRunner();
+			// A completed apply, but of somebody else's ref: this daemon's target resolves
+			// somewhere the install root is not.
+			writeLandedByPeer(home, {
+				commit: TARGET_COMMIT,
+				previousCommit: HEAD,
+				failedStarts: 0,
+				startedAt: NOW_ISO,
+			});
+			const other = 'e'.repeat(40);
+			const { run, argv } = scriptedRunner({
+				'git rev-parse HEAD': ok(TARGET_COMMIT),
+				[`git rev-parse --verify refs/remotes/${REMOTE}/${BRANCH}^{commit}`]: ok(other),
+			});
 
 			const outcome = await apply(home, run, BRANCH, peerReleasesWhileWeWait(home));
 
 			expect(outcome.status).toBe('refused');
 			if (outcome.status !== 'refused') return;
-			expect(outcome.reason).toContain(HEAD);
+			expect(outcome.reason).toContain(TARGET_COMMIT);
 			expect(outcome.reason).toContain(BRANCH);
-			// Re-running the same fetch and build behind a peer that just failed is how one
-			// broken build becomes four.
+			// Re-running the same fetch and build behind a peer that just landed something
+			// else is how one broken build becomes four.
 			expect(argv()).not.toContain(`git fetch ${REMOTE}`);
-			expect(argv()).not.toContain(`git checkout --detach ${TARGET_COMMIT}`);
 			expect(argv()).not.toContain('npm ci');
 		});
 
+		// Waiting proves only that somebody was *in* here. A holder whose own `git fetch`
+		// failed refused without refreshing a single ref, so a follower that resolved the
+		// target off disk would find HEAD, call it the target, and report a success for a
+		// machine that never moved.
+		it('does not adopt when the daemon that held the lock landed nothing', async () => {
+			const home = makeHome();
+			// The steady state of a machine that has applied once: on HEAD and proved on
+			// HEAD. The holder's own fetch failed, so `refs/remotes/origin/main` still
+			// resolves to the commit the machine is already on until somebody fetches —
+			// which is exactly the reading a follower must not turn into a success.
+			writeStoredState(home, { lastKnownGood: HEAD });
+			const inner = scriptedRunner();
+			let fetched = false;
+			const run: CommandRunner = async (command) => {
+				const key = argvOf(command);
+				if (key === `git fetch ${REMOTE}`) fetched = true;
+				if (!fetched && key === `git rev-parse --verify refs/remotes/${REMOTE}/${BRANCH}^{commit}`)
+					return ok(HEAD);
+				return inner.run(command);
+			};
+
+			const outcome = await apply(home, run, BRANCH, peerReleasesWhileWeWait(home));
+
+			// It fetched for itself rather than trusting refs the holder never touched, and
+			// applied what that fetch actually brought.
+			expect(outcome.status).toBe('applied');
+			expect(inner.argv()).toContain(`git fetch ${REMOTE}`);
+		});
+
+		it('refuses for itself when its own fetch fails behind a holder that landed nothing', async () => {
+			const home = makeHome();
+			writeStoredState(home, { lastKnownGood: HEAD });
+			const { run } = scriptedRunner({ [`git fetch ${REMOTE}`]: fail('no route to host') });
+
+			const outcome = await apply(home, run, BRANCH, peerReleasesWhileWeWait(home));
+
+			expect(outcome.status).toBe('refused');
+			if (outcome.status !== 'refused') return;
+			expect(outcome.reason).toContain('Fetching remote');
+		});
+
+		// A return leaves the install root on the commit it was already proved on, which
+		// is the same thing a holder that merely refused leaves behind — so the follower
+		// does the ordinary update rather than declining one it could have applied.
+		it('applies normally after queueing behind a return to the last known good build', async () => {
+			const home = makeHome();
+			// What a completed return leaves: back on the commit it was proved on, with the
+			// build it abandoned still named as the last target and nothing awaiting proof.
+			writeStoredState(home, {
+				lastKnownGood: HEAD,
+				target: BRANCH,
+				targetCommit: TARGET_COMMIT,
+				appliedAt: NOW_ISO,
+				pendingVerification: null,
+			});
+			const { run, argv } = scriptedRunner();
+
+			const outcome = await apply(home, run, BRANCH, peerReleasesWhileWeWait(home));
+
+			expect(outcome.status).toBe('applied');
+			expect(argv()).toContain(`git checkout --detach ${TARGET_COMMIT}`);
+		});
+
 		// The half-written tree itself: `applying` is written with no pending verification
-		// *before* the checkout, so HEAD reaches the target with `npm ci` still to run.
+		// *before* the checkout, so HEAD reaches the target with `npm ci` still to run —
+		// which is what a holder that died between the two leaves behind. HEAD is then on
+		// neither the build this machine proved nor one it finished applying.
 		it('refuses a target the install root reached but never finished building', async () => {
 			const home = makeHome();
 			writeLandedByPeer(home, null);
@@ -951,6 +1031,7 @@ describe('applyUpdateTarget — a shared install root', () => {
 			const outcome = await apply(home, run, BRANCH, peerReleasesWhileWeWait(home));
 
 			expect(outcome.status).toBe('refused');
+			expect(argv()).not.toContain(`git fetch ${REMOTE}`);
 			expect(argv()).not.toContain('npm ci');
 			expect(argv()).not.toContain('npm run build');
 		});

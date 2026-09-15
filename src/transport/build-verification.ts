@@ -23,7 +23,12 @@
  *   returns the install root to the last known good build and ends the process so the
  *   supervisor starts it there. Counting at *start* rather than on an observed failure
  *   is what makes a build that dies before reaching any code of its own recoverable:
- *   the count is already on disk by the time it dies. That guarantee is why
+ *   the count is already on disk by the time it dies. The budget it is measured
+ *   against is `MAX_FAILED_STARTS` *plus* the peers that adopted this build, because
+ *   the record is keyed on the install root while the failure it describes is one
+ *   daemon's: on a shared install root the peers' own healthy restarts land on this
+ *   same counter, and spending the budget on them would roll a working machine back
+ *   (issue #973). That guarantee is why
  *   `./connect-entry.ts` is a bootstrap that reaches `./worker-main.ts` through a
  *   dynamic import, and why this module keeps its own static imports down to the state
  *   mechanism — ESM evaluates static imports before any module body, so anything
@@ -98,13 +103,24 @@ export async function verifyStartupBuild(options: BuildVerificationOptions = {})
 	const pending = recordFailedStart(options);
 	if (!pending) return false;
 	const maxFailedStarts = options.maxFailedStarts ?? MAX_FAILED_STARTS;
+	// The counter is a fact about the install root and the budget is a fact about a
+	// daemon, and on a shared install root those differ (issue #973): every peer that
+	// adopted this build restarts into it once, and every one of those starts lands on
+	// this same record. Each adopter recorded itself when it took its licence to
+	// restart, so adding them back is what keeps this measuring one daemon failing
+	// `maxFailedStarts` starts in a row rather than a machine's worth of peers coming
+	// up healthily. On a machine with one daemon `adoptingPeers` is 0 and this is the
+	// constant it always was.
+	const budget = maxFailedStarts + pending.adoptingPeers;
 	const meta = {
 		commit: pending.commit,
 		previousCommit: pending.previousCommit,
 		failedStarts: pending.failedStarts,
 		maxFailedStarts,
+		adoptingPeers: pending.adoptingPeers,
+		failedStartBudget: budget,
 	};
-	if (pending.failedStarts >= maxFailedStarts) {
+	if (pending.failedStarts >= budget) {
 		logger.error('giving up on the updated SWARM build — it never handshaked', meta);
 		return performReturn(options, logger, pending);
 	}
