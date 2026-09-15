@@ -337,6 +337,7 @@ describe('workers.list (installation roster, issue #133)', () => {
 				workerId: WORKER_ID,
 				displayName: 'ada-laptop',
 				lastSeenAt: null,
+				rateLimits: [],
 				build: { commit: 'b'.repeat(40), dirty: true },
 				buildIsCurrent: false,
 			},
@@ -354,8 +355,13 @@ describe('workers.list (installation roster, issue #133)', () => {
 		// Named `a`/`b` so the ordering the unscoped list applies (issue #808) leaves
 		// them in this sequence — this test is about the timestamp, not the sort.
 		listDashboardWorkers.mockResolvedValue([
-			{ workerId: WORKER_ID, displayName: 'a', lastSeenAt: new Date('2026-07-01T12:00:00.000Z') },
-			{ workerId: 'w2', displayName: 'b', lastSeenAt: null },
+			{
+				workerId: WORKER_ID,
+				displayName: 'a',
+				lastSeenAt: new Date('2026-07-01T12:00:00.000Z'),
+				rateLimits: [],
+			},
+			{ workerId: 'w2', displayName: 'b', lastSeenAt: null, rateLimits: [] },
 		]);
 
 		const rows = await admin.list();
@@ -380,6 +386,9 @@ function rosterRow(
 		workerId,
 		displayName: labels.name ?? workerId,
 		lastSeenAt: null,
+		// Cooling on nothing (issue #988) — the roster carries the list so `swarm
+		// workers list` can mark a machine, and the router serializes it per row.
+		rateLimits: [],
 		owner: ownerUserId
 			? {
 					userId: ownerUserId,
@@ -565,7 +574,7 @@ describe('workers.list scoped to one project (issue #574)', () => {
 	it('still serves a non-admin contributor the roster of a project they are enrolled in', async () => {
 		getMembership.mockResolvedValue(membershipFor('contributor'));
 		listDashboardWorkers.mockResolvedValue([
-			{ workerId: WORKER_ID, lastSeenAt: new Date('2026-07-01T12:00:00.000Z') },
+			{ workerId: WORKER_ID, lastSeenAt: new Date('2026-07-01T12:00:00.000Z'), rateLimits: [] },
 		]);
 
 		const rows = await owner.list({ projectId: 'p1' });
@@ -575,6 +584,7 @@ describe('workers.list scoped to one project (issue #574)', () => {
 				workerId: WORKER_ID,
 				lastSeenAt: '2026-07-01T12:00:00.000Z',
 				drainingSince: null,
+				rateLimits: [],
 				update: null,
 			},
 		]);
@@ -602,6 +612,8 @@ describe('workers.getById (worker detail, issue #477)', () => {
 			// Issue #977 — the service's own scope filtering has already run, so the
 			// default here is a machine nobody has asked.
 			updateHistory: [],
+			// Cooling on nothing (issue #988), the default a machine is in.
+			rateLimits: [],
 			enrollments: [{ enrollmentId: ENROLLMENT_ID, projectId: 'p1', status: 'active' }],
 			...overrides,
 		};
@@ -889,11 +901,46 @@ describe('workers.register (issue #799)', () => {
 
 describe('workers.listMine (owner self-service)', () => {
 	it('returns only the caller’s own workers', async () => {
-		const views = [{ workerId: WORKER_ID, displayName: 'ada-laptop' }];
+		const views = [{ workerId: WORKER_ID, displayName: 'ada-laptop', rateLimits: [] }];
 		listOwnerWorkers.mockResolvedValue(views);
 
-		await expect(owner.listMine()).resolves.toBe(views);
+		// Content rather than identity: since issue #988 the procedure serializes each
+		// row's cool-downs on the way out, exactly as `list` does, so it answers a new
+		// array. Everything else is passed through untouched.
+		await expect(owner.listMine()).resolves.toEqual(views);
 		expect(listOwnerWorkers).toHaveBeenCalledWith(OWNER_ID);
+	});
+
+	// Issue #988: `swarm workers list` reads this procedure for the caller's own
+	// machines and `workers.list` for anyone else's, so both must hand the CLI one
+	// cool-down shape — ISO instants, and no redundant `workerId` per record.
+	it('serializes a cooling machine’s records exactly as the installation roster does', async () => {
+		listOwnerWorkers.mockResolvedValue([
+			{
+				workerId: WORKER_ID,
+				displayName: 'ada-laptop',
+				rateLimits: [
+					{
+						workerId: WORKER_ID,
+						cli: 'claude',
+						expiresAt: new Date('2026-07-01T18:00:00.000Z'),
+						observedAt: new Date('2026-07-01T12:00:00.000Z'),
+						resetHint: 'resets at 6pm',
+					},
+				],
+			},
+		]);
+
+		const [row] = await owner.listMine();
+
+		expect(row.rateLimits).toEqual([
+			{
+				cli: 'claude',
+				expiresAt: '2026-07-01T18:00:00.000Z',
+				observedAt: '2026-07-01T12:00:00.000Z',
+				resetHint: 'resets at 6pm',
+			},
+		]);
 	});
 });
 

@@ -244,9 +244,10 @@ const jobBase = z.object({
 	 * busy, consent was revoked, an enrollment is not active, or no enrolled
 	 * worker can run any configured target — so it waits as a token-free dispatch
 	 * (no worktree, no agent) and is re-evaluated on the same cadence as a
-	 * dependency re-check. **One counter, two wait reasons** (issue #607): the row
-	 * records `worker-eligibility` when a machine is merely busy or offline and
-	 * `worker-authorization` when only a human can clear the refusal, and both
+	 * dependency re-check. **One counter, three wait reasons** (issues #607, #988):
+	 * the row records `worker-eligibility` when a machine is merely busy or offline,
+	 * `worker-rate-limited` when every candidate has hit its usage limit, and
+	 * `worker-authorization` when only a human can clear the refusal, and all three
 	 * spend this same budget on the same cadence. Absent on a fresh webhook;
 	 * incremented on each re-check so the wait is bounded and finally surfaces the
 	 * actionable reason instead of polling forever. A separate budget from

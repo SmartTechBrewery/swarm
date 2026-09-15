@@ -247,6 +247,22 @@ it does not (a PR-driven phase has no board card to take a title from). The Work
 table marks every drained machine in its **Status** column, beside — never instead
 of — Online/Offline, since a drained machine that is online is still online.
 
+**When a machine is idle and you did not drain it.** The other reason SWARM stops
+giving a machine work is that one of its agent CLIs reported its usage allowance
+spent on a real run (issue #981). That is recorded per `(machine, CLI)` with the
+instant the allowance is expected back, and it is **not** a drain: nobody set it,
+nothing clears it by hand, it lapses by itself at that instant, and the machine goes
+on taking work on its *other* CLIs throughout. Read it in the two places it is
+surfaced (issue #988): `swarm workers list` marks such a machine `rate-limited:
+<cli>` beside the `draining` suffix — naming the CLIs, because the machine as a whole
+is not idle — and the machine's dashboard page has a **Usage limits** section, above
+Pool membership, giving each cooling CLI, when it is expected back, and the CLI's own
+reset wording. A machine cooling on nothing shows neither. On the **Queue**, work held
+back because *every* candidate machine is cooling reads "waiting for a usage limit to
+reset" rather than "waiting for an available worker", so it is distinguishable from a
+fleet that is genuinely busy or unauthorized; nothing needs doing to either, and the
+work starts by itself once the first allowance returns.
+
 **Updating one from the control plane.** A machine can be asked to move its SWARM
 **install root** to a build and restart into it, instead of pulling by hand on every
 host (issue #933) — and since issue #975 there is no per-host setting that can refuse.

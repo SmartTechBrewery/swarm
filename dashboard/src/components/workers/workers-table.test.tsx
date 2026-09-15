@@ -68,6 +68,9 @@ function makeWorker(overrides: Partial<WorkerRow> = {}): WorkerRow {
 		lastSeenAt: NOW.toISOString(),
 		// In the dispatch pool; a drained machine is the marked exception (issue #926).
 		drainingSince: null,
+		// No live CLI cool-down (issue #988) — the marked exception is a machine whose
+		// own CLI reported a spent usage allowance.
+		rateLimits: [],
 		// Never asked to update (issue #978) — the `Updating` mark's absent case.
 		update: null,
 		currentRun: null,

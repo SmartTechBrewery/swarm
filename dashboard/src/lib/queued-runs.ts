@@ -67,6 +67,13 @@ const QUEUED_WAIT_REASON_LABELS: Record<QueuedWaitReason, string> = {
 	// approve an enrollment, permit the phase, enroll a worker that runs the CLI).
 	'worker-eligibility': 'waiting for an available worker',
 	'worker-authorization': 'waiting for a worker to be authorized',
+	// The third of the gate's waits (issue #988), and the one neither of the two above
+	// describes: the machines are enrolled, consented and capable — they have simply
+	// spent their allowance. Names the *usage limit* rather than the worker, because
+	// nothing about the fleet is the problem and nothing an operator does to it helps;
+	// the wait ends when the first allowance refills. Which machine is cooling on which
+	// CLI is the Workers screen's to say.
+	'worker-rate-limited': 'waiting for a usage limit to reset',
 	// Deliberately names the *machine* rather than "a worker": every other worker in
 	// the project may be free and it changes nothing, because this dispatch continues
 	// work preserved on one specific machine (issue #567).

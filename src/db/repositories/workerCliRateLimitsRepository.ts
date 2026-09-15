@@ -1,4 +1,4 @@
-import { and, gt, inArray } from 'drizzle-orm';
+import { and, asc, gt, inArray } from 'drizzle-orm';
 
 import type { AgentCli } from '../../harness/agent-cli.js';
 import { getDb } from '../client.js';
@@ -90,4 +90,67 @@ export async function listActiveWorkerCliRateLimits(
 		byWorker.set(row.workerId, clis);
 	}
 	return byWorker;
+}
+
+/**
+ * The same **live** cool-downs as {@link listActiveWorkerCliRateLimits}, as whole
+ * rows grouped by worker — the read-model sibling of the gate's map (issue #988).
+ *
+ * Two shapes rather than one because the two callers want different facts. The
+ * gate asks "may this pairing run right now?" and needs nothing but the expiry,
+ * while an operator surface has to *say* which CLI, since when it was observed, and
+ * what the CLI's own reset text said — none of which a `(cli → expiresAt)` map
+ * carries. Grouped-and-batched for the same reason the gate's read is: the Workers
+ * roster asks for a whole fleet at once, and a per-row query there is an N+1 on a
+ * screen that polls.
+ *
+ * The same self-releasing filter applies: an expired row is simply not returned,
+ * and an empty `workerIds` answers an empty map without touching the database.
+ * Rows are ordered by CLI so a rendered list is stable between polls.
+ */
+export async function listActiveCliRateLimitsForWorkers(
+	workerIds: string[],
+	asOf: Date = new Date(),
+): Promise<Map<string, WorkerCliRateLimit[]>> {
+	const byWorker = new Map<string, WorkerCliRateLimit[]>();
+	if (workerIds.length === 0) return byWorker;
+	const rows = await getDb()
+		.select()
+		.from(workerCliRateLimits)
+		.where(
+			and(
+				inArray(workerCliRateLimits.workerId, workerIds),
+				gt(workerCliRateLimits.expiresAt, asOf),
+			),
+		)
+		.orderBy(asc(workerCliRateLimits.cli));
+	for (const row of rows) {
+		const limits = byWorker.get(row.workerId) ?? [];
+		limits.push({
+			workerId: row.workerId,
+			cli: row.cli as AgentCli,
+			expiresAt: row.expiresAt,
+			observedAt: row.observedAt,
+			resetHint: row.resetHint,
+		});
+		byWorker.set(row.workerId, limits);
+	}
+	return byWorker;
+}
+
+/**
+ * One machine's **live** cool-downs, newest-observation-per-CLI as stored — the
+ * single-worker sibling of {@link listActiveCliRateLimitsForWorkers}, for the
+ * detail read that already knows which machine it is about (issue #988).
+ *
+ * An empty array means the machine is cooling on nothing, which is the same answer
+ * as "never hit a limit" and deliberately so: the record is self-releasing, so
+ * there is no third state for a surface to distinguish.
+ */
+export async function listActiveCliRateLimitsForWorker(
+	workerId: string,
+	asOf: Date = new Date(),
+): Promise<WorkerCliRateLimit[]> {
+	const byWorker = await listActiveCliRateLimitsForWorkers([workerId], asOf);
+	return byWorker.get(workerId) ?? [];
 }

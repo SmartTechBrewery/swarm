@@ -6,6 +6,7 @@ import { z } from 'zod';
 import { findProjectByIdFromDb } from '../../db/repositories/projectsRepository.js';
 import type { WorkerUpdateRunRow } from '../../db/repositories/runsRepository.js';
 import { findUserByIdentifier, listUsers } from '../../db/repositories/usersRepository.js';
+import type { WorkerCliRateLimit } from '../../db/repositories/workerCliRateLimitsRepository.js';
 import { removeWorker } from '../../db/repositories/workersRepository.js';
 import { AgentCliSchema } from '../../harness/agent-cli.js';
 import { isInstanceAdmin, type SwarmUser } from '../../identity/schema.js';
@@ -377,6 +378,26 @@ function serializeWorkerUpdate(update: WorkerUpdateState | null) {
 }
 
 /**
+ * The wire form of a machine's live CLI cool-downs (issue #988) — the same
+ * explicit ISO-timestamp treatment {@link serializeWorkerUpdate} and
+ * `drainingSince` already get, over each record's two instants.
+ *
+ * `workerId` is deliberately dropped: the row it hangs off already names the
+ * machine, and repeating it would only invite a client to key on it. Everything
+ * left is non-secret by construction — a CLI identifier, two instants, and the
+ * CLI's own verbatim reset text. Ordering is the repository's (by CLI) and is not
+ * re-sorted here.
+ */
+function serializeWorkerRateLimits(rateLimits: WorkerCliRateLimit[]) {
+	return rateLimits.map((limit) => ({
+		cli: limit.cli,
+		expiresAt: limit.expiresAt.toISOString(),
+		observedAt: limit.observedAt.toISOString(),
+		resetHint: limit.resetHint,
+	}));
+}
+
+/**
  * The wire form of a machine's update history (issue #977) — the same explicit
  * ISO-timestamp treatment {@link serializeWorkerUpdate} applies, over each entry's
  * two instants. Ordering is the service's (newest first) and is not re-sorted here.
@@ -506,6 +527,7 @@ export const workersRouter = router({
 				...worker,
 				lastSeenAt: worker.lastSeenAt?.toISOString() ?? null,
 				drainingSince: worker.drainingSince?.toISOString() ?? null,
+				rateLimits: serializeWorkerRateLimits(worker.rateLimits),
 				update: serializeWorkerUpdate(worker.update),
 			}));
 		}),
@@ -544,6 +566,7 @@ export const workersRouter = router({
 				...detail,
 				lastSeenAt: detail.lastSeenAt?.toISOString() ?? null,
 				drainingSince: detail.drainingSince?.toISOString() ?? null,
+				rateLimits: serializeWorkerRateLimits(detail.rateLimits),
 				update: serializeWorkerUpdate(detail.update),
 				updateHistory: serializeWorkerUpdateHistory(detail.updateHistory),
 				viewerIsOwner,
@@ -629,7 +652,15 @@ export const workersRouter = router({
 	// The caller's own workers and their enrollments, with derived run state. A
 	// user who operates no workers gets an empty list.
 	listMine: authedProcedure.query(async ({ ctx }) => {
-		return await listOwnerWorkers(ctx.user.id);
+		const workers = await listOwnerWorkers(ctx.user.id);
+		// Mapped for the same reason `list` maps (issue #988), even though this view's
+		// other instants reach the wire as ISO strings on `JSON.stringify` alone: the
+		// serializer also drops each record's redundant `workerId`, so `swarm workers
+		// list` parses **one** cool-down shape whichever of the two reads answered it.
+		return workers.map((worker) => ({
+			...worker,
+			rateLimits: serializeWorkerRateLimits(worker.rateLimits),
+		}));
 	}),
 
 	// Rename one of the caller's own workers — the machine's own label, not a

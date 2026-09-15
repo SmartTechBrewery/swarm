@@ -1006,6 +1006,13 @@ function deferralWaitReason(
 		// coming online can change that verdict. Timing is identical either way; the
 		// row is where an operator sees which wait clears by itself.
 		const reason = outcome.workerIneligibilityReason;
+		// Checked ahead of that split (issue #988): a cool-down *is* an availability
+		// refusal — phase 1/2 classified it so deliberately, and this leaves that
+		// classification alone — but "every machine has spent its allowance" and "some
+		// machine is merely busy" are different answers to the operator's question, and
+		// only the second is helped by looking at the fleet. The row is the only place
+		// that difference survives.
+		if (reason === 'cli-rate-limited') return 'worker-rate-limited';
 		return reason && !isAvailabilityRefusal(reason) ? 'worker-authorization' : 'worker-eligibility';
 	}
 	return waitReasonForDeferral(outcome.failureKind);

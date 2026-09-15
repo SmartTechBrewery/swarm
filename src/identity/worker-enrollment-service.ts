@@ -76,7 +76,12 @@ import {
 	type WorkerUpdateRunRow,
 } from '../db/repositories/runsRepository.js';
 import { getUserById } from '../db/repositories/usersRepository.js';
-import { listActiveWorkerCliRateLimits } from '../db/repositories/workerCliRateLimitsRepository.js';
+import {
+	listActiveCliRateLimitsForWorker,
+	listActiveCliRateLimitsForWorkers,
+	listActiveWorkerCliRateLimits,
+	type WorkerCliRateLimit,
+} from '../db/repositories/workerCliRateLimitsRepository.js';
 import {
 	createEnrollment,
 	getEnrollmentById,
@@ -197,6 +202,16 @@ export interface OwnerWorkerView {
 	 * work is given, `runState.busy` whether the old work has finished.
 	 */
 	drainingSince: Date | null;
+	/**
+	 * The machine's **live CLI cool-downs** (issue #988), `[]` when it is cooling on
+	 * nothing — the third half of the same "why is this machine idle?" question the
+	 * two fields around it answer, and the one the machine reported about *itself*
+	 * rather than one its owner declared. See
+	 * {@link DashboardWorkerView.rateLimits}; this view carries it for the same
+	 * reason, so `swarm workers list` marks a cooling machine whichever of the two
+	 * reads answered it.
+	 */
+	rateLimits: WorkerCliRateLimit[];
 	/**
 	 * The self-update this machine was last asked for and what came of it (issue
 	 * #933), or `null` while nobody has asked. Surfaced beside `drainingSince` for the
@@ -406,6 +421,8 @@ export async function listProjectWorkerIdsInOrder(projectId: string): Promise<st
  */
 export async function listOwnerWorkers(ownerUserId: string): Promise<OwnerWorkerView[]> {
 	const workers = await listWorkersForOwner(ownerUserId);
+	// One query for the owner's whole set (issue #988), as on the installation roster.
+	const rateLimits = await listActiveCliRateLimitsForWorkers(workers.map((worker) => worker.id));
 	const views: OwnerWorkerView[] = [];
 	for (const worker of workers) {
 		const enrollments = await listEnrollmentsForWorker(worker.id);
@@ -415,6 +432,7 @@ export async function listOwnerWorkers(ownerUserId: string): Promise<OwnerWorker
 			displayName: worker.displayName,
 			capabilities: worker.capabilities,
 			drainingSince: worker.drainingSince,
+			rateLimits: rateLimits.get(worker.id) ?? [],
 			update: worker.update,
 			runState,
 			enrollments: enrollments.map(assembleOwnerEnrollmentView),
@@ -513,6 +531,29 @@ export interface DashboardWorkerView {
 	 * reconnect does not clear this — only an operator does.
 	 */
 	drainingSince: Date | null;
+	/**
+	 * The machine's **live CLI cool-downs** (issue #988, over issue #981's record) —
+	 * one entry per CLI whose usage limit has not lapsed yet, `[]` for a machine
+	 * cooling on nothing.
+	 *
+	 * Read *alongside* `drainingSince`, never in place of it: they are the two ends
+	 * of "why is this machine not taking work?" and they differ in every way that
+	 * matters to an operator. A drain is **operator-declared**, machine-wide, and
+	 * reversed only by a human; a cool-down is **observed** — the machine's own CLI
+	 * said its allowance was spent on a real run — per CLI, and reverses by itself at
+	 * the instant it names. A machine can be cooling on one CLI while taking work on
+	 * another, which is exactly what makes the per-entry list the honest shape.
+	 *
+	 * Non-secret, like every other field here: a CLI identifier, two instants and the
+	 * CLI's own verbatim reset text are the whole of it — no path, no credential, and
+	 * nothing about what ran.
+	 *
+	 * On the shared row rather than the detail view alone, because `swarm workers
+	 * list` marks a cooling machine (issue #988) and the CLI reads the roster, not
+	 * the detail. It costs the roster one batched query for the whole fleet
+	 * (`listActiveCliRateLimitsForWorkers`), not one per row.
+	 */
+	rateLimits: WorkerCliRateLimit[];
 	/**
 	 * The SWARM build the machine's daemon declared it is running (issue #925) — the
 	 * commit its install root is on plus the dirty flag — or `null` when it declared
@@ -726,8 +767,14 @@ export async function listDashboardWorkers(
 	// build of the process serving this read is fixed for its life, and reading it
 	// per row would only invite N rows judged against two different answers.
 	const controlPlaneBuild = await resolveOwnBuildIdentity();
+	const allWorkers = await listAllWorkers();
+	// One query for the whole fleet's live cool-downs (issue #988), resolved before
+	// the loop for the same reason `controlPlaneBuild` is: a read per row would be an
+	// N+1 on a screen that polls, and rows judged `asOf` different instants would let
+	// one lapsing mid-roster render inconsistently.
+	const rateLimits = await listActiveCliRateLimitsForWorkers(allWorkers.map((w) => w.id));
 	const views: DashboardWorkerView[] = [];
-	for (const worker of await listAllWorkers()) {
+	for (const worker of allWorkers) {
 		const enrollments = await listEnrollmentsForWorker(worker.id);
 		const visible = accessible
 			? enrollments.filter((enrollment) => accessible.has(enrollment.projectId))
@@ -735,7 +782,15 @@ export async function listDashboardWorkers(
 		// A restricted viewer only sees a machine they share a project with; an
 		// administrator also sees a registered-but-never-enrolled one.
 		if (accessible && visible.length === 0) continue;
-		views.push(await assembleDashboardWorker(worker, visible, accessible, controlPlaneBuild));
+		views.push(
+			await assembleDashboardWorker(
+				worker,
+				visible,
+				accessible,
+				controlPlaneBuild,
+				rateLimits.get(worker.id) ?? [],
+			),
+		);
 	}
 	return views;
 }
@@ -776,7 +831,13 @@ export async function getDashboardWorkerDetail(
 	const controlPlaneBuild = await resolveOwnBuildIdentity();
 	// Spreading the *assembled view* (not a row) keeps the one place that names
 	// the safe worker fields — `assembleDashboardWorker` — as the only assembler.
-	const row = await assembleDashboardWorker(worker, visible, accessible, controlPlaneBuild);
+	const row = await assembleDashboardWorker(
+		worker,
+		visible,
+		accessible,
+		controlPlaneBuild,
+		await listActiveCliRateLimitsForWorker(worker.id),
+	);
 	const updateHistory = await listWorkerUpdateRunsForWorker(worker.id);
 	return {
 		...row,
@@ -834,6 +895,7 @@ async function assembleDashboardWorker(
 	enrollments: WorkerEnrollment[],
 	accessible: Set<string> | null,
 	controlPlaneBuild: WorkerBuild | undefined,
+	rateLimits: WorkerCliRateLimit[],
 ): Promise<DashboardWorkerView> {
 	const ownerUser = await getUserById(worker.ownerUserId);
 	const liveSession = await getLiveSessionForWorker(worker.id);
@@ -854,6 +916,10 @@ async function assembleDashboardWorker(
 		supportedPhases: worker.supportedPhases,
 		repository: worker.repository,
 		drainingSince: worker.drainingSince,
+		// Resolved by the caller, never here: both callers read the whole set they are
+		// about in one query, so an assembler-side read would re-introduce the N+1 the
+		// batched repository read exists to avoid.
+		rateLimits,
 		build: worker.build,
 		buildIsCurrent: buildMatchesControlPlane(worker.build, controlPlaneBuild),
 		update: worker.update,

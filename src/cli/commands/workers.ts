@@ -425,6 +425,23 @@ const WorkerUpdateStateSchema = z.object({
 });
 type WorkerUpdateState = z.infer<typeof WorkerUpdateStateSchema>;
 
+/**
+ * One live CLI cool-down on a worker row (issue #988) — the machine's own CLI
+ * reported its allowance spent, and this is when it is expected back.
+ *
+ * `cli` is a plain string on this file's own rule: it is printed rather than acted
+ * on, so a control plane that learns a fourth CLI must not make `list` fail. Only
+ * the CLI name is read here; the expiry, the observation time and the CLI's reset
+ * text are the Workers screen's to render.
+ */
+const WorkerRateLimitSchema = z.object({
+	cli: z.string().min(1),
+	expiresAt: z.string().min(1),
+	observedAt: z.string().min(1),
+	resetHint: z.string().nullable().optional(),
+});
+type WorkerRateLimit = z.infer<typeof WorkerRateLimitSchema>;
+
 const RosterSchema = z.array(
 	z.object({
 		workerId: z.string().min(1),
@@ -433,6 +450,7 @@ const RosterSchema = z.array(
 		// Optional per this file's own rule: a control plane answering with fewer
 		// fields than these is not a failure, so an older one simply marks nothing.
 		drainingSince: z.string().nullable().optional(),
+		rateLimits: z.array(WorkerRateLimitSchema).optional(),
 		update: WorkerUpdateStateSchema.nullable().optional(),
 		owner: z.object({ identifier: z.string().min(1) }).nullable(),
 	}),
@@ -444,6 +462,7 @@ const OwnWorkersSchema = z.array(
 		displayName: z.string().min(1),
 		capabilities: CapabilityListSchema,
 		drainingSince: z.string().nullable().optional(),
+		rateLimits: z.array(WorkerRateLimitSchema).optional(),
 		update: WorkerUpdateStateSchema.nullable().optional(),
 	}),
 );
@@ -822,6 +841,14 @@ async function registerWorkerCommand(argv: string[]): Promise<number> {
  * `draining` (issue #919), so an operator scanning the list can see at a glance
  * which machines are taking no work — a drain is sticky and expires on nothing, so
  * without the marker a machine left drained is silently idle forever.
+ *
+ * A machine cooling on a usage limit is marked beside it (issue #988), and the two
+ * marks are deliberately separate: a drain is machine-wide and a human's, while a
+ * cool-down is per CLI and the machine's own observation, so a machine can carry
+ * both, or carry one and still be taking work through the other CLIs it declares.
+ * That is why the mark **names the cooling CLIs** rather than the machine — a bare
+ * `rate-limited` would read as "idle", which a machine with three CLIs and one
+ * cool-down is not.
  */
 function printWorker(
 	workerId: string,
@@ -830,10 +857,26 @@ function printWorker(
 	ownerIdentifier?: string,
 	drainingSince?: string | null,
 	update?: WorkerUpdateState | null,
+	rateLimits?: WorkerRateLimit[],
 ): void {
 	const prefix = ownerIdentifier ? `${ownerIdentifier}\t` : '';
-	const suffix = `${drainingSince ? '\tdraining' : ''}${describeUpdate(update)}`;
+	const suffix = `${drainingSince ? '\tdraining' : ''}${describeRateLimits(rateLimits)}${describeUpdate(update)}`;
 	out.info(`${prefix}${workerId}\t${displayName}\t${capabilities.join(',')}${suffix}`);
+}
+
+/**
+ * The cool-down marker on a `list` line (issue #988): which of the machine's CLIs
+ * are waiting on a usage limit right now. Nothing at all when none are — the record
+ * releases itself at its own expiry, so an absent mark is the same honest answer as
+ * "never hit a limit" and needs no separate wording.
+ *
+ * The expiry is deliberately not printed: an instant means nothing on a scan line,
+ * the Workers screen renders it properly, and the operator question this line
+ * answers is "which machines are not fully available?" rather than "until when?".
+ */
+function describeRateLimits(rateLimits?: WorkerRateLimit[]): string {
+	if (!rateLimits || rateLimits.length === 0) return '';
+	return `\trate-limited: ${rateLimits.map((limit) => limit.cli).join(',')}`;
 }
 
 /**
@@ -891,6 +934,7 @@ async function listWorkersCommand(argv: string[]): Promise<number> {
 				undefined,
 				worker.drainingSince,
 				worker.update,
+				worker.rateLimits,
 			);
 		}
 		return 0;
@@ -913,6 +957,7 @@ async function listWorkersCommand(argv: string[]): Promise<number> {
 				undefined,
 				worker.drainingSince,
 				worker.update,
+				worker.rateLimits,
 			);
 		}
 		return 0;
@@ -930,6 +975,7 @@ async function listWorkersCommand(argv: string[]): Promise<number> {
 			worker.owner?.identifier,
 			worker.drainingSince,
 			worker.update,
+			worker.rateLimits,
 		);
 	}
 	return 0;

@@ -2,6 +2,8 @@ import { beforeEach, describe, expect, it } from 'vitest';
 
 import { createUser } from '../../../src/db/repositories/usersRepository.js';
 import {
+	listActiveCliRateLimitsForWorker,
+	listActiveCliRateLimitsForWorkers,
 	listActiveWorkerCliRateLimits,
 	recordWorkerCliRateLimit,
 } from '../../../src/db/repositories/workerCliRateLimitsRepository.js';
@@ -123,6 +125,94 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 
 		it('answers an empty map for no workers at all', async () => {
 			expect(await listActiveWorkerCliRateLimits([], NOW)).toEqual(new Map());
+		});
+
+		// Issue #988's read-model half. The operator surfaces need what the gate's map
+		// throws away — which CLI, when it was observed, and the CLI's own words — but
+		// they must inherit the same self-releasing filter, or the Workers screen would
+		// keep naming a machine that is back and taking work.
+		describe('listActiveCliRateLimitsForWorker', () => {
+			it('returns the whole record, ordered by CLI, for one machine', async () => {
+				await recordWorkerCliRateLimit({
+					workerId,
+					cli: 'codex',
+					expiresAt: IN_TWO_HOURS,
+					observedAt: NOW,
+				});
+				await recordWorkerCliRateLimit({
+					workerId,
+					cli: 'claude',
+					expiresAt: IN_AN_HOUR,
+					observedAt: NOW,
+					resetHint: 'resets at 1pm',
+				});
+				// Another machine's cool-down is not this one's.
+				await recordWorkerCliRateLimit({
+					workerId: otherWorkerId,
+					cli: 'claude',
+					expiresAt: IN_TWO_HOURS,
+					observedAt: NOW,
+				});
+
+				expect(await listActiveCliRateLimitsForWorker(workerId, NOW)).toEqual([
+					{
+						workerId,
+						cli: 'claude',
+						expiresAt: IN_AN_HOUR,
+						observedAt: NOW,
+						resetHint: 'resets at 1pm',
+					},
+					{ workerId, cli: 'codex', expiresAt: IN_TWO_HOURS, observedAt: NOW, resetHint: null },
+				]);
+			});
+
+			// The same filter the gate's read applies: a lapsed row is invisible, so the
+			// surface stops naming the machine without anything having to clear it.
+			it('filters a lapsed record out, leaving the machine’s live one', async () => {
+				await recordWorkerCliRateLimit({
+					workerId,
+					cli: 'claude',
+					expiresAt: AN_HOUR_AGO,
+					observedAt: AN_HOUR_AGO,
+				});
+				await recordWorkerCliRateLimit({
+					workerId,
+					cli: 'codex',
+					expiresAt: IN_AN_HOUR,
+					observedAt: NOW,
+				});
+
+				const live = await listActiveCliRateLimitsForWorker(workerId, NOW);
+				expect(live.map((limit) => limit.cli)).toEqual(['codex']);
+			});
+
+			it('answers an empty list for a machine cooling on nothing', async () => {
+				expect(await listActiveCliRateLimitsForWorker(workerId, NOW)).toEqual([]);
+			});
+
+			// The batched sibling the rosters read, which must agree with the single-worker
+			// one rather than being a second definition of "live".
+			it('groups a fleet’s live records by machine, and answers nothing for no machines', async () => {
+				await recordWorkerCliRateLimit({
+					workerId,
+					cli: 'claude',
+					expiresAt: IN_AN_HOUR,
+					observedAt: NOW,
+				});
+				await recordWorkerCliRateLimit({
+					workerId: otherWorkerId,
+					cli: 'claude',
+					expiresAt: AN_HOUR_AGO,
+					observedAt: AN_HOUR_AGO,
+				});
+
+				const byWorker = await listActiveCliRateLimitsForWorkers([workerId, otherWorkerId], NOW);
+				expect(byWorker.get(workerId)).toEqual(
+					await listActiveCliRateLimitsForWorker(workerId, NOW),
+				);
+				expect(byWorker.get(otherWorkerId)).toBeUndefined();
+				expect(await listActiveCliRateLimitsForWorkers([], NOW)).toEqual(new Map());
+			});
 		});
 
 		it('cascades a deregistered worker’s records away with it', async () => {

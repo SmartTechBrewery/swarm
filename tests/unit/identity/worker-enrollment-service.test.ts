@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import type { WorkerCliRateLimit } from '@/db/repositories/workerCliRateLimitsRepository.js';
 import type { AgentCli } from '@/harness/agent-cli.js';
 
 const {
@@ -89,9 +90,19 @@ vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
 const listActiveWorkerCliRateLimits = vi.fn<
 	(workerIds: string[], asOf?: Date) => Promise<Map<string, Map<AgentCli, Date>>>
 >(async () => new Map());
+// The read-model sibling (issue #988): whole rows grouped by machine, which is what
+// the two rosters and the detail read carry onto their views. Cooling on nothing
+// unless a case says so, same as above.
+const listActiveCliRateLimitsForWorkers = vi.fn<
+	(workerIds: string[], asOf?: Date) => Promise<Map<string, WorkerCliRateLimit[]>>
+>(async () => new Map());
 vi.mock('@/db/repositories/workerCliRateLimitsRepository.js', () => ({
 	listActiveWorkerCliRateLimits: (...args: [string[], (Date | undefined)?]) =>
 		listActiveWorkerCliRateLimits(...args),
+	listActiveCliRateLimitsForWorkers: (...args: [string[], (Date | undefined)?]) =>
+		listActiveCliRateLimitsForWorkers(...args),
+	listActiveCliRateLimitsForWorker: async (workerId: string, asOf?: Date) =>
+		(await listActiveCliRateLimitsForWorkers([workerId], asOf)).get(workerId) ?? [],
 }));
 // Spread the real module and override the one export: `WorkerBuildSchema` beside it
 // is what `@/identity/worker.js` parses rows with, so a factory returning only the
@@ -835,6 +846,24 @@ describe('listDashboardWorkers (issue #133)', () => {
 		getUserById.mockResolvedValue(makeOwner());
 		getLiveSessionForWorker.mockResolvedValue(liveSession(RUN_ID));
 		getRunByIdFromDb.mockResolvedValue(runningRun());
+		// Carry a live cool-down rather than the empty default, so the secret-free
+		// assertion below actually reads a populated record (issue #988).
+		listActiveCliRateLimitsForWorkers.mockResolvedValue(
+			new Map([
+				[
+					WORKER_ID,
+					[
+						{
+							workerId: WORKER_ID,
+							cli: 'claude' as AgentCli,
+							expiresAt: new Date('2026-07-01T18:00:00Z'),
+							observedAt: new Date('2026-07-01T12:00:00Z'),
+							resetHint: 'resets at 6pm',
+						},
+					],
+				],
+			]),
+		);
 
 		const [view] = await listDashboardWorkers(null);
 
@@ -847,6 +876,10 @@ describe('listDashboardWorkers (issue #133)', () => {
 				// Non-secret: an operator's statement that the machine is out of the pool
 				// (issue #919), not a path or a credential.
 				'drainingSince',
+				// Non-secret in the same way (issue #988), and the machine's *own*
+				// observation rather than an operator's statement: a CLI identifier, two
+				// instants, and the CLI's verbatim reset text. Nothing about what ran.
+				'rateLimits',
 				'enrollments',
 				'lastSeenAt',
 				'owner',

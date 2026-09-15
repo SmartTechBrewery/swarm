@@ -2871,6 +2871,7 @@ describe('processJob', () => {
 				activeRuns?: number;
 				repository?: string | null;
 				drainingSince?: Date | null;
+				rateLimitedClis?: Map<AgentCli, Date>;
 			} = {},
 		): WorkerDispatchCandidate {
 			const capabilities = overrides.capabilities ?? ['claude'];
@@ -2907,7 +2908,7 @@ describe('processJob', () => {
 				},
 				availability: { connected: true, activeRuns: overrides.activeRuns ?? 0 },
 				// Cooling on nothing (issue #981) — the regression bar for every case here.
-				rateLimitedClis: new Map(),
+				rateLimitedClis: overrides.rateLimitedClis ?? new Map(),
 			};
 		}
 
@@ -3004,6 +3005,54 @@ describe('processJob', () => {
 				workerEligibilityRecheckAttempt: 1,
 				rateLimitRetryAttempt: 3,
 			});
+		});
+
+		// Issue #988. The third wait. A cooling machine is an *availability* refusal
+		// (issue #981 classified it so), so without its own reason it would have read as
+		// `worker-eligibility` — "no capable worker" — which sends an operator looking at
+		// a fleet that is enrolled, consented, capable and simply out of allowance.
+		it('records a cooling machine as its own worker-rate-limited wait', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				candidate('w-1', {
+					rateLimitedClis: new Map([['claude', new Date('2026-07-01T18:00:00Z')]]),
+				}),
+			]);
+
+			const outcome = await processJob(
+				createMockPmWebhookJob({ rateLimitRetryAttempt: 3 }),
+				registryReturning(planningTrigger()),
+			);
+
+			expect(outcome).toMatchObject({ status: 'phase-deferred', workerEligibilityRecheck: true });
+			const [, input] = scheduleDispatchRetry.mock.calls[0] as [string, Record<string, unknown>];
+			expect(input.waitReason).toBe('worker-rate-limited');
+			// Same counter and the same untouched rate-limit budget as the other two waits:
+			// the split is read-model-only, exactly as issue #607's was.
+			expect(input.jobPayload).toMatchObject({
+				workerEligibilityRecheckAttempt: 1,
+				rateLimitRetryAttempt: 3,
+			});
+		});
+
+		// The other half of the same split: every refusal that is *not* a cool-down must
+		// keep the reason it already recorded, so the new value narrows rather than
+		// captures.
+		it('leaves every other refusal on the reason it already recorded', async () => {
+			async function waitReasonFor(candidates: WorkerDispatchCandidate[]) {
+				scheduleDispatchRetry.mockClear();
+				listProjectDispatchCandidates.mockResolvedValue(candidates);
+				await processJob(createMockPmWebhookJob(), registryReturning(planningTrigger()));
+				const [, input] = scheduleDispatchRetry.mock.calls[0] as [string, Record<string, unknown>];
+				return input.waitReason;
+			}
+
+			expect(await waitReasonFor([candidate('w-1', { activeRuns: 1 })])).toBe('worker-eligibility');
+			expect(await waitReasonFor([candidate('w-1', { sharingConsent: false })])).toBe(
+				'worker-authorization',
+			);
+			expect(await waitReasonFor([candidate('w-1', { drainingSince: new Date() })])).toBe(
+				'worker-authorization',
+			);
 		});
 
 		// Issue #714. A machine holding another repository is skipped by the gate rather
