@@ -139,6 +139,8 @@ function makeDetail(overrides: Partial<WorkerDetail> = {}): WorkerDetail {
 		declaredCapabilities: null,
 		probedCapabilities: ['claude'],
 		controlPlaneBuild: { commit: 'abc1234def5678', dirty: false },
+		// Never asked to update (issue #977) — the card's empty state.
+		updateHistory: [],
 		enrollments: [
 			{
 				enrollmentId: 'enr-1',

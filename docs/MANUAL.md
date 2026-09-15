@@ -295,6 +295,18 @@ are refused for a maintenance run server-side, and nothing in the dashboard can 
 an update already in flight — asking again with a different build supersedes the
 request instead.
 
+**And on the machine's own page** (issue #977). `/workers/<worker-id>` carries an
+**Update history** card, right under the build the daemon declares, listing that
+machine's most recent requests: the build each was asked to move to, when it was
+asked, how it ended, and — for a failure — the machine's own reason, with each entry
+linking to its run. So "when did this machine last update, and did it work?" is
+answered on the machine's page rather than by filtering the global runs list for it.
+It is bounded to the ten most recent (the runs list stays where the whole history is
+read and filtered), it is read from `runs` rather than from the machine's latest
+outcome, so a request is still there after the next one is made, and it shows nothing
+for a machine nobody has asked. It offers no action: a failed request is re-asked with
+`swarm workers update`, exactly as below.
+
 **The machine must be enrolled in a project.** That run has to hang off one, so a
 worker enrolled in **no** project is refused rather than silently asked: `swarm
 workers update` says so and writes nothing, the fleet forms report the machine as

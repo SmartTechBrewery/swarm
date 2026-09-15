@@ -599,6 +599,9 @@ describe('workers.getById (worker detail, issue #477)', () => {
 			displayName: 'ada-laptop',
 			ownerUserId: OWNER_ID,
 			lastSeenAt: new Date('2026-07-01T12:00:00.000Z'),
+			// Issue #977 — the service's own scope filtering has already run, so the
+			// default here is a machine nobody has asked.
+			updateHistory: [],
 			enrollments: [{ enrollmentId: ENROLLMENT_ID, projectId: 'p1', status: 'active' }],
 			...overrides,
 		};
@@ -633,6 +636,76 @@ describe('workers.getById (worker detail, issue #477)', () => {
 		expect(detail.build).toEqual({ commit: 'b'.repeat(40), dirty: false });
 		expect(detail.buildIsCurrent).toBe(false);
 		expect(detail.controlPlaneBuild).toEqual({ commit: 'a'.repeat(40), dirty: false });
+	});
+
+	// Issue #977 — the machine's own update history, which is `runs` rows rather than
+	// the single latest outcome `update` carries, and so has its own wire shaping.
+	it('serializes the update history’s instants and keeps the service’s order', async () => {
+		listAccessibleProjectIds.mockResolvedValue(['p1']);
+		getDashboardWorkerDetail.mockResolvedValue(
+			detailView({
+				updateHistory: [
+					{
+						runId: 'run-2',
+						projectId: 'p1',
+						target: 'v2',
+						status: 'running',
+						startedAt: new Date('2026-07-01T11:00:00.000Z'),
+						completedAt: null,
+						durationMs: null,
+						error: null,
+					},
+					{
+						runId: 'run-1',
+						projectId: 'p1',
+						target: 'v1',
+						status: 'failed',
+						startedAt: new Date('2026-07-01T09:00:00.000Z'),
+						completedAt: new Date('2026-07-01T09:00:30.000Z'),
+						durationMs: 30_000,
+						error: 'The install root is dirty.',
+					},
+				],
+			}),
+		);
+		getMembership.mockResolvedValue(membershipFor('contributor'));
+
+		const detail = await owner.getById({ workerId: WORKER_ID });
+
+		expect(detail.updateHistory).toEqual([
+			{
+				runId: 'run-2',
+				projectId: 'p1',
+				target: 'v2',
+				status: 'running',
+				startedAt: '2026-07-01T11:00:00.000Z',
+				completedAt: null,
+				durationMs: null,
+				error: null,
+			},
+			{
+				runId: 'run-1',
+				projectId: 'p1',
+				target: 'v1',
+				status: 'failed',
+				startedAt: '2026-07-01T09:00:00.000Z',
+				completedAt: '2026-07-01T09:00:30.000Z',
+				durationMs: 30_000,
+				error: 'The install root is dirty.',
+			},
+		]);
+	});
+
+	// The service withholds an entry outside the viewer's scope (the Active job rule);
+	// the router states the empty answer rather than inventing one.
+	it('reports an empty update history for a machine nobody has asked', async () => {
+		listAccessibleProjectIds.mockResolvedValue(['p1']);
+		getDashboardWorkerDetail.mockResolvedValue(detailView({ updateHistory: [] }));
+		getMembership.mockResolvedValue(membershipFor('contributor'));
+
+		const detail = await owner.getById({ workerId: WORKER_ID });
+
+		expect(detail.updateHistory).toEqual([]);
 	});
 
 	it('is NOT_FOUND for a worker the viewer may not see, exactly like a missing one', async () => {

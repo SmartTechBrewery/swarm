@@ -8,6 +8,7 @@ import { WorkerDrainCard } from '@/components/workers/worker-drain-card.js';
 import { WorkerEnrollDialog } from '@/components/workers/worker-enroll-dialog.js';
 import { WorkerEnrollmentCard } from '@/components/workers/worker-enrollment-card.js';
 import { WorkerOperatorCredentialsCard } from '@/components/workers/worker-operator-credentials-card.js';
+import { WorkerUpdateHistoryCard } from '@/components/workers/worker-update-history-card.js';
 import { formatPhase, formatRelativeTime } from '@/lib/format.js';
 import { sortPipelinePhases } from '@/lib/pipeline-phases.js';
 import { trpcClient } from '@/lib/trpc.js';
@@ -19,9 +20,10 @@ import type { AgentCli } from '../../../../src/harness/agent-cli.js';
  * One machine in full (issue #477) — where the Workers table is the scannable
  * index, this is where an operator understands and administers a single worker.
  * It is grouped into sections rather than a field dump: identity and owner,
- * connectivity, what the daemon declares, the active job, and one block per
- * project the machine is enrolled in ({@link WorkerEnrollmentCard}, which owns the
- * editable values and their authorization).
+ * connectivity, what the daemon declares, what it has been asked to move to
+ * ({@link WorkerUpdateHistoryCard}), the active job, and one block per project the
+ * machine is enrolled in ({@link WorkerEnrollmentCard}, which owns the editable
+ * values and their authorization).
  *
  * **The daemon's `supportedPhases`, `repository` and `build` are read-only; its CLI
  * set is not.** A daemon declares them all at handshake and re-declares them on every
@@ -636,6 +638,14 @@ export function WorkerDetailView({
 					narrow that list: to add a CLI, install it on the machine. <em>Use auto-detected CLIs</em>{' '}
 					clears the declaration and hands the list back to auto-detection.
 				</p>
+			</div>
+
+			{/* Directly after the card that names the build this machine is *on*, so what
+			    it was asked to move to reads beside it — and before Active job, which is
+			    about right now rather than about history (issue #977). */}
+			<div className={CARD_CLASS}>
+				<h2 className={SECTION_HEADING_CLASS}>Update history</h2>
+				<WorkerUpdateHistoryCard entries={worker.updateHistory} />
 			</div>
 
 			<div className={CARD_CLASS}>

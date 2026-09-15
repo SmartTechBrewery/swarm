@@ -119,6 +119,8 @@ function makeWorker(overrides: Partial<WorkerDetail> = {}): WorkerDetail {
 		lastSeenAt: NOW.toISOString(),
 		// In the dispatch pool — the Pool membership card offers the drain (issue #926).
 		drainingSince: null,
+		// Never asked to update (issue #977) — the Update history card's empty state.
+		updateHistory: [],
 		currentRun: null,
 		viewerIsOwner: true,
 		enrollments: [makeEnrollment()],
@@ -336,6 +338,52 @@ describe('WorkerDetailView sections (issue #477)', () => {
 		renderWorker({ enrollments: [], viewerIsOwner: false });
 		expect(screen.getByText(/is its owner’s action/)).toBeDefined();
 		expect(screen.queryByRole('button', { name: 'Enroll in a project' })).toBeNull();
+	});
+});
+
+// Issue #977 — the machine's own update history, mounted between the build the
+// daemon declares (what it is *on*) and the active job (what it is doing *now*).
+describe('WorkerDetailView update history (issue #977)', () => {
+	/** The section headings in the order they render, so placement is asserted, not just presence. */
+	function headings(): string[] {
+		return screen.getAllByRole('heading').map((heading) => heading.textContent ?? '');
+	}
+
+	it('mounts the card directly after Declared by the daemon and before Active job', () => {
+		renderWorker();
+
+		const order = headings();
+		expect(order).toContain('Update history');
+		expect(order.indexOf('Update history')).toBe(order.indexOf('Declared by the daemon') + 1);
+		expect(order.indexOf('Update history')).toBeLessThan(order.indexOf('Active job'));
+	});
+
+	it('renders the machine’s requests in the card, each linking to its run', () => {
+		renderWorker({
+			updateHistory: [
+				{
+					runId: 'run-9',
+					projectId: 'proj-a',
+					target: 'v3',
+					status: 'completed',
+					startedAt: new Date(NOW.getTime() - 60 * 60_000).toISOString(),
+					completedAt: new Date(NOW.getTime() - 59 * 60_000).toISOString(),
+					durationMs: 60_000,
+					error: null,
+				},
+			],
+		});
+
+		const card = within(section('Update history'));
+		expect(card.getByRole('link', { name: 'v3' }).getAttribute('href')).toBe('/runs/run-9');
+	});
+
+	it('says a machine nobody has asked has never been asked', () => {
+		renderWorker();
+
+		expect(
+			within(section('Update history')).getByText('This machine has never been asked to update.'),
+		).toBeDefined();
 	});
 });
 
