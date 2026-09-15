@@ -1591,7 +1591,11 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 
 		/** A dispatch deferred on `waitReason`, due in a minute like the real re-check. */
 		async function deferredDispatch(
-			waitReason: 'worker-eligibility' | 'worker-authorization' | 'preserved-worker',
+			waitReason:
+				| 'worker-eligibility'
+				| 'worker-authorization'
+				| 'worker-rate-limited'
+				| 'preserved-worker',
 			overrides: { projectId?: string; runId?: string; availableAt?: Date } = {},
 		): Promise<DispatchRow> {
 			const { dispatch } = await createDispatch({
@@ -1686,6 +1690,42 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 			const waiting = await deferredDispatch('worker-authorization');
 
 			expect(await promoteDispatchToImmediateWake(waiting.id, waiting.wakeSeq)).toBeNull();
+		});
+
+		// Issue #988. The cooling wait is an *aggregate* refusal — every candidate was
+		// out of allowance — so a machine turning up is exactly the event that can clear
+		// it, and it joins the routable-enrollment leg rather than being left to the
+		// timer. Asserted at **both** gates on purpose: widening only the listing would
+		// strip the row's live wake-up and then have the re-date refuse it, abandoning
+		// the dispatch to the reconciler's republish with nothing in the log saying so.
+		it('wakes a cooling wait for a routably-enrolled machine, at both promotion gates', async () => {
+			const workerId = await seedEnrolledWorker('cooling');
+			const waiting = await deferredDispatch('worker-rate-limited');
+
+			expect((await listAvailabilityWaitsForWorker(workerId)).map((row) => row.id)).toEqual([
+				waiting.id,
+			]);
+
+			const promoted = await promoteDispatchToImmediateWake(waiting.id, waiting.wakeSeq);
+			expect(promoted?.waitReason).toBe('worker-rate-limited');
+			expect(promoted?.availableAt.getTime()).toBeLessThanOrEqual(Date.now());
+			// The wait reason is all that changed about this row's treatment: the retry
+			// intent it carries is untouched, exactly as for `worker-eligibility`.
+			expect(promoted?.attempt).toBe(waiting.attempt);
+			expect(promoted?.jobPayload).toEqual(waiting.jobPayload);
+		});
+
+		// The scoping rule is the eligibility wait's, not a looser one: a cooling
+		// refusal in a project this machine cannot take work in is none of its business.
+		it('offers a cooling wait only where the machine is routably enrolled', async () => {
+			await seedProject({ id: OTHER_PROJECT_ID, repo: 'jkwiecien/other-repo' });
+			const withoutConsent = await seedEnrolledWorker('cooling-no-consent', {
+				sharingConsent: false,
+			});
+			await deferredDispatch('worker-rate-limited');
+			await deferredDispatch('worker-rate-limited', { projectId: OTHER_PROJECT_ID });
+
+			expect(await listAvailabilityWaitsForWorker(withoutConsent)).toEqual([]);
 		});
 	});
 

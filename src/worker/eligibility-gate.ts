@@ -433,11 +433,14 @@ const AVAILABILITY_REFUSAL: Record<DispatchIneligibilityReason, boolean> = {
 	// Time alone clears it (issue #981) — the record carries the instant its limit is
 	// expected back and lapses there by itself, so this is an availability wait in
 	// exactly the sense this flag means, unlike `worker-draining`, which a human
-	// reverses. Classifying it `true` keeps its wait reason at the existing
-	// `worker-eligibility` and lets `promoteAvailabilityWaitsForWorker` (issue #610)
-	// wake the row when *another* machine connects — which, for an aggregate "every
-	// permitted worker is cooling" refusal, is precisely the event that can clear it.
-	// A wake that finds the records still live simply re-refuses, token-free.
+	// reverses. Classifying it `true` is what lets `promoteAvailabilityWaitsForWorker`
+	// (issue #610) wake the row when *another* machine connects — which, for an
+	// aggregate "every permitted worker is cooling" refusal, is precisely the event
+	// that can clear it. A wake that finds the records still live simply re-refuses,
+	// token-free. Its dispatch wait reason is nonetheless its own,
+	// `worker-rate-limited` rather than `worker-eligibility` (issue #988): the two
+	// share a timing policy and answer an operator differently, and
+	// `deferralWaitReason` keys that off this reason directly, ahead of this flag.
 	'cli-rate-limited': true,
 	// A machine coming online cannot clear this (issue #714): a checkout is re-declared
 	// only at handshake, and what ends the wait is a human pointing a worker at this

@@ -114,6 +114,22 @@ export type DispatchWaitReason =
 	 */
 	| 'worker-authorization'
 	/**
+	 * The same gate refused because every candidate machine has **hit its usage
+	 * limit** on the CLIs this phase is configured for (issue #988, over issue
+	 * #981's cool-down record). Split out of `worker-eligibility` so the Queue can
+	 * say *why* the machines are unavailable: nothing is wrong with the fleet, and
+	 * no human action shortens the wait — each machine's own allowance refills at
+	 * the instant its record names.
+	 *
+	 * Still an **availability** wait, and promoted like one: the refusal is an
+	 * aggregate over every candidate, so a machine that enrolls, connects, or frees
+	 * capacity while the cooling ones sit out genuinely can clear it. That is the
+	 * one thing that distinguishes it from `worker-authorization`, which no
+	 * connecting machine can clear at all. Same cadence, attempt counter, and
+	 * budget as both.
+	 */
+	| 'worker-rate-limited'
+	/**
 	 * A continuation is waiting for the one machine that holds its preserved
 	 * checkout (issue #567). Distinct from `worker-eligibility` on purpose: that
 	 * reason means "no capable worker", while this one means the capable workers
@@ -1580,7 +1596,7 @@ export async function selectNextCapacityDispatch(
 }
 
 /**
- * The wait reasons an *availability* wake-up may promote (issue #610) — the two
+ * The wait reasons an *availability* wake-up may promote (issue #610) — the ones
  * the dispatch gate records when nothing structural is wrong and a machine
  * merely has to become available (issue #607 is what made them distinguishable
  * on the row).
@@ -1589,23 +1605,55 @@ export async function selectNextCapacityDispatch(
  * capacity cannot grant sharing consent, approve an enrollment, permit a phase,
  * or teach a machine a CLI, so promoting such a row would only spend its budget
  * faster while changing nothing. It keeps the timed cadence.
+ *
+ * `worker-rate-limited` is deliberately **present** (issue #988), and the
+ * distinction is worth stating because the reason reads like the absent one: an
+ * individual machine's cool-down really is cleared by time alone, but the row
+ * records an *aggregate* refusal over every candidate, and a machine that enrolls,
+ * connects, or frees capacity is exactly the event that can make one of them
+ * routable while the cooling ones sit out. A wake that finds every candidate still
+ * cooling simply re-refuses, token-free — the same cost every other availability
+ * promotion already accepts.
+ *
+ * **Both readers must derive from this one const.** The candidate listing
+ * ({@link listAvailabilityWaitsForWorker}) and the conditional re-date
+ * ({@link promoteDispatchToImmediateWake}) gate independently, and the promotion
+ * removes the live wake-up between them: a reason listed but not promotable is
+ * stripped of its wake-up, refused by the re-date, and left to the reconciler's
+ * republish — silently.
  */
 export const PROMOTABLE_AVAILABILITY_WAIT_REASONS = [
 	'worker-eligibility',
+	'worker-rate-limited',
 	'preserved-worker',
+] as const satisfies readonly DispatchWaitReason[];
+
+/**
+ * The subset of {@link PROMOTABLE_AVAILABILITY_WAIT_REASONS} offered by **project
+ * enrollment** rather than by a recorded machine — the two aggregate refusals the
+ * dispatch gate records when no candidate could take the work right now.
+ * `preserved-worker` is excluded because it is keyed on the pinned machine
+ * instead (see {@link listAvailabilityWaitsForWorker}).
+ */
+const ROUTABLE_ENROLLMENT_WAIT_REASONS = [
+	'worker-eligibility',
+	'worker-rate-limited',
 ] as const satisfies readonly DispatchWaitReason[];
 
 /**
  * Availability-blocked dispatches that this worker becoming available could
  * start (issue #610) — the candidate set for an early wake-up, keyed on the two
- * different things the two waits are actually waiting for:
+ * different things the waits are actually waiting for:
  *
- * - `worker-eligibility` — any dispatch in a project this worker is **routable**
- *   enrolled in (`isRoutable`: an active enrollment with its owner's sharing
- *   consent). Deliberately no narrower: the row records a category, not the
- *   roster walk behind it, and re-deriving affinity or target capability here
- *   would mean a board read per waiting dispatch. A wake-up it did not need
- *   costs one token-free re-evaluation, which is what the gate does anyway.
+ * - `worker-eligibility` and `worker-rate-limited` — any dispatch in a project
+ *   this worker is **routable** enrolled in (`isRoutable`: an active enrollment
+ *   with its owner's sharing consent). Deliberately no narrower: the row records a
+ *   category, not the roster walk behind it, and re-deriving affinity or target
+ *   capability here would mean a board read per waiting dispatch. A wake-up it did
+ *   not need costs one token-free re-evaluation, which is what the gate does
+ *   anyway — which is also why the cooling refusal joins this leg (issue #988)
+ *   rather than getting a wake-up rule of its own: it is an aggregate over every
+ *   candidate, and *this* machine may be the one that is not cooling.
  * - `preserved-worker` — keyed on the **recorded machine**
  *   (`runs.recovery.preservedWorkerId`), never on project enrollment: the gate
  *   honours a pin to a machine that is no longer an enrolled candidate at all
@@ -1644,7 +1692,7 @@ export async function listAvailabilityWaitsForWorker(
 				gt(dispatches.availableAt, asOf),
 				or(
 					and(
-						eq(dispatches.waitReason, 'worker-eligibility'),
+						inArray(dispatches.waitReason, [...ROUTABLE_ENROLLMENT_WAIT_REASONS]),
 						inArray(dispatches.projectId, routableProjects),
 					),
 					and(eq(dispatches.waitReason, 'preserved-worker'), inArray(dispatches.runId, pinnedRuns)),

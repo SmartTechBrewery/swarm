@@ -106,6 +106,18 @@ describe('queuedWaitReasonLabel', () => {
 		);
 	});
 
+	// Issue #988: the gate's third wait. It is an availability wait like
+	// `worker-eligibility`, so without copy of its own it would read as "no capable
+	// worker" — which points an operator at a fleet that is enrolled, consented and
+	// capable, and has simply spent its allowance. The copy therefore names the
+	// *usage limit* rather than the worker, and must not read as something to act on.
+	it('names the usage limit rather than the worker for a cooling fleet', () => {
+		expect(queuedWaitReasonLabel('worker-rate-limited')).toBe('waiting for a usage limit to reset');
+		expect(queuedWaitReasonLabel('worker-rate-limited')).not.toBe(
+			queuedWaitReasonLabel('worker-eligibility'),
+		);
+	});
+
 	// Issue #759: the wait is on the *task*, so the copy must not read as another
 	// worker/slot wait — nothing but the phase ahead of it settling ends it. Issue
 	// #761 made that phase possibly *queued* rather than running, so the copy says

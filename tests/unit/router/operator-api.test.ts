@@ -85,6 +85,9 @@ beforeEach(() => {
 		lastSeenAt: null,
 		// Issue #977 — `getById` shapes this for the wire, so the stub must carry it.
 		updateHistory: [],
+		// Issue #988 — likewise: the cool-down list is shaped for the wire, so a stub
+		// omitting it would be a view the service never produces.
+		rateLimits: [],
 		enrollments: [],
 	});
 	getWorker.mockReset();
@@ -122,12 +125,14 @@ describe('registerOperatorApi — bearer authentication', () => {
 	});
 
 	it('reaches a workers procedure as the resolved user for a valid bearer', async () => {
-		listOwnerWorkers.mockResolvedValue([{ workerId: 'w1' }]);
+		listOwnerWorkers.mockResolvedValue([{ workerId: 'w1', rateLimits: [] }]);
 
 		const response = await get(appWith(makeDeps()), '/operator/trpc/workers.listMine', TOKEN);
 
 		expect(response.status).toBe(200);
-		expect(await response.json()).toEqual({ result: { data: [{ workerId: 'w1' }] } });
+		expect(await response.json()).toEqual({
+			result: { data: [{ workerId: 'w1', rateLimits: [] }] },
+		});
 		// The caller is the token's own user, not a privileged service identity.
 		expect(listOwnerWorkers).toHaveBeenCalledWith(USER_ID);
 	});
@@ -197,7 +202,7 @@ describe('the operator CLI client against this mount', () => {
 	}
 
 	it('round-trips an input-less query and unwraps its result envelope', async () => {
-		listOwnerWorkers.mockResolvedValue([{ workerId: WORKER_ID }]);
+		listOwnerWorkers.mockResolvedValue([{ workerId: WORKER_ID, rateLimits: [] }]);
 
 		const data = await clientFor(appWith(makeDeps())).query(
 			'workers.listMine',
@@ -205,7 +210,7 @@ describe('the operator CLI client against this mount', () => {
 			(value) => value,
 		);
 
-		expect(data).toEqual([{ workerId: WORKER_ID }]);
+		expect(data).toEqual([{ workerId: WORKER_ID, rateLimits: [] }]);
 	});
 
 	// The other half: `workers.listMine` takes no input, so it says nothing about

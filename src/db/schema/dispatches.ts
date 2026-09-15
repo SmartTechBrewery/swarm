@@ -61,7 +61,9 @@ export const dispatches = pgTable(
 		 * Why a non-terminal dispatch is waiting: `project-capacity`, `rate-limit`,
 		 * `agent-capacity`, `timeout`, `worker-shutdown`, `delivery`,
 		 * `worktree-exists`, `stalled`, `recheck`, `worker-eligibility`,
-		 * `worker-authorization`, `preserved-worker`, `task-in-flight` (a later phase
+		 * `worker-authorization`, `worker-rate-limited` (every candidate machine has
+		 * hit its usage limit on this phase's CLIs — issue #988),
+		 * `preserved-worker`, `task-in-flight` (a later phase
 		 * of a task whose earlier phase is still executing — issue #759 — or an
 		 * Implementation behind a Planning dispatch it must not overtake, queued or
 		 * executing — issue #761), `pr-in-flight` (a branch-writing phase behind

@@ -112,6 +112,32 @@ export interface WorkerUpdateHistoryEntry {
 	error: string | null;
 }
 
+/**
+ * One live CLI cool-down on a machine (issue #988, mirroring the server
+ * `WorkerCliRateLimit` as `workers.getById`/`list` serialize it): the machine's own
+ * CLI reported its usage allowance spent on a real run, and the record releases
+ * itself at `expiresAt`.
+ *
+ * **Observed, not declared** — the opposite end of `drainingSince`, which an
+ * operator sets and only an operator clears. Nothing here is an action item: there
+ * is no way to clear a cool-down and nothing to fix, which is what the copy
+ * rendering it must convey. Secret-free: a CLI name, two instants, and the CLI's
+ * own words.
+ */
+export interface WorkerRateLimit {
+	/** The agent CLI whose allowance is spent — `claude` | `antigravity` | `codex`. */
+	cli: string;
+	/** ISO 8601 — when the allowance is expected back; the record lapses by itself here. */
+	expiresAt: string;
+	/** ISO 8601 — when the deferral that recorded this was observed. */
+	observedAt: string;
+	/**
+	 * The CLI's verbatim reset text, when it gave one — shown as the machine's own
+	 * words beside the derived expiry, never parsed back into one.
+	 */
+	resetHint: string | null;
+}
+
 export interface WorkerRow {
 	workerId: string;
 	displayName: string;
@@ -177,6 +203,18 @@ export interface WorkerRow {
 	 * the pool, so only an operator clears this (`workers.setDraining`).
 	 */
 	drainingSince: string | null;
+	/**
+	 * The machine's live CLI cool-downs (issue #988) — one entry per CLI waiting on a
+	 * usage limit, `[]` when none is. Read *alongside* `drainingSince`: together they
+	 * are the two answers to "why is this machine not taking work?", one the
+	 * operator's own state and one the machine's own observation. A machine cooling on
+	 * one CLI keeps taking work on the others, so the per-entry list is the only
+	 * honest shape — never collapse it to a boolean.
+	 *
+	 * The detail view renders these ({@link WorkerRateLimit}); the roster carries them
+	 * because the read is shared with `swarm workers list` and does not render them.
+	 */
+	rateLimits: WorkerRateLimit[];
 	/**
 	 * The update this machine was last asked for, and what came of it (issue #933),
 	 * or `null` if nobody ever has. Read *alongside* `buildIsCurrent`, never in place

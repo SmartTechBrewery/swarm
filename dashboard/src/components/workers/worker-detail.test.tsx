@@ -119,6 +119,9 @@ function makeWorker(overrides: Partial<WorkerDetail> = {}): WorkerDetail {
 		lastSeenAt: NOW.toISOString(),
 		// In the dispatch pool — the Pool membership card offers the drain (issue #926).
 		drainingSince: null,
+		// No live CLI cool-down (issue #988) — the marked exception is a machine whose
+		// own CLI reported a spent usage allowance.
+		rateLimits: [],
 		// Never asked to update: no pending request (issue #978) and no history (#977).
 		update: null,
 		updateHistory: [],

@@ -12,6 +12,7 @@ import { WorkerDrainCard } from '@/components/workers/worker-drain-card.js';
 import { WorkerEnrollDialog } from '@/components/workers/worker-enroll-dialog.js';
 import { WorkerEnrollmentCard } from '@/components/workers/worker-enrollment-card.js';
 import { WorkerOperatorCredentialsCard } from '@/components/workers/worker-operator-credentials-card.js';
+import { WorkerRateLimitCard } from '@/components/workers/worker-rate-limit-card.js';
 import { WorkerUpdateHistoryCard } from '@/components/workers/worker-update-history-card.js';
 import { formatPhase, formatRelativeTime } from '@/lib/format.js';
 import { sortPipelinePhases } from '@/lib/pipeline-phases.js';
@@ -508,6 +509,33 @@ function PoolMembershipSection({
 }
 
 /**
+ * **Usage limits** (issue #988) — the machine's live CLI cool-downs, directly
+ * before Pool membership so the observed half of "why is this machine not taking
+ * work?" reads beside the operator-declared half ({@link WorkerDrainCard}).
+ *
+ * **Visible to every viewer of this screen, unlike the two owner-only sections
+ * below it.** Those gate on `viewerIsOwner` because they carry *controls*; this one
+ * carries none — there is no way to clear a cool-down — and it is a fact anyone
+ * looking at why their project's work is queued needs. Gating it would hide the
+ * answer from exactly the person asking the question.
+ *
+ * A section of its own rather than a field in the daemon card above: that card is
+ * what the machine *declares* and is stable between reconnects, while this is what a
+ * run *observed* and lapses on a timer. The whole section disappears for a machine
+ * cooling on nothing — the record self-releases, so an empty state would be
+ * reporting a non-event.
+ */
+function UsageLimitsSection({ worker }: { worker: WorkerDetail }) {
+	if (worker.rateLimits.length === 0) return null;
+	return (
+		<div className={CARD_CLASS}>
+			<h2 className={SECTION_HEADING_CLASS}>Usage limits</h2>
+			<WorkerRateLimitCard rateLimits={worker.rateLimits} />
+		</div>
+	);
+}
+
+/**
  * **Operator source-control credential** (issue #766) — worker-scoped state, so it
  * sits above the per-project blocks, which are also what decide which providers it
  * lists. Owner-only, the same strict flag that gates the rename field and the enroll
@@ -684,6 +712,8 @@ export function WorkerDetailView({
 					<p className="text-sm text-zinc-400">Idle — no run assigned right now.</p>
 				)}
 			</div>
+
+			<UsageLimitsSection worker={worker} />
 
 			<PoolMembershipSection worker={worker} onChanged={onChanged} />
 
