@@ -26,9 +26,10 @@ import { workers } from './workers.js';
  * permanently wedged machine. An instant releases itself by construction: the read
  * filters on `expires_at`, so a lapsed row is already invisible, needs no sweeper,
  * and is simply overwritten by the next observation. The value stored is
- * `retryDelayForFailure`'s own answer for the failure that produced it, so it is
- * clamped by that policy's `MAX_RETRY_DELAY_MS` (6 h) and no mis-parsed reset can
- * hold a machine back indefinitely.
+ * `retryDelayForFailure`'s own answer for the failure that produced it: the reset
+ * the CLI reported, honoured out to that policy's `MAX_RETRY_DELAY_MS` — the
+ * longest wait a deferred wake-up survives the job-freshness gate for, ~24 h by
+ * default — so no mis-parsed reset can hold a machine back indefinitely.
  *
  * Nothing is backfilled: an installation that has not migrated, or one no worker
  * has reported a limit on, behaves exactly as it did before this table existed.

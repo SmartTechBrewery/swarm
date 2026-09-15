@@ -4036,6 +4036,46 @@ describe('processJob', () => {
 		expect(outcome.retryDelayMs).toBeGreaterThanOrEqual(6 * 60 * 1000);
 	});
 
+	// The observed agy exhaustion (issue #1013): a reset well past the old six-hour
+	// ceiling is waited out in full. Clamping it retried the run — and lapsed the
+	// machine's `(worker, CLI)` cool-down, which is this same delay — ten hours before
+	// the account had anything left.
+	it('waits out a reported reset that is longer than the old six-hour ceiling', async () => {
+		const observed = 16 * 60 * 60 * 1000 + 39 * 60 * 1000 + 20 * 1000;
+		phaseImpl = async () => {
+			throw new AgentRunError('Resolve-conflicts agent (antigravity) exited with code 0', {
+				kind: 'rate-limit',
+				resetHint: 'in 16h39m20s',
+				retryAfter: new Date(Date.now() + observed),
+			});
+		};
+
+		const outcome = await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
+
+		if (outcome.status !== 'phase-deferred') throw new Error('expected phase-deferred');
+		expect(outcome.retryDelayMs).toBeGreaterThan(observed);
+		expect(outcome.retryDelayMs).toBeLessThanOrEqual(observed + 60 * 1000);
+	});
+
+	// The other side of the same policy: the wait stops where a wake-up stops being
+	// honoured. The control plane discards a job it dequeues more than
+	// `SWARM_MAX_JOB_AGE_MS` (24 h) after publication, so scheduling past that window
+	// would park the run on a wake-up nothing will act on; the retry budget covers the
+	// rest of a longer window.
+	it('caps a reset further out than a wake-up survives at the shared ceiling', async () => {
+		phaseImpl = async () => {
+			throw new AgentRunError('rate limited', {
+				kind: 'rate-limit',
+				retryAfter: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+			});
+		};
+
+		const outcome = await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
+
+		if (outcome.status !== 'phase-deferred') throw new Error('expected phase-deferred');
+		expect(outcome.retryDelayMs).toBe(24 * 60 * 60 * 1000 - 15 * 60 * 1000);
+	});
+
 	it('falls back to a default delay when the limit gave no parseable reset time', async () => {
 		phaseImpl = async () => {
 			throw new AgentRunError('rate limited', { kind: 'rate-limit' });

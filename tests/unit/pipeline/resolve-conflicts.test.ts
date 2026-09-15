@@ -35,7 +35,13 @@ import {
 	HANDOFF_FILENAMES,
 	type ScmDeliveryProvider,
 } from '@/scm/delivery.js';
+import { RETRY_BUFFER_MS, retryDelayForFailure } from '@/worker/consumer.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
+import {
+	ANTIGRAVITY_QUOTA_FAILURE,
+	ANTIGRAVITY_QUOTA_LOG_TEXT,
+	ANTIGRAVITY_QUOTA_SELF_TIMEOUT,
+} from '../../helpers/antigravity-quota.js';
 import { readDeliveryId } from '../../helpers/delivery-sidecar.js';
 import {
 	createMockProjectConfig,
@@ -515,6 +521,85 @@ describe('runResolveConflictsPhase — a CLI that timed itself out (issue #1000)
 		expect(error).toBeInstanceOf(AgentRunError);
 		expect((error as AgentRunError).failure.kind).toBe('timeout');
 		expect((error as AgentRunError).message).toContain(AGY_PRINT_TIMEOUT);
+		expect(commitPreparedTree).not.toHaveBeenCalled();
+		expect(deps.delivery.pushBranch).not.toHaveBeenCalled();
+	});
+});
+
+describe('runResolveConflictsPhase — an exhausted account quota (issue #1013)', () => {
+	// Run `8656fb88-9049-46a2-ab3b-f2ebfa393f2d`, on the phase it was observed on:
+	// agy hit a 429, retried it internally, was cut by its own print timeout
+	// mid-retry, and exited **0** with the quota verdict in its terminal `result`
+	// event. SWARM recorded `Agent did not write required hand-off
+	// resolve_conflicts_handoff.json`, settled terminally at attempt 0, threw away
+	// the reset agy named, and wrote no CLI cool-down — so routing kept sending
+	// Antigravity work to an account with none left.
+	const quotaExhausted = () =>
+		agentResult({
+			cli: 'antigravity',
+			exitCode: 0,
+			stdout: ANTIGRAVITY_QUOTA_LOG_TEXT,
+			stderr: `${ANTIGRAVITY_QUOTA_SELF_TIMEOUT}\n`,
+			cliSelfTimeout: ANTIGRAVITY_QUOTA_SELF_TIMEOUT,
+			antigravityFailure: ANTIGRAVITY_QUOTA_FAILURE,
+			sessionId: 'conversation-1',
+		});
+
+	/** A worktree the agent never got to write its hand-off into. */
+	function makeEmptyWorktree(): string {
+		const root = mkdtempSync(join(tmpdir(), 'swarm-resolve-conflicts-quota-'));
+		roots.push(root);
+		return root;
+	}
+
+	it('reports the quota rather than the hand-off the agent never got to write', async () => {
+		const deps = makeDeps(makeEmptyWorktree());
+		deps.runAgent.mockImplementation(async () => quotaExhausted());
+
+		const error = await runResolveConflictsPhase(deps).then(
+			() => undefined,
+			(err: unknown) => err,
+		);
+
+		expect(error).toBeInstanceOf(AgentRunError);
+		const failure = (error as AgentRunError).failure;
+		// A `rate-limit`, not the `timeout` the same run's self-timeout notice would
+		// otherwise have produced: only this kind carries a reset instant and makes the
+		// control plane record the machine's cool-down for that CLI.
+		expect(failure.kind).toBe('rate-limit');
+		expect(failure.resetHint).toContain('in 16h39m20s');
+		expect(failure.retryAfter).toBeInstanceOf(Date);
+		expect((error as AgentRunError).message).toContain('(rate limited)');
+		expect((error as AgentRunError).message).not.toMatch(/did not write required hand-off/);
+		// The reset agy named survives into the shared deferral policy rather than
+		// being clamped back under it: the retry — and the `(worker, CLI)` cool-down
+		// derived from the same answer — lands after the account actually refills.
+		const observed = 16 * 60 * 60 * 1000 + 39 * 60 * 1000 + 20 * 1000;
+		const now = Date.now();
+		expect((failure.retryAfter as Date).getTime() - now).toBeGreaterThan(observed - 5_000);
+		const delay = retryDelayForFailure(failure, now);
+		expect(delay).toBeGreaterThan(observed - 5_000);
+		expect(delay).toBeLessThanOrEqual(observed + RETRY_BUFFER_MS);
+		// Deferred and resumable, like every other rate limit: keep the checkout.
+		expect(deps.worktrees.preserve).toHaveBeenCalled();
+		expect(deps.worktrees.cleanup).not.toHaveBeenCalled();
+	});
+
+	it('delivers nothing even when the quota hit landed after a hand-off was written', async () => {
+		// The gate fires at the post-run statement, before any hand-off is read, so a
+		// run that ran out of quota after writing one is reported just as honestly —
+		// and delivers nothing, since the turn demonstrably did not finish.
+		const deps = makeDeps(makeWorktree());
+		writeCleanMigrations(deps.worktrees.worktreePath('task-508') as string, ['0000_first']);
+		deps.runAgent.mockImplementation(async () => quotaExhausted());
+
+		const error = await runResolveConflictsPhase(deps).then(
+			() => undefined,
+			(err: unknown) => err,
+		);
+
+		expect(error).toBeInstanceOf(AgentRunError);
+		expect((error as AgentRunError).failure.kind).toBe('rate-limit');
 		expect(commitPreparedTree).not.toHaveBeenCalled();
 		expect(deps.delivery.pushBranch).not.toHaveBeenCalled();
 	});

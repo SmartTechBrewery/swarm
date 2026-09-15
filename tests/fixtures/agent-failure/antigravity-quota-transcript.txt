@@ -1,0 +1,2 @@
+[agy] print timeout after 5m0s with turn in progress; returning partial output
+Antigravity run failed (ERROR): API error (attempt 6): RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 16h39m20s.
