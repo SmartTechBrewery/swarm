@@ -326,6 +326,23 @@ export async function createDispatch(
 }
 
 /**
+ * The dispatch a dedup key already names, in whatever state — the *look before you
+ * insert* half {@link createDispatch}'s `ON CONFLICT DO NOTHING` cannot serve on its
+ * own, because that clause covers the `dedup_key` index alone: a row that would also
+ * violate `uq_dispatches_active_run` raises rather than dedupes, and which of the two
+ * Postgres reports is not something a caller may rely on. A writer that can be handed
+ * a `runId` whose dispatch already exists (adopting a pre-#972 update request,
+ * `./workersRepository.ts`) therefore asks first.
+ */
+export async function findDispatchByDedupKey(
+	dedupKey: string,
+	db: DispatchWriteExecutor = getDb(),
+): Promise<DispatchRow | undefined> {
+	const rows = await db.select().from(dispatches).where(eq(dispatches.dedupKey, dedupKey)).limit(1);
+	return rows[0];
+}
+
+/**
  * Atomically claim a dispatch for execution: `pending`/`retry-scheduled` →
  * `leased`. Re-claiming a lease this owner already holds succeeds (a BullMQ
  * infra retry of the same job must not dead-end its own dispatch). Returns the

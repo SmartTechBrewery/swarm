@@ -272,6 +272,13 @@ export async function createFailedRun(input: CreateFailedRunInput): Promise<stri
  */
 type RunWriteExecutor = Pick<ReturnType<typeof getDb>, 'insert' | 'update'>;
 
+/**
+ * The same executor widened with `select`, for {@link findWorkerUpdateRunIdByRequestId}
+ * — the one maintenance-run *read* that has to join the caller's transaction, because
+ * what it answers decides whether that transaction writes a run.
+ */
+type RunReadWriteExecutor = RunWriteExecutor & Pick<ReturnType<typeof getDb>, 'select'>;
+
 export interface CreateWorkerUpdateRunInput {
 	/** The project the machine is enrolled in — what the run hangs off (issue #971). */
 	projectId: string;
@@ -403,6 +410,27 @@ export async function settleWorkerUpdateRun(
 		.where(and(eq(runs.kind, WORKER_UPDATE_RUN_KIND), eq(runs.maintenanceRequestId, requestId)))
 		.returning({ id: runs.id });
 	return rows.length > 0;
+}
+
+/**
+ * The worker-update run a request already has, if any — the read
+ * `adoptOutstandingWorkerUpdateRequest` (`./workersRepository.ts`) needs so it links
+ * a request's late dispatch to the run that request already created rather than
+ * inserting a second one for the same machine.
+ *
+ * `maintenance_request_id` is unique per run by the partial index, so this is a
+ * point lookup.
+ */
+export async function findWorkerUpdateRunIdByRequestId(
+	requestId: string,
+	db: RunReadWriteExecutor = getDb(),
+): Promise<string | undefined> {
+	const rows = await db
+		.select({ id: runs.id })
+		.from(runs)
+		.where(and(eq(runs.kind, WORKER_UPDATE_RUN_KIND), eq(runs.maintenanceRequestId, requestId)))
+		.limit(1);
+	return rows[0]?.id;
 }
 
 /**

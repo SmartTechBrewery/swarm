@@ -25,7 +25,7 @@ const { QueueMock, add, close, getDelayed, getWaiting, getPrioritized, fromId } 
 			(
 				name: string,
 				data: unknown,
-				opts?: { jobId?: string; delay?: number; priority?: number },
+				opts?: { jobId?: string; delay?: number; priority?: number; lifo?: boolean },
 			) => Promise<unknown>
 		>();
 	const close = vi.fn();
@@ -198,12 +198,13 @@ describe('enqueueJob', () => {
 		});
 	});
 
-	// Issue #972: the rank is negative in the dispatch table, and BullMQ is handed
-	// nothing at all. Passing a negative would put the wake-up in BullMQ's
+	// Issue #972: the rank is negative in the dispatch table, and BullMQ is asked for
+	// `lifo` instead of a priority. A negative would put the wake-up in BullMQ's
 	// prioritized ZSET, which a worker only reaches once the plain `wait` list is
-	// empty — i.e. *behind* every unset-priority job, the exact inversion the
-	// negative exists to remove.
-	it('omits the BullMQ priority option for a worker-update job that outranks the default', async () => {
+	// empty — i.e. *behind* every unset-priority job — and no option at all would
+	// `LPUSH` it onto the far end of `wait`, behind everything already queued there.
+	// `lifo` `RPUSH`es, which is the end `RPOPLPUSH` takes from: claimed next.
+	it('adds a worker-update job lifo so it outranks jobs already waiting', async () => {
 		const { enqueueJob, priorityFor, WORKER_UPDATE_JOB_PRIORITY } = await import(
 			'@/queue/producer.js'
 		);
@@ -216,7 +217,9 @@ describe('enqueueJob', () => {
 
 		const [name, , opts] = add.mock.calls[0];
 		expect(name).toBe('worker-update');
-		expect(opts).toBeUndefined();
+		expect(opts).toEqual({ lifo: true });
+		// Never the priority option: that is the ZSET, i.e. the inversion.
+		expect(opts).not.toHaveProperty('priority');
 	});
 
 	it('omits the job id when the event carries no deliveryId', async () => {
@@ -281,13 +284,27 @@ describe('enqueueDispatchWakeUp', () => {
 		});
 	});
 
-	it('omits the BullMQ priority option for a worker-update wake-up', async () => {
+	// The wake-up that races real work is the immediate one — the request's own, and
+	// the one a reconnect republishes — so this is where `lifo` has to bite.
+	it('adds a worker-update wake-up lifo rather than with a priority', async () => {
 		const { enqueueDispatchWakeUp } = await import('@/queue/producer.js');
 
 		await enqueueDispatchWakeUp(workerUpdateJob(), 'dispatch_update_w0', 0);
 
 		const [, , opts] = add.mock.calls[0];
-		expect(opts).toEqual({ jobId: 'dispatch_update_w0' });
+		expect(opts).toEqual({ jobId: 'dispatch_update_w0', lifo: true });
+	});
+
+	// The executor's timed backstop for an offline machine. `lifo` is still asked for
+	// — BullMQ's own `promoteDelayedJobs` drops it on the way out of the delayed set,
+	// which is the documented bound, not something the producer decides per call.
+	it('keeps the lifo request on a delayed worker-update wake-up', async () => {
+		const { enqueueDispatchWakeUp } = await import('@/queue/producer.js');
+
+		await enqueueDispatchWakeUp(workerUpdateJob(), 'dispatch_update_w1', 300_000);
+
+		const [, , opts] = add.mock.calls[0];
+		expect(opts).toEqual({ jobId: 'dispatch_update_w1', delay: 300_000, lifo: true });
 	});
 
 	// The reconciler's `republishWakeUps` repairs *every* wakeable dispatch on

@@ -53,10 +53,12 @@ import { workers } from '../schema/workers.js';
 import {
 	createDispatch,
 	type DispatchRow,
+	findDispatchByDedupKey,
 	supersedeWorkerUpdateDispatches,
 } from './dispatchesRepository.js';
 import {
 	createWorkerUpdateRun,
+	findWorkerUpdateRunIdByRequestId,
 	settleWorkerUpdateRun,
 	supersedeWorkerUpdateRun,
 } from './runsRepository.js';
@@ -531,6 +533,38 @@ export type WorkerUpdateRequestOutcome =
 	| { outcome: 'not-found' };
 
 /**
+ * The executor the two worker-update writers below take, so each can run its reads
+ * and its writes inside one transaction. The spirit of `RunWriteExecutor`
+ * (`./runsRepository.ts`), widened with `select` because both of them *decide* what
+ * to write from a read taken in the same transaction.
+ */
+type WorkerUpdateExecutor = Pick<ReturnType<typeof getDb>, 'insert' | 'select' | 'update'>;
+
+/**
+ * The machine's **oldest** enrollment — the project an update's run and dispatch hang
+ * off (issue #971), and deliberately unfiltered by enrollment status: those rows are
+ * a *record* of what happened to a machine, not a routing decision, so a `pending` or
+ * `suspended` enrollment still names the project the machine belongs to. A machine
+ * enrolled in none has nothing to hang them off, which is the `no-project` boundary.
+ *
+ * Shared by {@link requestWorkerUpdate} and {@link adoptOutstandingWorkerUpdateRequest}
+ * so the two cannot come to different answers about which project an update belongs
+ * to for the same machine.
+ */
+async function oldestEnrollment(
+	db: WorkerUpdateExecutor,
+	workerId: string,
+): Promise<{ projectId: string } | undefined> {
+	const [row] = await db
+		.select({ projectId: workerProjectEnrollments.projectId })
+		.from(workerProjectEnrollments)
+		.where(eq(workerProjectEnrollments.workerId, workerId))
+		.orderBy(asc(workerProjectEnrollments.createdAt), asc(workerProjectEnrollments.id))
+		.limit(1);
+	return row;
+}
+
+/**
  * Record that an operator asked this machine to move its SWARM install root to
  * `target`, replacing any request already outstanding (issue #933) — **only while
  * the machine is draining**.
@@ -591,12 +625,7 @@ export async function requestWorkerUpdate(
 	requestedByUserId: string,
 ): Promise<WorkerUpdateRequestOutcome> {
 	return await getDb().transaction(async (tx) => {
-		const [enrollment] = await tx
-			.select({ projectId: workerProjectEnrollments.projectId })
-			.from(workerProjectEnrollments)
-			.where(eq(workerProjectEnrollments.workerId, id))
-			.orderBy(asc(workerProjectEnrollments.createdAt), asc(workerProjectEnrollments.id))
-			.limit(1);
+		const enrollment = await oldestEnrollment(tx, id);
 		if (!enrollment) {
 			const existing = await getWorkerById(id);
 			return existing ? { outcome: 'no-project', worker: existing } : { outcome: 'not-found' };
@@ -657,7 +686,7 @@ export async function requestWorkerUpdate(
 			{
 				projectId: enrollment.projectId,
 				jobPayload,
-				dedupKey: `worker-update:${requestId}`,
+				dedupKey: workerUpdateDedupKey(requestId),
 				priority: priorityFor(jobPayload) ?? 0,
 				source: 'manual',
 				phase: 'worker-update',
@@ -666,6 +695,103 @@ export async function requestWorkerUpdate(
 			tx,
 		);
 		return { outcome: 'requested', worker: rowToWorker(updatedRow), runId, dispatch };
+	});
+}
+
+/**
+ * The dedup identity of the dispatch that delivers one update request: the request
+ * id, which is minted per machine, so two machines asked in the same fan-out never
+ * share one.
+ */
+function workerUpdateDedupKey(requestId: string): string {
+	return `worker-update:${requestId}`;
+}
+
+/**
+ * Give an outstanding update request the durable dispatch it is missing, and answer
+ * with the dispatch so the caller can publish its wake-up (issue #972).
+ *
+ * **This exists for one upgrade boundary.** Before this issue the request lived on the
+ * `workers` row alone and was delivered by a direct push — at request time, and again
+ * from the reconnect hook when the machine had been offline for it, which for a
+ * machine an operator drains first is the ordinary path rather than an edge. That hook
+ * now wakes a dispatch instead (`resendPendingWorkerUpdateToWorker`,
+ * `../../router/worker-update-dispatch.ts`), so a
+ * request recorded by the *old* control plane and still outstanding when the new one
+ * starts would have nothing to wake and would be dropped in silence, leaving an
+ * operator's machine on the old build with no error anywhere. The missing row is
+ * therefore written lazily, from the same reconnect that would have delivered it,
+ * rather than by a deployment-time backfill: a backfill would have to be sequenced
+ * against the rollout by hand, and still could not repair a request the old build
+ * recorded while that rollout was in progress.
+ *
+ * **Idempotent on the dispatch's dedup key, which is the request id.** A request whose
+ * dispatch already exists — waiting, claimed, or long since completed — is answered
+ * `undefined` and nothing is written, so a machine that reconnects repeatedly never
+ * collects a second dispatch for a request one delivery already settled. That is also
+ * what keeps this off the ordinary path entirely: every request recorded since this
+ * issue carries its dispatch out of the transaction that recorded it, so the first
+ * read here ends the call.
+ *
+ * `undefined` likewise covers a machine with nothing outstanding, an unknown machine,
+ * and one enrolled in no project — the same boundary {@link requestWorkerUpdate}
+ * answers `no-project` for, and for the same reason: there is no project to hang the
+ * run and the dispatch off.
+ */
+export async function adoptOutstandingWorkerUpdateRequest(
+	id: string,
+): Promise<DispatchRow | undefined> {
+	return await getDb().transaction(async (tx) => {
+		const [row] = await tx.select().from(workers).where(eq(workers.id, id)).limit(1);
+		// `update_request_id` is cleared by the report, so a non-null one *is* an
+		// outstanding request ({@link recordWorkerUpdateReport}); `update_target` is the
+		// build it names and no request is recorded without one.
+		if (!row?.updateRequestId || !row.updateTarget) return undefined;
+		const requestId = row.updateRequestId;
+		const target = row.updateTarget;
+		if (await findDispatchByDedupKey(workerUpdateDedupKey(requestId), tx)) return undefined;
+		const enrollment = await oldestEnrollment(tx, id);
+		if (!enrollment) return undefined;
+
+		// The run the request already created, when it was recorded by a build carrying
+		// issue #971 — linked to rather than duplicated, since that is the row an
+		// operator is already looking at. A request older than #971 has none and gets one
+		// here: the dispatch is what will deliver it, so the record of that delivery
+		// starts now.
+		const runId =
+			(await findWorkerUpdateRunIdByRequestId(requestId, tx)) ??
+			(await createWorkerUpdateRun(
+				{
+					projectId: enrollment.projectId,
+					workerId: id,
+					workerUserId: row.ownerUserId,
+					requestId,
+					target,
+					machine: row.displayName,
+				},
+				tx,
+			));
+
+		const jobPayload: WorkerUpdateJob = {
+			type: 'worker-update',
+			projectId: enrollment.projectId,
+			workerId: id,
+			requestId,
+			target,
+		};
+		const { dispatch } = await createDispatch(
+			{
+				projectId: enrollment.projectId,
+				jobPayload,
+				dedupKey: workerUpdateDedupKey(requestId),
+				priority: priorityFor(jobPayload) ?? 0,
+				source: 'manual',
+				phase: 'worker-update',
+				runId,
+			},
+			tx,
+		);
+		return dispatch;
 	});
 }
 
