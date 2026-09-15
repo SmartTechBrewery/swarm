@@ -15,6 +15,7 @@ import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import type { RecoveryMode } from '../queue/jobs.js';
 import {
+	advancedBaseHead,
 	assertRemoteHead,
 	type ConflictHandoff,
 	ConflictHandoffSchema,
@@ -30,11 +31,13 @@ import {
 	type ScmDeliveryProvider,
 	saveDeliveryProgress,
 	shouldDeferDeliveryFailure,
+	UnretryableDeliveryError,
 } from '../scm/delivery.js';
 import { GitWorktreeManager } from '../worker/git-worktree-manager.js';
 import { graftEnvironment } from '../worktree/graft.js';
 import { settleMergeResolution } from './merge-resolution.js';
 import {
+	buildBaseAdvancedRemergePrompt,
 	buildMigrationJournalRepairPrompt,
 	buildResolveConflictsPrompt,
 } from './prompts/resolve-conflicts.js';
@@ -60,6 +63,25 @@ export type ResolveConflictsOutcome = z.infer<typeof ResolveConflictsOutcomeSche
 
 /** Coded default CLI for the resolve-conflicts phase (mirrors the other phases). */
 export const DEFAULT_RESOLVE_CONFLICTS_CLI: AgentCli = 'claude';
+
+/**
+ * How many extra resolution passes one run spends chasing a base branch that
+ * keeps advancing (issue #1001).
+ *
+ * The window between reading the base and pushing is this phase's own runtime —
+ * minutes — so on a repository SWARM itself merges into, losing the race once is
+ * ordinary rather than unlucky, and catching up is cheap: only what the base
+ * gained since the last pass can conflict. Losing it repeatedly means the base is
+ * moving faster than the phase can resolve, which more agent runs do not fix, so
+ * the bound is small and the run then says so and delivers nothing.
+ *
+ * It is one budget across both reads {@link deliverMergeAgainstCurrentBase}
+ * makes, the one before a push and the one confirming it afterwards, because they
+ * are the same race caught at two points; the confirming read's window is the
+ * push itself, so it is the narrower of the two and rarely the one that spends a
+ * pass.
+ */
+const MAX_BASE_ADVANCE_REMERGES = 2;
 
 export interface RunResolveConflictsPhaseOptions {
 	project: ProjectConfig;
@@ -111,6 +133,16 @@ interface GuardMigrationJournalOptions {
 	timeoutMs?: number;
 	signal?: AbortSignal;
 	runAgent: typeof runAgentCli;
+}
+
+/**
+ * Everything the post-agent gates and a catch-up re-merge need about the run
+ * (issue #1001), so the initial resolution and every later pass are gated by one
+ * body rather than by copies that can drift apart.
+ */
+interface MergePassContext extends GuardMigrationJournalOptions {
+	/** The pull request's head branch — the branch a re-merge pass is standing on. */
+	prBranch: string;
 }
 
 /**
@@ -262,6 +294,220 @@ function assertMergeVerified(
 		);
 }
 
+/** The one subject every pass's merge commit carries. */
+function mergeCommitSubject(baseBranch: string, prBranch: string): string {
+	return `chore: merge ${baseBranch} into ${prBranch}`;
+}
+
+/**
+ * Read, gate and settle the merge an agent pass just left, and return the
+ * hand-off delivery is bound to — the three backstops in their established
+ * order, in one place so a catch-up pass (issue #1001) is gated exactly as the
+ * first pass is rather than delivering past them.
+ */
+async function gatePreparedMerge(ctx: MergePassContext): Promise<ConflictHandoff> {
+	const context = { taskId: ctx.taskId, prNumber: ctx.prNumber, headSha: ctx.headSha };
+	let handoff = readHandoff(
+		ctx.worktreePath,
+		RESOLVE_CONFLICTS_OUTCOME_FILENAME,
+		ConflictHandoffSchema,
+	);
+	// Before the repair pass and every delivery step, so a merge we are going to
+	// refuse never spends an agent run or reaches the remote (issue #924).
+	assertMergeVerified(handoff, context);
+	const repairPassRan = await guardMigrationJournal(ctx);
+	// After the repair pass, which can still edit files.
+	await settleResolvedPaths(ctx.worktreePath, context);
+	// The repair prompt tells that pass to rewrite the hand-off when its fix
+	// changes `body` or `verification`, so the gate above only ever covered what
+	// the merge agent wrote. Re-read and re-gate whatever it actually left, and
+	// bind the delivery steps to that: otherwise a repair pass that re-ran the
+	// suite and reported `failed` would be committed, pushed and commented on
+	// with the pre-repair body claiming success.
+	if (repairPassRan) {
+		handoff = readHandoff(
+			ctx.worktreePath,
+			RESOLVE_CONFLICTS_OUTCOME_FILENAME,
+			ConflictHandoffSchema,
+		);
+		assertMergeVerified(handoff, context);
+	}
+	return handoff;
+}
+
+/**
+ * The report for a run the base branch simply outran (issue #1001). The error
+ * class does not survive the federated wire, so this message is the whole thing
+ * an operator gets (see {@link UnretryableDeliveryError}): it names the branch
+ * that moved, where it moved to, how much was spent chasing it, and what is on
+ * the remote as a result. `Stale merge:` is the greppable prefix, deliberately
+ * distinct from `validatePreparedTree`'s `Unsafe delivery:` — this refusal is
+ * about the remote, not about the tree.
+ *
+ * The branch state is *not* always "untouched": the base is re-read after the
+ * push as well as before it ({@link deliverMergeAgainstCurrentBase}), so the run
+ * that exhausts the bound may already have pushed a catch-up merge. Saying
+ * otherwise would send an operator looking for a branch that had in fact moved.
+ */
+function staleMergeMessage(
+	ctx: MergePassContext,
+	advancedTo: string,
+	remerges: number,
+	pushedSha: string | null,
+): string {
+	const remote = pushedSha
+		? `Merge ${pushedSha} had already been pushed to '${ctx.prBranch}' when the base moved again, so ` +
+			`the branch carries it; no comment was posted and this run reports no resolution.`
+		: `Nothing was pushed or commented and the branch is untouched on the remote.`;
+	return (
+		`Stale merge: base branch '${ctx.baseBranch}' advanced to ${advancedTo} while PR #${ctx.prNumber}'s ` +
+		`conflicts were being resolved, and kept advancing through ${remerges} re-merge ` +
+		`${remerges === 1 ? 'pass' : 'passes'}, so the pull request is conflicted against it again. ` +
+		`${remote} Re-run this phase once '${ctx.baseBranch}' has settled.`
+	);
+}
+
+/**
+ * Where a delivery got to, written down as it happens so a crashed run resumes
+ * against what the remote actually holds (issue #1001). `committed` records a
+ * catch-up commit that still has to be pushed; `pushed` performs the push and
+ * records it.
+ */
+interface MergeDeliveryRecord {
+	/** A catch-up commit that still has to be pushed. */
+	committed(commitSha: string): void;
+	/** Push this commit to the pull request's branch, and record that it is there. */
+	pushed(commitSha: string): Promise<void>;
+}
+
+/**
+ * Push the resolved merge, and keep pushing catch-up merges — bounded by
+ * {@link MAX_BASE_ADVANCE_REMERGES} — until the commit on the branch contains the
+ * base branch **as an observation made after that push** (issue #1001).
+ *
+ * This is the other end of the staleness `GitWorktreeManager.provision()` guards
+ * at the start of a phase. The resolution is built against one read of
+ * `origin/<base>` and delivered minutes later; a merge landing in between makes
+ * the pull request conflicting again the instant the push lands, and the run
+ * still settles `phase-succeeded` over it.
+ *
+ * **The check has to outlive the push, not precede it.** Nothing SWARM can ask
+ * for constrains `origin/<base>` while it updates the pull request's own branch —
+ * the push is a write to a different ref, so no provider offers an atomic
+ * condition on the base — which means a base read taken *before* the push proves
+ * only that the base had not moved by then, and the same merge can still land in
+ * the interval that is left. So the loop re-reads the base **after** each push
+ * too, and the run only comments and reports `resolved` once a read taken with
+ * the commit already on the remote finds the base contained in it: at that
+ * instant the pull request really was mergeable. A base that advances later is
+ * ordinary — it is what re-dispatches this phase — and no check placed anywhere
+ * inside the run could speak for it.
+ *
+ * The cost of that is one extra `git fetch` of the base on the ordinary path (the
+ * read before the push, then the read confirming it), which is the price of the
+ * claim the comment makes.
+ *
+ * A catch-up pass is a *second merge on top of the first*, not a redo: the
+ * previous commit stays, only what the base gained is merged again, and each pass
+ * goes through {@link gatePreparedMerge} and {@link commitPreparedTree} exactly as
+ * the first did — then the push that follows fast-forwards the branch over the
+ * commit already delivered. That also means a pass with nothing to merge is
+ * refused by `validatePreparedTree` rather than silently pushed.
+ *
+ * Exhausting the bound throws an {@link UnretryableDeliveryError} rather than a
+ * plain error, because deferring is the one thing that must not happen: a
+ * deferred delivery resumes *without* re-running the agent
+ * ({@link resumedDeliveryAgent}), which is precisely a push of the stale merge
+ * this exists to stop. It can now throw with a merge already pushed — the
+ * post-push read is where the bound is most likely to bite — so the branch is
+ * left carrying that commit and {@link staleMergeMessage} says so rather than
+ * claiming the remote is untouched.
+ *
+ * Returns the hand-off the last delivered pass left, which is what the comment
+ * body and the outcome are bound to; the commit itself reaches the caller through
+ * `record`, which has already written it to the delivery progress.
+ */
+async function deliverMergeAgainstCurrentBase(
+	ctx: MergePassContext,
+	state: { commitSha: string; handoff: ConflictHandoff },
+	commitIdentity: { name: string; email: string },
+	record: MergeDeliveryRecord,
+): Promise<ConflictHandoff> {
+	let { commitSha, handoff } = state;
+	// A fresh pass mints its own session on a self-minting CLI, so the id the next
+	// one may resume is the one the last pass actually reported.
+	let resumeSessionId = ctx.resumeSessionId;
+	/** The commit the branch is known to carry, so the confirming read costs no second push. */
+	let pushedSha: string | null = null;
+	let remerges = 0;
+	for (;;) {
+		const advancedTo = await advancedBaseHead(ctx.worktreePath, ctx.baseBranch, commitSha);
+		if (!advancedTo) {
+			if (pushedSha === commitSha) return handoff;
+			await record.pushed(commitSha);
+			pushedSha = commitSha;
+			continue;
+		}
+		if (remerges >= MAX_BASE_ADVANCE_REMERGES)
+			throw new UnretryableDeliveryError(staleMergeMessage(ctx, advancedTo, remerges, pushedSha));
+		remerges += 1;
+		logger.warn(
+			'resolve-conflicts: the base advanced while the conflicts were being resolved — merging it again',
+			{
+				taskId: ctx.taskId,
+				prNumber: ctx.prNumber,
+				baseBranch: ctx.baseBranch,
+				advancedTo,
+				mergeCommitSha: commitSha,
+				pushedSha,
+				remerge: remerges,
+			},
+		);
+		const pass = await ctx.runAgent({
+			cli: ctx.cli,
+			model: ctx.model,
+			reasoning: ctx.reasoning,
+			resumeSessionId,
+			cwd: ctx.worktreePath,
+			args: [
+				buildBaseAdvancedRemergePrompt({
+					prNumber: ctx.prNumber,
+					prBranch: ctx.prBranch,
+					baseBranch: ctx.baseBranch,
+					baseSha: advancedTo,
+					deliveredSha: commitSha,
+					pushed: pushedSha === commitSha,
+				}),
+			],
+			maxOutputBytes: 1_000_000,
+			logContext: {
+				taskId: ctx.taskId,
+				phase: 'resolve-conflicts-base-advanced',
+				prNumber: ctx.prNumber,
+				headSha: ctx.headSha,
+				baseSha: advancedTo,
+			},
+			timeoutMs: ctx.timeoutMs,
+			signal: ctx.signal,
+		});
+		if (pass.exitCode !== 0)
+			throw agentRunError(
+				pass,
+				`Resolve-conflicts re-merge agent (${ctx.cli}) exited with code ${pass.exitCode}`,
+				` for PR #${ctx.prNumber}`,
+			);
+		resumeSessionId = pass.sessionId ?? resumeSessionId;
+		const passContext = { ...ctx, resumeSessionId };
+		handoff = await gatePreparedMerge(passContext);
+		commitSha = await commitPreparedTree(
+			ctx.worktreePath,
+			mergeCommitSubject(ctx.baseBranch, ctx.prBranch),
+			commitIdentity,
+		);
+		record.committed(commitSha);
+	}
+}
+
 export async function runResolveConflictsPhase(
 	options: RunResolveConflictsPhaseOptions,
 ): Promise<{ agent: AgentCliResult; outcome: ResolveConflictsOutcome }> {
@@ -359,50 +605,35 @@ export async function runResolveConflictsPhase(
 			);
 			throw error;
 		}
-		let handoff = readHandoff(
-			handle.path,
-			RESOLVE_CONFLICTS_OUTCOME_FILENAME,
-			ConflictHandoffSchema,
-		);
-		// Before the repair pass and every delivery step, so a merge we are going to
-		// refuse never spends an agent run or reaches the remote (issue #924).
-		assertMergeVerified(handoff, { taskId, prNumber, headSha });
-		// A resumed delivery already passed both gates in the attempt that first
-		// wrote `handoff` — delivery progress only exists past this point — so they
-		// are safe to skip here; only a fresh merge this call actually produced
-		// needs checking. See `validateMigrationJournal`'s own header (issue
-		// #503/#508) and `settleResolvedPaths` above (issue #844) for why each exists.
-		if (!shouldResumeDelivery) {
-			const repairPassRan = await guardMigrationJournal({
-				worktreePath: handle.path,
-				cli,
-				model,
-				reasoning,
-				resumeSessionId: repairSessionId(cli, agent, { sessionId, resumeSessionId }, resumed),
-				taskId,
-				prNumber,
-				headSha,
-				baseBranch,
-				timeoutMs,
-				signal,
-				runAgent,
-			});
-			// After the repair pass, which can still edit files.
-			await settleResolvedPaths(handle.path, { taskId, prNumber, headSha });
-			// The repair prompt tells that pass to rewrite the hand-off when its fix
-			// changes `body` or `verification`, so the gate above only ever covered what
-			// the merge agent wrote. Re-read and re-gate whatever it actually left, and
-			// bind the delivery steps to that: otherwise a repair pass that re-ran the
-			// suite and reported `failed` would be committed, pushed and commented on
-			// with the pre-repair body claiming success.
-			if (repairPassRan) {
-				handoff = readHandoff(
-					handle.path,
-					RESOLVE_CONFLICTS_OUTCOME_FILENAME,
-					ConflictHandoffSchema,
-				);
-				assertMergeVerified(handoff, { taskId, prNumber, headSha });
-			}
+		const mergeContext: MergePassContext = {
+			worktreePath: handle.path,
+			cli,
+			model,
+			reasoning,
+			resumeSessionId: repairSessionId(cli, agent, { sessionId, resumeSessionId }, resumed),
+			taskId,
+			prNumber,
+			prBranch,
+			headSha,
+			baseBranch,
+			timeoutMs,
+			signal,
+			runAgent,
+		};
+		// A resumed delivery already passed every gate in the attempt that first
+		// wrote the hand-off — delivery progress only exists past this point — so
+		// they are safe to skip here, bar the cheap read of what the agent claimed;
+		// only a fresh merge this call actually produced needs the rest. See
+		// `validateMigrationJournal`'s own header (issue #503/#508) and
+		// `settleResolvedPaths` above (issue #844) for why each exists.
+		let handoff: ConflictHandoff;
+		if (shouldResumeDelivery) {
+			handoff = readHandoff(handle.path, RESOLVE_CONFLICTS_OUTCOME_FILENAME, ConflictHandoffSchema);
+			// Before every delivery step, so a merge we are going to refuse never
+			// reaches the remote (issue #924).
+			assertMergeVerified(handoff, { taskId, prNumber, headSha });
+		} else {
+			handoff = await gatePreparedMerge(mergeContext);
 		}
 		const delivery =
 			options.delivery ??
@@ -420,13 +651,40 @@ export async function runResolveConflictsPhase(
 			await assertRemoteHead(handle.path, prBranch, headSha);
 			progress.commitSha = await commitPreparedTree(
 				handle.path,
-				`chore: merge ${baseBranch} into ${prBranch}`,
+				mergeCommitSubject(baseBranch, prBranch),
 				delivery.commitIdentity,
 			);
 			saveDeliveryProgress(handle.path, progress);
 		}
 		if (!progress.pushed) {
-			await pushDeliveredBranch(delivery, handle.path, prBranch, progress.commitSha);
+			// The base can advance between the read this resolution was built on and
+			// this push — on a repository SWARM itself merges into, well within the
+			// phase's own runtime (issue #1001). The push itself is where that window
+			// closes, so the push lives inside the catch-up loop: it is only left once
+			// a base read taken *after* a push finds it contained in what the branch
+			// now carries, which is what the comment and the outcome below then claim.
+			// Bind them to whatever the last delivered pass actually left.
+			handoff = await deliverMergeAgainstCurrentBase(
+				mergeContext,
+				{ commitSha: progress.commitSha, handoff },
+				delivery.commitIdentity,
+				{
+					committed: (commitSha) => {
+						progress.commitSha = commitSha;
+						saveDeliveryProgress(handle.path, progress);
+					},
+					pushed: async (commitSha) => {
+						await pushDeliveredBranch(delivery, handle.path, prBranch, commitSha);
+						progress.commitSha = commitSha;
+						saveDeliveryProgress(handle.path, progress);
+					},
+				},
+			);
+			// `pushed` is written only here, so it means "pushed *and* confirmed
+			// against a base read taken afterwards" — the precondition the comment
+			// below claims. A run that died between the push and that read resumes
+			// with it still `false` and re-enters the loop, where re-pushing the same
+			// commit is the no-op `git push` already makes it.
 			progress.pushed = true;
 			saveDeliveryProgress(handle.path, progress);
 		}

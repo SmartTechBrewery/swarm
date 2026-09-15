@@ -22,6 +22,7 @@ vi.mock('@/pipeline/merge-resolution.js', () => ({
 }));
 
 import type { AgentCliResult, RunAgentCliOptions } from '@/harness/agent-cli.js';
+import { buildBaseAdvancedRemergePrompt } from '@/pipeline/prompts/resolve-conflicts.js';
 import {
 	buildResolveConflictsPrompt,
 	runResolveConflictsPhase,
@@ -491,5 +492,40 @@ describe('buildResolveConflictsPrompt — verification contract (issue #924)', (
 		);
 		expect(prompt).toContain('Never put an explanation in `outcome`');
 		expect(prompt).not.toContain('outcome:"passed"');
+	});
+});
+
+/**
+ * The catch-up pass (issue #1001). It runs against a checkout whose merge SWARM
+ * has already committed locally and not pushed, so the prompt has to say that —
+ * an agent that "cleaned up" with a reset would destroy work existing nowhere
+ * else — and it has to restate the same floor and hand-off contract as the first
+ * pass, since the phase gates both through the identical code.
+ */
+describe('buildBaseAdvancedRemergePrompt (issue #1001)', () => {
+	const prompt = buildBaseAdvancedRemergePrompt({
+		prNumber: '162',
+		prBranch: 'issue-90',
+		baseBranch: 'develop',
+		baseSha: 'e117b52',
+		deliveredSha: 'db50b71',
+	});
+
+	it('names what moved, and the local commit that must survive the pass', () => {
+		expect(prompt).toContain('`origin/develop` advanced to e117b52');
+		expect(prompt).toContain('committed your resolved merge locally on "issue-90" as db50b71');
+		expect(prompt).toContain('never reset, rebase, amend or force-push it away');
+		expect(prompt).toContain('merge `origin/develop` into the checked-out branch again');
+	});
+
+	it('restates the first pass’s floor, hand-off contract and phase guard', () => {
+		expect(prompt).toContain('You are a SWARM pipeline agent assigned to exactly one phase');
+		expect(prompt).toContain('Do not commit, push, comment, or perform any GitHub mutation');
+		expect(prompt).toContain(HANDOFF_FILENAMES.resolveConflicts);
+		expect(prompt).toContain("keep `develop`'s migrations exactly as `develop` has them");
+	});
+
+	it.each(CONFLICT_VERIFICATION_OUTCOMES)('names `%s` as an outcome the agent may report', (o) => {
+		expect(prompt).toContain(`\`${o}\``);
 	});
 });

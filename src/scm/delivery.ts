@@ -1044,6 +1044,57 @@ export async function assertRemoteFastForwardable(cwd: string, branch: string): 
 }
 
 /**
+ * The base branch's head when `deliveredSha` does not already contain it, or
+ * `null` when it does — "did the base move out from under this resolution?",
+ * asked as the question that actually decides the pull request's mergeability
+ * (issue #1001).
+ *
+ * The hazard is the mirror of {@link assertRemoteHead}'s at the other end of a
+ * Resolve-conflicts run: the base is read once, the resolution takes minutes, and
+ * on a repository SWARM itself keeps merging into, a merge landing inside that
+ * window is the expected case rather than the unlucky one — leaving the pull
+ * request conflicting again the moment the push lands. Containment is the exact
+ * test, not a SHA comparison against the dispatched base: a commit that already
+ * holds the base tip merges into it as a fast-forward, so it cannot conflict,
+ * whichever base snapshot the agent happened to fetch for itself.
+ *
+ * Deliberately takes a `deliveredSha` rather than reading HEAD, because the
+ * caller asks this on **both** sides of its push: before, to avoid delivering a
+ * merge already known to be stale, and again afterwards, because nothing
+ * constrains `origin/<base>` while the pull request's own branch is updated, so
+ * only a read taken with the commit already on the remote can say the pull
+ * request was mergeable at an instant that actually happened.
+ *
+ * Fails **open** when git cannot read the remote at all — a fetch blip must not
+ * fail a phase whose merge is otherwise good, the rule {@link
+ * assertRemoteFastForwardable} and {@link assertCheckoutHoldsHead} already
+ * apply — but **closed** on an ancestry git declines to evaluate with both
+ * commits in hand, exactly as {@link divergedRemoteHead} does: an unprovable
+ * containment is not evidence the merge is current, and being wrong here reports
+ * a pull request resolved while it is still conflicted.
+ */
+export async function advancedBaseHead(
+	cwd: string,
+	baseBranch: string,
+	deliveredSha: string,
+): Promise<string | null> {
+	let base: string;
+	try {
+		await git(cwd, ['fetch', 'origin', baseBranch]);
+		base = await git(cwd, ['rev-parse', `origin/${baseBranch}`]);
+	} catch (error) {
+		logger.warn('Could not re-read the base branch — proceeding without the stale-merge check', {
+			baseBranch,
+			deliveredSha,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return null;
+	}
+	if (!base) return null;
+	return (await isAncestor(cwd, base, deliveredSha)) === true ? null : base;
+}
+
+/**
  * Push a delivered commit, turning an unwinnable push into a terminal
  * {@link DeliveryDivergedError} instead of a retry (issue #558).
  *

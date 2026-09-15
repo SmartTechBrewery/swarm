@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+	advancedBaseHead,
 	assertCheckoutHoldsHead,
 	assertRemoteFastForwardable,
 	ConflictHandoffSchema,
@@ -490,6 +491,43 @@ describe('assertRemoteFastForwardable', () => {
 
 		await expect(assertRemoteFastForwardable(clone, 'issue-1')).resolves.toBeUndefined();
 		await expect(assertRemoteFastForwardable(root, 'issue-1')).resolves.toBeUndefined();
+	});
+});
+
+/**
+ * The base-side twin (issue #1001): the pull request's own branch is what
+ * `assertRemoteFastForwardable` watches, and this watches the branch it is going
+ * to be merged *into*, which a Resolve-conflicts run reads once and then spends
+ * minutes resolving against.
+ */
+describe('advancedBaseHead', () => {
+	it('reports nothing while the delivered commit still contains the base tip', async () => {
+		const { clone } = makeRemoteAndClone();
+		const delivered = commitOn(clone, 'issue-1', 'built on top of the base as it stands\n');
+
+		await expect(advancedBaseHead(clone, 'main', delivered)).resolves.toBeNull();
+	});
+
+	// The incident: a merge landed on the base 15 seconds after the run read it, and
+	// the delivered merge of the older base left the pull request conflicting again.
+	it('names the base head a delivered commit does not contain', async () => {
+		const { origin, clone } = makeRemoteAndClone();
+		const delivered = commitOn(clone, 'issue-1', 'resolved against the base we read\n');
+		const advanced = pushFromAnotherClone(origin, 'main', 'another pull request merging\n');
+
+		await expect(advancedBaseHead(clone, 'main', delivered)).resolves.toBe(advanced);
+	});
+
+	// Fails open, exactly as `assertRemoteFastForwardable` does: a fetch blip must not
+	// fail a phase whose merge is otherwise good.
+	it('passes when the base branch cannot be read at all', async () => {
+		const { clone } = makeRemoteAndClone();
+		const delivered = commitOn(clone, 'issue-1', 'never mind the remote\n');
+		const root = mkdtempSync(join(tmpdir(), 'swarm-no-repo-'));
+		roots.push(root);
+
+		await expect(advancedBaseHead(clone, 'no-such-branch', delivered)).resolves.toBeNull();
+		await expect(advancedBaseHead(root, 'main', delivered)).resolves.toBeNull();
 	});
 });
 
