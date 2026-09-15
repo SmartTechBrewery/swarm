@@ -3,6 +3,7 @@ import { useNavigate } from '@tanstack/react-router';
 import { RefreshCw, Search, SearchX, Server } from 'lucide-react';
 import { useState } from 'react';
 import { buttonClass } from '@/components/ui/button.js';
+import { WorkerUpdateDialog } from '@/components/workers/worker-update-dialog.js';
 import { WorkersTable } from '@/components/workers/workers-table.js';
 import { canViewInstanceWide } from '@/lib/instance-admin.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
@@ -274,28 +275,120 @@ function WorkersSearchBox({
  * the copy names the whole set and the filter is left to do only what it looks
  * like it does.
  *
- * Deliberately inert for now: nothing is wired to either, so both render
- * `disabled` with a title saying so, rather than as live-looking controls that
- * silently swallow a click. Wiring them is this component's job alone — the
- * toolbar passes it nothing but the scope.
+ * **The installation-wide one is wired** (issue #1009) and never fires on a single
+ * click: it opens {@link WorkerUpdateDialog}, which names the build and the set
+ * before anything is asked and then renders the per-machine report. What it asks
+ * for is the control plane's **own commit**, read from `workers.controlPlaneBuild`
+ * and never a ref the browser invents — the same decision the one-machine button
+ * inherited from issue #998, and for the same reason: that commit is the comparand
+ * a machine's `Outdated` mark is judged against, so a successful update clears it,
+ * where `main` would land the machine on whatever was on it at apply time. A
+ * control plane that cannot read its own build therefore has nothing to offer, so
+ * the button is `disabled` and its title says so rather than falling back to a ref.
+ * That read is on the roster's polling cadence, so the commit the action names is
+ * the one the live control plane is running now and not the one it was running
+ * when the page was opened.
+ *
+ * It calls `requestUpdateForInstallation` rather than `startFleetUpdate`: that one
+ * is **owner-scoped** (`listWorkersForOwner`), so it cannot serve a button labelled
+ * "Update all workers" on an installation-wide screen. The fan-out is safe to use
+ * unstaged for the reason the procedure itself states — it asks only machines their
+ * owners have already drained, so it cannot take the installation's capacity down.
+ * A *staged* installation-wide rollout stays issue #922's open question and belongs
+ * in its own issue rather than in a widened `startFleetUpdate`.
+ *
+ * The client-side gate stays `canViewInstanceWide` at the call site — a decision
+ * about what to *offer*, not a copy of a server precondition — and the `FORBIDDEN`
+ * the server answers a non-administrator with is rendered verbatim in the dialog.
+ *
+ * The project-scoped one is still inert: it renders `disabled` with a title saying
+ * so, rather than as a live-looking control that silently swallows a click.
+ *
+ * The two are separate components rather than one body with a flag, so the inert
+ * one settles no query of its own — a `scope` branch *inside* one component would
+ * have to read the control plane's build for both.
  */
 function UpdateWorkersButton({ scope }: { scope: 'installation' | 'project' }) {
-	const { label, machines } =
-		scope === 'installation'
-			? { label: 'Update all workers', machines: 'every registered machine' }
-			: { label: 'Update project workers', machines: 'every machine enrolled in this project' };
+	return scope === 'installation' ? <UpdateAllWorkersButton /> : <UpdateProjectWorkersButton />;
+}
 
+/** The project-scoped action, still placed rather than wired (phase 3 of issue #998). */
+function UpdateProjectWorkersButton() {
 	return (
 		<button
 			type="button"
 			disabled
-			title={`Not wired up yet — this will ask ${machines} to update to the control plane's build.`}
+			title="Not wired up yet — this will ask every machine enrolled in this project to update to the control plane's build."
 			className={buttonClass('secondary')}
 		>
 			<RefreshCw className="h-4 w-4" aria-hidden="true" />
-			{label}
+			Update project workers
 		</button>
 	);
+}
+
+/** The installation-wide action — see {@link UpdateWorkersButton} for why it is shaped this way. */
+function UpdateAllWorkersButton() {
+	const [confirming, setConfirming] = useState(false);
+	// One value for the whole installation, so it is its own query rather than a
+	// roster row field: `workers.list` answers with a bare array, and repeating the
+	// comparand on every row would say nothing the `Outdated` mark does not.
+	//
+	// On the roster's own cadence, because the control plane resolves this from the
+	// process it is running in: redeploy it and a page left open would otherwise
+	// keep offering — and name — the build it read at mount, rolling every machine
+	// onto a commit the live server has already moved off. The one-machine button
+	// reads the same value off `workers.getById`, which polls at this interval too, so
+	// both surfaces answer with the same build at the same age.
+	const buildQuery = useQuery({
+		...trpc.workers.controlPlaneBuild.queryOptions(),
+		refetchInterval: WORKERS_REFETCH_MS,
+	});
+	const target = buildQuery.data?.build?.commit ?? null;
+
+	return (
+		<>
+			<button
+				type="button"
+				onClick={() => setConfirming(true)}
+				disabled={!target}
+				title={fleetUpdateTitle(buildQuery.isPending, target)}
+				className={buttonClass('secondary')}
+			>
+				<RefreshCw className="h-4 w-4" aria-hidden="true" />
+				Update all workers
+			</button>
+			{target ? (
+				<WorkerUpdateDialog
+					open={confirming}
+					onClose={() => setConfirming(false)}
+					title="Update every worker on this installation?"
+					confirmCopy={
+						<strong className="text-zinc-200">
+							every registered machine on this installation, including machines you do not own,
+						</strong>
+					}
+					target={target}
+					requestUpdate={() => trpcClient.workers.requestUpdateForInstallation.mutate({ target })}
+				/>
+			) : null}
+		</>
+	);
+}
+
+/**
+ * The installation-wide button's own title: what the click will ask for, or why
+ * there is nothing to ask for yet. A module-level helper rather than a ternary in
+ * the attribute, so each disabled case stays one readable sentence — the shape
+ * `updateActionTitle` uses on the worker detail view.
+ */
+function fleetUpdateTitle(loading: boolean, target: string | null): string {
+	if (target) {
+		return `Asks every registered machine on this installation to move its SWARM install root to ${target.slice(0, 7)} — the build this control plane is running — and restart its daemon.`;
+	}
+	return loading
+		? 'Reading the build this control plane is running…'
+		: 'This control plane cannot read its own build, so there is no build to ask these machines to move to.';
 }
 
 /**

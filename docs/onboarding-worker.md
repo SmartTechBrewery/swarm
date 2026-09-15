@@ -764,6 +764,20 @@ them, and this is which side it landed on and why.
 swarm workers request-update main          # every machine on the installation
 ```
 
+- **This has a dashboard equivalent** (issue #1009): an instance administrator can
+  ask for the same thing at `/workers` → **Update all workers**, in the toolbar above
+  the roster, which calls the same `workers.requestUpdateForInstallation` this command
+  does — no CLI or DB access needed. Like the machine-scoped button it always asks for
+  **the build the control plane itself is running** rather than taking a ref, and a
+  control plane that cannot read its own build offers no button rather than guessing
+  one. It never fires on a single click: a confirmation first names the build, the set
+  ("every registered machine on this installation, including machines you do not own")
+  and the fact that only already-drained machines are asked. It then shows the same
+  report this command prints — every machine with its owner and its disposition, and
+  the same grouped lines naming who to ask for a `swarm workers drain`, a
+  `swarm workers enroll` or a `swarm-worker-agent install`. A caller without the
+  installation role sees the refusal below in the control plane's own words.
+
 What settles it is that each of #800's four **takes something of the owner's** and
 keeps it — a credential the administrator would then hold, the machine's existence,
 the owner's consent to share it, the constraints their machine runs under — whereas

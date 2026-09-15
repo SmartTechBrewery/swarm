@@ -53,7 +53,7 @@ import {
 } from '../../identity/worker-service.js';
 import { RolloutWaveSizeSchema } from '../../identity/worker-update-rollout.js';
 import { requireProjectSCMProviderId } from '../../integrations/scm/registry.js';
-import { WorkerUpdateTargetSchema } from '../../lib/build-identity.js';
+import { resolveOwnBuildIdentity, WorkerUpdateTargetSchema } from '../../lib/build-identity.js';
 import { logger } from '../../lib/logger.js';
 import { publishWorktreeSweepRequest } from '../../queue/worker-sweeps.js';
 import { TriggerPhaseSchema } from '../../triggers/types.js';
@@ -100,7 +100,13 @@ import { workerScmCredentialsRouter } from './workerScmCredentials.js';
  *   which is the comparand that verdict was reached against and is one value for
  *   the whole installation rather than a per-row fact. Every one of the three is
  *   three-valued: an undeclared build and an unresolvable comparand both read as
- *   "no answer", never as stale. **One installation-wide *mutation* joins them**
+ *   "no answer", never as stale. That same value is served on its own as
+ *   `controlPlaneBuild` (issue #1009), for a surface holding rows rather than one
+ *   row — the roster's installation-wide update action, which has to name the build
+ *   it is about to ask for. A query rather than a roster field for the reason the
+ *   detail view already states: it is one value for the whole installation, and
+ *   `list` returns a bare array with no envelope to hang it off.
+ *   **One installation-wide *mutation* joins them**
  *   (`requestUpdateForInstallation`, issue #922): an administrator asks every
  *   machine on the installation to move to a build, including machines they do not
  *   own. It is an administrator's call on #647's terms — `FORBIDDEN` for anybody
@@ -556,6 +562,28 @@ export const workersRouter = router({
 				enrollments,
 			};
 		}),
+
+	// The build **this control plane** is running (issue #1009) — the same value
+	// `getById` carries per worker, served on its own for the surfaces that hold a
+	// roster rather than one machine: the `/workers` toolbar's installation-wide
+	// update action has to name the build it is about to ask every machine for, and
+	// the target it sends is this commit rather than a ref the browser invents.
+	//
+	// **Its own query rather than a roster field**, on the reasoning
+	// `DashboardWorkerDetailView.controlPlaneBuild` already records: it is one value
+	// for the whole installation, so repeating it on N rows would say nothing the
+	// `Outdated` mark does not — and `list` answers with a bare array, so there is no
+	// envelope to hang it off without reshaping every consumer of it.
+	//
+	// `authedProcedure` with no further gate. The same value is already served to any
+	// viewer of any worker detail page, and it is a commit id rather than a secret;
+	// what it enables — asking the installation to move — is gated where it is
+	// decided, on `requestUpdateForInstallation` itself. `null` when this process
+	// cannot read its own checkout, which is the same "no answer" every other reader
+	// of that build takes, never a guess.
+	controlPlaneBuild: authedProcedure.query(async () => ({
+		build: (await resolveOwnBuildIdentity()) ?? null,
+	})),
 
 	// --- Owner self-service (scoped to ctx.user) ---
 

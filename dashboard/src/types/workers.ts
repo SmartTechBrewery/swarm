@@ -370,3 +370,38 @@ export interface OwnerWorker {
 	runState: WorkerRunState;
 	enrollments: OwnerEnrollment[];
 }
+
+/**
+ * One machine's line in an update report (`workers.requestUpdateForInstallation`,
+ * issue #922; the project-scoped form reuses it) — what the control plane did about
+ * that machine, and enough to say which machine and whose.
+ *
+ * **`disposition` is a plain `string`, deliberately.** The server's own vocabulary is
+ * the seven words `WORKER_UPDATE_FANOUT_DISPOSITIONS` names (`requested`,
+ * `queued-offline`, `in-pool`, `no-project`, `unsupervised`, `already-asked`,
+ * `answered`), but a newer control plane may report an eighth, and a browser bundle
+ * this one was built before that happened must still list the machine rather than
+ * drop it. `src/cli/commands/workers.ts` reads it with exactly the same tolerance and
+ * for the same reason; `@/lib/worker-update-dispositions.js` is where the words this
+ * build does know are turned into copy.
+ */
+export interface WorkerUpdateReportEntry {
+	workerId: string;
+	displayName: string;
+	disposition: string;
+	/** `null` for an owner the server's users read could not resolve — print "unknown", never nobody. */
+	owner: WorkerOwner | null;
+	/** The machine's update state *after* the request; `null` for one nobody has ever asked. */
+	update: WorkerUpdate | null;
+}
+
+/**
+ * The answer to one update request over a set of machines — the build asked for, who
+ * asked, and one entry per machine. It is the answer to a single request rather than
+ * a live view, so nothing polls it.
+ */
+export interface WorkerUpdateReport {
+	target: string;
+	requestedBy: string;
+	workers: WorkerUpdateReportEntry[];
+}
