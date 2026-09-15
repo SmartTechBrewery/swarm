@@ -86,7 +86,12 @@ function writeHandoff(worktreePath: string): void {
  * checkout of the PR branch mid-merge with both sides in conflict. `headSha` is
  * the PR branch tip on `origin`, so the phase's real `assertRemoteHead` passes.
  */
-function makeConflictedCheckout(): { worktreePath: string; headSha: string; baseSha: string } {
+function makeConflictedCheckout(): {
+	worktreePath: string;
+	seed: string;
+	headSha: string;
+	baseSha: string;
+} {
 	const root = mkdtempSync(join(tmpdir(), 'swarm-resolve-delivery-'));
 	roots.push(root);
 	const origin = join(root, 'origin.git');
@@ -123,7 +128,33 @@ function makeConflictedCheckout(): { worktreePath: string; headSha: string; base
 	}
 	writeCleanMigrations(worktreePath);
 	writeHandoff(worktreePath);
-	return { worktreePath, headSha, baseSha };
+	return { worktreePath, seed, headSha, baseSha };
+}
+
+/** Another pull request merging into the base while this run is working — issue #1001. */
+function advanceBase(seed: string, content: string): string {
+	git(seed, 'checkout', '-q', 'main');
+	writeFileSync(join(seed, 'conflict.txt'), content);
+	git(seed, 'commit', '-q', '--no-verify', '-am', content.trim());
+	git(seed, 'push', '-q', 'origin', 'main');
+	return git(seed, 'rev-parse', 'HEAD').trim();
+}
+
+/** What the agent leaves behind for the merge already in progress: a staged resolution. */
+function stageResolution(worktreePath: string, content: string): void {
+	writeFileSync(join(worktreePath, 'conflict.txt'), content);
+	git(worktreePath, 'add', '--', 'conflict.txt');
+}
+
+/** What a catch-up pass does: take the advanced base in on top of the merge already committed. */
+function mergeAdvancedBase(worktreePath: string, content: string): void {
+	git(worktreePath, 'fetch', '-q', 'origin');
+	try {
+		git(worktreePath, 'merge', '--no-verify', '--no-commit', 'origin/main');
+	} catch {
+		// Expected: both sides moved the same line again.
+	}
+	stageResolution(worktreePath, content);
 }
 
 function makeOptions(worktreePath: string, headSha: string, baseSha: string) {
@@ -184,6 +215,8 @@ describe('resolve-conflicts production delivery', () => {
 		const { outcome } = await runResolveConflictsPhase(options);
 
 		expect(outcome.status).toBe('resolved');
+		// A base that stayed put costs no catch-up pass at all (issue #1001).
+		expect(options.runAgent).toHaveBeenCalledTimes(1);
 		expect(options.pushBranch).toHaveBeenCalledTimes(1);
 		expect(options.postComment).toHaveBeenCalledTimes(1);
 		expect(options.cleanup).toHaveBeenCalledTimes(1);
@@ -239,4 +272,95 @@ describe('resolve-conflicts production delivery', () => {
 		expect(options.preserve).toHaveBeenCalledTimes(1);
 		expect(options.cleanup).not.toHaveBeenCalled();
 	});
+});
+
+/**
+ * Issue #1001. The window between reading the base and pushing is the phase's own
+ * runtime, so on a repository SWARM itself merges into, a merge landing inside it
+ * is the expected case: the run pushed a merge of a base that no longer existed
+ * and settled `phase-succeeded` over a pull request GitHub had already recomputed
+ * as `CONFLICTING`. Real git, so the assertions are about what the pushed commit
+ * actually contains rather than about a mocked SHA comparison.
+ *
+ * Each case drives two or three full merge/commit rounds through real git
+ * subprocesses, which outruns the 5s default once the whole unit suite is
+ * competing for threads — hence the explicit per-case budget.
+ */
+const RACE_CASE_TIMEOUT_MS = 30_000;
+
+describe('resolve-conflicts when the base advances mid-run', () => {
+	it(
+		'merges the advanced base again and delivers a commit that contains it',
+		async () => {
+			const { worktreePath, seed, headSha, baseSha } = makeConflictedCheckout();
+			const options = makeOptions(worktreePath, headSha, baseSha);
+			let advancedTo = '';
+			let passes = 0;
+			options.runAgent = vi.fn(async () => {
+				passes += 1;
+				if (passes === 1) {
+					stageResolution(worktreePath, 'resolved by hand\n');
+					// The merge the incident describes: 15 seconds into the run.
+					advancedTo = advanceBase(seed, 'main moved on again\n');
+				} else {
+					mergeAdvancedBase(worktreePath, 'resolved against the newer main\n');
+				}
+				return agentResult();
+			});
+
+			const { outcome } = await runResolveConflictsPhase(options);
+
+			expect(outcome.status).toBe('resolved');
+			expect(options.runAgent).toHaveBeenCalledTimes(2);
+			// The catch-up pass is a second merge on top of the first, not a redo.
+			expect(options.pushBranch).toHaveBeenCalledTimes(1);
+			expect(options.pushBranch).toHaveBeenCalledWith(
+				worktreePath,
+				PR_BRANCH,
+				outcome.mergeCommitSha,
+			);
+			expect(options.postComment).toHaveBeenCalledTimes(1);
+			// The whole point: what was pushed contains the base as it stood at push time.
+			expect(() =>
+				git(worktreePath, 'merge-base', '--is-ancestor', advancedTo, outcome.mergeCommitSha),
+			).not.toThrow();
+		},
+		RACE_CASE_TIMEOUT_MS,
+	);
+
+	// A base merging continuously must not spin forever, and must not report success
+	// either: the run says what happened and delivers nothing.
+	it(
+		'stops after a bounded number of catch-up passes and reports the race',
+		async () => {
+			const { worktreePath, seed, headSha, baseSha } = makeConflictedCheckout();
+			const options = makeOptions(worktreePath, headSha, baseSha);
+			let passes = 0;
+			options.runAgent = vi.fn(async () => {
+				passes += 1;
+				if (passes === 1) stageResolution(worktreePath, `resolved on pass ${passes}\n`);
+				else mergeAdvancedBase(worktreePath, `resolved on pass ${passes}\n`);
+				advanceBase(seed, `main moved on again (${passes})\n`);
+				return agentResult();
+			});
+
+			const error = await runResolveConflictsPhase(options).catch((e) => e);
+
+			// One resolution plus the two catch-up passes, and then it stops.
+			expect(options.runAgent).toHaveBeenCalledTimes(3);
+			expect(error).toBeInstanceOf(UnretryableDeliveryError);
+			expect(error).not.toBeInstanceOf(DeliveryDeferredError);
+			expect(error.message).toContain('Stale merge: ');
+			expect(error.message).toContain("base branch 'main' advanced to");
+			expect(error.message).toContain('Nothing was pushed or commented');
+			// Nothing delivered, so no `phase-succeeded` over a still-conflicting PR.
+			expect(options.pushBranch).not.toHaveBeenCalled();
+			expect(options.postComment).not.toHaveBeenCalled();
+			// Terminal, not deferred: a resumed delivery skips the agent, so it would push
+			// exactly the stale merge this refused.
+			expect(options.cleanup).toHaveBeenCalledTimes(1);
+			expect(options.preserve).not.toHaveBeenCalled();
+		},
+		RACE_CASE_TIMEOUT_MS,
+	);
 });

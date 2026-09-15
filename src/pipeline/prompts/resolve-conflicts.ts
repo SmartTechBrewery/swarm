@@ -62,14 +62,68 @@ export function buildResolveConflictsPrompt(
 		`Merge origin/${input.baseBranch} into the checked-out PR branch with a normal merge (never rebase and never force-push). Resolve every conflict while preserving both changes' intent.`,
 		...migrationConflictGuidance(input.baseBranch),
 		...INDEX_RESOLUTION_GUIDANCE,
-		'Run the relevant lint, type-check, and tests. Do not commit, push, comment, or perform any GitHub mutation; leave the fully resolved merge staged in the working tree for SWARM.',
-		`Write ${RESOLVE_CONFLICTS_OUTCOME_FILENAME} as JSON with status:"resolved", \`body\` (a single string — the concise result comment), and \`verification\`: an array of one \`{command, outcome, detail}\` object per command you actually ran, at least one. \`command\` is a single string, one command line; \`outcome\` is a single string, exactly one of \`passed\`, \`pre-existing-failure\` or \`failed\`; \`detail\` is a single string and is required for anything that is not \`passed\`.`,
+		DELIVERY_FLOOR,
+		HANDOFF_CONTRACT,
 		...VERIFICATION_OUTCOME_GUIDANCE,
 		...checkpointInstructions('resolve-conflicts'),
 		...(input.checkpoint ? checkpointContinuationSection(input.checkpoint) : []),
 		...projectInstructionsParagraph(customPrompt),
 	].join('\n\n');
 }
+
+/** The runtime context {@link buildBaseAdvancedRemergePrompt} is built from. */
+export interface BaseAdvancedRemergeInput {
+	prNumber: string;
+	prBranch: string;
+	baseBranch: string;
+	/** Where `origin/<baseBranch>` has got to since the merge below was built. */
+	baseSha: string;
+	/** The merge SWARM already committed locally on the branch, and has not pushed. */
+	deliveredSha: string;
+}
+
+/**
+ * Build the prompt for a re-merge pass (issue #1001): the resolution this run
+ * produced is already stale, because the base branch advanced while it was being
+ * produced, so the merge has to take in what the base gained before it may be
+ * pushed.
+ *
+ * Written for a session that has *just* done the first merge, but carries the
+ * phase guard itself for the same reason
+ * {@link buildMigrationJournalRepairPrompt} does: the pass resumes the merge's
+ * own session where one is addressable and runs fresh where it is not
+ * (`repairSessionId`, `src/pipeline/resume.ts`).
+ *
+ * The paragraph about the local commit is load-bearing. SWARM commits each pass's
+ * merge before checking the base, so the branch this pass starts on already holds
+ * work that exists nowhere else — an agent that "cleaned up" with a reset or a
+ * rebase would throw away the resolution it is being asked to build on.
+ */
+export function buildBaseAdvancedRemergePrompt(input: BaseAdvancedRemergeInput): string {
+	return [
+		'You are the implementer assigned only to SWARM’s Resolve Conflicts phase.',
+		...pipelinePhaseGuard(),
+		`The merge you just produced for PR #${input.prNumber} is already stale: \`origin/${input.baseBranch}\` advanced to ${input.baseSha} while you were resolving, so pushing it would leave the pull request conflicted again.`,
+		`SWARM has committed your resolved merge locally on "${input.prBranch}" as ${input.deliveredSha}, and has not pushed it. Keep it: never reset, rebase, amend or force-push it away — it exists nowhere else.`,
+		`Fetch origin, then merge \`origin/${input.baseBranch}\` into the checked-out branch again, on top of that commit, with a normal merge (never rebase and never force-push). Resolve every conflict while preserving both changes' intent. Only what "${input.baseBranch}" gained since your last merge is new, so this is normally a much smaller job than the first pass.`,
+		...migrationConflictGuidance(input.baseBranch),
+		...INDEX_RESOLUTION_GUIDANCE,
+		DELIVERY_FLOOR,
+		HANDOFF_CONTRACT,
+		...VERIFICATION_OUTCOME_GUIDANCE,
+	].join('\n\n');
+}
+
+/**
+ * The repository-mutation floor and the hand-off contract, shared by the merge
+ * prompt and the re-merge pass so the two cannot state different contracts for
+ * the same file — `ConflictHandoffSchema` validates whatever either one wrote,
+ * and `assertMergeVerified` gates both.
+ */
+const DELIVERY_FLOOR =
+	'Run the relevant lint, type-check, and tests. Do not commit, push, comment, or perform any GitHub mutation; leave the fully resolved merge staged in the working tree for SWARM.';
+
+const HANDOFF_CONTRACT = `Write ${RESOLVE_CONFLICTS_OUTCOME_FILENAME} as JSON with status:"resolved", \`body\` (a single string — the concise result comment), and \`verification\`: an array of one \`{command, outcome, detail}\` object per command you actually ran, at least one. \`command\` is a single string, one command line; \`outcome\` is a single string, exactly one of \`passed\`, \`pre-existing-failure\` or \`failed\`; \`detail\` is a single string and is required for anything that is not \`passed\`.`;
 
 /**
  * What the three verification outcomes mean, stated where the agent chooses one
