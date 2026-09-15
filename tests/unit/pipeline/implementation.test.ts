@@ -49,6 +49,7 @@ vi.mock('@/pipeline/resume.js', async (importOriginal) => ({
 }));
 
 import type { AgentCliResult, RunAgentCliOptions } from '@/harness/agent-cli.js';
+import { AgentRunError } from '@/harness/agent-failure.js';
 import { logger } from '@/lib/logger.js';
 import type { Checkpoint } from '@/pipeline/checkpoint.js';
 import {
@@ -476,6 +477,39 @@ describe('runImplementationPhase', () => {
 		expect(deps.delivery.pushBranch).not.toHaveBeenCalled();
 		expect(deps.pm.addComment).not.toHaveBeenCalled();
 		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('19');
+	});
+
+	it('reports a CLI that timed itself out, not the hand-off it never got to write', async () => {
+		// The shared gate on the other side of the hand-off/delivery split from
+		// resolve-conflicts (issue #1000): agy exits **0** at its own print cap, so the
+		// exit code alone used to pass this run through to `readHandoff` and report the
+		// missing file — an agent-quality headline for a bounded transient failure.
+		const AGY_PRINT_TIMEOUT =
+			'[agy] print timeout after 5m0s with turn in progress; returning partial output';
+		handoffFileExists = false;
+		const deps = makeDeps();
+		deps.runAgent = vi.fn(async () =>
+			agentResult({
+				cli: 'antigravity',
+				exitCode: 0,
+				stderr: `${AGY_PRINT_TIMEOUT}\n`,
+				cliSelfTimeout: AGY_PRINT_TIMEOUT,
+			}),
+		);
+
+		const error = await runImplementationPhase(deps).then(
+			() => undefined,
+			(err: unknown) => err,
+		);
+
+		expect(error).toBeInstanceOf(AgentRunError);
+		expect((error as AgentRunError).failure).toEqual({
+			kind: 'timeout',
+			cliSelfTimeout: AGY_PRINT_TIMEOUT,
+		});
+		expect((error as AgentRunError).message).toContain(AGY_PRINT_TIMEOUT);
+		expect((error as AgentRunError).message).not.toMatch(/did not write required hand-off/);
+		expect(deps.delivery.pushBranch).not.toHaveBeenCalled();
 	});
 
 	it('surfaces an agent-written blocker instead of a generic missing-hand-off error', async () => {

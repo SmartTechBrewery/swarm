@@ -54,6 +54,16 @@ export interface AgentFailure {
 	 * a default backoff.
 	 */
 	retryAfter?: Date;
+	/**
+	 * The CLI's own self-timeout notice, verbatim, when this `timeout` is one the
+	 * *CLI* imposed rather than one SWARM's own `timeoutMs` fired (issue #1000).
+	 * Two things read it: the message, so `runs.error`, the dashboard run row and
+	 * the PR comment all name the cause instead of the missing hand-off it led to;
+	 * and the deferrable rule, which cannot use its usual "non-zero exit ⇒
+	 * genuinely interrupted" proxy here — a self-timing-out CLI exits 0 by
+	 * construction.
+	 */
+	cliSelfTimeout?: string;
 }
 
 /**
@@ -341,6 +351,9 @@ function parseRetryAfter(hint: string, now: Date): Date | undefined {
  * output and `signal: null`, since it trapped SIGTERM and called `process.exit`
  * itself rather than being torn down by the OS — {@link AgentCliResult.aborted}
  * exists precisely because `result.signal` can't be trusted to reflect this).
+ * Next, a run whose CLI capped *itself* — agy's print-mode timeout, which it
+ * announces on stderr while exiting 0 (issue #1000) — is a `timeout` too, and
+ * carries the CLI's own notice so the message can name it.
  * Next, a provider-capacity error is `capacity`, matched per CLI so one CLI's
  * provider error can't be triggered by another CLI merely quoting or discussing
  * the text: Codex's structured `error` / `turn.failed` events anywhere in its
@@ -359,6 +372,14 @@ function parseRetryAfter(hint: string, now: Date): Date | undefined {
 export function classifyAgentFailure(result: AgentCliResult, now: Date = new Date()): AgentFailure {
 	if (result.timedOut) return { kind: 'timeout' };
 	if (result.aborted) return { kind: 'aborted' };
+	// The CLI ended its own turn (issue #1000). Structural — the notice exists only
+	// because the CLI itself wrote it — so it is trusted with no co-occurrence gate,
+	// exactly like the three terminal failure records read below. Checked *after*
+	// SWARM's own two reasons, which stay authoritative: when SWARM killed the run
+	// or the caller cancelled it, that is the cause and the CLI's own cap never
+	// fired.
+	if (result.cliSelfTimeout !== undefined)
+		return { kind: 'timeout', cliSelfTimeout: result.cliSelfTimeout };
 
 	const output = `${result.stdout}\n${result.stderr}`;
 	const trimmed = output.trim();
@@ -453,6 +474,29 @@ export function agentRunError(
 	now: Date = new Date(),
 ): AgentRunError {
 	const failure = classifyAgentFailure(result, now);
-	const reason = FAILURE_REASONS[failure.kind] ?? '';
+	// A CLI that timed *itself* out replaces the bare `(timed out)` marker with its
+	// own words (issue #1000), so the cause travels all the way into `runs.error`
+	// and the PR comment instead of only into `run_output_events`: the operator
+	// reads `(CLI timed out: [agy] print timeout after 5m0s …)` rather than having
+	// to query Postgres to find out why a hand-off was never written.
+	const reason = failure.cliSelfTimeout
+		? ` (CLI timed out: ${failure.cliSelfTimeout})`
+		: (FAILURE_REASONS[failure.kind] ?? '');
 	return new AgentRunError(`${prefix}${reason}${tail}`, failure, result);
+}
+
+/**
+ * Whether this run must be treated as a failed one by a phase's post-run gate.
+ * A non-zero exit is the long-standing rule; a CLI that ended its own turn is the
+ * addition (issue #1000) — it exits **0** with partial output, so the exit code
+ * alone reads it as a finished run, and the phase walks on to a hand-off the agent
+ * never got to write and reports the missing file instead of the timeout that
+ * caused it.
+ *
+ * Phases call this *before* reading any hand-off, which is what makes the
+ * detection independent of one being absent: a CLI that self-terminates after
+ * writing its hand-off is stopped at the same gate and reported just as honestly.
+ */
+export function agentRunFailed(result: AgentCliResult): boolean {
+	return result.exitCode !== 0 || result.cliSelfTimeout !== undefined;
 }

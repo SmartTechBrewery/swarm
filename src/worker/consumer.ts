@@ -3777,8 +3777,14 @@ async function handlePhaseFailure(
 				// and preserved its worktree). A run that trapped SIGTERM and still
 				// exited 0 (issue #165's clean-exit case) already finished and cleaned up
 				// its worktree, so it stays a terminal failure rather than deferring onto
-				// a checkout that's gone.
-				(err.failure.kind === 'timeout' && err.agent !== undefined && err.agent.exitCode !== 0))) ||
+				// a checkout that's gone — unless the CLI itself is what ended the turn
+				// (issue #1000). That run *is* genuinely interrupted and its checkout was
+				// preserved above, but it exits 0 by construction, so the exit-code proxy
+				// alone would misfile it as #165's clean-exit case and discard a bounded
+				// transient failure terminally.
+				(err.failure.kind === 'timeout' &&
+					(err.failure.cliSelfTimeout !== undefined ||
+						(err.agent !== undefined && err.agent.exitCode !== 0))))) ||
 		err instanceof DeliveryDeferredError;
 	// Tier 2's decision (issue #503) is resolved once and used twice: by the deferral,
 	// which turns it into a `checkpointed` settle, and by the terminal path below, which

@@ -27,7 +27,12 @@ import {
 	resolveContainmentPlan,
 } from './containment.js';
 import { type ReasoningLevel, resolveModelLaunch } from './models.js';
-import { type AgentUsage, parseAgentOutput, sessionIdFromLine } from './usage.js';
+import {
+	type AgentUsage,
+	parseAgentOutput,
+	selfTimeoutFromLine,
+	sessionIdFromLine,
+} from './usage.js';
 
 /** Agent CLIs the harness knows how to launch. Source of truth for the set. */
 export const AgentCliSchema = z.enum(['claude', 'antigravity', 'codex']);
@@ -395,6 +400,22 @@ export interface AgentCliResult {
 	codexFailure?: {
 		message?: string;
 	};
+	/**
+	 * The CLI's own verbatim notice that it ended the turn itself rather than
+	 * finishing it — agy's `[agy] print timeout after 5m0s with turn in progress;
+	 * returning partial output`, which it writes on stderr **while exiting 0**
+	 * (issue #1000). Set only when such a line was seen, so its absence means "the
+	 * CLI did not say it cut the turn", never "the run succeeded".
+	 *
+	 * Sniffed off the *live* stderr line stream for the same reason
+	 * {@link sessionId} is sniffed off stdout's (issue #867): a run that floods
+	 * `maxOutputBytes` latches its head buffer, and a marker printed at the very
+	 * end falls outside it. **stderr only, deliberately** — that is where the
+	 * observed notice is written, it is low-volume enough to scan per line, and it
+	 * keeps an agent that quotes the phrase in its own stdout transcript from
+	 * self-reporting a timeout.
+	 */
+	cliSelfTimeout?: string;
 }
 
 /**
@@ -763,7 +784,14 @@ export async function runAgentCli(options: RunAgentCliOptions): Promise<AgentCli
 				options.onStdout?.(line);
 			}
 		});
+		// The CLI's own "I cut this turn short" notice (issue #1000), latched off the
+		// live stderr lines for the same reason the session id is latched off stdout's:
+		// a chatty run's head buffer stops growing long before a notice written at the
+		// very end of the run. First one wins — the cause is the first cap that fired.
+		let cliSelfTimeout: string | undefined;
+
 		const forwardStderr = lineForwarder((line) => {
+			if (cliSelfTimeout === undefined) cliSelfTimeout = selfTimeoutFromLine(cli, line);
 			if (options.logLines) logger.debug('agent stderr', { cli, line });
 			options.onStderr?.(line);
 		});
@@ -866,6 +894,9 @@ export async function runAgentCli(options: RunAgentCliOptions): Promise<AgentCli
 					? { antigravityFailure: parsed.antigravityFailure }
 					: {}),
 				...(cli === 'codex' && parsed.codexFailure ? { codexFailure: parsed.codexFailure } : {}),
+				// `forwardStderr.flush()` above has already run, so a notice written
+				// without a trailing newline is latched by the time this is read.
+				...(cliSelfTimeout ? { cliSelfTimeout } : {}),
 			};
 			logger.debug('agent run finished', {
 				...options.logContext,
@@ -874,6 +905,7 @@ export async function runAgentCli(options: RunAgentCliOptions): Promise<AgentCli
 				signal: result.signal,
 				durationMs: result.durationMs,
 				timedOut,
+				cliSelfTimeout,
 				aborted,
 				outputTruncated: result.outputTruncated,
 				sessionId,

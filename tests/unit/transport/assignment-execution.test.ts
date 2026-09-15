@@ -17,6 +17,7 @@ import { DeliveryDeferredError } from '@/scm/delivery.js';
 import { buildTaskAssignment } from '@/transport/assignment.js';
 import {
 	cancelAssignment,
+	classifyDeferrable,
 	createAssignmentRunAgent,
 	deferrableOrFailedResult,
 	fromAssignedWorkItem,
@@ -1400,6 +1401,55 @@ describe('runAssignmentDbFree', () => {
 		await runAssignmentDbFree(ciAssignment(), sink, { ...RUN_OPTIONS, deps: depsWith(runPhase) });
 
 		expect(sink.sent.at(-1)).toMatchObject({ status: 'deferred', failureKind: 'timeout' });
+	});
+
+	// Issue #1000: the worker-side twin of the in-process deferrable rule. A CLI that
+	// ended its own turn exits 0, so the "genuinely interrupted" exit-code proxy cannot
+	// see it — the notice is the evidence, and it has to reach the frame or the control
+	// plane re-judges the deferral back into a terminal failure.
+	describe('a CLI that timed itself out', () => {
+		const AGY_PRINT_TIMEOUT =
+			'[agy] print timeout after 5m0s with turn in progress; returning partial output';
+		const selfTimeoutError = () =>
+			new AgentRunError(
+				`Respond-to-CI agent (antigravity) exited with code 0 (CLI timed out: ${AGY_PRINT_TIMEOUT})`,
+				{ kind: 'timeout', cliSelfTimeout: AGY_PRINT_TIMEOUT },
+				agentResult({ cli: 'antigravity', exitCode: 0 }),
+			);
+
+		it('classifies it as deferrable despite the exit 0', () => {
+			expect(classifyDeferrable(selfTimeoutError())).toEqual({
+				kind: 'timeout',
+				cliSelfTimeout: AGY_PRINT_TIMEOUT,
+			});
+		});
+
+		it('leaves an exit-0 timeout with no notice terminal (issue #165)', () => {
+			expect(
+				classifyDeferrable(
+					new AgentRunError(
+						'exited with code 0 (timed out)',
+						{ kind: 'timeout' },
+						agentResult({ exitCode: 0, timedOut: true }),
+					),
+				),
+			).toBeUndefined();
+		});
+
+		it('puts the notice on the deferred frame so the control plane can re-apply the rule', () => {
+			const frame = deferrableOrFailedResult(
+				selfTimeoutError(),
+				buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'implementation' })),
+			);
+
+			expect(frame).toMatchObject({
+				status: 'deferred',
+				failureKind: 'timeout',
+				resumable: true,
+				exitCode: 0,
+				cliSelfTimeout: AGY_PRINT_TIMEOUT,
+			});
+		});
 	});
 
 	// Issue #596: the worker holds the real `AgentCliResult` at settle time, and used to

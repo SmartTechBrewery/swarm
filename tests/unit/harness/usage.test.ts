@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseAgentOutput, sessionIdFromLine } from '@/harness/usage.js';
+import { parseAgentOutput, selfTimeoutFromLine, sessionIdFromLine } from '@/harness/usage.js';
 import {
 	CODEX_USAGE_LIMIT_ERROR_LINE,
 	CODEX_USAGE_LIMIT_LOG_TEXT,
@@ -439,6 +439,56 @@ describe('sessionIdFromLine', () => {
 			expect(sessionIdFromLine(cli, '{"type":"thread.started","thread_id":')).toBeUndefined();
 			expect(sessionIdFromLine(cli, 'plain text, not protocol')).toBeUndefined();
 			expect(sessionIdFromLine(cli, '')).toBeUndefined();
+		}
+	});
+});
+
+describe('selfTimeoutFromLine', () => {
+	// The stderr twin of the sniff above (issue #1000): a CLI that ends its own turn
+	// exits 0, so its notice is the only evidence the run was cut short.
+	const AGY_PRINT_TIMEOUT =
+		'[agy] print timeout after 5m0s with turn in progress; returning partial output';
+
+	it('returns agy’s notice verbatim, so the cause can reach the operator', () => {
+		expect(selfTimeoutFromLine('antigravity', AGY_PRINT_TIMEOUT)).toBe(AGY_PRINT_TIMEOUT);
+		// Whatever budget it was given: #999 now passes the phase's own, which agy
+		// echoes back in its own units.
+		expect(
+			selfTimeoutFromLine(
+				'antigravity',
+				'[agy] print timeout after 31m0s with turn in progress; returning partial output',
+			),
+		).toBe('[agy] print timeout after 31m0s with turn in progress; returning partial output');
+	});
+
+	it('trims the line, so a marker recovered mid-stream carries no stray whitespace', () => {
+		expect(selfTimeoutFromLine('antigravity', `  ${AGY_PRINT_TIMEOUT}  \r`)).toBe(
+			AGY_PRINT_TIMEOUT,
+		);
+	});
+
+	it('requires both halves of the phrase', () => {
+		// Deliberately narrow: a miss degrades to the pre-#1000 behaviour rather than
+		// to a false timeout deferral, so text that merely mentions a print timeout —
+		// a CI log in respond-to-ci, a reviewed diff — must not match.
+		expect(selfTimeoutFromLine('antigravity', 'print timeout after 5m0s')).toBeUndefined();
+		expect(selfTimeoutFromLine('antigravity', 'the turn is still in progress')).toBeUndefined();
+		expect(
+			selfTimeoutFromLine('antigravity', 'we should handle the print timeout case'),
+		).toBeUndefined();
+	});
+
+	it('recognises nothing for claude or codex, neither of which declares a self-timeout', () => {
+		// Matched per CLI so one CLI's wording cannot classify another's run (#999
+		// checked both against their own `--help`).
+		expect(selfTimeoutFromLine('claude', AGY_PRINT_TIMEOUT)).toBeUndefined();
+		expect(selfTimeoutFromLine('codex', AGY_PRINT_TIMEOUT)).toBeUndefined();
+	});
+
+	it('answers undefined for an ordinary line, on every CLI', () => {
+		for (const cli of ['claude', 'antigravity', 'codex'] as const) {
+			expect(selfTimeoutFromLine(cli, 'plain text, not a notice')).toBeUndefined();
+			expect(selfTimeoutFromLine(cli, '')).toBeUndefined();
 		}
 	});
 });

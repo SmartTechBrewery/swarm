@@ -350,6 +350,30 @@ describe('transport protocol schemas', () => {
 			expect(TaskExecutionResultSchema.parse(older)).toEqual(older);
 		});
 
+		it('round-trips a deferred frame carrying the CLI’s own self-timeout notice', () => {
+			const frame = {
+				type: 'task-execution-result' as const,
+				dispatchId: DISPATCH_ID,
+				status: 'deferred' as const,
+				phase: 'implementation' as const,
+				taskId: '17',
+				retryDelayMs: 60_000,
+				resumable: true,
+				failureKind: 'timeout',
+				reason: 'CLI timed out',
+				exitCode: 0,
+				// Issue #1000: without it the control plane sees only `exitCode: 0` and
+				// re-judges the worker's deferral into a terminal failure.
+				cliSelfTimeout:
+					'[agy] print timeout after 5m0s with turn in progress; returning partial output',
+			};
+			expect(TaskExecutionResultSchema.parse(frame)).toEqual(frame);
+			// Optional and additive, so no protocol-version bump: an older worker omits
+			// it and its frames parse exactly as they do today.
+			const { cliSelfTimeout, ...older } = frame;
+			expect(TaskExecutionResultSchema.parse(older)).toEqual(older);
+		});
+
 		// Validated as a loose string rather than `z.string().datetime()` on purpose: a
 		// terminal result frame must never lose its whole settle over one optional field,
 		// so an unparseable reset reaches the control plane and is handled there.

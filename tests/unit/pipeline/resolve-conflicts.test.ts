@@ -22,6 +22,7 @@ vi.mock('@/pipeline/merge-resolution.js', () => ({
 }));
 
 import type { AgentCliResult, RunAgentCliOptions } from '@/harness/agent-cli.js';
+import { AgentRunError } from '@/harness/agent-failure.js';
 import { buildBaseAdvancedRemergePrompt } from '@/pipeline/prompts/resolve-conflicts.js';
 import {
 	buildResolveConflictsPrompt,
@@ -150,6 +151,10 @@ function makeDeps(worktreePath: string, project = createMockProjectConfig()) {
 		provision: vi.fn(async () => handle),
 		worktreePath: vi.fn(() => handle.path),
 		cleanup: vi.fn(async () => {}),
+		// The failure path retains the checkout for a session resume, so the fixture
+		// has to answer it — otherwise a resumable failure only looks clean here
+		// because the swallowed cleanup error hid it.
+		preserve: vi.fn(async () => {}),
 	};
 	return {
 		project,
@@ -443,6 +448,75 @@ describe('runResolveConflictsPhase — verification outcomes (issue #924)', () =
 		expect(deps.delivery.postComment).toHaveBeenCalledWith(
 			expect.objectContaining({ body: 'Merged main; regenerated the migration.' }),
 		);
+	});
+});
+
+describe('runResolveConflictsPhase — a CLI that timed itself out (issue #1000)', () => {
+	// The live incident, on the phase it was observed on: agy caps its own print
+	// mode, writes its notice on stderr, and exits **0**. The exit code alone read
+	// as a finished run, so the phase walked on to `readHandoff` and reported
+	// `Agent did not write required hand-off resolve_conflicts_handoff.json` —
+	// naming the consequence while the cause stayed in `run_output_events`, and
+	// settling terminally with no retry.
+	const AGY_PRINT_TIMEOUT =
+		'[agy] print timeout after 5m0s with turn in progress; returning partial output';
+	const selfTimedOut = () =>
+		agentResult({
+			cli: 'antigravity',
+			exitCode: 0,
+			stderr: `${AGY_PRINT_TIMEOUT}\n`,
+			cliSelfTimeout: AGY_PRINT_TIMEOUT,
+			sessionId: 'conversation-1',
+		});
+
+	/** A worktree the agent never got to write its hand-off into. */
+	function makeEmptyWorktree(): string {
+		const root = mkdtempSync(join(tmpdir(), 'swarm-resolve-conflicts-timeout-'));
+		roots.push(root);
+		return root;
+	}
+
+	it('reports the timeout rather than the hand-off the agent never got to write', async () => {
+		const deps = makeDeps(makeEmptyWorktree());
+		deps.runAgent.mockImplementation(async () => selfTimedOut());
+
+		const error = await runResolveConflictsPhase(deps).then(
+			() => undefined,
+			(err: unknown) => err,
+		);
+
+		expect(error).toBeInstanceOf(AgentRunError);
+		expect((error as AgentRunError).failure).toEqual({
+			kind: 'timeout',
+			cliSelfTimeout: AGY_PRINT_TIMEOUT,
+		});
+		expect((error as AgentRunError).message).toContain(AGY_PRINT_TIMEOUT);
+		expect((error as AgentRunError).message).not.toMatch(/did not write required hand-off/);
+		// The disposition the timeout kind already carries: the checkout is kept so the
+		// deferred retry resumes the CLI's own session rather than starting over.
+		expect(deps.worktrees.preserve).toHaveBeenCalled();
+		expect(deps.worktrees.cleanup).not.toHaveBeenCalled();
+	});
+
+	it('still reports the timeout when the CLI self-terminated after writing its hand-off', async () => {
+		// The detection must not depend on a hand-off being absent: the gate fires at
+		// the post-run statement, before any hand-off is read, so a run cut short
+		// after writing one is reported just as honestly — and delivers nothing, since
+		// the turn demonstrably did not finish.
+		const deps = makeDeps(makeWorktree());
+		writeCleanMigrations(deps.worktrees.worktreePath('task-508') as string, ['0000_first']);
+		deps.runAgent.mockImplementation(async () => selfTimedOut());
+
+		const error = await runResolveConflictsPhase(deps).then(
+			() => undefined,
+			(err: unknown) => err,
+		);
+
+		expect(error).toBeInstanceOf(AgentRunError);
+		expect((error as AgentRunError).failure.kind).toBe('timeout');
+		expect((error as AgentRunError).message).toContain(AGY_PRINT_TIMEOUT);
+		expect(commitPreparedTree).not.toHaveBeenCalled();
+		expect(deps.delivery.pushBranch).not.toHaveBeenCalled();
 	});
 });
 
