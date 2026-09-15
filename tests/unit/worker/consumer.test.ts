@@ -717,9 +717,21 @@ function dispatchDeps(overrides: Partial<ProcessJobDeps> = {}): ProcessJobDeps {
 			phaseCalls.push({ phase: context.trigger.phase, context });
 			return (await phaseImpl(context.trigger.phase, context)) as PhaseRunResult;
 		},
+		// The machine-scoped dispatch kind's one collaborator (issue #972) — required
+		// on the interface so a missing wiring is a compile error rather than an update
+		// that silently never arrives.
+		pushWorkerUpdate: async (workerId, requestId) => {
+			workerUpdatePushes.push({ workerId, requestId });
+			return workerUpdatePushResult;
+		},
 		...overrides,
 	};
 }
+
+/** Every `pushWorkerUpdate` the dispatcher made, in order. */
+let workerUpdatePushes: Array<{ workerId: string; requestId: string }> = [];
+/** What the injected push answers — varied by the `worker-update` cases below. */
+let workerUpdatePushResult: 'pushed' | 'superseded' | 'not-connected' = 'pushed';
 
 /**
  * The target `agentOverrideFor` resolved for a dispatched phase. The phase runs on
@@ -835,6 +847,8 @@ describe('processJob', () => {
 		phaseCalls.length = 0;
 		providerBuiltWith.length = 0;
 		projectLookupCalls.length = 0;
+		workerUpdatePushes = [];
+		workerUpdatePushResult = 'pushed';
 		projectLookup = () => PROJECT;
 		phaseImpl = async () => ({ agent: agentResult() });
 		addComment.mockClear();
@@ -1898,6 +1912,60 @@ describe('processJob', () => {
 		});
 	});
 
+	describe('worker-update wake-ups (issue #972)', () => {
+		const WORKER_UPDATE_JOB = {
+			type: 'worker-update' as const,
+			projectId: PROJECT.id,
+			workerId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+			requestId: '66666666-6666-4666-8666-666666666666',
+			target: 'main',
+		};
+
+		// It names no repository, so it is branched ahead of the project scoping and
+		// never resolves a trigger, provisions a worktree, or takes a project slot.
+		it('routes a claimed worker-update dispatch to the push, off every phase path', async () => {
+			const seen: TriggerContext[] = [];
+			const outcome = await processJob(
+				{ ...WORKER_UPDATE_JOB },
+				registryReturning(REVIEW_TRIGGER, seen),
+			);
+
+			expect(workerUpdatePushes).toEqual([
+				{ workerId: WORKER_UPDATE_JOB.workerId, requestId: WORKER_UPDATE_JOB.requestId },
+			]);
+			expect(outcome).toEqual({
+				status: 'worker-update-settled',
+				result: 'pushed',
+				workerId: WORKER_UPDATE_JOB.workerId,
+			});
+			expect(seen).toHaveLength(0);
+			expect(phaseCalls).toHaveLength(0);
+			expect(acquireProjectSlot).not.toHaveBeenCalled();
+			expect(projectLookupCalls).toHaveLength(0);
+		});
+
+		// Nothing in flight is cancelled, deferred or failed to make room for it —
+		// which holds because nothing was added, not because something checks.
+		it('preempts nothing when the machine is offline and the request has to wait', async () => {
+			workerUpdatePushResult = 'not-connected';
+
+			const outcome = await processJob({ ...WORKER_UPDATE_JOB }, registryReturning(REVIEW_TRIGGER));
+
+			expect(outcome).toMatchObject({ result: 'not-connected' });
+			expect(phaseCalls).toHaveLength(0);
+			expect(acquireProjectSlot).not.toHaveBeenCalled();
+		});
+
+		it('drops the wake-up without pushing when the dispatch claim is refused', async () => {
+			claimDispatchForJob.mockResolvedValue({ claimed: false, reason: 'terminal' });
+
+			const outcome = await processJob({ ...WORKER_UPDATE_JOB }, registryReturning(REVIEW_TRIGGER));
+
+			expect(workerUpdatePushes).toEqual([]);
+			expect(outcome).toEqual({ status: 'dispatch-refused', reason: 'terminal' });
+		});
+	});
+
 	it('builds a PM provider and passes the work item for a planning trigger', async () => {
 		const workItem = createMockWorkItem({ statusId: '61e4505c' });
 		const trigger: TriggerResult = { phase: 'planning', taskId: '10', workItem };
@@ -2747,11 +2815,11 @@ describe('processJob', () => {
 		} as const;
 
 		function blockingExecutor(workItem: WorkItem): ProcessJobDeps {
-			return {
+			return dispatchDeps({
 				executePhase: async () => {
 					throw new DependencyBlockedError(workItem, [BLOCKER]);
 				},
-			};
+			});
 		}
 
 		it('defers on the dependency-recheck budget without commenting', async () => {

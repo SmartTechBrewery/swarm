@@ -55,7 +55,6 @@ import { requireProjectSCMProviderId } from '../../integrations/scm/registry.js'
 import { WorkerUpdateTargetSchema } from '../../lib/build-identity.js';
 import { logger } from '../../lib/logger.js';
 import { publishWorktreeSweepRequest } from '../../queue/worker-sweeps.js';
-import { publishWorkerUpdateRequest } from '../../queue/worker-updates.js';
 import { TriggerPhaseSchema } from '../../triggers/types.js';
 import {
 	accessibleProjectScope,
@@ -65,7 +64,7 @@ import {
 } from '../authz.js';
 import { authedProcedure, router } from '../trpc.js';
 import { resolveStrictlyOwnedWorker, workerNotFound } from '../worker-access.js';
-import { fanOutWorkerUpdate } from '../worker-update-fanout.js';
+import { fanOutWorkerUpdate, publishWorkerUpdateWakeUp } from '../worker-update-fanout.js';
 import {
 	getRolloutForOwner,
 	type RolloutMemberView,
@@ -753,10 +752,14 @@ export const workersRouter = router({
 		}),
 
 	// Ask one of the caller's own machines to move its SWARM install root to a build
-	// and restart into it (issue #933). The request is recorded on the worker row and
-	// published; the router — the process that holds worker sockets — turns that into
-	// the push (`../../router/worker-update-dispatch.ts`), and the machine reports
-	// back on its own delivery route.
+	// and restart into it (issue #933). The request is recorded on the worker row
+	// together with the run that makes it visible (issue #971) and the durable
+	// `worker-update` dispatch that delivers it (issue #972) — one transaction, then
+	// that dispatch's wake-up is published. The router — the queue's only consumer, and
+	// the process that holds worker sockets — claims it and turns it into the push
+	// (`../../router/worker-update-dispatch.ts`); the machine reports back on its own
+	// delivery route. It is ranked ahead of everything already queued, so a full queue
+	// cannot leave a drained machine waiting on the shortest job in the system.
 	//
 	// Strictly owner-only, exactly like `setDraining` and `rename`: replacing the code
 	// a machine runs is the machine operator's call, so an `instanceAdmin` who does not
@@ -824,10 +827,13 @@ export const workersRouter = router({
 				});
 			}
 			const updated = result.worker;
-			// After the durable write, and never awaited for correctness: the request lives
-			// on the row, so a router that misses this notification pushes it the moment the
-			// machine next connects. The publish swallows its own failures for that reason.
-			await publishWorkerUpdateRequest(input.workerId);
+			// The outbox half, after the durable write (issue #972): the dispatch that
+			// delivers this request is already committed, so a failed publish costs
+			// promptness and nothing else — `reconcileDispatchesPeriodically` re-publishes
+			// any wake-up a crash window lost, and the machine's reconnection wakes it too.
+			// Swallowed for that reason: failing the mutation over the announcement would
+			// tell the operator their request did not land when it did.
+			await publishWorkerUpdateWakeUp(result.dispatch);
 			return {
 				workerId: updated.id,
 				displayName: updated.displayName,

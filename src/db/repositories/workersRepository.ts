@@ -41,10 +41,20 @@ import {
 	type WorktreeSweepStatus,
 } from '../../identity/worker.js';
 import type { WorkerBuild, WorkerUpdateStatus } from '../../lib/build-identity.js';
+import type { WorkerUpdateJob } from '../../queue/jobs.js';
+// The single place a job's priority is decided (issue #972) — imported rather than
+// restating the constant. A pure function: `getQueue()` is lazy, so importing the
+// producer opens no Redis connection.
+import { priorityFor } from '../../queue/producer.js';
 import type { TriggerPhase } from '../../triggers/types.js';
 import { getDb } from '../client.js';
 import { workerProjectEnrollments } from '../schema/workerProjectEnrollments.js';
 import { workers } from '../schema/workers.js';
+import {
+	createDispatch,
+	type DispatchRow,
+	supersedeWorkerUpdateDispatches,
+} from './dispatchesRepository.js';
 import {
 	createWorkerUpdateRun,
 	settleWorkerUpdateRun,
@@ -504,7 +514,9 @@ export async function setWorkerDraining(
  * itself (issue #921) and "declined" has to be tellable from "no such machine":
  *
  * - `requested` — the row now carries the request, and `worker` is it. `runId` is the
- *   `runs` row that records the update (issue #971).
+ *   `runs` row that records the update (issue #971), and `dispatch` is the durable
+ *   queued unit that will deliver it (issue #972) — the row the caller publishes a
+ *   wake-up for, and the reason the delivery survives a control-plane restart.
  * - `in-pool` — the machine was not draining, so nothing was written; `worker` is the
  *   row as it stands, for the refusal the caller words.
  * - `no-project` — the machine is enrolled in no project (issue #971), so there is no
@@ -513,7 +525,7 @@ export async function setWorkerDraining(
  * - `not-found` — no worker has that id.
  */
 export type WorkerUpdateRequestOutcome =
-	| { outcome: 'requested'; worker: Worker; runId: string }
+	| { outcome: 'requested'; worker: Worker; runId: string; dispatch: DispatchRow }
 	| { outcome: 'in-pool'; worker: Worker }
 	| { outcome: 'no-project'; worker: Worker }
 	| { outcome: 'not-found' };
@@ -554,6 +566,14 @@ export type WorkerUpdateRequestOutcome =
  * `runs` row that makes the update visible: the two must exist or not exist
  * together, since a recorded request with no run is the invisibility that issue
  * exists to remove, and a run with no request is a row nothing will ever settle.
+ *
+ * **The durable dispatch joined that transaction with issue #972**, for exactly
+ * the argument #971 made about the run: a recorded request with no dispatch is a
+ * request nothing will ever deliver, and a dispatch with no request is a unit that
+ * would push nothing. It is ranked below every other job's priority
+ * (`priorityFor`), so a machine asked to update while its project's queue is full
+ * is served first rather than last, and the previous request's dispatch is
+ * superseded beside the previous request's run.
  *
  * The machine's **project** is resolved first, from its oldest enrollment — the
  * order {@link listEnrollmentsForWorker} already reads in, and deliberately not
@@ -602,8 +622,15 @@ export async function requestWorkerUpdate(
 
 		// Re-targeting overwrites the row's one request, so the run the previous request
 		// created is settled here rather than left `running` with nothing coming to close
-		// it — its own report will answer `recorded: false`.
+		// it — its own report will answer `recorded: false`. Its dispatch goes the same
+		// way, and for the same reason: it would otherwise sit in the queue waiting to
+		// push a build the row has moved off.
 		await supersedeWorkerUpdateRun(id, target, tx);
+		await supersedeWorkerUpdateDispatches(
+			id,
+			`Superseded by a later request to move this machine to ${target}.`,
+			tx,
+		);
 		const runId = await createWorkerUpdateRun(
 			{
 				projectId: enrollment.projectId,
@@ -615,7 +642,30 @@ export async function requestWorkerUpdate(
 			},
 			tx,
 		);
-		return { outcome: 'requested', worker: rowToWorker(updatedRow), runId };
+		// The unit that actually delivers the request. `uq_dispatches_active_run` is per
+		// `run_id` and the run was just inserted, so there is nothing to collide with;
+		// the supersede above is what keeps the *previous* request's dispatch from
+		// lingering non-terminal.
+		const jobPayload: WorkerUpdateJob = {
+			type: 'worker-update',
+			projectId: enrollment.projectId,
+			workerId: id,
+			requestId,
+			target,
+		};
+		const { dispatch } = await createDispatch(
+			{
+				projectId: enrollment.projectId,
+				jobPayload,
+				dedupKey: `worker-update:${requestId}`,
+				priority: priorityFor(jobPayload) ?? 0,
+				source: 'manual',
+				phase: 'worker-update',
+				runId,
+			},
+			tx,
+		);
+		return { outcome: 'requested', worker: rowToWorker(updatedRow), runId, dispatch };
 	});
 }
 

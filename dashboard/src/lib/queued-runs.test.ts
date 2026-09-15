@@ -60,9 +60,39 @@ describe('queuedPhaseLabel', () => {
 		['respond-to-review', 'Respond to review'],
 		['respond-to-ci', 'Respond to CI'],
 		['resolve-conflicts', 'Resolve conflicts'],
+		['merge-automation', 'Merge automation'],
+		// Issue #972 — the machine-scoped queued kind.
+		['worker-update', 'Worker update'],
 		['unknown', 'Unknown'],
 	] as const)('labels %s as "%s"', (hint, label) => {
 		expect(queuedPhaseLabel(hint)).toBe(label);
+	});
+});
+
+// Issue #972. A worker-update row names no repository, no pull request and no
+// board item, so the two work-item helpers must fall through to their honest
+// "nothing to show" answers rather than inventing a link.
+describe('a worker-update row', () => {
+	function workerUpdateRun(): QueuedRun {
+		return {
+			jobId: 'job-update',
+			projectId: 'proj',
+			type: 'worker-update',
+			state: 'prioritized',
+			phaseHint: 'worker-update',
+			// Outranks everything already waiting — the schema must accept it.
+			priority: -10,
+			continuation: false,
+			prioritizeContinuations: true,
+			enqueuedAt: '2026-07-17T10:00:00.000Z',
+			availableAt: '2026-07-17T10:00:00.000Z',
+		};
+	}
+
+	it('renders an em dash for its work item and links nowhere', () => {
+		expect(queuedWorkItemLabel(workerUpdateRun())).toBe('—');
+		expect(queuedWorkItemUrl(workerUpdateRun())).toBeUndefined();
+		expect(queuedWorkItemTitle(workerUpdateRun())).toBeUndefined();
 	});
 });
 

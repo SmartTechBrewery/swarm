@@ -151,6 +151,9 @@ import {
 	SwarmJobSchema,
 } from '../queue/jobs.js';
 import { priorityFor } from '../queue/producer.js';
+// Type-only: the push itself is injected through {@link ProcessJobDeps}, since the
+// control plane is the side holding worker sockets.
+import type { WorkerUpdatePushResult } from '../router/worker-update-dispatch.js';
 import {
 	DeliveryDeferredError,
 	type ReviewAbsorbed,
@@ -220,6 +223,10 @@ import {
 } from './run-cancellation.js';
 import { PHASE_DEFAULT_CLI, phaseAgentConfig, resolveTargetPolicy } from './target-policy.js';
 import { selectTarget, type TargetSelection } from './target-selection.js';
+import {
+	processWorkerUpdateDispatch,
+	type WorkerUpdateSettledOutcome,
+} from './worker-update-dispatch.js';
 
 /** What became of a dequeued job — returned to BullMQ as the job's result. */
 export type JobOutcome =
@@ -250,6 +257,9 @@ export type JobOutcome =
 	// A merge-automation dispatch settled (merged, refused, retry-scheduled, or
 	// failed) — the agent-less dispatch kind (issue #292).
 	| MergeAutomationSettledOutcome
+	// A worker-update dispatch settled (pushed, superseded, or waiting for the
+	// machine to reconnect) — the machine-scoped agent-less kind (issue #972).
+	| WorkerUpdateSettledOutcome
 	| {
 			status: 'phase-succeeded';
 			phase: TriggerPhase;
@@ -1921,6 +1931,14 @@ export interface ProcessJobDeps {
 	 * pushed a `TaskAssignment` to.
 	 */
 	executePhase: (context: DispatchPhaseContext) => Promise<PhaseRunResult>;
+	/**
+	 * Hand one machine the self-update request a `worker-update` dispatch carries
+	 * (issue #972). Required, like {@link executePhase} and for the same reason:
+	 * the control plane is the side holding worker sockets, and a required member
+	 * makes a missing wiring a compile error rather than an update that silently
+	 * never arrives.
+	 */
+	pushWorkerUpdate: (workerId: string, requestId: string) => Promise<WorkerUpdatePushResult>;
 }
 
 /** Adapt the federated worker+target selection to the shared target-routing shape. */
@@ -3373,6 +3391,17 @@ export async function reportInterruptedJobToBoard(jobData: unknown, error: strin
 			return;
 		}
 
+		// A worker-update dispatch names no board item and no pull request either
+		// (issue #972) — it is about a machine. Its outcome is visible on the machine's
+		// own `runs` row and on the dispatch record.
+		if (job.type === 'worker-update') {
+			logger.debug('Interrupted-job report: worker-update dispatch — skipping comment', {
+				projectId: job.projectId,
+				workerId: job.workerId,
+			});
+			return;
+		}
+
 		const body = interruptedRunCommentBody(error);
 
 		if (job.type === 'pm') {
@@ -4224,6 +4253,15 @@ export async function processJob(
 			error,
 		});
 		return { status: 'dispatch-refused', reason: 'invalid-payload' };
+	}
+
+	// The machine-scoped dispatch kind (issue #972): it names no repository, needs no
+	// project config, resolves no trigger and provisions no worktree — it delivers one
+	// frame to one machine and settles itself. Branched ahead of the project scoping
+	// for that reason; `merge-automation` sits after it because it does merge against
+	// a repository.
+	if (job.type === 'worker-update') {
+		return processWorkerUpdateDispatch(dispatch, job, { push: deps.pushWorkerUpdate });
 	}
 
 	// **The seam this whole phase turns on** (issue #684 phase 2): the project is read

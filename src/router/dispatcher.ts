@@ -106,6 +106,7 @@ import { composeSystemPrompt, resolveTargetBranch } from './assignment-compositi
 import { cancelRunOnWorker, subscribeDispatchCancellations } from './dispatch-cancellation.js';
 import { awaitDispatchResult, type TransportInterruptions } from './dispatch-results.js';
 import { isWorkerConnected, sendToWorker } from './worker-connections.js';
+import { pushPendingWorkerUpdate } from './worker-update-dispatch.js';
 
 /**
  * How long past the phase's own wall-clock timeout the control plane waits for a
@@ -694,7 +695,9 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
  * The `ProcessJobDeps` that turn `processJob` into the control-plane dispatcher:
  * only socket-connected workers are selectable, an unfederated project defers
  * durably (no local executor), the fenced claim binds the selected worker's
- * session, and the phase runs by pushing an assignment rather than in-process.
+ * session, the phase runs by pushing an assignment rather than in-process, and a
+ * `worker-update` dispatch (issue #972) hands its frame to the machine over the
+ * very sockets this process holds.
  */
 export function createControlPlaneDispatchDeps(): ProcessJobDeps {
 	return {
@@ -702,6 +705,7 @@ export function createControlPlaneDispatchDeps(): ProcessJobDeps {
 		federatedOnly: true,
 		resolveBindIdentity: resolveSelectedWorkerIdentity,
 		executePhase: pushAndAwaitResult,
+		pushWorkerUpdate: pushPendingWorkerUpdate,
 	};
 }
 

@@ -116,6 +116,36 @@ describe('SwarmJobSchema', () => {
 	// A dependency recheck can wait days and a run's stored payload is re-parsed by
 	// "Retry now" indefinitely, so a deploy must read rows written before issue #385
 	// rather than fail their in-flight work.
+	// Issue #972 — the machine-scoped fourth variant. It carries no event and names
+	// no repository; what it does carry is re-validated here because the target ends
+	// up handed to `git` on an unattended host.
+	describe('worker-update job', () => {
+		const job = {
+			type: 'worker-update',
+			projectId: 'swarm',
+			workerId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+			requestId: '66666666-6666-4666-8666-666666666666',
+			target: 'main',
+		};
+
+		it('round-trips through the schema', () => {
+			expect(SwarmJobSchema.parse(roundTrip(job))).toEqual(job);
+		});
+
+		it('rejects a target that is not a well-formed ref', () => {
+			expect(() => SwarmJobSchema.parse({ ...job, target: 'https://evil.example/x' })).toThrow();
+		});
+
+		it('rejects a non-uuid worker id', () => {
+			expect(() => SwarmJobSchema.parse({ ...job, workerId: 'ada-laptop' })).toThrow();
+		});
+
+		it('carries the dispatch id every queued unit travels with', () => {
+			const withDispatch = { ...job, dispatchId: '11111111-1111-4111-8111-111111111111' };
+			expect(SwarmJobSchema.parse(roundTrip(withDispatch))).toEqual(withDispatch);
+		});
+	});
+
 	describe('legacy durable envelope (pre-#385)', () => {
 		/** A dispatch row as the router wrote it when `type` *was* the provider id. */
 		function legacyJob(event: Record<string, unknown>) {
@@ -315,6 +345,20 @@ describe('repositoryForJob', () => {
 	// the project's default entry — no migration, nothing to backfill.
 	it('answers a pm job written before card routing with undefined, so it scopes to the default entry', () => {
 		expect(repositoryForJob(createMockPmWebhookJob())).toBeUndefined();
+	});
+
+	// Issue #972: stated rather than defaulted. `undefined` also means "the project's
+	// default entry" for a pre-#686 board row, and this variant means something
+	// stronger — it moves a machine's install root and touches no repository at all.
+	it('answers a worker-update job with no repository at all', () => {
+		const job = SwarmJobSchema.parse({
+			type: 'worker-update',
+			projectId: 'swarm',
+			workerId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+			requestId: '66666666-6666-4666-8666-666666666666',
+			target: 'main',
+		});
+		expect(repositoryForJob(job)).toBeUndefined();
 	});
 
 	// The legacy envelope upgrades before the discriminator is read, so a dispatch row

@@ -9,13 +9,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
  */
 const { requestWorkerUpdate } = vi.hoisted(() => ({ requestWorkerUpdate: vi.fn() }));
 const { getLiveSessionForWorker } = vi.hoisted(() => ({ getLiveSessionForWorker: vi.fn() }));
-const { publishWorkerUpdateRequest } = vi.hoisted(() => ({ publishWorkerUpdateRequest: vi.fn() }));
+const { publishDispatchWakeUp } = vi.hoisted(() => ({ publishDispatchWakeUp: vi.fn() }));
 
 vi.mock('@/identity/worker-service.js', () => ({ requestWorkerUpdate }));
 vi.mock('@/identity/worker-session-service.js', () => ({ getLiveSessionForWorker }));
-vi.mock('@/queue/worker-updates.js', () => ({ publishWorkerUpdateRequest }));
+vi.mock('@/dispatch/dispatcher.js', () => ({ publishDispatchWakeUp }));
 
-import { fanOutWorkerUpdate } from '@/api/worker-update-fanout.js';
+import { fanOutWorkerUpdate, publishWorkerUpdateWakeUp } from '@/api/worker-update-fanout.js';
+import type { DispatchRow } from '@/db/repositories/dispatchesRepository.js';
 import { DEFAULT_WORKER_SUPPORTED_PHASES, type Worker } from '@/identity/worker.js';
 import type { WorkerUpdateStatus } from '@/lib/build-identity.js';
 
@@ -97,8 +98,16 @@ function afterWrite(worker: Worker, target: string): Worker {
 	};
 }
 
+/**
+ * The durable unit the write now creates beside the row and the run (issue #972)
+ * — what the fan-out publishes a wake-up for.
+ */
+function dispatchFor(workerId: string): DispatchRow {
+	return { id: `dispatch-${workerId}`, wakeSeq: 0, availableAt: new Date(0) } as DispatchRow;
+}
+
 beforeEach(() => {
-	for (const m of [requestWorkerUpdate, getLiveSessionForWorker, publishWorkerUpdateRequest]) {
+	for (const m of [requestWorkerUpdate, getLiveSessionForWorker, publishDispatchWakeUp]) {
 		m.mockReset();
 	}
 	// Connected unless a case says otherwise; the write lands and echoes the row back.
@@ -107,8 +116,22 @@ beforeEach(() => {
 		async (id: string, _requestId: string, target: string) => ({
 			outcome: 'requested',
 			worker: afterWrite(makeWorker({ id }), target),
+			runId: `run-${id}`,
+			dispatch: dispatchFor(id),
 		}),
 	);
+});
+
+// Issue #972 — the outbox half, shared with the single-machine mutation.
+describe('publishWorkerUpdateWakeUp', () => {
+	// Never throws: the dispatch is durable before this runs, so a failed publish
+	// costs promptness and nothing else — failing the mutation over it would tell
+	// the operator their request did not land when it did.
+	it('swallows a publish failure rather than failing the mutation that recorded the request', async () => {
+		publishDispatchWakeUp.mockRejectedValue(new Error('redis is down'));
+
+		await expect(publishWorkerUpdateWakeUp(dispatchFor(WORKER_ID))).resolves.toBeUndefined();
+	});
 });
 
 describe('fanOutWorkerUpdate (issue #921)', () => {
@@ -121,7 +144,7 @@ describe('fanOutWorkerUpdate (issue #921)', () => {
 			'main',
 			REQUESTER_ID,
 		);
-		expect(publishWorkerUpdateRequest).toHaveBeenCalledExactlyOnceWith(WORKER_ID);
+		expect(publishDispatchWakeUp).toHaveBeenCalledExactlyOnceWith(dispatchFor(WORKER_ID));
 		expect(entries).toMatchObject([
 			{ workerId: WORKER_ID, displayName: 'ada-laptop', disposition: 'requested' },
 		]);
@@ -142,7 +165,7 @@ describe('fanOutWorkerUpdate (issue #921)', () => {
 			'main',
 			REQUESTER_ID,
 		);
-		expect(publishWorkerUpdateRequest).toHaveBeenCalledExactlyOnceWith(WORKER_ID);
+		expect(publishDispatchWakeUp).toHaveBeenCalledExactlyOnceWith(dispatchFor(WORKER_ID));
 	});
 
 	// Issue #933's precondition, unrelaxed — but reported rather than thrown.
@@ -155,7 +178,7 @@ describe('fanOutWorkerUpdate (issue #921)', () => {
 
 		expect(entries).toMatchObject([{ workerId: WORKER_ID, disposition: 'in-pool', update: null }]);
 		expect(requestWorkerUpdate).not.toHaveBeenCalled();
-		expect(publishWorkerUpdateRequest).not.toHaveBeenCalled();
+		expect(publishDispatchWakeUp).not.toHaveBeenCalled();
 	});
 
 	// Re-running the command must not cost a second push, and the id the row waits on
@@ -169,7 +192,7 @@ describe('fanOutWorkerUpdate (issue #921)', () => {
 			target: 'main',
 		});
 		expect(requestWorkerUpdate).not.toHaveBeenCalled();
-		expect(publishWorkerUpdateRequest).not.toHaveBeenCalled();
+		expect(publishDispatchWakeUp).not.toHaveBeenCalled();
 	});
 
 	// `requestUpdate`'s documented re-issue semantics: a stale request for some other
@@ -197,7 +220,7 @@ describe('fanOutWorkerUpdate (issue #921)', () => {
 			target: 'main',
 		});
 		expect(requestWorkerUpdate).not.toHaveBeenCalled();
-		expect(publishWorkerUpdateRequest).not.toHaveBeenCalled();
+		expect(publishDispatchWakeUp).not.toHaveBeenCalled();
 	});
 
 	// An outcome about some other build answers nothing about this one.
@@ -265,7 +288,7 @@ describe('fanOutWorkerUpdate (issue #921)', () => {
 		);
 
 		expect(entries.map((entry) => entry.workerId)).toEqual([OTHER_WORKER_ID]);
-		expect(publishWorkerUpdateRequest).toHaveBeenCalledExactlyOnceWith(OTHER_WORKER_ID);
+		expect(publishDispatchWakeUp).toHaveBeenCalledExactlyOnceWith(dispatchFor(OTHER_WORKER_ID));
 	});
 
 	// The reason the snapshot check above is an optimisation and not the guarantee
@@ -290,7 +313,7 @@ describe('fanOutWorkerUpdate (issue #921)', () => {
 		]);
 		// Nothing was recorded, so nothing may be pushed: the daemon must not be told to
 		// restart a machine that is back in the dispatch pool.
-		expect(publishWorkerUpdateRequest).not.toHaveBeenCalled();
+		expect(publishDispatchWakeUp).not.toHaveBeenCalled();
 	});
 
 	// Issue #971 — an update is recorded as a run in the machine's own project, so a
@@ -304,7 +327,7 @@ describe('fanOutWorkerUpdate (issue #921)', () => {
 		expect(entries).toMatchObject([
 			{ workerId: WORKER_ID, displayName: 'ada-laptop', disposition: 'no-project', update: null },
 		]);
-		expect(publishWorkerUpdateRequest).not.toHaveBeenCalled();
+		expect(publishDispatchWakeUp).not.toHaveBeenCalled();
 	});
 
 	it('carries on past a machine enrolled in no project', async () => {
@@ -320,7 +343,7 @@ describe('fanOutWorkerUpdate (issue #921)', () => {
 			[WORKER_ID, 'no-project'],
 			[OTHER_WORKER_ID, 'requested'],
 		]);
-		expect(publishWorkerUpdateRequest).toHaveBeenCalledExactlyOnceWith(OTHER_WORKER_ID);
+		expect(publishDispatchWakeUp).toHaveBeenCalledExactlyOnceWith(dispatchFor(OTHER_WORKER_ID));
 	});
 
 	// The raced machine must not take the rest of the fleet with it, exactly as a
@@ -341,7 +364,7 @@ describe('fanOutWorkerUpdate (issue #921)', () => {
 			[WORKER_ID, 'in-pool'],
 			[OTHER_WORKER_ID, 'requested'],
 		]);
-		expect(publishWorkerUpdateRequest).toHaveBeenCalledExactlyOnceWith(OTHER_WORKER_ID);
+		expect(publishDispatchWakeUp).toHaveBeenCalledExactlyOnceWith(dispatchFor(OTHER_WORKER_ID));
 	});
 
 	// A machine that is not asked costs no session lookup — the liveness read decides

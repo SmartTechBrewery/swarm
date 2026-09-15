@@ -40,6 +40,7 @@ export const QueuedPhaseHintSchema = z.enum([
 	'respond-to-ci',
 	'resolve-conflicts',
 	'merge-automation',
+	'worker-update',
 	'unknown',
 ]);
 export type QueuedPhaseHint = z.infer<typeof QueuedPhaseHintSchema>;
@@ -141,9 +142,11 @@ export const QueuedRunSchema = z.object({
 	projectId: z.string(),
 	/**
 	 * What produced the dispatch: `scm` for an SCM job, `pm` for a board job (both
-	 * carrying `providerId` separately), or `merge-automation`.
+	 * carrying `providerId` separately), `merge-automation`, or `worker-update` —
+	 * the machine-scoped kind that names no repository and no work item at all
+	 * (issue #972).
 	 */
-	type: z.enum(['scm', 'pm', 'merge-automation']),
+	type: z.enum(['scm', 'pm', 'merge-automation', 'worker-update']),
 	/** SCM and `pm` jobs only — the producing provider's id (`github`, `github-projects`). */
 	providerId: z.union([ScmProviderIdSchema, PmProviderIdSchema]).optional(),
 	state: PendingJobStateSchema,
@@ -177,8 +180,14 @@ export const QueuedRunSchema = z.object({
 	workItemTitle: z.string().optional(),
 	/** Resolved backing Issue/PR URL for a board job, when the PM provider can read it. */
 	workItemUrl: z.string().optional(),
-	/** Effective queue priority; 0 is highest. */
-	priority: z.number().int().nonnegative(),
+	/**
+	 * Effective queue priority: 0 is the default, a **positive** value is a
+	 * demotion (board-driven work), and a **negative** value outranks everything
+	 * already waiting (a worker self-update, issue #972). Signed rather than
+	 * non-negative for that last one — a negative priority failing the parse here
+	 * would take the whole `runs.queued` response down with it.
+	 */
+	priority: z.number().int(),
 	/**
 	 * Whether this dispatch is a prioritized SCM continuation (Review /
 	 * Respond-to-review / Respond-to-CI / Resolve-conflicts resumed after a
@@ -218,6 +227,7 @@ export type QueuedRun = z.infer<typeof QueuedRunSchema>;
 export function deriveQueuedPhaseHint(job: SwarmJob): QueuedPhaseHint {
 	if (job.type === 'pm') return 'board';
 	if (job.type === 'merge-automation') return 'merge-automation';
+	if (job.type === 'worker-update') return 'worker-update';
 
 	const { event } = job;
 	switch (event.kind) {
@@ -269,7 +279,10 @@ export function deriveQueuedState(dispatch: DispatchRow): PendingJobState {
 	)
 		return 'blocked';
 	if (dispatch.availableAt.getTime() > Date.now()) return 'delayed';
-	return dispatch.priority > 0 ? 'prioritized' : 'waiting';
+	// Anything off the default rank is `prioritized` — a negative priority outranks
+	// plain FIFO (issue #972) just as a positive one is outranked by it. The word
+	// means "not plain FIFO", and a negative is more prioritized, not less.
+	return dispatch.priority !== 0 ? 'prioritized' : 'waiting';
 }
 
 /**
@@ -325,7 +338,10 @@ function toQueuedRun(dispatch: DispatchRow, prioritizeContinuations: boolean): Q
 			? { ...shared, prNumber: data.event.workItemId }
 			: data.type === 'merge-automation'
 				? { ...shared, prNumber: data.prNumber }
-				: { ...shared, workItemNodeId: data.event.itemId, contentType: data.event.contentType },
+				: data.type === 'worker-update'
+					? // A machine, not an artifact: no pull request and no board item to name.
+						shared
+					: { ...shared, workItemNodeId: data.event.itemId, contentType: data.event.contentType },
 	);
 }
 

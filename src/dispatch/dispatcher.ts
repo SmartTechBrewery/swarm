@@ -19,6 +19,7 @@ import {
 	claimDispatch,
 	createDispatch,
 	type DispatchRow,
+	findWakeableWorkerUpdateDispatch,
 	getActiveDispatchByRunId,
 	listAvailabilityWaitsForWorker,
 	listPullRequestInFlightWaits,
@@ -387,6 +388,48 @@ export async function promoteAvailabilityWaitsForWorker(
 			error: describeError(err),
 		});
 		return 0;
+	}
+}
+
+/**
+ * Wake the update dispatch this machine's reconnection unblocks (issue #972) —
+ * the worker-update sibling of {@link promoteAvailabilityWaitsForWorker}, and
+ * the reason an update for an offline machine is delivered the moment it comes
+ * back rather than on the executor's timed backstop.
+ *
+ * Follows that function's per-row order verbatim, for its reasons: **remove the
+ * delayed wake-up, then re-date the row, then publish the replacement**, so the
+ * dispatch never holds two live wake-ups at once. The candidate's wake-up is
+ * still delayed by construction ({@link findWakeableWorkerUpdateDispatch}), and
+ * the re-date is refused unless the row is still on that exact wake sequence, so
+ * a row that moved on had this wake-up superseded anyway.
+ *
+ * A dedicated read rather than a third leg on `listAvailabilityWaitsForWorker`:
+ * see that query's own comment. Best-effort and fully swallowed — it runs off a
+ * socket open, which a queue hiccup must never fail, and the executor's own timed
+ * re-check is underneath it. Returns whether a dispatch was woken.
+ */
+export async function promoteWorkerUpdateDispatchForWorker(workerId: string): Promise<boolean> {
+	try {
+		const waiting = await findWakeableWorkerUpdateDispatch(workerId);
+		if (!waiting) return false;
+		await removePendingJobById(wakeJobId(waiting));
+		const updated = await promoteDispatchToImmediateWake(waiting.id, waiting.wakeSeq);
+		// Claimed, cancelled, superseded by a re-target, or already promoted between
+		// the read and here — leave it to whoever won.
+		if (!updated) return false;
+		await publishDispatchWakeUp(updated);
+		logger.info('dispatch: worker reconnected — woke its pending update dispatch', {
+			workerId,
+			dispatchId: updated.id,
+		});
+		return true;
+	} catch (err) {
+		logger.warn('dispatch: worker-update promotion failed', {
+			workerId,
+			error: describeError(err),
+		});
+		return false;
 	}
 }
 

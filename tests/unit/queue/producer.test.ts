@@ -3,6 +3,17 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SwarmJob } from '@/queue/jobs.js';
 import { createMockPmWebhookJob, createMockScmWebhookJob } from '../../helpers/factories.js';
 
+/** The machine-scoped variant (issue #972) — the only one ranked above the default. */
+function workerUpdateJob(): SwarmJob {
+	return {
+		type: 'worker-update',
+		projectId: 'swarm',
+		workerId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+		requestId: '66666666-6666-4666-8666-666666666666',
+		target: 'main',
+	};
+}
+
 // Mock BullMQ's Queue so nothing touches Redis — capture constructor args and
 // the add()/close() calls the producer makes. Hoisted so the vi.mock factory
 // (itself hoisted above imports) can reference them.
@@ -187,6 +198,27 @@ describe('enqueueJob', () => {
 		});
 	});
 
+	// Issue #972: the rank is negative in the dispatch table, and BullMQ is handed
+	// nothing at all. Passing a negative would put the wake-up in BullMQ's
+	// prioritized ZSET, which a worker only reaches once the plain `wait` list is
+	// empty — i.e. *behind* every unset-priority job, the exact inversion the
+	// negative exists to remove.
+	it('omits the BullMQ priority option for a worker-update job that outranks the default', async () => {
+		const { enqueueJob, priorityFor, WORKER_UPDATE_JOB_PRIORITY } = await import(
+			'@/queue/producer.js'
+		);
+		const job = workerUpdateJob();
+
+		expect(WORKER_UPDATE_JOB_PRIORITY).toBeLessThan(0);
+		expect(priorityFor(job)).toBe(WORKER_UPDATE_JOB_PRIORITY);
+
+		await enqueueJob(job);
+
+		const [name, , opts] = add.mock.calls[0];
+		expect(name).toBe('worker-update');
+		expect(opts).toBeUndefined();
+	});
+
 	it('omits the job id when the event carries no deliveryId', async () => {
 		const { enqueueJob } = await import('@/queue/producer.js');
 		const { deliveryId: _dropped, ...job } = createMockScmWebhookJob();
@@ -247,6 +279,15 @@ describe('enqueueDispatchWakeUp', () => {
 			jobId: 'dispatch_board_w0',
 			priority: 10,
 		});
+	});
+
+	it('omits the BullMQ priority option for a worker-update wake-up', async () => {
+		const { enqueueDispatchWakeUp } = await import('@/queue/producer.js');
+
+		await enqueueDispatchWakeUp(workerUpdateJob(), 'dispatch_update_w0', 0);
+
+		const [, , opts] = add.mock.calls[0];
+		expect(opts).toEqual({ jobId: 'dispatch_update_w0' });
 	});
 
 	// The reconciler's `republishWakeUps` repairs *every* wakeable dispatch on

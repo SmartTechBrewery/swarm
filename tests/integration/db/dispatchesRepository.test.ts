@@ -19,6 +19,7 @@ import {
 	findActivePlanningDispatchForTask,
 	findExecutingDispatchForTask,
 	findExecutingWritingDispatchForPullRequest,
+	findWakeableWorkerUpdateDispatch,
 	getActiveDispatchByRunId,
 	getDispatchById,
 	getWorkerDispatchClaimState,
@@ -38,6 +39,7 @@ import {
 	scheduleDispatchRetry,
 	selectNextCapacityDispatch,
 	supersedeDispatchesByCoalesceKey,
+	supersedeWorkerUpdateDispatches,
 } from '../../../src/db/repositories/dispatchesRepository.js';
 import {
 	completeRun,
@@ -73,6 +75,20 @@ const OWNER = 'test-worker:1';
 
 function job(overrides: Partial<SwarmJob> = {}): SwarmJob {
 	return { ...createMockScmWebhookJob(), projectId: PROJECT_ID, ...overrides } as SwarmJob;
+}
+
+const WORKER_ID = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+const OTHER_WORKER_ID = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+
+/** A durable worker self-update payload (issue #972) — the only one ranked negatively. */
+function workerUpdateJob(workerId: string, requestId: string): SwarmJob {
+	return {
+		type: 'worker-update',
+		projectId: PROJECT_ID,
+		workerId,
+		requestId,
+		target: 'main',
+	};
 }
 
 /** States only reachable by actually executing the dispatch. */
@@ -1729,6 +1745,188 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 
 			expect(await listActiveDispatchTaskRefs([])).toEqual([]);
 			expect(await listActiveDispatchTaskRefs()).toHaveLength(1);
+		});
+	});
+
+	// Issue #972 — the machine-scoped queued unit. What only a real database settles
+	// is the *ordering* it buys and the two payload-keyed reads behind it.
+	describe('worker-update dispatches', () => {
+		const REQUEST_ID = '66666666-6666-4666-8666-666666666666';
+		const OTHER_REQUEST_ID = '77777777-7777-4777-8777-777777777777';
+
+		async function seedUpdateDispatch(
+			workerId: string,
+			requestId: string,
+			overrides: Partial<Parameters<typeof createDispatch>[0]> = {},
+		) {
+			const { dispatch } = await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: workerUpdateJob(workerId, requestId),
+				dedupKey: `worker-update:${requestId}`,
+				priority: -10,
+				source: 'manual',
+				phase: 'worker-update',
+				...overrides,
+			});
+			return dispatch;
+		}
+
+		// The acceptance criterion, in the queue's own terms: ahead of work already
+		// waiting, whatever it is and however long it has been there.
+		it('sorts ahead of everything already waiting, in both claim-ordering reads', async () => {
+			const board = await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: job({ deliveryId: 'd-board' }),
+				dedupKey: 'delivery:d-board',
+				source: 'webhook',
+				priority: 10,
+				phase: 'planning',
+				// Oldest of the three, so FIFO alone would put it first.
+				availableAt: new Date(Date.now() - 600_000),
+			});
+			const review = await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: job({ deliveryId: 'd-review' }),
+				dedupKey: 'delivery:d-review',
+				source: 'webhook',
+				phase: 'review',
+				availableAt: new Date(Date.now() - 300_000),
+			});
+			const update = await seedUpdateDispatch(WORKER_ID, REQUEST_ID);
+
+			expect((await listWaitingDispatches(PROJECT_ID)).map((row) => row.id)).toEqual([
+				update.id,
+				review.dispatch.id,
+				board.dispatch.id,
+			]);
+			expect((await listRunnableDispatchesForPool(PROJECT_ID)).map((row) => row.id)).toEqual([
+				update.id,
+				review.dispatch.id,
+				board.dispatch.id,
+			]);
+		});
+
+		// It names no pipeline phase and resolves no task, so nothing turns it into
+		// demand on the worker pool or into an item-liveness signal.
+		it('is invisible to the task-liveness read model', async () => {
+			await seedUpdateDispatch(WORKER_ID, REQUEST_ID);
+
+			expect(await listActiveDispatchTaskRefs()).toEqual([]);
+		});
+
+		describe('supersedeWorkerUpdateDispatches', () => {
+			it("cancels this machine's non-terminal update dispatches and nobody else's", async () => {
+				const mine = await seedUpdateDispatch(WORKER_ID, REQUEST_ID);
+				const theirs = await seedUpdateDispatch(OTHER_WORKER_ID, OTHER_REQUEST_ID);
+				const unrelated = await createDispatch({
+					projectId: PROJECT_ID,
+					jobPayload: job({ deliveryId: 'd-unrelated' }),
+					dedupKey: 'delivery:d-unrelated',
+					source: 'webhook',
+					phase: 'review',
+				});
+
+				await supersedeWorkerUpdateDispatches(WORKER_ID, 'Superseded by a later request.');
+
+				expect(await getDispatchById(mine.id)).toMatchObject({
+					state: 'cancelled',
+					lastError: 'Superseded by a later request.',
+				});
+				expect(await getDispatchById(theirs.id)).toMatchObject({ state: 'pending' });
+				expect(await getDispatchById(unrelated.dispatch.id)).toMatchObject({ state: 'pending' });
+			});
+
+			// Terminal states are never resurrected or rewritten, exactly as everywhere
+			// else in this repository.
+			it('leaves an already-settled update dispatch alone', async () => {
+				const settled = await seedUpdateDispatch(WORKER_ID, REQUEST_ID);
+				await claimDispatch(settled.id, OWNER, 60_000);
+				await completeDispatch(settled.id, 'worker-update-pushed');
+
+				await supersedeWorkerUpdateDispatches(WORKER_ID, 'Superseded.');
+
+				expect(await getDispatchById(settled.id)).toMatchObject({
+					state: 'completed',
+					outcome: 'worker-update-pushed',
+				});
+			});
+		});
+
+		describe('findWakeableWorkerUpdateDispatch', () => {
+			/** The state an offline machine's dispatch is left in by the executor. */
+			async function waitingForMachine(workerId: string, requestId: string) {
+				const dispatch = await seedUpdateDispatch(workerId, requestId);
+				await claimDispatch(dispatch.id, OWNER, 60_000);
+				const scheduled = await scheduleDispatchRetry(dispatch.id, {
+					jobPayload: workerUpdateJob(workerId, requestId),
+					availableAt: new Date(Date.now() + 300_000),
+					waitReason: 'worker-eligibility',
+					attempt: 1,
+				});
+				if (!scheduled) throw new Error('expected the retry to be scheduled');
+				return scheduled;
+			}
+
+			it("finds only this machine's future-dated retry-scheduled row", async () => {
+				const mine = await waitingForMachine(WORKER_ID, REQUEST_ID);
+				await waitingForMachine(OTHER_WORKER_ID, OTHER_REQUEST_ID);
+
+				expect((await findWakeableWorkerUpdateDispatch(WORKER_ID))?.id).toBe(mine.id);
+			});
+
+			// A dispatch already due needs no promotion, and its wake-up may be in flight
+			// — which is what makes the remove-then-re-date sequence safe for the caller.
+			it('ignores a dispatch that is already due', async () => {
+				await seedUpdateDispatch(WORKER_ID, REQUEST_ID, { state: 'retry-scheduled' });
+
+				expect(await findWakeableWorkerUpdateDispatch(WORKER_ID)).toBeUndefined();
+			});
+
+			it('ignores a pending or terminal dispatch', async () => {
+				const pending = await seedUpdateDispatch(WORKER_ID, REQUEST_ID);
+				expect(await findWakeableWorkerUpdateDispatch(WORKER_ID)).toBeUndefined();
+
+				await cancelWaitingDispatch(pending.id, 'cleared the queue');
+				expect(await findWakeableWorkerUpdateDispatch(WORKER_ID)).toBeUndefined();
+			});
+
+			// The whole point of the reconnect hook: the wait collapses to now, so the
+			// republished wake-up delivers the frame immediately.
+			it('hands the found row to promoteDispatchToImmediateWake', async () => {
+				const waiting = await waitingForMachine(WORKER_ID, REQUEST_ID);
+
+				const promoted = await promoteDispatchToImmediateWake(waiting.id, waiting.wakeSeq);
+
+				expect(promoted).not.toBeNull();
+				expect(promoted?.wakeSeq).toBe(waiting.wakeSeq + 1);
+				expect(promoted?.availableAt.getTime()).toBeLessThanOrEqual(Date.now());
+			});
+		});
+
+		// The executor is handed a transaction-less default in production but the
+		// *request* write hands it its own `tx`, so the parameter has to be honoured.
+		it('honours an executor so the dispatch can join the request transaction', async () => {
+			const db = getDb();
+			await expect(
+				db.transaction(async (tx) => {
+					const { dispatch } = await createDispatch(
+						{
+							projectId: PROJECT_ID,
+							jobPayload: workerUpdateJob(WORKER_ID, REQUEST_ID),
+							dedupKey: `worker-update:${REQUEST_ID}`,
+							priority: -10,
+							source: 'manual',
+							phase: 'worker-update',
+						},
+						tx,
+					);
+					expect(dispatch.priority).toBe(-10);
+					throw new Error('roll back');
+				}),
+			).rejects.toThrow('roll back');
+
+			// Rolled back with the transaction rather than committed on its own.
+			expect(await listWaitingDispatches(PROJECT_ID)).toEqual([]);
 		});
 	});
 });

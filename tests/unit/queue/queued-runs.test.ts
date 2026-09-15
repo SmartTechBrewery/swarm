@@ -58,6 +58,15 @@ const MERGE_JOB = {
 	approvedHeadSha: 'deadbeef',
 };
 
+/** A durable worker self-update request (issue #972). */
+const WORKER_UPDATE_JOB = {
+	type: 'worker-update' as const,
+	projectId: 'p1',
+	workerId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+	requestId: '66666666-6666-4666-8666-666666666666',
+	target: 'main',
+};
+
 describe('deriveQueuedPhaseHint', () => {
 	it('hints board for every pm job', () => {
 		expect(deriveQueuedPhaseHint(createMockPmWebhookJob())).toBe('board');
@@ -65,6 +74,10 @@ describe('deriveQueuedPhaseHint', () => {
 
 	it('hints merge-automation for a merge-automation job', () => {
 		expect(deriveQueuedPhaseHint(MERGE_JOB)).toBe('merge-automation');
+	});
+
+	it('hints worker-update for a worker-update job', () => {
+		expect(deriveQueuedPhaseHint(WORKER_UPDATE_JOB)).toBe('worker-update');
 	});
 
 	it('hints respond-to-review for a non-approved pull-request review', () => {
@@ -308,6 +321,55 @@ describe('toQueuedRuns', () => {
 			const [item] = toQueuedRuns([makeDispatch({ state: 'retry-scheduled', waitReason })]);
 			expect(item).toMatchObject({ state: 'delayed', waitReason });
 		}
+	});
+
+	// Issue #972. Two things would each take the whole `runs.queued` response down
+	// if the read model had not been widened: a `worker-update` type the enum does
+	// not list, and a *negative* priority a `nonnegative()` parse rejects.
+	it('renders a worker-update dispatch, negative priority and all', () => {
+		const [item] = toQueuedRuns([
+			makeDispatch({
+				phase: 'worker-update',
+				priority: -10,
+				runId: 'run-1',
+				jobPayload: WORKER_UPDATE_JOB,
+			}),
+		]);
+
+		expect(item).toMatchObject({
+			type: 'worker-update',
+			phaseHint: 'worker-update',
+			// Outranking the default is still "not plain FIFO".
+			state: 'prioritized',
+			priority: -10,
+			runId: 'run-1',
+		});
+		// A machine, not an artifact: nothing names a pull request or a board item.
+		expect(item.prNumber).toBeUndefined();
+		expect(item.workItemNodeId).toBeUndefined();
+		expect(item.repo).toBeUndefined();
+	});
+
+	// The offline machine's wait, exactly as an operator reads it off the Queue.
+	it('renders a worker-update dispatch waiting for its machine as a delayed eligibility wait', () => {
+		const [item] = toQueuedRuns([
+			makeDispatch({
+				phase: 'worker-update',
+				priority: -10,
+				state: 'retry-scheduled',
+				waitReason: 'worker-eligibility',
+				attempt: 3,
+				availableAt: new Date(Date.now() + 300_000),
+				jobPayload: WORKER_UPDATE_JOB,
+			}),
+		]);
+
+		expect(item).toMatchObject({
+			type: 'worker-update',
+			state: 'delayed',
+			waitReason: 'worker-eligibility',
+			attempt: 3,
+		});
 	});
 
 	it('maps a capacity-blocked dispatch to the blocked state with its wait reason', () => {

@@ -33,6 +33,18 @@ let queue: Queue<SwarmJob> | null = null;
 export const PM_BOARD_JOB_PRIORITY = 10;
 
 /**
+ * A worker self-update is promoted *above* the default (issue #972): it is the
+ * shortest job in the system and the one everything else is waiting behind, so a
+ * machine asked to update while its queue is full is served first rather than
+ * last. The durable dispatch table orders claims by `priority ASC` and its
+ * `priority` column is a plain `integer` with no lower bound, so ranking ahead of
+ * everything needs no new mechanism — just a negative.
+ *
+ * **Not handed to BullMQ, deliberately** — see {@link bullMqPriorityOption}.
+ */
+export const WORKER_UPDATE_JOB_PRIORITY = -10;
+
+/**
  * Normalizes before branching: most callers hand this a payload read straight out
  * of a `jsonb` column (`dispatch.jobPayload`, `run.jobPayload`), which is *typed*
  * {@link SwarmJob} but may still carry a pre-#385/#297 `{ type: 'github' }` /
@@ -41,13 +53,43 @@ export const PM_BOARD_JOB_PRIORITY = 10;
  * `priority: 0`, BullMQ's *highest*, the exact inversion this demotion exists to
  * prevent. Doing it here rather than at each call site covers every current and
  * future caller.
+ *
+ * The single place a job's priority is decided, for the dispatch table as well as
+ * for BullMQ — which is why the durable write (`requestWorkerUpdate`,
+ * `src/db/repositories/workersRepository.ts`) calls it rather than restating the
+ * constant.
  */
 export function priorityFor(job: SwarmJob): number | undefined {
 	const normalized = normalizeStoredJobPayload(job);
+	if (normalized.type === 'worker-update') return WORKER_UPDATE_JOB_PRIORITY;
 	return normalized.type === 'pm' ||
 		(normalized.type === 'scm' && normalized.event.kind === 'work-item')
 		? PM_BOARD_JOB_PRIORITY
 		: undefined;
+}
+
+/**
+ * The `priority` option to hand BullMQ for a job {@link priorityFor} ranked — the
+ * option itself when the rank is a *demotion*, and **nothing at all** when it
+ * ranks above the default.
+ *
+ * **BullMQ has no tier above unset, and a negative would invert the ordering it
+ * asks for.** A BullMQ worker `RPOPLPUSH`es from the plain `wait` list first and
+ * only falls through to the prioritized ZSET when `wait` is empty; a job added
+ * with no `priority` option goes to `wait`, and a job added with *any* priority —
+ * including a negative one, which `Job.addJob` rejects only for non-integers and
+ * values above `PRIORITY_LIMIT` — goes to the ZSET. So passing `-10` here would
+ * rank the wake-up **behind** every unset-priority wake-up: the exact inversion
+ * issue #972 exists to remove. Omitting the option asks for the highest tier
+ * BullMQ has, which is what a negative rank means.
+ *
+ * The durable dispatch table, where ordering actually decides which unit a worker
+ * claims, honours the negative directly (`priority ASC`); BullMQ only carries the
+ * wake-up.
+ */
+function bullMqPriorityOption(job: SwarmJob): { priority?: number } {
+	const priority = priorityFor(job);
+	return priority !== undefined && priority > 0 ? { priority } : {};
 }
 
 /**
@@ -88,13 +130,10 @@ function getQueue(): Queue<SwarmJob> {
  * present so a redelivered webhook dedupes while the completed job is retained.
  */
 export async function enqueueJob(job: SwarmJob): Promise<string | undefined> {
-	const priority = priorityFor(job);
+	const priorityOpt = bullMqPriorityOption(job);
 	const opts =
-		job.deliveryId || priority !== undefined
-			? {
-					...(job.deliveryId ? { jobId: job.deliveryId } : {}),
-					...(priority !== undefined ? { priority } : {}),
-				}
+		job.deliveryId || priorityOpt.priority !== undefined
+			? { ...(job.deliveryId ? { jobId: job.deliveryId } : {}), ...priorityOpt }
 			: undefined;
 	const added = await getQueue().add(job.type, job, opts);
 	return added.id;
@@ -114,11 +153,10 @@ export async function enqueueDispatchWakeUp(
 	jobId: string,
 	delayMs: number,
 ): Promise<string | undefined> {
-	const priority = priorityFor(job);
 	const added = await getQueue().add(job.type, job, {
 		jobId,
 		...(delayMs > 0 ? { delay: delayMs } : {}),
-		...(priority !== undefined ? { priority } : {}),
+		...bullMqPriorityOption(job),
 	});
 	return added.id;
 }

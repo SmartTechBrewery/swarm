@@ -1,4 +1,4 @@
-import { and, desc, eq } from 'drizzle-orm';
+import { and, asc, desc, eq, sql } from 'drizzle-orm';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { getDb } from '../../../src/db/client.js';
 import { deleteProjectFromDb } from '../../../src/db/repositories/projectsRepository.js';
@@ -26,6 +26,7 @@ import {
 	updateWorkerSupportedPhases,
 	type WorkerUpdateRequestOutcome,
 } from '../../../src/db/repositories/workersRepository.js';
+import { dispatches } from '../../../src/db/schema/dispatches.js';
 import { runs } from '../../../src/db/schema/runs.js';
 import { users } from '../../../src/db/schema/users.js';
 import { workerProjectEnrollments } from '../../../src/db/schema/workerProjectEnrollments.js';
@@ -507,6 +508,20 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 			return created.id;
 		}
 
+		/** The `worker-update` dispatch rows this machine has, oldest first. */
+		async function updateDispatchesFor(workerId: string) {
+			return await getDb()
+				.select()
+				.from(dispatches)
+				.where(
+					and(
+						eq(dispatches.phase, 'worker-update'),
+						sql`${dispatches.jobPayload} ->> 'workerId' = ${workerId}`,
+					),
+				)
+				.orderBy(asc(dispatches.createdAt));
+		}
+
 		/** The `worker-update` run rows this machine has, newest first. */
 		async function updateRunsFor(workerId: string) {
 			return await getDb()
@@ -864,6 +879,88 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 				expect(await updateRunsFor(id)).toHaveLength(0);
 				const reported = await recordWorkerUpdateReport(id, REQUEST_ID, 'applied', 'Applied.');
 				expect(reported?.update).toMatchObject({ status: 'applied' });
+			});
+		});
+
+		// Issue #972 — the durable unit that *delivers* the request, written in the same
+		// transaction as the row and the run for the reason #971 gave for the run: a
+		// recorded request with no dispatch is a request nothing will ever deliver.
+		describe('the dispatch it enqueues (issue #972)', () => {
+			it('creates one pending dispatch ranked ahead of waiting work, linked to the run', async () => {
+				const id = await freshWorker('ada-dispatch');
+
+				const result = await requestWorkerUpdate(id, REQUEST_ID, 'main', adaId);
+
+				if (result.outcome !== 'requested') throw new Error(`got '${result.outcome}'`);
+				const rows = await updateDispatchesFor(id);
+				expect(rows).toHaveLength(1);
+				expect(rows[0].id).toBe(result.dispatch.id);
+				expect(rows[0]).toMatchObject({
+					state: 'pending',
+					phase: 'worker-update',
+					source: 'manual',
+					projectId: UPDATE_PROJECT_ID,
+					runId: result.runId,
+					dedupKey: `worker-update:${REQUEST_ID}`,
+					attempt: 0,
+				});
+				// The whole point of the issue: it outranks everything already queued, and
+				// the column takes a negative with no migration.
+				expect(rows[0].priority).toBeLessThan(0);
+				expect(rows[0].jobPayload).toMatchObject({
+					type: 'worker-update',
+					workerId: id,
+					requestId: REQUEST_ID,
+					target: 'main',
+				});
+			});
+
+			// Without this the previous request's dispatch would sit in the queue waiting
+			// to push a build the row has moved off.
+			it('supersedes the previous dispatch when the machine is re-targeted', async () => {
+				const id = await freshWorker('ada-dispatch-retarget');
+				await requestWorkerUpdate(id, REQUEST_ID, 'main', adaId);
+
+				await requestWorkerUpdate(id, OTHER_REQUEST_ID, 'v2', adaId);
+
+				const rows = await updateDispatchesFor(id);
+				expect(rows).toHaveLength(2);
+				expect(rows[0]).toMatchObject({
+					state: 'cancelled',
+					dedupKey: `worker-update:${REQUEST_ID}`,
+				});
+				expect(rows[0].lastError).toContain('Superseded');
+				expect(rows[1]).toMatchObject({
+					state: 'pending',
+					dedupKey: `worker-update:${OTHER_REQUEST_ID}`,
+				});
+			});
+
+			// The same all-or-nothing boundary the run has: a machine with no project has
+			// nothing written at all.
+			it('writes no dispatch for a machine enrolled in no project', async () => {
+				const created = await createWorker({
+					ownerUserId: adaId,
+					displayName: 'ada-dispatch-orphan',
+					capabilities: ['claude'],
+					credentialHash: 'hash-ada-dispatch-orphan',
+				});
+				await setWorkerDraining(created.id, true);
+
+				expect((await requestWorkerUpdate(created.id, REQUEST_ID, 'main', adaId)).outcome).toBe(
+					'no-project',
+				);
+				expect(await updateDispatchesFor(created.id)).toHaveLength(0);
+			});
+
+			// The other refusal: still in the dispatch pool, so the write is declined by
+			// its own `WHERE` and none of the three rows is created.
+			it('writes no dispatch for a machine that is not draining', async () => {
+				const id = await freshWorker('ada-dispatch-in-pool');
+				await setWorkerDraining(id, false);
+
+				expect((await requestWorkerUpdate(id, REQUEST_ID, 'main', adaId)).outcome).toBe('in-pool');
+				expect(await updateDispatchesFor(id)).toHaveLength(0);
 			});
 		});
 	});

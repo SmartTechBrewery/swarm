@@ -3,9 +3,9 @@
  * worktrees (issue #955) — the cross-process hand-off behind
  * `workers.requestWorktreeSweep`.
  *
- * A copy of `./worker-updates.ts` on its own channel, for the same reason that one
- * exists: the API server and the router are separate processes and **only the
- * router holds worker sockets**, so the mutation cannot push the frame itself. It
+ * A best-effort notification channel of its own, for the reason such a bridge
+ * exists at all: the API server and the router are separate processes and **only
+ * the router holds worker sockets**, so the mutation cannot push the frame itself. It
  * records the request on the `workers` row and publishes the worker id here; the
  * router subscribes and turns each one into a `worktree-sweep` push
  * (`../router/worktree-sweep-dispatch.ts`).
@@ -15,9 +15,13 @@
  * channel fires and when a worker reconnects — so a Redis set recording the same
  * fact would be a second source of truth for one that already has one.
  *
- * Own lazy ioredis client per process, mirroring `./cancellation.ts` and
- * `./worker-updates.ts` — the API server publishes, the router subscribes, both
- * against the one shared Redis.
+ * Own lazy ioredis client per process, mirroring `./cancellation.ts` — the API
+ * server publishes, the router subscribes, both against the one shared Redis.
+ *
+ * The self-update request used to travel the same way. It no longer does: since
+ * issue #972 an update is a durable queued unit ranked ahead of waiting work, so
+ * its delivery is a dispatch rather than a publish. A sweep is a different request
+ * lifecycle with its own issue and keeps this channel.
  */
 
 import { Redis } from 'ioredis';
