@@ -279,6 +279,11 @@ export async function setWorkerDraining(
  * recorded as a `runs` row scoped to the machine's own project, so a machine enrolled
  * in none has nothing for its run to hang off and is refused by the same write. The
  * request and its run are created in one transaction, and `runId` names the row.
+ *
+ * And for the fifth, `unsupervised` (issue #997): the daemon applies an update by
+ * exiting, so a machine that declared no process supervisor will start it again is
+ * refused here rather than asked and lost. It fires on that declaration alone —
+ * `unknown` is asked exactly as `supervised` is.
  */
 export async function requestWorkerUpdate(
 	id: string,

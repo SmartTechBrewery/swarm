@@ -268,7 +268,8 @@ work starts by itself once the first allowance returns.
 host (issue #933) — and since issue #975 there is no per-host setting that can refuse.
 What bounds the request is the mechanism: the fetch takes no URL and no refspec, the
 target must be an ancestor of the branch the install root already tracks, a dirty
-install root is refused, and the drain below stays the machine owner's own control.
+install root is refused, a machine that declared it runs under no process supervisor
+is refused (below), and the drain below stays the machine owner's own control.
 See [`docs/onboarding-worker.md`](./onboarding-worker.md) and
 [`ADR-006`](./decisions/ADR-006-unconditional-worker-updates.md):
 
@@ -367,8 +368,30 @@ a Terminal window included, so accepting it on its own would read a genuinely
 hand-run daemon as supervised. The error therefore only ever under-claims — nothing
 is marked as coming back unless it demonstrably will.
 
-Nothing is gated on the declaration today — every machine is asked, dispatched to and
-updated exactly as before, and the two surfaces above simply say one more thing.
+**The machine must be under a process supervisor** (issue #997, phase 2/2). The
+daemon applies an update by *exiting*, so a machine that declared `unsupervised` would
+be gone until somebody started it by hand rather than restarted onto the new build —
+and it is refused instead of silently asked: `swarm workers update` says so and writes
+nothing, the fleet forms report it as `unsupervised`, and a staged rollout skips it and
+puts it back in the dispatch pool rather than halting for it. Install the daemon under
+launchd with `swarm-worker-agent install`
+([`docs/launchd-worker-autostart.md`](./launchd-worker-autostart.md)) and request the
+update again, or update that machine by hand (`git pull && npm ci && npm run build`,
+then restart it). A machine whose supervision is **unknown** is never refused — an
+older daemon, a machine that has never connected, a platform the reads cannot answer
+for — so a fact SWARM could not establish never blocks an operator who knows better.
+This is a precondition of the update *mechanism*, like the drain and the ancestor
+check, not a per-host setting: nothing on the machine turns it off, which is what
+keeps it consistent with
+[`ADR-006`](./decisions/ADR-006-unconditional-worker-updates.md).
+
+Read the macOS caveat above before relying on this: a LaunchAgent that starts the
+daemon through `swarm run:worker` leaves the daemon's parent as `npm`, so it declares
+`unsupervised` and is refused although launchd would in fact restart it. Until the
+detection reads that shape, such a host updates by hand.
+
+Nothing else is gated on the declaration — dispatch is unaffected, and a machine that
+declared `supervised` behaves exactly as it always has.
 
 **Or the whole fleet, staged.** `swarm workers update --all <ref>` (issue #940) moves
 every machine you own in one operator action — but a bounded wave at a time, so the

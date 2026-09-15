@@ -265,7 +265,11 @@ Usage:
              it happens, and settles — so a failed update is diagnosable where every
              other failure is. That is also why the machine must be ENROLLED IN A
              PROJECT: with none there is no project for the run to hang off, and the
-             request is refused. Requesting again replaces a
+             request is refused. It must also be UNDER A PROCESS SUPERVISOR: the
+             daemon applies an update by exiting, so a machine whose daemon declared
+             that nothing will start it again is refused rather than lost — install it
+             with 'swarm-worker-agent install' first. A machine whose supervision is
+             unknown is never refused. Requesting again replaces a
              request that has not been answered yet. The machine's owner alone may
              do it, so sign in as them. Remember to undrain it afterwards.
              With --all and no worker id, every machine you own is moved to <ref>
@@ -298,10 +302,13 @@ Usage:
              remote. So its owner can refuse it, or stop it later, without
              asking you. A machine enrolled in no project is reported
              'no-project' and left alone too: an update is recorded as a run in
-             the machine's own project, and there is none to record it in. Each
-             line carries the machine, its owner and the disposition (requested
-             | queued-offline | in-pool | no-project | already-asked |
-             answered). Every request records who made it, so 'swarm workers
+             the machine's own project, and there is none to record it in. And a
+             machine whose daemon declared that no process supervisor will start
+             it again is reported 'unsupervised' and left alone: the daemon
+             applies an update by exiting, so asking it would lose the machine.
+             Each line carries the machine, its owner and the disposition
+             (requested | queued-offline | in-pool | no-project | unsupervised |
+             already-asked | answered). Every request records who made it, so 'swarm workers
              update <worker-id> <ref>' is what an owner runs for
              their own machine and this is what an administrator runs for the fleet.
   sweep-worktrees
@@ -1545,7 +1552,7 @@ async function requestUpdateForInstallationCommand(argv: string[]): Promise<numb
 
 /**
  * The installation-wide report: a heading naming who asked and for what, one line per
- * machine with its owner, and the two lines that say what an administrator can and
+ * machine with its owner, and the lines that say what an administrator can and
  * cannot do about the machines that did not move.
  *
  * Lines are printed in the order the control plane answered in — grouped by owner —
@@ -1566,10 +1573,10 @@ function printInstallationUpdateRequest(result: InstallationUpdateRequest): void
 		const owner = worker.owner?.identifier ?? 'owner unknown';
 		out.info(`${worker.workerId}\t${worker.displayName}\t${owner}\t${worker.disposition}`);
 	}
-	// The one thing an administrator cannot do anything about on their own, named
+	// The first thing an administrator cannot do anything about on their own, named
 	// rather than left to be inferred from a disposition — the drain is the machine
 	// owner's own switch, and since issue #975 removed the per-host opt-in it is the
-	// only one, which is the whole reason this command is allowed to be
+	// only *switch* left, which is the whole reason this command is allowed to be
 	// installation-wide.
 	const inPool = result.workers.filter((worker) => worker.disposition === 'in-pool');
 	if (inPool.length > 0) {
@@ -1584,6 +1591,15 @@ function printInstallationUpdateRequest(result: InstallationUpdateRequest): void
 	if (noProject.length > 0) {
 		out.info(
 			`  ${noProject.length} enrolled in no project and so not asked — an update is recorded as a run in the machine's own project, so enroll it first ('swarm workers enroll <worker-id> <project-id>'), then run this again`,
+		);
+	}
+	// The third (issue #997), and the one an administrator can fix least of all from
+	// here: it takes a change on the machine itself. The daemon applies an update by
+	// exiting, so a machine nothing will start again would be lost rather than updated.
+	const unsupervised = result.workers.filter((worker) => worker.disposition === 'unsupervised');
+	if (unsupervised.length > 0) {
+		out.info(
+			`  ${unsupervised.length} not under a process supervisor and so not asked — an update is applied by exiting, so ask ${ownersOf(unsupervised)} to install the daemon under launchd ('swarm-worker-agent install' on the machine), then run this again`,
 		);
 	}
 	out.info(

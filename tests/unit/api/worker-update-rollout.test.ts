@@ -336,6 +336,44 @@ describe('advanceRollout — taking a wave', () => {
 		expect(view?.rollout.status).toBe('completed');
 	});
 
+	// Issue #997 — word for word `no-project`'s reasoning: a machine that declared no
+	// process supervisor will start its daemon again is reachable here, and nothing
+	// about advancing the rollout would ever change that answer, so a waiting member
+	// would hold the wave open forever.
+	it('settles a member that declared it is unsupervised as skipped, and completes', async () => {
+		givenRollout(makeRollout(), [makeMember(WORKER_A, 0)]);
+		givenWorkers(makeWorker(WORKER_A, { supervision: 'unsupervised' }));
+		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry(WORKER_A, 'unsupervised', null)]);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0]).toMatchObject({
+			state: 'skipped',
+			message:
+				'the machine is not under a process supervisor, so it would not come back from an update',
+		});
+		expect(view?.members[0].settledAt).toBeInstanceOf(Date);
+		// The rollout drained it and is not going to move it, so it goes back in the pool.
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_A, false);
+		expect(view?.rollout.status).toBe('completed');
+	});
+
+	// It settles well, not badly, exactly as `no-project` does: a machine nothing would
+	// restart is not a bad build, so it must not halt the wave for everybody else.
+	it('does not halt the rollout for a member that declared it is unsupervised', async () => {
+		givenRollout(makeRollout({ waveSize: 2 }), [makeMember(WORKER_A, 0), makeMember(WORKER_B, 1)]);
+		givenWorkers(makeWorker(WORKER_A, { supervision: 'unsupervised' }), makeWorker(WORKER_B));
+		fanOutWorkerUpdate.mockResolvedValue([
+			fanoutEntry(WORKER_A, 'unsupervised', null),
+			fanoutEntry(WORKER_B, 'requested'),
+		]);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.rollout.status).toBe('in_progress');
+		expect(view?.members.map((member) => member.state)).toEqual(['skipped', 'signalled']);
+	});
+
 	// It settles well, not badly: a machine that cannot be recorded against a project is
 	// not a bad build, so it must not halt the rollout for everybody else.
 	it('does not halt the rollout for a member enrolled in no project', async () => {

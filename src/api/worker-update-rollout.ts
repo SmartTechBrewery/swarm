@@ -649,6 +649,15 @@ class AdvancePass {
 	 * reachable, and nothing about advancing the rollout would ever change its answer —
 	 * so a waiting member would hold the wave open forever. Settled with `settledAt`,
 	 * it is one `completeIfSettled` can finish past.
+	 *
+	 * `unsupervised` (issue #997) settles the same way, for word-for-word the same
+	 * reason: a machine that declared no supervisor will start its daemon again is
+	 * reachable here, and nothing about advancing the rollout would ever change that
+	 * answer either — only reinstalling the daemon under launchd or systemd would, and
+	 * that is the machine owner's own doing, off this rollout's timeline. It settles
+	 * *well*, not badly: a machine that would not come back is not a bad build, so it
+	 * must not halt the wave for everybody else, and it goes back in the pool the
+	 * rollout borrowed it from.
 	 */
 	private async recordSignal(
 		member: WorkerUpdateRolloutMember,
@@ -661,6 +670,18 @@ class AdvancePass {
 				patch: {
 					state: 'skipped',
 					message: 'the machine is enrolled in no project',
+					settledAt: this.now,
+				},
+				returnToPool: true,
+			});
+			return;
+		}
+		if (entry.disposition === 'unsupervised') {
+			await this.apply(member, {
+				patch: {
+					state: 'skipped',
+					message:
+						'the machine is not under a process supervisor, so it would not come back from an update',
 					settledAt: this.now,
 				},
 				returnToPool: true,

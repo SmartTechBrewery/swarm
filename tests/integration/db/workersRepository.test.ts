@@ -31,6 +31,7 @@ import { dispatches } from '../../../src/db/schema/dispatches.js';
 import { runs } from '../../../src/db/schema/runs.js';
 import { users } from '../../../src/db/schema/users.js';
 import { workerProjectEnrollments } from '../../../src/db/schema/workerProjectEnrollments.js';
+import { workers } from '../../../src/db/schema/workers.js';
 import type { AgentCli } from '../../../src/harness/agent-cli.js';
 import {
 	type Worker,
@@ -39,6 +40,7 @@ import {
 	type WorktreeSweepResult,
 } from '../../../src/identity/worker.js';
 import { AllowedClisNotCapableError } from '../../../src/identity/worker-enrollment.js';
+import type { WorkerSupervision } from '../../../src/lib/worker-supervision.js';
 import { ALL_TRIGGER_PHASES, type TriggerPhase } from '../../../src/triggers/types.js';
 import { truncateAll } from '../helpers/db.js';
 import { seedProject } from '../helpers/seed.js';
@@ -509,6 +511,43 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 			return created.id;
 		}
 
+		/**
+		 * Re-declare how a machine is supervised (issue #997), the one way it ever
+		 * changes: the daemon states it at handshake, which is the same write that
+		 * re-declares its CLIs. A machine that has never connected stays `unknown`, which
+		 * is what {@link freshWorker} leaves behind.
+		 */
+		async function declareSupervision(
+			workerId: string,
+			supervision: WorkerSupervision,
+		): Promise<void> {
+			await updateWorkerCapabilities(
+				workerId,
+				['claude'],
+				undefined,
+				undefined,
+				undefined,
+				supervision,
+			);
+		}
+
+		/**
+		 * Resolve once some statement in this database is waiting on a lock — the
+		 * barrier that makes the reconnect race below deterministic rather than timed.
+		 * The integration project runs serially in a single fork (`vitest.config.ts`),
+		 * so the only statement that can be blocked is the one the test just started.
+		 */
+		async function waitForBlockedStatement(): Promise<void> {
+			for (let attempt = 0; attempt < 300; attempt += 1) {
+				const blocked = await getDb().execute(
+					sql`SELECT 1 FROM pg_locks WHERE NOT granted LIMIT 1`,
+				);
+				if (blocked.rows.length > 0) return;
+				await new Promise((resolve) => setTimeout(resolve, 10));
+			}
+			throw new Error('Timed out waiting for the request write to block on the row lock.');
+		}
+
 		/** The `worker-update` dispatch rows this machine has, oldest first. */
 		async function updateDispatchesFor(workerId: string) {
 			return await getDb()
@@ -832,6 +871,85 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 				expect(result.outcome).toBe('no-project');
 				expect((await getWorkerById(created.id))?.update).toBeNull();
 				expect(await updateRunsFor(created.id)).toHaveLength(0);
+			});
+
+			// Issue #997, phase 2/2 — the third precondition, and the same all-or-nothing
+			// boundary: the daemon applies an update by exiting, so a machine that declared
+			// nothing will start it again is answered before the row write and nothing at
+			// all is created for it.
+			it('refuses a machine that declared it is unsupervised, writing nothing', async () => {
+				const id = await freshWorker('ada-unsupervised');
+				await declareSupervision(id, 'unsupervised');
+
+				const result = await requestWorkerUpdate(id, REQUEST_ID, 'main', adaId);
+
+				expect(result.outcome).toBe('unsupervised');
+				expect((await getWorkerById(id))?.update).toBeNull();
+				expect(await updateRunsFor(id)).toHaveLength(0);
+				expect(await updateDispatchesFor(id)).toHaveLength(0);
+			});
+
+			// Never refused, anywhere: `unknown` is what a daemon predating the declaration
+			// and a machine that has never connected both say, so treating it as a refusal
+			// would let a fact SWARM could not establish block an operator who knows better.
+			// A freshly registered machine is already `unknown`, which is why every other
+			// case in this block is accepted.
+			it.each([
+				'unknown',
+				'supervised',
+			] as const)('asks a machine declaring %s exactly as before', async (supervision) => {
+				const id = await freshWorker(`ada-${supervision}`);
+				await declareSupervision(id, supervision);
+
+				const result = await requestWorkerUpdate(id, REQUEST_ID, 'main', adaId);
+
+				expect(result.outcome).toBe('requested');
+				expect((await getWorkerById(id))?.update).toMatchObject({ requestId: REQUEST_ID });
+			});
+
+			// Ordered behind the draining snapshot, exactly as the fan-out's own snapshot
+			// check orders the pair: the drain is the remedy the operator has to reach for
+			// either way, so the two forms never word one machine's state differently.
+			it('answers in-pool for a machine that is both in the pool and unsupervised', async () => {
+				const id = await freshWorker('ada-both');
+				await declareSupervision(id, 'unsupervised');
+				await setWorkerDraining(id, false);
+
+				expect((await requestWorkerUpdate(id, REQUEST_ID, 'main', adaId)).outcome).toBe('in-pool');
+				expect((await getWorkerById(id))?.update).toBeNull();
+			});
+
+			// The window the read in front of the write does not close on its own:
+			// supervision changes by *reconnecting*, so an old daemon that stops while this
+			// transaction is open and a hand-run replacement that handshakes before the row
+			// write lands is a sequence an operator can produce by hand. The write's own
+			// `supervision <> 'unsupervised'` predicate is what closes it. Held open as a
+			// real row lock rather than timed: the re-declaration is uncommitted while
+			// `requestWorkerUpdate` takes its read (so that read is guaranteed to see
+			// `supervised`) and committed while its UPDATE waits on the lock (so the
+			// predicate is guaranteed to be re-evaluated against it).
+			it('refuses at the write when the machine re-declares unsupervised after the read', async () => {
+				const id = await freshWorker('ada-reconnect');
+				await declareSupervision(id, 'supervised');
+
+				let commitHandshake: () => void = () => {};
+				const handshakeMayCommit = new Promise<void>((resolve) => {
+					commitHandshake = resolve;
+				});
+				const handshake = getDb().transaction(async (tx) => {
+					await tx.update(workers).set({ supervision: 'unsupervised' }).where(eq(workers.id, id));
+					await handshakeMayCommit;
+				});
+
+				const pending = requestWorkerUpdate(id, REQUEST_ID, 'main', adaId);
+				await waitForBlockedStatement();
+				commitHandshake();
+				await handshake;
+
+				expect((await pending).outcome).toBe('unsupervised');
+				expect((await getWorkerById(id))?.update).toBeNull();
+				expect(await updateRunsFor(id)).toHaveLength(0);
+				expect(await updateDispatchesFor(id)).toHaveLength(0);
 			});
 
 			// The machine is this run's whole subject, and `runs.worker_id` is

@@ -680,6 +680,13 @@ unchanged.
   tracks, fetched from that checkout's own remote — never to another repository or a
   branch somebody pushed — and a dirty install root is refused outright. Since issue
   #975 there is no per-host setting that can decline a request.
+  **Refused, too, for a machine that would not come back from it** (issue #997): the
+  daemon applies an update by *exiting*, so one whose handshake declared
+  `unsupervised` is told so and nothing is written — install it under launchd with
+  `swarm-worker-agent install` and ask again, or update that machine by hand. A
+  machine whose supervision is **unknown** is never refused. Like the drain and the
+  ancestor check this is a precondition of the mechanism, not a host setting, so
+  there is no override flag.
   A host where several daemons share one SWARM install root is supported
   (issue #935), and since issue #973 asking it brings *every* daemon on it over: the
   first to act takes a machine-local lock and does the fetch and build, the rest wait
@@ -720,8 +727,10 @@ unchanged.
   `draining` (out of the pool, waiting to go idle — draining never interrupts a
   run), `signalled` (asked, awaiting its report), `verifying` (it applied; waiting
   for a daemon on the new build to take a fresh lease), `done`, `skipped` (settled
-  without being moved — the rollout halted first, or another session re-targeted the
-  machine) and `failed`. A tally line counts them.
+  without being moved — the rollout halted first, another session re-targeted the
+  machine, it is enrolled in no project, or it declared it runs under no process
+  supervisor and so would not come back) and `failed`. A tally line counts them. A
+  skipped machine goes back in the dispatch pool and the wave carries on past it.
   **A bad build halts the rollout.** A machine that reports `failed`, `refused` or
   `declined`, that comes back still on the build it was asked to leave (which is what
   a machine returning itself to its last known good build looks like — issue #934),
@@ -762,14 +771,19 @@ unchanged.
   cannot take the installation's capacity down. What it can ask *for* is bounded by
   the mechanism — the daemon's fetch takes no URL and no refspec, and the target must
   be an ancestor of the branch its install root already tracks — so an administrator
-  can move a machine along the branch it already follows and nowhere else. Issue #975
+  can move a machine along the branch it already follows and nowhere else. That same
+  mechanism is why a machine that declared `unsupervised` is reported and left alone
+  (issue #997): the daemon applies an update by exiting, so asking it would lose it.
+  Issue #975
   removed the per-host opt-in that used to sit beside the drain; see
   [`ADR-006`](./decisions/ADR-006-unconditional-worker-updates.md).
-  Each line is `<worker-id>  <name>  <owner>  <disposition>`, with the same six
+  Each line is `<worker-id>  <name>  <owner>  <disposition>`, with the same seven
   dispositions the owner-scoped fan-out reports (`requested`, `queued-offline`,
-  `in-pool`, `no-project`, `already-asked`, `answered`). Under the table, the machines
+  `in-pool`, `no-project`, `unsupervised`, `already-asked`, `answered`). No machine's
+  state ever refuses the whole call. Under the table, the machines
   that did not move are counted with the owners to go and ask — a drain for the
-  `in-pool` ones, an enrollment for the `no-project` ones. Lines are grouped by owner for that reason.
+  `in-pool` ones, an enrollment for the `no-project` ones, and a
+  `swarm-worker-agent install` for the `unsupervised` ones. Lines are grouped by owner for that reason.
   **Exit code 0 whenever the call succeeded**, however many machines were skipped: a
   report, not a pass/fail. **Every request records who made it** on the machine's own
   row (`workers.update_requested_by_user_id`, beside the build and the instant), and
