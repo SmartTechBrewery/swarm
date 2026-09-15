@@ -379,32 +379,122 @@ function DriftedClisNote({ drifted }: { drifted: string[] }) {
  * administrator asks their project's machines from its Workers tab.
  *
  * `secondary`, because Connectivity is a card of facts and this is not the reason
- * the screen exists — and inert for now, rendered `disabled` with a title saying
- * so rather than as a live control that swallows a click.
+ * the screen exists.
+ *
+ * **What it asks for is the control plane's own commit** (issue #998), read from
+ * the server as `controlPlaneBuild.commit` and never a ref the browser invents. That
+ * is already the comparand the `Outdated` badge is reached against, so the machine is
+ * moved to exactly the build it is being judged against and a successful update clears
+ * the mark by construction; a branch name would not, since `main` moves and the machine
+ * would land on whatever is on it when it applies. A control plane that **cannot read
+ * its own build** therefore has nothing to offer: the button is `disabled` and its title
+ * says so, rather than falling back to a ref, which would move a machine on a guess —
+ * the same three-valued "no answer" {@link BuildComparisonNote} states two paragraphs
+ * further down the screen. A `dirty` build is still
+ * offered: the commit named is a real commit on the branch the install root follows, and
+ * `dirty` says only that the control plane's own running code is not exactly it.
+ *
+ * **The three refusals are surfaced, never pre-empted.** `drainingSince` and
+ * `supervision` are both on this read model, and the button is deliberately live for a
+ * machine either of them would get refused for: the server's answers name their own
+ * remedies (`swarm workers drain`, `swarm-worker-agent install`, `swarm workers enroll`),
+ * and replacing three specific messages with a silent disabled state would leave the
+ * operator with nothing to act on. The delete card next door states the same rule. The
+ * client-side gate stays exactly `viewerIsOwner`, which is a decision about what to
+ * *offer*, not a copy of a server precondition.
+ *
+ * No confirmation, like the drain card below it: one machine, named on the screen the
+ * operator is standing on, and the server refuses outright unless its owner has already
+ * drained it — a deliberate prior act. The fleet-wide and project-wide forms are the
+ * ones that state what they are about to touch first.
  */
-function UpdateWorkerAction({ worker }: { worker: WorkerDetail }) {
+function UpdateWorkerAction({
+	worker,
+	onChanged,
+}: {
+	worker: WorkerDetail;
+	onChanged: () => void;
+}) {
+	const updateMutation = useMutation({
+		mutationFn: (target: string) =>
+			trpcClient.workers.requestUpdate.mutate({ workerId: worker.workerId, target }),
+		// What makes the `Updating` mark appear on the SWARM build field below: the badge
+		// is already mounted and reads `worker.update.requestId`, so refetching the
+		// authoritative view is the whole of the wiring.
+		onSuccess: onChanged,
+	});
+
 	// The gate lives here rather than at the call site: `viewerIsOwner` is this
 	// action's own precondition, and asking it there would put a seventh branch in a
 	// view that is already one long list of sections.
 	if (!worker.viewerIsOwner) return null;
 
+	const controlPlaneBuild = worker.controlPlaneBuild;
+	const target = controlPlaneBuild?.commit ?? null;
+
 	return (
 		<div className="mt-4 border-t border-zinc-800 pt-4">
 			<button
 				type="button"
-				disabled
-				title="Not wired up yet — this will ask this machine to update to the control plane's build and restart its daemon."
+				onClick={() => {
+					if (target) updateMutation.mutate(target);
+				}}
+				disabled={!target || updateMutation.isPending}
+				title={updateActionTitle(controlPlaneBuild)}
 				className={buttonClass('secondary')}
 			>
 				<RefreshCw className="h-4 w-4" aria-hidden="true" />
-				Update worker
+				{updateMutation.isPending ? 'Asking…' : 'Update worker'}
 			</button>
 			<p className="text-xs text-zinc-500 mt-2">
-				Moves this machine's SWARM installation to the control plane's build and restarts its
-				daemon. Drain it first if it may be running a job.
+				{controlPlaneBuild ? (
+					<>
+						Moves this machine's SWARM installation to the build this control plane is running (
+						<span className="font-mono">{formatWorkerBuild(controlPlaneBuild)}</span>) and restarts
+						its daemon.
+					</>
+				) : (
+					<>
+						This control plane cannot read its own build, so there is no build to ask this machine
+						to move to.
+					</>
+				)}{' '}
+				The machine has to be out of the dispatch pool already — drain it under{' '}
+				<strong>Pool membership</strong> below — and a machine whose daemon declared that nothing
+				will start it again is refused rather than asked.
 			</p>
+			{updateMutation.isError ? (
+				<div className="mt-2 p-2.5 bg-red-950/30 border border-red-900/30 text-xs text-red-400 rounded">
+					{updateMutation.error.message}
+				</div>
+			) : null}
+			{updateMutation.isSuccess ? (
+				// The two facts `swarm workers update` prints, and no more: the machine has
+				// been *asked*, and it acts when it is idle. What it then reported is the
+				// runs list's to tell. The target echoed is the server's own, abbreviated the
+				// way `formatWorkerBuild` abbreviates a commit — a ref carries no dirty flag,
+				// so there is no build to format here.
+				<p className="text-xs text-emerald-400 mt-2">
+					Asked this machine to move to{' '}
+					<span className="font-mono">{updateMutation.data.target.slice(0, 7)}</span>. It applies
+					the update once it is holding no in-flight phase, then restarts its daemon.
+				</p>
+			) : null}
 		</div>
 	);
+}
+
+/**
+ * The update button's own title: what the click will ask for, or — when the control
+ * plane cannot read its own build — why there is nothing to ask for. A module-level
+ * helper rather than a ternary in the attribute, so the disabled case is one readable
+ * sentence.
+ */
+function updateActionTitle(controlPlaneBuild: WorkerDetail['controlPlaneBuild']): string {
+	if (!controlPlaneBuild) {
+		return 'This control plane cannot read its own build, so there is no build to ask this machine to move to.';
+	}
+	return `Asks this machine to move its SWARM install root to ${formatWorkerBuild(controlPlaneBuild)} — the build this control plane is running — and restart its daemon.`;
 }
 
 function ConnectionState({ worker }: { worker: WorkerDetail }) {
@@ -698,7 +788,7 @@ export function WorkerDetailView({
 				    Connectivity because that is the card about this machine's relationship
 				    with the control plane — and because an update ends in a restart, which
 				    is the one thing on this screen that interrupts that relationship. */}
-				<UpdateWorkerAction worker={worker} />
+				<UpdateWorkerAction worker={worker} onChanged={onChanged} />
 			</div>
 
 			<div className={CARD_CLASS}>
