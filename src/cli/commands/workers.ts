@@ -30,10 +30,13 @@
  * Exactly one subcommand goes the other way (issue #922): `request-update` is an
  * **installation administrator's**, and asks every machine on the installation —
  * other owners' included — to move to a build. It is not an exception to the rule
- * above but the other side of it, and the reason is that it only ever *asks*: a
- * machine acts solely if its own host set `SWARM_WORKER_SELF_UPDATE=true`, and one
- * its owner has not drained is reported and left alone, so both of the switches that
- * decide whether anything happens stay the owner's. `docs/onboarding-worker.md`
+ * above but the other side of it, and the reason is that it only ever *asks*, and
+ * asks for something bounded: a machine its owner has not drained is reported and
+ * left alone, so the drain stays the owner's own switch, and the request can only
+ * move a machine to a build already on the branch its install root tracks, fetched
+ * from that checkout's own remote (`../../worker/self-update.ts`). Issue #975 removed
+ * the per-host opt-in that used to sit beside the drain — see
+ * `docs/decisions/ADR-006-unconditional-worker-updates.md`. `docs/onboarding-worker.md`
  * states the rule beside #800's; a non-administrator running it is refused outright
  * rather than quietly shown their own machines.
  *
@@ -244,17 +247,20 @@ Usage:
              into it. Refused unless the machine is already draining, so drain
              it first: the daemon waits for the phases it is already running to
              finish before it applies anything, and only draining stops new work
-             arriving into that wait. The machine acts only if its host opted in
-             with SWARM_WORKER_SELF_UPDATE=true. On a host where several daemons
-             share one SWARM install root, the first to act does the fetch and
-             build and the rest wait for it, then restart onto what it landed and
-             report adopted — so one machine fetches once and every daemon asked
-             ends up on the new build. An update is refused while a peer daemon
-             there is mid-phase, naming the worker to drain. Every
-             outcome — applied, adopted, already-current, declined, refused,
-             failed — is reported back and shown by 'list'; 'applied' and
-             'adopted' both restart the daemon, and anything else leaves the
-             machine working on the build it has. Each request also appears in the
+             arriving into that wait. A machine can only be moved along the
+             branch its install root already tracks, fetched from that
+             checkout's own remote — never to another repository or a side
+             branch. On a host where several daemons share one SWARM install
+             root, the first to act does the fetch and build and the rest wait
+             for it, then restart onto what it landed and report adopted — so
+             one machine fetches once and every daemon asked ends up on the new
+             build. An update is refused while a peer daemon there is mid-phase,
+             naming the worker to drain. Every outcome — applied, adopted,
+             already-current, refused, failed, plus the legacy 'declined' from a
+             machine still on a build predating issue #975 — is reported back
+             and shown by 'list'; 'applied' and 'adopted' both restart the
+             daemon, and anything else leaves the machine working on the build
+             it has. Each request also appears in the
              project's RUNS LIST as a run of its own, which starts, is visible while
              it happens, and settles — so a failed update is diagnosable where every
              other failure is. That is also why the machine must be ENROLLED IN A
@@ -284,18 +290,19 @@ Usage:
              Ask EVERY machine on the installation — other people's included — to
              move to <ref>, and print what became of each. An INSTALLATION
              ADMINISTRATOR's command; anybody else is refused outright rather than
-             shown their own machines. It only ever ASKS: a machine acts solely if
-             its own host sets SWARM_WORKER_SELF_UPDATE=true, and a machine whose
-             owner has not drained it is reported 'in-pool' and left alone, because
-             draining stays the owner's own call. So its owner can refuse it, or
-             stop it later, without asking you. A machine enrolled in no project is
-             reported 'no-project' and left alone too: an update is recorded as a run
-             in the machine's own project, and there is none to record it in. Each
-             line carries the machine, its
-             owner, the disposition (requested | queued-offline | in-pool |
-             no-project | already-asked | answered) and 'owner opted out' for a machine that
-             last reported 'declined'. Every request records who made it, so
-             'swarm workers update <worker-id> <ref>' is what an owner runs for
+             shown their own machines. It only ever ASKS, and asks for something
+             bounded: a machine whose owner has not drained it is reported
+             'in-pool' and left alone, because draining stays the owner's own
+             call, and a machine can only be moved to a build already on the
+             branch its install root tracks, fetched from that checkout's own
+             remote. So its owner can refuse it, or stop it later, without
+             asking you. A machine enrolled in no project is reported
+             'no-project' and left alone too: an update is recorded as a run in
+             the machine's own project, and there is none to record it in. Each
+             line carries the machine, its owner and the disposition (requested
+             | queued-offline | in-pool | no-project | already-asked |
+             answered). Every request records who made it, so 'swarm workers
+             update <worker-id> <ref>' is what an owner runs for
              their own machine and this is what an administrator runs for the fleet.
   sweep-worktrees
              Ask a machine to remove its own task-<id> checkouts that nothing has
@@ -552,8 +559,7 @@ const FleetWorktreeSweepsSchema = z.object({
  * `disposition` is read as a plain string on this file's own rule: it is printed
  * rather than acted on, so a word a newer control plane reports and this build has
  * never heard of must not make the command fail. `owner` is nullable for the same
- * tolerance the roster reads it with, and `optedOut` is the server's own derivation
- * from the machine's last report — not re-derived here, so the two cannot drift.
+ * tolerance the roster reads it with.
  */
 const InstallationUpdateRequestSchema = z.object({
 	target: z.string().min(1),
@@ -563,7 +569,6 @@ const InstallationUpdateRequestSchema = z.object({
 			workerId: z.string().min(1),
 			displayName: z.string().min(1),
 			disposition: z.string().min(1),
-			optedOut: z.boolean(),
 			owner: z.object({ identifier: z.string().min(1) }).nullable(),
 		}),
 	),
@@ -1189,9 +1194,7 @@ async function updateWorkerCommand(argv: string[]): Promise<number> {
 	out.info(
 		`asked worker '${requested.displayName}' (${workerId}) to move to '${requested.target}' and restart`,
 	);
-	out.info(
-		'  it applies this once it holds no in-flight phase, and only if its host sets SWARM_WORKER_SELF_UPDATE=true',
-	);
+	out.info('  it applies this once it holds no in-flight phase');
 	out.info(
 		`  run 'swarm workers list' to read what it reported, then 'swarm workers undrain ${workerId}' to put it back in the pool`,
 	);
@@ -1431,13 +1434,12 @@ async function rolloutCommand(
  * shapes — this reports a disposition per machine, where `--all` reports a staged
  * rollout's members — so they would have shared no output either.
  *
- * **A request, and only a request**, which is what the printed lines say out loud:
- * a machine acts solely if its own host opted in, and one its owner has not drained
- * comes back `in-pool` untouched. Both of those are the *owner's* switches and neither
- * needs the administrator, so the machines that did not move are as much of the answer
- * as the ones that did — which is why every machine gets a line and why the exit code
- * is 0 whatever the dispositions say, exactly as `update --all` is a report rather
- * than a pass/fail.
+ * **A request, and only a request**, which is what the printed lines say out loud: a
+ * machine its owner has not drained comes back `in-pool` untouched. The drain is the
+ * *owner's* switch and does not need the administrator, so the machines that did not
+ * move are as much of the answer as the ones that did — which is why every machine
+ * gets a line and why the exit code is 0 whatever the dispositions say, exactly as
+ * `update --all` is a report rather than a pass/fail.
  *
  * The refusal for a non-administrator is the control plane's own words, printed
  * verbatim like every other refusal in this file.
@@ -1486,14 +1488,12 @@ function printInstallationUpdateRequest(result: InstallationUpdateRequest): void
 	);
 	for (const worker of result.workers) {
 		const owner = worker.owner?.identifier ?? 'owner unknown';
-		const optedOut = worker.optedOut ? '\towner opted out' : '';
-		out.info(
-			`${worker.workerId}\t${worker.displayName}\t${owner}\t${worker.disposition}${optedOut}`,
-		);
+		out.info(`${worker.workerId}\t${worker.displayName}\t${owner}\t${worker.disposition}`);
 	}
-	// The two things an administrator cannot do anything about on their own, named
-	// rather than left to be inferred from a disposition — they are the machine
-	// owner's two switches, and the whole reason this command is allowed to be
+	// The one thing an administrator cannot do anything about on their own, named
+	// rather than left to be inferred from a disposition — the drain is the machine
+	// owner's own switch, and since issue #975 removed the per-host opt-in it is the
+	// only one, which is the whole reason this command is allowed to be
 	// installation-wide.
 	const inPool = result.workers.filter((worker) => worker.disposition === 'in-pool');
 	if (inPool.length > 0) {
@@ -1501,19 +1501,13 @@ function printInstallationUpdateRequest(result: InstallationUpdateRequest): void
 			`  ${inPool.length} still in the dispatch pool and so not asked — draining is the machine owner's own call, so ask ${ownersOf(inPool)} to run 'swarm workers drain <worker-id>', then run this again`,
 		);
 	}
-	// The third thing an administrator cannot fix from here (issue #971): an update is
+	// The second thing an administrator cannot fix from here (issue #971): an update is
 	// recorded as a run in the machine's own project, so a machine enrolled in none has
 	// nowhere for that run to live and was not asked.
 	const noProject = result.workers.filter((worker) => worker.disposition === 'no-project');
 	if (noProject.length > 0) {
 		out.info(
 			`  ${noProject.length} enrolled in no project and so not asked — an update is recorded as a run in the machine's own project, so enroll it first ('swarm workers enroll <worker-id> <project-id>'), then run this again`,
-		);
-	}
-	const optedOut = result.workers.filter((worker) => worker.optedOut);
-	if (optedOut.length > 0) {
-		out.info(
-			`  ${optedOut.length} last reported 'declined' — ${ownersOf(optedOut)} have not set SWARM_WORKER_SELF_UPDATE=true on those hosts, and that is theirs to decide`,
 		);
 	}
 	out.info(
@@ -1581,14 +1575,6 @@ function printRollout(rollout: Rollout, action?: string): void {
 	if (rollout.status === 'completed') {
 		out.info(`  every machine is on '${rollout.target}' and back in the dispatch pool`);
 		return;
-	}
-	// The one thing an operator cannot see from the table: a machine only acts if its
-	// own host opted in, and a machine that has not reports `declined` — which halts
-	// the rollout, so it is worth naming before that happens rather than after.
-	if (rollout.members.some((member) => member.state === 'signalled')) {
-		out.info(
-			'  each machine asked applies this once it holds no in-flight phase, and only if its host sets SWARM_WORKER_SELF_UPDATE=true',
-		);
 	}
 	// It advances itself (issue #941), so the line under the table says what will
 	// happen rather than what to type — the commands are how you *watch* it now.

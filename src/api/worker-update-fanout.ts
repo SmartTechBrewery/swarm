@@ -71,7 +71,6 @@ import { publishDispatchWakeUp } from '../dispatch/dispatcher.js';
 import type { Worker, WorkerUpdateState } from '../identity/worker.js';
 import { requestWorkerUpdate } from '../identity/worker-service.js';
 import { getLiveSessionForWorker } from '../identity/worker-session-service.js';
-import type { WorkerUpdateStatus } from '../lib/build-identity.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 
@@ -136,23 +135,6 @@ export interface WorkerUpdateFanoutEntry {
 	displayName: string;
 	disposition: WorkerUpdateFanoutDisposition;
 	/**
-	 * The outcome this machine had last reported **before** this fan-out (issue
-	 * #922), or `null` when it had never answered one.
-	 *
-	 * It exists because asking a machine *destroys* the previous answer: a recorded
-	 * request resets `update_status` to NULL, so {@link WorkerUpdateFanoutEntry.update}
-	 * below carries no outcome for any machine that was just asked. The one an
-	 * operator most needs to keep is `declined` — the machine's own statement that its
-	 * host has not set `SWARM_WORKER_SELF_UPDATE`, which is the only place an opt-out
-	 * is visible from the control plane at all — so a report that dropped it would
-	 * leave an installation administrator unable to say which owners have opted out.
-	 *
-	 * It is a *report* annotation and deliberately not a disposition: a machine that
-	 * declined is still asked again, because its owner may have opted in since, and
-	 * the answer to that arrives later on the machine's own route.
-	 */
-	lastReportedStatus: WorkerUpdateStatus | null;
-	/**
 	 * The row's update state **after** the fan-out — the target, and the outcome
 	 * when one is recorded. `null` for a machine nobody has ever asked, which is what
 	 * a never-drained `in-pool` row says; an `in-pool` machine that was asked on some
@@ -181,17 +163,12 @@ export async function fanOutWorkerUpdate(
 ): Promise<WorkerUpdateFanoutEntry[]> {
 	const entries: WorkerUpdateFanoutEntry[] = [];
 	for (const worker of workers) {
-		// Read off the caller's snapshot, before the write below can reset it (issue
-		// #922) — see the field's own comment for why the pre-request answer is the one
-		// an operator needs kept.
-		const lastReportedStatus = worker.update?.status ?? null;
 		const skipped = dispositionWithoutAsking(worker, target);
 		if (skipped) {
 			entries.push({
 				workerId: worker.id,
 				displayName: worker.displayName,
 				disposition: skipped,
-				lastReportedStatus,
 				update: worker.update,
 			});
 			continue;
@@ -220,7 +197,6 @@ export async function fanOutWorkerUpdate(
 				workerId: result.worker.id,
 				displayName: result.worker.displayName,
 				disposition: 'in-pool',
-				lastReportedStatus,
 				update: result.worker.update,
 			});
 			continue;
@@ -234,7 +210,6 @@ export async function fanOutWorkerUpdate(
 				workerId: result.worker.id,
 				displayName: result.worker.displayName,
 				disposition: 'no-project',
-				lastReportedStatus,
 				update: result.worker.update,
 			});
 			continue;
@@ -255,7 +230,6 @@ export async function fanOutWorkerUpdate(
 			workerId: updated.id,
 			displayName: updated.displayName,
 			disposition: live ? 'requested' : 'queued-offline',
-			lastReportedStatus,
 			update: updated.update,
 		});
 	}

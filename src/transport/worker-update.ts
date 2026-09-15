@@ -4,14 +4,8 @@
  *
  * The mechanism it drives is phase 1's (`../worker/self-update.ts`), which knows how
  * to move an install root and nothing about *when* that is safe. This module is the
- * "when", and it is three refusals and one wait:
+ * "when", and it is two refusals and one wait:
  *
- * - **The machine must have opted in.** `SWARM_WORKER_SELF_UPDATE=true` on the host,
- *   read from its own environment and never from the wire. A host whose install root
- *   is shared by several daemons may set it since issue #935: the apply takes a
- *   machine-local lock on that root and refuses outright while a peer daemon is
- *   mid-phase (`../worktree/install-lock.ts`), so the flag is now only the operator
- *   saying this machine may replace its own code (`docs/onboarding-worker.md`).
  * - **The target is re-validated here**, against the same grammar the frame already
  *   enforced. Not redundancy for its own sake: this value is about to be handed to
  *   `git` on an unattended machine, so it is checked at every seam it crosses rather
@@ -31,6 +25,31 @@
  *   nobody asked for would instead leave an operator reading "refused" for a machine
  *   that simply restarted.
  *
+ * **What authorizes an update is the mechanism, not a per-host flag.** Until issue #975
+ * a machine also had to have opted in with `SWARM_WORKER_SELF_UPDATE=true`, read from
+ * its own environment and never from the wire; a host that had simply never been told
+ * about the variable declined every request and went on running whatever build it
+ * started with, silently. That cost more than the veto was worth, so the flag is gone —
+ * removed rather than defaulted on, because a setting that still exists is a setting
+ * that gets set — and a stale `SWARM_WORKER_SELF_UPDATE` left in a plist or a profile is
+ * now an environment variable nothing reads: ignored, not an error. What bounds an
+ * installation administrator's reach is where it always actually was:
+ *
+ * - the fetch is `git fetch <remote>` with **no URL and no refspec**, so the only code
+ *   that can ever arrive is what the install root's own already-configured remote
+ *   already says it fetches — nothing on the wire can redirect it;
+ * - the target must be **reachable from the branch the install tracks**
+ *   (`merge-base --is-ancestor`), so a machine can only be moved to code already on the
+ *   branch it follows, never onto a side branch somebody pushed;
+ * - a **dirty install root** is refused outright, so uncommitted work is never
+ *   overwritten;
+ * - the **drain** precondition is unchanged and remains strictly the machine owner's:
+ *   an update only ever reaches a machine already out of the dispatch pool (issue #919).
+ *
+ * The first three live in `../worker/self-update.ts` and the fourth in the control
+ * plane, so none of them is something this module — or a host environment — can waive.
+ * `docs/decisions/ADR-006-unconditional-worker-updates.md` carries the full argument.
+ *
  * **Every outcome is reported** — `POST /worker/delivery/update-report`, an HTTP
  * route rather than a stream frame for the reason the frame's own schema states
  * (`./protocol.ts`) — and two of them end the process. On `applied` — this daemon did
@@ -40,10 +59,12 @@
  * starts it again on the code that is now in the install root; the new build's identity
  * reaches the control plane on the next handshake through the existing `build` field
  * (issue #918), with no extra wiring. Both are successes, and they are distinguishable
- * precisely so an operator can tell which machine paid for the fetch. On `declined`,
- * `refused`, `failed` or `already-current` it reports and **keeps taking work** on the
- * build it has: nothing about the running process changed, because its modules were
- * loaded at startup.
+ * precisely so an operator can tell which machine paid for the fetch. On `refused`,
+ * `failed` or `already-current` it reports and **keeps taking work** on the build it
+ * has: nothing about the running process changed, because its modules were loaded at
+ * startup. (`declined` is a fifth status this module no longer produces — see
+ * `../lib/build-identity.ts`; a daemon on a pre-#975 build still reports it, so it
+ * stays on the wire.)
  *
  * The exit deliberately goes through the daemon's own graceful path rather than a
  * bare `process.exit`: the session is released so the control plane frees the lease
@@ -68,9 +89,6 @@ import {
 	type WorkerUpdate,
 } from './protocol.js';
 
-/** The host-level opt-in. Only the literal `true` enables it, like `SWARM_SINGLE_USER_MODE`. */
-export const SELF_UPDATE_ENV = 'SWARM_WORKER_SELF_UPDATE';
-
 /** The route this daemon reports to. */
 export const UPDATE_REPORT_PATH = '/worker/delivery/update-report';
 
@@ -81,16 +99,6 @@ export const UPDATE_REPORT_PATH = '/worker/delivery/update-report';
  * thing a longer one costs is a few seconds before a restart nobody is watching.
  */
 export const IDLE_POLL_INTERVAL_MS = 5_000;
-
-/**
- * Whether this machine opted in to self-update. Unset, empty, or any other value
- * keeps the coded default — the machine reports `declined` and keeps working — so
- * opting in is explicit and opting out needs no action, which is the safe direction
- * for a mechanism that rewrites the install root.
- */
-export function selfUpdateEnabled(raw = process.env[SELF_UPDATE_ENV]): boolean {
-	return raw === 'true';
-}
 
 /** The subset of the daemon's logger this module uses — injected in tests. */
 export interface UpdateLogger {
@@ -117,8 +125,6 @@ export interface WorkerUpdateHandlerOptions {
 	 * that go with it.
 	 */
 	shutdown: () => Promise<void>;
-	/** Whether this machine opted in; defaults to {@link selfUpdateEnabled}. */
-	enabled?: boolean;
 	/** Move the install root; defaults to phase 1's {@link applyUpdateTarget}. */
 	apply?: (target: string) => Promise<UpdateOutcome>;
 	/**
@@ -259,7 +265,7 @@ export function createWorkerUpdateHandler(
 }
 
 /**
- * One request, from the opt-in check to the report (and, on `applied`, the exit).
+ * One request, from the target check to the report (and, on `applied`, the exit).
  *
  * `owe` is how the outcome survives a report that did not land: it is called with the
  * report whenever the POST failed, so the handler above can re-send it on the next
@@ -275,23 +281,6 @@ async function runUpdate(
 	logger: UpdateLogger,
 	owe: (report: WorkerUpdateReport) => void,
 ): Promise<boolean> {
-	const enabled = options.enabled ?? selfUpdateEnabled();
-	if (!enabled) {
-		logger.info('declining a worker update — this machine has not opted in', {
-			requestId: update.requestId,
-			target: update.target,
-		});
-		await reportOrOwe(options, logger, update, owe, {
-			requestId: update.requestId,
-			target: update.target,
-			status: 'declined',
-			message:
-				`This machine has not opted in to self-update, so nothing was attempted. Set ` +
-				`${SELF_UPDATE_ENV}=true in the daemon's environment and restart it.`,
-		});
-		return false;
-	}
-
 	const parsedTarget = WorkerUpdateTargetSchema.safeParse(update.target);
 	if (!parsedTarget.success) {
 		await reportOrOwe(options, logger, update, owe, {

@@ -2,8 +2,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { WorkerUpdate } from '@/transport/protocol.js';
 import {
 	createWorkerUpdateHandler,
-	SELF_UPDATE_ENV,
-	selfUpdateEnabled,
 	type WorkerUpdateHandlerOptions,
 	type WorkerUpdateReport,
 } from '@/transport/worker-update.js';
@@ -17,8 +15,8 @@ import type { UpdateOutcome } from '@/worker/self-update.js';
  * mechanism (`applyUpdateTarget`) and the real POST replaced, because both are
  * already covered where they live — phase 1's own suite for the install root, the
  * delivery-client suite for the wire. What is under test here is the decision
- * layer between them, which is the whole of this module: the opt-in, the wait, the
- * exit, and the promise that *every* outcome is reported.
+ * layer between them, which is the whole of this module: the target check, the
+ * wait, the exit, and the promise that *every* outcome is reported.
  */
 
 const REQUEST_ID = '66666666-6666-4666-8666-666666666666';
@@ -73,9 +71,6 @@ function harness(overrides: Partial<WorkerUpdateHandlerOptions> = {}): Harness {
 		workerCredential: 'worker-credential',
 		inFlight,
 		shutdownSignal: shutdownSignal.signal,
-		// Opted in unless a case says otherwise, so the default harness exercises the
-		// path that actually does something.
-		enabled: true,
 		idlePollIntervalMs: 10,
 		logger,
 		...overrides,
@@ -106,81 +101,30 @@ beforeEach(() => {
 	vi.useRealTimers();
 });
 
-describe('selfUpdateEnabled', () => {
-	// The `undefined` case exercises the default argument, which reads the *real*
-	// environment — and the machine running this suite may well be one an operator
-	// opted in with `swarm-worker-agent install --self-update`, which exports this
-	// very variable into the daemon's environment. Stub it absent so the case asserts
-	// the default rather than the host.
-	beforeEach(() => {
-		vi.stubEnv(SELF_UPDATE_ENV, undefined);
-	});
-
+describe('createWorkerUpdateHandler — the removed host opt-in', () => {
 	afterEach(() => {
 		vi.unstubAllEnvs();
 	});
 
-	// Only the literal `true`, like `SWARM_SINGLE_USER_MODE`: opting a machine's
-	// install root into being rewritten must be an explicit act.
-	it.each([
-		[undefined, false],
-		['', false],
-		['false', false],
-		['1', false],
-		['TRUE', false],
-		['yes', false],
-		['true', true],
-	])('reads %s as %s', (raw, expected) => {
-		expect(selfUpdateEnabled(raw)).toBe(expected);
-	});
-
-	it('names the env var it reads', () => {
-		expect(SELF_UPDATE_ENV).toBe('SWARM_WORKER_SELF_UPDATE');
-	});
-});
-
-describe('createWorkerUpdateHandler — the opt-in', () => {
-	it('declines and never touches the install root when the machine has not opted in', async () => {
-		const h = harness({ enabled: false });
+	// The back-compat half of issue #975: the flag that used to gate this is gone, and
+	// a stale `SWARM_WORKER_SELF_UPDATE=false` left behind in a launchd plist or a shell
+	// profile on a machine that once opted out is now simply an environment variable
+	// nothing reads. Asserted rather than left to the absence of a branch, because
+	// "ignored, not an error" is the acceptance criterion an operator upgrading a
+	// previously-opted-out machine depends on.
+	it('applies anyway with a stale SWARM_WORKER_SELF_UPDATE=false in the environment', async () => {
+		vi.stubEnv('SWARM_WORKER_SELF_UPDATE', 'false');
+		const h = harness();
 
 		h.handle(UPDATE);
 		await settle();
 
-		expect(h.apply).not.toHaveBeenCalled();
-		expect(h.exit).not.toHaveBeenCalled();
+		expect(h.apply).toHaveBeenCalledWith('main');
 		expect(h.reported()).toMatchObject({
 			requestId: REQUEST_ID,
 			target: 'main',
-			status: 'declined',
+			status: 'applied',
 		});
-	});
-
-	// A declined machine is left working, so the operator has to be told *why* —
-	// otherwise the only symptom is a build that never moves.
-	it('names the flag to set in the declined report', async () => {
-		const h = harness({ enabled: false });
-
-		h.handle(UPDATE);
-		await settle();
-
-		expect(h.reported()?.message).toContain('SWARM_WORKER_SELF_UPDATE=true');
-	});
-
-	it('falls back to the process environment when the caller states nothing', async () => {
-		const previous = process.env[SELF_UPDATE_ENV];
-		process.env[SELF_UPDATE_ENV] = 'false';
-		try {
-			const h = harness({ enabled: undefined });
-
-			h.handle(UPDATE);
-			await settle();
-
-			expect(h.apply).not.toHaveBeenCalled();
-			expect(h.reported()?.status).toBe('declined');
-		} finally {
-			if (previous === undefined) delete process.env[SELF_UPDATE_ENV];
-			else process.env[SELF_UPDATE_ENV] = previous;
-		}
 	});
 });
 

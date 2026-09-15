@@ -92,13 +92,16 @@ export function isSettledMemberState(state: WorkerUpdateRolloutMemberState): boo
 
 /**
  * The reported outcomes that halt a rollout. `failed` and `refused` are the machine
- * saying the move did not happen; `declined` is it saying the host never opted in
- * (`SWARM_WORKER_SELF_UPDATE`).
+ * saying the move did not happen; `declined` is the legacy answer from a machine
+ * still on a build predating issue #975, whose host had not set the per-host opt-in
+ * that issue removed (`../lib/build-identity.ts`).
  *
  * `declined` halts for the same reason the other two do, even though it says nothing
- * about the *build*: a fleet whose next machine has not opted in is a fleet the
+ * about the *build*: a fleet whose next machine cannot be moved is a fleet the
  * rollout cannot finish, and carrying on would drain machine after machine only to
- * be declined by each in turn. Halting says so once, on the first one.
+ * be declined by each in turn. Halting says so once, on the first one. The remedy is
+ * now to update that machine by hand once — after which it is on a build with no
+ * opt-in to decline from, and never declines again.
  *
  * `applied`, `adopted` and `already-current` are the three that do not halt — the
  * first two move the member to `verifying`, the third settles it on the spot.

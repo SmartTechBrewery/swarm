@@ -2143,7 +2143,6 @@ describe('workers.requestUpdateForInstallation (installation-wide request, issue
 			workerId: WORKER_ID,
 			displayName: 'ada-laptop',
 			disposition: 'requested',
-			lastReportedStatus: null,
 			update: null,
 			...overrides,
 		};
@@ -2175,7 +2174,7 @@ describe('workers.requestUpdateForInstallation (installation-wide request, issue
 	});
 
 	// Every machine is labelled with the person who would have to act on it — the drain
-	// an administrator cannot run, or the opt-in they cannot set.
+	// an administrator cannot run.
 	it('names each machine’s owner', async () => {
 		listAllWorkers.mockResolvedValue(twoOwners());
 		fanOutWorkerUpdate.mockResolvedValue([
@@ -2192,29 +2191,9 @@ describe('workers.requestUpdateForInstallation (installation-wide request, issue
 		expect(result.requestedBy).toBe(ADMIN_USER.identifier);
 	});
 
-	// The acceptance criterion the fan-out's `lastReportedStatus` exists for: an
-	// administrator has to be able to see which owners have opted out, and `declined`
-	// is the only evidence of that the control plane ever gets.
-	it('marks a machine whose owner has opted out', async () => {
-		listAllWorkers.mockResolvedValue([makeWorker({ drainingSince: DRAINED_AT })]);
-		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry({ lastReportedStatus: 'declined' })]);
-
-		const result = await admin.requestUpdateForInstallation({ target: 'main' });
-
-		expect(result.workers[0]).toMatchObject({ optedOut: true });
-	});
-
-	it('does not call any other outcome an opt-out', async () => {
-		listAllWorkers.mockResolvedValue([makeWorker({ drainingSince: DRAINED_AT })]);
-		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry({ lastReportedStatus: 'failed' })]);
-
-		const result = await admin.requestUpdateForInstallation({ target: 'main' });
-
-		expect(result.workers[0]).toMatchObject({ optedOut: false });
-	});
-
 	// The other half of the authorization decision: asking is an administrator's, but
-	// draining is still the owner's, so a machine in the pool comes back untouched.
+	// draining is still the owner's — and since issue #975 removed the per-host opt-in,
+	// the only switch left to them — so a machine in the pool comes back untouched.
 	it('reports a machine its owner has not drained rather than moving it', async () => {
 		listAllWorkers.mockResolvedValue([makeWorker()]);
 		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry({ disposition: 'in-pool' })]);

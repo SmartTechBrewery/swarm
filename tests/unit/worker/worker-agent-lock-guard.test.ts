@@ -161,7 +161,7 @@ describe('swarm-worker-agent duplicate-worker guard', () => {
 
 	it("reinstalls over this checkout's own running agent", () => {
 		// `install` boots that job out before bootstrapping the new one, so its daemon is
-		// never the second worker — this is how `install --self-update` on a live agent works.
+		// never the second worker — this is how reinstalling over a live agent works.
 		const result = runGuard({
 			owner: owner(minutesAgo(2)),
 			psCommand: WORKER_COMMAND,
@@ -169,6 +169,14 @@ describe('swarm-worker-agent duplicate-worker guard', () => {
 		});
 
 		expect(result.status).toBe(0);
+	});
+
+	// Issue #975 removed the per-host self-update opt-in, and with it the two installer
+	// flags whose only job was to write the variable into the plist. Asserted against
+	// the script text — the precedent the TTL case below sets — so a reinstall can never
+	// put the key back on a machine whose daemon no longer reads it.
+	it('writes no SWARM_WORKER_SELF_UPDATE into the plist it generates', () => {
+		expect(readFileSync(SCRIPT, 'utf8')).not.toContain('SWARM_WORKER_SELF_UPDATE');
 	});
 
 	it('states the same TTL the daemon reclaims on', () => {

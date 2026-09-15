@@ -80,12 +80,11 @@ export interface WorktreeSweepFanoutEntry {
 	/**
 	 * The row's sweep state after the fan-out — the outstanding request, and the last
 	 * outcome the machine reported, whichever disposition it got. Asking does not
-	 * erase that outcome (`../db/repositories/workersRepository.ts`), which is why
-	 * this needs no `lastReportedStatus` twin of the kind `WorkerUpdateFanoutEntry`
-	 * carries: the update fan-out annotates the pre-request answer precisely because
-	 * its own write destroys it, and here the post-write state already holds it.
-	 * `null` only for a row nothing could be read back from, which the write below
-	 * makes unreachable for the two recording dispositions.
+	 * erase that outcome (`../db/repositories/workersRepository.ts`), so the
+	 * post-write state is the whole answer and nothing here has to annotate the
+	 * pre-request one separately — unlike the update fan-out, whose own write resets
+	 * `update_status` to NULL. `null` only for a row nothing could be read back from,
+	 * which the write below makes unreachable for the two recording dispositions.
 	 */
 	worktreeSweep: WorkerWorktreeSweepState | null;
 }

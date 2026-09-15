@@ -247,12 +247,14 @@ it does not (a PR-driven phase has no board card to take a title from). The Work
 table marks every drained machine in its **Status** column, beside — never instead
 of — Online/Offline, since a drained machine that is online is still online.
 
-**Updating one from the control plane.** A machine that has opted in
-(`SWARM_WORKER_SELF_UPDATE=true` — see
-[`docs/configuration.md`](./configuration.md) and
-[`docs/onboarding-worker.md`](./onboarding-worker.md)) can be asked to move its
-SWARM **install root** to a build and restart into it, instead of pulling by hand on
-every host (issue #933):
+**Updating one from the control plane.** A machine can be asked to move its SWARM
+**install root** to a build and restart into it, instead of pulling by hand on every
+host (issue #933) — and since issue #975 there is no per-host setting that can refuse.
+What bounds the request is the mechanism: the fetch takes no URL and no refspec, the
+target must be an ancestor of the branch the install root already tracks, a dirty
+install root is refused, and the drain below stays the machine owner's own control.
+See [`docs/onboarding-worker.md`](./onboarding-worker.md) and
+[`ADR-006`](./decisions/ADR-006-unconditional-worker-updates.md):
 
 ```bash
 swarm workers drain <worker-id>          # required first, for the reason above
@@ -367,15 +369,15 @@ swarm workers request-update main        # every machine on the installation
 ```
 
 This is the one worker *write* that spans owners, and it is allowed to only because
-it asks and nothing more. Both switches that decide whether a machine actually moves
-stay with whoever owns it and need no cooperation from the administrator: the host
-opt-in (`SWARM_WORKER_SELF_UPDATE`, read from the machine's own environment — unset it
-and restart, and that machine declines every request), and the **drain**, which is
-still strictly the owner's and which this command never performs. So a machine its
-owner has not drained comes back `in-pool`, untouched, and one enrolled in no project
-comes back `no-project` for the reason above. Each line names the machine,
-its owner and its disposition, with `owner opted out` for one that last reported
-`declined`; the counts under the table name the owners to go and ask. A caller who is
+it asks and nothing more, and asks for something bounded. The switch that decides
+whether a machine is asked at all stays with whoever owns it and needs no cooperation
+from the administrator: the **drain**, still strictly the owner's and never performed
+by this command. So a machine its owner has not drained comes back `in-pool`,
+untouched, and one enrolled in no project comes back `no-project` for the reason
+above. What it can ask *for* is bounded by the mechanism stated above — an
+administrator can move a machine along the branch its install root already tracks and
+nowhere else. Each line names the machine, its owner and its disposition; the counts
+under the table name the owners to go and ask. A caller who is
 not an installation administrator is refused outright rather than shown their own
 machines. Every request records **who made it** on the machine's own row, and the API
 server logs the fleet action as one line — see
@@ -386,10 +388,10 @@ Nothing about the restart differs from the one above — the daemon waits until 
 holds no in-flight phase, applies the update, releases its session and exits 0, and
 the host's process supervisor (launchd `KeepAlive` / systemd `Restart=always`) starts
 it again on the new build. That supervisor is a prerequisite: without one the machine
-simply stops. The request is refused while the machine is still in the pool, and with
-the opt-in flag off the machine reports `declined` and carries on working. `list`
-shows the outcome — `applied`, `adopted`, `already-current`, `declined`, `refused`,
-`failed` — and anything but `applied` or `adopted` leaves the machine working on the
+simply stops. The request is refused while the machine is still in the pool. `list`
+shows the outcome — `applied`, `adopted`, `already-current`, `refused`, `failed`, plus
+the legacy `declined` from a machine still on a build predating issue #975 — and
+anything but `applied` or `adopted` leaves the machine working on the
 build it had, with the one exception `failed` carries: a step that failed *and* could
 not be rolled back leaves the install root on neither build, which the reported message
 says outright. Read that message before moving on — it names the step and, when the
@@ -456,7 +458,7 @@ answers that for the machine it is running on, and the sweep holds the task's ow
 lease across each removal so a dispatch arriving mid-sweep cannot land in the
 checkout being deleted.
 
-Unlike an update this needs **no drain and no host opt-in**: a sweep disturbs no
+Unlike an update this needs **no drain**: a sweep disturbs no
 in-flight run, and it removes only `task-<id>` checkouts under a project's own
 worktree root, so `abandonedAfterDays` is the whole of the opt-out. A machine that is
 offline when you ask keeps the request on its row and is handed it on its next

@@ -106,9 +106,10 @@ import { workerScmCredentialsRouter } from './workerScmCredentials.js';
  *   (`requestUpdateForInstallation`, issue #922): an administrator asks every
  *   machine on the installation to move to a build, including machines they do not
  *   own. It is an administrator's call on #647's terms — `FORBIDDEN` for anybody
- *   else, never narrowed to their own machines — because it only ever *asks*: the
- *   host opt-in (`SWARM_WORKER_SELF_UPDATE`) and the drain that makes a machine
- *   askable at all both stay the owner's, so nothing #800 reserved to them moves.
+ *   else, never narrowed to their own machines — because it only ever *asks*, and
+ *   asks for something bounded: the drain that makes a machine askable at all stays
+ *   the owner's, and the machine can only be moved to a build already on the branch
+ *   its install root tracks, so nothing #800 reserved to them moves.
  *   The procedure's own comment carries the full reasoning and
  *   `docs/onboarding-worker.md` states it for operators. **A second
  *   installation-wide read joins them** (`listSweeps`, issue #956): every machine's
@@ -1015,22 +1016,28 @@ export const workersRouter = router({
 	// is that each of #800's four *takes something of the owner's* and keeps it — a
 	// credential the administrator would then hold, the machine's existence, the
 	// owner's consent to share it, the constraints their machine runs under — whereas
-	// this takes nothing and decides nothing. Both of the switches that decide whether
-	// a machine actually moves stay the owner's, and neither needs the administrator's
-	// cooperation to work:
+	// this takes nothing and decides nothing. What it *can* ask for is bounded, and the
+	// one switch that decides whether a machine is asked at all stays the owner's:
 	//
-	// - **The host opt-in** (`SWARM_WORKER_SELF_UPDATE`, issues #920/#933) is read
-	//   from the machine's own environment and never from the wire. With it unset the
-	//   daemon reports `declined` and carries on working, and unsetting it and
-	//   restarting revokes it outright.
 	// - **Draining** is still strictly the owner's (issue #919) and is *not* widened
 	//   here. The fan-out asks only machines already out of the dispatch pool, so a
 	//   machine its owner has not drained is reported `in-pool` and left untouched.
 	//   An administrator therefore cannot take the installation's capacity down with
 	//   this, and cannot move a machine whose owner has not made it askable.
+	// - **The mechanism bounds the reach**, which is what makes one veto enough. The
+	//   daemon's fetch is `git fetch <remote>` with no URL and no refspec, and the
+	//   target must be an ancestor of the branch the install root already tracks
+	//   (`../../worker/self-update.ts`), so an administrator cannot point a machine at
+	//   another repository or at a side branch they pushed — only along the branch it
+	//   already follows. Moving it *backwards* along that branch is what remains, and
+	//   that is visible, bounded, and reversible.
 	//
-	// So the administrator may put the request; the owner keeps both vetoes. The rule
-	// is written down for operators in `docs/onboarding-worker.md` beside #800's.
+	// Issue #975 removed the per-host opt-in that used to sit beside the drain: it
+	// defaulted to off, so a host that had never been told about it declined every
+	// request and drifted silently, which cost more than the veto was worth. The
+	// argument above is the one it was standing in front of;
+	// `docs/decisions/ADR-006-unconditional-worker-updates.md` records the decision and
+	// `docs/onboarding-worker.md` states the rule for operators beside #800's.
 	//
 	// **A non-administrator is refused outright, never narrowed.** No fallback to the
 	// caller's own machines, and no per-worker filtering — an installation-wide action
@@ -1079,12 +1086,6 @@ export const workersRouter = router({
 					// unresolvable owner the same way, and a reader must print "unknown" for it
 					// rather than silently attribute the machine to nobody in particular.
 					owner: ownerUserId === undefined ? null : (owners.get(ownerUserId) ?? null),
-					// The machine's own last word on its host opt-in (issue #933): `declined` is
-					// reported by nothing else, so it is the only signal the control plane has
-					// that this owner has opted out. Derived rather than stored, because it is
-					// only ever true of a machine that has *answered* — a machine nobody has
-					// asked yet has not opted out, it is simply unknown.
-					optedOut: entry.lastReportedStatus === 'declined',
 					update: serializeWorkerUpdate(entry.update),
 				};
 			});
@@ -1100,7 +1101,6 @@ export const workersRouter = router({
 					workerId: entry.workerId,
 					owner: entry.owner?.identifier ?? null,
 					disposition: entry.disposition,
-					optedOut: entry.optedOut,
 				})),
 			});
 			return { target: input.target, requestedBy: ctx.user.identifier, workers: reported };

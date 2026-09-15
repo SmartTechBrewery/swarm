@@ -391,23 +391,14 @@ describe('fanOutWorkerUpdate (issue #921)', () => {
 		]);
 	});
 
-	// Issue #922 — a recorded request resets `update_status`, so the pre-request answer
-	// has to travel on the entry or it is gone. `declined` is the one that matters:
-	// it is the only evidence the control plane has that a host has not opted in.
-	it('carries the outcome a machine had reported before it was re-asked', async () => {
+	// A recorded request resets `update_status`, so the state the entry carries is the
+	// *new* request with no outcome beside it — never the answer the machine gave to
+	// an earlier one.
+	it('carries the new request, not the outcome a machine had reported before', async () => {
 		const entries = await fanOutWorkerUpdate([reported('v2', 'declined')], 'main', REQUESTER_ID);
 
-		expect(entries[0]).toMatchObject({ disposition: 'requested', lastReportedStatus: 'declined' });
-		// And the state it now carries is the *new* request, with no outcome beside it.
+		expect(entries[0]).toMatchObject({ disposition: 'requested' });
 		expect(entries[0]?.update).toMatchObject({ target: 'main', status: null });
-	});
-
-	// A machine that was never asked has not opted out — it is simply unknown, and the
-	// annotation must not invent an answer for it.
-	it('reports no prior outcome for a machine nobody has asked', async () => {
-		const entries = await fanOutWorkerUpdate([makeWorker()], 'main', REQUESTER_ID);
-
-		expect(entries[0]?.lastReportedStatus).toBeNull();
 	});
 
 	it('answers an empty fleet with an empty report', async () => {

@@ -148,6 +148,7 @@ The interesting parts are written down as ADRs rather than left in the code:
 
 - [ADR-002](./docs/decisions/ADR-002-durable-dispatch-state-machine.md) — one durable dispatch state machine for orchestration *(accepted)*
 - [ADR-003](./docs/decisions/ADR-003-worker-transport-and-split-delivery.md) / [ADR-004](./docs/decisions/ADR-004-worker-transport-and-split-delivery.md) — worker↔control-plane transport and split delivery: why the worker gets a WebSocket and an assignment instead of a database URL *(accepted)*
+- [ADR-006](./docs/decisions/ADR-006-unconditional-worker-updates.md) — a worker updates when the installation asks it to: why the per-host self-update opt-in was removed *(accepted)*
 - [ADR-001](./docs/decisions/ADR-001-federated-workers-and-project-access.md) — federated workers and project access *(proposed)*
 - [ADR-005](./docs/decisions/ADR-005-dashboard-chat-with-worker-agent-clis.md) — dashboard chat with a worker's agent CLIs *(under discussion)*
 
