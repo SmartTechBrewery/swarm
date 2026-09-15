@@ -1352,8 +1352,9 @@ describe('RecoverRunButton (issue #593)', () => {
 		expect(screen.getByLabelText('Agent CLI')).toBeDefined();
 		expect(screen.getByLabelText('Model')).toBeDefined();
 		expect(screen.getByLabelText('Reasoning')).toBeDefined();
-		// The override submit never collides with the plain retry choice beside it.
-		expect(screen.getByRole('button', { name: /retry with these settings/i })).toBeDefined();
+		// One retry button, not two (issue #989): the fields drive the action above
+		// them, so there is no second submit an operator can miss.
+		expect(screen.queryByRole('button', { name: /retry with these settings/i })).toBeNull();
 	});
 
 	it.each([
@@ -1397,6 +1398,77 @@ describe('RecoverRunButton (issue #593)', () => {
 			);
 		});
 		expect(resetMutate).not.toHaveBeenCalled();
+	});
+
+	// The reported defect (issue #989), confirmed on run 9865ce7a-…: the popup's one
+	// prominent button called `onRetry({})` regardless of the fields below it, so an
+	// operator who lowered the model re-ran the phase on the model that had just
+	// failed — the rebuilt dispatch payload carried no `modelOverride` at all.
+	it('carries a model-only edit on the popup’s own retry button, within the same CLI', async () => {
+		retryMutate.mockResolvedValue({ runId: 'run-1', status: 'retrying' });
+		openRecover(failedRun({ engine: 'antigravity', model: 'gemini-3.8-flash', reasoning: 'high' }));
+
+		// Untouched, the button is still the plain retry the run's status names.
+		expect(screen.getByRole('button', { name: /^retry now$/i })).toBeDefined();
+
+		fireEvent.change(screen.getByLabelText('Model'), { target: { value: 'gemini-3.7-flash' } });
+
+		// …and says so before it is clicked, rather than silently dropping the edit.
+		expect(screen.queryByRole('button', { name: /^retry now$/i })).toBeNull();
+		fireEvent.click(screen.getByRole('button', { name: /retry with these settings/i }));
+
+		await waitFor(() => {
+			expect(retryMutate).toHaveBeenCalledWith({
+				runId: 'run-1',
+				cli: 'antigravity',
+				model: 'gemini-3.7-flash',
+				reasoning: 'high',
+			});
+		});
+	});
+
+	// The other half of the same rule: an untouched selection must still submit
+	// nothing, or every plain recovery would become an override — which the server
+	// reads as "start fresh", abandoning the resume this button promises.
+	it('submits no overrides when a resumable run’s fields are left untouched', async () => {
+		retryMutate.mockResolvedValue({ runId: 'run-1', status: 'retrying' });
+		openRecover(
+			failedRun({
+				recovery: { state: 'preserved' },
+				engine: 'antigravity',
+				model: 'gemini-3.8-flash',
+				reasoning: 'high',
+			}),
+		);
+
+		fireEvent.click(screen.getByRole('button', { name: /^resume$/i }));
+
+		await waitFor(() => {
+			expect(retryMutate).toHaveBeenCalledWith({
+				runId: 'run-1',
+				cli: undefined,
+				model: undefined,
+				reasoning: undefined,
+			});
+		});
+	});
+
+	// An override turns a resume into a fresh start server-side, so the button must
+	// stop reading as "Resume" the moment the fields say one is coming.
+	it('stops offering a resume once the fields are edited', () => {
+		openRecover(
+			failedRun({
+				recovery: { state: 'preserved' },
+				engine: 'antigravity',
+				model: 'gemini-3.8-flash',
+				reasoning: 'high',
+			}),
+		);
+
+		fireEvent.change(screen.getByLabelText('Model'), { target: { value: 'gemini-3.7-flash' } });
+
+		expect(screen.queryByRole('button', { name: /^resume$/i })).toBeNull();
+		expect(screen.getByRole('button', { name: /retry with these settings/i })).toBeDefined();
 	});
 
 	it('routes the reset choice through its own confirmation before submitting', async () => {

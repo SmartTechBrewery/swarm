@@ -147,6 +147,20 @@ Interact with the board via `gh` (`gh issue create/list/view`, `gh project item-
 
 ## 6. Workflow expectations
 
+### Implementation is the pipeline's job, not this session's
+
+> **Scope: interactive/human-driven sessions only**, exactly as §3 — an agent working *on* SWARM as a stand-in for `jkwiecien`. A pipeline agent the worker spawned inside `.swarm-workspaces/` was dispatched *to* implement; none of this applies to it.
+
+**Do not implement a change in this checkout on your own initiative.** When you identify work — a bug you diagnosed, a follow-up, an improvement — write it up as a GitHub issue (§5: `swarm` label, on the live board in Backlog) and **stop there**. The `swarm` label is the hand-off, not a filing convention: it is the automation opt-in SWARM checks before starting any phase, so a labelled issue on the board *is* a task the pipeline will plan, implement, review and merge by itself. An agent that files the issue **and** writes the code has queued the same work twice — once here, once for a Planning dispatch that will redo it from scratch in its own worktree, against a base that knows nothing about the first copy.
+
+**The exception is an operator who asks for the change in this session** — "fix it", "make that change", "open the PR". That is a deliberate opt-out of the pipeline, and it carries its own rules:
+
+- **No issue, and no `swarm` label.** The work is not going to the pipeline, so it needs no board card, and labelling one would dispatch the pipeline at the work you are doing by hand. File an issue only if the operator asks for one; leave the label off when you do, and take it off if you filed one before being asked to implement.
+- **Never commit to `main`.** Cut a branch, commit there, open a pull request, and merge that — the same shape the pipeline produces, and the one the operator reviews. `main` is the developer's own long-lived branch (below) and the base every worktree is cut from.
+- **The verification bar is unchanged.** Lint, typecheck and the relevant tests still gate "done"; a hand-driven change skips the pipeline, not `ai/TESTING.md`.
+
+**When it is unclear which of the two you were asked for, file the issue** — that is the reversible one. A question ("why did X fail?", "is this a bug?") is an investigation, not an instruction to implement: answer it, name the fix, and offer to make it.
+
 - **Fetch and fast-forward local `main` to `origin/main` before grepping/reading the project to answer a question or verify a plan.** SWARM's own worktree provisioning never trusts a local branch for this reason — `src/worker/git-worktree-manager.ts`'s `provision()` runs `git fetch origin` and then cuts from `origin/<baseBranch>` specifically because "fetching and then cutting from the local ref leaves the fetch with no effect." An interactive session reading files straight off disk has the identical problem without that safety net: this repo's own pipeline merges to `origin/main` continuously (Planning → Implementation → Review → merge can complete in minutes), so a local checkout that hasn't pulled recently silently answers questions — "does X exist," "what does this plan need to build," "is this issue's dependency done" — against a stale snapshot, with no error to signal it. Confirmed live: mid-session, local `main` was 12 commits behind `origin/main` (missing four merged issues' worth of shipped code) with no symptom other than `git status` saying "behind." `git pull --ff-only origin main` (never `--rebase`/`--force` here — this is the developer's own long-lived branch) before any investigation that reads current-state files is cheap insurance against reporting on code that no longer reflects reality.
 - Verify before claiming done — run the relevant lints/type-checks/tests; if something couldn't be run, say so plainly.
 - Small, reviewable changes over sweeping rewrites.

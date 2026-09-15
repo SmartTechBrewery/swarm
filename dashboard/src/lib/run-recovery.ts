@@ -91,11 +91,65 @@ export function recoverButtonLabel(
 }
 
 /**
- * The override form's submit label inside the Recover popup. Deliberately *not*
- * `retryOverrideActionLabel`'s "Retry Now": in this popup that would sit beside
- * the plain "Retry now" choice as two buttons differing only by capitalization —
- * ambiguous for an operator, and indistinguishable by accessible name.
+ * The label the Recover popup's retry choice carries once the operator has edited
+ * the override fields. Deliberately *not* `retryOverrideActionLabel`'s "Retry Now":
+ * that would differ from the untouched label only by capitalization — ambiguous for
+ * an operator, and indistinguishable by accessible name.
  */
 export function recoveryOverrideSubmitLabel(kind: RetryActionKind): string {
 	return kind === 'continue' ? 'Continue with these settings' : 'Retry with these settings';
+}
+
+/**
+ * The agent selection the Recover popup's override fields hold — the run's own
+ * engine/model/reasoning as the fields seed them, or the operator's edit of it.
+ * `reasoning` is `''` when the model exposes no choice or the operator left it on
+ * the CLI's default, which is how the selects represent "send nothing".
+ */
+export interface OverrideSelection {
+	cli: string;
+	model: string;
+	reasoning: string;
+}
+
+/**
+ * Whether the operator actually moved the override fields off the run's own
+ * settings.
+ *
+ * This is what decides whether the popup's retry submits overrides at all, and it
+ * has to stay a *comparison* rather than "the fields have a value": they always
+ * do, because they seed from the run. Sending them unconditionally would turn
+ * every plain retry into an override — and an override is never a no-op
+ * server-side, since `runs.retryNow` reads one as "start fresh", abandoning the
+ * session resume or preserved-checkout adoption the plain choice exists to
+ * perform.
+ *
+ * The seed is the baseline rather than the run row's raw `engine`/`model`: a run
+ * whose stored model is not in the live catalogue seeds the first listed one, and
+ * an operator who did not touch that field asked for nothing.
+ */
+export function overrideSelectionChanged(
+	seeded: OverrideSelection,
+	selected: OverrideSelection,
+): boolean {
+	return (
+		seeded.cli !== selected.cli ||
+		seeded.model !== selected.model ||
+		seeded.reasoning !== selected.reasoning
+	);
+}
+
+/**
+ * The Recover popup's single retry label (issue #989). The popup used to carry two
+ * retry buttons — a prominent plain one above the override fields and a quiet
+ * "Retry with these settings" below them — so an operator who changed the Model
+ * select and then clicked the obvious button re-ran the phase on exactly the model
+ * it had just failed on, with nothing saying the selection had been dropped.
+ *
+ * There is one button now, and this is how it says which of the two it currently
+ * is: the run's own server semantics while the fields are untouched, and the
+ * override submit the moment one is edited.
+ */
+export function recoveryRetryChoiceLabel(kind: RetryActionKind, selectionChanged: boolean): string {
+	return selectionChanged ? recoveryOverrideSubmitLabel(kind) : retryButtonLabel(kind, false);
 }
