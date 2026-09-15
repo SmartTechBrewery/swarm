@@ -210,7 +210,6 @@ function RosterToolbar({
 }) {
 	const currentUser = useCurrentUser();
 	const canRequestFleetUpdate = !projectId && canViewInstanceWide(currentUser.data);
-	const canRequestProjectUpdate = Boolean(projectId) && canAdminister;
 
 	// One line: the search field grows into the space up to `max-w-sm`, the action is
 	// pushed to the right edge, and only a window too narrow for both drops the button
@@ -219,7 +218,9 @@ function RosterToolbar({
 		<div className="flex flex-wrap items-center justify-between gap-3">
 			<WorkersSearchBox value={search} onChange={onSearchChange} />
 			{canRequestFleetUpdate ? <UpdateWorkersButton scope="installation" /> : null}
-			{canRequestProjectUpdate ? <UpdateWorkersButton scope="project" /> : null}
+			{projectId && canAdminister ? (
+				<UpdateWorkersButton scope="project" projectId={projectId} />
+			) : null}
 		</div>
 	);
 }
@@ -257,6 +258,10 @@ function WorkersSearchBox({
 	);
 }
 
+/** The set each toolbar action names — the one phrase its title and its copy share. */
+const INSTALLATION_SET = 'every registered machine on this installation';
+const PROJECT_SET = 'every machine enrolled in this project';
+
 /**
  * The roster's update action: ask the machines this roster lists to move to the
  * build the control plane is running.
@@ -275,55 +280,114 @@ function WorkersSearchBox({
  * the copy names the whole set and the filter is left to do only what it looks
  * like it does.
  *
- * **The installation-wide one is wired** (issue #1009) and never fires on a single
- * click: it opens {@link WorkerUpdateDialog}, which names the build and the set
- * before anything is asked and then renders the per-machine report. What it asks
- * for is the control plane's **own commit**, read from `workers.controlPlaneBuild`
- * and never a ref the browser invents — the same decision the one-machine button
- * inherited from issue #998, and for the same reason: that commit is the comparand
- * a machine's `Outdated` mark is judged against, so a successful update clears it,
- * where `main` would land the machine on whatever was on it at apply time. A
- * control plane that cannot read its own build therefore has nothing to offer, so
- * the button is `disabled` and its title says so rather than falling back to a ref.
- * That read is on the roster's polling cadence, so the commit the action names is
- * the one the live control plane is running now and not the one it was running
- * when the page was opened.
+ * **Both are wired** — the installation-wide one by issue #1009, the project-scoped
+ * one by issue #1010 — and neither fires on a single click: each opens
+ * {@link WorkerUpdateDialog}, which names the build and its own set before anything
+ * is asked and then renders the per-machine report. What either asks for is the
+ * control plane's **own commit**, read from `workers.controlPlaneBuild` and never a
+ * ref the browser invents — the same decision the one-machine button inherited from
+ * issue #998, and for the same reason: that commit is the comparand a machine's
+ * `Outdated` mark is judged against, so a successful update clears it, where `main`
+ * would land the machine on whatever was on it at apply time. A control plane that
+ * cannot read its own build therefore has nothing to offer, so the button is
+ * `disabled` and its title says so rather than falling back to a ref. That read is
+ * on the roster's polling cadence, so the commit the action names is the one the
+ * live control plane is running now and not the one it was running when the page
+ * was opened.
  *
- * It calls `requestUpdateForInstallation` rather than `startFleetUpdate`: that one
- * is **owner-scoped** (`listWorkersForOwner`), so it cannot serve a button labelled
- * "Update all workers" on an installation-wide screen. The fan-out is safe to use
- * unstaged for the reason the procedure itself states — it asks only machines their
- * owners have already drained, so it cannot take the installation's capacity down.
- * A *staged* installation-wide rollout stays issue #922's open question and belongs
- * in its own issue rather than in a widened `startFleetUpdate`.
+ * The installation-wide one calls `requestUpdateForInstallation` rather than
+ * `startFleetUpdate`: that one is **owner-scoped** (`listWorkersForOwner`), so it
+ * cannot serve a button labelled "Update all workers" on an installation-wide
+ * screen. The fan-out is safe to use unstaged for the reason the procedure itself
+ * states — it asks only machines their owners have already drained, so it cannot
+ * take the installation's capacity down. A *staged* installation-wide rollout stays
+ * issue #922's open question and belongs in its own issue rather than in a widened
+ * `startFleetUpdate`.
  *
- * The client-side gate stays `canViewInstanceWide` at the call site — a decision
- * about what to *offer*, not a copy of a server precondition — and the `FORBIDDEN`
- * the server answers a non-administrator with is rendered verbatim in the dialog.
+ * The project-scoped one calls `requestUpdateForProject`, which is a third
+ * *selection* over that same fan-out rather than the installation-wide procedure
+ * with a project passed in: the two answer to different rules — `instanceAdmin`
+ * there, `projectAdmin` here — and one procedure whose scope depended on whether an
+ * argument was present would be one omitted field away from the wider act. Its own
+ * copy carries the one thing only it has to say: an update moves a machine's SWARM
+ * install root, so a machine this project shares with another is moved for both.
  *
- * The project-scoped one is still inert: it renders `disabled` with a title saying
- * so, rather than as a live-looking control that silently swallows a click.
+ * The client-side gates stay at the call site — `canViewInstanceWide` for the
+ * installation, the server-declared `canAdminister` capability for the project, each
+ * a decision about what to *offer* rather than a copy of a server precondition — and
+ * the refusal the server answers with is rendered verbatim in the dialog either way.
  *
- * The two are separate components rather than one body with a flag, so the inert
- * one settles no query of its own — a `scope` branch *inside* one component would
- * have to read the control plane's build for both.
+ * The two stay separate components rather than one body with a `scope` flag: the
+ * title, the confirmation copy, the modal heading and the procedure all differ, so a
+ * single body would branch at every one of them. What they share they share
+ * properly — one dialog, and one `controlPlaneBuild` query key, so the second reader
+ * costs no second request.
  */
-function UpdateWorkersButton({ scope }: { scope: 'installation' | 'project' }) {
-	return scope === 'installation' ? <UpdateAllWorkersButton /> : <UpdateProjectWorkersButton />;
+function UpdateWorkersButton(
+	props: { scope: 'installation' } | { scope: 'project'; projectId: string },
+) {
+	return props.scope === 'installation' ? (
+		<UpdateAllWorkersButton />
+	) : (
+		<UpdateProjectWorkersButton projectId={props.projectId} />
+	);
 }
 
-/** The project-scoped action, still placed rather than wired (phase 3 of issue #998). */
-function UpdateProjectWorkersButton() {
+/**
+ * The project-scoped action (issue #1010) — see {@link UpdateWorkersButton} for why
+ * it is its own component and why it calls its own procedure.
+ *
+ * The set is the project's *enrolled* machines, which the server resolves from the
+ * project's own configured order — never the rows the search box happens to be
+ * showing, which is why the copy names the whole set rather than a count.
+ */
+function UpdateProjectWorkersButton({ projectId }: { projectId: string }) {
+	const [confirming, setConfirming] = useState(false);
+	// The same query key the installation-wide action reads, so the two never disagree
+	// about the build and only one request is in flight for both.
+	const buildQuery = useQuery({
+		...trpc.workers.controlPlaneBuild.queryOptions(),
+		refetchInterval: WORKERS_REFETCH_MS,
+	});
+	const target = buildQuery.data?.build?.commit ?? null;
+
 	return (
-		<button
-			type="button"
-			disabled
-			title="Not wired up yet — this will ask every machine enrolled in this project to update to the control plane's build."
-			className={buttonClass('secondary')}
-		>
-			<RefreshCw className="h-4 w-4" aria-hidden="true" />
-			Update project workers
-		</button>
+		<>
+			<button
+				type="button"
+				onClick={() => setConfirming(true)}
+				disabled={!target}
+				title={updateActionTitle(PROJECT_SET, buildQuery.isPending, target)}
+				className={buttonClass('secondary')}
+			>
+				<RefreshCw className="h-4 w-4" aria-hidden="true" />
+				Update project workers
+			</button>
+			{target ? (
+				<WorkerUpdateDialog
+					open={confirming}
+					onClose={() => setConfirming(false)}
+					title="Update every worker enrolled in this project?"
+					confirmCopy={
+						<strong className="text-zinc-200">
+							{PROJECT_SET}, including machines you do not own,
+						</strong>
+					}
+					scopeNote={
+						// The mechanism has no per-enrollment SWARM to move, so this says what the
+						// action actually does rather than implying a semantics it does not have.
+						<>
+							A machine enrolled in other projects as well is moved for all of them: an update moves
+							its SWARM install root and restarts its daemon, not one enrollment.
+						</>
+					}
+					target={target}
+					requestUpdate={() =>
+						trpcClient.workers.requestUpdateForProject.mutate({ projectId, target })
+					}
+				/>
+			) : null}
+		</>
 	);
 }
 
@@ -352,7 +416,7 @@ function UpdateAllWorkersButton() {
 				type="button"
 				onClick={() => setConfirming(true)}
 				disabled={!target}
-				title={fleetUpdateTitle(buildQuery.isPending, target)}
+				title={updateActionTitle(INSTALLATION_SET, buildQuery.isPending, target)}
 				className={buttonClass('secondary')}
 			>
 				<RefreshCw className="h-4 w-4" aria-hidden="true" />
@@ -365,7 +429,7 @@ function UpdateAllWorkersButton() {
 					title="Update every worker on this installation?"
 					confirmCopy={
 						<strong className="text-zinc-200">
-							every registered machine on this installation, including machines you do not own,
+							{INSTALLATION_SET}, including machines you do not own,
 						</strong>
 					}
 					target={target}
@@ -377,14 +441,18 @@ function UpdateAllWorkersButton() {
 }
 
 /**
- * The installation-wide button's own title: what the click will ask for, or why
- * there is nothing to ask for yet. A module-level helper rather than a ternary in
- * the attribute, so each disabled case stays one readable sentence — the shape
- * `updateActionTitle` uses on the worker detail view.
+ * A toolbar action's own title: what the click will ask for, or why there is nothing
+ * to ask for yet. A module-level helper rather than a ternary in the attribute, so
+ * each disabled case stays one readable sentence — the shape the worker detail
+ * view's own title helper uses.
+ *
+ * `set` is the only part that differs between the two actions: both read the same
+ * build the same way, so both explain an unreadable one in the same words rather
+ * than in two copies that can drift.
  */
-function fleetUpdateTitle(loading: boolean, target: string | null): string {
+function updateActionTitle(set: string, loading: boolean, target: string | null): string {
 	if (target) {
-		return `Asks every registered machine on this installation to move its SWARM install root to ${target.slice(0, 7)} — the build this control plane is running — and restart its daemon.`;
+		return `Asks ${set} to move its SWARM install root to ${target.slice(0, 7)} — the build this control plane is running — and restart its daemon.`;
 	}
 	return loading
 		? 'Reading the build this control plane is running…'

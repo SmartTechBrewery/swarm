@@ -111,8 +111,11 @@ const { getMembership, listAccessibleProjectIds } = vi.hoisted(() => ({
 }));
 // Issue #799 — `register` resolves its owner and `projectScmProvider` its project
 // and that project's SCM provider.
-const { findUserByIdentifier, listUsers } = vi.hoisted(() => ({
+const { findUserByIdentifier, getUserById, listUsers } = vi.hoisted(() => ({
 	findUserByIdentifier: vi.fn(),
+	// Issue #1010 — `requestUpdateForProject` labels a project's machines one owner at
+	// a time, deliberately *not* through the installation-wide read below it.
+	getUserById: vi.fn(),
 	// Issue #922 — `requestUpdateForInstallation` labels every machine with its owner.
 	listUsers: vi.fn(),
 }));
@@ -161,7 +164,11 @@ vi.mock('@/api/worker-update-fanout.js', () => ({ fanOutWorkerUpdate, publishWor
 vi.mock('@/api/worker-update-rollout.js', () => ({ getRolloutForOwner, startRollout }));
 vi.mock('@/db/repositories/workersRepository.js', () => ({ removeWorker }));
 vi.mock('@/identity/membership-service.js', () => ({ getMembership, listAccessibleProjectIds }));
-vi.mock('@/db/repositories/usersRepository.js', () => ({ findUserByIdentifier, listUsers }));
+vi.mock('@/db/repositories/usersRepository.js', () => ({
+	findUserByIdentifier,
+	getUserById,
+	listUsers,
+}));
 // Spread the real modules and override one export each: both are imported
 // elsewhere in this router's module graph (`identity/worker-scm-credential.ts`
 // reads `requireProjectSCMProviderId` and `findProjectByIdFromDb` too), so a
@@ -297,6 +304,7 @@ beforeEach(() => {
 		getMembership,
 		listAccessibleProjectIds,
 		findUserByIdentifier,
+		getUserById,
 		listUsers,
 		listAllWorkers,
 		findProjectByIdFromDb,
@@ -2316,6 +2324,214 @@ describe('workers.requestUpdateForInstallation (installation-wide request, issue
 			requestedByUserId: ADMIN_USER.id,
 			requestedAt: DRAINED_AT.toISOString(),
 			reportedAt: null,
+		});
+	});
+});
+
+/**
+ * The third selection over the one fan-out (issue #1010): a project's own machines,
+ * asked by that project's administrator. What this suite owns is the authorization,
+ * the selection and the wire shape — the fan-out has its own suite
+ * (`tests/unit/api/worker-update-fanout.test.ts`).
+ */
+describe('workers.requestUpdateForProject (project-scoped request, issue #1010)', () => {
+	const SECOND_WORKER_ID = '22222222-2222-4222-8222-222222222222';
+	const THIRD_WORKER_ID = '33333333-3333-4333-8333-333333333333';
+	const DRAINED_AT = new Date('2026-09-15T10:00:00Z');
+	/** Somebody else's machine in the same project — the case the labelling is for. */
+	const OTHER_USER: SwarmUser = {
+		...OWNER_USER,
+		id: OTHER_ID,
+		identifier: 'grace@example.com',
+		displayName: 'Grace',
+	};
+
+	/** Two of the project's machines, under two different owners. */
+	function enrolled(): Worker[] {
+		return [
+			makeWorker({ drainingSince: DRAINED_AT }),
+			makeWorker({
+				id: SECOND_WORKER_ID,
+				ownerUserId: OTHER_ID,
+				displayName: 'grace-box',
+				drainingSince: DRAINED_AT,
+			}),
+		];
+	}
+
+	/** The project's configured order, and the rows the ids in it resolve to. */
+	function seedRoster(workers: Worker[]) {
+		listProjectWorkerIdsInOrder.mockResolvedValue(workers.map((worker) => worker.id));
+		const byId = new Map(workers.map((worker) => [worker.id, worker]));
+		getWorker.mockImplementation(async (workerId: string) => byId.get(workerId));
+	}
+
+	function fanoutEntry(overrides: Record<string, unknown> = {}) {
+		return {
+			workerId: WORKER_ID,
+			displayName: 'ada-laptop',
+			disposition: 'requested',
+			update: null,
+			...overrides,
+		};
+	}
+
+	beforeEach(() => {
+		getMembership.mockResolvedValue(membershipFor('projectAdmin'));
+		getUserById.mockImplementation(async (userId: string) =>
+			[OWNER_USER, OTHER_USER].find((user) => user.id === userId),
+		);
+	});
+
+	// The selection, and the two it is deliberately not: the tab renders the project's
+	// configured order, so a report in any other one would not line up with the list
+	// the operator read it against.
+	it('fans out over exactly the project’s machines, in the project’s own order', async () => {
+		const [ada, grace] = enrolled();
+		seedRoster([grace, ada]);
+		fanOutWorkerUpdate.mockResolvedValue([
+			fanoutEntry({ workerId: SECOND_WORKER_ID, displayName: 'grace-box' }),
+			fanoutEntry(),
+		]);
+
+		const result = await owner.requestUpdateForProject({ projectId: 'p1', target: 'main' });
+
+		expect(listProjectWorkerIdsInOrder).toHaveBeenCalledWith('p1');
+		expect(fanOutWorkerUpdate).toHaveBeenCalledWith([grace, ada], 'main', OWNER_ID);
+		expect(listAllWorkers).not.toHaveBeenCalled();
+		expect(listWorkersForOwner).not.toHaveBeenCalled();
+		expect(result).toMatchObject({
+			projectId: 'p1',
+			target: 'main',
+			requestedBy: OWNER_USER.identifier,
+		});
+		expect(result.workers.map((worker) => worker.workerId)).toEqual([SECOND_WORKER_ID, WORKER_ID]);
+	});
+
+	// An update moves a machine's install root, so the project's roster reaches machines
+	// their owners will have to deal with — each line names whose.
+	it('asks a machine owned by someone else and labels it with its owner', async () => {
+		const [ada, grace] = enrolled();
+		seedRoster([ada, grace]);
+		fanOutWorkerUpdate.mockResolvedValue([
+			fanoutEntry(),
+			fanoutEntry({ workerId: SECOND_WORKER_ID, displayName: 'grace-box' }),
+		]);
+
+		const result = await owner.requestUpdateForProject({ projectId: 'p1', target: 'main' });
+
+		expect(result.workers.map((worker) => worker.owner?.identifier)).toEqual([
+			OWNER_USER.identifier,
+			OTHER_USER.identifier,
+		]);
+		// One lookup per distinct owner, and never the installation-wide users read: a
+		// project administrator is not an `instanceAdmin`.
+		expect(listUsers).not.toHaveBeenCalled();
+		expect(getUserById).toHaveBeenCalledTimes(2);
+	});
+
+	// The same reading the roster and the installation-wide report give it.
+	it('reports an owner that no longer resolves as null rather than dropping the machine', async () => {
+		seedRoster([makeWorker({ drainingSince: DRAINED_AT })]);
+		getUserById.mockResolvedValue(undefined);
+		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry()]);
+
+		const result = await owner.requestUpdateForProject({ projectId: 'p1', target: 'main' });
+
+		expect(result.workers).toHaveLength(1);
+		expect(result.workers[0]?.owner).toBeNull();
+	});
+
+	// Deregistered between the order read and its row read: there is no machine left to
+	// say anything about, so it is left out rather than given a disposition.
+	it('drops an id the project’s order still names but no worker row answers', async () => {
+		const [ada] = enrolled();
+		listProjectWorkerIdsInOrder.mockResolvedValue([ada.id, THIRD_WORKER_ID]);
+		getWorker.mockImplementation(async (workerId: string) =>
+			workerId === ada.id ? ada : undefined,
+		);
+		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry()]);
+
+		await owner.requestUpdateForProject({ projectId: 'p1', target: 'main' });
+
+		expect(fanOutWorkerUpdate).toHaveBeenCalledWith([ada], 'main', OWNER_ID);
+	});
+
+	// One machine's state never refuses the whole call — the fan-out's own rule, which
+	// this selection inherits rather than restates.
+	it('reports the refusal dispositions rather than throwing on them', async () => {
+		seedRoster(enrolled());
+		fanOutWorkerUpdate.mockResolvedValue([
+			fanoutEntry({ disposition: 'in-pool' }),
+			fanoutEntry({
+				workerId: SECOND_WORKER_ID,
+				displayName: 'grace-box',
+				disposition: 'no-project',
+			}),
+			fanoutEntry({
+				workerId: THIRD_WORKER_ID,
+				displayName: 'root-box',
+				disposition: 'unsupervised',
+			}),
+		]);
+
+		const result = await owner.requestUpdateForProject({ projectId: 'p1', target: 'main' });
+
+		expect(result.workers.map((worker) => worker.disposition)).toEqual([
+			'in-pool',
+			'no-project',
+			'unsupervised',
+		]);
+	});
+
+	// The project roster's own rule, the one `approveEnrollment`/`setStatus`/
+	// `reorderProjectWorker` already apply.
+	it('forbids a contributor and asks no machine', async () => {
+		getMembership.mockResolvedValue(membershipFor('contributor'));
+
+		await expect(
+			owner.requestUpdateForProject({ projectId: 'p1', target: 'main' }),
+		).rejects.toThrowError(expect.objectContaining({ code: 'FORBIDDEN' }));
+		expect(listProjectWorkerIdsInOrder).not.toHaveBeenCalled();
+		expect(fanOutWorkerUpdate).not.toHaveBeenCalled();
+	});
+
+	it('hides the project from a non-member (NOT_FOUND) and asks no machine', async () => {
+		getMembership.mockResolvedValue(undefined);
+
+		await expect(
+			owner.requestUpdateForProject({ projectId: 'p1', target: 'main' }),
+		).rejects.toThrowError(expect.objectContaining({ code: 'NOT_FOUND' }));
+		expect(listProjectWorkerIdsInOrder).not.toHaveBeenCalled();
+		expect(fanOutWorkerUpdate).not.toHaveBeenCalled();
+	});
+
+	// The grammar is the security boundary — the value ends up handed to `git` on
+	// unattended machines — so it is checked before anything is read, and once.
+	it.each([
+		['a URL', 'https://example.com/evil.git'],
+		['a shell fragment', 'main; rm -rf /'],
+		['a git option', '--upload-pack=curl'],
+	])('rejects %s as a target with BAD_REQUEST, reading nothing', async (_what, target) => {
+		await expect(owner.requestUpdateForProject({ projectId: 'p1', target })).rejects.toThrowError(
+			expect.objectContaining({ code: 'BAD_REQUEST' }),
+		);
+		expect(getMembership).not.toHaveBeenCalled();
+		expect(listProjectWorkerIdsInOrder).not.toHaveBeenCalled();
+		expect(fanOutWorkerUpdate).not.toHaveBeenCalled();
+	});
+
+	it('answers a project with no enrolled machines honestly, not with an error', async () => {
+		seedRoster([]);
+		fanOutWorkerUpdate.mockResolvedValue([]);
+
+		await expect(
+			owner.requestUpdateForProject({ projectId: 'p1', target: 'main' }),
+		).resolves.toEqual({
+			projectId: 'p1',
+			target: 'main',
+			requestedBy: OWNER_USER.identifier,
+			workers: [],
 		});
 	});
 });

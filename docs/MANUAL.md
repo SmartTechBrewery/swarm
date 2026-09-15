@@ -441,7 +441,14 @@ swarm workers request-update main        # every machine on the installation
 The same ask is in the dashboard (issue #1009), in the `/workers` toolbar above the
 roster: **Update all workers**, which asks for the build the control plane itself is
 running rather than taking a ref, confirms what it is about to touch first, and then
-shows the same per-machine report — dispositions, owners and all — in the modal.
+shows the same per-machine report — dispositions, owners and all — in the modal. A
+project's own administrator has the narrower form in the same place on the project
+detail page's **Workers** tab (issue #1010): **Update project workers** asks the
+machines enrolled in that project, in the project's configured order, through
+`workers.requestUpdateForProject`. It has no CLI counterpart — the command above is
+the installation — and its confirmation adds the one thing that set has to say: a
+machine enrolled in other projects as well is moved for all of them, since an update
+moves its SWARM install root rather than one enrollment.
 
 This is the one worker *write* that spans owners, and it is allowed to only because
 it asks and nothing more, and asks for something bounded. The switch that decides

@@ -4,7 +4,11 @@ import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 
 import { findProjectByIdFromDb } from '../../db/repositories/projectsRepository.js';
-import { findUserByIdentifier, listUsers } from '../../db/repositories/usersRepository.js';
+import {
+	findUserByIdentifier,
+	getUserById,
+	listUsers,
+} from '../../db/repositories/usersRepository.js';
 import type { WorkerCliRateLimit } from '../../db/repositories/workerCliRateLimitsRepository.js';
 import { removeWorker } from '../../db/repositories/workersRepository.js';
 import { AgentCliSchema } from '../../harness/agent-cli.js';
@@ -168,9 +172,14 @@ import { workerScmCredentialsRouter } from './workerScmCredentials.js';
  *   `routers/projects.ts`: a `contributor` reads the roster (`roster`) and the
  *   SCM provider the project runs on (`projectScmProvider`, issue #799); only a
  *   `projectAdmin` approves an enrollment (`approveEnrollment`), revokes/
- *   reactivates one (`setStatus`), or moves a worker through the project's
- *   configured order (`reorderProjectWorker`, issue #750). A non-member gets
- *   `NOT_FOUND` (existence hidden), a member below the required role `FORBIDDEN`
+ *   reactivates one (`setStatus`), moves a worker through the project's
+ *   configured order (`reorderProjectWorker`, issue #750), or asks every machine
+ *   enrolled in the project to move to a build (`requestUpdateForProject`, issue
+ *   #1010 — the third selection over the one fan-out, beside the owner-scoped and
+ *   installation-wide ones above, and a project administrator's on the same terms
+ *   #922 settled: it only asks, and the drain that makes a machine askable stays
+ *   the owner's). A non-member gets `NOT_FOUND` (existence hidden), a member
+ *   below the required role `FORBIDDEN`
  *   — with one deliberate exception, `projectScmProvider`, which since issue #899
  *   answers a non-member of a *real* project with `FORBIDDEN` naming the
  *   `swarm members add` remedy instead, because its only caller is an operator
@@ -401,6 +410,14 @@ function serializeWorkerRateLimits(rateLimits: WorkerCliRateLimit[]) {
 }
 
 /**
+ * The non-secret {@link RosterOwner} the rosters and both fan-out reports label a
+ * machine's owner with — an identity, never a credential.
+ */
+function rosterOwnerOf(user: SwarmUser): RosterOwner {
+	return { userId: user.id, identifier: user.identifier, displayName: user.displayName };
+}
+
+/**
  * Every user on the installation, keyed by id, in the non-secret {@link RosterOwner}
  * shape the rosters already report an owner in (issue #922).
  *
@@ -409,15 +426,15 @@ function serializeWorkerRateLimits(rateLimits: WorkerCliRateLimit[]) {
  * is cheaper than N round trips. Nothing here decides visibility — the caller has
  * already been established as an `instanceAdmin`, for whom every machine and its
  * owner are visible anyway — and no credential material is in `SwarmUser` to leak.
+ *
+ * **Installation-wide callers only**, which is why `requestUpdateForProject` (issue
+ * #1010) looks its owners up one at a time instead: a project administrator is not
+ * an `instanceAdmin`, and reading every user on the installation to label a project's
+ * roster would go well past what that caller may see.
  */
 async function resolveWorkerOwners(): Promise<Map<string, RosterOwner>> {
 	const users = await listUsers();
-	return new Map(
-		users.map((user) => [
-			user.id,
-			{ userId: user.id, identifier: user.identifier, displayName: user.displayName },
-		]),
-	);
+	return new Map(users.map((user) => [user.id, rosterOwnerOf(user)]));
 }
 
 /**
@@ -1181,6 +1198,108 @@ export const workersRouter = router({
 				})),
 			});
 			return { target: input.target, requestedBy: ctx.user.identifier, workers: reported };
+		}),
+
+	// The same request, asked of **every machine enrolled in one project** (issue
+	// #1010) — the third and narrowest selection over the one fan-out, and the one a
+	// project's own administrator may make.
+	//
+	// **A new selection, never a widening.** `requestUpdate` is one machine,
+	// `requestUpdateForMine` the caller's own, `requestUpdateForInstallation` the whole
+	// installation, and `startFleetUpdate` an owner's fleet — none of them can name a
+	// project. Giving the installation-wide one an optional `projectId` was the
+	// alternative and loses: it would put two authorization rules behind one procedure
+	// whose scope is decided by whether an argument is present, which is how an
+	// installation-wide action ends up one omitted field away from a project
+	// administrator. So this is a selection and nothing else — the same
+	// `fanOutWorkerUpdate`, which takes an already-resolved worker list precisely so a
+	// new set costs a set; the request/report lifecycle stays
+	// `../worker-update-fanout.ts`'s and is not copied.
+	//
+	// **`projectAdmin`, the rule `approveEnrollment`/`setStatus`/
+	// `reorderProjectWorker` already use**: a non-member gets the roster's
+	// existence-hiding `NOT_FOUND`, a member below it `FORBIDDEN`. Not the machine
+	// owner's, for the argument `requestUpdateForInstallation` records at length,
+	// applied to a narrower set — it only ever *asks*; the drain that makes a machine
+	// askable at all stays strictly the owner's (issue #919), so a machine its owner
+	// has not drained comes back `in-pool` and untouched; and the mechanism bounds the
+	// reach to the branch each install root already tracks
+	// (`../../worker/self-update.ts`). A project administrator already decides which
+	// machines this project routes work to, which is the larger of the two powers.
+	//
+	// **A machine enrolled in several projects is asked as a machine.** An update
+	// moves its SWARM install root and restarts its daemon; there is no per-enrollment
+	// SWARM to move. So a machine this project shares with another is moved for both,
+	// and the dashboard's confirmation says so rather than implying a per-project
+	// semantics the mechanism does not have. No dedup is needed *inside* one call — a
+	// machine appears once in a project's roster.
+	//
+	// The set is `listProjectWorkerIdsInOrder`: the project's own configured order
+	// (issue #750), which is the order its Workers tab renders and the dispatch gate
+	// prefers, so the report lines up with the list the operator read it against. Never
+	// the tab's search-filtered list, which is a transient text box. A machine
+	// deregistered between the order read and its row read is dropped rather than given
+	// a disposition — there is no machine left to say anything about, exactly as the
+	// fan-out drops one that disappears under it.
+	//
+	// Owners are labelled one lookup per distinct owner rather than through
+	// `resolveWorkerOwners()`, whose `listUsers()` reads every user on the
+	// installation: that read is justified for an `instanceAdmin` caller, for whom
+	// every machine and owner is visible anyway, and a project administrator is not
+	// one. The project's own roster is the bound here. An owner that no longer resolves
+	// is reported `null`, the way the roster and the installation-wide report report
+	// one.
+	//
+	// The wire shape is `requestUpdateForInstallation`'s plus the `projectId` that was
+	// asked about, so one dashboard report component serves both scopes.
+	requestUpdateForProject: authedProcedure
+		.input(z.object({ projectId: z.string().min(1), target: WorkerUpdateTargetSchema }))
+		.mutation(async ({ ctx, input }) => {
+			await assertProjectAccess(ctx.user, input.projectId, 'projectAdmin');
+			const workerIds = await listProjectWorkerIdsInOrder(input.projectId);
+			const workers: Worker[] = [];
+			for (const workerId of workerIds) {
+				const worker = await getWorker(workerId);
+				if (worker) workers.push(worker);
+			}
+			// Before the fan-out, so a lookup that fails takes nothing with it that was
+			// already asked for; one per distinct owner, since a project's machines are
+			// commonly several people's rather than one machine each.
+			const owners = new Map<string, RosterOwner | null>();
+			for (const ownerUserId of new Set(workers.map((worker) => worker.ownerUserId))) {
+				const user = await getUserById(ownerUserId);
+				owners.set(ownerUserId, user ? rosterOwnerOf(user) : null);
+			}
+			const entries = await fanOutWorkerUpdate(workers, input.target, ctx.user.id);
+			const ownerOf = new Map(workers.map((worker) => [worker.id, worker.ownerUserId]));
+			const reported = entries.map((entry) => {
+				const ownerUserId = ownerOf.get(entry.workerId);
+				return {
+					...entry,
+					owner: ownerUserId === undefined ? null : (owners.get(ownerUserId) ?? null),
+					update: serializeWorkerUpdate(entry.update),
+				};
+			});
+			// The audit line for the action as a whole, mirroring the installation-wide one
+			// and naming the project that bounded it. The durable per-machine record is on
+			// the rows themselves.
+			logger.info('project-wide worker update requested', {
+				projectId: input.projectId,
+				requestedBy: ctx.user.identifier,
+				requestedByUserId: ctx.user.id,
+				target: input.target,
+				workers: reported.map((entry) => ({
+					workerId: entry.workerId,
+					owner: entry.owner?.identifier ?? null,
+					disposition: entry.disposition,
+				})),
+			});
+			return {
+				projectId: input.projectId,
+				target: input.target,
+				requestedBy: ctx.user.identifier,
+				workers: reported,
+			};
 		}),
 
 	// Move **every machine the caller owns** to a build as a staged rollout (issue

@@ -777,6 +777,20 @@ swarm workers request-update main          # every machine on the installation
   the same grouped lines naming who to ask for a `swarm workers drain`, a
   `swarm workers enroll` or a `swarm-worker-agent install`. A caller without the
   installation role sees the refusal below in the control plane's own words.
+- **A project's own administrator can ask for the project's machines** (issue #1010),
+  without the installation role and without CLI access: the project detail page's
+  **Workers** tab has **Update project workers** in the same toolbar, calling
+  `workers.requestUpdateForProject`. The set is the machines enrolled in *that*
+  project, in the project's own configured order — the order the tab lists them in,
+  never the rows a search box happens to be showing. Everything else is the same
+  action: the build the control plane itself is running, the same confirmation, the
+  same per-machine report with owners, dispositions and remedy lines. It adds one
+  sentence the installation-wide form does not need — **a machine enrolled in other
+  projects as well is moved for all of them**, because an update moves that machine's
+  SWARM install root and restarts its daemon rather than touching one enrollment. The
+  drain stays the machine owner's here too, so a machine its owner has not drained
+  comes back `in-pool`. There is no CLI counterpart for this set; `swarm workers
+  request-update` is the installation.
 
 What settles it is that each of #800's four **takes something of the owner's** and
 keeps it — a credential the administrator would then hold, the machine's existence,
