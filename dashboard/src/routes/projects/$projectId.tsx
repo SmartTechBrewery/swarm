@@ -2599,10 +2599,11 @@ function ProjectDetailRouteComponent() {
 			{/* This project's worker roster (issue #574) — the same component `/workers`
 			    renders, scoped server-side to the machines enrolled here. An
 			    administrator additionally reorders the project's dispatch preference
-			    here (issue #750 phase 2); `canAdminister` fails closed while
-			    `projects.viewerAccess` loads, and the mutation re-checks it server-side. */}
+			    here (issue #750 phase 2) and may ask this project's machines to update;
+			    `canAdminister` fails closed while `projects.viewerAccess` loads, and
+			    every mutation behind it re-checks `projectAdmin` server-side. */}
 			{activeTab === 'workers' && (
-				<WorkersRoster projectId={projectId} canReorder={canAdminister} />
+				<WorkersRoster projectId={projectId} canAdminister={canAdminister} />
 			)}
 
 			<ProjectAdminOnly tab={activeTab} canAdminister={canAdminister}>
