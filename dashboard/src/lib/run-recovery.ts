@@ -17,6 +17,8 @@
  * what keeps the unified control and those buttons from drifting apart.
  */
 
+import type { AgentCli } from '../../../src/harness/agent-cli.js';
+import type { ReasoningLevel } from '../../../src/harness/models.js';
 import { canResetRun, resetButtonLabel } from './run-reset.js';
 import {
 	canRetryRun,
@@ -95,9 +97,17 @@ export function recoverButtonLabel(
  * the override fields. Deliberately *not* `retryOverrideActionLabel`'s "Retry Now":
  * that would differ from the untouched label only by capitalization — ambiguous for
  * an operator, and indistinguishable by accessible name.
+ *
+ * Each kind keeps the verb its untouched label uses, because an override changes
+ * only *which agent runs*, never what the server does around it: a `continue` still
+ * continues from the checkpoint, and a `recheck` still has its protected worktree
+ * re-verified before the phase starts. `resume` is the one kind that loses its verb
+ * — an override really does abandon the session — so it reads as a plain retry.
  */
 export function recoveryOverrideSubmitLabel(kind: RetryActionKind): string {
-	return kind === 'continue' ? 'Continue with these settings' : 'Retry with these settings';
+	if (kind === 'continue') return 'Continue with these settings';
+	if (kind === 'recheck') return 'Recheck with these settings';
+	return 'Retry with these settings';
 }
 
 /**
@@ -107,9 +117,9 @@ export function recoveryOverrideSubmitLabel(kind: RetryActionKind): string {
  * the CLI's default, which is how the selects represent "send nothing".
  */
 export interface OverrideSelection {
-	cli: string;
+	cli: AgentCli;
 	model: string;
-	reasoning: string;
+	reasoning: ReasoningLevel | '';
 }
 
 /**

@@ -120,6 +120,11 @@ function continuesPriorWork(kind: RetryActionKind): boolean {
  * moment one is changed — while a checkpoint continuation does not, because it
  * runs a fresh session seeded from the recorded remainder either way and is
  * CLI-agnostic by construction.
+ *
+ * That `'continue'` arm is unreachable from today's only caller — the Recover
+ * control is scoped to the error states, and only a `checkpointed` run resolves
+ * `'continue'` — but it is stated rather than omitted so the function is total
+ * over `RetryActionKind`, which is what `recoveryChoices` can return.
  */
 function carriesPriorWorkWith(kind: RetryActionKind, selectionChanged: boolean): boolean {
 	return kind === 'continue' || (continuesPriorWork(kind) && !selectionChanged);
@@ -254,21 +259,10 @@ interface RetryOverrides {
 	reasoning?: ReasoningLevel;
 }
 
-/**
- * What the override selects hold — {@link OverrideSelection} narrowed to the
- * route's own agent/reasoning unions, which is why the comparison helper takes
- * the widened shape rather than importing them.
- */
-interface SelectedAgent extends OverrideSelection {
-	cli: RunAgent;
-	model: string;
-	reasoning: ReasoningLevel | '';
-}
-
 /** The override selects' own state, plus how it compares to the run's settings. */
 interface OverrideSelectionState {
 	/** What the fields currently hold. */
-	selection: SelectedAgent;
+	selection: OverrideSelection;
 	/** Whether the operator moved any field off the run's own settings. */
 	changed: boolean;
 	selectCli: (cli: RunAgent) => void;
@@ -317,12 +311,12 @@ function useOverrideSelection(run: RunRow): OverrideSelectionState {
 		setSelectedReasoning(currentReasoning ?? '');
 	}, [currentCli, currentModel, currentReasoning]);
 
-	const seeded: SelectedAgent = {
+	const seeded: OverrideSelection = {
 		cli: currentCli,
 		model: currentModel,
 		reasoning: currentReasoning ?? '',
 	};
-	const selection: SelectedAgent = {
+	const selection: OverrideSelection = {
 		cli: selectedCli,
 		model: selectedModel,
 		reasoning: selectedReasoning,
@@ -350,7 +344,7 @@ function useOverrideSelection(run: RunRow): OverrideSelectionState {
 }
 
 /** The `runs.retryNow` overrides a selection stands for. */
-function overridesFrom(selection: SelectedAgent): RetryOverrides {
+function overridesFrom(selection: OverrideSelection): RetryOverrides {
 	return {
 		cli: selection.cli,
 		model: selection.model,
@@ -466,13 +460,11 @@ function RetryOverridePanel({
 	submitLabel,
 	onSubmit,
 	onCancel,
-	disabled = false,
 }: {
 	run: RunRow;
 	submitLabel: string;
 	onSubmit: (overrides: RetryOverrides) => void;
 	onCancel?: () => void;
-	disabled?: boolean;
 }) {
 	const { selection, selectCli, selectModel, selectReasoning } = useOverrideSelection(run);
 
@@ -498,8 +490,7 @@ function RetryOverridePanel({
 				<button
 					type="button"
 					onClick={() => onSubmit(overridesFrom(selection))}
-					disabled={disabled}
-					className="px-3 py-1.5 text-xs font-semibold text-white bg-violet-600 rounded hover:bg-violet-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+					className="px-3 py-1.5 text-xs font-semibold text-white bg-violet-600 rounded hover:bg-violet-500 transition-colors cursor-pointer"
 				>
 					{submitLabel}
 				</button>

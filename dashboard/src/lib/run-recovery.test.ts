@@ -127,20 +127,23 @@ describe('overrideSelectionChanged', () => {
 
 describe('recoveryRetryChoiceLabel', () => {
 	it.each([
-		'retry',
-		'resume',
-		'recheck',
-		'continue',
-	] as const)('keeps the %s run’s own server semantics while the fields are untouched', (kind) => {
+		['retry', 'Retry now'],
+		['resume', 'Resume'],
+		['recheck', 'Recheck and retry'],
+		['continue', 'Continue now'],
+	] as const)('keeps the %s run’s own server semantics while the fields are untouched', (kind, label) => {
+		expect(recoveryRetryChoiceLabel(kind, false)).toBe(label);
+		// …which is the same wording the side-by-side buttons use for that kind.
 		expect(recoveryRetryChoiceLabel(kind, false)).toBe(retryButtonLabel(kind, false));
 	});
 
 	it.each([
-		'retry',
-		'resume',
-		'recheck',
-		'continue',
-	] as const)('becomes the override submit for a %s run once a field is edited', (kind) => {
+		['retry', 'Retry with these settings'],
+		['resume', 'Retry with these settings'],
+		['recheck', 'Recheck with these settings'],
+		['continue', 'Continue with these settings'],
+	] as const)('becomes the override submit for a %s run once a field is edited', (kind, label) => {
+		expect(recoveryRetryChoiceLabel(kind, true)).toBe(label);
 		expect(recoveryRetryChoiceLabel(kind, true)).toBe(recoveryOverrideSubmitLabel(kind));
 	});
 });
@@ -152,8 +155,11 @@ describe('recoveryOverrideSubmitLabel', () => {
 		}
 	});
 
-	it('keeps a continuation reading as a continuation', () => {
+	// An override changes which agent runs, never what the server does around it —
+	// except for a resume, which it really does abandon.
+	it('keeps each kind’s own verb, and drops it only for a resume', () => {
 		expect(recoveryOverrideSubmitLabel('continue')).toBe('Continue with these settings');
+		expect(recoveryOverrideSubmitLabel('recheck')).toBe('Recheck with these settings');
 		expect(recoveryOverrideSubmitLabel('resume')).toBe('Retry with these settings');
 		expect(recoveryOverrideSubmitLabel('retry')).toBe('Retry with these settings');
 	});

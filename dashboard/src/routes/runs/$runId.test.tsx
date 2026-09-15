@@ -504,6 +504,46 @@ describe('RunDetailHeader for a checkpointed run (issue #504)', () => {
 		});
 	});
 
+	// The split control is deliberately *not* the Recover popup (issue #989): its
+	// plain action is a separate main button outside the popup, so the popup's own
+	// submit still sends the fields unconditionally, edited or not. Pinned here
+	// because the #989 refactor moved every handler in that component.
+	it('submits the override popup’s fields unconditionally, unlike the Recover popup', async () => {
+		const retryMutate = vi.mocked(trpcClient.runs.retryNow.mutate);
+		retryMutate.mockReset();
+		retryMutate.mockResolvedValue({ runId: 'run-1', status: 'retrying' });
+		renderHeader();
+
+		fireEvent.click(
+			screen.getByRole('button', { name: /continue with a different model\/agent/i }),
+		);
+		// Two buttons read "Continue now" here — the split control's own main button and
+		// the popup's submit, which renders after it. The popup's is the one under test.
+		const continues = screen.getAllByRole('button', { name: /^continue now$/i });
+		fireEvent.click(continues[continues.length - 1]);
+
+		await waitFor(() => {
+			expect(retryMutate).toHaveBeenCalledWith(
+				expect.objectContaining({ runId: 'run-1', cli: 'claude' }),
+			);
+		});
+	});
+
+	it('keeps the override popup’s CLI change re-seeding the model and clearing reasoning', () => {
+		renderHeader();
+
+		fireEvent.click(
+			screen.getByRole('button', { name: /continue with a different model\/agent/i }),
+		);
+		fireEvent.change(screen.getByLabelText('Agent CLI'), { target: { value: 'antigravity' } });
+
+		// The model select re-seeds to the new CLI's first model rather than keeping a
+		// value that CLI cannot launch, and the model-specific reasoning is dropped.
+		const model = screen.getByLabelText('Model') as HTMLSelectElement;
+		expect(model.value.startsWith('gemini-')).toBe(true);
+		expect((screen.getByLabelText('Reasoning') as HTMLSelectElement).value).toBe('');
+	});
+
 	it('warns in the terminate confirmation that the recorded remainder is abandoned', () => {
 		renderHeader();
 
@@ -1469,6 +1509,52 @@ describe('RecoverRunButton (issue #593)', () => {
 
 		expect(screen.queryByRole('button', { name: /^resume$/i })).toBeNull();
 		expect(screen.getByRole('button', { name: /retry with these settings/i })).toBeDefined();
+	});
+
+	// A blocked run's server behaviour is unchanged by an override — its protected
+	// worktree is re-verified either way — so the button must not lose the only word
+	// that says so.
+	it('keeps a blocked run’s recheck in the label after an edit', () => {
+		openRecover(
+			failedRun({
+				recovery: { state: 'blocked' },
+				engine: 'antigravity',
+				model: 'gemini-3.8-flash',
+				reasoning: 'high',
+			}),
+		);
+
+		fireEvent.change(screen.getByLabelText('Model'), { target: { value: 'gemini-3.7-flash' } });
+
+		expect(screen.getByRole('button', { name: /recheck with these settings/i })).toBeDefined();
+	});
+
+	// The inverse of the fix: an edit put back must go back to submitting nothing,
+	// or a resume the operator decided against would still be abandoned.
+	it('returns to the plain choice when an edit is reverted', async () => {
+		retryMutate.mockResolvedValue({ runId: 'run-1', status: 'retrying' });
+		openRecover(
+			failedRun({
+				recovery: { state: 'preserved' },
+				engine: 'antigravity',
+				model: 'gemini-3.8-flash',
+				reasoning: 'high',
+			}),
+		);
+
+		fireEvent.change(screen.getByLabelText('Model'), { target: { value: 'gemini-3.7-flash' } });
+		fireEvent.change(screen.getByLabelText('Model'), { target: { value: 'gemini-3.8-flash' } });
+
+		fireEvent.click(screen.getByRole('button', { name: /^resume$/i }));
+
+		await waitFor(() => {
+			expect(retryMutate).toHaveBeenCalledWith({
+				runId: 'run-1',
+				cli: undefined,
+				model: undefined,
+				reasoning: undefined,
+			});
+		});
 	});
 
 	it('routes the reset choice through its own confirmation before submitting', async () => {
