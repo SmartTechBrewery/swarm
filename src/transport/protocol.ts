@@ -660,10 +660,29 @@ export const TaskExecutionResultSchema = z.object({
 	signal: z.string().nullable().optional(),
 	timedOut: z.boolean().optional(),
 	durationMs: z.number().int().nonnegative().optional(),
-	// `deferred` — the retry hint + resume flags (mirrors `phase-deferred`).
+	// `deferred` — the retry hint + resume flags (mirrors `phase-deferred`). Since
+	// issue #980 `retryDelayMs` is the **back-compat fallback** rather than the
+	// primary reading: the control plane prefers `retryAfter` below and falls back to
+	// this duration only for a frame from a worker that predates it.
 	retryDelayMs: z.number().int().nonnegative().optional(),
 	resumable: z.boolean().optional(),
 	resumeDelivery: z.boolean().optional(),
+	// `deferred` — the reset the CLI actually reported (issue #980). The worker
+	// resolves the real `AgentFailure` and used to send only the delay it derived from
+	// it, so the control plane rebuilt a kind-only failure, found no `retryAfter`, and
+	// fell back to the 30-minute default — retrying a Claude 5-hour window ~10 times
+	// and spending the whole rate-limit retry budget against a limit that had not
+	// moved. The absolute instant travels rather than the duration because a duration
+	// goes stale in transit, and `resetHint` travels beside it because it is what the
+	// deferral log line names to the operator. ISO-8601 in a loose `string`, not
+	// `z.string().datetime()`, for the same reason `failureKind` is a bare string: a
+	// terminal result frame must never fail to parse — and so lose the whole settle —
+	// over one optional field, so the control plane parses it defensively and falls
+	// back when it cannot. Optional and additive in both directions, so
+	// `TRANSPORT_PROTOCOL_VERSION` is deliberately **not** bumped: an older worker
+	// omits both and the control plane falls back to `retryDelayMs`.
+	retryAfter: z.string().min(1).optional(),
+	resetHint: z.string().min(1).optional(),
 	// `deferred` — the Tier 2 checkpoint the stopped run left in its worktree
 	// (`docs/CHECKPOINTS.md`, issue #503), parsed by the worker because only the
 	// worker's host holds that worktree: the control plane cannot read the file, so it

@@ -15,6 +15,7 @@ import { DeliveryDeferredError } from '@/scm/delivery.js';
 import { buildTaskAssignment } from '@/transport/assignment.js';
 import { deferrableOrFailedResult } from '@/transport/assignment-execution.js';
 import type { TaskExecutionResult } from '@/transport/protocol.js';
+import { retryDelayForFailure } from '@/worker/consumer.js';
 import type { DispatchSelection } from '@/worker/eligibility-gate.js';
 import { RunTerminatedError } from '@/worker/run-cancellation.js';
 import { BlockedRecoveryError } from '@/worktree/reclaim.js';
@@ -407,6 +408,111 @@ describe('adaptResultToPhaseRun', () => {
 			expect(agentErr.agent?.exitCode).toBe(143);
 		}
 	});
+
+	/**
+	 * The reported reset crossing the split (issue #980). The rebuilt failure used to
+	 * carry the kind alone, so `retryDelayForFailure` found no `retryAfter` and returned
+	 * the flat 30-minute default — retrying a Claude 5-hour window ~10 times against a
+	 * limit that had not moved. Each case asserts the delay the *shared* policy produces,
+	 * not just the rebuilt fields, because that delay is the behaviour the issue is about.
+	 */
+	describe('reported rate-limit reset', () => {
+		const RESET_HINT = '1:40pm (Europe/Warsaw)';
+		const MIN_RETRY_DELAY_MS = 6 * 60 * 1000;
+		const MAX_RETRY_DELAY_MS = 6 * 60 * 60 * 1000;
+		const DEFAULT_RETRY_DELAY_MS = 30 * 60 * 1000;
+
+		/** The failure `adaptResultToPhaseRun` rebuilt from a deferral frame. */
+		function rebuiltFailure(overrides: Partial<TaskExecutionResult>) {
+			try {
+				adaptResultToPhaseRun(
+					base({
+						status: 'deferred',
+						failureKind: 'rate-limit',
+						reason: 'rate limited',
+						...overrides,
+					}),
+					SELECTION,
+				);
+			} catch (err) {
+				expect(err).toBeInstanceOf(AgentRunError);
+				return (err as AgentRunError).failure;
+			}
+			throw new Error('expected a throw');
+		}
+
+		it('carries the reported reset onto the rebuilt failure', () => {
+			const reset = new Date(Date.now() + 90 * 60 * 1000).toISOString();
+
+			const failure = rebuiltFailure({ retryAfter: reset, resetHint: RESET_HINT });
+
+			expect(failure.retryAfter?.toISOString()).toBe(reset);
+			// What the deferral log line names to the operator (`src/worker/consumer.ts`).
+			expect(failure.resetHint).toBe(RESET_HINT);
+		});
+
+		it('schedules the retry from the reset rather than the default backoff', () => {
+			const reset = new Date(Date.now() + 90 * 60 * 1000).toISOString();
+
+			const delay = retryDelayForFailure(rebuiltFailure({ retryAfter: reset }), Date.now());
+
+			expect(delay).toBeGreaterThan(90 * 60 * 1000);
+			expect(delay).toBeLessThan(92 * 60 * 1000);
+			expect(delay).not.toBe(DEFAULT_RETRY_DELAY_MS);
+		});
+
+		// An older worker reports neither field. Its own `retryDelayMs` — computed from
+		// this same policy on its side — is re-expressed as an instant so the one shared
+		// policy reproduces it, net of the milliseconds the settle spends in between.
+		it('falls back to the frame’s own delay when it reports no instant', () => {
+			const reported = 47 * 60 * 1000;
+
+			const delay = retryDelayForFailure(rebuiltFailure({ retryDelayMs: reported }), Date.now());
+
+			expect(delay).toBeGreaterThan(reported - 1_000);
+			expect(delay).toBeLessThanOrEqual(reported);
+		});
+
+		it('keeps today’s default backoff when the frame reports neither field nor a delay', () => {
+			expect(retryDelayForFailure(rebuiltFailure({}), Date.now())).toBe(DEFAULT_RETRY_DELAY_MS);
+		});
+
+		it('still defers on an unparseable reset instant, using the frame’s delay', () => {
+			const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+			const failure = rebuiltFailure({ retryAfter: 'not a date', retryDelayMs: 47 * 60 * 1000 });
+
+			expect(failure.retryAfter?.getTime()).not.toBeNaN();
+			expect(retryDelayForFailure(failure, Date.now())).toBeLessThanOrEqual(47 * 60 * 1000);
+			expect(warn).toHaveBeenCalledWith(
+				expect.stringContaining('unparseable reset instant'),
+				expect.objectContaining({ retryAfter: 'not a date' }),
+			);
+			warn.mockRestore();
+		});
+
+		it('keeps the MIN/MAX clamps bounding the delay', () => {
+			const far = new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString();
+			const near = new Date(Date.now() + 1_000).toISOString();
+
+			expect(retryDelayForFailure(rebuiltFailure({ retryAfter: far }), Date.now())).toBe(
+				MAX_RETRY_DELAY_MS,
+			);
+			expect(retryDelayForFailure(rebuiltFailure({ retryAfter: near }), Date.now())).toBe(
+				MIN_RETRY_DELAY_MS,
+			);
+		});
+
+		// `rate-limit` is the only kind whose delay is computed from an instant at all, so
+		// no reset is synthesized for any other — that would invent one nothing reads.
+		it('invents no reset for a non-rate-limit deferral carrying a delay', () => {
+			const failure = rebuiltFailure({ failureKind: 'aborted', retryDelayMs: 47 * 60 * 1000 });
+
+			expect(failure.kind).toBe('aborted');
+			expect(failure.retryAfter).toBeUndefined();
+			expect(retryDelayForFailure(failure, Date.now())).toBe(MIN_RETRY_DELAY_MS);
+		});
+	});
 });
 
 /**
@@ -509,6 +615,37 @@ describe('adaptResultToPhaseRun exit metadata', () => {
 		expect(err.agent?.exitCode).toBeNull();
 		expect(err.agent?.timedOut).toBeUndefined();
 		expect(err.agent?.durationMs).toBeUndefined();
+	});
+
+	// The regression of issue #980 caught at its own seam: the worker sends the reset it
+	// resolved, and the control plane must keep it. Asserted against the worker's real
+	// frame rather than a fixture, which is what would have caught the loss in #407.
+	it('keeps a rate-limit deferral’s reported reset across the split', () => {
+		const retryAfter = new Date(Date.now() + 5 * 60 * 60 * 1000);
+		const resetHint = '1:40pm (Europe/Warsaw)';
+		const frame = deferrableOrFailedResult(
+			new AgentRunError(
+				'Implementation agent (claude) exited with code 1 (usage limit reached)',
+				{ kind: 'rate-limit', resetHint, retryAfter },
+				{
+					cli: 'claude',
+					exitCode: 1,
+					signal: null,
+					stdout: '',
+					stderr: '',
+					durationMs: 12_000,
+					timedOut: false,
+					aborted: false,
+					outputTruncated: false,
+				},
+			),
+			ASSIGNMENT(),
+		);
+		expect(frame).toMatchObject({ status: 'deferred', retryAfter: retryAfter.toISOString() });
+
+		const err = thrownAgent(frame);
+		expect(err.failure.retryAfter?.getTime()).toBe(retryAfter.getTime());
+		expect(err.failure.resetHint).toBe(resetHint);
 	});
 
 	it('still raises RunTerminatedError for a cancelled frame', () => {

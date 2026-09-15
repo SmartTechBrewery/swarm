@@ -437,8 +437,13 @@ const MIN_RETRY_DELAY_MS = 6 * 60 * 1000;
 const MAX_RETRY_DELAY_MS = 6 * 60 * 60 * 1000;
 /** Backoff when the CLI gave no parseable reset time — likely lands past reset. */
 const DEFAULT_RETRY_DELAY_MS = 30 * 60 * 1000;
-/** Fire slightly *after* the reported reset so quota is actually back. */
-const RETRY_BUFFER_MS = 60 * 1000;
+/**
+ * Fire slightly *after* the reported reset so quota is actually back. Exported
+ * since issue #980 because the control plane subtracts it when re-expressing an
+ * older worker's already-computed `retryDelayMs` as an instant, so that worker's
+ * delay is reproduced by this one shared policy rather than by a second one.
+ */
+export const RETRY_BUFFER_MS = 60 * 1000;
 
 /**
  * TTL the review-dispatch claim is refreshed while an SCM continuation is held

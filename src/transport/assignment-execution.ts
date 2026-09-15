@@ -552,6 +552,12 @@ export function deferrableOrFailedResult(
 			...terminal,
 			status: 'deferred',
 			retryDelayMs: retryDelayForFailure(failure, Date.now()),
+			// The reset the classification actually resolved (issue #980), so the control
+			// plane rebuilds the whole `AgentFailure` and its shared deferral path
+			// schedules from the instant instead of the no-hint default. `retryDelayMs`
+			// above stays on the frame as the older-control-plane reading of the same fact.
+			retryAfter: 'retryAfter' in failure ? failure.retryAfter?.toISOString() : undefined,
+			resetHint: 'resetHint' in failure ? failure.resetHint : undefined,
 			resumable,
 			resumeDelivery: failure.kind === 'delivery' || undefined,
 			failureKind: failure.kind,

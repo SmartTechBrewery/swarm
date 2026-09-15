@@ -58,7 +58,11 @@ import {
 	UNREVIEWED_PR_SWEEP_INTERVAL_MS,
 } from '../dispatch/unreviewed-pr-recovery.js';
 import type { AgentCliResult, ReportedAgentResult } from '../harness/agent-cli.js';
-import { type AgentFailureKind, AgentRunError } from '../harness/agent-failure.js';
+import {
+	type AgentFailure,
+	type AgentFailureKind,
+	AgentRunError,
+} from '../harness/agent-failure.js';
 import {
 	MissingWorkerScmCredentialError,
 	requireWorkerScmCredential,
@@ -92,6 +96,7 @@ import {
 	type PhaseRunResult,
 	type ProcessJobDeps,
 	processJob,
+	RETRY_BUFFER_MS,
 	reportInterruptedJobToBoard,
 	resolveAgentTimeoutMs,
 } from '../worker/consumer.js';
@@ -253,6 +258,47 @@ function capturedAgent(cli: AgentCliResult['cli'], fields: ReportedAgentFields):
 }
 
 /**
+ * Rebuild the reset context of a reported deferral (issue #980). The worker
+ * resolved the real `AgentFailure` — its `retryAfter` is the structural reset the
+ * CLI reported (`AgentCliResult.rateLimitResetAt`), not a parsed banner — and this
+ * is what carries it across the split so `retryDelayForFailure` and the deferral
+ * log line behave exactly as they do in-process. Rebuilt from the instant rather
+ * than from the frame's pre-computed `retryDelayMs` on purpose: a duration has
+ * already gone stale in transit, and only the instant restores `resetHint` for the
+ * operator-facing log.
+ *
+ * A frame from an older worker carries neither field. Then its `retryDelayMs` — the
+ * same number that worker computed from the same policy, and until now the one the
+ * control plane threw away — is re-expressed as an instant, net of the buffer
+ * `retryDelayForFailure` re-adds, so that shared policy reproduces it to within the
+ * milliseconds the settle spends between the two `Date.now()` calls (its MIN/MAX
+ * clamps re-apply to an already-clamped value, which is idempotent). Only for
+ * `rate-limit`: it is the one kind whose delay is computed from an instant at all,
+ * so re-expressing any other kind's floor would invent a reset nothing reads. A
+ * frame carrying neither field nor a delay keeps today's default backoff.
+ */
+function reportedRetryHint(
+	result: TaskExecutionResult,
+	kind: AgentFailureKind,
+): Pick<AgentFailure, 'retryAfter' | 'resetHint'> {
+	const resetHint = result.resetHint;
+	if (result.retryAfter !== undefined) {
+		const reported = new Date(result.retryAfter);
+		if (!Number.isNaN(reported.getTime())) return { retryAfter: reported, resetHint };
+		// Never fail the settle over it — fall through to the delay the same frame
+		// carries, exactly as an older worker's frame is handled.
+		logger.warn('dispatcher: worker reported an unparseable reset instant — using its delay', {
+			dispatchId: result.dispatchId,
+			retryAfter: result.retryAfter,
+		});
+	}
+	if (kind === 'rate-limit' && result.retryDelayMs !== undefined) {
+		return { retryAfter: new Date(Date.now() + result.retryDelayMs - RETRY_BUFFER_MS), resetHint };
+	}
+	return { resetHint };
+}
+
+/**
  * Narrow a worker's reported Review verdict to the two SWARM still produces.
  *
  * The completion frame's enum (`src/transport/protocol.ts`) deliberately still
@@ -279,7 +325,9 @@ function reportedVerdict(verdict: TaskExecutionResult['verdict']): ReviewVerdict
  * `processJob`'s shared settle path consumes: a `PhaseRunResult` for a success, or
  * a throw that the shared `handlePhaseFailure` classifies exactly as an in-process
  * failure would — `RunTerminatedError` for a user cancellation, `DependencyBlockedError`,
- * `DeliveryDeferredError` or an `AgentRunError` (with the reported failure kind) for a
+ * `DeliveryDeferredError` or an `AgentRunError` (carrying the reported failure kind *and*
+ * the reset the worker resolved, issue #980, so the shared path schedules the retry from
+ * that instant rather than from its no-hint default) for a
  * deferral, `BlockedRecoveryError` for a terminal failure whose frame names the recovery
  * gate's refusal (issue #952, so the settle records where the preserved checkout is
  * rather than erasing it), and an `AgentRunError` carrying the reported exit metadata
@@ -391,7 +439,9 @@ export function adaptResultToPhaseRun(
 	const kind = (result.failureKind ?? 'rate-limit') as AgentFailureKind;
 	throw new AgentRunError(
 		result.reason ?? `Phase deferred (${kind}) on the worker`,
-		{ kind },
+		// The whole classified failure, not the kind alone (issue #980) — which is what
+		// the comment above this block has always claimed and, until now, did not do.
+		{ kind, ...reportedRetryHint(result, kind) },
 		// The frame's own reported metadata, not a `?? 1 / 0 ms / false` stand-in
 		// (issue #596). A frame that reports no exit code leaves `exitCode: null`, which
 		// still satisfies the shared "genuinely interrupted" timeout rule
