@@ -54,9 +54,8 @@
  *
  * It also answers one thing asked *of* its machine rather than of a dispatch: a
  * pushed request to move the SWARM install root to a build and restart into it
- * (`./worker-update.ts`, issue #933). It acts only if this host opted in
- * (`SWARM_WORKER_SELF_UPDATE`), only once it holds no in-flight phase, only while no
- * *peer* daemon on this machine holds one either (issue #935), and on
+ * (`./worker-update.ts`, issue #933). It acts once it holds no in-flight phase, only
+ * while no *peer* daemon on this machine holds one either (issue #935), and on
  * success takes the same graceful teardown a SIGTERM does before exiting 0 — so
  * launchd `KeepAlive` / systemd `Restart=always` starts it again on the new build,
  * whose identity reaches the control plane through the `build` field above. Every
@@ -109,7 +108,7 @@ import {
 	type WorkerQuotaReportingHandle,
 } from './quota-reporting.js';
 import { connectWorkerTransport } from './worker-client.js';
-import { createWorkerUpdateHandler, selfUpdateEnabled } from './worker-update.js';
+import { createWorkerUpdateHandler } from './worker-update.js';
 import { createWorktreeSweepHandler } from './worktree-sweep.js';
 
 /**
@@ -344,11 +343,9 @@ async function main(): Promise<void> {
 		onCancel: (cancel, sink) => handleTaskCancel(cancel, sink, logger),
 		// The one pushed frame that concerns this *machine* rather than a dispatch
 		// (issue #933): move the SWARM install root to a build and restart into it. The
-		// handler declines outright unless this host opted in, waits until `inFlight` is
-		// empty so no run is ever disturbed, and on a successful apply takes the same
-		// graceful teardown a SIGTERM does before exiting 0 for the supervisor to
-		// restart. Always wired, even with the opt-in off: a machine that will not act
-		// still owes the operator the reason.
+		// handler waits until `inFlight` is empty so no run is ever disturbed, and on a
+		// successful apply takes the same graceful teardown a SIGTERM does before exiting
+		// 0 for the supervisor to restart.
 		onUpdate: createWorkerUpdateHandler({
 			controlPlaneUrl,
 			workerCredential: credential,
@@ -418,10 +415,6 @@ async function main(): Promise<void> {
 		// Explicitly null for the same reason, and the field an operator reads first when
 		// asking whether this daemon carries a fix (issue #918).
 		build: build ?? null,
-		// Whether this host will act on a pushed update at all (issue #933). Logged at
-		// startup because the alternative is discovering it from a `declined` report
-		// after an operator has already asked.
-		selfUpdate: selfUpdateEnabled(),
 	});
 
 	// Graceful shutdown: abort any in-flight agent CLI, then release the session

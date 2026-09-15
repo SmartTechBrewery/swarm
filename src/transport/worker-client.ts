@@ -833,9 +833,10 @@ export interface WorkerTransportOptions {
 	 * no {@link AssignmentSink}: its answer goes up a delivery route rather than the
 	 * back-channel (`./worker-update.ts`).
 	 *
-	 * The handler decides whether to act at all — the machine must have opted in — and
-	 * when, since it must hold no in-flight phase. Left undefined the frame is logged
-	 * and ignored, which is exactly how a daemon predating the frame behaves.
+	 * The handler decides *when* to act, since the daemon must hold no in-flight
+	 * phase; whether it may act at all is not a question it asks, because issue #975
+	 * removed the per-host opt-in that used to be one. Left undefined the frame is
+	 * logged and ignored, which is exactly how a daemon predating the frame behaves.
 	 */
 	onUpdate?: (update: WorkerUpdate) => void;
 	/**
@@ -845,9 +846,9 @@ export interface WorkerTransportOptions {
 	 * {@link AssignmentSink} either: its answer goes up a delivery route rather than
 	 * the back-channel (`./worktree-sweep.ts`).
 	 *
-	 * Unlike `onUpdate` the handler has nothing to decide about *whether* to act —
-	 * there is no host opt-in and no wait, because a checkout a phase here still
-	 * holds reads as leased and is skipped. Left undefined the frame is logged and
+	 * Unlike `onUpdate` the handler has nothing to decide about *when* to act — there
+	 * is no wait, because a checkout a phase here still holds reads as leased and is
+	 * skipped. Left undefined the frame is logged and
 	 * ignored, which is exactly how a daemon predating the frame behaves.
 	 */
 	onWorktreeSweep?: (sweep: WorktreeSweep) => void;

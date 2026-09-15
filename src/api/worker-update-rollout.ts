@@ -225,9 +225,11 @@ async function readRolloutView(rolloutId: string): Promise<RolloutView | undefin
  * durable state, so re-running it is a no-op rather than a second effect:
  *
  * 1. **Settle** every member that was signalled, from the answer on its own
- *    `workers` row. `applied` moves it on to verification, `already-current`
- *    settles it on the spot (nothing restarted, so there is nothing to come back
- *    from), and `failed`/`refused`/`declined` settles it badly and **halts**.
+ *    `workers` row. `applied` and `adopted` move it on to verification,
+ *    `already-current` settles it on the spot (nothing restarted, so there is
+ *    nothing to come back from), and `failed`/`refused`/`declined` settles it badly
+ *    and **halts** — the last of those only ever from a machine on a build predating
+ *    issue #975.
  * 2. **Verify** every member that applied: it has come back when a daemon has taken
  *    a fresh lease *and* the machine is no longer declaring the build it started
  *    from. Not coming back inside {@link COME_BACK_WINDOW_MS} halts too — a build

@@ -541,7 +541,7 @@ to expire after `heartbeatTtlMs`.
 
 ---
 
-## Optional — let the control plane update this machine (issue #933)
+## Updating a machine from the control plane (issues #933, #975)
 
 A machine can be asked, from the control plane, to move its SWARM **install root**
 to a build and restart into it, instead of an operator going to every host and
@@ -578,10 +578,36 @@ and the machines it had not reached stay in the pool. The one that failed is lef
 drained so you can look at it. A halt is final — fix the build and start a new
 rollout.
 
-**It is off unless this host opts in.** Set `SWARM_WORKER_SELF_UPDATE=true` in the
-same `.env` the daemon already reads and restart it; with the flag off the machine
-reports `declined` to any such request and carries on working, which is what every
-existing machine keeps doing. One thing has to be true of the host before you set it:
+**There is no per-host setting to turn this on or off, and since issue #975 there is
+no setting that can refuse it.** What authorizes an update is the mechanism itself,
+and it is worth reading once, because it is what the removed flag was standing in
+front of:
+
+- **The fetch takes no URL and no refspec.** The daemon runs `git fetch <remote>` —
+  a remote *name* — so the only code that can ever arrive is what the install root's
+  own already-configured remote already says it fetches. Nothing on the wire can
+  redirect it at another repository.
+- **The target must be an ancestor of the branch the install root tracks.** A machine
+  can only be moved to code that is already on the branch it follows, never onto a
+  side branch somebody pushed. What that leaves an administrator able to do is move a
+  machine *backwards* along its own branch — visible in `swarm workers list`, bounded,
+  and reversible by asking for the newer ref.
+- **A dirty install root is refused outright**, so uncommitted work on the host is
+  never overwritten.
+- **The drain is the machine owner's own control, and is unchanged.** An update only
+  ever reaches a machine already out of the dispatch pool — see "Why the drain is
+  required" below.
+
+The flag that used to sit in front of all of this,
+`SWARM_WORKER_SELF_UPDATE`, defaulted to off, so a host that had simply never been
+told about it declined every request and drifted, silently. It was removed rather
+than defaulted on — a setting that still exists is a setting that gets set — and
+[`ADR-006`](./decisions/ADR-006-unconditional-worker-updates.md) records the
+reasoning. **A stale value left behind is inert**: a `SWARM_WORKER_SELF_UPDATE` still
+in a launchd plist, an `.env`, or a shell profile is an environment variable nothing
+reads, it breaks nothing, and the next `swarm-worker-agent install` drops it.
+
+One thing still has to be true of the host:
 
 - **A process supervisor must be restarting the daemon.** On a successful update the
   daemon releases its session and exits 0; launchd `KeepAlive`
@@ -662,8 +688,9 @@ hand. Deploy the router and API server, then the workers.
 
 **What "it worked" looks like.** `swarm workers list` marks the machine
 `update <ref> pending` while the request is outstanding and `update <ref> <outcome>`
-once it has answered — `applied`, `adopted`, `already-current`, `declined`, `refused`,
-or `failed`, the last two carrying the machine's own words about why. Anything but
+once it has answered — `applied`, `adopted`, `already-current`, `refused` or `failed`
+(the last two carrying the machine's own words about why), plus the legacy `declined`
+from a machine still running a build that predates issue #975. Anything but
 `applied` or `adopted` leaves the machine working on the build it already had. After
 either of those restarts the machine re-declares its build at handshake, so the
 `/workers` screen's build column is the independent confirmation that the new code is
@@ -713,27 +740,30 @@ swarm workers request-update main          # every machine on the installation
 What settles it is that each of #800's four **takes something of the owner's** and
 keeps it — a credential the administrator would then hold, the machine's existence,
 the owner's consent to share it, the constraints their machine runs under — whereas
-this takes nothing and decides nothing. Both of the switches that decide whether a
-machine actually moves stay with the person who owns it, and neither needs the
-administrator's cooperation:
+this takes nothing and decides nothing. What it can ask for is bounded by the
+mechanism, and the one switch that decides whether a machine is asked at all stays
+with the person who owns it:
 
-- **The host opt-in above** is read from the machine's own environment and never from
-  the wire. With `SWARM_WORKER_SELF_UPDATE` unset the daemon reports `declined` and
-  carries on working; unsetting it and restarting the daemon revokes it outright, at
-  any time, with nothing to ask anybody.
 - **Draining is still strictly the owner's** (issue #919) and is *not* widened by
   this command. It asks only machines already out of the dispatch pool, so a machine
   its owner has not drained comes back `in-pool` and untouched, and one enrolled in no
   project comes back `no-project`. An administrator
   therefore cannot take the installation's capacity down with this, and cannot move a
   machine whose owner has not made it askable in the first place.
+- **The mechanism bounds the reach** — the two guards stated at the top of this
+  section. The fetch takes no URL and no refspec, and the target must be an ancestor
+  of the branch the install root already tracks, so an administrator cannot point a
+  machine at another repository or at a branch they pushed. They can move it along the
+  branch it already follows, and nowhere else.
 
-So the administrator may put the request; the owner keeps both vetoes. The report
-prints a line per machine with its owner, its disposition, and `owner opted out` for
-a machine that last reported `declined` — so the two things the administrator cannot
-do anything about themselves are named, with the person to ask. A caller who is *not*
-an installation administrator is refused outright and shown nothing: it never quietly
-narrows to their own machines, which would read as the whole installation.
+So the administrator may put the request; the owner keeps the drain. Until issue #975
+there was a second veto, a per-host opt-in the owner could unset — it is gone, and
+[`ADR-006`](./decisions/ADR-006-unconditional-worker-updates.md) says why. The report
+prints a line per machine with its owner and its disposition, so the machines the
+administrator cannot do anything about themselves are named, with the person to ask. A
+caller who is *not* an installation administrator is refused outright and shown
+nothing: it never quietly narrows to their own machines, which would read as the whole
+installation.
 
 **Every request records who made it.** `workers.update_requested_by_user_id` sits
 beside the build and the instant on the machine's own row, so an owner whose machine
@@ -800,10 +830,9 @@ stays each owner's own `swarm workers update --all <ref>`.
 | `swarm workers update --all <ref>` is refused because a fleet update is already in progress | Only one rollout runs per operator at a time, so a *different* ref mid-move is refused rather than silently re-targeting the fleet. Run `swarm workers update --status` to see where it stands and wait for it to finish; asking for the **same** ref is never refused, it just nudges and prints it. |
 | `swarm workers request-update <ref>` says it is "available to instance administrators only" | It is (issue #922) — asking machines across the installation is an installation-admin act, while `swarm workers update --all <ref>` moves the machines *you* own and needs no such role. Ask an instance administrator to run it, or run `update --all` for your own fleet. |
 | `swarm workers request-update <ref>` reports `in-pool` for most of the installation | Those machines are not draining, and draining stays strictly the machine owner's own call (issue #919) — this command asks, it never drains. The line under the table names the owners to ask for a `swarm workers drain <worker-id>`; run `request-update` again once they have. |
-| `swarm workers request-update <ref>` marks a machine `owner opted out` | That host last reported `declined`, which it only ever does when `SWARM_WORKER_SELF_UPDATE` is not `true` in its environment (issue #933). That is its owner's decision to make and unmake; nothing an administrator runs can override it. |
 | A machine restarted into a build its owner never asked for | Since issue #922 an installation administrator can request one. The machine's own row records who asked — see the `update_requested_by_user_id` query in "Who may ask, and for whose machines"; the API server's `installation-wide worker update requested` log line carries the same act for the whole fleet. |
 | `swarm workers update` is refused with "still in the dispatch pool" | The machine has to be drained first (issue #933) — it would otherwise be given new work while it waits to restart. Run `swarm workers drain <worker-id>`, then request the update again, and `swarm workers undrain <worker-id>` once it has reported. |
-| `swarm workers list` shows `update <ref> declined` | That host has not opted in. Set `SWARM_WORKER_SELF_UPDATE=true` in its `.env` and restart the daemon (see "Optional — let the control plane update this machine"). |
+| `swarm workers list` shows `update <ref> declined` | That machine is running a build that predates issue #975, on a host that had never set the per-host opt-in that build still reads. Nothing reports `declined` any more, so update that machine **by hand once** — `git pull && npm ci && npm run build` in its install root, then restart the daemon — and it will never decline again. |
 | `swarm workers list` shows `update <ref> refused` with "is already updating the SWARM install root" | A peer daemon holds the install-root lock and was still holding it after this one had waited the whole window out (issue #973) — an apply that ran past its own step timeouts, or one whose daemon is wedged. Read *that* daemon's outcome, sort out what it reports, then re-issue this one. Nothing was changed on this machine. |
 | `swarm workers list` shows `update <ref> refused` with "is on … not on a finished build of the target" | The peer that was moving the install root finished a build of a *different* ref than this daemon was asked for — two requests crossed. Deliberate: re-running the same fetch and build behind it would fight it. Read that daemon's outcome, then re-issue this one for the ref you want. |
 | `swarm workers list` shows `update <ref> refused` with "neither the build this machine last proved nor one a daemon here finished applying" | The install root is on a commit nothing here finished putting it there — a daemon that died between its `git checkout` and its `npm ci` leaves exactly that, and restarting onto it would restart onto a tree with no `node_modules` or `dist` (issue #973). Nothing was changed. Check the install root out by hand and run `npm ci && npm run build` there, then re-issue. |

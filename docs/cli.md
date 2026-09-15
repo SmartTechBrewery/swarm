@@ -495,9 +495,10 @@ tRPC layer enforces ownership the direct-DB CLI never did. All four are intended
 an installation administrator's, and asks every machine on the installation — other
 owners' included — to move to a build. It is not an exception to the four above but
 the other side of the same distinction: each of those *takes* something of the
-owner's and keeps it, while this only ever asks, and both switches that decide
-whether a machine moves stay the owner's (the host `SWARM_WORKER_SELF_UPDATE` opt-in,
-and the drain, which this command never performs). A non-administrator running it is
+owner's and keeps it, while this only ever asks — and asks for something bounded. The
+**drain** that decides whether a machine is asked at all stays the owner's (this
+command never performs one), and the request can only move a machine along the branch
+its install root already tracks, from that checkout's own remote. A non-administrator running it is
 refused outright rather than shown their own machines.
 [`docs/onboarding-worker.md`](./onboarding-worker.md) states the rule beside #800's.
 **`sweeps` is installation-wide for the same reason narrowing 3 makes `list` one**
@@ -672,9 +673,11 @@ unchanged.
   **Refused unless the machine is already draining**, naming
   `swarm workers drain <worker-id>` as the remedy — draining is what stops new work
   arriving into that wait — so the sequence is `drain` → `update` → read `list` →
-  `undrain`. The machine acts only if its host opted in with
-  `SWARM_WORKER_SELF_UPDATE=true`; with the flag off it reports `declined` and keeps
-  working. A host where several daemons share one SWARM install root may opt in
+  `undrain`. A machine can only be moved along the branch its install root already
+  tracks, fetched from that checkout's own remote — never to another repository or a
+  branch somebody pushed — and a dirty install root is refused outright. Since issue
+  #975 there is no per-host setting that can decline a request.
+  A host where several daemons share one SWARM install root is supported
   (issue #935), and since issue #973 asking it brings *every* daemon on it over: the
   first to act takes a machine-local lock and does the fetch and build, the rest wait
   for it, then restart onto what it landed and report `adopted` — one fetch and one
@@ -749,20 +752,21 @@ unchanged.
   outright and shown nothing; it never narrows to their own machines, which would read
   as the whole installation.
   **It asks, and that is all it does**, which is why it is allowed to span owners.
-  Both switches that decide whether a machine actually moves stay with the person who
-  owns it, and neither needs the administrator: the host opt-in
-  (`SWARM_WORKER_SELF_UPDATE=true`, read from the machine's own environment and never
-  from the wire — unset it and restart, and the machine declines every request), and
-  the **drain**, which is still strictly the owner's (issue #919) and is not widened
-  here. So a machine its owner has not drained comes back `in-pool`, untouched: this
-  command drains nothing, undrains nothing, and cannot take the installation's
-  capacity down.
-  Each line is `<worker-id>  <name>  <owner>  <disposition>`, with the same five
+  The switch that decides whether a machine is asked at all stays with the person who
+  owns it and does not need the administrator: the **drain**, still strictly the
+  owner's (issue #919) and not widened here. So a machine its owner has not drained
+  comes back `in-pool`, untouched: this command drains nothing, undrains nothing, and
+  cannot take the installation's capacity down. What it can ask *for* is bounded by
+  the mechanism — the daemon's fetch takes no URL and no refspec, and the target must
+  be an ancestor of the branch its install root already tracks — so an administrator
+  can move a machine along the branch it already follows and nowhere else. Issue #975
+  removed the per-host opt-in that used to sit beside the drain; see
+  [`ADR-006`](./decisions/ADR-006-unconditional-worker-updates.md).
+  Each line is `<worker-id>  <name>  <owner>  <disposition>`, with the same six
   dispositions the owner-scoped fan-out reports (`requested`, `queued-offline`,
-  `in-pool`, `already-asked`, `answered`) and a trailing `owner opted out` for a
-  machine that last reported `declined`. Under the table, the machines that did not
-  move are counted with the owners to go and ask — a drain for the `in-pool` ones, the
-  opt-in for the opted-out ones. Lines are grouped by owner for that reason.
+  `in-pool`, `no-project`, `already-asked`, `answered`). Under the table, the machines
+  that did not move are counted with the owners to go and ask — a drain for the
+  `in-pool` ones, an enrollment for the `no-project` ones. Lines are grouped by owner for that reason.
   **Exit code 0 whenever the call succeeded**, however many machines were skipped: a
   report, not a pass/fail. **Every request records who made it** on the machine's own
   row (`workers.update_requested_by_user_id`, beside the build and the instant), and
@@ -795,7 +799,7 @@ unchanged.
   next *report* — so a machine asked and not yet heard from still reads as what it
   last swept, here and in `sweeps`. The new answer lands on the row later and is
   printed by the next run, exactly as `update`'s outcome is read back through `list`.
-  **No drain and no host opt-in**, unlike `update`: a sweep disturbs no in-flight run,
+  **No drain**, unlike `update`: a sweep disturbs no in-flight run,
   and it removes only `task-<id>` checkouts under a project's own `worktreeRoot`, so
   `worktreeRetention.abandonedAfterDays` is the whole of the opt-out. A machine that
   is offline when you ask keeps the request on its row and is handed it on its next

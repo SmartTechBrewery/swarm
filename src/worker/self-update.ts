@@ -4,8 +4,8 @@
  *
  * This is the host-local half of worker self-update and nothing else: it never
  * exits the process, and it never decides *when* an update is safe for this daemon.
- * Its caller does (`../transport/worker-update.ts`, issue #933) — the opt-in, the
- * wait for an idle daemon, and the restart all live there.
+ * Its caller does (`../transport/worker-update.ts`, issue #933) — the wait for an
+ * idle daemon and the restart both live there.
  *
  * What it *does* decide is whether the update is safe for the **machine** (issue
  * #935), because that question belongs to the install root rather than to any one

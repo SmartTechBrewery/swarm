@@ -383,9 +383,11 @@ export async function supersedeWorkerUpdateRun(
  * fetch is a distinction the *status* carries; it is not a difference in whether the
  * unit of work succeeded.
  *
- * `declined` fails rather than completes on purpose: "this host has not opted in to
- * self-update" is an actionable reason an operator can do something about, and a
- * `completed` row would say the machine moved.
+ * `declined` fails rather than completes on purpose, and still does even though
+ * issue #975 removed the per-host opt-in that produced it: a machine on a build
+ * predating that change still reports it, "this host has not opted in to
+ * self-update" is an actionable reason an operator can do something about (update
+ * that machine by hand once), and a `completed` row would say the machine moved.
  *
  * Keyed on `maintenance_request_id` alone — unique per run by the partial index —
  * and deliberately **not** guarded on the run's current status. The machine's answer

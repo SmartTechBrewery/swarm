@@ -67,7 +67,7 @@ function pending(overrides: Partial<Worker> = {}): Worker {
  * What the row looks like after this fan-out's own write landed: a fresh request
  * pair, with whatever outcome the machine had already reported left standing —
  * which is what `requestWorktreeSweep` writes since issue #956, and the reason the
- * entries here need no `lastReportedStatus` twin of the update fan-out's.
+ * post-write state here is the whole answer, unlike the update fan-out's own write.
  */
 function afterWrite(worker: Worker): Worker {
 	return {

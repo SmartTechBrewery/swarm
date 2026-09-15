@@ -9,11 +9,11 @@
  * `./worker-update.ts` — the round trip it is a deliberate copy of — it is mostly a
  * list of things it does **not** have to do:
  *
- * - **No host opt-in.** `SWARM_WORKER_SELF_UPDATE` exists because a self-update
- *   rewrites the install root, which is the operator's own working copy. A sweep
- *   removes only `task-<id>` checkouts under a project's own `worktreeRoot`, behind
- *   phase 1's liveness gate, so the `abandonedAfterDays` setting is the whole of the
- *   opt-out.
+ * - **Nothing here is the operator's own working copy.** A self-update rewrites the
+ *   install root, and the guards on it are correspondingly careful about where the
+ *   code may come from (`../worker/self-update.ts`). A sweep removes only `task-<id>`
+ *   checkouts under a project's own `worktreeRoot`, behind phase 1's liveness gate,
+ *   so the `abandonedAfterDays` setting is the whole of the opt-out.
  * - **No wait for the machine to go idle, and no draining precondition.** A checkout
  *   a phase on this daemon currently holds reads as *leased* — `isOwnerLive` is
  *   answered from this process's own in-flight set — so it is skipped by

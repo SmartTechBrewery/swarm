@@ -103,9 +103,17 @@ export type WorkerUpdateTarget = z.infer<typeof WorkerUpdateTargetSchema>;
  * which is a plain union rather than a schema because nothing sent it anywhere; it
  * cannot be the source of truth *here* either, since that module reaches for
  * `node:fs` and `node:child_process` and this vocabulary has to be readable by the
- * control plane, the wire, and the database. `declined` is the daemon's alone: the
- * machine never opted in (`SWARM_WORKER_SELF_UPDATE`), so nothing was attempted and
- * nothing could have been.
+ * control plane, the wire, and the database.
+ *
+ * `declined` is a **legacy** value and nothing reports it any more. It was the
+ * daemon's alone — the machine's host had not set the per-host opt-in
+ * `SWARM_WORKER_SELF_UPDATE`, so nothing was attempted and nothing could have
+ * been — and issue #975 removed that flag outright. It stays in the enum because a
+ * daemon on a build predating #975 still reports it, and this very change reaches
+ * the fleet *through* the update mechanism: narrowing the enum would make such a
+ * report fail `ReportWorkerUpdateDeliveryRequestSchema` at the wire
+ * (`../transport/protocol.ts`), and it must still parse, still be shown by
+ * `swarm workers list`, and still halt a staged rollout.
  *
  * `adopted` is the daemon's alone too, and for a subtler reason (issue #973). Two
  * words here mean "this daemon is restarting": `applied` — it did the fetch and the

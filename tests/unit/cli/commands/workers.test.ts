@@ -217,7 +217,6 @@ describe('swarm workers', () => {
 					workerId: WORKER_ID,
 					displayName: 'ada-laptop',
 					disposition: 'requested',
-					optedOut: false,
 					owner: { identifier: IDENTIFIER },
 				},
 			],
@@ -1189,14 +1188,12 @@ describe('swarm workers', () => {
 			expect(log).toHaveBeenCalledWith(expect.stringContaining("to move to 'main' and restart"));
 		});
 
-		// Both of the things an operator has to know next, because neither is visible
-		// from the acknowledgement itself: the host-side opt-in, and that the drain the
-		// mutation required is still in force afterwards.
-		it('names the opt-in flag and the undrain that follows', async () => {
+		// The thing an operator has to know next, because it is not visible from the
+		// acknowledgement itself: the drain the mutation required is still in force
+		// afterwards.
+		it('names the undrain that follows', async () => {
 			expect(await run(['update', WORKER_ID, 'main'])).toBe(0);
-			const printed = lines().join('\n');
-			expect(printed).toContain('SWARM_WORKER_SELF_UPDATE=true');
-			expect(printed).toContain(`swarm workers undrain ${WORKER_ID}`);
+			expect(lines().join('\n')).toContain(`swarm workers undrain ${WORKER_ID}`);
 		});
 
 		// Both refusals are the control plane's own words, printed verbatim rather than
@@ -1324,24 +1321,6 @@ describe('swarm workers', () => {
 			expect(joined).toContain('swarm workers update --all main');
 		});
 
-		// The one thing the table cannot show: a machine only acts if its own host opted
-		// in, and one that has not reports `declined` — which halts the rollout.
-		it('names the host opt-in while machines are waiting on their answer', async () => {
-			fleet({
-				members: [{ workerId: WORKER_ID, displayName: 'ada-laptop', state: 'signalled' }],
-			});
-
-			expect(await run(['update', '--all', 'main'])).toBe(0);
-			expect(lines().join('\n')).toContain('SWARM_WORKER_SELF_UPDATE=true');
-		});
-
-		it('does not name the opt-in when nothing is waiting on an answer', async () => {
-			fleet({ members: [{ workerId: WORKER_ID, displayName: 'ada-laptop', state: 'queued' }] });
-
-			expect(await run(['update', '--all', 'main'])).toBe(0);
-			expect(lines().join('\n')).not.toContain('SWARM_WORKER_SELF_UPDATE=true');
-		});
-
 		it('shows the reported outcome beside a machine that answered', async () => {
 			fleet({
 				members: [
@@ -1442,7 +1421,6 @@ describe('swarm workers', () => {
 				workerId: WORKER_ID,
 				displayName: 'ada-laptop',
 				disposition: 'requested',
-				optedOut: false,
 				owner: { identifier: IDENTIFIER },
 				...overrides,
 			};
@@ -1489,19 +1467,6 @@ describe('swarm workers', () => {
 			expect(joined).toContain('1 still in the dispatch pool');
 			expect(joined).toContain('karolina@example.com');
 			expect(joined).toContain("draining is the machine owner's own call");
-		});
-
-		// The acceptance criterion: an administrator has to be able to see which owners
-		// have opted out, and the only evidence is the machine's own `declined`.
-		it('marks and counts the machines whose owners have opted out', async () => {
-			installation([line({ optedOut: true, owner: { identifier: 'karolina@example.com' } })]);
-
-			expect(await run(['request-update', 'main'])).toBe(0);
-
-			const joined = lines().join('\n');
-			expect(joined).toContain('owner opted out');
-			expect(joined).toContain("1 last reported 'declined'");
-			expect(joined).toContain('SWARM_WORKER_SELF_UPDATE=true');
 		});
 
 		it('says so plainly when the installation has no machines, and exits 0', async () => {
