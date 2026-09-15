@@ -269,9 +269,10 @@ export async function fanOutWorkerUpdate(
  * `requestWorkerUpdate`'s own `WHERE`, which is the only one a concurrent undrain
  * cannot get in front of. The supervision check beside it is the same kind of
  * optimisation for the same kind of precondition (issue #997) — the *enforcing* copy
- * again lives in `requestWorkerUpdate`, which decides it from a read in its own
- * transaction — and it is ordered **after** the draining check on purpose: a machine
- * that is both reads `in-pool` first, because the drain is the remedy the operator
+ * again lives in `requestWorkerUpdate`, as a `supervision <> 'unsupervised'` predicate
+ * on that same `WHERE`, which is the only one a reconnecting daemon's re-declaration
+ * cannot get in front of — and it is ordered **after** the draining check on purpose:
+ * a machine that is both reads `in-pool` first, because the drain is the remedy the operator
  * has to reach for either way, and the repository orders the pair the same way so the
  * two can never disagree. It fires on `unsupervised` alone; `unknown` is a machine
  * whose declaration could not be read, not one that would be lost, so it is asked.

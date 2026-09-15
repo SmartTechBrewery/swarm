@@ -26,7 +26,7 @@
  * not-found, not an error (ai/CODING_STANDARDS.md "Error handling").
  */
 
-import { and, asc, eq, inArray, isNotNull, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNotNull, ne, sql } from 'drizzle-orm';
 
 import type { AgentCli } from '../../harness/agent-cli.js';
 import {
@@ -585,6 +585,42 @@ async function oldestEnrollment(
 }
 
 /**
+ * One machine's row read through the executor it is handed — the transaction-scoped
+ * twin of {@link getWorkerById}, which goes to the global handle and so reads on a
+ * connection outside whatever transaction is open around it.
+ * {@link requestWorkerUpdate} decides an outcome from what it reads here, so it reads
+ * on its own connection rather than beside it.
+ */
+async function workerByIdIn(db: WorkerUpdateExecutor, id: string): Promise<Worker | undefined> {
+	const [row] = await db.select().from(workers).where(eq(workers.id, id)).limit(1);
+	return row ? rowToWorker(row) : undefined;
+}
+
+/**
+ * Whether this row is the one the supervision gate refuses: declared `unsupervised`
+ * **and** already draining, in that order, so a machine that is also in the pool is
+ * answered `in-pool` instead (see {@link requestWorkerUpdate}). Shared by the read
+ * before the write and the re-read on the declined path, so a refusal the predicate
+ * decided is worded exactly as one the read decided.
+ */
+function refusedAsUnsupervised(worker: Worker): boolean {
+	return worker.drainingSince !== null && worker.supervision === 'unsupervised';
+}
+
+/**
+ * The refusal a **declined** request write is reported as, decided from the row as it
+ * stands after the write rather than assumed to be the drain: either of that `WHERE`'s
+ * two predicates can be what declined it, so a machine re-declared `unsupervised`
+ * between the read and the write must still be told that rather than told it is in the
+ * pool (see {@link requestWorkerUpdate}). A row that is gone is `not-found`.
+ */
+function declinedUpdateOutcome(existing: Worker | undefined): WorkerUpdateRequestOutcome {
+	if (!existing) return { outcome: 'not-found' };
+	if (refusedAsUnsupervised(existing)) return { outcome: 'unsupervised', worker: existing };
+	return { outcome: 'in-pool', worker: existing };
+}
+
+/**
  * Record that an operator asked this machine to move its SWARM install root to
  * `target`, replacing any request already outstanding (issue #933) — **only while
  * the machine is draining**.
@@ -649,23 +685,29 @@ async function oldestEnrollment(
  * cover — and refusing on it would let a missing declaration block an operator who
  * knows better.
  *
- * It is a **read** in this transaction rather than a `WHERE` predicate beside
- * `draining_since IS NOT NULL`, and the difference between the two facts is what
- * decides that. Draining is an operator switch a concurrent session can flip between
- * a fleet action's read and its write, which is the race that predicate exists to
- * close. Supervision is a fact a machine states once per connection and can only
- * change by restarting — and a machine that restarts unsupervised a second after the
- * write is not a window a predicate closes either, so a predicate would buy nothing
- * and cost the caller the row it needs to word the refusal from.
+ * It is decided **twice**, and the pair is deliberate. The enforcing copy is a
+ * `supervision <> 'unsupervised'` predicate beside `draining_since IS NOT NULL` on
+ * the `UPDATE`; the read in front of it only words the refusal from the row. A read
+ * alone would not be enough, even though supervision is a fact a machine states once
+ * per connection: stating it again is exactly what a *reconnect* does, and
+ * {@link updateWorkerCapabilities} writes it under `FOR UPDATE` on this same row. So
+ * an old daemon that stops while this transaction is open and a hand-run replacement
+ * that reconnects before the write lands is a real window — one the machine's
+ * operator can open by hand in a second — and a request written through it would be
+ * pushed to the replacement, which applies it by exiting. That is the precise outcome
+ * this refuses, so it is closed the way the undrain window is closed, by testing the
+ * row in the statement that writes it. The read stays because a `WHERE` clause hands
+ * the caller no row to word a refusal from, and the declined path re-reads and
+ * re-classifies through the same {@link refusedAsUnsupervised} rule, so a refusal the
+ * predicate decided still reads `unsupervised` rather than `in-pool`.
  *
- * That read is ordered **behind** the draining snapshot rather than in front of it,
- * so a machine that is both still answers `in-pool`: draining is the remedy the
- * operator has to reach for either way, and the fan-out's own snapshot check
+ * Both are ordered **behind** the draining test rather than in front of it, so a
+ * machine that is both still answers `in-pool`: draining is the remedy the operator
+ * has to reach for either way, and the fan-out's own snapshot check
  * (`../../api/worker-update-fanout.ts`) reports the pair in that same order, so the
- * two forms never word one machine's state differently. It relaxes nothing — the
- * predicate below is still the only thing that decides whether the write lands, and
- * this read, like the follow-up read on the declined path, only decides which refusal
- * the caller gets to name.
+ * two forms never word one machine's state differently. It relaxes nothing — the two
+ * predicates below are the only thing that decides whether the write lands, and the
+ * reads around them only decide which refusal the caller gets to name.
  */
 export async function requestWorkerUpdate(
 	id: string,
@@ -676,11 +718,11 @@ export async function requestWorkerUpdate(
 	return await getDb().transaction(async (tx) => {
 		const enrollment = await oldestEnrollment(tx, id);
 		if (!enrollment) {
-			const existing = await getWorkerById(id);
+			const existing = await workerByIdIn(tx, id);
 			return existing ? { outcome: 'no-project', worker: existing } : { outcome: 'not-found' };
 		}
-		const declared = await getWorkerById(id);
-		if (declared?.drainingSince && declared.supervision === 'unsupervised') {
+		const declared = await workerByIdIn(tx, id);
+		if (declared && refusedAsUnsupervised(declared)) {
 			return { outcome: 'unsupervised', worker: declared };
 		}
 
@@ -695,12 +737,18 @@ export async function requestWorkerUpdate(
 				updateMessage: null,
 				updateReportedAt: null,
 			})
-			.where(and(eq(workers.id, id), isNotNull(workers.drainingSince)))
+			.where(
+				and(
+					eq(workers.id, id),
+					isNotNull(workers.drainingSince),
+					// The enforcing half of the supervision gate, beside the enforcing half
+					// of the drain: the column is `NOT NULL DEFAULT 'unknown'`, so this
+					// excludes `unsupervised` alone and leaves `unknown` eligible.
+					ne(workers.supervision, 'unsupervised'),
+				),
+			)
 			.returning();
-		if (!updatedRow) {
-			const existing = await getWorkerById(id);
-			return existing ? { outcome: 'in-pool', worker: existing } : { outcome: 'not-found' };
-		}
+		if (!updatedRow) return declinedUpdateOutcome(await workerByIdIn(tx, id));
 
 		// Re-targeting overwrites the row's one request, so the run the previous request
 		// created is settled here rather than left `running` with nothing coming to close

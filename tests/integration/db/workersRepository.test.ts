@@ -31,6 +31,7 @@ import { dispatches } from '../../../src/db/schema/dispatches.js';
 import { runs } from '../../../src/db/schema/runs.js';
 import { users } from '../../../src/db/schema/users.js';
 import { workerProjectEnrollments } from '../../../src/db/schema/workerProjectEnrollments.js';
+import { workers } from '../../../src/db/schema/workers.js';
 import type { AgentCli } from '../../../src/harness/agent-cli.js';
 import {
 	type Worker,
@@ -530,6 +531,23 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 			);
 		}
 
+		/**
+		 * Resolve once some statement in this database is waiting on a lock — the
+		 * barrier that makes the reconnect race below deterministic rather than timed.
+		 * The integration project runs serially in a single fork (`vitest.config.ts`),
+		 * so the only statement that can be blocked is the one the test just started.
+		 */
+		async function waitForBlockedStatement(): Promise<void> {
+			for (let attempt = 0; attempt < 300; attempt += 1) {
+				const blocked = await getDb().execute(
+					sql`SELECT 1 FROM pg_locks WHERE NOT granted LIMIT 1`,
+				);
+				if (blocked.rows.length > 0) return;
+				await new Promise((resolve) => setTimeout(resolve, 10));
+			}
+			throw new Error('Timed out waiting for the request write to block on the row lock.');
+		}
+
 		/** The `worker-update` dispatch rows this machine has, oldest first. */
 		async function updateDispatchesFor(workerId: string) {
 			return await getDb()
@@ -899,6 +917,39 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 
 				expect((await requestWorkerUpdate(id, REQUEST_ID, 'main', adaId)).outcome).toBe('in-pool');
 				expect((await getWorkerById(id))?.update).toBeNull();
+			});
+
+			// The window the read in front of the write does not close on its own:
+			// supervision changes by *reconnecting*, so an old daemon that stops while this
+			// transaction is open and a hand-run replacement that handshakes before the row
+			// write lands is a sequence an operator can produce by hand. The write's own
+			// `supervision <> 'unsupervised'` predicate is what closes it. Held open as a
+			// real row lock rather than timed: the re-declaration is uncommitted while
+			// `requestWorkerUpdate` takes its read (so that read is guaranteed to see
+			// `supervised`) and committed while its UPDATE waits on the lock (so the
+			// predicate is guaranteed to be re-evaluated against it).
+			it('refuses at the write when the machine re-declares unsupervised after the read', async () => {
+				const id = await freshWorker('ada-reconnect');
+				await declareSupervision(id, 'supervised');
+
+				let commitHandshake: () => void = () => {};
+				const handshakeMayCommit = new Promise<void>((resolve) => {
+					commitHandshake = resolve;
+				});
+				const handshake = getDb().transaction(async (tx) => {
+					await tx.update(workers).set({ supervision: 'unsupervised' }).where(eq(workers.id, id));
+					await handshakeMayCommit;
+				});
+
+				const pending = requestWorkerUpdate(id, REQUEST_ID, 'main', adaId);
+				await waitForBlockedStatement();
+				commitHandshake();
+				await handshake;
+
+				expect((await pending).outcome).toBe('unsupervised');
+				expect((await getWorkerById(id))?.update).toBeNull();
+				expect(await updateRunsFor(id)).toHaveLength(0);
+				expect(await updateDispatchesFor(id)).toHaveLength(0);
 			});
 
 			// The machine is this run's whole subject, and `runs.worker_id` is
