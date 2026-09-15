@@ -885,6 +885,60 @@ describe('swarm workers', () => {
 			expect(printed.find((line) => line.includes('grace-desktop'))).not.toContain('draining');
 		});
 
+		// Issue #997: an unsupervised machine exits for a supervisor that is not there, so
+		// an update applied on it does not come back — the one value an operator can act
+		// on, and so the only one marked. The detail view states all three.
+		it('marks only an unsupervised machine', async () => {
+			answers.set('workers.listMine', () => [
+				{
+					workerId: WORKER_ID,
+					displayName: 'ada-laptop',
+					capabilities: ['claude'],
+					supervision: 'unsupervised',
+				},
+				{
+					workerId: '22222222-2222-4222-8222-222222222222',
+					displayName: 'grace-desktop',
+					capabilities: ['codex'],
+					supervision: 'supervised',
+				},
+				{
+					workerId: '33333333-3333-4333-8333-333333333333',
+					displayName: 'lin-box',
+					capabilities: ['codex'],
+					supervision: 'unknown',
+				},
+				// A control plane too old to answer with the field marks nothing at all.
+				{
+					workerId: '44444444-4444-4444-8444-444444444444',
+					displayName: 'older-plane',
+					capabilities: ['codex'],
+				},
+			]);
+			expect(await run(['list', IDENTIFIER])).toBe(0);
+			const printed = lines();
+
+			expect(printed.find((line) => line.includes('ada-laptop'))).toContain('unsupervised');
+			for (const machine of ['grace-desktop', 'lin-box', 'older-plane']) {
+				expect(printed.find((line) => line.includes(machine))).not.toContain('supervis');
+			}
+		});
+
+		// The vocabulary is printed, never acted on, so a value this build has never heard
+		// of must leave `list` working rather than fail the whole command.
+		it('still prints a machine whose supervision this build does not know', async () => {
+			answers.set('workers.listMine', () => [
+				{
+					workerId: WORKER_ID,
+					displayName: 'ada-laptop',
+					capabilities: ['claude'],
+					supervision: 'runit',
+				},
+			]);
+			expect(await run(['list', IDENTIFIER])).toBe(0);
+			expect(lines().find((line) => line.includes('ada-laptop'))).toBeDefined();
+		});
+
 		// Issue #933: a machine that declined or failed an update carries on looking
 		// entirely normal, so the outcome has to be on the line or an operator never
 		// sees it; a request nobody has answered is the other half.

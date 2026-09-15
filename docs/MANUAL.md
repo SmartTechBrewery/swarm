@@ -339,6 +339,37 @@ workers update` says so and writes nothing, the fleet forms report the machine a
 `no-project`, and a staged rollout skips it. Enroll it first with `swarm workers
 enroll <worker-id> <project-id>`.
 
+**What the machine says about coming back** (issue #997). A daemon works out at
+startup whether a process supervisor will start it again after it exits — launchd or
+systemd — and declares that at handshake as one of three values, beside the phases,
+the checkout repository and the SWARM build it already declares. `swarm workers list`
+marks a machine that declared `unsupervised`: it was started by hand, so an update
+applied there exits and the machine is gone until somebody starts it again.
+`/workers/<worker-id>` states all three under **Declared by the daemon** — *Supervised*,
+*Not supervised*, or *Unknown* for a daemon that predates the field or runs somewhere
+SWARM cannot read it, which is stated as unknown rather than assumed either way. It
+also logs the answer at startup, so an operator running `npm run dev:worker` in a
+terminal is told there and then.
+
+What that reading **cannot** prove, and deliberately does not claim: that the
+supervisor is configured to restart the job. `KeepAlive` and `Restart=always` are not
+readable from inside the process, so *Supervised* means "launchd or systemd started
+this daemon", not "it will definitely come back".
+
+**On macOS it is also narrower than it sounds, and errs on the safe side.** The
+launchd reading asks whether launchd started *this process*, and a LaunchAgent that
+starts the daemon through a launcher — `swarm run:worker`, which spawns `npm run
+dev:worker`, which spawns the daemon, the shape the plists installed by
+`swarm-worker-agent` use — puts two processes between launchd and the daemon, so that
+machine reads *Not supervised* even though launchd will restart it. The alternative
+was worse: `XPC_SERVICE_NAME` is inherited by every descendant of every launchd job,
+a Terminal window included, so accepting it on its own would read a genuinely
+hand-run daemon as supervised. The error therefore only ever under-claims — nothing
+is marked as coming back unless it demonstrably will.
+
+Nothing is gated on the declaration today — every machine is asked, dispatched to and
+updated exactly as before, and the two surfaces above simply say one more thing.
+
 **Or the whole fleet, staged.** `swarm workers update --all <ref>` (issue #940) moves
 every machine you own in one operator action — but a bounded wave at a time, so the
 fleet's capacity is never down at once and the drain/undrain per machine stops being

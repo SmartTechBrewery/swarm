@@ -23,6 +23,9 @@ const validWorker = {
 	// `repository` is: no reader gets an "absent" case to interpret.
 	drainingSince: null,
 	build: null,
+	// The fifth self-declared fact (issue #997), and the one that is *not* nullable:
+	// `unknown` is a member of the vocabulary, so there is no absent case to spell.
+	supervision: 'unknown' as const,
 	// Nobody has asked this machine to update (issue #933) — nullable for the same
 	// reason `build` is, so no reader gets an "absent" case to interpret.
 	update: null,
@@ -143,6 +146,25 @@ describe('WorkerSchema', () => {
 			WorkerSchema.safeParse({ ...validWorker, build: { commit: 'nothex!', dirty: false } })
 				.success,
 		).toBe(false);
+	});
+
+	// Issue #997 — the daemon-declared supervision. Required rather than nullable, and
+	// closed to the three members, so no reader has both a null and an `unknown` to
+	// interpret as the same thing.
+	it('accepts each of the three supervision states', () => {
+		for (const supervision of ['supervised', 'unsupervised', 'unknown'] as const) {
+			expect(WorkerSchema.parse({ ...validWorker, supervision })).toEqual({
+				...validWorker,
+				supervision,
+			});
+		}
+	});
+
+	it('rejects an omitted supervision, and a value outside the vocabulary', () => {
+		const { supervision, ...withoutSupervision } = validWorker;
+		expect(WorkerSchema.safeParse(withoutSupervision).success).toBe(false);
+		expect(WorkerSchema.safeParse({ ...validWorker, supervision: null }).success).toBe(false);
+		expect(WorkerSchema.safeParse({ ...validWorker, supervision: 'launchd' }).success).toBe(false);
 	});
 
 	it('has no credential/hash field in the read model', () => {

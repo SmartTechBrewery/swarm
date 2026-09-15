@@ -48,6 +48,7 @@ import {
 	type WorkerUpdateStatus,
 	WorkerUpdateTargetSchema,
 } from '../lib/build-identity.js';
+import { type WorkerSupervision, WorkerSupervisionSchema } from '../lib/worker-supervision.js';
 import { RepoSlugSchema } from '../scm/repo-slug.js';
 import type { TriggerPhase } from '../triggers/types.js';
 import type { Worker, WorktreeSweepResult, WorktreeSweepStatus } from './worker.js';
@@ -151,6 +152,11 @@ export async function registerWorker(input: RegisterWorkerInput): Promise<Regist
  * `build` (issue #918) is the SWARM build that daemon is running, three-valued and
  * validated on exactly the same terms — so the service seam, not only the wire, is a
  * boundary that cannot store a commit id no reader would recognise.
+ *
+ * `supervision` (issue #997) is how that daemon is supervised, validated on the same
+ * rule for the same reason. Two-valued rather than three, since the column has no
+ * null: omit it to leave the stored value alone (the `set-cli` path), pass one of the
+ * three members to write it.
  */
 export async function refreshWorkerCapabilities(
 	id: string,
@@ -158,6 +164,7 @@ export async function refreshWorkerCapabilities(
 	supportedPhases?: TriggerPhase[],
 	repository?: string | null,
 	build?: WorkerBuild | null,
+	supervision?: WorkerSupervision,
 ): Promise<Worker | undefined> {
 	const validated = WorkerCapabilitiesSchema.parse(capabilities);
 	const validatedPhases =
@@ -166,12 +173,15 @@ export async function refreshWorkerCapabilities(
 		repository === undefined || repository === null ? repository : RepoSlugSchema.parse(repository);
 	const validatedBuild =
 		build === undefined || build === null ? build : WorkerBuildSchema.parse(build);
+	const validatedSupervision =
+		supervision === undefined ? undefined : WorkerSupervisionSchema.parse(supervision);
 	return updateWorkerCapabilities(
 		id,
 		validated,
 		validatedPhases,
 		validatedRepository,
 		validatedBuild,
+		validatedSupervision,
 	);
 }
 

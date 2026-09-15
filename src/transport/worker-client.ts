@@ -58,6 +58,7 @@ import type { AgentCli } from '../harness/agent-cli.js';
 import type { WorkerSessionReclaim } from '../identity/worker-session.js';
 import type { WorkerBuild } from '../lib/build-identity.js';
 import { logger as defaultLogger } from '../lib/logger.js';
+import type { WorkerSupervision } from '../lib/worker-supervision.js';
 import {
 	type ControlPlaneMessage,
 	ControlPlaneMessageSchema,
@@ -203,6 +204,12 @@ const UNREACHABLE_STATUSES: ReadonlySet<number> = new Set([
  * `build` is the SWARM build this daemon runs (issue #918) and is omitted the same
  * way, for the same reason: a daemon whose install root is not a git checkout sends
  * exactly what a daemon predating the field sends.
+ *
+ * `supervision` is how this daemon is supervised (issue #997), omitted the same way
+ * again — a caller that supplies nothing sends a body byte-identical to a daemon
+ * predating the field. In practice the daemon always declares, since
+ * `resolveOwnSupervision()` never returns `undefined`; the optionality is for the
+ * protocol and for tests.
  */
 export function buildHandshakeRequest(input: {
 	credential: string;
@@ -212,6 +219,7 @@ export function buildHandshakeRequest(input: {
 	supportedPhases: readonly TaskPhase[];
 	repository?: string;
 	build?: WorkerBuild;
+	supervision?: WorkerSupervision;
 	instanceId?: string;
 }): HandshakeRequest {
 	return HandshakeRequestSchema.parse({
@@ -222,6 +230,7 @@ export function buildHandshakeRequest(input: {
 		supportedPhases: [...input.supportedPhases],
 		...(input.repository ? { repository: input.repository } : {}),
 		...(input.build ? { build: input.build } : {}),
+		...(input.supervision ? { supervision: input.supervision } : {}),
 		...(input.instanceId ? { instanceId: input.instanceId } : {}),
 		protocolVersion: TRANSPORT_PROTOCOL_VERSION,
 	});
@@ -785,6 +794,15 @@ export interface WorkerTransportOptions {
 	 * install root is not a git checkout, which declares nothing rather than failing.
 	 */
 	build?: WorkerBuild;
+	/**
+	 * How this daemon is supervised (issue #997) — whether launchd or systemd will
+	 * start it again after it exits, or nobody will — declared at handshake so the
+	 * control plane can tell a machine that comes back from a restart it takes on its
+	 * own from one that does not. `./connect-entry.ts` resolves it once at startup;
+	 * a platform these reads cannot answer for declares `unknown` rather than
+	 * claiming either answer.
+	 */
+	supervision?: WorkerSupervision;
 	/**
 	 * Re-run capability discovery after the control plane rejects the declared set
 	 * (issue #559). A PATH probe can miss a CLI that is installed — a loaded

@@ -65,6 +65,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		update: null,
 		worktreeSweep: null,
 		build: null,
+		supervision: 'unknown',
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		updatedAt: new Date('2026-01-01T00:00:00Z'),
 		...overrides,
@@ -151,12 +152,13 @@ describe('refreshWorkerCapabilities', () => {
 		// No phases passed through: the caller declared none, so the stored repertoire is
 		// left untouched rather than reset to the every-phase default (issue #467) — the
 		// `swarm workers set-cli` path, which knows nothing about phases.
-		// The fourth and fifth arguments are `undefined` for the same reason (issues #687
-		// and #918): a caller that knows nothing about checkouts or builds must not clear
-		// a declaration it cannot make.
+		// The fourth, fifth and sixth arguments are `undefined` for the same reason
+		// (issues #687, #918 and #997): a caller that knows nothing about checkouts,
+		// builds or supervision must not clear a declaration it cannot make.
 		expect(updateWorkerCapabilities).toHaveBeenCalledWith(
 			'worker-1',
 			['codex'],
+			undefined,
 			undefined,
 			undefined,
 			undefined,
@@ -179,6 +181,7 @@ describe('refreshWorkerCapabilities', () => {
 			'worker-1',
 			['claude'],
 			['implementation', 'review'],
+			undefined,
 			undefined,
 			undefined,
 		);
@@ -204,6 +207,7 @@ describe('refreshWorkerCapabilities', () => {
 			undefined,
 			'smarttechbrewery/swarm',
 			undefined,
+			undefined,
 		);
 	});
 
@@ -219,6 +223,7 @@ describe('refreshWorkerCapabilities', () => {
 			['claude'],
 			undefined,
 			null,
+			undefined,
 			undefined,
 		);
 	});
@@ -242,10 +247,14 @@ describe('refreshWorkerCapabilities', () => {
 			dirty: false,
 		});
 
-		expect(updateWorkerCapabilities).toHaveBeenCalledWith('worker-1', ['claude'], undefined, null, {
-			commit: '9f3a1b2c4d5e6f70819a2b3c4d5e6f7081920a3b',
-			dirty: false,
-		});
+		expect(updateWorkerCapabilities).toHaveBeenCalledWith(
+			'worker-1',
+			['claude'],
+			undefined,
+			null,
+			{ commit: '9f3a1b2c4d5e6f70819a2b3c4d5e6f7081920a3b', dirty: false },
+			undefined,
+		);
 	});
 
 	it('forwards a null build unchanged, which clears an earlier daemon’s build', async () => {
@@ -261,6 +270,7 @@ describe('refreshWorkerCapabilities', () => {
 			undefined,
 			null,
 			null,
+			undefined,
 		);
 	});
 
@@ -270,6 +280,33 @@ describe('refreshWorkerCapabilities', () => {
 				commit: 'not-a-commit',
 				dirty: false,
 			}),
+		).rejects.toThrow();
+		expect(updateWorkerCapabilities).not.toHaveBeenCalled();
+	});
+
+	// Issue #997 — the daemon's supervision declaration. Two-valued at this seam, since
+	// the column has no null, and validated here so the service is a boundary that
+	// cannot store a value no reader would recognise.
+	it('validates and forwards a declared supervision', async () => {
+		updateWorkerCapabilities.mockImplementation(async (id, capabilities) =>
+			makeWorker({ id, capabilities }),
+		);
+
+		await refreshWorkerCapabilities('worker-1', ['claude'], undefined, null, null, 'unsupervised');
+
+		expect(updateWorkerCapabilities).toHaveBeenCalledWith(
+			'worker-1',
+			['claude'],
+			undefined,
+			null,
+			null,
+			'unsupervised',
+		);
+	});
+
+	it('rejects a supervision value outside the vocabulary without hitting the repository', async () => {
+		await expect(
+			refreshWorkerCapabilities('worker-1', ['claude'], undefined, null, null, 'launchd' as never),
 		).rejects.toThrow();
 		expect(updateWorkerCapabilities).not.toHaveBeenCalled();
 	});

@@ -41,6 +41,7 @@ import {
 	type WorktreeSweepStatus,
 } from '../../identity/worker.js';
 import type { WorkerBuild, WorkerUpdateStatus } from '../../lib/build-identity.js';
+import type { WorkerSupervision } from '../../lib/worker-supervision.js';
 import type { WorkerUpdateJob } from '../../queue/jobs.js';
 // The single place a job's priority is decided (issue #972) — imported rather than
 // restating the constant. A pure function: `getQueue()` is lazy, so importing the
@@ -105,6 +106,10 @@ function rowToWorker(row: WorkerRow): Worker {
 		// (issue #918). The pair is always written together, so a non-null commit with a
 		// null flag can only be a row hand-edited in `psql`; read that as not dirty.
 		build: row.buildCommit ? { commit: row.buildCommit, dirty: row.buildDirty ?? false } : null,
+		// No reassembly and no defaulting, unlike the pair above: the column is NOT NULL
+		// with an `'unknown'` default, so every row already carries one of the three
+		// members (issue #997).
+		supervision: row.supervision as WorkerSupervision,
 		update: rowToUpdateState(row),
 		worktreeSweep: rowToWorktreeSweepState(row),
 		createdAt: row.createdAt,
@@ -298,6 +303,13 @@ export async function findWorkerByCredentialHash(hash: string): Promise<Worker |
  * spans **two** columns: `null` sets both `build_commit` and `build_dirty` to null,
  * and a value writes both, so the pair is never half-set.
  *
+ * `supervision` (issue #997) is how that daemon is supervised, written in the same
+ * transaction and **two-valued** rather than three: `undefined` leaves the stored
+ * value alone (the `set-cli` path again, which knows nothing about supervision) and
+ * a value writes it. There is no `null` case because the column has none — `unknown`
+ * is a member of the vocabulary, so a daemon that cannot tell says so explicitly and
+ * the caller's own boundary is where an omitted wire field becomes it.
+ *
  * Note the asymmetry with the CLI check above: phases are deliberately *not*
  * validated against enrollments, even though an enrollment does now constrain them
  * (`allowedPhases`, issue #509). The two constraints are maintained differently on
@@ -336,6 +348,7 @@ export async function updateWorkerCapabilities(
 	supportedPhases?: TriggerPhase[],
 	repository?: string | null,
 	build?: WorkerBuild | null,
+	supervision?: WorkerSupervision,
 ): Promise<Worker | undefined> {
 	return await getDb().transaction(async (tx) => {
 		const existingWorkerRows = await tx
@@ -374,6 +387,7 @@ export async function updateWorkerCapabilities(
 			declaration.buildCommit = build?.commit ?? null;
 			declaration.buildDirty = build?.dirty ?? null;
 		}
+		if (supervision) declaration.supervision = supervision;
 
 		const [updatedRow] = await tx
 			.update(workers)

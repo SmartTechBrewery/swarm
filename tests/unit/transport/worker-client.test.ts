@@ -246,6 +246,33 @@ describe('buildHandshakeRequest', () => {
 		expect(request).not.toHaveProperty('build');
 	});
 
+	// Issue #997 — how this daemon is supervised, carried and omitted on exactly the
+	// same terms again, so a caller that supplies nothing sends the body a daemon
+	// predating the field sends.
+	it('carries the declared supervision', () => {
+		const request = buildHandshakeRequest({
+			credential: CREDENTIAL,
+			daemonVersion: '0.1.0',
+			hostname: 'ada-laptop',
+			capabilities: ['claude'],
+			supportedPhases: ALL_TRIGGER_PHASES,
+			supervision: 'unsupervised',
+		});
+		expect(request.supervision).toBe('unsupervised');
+	});
+
+	it('omits the supervision key entirely when the caller declares none', () => {
+		const request = buildHandshakeRequest({
+			credential: CREDENTIAL,
+			daemonVersion: '0.1.0',
+			hostname: 'ada-laptop',
+			capabilities: ['claude'],
+			supportedPhases: ALL_TRIGGER_PHASES,
+			supervision: undefined,
+		});
+		expect(request).not.toHaveProperty('supervision');
+	});
+
 	it('rejects an empty capability set (the protocol requires at least one CLI)', () => {
 		expect(() =>
 			buildHandshakeRequest({

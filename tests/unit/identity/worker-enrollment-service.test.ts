@@ -154,6 +154,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		update: null,
 		worktreeSweep: null,
 		build: null,
+		supervision: 'unknown',
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		updatedAt: new Date('2026-01-01T00:00:00Z'),
 		...overrides,
@@ -381,6 +382,18 @@ describe('listOwnerWorkers', () => {
 		const [view] = await listOwnerWorkers(OWNER_ID);
 
 		expect(view.drainingSince).toEqual(drainedAt);
+	});
+
+	// Issue #997: `swarm workers list` marks an unsupervised machine off whichever of
+	// the two reads answered it, so the owner's own view has to carry it too.
+	it('carries the declared supervision', async () => {
+		listWorkersForOwner.mockResolvedValue([makeWorker({ supervision: 'unsupervised' })]);
+		listEnrollmentsForWorker.mockResolvedValue([makeEnrollment()]);
+		getLiveSessionForWorker.mockResolvedValue(undefined);
+
+		const [view] = await listOwnerWorkers(OWNER_ID);
+
+		expect(view.supervision).toBe('unsupervised');
 	});
 });
 
@@ -711,6 +724,20 @@ describe('listDashboardWorkers (issue #133)', () => {
 			expect(view.buildIsCurrent).toBeNull();
 		});
 
+		// Issue #997 — the fifth declaration, carried straight through with no
+		// server-side verdict beside it: nothing is derived from it and nothing gated on
+		// it in this phase.
+		it('carries the declared supervision through to the row', async () => {
+			for (const supervision of ['supervised', 'unsupervised', 'unknown'] as const) {
+				rosterOf(makeWorker({ supervision }));
+				resolveOwnBuildIdentity.mockResolvedValue(CONTROL_PLANE);
+
+				const [view] = await listDashboardWorkers(null);
+
+				expect(view.supervision).toBe(supervision);
+			}
+		});
+
 		it('has no verdict for a machine that declared no build', async () => {
 			rosterOf(makeWorker({ build: null }));
 			resolveOwnBuildIdentity.mockResolvedValue(CONTROL_PLANE);
@@ -881,6 +908,10 @@ describe('listDashboardWorkers (issue #133)', () => {
 				'repository',
 				'build',
 				'buildIsCurrent',
+				// Non-secret in exactly the same way (issue #997): one enum member naming a
+				// kind of process supervision — no path, no supervisor job label, no
+				// credential.
+				'supervision',
 				// Non-secret in exactly the same way (issue #933): the ref an operator asked
 				// this machine to move to, and the machine's own words about what happened.
 				'update',

@@ -68,6 +68,7 @@ import {
 } from '../identity/worker-session-service.js';
 import type { WorkerBuild } from '../lib/build-identity.js';
 import { logger } from '../lib/logger.js';
+import type { WorkerSupervision } from '../lib/worker-supervision.js';
 import {
 	type ControlPlaneMessage,
 	HandshakeRequestSchema,
@@ -150,6 +151,7 @@ export interface WorkerTransportDeps {
 		supportedPhases: TriggerPhase[],
 		repository: string | null,
 		build: WorkerBuild | null,
+		supervision: WorkerSupervision,
 	) => Promise<Worker | undefined>;
 	/**
 	 * Police the worker's existing enrollments against the repository it just
@@ -410,6 +412,12 @@ export async function handleHandshake(
 	// NULL, i.e. exactly today's behaviour. `build` (issue #918) is normalized on that
 	// same clearing rule and for the same reason — the row states the build of the
 	// program currently operating it, so an older daemon's commit must not outlive it.
+	// `supervision` (issue #997) normalizes the same way once more: an omitted field
+	// records `'unknown'`, the neutral member, rather than leaving a newer daemon's
+	// statement standing for an older one replacing it on the same row. Note the two
+	// silences that meet here — a daemon too old to send the field, and one on a
+	// platform it cannot read — and that only the second is a *statement*; both are
+	// recorded as `'unknown'`, which is exactly what the column already said.
 	//
 	// The CLI set written here is only the daemon's *probe* (issue #783). If the row
 	// carries an owner's declaration, that declaration outranks it and is what
@@ -424,6 +432,7 @@ export async function handleHandshake(
 			request.supportedPhases ?? [...DEFAULT_WORKER_SUPPORTED_PHASES],
 			request.repository ?? null,
 			request.build ?? null,
+			request.supervision ?? 'unknown',
 		);
 	} catch (err) {
 		if (err instanceof WorkerCapabilityReductionError) {

@@ -11,6 +11,7 @@ import {
 import type { AgentCli } from '../../harness/agent-cli.js';
 import type { WorktreeSweepResult, WorktreeSweepStatus } from '../../identity/worker.js';
 import type { WorkerUpdateStatus } from '../../lib/build-identity.js';
+import type { WorkerSupervision } from '../../lib/worker-supervision.js';
 import { ALL_TRIGGER_PHASES, type TriggerPhase } from '../../triggers/types.js';
 import { users } from './users.js';
 
@@ -144,6 +145,28 @@ export const workers = pgTable(
 		 * written together (`updateWorkerCapabilities`), so it is never half-set.
 		 */
 		buildDirty: boolean('build_dirty'),
+		/**
+		 * Whether a process supervisor will start the daemon currently operating this
+		 * row again after it exits (issue #997) — the **fifth** self-declared fact,
+		 * declared at handshake and rewritten on every reconnect. Nothing else on the
+		 * row implies it: the four declarations above read identically on a machine that
+		 * comes back from a restart it takes on its own and on one that is simply gone.
+		 *
+		 * `NOT NULL` with an `'unknown'` default, deliberately **not** `repository`/`build`'s
+		 * nullable contract. Those two have a meaningful absent state; this one does not
+		 * — the whole point of the third enum member is that "we do not know" is a value
+		 * every reader must handle, so a NULL beside it would be two spellings of one
+		 * fact and an invitation to read one of them as false. It is the shape
+		 * `supported_phases` already uses: `NOT NULL` with a default that is exactly the
+		 * pre-column behaviour. The default is the *neutral* member, never `supervised`
+		 * — nothing is defaulted into "this machine will come back".
+		 *
+		 * `WorkerSupervisionSchema` (`src/lib/worker-supervision.ts`) is the source of
+		 * truth for the values. Nothing is backfilled and there is no index: the
+		 * supervision of a program that is not currently connected is not guessable, and
+		 * nothing queries by it.
+		 */
+		supervision: text('supervision').$type<WorkerSupervision>().notNull().default('unknown'),
 		/**
 		 * The self-update an operator asked this machine for (issue #933), in seven
 		 * columns that split cleanly in two: the **request** still outstanding
