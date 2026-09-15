@@ -68,6 +68,22 @@ export const SPLIT_CHILD_LABEL = 'swarm:split-child';
 export const PLANNED_LABEL = 'planned';
 
 /**
+ * Whether a card carries {@link PLANNED_LABEL} — the one provider-visible
+ * statement that this item holds a plan.
+ *
+ * Kept beside the label itself so its two readers share one reading rather than
+ * each writing the same `labels.some(…)`: the Planning dispatch gate
+ * (`src/triggers/handlers/pm-status.ts`) and the Implementation agent-config
+ * selection (`src/worker/consumer.ts`, issue #992). Provider-agnostic, because
+ * `WorkItem.labels` is the neutral shape every PM provider fills on its own board
+ * read (ai/RULES.md §2) — a Linear, Jira, or Trello card answers from its own
+ * native labels with no code change here.
+ */
+export function hasPlannedLabel(workItem: WorkItem): boolean {
+	return workItem.labels.some((label) => label.name === PLANNED_LABEL);
+}
+
+/**
  * Delimiters of the hidden HTML-comment block the contract is embedded in. An
  * HTML comment is invisible in GitHub's rendered issue body, so the marker adds
  * no visible clutter for a human reading the child issue. (This invisibility is

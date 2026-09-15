@@ -115,6 +115,7 @@ import type { ScheduleFollowUpReview } from '../pipeline/follow-up-review.js';
 import { runImplementationPhase } from '../pipeline/implementation.js';
 import { phaseLabel } from '../pipeline/phase-label.js';
 import { type ProposedScope, runPlanningPhase } from '../pipeline/planning.js';
+import { evaluatePreplan, hasPlannedLabel, isPreplanSkip } from '../pipeline/preplan.js';
 import { runResolveConflictsPhase } from '../pipeline/resolve-conflicts.js';
 import { type RespondCiOutcome, runRespondToCiPhase } from '../pipeline/respond-to-ci.js';
 import { runRespondToReviewPhase } from '../pipeline/respond-to-review.js';
@@ -1820,7 +1821,7 @@ function resolveModel(
 }
 
 /**
- * Check whether Planning **completed** for this work item — a failed or
+ * Check whether a Planning **run** completed for this task — a failed or
  * deferred attempt does not count (issue #247). The history lookup is
  * best-effort: an error assumes planning occurred so dispatch keeps using the
  * established Implementation config rather than changing behavior on a DB hiccup.
@@ -1836,6 +1837,53 @@ async function wasPrecededByPlanning(projectId: string, taskId: string): Promise
 		});
 		return true;
 	}
+}
+
+/**
+ * Whether the item an Implementation dispatch is for holds a plan — the question
+ * `agents.implementationUnplanned` is selected by (`phaseAgentConfig`,
+ * `./target-policy.ts`). The unplanned variant is for an item that genuinely
+ * reached Implementation with nothing planned behind it, so anything that *is*
+ * planned has to answer yes here, however its plan was produced.
+ *
+ * Three signals, board-side first, run history last (issue #992):
+ *
+ * - **The `planned` label on the card** ({@link hasPlannedLabel}) — the canonical
+ *   provider-visible marker for "this item holds a plan" (issue #737), written by
+ *   every completed Planning run (`applyPlannedLabel`, a hard step no failed run
+ *   reaches) *and* by the split that hands a child its parent's plan
+ *   (`markSplitChildPlanned`). Free: the board read that resolved it is the
+ *   trigger's own authoritative re-read, already on `trigger.workItem`, so this
+ *   costs no extra board call and honours the one-card lookup budget (issue #735).
+ * - **A validated preplan marker in the card's description** — the plan itself,
+ *   for the narrow case where the label write was swallowed but the marker landed
+ *   (`markSplitChildPlanned`'s two failure branches). Deterministic and fail-closed:
+ *   a missing, malformed, foreign, or stale-scope marker is no answer at all
+ *   ({@link evaluatePreplan}) and falls through.
+ * - **A completed Planning run for this task** — {@link wasPrecededByPlanning}, the
+ *   original probe, now the fallback rather than the sole signal. It is what still
+ *   answers for a card whose label an operator removed after Planning ran, and for
+ *   the split child whose label write failed and was healed by a marker-reuse
+ *   Planning run.
+ *
+ * A split child is the case the run-history probe read backwards: it holds its
+ * parent's plan and carries the label, but never has a `runs` row of its own — so
+ * the correctly-labelled child looked unplanned while the one whose labelling
+ * failed (and therefore got a Planning dispatch) looked planned. All three signals
+ * are "a plan exists", so both paths now answer the same.
+ *
+ * Provider-agnostic throughout: the label and the description both come off the
+ * neutral {@link WorkItem} the `PMProvider` resolved (ai/RULES.md §2), never a
+ * GitHub shape.
+ */
+async function isPlannedForImplementation(
+	projectId: string,
+	taskId: string,
+	workItem: WorkItem,
+): Promise<boolean> {
+	if (hasPlannedLabel(workItem)) return true;
+	if (isPreplanSkip(evaluatePreplan(workItem))) return true;
+	return await wasPrecededByPlanning(projectId, taskId);
 }
 
 /**
@@ -4484,9 +4532,12 @@ export async function processJob(
 		// per job, best-effort: a DB hiccup falls through to the coded defaults rather
 		// than failing the run.
 		const globalDefaults = await loadGlobalDefaults();
+		// Which Implementation config block this dispatch runs on
+		// (`isPlannedForImplementation`). The card it reads is the trigger's own
+		// authoritative board re-read, so the two board-side signals cost nothing here.
 		const implementationUnplanned =
 			trigger.phase === 'implementation' &&
-			!(await wasPrecededByPlanning(project.id, trigger.taskId));
+			!(await isPlannedForImplementation(project.id, trigger.taskId, trigger.workItem));
 
 		// The federated dispatch gate (issue #339): confirm an eligible worker may
 		// take this phase — and on which configured target — *before* anything is

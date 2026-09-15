@@ -29,7 +29,7 @@ import type { ProjectConfig } from '../../config/schema.js';
 import { retireSupersededBoardPhases } from '../../dispatch/board-phase-retirement.js';
 import { requireProjectPMAdapter } from '../../integrations/pm/registry.js';
 import { logger } from '../../lib/logger.js';
-import { PLANNED_LABEL } from '../../pipeline/preplan.js';
+import { hasPlannedLabel, PLANNED_LABEL } from '../../pipeline/preplan.js';
 import {
 	isPhaseReportedStatusKey,
 	type PipelinePhase,
@@ -69,7 +69,7 @@ function isAlreadyPlanned(
 	resumePmPhase?: string,
 ): boolean {
 	if (phase !== 'planning' || resumePmPhase) return false;
-	if (!workItem.labels.some((label) => label.name === PLANNED_LABEL)) return false;
+	if (!hasPlannedLabel(workItem)) return false;
 	logger.info('pm-status: item already carries the planned label — skipping planning dispatch', {
 		itemId: workItem.id,
 		label: PLANNED_LABEL,
