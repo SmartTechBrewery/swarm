@@ -20,6 +20,18 @@
  * Not every recognised kind is a retry signal: `auth` (issue #343) is terminal
  * and classified purely so the run's headline says *why* — waiting cannot restore
  * a login, only a human re-running `/login` can.
+ *
+ * One signal is deliberately read outside "the CLI exited non-zero": an account
+ * quota the CLI reported in its *own* terminal failure record (issue #1013). `agy`
+ * hit a 429, retried it internally, was cut by its own print timeout mid-retry and
+ * **exited 0** with the quota verdict in its `result` event — so the exit code said
+ * the run had succeeded, the phase walked on into delivery validation, and the
+ * operator was told a hand-off was missing while the real cause (and a 16h39m reset
+ * hint) sat in the captured output. {@link agentRunFailed} therefore consults that
+ * verdict too, and {@link classifyAgentFailure} lets it outrank *how* the run
+ * stopped, so the run defers until the quota is actually back and the worker's CLI
+ * cool-down is recorded (issues #981/#988) instead of routing keeping an exhausted
+ * account in service.
  */
 
 import type { Checkpoint } from '../pipeline/checkpoint.js';
@@ -177,6 +189,17 @@ const TERMINAL_TAIL_LINES = 15;
 // A clock time optionally followed by a parenthesised IANA timezone, e.g.
 // `1:40pm (Europe/Warsaw)` or `13:40 (Europe/Warsaw)`.
 const RESET_TIME_RE = /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b(?:[^\n(]*\(([^)]+)\))?/i;
+// A *relative* reset — `in 16h39m20s` — which is how `agy` names one (observed
+// live on run 8656fb88-9049-46a2-ab3b-f2ebfa393f2d, issue #1013; it is Go's own
+// `time.Duration` rendering, agy being a Go binary). Unlike a wall-clock hint this
+// needs no timezone to resolve, so it is the one phrasing that always reaches
+// `retryAfter`. Anchored on a leading `in` and on digits immediately followed by
+// their unit, so prose that merely starts with a number ("in 3 minutes", "in a
+// while") matches nothing and falls through to the wall-clock reader; a trailing
+// sentence (`in 16h39m20s. Please upgrade …`) is ignored rather than rejected.
+const RELATIVE_RESET_RE = /^in\s+((?:\d+(?:\.\d+)?(?:ms|h|m|s))+)\b/i;
+const DURATION_PART_RE = /(\d+(?:\.\d+)?)(ms|h|m|s)/gi;
+const DURATION_UNIT_MS: Record<string, number> = { h: 3_600_000, m: 60_000, s: 1_000, ms: 1 };
 
 function terminalTail(output: string): string {
 	return output
@@ -294,13 +317,40 @@ function codexResetHint(message: string): string | undefined {
 }
 
 /**
+ * Resolve a relative "resets …" hint like `in 16h39m20s` to the instant that
+ * duration lands on, or undefined when the hint is not one. Needs no timezone,
+ * which is what makes it the phrasing that actually reaches `retryAfter` — a
+ * zone-less wall-clock hint never can (issue #1013).
+ */
+function parseRelativeReset(hint: string, now: Date): Date | undefined {
+	const match = RELATIVE_RESET_RE.exec(hint.trim());
+	if (!match?.[1]) return undefined;
+	let total = 0;
+	for (const [, amount, unit] of match[1].matchAll(DURATION_PART_RE)) {
+		total += Number(amount) * (DURATION_UNIT_MS[unit.toLowerCase()] ?? 0);
+	}
+	// A zero-length wait is no reset at all; leave the caller on its default
+	// backoff rather than scheduling a retry for this instant.
+	return total > 0 ? new Date(now.getTime() + total) : undefined;
+}
+
+/**
+ * Resolve a "resets …" hint to an absolute instant: either the duration it names
+ * ({@link parseRelativeReset}) or the next occurrence of the wall-clock time it
+ * names ({@link parseWallClockReset}).
+ */
+function parseRetryAfter(hint: string, now: Date): Date | undefined {
+	return parseRelativeReset(hint, now) ?? parseWallClockReset(hint, now);
+}
+
+/**
  * Resolve a "resets …" hint like `1:40pm (Europe/Warsaw)` to the next instant
  * that wall-clock time occurs in that timezone, relative to `now`. Returns
  * undefined if the hint lacks a timezone or anything fails to parse — the reset
  * time is unknowable without the zone, and a wrong guess is worse than a
  * default backoff. Never throws (an invalid timezone makes Intl throw).
  */
-function parseRetryAfter(hint: string, now: Date): Date | undefined {
+function parseWallClockReset(hint: string, now: Date): Date | undefined {
 	try {
 		const match = RESET_TIME_RE.exec(hint);
 		if (!match) return undefined;
@@ -339,30 +389,70 @@ function parseRetryAfter(hint: string, now: Date): Date | undefined {
 }
 
 /**
+ * Whether the CLI's *own* terminal failure record names an account quota: Claude's
+ * failed `result` event, Antigravity's non-`SUCCESS` `status`, or Codex's
+ * `error`/`turn.failed` record. Structural rather than free text — the record
+ * exists only because the CLI itself reported the run as failed *with* that
+ * reason, so it cannot be transcript text the agent merely quoted, and it needs no
+ * "resets …" co-occurrence to be trusted.
+ *
+ * That distinction is what makes this the one quota signal read outside a
+ * known-failed run (issue #1013): {@link agentRunFailed} consults it on a run that
+ * exited **0**, and {@link classifyAgentFailure} lets it outrank *how* the run
+ * stopped. The free-text branch stays confined to runs already known to have
+ * failed, where borrowed 429/"resets …" prose is the risk the co-occurrence gate
+ * guards against.
+ */
+function structuralRateLimit(result: AgentCliResult): boolean {
+	if (result.cli === 'claude')
+		return (
+			result.claudeFailure !== undefined &&
+			(CLAUDE_RATE_LIMIT_ERROR_RE.test(result.claudeFailure.subtype ?? '') ||
+				CLAUDE_RATE_LIMIT_ERROR_RE.test(result.claudeFailure.message ?? ''))
+		);
+	if (result.cli === 'antigravity')
+		return (
+			result.antigravityFailure !== undefined &&
+			(ANTIGRAVITY_RATE_LIMIT_ERROR_RE.test(result.antigravityFailure.status ?? '') ||
+				ANTIGRAVITY_RATE_LIMIT_ERROR_RE.test(result.antigravityFailure.message ?? ''))
+		);
+	return codexRateLimitMessage(result) !== undefined;
+}
+
+/**
  * Classify a failed agent run. `now` is injectable so the reset-time parse is
- * deterministic under test. A timed-out run is a `timeout` regardless of what it
- * printed (the harness killing it is the authoritative cause); next, a run the
- * harness's `signal` cancelled is `aborted` — this is the worker's own
- * shutdown (e.g. a dev `--watch` restart, or a graceful SIGTERM/SIGINT)
- * deliberately killing an in-flight run, not the agent failing on its own, and
- * it must be checked before scanning output: an aborted run's stdout/stderr is
- * typically empty or cut off mid-line, so there is nothing meaningful to scan
- * anyway (confirmed live: a `claude` run killed this way exited 143 with empty
- * output and `signal: null`, since it trapped SIGTERM and called `process.exit`
- * itself rather than being torn down by the OS — {@link AgentCliResult.aborted}
- * exists precisely because `result.signal` can't be trusted to reflect this).
+ * deterministic under test.
+ *
+ * A timed-out run is a `timeout` — the harness killing it is the authoritative
+ * cause — **unless the CLI had already reported an exhausted account quota**
+ * ({@link structuralRateLimit}, issue #1013): a run that spent its whole budget
+ * retrying a 429 stopped because the account is out of quota, and calling that a
+ * timeout defers it with no reset instant and records no CLI cool-down, so routing
+ * keeps sending Antigravity work to a machine that has none.
+ * Next, a run the harness's `signal` cancelled is `aborted` — this is the worker's
+ * own shutdown (e.g. a dev `--watch` restart, or a graceful SIGTERM/SIGINT)
+ * deliberately killing an in-flight run, not the agent failing on its own, and it
+ * outranks even a quota verdict: an aborted run's stdout/stderr is typically empty
+ * or cut off mid-line, so nothing read out of it is trustworthy (confirmed live: a
+ * `claude` run killed this way exited 143 with empty output and `signal: null`,
+ * since it trapped SIGTERM and called `process.exit` itself rather than being torn
+ * down by the OS — {@link AgentCliResult.aborted} exists precisely because
+ * `result.signal` can't be trusted to reflect this).
  * Next, a run whose CLI capped *itself* — agy's print-mode timeout, which it
  * announces on stderr while exiting 0 (issue #1000) — is a `timeout` too, and
- * carries the CLI's own notice so the message can name it.
+ * carries the CLI's own notice so the message can name it; a reported quota
+ * outranks this for the same reason it outranks SWARM's own kill, and the observed
+ * run carried both.
  * Next, a provider-capacity error is `capacity`, matched per CLI so one CLI's
  * provider error can't be triggered by another CLI merely quoting or discussing
  * the text: Codex's structured `error` / `turn.failed` events anywhere in its
  * output, or its terminal `selected model is at capacity` banner; and Claude's
- * terminal `529 Overloaded` / `overloaded_error` banner. A recognisable terminal
- * limit banner is then a `rate-limit` — as is a quota signal reported by a CLI's
- * own structural terminal failure record (Claude's failed `result` event,
- * Antigravity's non-`SUCCESS` `status`, or Codex's `error`/`turn.failed`
- * record), which needs no reset hint to be trusted.
+ * terminal `529 Overloaded` / `overloaded_error` banner. Capacity keeps its
+ * priority over a quota reading of the same run (issue #142) — the two share an
+ * HTTP status but not a disposition — which is why a capacity match suppresses
+ * the quota signal outright rather than merely being checked after it.
+ * A recognisable terminal limit banner is then a `rate-limit`, as is the
+ * structural quota verdict above.
  * Then a CLI's own "not authenticated" banner is `auth` — recognised for its
  * message, not to retry, and checked before the trailing stall marker so an
  * unauthenticated run cannot be deferred and resumed onto a login only a human
@@ -370,45 +460,33 @@ function parseRetryAfter(hint: string, now: Date): Date | undefined {
  * everything else is a plain `error`.
  */
 export function classifyAgentFailure(result: AgentCliResult, now: Date = new Date()): AgentFailure {
-	if (result.timedOut) return { kind: 'timeout' };
+	const output = `${result.stdout}\n${result.stderr}`;
+	const trimmed = output.trim();
+	const tail = terminalTail(output);
+
+	const isCapacity =
+		(result.cli === 'codex' &&
+			(hasCodexCapacityEvent(result.rawStdout ?? output) || CODEX_CAPACITY_RE.test(tail))) ||
+		(result.cli === 'claude' && CLAUDE_CAPACITY_RE.test(tail));
+	// Resolved up front because it is read *before* the two stop reasons below, not
+	// only after them (issue #1013).
+	const hasStructuralRateLimit = !isCapacity && structuralRateLimit(result);
+
+	if (result.timedOut && !hasStructuralRateLimit) return { kind: 'timeout' };
 	if (result.aborted) return { kind: 'aborted' };
 	// The CLI ended its own turn (issue #1000). Structural — the notice exists only
 	// because the CLI itself wrote it — so it is trusted with no co-occurrence gate,
-	// exactly like the three terminal failure records read below. Checked *after*
-	// SWARM's own two reasons, which stay authoritative: when SWARM killed the run
-	// or the caller cancelled it, that is the cause and the CLI's own cap never
-	// fired.
-	if (result.cliSelfTimeout !== undefined)
+	// exactly like the three terminal failure records read below.
+	if (result.cliSelfTimeout !== undefined && !hasStructuralRateLimit)
 		return { kind: 'timeout', cliSelfTimeout: result.cliSelfTimeout };
 
-	const output = `${result.stdout}\n${result.stderr}`;
-	const trimmed = output.trim();
+	if (isCapacity) return { kind: 'capacity' };
 
-	const tail = terminalTail(output);
-	if (
-		result.cli === 'codex' &&
-		(hasCodexCapacityEvent(result.rawStdout ?? output) || CODEX_CAPACITY_RE.test(tail))
-	)
-		return { kind: 'capacity' };
-	if (result.cli === 'claude' && CLAUDE_CAPACITY_RE.test(tail)) return { kind: 'capacity' };
-
-	const hasClaudeRateLimit =
-		result.cli === 'claude' &&
-		result.claudeFailure !== undefined &&
-		(CLAUDE_RATE_LIMIT_ERROR_RE.test(result.claudeFailure.subtype ?? '') ||
-			CLAUDE_RATE_LIMIT_ERROR_RE.test(result.claudeFailure.message ?? ''));
-	const hasAntigravityRateLimit =
-		result.cli === 'antigravity' &&
-		result.antigravityFailure !== undefined &&
-		(ANTIGRAVITY_RATE_LIMIT_ERROR_RE.test(result.antigravityFailure.status ?? '') ||
-			ANTIGRAVITY_RATE_LIMIT_ERROR_RE.test(result.antigravityFailure.message ?? ''));
 	const codexLimitMessage = codexRateLimitMessage(result);
 	const resetMatch = RESET_RE.exec(tail);
 	const isRateLimited =
+		hasStructuralRateLimit ||
 		LIMIT_BANNER_RE.test(tail) ||
-		hasClaudeRateLimit ||
-		hasAntigravityRateLimit ||
-		codexLimitMessage !== undefined ||
 		((USAGE_LIMIT_RE.test(tail) || RATE_HTTP_RE.test(tail)) && resetMatch !== null);
 
 	if (isRateLimited) {
@@ -433,7 +511,8 @@ export function classifyAgentFailure(result: AgentCliResult, now: Date = new Dat
 	// restores a login, so this is recognised for the headline's sake rather than
 	// to retry. Rate-limit signals return above because a structural quota result
 	// or terminal limit banner is more specific; auth still outranks the generic
-	// trailing stall marker below. `timedOut`/`aborted` still win above both.
+	// trailing stall marker below. `aborted` still wins above both, and so does a
+	// timeout that carried no structural quota verdict.
 	if (AUTH_BANNER_RE.test(tail)) return { kind: 'auth' };
 
 	// The CLI's own give-up-waiting phrasing (matched case-insensitively). Checked
@@ -461,11 +540,12 @@ const FAILURE_REASONS: Partial<Record<AgentFailureKind, string>> = {
 };
 
 /**
- * Build the {@link AgentRunError} a pipeline phase throws on a non-zero exit.
- * `prefix` is the phase-specific stem (`Review agent (claude) exited with code
- * 1`) and `tail` its suffix (` for PR #90`); this splices in a reason marker so
- * the message reads `… exited with code 1 (rate limited) for PR #90`, and
- * attaches the classification for the consumer to act on.
+ * Build the {@link AgentRunError} a pipeline phase throws for a run
+ * {@link agentRunFailed} rejected. `prefix` is the phase-specific stem (`Review
+ * agent (claude) exited with code 1`) and `tail` its suffix (` for PR #90`); this
+ * splices in a reason marker so the message reads `… exited with code 1 (rate
+ * limited) for PR #90`, and attaches the classification for the consumer to act
+ * on.
  */
 export function agentRunError(
 	result: AgentCliResult,
@@ -488,15 +568,27 @@ export function agentRunError(
 /**
  * Whether this run must be treated as a failed one by a phase's post-run gate.
  * A non-zero exit is the long-standing rule; a CLI that ended its own turn is the
- * addition (issue #1000) — it exits **0** with partial output, so the exit code
- * alone reads it as a finished run, and the phase walks on to a hand-off the agent
- * never got to write and reports the missing file instead of the timeout that
- * caused it.
+ * first addition (issue #1000) — it exits **0** with partial output, so the exit
+ * code alone reads it as a finished run, and the phase walks on to a hand-off the
+ * agent never got to write and reports the missing file instead of the timeout
+ * that caused it.
+ *
+ * A CLI that reported an exhausted account quota in its own terminal failure
+ * record is the second (issue #1013), and for the same reason: `agy` retried a 429
+ * internally, was cut mid-retry, and still exited 0 with that verdict in its
+ * `result` event. Only the **structural** verdict counts here
+ * ({@link structuralRateLimit}) — this gate also runs on runs that genuinely
+ * succeeded, and free-text 429/"resets …" prose in a healthy run's transcript must
+ * never turn it into a deferred one.
  *
  * Phases call this *before* reading any hand-off, which is what makes the
- * detection independent of one being absent: a CLI that self-terminates after
- * writing its hand-off is stopped at the same gate and reported just as honestly.
+ * detection independent of one being absent: a delivery-validation error cannot
+ * mask a cause the run's own output already named, and a CLI that self-terminates
+ * or runs out of quota after writing its hand-off is stopped at the same gate and
+ * reported just as honestly.
  */
 export function agentRunFailed(result: AgentCliResult): boolean {
-	return result.exitCode !== 0 || result.cliSelfTimeout !== undefined;
+	return (
+		result.exitCode !== 0 || result.cliSelfTimeout !== undefined || structuralRateLimit(result)
+	);
 }

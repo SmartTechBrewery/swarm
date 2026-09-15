@@ -8,6 +8,11 @@ import {
 	classifyAgentFailure,
 } from '@/harness/agent-failure.js';
 import {
+	ANTIGRAVITY_QUOTA_FAILURE,
+	ANTIGRAVITY_QUOTA_LOG_TEXT,
+	ANTIGRAVITY_QUOTA_SELF_TIMEOUT,
+} from '../../helpers/antigravity-quota.js';
+import {
 	CODEX_USAGE_LIMIT_ERROR_LINE,
 	CODEX_USAGE_LIMIT_LOG_TEXT,
 	CODEX_USAGE_LIMIT_MESSAGE,
@@ -395,17 +400,20 @@ describe('classifyAgentFailure', () => {
 		expect(failure.kind).toBe('rate-limit');
 	});
 
-	it('keeps timeout and abort ahead of a streamed Claude rate limit', () => {
+	it('keeps a streamed Claude rate limit ahead of a timeout, and abort ahead of both', () => {
+		// Issue #1013 inverts the timeout half: a run that spent its budget retrying a
+		// 429 stopped because the account is out of quota, and a `timeout` verdict
+		// defers it with no reset instant and records no CLI cool-down. An abort still
+		// wins — the worker's own shutdown leaves buffers empty or cut off mid-line.
 		const stdout = 'Claude run failed (error_during_execution): API Error: 429 rate_limit_error';
 		const claudeFailure = {
 			subtype: 'error_during_execution',
 			message: 'API Error: 429 rate_limit_error',
 		};
 		expect(
-			classifyAgentFailure(result({ cli: 'claude', stdout, claudeFailure, timedOut: true }), NOW),
-		).toEqual({
-			kind: 'timeout',
-		});
+			classifyAgentFailure(result({ cli: 'claude', stdout, claudeFailure, timedOut: true }), NOW)
+				.kind,
+		).toBe('rate-limit');
 		expect(
 			classifyAgentFailure(result({ cli: 'claude', stdout, claudeFailure, aborted: true }), NOW),
 		).toEqual({
@@ -466,15 +474,18 @@ describe('classifyAgentFailure', () => {
 		expect(failure.kind).toBe('error');
 	});
 
-	it('keeps timeout and abort ahead of a structural Antigravity rate limit', () => {
+	it('keeps a structural Antigravity rate limit ahead of a timeout, and abort ahead of both', () => {
+		// The #999 residue issue #1013 names: with agy's print cap raised to the phase
+		// budget, a run left retrying a 429 dies on SWARM's own timeout instead — still
+		// an exhausted account, so it must not settle as a plain timeout.
 		const stdout = 'Antigravity run failed (ERROR): RESOURCE_EXHAUSTED';
 		const antigravityFailure = { status: 'ERROR', message: 'RESOURCE_EXHAUSTED' };
 		expect(
 			classifyAgentFailure(
 				result({ cli: 'antigravity', stdout, antigravityFailure, timedOut: true }),
 				NOW,
-			),
-		).toEqual({ kind: 'timeout' });
+			).kind,
+		).toBe('rate-limit');
 		expect(
 			classifyAgentFailure(
 				result({ cli: 'antigravity', stdout, antigravityFailure, aborted: true }),
@@ -569,11 +580,11 @@ describe('classifyAgentFailure', () => {
 		expect(failure).toEqual({ kind: 'error' });
 	});
 
-	it('keeps timeout and abort ahead of a structural Codex rate limit', () => {
+	it('keeps a structural Codex rate limit ahead of a timeout, and abort ahead of both', () => {
 		const codexFailure = { message: CODEX_USAGE_LIMIT_MESSAGE };
 		expect(
-			classifyAgentFailure(result({ cli: 'codex', codexFailure, timedOut: true }), NOW),
-		).toEqual({ kind: 'timeout' });
+			classifyAgentFailure(result({ cli: 'codex', codexFailure, timedOut: true }), NOW).kind,
+		).toBe('rate-limit');
 		expect(
 			classifyAgentFailure(result({ cli: 'codex', codexFailure, aborted: true }), NOW),
 		).toEqual({ kind: 'aborted' });
@@ -786,7 +797,10 @@ describe('classifyAgentFailure', () => {
 		expect(failure).toEqual({ kind: 'stalled' });
 	});
 
-	it('treats a timed-out run as a timeout regardless of its output', () => {
+	it('treats a timed-out run with only free-text limit prose as a timeout', () => {
+		// The boundary issue #1013 draws: only the CLI's *own* terminal failure record
+		// outranks SWARM's kill. A banner in the transcript of a run SWARM killed is
+		// text the agent could have quoted, so it stays the timeout it was.
 		const failure = classifyAgentFailure(
 			result({ exitCode: null, timedOut: true, stdout: "you've hit your session limit" }),
 			NOW,
@@ -1005,5 +1019,95 @@ describe('a CLI that timed itself out (issue #1000)', () => {
 		it('passes a clean exit-0 run', () => {
 			expect(agentRunFailed(result({ exitCode: 0 }))).toBe(false);
 		});
+	});
+});
+
+describe('an agy run that exhausted its account quota (issue #1013)', () => {
+	// The observed shape, verbatim: `agy` hit a 429, retried it internally, was cut
+	// by its own print timeout mid-retry, and **exited 0** with the quota verdict in
+	// its terminal `result` event. SWARM recorded `Agent did not write required
+	// hand-off resolve_conflicts_handoff.json` and failed the run terminally at
+	// attempt 0, throwing away a 16h39m reset and writing no CLI cool-down.
+	const quotaExhausted = (overrides: Partial<AgentCliResult> = {}): AgentCliResult =>
+		result({
+			cli: 'antigravity',
+			exitCode: 0,
+			stdout: ANTIGRAVITY_QUOTA_LOG_TEXT,
+			stderr: ANTIGRAVITY_QUOTA_SELF_TIMEOUT,
+			// Latched off the live stderr stream by the harness (issue #1000) — this run
+			// carried both signals at once, which is the whole difficulty.
+			cliSelfTimeout: ANTIGRAVITY_QUOTA_SELF_TIMEOUT,
+			antigravityFailure: ANTIGRAVITY_QUOTA_FAILURE,
+			...overrides,
+		});
+
+	it('fails the phase gate despite the exit code the CLI chose', () => {
+		// `agentRunFailed` runs before any hand-off is read, so the missing hand-off
+		// this run would otherwise have produced can never mask the quota. The
+		// structural verdict stands on its own: the same run with no self-timeout
+		// notice — agy giving up on the 429 rather than being cut mid-retry — is
+		// stopped by the quota alone.
+		expect(agentRunFailed(quotaExhausted())).toBe(true);
+		expect(agentRunFailed(quotaExhausted({ cliSelfTimeout: undefined, stderr: '' }))).toBe(true);
+		expect(agentRunFailed(quotaExhausted({ exitCode: 1 }))).toBe(true);
+	});
+
+	it('classifies it as a rate-limit rather than the timeout it also was', () => {
+		// Both signals are present; a `timeout` verdict would defer with no reset
+		// instant and record no CLI cool-down, so routing would keep feeding the
+		// exhausted account for the next ~17 hours.
+		const failure = classifyAgentFailure(quotaExhausted(), NOW);
+		expect(failure.kind).toBe('rate-limit');
+		expect(failure.cliSelfTimeout).toBeUndefined();
+	});
+
+	it("carries agy's own reset instant through to retryAfter", () => {
+		const failure = classifyAgentFailure(quotaExhausted(), NOW);
+		expect(failure.resetHint).toContain('in 16h39m20s');
+		// NOW + 16h39m20s — the reset agy named, not the consumer's default backoff.
+		expect(failure.retryAfter?.toISOString()).toBe('2026-07-08T02:39:20.000Z');
+	});
+
+	it('names the quota in the message the operator reads', () => {
+		const err = agentRunError(
+			quotaExhausted(),
+			'Resolve-conflicts agent (antigravity) exited with code 0',
+			' for PR #170',
+			NOW,
+		);
+		expect(err.message).toBe(
+			'Resolve-conflicts agent (antigravity) exited with code 0 (rate limited) for PR #170',
+		);
+		expect(err.message).not.toMatch(/did not write required hand-off/);
+		expect(err.message).not.toMatch(/CLI timed out/);
+		expect(err.failure.kind).toBe('rate-limit');
+	});
+
+	it('still reports a self-timeout that named no quota as a timeout', () => {
+		// Issue #1000's case is untouched: without the CLI's own quota verdict the
+		// notice is still the most specific thing the run said about itself.
+		const failure = classifyAgentFailure(
+			quotaExhausted({ stdout: '', antigravityFailure: undefined }),
+			NOW,
+		);
+		expect(failure).toEqual({
+			kind: 'timeout',
+			cliSelfTimeout: ANTIGRAVITY_QUOTA_SELF_TIMEOUT,
+		});
+	});
+
+	it('does not defer a successful run whose transcript merely discusses a 429', () => {
+		// `agentRunFailed` now reads output on healthy runs too, so the free-text
+		// branch must stay out of it: this run wrote its hand-off and exited 0.
+		expect(
+			agentRunFailed(
+				result({
+					cli: 'antigravity',
+					exitCode: 0,
+					stdout:
+						'Added retry handling for HTTP 429 responses.\nThe budget resets 9:00am (Europe/Warsaw).',
+				}),
+			),
+		).toBe(false);
 	});
 });
