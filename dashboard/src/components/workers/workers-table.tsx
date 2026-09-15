@@ -5,7 +5,7 @@ import { WorkItemCell } from '@/components/runs/work-item-cell.js';
 import { Badge } from '@/components/ui/badge.js';
 import { Modal, ModalFooter } from '@/components/ui/modal.js';
 import { ToggleSwitch } from '@/components/ui/toggle-switch.js';
-import { WorkerBuildBadge } from '@/components/workers/worker-build.js';
+import { WorkerBuildBadge, WorkerUpdatingBadge } from '@/components/workers/worker-build.js';
 import { formatPhase, formatRelativeTime } from '@/lib/format.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
 import type {
@@ -44,13 +44,22 @@ import type {
  * broken out per project — a per-project breakdown is what the detail view is
  * for.
  *
- * The one *non*-operable addition since is the **build mark** (issue #925): a
- * machine whose declared SWARM build is not the control plane's own carries an
- * `Outdated` badge beside its name, so "which workers are behind?" is answerable by
- * scanning this table rather than by asking each machine's operator. It is a mark
- * and nothing more — dispatch is unaffected — and it earns no column of its own,
- * because it is a rare per-row exception rather than a fact every row carries. Which
- * build, and what it is being compared against, are on the detail view.
+ * The *non*-operable additions since are the two **build marks** beside a machine's
+ * name (`worker-build.tsx`). The first is staleness (issue #925): a machine whose
+ * declared SWARM build is not the control plane's own carries an `Outdated` badge,
+ * so "which workers are behind?" is answerable by scanning this table rather than by
+ * asking each machine's operator. The second is an update still in flight (issue
+ * #978): a machine with an outstanding request carries `Updating`, listed first
+ * because it is the more recent fact and the one that explains the other. Both are
+ * marks and nothing more — dispatch is unaffected — and they earn no column of their
+ * own, because they are rare per-row exceptions rather than facts every row carries.
+ * Which build, and what it is being compared against, are on the detail view.
+ *
+ * **They are shown together, never one instead of the other.** A machine waiting on
+ * an update usually *is* on a differing build, and the two say different things:
+ * `Outdated` that nobody has acted, `Updating` that somebody has. Hiding the first
+ * while the second shows would make the table lie by omission for exactly the window
+ * an operator is watching it.
  *
  * The **Draining marker** on the Status cell (issue #926) is the same kind of
  * addition: a machine an operator has taken out of the dispatch pool (issue #919) is
@@ -638,9 +647,9 @@ export function WorkersTable({
 							}`}
 						>
 							<td className="px-3 py-3 align-top text-sm font-medium text-zinc-100 break-words">
-								{/* The build mark sits beside the name rather than in a column of its
-								    own (issue #925): COLUMN_WIDTHS is a hand-tuned budget, and this is
-								    a rare per-row exception, not a fact every row carries. */}
+								{/* The build marks sit beside the name rather than in a column of their
+								    own (issues #925, #978): COLUMN_WIDTHS is a hand-tuned budget, and
+								    these are rare per-row exceptions, not facts every row carries. */}
 								<div className="flex flex-wrap items-center gap-x-2 gap-y-1">
 									{onSelectWorker ? (
 										<button
@@ -657,6 +666,7 @@ export function WorkersTable({
 									) : (
 										worker.displayName
 									)}
+									<WorkerUpdatingBadge update={worker.update} />
 									<WorkerBuildBadge buildIsCurrent={worker.buildIsCurrent} />
 								</div>
 							</td>

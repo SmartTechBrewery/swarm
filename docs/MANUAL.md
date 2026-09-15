@@ -307,6 +307,14 @@ outcome, so a request is still there after the next one is made, and it shows no
 for a machine nobody has asked. It offers no action: a failed request is re-asked with
 `swarm workers update`, exactly as below.
 
+**And while the request is outstanding, the roster says so** (issue #978). From the
+moment a machine is asked until it reports, it carries an amber `UPDATING` mark
+beside its name on the Workers table and on its own page — so a machine mid-update
+is not mistaken for one nobody has looked at. The build mark next to it is unchanged
+and still answers which build the machine is *actually* on: an update is only in
+effect once the daemon has restarted and re-declared. See **Is this worker running
+the fix?** below for how the two marks read together.
+
 **The machine must be enrolled in a project.** That run has to hang off one, so a
 worker enrolled in **no** project is refused rather than silently asked: `swarm
 workers update` says so and writes nothing, the fleet forms report the machine as
@@ -513,6 +521,20 @@ so that machine counts as a different build even on the same commit. No badge at
 all means there is nothing to compare: the machine declared no build (it has never
 connected, or its daemon predates the field), or this control plane cannot read its
 own (an install root with no `.git`). An unknown is never reported as stale.
+
+**Is somebody already fixing it?** That is the second badge (issue #978). A machine
+with an update request still outstanding — asked, and not yet reported — carries
+`UPDATING` beside its name on the roster and on its own page, naming on hover the
+build it was asked to move to and when it was asked. It is shown **beside**
+`OUTDATED`, never instead of it: the two are different facts, and a machine waiting
+on a request is usually both. `OUTDATED` says the machine's build differs and
+nobody has acted; `UPDATING` says somebody has, and that until the daemon restarts
+and re-declares, the machine is still running the build shown next to it. So the
+pair reads as "behind, and already being fixed" rather than as the bare "behind"
+both states used to look like. The mark clears itself when the machine reports —
+there is nothing to dismiss — and re-targeting a machine replaces the request it
+marks. It is read only from the pending request: what a machine last *reported* is
+`swarm workers list`'s answer and the **Update history** card's, not this badge's.
 
 Nothing is gated on the badge — a machine on a different build is still dispatched
 to. **A worker keeps running whatever its checkout held when its process last

@@ -4,7 +4,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import type { ReactElement } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { WorkerDetail, WorkerDetailEnrollment } from '@/types/workers.js';
+import type { WorkerDetail, WorkerDetailEnrollment, WorkerUpdate } from '@/types/workers.js';
 
 const {
 	setConsentMutate,
@@ -119,7 +119,8 @@ function makeWorker(overrides: Partial<WorkerDetail> = {}): WorkerDetail {
 		lastSeenAt: NOW.toISOString(),
 		// In the dispatch pool — the Pool membership card offers the drain (issue #926).
 		drainingSince: null,
-		// Never asked to update (issue #977) — the Update history card's empty state.
+		// Never asked to update: no pending request (issue #978) and no history (#977).
+		update: null,
 		updateHistory: [],
 		currentRun: null,
 		viewerIsOwner: true,
@@ -750,6 +751,117 @@ describe('WorkerDetailView enrollment blocks', () => {
 			expect(screen.queryByTitle(/differs from the control plane/)).toBeNull();
 			// …and the card says so, rather than silently comparing nothing.
 			expect(screen.getByText(/cannot read its own build/)).toBeDefined();
+		});
+
+		// Issue #978 — the second mark on the same field. It answers "somebody has
+		// acted", which the staleness mark beside it cannot.
+		describe('and the update in flight beside it (issue #978)', () => {
+			const UPDATING = /asked to move to/;
+			const OUTDATED = /differs from the control plane/;
+
+			/** A machine's update state as `workers.getById` serializes it (issue #933). */
+			function makeUpdate(overrides: Partial<WorkerUpdate> = {}): WorkerUpdate {
+				return {
+					// Non-null: the machine still owes an answer.
+					requestId: 'a1b2c3d4-0000-4000-8000-000000000000',
+					target: 'main',
+					requestedAt: NOW.toISOString(),
+					requestedByUserId: 'u1',
+					status: null,
+					message: null,
+					reportedAt: null,
+					...overrides,
+				};
+			}
+
+			/** The SWARM build field itself, so a mark is asserted on that field, not on the card. */
+			function buildField(): HTMLElement {
+				return within(section('Declared by the daemon')).getByText('SWARM build')
+					.parentElement as HTMLElement;
+			}
+
+			it('marks an outstanding request, naming the build and when it was asked', () => {
+				renderWorker({ update: makeUpdate(), enrollments: [] });
+
+				const badge = within(buildField()).getByTitle(UPDATING);
+				expect(badge.textContent).toBe('Updating');
+				expect(badge.getAttribute('title')).toContain('main');
+				expect(badge.getAttribute('title')).toContain(NOW.toLocaleString());
+			});
+
+			it('stops marking one that has reported — the request id is the pending marker', () => {
+				renderWorker({
+					update: makeUpdate({
+						requestId: null,
+						status: 'applied',
+						reportedAt: NOW.toISOString(),
+					}),
+					enrollments: [],
+				});
+
+				expect(screen.queryByTitle(UPDATING)).toBeNull();
+			});
+
+			it('marks nothing for a machine nobody has ever asked', () => {
+				renderWorker({ update: null, enrollments: [] });
+
+				expect(screen.queryByTitle(UPDATING)).toBeNull();
+			});
+
+			// The regression this phase exists to prevent.
+			it('shows both marks, distinctly, for a machine that is outdated and updating', () => {
+				renderWorker({
+					build: { commit: 'fedcba9876543210', dirty: false },
+					buildIsCurrent: false,
+					controlPlaneBuild: CONTROL_PLANE,
+					update: makeUpdate(),
+					enrollments: [],
+				});
+
+				const updating = screen.getByTitle(UPDATING);
+				const outdated = screen.getByTitle(OUTDATED);
+				expect(updating.textContent).toBe('Updating');
+				expect(outdated.textContent).toBe('Outdated');
+				expect(updating.getAttribute('title')).not.toBe(outdated.getAttribute('title'));
+				// Both on the SWARM build field, as two marks rather than one combined
+				// pill, with the more recent fact first.
+				expect(declaredFieldValue('SWARM build')).toBe('fedcba9UpdatingOutdated');
+			});
+
+			// A staleness verdict with no answer says nothing about a request in flight.
+			it('keeps the mark when the control plane cannot resolve its own build', () => {
+				renderWorker({
+					build: { commit: 'fedcba9876543210', dirty: false },
+					buildIsCurrent: null,
+					controlPlaneBuild: null,
+					update: makeUpdate(),
+					enrollments: [],
+				});
+
+				expect(screen.getByTitle(UPDATING).textContent).toBe('Updating');
+				expect(screen.queryByTitle(OUTDATED)).toBeNull();
+			});
+
+			// A daemon too old to declare a build can still be asked to move to one.
+			it('marks a machine that declared no build at all', () => {
+				renderWorker({
+					build: null,
+					buildIsCurrent: null,
+					update: makeUpdate(),
+					enrollments: [],
+				});
+
+				const field = within(buildField());
+				expect(field.getByTitle(UPDATING).textContent).toBe('Updating');
+				// …and the field still says it declared nothing, rather than going blank.
+				expect(field.getByText('—')).toBeDefined();
+			});
+
+			it('says in the card’s own prose that the two marks are different facts', () => {
+				renderWorker({ enrollments: [] });
+
+				expect(screen.getByText(/has been asked to move to a named build/)).toBeDefined();
+			});
 		});
 	});
 

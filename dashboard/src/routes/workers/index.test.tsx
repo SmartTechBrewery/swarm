@@ -69,6 +69,8 @@ function makeWorker(overrides: Partial<WorkerRow> = {}): WorkerRow {
 		connection: 'online',
 		lastSeenAt: '2026-07-01T12:00:00.000Z',
 		drainingSince: null,
+		// Never asked to update (issue #978) — the `Updating` mark's absent case.
+		update: null,
 		currentRun: null,
 		enrollments: [{ projectId: 'proj-a', status: 'active', allowedClis: ['claude'] }],
 		...overrides,

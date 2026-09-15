@@ -2,7 +2,11 @@ import { useMutation } from '@tanstack/react-query';
 import { type ReactNode, useState } from 'react';
 import { resolveRunTitle, WorkItemCell } from '@/components/runs/work-item-cell.js';
 import { Badge } from '@/components/ui/badge.js';
-import { formatWorkerBuild, WorkerBuildBadge } from '@/components/workers/worker-build.js';
+import {
+	formatWorkerBuild,
+	WorkerBuildBadge,
+	WorkerUpdatingBadge,
+} from '@/components/workers/worker-build.js';
 import { WorkerDeleteCard } from '@/components/workers/worker-delete-card.js';
 import { WorkerDrainCard } from '@/components/workers/worker-drain-card.js';
 import { WorkerEnrollDialog } from '@/components/workers/worker-enroll-dialog.js';
@@ -37,7 +41,10 @@ import type { AgentCli } from '../../../../src/harness/agent-cli.js';
  * when it is not the control plane's own build, and this screen is the one surface
  * that also *names* that build, so "differs from what" is readable rather than
  * remembered. Nothing acts on the mark — a machine on a different build is dispatched
- * to exactly as before.
+ * to exactly as before. Since issue #978 that field carries a second mark beside it,
+ * `Updating`, for a request the machine has not answered yet; the two are shown
+ * together, because "behind and nobody has noticed" and "behind and already being
+ * fixed" are different answers to the same glance.
  *
  * The CLI set is the exception, because since issue #783 it is two facts rather than
  * one: the daemon's probe, and the owner's **durable declaration** over it, which no
@@ -403,15 +410,21 @@ function SupportedPhases({ phases }: { phases: string[] }) {
 }
 
 /**
- * The build the daemon declared (issue #925), with the mark when it is not the
- * control plane's own: the short commit, a `+dirty` suffix when the running code is
+ * The build the daemon declared (issue #925), with both marks the Workers screens
+ * put beside a machine: the short commit, a `+dirty` suffix when the running code is
  * not exactly that commit, and `—` when the machine declared nothing.
+ *
+ * `Updating` leads (issue #978) — the more recent fact, and the one that explains a
+ * differing build beside it — and the two render together rather than one instead of
+ * the other. It is deliberately outside the undeclared-build case: a machine that
+ * declared no build can still have been asked to move to one, and that request is
+ * exactly what an operator is watching for.
  */
 function DeclaredBuild({ worker }: { worker: WorkerDetail }) {
-	if (!worker.build) return EM_DASH;
 	return (
-		<span className="inline-flex items-center gap-2">
-			{formatWorkerBuild(worker.build)}
+		<span className="inline-flex flex-wrap items-center gap-2">
+			{worker.build ? formatWorkerBuild(worker.build) : EM_DASH}
+			<WorkerUpdatingBadge update={worker.update} />
 			<WorkerBuildBadge
 				buildIsCurrent={worker.buildIsCurrent}
 				controlPlaneBuild={worker.controlPlaneBuild}
@@ -436,7 +449,8 @@ function BuildComparisonNote({
 		return (
 			<>
 				This control plane cannot read its own build, so nothing here is compared against it and no
-				machine is marked either way.
+				machine is marked <em>Outdated</em> either way. An <em>Updating</em> mark is unaffected: it
+				reports a request this machine has not answered, which needs no comparison.
 			</>
 		);
 	}
@@ -446,7 +460,10 @@ function BuildComparisonNote({
 			<span className="font-mono text-zinc-400">{formatWorkerBuild(controlPlaneBuild)}</span>, and a
 			machine whose build is not that one is marked <em>Outdated</em> — the two builds differ, which
 			is all an equality check can say. A worker keeps running whatever its checkout held when its
-			process last started, so the remedy is updating that checkout and restarting the daemon.
+			process last started, so the remedy is updating that checkout and restarting the daemon. A
+			machine marked <em>Updating</em> has been asked to move to a named build and has not answered
+			yet, so it is still running the build above: the two marks are different facts, and a machine
+			waiting on a request it has not answered carries both.
 		</>
 	);
 }

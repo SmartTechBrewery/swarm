@@ -62,6 +62,28 @@ export interface WorkerActiveRun {
 }
 
 /**
+ * The self-update an operator asked this machine for, and what came of it —
+ * mirroring the server `WorkerUpdateState` (`src/identity/worker.ts`, issue #933)
+ * as the wire serializes it (`serializeWorkerUpdate`): ISO instants, everything
+ * else verbatim. `null` for a machine nobody has ever asked.
+ *
+ * **`requestId` is the pending marker** — non-null means the machine still owes an
+ * answer — and it is the only field the build marks read (issue #978). `target`
+ * goes on naming the build the *latest* request concerned long after that request
+ * was answered, so presence of a value here says nothing about whether one is in
+ * flight; the durable per-request record is {@link WorkerUpdateHistoryEntry}.
+ */
+export interface WorkerUpdate {
+	requestId: string | null;
+	target: string;
+	requestedAt: string;
+	requestedByUserId: string | null;
+	status: string | null;
+	message: string | null;
+	reportedAt: string | null;
+}
+
+/**
  * One row of a machine's update history (`workers.getById`, issue #977, mirroring
  * the service's `WorkerUpdateRunRow`) — one `runs` row of `kind = 'worker-update'`,
  * which is what an update request has been recorded as since issue #971.
@@ -155,6 +177,17 @@ export interface WorkerRow {
 	 * the pool, so only an operator clears this (`workers.setDraining`).
 	 */
 	drainingSince: string | null;
+	/**
+	 * The update this machine was last asked for, and what came of it (issue #933),
+	 * or `null` if nobody ever has. Read *alongside* `buildIsCurrent`, never in place
+	 * of it: an outstanding request says somebody has acted, a differing build says
+	 * nobody has yet, and while a machine waits both are true at once — which is why
+	 * the Workers screen marks them separately (issue #978).
+	 *
+	 * The dashboard reads only the pending marker off it; what a machine *reported*
+	 * is `swarm workers list`'s and the detail view's `updateHistory`'s to tell.
+	 */
+	update: WorkerUpdate | null;
 	/** The job it is executing right now; null when idle or the run is out of scope. */
 	currentRun: WorkerActiveRun | null;
 	/** Only enrollments in projects the viewer may access; empty for an un-enrolled machine. */

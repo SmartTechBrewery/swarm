@@ -9,6 +9,7 @@ import type {
 	WorkerActiveRun,
 	WorkerRosterEntry,
 	WorkerRow,
+	WorkerUpdate,
 } from '@/types/workers.js';
 
 const { projectsListQueryFn, listMineQueryFn, rosterQueryFn, setConsentMutate } = vi.hoisted(
@@ -67,6 +68,8 @@ function makeWorker(overrides: Partial<WorkerRow> = {}): WorkerRow {
 		lastSeenAt: NOW.toISOString(),
 		// In the dispatch pool; a drained machine is the marked exception (issue #926).
 		drainingSince: null,
+		// Never asked to update (issue #978) — the `Updating` mark's absent case.
+		update: null,
 		currentRun: null,
 		enrollments: [{ projectId: 'proj-a', status: 'active', allowedClis: ['claude', 'codex'] }],
 		...overrides,
@@ -807,6 +810,93 @@ describe('WorkersTable build mark (issue #925)', () => {
 
 		expect(screen.getAllByRole('columnheader')).toHaveLength(6);
 		expect(screen.getAllByRole('row')[1].querySelectorAll('td')).toHaveLength(6);
+	});
+});
+
+// Issue #978 — the second mark beside a machine's name. "Behind and nobody has
+// noticed" and "behind and already being fixed" used to read as one state.
+describe('WorkersTable updating mark (issue #978)', () => {
+	/** Each mark by its own tooltip, which is also what tells the two apart. */
+	const OUTDATED = /differs from the control plane/;
+	const UPDATING = /asked to move to/;
+
+	/** A machine's update state as `workers.list` serializes it (issue #933). */
+	function makeUpdate(overrides: Partial<WorkerUpdate> = {}): WorkerUpdate {
+		return {
+			// Non-null: the machine still owes an answer.
+			requestId: 'a1b2c3d4-0000-4000-8000-000000000000',
+			target: 'main',
+			requestedAt: NOW.toISOString(),
+			requestedByUserId: 'u1',
+			status: null,
+			message: null,
+			reportedAt: null,
+			...overrides,
+		};
+	}
+
+	it('marks a machine whose request is still outstanding, naming the build and when', () => {
+		renderTable(<WorkersTable workers={[makeWorker({ update: makeUpdate() })]} />);
+
+		const badge = screen.getByTitle(UPDATING);
+		expect(badge.textContent).toBe('Updating');
+		expect(badge.getAttribute('title')).toContain('main');
+		expect(badge.getAttribute('title')).toContain(NOW.toLocaleString());
+		// In the Machine cell, beside the name — not a cell of its own.
+		expect(badge.closest('td')?.textContent).toContain('ada-laptop');
+	});
+
+	it('stops marking one that has reported — the request id is the pending marker', () => {
+		renderTable(
+			<WorkersTable
+				workers={[
+					// `target` still names the build the answered request concerned, so a mark
+					// keyed on the value's presence would never clear.
+					makeWorker({
+						update: makeUpdate({
+							requestId: null,
+							status: 'applied',
+							reportedAt: NOW.toISOString(),
+						}),
+					}),
+				]}
+			/>,
+		);
+
+		expect(screen.queryAllByTitle(UPDATING)).toHaveLength(0);
+	});
+
+	it('marks nothing for a machine nobody has ever asked', () => {
+		renderTable(<WorkersTable workers={[makeWorker({ update: null })]} />);
+
+		expect(screen.queryAllByTitle(UPDATING)).toHaveLength(0);
+	});
+
+	// The regression this phase exists to prevent: the two are different facts, and
+	// a machine waiting on a request it has not answered carries both.
+	it('shows both marks, distinctly, for a machine that is outdated and updating', () => {
+		renderTable(
+			<WorkersTable workers={[makeWorker({ buildIsCurrent: false, update: makeUpdate() })]} />,
+		);
+
+		const updating = screen.getByTitle(UPDATING);
+		const outdated = screen.getByTitle(OUTDATED);
+		expect(updating.textContent).toBe('Updating');
+		expect(outdated.textContent).toBe('Outdated');
+		expect(updating.getAttribute('title')).not.toBe(outdated.getAttribute('title'));
+		// Two marks in the one Machine cell, not one combined pill.
+		expect(updating.closest('td')).toBe(outdated.closest('td'));
+	});
+
+	// An unknown staleness verdict is still "no answer" — and says nothing about
+	// whether a request is outstanding.
+	it('keeps Updating when the staleness verdict is unknown', () => {
+		renderTable(
+			<WorkersTable workers={[makeWorker({ buildIsCurrent: null, update: makeUpdate() })]} />,
+		);
+
+		expect(screen.getByTitle(UPDATING).textContent).toBe('Updating');
+		expect(screen.queryAllByTitle(OUTDATED)).toHaveLength(0);
 	});
 });
 
