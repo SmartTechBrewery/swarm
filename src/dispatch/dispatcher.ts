@@ -19,6 +19,7 @@ import {
 	claimDispatch,
 	createDispatch,
 	type DispatchRow,
+	findWakeableWorkerUpdateDispatch,
 	getActiveDispatchByRunId,
 	listAvailabilityWaitsForWorker,
 	listPullRequestInFlightWaits,
@@ -27,6 +28,7 @@ import {
 	selectNextCapacityDispatch,
 	supersedeDispatchesByCoalesceKey,
 } from '../db/repositories/dispatchesRepository.js';
+import { adoptOutstandingWorkerUpdateRequest } from '../db/repositories/workersRepository.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { normalizeStoredJobPayload, type SwarmJob, SwarmJobSchema } from '../queue/jobs.js';
@@ -388,6 +390,78 @@ export async function promoteAvailabilityWaitsForWorker(
 		});
 		return 0;
 	}
+}
+
+/**
+ * Wake the update dispatch this machine's reconnection unblocks (issue #972) —
+ * the worker-update sibling of {@link promoteAvailabilityWaitsForWorker}, and
+ * the reason an update for an offline machine is delivered the moment it comes
+ * back rather than on the executor's timed backstop.
+ *
+ * A machine with an outstanding request and **no** dispatch at all is the one
+ * upgrade case this also has to serve: the request was recorded by a control
+ * plane older than this issue, when the row was the whole record and this hook
+ * pushed the frame itself. `adoptOutstandingWorkerUpdateRequest` writes the
+ * missing dispatch (idempotently, and answering `undefined` in every ordinary
+ * case, where the request already has one), and it is published here on the same
+ * outbox order as a fresh one.
+ *
+ * Follows that function's per-row order verbatim, for its reasons: **remove the
+ * delayed wake-up, then re-date the row, then publish the replacement**, so the
+ * dispatch never holds two live wake-ups at once. The candidate's wake-up is
+ * still delayed by construction ({@link findWakeableWorkerUpdateDispatch}), and
+ * the re-date is refused unless the row is still on that exact wake sequence, so
+ * a row that moved on had this wake-up superseded anyway.
+ *
+ * A dedicated read rather than a third leg on `listAvailabilityWaitsForWorker`:
+ * see that query's own comment. Best-effort and fully swallowed — it runs off a
+ * socket open, which a queue hiccup must never fail, and the executor's own timed
+ * re-check is underneath it. Returns whether a dispatch was woken.
+ */
+export async function promoteWorkerUpdateDispatchForWorker(workerId: string): Promise<boolean> {
+	try {
+		const waiting = await findWakeableWorkerUpdateDispatch(workerId);
+		if (!waiting) return await adoptPendingWorkerUpdateDispatch(workerId);
+		await removePendingJobById(wakeJobId(waiting));
+		const updated = await promoteDispatchToImmediateWake(waiting.id, waiting.wakeSeq);
+		// Claimed, cancelled, superseded by a re-target, or already promoted between
+		// the read and here — leave it to whoever won.
+		if (!updated) return false;
+		await publishDispatchWakeUp(updated);
+		logger.info('dispatch: worker reconnected — woke its pending update dispatch', {
+			workerId,
+			dispatchId: updated.id,
+		});
+		return true;
+	} catch (err) {
+		logger.warn('dispatch: worker-update promotion failed', {
+			workerId,
+			error: describeError(err),
+		});
+		return false;
+	}
+}
+
+/**
+ * Write and publish the dispatch an update request recorded before issue #972 never
+ * got, so the reconnect that used to push it directly still delivers it.
+ *
+ * The repository decides whether there is anything to do — it answers `undefined`
+ * for a request that already has a dispatch, which is every request recorded since
+ * — so this is a no-op on the ordinary path and reachable only across the upgrade.
+ * Throws are left to {@link promoteWorkerUpdateDispatchForWorker}'s own catch, which
+ * is what keeps a socket open failing on neither half.
+ */
+async function adoptPendingWorkerUpdateDispatch(workerId: string): Promise<boolean> {
+	const adopted = await adoptOutstandingWorkerUpdateRequest(workerId);
+	if (!adopted) return false;
+	await publishDispatchWakeUp(adopted);
+	logger.info('dispatch: adopted a pre-#972 update request into a durable dispatch', {
+		workerId,
+		dispatchId: adopted.id,
+		runId: adopted.runId,
+	});
+	return true;
 }
 
 /**

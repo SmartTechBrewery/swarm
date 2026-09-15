@@ -6,10 +6,11 @@
  * (`./worker-access.ts`, `./scm-verification.ts`) rather than inside a router.
  *
  * Nothing about the per-worker lifecycle moves here: each machine that is asked
- * gets the same row write (`requestWorkerUpdate`), the same `swarm:worker-update`
- * publish, the same `worker-update` frame and the same daemon decision layer
- * issue #933 built. What is new is *which* machines are asked in one action, and
- * a vocabulary for the ones that are deliberately not.
+ * gets the same row write (`requestWorkerUpdate`), the same durable
+ * `worker-update` dispatch it enqueues (issue #972), the same `worker-update`
+ * frame and the same daemon decision layer issue #933 built. What is new is
+ * *which* machines are asked in one action, and a vocabulary for the ones that
+ * are deliberately not.
  *
  * **One machine's state is never allowed to refuse the whole call.**
  * `workers.requestUpdate` throws `CONFLICT` for a machine still in the dispatch
@@ -65,11 +66,37 @@ import { randomUUID } from 'node:crypto';
 
 import { z } from 'zod';
 
+import type { DispatchRow } from '../db/repositories/dispatchesRepository.js';
+import { publishDispatchWakeUp } from '../dispatch/dispatcher.js';
 import type { Worker, WorkerUpdateState } from '../identity/worker.js';
 import { requestWorkerUpdate } from '../identity/worker-service.js';
 import { getLiveSessionForWorker } from '../identity/worker-session-service.js';
 import type { WorkerUpdateStatus } from '../lib/build-identity.js';
-import { publishWorkerUpdateRequest } from '../queue/worker-updates.js';
+import { describeError } from '../lib/errors.js';
+import { logger } from '../lib/logger.js';
+
+/**
+ * Publish the wake-up for a just-recorded update dispatch, swallowing any failure
+ * (issue #972) — the outbox half of `requestWorkerUpdate`, shared by the
+ * single-machine mutation (`./routers/workers.ts`) and the fan-out below so both
+ * keep one contract.
+ *
+ * **Never throws.** The dispatch is durable before this runs, so a failed publish
+ * costs promptness and nothing else: `reconcileDispatchesPeriodically` re-publishes
+ * any wake-up a crash window lost, and the machine's own reconnection wakes it as
+ * well. Failing the mutation over it would tell the operator their request did not
+ * land when it did.
+ */
+export async function publishWorkerUpdateWakeUp(dispatch: DispatchRow): Promise<void> {
+	try {
+		await publishDispatchWakeUp(dispatch);
+	} catch (err) {
+		logger.warn('worker update: failed to publish the update dispatch wake-up', {
+			dispatchId: dispatch.id,
+			error: describeError(err),
+		});
+	}
+}
 
 /**
  * What became of one machine in a fan-out. Two of the six record a request
@@ -78,8 +105,9 @@ import { publishWorkerUpdateRequest } from '../queue/worker-updates.js';
  *
  * - `requested` — recorded, and the machine has a live session, so the push is on
  *   its way.
- * - `queued-offline` — recorded; no live session, so the router states it again on
- *   the machine's next connection (`resendPendingWorkerUpdateToWorker`).
+ * - `queued-offline` — recorded; no live session, so its dispatch waits as a
+ *   `worker-eligibility` retry until the machine comes back and the reconnection
+ *   wakes it (`resendPendingWorkerUpdateToWorker`).
  * - `in-pool` — skipped: the machine is not draining, so asking it would give it
  *   new work while it waits to restart. The remedy is `swarm workers drain <id>`,
  *   exactly as `requestUpdate`'s own refusal names it.
@@ -143,8 +171,8 @@ export interface WorkerUpdateFanoutEntry {
  * list the operator read it against.
  *
  * Sequential rather than `Promise.all`: a fan-out across a fleet is a handful of row
- * writes plus a publish each, and serialising them keeps the Redis publishes — and
- * so the router's pushes — in a predictable order in the log.
+ * writes plus a publish each, and serialising them keeps the wake-ups — and so the
+ * router's pushes — in a predictable order in the log.
  */
 export async function fanOutWorkerUpdate(
 	workers: Worker[],
@@ -219,10 +247,10 @@ export async function fanOutWorkerUpdate(
 		// a machine that goes offline between this read and the push loses nothing. Read
 		// after the write, so a machine that was not asked costs no session lookup.
 		const live = await getLiveSessionForWorker(worker.id);
-		// After the durable write and never guarded: `publishWorkerUpdateRequest` swallows
-		// its own failures by contract, because the request lives on the row and a router
-		// that misses the notification pushes it the moment the machine next connects.
-		await publishWorkerUpdateRequest(worker.id);
+		// After the durable write and never guarded: the wake-up publisher swallows its
+		// own failures by contract, because the dispatch that delivers the request is
+		// already committed and the reconciler re-publishes anything a crash window lost.
+		await publishWorkerUpdateWakeUp(result.dispatch);
 		entries.push({
 			workerId: updated.id,
 			displayName: updated.displayName,

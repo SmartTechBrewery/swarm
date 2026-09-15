@@ -80,9 +80,10 @@ const {
 	requestWorktreeSweep: vi.fn(),
 	setWorkerDraining: vi.fn(),
 }));
-// Issue #933 — the API server publishes; only the router holds worker sockets.
-const { publishWorkerUpdateRequest } = vi.hoisted(() => ({
-	publishWorkerUpdateRequest: vi.fn(),
+// Issue #972 — the request enqueues a durable dispatch and the mutation publishes
+// its wake-up; only the router (the queue's consumer) holds worker sockets.
+const { publishWorkerUpdateWakeUp } = vi.hoisted(() => ({
+	publishWorkerUpdateWakeUp: vi.fn(),
 }));
 // Issue #955 — the same split for the sweep, on its own channel.
 const { publishWorktreeSweepRequest } = vi.hoisted(() => ({
@@ -151,9 +152,8 @@ vi.mock('@/identity/worker-service.js', () => ({
 	requestWorktreeSweep,
 	setWorkerDraining,
 }));
-vi.mock('@/queue/worker-updates.js', () => ({ publishWorkerUpdateRequest }));
 vi.mock('@/queue/worker-sweeps.js', () => ({ publishWorktreeSweepRequest }));
-vi.mock('@/api/worker-update-fanout.js', () => ({ fanOutWorkerUpdate }));
+vi.mock('@/api/worker-update-fanout.js', () => ({ fanOutWorkerUpdate, publishWorkerUpdateWakeUp }));
 vi.mock('@/api/worker-update-rollout.js', () => ({ getRolloutForOwner, startRollout }));
 vi.mock('@/db/repositories/workersRepository.js', () => ({ removeWorker }));
 vi.mock('@/identity/membership-service.js', () => ({ getMembership, listAccessibleProjectIds }));
@@ -279,7 +279,7 @@ beforeEach(() => {
 		fanOutWorkerUpdate,
 		startRollout,
 		getRolloutForOwner,
-		publishWorkerUpdateRequest,
+		publishWorkerUpdateWakeUp,
 		publishWorktreeSweepRequest,
 		removeWorker,
 		getMembership,
@@ -1555,7 +1555,15 @@ describe('workers.requestUpdate (owner-only, draining-only, issue #933)', () => 
 
 	/** The write accepted the request — its `draining_since` predicate matched. */
 	function accepted(target: string) {
-		return { outcome: 'requested', worker: requested(target) };
+		// The three writes `requestWorkerUpdate` now makes in one transaction: the row,
+		// the run that records the update (issue #971), and the dispatch that delivers
+		// it (issue #972).
+		return {
+			outcome: 'requested',
+			worker: requested(target),
+			runId: 'run-1',
+			dispatch: { id: 'dispatch-1', wakeSeq: 0, availableAt: new Date(0) },
+		};
 	}
 
 	it('is NOT_FOUND for an unknown worker', async () => {
@@ -1604,7 +1612,7 @@ describe('workers.requestUpdate (owner-only, draining-only, issue #933)', () => 
 				message: expect.stringContaining(`swarm workers drain ${WORKER_ID}`),
 			}),
 		);
-		expect(publishWorkerUpdateRequest).not.toHaveBeenCalled();
+		expect(publishWorkerUpdateWakeUp).not.toHaveBeenCalled();
 	});
 
 	// The same refusal for a machine that *was* draining when this handler read it and
@@ -1622,7 +1630,7 @@ describe('workers.requestUpdate (owner-only, draining-only, issue #933)', () => 
 				message: expect.stringContaining(`swarm workers drain ${WORKER_ID}`),
 			}),
 		);
-		expect(publishWorkerUpdateRequest).not.toHaveBeenCalled();
+		expect(publishWorkerUpdateWakeUp).not.toHaveBeenCalled();
 	});
 
 	it('records the request and publishes it for the router to push', async () => {
@@ -1639,7 +1647,9 @@ describe('workers.requestUpdate (owner-only, draining-only, issue #933)', () => 
 			'main',
 			OWNER_ID,
 		);
-		expect(publishWorkerUpdateRequest).toHaveBeenCalledWith(WORKER_ID);
+		expect(publishWorkerUpdateWakeUp).toHaveBeenCalledWith(
+			expect.objectContaining({ id: 'dispatch-1' }),
+		);
 		expect(result).toMatchObject({
 			workerId: WORKER_ID,
 			target: 'main',
@@ -1682,7 +1692,7 @@ describe('workers.requestUpdate (owner-only, draining-only, issue #933)', () => 
 		await expect(owner.requestUpdate({ workerId: WORKER_ID, target: 'main' })).rejects.toThrowError(
 			expect.objectContaining({ code: 'NOT_FOUND' }),
 		);
-		expect(publishWorkerUpdateRequest).not.toHaveBeenCalled();
+		expect(publishWorkerUpdateWakeUp).not.toHaveBeenCalled();
 	});
 
 	// Re-issuing overwrites, which is the only form of re-targeting this phase has.

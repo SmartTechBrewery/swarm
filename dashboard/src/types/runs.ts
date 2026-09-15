@@ -117,6 +117,7 @@ export const queuedPhaseHintSchema = z.enum([
 	'respond-to-ci',
 	'resolve-conflicts',
 	'merge-automation',
+	'worker-update',
 	'unknown',
 ]);
 export type QueuedPhaseHint = z.infer<typeof queuedPhaseHintSchema>;
@@ -196,7 +197,12 @@ export const queuedRunSchema = z.object({
 	/** The canonical dispatch id (issue #284) — the handle Put back operates on. */
 	jobId: z.string(),
 	projectId: z.string(),
-	type: z.enum(['scm', 'pm', 'merge-automation']),
+	/**
+	 * `worker-update` is the machine-scoped kind (issue #972): it names no
+	 * repository, no pull request and no board item — only a machine being moved to
+	 * a build.
+	 */
+	type: z.enum(['scm', 'pm', 'merge-automation', 'worker-update']),
 	providerId: z.string().optional(),
 	state: queuedRunStateSchema,
 	phaseHint: queuedPhaseHintSchema,
@@ -220,8 +226,13 @@ export const queuedRunSchema = z.object({
 	workItemTitle: z.string().optional(),
 	/** Resolved backing Issue/PR URL for a board job, when available. */
 	workItemUrl: z.string().optional(),
-	/** Effective BullMQ priority; 0 is highest. */
-	priority: z.number().int().nonnegative(),
+	/**
+	 * Effective queue priority: 0 is the default, positive is a demotion
+	 * (board-driven work), negative outranks everything already waiting (a worker
+	 * self-update, issue #972). Signed rather than non-negative — a negative that
+	 * failed the parse would take the whole queued-runs response down.
+	 */
+	priority: z.number().int(),
 	/**
 	 * Whether this dispatch is a prioritized SCM continuation (Review /
 	 * Respond-to-review / Respond-to-CI / Resolve-conflicts resumed after a

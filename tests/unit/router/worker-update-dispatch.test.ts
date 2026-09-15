@@ -5,27 +5,22 @@ import { deregisterConnection, registerConnection } from '@/router/worker-connec
 import {
 	pushPendingWorkerUpdate,
 	resendPendingWorkerUpdateToWorker,
-	subscribeWorkerUpdateDispatch,
 } from '@/router/worker-update-dispatch.js';
 
 /**
- * The bridge from a recorded update request to a pushed frame (issue #933).
+ * The bridge from a recorded update request to a pushed frame (issue #933),
+ * re-addressed to the durable queued unit that carries it (issue #972).
  *
  * Two collaborators are mocked and one is not, on the same reasoning
- * `dispatch-cancellation.test.ts` gives: the Redis subscription and the Postgres
+ * `dispatch-cancellation.test.ts` gives: the dispatch promotion and the Postgres
  * read are datastores, while the connected-worker registry is the real one, because
  * *which socket the frame lands on* is the thing under test.
  */
 
-const { subscribeToWorkerUpdateRequests, closeWorkerUpdateRedis } = vi.hoisted(() => ({
-	subscribeToWorkerUpdateRequests:
-		vi.fn<(onRequest: (workerId: string) => void) => { close: () => Promise<void> }>(),
-	closeWorkerUpdateRedis: vi.fn<() => Promise<void>>(),
+const { promoteWorkerUpdateDispatchForWorker } = vi.hoisted(() => ({
+	promoteWorkerUpdateDispatchForWorker: vi.fn<(workerId: string) => Promise<boolean>>(),
 }));
-vi.mock('@/queue/worker-updates.js', () => ({
-	subscribeToWorkerUpdateRequests,
-	closeWorkerUpdateRedis,
-}));
+vi.mock('@/dispatch/dispatcher.js', () => ({ promoteWorkerUpdateDispatchForWorker }));
 
 const { getWorker } = vi.hoisted(() => ({
 	getWorker: vi.fn<(id: string) => Promise<Worker | undefined>>(),
@@ -38,6 +33,8 @@ const OPEN = 1;
 const WORKER_ID = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
 const OTHER_WORKER_ID = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
 const REQUEST_ID = '66666666-6666-4666-8666-666666666666';
+/** A request the row has since moved off — what an id mismatch is written with. */
+const OTHER_REQUEST_ID = '77777777-7777-4777-8777-777777777777';
 /** Who asked for the update (issue #922) — recorded on the row, never read by the push. */
 const REQUESTER_ID = '00000000-0000-4000-8000-0000000000cc';
 
@@ -107,9 +104,8 @@ function connect(workerId: string): FakeWs {
 }
 
 beforeEach(() => {
-	subscribeToWorkerUpdateRequests.mockReset();
-	closeWorkerUpdateRedis.mockReset();
-	closeWorkerUpdateRedis.mockResolvedValue(undefined);
+	promoteWorkerUpdateDispatchForWorker.mockReset();
+	promoteWorkerUpdateDispatchForWorker.mockResolvedValue(true);
 	getWorker.mockReset();
 	connections = [];
 });
@@ -125,7 +121,7 @@ describe('pushPendingWorkerUpdate', () => {
 		const bystander = connect(OTHER_WORKER_ID);
 		getWorker.mockResolvedValue(workerWith(pending()));
 
-		await expect(pushPendingWorkerUpdate(WORKER_ID)).resolves.toBe(true);
+		await expect(pushPendingWorkerUpdate(WORKER_ID, REQUEST_ID)).resolves.toBe('pushed');
 
 		expect(framesOn(target)).toEqual([
 			{ type: 'worker-update', requestId: REQUEST_ID, target: 'main' },
@@ -133,99 +129,81 @@ describe('pushPendingWorkerUpdate', () => {
 		expect(framesOn(bystander)).toEqual([]);
 	});
 
-	// The channel carries a worker id and nothing else, so a message that arrives
-	// late, twice, or after a re-target cannot push a build the row has moved off.
-	it('pushes what the row says now, not what a notification claimed', async () => {
+	// The dispatch names a request; the *row* names the build. So a wake-up that
+	// arrives late, twice, or after a re-target cannot push a build the row moved off.
+	it('pushes what the row says now, not what the dispatch payload claimed', async () => {
 		const ws = connect(WORKER_ID);
 		getWorker.mockResolvedValue(workerWith(pending('v2')));
 
-		await pushPendingWorkerUpdate(WORKER_ID);
+		await pushPendingWorkerUpdate(WORKER_ID, REQUEST_ID);
 
 		expect(framesOn(ws)[0]).toMatchObject({ target: 'v2' });
 	});
 
-	it('pushes nothing when the request has already been answered', async () => {
+	// The id match, not a bare presence check: the row has moved on to another
+	// request, so this dispatch has nothing left to deliver.
+	it('answers superseded when the row waits on a different request', async () => {
+		const ws = connect(WORKER_ID);
+		getWorker.mockResolvedValue(workerWith(pending()));
+
+		await expect(pushPendingWorkerUpdate(WORKER_ID, OTHER_REQUEST_ID)).resolves.toBe('superseded');
+		expect(framesOn(ws)).toEqual([]);
+	});
+
+	it('answers superseded when the request has already been answered', async () => {
 		const ws = connect(WORKER_ID);
 		getWorker.mockResolvedValue(workerWith(reported()));
 
-		await expect(pushPendingWorkerUpdate(WORKER_ID)).resolves.toBe(false);
+		await expect(pushPendingWorkerUpdate(WORKER_ID, REQUEST_ID)).resolves.toBe('superseded');
 		expect(framesOn(ws)).toEqual([]);
 	});
 
-	it('pushes nothing when nobody has asked this machine to update', async () => {
+	it('answers superseded when nobody has asked this machine to update', async () => {
 		const ws = connect(WORKER_ID);
 		getWorker.mockResolvedValue(workerWith(null));
 
-		await expect(pushPendingWorkerUpdate(WORKER_ID)).resolves.toBe(false);
+		await expect(pushPendingWorkerUpdate(WORKER_ID, REQUEST_ID)).resolves.toBe('superseded');
 		expect(framesOn(ws)).toEqual([]);
 	});
 
-	it('answers false for an unknown worker rather than throwing', async () => {
+	it('answers superseded for an unknown worker rather than throwing', async () => {
 		getWorker.mockResolvedValue(undefined);
 
-		await expect(pushPendingWorkerUpdate(WORKER_ID)).resolves.toBe(false);
+		await expect(pushPendingWorkerUpdate(WORKER_ID, REQUEST_ID)).resolves.toBe('superseded');
 	});
 
 	// Not connected here is the *expected* case, since the machine has to be drained
-	// before it can be asked: the request stays on the row for the reconnect hook.
-	it('leaves the request pending when the worker has no socket here', async () => {
+	// before it can be asked: the dispatch waits rather than settling.
+	it('answers not-connected when the worker has no socket here', async () => {
 		getWorker.mockResolvedValue(workerWith(pending()));
 
-		await expect(pushPendingWorkerUpdate(WORKER_ID)).resolves.toBe(false);
+		await expect(pushPendingWorkerUpdate(WORKER_ID, REQUEST_ID)).resolves.toBe('not-connected');
 	});
 });
 
 describe('resendPendingWorkerUpdateToWorker', () => {
-	// The notification fires once, so the socket opening is where a request recorded
-	// while the machine was away is stated again.
-	it('pushes a pending request when the worker reconnects', async () => {
+	// One delivery path, not two (issue #972): reconnecting wakes the queued
+	// dispatch, which is what pushes — this hook never pushes on its own.
+	it("wakes the machine's queued update dispatch and pushes nothing itself", async () => {
 		const ws = connect(WORKER_ID);
 		getWorker.mockResolvedValue(workerWith(pending()));
 
 		resendPendingWorkerUpdateToWorker(WORKER_ID);
-		await vi.waitFor(() => expect(ws.send).toHaveBeenCalled());
+		await vi.waitFor(() =>
+			expect(promoteWorkerUpdateDispatchForWorker).toHaveBeenCalledExactlyOnceWith(WORKER_ID),
+		);
 
-		expect(framesOn(ws)[0]).toMatchObject({ type: 'worker-update', requestId: REQUEST_ID });
+		expect(ws.send).not.toHaveBeenCalled();
+		expect(getWorker).not.toHaveBeenCalled();
 	});
 
 	// Fire-and-forget by contract: the transport's connection hooks stay synchronous,
 	// so a socket that just opened must never fail on this.
-	it('swallows a failed read rather than throwing into the socket-open hook', async () => {
+	it('swallows a failed promotion rather than throwing into the socket-open hook', async () => {
 		connect(WORKER_ID);
-		getWorker.mockRejectedValue(new Error('database is down'));
+		promoteWorkerUpdateDispatchForWorker.mockRejectedValue(new Error('database is down'));
 
 		expect(() => resendPendingWorkerUpdateToWorker(WORKER_ID)).not.toThrow();
-		await vi.waitFor(() => expect(getWorker).toHaveBeenCalled());
-	});
-});
-
-describe('subscribeWorkerUpdateDispatch', () => {
-	it('turns each notification into a push to the worker it names', async () => {
-		const ws = connect(WORKER_ID);
-		getWorker.mockResolvedValue(workerWith(pending()));
-		let notify: ((workerId: string) => void) | undefined;
-		subscribeToWorkerUpdateRequests.mockImplementation((onRequest) => {
-			notify = onRequest;
-			return { close: async () => {} };
-		});
-
-		const subscription = subscribeWorkerUpdateDispatch();
-		notify?.(WORKER_ID);
-		await vi.waitFor(() => expect(ws.send).toHaveBeenCalled());
-
-		expect(framesOn(ws)[0]).toMatchObject({ type: 'worker-update', target: 'main' });
-		await subscription.close();
-	});
-
-	// Both halves, not just the subscriber: it is a duplicate of the shared client, so
-	// quitting only the duplicate leaves the router on an open Redis socket.
-	it('closes the subscriber and the shared client so the router can shut down cleanly', async () => {
-		const close = vi.fn().mockResolvedValue(undefined);
-		subscribeToWorkerUpdateRequests.mockReturnValue({ close });
-
-		await subscribeWorkerUpdateDispatch().close();
-
-		expect(close).toHaveBeenCalledTimes(1);
-		expect(closeWorkerUpdateRedis).toHaveBeenCalledTimes(1);
+		await vi.waitFor(() => expect(promoteWorkerUpdateDispatchForWorker).toHaveBeenCalled());
 	});
 });

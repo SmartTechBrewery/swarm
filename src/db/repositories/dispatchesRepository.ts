@@ -185,11 +185,16 @@ export const BRANCH_WRITING_PHASES = [
 ] as const satisfies readonly TriggerPhase[];
 
 /**
- * What a dispatch runs: a pipeline phase, or the agent-less merge-automation
- * executor (issue #292) — the one dispatch kind that never provisions a
- * worktree or spawns an agent CLI.
+ * What a dispatch runs: a pipeline phase, or one of the two agent-less
+ * executors — merge-automation (issue #292) and worker-update (issue #972) —
+ * the dispatch kinds that never provision a worktree or spawn an agent CLI.
+ *
+ * Neither is a {@link TriggerPhase}, which is what keeps them out of worker
+ * demand with no edit of their own: `pool-demand.ts` resolves a row's phase
+ * through `ALL_TRIGGER_PHASES.find(...)`, so a row naming one of these answers
+ * `undefined` and is never turned into demand on the worker pool.
  */
-export type DispatchPhase = TriggerPhase | 'merge-automation';
+export type DispatchPhase = TriggerPhase | 'merge-automation' | 'worker-update';
 
 /**
  * Terminal detail for a `completed` dispatch. The `merge-*` values (and
@@ -229,7 +234,14 @@ export type DispatchOutcome =
 	| 'merge-not-eligible'
 	| 'merge-policy-blocked'
 	| 'merge-unsupported'
-	| 'merge-retry-exhausted';
+	| 'merge-retry-exhausted'
+	/**
+	 * The `worker-update` frame reached the machine (issue #972). The dispatch's
+	 * whole job is the delivery, so this is where it ends: what the daemon makes
+	 * of the request is answered on its own report route and lands on the
+	 * `runs` row the request created (issue #971).
+	 */
+	| 'worker-update-pushed';
 
 export interface CreateDispatchInput {
 	projectId: string;
@@ -256,6 +268,19 @@ export interface CreateDispatchInput {
 }
 
 /**
+ * The executor the transaction-scoped writers here take, so `workersRepository`
+ * can create a worker-update dispatch inside the same transaction that writes
+ * the `workers` row and its run (issue #972) — a request with no dispatch is a
+ * request nothing will ever deliver.
+ *
+ * The spirit of `RunWriteExecutor` (`./runsRepository.ts`), widened to cover
+ * every statement these writers issue: `createDispatch` re-reads on a dedup
+ * conflict (`select`) as well as inserting, and
+ * {@link supersedeWorkerUpdateDispatches} updates.
+ */
+type DispatchWriteExecutor = Pick<ReturnType<typeof getDb>, 'insert' | 'select' | 'update'>;
+
+/**
  * Insert a dispatch, deduplicating on `dedupKey`: a conflict leaves the
  * existing row untouched and returns it with `created: false`, so a redelivered
  * webhook or a crash-retried synthetic enqueue can never mint a second
@@ -264,8 +289,8 @@ export interface CreateDispatchInput {
  */
 export async function createDispatch(
 	input: CreateDispatchInput,
+	db: DispatchWriteExecutor = getDb(),
 ): Promise<{ dispatch: DispatchRow; created: boolean }> {
-	const db = getDb();
 	const inserted = await db
 		.insert(dispatches)
 		.values({
@@ -298,6 +323,23 @@ export async function createDispatch(
 		.limit(1);
 	if (!existing[0]) throw new Error('Dispatch dedup conflict but no existing row found');
 	return { dispatch: existing[0], created: false };
+}
+
+/**
+ * The dispatch a dedup key already names, in whatever state — the *look before you
+ * insert* half {@link createDispatch}'s `ON CONFLICT DO NOTHING` cannot serve on its
+ * own, because that clause covers the `dedup_key` index alone: a row that would also
+ * violate `uq_dispatches_active_run` raises rather than dedupes, and which of the two
+ * Postgres reports is not something a caller may rely on. A writer that can be handed
+ * a `runId` whose dispatch already exists (adopting a pre-#972 update request,
+ * `./workersRepository.ts`) therefore asks first.
+ */
+export async function findDispatchByDedupKey(
+	dedupKey: string,
+	db: DispatchWriteExecutor = getDb(),
+): Promise<DispatchRow | undefined> {
+	const rows = await db.select().from(dispatches).where(eq(dispatches.dedupKey, dedupKey)).limit(1);
+	return rows[0];
 }
 
 /**
@@ -1651,6 +1693,84 @@ export async function promoteDispatchToImmediateWake(
 		)
 		.returning();
 	return rows[0] ?? null;
+}
+
+/**
+ * Cancel every non-terminal `worker-update` dispatch for this machine — the
+ * dispatch twin of `supersedeWorkerUpdateRun` (`./runsRepository.ts`), called
+ * from inside `requestWorkerUpdate`'s own transaction (issue #972).
+ *
+ * Re-targeting is the only "cancel" an update request has: the `workers` row
+ * keeps one request, so the previous request's dispatch must not linger
+ * non-terminal, both because it would push a build the row has moved off and
+ * because it would sit in the queue as a unit nothing can ever settle.
+ *
+ * Keyed on the payload's own `workerId` rather than on a column: the machine is
+ * this variant's subject and no dispatch column names one (`selected_worker_id`
+ * is the *executing* worker, which for this kind is always null — the control
+ * plane pushes the frame itself).
+ */
+export async function supersedeWorkerUpdateDispatches(
+	workerId: string,
+	reason: string,
+	db: DispatchWriteExecutor = getDb(),
+): Promise<void> {
+	const now = new Date();
+	await db
+		.update(dispatches)
+		.set({
+			state: 'cancelled',
+			lastError: reason,
+			waitReason: null,
+			leaseOwner: null,
+			leaseExpiresAt: null,
+			completedAt: now,
+			updatedAt: now,
+		})
+		.where(
+			and(
+				inArray(dispatches.state, [...ACTIVE_DISPATCH_STATES]),
+				eq(dispatches.phase, 'worker-update'),
+				sql`${dispatches.jobPayload} ->> 'workerId' = ${workerId}`,
+			),
+		);
+}
+
+/**
+ * The update dispatch this machine's reconnection unblocks (issue #972): its
+ * `worker-update` row waiting out a `not-connected` push on the timed backstop,
+ * with a wake-up still in the future.
+ *
+ * Mirrors {@link listAvailabilityWaitsForWorker}'s predicate shape
+ * (`retry-scheduled` plus a still-future `available_at`), which is what makes
+ * {@link promoteDispatchToImmediateWake}'s remove-then-re-date sequence safe for
+ * it. A dedicated query rather than a third leg on that one, because its
+ * `worker-eligibility` leg is keyed on *routable project enrollment* while a
+ * worker-update dispatch deliberately hangs off the machine's oldest enrollment
+ * whatever its status (issue #971) — the generic query would miss exactly the
+ * machines this has to reach.
+ *
+ * At most one: a fresh request supersedes the previous machine's dispatch in the
+ * same transaction that records it ({@link supersedeWorkerUpdateDispatches}).
+ */
+export async function findWakeableWorkerUpdateDispatch(
+	workerId: string,
+	asOf: Date = new Date(),
+): Promise<DispatchRow | undefined> {
+	const rows = await getDb()
+		.select()
+		.from(dispatches)
+		.where(
+			and(
+				eq(dispatches.state, 'retry-scheduled'),
+				eq(dispatches.phase, 'worker-update'),
+				gt(dispatches.availableAt, asOf),
+				sql`${dispatches.jobPayload} ->> 'workerId' = ${workerId}`,
+			),
+		)
+		.orderBy(asc(dispatches.createdAt))
+		.limit(1);
+	return rows[0];
 }
 
 /**

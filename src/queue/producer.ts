@@ -33,6 +33,19 @@ let queue: Queue<SwarmJob> | null = null;
 export const PM_BOARD_JOB_PRIORITY = 10;
 
 /**
+ * A worker self-update is promoted *above* the default (issue #972): it is the
+ * shortest job in the system and the one everything else is waiting behind, so a
+ * machine asked to update while its queue is full is served first rather than
+ * last. The durable dispatch table orders claims by `priority ASC` and its
+ * `priority` column is a plain `integer` with no lower bound, so ranking ahead of
+ * everything needs no new mechanism — just a negative.
+ *
+ * **Carried to BullMQ as `lifo`, not as a priority** — see
+ * {@link bullMqOrderingOptions}.
+ */
+export const WORKER_UPDATE_JOB_PRIORITY = -10;
+
+/**
  * Normalizes before branching: most callers hand this a payload read straight out
  * of a `jsonb` column (`dispatch.jobPayload`, `run.jobPayload`), which is *typed*
  * {@link SwarmJob} but may still carry a pre-#385/#297 `{ type: 'github' }` /
@@ -41,13 +54,60 @@ export const PM_BOARD_JOB_PRIORITY = 10;
  * `priority: 0`, BullMQ's *highest*, the exact inversion this demotion exists to
  * prevent. Doing it here rather than at each call site covers every current and
  * future caller.
+ *
+ * The single place a job's priority is decided, for the dispatch table as well as
+ * for BullMQ — which is why the durable write (`requestWorkerUpdate`,
+ * `src/db/repositories/workersRepository.ts`) calls it rather than restating the
+ * constant.
  */
 export function priorityFor(job: SwarmJob): number | undefined {
 	const normalized = normalizeStoredJobPayload(job);
+	if (normalized.type === 'worker-update') return WORKER_UPDATE_JOB_PRIORITY;
 	return normalized.type === 'pm' ||
 		(normalized.type === 'scm' && normalized.event.kind === 'work-item')
 		? PM_BOARD_JOB_PRIORITY
 		: undefined;
+}
+
+/**
+ * The BullMQ job options that make the *transport* order a wake-up the way
+ * {@link priorityFor} ranks its dispatch — the `priority` option when the rank is a
+ * *demotion*, and `lifo` when it ranks above the default.
+ *
+ * **BullMQ has no priority tier above unset, and a negative would invert the
+ * ordering it asks for.** A BullMQ worker `RPOPLPUSH`es from the plain `wait` list
+ * first and only falls through to the prioritized ZSET when `wait` is empty; a job
+ * added with *any* priority — including a negative one, which `Job.addJob` rejects
+ * only for non-integers and values above `PRIORITY_LIMIT` — goes to that ZSET. So
+ * passing `-10` here would rank the wake-up **behind** every unset-priority
+ * wake-up: the exact inversion issue #972 exists to remove.
+ *
+ * Passing *nothing* is not enough either, which is what the first cut of #972 did:
+ * an option-less add `LPUSH`es onto `wait`, the end `RPOPLPUSH` does **not** take
+ * from, so the wake-up still queues behind every default job already waiting there
+ * — and with the control-plane consumer's slots all busy that is the ordinary case,
+ * not an edge. `lifo: true` is the remaining half and BullMQ's own name for it:
+ * `addStandardJob` `RPUSH`es instead, so the wake-up is the next job claimed rather
+ * than the last. It is the only mechanism BullMQ offers for ranking *above* the
+ * default, which is why a negative rank is expressed as this rather than handed
+ * over as a priority.
+ *
+ * One bound worth stating rather than rediscovering: a wake-up published with a
+ * **delay** loses it, because `promoteDelayedJobs` `LPUSH`es everything it moves out
+ * of the delayed set regardless of `lifo`. That costs this nothing — an update's
+ * delayed wake-up is only the executor's timed backstop for an offline machine, and
+ * the reconnect that actually ends that wait removes the delayed job and republishes
+ * it undelayed (`promoteWorkerUpdateDispatchForWorker`), so the wake-up that races
+ * real work is always an immediate one.
+ *
+ * The durable dispatch table, where ordering actually decides which unit a worker
+ * claims, honours the negative directly (`priority ASC`); BullMQ only carries the
+ * wake-up.
+ */
+function bullMqOrderingOptions(job: SwarmJob): { priority?: number; lifo?: boolean } {
+	const priority = priorityFor(job);
+	if (priority === undefined) return {};
+	return priority > 0 ? { priority } : { lifo: true };
 }
 
 /**
@@ -88,13 +148,10 @@ function getQueue(): Queue<SwarmJob> {
  * present so a redelivered webhook dedupes while the completed job is retained.
  */
 export async function enqueueJob(job: SwarmJob): Promise<string | undefined> {
-	const priority = priorityFor(job);
+	const ordering = bullMqOrderingOptions(job);
 	const opts =
-		job.deliveryId || priority !== undefined
-			? {
-					...(job.deliveryId ? { jobId: job.deliveryId } : {}),
-					...(priority !== undefined ? { priority } : {}),
-				}
+		job.deliveryId || Object.keys(ordering).length > 0
+			? { ...(job.deliveryId ? { jobId: job.deliveryId } : {}), ...ordering }
 			: undefined;
 	const added = await getQueue().add(job.type, job, opts);
 	return added.id;
@@ -114,11 +171,10 @@ export async function enqueueDispatchWakeUp(
 	jobId: string,
 	delayMs: number,
 ): Promise<string | undefined> {
-	const priority = priorityFor(job);
 	const added = await getQueue().add(job.type, job, {
 		jobId,
 		...(delayMs > 0 ? { delay: delayMs } : {}),
-		...(priority !== undefined ? { priority } : {}),
+		...bullMqOrderingOptions(job),
 	});
 	return added.id;
 }

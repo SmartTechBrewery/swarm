@@ -1,4 +1,4 @@
-import { and, desc, eq } from 'drizzle-orm';
+import { and, asc, desc, eq, sql } from 'drizzle-orm';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { getDb } from '../../../src/db/client.js';
 import { deleteProjectFromDb } from '../../../src/db/repositories/projectsRepository.js';
@@ -8,6 +8,7 @@ import {
 	getEnrollmentById,
 } from '../../../src/db/repositories/workerEnrollmentsRepository.js';
 import {
+	adoptOutstandingWorkerUpdateRequest,
 	createWorker,
 	findWorkerByCredentialHash,
 	getWorkerById,
@@ -26,6 +27,7 @@ import {
 	updateWorkerSupportedPhases,
 	type WorkerUpdateRequestOutcome,
 } from '../../../src/db/repositories/workersRepository.js';
+import { dispatches } from '../../../src/db/schema/dispatches.js';
 import { runs } from '../../../src/db/schema/runs.js';
 import { users } from '../../../src/db/schema/users.js';
 import { workerProjectEnrollments } from '../../../src/db/schema/workerProjectEnrollments.js';
@@ -507,6 +509,20 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 			return created.id;
 		}
 
+		/** The `worker-update` dispatch rows this machine has, oldest first. */
+		async function updateDispatchesFor(workerId: string) {
+			return await getDb()
+				.select()
+				.from(dispatches)
+				.where(
+					and(
+						eq(dispatches.phase, 'worker-update'),
+						sql`${dispatches.jobPayload} ->> 'workerId' = ${workerId}`,
+					),
+				)
+				.orderBy(asc(dispatches.createdAt));
+		}
+
 		/** The `worker-update` run rows this machine has, newest first. */
 		async function updateRunsFor(workerId: string) {
 			return await getDb()
@@ -864,6 +880,235 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 				expect(await updateRunsFor(id)).toHaveLength(0);
 				const reported = await recordWorkerUpdateReport(id, REQUEST_ID, 'applied', 'Applied.');
 				expect(reported?.update).toMatchObject({ status: 'applied' });
+			});
+		});
+
+		// Issue #972 — the durable unit that *delivers* the request, written in the same
+		// transaction as the row and the run for the reason #971 gave for the run: a
+		// recorded request with no dispatch is a request nothing will ever deliver.
+		describe('the dispatch it enqueues (issue #972)', () => {
+			it('creates one pending dispatch ranked ahead of waiting work, linked to the run', async () => {
+				const id = await freshWorker('ada-dispatch');
+
+				const result = await requestWorkerUpdate(id, REQUEST_ID, 'main', adaId);
+
+				if (result.outcome !== 'requested') throw new Error(`got '${result.outcome}'`);
+				const rows = await updateDispatchesFor(id);
+				expect(rows).toHaveLength(1);
+				expect(rows[0].id).toBe(result.dispatch.id);
+				expect(rows[0]).toMatchObject({
+					state: 'pending',
+					phase: 'worker-update',
+					source: 'manual',
+					projectId: UPDATE_PROJECT_ID,
+					runId: result.runId,
+					dedupKey: `worker-update:${REQUEST_ID}`,
+					attempt: 0,
+				});
+				// The whole point of the issue: it outranks everything already queued, and
+				// the column takes a negative with no migration.
+				expect(rows[0].priority).toBeLessThan(0);
+				expect(rows[0].jobPayload).toMatchObject({
+					type: 'worker-update',
+					workerId: id,
+					requestId: REQUEST_ID,
+					target: 'main',
+				});
+			});
+
+			// Without this the previous request's dispatch would sit in the queue waiting
+			// to push a build the row has moved off.
+			it('supersedes the previous dispatch when the machine is re-targeted', async () => {
+				const id = await freshWorker('ada-dispatch-retarget');
+				await requestWorkerUpdate(id, REQUEST_ID, 'main', adaId);
+
+				await requestWorkerUpdate(id, OTHER_REQUEST_ID, 'v2', adaId);
+
+				const rows = await updateDispatchesFor(id);
+				expect(rows).toHaveLength(2);
+				expect(rows[0]).toMatchObject({
+					state: 'cancelled',
+					dedupKey: `worker-update:${REQUEST_ID}`,
+				});
+				expect(rows[0].lastError).toContain('Superseded');
+				expect(rows[1]).toMatchObject({
+					state: 'pending',
+					dedupKey: `worker-update:${OTHER_REQUEST_ID}`,
+				});
+			});
+
+			// The same all-or-nothing boundary the run has: a machine with no project has
+			// nothing written at all.
+			it('writes no dispatch for a machine enrolled in no project', async () => {
+				const created = await createWorker({
+					ownerUserId: adaId,
+					displayName: 'ada-dispatch-orphan',
+					capabilities: ['claude'],
+					credentialHash: 'hash-ada-dispatch-orphan',
+				});
+				await setWorkerDraining(created.id, true);
+
+				expect((await requestWorkerUpdate(created.id, REQUEST_ID, 'main', adaId)).outcome).toBe(
+					'no-project',
+				);
+				expect(await updateDispatchesFor(created.id)).toHaveLength(0);
+			});
+
+			// The other refusal: still in the dispatch pool, so the write is declined by
+			// its own `WHERE` and none of the three rows is created.
+			it('writes no dispatch for a machine that is not draining', async () => {
+				const id = await freshWorker('ada-dispatch-in-pool');
+				await setWorkerDraining(id, false);
+
+				expect((await requestWorkerUpdate(id, REQUEST_ID, 'main', adaId)).outcome).toBe('in-pool');
+				expect(await updateDispatchesFor(id)).toHaveLength(0);
+			});
+		});
+
+		// Issue #972's upgrade boundary. Before it, a request lived on the `workers` row
+		// alone and the reconnect hook pushed it directly; that hook now wakes a dispatch,
+		// so a request an older control plane recorded and never delivered would have
+		// nothing to wake. Only a real database settles this one: what it does turns on
+		// the dispatch's dedup key and on the `runs` row the request may or may not have.
+		describe('adoptOutstandingWorkerUpdateRequest (issue #972)', () => {
+			/** Roll a machine's state back to what a pre-#972 control plane would have left. */
+			async function dropDispatch(workerId: string): Promise<void> {
+				await getDb()
+					.delete(dispatches)
+					.where(sql`${dispatches.jobPayload} ->> 'workerId' = ${workerId}`);
+			}
+
+			/** …and back to pre-#971, where the request had no run either. */
+			async function dropRun(workerId: string): Promise<void> {
+				await getDb().delete(runs).where(eq(runs.workerId, workerId));
+			}
+
+			it('writes the missing dispatch and links it to the run the request already has', async () => {
+				const id = await freshWorker('ada-adopt');
+				const requested = await requestWorkerUpdate(id, REQUEST_ID, 'main', adaId);
+				if (requested.outcome !== 'requested') throw new Error(`got '${requested.outcome}'`);
+				await dropDispatch(id);
+
+				const adopted = await adoptOutstandingWorkerUpdateRequest(id);
+
+				expect(adopted).toBeDefined();
+				expect(adopted).toMatchObject({
+					state: 'pending',
+					phase: 'worker-update',
+					source: 'manual',
+					projectId: UPDATE_PROJECT_ID,
+					// The run the operator is already looking at, not a second one.
+					runId: requested.runId,
+					dedupKey: `worker-update:${REQUEST_ID}`,
+				});
+				expect(adopted?.priority).toBeLessThan(0);
+				expect(adopted?.jobPayload).toMatchObject({
+					type: 'worker-update',
+					workerId: id,
+					requestId: REQUEST_ID,
+					target: 'main',
+				});
+				expect(await updateDispatchesFor(id)).toHaveLength(1);
+				expect(await updateRunsFor(id)).toHaveLength(1);
+			});
+
+			// A request older than #971 has no run at all: the dispatch is what will
+			// deliver it, so the record of that delivery starts here rather than nowhere.
+			it('creates the run too when the request predates issue #971', async () => {
+				const id = await freshWorker('ada-adopt-no-run');
+				await requestWorkerUpdate(id, REQUEST_ID, 'main', adaId);
+				await dropDispatch(id);
+				await dropRun(id);
+
+				const adopted = await adoptOutstandingWorkerUpdateRequest(id);
+
+				const runRows = await updateRunsFor(id);
+				expect(runRows).toHaveLength(1);
+				expect(runRows[0]).toMatchObject({
+					kind: 'worker-update',
+					phase: 'worker-update',
+					status: 'running',
+					maintenanceRequestId: REQUEST_ID,
+					maintenanceTarget: 'main',
+					maintenanceMachine: 'ada-adopt-no-run',
+				});
+				expect(adopted?.runId).toBe(runRows[0].id);
+			});
+
+			// The ordinary path since the issue: the request already carries its dispatch
+			// out of the transaction that recorded it, so a reconnect writes nothing.
+			it('writes nothing when the request already has its dispatch', async () => {
+				const id = await freshWorker('ada-adopt-noop');
+				await requestWorkerUpdate(id, REQUEST_ID, 'main', adaId);
+
+				expect(await adoptOutstandingWorkerUpdateRequest(id)).toBeUndefined();
+				expect(await updateDispatchesFor(id)).toHaveLength(1);
+			});
+
+			// Idempotent on the dedup key in *any* state, so a machine that reconnects
+			// after its update was delivered never collects a second dispatch for it.
+			it('writes nothing when the request’s dispatch has already been settled', async () => {
+				const id = await freshWorker('ada-adopt-settled');
+				await requestWorkerUpdate(id, REQUEST_ID, 'main', adaId);
+				await getDb()
+					.update(dispatches)
+					.set({ state: 'completed', outcome: 'worker-update-pushed', completedAt: new Date() })
+					.where(sql`${dispatches.jobPayload} ->> 'workerId' = ${id}`);
+
+				expect(await adoptOutstandingWorkerUpdateRequest(id)).toBeUndefined();
+				expect(await updateDispatchesFor(id)).toHaveLength(1);
+			});
+
+			it('is idempotent across repeated reconnects', async () => {
+				const id = await freshWorker('ada-adopt-twice');
+				await requestWorkerUpdate(id, REQUEST_ID, 'main', adaId);
+				await dropDispatch(id);
+
+				const first = await adoptOutstandingWorkerUpdateRequest(id);
+				const second = await adoptOutstandingWorkerUpdateRequest(id);
+
+				expect(first).toBeDefined();
+				expect(second).toBeUndefined();
+				expect(await updateDispatchesFor(id)).toHaveLength(1);
+				expect(await updateRunsFor(id)).toHaveLength(1);
+			});
+
+			// `update_request_id` is cleared by the report, so an answered request is not
+			// outstanding — reconnecting must not resurrect it.
+			it('writes nothing once the machine has reported an outcome', async () => {
+				const id = await freshWorker('ada-adopt-answered');
+				await requestWorkerUpdate(id, REQUEST_ID, 'main', adaId);
+				await recordWorkerUpdateReport(id, REQUEST_ID, 'applied', 'Applied.');
+				await dropDispatch(id);
+
+				expect(await adoptOutstandingWorkerUpdateRequest(id)).toBeUndefined();
+				expect(await updateDispatchesFor(id)).toHaveLength(0);
+			});
+
+			it('writes nothing for a machine nobody has asked to update', async () => {
+				const id = await freshWorker('ada-adopt-unasked');
+
+				expect(await adoptOutstandingWorkerUpdateRequest(id)).toBeUndefined();
+				expect(await updateDispatchesFor(id)).toHaveLength(0);
+			});
+
+			// The same boundary `requestWorkerUpdate` answers `no-project` for: nothing to
+			// hang the run and the dispatch off.
+			it('writes nothing for a machine enrolled in no project', async () => {
+				const id = await freshWorker('ada-adopt-orphan');
+				await requestWorkerUpdate(id, REQUEST_ID, 'main', adaId);
+				await dropDispatch(id);
+				await getDb()
+					.delete(workerProjectEnrollments)
+					.where(eq(workerProjectEnrollments.workerId, id));
+
+				expect(await adoptOutstandingWorkerUpdateRequest(id)).toBeUndefined();
+				expect(await updateDispatchesFor(id)).toHaveLength(0);
+			});
+
+			it('writes nothing for an unknown machine rather than throwing', async () => {
+				const unknown = '00000000-0000-4000-8000-0000000000ff';
+				await expect(adoptOutstandingWorkerUpdateRequest(unknown)).resolves.toBeUndefined();
 			});
 		});
 	});

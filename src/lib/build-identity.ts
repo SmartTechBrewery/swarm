@@ -37,8 +37,6 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 
-const execFileAsync = promisify(execFile);
-
 /**
  * A build identity on the wire (`HandshakeRequestSchema.build`) and in the read
  * model (`Worker.build`). The commit is normalised to lower-case hex so one
@@ -136,6 +134,11 @@ export function swarmInstallRoot(): string {
 
 async function git(cwd: string, args: string[]): Promise<string | null> {
 	try {
+		// Promisified here rather than at module scope: this module's *schemas* are
+		// imported by the queue contract (`../queue/jobs.ts`, issue #972) and by the
+		// wire protocol, and neither has any business binding `child_process` just by
+		// being loaded. Nothing here runs until a build identity is actually resolved.
+		const execFileAsync = promisify(execFile);
 		return (await execFileAsync('git', args, { cwd })).stdout.trim();
 	} catch {
 		return null;

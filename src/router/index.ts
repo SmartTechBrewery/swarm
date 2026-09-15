@@ -32,7 +32,6 @@ import { createWebhookApp } from './webhook-receiver.js';
 import { registerWorkerDelivery } from './worker-delivery.js';
 import { startRolloutAdvanceTicker } from './worker-rollout-advance.js';
 import { registerWorkerTransport } from './worker-transport.js';
-import { subscribeWorkerUpdateDispatch } from './worker-update-dispatch.js';
 import { subscribeWorktreeSweepDispatch } from './worktree-sweep-dispatch.js';
 
 // Tag every line this process emits so router and worker logs stay
@@ -73,25 +72,24 @@ const server = serve({ fetch: app.fetch, port }, () => {
 });
 injectWebSocket(server);
 
-// Deliver operator-requested worker self-updates to the machine they name (issue
-// #933). This process is the one holding worker sockets, so the API server records
-// the request and publishes it and the push happens here. Subscribed beside the
-// transport rather than inside the dispatch consumer, because an update concerns the
-// *machine* rather than any dispatch — a router serving sockets must deliver it
-// whatever the consumer is doing.
-const workerUpdates = subscribeWorkerUpdateDispatch();
-
-// The same bridge for the abandoned-worktree sweep (issue #955), subscribed beside
-// it for the same reason: a sweep concerns the *machine* rather than any dispatch,
-// and only this process can push the frame to it.
+// The cross-process bridge for the abandoned-worktree sweep (issue #955): this
+// process is the one holding worker sockets, so the API server records the request
+// and publishes it and the push happens here. Subscribed beside the transport rather
+// than inside the dispatch consumer, because a sweep concerns the *machine* rather
+// than any dispatch, and only this process can push the frame to it.
+//
+// Operator-requested worker self-updates used to be delivered by a second such
+// bridge. Since issue #972 an update is a durable queued unit like every other piece
+// of work, so its push is driven by the dispatch consumer below — which runs in this
+// same process — and there is nothing to subscribe here.
 const worktreeSweeps = subscribeWorktreeSweepDispatch();
 
 // Keep a staged fleet update moving with nobody watching (issue #941). The report
 // route and the socket-open hook cover every move a machine announces; this timer
 // covers the two it cannot — a machine that applied and never came back, and a wave
-// whose members were still mid-phase when they were drained. Started here for
-// `subscribeWorkerUpdateDispatch`'s reason: this is the process that holds worker
-// sockets and already runs migrations, so a control-plane timer belongs here. Ahead
+// whose members were still mid-phase when they were drained. Started here for the
+// sweep bridge's reason: this is the process that holds worker sockets and already
+// runs migrations, so a control-plane timer belongs here. Ahead
 // of those migrations is safe — the first sweep is a minute away, by which time they
 // have either run or this process has exited over them.
 const rolloutAdvance = startRolloutAdvanceTicker();
@@ -139,11 +137,6 @@ for (const signal of ['SIGTERM', 'SIGINT'] as const) {
 					await dispatchConsumer?.close();
 				} catch (err) {
 					logger.error('Dispatch consumer close failed', { error: describeError(err) });
-				}
-				try {
-					await workerUpdates.close();
-				} catch (err) {
-					logger.error('Worker-update subscriber close failed', { error: describeError(err) });
 				}
 				try {
 					await worktreeSweeps.close();

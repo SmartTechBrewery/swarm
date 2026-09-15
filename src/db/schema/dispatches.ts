@@ -95,7 +95,15 @@ export const dispatches = pgTable(
 		coalesceKey: text('coalesce_key'),
 		/** SCM continuations jump ahead of new board work when the project opts in. */
 		continuation: boolean('continuation').notNull().default(false),
-		/** Effective queue priority (BullMQ ranks 0/unset highest). */
+		/**
+		 * Effective queue priority: the column every claim-ordering read sorts by
+		 * `ASC`. 0 is the default, a positive value is a demotion (board-driven work,
+		 * `PM_BOARD_JOB_PRIORITY`), and a **negative** value outranks everything
+		 * already waiting (a worker self-update, `WORKER_UPDATE_JOB_PRIORITY`, issue
+		 * #972) — a plain `integer` with no lower bound, so ranking ahead needed no
+		 * migration. BullMQ's own priority is a different scale and is deliberately
+		 * not handed a negative (see `bullMqPriorityOption`, `src/queue/producer.ts`).
+		 */
 		priority: integer('priority').notNull().default(0),
 		/** Deferred-retry attempt counter (mirrors the payload's rateLimitRetryAttempt). */
 		attempt: integer('attempt').notNull().default(0),

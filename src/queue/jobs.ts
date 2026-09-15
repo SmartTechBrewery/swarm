@@ -20,6 +20,7 @@
 import { z } from 'zod';
 import { AgentCliSchema } from '../harness/agent-cli.js';
 import { ReasoningLevelSchema } from '../harness/models.js';
+import { WorkerUpdateTargetSchema } from '../lib/build-identity.js';
 import { PmEventSchema, PmProviderIdSchema } from '../pm/events.js';
 import { ScmEventSchema, ScmProviderIdSchema } from '../scm/events.js';
 
@@ -401,10 +402,44 @@ export const MergeAutomationJobSchema = jobBase.extend({
 	baseUpdates: z.number().int().min(0).optional(),
 });
 
+/**
+ * A durable worker self-update request (issue #972): an operator asked one
+ * machine to move its SWARM install root to a build, and that ask travels as a
+ * queued unit like every other piece of work rather than as a fire-and-forget
+ * pub/sub notification. The control-plane dispatch consumer — the process that
+ * holds worker sockets — claims it and pushes the `worker-update` frame, then
+ * settles the dispatch itself (`src/worker/worker-update-dispatch.ts`).
+ *
+ * The shortest job in the system and the one everything else waits behind, so it
+ * ranks *ahead* of everything already queued ({@link priorityFor},
+ * `./producer.ts`). It carries no webhook event, resolves no trigger, provisions
+ * no worktree and takes no project slot — modelled on `merge-automation`, the
+ * existing agent-less dispatch kind.
+ */
+export const WorkerUpdateJobSchema = jobBase.extend({
+	type: z.literal('worker-update'),
+	/** The machine asked to move its SWARM install root. */
+	workerId: z.string().uuid(),
+	/**
+	 * The request this dispatch delivers — `workers.update_request_id`, the id
+	 * `recordWorkerUpdateReport` settles by and the one the push matches the row
+	 * against, so a wake-up for a request the operator has since re-targeted away
+	 * from pushes nothing.
+	 */
+	requestId: z.string().uuid(),
+	/**
+	 * The build to move to. Re-validated here rather than trusted, because the
+	 * target is checked at every seam it crosses rather than once at the edge
+	 * (ai/ARCHITECTURE.md).
+	 */
+	target: WorkerUpdateTargetSchema,
+});
+
 const swarmJobVariants = z.discriminatedUnion('type', [
 	ScmWebhookJobSchema,
 	PmWebhookJobSchema,
 	MergeAutomationJobSchema,
+	WorkerUpdateJobSchema,
 ]);
 
 /**
@@ -443,6 +478,7 @@ export const SwarmJobSchema = z.preprocess(upgradeLegacyJobEnvelope, swarmJobVar
 export type ScmWebhookJob = z.infer<typeof ScmWebhookJobSchema>;
 export type PmWebhookJob = z.infer<typeof PmWebhookJobSchema>;
 export type MergeAutomationJob = z.infer<typeof MergeAutomationJobSchema>;
+export type WorkerUpdateJob = z.infer<typeof WorkerUpdateJobSchema>;
 export type SwarmJob = z.infer<typeof swarmJobVariants>;
 
 /**
@@ -466,9 +502,10 @@ export type SwarmJob = z.infer<typeof swarmJobVariants>;
  *   (`ProjectRepository.pmRoutingToken`), and a card claiming none or two is
  *   refused at ingress rather than enqueued. `undefined` only for a row written
  *   before that — the default entry, exactly as it ran then.
+ * - `worker-update` — none, stated rather than defaulted (see the case below).
  *
  * One `switch` exhaustive over the discriminator rather than a lookup with a
- * fallback: a fourth job type fails to compile until it states which repository it
+ * fallback: a fifth job type fails to compile until it states which repository it
  * belongs to, instead of silently inheriting the default.
  */
 export function repositoryForJob(job: SwarmJob): string | undefined {
@@ -479,6 +516,13 @@ export function repositoryForJob(job: SwarmJob): string | undefined {
 			return job.repo;
 		case 'pm':
 			return job.repository;
+		case 'worker-update':
+			// None. It moves a machine's SWARM install root; it touches no repository's
+			// code, opens no branch and no pull request. Stated rather than defaulted,
+			// because `undefined` here also means "the project's default entry" for a
+			// pre-#686 board row, and this variant means something stronger: there is no
+			// repository to scope to at all.
+			return undefined;
 	}
 }
 
