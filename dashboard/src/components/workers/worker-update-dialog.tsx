@@ -37,6 +37,7 @@ export function WorkerUpdateDialog({
 	onClose,
 	title,
 	confirmCopy,
+	scopeNote,
 	target,
 	requestUpdate,
 }: {
@@ -45,6 +46,13 @@ export function WorkerUpdateDialog({
 	title: string;
 	/** What the set is, in the caller's own words — the one sentence that differs between scopes. */
 	confirmCopy: ReactNode;
+	/**
+	 * One further sentence a scope needs and the shared copy cannot state — the
+	 * project-scoped action's "a machine enrolled in several projects is moved for all
+	 * of them", say. Rendered under the set it qualifies, and omitted entirely by a
+	 * scope with nothing extra to say, so neither caller carries the other's caveat.
+	 */
+	scopeNote?: ReactNode;
 	/** The build every machine is asked for: the control plane's own commit, read from the server. */
 	target: string;
 	/** The one mutation this dialog makes. The caller owns which procedure that is. */
@@ -69,7 +77,11 @@ export function WorkerUpdateDialog({
 				{updateMutation.isSuccess ? (
 					<WorkerUpdateReportView report={updateMutation.data} />
 				) : (
-					<WorkerUpdateConfirmation confirmCopy={confirmCopy} target={target} />
+					<WorkerUpdateConfirmation
+						confirmCopy={confirmCopy}
+						scopeNote={scopeNote}
+						target={target}
+					/>
 				)}
 
 				{updateMutation.isError ? (
@@ -132,9 +144,11 @@ export function WorkerUpdateDialog({
  */
 function WorkerUpdateConfirmation({
 	confirmCopy,
+	scopeNote,
 	target,
 }: {
 	confirmCopy: ReactNode;
+	scopeNote?: ReactNode;
 	target: string;
 }) {
 	return (
@@ -144,6 +158,7 @@ function WorkerUpdateConfirmation({
 				<span className="font-mono text-zinc-200">{target.slice(0, 7)}</span> — the build this
 				control plane is running — and restart its daemon.
 			</p>
+			{scopeNote ? <p className="text-sm text-zinc-400 leading-relaxed">{scopeNote}</p> : null}
 			<p className="text-sm text-zinc-400 leading-relaxed">
 				Only machines their owners have <strong>already drained</strong> are asked. One still in the
 				dispatch pool, enrolled in no project, or running under no process supervisor is reported

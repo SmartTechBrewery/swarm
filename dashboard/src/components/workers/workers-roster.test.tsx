@@ -16,6 +16,7 @@ const {
 	meQueryFn,
 	controlPlaneBuildQueryFn,
 	requestUpdateForInstallationMutate,
+	requestUpdateForProjectMutate,
 	reorderMutate,
 	navigate,
 } = vi.hoisted(() => ({
@@ -29,6 +30,8 @@ const {
 	// machine for, read from the server rather than invented in the browser.
 	controlPlaneBuildQueryFn: vi.fn(),
 	requestUpdateForInstallationMutate: vi.fn(),
+	// Issue #1010 — the project-scoped selection over that same fan-out.
+	requestUpdateForProjectMutate: vi.fn(),
 	reorderMutate: vi.fn(),
 	navigate: vi.fn(),
 }));
@@ -71,6 +74,7 @@ vi.mock('@/lib/trpc.js', () => ({
 			setConsent: { mutate: vi.fn() },
 			reorderProjectWorker: { mutate: reorderMutate },
 			requestUpdateForInstallation: { mutate: requestUpdateForInstallationMutate },
+			requestUpdateForProject: { mutate: requestUpdateForProjectMutate },
 		},
 	},
 }));
@@ -132,6 +136,7 @@ beforeEach(() => {
 		meQueryFn,
 		controlPlaneBuildQueryFn,
 		requestUpdateForInstallationMutate,
+		requestUpdateForProjectMutate,
 		reorderMutate,
 		navigate,
 	]) {
@@ -622,18 +627,102 @@ describe('WorkersRoster update actions', () => {
 		expect(button.title).toContain('Reading the build');
 	});
 
+	/** The report `requestUpdateForProject` answers with — the installation's plus the project. */
+	function projectReport() {
+		return { ...installationReport(), projectId: 'proj-a' };
+	}
+
+	/** Open a project's Workers tab as its administrator and wait for the action to be live. */
+	async function openProjectAction(): Promise<HTMLButtonElement> {
+		workersListQueryFn.mockResolvedValue([makeWorker()]);
+		renderRoster(<WorkersRoster projectId="proj-a" canAdminister />);
+		const button = (await screen.findByRole('button', PROJECT_BUTTON)) as HTMLButtonElement;
+		await vi.waitFor(() => expect(button.disabled).toBe(false));
+		return button;
+	}
+
 	it('offers the scoped action to a project administrator, naming its own set', async () => {
+		const button = await openProjectAction();
+
+		// The set it names is this project's machines, never the installation's.
+		expect(button.title).toContain('every machine enrolled in this project');
+		expect(button.title).not.toContain('on this installation');
+		// The same build the installation-wide action asks for, named before the click.
+		expect(button.title).toContain(CONTROL_PLANE_COMMIT.slice(0, 7));
+	});
+
+	it('opens the confirmation rather than mutating on the click (issue #1010)', async () => {
+		fireEvent.click(await openProjectAction());
+
+		expect(await screen.findByText(/Update every worker enrolled in this project/)).toBeDefined();
+		expect(requestUpdateForProjectMutate).not.toHaveBeenCalled();
+	});
+
+	it('names the project’s machines, the build, and what a shared machine means', async () => {
+		fireEvent.click(await openProjectAction());
+
+		await screen.findByText(/Update every worker enrolled in this project/);
+		expect(
+			screen.getByText(/every machine enrolled in this project, including machines you do not own/),
+		).toBeDefined();
+		expect(screen.getByText(CONTROL_PLANE_COMMIT.slice(0, 7))).toBeDefined();
+		// An update moves a machine's install root, not one enrollment — said out loud
+		// rather than left for an operator to discover on a shared machine.
+		expect(screen.getByText(/moved for all of them/)).toBeDefined();
+		expect(screen.getByText(/already drained/)).toBeDefined();
+	});
+
+	it('asks this project once, for the commit `controlPlaneBuild` answered with', async () => {
+		requestUpdateForProjectMutate.mockResolvedValue(projectReport());
+		fireEvent.click(await openProjectAction());
+
+		fireEvent.click(await screen.findByRole('button', { name: 'Ask them to update' }));
+
+		await vi.waitFor(() =>
+			expect(requestUpdateForProjectMutate).toHaveBeenCalledWith({
+				projectId: 'proj-a',
+				target: CONTROL_PLANE_COMMIT,
+			}),
+		);
+		expect(requestUpdateForProjectMutate).toHaveBeenCalledTimes(1);
+		// Never the installation-wide procedure, whatever the viewer's installation role.
+		expect(requestUpdateForInstallationMutate).not.toHaveBeenCalled();
+	});
+
+	it('renders the per-machine report this request answers with', async () => {
+		requestUpdateForProjectMutate.mockResolvedValue(projectReport());
+		fireEvent.click(await openProjectAction());
+
+		fireEvent.click(await screen.findByRole('button', { name: 'Ask them to update' }));
+
+		// The same report component the installation-wide action renders.
+		expect(await screen.findByText('Requested')).toBeDefined();
+		expect(screen.getByText('ada@example.com')).toBeDefined();
+	});
+
+	it('renders the refusal a caller who may not administer the project gets verbatim', async () => {
+		// `canAdminister` is a decision about what to offer; `projectAdmin` is re-checked
+		// server-side, and a member below it is refused there.
+		const forbidden = 'You do not have permission to perform this action on project "proj-a".';
+		requestUpdateForProjectMutate.mockRejectedValue(new Error(forbidden));
+		fireEvent.click(await openProjectAction());
+
+		fireEvent.click(await screen.findByRole('button', { name: 'Ask them to update' }));
+
+		expect(await screen.findByText(forbidden)).toBeDefined();
+	});
+
+	it('leaves the scoped action disabled when the control plane cannot read its own build', async () => {
+		controlPlaneBuildQueryFn.mockResolvedValue({ build: null });
 		workersListQueryFn.mockResolvedValue([makeWorker()]);
 		renderRoster(<WorkersRoster projectId="proj-a" canAdminister />);
 
 		const button = (await screen.findByRole('button', PROJECT_BUTTON)) as HTMLButtonElement;
-		// The set it names is this project's machines, never the installation's.
-		expect(button.title).toContain('every machine enrolled in this project');
-		// Still placed rather than wired — phase 3 of issue #998.
+		await vi.waitFor(() => expect(button.title).toContain('cannot read its own build'));
 		expect(button.disabled).toBe(true);
-		expect(button.title).toContain('Not wired up yet');
-		// And it reads nothing it does not need: the build query is the wired action's.
-		expect(controlPlaneBuildQueryFn).not.toHaveBeenCalled();
+
+		fireEvent.click(button);
+		expect(screen.queryByText(/Update every worker enrolled in this project\?/)).toBeNull();
 	});
 
 	it('withholds the scoped action from a member who does not administer the project', async () => {
