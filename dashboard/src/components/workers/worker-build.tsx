@@ -11,6 +11,12 @@ import { Badge } from '@/components/ui/badge.js';
  * predates that commit. It answers the question `daemonVersion` cannot — that
  * resolves to `package.json`'s never-bumped `0.1.0`, identical on every machine in
  * the fleet whatever code it is running.
+ *
+ * Since issue #978 the module holds the *second* mark those screens put beside a
+ * machine's name — `Updating`, for a request still outstanding. It lives here
+ * because the two are read together and must never be written to read as one
+ * state; keeping them in one file is what makes that a decision rather than a
+ * coincidence of two components.
  */
 
 /** A build as one scannable token: the abbreviated commit, marked when the checkout it named was dirty. */
@@ -52,6 +58,49 @@ export function WorkerBuildBadge({
 			title={`This machine's SWARM build differs from the control plane's${against}. It is running code from a different checkout state — restart the daemon after updating its checkout.`}
 		>
 			Outdated
+		</Badge>
+	);
+}
+
+/**
+ * The mark for a machine with an update request still **outstanding** (issue #978)
+ * — the same shared `Badge` in `caution`, for the same reason: it is the identical
+ * "attention, not an error" register as `Outdated`, and a new pill is not to be
+ * hand-rolled (`ai/DESIGN_SYSTEM.md` §4). The *words* carry the distinction, which
+ * is also what keeps it legible without colour.
+ *
+ * `Updating` rather than the runs surfaces' `Maintenance` (issue #974) because this
+ * is the other axis: there the pill says what *kind* of row it is among pipeline
+ * runs, with the status badge beside it saying how it is going; here the machine's
+ * state *is* the fact, so it takes the status word that mark deliberately left free.
+ *
+ * **Rendered only for a non-null `requestId`.** That is the pending marker; `target`
+ * is not, since `workers.update` goes on naming the build the latest request
+ * concerned long after the machine answered, so testing the value's presence would
+ * leave every machine ever updated marked forever.
+ *
+ * It sits *beside* {@link WorkerBuildBadge}, never instead of it. Both facts are
+ * true at once while a machine waits — its build differs, and it has been asked to
+ * move — and they are not one state: one says nobody has acted, the other that
+ * somebody has. Suppressing the staleness mark here would make it lie by omission
+ * for exactly the window an operator is watching it.
+ *
+ * It clears itself: the machine reports, `requestId` goes `null`, and the build
+ * mark alone answers whatever build the daemon re-declared on reconnect.
+ */
+export function WorkerUpdatingBadge({
+	update,
+}: {
+	/** Only these three fields are read — never the reported outcome beside them. */
+	update: { requestId: string | null; target: string; requestedAt: string } | null;
+}) {
+	if (!update?.requestId) return null;
+	return (
+		<Badge
+			tone="caution"
+			title={`This machine was asked to move to ${update.target} on ${new Date(update.requestedAt).toLocaleString()} and has not reported yet. It is still running the build shown beside it until it restarts and re-declares.`}
+		>
+			Updating
 		</Badge>
 	);
 }
