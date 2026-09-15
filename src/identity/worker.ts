@@ -34,6 +34,7 @@ import {
 	WorkerUpdateStatusSchema,
 	WorkerUpdateTargetSchema,
 } from '../lib/build-identity.js';
+import { WorkerSupervisionSchema } from '../lib/worker-supervision.js';
 import { RepoSlugSchema } from '../scm/repo-slug.js';
 import { ALL_TRIGGER_PHASES, type TriggerPhase, TriggerPhaseSchema } from '../triggers/types.js';
 
@@ -257,6 +258,20 @@ export type WorkerWorktreeSweepState = z.infer<typeof WorkerWorktreeSweepStateSc
  * exactly as the other declarations are — it guards against operator error (a stale
  * daemon), not against an attacker.
  *
+ * `supervision` is the **fifth** self-declared fact (issue #997), and the one no
+ * other declaration implies: whether a process supervisor — launchd, systemd —
+ * will start this machine's daemon again after it exits, re-declared on every
+ * reconnect. It answers whether the machine comes back from a restart it takes on
+ * its own; the four facts above read identically on a machine that does and on one
+ * that does not. `unknown` is a **real answer**, not an absent one, and is what
+ * three different machines say: a worker registered but never connected, a daemon
+ * too old to send the field, and a daemon on a platform these reads cannot answer
+ * for — which states `unknown` rather than claiming either alternative. Trusted
+ * exactly as the other declarations are: it guards against operator error (a daemon
+ * started by hand and then updated), not against an attacker. Nothing routes on it
+ * in this phase — refusing an update aimed at a machine that would not come back is
+ * phase 2/2 of issue #997.
+ *
  * `update` (issue #933) is the second field that is the *operator's* statement
  * rather than the daemon's, and it is the request half of what `build` reports: the
  * build this machine was asked to move to, whether that request is still awaiting an
@@ -300,6 +315,12 @@ export const WorkerSchema = z.object({
 	 */
 	drainingSince: z.date().nullable(),
 	build: WorkerBuildSchema.nullable(),
+	/**
+	 * How the machine's daemon declared it is supervised (issue #997) — see the block
+	 * above for why `unknown` is an answer rather than an absence, which is why this
+	 * is not nullable.
+	 */
+	supervision: WorkerSupervisionSchema,
 	/**
 	 * The self-update an operator asked this machine for and what came of it (issue
 	 * #933), or `null` while nobody has asked. Like `drainingSince` it is the

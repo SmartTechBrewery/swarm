@@ -95,6 +95,7 @@ import {
 import type { AgentCli } from '../harness/agent-cli.js';
 import { resolveOwnBuildIdentity, type WorkerBuild } from '../lib/build-identity.js';
 import { logger } from '../lib/logger.js';
+import type { WorkerSupervision } from '../lib/worker-supervision.js';
 import { normalizeRepoSlug, repoSlugsMatch } from '../scm/repo-slug.js';
 import type { TriggerPhase } from '../triggers/types.js';
 import type { Worker, WorkerUpdateState } from './worker.js';
@@ -215,6 +216,14 @@ export interface OwnerWorkerView {
 	 * other half of "why is this machine idle?".
 	 */
 	update: WorkerUpdateState | null;
+	/**
+	 * How the machine's daemon declared it is supervised (issue #997) — see
+	 * {@link DashboardWorkerView.supervision}, including why `unknown` is an answer
+	 * rather than an absence. This view carries it for the same reason it carries
+	 * `rateLimits`: `swarm workers list` marks an unsupervised machine whichever of the
+	 * two reads answered it.
+	 */
+	supervision: WorkerSupervision;
 	runState: WorkerRunState;
 	enrollments: OwnerEnrollmentView[];
 }
@@ -429,6 +438,7 @@ export async function listOwnerWorkers(ownerUserId: string): Promise<OwnerWorker
 			drainingSince: worker.drainingSince,
 			rateLimits: rateLimits.get(worker.id) ?? [],
 			update: worker.update,
+			supervision: worker.supervision,
 			runState,
 			enrollments: enrollments.map(assembleOwnerEnrollmentView),
 		});
@@ -560,6 +570,23 @@ export interface DashboardWorkerView {
 	 * several different project repositories.
 	 */
 	build: WorkerBuild | null;
+	/**
+	 * How the machine's daemon declared it is supervised (issue #997) — whether
+	 * launchd or systemd will start it again after it exits, or nobody will.
+	 *
+	 * **Three-valued, and `unknown` is an answer rather than an absence**: it is what
+	 * a machine that never connected, a daemon too old to send the field, and a daemon
+	 * on a platform these reads cannot answer for all say. A reader must render it as
+	 * *unknown* and never as either of the other two.
+	 *
+	 * Non-secret by construction like every other field here: one enum member naming a
+	 * kind of process supervision — no path, no supervisor job label, no credential.
+	 *
+	 * On the shared row rather than the detail view alone, because `swarm workers
+	 * list` marks an unsupervised machine and the CLI reads the roster, not the
+	 * detail. Nothing is gated on it in this phase.
+	 */
+	supervision: WorkerSupervision;
 	/**
 	 * **Server-derived**, the same way {@link isRoutable} is: whether the declared
 	 * `build` above is the control plane's own ({@link buildMatchesControlPlane}).
@@ -892,6 +919,7 @@ async function assembleDashboardWorker(
 		rateLimits,
 		build: worker.build,
 		buildIsCurrent: buildMatchesControlPlane(worker.build, controlPlaneBuild),
+		supervision: worker.supervision,
 		update: worker.update,
 		connection: liveSession ? 'online' : 'offline',
 		lastSeenAt: lastSeenSession?.lastHeartbeatAt ?? null,

@@ -59,6 +59,7 @@ function makeWorker(): Worker {
 		update: null,
 		worktreeSweep: null,
 		build: null,
+		supervision: 'unknown',
 		createdAt: new Date(0),
 		updatedAt: new Date(0),
 	};

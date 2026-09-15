@@ -136,6 +136,24 @@ describe('transport protocol schemas', () => {
 			).toBe(false);
 		});
 
+		// Issue #997: the daemon declares how it is supervised. Additive and optional on
+		// exactly the same terms as the two above — the shape above, with no
+		// `supervision`, is the older daemon's and stays valid.
+		it('accepts each of the three declared supervision states', () => {
+			for (const supervision of ['supervised', 'unsupervised', 'unknown'] as const) {
+				expect(HandshakeRequestSchema.parse({ ...valid, supervision })).toEqual({
+					...valid,
+					supervision,
+				});
+			}
+		});
+
+		it('rejects a supervision value outside the vocabulary', () => {
+			for (const supervision of ['launchd', 'SUPERVISED', '']) {
+				expect(HandshakeRequestSchema.safeParse({ ...valid, supervision }).success).toBe(false);
+			}
+		});
+
 		// Issue #608: a reconnecting daemon presents the lease it already holds. The
 		// field is additive and optional in both directions, which is why
 		// `TRANSPORT_PROTOCOL_VERSION` is deliberately not bumped for it — the shape

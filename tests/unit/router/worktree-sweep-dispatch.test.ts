@@ -75,6 +75,7 @@ function workerWith(worktreeSweep: Worker['worktreeSweep']): Worker {
 		repository: null,
 		drainingSince: null,
 		build: null,
+		supervision: 'unknown',
 		update: null,
 		worktreeSweep,
 		createdAt: new Date(0),

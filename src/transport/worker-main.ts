@@ -87,6 +87,7 @@ import { resolveOwnBuildIdentity, swarmInstallRoot } from '../lib/build-identity
 import { requireEnv, resolveWorkerRepoRoot } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
+import { resolveOwnSupervision } from '../lib/worker-supervision.js';
 import { resolveDeclarableOriginRepoSlug } from '../scm/repo-slug.js';
 import {
 	acquireCheckoutLock,
@@ -239,6 +240,14 @@ async function main(): Promise<void> {
 	// project repository each. Resolved once at startup for the same reason as the
 	// repository above, and `undefined` when the install root is not a git checkout.
 	const build = await resolveOwnBuildIdentity();
+	// Whether anything will start this daemon again after it exits (issue #997) —
+	// launchd or systemd, or nobody. Resolved once for the same reason as the two
+	// above: the supervision of a running process is fixed for its life.
+	const supervision = resolveOwnSupervision();
+	// Logged here, beside the containment mode, because this is the only place phase
+	// 1 can tell the operator *directly*: somebody running `npm run dev:worker` in a
+	// terminal is told at startup that this daemon will not come back from an update.
+	logger.info('worker supervision', { supervision });
 	// Same reason: a typo in SWARM_AGENT_CONTAINMENT should fail this daemon at
 	// startup, not once per dispatched phase (issue #614). The resolved value is
 	// not held — `runAgentCli` reads it per run — this is validation only, and
@@ -313,6 +322,7 @@ async function main(): Promise<void> {
 		supportedPhases,
 		repository,
 		build,
+		supervision,
 		hostname: host,
 		daemonVersion: resolveDaemonVersion(),
 		onAssignment: (assignment, sink) => {

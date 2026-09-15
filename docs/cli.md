@@ -612,7 +612,10 @@ unchanged.
   registration fails, the command prints what is left to run by hand *and* the worker
   credential once, since that value is otherwise unrecoverable.
 - **`list`** — list workers (`<id>\t<displayName>\t<clis>` per line, with a trailing
-  `draining` on a machine that has been taken out of the dispatch pool). With your own
+  `draining` on a machine that has been taken out of the dispatch pool, and a trailing
+  `unsupervised` on one whose daemon declared that nothing will start it again — so an
+  update applied there would not come back, issue #997; a `supervised` or unknown
+  machine is marked nothing, and `/workers/<worker-id>` states all three). With your own
   owner identifier, your machines; without one, or with somebody else's, the
   installation roster (prefixed with the owner identifier when unfiltered) — see
   narrowing 3 above. Never prints a credential.

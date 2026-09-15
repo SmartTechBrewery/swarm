@@ -37,6 +37,7 @@ import {
 	WorkerUpdateStatusSchema,
 	WorkerUpdateTargetSchema,
 } from '../lib/build-identity.js';
+import { WorkerSupervisionSchema } from '../lib/worker-supervision.js';
 import { CheckpointSchema } from '../pipeline/checkpoint.js';
 import { RecoveryIntentSchema } from '../queue/jobs.js';
 import { RepoSlugSchema } from '../scm/repo-slug.js';
@@ -163,6 +164,32 @@ export type TaskPhase = z.infer<typeof TaskPhaseSchema>;
  * stale-but-wrong build is worse than an absent one. Nothing is gated on it:
  * reading it back on the roster is the follow-on phase of issue #918.
  *
+ * `supervision` is whether a process supervisor will start this daemon again after
+ * it exits (issue #997) — `INVOCATION_ID` for systemd, a real `XPC_SERVICE_NAME`
+ * beside ppid 1 for launchd, neither for a daemon run by hand in a terminal
+ * (`WorkerSupervisionSchema`, `../lib/worker-supervision.js` — again the shared
+ * definition rather than a re-declaration). It is the fifth self-declared fact, and
+ * the one nothing else on this frame implies: the other four read identically on a
+ * machine that comes back from a restart and on one that does not.
+ *
+ * **Optional on purpose, and persisted like `repository` and `build`.** A daemon
+ * built before this field simply omits it, an older router ignores a key it does
+ * not know, so this too is additive in both directions and needs no
+ * protocol-version bump. It carries **no secret**: it is one of three enum members
+ * naming a kind of process supervision — no path, no job label, no credential. An
+ * omitted field **clears** the stored value to `unknown`, the same asymmetry
+ * `repository` and `build` make and for the same reason: the row states how the
+ * program *currently* operating it is supervised, so an older daemon replacing a
+ * newer one must not leave the newer one's statement standing.
+ *
+ * Note the two distinct "we do not know" cases and why they collapse: a daemon on a
+ * build predating this field omits the key, and a daemon on a platform these reads
+ * cannot answer for declares `unknown` explicitly. Both land on `unknown` in the
+ * row — but keeping the explicit member *on the wire* is what makes a current
+ * daemon's "I cannot tell" a statement rather than a silence. Nothing is gated on
+ * it: refusing an update aimed at a machine that would not come back is phase 2/2
+ * of issue #997, which needs the fact to exist first.
+ *
  * `reclaim` is what lets a daemon say *"this is me, taking my own lease back"*
  * (issue #608). It carries the `sessionId`/`fencingToken` the control plane already
  * minted for this daemon — it *is* the identity module's validator
@@ -191,6 +218,7 @@ export const HandshakeRequestSchema = z.object({
 	supportedPhases: z.array(TaskPhaseSchema).nonempty().optional(),
 	repository: RepoSlugSchema.optional(),
 	build: WorkerBuildSchema.optional(),
+	supervision: WorkerSupervisionSchema.optional(),
 	reclaim: WorkerSessionReclaimSchema.optional(),
 	instanceId: WorkerSessionInstanceIdSchema.optional(),
 	protocolVersion: z.number().int(),

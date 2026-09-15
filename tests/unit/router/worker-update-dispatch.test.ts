@@ -61,6 +61,7 @@ function workerWith(update: Worker['update']): Worker {
 		repository: null,
 		drainingSince: new Date('2026-09-13T10:00:00Z'),
 		build: null,
+		supervision: 'unknown',
 		update,
 		worktreeSweep: null,
 		createdAt: new Date(0),

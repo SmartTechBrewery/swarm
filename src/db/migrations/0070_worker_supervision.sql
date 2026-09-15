@@ -1,0 +1,28 @@
+-- Issue #997: a worker's daemon now declares **how it is supervised** — whether a
+-- process supervisor will start it again after it exits — carried on the handshake
+-- (`HandshakeRequestSchema.supervision`, `src/transport/protocol.ts`) and resolved
+-- from `INVOCATION_ID` (systemd), a real `XPC_SERVICE_NAME` beside ppid 1
+-- (launchd), or neither. Nothing else on the row could answer it: the four
+-- declarations already there read identically on a machine that comes back from a
+-- restart it takes on its own and on one that is simply gone afterwards.
+--
+-- `NOT NULL` with an `'unknown'` default, deliberately *not* the nullable contract
+-- `build_commit`/`repository` use (`0060_worker_build_identity.sql`). Those have a
+-- meaningful absent state; this one does not — `unknown` is a real member of the
+-- vocabulary, so a NULL beside it would be a second spelling of one fact and an
+-- invitation to read one of them as false. It is `supported_phases`'s shape
+-- instead: `NOT NULL` with a default that is exactly the pre-column behaviour, and
+-- the default is the *neutral* value, never `supervised` — nothing is defaulted
+-- into "this machine will come back".
+--
+-- Every existing row therefore reads `unknown`, which is verbatim what it says
+-- today. Nothing is backfilled: the supervision of a program that is not currently
+-- connected is not guessable, and a connected one rewrites this on its next
+-- handshake. No index — nothing queries by it.
+--
+-- What this column does *not* record: that the supervisor is configured to restart
+-- the job. `KeepAlive` / `Restart=always` are not readable from inside the process,
+-- so `supervised` means "I am under launchd/systemd", not "I will come back".
+-- Nothing is gated on it here; refusing an update aimed at a machine that would not
+-- come back is phase 2/2 of issue #997.
+ALTER TABLE "workers" ADD COLUMN "supervision" text DEFAULT 'unknown' NOT NULL;

@@ -161,6 +161,21 @@ export interface WorkerRow {
 	 * the comparand went missing. Test `=== false`, never falsiness.
 	 */
 	buildIsCurrent: boolean | null;
+	/**
+	 * How the machine's daemon declared it is supervised (issue #997): whether
+	 * launchd or systemd starts it again after it exits, or nobody does.
+	 *
+	 * **Three-valued, and `'unknown'` must render as *unknown*, never as either
+	 * answer.** It is what a machine that never connected says, what a daemon on a
+	 * build that predates the field says, and what a daemon on a platform these reads
+	 * cannot answer for says — so collapsing it onto `'supervised'` would tell an
+	 * operator a machine comes back when nothing established that, and onto
+	 * `'unsupervised'` would mark a whole fleet as not coming back.
+	 *
+	 * Not a path and not a secret: one enum member naming a kind of process
+	 * supervision, with no supervisor job label beside it.
+	 */
+	supervision: 'supervised' | 'unsupervised' | 'unknown';
 	connection: WorkerConnectionState;
 	/** ISO 8601 — when the worker was last heard from; null if it never connected. */
 	lastSeenAt: string | null;

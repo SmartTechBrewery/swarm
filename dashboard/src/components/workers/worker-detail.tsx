@@ -477,6 +477,25 @@ function DeclaredBuild({ worker }: { worker: WorkerDetail }) {
 }
 
 /**
+ * How the machine's daemon declared it is supervised (issue #997) — whether
+ * anything starts it again after it exits.
+ *
+ * All **three** values are stated here, unlike `swarm workers list`, which marks
+ * only `unsupervised`: this is the screen an operator opens to read what a machine
+ * is, and `unknown` is a real answer that must render as *unknown* rather than as
+ * either alternative. Only the one value an operator can act on carries a mark —
+ * the shared `Badge` on `caution`, like the build mark beside it — and the other two
+ * are plain text, so a fleet of machines that simply predate the field does not read
+ * as a fleet with a problem.
+ */
+function DeclaredSupervision({ supervision }: { supervision: WorkerDetail['supervision'] }) {
+	if (supervision === 'unsupervised') {
+		return <Badge tone="caution">Not supervised</Badge>;
+	}
+	return <>{supervision === 'supervised' ? 'Supervised' : 'Unknown'}</>;
+}
+
+/**
  * What the build above is being compared against — the whole reason this screen
  * carries the comparand (issue #925): a mark that names no other build leaves
  * "outdated relative to what?" in the operator's head. A control plane that cannot
@@ -705,15 +724,19 @@ export function WorkerDetailView({
 					<Field label="SWARM build" mono>
 						<DeclaredBuild worker={worker} />
 					</Field>
+					<Field label="Process supervision">
+						<DeclaredSupervision supervision={worker.supervision} />
+					</Field>
 				</div>
 				<p className="text-xs text-zinc-500 mt-4">
 					Declared by the machine's own daemon at handshake, and re-declared on every reconnect. The
-					pipeline phases, the checkout repository and the SWARM build are reported here and never
-					editable — editing any of them would make this screen disagree with the machine. A daemon
-					on an older build can declare fewer phases than this one runs; which of them a project may
-					actually give this machine is the enrollment's Allowed pipeline phases, below. The
-					checkout repository is the single repository this machine works in: a project for any
-					other one cannot run here, and an unidentifiable checkout declares nothing.
+					pipeline phases, the checkout repository, the SWARM build and the process supervision are
+					reported here and never editable — editing any of them would make this screen disagree
+					with the machine. A daemon on an older build can declare fewer phases than this one runs;
+					which of them a project may actually give this machine is the enrollment's Allowed
+					pipeline phases, below. The checkout repository is the single repository this machine
+					works in: a project for any other one cannot run here, and an unidentifiable checkout
+					declares nothing.
 				</p>
 				<p className="text-xs text-zinc-500 mt-2">
 					The <strong>SWARM build is the commit this machine's daemon is actually running</strong> —
@@ -722,6 +745,14 @@ export function WorkerDetailView({
 					means the running code is not exactly that commit (uncommitted changes, or a build older
 					than the commit it names).{' '}
 					<BuildComparisonNote controlPlaneBuild={worker.controlPlaneBuild} />
+				</p>
+				<p className="text-xs text-zinc-500 mt-2">
+					<strong>Process supervision is whether this machine comes back</strong> from a restart its
+					own daemon takes. <em>Supervised</em> means launchd or systemd started the daemon and
+					starts it again when it exits. <em>Not supervised</em> means nobody will: the daemon was
+					started by hand, so an update would apply and the machine would then be gone until
+					somebody starts it again. <em>Unknown</em> means the daemon predates this field or runs
+					somewhere SWARM cannot read it — stated as unknown rather than assumed either way.
 				</p>
 				<p className="text-xs text-zinc-500 mt-2">
 					The <strong>agent CLIs are the one fact the machine's owner may pin.</strong> Left alone,

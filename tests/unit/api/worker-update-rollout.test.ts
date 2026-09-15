@@ -84,6 +84,7 @@ function makeWorker(id: string, overrides: Partial<Worker> = {}): Worker {
 		update: null,
 		worktreeSweep: null,
 		build: { commit: 'aaaaaaa', dirty: false },
+		supervision: 'unknown',
 		createdAt: new Date(0),
 		updatedAt: new Date(0),
 		...overrides,

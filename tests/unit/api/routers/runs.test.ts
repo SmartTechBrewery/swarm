@@ -460,6 +460,7 @@ describe('runsRouter', () => {
 					update: null,
 					worktreeSweep: null,
 					build: null,
+					supervision: 'unknown',
 					createdAt: new Date(0),
 					updatedAt: new Date(0),
 				},
@@ -1306,6 +1307,7 @@ describe('runsRouter', () => {
 				update: null,
 				worktreeSweep: null,
 				build: null,
+				supervision: 'unknown' as const,
 				createdAt: new Date(0),
 				updatedAt: new Date(0),
 			};

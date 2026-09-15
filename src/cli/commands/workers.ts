@@ -452,6 +452,10 @@ const RosterSchema = z.array(
 		drainingSince: z.string().nullable().optional(),
 		rateLimits: z.array(WorkerRateLimitSchema).optional(),
 		update: WorkerUpdateStateSchema.nullable().optional(),
+		// A plain string rather than the enum, on this file's own rule: it is printed
+		// rather than acted on, so a vocabulary this build has never heard of must not
+		// fail `list` (issue #997).
+		supervision: z.string().optional(),
 		owner: z.object({ identifier: z.string().min(1) }).nullable(),
 	}),
 );
@@ -464,6 +468,7 @@ const OwnWorkersSchema = z.array(
 		drainingSince: z.string().nullable().optional(),
 		rateLimits: z.array(WorkerRateLimitSchema).optional(),
 		update: WorkerUpdateStateSchema.nullable().optional(),
+		supervision: z.string().optional(),
 	}),
 );
 
@@ -849,6 +854,12 @@ async function registerWorkerCommand(argv: string[]): Promise<number> {
  * That is why the mark **names the cooling CLIs** rather than the machine — a bare
  * `rate-limited` would read as "idle", which a machine with three CLIs and one
  * cool-down is not.
+ *
+ * A machine whose daemon declared that **nothing will start it again** is marked
+ * `unsupervised` (issue #997): it was started by hand rather than by launchd or
+ * systemd, so a self-update applied there exits and the machine is gone until
+ * somebody starts it by hand. Only that one value is marked — see
+ * {@link describeSupervision}.
  */
 function printWorker(
 	workerId: string,
@@ -858,10 +869,26 @@ function printWorker(
 	drainingSince?: string | null,
 	update?: WorkerUpdateState | null,
 	rateLimits?: WorkerRateLimit[],
+	supervision?: string,
 ): void {
 	const prefix = ownerIdentifier ? `${ownerIdentifier}\t` : '';
-	const suffix = `${drainingSince ? '\tdraining' : ''}${describeRateLimits(rateLimits)}${describeUpdate(update)}`;
+	const suffix = `${drainingSince ? '\tdraining' : ''}${describeSupervision(supervision)}${describeRateLimits(rateLimits)}${describeUpdate(update)}`;
 	out.info(`${prefix}${workerId}\t${displayName}\t${capabilities.join(',')}${suffix}`);
+}
+
+/**
+ * The supervision marker on a `list` line (issue #997): that this machine's daemon
+ * exits for a supervisor that is not there, so an update applied here does not come
+ * back.
+ *
+ * Printed for `unsupervised` **only**. `draining` and `rate-limited` beside it both
+ * follow "an absent mark is the honest answer", the scan line answers "which
+ * machines need attention?", and an `unknown` is nothing an operator can act on — so
+ * marking every pre-upgrade machine in the fleet would drown the line it is meant to
+ * clarify. `/workers/<worker-id>` states all three.
+ */
+function describeSupervision(supervision?: string): string {
+	return supervision === 'unsupervised' ? '\tunsupervised' : '';
 }
 
 /**
@@ -935,6 +962,7 @@ async function listWorkersCommand(argv: string[]): Promise<number> {
 				worker.drainingSince,
 				worker.update,
 				worker.rateLimits,
+				worker.supervision,
 			);
 		}
 		return 0;
@@ -958,6 +986,7 @@ async function listWorkersCommand(argv: string[]): Promise<number> {
 				worker.drainingSince,
 				worker.update,
 				worker.rateLimits,
+				worker.supervision,
 			);
 		}
 		return 0;
@@ -976,6 +1005,7 @@ async function listWorkersCommand(argv: string[]): Promise<number> {
 			worker.drainingSince,
 			worker.update,
 			worker.rateLimits,
+			worker.supervision,
 		);
 	}
 	return 0;

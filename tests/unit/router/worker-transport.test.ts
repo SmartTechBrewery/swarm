@@ -58,6 +58,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		update: null,
 		worktreeSweep: null,
 		build: null,
+		supervision: 'unknown',
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		updatedAt: new Date('2026-01-01T00:00:00Z'),
 		...overrides,
@@ -154,6 +155,7 @@ describe('handleHandshake', () => {
 			[...DEFAULT_WORKER_SUPPORTED_PHASES],
 			null,
 			null,
+			'unknown',
 		);
 	});
 
@@ -170,6 +172,7 @@ describe('handleHandshake', () => {
 			declared,
 			null,
 			null,
+			'unknown',
 		);
 	});
 
@@ -191,6 +194,7 @@ describe('handleHandshake', () => {
 			[...DEFAULT_WORKER_SUPPORTED_PHASES],
 			'smarttechbrewery/swarm',
 			null,
+			'unknown',
 		);
 		expect(result.json).toMatchObject({ authenticated: true, workerId: WORKER_ID });
 	});
@@ -212,6 +216,7 @@ describe('handleHandshake', () => {
 			[...DEFAULT_WORKER_SUPPORTED_PHASES],
 			null,
 			{ commit: '9f3a1b2c4d5e6f70819a2b3c4d5e6f7081920a3b', dirty: true },
+			'unknown',
 		);
 	});
 
@@ -229,7 +234,76 @@ describe('handleHandshake', () => {
 			[...DEFAULT_WORKER_SUPPORTED_PHASES],
 			null,
 			null,
+			'unknown',
 		);
+	});
+
+	// Issue #997 — the fifth declaration. Nothing is gated on it here; what is asserted
+	// is that the row records what the daemon actually said, and that a silence is
+	// recorded as the neutral member rather than left alone.
+	it('records the declared supervision', async () => {
+		const deps = makeDeps();
+
+		const result = await handleHandshake(deps, { ...validBody(), supervision: 'unsupervised' });
+
+		expect(result.status).toBe(200);
+		expect(deps.refreshWorkerCapabilities).toHaveBeenCalledWith(
+			WORKER_ID,
+			['claude'],
+			[...DEFAULT_WORKER_SUPPORTED_PHASES],
+			null,
+			null,
+			'unsupervised',
+		);
+	});
+
+	it("records a daemon's explicit 'unknown' as the statement it is", async () => {
+		const deps = makeDeps();
+
+		const result = await handleHandshake(deps, { ...validBody(), supervision: 'unknown' });
+
+		expect(result.status).toBe(200);
+		expect(deps.refreshWorkerCapabilities).toHaveBeenCalledWith(
+			WORKER_ID,
+			['claude'],
+			[...DEFAULT_WORKER_SUPPORTED_PHASES],
+			null,
+			null,
+			'unknown',
+		);
+	});
+
+	// The same clearing rule the two declarations above follow, asserted specifically
+	// because a reader would expect an omitted field to leave the column alone: an
+	// older daemon replacing a newer one on this row must not leave the newer one's
+	// statement standing.
+	it("clears the stored supervision to 'unknown' when the daemon declares none", async () => {
+		const deps = makeDeps();
+
+		const result = await handleHandshake(deps, validBody());
+
+		expect(result.status).toBe(200);
+		expect(deps.refreshWorkerCapabilities).toHaveBeenCalledWith(
+			WORKER_ID,
+			['claude'],
+			[...DEFAULT_WORKER_SUPPORTED_PHASES],
+			null,
+			null,
+			'unknown',
+		);
+	});
+
+	it('rejects a supervision value outside the vocabulary with 400', async () => {
+		const deps = makeDeps();
+
+		const result = await handleHandshake(deps, { ...validBody(), supervision: 'launchd' });
+
+		expect(result).toEqual({
+			status: 400,
+			json: { authenticated: false, reason: 'invalid handshake request' },
+		});
+		expect(deps.acquireSession).not.toHaveBeenCalled();
+		expect(deps.refreshWorkerCapabilities).not.toHaveBeenCalled();
 	});
 
 	it('rejects a malformed build with 400 before the lease is touched', async () => {

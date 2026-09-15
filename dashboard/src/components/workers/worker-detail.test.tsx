@@ -115,6 +115,7 @@ function makeWorker(overrides: Partial<WorkerDetail> = {}): WorkerDetail {
 		// The daemon's declared SWARM build and the server's verdict on it (issue #925).
 		build: { commit: 'abc1234def5678', dirty: false },
 		buildIsCurrent: true,
+		supervision: 'unknown',
 		connection: 'online',
 		lastSeenAt: NOW.toISOString(),
 		// In the dispatch pool — the Pool membership card offers the drain (issue #926).
@@ -845,6 +846,46 @@ describe('WorkerDetailView enrollment blocks', () => {
 
 				expect(screen.getByText(/has been asked to move to a named build/)).toBeDefined();
 			});
+		});
+	});
+
+	/**
+	 * Issue #997 — the fifth fact the daemon declares. Three-valued like
+	 * `buildIsCurrent` above it, and asserted the same way: the case a regression gets
+	 * wrong is `unknown`, which must read as *unknown* rather than as either answer.
+	 */
+	describe('the declared process supervision', () => {
+		function supervisionField(): string {
+			const field = within(section('Declared by the daemon')).getByText(
+				'Process supervision',
+			).parentElement;
+			return (field?.textContent ?? '').replace('Process supervision', '').trim();
+		}
+
+		it('says a machine under launchd or systemd is supervised', () => {
+			renderWorker({ supervision: 'supervised', enrollments: [] });
+
+			expect(supervisionField()).toBe('Supervised');
+		});
+
+		it('marks a machine nothing will start again', () => {
+			renderWorker({ supervision: 'unsupervised', enrollments: [] });
+
+			expect(supervisionField()).toBe('Not supervised');
+		});
+
+		it('says unknown, and neither of the other two, when the daemon could not tell', () => {
+			renderWorker({ supervision: 'unknown', enrollments: [] });
+
+			const value = supervisionField();
+			expect(value).toBe('Unknown');
+			expect(value).not.toContain('Not supervised');
+		});
+
+		it('explains all three values in the card’s own prose', () => {
+			renderWorker({ enrollments: [] });
+
+			expect(screen.getByText(/whether this machine comes back/)).toBeDefined();
 		});
 	});
 
