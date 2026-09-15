@@ -59,6 +59,9 @@ function makeReviewRun(overrides: Partial<RunRow> = {}): RunRow {
 	return {
 		id: 'run-1',
 		projectId: 'project-1',
+		kind: 'pipeline',
+		maintenanceTarget: null,
+		maintenanceRequestId: null,
 		repository: 'acme/demo',
 		taskId: 'task-1',
 		workItemId: null,
@@ -645,6 +648,35 @@ describe('RunAttributionFields (issue #446)', () => {
 		expect(screen.queryByText('user-1')).toBeNull();
 	});
 
+	// Issue #971 — deleting a worker nulls the run's `worker_id`, and the machine is a
+	// maintenance run's whole subject. The server resolves the name the run itself
+	// recorded into this same `workerName`, so the cell names the retired machine rather
+	// than falling through to the neutral dash.
+	it('names a retired machine on a maintenance run, with no id to fall back to', () => {
+		render(
+			<RunAttributionFields
+				run={makeReviewRun({
+					kind: 'worker-update',
+					phase: 'worker-update',
+					repository: null,
+					taskId: null,
+					maintenanceTarget: 'main',
+					workerId: null,
+					workerUserId: 'user-1',
+					attribution: {
+						workerId: null,
+						workerName: 'studio-mac',
+						userId: 'user-1',
+						userDisplayName: 'Alice Example',
+					},
+				})}
+			/>,
+		);
+
+		expect(screen.getByText('studio-mac')).toBeDefined();
+		expect(screen.queryByText('—')).toBeNull();
+	});
+
 	it('renders the neutral dash — never an id — for a run with no recorded worker', () => {
 		render(<RunAttributionFields run={makeReviewRun({ attribution: null })} />);
 
@@ -716,6 +748,29 @@ describe('GitHubReferences produced-PR link (issue #446)', () => {
 		);
 
 		expect(container.textContent).toBe('—');
+	});
+
+	// Issue #971 — a maintenance run references neither a pull request nor a board
+	// card, so it states the build instead of rendering the neutral dash of a run that
+	// simply has nothing to say.
+	it('names the build a maintenance run is moving its machine to', () => {
+		const { container } = render(
+			<GitHubReferences
+				run={makeReviewRun({
+					kind: 'worker-update',
+					phase: 'worker-update',
+					repository: null,
+					taskId: null,
+					prNumber: null,
+					prTitle: null,
+					maintenanceTarget: 'main',
+				})}
+			/>,
+		);
+
+		expect(container.textContent).toContain('main');
+		expect(container.textContent).not.toBe('—');
+		expect(container.querySelectorAll('a')).toHaveLength(0);
 	});
 });
 

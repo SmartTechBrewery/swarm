@@ -261,6 +261,27 @@ swarm workers list                       # read what it reported
 swarm workers undrain <worker-id>        # back in the pool
 ```
 
+**Each request is a run, in the runs list** (issue #971). Asking a machine to move
+creates one run per machine asked, scoped to that machine's project, which starts,
+is visible in the project's Runs list while it is happening, and settles —
+`completed` for `applied`/`already-current`, `failed` for `declined`/`refused`/
+`failed` carrying the machine's own reason, or `failed` after six hours for a machine
+that never answers (one that answers later corrects the row). So a failed update is
+diagnosable where every other failure is, and the history survives: the runs list is
+where you read when a machine was last updated and what happened, after the fact,
+while `swarm workers list` shows only its latest outcome. The run names the machine
+and the build it was moving to, and nothing else — it references no pull request and
+no board item, produces none, and does not count against the project's concurrency.
+It goes on naming that machine after the machine itself is gone: deleting a worker
+removes it from the roster, and its update history stays readable, still saying which
+machine each row was about.
+
+**The machine must be enrolled in a project.** That run has to hang off one, so a
+worker enrolled in **no** project is refused rather than silently asked: `swarm
+workers update` says so and writes nothing, the fleet forms report the machine as
+`no-project`, and a staged rollout skips it. Enroll it first with `swarm workers
+enroll <worker-id> <project-id>`.
+
 **Or the whole fleet, staged.** `swarm workers update --all <ref>` (issue #940) moves
 every machine you own in one operator action — but a bounded wave at a time, so the
 fleet's capacity is never down at once and the drain/undrain per machine stops being
@@ -279,6 +300,8 @@ control plane for the machine that applied and never came back. So the command a
 is one operator action, not one to re-run until the fleet has moved. Re-running it is
 still legal and is a nudge as well as a read; either form prints where each machine
 stands: `queued`, `draining`, `signalled`, `verifying`, `done`, `skipped` or `failed`.
+A machine enrolled in no project settles `skipped` — advancing the rollout would never
+change that answer, so it is never waited on.
 
 **A bad build stops it.** A machine that reports `failed`, `refused` or `declined`,
 one that comes back still on the build it was asked to leave (what a machine
@@ -310,7 +333,8 @@ stay with whoever owns it and need no cooperation from the administrator: the ho
 opt-in (`SWARM_WORKER_SELF_UPDATE`, read from the machine's own environment — unset it
 and restart, and that machine declines every request), and the **drain**, which is
 still strictly the owner's and which this command never performs. So a machine its
-owner has not drained comes back `in-pool`, untouched. Each line names the machine,
+owner has not drained comes back `in-pool`, untouched, and one enrolled in no project
+comes back `no-project` for the reason above. Each line names the machine,
 its owner and its disposition, with `owner opted out` for one that last reported
 `declined`; the counts under the table name the owners to go and ask. A caller who is
 not an installation administrator is refused outright rather than shown their own

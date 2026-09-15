@@ -25,6 +25,9 @@ export const runPhaseFilterSchema = z.enum([
 	'respond-to-review',
 	'respond-to-ci',
 	'resolve-conflicts',
+	// A worker-update run's `phase` (issue #971) — machine maintenance rather than a
+	// `TriggerPhase`, so the list can isolate it the same way it isolates any phase.
+	'worker-update',
 ]);
 export type RunPhaseFilter = z.infer<typeof runPhaseFilterSchema>;
 
@@ -319,7 +322,9 @@ export interface AgentUsage {
  * display labels for the worker that executed a run and the SWARM user who owns
  * it, resolved server-side from the row's `workerId`/`workerUserId`. A name is
  * null when the worker/user row no longer resolves; the ids ride along so the UI
- * can fall back to one instead of showing nothing.
+ * can fall back to one instead of showing nothing — except on a maintenance run,
+ * whose `workerName` falls back server-side to the machine name the run itself
+ * recorded (issue #971).
  */
 export interface RunAttribution {
 	workerId: string | null;
@@ -377,13 +382,36 @@ export interface RunRow {
 	id: string;
 	projectId: string;
 	/**
+	 * What kind of work this run records — mirrors the `kind` column (issue #971).
+	 * `'pipeline'` for a phase run against a repository; a maintenance kind
+	 * (`'worker-update'`) for a run that moves one machine to a build. It is the
+	 * discriminator: a surface telling the two apart reads this, never a null
+	 * coordinate and never `phase`.
+	 */
+	kind: string;
+	/**
 	 * The repository this run acted on, in `owner/repo` form — mirrors the
 	 * `repository` column (issue #683). Every run-facing surface builds its PR link
 	 * from this rather than from the owning project's `repo` (issue #691): a project
 	 * id identifies a repository only while the project owns exactly one.
+	 *
+	 * **Null for a maintenance run** (issue #971): it acts on no repository.
 	 */
-	repository: string;
-	taskId: string;
+	repository: string | null;
+	/** Null for a maintenance run, for {@link RunRow.repository}'s reason (issue #971). */
+	taskId: string | null;
+	/**
+	 * The build a maintenance run is moving its machine to — mirrors the
+	 * `maintenance_target` column (issue #971). Null for a pipeline run. Together with
+	 * the machine named by {@link RunRow.workerName} it is what a maintenance row says
+	 * instead of a work item.
+	 */
+	maintenanceTarget: string | null;
+	/**
+	 * The per-machine request id a maintenance run was created for — mirrors the
+	 * `maintenance_request_id` column (issue #971). Null for a pipeline run.
+	 */
+	maintenanceRequestId: string | null;
 	workItemId: string | null;
 	workItemTitle: string | null;
 	workItemUrl: string | null;
@@ -406,6 +434,12 @@ export interface RunRow {
 	 * the recorded worker's row no longer resolves — the list then shows no machine
 	 * rather than a stale or invented one. Optional because `runs.getById` carries
 	 * the richer {@link RunAttribution} instead.
+	 *
+	 * A **maintenance run is the exception**: the server falls back to the machine
+	 * name that run recorded when it was asked (issue #971), so a run whose whole
+	 * subject is a machine still names it after that machine has been retired. Nothing
+	 * here reads that column directly — the fallback is resolved into this same field,
+	 * so every surface that already renders a machine name keeps working unchanged.
 	 */
 	workerName?: string | null;
 	/** The SWARM user owning `workerId`, denormalized at dispatch so it survives the worker row's removal. */

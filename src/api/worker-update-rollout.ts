@@ -632,6 +632,14 @@ class AdvancePass {
 	 * `in-pool` is a machine another session returned to the dispatch pool between this
 	 * pass's drain and the fan-out's write: nothing was recorded, so the member stays
 	 * draining and is asked again on the next advance.
+	 *
+	 * `no-project` (issue #971) settles `skipped` instead, and deliberately does not
+	 * copy `in-pool`'s early return: that one leaves the member waiting on purpose,
+	 * because `reassertDrain` drains every member before the fan-out and so makes
+	 * `in-pool` all but unreachable here. A machine enrolled in no project *is*
+	 * reachable, and nothing about advancing the rollout would ever change its answer —
+	 * so a waiting member would hold the wave open forever. Settled with `settledAt`,
+	 * it is one `completeIfSettled` can finish past.
 	 */
 	private async recordSignal(
 		member: WorkerUpdateRolloutMember,
@@ -639,6 +647,17 @@ class AdvancePass {
 		atSignal: MemberPatch | undefined,
 	): Promise<void> {
 		if (entry.disposition === 'in-pool') return;
+		if (entry.disposition === 'no-project') {
+			await this.apply(member, {
+				patch: {
+					state: 'skipped',
+					message: 'the machine is enrolled in no project',
+					settledAt: this.now,
+				},
+				returnToPool: true,
+			});
+			return;
+		}
 		const worker = this.workers.get(member.workerId);
 		if (entry.disposition === 'answered' && worker) {
 			const verdict = decideReportedOutcome(

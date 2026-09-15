@@ -41,7 +41,13 @@ import { runs } from '../schema/runs.js';
 import { workerProjectEnrollments } from '../schema/workerProjectEnrollments.js';
 import { workerSessions } from '../schema/workerSessions.js';
 import { workers } from '../schema/workers.js';
-import { RETRY_PENDING_RUN_STATUSES, UNSETTLED_RUN_STATUSES } from './runsRepository.js';
+import {
+	isPipelineRun,
+	PIPELINE_RUN_KIND,
+	type PipelineRunRow,
+	RETRY_PENDING_RUN_STATUSES,
+	UNSETTLED_RUN_STATUSES,
+} from './runsRepository.js';
 
 export type DispatchRow = typeof dispatches.$inferSelect;
 
@@ -1788,10 +1794,13 @@ export async function listProjectsWithCapacityPending(): Promise<string[]> {
  * dispatch — legacy orphans whose retry intent survives only on the run row
  * (`job_payload`, `next_retry_at`). The startup backfill turns each into a
  * `retry-scheduled` dispatch (issue #284's #269/#279 repair).
+ *
+ * Pipeline work only, and returned already narrowed to {@link PipelineRunRow}
+ * (issue #971): a maintenance run is not a phase the reconciler could re-dispatch,
+ * and narrowing here is what keeps one out of `backfillOrphanedDeferredRuns`
+ * (`../../dispatch/reconciler.ts`) rather than each of its reads having to notice.
  */
-export async function listDeferredRunsWithoutActiveDispatch(): Promise<
-	Array<typeof runs.$inferSelect>
-> {
+export async function listDeferredRunsWithoutActiveDispatch(): Promise<PipelineRunRow[]> {
 	const active = getDb()
 		.select({ runId: dispatches.runId })
 		.from(dispatches)
@@ -1801,10 +1810,17 @@ export async function listDeferredRunsWithoutActiveDispatch(): Promise<
 				sql`${dispatches.runId} IS NOT NULL`,
 			),
 		);
-	return getDb()
+	const rows = await getDb()
 		.select()
 		.from(runs)
-		.where(and(inArray(runs.status, [...RETRY_PENDING_RUN_STATUSES]), notInArray(runs.id, active)));
+		.where(
+			and(
+				eq(runs.kind, PIPELINE_RUN_KIND),
+				inArray(runs.status, [...RETRY_PENDING_RUN_STATUSES]),
+				notInArray(runs.id, active),
+			),
+		);
+	return rows.filter(isPipelineRun);
 }
 
 /** Whether any dispatch rows exist at all — used to gate one-time backfills. */

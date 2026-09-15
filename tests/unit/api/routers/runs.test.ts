@@ -224,6 +224,10 @@ function makeRun(overrides: Partial<RunRow> = {}): RunRow {
 	return {
 		id: 'run-1',
 		projectId: 'p1',
+		maintenanceTarget: null,
+		maintenanceRequestId: null,
+		maintenanceMachine: null,
+		kind: 'pipeline',
 		repository: 'SmartTechBrewery/swarm',
 		taskId: '103',
 		workItemId: null,
@@ -488,6 +492,33 @@ describe('runsRouter', () => {
 
 			expect(result.data[0].workerName).toBeNull();
 			expect(result.data[0].workerId).toBe('worker-gone');
+		});
+
+		// Issue #971 — same fallback in the list, for the same reason: a maintenance row
+		// whose machine has been retired still names it, while an ordinary pipeline row
+		// with a gone worker keeps showing no machine rather than an invented one.
+		it('names a retired machine from the maintenance run itself', async () => {
+			vi.mocked(listRunsFromDb).mockResolvedValue({
+				data: [
+					makeRun({
+						id: 'run-update',
+						kind: 'worker-update',
+						phase: 'worker-update',
+						repository: null,
+						taskId: null,
+						workerId: null,
+						maintenanceMachine: 'studio-mac',
+						maintenanceTarget: 'main',
+					}),
+					makeRun({ id: 'run-pipeline', workerId: 'worker-gone' }),
+				],
+				total: 2,
+			});
+			vi.mocked(getWorkers).mockResolvedValue([]);
+
+			const result = await caller.list({});
+
+			expect(result.data.map((run) => run.workerName)).toEqual(['studio-mac', null]);
 		});
 
 		it('degrades to unnamed machines when the lookup itself fails', async () => {
@@ -1345,6 +1376,54 @@ describe('runsRouter', () => {
 					userId: 'user-gone',
 					userDisplayName: null,
 				});
+			});
+
+			// Issue #971 — the machine is a maintenance run's whole subject, and deleting a
+			// worker nulls `worker_id`. Retiring a machine is exactly when its update history
+			// is read, so the name the run recorded is what the detail page falls back to.
+			it('names a retired machine from the maintenance run itself', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({
+						id: 'run-1',
+						kind: 'worker-update',
+						phase: 'worker-update',
+						repository: null,
+						taskId: null,
+						workerId: null,
+						workerUserId: 'user-1',
+						maintenanceMachine: 'studio-mac',
+						maintenanceTarget: 'main',
+					}),
+				);
+				vi.mocked(getUserById).mockResolvedValue(OWNER);
+
+				const result = await caller.getById({ id: 'run-1' });
+				expect(result.attribution).toEqual({
+					workerId: null,
+					workerName: 'studio-mac',
+					userId: 'user-1',
+					userDisplayName: 'Alice Example',
+				});
+				expect(getWorker).not.toHaveBeenCalled();
+			});
+
+			// The live row wins where it resolves, so a rename shows through; the recorded
+			// name is the fallback, never the override.
+			it('prefers the live machine name over the one the run recorded', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({
+						id: 'run-1',
+						kind: 'worker-update',
+						workerId: 'worker-1',
+						workerUserId: 'user-1',
+						maintenanceMachine: 'studio-mac-as-named-then',
+					}),
+				);
+				vi.mocked(getWorker).mockResolvedValue(WORKER);
+				vi.mocked(getUserById).mockResolvedValue(OWNER);
+
+				const result = await caller.getById({ id: 'run-1' });
+				expect(result.attribution?.workerName).toBe('alice-macbook');
 			});
 
 			it('degrades to the recorded ids instead of failing the page when a lookup throws', async () => {
@@ -2419,6 +2498,67 @@ describe('runsRouter', () => {
 	});
 
 	// issue #880 — the operator's forced age-out of one stalled liveness unit.
+	// Issue #971 — an update is a run, and the acceptance criterion is that nothing
+	// reasoning about a phase-against-a-worktree treats it as one. These four mutations
+	// are that boundary at the API: reading it is the whole point, driving it is not.
+	describe('a maintenance run (issue #971)', () => {
+		const maintenanceRun = () =>
+			makeRun({
+				id: 'run-mx',
+				kind: 'worker-update',
+				phase: 'worker-update',
+				status: 'running',
+				repository: null,
+				taskId: null,
+				maintenanceRequestId: '11111111-1111-4111-8111-111111111111',
+				maintenanceTarget: 'main',
+			});
+
+		it.each([
+			['retryNow', () => caller.retryNow({ runId: 'run-mx' })],
+			['terminate', () => caller.terminate({ runId: 'run-mx' })],
+			['reset', () => caller.reset({ runId: 'run-mx' })],
+			['forceReReview', () => caller.forceReReview({ runId: 'run-mx' })],
+		] as const)('refuses %s with PRECONDITION_FAILED', async (_name, invoke) => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(maintenanceRun());
+
+			await expect(invoke()).rejects.toMatchObject({
+				code: 'PRECONDITION_FAILED',
+				message: expect.stringContaining('machine maintenance'),
+			});
+			// Refused before anything is driven: no dispatch, no cancellation marker, no
+			// service call.
+			expect(createAndPublishDispatch).not.toHaveBeenCalled();
+			expect(requestRunCancellation).not.toHaveBeenCalled();
+			expect(resetRun).not.toHaveBeenCalled();
+			expect(forceReReview).not.toHaveBeenCalled();
+		});
+
+		it('is returned by getById, because reading it is the point', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(maintenanceRun());
+
+			const run = await caller.getById({ id: 'run-mx' });
+
+			expect(run).toMatchObject({
+				id: 'run-mx',
+				kind: 'worker-update',
+				maintenanceTarget: 'main',
+				repository: null,
+				taskId: null,
+			});
+		});
+
+		it('is listed, and can be isolated by its phase', async () => {
+			vi.mocked(listRunsFromDb).mockResolvedValue({ data: [maintenanceRun()], total: 1 });
+
+			const page = await caller.list({ phase: 'worker-update' });
+
+			expect(page.data.map((row) => row.id)).toEqual(['run-mx']);
+			expect(listRunsFromDb).toHaveBeenCalledWith(
+				expect.objectContaining({ phase: 'worker-update' }),
+			);
+		});
+	});
 	describe('dismissStalled', () => {
 		const DISMISSAL = {
 			projectId: 'p1',

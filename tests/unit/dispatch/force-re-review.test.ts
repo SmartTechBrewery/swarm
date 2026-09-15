@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('@/db/repositories/runsRepository.js', () => ({
+// The real `isPipelineRun` is kept (issue #971) for the reason the ledger mock
+// below keeps `isCapReachingRequestChanges`: it is a pure predicate, and stubbing
+// it would let the service and the repository disagree.
+vi.mock('@/db/repositories/runsRepository.js', async (importOriginal) => ({
+	...(await importOriginal<typeof import('@/db/repositories/runsRepository.js')>()),
 	getRunByIdFromDb: vi.fn(),
 }));
 
@@ -70,6 +74,10 @@ function makeCappedReviewRun(overrides: Partial<RunRow> = {}): RunRow {
 	return {
 		id: 'run-1',
 		projectId: 'p1',
+		maintenanceTarget: null,
+		maintenanceRequestId: null,
+		maintenanceMachine: null,
+		kind: 'pipeline',
 		repository: 'SmartTechBrewery/swarm',
 		taskId: '508',
 		workItemId: null,
@@ -323,6 +331,13 @@ describe('forceReReview (issue #511)', () => {
 			['a non-review phase', { phase: 'implementation' }],
 			['an approved review', { reviewVerdict: 'approve' }],
 			['a review the cap never stopped', { reviewAutomationOutcome: null }],
+			// Issue #971 — "not a Review run at all", refused at the same guard rather than
+			// left to trip the `missing-coordinates` one further down, since `repository` is
+			// consumed by the project read in between.
+			[
+				'a maintenance run',
+				{ kind: 'worker-update', phase: 'worker-update', repository: null, taskId: null },
+			],
 		])('refuses %s', async (_label, overrides) => {
 			vi.mocked(getRunByIdFromDb).mockResolvedValue(makeCappedReviewRun(overrides));
 			await expect(forceReReview('run-1')).rejects.toMatchObject({ reason: 'not-capped' });

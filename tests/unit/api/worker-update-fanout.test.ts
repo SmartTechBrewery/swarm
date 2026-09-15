@@ -293,6 +293,36 @@ describe('fanOutWorkerUpdate (issue #921)', () => {
 		expect(publishWorkerUpdateRequest).not.toHaveBeenCalled();
 	});
 
+	// Issue #971 — an update is recorded as a run in the machine's own project, so a
+	// machine enrolled in none is reported rather than thrown for: one machine's state
+	// never refuses the whole call.
+	it('reports a machine enrolled in no project, writing and publishing nothing', async () => {
+		requestWorkerUpdate.mockResolvedValueOnce({ outcome: 'no-project', worker: makeWorker() });
+
+		const entries = await fanOutWorkerUpdate([makeWorker()], 'main', REQUESTER_ID);
+
+		expect(entries).toMatchObject([
+			{ workerId: WORKER_ID, displayName: 'ada-laptop', disposition: 'no-project', update: null },
+		]);
+		expect(publishWorkerUpdateRequest).not.toHaveBeenCalled();
+	});
+
+	it('carries on past a machine enrolled in no project', async () => {
+		requestWorkerUpdate.mockResolvedValueOnce({ outcome: 'no-project', worker: makeWorker() });
+
+		const entries = await fanOutWorkerUpdate(
+			[makeWorker(), makeWorker({ id: OTHER_WORKER_ID, displayName: 'ada-desktop' })],
+			'main',
+			REQUESTER_ID,
+		);
+
+		expect(entries.map((entry) => [entry.workerId, entry.disposition])).toEqual([
+			[WORKER_ID, 'no-project'],
+			[OTHER_WORKER_ID, 'requested'],
+		]);
+		expect(publishWorkerUpdateRequest).toHaveBeenCalledExactlyOnceWith(OTHER_WORKER_ID);
+	});
+
 	// The raced machine must not take the rest of the fleet with it, exactly as a
 	// machine that was in the pool from the start does not.
 	it('carries on past a machine the write declined', async () => {

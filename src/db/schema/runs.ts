@@ -1,3 +1,4 @@
+import { sql } from 'drizzle-orm';
 import {
 	bigint,
 	bigserial,
@@ -8,6 +9,7 @@ import {
 	pgTable,
 	text,
 	timestamp,
+	uniqueIndex,
 	uuid,
 } from 'drizzle-orm/pg-core';
 import type { AgentUsage } from '../../harness/usage.js';
@@ -29,10 +31,34 @@ export const runs = pgTable(
 			.notNull()
 			.references(() => projects.id, { onDelete: 'cascade' }),
 		/**
+		 * What kind of work this run records (issue #971) — `'pipeline'` for a phase
+		 * run against a repository, and one value per kind of **machine maintenance**
+		 * SWARM executes on a worker, of which `'worker-update'` is the first.
+		 *
+		 * NOT NULL with a `'pipeline'` default, and the default is load-bearing: every
+		 * row written before this column existed is pipeline work, so nothing is
+		 * backfilled and the pre-existing behaviour is verbatim what an unstated kind
+		 * means.
+		 *
+		 * It is a discriminator, never an inference: a reader that wants pipeline work
+		 * asks for `kind = 'pipeline'` positively rather than testing a null
+		 * coordinate, so a second maintenance kind is excluded from every one of those
+		 * readers by construction rather than by each of them being edited again. The
+		 * vocabulary lives beside the writers, in `RunKind`
+		 * (`../repositories/runsRepository.ts`).
+		 */
+		kind: text('kind').notNull().default('pipeline'),
+		/**
 		 * The repository this run acted on, in `ProjectConfig.repo`'s `owner/repo`
 		 * form (issue #683) — denormalized alongside `project_id` rather than joined
 		 * through it, exactly as `review_verdicts.repository` is
 		 * (`src/db/schema/reviewVerdicts.ts`).
+		 *
+		 * **Null for a maintenance run** (`kind <> 'pipeline'`, issue #971): moving a
+		 * machine to a new build acts on no repository and provisions no worktree, so
+		 * naming the project's repo here would be a lie — and the nullability is what
+		 * makes the type-checker, rather than each reader's memory, keep a maintenance
+		 * run out of every path that assumes a phase-against-a-worktree.
 		 *
 		 * A project id alone does not identify a repository: it does so only while a
 		 * project owns exactly one repo, which is what makes every value derived from
@@ -45,8 +71,13 @@ export const runs = pgTable(
 		 * ({@link resetRunToRunning}) — a retry re-runs the same work against the
 		 * same repository.
 		 */
-		repository: text('repository').notNull(),
-		taskId: text('task_id').notNull(),
+		repository: text('repository'),
+		/**
+		 * The worktree/branch/PR identity this run's work is keyed on. **Null for a
+		 * maintenance run** (issue #971) — see {@link runs.repository} for why the two
+		 * coordinates drop `NOT NULL` together.
+		 */
+		taskId: text('task_id'),
 		workItemId: text('work_item_id'),
 		workItemTitle: text('work_item_title'),
 		workItemUrl: text('work_item_url'),
@@ -69,7 +100,49 @@ export const runs = pgTable(
 		 * outlives the attempt.
 		 */
 		producedPrUrl: text('produced_pr_url'),
+		/**
+		 * What this run is doing, as free `text` it has always been. The vocabulary is
+		 * `TriggerPhase` for a pipeline run and the maintenance kind's own name
+		 * otherwise (`'worker-update'`, issue #971) — but **`kind` is the
+		 * discriminator, never `phase`**: a reader telling maintenance from pipeline
+		 * work asks the column that exists to answer it.
+		 */
 		phase: text('phase').notNull(),
+		/**
+		 * The per-machine request id this maintenance run was created for (issue #971)
+		 * — `workers.update_request_id` for a `'worker-update'` run, which is the key
+		 * the machine's own report settles this row by
+		 * ({@link settleWorkerUpdateRun}). Null for a pipeline run.
+		 *
+		 * A **partial** unique index where `kind <> 'pipeline'` keeps a request id
+		 * naming at most one run, so the settle can key on it alone.
+		 */
+		maintenanceRequestId: uuid('maintenance_request_id'),
+		/**
+		 * What this maintenance run is moving its machine to (issue #971) — the build
+		 * ref for a `'worker-update'` run. Null for a pipeline run.
+		 *
+		 * Denormalized rather than read back off `workers.update_target`, which the
+		 * next request overwrites: the run would otherwise stop naming the build it
+		 * was actually for.
+		 */
+		maintenanceTarget: text('maintenance_target'),
+		/**
+		 * The display name the machine carried when this maintenance run was created
+		 * (issue #971) — the run's own record of *which machine* it is about, and the
+		 * only one that outlives the machine.
+		 *
+		 * Denormalized for exactly the reason {@link runs.workerUserId} is, and the
+		 * case is sharper here: `worker_id` is `ON DELETE SET NULL`, so retiring a
+		 * machine would otherwise erase the single coordinate a maintenance run exists
+		 * to state — and retirement is precisely when "what did this machine last do?"
+		 * gets asked. A later rename is not backfilled either: the row names the
+		 * machine as it was when it was asked.
+		 *
+		 * Null for a pipeline run, which states its repository and task instead and
+		 * reads perfectly well with no machine named at all.
+		 */
+		maintenanceMachine: text('maintenance_machine'),
 		/** Registered worker that was authenticated and capacity-claimed for this attempt. */
 		workerId: uuid('worker_id').references(() => workers.id, { onDelete: 'set null' }),
 		/**
@@ -294,6 +367,11 @@ export const runs = pgTable(
 		index('idx_runs_status').on(table.status),
 		index('idx_runs_started_at').on(table.startedAt),
 		index('idx_runs_worker_id').on(table.workerId),
+		// Partial: only a maintenance run carries a request id, and a pipeline run's
+		// NULL must not be constrained at all (issue #971).
+		uniqueIndex('idx_runs_maintenance_request')
+			.on(table.maintenanceRequestId)
+			.where(sql`${table.kind} <> 'pipeline'`),
 	],
 );
 

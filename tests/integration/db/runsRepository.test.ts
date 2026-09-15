@@ -5,6 +5,7 @@ import { getDb } from '../../../src/db/client.js';
 import {
 	cancelWaitingDispatch,
 	createDispatch,
+	listDeferredRunsWithoutActiveDispatch,
 	listWaitingDispatches,
 } from '../../../src/db/repositories/dispatchesRepository.js';
 import { deleteProjectFromDb } from '../../../src/db/repositories/projectsRepository.js';
@@ -17,6 +18,7 @@ import {
 	countRunningRunsForProject,
 	createFailedRun,
 	createRun as createRunRow,
+	createWorkerUpdateRun,
 	failOrphanedRunningRuns,
 	failStaleRunningRuns,
 	findBoardItemIdForTask,
@@ -38,8 +40,13 @@ import {
 	recordRunCleanupBlocked,
 	recordRunPreservedWorker,
 	resetRunToRunning,
+	settleWorkerUpdateRun,
 	storeRunLogs,
+	supersedeWorkerUpdateRun,
 	updateReviewMergeOutcome,
+	WORKER_UPDATE_RUN_KIND,
+	WORKER_UPDATE_RUN_PHASE,
+	WORKER_UPDATE_RUN_TIMEOUT_MS,
 } from '../../../src/db/repositories/runsRepository.js';
 import { createUser } from '../../../src/db/repositories/usersRepository.js';
 import { removeWorker } from '../../../src/db/repositories/workersRepository.js';
@@ -1830,6 +1837,236 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 
 		it('returns 0 when there are no running rows', async () => {
 			expect(await failOrphanedRunningRuns('nothing to do', null)).toBe(0);
+		});
+	});
+
+	// Issue #971 — an update is a run. Only a real database settles the partial unique
+	// index, the `kind` filters, and that a maintenance row is visible to the runs list
+	// while being invisible to every reader that assumes a phase-against-a-worktree.
+	describe('worker-update runs (issue #971)', () => {
+		const REQUEST_ID = '11111111-1111-4111-8111-111111111111';
+		const OTHER_REQUEST_ID = '22222222-2222-4222-8222-222222222222';
+
+		/** A maintenance run for a freshly seeded machine, plus the ids it was written with. */
+		async function seedUpdateRun(
+			label: string,
+			requestId = REQUEST_ID,
+			target = 'main',
+		): Promise<{ runId: string; workerId: string; ownerUserId: string; machine: string }> {
+			const { worker, owner } = await seedWorker(label);
+			const runId = await createWorkerUpdateRun({
+				projectId: PROJECT_ID,
+				workerId: worker.id,
+				workerUserId: owner.id,
+				requestId,
+				target,
+				machine: worker.displayName,
+			});
+			return { runId, workerId: worker.id, ownerUserId: owner.id, machine: worker.displayName };
+		}
+
+		describe('createWorkerUpdateRun', () => {
+			it('writes the kind, phase, timeout, machine and build, and nothing pipeline-shaped', async () => {
+				const { runId, workerId, ownerUserId } = await seedUpdateRun('create');
+
+				const row = await getRunByIdFromDb(runId);
+				expect(row).toMatchObject({
+					kind: WORKER_UPDATE_RUN_KIND,
+					phase: WORKER_UPDATE_RUN_PHASE,
+					status: 'running',
+					projectId: PROJECT_ID,
+					workerId,
+					workerUserId: ownerUserId,
+					maintenanceRequestId: REQUEST_ID,
+					maintenanceTarget: 'main',
+					maintenanceMachine: 'worker-create',
+					timeoutMs: WORKER_UPDATE_RUN_TIMEOUT_MS,
+				});
+				expect(row?.repository).toBeNull();
+				expect(row?.taskId).toBeNull();
+				// Deliberately unlike `createRun`, which seeds one: there is no session to resume.
+				expect(row?.agentSessionId).toBeNull();
+				expect(row?.jobPayload).toBeNull();
+				expect(row?.workItemId).toBeNull();
+				expect(row?.prNumber).toBeNull();
+			});
+
+			it('refuses a second run for the same request id', async () => {
+				const { workerId, ownerUserId } = await seedUpdateRun('unique');
+
+				await expect(
+					createWorkerUpdateRun({
+						projectId: PROJECT_ID,
+						workerId,
+						workerUserId: ownerUserId,
+						requestId: REQUEST_ID,
+						target: 'v2',
+						machine: 'worker-unique',
+					}),
+				).rejects.toThrow();
+			});
+		});
+
+		describe('settleWorkerUpdateRun', () => {
+			it.each([
+				['applied', 'completed'],
+				['already-current', 'completed'],
+			] as const)('completes the run for a reported %s', async (reported, expected) => {
+				const { runId } = await seedUpdateRun(`settle-${reported}`);
+
+				expect(await settleWorkerUpdateRun(REQUEST_ID, reported, 'All good.')).toBe(true);
+
+				const row = await getRunByIdFromDb(runId);
+				expect(row?.status).toBe(expected);
+				expect(row?.error).toBeNull();
+				expect(row?.completedAt).toBeInstanceOf(Date);
+				expect(row?.durationMs).toBeGreaterThanOrEqual(0);
+			});
+
+			// `declined` fails rather than completes on purpose: a `completed` row would say
+			// the machine moved, and "this host has not opted in" is the actionable reason.
+			it.each([
+				'declined',
+				'refused',
+				'failed',
+			] as const)('fails the run for a reported %s, carrying the machine’s own words', async (reported) => {
+				const { runId } = await seedUpdateRun(`settle-${reported}`);
+
+				await settleWorkerUpdateRun(REQUEST_ID, reported, 'The install root is dirty.');
+
+				const row = await getRunByIdFromDb(runId);
+				expect(row?.status).toBe('failed');
+				expect(row?.error).toBe('The install root is dirty.');
+			});
+
+			it('is idempotent on a duplicate report', async () => {
+				const { runId } = await seedUpdateRun('settle-duplicate');
+				await settleWorkerUpdateRun(REQUEST_ID, 'applied', 'Applied.');
+
+				await settleWorkerUpdateRun(REQUEST_ID, 'applied', 'Applied.');
+
+				expect((await getRunByIdFromDb(runId))?.status).toBe('completed');
+			});
+
+			// Unguarded on the current status, and this is why: the machine's answer is
+			// authoritative for the request it names, so a row the control plane had already
+			// given up on is corrected rather than left saying something that did not happen.
+			it('corrects a run the stale sweep had already failed', async () => {
+				const { runId } = await seedUpdateRun('settle-reaped');
+				// Past the row's own `timeout_ms`, which is what bounds the sweep for it.
+				await getDb()
+					.update(runs)
+					.set({ startedAt: new Date(Date.now() - WORKER_UPDATE_RUN_TIMEOUT_MS - 60_000) })
+					.where(eq(runs.id, runId));
+				await failStaleRunningRuns(60 * 60 * 1000, 0, 'reconciled as stale');
+				expect((await getRunByIdFromDb(runId))?.status).toBe('failed');
+
+				await settleWorkerUpdateRun(REQUEST_ID, 'applied', 'Applied.');
+
+				const row = await getRunByIdFromDb(runId);
+				expect(row?.status).toBe('completed');
+				expect(row?.error).toBeNull();
+			});
+
+			it('answers false for a request no run was created for', async () => {
+				expect(await settleWorkerUpdateRun(OTHER_REQUEST_ID, 'applied', 'Applied.')).toBe(false);
+			});
+		});
+
+		describe('supersedeWorkerUpdateRun', () => {
+			it('fails only the still-running update run of that machine', async () => {
+				const { runId: settledRun, workerId, ownerUserId } = await seedUpdateRun('supersede');
+				await settleWorkerUpdateRun(REQUEST_ID, 'applied', 'Applied.');
+				const liveRun = await createWorkerUpdateRun({
+					projectId: PROJECT_ID,
+					workerId,
+					workerUserId: ownerUserId,
+					requestId: OTHER_REQUEST_ID,
+					target: 'v2',
+					machine: 'worker-supersede',
+				});
+
+				await supersedeWorkerUpdateRun(workerId, 'v3');
+
+				expect((await getRunByIdFromDb(liveRun))?.status).toBe('failed');
+				expect((await getRunByIdFromDb(liveRun))?.error).toContain('v3');
+				// A settled run is a record of what happened and is never rewritten.
+				expect((await getRunByIdFromDb(settledRun))?.status).toBe('completed');
+			});
+
+			it('leaves another machine’s running update run alone', async () => {
+				const mine = await seedUpdateRun('supersede-mine');
+				const theirs = await seedUpdateRun('supersede-theirs', OTHER_REQUEST_ID, 'v2');
+
+				await supersedeWorkerUpdateRun(mine.workerId, 'v3');
+
+				expect((await getRunByIdFromDb(theirs.runId))?.status).toBe('running');
+			});
+		});
+
+		describe('what it is and is not visible to', () => {
+			it('appears in the runs list, which is the whole point', async () => {
+				const { runId } = await seedUpdateRun('visible');
+
+				const { data } = await listRunsFromDb({ limit: 50, offset: 0, projectId: PROJECT_ID });
+
+				expect(data.map((row) => row.id)).toContain(runId);
+			});
+
+			it('can be isolated by the list’s own phase filter', async () => {
+				const { runId } = await seedUpdateRun('filterable');
+				await createRun({ projectId: PROJECT_ID, taskId: 'pipeline', phase: 'review' });
+
+				const { data } = await listRunsFromDb({
+					limit: 50,
+					offset: 0,
+					phase: WORKER_UPDATE_RUN_PHASE,
+				});
+
+				expect(data.map((row) => row.id)).toEqual([runId]);
+			});
+
+			// The acceptance criterion: nothing that reasons about a phase-against-a-worktree
+			// treats it as one.
+			it('is invisible to every pipeline-scoped reader', async () => {
+				const { runId, workerId } = await seedUpdateRun('invisible');
+
+				// Project concurrency / the project-delete guard.
+				expect(await countRunningRunsForProject(PROJECT_ID)).toBe(0);
+				// Stalled detection — the read model the fifth criterion names.
+				expect(await listTaskActivitySince({ since: new Date(0) })).toEqual([]);
+				// The retry / worktree-pinning questions, asked with the row's own null task id.
+				expect(await hasLiveRunForTask(PROJECT_ID, WORKER_UPDATE_RUN_PHASE)).toBe(false);
+				expect(await hasResumableDeferredRun(PROJECT_ID, WORKER_UPDATE_RUN_PHASE)).toBe(false);
+				// The review ledger and the board-card link.
+				expect(
+					await getLatestRunForTask(PROJECT_ID, WORKER_UPDATE_RUN_PHASE, 'review'),
+				).toBeUndefined();
+				expect(await hasRunForTask(PROJECT_ID, WORKER_UPDATE_RUN_PHASE, 'review')).toBe(false);
+				expect(await findBoardItemIdForTask(PROJECT_ID, WORKER_UPDATE_RUN_PHASE)).toBeUndefined();
+				// The reconciler's orphan backfill.
+				expect(await listDeferredRunsWithoutActiveDispatch()).toEqual([]);
+				// And the worker's own startup reap, which narrows on the very `worker_id`
+				// this row records — the restart the update asked for must not fail its run.
+				expect(await failOrphanedRunningRuns('worker restarted', workerId)).toBe(0);
+				expect((await getRunByIdFromDb(runId))?.status).toBe('running');
+			});
+
+			// Deliberately *not* filtered: this is the settle-of-last-resort that makes "it
+			// settles like any other run" true for a machine that never answers.
+			it('is settled by the stale sweep once its own timeout is past', async () => {
+				const { runId } = await seedUpdateRun('reaped');
+				const young = await seedUpdateRun('young', OTHER_REQUEST_ID, 'v2');
+				await getDb()
+					.update(runs)
+					.set({ startedAt: new Date(Date.now() - WORKER_UPDATE_RUN_TIMEOUT_MS - 60_000) })
+					.where(eq(runs.id, runId));
+
+				await failStaleRunningRuns(60 * 60 * 1000, 0, 'reconciled as stale');
+
+				expect((await getRunByIdFromDb(runId))?.status).toBe('failed');
+				expect((await getRunByIdFromDb(young.runId))?.status).toBe('running');
+			});
 		});
 	});
 

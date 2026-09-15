@@ -264,6 +264,11 @@ export async function setWorkerDraining(
  * `undrain` has returned to the dispatch pool. How a refusal is *worded* is still the
  * API layer's — a `CONFLICT` for the single-machine form, an `in-pool` disposition
  * for the fleet one — but whether it is refused is settled here.
+ *
+ * The same holds for the fourth outcome, `no-project` (issue #971): an update is now
+ * recorded as a `runs` row scoped to the machine's own project, so a machine enrolled
+ * in none has nothing for its run to hang off and is refused by the same write. The
+ * request and its run are created in one transaction, and `runId` names the row.
  */
 export async function requestWorkerUpdate(
 	id: string,

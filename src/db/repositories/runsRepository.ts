@@ -34,6 +34,7 @@ import {
 } from 'drizzle-orm';
 import type { AgentCli } from '../../harness/agent-cli.js';
 import type { AgentUsage } from '../../harness/usage.js';
+import type { WorkerUpdateStatus } from '../../lib/build-identity.js';
 import type { Checkpoint } from '../../pipeline/checkpoint.js';
 import type { ProposedScope } from '../../pipeline/planning.js';
 import type { ReviewAutomationOutcome, ReviewVerdict } from '../../pipeline/review.js';
@@ -86,6 +87,53 @@ export function isRetryPendingStatus(
 	status: string,
 ): status is (typeof RETRY_PENDING_RUN_STATUSES)[number] {
 	return (RETRY_PENDING_RUN_STATUSES as readonly string[]).includes(status);
+}
+
+/** A phase run against a repository — everything the pipeline dispatches. */
+export const PIPELINE_RUN_KIND = 'pipeline';
+/** Moving one machine's SWARM install root to a new build (issue #971). */
+export const WORKER_UPDATE_RUN_KIND = 'worker-update';
+
+/**
+ * What kind of work a `runs` row records — the `kind` column's vocabulary
+ * (`../schema/runs.ts`, issue #971). One value for pipeline work and one per kind
+ * of machine maintenance, so a reader keeps maintenance out by naming the kind it
+ * wants rather than by testing a null coordinate.
+ */
+export type RunKind = typeof PIPELINE_RUN_KIND | typeof WORKER_UPDATE_RUN_KIND;
+
+/**
+ * The `phase` a worker-update run records. Deliberately the kind's own name: the
+ * column has always been free text, and a maintenance run has no `TriggerPhase` to
+ * borrow — see the column's own comment for why `kind`, not this, is what a reader
+ * discriminates on.
+ */
+export const WORKER_UPDATE_RUN_PHASE = 'worker-update';
+
+/**
+ * How long a worker-update run may stay `running` before the periodic stale sweep
+ * ({@link failStaleRunningRuns}) settles it. Written into `timeout_ms` so the
+ * settle-of-last-resort that already exists covers this run too, rather than a
+ * second reaper being added for it.
+ *
+ * Generous on purpose: the daemon waits for its own in-flight phases before it
+ * applies anything, and a machine asked while offline is pushed the request only
+ * on its next connection. A machine that does answer later corrects the row — see
+ * {@link settleWorkerUpdateRun}.
+ */
+export const WORKER_UPDATE_RUN_TIMEOUT_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * A run whose coordinates are the ones a phase-against-a-worktree needs. The
+ * nullable `repository`/`task_id` (issue #971) are what make the compiler ask every
+ * such path to decide about a maintenance run; this is the narrowing it decides
+ * *with*, once it has refused one.
+ */
+export type PipelineRunRow = RunRow & { repository: string; taskId: string };
+
+/** Whether this row is pipeline work — see {@link PipelineRunRow}. */
+export function isPipelineRun(run: RunRow): run is PipelineRunRow {
+	return run.kind === PIPELINE_RUN_KIND && run.repository !== null && run.taskId !== null;
 }
 
 export interface CreateRunInput {
@@ -215,6 +263,149 @@ export async function createFailedRun(input: CreateFailedRunInput): Promise<stri
 }
 
 /**
+ * The executor the three maintenance-run writers take, so `workersRepository` can
+ * call them inside the transaction that writes the `workers` row and the request
+ * and its run can never exist without one another.
+ *
+ * Deliberately not {@link countRunningRunsForProject}'s `Pick<…, 'select'>`: that
+ * one threads a *read* into a transaction, and these three write.
+ */
+type RunWriteExecutor = Pick<ReturnType<typeof getDb>, 'insert' | 'update'>;
+
+export interface CreateWorkerUpdateRunInput {
+	/** The project the machine is enrolled in — what the run hangs off (issue #971). */
+	projectId: string;
+	workerId: string;
+	/** The machine's owner, the `worker_user_id` half of the attribution record. */
+	workerUserId: string;
+	/** `workers.update_request_id` — the key the machine's report settles this run by. */
+	requestId: string;
+	/** The build this run is moving its machine to. */
+	target: string;
+	/**
+	 * The machine's display name as it stands now, stored on the row so the run still
+	 * says which machine it was about once that machine is retired
+	 * (`runs.maintenance_machine`).
+	 */
+	machine: string;
+}
+
+/**
+ * Insert the `running` run that records one machine being asked to move to a build
+ * (issue #971) — the row that makes an update visible in the runs list rather than
+ * only as an outcome word on `swarm workers list`. Returns the new row's id.
+ *
+ * Everything a pipeline run carries and this does not is left null deliberately:
+ * no `repository` or `task_id` (it acts on no repository and provisions no
+ * worktree), no `job_payload` (there is no phase to re-dispatch), no `work_item_id`
+ * or `pr_number` (it names no board card and no pull request), and — unlike
+ * {@link createRun}, which seeds one — **no `agent_session_id`**, because there is
+ * no agent session to resume.
+ *
+ * `timeout_ms` is {@link WORKER_UPDATE_RUN_TIMEOUT_MS} so the existing stale sweep
+ * is what settles a machine that never answers.
+ *
+ * The machine is recorded **twice**, deliberately: `worker_id` as the live link, and
+ * `maintenance_machine` as the name it carried when it was asked. `worker_id` is
+ * `ON DELETE SET NULL`, and a machine being retired is exactly when an operator asks
+ * what it last did — so without the second the delete would empty the one coordinate
+ * this run exists to state.
+ */
+export async function createWorkerUpdateRun(
+	input: CreateWorkerUpdateRunInput,
+	db: RunWriteExecutor = getDb(),
+): Promise<string> {
+	const rows = await db
+		.insert(runs)
+		.values({
+			kind: WORKER_UPDATE_RUN_KIND,
+			phase: WORKER_UPDATE_RUN_PHASE,
+			status: 'running',
+			projectId: input.projectId,
+			workerId: input.workerId,
+			workerUserId: input.workerUserId,
+			maintenanceRequestId: input.requestId,
+			maintenanceTarget: input.target,
+			maintenanceMachine: input.machine,
+			timeoutMs: WORKER_UPDATE_RUN_TIMEOUT_MS,
+		})
+		.returning({ id: runs.id });
+	return rows[0].id;
+}
+
+/**
+ * Settle any still-`running` worker-update run for this machine, because a later
+ * request has replaced it (issue #971).
+ *
+ * Without it, re-targeting a machine would leave the previous request's run
+ * `running` for as long as the stale sweep takes: the daemon's report for that
+ * request answers `recorded: false` against the `workers` row and would never close
+ * the older run.
+ */
+export async function supersedeWorkerUpdateRun(
+	workerId: string,
+	target: string,
+	db: RunWriteExecutor = getDb(),
+): Promise<void> {
+	await db
+		.update(runs)
+		.set({
+			status: 'failed',
+			error: `Superseded by a later request to move this machine to ${target}.`,
+			completedAt: new Date(),
+			durationMs: sql`(EXTRACT(EPOCH FROM (NOW() - ${runs.startedAt})) * 1000)::int`,
+		})
+		.where(
+			and(
+				eq(runs.kind, WORKER_UPDATE_RUN_KIND),
+				eq(runs.workerId, workerId),
+				eq(runs.status, 'running'),
+			),
+		);
+}
+
+/**
+ * Settle the worker-update run the machine's report answers (issue #971), mapping
+ * the machine's own vocabulary onto the run's: `applied`/`already-current` complete
+ * it, and `declined`/`refused`/`failed` fail it carrying the machine's prose as the
+ * run's `error` — which is where the run detail page already shows a failure.
+ *
+ * `declined` fails rather than completes on purpose: "this host has not opted in to
+ * self-update" is an actionable reason an operator can do something about, and a
+ * `completed` row would say the machine moved.
+ *
+ * Keyed on `maintenance_request_id` alone — unique per run by the partial index —
+ * and deliberately **not** guarded on the run's current status. The machine's answer
+ * is authoritative for the request it names, so a run this control plane had already
+ * given up on (superseded above, or reaped by {@link failStaleRunningRuns} while the
+ * machine was offline) is *corrected* rather than left saying something that did not
+ * happen. A duplicate report rewrites the same values, so it is idempotent;
+ * `started_at` is untouched, so `duration_ms` is recomputed consistently.
+ *
+ * Returns whether a run was settled — `false` when the report names a request no run
+ * was ever created for (a request recorded before this issue, say).
+ */
+export async function settleWorkerUpdateRun(
+	requestId: string,
+	status: WorkerUpdateStatus,
+	message: string,
+	db: RunWriteExecutor = getDb(),
+): Promise<boolean> {
+	const applied = status === 'applied' || status === 'already-current';
+	const rows = await db
+		.update(runs)
+		.set({
+			status: applied ? 'completed' : 'failed',
+			error: applied ? null : message,
+			completedAt: new Date(),
+			durationMs: sql`(EXTRACT(EPOCH FROM (NOW() - ${runs.startedAt})) * 1000)::int`,
+		})
+		.where(and(eq(runs.kind, WORKER_UPDATE_RUN_KIND), eq(runs.maintenanceRequestId, requestId)))
+		.returning({ id: runs.id });
+	return rows.length > 0;
+}
+
+/**
  * Whether retention must pin this task's checkout for a resumable deferred run —
  * any phase, any engine (cross-CLI resume). A deferred row that still holds an
  * `agentSessionId` is one the worker intends to resume; pruning its worktree
@@ -233,6 +424,11 @@ export async function hasResumableDeferredRun(projectId: string, taskId: string)
 		.from(runs)
 		.where(
 			and(
+				// Pipeline work only: a maintenance run pins no checkout and holds no
+				// session, and a null `task_id` could never match the `eq` below anyway —
+				// stated positively so this reads as the "is this task resumable?" question
+				// it is (issue #971).
+				eq(runs.kind, PIPELINE_RUN_KIND),
 				eq(runs.projectId, projectId),
 				eq(runs.taskId, taskId),
 				inArray(runs.status, ['deferred', 'failed', 'checkpointed']),
@@ -806,6 +1002,9 @@ export async function hasLiveRunForTask(
 	excludeRunId?: string,
 ): Promise<boolean> {
 	const conditions = [
+		// Pipeline work only (issue #971): this is "does a live phase still own the
+		// checkout?", and a maintenance run holds no lease to own one with.
+		eq(runs.kind, PIPELINE_RUN_KIND),
 		eq(runs.projectId, projectId),
 		eq(runs.taskId, taskId),
 		eq(runs.status, 'running'),
@@ -842,7 +1041,18 @@ export async function countRunningRunsForProject(
 	const rows = await db
 		.select({ total: count() })
 		.from(runs)
-		.where(and(eq(runs.projectId, projectId), eq(runs.status, 'running')));
+		.where(
+			and(
+				// Pipeline work only (issue #971): a machine mid-update is not executing
+				// this project's work, so it must not block deleting the project. This is
+				// also the only place anything counts running runs *per project* — project
+				// concurrency proper is computed from `dispatches` claims, which a
+				// maintenance run never creates.
+				eq(runs.kind, PIPELINE_RUN_KIND),
+				eq(runs.projectId, projectId),
+				eq(runs.status, 'running'),
+			),
+		);
 	return rows[0].total;
 }
 
@@ -1095,12 +1305,24 @@ export async function updateReviewMergeOutcome(
  * (`backfillLegacyMergeFollowUps`, `src/dispatch/reconciler.ts`) to import
  * pre-#292 merge-follow-up intent as durable merge dispatches. Rows whose
  * dispatch already exists are skipped there via the dispatch dedup key.
+ *
+ * Narrowed to {@link PipelineRunRow} (issue #971) so the backfill's repository-scoped
+ * project read takes the coordinates verbatim. A maintenance run could never match a
+ * Review phase with a merge outcome; the filter is what makes that a fact the
+ * compiler knows rather than one the caller has to.
  */
-export async function getPendingReviewMergeFollowUps(): Promise<RunRow[]> {
-	return getDb()
+export async function getPendingReviewMergeFollowUps(): Promise<PipelineRunRow[]> {
+	const rows = await getDb()
 		.select()
 		.from(runs)
-		.where(and(eq(runs.phase, 'review'), eq(runs.reviewMergeOutcome, 'not-ready')));
+		.where(
+			and(
+				eq(runs.kind, PIPELINE_RUN_KIND),
+				eq(runs.phase, 'review'),
+				eq(runs.reviewMergeOutcome, 'not-ready'),
+			),
+		);
+	return rows.filter(isPipelineRun);
 }
 
 /**
@@ -1218,9 +1440,17 @@ export async function failOrphanedRunningRuns(
 		.update(runs)
 		.set({ status: 'failed', error: reason, completedAt: new Date() })
 		.where(
+			// The kind filter is a real guard here, not a cosmetic one (issue #971): a
+			// maintenance run records the very `worker_id` this sweep narrows on, so a
+			// worker's own startup reap would otherwise fail the update run that asked it
+			// to restart — the one moment the restart is expected.
 			workerId !== null
-				? and(eq(runs.status, 'running'), eq(runs.workerId, workerId))
-				: and(eq(runs.status, 'running'), isNull(runs.workerId)),
+				? and(
+						eq(runs.kind, PIPELINE_RUN_KIND),
+						eq(runs.status, 'running'),
+						eq(runs.workerId, workerId),
+					)
+				: and(eq(runs.kind, PIPELINE_RUN_KIND), eq(runs.status, 'running'), isNull(runs.workerId)),
 		)
 		.returning({ id: runs.id });
 	return rows.length;
@@ -1238,6 +1468,13 @@ export async function failOrphanedRunningRuns(
  * whose finalize never landed (its process died, but the worker survived). Flip
  * those to `failed` with an explanatory `error`; return the count reconciled.
  * Best-effort like the rest of run tracking: callers log and continue on error.
+ *
+ * **Deliberately not narrowed to pipeline work** (issue #971), unlike every other
+ * filtered reader here: this is the settle-of-last-resort that makes "it settles
+ * like any other run" true for a machine that never answers its update, and
+ * {@link WORKER_UPDATE_RUN_TIMEOUT_MS} — written into that row's own `timeout_ms` —
+ * is what bounds the wait. A machine that answers later corrects the row
+ * ({@link settleWorkerUpdateRun}).
  */
 export async function failStaleRunningRuns(
 	defaultTimeoutMs: number,
@@ -1269,7 +1506,11 @@ export interface ListRunsFilter {
 	 */
 	projectIds?: readonly string[];
 	status?: RunStatus;
-	phase?: TriggerPhase;
+	/**
+	 * Widened past `TriggerPhase` (issue #971) so the list's existing phase filter can
+	 * isolate maintenance runs, whose `phase` is the maintenance kind's own name.
+	 */
+	phase?: TriggerPhase | typeof WORKER_UPDATE_RUN_PHASE;
 	limit: number;
 	offset: number;
 }
@@ -1285,6 +1526,10 @@ export interface ListRunsFilter {
  * attempt — `deferred`, or `checkpointed` (issue #503) — linked to a
  * pending/retry-scheduled dispatch. Retry-pending attempts with no waiting dispatch
  * remain visible as history and for operator recovery.
+ *
+ * **Deliberately not narrowed by `kind`** (issue #971): this is the runs list, and
+ * a maintenance run appearing in it without an operator knowing to look anywhere
+ * special is the whole point.
  */
 export async function listRunsFromDb(
 	filter: ListRunsFilter,
@@ -1393,7 +1638,11 @@ export async function listTaskActivitySince(input: {
 	if (input.projectIds && input.projectIds.length === 0) return [];
 
 	const db = getDb();
-	const conditions: SQL[] = [gte(runs.startedAt, input.since)];
+	// Pipeline work only (issue #971) — the acceptance criterion stalled detection is
+	// named by. A maintenance run belongs to no `(repository, task_id)` unit and would
+	// otherwise group under a pair of nulls and be reported as stalled work nobody can
+	// act on.
+	const conditions: SQL[] = [eq(runs.kind, PIPELINE_RUN_KIND), gte(runs.startedAt, input.since)];
 	if (input.projectIds) {
 		conditions.push(inArray(runs.projectId, [...input.projectIds]));
 	}
@@ -1426,7 +1675,7 @@ export async function listTaskActivitySince(input: {
 		.groupBy(runs.projectId, runs.repository, runs.taskId)
 		.as('task_activity');
 
-	return db
+	const rows = await db
 		.selectDistinctOn([runs.projectId, runs.repository, runs.taskId], {
 			projectId: runs.projectId,
 			repository: runs.repository,
@@ -1464,6 +1713,16 @@ export async function listTaskActivitySince(input: {
 			desc(sql`coalesce(${runs.completedAt}, ${runs.startedAt})`),
 			desc(runs.startedAt),
 		);
+
+	// `TaskActivityRow` keeps both coordinates non-nullable — the unit it describes is
+	// a `(repository, task_id)` pair, so a row without one is not a unit. With the kind
+	// filter above this drops nothing; it is how the declared type stays honest rather
+	// than being asserted (issue #971).
+	return rows.flatMap((row) =>
+		row.repository !== null && row.taskId !== null
+			? [{ ...row, repository: row.repository, taskId: row.taskId }]
+			: [],
+	);
 }
 
 /** Resolve a single run by its id. Returns `undefined` when unknown. */

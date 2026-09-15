@@ -252,7 +252,12 @@ Usage:
              to drain. Every
              outcome — applied, already-current, declined, refused, failed — is
              reported back and shown by 'list'; anything but 'applied' leaves the
-             machine working on the build it has. Requesting again replaces a
+             machine working on the build it has. Each request also appears in the
+             project's RUNS LIST as a run of its own, which starts, is visible while
+             it happens, and settles — so a failed update is diagnosable where every
+             other failure is. That is also why the machine must be ENROLLED IN A
+             PROJECT: with none there is no project for the run to hang off, and the
+             request is refused. Requesting again replaces a
              request that has not been answered yet. The machine's owner alone may
              do it, so sign in as them. Remember to undrain it afterwards.
              With --all and no worker id, every machine you own is moved to <ref>
@@ -281,9 +286,12 @@ Usage:
              its own host sets SWARM_WORKER_SELF_UPDATE=true, and a machine whose
              owner has not drained it is reported 'in-pool' and left alone, because
              draining stays the owner's own call. So its owner can refuse it, or
-             stop it later, without asking you. Each line carries the machine, its
+             stop it later, without asking you. A machine enrolled in no project is
+             reported 'no-project' and left alone too: an update is recorded as a run
+             in the machine's own project, and there is none to record it in. Each
+             line carries the machine, its
              owner, the disposition (requested | queued-offline | in-pool |
-             already-asked | answered) and 'owner opted out' for a machine that
+             no-project | already-asked | answered) and 'owner opted out' for a machine that
              last reported 'declined'. Every request records who made it, so
              'swarm workers update <worker-id> <ref>' is what an owner runs for
              their own machine and this is what an administrator runs for the fleet.
@@ -1489,6 +1497,15 @@ function printInstallationUpdateRequest(result: InstallationUpdateRequest): void
 	if (inPool.length > 0) {
 		out.info(
 			`  ${inPool.length} still in the dispatch pool and so not asked — draining is the machine owner's own call, so ask ${ownersOf(inPool)} to run 'swarm workers drain <worker-id>', then run this again`,
+		);
+	}
+	// The third thing an administrator cannot fix from here (issue #971): an update is
+	// recorded as a run in the machine's own project, so a machine enrolled in none has
+	// nowhere for that run to live and was not asked.
+	const noProject = result.workers.filter((worker) => worker.disposition === 'no-project');
+	if (noProject.length > 0) {
+		out.info(
+			`  ${noProject.length} enrolled in no project and so not asked — an update is recorded as a run in the machine's own project, so enroll it first ('swarm workers enroll <worker-id> <project-id>'), then run this again`,
 		);
 	}
 	const optedOut = result.workers.filter((worker) => worker.optedOut);

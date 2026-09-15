@@ -458,8 +458,12 @@ const getRunByIdFromDb = vi.fn(
 					// Read by the no-trigger settle (issue #815) to establish that the
 					// redelivered run really is the Review the ledger slot belongs to.
 					phase?: string;
-					taskId?: string;
+					taskId?: string | null;
 					prNumber?: string | null;
+					// Issue #971 — the two the no-trigger settle narrows on before it reads
+					// `taskId`: a maintenance run carries neither.
+					kind?: string;
+					repository?: string | null;
 			  }
 			| undefined,
 );
@@ -492,6 +496,11 @@ vi.mock('@/db/repositories/runsRepository.js', () => ({
 	},
 	getRunByIdFromDb: (id: string) => getRunByIdFromDb(id),
 	recordRunPreservedWorker: (runId: string) => recordRunPreservedWorker(runId),
+	// Issue #971 — a pure predicate over the row's own columns, so the real rule is
+	// restated rather than stubbed to a constant: the no-trigger settle must agree with
+	// the repository about what counts as pipeline work.
+	isPipelineRun: (run: { kind?: string; repository?: string | null; taskId?: string | null }) =>
+		run.kind === 'pipeline' && run.repository !== null && run.taskId !== null,
 }));
 
 // The preserved-checkout pin resolves the machine's display name for its refusal
@@ -1220,6 +1229,8 @@ describe('processJob', () => {
 			/** The run row behind the redelivery: the Review for the same PR. */
 			const completedReviewRun = (overrides: Record<string, unknown> = {}) =>
 				getRunByIdFromDb.mockResolvedValue({
+					kind: 'pipeline',
+					repository: 'SmartTechBrewery/swarm',
 					phase: 'review',
 					taskId: '17',
 					prNumber: '17',

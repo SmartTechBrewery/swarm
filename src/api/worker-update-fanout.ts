@@ -72,8 +72,8 @@ import type { WorkerUpdateStatus } from '../lib/build-identity.js';
 import { publishWorkerUpdateRequest } from '../queue/worker-updates.js';
 
 /**
- * What became of one machine in a fan-out. Two of the five record a request
- * (`requested`, `queued-offline`); the other three name a state that was left
+ * What became of one machine in a fan-out. Two of the six record a request
+ * (`requested`, `queued-offline`); the other four name a state that was left
  * exactly as it was:
  *
  * - `requested` — recorded, and the machine has a live session, so the push is on
@@ -83,6 +83,9 @@ import { publishWorkerUpdateRequest } from '../queue/worker-updates.js';
  * - `in-pool` — skipped: the machine is not draining, so asking it would give it
  *   new work while it waits to restart. The remedy is `swarm workers drain <id>`,
  *   exactly as `requestUpdate`'s own refusal names it.
+ * - `no-project` — skipped: the machine is enrolled in no project (issue #971), so
+ *   the `runs` row that records an update has no project to hang off. The remedy is
+ *   `swarm workers enroll <worker-id> <project-id>`.
  * - `already-asked` — an unanswered request for **this same target** is already
  *   outstanding; left as it is, request id and all.
  * - `answered` — the machine already reported an outcome for **this exact
@@ -92,6 +95,7 @@ export const WORKER_UPDATE_FANOUT_DISPOSITIONS = [
 	'requested',
 	'queued-offline',
 	'in-pool',
+	'no-project',
 	'already-asked',
 	'answered',
 ] as const;
@@ -188,6 +192,20 @@ export async function fanOutWorkerUpdate(
 				workerId: result.worker.id,
 				displayName: result.worker.displayName,
 				disposition: 'in-pool',
+				lastReportedStatus,
+				update: result.worker.update,
+			});
+			continue;
+		}
+		// Enrolled in no project, so the run that records an update has nothing to hang
+		// off and the write recorded nothing (issue #971). Reported like `in-pool` — one
+		// machine's state never refuses the whole call — rather than thrown for, which is
+		// what the single-machine form does with the same outcome.
+		if (result.outcome === 'no-project') {
+			entries.push({
+				workerId: result.worker.id,
+				displayName: result.worker.displayName,
+				disposition: 'no-project',
 				lastReportedStatus,
 				update: result.worker.update,
 			});

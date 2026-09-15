@@ -61,7 +61,14 @@ vi.mock('@/db/repositories/usersRepository.js', () => ({ getUserById }));
 vi.mock('@/db/repositories/projectsRepository.js', () => ({
 	findProjectRecordByIdFromDb,
 }));
-vi.mock('@/db/repositories/runsRepository.js', () => ({ getRunByIdFromDb }));
+// `isPipelineRun` is a pure predicate over the row's own columns (issue #971) and is
+// restated rather than stubbed, so the roster and the repository cannot disagree
+// about what counts as an Active job.
+vi.mock('@/db/repositories/runsRepository.js', () => ({
+	getRunByIdFromDb,
+	isPipelineRun: (run: { kind?: string; repository?: string | null; taskId?: string | null }) =>
+		run.kind === 'pipeline' && run.repository !== null && run.taskId !== null,
+}));
 vi.mock('@/identity/worker-session-service.js', () => ({
 	getLiveSessionForWorker,
 	getRetainedSessionForWorker,
@@ -371,6 +378,7 @@ describe('listDashboardWorkers (issue #133)', () => {
 		return {
 			id: RUN_ID,
 			status: 'running',
+			kind: 'pipeline',
 			projectId: 'proj-a',
 			repository: 'acme/api',
 			taskId: '42',
@@ -599,6 +607,33 @@ describe('listDashboardWorkers (issue #133)', () => {
 
 			const [view] = await listDashboardWorkers(null);
 			expect(view.currentRun?.runId).toBe(RUN_ID);
+		});
+
+		// Issue #971 — a `worker-update` run names no repository and no task, so there is
+		// no Active job to describe. It cannot be reached through either pointer (it
+		// creates neither a dispatch claim nor a session pointer), so this is the guard
+		// rather than a live case, and a run with no coordinates must read as idle rather
+		// than as a job with blank fields.
+		it('reports no active job for a machine-maintenance run', async () => {
+			listAllWorkers.mockResolvedValue([makeWorker()]);
+			listEnrollmentsForWorker.mockResolvedValue([makeEnrollment()]);
+			getUserById.mockResolvedValue(makeOwner());
+			getLiveSessionForWorker.mockResolvedValue(liveSession(RUN_ID));
+			getActiveWorkerClaims.mockResolvedValue([]);
+			getRunByIdFromDb.mockResolvedValue(
+				runningRun({
+					kind: 'worker-update',
+					phase: 'worker-update',
+					repository: null,
+					taskId: null,
+					workItemId: null,
+					workItemTitle: null,
+					workItemUrl: null,
+				}),
+			);
+
+			const [view] = await listDashboardWorkers(null);
+			expect(view.currentRun).toBeNull();
 		});
 	});
 

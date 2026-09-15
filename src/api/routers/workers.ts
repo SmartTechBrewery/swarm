@@ -655,7 +655,10 @@ export const workersRouter = router({
 	//
 	// Everything else the worker carries goes with it through existing FK constraints —
 	// its enrollments, its operator SCM credentials, and its session — while its runs
-	// stay in history with `worker_user_id` preserving the attribution.
+	// stay in history with `worker_user_id` preserving the attribution, and a
+	// maintenance run (issue #971) additionally keeping the `maintenance_machine` name
+	// it recorded: a run whose whole subject is a machine has to go on naming it once
+	// that machine is retired, which is exactly when it gets read.
 	remove: authedProcedure
 		.input(z.object({ workerId: z.string().uuid() }))
 		.mutation(async ({ ctx, input }) => {
@@ -805,6 +808,19 @@ export const workersRouter = router({
 						`Worker '${result.worker.displayName}' is still in the dispatch pool, so it cannot be ` +
 						`asked to update: it would be given new work while it waits to restart. Run ` +
 						`\`swarm workers drain ${input.workerId}\` first, then request the update.`,
+				});
+			}
+			// The boundary that comes with recording an update as a run (issue #971): the
+			// run is scoped to the machine's own project, so a machine enrolled in none has
+			// nothing for it to hang off and nothing was written.
+			if (result.outcome === 'no-project') {
+				throw new TRPCError({
+					code: 'PRECONDITION_FAILED',
+					message:
+						`Worker '${result.worker.displayName}' is enrolled in no project, so an update for ` +
+						`it has no project to be recorded against and nothing was requested. Enroll the ` +
+						`machine in a project first (\`swarm workers enroll ${input.workerId} <project-id>\`), ` +
+						`then request the update.`,
 				});
 			}
 			const updated = result.worker;

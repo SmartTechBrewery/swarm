@@ -69,7 +69,7 @@ import {
 	getWorkerDispatchClaimState,
 } from '../db/repositories/dispatchesRepository.js';
 import { findProjectRecordByIdFromDb } from '../db/repositories/projectsRepository.js';
-import { getRunByIdFromDb } from '../db/repositories/runsRepository.js';
+import { getRunByIdFromDb, isPipelineRun } from '../db/repositories/runsRepository.js';
 import { getUserById } from '../db/repositories/usersRepository.js';
 import {
 	createEnrollment,
@@ -827,6 +827,11 @@ async function getIfRunningAndAccessible(
 ): Promise<DashboardWorkerRun | null> {
 	const run = await getRunByIdFromDb(runId);
 	if (!run || run.status !== 'running') return null;
+	// Pipeline work only (issue #971). A maintenance run names no repository and no
+	// task, so there is no Active job to describe — and it cannot be reached here
+	// anyway, since it creates neither the dispatch claim nor the session pointer the
+	// caller derives its candidate from.
+	if (!isPipelineRun(run)) return null;
 	if (accessible && !accessible.has(run.projectId)) return null;
 	return {
 		runId: run.id,
