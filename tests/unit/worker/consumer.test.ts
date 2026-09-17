@@ -24,6 +24,7 @@ import type { CancellationOrigin } from '@/queue/cancellation.js';
 import { TRANSPORT_LOST_ORPHAN_REASON } from '@/router/transport-loss-reaper.js';
 import { DeliveryDeferredError, HANDOFF_FILENAMES, validatePreparedTree } from '@/scm/delivery.js';
 import { GitWorktreeManager } from '@/worker/git-worktree-manager.js';
+import { CommitUnavailableError } from '@/worktree/commit-availability.js';
 import {
 	createMockPhaseRecovery,
 	createMockPmWebhookJob,
@@ -470,6 +471,10 @@ const getRunByIdFromDb = vi.fn(
 );
 /** Issue #567 — the settle-time record of which machine holds the preserved checkout. */
 const recordRunPreservedWorker = vi.fn(async (_runId: string) => {});
+// Issue #1018 — the run's record of which machines could not obtain its commit: the
+// write the failure makes, and the read the next dispatch's gate does.
+const recordRunCommitUnavailableWorker = vi.fn(async (_runId: string) => {});
+const listRunCommitUnavailableWorkerIds = vi.fn(async (_runId: string): Promise<string[]> => []);
 vi.mock('@/db/repositories/runsRepository.js', () => ({
 	createRun: (input: unknown) => createRun(input),
 	completeRun: (id: string, input: unknown) => completeRun(id, input),
@@ -497,6 +502,8 @@ vi.mock('@/db/repositories/runsRepository.js', () => ({
 	},
 	getRunByIdFromDb: (id: string) => getRunByIdFromDb(id),
 	recordRunPreservedWorker: (runId: string) => recordRunPreservedWorker(runId),
+	recordRunCommitUnavailableWorker: (runId: string) => recordRunCommitUnavailableWorker(runId),
+	listRunCommitUnavailableWorkerIds: (runId: string) => listRunCommitUnavailableWorkerIds(runId),
 	// Issue #971 — a pure predicate over the row's own columns, so the real rule is
 	// restated rather than stubbed to a constant: the no-trigger settle must agree with
 	// the repository about what counts as pipeline work.
@@ -4736,6 +4743,66 @@ describe('processJob', () => {
 		expect(addComment).toHaveBeenCalledTimes(1);
 		expect(addComment.mock.calls[0][0]).toBe('item-100');
 		expect(addComment.mock.calls[0][1]).toContain('unpushed commits');
+	});
+
+	// Issue #1018. The live shape: the reviewed head SHA was produced by another
+	// worker, the machine this Review was routed to had no fetch that worked, and the
+	// run settled terminally on `fatal: invalid reference` — then every retry came
+	// back to the same machine, because nothing recorded that it had just failed.
+	describe('a commit this worker could not obtain', () => {
+		it('defers instead of settling terminally, and records the machine that failed', async () => {
+			phaseImpl = async () => {
+				throw new CommitUnavailableError('bbe9b84c4a32486778d136f4d9c0c0cbe13bbd7e', {
+					repoRoot: '/Users/dev/swarm/swarm',
+					taskId: '224',
+					fetchError: 'Connection refused',
+					fetched: true,
+				});
+			};
+			recordRunCommitUnavailableWorker.mockClear();
+			commentOnPullRequest.mockClear();
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ rateLimitRetryAttempt: 0 }),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			// Deferred, not `phase-failed`: the commit is on the remote, so the run has
+			// somewhere else to go.
+			expect(outcome.status).toBe('phase-deferred');
+			expect(outcome).toHaveProperty('retryDelayMs');
+			// The machine is on the run, so the next dispatch's gate can pass it over.
+			expect(recordRunCommitUnavailableWorker).toHaveBeenCalledWith('run-1');
+			// A deferral posts no "failed" comment on the pull request.
+			expect(commentOnPullRequest).not.toHaveBeenCalled();
+		});
+
+		it('waits on the commit-unavailable reason, and names the fetch failure in the run error', async () => {
+			phaseImpl = async () => {
+				throw new CommitUnavailableError('bbe9b84c4a32486778d136f4d9c0c0cbe13bbd7e', {
+					repoRoot: '/Users/dev/swarm/swarm',
+					taskId: '224',
+					fetchError: 'Connection refused',
+					fetched: true,
+				});
+			};
+			scheduleDispatchRetry.mockClear();
+
+			await processJob(
+				createMockScmWebhookJob({ rateLimitRetryAttempt: 0 }),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			const [, input] = scheduleDispatchRetry.mock.calls.at(-1) as [
+				string,
+				Record<string, unknown>,
+			];
+			expect(input.waitReason).toBe('commit-unavailable');
+			// The cause that used to live only in a warn on the worker's own machine.
+			const settle = completeRun.mock.calls.at(-1)?.[1] as { error?: string };
+			expect(settle.error).toContain('Connection refused');
+			expect(settle.error).not.toContain('invalid reference');
+		});
 	});
 
 	// Issue #1019: the PR+SHA dispatch claim is taken before a Review starts and used

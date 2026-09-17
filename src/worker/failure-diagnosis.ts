@@ -12,6 +12,7 @@ export const FailureDiagnosisKindSchema = z.enum([
 	'worker-shutdown',
 	'user-terminated',
 	'continuation-budget-exhausted',
+	'commit-unavailable',
 ]);
 
 export type FailureDiagnosisKind = z.infer<typeof FailureDiagnosisKindSchema>;
@@ -91,6 +92,13 @@ function knownDiagnosis(condition: KnownFailureCondition): FailureDiagnosis {
 				'Known condition: user termination',
 				'The run was terminated by a user request.',
 				'Retry the phase only if you want to run it again.',
+			);
+		case 'commit-unavailable':
+			return diagnosis(
+				condition,
+				'Known condition: the commit is not on the worker',
+				"The phase needs a checkout detached at a specific commit, and the worker's clone did not have it — a `git fetch origin` and a direct fetch of the commit both failed to supply it. The run error names both attempts verbatim. This is a fact about that machine's access to the remote, not about the pull request, the branch or the SHA.",
+				"Check that machine's network access and credentials for the remote (`git fetch origin` in its checkout), or enroll a worker that can reach it, then retry the phase.",
 			);
 		case 'continuation-budget-exhausted':
 			return diagnosis(

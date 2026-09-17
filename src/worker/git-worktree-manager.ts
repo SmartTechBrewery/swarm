@@ -19,9 +19,11 @@ import { existsSync, realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { promisify } from 'node:util';
 import type { ProjectConfig } from '../config/schema.js';
+import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { SCRATCH_PATHSPECS } from '../scm/delivery.js';
 import { normalizeRepoSlug, resolveOriginRepoSlug } from '../scm/repo-slug.js';
+import { CommitUnavailableError } from '../worktree/commit-availability.js';
 import {
 	BlockedRecoveryError,
 	evaluateWorktreeLiveness,
@@ -179,6 +181,14 @@ export type SweepClaim = { safe: true; token: string } | Extract<LivenessDecisio
 
 /** Manages the git-worktree lifecycle for one SWARM project. Construct one per project. */
 export class GitWorktreeManager {
+	/**
+	 * The provision-time `git fetch origin` failure, when this manager's last fetch
+	 * failed (issue #1018) — the cause every later "the ref is not here" symptom has
+	 * to be able to name. Per instance because a manager is constructed per
+	 * provisioning call site, so it can never describe another task's fetch.
+	 */
+	private lastFetchError?: string;
+
 	constructor(
 		private readonly project: ProjectConfig,
 		private readonly runtime: WorktreeRuntime = storeBackedWorktreeRuntime,
@@ -479,6 +489,7 @@ export class GitWorktreeManager {
 			: baseBranch;
 
 		const explicitlyDetached = options.detach ?? false;
+		await this.ensureDetachBaseCommit(taskId, baseBranch, baseRef, options);
 		// Detached HEAD has no branch; the handle reports the base ref it points at.
 		const branch = explicitlyDetached
 			? baseBranch
@@ -515,7 +526,7 @@ export class GitWorktreeManager {
 			detached,
 			checkoutMode: checkout.mode,
 		});
-		await this.git(args);
+		await this.addWorktree(args);
 
 		await this.runtime.claim(this.project.id, taskId, leaseToken);
 
@@ -631,6 +642,27 @@ export class GitWorktreeManager {
 		}
 	}
 
+	/**
+	 * Run `git worktree add`, naming a failed provision-time fetch when there was one
+	 * (issue #1018).
+	 *
+	 * A checkout that fails right after a fetch that failed is very likely that
+	 * fetch's consequence, and the fetch is the half the operator cannot see — it
+	 * failed into a `logger.warn` on this machine. Naming it here is what carries the
+	 * cause to the control plane instead of leaving it git's message about a ref whose
+	 * absence already had an explanation nobody reported.
+	 */
+	private async addWorktree(args: string[]): Promise<void> {
+		try {
+			await this.git(args);
+		} catch (err) {
+			if (!this.lastFetchError) throw err;
+			throw new Error(
+				`${describeError(err)} (this worker's \`git fetch origin\` had failed first: ${this.lastFetchError})`,
+			);
+		}
+	}
+
 	/** Whether a ref resolves in this repository — used for `origin/<branch>`. */
 	private async refExists(ref: string): Promise<boolean> {
 		try {
@@ -639,6 +671,75 @@ export class GitWorktreeManager {
 		} catch {
 			return false;
 		}
+	}
+
+	/**
+	 * Whether `commitish` names a commit **this clone actually holds** (issue #1018).
+	 *
+	 * Distinct from {@link refExists} in the one way that matters here: it peels to
+	 * `^{commit}`, which forces git to read the object. A bare
+	 * `rev-parse --verify <40-hex>` echoes any well-formed SHA straight back, present
+	 * or not — which is precisely why a head SHA the worker had never fetched sailed
+	 * through every check and died inside `git worktree add`.
+	 */
+	private async commitExists(commitish: string): Promise<boolean> {
+		return this.refExists(`${commitish}^{commit}`);
+	}
+
+	/**
+	 * Make sure a deliberately detached checkout's base commit is in this clone, or fail
+	 * saying why it is not (issue #1018).
+	 *
+	 * Applies to exactly one shape, which it decides itself so the caller carries no
+	 * branch: a `detach` whose base resolved to the **literal** value rather than to
+	 * `origin/<name>`. That is the detach-at-a-head-SHA case, and it is the one base
+	 * `git worktree add` cannot be trusted to judge for itself — `rev-parse --verify
+	 * <40-hex>` answers a full SHA back **without checking the object is present**, so
+	 * nothing upstream of here could tell a commit this clone holds from one it has
+	 * never seen, and the checkout died on `fatal: invalid reference: <sha>` about a
+	 * commit that was on the remote all along.
+	 *
+	 * The provision-time `git fetch origin` is the only thing that supplies a commit
+	 * another machine produced, and it is best-effort: it updates `refs/remotes/origin/*`
+	 * and is otherwise allowed to fail into a local warn. So when the commit is absent,
+	 * ask the remote for it **by name** first — `git fetch origin <sha>` is served for
+	 * any commit reachable from a ref, which is every same-repo pull request head — and
+	 * only then conclude that this machine cannot obtain it.
+	 *
+	 * Both attempts' failures are carried into {@link CommitUnavailableError}, because
+	 * the cause an operator needs is the fetch, not the checkout that failed after it.
+	 */
+	private async ensureDetachBaseCommit(
+		taskId: string,
+		commitish: string,
+		baseRef: string,
+		options: ProvisionOptions,
+	): Promise<void> {
+		if (!options.detach || baseRef !== commitish) return;
+		if (await this.commitExists(commitish)) return;
+
+		let targetedFetchError: string | undefined;
+		try {
+			await this.git(['fetch', 'origin', commitish]);
+		} catch (err) {
+			targetedFetchError = err instanceof Error ? err.message : String(err);
+		}
+		if (await this.commitExists(commitish)) {
+			logger.info('Fetched a detached checkout base commit missing from this clone', {
+				taskId,
+				commit: commitish,
+				repoRoot: this.project.repoRoot,
+			});
+			return;
+		}
+
+		throw new CommitUnavailableError(commitish, {
+			repoRoot: this.project.repoRoot,
+			taskId,
+			fetchError: this.lastFetchError,
+			targetedFetchError,
+			fetched: options.fetch !== false,
+		});
 	}
 
 	/**
@@ -939,14 +1040,26 @@ export class GitWorktreeManager {
 		);
 	}
 
-	/** Best-effort `git fetch origin` — a failure (no remote, offline) is logged, not thrown. */
+	/**
+	 * Best-effort `git fetch origin` — a failure (no remote, offline) is logged, not
+	 * thrown, because a local-only clone must still be able to cut a branch.
+	 *
+	 * The failure is also **kept** (issue #1018). Swallowing it entirely is what left
+	 * the one consequence that is not survivable — a detached-at-SHA checkout of a
+	 * commit only the remote has — reported as git's `invalid reference`, with the
+	 * real cause sitting in a warn on the worker's own machine. {@link lastFetchError}
+	 * carries it to whoever ends up failing because of it, which is how it reaches the
+	 * control plane at all.
+	 */
 	private async fetch(): Promise<void> {
+		this.lastFetchError = undefined;
 		try {
 			await this.git(['fetch', 'origin']);
 		} catch (err) {
+			this.lastFetchError = err instanceof Error ? err.message : String(err);
 			logger.warn('git fetch origin failed — continuing with local refs', {
 				repoRoot: this.project.repoRoot,
-				error: err instanceof Error ? err.message : String(err),
+				error: this.lastFetchError,
 			});
 		}
 	}
