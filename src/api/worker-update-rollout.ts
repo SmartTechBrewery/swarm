@@ -41,12 +41,27 @@
  * #933 has no cancel for a single request: the way forward is to fix the build and
  * start a new rollout, which is possible precisely because only an `in_progress`
  * rollout blocks a new one.
+ *
+ * **A rollout has a scope since issue #1024**, and almost nothing here reads it. The
+ * scope decides two things and no third: *which machines* `startRollout` names
+ * (`listWorkersForOwner` or `listAllWorkers` grouped by owner), and whether a member
+ * that settles `failed` goes back in the dispatch pool
+ * (`rolloutReleasesFailedMembers` — an installation-wide rollout drained a machine
+ * belonging to somebody who never asked, so it returns every one of them). Everything
+ * else — the wave bound, the idle wait, the come-back verdict, the halt, the
+ * stand-down, the drain hand-off — is scope-blind and is the same code for both. A
+ * third rule lives here rather than in an index because no key expresses it: an
+ * installation-wide rollout and an owner-scoped one must never be live together,
+ * since the former overlaps every one of the latter.
  */
 
 import {
 	advanceUnderRolloutLock,
 	createRollout,
+	findAnyInProgressOwnerRollout,
+	findInProgressInstallationRollout,
 	findInProgressRolloutForOwner,
+	findLatestInstallationRollout,
 	findLatestRolloutForOwner,
 	findRolloutHoldElsewhere,
 	type MemberPatch,
@@ -55,7 +70,12 @@ import {
 } from '../db/repositories/workerUpdateRolloutsRepository.js';
 import type { Worker } from '../identity/worker.js';
 import { deriveWorkerRunState } from '../identity/worker-enrollment-service.js';
-import { getWorkers, listWorkersForOwner, setWorkerDraining } from '../identity/worker-service.js';
+import {
+	getWorkers,
+	listAllWorkers,
+	listWorkersForOwner,
+	setWorkerDraining,
+} from '../identity/worker-service.js';
 import { getLiveSessionForWorker, type WorkerSession } from '../identity/worker-session-service.js';
 import {
 	DEFAULT_ROLLOUT_WAVE_SIZE,
@@ -63,8 +83,10 @@ import {
 	isHaltingUpdateStatus,
 	isRestartingUpdateStatus,
 	isSettledMemberState,
+	rolloutReleasesFailedMembers,
 	type WorkerUpdateRollout,
 	type WorkerUpdateRolloutMember,
+	type WorkerUpdateRolloutScope,
 } from '../identity/worker-update-rollout.js';
 import type { WorkerUpdateStatus } from '../lib/build-identity.js';
 import { fanOutWorkerUpdate } from './worker-update-fanout.js';
@@ -94,6 +116,16 @@ const COME_BACK_WINDOW_MS = 10 * 60_000;
 /** One machine's line in a rollout readout — its member row plus the label an operator reads it by. */
 export interface RolloutMemberView extends WorkerUpdateRolloutMember {
 	displayName: string;
+	/**
+	 * Who owns the machine, read straight off the `Worker` the pass already loaded
+	 * (issue #1024) — `null` for a member whose row has gone, exactly as
+	 * `displayName` falls back to the id for one.
+	 *
+	 * An id and not a name: turning it into a person is a `listUsers()` read, which is
+	 * the router's to make and to justify against its own caller. The policy module
+	 * resolves no users.
+	 */
+	ownerUserId: string | null;
 }
 
 /** A rollout as the API surfaces answer it. */
@@ -120,6 +152,11 @@ export interface RolloutView {
  *   machines. That overlap is bounded instead of refused: a machine is held by at
  *   most one of them, the drain is handed on rather than undrained under the other
  *   (`ownsTheDrain` / `returnToPool`), and the halted one signals nothing further.
+ * - `blocked-by-other-scope` — a rollout of the **other** scope is in progress
+ *   (issue #1024). Two rollouts whose member sets overlap would drain and undrain
+ *   each other's members, and an installation-wide rollout overlaps every
+ *   owner-scoped one, so neither kind may start while the other is moving. `view` is
+ *   the rollout that is in the way, so the caller can name where to go and look.
  * - `no-machines` — the caller operates none, so there is nothing to roll out and
  *   no rollout is recorded. An honest empty answer, not an error, exactly as
  *   `requestUpdateForMine` answers an operator with no machines.
@@ -128,48 +165,86 @@ export type StartRolloutResult =
 	| { outcome: 'started'; view: RolloutView }
 	| { outcome: 'advanced'; view: RolloutView }
 	| { outcome: 'conflict'; view: RolloutView }
+	| { outcome: 'blocked-by-other-scope'; view: RolloutView }
 	| { outcome: 'no-machines' };
 
 /** The fields a caller supplies to start a rollout. */
 export interface StartRolloutInput {
+	/**
+	 * Who is asking. For `scope: 'owner'` it is also whose machines are moved; for
+	 * `scope: 'installation'` it is only the administrator the per-machine requests are
+	 * recorded under (issue #1024).
+	 */
 	ownerUserId: string;
+	/** Which machines to move — the caller's own fleet, or every machine registered. */
+	scope: WorkerUpdateRolloutScope;
 	target: string;
 	/** Omit for {@link DEFAULT_ROLLOUT_WAVE_SIZE}; ignored when an existing rollout is advanced. */
 	waveSize?: number;
 }
 
 /**
- * Start a rollout over every machine the caller owns — or advance the one already
+ * Start a rollout over the machines `scope` names — or advance the one already
  * moving to this same target.
  *
- * The membership snapshot is `listWorkersForOwner` order, which is what `swarm
- * workers list` already prints, so the order a rollout moves a fleet in is the
- * order the operator read it in. Nothing is recorded about a machine the operator
- * does not own: the set is theirs and nothing wider, inheriting `requestUpdate`'s
- * strictly-owner-only rule rather than restating it (issue #922 owns the
- * administrator-over-someone-else's-machine question).
+ * **Membership is the scope, and nothing else about the state machine moves.** An
+ * owner-scoped rollout is `listWorkersForOwner` order, which is what `swarm workers
+ * list` already prints, so the order a rollout moves a fleet in is the order the
+ * operator read it in. An installation-scoped one is `listAllWorkers` grouped by
+ * `ownerUserId` — one contiguous block per owner, which is the axis an administrator
+ * reads a fleet report along, and a stable sort so `listAllWorkers`' own oldest-first
+ * order holds inside each block. Be honest about what that key buys: `ownerUserId` is
+ * a uuid, so the blocks come out *grouped but arbitrarily ordered*, unlike
+ * `requestUpdateForInstallation`, which sorts by the owner's `identifier`. That is the
+ * right trade here — resolving users is a `listUsers()` read and this is a policy
+ * module — and the router can re-sort by identifier after labelling, where the names
+ * already are.
  *
  * A new rollout is advanced once before it is returned, so starting one *is*
  * draining and signalling its first wave rather than recording an intention.
  *
- * The "one in progress per owner" rule is decided by the insert's own partial
- * unique index, not by the read above it: two `swarm workers update --all` calls
- * landing at the same instant would both find nothing and both insert. The loser's
- * `23505` is caught here and re-resolved against whatever actually won, so a race
- * produces the same answer as arriving second.
+ * **Two uniqueness rules are the insert's own partial unique indexes**, not the read
+ * above them: two `swarm workers update --all` calls landing at the same instant
+ * would both find nothing and both insert. The loser's `23505` is caught here and
+ * re-resolved against whatever actually won, so a race produces the same answer as
+ * arriving second.
+ *
+ * **The cross-scope refusal is a read, because no single key expresses it.** An
+ * installation-wide rollout overlaps every owner-scoped one by construction, so the
+ * two must never be live together — but "no rollout of the other scope exists" is not
+ * a value any index can be unique on. The residual same-instant race that leaves is
+ * bounded rather than closed: `reassertDrain` re-drains its whole wave on every pass,
+ * so a member undrained out from under the current wave is taken back on the next
+ * advance. What it does not cover is a machine the other rollout has already settled
+ * and released, which is the cost of not having a key for it.
  */
 export async function startRollout(input: StartRolloutInput): Promise<StartRolloutResult> {
 	const waveSize = input.waveSize ?? DEFAULT_ROLLOUT_WAVE_SIZE;
-	const existing = await findInProgressRolloutForOwner(input.ownerUserId);
+	const existing =
+		input.scope === 'installation'
+			? await findInProgressInstallationRollout()
+			: await findInProgressRolloutForOwner(input.ownerUserId);
 	if (existing) return await resolveAgainstExisting(existing, input.target);
 
-	const workers = await listWorkersForOwner(input.ownerUserId);
+	const blocking = await findRolloutOfOtherScope(input.scope);
+	if (blocking) {
+		const view = await readRolloutView(blocking.id);
+		if (view) return { outcome: 'blocked-by-other-scope', view };
+		// It finished between the two reads; carry on rather than refusing over a
+		// rollout that no longer exists, exactly as `resolveAgainstExisting` does.
+	}
+
+	const workers =
+		input.scope === 'installation'
+			? byOwnerBlock(await listAllWorkers())
+			: await listWorkersForOwner(input.ownerUserId);
 	if (workers.length === 0) return { outcome: 'no-machines' };
 
 	let rolloutId: string;
 	try {
 		const created = await createRollout({
 			requestedByUserId: input.ownerUserId,
+			scope: input.scope,
 			target: input.target,
 			waveSize,
 			workerIds: workers.map((worker) => worker.id),
@@ -179,7 +254,10 @@ export async function startRollout(input: StartRolloutInput): Promise<StartRollo
 		if (!isUniqueViolation(error)) throw error;
 		// Lost the race to another call of this same procedure. Whatever won is the
 		// rollout in progress now, so answer against it exactly as arriving second would.
-		const winner = await findInProgressRolloutForOwner(input.ownerUserId);
+		const winner =
+			input.scope === 'installation'
+				? await findInProgressInstallationRollout()
+				: await findInProgressRolloutForOwner(input.ownerUserId);
 		if (!winner) throw error;
 		return await resolveAgainstExisting(winner, input.target);
 	}
@@ -189,6 +267,31 @@ export async function startRollout(input: StartRolloutInput): Promise<StartRollo
 	// `undefined` for a rollout that is gone, and inventing a view would be a lie.
 	if (!view) throw new Error(`Rollout ${rolloutId} disappeared immediately after it was created`);
 	return { outcome: 'started', view };
+}
+
+/**
+ * A live rollout of the scope this one is *not*, or `undefined` when there is none —
+ * the cross-scope refusal's own read (issue #1024). An installation-wide rollout is
+ * blocked by any owner's, an owner's by the single installation-wide one.
+ */
+async function findRolloutOfOtherScope(
+	scope: WorkerUpdateRolloutScope,
+): Promise<WorkerUpdateRollout | undefined> {
+	return scope === 'installation'
+		? await findAnyInProgressOwnerRollout()
+		: await findInProgressInstallationRollout();
+}
+
+/**
+ * Every machine on the installation, one contiguous block per owner. A stable sort on
+ * `ownerUserId` alone, so each owner's machines keep `listAllWorkers`' own
+ * `created_at, id` order inside their block — see {@link startRollout} on what this
+ * key does and does not buy.
+ */
+function byOwnerBlock(workers: Worker[]): Worker[] {
+	return [...workers].sort((a, b) =>
+		a.ownerUserId < b.ownerUserId ? -1 : a.ownerUserId > b.ownerUserId ? 1 : 0,
+	);
 }
 
 /** Advance an existing in-progress rollout, or refuse it for naming a different build. */
@@ -208,9 +311,20 @@ async function resolveAgainstExisting(
 	return { outcome: 'advanced', view };
 }
 
-/** The owner's most recent rollout, or `null` when they have never started one. */
+/** The owner's most recent owner-scoped rollout, or `null` when they have never started one. */
 export async function getRolloutForOwner(ownerUserId: string): Promise<RolloutView | null> {
 	const rollout = await findLatestRolloutForOwner(ownerUserId);
+	if (!rollout) return null;
+	return (await readRolloutView(rollout.id)) ?? null;
+}
+
+/**
+ * The installation's most recent installation-wide rollout, or `null` when none has
+ * ever run (issue #1024) — the installation twin of {@link getRolloutForOwner}, and
+ * read-only exactly like it.
+ */
+export async function getInstallationRollout(): Promise<RolloutView | null> {
+	const rollout = await findLatestInstallationRollout();
 	if (!rollout) return null;
 	return (await readRolloutView(rollout.id)) ?? null;
 }
@@ -243,7 +357,9 @@ async function readRolloutView(rolloutId: string): Promise<RolloutView | undefin
  *    that cannot start says nothing, so silence has to be the verdict.
  * 3. **Return** each member the rollout is finished with to the dispatch pool, but
  *    only one the rollout drained itself: a machine the operator had drained for
- *    their own reasons is left exactly as they left it.
+ *    their own reasons is left exactly as they left it. A member that settled
+ *    `failed` is left drained in an owner-scoped rollout and returned in an
+ *    installation-scoped one (issue #1024).
  * 4. **Stand down** every machine the rollout has not committed to yet, if it has
  *    halted — so a halt leaves the untouched majority of the fleet in the pool.
  * 5. **Advance**, while it is still in progress: take the next `waveSize` queued
@@ -295,6 +411,7 @@ function decideSettlement(
 	worker: Worker,
 	target: string,
 	now: Date,
+	releasesFailedMembers: boolean,
 ): MemberVerdict | undefined {
 	const update = worker.update;
 	if (update?.requestId && update.requestId === member.requestId) return undefined;
@@ -304,7 +421,7 @@ function decideSettlement(
 			returnToPool: true,
 		};
 	}
-	return decideReportedOutcome(worker, update.status, update.message, now);
+	return decideReportedOutcome(worker, update.status, update.message, now, releasesFailedMembers);
 }
 
 /**
@@ -319,12 +436,17 @@ function decideSettlement(
  * next step's question. Which of the two it was makes no difference here, so the test
  * asks the vocabulary rather than naming them. `already-current` settles at once,
  * because nothing was installed and nothing restarted, so there is nothing to wait for.
+ *
+ * `releasesFailedMembers` is the rollout's scope, already answered
+ * (`rolloutReleasesFailedMembers`, issue #1024) — the one fact that makes the `failed`
+ * verdict below differ between an owner-scoped rollout and an installation-wide one.
  */
 function decideReportedOutcome(
 	worker: Worker,
 	outcome: WorkerUpdateStatus | null,
 	message: string | null,
 	now: Date,
+	releasesFailedMembers: boolean,
 ): MemberVerdict {
 	if (outcome && isRestartingUpdateStatus(outcome)) {
 		return { patch: { state: 'verifying', outcome, message } };
@@ -332,6 +454,7 @@ function decideReportedOutcome(
 	if (outcome && isHaltingUpdateStatus(outcome)) {
 		return {
 			patch: { state: 'failed', outcome, message, settledAt: now },
+			returnToPool: releasesFailedMembers,
 			halt: `worker '${worker.displayName}' reported ${outcome}${message ? `: ${message}` : ''}`,
 		};
 	}
@@ -366,6 +489,7 @@ function decideComeBack(
 	session: WorkerSession | undefined,
 	target: string,
 	now: Date,
+	releasesFailedMembers: boolean,
 ): MemberVerdict | undefined {
 	// A null token at signal time means the machine had no live session to read one
 	// from, so any live session now is the new daemon.
@@ -387,6 +511,7 @@ function decideComeBack(
 				message: `came back still on ${member.buildCommitAtSignal}, the build it was asked to move off`,
 				settledAt: now,
 			},
+			returnToPool: releasesFailedMembers,
 			halt:
 				`worker '${worker.displayName}' applied '${target}' and then came back on ` +
 				`${member.buildCommitAtSignal} — the build it started from — so it did not stay on the new one`,
@@ -400,6 +525,7 @@ function decideComeBack(
 	if (now.getTime() - appliedAt.getTime() <= COME_BACK_WINDOW_MS) return undefined;
 	return {
 		patch: { state: 'failed', message: 'applied the update and never came back', settledAt: now },
+		returnToPool: releasesFailedMembers,
 		halt:
 			`worker '${worker.displayName}' applied '${target}' and has not come back within ` +
 			`${Math.round(COME_BACK_WINDOW_MS / 60_000)} minutes — treat the build as unable to start`,
@@ -421,6 +547,13 @@ class AdvancePass {
 	private haltReason: string | null;
 	private workers = new Map<string, Worker>();
 	private readonly now = new Date();
+	/**
+	 * Whether a member that settles `failed` goes back in the dispatch pool — the one
+	 * thing the rollout's scope decides (issue #1024). Taken off the row rather than
+	 * passed in, so every caller of an advance answers it the same way and a rollout
+	 * cannot be advanced under a scope it was not started with.
+	 */
+	private readonly releasesFailedMembers: boolean;
 
 	constructor(
 		private readonly rollout: WorkerUpdateRollout,
@@ -430,6 +563,7 @@ class AdvancePass {
 		this.members = members.map((member) => ({ ...member }));
 		this.status = rollout.status;
 		this.haltReason = rollout.haltReason;
+		this.releasesFailedMembers = rolloutReleasesFailedMembers(rollout.scope);
 	}
 
 	async run(): Promise<void> {
@@ -454,7 +588,13 @@ class AdvancePass {
 			if (member.state !== 'signalled') continue;
 			const worker = this.workers.get(member.workerId);
 			if (!worker) continue;
-			const verdict = decideSettlement(member, worker, this.rollout.target, this.now);
+			const verdict = decideSettlement(
+				member,
+				worker,
+				this.rollout.target,
+				this.now,
+				this.releasesFailedMembers,
+			);
 			if (verdict) await this.apply(member, verdict);
 		}
 	}
@@ -466,7 +606,14 @@ class AdvancePass {
 			const worker = this.workers.get(member.workerId);
 			if (!worker) continue;
 			const session = await getLiveSessionForWorker(member.workerId);
-			const verdict = decideComeBack(member, worker, session, this.rollout.target, this.now);
+			const verdict = decideComeBack(
+				member,
+				worker,
+				session,
+				this.rollout.target,
+				this.now,
+				this.releasesFailedMembers,
+			);
 			if (verdict) await this.apply(member, verdict);
 		}
 	}
@@ -723,6 +870,7 @@ class AdvancePass {
 				entry.update?.status ?? null,
 				entry.update?.message ?? null,
 				this.now,
+				this.releasesFailedMembers,
 			);
 			await this.apply(member, {
 				...verdict,
@@ -773,12 +921,21 @@ class AdvancePass {
 	 * out of it. A machine the operator had drained for their own reasons keeps their
 	 * drain: the rollout borrowed it, it did not create it.
 	 *
-	 * Reached for every member that settles **well** — `done` or `skipped` — and
-	 * deliberately never for one that settles `failed`: a machine that could not take
-	 * the build, or took it and did not come back, is exactly the machine an operator
-	 * needs to look at before it is given work again, so it stays out of the pool until
-	 * they run `swarm workers undrain` themselves. That is verbatim what issue #933's
-	 * single-machine form already leaves them to do.
+	 * Reached for every member that settles **well** — `done` or `skipped` — and, in an
+	 * **owner-scoped** rollout, deliberately never for one that settles `failed`: a
+	 * machine that could not take the build, or took it and did not come back, is
+	 * exactly the machine an operator needs to look at before it is given work again,
+	 * so it stays out of the pool until they run `swarm workers undrain` themselves.
+	 * That is verbatim what issue #933's single-machine form already leaves them to do.
+	 *
+	 * **An installation-scoped rollout returns a `failed` member too** (issue #1024,
+	 * {@link rolloutReleasesFailedMembers}), which is the one behaviour the two scopes
+	 * differ on. The machine it drained belongs to somebody who never asked for the
+	 * rollout, so leaving it drained would be a standing administrative drain over
+	 * another owner's machine — what issue #919 refused by keeping `setDraining`
+	 * owner-only. The verdicts say so rather than this method: all three `failed`
+	 * verdicts carry `returnToPool: releasesFailedMembers`, so what is left here is
+	 * unchanged.
 	 *
 	 * **Not while another rollout holds the machine** (issue #1023). A halted rollout
 	 * goes on settling the members it had committed to, so it is routinely still
@@ -817,15 +974,21 @@ async function resolveWorkers(members: WorkerUpdateRolloutMember[]): Promise<Map
 }
 
 /**
- * Label a member with its machine's display name. A member whose `workers` row has
- * gone is named by its id rather than by an invented label — the row is on its way
- * out through the FK cascade, and calling it anything else would read as a machine.
+ * Label a member with its machine's display name and its owner's id. A member whose
+ * `workers` row has gone is named by its id rather than by an invented label — the
+ * row is on its way out through the FK cascade, and calling it anything else would
+ * read as a machine — and its owner is reported `null` for the same reason.
  */
 function withLabel(
 	member: WorkerUpdateRolloutMember,
 	workers: Map<string, Worker>,
 ): RolloutMemberView {
-	return { ...member, displayName: workers.get(member.workerId)?.displayName ?? member.workerId };
+	const worker = workers.get(member.workerId);
+	return {
+		...member,
+		displayName: worker?.displayName ?? member.workerId,
+		ownerUserId: worker?.ownerUserId ?? null,
+	};
 }
 
 function hasUniqueViolationCode(error: unknown): boolean {

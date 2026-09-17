@@ -505,6 +505,13 @@
       "when": 1789678036618,
       "tag": "0071_rollout_member_worker_index",
       "breakpoints": true
+    },
+    {
+      "idx": 72,
+      "version": "7",
+      "when": 1789679547759,
+      "tag": "0072_worker_update_rollout_scope",
+      "breakpoints": true
     }
   ]
 }

@@ -26,20 +26,30 @@ import { workers } from './workers.js';
  *
  * `requested_by_user_id` is a `users.id` (`uuid`); the FK is `ON DELETE CASCADE`,
  * so a rollout vanishes with the operator who asked for it and never dangles —
- * their machines cascade away with them too, so a surviving rollout would name
- * nothing.
+ * their machines cascade away with them too, so a surviving *owner-scoped* rollout
+ * would name nothing. `scope` is the other half of that pair since issue #1024:
+ * who asked and what they asked it of are different facts once an `instanceAdmin`
+ * can start a rollout over machines they do not own.
  *
- * **At most one `in_progress` rollout per owner**, enforced by the partial unique
- * index below rather than by a read-then-insert in the service. Two overlapping
- * rollouts over the same machines would drain and undrain each other's members,
- * and the check has to be one statement with the insert or a second `swarm workers
- * update --all` landing at the same instant slips between them. `halted` and
- * `completed` rows are exempt and accumulate as history, which is what makes
- * "start a new rollout" the documented way past a halted one.
+ * **Two uniqueness rules, one partial unique index each.** At most one
+ * `in_progress` rollout **per owner** for `scope = 'owner'`, and at most one
+ * `in_progress` **installation-wide** rollout for the whole installation. Both are
+ * decided by an index rather than by a read-then-insert in the service: two
+ * overlapping rollouts over the same machines would drain and undrain each other's
+ * members, and the check has to be one statement with the insert or a second
+ * `swarm workers update --all` landing at the same instant slips between them. The
+ * owner index is narrowed to `scope = 'owner'` so an administrator's
+ * installation-wide rollout does not consume their own per-owner slot. `halted`
+ * and `completed` rows are exempt from both and accumulate as history, which is
+ * what makes "start a new rollout" the documented way past a halted one.
  *
- * `status` and both member vocabularies are stored as free `text` with the Zod
- * enums as the source of truth, the treatment `worker_project_enrollments.status`
- * already gets.
+ * What no index expresses is that an installation-wide rollout overlaps *every*
+ * owner-scoped one, so the two must not run at once either. That is a read in the
+ * policy (`src/api/worker-update-rollout.ts`), not a key.
+ *
+ * `status`, `scope` and both member vocabularies are stored as free `text` with
+ * the Zod enums as the source of truth, the treatment
+ * `worker_project_enrollments.status` already gets.
  */
 export const workerUpdateRollouts = pgTable(
 	'worker_update_rollouts',
@@ -48,6 +58,13 @@ export const workerUpdateRollouts = pgTable(
 		requestedByUserId: uuid('requested_by_user_id')
 			.notNull()
 			.references(() => users.id, { onDelete: 'cascade' }),
+		/**
+		 * Which machines the rollout is over — one of `WorkerUpdateRolloutScopeSchema`
+		 * (`src/identity/worker-update-rollout.ts`), `owner` | `installation`. Defaults
+		 * to `'owner'`, which is verbatim what every row written before issue #1024 is,
+		 * so nothing is backfilled.
+		 */
+		scope: text('scope').notNull().default('owner'),
 		/** The build every member is being moved to — one of `WorkerUpdateTargetSchema` (`src/lib/build-identity.ts`). */
 		target: text('target').notNull(),
 		/**
@@ -73,10 +90,19 @@ export const workerUpdateRollouts = pgTable(
 	},
 	(table) => [
 		// One live rollout per operator — see the table doc-comment. Partial, so the
-		// halted/completed history is unconstrained.
+		// halted/completed history is unconstrained, and narrowed to owner scope since
+		// issue #1024 so an administrator's installation-wide rollout does not consume
+		// the per-owner slot their own fleet rollout needs.
 		uniqueIndex('idx_worker_update_rollouts_owner_live')
 			.on(table.requestedByUserId)
-			.where(sql`${table.status} = 'in_progress'`),
+			.where(sql`${table.status} = 'in_progress' AND ${table.scope} = 'owner'`),
+		// …and one live installation-wide rollout for the whole installation (issue
+		// #1024). Keyed on `scope` alone, which takes exactly one value under this
+		// predicate, so the index holds at most one row — the installation-wide twin of
+		// the per-owner rule above, and decided the same way rather than by a read.
+		uniqueIndex('idx_worker_update_rollouts_installation_live')
+			.on(table.scope)
+			.where(sql`${table.status} = 'in_progress' AND ${table.scope} = 'installation'`),
 		// The owner-scoped read (`swarm workers update --status`), newest first.
 		index('idx_worker_update_rollouts_owner').on(table.requestedByUserId, table.createdAt),
 	],

@@ -71,6 +71,7 @@ import { authedProcedure, router } from '../trpc.js';
 import { resolveStrictlyOwnedWorker, workerNotFound } from '../worker-access.js';
 import { fanOutWorkerUpdate, publishWorkerUpdateWakeUp } from '../worker-update-fanout.js';
 import {
+	getInstallationRollout,
 	getRolloutForOwner,
 	type RolloutMemberView,
 	type RolloutView,
@@ -119,7 +120,19 @@ import { workerScmCredentialsRouter } from './workerScmCredentials.js';
  *   the owner's, and the machine can only be moved to a build already on the branch
  *   its install root tracks, so nothing #800 reserved to them moves.
  *   The procedure's own comment carries the full reasoning and
- *   `docs/onboarding-worker.md` states it for operators. **A second
+ *   `docs/onboarding-worker.md` states it for operators.
+ *   **A *staged* installation-wide pair joins it** (`startFleetUpdateForInstallation`
+ *   / `fleetUpdateStatusForInstallation`, issue #1024): the same rollout state
+ *   machine `startFleetUpdate` drives, over `listAllWorkers()`, with each member
+ *   labelled with its machine's owner — `instanceAdmin`-only on the same #647 terms.
+ *   That one does more than ask: it *drains* machines an administrator does not own.
+ *   The sentence above still holds, with one addition — an administrator may drain
+ *   another owner's machine **only inside a rollout that puts it back**, which is
+ *   exactly what this one does: once it is terminal and its members have settled, no
+ *   machine it drained is left out of the pool, a member that settled `failed`
+ *   included, which is the one behaviour it differs from the owner-scoped rollout on.
+ *   `workers.setDraining` itself is untouched and stays strictly owner-only, so the
+ *   standing administrative drain issue #919 refused is still refused. **A second
  *   installation-wide read joins them** (`listSweeps`, issue #956): every machine's
  *   last recorded abandoned-worktree sweep and what it removed — the readout behind
  *   `swarm workers sweeps`, and the only way to see a sweep without replacing it,
@@ -438,25 +451,69 @@ async function resolveWorkerOwners(): Promise<Map<string, RosterOwner>> {
 }
 
 /**
+ * The owner map for a surface whose every machine is the caller's own — the
+ * owner-scoped rollout pair (issue #1024). One entry, no read: a rollout started from
+ * `listWorkersForOwner(ctx.user.id)` names nobody else, so this is the whole truth for
+ * it, and {@link resolveWorkerOwners}' `listUsers()` is justified for an
+ * `instanceAdmin` caller and not for this one.
+ */
+function ownerLabelOf(user: SwarmUser): Map<string, RosterOwner> {
+	return new Map([[user.id, rosterOwnerOf(user)]]);
+}
+
+/**
+ * The gate on both installation-wide rollout procedures (issue #1024).
+ *
+ * A bare `isInstanceAdmin` check with its own message rather than
+ * `assertInstanceAdmin`'s shared wording, following `requestUpdateForInstallation` —
+ * the installation-wide *mutation* this one is the staged twin of — and used for the
+ * mutation and the read alike, so one caller is never refused two different ways on
+ * the same screen. `remedy` is the owner-scoped command that does the equivalent over
+ * the caller's own machines, which is what is actually left open to them.
+ *
+ * `FORBIDDEN` rather than the owner-scoped surfaces' `NOT_FOUND`, on #647's reasoning:
+ * the caller named no worker id, so there is no existence to hide, and nothing about
+ * the installation leaks through the refusal.
+ */
+function assertInstallationRolloutAdmin(user: SwarmUser, remedy: string): void {
+	if (isInstanceAdmin(user)) return;
+	throw new TRPCError({
+		code: 'FORBIDDEN',
+		message:
+			`Staging a fleet update across the installation is available to instance ` +
+			`administrators only. Run \`${remedy}\` for the machines you own.`,
+	});
+}
+
+/**
  * The wire form of a staged fleet update (issue #940) — the same explicit
  * ISO-timestamp treatment {@link serializeWorkerUpdate} applies, over the rollout's
  * two instants and each member's two. `null` when the caller has never started one,
  * which is an honest empty answer rather than an error.
+ *
+ * `owners` labels each member's machine with the person who owns it (issue #1024).
+ * One wire shape serves both scopes: the installation procedures pass
+ * {@link resolveWorkerOwners}' map, and the owner-scoped pair passes a map holding
+ * the caller alone — every member of an owner-scoped rollout is their own machine, so
+ * that is the whole truth for it and costs no `listUsers()` read a non-administrator
+ * has no business making. An owner that does not resolve is reported `null`, exactly
+ * as the roster and both fan-out reports report one.
  */
-function serializeRollout(view: RolloutView | null) {
+function serializeRollout(view: RolloutView | null, owners: Map<string, RosterOwner>) {
 	if (!view) return null;
 	return {
 		...view.rollout,
 		createdAt: view.rollout.createdAt.toISOString(),
 		updatedAt: view.rollout.updatedAt.toISOString(),
-		members: view.members.map(serializeRolloutMember),
+		members: view.members.map((member) => serializeRolloutMember(member, owners)),
 	};
 }
 
-/** One member's line on the wire — the row plus its machine's label, instants as ISO strings. */
-function serializeRolloutMember(member: RolloutMemberView) {
+/** One member's line on the wire — the row plus its machine's label and owner, instants as ISO strings. */
+function serializeRolloutMember(member: RolloutMemberView, owners: Map<string, RosterOwner>) {
 	return {
 		...member,
+		owner: member.ownerUserId === null ? null : (owners.get(member.ownerUserId) ?? null),
 		signalledAt: member.signalledAt?.toISOString() ?? null,
 		settledAt: member.settledAt?.toISOString() ?? null,
 	};
@@ -1340,6 +1397,7 @@ export const workersRouter = router({
 		.mutation(async ({ ctx, input }) => {
 			const result = await startRollout({
 				ownerUserId: ctx.user.id,
+				scope: 'owner',
 				target: input.target,
 				waveSize: input.waveSize,
 			});
@@ -1356,10 +1414,24 @@ export const workersRouter = router({
 						`halt before another can start.`,
 				});
 			}
+			// The cross-scope refusal (issue #1024): an installation-wide rollout names
+			// every machine, this one's included, so the two would drain and undrain each
+			// other's members. The remedy is somebody else's — an administrator's — so it
+			// names the read rather than an action this caller could take.
+			if (result.outcome === 'blocked-by-other-scope') {
+				throw new TRPCError({
+					code: 'CONFLICT',
+					message:
+						`An installation-wide fleet update to '${result.view.rollout.target}' is in ` +
+						`progress and already names your machines, so a second rollout over them cannot ` +
+						`start. An instance administrator can see where it stands with ` +
+						`\`workers.fleetUpdateStatusForInstallation\`; it has to finish or halt first.`,
+				});
+			}
 			return {
 				action: result.outcome,
 				target: input.target,
-				rollout: serializeRollout(result.view),
+				rollout: serializeRollout(result.view, ownerLabelOf(ctx.user)),
 			};
 		}),
 
@@ -1373,7 +1445,114 @@ export const workersRouter = router({
 	// one, because the state a halted rollout left behind is the whole point of
 	// recording it. `null` when they have never started one.
 	fleetUpdateStatus: authedProcedure.query(async ({ ctx }) => {
-		return { rollout: serializeRollout(await getRolloutForOwner(ctx.user.id)) };
+		const view = await getRolloutForOwner(ctx.user.id);
+		return { rollout: serializeRollout(view, ownerLabelOf(ctx.user)) };
+	}),
+
+	// The same staged rollout over **every machine on the installation** (issue #1024)
+	// — the state machine `startFleetUpdate` drives, with `listAllWorkers()` for its
+	// membership instead of `listWorkersForOwner()`. It is the staged twin of
+	// `requestUpdateForInstallation` above: that one asks, once, and touches nothing;
+	// this one drains, signals, verifies and returns machines to the pool a bounded
+	// wave at a time, and halts on a bad build.
+	//
+	// **An `instanceAdmin`'s, on #647's terms**, and refused outright rather than
+	// narrowed for the reason `requestUpdateForInstallation` records: an
+	// installation-wide action that quietly became an owner-scoped one would be read as
+	// the whole installation. Both new procedures are gated by the same
+	// {@link assertInstallationRolloutAdmin}, so the same caller is refused the same
+	// way on both halves of one screen.
+	//
+	// **This is the one place an administrator may drain somebody else's machine**, and
+	// `workers.setDraining` is deliberately untouched — still strictly owner-only, no
+	// override. What makes the drain acceptable here is that it is bounded by a rollout
+	// that gives the machine back: once this rollout is terminal and its members have
+	// settled, no machine it drained is left out of the pool, a member that settled
+	// `failed` included (`rolloutReleasesFailedMembers`). That is the whole difference
+	// from the owner-scoped rollout, and without it this would be the standing
+	// administrative drain issue #919 refused.
+	//
+	// `CONFLICT` twice over, each naming the status procedure: for a different target
+	// while one is in progress, and for the cross-scope refusal — an installation-wide
+	// rollout overlaps every owner-scoped one, so neither may start while the other is
+	// moving.
+	startFleetUpdateForInstallation: authedProcedure
+		.input(
+			z.object({
+				target: WorkerUpdateTargetSchema,
+				// Omit for the default of one machine at a time, and ignored when this call
+				// advances a rollout already in progress — exactly as on `startFleetUpdate`.
+				waveSize: RolloutWaveSizeSchema.optional(),
+			}),
+		)
+		.mutation(async ({ ctx, input }) => {
+			assertInstallationRolloutAdmin(ctx.user, `swarm workers update --all ${input.target}`);
+			const result = await startRollout({
+				ownerUserId: ctx.user.id,
+				scope: 'installation',
+				target: input.target,
+				waveSize: input.waveSize,
+			});
+			if (result.outcome === 'no-machines') {
+				return { action: 'no-machines' as const, target: input.target, rollout: null };
+			}
+			if (result.outcome === 'conflict') {
+				throw new TRPCError({
+					code: 'CONFLICT',
+					message:
+						`An installation-wide fleet update to '${result.view.rollout.target}' is already ` +
+						`in progress, so it cannot be re-targeted at '${input.target}' mid-move. Read ` +
+						`\`workers.fleetUpdateStatusForInstallation\` to see where it stands; it has to ` +
+						`finish or halt before another can start.`,
+				});
+			}
+			if (result.outcome === 'blocked-by-other-scope') {
+				throw new TRPCError({
+					code: 'CONFLICT',
+					message:
+						`A fleet update to '${result.view.rollout.target}' is already in progress over ` +
+						`one owner's machines, and an installation-wide rollout names those same ` +
+						`machines, so the two cannot run at once. Read ` +
+						`\`workers.fleetUpdateStatusForInstallation\` once it has finished or halted, ` +
+						`or ask that owner to let theirs finish.`,
+				});
+			}
+			const owners = await resolveWorkerOwners();
+			const rollout = serializeRollout(result.view, owners);
+			// The audit line for the action as a whole, mirroring
+			// `installation-wide worker update requested`. The durable per-machine record is
+			// on the member rows; this is what an operator greps for the fleet action.
+			logger.info('installation-wide fleet update started', {
+				action: result.outcome,
+				requestedBy: ctx.user.identifier,
+				requestedByUserId: ctx.user.id,
+				target: input.target,
+				rolloutId: result.view.rollout.id,
+				status: result.view.rollout.status,
+				waveSize: result.view.rollout.waveSize,
+				workers: result.view.members.map((member) => ({
+					workerId: member.workerId,
+					owner: (member.ownerUserId && owners.get(member.ownerUserId)?.identifier) ?? null,
+					state: member.state,
+				})),
+			});
+			return { action: result.outcome, target: input.target, rollout };
+		}),
+
+	// Where the installation's most recent installation-wide rollout stands (issue
+	// #1024) — the `instanceAdmin` twin of `fleetUpdateStatus`, with each member
+	// labelled with its machine's owner, which is the only thing an administrator can
+	// do about a machine the rollout could not move. Read-only: it never drains,
+	// signals or advances anything.
+	//
+	// The **latest** whatever its status, not only a live one, for `fleetUpdateStatus`'
+	// own reason: the state a halted rollout left behind is the whole point of
+	// recording it. `null` when none has ever run.
+	fleetUpdateStatusForInstallation: authedProcedure.query(async ({ ctx }) => {
+		assertInstallationRolloutAdmin(ctx.user, 'swarm workers update --status');
+		const view = await getInstallationRollout();
+		if (!view) return { rollout: null };
+		return { rollout: serializeRollout(view, await resolveWorkerOwners()) };
 	}),
 
 	// Offer one of the caller's workers to a project. The caller must own the

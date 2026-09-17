@@ -43,6 +43,44 @@ export const WorkerUpdateRolloutStatusSchema = z.enum(WORKER_UPDATE_ROLLOUT_STAT
 export type WorkerUpdateRolloutStatus = z.infer<typeof WorkerUpdateRolloutStatusSchema>;
 
 /**
+ * **Which machines** a rollout is over — the set it was asked of, which is a
+ * different fact from who asked for it (issue #1024).
+ *
+ * - `owner` — every machine one operator owns (`listWorkersForOwner`), which is what
+ *   every rollout was until this scope existed and what `swarm workers update --all`
+ *   still starts.
+ * - `installation` — every registered machine, whatever account owns it
+ *   (`listAllWorkers`), started and read by an `instanceAdmin`.
+ *
+ * Stored as free `text` with this enum as the source of truth, exactly like
+ * {@link WorkerUpdateRolloutStatusSchema} above. Both scopes run the *same* state
+ * machine; the one rule that reads this is {@link rolloutReleasesFailedMembers}.
+ */
+export const WORKER_UPDATE_ROLLOUT_SCOPES = ['owner', 'installation'] as const;
+export const WorkerUpdateRolloutScopeSchema = z.enum(WORKER_UPDATE_ROLLOUT_SCOPES);
+export type WorkerUpdateRolloutScope = z.infer<typeof WorkerUpdateRolloutScopeSchema>;
+
+/**
+ * Whether a rollout of this scope puts a member that settled **`failed`** back in the
+ * dispatch pool. `true` for `installation`, `false` for `owner` — the one behavioural
+ * difference between the two scopes, named once here rather than branched at the
+ * three verdicts that read it.
+ *
+ * An owner-scoped rollout leaves *your own* failed machine drained for you to look at
+ * (issue #940): it is the machine that could not take the build, you asked for the
+ * move, and the machine is yours to inspect before it is given work again. An
+ * installation-scoped rollout drained a machine belonging to **somebody who never
+ * asked**, so leaving it drained would hand an administrator a standing drain over
+ * another owner's machine — exactly what issue #919 refused when it kept
+ * `workers.setDraining` strictly owner-only. An administrator may take another
+ * owner's machine out of the pool only inside a rollout that puts it back, so this
+ * rollout puts every machine it drained back, a failure included.
+ */
+export function rolloutReleasesFailedMembers(scope: WorkerUpdateRolloutScope): boolean {
+	return scope === 'installation';
+}
+
+/**
  * Where one machine stands inside a rollout. The first four are *unsettled* — the
  * rollout is waiting on that machine and will not start another wave — and the last
  * three are settled.
@@ -185,9 +223,10 @@ export const RolloutWaveSizeSchema = z.number().int().positive();
  * One machine's place in a rollout — the persisted form of a
  * `worker_update_rollout_members` row.
  *
- * `position` is the order the rollout will reach the machines in, taken from
- * `listWorkersForOwner` at start so it matches the list `swarm workers list`
- * already prints. `requestId` is the per-machine request id phase 1 minted, kept so
+ * `position` is the order the rollout will reach the machines in, taken at start from
+ * `listWorkersForOwner` for an owner-scoped rollout — so it matches the list `swarm
+ * workers list` already prints — and from `listAllWorkers` grouped by owner for an
+ * installation-scoped one. `requestId` is the per-machine request id phase 1 minted, kept so
  * a report can be told from a stale one exactly as the `workers` row tells them
  * apart. `outcome`/`message` are the machine's own words, recorded verbatim.
  *
@@ -227,17 +266,19 @@ export type WorkerUpdateRolloutMember = z.infer<typeof WorkerUpdateRolloutMember
 /**
  * A staged fleet update — the persisted form of a `worker_update_rollouts` row.
  *
- * `requestedByUserId` is both the owner whose machines it names and the scope it is
- * read back under: a rollout is strictly one operator's own fleet, inheriting
- * `requestUpdateForMine`'s owner-only rule rather than restating it (issue #922 owns
- * the administrator-over-someone-else's-machine question). `target` is the build
- * every member is being moved to, `waveSize` how many may be taken out of the pool
- * per advance, and `haltReason` the operator-facing sentence recorded when `status`
+ * `requestedByUserId` is **who asked** — the operator whose name the per-machine
+ * requests are recorded under, and nothing more. It stopped doubling as the set with
+ * issue #1024: `scope` is **what was asked of**, an owner's own fleet or the whole
+ * installation, and the two are different people's questions once an `instanceAdmin`
+ * can start a rollout over machines they do not own. `target` is the build every
+ * member is being moved to, `waveSize` how many may be taken out of the pool per
+ * advance, and `haltReason` the operator-facing sentence recorded when `status`
  * became `halted` — `null` at every other status.
  */
 export const WorkerUpdateRolloutSchema = z.object({
 	id: z.string().uuid(),
 	requestedByUserId: z.string().uuid(),
+	scope: WorkerUpdateRolloutScopeSchema,
 	target: WorkerUpdateTargetSchema,
 	waveSize: RolloutWaveSizeSchema,
 	status: WorkerUpdateRolloutStatusSchema,

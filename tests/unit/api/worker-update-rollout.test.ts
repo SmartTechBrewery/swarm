@@ -17,20 +17,27 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const {
 	advanceUnderRolloutLock,
 	createRollout,
+	findAnyInProgressOwnerRollout,
+	findInProgressInstallationRollout,
 	findInProgressRolloutForOwner,
+	findLatestInstallationRollout,
 	findLatestRolloutForOwner,
 	findRolloutHoldElsewhere,
 	readRollout,
 } = vi.hoisted(() => ({
 	advanceUnderRolloutLock: vi.fn(),
 	createRollout: vi.fn(),
+	findAnyInProgressOwnerRollout: vi.fn(),
+	findInProgressInstallationRollout: vi.fn(),
 	findInProgressRolloutForOwner: vi.fn(),
+	findLatestInstallationRollout: vi.fn(),
 	findLatestRolloutForOwner: vi.fn(),
 	findRolloutHoldElsewhere: vi.fn(),
 	readRollout: vi.fn(),
 }));
-const { getWorkers, listWorkersForOwner, setWorkerDraining } = vi.hoisted(() => ({
+const { getWorkers, listAllWorkers, listWorkersForOwner, setWorkerDraining } = vi.hoisted(() => ({
 	getWorkers: vi.fn(),
+	listAllWorkers: vi.fn(),
 	listWorkersForOwner: vi.fn(),
 	setWorkerDraining: vi.fn(),
 }));
@@ -41,13 +48,17 @@ const { fanOutWorkerUpdate } = vi.hoisted(() => ({ fanOutWorkerUpdate: vi.fn() }
 vi.mock('@/db/repositories/workerUpdateRolloutsRepository.js', () => ({
 	advanceUnderRolloutLock,
 	createRollout,
+	findAnyInProgressOwnerRollout,
+	findInProgressInstallationRollout,
 	findInProgressRolloutForOwner,
+	findLatestInstallationRollout,
 	findLatestRolloutForOwner,
 	findRolloutHoldElsewhere,
 	readRollout,
 }));
 vi.mock('@/identity/worker-service.js', () => ({
 	getWorkers,
+	listAllWorkers,
 	listWorkersForOwner,
 	setWorkerDraining,
 }));
@@ -55,7 +66,12 @@ vi.mock('@/identity/worker-session-service.js', () => ({ getLiveSessionForWorker
 vi.mock('@/identity/worker-enrollment-service.js', () => ({ deriveWorkerRunState }));
 vi.mock('@/api/worker-update-fanout.js', () => ({ fanOutWorkerUpdate }));
 
-import { advanceRollout, getRolloutForOwner, startRollout } from '@/api/worker-update-rollout.js';
+import {
+	advanceRollout,
+	getInstallationRollout,
+	getRolloutForOwner,
+	startRollout,
+} from '@/api/worker-update-rollout.js';
 import { DEFAULT_WORKER_SUPPORTED_PHASES, type Worker } from '@/identity/worker.js';
 import type {
 	WorkerUpdateRollout,
@@ -63,6 +79,8 @@ import type {
 } from '@/identity/worker-update-rollout.js';
 
 const OWNER_ID = '00000000-0000-4000-8000-0000000000aa';
+/** A second operator, for the installation scope — the machines the rollout does not belong to. */
+const OTHER_OWNER_ID = '00000000-0000-4000-8000-0000000000bb';
 /** Who asked for the update on a machine's row (issue #922) — the rollout's own requester. */
 const REQUESTER_ID = OWNER_ID;
 const ROLLOUT_ID = '99999999-9999-4999-8999-999999999999';
@@ -119,6 +137,7 @@ function makeRollout(overrides: Partial<WorkerUpdateRollout> = {}): WorkerUpdate
 	return {
 		id: ROLLOUT_ID,
 		requestedByUserId: OWNER_ID,
+		scope: 'owner',
 		target: 'main',
 		waveSize: 1,
 		status: 'in_progress',
@@ -209,11 +228,15 @@ beforeEach(() => {
 	for (const mock of [
 		advanceUnderRolloutLock,
 		createRollout,
+		findAnyInProgressOwnerRollout,
+		findInProgressInstallationRollout,
 		findInProgressRolloutForOwner,
+		findLatestInstallationRollout,
 		findLatestRolloutForOwner,
 		findRolloutHoldElsewhere,
 		readRollout,
 		getWorkers,
+		listAllWorkers,
 		listWorkersForOwner,
 		setWorkerDraining,
 		getLiveSessionForWorker,
@@ -222,7 +245,10 @@ beforeEach(() => {
 	]) {
 		mock.mockReset();
 	}
+	findAnyInProgressOwnerRollout.mockResolvedValue(undefined);
+	findInProgressInstallationRollout.mockResolvedValue(undefined);
 	findInProgressRolloutForOwner.mockResolvedValue(undefined);
+	findLatestInstallationRollout.mockResolvedValue(undefined);
 	findLatestRolloutForOwner.mockResolvedValue(undefined);
 	// No other rollout holds any of these machines unless a test says one does.
 	findRolloutHoldElsewhere.mockResolvedValue(undefined);
@@ -947,10 +973,16 @@ describe('startRollout', () => {
 		givenWorkers(...workers);
 		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry(WORKER_A, 'requested')]);
 
-		const result = await startRollout({ ownerUserId: OWNER_ID, target: 'main', waveSize: 1 });
+		const result = await startRollout({
+			ownerUserId: OWNER_ID,
+			scope: 'owner',
+			target: 'main',
+			waveSize: 1,
+		});
 
 		expect(createRollout).toHaveBeenCalledExactlyOnceWith({
 			requestedByUserId: OWNER_ID,
+			scope: 'owner',
 			target: 'main',
 			waveSize: 1,
 			workerIds: [WORKER_A, WORKER_B],
@@ -966,7 +998,7 @@ describe('startRollout', () => {
 		givenRollout(makeRollout(), [makeMember(WORKER_A, 0)]);
 		givenWorkers(makeWorker(WORKER_A));
 
-		await startRollout({ ownerUserId: OWNER_ID, target: 'main' });
+		await startRollout({ ownerUserId: OWNER_ID, scope: 'owner', target: 'main' });
 
 		expect(createRollout).toHaveBeenCalledWith(expect.objectContaining({ waveSize: 1 }));
 	});
@@ -978,7 +1010,7 @@ describe('startRollout', () => {
 		givenRollout(makeRollout(), [makeMember(WORKER_A, 0)]);
 		givenWorkers(makeWorker(WORKER_A));
 
-		const result = await startRollout({ ownerUserId: OWNER_ID, target: 'main' });
+		const result = await startRollout({ ownerUserId: OWNER_ID, scope: 'owner', target: 'main' });
 
 		expect(result.outcome).toBe('advanced');
 		expect(createRollout).not.toHaveBeenCalled();
@@ -990,7 +1022,11 @@ describe('startRollout', () => {
 		findInProgressRolloutForOwner.mockResolvedValue(makeRollout({ target: 'main' }));
 		readRollout.mockResolvedValue({ rollout: makeRollout({ target: 'main' }), members: [] });
 
-		const result = await startRollout({ ownerUserId: OWNER_ID, target: 'fix/hotfix' });
+		const result = await startRollout({
+			ownerUserId: OWNER_ID,
+			scope: 'owner',
+			target: 'fix/hotfix',
+		});
 
 		expect(result.outcome).toBe('conflict');
 		expect(createRollout).not.toHaveBeenCalled();
@@ -999,7 +1035,7 @@ describe('startRollout', () => {
 	it('records nothing at all for an operator who owns no machines', async () => {
 		listWorkersForOwner.mockResolvedValue([]);
 
-		const result = await startRollout({ ownerUserId: OWNER_ID, target: 'main' });
+		const result = await startRollout({ ownerUserId: OWNER_ID, scope: 'owner', target: 'main' });
 
 		expect(result.outcome).toBe('no-machines');
 		expect(createRollout).not.toHaveBeenCalled();
@@ -1014,7 +1050,7 @@ describe('startRollout', () => {
 		givenRollout(makeRollout(), [makeMember(WORKER_A, 0)]);
 		givenWorkers(makeWorker(WORKER_A));
 
-		const result = await startRollout({ ownerUserId: OWNER_ID, target: 'main' });
+		const result = await startRollout({ ownerUserId: OWNER_ID, scope: 'owner', target: 'main' });
 
 		expect(result.outcome).toBe('advanced');
 	});
@@ -1040,5 +1076,310 @@ describe('getRolloutForOwner', () => {
 
 	it('answers null for an operator who has never started one', async () => {
 		expect(await getRolloutForOwner(OWNER_ID)).toBeNull();
+	});
+});
+
+/**
+ * The installation-scoped rollout (issue #1024) — the same state machine over
+ * `listAllWorkers()`. What this suite owns is the three things the scope actually
+ * decides: which machines are named, whether a `failed` member goes back in the
+ * dispatch pool, and that neither scope may start while the other is moving.
+ * Everything else is the suites above, unchanged and deliberately not re-tested.
+ */
+describe('startRollout — installation scope', () => {
+	// The membership difference, and the only one: every registered machine, whoever
+	// owns it, in one contiguous block per owner.
+	it('names every machine on the installation, grouped by owner', async () => {
+		const workers = [
+			makeWorker(WORKER_A, { ownerUserId: OTHER_OWNER_ID }),
+			makeWorker(WORKER_B, { ownerUserId: OWNER_ID }),
+			makeWorker(WORKER_C, { ownerUserId: OTHER_OWNER_ID }),
+		];
+		listAllWorkers.mockResolvedValue(workers);
+		createRollout.mockResolvedValue({
+			rollout: makeRollout({ scope: 'installation' }),
+			members: [],
+		});
+		givenRollout(makeRollout({ scope: 'installation' }), [makeMember(WORKER_B, 0)]);
+		givenWorkers(...workers);
+
+		const result = await startRollout({
+			ownerUserId: OWNER_ID,
+			scope: 'installation',
+			target: 'main',
+		});
+
+		expect(listWorkersForOwner).not.toHaveBeenCalled();
+		expect(createRollout).toHaveBeenCalledExactlyOnceWith({
+			// Who asked, which is no longer the same fact as whose machines these are.
+			requestedByUserId: OWNER_ID,
+			scope: 'installation',
+			target: 'main',
+			waveSize: 1,
+			// One block per owner; `listAllWorkers`' own order holds inside each block.
+			workerIds: [WORKER_B, WORKER_A, WORKER_C],
+		});
+		expect(result.outcome).toBe('started');
+	});
+
+	it('answers an installation with no machines honestly, recording nothing', async () => {
+		listAllWorkers.mockResolvedValue([]);
+
+		const result = await startRollout({
+			ownerUserId: OWNER_ID,
+			scope: 'installation',
+			target: 'main',
+		});
+
+		expect(result.outcome).toBe('no-machines');
+		expect(createRollout).not.toHaveBeenCalled();
+	});
+
+	// Re-asking for the build it is already moving to advances it, exactly as the
+	// owner-scoped one does — and it looks the live installation rollout up by scope,
+	// never through whoever happens to be calling.
+	it('advances the installation rollout already moving to this target', async () => {
+		findInProgressInstallationRollout.mockResolvedValue(makeRollout({ scope: 'installation' }));
+		givenRollout(makeRollout({ scope: 'installation' }), [makeMember(WORKER_A, 0)]);
+		givenWorkers(makeWorker(WORKER_A));
+
+		const result = await startRollout({
+			ownerUserId: OTHER_OWNER_ID,
+			scope: 'installation',
+			target: 'main',
+		});
+
+		expect(result.outcome).toBe('advanced');
+		expect(findInProgressRolloutForOwner).not.toHaveBeenCalled();
+		expect(createRollout).not.toHaveBeenCalled();
+	});
+
+	it('refuses a different target while the installation rollout is in progress', async () => {
+		findInProgressInstallationRollout.mockResolvedValue(
+			makeRollout({ scope: 'installation', target: 'main' }),
+		);
+		readRollout.mockResolvedValue({
+			rollout: makeRollout({ scope: 'installation', target: 'main' }),
+			members: [],
+		});
+
+		const result = await startRollout({
+			ownerUserId: OWNER_ID,
+			scope: 'installation',
+			target: 'fix/hotfix',
+		});
+
+		expect(result.outcome).toBe('conflict');
+		expect(createRollout).not.toHaveBeenCalled();
+	});
+});
+
+/**
+ * The cross-scope refusal (issue #1024). An installation-wide rollout names every
+ * machine, so it overlaps *every* owner-scoped one, and two rollouts holding the same
+ * machine would drain and undrain each other's members. No single key expresses
+ * "no rollout of the other scope exists", so this is a read rather than an index.
+ */
+describe('startRollout — one scope at a time', () => {
+	it('refuses an installation rollout while any owner’s is in progress', async () => {
+		const blocking = makeRollout({ requestedByUserId: OTHER_OWNER_ID, target: 'v3' });
+		findAnyInProgressOwnerRollout.mockResolvedValue(blocking);
+		readRollout.mockResolvedValue({ rollout: blocking, members: [makeMember(WORKER_A, 0)] });
+		givenWorkers(makeWorker(WORKER_A));
+
+		const result = await startRollout({
+			ownerUserId: OWNER_ID,
+			scope: 'installation',
+			target: 'main',
+		});
+
+		expect(result.outcome).toBe('blocked-by-other-scope');
+		// The rollout that is in the way, so the caller can say where to go and look.
+		expect(result.outcome === 'blocked-by-other-scope' && result.view.rollout.target).toBe('v3');
+		expect(listAllWorkers).not.toHaveBeenCalled();
+		expect(createRollout).not.toHaveBeenCalled();
+	});
+
+	it('refuses an owner rollout while the installation one is in progress', async () => {
+		const blocking = makeRollout({ scope: 'installation', target: 'v3' });
+		findInProgressInstallationRollout.mockResolvedValue(blocking);
+		readRollout.mockResolvedValue({ rollout: blocking, members: [makeMember(WORKER_A, 0)] });
+		givenWorkers(makeWorker(WORKER_A));
+
+		const result = await startRollout({ ownerUserId: OWNER_ID, scope: 'owner', target: 'main' });
+
+		expect(result.outcome).toBe('blocked-by-other-scope');
+		expect(listWorkersForOwner).not.toHaveBeenCalled();
+		expect(createRollout).not.toHaveBeenCalled();
+	});
+
+	// A rollout that finished between the two reads must not refuse anything: the
+	// refusal is about a rollout that is moving, and that one no longer is.
+	it('carries on when the blocking rollout has gone between the two reads', async () => {
+		findInProgressInstallationRollout.mockResolvedValue(makeRollout({ scope: 'installation' }));
+		readRollout.mockResolvedValue(undefined);
+		listWorkersForOwner.mockResolvedValue([makeWorker(WORKER_A)]);
+		createRollout.mockResolvedValue({ rollout: makeRollout(), members: [] });
+		givenRollout(makeRollout(), [makeMember(WORKER_A, 0)]);
+		givenWorkers(makeWorker(WORKER_A));
+
+		const result = await startRollout({ ownerUserId: OWNER_ID, scope: 'owner', target: 'main' });
+
+		expect(result.outcome).toBe('started');
+	});
+
+	// The refusal is only ever about a rollout that is still *moving*. A halted one of
+	// the other scope must not refuse a new rollout, exactly as a halted owner rollout
+	// never refuses its owner's next — which is why the question is asked of the
+	// in-progress read and of nothing wider.
+	it('asks only whether a rollout of the other scope is in progress', async () => {
+		listAllWorkers.mockResolvedValue([makeWorker(WORKER_A)]);
+		createRollout.mockResolvedValue({
+			rollout: makeRollout({ scope: 'installation' }),
+			members: [],
+		});
+		givenRollout(makeRollout({ scope: 'installation' }), [makeMember(WORKER_A, 0)]);
+		givenWorkers(makeWorker(WORKER_A));
+
+		const result = await startRollout({
+			ownerUserId: OWNER_ID,
+			scope: 'installation',
+			target: 'main',
+		});
+
+		expect(findAnyInProgressOwnerRollout).toHaveBeenCalledOnce();
+		expect(result.outcome).toBe('started');
+	});
+});
+
+/**
+ * The one behaviour the two scopes differ on (issue #1024): an installation-scoped
+ * rollout drained a machine belonging to somebody who never asked for it, so it puts
+ * **every** machine it drained back — a member that settled `failed` included.
+ * Leaving one drained would be the standing administrative drain issue #919 refused.
+ */
+describe('advanceRollout — a failed member of an installation rollout', () => {
+	/** A member mid-flight, drained by this rollout, whose machine reported `failed`. */
+	function givenFailingMember(scope: 'owner' | 'installation'): void {
+		givenRollout(makeRollout({ scope }), [
+			makeMember(WORKER_A, 0, { state: 'signalled', requestId: REQUEST_A, drainedByRollout: true }),
+		]);
+		givenWorkers(reported(WORKER_A, 'failed'));
+	}
+
+	it('goes back in the dispatch pool, unlike an owner-scoped rollout’s', async () => {
+		givenFailingMember('installation');
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0].state).toBe('failed');
+		// It still halts — releasing the machine is not forgiving the build.
+		expect(view?.rollout.status).toBe('halted');
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_A, false);
+	});
+
+	it('stays drained for the operator to look at when the rollout is their own', async () => {
+		givenFailingMember('owner');
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0].state).toBe('failed');
+		expect(view?.rollout.status).toBe('halted');
+		expect(setWorkerDraining).not.toHaveBeenCalledWith(WORKER_A, false);
+	});
+
+	// The headline criterion, in the state the stranding is actually reachable in: the
+	// rollout has already halted, and the machine it is still holding belongs to
+	// somebody else. A member that applied and never came back settles `failed` — and
+	// an installation rollout must still hand that machine back.
+	it('leaves nothing drained once a halted installation rollout’s members settle', async () => {
+		givenRollout(
+			makeRollout({ scope: 'installation', status: 'halted', haltReason: 'bad build' }),
+			[
+				makeMember(WORKER_A, 0, {
+					state: 'verifying',
+					outcome: 'applied',
+					drainedByRollout: true,
+					fencingTokenAtSignal: 7,
+					buildCommitAtSignal: 'aaaaaaa',
+					signalledAt: new Date('2026-09-13T11:05:00Z'),
+				}),
+			],
+		);
+		// Reported `applied` at 11:50 and nothing since — well past the come-back window.
+		givenWorkers(reported(WORKER_A, 'applied', { ownerUserId: OTHER_OWNER_ID }));
+		vi.setSystemTime(new Date('2026-09-13T13:00:00Z'));
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0]).toMatchObject({
+			state: 'failed',
+			message: 'applied the update and never came back',
+		});
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_A, false);
+	});
+
+	// The third `failed` verdict, for completeness: a machine that came back on the
+	// build it was asked to leave.
+	it('releases a member that came back on the build it was asked to leave', async () => {
+		givenRollout(makeRollout({ scope: 'installation' }), [
+			makeMember(WORKER_A, 0, {
+				state: 'verifying',
+				outcome: 'applied',
+				drainedByRollout: true,
+				fencingTokenAtSignal: 7,
+				buildCommitAtSignal: 'aaaaaaa',
+				signalledAt: new Date('2026-09-13T11:05:00Z'),
+			}),
+		]);
+		givenWorkers(reported(WORKER_A, 'applied', { build: { commit: 'aaaaaaa', dirty: false } }));
+		getLiveSessionForWorker.mockResolvedValue({ fencingToken: 8 });
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0].state).toBe('failed');
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_A, false);
+	});
+
+	// A machine the *operator* had drained for their own reasons is still never
+	// undrained: the release is of the rollout's own drain, not of anybody's.
+	it('does not undrain a failed machine the rollout never drained itself', async () => {
+		givenRollout(makeRollout({ scope: 'installation' }), [
+			makeMember(WORKER_A, 0, {
+				state: 'signalled',
+				requestId: REQUEST_A,
+				drainedByRollout: false,
+			}),
+		]);
+		givenWorkers(reported(WORKER_A, 'failed'));
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0].state).toBe('failed');
+		expect(setWorkerDraining).not.toHaveBeenCalledWith(WORKER_A, false);
+	});
+});
+
+describe('getInstallationRollout', () => {
+	it('answers the latest installation rollout, labelled with each machine’s owner', async () => {
+		findLatestInstallationRollout.mockResolvedValue(makeRollout({ scope: 'installation' }));
+		readRollout.mockResolvedValue({
+			rollout: makeRollout({ scope: 'installation', status: 'halted', haltReason: 'bad build' }),
+			members: [makeMember(WORKER_A, 0, { state: 'failed' }), makeMember(WORKER_B, 1)],
+		});
+		// The second machine's row has gone — the FK cascade is on its way through.
+		givenWorkers(makeWorker(WORKER_A, { ownerUserId: OTHER_OWNER_ID }));
+
+		const view = await getInstallationRollout();
+
+		expect(view?.rollout.haltReason).toBe('bad build');
+		expect(view?.members.map((member) => member.ownerUserId)).toEqual([OTHER_OWNER_ID, null]);
+		// Reading never advances: nothing is drained, signalled or written.
+		expect(advanceUnderRolloutLock).not.toHaveBeenCalled();
+		expect(setWorkerDraining).not.toHaveBeenCalled();
+	});
+
+	it('answers null when no installation-wide rollout has ever run', async () => {
+		expect(await getInstallationRollout()).toBeNull();
 	});
 });

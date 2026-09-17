@@ -96,7 +96,8 @@ const { fanOutWorkerUpdate } = vi.hoisted(() => ({ fanOutWorkerUpdate: vi.fn() }
 // Issue #940 — the staged rollout likewise has its own suite
 // (`tests/unit/api/worker-update-rollout.test.ts`); the router owns the owner
 // scoping, the CONFLICT wording and the serialized wire shape.
-const { getRolloutForOwner, startRollout } = vi.hoisted(() => ({
+const { getInstallationRollout, getRolloutForOwner, startRollout } = vi.hoisted(() => ({
+	getInstallationRollout: vi.fn(),
 	getRolloutForOwner: vi.fn(),
 	startRollout: vi.fn(),
 }));
@@ -161,7 +162,11 @@ vi.mock('@/identity/worker-service.js', () => ({
 }));
 vi.mock('@/queue/worker-sweeps.js', () => ({ publishWorktreeSweepRequest }));
 vi.mock('@/api/worker-update-fanout.js', () => ({ fanOutWorkerUpdate, publishWorkerUpdateWakeUp }));
-vi.mock('@/api/worker-update-rollout.js', () => ({ getRolloutForOwner, startRollout }));
+vi.mock('@/api/worker-update-rollout.js', () => ({
+	getInstallationRollout,
+	getRolloutForOwner,
+	startRollout,
+}));
 vi.mock('@/db/repositories/workersRepository.js', () => ({ removeWorker }));
 vi.mock('@/identity/membership-service.js', () => ({ getMembership, listAccessibleProjectIds }));
 vi.mock('@/db/repositories/usersRepository.js', () => ({
@@ -298,6 +303,7 @@ beforeEach(() => {
 		fanOutWorkerUpdate,
 		startRollout,
 		getRolloutForOwner,
+		getInstallationRollout,
 		publishWorkerUpdateWakeUp,
 		publishWorktreeSweepRequest,
 		removeWorker,
@@ -2546,6 +2552,7 @@ describe('workers.startFleetUpdate / fleetUpdateStatus (staged rollout, issue #9
 			rollout: {
 				id: ROLLOUT_ID,
 				requestedByUserId: OWNER_ID,
+				scope: 'owner',
 				target: 'main',
 				waveSize: 1,
 				status: 'in_progress',
@@ -2558,6 +2565,7 @@ describe('workers.startFleetUpdate / fleetUpdateStatus (staged rollout, issue #9
 				{
 					workerId: WORKER_ID,
 					displayName: 'ada-laptop',
+					ownerUserId: OWNER_ID,
 					position: 0,
 					state: 'done',
 					requestId: null,
@@ -2580,6 +2588,7 @@ describe('workers.startFleetUpdate / fleetUpdateStatus (staged rollout, issue #9
 
 		expect(startRollout).toHaveBeenCalledExactlyOnceWith({
 			ownerUserId: OWNER_ID,
+			scope: 'owner',
 			target: 'main',
 			waveSize: 2,
 		});
@@ -2597,7 +2606,7 @@ describe('workers.startFleetUpdate / fleetUpdateStatus (staged rollout, issue #9
 		await admin.startFleetUpdate({ target: 'main' });
 
 		expect(startRollout).toHaveBeenCalledWith(
-			expect.objectContaining({ ownerUserId: ADMIN_USER.id }),
+			expect.objectContaining({ ownerUserId: ADMIN_USER.id, scope: 'owner' }),
 		);
 	});
 
@@ -2690,10 +2699,250 @@ describe('workers.startFleetUpdate / fleetUpdateStatus (staged rollout, issue #9
 		expect(result.rollout?.haltReason).toContain('npm ci exited 1');
 	});
 
-	it('answers null for an operator who has never started one', async () => {
-		getRolloutForOwner.mockResolvedValue(null);
+	// The cross-scope refusal seen from the owner's side (issue #1024): an
+	// installation-wide rollout already names their machines, so a second rollout over
+	// the same set is refused rather than run alongside it.
+	it('is CONFLICT while an installation-wide rollout is in progress', async () => {
+		startRollout.mockResolvedValue({ outcome: 'blocked-by-other-scope', view: view() });
 
-		await expect(owner.fleetUpdateStatus()).resolves.toEqual({ rollout: null });
+		await expect(owner.startFleetUpdate({ target: 'main' })).rejects.toThrowError(
+			expect.objectContaining({
+				code: 'CONFLICT',
+				message: expect.stringContaining('workers.fleetUpdateStatusForInstallation'),
+			}),
+		);
+	});
+
+	// Owner-scoped members are always the caller's own machines, so labelling them
+	// costs no `listUsers()` read — the caller is the whole truth.
+	it('labels the caller’s own members without reading every user', async () => {
+		startRollout.mockResolvedValue({ outcome: 'started', view: view() });
+
+		const result = await owner.startFleetUpdate({ target: 'main' });
+
+		expect(result.rollout?.members[0]?.owner).toMatchObject({
+			userId: OWNER_ID,
+			identifier: OWNER_USER.identifier,
+		});
+		expect(listUsers).not.toHaveBeenCalled();
+	});
+});
+
+/**
+ * The installation-wide staged rollout (issue #1024) — the `instanceAdmin` twin of
+ * the pair above. What this suite owns is the authorization, the two `CONFLICT`
+ * wordings and the owner labelling; the state machine has its own suite
+ * (`tests/unit/api/worker-update-rollout.test.ts`).
+ */
+describe('workers.startFleetUpdateForInstallation / …ForInstallation status (issue #1024)', () => {
+	const admin = workersRouter.createCaller({ user: ADMIN_USER });
+	const ROLLOUT_ID = '99999999-9999-4999-8999-999999999999';
+	const OTHER_WORKER_ID = '22222222-2222-4222-8222-222222222222';
+	const GONE_WORKER_ID = '33333333-3333-4333-8333-333333333333';
+
+	/** A rollout over two owners' machines, plus a member whose `workers` row has gone. */
+	function view(overrides: Record<string, unknown> = {}) {
+		return {
+			rollout: {
+				id: ROLLOUT_ID,
+				requestedByUserId: ADMIN_USER.id,
+				scope: 'installation',
+				target: 'main',
+				waveSize: 1,
+				status: 'in_progress',
+				haltReason: null,
+				createdAt: new Date('2026-09-13T11:00:00Z'),
+				updatedAt: new Date('2026-09-13T11:20:00Z'),
+				...overrides,
+			},
+			members: [
+				member(WORKER_ID, 'ada-laptop', 0, OWNER_ID),
+				member(OTHER_WORKER_ID, 'root-box', 1, ADMIN_USER.id),
+				member(GONE_WORKER_ID, GONE_WORKER_ID, 2, null),
+			],
+		};
+	}
+
+	function member(
+		workerId: string,
+		displayName: string,
+		position: number,
+		ownerUserId: string | null,
+	) {
+		return {
+			workerId,
+			displayName,
+			ownerUserId,
+			position,
+			state: 'queued',
+			requestId: null,
+			outcome: null,
+			message: null,
+			drainedByRollout: false,
+			fencingTokenAtSignal: null,
+			buildCommitAtSignal: null,
+			signalledAt: null,
+			settledAt: null,
+		};
+	}
+
+	beforeEach(() => {
+		listUsers.mockResolvedValue([OWNER_USER, ADMIN_USER]);
+	});
+
+	it('stages the rollout over every machine on the installation', async () => {
+		startRollout.mockResolvedValue({ outcome: 'started', view: view() });
+
+		const result = await admin.startFleetUpdateForInstallation({ target: 'main', waveSize: 2 });
+
+		expect(startRollout).toHaveBeenCalledExactlyOnceWith({
+			// Who asked — the membership is the scope's, not this id's.
+			ownerUserId: ADMIN_USER.id,
+			scope: 'installation',
+			target: 'main',
+			waveSize: 2,
+		});
+		expect(result.action).toBe('started');
+	});
+
+	// Every member is labelled with the person who owns the machine — the one thing an
+	// administrator can do about a machine the rollout could not move is go and ask them.
+	it('names each member’s owner, and an unresolvable one as null', async () => {
+		startRollout.mockResolvedValue({ outcome: 'started', view: view() });
+
+		const result = await admin.startFleetUpdateForInstallation({ target: 'main' });
+
+		expect(result.rollout?.members.map((m) => m.owner?.identifier ?? null)).toEqual([
+			OWNER_USER.identifier,
+			ADMIN_USER.identifier,
+			null,
+		]);
+	});
+
+	// A machine whose owner row is gone is reported `null` rather than dropped, exactly
+	// as the roster and both fan-out reports report one.
+	it('reports an owner the users read did not carry as null', async () => {
+		listUsers.mockResolvedValue([ADMIN_USER]);
+		startRollout.mockResolvedValue({ outcome: 'started', view: view() });
+
+		const result = await admin.startFleetUpdateForInstallation({ target: 'main' });
+
+		expect(result.rollout?.members[0]?.owner).toBeNull();
+	});
+
+	// Refused outright, never narrowed to the caller's own machines — the reasoning
+	// `requestUpdateForInstallation` records, applied to the staged form.
+	it('refuses a non-administrator with FORBIDDEN and stages nothing', async () => {
+		await expect(owner.startFleetUpdateForInstallation({ target: 'main' })).rejects.toThrowError(
+			expect.objectContaining({ code: 'FORBIDDEN' }),
+		);
+		expect(startRollout).not.toHaveBeenCalled();
+	});
+
+	// The same refusal on the read, worded the same way: one caller is never refused
+	// two different ways on the same screen.
+	it('refuses a non-administrator the status read too', async () => {
+		await expect(owner.fleetUpdateStatusForInstallation()).rejects.toThrowError(
+			expect.objectContaining({
+				code: 'FORBIDDEN',
+				message: expect.stringContaining('instance administrators only'),
+			}),
+		);
+		expect(getInstallationRollout).not.toHaveBeenCalled();
+	});
+
+	it('reports an advance rather than an error when one is already under way', async () => {
+		startRollout.mockResolvedValue({ outcome: 'advanced', view: view() });
+
+		await expect(admin.startFleetUpdateForInstallation({ target: 'main' })).resolves.toMatchObject({
+			action: 'advanced',
+		});
+	});
+
+	it('is CONFLICT for a different target mid-move, naming the status procedure', async () => {
+		startRollout.mockResolvedValue({ outcome: 'conflict', view: view() });
+
+		await expect(
+			admin.startFleetUpdateForInstallation({ target: 'fix/hotfix' }),
+		).rejects.toThrowError(
+			expect.objectContaining({
+				code: 'CONFLICT',
+				message: expect.stringContaining('workers.fleetUpdateStatusForInstallation'),
+			}),
+		);
+	});
+
+	// The other `CONFLICT`: an installation-wide rollout names every machine, so it
+	// overlaps any owner's rollout and the two cannot run at once.
+	it('is CONFLICT while an owner-scoped rollout is in progress', async () => {
+		startRollout.mockResolvedValue({
+			outcome: 'blocked-by-other-scope',
+			view: view({ scope: 'owner', requestedByUserId: OWNER_ID }),
+		});
+
+		await expect(admin.startFleetUpdateForInstallation({ target: 'main' })).rejects.toThrowError(
+			expect.objectContaining({
+				code: 'CONFLICT',
+				message: expect.stringContaining('cannot run at once'),
+			}),
+		);
+	});
+
+	// The grammar is the security boundary — the value ends up handed to `git` on
+	// unattended machines — so it is checked before anything is staged.
+	it.each([
+		['a URL', 'https://example.com/evil.git'],
+		['a shell fragment', 'main; rm -rf /'],
+		['a git option', '--upload-pack=curl'],
+	])('rejects %s as a target with BAD_REQUEST, staging nothing', async (_what, target) => {
+		await expect(admin.startFleetUpdateForInstallation({ target })).rejects.toThrowError(
+			expect.objectContaining({ code: 'BAD_REQUEST' }),
+		);
+		expect(startRollout).not.toHaveBeenCalled();
+	});
+
+	it('answers an installation with no machines honestly, not with an error', async () => {
+		startRollout.mockResolvedValue({ outcome: 'no-machines' });
+
+		await expect(admin.startFleetUpdateForInstallation({ target: 'main' })).resolves.toEqual({
+			action: 'no-machines',
+			target: 'main',
+			rollout: null,
+		});
+	});
+
+	it('reads the latest installation rollout without advancing anything', async () => {
+		getInstallationRollout.mockResolvedValue(
+			view({ status: 'halted', haltReason: "worker 'root-box' reported failed: npm ci exited 1" }),
+		);
+
+		const result = await admin.fleetUpdateStatusForInstallation();
+
+		expect(getInstallationRollout).toHaveBeenCalledOnce();
+		expect(startRollout).not.toHaveBeenCalled();
+		expect(result.rollout).toMatchObject({ status: 'halted' });
+		expect(result.rollout?.members[1]?.owner?.identifier).toBe(ADMIN_USER.identifier);
+	});
+
+	it('answers null when no installation-wide rollout has ever run', async () => {
+		getInstallationRollout.mockResolvedValue(null);
+
+		await expect(admin.fleetUpdateStatusForInstallation()).resolves.toEqual({ rollout: null });
+		// Nothing to label, so the installation's users are never read.
+		expect(listUsers).not.toHaveBeenCalled();
+	});
+
+	// The same explicit ISO treatment every other timestamp on this router gets.
+	it('serialises the rollout’s and every member’s instants as ISO strings', async () => {
+		startRollout.mockResolvedValue({ outcome: 'started', view: view() });
+
+		const result = await admin.startFleetUpdateForInstallation({ target: 'main' });
+
+		expect(result.rollout).toMatchObject({
+			createdAt: '2026-09-13T11:00:00.000Z',
+			updatedAt: '2026-09-13T11:20:00.000Z',
+		});
+		expect(result.rollout?.members[0]).toMatchObject({ signalledAt: null, settledAt: null });
 	});
 });
 

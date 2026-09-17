@@ -807,6 +807,15 @@ with the person who owns it:
   project comes back `no-project`. An administrator
   therefore cannot take the installation's capacity down with this, and cannot move a
   machine whose owner has not made it askable in the first place.
+  - **The one exception is a rollout that returns its own members** (issue #1024).
+    `workers.startFleetUpdateForInstallation` stages this same move across the whole
+    installation and *does* drain machines the administrator does not own — one
+    bounded wave at a time — but every machine it drained goes back in the dispatch
+    pool once the rollout is finished with it, on a halt and including a machine that
+    failed. That is what makes it acceptable: it is a borrowed drain with a deadline,
+    not a standing right. `swarm workers drain` / `workers.setDraining` themselves are
+    unchanged and are still refused to an administrator on somebody else's machine, so
+    there is no way to take a machine out of the pool and leave it there.
 - **The mechanism bounds the reach** — the two guards stated at the top of this
   section. The fetch takes no URL and no refspec, and the target must be an ancestor
   of the branch the install root already tracks, so an administrator cannot point a
@@ -842,8 +851,11 @@ act seen as one fleet action rather than one machine's history.
 
 Note what this command is *not*: it is the one-shot fan-out, not the staged rollout
 `update --all` runs. It drains nothing, undrains nothing and stages nothing, because
-every one of those acts on a machine rather than asking it. Moving a fleet in waves
-stays each owner's own `swarm workers update --all <ref>`.
+every one of those acts on a machine rather than asking it. Moving a fleet in waves is
+each owner's own `swarm workers update --all <ref>` — or, since issue #1024, an
+administrator's `workers.startFleetUpdateForInstallation` over the whole installation,
+which has no CLI command of its own and is read back through
+`workers.fleetUpdateStatusForInstallation`.
 
 ---
 

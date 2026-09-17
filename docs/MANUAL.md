@@ -432,6 +432,33 @@ nothing wider. The unstaged one-shot fan-out issue #921 shipped is still there o
 API (`workers.requestUpdateForMine`), which asks every machine you have *already*
 drained, all at once, and reports a disposition per machine.
 
+**Or the whole installation, staged.** An **installation administrator** can run the
+very same rollout over *every* registered machine, whoever owns it (issue #1024) —
+`workers.startFleetUpdateForInstallation` to start or advance it,
+`workers.fleetUpdateStatusForInstallation` to read it, each line naming the machine's
+owner. It is API-only for now: there is no CLI command and no dashboard button yet
+(`swarm workers request-update` stays the unstaged installation-wide fan-out, and
+`swarm workers update --all` stays your own fleet).
+
+It behaves exactly like the rollout above — one bounded wave at a time, never
+interrupting a machine mid-phase, advancing itself off reports and reconnects, and
+halting on a machine that reports `failed`/`refused`/`declined`, comes back on the
+build it was asked to leave, or applies and never comes back. **One thing differs, and
+it is the point: every machine it drained goes back in the dispatch pool when the
+rollout is finished with it — on a halt, and including the machine that failed.** An
+administrator drained machines belonging to people who never asked for the update, so
+none of them is left out of the pool for somebody else to notice; the machine that
+failed is reported in the table rather than held out of service. Draining itself is
+still not an administrator's to do (`swarm workers drain` is the owner's alone), which
+is why this is the only way an administrator's action can take a machine out of the
+pool at all — inside a rollout that puts it back.
+
+Only one rollout runs on the installation at a time, and the two scopes exclude each
+other: an installation-wide rollout names your machines too, so starting one while
+*any* owner's rollout is under way is refused, and so is starting your own while the
+installation-wide one is. The refusal names the status procedure to read; it has to
+finish or halt first.
+
 **Or every machine on the installation — other people's included.** When the person
 shipping a fix is not the person who owns the machines that have to run it, an
 **installation administrator** asks them all in one command (issue #922):
@@ -452,8 +479,10 @@ the installation — and its confirmation adds the one thing that set has to say
 machine enrolled in other projects as well is moved for all of them, since an update
 moves its SWARM install root rather than one enrollment.
 
-This is the one worker *write* that spans owners, and it is allowed to only because
-it asks and nothing more, and asks for something bounded. The switch that decides
+This command spans owners, and is allowed to only because
+it asks and nothing more, and asks for something bounded. (The staged
+installation-wide rollout above spans owners too and goes further — it drains — which
+is why it is bounded differently: by having to give every machine back.) The switch that decides
 whether a machine is asked at all stays with whoever owns it and needs no cooperation
 from the administrator: the **drain**, still strictly the owner's and never performed
 by this command. So a machine its owner has not drained comes back `in-pool`,

@@ -28,11 +28,17 @@ const { advanceRollout } = vi.hoisted(() => ({
 }));
 vi.mock('@/api/worker-update-rollout.js', () => ({ advanceRollout }));
 
-const { listAdvanceableRollouts, listAdvanceableRolloutsForOwner } = vi.hoisted(() => ({
+const {
+	findAdvanceableInstallationRollout,
+	listAdvanceableRollouts,
+	listAdvanceableRolloutsForOwner,
+} = vi.hoisted(() => ({
+	findAdvanceableInstallationRollout: vi.fn<() => Promise<WorkerUpdateRollout | undefined>>(),
 	listAdvanceableRollouts: vi.fn<() => Promise<WorkerUpdateRollout[]>>(),
 	listAdvanceableRolloutsForOwner: vi.fn<(ownerUserId: string) => Promise<WorkerUpdateRollout[]>>(),
 }));
 vi.mock('@/db/repositories/workerUpdateRolloutsRepository.js', () => ({
+	findAdvanceableInstallationRollout,
 	listAdvanceableRollouts,
 	listAdvanceableRolloutsForOwner,
 }));
@@ -46,6 +52,8 @@ const WORKER_ID = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
 const OWNER_ID = '22222222-2222-4222-8222-222222222222';
 const ROLLOUT_ID = '77777777-7777-4777-8777-777777777777';
 const OTHER_ROLLOUT_ID = '88888888-8888-4888-8888-888888888888';
+/** The administrator an installation-wide rollout is recorded under (issue #1024). */
+const ADMIN_ID = '33333333-3333-4333-8333-333333333333';
 
 function makeWorker(): Worker {
 	return {
@@ -71,6 +79,7 @@ function makeRollout(overrides: Partial<WorkerUpdateRollout> = {}): WorkerUpdate
 	return {
 		id: ROLLOUT_ID,
 		requestedByUserId: OWNER_ID,
+		scope: 'owner',
 		target: 'main',
 		waveSize: 1,
 		status: 'in_progress',
@@ -90,6 +99,8 @@ beforeEach(() => {
 	getWorker.mockResolvedValue(makeWorker());
 	listAdvanceableRolloutsForOwner.mockResolvedValue([makeRollout()]);
 	listAdvanceableRollouts.mockResolvedValue([]);
+	// No installation-wide rollout unless a case says there is one (issue #1024).
+	findAdvanceableInstallationRollout.mockResolvedValue(undefined);
 	advanceRollout.mockImplementation(async (id) => makeView(makeRollout({ id })));
 });
 
@@ -127,6 +138,44 @@ describe('advanceRolloutForWorker', () => {
 
 		await expect(advanceRolloutForWorker(WORKER_ID)).resolves.toBe(false);
 		expect(advanceRollout).not.toHaveBeenCalled();
+	});
+
+	// Issue #1024 — the case the owner lookup can never answer: an installation-wide
+	// rollout carries the *administrator* in `requested_by_user_id`, so a machine whose
+	// own owner started nothing is a member of a rollout that read can never find.
+	it('advances the installation rollout for a machine whose owner has none', async () => {
+		listAdvanceableRolloutsForOwner.mockResolvedValue([]);
+		findAdvanceableInstallationRollout.mockResolvedValue(
+			makeRollout({ id: OTHER_ROLLOUT_ID, scope: 'installation', requestedByUserId: ADMIN_ID }),
+		);
+
+		await expect(advanceRolloutForWorker(WORKER_ID)).resolves.toBe(true);
+
+		expect(advanceRollout).toHaveBeenCalledExactlyOnceWith(OTHER_ROLLOUT_ID);
+	});
+
+	it('advances the operator’s own rollout and the installation one together', async () => {
+		findAdvanceableInstallationRollout.mockResolvedValue(
+			makeRollout({ id: OTHER_ROLLOUT_ID, scope: 'installation', requestedByUserId: ADMIN_ID }),
+		);
+
+		await expect(advanceRolloutForWorker(WORKER_ID)).resolves.toBe(true);
+
+		expect(advanceRollout).toHaveBeenCalledTimes(2);
+		expect(advanceRollout).toHaveBeenCalledWith(ROLLOUT_ID);
+		expect(advanceRollout).toHaveBeenCalledWith(OTHER_ROLLOUT_ID);
+	});
+
+	// When the machine's owner *is* the administrator who started it, both reads answer
+	// with the same row — advancing it twice would take its lock twice for nothing.
+	it('advances a rollout both reads name only once', async () => {
+		const installationRollout = makeRollout({ scope: 'installation' });
+		listAdvanceableRolloutsForOwner.mockResolvedValue([installationRollout]);
+		findAdvanceableInstallationRollout.mockResolvedValue(installationRollout);
+
+		await expect(advanceRolloutForWorker(WORKER_ID)).resolves.toBe(true);
+
+		expect(advanceRollout).toHaveBeenCalledExactlyOnceWith(ROLLOUT_ID);
 	});
 
 	it('is a no-op for a machine that no longer exists', async () => {
