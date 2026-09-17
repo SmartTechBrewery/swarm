@@ -3,12 +3,13 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 // Mock ioredis so nothing touches a real Redis — capture the constructor and the
 // set()/del() calls the helper makes. Hoisted so the vi.mock factory (itself
 // hoisted above imports) can reference them.
-const { RedisMock, set, del, on } = vi.hoisted(() => {
+const { RedisMock, set, del, on, ttl } = vi.hoisted(() => {
 	const set = vi.fn();
 	const del = vi.fn();
 	const on = vi.fn();
-	const RedisMock = vi.fn(() => ({ set, del, on }));
-	return { RedisMock, set, del, on };
+	const ttl = vi.fn();
+	const RedisMock = vi.fn(() => ({ set, del, on, ttl }));
+	return { RedisMock, set, del, on, ttl };
 });
 
 vi.mock('ioredis', () => ({ Redis: RedisMock }));
@@ -23,6 +24,8 @@ beforeEach(() => {
 	del.mockReset();
 	del.mockResolvedValue(1);
 	on.mockReset();
+	ttl.mockReset();
+	ttl.mockResolvedValue(-2);
 	process.env.REDIS_URL = 'redis://localhost:6379';
 });
 
@@ -32,6 +35,33 @@ describe('buildReviewDispatchKey', () => {
 	it('joins owner/repo, PR number, and head SHA', async () => {
 		const { buildReviewDispatchKey } = await import('@/triggers/review-dispatch-dedup.js');
 		expect(buildReviewDispatchKey('acme/widgets', '42', 'abc123')).toBe('acme/widgets:42:abc123');
+	});
+});
+
+// Issue #1019 — read only so a declined dispatch can tell the operator which
+// slot is held and for how long, instead of blaming their board.
+describe('reviewDispatchClaimTtlSec', () => {
+	it('reports the live claim\u2019s remaining lease from the namespaced key', async () => {
+		ttl.mockResolvedValue(252);
+		const { reviewDispatchClaimTtlSec } = await import('@/triggers/review-dispatch-dedup.js');
+
+		await expect(reviewDispatchClaimTtlSec('acme/widgets:42:abc')).resolves.toBe(252);
+		expect(ttl).toHaveBeenCalledWith(`${NS}acme/widgets:42:abc`);
+	});
+
+	// `-2` (no such key) and `-1` (no expiry) are not waits an operator can sit out.
+	it.each([-2, -1, 0])('reports nothing for a TTL of %s', async (answer) => {
+		ttl.mockResolvedValue(answer);
+		const { reviewDispatchClaimTtlSec } = await import('@/triggers/review-dispatch-dedup.js');
+
+		await expect(reviewDispatchClaimTtlSec('acme/widgets:42:abc')).resolves.toBeUndefined();
+	});
+
+	it('reports nothing when the read throws', async () => {
+		ttl.mockRejectedValue(new Error('ECONNREFUSED'));
+		const { reviewDispatchClaimTtlSec } = await import('@/triggers/review-dispatch-dedup.js');
+
+		await expect(reviewDispatchClaimTtlSec('acme/widgets:42:abc')).resolves.toBeUndefined();
 	});
 });
 

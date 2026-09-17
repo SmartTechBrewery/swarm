@@ -256,6 +256,21 @@ const jobBase = z.object({
 	 */
 	workerEligibilityRecheckAttempt: z.number().int().nonnegative().optional(),
 	/**
+	 * How many times this job has been re-checked while another dispatch held the
+	 * PR+SHA review-dispatch slot it needs (issue #1019): a continuation — an
+	 * operator's "Retry now", a "Reset & restart" — that meets a *live* claim is
+	 * not a phase whose disposition changed, so it waits for the holder to settle
+	 * (a token-free deferral: the decline happens in the trigger registry, before
+	 * any worktree or agent) instead of being finalized terminally `failed`.
+	 * Absent on a fresh webhook, which owns no run to defer and is simply dropped
+	 * as the duplicate it is. Its own budget, like every other wait's, so a
+	 * collision never spends the rate-limit or eligibility allowance — capped by
+	 * `MAX_DISPATCH_CLAIM_RECHECKS` (`src/worker/consumer.ts`) so a holder that
+	 * keeps refreshing its claim ends in a report naming the collision rather than
+	 * in an unbounded poll.
+	 */
+	dispatchClaimRecheckAttempt: z.number().int().nonnegative().optional(),
+	/**
 	 * PM phase to resume after an agent failure. A retried implementation has
 	 * already moved its card to In progress, which normally is deliberately not
 	 * a phase-triggering status; this preserves the original dispatch intent.

@@ -793,6 +793,36 @@ function registryReturning(result: TriggerResult | null, seenContexts: TriggerCo
 	return registry;
 }
 
+const HELD_CLAIM_REASON =
+	"Another dispatch holds the review slot for pull request #17 at head 'deadbeef'";
+
+/**
+ * A registry whose single handler declines *and says why* — the shape the
+ * `pr-review` handler produces when another dispatch already holds the PR+SHA
+ * review slot (issue #1019).
+ */
+function registryDecliningWithHeldClaim(
+	// Defaulted as a whole object rather than per-field, so a case can state the
+	// *unreadable* lease by passing `{}` — a bare `undefined` would take the default.
+	{ retryAfterSec }: { retryAfterSec?: number } = { retryAfterSec: 180 },
+) {
+	const registry = createTriggerRegistry();
+	registry.register({
+		name: 'test-trigger',
+		description: 'declines because the dispatch slot is held',
+		matches: () => true,
+		handle: async (ctx) => {
+			ctx.noteDecline?.({
+				kind: 'dispatch-claim-held',
+				reason: HELD_CLAIM_REASON,
+				retryAfterSec,
+			});
+			return null;
+		},
+	});
+	return registry;
+}
+
 /**
  * Claim the next dispatch as a row whose earlier evaluation resolved `phase` —
  * what `recordDispatchResolution` leaves behind, and the only thing the
@@ -1437,6 +1467,157 @@ describe('processJob', () => {
 					error: expect.stringContaining('no-trigger'),
 				});
 				expect(requestMergeAutomation).not.toHaveBeenCalled();
+			});
+		});
+
+		// Issue #1019: the settle's generic wording is a *guess* at the cause, and for
+		// a dispatch dropped because SWARM's own PR+SHA lock is held it guessed wrong
+		// in the most expensive direction — it named the board, so the operator went
+		// and inspected a disposition that was fine.
+		describe('a decline the handler named is reported as such (issue #1019)', () => {
+			/** The live-collision shape: a continuation carrying the run it retries. */
+			const collidingContinuation = (overrides: Record<string, unknown> = {}) =>
+				createMockScmWebhookJob({
+					runId: 'run-123',
+					event: createMockScmEvent({ headSha: 'deadbeef' }),
+					...overrides,
+				});
+
+			it("records the handler's reason instead of the disposition wording", async () => {
+				claimDispatchWithPhase('review');
+
+				const outcome = await processJob(collidingContinuation(), registryDecliningWithHeldClaim());
+
+				expect(outcome.status).toBe('no-trigger');
+				expect(completeRun).toHaveBeenCalledWith(
+					'run-123',
+					expect.objectContaining({ error: HELD_CLAIM_REASON }),
+				);
+				expect(completeRun).not.toHaveBeenCalledWith(
+					'run-123',
+					expect.objectContaining({ error: expect.stringContaining('disposition changed') }),
+				);
+			});
+
+			// The other half of the acceptance criteria: a retry blocked by a claim
+			// that is *genuinely* held is waiting for a holder, not failing. Marking it
+			// terminal records a second Review failure for a phase nothing is wrong
+			// with, and leaves the operator to click again once the holder settles.
+			it('defers the carried run instead of failing it terminally', async () => {
+				claimDispatchWithPhase('review');
+
+				const outcome = await processJob(collidingContinuation(), registryDecliningWithHeldClaim());
+
+				expect(outcome).toEqual({ status: 'no-trigger', heldClaimRetryScheduled: true });
+				expect(completeRun).toHaveBeenCalledWith('run-123', {
+					status: 'deferred',
+					error: HELD_CLAIM_REASON,
+					nextRetryAt: expect.any(Date),
+				});
+				expect(completeRun).not.toHaveBeenCalledWith(
+					'run-123',
+					expect.objectContaining({ status: 'failed' }),
+				);
+				// The dispatch is re-scheduled, not settled: it is the durable intent
+				// that brings the retry back once the holder's lease lapses.
+				expect(completeDispatch).not.toHaveBeenCalled();
+				expect(scheduleDispatchRetry).toHaveBeenCalledOnce();
+				const [, input] = scheduleDispatchRetry.mock.calls[0] as [string, Record<string, unknown>];
+				expect(input).toMatchObject({
+					waitReason: 'recheck',
+					lastError: HELD_CLAIM_REASON,
+					runId: 'run-123',
+					attempt: 1,
+				});
+				// Timed by the holder's own lease (180 s here) plus the margin that puts
+				// the re-check *after* it, rather than on a number of our own.
+				expect((input.availableAt as Date).getTime() - Date.now()).toBeGreaterThan(180_000);
+				expect((input.availableAt as Date).getTime() - Date.now()).toBeLessThanOrEqual(182_000);
+				// The counter the budget is spent from rides the persisted retry payload.
+				expect(updateRunJobPayload).toHaveBeenCalledWith(
+					'run-123',
+					expect.objectContaining({ dispatchClaimRecheckAttempt: 1 }),
+				);
+				expect(publishDispatchWakeUp).toHaveBeenCalledOnce();
+			});
+
+			// No lease to sit out — an unreachable Redis reads the same way — so the
+			// re-check lands on its own short cadence instead of a guessed wait.
+			it('falls back to its own cadence when the lease could not be read', async () => {
+				claimDispatchWithPhase('review');
+
+				await processJob(collidingContinuation(), registryDecliningWithHeldClaim({}));
+
+				const [, input] = scheduleDispatchRetry.mock.calls[0] as [string, Record<string, unknown>];
+				expect((input.availableAt as Date).getTime() - Date.now()).toBeLessThanOrEqual(30_000);
+			});
+
+			// Bounded, like every other token-free re-check: a holder that keeps
+			// refreshing its claim is not out-waited forever. The report still names the
+			// collision — the operator is never sent back to the board.
+			it('fails with the collision reason once the re-check budget is spent', async () => {
+				claimDispatchWithPhase('review');
+
+				const outcome = await processJob(
+					collidingContinuation({ dispatchClaimRecheckAttempt: 3 }),
+					registryDecliningWithHeldClaim(),
+				);
+
+				expect(outcome.status).toBe('no-trigger');
+				expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+				expect(completeRun).toHaveBeenCalledWith('run-123', {
+					status: 'failed',
+					error: HELD_CLAIM_REASON,
+				});
+				expect(completeDispatch).toHaveBeenCalledWith('dispatch-1', 'no-trigger');
+			});
+
+			// A fresh delivery that collides is the duplicate the dedup exists to drop:
+			// there is no run behind it to wait for, and nothing was mis-reported.
+			it('drops a colliding delivery that carries no run', async () => {
+				claimDispatchWithPhase('review');
+
+				const outcome = await processJob(
+					createMockScmWebhookJob({ event: createMockScmEvent({ headSha: 'deadbeef' }) }),
+					registryDecliningWithHeldClaim(),
+				);
+
+				expect(outcome.status).toBe('no-trigger');
+				expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+				expect(completeRun).not.toHaveBeenCalled();
+				expect(completeDispatch).toHaveBeenCalledWith('dispatch-1', 'no-trigger');
+			});
+
+			// And once the holder settles, the re-check it was deferred for dispatches
+			// exactly like any other delivery — the spent counter gates nothing but the
+			// wait itself.
+			it('dispatches normally when the re-check finds the slot free', async () => {
+				const outcome = await processJob(
+					collidingContinuation({ dispatchClaimRecheckAttempt: 1 }),
+					registryReturning(REVIEW_TRIGGER),
+				);
+
+				expect(outcome.status).toBe('phase-succeeded');
+				expect(phaseCalls).toHaveLength(1);
+			});
+
+			// The hand-back releases what *this dispatch's own trigger* claimed, and a
+			// dispatch declined because another one holds the slot claimed nothing. The
+			// `dispatch.phase` gate cannot see that on its own: an operator's "Retry
+			// now" / "Reset & restart" carries the retried run's phase from the moment
+			// its row is created, so without the decline it would release a live
+			// Review's claim and abandon its ledger reservation.
+			it('hands back nothing it did not take', async () => {
+				const job = createMockScmWebhookJob({
+					runId: 'run-123',
+					event: createMockScmEvent({ headSha: 'deadbeef' }),
+				});
+				claimDispatchWithPhase('review');
+
+				await processJob(job, registryDecliningWithHeldClaim());
+
+				expect(releaseReviewDispatch).not.toHaveBeenCalled();
+				expect(abandonReviewVerdict).not.toHaveBeenCalled();
 			});
 		});
 
@@ -4555,6 +4736,117 @@ describe('processJob', () => {
 		expect(addComment).toHaveBeenCalledTimes(1);
 		expect(addComment.mock.calls[0][0]).toBe('item-100');
 		expect(addComment.mock.calls[0][1]).toContain('unpushed commits');
+	});
+
+	// Issue #1019: the PR+SHA dispatch claim is taken before a Review starts and used
+	// to survive a run that failed without ever submitting a verdict, so for five
+	// minutes the guard against a *duplicate* review blocked the retry of a review
+	// that never happened — and the bounced retry was reported as a changed board
+	// disposition. Live on `under-control-platform#224`: eight dispatches, every
+	// second one a no-op, in strict alternation.
+	describe('a failed Review hands back its dispatch claim (issue #1019)', () => {
+		const failWith = (err: unknown) => {
+			phaseImpl = async () => {
+				throw err;
+			};
+		};
+
+		it('releases the claim when the run delivered no verdict', async () => {
+			failWith(new Error('worktree provisioning failed'));
+
+			const outcome = await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-failed');
+			expect(getSubmittedReviewSlot).toHaveBeenCalledWith({
+				projectId: PROJECT.id,
+				repository: PROJECT.repo,
+				prNumber: '17',
+				headSha: 'deadbeef',
+			});
+			expect(releaseReviewDispatch).toHaveBeenCalledWith(`${PROJECT.repo}:17:deadbeef`);
+		});
+
+		// The acceptance criterion the whole dedup exists for: a run that *did* post
+		// its review keeps the slot, or a sibling event posts a second one.
+		it('keeps the claim when the ledger records a submitted verdict for the head', async () => {
+			getSubmittedReviewSlot.mockResolvedValueOnce({
+				ordinal: 1,
+				verdict: 'approve',
+				reviewId: 'review-1',
+			});
+			failWith(new Error('cleanup exploded after the review was submitted'));
+
+			const outcome = await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-failed');
+			expect(releaseReviewDispatch).not.toHaveBeenCalled();
+		});
+
+		// The second read, for the window the ledger alone cannot judge: the phase
+		// raises `DeliveryDeferredError` for any error once delivery progress exists on
+		// disk, which is written immediately before the review is submitted. Terminal
+		// only once its retry budget is spent — at which point the review may well be
+		// out there with no ledger row behind it.
+		it('keeps the claim when the terminal failure is a spent delivery deferral', async () => {
+			failWith(new DeliveryDeferredError('Review delivery deferred for retry'));
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ rateLimitRetryAttempt: 6 }),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-failed');
+			expect(releaseReviewDispatch).not.toHaveBeenCalled();
+		});
+
+		// Fails closed, exactly as the claim itself does: an unreadable ledger cannot
+		// establish that nothing was delivered, so the TTL reaps the claim instead.
+		it('keeps the claim when the ledger read throws', async () => {
+			getSubmittedReviewSlot.mockRejectedValueOnce(new Error('db down'));
+			failWith(new Error('worktree provisioning failed'));
+
+			const outcome = await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-failed');
+			expect(releaseReviewDispatch).not.toHaveBeenCalled();
+		});
+
+		// A deferral keeps its slot deliberately — `retainContinuationDispatchClaim`
+		// is holding it open for the prioritized retry that reuses it.
+		it('leaves a deferred run\u2019s claim alone', async () => {
+			failWith(new AgentRunError('rate limited', { kind: 'rate-limit' }));
+
+			const outcome = await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-deferred');
+			expect(releaseReviewDispatch).not.toHaveBeenCalled();
+		});
+
+		// Only Review owns a verdict; the other PR-driven phases have their own
+		// budgets and are left strictly alone here.
+		it('leaves another phase\u2019s failure alone', async () => {
+			failWith(new Error('boom'));
+
+			const outcome = await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(RESPOND_TO_REVIEW_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-failed');
+			expect(releaseReviewDispatch).not.toHaveBeenCalled();
+		});
 	});
 
 	describe('automation-label gate (issue #131)', () => {
