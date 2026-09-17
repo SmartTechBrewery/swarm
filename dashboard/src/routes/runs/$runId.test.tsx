@@ -1170,6 +1170,77 @@ describe('ResetRunButton (issue #428)', () => {
 	});
 });
 
+// A deferred run whose dispatch is gone (issue #1017). `nextRetryAt` survives the
+// death of the attempt it named, so the amber "automatic retry scheduled" callout
+// kept promising a retry that could never land — and a run with no `nextRetryAt` at
+// all rendered no callout and therefore none of the controls that could move it.
+describe('a deferred run with no scheduled retry (issue #1017)', () => {
+	function renderHeader(run: RunRow) {
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		return render(
+			<QueryClientProvider client={queryClient}>
+				<RunDetailHeader run={run} />
+			</QueryClientProvider>,
+		);
+	}
+
+	/** The live shape: deferred by the dependency gate, its dispatch reaped afterwards. */
+	function makeStrandedRun(overrides: Partial<RunRow> = {}): RunRow {
+		return makeReviewRun({
+			status: 'deferred',
+			phase: 'implementation',
+			error: 'Blocked: #191 must be done first',
+			nextRetryAt: '2026-09-16T09:40:28.000Z',
+			retryScheduled: false,
+			...overrides,
+		});
+	}
+
+	it('says nothing is scheduled instead of naming a retry that will never land', () => {
+		renderHeader(makeStrandedRun());
+
+		expect(
+			screen.getByRole('heading', { name: /deferred — no retry is scheduled/i }),
+		).toBeDefined();
+		expect(screen.queryByRole('heading', { name: /automatic retry scheduled/i })).toBeNull();
+		expect(screen.getByText(/nothing will pick it up on its own/i)).toBeDefined();
+	});
+
+	it('offers Retry now, Terminate, and Reset & restart', () => {
+		renderHeader(makeStrandedRun());
+
+		expect(screen.getByRole('button', { name: /retry now/i })).toBeDefined();
+		expect(screen.getByRole('button', { name: /^terminate$/i })).toBeDefined();
+		expect(screen.getByRole('button', { name: /reset & restart/i })).toBeDefined();
+	});
+
+	it('still renders the controls when the row carries no next-retry time at all', () => {
+		renderHeader(makeStrandedRun({ nextRetryAt: null }));
+
+		expect(
+			screen.getByRole('heading', { name: /deferred — no retry is scheduled/i }),
+		).toBeDefined();
+		expect(screen.getByRole('button', { name: /retry now/i })).toBeDefined();
+	});
+
+	it('keeps the scheduled-retry callout while a dispatch still stands behind it', () => {
+		renderHeader(makeStrandedRun({ retryScheduled: true }));
+
+		expect(
+			screen.getByRole('heading', { name: /deferred — automatic retry scheduled/i }),
+		).toBeDefined();
+	});
+
+	it('keeps the scheduled-retry callout when the server reports no verdict', () => {
+		// An unreadable dispatch (or an older server) must not be read as "stranded".
+		renderHeader(makeStrandedRun({ retryScheduled: null }));
+
+		expect(
+			screen.getByRole('heading', { name: /deferred — automatic retry scheduled/i }),
+		).toBeDefined();
+	});
+});
+
 // An accepted Terminate / Reset request that hasn't taken effect (issue #561):
 // the button must be disabled, relabelled to the wait, and explained — driven by
 // the run-scoped `pendingRequest` the server resolves, not by the mutation's own

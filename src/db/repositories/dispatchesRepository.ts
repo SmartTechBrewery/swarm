@@ -13,6 +13,7 @@
  */
 
 import {
+	type AnyColumn,
 	and,
 	asc,
 	desc,
@@ -1005,6 +1006,88 @@ export async function reopenDispatchForManualRetry(
 			updatedAt: now,
 		})
 		.where(and(eq(dispatches.id, id), inArray(dispatches.state, [...WAITING_DISPATCH_STATES])))
+		.returning();
+	return rows[0] ?? null;
+}
+
+/**
+ * The claim columns a stale-claim take-over was decided against, re-asserted in
+ * its own UPDATE (issue #1017). Read off the same row the caller classified, so
+ * "nothing has changed since I judged this claim dead" is a compare-and-set rather
+ * than a second opinion taken a round trip later.
+ */
+export interface StaleDispatchClaim {
+	leaseExpiresAt: Date | null;
+	workerSessionId: string | null;
+	workerFencingToken: number | null;
+}
+
+/**
+ * `column` still holds exactly `value`, null included — every claim column is
+ * nullable, and SQL equality against a null is unknown rather than true. Built as
+ * one of two drizzle conditions rather than a raw `IS NOT DISTINCT FROM`
+ * specifically so the column's own value mapper runs: a bare `Date` interpolated
+ * into a `sql` template reaches a `timestamp` column as an offset-bearing string
+ * Postgres then reads as local time, which silently never matches.
+ */
+function columnStillHolds<T>(column: AnyColumn, value: T | null): SQL | undefined {
+	return value === null ? isNull(column) : eq(column, value);
+}
+
+/**
+ * Take a `leased`/`running` dispatch back for an immediate manual retry, when its
+ * lease has lapsed and nothing is therefore honouring its claim (issue #1017 —
+ * `../../dispatch/claim-liveness.ts` is what decides that, and is the only caller's
+ * gate).
+ *
+ * The transition itself is {@link deferDispatchToPending}'s, which has always
+ * returned a claimed dispatch to `pending`: same states in, same claim columns
+ * cleared, so the freed capacity, the abandoned worker binding, and the wake-up
+ * sequence are all handled exactly as a capacity deferral handles them. What it
+ * adds is {@link reopenDispatchForManualRetry}'s retry semantics — a fresh attempt
+ * budget, the operator's overrides folded into `jobPayload`, eligible now — and the
+ * compare-and-set below.
+ *
+ * **The CAS is the whole safety argument.** Liveness was judged off a row read a
+ * moment earlier, and the two things that would invalidate it both write these
+ * columns: a worker starting the phase renews `leaseExpiresAt`
+ * ({@link markDispatchRunning}), and a different session claiming it rewrites
+ * `workerSessionId`/`workerFencingToken` ({@link claimWorkerForDispatch}). Matching
+ * all three as they were read means a claim that came alive in that window keeps
+ * it, and the caller refuses instead of running the phase twice. Each is matched
+ * through {@link columnStillHolds}, because every one of them is nullable.
+ */
+export async function takeOverStaleDispatchForManualRetry(
+	id: string,
+	jobPayload: SwarmJob,
+	claim: StaleDispatchClaim,
+): Promise<DispatchRow | null> {
+	const now = new Date();
+	const rows = await getDb()
+		.update(dispatches)
+		.set({
+			state: 'pending',
+			jobPayload,
+			availableAt: now,
+			waitReason: 'manual-retry',
+			attempt: 0,
+			wakeSeq: sql`${dispatches.wakeSeq} + 1`,
+			leaseOwner: null,
+			leaseExpiresAt: null,
+			selectedWorkerId: null,
+			workerSessionId: null,
+			workerFencingToken: null,
+			updatedAt: now,
+		})
+		.where(
+			and(
+				eq(dispatches.id, id),
+				inArray(dispatches.state, [...EXECUTING_DISPATCH_STATES]),
+				columnStillHolds(dispatches.leaseExpiresAt, claim.leaseExpiresAt),
+				columnStillHolds(dispatches.workerSessionId, claim.workerSessionId),
+				columnStillHolds(dispatches.workerFencingToken, claim.workerFencingToken),
+			),
+		)
 		.returning();
 	return rows[0] ?? null;
 }

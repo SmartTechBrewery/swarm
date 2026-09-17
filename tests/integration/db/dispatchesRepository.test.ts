@@ -40,6 +40,7 @@ import {
 	selectNextCapacityDispatch,
 	supersedeDispatchesByCoalesceKey,
 	supersedeWorkerUpdateDispatches,
+	takeOverStaleDispatchForManualRetry,
 } from '../../../src/db/repositories/dispatchesRepository.js';
 import {
 	completeRun,
@@ -1280,6 +1281,87 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 			await claimDispatch(dispatch.id, OWNER, 60_000);
 
 			expect(await reopenDispatchForManualRetry(dispatch.id, job())).toBeNull();
+		});
+
+		// Issue #1017. The claim the retry takes back is exactly the one the
+		// lease-expiry sweep would have reaped; the take-over just does not wait for it.
+		it('takes a claimed dispatch back, clearing the abandoned worker binding', async () => {
+			const { dispatch } = await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: job(),
+				source: 'webhook',
+			});
+			const claimed = await claimDispatch(dispatch.id, OWNER, -1_000); // lease already lapsed
+
+			const reopened = await takeOverStaleDispatchForManualRetry(
+				dispatch.id,
+				job({ rateLimitRetryAttempt: 0, cliOverride: 'codex' }),
+				{
+					leaseExpiresAt: claimed?.leaseExpiresAt ?? null,
+					workerSessionId: claimed?.workerSessionId ?? null,
+					workerFencingToken: claimed?.workerFencingToken ?? null,
+				},
+			);
+
+			expect(reopened).toMatchObject({
+				state: 'pending',
+				waitReason: 'manual-retry',
+				attempt: 0,
+				leaseOwner: null,
+				leaseExpiresAt: null,
+				selectedWorkerId: null,
+				workerSessionId: null,
+				workerFencingToken: null,
+			});
+			expect(reopened?.jobPayload).toMatchObject({ cliOverride: 'codex' });
+			// A worker that comes back to a dispatch it no longer holds must not be able
+			// to start the phase on it.
+			expect(
+				await markDispatchRunning(dispatch.id, undefined, new Date(Date.now() + 60_000), {
+					taskId: '103',
+					phase: 'implementation',
+				}),
+			).toBe(false);
+		});
+
+		it('refuses the take-over when the claim moved since it was judged stale', async () => {
+			const { dispatch } = await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: job(),
+				source: 'webhook',
+			});
+			const claimed = await claimDispatch(dispatch.id, OWNER, -1_000);
+			// The worker got there first and renewed the lease onto the phase's budget,
+			// which is precisely the window the compare-and-set closes.
+			await markDispatchRunning(dispatch.id, undefined, new Date(Date.now() + 60_000), {
+				taskId: '103',
+				phase: 'implementation',
+			});
+
+			expect(
+				await takeOverStaleDispatchForManualRetry(dispatch.id, job(), {
+					leaseExpiresAt: claimed?.leaseExpiresAt ?? null,
+					workerSessionId: claimed?.workerSessionId ?? null,
+					workerFencingToken: claimed?.workerFencingToken ?? null,
+				}),
+			).toBeNull();
+			expect((await getDispatchById(dispatch.id))?.state).toBe('running');
+		});
+
+		it('leaves a waiting dispatch to the reopen path', async () => {
+			const { dispatch } = await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: job(),
+				source: 'webhook',
+			});
+
+			expect(
+				await takeOverStaleDispatchForManualRetry(dispatch.id, job(), {
+					leaseExpiresAt: null,
+					workerSessionId: null,
+					workerFencingToken: null,
+				}),
+			).toBeNull();
 		});
 	});
 
