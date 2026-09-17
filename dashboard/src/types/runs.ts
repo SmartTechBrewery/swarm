@@ -585,6 +585,15 @@ export interface RunRow {
 	 * such field; optional for exactly that reason.
 	 */
 	pendingRequest?: PendingRunRequest | null;
+	/**
+	 * Whether this `deferred` run still has an active dispatch that will fire the
+	 * retry its `nextRetryAt` names (issue #1017). `false` means nothing is queued
+	 * for it — the attempt behind that timestamp died and was reaped, so the run
+	 * will not move until an operator moves it. `null`/absent for every other
+	 * status, for a server that could not read the dispatch, and for the runs list,
+	 * which `runs.getById` alone resolves this for.
+	 */
+	retryScheduled?: boolean | null;
 	/** Evidence-based terminal diagnosis; null for ordinary and historical runs. */
 	failureDiagnosis: FailureDiagnosis | null;
 }

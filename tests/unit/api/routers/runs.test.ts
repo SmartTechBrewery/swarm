@@ -61,6 +61,15 @@ vi.mock('@/db/repositories/dispatchesRepository.js', async (importOriginal) => (
 	listActiveDispatchTaskRefs: vi.fn(),
 	listWaitingDispatches: vi.fn(),
 	reopenDispatchForManualRetry: vi.fn(),
+	takeOverStaleDispatchForManualRetry: vi.fn(),
+}));
+
+// The stale-claim judgement (issue #1017) is two worker-session reads of its own,
+// covered by `tests/unit/dispatch/claim-liveness.test.ts`. Stubbed at its own module
+// boundary so these tests stay a wiring check: which verdict produces which write,
+// and which produces which refusal.
+vi.mock('@/dispatch/claim-liveness.js', () => ({
+	classifyDispatchClaim: vi.fn(),
 }));
 
 // Only the reset *service* is stubbed; its real `RunResetError` is kept so the
@@ -160,6 +169,7 @@ import {
 	listActiveDispatchTaskRefs,
 	listWaitingDispatches,
 	reopenDispatchForManualRetry,
+	takeOverStaleDispatchForManualRetry,
 } from '@/db/repositories/dispatchesRepository.js';
 import {
 	getProjectByIdFromDb,
@@ -182,6 +192,7 @@ import {
 } from '@/db/repositories/stalledDismissalsRepository.js';
 import { getUserById } from '@/db/repositories/usersRepository.js';
 import type { runs } from '@/db/schema/runs.js';
+import { classifyDispatchClaim } from '@/dispatch/claim-liveness.js';
 import {
 	cancelDispatchAndWake,
 	cancelDispatchForRun,
@@ -399,6 +410,9 @@ describe('runsRouter', () => {
 		vi.mocked(recordStalledDismissal).mockReset();
 		vi.mocked(recordStalledDismissal).mockResolvedValue({ dismissedAt: new Date(0) });
 		vi.mocked(reopenDispatchForManualRetry).mockReset();
+		vi.mocked(takeOverStaleDispatchForManualRetry).mockReset();
+		// The overwhelmingly common shape: the run's dispatch is queued, not claimed.
+		vi.mocked(classifyDispatchClaim).mockReset().mockResolvedValue('waiting');
 		vi.mocked(cancelDispatchAndWake).mockReset();
 		vi.mocked(cancelDispatchForRun).mockReset();
 		vi.mocked(createAndPublishDispatch).mockReset();
@@ -1275,6 +1289,7 @@ describe('runsRouter', () => {
 				preservedWorker: null,
 				maxContinuations: null,
 				pendingRequest: null,
+				retryScheduled: null,
 			});
 			expect(result.nextRetryAt).toEqual(nextRetryAt);
 			expect(getRunByIdFromDb).toHaveBeenCalledWith('run-1');
@@ -1688,6 +1703,55 @@ describe('runsRouter', () => {
 					preservedWorker: null,
 					maxContinuations: null,
 					pendingRequest: null,
+					retryScheduled: null,
+				});
+			});
+		});
+
+		// Issue #1017: `next_retry_at` survives the death of the attempt it named, so
+		// the detail page is told whether a dispatch still stands behind it rather than
+		// left to read a past timestamp as "still waiting".
+		describe('retryScheduled', () => {
+			it('is true for a deferred run whose dispatch is still active', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', status: 'deferred' }));
+				vi.mocked(getActiveDispatchByRunId).mockResolvedValue(
+					makeDispatch({ state: 'retry-scheduled' }),
+				);
+
+				await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+					retryScheduled: true,
+				});
+			});
+
+			it('is false for a deferred run whose dispatch settled terminally', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({
+						id: 'run-1',
+						status: 'deferred',
+						nextRetryAt: new Date('2026-09-16T09:40:28Z'),
+					}),
+				);
+				vi.mocked(getActiveDispatchByRunId).mockResolvedValue(undefined);
+
+				await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+					retryScheduled: false,
+				});
+			});
+
+			it('reports no verdict for a status that has no scheduled retry', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', status: 'running' }));
+
+				await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+					retryScheduled: null,
+				});
+			});
+
+			it('reports no verdict rather than a wrong one when the dispatch read throws', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', status: 'deferred' }));
+				vi.mocked(getActiveDispatchByRunId).mockRejectedValue(new Error('db unreachable'));
+
+				await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+					retryScheduled: null,
 				});
 			});
 		});
@@ -2020,6 +2084,86 @@ describe('runsRouter', () => {
 				expect.objectContaining({ code: 'PRECONDITION_FAILED' }),
 			);
 			expect(createAndPublishDispatch).not.toHaveBeenCalled();
+		});
+
+		// Issue #1017's live shape, 2026-09-16: the dispatch was claimed, the worker's
+		// transport dropped mid-hand-off, the phase never started, and the run row stayed
+		// `deferred` with a `next_retry_at` in the past. The claim reads `leased` for the
+		// whole lease window, so "Retry now" refused it as "already retrying" — a
+		// statement that was the opposite of the truth — until the lease-expiry sweep
+		// reached it ~19 minutes later.
+		it('takes over a leased dispatch whose lease no live worker is honouring', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', status: 'deferred' }));
+			const stale = makeDispatch({
+				state: 'leased',
+				waitReason: null,
+				selectedWorkerId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+				workerSessionId: 'ffffffff-ffff-4fff-8fff-ffffffffffff',
+				workerFencingToken: 7,
+				leaseExpiresAt: new Date('2026-07-10T00:15:00Z'),
+			});
+			vi.mocked(getActiveDispatchByRunId).mockResolvedValue(stale);
+			vi.mocked(classifyDispatchClaim).mockResolvedValue('stale');
+			const reopened = makeDispatch({ state: 'pending', waitReason: 'manual-retry', attempt: 0 });
+			vi.mocked(takeOverStaleDispatchForManualRetry).mockResolvedValue(reopened);
+
+			await expect(caller.retryNow({ runId: 'run-1' })).resolves.toEqual({
+				runId: 'run-1',
+				status: 'retrying',
+			});
+			// The take-over is conditional on the very claim columns the verdict was read
+			// from, so a claim that came alive in between keeps it.
+			expect(takeOverStaleDispatchForManualRetry).toHaveBeenCalledWith(
+				'dispatch-1',
+				expect.objectContaining({ runId: 'run-1', rateLimitRetryAttempt: 0 }),
+				expect.objectContaining({
+					leaseExpiresAt: stale.leaseExpiresAt,
+					workerSessionId: stale.workerSessionId,
+					workerFencingToken: 7,
+				}),
+			);
+			expect(reopenDispatchForManualRetry).not.toHaveBeenCalled();
+			expect(publishDispatchWakeUp).toHaveBeenCalledWith(reopened);
+		});
+
+		it('still refuses a dispatch a live worker is running, with its own message', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', status: 'deferred' }));
+			vi.mocked(getActiveDispatchByRunId).mockResolvedValue(
+				makeDispatch({
+					state: 'running',
+					waitReason: null,
+					selectedWorkerId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+					leaseExpiresAt: new Date('2026-07-10T02:00:00Z'),
+				}),
+			);
+			vi.mocked(classifyDispatchClaim).mockResolvedValue('executing');
+
+			await expect(caller.retryNow({ runId: 'run-1' })).rejects.toThrowError(
+				expect.objectContaining({
+					code: 'CONFLICT',
+					message: expect.stringContaining('A worker is running this phase right now'),
+				}),
+			);
+			// Neither write is attempted: no double-execution, and no race with a worker
+			// about to report its result.
+			expect(reopenDispatchForManualRetry).not.toHaveBeenCalled();
+			expect(takeOverStaleDispatchForManualRetry).not.toHaveBeenCalled();
+			expect(publishDispatchWakeUp).not.toHaveBeenCalled();
+		});
+
+		it('reports the lost race, not "a worker is running it", when the take-over CAS fails', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', status: 'deferred' }));
+			vi.mocked(getActiveDispatchByRunId).mockResolvedValue(makeDispatch({ state: 'leased' }));
+			vi.mocked(classifyDispatchClaim).mockResolvedValue('stale');
+			vi.mocked(takeOverStaleDispatchForManualRetry).mockResolvedValue(null);
+
+			await expect(caller.retryNow({ runId: 'run-1' })).rejects.toThrowError(
+				expect.objectContaining({
+					code: 'CONFLICT',
+					message: expect.stringContaining('already retrying'),
+				}),
+			);
+			expect(publishDispatchWakeUp).not.toHaveBeenCalled();
 		});
 
 		it('rejects with CONFLICT when the dispatch was claimed before the reopen landed', async () => {
@@ -3276,6 +3420,7 @@ describe('runsRouter', () => {
 					preservedWorker: null,
 					maxContinuations: null,
 					pendingRequest: null,
+					retryScheduled: null,
 				});
 			});
 		});

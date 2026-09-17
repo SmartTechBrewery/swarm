@@ -716,6 +716,26 @@ leases (failing the dispatch and its still-`running` run together), re-publishes
 lost wake-ups, and — once, at startup — imports legacy shapes (Redis
 pending-continuation entries, deferred runs with no active dispatch, and
 pre-#292 `not-ready` merge-follow-up intent) as durable dispatches.
+**That sweep is no longer the only thing that ends an abandoned claim** (issue
+#1017). A dispatch in `leased`/`running` is active, so the operator's "Retry now"
+found one and refused — "This run is already retrying" — for a claim whose worker
+lost the control plane mid-hand-off and never started the phase: true of a live
+worker, false of an abandoned claim, and indistinguishable from the row alone
+until the lease expired and the 5-minute sweep came round (~19 minutes, live on
+2026-09-16). `classifyDispatchClaim` (`src/dispatch/claim-liveness.ts`) is what
+tells them apart, from two facts the system already had rather than a new notion
+of staleness: the lease has lapsed, or the machine the claim is bound to has been
+silent past the shared `offlineSilenceMs` grace (`isWorkerConfirmedSilent`, moved
+there from `src/router/dispatch-cancellation.ts` so issue #827's settle and this
+share one definition). A stale claim is taken back in place — `pending`,
+`manual-retry`, attempt 0, every claim column cleared, exactly
+`deferDispatchToPending`'s transition — through a compare-and-set on
+`lease_expires_at` + `worker_session_id` + `worker_fencing_token`, so a claim that
+came alive in the window keeps it. A claim a live worker *is* holding is still
+refused, now with its own message rather than the retry one; and because the run
+row behind a reaped claim stays `deferred` with a `next_retry_at` nothing is
+waiting for, `runs.getById` reports `retryScheduled` so the detail page says "no
+retry is scheduled" and offers the controls instead of naming a time in the past.
 Merge automation is the one agent-less dispatch kind (issue #292): a
 `merge-automation` payload (dedup key `merge:<reviewRunId>`, linked to the
 approving Review run) skips triggers, worktrees, and project slots entirely —

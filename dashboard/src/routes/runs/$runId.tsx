@@ -1896,6 +1896,51 @@ function DeferredCallout({ run, onResetSuccess, nextRetryAt }: DeferredCalloutPr
 	);
 }
 
+/** {@link DeferredCalloutProps} minus the schedule — this callout is the "there isn't one" case. */
+type StrandedDeferredCalloutProps = Omit<DeferredCalloutProps, 'nextRetryAt'>;
+
+/**
+ * The `deferred` callout for a run nothing is going to retry (issue #1017).
+ *
+ * `nextRetryAt` is not cleared when the attempt behind it dies, so a run whose
+ * dispatch was reaped — an abandoned worker claim settled terminally by the
+ * lease-expiry sweep is how this happens — kept rendering
+ * {@link DeferredCallout}'s "automatic retry scheduled" against a time in the
+ * past, and a run with no `nextRetryAt` at all rendered nothing whatsoever: no
+ * heading, and none of the three controls that could move it. Both now say the
+ * same true thing, and carry the same buttons.
+ */
+function StrandedDeferredCallout({ run, onResetSuccess }: StrandedDeferredCalloutProps) {
+	return (
+		<div className="p-4 bg-amber-950/20 border border-amber-900/30 rounded flex items-start gap-3">
+			<AlertTriangle className="h-5 w-5 text-amber-500 shrink-0 mt-0.5" />
+			<div>
+				<h3 className="text-xs font-semibold text-amber-200">Deferred — no retry is scheduled</h3>
+				{run.error && (
+					<p className="text-xs text-amber-200/70 mt-1 font-mono whitespace-pre-wrap">
+						{normalizeRunError(run.error)}
+					</p>
+				)}
+				<p className="text-xs text-amber-200/70 mt-2">
+					The attempt this run was waiting on ended without scheduling another, so nothing will pick
+					it up on its own. Retry now starts it immediately.
+				</p>
+				{run.nextRetryAt && (
+					<p className="text-xs text-amber-200/70 mt-2 font-mono">
+						Last scheduled for {new Date(run.nextRetryAt).toLocaleString()} (
+						{new Date(run.nextRetryAt).toISOString()})
+					</p>
+				)}
+				<div className="flex flex-wrap items-start gap-3">
+					{canRetryRun(run.status) && <RetryNowButton run={run} />}
+					{canTerminateRun(run.status) && <TerminateRunButton run={run} />}
+					{canResetRun(run.status) && <ResetRunButton run={run} onResetSuccess={onResetSuccess} />}
+				</div>
+			</div>
+		</div>
+	);
+}
+
 interface PipelineFailureCalloutProps {
 	run: RunRow;
 	error: string;
@@ -1970,6 +2015,13 @@ function RunStatusCallout({ run, onResetSuccess }: RunStatusCalloutProps) {
 				<PipelineRunningCallout run={run} />
 			);
 		case 'deferred':
+			// `retryScheduled === false` is the server saying this run has no active
+			// dispatch (issue #1017) — its `nextRetryAt`, if any, is a time nothing is
+			// waiting for. `null`/absent keeps the pre-#1017 rendering, which is what an
+			// unreadable dispatch and an older server both report.
+			if (run.retryScheduled === false) {
+				return <StrandedDeferredCallout run={run} onResetSuccess={onResetSuccess} />;
+			}
 			return run.nextRetryAt ? (
 				<DeferredCallout run={run} onResetSuccess={onResetSuccess} nextRetryAt={run.nextRetryAt} />
 			) : null;

@@ -3,11 +3,13 @@ import { z } from 'zod';
 
 import type { ProjectConfig } from '../../config/schema.js';
 import {
+	type DispatchRow,
 	getActiveDispatchByRunId,
 	getDispatchById,
 	listActiveDispatchTaskRefs,
 	listWaitingDispatches,
 	reopenDispatchForManualRetry,
+	takeOverStaleDispatchForManualRetry,
 	WAITING_DISPATCH_STATES,
 } from '../../db/repositories/dispatchesRepository.js';
 import {
@@ -34,6 +36,7 @@ import {
 	recordStalledDismissal,
 } from '../../db/repositories/stalledDismissalsRepository.js';
 import { getUserById } from '../../db/repositories/usersRepository.js';
+import { classifyDispatchClaim } from '../../dispatch/claim-liveness.js';
 import {
 	cancelDispatchAndWake,
 	createAndPublishDispatch,
@@ -381,10 +384,70 @@ const FORCE_RE_REVIEW_REFUSAL_CODES: Record<ForceReReviewRefusal, TRPCError['cod
 	'missing-review-record': 'PRECONDITION_FAILED',
 };
 
+/**
+ * Re-open this run's own active dispatch for an immediate manual attempt, in
+ * whichever of the two ways its current claim allows (issue #1017).
+ *
+ * The classification is the whole point. `getActiveDispatchByRunId` answers over
+ * `ACTIVE_DISPATCH_STATES`, but only the two *waiting* ones were ever
+ * re-openable, so a dispatch in `leased`/`running` fell through to a refusal —
+ * correct for a claim a worker is honouring and flatly wrong for one abandoned
+ * mid-hand-off, which is the shape that stranded a run for the whole lease window
+ * and then some. `classifyDispatchClaim` (`../../dispatch/claim-liveness.ts`) is
+ * what tells the two apart; the abandoned one is taken back here instead of waiting
+ * for the lease-expiry sweep to reach the same verdict.
+ *
+ * Both writes are conditional on the facts the classification was made against — a
+ * still-waiting state for one, the unchanged claim columns for the other — so a
+ * claim that came alive in the window between keeps it, and the caller's
+ * {@link alreadyRetrying} reports the lost race rather than a second attempt
+ * starting.
+ *
+ * Throws {@link workerRunningPhase} for the one claim that must not be taken;
+ * returns `null` when the conditional write found the row already moved.
+ */
+async function reopenActiveDispatchForRetry(
+	active: DispatchRow,
+	job: SwarmJob,
+): Promise<DispatchRow | null> {
+	const claim = await classifyDispatchClaim(active);
+	if (claim === 'executing') throw workerRunningPhase();
+	return claim === 'stale'
+		? takeOverStaleDispatchForManualRetry(active.id, job, active)
+		: reopenDispatchForManualRetry(active.id, job);
+}
+
+/**
+ * The retry lost a race — something else moved this run's dispatch between the
+ * read that judged it retryable and the conditional write that would have
+ * re-opened it (a double-click, a concurrent retry taking the unique active-run
+ * index, or the automatic pickup getting there first).
+ *
+ * Deliberately **not** the refusal for a dispatch a worker holds (issue #1017):
+ * the two used to share this message, so an operator whose run was stranded
+ * behind an abandoned claim was told to wait for a retry that was never going to
+ * arrive. {@link workerRunningPhase} is that case's own message now, and neither
+ * is reachable for a claim no live worker is honouring — that one is taken over
+ * and retried.
+ */
 function alreadyRetrying(): TRPCError {
 	return new TRPCError({
 		code: 'CONFLICT',
 		message: 'This run is already retrying. Refresh to see its current status.',
+	});
+}
+
+/**
+ * A worker holds an unexpired claim on this run's dispatch and is not silent
+ * (issue #1017), so the phase may genuinely be executing there — or be one round
+ * trip from reporting its result. Retrying would run it twice, so it is refused,
+ * and the message names the actual obstacle and the lever that clears it.
+ */
+function workerRunningPhase(): TRPCError {
+	return new TRPCError({
+		code: 'CONFLICT',
+		message:
+			'A worker is running this phase right now. Terminate the run first if you need to start it over.',
 	});
 }
 
@@ -796,6 +859,36 @@ async function resolvePendingRunRequest(run: {
 }
 
 /**
+ * Whether a `deferred` run still has something that will fire its retry
+ * (issue #1017) — `null` for every other status, which has no scheduled retry to
+ * describe.
+ *
+ * A deferred run's `nextRetryAt` records *when* its attempt was meant to land; it
+ * is never cleared when the attempt behind it dies. So a run whose dispatch settled
+ * terminally — the lease-expiry sweep reaping an abandoned claim is the way this
+ * happens — keeps a timestamp that reads as "waiting", while in fact nothing is
+ * queued and the row will not move until an operator moves it. The dispatch table
+ * is the only place that distinction exists, so the detail view is told the answer
+ * rather than left to infer it from a time in the past.
+ *
+ * Its own read, and its own soft failure: a dispatch read that throws must show the
+ * run as it always did (the scheduled-retry callout) rather than claim, wrongly,
+ * that nothing is coming.
+ */
+async function resolveRetryScheduled(run: { id: string; status: string }): Promise<boolean | null> {
+	if (run.status !== 'deferred') return null;
+	try {
+		return (await getActiveDispatchByRunId(run.id)) !== undefined;
+	} catch (error) {
+		logger.warn('runs.getById: retry-schedule lookup failed; reporting no verdict', {
+			runId: run.id,
+			error: describeError(error),
+		});
+		return null;
+	}
+}
+
+/**
  * The two project policies the liveness classification consults, read exactly as
  * the pipeline itself reads them (issue #840): Planning's `autoAdvance` is off
  * unless set (`DEFAULT_AUTO_ADVANCE`, `src/pipeline/planning.ts`) and merge
@@ -1009,15 +1102,17 @@ export const runsRouter = router({
 	// of the run's project (existence hidden with identical run-not-found message).
 	// The row is returned as-is — including the persisted Tier 2 `checkpoint` and
 	// `continuationCount` (issue #503) the detail page's checkpoint panel renders —
-	// plus four additive, server-resolved fields: an `attribution` object resolving
+	// plus five additive, server-resolved fields: an `attribution` object resolving
 	// the recorded worker/user to display labels (issue #446), the
 	// `maxContinuations` ceiling that count reads against (issue #504), the
 	// `pendingRequest` naming an accepted Terminate/Reset request that hasn't taken
 	// effect yet (issue #561 — the Redis cancellation marker for a `running` run, the
-	// run's waiting `manual-retry` dispatch otherwise), and the `preservedWorker`
+	// run's waiting `manual-retry` dispatch otherwise), the `preservedWorker`
 	// naming the machine that holds (or has had discarded) this run's preserved
-	// checkout (issue #567). All four are looked up only after the access check, so a
-	// non-member never triggers an identity, project, or queue read.
+	// checkout (issue #567), and `retryScheduled`, which tells a `deferred` run's
+	// callout whether its `nextRetryAt` is still backed by a dispatch (issue #1017).
+	// All five are looked up only after the access check, so a non-member never
+	// triggers an identity, project, or queue read.
 	getById: authedProcedure
 		.input(z.object({ id: z.string().min(1) }))
 		.query(async ({ ctx, input }) => {
@@ -1040,6 +1135,7 @@ export const runsRouter = router({
 				maxContinuations: await resolveContinuationBudget(run),
 				pendingRequest: await resolvePendingRunRequest(run),
 				preservedWorker: await resolveRunPreservedWorker(run),
+				retryScheduled: await resolveRetryScheduled(run),
 			};
 		}),
 
@@ -1098,10 +1194,21 @@ export const runsRouter = router({
 	//     overrides folded in and the dispatch is atomically re-opened for an
 	//     immediate attempt (`reopenDispatchForManualRetry`); losing that
 	//     conditional update to a concurrent pickup returns CONFLICT.
+	//  1b. The run's dispatch is `leased`/`running` but **nothing is honouring
+	//     that claim** (issue #1017) — its lease has lapsed, or the machine it is
+	//     bound to has been silent past the shared grace
+	//     (`../../dispatch/claim-liveness.ts`). That is the same verdict the
+	//     lease-expiry sweep would reach minutes later, so the claim is taken back
+	//     here (`takeOverStaleDispatchForManualRetry`, a compare-and-set on the
+	//     claim columns) and the retry proceeds as in 1. A claim a live worker
+	//     *is* holding is still refused — with its own message, not this path's.
 	//  2. No active dispatch (a terminally `failed` run, or a legacy row whose
 	//     retry intent was lost) — reconstruct from the run's stored
 	//     `jobPayload` and create a fresh dispatch. The one-active-dispatch-per-
-	//     run unique index turns a double-click into CONFLICT, not two runs.
+	//     run unique index turns a double-click into CONFLICT, not two runs. A
+	//     `deferred` run in this shape is the stranded one issue #1017 also
+	//     surfaces in the dashboard (`retryScheduled` on `getById`): nothing is
+	//     scheduled for it, and this is the button that moves it.
 	//
 	// Cap-bypass: every path resets `rateLimitRetryAttempt` to 0, so a manual
 	// retry always gets a fresh budget — including a run whose next *automatic*
@@ -1194,7 +1301,7 @@ export const runsRouter = router({
 					recoveryMode,
 					run.recovery?.agentSessionId ?? run.agentSessionId,
 				);
-				const reopened = await reopenDispatchForManualRetry(active.id, job);
+				const reopened = await reopenActiveDispatchForRetry(active, job);
 				if (!reopened) throw alreadyRetrying();
 				try {
 					await publishDispatchWakeUp(reopened);

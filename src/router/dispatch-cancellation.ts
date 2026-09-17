@@ -33,13 +33,16 @@
  * `/worker/stream` close (`./worker-transport.ts`), while a phase runs independently
  * of the heartbeat loop and so routinely outlives the session it was pushed on
  * (`../transport/worker-client.ts`, issue #718). What does carry information is
- * **silence**: the retained session row survives release, and its `lastHeartbeatAt`
- * is the worker's *last seen*. A daemon that is up heartbeats every third of the
- * TTL and climbs a reconnect ladder capped at a jittered 30s, so a worker that has
- * said nothing for longer than {@link offlineSilenceMs} is one nothing was going to
- * settle this run for, and it is settled `SWARM_OFFLINE_WORKER_CANCEL_TIMEOUT_MS`
- * later instead. That remains a **heuristic about liveness, not proof the phase
- * stopped** — which is why the same test is re-run when the timer fires, and why a
+ * **silence** — {@link isWorkerConfirmedSilent}, which lives in
+ * `../dispatch/claim-liveness.ts` since issue #1017 gave the manual retry's
+ * stale-claim take-over the same question to answer. The retained session row
+ * survives release, and its `lastHeartbeatAt` is the worker's *last seen*. A daemon
+ * that is up heartbeats every third of the TTL and climbs a reconnect ladder capped
+ * at a jittered 30s, so a worker that has said nothing for longer than that grace is
+ * one nothing was going to settle this run for, and it is settled
+ * `SWARM_OFFLINE_WORKER_CANCEL_TIMEOUT_MS` later instead. That remains a **heuristic
+ * about liveness, not proof the phase stopped** — which is why the same test is
+ * re-run when the timer fires, and why a
  * worker that comes back inside the wait is handed the cancellation (issue #724's
  * path) rather than settled behind its back. A worker that comes back when no wait
  * was ever armed — the socket dropped, the terminate landed while its heartbeat was
@@ -52,11 +55,7 @@
  * was settled by hand in Postgres.
  */
 
-import {
-	getLiveSessionForWorker,
-	getRetainedSessionForWorker,
-	resolveHeartbeatTtlMs,
-} from '../identity/worker-session-service.js';
+import { isWorkerConfirmedSilent } from '../dispatch/claim-liveness.js';
 import { optionalEnv } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
@@ -72,7 +71,6 @@ import {
 	resolveDispatchTargetForRun,
 } from './dispatch-results.js';
 import { sendToWorker } from './worker-connections.js';
-import { offlineSilenceMs } from './worker-liveness.js';
 
 /**
  * The `reason` carried on the pushed frame. It is for the daemon's log only — the
@@ -110,31 +108,6 @@ export function resolveOfflineWorkerCancelTimeoutMs(
 
 /** Resolved once (validates the env var at load), like the sibling dispatch timeouts. */
 const OFFLINE_WORKER_CANCEL_TIMEOUT_MS = resolveOfflineWorkerCancelTimeoutMs();
-
-/**
- * Whether the worker has been silent long enough that nothing is going to report
- * this dispatch's result (issue #827).
- *
- * Deliberately *not* "has no live session": `releaseSession` runs on every
- * `/worker/stream` close (`./worker-transport.ts`), so `getLiveSessionForWorker`
- * answers `undefined` the instant a socket drops — for a worker whose phase is
- * still executing just as much as for a dead one. The retained row is what
- * distinguishes them: it survives release precisely so `lastHeartbeatAt` can be
- * read as *last seen* (`getRetainedSessionForWorker`), and only a worker silent
- * past {@link offlineSilenceMs} qualifies. A worker that never handshook here at
- * all has no silence to measure and never qualifies either.
- *
- * This is a liveness heuristic, not proof the phase stopped — so it is re-run
- * before anything is settled, and it fails *safe*: an unreadable row throws to the
- * caller, which leaves the wait to the lease window exactly as before.
- */
-async function isWorkerConfirmedSilent(workerId: string): Promise<boolean> {
-	const ttlMs = resolveHeartbeatTtlMs();
-	if (await getLiveSessionForWorker(workerId, ttlMs)) return false;
-	const retained = await getRetainedSessionForWorker(workerId);
-	if (!retained) return false;
-	return Date.now() - retained.lastHeartbeatAt.getTime() >= offlineSilenceMs(ttlMs);
-}
 
 /**
  * Bound the wait for a termination that could not be pushed, but only for a worker
@@ -296,7 +269,7 @@ export function cancelRunOnWorker(runId: string): boolean {
  * (issue #827 review).
  *
  * The silence wait above only re-pushes from a timer it armed, and it arms one only
- * for a worker that was *already* silent past {@link offlineSilenceMs} when the
+ * for a worker that was *already* silent past that same grace when the
  * termination arrived. The common case is the opposite order: the socket drops, the
  * operator terminates seconds later, the push fails against a worker whose retained
  * heartbeat is still fresh — so nothing is armed — and the daemon reconnects a
