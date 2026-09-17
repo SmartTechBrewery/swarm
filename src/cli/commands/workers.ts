@@ -285,8 +285,11 @@ Usage:
              failed). A machine that reports failed, refused or declined, or that
              applies and never comes back, HALTS the rollout: nothing further is
              drained or signalled, the reason is recorded, and the untouched
-             machines stay in the pool. A halted rollout is final — fix the build
-             and start a new one; there is no resume and no cancel. --status prints
+             machines stay in the pool. A machine the rollout had already
+             committed to keeps being settled on the advances that follow and
+             returns to the pool once it settles without failing; only the one
+             that failed is left drained. A halted rollout is final — fix the
+             build and start a new one; there is no resume and no cancel. --status prints
              the same table without advancing anything. One rollout at a time per
              operator: asking for a different ref while one is under way is refused
              rather than re-targeting a fleet mid-move.
@@ -659,6 +662,16 @@ const ROLLOUT_MEMBER_STATES = [
 	'skipped',
 	'failed',
 ];
+
+/**
+ * The subset of those in which the rollout has **committed** to a machine — taken it
+ * out of the pool for a wave and not yet settled it. Restated here for the same
+ * reason the list above is, and read for one sentence only: what a halt leaves those
+ * machines doing (issue #1023). A state this build has never heard of is deliberately
+ * not counted, so a newer control plane's vocabulary can only under-report the
+ * sentence, never invent it.
+ */
+const COMMITTED_ROLLOUT_MEMBER_STATES = ['draining', 'signalled', 'verifying'];
 
 const StoredScmCredentialSchema = z.object({ login: z.string().min(1) });
 const ProjectScmProviderSchema = z.object({ providerId: z.string().min(1) });
@@ -1648,20 +1661,7 @@ function printRollout(rollout: Rollout, action?: string): void {
 	}
 	out.info(summariseRollout(rollout.members));
 	if (rollout.status === 'halted') {
-		out.info(`  halted: ${rollout.haltReason ?? 'no reason recorded'}`);
-		out.info(
-			'  no further machine is drained or signalled. Fix the build, then start a new fleet update — there is no resume.',
-		);
-		// A machine that failed is left out of the pool on purpose, so the undrain that
-		// ends that is named here rather than left to be remembered.
-		const failed = rollout.members.filter((member) => member.state === 'failed');
-		if (failed.length > 0) {
-			out.info(
-				`  left drained so you can look at ${failed.length === 1 ? 'it' : 'them'}: ${failed
-					.map((member) => `swarm workers undrain ${member.workerId}`)
-					.join('; ')}`,
-			);
-		}
+		printHaltFooter(rollout);
 		return;
 	}
 	if (rollout.status === 'completed') {
@@ -1673,6 +1673,43 @@ function printRollout(rollout: Rollout, action?: string): void {
 	out.info(
 		`  it advances on its own from here — read it with 'swarm workers update --status', or re-run 'swarm workers update --all ${rollout.target}' to nudge and read it`,
 	);
+}
+
+/**
+ * What a halt leaves, in the three sentences an operator acts on: why it stopped, that
+ * it is final, what is still moving, and what is left drained for them to look at.
+ *
+ * Its own function so the three cases read side by side, and so `printRollout` stays a
+ * heading, a table and a tally.
+ */
+function printHaltFooter(rollout: Rollout): void {
+	out.info(`  halted: ${rollout.haltReason ?? 'no reason recorded'}`);
+	out.info(
+		'  no further machine is drained or signalled. Fix the build, then start a new fleet update — there is no resume.',
+	);
+	// The machines the halt caught mid-move are not stuck: the rollout goes on
+	// advancing until each has an answer (issue #1023), and each that settles without
+	// failing goes back in the pool by itself. Said here because the two outcomes above
+	// — untouched, or failed — are otherwise read as the only two.
+	const committed = rollout.members.filter((member) =>
+		COMMITTED_ROLLOUT_MEMBER_STATES.includes(member.state),
+	);
+	if (committed.length > 0) {
+		const machines = committed.length === 1 ? '1 machine' : `${committed.length} machines`;
+		out.info(
+			`  still settling ${machines} the rollout had already committed to; each returns to the pool once it settles without failing`,
+		);
+	}
+	// A machine that failed is left out of the pool on purpose, so the undrain that ends
+	// that is named here rather than left to be remembered.
+	const failed = rollout.members.filter((member) => member.state === 'failed');
+	if (failed.length > 0) {
+		out.info(
+			`  left drained so you can look at ${failed.length === 1 ? 'it' : 'them'}: ${failed
+				.map((member) => `swarm workers undrain ${member.workerId}`)
+				.join('; ')}`,
+		);
+	}
 }
 
 /** The rollout status in the words an operator reads it in, not the stored token. */

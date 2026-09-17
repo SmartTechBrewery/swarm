@@ -37,11 +37,14 @@
  * again, so a machine it had drained stayed out of the dispatch pool for good.
  * {@link findInProgressRolloutForOwner} deliberately keeps the narrower meaning: it
  * answers "is one already moving", and a halted rollout must not block a new one.
+ * That in turn is what lets two of an operator's rollouts hold the same machine at
+ * once, which {@link findRolloutHoldElsewhere} is the read for.
  */
 
-import { and, asc, desc, eq, exists, notInArray, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, exists, inArray, ne, notInArray, or, sql } from 'drizzle-orm';
 
 import {
+	COMMITTED_WORKER_UPDATE_ROLLOUT_MEMBER_STATES,
 	SETTLED_WORKER_UPDATE_ROLLOUT_MEMBER_STATES,
 	type WorkerUpdateRollout,
 	type WorkerUpdateRolloutMember,
@@ -259,6 +262,58 @@ export async function listAdvanceableRolloutsForOwner(
 		.where(and(eq(workerUpdateRollouts.requestedByUserId, ownerUserId), advanceableRollout()))
 		.orderBy(asc(workerUpdateRollouts.createdAt), asc(workerUpdateRollouts.id));
 	return rows.map(rowToRollout);
+}
+
+/**
+ * Another rollout's live claim on one machine — see {@link findRolloutHoldElsewhere}.
+ */
+export interface RolloutHold {
+	/** Whether that other rollout is the one that took the machine out of the pool. */
+	drainedByRollout: boolean;
+}
+
+/**
+ * Whether a rollout *other than* `excludeRolloutId` has committed to this machine and
+ * not yet settled it — and if so, whether that rollout is the one holding its drain.
+ *
+ * Only exists because a halted rollout is advanceable again since issue #1023: the
+ * operator's next rollout is created while the halted one is still settling the
+ * members it had committed to, and the two then overlap on the same machines — the
+ * very thing the partial unique index prevents between two *live* rollouts. Without
+ * this read the halted rollout's member settles `skipped` (its machine's request id
+ * has moved on to the newer rollout's) and puts the machine straight back in the
+ * dispatch pool while the newer rollout has it mid-update.
+ *
+ * `queued` members are not holds: the rollout has not reached them, nothing was
+ * drained for them, and nothing is owed on them — the same line `takeNextWave` draws
+ * between "in flight" and "not reached yet". Settled members are not holds either,
+ * which is what makes the answer drop back to `undefined` by itself as the older
+ * rollout finishes.
+ *
+ * Answers with the **strongest** hold when there are several: if any of them took the
+ * machine out of the pool, the drain is a rollout's to hand on rather than the
+ * operator's to keep. Served by `idx_worker_update_rollout_members_worker`.
+ */
+export async function findRolloutHoldElsewhere(
+	workerId: string,
+	excludeRolloutId: string,
+): Promise<RolloutHold | undefined> {
+	const rows = await getDb()
+		.select({ drainedByRollout: workerUpdateRolloutMembers.drainedByRollout })
+		.from(workerUpdateRolloutMembers)
+		.where(
+			and(
+				eq(workerUpdateRolloutMembers.workerId, workerId),
+				ne(workerUpdateRolloutMembers.rolloutId, excludeRolloutId),
+				inArray(workerUpdateRolloutMembers.state, [
+					...COMMITTED_WORKER_UPDATE_ROLLOUT_MEMBER_STATES,
+				]),
+			),
+		)
+		.orderBy(desc(workerUpdateRolloutMembers.drainedByRollout))
+		.limit(1);
+	const row = rows[0];
+	return row ? { drainedByRollout: row.drainedByRollout } : undefined;
 }
 
 /** One rollout and its members, unlocked — the read behind the status surfaces. */

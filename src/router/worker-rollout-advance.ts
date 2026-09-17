@@ -111,14 +111,26 @@ export async function advanceRolloutForWorker(workerId: string): Promise<boolean
 
 	let advanced = false;
 	for (const rollout of rollouts) {
-		const view = await advanceRollout(rollout.id);
-		logger.info('fleet update: advanced a rollout on a worker event', {
-			workerId,
-			rolloutId: rollout.id,
-			target: rollout.target,
-			status: view?.rollout.status ?? rollout.status,
-		});
-		advanced ||= view !== undefined;
+		// Each rollout is advanced on its own, exactly as the sweep below does it: the
+		// list is ordered oldest first, so a halted rollout that keeps failing to
+		// advance would otherwise cost the owner's *live* rollout every one of its
+		// event-driven advances and leave it waiting on the tick instead.
+		try {
+			const view = await advanceRollout(rollout.id);
+			logger.info('fleet update: advanced a rollout on a worker event', {
+				workerId,
+				rolloutId: rollout.id,
+				target: rollout.target,
+				status: view?.rollout.status ?? rollout.status,
+			});
+			advanced ||= view !== undefined;
+		} catch (err) {
+			logger.warn('fleet update: advancing a rollout on a worker event failed — continuing', {
+				workerId,
+				rolloutId: rollout.id,
+				error: describeError(err),
+			});
+		}
 	}
 	return advanced;
 }
@@ -129,7 +141,9 @@ export async function advanceRolloutForWorker(workerId: string): Promise<boolean
  * The fire-and-forget wrapper the event hooks are wired to — `void` out, every
  * failure caught and logged — so neither an update report nor a handshake can be
  * failed by a rollout. A missed advance costs latency and nothing else: the next
- * event, or the tick below, re-decides the whole thing from durable state.
+ * event, or the tick below, re-decides the whole thing from durable state. And it
+ * costs it to the one rollout that missed it — the loop above catches per rollout,
+ * so this outer catch is left only whatever failed before the list was read.
  */
 export function advanceWorkerRollout(workerId: string): void {
 	void advanceRolloutForWorker(workerId).catch((err) => {

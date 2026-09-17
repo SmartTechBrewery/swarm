@@ -100,6 +100,30 @@ export function isSettledMemberState(state: WorkerUpdateRolloutMemberState): boo
 }
 
 /**
+ * The member states in which the rollout has **committed** to the machine — taken it
+ * into a wave and not yet settled it. A `queued` member is neither: it is not reached
+ * yet, nothing was drained for it, and nothing is owed on it.
+ *
+ * Exported as a list for the same reason the settled one is: the repository's
+ * "does another rollout still hold this machine" read has to express the same set in
+ * SQL (issue #1023) and must not restate it.
+ */
+export const COMMITTED_WORKER_UPDATE_ROLLOUT_MEMBER_STATES = [
+	'draining',
+	'signalled',
+	'verifying',
+] as const satisfies readonly WorkerUpdateRolloutMemberState[];
+
+const COMMITTED_MEMBER_STATES = new Set<WorkerUpdateRolloutMemberState>(
+	COMMITTED_WORKER_UPDATE_ROLLOUT_MEMBER_STATES,
+);
+
+/** Whether the rollout has taken this machine into a wave and still owes it an answer. */
+export function isCommittedMemberState(state: WorkerUpdateRolloutMemberState): boolean {
+	return COMMITTED_MEMBER_STATES.has(state);
+}
+
+/**
  * The reported outcomes that halt a rollout. `failed` and `refused` are the machine
  * saying the move did not happen; `declined` is the legacy answer from a machine
  * still on a build predating issue #975, whose host had not set the per-host opt-in

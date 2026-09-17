@@ -144,6 +144,24 @@ describe('advanceRolloutForWorker', () => {
 
 		await expect(advanceRolloutForWorker(WORKER_ID)).resolves.toBe(false);
 	});
+
+	// Per-rollout isolation, exactly as the sweep has it. The list is oldest first, so
+	// the halted rollout is advanced before the live one — and a halted rollout that
+	// kept failing must not cost the live one every event-driven advance it has.
+	it('carries on to the operator’s other rollouts past one that failed', async () => {
+		const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+		listAdvanceableRolloutsForOwner.mockResolvedValue([
+			makeRollout({ id: OTHER_ROLLOUT_ID, status: 'halted', haltReason: 'build was bad' }),
+			makeRollout(),
+		]);
+		advanceRollout.mockRejectedValueOnce(new Error('settle write failed'));
+
+		await expect(advanceRolloutForWorker(WORKER_ID)).resolves.toBe(true);
+
+		expect(advanceRollout).toHaveBeenCalledWith(ROLLOUT_ID);
+		expect(warnSpy).toHaveBeenCalled();
+		warnSpy.mockRestore();
+	});
 });
 
 describe('advanceWorkerRollout', () => {

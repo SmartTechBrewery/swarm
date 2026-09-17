@@ -157,5 +157,13 @@ export const workerUpdateRolloutMembers = pgTable(
 		primaryKey({ columns: [table.rolloutId, table.workerId] }),
 		// Every read is "this rollout's members, in order".
 		index('idx_worker_update_rollout_members_order').on(table.rolloutId, table.position),
+		// …every read but one (issue #1023): "does another rollout still hold this
+		// machine", asked when a member is taken into a wave and when one settles, so
+		// two rollouts over the same machine hand the drain over rather than undraining
+		// it out from under each other. The primary key leads with `rollout_id` and so
+		// cannot serve a `worker_id` search, which would otherwise be a scan growing
+		// with the whole rollout history. The per-event trigger path deliberately does
+		// *not* use this — it still resolves rollouts through the machine's owner.
+		index('idx_worker_update_rollout_members_worker').on(table.workerId),
 	],
 );

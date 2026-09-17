@@ -48,6 +48,7 @@ import {
 	createRollout,
 	findInProgressRolloutForOwner,
 	findLatestRolloutForOwner,
+	findRolloutHoldElsewhere,
 	type MemberPatch,
 	type RolloutWriter,
 	readRollout,
@@ -58,6 +59,7 @@ import { getWorkers, listWorkersForOwner, setWorkerDraining } from '../identity/
 import { getLiveSessionForWorker, type WorkerSession } from '../identity/worker-session-service.js';
 import {
 	DEFAULT_ROLLOUT_WAVE_SIZE,
+	isCommittedMemberState,
 	isHaltingUpdateStatus,
 	isRestartingUpdateStatus,
 	isSettledMemberState,
@@ -109,10 +111,15 @@ export interface RolloutView {
  *   advanced it. Asking for the build a rollout is already moving to must never be an
  *   error: it is how an operator nudges and reads one, even though since issue #941
  *   the rollout no longer needs the nudge to finish.
- * - `conflict` — one is in progress for a **different** target. Two rollouts over
- *   the same machines would drain and undrain each other's members, so this is
+ * - `conflict` — one is in progress for a **different** target. Two *live* rollouts
+ *   over the same machines would drain and undrain each other's members, so this is
  *   refused naming the status command rather than silently re-targeting a fleet
- *   mid-move.
+ *   mid-move. A **halted** rollout never refuses one, by design — starting a new
+ *   rollout is the documented way past a halt — so since issue #1023, when it goes on
+ *   advancing to settle what it had committed to, the two do overlap on the same
+ *   machines. That overlap is bounded instead of refused: a machine is held by at
+ *   most one of them, the drain is handed on rather than undrained under the other
+ *   (`ownsTheDrain` / `returnToPool`), and the halted one signals nothing further.
  * - `no-machines` — the caller operates none, so there is nothing to roll out and
  *   no rollout is recorded. An honest empty answer, not an error, exactly as
  *   `requestUpdateForMine` answers an operator with no machines.
@@ -519,9 +526,7 @@ class AdvancePass {
 		// "In flight" is the wave the rollout has actually committed to — a `queued`
 		// member is neither settled nor in flight, it is simply not reached yet, so it
 		// must not count as a reason to hold the next wave back.
-		const inFlight = this.members.filter(
-			(member) => !isSettledMemberState(member.state) && member.state !== 'queued',
-		);
+		const inFlight = this.members.filter((member) => isCommittedMemberState(member.state));
 		const draining = inFlight.filter((member) => member.state === 'draining');
 		if (inFlight.length > 0) return draining;
 		for (const member of this.members
@@ -535,11 +540,34 @@ class AdvancePass {
 			// never be asked again — the machine is draining now because *this* rollout
 			// drained it — so the answer has to be durable from the instant it is reached.
 			await this.apply(member, {
-				patch: { state: 'draining', drainedByRollout: worker.drainingSince === null },
+				patch: {
+					state: 'draining',
+					drainedByRollout: await this.ownsTheDrain(member.workerId, worker),
+				},
 			});
 			draining.push(member);
 		}
 		return draining;
+	}
+
+	/**
+	 * Whether the drain this member is about to take over is the rollout's to give
+	 * back — the durable answer `drainedByRollout` records.
+	 *
+	 * A machine still in the pool is plainly the rollout's own to drain and to return.
+	 * A machine already drained is the operator's, *unless* another rollout is holding
+	 * it (issue #1023): since a halted rollout goes on settling its committed members,
+	 * the operator's replacement rollout routinely takes a machine the halted one still
+	 * has drained. The drain is then handed **on** rather than dropped — the older
+	 * rollout stops short of undraining it in {@link returnToPool}, and this rollout
+	 * records that putting it back is now its job. Without the hand-off the machine
+	 * would be stranded out of the pool by whichever rollout settles last, which is
+	 * precisely the stranding issue #1023 exists to end.
+	 */
+	private async ownsTheDrain(workerId: string, worker: Worker): Promise<boolean> {
+		if (worker.drainingSince === null) return true;
+		const held = await findRolloutHoldElsewhere(workerId, this.rollout.id);
+		return held?.drainedByRollout === true;
 	}
 
 	/**
@@ -751,9 +779,24 @@ class AdvancePass {
 	 * needs to look at before it is given work again, so it stays out of the pool until
 	 * they run `swarm workers undrain` themselves. That is verbatim what issue #933's
 	 * single-machine form already leaves them to do.
+	 *
+	 * **Not while another rollout holds the machine** (issue #1023). A halted rollout
+	 * goes on settling the members it had committed to, so it is routinely still
+	 * holding a machine the operator's replacement rollout has already drained,
+	 * signalled and is waiting on — and its member then settles `skipped`, because the
+	 * machine's `workers.update` row carries the *newer* rollout's request id, which is
+	 * exactly the settlement that would hand a machine mid-update back to the
+	 * dispatcher. The newer rollout cannot repair that: it re-asserts its drain over
+	 * `draining` members only, and by then its member is `signalled` or `verifying`.
+	 * So the drain is left to whoever now holds it, which {@link ownsTheDrain} has
+	 * already made that rollout's own to give back. The two together are what keeps
+	 * "at most `waveSize` machines are out of the pool, and each is verified before the
+	 * next wave moves" true across two overlapping rollouts.
 	 */
 	private async returnToPool(member: WorkerUpdateRolloutMember): Promise<void> {
 		if (!member.drainedByRollout) return;
+		const held = await findRolloutHoldElsewhere(member.workerId, this.rollout.id);
+		if (held) return;
 		const worker = await setWorkerDraining(member.workerId, false);
 		if (worker) this.workers.set(member.workerId, worker);
 	}

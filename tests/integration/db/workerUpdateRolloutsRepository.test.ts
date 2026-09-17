@@ -6,6 +6,7 @@ import {
 	advanceUnderRolloutLock,
 	createRollout,
 	findInProgressRolloutForOwner,
+	findRolloutHoldElsewhere,
 	listAdvanceableRollouts,
 	listAdvanceableRolloutsForOwner,
 } from '../../../src/db/repositories/workerUpdateRolloutsRepository.js';
@@ -155,6 +156,78 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 			await givenRollout(adaId, adaWorkerId, 'halted', ['verifying']);
 
 			expect(await findInProgressRolloutForOwner(adaId)).toBeUndefined();
+		});
+
+		/**
+		 * The other half of issue #1023, and the reason it needed one: because a halted
+		 * rollout no longer blocks its owner's next one *and* now goes on advancing, two
+		 * of an operator's rollouts routinely hold the same machine. The drain is then
+		 * handed between them rather than undrained under whichever is still using it,
+		 * which rests entirely on this read answering "does anyone else still hold it".
+		 */
+		describe('findRolloutHoldElsewhere', () => {
+			it('answers undefined when no other rollout has the machine', async () => {
+				const only = await givenRollout(adaId, adaWorkerId, 'halted', ['signalled']);
+
+				expect(await findRolloutHoldElsewhere(adaWorkerId, only)).toBeUndefined();
+			});
+
+			it('finds the hold of a rollout that has committed to the machine', async () => {
+				const older = await givenRollout(adaId, adaWorkerId, 'halted', ['signalled']);
+				const newer = await givenRollout(adaId, adaWorkerId, 'in_progress', ['draining']);
+
+				expect(await findRolloutHoldElsewhere(adaWorkerId, newer)).toEqual({
+					drainedByRollout: false,
+				});
+				expect(await findRolloutHoldElsewhere(adaWorkerId, older)).toEqual({
+					drainedByRollout: false,
+				});
+			});
+
+			// The hand-off's own question: whoever settles last must know the drain is a
+			// rollout's to give back rather than the operator's to keep.
+			it('reports a hold that took the machine out of the pool itself', async () => {
+				const older = await createRollout({
+					requestedByUserId: adaId,
+					target: 'main',
+					waveSize: 1,
+					workerIds: [adaWorkerId],
+				});
+				await advanceUnderRolloutLock(older.rollout.id, async (_loaded, write) => {
+					await write.setMember(adaWorkerId, { state: 'signalled', drainedByRollout: true });
+					await write.setStatus('halted', 'the build was bad');
+				});
+				const newer = await givenRollout(adaId, adaWorkerId, 'in_progress', ['draining']);
+
+				expect(await findRolloutHoldElsewhere(adaWorkerId, newer)).toEqual({
+					drainedByRollout: true,
+				});
+			});
+
+			// A `queued` member is not a hold: the rollout has not reached it, drained
+			// nothing for it and owes nothing on it — the same line `takeNextWave` draws.
+			it('ignores a rollout that has only queued the machine', async () => {
+				const older = await givenRollout(adaId, adaWorkerId, 'halted', ['signalled']);
+				await givenRollout(adaId, adaWorkerId, 'in_progress', ['queued']);
+
+				expect(await findRolloutHoldElsewhere(adaWorkerId, older)).toBeUndefined();
+			});
+
+			// And a settled one is not a hold either, which is what makes the answer fall
+			// back to undefined by itself as the other rollout finishes.
+			it('ignores a rollout that has settled the machine', async () => {
+				const older = await givenRollout(adaId, adaWorkerId, 'halted', ['signalled']);
+				await givenRollout(adaId, adaWorkerId, 'in_progress', ['draining', 'done']);
+
+				expect(await findRolloutHoldElsewhere(adaWorkerId, older)).toBeUndefined();
+			});
+
+			it('never answers with another machine’s hold', async () => {
+				const adaRollout = await givenRollout(adaId, adaWorkerId, 'halted', ['signalled']);
+				await givenRollout(graceId, graceWorkerId, 'in_progress', ['draining']);
+
+				expect(await findRolloutHoldElsewhere(adaWorkerId, adaRollout)).toBeUndefined();
+			});
 		});
 	},
 );
