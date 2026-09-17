@@ -78,12 +78,21 @@ export const WORKER_UPDATE_ROLLOUT_MEMBER_STATES = [
 export const WorkerUpdateRolloutMemberStateSchema = z.enum(WORKER_UPDATE_ROLLOUT_MEMBER_STATES);
 export type WorkerUpdateRolloutMemberState = z.infer<typeof WorkerUpdateRolloutMemberStateSchema>;
 
-/** The member states the rollout is finished with — the complement of "still waiting". */
-const SETTLED_MEMBER_STATES = new Set<WorkerUpdateRolloutMemberState>([
+/**
+ * The member states the rollout is finished with — the complement of "still
+ * waiting". Exported as a list, and not only through the predicate below, because
+ * the repository's own "is this rollout still worth advancing" read has to express
+ * the same set in SQL and must not restate it (issue #1023).
+ */
+export const SETTLED_WORKER_UPDATE_ROLLOUT_MEMBER_STATES = [
 	'done',
 	'skipped',
 	'failed',
-]);
+] as const satisfies readonly WorkerUpdateRolloutMemberState[];
+
+const SETTLED_MEMBER_STATES = new Set<WorkerUpdateRolloutMemberState>(
+	SETTLED_WORKER_UPDATE_ROLLOUT_MEMBER_STATES,
+);
 
 /** Whether the rollout has finished with this member, whatever became of it. */
 export function isSettledMemberState(state: WorkerUpdateRolloutMemberState): boolean {

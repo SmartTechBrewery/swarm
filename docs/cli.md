@@ -737,7 +737,10 @@ unchanged.
   or that applies and never comes back within ten minutes, stops the whole thing: no
   further machine is drained or signalled, the reason is recorded verbatim and
   printed under the table, and every machine the rollout had not committed to yet
-  stays in the pool. The one machine that failed is deliberately left **drained**, so
+  stays in the pool. A machine the rollout had already committed to when it stopped
+  keeps being settled afterwards — the rollout goes on advancing until every one of
+  them has an answer — and each that settles without failing returns to the dispatch
+  pool by itself. The one machine that failed is deliberately left **drained**, so
   you can look at it before it is given work again; `swarm workers undrain` is still
   yours to run. A halt is final — fix the build and start a new rollout; there is no
   resume and no cancel, exactly as there is none for a single request.

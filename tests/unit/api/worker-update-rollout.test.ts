@@ -781,6 +781,32 @@ describe('advanceRollout — after a halt', () => {
 		expect(view?.members[0].state).toBe('done');
 		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_A, false);
 	});
+
+	// The state the stranding was actually observed in (issue #1023): a member left
+	// `verifying` by the halt is the one whose machine has already been taken out of the
+	// pool and restarted, so nothing but a later advance can put it back.
+	it('goes on verifying a member that was already applying, and returns it to the pool', async () => {
+		givenRollout(makeRollout({ status: 'halted', haltReason: 'worker reported failed' }), [
+			makeMember(WORKER_A, 0, {
+				state: 'verifying',
+				outcome: 'applied',
+				drainedByRollout: true,
+				fencingTokenAtSignal: 7,
+				buildCommitAtSignal: 'aaaaaaa',
+				signalledAt: new Date('2026-09-13T11:05:00Z'),
+			}),
+		]);
+		givenWorkers(reported(WORKER_A, 'applied', { build: { commit: 'bbbbbbb', dirty: false } }));
+		getLiveSessionForWorker.mockResolvedValue({ fencingToken: 8 });
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0].state).toBe('done');
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_A, false);
+		// Halted stays halted: settling its last member never promotes it to completed.
+		expect(view?.rollout.status).toBe('halted');
+		expect(statusWrites).toEqual([]);
+	});
 });
 
 describe('startRollout', () => {
