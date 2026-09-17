@@ -29,6 +29,43 @@ import type { ScmEvent } from '../scm/events.js';
 import type { SCMProvider, ScmType } from '../scm/types.js';
 
 /**
+ * Why a handler declined a delivery, when "no trigger matched" would be a
+ * misleading account of it (issue #1019).
+ *
+ * A handler declines by returning `null`, which the registry reports as "nothing
+ * claimed this delivery" — indistinguishable, at the settle, from a disposition
+ * that genuinely changed (the automation label pulled, the phase disabled, the
+ * card moved). For most declines that conflation costs nothing, because they
+ * *are* dispositions. For one it costs the operator an investigation into the
+ * wrong system: a `pr-review` dispatch dropped because another dispatch holds
+ * the PR+SHA review-dispatch slot (`../review-dispatch-dedup.ts`) was reported
+ * as a changed disposition, while the actual cause was SWARM's own lock.
+ *
+ * So a handler that declines for a reason the *operator* would read differently
+ * records it here, and the worker's no-trigger settle reports it verbatim
+ * instead of its generic wording.
+ */
+export interface TriggerDecline {
+	/**
+	 * `dispatch-claim-held` — another dispatch owns the PR+SHA review-dispatch
+	 * slot, so this delivery is a duplicate of work already in flight. The settle
+	 * keys on this to leave the holder's claims strictly alone: handing back a
+	 * claim this dispatch never took would abandon the live phase's slot.
+	 */
+	kind: 'dispatch-claim-held';
+	/** Operator-facing sentence, recorded verbatim as the settled run's error. */
+	reason: string;
+	/**
+	 * How long the held claim's lease has left, when it could be read — the wait
+	 * the settle schedules its re-check on, so a continuation blocked by a live
+	 * holder is deferred until the slot can actually free rather than failed for
+	 * it (issue #1019). Absent when the lease could not be read at all, which the
+	 * settle falls back to its own cadence for.
+	 */
+	retryAfterSec?: number;
+}
+
+/**
  * What a trigger handler sees: the resolved project plus the normalized event,
  * discriminated by which ingress produced it.
  *
@@ -100,6 +137,16 @@ export type TriggerContext = {
 	 * rather than routing back to Respond-to-CI.
 	 */
 	ciNoFixRecovery?: boolean;
+	/**
+	 * Records why this handler declined the delivery, for the settle to report in
+	 * place of its generic "re-evaluated to no-trigger" wording ({@link
+	 * TriggerDecline}, issue #1019). Supplied by the composition root that builds
+	 * the context, like every other ambient dependency here; optional so a caller
+	 * that does not settle runs (a test, a probe) need not supply one. Read only
+	 * when no handler claimed the delivery, so a note left by a handler the
+	 * registry then walked past is discarded with it.
+	 */
+	noteDecline?: (decline: TriggerDecline) => void;
 } & (
 	| { source: 'scm'; providerId: ScmType; event: ScmEvent; scm: SCMProvider }
 	| { source: 'pm'; providerId: PMType; event: PmEvent; pm: PMProvider }
