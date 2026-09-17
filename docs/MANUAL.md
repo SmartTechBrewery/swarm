@@ -419,7 +419,9 @@ one that comes back still on the build it was asked to leave (what a machine
 returning itself to its last known good build looks like — issue #934), or one that
 applies and never comes back inside ten minutes, halts the rollout: nothing further is
 drained or signalled, the reason is recorded and printed, and every machine it had not
-reached stays in the pool. The machine that failed is deliberately left drained so you
+reached stays in the pool. A machine that was *already* being moved when the halt
+landed still finishes settling on the advances that follow, and goes back in the pool
+once it does; only the machine that **failed** is deliberately left drained, so you
 can look at it. A halt is final — fix the build and start a new rollout; there is no
 resume and no cancel. Only one rollout runs per operator at a time, so asking for a
 different ref mid-move is refused rather than silently re-targeting the fleet.

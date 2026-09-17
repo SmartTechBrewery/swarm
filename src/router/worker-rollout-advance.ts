@@ -26,6 +26,15 @@
  *   and a wave whose members were still running a phase at the last advance, since
  *   a machine going idle is not something the control plane is told.
  *
+ * All three select an **advanceable** rollout since issue #1023 — every `in_progress`
+ * one, plus a `halted` one that still holds an unsettled member. A halt does not stop
+ * the members the rollout had already committed to: the policy leaves them to settle
+ * on later advances and returns each well-settled one to the dispatch pool, and until
+ * these reads were widened there were no later advances, so those machines stayed
+ * drained with nothing but a manual `swarm workers undrain` to put them back. Nothing
+ * about the halt itself changes — it is still terminal, a member that settles `failed`
+ * still stays drained, and the rollout is never promoted back to `in_progress`.
+ *
  * Both per-machine triggers are **fire-and-forget and caught**, on exactly the
  * contract `resendPendingWorkerUpdateToWorker` already keeps on the socket-open path
  * (`./worker-update-dispatch.ts`): they return `void`, so a report route and a
@@ -47,8 +56,8 @@
 
 import { advanceRollout } from '../api/worker-update-rollout.js';
 import {
-	findInProgressRolloutForOwner,
-	listInProgressRollouts,
+	listAdvanceableRollouts,
+	listAdvanceableRolloutsForOwner,
 } from '../db/repositories/workerUpdateRolloutsRepository.js';
 import { getWorker } from '../identity/worker-service.js';
 import type { WorkerUpdateRollout } from '../identity/worker-update-rollout.js';
@@ -56,7 +65,7 @@ import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 
 /**
- * How often every rollout still in progress is advanced with nobody watching.
+ * How often every rollout still in flight is advanced with nobody watching.
  *
  * A minute, because of what the tick is actually *for*. Both per-machine triggers
  * below fire the instant their event happens, so the tick is not how a rollout
@@ -77,34 +86,53 @@ import { logger } from '../lib/logger.js';
 export const ROLLOUT_ADVANCE_TICK_MS = 60_000;
 
 /**
- * Advance the rollout the machine `workerId` belongs to, if its operator has one
- * still moving. Returns whether a rollout was advanced; `false` covers "no such
- * machine" and "its operator has no rollout in progress", neither of which is an
- * error — most machines, most of the time, are in neither.
+ * Advance the rollouts the machine `workerId` belongs to, if its operator has any an
+ * advance can still move. Returns whether at least one was advanced; `false` covers
+ * "no such machine" and "its operator has no rollout still owed an answer", neither
+ * of which is an error — most machines, most of the time, are in neither.
  *
- * The rollout is resolved through the machine's **owner** rather than through the
- * member rows: an owner has at most one `in_progress` rollout (the partial unique
- * index is what decides that) and a machine has exactly one owner, so the owner's
- * live rollout *is* the one this machine is in, found by an indexed lookup instead
- * of a scan over every member row ever written. The one case the two answers differ
- * is a machine enrolled after the rollout started, which is not a member — and
- * advancing on its event is still right, since an advance only ever reads the
- * rollout's own durable state and a spare trigger is a no-op.
+ * The rollouts are resolved through the machine's **owner** rather than through the
+ * member rows: a machine has exactly one owner, so the owner's advanceable rollouts
+ * are the ones this machine can be in, found by an indexed lookup instead of a scan
+ * over every member row ever written. The one case the two answers differ is a
+ * machine enrolled after a rollout started, which is not a member — and advancing on
+ * its event is still right, since an advance only ever reads the rollout's own
+ * durable state and a spare trigger is a no-op.
+ *
+ * A **list** rather than a lookup since issue #1023: an owner still has at most one
+ * `in_progress` rollout (the partial unique index decides that), but a halted one
+ * that never settled its in-flight members is advanceable too, and the halted rows
+ * are exempt from that index, so there can be more than one.
  */
 export async function advanceRolloutForWorker(workerId: string): Promise<boolean> {
 	const worker = await getWorker(workerId);
 	if (!worker) return false;
-	const rollout = await findInProgressRolloutForOwner(worker.ownerUserId);
-	if (!rollout) return false;
+	const rollouts = await listAdvanceableRolloutsForOwner(worker.ownerUserId);
 
-	const view = await advanceRollout(rollout.id);
-	logger.info('fleet update: advanced a rollout on a worker event', {
-		workerId,
-		rolloutId: rollout.id,
-		target: rollout.target,
-		status: view?.rollout.status ?? rollout.status,
-	});
-	return view !== undefined;
+	let advanced = false;
+	for (const rollout of rollouts) {
+		// Each rollout is advanced on its own, exactly as the sweep below does it: the
+		// list is ordered oldest first, so a halted rollout that keeps failing to
+		// advance would otherwise cost the owner's *live* rollout every one of its
+		// event-driven advances and leave it waiting on the tick instead.
+		try {
+			const view = await advanceRollout(rollout.id);
+			logger.info('fleet update: advanced a rollout on a worker event', {
+				workerId,
+				rolloutId: rollout.id,
+				target: rollout.target,
+				status: view?.rollout.status ?? rollout.status,
+			});
+			advanced ||= view !== undefined;
+		} catch (err) {
+			logger.warn('fleet update: advancing a rollout on a worker event failed — continuing', {
+				workerId,
+				rolloutId: rollout.id,
+				error: describeError(err),
+			});
+		}
+	}
+	return advanced;
 }
 
 /**
@@ -113,7 +141,9 @@ export async function advanceRolloutForWorker(workerId: string): Promise<boolean
  * The fire-and-forget wrapper the event hooks are wired to — `void` out, every
  * failure caught and logged — so neither an update report nor a handshake can be
  * failed by a rollout. A missed advance costs latency and nothing else: the next
- * event, or the tick below, re-decides the whole thing from durable state.
+ * event, or the tick below, re-decides the whole thing from durable state. And it
+ * costs it to the one rollout that missed it — the loop above catches per rollout,
+ * so this outer catch is left only whatever failed before the list was read.
  */
 export function advanceWorkerRollout(workerId: string): void {
 	void advanceRolloutForWorker(workerId).catch((err) => {
@@ -125,7 +155,15 @@ export function advanceWorkerRollout(workerId: string): void {
 }
 
 /**
- * One sweep: advance every rollout that is still in progress.
+ * One sweep: advance every rollout an advance can still move — those in progress,
+ * plus a halted one that still owes its committed members an answer (issue #1023).
+ * That second half is the one where a stranded drain would otherwise be permanent:
+ * no event is guaranteed for a member the halt left `draining`, and a machine the
+ * rollout took out of the pool has no other way back than settling well.
+ *
+ * The extra work it buys is bounded and ends by itself — one locked transaction per
+ * such rollout per minute, and a halted rollout drops out of the read the moment its
+ * last unsettled member settles.
  *
  * Best-effort throughout, on `recoverUnreviewedPullRequests`'s posture
  * (`../dispatch/unreviewed-pr-recovery.ts`): one rollout's failure is logged and the
@@ -135,9 +173,9 @@ export function advanceWorkerRollout(workerId: string): void {
 export async function advanceRolloutsInProgress(): Promise<void> {
 	let rollouts: WorkerUpdateRollout[];
 	try {
-		rollouts = await listInProgressRollouts();
+		rollouts = await listAdvanceableRollouts();
 	} catch (err) {
-		logger.error('fleet update: could not read the rollouts in progress (continuing)', {
+		logger.error('fleet update: could not read the rollouts still in flight (continuing)', {
 			error: describeError(err),
 		});
 		return;

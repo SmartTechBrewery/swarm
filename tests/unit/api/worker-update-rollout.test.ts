@@ -19,12 +19,14 @@ const {
 	createRollout,
 	findInProgressRolloutForOwner,
 	findLatestRolloutForOwner,
+	findRolloutHoldElsewhere,
 	readRollout,
 } = vi.hoisted(() => ({
 	advanceUnderRolloutLock: vi.fn(),
 	createRollout: vi.fn(),
 	findInProgressRolloutForOwner: vi.fn(),
 	findLatestRolloutForOwner: vi.fn(),
+	findRolloutHoldElsewhere: vi.fn(),
 	readRollout: vi.fn(),
 }));
 const { getWorkers, listWorkersForOwner, setWorkerDraining } = vi.hoisted(() => ({
@@ -41,6 +43,7 @@ vi.mock('@/db/repositories/workerUpdateRolloutsRepository.js', () => ({
 	createRollout,
 	findInProgressRolloutForOwner,
 	findLatestRolloutForOwner,
+	findRolloutHoldElsewhere,
 	readRollout,
 }));
 vi.mock('@/identity/worker-service.js', () => ({
@@ -208,6 +211,7 @@ beforeEach(() => {
 		createRollout,
 		findInProgressRolloutForOwner,
 		findLatestRolloutForOwner,
+		findRolloutHoldElsewhere,
 		readRollout,
 		getWorkers,
 		listWorkersForOwner,
@@ -220,6 +224,8 @@ beforeEach(() => {
 	}
 	findInProgressRolloutForOwner.mockResolvedValue(undefined);
 	findLatestRolloutForOwner.mockResolvedValue(undefined);
+	// No other rollout holds any of these machines unless a test says one does.
+	findRolloutHoldElsewhere.mockResolvedValue(undefined);
 	getWorkers.mockResolvedValue([]);
 	getLiveSessionForWorker.mockResolvedValue(undefined);
 	deriveWorkerRunState.mockResolvedValue({ busy: false, currentRunId: null });
@@ -775,6 +781,155 @@ describe('advanceRollout — after a halt', () => {
 			}),
 		]);
 		givenWorkers(reported(WORKER_A, 'already-current'));
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0].state).toBe('done');
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_A, false);
+	});
+
+	// The state the stranding was actually observed in (issue #1023): a member left
+	// `verifying` by the halt is the one whose machine has already been taken out of the
+	// pool and restarted, so nothing but a later advance can put it back.
+	it('goes on verifying a member that was already applying, and returns it to the pool', async () => {
+		givenRollout(makeRollout({ status: 'halted', haltReason: 'worker reported failed' }), [
+			makeMember(WORKER_A, 0, {
+				state: 'verifying',
+				outcome: 'applied',
+				drainedByRollout: true,
+				fencingTokenAtSignal: 7,
+				buildCommitAtSignal: 'aaaaaaa',
+				signalledAt: new Date('2026-09-13T11:05:00Z'),
+			}),
+		]);
+		givenWorkers(reported(WORKER_A, 'applied', { build: { commit: 'bbbbbbb', dirty: false } }));
+		getLiveSessionForWorker.mockResolvedValue({ fencingToken: 8 });
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0].state).toBe('done');
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_A, false);
+		// Halted stays halted: settling its last member never promotes it to completed.
+		expect(view?.rollout.status).toBe('halted');
+		expect(statusWrites).toEqual([]);
+	});
+
+	// The hazard the halted rollout's new advanceability opens (issue #1023): a halt
+	// never blocks the operator's next rollout, so the replacement one is routinely
+	// holding a machine this one has not finished settling. Undraining there would put a
+	// machine that is mid-update back in the dispatch pool.
+	it('settles a member the newer rollout has taken over without returning it to the pool', async () => {
+		givenRollout(makeRollout({ status: 'halted', haltReason: 'worker reported failed' }), [
+			makeMember(WORKER_A, 0, {
+				state: 'signalled',
+				requestId: REQUEST_A,
+				drainedByRollout: true,
+			}),
+		]);
+		// The machine's own row now carries the *newer* rollout's request id, which is
+		// what makes this member `skipped` rather than answered.
+		givenWorkers(
+			makeWorker(WORKER_A, {
+				drainingSince: new Date('2026-09-13T11:00:00Z'),
+				update: {
+					requestId: '77777777-7777-4777-8777-777777777777',
+					target: 'v3',
+					requestedAt: new Date('2026-09-13T11:40:00Z'),
+					requestedByUserId: REQUESTER_ID,
+					status: null,
+					message: null,
+					reportedAt: null,
+				},
+			}),
+		);
+		findRolloutHoldElsewhere.mockResolvedValue({ drainedByRollout: false });
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0].state).toBe('skipped');
+		expect(findRolloutHoldElsewhere).toHaveBeenCalledWith(WORKER_A, ROLLOUT_ID);
+		expect(setWorkerDraining).not.toHaveBeenCalledWith(WORKER_A, false);
+	});
+
+	// The same rule for the other committed state: a member that came back on the new
+	// build settles `done` on its own merits, and still leaves the drain alone.
+	it('settles a verifying member well without undraining a machine another rollout holds', async () => {
+		givenRollout(makeRollout({ status: 'halted', haltReason: 'worker reported failed' }), [
+			makeMember(WORKER_A, 0, {
+				state: 'verifying',
+				outcome: 'applied',
+				drainedByRollout: true,
+				fencingTokenAtSignal: 7,
+				buildCommitAtSignal: 'aaaaaaa',
+				signalledAt: new Date('2026-09-13T11:05:00Z'),
+			}),
+		]);
+		givenWorkers(reported(WORKER_A, 'applied', { build: { commit: 'bbbbbbb', dirty: false } }));
+		getLiveSessionForWorker.mockResolvedValue({ fencingToken: 8 });
+		findRolloutHoldElsewhere.mockResolvedValue({ drainedByRollout: false });
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0].state).toBe('done');
+		expect(setWorkerDraining).not.toHaveBeenCalledWith(WORKER_A, false);
+	});
+});
+
+describe('advanceRollout — a machine two of the owner’s rollouts hold', () => {
+	// The other half of the hand-off (issue #1023). The newer rollout takes a machine the
+	// halted one still has drained: that drain is a rollout's, not the operator's, so it
+	// is inherited rather than left behind — otherwise nobody would ever put the machine
+	// back and the stranding this issue fixes would simply move one rollout along.
+	it('inherits the drain of a machine another rollout took out of the pool', async () => {
+		givenRollout(makeRollout(), [makeMember(WORKER_A, 0)]);
+		givenWorkers(makeWorker(WORKER_A, { drainingSince: new Date('2026-09-13T11:00:00Z') }));
+		findRolloutHoldElsewhere.mockResolvedValue({ drainedByRollout: true });
+		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry(WORKER_A, 'requested')]);
+
+		await advanceRollout(ROLLOUT_ID);
+
+		expect(findRolloutHoldElsewhere).toHaveBeenCalledWith(WORKER_A, ROLLOUT_ID);
+		expect(memberWrites.get(WORKER_A)).toMatchObject({ drainedByRollout: true });
+	});
+
+	// An operator's own drain is still never inherited: no rollout holds the machine, so
+	// the drain is theirs and stays theirs.
+	it('leaves the operator’s own drain alone when no other rollout holds the machine', async () => {
+		givenRollout(makeRollout(), [makeMember(WORKER_A, 0)]);
+		givenWorkers(makeWorker(WORKER_A, { drainingSince: new Date('2026-09-13T11:00:00Z') }));
+		findRolloutHoldElsewhere.mockResolvedValue(undefined);
+		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry(WORKER_A, 'requested')]);
+
+		await advanceRollout(ROLLOUT_ID);
+
+		expect(memberWrites.get(WORKER_A)).toMatchObject({ drainedByRollout: false });
+	});
+
+	// A machine still in the pool is plainly this rollout's to drain and to give back, so
+	// the cross-rollout question is never asked at all.
+	it('does not ask who holds a machine that is still in the pool', async () => {
+		givenRollout(makeRollout(), [makeMember(WORKER_A, 0)]);
+		givenWorkers(makeWorker(WORKER_A));
+		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry(WORKER_A, 'requested')]);
+
+		await advanceRollout(ROLLOUT_ID);
+
+		expect(findRolloutHoldElsewhere).not.toHaveBeenCalled();
+		expect(memberWrites.get(WORKER_A)).toMatchObject({ drainedByRollout: true });
+	});
+
+	// Whichever of the two settles last is the one that puts the machine back: once the
+	// other rollout has finished with it, there is no hold and the undrain happens.
+	it('returns the machine to the pool once no other rollout holds it', async () => {
+		givenRollout(makeRollout({ status: 'halted', haltReason: 'worker reported failed' }), [
+			makeMember(WORKER_A, 0, {
+				state: 'signalled',
+				requestId: REQUEST_A,
+				drainedByRollout: true,
+			}),
+		]);
+		givenWorkers(reported(WORKER_A, 'already-current'));
+		findRolloutHoldElsewhere.mockResolvedValue(undefined);
 
 		const view = await advanceRollout(ROLLOUT_ID);
 

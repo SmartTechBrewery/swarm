@@ -17,7 +17,10 @@ import {
  * Three collaborators are mocked and nothing else is, on `worker-update-dispatch.test.ts`'s
  * reasoning: the two Postgres reads and the advance itself are datastores and policy
  * this module deliberately owns none of — *when* the advance runs is the thing under
- * test, and it is decided here alone.
+ * test, and it is decided here alone. Since issue #1023 those two reads answer with
+ * whatever an advance can still move — a halted-but-unsettled rollout included — and
+ * which rows they pick is pinned where the SQL is
+ * (`tests/integration/db/workerUpdateRolloutsRepository.test.ts`), not here.
  */
 
 const { advanceRollout } = vi.hoisted(() => ({
@@ -25,14 +28,13 @@ const { advanceRollout } = vi.hoisted(() => ({
 }));
 vi.mock('@/api/worker-update-rollout.js', () => ({ advanceRollout }));
 
-const { findInProgressRolloutForOwner, listInProgressRollouts } = vi.hoisted(() => ({
-	findInProgressRolloutForOwner:
-		vi.fn<(ownerUserId: string) => Promise<WorkerUpdateRollout | undefined>>(),
-	listInProgressRollouts: vi.fn<() => Promise<WorkerUpdateRollout[]>>(),
+const { listAdvanceableRollouts, listAdvanceableRolloutsForOwner } = vi.hoisted(() => ({
+	listAdvanceableRollouts: vi.fn<() => Promise<WorkerUpdateRollout[]>>(),
+	listAdvanceableRolloutsForOwner: vi.fn<(ownerUserId: string) => Promise<WorkerUpdateRollout[]>>(),
 }));
 vi.mock('@/db/repositories/workerUpdateRolloutsRepository.js', () => ({
-	findInProgressRolloutForOwner,
-	listInProgressRollouts,
+	listAdvanceableRollouts,
+	listAdvanceableRolloutsForOwner,
 }));
 
 const { getWorker } = vi.hoisted(() => ({
@@ -86,25 +88,42 @@ function makeView(rollout: WorkerUpdateRollout): RolloutView {
 beforeEach(() => {
 	vi.clearAllMocks();
 	getWorker.mockResolvedValue(makeWorker());
-	findInProgressRolloutForOwner.mockResolvedValue(makeRollout());
-	listInProgressRollouts.mockResolvedValue([]);
+	listAdvanceableRolloutsForOwner.mockResolvedValue([makeRollout()]);
+	listAdvanceableRollouts.mockResolvedValue([]);
 	advanceRollout.mockImplementation(async (id) => makeView(makeRollout({ id })));
 });
 
 describe('advanceRolloutForWorker', () => {
-	// The event hooks learn about a *machine*; the rollout is resolved from it through
-	// the machine's owner, which is the indexed lookup and the only rollout it can be in.
+	// The event hooks learn about a *machine*; the rollouts are resolved from it through
+	// the machine's owner, which is the indexed lookup and the only ones it can be in.
 	it("advances the rollout the machine's operator has under way", async () => {
 		await expect(advanceRolloutForWorker(WORKER_ID)).resolves.toBe(true);
 
-		expect(findInProgressRolloutForOwner).toHaveBeenCalledWith(OWNER_ID);
+		expect(listAdvanceableRolloutsForOwner).toHaveBeenCalledWith(OWNER_ID);
+		expect(advanceRollout).toHaveBeenCalledWith(ROLLOUT_ID);
+	});
+
+	// An owner has at most one `in_progress` rollout, but the halted rows are exempt from
+	// that index, so a machine's event may have several rollouts still owed an answer —
+	// and a member stranded by one halt is settled by advancing *that* rollout, not the
+	// newest one (issue #1023).
+	it('advances every rollout its operator still owes an answer', async () => {
+		listAdvanceableRolloutsForOwner.mockResolvedValue([
+			makeRollout({ id: OTHER_ROLLOUT_ID, status: 'halted', haltReason: 'build was bad' }),
+			makeRollout(),
+		]);
+
+		await expect(advanceRolloutForWorker(WORKER_ID)).resolves.toBe(true);
+
+		expect(advanceRollout).toHaveBeenCalledTimes(2);
+		expect(advanceRollout).toHaveBeenCalledWith(OTHER_ROLLOUT_ID);
 		expect(advanceRollout).toHaveBeenCalledWith(ROLLOUT_ID);
 	});
 
 	// The ordinary case for almost every machine: nobody is moving the fleet, so the
 	// hook costs two reads and does nothing.
-	it('is a no-op when the operator has no rollout in progress', async () => {
-		findInProgressRolloutForOwner.mockResolvedValue(undefined);
+	it('is a no-op when the operator has no rollout left to advance', async () => {
+		listAdvanceableRolloutsForOwner.mockResolvedValue([]);
 
 		await expect(advanceRolloutForWorker(WORKER_ID)).resolves.toBe(false);
 		expect(advanceRollout).not.toHaveBeenCalled();
@@ -114,7 +133,7 @@ describe('advanceRolloutForWorker', () => {
 		getWorker.mockResolvedValue(undefined);
 
 		await expect(advanceRolloutForWorker(WORKER_ID)).resolves.toBe(false);
-		expect(findInProgressRolloutForOwner).not.toHaveBeenCalled();
+		expect(listAdvanceableRolloutsForOwner).not.toHaveBeenCalled();
 		expect(advanceRollout).not.toHaveBeenCalled();
 	});
 
@@ -124,6 +143,24 @@ describe('advanceRolloutForWorker', () => {
 		advanceRollout.mockResolvedValue(undefined);
 
 		await expect(advanceRolloutForWorker(WORKER_ID)).resolves.toBe(false);
+	});
+
+	// Per-rollout isolation, exactly as the sweep has it. The list is oldest first, so
+	// the halted rollout is advanced before the live one — and a halted rollout that
+	// kept failing must not cost the live one every event-driven advance it has.
+	it('carries on to the operator’s other rollouts past one that failed', async () => {
+		const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+		listAdvanceableRolloutsForOwner.mockResolvedValue([
+			makeRollout({ id: OTHER_ROLLOUT_ID, status: 'halted', haltReason: 'build was bad' }),
+			makeRollout(),
+		]);
+		advanceRollout.mockRejectedValueOnce(new Error('settle write failed'));
+
+		await expect(advanceRolloutForWorker(WORKER_ID)).resolves.toBe(true);
+
+		expect(advanceRollout).toHaveBeenCalledWith(ROLLOUT_ID);
+		expect(warnSpy).toHaveBeenCalled();
+		warnSpy.mockRestore();
 	});
 });
 
@@ -153,7 +190,7 @@ describe('advanceWorkerRollout', () => {
 
 describe('advanceRolloutsInProgress', () => {
 	it('advances every rollout that is still moving', async () => {
-		listInProgressRollouts.mockResolvedValue([
+		listAdvanceableRollouts.mockResolvedValue([
 			makeRollout(),
 			makeRollout({ id: OTHER_ROLLOUT_ID, requestedByUserId: 'someone-else' }),
 		]);
@@ -164,12 +201,25 @@ describe('advanceRolloutsInProgress', () => {
 		expect(advanceRollout).toHaveBeenCalledWith(OTHER_ROLLOUT_ID);
 	});
 
+	// The sweep is the only trigger guaranteed to reach a halted rollout whose stranded
+	// member is merely `draining` — no report and no handshake is coming for a machine
+	// that was never signalled (issue #1023).
+	it('sweeps a halted rollout that still owes its committed members an answer', async () => {
+		listAdvanceableRollouts.mockResolvedValue([
+			makeRollout({ status: 'halted', haltReason: 'worker reported failed' }),
+		]);
+
+		await advanceRolloutsInProgress();
+
+		expect(advanceRollout).toHaveBeenCalledExactlyOnceWith(ROLLOUT_ID);
+	});
+
 	// One operator's failure must not stop another operator's fleet from moving — and
 	// an unhandled rejection out of a bare `setInterval` callback would take the router
 	// down, so nothing here may escape.
 	it('carries on past a rollout that failed, and never throws', async () => {
 		const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
-		listInProgressRollouts.mockResolvedValue([
+		listAdvanceableRollouts.mockResolvedValue([
 			makeRollout(),
 			makeRollout({ id: OTHER_ROLLOUT_ID }),
 		]);
@@ -184,7 +234,7 @@ describe('advanceRolloutsInProgress', () => {
 
 	it('swallows a failed read of the live set', async () => {
 		const errorSpy = vi.spyOn(logger, 'error').mockImplementation(() => {});
-		listInProgressRollouts.mockRejectedValue(new Error('database is down'));
+		listAdvanceableRollouts.mockRejectedValue(new Error('database is down'));
 
 		await expect(advanceRolloutsInProgress()).resolves.toBeUndefined();
 
@@ -201,7 +251,7 @@ describe('startRolloutAdvanceTicker', () => {
 
 	it('advances every rollout in progress on each tick', async () => {
 		vi.useFakeTimers();
-		listInProgressRollouts.mockResolvedValue([makeRollout()]);
+		listAdvanceableRollouts.mockResolvedValue([makeRollout()]);
 		const ticker = startRolloutAdvanceTicker();
 
 		await vi.advanceTimersByTimeAsync(ROLLOUT_ADVANCE_TICK_MS);
@@ -215,7 +265,7 @@ describe('startRolloutAdvanceTicker', () => {
 
 	it('ticks no more once it is closed', async () => {
 		vi.useFakeTimers();
-		listInProgressRollouts.mockResolvedValue([makeRollout()]);
+		listAdvanceableRollouts.mockResolvedValue([makeRollout()]);
 		const ticker = startRolloutAdvanceTicker();
 
 		ticker.close();
@@ -228,7 +278,7 @@ describe('startRolloutAdvanceTicker', () => {
 	// the same row locks, so a tick arriving while one is still running is skipped.
 	it('runs one sweep at a time', async () => {
 		vi.useFakeTimers();
-		listInProgressRollouts.mockResolvedValue([makeRollout()]);
+		listAdvanceableRollouts.mockResolvedValue([makeRollout()]);
 		let release: () => void = () => {};
 		advanceRollout.mockImplementation(
 			() =>
