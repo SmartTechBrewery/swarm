@@ -179,6 +179,7 @@ import {
 import {
 	isPrioritizedContinuationPhase,
 	type TriggerContext,
+	type TriggerDecline,
 	type TriggerPhase,
 	type TriggerResult,
 } from '../triggers/types.js';
@@ -1371,6 +1372,77 @@ async function abandonReviewReservation(
 			headSha,
 			error: describeError(error),
 		});
+	}
+}
+
+/**
+ * Hand the PR+SHA review-dispatch slot back after a Review settled terminally
+ * **without delivering a verdict** (issue #1019), so the next attempt — the
+ * operator's or the system's — is evaluated on its merits instead of being
+ * bounced by the guard against a *duplicate* review.
+ *
+ * This is the rule the two sibling drop paths already state, applied to the one
+ * that did not get it: a Review that consumed nothing must not leave the head
+ * unreviewable until the claim's TTL lapses (`handlePullRequestInFlight` above
+ * and the automation-label gate in `processJob`). Until now a failed run kept its
+ * claim unconditionally, which made the *first* retry inside the five-minute
+ * window re-evaluate to `no-trigger` while the second — arriving after the
+ * no-trigger settle had handed the claim back — ran. Alternating, with nothing in
+ * the report naming the lock.
+ *
+ * **Two independent reads must both say "nothing was delivered"**, because the
+ * agent submits the formal review inside its own run:
+ *
+ * - the ledger has no `submitted` slot for this exact head — the same durable
+ *   record {@link resolveCompletedNoTriggerOutcome} reads, and the authority on
+ *   whether a verdict landed (issue #235);
+ * - and the failure is not a {@link DeliveryDeferredError}. `runReviewPhase`
+ *   raises that one for *any* error once delivery progress exists on disk —
+ *   written immediately before `submitReview` — so it is the phase's own
+ *   "a review may be out there" signal, and it survives the federated wire
+ *   (`src/router/dispatcher.ts` rethrows it from a `delivery` frame). It reaches
+ *   a terminal settle only once the retry budget behind it is spent, which is
+ *   exactly the case the ledger read alone could misjudge: a review delivered to
+ *   the provider whose ledger write never landed.
+ *
+ * Fails **closed**, like the claim itself: an unreadable ledger keeps the claim
+ * and lets the TTL reap it, rather than risking the duplicate review this whole
+ * mechanism exists to prevent.
+ */
+async function releaseFailedReviewClaim(
+	outcome: JobOutcome,
+	err: unknown,
+	trigger: TriggerResult,
+	project: ProjectConfig,
+): Promise<void> {
+	if (outcome.status !== 'phase-failed' || trigger.phase !== 'review') return;
+	if (err instanceof DeliveryDeferredError) return;
+	try {
+		const slot = await getSubmittedReviewSlot({
+			projectId: project.id,
+			repository: project.repo,
+			prNumber: trigger.prNumber,
+			headSha: trigger.headSha,
+		});
+		if (slot) return;
+		logger.info('Failed Review delivered no verdict — releasing its review-dispatch claim', {
+			projectId: project.id,
+			prNumber: trigger.prNumber,
+			headSha: trigger.headSha,
+		});
+		await releaseReviewDispatch(
+			buildReviewDispatchKey(project.repo, trigger.prNumber, trigger.headSha),
+		);
+	} catch (readErr) {
+		logger.warn(
+			'Could not establish whether a failed Review delivered a verdict — keeping its claim',
+			{
+				projectId: project.id,
+				prNumber: trigger.prNumber,
+				headSha: trigger.headSha,
+				error: describeError(readErr),
+			},
+		);
 	}
 }
 
@@ -3563,11 +3635,13 @@ function buildTriggerContext(
 	job: ScmWebhookJob | PmWebhookJob,
 	project: ProjectConfig,
 	dispatchId: string,
+	noteDecline: (decline: TriggerDecline) => void,
 ): TriggerContext {
 	return job.type === 'scm'
 		? {
 				project,
 				dispatchId,
+				noteDecline,
 				deliveryId: job.deliveryId,
 				recheckAttempt: job.recheckAttempt,
 				readFailureRecheckAttempt: job.readFailureRecheckAttempt,
@@ -3586,6 +3660,7 @@ function buildTriggerContext(
 		: {
 				project,
 				dispatchId,
+				noteDecline,
 				deliveryId: job.deliveryId,
 				recheckAttempt: job.recheckAttempt,
 				rateLimitRetryAttempt: job.rateLimitRetryAttempt,
@@ -3868,12 +3943,14 @@ async function handlePhaseFailure(
 	// above returns early), so a run that's about to be retried never posts a
 	// premature "failed".
 	await reportPhaseFailureToBoardOrPr(trigger, project, terminalError, failureDiagnosis);
-	// The review handler's claim intentionally survives a failed run: the review
-	// agent submits its formal `gh pr review` *inside* the run, so a phase that
-	// threw afterward may have already posted the review — releasing the claim
-	// here would let a sibling event for the same PR+SHA post a duplicate, the
-	// exact incident the dedup guards against. The 5-minute TTL reaps a claim
-	// whose run genuinely failed before submitting. See review-dispatch-dedup.ts.
+	// The review handler's claim is handed back by the caller's
+	// {@link releaseFailedReviewClaim} once this outcome is settled — but only for a
+	// run that provably delivered nothing (issue #1019). It is deliberately not done
+	// here: the review agent submits its formal review *inside* the run, so this
+	// function, which sees only why the run stopped, cannot tell a phase that
+	// delivered from one that never got there. That judgement needs the ledger and
+	// the phase's own delivery signal, and a wrong answer lets a sibling event for
+	// the same PR+SHA post a duplicate review. See review-dispatch-dedup.ts.
 	return {
 		status: 'phase-failed',
 		phase: trigger.phase,
@@ -4172,6 +4249,13 @@ async function bindSelectedWorker(
  * the claims, and re-written by `markDispatchRunning`; the waits leave it alone,
  * so it survives a defer with or without a run row.
  *
+ * That gate is necessary but not sufficient, which is why the call site also
+ * skips this entirely for a `dispatch-claim-held` decline (issue #1019). A
+ * *continuation* — an operator's "Retry now", a "Reset & restart" — carries the
+ * retried run's phase on its dispatch row from the moment it is created, so it
+ * passes the gate above while having claimed nothing itself. The handler's own
+ * decline is the only signal that says so.
+ *
  * Only Review reserves a ledger slot; Respond-to-CI shares the same PR+SHA
  * dedup slot and never takes one. Any other phase — or a null `phase` — took
  * neither and is left strictly alone: a Respond-to-review or Resolve-conflicts
@@ -4251,11 +4335,20 @@ async function handBackNoTriggerClaims(
  *   makes `matches` return `true` unconditionally and exempts the run from both the
  *   `planned`-label gate and the `statusChanged` dedup — the "already done" signals
  *   a completed Planning run writes are deliberately stood down for its own retry.
+ *
+ * **Issue #1019.** The `failed` branch's wording is a guess at the cause, and for
+ * one decline it guessed wrong in the most expensive direction: a dispatch
+ * dropped because another one holds the PR+SHA review slot was reported as a
+ * disposition that changed, sending the operator to inspect a board that was
+ * fine. A handler that knows better now says so ({@link TriggerDecline}), and
+ * that note is reported verbatim and keeps this settle from handing back claims
+ * the dispatch never took.
  */
 async function settleNoTriggerDelivery(
 	job: SwarmJob,
 	project: ProjectConfig,
 	dispatch: DispatchRow,
+	decline?: TriggerDecline,
 ): Promise<JobOutcome> {
 	const completed = job.runId ? await resolveCompletedNoTriggerOutcome(job, project) : undefined;
 	if (job.runId && completed) {
@@ -4289,13 +4382,31 @@ async function settleNoTriggerDelivery(
 		if (job.runId) {
 			await finalizeRun(job.runId, {
 				status: 'failed',
+				// A handler that named its own reason is reported verbatim (issue
+				// #1019). The generic wording below is a *guess* at the cause — it names
+				// the board and the phase's disposition — and a dispatch dropped because
+				// SWARM's own PR+SHA lock is held sends the operator to investigate the
+				// wrong system entirely.
 				error:
+					decline?.reason ??
 					'The pending continuation re-evaluated to no-trigger (e.g. disposition changed or was disabled)',
 			});
 		}
 		// Issue #856: outside the `runId` gate deliberately — the leak this closes
 		// is a dispatch deferred for worker capacity, which never got a run row.
-		await handBackNoTriggerClaims(job, project, dispatch);
+		//
+		// Skipped outright for a claim collision (issue #1019), and that is the same
+		// rule the hand-back already states rather than a new one: it hands back what
+		// *this dispatch's own trigger* claimed, and a dispatch declined because
+		// another one holds the slot claimed nothing. The gate below keys on
+		// `dispatch.phase`, which a continuation carries from the run it retries
+		// (`runs.retryNow`, `resetRun`), so without this a retry that met a live
+		// Review's claim would release that Review's slot and abandon its ledger
+		// reservation — the very hand-back the fresh-webhook case is spared by having
+		// no recorded phase.
+		if (decline?.kind !== 'dispatch-claim-held') {
+			await handBackNoTriggerClaims(job, project, dispatch);
+		}
 	}
 	await tryCompleteDispatch(dispatch.id, 'no-trigger');
 	// Ordering matters exactly as on the ordinary Review success path (see the
@@ -4396,7 +4507,13 @@ export async function processJob(
 		return processMergeAutomationDispatch(dispatch, job, project);
 	}
 
-	const ctx = buildTriggerContext(job, project, dispatch.id);
+	// Where a handler records a decline the operator would read differently from
+	// "nothing matched" (issue #1019). Read only on the no-trigger path below, so a
+	// note left by a handler the registry then walked past is discarded with it.
+	let decline: TriggerDecline | undefined;
+	const ctx = buildTriggerContext(job, project, dispatch.id, (note) => {
+		decline = note;
+	});
 
 	const trigger = await registry.dispatch(ctx);
 	if (!trigger) {
@@ -4406,7 +4523,7 @@ export async function processJob(
 			event: ctx.source === 'scm' ? ctx.event.kind : ctx.event.action,
 			deliveryId: job.deliveryId,
 		});
-		return settleNoTriggerDelivery(job, project, dispatch);
+		return settleNoTriggerDelivery(job, project, dispatch, decline);
 	}
 
 	// The pull request this phase acts on, resolved once: it is the key the PR-scoped
@@ -4817,6 +4934,13 @@ export async function processJob(
 				error: describeError(settleErr),
 			});
 		}
+		// A Review that ended terminally without delivering a verdict owes the PR+SHA
+		// slot back (issue #1019), so the retry this failure invites is evaluated on
+		// its merits rather than dropped as a duplicate of the run that never
+		// happened. Placed after the dispatch settle for the same reason the other
+		// hand-backs are placed where they are: this dispatch is terminal first, so a
+		// sibling event taking the freed slot cannot collide with it.
+		await releaseFailedReviewClaim(outcome, err, trigger, project);
 		return outcome;
 	} finally {
 		// Detach the shutdown listener and drop this run from the cancellation

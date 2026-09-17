@@ -128,6 +128,36 @@ export async function claimReviewDispatch(
 }
 
 /**
+ * How many seconds a live claim on `key` has left, or `undefined` when nothing
+ * holds it (or the lease can't be read).
+ *
+ * Read-only, and for the operator's benefit alone (issue #1019): a dispatch
+ * dropped because this slot is held is reported with the wait it actually faces
+ * rather than as a disposition that changed. It is deliberately *not* consulted
+ * before claiming — {@link claimReviewDispatch}'s `SET NX` is the only thing
+ * that decides ownership, and a check-then-claim would reopen the race that
+ * atomic primitive exists to close.
+ *
+ * Best-effort, like every other read here: an unreachable Redis costs the
+ * message its "frees in" clause, never the decline itself.
+ */
+export async function reviewDispatchClaimTtlSec(key: string): Promise<number | undefined> {
+	try {
+		// `TTL` answers -2 for a key that does not exist and -1 for one with no
+		// expiry; neither is a wait an operator can be told to sit out, so both
+		// collapse to "unknown" here.
+		const ttl = await getRedis().ttl(`${KEY_NS}${key}`);
+		return ttl > 0 ? ttl : undefined;
+	} catch (err) {
+		logger.debug('review-dispatch dedup: could not read a claim TTL', {
+			reviewDispatchKey: key,
+			error: String(err),
+		});
+		return undefined;
+	}
+}
+
+/**
  * Refresh (extend) a live claim's TTL without re-claiming — the counterpart used
  * wherever the slot has to stay owned for longer than the default TTL, by a
  * holder that will re-enter without re-claiming. Three callers:
@@ -169,15 +199,27 @@ export async function refreshReviewDispatchClaim(key: string, ttlSec: number): P
  * the next legitimate trigger for the same PR+SHA needn't wait out the TTL. That
  * is Cascade's pre-run `onBlocked` case: a capacity/lock gate that rejects the
  * dispatch before the agent ever runs (issue #62 asked to port an equivalent
- * claim/release). `src/worker/consumer.ts` calls it for the two dispatches that
- * provably ran nothing: one the automation-label gate skipped, and one that
- * re-evaluated to `no-trigger` *without* an already-submitted verdict behind it.
- * It must NOT be called on a *failed* review run, nor on the no-trigger
- * redelivery of a run whose verdict the ledger already records as submitted
- * (issue #815): the agent submits the formal review inside its run
- * (`src/pipeline/review.ts`), so in both cases the review may already be posted,
- * and releasing then would let a sibling event post a duplicate — the exact
- * incident this dedup exists to prevent.
+ * claim/release). `src/worker/consumer.ts` calls it for the dispatches that
+ * provably delivered no review: one the automation-label gate skipped, one a
+ * writing phase's hold dropped, one that re-evaluated to `no-trigger` *without*
+ * an already-submitted verdict behind it — and, since issue #1019, a Review run
+ * that settled terminally `failed` having delivered nothing.
+ *
+ * The rule all of them share is the only one that matters: **it must NOT be
+ * called once a verdict may have been posted.** The agent submits the formal
+ * review inside its run (`src/pipeline/review.ts`), so releasing then would let a
+ * sibling event post a duplicate — the exact incident this dedup exists to
+ * prevent. That is why the no-trigger redelivery of a run the ledger already
+ * records as `submitted` keeps its claim (issue #815), and why the failed-run
+ * release is conditioned on that same ledger read *plus* the phase's own
+ * delivery signal: a Review that got as far as delivery raises a
+ * `DeliveryDeferredError` rather than an ordinary failure, so a terminal failure
+ * carrying one keeps its claim too.
+ *
+ * Before #1019 a failed run kept its claim unconditionally, and the TTL was the
+ * only thing that freed it — which left the operator's retry of a review that
+ * never ran bounced by the guard against a *duplicate* review, and told them
+ * their board disposition had changed.
  *
  * Best-effort: errors are logged, never thrown — the TTL is the safety net.
  */

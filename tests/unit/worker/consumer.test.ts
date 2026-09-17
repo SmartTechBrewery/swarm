@@ -793,6 +793,28 @@ function registryReturning(result: TriggerResult | null, seenContexts: TriggerCo
 	return registry;
 }
 
+const HELD_CLAIM_REASON =
+	"Another dispatch holds the review slot for pull request #17 at head 'deadbeef'";
+
+/**
+ * A registry whose single handler declines *and says why* — the shape the
+ * `pr-review` handler produces when another dispatch already holds the PR+SHA
+ * review slot (issue #1019).
+ */
+function registryDecliningWithHeldClaim(reason = HELD_CLAIM_REASON) {
+	const registry = createTriggerRegistry();
+	registry.register({
+		name: 'test-trigger',
+		description: 'declines because the dispatch slot is held',
+		matches: () => true,
+		handle: async (ctx) => {
+			ctx.noteDecline?.({ kind: 'dispatch-claim-held', reason });
+			return null;
+		},
+	});
+	return registry;
+}
+
 /**
  * Claim the next dispatch as a row whose earlier evaluation resolved `phase` —
  * what `recordDispatchResolution` leaves behind, and the only thing the
@@ -1437,6 +1459,51 @@ describe('processJob', () => {
 					error: expect.stringContaining('no-trigger'),
 				});
 				expect(requestMergeAutomation).not.toHaveBeenCalled();
+			});
+		});
+
+		// Issue #1019: the settle's generic wording is a *guess* at the cause, and for
+		// a dispatch dropped because SWARM's own PR+SHA lock is held it guessed wrong
+		// in the most expensive direction — it named the board, so the operator went
+		// and inspected a disposition that was fine.
+		describe('a decline the handler named is reported as such (issue #1019)', () => {
+			it("records the handler's reason instead of the disposition wording", async () => {
+				const job = createMockScmWebhookJob({
+					runId: 'run-123',
+					event: createMockScmEvent({ headSha: 'deadbeef' }),
+				});
+				claimDispatchWithPhase('review');
+
+				const outcome = await processJob(job, registryDecliningWithHeldClaim());
+
+				expect(outcome.status).toBe('no-trigger');
+				expect(completeRun).toHaveBeenCalledWith('run-123', {
+					status: 'failed',
+					error: HELD_CLAIM_REASON,
+				});
+				expect(completeRun).not.toHaveBeenCalledWith('run-123', {
+					status: 'failed',
+					error: expect.stringContaining('disposition changed'),
+				});
+			});
+
+			// The hand-back releases what *this dispatch's own trigger* claimed, and a
+			// dispatch declined because another one holds the slot claimed nothing. The
+			// `dispatch.phase` gate cannot see that on its own: an operator's "Retry
+			// now" / "Reset & restart" carries the retried run's phase from the moment
+			// its row is created, so without the decline it would release a live
+			// Review's claim and abandon its ledger reservation.
+			it('hands back nothing it did not take', async () => {
+				const job = createMockScmWebhookJob({
+					runId: 'run-123',
+					event: createMockScmEvent({ headSha: 'deadbeef' }),
+				});
+				claimDispatchWithPhase('review');
+
+				await processJob(job, registryDecliningWithHeldClaim());
+
+				expect(releaseReviewDispatch).not.toHaveBeenCalled();
+				expect(abandonReviewVerdict).not.toHaveBeenCalled();
 			});
 		});
 
@@ -4555,6 +4622,117 @@ describe('processJob', () => {
 		expect(addComment).toHaveBeenCalledTimes(1);
 		expect(addComment.mock.calls[0][0]).toBe('item-100');
 		expect(addComment.mock.calls[0][1]).toContain('unpushed commits');
+	});
+
+	// Issue #1019: the PR+SHA dispatch claim is taken before a Review starts and used
+	// to survive a run that failed without ever submitting a verdict, so for five
+	// minutes the guard against a *duplicate* review blocked the retry of a review
+	// that never happened — and the bounced retry was reported as a changed board
+	// disposition. Live on `under-control-platform#224`: eight dispatches, every
+	// second one a no-op, in strict alternation.
+	describe('a failed Review hands back its dispatch claim (issue #1019)', () => {
+		const failWith = (err: unknown) => {
+			phaseImpl = async () => {
+				throw err;
+			};
+		};
+
+		it('releases the claim when the run delivered no verdict', async () => {
+			failWith(new Error('worktree provisioning failed'));
+
+			const outcome = await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-failed');
+			expect(getSubmittedReviewSlot).toHaveBeenCalledWith({
+				projectId: PROJECT.id,
+				repository: PROJECT.repo,
+				prNumber: '17',
+				headSha: 'deadbeef',
+			});
+			expect(releaseReviewDispatch).toHaveBeenCalledWith(`${PROJECT.repo}:17:deadbeef`);
+		});
+
+		// The acceptance criterion the whole dedup exists for: a run that *did* post
+		// its review keeps the slot, or a sibling event posts a second one.
+		it('keeps the claim when the ledger records a submitted verdict for the head', async () => {
+			getSubmittedReviewSlot.mockResolvedValueOnce({
+				ordinal: 1,
+				verdict: 'approve',
+				reviewId: 'review-1',
+			});
+			failWith(new Error('cleanup exploded after the review was submitted'));
+
+			const outcome = await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-failed');
+			expect(releaseReviewDispatch).not.toHaveBeenCalled();
+		});
+
+		// The second read, for the window the ledger alone cannot judge: the phase
+		// raises `DeliveryDeferredError` for any error once delivery progress exists on
+		// disk, which is written immediately before the review is submitted. Terminal
+		// only once its retry budget is spent — at which point the review may well be
+		// out there with no ledger row behind it.
+		it('keeps the claim when the terminal failure is a spent delivery deferral', async () => {
+			failWith(new DeliveryDeferredError('Review delivery deferred for retry'));
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ rateLimitRetryAttempt: 6 }),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-failed');
+			expect(releaseReviewDispatch).not.toHaveBeenCalled();
+		});
+
+		// Fails closed, exactly as the claim itself does: an unreadable ledger cannot
+		// establish that nothing was delivered, so the TTL reaps the claim instead.
+		it('keeps the claim when the ledger read throws', async () => {
+			getSubmittedReviewSlot.mockRejectedValueOnce(new Error('db down'));
+			failWith(new Error('worktree provisioning failed'));
+
+			const outcome = await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-failed');
+			expect(releaseReviewDispatch).not.toHaveBeenCalled();
+		});
+
+		// A deferral keeps its slot deliberately — `retainContinuationDispatchClaim`
+		// is holding it open for the prioritized retry that reuses it.
+		it('leaves a deferred run\u2019s claim alone', async () => {
+			failWith(new AgentRunError('rate limited', { kind: 'rate-limit' }));
+
+			const outcome = await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-deferred');
+			expect(releaseReviewDispatch).not.toHaveBeenCalled();
+		});
+
+		// Only Review owns a verdict; the other PR-driven phases have their own
+		// budgets and are left strictly alone here.
+		it('leaves another phase\u2019s failure alone', async () => {
+			failWith(new Error('boom'));
+
+			const outcome = await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(RESPOND_TO_REVIEW_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-failed');
+			expect(releaseReviewDispatch).not.toHaveBeenCalled();
+		});
 	});
 
 	describe('automation-label gate (issue #131)', () => {

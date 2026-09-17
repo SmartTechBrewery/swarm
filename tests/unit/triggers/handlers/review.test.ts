@@ -3,7 +3,7 @@ import type { ProjectConfig } from '@/config/schema.js';
 import type { ScmDeliveryProvider } from '@/scm/delivery.js';
 import type { AggregateCheckStatus, ScmPersona } from '@/scm/types.js';
 import { createReviewTrigger } from '@/triggers/handlers/review.js';
-import type { TriggerContext } from '@/triggers/types.js';
+import type { TriggerContext, TriggerDecline } from '@/triggers/types.js';
 import {
 	createFakeScmProvider,
 	createMockProjectConfig,
@@ -15,13 +15,19 @@ import {
 // The handler gates dispatch on a Redis-backed dedup claim; mock it so these
 // tests stay pure-in-memory. `claimReviewDispatch` defaults to granting the
 // claim (the common path); individual tests flip it to exercise a skip.
-const { claimReviewDispatch, refreshReviewDispatchClaim } = vi.hoisted(() => ({
-	claimReviewDispatch: vi.fn(),
-	refreshReviewDispatchClaim: vi.fn(),
-}));
+const { claimReviewDispatch, refreshReviewDispatchClaim, reviewDispatchClaimTtlSec } = vi.hoisted(
+	() => ({
+		claimReviewDispatch: vi.fn(),
+		refreshReviewDispatchClaim: vi.fn(),
+		// Read only to describe a *declined* claim to the operator (issue #1019);
+		// defaults to "no lease could be read", the shape a down Redis produces.
+		reviewDispatchClaimTtlSec: vi.fn(),
+	}),
+);
 vi.mock('@/triggers/review-dispatch-dedup.js', () => ({
 	claimReviewDispatch,
 	refreshReviewDispatchClaim,
+	reviewDispatchClaimTtlSec,
 	buildReviewDispatchKey: (repo: string, prNumber: string, headSha: string) =>
 		`${repo}:${prNumber}:${headSha}`,
 }));
@@ -138,6 +144,8 @@ function checkStatus(runs: Array<[string, string, string | null]>): AggregateChe
 beforeEach(() => {
 	claimReviewDispatch.mockReset();
 	claimReviewDispatch.mockResolvedValue(true);
+	reviewDispatchClaimTtlSec.mockReset();
+	reviewDispatchClaimTtlSec.mockResolvedValue(undefined);
 	refreshReviewDispatchClaim.mockReset();
 	refreshReviewDispatchClaim.mockResolvedValue(undefined);
 	claimRespondToCiAttempt.mockReset();
@@ -195,6 +203,7 @@ function ctx(
 		deliveryId?: string;
 		continuationDispatchClaimed?: boolean;
 		ciNoFixRecovery?: boolean;
+		noteDecline?: (decline: TriggerDecline) => void;
 	} = {},
 ): TriggerContext {
 	return createMockScmTriggerContext({
@@ -724,6 +733,51 @@ describe('review trigger', () => {
 			claimReviewDispatch.mockResolvedValue(false);
 			expect(await handler.handle(ctx(reviewable))).toBeNull();
 			expect(reserveReviewVerdict).not.toHaveBeenCalled();
+		});
+
+		// Issue #1019: returning a bare `null` here let the worker report the drop as
+		// "the disposition changed" — the board and the PR — when the actual cause was
+		// SWARM's own lock, taken seconds earlier by the operator's own previous click.
+		describe('a declined claim says so (issue #1019)', () => {
+			it('records the collision, naming the slot and the wait', async () => {
+				claimReviewDispatch.mockResolvedValue(false);
+				reviewDispatchClaimTtlSec.mockResolvedValue(252);
+				const noteDecline = vi.fn();
+
+				expect(await handler.handle(ctx(reviewable, { noteDecline }))).toBeNull();
+
+				expect(reviewDispatchClaimTtlSec).toHaveBeenCalledWith(`${PROJECT.repo}:42:abc123`);
+				expect(noteDecline).toHaveBeenCalledExactlyOnceWith({
+					kind: 'dispatch-claim-held',
+					reason: expect.stringContaining(`${PROJECT.repo}:42:abc123`),
+				});
+				const [{ reason }] = noteDecline.mock.calls[0] as [TriggerDecline];
+				expect(reason).toContain('4m 12s');
+				expect(reason).toContain('disposition did not change');
+			});
+
+			// The claim also fails closed on an unreachable Redis, in which case there is
+			// no lease to read — so the message says that rather than inventing a wait.
+			it('says the holder could not be read when no lease answers', async () => {
+				claimReviewDispatch.mockResolvedValue(false);
+				reviewDispatchClaimTtlSec.mockResolvedValue(undefined);
+				const noteDecline = vi.fn();
+
+				expect(await handler.handle(ctx(reviewable, { noteDecline }))).toBeNull();
+
+				const [{ reason }] = noteDecline.mock.calls[0] as [TriggerDecline];
+				expect(reason).toContain('could not be read');
+				expect(reason).not.toContain('frees in');
+			});
+
+			it('records nothing when the claim is granted', async () => {
+				const noteDecline = vi.fn();
+
+				await handler.handle(ctx(reviewable, { noteDecline }));
+
+				expect(noteDecline).not.toHaveBeenCalled();
+				expect(reviewDispatchClaimTtlSec).not.toHaveBeenCalled();
+			});
 		});
 
 		it('does not claim for an unreviewable event', async () => {

@@ -199,6 +199,7 @@ import {
 	buildReviewDispatchKey,
 	claimReviewDispatch,
 	refreshReviewDispatchClaim,
+	reviewDispatchClaimTtlSec,
 } from '../review-dispatch-dedup.js';
 import { resolveSwarmManagedPr, type SwarmManagedPrResult } from '../swarm-managed-pr.js';
 import type { ScmTriggerContext, TriggerContext, TriggerHandler, TriggerResult } from '../types.js';
@@ -1358,6 +1359,47 @@ function heldDispatchClaimReason(ctx: TriggerContext): string | null {
 	return null;
 }
 
+/** `312` → `5m 12s`, `47` → `47s` — the wait, as an operator would say it. */
+function describeWait(seconds: number): string {
+	const minutes = Math.floor(seconds / 60);
+	const rest = seconds % 60;
+	return minutes > 0 ? `${minutes}m ${rest}s` : `${rest}s`;
+}
+
+/**
+ * Record *why* a dispatch was dropped when the PR+SHA slot is already claimed
+ * (issue #1019), so the worker's settle reports the collision instead of
+ * "the disposition changed".
+ *
+ * The distinction is the whole point: a disposition change (the automation label
+ * pulled, the phase disabled, the card moved) is a fact about the board that the
+ * operator has to go and look at, while this is SWARM's own short-lived lock and
+ * needs nothing but the holder settling. Naming the slot and the wait is what
+ * makes the two tellable apart at a glance.
+ *
+ * The TTL read is best-effort and deliberately *after* the failed claim, never
+ * before it: `claimReviewDispatch` also fails closed on an unreachable Redis, in
+ * which case there is no lease to read and the message says so rather than
+ * inventing a wait.
+ */
+async function noteDispatchClaimHeld(
+	ctx: ScmTriggerContext,
+	dispatchKey: string,
+	prNumber: string,
+	headSha: string,
+): Promise<void> {
+	if (!ctx.noteDecline) return;
+	const ttlSec = await reviewDispatchClaimTtlSec(dispatchKey);
+	const wait =
+		ttlSec === undefined
+			? 'its holder could not be read (an unreachable Redis reads the same way, and also declines)'
+			: `it frees in about ${describeWait(ttlSec)} unless its holder releases it sooner`;
+	ctx.noteDecline({
+		kind: 'dispatch-claim-held',
+		reason: `Another dispatch holds the review slot for pull request #${prNumber} at head '${headSha}' (${dispatchKey}), so this delivery was dropped as a duplicate — ${wait}. This phase's disposition did not change.`,
+	});
+}
+
 export function createReviewTrigger(): TriggerHandler {
 	return {
 		name: 'pr-review',
@@ -1429,7 +1471,12 @@ export function createReviewTrigger(): TriggerHandler {
 					prNumber,
 					headSha,
 				});
-				if (!claimed) return null;
+				if (!claimed) {
+					// A decline the operator would otherwise have to diagnose off the
+					// board (issue #1019) — record what actually stopped it.
+					await noteDispatchClaimHeld(ctx, dispatchKey, prNumber, headSha);
+					return null;
+				}
 			}
 
 			if (disposition.kind === 'respond-to-ci') {
