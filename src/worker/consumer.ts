@@ -233,7 +233,18 @@ import {
 
 /** What became of a dequeued job — returned to BullMQ as the job's result. */
 export type JobOutcome =
-	| { status: 'no-trigger' }
+	| {
+			status: 'no-trigger';
+			/**
+			 * Set when this delivery matched nothing because another dispatch holds
+			 * the PR+SHA review-dispatch slot, and the run it carried was therefore
+			 * **deferred** rather than failed for it (issue #1019): the dispatch is
+			 * `retry-scheduled` on the holder's remaining lease, not settled. Absent
+			 * on every ordinary no-trigger, where the delivery really did match
+			 * nothing and its dispatch is completed here.
+			 */
+			heldClaimRetryScheduled?: true;
+	  }
 	| {
 			/**
 			 * The wake-up's dispatch record refused the claim (cancelled, completed,
@@ -491,6 +502,36 @@ const PENDING_CONTINUATION_CLAIM_TTL_SEC = Math.ceil(MIN_RETRY_DELAY_MS / 1000) 
  */
 const ELIGIBILITY_CONTINUATION_CLAIM_TTL_SEC =
 	Math.ceil(ELIGIBILITY_RECHECK_INTERVAL_MS / 1000) + 120;
+
+/**
+ * Budget for the re-check a continuation waits out when another dispatch holds
+ * the PR+SHA review-dispatch slot it needs (issue #1019).
+ *
+ * The wait itself is timed by the *holder's own lease* — the decline carries its
+ * remaining TTL ({@link TriggerDecline.retryAfterSec}) — so the ordinary case
+ * needs one re-check: the claim cannot outlive its TTL unless its holder is alive
+ * and refreshing it, and a Review that fails without delivering now hands the slot
+ * back long before then. The budget exists for the case that *is* alive: a holder
+ * refreshing across a long wait of its own, which no amount of waiting here will
+ * out-sit. Three re-checks, then the collision is reported as a terminal failure
+ * naming the slot — which is still the operator's own answer, not the board's.
+ */
+const MAX_DISPATCH_CLAIM_RECHECKS = 3;
+/**
+ * The wait when the holder's lease could not be read at all — an unreachable Redis
+ * reads exactly like a free slot here, and {@link claimReviewDispatch} declines on
+ * it too. Short deliberately: there is no lease to sit out, so this re-checks soon
+ * rather than parking the run on a guess.
+ */
+const DISPATCH_CLAIM_RECHECK_FALLBACK_MS = 30 * 1000;
+/**
+ * Ceiling on a single claim re-check, one second above the dedup TTL
+ * (`DEDUP_TTL_SEC`, `src/triggers/review-dispatch-dedup.ts`): a lease longer than
+ * that is one a holder refreshed, and waiting out a refresh in one sitting would
+ * spend the whole budget on a single sleep. The margin is what makes the re-check
+ * land *after* the lease it waited for rather than on its last second.
+ */
+const MAX_DISPATCH_CLAIM_RECHECK_MS = 5 * 60 * 1000 + 1000;
 
 /**
  * The coded default agent CLI — used when neither a per-job override nor a phase
@@ -4291,10 +4332,166 @@ async function handBackNoTriggerClaims(
 }
 
 /**
- * Settle a delivery no trigger claimed. The dispatch itself always completes as
+ * Wait out a **live** claim collision instead of failing the run that met it
+ * (issue #1019): the continuation's dispatch is re-scheduled on the holder's own
+ * remaining lease and its run settles `deferred`, carrying the collision sentence.
+ *
+ * This is the half of #1019 the claim hand-back cannot cover. The hand-back frees
+ * the slot a *failed* Review left behind, so the ordinary retry now finds it free;
+ * what remains is the retry that meets a claim genuinely in flight — and that run
+ * was never a terminal failure. Nothing about the phase, the pull request or the
+ * board is wrong: another dispatch is doing the very work this one was asked to
+ * do, and it will either deliver a verdict (the retry then settles `completed`
+ * off the ledger — issue #815's path) or fail and hand the slot back (the retry
+ * then dispatches normally). Both are reached by waiting; neither is reached by
+ * recording a second terminal Review failure and asking the operator to click
+ * again.
+ *
+ * Shaped exactly like the other two token-free waits (the dependency gate, the
+ * eligibility gate): no worktree and no agent were involved — the decline happened
+ * in the trigger registry — so re-checking costs nothing but a row, it spends its
+ * own budget ({@link MAX_DISPATCH_CLAIM_RECHECKS}), and the budget's exhaustion
+ * still reports the collision rather than reverting to the disposition wording.
+ *
+ * Returns `undefined` when the wait cannot be taken — no run to defer, the budget
+ * spent, or the dispatch no longer claimed — and the caller settles terminally as
+ * before. **Claims are deliberately untouched throughout**: this dispatch took
+ * none, and the one it collided with belongs to a live holder.
+ */
+async function deferHeldDispatchClaim(
+	job: SwarmJob,
+	project: ProjectConfig,
+	dispatch: DispatchRow,
+	decline: TriggerDecline,
+): Promise<JobOutcome | undefined> {
+	if (!job.runId) return undefined;
+	const attempt = job.dispatchClaimRecheckAttempt ?? 0;
+	if (attempt >= MAX_DISPATCH_CLAIM_RECHECKS) {
+		logger.warn('Review dispatch claim still held after its re-check budget — failing the run', {
+			projectId: project.id,
+			dispatchId: dispatch.id,
+			runId: job.runId,
+			attempt,
+			reason: decline.reason,
+		});
+		return undefined;
+	}
+	const delayMs =
+		decline.retryAfterSec === undefined
+			? DISPATCH_CLAIM_RECHECK_FALLBACK_MS
+			: Math.min(decline.retryAfterSec * 1000 + 1000, MAX_DISPATCH_CLAIM_RECHECK_MS);
+	const next: SwarmJob = { ...job, dispatchClaimRecheckAttempt: attempt + 1 };
+	logger.info('Dispatch deferred — another dispatch holds this review slot', {
+		projectId: project.id,
+		dispatchId: dispatch.id,
+		runId: job.runId,
+		attempt,
+		retryDelayMs: delayMs,
+		reason: decline.reason,
+	});
+	// Durable intent first, run row second — the ordering every other deferral
+	// uses (`deferBeforeRun`): a crash between them leaves a retry that still fires.
+	await persistRetryPayloadOnRun(job.runId, next);
+	const updated = await scheduleDispatchRetry(dispatch.id, {
+		jobPayload: next,
+		availableAt: new Date(Date.now() + delayMs),
+		// The same reason the two other token-free re-checks record: this waits on an
+		// external condition, and spends no attempt of any failure budget.
+		waitReason: 'recheck',
+		attempt: attempt + 1,
+		lastError: decline.reason,
+		runId: job.runId,
+	});
+	if (!updated) {
+		logger.debug('Dispatch no longer claimed — not deferring the claim collision (cancelled?)', {
+			dispatchId: dispatch.id,
+			runId: job.runId,
+		});
+		return undefined;
+	}
+	await finalizeRun(job.runId, {
+		status: 'deferred',
+		error: decline.reason,
+		nextRetryAt: new Date(Date.now() + delayMs),
+	});
+	try {
+		await publishDispatchWakeUp(updated);
+	} catch (err) {
+		logger.warn('Failed to publish a claim-collision re-check (reconciler will repair)', {
+			dispatchId: dispatch.id,
+			error: describeError(err),
+		});
+	}
+	return { status: 'no-trigger', heldClaimRetryScheduled: true };
+}
+
+/**
+ * Settle a no-trigger delivery whose work was **not** already done — the ordinary
+ * case: the disposition changed, the phase was disabled, the card moved. The run a
+ * continuation carries is finalized `failed` and whatever this dispatch's own
+ * trigger claimed is handed back.
+ *
+ * Split out of {@link settleNoTriggerDelivery} so that function stays within the
+ * complexity budget (the file already splits helpers this way), and returns an
+ * outcome only for the one delivery that is *not* settled at all: a collision with
+ * a claim genuinely held, which is deferred instead ({@link deferHeldDispatchClaim}).
+ */
+async function settleUnmatchedNoTriggerDelivery(
+	job: SwarmJob,
+	project: ProjectConfig,
+	dispatch: DispatchRow,
+	decline: TriggerDecline | undefined,
+): Promise<JobOutcome | undefined> {
+	// A collision with a *live* claim is a wait, not a verdict on this run (issue
+	// #1019): the holder is doing this run's work, so the continuation is
+	// re-scheduled on the holder's lease and settles `deferred` instead of
+	// terminally `failed`. Reached only once the caller's already-completed read has
+	// declined it, deliberately: a redelivery whose verdict the ledger records has
+	// *finished*, and recording that outcome beats waiting for a slot it no longer
+	// needs. Falls through to the terminal settle below when the wait cannot be
+	// taken — no run row, budget spent, dispatch gone — which still reports the
+	// collision rather than the disposition wording.
+	if (decline?.kind === 'dispatch-claim-held') {
+		const deferred = await deferHeldDispatchClaim(job, project, dispatch, decline);
+		if (deferred) return deferred;
+	}
+	if (job.runId) {
+		await finalizeRun(job.runId, {
+			status: 'failed',
+			// A handler that named its own reason is reported verbatim (issue #1019).
+			// The generic wording below is a *guess* at the cause — it names the board
+			// and the phase's disposition — and a dispatch dropped because SWARM's own
+			// PR+SHA lock is held sends the operator to investigate the wrong system
+			// entirely.
+			error:
+				decline?.reason ??
+				'The pending continuation re-evaluated to no-trigger (e.g. disposition changed or was disabled)',
+		});
+	}
+	// Issue #856: outside the `runId` gate deliberately — the leak this closes is a
+	// dispatch deferred for worker capacity, which never got a run row.
+	//
+	// Skipped outright for a claim collision (issue #1019), and that is the same rule
+	// the hand-back already states rather than a new one: it hands back what *this
+	// dispatch's own trigger* claimed, and a dispatch declined because another one
+	// holds the slot claimed nothing. The gate below keys on `dispatch.phase`, which a
+	// continuation carries from the run it retries (`runs.retryNow`, `resetRun`), so
+	// without this a retry that met a live Review's claim would release that Review's
+	// slot and abandon its ledger reservation — the very hand-back the fresh-webhook
+	// case is spared by having no recorded phase.
+	if (decline?.kind !== 'dispatch-claim-held') {
+		await handBackNoTriggerClaims(job, project, dispatch);
+	}
+	return undefined;
+}
+
+/**
+ * Settle a delivery no trigger claimed. The dispatch normally completes as
  * `no-trigger` — that delivery genuinely matched nothing — but a job carrying a
  * `runId` is a *continuation*, and how its run settles depends on whether the
- * work behind it was ever done.
+ * work behind it was ever done. (The one delivery that does **not** settle here
+ * is the live claim collision below: it is re-scheduled rather than completed,
+ * because nothing about it says the work is over.)
  *
  * **Issue #815.** This branch used to write `failed` unconditionally, conflating
  * two cases it could not tell apart: "the disposition changed and nothing ran"
@@ -4342,7 +4539,9 @@ async function handBackNoTriggerClaims(
  * disposition that changed, sending the operator to inspect a board that was
  * fine. A handler that knows better now says so ({@link TriggerDecline}), and
  * that note is reported verbatim and keeps this settle from handing back claims
- * the dispatch never took.
+ * the dispatch never took. For the one decline that is a *wait* rather than an
+ * outcome — a live claim collision — the run is not settled here at all: see
+ * {@link deferHeldDispatchClaim}.
  */
 async function settleNoTriggerDelivery(
 	job: SwarmJob,
@@ -4379,34 +4578,8 @@ async function settleNoTriggerDelivery(
 		// verdict's own record and must stay. The TTL reaps the claim instead,
 		// exactly as it does for a failed run.
 	} else {
-		if (job.runId) {
-			await finalizeRun(job.runId, {
-				status: 'failed',
-				// A handler that named its own reason is reported verbatim (issue
-				// #1019). The generic wording below is a *guess* at the cause — it names
-				// the board and the phase's disposition — and a dispatch dropped because
-				// SWARM's own PR+SHA lock is held sends the operator to investigate the
-				// wrong system entirely.
-				error:
-					decline?.reason ??
-					'The pending continuation re-evaluated to no-trigger (e.g. disposition changed or was disabled)',
-			});
-		}
-		// Issue #856: outside the `runId` gate deliberately — the leak this closes
-		// is a dispatch deferred for worker capacity, which never got a run row.
-		//
-		// Skipped outright for a claim collision (issue #1019), and that is the same
-		// rule the hand-back already states rather than a new one: it hands back what
-		// *this dispatch's own trigger* claimed, and a dispatch declined because
-		// another one holds the slot claimed nothing. The gate below keys on
-		// `dispatch.phase`, which a continuation carries from the run it retries
-		// (`runs.retryNow`, `resetRun`), so without this a retry that met a live
-		// Review's claim would release that Review's slot and abandon its ledger
-		// reservation — the very hand-back the fresh-webhook case is spared by having
-		// no recorded phase.
-		if (decline?.kind !== 'dispatch-claim-held') {
-			await handBackNoTriggerClaims(job, project, dispatch);
-		}
+		const deferred = await settleUnmatchedNoTriggerDelivery(job, project, dispatch, decline);
+		if (deferred) return deferred;
 	}
 	await tryCompleteDispatch(dispatch.id, 'no-trigger');
 	// Ordering matters exactly as on the ordinary Review success path (see the

@@ -55,6 +55,14 @@ export interface TriggerDecline {
 	kind: 'dispatch-claim-held';
 	/** Operator-facing sentence, recorded verbatim as the settled run's error. */
 	reason: string;
+	/**
+	 * How long the held claim's lease has left, when it could be read — the wait
+	 * the settle schedules its re-check on, so a continuation blocked by a live
+	 * holder is deferred until the slot can actually free rather than failed for
+	 * it (issue #1019). Absent when the lease could not be read at all, which the
+	 * settle falls back to its own cadence for.
+	 */
+	retryAfterSec?: number;
 }
 
 /**

@@ -750,6 +750,9 @@ describe('review trigger', () => {
 				expect(noteDecline).toHaveBeenCalledExactlyOnceWith({
 					kind: 'dispatch-claim-held',
 					reason: expect.stringContaining(`${PROJECT.repo}:42:abc123`),
+					// The same lease as a number: the settle defers a carried run on it
+					// rather than failing the run for a collision that clears by itself.
+					retryAfterSec: 252,
 				});
 				const [{ reason }] = noteDecline.mock.calls[0] as [TriggerDecline];
 				expect(reason).toContain('4m 12s');

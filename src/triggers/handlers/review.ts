@@ -1397,6 +1397,9 @@ async function noteDispatchClaimHeld(
 	ctx.noteDecline({
 		kind: 'dispatch-claim-held',
 		reason: `Another dispatch holds the review slot for pull request #${prNumber} at head '${headSha}' (${dispatchKey}), so this delivery was dropped as a duplicate — ${wait}. This phase's disposition did not change.`,
+		// The same lease, as a number: the settle re-checks a carried run on it
+		// rather than failing the run for a collision that clears by itself.
+		retryAfterSec: ttlSec,
 	});
 }
 
