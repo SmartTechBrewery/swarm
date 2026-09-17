@@ -39,6 +39,17 @@
  * answers "is one already moving", and a halted rollout must not block a new one.
  * That in turn is what lets two of an operator's rollouts hold the same machine at
  * once, which {@link findRolloutHoldElsewhere} is the read for.
+ *
+ * Since issue #1024 a rollout also has a **scope**, and the lookups come in pairs
+ * because of it: every read that used to mean "this operator's rollout" now says
+ * `scope = 'owner'` as well, and each has an installation-wide twin
+ * ({@link findInProgressInstallationRollout}, {@link findLatestInstallationRollout},
+ * {@link findAdvanceableInstallationRollout}). The narrowing is not cosmetic — an
+ * installation-wide rollout carries the administrator who started it in
+ * `requested_by_user_id`, so an un-narrowed owner read would hand *their own*
+ * owner-scoped surfaces a rollout over machines they do not own.
+ * {@link listAdvanceableRollouts}, the tick's read, is deliberately left scope-blind:
+ * a rollout worth advancing is worth advancing whatever it is over.
  */
 
 import { and, asc, desc, eq, exists, inArray, ne, notInArray, or, sql } from 'drizzle-orm';
@@ -49,6 +60,7 @@ import {
 	type WorkerUpdateRollout,
 	type WorkerUpdateRolloutMember,
 	type WorkerUpdateRolloutMemberState,
+	type WorkerUpdateRolloutScope,
 	type WorkerUpdateRolloutStatus,
 } from '../../identity/worker-update-rollout.js';
 import type { WorkerUpdateStatus } from '../../lib/build-identity.js';
@@ -72,6 +84,7 @@ function rowToRollout(row: RolloutRow): WorkerUpdateRollout {
 	return {
 		id: row.id,
 		requestedByUserId: row.requestedByUserId,
+		scope: row.scope as WorkerUpdateRolloutScope,
 		target: row.target,
 		waveSize: row.waveSize,
 		status: row.status as WorkerUpdateRolloutStatus,
@@ -101,6 +114,8 @@ function rowToMember(row: MemberRow): WorkerUpdateRolloutMember {
 /** The fields a caller supplies to start a rollout; `id`/timestamps are generated. */
 export interface CreateRolloutInput {
 	requestedByUserId: string;
+	/** Which machines this rollout is over — `owner` | `installation` (issue #1024). */
+	scope: WorkerUpdateRolloutScope;
 	target: string;
 	waveSize: number;
 	/** The machines to move, in the order they are to be moved — `position` is the index. */
@@ -111,11 +126,13 @@ export interface CreateRolloutInput {
  * Start a rollout and name its members, in one transaction so a rollout never
  * exists without the machines it is about.
  *
- * Rejects with the pg `23505` unique violation when the owner already has an
- * `in_progress` rollout — the partial unique index decides that, not a read here,
- * so a second `swarm workers update --all` landing at the same instant cannot slip
- * between a check and the insert. The caller translates it (a `CONFLICT` naming the
- * status command), exactly as `createWorker`'s duplicate is translated by its own.
+ * Rejects with the pg `23505` unique violation when a live rollout already occupies
+ * the slot this one asks for — the owner's, for `scope = 'owner'`, or the
+ * installation's single one, for `scope = 'installation'`. Both partial unique
+ * indexes decide that, not a read here, so a second `swarm workers update --all`
+ * landing at the same instant cannot slip between a check and the insert. The caller
+ * translates it (a `CONFLICT` naming the status command), exactly as `createWorker`'s
+ * duplicate is translated by its own.
  */
 export async function createRollout(input: CreateRolloutInput): Promise<LoadedRollout> {
 	return await getDb().transaction(async (tx) => {
@@ -123,6 +140,7 @@ export async function createRollout(input: CreateRolloutInput): Promise<LoadedRo
 			.insert(workerUpdateRollouts)
 			.values({
 				requestedByUserId: input.requestedByUserId,
+				scope: input.scope,
 				target: input.target,
 				waveSize: input.waveSize,
 			})
@@ -147,9 +165,18 @@ export async function createRollout(input: CreateRolloutInput): Promise<LoadedRo
 }
 
 /**
- * The owner's most recent rollout whatever its status, or `undefined` when they
- * have never started one — what `swarm workers update --status` reads, so a halted
- * or completed rollout stays readable after it has stopped moving.
+ * The owner's most recent **owner-scoped** rollout whatever its status, or
+ * `undefined` when they have never started one — what `swarm workers update
+ * --status` reads, so a halted or completed rollout stays readable after it has
+ * stopped moving.
+ *
+ * Narrowed by `scope` since issue #1024 for the same reason
+ * {@link findInProgressRolloutForOwner} is, and one that matters more here: an
+ * administrator's installation-wide rollout carries *their* id in
+ * `requested_by_user_id`, so without the narrowing their own owner-scoped status
+ * procedure would answer with it — a member list of machines they do not own,
+ * through a procedure that is owner-scoped and gated by nothing but
+ * `authedProcedure`.
  */
 export async function findLatestRolloutForOwner(
 	ownerUserId: string,
@@ -157,7 +184,12 @@ export async function findLatestRolloutForOwner(
 	const rows = await getDb()
 		.select()
 		.from(workerUpdateRollouts)
-		.where(eq(workerUpdateRollouts.requestedByUserId, ownerUserId))
+		.where(
+			and(
+				eq(workerUpdateRollouts.requestedByUserId, ownerUserId),
+				eq(workerUpdateRollouts.scope, 'owner'),
+			),
+		)
 		.orderBy(desc(workerUpdateRollouts.createdAt), desc(workerUpdateRollouts.id))
 		.limit(1);
 	const row = rows[0];
@@ -165,8 +197,16 @@ export async function findLatestRolloutForOwner(
 }
 
 /**
- * The owner's rollout that is still moving, or `undefined` when none is. At most
- * one can exist (the partial unique index), so this is a lookup rather than a pick.
+ * The owner's **owner-scoped** rollout that is still moving, or `undefined` when none
+ * is. At most one can exist (the partial unique index), so this is a lookup rather
+ * than a pick.
+ *
+ * `scope = 'owner'` is not redundant with the cross-scope refusal the policy applies
+ * on top of it (issue #1024): an installation-wide rollout carries the administrator
+ * who started it in `requested_by_user_id`, so without this the administrator's own
+ * `startRollout({ scope: 'owner' })` would find it and hand it to
+ * `resolveAgainstExisting`, which would *advance* an installation-wide rollout on an
+ * owner-scoped call.
  */
 export async function findInProgressRolloutForOwner(
 	ownerUserId: string,
@@ -177,9 +217,74 @@ export async function findInProgressRolloutForOwner(
 		.where(
 			and(
 				eq(workerUpdateRollouts.requestedByUserId, ownerUserId),
+				eq(workerUpdateRollouts.scope, 'owner'),
 				eq(workerUpdateRollouts.status, 'in_progress'),
 			),
 		)
+		.limit(1);
+	const row = rows[0];
+	return row ? rowToRollout(row) : undefined;
+}
+
+/**
+ * **Anybody's** owner-scoped rollout that is still moving, or `undefined` when none
+ * is — the read behind the cross-scope refusal (issue #1024), which has to answer
+ * "is any owner mid-rollout" before an installation-wide one drains machines those
+ * rollouts are already holding. A lookup rather than a list: the refusal needs one
+ * example to name, not the set.
+ *
+ * Served by the same partial unique index the per-owner lookup is, which under this
+ * predicate holds one row per owner with a live rollout and nothing else.
+ */
+export async function findAnyInProgressOwnerRollout(): Promise<WorkerUpdateRollout | undefined> {
+	const rows = await getDb()
+		.select()
+		.from(workerUpdateRollouts)
+		.where(
+			and(eq(workerUpdateRollouts.scope, 'owner'), eq(workerUpdateRollouts.status, 'in_progress')),
+		)
+		.orderBy(asc(workerUpdateRollouts.createdAt), asc(workerUpdateRollouts.id))
+		.limit(1);
+	const row = rows[0];
+	return row ? rowToRollout(row) : undefined;
+}
+
+/**
+ * The installation-wide rollout that is still moving, or `undefined` when none is —
+ * the installation twin of {@link findInProgressRolloutForOwner} (issue #1024). At
+ * most one can exist for the whole installation, which is
+ * `idx_worker_update_rollouts_installation_live`'s own rule, so this is a lookup
+ * rather than a pick.
+ */
+export async function findInProgressInstallationRollout(): Promise<
+	WorkerUpdateRollout | undefined
+> {
+	const rows = await getDb()
+		.select()
+		.from(workerUpdateRollouts)
+		.where(
+			and(
+				eq(workerUpdateRollouts.scope, 'installation'),
+				eq(workerUpdateRollouts.status, 'in_progress'),
+			),
+		)
+		.limit(1);
+	const row = rows[0];
+	return row ? rowToRollout(row) : undefined;
+}
+
+/**
+ * The installation's most recent installation-wide rollout whatever its status, or
+ * `undefined` when none has ever run — the installation twin of
+ * {@link findLatestRolloutForOwner}, and what
+ * `workers.fleetUpdateStatusForInstallation` reads.
+ */
+export async function findLatestInstallationRollout(): Promise<WorkerUpdateRollout | undefined> {
+	const rows = await getDb()
+		.select()
+		.from(workerUpdateRollouts)
+		.where(eq(workerUpdateRollouts.scope, 'installation'))
+		.orderBy(desc(workerUpdateRollouts.createdAt), desc(workerUpdateRollouts.id))
 		.limit(1);
 	const row = rows[0];
 	return row ? rowToRollout(row) : undefined;
@@ -262,6 +367,33 @@ export async function listAdvanceableRolloutsForOwner(
 		.where(and(eq(workerUpdateRollouts.requestedByUserId, ownerUserId), advanceableRollout()))
 		.orderBy(asc(workerUpdateRollouts.createdAt), asc(workerUpdateRollouts.id));
 	return rows.map(rowToRollout);
+}
+
+/**
+ * The single installation-wide rollout an advance can still move, or `undefined` when
+ * there is none (issue #1024) — the same predicate as the two reads above, narrowed to
+ * `scope = 'installation'`.
+ *
+ * A lookup rather than a list, unlike the owner read beside it: the live one is unique
+ * by index, and a halted installation-wide rollout still owing its members an answer
+ * is the rare second row, so the newest is taken and any older one is left to the
+ * tick — which is already scope-blind and sweeps every advanceable rollout.
+ *
+ * It exists because the per-machine triggers resolve rollouts through the machine's
+ * **owner**, and an installation-wide rollout names machines whose owner never started
+ * anything, so the owner lookup can never find it.
+ */
+export async function findAdvanceableInstallationRollout(): Promise<
+	WorkerUpdateRollout | undefined
+> {
+	const rows = await getDb()
+		.select()
+		.from(workerUpdateRollouts)
+		.where(and(eq(workerUpdateRollouts.scope, 'installation'), advanceableRollout()))
+		.orderBy(desc(workerUpdateRollouts.createdAt), desc(workerUpdateRollouts.id))
+		.limit(1);
+	const row = rows[0];
+	return row ? rowToRollout(row) : undefined;
 }
 
 /**

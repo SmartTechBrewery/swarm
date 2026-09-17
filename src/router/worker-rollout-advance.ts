@@ -26,6 +26,12 @@
  *   and a wave whose members were still running a phase at the last advance, since
  *   a machine going idle is not something the control plane is told.
  *
+ * The two per-machine triggers resolve rollouts through the machine's **owner**, which
+ * since issue #1024 is no longer enough on its own: an installation-wide rollout names
+ * machines whose owner never started anything, so it is looked up beside the owner's
+ * (`findAdvanceableInstallationRollout`). The tick needs no such addition — it is
+ * scope-blind already (`listAdvanceableRollouts`).
+ *
  * All three select an **advanceable** rollout since issue #1023 — every `in_progress`
  * one, plus a `halted` one that still holds an unsettled member. A halt does not stop
  * the members the rollout had already committed to: the policy leaves them to settle
@@ -56,6 +62,7 @@
 
 import { advanceRollout } from '../api/worker-update-rollout.js';
 import {
+	findAdvanceableInstallationRollout,
 	listAdvanceableRollouts,
 	listAdvanceableRolloutsForOwner,
 } from '../db/repositories/workerUpdateRolloutsRepository.js';
@@ -103,11 +110,24 @@ export const ROLLOUT_ADVANCE_TICK_MS = 60_000;
  * `in_progress` rollout (the partial unique index decides that), but a halted one
  * that never settled its in-flight members is advanceable too, and the halted rows
  * are exempt from that index, so there can be more than one.
+ *
+ * And **two lookups** since issue #1024: the owner read can never find an
+ * installation-wide rollout over a machine whose owner started nothing themselves —
+ * its `requested_by_user_id` is the administrator's — so the single advanceable
+ * installation-wide rollout is asked for beside it. Still two indexed lookups and
+ * still no `worker_id` scan over member rows. Both may answer with the same row when
+ * the machine's owner *is* that administrator, so the ids are de-duplicated: advancing
+ * twice would be a no-op, but it would also take the rollout's lock twice for nothing.
  */
 export async function advanceRolloutForWorker(workerId: string): Promise<boolean> {
 	const worker = await getWorker(workerId);
 	if (!worker) return false;
-	const rollouts = await listAdvanceableRolloutsForOwner(worker.ownerUserId);
+	const owned = await listAdvanceableRolloutsForOwner(worker.ownerUserId);
+	const installation = await findAdvanceableInstallationRollout();
+	const rollouts =
+		installation && !owned.some((rollout) => rollout.id === installation.id)
+			? [...owned, installation]
+			: owned;
 
 	let advanced = false;
 	for (const rollout of rollouts) {
