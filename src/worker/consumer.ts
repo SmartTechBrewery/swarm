@@ -62,7 +62,9 @@ import {
 	hasCompletedRunForTask,
 	isPipelineRun,
 	isRetryPendingStatus,
+	listRunCommitUnavailableWorkerIds,
 	type RunStatus,
+	recordRunCommitUnavailableWorker,
 	recordRunPreservedWorker,
 	resetRunToRunning,
 	storeRunLogs,
@@ -182,6 +184,7 @@ import {
 	type TriggerPhase,
 	type TriggerResult,
 } from '../triggers/types.js';
+import { CommitUnavailableError } from '../worktree/commit-availability.js';
 import { reconcileTerminatedWorktree } from '../worktree/termination-cleanup.js';
 import { DEFAULT_AGENT_TIMEOUT_MS, resolveAgentTimeoutMs } from './agent-timeout.js';
 import {
@@ -575,6 +578,10 @@ export function retryDelayForFailure(failure: DeferrableFailure, now: number): n
 		failure.kind === 'delivery' ||
 		failure.kind === 'worktree-exists' ||
 		failure.kind === 'stalled' ||
+		// A commit this machine could not obtain (issue #1018): waiting changes nothing
+		// about the machine that failed, and the point of the retry is to reach a
+		// *different* one — so it takes the same dedup-claim floor an abort does.
+		failure.kind === 'commit-unavailable' ||
 		// A timeout has no "resets at…" hint and needs no long wait — the run
 		// simply ran long; retry after the same dedup-claim floor as an abort.
 		failure.kind === 'timeout'
@@ -596,6 +603,8 @@ function deferredPhaseMessage(failure: DeferrableFailure, phase: TriggerPhase): 
 			return `Phase stopped - ${phaseLabel(phase)} — delivery failed, deferring retry`;
 		case 'worktree-exists':
 			return `Phase stopped - ${phaseLabel(phase)} — worktree already exists, deferring retry`;
+		case 'commit-unavailable':
+			return `Phase stopped - ${phaseLabel(phase)} — this worker could not obtain the commit, deferring retry on another worker`;
 		case 'stalled':
 			return `Phase stopped - ${phaseLabel(phase)} — response stalled, deferring resume retry`;
 		case 'timeout':
@@ -994,6 +1003,8 @@ function waitReasonForDeferral(kind: DeferrableFailure['kind'] | undefined): Dis
 			return 'delivery';
 		case 'worktree-exists':
 			return 'worktree-exists';
+		case 'commit-unavailable':
+			return 'commit-unavailable';
 		default:
 			return 'rate-limit';
 	}
@@ -3668,6 +3679,11 @@ function knownFailureCondition(
 	// A classified auth failure (issue #343) diagnoses off its kind, like the three
 	// above, rather than depending on the exact wording of its message.
 	if (failureKind === 'auth') return 'launch-or-authentication';
+	// The only machine-scoped condition in this list (issue #1018): every eligible
+	// worker has now failed to obtain the commit, so the run really has run out of
+	// places to go and the diagnosis says what was missing rather than restating git's
+	// `invalid reference`.
+	if (failureKind === 'commit-unavailable') return 'commit-unavailable';
 	if (isLaunchOrAuthenticationFailure(error)) return 'launch-or-authentication';
 	return undefined;
 }
@@ -3785,7 +3801,27 @@ async function handlePhaseFailure(
 			? err.failure.kind
 			: err instanceof BlockedRecoveryError
 				? 'blocked-recovery'
-				: undefined;
+				: err instanceof CommitUnavailableError
+					? ('commit-unavailable' as const)
+					: undefined;
+
+	// This machine could not obtain the commit the phase's checkout has to be detached
+	// at (issue #1018). Record it against the run *before* the deferral settles, so the
+	// next attempt's gate can prefer a machine that has not already failed to get it —
+	// the write is sticky across the settle's own recovery rewrite, so the order is not
+	// load-bearing, only the fact that it happens at all. Best-effort: a machine SWARM
+	// merely fails to steer away from is exactly today's behaviour, and must not cost
+	// the run its retry.
+	if (failureKind === 'commit-unavailable' && runId) {
+		try {
+			await recordRunCommitUnavailableWorker(runId);
+		} catch (recordErr) {
+			logger.warn('Failed to record the worker that could not obtain the run commit', {
+				runId,
+				error: describeError(recordErr),
+			});
+		}
+	}
 
 	// A usage/session-limit hit or a worker-shutdown abort is transient/recoverable:
 	// rather than failing the job, we defer it and let the worker re-enqueue it once
@@ -3803,6 +3839,11 @@ async function handlePhaseFailure(
 				err.failure.kind === 'capacity' ||
 				err.failure.kind === 'aborted' ||
 				err.failure.kind === 'stalled' ||
+				// A commit this machine could not obtain (issue #1018) — the rebuilt
+				// federated twin of the `CommitUnavailableError` branch below, since a
+				// worker reports it as a classified deferral rather than as the error
+				// object.
+				err.failure.kind === 'commit-unavailable' ||
 				// A timeout resumes only when the run was genuinely interrupted: it
 				// carries an agent result whose exit was non-zero/null (the phase threw
 				// and preserved its worktree). A run that trapped SIGTERM and still
@@ -3816,7 +3857,14 @@ async function handlePhaseFailure(
 				(err.failure.kind === 'timeout' &&
 					(err.failure.cliSelfTimeout !== undefined ||
 						(err.agent !== undefined && err.agent.exitCode !== 0))))) ||
-		err instanceof DeliveryDeferredError;
+		err instanceof DeliveryDeferredError ||
+		// A phase whose checkout must be detached at a commit this worker does not have
+		// (issue #1018). Deferrable — unlike the worktree collision above — because it
+		// is a statement about *this machine*, not about the run: the commit is on the
+		// remote and another enrolled worker can serve it, so the retry has somewhere
+		// better to go. The gate is what sends it there; this is only what keeps the run
+		// alive long enough to be sent.
+		err instanceof CommitUnavailableError;
 	// Tier 2's decision (issue #503) is resolved once and used twice: by the deferral,
 	// which turns it into a `checkpointed` settle, and by the terminal path below, which
 	// reports an exhausted continuation budget as the reason the run stopped for good.
@@ -3828,7 +3876,11 @@ async function handlePhaseFailure(
 	}
 	if (isDeferrable) {
 		const failure: DeferrableFailure =
-			err instanceof AgentRunError ? err.failure : { kind: 'delivery' };
+			err instanceof AgentRunError
+				? err.failure
+				: err instanceof CommitUnavailableError
+					? { kind: 'commit-unavailable' }
+					: { kind: 'delivery' };
 		const deferred = deferAgentRunError(
 			failure,
 			job,
@@ -3963,6 +4015,29 @@ async function resolvePreservedWorkerPin(job: SwarmJob): Promise<PreservedWorker
 }
 
 /**
+ * The machines this run has already failed to obtain its commit on (issue #1018).
+ *
+ * Read separately from {@link resolvePreservedWorkerPin}'s run read, and on the
+ * opposite failure policy: that one fails **closed**, because dispatching a
+ * continuation without its pin is itself the defect, while this one fails **open** —
+ * an unreadable list only costs the retry the preference it would have had, which is
+ * exactly today's behaviour, and refusing a dispatch over it would be a worse outcome
+ * than the defect it steers around.
+ */
+async function resolveCommitUnavailableWorkers(job: SwarmJob): Promise<string[]> {
+	if (!job.runId) return [];
+	try {
+		return await listRunCommitUnavailableWorkerIds(job.runId);
+	} catch (err) {
+		logger.warn('Could not read which workers failed to obtain this run commit (continuing)', {
+			runId: job.runId,
+			error: describeError(err),
+		});
+		return [];
+	}
+}
+
+/**
  * Run the federated eligibility gate for this dispatch (issue #339) and return
  * the selected target, or `undefined` when the project is not federated (no
  * enrolled workers — the local worker runs it, exactly as before).
@@ -4029,6 +4104,11 @@ async function gateDispatch(
 				// recorded for it (issue #954). The gate refuses that rather than routing
 				// it, but only once it knows the project is federated at all.
 				preservedWorkerUnknown: preservedPin.machineUnknown,
+				// The machines that already failed to obtain this run's commit (issue
+				// #1018) — the softest narrowing the gate applies, and the one that stops
+				// a deterministic roster walk from sending every retry back to the clone
+				// that does not have it.
+				commitUnavailableWorkerIds: await resolveCommitUnavailableWorkers(job),
 			},
 			{
 				...gateOptions,

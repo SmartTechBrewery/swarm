@@ -491,6 +491,11 @@ export type RunRecoveryRecord = NonNullable<typeof runs.$inferSelect.recovery>;
  *   write, which is the fresh, non-recovery attempt that gives the checkout up.
  * - `abandonedWorkerId` — a historical fact about the row, so it survives even a
  *   `null` write; nothing but a later abandonment replaces it.
+ * - `commitUnavailableWorkerIds` — the machines that could not obtain this run's
+ *   commit (issue #1018), sticky on the same terms as `abandonedWorkerId`: the
+ *   settle that records the failure is followed immediately by the deferral's own
+ *   recovery write, and the next attempt's is a `null` one, so anything less sticky
+ *   than this would be erased before the retry it exists to steer ever reads it.
  *
  * Written as one SQL expression so the merge reads the row's current value under
  * the same statement that replaces it — no read-modify-write race with a
@@ -499,10 +504,14 @@ export type RunRecoveryRecord = NonNullable<typeof runs.$inferSelect.recovery>;
 function recoveryWriteSql(next: RunRecoveryRecord | null): SQL {
 	const sticky =
 		next === null
-			? sql`jsonb_build_object('abandonedWorkerId', ${runs.recovery} -> 'abandonedWorkerId')`
+			? sql`jsonb_build_object(
+					'abandonedWorkerId', ${runs.recovery} -> 'abandonedWorkerId',
+					'commitUnavailableWorkerIds', ${runs.recovery} -> 'commitUnavailableWorkerIds'
+				)`
 			: sql`jsonb_build_object(
 					'abandonedWorkerId', ${runs.recovery} -> 'abandonedWorkerId',
-					'preservedWorkerId', ${runs.recovery} -> 'preservedWorkerId'
+					'preservedWorkerId', ${runs.recovery} -> 'preservedWorkerId',
+					'commitUnavailableWorkerIds', ${runs.recovery} -> 'commitUnavailableWorkerIds'
 				)`;
 	const base = next === null ? sql`'{}'::jsonb` : sql`${JSON.stringify(next)}::jsonb`;
 	// `jsonb_strip_nulls` drops the absent sticky keys (`jsonb -> key` is SQL NULL
@@ -974,6 +983,63 @@ export async function recordRunPreservedWorker(runId: string): Promise<void> {
 }
 
 /**
+ * Record that **this attempt's machine** could not obtain the commit the phase's
+ * checkout has to be detached at (issue #1018), taken from the attempt's own
+ * `worker_id` exactly as {@link recordRunPreservedWorker} is.
+ *
+ * Appended rather than replaced: each failing machine adds itself, so the next
+ * attempt can prefer one that has not failed yet, and the list is what eventually
+ * bounds the search once every eligible machine is on it. The `@>` guard makes a
+ * repeat observation a no-op instead of growing the array — and, together with the
+ * sticky merge in {@link recoveryWriteSql}, is what lets this be written *before*
+ * the settle that immediately rewrites the column.
+ *
+ * A run with no recorded worker (an unfederated one) matches nothing and records
+ * nothing: there is no other machine to steer a retry towards. Best-effort like the
+ * rest of run tracking — the caller swallows and logs a throw.
+ */
+export async function recordRunCommitUnavailableWorker(runId: string): Promise<void> {
+	await getDb()
+		.update(runs)
+		.set({
+			recovery: sql`coalesce(${runs.recovery}, '{}'::jsonb) || jsonb_build_object(
+				'commitUnavailableWorkerIds',
+				coalesce(${runs.recovery} -> 'commitUnavailableWorkerIds', '[]'::jsonb)
+					|| to_jsonb(${runs.workerId}::text)
+			)`,
+		})
+		.where(
+			and(
+				eq(runs.id, runId),
+				isNotNull(runs.workerId),
+				sql`not coalesce(${runs.recovery} -> 'commitUnavailableWorkerIds', '[]'::jsonb)
+					@> to_jsonb(${runs.workerId}::text)`,
+			),
+		);
+}
+
+/**
+ * The machines already known to be unable to obtain this run's commit (issue
+ * #1018) — the dispatch gate's read of what {@link recordRunCommitUnavailableWorker}
+ * wrote.
+ *
+ * Answers an empty array for a run that has none, for a run that does not exist,
+ * and for a malformed record: the list only ever *reorders* a preference the gate
+ * would otherwise make blindly, so a value it cannot read must degrade to today's
+ * behaviour rather than narrow the roster on a guess.
+ */
+export async function listRunCommitUnavailableWorkerIds(runId: string): Promise<string[]> {
+	const rows = await getDb()
+		.select({ recovery: runs.recovery })
+		.from(runs)
+		.where(eq(runs.id, runId))
+		.limit(1);
+	const recorded = rows[0]?.recovery?.commitUnavailableWorkerIds;
+	if (!Array.isArray(recorded)) return [];
+	return recorded.filter((id): id is string => typeof id === 'string' && id.length > 0);
+}
+
+/**
  * Clear a run's recovery record for a "Reset & restart" (issue #424): the fresh
  * attempt starts from a clean slate, so a `blocked`/`preserved` record must not
  * keep misleading retention (`hasResumableDeferredRun`), the reclaim gate, or
@@ -993,6 +1059,10 @@ export async function recordRunPreservedWorker(runId: string): Promise<void> {
  * whose work was given up is kept as the record of it. An existing
  * `abandonedWorkerId` is retained when there is no pin to replace it, and a run with
  * neither ends up with a `NULL` column exactly as before.
+ *
+ * The commit-unavailability list (issue #1018) is cleared with everything else, and
+ * that is the action's whole job here: it is the one operator gesture that forgives
+ * a machine SWARM has been steering this run away from.
  */
 export async function clearRunRecovery(runId: string): Promise<void> {
 	await getDb()

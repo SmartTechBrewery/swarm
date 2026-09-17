@@ -95,6 +95,14 @@ export type DispatchWaitReason =
 	| 'delivery'
 	| 'worktree-exists'
 	| 'stalled'
+	/**
+	 * The machine this attempt ran on could not obtain the commit its checkout has to
+	 * be detached at (issue #1018). A wait on *routing* rather than on time: the retry
+	 * is scheduled at the ordinary floor, and the dispatch gate prefers a machine that
+	 * has not already failed to get the commit
+	 * (`runs.recovery.commitUnavailableWorkerIds`).
+	 */
+	| 'commit-unavailable'
 	| 'recheck'
 	/**
 	 * No eligible worker could take the dispatch (issue #339's federated gate)

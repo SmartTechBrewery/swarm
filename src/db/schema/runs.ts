@@ -349,6 +349,27 @@ export const runs = pgTable(
 			 * attempt's recovery rewrite does not clear.
 			 */
 			abandonedWorkerId?: string | null;
+			/**
+			 * The machines that failed to obtain a commit this run's checkout has to be
+			 * detached at (issue #1018) — appended by
+			 * {@link recordRunCommitUnavailableWorker} from the attempt's own `worker_id`.
+			 *
+			 * A third machine-location fact, beside the two above and for the same reason
+			 * they are here: selection is deterministic (the roster is walked in the
+			 * project's configured order and the first eligible machine wins), so nothing
+			 * recorded that *this* worker had just failed this dispatch, and every retry
+			 * went back to the machine whose clone could not serve the commit. The
+			 * dispatch gate reads this as a **preference**, not a ban — it re-admits the
+			 * listed machines when they are all that is eligible, which is what bounds a
+			 * commit no worker can fetch to the ordinary retry budget instead of a walk
+			 * around the roster forever.
+			 *
+			 * A historical fact about the row rather than live recovery state, so — like
+			 * `abandonedWorkerId` — it survives even the `null` recovery write a fresh
+			 * attempt makes, and is forgiven only by "Reset & restart"
+			 * ({@link clearRunRecovery}).
+			 */
+			commitUnavailableWorkerIds?: string[] | null;
 		}>(),
 		/**
 		 * This run's recorded cancellation origin (issue #308), mirroring

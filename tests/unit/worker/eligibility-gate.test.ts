@@ -598,6 +598,65 @@ describe('evaluateDispatchEligibility', () => {
 		});
 	});
 
+	// Issue #1018. Selection is deterministic — the roster is walked in the project's
+	// configured order and the first eligible machine wins — so a worker at the front
+	// whose clone cannot serve the reviewed commit won every retry, and the operator's
+	// only escape was suspending its enrollment by hand. These pin the preference and,
+	// just as importantly, its bound.
+	describe('commit-unavailable preference', () => {
+		it('sends the retry to another eligible worker, not back to the one that failed', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-stale'),
+				makeCandidate('w-has-commit'),
+			]);
+
+			const decision = await evaluateDispatchEligibility(
+				gateInput({ phase: 'review', commitUnavailableWorkerIds: ['w-stale'] }),
+			);
+
+			expect(decision).toMatchObject({
+				status: 'selected',
+				selection: { workerId: 'w-has-commit' },
+			});
+		});
+
+		it('re-admits the listed machine when it is the only eligible one', async () => {
+			// The bound. A commit no worker can fetch must spend the ordinary retry
+			// budget rather than walk the roster forever, and a single-worker project
+			// must never be wedged by a list covering its one machine.
+			listProjectDispatchCandidates.mockResolvedValue([makeCandidate('w-stale')]);
+
+			expect(
+				await evaluateDispatchEligibility(
+					gateInput({ phase: 'review', commitUnavailableWorkerIds: ['w-stale'] }),
+				),
+			).toMatchObject({ status: 'selected', selection: { workerId: 'w-stale' } });
+		});
+
+		it('prefers between *eligible* workers only — a listed machine still wins over an ineligible one', async () => {
+			// "While another eligible worker exists" is the rule, so a second machine that
+			// is merely offline must not turn the preference into a wait for it.
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-stale'),
+				makeCandidate('w-offline', { connected: false }),
+			]);
+
+			expect(
+				await evaluateDispatchEligibility(
+					gateInput({ phase: 'review', commitUnavailableWorkerIds: ['w-stale'] }),
+				),
+			).toMatchObject({ status: 'selected', selection: { workerId: 'w-stale' } });
+		});
+
+		it('changes nothing for a dispatch with no such record', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([makeCandidate('w-1'), makeCandidate('w-2')]);
+
+			expect(
+				await evaluateDispatchEligibility(gateInput({ commitUnavailableWorkerIds: [] })),
+			).toMatchObject({ status: 'selected', selection: { workerId: 'w-1' } });
+		});
+	});
+
 	// Issue #567. A continuation's state — a Tier 2 checkpoint, a resumable session,
 	// a delivery sidecar — is machine-local, so routing it anywhere but the machine
 	// that holds it silently redoes the work. These pin the narrowing itself; the

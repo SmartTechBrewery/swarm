@@ -30,6 +30,7 @@ import { TRANSPORT_PROTOCOL_VERSION } from '@/transport/protocol.js';
 import type { AssignmentSink } from '@/transport/worker-client.js';
 import { ALL_TRIGGER_PHASES } from '@/triggers/types.js';
 import type { AssignedPhaseInputs, PhaseRunResult } from '@/worker/consumer.js';
+import { CommitUnavailableError } from '@/worktree/commit-availability.js';
 import { BlockedRecoveryError } from '@/worktree/reclaim.js';
 import { createMockTaskAssignmentInput, createMockWorkItem } from '../../helpers/factories.js';
 
@@ -1221,6 +1222,29 @@ describe('runAssignmentDbFree', () => {
 
 		expect(frame.retryAfter).toBeUndefined();
 		expect(frame.resetHint).toBeUndefined();
+	});
+
+	// Issue #1018. A federated worker is the only side that can see its own clone, and
+	// the control plane is the only side that knows whether another machine could serve
+	// the commit — so this settles as a deferral carrying the whole cause, not as a
+	// terminal failure the control plane could only re-report.
+	it('defers a commit this machine could not obtain, carrying the fetch failure', () => {
+		const frame = deferrableOrFailedResult(
+			new CommitUnavailableError('bbe9b84c4a32486778d136f4d9c0c0cbe13bbd7e', {
+				repoRoot: '/Users/dev/swarm/swarm',
+				taskId: '224',
+				fetchError: 'Connection refused',
+				fetched: true,
+			}),
+			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'review' })),
+		);
+
+		expect(frame).toMatchObject({ status: 'deferred', failureKind: 'commit-unavailable' });
+		// Not resumable: nothing was provisioned, so there is no checkout to continue —
+		// which is exactly what frees the retry to land on a different machine.
+		expect(frame.resumable).toBe(false);
+		expect(frame.reason).toContain('Connection refused');
+		expect(frame.reason).not.toContain('invalid reference');
 	});
 
 	// A delivery deferral carries no `AgentFailure` at all — this guards the `in`

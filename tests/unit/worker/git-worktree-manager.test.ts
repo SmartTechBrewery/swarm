@@ -96,11 +96,39 @@ vi.mock('node:fs', () => ({
 }));
 
 import { GitWorktreeManager } from '@/worker/git-worktree-manager.js';
+import { CommitUnavailableError } from '@/worktree/commit-availability.js';
 import { BlockedRecoveryError } from '@/worktree/reclaim.js';
 import type { WorktreeRuntime } from '@/worktree/worktree-runtime.js';
 
 const REPO_ROOT = '/Users/dev/swarm/swarm';
 const WORKTREE_14 = `${REPO_ROOT}/.swarm-workspaces/task-14`;
+/** The head SHA shape Review detaches at — a commit, never a branch name. */
+const HEAD_SHA = 'bbe9b84c4a32486778d136f4d9c0c0cbe13bbd7e';
+
+/**
+ * A git world for the detach-at-a-head-SHA path (issue #1018): `origin/<sha>` never
+ * resolves, and whether the *commit* resolves is the question the provisioner now
+ * asks. `present` is that answer, as a value or as a function for a world the
+ * targeted fetch changes mid-provision.
+ */
+function detachWorld(world: {
+	present: boolean | (() => boolean);
+}): (args: string[]) => GitOutcome {
+	const present = (): boolean =>
+		typeof world.present === 'function' ? world.present() : world.present;
+	return (args) => {
+		if (args[0] === 'symbolic-ref') return { stdout: 'issue-14\n' };
+		if (args[0] === 'rev-parse' && args[1] === '--verify') {
+			if (args[3] === `${HEAD_SHA}^{commit}`) {
+				if (!present()) throw new Error('fatal: Needed a single revision');
+				return { stdout: `${HEAD_SHA}\n` };
+			}
+			// Every other ref read here is `refs/remotes/origin/<sha>`, which never resolves.
+			throw new Error('fatal: unknown revision');
+		}
+		return { stdout: '' };
+	};
+}
 
 function makeManager(overrides = {}) {
 	return new GitWorktreeManager(createMockProjectConfig({ repoRoot: REPO_ROOT, ...overrides }));
@@ -445,17 +473,79 @@ describe('GitWorktreeManager', () => {
 		it('falls back to the literal base when origin has no ref of that name', async () => {
 			// What the Review phase passes: a head SHA, which names no remote branch.
 			// Prefixing it with `origin/` would make every review provision fail.
+			gitHandler = detachWorld({ present: true });
+
+			await makeManager().provision('14', { detach: true, baseBranch: HEAD_SHA });
+
+			expect(gitCalls.at(-1)).toEqual(['worktree', 'add', '--detach', WORKTREE_14, HEAD_SHA]);
+			// The commit was already here, so nothing beyond the ordinary fetch was asked
+			// of the remote.
+			expect(gitCalls.filter((c) => c[0] === 'fetch')).toEqual([['fetch', 'origin']]);
+		});
+
+		// Issue #1018. `rev-parse --verify <40-hex>` answers a well-formed SHA back
+		// whether or not the object is present, which is how a head SHA produced on
+		// another machine reached `git worktree add` and died there as
+		// `fatal: invalid reference`.
+		it('fetches a detach base commit this clone does not have, then provisions at it', async () => {
+			let present = false;
 			gitHandler = (args) => {
+				if (args[0] === 'fetch' && args[2] === HEAD_SHA) {
+					present = true;
+					return { stdout: '' };
+				}
+				return detachWorld({ present: () => present })(args);
+			};
+
+			const handle = await makeManager().provision('14', {
+				detach: true,
+				baseBranch: HEAD_SHA,
+			});
+
+			expect(gitCalls.filter((c) => c[0] === 'fetch')).toEqual([
+				['fetch', 'origin'],
+				['fetch', 'origin', HEAD_SHA],
+			]);
+			expect(gitCalls.at(-1)).toEqual(['worktree', 'add', '--detach', WORKTREE_14, HEAD_SHA]);
+			expect(handle).toMatchObject({ branch: HEAD_SHA, detached: true });
+		});
+
+		it('fails naming the commit and the failed fetch when the commit cannot be obtained', async () => {
+			gitHandler = (args) => {
+				if (args[0] === 'fetch') throw new Error('git fetch origin failed: Connection refused');
+				return detachWorld({ present: false })(args);
+			};
+
+			const err = await makeManager()
+				.provision('14', { detach: true, baseBranch: HEAD_SHA })
+				.catch((e: unknown) => e);
+
+			expect(err).toBeInstanceOf(CommitUnavailableError);
+			const message = (err as Error).message;
+			// The cause the operator never saw: the fetch, and why it failed.
+			expect(message).toContain(HEAD_SHA);
+			expect(message).toContain('Connection refused');
+			expect(message).toContain(REPO_ROOT);
+			// Never git's own symptom, which sent operators to check the PR and the SHA.
+			expect(message).not.toContain('invalid reference');
+			// The checkout was never attempted, so nothing was left half-created.
+			expect(gitCalls.some((c) => c[0] === 'worktree' && c[1] === 'add')).toBe(false);
+			expect(releaseWorktreeLeaseMock).toHaveBeenCalled();
+		});
+
+		it('names a failed fetch when the checkout itself fails afterwards', async () => {
+			gitHandler = (args) => {
+				if (args[0] === 'fetch') throw new Error('Could not resolve host: github.com');
 				if (args[0] === 'symbolic-ref') return { stdout: 'issue-14\n' };
-				if (args[0] === 'rev-parse' && args[1] === '--verify') {
-					throw new Error('fatal: unknown revision');
+				if (args[0] === 'worktree' && args[1] === 'add') {
+					throw new Error('fatal: invalid reference: origin/main');
 				}
 				return { stdout: '' };
 			};
 
-			await makeManager().provision('14', { detach: true, baseBranch: 'deadbee' });
-
-			expect(gitCalls.at(-1)).toEqual(['worktree', 'add', '--detach', WORKTREE_14, 'deadbee']);
+			await expect(makeManager().provision('14')).rejects.toThrow(
+				/Could not resolve host: github.com/,
+			);
 		});
 
 		it('skips the fetch when fetch is false', async () => {

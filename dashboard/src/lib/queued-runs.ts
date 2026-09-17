@@ -60,6 +60,10 @@ const QUEUED_WAIT_REASON_LABELS: Record<QueuedWaitReason, string> = {
 	delivery: 'retrying result delivery',
 	'worktree-exists': 'retrying after a worktree collision',
 	stalled: 'retrying after a stalled response',
+	// Names the machine's clone rather than the commit, because the commit is fine —
+	// it is on the remote, and the retry is going to a machine that has it (issue
+	// #1018).
+	'commit-unavailable': 'retrying on a worker that has the commit',
 	recheck: 'waiting for checks to settle',
 	// The two halves of the dispatch gate's wait, deliberately worded so an operator
 	// can tell them apart at a glance (issue #607): the first clears on its own once a

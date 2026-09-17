@@ -88,6 +88,7 @@ import {
 import { GitWorktreeManager } from '../worker/git-worktree-manager.js';
 import { HEARTBEAT_MS, stillRunningLine } from '../worker/live-output.js';
 import { linkRunAbortController } from '../worker/run-cancellation.js';
+import { CommitUnavailableError } from '../worktree/commit-availability.js';
 import { createHostLocalWorktreeRuntime } from '../worktree/host-local-runtime.js';
 import { BlockedRecoveryError } from '../worktree/reclaim.js';
 import { reconstructProjectConfig } from './db-free-project.js';
@@ -257,6 +258,13 @@ export type DeferrableAssignmentFailure =
 export function classifyDeferrable(err: unknown): DeferrableAssignmentFailure | undefined {
 	if (err instanceof DependencyBlockedError) return { kind: 'dependency', blockers: err.blockers };
 	if (err instanceof DeliveryDeferredError) return { kind: 'delivery' };
+	// This machine could not obtain the commit the phase's checkout has to be detached
+	// at (issue #1018). Reported as a deferral rather than a terminal failure because
+	// the fact is about *this host*, not about the run — the control plane's gate can
+	// route the retry to a machine that holds the commit, and it is the only side that
+	// knows whether one exists. The message already names the commit and both fetch
+	// failures, so the frame's `reason` carries the whole cause across.
+	if (err instanceof CommitUnavailableError) return { kind: 'commit-unavailable' };
 	if (err instanceof AgentRunError) {
 		const kind = err.failure.kind;
 		if (kind === 'rate-limit' || kind === 'capacity' || kind === 'aborted' || kind === 'stalled') {

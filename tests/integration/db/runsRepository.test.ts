@@ -33,11 +33,13 @@ import {
 	hasLiveRunForTask,
 	hasResumableDeferredRun,
 	hasRunForTask,
+	listRunCommitUnavailableWorkerIds,
 	listRunsFromDb,
 	listTaskActivitySince,
 	MAX_RUN_OUTPUT_BYTES,
 	markRunUserTerminated,
 	recordRunCleanupBlocked,
+	recordRunCommitUnavailableWorker,
 	recordRunPreservedWorker,
 	resetRunToRunning,
 	settleWorkerUpdateRun,
@@ -1017,6 +1019,92 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			);
 
 			expect((await getRunByIdFromDb(id))?.recovery).toEqual({ abandonedWorkerId: worker.id });
+		});
+	});
+
+	// Issue #1018. Same reasoning as the pin above, and the same risk: three
+	// hand-written jsonb expressions whose whole job is to survive the wholesale
+	// recovery rewrites every settle performs. Losing the list silently re-opens the
+	// defect — every retry back to the one clone that could not serve the commit.
+	describe('commit-unavailable machines (issue #1018)', () => {
+		it('records the attempt’s own machine, and survives the settle that follows it', async () => {
+			const { worker, owner } = await seedWorker('commit-a');
+			const id = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '1018a',
+				phase: 'review',
+				workerId: worker.id,
+				workerUserId: owner.id,
+			});
+
+			await recordRunCommitUnavailableWorker(id);
+			// The deferral's own recovery write lands right after, and a later fresh
+			// attempt writes `null` — neither may erase the list.
+			await completeRun(id, { status: 'deferred', error: 'commit not in this clone' });
+
+			expect(await listRunCommitUnavailableWorkerIds(id)).toEqual([worker.id]);
+		});
+
+		it('appends a second machine and never duplicates the first', async () => {
+			const first = await seedWorker('commit-b');
+			const second = await seedWorker('commit-b-two');
+			const id = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '1018b',
+				phase: 'review',
+				workerId: first.worker.id,
+				workerUserId: first.owner.id,
+			});
+
+			await recordRunCommitUnavailableWorker(id);
+			// A repeat observation from the same machine must not grow the array.
+			await recordRunCommitUnavailableWorker(id);
+			// The retry re-binds the run to the next machine, which then fails too.
+			await resetRunToRunning(
+				id,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				null,
+				second.worker.id,
+				1,
+				second.owner.id,
+			);
+			await recordRunCommitUnavailableWorker(id);
+
+			expect(await listRunCommitUnavailableWorkerIds(id)).toEqual([
+				first.worker.id,
+				second.worker.id,
+			]);
+		});
+
+		it('records nothing for a run with no worker — there is nowhere else to send it', async () => {
+			const id = await createRun({ projectId: PROJECT_ID, taskId: '1018c', phase: 'review' });
+
+			await recordRunCommitUnavailableWorker(id);
+
+			expect((await getRunByIdFromDb(id))?.recovery).toBeNull();
+			expect(await listRunCommitUnavailableWorkerIds(id)).toEqual([]);
+		});
+
+		it('is forgiven by "Reset & restart", the one gesture that clears it', async () => {
+			const { worker, owner } = await seedWorker('commit-d');
+			const id = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '1018d',
+				phase: 'review',
+				workerId: worker.id,
+				workerUserId: owner.id,
+			});
+			await recordRunCommitUnavailableWorker(id);
+
+			await clearRunRecovery(id);
+
+			expect(await listRunCommitUnavailableWorkerIds(id)).toEqual([]);
 		});
 	});
 

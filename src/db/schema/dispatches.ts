@@ -60,7 +60,9 @@ export const dispatches = pgTable(
 		/**
 		 * Why a non-terminal dispatch is waiting: `project-capacity`, `rate-limit`,
 		 * `agent-capacity`, `timeout`, `worker-shutdown`, `delivery`,
-		 * `worktree-exists`, `stalled`, `recheck`, `worker-eligibility`,
+		 * `worktree-exists`, `stalled`, `commit-unavailable` (the machine this attempt
+		 * ran on could not obtain the commit its checkout must be detached at — issue
+		 * #1018), `recheck`, `worker-eligibility`,
 		 * `worker-authorization`, `worker-rate-limited` (every candidate machine has
 		 * hit its usage limit on this phase's CLIs — issue #988),
 		 * `preserved-worker`, `task-in-flight` (a later phase

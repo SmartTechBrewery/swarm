@@ -47,6 +47,15 @@ export type AgentFailureKind =
 	| 'stalled'
 	| 'error'
 	| 'worktree-exists'
+	/**
+	 * This machine could not obtain the commit the phase's checkout has to be
+	 * detached at (issue #1018, `CommitUnavailableError` in
+	 * `../worktree/commit-availability.ts`). A statement about the *worker*, not about
+	 * the run: the commit is typically on the remote and another enrolled machine
+	 * holds it, so the run defers and the next attempt prefers a machine that has not
+	 * already failed to get it (`../worker/eligibility-gate.ts`).
+	 */
+	| 'commit-unavailable'
 	| 'blocked-recovery';
 
 export interface AgentFailure {
