@@ -436,9 +436,11 @@ drained, all at once, and reports a disposition per machine.
 very same rollout over *every* registered machine, whoever owns it (issue #1024) —
 `workers.startFleetUpdateForInstallation` to start or advance it,
 `workers.fleetUpdateStatusForInstallation` to read it, each line naming the machine's
-owner. It is API-only for now: there is no CLI command and no dashboard button yet
-(`swarm workers request-update` stays the unstaged installation-wide fan-out, and
-`swarm workers update --all` stays your own fleet).
+owner. **The dashboard is where an administrator drives it** (issue #1025): the
+`/workers` toolbar's **Update all workers** button starts it, and the readout above
+the roster says where every machine stands while it runs — see below. There is still
+no CLI command for it (`swarm workers request-update` stays the unstaged
+installation-wide fan-out, and `swarm workers update --all` stays your own fleet).
 
 It behaves exactly like the rollout above — one bounded wave at a time, never
 interrupting a machine mid-phase, advancing itself off reports and reconnects, and
@@ -467,17 +469,40 @@ shipping a fix is not the person who owns the machines that have to run it, an
 swarm workers request-update main        # every machine on the installation
 ```
 
-The same ask is in the dashboard (issue #1009), in the `/workers` toolbar above the
-roster: **Update all workers**, which asks for the build the control plane itself is
-running rather than taking a ref, confirms what it is about to touch first, and then
-shows the same per-machine report — dispositions, owners and all — in the modal. A
-project's own administrator has the narrower form in the same place on the project
-detail page's **Workers** tab (issue #1010): **Update project workers** asks the
-machines enrolled in that project, in the project's configured order, through
-`workers.requestUpdateForProject`. It has no CLI counterpart — the command above is
-the installation — and its confirmation adds the one thing that set has to say: a
-machine enrolled in other projects as well is moved for all of them, since an update
-moves its SWARM install root rather than one enrollment.
+**The dashboard does the staged thing instead** (issue #1025). The `/workers` toolbar
+above the roster has **Update all workers**, and since that issue it starts the
+*staged installation-wide rollout* described earlier —
+`workers.startFleetUpdateForInstallation` — rather than this command's one-shot ask.
+It arrived (issue #1009) calling the fan-out, which on an installation where draining
+stays each owner's own call reported nearly every machine `in-pool` and moved nothing;
+the rollout drains the machines itself, so the button now does what its label says. It
+asks for the build the control plane itself is running rather than taking a ref, and
+confirms first — and its confirmation says what a rollout actually does: it drains a
+bounded number of machines at a time, never interrupts a phase already running, waits
+for each machine to come back on the new build, halts the whole thing on one that
+cannot take it, and gives every machine it drained back to the dispatch pool, a halt
+included.
+
+**Where it is read from is the page, not the modal.** A rollout advances itself, so
+`/workers` carries a readout above the roster whenever one has run: the target, the
+status, the wave size, the halt reason when it halted, and one line per machine with
+its owner, its state (`queued`, `draining`, `signalled`, `verifying`, `done`,
+`skipped`, `failed`) and whatever that machine itself reported. It polls on the
+roster's own cadence and survives a page reload, so closing the tab mid-rollout loses
+nothing. A machine that settled `skipped` — enrolled in no project, or running under
+no process supervisor — reads as skipped with its reason and never as done: it is
+still on the build it had.
+
+A project's own administrator has the narrower, **unstaged** form in the same place on
+the project detail page's **Workers** tab (issue #1010): **Update project workers**
+asks the machines enrolled in that project, in the project's configured order, through
+`workers.requestUpdateForProject` — this command's fan-out, scoped to one project, and
+unchanged by the button above. It has no CLI counterpart — the command above is the
+installation — and its confirmation adds the one thing that set has to say: a machine
+enrolled in other projects as well is moved for all of them, since an update moves its
+SWARM install root rather than one enrollment. It also keeps the fan-out's own
+precondition, which is true of it and not of the rollout: only machines their owners
+have already drained are asked, so it cannot take capacity down.
 
 This command spans owners, and is allowed to only because
 it asks and nothing more, and asks for something bounded. (The staged

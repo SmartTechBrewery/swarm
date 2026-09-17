@@ -3,6 +3,7 @@ import { useNavigate } from '@tanstack/react-router';
 import { RefreshCw, Search, SearchX, Server } from 'lucide-react';
 import { useState } from 'react';
 import { buttonClass } from '@/components/ui/button.js';
+import { FleetRolloutDialog } from '@/components/workers/fleet-rollout-dialog.js';
 import { WorkerUpdateDialog } from '@/components/workers/worker-update-dialog.js';
 import { WorkersTable } from '@/components/workers/workers-table.js';
 import { canViewInstanceWide } from '@/lib/instance-admin.js';
@@ -280,10 +281,11 @@ const PROJECT_SET = 'every machine enrolled in this project';
  * the copy names the whole set and the filter is left to do only what it looks
  * like it does.
  *
- * **Both are wired** — the installation-wide one by issue #1009, the project-scoped
- * one by issue #1010 — and neither fires on a single click: each opens
- * {@link WorkerUpdateDialog}, which names the build and its own set before anything
- * is asked and then renders the per-machine report. What either asks for is the
+ * **Both are wired** — the installation-wide one by issue #1009 and repointed at the
+ * staged rollout by issue #1025, the project-scoped one by issue #1010 — and neither
+ * fires on a single click: each opens its own dialog, which names the build and its
+ * own set before anything happens and then renders what came back. What either acts
+ * on is the
  * control plane's **own commit**, read from `workers.controlPlaneBuild` and never a
  * ref the browser invents — the same decision the one-machine button inherited from
  * issue #998, and for the same reason: that commit is the comparand a machine's
@@ -295,14 +297,21 @@ const PROJECT_SET = 'every machine enrolled in this project';
  * live control plane is running now and not the one it was running when the page
  * was opened.
  *
- * The installation-wide one calls `requestUpdateForInstallation` rather than
- * `startFleetUpdate`: that one is **owner-scoped** (`listWorkersForOwner`), so it
- * cannot serve a button labelled "Update all workers" on an installation-wide
- * screen. The fan-out is safe to use unstaged for the reason the procedure itself
- * states — it asks only machines their owners have already drained, so it cannot
- * take the installation's capacity down. A *staged* installation-wide rollout stays
- * issue #922's open question and belongs in its own issue rather than in a widened
- * `startFleetUpdate`.
+ * The installation-wide one calls `startFleetUpdateForInstallation` (issue #1025) —
+ * the staged rollout, not the one-shot `requestUpdateForInstallation` it used to
+ * call and not the owner-scoped `startFleetUpdate` (`listWorkersForOwner`), which
+ * could never serve a button labelled "Update all workers" on an installation-wide
+ * screen. The fan-out only *asked* machines somebody had already drained by hand and
+ * reported every other machine as `in-pool`, so on an installation where draining
+ * stays each owner's own call it moved nothing in practice; the rollout drains the
+ * machines itself, a bounded wave at a time, and gives every one of them back. That
+ * is also why this one's copy cannot be {@link WorkerUpdateDialog}'s: that body says
+ * only already-drained machines are asked and so capacity cannot go down, which is
+ * true of the fan-out the project action still makes and false of a rollout. So the
+ * rollout has its own {@link FleetRolloutDialog}, and what it leaves behind is not a
+ * one-shot report at all — a rollout advances itself, so
+ * {@link InstallationRolloutPanel} on `/workers` is where it is read from, including
+ * after a reload. The success view here and that panel render the same member list.
  *
  * The project-scoped one calls `requestUpdateForProject`, which is a third
  * *selection* over that same fan-out rather than the installation-wide procedure
@@ -394,6 +403,7 @@ function UpdateProjectWorkersButton({ projectId }: { projectId: string }) {
 /** The installation-wide action — see {@link UpdateWorkersButton} for why it is shaped this way. */
 function UpdateAllWorkersButton() {
 	const [confirming, setConfirming] = useState(false);
+	const queryClient = useQueryClient();
 	// One value for the whole installation, so it is its own query rather than a
 	// roster row field: `workers.list` answers with a bare array, and repeating the
 	// comparand on every row would say nothing the `Outdated` mark does not.
@@ -416,24 +426,29 @@ function UpdateAllWorkersButton() {
 				type="button"
 				onClick={() => setConfirming(true)}
 				disabled={!target}
-				title={updateActionTitle(INSTALLATION_SET, buildQuery.isPending, target)}
+				title={fleetRolloutActionTitle(buildQuery.isPending, target)}
 				className={buttonClass('secondary')}
 			>
 				<RefreshCw className="h-4 w-4" aria-hidden="true" />
 				Update all workers
 			</button>
 			{target ? (
-				<WorkerUpdateDialog
+				<FleetRolloutDialog
 					open={confirming}
 					onClose={() => setConfirming(false)}
-					title="Update every worker on this installation?"
-					confirmCopy={
-						<strong className="text-zinc-200">
-							{INSTALLATION_SET}, including machines you do not own,
-						</strong>
-					}
 					target={target}
-					requestUpdate={() => trpcClient.workers.requestUpdateForInstallation.mutate({ target })}
+					startRollout={async () => {
+						const started = await trpcClient.workers.startFleetUpdateForInstallation.mutate({
+							target,
+						});
+						// The readout above the roster is the surface this action actually leaves
+						// behind, so it must not wait up to a whole poll interval to notice the
+						// rollout that was just started.
+						queryClient.invalidateQueries({
+							queryKey: trpc.workers.fleetUpdateStatusForInstallation.queryOptions().queryKey,
+						});
+						return started;
+					}}
 				/>
 			) : null}
 		</>
@@ -457,6 +472,34 @@ function updateActionTitle(set: string, loading: boolean, target: string | null)
 	return loading
 		? 'Reading the build this control plane is running…'
 		: 'This control plane cannot read its own build, so there is no build to ask these machines to move to.';
+}
+
+/**
+ * How the title describes the wave bound. The server owns the number
+ * (`DEFAULT_ROLLOUT_WAVE_SIZE`, and an explicit `waveSize` this button does not
+ * send), so the promise is the *bound* rather than a count the browser would be
+ * guessing at; the readout names the actual wave size once a rollout exists.
+ */
+const DEFAULT_WAVE_PHRASE = 'a bounded number of machines';
+
+/**
+ * The installation-wide action's own title (issue #1025), which promises something
+ * different from {@link updateActionTitle}'s ask: this button *stages* a rollout,
+ * so the sentence says it drains the machines itself rather than asking the ones
+ * somebody else already drained.
+ *
+ * A second helper rather than a verb threaded through the first, so the project
+ * action's wording cannot move when this one does — the two make genuinely different
+ * promises now. The unreadable-build cases are the same words in both, because both
+ * read the same value the same way.
+ */
+function fleetRolloutActionTitle(loading: boolean, target: string | null): string {
+	if (target) {
+		return `Stages a rollout over ${INSTALLATION_SET} to ${target.slice(0, 7)} — the build this control plane is running — draining ${DEFAULT_WAVE_PHRASE} at a time, verifying each came back on the new build, and halting the whole rollout on one that cannot take it.`;
+	}
+	return loading
+		? 'Reading the build this control plane is running…'
+		: 'This control plane cannot read its own build, so there is no build to move these machines to.';
 }
 
 /**

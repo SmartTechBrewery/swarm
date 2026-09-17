@@ -766,19 +766,26 @@ them, and this is which side it landed on and why.
 swarm workers request-update main          # every machine on the installation
 ```
 
-- **This has a dashboard equivalent** (issue #1009): an instance administrator can
-  ask for the same thing at `/workers` → **Update all workers**, in the toolbar above
-  the roster, which calls the same `workers.requestUpdateForInstallation` this command
-  does — no CLI or DB access needed. Like the machine-scoped button it always asks for
+- **The dashboard does the staged thing instead** (issue #1009, repointed by #1025):
+  an instance administrator reaches every machine on the installation at `/workers` →
+  **Update all workers**, in the toolbar above the roster — but that button now starts
+  the *staged rollout* (`workers.startFleetUpdateForInstallation`), not this command's
+  one-shot fan-out. That is deliberate: what this command asks is bounded by a drain
+  it will not perform, so on an installation where owners have not drained anything it
+  reports `in-pool` and moves nothing, while the rollout drains the machines itself and
+  gives every one of them back. Like the machine-scoped button it always asks for
   **the build the control plane itself is running** rather than taking a ref, and a
   control plane that cannot read its own build offers no button rather than guessing
   one. It never fires on a single click: a confirmation first names the build, the set
   ("every registered machine on this installation, including machines you do not own")
-  and the fact that only already-drained machines are asked. It then shows the same
-  report this command prints — every machine with its owner and its disposition, and
-  the same grouped lines naming who to ask for a `swarm workers drain`, a
-  `swarm workers enroll` or a `swarm-worker-agent install`. A caller without the
-  installation role sees the refusal below in the control plane's own words.
+  and what a rollout does — a bounded wave at a time, never interrupting a running
+  phase, verified on the way back, halting on a bad build, every drained machine
+  returned. Because a rollout advances itself, what it leaves behind is a **readout on
+  `/workers`** above the roster rather than a one-shot modal report: target, status,
+  wave size, halt reason, and a line per machine with its owner, its state and its own
+  message, live and still there after a reload. A caller without the installation role
+  sees the refusal below in the control plane's own words. This command, and the
+  per-machine report it prints, are unchanged.
 - **A project's own administrator can ask for the project's machines** (issue #1010),
   without the installation role and without CLI access: the project detail page's
   **Workers** tab has **Update project workers** in the same toolbar, calling
@@ -854,8 +861,10 @@ Note what this command is *not*: it is the one-shot fan-out, not the staged roll
 every one of those acts on a machine rather than asking it. Moving a fleet in waves is
 each owner's own `swarm workers update --all <ref>` — or, since issue #1024, an
 administrator's `workers.startFleetUpdateForInstallation` over the whole installation,
-which has no CLI command of its own and is read back through
-`workers.fleetUpdateStatusForInstallation`.
+which still has no CLI command of its own and is driven from the dashboard instead
+(issue #1025): the `/workers` toolbar's **Update all workers** button starts it, and
+the readout above the roster reads `workers.fleetUpdateStatusForInstallation` for
+where every machine stands, live and across a page reload.
 
 ---
 

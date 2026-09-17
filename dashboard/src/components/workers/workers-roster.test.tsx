@@ -15,7 +15,9 @@ const {
 	workersQueryOptions,
 	meQueryFn,
 	controlPlaneBuildQueryFn,
+	fleetUpdateStatusQueryFn,
 	requestUpdateForInstallationMutate,
+	startFleetUpdateForInstallationMutate,
 	requestUpdateForProjectMutate,
 	reorderMutate,
 	navigate,
@@ -29,7 +31,11 @@ const {
 	// Issue #1009 — the build the toolbar's installation-wide action asks every
 	// machine for, read from the server rather than invented in the browser.
 	controlPlaneBuildQueryFn: vi.fn(),
+	// Issue #1025 — the staged rollout the installation-wide action now starts, and
+	// the readout it invalidates so `/workers` shows it at once.
+	fleetUpdateStatusQueryFn: vi.fn(),
 	requestUpdateForInstallationMutate: vi.fn(),
+	startFleetUpdateForInstallationMutate: vi.fn(),
 	// Issue #1010 — the project-scoped selection over that same fan-out.
 	requestUpdateForProjectMutate: vi.fn(),
 	reorderMutate: vi.fn(),
@@ -59,6 +65,12 @@ vi.mock('@/lib/trpc.js', () => ({
 					queryFn: controlPlaneBuildQueryFn,
 				}),
 			},
+			fleetUpdateStatusForInstallation: {
+				queryOptions: () => ({
+					queryKey: ['workers.fleetUpdateStatusForInstallation'],
+					queryFn: fleetUpdateStatusQueryFn,
+				}),
+			},
 		},
 		projects: {
 			list: {
@@ -74,6 +86,7 @@ vi.mock('@/lib/trpc.js', () => ({
 			setConsent: { mutate: vi.fn() },
 			reorderProjectWorker: { mutate: reorderMutate },
 			requestUpdateForInstallation: { mutate: requestUpdateForInstallationMutate },
+			startFleetUpdateForInstallation: { mutate: startFleetUpdateForInstallationMutate },
 			requestUpdateForProject: { mutate: requestUpdateForProjectMutate },
 		},
 	},
@@ -135,7 +148,9 @@ beforeEach(() => {
 		rosterQueryFn,
 		meQueryFn,
 		controlPlaneBuildQueryFn,
+		fleetUpdateStatusQueryFn,
 		requestUpdateForInstallationMutate,
+		startFleetUpdateForInstallationMutate,
 		requestUpdateForProjectMutate,
 		reorderMutate,
 		navigate,
@@ -160,6 +175,9 @@ beforeEach(() => {
 	controlPlaneBuildQueryFn.mockResolvedValue({
 		build: { commit: CONTROL_PLANE_COMMIT, dirty: false },
 	});
+	// The roster itself never renders the readout — that is the route's (issue #1025)
+	// — but the toolbar reads this query's key to invalidate it after a start.
+	fleetUpdateStatusQueryFn.mockResolvedValue({ rollout: null });
 });
 
 describe('WorkersRoster scoping (issue #574)', () => {
@@ -464,20 +482,33 @@ describe('WorkersRoster update actions', () => {
 		expect(screen.queryByRole('button', FLEET_BUTTON)).toBeNull();
 	});
 
-	/** The report `requestUpdateForInstallation` answers with — one machine, asked. */
-	function installationReport() {
+	/** The rollout `startFleetUpdateForInstallation` answers with — one machine, draining. */
+	function startedRollout() {
 		return {
+			action: 'started',
 			target: CONTROL_PLANE_COMMIT,
-			requestedBy: 'ada@example.com',
-			workers: [
-				{
-					workerId: 'worker-1',
-					displayName: 'ada-laptop',
-					disposition: 'requested',
-					owner: { userId: 'u1', identifier: 'ada@example.com', displayName: 'Ada Lovelace' },
-					update: null,
-				},
-			],
+			rollout: {
+				id: 'rollout-1',
+				target: CONTROL_PLANE_COMMIT,
+				waveSize: 1,
+				status: 'in_progress',
+				haltReason: null,
+				createdAt: '2026-07-01T12:00:00.000Z',
+				updatedAt: '2026-07-01T12:00:00.000Z',
+				members: [
+					{
+						workerId: 'worker-1',
+						displayName: 'ada-laptop',
+						owner: { userId: 'u1', identifier: 'ada@example.com', displayName: 'Ada Lovelace' },
+						position: 0,
+						state: 'draining',
+						outcome: null,
+						message: null,
+						signalledAt: null,
+						settledAt: null,
+					},
+				],
+			},
 		};
 	}
 
@@ -498,10 +529,10 @@ describe('WorkersRoster update actions', () => {
 
 		expect(await screen.findByText(/Update every worker on this installation/)).toBeDefined();
 		// It never fires on a single click — the modal is the whole point of the action.
-		expect(requestUpdateForInstallationMutate).not.toHaveBeenCalled();
+		expect(startFleetUpdateForInstallationMutate).not.toHaveBeenCalled();
 	});
 
-	it('names the build and the set it is about to touch', async () => {
+	it('names the build, the set, and what a rollout actually does to it (issue #1025)', async () => {
 		fireEvent.click(await openFleetAction());
 
 		await screen.findByText(/Update every worker on this installation/);
@@ -512,21 +543,46 @@ describe('WorkersRoster update actions', () => {
 		).toBeDefined();
 		// The control plane's own commit, abbreviated the way every Workers surface does.
 		expect(screen.getByText(CONTROL_PLANE_COMMIT.slice(0, 7))).toBeDefined();
-		expect(screen.getByText(/already drained/)).toBeDefined();
+		// The rollout drains the machines itself, so the copy says so — a bounded wave
+		// at a time, never mid-phase, verified, halting on a bad build, and every
+		// machine it drained given back.
+		expect(
+			screen.getByText(/drains the machines itself, a bounded number at a time/),
+		).toBeDefined();
+		expect(screen.getByText(/never interrupts a phase/)).toBeDefined();
+		expect(screen.getByText(/comes? back on the new build/)).toBeDefined();
+		expect(screen.getByText(/goes back in the dispatch pool/)).toBeDefined();
+		// The fan-out's sentence is the one thing that must not be here: this path
+		// drains machines nobody drained by hand, so "this cannot take capacity down"
+		// would be a promise it does not keep. It stays on the project action's dialog.
+		expect(screen.queryByText(/already drained/)).toBeNull();
 	});
 
-	it('asks the installation once, for the commit `controlPlaneBuild` answered with', async () => {
-		requestUpdateForInstallationMutate.mockResolvedValue(installationReport());
+	it('stages the rollout once, for the commit `controlPlaneBuild` answered with', async () => {
+		startFleetUpdateForInstallationMutate.mockResolvedValue(startedRollout());
 		fireEvent.click(await openFleetAction());
 
-		fireEvent.click(await screen.findByRole('button', { name: 'Ask them to update' }));
+		fireEvent.click(await screen.findByRole('button', { name: 'Start the rollout' }));
 
 		await vi.waitFor(() =>
-			expect(requestUpdateForInstallationMutate).toHaveBeenCalledWith({
+			expect(startFleetUpdateForInstallationMutate).toHaveBeenCalledWith({
 				target: CONTROL_PLANE_COMMIT,
 			}),
 		);
-		expect(requestUpdateForInstallationMutate).toHaveBeenCalledTimes(1);
+		expect(startFleetUpdateForInstallationMutate).toHaveBeenCalledTimes(1);
+		// Never the one-shot fan-out, which only asked machines somebody had already
+		// drained by hand and moved nothing in practice (issue #1025).
+		expect(requestUpdateForInstallationMutate).not.toHaveBeenCalled();
+	});
+
+	it('promises a staged rollout in the button’s own title, not an ask', async () => {
+		const button = await openFleetAction();
+
+		expect(button.title).toContain('Stages a rollout');
+		expect(button.title).toContain('every registered machine on this installation');
+		expect(button.title).toContain(CONTROL_PLANE_COMMIT.slice(0, 7));
+		// The project action's wording is untouched, so this one must not borrow it.
+		expect(button.title).not.toContain('Asks ');
 	});
 
 	it('asks for the build the control plane is running now, not the one it was running at mount', async () => {
@@ -536,8 +592,8 @@ describe('WorkersRoster update actions', () => {
 		controlPlaneBuildQueryFn
 			.mockResolvedValueOnce({ build: { commit: CONTROL_PLANE_COMMIT, dirty: false } })
 			.mockResolvedValue({ build: { commit: REDEPLOYED_COMMIT, dirty: false } });
-		requestUpdateForInstallationMutate.mockResolvedValue({
-			...installationReport(),
+		startFleetUpdateForInstallationMutate.mockResolvedValue({
+			...startedRollout(),
 			target: REDEPLOYED_COMMIT,
 		});
 		asInstanceAdmin();
@@ -565,10 +621,10 @@ describe('WorkersRoster update actions', () => {
 			);
 			fireEvent.click(screen.getByRole('button', FLEET_BUTTON));
 			await vi.waitFor(() => expect(screen.getByText(REDEPLOYED_COMMIT.slice(0, 7))).toBeDefined());
-			fireEvent.click(screen.getByRole('button', { name: 'Ask them to update' }));
+			fireEvent.click(screen.getByRole('button', { name: 'Start the rollout' }));
 
 			await vi.waitFor(() =>
-				expect(requestUpdateForInstallationMutate).toHaveBeenCalledWith({
+				expect(startFleetUpdateForInstallationMutate).toHaveBeenCalledWith({
 					target: REDEPLOYED_COMMIT,
 				}),
 			);
@@ -577,25 +633,29 @@ describe('WorkersRoster update actions', () => {
 		}
 	});
 
-	it('renders the per-machine report the request answers with', async () => {
-		requestUpdateForInstallationMutate.mockResolvedValue(installationReport());
+	it('renders the rollout it started, through the readout’s own member list', async () => {
+		startFleetUpdateForInstallationMutate.mockResolvedValue(startedRollout());
 		fireEvent.click(await openFleetAction());
 
-		fireEvent.click(await screen.findByRole('button', { name: 'Ask them to update' }));
+		fireEvent.click(await screen.findByRole('button', { name: 'Start the rollout' }));
 
-		expect(await screen.findByText('Requested')).toBeDefined();
+		expect(await screen.findByText('Draining')).toBeDefined();
 		expect(screen.getByText('ada@example.com')).toBeDefined();
+		// The first wave is not the end of it, so the modal points at the surface that
+		// outlives it rather than pretending to be the whole report.
+		expect(screen.getByText(/survives a reload/)).toBeDefined();
 	});
 
 	it('renders the FORBIDDEN a non-administrator gets verbatim', async () => {
 		// The client gate is a decision about what to *offer*; the server re-checks,
-		// and its refusal names the command that moves the caller's own machines.
+		// and its refusal names the command that stages this over the caller's own
+		// machines instead.
 		const forbidden =
-			'Requesting an update across the installation is available to instance administrators only.';
-		requestUpdateForInstallationMutate.mockRejectedValue(new Error(forbidden));
+			'Staging a fleet update across the installation is available to instance administrators only. Run `swarm workers update --all abc1234` for the machines you own.';
+		startFleetUpdateForInstallationMutate.mockRejectedValue(new Error(forbidden));
 		fireEvent.click(await openFleetAction());
 
-		fireEvent.click(await screen.findByRole('button', { name: 'Ask them to update' }));
+		fireEvent.click(await screen.findByRole('button', { name: 'Start the rollout' }));
 
 		expect(await screen.findByText(forbidden)).toBeDefined();
 	});
@@ -627,9 +687,26 @@ describe('WorkersRoster update actions', () => {
 		expect(button.title).toContain('Reading the build');
 	});
 
-	/** The report `requestUpdateForProject` answers with — the installation's plus the project. */
+	/**
+	 * The report `requestUpdateForProject` answers with — the fan-out's own per-machine
+	 * shape, which the project action still makes and which is nothing like the
+	 * installation-wide rollout above.
+	 */
 	function projectReport() {
-		return { ...installationReport(), projectId: 'proj-a' };
+		return {
+			projectId: 'proj-a',
+			target: CONTROL_PLANE_COMMIT,
+			requestedBy: 'ada@example.com',
+			workers: [
+				{
+					workerId: 'worker-1',
+					displayName: 'ada-laptop',
+					disposition: 'requested',
+					owner: { userId: 'u1', identifier: 'ada@example.com', displayName: 'Ada Lovelace' },
+					update: null,
+				},
+			],
+		};
 	}
 
 	/** Open a project's Workers tab as its administrator and wait for the action to be live. */

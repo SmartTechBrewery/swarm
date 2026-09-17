@@ -12,12 +12,15 @@ const {
 	listMineQueryFn,
 	rosterQueryFn,
 	workersQueryOptions,
+	fleetUpdateStatusQueryFn,
 } = vi.hoisted(() => ({
 	workersListQueryFn: vi.fn(),
 	projectsListQueryFn: vi.fn(),
 	listMineQueryFn: vi.fn(),
 	rosterQueryFn: vi.fn(),
 	workersQueryOptions: vi.fn(),
+	// The installation rollout readout this screen mounts above the roster (issue #1025).
+	fleetUpdateStatusQueryFn: vi.fn(),
 }));
 
 vi.mock('@/lib/trpc.js', () => ({
@@ -40,6 +43,12 @@ vi.mock('@/lib/trpc.js', () => ({
 				queryOptions: () => ({
 					queryKey: ['workers.controlPlaneBuild'],
 					queryFn: () => new Promise(() => {}),
+				}),
+			},
+			fleetUpdateStatusForInstallation: {
+				queryOptions: () => ({
+					queryKey: ['workers.fleetUpdateStatusForInstallation'],
+					queryFn: fleetUpdateStatusQueryFn,
 				}),
 			},
 		},
@@ -101,6 +110,9 @@ beforeEach(() => {
 	workersQueryOptions.mockReset();
 	listMineQueryFn.mockReset();
 	rosterQueryFn.mockReset();
+	fleetUpdateStatusQueryFn.mockReset();
+	// No rollout has ever run, which is the ordinary case and renders nothing at all.
+	fleetUpdateStatusQueryFn.mockResolvedValue({ rollout: null });
 	workersQueryOptions.mockReturnValue({
 		queryKey: ['workers.list'],
 		queryFn: workersListQueryFn,
@@ -235,5 +247,49 @@ describe('Workers screen states', () => {
 		expect(
 			await screen.findByRole('switch', { name: 'Share ada-laptop with proj-a' }),
 		).toBeDefined();
+	});
+});
+
+describe('/workers carries the installation rollout readout (issue #1025)', () => {
+	it('renders nothing above the roster when no rollout has ever run', async () => {
+		workersListQueryFn.mockResolvedValue([makeWorker()]);
+		renderScreen(<WorkersRouteComponent />);
+
+		await screen.findByText('ada-laptop');
+		expect(screen.queryByText('Installation fleet update')).toBeNull();
+	});
+
+	it('renders the rollout on a plain page load, with no modal involved', async () => {
+		// The point of the readout: a rollout advances itself, so an operator who
+		// reloads mid-move — or comes back later — still reads where the fleet got to.
+		workersListQueryFn.mockResolvedValue([makeWorker()]);
+		fleetUpdateStatusQueryFn.mockResolvedValue({
+			rollout: {
+				id: 'rollout-1',
+				target: 'abc1234def5678901234567890123456789abcde',
+				waveSize: 2,
+				status: 'in_progress',
+				haltReason: null,
+				createdAt: '2026-07-01T12:00:00.000Z',
+				updatedAt: '2026-07-01T12:01:00.000Z',
+				members: [
+					{
+						workerId: 'worker-1',
+						displayName: 'ada-laptop',
+						owner: { userId: 'u1', identifier: 'ada@example.com', displayName: 'Ada Lovelace' },
+						position: 0,
+						state: 'verifying',
+						outcome: 'applied',
+						message: null,
+						signalledAt: '2026-07-01T12:00:30.000Z',
+						settledAt: null,
+					},
+				],
+			},
+		});
+		renderScreen(<WorkersRouteComponent />);
+
+		expect(await screen.findByText('Installation fleet update')).toBeDefined();
+		expect(screen.getByText('Verifying')).toBeDefined();
 	});
 });
