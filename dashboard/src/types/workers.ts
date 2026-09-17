@@ -405,3 +405,59 @@ export interface WorkerUpdateReport {
 	requestedBy: string;
 	workers: WorkerUpdateReportEntry[];
 }
+
+/**
+ * One machine's line in a staged fleet update (`workers.fleetUpdateStatusForInstallation`
+ * / `workers.startFleetUpdateForInstallation`, issues #940 and #1024) as the wire
+ * serializes it (`serializeRolloutMember`): the member row, the machine's label, its
+ * owner, and the two instants as ISO strings.
+ *
+ * **`state` and `outcome` are plain `string`s, for {@link WorkerUpdateReportEntry}'s
+ * reason.** The server's own vocabularies are the seven member states
+ * `WORKER_UPDATE_ROLLOUT_MEMBER_STATES` names and the update statuses beside them,
+ * but a newer control plane may report a word this bundle was built before, and a
+ * machine dropped from the readout reads as a machine the rollout never named — the
+ * one wrong answer here. `@/lib/worker-rollout-states.js` turns the words this build
+ * does know into copy and describes the rest.
+ */
+export interface WorkerRolloutMember {
+	workerId: string;
+	displayName: string;
+	/** `null` for an owner the server's users read could not resolve — say so, never nobody. */
+	owner: WorkerOwner | null;
+	/**
+	 * The order the rollout reaches the machines in, which is what the readout sorts
+	 * on — explicitly, rather than trusting the order the array happened to arrive in.
+	 */
+	position: number;
+	state: string;
+	/** What the machine reported, in the server's own word; `null` until it has. */
+	outcome: string | null;
+	/** The machine's own words, verbatim; `null` when it gave none. */
+	message: string | null;
+	/** ISO 8601 — when the machine was asked to move; `null` until its wave came up. */
+	signalledAt: string | null;
+	/** ISO 8601 — when the rollout finished with it; `null` while it is still unsettled. */
+	settledAt: string | null;
+}
+
+/**
+ * A staged fleet update as the rollout procedures answer it (`serializeRollout`).
+ * `null` from those procedures when none has ever run, which is an honest empty
+ * answer rather than an error.
+ *
+ * `status` is a plain `string` for the same reason a member's `state` is.
+ * `haltReason` is the operator-facing sentence recorded when the rollout stopped
+ * itself on a bad build, and is `null` at every other status.
+ */
+export interface WorkerRollout {
+	id: string;
+	target: string;
+	/** How many machines one wave may take out of the dispatch pool at once. */
+	waveSize: number;
+	status: string;
+	haltReason: string | null;
+	createdAt: string;
+	updatedAt: string;
+	members: WorkerRolloutMember[];
+}

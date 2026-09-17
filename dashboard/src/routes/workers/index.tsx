@@ -1,6 +1,7 @@
 import { createRoute } from '@tanstack/react-router';
 import { Server } from 'lucide-react';
 import { InstanceAdminOnly } from '@/components/layout/instance-admin-only.js';
+import { InstallationRolloutPanel } from '@/components/workers/installation-rollout-panel.js';
 import { WorkersRoster } from '@/components/workers/workers-roster.js';
 import { rootRoute } from '../__root.js';
 
@@ -20,6 +21,13 @@ import { rootRoute } from '../__root.js';
  * — so the route renders it behind {@link InstanceAdminOnly} (see
  * {@link WorkersScreen}); a worker owner reads the same roster, scoped, on their
  * project's Workers tab (issue #647).
+ *
+ * It is also where a **staged installation-wide rollout** is started and watched
+ * (issue #1025): the roster toolbar's **Update all workers** button starts one, and
+ * {@link InstallationRolloutPanel} above the roster says where every machine stands
+ * while it runs and afterwards. That readout lives on the screen rather than in the
+ * modal because a rollout advances itself, so it has to outlive the click that
+ * started it.
  */
 
 export function WorkersRouteComponent() {
@@ -39,6 +47,12 @@ export function WorkersRouteComponent() {
 					the machine carries.
 				</p>
 			</div>
+
+			{/* The staged installation-wide rollout, when one has run (issue #1025) —
+			    above the roster, so it is the first thing an operator sees while a fleet
+			    is moving, and reachable by reloading the page rather than only from the
+			    modal that started it. It renders nothing at all when there is no rollout. */}
+			<InstallationRolloutPanel />
 
 			<WorkersRoster />
 		</div>

@@ -65,6 +65,14 @@ vi.mock('@/lib/trpc.js', () => ({
 					queryFn: () => new Promise(() => {}),
 				}),
 			},
+			// The `/workers` screen this suite navigates back to mounts the installation
+			// rollout readout (issue #1025); no rollout has run, so it renders nothing.
+			fleetUpdateStatusForInstallation: {
+				queryOptions: () => ({
+					queryKey: ['workers.fleetUpdateStatusForInstallation'],
+					queryFn: async () => ({ rollout: null }),
+				}),
+			},
 			// The operator-credential card (issue #766) mounts for an owner.
 			scmCredentials: {
 				list: {
