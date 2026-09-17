@@ -394,8 +394,10 @@ const FORCE_RE_REVIEW_REFUSAL_CODES: Record<ForceReReviewRefusal, TRPCError['cod
  * correct for a claim a worker is honouring and flatly wrong for one abandoned
  * mid-hand-off, which is the shape that stranded a run for the whole lease window
  * and then some. `classifyDispatchClaim` (`../../dispatch/claim-liveness.ts`) is
- * what tells the two apart; the abandoned one is taken back here instead of waiting
- * for the lease-expiry sweep to reach the same verdict.
+ * what tells the two apart — on the lease alone, the one bound on the *execution*
+ * rather than on the transport (PR #1021 review, F1) — and the abandoned one is
+ * taken back here instead of waiting for the lease-expiry sweep to reach the same
+ * verdict on its own cadence.
  *
  * Both writes are conditional on the facts the classification was made against — a
  * still-waiting state for one, the unchanged claim columns for the other — so a
@@ -410,7 +412,7 @@ async function reopenActiveDispatchForRetry(
 	active: DispatchRow,
 	job: SwarmJob,
 ): Promise<DispatchRow | null> {
-	const claim = await classifyDispatchClaim(active);
+	const claim = classifyDispatchClaim(active);
 	if (claim === 'executing') throw workerRunningPhase();
 	return claim === 'stale'
 		? takeOverStaleDispatchForManualRetry(active.id, job, active)
@@ -427,8 +429,8 @@ async function reopenActiveDispatchForRetry(
  * the two used to share this message, so an operator whose run was stranded
  * behind an abandoned claim was told to wait for a retry that was never going to
  * arrive. {@link workerRunningPhase} is that case's own message now, and neither
- * is reachable for a claim no live worker is honouring — that one is taken over
- * and retried.
+ * is reachable for a claim whose lease has lapsed — that one is taken over and
+ * retried.
  */
 function alreadyRetrying(): TRPCError {
 	return new TRPCError({
@@ -438,10 +440,11 @@ function alreadyRetrying(): TRPCError {
 }
 
 /**
- * A worker holds an unexpired claim on this run's dispatch and is not silent
- * (issue #1017), so the phase may genuinely be executing there — or be one round
- * trip from reporting its result. Retrying would run it twice, so it is refused,
- * and the message names the actual obstacle and the lever that clears it.
+ * A worker holds an unexpired claim on this run's dispatch (issue #1017), so the
+ * phase may genuinely be executing there — or be one round trip from reporting its
+ * result — whether or not its transport is currently up, since a phase outlives the
+ * session it was pushed on (issue #718). Retrying would run it twice, so it is
+ * refused, and the message names the actual obstacle and the lever that clears it.
  */
 function workerRunningPhase(): TRPCError {
 	return new TRPCError({
@@ -1194,14 +1197,15 @@ export const runsRouter = router({
 	//     overrides folded in and the dispatch is atomically re-opened for an
 	//     immediate attempt (`reopenDispatchForManualRetry`); losing that
 	//     conditional update to a concurrent pickup returns CONFLICT.
-	//  1b. The run's dispatch is `leased`/`running` but **nothing is honouring
-	//     that claim** (issue #1017) — its lease has lapsed, or the machine it is
-	//     bound to has been silent past the shared grace
-	//     (`../../dispatch/claim-liveness.ts`). That is the same verdict the
-	//     lease-expiry sweep would reach minutes later, so the claim is taken back
-	//     here (`takeOverStaleDispatchForManualRetry`, a compare-and-set on the
-	//     claim columns) and the retry proceeds as in 1. A claim a live worker
-	//     *is* holding is still refused — with its own message, not this path's.
+	//  1b. The run's dispatch is `leased`/`running` but **its lease has lapsed**
+	//     (issue #1017, `../../dispatch/claim-liveness.ts`), so nothing is
+	//     honouring that claim. That is the same verdict the lease-expiry sweep
+	//     would reach minutes later, so the claim is taken back here
+	//     (`takeOverStaleDispatchForManualRetry`, a compare-and-set on the claim
+	//     columns) and the retry proceeds as in 1. A claim whose lease still
+	//     holds is refused — with its own message, not this path's — however
+	//     quiet the machine it is bound to has gone: the lease bounds the phase,
+	//     the transport does not (PR #1021 review, F1).
 	//  2. No active dispatch (a terminally `failed` run, or a legacy row whose
 	//     retry intent was lost) — reconstruct from the run's stored
 	//     `jobPayload` and create a fresh dispatch. The one-active-dispatch-per-

@@ -64,10 +64,10 @@ vi.mock('@/db/repositories/dispatchesRepository.js', async (importOriginal) => (
 	takeOverStaleDispatchForManualRetry: vi.fn(),
 }));
 
-// The stale-claim judgement (issue #1017) is two worker-session reads of its own,
-// covered by `tests/unit/dispatch/claim-liveness.test.ts`. Stubbed at its own module
-// boundary so these tests stay a wiring check: which verdict produces which write,
-// and which produces which refusal.
+// The stale-claim judgement (issue #1017) has its own coverage in
+// `tests/unit/dispatch/claim-liveness.test.ts`. Stubbed at its own module boundary so
+// these tests stay a wiring check: which verdict produces which write, and which
+// produces which refusal.
 vi.mock('@/dispatch/claim-liveness.js', () => ({
 	classifyDispatchClaim: vi.fn(),
 }));
@@ -412,7 +412,7 @@ describe('runsRouter', () => {
 		vi.mocked(reopenDispatchForManualRetry).mockReset();
 		vi.mocked(takeOverStaleDispatchForManualRetry).mockReset();
 		// The overwhelmingly common shape: the run's dispatch is queued, not claimed.
-		vi.mocked(classifyDispatchClaim).mockReset().mockResolvedValue('waiting');
+		vi.mocked(classifyDispatchClaim).mockReset().mockReturnValue('waiting');
 		vi.mocked(cancelDispatchAndWake).mockReset();
 		vi.mocked(cancelDispatchForRun).mockReset();
 		vi.mocked(createAndPublishDispatch).mockReset();
@@ -2092,7 +2092,7 @@ describe('runsRouter', () => {
 		// whole lease window, so "Retry now" refused it as "already retrying" — a
 		// statement that was the opposite of the truth — until the lease-expiry sweep
 		// reached it ~19 minutes later.
-		it('takes over a leased dispatch whose lease no live worker is honouring', async () => {
+		it('takes over a leased dispatch whose lease has lapsed', async () => {
 			vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', status: 'deferred' }));
 			const stale = makeDispatch({
 				state: 'leased',
@@ -2103,7 +2103,7 @@ describe('runsRouter', () => {
 				leaseExpiresAt: new Date('2026-07-10T00:15:00Z'),
 			});
 			vi.mocked(getActiveDispatchByRunId).mockResolvedValue(stale);
-			vi.mocked(classifyDispatchClaim).mockResolvedValue('stale');
+			vi.mocked(classifyDispatchClaim).mockReturnValue('stale');
 			const reopened = makeDispatch({ state: 'pending', waitReason: 'manual-retry', attempt: 0 });
 			vi.mocked(takeOverStaleDispatchForManualRetry).mockResolvedValue(reopened);
 
@@ -2126,7 +2126,12 @@ describe('runsRouter', () => {
 			expect(publishDispatchWakeUp).toHaveBeenCalledWith(reopened);
 		});
 
-		it('still refuses a dispatch a live worker is running, with its own message', async () => {
+		// Whatever the worker's transport is doing: an unexpired lease is `executing`
+		// (PR #1021 review, F1 — `classifyDispatchClaim` reads the lease and nothing
+		// else, pinned in `tests/unit/dispatch/claim-liveness.test.ts`), so a daemon
+		// partitioned mid-phase is refused here rather than having its claim taken and
+		// the phase started a second time beside the one still running.
+		it('still refuses a dispatch whose lease holds, with its own message', async () => {
 			vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', status: 'deferred' }));
 			vi.mocked(getActiveDispatchByRunId).mockResolvedValue(
 				makeDispatch({
@@ -2136,7 +2141,7 @@ describe('runsRouter', () => {
 					leaseExpiresAt: new Date('2026-07-10T02:00:00Z'),
 				}),
 			);
-			vi.mocked(classifyDispatchClaim).mockResolvedValue('executing');
+			vi.mocked(classifyDispatchClaim).mockReturnValue('executing');
 
 			await expect(caller.retryNow({ runId: 'run-1' })).rejects.toThrowError(
 				expect.objectContaining({
@@ -2154,7 +2159,7 @@ describe('runsRouter', () => {
 		it('reports the lost race, not "a worker is running it", when the take-over CAS fails', async () => {
 			vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', status: 'deferred' }));
 			vi.mocked(getActiveDispatchByRunId).mockResolvedValue(makeDispatch({ state: 'leased' }));
-			vi.mocked(classifyDispatchClaim).mockResolvedValue('stale');
+			vi.mocked(classifyDispatchClaim).mockReturnValue('stale');
 			vi.mocked(takeOverStaleDispatchForManualRetry).mockResolvedValue(null);
 
 			await expect(caller.retryNow({ runId: 'run-1' })).rejects.toThrowError(

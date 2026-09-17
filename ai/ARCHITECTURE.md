@@ -723,16 +723,21 @@ lost the control plane mid-hand-off and never started the phase: true of a live
 worker, false of an abandoned claim, and indistinguishable from the row alone
 until the lease expired and the 5-minute sweep came round (~19 minutes, live on
 2026-09-16). `classifyDispatchClaim` (`src/dispatch/claim-liveness.ts`) is what
-tells them apart, from two facts the system already had rather than a new notion
-of staleness: the lease has lapsed, or the machine the claim is bound to has been
-silent past the shared `offlineSilenceMs` grace (`isWorkerConfirmedSilent`, moved
-there from `src/router/dispatch-cancellation.ts` so issue #827's settle and this
-share one definition). A stale claim is taken back in place — `pending`,
+tells them apart, from the one fact the system already had rather than a new
+notion of staleness: **the lease has lapsed** — the same verdict the sweep would
+reach, just not waited for, so the take-over licenses no execution the sweep was
+not about to license anyway. Transport silence is deliberately *not* the other
+half (PR #1021 review): issue #827's termination settle and issue #859's orphan
+reap both act on `offlineSilenceMs`, but neither re-dispatches the phase, and a
+daemon partitioned from the control plane keeps its agent running against the
+task worktree and holds its terminal result for the next session (issue #718).
+Re-opening its unexpired claim on the strength of that silence would run one
+phase twice, concurrently. A stale claim is taken back in place — `pending`,
 `manual-retry`, attempt 0, every claim column cleared, exactly
 `deferDispatchToPending`'s transition — through a compare-and-set on
 `lease_expires_at` + `worker_session_id` + `worker_fencing_token`, so a claim that
-came alive in the window keeps it. A claim a live worker *is* holding is still
-refused, now with its own message rather than the retry one; and because the run
+came alive in the window keeps it. A claim whose lease still holds is refused,
+now with its own message rather than the retry one; and because the run
 row behind a reaped claim stays `deferred` with a `next_retry_at` nothing is
 waiting for, `runs.getById` reports `retryScheduled` so the detail page says "no
 retry is scheduled" and offers the controls instead of naming a time in the past.

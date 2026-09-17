@@ -1035,9 +1035,10 @@ function columnStillHolds<T>(column: AnyColumn, value: T | null): SQL | undefine
 }
 
 /**
- * Take a `leased`/`running` dispatch back for an immediate manual retry, when no
- * live worker is honouring its claim (issue #1017 — `../../dispatch/claim-liveness.ts`
- * is what decides that, and is the only caller's gate).
+ * Take a `leased`/`running` dispatch back for an immediate manual retry, when its
+ * lease has lapsed and nothing is therefore honouring its claim (issue #1017 —
+ * `../../dispatch/claim-liveness.ts` is what decides that, and is the only caller's
+ * gate).
  *
  * The transition itself is {@link deferDispatchToPending}'s, which has always
  * returned a claimed dispatch to `pending`: same states in, same claim columns
