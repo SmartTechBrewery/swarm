@@ -71,8 +71,26 @@ export const PR_DRIVEN_PHASES = new Set([
  * presence and use this only for the words. Exported so a caller outside the cell
  * describes a run in the identical way rather than re-deriving the PR-driven rule.
  */
-export function resolveRunTitle(run: Pick<WorkItemCellRun, 'phase' | 'workItemTitle' | 'prTitle'>) {
+export function resolveRunTitle(
+	run: Pick<WorkItemCellRun, 'phase' | 'workItemTitle' | 'prTitle'> & {
+		maintenanceTarget?: string | null;
+	},
+) {
+	// A maintenance run has no work item and no pull request, so both branches below
+	// answer `null` for it and the cell fell back to naming itself — "View run", which
+	// says nothing about what the row is. It has a subject of its own: the build it is
+	// moving its machine to.
+	if (run.maintenanceTarget) return `Update to ${shortenTarget(run.maintenanceTarget)}`;
 	return PR_DRIVEN_PHASES.has(run.phase) ? run.prTitle : run.workItemTitle;
+}
+
+/**
+ * A target as an operator would say it: a full commit id cut to the seven characters
+ * every other build reads as, anything else — a branch name, a tag — left alone,
+ * because shortening `main` would be vandalism.
+ */
+function shortenTarget(target: string): string {
+	return /^[0-9a-f]{40}$/i.test(target) ? target.slice(0, 7) : target;
 }
 
 /** The title line: prose naming the work, optionally linking to the run itself. */

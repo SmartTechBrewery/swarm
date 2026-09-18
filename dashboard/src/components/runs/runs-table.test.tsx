@@ -502,7 +502,10 @@ describe('RunsTable', () => {
 
 		// Issue #974 — the row is marked as machine maintenance at a glance, on the
 		// kind axis rather than the status one, without displacing anything it said.
-		it('marks the desktop Phase cell as maintenance, beside the phase and the machine', () => {
+		// The `Maintenance` pill is gone: the Phase column already says "worker update"
+		// and the title now says what the run is doing, so the pill was a third way of
+		// saying the same thing.
+		it('names what the run is doing, and keeps the phase and the machine', () => {
 			const { container } = renderTable(
 				<RunsTable
 					runs={[maintenanceRun]}
@@ -516,12 +519,8 @@ describe('RunsTable', () => {
 			const table = container.querySelector('table') as HTMLElement;
 			const row = within(table).getAllByRole('row')[1];
 			const phaseCell = row.querySelectorAll('td')[0];
-			const mark = within(phaseCell as HTMLElement).getByTestId('run-maintenance-mark');
-			expect(mark.textContent).toBe('Maintenance');
-			// The shared caution badge, not a hand-rolled pill of its own.
-			const pill = mark.querySelector('span') as HTMLElement;
-			expect(pill.className).toContain('bg-amber-950/20');
-			expect(pill.className).toContain('text-amber-200');
+			expect(within(row as HTMLElement).getByText('Update to main')).not.toBeNull();
+			expect((row as HTMLElement).textContent).not.toContain('Maintenance');
 			// Never a status word: the Status column keeps that axis to itself.
 			expect((row as HTMLElement).textContent).not.toContain('Updating');
 			// Everything the row already said is still there.
@@ -532,7 +531,23 @@ describe('RunsTable', () => {
 			expect(within(row as HTMLElement).getByText('→ main')).not.toBeNull();
 		});
 
-		it('leaves a pipeline row unmarked', () => {
+		// A full commit id is cut to the seven characters every other build reads as.
+		it('shortens a commit target in the title, leaving a branch name alone', () => {
+			const { container } = renderTable(
+				<RunsTable
+					runs={[{ ...maintenanceRun, maintenanceTarget: 'a'.repeat(40) }]}
+					totalCount={1}
+					currentPage={1}
+					pageSize={25}
+					onPageChange={vi.fn()}
+				/>,
+			);
+
+			const row = within(container.querySelector('table') as HTMLElement).getAllByRole('row')[1];
+			expect(within(row as HTMLElement).getByText('Update to aaaaaaa')).not.toBeNull();
+		});
+
+		it('leaves a pipeline row titled by its own work', () => {
 			const { container } = renderTable(
 				<RunsTable
 					runs={[baseRun]}
@@ -545,10 +560,11 @@ describe('RunsTable', () => {
 
 			const table = container.querySelector('table') as HTMLElement;
 			const row = within(table).getAllByRole('row')[1];
-			expect(within(row as HTMLElement).queryByTestId('run-maintenance-mark')).toBeNull();
+			expect((row as HTMLElement).textContent).not.toContain('Update to');
+			expect((row as HTMLElement).textContent).not.toContain('Maintenance');
 		});
 
-		it('marks the mobile card too', () => {
+		it('names it on the mobile card too', () => {
 			renderTable(
 				<RunsTable
 					runs={[maintenanceRun, { ...baseRun, id: 'run-2' }]}
@@ -560,10 +576,9 @@ describe('RunsTable', () => {
 			);
 
 			const [maintenanceCard, pipelineCard] = screen.getAllByTestId('run-card');
-			expect(within(maintenanceCard).getByTestId('run-maintenance-mark').textContent).toBe(
-				'Maintenance',
-			);
-			expect(within(pipelineCard).queryByTestId('run-maintenance-mark')).toBeNull();
+			expect(within(maintenanceCard).getByText('Update to main')).not.toBeNull();
+			expect(maintenanceCard.textContent).not.toContain('Maintenance');
+			expect(pipelineCard.textContent).not.toContain('Update to');
 		});
 	});
 
