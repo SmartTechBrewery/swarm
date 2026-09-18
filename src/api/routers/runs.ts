@@ -907,7 +907,11 @@ async function resolveRetryScheduled(run: { id: string; status: string }): Promi
  * is spent by the reservation it pays for, so the moment the granted Review takes
  * its slot the ledger shows a spent allowance, no outstanding grant, and this run
  * still holding the last submitted verdict — every earlier clause satisfied while
- * SWARM is mid-review. Only the pending slot above it says otherwise.
+ * SWARM is mid-review. Only the pending slot above it says otherwise — and only
+ * while the dispatch that took it is still due to run: a reservation whose owner
+ * died is a relic no reservation will clear on a capped pull request, so counting
+ * it as a review in flight would retire the callout exactly when the operator
+ * needs it ({@link hasReviewInFlightAbove}).
  *
  * Resolved here rather than stored on the run, because the answer belongs to the
  * *pull request's* ledger and keeps changing after the run ends (a later grant, a

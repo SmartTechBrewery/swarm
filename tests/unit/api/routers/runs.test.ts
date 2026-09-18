@@ -1790,6 +1790,9 @@ describe('runsRouter', () => {
 					headSha: 'head-1',
 					capOverrideGrantedAt: null,
 					capOverrideConsumedAt: null,
+					// Meaningful only on a `pending` slot, so each case that turns on it
+					// says so itself.
+					dispatchActive: false,
 					...overrides,
 				};
 			}
@@ -1853,25 +1856,52 @@ describe('runsRouter', () => {
 				});
 			});
 
-			// Issue #1038 review pass 1: a grant is spent by the reservation it pays for,
-			// so the ledger reads as a full allowance with no outstanding grant the moment
-			// the granted Review starts. The pending slot above this verdict is the only
-			// thing saying an operator has already acted.
-			it('is false while the review a consumed grant bought is still in flight', async () => {
+			/**
+			 * The ledger a redeemed grant leaves: the allowance spent, the grant
+			 * consumed, this run still holding the last submitted verdict, and one
+			 * reservation above it — whose owning dispatch is or is not still due to run.
+			 */
+			function redeemedGrantSlots(dispatchActive: boolean): PullRequestReviewSlot[] {
 				const slots = spentSlots();
 				slots[REVIEW_VERDICT_CAP - 1] = {
 					...slots[REVIEW_VERDICT_CAP - 1],
 					capOverrideGrantedAt: new Date(),
 					capOverrideConsumedAt: new Date(),
 				};
-				slots.push(
-					slot({ ordinal: REVIEW_VERDICT_CAP + 1, state: 'pending', headSha: 'head-next' }),
-				);
+				return [
+					...slots,
+					slot({
+						ordinal: REVIEW_VERDICT_CAP + 1,
+						state: 'pending',
+						headSha: 'head-next',
+						dispatchActive,
+					}),
+				];
+			}
+
+			// Issue #1038 review pass 1: a grant is spent by the reservation it pays for,
+			// so the ledger reads as a full allowance with no outstanding grant the moment
+			// the granted Review starts. The pending slot above this verdict is the only
+			// thing saying an operator has already acted.
+			it('is false while the review a consumed grant bought is still in flight', async () => {
 				vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', ...REVIEW_RUN }));
-				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(slots);
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(redeemedGrantSlots(true));
 
 				await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
 					reviewCapSpent: false,
+				});
+			});
+
+			// Issue #1038 review pass 2: the same ledger, but the granted Review's
+			// dispatch has settled without submitting. Nothing is coming — a capped pull
+			// request makes no further reservation, so nothing will clear the relic
+			// either — and the run is exactly as stopped as before the operator acted.
+			it('is true when the reservation above it is a relic of a dead dispatch', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', ...REVIEW_RUN }));
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(redeemedGrantSlots(false));
+
+				await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+					reviewCapSpent: true,
 				});
 			});
 

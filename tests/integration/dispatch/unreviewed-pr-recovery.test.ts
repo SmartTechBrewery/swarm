@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { getDb } from '../../../src/db/client.js';
 import {
+	cancelWaitingDispatch,
 	claimDispatch,
 	completeDispatch,
 	createDispatch,
@@ -149,7 +150,40 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 						headSha: 'sha-1',
 						capOverrideGrantedAt: null,
 						capOverrideConsumedAt: null,
+						// Its owner is still in `createDispatch`'s default `pending` state;
+						// only a `pending` slot's liveness is read anywhere (issue #1038).
+						dispatchActive: true,
 					},
+				]);
+			});
+
+			// Issue #1038: the run-detail read model has to tell a Review in flight from
+			// the relic of a dispatch that died without submitting, so the projection
+			// carries the owner's liveness — the same question `reserveReviewVerdict`
+			// asks inside its lock, answered here in the one read.
+			it('reports a pending slot live only while its owning dispatch is', async () => {
+				const owner = await seedVerdictOwner();
+				await reserveReviewVerdict(
+					{ projectId: PROJECT_ID, repository: REPO, prNumber: PR, headSha: 'sha-1' },
+					owner,
+				);
+
+				expect(await listActiveReviewSlotsForPullRequest(PROJECT_ID, REPO, PR)).toMatchObject([
+					{ ordinal: 1, state: 'pending', dispatchActive: true },
+				]);
+
+				await cancelWaitingDispatch(owner, 'test: settled without submitting');
+
+				expect(await listActiveReviewSlotsForPullRequest(PROJECT_ID, REPO, PR)).toMatchObject([
+					{ ordinal: 1, state: 'pending', dispatchActive: false },
+				]);
+
+				// And the same answer when the owner is gone entirely: the foreign key
+				// nulls `dispatch_id`, which the left join leaves as no state at all.
+				await getDb().delete(dispatches).where(eq(dispatches.id, owner));
+
+				expect(await listActiveReviewSlotsForPullRequest(PROJECT_ID, REPO, PR)).toMatchObject([
+					{ ordinal: 1, state: 'pending', dispatchActive: false },
 				]);
 			});
 

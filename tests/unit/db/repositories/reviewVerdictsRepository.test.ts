@@ -25,6 +25,9 @@ function slot(overrides: Partial<PullRequestReviewSlot> = {}): PullRequestReview
 		headSha: 'abc123',
 		capOverrideGrantedAt: null,
 		capOverrideConsumedAt: null,
+		// Only a `pending` slot's owner liveness means anything, so every case that
+		// depends on it says so at the call site rather than inheriting it here.
+		dispatchActive: false,
 		...overrides,
 	};
 }
@@ -103,14 +106,14 @@ describe('hasReviewInFlightAbove', () => {
 	 * allowance reads spent, the grant is consumed, the last verdict is still this
 	 * run's — and a Review is already running on the extra slot it bought.
 	 */
-	function grantedFollowUpSlots(): PullRequestReviewSlot[] {
+	function grantedFollowUpSlots(dispatchActive = true): PullRequestReviewSlot[] {
 		const slots = spentSlots();
 		slots[REVIEW_VERDICT_CAP - 1] = {
 			...slots[REVIEW_VERDICT_CAP - 1],
 			capOverrideGrantedAt: new Date(),
 			capOverrideConsumedAt: new Date(),
 		};
-		return [...slots, slot({ ordinal: REVIEW_VERDICT_CAP + 1, state: 'pending' })];
+		return [...slots, slot({ ordinal: REVIEW_VERDICT_CAP + 1, state: 'pending', dispatchActive })];
 	}
 
 	it('recognises the granted review a consumed override put in flight', () => {
@@ -124,6 +127,17 @@ describe('hasReviewInFlightAbove', () => {
 		expect(isReviewAllowanceSpent(inFlight)).toBe(true);
 		expect(isLastPermittedVerdict(inFlight, REVIEW_VERDICT_CAP)).toBe(true);
 		expect(hasReviewInFlightAbove(inFlight, REVIEW_VERDICT_CAP)).toBe(true);
+	});
+
+	// The other half of the same question: a reservation whose dispatch settled
+	// terminally without submitting is a relic, and the capped pull request will
+	// never make the next reservation that would clear it — so the run it stopped
+	// at must go on reading as stopped.
+	it('refuses a pending slot whose owning dispatch is no longer due to run', () => {
+		const stale = grantedFollowUpSlots(false);
+		expect(isReviewAllowanceSpent(stale)).toBe(true);
+		expect(isLastPermittedVerdict(stale, REVIEW_VERDICT_CAP)).toBe(true);
+		expect(hasReviewInFlightAbove(stale, REVIEW_VERDICT_CAP)).toBe(false);
 	});
 
 	it('answers false on a capped pull request with nothing reserved', () => {

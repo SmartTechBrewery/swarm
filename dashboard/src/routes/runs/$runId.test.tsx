@@ -257,6 +257,24 @@ describe('CapSpentApprovalCallout (issue #1038)', () => {
 		expect(link.href).toBe('https://github.com/acme/api/pull/42');
 	});
 
+	// Issue #1038 review pass 2: `reviewCapSpent: true` is equally the server's
+	// answer for a capped pull request whose granted follow-up Review died before
+	// submitting — a reservation nothing owns is not a continuation — so the run
+	// detail goes back to saying a person is needed. One boolean, so this asserts
+	// the callout is on the page rather than any second distinction the component
+	// cannot see.
+	it('renders again once a granted follow-up review has died without submitting', () => {
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		render(
+			<QueryClientProvider client={queryClient}>
+				<RunDetailHeader run={makeCapSpentApprovalRun({ reviewCapSpent: true })} project={null} />
+			</QueryClientProvider>,
+		);
+
+		expect(screen.getByRole('heading', { name: 'Manual action required' })).toBeDefined();
+		expect(screen.getByText(/will not dispatch another review/i)).toBeDefined();
+	});
+
 	// Phase 2's lever, deliberately absent here.
 	it('offers no action button in this phase', () => {
 		render(<CapSpentApprovalCallout run={makeCapSpentApprovalRun()} />);
@@ -266,10 +284,11 @@ describe('CapSpentApprovalCallout (issue #1038)', () => {
 
 	// `reviewCapSpent: false` is the whole of "not stopped": the server resolves it
 	// from the ledger, so it covers a pull request with a slot still free *and* one
-	// whose granted follow-up Review is already in flight (issue #1038 review pass 1).
+	// whose granted follow-up Review is already in flight on a dispatch that is
+	// still due to run (issue #1038 review passes 1–2).
 	it.each([
 		['a pull request that still has allowance left', { reviewCapSpent: false }],
-		['a granted follow-up review already in flight', { reviewCapSpent: false }],
+		['a granted follow-up review in flight on a live dispatch', { reviewCapSpent: false }],
 		['a row the server resolved no ledger fact for', { reviewCapSpent: null }],
 		['an approval that merged', { reviewMergeOutcome: 'merged' }],
 		['a changes-requested verdict', { reviewVerdict: 'request-changes' }],

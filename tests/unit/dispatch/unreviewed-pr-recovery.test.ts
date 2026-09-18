@@ -188,6 +188,9 @@ describe('classifyReviewLedgerForRecovery', () => {
 			headSha: 'abc123',
 			capOverrideGrantedAt: null,
 			capOverrideConsumedAt: null,
+			// The sweep classifies on slot state alone; owner liveness is the run-detail
+			// read model's question (issue #1038).
+			dispatchActive: false,
 			...overrides,
 		};
 	}
@@ -387,7 +390,14 @@ describe('recoverUnreviewedPullRequests', () => {
 			['a review in flight at another head', 'pending' as const, 'older'],
 		])('%s', async (_label, state, headSha) => {
 			listActiveReviewSlotsForPullRequest.mockResolvedValue([
-				{ ordinal: 1, state, headSha, capOverrideGrantedAt: null, capOverrideConsumedAt: null },
+				{
+					ordinal: 1,
+					state,
+					headSha,
+					capOverrideGrantedAt: null,
+					capOverrideConsumedAt: null,
+					dispatchActive: false,
+				},
 			]);
 
 			await recoverUnreviewedPullRequests();
