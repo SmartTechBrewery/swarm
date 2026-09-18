@@ -140,6 +140,27 @@ const textSlot = () => z.preprocess(asText, z.string().min(1));
 const textListSlot = () => z.preprocess(asList, z.array(z.string().min(1)).min(1));
 
 /**
+ * A free-text slot where **blank is absent** (issue #1037). `textSlot().optional()`
+ * exempts only a *missing* key — `.optional()` wraps the effect, so Zod
+ * short-circuits before the inner `min(1)` ever runs — while an explicitly present
+ * `""` is parsed and fails as a raw `too_small` on `verification[n].detail`, naming
+ * neither the command nor the outcome that required it. Moving `.optional()` inside
+ * lets the preprocess see the absent key too, so a blank one reads the same way and
+ * reaches the refinement that knows what the slot is for. Confirmed live: a
+ * resolve-conflicts hand-off wrote `detail: ""` on two entries and a merge that was
+ * already resolved, staged and verified was discarded over it.
+ *
+ * Deliberately a second factory rather than a change to {@link textSlot}: every
+ * other slot's blank handling is unchanged, so this is the conflict hand-off's rule
+ * and not a repo-wide relaxation of what an empty string means.
+ */
+const optionalTextSlot = () =>
+	z.preprocess((value) => {
+		const text = asText(value);
+		return typeof text === 'string' && text.trim() === '' ? undefined : text;
+	}, z.string().min(1).optional());
+
+/**
  * One review finding. Every prose slot is shape-normalized; `id`, `severity` and
  * `category` deliberately are not, because an enum's shape *is* its semantics and
  * a joined id is a corrupted value rather than a recovered one.
@@ -459,7 +480,7 @@ export const ConflictVerificationSchema = z.object({
 	command: z.string().min(1),
 	outcome: z.enum(CONFLICT_VERIFICATION_OUTCOMES),
 	/** Required for either failing outcome — see {@link ConflictHandoffSchema}'s refinement. */
-	detail: textSlot().optional(),
+	detail: optionalTextSlot(),
 });
 
 export type ConflictVerification = z.infer<typeof ConflictVerificationSchema>;
