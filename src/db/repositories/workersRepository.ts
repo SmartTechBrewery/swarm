@@ -106,6 +106,7 @@ function rowToWorker(row: WorkerRow): Worker {
 		// (issue #918). The pair is always written together, so a non-null commit with a
 		// null flag can only be a row hand-edited in `psql`; read that as not dirty.
 		build: row.buildCommit ? { commit: row.buildCommit, dirty: row.buildDirty ?? false } : null,
+		version: row.version ?? null,
 		// No reassembly and no defaulting, unlike the pair above: the column is NOT NULL
 		// with an `'unknown'` default, so every row already carries one of the three
 		// members (issue #997).
@@ -349,6 +350,7 @@ export async function updateWorkerCapabilities(
 	repository?: string | null,
 	build?: WorkerBuild | null,
 	supervision?: WorkerSupervision,
+	version?: string | null,
 ): Promise<Worker | undefined> {
 	return await getDb().transaction(async (tx) => {
 		const existingWorkerRows = await tx
@@ -388,6 +390,10 @@ export async function updateWorkerCapabilities(
 			declaration.buildDirty = build?.dirty ?? null;
 		}
 		if (supervision) declaration.supervision = supervision;
+		// Its own axis rather than a member of `build`: the commit is what staleness is
+		// judged on and the version is only the label beside it, so a daemon that
+		// declares one without the other must not have the other cleared.
+		if (version !== undefined) declaration.version = version;
 
 		const [updatedRow] = await tx
 			.update(workers)

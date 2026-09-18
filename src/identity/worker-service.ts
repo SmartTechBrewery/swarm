@@ -166,6 +166,7 @@ export async function refreshWorkerCapabilities(
 	repository?: string | null,
 	build?: WorkerBuild | null,
 	supervision?: WorkerSupervision,
+	version?: string | null,
 ): Promise<Worker | undefined> {
 	const validated = WorkerCapabilitiesSchema.parse(capabilities);
 	const validatedPhases =
@@ -176,6 +177,12 @@ export async function refreshWorkerCapabilities(
 		build === undefined || build === null ? build : WorkerBuildSchema.parse(build);
 	const validatedSupervision =
 		supervision === undefined ? undefined : WorkerSupervisionSchema.parse(supervision);
+	// Trimmed rather than schema-parsed: it is the install root's own `package.json`
+	// string, displayed and never compared, so there is nothing to validate it against
+	// — and rejecting a version this control plane does not recognise would drop a
+	// label from a machine that is otherwise fine.
+	const validatedVersion =
+		version === undefined || version === null ? version : version.trim() || null;
 	return updateWorkerCapabilities(
 		id,
 		validated,
@@ -183,6 +190,7 @@ export async function refreshWorkerCapabilities(
 		validatedRepository,
 		validatedBuild,
 		validatedSupervision,
+		validatedVersion,
 	);
 }
 

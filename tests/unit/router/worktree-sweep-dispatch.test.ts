@@ -66,6 +66,7 @@ function framesOn(ws: FakeWs): Array<Record<string, unknown>> {
 function workerWith(worktreeSweep: Worker['worktreeSweep']): Worker {
 	return {
 		id: WORKER_ID,
+		version: null,
 		ownerUserId: '22222222-2222-4222-8222-222222222222',
 		displayName: 'ada-laptop',
 		capabilities: ['claude'],

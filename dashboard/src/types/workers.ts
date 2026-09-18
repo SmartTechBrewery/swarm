@@ -152,6 +152,16 @@ export interface WorkerRow {
 	 */
 	build: { commit: string; dirty: boolean } | null;
 	/**
+	 * The version that machine's SWARM install root declares (`package.json`), or
+	 * `null` while it has declared none.
+	 *
+	 * A **label beside** `build`, not a replacement for it: `buildIsCurrent` below is
+	 * still decided on the commit, because a version only moves when an operator bumps
+	 * it and every machine reports the same one between releases. Read as a plain
+	 * string and never parsed — this bundle compares no versions.
+	 */
+	version: string | null;
+	/**
 	 * Server-derived: whether the `build` above is the control plane's own. `false`
 	 * is what the `OUTDATED` mark renders for.
 	 *

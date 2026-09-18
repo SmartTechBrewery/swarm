@@ -38,6 +38,7 @@ function createCollaborators(projects: ProjectConfig[], workers: Worker[] = []) 
 				workerId: worker.id,
 				displayName: worker.displayName,
 				disposition: 'requested' as const,
+				version: null,
 				worktreeSweep: null,
 			})),
 		),

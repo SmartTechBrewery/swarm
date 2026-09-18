@@ -63,6 +63,7 @@ function workerWith(update: Worker['update']): Worker {
 		build: null,
 		supervision: 'unknown',
 		update,
+		version: null,
 		worktreeSweep: null,
 		createdAt: new Date(0),
 		updatedAt: new Date(0),

@@ -146,6 +146,25 @@ export const workers = pgTable(
 		 */
 		buildDirty: boolean('build_dirty'),
 		/**
+		 * The **version** that daemon's SWARM install root declares — `package.json`'s
+		 * `version`, carried on the handshake as `daemonVersion` since the field
+		 * existed and, until now, read and thrown away.
+		 *
+		 * It is a **label, not a comparand.** {@link buildCommit} stays the fact
+		 * staleness is judged on, and the comment above says why that switch was made:
+		 * a version moves when somebody bumps it, so between two releases every machine
+		 * in the fleet reports the same string whatever code it runs, and an equality
+		 * check on it would read a drifting fleet as a current one. What this column
+		 * buys is the name an operator actually uses — "the 1.2 machines" — beside the
+		 * commit that answers whether the fix is running.
+		 *
+		 * Nullable on `build_commit`'s exact contract: NULL is "this daemon declared
+		 * none", which is what every row written before this column says until its
+		 * machine next connects. Nothing is backfilled; no index, since nothing queries
+		 * by it.
+		 */
+		version: text('version'),
+		/**
 		 * Whether a process supervisor will start the daemon currently operating this
 		 * row again after it exits (issue #997) — the **fifth** self-declared fact,
 		 * declared at handshake and rewritten on every reconnect. Nothing else on the

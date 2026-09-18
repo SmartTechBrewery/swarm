@@ -243,6 +243,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		drainingSince: null,
 		// Nobody has asked this machine to update (issue #933).
 		update: null,
+		version: null,
 		worktreeSweep: null,
 		build: null,
 		supervision: 'unknown',

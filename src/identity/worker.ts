@@ -316,6 +316,13 @@ export const WorkerSchema = z.object({
 	drainingSince: z.date().nullable(),
 	build: WorkerBuildSchema.nullable(),
 	/**
+	 * The version the machine's SWARM install root declares (`package.json`), or
+	 * `null` while it has declared none. A **label**, never a comparand: `build`
+	 * above is what staleness is judged on, because a version only moves when an
+	 * operator bumps it and every machine reports the same one between releases.
+	 */
+	version: z.string().nullable(),
+	/**
 	 * How the machine's daemon declared it is supervised (issue #997) — see the block
 	 * above for why `unknown` is an answer rather than an absence, which is why this
 	 * is not nullable.

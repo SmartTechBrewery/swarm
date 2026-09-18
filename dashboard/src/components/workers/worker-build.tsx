@@ -20,8 +20,16 @@ import { Badge } from '@/components/ui/badge.js';
  */
 
 /** A build as one scannable token: the abbreviated commit, marked when the checkout it named was dirty. */
-export function formatWorkerBuild(build: { commit: string; dirty: boolean }): string {
-	return `${build.commit.slice(0, 7)}${build.dirty ? '+dirty' : ''}`;
+export function formatWorkerBuild(
+	build: { commit: string; dirty: boolean },
+	version?: string | null,
+): string {
+	const commit = `${build.commit.slice(0, 7)}${build.dirty ? '+dirty' : ''}`;
+	// The version leads because it is what an operator says out loud, and the commit
+	// stays because it is what "Outdated" was actually decided on — dropping it would
+	// leave the mark answering a question the text no longer asks. A machine that has
+	// declared no version reads exactly as it did before.
+	return version ? `${version} (${commit})` : commit;
 }
 
 /**

@@ -85,6 +85,7 @@ function makeCandidate(
 			// In the pool (issue #919) for every case that says nothing about draining.
 			drainingSince: overrides.drainingSince ?? null,
 			update: null,
+			version: null,
 			worktreeSweep: null,
 			build: null,
 			supervision: 'unknown',

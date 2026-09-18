@@ -152,6 +152,7 @@ export interface WorkerTransportDeps {
 		repository: string | null,
 		build: WorkerBuild | null,
 		supervision: WorkerSupervision,
+		version: string | null,
 	) => Promise<Worker | undefined>;
 	/**
 	 * Police the worker's existing enrollments against the repository it just
@@ -433,6 +434,10 @@ export async function handleHandshake(
 			request.repository ?? null,
 			request.build ?? null,
 			request.supervision ?? 'unknown',
+			// Already on the wire since the field existed, and read here for the first
+			// time: it is the label shown beside the build, never what staleness is
+			// judged on (`src/db/schema/workers.ts`).
+			request.daemonVersion ?? null,
 		);
 	} catch (err) {
 		if (err instanceof WorkerCapabilityReductionError) {

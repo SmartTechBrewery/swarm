@@ -591,7 +591,7 @@ function SupportedPhases({ phases }: { phases: string[] }) {
 function DeclaredBuild({ worker }: { worker: WorkerDetail }) {
 	return (
 		<span className="inline-flex flex-wrap items-center gap-2">
-			{worker.build ? formatWorkerBuild(worker.build) : EM_DASH}
+			{worker.build ? formatWorkerBuild(worker.build, worker.version) : EM_DASH}
 			<WorkerUpdatingBadge update={worker.update} />
 			<WorkerBuildBadge
 				buildIsCurrent={worker.buildIsCurrent}
