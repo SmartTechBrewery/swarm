@@ -30,7 +30,8 @@ import {
 	forceReReviewButtonLabel,
 	forceReReviewConfirmMessage,
 	forceReviewOfSupersededHeadConfirmMessage,
-	isCapSpentApproval,
+	isForcedReviewPending,
+	showsCapSpentApprovalCallout,
 } from '@/lib/force-re-review.js';
 import { formatDuration, formatPhase, formatTimeUntil, formatTokenCount } from '@/lib/format.js';
 import { describePreservedWorker, preservedWorkerLabel } from '@/lib/preserved-worker.js';
@@ -1707,6 +1708,13 @@ export function ReviewCapCallout({ run, project }: ReviewCapCalloutProps) {
  * refused for one of `not-eligible`'s other causes, because only the provider
  * knows whether the head moved and the server answers that with its own
  * `head-unchanged` refusal rather than a read on every render here.
+ *
+ * It therefore also has a second state. The force's success report is rendered
+ * inside this panel, and the ledger fact gating the first state goes false the
+ * instant the force records its grant — so the panel would unmount itself one
+ * refetch after the click, hiding the dispatch id and reading as "resolved" while
+ * the forced review had not started. `reviewCapOverrideOutstanding` carries that
+ * window, and the copy says what is actually true in it.
  */
 export function CapSpentApprovalCallout({
 	run,
@@ -1715,21 +1723,43 @@ export function CapSpentApprovalCallout({
 	run: RunRow;
 	project?: ReviewCapCalloutProject;
 }) {
-	if (!isCapSpentApproval(run)) return null;
+	if (!showsCapSpentApprovalCallout(run)) return null;
+	// The same panel in its second state: an operator has forced the continuation
+	// and the extra slot is granted but unspent, so the review is scheduled and has
+	// not started. It stays mounted for that window deliberately — the force's own
+	// report is rendered inside it, and unmounting on success would hide the only
+	// confirmation the operator gets (and read as "resolved" while nothing has run).
+	const forcedReviewPending = isForcedReviewPending(run);
 
 	return (
 		<div className="p-4 bg-red-950/20 border border-red-900/30 rounded flex items-start gap-3">
 			<AlertTriangle className="h-5 w-5 text-red-400 shrink-0 mt-0.5" />
 			<div>
-				<h3 className="text-xs font-semibold text-red-200">Manual action required</h3>
+				<h3 className="text-xs font-semibold text-red-200">
+					{forcedReviewPending ? 'Forced review pending' : 'Manual action required'}
+				</h3>
 				<p className="text-xs text-red-400/80 mt-1">
-					This approval was the last review verdict SWARM's review safety cap allows for this pull
-					request
-					{run.reviewOrdinal ? ` (review ${run.reviewOrdinal} of this PR)` : ''}, and the automatic
-					merge did not go through — see the merge result below for the provider's own reason. SWARM
-					will not dispatch another review for this pull request on its own, so it stays here until
-					a person acts. If that decision is to keep going, "Force re-review" reviews the pull
-					request's current head once.
+					{forcedReviewPending ? (
+						<>
+							This approval was the last review verdict SWARM's review safety cap allows for this
+							pull request
+							{run.reviewOrdinal ? ` (review ${run.reviewOrdinal} of this PR)` : ''}, and the
+							automatic merge did not go through. An operator has already forced the continuation:
+							the extra review slot is granted and waiting to be spent, so a review of the pull
+							request's current head is scheduled and has not started yet. Forcing again reports
+							what is already scheduled rather than starting a second one.
+						</>
+					) : (
+						<>
+							This approval was the last review verdict SWARM's review safety cap allows for this
+							pull request
+							{run.reviewOrdinal ? ` (review ${run.reviewOrdinal} of this PR)` : ''}, and the
+							automatic merge did not go through — see the merge result below for the provider's own
+							reason. SWARM will not dispatch another review for this pull request on its own, so it
+							stays here until a person acts. If that decision is to keep going, "Force re-review"
+							reviews the pull request's current head once.
+						</>
+					)}
 				</p>
 				{run.repository && run.prNumber && (
 					<a

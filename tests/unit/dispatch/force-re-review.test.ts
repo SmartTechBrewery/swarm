@@ -14,8 +14,8 @@ vi.mock('@/db/repositories/projectsRepository.js', () => ({
 
 // Only the ledger *writes/reads* the service performs are stubbed; the real
 // predicates (`isCapReachingRequestChanges`, and issue #1040's
-// `isReviewAllowanceSpent`/`isLastPermittedVerdict`) are kept so the service's cap
-// guards are exercised against the same arithmetic the writer uses.
+// `hasSubmittedEveryPermittedVerdict`/`isLastPermittedVerdict`) are kept so the
+// service's cap guards are exercised against the same arithmetic the writer uses.
 vi.mock('@/db/repositories/reviewVerdictsRepository.js', async (importOriginal) => ({
 	...(await importOriginal<typeof import('@/db/repositories/reviewVerdictsRepository.js')>()),
 	getSubmittedReviewSlot: vi.fn(),
@@ -162,6 +162,15 @@ function submittedSlots(count: number): PullRequestReviewSlot[] {
 /** A pull request whose whole review allowance is spent and holds no outstanding grant. */
 function spentLedger(): PullRequestReviewSlot[] {
 	return submittedSlots(REVIEW_VERDICT_CAP);
+}
+
+/**
+ * The ledger a force leaves behind: the same spent allowance, plus the extra slot
+ * it granted, still unconsumed because the Review it bought has not reserved one.
+ * This is the state every click after the first sees.
+ */
+function grantedLedger(): PullRequestReviewSlot[] {
+	return spentLedger().map((slot) => ({ ...slot, capOverrideGrantedAt: new Date() }));
 }
 
 /** A completed Review run that approved — the cap stop issue #1040 recovers. */
@@ -663,7 +672,13 @@ describe('forceReReview (issue #511)', () => {
 				expect(second[0].dedupKey).toBe(first[0].dedupKey);
 			});
 
+			// The state a second click actually sees: the first force's grant is on the
+			// ledger and unconsumed, because the dispatch it bought died without ever
+			// reserving a slot. That is precisely when the chain walk has to run, so the
+			// ledger here carries the grant rather than the pristine `spentLedger()`.
 			it('chains a fresh dispatch past a dead prior attempt', async () => {
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(grantedLedger());
+				vi.mocked(grantReviewCapOverride).mockResolvedValue('already-granted');
 				vi.mocked(createAndPublishDispatch)
 					.mockResolvedValueOnce({
 						dispatch: { id: 'dispatch-dead', state: 'completed', outcome: 'no-trigger' },
@@ -678,9 +693,27 @@ describe('forceReReview (issue #511)', () => {
 				expect(second[0].dedupKey).not.toBe(first[0].dedupKey);
 				expect(result).toMatchObject({
 					continuation: 'review',
+					capOverride: 'already-granted',
 					dispatch: 'retried',
 					previousAttemptOutcome: 'no-trigger',
 				});
+			});
+
+			// The grant this action writes is unconsumed until the Review it pays for
+			// reserves its slot, so an allowance-spent guard would turn away every click
+			// after the first — including the one above, which exists to chain past a
+			// dead attempt. The repeat click reports what it found instead.
+			it('reports what it found while its own granted override is still outstanding', async () => {
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(grantedLedger());
+				vi.mocked(grantReviewCapOverride).mockResolvedValue('already-granted');
+				vi.mocked(createAndPublishDispatch).mockResolvedValue(dispatchResult(false));
+
+				await expect(forceReReview('run-1')).resolves.toMatchObject({
+					continuation: 'review',
+					capOverride: 'already-granted',
+					dispatch: 'already-scheduled',
+				});
+				expect(createAndPublishDispatch).toHaveBeenCalledTimes(1);
 			});
 		});
 
@@ -716,6 +749,29 @@ describe('forceReReview (issue #511)', () => {
 				await expect(forceReReview('run-1')).resolves.toMatchObject({ dispatch: 'scheduled' });
 			});
 
+			// The branch this continuation reviews comes from the provider, with the
+			// current head — so a stored payload that no longer names one refuses the
+			// corrective continuation alone, not this one.
+			it('is unaffected by a stored payload that no longer names the PR branch', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeCapSpentApprovalRun({
+						jobPayload: {
+							...JOB_PAYLOAD,
+							event: { ...JOB_PAYLOAD.event, prBranch: undefined },
+						} as SwarmJob,
+					}),
+				);
+
+				await expect(forceReReview('run-1')).resolves.toMatchObject({
+					continuation: 'review',
+					dispatch: 'scheduled',
+				});
+				expect(vi.mocked(createAndPublishDispatch).mock.calls[0][0].jobPayload).toMatchObject({
+					type: 'scm',
+					event: { prBranch: 'issue-508' },
+				});
+			});
+
 			it('refuses when the ledger holds no submitted review for the reviewed head', async () => {
 				vi.mocked(getSubmittedReviewSlot).mockResolvedValue(undefined);
 
@@ -724,6 +780,8 @@ describe('forceReReview (issue #511)', () => {
 				});
 			});
 
+			// `not-capped` keeps the two cases it is really for, and its message claims
+			// only what the ledger shows — never that a spent allowance is unspent.
 			it('refuses when the pull request still has review allowance left', async () => {
 				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(
 					submittedSlots(REVIEW_VERDICT_CAP - 1),
@@ -736,16 +794,6 @@ describe('forceReReview (issue #511)', () => {
 
 			it("refuses when this run's verdict is not the pull request's latest", async () => {
 				vi.mocked(getSubmittedReviewSlot).mockResolvedValue({ ...approvingSlot, ordinal: 2 });
-
-				await expect(forceReReview('run-1')).rejects.toMatchObject({ reason: 'not-capped' });
-			});
-
-			// The grant is still outstanding, so the allowance is not spent — this is the
-			// stale second click, told to refresh rather than shown a second force.
-			it('refuses while a granted, unconsumed override is still outstanding', async () => {
-				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(
-					spentLedger().map((slot) => ({ ...slot, capOverrideGrantedAt: new Date() })),
-				);
 
 				await expect(forceReReview('run-1')).rejects.toMatchObject({ reason: 'not-capped' });
 			});

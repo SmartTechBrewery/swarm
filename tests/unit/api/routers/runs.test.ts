@@ -1311,6 +1311,7 @@ describe('runsRouter', () => {
 				pendingRequest: null,
 				retryScheduled: null,
 				reviewCapSpent: null,
+				reviewCapOverrideOutstanding: null,
 			});
 			expect(result.nextRetryAt).toEqual(nextRetryAt);
 			expect(getRunByIdFromDb).toHaveBeenCalledWith('run-1');
@@ -1727,6 +1728,7 @@ describe('runsRouter', () => {
 					pendingRequest: null,
 					retryScheduled: null,
 					reviewCapSpent: null,
+					reviewCapOverrideOutstanding: null,
 				});
 			});
 		});
@@ -1942,6 +1944,96 @@ describe('runsRouter', () => {
 
 				await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
 					reviewCapSpent: null,
+				});
+			});
+
+			/**
+			 * Issue #1040: the window "Force re-review" leaves behind — the extra slot
+			 * granted, nothing having spent it yet. `reviewCapSpent` is false there (an
+			 * operator has acted), so this second fact is what keeps the callout hosting
+			 * the force button, and its success report, on screen.
+			 */
+			describe('reviewCapOverrideOutstanding', () => {
+				/** A spent allowance carrying the grant a force just wrote. */
+				function grantedSlots(): PullRequestReviewSlot[] {
+					const slots = spentSlots();
+					slots[REVIEW_VERDICT_CAP - 1] = {
+						...slots[REVIEW_VERDICT_CAP - 1],
+						capOverrideGrantedAt: new Date(),
+					};
+					return slots;
+				}
+
+				it('is true while the granted slot is unspent, where reviewCapSpent is false', async () => {
+					vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', ...REVIEW_RUN }));
+					vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(grantedSlots());
+
+					await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+						reviewCapSpent: false,
+						reviewCapOverrideOutstanding: true,
+					});
+					// Both facts, one indexed read.
+					expect(listActiveReviewSlotsForPullRequest).toHaveBeenCalledTimes(1);
+				});
+
+				// The stop itself: no grant yet, so nothing is outstanding and the two
+				// facts never claim the same run.
+				it('is false on the untouched cap stop', async () => {
+					vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', ...REVIEW_RUN }));
+					vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(spentSlots());
+
+					await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+						reviewCapSpent: true,
+						reviewCapOverrideOutstanding: false,
+					});
+				});
+
+				// Once the forced Review has taken the slot, SWARM is visibly working on
+				// the pull request and both callout states retire.
+				it('is false once the granted review has consumed it and is in flight', async () => {
+					vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', ...REVIEW_RUN }));
+					vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(
+						redeemedGrantSlots(true),
+					);
+
+					await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+						reviewCapSpent: false,
+						reviewCapOverrideOutstanding: false,
+					});
+				});
+
+				it('is false for an earlier verdict on the same pull request', async () => {
+					vi.mocked(getRunByIdFromDb).mockResolvedValue(
+						makeRun({ id: 'run-1', ...REVIEW_RUN, reviewOrdinal: 1 }),
+					);
+					vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(grantedSlots());
+
+					await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+						reviewCapOverrideOutstanding: false,
+					});
+				});
+
+				// Same cost gate and same failure posture as its sibling.
+				it('reports null for a run the question does not apply to', async () => {
+					vi.mocked(getRunByIdFromDb).mockResolvedValue(
+						makeRun({ id: 'run-1', ...REVIEW_RUN, phase: 'implementation' }),
+					);
+
+					await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+						reviewCapOverrideOutstanding: null,
+					});
+					expect(listActiveReviewSlotsForPullRequest).not.toHaveBeenCalled();
+				});
+
+				it('reports null rather than failing the page when the ledger read throws', async () => {
+					vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', ...REVIEW_RUN }));
+					vi.mocked(listActiveReviewSlotsForPullRequest).mockRejectedValue(
+						new Error('db unreachable'),
+					);
+
+					await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+						reviewCapOverrideOutstanding: null,
+					});
 				});
 			});
 		});
@@ -3648,6 +3740,7 @@ describe('runsRouter', () => {
 					pendingRequest: null,
 					retryScheduled: null,
 					reviewCapSpent: null,
+					reviewCapOverrideOutstanding: null,
 				});
 			});
 		});

@@ -3,7 +3,9 @@ import { describe, expect, it, vi } from 'vitest';
 vi.mock('@/db/client.js', () => ({ getDb: vi.fn() }));
 
 import {
+	hasOutstandingCapOverride,
 	hasReviewInFlightAbove,
+	hasSubmittedEveryPermittedVerdict,
 	isLastPermittedVerdict,
 	isReviewAllowanceSpent,
 	type PullRequestReviewSlot,
@@ -72,6 +74,57 @@ describe('isReviewAllowanceSpent', () => {
 		const slots = spentSlots();
 		slots[REVIEW_VERDICT_CAP - 1] = { ...slots[REVIEW_VERDICT_CAP - 1], state: 'pending' };
 		expect(isReviewAllowanceSpent(slots)).toBe(false);
+	});
+});
+
+/**
+ * The two halves above, named (issue #1040). "Force re-review" writes a grant and
+ * then enqueues the work it pays for, so the caller that made the grant has to be
+ * able to ask "did the cap really stop this pull request?" without its own grant
+ * answering no.
+ */
+describe('hasSubmittedEveryPermittedVerdict / hasOutstandingCapOverride', () => {
+	it('counts submitted verdicts and ignores a grant entirely', () => {
+		const granted = spentSlots();
+		granted[REVIEW_VERDICT_CAP - 1] = {
+			...granted[REVIEW_VERDICT_CAP - 1],
+			capOverrideGrantedAt: new Date(),
+		};
+
+		expect(hasSubmittedEveryPermittedVerdict(spentSlots().slice(0, REVIEW_VERDICT_CAP - 1))).toBe(
+			false,
+		);
+		expect(hasSubmittedEveryPermittedVerdict(spentSlots())).toBe(true);
+		// The state that made `isReviewAllowanceSpent` answer false above.
+		expect(hasSubmittedEveryPermittedVerdict(granted)).toBe(true);
+		expect(isReviewAllowanceSpent(granted)).toBe(false);
+	});
+
+	it('reports a grant outstanding only until a reservation consumes it', () => {
+		const slots = spentSlots();
+		expect(hasOutstandingCapOverride(slots)).toBe(false);
+
+		slots[REVIEW_VERDICT_CAP - 1] = {
+			...slots[REVIEW_VERDICT_CAP - 1],
+			capOverrideGrantedAt: new Date(),
+		};
+		expect(hasOutstandingCapOverride(slots)).toBe(true);
+
+		slots[REVIEW_VERDICT_CAP - 1] = {
+			...slots[REVIEW_VERDICT_CAP - 1],
+			capOverrideConsumedAt: new Date(),
+		};
+		expect(hasOutstandingCapOverride(slots)).toBe(false);
+	});
+
+	// The composition the two were split out of, restated: nothing about
+	// `isReviewAllowanceSpent`'s answer changed.
+	it('compose back into isReviewAllowanceSpent', () => {
+		for (const slots of [[], spentSlots(), spentSlots().slice(0, 1)]) {
+			expect(isReviewAllowanceSpent(slots)).toBe(
+				hasSubmittedEveryPermittedVerdict(slots) && !hasOutstandingCapOverride(slots),
+			);
+		}
 	});
 });
 

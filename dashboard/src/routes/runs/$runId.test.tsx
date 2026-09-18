@@ -363,6 +363,107 @@ describe('CapSpentApprovalCallout (issue #1038)', () => {
 		).toBeDefined();
 	});
 
+	/**
+	 * The window the force itself opens (issue #1040 review pass 1): the grant is
+	 * written and unconsumed, so the server's `reviewCapSpent` is false and
+	 * `reviewCapOverrideOutstanding` is true. The panel has to stay mounted for it —
+	 * the force's own report is rendered inside it, and unmounting on success would
+	 * take the dispatch id with it and read as "resolved" while nothing had run.
+	 */
+	function makeForcedReviewPendingRun(overrides: Partial<RunRow> = {}): RunRow {
+		return makeCapSpentApprovalRun({
+			reviewCapSpent: false,
+			reviewCapOverrideOutstanding: true,
+			...overrides,
+		});
+	}
+
+	describe('once the force has been made (issue #1040)', () => {
+		const forceMutate = vi.mocked(trpcClient.runs.forceReReview.mutate);
+
+		beforeEach(() => {
+			forceMutate.mockReset();
+		});
+
+		it('stays on the page, saying what is actually true, while the grant is unspent', () => {
+			renderCapSpentCallout(makeForcedReviewPendingRun());
+
+			expect(screen.getByRole('heading', { name: 'Forced review pending' })).toBeDefined();
+			expect(
+				screen.getByText(/extra review slot is granted and waiting to be spent/i),
+			).toBeDefined();
+			// The stop's own copy is gone: a review *is* scheduled now.
+			expect(screen.queryByText(/will not dispatch another review/i)).toBeNull();
+		});
+
+		// The repeat click the server no longer refuses: both writes are conditional,
+		// so it reports the grant and dispatch it finds instead of duplicating either.
+		it('keeps offering the action, and says a second force duplicates nothing', () => {
+			renderCapSpentCallout(makeForcedReviewPendingRun());
+
+			expect(screen.getByRole('button', { name: /force re-review/i })).toBeDefined();
+			expect(screen.getByText(/Forcing again reports what is already scheduled/i)).toBeDefined();
+		});
+
+		// The end-to-end of the finding: click, confirm, and read the report — then
+		// re-render with the state the invalidated `runs.getById` actually returns.
+		it('renders the forced review report, and survives the refetch that follows', async () => {
+			forceMutate.mockResolvedValue({
+				runId: 'run-1',
+				prNumber: '42',
+				continuation: 'review' as const,
+				headSha: 'cafebabe',
+				reviewHeadSha: 'facef00d',
+				capOverride: 'granted' as const,
+				dispatch: 'scheduled' as const,
+				dispatchId: 'dispatch-9',
+			});
+			const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+			const view = render(
+				<QueryClientProvider client={queryClient}>
+					<CapSpentApprovalCallout run={makeCapSpentApprovalRun()} project={{}} />
+				</QueryClientProvider>,
+			);
+
+			fireEvent.click(screen.getByRole('button', { name: /force re-review/i }));
+			const buttons = screen.getAllByRole('button', { name: /force re-review/i });
+			fireEvent.click(buttons[buttons.length - 1]);
+
+			await waitFor(() => {
+				expect(screen.getByRole('heading', { name: 'Re-review scheduled' })).toBeDefined();
+			});
+			expect(
+				screen.getByText(/scheduled for PR #42 .*facef00d.* as dispatch dispatch-9/i),
+			).toBeDefined();
+
+			// The refetch the mutation's own `onSuccess` triggers: the grant it just
+			// wrote makes `reviewCapSpent` false, which used to unmount all of this.
+			view.rerender(
+				<QueryClientProvider client={queryClient}>
+					<CapSpentApprovalCallout run={makeForcedReviewPendingRun()} project={{}} />
+				</QueryClientProvider>,
+			);
+
+			expect(screen.getByRole('heading', { name: 'Re-review scheduled' })).toBeDefined();
+			expect(
+				screen.getByText(/scheduled for PR #42 .*facef00d.* as dispatch dispatch-9/i),
+			).toBeDefined();
+		});
+
+		// Once the granted Review has taken the slot, SWARM is visibly working on the
+		// pull request and the panel retires — the behaviour issue #1038's review
+		// pass 1 settled, unchanged.
+		it('retires once the granted review has consumed the slot', () => {
+			const { container } = render(
+				<CapSpentApprovalCallout
+					run={makeForcedReviewPendingRun({ reviewCapOverrideOutstanding: false })}
+				/>,
+			);
+
+			expect(container.firstChild).toBeNull();
+		});
+	});
+
 	// The two cap callouts are mutually exclusive by verdict, so a capped
 	// `request-changes` run must still show exactly one "Manual action required".
 	it('does not double up with the request-changes cap callout', () => {

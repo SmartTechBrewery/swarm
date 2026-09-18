@@ -80,6 +80,16 @@
  * closed. It is made here, once per operator click, rather than on every render of
  * the run-detail page.
  *
+ * Its cap guard is the one place the two branches read the ledger differently, and
+ * deliberately so: it asks whether every permitted verdict has been *submitted*
+ * ({@link hasSubmittedEveryPermittedVerdict}) rather than whether the allowance is
+ * spent, because the grant this very action writes makes the allowance read
+ * unspent until a reservation consumes it. A guard that counted that grant would
+ * refuse every click after the first — including the one that exists to chain past
+ * a forced dispatch that died before starting a Review — while telling the
+ * operator the allowance has room. The #511 branch is unaffected: it is gated on
+ * {@link isCapReachingRequestChanges}, which no grant changes.
+ *
  * Like `run-reset.ts`, this module knows nothing about tRPC: the API router is a
  * thin surface over it.
  */
@@ -90,9 +100,9 @@ import { getProjectByIdFromDb } from '../db/repositories/projectsRepository.js';
 import {
 	getSubmittedReviewSlot,
 	grantReviewCapOverride,
+	hasSubmittedEveryPermittedVerdict,
 	isCapReachingRequestChanges,
 	isLastPermittedVerdict,
-	isReviewAllowanceSpent,
 	listActiveReviewSlotsForPullRequest,
 } from '../db/repositories/reviewVerdictsRepository.js';
 import {
@@ -172,29 +182,55 @@ export interface ForceReReviewResult {
 }
 
 /**
- * The PR coordinates a forced Respond-to-review needs, recovered from the capped
+ * The PR coordinates *both* forced continuations need, recovered from the capped
  * Review run's own stored job payload. They are read rather than re-fetched from
  * the provider for the same reason the trigger handlers read them off the
  * normalized event (`src/scm/events.ts`): the dispatch that started the Review
  * already carried them, so a provider round-trip would only re-derive data SWARM
  * durably holds.
+ *
+ * Exactly the two each branch actually uses — together they are the ledger key
+ * the grant is written on. The branch name is *not* here: only the
+ * Respond-to-review continuation replays an event that carries one, so requiring
+ * it of both would refuse the superseded-head review over a field it never reads
+ * ({@link respondToReviewCoordinates} asks for it where it is needed).
  */
 function reviewCoordinates(run: {
 	id: string;
 	prNumber: string | null;
 	jobPayload: SwarmJob | null;
-}): { prNumber: string; headSha: string; prBranch: string } {
+}): { prNumber: string; headSha: string; event: ScmEvent | undefined } {
 	// Normalized first: a row written before the queue's #385 envelope rename is
 	// *typed* current while still carrying the legacy shape.
 	const payload = run.jobPayload ? normalizeStoredJobPayload(run.jobPayload) : undefined;
 	const event = payload?.type === 'scm' ? payload.event : undefined;
 	const prNumber = run.prNumber ?? event?.workItemId;
 	const headSha = event?.headSha;
-	const prBranch = event?.prBranch;
-	if (!prNumber || !headSha || !prBranch) {
+	if (!prNumber || !headSha) {
 		throw new ForceReReviewError(
 			'missing-coordinates',
-			`Cannot force a re-review for run "${run.id}" — its stored payload no longer names the PR number, reviewed commit, and branch the corrective run needs.`,
+			`Cannot force a re-review for run "${run.id}" — its stored payload no longer names the PR number and reviewed commit the forced continuation needs.`,
+		);
+	}
+	return { prNumber, headSha, event };
+}
+
+/**
+ * {@link reviewCoordinates} plus the branch the corrective Respond-to-review's
+ * synthetic `pull-request-review` event must carry — the one coordinate that
+ * belongs to that continuation alone, so its absence refuses only it.
+ */
+function respondToReviewCoordinates(run: {
+	id: string;
+	prNumber: string | null;
+	jobPayload: SwarmJob | null;
+}): { prNumber: string; headSha: string; prBranch: string } {
+	const { prNumber, headSha, event } = reviewCoordinates(run);
+	const prBranch = event?.prBranch;
+	if (!prBranch) {
+		throw new ForceReReviewError(
+			'missing-coordinates',
+			`Cannot force a re-review for run "${run.id}" — its stored payload no longer names the branch the corrective run needs.`,
 		);
 	}
 	return { prNumber, headSha, prBranch };
@@ -365,7 +401,7 @@ async function continueCorrectiveCycle(
 		);
 	}
 
-	const { prNumber, headSha, prBranch } = reviewCoordinates(run);
+	const { prNumber, headSha, prBranch } = respondToReviewCoordinates(run);
 	// The submitted review the forced response must answer. Its id pins the
 	// Respond-to-review phase to that one batched review, exactly as the real
 	// webhook would have.
@@ -476,6 +512,8 @@ async function forceReviewOfSupersededHead(
 	}
 
 	const { prNumber, headSha } = reviewCoordinates(run);
+	// The branch is deliberately not read: this continuation's synthetic event
+	// names the *current* head's branch, which comes from the provider below.
 	// The slot the grant will be written on. No `reviewId` is needed — nothing
 	// replays this approval; the dispatch below names a commit, not a review.
 	const slot = await getSubmittedReviewSlot({
@@ -491,13 +529,23 @@ async function forceReviewOfSupersededHead(
 		);
 	}
 	// The ledger re-check, mirroring the other branch's: the run row alone cannot
-	// say whether the pull request is stopped, because a grant, a later verdict or
-	// a recovered slot all change the answer after the run ended.
+	// say whether the pull request is stopped, because a later verdict or a
+	// recovered slot changes the answer after the run ended.
+	//
+	// `hasSubmittedEveryPermittedVerdict`, deliberately, and not
+	// `isReviewAllowanceSpent`: the latter also answers false while an unconsumed
+	// grant exists — which is exactly the state *this action* leaves behind between
+	// writing the grant and the Review it pays for reserving its slot. Refusing
+	// there would make the first click the only one this pull request ever gets,
+	// and would put the dispatch step — the half that chains past a prior attempt
+	// that resolved dead without starting a run — out of reach for the case it was
+	// written for. Both writes past this point are idempotent, so a repeat click
+	// reports the grant and the dispatch it finds instead.
 	const slots = await listActiveReviewSlotsForPullRequest(project.id, project.repo, prNumber);
-	if (!isReviewAllowanceSpent(slots) || !isLastPermittedVerdict(slots, slot.ordinal)) {
+	if (!hasSubmittedEveryPermittedVerdict(slots) || !isLastPermittedVerdict(slots, slot.ordinal)) {
 		throw new ForceReReviewError(
 			'not-capped',
-			`Run "${runId}" approved PR #${prNumber}, but its pull request's review allowance is not spent at that verdict (ledger ordinal ${slot.ordinal}) — refresh to see the pull request's current review state.`,
+			`Run "${runId}" approved PR #${prNumber}, but that approval is not the verdict the review cap stopped the pull request at (ledger ordinal ${slot.ordinal}) — either the allowance still has a verdict left, or a later review has since superseded this one. Refresh to see the pull request's current review state.`,
 		);
 	}
 

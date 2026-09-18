@@ -9,7 +9,8 @@
  * from the run's own shape, not from anything the button says. The
  * `request-changes` loop's (issue #511) is gated by {@link canForceReReview}; the
  * approval that merge automation then refused (issue #1038) is recognised by
- * {@link isCapSpentApproval} and gated for action by
+ * {@link isCapSpentApproval}, kept on screen across its own force by
+ * {@link showsCapSpentApprovalCallout}, and gated for action by
  * {@link canForceReviewOfSupersededHead}. The two predicates are mutually
  * exclusive by verdict and each keeps its own confirmation copy, because they
  * promise different work: a corrective response, vs. one review of the pull
@@ -44,6 +45,12 @@ export interface ForceReReviewRunState {
 	reviewMergeOutcome?: string | null;
 	/** Likewise — the server-resolved ledger fact, absent on the list read model. */
 	reviewCapSpent?: boolean | null;
+	/**
+	 * The second server-resolved ledger fact (issue #1040): an operator's extra
+	 * review slot is granted and nothing has spent it yet — i.e. a forced review is
+	 * scheduled but has not started. Read by {@link isForcedReviewPending} alone.
+	 */
+	reviewCapOverrideOutstanding?: boolean | null;
 }
 
 /**
@@ -106,10 +113,52 @@ export function isCapSpentApproval(run: ForceReReviewRunState): boolean {
 }
 
 /**
+ * The window straight after an operator forced this stop's continuation (issue
+ * #1040): the same approval, on a pull request that now holds a granted,
+ * unconsumed extra review slot — the forced review is scheduled and has not
+ * started.
+ *
+ * It exists because {@link isCapSpentApproval} cannot answer true here: a grant
+ * means the pull request is no longer waiting on a person, so the server's
+ * `reviewCapSpent` correctly goes false the moment the force writes one. Without a
+ * second fact, the callout that hosts the force button would unmount itself on its
+ * own success — taking the mutation's report, and the dispatch id in it, with it
+ * before the operator could read either.
+ *
+ * Mutually exclusive with {@link isCapSpentApproval} by construction: the server
+ * resolves both from the same ledger read, and the grant that makes this one true
+ * is what makes that one false.
+ */
+export function isForcedReviewPending(run: ForceReReviewRunState): boolean {
+	return (
+		run.status === 'completed' &&
+		run.phase === 'review' &&
+		run.reviewVerdict === 'approve' &&
+		run.reviewMergeOutcome === 'not-eligible' &&
+		run.reviewCapOverrideOutstanding === true
+	);
+}
+
+/**
+ * Whether the approval cap stop's callout renders at all: the stop itself, or the
+ * window in which an operator has already forced its continuation. One predicate
+ * so the component has one gate, and so "the panel stays up across the force" is
+ * asserted without a rendered component.
+ */
+export function showsCapSpentApprovalCallout(run: ForceReReviewRunState): boolean {
+	return isCapSpentApproval(run) || isForcedReviewPending(run);
+}
+
+/**
  * Whether the superseded-head review can be forced for this run (issue #1040):
  * the cap stop {@link isCapSpentApproval} recognises, on a project that still has
  * Review enabled. Mirrors the server's own two gates for that branch, so the
  * button never offers an action the router would refuse outright.
+ *
+ * {@link isForcedReviewPending} counts too, because the server's guard for this
+ * continuation does not refuse a click that finds its own outstanding grant: both
+ * writes are conditional, so a repeat force reports the grant and the dispatch it
+ * finds — and chains past one that resolved dead — rather than duplicating either.
  *
  * It deliberately stops there. Whether the head actually moved is a fact only the
  * provider holds, and the server reads it once per click rather than on every
@@ -121,7 +170,7 @@ export function canForceReviewOfSupersededHead(
 	run: ForceReReviewRunState,
 	pipeline?: ForceReReviewPipeline,
 ): boolean {
-	return isCapSpentApproval(run) && pipeline?.review?.enabled !== false;
+	return showsCapSpentApprovalCallout(run) && pipeline?.review?.enabled !== false;
 }
 
 /** Confirm-button label: reads "Scheduling…" while the mutation is pending. */

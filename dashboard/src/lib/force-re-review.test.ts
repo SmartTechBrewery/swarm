@@ -8,6 +8,8 @@ import {
 	forceReReviewConfirmMessage,
 	forceReviewOfSupersededHeadConfirmMessage,
 	isCapSpentApproval,
+	isForcedReviewPending,
+	showsCapSpentApprovalCallout,
 } from './force-re-review.js';
 
 const CAPPED = {
@@ -24,6 +26,17 @@ const CAP_SPENT_APPROVAL = {
 	reviewVerdict: 'approve',
 	reviewMergeOutcome: 'not-eligible',
 	reviewCapSpent: true,
+};
+
+/**
+ * The same stop one click later (issue #1040): the force has granted the extra
+ * slot and nothing has spent it, so the server's `reviewCapSpent` is false and
+ * `reviewCapOverrideOutstanding` carries the window instead.
+ */
+const FORCED_REVIEW_PENDING = {
+	...CAP_SPENT_APPROVAL,
+	reviewCapSpent: false,
+	reviewCapOverrideOutstanding: true,
 };
 
 function report(overrides: Partial<ForceReReviewReport> = {}): ForceReReviewReport {
@@ -95,6 +108,47 @@ describe('isCapSpentApproval (issue #1038)', () => {
 	});
 });
 
+describe('isForcedReviewPending / showsCapSpentApprovalCallout (issue #1040)', () => {
+	// The whole point of the second fact: the callout hosting the force button is
+	// the only place its report is rendered, so it has to survive its own success.
+	it('keeps the panel up across the force that retires the cap stop', () => {
+		expect(isCapSpentApproval(FORCED_REVIEW_PENDING)).toBe(false);
+		expect(isForcedReviewPending(FORCED_REVIEW_PENDING)).toBe(true);
+		expect(showsCapSpentApprovalCallout(FORCED_REVIEW_PENDING)).toBe(true);
+	});
+
+	it('shows the panel for the untouched stop, where nothing is outstanding', () => {
+		expect(isForcedReviewPending(CAP_SPENT_APPROVAL)).toBe(false);
+		expect(showsCapSpentApprovalCallout(CAP_SPENT_APPROVAL)).toBe(true);
+	});
+
+	it.each([
+		['a grant the granted review has since spent', { reviewCapOverrideOutstanding: false }],
+		['a row the server resolved no ledger fact for', { reviewCapOverrideOutstanding: null }],
+		['a changes-requested verdict', { reviewVerdict: 'request-changes' }],
+		['an approval that merged', { reviewMergeOutcome: 'merged' }],
+		['a run still in progress', { status: 'running' }],
+		['a non-Review phase', { phase: 'respond-to-review' }],
+	])('reports no pending force for %s', (_label, overrides) => {
+		expect(isForcedReviewPending({ ...FORCED_REVIEW_PENDING, ...overrides })).toBe(false);
+	});
+
+	// Once the granted review is actually running, the server reports neither fact
+	// and the panel retires — the state issue #1038's review pass 1 settled.
+	it('retires the panel once the granted review has taken the slot', () => {
+		expect(
+			showsCapSpentApprovalCallout({
+				...FORCED_REVIEW_PENDING,
+				reviewCapOverrideOutstanding: false,
+			}),
+		).toBe(false);
+	});
+
+	it('never fires for the request-changes cap stop', () => {
+		expect(isForcedReviewPending({ ...CAPPED, reviewCapOverrideOutstanding: true })).toBe(false);
+	});
+});
+
 describe('canForceReviewOfSupersededHead (issue #1040)', () => {
 	it('offers the action for the cap stop the approval left behind', () => {
 		expect(canForceReviewOfSupersededHead(CAP_SPENT_APPROVAL)).toBe(true);
@@ -132,6 +186,15 @@ describe('canForceReviewOfSupersededHead (issue #1040)', () => {
 	// The two levers are mutually exclusive by verdict, exactly as their callouts are.
 	it('never fires for the request-changes cap stop', () => {
 		expect(canForceReviewOfSupersededHead(CAPPED)).toBe(false);
+	});
+
+	// A repeat click is not refused by the server — both writes are conditional, so
+	// it reports the grant and the dispatch it finds, and chains past a dead one.
+	it('keeps offering the action while the force it started is still pending', () => {
+		expect(canForceReviewOfSupersededHead(FORCED_REVIEW_PENDING)).toBe(true);
+		expect(
+			canForceReviewOfSupersededHead(FORCED_REVIEW_PENDING, { review: { enabled: false } }),
+		).toBe(false);
 	});
 });
 

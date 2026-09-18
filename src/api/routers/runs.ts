@@ -17,10 +17,13 @@ import {
 	listAllProjectsFromDb,
 } from '../../db/repositories/projectsRepository.js';
 import {
+	hasOutstandingCapOverride,
 	hasReviewInFlightAbove,
+	hasSubmittedEveryPermittedVerdict,
 	isLastPermittedVerdict,
 	isReviewAllowanceSpent,
 	listActiveReviewSlotsForPullRequest,
+	type PullRequestReviewSlot,
 } from '../../db/repositories/reviewVerdictsRepository.js';
 import {
 	cancelDeferredRunInDb,
@@ -921,19 +924,32 @@ async function resolveRetryScheduled(run: { id: string; status: string }): Promi
  *
  * Resolved here rather than stored on the run, because the answer belongs to the
  * *pull request's* ledger and keeps changing after the run ends (a later grant, a
- * recovered slot). One indexed read, and only for a completed, ledgered Review
- * run — every other run costs nothing.
+ * recovered slot). {@link readReviewCapSlots} makes the one indexed read it and
+ * {@link resolveReviewCapOverrideOutstanding} share.
  *
  * `null`, never `false`, when the question does not apply, so the dashboard can
- * tell "not a ledgered Review run" from "still has allowance left". A read that
- * throws answers `null` too, on every neighbouring resolver's posture: a detail
- * page that shows one callout fewer beats one that fails to load.
- *
- * Keyed on the run's **own** recorded repository (issue #683), never the
- * project's `repo`: a project spans repositories, and the ledger's natural key
- * includes one.
+ * tell "not a ledgered Review run" from "still has allowance left".
  */
-async function resolveReviewCapSpent(run: {
+function resolveReviewCapSpent(
+	run: { reviewOrdinal: number | null },
+	slots: readonly PullRequestReviewSlot[] | null,
+): boolean | null {
+	if (!slots) return null;
+	return (
+		isReviewAllowanceSpent(slots) &&
+		isLastPermittedVerdict(slots, run.reviewOrdinal) &&
+		!hasReviewInFlightAbove(slots, run.reviewOrdinal)
+	);
+}
+
+/**
+ * The single ledger read both cap facts above are resolved from, with the cost
+ * gate and the failure posture they describe: `null` — and no read at all — for
+ * every run the question does not apply to, and `null` rather than a throw when
+ * the read fails, so a detail page shows one callout fewer instead of failing to
+ * load.
+ */
+async function readReviewCapSlots(run: {
 	id: string;
 	projectId: string;
 	repository: string | null;
@@ -941,20 +957,11 @@ async function resolveReviewCapSpent(run: {
 	status: string;
 	phase: string;
 	reviewOrdinal: number | null;
-}): Promise<boolean | null> {
+}): Promise<PullRequestReviewSlot[] | null> {
 	if (run.status !== 'completed' || run.phase !== 'review') return null;
 	if (!run.repository || !run.prNumber || run.reviewOrdinal === null) return null;
 	try {
-		const slots = await listActiveReviewSlotsForPullRequest(
-			run.projectId,
-			run.repository,
-			run.prNumber,
-		);
-		return (
-			isReviewAllowanceSpent(slots) &&
-			isLastPermittedVerdict(slots, run.reviewOrdinal) &&
-			!hasReviewInFlightAbove(slots, run.reviewOrdinal)
-		);
+		return await listActiveReviewSlotsForPullRequest(run.projectId, run.repository, run.prNumber);
 	} catch (error) {
 		logger.warn('runs.getById: review-ledger lookup failed; reporting no verdict', {
 			runId: run.id,
@@ -962,6 +969,41 @@ async function resolveReviewCapSpent(run: {
 		});
 		return null;
 	}
+}
+
+/**
+ * Whether an operator's cap-override grant is recorded on this run's pull request
+ * and nothing has spent it yet, with this run still holding the last submitted
+ * verdict (issue #1040) — the window between "Force re-review" writing the grant
+ * and the Review it pays for reserving its slot.
+ *
+ * Deliberately a second field rather than a clause inside
+ * {@link resolveReviewCapSpent}: that one goes `false` the instant a grant exists,
+ * which is the right answer to *its* question (issue #511 — an operator has acted,
+ * so the pull request is not waiting on a person) but collapses this window into
+ * "nothing to see here". The run-detail callout that hosts the force button is
+ * gated on that fact, so without this field the callout unmounts itself on its own
+ * success and takes the mutation's report with it before the operator can read it.
+ *
+ * The in-flight clause is {@link resolveReviewCapSpent}'s, for the same reason: once
+ * the granted Review has taken its slot, SWARM is visibly working on the pull
+ * request and the callout retires (issue #1038 review pass 1). Between the two, the
+ * grant is the only trace of the operator's click, and this is what carries it.
+ *
+ * Same cost gate and same failure posture as its sibling — it reuses that read's
+ * own slots rather than making a second one.
+ */
+function resolveReviewCapOverrideOutstanding(
+	run: { reviewOrdinal: number | null },
+	slots: readonly PullRequestReviewSlot[] | null,
+): boolean | null {
+	if (!slots) return null;
+	return (
+		hasSubmittedEveryPermittedVerdict(slots) &&
+		isLastPermittedVerdict(slots, run.reviewOrdinal) &&
+		hasOutstandingCapOverride(slots) &&
+		!hasReviewInFlightAbove(slots, run.reviewOrdinal)
+	);
 }
 
 /**
@@ -1205,6 +1247,9 @@ export const runsRouter = router({
 				'contributor',
 				`Run with ID "${input.id}" not found`,
 			);
+			// One ledger read, two facts: the cap stop itself and the window in which an
+			// operator has already forced its continuation (issue #1040).
+			const reviewCapSlots = await readReviewCapSlots(run);
 			return {
 				...run,
 				attribution: await resolveRunAttribution(run),
@@ -1212,7 +1257,8 @@ export const runsRouter = router({
 				pendingRequest: await resolvePendingRunRequest(run),
 				preservedWorker: await resolveRunPreservedWorker(run),
 				retryScheduled: await resolveRetryScheduled(run),
-				reviewCapSpent: await resolveReviewCapSpent(run),
+				reviewCapSpent: resolveReviewCapSpent(run, reviewCapSlots),
+				reviewCapOverrideOutstanding: resolveReviewCapOverrideOutstanding(run, reviewCapSlots),
 			};
 		}),
 
