@@ -136,6 +136,76 @@ describe('SCM delivery hand-offs', () => {
 					.verification,
 			).toEqual([{ command: 'npm test', outcome: 'passed' }]);
 		});
+
+		// A hand-off that *writes* the slot blank used to fail as a raw `too_small` on
+		// `verification[n].detail`, which names neither the command nor the outcome that
+		// wanted it — and took a resolved, staged and verified merge down with it.
+		describe('a blank detail is an absent one (issue #1037)', () => {
+			const failingOutcomes = ['pre-existing-failure', 'failed'];
+
+			it.each(failingOutcomes)('reads an empty detail on a %s outcome as missing', (outcome) => {
+				const parse = () =>
+					ConflictHandoffSchema.parse(resolved([{ command: 'npm test', outcome, detail: '' }]));
+				expect(parse).toThrow(/detail is required/);
+				expect(parse).not.toThrow(/at least 1 character/);
+			});
+
+			it.each(failingOutcomes)('reads a whitespace-only detail on %s the same way', (outcome) => {
+				const parse = () =>
+					ConflictHandoffSchema.parse(resolved([{ command: 'npm test', outcome, detail: '   ' }]));
+				expect(parse).toThrow(/detail is required/);
+				expect(parse).not.toThrow(/at least 1 character/);
+			});
+
+			// The `asText` interaction (issue #861): a list slot that joins to nothing is
+			// the one way this could regress silently.
+			it('reads a list that joins to nothing the same way', () => {
+				const parse = () =>
+					ConflictHandoffSchema.parse(
+						resolved([{ command: 'npm test', outcome: 'failed', detail: [] }]),
+					);
+				expect(parse).toThrow(/detail is required/);
+				expect(parse).not.toThrow(/at least 1 character/);
+			});
+
+			// The live incident's shape: every command passed, two entries carried a blank
+			// detail, and the finished merge was discarded over it.
+			it('no longer discards an all-passed hand-off that wrote detail blank', () => {
+				expect(
+					ConflictHandoffSchema.parse(
+						resolved([
+							{ command: 'npm run lint', outcome: 'passed', detail: '' },
+							{ command: 'npm test', outcome: 'passed', detail: '' },
+						]),
+					).verification,
+				).toEqual([
+					{ command: 'npm run lint', outcome: 'passed' },
+					{ command: 'npm test', outcome: 'passed' },
+				]);
+			});
+
+			it('still joins a detail the agent split across a list', () => {
+				expect(
+					ConflictHandoffSchema.parse(
+						resolved([
+							{
+								command: 'npm test',
+								outcome: 'failed',
+								detail: ['the merged tree', 'does not build'],
+							},
+						]),
+					).verification[0],
+				).toMatchObject({ detail: 'the merged tree does not build' });
+			});
+
+			it('still rejects a detail that is neither text nor a list of text', () => {
+				expect(() =>
+					ConflictHandoffSchema.parse(
+						resolved([{ command: 'npm test', outcome: 'failed', detail: { note: 'x' } }]),
+					),
+				).toThrow();
+			});
+		});
 	});
 
 	it('persists and reloads step-level progress under a stable identity', () => {
