@@ -4,11 +4,11 @@
  * `src/pipeline/resolve-conflicts.ts`, which re-exports this for its existing
  * callers. Unlike the other phases this prompt has no `GH_IDENTITY_GUARD` (the
  * agent performs no GitHub mutation — SWARM delivers the resolved merge) and
- * joins its lines with a blank line between them. That omission holds for the
- * migration-journal repair pass below too — `guardMigrationJournal` passes it no
- * `env`/token either — but since issue #865 that pass can run in a *fresh*
- * session, so it carries `pipelinePhaseGuard()` of its own rather than relying on
- * the phase prompt having said it earlier in the same session.
+ * joins its lines with a blank line between them. That omission holds for the two
+ * repair passes below too — neither is passed an `env`/token either — but since
+ * issue #865 a repair pass can run in a *fresh* session, so each carries
+ * `pipelinePhaseGuard()` of its own rather than relying on the phase prompt
+ * having said it earlier in the same session.
  */
 
 import type { ProjectConfig } from '@/config/schema.js';
@@ -218,5 +218,49 @@ export function buildMigrationJournalRepairPrompt(
 		`Fix only \`src/db/migrations/\` (the numbered \`.sql\` files and \`meta/_journal.json\`/its snapshot files) so every reported problem is gone. Do not touch any other file — every other conflict in the merge is already correctly resolved. Prefer \`npx drizzle-kit generate\` over hand-editing the journal or a snapshot: keep \`${baseBranch}\`'s existing migrations exactly as \`${baseBranch}\` has them, and let \`drizzle-kit generate\` produce one fresh, correctly-numbered migration (with its own journal entry and snapshot) for whatever schema change this branch still needs beyond \`${baseBranch}\`. Remove this branch's now-superseded migration file(s) and their orphaned journal entries if \`drizzle-kit generate\` replaces them.`,
 		'',
 		`Do not commit, push, comment, or perform any GitHub mutation — leave the corrected tree in the working directory for SWARM, and rewrite the hand-off "${RESOLVE_CONFLICTS_OUTCOME_FILENAME}" (already in this worktree) only if the fix changes its \`body\` or \`verification\`.`,
+	].join('\n');
+}
+
+/**
+ * Build the one repair pass `readConflictHandoff`
+ * (`src/pipeline/resolve-conflicts.ts`) runs when the hand-off on disk fails
+ * `ConflictHandoffSchema` (issue #1037): the merge is already resolved, staged
+ * and verified, and the only thing standing between it and delivery is the JSON
+ * describing it.
+ *
+ * Mirrors `buildMigrationJournalRepairPrompt` above and
+ * `buildReviewHandoffRepairPrompt`'s shape (`src/pipeline/prompts/review.ts`) —
+ * one paragraph naming the validator's own complaint, one naming the narrow fix,
+ * and the same mutation floor.
+ *
+ * Written for **either** session, like the repair pass above (issue #865): it
+ * resumes the merge's own session where one is addressable and runs fresh where
+ * it is not, so it carries the phase guard itself and names the hand-off file
+ * rather than saying "the hand-off file" to an agent that may never have written
+ * one — `readHandoff` throws for a missing file too, and this pass covers that.
+ *
+ * The floor is stated here rather than reusing `DELIVERY_FLOOR`, which opens by
+ * telling the agent to run lint, type-check and tests: re-running the suite is
+ * exactly what this pass must not do, since the verification it is repairing is
+ * the record of the run that already happened.
+ */
+export function buildConflictHandoffRepairPrompt(validationError: string): string {
+	return [
+		...pipelinePhaseGuard(),
+		'',
+		`A merge produced in this worktree is NOT delivered: the hand-off "${RESOLVE_CONFLICTS_OUTCOME_FILENAME}" failed SWARM's validation.`,
+		'',
+		'The validator reported:',
+		validationError,
+		'',
+		`Read "${RESOLVE_CONFLICTS_OUTCOME_FILENAME}" first if it exists — it holds the result and the verification this pass must preserve, whether or not you remember writing them.`,
+		'',
+		`Then write "${RESOLVE_CONFLICTS_OUTCOME_FILENAME}" so it satisfies every rule below. This is a formatting repair, not a re-merge: do not re-resolve anything, do not re-run the commands you already ran, and keep every \`command\` and \`outcome\` the file records as they are — a \`failed\` stays \`failed\`, and reporting one honestly is not what this pass is here to change. Where a required slot is missing, fill it from what you actually observed; never invent one.`,
+		'',
+		'Leave the resolved merge staged in the working tree exactly as it is: do not edit any other file, do not commit, do not push, do not comment or perform any GitHub mutation. SWARM delivers the merge after you exit.',
+		'',
+		HANDOFF_CONTRACT,
+		'',
+		...VERIFICATION_OUTCOME_GUIDANCE,
 	].join('\n');
 }

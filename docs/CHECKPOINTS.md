@@ -74,8 +74,8 @@ and the rolling tail it parses instead — where a trailing usage summary lives 
 between them. Every line reaches the live callback exactly once whichever buffer later
 truncates, so it is the only window guaranteed to see it; a codex run that logged a large test
 suite therefore keeps its thread id instead of losing every downstream resume (the Review
-hand-off repair pass, `resolve-conflicts`' migration-journal repair pass, and the
-`agent_session_id` a deferred run persists for its retry). The captured text is still asked
+hand-off repair pass, `resolve-conflicts`' migration-journal and hand-off repair passes, and
+the `agent_session_id` a deferred run persists for its retry). The captured text is still asked
 first, so a resume run's re-emitted id wins and the non-truncated path is unchanged; a run that
 genuinely emitted no opening event still reports **no** id rather than an invented one. `claude`
 needs none of this — SWARM assigns its id up front.
