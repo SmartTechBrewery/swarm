@@ -19,6 +19,7 @@ import { formatPhase, formatRelativeTime } from '@/lib/format.js';
 import { sortPipelinePhases } from '@/lib/pipeline-phases.js';
 import { trpcClient } from '@/lib/trpc.js';
 import { useDraftSync } from '@/lib/use-draft-sync.js';
+import { describeWorkerSupervision } from '@/lib/worker-supervision-states.js';
 import type { WorkerDetail } from '@/types/workers.js';
 import type { AgentCli } from '../../../../src/harness/agent-cli.js';
 
@@ -112,10 +113,44 @@ const FIELD_CLASS =
 	'block w-full max-w-xs px-3 py-1.5 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 disabled:opacity-50 disabled:bg-zinc-950 disabled:border-zinc-800 disabled:text-zinc-500';
 
 /** One labelled read-only field of the identity/connectivity grids. */
-function Field({ label, children, mono }: { label: string; children: ReactNode; mono?: boolean }) {
+/**
+ * One labelled fact, with its explanation attached to it rather than to the card.
+ *
+ * `hint` is what used to be a paragraph of prose below the grid: five fields' worth
+ * of explanation run together, so a reader who wanted one of them read all five. A
+ * sentence belongs to the field it is about, and is asked for rather than served —
+ * hence the marker, and hence one sentence.
+ *
+ * A native `title` rather than a tooltip component: the UI kit has no tooltip, and
+ * `title` is what `ui/badge.tsx` and `ui/toggle-switch.tsx` already use. `aria-label`
+ * carries the same text, since a `title` alone is not reliably announced.
+ */
+function Field({
+	label,
+	children,
+	mono,
+	hint,
+}: {
+	label: string;
+	children: ReactNode;
+	mono?: boolean;
+	hint?: string;
+}) {
 	return (
 		<div>
 			<span className={LABEL_CLASS}>{label}</span>
+			{hint ? (
+				<span
+					className="ml-1 cursor-help text-zinc-500 select-none"
+					// `role="img"` so the glyph is an element `aria-label` is valid on, and so a
+					// screen reader announces the sentence rather than spelling the character.
+					role="img"
+					title={hint}
+					aria-label={`${label}: ${hint}`}
+				>
+					&#9432;
+				</span>
+			) : null}
 			<div
 				className={`mt-1 text-sm text-zinc-200 break-words ${mono ? 'font-mono select-all' : ''}`}
 			>
@@ -567,8 +602,8 @@ function DeclaredBuild({ worker }: { worker: WorkerDetail }) {
 }
 
 /**
- * How the machine's daemon declared it is supervised (issue #997) — whether
- * anything starts it again after it exits.
+ * How the machine declared it is supervised (issue #997) — whether anything starts
+ * it again after it stops.
  *
  * All **three** values are stated here, unlike `swarm workers list`, which marks
  * only `unsupervised`: this is the screen an operator opens to read what a machine
@@ -576,48 +611,41 @@ function DeclaredBuild({ worker }: { worker: WorkerDetail }) {
  * either alternative. Only the one value an operator can act on carries a mark —
  * the shared `Badge` on `caution`, like the build mark beside it — and the other two
  * are plain text, so a fleet of machines that simply predate the field does not read
- * as a fleet with a problem.
+ * as a fleet with a problem. The vocabulary decides which is which
+ * (`@/lib/worker-supervision-states.js`), so the tone and the wording cannot drift
+ * apart.
+ *
+ * **The value carries its own explanation**, which is the whole reason that module
+ * exists: the paragraph this replaced described all three states to every reader,
+ * whatever their machine had declared.
  */
 function DeclaredSupervision({ supervision }: { supervision: WorkerDetail['supervision'] }) {
-	if (supervision === 'unsupervised') {
-		return <Badge tone="caution">Not supervised</Badge>;
+	const state = describeWorkerSupervision(supervision);
+	if (state.tone === 'caution') {
+		return (
+			<span title={state.description}>
+				<Badge tone={state.tone}>{state.label}</Badge>
+			</span>
+		);
 	}
-	return <>{supervision === 'supervised' ? 'Supervised' : 'Unknown'}</>;
+	return <span title={state.description}>{state.label}</span>;
 }
 
 /**
- * What the build above is being compared against — the whole reason this screen
- * carries the comparand (issue #925): a mark that names no other build leaves
- * "outdated relative to what?" in the operator's head. A control plane that cannot
- * read its own build says so, rather than letting an absent mark read as "all
- * current".
+ * The SWARM-build field's own sentence, including what "Outdated" is measured
+ * against — the whole reason this screen carries the comparand (issue #925): a mark
+ * that names no other build leaves "outdated relative to what?" in the operator's
+ * head. A control plane that cannot read its own build says so, rather than letting
+ * an absent mark read as "all current".
+ *
+ * A string rather than the paragraph of prose it replaces, because it is now the
+ * field's `hint` — asked for, and read by whoever is looking at that one field.
  */
-function BuildComparisonNote({
-	controlPlaneBuild,
-}: {
-	controlPlaneBuild: WorkerDetail['controlPlaneBuild'];
-}) {
-	if (!controlPlaneBuild) {
-		return (
-			<>
-				This control plane cannot read its own build, so nothing here is compared against it and no
-				machine is marked <em>Outdated</em> either way. An <em>Updating</em> mark is unaffected: it
-				reports a request this machine has not answered, which needs no comparison.
-			</>
-		);
-	}
-	return (
-		<>
-			This control plane is on{' '}
-			<span className="font-mono text-zinc-400">{formatWorkerBuild(controlPlaneBuild)}</span>, and a
-			machine whose build is not that one is marked <em>Outdated</em> — the two builds differ, which
-			is all an equality check can say. A worker keeps running whatever its checkout held when its
-			process last started, so the remedy is updating that checkout and restarting the daemon. A
-			machine marked <em>Updating</em> has been asked to move to a named build and has not answered
-			yet, so it is still running the build above: the two marks are different facts, and a machine
-			waiting on a request it has not answered carries both.
-		</>
-	);
+function buildHint(controlPlaneBuild: WorkerDetail['controlPlaneBuild']): string {
+	const measured = controlPlaneBuild
+		? `This control plane is on ${formatWorkerBuild(controlPlaneBuild)}, and a machine on any other build is marked Outdated.`
+		: 'This control plane cannot read its own build, so nothing is marked Outdated either way.';
+	return `Which version of SWARM the machine itself is running — separate from the repository above. ${measured} A machine can carry Updating too: that one means it has been asked to move and has not answered yet.`;
 }
 
 /**
@@ -794,7 +822,10 @@ export function WorkerDetailView({
 			<div className={CARD_CLASS}>
 				<h2 className={SECTION_HEADING_CLASS}>Declared by the daemon</h2>
 				<div className="grid gap-4 grid-cols-1 md:grid-cols-2">
-					<Field label="Agent CLIs">
+					<Field
+						label="Agent CLIs"
+						hint="Found automatically on the machine. Its owner can remove some — adding one means installing it there."
+					>
 						<DeclaredClisControl
 							workerId={worker.workerId}
 							declaredCapabilities={worker.declaredCapabilities}
@@ -805,51 +836,32 @@ export function WorkerDetailView({
 							onChanged={onChanged}
 						/>
 					</Field>
-					<Field label="Pipeline phases">
+					<Field
+						label="Pipeline phases"
+						hint="What this machine's version of SWARM can run. Which of them a project actually uses is set further down."
+					>
 						<SupportedPhases phases={worker.supportedPhases} />
 					</Field>
-					<Field label="Checkout repository" mono>
+					<Field
+						label="Checkout repository"
+						mono
+						hint="The only repository this machine works in. Work for any other repository is never sent here."
+					>
 						{worker.repository ?? EM_DASH}
 					</Field>
-					<Field label="SWARM build" mono>
+					<Field label="SWARM build" mono hint={buildHint(worker.controlPlaneBuild)}>
 						<DeclaredBuild worker={worker} />
 					</Field>
-					<Field label="Process supervision">
+					<Field
+						label="Process supervision"
+						hint="Whether the machine's worker starts back up on its own after it stops."
+					>
 						<DeclaredSupervision supervision={worker.supervision} />
 					</Field>
 				</div>
 				<p className="text-xs text-zinc-500 mt-4">
-					Declared by the machine's own daemon at handshake, and re-declared on every reconnect. The
-					pipeline phases, the checkout repository, the SWARM build and the process supervision are
-					reported here and never editable — editing any of them would make this screen disagree
-					with the machine. A daemon on an older build can declare fewer phases than this one runs;
-					which of them a project may actually give this machine is the enrollment's Allowed
-					pipeline phases, below. The checkout repository is the single repository this machine
-					works in: a project for any other one cannot run here, and an unidentifiable checkout
-					declares nothing.
-				</p>
-				<p className="text-xs text-zinc-500 mt-2">
-					The <strong>SWARM build is the commit this machine's daemon is actually running</strong> —
-					its own SWARM install root, which is not the checkout repository above: one installation
-					can serve several project repositories. A <span className="font-mono">+dirty</span> marker
-					means the running code is not exactly that commit (uncommitted changes, or a build older
-					than the commit it names).{' '}
-					<BuildComparisonNote controlPlaneBuild={worker.controlPlaneBuild} />
-				</p>
-				<p className="text-xs text-zinc-500 mt-2">
-					<strong>Process supervision is whether this machine comes back</strong> from a restart its
-					own daemon takes. <em>Supervised</em> means launchd or systemd started the daemon and
-					starts it again when it exits. <em>Not supervised</em> means nobody will: the daemon was
-					started by hand, so an update would apply and the machine would then be gone until
-					somebody starts it again. <em>Unknown</em> means the daemon predates this field or runs
-					somewhere SWARM cannot read it — stated as unknown rather than assumed either way.
-				</p>
-				<p className="text-xs text-zinc-500 mt-2">
-					The <strong>agent CLIs are the one fact the machine's owner may pin.</strong> Left alone,
-					the list is whatever the daemon last found on the machine's own PATH. Declaring a narrower
-					set is durable — it survives every reconnect and is what dispatch routes on — and can only
-					narrow that list: to add a CLI, install it on the machine. <em>Use auto-detected CLIs</em>{' '}
-					clears the declaration and hands the list back to auto-detection.
+					The machine reports all of this about itself, so none of it is editable here — apart from
+					the agent CLI list, which its owner can shorten.
 				</p>
 			</div>
 

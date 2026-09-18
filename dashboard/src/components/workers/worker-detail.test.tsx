@@ -197,8 +197,15 @@ function phaseCheckbox(phase: string): HTMLInputElement {
  * field, since the same section also stamps the declared agent CLIs.
  */
 function declaredPhaseBadges(): string[] {
-	const value = screen.getByText('Pipeline phases').nextElementSibling as HTMLElement;
+	// The value is the field's last child: the label's next sibling is now its hint marker.
+	const value = screen.getByText('Pipeline phases').parentElement?.lastElementChild as HTMLElement;
 	return Array.from(value.querySelectorAll('span')).map((badge) => badge.textContent ?? '');
+}
+
+/** The one-sentence hint attached to a field's label, as an operator would hover it. */
+function fieldHint(label: string): string {
+	const marker = screen.getByText(label).nextElementSibling as HTMLElement;
+	return marker?.getAttribute('title') ?? '';
 }
 
 beforeEach(() => {
@@ -319,7 +326,7 @@ describe('WorkerDetailView sections (issue #477)', () => {
 		// the phase repertoire and the checkout repository stay reported-only.
 		renderWorker({ enrollments: [], viewerIsOwner: false });
 
-		expect(screen.getByText(/never editable/)).toBeDefined();
+		expect(screen.getByText(/none of it is editable here/)).toBeDefined();
 		// Nothing editable at all for a non-owner on a machine with no visible enrollment.
 		expect(screen.queryAllByRole('checkbox')).toHaveLength(0);
 		expect(screen.queryAllByRole('switch')).toHaveLength(0);
@@ -771,9 +778,10 @@ describe('WorkerDetailView enrollment blocks', () => {
 		 * One labelled field's rendered value in the daemon card — the field itself,
 		 * never the card's prose, which names the control plane's build too.
 		 */
+		/** The field's value, with the label and its hint marker stripped off the row. */
 		function declaredFieldValue(label: string): string {
 			const field = within(section('Declared by the daemon')).getByText(label).parentElement;
-			return (field?.textContent ?? '').replace(label, '').trim();
+			return (field?.textContent ?? '').replace(label, '').replace('\u24d8', '').trim();
 		}
 
 		it('renders the short commit the daemon declared', () => {
@@ -834,9 +842,7 @@ describe('WorkerDetailView enrollment blocks', () => {
 			// …and the card says so, rather than silently comparing nothing. Scoped to
 			// this card: the update action in Connectivity states the same absence for
 			// its own reason (issue #998).
-			expect(
-				within(section('Declared by the daemon')).getByText(/cannot read its own build/),
-			).toBeDefined();
+			expect(fieldHint('SWARM build')).toContain('cannot read its own build');
 		});
 
 		// Issue #978 — the second mark on the same field. It answers "somebody has
@@ -943,10 +949,10 @@ describe('WorkerDetailView enrollment blocks', () => {
 				expect(field.getByText('—')).toBeDefined();
 			});
 
-			it('says in the card’s own prose that the two marks are different facts', () => {
+			it('says on the field itself that the two marks are different facts', () => {
 				renderWorker({ enrollments: [] });
 
-				expect(screen.getByText(/has been asked to move to a named build/)).toBeDefined();
+				expect(fieldHint('SWARM build')).toContain('has been asked to move');
 			});
 		});
 	});
@@ -961,7 +967,10 @@ describe('WorkerDetailView enrollment blocks', () => {
 			const field = within(section('Declared by the daemon')).getByText(
 				'Process supervision',
 			).parentElement;
-			return (field?.textContent ?? '').replace('Process supervision', '').trim();
+			return (field?.textContent ?? '')
+				.replace('Process supervision', '')
+				.replace('\u24d8', '')
+				.trim();
 		}
 
 		it('says a machine under launchd or systemd is supervised', () => {
@@ -984,10 +993,45 @@ describe('WorkerDetailView enrollment blocks', () => {
 			expect(value).not.toContain('Not supervised');
 		});
 
-		it('explains all three values in the card’s own prose', () => {
-			renderWorker({ enrollments: [] });
+		// Each value explains itself, on itself: the prose this replaced described all
+		// three states to every reader, whatever their own machine had declared — so the
+		// one that matters, "it cannot be updated from here", had to be dug out of a
+		// definition of the other two.
+		it('explains the value the machine actually declared, and only that one', () => {
+			renderWorker({ supervision: 'unsupervised', enrollments: [] });
 
-			expect(screen.getByText(/whether this machine comes back/)).toBeDefined();
+			const explained = within(section('Declared by the daemon')).getByTitle(
+				/can't be updated from here/,
+			);
+			expect(explained.textContent).toBe('Not supervised');
+			expect(
+				within(section('Declared by the daemon')).queryByTitle(/launchd or systemd/),
+			).toBeNull();
+		});
+
+		it('explains a supervised machine in its own terms', () => {
+			renderWorker({ supervision: 'supervised', enrollments: [] });
+
+			expect(
+				within(section('Declared by the daemon')).getByTitle(/launchd or systemd/).textContent,
+			).toBe('Supervised');
+		});
+
+		it('says why it cannot tell, for a machine whose supervision is unknown', () => {
+			renderWorker({ supervision: 'unknown', enrollments: [] });
+
+			expect(
+				within(section('Declared by the daemon')).getByTitle(/older version of the worker/)
+					.textContent,
+			).toBe('Unknown');
+		});
+
+		it('keeps the field’s own sentence short, whatever the value', () => {
+			renderWorker({ supervision: 'unsupervised', enrollments: [] });
+
+			expect(fieldHint('Process supervision')).toBe(
+				"Whether the machine's worker starts back up on its own after it stops.",
+			);
 		});
 	});
 
