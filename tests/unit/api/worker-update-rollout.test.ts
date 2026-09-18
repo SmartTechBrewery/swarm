@@ -485,6 +485,52 @@ describe('advanceRollout — taking a wave', () => {
 		expect(fanOutWorkerUpdate).not.toHaveBeenCalled();
 		expect(view?.members.map((member) => member.state)).toEqual(['signalled', 'queued']);
 	});
+
+	// A member decided the instant it is asked produces no update report and no
+	// handshake, so nothing but the periodic tick could reach the machine behind it —
+	// a whole minute of waiting for an answer no machine was ever going to give. The
+	// wave bound is per wave, not per pass, so the pass takes another one.
+	it('takes another wave in the same advance when the first settled without being signalled', async () => {
+		givenRollout(makeRollout({ waveSize: 1 }), [makeMember(WORKER_A, 0), makeMember(WORKER_B, 1)]);
+		givenWorkers(makeWorker(WORKER_A, { supervision: 'unsupervised' }), makeWorker(WORKER_B));
+		fanOutWorkerUpdate
+			.mockResolvedValueOnce([fanoutEntry(WORKER_A, 'unsupervised', null)])
+			.mockResolvedValueOnce([fanoutEntry(WORKER_B, 'requested')]);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		// Two waves, one machine each: the bound held, the pass simply did not end on
+		// the wave that evaporated.
+		expect(fanOutWorkerUpdate).toHaveBeenCalledTimes(2);
+		expect(view?.members.map((member) => member.state)).toEqual(['skipped', 'signalled']);
+		expect(view?.rollout.status).toBe('in_progress');
+	});
+
+	// The measured shape (2026-09-18): four machines in a row declaring no supervisor,
+	// which used to cost four ticks and now costs none.
+	it('walks through a run of members that all settle at once, and completes', async () => {
+		givenRollout(makeRollout({ waveSize: 1 }), [
+			makeMember(WORKER_A, 0),
+			makeMember(WORKER_B, 1),
+			makeMember(WORKER_C, 2),
+		]);
+		givenWorkers(
+			makeWorker(WORKER_A, { supervision: 'unsupervised' }),
+			makeWorker(WORKER_B, { supervision: 'unsupervised' }),
+			makeWorker(WORKER_C, { supervision: 'unsupervised' }),
+		);
+		fanOutWorkerUpdate
+			.mockResolvedValueOnce([fanoutEntry(WORKER_A, 'unsupervised', null)])
+			.mockResolvedValueOnce([fanoutEntry(WORKER_B, 'unsupervised', null)])
+			.mockResolvedValueOnce([fanoutEntry(WORKER_C, 'unsupervised', null)]);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members.map((member) => member.state)).toEqual(['skipped', 'skipped', 'skipped']);
+		// Every one of them was drained and put straight back, and the rollout finished
+		// in this single pass rather than over three ticks.
+		expect(view?.rollout.status).toBe('completed');
+	});
 });
 
 /**

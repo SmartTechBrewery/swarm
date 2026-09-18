@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import type { ReactElement } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { WorkerRollout, WorkerRolloutMember } from '@/types/workers.js';
@@ -246,5 +246,58 @@ describe('InstallationRolloutPanel readout (issue #1025)', () => {
 		expect(
 			screen.getAllByRole('listitem').map((item) => item.querySelector('p')?.textContent),
 		).toEqual(['ada-laptop', 'grace-box']);
+	});
+});
+
+/**
+ * A finished rollout has nothing left to watch, so it folds to its own heading — but
+ * the fold is a *default*, and the operator's own choice has to outlive the poll that
+ * refetches under them.
+ */
+describe('InstallationRolloutPanel folds a finished rollout away', () => {
+	it('collapses a completed rollout to its report heading', async () => {
+		fleetUpdateStatusQueryFn.mockResolvedValue({
+			rollout: makeRollout({ status: 'completed' }),
+		});
+		renderPanel(<InstallationRolloutPanel />);
+
+		expect(await screen.findByText('Last fleet update report')).toBeDefined();
+		// The machines are folded away, not gone: the heading is the handle to them.
+		expect(screen.queryByText('ada-laptop')).toBeNull();
+		expect(screen.getByRole('button', { expanded: false })).toBeDefined();
+	});
+
+	it('opens a completed rollout again, and folds it back', async () => {
+		fleetUpdateStatusQueryFn.mockResolvedValue({
+			rollout: makeRollout({ status: 'completed' }),
+		});
+		renderPanel(<InstallationRolloutPanel />);
+
+		const toggle = await screen.findByRole('button', { expanded: false });
+		fireEvent.click(toggle);
+		expect(await screen.findByText('ada-laptop')).toBeDefined();
+
+		fireEvent.click(screen.getByRole('button', { expanded: true }));
+		expect(screen.queryByText('ada-laptop')).toBeNull();
+	});
+
+	it('leaves a rollout that is still moving open', async () => {
+		fleetUpdateStatusQueryFn.mockResolvedValue({ rollout: makeRollout() });
+		renderPanel(<InstallationRolloutPanel />);
+
+		expect(await screen.findByText('Installation fleet update')).toBeDefined();
+		expect(screen.getByText('ada-laptop')).toBeDefined();
+	});
+
+	// A halt is the one terminal status somebody still has to act on, so it is never
+	// the thing that folds itself out of sight.
+	it('leaves a halted rollout open, with its reason showing', async () => {
+		fleetUpdateStatusQueryFn.mockResolvedValue({
+			rollout: makeRollout({ status: 'halted', haltReason: 'grace-box never came back' }),
+		});
+		renderPanel(<InstallationRolloutPanel />);
+
+		expect(await screen.findByText('grace-box never came back')).toBeDefined();
+		expect(screen.getByText('Installation fleet update')).toBeDefined();
 	});
 });

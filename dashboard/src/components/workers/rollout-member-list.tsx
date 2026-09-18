@@ -25,7 +25,22 @@ import type { WorkerRolloutMember } from '@/types/workers.js';
  * array arrived in — that is the order it reaches the machines in, and it is the one
  * thing here that is a fact rather than a presentation choice.
  */
-export function RolloutMemberList({ members }: { members: WorkerRolloutMember[] }) {
+export function RolloutMemberList({
+	members,
+	framed = true,
+}: {
+	members: WorkerRolloutMember[];
+	/**
+	 * Whether the list draws its own border and panel fill. The dialog keeps them,
+	 * because there the list is a scroll region floating in a modal body and the edge
+	 * is what says where it ends. The `/workers` readout turns them off: it is already
+	 * a bordered card, and a second border inside it reads as a card within a card
+	 * rather than as part of the same surface. Chrome only — the rows, their order and
+	 * their wording are the same on both surfaces, which is the drift this shared
+	 * component exists to prevent.
+	 */
+	framed?: boolean;
+}) {
 	const ordered = [...members].sort((a, b) => a.position - b.position);
 	const tally = tallyRolloutMemberStates(ordered);
 
@@ -39,9 +54,13 @@ export function RolloutMemberList({ members }: { members: WorkerRolloutMember[] 
 
 	return (
 		<div className="space-y-2">
-			<ul className="max-h-64 overflow-y-auto border border-zinc-800 rounded-lg bg-panel/20 divide-y divide-zinc-800/60">
+			<ul
+				className={`max-h-64 overflow-y-auto divide-y divide-zinc-800/60 ${
+					framed ? 'border border-zinc-800 rounded-lg bg-panel/20' : ''
+				}`}
+			>
 				{ordered.map((member) => (
-					<RolloutMemberRow key={member.workerId} member={member} />
+					<RolloutMemberRow key={member.workerId} member={member} framed={framed} />
 				))}
 			</ul>
 			<p className="text-xs text-zinc-500">
@@ -63,12 +82,15 @@ export function RolloutMemberList({ members }: { members: WorkerRolloutMember[] 
  * in the middle of it. The machine's reported `outcome` leads it where there is one,
  * since that is the machine's own verdict rather than the rollout's.
  */
-function RolloutMemberRow({ member }: { member: WorkerRolloutMember }) {
+function RolloutMemberRow({ member, framed }: { member: WorkerRolloutMember; framed: boolean }) {
 	const state = describeRolloutMemberState(member.state);
 	const detail = memberDetail(member);
 
 	return (
-		<li className="flex items-start justify-between gap-3 px-3 py-2">
+		// Unframed, the row is flush with the rest of the card's content: there is no
+		// border for the inset padding to sit inside, so keeping it would indent every
+		// machine from the heading above it for no reason.
+		<li className={`flex items-start justify-between gap-3 py-2 ${framed ? 'px-3' : ''}`}>
 			<div className="min-w-0">
 				<p className="text-sm text-zinc-200 font-mono truncate">{member.displayName}</p>
 				{/* An owner the server could not resolve is named as unknown rather than

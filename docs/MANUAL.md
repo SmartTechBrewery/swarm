@@ -501,7 +501,9 @@ its owner, its state (`queued`, `draining`, `signalled`, `verifying`, `done`,
 roster's own cadence and survives a page reload, so closing the tab mid-rollout loses
 nothing. A machine that settled `skipped` — enrolled in no project, or running under
 no process supervisor — reads as skipped with its reason and never as done: it is
-still on the build it had.
+still on the build it had. Once the rollout is `completed` the readout folds to a
+`Last fleet update report` heading you can open again — and fold back; a halted one
+stays open, since it is the one that is waiting on you.
 
 A project's own administrator has the narrower, **unstaged** form in the same place on
 the project detail page's **Workers** tab (issue #1010): **Update project workers**

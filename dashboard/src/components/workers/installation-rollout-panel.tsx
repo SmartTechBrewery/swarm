@@ -1,4 +1,6 @@
 import { useQuery } from '@tanstack/react-query';
+import { ChevronDown, ChevronRight } from 'lucide-react';
+import { useState } from 'react';
 import { Badge } from '@/components/ui/badge.js';
 import { RolloutMemberList } from '@/components/workers/rollout-member-list.js';
 import { canViewInstanceWide } from '@/lib/instance-admin.js';
@@ -19,6 +21,15 @@ import type { WorkerRollout } from '@/types/workers.js';
  * read where the fleet got to. So this polls on {@link WORKERS_REFETCH_MS}, the
  * roster's own cadence, and is mounted on the screen rather than inside the dialog,
  * which is what makes it survive a reload.
+ *
+ * **A finished rollout folds itself away.** The readout is permanent — there is no
+ * dismissing it, because the last rollout is how an operator answers "what build is
+ * this fleet on" — but a `completed` one has nothing left to watch, so it collapses
+ * to its own heading and can be opened again from there. The fold is a default rather
+ * than a rule: an operator who opens a finished report keeps it open, and one who
+ * folds a live rollout away keeps it folded, for as long as it is the same rollout.
+ * A halted one is never folded by default, since it is the one status that is waiting
+ * on somebody.
  *
  * **It renders nothing at all when no rollout has ever run**, and nothing while the
  * viewer is unresolved — `/workers` is an operator's screen first, and an empty
@@ -55,7 +66,10 @@ export function InstallationRolloutPanel() {
 	const rollout = rolloutQuery.data?.rollout;
 	if (!rollout) return null;
 
-	return <RolloutReadout rollout={rollout} />;
+	// Keyed on the rollout so a newly started one is a fresh readout: whether the
+	// operator had folded the *previous* rollout away says nothing about this one, and
+	// carrying that choice over would open a finished rollout or hide a live one.
+	return <RolloutReadout key={rollout.id} rollout={rollout} />;
 }
 
 /**
@@ -69,26 +83,50 @@ export function InstallationRolloutPanel() {
  */
 function RolloutReadout({ rollout }: { rollout: WorkerRollout }) {
 	const status = describeRolloutStatus(rollout.status);
+	const finished = rollout.status === 'completed';
+	// `null` until the operator says otherwise, so the default is free to follow the
+	// rollout: a live one is open, and it folds itself away the moment it completes.
+	// Once they have chosen, their choice wins and a poll cannot undo it — a report
+	// they opened to read must not snap shut under them on the next refetch.
+	const [override, setOverride] = useState<boolean | null>(null);
+	const expanded = override ?? !finished;
 
 	return (
 		<section className="border border-zinc-800 rounded-lg bg-panel/40 p-6 shadow-sm space-y-4">
 			<div className="space-y-2">
-				<div className="flex flex-wrap items-center gap-3">
-					<h2 className="text-sm font-semibold text-zinc-200">Installation fleet update</h2>
+				<button
+					type="button"
+					aria-expanded={expanded}
+					onClick={() => setOverride(!expanded)}
+					className="flex w-full flex-wrap items-center gap-3 text-left"
+				>
+					{expanded ? (
+						<ChevronDown className="h-4 w-4 shrink-0 text-zinc-500" />
+					) : (
+						<ChevronRight className="h-4 w-4 shrink-0 text-zinc-500" />
+					)}
+					{/* A finished rollout is named for what it now is — a report of the last one
+					    — while a live or halted one keeps the present tense. A halt is deliberately
+					    not called a report: it is the one status an operator has to act on. */}
+					<h2 className="text-sm font-semibold text-zinc-200">
+						{finished ? 'Last fleet update report' : 'Installation fleet update'}
+					</h2>
 					<Badge tone={status.tone} title={status.description}>
 						{status.label}
 					</Badge>
-				</div>
-				<p className="text-xs text-zinc-400">
-					Moving every registered machine to{' '}
-					<span className="font-mono text-zinc-200">{rollout.target.slice(0, 7)}</span>,{' '}
-					{rollout.waveSize} {rollout.waveSize === 1 ? 'machine' : 'machines'} per wave. It drains
-					each machine itself, never interrupting a phase already running, and puts every machine it
-					drained back in the dispatch pool when it is finished with it.
-				</p>
+				</button>
+				{expanded ? (
+					<p className="text-xs text-zinc-400">
+						Moving every registered machine to{' '}
+						<span className="font-mono text-zinc-200">{rollout.target.slice(0, 7)}</span>,{' '}
+						{rollout.waveSize} {rollout.waveSize === 1 ? 'machine' : 'machines'} per wave. It drains
+						each machine itself, never interrupting a phase already running, and puts every machine
+						it drained back in the dispatch pool when it is finished with it.
+					</p>
+				) : null}
 			</div>
 
-			{rollout.status === 'halted' ? (
+			{expanded && rollout.status === 'halted' ? (
 				// A halt is final and its reason is the machine's own words, so it gets the
 				// error banner rather than a line of helper text: nothing further is drained
 				// or signalled until somebody fixes the build and starts a new rollout.
@@ -102,7 +140,7 @@ function RolloutReadout({ rollout }: { rollout: WorkerRollout }) {
 				</div>
 			) : null}
 
-			<RolloutMemberList members={rollout.members} />
+			{expanded ? <RolloutMemberList members={rollout.members} framed={false} /> : null}
 		</section>
 	);
 }

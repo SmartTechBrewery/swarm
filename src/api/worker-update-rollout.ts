@@ -669,7 +669,7 @@ class AdvancePass {
 		await this.settleSignalled();
 		await this.verifyApplied();
 		await this.standDownUncommitted();
-		await this.advanceWave();
+		await this.advanceWaves();
 		await this.completeIfSettled();
 	}
 
@@ -759,14 +759,56 @@ class AdvancePass {
 		}
 	}
 
-	/** Step 5 — take the next wave if nothing is in flight, then signal whatever has gone idle. */
-	private async advanceWave(): Promise<void> {
-		if (this.status !== 'in_progress') return;
+	/**
+	 * Step 5 — take waves for as long as this pass can keep taking them.
+	 *
+	 * **A wave that settles without ever being signalled must not cost a tick.** Some
+	 * members are decided the instant they are asked and never involve the machine at
+	 * all: `no-project` and `unsupervised` settle inside {@link recordSignal}, a
+	 * deregistered machine settles inside {@link reassertDrain}, and an `answered` one
+	 * is read straight off its own row. None of those produces an update report or a
+	 * handshake, so before this loop the only thing that could reach the member behind
+	 * them was `ROLLOUT_ADVANCE_TICK_MS` — a full minute of nothing, for a decision
+	 * that needed no machine to answer. Measured on a twelve-machine installation on
+	 * 2026-09-18: six such members turned 44 seconds of real work into a 325-second
+	 * rollout, 279 of which was the tick.
+	 *
+	 * **The wave bound is untouched, and that is what makes looping safe.** The loop
+	 * stops the instant anything is in flight, and {@link takeNextWave} is still the
+	 * one place that decides a wave may be taken — it refuses queued members while any
+	 * member is committed. So "at most `waveSize` machines out of the pool at once"
+	 * holds exactly as before; what changes is only that a pass no longer *ends*
+	 * because a wave evaporated. A member left `draining` because its machine is
+	 * mid-phase is committed too, so the rule that draining never interrupts a run is
+	 * unchanged: the loop stops there and the next advance picks it up.
+	 *
+	 * Termination is bounded twice over. Every iteration that returns `true` settled
+	 * at least one member that was `queued` when the pass began, and nothing inside a
+	 * pass ever returns a member to `queued`, so the queue strictly shrinks; the
+	 * counter is the belt to that braces, and costs one comparison.
+	 */
+	private async advanceWaves(): Promise<void> {
+		for (let waves = 0; waves <= this.members.length; waves += 1) {
+			if (!(await this.advanceWave())) return;
+		}
+	}
+
+	/**
+	 * One wave. Answers whether another may follow it in this same pass — which is
+	 * true only when it left nothing in flight, the condition {@link advanceWaves}
+	 * explains.
+	 */
+	private async advanceWave(): Promise<boolean> {
+		if (this.status !== 'in_progress') return false;
 		const draining = await this.takeNextWave();
-		if (draining.length === 0) return;
+		if (draining.length === 0) return false;
 		const drained = await this.reassertDrain(draining);
 		const idle = await this.idleAmong(draining, drained);
 		if (idle.length > 0) await this.signal(idle, drained);
+		// Read after the wave rather than from its own members: `signal` can halt the
+		// rollout, and a member can settle in any of three places above.
+		if (this.status !== 'in_progress') return false;
+		return !this.members.some((member) => isCommittedMemberState(member.state));
 	}
 
 	/**
