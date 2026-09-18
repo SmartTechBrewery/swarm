@@ -234,6 +234,16 @@ cmd_reload() {
 	# Deliberately in the foreground: a failed migration, a failed dashboard build or
 	# a router that comes back unhealthy must stop the chain *before* the restart,
 	# with its own output on screen, rather than disappear into the agent's log.
+	#
+	# That guarantee rests on `dev:api` watching `./src` and nothing else. It used to
+	# watch the whole checkout, so `npm install` churning `node_modules` restarted the
+	# API mid-chain and the promise above was simply untrue: the chain could abort on
+	# the router step having already put the API on the new build, which is the one
+	# outcome this wording rules out. Confirmed live on 2026-09-18 — the Docker daemon
+	# was down, `reload:all` died on `docker compose --wait`, `cmd_restart` never ran,
+	# and the API was on the new build anyway. None of the steps this runs touches
+	# `./src`, so with the watch scoped there, aborting really does leave the old
+	# build serving. Widen that watch and this comment becomes a lie again.
 	printf 'swarm-api-agent: npm run %s in %s\n' "$script" "$CHECKOUT"
 	(cd "$CHECKOUT" && npm run "$script") ||
 		die "npm run $script failed -- the API was left running on the old build"

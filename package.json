@@ -14,7 +14,7 @@
 		"swarm": "node --env-file-if-exists=.env --import tsx/esm src/cli/index.ts",
 		"dev": "node --env-file=.env --import tsx/esm --watch src/index.ts",
 		"dev:router": "node --env-file=.env bin/kill-port.js ROUTER_PORT && node --env-file=.env --import tsx/esm --watch src/router/index.ts",
-		"dev:api": "npm run db:migrate && node --env-file=.env bin/kill-port.js API_PORT && node --env-file=.env --import tsx/esm --watch src/api/server.ts",
+		"dev:api": "npm run db:migrate && node --env-file=.env bin/kill-port.js API_PORT && node --env-file=.env --import tsx/esm --watch --watch-path=./src src/api/server.ts",
 		"dev:worker": "node --env-file-if-exists=.env --import tsx/esm src/transport/connect-entry.ts",
 		"dev:worker:watch": "node --env-file-if-exists=.env --import tsx/esm --watch src/transport/connect-entry.ts",
 		"dev:worker:seed": "npm run db:seed && npm run dev:worker",
