@@ -152,6 +152,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		// In the pool (issue #919) — every case here that says nothing about draining.
 		drainingSince: null,
 		update: null,
+		version: null,
 		worktreeSweep: null,
 		build: null,
 		supervision: 'unknown',
@@ -907,6 +908,9 @@ describe('listDashboardWorkers (issue #133)', () => {
 				'owner',
 				'repository',
 				'build',
+				// The install root's own `package.json` version — a label an operator reads,
+				// and no more a secret than the commit beside it.
+				'version',
 				'buildIsCurrent',
 				// Non-secret in exactly the same way (issue #997): one enum member naming a
 				// kind of process supervision — no path, no supervisor job label, no

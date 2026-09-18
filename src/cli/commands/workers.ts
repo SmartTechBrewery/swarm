@@ -466,6 +466,9 @@ const RosterSchema = z.array(
 		// rather than acted on, so a vocabulary this build has never heard of must not
 		// fail `list` (issue #997).
 		supervision: z.string().optional(),
+		// The install root's declared version, printed as a label and never compared —
+		// optional on this file's own rule, so an older control plane simply prints none.
+		version: z.string().nullable().optional(),
 		owner: z.object({ identifier: z.string().min(1) }).nullable(),
 	}),
 );
@@ -479,6 +482,7 @@ const OwnWorkersSchema = z.array(
 		rateLimits: z.array(WorkerRateLimitSchema).optional(),
 		update: WorkerUpdateStateSchema.nullable().optional(),
 		supervision: z.string().optional(),
+		version: z.string().nullable().optional(),
 	}),
 );
 
@@ -890,10 +894,16 @@ function printWorker(
 	update?: WorkerUpdateState | null,
 	rateLimits?: WorkerRateLimit[],
 	supervision?: string,
+	version?: string | null,
 ): void {
 	const prefix = ownerIdentifier ? `${ownerIdentifier}\t` : '';
+	// The version rides with the CLI list rather than as a column of its own: it is a
+	// short label, and a machine that has declared none must not leave a hole in the
+	// line. The commit is deliberately *not* printed here — a SHA per row is noise in a
+	// scan line, and the page is where the two are read together.
+	const label = version ? `\t${version}` : '';
 	const suffix = `${drainingSince ? '\tdraining' : ''}${describeSupervision(supervision)}${describeRateLimits(rateLimits)}${describeUpdate(update)}`;
-	out.info(`${prefix}${workerId}\t${displayName}\t${capabilities.join(',')}${suffix}`);
+	out.info(`${prefix}${workerId}\t${displayName}\t${capabilities.join(',')}${label}${suffix}`);
 }
 
 /**
@@ -983,6 +993,7 @@ async function listWorkersCommand(argv: string[]): Promise<number> {
 				worker.update,
 				worker.rateLimits,
 				worker.supervision,
+				worker.version,
 			);
 		}
 		return 0;
@@ -1007,6 +1018,7 @@ async function listWorkersCommand(argv: string[]): Promise<number> {
 				worker.update,
 				worker.rateLimits,
 				worker.supervision,
+				worker.version,
 			);
 		}
 		return 0;
@@ -1026,6 +1038,7 @@ async function listWorkersCommand(argv: string[]): Promise<number> {
 			worker.update,
 			worker.rateLimits,
 			worker.supervision,
+			worker.version,
 		);
 	}
 	return 0;

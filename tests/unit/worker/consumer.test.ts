@@ -3238,6 +3238,7 @@ describe('processJob', () => {
 					repository: overrides.repository ?? null,
 					drainingSince: overrides.drainingSince ?? null,
 					update: null,
+					version: null,
 					worktreeSweep: null,
 					build: null,
 					supervision: 'unknown',

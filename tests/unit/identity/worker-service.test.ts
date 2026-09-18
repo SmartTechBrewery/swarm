@@ -63,6 +63,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		repository: null,
 		drainingSince: null,
 		update: null,
+		version: null,
 		worktreeSweep: null,
 		build: null,
 		supervision: 'unknown',
@@ -152,12 +153,14 @@ describe('refreshWorkerCapabilities', () => {
 		// No phases passed through: the caller declared none, so the stored repertoire is
 		// left untouched rather than reset to the every-phase default (issue #467) — the
 		// `swarm workers set-cli` path, which knows nothing about phases.
-		// The fourth, fifth and sixth arguments are `undefined` for the same reason
-		// (issues #687, #918 and #997): a caller that knows nothing about checkouts,
-		// builds or supervision must not clear a declaration it cannot make.
+		// The fourth through seventh arguments are `undefined` for the same reason
+		// (issues #687, #918, #997 and the version label): a caller that knows nothing
+		// about checkouts, builds, supervision or versions must not clear a declaration
+		// it cannot make.
 		expect(updateWorkerCapabilities).toHaveBeenCalledWith(
 			'worker-1',
 			['codex'],
+			undefined,
 			undefined,
 			undefined,
 			undefined,
@@ -181,6 +184,7 @@ describe('refreshWorkerCapabilities', () => {
 			'worker-1',
 			['claude'],
 			['implementation', 'review'],
+			undefined,
 			undefined,
 			undefined,
 			undefined,
@@ -208,6 +212,7 @@ describe('refreshWorkerCapabilities', () => {
 			'smarttechbrewery/swarm',
 			undefined,
 			undefined,
+			undefined,
 		);
 	});
 
@@ -223,6 +228,7 @@ describe('refreshWorkerCapabilities', () => {
 			['claude'],
 			undefined,
 			null,
+			undefined,
 			undefined,
 			undefined,
 		);
@@ -254,6 +260,7 @@ describe('refreshWorkerCapabilities', () => {
 			null,
 			{ commit: '9f3a1b2c4d5e6f70819a2b3c4d5e6f7081920a3b', dirty: false },
 			undefined,
+			undefined,
 		);
 	});
 
@@ -270,6 +277,7 @@ describe('refreshWorkerCapabilities', () => {
 			undefined,
 			null,
 			null,
+			undefined,
 			undefined,
 		);
 	});
@@ -301,6 +309,7 @@ describe('refreshWorkerCapabilities', () => {
 			null,
 			null,
 			'unsupervised',
+			undefined,
 		);
 	});
 

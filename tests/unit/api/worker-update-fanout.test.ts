@@ -42,6 +42,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		// Out of the dispatch pool, so eligible, unless a case says otherwise.
 		drainingSince: DRAINED_AT,
 		update: null,
+		version: null,
 		worktreeSweep: null,
 		build: null,
 		supervision: 'unknown',

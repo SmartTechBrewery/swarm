@@ -673,6 +673,17 @@ machine. The badge says the builds *differ*, not that the machine is behind: the
 control plane compares the two commits for equality, and cannot prove a commit it
 may never have fetched is an ancestor of its own.
 
+**The version beside it is a label, not the comparison.** A machine also declares the
+`version` its SWARM install root's `package.json` carries, and the detail view and
+`swarm workers list` show it — `1.2.0 (abc1234)` on the detail view, the bare version
+in the list — because that is the name an operator uses for a release. It is *not*
+what `OUTDATED` is decided on, and deliberately so: a version only moves when somebody
+runs a bump, so between two releases every machine in the fleet reports the same
+string whatever code it is running, and an equality check on it would read a drifting
+fleet as a current one. The commit answers "is this worker running the fix?"; the
+version answers "which release is this?". A machine that has declared no version shows
+the commit alone.
+
 A `+dirty` marker on a build means the running code is not exactly the commit it
 names — the checkout has uncommitted changes, or its `dist/` build predates HEAD —
 so that machine counts as a different build even on the same commit. No badge at

@@ -571,6 +571,16 @@ export interface DashboardWorkerView {
 	 */
 	build: WorkerBuild | null;
 	/**
+	 * The version that machine's SWARM install root declares, or `null` while it has
+	 * declared none.
+	 *
+	 * Served **beside** {@link build}, never instead of it: it is the name an operator
+	 * uses for a release, while the commit is what `buildIsCurrent` is decided on. A
+	 * version only moves when somebody bumps it, so between two releases every machine
+	 * reports the same string whatever code it runs — see the column's own comment.
+	 */
+	version: string | null;
+	/**
 	 * How the machine's daemon declared it is supervised (issue #997) — whether
 	 * launchd or systemd will start it again after it exits, or nobody will.
 	 *
@@ -918,6 +928,7 @@ async function assembleDashboardWorker(
 		// batched repository read exists to avoid.
 		rateLimits,
 		build: worker.build,
+		version: worker.version,
 		buildIsCurrent: buildMatchesControlPlane(worker.build, controlPlaneBuild),
 		supervision: worker.supervision,
 		update: worker.update,

@@ -512,6 +512,13 @@
       "when": 1789679547759,
       "tag": "0072_worker_update_rollout_scope",
       "breakpoints": true
+    },
+    {
+      "idx": 73,
+      "version": "7",
+      "when": 1789723542765,
+      "tag": "0073_worker_version",
+      "breakpoints": true
     }
   ]
 }

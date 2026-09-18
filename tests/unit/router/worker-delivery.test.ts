@@ -52,6 +52,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		repository: null,
 		drainingSince: null,
 		update: null,
+		version: null,
 		worktreeSweep: null,
 		build: null,
 		supervision: 'unknown',

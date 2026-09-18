@@ -41,6 +41,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		// no in-flight run, so a machine in the dispatch pool is asked like any other.
 		drainingSince: null,
 		update: null,
+		version: null,
 		worktreeSweep: null,
 		build: null,
 		supervision: 'unknown',

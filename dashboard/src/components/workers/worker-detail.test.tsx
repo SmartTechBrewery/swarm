@@ -125,6 +125,7 @@ function makeWorker(overrides: Partial<WorkerDetail> = {}): WorkerDetail {
 		repository: 'acme/frontend',
 		// The daemon's declared SWARM build and the server's verdict on it (issue #925).
 		build: { commit: 'abc1234def5678', dirty: false },
+		version: null,
 		buildIsCurrent: true,
 		supervision: 'unknown',
 		connection: 'online',
@@ -783,6 +784,18 @@ describe('WorkerDetailView enrollment blocks', () => {
 			const field = within(section('Declared by the daemon')).getByText(label).parentElement;
 			return (field?.textContent ?? '').replace(label, '').replace('\u24d8', '').trim();
 		}
+
+		// The version is the label an operator uses; the commit stays because it is what
+		// the Outdated mark was decided on (`src/db/schema/workers.ts`).
+		it('leads with the declared version, keeping the commit beside it', () => {
+			renderWorker({
+				build: { commit: 'fedcba9876543210', dirty: false },
+				version: '1.2.0',
+				enrollments: [],
+			});
+
+			expect(declaredFieldValue('SWARM build')).toBe('1.2.0 (fedcba9)');
+		});
 
 		it('renders the short commit the daemon declared', () => {
 			renderWorker({ build: { commit: 'fedcba9876543210', dirty: false }, enrollments: [] });

@@ -56,6 +56,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		// In the pool (issue #919) unless a case overrides it.
 		drainingSince: null,
 		update: null,
+		version: null,
 		worktreeSweep: null,
 		build: null,
 		supervision: 'unknown',
@@ -156,6 +157,7 @@ describe('handleHandshake', () => {
 			null,
 			null,
 			'unknown',
+			'1.0.0',
 		);
 	});
 
@@ -173,6 +175,7 @@ describe('handleHandshake', () => {
 			null,
 			null,
 			'unknown',
+			'1.0.0',
 		);
 	});
 
@@ -195,6 +198,7 @@ describe('handleHandshake', () => {
 			'smarttechbrewery/swarm',
 			null,
 			'unknown',
+			'1.0.0',
 		);
 		expect(result.json).toMatchObject({ authenticated: true, workerId: WORKER_ID });
 	});
@@ -217,6 +221,7 @@ describe('handleHandshake', () => {
 			null,
 			{ commit: '9f3a1b2c4d5e6f70819a2b3c4d5e6f7081920a3b', dirty: true },
 			'unknown',
+			'1.0.0',
 		);
 	});
 
@@ -235,6 +240,7 @@ describe('handleHandshake', () => {
 			null,
 			null,
 			'unknown',
+			'1.0.0',
 		);
 	});
 
@@ -254,6 +260,7 @@ describe('handleHandshake', () => {
 			null,
 			null,
 			'unsupervised',
+			'1.0.0',
 		);
 	});
 
@@ -270,6 +277,7 @@ describe('handleHandshake', () => {
 			null,
 			null,
 			'unknown',
+			'1.0.0',
 		);
 	});
 
@@ -290,6 +298,7 @@ describe('handleHandshake', () => {
 			null,
 			null,
 			'unknown',
+			'1.0.0',
 		);
 	});
 

@@ -1,0 +1,14 @@
+-- The version a worker's SWARM install root declares, carried on the handshake as
+-- `daemonVersion` since that field existed and, until now, read and discarded.
+--
+-- It is a **label, not a comparand**. `build_commit` beside it stays what staleness is
+-- judged on: a version moves when an operator bumps it, so between two releases every
+-- machine reports the same string whatever code it runs, and an equality check on it
+-- would read a drifting fleet as a current one. This column buys the name an operator
+-- actually uses in conversation, beside the commit that answers whether the fix is
+-- running.
+--
+-- Nullable with no default, on `build_commit`'s contract: NULL means "this daemon
+-- declared none", which is what every existing row says until its machine next
+-- connects. Nothing is backfilled and no index is added, since nothing queries by it.
+ALTER TABLE "workers" ADD COLUMN "version" text;
