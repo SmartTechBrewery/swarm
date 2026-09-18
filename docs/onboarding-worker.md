@@ -638,11 +638,11 @@ One thing still has to be true of the host:
   precondition of the update *mechanism*, like the drain and the ancestor check above,
   not a per-host setting of the kind ADR-006 removed — nothing turns it off. A machine
   whose supervision is **unknown** — an older daemon, one that has never connected, a
-  platform the reads cannot answer for — is never refused. Read the macOS caveat in
-  [`docs/MANUAL.md`](./MANUAL.md) first: a LaunchAgent that starts the daemon through
-  `swarm run:worker` currently declares `unsupervised`, so such a host is refused
-  although launchd would restart it, and updates by hand until the detection reads
-  that shape.
+  platform the reads cannot answer for — is never refused. One macOS wrinkle is worth
+  knowing, and is described in full in [`docs/MANUAL.md`](./MANUAL.md): a LaunchAgent
+  installed before `swarm run:worker` learned to replace its own process declares
+  `unsupervised` although launchd would restart it, so that machine is refused until
+  it has been updated by hand once and restarted.
 
 **Why the drain is required.** `swarm workers update` is refused unless the machine
 is already out of the dispatch pool, and names the drain as the remedy. The daemon

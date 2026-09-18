@@ -357,16 +357,26 @@ supervisor is configured to restart the job. `KeepAlive` and `Restart=always` ar
 readable from inside the process, so *Supervised* means "launchd or systemd started
 this daemon", not "it will definitely come back".
 
-**On macOS it is also narrower than it sounds, and errs on the safe side.** The
-launchd reading asks whether launchd started *this process*, and a LaunchAgent that
-starts the daemon through a launcher — `swarm run:worker`, which spawns `npm run
-dev:worker`, which spawns the daemon, the shape the plists installed by
-`swarm-worker-agent` use — puts two processes between launchd and the daemon, so that
-machine reads *Not supervised* even though launchd will restart it. The alternative
-was worse: `XPC_SERVICE_NAME` is inherited by every descendant of every launchd job,
-a Terminal window included, so accepting it on its own would read a genuinely
-hand-run daemon as supervised. The error therefore only ever under-claims — nothing
-is marked as coming back unless it demonstrably will.
+**On macOS it is narrower than it sounds, and errs on the safe side.** The launchd
+reading asks whether launchd started *this process*. Accepting anything looser was
+worse: `XPC_SERVICE_NAME` is inherited by every descendant of every launchd job, a
+Terminal window included, so taking it on its own would read a genuinely hand-run
+daemon as supervised. The error therefore only ever under-claims — nothing is marked
+as coming back unless it demonstrably will.
+
+That strictness used to catch SWARM's own agents. A LaunchAgent starts
+`swarm run:worker`, which until recently spawned `npm run dev:worker`, which spawned
+the daemon — two processes between launchd and the worker, so every machine
+`swarm-worker-agent` installed read *Not supervised* although launchd would restart
+it, and every fleet update skipped all of them. `swarm run:worker` now **replaces its
+own process** with the daemon, so the job launchd started is the worker and the
+reading is right without being loosened. Two things follow for an operator. A machine
+has to be on a build carrying that change and have been restarted once before it
+declares *Supervised* — until then it is refused exactly as before, and the way out
+of that first refusal is to update it by hand (`git pull && npm ci && npm run build`,
+then restart the agent). And a daemon started some other way — `npm run dev:worker`
+in a terminal, or a LaunchAgent of your own that runs something other than
+`swarm run:worker` — still reads *Not supervised*, correctly.
 
 **The machine must be under a process supervisor** (issue #997, phase 2/2). The
 daemon applies an update by *exiting*, so a machine that declared `unsupervised` would

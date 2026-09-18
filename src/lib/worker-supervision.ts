@@ -30,11 +30,19 @@
  * *silent* one, a machine claiming nothing while exiting for nobody.
  *
  * **The launchd arm reads `supervised` only for launchd's *direct* child, and that
- * is narrower than "started by a LaunchAgent".** Verified live on this
- * installation: the worker plists run `swarm run:worker`, which spawns `npm run
- * dev:worker`, which spawns the daemon — so the daemon's parent is `npm` and only
- * the launcher three levels up has ppid 1. Such a machine declares `unsupervised`
- * although launchd will in fact restart it.
+ * is narrower than "started by a LaunchAgent".** It used to be narrower than SWARM's
+ * own installer too: the worker plists ran `swarm run:worker`, which spawned `npm
+ * run dev:worker`, which spawned the daemon — so the daemon's parent was `npm`, only
+ * the launcher three levels up had ppid 1, and every machine `bin/swarm-worker-agent`
+ * installed declared `unsupervised` although launchd would in fact restart it. The
+ * warning below came true exactly as written: issue #1024's installation-wide fleet
+ * update shipped, and on 2026-09-18 all twelve machines on this installation were
+ * refused by it. The fix was to stop lying to this read rather than to loosen it —
+ * `swarm run:worker` now replaces its own process with the daemon
+ * (`process.execve`, `../cli/commands/run-worker.ts`), so the job launchd started
+ * *is* the daemon and `ppid === 1` holds. A machine on a build predating that, or on
+ * a runtime without `execve`, still takes the old spawn and still reads
+ * `unsupervised` — correctly, as far as this read can tell.
  *
  * That conjunct is kept anyway, because dropping it is worse and nothing cheaper
  * replaces it: `XPC_SERVICE_NAME` is inherited by *every* descendant of *any*
@@ -45,8 +53,9 @@
  * the plist, both of which issue #997 puts out of scope. So the error is left
  * pointing the **safe** way: this never claims `supervised` for a machine that
  * would not come back, only `unsupervised` for one that would. A consumer that
- * refuses on `unsupervised` (phase 2/2) must reckon with that before it ships —
- * on an installation shaped like this one it refuses everything.
+ * refuses on `unsupervised` must still reckon with that — the residual error is
+ * unchanged for anything this installer did not start, and a false `unsupervised`
+ * costs that machine every update it would otherwise have been asked for.
  */
 
 import { z } from 'zod';
