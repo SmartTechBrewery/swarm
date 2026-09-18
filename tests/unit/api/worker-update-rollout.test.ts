@@ -35,13 +35,23 @@ const {
 	findRolloutHoldElsewhere: vi.fn(),
 	readRollout: vi.fn(),
 }));
-const { getWorkers, listAllWorkers, listWorkersForOwner, setWorkerDraining } = vi.hoisted(() => ({
+const {
+	getWorkers,
+	listAllWorkers,
+	listWorkersForOwner,
+	setWorkerDraining,
+	withdrawWorkerUpdateRequest,
+} = vi.hoisted(() => ({
 	getWorkers: vi.fn(),
 	listAllWorkers: vi.fn(),
 	listWorkersForOwner: vi.fn(),
 	setWorkerDraining: vi.fn(),
+	withdrawWorkerUpdateRequest: vi.fn(),
 }));
-const { getLiveSessionForWorker } = vi.hoisted(() => ({ getLiveSessionForWorker: vi.fn() }));
+const { getLiveSessionForWorker, getRetainedSessionForWorker } = vi.hoisted(() => ({
+	getLiveSessionForWorker: vi.fn(),
+	getRetainedSessionForWorker: vi.fn(),
+}));
 const { deriveWorkerRunState } = vi.hoisted(() => ({ deriveWorkerRunState: vi.fn() }));
 const { fanOutWorkerUpdate } = vi.hoisted(() => ({ fanOutWorkerUpdate: vi.fn() }));
 
@@ -61,8 +71,12 @@ vi.mock('@/identity/worker-service.js', () => ({
 	listAllWorkers,
 	listWorkersForOwner,
 	setWorkerDraining,
+	withdrawWorkerUpdateRequest,
 }));
-vi.mock('@/identity/worker-session-service.js', () => ({ getLiveSessionForWorker }));
+vi.mock('@/identity/worker-session-service.js', () => ({
+	getLiveSessionForWorker,
+	getRetainedSessionForWorker,
+}));
 vi.mock('@/identity/worker-enrollment-service.js', () => ({ deriveWorkerRunState }));
 vi.mock('@/api/worker-update-fanout.js', () => ({ fanOutWorkerUpdate }));
 
@@ -254,6 +268,10 @@ beforeEach(() => {
 	findRolloutHoldElsewhere.mockResolvedValue(undefined);
 	getWorkers.mockResolvedValue([]);
 	getLiveSessionForWorker.mockResolvedValue(undefined);
+	// Heard from just now unless a test says otherwise, so the silence window never fires
+	// by accident in a case that is about something else.
+	getRetainedSessionForWorker.mockResolvedValue({ fencingToken: 1, lastHeartbeatAt: NOW });
+	withdrawWorkerUpdateRequest.mockResolvedValue(undefined);
 	deriveWorkerRunState.mockResolvedValue({ busy: false, currentRunId: null });
 	fanOutWorkerUpdate.mockResolvedValue([]);
 	// The drain write answers with the row as it now stands, which is what the fan-out
@@ -681,6 +699,142 @@ describe('advanceRollout — settling what a machine reported', () => {
 
 		expect(view?.members[0].state).toBe('skipped');
 		expect(view?.rollout.status).toBe('completed');
+	});
+});
+
+describe('advanceRollout — a signalled machine that stops answering', () => {
+	/** A member asked and still waiting: its `workers` row carries the rollout's own request. */
+	function signalled(overrides: Partial<WorkerUpdateRolloutMember> = {}) {
+		return makeMember(WORKER_A, 0, {
+			state: 'signalled',
+			requestId: REQUEST_A,
+			drainedByRollout: true,
+			signalledAt: new Date('2026-09-13T11:05:00Z'),
+			...overrides,
+		});
+	}
+
+	/** The machine's row, with this rollout's request still outstanding and unanswered. */
+	function waiting(): Worker {
+		return makeWorker(WORKER_A, {
+			drainingSince: new Date('2026-09-13T11:00:00Z'),
+			update: {
+				requestId: REQUEST_A,
+				target: 'main',
+				requestedAt: new Date('2026-09-13T11:05:00Z'),
+				requestedByUserId: REQUESTER_ID,
+				status: null,
+				message: null,
+				reportedAt: null,
+			},
+		});
+	}
+
+	/** Offline, and last heard from this many minutes before the pass. */
+	function silentFor(minutes: number): void {
+		getLiveSessionForWorker.mockResolvedValue(undefined);
+		getRetainedSessionForWorker.mockResolvedValue({
+			fencingToken: 1,
+			lastHeartbeatAt: new Date(NOW.getTime() - minutes * 60_000),
+		});
+	}
+
+	// The whole point: before this, such a member waited for ever and its machine stayed
+	// out of the dispatch pool with only a manual undrain — by its owner — to recover it.
+	it('settles it and puts the machine back in the pool once it has been silent too long', async () => {
+		givenRollout(makeRollout(), [signalled()]);
+		givenWorkers(waiting());
+		silentFor(6);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0].state).toBe('skipped');
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_A, false);
+	});
+
+	// A machine nobody can reach has said nothing about the build, so stopping the fleet
+	// over it would turn one dead laptop into a stalled rollout.
+	it('does not halt the rollout, and does not count the machine as done', async () => {
+		givenRollout(makeRollout(), [signalled()]);
+		givenWorkers(waiting());
+		silentFor(6);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.rollout.haltReason).toBeNull();
+		expect(view?.rollout.status).not.toBe('halted');
+		expect(view?.members[0].state).not.toBe('done');
+		expect(view?.members[0].state).not.toBe('failed');
+	});
+
+	// Without this the machine is handed the very request it gave up on, by
+	// `resendPendingWorkerUpdateToWorker`, while it is back in the dispatch pool — so it
+	// would exit to apply an update with work already dispatched to it.
+	it('withdraws the outstanding request it gave up on', async () => {
+		givenRollout(makeRollout(), [signalled()]);
+		givenWorkers(waiting());
+		silentFor(6);
+
+		await advanceRollout(ROLLOUT_ID);
+
+		expect(withdrawWorkerUpdateRequest).toHaveBeenCalledWith(WORKER_A, REQUEST_A);
+	});
+
+	// Slowness is not the failure being caught: the apply itself happens in this state,
+	// and a machine holding its session is answerable however long its build takes.
+	it('leaves a machine that still holds a session alone, however long it has been', async () => {
+		givenRollout(makeRollout(), [signalled()]);
+		givenWorkers(waiting());
+		getLiveSessionForWorker.mockResolvedValue({ fencingToken: 1 });
+		getRetainedSessionForWorker.mockResolvedValue({
+			fencingToken: 1,
+			lastHeartbeatAt: new Date(NOW.getTime() - 60 * 60_000),
+		});
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0].state).toBe('signalled');
+		expect(withdrawWorkerUpdateRequest).not.toHaveBeenCalled();
+		expect(setWorkerDraining).not.toHaveBeenCalledWith(WORKER_A, false);
+	});
+
+	// The daemon exits and reconnects as a matter of course, and a supervisor restarts a
+	// crashed one within seconds, so a brief absence must not end the wait.
+	it('keeps waiting on a machine that has only just gone quiet', async () => {
+		givenRollout(makeRollout(), [signalled()]);
+		givenWorkers(waiting());
+		silentFor(2);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0].state).toBe('signalled');
+		expect(withdrawWorkerUpdateRequest).not.toHaveBeenCalled();
+	});
+
+	// A machine that never connected at all has no heartbeat to measure from, so the
+	// instant it was signalled is what the window runs from.
+	it('measures from the signal for a machine that has never connected', async () => {
+		givenRollout(makeRollout(), [signalled({ signalledAt: new Date(NOW.getTime() - 6 * 60_000) })]);
+		givenWorkers(waiting());
+		getLiveSessionForWorker.mockResolvedValue(undefined);
+		getRetainedSessionForWorker.mockResolvedValue(undefined);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0].state).toBe('skipped');
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_A, false);
+	});
+
+	// The drain is the rollout's to return only where the rollout took it.
+	it('never undrains a machine the operator had drained themselves', async () => {
+		givenRollout(makeRollout(), [signalled({ drainedByRollout: false })]);
+		givenWorkers(waiting());
+		silentFor(6);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0].state).toBe('skipped');
+		expect(setWorkerDraining).not.toHaveBeenCalledWith(WORKER_A, false);
 	});
 });
 
