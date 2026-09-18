@@ -671,6 +671,14 @@ SWARM checkout a daemon's *own code* is loaded from, which is not
 control-plane host one npm-linked install root serves several daemons at once. Drain
 **every** worker on that machine, then update them, and read the reports:
 
+- **The install root is left on its branch when the build it moved to is that
+  branch's tip.** An apply checks out a *commit*, detached, because that is what pins
+  the build exactly — but leaving it detached broke the by-hand path, since
+  `swarm-worker-agent update` runs `git pull --ff-only` and that fails on a detached
+  HEAD. So a successful apply reattaches when, and only when, the commit it landed is
+  the tip of the branch the install tracks and the local branch carries nothing the
+  commit lacks. Asked for an older commit, or with a diverged local branch, it stays
+  detached — reattaching there would run code nobody asked for, or discard work.
 - The first daemon to act takes a machine-local lock on the install root and does the
   fetch, the `npm ci` and the build. The others find it held and **wait for it**,
   because holding that lock afterwards is the only proof the build is finished rather

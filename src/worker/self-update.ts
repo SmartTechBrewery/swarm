@@ -635,6 +635,7 @@ async function updateLocked(
 	});
 	const outcome = await applyCommit(ctx, head, commit);
 	if (outcome.status === 'applied') {
+		await attachToTrackedBranch(ctx, tracking, commit);
 		// The build is on disk but unproved: the daemon that will run it has not started
 		// yet, let alone handshaked. Recorded now so the *next* process finds the question
 		// already asked (issue #934).
@@ -866,6 +867,83 @@ async function buildAt(
 	const build = await ctx.run(npm(ctx, ['run', 'build'], NPM_BUILD_TIMEOUT_MS));
 	if (build.exitCode !== 0) return { stage: 'build', result: build };
 	return null;
+}
+
+/**
+ * Leave HEAD **on the tracked branch** rather than detached, when the commit just
+ * applied is exactly that branch's tip.
+ *
+ * An apply checks out a commit, and it detaches to do it because the target *is* a
+ * commit: pinning it exactly is what makes `build_commit` honest and what lets a
+ * rollback name a precise `lastKnownGood`. Fast-forwarding a branch instead would let
+ * the build move under the machine.
+ *
+ * What that cost, and what this repays: the install root on somebody's machine is
+ * often also a checkout they use, and `swarm-worker-agent update` — the documented
+ * by-hand path, and the only recovery when the control-plane route cannot be used —
+ * runs `git pull --ff-only` and dies on a detached HEAD. So an automated update broke
+ * the manual one until an operator reattached by hand. Reported live on 2026-09-18
+ * after a fleet update left `jacek_tp`'s install root detached.
+ *
+ * **Three conditions, all necessary.** Reattaching is only ever safe when it changes
+ * which *ref* HEAD names and not which *commit* it is on:
+ *
+ * 1. The applied commit must be the tracked remote branch's tip. When an operator
+ *    asked for an older commit, attaching to a branch that has moved past it would
+ *    run code they did not ask for — so that case stays detached, correctly. This
+ *    also excludes a rollback and a return to the last known good build without
+ *    naming them: neither is the tip.
+ * 2. A local branch of that name must not carry commits the applied one lacks.
+ *    `checkout -B` would discard them, and an install root that doubles as a working
+ *    copy is exactly where somebody's unpushed work would be. Diverged means stay
+ *    detached.
+ * 3. It must not be able to fail the apply. The build is already on disk and correct;
+ *    which ref HEAD names is a convenience next to that, so every failure here is
+ *    logged and swallowed.
+ */
+async function attachToTrackedBranch(
+	ctx: UpdateContext,
+	tracking: { remote: string; branch: string },
+	commit: string,
+): Promise<void> {
+	const tip = await gitRead(
+		ctx,
+		['rev-parse', '--verify', `refs/remotes/${tracking.remote}/${tracking.branch}^{commit}`],
+		GIT_READ_TIMEOUT_MS,
+	);
+	if (tip !== commit) return;
+
+	const localTip = await gitRead(
+		ctx,
+		['rev-parse', '--verify', `refs/heads/${tracking.branch}^{commit}`],
+		GIT_READ_TIMEOUT_MS,
+	);
+	if (localTip && localTip !== commit) {
+		const ancestor = await ctx.run(
+			git(ctx, ['merge-base', '--is-ancestor', localTip, commit], GIT_READ_TIMEOUT_MS),
+		);
+		if (ancestor.exitCode !== 0) {
+			logger.info('Left the SWARM install root detached: its local branch has diverged', {
+				installRoot: ctx.installRoot,
+				branch: tracking.branch,
+				commit,
+				localTip,
+			});
+			return;
+		}
+	}
+
+	const attached = await ctx.run(
+		git(ctx, ['checkout', '-B', tracking.branch, commit], GIT_CHECKOUT_TIMEOUT_MS),
+	);
+	if (attached.exitCode !== 0) {
+		logger.warn('Applied the update but could not reattach the SWARM install root to its branch', {
+			installRoot: ctx.installRoot,
+			branch: tracking.branch,
+			commit,
+			exitCode: attached.exitCode,
+		});
+	}
 }
 
 /** What failed, in the words the operator-facing `reason` is built from. */

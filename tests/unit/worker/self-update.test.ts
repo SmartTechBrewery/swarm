@@ -238,13 +238,101 @@ describe('applyUpdateTarget — what it asks git for', () => {
 			commit: TARGET_COMMIT,
 			previousCommit: HEAD,
 		});
-		expect(argv().slice(-3)).toEqual([
+		// The three that move the install root, in order — anchored on the checkout
+		// rather than on the tail, because the reattach afterwards has its own suite
+		// below and this assertion is about what an apply does to the *tree*.
+		const commands = argv();
+		const checkoutAt = commands.indexOf(`git checkout --detach ${TARGET_COMMIT}`);
+		expect(checkoutAt).toBeGreaterThanOrEqual(0);
+		expect(commands.slice(checkoutAt, checkoutAt + 3)).toEqual([
 			`git checkout --detach ${TARGET_COMMIT}`,
 			'npm ci',
 			'npm run build',
 		]);
 		expect(calls.every((call) => call.cwd === INSTALL_ROOT)).toBe(true);
 		expect(calls.every((call) => call.timeoutMs > 0)).toBe(true);
+	});
+});
+
+describe('applyUpdateTarget — reattaching the install root to its branch', () => {
+	const REATTACH = `git checkout -B ${BRANCH} ${TARGET_COMMIT}`;
+	const LOCAL_TIP_ARGV = `git rev-parse --verify refs/heads/${BRANCH}^{commit}`;
+	const OTHER_COMMIT = 'c'.repeat(40);
+
+	// An install root is often also a checkout somebody uses, and
+	// `swarm-worker-agent update` runs `git pull --ff-only`, which dies on a detached
+	// HEAD — so an automated update used to break the by-hand one.
+	it('attaches to the tracked branch when the applied commit is its tip', async () => {
+		const home = makeHome();
+		const { run, argv } = scriptedRunner();
+
+		const outcome = await apply(home, run);
+
+		expect(outcome.status).toBe('applied');
+		expect(argv()).toContain(REATTACH);
+	});
+
+	// Attaching to a branch that has moved past the commit an operator asked for would
+	// run code they did not ask for. This also covers a rollback and a return to the
+	// last known good build without naming them: neither is the tip.
+	it('stays detached when the applied commit is not the branch tip', async () => {
+		const home = makeHome();
+		const { run, argv } = scriptedRunner({
+			[`git rev-parse --verify refs/remotes/${REMOTE}/${BRANCH}^{commit}`]: [
+				ok(TARGET_COMMIT),
+				ok(OTHER_COMMIT),
+			],
+		});
+
+		const outcome = await apply(home, run);
+
+		expect(outcome.status).toBe('applied');
+		expect(argv()).not.toContain(REATTACH);
+	});
+
+	// `checkout -B` would discard them, and an install root that doubles as a working
+	// copy is exactly where somebody's unpushed work would be.
+	it('stays detached when the local branch carries commits the applied one lacks', async () => {
+		const home = makeHome();
+		const { run, argv } = scriptedRunner({
+			[LOCAL_TIP_ARGV]: ok(OTHER_COMMIT),
+			[`git merge-base --is-ancestor ${OTHER_COMMIT} ${TARGET_COMMIT}`]: fail(),
+		});
+
+		const outcome = await apply(home, run);
+
+		expect(outcome.status).toBe('applied');
+		expect(argv()).not.toContain(REATTACH);
+	});
+
+	// The ordinary case for a machine that has not pulled in a while: the local branch
+	// is simply behind, so moving it forward loses nothing.
+	it('attaches when the local branch is merely behind the applied commit', async () => {
+		const home = makeHome();
+		const { run, argv } = scriptedRunner({
+			[LOCAL_TIP_ARGV]: ok(HEAD),
+			[`git merge-base --is-ancestor ${HEAD} ${TARGET_COMMIT}`]: ok(''),
+		});
+
+		const outcome = await apply(home, run);
+
+		expect(outcome.status).toBe('applied');
+		expect(argv()).toContain(REATTACH);
+	});
+
+	// The build is already on disk and correct; which ref HEAD names is a convenience
+	// next to that, so a failure here must never turn a good apply into a bad one.
+	it('still reports the update applied when the reattach itself fails', async () => {
+		const home = makeHome();
+		const { run } = scriptedRunner({ [REATTACH]: fail() });
+
+		const outcome = await apply(home, run);
+
+		expect(outcome).toEqual({
+			status: 'applied',
+			commit: TARGET_COMMIT,
+			previousCommit: HEAD,
+		});
 	});
 });
 
