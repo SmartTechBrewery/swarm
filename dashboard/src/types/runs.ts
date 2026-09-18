@@ -515,6 +515,15 @@ export interface RunRow {
 	 * list read model, which resolves no ledger read per row.
 	 */
 	reviewCapSpent?: boolean | null;
+	/**
+	 * Whether an operator's extra review slot is granted on this run's pull request
+	 * and nothing has spent it yet (issue #1040) — the window between "Force
+	 * re-review" recording the grant and the review it pays for starting. The
+	 * complement of `reviewCapSpent`, which goes false the instant a grant exists;
+	 * resolved from the same server-side ledger read, null and absent on the same
+	 * terms.
+	 */
+	reviewCapOverrideOutstanding?: boolean | null;
 	exitCode: number | null;
 	timedOut: boolean;
 	error: string | null;

@@ -12,13 +12,15 @@ vi.mock('@/db/repositories/projectsRepository.js', () => ({
 	getProjectByIdFromDb: vi.fn(),
 }));
 
-// Only the two ledger *writes/reads* the service performs are stubbed; the real
-// `isCapReachingRequestChanges` is kept so the service's cap guard is exercised
-// against the same predicate the Review phase and the trigger use.
+// Only the ledger *writes/reads* the service performs are stubbed; the real
+// predicates (`isCapReachingRequestChanges`, and issue #1040's
+// `hasSubmittedEveryPermittedVerdict`/`isLastPermittedVerdict`) are kept so the
+// service's cap guards are exercised against the same arithmetic the writer uses.
 vi.mock('@/db/repositories/reviewVerdictsRepository.js', async (importOriginal) => ({
 	...(await importOriginal<typeof import('@/db/repositories/reviewVerdictsRepository.js')>()),
 	getSubmittedReviewSlot: vi.fn(),
 	grantReviewCapOverride: vi.fn(),
+	listActiveReviewSlotsForPullRequest: vi.fn(),
 }));
 
 vi.mock('@/dispatch/dispatcher.js', () => ({
@@ -26,8 +28,10 @@ vi.mock('@/dispatch/dispatcher.js', () => ({
 	deliveryDedupKey: (deliveryId: string) => `delivery:${deliveryId}`,
 }));
 
+const getPullRequest = vi.fn();
+
 vi.mock('@/integrations/scm/registry.js', () => ({
-	requireProjectSCMProvider: () => ({ type: 'github' }),
+	requireProjectSCMProvider: () => ({ type: 'github', getPullRequest }),
 	// Also read by `ProjectConfigSchema`'s per-provider credential check (issue #628);
 	// an empty registry skips it, which is what this suite's fixtures expect.
 	listSCMProviders: () => [],
@@ -37,6 +41,8 @@ import { getProjectByIdFromDb } from '@/db/repositories/projectsRepository.js';
 import {
 	getSubmittedReviewSlot,
 	grantReviewCapOverride,
+	listActiveReviewSlotsForPullRequest,
+	type PullRequestReviewSlot,
 	REVIEW_VERDICT_CAP,
 } from '@/db/repositories/reviewVerdictsRepository.js';
 import { getRunByIdFromDb } from '@/db/repositories/runsRepository.js';
@@ -134,6 +140,58 @@ const cappedSlot = {
 	capOverrideConsumedAt: null,
 };
 
+/** The head a later push moved PR #508 to, superseding the one the run reviewed. */
+const CURRENT_HEAD_SHA = 'facef00d0000facef00d0000facef00d0000face';
+
+/**
+ * A ledger holding `n` submitted slots, so `isReviewAllowanceSpent` answers the
+ * real thing rather than a stub. The highest ordinal is the one the approving run
+ * holds, which is what `isLastPermittedVerdict` is asked about.
+ */
+function submittedSlots(count: number): PullRequestReviewSlot[] {
+	return Array.from({ length: count }, (_unused, index) => ({
+		ordinal: index + 1,
+		state: 'submitted' as const,
+		headSha: index + 1 === count ? HEAD_SHA : `older-${index}`,
+		capOverrideGrantedAt: null,
+		capOverrideConsumedAt: null,
+		dispatchActive: false,
+	}));
+}
+
+/** A pull request whose whole review allowance is spent and holds no outstanding grant. */
+function spentLedger(): PullRequestReviewSlot[] {
+	return submittedSlots(REVIEW_VERDICT_CAP);
+}
+
+/**
+ * The ledger a force leaves behind: the same spent allowance, plus the extra slot
+ * it granted, still unconsumed because the Review it bought has not reserved one.
+ * This is the state every click after the first sees.
+ */
+function grantedLedger(): PullRequestReviewSlot[] {
+	return spentLedger().map((slot) => ({ ...slot, capOverrideGrantedAt: new Date() }));
+}
+
+/** A completed Review run that approved — the cap stop issue #1040 recovers. */
+function makeCapSpentApprovalRun(overrides: Partial<RunRow> = {}): RunRow {
+	return makeCappedReviewRun({
+		reviewVerdict: 'approve',
+		reviewAutomationOutcome: null,
+		reviewMergeOutcome: 'not-eligible',
+		...overrides,
+	});
+}
+
+/** The approving ledger slot the grant lands on: same head, approving verdict. */
+const approvingSlot = {
+	ordinal: REVIEW_VERDICT_CAP,
+	verdict: 'approve',
+	reviewId: '900456',
+	capOverrideGrantedAt: null,
+	capOverrideConsumedAt: null,
+};
+
 type CreateDispatchResult = Awaited<ReturnType<typeof createAndPublishDispatch>>;
 
 function dispatchResult(
@@ -155,6 +213,19 @@ describe('forceReReview (issue #511)', () => {
 		vi.mocked(getSubmittedReviewSlot).mockResolvedValue(cappedSlot);
 		vi.mocked(grantReviewCapOverride).mockResolvedValue('granted');
 		vi.mocked(createAndPublishDispatch).mockResolvedValue(dispatchResult(true));
+		// Issue #1040's branch only: a ledger with allowance left, so an approving run
+		// that reaches it is refused `not-capped` unless a test says otherwise.
+		vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(submittedSlots(1));
+		getPullRequest.mockResolvedValue({
+			number: 508,
+			headBranch: 'issue-508',
+			headSha: CURRENT_HEAD_SHA,
+			baseBranch: 'main',
+			baseSha: 'base',
+			mergeable: true,
+			authorLogin: 'someone',
+			state: 'open',
+		});
 	});
 
 	describe('the forced continuation', () => {
@@ -482,5 +553,340 @@ describe('forceReReview (issue #511)', () => {
 		expect(getSubmittedReviewSlot).not.toHaveBeenCalled();
 		expect(grantReviewCapOverride).not.toHaveBeenCalled();
 		expect(createAndPublishDispatch).not.toHaveBeenCalled();
+	});
+
+	/**
+	 * The second shape (issue #1040): a completed Review that **approved**, whose
+	 * pull request's allowance is spent and whose reviewed head a later push
+	 * superseded. Its continuation is one Review of the *current* head, not a
+	 * corrective response — there is no requested change to answer.
+	 */
+	describe('a review of the superseded head (issue #1040)', () => {
+		beforeEach(() => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(makeCapSpentApprovalRun());
+			vi.mocked(getSubmittedReviewSlot).mockResolvedValue(approvingSlot);
+			vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(spentLedger());
+		});
+
+		it('grants one extra slot on the approving record and enqueues a review of the new head', async () => {
+			const result = await forceReReview('run-1');
+
+			// The grant lands on the *reviewed* head's slot — the approving one — which
+			// `reserveReviewVerdict` finds among the PR's active slots whatever head the
+			// next review is of.
+			expect(grantReviewCapOverride).toHaveBeenCalledWith({
+				projectId: 'p1',
+				repository: 'SmartTechBrewery/swarm',
+				prNumber: '508',
+				headSha: HEAD_SHA,
+			});
+			expect(result).toMatchObject({
+				runId: 'run-1',
+				prNumber: '508',
+				continuation: 'review',
+				headSha: HEAD_SHA,
+				reviewHeadSha: CURRENT_HEAD_SHA,
+				capOverride: 'granted',
+				dispatch: 'scheduled',
+				dispatchId: 'dispatch-9',
+			});
+		});
+
+		it('enqueues the unmarked checks/completed event the pr-review trigger reads', async () => {
+			await forceReReview('run-1');
+
+			const input = vi.mocked(createAndPublishDispatch).mock.calls[0][0];
+			expect(input).toMatchObject({
+				projectId: 'p1',
+				source: 'manual',
+				taskId: '508',
+				phase: 'review',
+			});
+			expect(input.jobPayload).toMatchObject({
+				type: 'scm',
+				providerId: 'github',
+				event: {
+					kind: 'checks',
+					action: 'completed',
+					repoFullName: 'SmartTechBrewery/swarm',
+					workItemId: '508',
+					headSha: CURRENT_HEAD_SHA,
+					prBranch: 'issue-508',
+				},
+			});
+			// `forcedReReview` is the Respond-to-review trigger's cap-gate bypass alone;
+			// a forced Review is licensed by the grant its reservation consumes.
+			expect(input.jobPayload).not.toHaveProperty('forcedReReview');
+		});
+
+		it('keys the dispatch on the current head, under its own prefix', async () => {
+			await forceReReview('run-1');
+			const forcedReviewKey = vi.mocked(createAndPublishDispatch).mock.calls[0][0].dedupKey;
+
+			// The same run, forced through the #511 branch, must not collide with it.
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(makeCappedReviewRun());
+			vi.mocked(getSubmittedReviewSlot).mockResolvedValue(cappedSlot);
+			await forceReReview('run-1');
+
+			expect(forcedReviewKey).toBeDefined();
+			expect(vi.mocked(createAndPublishDispatch).mock.calls[1][0].dedupKey).not.toBe(
+				forcedReviewKey,
+			);
+		});
+
+		it('grants the extra slot before enqueueing, so a failed enqueue leaves no half-forced force', async () => {
+			vi.mocked(createAndPublishDispatch).mockRejectedValueOnce(new Error('queue down'));
+			await expect(forceReReview('run-1')).rejects.toThrow('queue down');
+			expect(grantReviewCapOverride).toHaveBeenCalledTimes(1);
+		});
+
+		describe('deduplication', () => {
+			// Reachable once the granted Review has *consumed* the grant: the allowance
+			// reads spent again, so the guards pass and the second call reports what it
+			// found rather than granting or scheduling twice.
+			it('reports an already-granted override without granting a second slot', async () => {
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(
+					spentLedger().map((slot) => ({
+						...slot,
+						capOverrideGrantedAt: new Date(),
+						capOverrideConsumedAt: new Date(),
+					})),
+				);
+				vi.mocked(grantReviewCapOverride).mockResolvedValue('already-granted');
+				vi.mocked(createAndPublishDispatch).mockResolvedValue(dispatchResult(false));
+
+				await expect(forceReReview('run-1')).resolves.toMatchObject({
+					continuation: 'review',
+					capOverride: 'already-granted',
+					dispatch: 'already-scheduled',
+				});
+				expect(grantReviewCapOverride).toHaveBeenCalledTimes(1);
+			});
+
+			it('always enqueues under the same deterministic key for a PR and current head', async () => {
+				await forceReReview('run-1');
+				await forceReReview('run-1');
+
+				const [first, second] = vi.mocked(createAndPublishDispatch).mock.calls;
+				expect(first[0].dedupKey).toBeDefined();
+				expect(second[0].dedupKey).toBe(first[0].dedupKey);
+			});
+
+			// The state a second click actually sees: the first force's grant is on the
+			// ledger and unconsumed, because the dispatch it bought died without ever
+			// reserving a slot. That is precisely when the chain walk has to run, so the
+			// ledger here carries the grant rather than the pristine `spentLedger()`.
+			it('chains a fresh dispatch past a dead prior attempt', async () => {
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(grantedLedger());
+				vi.mocked(grantReviewCapOverride).mockResolvedValue('already-granted');
+				vi.mocked(createAndPublishDispatch)
+					.mockResolvedValueOnce({
+						dispatch: { id: 'dispatch-dead', state: 'completed', outcome: 'no-trigger' },
+						created: false,
+					} as CreateDispatchResult)
+					.mockResolvedValueOnce(dispatchResult(true, 'pending', null));
+
+				const result = await forceReReview('run-1');
+
+				expect(createAndPublishDispatch).toHaveBeenCalledTimes(2);
+				const [first, second] = vi.mocked(createAndPublishDispatch).mock.calls;
+				expect(second[0].dedupKey).not.toBe(first[0].dedupKey);
+				expect(result).toMatchObject({
+					continuation: 'review',
+					capOverride: 'already-granted',
+					dispatch: 'retried',
+					previousAttemptOutcome: 'no-trigger',
+				});
+			});
+
+			// The grant this action writes is unconsumed until the Review it pays for
+			// reserves its slot, so an allowance-spent guard would turn away every click
+			// after the first — including the one above, which exists to chain past a
+			// dead attempt. The repeat click reports what it found instead.
+			it('reports what it found while its own granted override is still outstanding', async () => {
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(grantedLedger());
+				vi.mocked(grantReviewCapOverride).mockResolvedValue('already-granted');
+				vi.mocked(createAndPublishDispatch).mockResolvedValue(dispatchResult(false));
+
+				await expect(forceReReview('run-1')).resolves.toMatchObject({
+					continuation: 'review',
+					capOverride: 'already-granted',
+					dispatch: 'already-scheduled',
+				});
+				expect(createAndPublishDispatch).toHaveBeenCalledTimes(1);
+			});
+		});
+
+		// Every refusal is made before the first mutation — the module's stated
+		// invariant — so a refused force changes nothing at all.
+		describe('refusals', () => {
+			it('refuses before any read when Review is disabled for the project', async () => {
+				vi.mocked(getProjectByIdFromDb).mockResolvedValue(
+					// The config schema refuses Review off while Respond-to-review is on, so a
+					// project with Review disabled always has both off — and this branch is
+					// still gated on `review`, the phase it actually dispatches.
+					createMockProjectConfig({
+						pipeline: { review: { enabled: false }, respondToReview: { enabled: false } },
+					}),
+				);
+
+				await expect(forceReReview('run-1')).rejects.toMatchObject({
+					reason: 'review-disabled',
+				});
+				expect(getSubmittedReviewSlot).not.toHaveBeenCalled();
+			});
+
+			// The switch gating the *other* continuation has no say over this one.
+			it('is unaffected by a disabled Respond-to-review', async () => {
+				vi.mocked(getProjectByIdFromDb).mockResolvedValue(
+					createMockProjectConfig({
+						id: 'p1',
+						repo: 'SmartTechBrewery/swarm',
+						pipeline: { respondToReview: { enabled: false } },
+					}),
+				);
+
+				await expect(forceReReview('run-1')).resolves.toMatchObject({ dispatch: 'scheduled' });
+			});
+
+			// The branch this continuation reviews comes from the provider, with the
+			// current head — so a stored payload that no longer names one refuses the
+			// corrective continuation alone, not this one.
+			it('is unaffected by a stored payload that no longer names the PR branch', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeCapSpentApprovalRun({
+						jobPayload: {
+							...JOB_PAYLOAD,
+							event: { ...JOB_PAYLOAD.event, prBranch: undefined },
+						} as SwarmJob,
+					}),
+				);
+
+				await expect(forceReReview('run-1')).resolves.toMatchObject({
+					continuation: 'review',
+					dispatch: 'scheduled',
+				});
+				expect(vi.mocked(createAndPublishDispatch).mock.calls[0][0].jobPayload).toMatchObject({
+					type: 'scm',
+					event: { prBranch: 'issue-508' },
+				});
+			});
+
+			it('refuses when the ledger holds no submitted review for the reviewed head', async () => {
+				vi.mocked(getSubmittedReviewSlot).mockResolvedValue(undefined);
+
+				await expect(forceReReview('run-1')).rejects.toMatchObject({
+					reason: 'missing-review-record',
+				});
+			});
+
+			// `not-capped` keeps the two cases it is really for, and its message claims
+			// only what the ledger shows — never that a spent allowance is unspent.
+			it('refuses when the pull request still has review allowance left', async () => {
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(
+					submittedSlots(REVIEW_VERDICT_CAP - 1),
+				);
+
+				await expect(forceReReview('run-1')).rejects.toMatchObject({ reason: 'not-capped' });
+				// The ledger guard is the cheap one and runs first: no provider call either.
+				expect(getPullRequest).not.toHaveBeenCalled();
+			});
+
+			it("refuses when this run's verdict is not the pull request's latest", async () => {
+				vi.mocked(getSubmittedReviewSlot).mockResolvedValue({ ...approvingSlot, ordinal: 2 });
+
+				await expect(forceReReview('run-1')).rejects.toMatchObject({ reason: 'not-capped' });
+			});
+
+			it('refuses when the pull request is closed', async () => {
+				getPullRequest.mockResolvedValue({
+					number: 508,
+					headBranch: 'issue-508',
+					headSha: CURRENT_HEAD_SHA,
+					baseBranch: 'main',
+					baseSha: 'base',
+					mergeable: null,
+					authorLogin: 'someone',
+					state: 'closed',
+				});
+
+				await expect(forceReReview('run-1')).rejects.toMatchObject({
+					reason: 'pull-request-closed',
+				});
+			});
+
+			it("refuses when the head never moved, naming the run's own merge result", async () => {
+				getPullRequest.mockResolvedValue({
+					number: 508,
+					headBranch: 'issue-508',
+					headSha: HEAD_SHA,
+					baseBranch: 'main',
+					baseSha: 'base',
+					mergeable: true,
+					authorLogin: 'someone',
+					state: 'open',
+				});
+
+				await expect(forceReReview('run-1')).rejects.toMatchObject({
+					reason: 'head-unchanged',
+					message: expect.stringContaining('merge result'),
+				});
+			});
+
+			it('mutates nothing on any refusal', async () => {
+				const refusals: Array<() => void> = [
+					() =>
+						vi.mocked(getProjectByIdFromDb).mockResolvedValue(
+							createMockProjectConfig({
+								pipeline: { review: { enabled: false }, respondToReview: { enabled: false } },
+							}),
+						),
+					() => vi.mocked(getSubmittedReviewSlot).mockResolvedValue(undefined),
+					() =>
+						vi
+							.mocked(listActiveReviewSlotsForPullRequest)
+							.mockResolvedValue(submittedSlots(REVIEW_VERDICT_CAP - 1)),
+					() =>
+						getPullRequest.mockResolvedValue({
+							number: 508,
+							headBranch: 'issue-508',
+							headSha: HEAD_SHA,
+							baseBranch: 'main',
+							baseSha: 'base',
+							mergeable: true,
+							authorLogin: 'someone',
+							state: 'open',
+						}),
+				];
+				for (const arrange of refusals) {
+					arrange();
+					await expect(forceReReview('run-1')).rejects.toBeInstanceOf(ForceReReviewError);
+				}
+				expect(grantReviewCapOverride).not.toHaveBeenCalled();
+				expect(createAndPublishDispatch).not.toHaveBeenCalled();
+			});
+		});
+
+		// Issue #684 phase 2, for the new branch: the provider read is made against the
+		// project scoped to the *run's* repository, like every other value here.
+		it("reads the pull request through the run's own repository", async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(
+				makeCapSpentApprovalRun({ repository: 'SmartTechBrewery/second' }),
+			);
+			vi.mocked(getProjectByIdFromDb).mockImplementation(async (_id, repo) =>
+				createMockProjectConfig({ id: 'p1', repo: repo ?? 'SmartTechBrewery/swarm' }),
+			);
+
+			await forceReReview('run-1');
+
+			expect(getPullRequest).toHaveBeenCalledWith(
+				expect.objectContaining({ repo: 'SmartTechBrewery/second' }),
+				508,
+			);
+			expect(vi.mocked(createAndPublishDispatch).mock.calls[0][0].jobPayload).toMatchObject({
+				type: 'scm',
+				event: { repoFullName: 'SmartTechBrewery/second' },
+			});
+		});
 	});
 });

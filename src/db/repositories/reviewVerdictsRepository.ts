@@ -600,9 +600,36 @@ export function isCapReachingRequestChanges(
  * decides whether a review may proceed, and only it spends a grant.
  */
 export function isReviewAllowanceSpent(slots: readonly PullRequestReviewSlot[]): boolean {
-	const submitted = slots.filter((slot) => slot.state === 'submitted').length;
-	if (submitted < REVIEW_VERDICT_CAP) return false;
-	return !slots.some(
+	return hasSubmittedEveryPermittedVerdict(slots) && !hasOutstandingCapOverride(slots);
+}
+
+/**
+ * {@link isReviewAllowanceSpent}'s first half alone: every permitted verdict has
+ * actually been submitted, whatever an operator has since granted.
+ *
+ * Split out for the caller that *made* the grant (`src/dispatch/force-re-review.ts`,
+ * issue #1040). "Force re-review" writes the grant and then enqueues the work it
+ * pays for; a second click has to be able to reach that enqueue — the dispatch
+ * step is idempotent and chains past a dead prior attempt — so it must not be
+ * turned away by its own outstanding grant. What it needs to know is whether the
+ * cap really stopped this pull request, which is this predicate; whether an
+ * operator has already acted is the separate question
+ * {@link hasOutstandingCapOverride} answers.
+ */
+export function hasSubmittedEveryPermittedVerdict(
+	slots: readonly PullRequestReviewSlot[],
+): boolean {
+	return slots.filter((slot) => slot.state === 'submitted').length >= REVIEW_VERDICT_CAP;
+}
+
+/**
+ * Whether an operator's cap-override grant is recorded on this pull request and
+ * no reservation has spent it yet — {@link isReviewAllowanceSpent}'s second half,
+ * named so a reader can tell "the operator has already acted" apart from "the
+ * allowance still has room" instead of collapsing both into one `false`.
+ */
+export function hasOutstandingCapOverride(slots: readonly PullRequestReviewSlot[]): boolean {
+	return slots.some(
 		(slot) => slot.capOverrideGrantedAt !== null && slot.capOverrideConsumedAt === null,
 	);
 }
