@@ -20,7 +20,6 @@ import {
 import { useEffect, useRef, useState } from 'react';
 import { type LiveOutputEvent, LiveOutputViewer } from '@/components/runs/live-output-viewer.js';
 import { LogViewer } from '@/components/runs/log-viewer.js';
-import { MaintenanceRunBadge } from '@/components/runs/maintenance-run-badge.js';
 import { RunStatusBadge } from '@/components/runs/run-status-badge.js';
 import { buttonClass } from '@/components/ui/button.js';
 import { Modal, ModalFooter } from '@/components/ui/modal.js';
@@ -2080,7 +2079,6 @@ export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
 				<div className="flex flex-wrap items-center gap-2">
 					{/* The page states the same kind the list did (issue #974), beside — never
 					    instead of — the status, which is the other axis. */}
-					<MaintenanceRunBadge run={run} />
 					<RunStatusBadge
 						status={run.status as RunStatus}
 						timedOut={run.timedOut}

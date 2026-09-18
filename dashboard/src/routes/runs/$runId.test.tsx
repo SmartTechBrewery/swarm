@@ -610,15 +610,18 @@ describe('RunDetailHeader for a maintenance run (issue #974)', () => {
 		);
 	}
 
-	it('marks the header as maintenance, beside the status rather than instead of it', () => {
+	// The `Maintenance` pill is gone. The header already says the phase, the body says
+	// what an update in progress means, and the Target build field names the build — so
+	// the pill was a fourth way of saying this row is not pipeline work.
+	it('carries no maintenance pill, and leaves the status axis untouched', () => {
 		renderHeader(makeMaintenanceRun({ status: 'running' }));
 
-		expect(screen.getByTestId('run-maintenance-mark').textContent).toBe('Maintenance');
-		// The status axis is untouched: the badge still says what the run is doing.
+		expect(screen.queryByTestId('run-maintenance-mark')).toBeNull();
+		expect(screen.queryByText('Maintenance')).toBeNull();
 		expect(screen.getByText('Running')).toBeDefined();
 	});
 
-	it('leaves a pipeline run unmarked', () => {
+	it('leaves a pipeline run unmarked too', () => {
 		renderHeader(makeReviewRun({ status: 'running', phase: 'implementation' }));
 
 		expect(screen.queryByTestId('run-maintenance-mark')).toBeNull();
