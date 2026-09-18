@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 vi.mock('@/db/client.js', () => ({ getDb: vi.fn() }));
 
 import {
+	hasReviewInFlightAbove,
 	isLastPermittedVerdict,
 	isReviewAllowanceSpent,
 	type PullRequestReviewSlot,
@@ -93,5 +94,50 @@ describe('isLastPermittedVerdict', () => {
 	it('ignores a pending slot above the highest submitted one', () => {
 		const slots = [...spentSlots(), slot({ ordinal: REVIEW_VERDICT_CAP + 1, state: 'pending' })];
 		expect(isLastPermittedVerdict(slots, REVIEW_VERDICT_CAP)).toBe(true);
+	});
+});
+
+describe('hasReviewInFlightAbove', () => {
+	/**
+	 * The state an operator's grant leaves behind the moment it is redeemed: the
+	 * allowance reads spent, the grant is consumed, the last verdict is still this
+	 * run's — and a Review is already running on the extra slot it bought.
+	 */
+	function grantedFollowUpSlots(): PullRequestReviewSlot[] {
+		const slots = spentSlots();
+		slots[REVIEW_VERDICT_CAP - 1] = {
+			...slots[REVIEW_VERDICT_CAP - 1],
+			capOverrideGrantedAt: new Date(),
+			capOverrideConsumedAt: new Date(),
+		};
+		return [...slots, slot({ ordinal: REVIEW_VERDICT_CAP + 1, state: 'pending' })];
+	}
+
+	it('recognises the granted review a consumed override put in flight', () => {
+		expect(hasReviewInFlightAbove(grantedFollowUpSlots(), REVIEW_VERDICT_CAP)).toBe(true);
+	});
+
+	// The three clauses the run-detail read model ANDs together: without the third,
+	// a run an operator has already acted on still reports as the cap stop.
+	it('is what separates a redeemed grant from a genuine stop', () => {
+		const inFlight = grantedFollowUpSlots();
+		expect(isReviewAllowanceSpent(inFlight)).toBe(true);
+		expect(isLastPermittedVerdict(inFlight, REVIEW_VERDICT_CAP)).toBe(true);
+		expect(hasReviewInFlightAbove(inFlight, REVIEW_VERDICT_CAP)).toBe(true);
+	});
+
+	it('answers false on a capped pull request with nothing reserved', () => {
+		expect(hasReviewInFlightAbove(spentSlots(), REVIEW_VERDICT_CAP)).toBe(false);
+	});
+
+	// Only a *later* reservation can displace this verdict; an earlier pending slot
+	// is a relic the writer abandons, not a review that supersedes it.
+	it('ignores a pending slot at or below the ordinal asked about', () => {
+		const slots = [...spentSlots(), slot({ ordinal: REVIEW_VERDICT_CAP, state: 'pending' })];
+		expect(hasReviewInFlightAbove(slots, REVIEW_VERDICT_CAP)).toBe(false);
+	});
+
+	it('answers false for a run that was never ledgered', () => {
+		expect(hasReviewInFlightAbove(grantedFollowUpSlots(), null)).toBe(false);
 	});
 });

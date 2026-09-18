@@ -264,8 +264,12 @@ describe('CapSpentApprovalCallout (issue #1038)', () => {
 		expect(screen.queryByRole('button')).toBeNull();
 	});
 
+	// `reviewCapSpent: false` is the whole of "not stopped": the server resolves it
+	// from the ledger, so it covers a pull request with a slot still free *and* one
+	// whose granted follow-up Review is already in flight (issue #1038 review pass 1).
 	it.each([
 		['a pull request that still has allowance left', { reviewCapSpent: false }],
+		['a granted follow-up review already in flight', { reviewCapSpent: false }],
 		['a row the server resolved no ledger fact for', { reviewCapSpent: null }],
 		['an approval that merged', { reviewMergeOutcome: 'merged' }],
 		['a changes-requested verdict', { reviewVerdict: 'request-changes' }],

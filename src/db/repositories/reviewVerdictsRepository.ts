@@ -606,3 +606,32 @@ export function isLastPermittedVerdict(
 	const submitted = slots.filter((slot) => slot.state === 'submitted');
 	return submitted.length > 0 && Math.max(...submitted.map((slot) => slot.ordinal)) === ordinal;
 }
+
+/**
+ * Whether a reservation *above* `ordinal` is still pending — a Review already in
+ * flight that has simply not submitted its verdict yet.
+ *
+ * The counterpart to {@link isLastPermittedVerdict}, and deliberately a second
+ * question rather than a clause inside it: "which verdict is the latest" and "is
+ * another review already coming" are different facts, and only the second one can
+ * stop a spent allowance from meaning *stopped*. An operator's grant is spent by
+ * the very reservation it pays for ({@link reserveReviewVerdict}), so from the
+ * instant that granted Review takes its slot the ledger reads as a full
+ * allowance, no outstanding grant, and a pending ordinal above the last verdict —
+ * a reader that ignored the pending row would report the pull request as needing
+ * a person while SWARM is already working on it.
+ *
+ * A pending slot whose owning dispatch died is indistinguishable from a live one
+ * here, which is deliberate: {@link reserveReviewVerdict} permits one pending slot
+ * per pull request and abandons a relic in the same lock, so a relic can at worst
+ * withhold a reader's answer until the next reservation clears it — one callout
+ * fewer, never a fabricated one, which is the posture the readers here already
+ * take. Telling the two apart needs a dispatch read, which belongs to the writer.
+ */
+export function hasReviewInFlightAbove(
+	slots: readonly PullRequestReviewSlot[],
+	ordinal: number | null,
+): boolean {
+	if (ordinal === null) return false;
+	return slots.some((slot) => slot.state === 'pending' && slot.ordinal > ordinal);
+}

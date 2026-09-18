@@ -17,6 +17,7 @@ import {
 	listAllProjectsFromDb,
 } from '../../db/repositories/projectsRepository.js';
 import {
+	hasReviewInFlightAbove,
 	isLastPermittedVerdict,
 	isReviewAllowanceSpent,
 	listActiveReviewSlotsForPullRequest,
@@ -899,8 +900,14 @@ async function resolveRetryScheduled(run: { id: string; status: string }): Promi
 /**
  * Whether this Review run's verdict is the last one SWARM will produce for its
  * pull request unless an operator intervenes (issue #1038): the review-verdict
- * allowance is spent, no operator grant is outstanding, and this run holds the
- * highest submitted slot.
+ * allowance is spent, no operator grant is outstanding, this run holds the
+ * highest submitted slot, and no later reservation is already in flight.
+ *
+ * That last clause is what keeps the answer true *after* an operator acts. A grant
+ * is spent by the reservation it pays for, so the moment the granted Review takes
+ * its slot the ledger shows a spent allowance, no outstanding grant, and this run
+ * still holding the last submitted verdict — every earlier clause satisfied while
+ * SWARM is mid-review. Only the pending slot above it says otherwise.
  *
  * Resolved here rather than stored on the run, because the answer belongs to the
  * *pull request's* ledger and keeps changing after the run ends (a later grant, a
@@ -933,7 +940,11 @@ async function resolveReviewCapSpent(run: {
 			run.repository,
 			run.prNumber,
 		);
-		return isReviewAllowanceSpent(slots) && isLastPermittedVerdict(slots, run.reviewOrdinal);
+		return (
+			isReviewAllowanceSpent(slots) &&
+			isLastPermittedVerdict(slots, run.reviewOrdinal) &&
+			!hasReviewInFlightAbove(slots, run.reviewOrdinal)
+		);
 	} catch (error) {
 		logger.warn('runs.getById: review-ledger lookup failed; reporting no verdict', {
 			runId: run.id,

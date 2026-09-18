@@ -1853,6 +1853,28 @@ describe('runsRouter', () => {
 				});
 			});
 
+			// Issue #1038 review pass 1: a grant is spent by the reservation it pays for,
+			// so the ledger reads as a full allowance with no outstanding grant the moment
+			// the granted Review starts. The pending slot above this verdict is the only
+			// thing saying an operator has already acted.
+			it('is false while the review a consumed grant bought is still in flight', async () => {
+				const slots = spentSlots();
+				slots[REVIEW_VERDICT_CAP - 1] = {
+					...slots[REVIEW_VERDICT_CAP - 1],
+					capOverrideGrantedAt: new Date(),
+					capOverrideConsumedAt: new Date(),
+				};
+				slots.push(
+					slot({ ordinal: REVIEW_VERDICT_CAP + 1, state: 'pending', headSha: 'head-next' }),
+				);
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', ...REVIEW_RUN }));
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(slots);
+
+				await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+					reviewCapSpent: false,
+				});
+			});
+
 			it('is false for an earlier verdict on a capped pull request', async () => {
 				vi.mocked(getRunByIdFromDb).mockResolvedValue(
 					makeRun({ id: 'run-1', ...REVIEW_RUN, reviewOrdinal: 1 }),
