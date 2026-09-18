@@ -83,9 +83,9 @@ import type { ProjectConfig } from '../config/schema.js';
 import { hasActiveDispatchForPullRequest } from '../db/repositories/dispatchesRepository.js';
 import { listAllProjectRecordsFromDb } from '../db/repositories/projectsRepository.js';
 import {
+	isReviewAllowanceSpent,
 	listActiveReviewSlotsForPullRequest,
 	type PullRequestReviewSlot,
-	REVIEW_VERDICT_CAP,
 } from '../db/repositories/reviewVerdictsRepository.js';
 import { requireProjectSCMProvider } from '../integrations/scm/registry.js';
 import { describeError } from '../lib/errors.js';
@@ -147,11 +147,14 @@ export type LedgerRecoveryVerdict = 'recover' | 'reviewed-at-head' | 'review-in-
  * so the sweep can never reach a conclusion the reservation would contradict.
  * Pure, so it unit-tests without a database.
  *
- * Rule 3 mirrors issue #511 exactly — a granted, unconsumed cap override makes a
- * capped pull request recoverable again, which is what lets a forced
- * continuation whose follow-up Review died still be rescued. The grant is only
- * *observed* here; `reserveReviewVerdict` is the only thing that spends one, and
- * it does so inside its advisory lock.
+ * Rule 3 is `isReviewAllowanceSpent` — the writer's own cap arithmetic, called
+ * rather than copied (issue #1038), so the sweep's judgement cannot drift from
+ * `reserveReviewVerdict`'s as the module header requires. It mirrors issue #511
+ * exactly: a granted, unconsumed cap override makes a capped pull request
+ * recoverable again, which is what lets a forced continuation whose follow-up
+ * Review died still be rescued. The grant is only *observed* there;
+ * `reserveReviewVerdict` is the only thing that spends one, and it does so
+ * inside its advisory lock.
  */
 export function classifyReviewLedgerForRecovery(
 	slots: readonly PullRequestReviewSlot[],
@@ -161,14 +164,7 @@ export function classifyReviewLedgerForRecovery(
 	if (sameHead) return sameHead.state === 'submitted' ? 'reviewed-at-head' : 'review-in-flight';
 	if (slots.some((slot) => slot.state === 'pending')) return 'review-in-flight';
 
-	const submitted = slots.filter((slot) => slot.state === 'submitted').length;
-	if (submitted >= REVIEW_VERDICT_CAP) {
-		const grant = slots.some(
-			(slot) => slot.capOverrideGrantedAt !== null && slot.capOverrideConsumedAt === null,
-		);
-		if (!grant) return 'capped';
-	}
-	return 'recover';
+	return isReviewAllowanceSpent(slots) ? 'capped' : 'recover';
 }
 
 /** What one candidate's enqueue resolved to — the log line's vocabulary, and the unit tests'. */

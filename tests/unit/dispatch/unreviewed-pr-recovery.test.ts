@@ -36,12 +36,14 @@ const listActiveReviewSlotsForPullRequest = vi.fn<
 	(projectId: string, repository: string, prNumber: string) => Promise<PullRequestReviewSlot[]>
 >(async () => []);
 vi.mock('@/db/repositories/reviewVerdictsRepository.js', async (importOriginal) => {
-	// `REVIEW_VERDICT_CAP` is the real constant — the classifier's cap rule has to
-	// stay pinned to the ledger's own number, not to a copy that could drift.
+	// Only the ledger *read* is stubbed. `REVIEW_VERDICT_CAP` and the pure cap
+	// predicates (`isReviewAllowanceSpent`, issue #1038) stay real: the classifier's
+	// cap rule has to stay pinned to the ledger's own arithmetic, not to a copy that
+	// could drift — which is the whole point of calling the writer's predicate.
 	const actual =
 		await importOriginal<typeof import('@/db/repositories/reviewVerdictsRepository.js')>();
 	return {
-		REVIEW_VERDICT_CAP: actual.REVIEW_VERDICT_CAP,
+		...actual,
 		listActiveReviewSlotsForPullRequest: (
 			projectId: string,
 			repository: string,
@@ -186,6 +188,9 @@ describe('classifyReviewLedgerForRecovery', () => {
 			headSha: 'abc123',
 			capOverrideGrantedAt: null,
 			capOverrideConsumedAt: null,
+			// The sweep classifies on slot state alone; owner liveness is the run-detail
+			// read model's question (issue #1038).
+			dispatchActive: false,
 			...overrides,
 		};
 	}
@@ -385,7 +390,14 @@ describe('recoverUnreviewedPullRequests', () => {
 			['a review in flight at another head', 'pending' as const, 'older'],
 		])('%s', async (_label, state, headSha) => {
 			listActiveReviewSlotsForPullRequest.mockResolvedValue([
-				{ ordinal: 1, state, headSha, capOverrideGrantedAt: null, capOverrideConsumedAt: null },
+				{
+					ordinal: 1,
+					state,
+					headSha,
+					capOverrideGrantedAt: null,
+					capOverrideConsumedAt: null,
+					dispatchActive: false,
+				},
 			]);
 
 			await recoverUnreviewedPullRequests();

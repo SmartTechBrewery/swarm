@@ -5,6 +5,7 @@ import {
 	type ForceReReviewReport,
 	forceReReviewButtonLabel,
 	forceReReviewConfirmMessage,
+	isCapSpentApproval,
 } from './force-re-review.js';
 
 const CAPPED = {
@@ -12,6 +13,15 @@ const CAPPED = {
 	phase: 'review',
 	reviewVerdict: 'request-changes',
 	reviewAutomationOutcome: 'manual-intervention-required',
+};
+
+/** The other cap stop (issue #1038): an approval merge automation then refused. */
+const CAP_SPENT_APPROVAL = {
+	status: 'completed',
+	phase: 'review',
+	reviewVerdict: 'approve',
+	reviewMergeOutcome: 'not-eligible',
+	reviewCapSpent: true,
 };
 
 function report(overrides: Partial<ForceReReviewReport> = {}): ForceReReviewReport {
@@ -43,6 +53,37 @@ describe('canForceReReview (issue #511)', () => {
 		['an ordinary verdict the cap never stopped', { reviewAutomationOutcome: null }],
 	])('withholds the action for %s', (_label, overrides) => {
 		expect(canForceReReview({ ...CAPPED, ...overrides })).toBe(false);
+	});
+
+	// Criterion 3 of issue #1038: the `request-changes` cap stop's predicate answers
+	// exactly as it did, for both shapes — the new one included.
+	it('is unchanged by the approval cap stop it does not own (issue #1038)', () => {
+		expect(canForceReReview(CAPPED)).toBe(true);
+		expect(canForceReReview(CAP_SPENT_APPROVAL)).toBe(false);
+	});
+});
+
+describe('isCapSpentApproval (issue #1038)', () => {
+	it('recognises a spent-allowance approval merge automation refused', () => {
+		expect(isCapSpentApproval(CAP_SPENT_APPROVAL)).toBe(true);
+	});
+
+	it.each([
+		['a changes-requested verdict', { reviewVerdict: 'request-changes' }],
+		['an approval that merged', { reviewMergeOutcome: 'merged' }],
+		['an approval still waiting on its merge retry', { reviewMergeOutcome: 'not-ready' }],
+		['an approval that never attempted a merge', { reviewMergeOutcome: null }],
+		['a pull request that still has allowance left', { reviewCapSpent: false }],
+		['a row the server resolved no ledger fact for', { reviewCapSpent: undefined }],
+		['a run still in progress', { status: 'running' }],
+		['a non-Review phase', { phase: 'respond-to-review' }],
+	])('withholds the callout for %s', (_label, overrides) => {
+		expect(isCapSpentApproval({ ...CAP_SPENT_APPROVAL, ...overrides })).toBe(false);
+	});
+
+	// Mutually exclusive by verdict: the two callouts can never render together.
+	it('never fires for the request-changes cap stop', () => {
+		expect(isCapSpentApproval(CAPPED)).toBe(false);
 	});
 });
 

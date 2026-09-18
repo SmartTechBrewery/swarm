@@ -499,10 +499,11 @@ export async function getSubmittedReviewSlot(
  *
  * The projection deliberately mirrors exactly what {@link reserveReviewVerdict}
  * itself reads inside its advisory lock — the same-head slot, another head's
- * `pending` one, the `submitted` count, and the unconsumed cap-override grant —
- * so the sweep's judgement cannot drift from the writer's. `abandoned` slots are
- * excluded here for the same reason they are filtered there: they free their
- * ordinal without costing the PR a slot.
+ * `pending` one *and whether the dispatch owning it is still due to run*, the
+ * `submitted` count, and the unconsumed cap-override grant — so the sweep's
+ * judgement cannot drift from the writer's. `abandoned` slots are excluded here
+ * for the same reason they are filtered there: they free their ordinal without
+ * costing the PR a slot.
  *
  * **A pre-check, never a substitute for the reservation.** Only
  * {@link reserveReviewVerdict} decides whether a review may proceed, and only it
@@ -521,6 +522,15 @@ export interface PullRequestReviewSlot {
 	headSha: string;
 	capOverrideGrantedAt: Date | null;
 	capOverrideConsumedAt: Date | null;
+	/**
+	 * Whether the dispatch that took this slot is still due to run — the reader's
+	 * copy of the writer's own `isDispatchActive` question (issue #857), resolved
+	 * in the same query so a `pending` row can be told apart from the relic of a
+	 * dispatch that settled terminally without submitting. Always `false` for a
+	 * `submitted` slot whose owner has since finished, so only a `pending` row's
+	 * value carries meaning.
+	 */
+	dispatchActive: boolean;
 }
 
 export async function listActiveReviewSlotsForPullRequest(
@@ -535,8 +545,15 @@ export async function listActiveReviewSlotsForPullRequest(
 			headSha: reviewVerdicts.headSha,
 			capOverrideGrantedAt: reviewVerdicts.capOverrideGrantedAt,
 			capOverrideConsumedAt: reviewVerdicts.capOverrideConsumedAt,
+			// `coalesce`, because the left join leaves the state null for a slot whose
+			// owner is gone or was never recorded — the answer `isDispatchActive` gives
+			// a null owner too, so reader and writer agree on that case as well as on a
+			// terminal one. The join is on the dispatch's primary key, so this stays the
+			// one indexed read it was.
+			dispatchActive: sql<boolean>`coalesce(${inArray(dispatches.state, [...ACTIVE_DISPATCH_STATES])}, false)`,
 		})
 		.from(reviewVerdicts)
+		.leftJoin(dispatches, eq(reviewVerdicts.dispatchId, dispatches.id))
 		.where(
 			and(
 				eq(reviewVerdicts.projectId, projectId),
@@ -567,4 +584,78 @@ export function isCapReachingRequestChanges(
 	verdict: string | null | undefined,
 ): boolean {
 	return ordinal !== undefined && ordinal >= REVIEW_VERDICT_CAP && verdict === 'request-changes';
+}
+
+/**
+ * Whether this pull request has spent every permitted verdict and holds no
+ * unconsumed operator grant — {@link reserveReviewVerdict}'s own cap arithmetic,
+ * as a pure predicate, so a reader can reach the writer's conclusion without
+ * taking the advisory lock.
+ *
+ * `abandoned` slots must already be excluded by the caller
+ * ({@link listActiveReviewSlotsForPullRequest} does), for the reason the writer
+ * excludes them: an abandoned row never counted toward the cap.
+ *
+ * A *reader's* answer, never a decision: only {@link reserveReviewVerdict}
+ * decides whether a review may proceed, and only it spends a grant.
+ */
+export function isReviewAllowanceSpent(slots: readonly PullRequestReviewSlot[]): boolean {
+	const submitted = slots.filter((slot) => slot.state === 'submitted').length;
+	if (submitted < REVIEW_VERDICT_CAP) return false;
+	return !slots.some(
+		(slot) => slot.capOverrideGrantedAt !== null && slot.capOverrideConsumedAt === null,
+	);
+}
+
+/**
+ * Whether `ordinal` is the highest *submitted* slot — i.e. the verdict the run
+ * asking carried is the pull request's latest, not an earlier one an operator
+ * happens to be looking at.
+ *
+ * Pending slots are ignored: a reservation that has not submitted anything is
+ * not a verdict, so it cannot displace the last one that is.
+ */
+export function isLastPermittedVerdict(
+	slots: readonly PullRequestReviewSlot[],
+	ordinal: number | null,
+): boolean {
+	if (ordinal === null) return false;
+	const submitted = slots.filter((slot) => slot.state === 'submitted');
+	return submitted.length > 0 && Math.max(...submitted.map((slot) => slot.ordinal)) === ordinal;
+}
+
+/**
+ * Whether a reservation *above* `ordinal` is still pending **and still owned by a
+ * dispatch that is due to run** — a Review already in flight that has simply not
+ * submitted its verdict yet.
+ *
+ * The counterpart to {@link isLastPermittedVerdict}, and deliberately a second
+ * question rather than a clause inside it: "which verdict is the latest" and "is
+ * another review already coming" are different facts, and only the second one can
+ * stop a spent allowance from meaning *stopped*. An operator's grant is spent by
+ * the very reservation it pays for ({@link reserveReviewVerdict}), so from the
+ * instant that granted Review takes its slot the ledger reads as a full
+ * allowance, no outstanding grant, and a pending ordinal above the last verdict —
+ * a reader that ignored the pending row would report the pull request as needing
+ * a person while SWARM is already working on it.
+ *
+ * The liveness half is what keeps that suppression honest in the other direction.
+ * A `pending` row whose owning dispatch settled terminally without submitting — a
+ * crash, a missed hand-back (issue #857) — is a relic, not a continuation, and
+ * {@link reserveReviewVerdict} only clears it when a *next* reservation is
+ * attempted, which a capped pull request will never make on its own. Treating
+ * that relic as a review in flight would withhold the one indication that the
+ * pull request is stopped and stranded, indefinitely; so the slot carries its
+ * owner's liveness ({@link PullRequestReviewSlot.dispatchActive}), resolved by
+ * {@link listActiveReviewSlotsForPullRequest} in the same read, and only a live
+ * owner counts as in flight.
+ */
+export function hasReviewInFlightAbove(
+	slots: readonly PullRequestReviewSlot[],
+	ordinal: number | null,
+): boolean {
+	if (ordinal === null) return false;
+	return slots.some(
+		(slot) => slot.state === 'pending' && slot.ordinal > ordinal && slot.dispatchActive,
+	);
 }

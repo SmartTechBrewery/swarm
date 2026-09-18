@@ -28,6 +28,7 @@ import {
 	describeForceReReviewResult,
 	forceReReviewButtonLabel,
 	forceReReviewConfirmMessage,
+	isCapSpentApproval,
 } from '@/lib/force-re-review.js';
 import { formatDuration, formatPhase, formatTimeUntil, formatTokenCount } from '@/lib/format.js';
 import { describePreservedWorker, preservedWorkerLabel } from '@/lib/preserved-worker.js';
@@ -1657,6 +1658,56 @@ export function ReviewCapCallout({ run, project }: ReviewCapCalloutProps) {
 	);
 }
 
+/**
+ * Run-detail warning for the review-cap stop that leaves no run behind (issue
+ * #1038): a completed Review run that **approved**, whose approval merge
+ * automation then refused, on a pull request whose review allowance is spent.
+ * Nothing will dispatch a further review for it on its own — the `pr-review`
+ * trigger's cap gate skips with a warn log and creates no run — so without this
+ * the operator sees a merge refusal and no sign that nothing will ever fix it.
+ *
+ * Its sibling {@link ReviewCapCallout} covers the `request-changes` loop (issue
+ * #242) and is unchanged; the two never render together, because their verdicts
+ * are mutually exclusive.
+ *
+ * The copy names no cap value, for the reason {@link ReviewCapCallout}'s does
+ * not: `REVIEW_VERDICT_CAP` lives once, in a DB-bound module this bundle cannot
+ * import. It also names no *cause* for the refusal — `not-eligible` has five,
+ * and the merge callout below carries the provider's own message. No action
+ * button: the operator lever is issue #1038's phase 2.
+ */
+export function CapSpentApprovalCallout({ run }: { run: RunRow }) {
+	if (!isCapSpentApproval(run)) return null;
+
+	return (
+		<div className="p-4 bg-red-950/20 border border-red-900/30 rounded flex items-start gap-3">
+			<AlertTriangle className="h-5 w-5 text-red-400 shrink-0 mt-0.5" />
+			<div>
+				<h3 className="text-xs font-semibold text-red-200">Manual action required</h3>
+				<p className="text-xs text-red-400/80 mt-1">
+					This approval was the last review verdict SWARM's review safety cap allows for this pull
+					request
+					{run.reviewOrdinal ? ` (review ${run.reviewOrdinal} of this PR)` : ''}, and the automatic
+					merge did not go through — see the merge result below for the provider's own reason. SWARM
+					will not dispatch another review for this pull request on its own, so it stays here until
+					a person acts.
+				</p>
+				{run.repository && run.prNumber && (
+					<a
+						href={`https://github.com/${run.repository}/pull/${run.prNumber}`}
+						target="_blank"
+						rel="noopener noreferrer"
+						className="inline-flex items-center gap-1 mt-2 text-red-300 hover:text-red-200 font-mono hover:underline"
+					>
+						View PR #{run.prNumber}
+						<ExternalLink className="h-3 w-3" />
+					</a>
+				)}
+			</div>
+		</div>
+	);
+}
+
 /** Human-readable heading for each terminal (non-merged, non-waiting) merge-automation outcome. */
 const MERGE_TERMINAL_LABELS: Record<string, string> = {
 	'not-eligible': 'No longer eligible for automatic merge',
@@ -2110,6 +2161,9 @@ export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
 			<CheckpointPanel run={run} />
 			<RecoveryCallout run={run} />
 			<ReviewCapCallout run={run} project={project} />
+			{/* Above the merge callout on purpose (issue #1038): the provider's own
+			    refusal message reads as the detail behind this one. */}
+			<CapSpentApprovalCallout run={run} />
 			<ReviewMergeCallout run={run} />
 		</div>
 	);

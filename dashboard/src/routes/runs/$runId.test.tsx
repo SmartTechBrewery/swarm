@@ -40,6 +40,7 @@ vi.mock('@tanstack/react-router', async (importOriginal) => {
 
 import { trpcClient } from '@/lib/trpc.js';
 import {
+	CapSpentApprovalCallout,
 	CheckpointedCallout,
 	CheckpointPanel,
 	FailureDiagnosisCallout,
@@ -209,6 +210,123 @@ describe('ReviewCapCallout (issue #242)', () => {
 		const { container } = render(<ReviewCapCallout run={makeReviewRun({ status: 'running' })} />);
 
 		expect(container.firstChild).toBeNull();
+	});
+});
+
+/**
+ * The cap stop that leaves no run behind (issue #1038). Its whole job is to exist
+ * on the page: without it the operator sees a merge refusal and nothing saying
+ * that no further review will ever be dispatched for the pull request.
+ */
+describe('CapSpentApprovalCallout (issue #1038)', () => {
+	/** A completed approving Review whose merge was refused on a spent allowance. */
+	function makeCapSpentApprovalRun(overrides: Partial<RunRow> = {}): RunRow {
+		return makeReviewRun({
+			reviewVerdict: 'approve',
+			reviewOrdinal: 3,
+			reviewAutomationOutcome: null,
+			reviewMergeOutcome: 'not-eligible',
+			reviewMergeMessage: 'pull request head changed since the reviewed commit',
+			reviewCapSpent: true,
+			...overrides,
+		});
+	}
+
+	it('names the spent allowance, the refused merge, and the consequence', () => {
+		render(<CapSpentApprovalCallout run={makeCapSpentApprovalRun()} />);
+
+		expect(screen.getByRole('heading', { name: 'Manual action required' })).toBeDefined();
+		expect(screen.getByText(/last review verdict SWARM's review safety cap allows/i)).toBeDefined();
+		expect(screen.getByText(/review 3 of this PR/i)).toBeDefined();
+		expect(screen.getByText(/will not dispatch another review/i)).toBeDefined();
+	});
+
+	// The copy must claim only what the row proves: `not-eligible` has five causes,
+	// and naming one would mean matching a provider's own message text.
+	it("claims no cause of its own and points at the merge result's", () => {
+		render(<CapSpentApprovalCallout run={makeCapSpentApprovalRun()} />);
+
+		expect(screen.getByText(/see the merge result below/i)).toBeDefined();
+		expect(screen.queryByText(/head changed/i)).toBeNull();
+	});
+
+	it("links to the PR in the run's own repository", () => {
+		render(<CapSpentApprovalCallout run={makeCapSpentApprovalRun({ repository: 'acme/api' })} />);
+
+		const link = screen.getByRole('link', { name: /view pr #42/i }) as HTMLAnchorElement;
+		expect(link.href).toBe('https://github.com/acme/api/pull/42');
+	});
+
+	// Issue #1038 review pass 2: `reviewCapSpent: true` is equally the server's
+	// answer for a capped pull request whose granted follow-up Review died before
+	// submitting — a reservation nothing owns is not a continuation — so the run
+	// detail goes back to saying a person is needed. One boolean, so this asserts
+	// the callout is on the page rather than any second distinction the component
+	// cannot see.
+	it('renders again once a granted follow-up review has died without submitting', () => {
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		render(
+			<QueryClientProvider client={queryClient}>
+				<RunDetailHeader run={makeCapSpentApprovalRun({ reviewCapSpent: true })} project={null} />
+			</QueryClientProvider>,
+		);
+
+		expect(screen.getByRole('heading', { name: 'Manual action required' })).toBeDefined();
+		expect(screen.getByText(/will not dispatch another review/i)).toBeDefined();
+	});
+
+	// Phase 2's lever, deliberately absent here.
+	it('offers no action button in this phase', () => {
+		render(<CapSpentApprovalCallout run={makeCapSpentApprovalRun()} />);
+
+		expect(screen.queryByRole('button')).toBeNull();
+	});
+
+	// `reviewCapSpent: false` is the whole of "not stopped": the server resolves it
+	// from the ledger, so it covers a pull request with a slot still free *and* one
+	// whose granted follow-up Review is already in flight on a dispatch that is
+	// still due to run (issue #1038 review passes 1–2).
+	it.each([
+		['a pull request that still has allowance left', { reviewCapSpent: false }],
+		['a granted follow-up review in flight on a live dispatch', { reviewCapSpent: false }],
+		['a row the server resolved no ledger fact for', { reviewCapSpent: null }],
+		['an approval that merged', { reviewMergeOutcome: 'merged' }],
+		['a changes-requested verdict', { reviewVerdict: 'request-changes' }],
+		['a run still in progress', { status: 'running' }],
+	])('renders nothing for %s', (_label, overrides) => {
+		const { container } = render(
+			<CapSpentApprovalCallout run={makeCapSpentApprovalRun(overrides)} />,
+		);
+
+		expect(container.firstChild).toBeNull();
+	});
+
+	it('is wired into the run detail header, beside the merge result', () => {
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		render(
+			<QueryClientProvider client={queryClient}>
+				<RunDetailHeader run={makeCapSpentApprovalRun()} project={null} />
+			</QueryClientProvider>,
+		);
+
+		expect(screen.getByRole('heading', { name: 'Manual action required' })).toBeDefined();
+		expect(
+			screen.getByRole('heading', { name: /no longer eligible for automatic merge/i }),
+		).toBeDefined();
+	});
+
+	// The two cap callouts are mutually exclusive by verdict, so a capped
+	// `request-changes` run must still show exactly one "Manual action required".
+	it('does not double up with the request-changes cap callout', () => {
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		render(
+			<QueryClientProvider client={queryClient}>
+				<RunDetailHeader run={makeReviewRun({ reviewCapSpent: true })} project={null} />
+			</QueryClientProvider>,
+		);
+
+		expect(screen.getAllByRole('heading', { name: 'Manual action required' })).toHaveLength(1);
+		expect(screen.getByRole('button', { name: /force re-review/i })).toBeDefined();
 	});
 });
 

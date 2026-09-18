@@ -505,6 +505,16 @@ export interface RunRow {
 	reviewMergeOutcome: string | null;
 	/** Human-readable detail for `reviewMergeOutcome`; null alongside it. */
 	reviewMergeMessage: string | null;
+	/**
+	 * Whether this Review run's verdict is the last one SWARM will produce for its
+	 * pull request without operator action (issue #1038) — the review-verdict
+	 * allowance is spent, no operator grant is outstanding, and this run holds the
+	 * highest submitted slot. Resolved server-side (`runs.getById`) because the
+	 * ledger and `REVIEW_VERDICT_CAP` live in a DB-bound module this bundle cannot
+	 * import. Null for every run the question does not apply to, and absent on the
+	 * list read model, which resolves no ledger read per row.
+	 */
+	reviewCapSpent?: boolean | null;
 	exitCode: number | null;
 	timedOut: boolean;
 	error: string | null;
