@@ -23,7 +23,10 @@ vi.mock('@/pipeline/merge-resolution.js', () => ({
 
 import type { AgentCliResult, RunAgentCliOptions } from '@/harness/agent-cli.js';
 import { AgentRunError } from '@/harness/agent-failure.js';
-import { buildBaseAdvancedRemergePrompt } from '@/pipeline/prompts/resolve-conflicts.js';
+import {
+	buildBaseAdvancedRemergePrompt,
+	buildConflictHandoffRepairPrompt,
+} from '@/pipeline/prompts/resolve-conflicts.js';
 import {
 	buildResolveConflictsPrompt,
 	runResolveConflictsPhase,
@@ -457,6 +460,210 @@ describe('runResolveConflictsPhase — verification outcomes (issue #924)', () =
 	});
 });
 
+/**
+ * Issue #1037. The hand-off's own validation had no repair path, so a merge that
+ * was already resolved, staged and (per its own verification) tested was
+ * discarded over the JSON describing it — the one failure class #924 left
+ * unaddressed. The fixtures here are invalid for reasons the schema refinement
+ * cannot rescue, which is what the repair pass is for.
+ */
+describe('runResolveConflictsPhase — an invalid hand-off (issue #1037)', () => {
+	/** Prose in `outcome`, which the enum refuses and no schema refinement fixes. */
+	const proseOutcome = [
+		{
+			command: 'npm test',
+			outcome: 'passed: reproduced the identical 4 sessions.test.ts failures on the unmerged head',
+		},
+	];
+
+	/** The hand-off a repair pass is expected to leave behind. */
+	function writeValidHandoff(worktreePath: string): void {
+		writeFileSync(
+			join(worktreePath, HANDOFF_FILENAMES.resolveConflicts),
+			JSON.stringify({
+				status: 'resolved',
+				body: 'Merged main; resolved every conflict.',
+				verification: [
+					{
+						command: 'npm test',
+						outcome: 'pre-existing-failure',
+						detail: 'the identical 4 sessions.test.ts failures reproduce on the unmerged head',
+					},
+				],
+			}),
+		);
+	}
+
+	it('runs one repair pass and delivers once the repair fixes the hand-off', async () => {
+		const worktreePath = makeWorktree(proseOutcome);
+		writeCleanMigrations(worktreePath, ['0000_first', '0001_second']);
+		const deps = makeDeps(worktreePath);
+		deps.runAgent.mockImplementationOnce(async () => agentResult({ sessionId: 'session-1' }));
+		deps.runAgent.mockImplementationOnce(async () => {
+			writeValidHandoff(worktreePath);
+			return agentResult({ sessionId: 'session-1' });
+		});
+
+		const { outcome } = await runResolveConflictsPhase(deps);
+
+		expect(outcome.status).toBe('resolved');
+		expect(deps.runAgent).toHaveBeenCalledTimes(2);
+		// The repair pass resumes the session that wrote the file it is repairing.
+		const repairCall = deps.runAgent.mock.calls[1]?.[0];
+		expect(repairCall).toMatchObject({ resumeSessionId: 'session-1' });
+		expect(repairCall?.args?.[0]).toContain("failed SWARM's validation");
+		expect(repairCall?.args?.[0]).toContain(HANDOFF_FILENAMES.resolveConflicts);
+		// The validator's own complaint is what the pass is handed.
+		expect(repairCall?.args?.[0]).toContain('"invalid_enum_value"');
+		expect(commitPreparedTree).toHaveBeenCalledTimes(1);
+		expect(deps.delivery.pushBranch).toHaveBeenCalledTimes(1);
+		expect(deps.delivery.postComment).toHaveBeenCalledTimes(1);
+	});
+
+	// The issue's own incident shape, now that phase 1 reads a blank `detail` as an
+	// omitted one: the complaint the pass is handed names the command and the
+	// outcome rather than a raw `too_small` on an array index.
+	it("hands the pass the refinement's message for a blank detail", async () => {
+		const worktreePath = makeWorktree([
+			{ command: 'npm run build', outcome: 'failed', detail: '' },
+		]);
+		writeCleanMigrations(worktreePath, ['0000_first', '0001_second']);
+		const deps = makeDeps(worktreePath);
+		deps.runAgent.mockImplementationOnce(async () => agentResult({ sessionId: 'session-1' }));
+		deps.runAgent.mockImplementationOnce(async () => {
+			writeValidHandoff(worktreePath);
+			return agentResult({ sessionId: 'session-1' });
+		});
+
+		const { outcome } = await runResolveConflictsPhase(deps);
+
+		expect(outcome.status).toBe('resolved');
+		expect(deps.runAgent.mock.calls[1]?.[0]?.args?.[0]).toContain(
+			"'npm run build' is failed, so detail is required",
+		);
+	});
+
+	it('fails with the original validation error leading when the repair does not fix it', async () => {
+		const worktreePath = makeWorktree(proseOutcome);
+		writeCleanMigrations(worktreePath, ['0000_first', '0001_second']);
+		const deps = makeDeps(worktreePath);
+
+		const error = await runResolveConflictsPhase(deps).then(
+			() => undefined,
+			(err: unknown) => err,
+		);
+
+		expect((error as Error).message).toMatch(/^Invalid hand-off resolve_conflicts_handoff\.json: /);
+		expect((error as Error).message).toContain('still invalid');
+		expect(deps.runAgent).toHaveBeenCalledTimes(2);
+		expect(assertRemoteHead).not.toHaveBeenCalled();
+		expect(commitPreparedTree).not.toHaveBeenCalled();
+		expect(deps.delivery.pushBranch).not.toHaveBeenCalled();
+		expect(deps.delivery.postComment).not.toHaveBeenCalled();
+	});
+
+	it('still fails cleanly when the repair pass itself cannot run', async () => {
+		const worktreePath = makeWorktree(proseOutcome);
+		writeCleanMigrations(worktreePath, ['0000_first', '0001_second']);
+		const deps = makeDeps(worktreePath);
+		deps.runAgent.mockImplementationOnce(async () => agentResult());
+		deps.runAgent.mockImplementationOnce(async () => {
+			throw new Error('agent CLI crashed');
+		});
+
+		const error = await runResolveConflictsPhase(deps).then(
+			() => undefined,
+			(err: unknown) => err,
+		);
+
+		expect((error as Error).message).toMatch(/^Invalid hand-off resolve_conflicts_handoff\.json: /);
+		expect((error as Error).message).toContain('the repair pass never ran');
+		expect((error as Error).message).toContain('agent CLI crashed');
+		expect(deps.runAgent).toHaveBeenCalledTimes(2);
+		expect(commitPreparedTree).not.toHaveBeenCalled();
+	});
+
+	// The same rule as the migration-journal pass's (issue #865): an assigned id
+	// names a session `codex exec resume` never created, so the pass runs fresh —
+	// and a first turn has to carry the phase guard itself.
+	it('runs the repair pass fresh on a self-minting CLI whose merge reported no session id', async () => {
+		const worktreePath = makeWorktree(proseOutcome);
+		writeCleanMigrations(worktreePath, ['0000_first', '0001_second']);
+		const deps = makeDeps(worktreePath);
+		deps.runAgent.mockImplementationOnce(async () => agentResult({ cli: 'codex' }));
+		deps.runAgent.mockImplementationOnce(async () => {
+			writeValidHandoff(worktreePath);
+			return agentResult({ cli: 'codex' });
+		});
+
+		const { outcome } = await runResolveConflictsPhase({
+			...deps,
+			cli: 'codex',
+			sessionId: 'assigned-run-id',
+		});
+
+		expect(outcome.status).toBe('resolved');
+		const repairCall = deps.runAgent.mock.calls[1]?.[0];
+		expect(repairCall).toBeDefined();
+		expect('resumeSessionId' in (repairCall as object)).toBe(true);
+		expect(repairCall?.resumeSessionId).toBeUndefined();
+		expect(repairCall?.args?.[0]).toContain(
+			'You are a SWARM pipeline agent assigned to exactly one phase',
+		);
+	});
+
+	// `readHandoff` throws for a missing file as well as an invalid one, and the
+	// repair pass wraps the whole read — so an agent that resolved the merge and
+	// never wrote the hand-off gets the same one chance.
+	it('repairs a hand-off the agent never wrote at all', async () => {
+		const worktreePath = mkdtempSync(join(tmpdir(), 'swarm-resolve-conflicts-missing-'));
+		roots.push(worktreePath);
+		const deps = makeDeps(worktreePath);
+		deps.runAgent.mockImplementationOnce(async () => agentResult({ sessionId: 'session-1' }));
+		deps.runAgent.mockImplementationOnce(async () => {
+			writeValidHandoff(worktreePath);
+			return agentResult({ sessionId: 'session-1' });
+		});
+
+		const { outcome } = await runResolveConflictsPhase(deps);
+
+		expect(outcome.status).toBe('resolved');
+		expect(deps.runAgent).toHaveBeenCalledTimes(2);
+		expect(deps.runAgent.mock.calls[1]?.[0]?.args?.[0]).toContain(
+			'Agent did not write required hand-off',
+		);
+		expect(deps.delivery.pushBranch).toHaveBeenCalledTimes(1);
+	});
+
+	// The hand-off the migration repair pass leaves is a second file, so it gets
+	// its own chance rather than discarding the merge that pass just fixed.
+	it('repairs the hand-off a migration repair pass mis-shaped', async () => {
+		const worktreePath = makeWorktree();
+		writeCleanMigrations(worktreePath, ['0000_first', '0001_second']);
+		corruptMigrationsWithPhantomEntry(worktreePath);
+		const deps = makeDeps(worktreePath);
+		deps.runAgent.mockImplementationOnce(async () => agentResult({ sessionId: 'session-1' }));
+		deps.runAgent.mockImplementationOnce(async () => {
+			repairPhantomEntry(worktreePath);
+			rewriteHandoff(worktreePath, { verification: proseOutcome });
+			return agentResult({ sessionId: 'session-1' });
+		});
+		deps.runAgent.mockImplementationOnce(async () => {
+			writeValidHandoff(worktreePath);
+			return agentResult({ sessionId: 'session-1' });
+		});
+
+		const { outcome } = await runResolveConflictsPhase(deps);
+
+		expect(outcome.status).toBe('resolved');
+		expect(deps.runAgent).toHaveBeenCalledTimes(3);
+		expect(deps.runAgent.mock.calls[2]?.[0]?.logContext).toMatchObject({
+			phase: 'resolve-conflicts-handoff-repair',
+		});
+		expect(commitPreparedTree).toHaveBeenCalledTimes(1);
+	});
+});
+
 describe('runResolveConflictsPhase — a CLI that timed itself out (issue #1000)', () => {
 	// The live incident, on the phase it was observed on: agy caps its own print
 	// mode, writes its notice on stderr, and exits **0**. The exit code alone read
@@ -686,5 +893,37 @@ describe('buildBaseAdvancedRemergePrompt (issue #1001)', () => {
 
 	it.each(CONFLICT_VERIFICATION_OUTCOMES)('names `%s` as an outcome the agent may report', (o) => {
 		expect(prompt).toContain(`\`${o}\``);
+	});
+});
+
+/**
+ * The hand-off repair pass (issue #1037). It runs against a merge that is
+ * already resolved, staged and verified, so its whole job is the JSON — which is
+ * why it must restate the same contract as the two merge prompts without
+ * inviting a re-merge or a second run of the suite.
+ */
+describe('buildConflictHandoffRepairPrompt (issue #1037)', () => {
+	const complaint =
+		'Invalid hand-off resolve_conflicts_handoff.json: [{"code":"invalid_enum_value","path":["verification",0,"outcome"]}]';
+	const prompt = buildConflictHandoffRepairPrompt(complaint);
+
+	it("carries the validator's own complaint, the file, and the phase guard", () => {
+		expect(prompt).toContain(complaint);
+		expect(prompt).toContain(HANDOFF_FILENAMES.resolveConflicts);
+		expect(prompt).toContain('You are a SWARM pipeline agent assigned to exactly one phase');
+		// A fresh session may never have written the file, so the read is conditional.
+		expect(prompt).toContain(`Read "${HANDOFF_FILENAMES.resolveConflicts}" first if it exists`);
+	});
+
+	it.each(CONFLICT_VERIFICATION_OUTCOMES)('names `%s` as an outcome the agent may report', (o) => {
+		expect(prompt).toContain(`\`${o}\``);
+	});
+
+	it('states the no-mutation floor and asks for no re-merge or re-run', () => {
+		expect(prompt).toContain('do not commit, do not push');
+		expect(prompt).toContain('perform any GitHub mutation');
+		expect(prompt).toContain('a formatting repair, not a re-merge');
+		// `DELIVERY_FLOOR`'s opening is exactly what this pass must not be handed.
+		expect(prompt).not.toContain('Run the relevant lint, type-check, and tests');
 	});
 });

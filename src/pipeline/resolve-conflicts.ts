@@ -38,6 +38,7 @@ import { graftEnvironment } from '../worktree/graft.js';
 import { settleMergeResolution } from './merge-resolution.js';
 import {
 	buildBaseAdvancedRemergePrompt,
+	buildConflictHandoffRepairPrompt,
 	buildMigrationJournalRepairPrompt,
 	buildResolveConflictsPrompt,
 } from './prompts/resolve-conflicts.js';
@@ -300,6 +301,92 @@ function mergeCommitSubject(baseBranch: string, prBranch: string): string {
 }
 
 /**
+ * Read the hand-off this pass left, giving a file that fails
+ * `ConflictHandoffSchema` **one** repair pass with the validator's own complaint
+ * before the phase gives up on it (issue #1037) — the same shape
+ * {@link guardMigrationJournal} above and `readReviewSubmission`
+ * (`src/pipeline/review.ts`) already have, for the same reason. The agent never
+ * sees the complaint otherwise: `readHandoff` throws, the queue retries the job,
+ * and the whole merge is resolved again from scratch — so a mis-shaped JSON file
+ * discards a merge that is already resolved, staged and, by its own
+ * verification, tested.
+ *
+ * A pass that exits non-zero or cannot be started is logged and **not**
+ * rethrown, as the migration-journal guard's is: it may still have written the
+ * file before it died, so the re-read always happens, and what it did is carried
+ * into the failure message instead.
+ *
+ * A still-invalid hand-off fails with the original validator message as the
+ * **head** of the composed error — it names the actual defect, which is what an
+ * operator reads first — carrying the original error on `cause`
+ * (`repairFailureError`'s rule). Deliberately a plain `Error`, not an
+ * `UnretryableDeliveryError`: a fresh attempt re-runs the agent and can
+ * genuinely produce a valid hand-off, the same reasoning
+ * {@link assertMergeVerified} states.
+ */
+async function readConflictHandoff(ctx: MergePassContext): Promise<ConflictHandoff> {
+	const read = () =>
+		readHandoff(ctx.worktreePath, RESOLVE_CONFLICTS_OUTCOME_FILENAME, ConflictHandoffSchema);
+	const context = { taskId: ctx.taskId, prNumber: ctx.prNumber, headSha: ctx.headSha };
+	try {
+		return read();
+	} catch (error) {
+		const validationError = describeError(error);
+		logger.warn('resolve-conflicts: hand-off failed validation — running one repair pass', {
+			...context,
+			reason: validationError,
+			resumingSession: ctx.resumeSessionId !== undefined,
+		});
+		let repairNote = ctx.resumeSessionId
+			? "the repair pass re-asked the agent in the merge's own session and the hand-off was still invalid"
+			: 'the repair pass re-asked the agent in a fresh session and the hand-off was still invalid';
+		try {
+			const repair = await ctx.runAgent({
+				cli: ctx.cli,
+				model: ctx.model,
+				reasoning: ctx.reasoning,
+				resumeSessionId: ctx.resumeSessionId,
+				cwd: ctx.worktreePath,
+				args: [buildConflictHandoffRepairPrompt(validationError)],
+				maxOutputBytes: 1_000_000,
+				logContext: {
+					taskId: ctx.taskId,
+					phase: 'resolve-conflicts-handoff-repair',
+					prNumber: ctx.prNumber,
+					headSha: ctx.headSha,
+				},
+				timeoutMs: ctx.timeoutMs,
+				signal: ctx.signal,
+			});
+			if (repair.exitCode !== 0) {
+				logger.warn('resolve-conflicts: hand-off repair pass exited non-zero', {
+					...context,
+					exitCode: repair.exitCode,
+				});
+				repairNote = `the repair pass ran but the ${ctx.cli} run exited ${repair.exitCode}`;
+			}
+		} catch (runError) {
+			logger.warn('resolve-conflicts: hand-off repair pass could not be run', {
+				...context,
+				error: describeError(runError),
+			});
+			repairNote = `the repair pass never ran — the ${ctx.cli} run could not be started: ${describeError(runError)}`;
+		}
+		try {
+			const repaired = read();
+			logger.info('resolve-conflicts: the hand-off repair pass produced a valid hand-off', context);
+			return repaired;
+		} catch (repairError) {
+			logger.error('resolve-conflicts: the repair pass did not produce a valid hand-off', {
+				...context,
+				reason: describeError(repairError),
+			});
+			throw new Error(`${validationError} — ${repairNote}`, { cause: error });
+		}
+	}
+}
+
+/**
  * Read, gate and settle the merge an agent pass just left, and return the
  * hand-off delivery is bound to — the three backstops in their established
  * order, in one place so a catch-up pass (issue #1001) is gated exactly as the
@@ -307,11 +394,7 @@ function mergeCommitSubject(baseBranch: string, prBranch: string): string {
  */
 async function gatePreparedMerge(ctx: MergePassContext): Promise<ConflictHandoff> {
 	const context = { taskId: ctx.taskId, prNumber: ctx.prNumber, headSha: ctx.headSha };
-	let handoff = readHandoff(
-		ctx.worktreePath,
-		RESOLVE_CONFLICTS_OUTCOME_FILENAME,
-		ConflictHandoffSchema,
-	);
+	let handoff = await readConflictHandoff(ctx);
 	// Before the repair pass and every delivery step, so a merge we are going to
 	// refuse never spends an agent run or reaches the remote (issue #924).
 	assertMergeVerified(handoff, context);
@@ -323,13 +406,13 @@ async function gatePreparedMerge(ctx: MergePassContext): Promise<ConflictHandoff
 	// the merge agent wrote. Re-read and re-gate whatever it actually left, and
 	// bind the delivery steps to that: otherwise a repair pass that re-ran the
 	// suite and reported `failed` would be committed, pushed and commented on
-	// with the pre-repair body claiming success.
+	// with the pre-repair body claiming success. That read is a second hand-off,
+	// so it gets its own hand-off repair pass rather than discarding the merge the
+	// migration pass just fixed — worst case one gate spends two repair passes on
+	// top of the migration one, which is the deliberate price of not throwing away
+	// a finished merge over the JSON describing it.
 	if (repairPassRan) {
-		handoff = readHandoff(
-			ctx.worktreePath,
-			RESOLVE_CONFLICTS_OUTCOME_FILENAME,
-			ConflictHandoffSchema,
-		);
+		handoff = await readConflictHandoff(ctx);
 		assertMergeVerified(handoff, context);
 	}
 	return handoff;
