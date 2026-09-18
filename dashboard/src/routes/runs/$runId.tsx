@@ -25,9 +25,11 @@ import { buttonClass } from '@/components/ui/button.js';
 import { Modal, ModalFooter } from '@/components/ui/modal.js';
 import {
 	canForceReReview,
+	canForceReviewOfSupersededHead,
 	describeForceReReviewResult,
 	forceReReviewButtonLabel,
 	forceReReviewConfirmMessage,
+	forceReviewOfSupersededHeadConfirmMessage,
 	isCapSpentApproval,
 } from '@/lib/force-re-review.js';
 import { formatDuration, formatPhase, formatTimeUntil, formatTokenCount } from '@/lib/format.js';
@@ -1184,8 +1186,20 @@ export function RecoverRunButton({
  * same corrective cycle rather than a second one — and if that cycle's prior
  * attempt turns out to have been dead (never actually started Respond-to-review),
  * the server chains a fresh one rather than reporting the dead one as done.
+ *
+ * One component serves both cap callouts (issue #1040). The mutation is the same
+ * either way — the server decides which continuation the run's shape calls for —
+ * so the only thing that varies is the promise the modal makes, which the caller
+ * supplies as `confirmMessage`. The result lines then describe whichever
+ * continuation actually ran, off the report's own `continuation`.
  */
-export function ForceReReviewButton({ run }: { run: RunRow }) {
+export function ForceReReviewButton({
+	run,
+	confirmMessage,
+}: {
+	run: RunRow;
+	confirmMessage: string;
+}) {
 	const queryClient = useQueryClient();
 	const [confirmOpen, setConfirmOpen] = useState(false);
 
@@ -1240,7 +1254,7 @@ export function ForceReReviewButton({ run }: { run: RunRow }) {
 				}}
 				title="Force re-review?"
 			>
-				<p className="text-sm text-zinc-300">{forceReReviewConfirmMessage(run.prNumber)}</p>
+				<p className="text-sm text-zinc-300">{confirmMessage}</p>
 				{mutation.isError && (
 					<div className="mt-3 p-2.5 bg-red-950/30 border border-red-900/30 text-xs text-red-400 rounded">
 						{mutation.error.message}
@@ -1587,7 +1601,12 @@ export function CheckpointedCallout({ run, onResetSuccess }: CheckpointedCallout
  * settings that gate "Force re-review", and nothing else. The repo used to be here
  * too, for the PR links, which now come from `run.repository` (issue #691).
  */
-type ReviewCapCalloutProject = { pipeline?: { respondToReview?: { enabled?: boolean } } } | null;
+type ReviewCapCalloutProject = {
+	pipeline?: {
+		respondToReview?: { enabled?: boolean };
+		review?: { enabled?: boolean };
+	};
+} | null;
 
 interface ReviewCapCalloutProps {
 	run: RunRow;
@@ -1652,7 +1671,12 @@ export function ReviewCapCallout({ run, project }: ReviewCapCalloutProps) {
 						<ExternalLink className="h-3 w-3" />
 					</a>
 				)}
-				{canForceReReview(run, project?.pipeline) && <ForceReReviewButton run={run} />}
+				{canForceReReview(run, project?.pipeline) && (
+					<ForceReReviewButton
+						run={run}
+						confirmMessage={forceReReviewConfirmMessage(run.prNumber)}
+					/>
+				)}
 			</div>
 		</div>
 	);
@@ -1673,10 +1697,24 @@ export function ReviewCapCallout({ run, project }: ReviewCapCalloutProps) {
  * The copy names no cap value, for the reason {@link ReviewCapCallout}'s does
  * not: `REVIEW_VERDICT_CAP` lives once, in a DB-bound module this bundle cannot
  * import. It also names no *cause* for the refusal — `not-eligible` has five,
- * and the merge callout below carries the provider's own message. No action
- * button: the operator lever is issue #1038's phase 2.
+ * and the merge callout below carries the provider's own message.
+ *
+ * Since issue #1040 it hosts its own "Force re-review" (the same component and
+ * the same mutation as the sibling's, with its own confirmation copy): the
+ * continuation this stop needs is one Review of the pull request's *current*
+ * head, and the server picks it from the run's shape. The button is gated on
+ * Review being enabled for the project; it is still offered when the merge was
+ * refused for one of `not-eligible`'s other causes, because only the provider
+ * knows whether the head moved and the server answers that with its own
+ * `head-unchanged` refusal rather than a read on every render here.
  */
-export function CapSpentApprovalCallout({ run }: { run: RunRow }) {
+export function CapSpentApprovalCallout({
+	run,
+	project,
+}: {
+	run: RunRow;
+	project?: ReviewCapCalloutProject;
+}) {
 	if (!isCapSpentApproval(run)) return null;
 
 	return (
@@ -1690,7 +1728,8 @@ export function CapSpentApprovalCallout({ run }: { run: RunRow }) {
 					{run.reviewOrdinal ? ` (review ${run.reviewOrdinal} of this PR)` : ''}, and the automatic
 					merge did not go through — see the merge result below for the provider's own reason. SWARM
 					will not dispatch another review for this pull request on its own, so it stays here until
-					a person acts.
+					a person acts. If that decision is to keep going, "Force re-review" reviews the pull
+					request's current head once.
 				</p>
 				{run.repository && run.prNumber && (
 					<a
@@ -1702,6 +1741,12 @@ export function CapSpentApprovalCallout({ run }: { run: RunRow }) {
 						View PR #{run.prNumber}
 						<ExternalLink className="h-3 w-3" />
 					</a>
+				)}
+				{canForceReviewOfSupersededHead(run, project?.pipeline) && (
+					<ForceReReviewButton
+						run={run}
+						confirmMessage={forceReviewOfSupersededHeadConfirmMessage(run.prNumber)}
+					/>
 				)}
 			</div>
 		</div>
@@ -2094,7 +2139,10 @@ function RunStatusCallout({ run, onResetSuccess }: RunStatusCalloutProps) {
 
 interface RunDetailHeaderProps {
 	run: RunRow;
-	/** Forwarded to {@link ReviewCapCallout}, which is the header's only use for it. */
+	/**
+	 * Forwarded to the two review-cap callouts, which are the header's only use for
+	 * it: each reads the pipeline switch gating its own continuation.
+	 */
 	project?: ReviewCapCalloutProject;
 }
 
@@ -2163,7 +2211,7 @@ export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
 			<ReviewCapCallout run={run} project={project} />
 			{/* Above the merge callout on purpose (issue #1038): the provider's own
 			    refusal message reads as the detail behind this one. */}
-			<CapSpentApprovalCallout run={run} />
+			<CapSpentApprovalCallout run={run} project={project} />
 			<ReviewMergeCallout run={run} />
 		</div>
 	);

@@ -4,18 +4,27 @@
  * without a rendered component, and so the "Force re-review" action's copy lives
  * beside the recovery action whose interaction pattern it follows.
  *
- * It covers **both** cap stops. The `request-changes` loop's (issue #511) is the
- * one with an operator lever: {@link canForceReReview} gates it and the route
- * wires it into the `runs.forceReReview` mutation and its confirmation modal.
- * The approval that merge automation then refused (issue #1038) is recognised by
- * {@link isCapSpentApproval} and, for now, only rendered.
+ * It covers **both** cap stops, and since issue #1040 both have a lever on the
+ * same `runs.forceReReview` mutation — which continuation the server runs follows
+ * from the run's own shape, not from anything the button says. The
+ * `request-changes` loop's (issue #511) is gated by {@link canForceReReview}; the
+ * approval that merge automation then refused (issue #1038) is recognised by
+ * {@link isCapSpentApproval} and gated for action by
+ * {@link canForceReviewOfSupersededHead}. The two predicates are mutually
+ * exclusive by verdict and each keeps its own confirmation copy, because they
+ * promise different work: a corrective response, vs. one review of the pull
+ * request's current head.
  */
 
 /** The report `runs.forceReReview` returns — mirrors `ForceReReviewResult`. */
 export interface ForceReReviewReport {
 	runId: string;
 	prNumber: string;
+	/** Which continuation the server ran — it decides, from the run's shape (issue #1040). */
+	continuation: 'respond-to-review' | 'review';
 	headSha: string;
+	/** Set only when `continuation === 'review'`: the current head that review targets. */
+	reviewHeadSha?: string;
 	capOverride: 'granted' | 'already-granted';
 	dispatch: 'scheduled' | 'already-scheduled' | 'already-completed' | 'retried';
 	dispatchId: string;
@@ -37,9 +46,14 @@ export interface ForceReReviewRunState {
 	reviewCapSpent?: boolean | null;
 }
 
-/** The project setting that can disable the forced corrective sequence. */
+/**
+ * The project settings that can disable a forced continuation — one per
+ * continuation, because each is gated by the phase it actually dispatches: the
+ * corrective sequence by Respond-to-review, the superseded-head review by Review.
+ */
 export interface ForceReReviewPipeline {
 	respondToReview?: { enabled?: boolean };
+	review?: { enabled?: boolean };
 }
 
 /**
@@ -91,6 +105,25 @@ export function isCapSpentApproval(run: ForceReReviewRunState): boolean {
 	);
 }
 
+/**
+ * Whether the superseded-head review can be forced for this run (issue #1040):
+ * the cap stop {@link isCapSpentApproval} recognises, on a project that still has
+ * Review enabled. Mirrors the server's own two gates for that branch, so the
+ * button never offers an action the router would refuse outright.
+ *
+ * It deliberately stops there. Whether the head actually moved is a fact only the
+ * provider holds, and the server reads it once per click rather than on every
+ * render of this page; a run whose merge was refused for one of `not-eligible`'s
+ * other causes therefore still shows the button and is answered with the
+ * `head-unchanged` refusal, which names the real cause.
+ */
+export function canForceReviewOfSupersededHead(
+	run: ForceReReviewRunState,
+	pipeline?: ForceReReviewPipeline,
+): boolean {
+	return isCapSpentApproval(run) && pipeline?.review?.enabled !== false;
+}
+
 /** Confirm-button label: reads "Scheduling…" while the mutation is pending. */
 export function forceReReviewButtonLabel(isPending: boolean): string {
 	return isPending ? 'Scheduling…' : 'Force re-review';
@@ -113,14 +146,56 @@ export function forceReReviewConfirmMessage(prNumber?: string | null): string {
 }
 
 /**
+ * The confirmation-modal copy for the *other* continuation (issue #1040). Same
+ * job as {@link forceReReviewConfirmMessage} and deliberately a separate string:
+ * this force schedules no response at all, so promising one would misdescribe
+ * what the operator is about to start.
+ */
+export function forceReviewOfSupersededHeadConfirmMessage(prNumber?: string | null): string {
+	const pr = prNumber ? `PR #${prNumber}` : 'this PR';
+	return (
+		`This bypasses SWARM's review safety cap for ${pr} once: it grants one extra review slot and ` +
+		"reviews the pull request's current head — the commit that superseded the one this run approved. " +
+		'Nothing already running is interrupted, and if that review requests changes the cap stops the ' +
+		'cycle again.'
+	);
+}
+
+/**
  * The success report, one line per durable step, in the order `forceReReview`
  * performs them. Operators use this to tell a force that actually scheduled work
- * from one that found the cycle already continued (a second click, a refresh),
- * and from one that found a *dead* prior attempt — one that never actually
- * started Respond-to-review (e.g. a stale worker refused it) — and scheduled a
- * fresh one in its place (`dispatch === 'retried'`).
+ * from one that found the continuation already under way (a second click, a
+ * refresh), and from one that found a *dead* prior attempt — one that never
+ * actually started the run it promised (e.g. a stale worker refused it) — and
+ * scheduled a fresh one in its place (`dispatch === 'retried'`).
+ *
+ * Branched on `continuation` (issue #1040), because the two forces schedule
+ * different work and the report must name what the operator will actually see: a
+ * corrective response whose follow-up review comes later, or one review of a
+ * named commit with nothing queued behind it.
  */
 export function describeForceReReviewResult(result: ForceReReviewReport): string[] {
+	const capLine =
+		result.capOverride === 'granted'
+			? 'Review cap: one extra review slot granted for this PR.'
+			: 'Review cap: an extra review slot was already granted for this review.';
+
+	if (result.continuation === 'review') {
+		// The head is part of every line that names scheduled work: the whole point of
+		// this force is *which* commit gets reviewed.
+		const at = result.reviewHeadSha ? ` at \`${result.reviewHeadSha}\`` : '';
+		return [
+			capLine,
+			result.dispatch === 'scheduled'
+				? `Review: scheduled for PR #${result.prNumber}${at} as dispatch ${result.dispatchId}.`
+				: result.dispatch === 'retried'
+					? `Review: the previous forced attempt never actually started one${result.previousAttemptOutcome ? ` (${result.previousAttemptOutcome})` : ''} — scheduled a fresh attempt for PR #${result.prNumber}${at} as dispatch ${result.dispatchId}.`
+					: result.dispatch === 'already-completed'
+						? `Review: prior forced dispatch ${result.dispatchId} already completed${result.dispatchOutcome ? ` (${result.dispatchOutcome})` : ''} — check the PR for its review.`
+						: `Review: already scheduled for PR #${result.prNumber}${at} as dispatch ${result.dispatchId} — nothing duplicated.`,
+		];
+	}
+
 	const dispatchLine =
 		result.dispatch === 'scheduled'
 			? `Respond-to-review: scheduled for PR #${result.prNumber} as dispatch ${result.dispatchId}.`
@@ -131,9 +206,7 @@ export function describeForceReReviewResult(result: ForceReReviewReport): string
 					: `Respond-to-review: already scheduled for PR #${result.prNumber} as dispatch ${result.dispatchId} — nothing duplicated.`;
 
 	return [
-		result.capOverride === 'granted'
-			? 'Review cap: one extra review slot granted for this PR.'
-			: 'Review cap: an extra review slot was already granted for this review.',
+		capLine,
 		dispatchLine,
 		result.dispatch === 'already-completed'
 			? 'Re-review: the corrective response already ran — check the PR for its follow-up review.'

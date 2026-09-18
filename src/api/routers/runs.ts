@@ -385,9 +385,15 @@ const FORCE_RE_REVIEW_REFUSAL_CODES: Record<ForceReReviewRefusal, TRPCError['cod
 	'run-not-found': 'NOT_FOUND',
 	'project-not-found': 'PRECONDITION_FAILED',
 	'respond-to-review-disabled': 'PRECONDITION_FAILED',
+	'review-disabled': 'PRECONDITION_FAILED',
 	'not-capped': 'PRECONDITION_FAILED',
 	'missing-coordinates': 'PRECONDITION_FAILED',
 	'missing-review-record': 'PRECONDITION_FAILED',
+	// Issue #1040's two provider-decided refusals: a head that never moved and a
+	// closed pull request are both "the state you acted on is not the state that is
+	// there", which is what PRECONDITION_FAILED already means on this surface.
+	'head-unchanged': 'PRECONDITION_FAILED',
+	'pull-request-closed': 'PRECONDITION_FAILED',
 };
 
 /**
@@ -1615,15 +1621,20 @@ export const runsRouter = router({
 			}
 		}),
 
-	// Force a re-review past the review-verdict safety cap ("Force re-review",
-	// issue #511).
+	// Force a continuation past the review-verdict safety cap ("Force re-review",
+	// issues #511 and #1040).
 	//
-	// The recovery action for the one state the cap deliberately leaves stopped: a
-	// completed Review run whose last permitted `request-changes` verdict set
-	// `manual-intervention-required`, so no further Respond-to-review/re-review is
-	// enqueued automatically. Invoking it grants the PR exactly one extra review
-	// slot and enqueues the corrective Respond-to-review run; the normal pipeline
-	// (response → follow-up Review) carries on from there unchanged.
+	// The recovery action for the two states the cap deliberately leaves stopped,
+	// each with the continuation its own shape needs. A completed Review run whose
+	// last permitted `request-changes` verdict set `manual-intervention-required`
+	// gets the corrective sequence (issue #511): one extra review slot, then the
+	// Respond-to-review run, after which the normal pipeline (response → follow-up
+	// Review) carries on unchanged. A completed Review run that **approved** on a
+	// pull request whose allowance is spent and whose reviewed head a later push
+	// superseded gets one Review of the pull request's *current* head instead (issue
+	// #1040) — there is no requested change to answer, so a response would have
+	// nothing to do. Which one applies is the service's call, reported back as
+	// `continuation`.
 	//
 	// Authorized exactly like the comparable run-recovery action, "Reset &
 	// restart": driving a run is `member`+ on its project, and a non-member gets

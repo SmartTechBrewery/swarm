@@ -38,6 +38,7 @@ vi.mock('@tanstack/react-router', async (importOriginal) => {
 	};
 });
 
+import { forceReReviewConfirmMessage } from '@/lib/force-re-review.js';
 import { trpcClient } from '@/lib/trpc.js';
 import {
 	CapSpentApprovalCallout,
@@ -232,8 +233,27 @@ describe('CapSpentApprovalCallout (issue #1038)', () => {
 		});
 	}
 
+	/**
+	 * The callout hosts "Force re-review" since issue #1040, which owns a mutation —
+	 * so a rendered callout needs the query client the app provides. The
+	 * `renders nothing` cases below return before that and stay provider-free.
+	 */
+	function renderCapSpentCallout(
+		run: RunRow = makeCapSpentApprovalRun(),
+		project: {
+			pipeline?: { respondToReview?: { enabled?: boolean }; review?: { enabled?: boolean } };
+		} | null = {},
+	) {
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		return render(
+			<QueryClientProvider client={queryClient}>
+				<CapSpentApprovalCallout run={run} project={project} />
+			</QueryClientProvider>,
+		);
+	}
+
 	it('names the spent allowance, the refused merge, and the consequence', () => {
-		render(<CapSpentApprovalCallout run={makeCapSpentApprovalRun()} />);
+		renderCapSpentCallout();
 
 		expect(screen.getByRole('heading', { name: 'Manual action required' })).toBeDefined();
 		expect(screen.getByText(/last review verdict SWARM's review safety cap allows/i)).toBeDefined();
@@ -244,14 +264,14 @@ describe('CapSpentApprovalCallout (issue #1038)', () => {
 	// The copy must claim only what the row proves: `not-eligible` has five causes,
 	// and naming one would mean matching a provider's own message text.
 	it("claims no cause of its own and points at the merge result's", () => {
-		render(<CapSpentApprovalCallout run={makeCapSpentApprovalRun()} />);
+		renderCapSpentCallout();
 
 		expect(screen.getByText(/see the merge result below/i)).toBeDefined();
 		expect(screen.queryByText(/head changed/i)).toBeNull();
 	});
 
 	it("links to the PR in the run's own repository", () => {
-		render(<CapSpentApprovalCallout run={makeCapSpentApprovalRun({ repository: 'acme/api' })} />);
+		renderCapSpentCallout(makeCapSpentApprovalRun({ repository: 'acme/api' }));
 
 		const link = screen.getByRole('link', { name: /view pr #42/i }) as HTMLAnchorElement;
 		expect(link.href).toBe('https://github.com/acme/api/pull/42');
@@ -275,11 +295,39 @@ describe('CapSpentApprovalCallout (issue #1038)', () => {
 		expect(screen.getByText(/will not dispatch another review/i)).toBeDefined();
 	});
 
-	// Phase 2's lever, deliberately absent here.
-	it('offers no action button in this phase', () => {
-		render(<CapSpentApprovalCallout run={makeCapSpentApprovalRun()} />);
+	// Phase 2's lever (issue #1040): the same component and mutation as the sibling
+	// callout's, with its own confirmation copy naming *this* continuation.
+	it('offers Force re-review for the superseded head', () => {
+		renderCapSpentCallout();
 
-		expect(screen.queryByRole('button')).toBeNull();
+		expect(screen.getByRole('button', { name: /force re-review/i })).toBeDefined();
+	});
+
+	it('names the current-head review, not a corrective response, in its confirmation', () => {
+		renderCapSpentCallout();
+		fireEvent.click(screen.getByRole('button', { name: /force re-review/i }));
+
+		expect(screen.getByRole('heading', { name: 'Force re-review?' })).toBeDefined();
+		expect(screen.getByText(/the commit that superseded the one this run approved/i)).toBeDefined();
+		expect(screen.queryByText(/Respond-to-review run/i)).toBeNull();
+	});
+
+	it('withholds Force re-review when Review is disabled for the project', () => {
+		renderCapSpentCallout(makeCapSpentApprovalRun(), {
+			pipeline: { review: { enabled: false } },
+		});
+
+		expect(screen.getByRole('heading', { name: 'Manual action required' })).toBeDefined();
+		expect(screen.queryByRole('button', { name: /force re-review/i })).toBeNull();
+	});
+
+	// The switch that gates the *other* continuation has no say over this one.
+	it('still offers it when only Respond-to-review is disabled', () => {
+		renderCapSpentCallout(makeCapSpentApprovalRun(), {
+			pipeline: { respondToReview: { enabled: false } },
+		});
+
+		expect(screen.getByRole('button', { name: /force re-review/i })).toBeDefined();
 	});
 
 	// `reviewCapSpent: false` is the whole of "not stopped": the server resolves it
@@ -1950,7 +1998,7 @@ describe('ForceReReviewButton (issue #511)', () => {
 		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 		return render(
 			<QueryClientProvider client={queryClient}>
-				<ForceReReviewButton run={run} />
+				<ForceReReviewButton run={run} confirmMessage={forceReReviewConfirmMessage(run.prNumber)} />
 			</QueryClientProvider>,
 		);
 	}
@@ -1970,6 +2018,7 @@ describe('ForceReReviewButton (issue #511)', () => {
 	const scheduled = {
 		runId: 'run-1',
 		prNumber: '42',
+		continuation: 'respond-to-review' as const,
 		headSha: 'cafebabe',
 		capOverride: 'granted' as const,
 		dispatch: 'scheduled' as const,

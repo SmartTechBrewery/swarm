@@ -2764,6 +2764,7 @@ describe('runsRouter', () => {
 		const FORCE_RESULT = {
 			runId: 'run-1',
 			prNumber: '508',
+			continuation: 'respond-to-review' as const,
 			headSha: 'cafebabe',
 			capOverride: 'granted' as const,
 			dispatch: 'scheduled' as const,
@@ -2810,6 +2811,32 @@ describe('runsRouter', () => {
 			expect(forceReReview).not.toHaveBeenCalled();
 		});
 
+		// The approving run issue #1040's branch recovers — the procedure authorizes and
+		// maps for it exactly as for the `request-changes` shape, and the service decides
+		// which continuation applies.
+		const capSpentApprovalRun = () =>
+			makeRun({
+				id: 'run-1',
+				status: 'completed',
+				phase: 'review',
+				prNumber: '508',
+				reviewVerdict: 'approve',
+				reviewMergeOutcome: 'not-eligible',
+			});
+
+		it('returns the review continuation verbatim for a cap-spent approval', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(capSpentApprovalRun());
+			const reviewResult = {
+				...FORCE_RESULT,
+				continuation: 'review' as const,
+				reviewHeadSha: 'deadbeef',
+			};
+			vi.mocked(forceReReview).mockResolvedValue(reviewResult);
+
+			await expect(caller.forceReReview({ runId: 'run-1' })).resolves.toEqual(reviewResult);
+			expect(forceReReview).toHaveBeenCalledWith('run-1');
+		});
+
 		it.each([
 			['run-not-found', 'NOT_FOUND'],
 			['project-not-found', 'PRECONDITION_FAILED'],
@@ -2817,6 +2844,10 @@ describe('runsRouter', () => {
 			['not-capped', 'PRECONDITION_FAILED'],
 			['missing-coordinates', 'PRECONDITION_FAILED'],
 			['missing-review-record', 'PRECONDITION_FAILED'],
+			// Issue #1040's three.
+			['review-disabled', 'PRECONDITION_FAILED'],
+			['head-unchanged', 'PRECONDITION_FAILED'],
+			['pull-request-closed', 'PRECONDITION_FAILED'],
 		] as const)('maps the %s refusal to %s, keeping its message', async (reason, code) => {
 			vi.mocked(getRunByIdFromDb).mockResolvedValue(cappedReviewRun());
 			vi.mocked(forceReReview).mockRejectedValue(
@@ -3761,6 +3792,7 @@ describe('runsRouter', () => {
 				vi.mocked(forceReReview).mockResolvedValue({
 					runId: 'run-1',
 					prNumber: '508',
+					continuation: 'respond-to-review',
 					headSha: 'cafebabe',
 					capOverride: 'granted',
 					dispatch: 'scheduled',
