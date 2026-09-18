@@ -17,6 +17,11 @@ import {
 	listAllProjectsFromDb,
 } from '../../db/repositories/projectsRepository.js';
 import {
+	isLastPermittedVerdict,
+	isReviewAllowanceSpent,
+	listActiveReviewSlotsForPullRequest,
+} from '../../db/repositories/reviewVerdictsRepository.js';
+import {
 	cancelDeferredRunInDb,
 	getRunByIdFromDb,
 	getRunLogsFromDb,
@@ -892,6 +897,53 @@ async function resolveRetryScheduled(run: { id: string; status: string }): Promi
 }
 
 /**
+ * Whether this Review run's verdict is the last one SWARM will produce for its
+ * pull request unless an operator intervenes (issue #1038): the review-verdict
+ * allowance is spent, no operator grant is outstanding, and this run holds the
+ * highest submitted slot.
+ *
+ * Resolved here rather than stored on the run, because the answer belongs to the
+ * *pull request's* ledger and keeps changing after the run ends (a later grant, a
+ * recovered slot). One indexed read, and only for a completed, ledgered Review
+ * run — every other run costs nothing.
+ *
+ * `null`, never `false`, when the question does not apply, so the dashboard can
+ * tell "not a ledgered Review run" from "still has allowance left". A read that
+ * throws answers `null` too, on every neighbouring resolver's posture: a detail
+ * page that shows one callout fewer beats one that fails to load.
+ *
+ * Keyed on the run's **own** recorded repository (issue #683), never the
+ * project's `repo`: a project spans repositories, and the ledger's natural key
+ * includes one.
+ */
+async function resolveReviewCapSpent(run: {
+	id: string;
+	projectId: string;
+	repository: string | null;
+	prNumber: string | null;
+	status: string;
+	phase: string;
+	reviewOrdinal: number | null;
+}): Promise<boolean | null> {
+	if (run.status !== 'completed' || run.phase !== 'review') return null;
+	if (!run.repository || !run.prNumber || run.reviewOrdinal === null) return null;
+	try {
+		const slots = await listActiveReviewSlotsForPullRequest(
+			run.projectId,
+			run.repository,
+			run.prNumber,
+		);
+		return isReviewAllowanceSpent(slots) && isLastPermittedVerdict(slots, run.reviewOrdinal);
+	} catch (error) {
+		logger.warn('runs.getById: review-ledger lookup failed; reporting no verdict', {
+			runId: run.id,
+			error: describeError(error),
+		});
+		return null;
+	}
+}
+
+/**
  * The two project policies the liveness classification consults, read exactly as
  * the pipeline itself reads them (issue #840): Planning's `autoAdvance` is off
  * unless set (`DEFAULT_AUTO_ADVANCE`, `src/pipeline/planning.ts`) and merge
@@ -1139,6 +1191,7 @@ export const runsRouter = router({
 				pendingRequest: await resolvePendingRunRequest(run),
 				preservedWorker: await resolveRunPreservedWorker(run),
 				retryScheduled: await resolveRetryScheduled(run),
+				reviewCapSpent: await resolveReviewCapSpent(run),
 			};
 		}),
 

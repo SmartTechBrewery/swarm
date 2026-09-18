@@ -36,12 +36,14 @@ const listActiveReviewSlotsForPullRequest = vi.fn<
 	(projectId: string, repository: string, prNumber: string) => Promise<PullRequestReviewSlot[]>
 >(async () => []);
 vi.mock('@/db/repositories/reviewVerdictsRepository.js', async (importOriginal) => {
-	// `REVIEW_VERDICT_CAP` is the real constant — the classifier's cap rule has to
-	// stay pinned to the ledger's own number, not to a copy that could drift.
+	// Only the ledger *read* is stubbed. `REVIEW_VERDICT_CAP` and the pure cap
+	// predicates (`isReviewAllowanceSpent`, issue #1038) stay real: the classifier's
+	// cap rule has to stay pinned to the ledger's own arithmetic, not to a copy that
+	// could drift — which is the whole point of calling the writer's predicate.
 	const actual =
 		await importOriginal<typeof import('@/db/repositories/reviewVerdictsRepository.js')>();
 	return {
-		REVIEW_VERDICT_CAP: actual.REVIEW_VERDICT_CAP,
+		...actual,
 		listActiveReviewSlotsForPullRequest: (
 			projectId: string,
 			repository: string,

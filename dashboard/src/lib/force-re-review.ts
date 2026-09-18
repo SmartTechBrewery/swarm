@@ -1,11 +1,14 @@
 /**
- * Pure view-logic for the "Force re-review" action (issue #511), split out of
- * the run-detail route the same way `./run-reset.ts` is — so it can be
- * unit-tested without a rendered component, and so the action's copy lives
+ * Pure view-logic for the review-cap stops the run-detail view surfaces, split
+ * out of the route the same way `./run-reset.ts` is — so it can be unit-tested
+ * without a rendered component, and so the "Force re-review" action's copy lives
  * beside the recovery action whose interaction pattern it follows.
  *
- * The route wires these into the `runs.forceReReview` mutation and its
- * confirmation modal.
+ * It covers **both** cap stops. The `request-changes` loop's (issue #511) is the
+ * one with an operator lever: {@link canForceReReview} gates it and the route
+ * wires it into the `runs.forceReReview` mutation and its confirmation modal.
+ * The approval that merge automation then refused (issue #1038) is recognised by
+ * {@link isCapSpentApproval} and, for now, only rendered.
  */
 
 /** The report `runs.forceReReview` returns — mirrors `ForceReReviewResult`. */
@@ -22,12 +25,16 @@ export interface ForceReReviewReport {
 	previousAttemptOutcome?: string | null;
 }
 
-/** The run fields the availability rule reads — the subset `RunRow` and the API row share. */
+/** The run fields the availability rules read — the subset `RunRow` and the API row share. */
 export interface ForceReReviewRunState {
 	status: string;
 	phase: string;
 	reviewVerdict?: string | null;
 	reviewAutomationOutcome?: string | null;
+	/** Read by {@link isCapSpentApproval} alone (issue #1038); optional, so #511's callers are unaffected. */
+	reviewMergeOutcome?: string | null;
+	/** Likewise — the server-resolved ledger fact, absent on the list read model. */
+	reviewCapSpent?: boolean | null;
 }
 
 /** The project setting that can disable the forced corrective sequence. */
@@ -53,6 +60,34 @@ export function canForceReReview(
 		run.reviewVerdict === 'request-changes' &&
 		run.reviewAutomationOutcome === 'manual-intervention-required' &&
 		pipeline?.respondToReview?.enabled !== false
+	);
+}
+
+/**
+ * Whether this run is the *other* review-cap stop (issue #1038): a completed
+ * Review that **approved**, whose approval merge automation then refused, on a
+ * pull request whose review allowance is spent. Nothing will dispatch another
+ * review for it — the `pr-review` trigger's cap gate skips, and the recovery
+ * sweep classifies it `capped` — so it needs a person.
+ *
+ * Deliberately *not* a variant of {@link canForceReReview}: that predicate is the
+ * `request-changes` loop's (issue #511) and must keep answering exactly as it
+ * does. The two are mutually exclusive by verdict.
+ *
+ * It claims only what the row proves. `not-eligible` covers five refusals — the
+ * superseded reviewed head this is usually about, plus draft, closed, a
+ * dismissed approval and changes requested since — and telling them apart means
+ * matching a provider's own message text, which shared code must not do. The
+ * merge callout rendered below already names the provider's cause; this one
+ * names the consequence.
+ */
+export function isCapSpentApproval(run: ForceReReviewRunState): boolean {
+	return (
+		run.status === 'completed' &&
+		run.phase === 'review' &&
+		run.reviewVerdict === 'approve' &&
+		run.reviewMergeOutcome === 'not-eligible' &&
+		run.reviewCapSpent === true
 	);
 }
 

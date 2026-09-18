@@ -20,6 +20,16 @@ vi.mock('@/db/repositories/projectsRepository.js', () => ({
 	listAllProjectsFromDb: vi.fn(),
 }));
 
+// The review-verdict ledger read `getById` resolves `reviewCapSpent` from (issue
+// #1038). Only the read is stubbed: the module's pure cap predicates
+// (`isReviewAllowanceSpent`, `isLastPermittedVerdict`) and `REVIEW_VERDICT_CAP`
+// stay real, for the reason `isRetryPendingStatus` does above — a stubbed copy of
+// the writer's own arithmetic could drift from it.
+vi.mock('@/db/repositories/reviewVerdictsRepository.js', async (importOriginal) => ({
+	...(await importOriginal<typeof import('@/db/repositories/reviewVerdictsRepository.js')>()),
+	listActiveReviewSlotsForPullRequest: vi.fn(),
+}));
+
 // The `stalled_dismissals` read `stalled` folds in and the upsert `dismissStalled`
 // makes (issue #880).
 vi.mock('@/db/repositories/stalledDismissalsRepository.js', () => ({
@@ -175,6 +185,11 @@ import {
 	getProjectByIdFromDb,
 	listAllProjectsFromDb,
 } from '@/db/repositories/projectsRepository.js';
+import {
+	listActiveReviewSlotsForPullRequest,
+	type PullRequestReviewSlot,
+	REVIEW_VERDICT_CAP,
+} from '@/db/repositories/reviewVerdictsRepository.js';
 import {
 	cancelDeferredRunInDb,
 	getRunByIdFromDb,
@@ -423,6 +438,10 @@ describe('runsRouter', () => {
 		vi.mocked(getWorkers).mockReset();
 		vi.mocked(getWorkers).mockResolvedValue([]);
 		vi.mocked(getUserById).mockReset();
+		// An empty ledger is the default: every run that is not a completed, ledgered
+		// Review skips this read entirely, and the ones below state their own slots.
+		vi.mocked(listActiveReviewSlotsForPullRequest).mockReset();
+		vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue([]);
 	});
 
 	describe('list', () => {
@@ -1291,6 +1310,7 @@ describe('runsRouter', () => {
 				maxContinuations: null,
 				pendingRequest: null,
 				retryScheduled: null,
+				reviewCapSpent: null,
 			});
 			expect(result.nextRetryAt).toEqual(nextRetryAt);
 			expect(getRunByIdFromDb).toHaveBeenCalledWith('run-1');
@@ -1706,6 +1726,7 @@ describe('runsRouter', () => {
 					maxContinuations: null,
 					pendingRequest: null,
 					retryScheduled: null,
+					reviewCapSpent: null,
 				});
 			});
 		});
@@ -1754,6 +1775,121 @@ describe('runsRouter', () => {
 
 				await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
 					retryScheduled: null,
+				});
+			});
+		});
+
+		// Issue #1038: the cap stop that leaves no run behind. The answer belongs to
+		// the *pull request's* ledger, so it is resolved here rather than stored on the
+		// run — and only for a completed, ledgered Review run, which is the cost gate.
+		describe('reviewCapSpent', () => {
+			function slot(overrides: Partial<PullRequestReviewSlot> = {}): PullRequestReviewSlot {
+				return {
+					ordinal: 1,
+					state: 'submitted',
+					headSha: 'head-1',
+					capOverrideGrantedAt: null,
+					capOverrideConsumedAt: null,
+					...overrides,
+				};
+			}
+
+			/** A spent allowance: one submitted slot per permitted verdict. */
+			function spentSlots(): PullRequestReviewSlot[] {
+				return Array.from({ length: REVIEW_VERDICT_CAP }, (_, i) =>
+					slot({ ordinal: i + 1, headSha: `head-${i}` }),
+				);
+			}
+
+			const REVIEW_RUN = {
+				status: 'completed',
+				phase: 'review',
+				prNumber: '262',
+				reviewVerdict: 'approve',
+				reviewOrdinal: REVIEW_VERDICT_CAP,
+			};
+
+			it('is true for the last permitted verdict on a pull request whose allowance is spent', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', ...REVIEW_RUN }));
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(spentSlots());
+
+				await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+					reviewCapSpent: true,
+				});
+				// Scoped to the run's own repository (issue #683), never the project's.
+				expect(listActiveReviewSlotsForPullRequest).toHaveBeenCalledWith(
+					'p1',
+					'SmartTechBrewery/swarm',
+					'262',
+				);
+			});
+
+			it('is false while the pull request still has a slot free', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({ id: 'run-1', ...REVIEW_RUN, reviewOrdinal: REVIEW_VERDICT_CAP - 1 }),
+				);
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(
+					spentSlots().slice(0, REVIEW_VERDICT_CAP - 1),
+				);
+
+				await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+					reviewCapSpent: false,
+				});
+			});
+
+			// Issue #511: an unconsumed grant is an extra slot the next reservation may
+			// take, so the operator has already acted and nothing is stuck.
+			it('is false while an unconsumed operator grant is outstanding', async () => {
+				const slots = spentSlots();
+				slots[REVIEW_VERDICT_CAP - 1] = {
+					...slots[REVIEW_VERDICT_CAP - 1],
+					capOverrideGrantedAt: new Date(),
+				};
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', ...REVIEW_RUN }));
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(slots);
+
+				await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+					reviewCapSpent: false,
+				});
+			});
+
+			it('is false for an earlier verdict on a capped pull request', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({ id: 'run-1', ...REVIEW_RUN, reviewOrdinal: 1 }),
+				);
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(spentSlots());
+
+				await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+					reviewCapSpent: false,
+				});
+			});
+
+			// The cost gate: every run the question does not apply to answers `null`
+			// with no ledger read at all.
+			it.each([
+				['a non-Review phase', { phase: 'implementation' }],
+				['a Review run still in progress', { status: 'running' }],
+				['a Review run whose verdict was never ledgered', { reviewOrdinal: null }],
+				['a Review run with no pull request recorded', { prNumber: null }],
+			])('reports null — and reads no ledger — for %s', async (_label, overrides) => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({ id: 'run-1', ...REVIEW_RUN, ...overrides }),
+				);
+
+				await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+					reviewCapSpent: null,
+				});
+				expect(listActiveReviewSlotsForPullRequest).not.toHaveBeenCalled();
+			});
+
+			it('reports no verdict rather than failing the page when the ledger read throws', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', ...REVIEW_RUN }));
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockRejectedValue(
+					new Error('db unreachable'),
+				);
+
+				await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+					reviewCapSpent: null,
 				});
 			});
 		});
@@ -3428,6 +3564,7 @@ describe('runsRouter', () => {
 					maxContinuations: null,
 					pendingRequest: null,
 					retryScheduled: null,
+					reviewCapSpent: null,
 				});
 			});
 		});

@@ -568,3 +568,41 @@ export function isCapReachingRequestChanges(
 ): boolean {
 	return ordinal !== undefined && ordinal >= REVIEW_VERDICT_CAP && verdict === 'request-changes';
 }
+
+/**
+ * Whether this pull request has spent every permitted verdict and holds no
+ * unconsumed operator grant — {@link reserveReviewVerdict}'s own cap arithmetic,
+ * as a pure predicate, so a reader can reach the writer's conclusion without
+ * taking the advisory lock.
+ *
+ * `abandoned` slots must already be excluded by the caller
+ * ({@link listActiveReviewSlotsForPullRequest} does), for the reason the writer
+ * excludes them: an abandoned row never counted toward the cap.
+ *
+ * A *reader's* answer, never a decision: only {@link reserveReviewVerdict}
+ * decides whether a review may proceed, and only it spends a grant.
+ */
+export function isReviewAllowanceSpent(slots: readonly PullRequestReviewSlot[]): boolean {
+	const submitted = slots.filter((slot) => slot.state === 'submitted').length;
+	if (submitted < REVIEW_VERDICT_CAP) return false;
+	return !slots.some(
+		(slot) => slot.capOverrideGrantedAt !== null && slot.capOverrideConsumedAt === null,
+	);
+}
+
+/**
+ * Whether `ordinal` is the highest *submitted* slot — i.e. the verdict the run
+ * asking carried is the pull request's latest, not an earlier one an operator
+ * happens to be looking at.
+ *
+ * Pending slots are ignored: a reservation that has not submitted anything is
+ * not a verdict, so it cannot displace the last one that is.
+ */
+export function isLastPermittedVerdict(
+	slots: readonly PullRequestReviewSlot[],
+	ordinal: number | null,
+): boolean {
+	if (ordinal === null) return false;
+	const submitted = slots.filter((slot) => slot.state === 'submitted');
+	return submitted.length > 0 && Math.max(...submitted.map((slot) => slot.ordinal)) === ordinal;
+}
