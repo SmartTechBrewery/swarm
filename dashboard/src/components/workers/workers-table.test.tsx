@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { fireEvent, render, screen, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import type { ReactElement } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
@@ -12,20 +12,35 @@ import type {
 	WorkerUpdate,
 } from '@/types/workers.js';
 
-const { projectsListQueryFn, listMineQueryFn, rosterQueryFn, setConsentMutate } = vi.hoisted(
-	() => ({
-		projectsListQueryFn: vi.fn(),
-		listMineQueryFn: vi.fn(),
-		rosterQueryFn: vi.fn(),
-		setConsentMutate: vi.fn(),
-	}),
-);
+const {
+	projectsListQueryFn,
+	viewerAccessQueryFn,
+	listMineQueryFn,
+	rosterQueryFn,
+	setConsentMutate,
+	setStatusMutate,
+} = vi.hoisted(() => ({
+	projectsListQueryFn: vi.fn(),
+	// Issue #1035 — whether the viewer administers each visible project, which is
+	// what makes an **Enrolled** switch actionable.
+	viewerAccessQueryFn: vi.fn(),
+	listMineQueryFn: vi.fn(),
+	rosterQueryFn: vi.fn(),
+	setConsentMutate: vi.fn(),
+	setStatusMutate: vi.fn(),
+}));
 
 vi.mock('@/lib/trpc.js', () => ({
 	trpc: {
 		projects: {
 			list: {
 				queryOptions: () => ({ queryKey: ['projects.list'], queryFn: projectsListQueryFn }),
+			},
+			viewerAccess: {
+				queryOptions: (input: { projectId: string }) => ({
+					queryKey: ['projects.viewerAccess', input],
+					queryFn: () => viewerAccessQueryFn(input),
+				}),
 			},
 		},
 		workers: {
@@ -41,7 +56,10 @@ vi.mock('@/lib/trpc.js', () => ({
 		},
 	},
 	trpcClient: {
-		workers: { setConsent: { mutate: setConsentMutate } },
+		workers: {
+			setConsent: { mutate: setConsentMutate },
+			setStatus: { mutate: setStatusMutate },
+		},
 	},
 }));
 
@@ -144,10 +162,12 @@ function makeOwnerWorker(overrides: Partial<OwnerWorker> = {}): OwnerWorker {
 }
 
 // The table resolves project names/repos via `projects.list`, its own enrollments
-// via `workers.listMine`, and per-project consent via `workers.roster`. Wrap in a
-// QueryClient (retry off). By default `projects.list` stays pending (raw id
-// fallback) and the owner/roster queries are empty so no control renders — each
-// test overrides only what it exercises.
+// via `workers.listMine`, per-project consent and enrollment status via
+// `workers.roster`, and whether the viewer administers each project via
+// `projects.viewerAccess`. Wrap in a QueryClient (retry off). By default
+// `projects.list` stays pending (raw id fallback), the owner/roster queries are
+// empty so no control renders, and the viewer administers nothing — each test
+// overrides only what it exercises.
 function renderTable(ui: ReactElement) {
 	const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 	return render(<QueryClientProvider client={queryClient}>{ui}</QueryClientProvider>);
@@ -155,10 +175,13 @@ function renderTable(ui: ReactElement) {
 
 beforeEach(() => {
 	projectsListQueryFn.mockReset();
+	viewerAccessQueryFn.mockReset();
 	listMineQueryFn.mockReset();
 	rosterQueryFn.mockReset();
 	setConsentMutate.mockReset();
+	setStatusMutate.mockReset();
 	projectsListQueryFn.mockReturnValue(new Promise(() => {}));
+	viewerAccessQueryFn.mockResolvedValue({ canAdminister: false });
 	listMineQueryFn.mockResolvedValue([]);
 	rosterQueryFn.mockResolvedValue([]);
 	// Fake only `Date` (fixes `formatRelativeTime`'s "now") so setTimeout stays
@@ -750,6 +773,305 @@ describe('WorkersTable sharing consent (issue #282)', () => {
 	});
 });
 
+/**
+ * Issue #1035 — the **Enrolled** column: enrollment status (`active`/`suspended`)
+ * as a switch per visible enrollment, actionable only for a project the viewer
+ * administers, and calling the existing `workers.setStatus`.
+ */
+describe('WorkersTable Enrolled column (issue #1035)', () => {
+	/** The enrollment row `workers.setStatus` answers with, at the status asked for. */
+	function updatedEnrollment(status: 'active' | 'suspended', sharingConsent = true) {
+		return {
+			id: 'enr-1',
+			workerId: 'worker-1',
+			projectId: 'proj-a',
+			status,
+			allowedClis: ['claude'],
+			allowedPhases: ['implementation'],
+			concurrencyAllocation: 1,
+			sharingConsent,
+			createdAt: NOW.toISOString(),
+			updatedAt: NOW.toISOString(),
+		};
+	}
+
+	it('gives the column its own header, beside Available rather than instead of it', () => {
+		renderTable(<WorkersTable workers={[makeWorker()]} />);
+
+		const headers = screen.getAllByRole('columnheader').map((cell) => cell.textContent);
+		expect(headers).toContain('Enrolled');
+		expect(headers).toContain('Available');
+		// The dispatch gate reads `status === 'active' && sharingConsent`; the columns
+		// read in that order.
+		expect(headers.indexOf('Enrolled')).toBeLessThan(headers.indexOf('Available'));
+	});
+
+	it('shows an active enrollment as on and a suspended one as off, for the project admin', async () => {
+		viewerAccessQueryFn.mockResolvedValue({ canAdminister: true });
+		rosterQueryFn.mockImplementation(async ({ projectId }: { projectId: string }) =>
+			projectId === 'proj-a'
+				? [makeRosterEntry()]
+				: [
+						makeRosterEntry({
+							enrollmentId: 'enr-2',
+							projectId: 'proj-b',
+							status: 'suspended',
+							isRoutable: false,
+						}),
+					],
+		);
+		renderTable(
+			<WorkersTable
+				workers={[
+					makeWorker({
+						enrollments: [
+							{ projectId: 'proj-a', status: 'active', allowedClis: ['claude'] },
+							{ projectId: 'proj-b', status: 'suspended', allowedClis: ['claude'] },
+						],
+					}),
+				]}
+			/>,
+		);
+
+		const active = await screen.findByRole('switch', {
+			name: 'Enrollment of ada-laptop in proj-a',
+		});
+		const suspended = await screen.findByRole('switch', {
+			name: 'Enrollment of ada-laptop in proj-b',
+		});
+		expect(active.getAttribute('aria-checked')).toBe('true');
+		expect(suspended.getAttribute('aria-checked')).toBe('false');
+		expect((active as HTMLButtonElement).disabled).toBe(false);
+	});
+
+	it('renders a pending enrollment as its own marker — neither enrolled nor suspended', async () => {
+		viewerAccessQueryFn.mockResolvedValue({ canAdminister: true });
+		rosterQueryFn.mockResolvedValue([makeRosterEntry({ status: 'pending', isRoutable: false })]);
+		renderTable(
+			<WorkersTable
+				workers={[
+					makeWorker({
+						enrollments: [{ projectId: 'proj-a', status: 'pending', allowedClis: ['claude'] }],
+					}),
+				]}
+			/>,
+		);
+
+		const marker = await screen.findByText('Pending');
+		expect(marker.getAttribute('title')).toContain('neither enrolled nor suspended');
+		// A switch would have to claim one of the two states it is not in.
+		expect(screen.queryByRole('switch', { name: 'Enrollment of ada-laptop in proj-a' })).toBeNull();
+	});
+
+	it('renders the status read-only for a project the viewer does not administer', async () => {
+		viewerAccessQueryFn.mockResolvedValue({ canAdminister: false });
+		rosterQueryFn.mockResolvedValue([makeRosterEntry()]);
+		renderTable(<WorkersTable workers={[makeWorker()]} />);
+
+		const readOnly = await screen.findByRole('switch', {
+			name: 'Enrollment of ada-laptop in proj-a',
+		});
+		// The state is still visible — only the control is withheld.
+		expect(readOnly.getAttribute('aria-checked')).toBe('true');
+		expect((readOnly as HTMLButtonElement).disabled).toBe(true);
+		expect(readOnly.getAttribute('title')).toContain('administrator');
+		fireEvent.click(readOnly);
+		expect(setStatusMutate).not.toHaveBeenCalled();
+	});
+
+	it('fails closed while the access read is still in flight', async () => {
+		viewerAccessQueryFn.mockReturnValue(new Promise(() => {}));
+		rosterQueryFn.mockResolvedValue([makeRosterEntry()]);
+		renderTable(<WorkersTable workers={[makeWorker()]} />);
+
+		const unresolved = await screen.findByRole('switch', {
+			name: 'Enrollment of ada-laptop in proj-a',
+		});
+		expect((unresolved as HTMLButtonElement).disabled).toBe(true);
+	});
+
+	it('confirms before suspending, then calls setStatus with the enrollment and the new status', async () => {
+		viewerAccessQueryFn.mockResolvedValue({ canAdminister: true });
+		rosterQueryFn.mockResolvedValueOnce([makeRosterEntry()]).mockReturnValue(new Promise(() => {}));
+		setStatusMutate.mockResolvedValue(updatedEnrollment('suspended'));
+		renderTable(<WorkersTable workers={[makeWorker()]} />);
+
+		fireEvent.click(
+			await screen.findByRole('switch', { name: 'Enrollment of ada-laptop in proj-a' }),
+		);
+
+		// The confirmation names the consequence and nothing has been sent yet.
+		expect(screen.getByRole('heading', { name: 'Suspend this enrollment?' })).toBeDefined();
+		expect(screen.getByText(/does not stop a run already in progress/i)).toBeDefined();
+		expect(setStatusMutate).not.toHaveBeenCalled();
+
+		fireEvent.click(screen.getByRole('button', { name: 'Suspend enrollment' }));
+
+		// Immediately effective: the switch flips before the reconciling refetch lands.
+		expect(
+			(
+				await screen.findByRole('switch', { name: 'Enrollment of ada-laptop in proj-a' })
+			).getAttribute('aria-checked'),
+		).toBe('false');
+		expect(setStatusMutate).toHaveBeenCalledWith({ enrollmentId: 'enr-1', status: 'suspended' });
+	});
+
+	it('reactivates directly, with no confirmation', async () => {
+		viewerAccessQueryFn.mockResolvedValue({ canAdminister: true });
+		rosterQueryFn
+			.mockResolvedValueOnce([makeRosterEntry({ status: 'suspended', isRoutable: false })])
+			.mockReturnValue(new Promise(() => {}));
+		setStatusMutate.mockResolvedValue(updatedEnrollment('active'));
+		renderTable(<WorkersTable workers={[makeWorker()]} />);
+
+		fireEvent.click(
+			await screen.findByRole('switch', { name: 'Enrollment of ada-laptop in proj-a' }),
+		);
+
+		expect(screen.queryByRole('heading', { name: 'Suspend this enrollment?' })).toBeNull();
+		expect(
+			(
+				await screen.findByRole('switch', { name: 'Enrollment of ada-laptop in proj-a' })
+			).getAttribute('aria-checked'),
+		).toBe('true');
+		expect(setStatusMutate).toHaveBeenCalledWith({ enrollmentId: 'enr-1', status: 'active' });
+	});
+
+	it('leaves the status unchanged and surfaces the error inline when a reactivate is rejected', async () => {
+		viewerAccessQueryFn.mockResolvedValue({ canAdminister: true });
+		rosterQueryFn.mockResolvedValue([makeRosterEntry({ status: 'suspended', isRoutable: false })]);
+		setStatusMutate.mockRejectedValue(new Error('Enrollment with ID "enr-1" not found'));
+		renderTable(<WorkersTable workers={[makeWorker()]} />);
+
+		fireEvent.click(
+			await screen.findByRole('switch', { name: 'Enrollment of ada-laptop in proj-a' }),
+		);
+
+		expect(await screen.findByText('Enrollment with ID "enr-1" not found')).toBeDefined();
+		expect(
+			(
+				await screen.findByRole('switch', { name: 'Enrollment of ada-laptop in proj-a' })
+			).getAttribute('aria-checked'),
+		).toBe('false');
+	});
+
+	it('withholds the switch while the roster query is delayed rather than implying a suspension', async () => {
+		viewerAccessQueryFn.mockResolvedValue({ canAdminister: true });
+		rosterQueryFn.mockReturnValue(new Promise(() => {}));
+		renderTable(<WorkersTable workers={[makeWorker()]} />);
+
+		expect(screen.queryByRole('switch')).toBeNull();
+		expect(screen.getAllByTitle('Enrollment status unavailable').length).toBeGreaterThan(0);
+	});
+
+	it('shows an em dash for a registered-but-un-enrolled machine', () => {
+		renderTable(<WorkersTable workers={[makeWorker({ enrollments: [] })]} />);
+
+		expect(screen.queryByRole('switch')).toBeNull();
+		expect(screen.queryByText('Pending')).toBeNull();
+	});
+
+	// Both switch columns share one confirmation, and this column's mutation also
+	// carries the direct reactivation of every other row — so a reactivation landing
+	// mid-flight must leave another enrollment's open confirmation entirely alone.
+	it('leaves a second enrollment’s confirmation open when an unrelated reactivation lands', async () => {
+		viewerAccessQueryFn.mockResolvedValue({ canAdminister: true });
+		rosterQueryFn.mockImplementation(async ({ projectId }: { projectId: string }) =>
+			projectId === 'proj-a'
+				? [makeRosterEntry()]
+				: [
+						makeRosterEntry({
+							enrollmentId: 'enr-2',
+							projectId: 'proj-b',
+							status: 'suspended',
+							isRoutable: false,
+						}),
+					],
+		);
+		let settleReactivation: () => void = () => {};
+		setStatusMutate.mockImplementationOnce(
+			() =>
+				new Promise((resolve) => {
+					settleReactivation = () =>
+						resolve({ ...updatedEnrollment('active'), id: 'enr-2', projectId: 'proj-b' });
+				}),
+		);
+		setStatusMutate.mockResolvedValue(updatedEnrollment('suspended'));
+		renderTable(
+			<WorkersTable
+				workers={[
+					makeWorker({
+						enrollments: [
+							{ projectId: 'proj-a', status: 'active', allowedClis: ['claude'] },
+							{ projectId: 'proj-b', status: 'suspended', allowedClis: ['claude'] },
+						],
+					}),
+				]}
+			/>,
+		);
+
+		// Reactivate proj-b directly — no dialog — and leave it in flight.
+		fireEvent.click(
+			await screen.findByRole('switch', { name: 'Enrollment of ada-laptop in proj-b' }),
+		);
+		// Then open proj-a's suspension confirmation while that request is outstanding.
+		fireEvent.click(
+			await screen.findByRole('switch', { name: 'Enrollment of ada-laptop in proj-a' }),
+		);
+		const confirmButton = screen.getByRole('button', { name: 'Suspend enrollment' });
+		// The dialog reports its own action only: the outstanding write is not its own.
+		expect((confirmButton as HTMLButtonElement).disabled).toBe(false);
+		expect(setStatusMutate).toHaveBeenCalledTimes(1);
+
+		settleReactivation();
+		await waitFor(() =>
+			expect(
+				(
+					screen.getByRole('switch', {
+						name: 'Enrollment of ada-laptop in proj-b',
+					}) as HTMLButtonElement
+				).disabled,
+			).toBe(false),
+		);
+
+		// proj-a's confirmation survived the unrelated success, and still sends its own
+		// write — the one the operator confirmed — when it is finally confirmed.
+		expect(screen.getByRole('heading', { name: 'Suspend this enrollment?' })).toBeDefined();
+		expect(setStatusMutate).toHaveBeenCalledTimes(1);
+
+		fireEvent.click(screen.getByRole('button', { name: 'Suspend enrollment' }));
+		await waitFor(() =>
+			expect(screen.queryByRole('heading', { name: 'Suspend this enrollment?' })).toBeNull(),
+		);
+		expect(setStatusMutate).toHaveBeenLastCalledWith({
+			enrollmentId: 'enr-1',
+			status: 'suspended',
+		});
+	});
+
+	it('keeps the two axes apart: suspending never touches sharing consent', async () => {
+		viewerAccessQueryFn.mockResolvedValue({ canAdminister: true });
+		listMineQueryFn.mockResolvedValue([makeOwnerWorker()]);
+		rosterQueryFn.mockResolvedValueOnce([makeRosterEntry()]).mockReturnValue(new Promise(() => {}));
+		setStatusMutate.mockResolvedValue(updatedEnrollment('suspended'));
+		renderTable(<WorkersTable workers={[makeWorker()]} />);
+
+		fireEvent.click(
+			await screen.findByRole('switch', { name: 'Enrollment of ada-laptop in proj-a' }),
+		);
+		fireEvent.click(screen.getByRole('button', { name: 'Suspend enrollment' }));
+
+		expect(setConsentMutate).not.toHaveBeenCalled();
+		// The owner's consent switch is still on — the server said so, and the
+		// optimistic patch restates it rather than guessing.
+		expect(
+			(await screen.findByRole('switch', { name: 'Share ada-laptop with proj-a' })).getAttribute(
+				'aria-checked',
+			),
+		).toBe('true');
+	});
+});
+
 describe('WorkersTable read-only surface for non-owners', () => {
 	it('offers no operable control when the viewer owns no worker', async () => {
 		projectsListQueryFn.mockResolvedValue([
@@ -813,8 +1135,8 @@ describe('WorkersTable build mark (issue #925)', () => {
 	it('adds no column — the mark rides in the Machine cell', () => {
 		renderTable(<WorkersTable workers={[makeWorker({ buildIsCurrent: false })]} />);
 
-		expect(screen.getAllByRole('columnheader')).toHaveLength(6);
-		expect(screen.getAllByRole('row')[1].querySelectorAll('td')).toHaveLength(6);
+		expect(screen.getAllByRole('columnheader')).toHaveLength(7);
+		expect(screen.getAllByRole('row')[1].querySelectorAll('td')).toHaveLength(7);
 	});
 });
 
@@ -938,7 +1260,7 @@ describe('WorkersTable row navigation (issue #477)', () => {
 
 		// The row's last cell is Available (the consent switch's), not a chevron's.
 		const cells = screen.getAllByRole('row')[1].querySelectorAll('td');
-		expect(cells).toHaveLength(6);
+		expect(cells).toHaveLength(7);
 		expect(screen.queryByText('Open')).toBeNull();
 	});
 
