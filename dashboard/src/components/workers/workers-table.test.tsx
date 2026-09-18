@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { fireEvent, render, screen, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import type { ReactElement } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
@@ -969,6 +969,84 @@ describe('WorkersTable Enrolled column (issue #1035)', () => {
 
 		expect(screen.queryByRole('switch')).toBeNull();
 		expect(screen.queryByText('Pending')).toBeNull();
+	});
+
+	// Both switch columns share one confirmation, and this column's mutation also
+	// carries the direct reactivation of every other row — so a reactivation landing
+	// mid-flight must leave another enrollment's open confirmation entirely alone.
+	it('leaves a second enrollment’s confirmation open when an unrelated reactivation lands', async () => {
+		viewerAccessQueryFn.mockResolvedValue({ canAdminister: true });
+		rosterQueryFn.mockImplementation(async ({ projectId }: { projectId: string }) =>
+			projectId === 'proj-a'
+				? [makeRosterEntry()]
+				: [
+						makeRosterEntry({
+							enrollmentId: 'enr-2',
+							projectId: 'proj-b',
+							status: 'suspended',
+							isRoutable: false,
+						}),
+					],
+		);
+		let settleReactivation: () => void = () => {};
+		setStatusMutate.mockImplementationOnce(
+			() =>
+				new Promise((resolve) => {
+					settleReactivation = () =>
+						resolve({ ...updatedEnrollment('active'), id: 'enr-2', projectId: 'proj-b' });
+				}),
+		);
+		setStatusMutate.mockResolvedValue(updatedEnrollment('suspended'));
+		renderTable(
+			<WorkersTable
+				workers={[
+					makeWorker({
+						enrollments: [
+							{ projectId: 'proj-a', status: 'active', allowedClis: ['claude'] },
+							{ projectId: 'proj-b', status: 'suspended', allowedClis: ['claude'] },
+						],
+					}),
+				]}
+			/>,
+		);
+
+		// Reactivate proj-b directly — no dialog — and leave it in flight.
+		fireEvent.click(
+			await screen.findByRole('switch', { name: 'Enrollment of ada-laptop in proj-b' }),
+		);
+		// Then open proj-a's suspension confirmation while that request is outstanding.
+		fireEvent.click(
+			await screen.findByRole('switch', { name: 'Enrollment of ada-laptop in proj-a' }),
+		);
+		const confirmButton = screen.getByRole('button', { name: 'Suspend enrollment' });
+		// The dialog reports its own action only: the outstanding write is not its own.
+		expect((confirmButton as HTMLButtonElement).disabled).toBe(false);
+		expect(setStatusMutate).toHaveBeenCalledTimes(1);
+
+		settleReactivation();
+		await waitFor(() =>
+			expect(
+				(
+					screen.getByRole('switch', {
+						name: 'Enrollment of ada-laptop in proj-b',
+					}) as HTMLButtonElement
+				).disabled,
+			).toBe(false),
+		);
+
+		// proj-a's confirmation survived the unrelated success, and still sends its own
+		// write — the one the operator confirmed — when it is finally confirmed.
+		expect(screen.getByRole('heading', { name: 'Suspend this enrollment?' })).toBeDefined();
+		expect(setStatusMutate).toHaveBeenCalledTimes(1);
+
+		fireEvent.click(screen.getByRole('button', { name: 'Suspend enrollment' }));
+		await waitFor(() =>
+			expect(screen.queryByRole('heading', { name: 'Suspend this enrollment?' })).toBeNull(),
+		);
+		expect(setStatusMutate).toHaveBeenLastCalledWith({
+			enrollmentId: 'enr-1',
+			status: 'suspended',
+		});
 	});
 
 	it('keeps the two axes apart: suspending never touches sharing consent', async () => {

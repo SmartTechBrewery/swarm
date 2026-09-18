@@ -672,8 +672,14 @@ function switchFeedback<Variables extends { enrollmentId: string }>(
 		variables: Variables | undefined;
 	},
 	restoring: (variables: Variables) => boolean,
-	/** A confirmation is open, so a failure has a dialog of its own to be reported in. */
-	confirming: boolean,
+	/**
+	 * The enrollment whose confirmation is open, if any — that one's failure has a
+	 * dialog of its own to be reported in. Scoped to the enrollment rather than a bare
+	 * "a dialog is open", because one mutation serves both directions on every row:
+	 * suppressing on the open dialog alone would swallow an unrelated row's failure,
+	 * which {@link confirmFeedback} is no longer willing to report either.
+	 */
+	confirmingEnrollmentId: string | undefined,
 ): {
 	pendingEnrollmentId: string | undefined;
 	inlineErrorEnrollmentId: string | undefined;
@@ -681,7 +687,10 @@ function switchFeedback<Variables extends { enrollmentId: string }>(
 } {
 	const variables = mutation.variables;
 	const reportsInline =
-		mutation.isError && !confirming && variables !== undefined && restoring(variables);
+		mutation.isError &&
+		variables !== undefined &&
+		restoring(variables) &&
+		confirmingEnrollmentId !== variables.enrollmentId;
 	return {
 		pendingEnrollmentId: mutation.isPending ? variables?.enrollmentId : undefined,
 		inlineErrorEnrollmentId: reportsInline ? variables?.enrollmentId : undefined,
@@ -693,13 +702,31 @@ function switchFeedback<Variables extends { enrollmentId: string }>(
  * Which of the two writes an open confirmation belongs to, as the shared dialog needs
  * to read it. Resolved here rather than in the table body so the dialog always
  * reports the mutation it is actually about.
+ *
+ * "Actually about" is the enrollment as well as the kind: the same mutation also
+ * carries the *direct* direction — reactivating, re-enabling sharing — for every other
+ * row, so a dialog that read the mutation's bare pending/error state would report a
+ * write it never asked for (claiming "Suspending…" over an unrelated reactivation, and
+ * disabling its own buttons for the duration). Until this target's own write is sent,
+ * the dialog reports nothing.
  */
 function confirmFeedback(
 	target: ConfirmTarget | null,
-	consent: { isPending: boolean; error: { message: string } | null },
-	status: { isPending: boolean; error: { message: string } | null },
+	consent: {
+		isPending: boolean;
+		error: { message: string } | null;
+		variables: { enrollmentId: string } | undefined;
+	},
+	status: {
+		isPending: boolean;
+		error: { message: string } | null;
+		variables: { enrollmentId: string } | undefined;
+	},
 ): { pending: boolean; errorMessage: string | null } {
 	const responsible = target?.kind === 'suspend' ? status : consent;
+	if (!target || responsible.variables?.enrollmentId !== target.enrollmentId) {
+		return { pending: false, errorMessage: null };
+	}
 	return { pending: responsible.isPending, errorMessage: responsible.error?.message ?? null };
 }
 
@@ -853,6 +880,22 @@ export function WorkersTable({
 
 	const [confirmTarget, setConfirmTarget] = useState<ConfirmTarget | null>(null);
 
+	/**
+	 * A confirmation is dismissed by its **own** write landing, never by any other.
+	 * Both columns share one `confirmTarget` and each column's mutation also serves a
+	 * direct, unconfirmed toggle on every other row, so an unconditional dismissal let
+	 * a reactivation (or a sharing enable) completing anywhere close a dialog the
+	 * operator had since opened for a different enrollment — discarding a confirmed
+	 * intent without ever sending its write. Matching on both the kind and the
+	 * enrollment is what makes "its own" precise; the state updater reads the current
+	 * target rather than the one captured when the write was sent.
+	 */
+	function dismissConfirmed(kind: ConfirmTarget['kind'], enrollmentId: string) {
+		setConfirmTarget((current) =>
+			current?.kind === kind && current.enrollmentId === enrollmentId ? null : current,
+		);
+	}
+
 	const consentMutation = useMutation({
 		mutationFn: (variables: { enrollmentId: string; projectId: string; sharingConsent: boolean }) =>
 			trpcClient.workers.setConsent.mutate({
@@ -878,7 +921,10 @@ export function WorkersTable({
 			queryClient.invalidateQueries({
 				queryKey: trpc.workers.listMine.queryOptions().queryKey,
 			});
-			setConfirmTarget(null);
+			// Only the revoking direction ever came from the dialog.
+			if (!variables.sharingConsent) {
+				dismissConfirmed('stop-sharing', variables.enrollmentId);
+			}
 		},
 	});
 
@@ -912,7 +958,10 @@ export function WorkersTable({
 			queryClient.invalidateQueries({
 				queryKey: trpc.workers.listMine.queryOptions().queryKey,
 			});
-			setConfirmTarget(null);
+			// Only suspension ever came from the dialog; a reactivation is sent directly.
+			if (variables.status === 'suspended') {
+				dismissConfirmed('suspend', variables.enrollmentId);
+			}
 		},
 	});
 
@@ -986,16 +1035,16 @@ export function WorkersTable({
 		});
 	}
 
-	const confirming = confirmTarget !== null;
+	const confirmingEnrollmentId = confirmTarget?.enrollmentId;
 	const consentFeedback = switchFeedback(
 		consentMutation,
 		(variables) => variables.sharingConsent,
-		confirming,
+		confirmingEnrollmentId,
 	);
 	const statusFeedback = switchFeedback(
 		statusMutation,
 		(variables) => variables.status === 'active',
-		confirming,
+		confirmingEnrollmentId,
 	);
 	const confirm = confirmFeedback(confirmTarget, consentMutation, statusMutation);
 
