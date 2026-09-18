@@ -76,6 +76,16 @@ vi.mock('@/lib/trpc.js', () => ({
 			list: {
 				queryOptions: () => ({ queryKey: ['projects.list'], queryFn: projectsListQueryFn }),
 			},
+			// The table's **Enrolled** column asks this per visible project (issue #1035)
+			// to decide whether the status switch is actionable. Left pending here, which
+			// is the fail-closed reading — this suite is about the roster around the
+			// table, not about that column.
+			viewerAccess: {
+				queryOptions: (input: { projectId: string }) => ({
+					queryKey: ['projects.viewerAccess', input],
+					queryFn: () => new Promise(() => {}),
+				}),
+			},
 		},
 		auth: {
 			me: { queryOptions: () => ({ queryKey: ['auth.me'], queryFn: meQueryFn }) },
@@ -84,6 +94,7 @@ vi.mock('@/lib/trpc.js', () => ({
 	trpcClient: {
 		workers: {
 			setConsent: { mutate: vi.fn() },
+			setStatus: { mutate: vi.fn() },
 			reorderProjectWorker: { mutate: reorderMutate },
 			requestUpdateForInstallation: { mutate: requestUpdateForInstallationMutate },
 			startFleetUpdateForInstallation: { mutate: startFleetUpdateForInstallationMutate },

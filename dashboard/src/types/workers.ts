@@ -7,9 +7,13 @@
  *
  * Everything here is secret-free by construction on the server: no machine path,
  * credential, token, or credential hash crosses the wire. The Workers *table*
- * exposes one operable field, the owner-controlled `sharingConsent` toggle
- * (#282); the per-worker detail view (#477) adds the enrollment's execution
- * constraints (owner) and its approval/suspension (project administrator), each
+ * exposes two operable fields, one per axis of an enrollment: the owner-controlled
+ * `sharingConsent` toggle (#282) and, since issue #1035, the project
+ * administrator's `status` (`active` ↔ `suspended`) — the second gated on
+ * `projects.viewerAccess` rather than on a flag carried here, since the roster
+ * entry is per `(worker, project)` and the capability is per project. The
+ * per-worker detail view (#477) adds the enrollment's execution
+ * constraints (owner) and its approval (project administrator), each
  * offered only where the server-declared capability flag says the viewer may
  * change it. Facts a daemon states at handshake stay read-only everywhere —
  * `supportedPhases`, the checkout `repository`, and the SWARM `build` (issue #925)

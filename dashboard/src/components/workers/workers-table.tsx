@@ -1,4 +1,10 @@
-import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
+import {
+	type QueryClient,
+	useMutation,
+	useQueries,
+	useQuery,
+	useQueryClient,
+} from '@tanstack/react-query';
 import { ChevronDown, ChevronUp } from 'lucide-react';
 import { useState } from 'react';
 import { WorkItemCell } from '@/components/runs/work-item-cell.js';
@@ -8,7 +14,9 @@ import { Modal, ModalFooter } from '@/components/ui/modal.js';
 import { ToggleSwitch } from '@/components/ui/toggle-switch.js';
 import { WorkerBuildBadge, WorkerUpdatingBadge } from '@/components/workers/worker-build.js';
 import { formatPhase, formatRelativeTime } from '@/lib/format.js';
+import { viewerAdministersProject } from '@/lib/project-nav.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
+import { ENROLLMENT_STATUS_LABELS } from '@/lib/worker-enrollment-view.js';
 import type {
 	OwnerWorker,
 	WorkerEnrollmentStatus,
@@ -21,7 +29,7 @@ import type {
  * connectivity, effective CLI capabilities, the job it is executing, and — per
  * visible project — whether it is available for automatic dispatch.
  *
- * The one operable affordance (issue #282) is the owner-controlled **sharing
+ * The first operable affordance (issue #282) is the owner-controlled **sharing
  * consent** switch, which the **Available** column is named for: it is actionable
  * only for an enrollment the signed-in operator *owns* — established by its
  * presence in `workers.listMine`, never inferred from a client-supplied owner
@@ -30,17 +38,36 @@ import type {
  * automatic dispatch immediately; it never kills a running agent. Someone else's
  * worker shows the same switch **disabled**, so a project administrator can see
  * that an enrolled worker isn't shared without gaining a control over it.
- * Approval, routing, and machine lifecycle stay off this screen entirely.
+ * Routing and machine lifecycle stay off this screen entirely.
  *
- * Consent state comes from `workers.roster` (readable by any project
- * `contributor`), so that unavailability is visible with no machine path, token,
+ * The second is the **Enrolled** column (issue #1035) — the *other* half of the
+ * routability predicate (`status === 'active' && sharingConsent`), which is why it
+ * reads immediately before **Available**. It is the same switch over the same
+ * one-row-per-enrollment shape, and everything that differs about it follows from
+ * the axis having a different owner: enrollment status is the **project
+ * administrator's**, so the switch is actionable only where
+ * `projects.viewerAccess` says the viewer administers *that enrollment's* project
+ * — the same authorization `workers.setStatus`, the mutation it calls, re-checks
+ * server-side — and read-only everywhere else, exactly as **Available** is for a
+ * machine the viewer doesn't own. Suspending takes the same confirmation
+ * disabling sharing does, because it has the identical consequence. Approving a
+ * `pending` enrollment is *not* offered here: a third state cannot be an on/off
+ * switch without reading as one of the two it isn't, so a pending enrollment
+ * renders as a marker and its approval stays on the machine's own detail page,
+ * where the administrator's other acts already live.
+ *
+ * Consent and enrollment status both come from `workers.roster` (readable by any
+ * project `contributor`), so both are visible with no machine path, token,
  * or credential. The table deliberately shows *less* than the roster read model
  * carries (issue #473): approval state and per-project busy/idle were dropped
  * from the old Enrollment cell rather than crowding one column with five
  * unrelated facts — busy already reads off **Active job**. Those facts, and the
  * controls that administer them, now live one click away on the per-worker
  * detail view (issue #477): a row click opens it, so the table stays the
- * scannable index. Effective allowed CLIs stayed, but folded into
+ * scannable index. **Enrolled** is not that cell coming back: it is one fact with
+ * one control in a column of its own, on the same terms **Available** already
+ * held, and the rest of what the old cell crowded in stays on the detail view.
+ * Effective allowed CLIs stayed, but folded into
  * **Capabilities** as a cross-project union ({@link effectiveClis}) rather than
  * broken out per project — a per-project breakdown is what the detail view is
  * for.
@@ -128,19 +155,27 @@ interface WorkersTableProps {
  * last-seen time wraps under it, so half its former width goes to Capabilities,
  * whose CLI chips otherwise wrap one-per-line for a three-CLI machine.
  *
- * Active job is also where the reorder column takes its width from and where the
- * removed row-open chevron's went (issue #752): the prose cell absorbs and gives
- * back spare width without any other column changing size, so the two variants of
- * the table read identically column-for-column.
+ * Active job is also where the reorder column takes its width from, where the
+ * removed row-open chevron's went (issue #752), and where **Enrolled**'s came from
+ * (issue #1035): the prose cell absorbs and gives back spare width without any
+ * other column changing size, so every variant of the table reads identically
+ * column-for-column.
+ *
+ * **Enrolled** and **Available** are sized identically because they hold the same
+ * thing — one switch per visible enrollment — and a pair of twins that differed in
+ * width would read as a difference in what they carry. Nine percent rather than the
+ * ten **Available** had alone: a switch is 36px, so the extra point bought nothing,
+ * and the prose column is where it is worth more.
  */
 const COLUMN_WIDTHS = {
 	machine: 'w-[16%]',
 	owner: 'w-[14%]',
 	status: 'w-[9%]',
 	capabilities: 'w-[20%]',
-	activeJob: 'w-[31%]',
-	activeJobWithReorder: 'w-[24%]',
-	available: 'w-[10%]',
+	activeJob: 'w-[23%]',
+	activeJobWithReorder: 'w-[16%]',
+	enrolled: 'w-[9%]',
+	available: 'w-[9%]',
 	// The two stacked-side-by-side reorder arrows — the narrowest column that fits them.
 	reorder: 'w-[7%]',
 };
@@ -246,22 +281,29 @@ function CapabilitiesCell({ worker }: { worker: WorkerRow }) {
 }
 
 /**
- * Sharing consent as the shared design-system switch (`components/ui/toggle-switch.tsx`,
- * the one the Agent Configuration phase toggles use), so a switch looks and
- * behaves the same everywhere. Read-only for a worker the viewer doesn't own: it
- * renders disabled, with the `title` saying who can change it.
+ * One boolean of one `(worker, project)` enrollment, as the shared design-system
+ * switch (`components/ui/toggle-switch.tsx`, the one the Agent Configuration phase
+ * toggles use), so a switch looks and behaves the same everywhere. Shared by both
+ * switch columns — **Available**'s sharing consent and **Enrolled**'s enrollment
+ * status — which differ in who may operate them and in nothing else the control
+ * itself can see.
+ *
+ * Read-only for a viewer who may not change *this* value: it renders disabled, with
+ * the `title` saying whose it is. `readOnly` is re-checked in `onChange` as well as
+ * being passed to `disabled`, so a disabled switch cannot report an intent even if
+ * something contrives to click it.
  */
-function ConsentSwitch({
-	sharing,
+function EnrollmentSwitch({
+	checked,
 	pending,
 	readOnly,
 	label,
 	title,
 	onToggle,
 }: {
-	sharing: boolean;
+	checked: boolean;
 	pending: boolean;
-	/** A worker the viewer doesn't own: the state is shown, the control is not offered. */
+	/** A value the viewer may not change: the state is shown, the control is not offered. */
 	readOnly: boolean;
 	label: string;
 	title: string;
@@ -269,12 +311,12 @@ function ConsentSwitch({
 }) {
 	return (
 		<ToggleSwitch
-			checked={sharing}
+			checked={checked}
 			label={label}
 			title={title}
 			disabled={pending || readOnly}
 			onChange={() => {
-				if (!readOnly) onToggle(!sharing);
+				if (!readOnly) onToggle(!checked);
 			}}
 		/>
 	);
@@ -339,8 +381,8 @@ function AvailabilityCell({
 				}
 				return (
 					<li key={enrollment.projectId} className="space-y-1">
-						<ConsentSwitch
-							sharing={roster.sharingConsent}
+						<EnrollmentSwitch
+							checked={roster.sharingConsent}
 							pending={ownedEnrollmentId !== undefined && pendingEnrollmentId === ownedEnrollmentId}
 							readOnly={ownedEnrollmentId === undefined}
 							label={
@@ -367,6 +409,114 @@ function AvailabilityCell({
 						{ownedEnrollmentId !== undefined &&
 						inlineErrorEnrollmentId === ownedEnrollmentId &&
 						errorMessage ? (
+							<div className="text-[10px] text-red-400">{errorMessage}</div>
+						) : null}
+					</li>
+				);
+			})}
+		</ul>
+	);
+}
+
+interface EnrolledCellProps {
+	worker: WorkerRow;
+	projectNames: Map<string, string>;
+	rosterByKey: Map<string, WorkerRosterEntry>;
+	/** The visible projects the viewer administers — see {@link WorkersTable}'s access reads. */
+	administeredProjectIds: ReadonlySet<string>;
+	pendingEnrollmentId: string | undefined;
+	inlineErrorEnrollmentId: string | undefined;
+	errorMessage: string | null;
+	onToggle: (args: {
+		enrollmentId: string;
+		projectId: string;
+		workerName: string;
+		projectName: string;
+		next: boolean;
+	}) => void;
+}
+
+/**
+ * Enrollment status, one switch per visible enrollment (issue #1035): on is
+ * `active`, off is `suspended`, and the switch is actionable only for a project the
+ * viewer administers. Same shape, labelling and read-only treatment as
+ * {@link AvailabilityCell} beside it — the two columns are the two halves of the
+ * dispatch gate's own predicate, so they have to read as one kind of thing.
+ *
+ * **A `pending` enrollment is a marker, not a switch.** The axis has three states
+ * and a switch has two, so rendering one would put a never-approved enrollment on
+ * the side of either "enrolled" or "suspended" — and it is neither. The badge states
+ * the third state instead, and the act that resolves it (approval, a different
+ * mutation) stays on the machine's detail page rather than being smuggled into a
+ * switch that would then mean two things.
+ *
+ * A switch is withheld entirely while the project's roster query is loading or
+ * failed, for {@link AvailabilityCell}'s reason: the status is unknown then, and an
+ * off switch would state a suspension the server never reported.
+ */
+function EnrolledCell({
+	worker,
+	projectNames,
+	rosterByKey,
+	administeredProjectIds,
+	pendingEnrollmentId,
+	inlineErrorEnrollmentId,
+	errorMessage,
+	onToggle,
+}: EnrolledCellProps) {
+	if (worker.enrollments.length === 0) {
+		return <span className="text-sm text-zinc-500">—</span>;
+	}
+	return (
+		<ul className="space-y-2">
+			{worker.enrollments.map((enrollment) => {
+				const roster = rosterByKey.get(enrollmentKey(worker.workerId, enrollment.projectId));
+				const projectName = projectNames.get(enrollment.projectId) ?? enrollment.projectId;
+				if (!roster) {
+					return (
+						<li key={enrollment.projectId}>
+							<span className="text-sm text-zinc-500" title="Enrollment status unavailable">
+								—
+							</span>
+						</li>
+					);
+				}
+				if (roster.status === 'pending') {
+					return (
+						<li key={enrollment.projectId}>
+							<Badge
+								tone="caution"
+								title={`${ENROLLMENT_STATUS_LABELS.pending} — neither enrolled nor suspended. A ${projectName} administrator approves it on this machine's own page.`}
+							>
+								Pending
+							</Badge>
+						</li>
+					);
+				}
+				const canAdminister = administeredProjectIds.has(enrollment.projectId);
+				return (
+					<li key={enrollment.projectId} className="space-y-1">
+						<EnrollmentSwitch
+							checked={roster.status === 'active'}
+							pending={pendingEnrollmentId === roster.enrollmentId}
+							readOnly={!canAdminister}
+							label={`Enrollment of ${worker.displayName} in ${projectName}`}
+							title={
+								canAdminister
+									? `Suspend or reactivate ${worker.displayName}'s enrollment in ${projectName}`
+									: `Only a ${projectName} administrator can suspend or reactivate this enrollment`
+							}
+							onToggle={(next) =>
+								onToggle({
+									enrollmentId: roster.enrollmentId,
+									projectId: enrollment.projectId,
+									workerName: worker.displayName,
+									projectName,
+									next,
+								})
+							}
+						/>
+						{inlineErrorEnrollmentId === roster.enrollmentId && errorMessage ? (
 							<div className="text-[10px] text-red-400">{errorMessage}</div>
 						) : null}
 					</li>
@@ -432,11 +582,201 @@ function ReorderCell({
 	);
 }
 
+/**
+ * What one enrollment write leaves in the two canonical caches. Both writes patch
+ * **both** fields plus the derived verdict, whichever of the two they changed: the
+ * write path returns the whole enrollment row, so restating the status on a consent
+ * change (and the consent on a status change) says what the server just said rather
+ * than guessing, and the **Enrolled** and **Available** columns can never disagree
+ * in the window before the reconciling refetch lands.
+ */
+interface EnrollmentWriteResult {
+	enrollmentId: string;
+	sharingConsent: boolean;
+	status: WorkerEnrollmentStatus;
+}
+
+/** The project roster entry that write produces, with the routing verdict re-derived. */
+function patchRosterCache(
+	queryClient: QueryClient,
+	projectId: string,
+	written: EnrollmentWriteResult,
+) {
+	queryClient.setQueryData<WorkerRosterEntry[]>(
+		trpc.workers.roster.queryOptions({ projectId }).queryKey,
+		(old) =>
+			old?.map((entry) =>
+				entry.enrollmentId === written.enrollmentId ? { ...entry, ...patched(written) } : entry,
+			),
+	);
+}
+
+/** The same write, in the owner's own view of their machines. */
+function patchMineCache(queryClient: QueryClient, written: EnrollmentWriteResult) {
+	queryClient.setQueryData<OwnerWorker[]>(trpc.workers.listMine.queryOptions().queryKey, (old) =>
+		old?.map((owned) => ({
+			...owned,
+			enrollments: owned.enrollments.map((enrollment) =>
+				enrollment.enrollmentId === written.enrollmentId
+					? { ...enrollment, ...patched(written) }
+					: enrollment,
+			),
+		})),
+	);
+}
+
+/** The fields both caches take from a write — `isRoutable` is the gate's own predicate. */
+function patched({ sharingConsent, status }: EnrollmentWriteResult) {
+	return { sharingConsent, status, isRoutable: status === 'active' && sharingConsent };
+}
+
+/**
+ * A reduce-availability action waiting on its confirmation. Both kinds block
+ * *future* automatic dispatch the moment they land and neither touches a run in
+ * flight, which is why they share one dialog and one copy — the worker detail view
+ * pairs them for the same reason (`worker-enrollment-card.tsx`).
+ */
 interface ConfirmTarget {
+	kind: 'stop-sharing' | 'suspend';
 	enrollmentId: string;
 	projectId: string;
 	workerName: string;
 	projectName: string;
+}
+
+/**
+ * What the shared confirmation's danger button says: which of the two acts it is
+ * about to make, or that it is making it. A helper rather than a nested ternary in
+ * the attribute, so each of the four readings stays one legible phrase.
+ */
+function reduceAvailabilityConfirmLabel(suspending: boolean, pending: boolean): string {
+	if (suspending) return pending ? 'Suspending…' : 'Suspend enrollment';
+	return pending ? 'Stopping…' : 'Stop sharing';
+}
+
+/**
+ * The state one switch column reports back to its cell: which enrollment's control
+ * is busy, and which one failed somewhere the failure can actually be read.
+ *
+ * An inline (non-modal) error is surfaced only for the *restoring* direction —
+ * enabling sharing, reactivating an enrollment — because the reducing direction goes
+ * through the confirmation dialog, which stays open and states the message itself.
+ * Written once for both columns rather than twice, since the two axes differ only in
+ * which of their own variables counts as restoring.
+ */
+function switchFeedback<Variables extends { enrollmentId: string }>(
+	mutation: {
+		isPending: boolean;
+		isError: boolean;
+		error: { message: string } | null;
+		variables: Variables | undefined;
+	},
+	restoring: (variables: Variables) => boolean,
+	/** A confirmation is open, so a failure has a dialog of its own to be reported in. */
+	confirming: boolean,
+): {
+	pendingEnrollmentId: string | undefined;
+	inlineErrorEnrollmentId: string | undefined;
+	errorMessage: string | null;
+} {
+	const variables = mutation.variables;
+	const reportsInline =
+		mutation.isError && !confirming && variables !== undefined && restoring(variables);
+	return {
+		pendingEnrollmentId: mutation.isPending ? variables?.enrollmentId : undefined,
+		inlineErrorEnrollmentId: reportsInline ? variables?.enrollmentId : undefined,
+		errorMessage: mutation.error?.message ?? null,
+	};
+}
+
+/**
+ * Which of the two writes an open confirmation belongs to, as the shared dialog needs
+ * to read it. Resolved here rather than in the table body so the dialog always
+ * reports the mutation it is actually about.
+ */
+function confirmFeedback(
+	target: ConfirmTarget | null,
+	consent: { isPending: boolean; error: { message: string } | null },
+	status: { isPending: boolean; error: { message: string } | null },
+): { pending: boolean; errorMessage: string | null } {
+	const responsible = target?.kind === 'suspend' ? status : consent;
+	return { pending: responsible.isPending, errorMessage: responsible.error?.message ?? null };
+}
+
+/**
+ * The confirmation both reduce-availability actions share — revoking sharing
+ * consent (issue #282) and suspending an enrollment (issue #1035). Their
+ * consequence is identical, future dispatch stops now and the run in flight is
+ * untouched, so only the verb, the heading and the confirm label differ; the worker
+ * detail view pairs the same two for the same reason.
+ *
+ * The caller decides *which* mutation the open dialog belongs to and hands over its
+ * pending and error state, so this component never has to know there are two.
+ */
+function ReduceAvailabilityConfirm({
+	target,
+	pending,
+	errorMessage,
+	onCancel,
+	onConfirm,
+}: {
+	/** The action awaiting confirmation, or `null` when none is — which is also "closed". */
+	target: ConfirmTarget | null;
+	pending: boolean;
+	errorMessage: string | null;
+	onCancel: () => void;
+	onConfirm: () => void;
+}) {
+	const suspending = target?.kind === 'suspend';
+	return (
+		<Modal
+			open={target !== null}
+			onClose={() => {
+				if (!pending) onCancel();
+			}}
+			title={suspending ? 'Suspend this enrollment?' : 'Stop sharing this worker?'}
+		>
+			<div className="space-y-4">
+				<p className="text-sm text-zinc-400 leading-relaxed">
+					{suspending ? 'Suspending ' : 'Disabling sharing for '}
+					<span className="font-semibold text-zinc-200">{target?.workerName}</span> on{' '}
+					<span className="font-mono text-zinc-300">{target?.projectName}</span> blocks{' '}
+					<span className="text-zinc-200">future automatic dispatch</span> immediately. It{' '}
+					<span className="text-zinc-200">does not stop a run already in progress</span> — the
+					current run finishes normally.
+				</p>
+
+				{errorMessage ? (
+					<div className="p-2.5 bg-red-950/30 border border-red-900/30 text-xs text-red-400 rounded">
+						{errorMessage}
+					</div>
+				) : null}
+
+				<ModalFooter
+					primary={
+						<button
+							type="button"
+							onClick={onConfirm}
+							disabled={pending}
+							className={buttonClass('danger')}
+						>
+							{reduceAvailabilityConfirmLabel(suspending, pending)}
+						</button>
+					}
+					secondary={
+						<button
+							type="button"
+							onClick={onCancel}
+							disabled={pending}
+							className={buttonClass('secondary')}
+						>
+							Cancel
+						</button>
+					}
+				/>
+			</div>
+		</Modal>
+	);
 }
 
 export function WorkersTable({
@@ -480,6 +820,27 @@ export function WorkersTable({
 		}
 	});
 
+	// Which of those projects the viewer administers (issue #1035) — what authorizes
+	// an actionable **Enrolled** switch, the way `workers.listMine` authorizes an
+	// actionable **Available** one. It is the server-declared `projects.viewerAccess`
+	// capability, the same read the project screen decides its administrator tabs from
+	// and the same rule `workers.setStatus` re-checks on every call; never a role
+	// inferred client-side, and never `projects.list` membership, which reports
+	// nothing for an `instanceAdmin` who administers every project without a
+	// membership row. One query per visible project, authorized for the reason the
+	// roster reads above are.
+	//
+	// Deliberately *not* polled, unlike those: consent and enrollment status move
+	// under an open roster, a viewer's role on a project does not. It fails closed
+	// while it loads ({@link viewerAdministersProject}), so a control never flashes in
+	// for someone the server would refuse.
+	const viewerAccessQueries = useQueries({
+		queries: projectIds.map((projectId) => trpc.projects.viewerAccess.queryOptions({ projectId })),
+	});
+	const administeredProjectIds = new Set(
+		projectIds.filter((_, index) => viewerAdministersProject(viewerAccessQueries[index]?.data)),
+	);
+
 	const ownedEnrollmentIdByKey = new Map<string, string>();
 	for (const owned of mineQuery.data ?? []) {
 		for (const enrollment of owned.enrollments) {
@@ -503,8 +864,13 @@ export function WorkersTable({
 			// both canonical caches so the row flips before the refetch lands…
 			// The write path returns the raw enrollment row, whose id is the
 			// enrollment id the read models expose as `enrollmentId`.
-			patchRosterCache(variables.projectId, updated.id, updated.sharingConsent, updated.status);
-			patchMineCache(updated.id, updated.sharingConsent, updated.status);
+			const written = {
+				enrollmentId: updated.id,
+				sharingConsent: updated.sharingConsent,
+				status: updated.status,
+			};
+			patchRosterCache(queryClient, variables.projectId, written);
+			patchMineCache(queryClient, written);
 			// …then invalidate both for authoritative reconciliation.
 			queryClient.invalidateQueries({
 				queryKey: trpc.workers.roster.queryOptions({ projectId: variables.projectId }).queryKey,
@@ -516,39 +882,39 @@ export function WorkersTable({
 		},
 	});
 
-	function patchRosterCache(
-		projectId: string,
-		enrollmentId: string,
-		sharingConsent: boolean,
-		status: WorkerEnrollmentStatus,
-	) {
-		queryClient.setQueryData<WorkerRosterEntry[]>(
-			trpc.workers.roster.queryOptions({ projectId }).queryKey,
-			(old) =>
-				old?.map((entry) =>
-					entry.enrollmentId === enrollmentId
-						? { ...entry, sharingConsent, isRoutable: status === 'active' && sharingConsent }
-						: entry,
-				),
-		);
-	}
-
-	function patchMineCache(
-		enrollmentId: string,
-		sharingConsent: boolean,
-		status: WorkerEnrollmentStatus,
-	) {
-		queryClient.setQueryData<OwnerWorker[]>(trpc.workers.listMine.queryOptions().queryKey, (old) =>
-			old?.map((owned) => ({
-				...owned,
-				enrollments: owned.enrollments.map((enrollment) =>
-					enrollment.enrollmentId === enrollmentId
-						? { ...enrollment, sharingConsent, isRoutable: status === 'active' && sharingConsent }
-						: enrollment,
-				),
-			})),
-		);
-	}
+	// Suspend/reactivate (issue #1035) — the **existing** `workers.setStatus`, reached
+	// from a second place rather than reimplemented: no new endpoint, and the
+	// `projectAdmin` rule is re-checked there whatever this table offered. Its own
+	// mutation rather than a branch inside the consent one, so each switch reports
+	// only its own pending and error state, exactly as the detail view keeps its
+	// controls' outcomes apart.
+	const statusMutation = useMutation({
+		mutationFn: (variables: {
+			enrollmentId: string;
+			projectId: string;
+			status: 'active' | 'suspended';
+		}) =>
+			trpcClient.workers.setStatus.mutate({
+				enrollmentId: variables.enrollmentId,
+				status: variables.status,
+			}),
+		onSuccess: (updated, variables) => {
+			const written = {
+				enrollmentId: updated.id,
+				sharingConsent: updated.sharingConsent,
+				status: updated.status,
+			};
+			patchRosterCache(queryClient, variables.projectId, written);
+			patchMineCache(queryClient, written);
+			queryClient.invalidateQueries({
+				queryKey: trpc.workers.roster.queryOptions({ projectId: variables.projectId }).queryKey,
+			});
+			queryClient.invalidateQueries({
+				queryKey: trpc.workers.listMine.queryOptions().queryKey,
+			});
+			setConfirmTarget(null);
+		},
+	});
 
 	function handleToggle(args: {
 		enrollmentId: string;
@@ -568,6 +934,7 @@ export function WorkersTable({
 		}
 		// Disabling blocks future dispatch — confirm first.
 		setConfirmTarget({
+			kind: 'stop-sharing',
 			enrollmentId: args.enrollmentId,
 			projectId: args.projectId,
 			workerName: args.workerName,
@@ -575,8 +942,43 @@ export function WorkersTable({
 		});
 	}
 
-	function confirmDisable() {
+	function handleStatusToggle(args: {
+		enrollmentId: string;
+		projectId: string;
+		workerName: string;
+		projectName: string;
+		next: boolean;
+	}) {
+		if (args.next) {
+			// Reactivating only restores dispatch — nothing to warn about.
+			statusMutation.mutate({
+				enrollmentId: args.enrollmentId,
+				projectId: args.projectId,
+				status: 'active',
+			});
+			return;
+		}
+		// Suspending blocks future dispatch, the same consequence disabling sharing
+		// has — so it takes the same confirmation rather than landing on one click.
+		setConfirmTarget({
+			kind: 'suspend',
+			enrollmentId: args.enrollmentId,
+			projectId: args.projectId,
+			workerName: args.workerName,
+			projectName: args.projectName,
+		});
+	}
+
+	function confirmReduceAvailability() {
 		if (!confirmTarget) return;
+		if (confirmTarget.kind === 'suspend') {
+			statusMutation.mutate({
+				enrollmentId: confirmTarget.enrollmentId,
+				projectId: confirmTarget.projectId,
+				status: 'suspended',
+			});
+			return;
+		}
 		consentMutation.mutate({
 			enrollmentId: confirmTarget.enrollmentId,
 			projectId: confirmTarget.projectId,
@@ -584,15 +986,18 @@ export function WorkersTable({
 		});
 	}
 
-	const pendingEnrollmentId = consentMutation.isPending
-		? consentMutation.variables?.enrollmentId
-		: undefined;
-	// Surface an inline (non-modal) error only for a failed *enable*; a failed
-	// disable is shown inside its confirmation dialog, which stays open.
-	const inlineErrorEnrollmentId =
-		consentMutation.isError && consentMutation.variables?.sharingConsent === true && !confirmTarget
-			? consentMutation.variables?.enrollmentId
-			: undefined;
+	const confirming = confirmTarget !== null;
+	const consentFeedback = switchFeedback(
+		consentMutation,
+		(variables) => variables.sharingConsent,
+		confirming,
+	);
+	const statusFeedback = switchFeedback(
+		statusMutation,
+		(variables) => variables.status === 'active',
+		confirming,
+	);
+	const confirm = confirmFeedback(confirmTarget, consentMutation, statusMutation);
 
 	return (
 		<div className="border border-zinc-800 rounded-md overflow-hidden bg-panel/20 shadow-sm">
@@ -603,6 +1008,7 @@ export function WorkersTable({
 					<col className={COLUMN_WIDTHS.status} />
 					<col className={COLUMN_WIDTHS.capabilities} />
 					<col className={reorder ? COLUMN_WIDTHS.activeJobWithReorder : COLUMN_WIDTHS.activeJob} />
+					<col className={COLUMN_WIDTHS.enrolled} />
 					<col className={COLUMN_WIDTHS.available} />
 					{reorder ? <col className={COLUMN_WIDTHS.reorder} /> : null}
 				</colgroup>
@@ -622,6 +1028,12 @@ export function WorkersTable({
 						</th>
 						<th className="px-3 py-3 text-xs font-semibold uppercase tracking-wider text-zinc-400">
 							Active job
+						</th>
+						{/* Enrolled before Available: the dispatch gate's own predicate reads
+						    `status === 'active' && sharingConsent`, and the approval is the
+						    precondition the consent sits inside. */}
+						<th className="px-3 py-3 text-xs font-semibold uppercase tracking-wider text-zinc-400">
+							Enrolled
 						</th>
 						<th className="px-3 py-3 text-xs font-semibold uppercase tracking-wider text-zinc-400">
 							Available
@@ -700,14 +1112,26 @@ export function WorkersTable({
 								)}
 							</td>
 							<td className="px-3 py-3 align-top">
+								<EnrolledCell
+									worker={worker}
+									projectNames={projectNames}
+									rosterByKey={rosterByKey}
+									administeredProjectIds={administeredProjectIds}
+									pendingEnrollmentId={statusFeedback.pendingEnrollmentId}
+									inlineErrorEnrollmentId={statusFeedback.inlineErrorEnrollmentId}
+									errorMessage={statusFeedback.errorMessage}
+									onToggle={handleStatusToggle}
+								/>
+							</td>
+							<td className="px-3 py-3 align-top">
 								<AvailabilityCell
 									worker={worker}
 									projectNames={projectNames}
 									rosterByKey={rosterByKey}
 									ownedEnrollmentIdByKey={ownedEnrollmentIdByKey}
-									pendingEnrollmentId={pendingEnrollmentId}
-									inlineErrorEnrollmentId={inlineErrorEnrollmentId}
-									errorMessage={consentMutation.error?.message ?? null}
+									pendingEnrollmentId={consentFeedback.pendingEnrollmentId}
+									inlineErrorEnrollmentId={consentFeedback.inlineErrorEnrollmentId}
+									errorMessage={consentFeedback.errorMessage}
 									onToggle={handleToggle}
 								/>
 							</td>
@@ -726,53 +1150,13 @@ export function WorkersTable({
 				</tbody>
 			</table>
 
-			<Modal
-				open={!!confirmTarget}
-				onClose={() => {
-					if (!consentMutation.isPending) setConfirmTarget(null);
-				}}
-				title="Stop sharing this worker?"
-			>
-				<div className="space-y-4">
-					<p className="text-sm text-zinc-400 leading-relaxed">
-						Disabling sharing for{' '}
-						<span className="font-semibold text-zinc-200">{confirmTarget?.workerName}</span> on{' '}
-						<span className="font-mono text-zinc-300">{confirmTarget?.projectName}</span> blocks{' '}
-						<span className="text-zinc-200">future automatic dispatch</span> immediately. It{' '}
-						<span className="text-zinc-200">does not stop a run already in progress</span> — the
-						current run finishes normally.
-					</p>
-
-					{consentMutation.isError && confirmTarget ? (
-						<div className="p-2.5 bg-red-950/30 border border-red-900/30 text-xs text-red-400 rounded">
-							{consentMutation.error.message}
-						</div>
-					) : null}
-
-					<ModalFooter
-						primary={
-							<button
-								type="button"
-								onClick={confirmDisable}
-								disabled={consentMutation.isPending}
-								className={buttonClass('danger')}
-							>
-								{consentMutation.isPending ? 'Stopping…' : 'Stop sharing'}
-							</button>
-						}
-						secondary={
-							<button
-								type="button"
-								onClick={() => setConfirmTarget(null)}
-								disabled={consentMutation.isPending}
-								className={buttonClass('secondary')}
-							>
-								Cancel
-							</button>
-						}
-					/>
-				</div>
-			</Modal>
+			<ReduceAvailabilityConfirm
+				target={confirmTarget}
+				pending={confirm.pending}
+				errorMessage={confirm.errorMessage}
+				onCancel={() => setConfirmTarget(null)}
+				onConfirm={confirmReduceAvailability}
+			/>
 		</div>
 	);
 }

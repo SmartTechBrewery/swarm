@@ -1,7 +1,8 @@
 /**
  * The dashboard's one on/off switch, shared by every screen that has a boolean to
  * flip: the Agent Configuration phase toggles it was extracted from
- * (`routes/projects/$projectId.tsx`) and the Workers screen's Available column.
+ * (`routes/projects/$projectId.tsx`) and the Workers screen's Available and
+ * Enrolled columns.
  * One component, so a switch reads and behaves identically wherever it appears.
  *
  * It always calls `stopPropagation`: a switch commonly sits in a row that

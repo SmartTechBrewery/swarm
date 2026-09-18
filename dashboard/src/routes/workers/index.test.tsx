@@ -56,10 +56,18 @@ vi.mock('@/lib/trpc.js', () => ({
 			list: {
 				queryOptions: () => ({ queryKey: ['projects.list'], queryFn: projectsListQueryFn }),
 			},
+			// The roster table's **Enrolled** column asks this per visible project
+			// (issue #1035); left pending, which is its fail-closed reading.
+			viewerAccess: {
+				queryOptions: (input: { projectId: string }) => ({
+					queryKey: ['projects.viewerAccess', input],
+					queryFn: () => new Promise(() => {}),
+				}),
+			},
 		},
 	},
 	trpcClient: {
-		workers: { setConsent: { mutate: vi.fn() } },
+		workers: { setConsent: { mutate: vi.fn() }, setStatus: { mutate: vi.fn() } },
 	},
 }));
 
