@@ -99,13 +99,40 @@ export { installUpdateStateDir };
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * What each step of an apply is given before it is called hung.
+ *
+ * These are **kill thresholds, not expected durations**, and they are sized as
+ * generous multiples of what the step actually costs rather than as guesses at a
+ * worst case. Measured on this installation's own checkout (226 packages) on
+ * 2026-09-18: a warm `git fetch` took 1s and `npm run build` 4s.
+ *
+ * They used to be far looser — 10 minutes for a fetch, 5 for a checkout, 30 for
+ * each `npm` step — which cost nothing on its own, since a threshold only bites
+ * when something hangs. What it did cost was everything *derived* from it:
+ * {@link INSTALL_LOCK_FOLLOW_WAIT_MS} is their sum, so the peers sharing an install
+ * root waited 75 minutes on a holder that had wedged, and a sum of four
+ * independent worst cases describes no real run at all. Tightening the components
+ * is what makes that derived number mean something (it is now 16 minutes).
+ *
+ * The remaining headroom is deliberate and asymmetric: a threshold that is too
+ * tight kills a legitimate apply — a cold npm cache, a slow link, a weaker machine
+ * than this one — and leaves the install root half-written for its peers, which is
+ * far worse than waiting a few more minutes for a hang. So each is set well above
+ * anything observed, just no longer above anything imaginable.
+ */
 /** Reads (`rev-parse`, `status`, `merge-base`) answer immediately or not at all. */
 const GIT_READ_TIMEOUT_MS = 30_000;
-/** A fetch crosses the network; a checkout rewrites a working tree. */
-const GIT_FETCH_TIMEOUT_MS = 10 * 60_000;
-const GIT_CHECKOUT_TIMEOUT_MS = 5 * 60_000;
-/** A cold `npm ci` on a slow machine is the longest step here by a wide margin. */
-const NPM_TIMEOUT_MS = 30 * 60_000;
+/** A fetch crosses the network; a checkout rewrites a working tree. Both ran in ~1s. */
+const GIT_FETCH_TIMEOUT_MS = 2 * 60_000;
+const GIT_CHECKOUT_TIMEOUT_MS = 2 * 60_000;
+/**
+ * The two `npm` steps are budgeted apart because they fail differently: `ci` crosses
+ * the network and can face a cold cache, while `build` is local CPU and was measured
+ * at 4s. One constant for both gave the build the install's budget for no reason.
+ */
+const NPM_CI_TIMEOUT_MS = 8 * 60_000;
+const NPM_BUILD_TIMEOUT_MS = 4 * 60_000;
 
 /** Hard cap on what a subprocess may buffer, so a runaway build cannot exhaust memory. */
 const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
@@ -268,13 +295,16 @@ export const INSTALL_LOCK_WAIT_MS = 5_000;
  * (issue #973).
  *
  * Derived from this module's own step timeouts rather than picked: one fetch, one
- * checkout and the two `npm` steps is the longest apply it can run. A holder that
+ * checkout and the two `npm` steps is the longest apply it can run. That derivation
+ * is only honest while those thresholds are themselves realistic — summing four
+ * independent worst cases describes no run that has ever happened — which is why
+ * they are now sized against measurements (see their own comment). A holder that
  * *died* never costs this — the lock is reclaimable on liveness — and a holder still
  * going after it has left the install root on neither this daemon's target nor
  * anything else, which waiting longer cannot improve.
  */
 export const INSTALL_LOCK_FOLLOW_WAIT_MS =
-	GIT_FETCH_TIMEOUT_MS + GIT_CHECKOUT_TIMEOUT_MS + 2 * NPM_TIMEOUT_MS;
+	GIT_FETCH_TIMEOUT_MS + GIT_CHECKOUT_TIMEOUT_MS + NPM_CI_TIMEOUT_MS + NPM_BUILD_TIMEOUT_MS;
 
 /** How often that wait re-tries the lock. */
 const INSTALL_LOCK_POLL_MS = 500;
@@ -831,9 +861,9 @@ async function buildAt(
 		git(ctx, ['checkout', '--detach', commit], GIT_CHECKOUT_TIMEOUT_MS),
 	);
 	if (checkout.exitCode !== 0) return { stage: 'checkout', result: checkout };
-	const install = await ctx.run(npm(ctx, ['ci']));
+	const install = await ctx.run(npm(ctx, ['ci'], NPM_CI_TIMEOUT_MS));
 	if (install.exitCode !== 0) return { stage: 'install', result: install };
-	const build = await ctx.run(npm(ctx, ['run', 'build']));
+	const build = await ctx.run(npm(ctx, ['run', 'build'], NPM_BUILD_TIMEOUT_MS));
 	if (build.exitCode !== 0) return { stage: 'build', result: build };
 	return null;
 }
@@ -1171,8 +1201,8 @@ function git(ctx: InstallContext, args: string[], timeoutMs: number): UpdateComm
 	return { command: 'git', args, cwd: ctx.installRoot, timeoutMs };
 }
 
-function npm(ctx: InstallContext, args: string[]): UpdateCommand {
-	return { command: 'npm', args, cwd: ctx.installRoot, timeoutMs: NPM_TIMEOUT_MS };
+function npm(ctx: InstallContext, args: string[], timeoutMs: number): UpdateCommand {
+	return { command: 'npm', args, cwd: ctx.installRoot, timeoutMs };
 }
 
 /** A git read's trimmed stdout, or `null` when it did not answer. */

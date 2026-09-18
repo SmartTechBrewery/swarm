@@ -941,6 +941,41 @@ export async function recordWorkerUpdateReport(
 }
 
 /**
+ * Withdraw an update request nothing is waiting on any more, leaving the machine with
+ * no outstanding one.
+ *
+ * The control plane had no way to do this: `update_request_id` was cleared **only** by
+ * the machine's own report above, so a request whose asker had given up stayed
+ * pending, and `resendPendingWorkerUpdateToWorker` re-pushed it the next time the
+ * machine connected. For a rollout that has already settled such a member and put it
+ * back in the dispatch pool that is the drain's whole purpose undone: the machine
+ * would apply the update — exiting to do it — while eligible for new work.
+ *
+ * The `update_request_id` match carries the same weight it does for a report: only the
+ * exact request the caller gave up on is withdrawn, so one that has since been
+ * re-targeted by another session is left alone and the caller learns nothing was
+ * cleared (`undefined`). `undefined` also covers a request the machine answered in the
+ * same instant — the report wins, which is the right way round, since it is the
+ * machine's own account of what actually happened.
+ *
+ * `update_status` and `update_message` are deliberately **not** written: no outcome
+ * was reported, and inventing one would put a verdict the machine never gave in front
+ * of an operator. What the rollout knows goes on its own member row, which is where a
+ * reader is already looking.
+ */
+export async function withdrawWorkerUpdateRequest(
+	id: string,
+	requestId: string,
+): Promise<Worker | undefined> {
+	const [updatedRow] = await getDb()
+		.update(workers)
+		.set({ updateRequestId: null })
+		.where(and(eq(workers.id, id), eq(workers.updateRequestId, requestId)))
+		.returning();
+	return updatedRow ? rowToWorker(updatedRow) : undefined;
+}
+
+/**
  * Record that an operator asked this machine to sweep its abandoned worktrees,
  * replacing any request already outstanding (issue #955). Returns the updated
  * worker, or `undefined` if no worker has that id.

@@ -75,8 +75,13 @@ import {
 	listAllWorkers,
 	listWorkersForOwner,
 	setWorkerDraining,
+	withdrawWorkerUpdateRequest,
 } from '../identity/worker-service.js';
-import { getLiveSessionForWorker, type WorkerSession } from '../identity/worker-session-service.js';
+import {
+	getLiveSessionForWorker,
+	getRetainedSessionForWorker,
+	type WorkerSession,
+} from '../identity/worker-session-service.js';
 import {
 	DEFAULT_ROLLOUT_WAVE_SIZE,
 	isCommittedMemberState,
@@ -112,6 +117,38 @@ import { fanOutWorkerUpdate } from './worker-update-fanout.js';
  * known not to start.
  */
 const COME_BACK_WINDOW_MS = 10 * 60_000;
+
+/**
+ * How long a **signalled** member's machine may be silent before the rollout stops
+ * waiting for an answer it is not going to get.
+ *
+ * This state had no bound at all, which for an owner-scoped rollout was survivable —
+ * the stranded machine is your own and `swarm workers undrain` is yours to run — and
+ * stopped being so when issue #1024 let an administrator drain a machine belonging to
+ * somebody who never asked. A member signalled on a machine that then vanished would
+ * stay `signalled` for ever, `drainedByRollout`, and the only thing that could put it
+ * back was a manual undrain **by its owner**, since `setDraining` is still strictly
+ * owner-only. That is the standing administrative drain issue #919 refused, and it
+ * made issue #1024's own promise — nothing left out of the pool once the rollout is
+ * terminal — false for exactly the machines it was written for.
+ *
+ * **It is a silence window, not a duration for the state.** The apply happens inside
+ * `signalled` (fetch, `npm ci`, build; the daemon reports only once it is done), so a
+ * wall-clock bound on the state would be a guess at how long an apply takes — and
+ * nothing here can make that guess honestly: no worker update had ever completed on
+ * the installation this was written for. Disconnection is a fact rather than an
+ * estimate, and it is the failure actually being caught. A machine holding its session
+ * while it builds is healthy however long it takes, and is never settled by this.
+ *
+ * Five minutes is read off the ladder the machine would come back on, exactly as
+ * {@link COME_BACK_WINDOW_MS} is: the reconnect backoff is capped at a jittered 30s
+ * (`DEFAULT_BACKOFF.maxMs`), a LaunchAgent's `ThrottleInterval` is 30s, and
+ * `offlineSilenceMs` (`../router/worker-liveness.ts`) already calls 120s offline. Five
+ * minutes covers something like ten restart attempts, so a daemon that crashed
+ * mid-apply and is being restarted by its supervisor has room to come back and finish,
+ * while one that is genuinely gone is released in minutes rather than never.
+ */
+const SIGNALLED_SILENCE_WINDOW_MS = 5 * 60_000;
 
 /** One machine's line in a rollout readout — its member row plus the label an operator reads it by. */
 export interface RolloutMemberView extends WorkerUpdateRolloutMember {
@@ -390,11 +427,69 @@ interface MemberVerdict {
 	patch: MemberPatch;
 	returnToPool?: boolean;
 	halt?: string;
+	/**
+	 * The update request to withdraw as this member settles — set only where the
+	 * machine never answered, so the request would otherwise still be outstanding and
+	 * be re-pushed to it on its next connection.
+	 */
+	withdrawRequest?: string;
 }
+
+/** The message recorded for a member whose machine went quiet before it ever answered. */
+const SILENT_MESSAGE =
+	'the machine stopped answering before it reported what became of the update, so the ' +
+	'request was withdrawn and it was returned to the dispatch pool';
 
 /** The message recorded for a member whose machine another session asked again. */
 const SUPERSEDED_MESSAGE =
 	'another request replaced this rollout’s, so there was nothing left to verify here';
+
+/** What the control plane knows about a machine's reachability, read once per member. */
+interface MemberSilence {
+	/** Whether the machine holds a live session right now. */
+	live: boolean;
+	/** When it was last heard from, or `undefined` if it has never connected. */
+	lastSeenAt: Date | undefined;
+}
+
+/**
+ * Give up on a signalled member whose machine has gone quiet, or `undefined` while
+ * there is still reason to wait (see {@link SIGNALLED_SILENCE_WINDOW_MS}).
+ *
+ * Both halves are required and neither is sufficient. A machine that holds a session
+ * is answerable however long its apply is taking, so a live one is never settled here.
+ * A machine that is merely offline may have been offline for seconds — the daemon
+ * exits and reconnects as a matter of course — so how long it has been silent is what
+ * decides it, measured from the last heartbeat and falling back to the instant it was
+ * signalled for a machine that never connected at all.
+ *
+ * It settles `skipped`, never `failed`, and so does not halt: a machine nobody can
+ * reach has said nothing whatever about the build it was asked to move to, and
+ * stopping the fleet over it would turn one dead laptop into a stalled rollout. It is
+ * not counted as `done` either — nothing was installed and nothing came back.
+ *
+ * `returnToPool` is unconditional rather than scope-dependent, unlike the `failed`
+ * verdicts: the machine is being released precisely because this rollout has stopped
+ * waiting for it, and leaving an owner's own machine drained to be looked at only
+ * makes sense for one that answered.
+ */
+function decideSilence(
+	member: WorkerUpdateRolloutMember,
+	now: Date,
+	silence: MemberSilence,
+): MemberVerdict | undefined {
+	if (silence.live) return undefined;
+	const since = silence.lastSeenAt ?? member.signalledAt ?? now;
+	if (now.getTime() - since.getTime() <= SIGNALLED_SILENCE_WINDOW_MS) return undefined;
+	return {
+		patch: { state: 'skipped', message: SILENT_MESSAGE, settledAt: now },
+		returnToPool: true,
+		// Withdraw it, or `resendPendingWorkerUpdateToWorker` hands the machine the very
+		// request this member gave up on the moment it reconnects — and it is back in the
+		// dispatch pool by then, so it would exit to apply an update while holding work.
+		...(member.requestId ? { withdrawRequest: member.requestId } : {}),
+	};
+}
 
 /**
  * What a signalled member's own `workers` row says became of it, or `undefined`
@@ -412,9 +507,12 @@ function decideSettlement(
 	target: string,
 	now: Date,
 	releasesFailedMembers: boolean,
+	silence: MemberSilence,
 ): MemberVerdict | undefined {
 	const update = worker.update;
-	if (update?.requestId && update.requestId === member.requestId) return undefined;
+	if (update?.requestId && update.requestId === member.requestId) {
+		return decideSilence(member, now, silence);
+	}
 	if (!update || update.requestId || update.target !== target || !update.status) {
 		return {
 			patch: { state: 'skipped', message: SUPERSEDED_MESSAGE, settledAt: now },
@@ -582,18 +680,32 @@ class AdvancePass {
 		};
 	}
 
-	/** Step 1 — read each signalled member's answer off its own `workers` row. */
+	/**
+	 * Step 1 — read each signalled member's answer off its own `workers` row, and give
+	 * up on the ones whose machines have stopped answering at all.
+	 *
+	 * The two session reads are made for every signalled member rather than only for
+	 * one that looks stuck, because "has it gone quiet" cannot be answered from the
+	 * member row: the retained session is the only record of when the machine was last
+	 * heard from. They are the same two indexed lookups `verifyApplied` already makes
+	 * per member next door.
+	 */
 	private async settleSignalled(): Promise<void> {
 		for (const member of this.members) {
 			if (member.state !== 'signalled') continue;
 			const worker = this.workers.get(member.workerId);
 			if (!worker) continue;
+			const [live, retained] = await Promise.all([
+				getLiveSessionForWorker(member.workerId),
+				getRetainedSessionForWorker(member.workerId),
+			]);
 			const verdict = decideSettlement(
 				member,
 				worker,
 				this.rollout.target,
 				this.now,
 				this.releasesFailedMembers,
+				{ live: live !== undefined, lastSeenAt: retained?.lastHeartbeatAt },
 			);
 			if (verdict) await this.apply(member, verdict);
 		}
@@ -912,6 +1024,13 @@ class AdvancePass {
 	private async apply(member: WorkerUpdateRolloutMember, verdict: MemberVerdict): Promise<void> {
 		Object.assign(member, verdict.patch);
 		await this.write.setMember(member.workerId, verdict.patch);
+		// Before the pool return, deliberately: the hazard being closed is a machine that
+		// is back in the pool *and* still holds an outstanding request, so the window
+		// where both are true is kept shut rather than merely short. A request the
+		// machine answered in the same instant is left alone by the write's own guard.
+		if (verdict.withdrawRequest) {
+			await withdrawWorkerUpdateRequest(member.workerId, verdict.withdrawRequest);
+		}
 		if (verdict.returnToPool) await this.returnToPool(member);
 		if (verdict.halt) await this.halt(verdict.halt);
 	}

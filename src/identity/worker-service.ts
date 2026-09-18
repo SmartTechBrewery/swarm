@@ -40,6 +40,7 @@ import {
 	updateWorkerDisplayName,
 	updateWorkerSupportedPhases,
 	type WorkerUpdateRequestOutcome,
+	withdrawWorkerUpdateRequest as withdrawWorkerUpdateRequestRow,
 } from '../db/repositories/workersRepository.js';
 import type { AgentCli } from '../harness/agent-cli.js';
 import {
@@ -315,6 +316,23 @@ export async function recordWorkerUpdateReport(
 	message: string,
 ): Promise<Worker | undefined> {
 	return recordWorkerUpdateReportRow(id, requestId, status, message);
+}
+
+/**
+ * Withdraw an update request whose asker has given up on it, so the machine is left
+ * with none outstanding. Returns the updated worker, or `undefined` when the request
+ * named is no longer the outstanding one — it was re-targeted, or the machine
+ * answered it in the same instant, in which case its own report stands.
+ *
+ * The caller is a rollout releasing a member it can no longer wait for: putting the
+ * machine back in the dispatch pool while its request still stood would have the
+ * daemon apply the update, and so exit, while it was eligible for work again.
+ */
+export async function withdrawWorkerUpdateRequest(
+	id: string,
+	requestId: string,
+): Promise<Worker | undefined> {
+	return withdrawWorkerUpdateRequestRow(id, requestId);
 }
 
 /**
