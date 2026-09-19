@@ -295,10 +295,10 @@ export function classifyDeferrable(err: unknown): DeferrableAssignmentFailure | 
  */
 function reportedAgentExit(
 	err: unknown,
-): Pick<TaskExecutionResult, 'exitCode' | 'signal' | 'timedOut' | 'durationMs'> {
+): Pick<TaskExecutionResult, 'exitCode' | 'signal' | 'timedOut' | 'durationMs' | 'usage'> {
 	if (!(err instanceof AgentRunError) || err.agent === undefined) return {};
-	const { exitCode, signal, timedOut, durationMs } = err.agent;
-	return { exitCode, signal, timedOut, durationMs };
+	const { exitCode, signal, timedOut, durationMs, usage } = err.agent;
+	return { exitCode, signal, timedOut, durationMs, usage };
 }
 
 /** Build the terminal `succeeded` result frame from a completed phase run. */
@@ -317,6 +317,7 @@ export function succeededResult(
 		signal: result.agent.signal,
 		timedOut: result.agent.timedOut,
 		durationMs: result.agent.durationMs,
+		usage: result.agent.usage,
 		// The terminal PM/verdict context the control plane settles on (issue #407):
 		// a PM-driven phase's auto-advance status drives the next phase's
 		// self-enqueue on the control plane; a Review run's verdict/ordinal/outcome
