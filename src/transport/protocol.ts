@@ -27,6 +27,7 @@ import { NonSecretProjectConfigSchema } from '../config/project-config-slice.js'
 import { AgentTargetSchema } from '../config/schema.js';
 import { AgentCliSchema } from '../harness/agent-cli.js';
 import { CliQuotaSnapshotSchema } from '../harness/quota.js';
+import { AgentUsageSchema } from '../harness/usage.js';
 import { WorktreeSweepResultSchema, WorktreeSweepStatusSchema } from '../identity/worker.js';
 import {
 	WorkerSessionInstanceIdSchema,
@@ -688,6 +689,13 @@ export const TaskExecutionResultSchema = z.object({
 	signal: z.string().nullable().optional(),
 	timedOut: z.boolean().optional(),
 	durationMs: z.number().int().nonnegative().optional(),
+	// The agent run's token usage, reported alongside the exit metadata above and for
+	// the same terminal statuses — dropped entirely between the DB-free worker cutover
+	// (issue #462) and its restoration here, which left every transport-settled run's
+	// `runs.usage` column null (never fixed up on the in-process path, which reports
+	// the real `AgentCliResult` directly and was unaffected). Absent for a frame from a
+	// worker that predates it, or whose run produced no usage at all.
+	usage: AgentUsageSchema.optional(),
 	// `deferred` — the retry hint + resume flags (mirrors `phase-deferred`). Since
 	// issue #980 `retryDelayMs` is the **back-compat fallback** rather than the
 	// primary reading: the control plane prefers `retryAfter` below and falls back to

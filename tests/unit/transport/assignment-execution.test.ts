@@ -24,6 +24,7 @@ import {
 	handleTaskCancel,
 	runAssignmentDbFree,
 	SUPPORTED_DB_FREE_PHASES,
+	succeededResult,
 } from '@/transport/assignment-execution.js';
 import type { FetchLike } from '@/transport/delivery-client.js';
 import { TRANSPORT_PROTOCOL_VERSION } from '@/transport/protocol.js';
@@ -1544,6 +1545,29 @@ describe('runAssignmentDbFree', () => {
 			});
 		});
 
+		it('carries the run’s token usage on a succeeded frame too', () => {
+			const usage = { inputTokens: 1_200, outputTokens: 340, totalTokens: 1_540 };
+			const frame = succeededResult(ASSIGNMENT(), {
+				agent: agentResult({ usage }),
+			});
+
+			expect(frame.usage).toEqual(usage);
+		});
+
+		it('carries the run’s token usage on a deferred frame', () => {
+			const usage = { inputTokens: 500, outputTokens: 20 };
+			const frame = deferrableOrFailedResult(
+				new AgentRunError(
+					'rate limited',
+					{ kind: 'rate-limit' },
+					agentResult({ exitCode: 1, durationMs: 4_200, usage }),
+				),
+				ASSIGNMENT(),
+			);
+
+			expect(frame.usage).toEqual(usage);
+		});
+
 		// A failure that ran no agent has nothing to report, so the frame must stay
 		// silent rather than assert a default the control plane would then persist.
 		it.each([
@@ -1562,13 +1586,14 @@ describe('runAssignmentDbFree', () => {
 				]),
 			],
 			['an agent error carrying no result', new AgentRunError('stalled', { kind: 'stalled' })],
-		])('omits all four fields for %s', (_label, err) => {
+		])('omits all five fields for %s', (_label, err) => {
 			const frame = deferrableOrFailedResult(err, ASSIGNMENT());
 
 			expect(frame.exitCode).toBeUndefined();
 			expect(frame.signal).toBeUndefined();
 			expect(frame.timedOut).toBeUndefined();
 			expect(frame.durationMs).toBeUndefined();
+			expect(frame.usage).toBeUndefined();
 		});
 	});
 });

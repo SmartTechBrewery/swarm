@@ -64,6 +64,7 @@ import {
 	type AgentFailureKind,
 	AgentRunError,
 } from '../harness/agent-failure.js';
+import type { AgentUsage } from '../harness/usage.js';
 import {
 	MissingWorkerScmCredentialError,
 	requireWorkerScmCredential,
@@ -224,6 +225,7 @@ interface ReportedAgentFields {
 	durationMs?: number;
 	timedOut?: boolean;
 	aborted?: boolean;
+	usage?: AgentUsage;
 }
 
 /**
@@ -247,6 +249,7 @@ function reportedAgent(
 		timedOut: fields.timedOut,
 		aborted: fields.aborted ?? false,
 		outputTruncated: false,
+		usage: fields.usage,
 	};
 }
 
@@ -414,6 +417,7 @@ export function adaptResultToPhaseRun(
 				signal: result.signal,
 				durationMs: result.durationMs,
 				timedOut: result.timedOut ?? false,
+				usage: result.usage,
 			}),
 			movedTo: result.movedTo,
 			// Feeds the shared settle path's per-child self-enqueue (issue #911); absent
@@ -477,6 +481,7 @@ export function adaptResultToPhaseRun(
 				signal: result.signal,
 				timedOut: result.timedOut,
 				durationMs: result.durationMs,
+				usage: result.usage,
 			}),
 		);
 	}
@@ -523,6 +528,7 @@ export function adaptResultToPhaseRun(
 			timedOut: result.timedOut,
 			durationMs: result.durationMs,
 			aborted: kind === 'aborted',
+			usage: result.usage,
 		}),
 		// The Tier 2 checkpoint the worker read off its own disk (issue #503). Carried on
 		// the rebuilt error so the shared deferral path applies the identical continuation

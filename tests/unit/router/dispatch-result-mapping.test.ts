@@ -680,6 +680,46 @@ describe('adaptResultToPhaseRun exit metadata', () => {
 		expect(err.agent?.durationMs).toBeUndefined();
 	});
 
+	// The transport frame boundary silently dropped `usage` between the DB-free
+	// worker cutover and its restoration: `runs.usage` went null for every
+	// transport-settled run with no test catching it, because the harness-parsing
+	// and dashboard-rendering halves were each tested in isolation against correct
+	// data — neither exercised the frame in between. Asserted at both terminal
+	// shapes `adaptResultToPhaseRun` produces: a `PhaseRunResult` for a succeeded
+	// run, and the rebuilt `AgentRunError` for a deferred/failed one.
+	it('carries the run’s token usage across the succeeded frame', () => {
+		const usage = { inputTokens: 12_000, outputTokens: 3_400, totalTokens: 15_400 };
+		const run = adaptResultToPhaseRun(base({ status: 'succeeded', exitCode: 0, usage }), SELECTION);
+		expect(run.agent.usage).toEqual(usage);
+	});
+
+	it('carries the run’s token usage across a deferred frame onto the rebuilt error', () => {
+		const usage = { inputTokens: 500, outputTokens: 20 };
+		const frame = deferrableOrFailedResult(
+			new AgentRunError(
+				'rate limited',
+				{ kind: 'rate-limit' },
+				{
+					cli: 'claude',
+					exitCode: 1,
+					signal: null,
+					stdout: '',
+					stderr: '',
+					durationMs: 4_200,
+					timedOut: false,
+					aborted: false,
+					outputTruncated: false,
+					usage,
+				},
+			),
+			ASSIGNMENT(),
+		);
+		expect(frame.usage).toEqual(usage);
+
+		const err = thrownAgent(frame);
+		expect(err.agent?.usage).toEqual(usage);
+	});
+
 	// The regression of issue #980 caught at its own seam: the worker sends the reset it
 	// resolved, and the control plane must keep it. Asserted against the worker's real
 	// frame rather than a fixture, which is what would have caught the loss in #407.
