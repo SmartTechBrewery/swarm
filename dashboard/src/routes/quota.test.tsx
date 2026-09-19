@@ -173,6 +173,76 @@ describe('quota route', () => {
 		consoleError.mockRestore();
 	});
 
+	// The operator's own complaint this grouping exists to fix: several of their
+	// workers on one physical machine (a shared `workerHostname`) each independently
+	// discover and report what is, for one machine-local CLI login, the *same*
+	// allowance — so the page must show it once, not once per worker.
+	it('collapses two workers sharing a hostname into one card, keeping the freshest report', async () => {
+		renderQuotaScreen([
+			{
+				workerId: 'worker-01',
+				workerName: 'jacek_tp_1',
+				workerHostname: 'jacek-tower',
+				cli: 'codex',
+				status: 'available',
+				source: 'live',
+				lastUpdated: '2026-08-13T08:00:00.000Z',
+				windows: [{ name: 'Weekly', sourceSlot: 'primary', durationMins: 10080, usedPercent: 10 }],
+			},
+			{
+				workerId: 'worker-02',
+				workerName: 'jacek_tp_2',
+				workerHostname: 'jacek-tower',
+				cli: 'codex',
+				status: 'available',
+				source: 'live',
+				lastUpdated: '2026-08-13T09:00:00.000Z',
+				windows: [{ name: 'Weekly', sourceSlot: 'primary', durationMins: 10080, usedPercent: 80 }],
+			},
+		]);
+
+		expect(await screen.findByText('jacek-tower')).toBeTruthy();
+		// Both worker names are listed under the one machine header.
+		expect(screen.getByText(/jacek_tp_1/)).toBeTruthy();
+		expect(screen.getByText(/jacek_tp_2/)).toBeTruthy();
+		// One card, not two: the freshest report (worker-02, 09:00) wins.
+		expect(screen.getAllByText('Codex')).toHaveLength(1);
+		expect(screen.getByText('20% remaining')).toBeTruthy();
+		expect(screen.queryByText('90% remaining')).toBeNull();
+	});
+
+	// A hostname is unauthenticated and unconstrained — this is the one case the
+	// grouping key must get right: two workers reporting *no* hostname must never be
+	// merged into each other's section just because both fall back to "no hostname".
+	it('never merges two hostname-less workers into one machine', async () => {
+		renderQuotaScreen([
+			{
+				workerId: 'worker-01',
+				workerName: 'builder-01',
+				workerHostname: null,
+				cli: 'codex',
+				status: 'available',
+				source: 'live',
+				lastUpdated: '2026-08-13T08:00:00.000Z',
+				windows: [{ name: 'Weekly', sourceSlot: 'primary', durationMins: 10080, usedPercent: 10 }],
+			},
+			{
+				workerId: 'worker-02',
+				workerName: 'builder-02',
+				workerHostname: null,
+				cli: 'codex',
+				status: 'available',
+				source: 'live',
+				lastUpdated: '2026-08-13T09:00:00.000Z',
+				windows: [{ name: 'Weekly', sourceSlot: 'primary', durationMins: 10080, usedPercent: 80 }],
+			},
+		]);
+
+		expect(await screen.findByText('builder-01')).toBeTruthy();
+		expect(screen.getByText('builder-02')).toBeTruthy();
+		expect(screen.getAllByText('Codex')).toHaveLength(2);
+	});
+
 	it('reports a worker’s own diagnostics under that worker', async () => {
 		renderQuotaScreen([
 			{

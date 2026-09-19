@@ -396,7 +396,9 @@ export async function updateWorkerCapabilities(
 		// judged on and the version is only the label beside it, so a daemon that
 		// declares one without the other must not have the other cleared.
 		if (version !== undefined) declaration.version = version;
-		// `repository`'s exact contract: diagnostic and display-only, never gated on
+		// Three-valued on `repository`'s exact pattern (omit to leave the stored value
+		// alone, `null` to clear it) — but unlike `repository`, `hostname` itself is
+		// diagnostic and display-only and is never gated on anywhere
 		// (`src/db/schema/workers.ts` "Diagnostic only" note).
 		if (hostname !== undefined) declaration.hostname = hostname;
 

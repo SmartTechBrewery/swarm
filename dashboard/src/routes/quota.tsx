@@ -92,7 +92,12 @@ export function QuotaWindowCard({
  * (issue #823, widened by the hostname grouping below).
  */
 interface MachineGroup {
-	/** `hostname` when reported, else the sole worker's id — see {@link machineKey}. */
+	/**
+	 * `hostname` when reported, else the sole worker's id — a React list key only,
+	 * not a grouping key (`groupByMachine` groups hostname-keyed and worker-keyed
+	 * machines in two separate maps, so this string's two possible origins can never
+	 * collide with each other in a way that merges two machines).
+	 */
 	machineKey: string;
 	/** The machine's self-reported hostname, or `null` for the per-worker fallback. */
 	hostname: string | null;
@@ -101,20 +106,6 @@ interface MachineGroup {
 	available: WorkerCliQuotaSnapshot[];
 	unavailable: WorkerCliQuotaSnapshot[];
 	lastUpdated: number | null;
-}
-
-/**
- * The machine a snapshot belongs to: its worker's reported hostname when there is
- * one, or a per-worker fallback otherwise.
- *
- * The fallback is what keeps this additive rather than a behaviour change for a
- * worker whose daemon predates the hostname column (`workers.hostname`, still
- * `null` on that row): it groups alone, exactly as grouping on `workerId` alone
- * always did. A `worker:`-prefixed key can never collide with a real hostname, so
- * two ungrouped workers never merge just because one has no hostname.
- */
-function machineKey(quota: WorkerCliQuotaSnapshot): string {
-	return quota.workerHostname ?? `worker:${quota.workerId}`;
 }
 
 /**
@@ -127,14 +118,31 @@ function machineKey(quota: WorkerCliQuotaSnapshot): string {
  * grouped by worker alone, the page showed that one allowance once per worker
  * sharing it, which reads as N independent quotas rather than one shared machine's.
  *
+ * A worker with no reported hostname (a daemon that predates the `workers.hostname`
+ * column) groups alone, exactly as grouping on `workerId` alone always did — kept
+ * in a *separate* map from the hostname-keyed groups below, rather than a shared
+ * map with a `worker:<id>`-prefixed fallback key, because `hostname` is a fully
+ * unauthenticated, unconstrained string (`z.string().min(1)`, no format check): a
+ * daemon could self-report exactly that shape and silently merge into an unrelated
+ * ungrouped worker's section. Two separate maps make that impossible rather than
+ * merely unlikely.
+ *
  * Within a machine, snapshots are deduplicated per CLI, keeping the most recently
- * reported one — never merged or averaged, since two workers' probes of the same
- * account can only disagree by being differently stale, and the freshest is the
- * most honest answer. `hostname` is diagnostic and unauthenticated
- * (`src/db/schema/workers.ts` "Diagnostic only" note) so this grouping is display
- * only: it changes nothing about which rows a viewer is scoped to see
- * (`listCliQuotasForOwner` already did that on `worker_id`), only how the rows
- * this viewer already owns are presented.
+ * reported one — never merged or averaged. This assumes what the operator who
+ * asked for this page confirmed directly: co-located workers share one real CLI
+ * login, so two reports for the same CLI can only disagree by being differently
+ * stale, and the freshest is the most honest single answer to show. It does mean a
+ * workers pair that is *not* actually sharing one CLI account (a hostname collision,
+ * or two logins deliberately kept separate on one box) has its older, possibly
+ * still-accurate report silently dropped rather than surfaced as a conflict — accepted
+ * here because the whole feature exists to collapse what is normally the same
+ * allowance, and the corrected `machineKey` above already closes the one collision
+ * this page could itself cause.
+ *
+ * `hostname` is diagnostic and unauthenticated (`src/db/schema/workers.ts`
+ * "Diagnostic only" note) so this grouping is display only: it changes nothing
+ * about which rows a viewer is scoped to see (`listCliQuotasForOwner` already did
+ * that on `worker_id`), only how the rows this viewer already owns are presented.
  */
 function groupByMachine(quotas: WorkerCliQuotaSnapshot[]): MachineGroup[] {
 	interface Building {
@@ -143,9 +151,14 @@ function groupByMachine(quotas: WorkerCliQuotaSnapshot[]): MachineGroup[] {
 		byCli: Map<string, WorkerCliQuotaSnapshot>;
 		lastUpdated: number | null;
 	}
-	const groups = new Map<string, Building>();
+	// Keyed separately so a self-reported hostname can never collide with the other
+	// map's per-worker fallback key — see the docstring above.
+	const byHostname = new Map<string, Building>();
+	const byWorkerId = new Map<string, Building>();
+
 	for (const quota of quotas) {
-		const key = machineKey(quota);
+		const groups = quota.workerHostname !== null ? byHostname : byWorkerId;
+		const key = quota.workerHostname ?? quota.workerId;
 		let group = groups.get(key);
 		if (!group) {
 			group = {
@@ -158,32 +171,40 @@ function groupByMachine(quotas: WorkerCliQuotaSnapshot[]): MachineGroup[] {
 		}
 		group.workerNames.add(quota.workerName);
 
+		const updated = new Date(quota.lastUpdated).getTime();
 		const existing = group.byCli.get(quota.cli);
-		if (
-			!existing ||
-			new Date(quota.lastUpdated).getTime() > new Date(existing.lastUpdated).getTime()
-		) {
+		const existingUpdated = existing ? new Date(existing.lastUpdated).getTime() : Number.NaN;
+		// A malformed `lastUpdated` on the first report for a CLI must not permanently
+		// block every later, valid report from replacing it (`x > NaN` is always false).
+		if (!existing || Number.isNaN(existingUpdated) || updated > existingUpdated) {
 			group.byCli.set(quota.cli, quota);
 		}
 
-		const updated = new Date(quota.lastUpdated).getTime();
 		if (!Number.isNaN(updated) && (group.lastUpdated === null || updated > group.lastUpdated)) {
 			group.lastUpdated = updated;
 		}
 	}
-	return [...groups.entries()]
-		.map(([machineKey, group]) => {
-			const deduped = [...group.byCli.values()];
-			return {
-				machineKey,
-				hostname: group.hostname,
-				workerNames: [...group.workerNames].sort((a, b) => a.localeCompare(b)),
-				available: deduped.filter((q) => q.status === 'available'),
-				unavailable: deduped.filter((q) => q.status !== 'available'),
-				lastUpdated: group.lastUpdated,
-			};
-		})
-		.sort((a, b) => a.workerNames[0].localeCompare(b.workerNames[0]));
+
+	function toMachineGroup(key: string, group: Building): MachineGroup {
+		const available: WorkerCliQuotaSnapshot[] = [];
+		const unavailable: WorkerCliQuotaSnapshot[] = [];
+		for (const q of group.byCli.values()) {
+			(q.status === 'available' ? available : unavailable).push(q);
+		}
+		return {
+			machineKey: key,
+			hostname: group.hostname,
+			workerNames: [...group.workerNames].sort((a, b) => a.localeCompare(b)),
+			available,
+			unavailable,
+			lastUpdated: group.lastUpdated,
+		};
+	}
+
+	return [
+		...[...byHostname.entries()].map(([key, group]) => toMachineGroup(key, group)),
+		...[...byWorkerId.entries()].map(([key, group]) => toMachineGroup(key, group)),
+	].sort((a, b) => (a.hostname ?? a.workerNames[0]).localeCompare(b.hostname ?? b.workerNames[0]));
 }
 
 /** The display name for a CLI identifier. */
