@@ -107,6 +107,28 @@ export const workers = pgTable(
 		 */
 		repository: text('repository'),
 		/**
+		 * The `os.hostname()` the daemon **currently operating this row** reported at
+		 * handshake (`HandshakeRequestSchema.hostname`, `src/transport/protocol.ts`) —
+		 * rewritten verbatim on every reconnect, the same treatment `capabilities` gets,
+		 * because it describes whichever machine is connected right now rather than an
+		 * operator's declaration.
+		 *
+		 * Nullable with no default, on `repository`'s exact contract: NULL means "no
+		 * hostname reported", what every row written before this column existed says and
+		 * what a daemon too old to send the field keeps saying. Nothing is backfilled.
+		 *
+		 * **Diagnostic only, never a security boundary**: unlike `id`, a hostname is
+		 * self-reported by an unauthenticated field of the handshake body — any daemon
+		 * could claim any string — so nothing may be gated or scoped on it (the exact
+		 * reasoning `cli_quotas` keys on `worker_id` rather than hostname for, issue
+		 * #703/#823). Its only legitimate use is display: letting an operator notice
+		 * that several of their *own already-authorized* workers share one machine, so a
+		 * per-worker view (the CLI Quotas page above all) can group or label them instead
+		 * of presenting one machine's shared allowance as though it belonged to each
+		 * worker separately.
+		 */
+		hostname: text('hostname'),
+		/**
 		 * When an operator took this machine **out of the pool** (issue #919), or NULL
 		 * while it is in it. A draining worker finishes what it is already running and
 		 * is given no new work, so it can be restarted without a superseded-session

@@ -849,6 +849,13 @@ export function WorkerDetailView({
 					>
 						{worker.repository ?? EM_DASH}
 					</Field>
+					<Field
+						label="Hostname"
+						mono
+						hint="Self-reported by the daemon, diagnostic only. Several of your workers sharing this value are the same physical machine, and share one CLI account's allowance — see the CLI Quotas page."
+					>
+						{worker.hostname ?? EM_DASH}
+					</Field>
 					<Field label="SWARM build" mono hint={buildHint(worker.controlPlaneBuild)}>
 						<DeclaredBuild worker={worker} />
 					</Field>

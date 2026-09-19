@@ -101,6 +101,7 @@ function rowToWorker(row: WorkerRow): Worker {
 		declaredCapabilities,
 		supportedPhases: row.supportedPhases as TriggerPhase[],
 		repository: row.repository ?? null,
+		hostname: row.hostname ?? null,
 		drainingSince: row.drainingSince ?? null,
 		// Reassembled as one value so a consumer cannot read a commit without its flag
 		// (issue #918). The pair is always written together, so a non-null commit with a
@@ -351,6 +352,7 @@ export async function updateWorkerCapabilities(
 	build?: WorkerBuild | null,
 	supervision?: WorkerSupervision,
 	version?: string | null,
+	hostname?: string | null,
 ): Promise<Worker | undefined> {
 	return await getDb().transaction(async (tx) => {
 		const existingWorkerRows = await tx
@@ -394,6 +396,11 @@ export async function updateWorkerCapabilities(
 		// judged on and the version is only the label beside it, so a daemon that
 		// declares one without the other must not have the other cleared.
 		if (version !== undefined) declaration.version = version;
+		// Three-valued on `repository`'s exact pattern (omit to leave the stored value
+		// alone, `null` to clear it) — but unlike `repository`, `hostname` itself is
+		// diagnostic and display-only and is never gated on anywhere
+		// (`src/db/schema/workers.ts` "Diagnostic only" note).
+		if (hostname !== undefined) declaration.hostname = hostname;
 
 		const [updatedRow] = await tx
 			.update(workers)

@@ -149,6 +149,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		declaredCapabilities: null,
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 		repository: null,
+		hostname: null,
 		// In the pool (issue #919) — every case here that says nothing about draining.
 		drainingSince: null,
 		update: null,
@@ -907,6 +908,10 @@ describe('listDashboardWorkers (issue #133)', () => {
 				'lastSeenAt',
 				'owner',
 				'repository',
+				// Non-secret and diagnostic only: a self-reported machine name, never a path
+				// or credential — it exists purely so an operator can spot two workers
+				// sharing one physical machine.
+				'hostname',
 				'build',
 				// The install root's own `package.json` version — a label an operator reads,
 				// and no more a secret than the commit beside it.

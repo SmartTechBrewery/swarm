@@ -53,6 +53,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		declaredCapabilities: null,
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 		repository: null,
+		hostname: null,
 		// In the pool (issue #919) unless a case overrides it.
 		drainingSince: null,
 		update: null,
@@ -158,6 +159,7 @@ describe('handleHandshake', () => {
 			null,
 			'unknown',
 			'1.0.0',
+			'ada-laptop',
 		);
 	});
 
@@ -176,12 +178,13 @@ describe('handleHandshake', () => {
 			null,
 			'unknown',
 			'1.0.0',
+			'ada-laptop',
 		);
 	});
 
-	// Issue #687 — the third declaration. Persisted (unlike `hostname`) and normalised at
-	// this boundary, so the roster records one canonical `owner/repo` whatever form a
-	// daemon sent.
+	// Issue #687 — the third declaration. Persisted, like `hostname` now is too, and
+	// normalised at this boundary, so the roster records one canonical `owner/repo`
+	// whatever form a daemon sent.
 	it('records the declared repository, normalised', async () => {
 		const deps = makeDeps();
 
@@ -199,6 +202,7 @@ describe('handleHandshake', () => {
 			null,
 			'unknown',
 			'1.0.0',
+			'ada-laptop',
 		);
 		expect(result.json).toMatchObject({ authenticated: true, workerId: WORKER_ID });
 	});
@@ -222,6 +226,7 @@ describe('handleHandshake', () => {
 			{ commit: '9f3a1b2c4d5e6f70819a2b3c4d5e6f7081920a3b', dirty: true },
 			'unknown',
 			'1.0.0',
+			'ada-laptop',
 		);
 	});
 
@@ -241,6 +246,7 @@ describe('handleHandshake', () => {
 			null,
 			'unknown',
 			'1.0.0',
+			'ada-laptop',
 		);
 	});
 
@@ -261,6 +267,7 @@ describe('handleHandshake', () => {
 			null,
 			'unsupervised',
 			'1.0.0',
+			'ada-laptop',
 		);
 	});
 
@@ -278,6 +285,7 @@ describe('handleHandshake', () => {
 			null,
 			'unknown',
 			'1.0.0',
+			'ada-laptop',
 		);
 	});
 
@@ -299,6 +307,7 @@ describe('handleHandshake', () => {
 			null,
 			'unknown',
 			'1.0.0',
+			'ada-laptop',
 		);
 	});
 

@@ -19,6 +19,7 @@ const validWorker = {
 	declaredCapabilities: null,
 	supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 	repository: null,
+	hostname: null,
 	// In the pool (issue #919) — nullable, not optional, for the same reason
 	// `repository` is: no reader gets an "absent" case to interpret.
 	drainingSince: null,
@@ -124,6 +125,21 @@ describe('WorkerSchema', () => {
 				repository: 'https://github.com/SmartTechBrewery/swarm',
 			}).success,
 		).toBe(false);
+	});
+
+	// The daemon's self-reported hostname, on `repository`'s exact nullable contract —
+	// diagnostic/display only, so unlike `repository` there is no shape to normalise or
+	// reject: any non-empty string is accepted verbatim.
+	it('accepts a declared hostname verbatim', () => {
+		expect(WorkerSchema.parse({ ...validWorker, hostname: 'ada-laptop' })).toEqual({
+			...validWorker,
+			hostname: 'ada-laptop',
+		});
+	});
+
+	it('rejects an omitted hostname', () => {
+		const { hostname, ...withoutHostname } = validWorker;
+		expect(WorkerSchema.safeParse(withoutHostname).success).toBe(false);
 	});
 
 	// Issue #918 — the daemon-declared build. Nullable on the same terms, and one

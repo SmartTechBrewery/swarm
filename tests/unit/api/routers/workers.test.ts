@@ -239,6 +239,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		declaredCapabilities: null,
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 		repository: null,
+		hostname: null,
 		// In the pool (issue #919) unless a case overrides it.
 		drainingSince: null,
 		// Nobody has asked this machine to update (issue #933).

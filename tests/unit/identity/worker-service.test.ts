@@ -61,6 +61,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		declaredCapabilities: null,
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 		repository: null,
+		hostname: null,
 		drainingSince: null,
 		update: null,
 		version: null,
@@ -153,13 +154,14 @@ describe('refreshWorkerCapabilities', () => {
 		// No phases passed through: the caller declared none, so the stored repertoire is
 		// left untouched rather than reset to the every-phase default (issue #467) — the
 		// `swarm workers set-cli` path, which knows nothing about phases.
-		// The fourth through seventh arguments are `undefined` for the same reason
-		// (issues #687, #918, #997 and the version label): a caller that knows nothing
-		// about checkouts, builds, supervision or versions must not clear a declaration
-		// it cannot make.
+		// The fourth through eighth arguments are `undefined` for the same reason
+		// (issues #687, #918, #997, the version label, and the hostname label): a caller
+		// that knows nothing about checkouts, builds, supervision, versions or hostnames
+		// must not clear a declaration it cannot make.
 		expect(updateWorkerCapabilities).toHaveBeenCalledWith(
 			'worker-1',
 			['codex'],
+			undefined,
 			undefined,
 			undefined,
 			undefined,
@@ -184,6 +186,7 @@ describe('refreshWorkerCapabilities', () => {
 			'worker-1',
 			['claude'],
 			['implementation', 'review'],
+			undefined,
 			undefined,
 			undefined,
 			undefined,
@@ -213,6 +216,7 @@ describe('refreshWorkerCapabilities', () => {
 			undefined,
 			undefined,
 			undefined,
+			undefined,
 		);
 	});
 
@@ -228,6 +232,7 @@ describe('refreshWorkerCapabilities', () => {
 			['claude'],
 			undefined,
 			null,
+			undefined,
 			undefined,
 			undefined,
 			undefined,
@@ -261,6 +266,7 @@ describe('refreshWorkerCapabilities', () => {
 			{ commit: '9f3a1b2c4d5e6f70819a2b3c4d5e6f7081920a3b', dirty: false },
 			undefined,
 			undefined,
+			undefined,
 		);
 	});
 
@@ -277,6 +283,7 @@ describe('refreshWorkerCapabilities', () => {
 			undefined,
 			null,
 			null,
+			undefined,
 			undefined,
 			undefined,
 		);
@@ -310,6 +317,66 @@ describe('refreshWorkerCapabilities', () => {
 			null,
 			'unsupervised',
 			undefined,
+			undefined,
+		);
+	});
+
+	// The daemon's self-reported hostname, three-valued at this seam on `repository`'s
+	// contract, but trimmed rather than schema-validated (`version`'s exact treatment):
+	// diagnostic/display only, so there is nothing to validate a machine name against.
+	it('validates and forwards a declared hostname, trimmed', async () => {
+		updateWorkerCapabilities.mockImplementation(async (id, capabilities) =>
+			makeWorker({ id, capabilities }),
+		);
+
+		await refreshWorkerCapabilities(
+			'worker-1',
+			['claude'],
+			undefined,
+			null,
+			null,
+			undefined,
+			undefined,
+			'  ada-laptop  ',
+		);
+
+		expect(updateWorkerCapabilities).toHaveBeenCalledWith(
+			'worker-1',
+			['claude'],
+			undefined,
+			null,
+			null,
+			undefined,
+			undefined,
+			'ada-laptop',
+		);
+	});
+
+	it('forwards null unchanged, which clears an earlier daemon’s reported hostname', async () => {
+		updateWorkerCapabilities.mockImplementation(async (id, capabilities) =>
+			makeWorker({ id, capabilities }),
+		);
+
+		await refreshWorkerCapabilities(
+			'worker-1',
+			['claude'],
+			undefined,
+			null,
+			null,
+			undefined,
+			undefined,
+			null,
+		);
+
+		expect(updateWorkerCapabilities).toHaveBeenCalledWith(
+			'worker-1',
+			['claude'],
+			undefined,
+			null,
+			null,
+			undefined,
+			undefined,
+			null,
 		);
 	});
 

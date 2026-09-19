@@ -1,0 +1,18 @@
+-- The daemon's self-reported `os.hostname()`, carried on the handshake since that
+-- field existed and, until now, used only for connect-time logging and discarded.
+--
+-- Rewritten verbatim on every reconnect, the same treatment `capabilities` gets,
+-- because it describes whichever machine is connected right now.
+--
+-- Diagnostic only, never a security boundary: a hostname is self-reported by an
+-- unauthenticated field of the handshake body, so nothing may be gated or scoped
+-- on it (the exact reasoning `cli_quotas` keys on `worker_id` rather than hostname
+-- for). Its only legitimate use is display — letting an operator notice that
+-- several of their own already-authorized workers share one machine, and
+-- therefore one CLI account's allowance.
+--
+-- Nullable with no default, on `repository`'s exact contract: NULL means "no
+-- hostname reported", which is what every existing row says until its machine
+-- next connects. Nothing is backfilled and no index is added, since nothing
+-- queries by it.
+ALTER TABLE "workers" ADD COLUMN "hostname" text;

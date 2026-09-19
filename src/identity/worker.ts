@@ -309,6 +309,14 @@ export const WorkerSchema = z.object({
 	supportedPhases: z.array(TriggerPhaseSchema),
 	repository: RepoSlugSchema.nullable(),
 	/**
+	 * The daemon's self-reported `os.hostname()`, or `null` when none has been
+	 * reported — rewritten at every handshake, `repository`'s exact contract.
+	 * Diagnostic/display only: an unauthenticated field of the handshake body, so
+	 * nothing may be gated or scoped on it (`src/db/schema/workers.ts` "Diagnostic
+	 * only" note).
+	 */
+	hostname: z.string().nullable(),
+	/**
 	 * When an operator took this machine out of the dispatch pool (issue #919), or
 	 * `null` while it is in it — see the block above for why it is neither a
 	 * capability nor daemon-declared.

@@ -39,6 +39,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		declaredCapabilities: null,
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 		repository: null,
+		hostname: null,
 		// Out of the dispatch pool, so eligible, unless a case says otherwise.
 		drainingSince: DRAINED_AT,
 		update: null,

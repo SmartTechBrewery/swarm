@@ -530,6 +530,14 @@ export interface DashboardWorkerView {
 	 */
 	repository: string | null;
 	/**
+	 * The machine's self-reported `os.hostname()` (`Worker.hostname`), or `null` when
+	 * it declared none. Diagnostic/display only — an unauthenticated field of the
+	 * handshake body — so this exists purely to let an operator notice that several
+	 * of their own workers are the same physical machine and therefore share one CLI
+	 * account's allowance (the CLI Quotas page's grouping key); nothing routes on it.
+	 */
+	hostname: string | null;
+	/**
 	 * When the machine's operator took it **out of the dispatch pool** (issue #919),
 	 * or `null` while it is in it. Read alongside `connection`, not in place of it: a
 	 * draining machine may be perfectly online and merely given no new work, and a
@@ -922,6 +930,7 @@ async function assembleDashboardWorker(
 		capabilities: worker.capabilities,
 		supportedPhases: worker.supportedPhases,
 		repository: worker.repository,
+		hostname: worker.hostname,
 		drainingSince: worker.drainingSince,
 		// Resolved by the caller, never here: both callers read the whole set they are
 		// about in one query, so an assembler-side read would re-introduce the N+1 the
