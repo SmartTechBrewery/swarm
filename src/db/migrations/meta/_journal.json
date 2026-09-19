@@ -519,6 +519,13 @@
       "when": 1789723542765,
       "tag": "0073_worker_version",
       "breakpoints": true
+    },
+    {
+      "idx": 74,
+      "version": "7",
+      "when": 1789808297213,
+      "tag": "0074_worker_hostname",
+      "breakpoints": true
     }
   ]
 }

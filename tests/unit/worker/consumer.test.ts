@@ -3236,6 +3236,7 @@ describe('processJob', () => {
 					declaredCapabilities: null,
 					supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 					repository: overrides.repository ?? null,
+					hostname: null,
 					drainingSince: overrides.drainingSince ?? null,
 					update: null,
 					version: null,

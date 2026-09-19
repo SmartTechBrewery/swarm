@@ -158,6 +158,12 @@ export async function registerWorker(input: RegisterWorkerInput): Promise<Regist
  * rule for the same reason. Two-valued rather than three, since the column has no
  * null: omit it to leave the stored value alone (the `set-cli` path), pass one of the
  * three members to write it.
+ *
+ * `hostname` is the daemon's self-reported `os.hostname()`, three-valued on
+ * `repository`'s contract but diagnostic/display only — not schema-validated against
+ * anything, `version`'s exact treatment, since there is nothing to validate a
+ * self-reported machine name against and rejecting one this control plane finds
+ * unfamiliar would drop a label from a machine that is otherwise fine.
  */
 export async function refreshWorkerCapabilities(
 	id: string,
@@ -167,6 +173,7 @@ export async function refreshWorkerCapabilities(
 	build?: WorkerBuild | null,
 	supervision?: WorkerSupervision,
 	version?: string | null,
+	hostname?: string | null,
 ): Promise<Worker | undefined> {
 	const validated = WorkerCapabilitiesSchema.parse(capabilities);
 	const validatedPhases =
@@ -183,6 +190,8 @@ export async function refreshWorkerCapabilities(
 	// label from a machine that is otherwise fine.
 	const validatedVersion =
 		version === undefined || version === null ? version : version.trim() || null;
+	const validatedHostname =
+		hostname === undefined || hostname === null ? hostname : hostname.trim() || null;
 	return updateWorkerCapabilities(
 		id,
 		validated,
@@ -191,6 +200,7 @@ export async function refreshWorkerCapabilities(
 		validatedBuild,
 		validatedSupervision,
 		validatedVersion,
+		validatedHostname,
 	);
 }
 

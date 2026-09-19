@@ -87,48 +87,103 @@ export function QuotaWindowCard({
 	);
 }
 
-/** One worker's own snapshots, gathered under the machine they describe (issue #823). */
-interface WorkerGroup {
-	workerId: string;
-	workerName: string;
+/**
+ * Every worker sharing one machine, gathered under the machine they describe
+ * (issue #823, widened by the hostname grouping below).
+ */
+interface MachineGroup {
+	/** `hostname` when reported, else the sole worker's id — see {@link machineKey}. */
+	machineKey: string;
+	/** The machine's self-reported hostname, or `null` for the per-worker fallback. */
+	hostname: string | null;
+	/** Every one of the owner's workers on this machine, sorted by name. */
+	workerNames: string[];
 	available: WorkerCliQuotaSnapshot[];
 	unavailable: WorkerCliQuotaSnapshot[];
 	lastUpdated: number | null;
 }
 
 /**
- * Gather snapshots under the worker that reported them, workers sorted by name.
+ * The machine a snapshot belongs to: its worker's reported hostname when there is
+ * one, or a per-worker fallback otherwise.
  *
- * The page shows one section per worker rather than one flat list: a row records
- * a *machine-local* fact, so an allowance presented without its machine is one
- * machine's answer read as the installation's (issue #703). Grouping on the
- * worker rather than a hostname is what makes each section attributable to an
- * owner (issue #823) — and there is no unattributed row to name a fallback for,
- * since `worker_id` is `NOT NULL` and the read joins the worker in.
+ * The fallback is what keeps this additive rather than a behaviour change for a
+ * worker whose daemon predates the hostname column (`workers.hostname`, still
+ * `null` on that row): it groups alone, exactly as grouping on `workerId` alone
+ * always did. A `worker:`-prefixed key can never collide with a real hostname, so
+ * two ungrouped workers never merge just because one has no hostname.
  */
-function groupByWorker(quotas: WorkerCliQuotaSnapshot[]): WorkerGroup[] {
-	const groups = new Map<string, WorkerGroup>();
+function machineKey(quota: WorkerCliQuotaSnapshot): string {
+	return quota.workerHostname ?? `worker:${quota.workerId}`;
+}
+
+/**
+ * Gather snapshots under the *machine* that reported them rather than the worker
+ * alone (issue #703, re-keyed onto the worker by #823, grouped onto the machine
+ * here): several of an owner's workers can be the same physical machine — the
+ * worker's display name is chosen at registration and cannot tell two workers on
+ * one box apart from two on separate ones — and each independently discovers and
+ * reports what is, for a machine-local CLI login, the *same* real allowance. Left
+ * grouped by worker alone, the page showed that one allowance once per worker
+ * sharing it, which reads as N independent quotas rather than one shared machine's.
+ *
+ * Within a machine, snapshots are deduplicated per CLI, keeping the most recently
+ * reported one — never merged or averaged, since two workers' probes of the same
+ * account can only disagree by being differently stale, and the freshest is the
+ * most honest answer. `hostname` is diagnostic and unauthenticated
+ * (`src/db/schema/workers.ts` "Diagnostic only" note) so this grouping is display
+ * only: it changes nothing about which rows a viewer is scoped to see
+ * (`listCliQuotasForOwner` already did that on `worker_id`), only how the rows
+ * this viewer already owns are presented.
+ */
+function groupByMachine(quotas: WorkerCliQuotaSnapshot[]): MachineGroup[] {
+	interface Building {
+		hostname: string | null;
+		workerNames: Set<string>;
+		byCli: Map<string, WorkerCliQuotaSnapshot>;
+		lastUpdated: number | null;
+	}
+	const groups = new Map<string, Building>();
 	for (const quota of quotas) {
-		let group = groups.get(quota.workerId);
+		const key = machineKey(quota);
+		let group = groups.get(key);
 		if (!group) {
 			group = {
-				workerId: quota.workerId,
-				workerName: quota.workerName,
-				available: [],
-				unavailable: [],
+				hostname: quota.workerHostname,
+				workerNames: new Set(),
+				byCli: new Map(),
 				lastUpdated: null,
 			};
-			groups.set(quota.workerId, group);
+			groups.set(key, group);
 		}
-		if (quota.status === 'available') group.available.push(quota);
-		else group.unavailable.push(quota);
+		group.workerNames.add(quota.workerName);
+
+		const existing = group.byCli.get(quota.cli);
+		if (
+			!existing ||
+			new Date(quota.lastUpdated).getTime() > new Date(existing.lastUpdated).getTime()
+		) {
+			group.byCli.set(quota.cli, quota);
+		}
 
 		const updated = new Date(quota.lastUpdated).getTime();
 		if (!Number.isNaN(updated) && (group.lastUpdated === null || updated > group.lastUpdated)) {
 			group.lastUpdated = updated;
 		}
 	}
-	return [...groups.values()].sort((a, b) => a.workerName.localeCompare(b.workerName));
+	return [...groups.entries()]
+		.map(([machineKey, group]) => {
+			const deduped = [...group.byCli.values()];
+			return {
+				machineKey,
+				hostname: group.hostname,
+				workerNames: [...group.workerNames].sort((a, b) => a.localeCompare(b)),
+				available: deduped.filter((q) => q.status === 'available'),
+				unavailable: deduped.filter((q) => q.status !== 'available'),
+				lastUpdated: group.lastUpdated,
+			};
+		})
+		.sort((a, b) => a.workerNames[0].localeCompare(b.workerNames[0]));
 }
 
 /** The display name for a CLI identifier. */
@@ -151,7 +206,7 @@ export function QuotaRouteComponent() {
 		}
 	};
 
-	const workerGroups = groupByWorker(quotasQuery.data || []);
+	const machineGroups = groupByMachine(quotasQuery.data || []);
 
 	// Re-reads the stored snapshots. There is no probe to trigger from here: a
 	// machine's allowance is discovered by the worker that runs on it, not by the
@@ -212,7 +267,7 @@ export function QuotaRouteComponent() {
 				</div>
 			)}
 
-			{workerGroups.length === 0 ? (
+			{machineGroups.length === 0 ? (
 				/* One state covers both cases — owning no worker, and owning a worker that has
 				   not reported — because the page has no way to tell an operator apart from
 				   the other and the remedy is the same. */
@@ -226,13 +281,19 @@ export function QuotaRouteComponent() {
 					</p>
 				</div>
 			) : (
-				workerGroups.map((group) => (
-					<div key={group.workerId} className="space-y-4">
-						{/* Worker Header — every allowance below belongs to this machine alone. */}
+				machineGroups.map((group) => (
+					<div key={group.machineKey} className="space-y-4">
+						{/* Machine header — every allowance below belongs to this machine alone,
+						    shared by every worker on it listed beside the name. */}
 						<div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-zinc-850 pb-2">
 							<h2 className="text-sm font-semibold text-zinc-200 flex items-center gap-2">
 								<Server className="h-4 w-4 text-zinc-500" />
-								<span className="font-mono">{group.workerName}</span>
+								<span className="font-mono">{group.hostname ?? group.workerNames[0]}</span>
+								{group.workerNames.length > 1 && (
+									<span className="text-[11px] font-mono text-zinc-500 font-normal">
+										(workers: {group.workerNames.join(', ')})
+									</span>
+								)}
 							</h2>
 							{group.lastUpdated !== null && (
 								<span className="text-[11px] text-zinc-500 font-mono">
@@ -258,7 +319,7 @@ export function QuotaRouteComponent() {
 								<div className="grid gap-6 md:grid-cols-2">
 									{group.available.map((q) => (
 										<div
-											key={`${group.workerId}:${q.cli}`}
+											key={`${group.machineKey}:${q.cli}`}
 											className="border border-zinc-800 rounded-lg bg-panel/45 p-6 space-y-6 flex flex-col justify-between"
 										>
 											<div className="space-y-4">
@@ -366,7 +427,7 @@ export function QuotaRouteComponent() {
 									<div className="divide-y divide-zinc-850">
 										{group.unavailable.map((q) => (
 											<div
-												key={`${group.workerId}:${q.cli}`}
+												key={`${group.machineKey}:${q.cli}`}
 												className="p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4 hover:bg-zinc-900/20 transition-colors"
 											>
 												<div className="space-y-1">

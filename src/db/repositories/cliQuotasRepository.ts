@@ -15,7 +15,18 @@ import { workers } from '../schema/workers.js';
  * does not own the storage key. The snapshot's own fields stay top-level so every
  * reader keeps reading `cli`/`status`/`windows` exactly as before.
  */
-export type WorkerCliQuotaSnapshot = CliQuotaSnapshot & { workerId: string; workerName: string };
+export type WorkerCliQuotaSnapshot = CliQuotaSnapshot & {
+	workerId: string;
+	workerName: string;
+	/**
+	 * The worker's self-reported `os.hostname()` (`workers.hostname`), or `null`
+	 * when it declared none. Diagnostic/display only — several workers sharing a
+	 * hostname are the same physical machine, and therefore the same real CLI
+	 * allowance, which is what lets the CLI Quotas page group them instead of
+	 * presenting one machine's shared allowance once per worker on it.
+	 */
+	workerHostname: string | null;
+};
 
 /**
  * Every persisted CLI quota snapshot belonging to **one owner's** workers, each
@@ -36,13 +47,19 @@ export async function listCliQuotasForOwner(
 		.select({
 			workerId: cliQuotas.workerId,
 			workerName: workers.displayName,
+			workerHostname: workers.hostname,
 			snapshot: cliQuotas.snapshot,
 		})
 		.from(cliQuotas)
 		.innerJoin(workers, eq(cliQuotas.workerId, workers.id))
 		.where(eq(workers.ownerUserId, ownerUserId))
 		.orderBy(workers.displayName, cliQuotas.cli);
-	return rows.map((r) => ({ ...r.snapshot, workerId: r.workerId, workerName: r.workerName }));
+	return rows.map((r) => ({
+		...r.snapshot,
+		workerId: r.workerId,
+		workerName: r.workerName,
+		workerHostname: r.workerHostname ?? null,
+	}));
 }
 
 /**

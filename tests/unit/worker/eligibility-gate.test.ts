@@ -82,6 +82,7 @@ function makeCandidate(
 			// file that says nothing about repositories: the declared checkout always is the
 			// task's, so the #714 check is satisfied rather than merely skipped.
 			repository: overrides.repository === undefined ? REPOSITORY : overrides.repository,
+			hostname: null,
 			// In the pool (issue #919) for every case that says nothing about draining.
 			drainingSince: overrides.drainingSince ?? null,
 			update: null,

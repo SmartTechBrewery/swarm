@@ -144,6 +144,14 @@ export interface WorkerRow {
 	 */
 	repository: string | null;
 	/**
+	 * The machine's self-reported `os.hostname()`, or `null` when it declared none.
+	 * Diagnostic/display only — an unauthenticated field of the daemon's handshake —
+	 * so it exists purely to let an operator notice that several of their own
+	 * workers are the same physical machine and therefore share one CLI account's
+	 * allowance; nothing routes on it.
+	 */
+	hostname: string | null;
+	/**
 	 * The SWARM build the machine's daemon declared (issue #925): the commit its
 	 * install root is on, plus a flag for a checkout that is dirty or whose `dist/`
 	 * build predates it. `null` when it declared none — a machine that never

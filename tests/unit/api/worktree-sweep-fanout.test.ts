@@ -37,6 +37,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		declaredCapabilities: null,
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 		repository: null,
+		hostname: null,
 		// No draining precondition here, unlike the update fan-out: a sweep disturbs
 		// no in-flight run, so a machine in the dispatch pool is asked like any other.
 		drainingSince: null,

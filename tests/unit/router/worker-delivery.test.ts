@@ -50,6 +50,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		declaredCapabilities: null,
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
 		repository: null,
+		hostname: null,
 		drainingSince: null,
 		update: null,
 		version: null,

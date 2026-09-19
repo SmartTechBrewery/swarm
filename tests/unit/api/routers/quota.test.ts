@@ -27,6 +27,7 @@ function snapshot(overrides: Partial<WorkerCliQuotaSnapshot> = {}): WorkerCliQuo
 	return {
 		workerId: '11111111-1111-4111-8111-111111111111',
 		workerName: 'm5_pro',
+		workerHostname: null,
 		cli: 'codex',
 		status: 'available',
 		source: 'live',
