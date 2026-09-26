@@ -105,7 +105,12 @@ describe('resolve-conflicts trigger', () => {
 			...mergedEvent,
 			event: { ...mergedEvent.event, conflictPrNumber: '42' },
 		});
-		expect(claimConflictResolution).toHaveBeenCalledWith('acme/widgets:42:head123:base456');
+		// Claimed on behalf of the evaluating dispatch, so the claim ends with it
+		// rather than outliving it (issue #1047).
+		expect(claimConflictResolution).toHaveBeenCalledWith(
+			'acme/widgets:42:head123:base456',
+			mergedEvent.dispatchId,
+		);
 		expect(hasRunForTask).toHaveBeenCalledWith(project.id, '42', 'implementation');
 		expect(result).toMatchObject({
 			phase: 'resolve-conflicts',

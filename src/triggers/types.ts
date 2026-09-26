@@ -87,7 +87,7 @@ export type TriggerContext = {
 	 *
 	 * A handler that takes a durable claim before any run row exists records it as
 	 * that claim's owner, which is what lets the claim expire with the attempt
-	 * instead of outliving it (`reserveReviewVerdict`).
+	 * instead of outliving it (`reserveReviewVerdict`, `claimConflictResolution`).
 	 */
 	dispatchId: string;
 	/** The provider's per-delivery webhook id, when the job carried one. */

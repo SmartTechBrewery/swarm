@@ -916,7 +916,8 @@ describe('review trigger', () => {
 				state: 'open',
 			});
 
-			const result = await handler.handle(ctx(synchronized));
+			const context = ctx(synchronized);
+			const result = await handler.handle(context);
 
 			expect(result).toEqual({
 				phase: 'resolve-conflicts',
@@ -927,6 +928,12 @@ describe('review trigger', () => {
 				baseBranch: 'main',
 				baseSha: 'base123',
 			});
+			// The same owner-bound claim the resolve-conflicts trigger takes, so an
+			// ended holder frees this route too (issue #1047).
+			expect(claimConflictResolution).toHaveBeenCalledWith(
+				`${PROJECT.repo}:42:abc123:base123`,
+				context.dispatchId,
+			);
 		});
 
 		it('skips (returns null) on synchronize event when PR is mergeable (true)', async () => {

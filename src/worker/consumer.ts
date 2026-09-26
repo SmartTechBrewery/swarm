@@ -914,11 +914,16 @@ function deferDependencyBlock(
  * inside its TTL without the flag) is refused by its own claim on the way back
  * in. Respond-to-review is a prioritized continuation with no claim of this
  * shape, so it reports `true` and refreshes nothing.
+ *
+ * `dispatchId` is the dispatch doing the waiting: the resolve-conflicts claim
+ * records it as the claim's owner, so the claim ends with this dispatch rather
+ * than outliving it (issue #1047).
  */
 async function retainContinuationDispatchClaim(
 	project: ProjectConfig,
 	trigger: TriggerResult,
 	ttlSec: number,
+	dispatchId: string,
 ): Promise<boolean> {
 	if (!isPrioritizedContinuationPhase(trigger.phase)) return false;
 	if (trigger.phase === 'review' || trigger.phase === 'respond-to-ci') {
@@ -931,6 +936,7 @@ async function retainContinuationDispatchClaim(
 		await refreshConflictResolutionClaim(
 			buildConflictResolutionKey(project.repo, trigger.prNumber, trigger.headSha, trigger.baseSha),
 			ttlSec,
+			dispatchId,
 		);
 	}
 	return true;
@@ -962,6 +968,7 @@ async function deferWorkerIneligible(
 	project: ProjectConfig,
 	error: string,
 	runId: string | undefined,
+	dispatchId: string,
 ): Promise<Extract<JobOutcome, { status: 'phase-deferred' }> | undefined> {
 	const projectId = project.id;
 	const attempt = job.workerEligibilityRecheckAttempt ?? 0;
@@ -1023,7 +1030,12 @@ async function deferWorkerIneligible(
 	// promotion via `deferDispatchToPending`'s `continuation` column, and an
 	// eligibility wait is a timed re-check, not a slot wait.
 	if (
-		await retainContinuationDispatchClaim(project, trigger, ELIGIBILITY_CONTINUATION_CLAIM_TTL_SEC)
+		await retainContinuationDispatchClaim(
+			project,
+			trigger,
+			ELIGIBILITY_CONTINUATION_CLAIM_TTL_SEC,
+			dispatchId,
+		)
 	) {
 		deferred.continuationDispatchClaimed = true;
 	}
@@ -1246,7 +1258,14 @@ async function deferBeforeRun(
 	if (runId) deferred.runId = runId;
 
 	// Retain a blocked SCM phase as a prioritized continuation once it can run.
-	if (await retainContinuationDispatchClaim(project, trigger, PENDING_CONTINUATION_CLAIM_TTL_SEC)) {
+	if (
+		await retainContinuationDispatchClaim(
+			project,
+			trigger,
+			PENDING_CONTINUATION_CLAIM_TTL_SEC,
+			dispatch.id,
+		)
+	) {
 		deferred.continuationDispatchClaimed = true;
 		deferred.pendingContinuation = project.pipeline?.prioritizeContinuations !== false;
 	}
@@ -3828,6 +3847,7 @@ async function handlePhaseFailure(
 	trigger: TriggerResult,
 	project: ProjectConfig,
 	runId: string | undefined,
+	dispatchId: string,
 ): Promise<JobOutcome> {
 	// Delivery errors deliberately wrap a resumable checkpoint around the
 	// underlying push/hook/API failure. Preserve that cause chain in the run row,
@@ -3908,7 +3928,15 @@ async function handlePhaseFailure(
 	// the actionable reason (grant consent, approve the enrollment, enroll a
 	// worker that can run the configured CLI) on the item.
 	if (err instanceof WorkerIneligibleError) {
-		const deferred = await deferWorkerIneligible(err, job, trigger, project, error, runId);
+		const deferred = await deferWorkerIneligible(
+			err,
+			job,
+			trigger,
+			project,
+			error,
+			runId,
+			dispatchId,
+		);
 		if (deferred) return deferred;
 	}
 
@@ -5157,7 +5185,7 @@ export async function processJob(
 			durationMs: result.agent.durationMs,
 		};
 	} catch (err) {
-		const outcome = await handlePhaseFailure(err, job, trigger, project, runId);
+		const outcome = await handlePhaseFailure(err, job, trigger, project, runId, dispatch.id);
 		preserveCancellationMarker = outcome.status === 'phase-deferred';
 		// Reconcile the terminated run's checkout before the `finally` clears
 		// cancellation tracking and releases the project slot.

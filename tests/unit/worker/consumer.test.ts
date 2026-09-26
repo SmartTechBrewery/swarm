@@ -355,11 +355,13 @@ vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
 		scheduleDispatchRetry(id, input),
 }));
 
-const refreshConflictResolutionClaim = vi.fn(async (_key: string, _ttlSec: number) => {});
+const refreshConflictResolutionClaim = vi.fn(
+	async (_key: string, _ttlSec: number, _dispatchId: string) => {},
+);
 const releaseConflictResolution = vi.fn(async (_key: string) => {});
 vi.mock('@/triggers/resolve-conflicts-dedup.js', () => ({
-	refreshConflictResolutionClaim: (key: string, ttlSec: number) =>
-		refreshConflictResolutionClaim(key, ttlSec),
+	refreshConflictResolutionClaim: (key: string, ttlSec: number, dispatchId: string) =>
+		refreshConflictResolutionClaim(key, ttlSec, dispatchId),
 	buildConflictResolutionKey: (repo: string, prNumber: string, headSha: string, baseSha: string) =>
 		`${repo}:${prNumber}:${headSha}:${baseSha}`,
 	releaseConflictResolution: (key: string) => releaseConflictResolution(key),
@@ -1122,9 +1124,12 @@ describe('processJob', () => {
 
 			await processJob(createMockScmWebhookJob(), registryReturning(RESOLVE_CONFLICTS_TRIGGER));
 
+			// Stamped with the dispatch doing the waiting, so the claim ends with it
+			// rather than outliving it (issue #1047).
 			expect(refreshConflictResolutionClaim).toHaveBeenCalledWith(
 				`${PROJECT.repo}:17:deadbeef:cafebabe`,
 				expect.any(Number),
+				'dispatch-1',
 			);
 		});
 
@@ -3749,12 +3754,13 @@ describe('processJob', () => {
 				expect(input.jobPayload).toMatchObject({ continuationDispatchClaimed: true });
 			});
 
-			it('refreshes the Resolve-conflicts head/base claim, whose TTL nothing else reaps', async () => {
+			it('refreshes the Resolve-conflicts head/base claim on behalf of the waiting dispatch', async () => {
 				await waitOn(RESOLVE_CONFLICTS_TRIGGER);
 
 				expect(refreshConflictResolutionClaim).toHaveBeenCalledWith(
 					`${PROJECT.repo}:17:deadbeef:cafebabe`,
 					expect.any(Number),
+					'dispatch-1',
 				);
 			});
 
