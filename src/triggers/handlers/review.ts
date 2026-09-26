@@ -1327,7 +1327,7 @@ async function handleConflictingPullRequest(
 	if (
 		!ctx.runId &&
 		!ctx.continuationDispatchClaimed &&
-		!(await claimConflictResolution(stateKey))
+		!(await claimConflictResolution(stateKey, ctx.dispatchId))
 	) {
 		logger.debug('review: conflict resolution already claimed — skipping', {
 			prNumber,

@@ -104,7 +104,7 @@ async function checkCandidate(
 	if (
 		!ctx.runId &&
 		!ctx.continuationDispatchClaimed &&
-		!(await claimConflictResolution(stateKey))
+		!(await claimConflictResolution(stateKey, ctx.dispatchId))
 	) {
 		return null;
 	}
