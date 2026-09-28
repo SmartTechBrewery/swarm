@@ -6,6 +6,7 @@ import {
 	type DispatchRow,
 	getActiveDispatchByRunId,
 	getDispatchById,
+	hasActiveDispatchForCoalesceKeys,
 	listActiveDispatchTaskRefs,
 	listWaitingDispatches,
 	reopenDispatchForManualRetry,
@@ -98,6 +99,7 @@ import {
 	toQueuedRuns,
 } from '../../queue/queued-runs.js';
 import type { SCMProvider } from '../../scm/types.js';
+import { reviewRecheckCoalesceKeys } from '../../triggers/review-recheck-keys.js';
 import type { TriggerPhase } from '../../triggers/types.js';
 import { GitWorktreeManager } from '../../worker/git-worktree-manager.js';
 import { reconcileTerminatedWorktree } from '../../worktree/termination-cleanup.js';
@@ -889,14 +891,21 @@ async function resolvePendingRunRequest(run: {
  * is the only place that distinction exists, so the detail view is told the answer
  * rather than left to infer it from a time in the past.
  *
+ * One deferred run is backed by a dispatch that does not name it (issue #1049): a
+ * retried Review — or Respond-to-CI — whose trigger deferred to its own coalesced
+ * recheck. That recheck carries no `runId` by design and re-adopts the run once it
+ * dispatches, so it is found by the coalesce key the handler scheduled it under,
+ * rebuilt from the run's own stored event ({@link awaitsReviewRecheck}).
+ *
  * Its own read, and its own soft failure: a dispatch read that throws must show the
  * run as it always did (the scheduled-retry callout) rather than claim, wrongly,
  * that nothing is coming.
  */
-async function resolveRetryScheduled(run: { id: string; status: string }): Promise<boolean | null> {
+async function resolveRetryScheduled(run: RunRow): Promise<boolean | null> {
 	if (run.status !== 'deferred') return null;
 	try {
-		return (await getActiveDispatchByRunId(run.id)) !== undefined;
+		if ((await getActiveDispatchByRunId(run.id)) !== undefined) return true;
+		return await awaitsReviewRecheck(run);
 	} catch (error) {
 		logger.warn('runs.getById: retry-schedule lookup failed; reporting no verdict', {
 			runId: run.id,
@@ -904,6 +913,21 @@ async function resolveRetryScheduled(run: { id: string; status: string }): Promi
 		});
 		return null;
 	}
+}
+
+/**
+ * Whether a `pr-review` recheck for this run's own pull request head is still
+ * active — the unlinked dispatch a retried Review or Respond-to-CI run waits on
+ * (issue #1049, {@link resolveRetryScheduled}). Only those two phases are ever
+ * left waiting on one, and only with an SCM event naming the head.
+ */
+async function awaitsReviewRecheck(run: RunRow): Promise<boolean> {
+	if (run.phase !== 'review' && run.phase !== 'respond-to-ci') return false;
+	const payload = run.jobPayload;
+	if (!run.repository || !run.prNumber || payload?.type !== 'scm') return false;
+	return hasActiveDispatchForCoalesceKeys(
+		reviewRecheckCoalesceKeys(run.repository, run.prNumber, payload.event),
+	);
 }
 
 /**

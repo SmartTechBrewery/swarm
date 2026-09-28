@@ -175,17 +175,23 @@
  */
 
 import type { ProjectConfig } from '../../config/schema.js';
+import { getActiveDispatchByRunId } from '../../db/repositories/dispatchesRepository.js';
 import {
 	REVIEW_VERDICT_CAP,
 	reserveReviewVerdict,
 } from '../../db/repositories/reviewVerdictsRepository.js';
-import { createFailedRun } from '../../db/repositories/runsRepository.js';
+import {
+	createFailedRun,
+	failRunFromStatus,
+	getLatestRunForTask,
+} from '../../db/repositories/runsRepository.js';
 import { readBaseBranchHealth } from '../../dispatch/base-branch-health.js';
 import { scheduleCoalescedDispatch } from '../../dispatch/dispatcher.js';
 import { logger } from '../../lib/logger.js';
 import type { SwarmJob } from '../../queue/jobs.js';
 import { deliveryIdentity } from '../../scm/delivery.js';
 import type { ScmEvent } from '../../scm/events.js';
+import { repoSlugsMatch } from '../../scm/repo-slug.js';
 import { SWARM_GENERATED_FOOTER } from '../../scm/swarm-origin.js';
 import type { AggregateCheckStatus, PullRequestDetails, SCMProvider } from '../../scm/types.js';
 import { resolveAgentTimeoutMs } from '../../worker/agent-timeout.js';
@@ -201,8 +207,15 @@ import {
 	refreshReviewDispatchClaim,
 	reviewDispatchClaimTtlSec,
 } from '../review-dispatch-dedup.js';
+import { checkRecheckCoalesceKey, mergeabilityRecheckCoalesceKey } from '../review-recheck-keys.js';
 import { resolveSwarmManagedPr, type SwarmManagedPrResult } from '../swarm-managed-pr.js';
-import type { ScmTriggerContext, TriggerContext, TriggerHandler, TriggerResult } from '../types.js';
+import type {
+	ScmTriggerContext,
+	TriggerContext,
+	TriggerHandler,
+	TriggerPhase,
+	TriggerResult,
+} from '../types.js';
 import { decideAggregateCheckOutcome } from './aggregate-check-decision.js';
 
 /**
@@ -304,6 +317,26 @@ const ABANDONED_REVIEW_REASONS: Record<DeferBudget, string> = {
 };
 
 /**
+ * What a deferred recheck is waiting on, in the operator's words (issue #1049).
+ *
+ * A retried Review whose trigger defers used to be settled `failed` with "the
+ * disposition changed or was disabled" — a guess that named the board, while the
+ * handler knew exactly what it was waiting for. Each defer site states it here, and
+ * {@link scheduleReviewRecheck} reports it as the deferred run's reason.
+ */
+interface RecheckWait {
+	/** Completes "Waiting for …" — the read that has no final answer yet. */
+	waitingFor: string;
+	/**
+	 * The operator's own lever, for a wait that may never end by itself — a
+	 * zero-check head under `pipeline.review.checks: 'required'`. Named in the
+	 * deferred run's reason *and* in the give-up record, which is where a wait
+	 * nothing will ever satisfy ends up.
+	 */
+	lever?: string;
+}
+
+/**
  * This event's job payload carrying **no recheck counters** — the shape the
  * recheck scheduler extends, and the one the abandonment record below stores, so
  * that a "Retry now" on that record re-enters this handler with a clean budget
@@ -344,6 +377,12 @@ function baseReviewJobPayload(ctx: ScmTriggerContext): SwarmJob {
  * and, because it stores this event's payload, `runs.retryNow` re-runs the
  * review decision from the dashboard on a fresh budget.
  *
+ * **A chain a retry started ends on the retried run, not on a second row** (issue
+ * #1049). Retrying an abandoned review — or a Respond-to-CI run this handler
+ * dispatched — whose head still has no final state leaves that run `deferred`
+ * while this chain waits for it; giving up here settles that same run `failed` ({@link settleRunAwaitingRecheck}) instead of minting another
+ * record beside a `deferred` row nothing would ever pick up again.
+ *
  * Bookkeeping, so it swallows and logs its own failures: a throw here would
  * escape `handle` into `processJob`'s untried region and fail the job.
  */
@@ -355,11 +394,18 @@ async function recordAbandonedReview(
 	attemptsSpent: number,
 	cap: number,
 	details: Record<string, unknown>,
+	lever?: string,
 ): Promise<void> {
 	const lastRead = Object.entries(details)
 		.map(([key, value]) => `${key}: ${typeof value === 'string' ? value : JSON.stringify(value)}`)
 		.join('; ');
+	const error =
+		`Review abandoned: ${ABANDONED_REVIEW_REASONS[budget]}. ` +
+		`PR #${prNumber} at ${headSha}; the ${budget} recheck budget is spent (${attemptsSpent}/${cap} attempts).` +
+		(lastRead ? ` Last read — ${lastRead}.` : '') +
+		(lever ? ` ${lever}` : '');
 	try {
+		if (await settleRunAwaitingRecheck(ctx, prNumber, headSha, error)) return;
 		await createFailedRun({
 			projectId: ctx.project.id,
 			repository: ctx.project.repo,
@@ -369,10 +415,7 @@ async function recordAbandonedReview(
 			phase: 'review',
 			prNumber,
 			jobPayload: baseReviewJobPayload(ctx),
-			error:
-				`Review abandoned: ${ABANDONED_REVIEW_REASONS[budget]}. ` +
-				`PR #${prNumber} at ${headSha}; the ${budget} recheck budget is spent (${attemptsSpent}/${cap} attempts).` +
-				(lastRead ? ` Last read — ${lastRead}.` : ''),
+			error,
 		});
 	} catch (err) {
 		logger.error('review: failed to record the abandoned review run', {
@@ -382,6 +425,61 @@ async function recordAbandonedReview(
 			error: err instanceof Error ? err.message : String(err),
 		});
 	}
+}
+
+/**
+ * The runs a retry can leave waiting on this handler's recheck chain (issue #1049):
+ * a retried Review, and a retried Respond-to-CI — whose continuation re-enters this
+ * same handler, since it is the one that dispatches Respond-to-CI (under
+ * `<pr>-ci`, {@link dispatchRespondToCi}).
+ */
+function recheckWaiterTasks(prNumber: string): ReadonlyArray<readonly [string, TriggerPhase]> {
+	return [
+		[prNumber, 'review'],
+		[`${prNumber}-ci`, 'respond-to-ci'],
+	];
+}
+
+/**
+ * Settle the run(s) a retry left waiting on this recheck chain, when there are any
+ * (issue #1049) — returns whether it did, so the give-up writes no second row.
+ *
+ * The chain itself carries no `runId` — it re-enters this handler as a fresh
+ * decision, and the phase it dispatches re-adopts the latest `deferred` row for
+ * its task — so the run is found the same way here: for each phase a retry of this
+ * handler's decision can carry ({@link recheckWaiterTasks}), the **latest** run for
+ * that task, still `deferred`, in this repository, for this head, and with no
+ * active dispatch of its own. That last test is what keeps every other `deferred`
+ * run alone — one waiting out a rate limit, a held claim, or an operator's fresh
+ * "Retry now" is owned by its own dispatch, which settles it.
+ *
+ * Conditional on the row still being `deferred`, so a run that meanwhile went back
+ * to `running` is never failed from under its phase.
+ */
+async function settleRunAwaitingRecheck(
+	ctx: ScmTriggerContext,
+	prNumber: string,
+	headSha: string,
+	error: string,
+): Promise<boolean> {
+	let settledAny = false;
+	for (const [taskId, phase] of recheckWaiterTasks(prNumber)) {
+		const run = await getLatestRunForTask(ctx.project.id, taskId, phase);
+		if (!run || run.status !== 'deferred') continue;
+		if (!run.repository || !repoSlugsMatch(run.repository, ctx.project.repo)) continue;
+		const payload = run.jobPayload;
+		if (payload?.type !== 'scm' || payload.event.headSha !== headSha) continue;
+		if (await getActiveDispatchByRunId(run.id)) continue;
+		if (!(await failRunFromStatus(run.id, error, 'deferred'))) continue;
+		settledAny = true;
+		logger.info('review: recheck chain gave up — settled the run it was waiting on', {
+			runId: run.id,
+			phase,
+			prNumber,
+			headSha,
+		});
+	}
+	return settledAny;
 }
 
 /**
@@ -450,6 +548,12 @@ async function recordAbandonedCiFix(
  * answered. As before, the payload deliberately carries no `runId` or
  * `continuationDispatchClaimed`: the recheck re-enters the handler as a fresh
  * decision.
+ *
+ * A scheduled recheck is also noted as this delivery's decline (issue #1049),
+ * naming `wait`: a continuation that lands here — an operator's "Retry now" on an
+ * abandoned review whose head still has no final check state — is *waiting*, and
+ * the settle defers its run with this sentence instead of failing it as a changed
+ * disposition.
  */
 async function scheduleReviewRecheck(
 	ctx: ScmTriggerContext,
@@ -458,6 +562,7 @@ async function scheduleReviewRecheck(
 	prNumber: string,
 	headSha: string,
 	details: Record<string, unknown>,
+	wait: RecheckWait,
 ): Promise<boolean> {
 	const readFailed = budget === 'read-failed';
 	const checkAttempt = ctx.recheckAttempt ?? 0;
@@ -477,7 +582,16 @@ async function scheduleReviewRecheck(
 		// Both terminal give-up paths — the mergeability one and the aggregate-check
 		// one — funnel through this branch, so the durable trace is written once,
 		// here, rather than repeated at (and forgettable from) each caller.
-		await recordAbandonedReview(ctx, budget, prNumber, headSha, attemptsSpent, cap, details);
+		await recordAbandonedReview(
+			ctx,
+			budget,
+			prNumber,
+			headSha,
+			attemptsSpent,
+			cap,
+			details,
+			wait.lever,
+		);
 		return false;
 	}
 
@@ -492,6 +606,18 @@ async function scheduleReviewRecheck(
 		coalesceKey,
 		delayMs,
 	);
+	// After the schedule, never before: the settle defers the run on the strength of
+	// this note, so it must only ever describe a recheck that actually exists.
+	const delaySec = Math.round(delayMs / 1000);
+	ctx.noteDecline?.({
+		kind: 'recheck-scheduled',
+		reason:
+			`Waiting for ${wait.waitingFor}. SWARM re-checks in ${describeWait(delaySec)} ` +
+			`(attempt ${attemptsSpent + 1} of ${cap}).` +
+			(wait.lever ? ` ${wait.lever}` : '') +
+			" This phase's disposition did not change.",
+		retryAfterSec: delaySec,
+	});
 	logger.debug('review: scheduled deferred recheck', {
 		budget,
 		prNumber,
@@ -548,7 +674,8 @@ function isReviewablePullRequest(event: ScmEvent, prNumber: string): ReviewDispo
  * queued or the cap stopped the loop. Shared by the two defer paths in
  * {@link resolveAggregateCheckReview}: some check still incomplete
  * (`state-pending`), and a failed aggregate query (`read-failed`). `details` is
- * merged into the log line so each caller records why it deferred.
+ * merged into the log line so each caller records why it deferred; `wait` is the
+ * same thing in the operator's words (issue #1049).
  */
 async function scheduleCheckRecheck(
 	ctx: ScmTriggerContext,
@@ -556,10 +683,36 @@ async function scheduleCheckRecheck(
 	prNumber: string,
 	headSha: string,
 	details: Record<string, unknown>,
+	wait: RecheckWait,
 ): Promise<ReviewDisposition> {
-	const coalesceKey = `check-suite:${ctx.project.repo}:${prNumber}:${headSha}`;
-	await scheduleReviewRecheck(ctx, budget, coalesceKey, prNumber, headSha, details);
+	const coalesceKey = checkRecheckCoalesceKey(ctx.project.repo, prNumber, headSha);
+	await scheduleReviewRecheck(ctx, budget, coalesceKey, prNumber, headSha, details, wait);
 	return { kind: 'none' };
+}
+
+/**
+ * What a `state-pending` aggregate-check defer waits on (issue #1049). A head with
+ * **no** checks at all is the one wait that may never end: under the default
+ * `required` policy it is never reviewed, and when every CI workflow skips the
+ * change — a diff its `paths-ignore` covers entirely — no check will ever arrive.
+ * That is the case the operator holds the lever for, so it is named outright.
+ */
+function aggregateCheckWait(
+	prNumber: string,
+	headSha: string,
+	incompleteChecks: string[],
+): RecheckWait {
+	const subject = `checks on pull request #${prNumber} at head '${headSha}'`;
+	if (incompleteChecks.length > 0) {
+		return { waitingFor: `${subject} to finish (still running: ${incompleteChecks.join(', ')})` };
+	}
+	return {
+		waitingFor: `${subject}: none are registered on this head yet`,
+		lever:
+			"This project's `pipeline.review.checks` is `required`, so a head no CI workflow runs on " +
+			'(for example a change every workflow `paths-ignore`s) is never reviewed — set it to ' +
+			'`if-present` to review a head that has no checks.',
+	};
 }
 
 /**
@@ -666,10 +819,17 @@ async function resolveAggregateCheckReview(
 	try {
 		checkStatus = await ctx.scm.getAggregateCheckStatus(project, headSha);
 	} catch (err) {
-		return scheduleCheckRecheck(ctx, 'read-failed', prNumber, headSha, {
-			reason: 'aggregate query failed',
-			error: err instanceof Error ? err.message : String(err),
-		});
+		const error = err instanceof Error ? err.message : String(err);
+		return scheduleCheckRecheck(
+			ctx,
+			'read-failed',
+			prNumber,
+			headSha,
+			{ reason: 'aggregate query failed', error },
+			{
+				waitingFor: `the source-control provider to report the checks on pull request #${prNumber} at head '${headSha}' (the last read failed: ${error})`,
+			},
+		);
 	}
 
 	const checksPolicy = project.pipeline?.review?.checks ?? 'required';
@@ -701,9 +861,14 @@ async function resolveAggregateCheckReview(
 	}
 
 	// defer — some check is still incomplete; re-query fresh API state shortly.
-	return scheduleCheckRecheck(ctx, 'state-pending', prNumber, headSha, {
-		incompleteChecks: decision.incompleteChecks,
-	});
+	return scheduleCheckRecheck(
+		ctx,
+		'state-pending',
+		prNumber,
+		headSha,
+		{ incompleteChecks: decision.incompleteChecks },
+		aggregateCheckWait(prNumber, headSha, decision.incompleteChecks),
+	);
 }
 
 /**
@@ -1160,11 +1325,17 @@ async function scheduleMergeabilityRecheck(
 	prNumber: string,
 	headSha: string,
 	details: Record<string, unknown>,
+	wait: RecheckWait,
 ): Promise<null> {
 	// A PR-updated event intentionally never dispatches Review; a completed
 	// checks event can. Keep their rechecks separate so a later PR-updated
 	// delivery cannot replace the follow-up Review's dispatch-capable recheck.
-	const coalesceKey = `review-mergeability:${ctx.project.repo}:${prNumber}:${headSha}:${ctx.event.kind}`;
+	const coalesceKey = mergeabilityRecheckCoalesceKey(
+		ctx.project.repo,
+		prNumber,
+		headSha,
+		ctx.event.kind,
+	);
 	const scheduled = await scheduleReviewRecheck(
 		ctx,
 		budget,
@@ -1172,6 +1343,7 @@ async function scheduleMergeabilityRecheck(
 		prNumber,
 		headSha,
 		details,
+		wait,
 	);
 	if (!scheduled) {
 		await scmCommentReviewGaveUp(ctx.scm, ctx.project, Number(prNumber), budget);
@@ -1239,10 +1411,17 @@ async function checkMergeabilityAndConflicts(
 	try {
 		prDetails = await scm.getPullRequest(project, Number(prNumber), persona);
 	} catch (err) {
-		return scheduleMergeabilityRecheck(ctx, 'read-failed', prNumber, headSha, {
-			reason: 'fetch PR failed',
-			error: err instanceof Error ? err.message : String(err),
-		});
+		const error = err instanceof Error ? err.message : String(err);
+		return scheduleMergeabilityRecheck(
+			ctx,
+			'read-failed',
+			prNumber,
+			headSha,
+			{ reason: 'fetch PR failed', error },
+			{
+				waitingFor: `the source-control provider to return pull request #${prNumber} (the last read failed: ${error})`,
+			},
+		);
 	}
 
 	if (!prDetails) {
@@ -1276,9 +1455,16 @@ async function checkMergeabilityAndConflicts(
 	// aggregate checks-API query.
 	const isSwarm = await resolveSwarmManagedPr(project, prDetails.headBranch, 'review');
 	if (isSwarm === 'error') {
-		return scheduleMergeabilityRecheck(ctx, 'read-failed', prNumber, headSha, {
-			reason: 'ownership gate resolution failed',
-		});
+		return scheduleMergeabilityRecheck(
+			ctx,
+			'read-failed',
+			prNumber,
+			headSha,
+			{ reason: 'ownership gate resolution failed' },
+			{
+				waitingFor: `SWARM's run history to confirm pull request #${prNumber} is one SWARM implemented (the lookup failed)`,
+			},
+		);
 	}
 	if (!isSwarm.managed) {
 		logOwnershipSkip(project.id, prNumber, prDetails.headBranch, prDetails.authorLogin, isSwarm);
@@ -1286,9 +1472,16 @@ async function checkMergeabilityAndConflicts(
 	}
 
 	if (prDetails.mergeable === null) {
-		return scheduleMergeabilityRecheck(ctx, 'state-pending', prNumber, headSha, {
-			reason: 'mergeable is null (unknown)',
-		});
+		return scheduleMergeabilityRecheck(
+			ctx,
+			'state-pending',
+			prNumber,
+			headSha,
+			{ reason: 'mergeable is null (unknown)' },
+			{
+				waitingFor: `the source-control provider to report whether pull request #${prNumber} at head '${headSha}' is mergeable (it has not computed it yet)`,
+			},
+		);
 	}
 
 	if (prDetails.mergeable === false) {
