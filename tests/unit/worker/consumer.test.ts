@@ -832,6 +832,28 @@ function registryDecliningWithHeldClaim(
 	return registry;
 }
 
+const RECHECK_REASON =
+	"Waiting for checks on pull request #17 at head 'deadbeef': none are registered on this head yet.";
+
+/**
+ * A registry whose single handler *defers* — it has scheduled its own recheck and
+ * says what it waits for — the shape the `pr-review` handler produces when a
+ * retried Review's head has no final check state yet (issue #1049).
+ */
+function registryDeferringToRecheck() {
+	const registry = createTriggerRegistry();
+	registry.register({
+		name: 'test-trigger',
+		description: 'defers to a recheck it scheduled',
+		matches: () => true,
+		handle: async (ctx) => {
+			ctx.noteDecline?.({ kind: 'recheck-scheduled', reason: RECHECK_REASON, retryAfterSec: 30 });
+			return null;
+		},
+	});
+	return registry;
+}
+
 /**
  * Claim the next dispatch as a row whose earlier evaluation resolved `phase` —
  * what `recordDispatchResolution` leaves behind, and the only thing the
@@ -1630,6 +1652,84 @@ describe('processJob', () => {
 
 				expect(releaseReviewDispatch).not.toHaveBeenCalled();
 				expect(abandonReviewVerdict).not.toHaveBeenCalled();
+			});
+		});
+
+		// Issue #1049: "Retry now" on an abandoned Review whose head still had no
+		// final check state was settled `failed` as a changed disposition, while the
+		// recheck that same evaluation scheduled went on to flip the run back to
+		// `running`. A deferring handler is waiting, and the run now says so.
+		describe('a retry that meets a scheduled recheck waits instead of failing (issue #1049)', () => {
+			/** The operator's retry of the abandoned record: a continuation carrying it. */
+			const retriedReview = (overrides: Record<string, unknown> = {}) =>
+				createMockScmWebhookJob({
+					runId: 'run-123',
+					event: createMockScmEvent({ headSha: 'deadbeef' }),
+					...overrides,
+				});
+
+			it('defers the carried run with what it waits for', async () => {
+				claimDispatchWithPhase('review');
+
+				const outcome = await processJob(retriedReview(), registryDeferringToRecheck());
+
+				expect(outcome).toEqual({ status: 'no-trigger' });
+				expect(completeRun).toHaveBeenCalledExactlyOnceWith('run-123', {
+					status: 'deferred',
+					error: RECHECK_REASON,
+					nextRetryAt: expect.any(Date),
+				});
+				// Timed by the recheck the handler scheduled.
+				const [, input] = completeRun.mock.calls[0] as [string, { nextRetryAt: Date }];
+				expect(input.nextRetryAt.getTime() - Date.now()).toBeGreaterThan(25_000);
+				expect(input.nextRetryAt.getTime() - Date.now()).toBeLessThanOrEqual(30_000);
+			});
+
+			// The wait belongs to the handler's own coalesced recheck, which re-adopts
+			// the run once it dispatches — so this dispatch completes, and no second
+			// retry is scheduled beside the recheck.
+			it('completes its own dispatch rather than scheduling a second wait', async () => {
+				claimDispatchWithPhase('review');
+
+				await processJob(retriedReview(), registryDeferringToRecheck());
+
+				expect(completeDispatch).toHaveBeenCalledWith('dispatch-1', 'no-trigger');
+				expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+			});
+
+			// A continuation re-evaluated after a capacity deferral still holds the
+			// claim its first evaluation took, and the recheck needs that slot free.
+			it('still hands back what an earlier evaluation claimed', async () => {
+				claimDispatchWithPhase('review');
+
+				await processJob(
+					retriedReview({ continuationDispatchClaimed: true }),
+					registryDeferringToRecheck(),
+				);
+
+				expect(releaseReviewDispatch).toHaveBeenCalledWith(`${PROJECT.repo}:17:deadbeef`);
+			});
+
+			it('touches no run for a fresh delivery that defers', async () => {
+				await processJob(
+					createMockScmWebhookJob({ event: createMockScmEvent({ headSha: 'deadbeef' }) }),
+					registryDeferringToRecheck(),
+				);
+
+				expect(completeRun).not.toHaveBeenCalled();
+				expect(completeDispatch).toHaveBeenCalledWith('dispatch-1', 'no-trigger');
+			});
+
+			// The generic wording is kept for what it actually describes.
+			it('keeps the disposition wording for a genuine decline', async () => {
+				claimDispatchWithPhase('review');
+
+				await processJob(retriedReview(), registryReturning(null));
+
+				expect(completeRun).toHaveBeenCalledWith('run-123', {
+					status: 'failed',
+					error: expect.stringContaining('disposition changed or was disabled'),
+				});
 			});
 		});
 

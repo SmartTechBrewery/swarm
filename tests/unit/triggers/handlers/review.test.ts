@@ -113,15 +113,28 @@ vi.mock('@/lib/logger.js', () => ({
 // Implementation for this item" — the common path. `createFailedRun` is the
 // durable trace a terminal give-up writes (issue #742), mocked from the same
 // partial so these tests need no database.
-const { hasRunForTask, createFailedRun } = vi.hoisted(() => ({
-	hasRunForTask: vi.fn(),
-	createFailedRun: vi.fn(),
-}));
+//
+// A give-up first looks for the Review run a retry left `deferred` on the chain
+// (issue #1049) — the latest run for the task, its active dispatch, and the
+// conditional settle. Defaults to "no such run", so every give-up below still
+// writes its own record unless a case says otherwise.
+const { hasRunForTask, createFailedRun, getLatestRunForTask, failRunFromStatus } = vi.hoisted(
+	() => ({
+		hasRunForTask: vi.fn(),
+		createFailedRun: vi.fn(),
+		getLatestRunForTask: vi.fn(),
+		failRunFromStatus: vi.fn(),
+	}),
+);
 vi.mock('@/db/repositories/runsRepository.js', async (importActual) => ({
 	...(await importActual<typeof import('@/db/repositories/runsRepository.js')>()),
 	hasRunForTask,
 	createFailedRun,
+	getLatestRunForTask,
+	failRunFromStatus,
 }));
+const { getActiveDispatchByRunId } = vi.hoisted(() => ({ getActiveDispatchByRunId: vi.fn() }));
+vi.mock('@/db/repositories/dispatchesRepository.js', () => ({ getActiveDispatchByRunId }));
 
 // The `review` disposition reserves a durable safety-cap slot before
 // dispatching (issue #235); mock the ledger so these tests need no database.
@@ -161,6 +174,12 @@ beforeEach(() => {
 	hasRunForTask.mockResolvedValue(true);
 	createFailedRun.mockReset();
 	createFailedRun.mockResolvedValue('run-abandoned');
+	getLatestRunForTask.mockReset();
+	getLatestRunForTask.mockResolvedValue(undefined);
+	failRunFromStatus.mockReset();
+	failRunFromStatus.mockResolvedValue(true);
+	getActiveDispatchByRunId.mockReset();
+	getActiveDispatchByRunId.mockResolvedValue(undefined);
 	reserveReviewVerdict.mockReset();
 	reserveReviewVerdict.mockResolvedValue({ status: 'reserved', id: 'v1', ordinal: 1 });
 	hasPersonaToken.mockReset();
@@ -204,6 +223,7 @@ function ctx(
 		continuationDispatchClaimed?: boolean;
 		ciNoFixRecovery?: boolean;
 		noteDecline?: (decline: TriggerDecline) => void;
+		runId?: string;
 	} = {},
 ): TriggerContext {
 	return createMockScmTriggerContext({
@@ -1525,6 +1545,182 @@ describe('review trigger — durable trace when a review is abandoned (issue #74
 			phase: 'review',
 		});
 		expect(createFailedRun).not.toHaveBeenCalled();
+	});
+});
+
+/**
+ * A retry that meets a defer is a wait, and says what for (issue #1049).
+ *
+ * The observed case: a PR touching only paths every CI workflow `paths-ignore`s
+ * has **zero** checks, under `pipeline.review.checks: 'required'` the
+ * `state-pending` chain spent its budget and recorded an abandoned review, and each
+ * "Retry now" on that record re-entered here as a continuation, deferred again —
+ * and was settled `failed` as a changed disposition while its own recheck went on
+ * to pick the very same run back up. The handler now names the wait, and the chain
+ * a retry started ends on the retried run rather than beside it.
+ */
+describe('review trigger — a retry that meets a defer names its wait (issue #1049)', () => {
+	const checks = { kind: 'checks', action: 'completed', workItemId: '9' } as const;
+	/** The retried abandoned record: a continuation carrying its run. */
+	const retry = (noteDecline: (decline: TriggerDecline) => void, recheckAttempt?: number) =>
+		ctx({ ...checks, headSha: 'cafe' }, { runId: 'run-abandoned', noteDecline, recheckAttempt });
+
+	function notedDecline(noteDecline: ReturnType<typeof vi.fn>): TriggerDecline {
+		expect(noteDecline).toHaveBeenCalledOnce();
+		return noteDecline.mock.calls[0][0] as TriggerDecline;
+	}
+
+	it('names a zero-check head, and the if-present lever, on the recheck it schedules', async () => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([]));
+		const noteDecline = vi.fn();
+
+		expect(await handler.handle(retry(noteDecline))).toBeNull();
+
+		expect(scheduleCoalescedJob).toHaveBeenCalledOnce();
+		const decline = notedDecline(noteDecline);
+		expect(decline).toMatchObject({ kind: 'recheck-scheduled', retryAfterSec: 30 });
+		expect(decline.reason).toContain("checks on pull request #9 at head 'cafe'");
+		expect(decline.reason).toContain('none are registered');
+		expect(decline.reason).toContain('attempt 1 of 20');
+		// The one wait that may never end by itself — so the lever is named outright.
+		expect(decline.reason).toContain('`if-present`');
+		expect(decline.reason).toContain('disposition did not change');
+		expect(decline.reason).not.toContain('disabled');
+	});
+
+	it('names the checks still running, with no policy advice they do not need', async () => {
+		getAggregateCheckStatus.mockResolvedValue(
+			checkStatus([
+				['build', 'completed', 'success'],
+				['test', 'in_progress', null],
+			]),
+		);
+		const noteDecline = vi.fn();
+
+		await handler.handle(retry(noteDecline, 4));
+
+		const { reason } = notedDecline(noteDecline);
+		expect(reason).toContain('still running: test');
+		expect(reason).toContain('attempt 5 of 20');
+		expect(reason).not.toContain('if-present');
+	});
+
+	it('names an unknown mergeability on the mergeability recheck', async () => {
+		getPullRequest.mockResolvedValue({
+			number: 9,
+			headBranch: 'issue-9',
+			headSha: 'cafe',
+			baseBranch: 'main',
+			baseSha: 'base-sha-123',
+			mergeable: null,
+			authorLogin: 'operator-human',
+			state: 'open',
+		});
+		const noteDecline = vi.fn();
+
+		await handler.handle(retry(noteDecline));
+
+		expect(scheduleCoalescedJob).toHaveBeenCalledOnce();
+		const decline = notedDecline(noteDecline);
+		expect(decline.kind).toBe('recheck-scheduled');
+		expect(decline.reason).toContain('is mergeable');
+		expect(getAggregateCheckStatus).not.toHaveBeenCalled();
+	});
+
+	// The note is what lets the settle *defer* a run, so it may only ever describe
+	// a recheck that exists: a spent budget schedules none.
+	it('notes no wait once the budget is spent', async () => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([]));
+		const noteDecline = vi.fn();
+
+		await handler.handle(retry(noteDecline, 20));
+
+		expect(scheduleCoalescedJob).not.toHaveBeenCalled();
+		expect(noteDecline).not.toHaveBeenCalled();
+	});
+
+	describe('the give-up that ends such a wait', () => {
+		/** The retried run as the settle left it: deferred on this head's chain. */
+		const waitingRun = (overrides: Record<string, unknown> = {}) => ({
+			id: 'run-abandoned',
+			status: 'deferred',
+			repository: PROJECT.repo,
+			jobPayload: { type: 'scm', event: createMockScmEvent({ ...checks, headSha: 'cafe' }) },
+			...overrides,
+		});
+		/** The chain's last recheck: a fresh decision, carrying no run of its own. */
+		const exhaustedChain = () =>
+			handler.handle(ctx({ ...checks, headSha: 'cafe' }, { recheckAttempt: 20 }));
+
+		it('names the if-present lever on the record for a zero-check head', async () => {
+			getAggregateCheckStatus.mockResolvedValue(checkStatus([]));
+
+			await exhaustedChain();
+
+			expect(createFailedRun).toHaveBeenCalledOnce();
+			expect(createFailedRun.mock.calls[0][0].error).toContain('`if-present`');
+		});
+
+		it('settles the run the retry left waiting instead of writing a second record', async () => {
+			getAggregateCheckStatus.mockResolvedValue(checkStatus([]));
+			getLatestRunForTask.mockResolvedValue(waitingRun());
+
+			await exhaustedChain();
+
+			expect(getLatestRunForTask).toHaveBeenCalledWith(PROJECT.id, '9', 'review');
+			expect(getActiveDispatchByRunId).toHaveBeenCalledWith('run-abandoned');
+			expect(failRunFromStatus).toHaveBeenCalledExactlyOnceWith(
+				'run-abandoned',
+				expect.stringContaining('Review abandoned'),
+				'deferred',
+			);
+			expect(failRunFromStatus.mock.calls[0][1]).toContain('`if-present`');
+			expect(createFailedRun).not.toHaveBeenCalled();
+		});
+
+		// A `deferred` Review with a dispatch of its own is waiting on *that*
+		// dispatch — a rate limit, a held claim, an operator's fresh retry — which
+		// settles it; this chain's give-up must not.
+		it('leaves a deferred run that its own dispatch owns alone', async () => {
+			getAggregateCheckStatus.mockResolvedValue(checkStatus([]));
+			getLatestRunForTask.mockResolvedValue(waitingRun());
+			getActiveDispatchByRunId.mockResolvedValue({ id: 'dispatch-retry' });
+
+			await exhaustedChain();
+
+			expect(failRunFromStatus).not.toHaveBeenCalled();
+			expect(createFailedRun).toHaveBeenCalledOnce();
+		});
+
+		it.each([
+			[
+				'another head',
+				{ jobPayload: { type: 'scm', event: createMockScmEvent({ headSha: 'beef' }) } },
+			],
+			['another repository', { repository: 'someone/else' }],
+			['a run that is not waiting', { status: 'failed' }],
+		])('leaves the latest run alone when it is for %s', async (_label, overrides) => {
+			getAggregateCheckStatus.mockResolvedValue(checkStatus([]));
+			getLatestRunForTask.mockResolvedValue(waitingRun(overrides));
+
+			await exhaustedChain();
+
+			expect(failRunFromStatus).not.toHaveBeenCalled();
+			expect(createFailedRun).toHaveBeenCalledOnce();
+		});
+
+		// The settle is conditional on the row still being `deferred`: a run that went
+		// back to `running` meanwhile is left to its phase, and the give-up is still
+		// recorded rather than lost.
+		it('still records the give-up when the waiting run moved on first', async () => {
+			getAggregateCheckStatus.mockResolvedValue(checkStatus([]));
+			getLatestRunForTask.mockResolvedValue(waitingRun());
+			failRunFromStatus.mockResolvedValue(false);
+
+			await exhaustedChain();
+
+			expect(createFailedRun).toHaveBeenCalledOnce();
+		});
 	});
 });
 

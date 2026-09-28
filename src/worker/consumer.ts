@@ -4543,6 +4543,8 @@ async function deferHeldDispatchClaim(
  * complexity budget (the file already splits helpers this way), and returns an
  * outcome only for the one delivery that is *not* settled at all: a collision with
  * a claim genuinely held, which is deferred instead ({@link deferHeldDispatchClaim}).
+ * A handler that deferred to its own scheduled recheck (issue #1049) settles its
+ * dispatch as usual, but leaves the carried run `deferred` rather than `failed`.
  */
 async function settleUnmatchedNoTriggerDelivery(
 	job: SwarmJob,
@@ -4562,6 +4564,28 @@ async function settleUnmatchedNoTriggerDelivery(
 	if (decline?.kind === 'dispatch-claim-held') {
 		const deferred = await deferHeldDispatchClaim(job, project, dispatch, decline);
 		if (deferred) return deferred;
+	}
+	// A handler that deferred to a recheck it has *already scheduled* is waiting,
+	// not declining (issue #1049): a retried Review whose head has no final check
+	// state yet. The recheck is its own coalesced dispatch and re-adopts this run
+	// once it dispatches (the latest `deferred` row for the task,
+	// `tryReuseLatestRun`), so the run is settled `deferred` with what it waits for
+	// rather than terminally `failed` — which the recheck then flipped straight back
+	// to `running`. This dispatch still completes: the wait belongs to the recheck.
+	// The hand-back below is left exactly as it was, because a continuation that
+	// re-evaluated here may still hold a claim from an earlier evaluation
+	// (`continuationDispatchClaimed`), and the recheck needs that slot free.
+	if (decline?.kind === 'recheck-scheduled' && job.runId) {
+		await finalizeRun(job.runId, {
+			status: 'deferred',
+			error: decline.reason,
+			nextRetryAt:
+				decline.retryAfterSec === undefined
+					? null
+					: new Date(Date.now() + decline.retryAfterSec * 1000),
+		});
+		await handBackNoTriggerClaims(job, project, dispatch);
+		return undefined;
 	}
 	if (job.runId) {
 		await finalizeRun(job.runId, {
@@ -4650,6 +4674,13 @@ async function settleUnmatchedNoTriggerDelivery(
  * the dispatch never took. For the one decline that is a *wait* rather than an
  * outcome — a live claim collision — the run is not settled here at all: see
  * {@link deferHeldDispatchClaim}.
+ *
+ * **Issue #1049.** The same wrong guess, from the other side: a retried Review
+ * whose head had no final check state was declined because the handler had
+ * *deferred* — it scheduled its own recheck — and the run was recorded as a
+ * changed disposition and terminally `failed`, until that recheck dispatched and
+ * flipped the same row back to `running`. A `recheck-scheduled` decline now leaves
+ * the run `deferred`, naming what it waits for.
  */
 async function settleNoTriggerDelivery(
 	job: SwarmJob,

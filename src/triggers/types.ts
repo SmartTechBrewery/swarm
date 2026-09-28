@@ -51,16 +51,26 @@ export interface TriggerDecline {
 	 * slot, so this delivery is a duplicate of work already in flight. The settle
 	 * keys on this to leave the holder's claims strictly alone: handing back a
 	 * claim this dispatch never took would abandon the live phase's slot.
+	 *
+	 * `recheck-scheduled` — the handler could not decide yet (a check still
+	 * running, no checks on the head, `mergeable` unknown, a read that failed) and
+	 * has already scheduled its own recheck of this event (issue #1049). That is a
+	 * wait, not a verdict: the recheck re-adopts the Review run once it dispatches
+	 * (the latest `deferred` row for the task, `tryReuseLatestRun` in
+	 * `src/worker/consumer.ts`), so the settle marks the run a continuation carries
+	 * `deferred` with this reason rather than terminally `failed`.
 	 */
-	kind: 'dispatch-claim-held';
+	kind: 'dispatch-claim-held' | 'recheck-scheduled';
 	/** Operator-facing sentence, recorded verbatim as the settled run's error. */
 	reason: string;
 	/**
-	 * How long the held claim's lease has left, when it could be read — the wait
-	 * the settle schedules its re-check on, so a continuation blocked by a live
-	 * holder is deferred until the slot can actually free rather than failed for
-	 * it (issue #1019). Absent when the lease could not be read at all, which the
-	 * settle falls back to its own cadence for.
+	 * How long until the decline can resolve, when known. For `dispatch-claim-held`
+	 * it is the held claim's remaining lease — the wait the settle schedules its
+	 * re-check on, so a continuation blocked by a live holder is deferred until the
+	 * slot can actually free rather than failed for it (issue #1019); absent when
+	 * the lease could not be read at all, which the settle falls back to its own
+	 * cadence for. For `recheck-scheduled` it is the delay of the recheck the
+	 * handler scheduled, recorded as the deferred run's next retry time.
 	 */
 	retryAfterSec?: number;
 }
