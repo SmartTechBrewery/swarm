@@ -1117,6 +1117,27 @@ export async function getActiveDispatchByRunId(runId: string): Promise<DispatchR
 }
 
 /**
+ * Whether any active dispatch carries one of these coalesce keys — the only link
+ * between a run a retry left `deferred` and the recheck it waits on, which is
+ * deliberately scheduled without a `runId` (issue #1049). Served by
+ * `idx_dispatches_coalesce_key`; an empty key list is a free `false`.
+ */
+export async function hasActiveDispatchForCoalesceKeys(keys: readonly string[]): Promise<boolean> {
+	if (keys.length === 0) return false;
+	const rows = await getDb()
+		.select({ id: dispatches.id })
+		.from(dispatches)
+		.where(
+			and(
+				inArray(dispatches.coalesceKey, [...keys]),
+				inArray(dispatches.state, [...ACTIVE_DISPATCH_STATES]),
+			),
+		)
+		.limit(1);
+	return rows.length > 0;
+}
+
+/**
  * Whether some *other* attempt is mid-execution against this task's checkout —
  * the dispatch-side worktree-lease liveness signal (issue #427). Counts only
  * {@link EXECUTING_DISPATCH_STATES}, and skips the asking attempt's own run

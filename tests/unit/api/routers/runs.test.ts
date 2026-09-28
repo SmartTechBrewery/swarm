@@ -68,6 +68,7 @@ vi.mock('@/db/repositories/dispatchesRepository.js', async (importOriginal) => (
 	...(await importOriginal<typeof import('@/db/repositories/dispatchesRepository.js')>()),
 	getActiveDispatchByRunId: vi.fn(),
 	getDispatchById: vi.fn(),
+	hasActiveDispatchForCoalesceKeys: vi.fn(),
 	listActiveDispatchTaskRefs: vi.fn(),
 	listWaitingDispatches: vi.fn(),
 	reopenDispatchForManualRetry: vi.fn(),
@@ -176,6 +177,7 @@ import {
 	type DispatchRow,
 	getActiveDispatchByRunId,
 	getDispatchById,
+	hasActiveDispatchForCoalesceKeys,
 	listActiveDispatchTaskRefs,
 	listWaitingDispatches,
 	reopenDispatchForManualRetry,
@@ -413,6 +415,8 @@ describe('runsRouter', () => {
 		vi.mocked(listAllProjectsFromDb).mockResolvedValue([]);
 		vi.mocked(getPMProvider).mockReset();
 		vi.mocked(getActiveDispatchByRunId).mockReset();
+		vi.mocked(hasActiveDispatchForCoalesceKeys).mockReset();
+		vi.mocked(hasActiveDispatchForCoalesceKeys).mockResolvedValue(false);
 		vi.mocked(getDispatchById).mockReset();
 		vi.mocked(listWaitingDispatches).mockReset();
 		vi.mocked(listWaitingDispatches).mockResolvedValue([]);
@@ -1763,6 +1767,72 @@ describe('runsRouter', () => {
 				await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
 					retryScheduled: false,
 				});
+			});
+
+			// Issue #1049: a retried Review (or Respond-to-CI) whose trigger deferred to
+			// its own coalesced recheck is backed by a dispatch that carries no `runId` —
+			// it is found by the coalesce key, rebuilt from the run's own stored event.
+			function makeRecheckWaiter(phase: 'review' | 'respond-to-ci', taskId: string): RunRow {
+				return makeRun({
+					id: 'run-1',
+					status: 'deferred',
+					phase,
+					taskId,
+					prNumber: '405',
+					repository: 'acme/platform',
+					nextRetryAt: new Date('2026-09-28T12:00:30Z'),
+					jobPayload: {
+						type: 'scm',
+						providerId: 'github',
+						projectId: 'p1',
+						event: {
+							kind: 'checks',
+							repoFullName: 'acme/platform',
+							isCommentEvent: false,
+							workItemId: '405',
+							headSha: '2dd42fb',
+						},
+					},
+				});
+			}
+
+			it.each([
+				['review', '405'],
+				['respond-to-ci', '405-ci'],
+			] as const)('is true for a deferred %s run waiting on an unlinked recheck', async (phase, taskId) => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRecheckWaiter(phase, taskId));
+				vi.mocked(getActiveDispatchByRunId).mockResolvedValue(undefined);
+				vi.mocked(hasActiveDispatchForCoalesceKeys).mockResolvedValue(true);
+
+				await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+					retryScheduled: true,
+				});
+				expect(hasActiveDispatchForCoalesceKeys).toHaveBeenCalledWith([
+					'check-suite:acme/platform:405:2dd42fb',
+					'review-mergeability:acme/platform:405:2dd42fb:checks',
+				]);
+			});
+
+			it('is false once the recheck chain the run waited on has ended', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRecheckWaiter('review', '405'));
+				vi.mocked(getActiveDispatchByRunId).mockResolvedValue(undefined);
+				vi.mocked(hasActiveDispatchForCoalesceKeys).mockResolvedValue(false);
+
+				await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+					retryScheduled: false,
+				});
+			});
+
+			it('never looks for a recheck behind a phase no recheck re-adopts', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({ id: 'run-1', status: 'deferred', phase: 'implementation' }),
+				);
+				vi.mocked(getActiveDispatchByRunId).mockResolvedValue(undefined);
+
+				await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+					retryScheduled: false,
+				});
+				expect(hasActiveDispatchForCoalesceKeys).not.toHaveBeenCalled();
 			});
 
 			it('reports no verdict for a status that has no scheduled retry', async () => {

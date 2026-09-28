@@ -1661,9 +1661,15 @@ describe('review trigger — a retry that meets a defer names its wait (issue #1
 			expect(createFailedRun.mock.calls[0][0].error).toContain('`if-present`');
 		});
 
+		/** Only the named phase's task has a run waiting; the other has none. */
+		const waitingOnly = (phase: 'review' | 'respond-to-ci') =>
+			getLatestRunForTask.mockImplementation(async (_projectId, _taskId, asked) =>
+				asked === phase ? waitingRun() : undefined,
+			);
+
 		it('settles the run the retry left waiting instead of writing a second record', async () => {
 			getAggregateCheckStatus.mockResolvedValue(checkStatus([]));
-			getLatestRunForTask.mockResolvedValue(waitingRun());
+			waitingOnly('review');
 
 			await exhaustedChain();
 
@@ -1675,6 +1681,24 @@ describe('review trigger — a retry that meets a defer names its wait (issue #1
 				'deferred',
 			);
 			expect(failRunFromStatus.mock.calls[0][1]).toContain('`if-present`');
+			expect(createFailedRun).not.toHaveBeenCalled();
+		});
+
+		// A retried Respond-to-CI run re-enters this same handler (it is the one that
+		// dispatches Respond-to-CI), so its wait ends on this chain's give-up too —
+		// looked up under Respond-to-CI's own task id, not Review's.
+		it('settles a Respond-to-CI run the retry left waiting', async () => {
+			getAggregateCheckStatus.mockResolvedValue(checkStatus([]));
+			waitingOnly('respond-to-ci');
+
+			await exhaustedChain();
+
+			expect(getLatestRunForTask).toHaveBeenCalledWith(PROJECT.id, '9-ci', 'respond-to-ci');
+			expect(failRunFromStatus).toHaveBeenCalledExactlyOnceWith(
+				'run-abandoned',
+				expect.stringContaining('Review abandoned'),
+				'deferred',
+			);
 			expect(createFailedRun).not.toHaveBeenCalled();
 		});
 

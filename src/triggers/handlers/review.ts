@@ -207,8 +207,15 @@ import {
 	refreshReviewDispatchClaim,
 	reviewDispatchClaimTtlSec,
 } from '../review-dispatch-dedup.js';
+import { checkRecheckCoalesceKey, mergeabilityRecheckCoalesceKey } from '../review-recheck-keys.js';
 import { resolveSwarmManagedPr, type SwarmManagedPrResult } from '../swarm-managed-pr.js';
-import type { ScmTriggerContext, TriggerContext, TriggerHandler, TriggerResult } from '../types.js';
+import type {
+	ScmTriggerContext,
+	TriggerContext,
+	TriggerHandler,
+	TriggerPhase,
+	TriggerResult,
+} from '../types.js';
 import { decideAggregateCheckOutcome } from './aggregate-check-decision.js';
 
 /**
@@ -371,9 +378,9 @@ function baseReviewJobPayload(ctx: ScmTriggerContext): SwarmJob {
  * review decision from the dashboard on a fresh budget.
  *
  * **A chain a retry started ends on the retried run, not on a second row** (issue
- * #1049). Retrying an abandoned review whose head still has no final state leaves
- * that run `deferred` while this chain waits for it; giving up here settles that
- * same run `failed` ({@link settleRunAwaitingRecheck}) instead of minting another
+ * #1049). Retrying an abandoned review — or a Respond-to-CI run this handler
+ * dispatched — whose head still has no final state leaves that run `deferred`
+ * while this chain waits for it; giving up here settles that same run `failed` ({@link settleRunAwaitingRecheck}) instead of minting another
  * record beside a `deferred` row nothing would ever pick up again.
  *
  * Bookkeeping, so it swallows and logs its own failures: a throw here would
@@ -421,15 +428,29 @@ async function recordAbandonedReview(
 }
 
 /**
- * Settle the Review run a retry left waiting on this recheck chain, when there is
- * one (issue #1049) — returns whether it did, so the give-up writes no second row.
+ * The runs a retry can leave waiting on this handler's recheck chain (issue #1049):
+ * a retried Review, and a retried Respond-to-CI — whose continuation re-enters this
+ * same handler, since it is the one that dispatches Respond-to-CI (under
+ * `<pr>-ci`, {@link dispatchRespondToCi}).
+ */
+function recheckWaiterTasks(prNumber: string): ReadonlyArray<readonly [string, TriggerPhase]> {
+	return [
+		[prNumber, 'review'],
+		[`${prNumber}-ci`, 'respond-to-ci'],
+	];
+}
+
+/**
+ * Settle the run(s) a retry left waiting on this recheck chain, when there are any
+ * (issue #1049) — returns whether it did, so the give-up writes no second row.
  *
  * The chain itself carries no `runId` — it re-enters this handler as a fresh
- * decision, and the Review it dispatches re-adopts the latest `deferred` row for
- * the task — so the run is found the same way here: the **latest** Review run for
- * this PR, still `deferred`, in this repository, for this head, and with no active
- * dispatch of its own. That last test is what keeps every other `deferred` Review
- * alone — one waiting out a rate limit, a held claim, or an operator's fresh
+ * decision, and the phase it dispatches re-adopts the latest `deferred` row for
+ * its task — so the run is found the same way here: for each phase a retry of this
+ * handler's decision can carry ({@link recheckWaiterTasks}), the **latest** run for
+ * that task, still `deferred`, in this repository, for this head, and with no
+ * active dispatch of its own. That last test is what keeps every other `deferred`
+ * run alone — one waiting out a rate limit, a held claim, or an operator's fresh
  * "Retry now" is owned by its own dispatch, which settles it.
  *
  * Conditional on the row still being `deferred`, so a run that meanwhile went back
@@ -441,21 +462,24 @@ async function settleRunAwaitingRecheck(
 	headSha: string,
 	error: string,
 ): Promise<boolean> {
-	const run = await getLatestRunForTask(ctx.project.id, prNumber, 'review');
-	if (!run || run.status !== 'deferred') return false;
-	if (!run.repository || !repoSlugsMatch(run.repository, ctx.project.repo)) return false;
-	const payload = run.jobPayload;
-	if (payload?.type !== 'scm' || payload.event.headSha !== headSha) return false;
-	if (await getActiveDispatchByRunId(run.id)) return false;
-	const settled = await failRunFromStatus(run.id, error, 'deferred');
-	if (settled) {
+	let settledAny = false;
+	for (const [taskId, phase] of recheckWaiterTasks(prNumber)) {
+		const run = await getLatestRunForTask(ctx.project.id, taskId, phase);
+		if (!run || run.status !== 'deferred') continue;
+		if (!run.repository || !repoSlugsMatch(run.repository, ctx.project.repo)) continue;
+		const payload = run.jobPayload;
+		if (payload?.type !== 'scm' || payload.event.headSha !== headSha) continue;
+		if (await getActiveDispatchByRunId(run.id)) continue;
+		if (!(await failRunFromStatus(run.id, error, 'deferred'))) continue;
+		settledAny = true;
 		logger.info('review: recheck chain gave up — settled the run it was waiting on', {
 			runId: run.id,
+			phase,
 			prNumber,
 			headSha,
 		});
 	}
-	return settled;
+	return settledAny;
 }
 
 /**
@@ -661,7 +685,7 @@ async function scheduleCheckRecheck(
 	details: Record<string, unknown>,
 	wait: RecheckWait,
 ): Promise<ReviewDisposition> {
-	const coalesceKey = `check-suite:${ctx.project.repo}:${prNumber}:${headSha}`;
+	const coalesceKey = checkRecheckCoalesceKey(ctx.project.repo, prNumber, headSha);
 	await scheduleReviewRecheck(ctx, budget, coalesceKey, prNumber, headSha, details, wait);
 	return { kind: 'none' };
 }
@@ -1306,7 +1330,12 @@ async function scheduleMergeabilityRecheck(
 	// A PR-updated event intentionally never dispatches Review; a completed
 	// checks event can. Keep their rechecks separate so a later PR-updated
 	// delivery cannot replace the follow-up Review's dispatch-capable recheck.
-	const coalesceKey = `review-mergeability:${ctx.project.repo}:${prNumber}:${headSha}:${ctx.event.kind}`;
+	const coalesceKey = mergeabilityRecheckCoalesceKey(
+		ctx.project.repo,
+		prNumber,
+		headSha,
+		ctx.event.kind,
+	);
 	const scheduled = await scheduleReviewRecheck(
 		ctx,
 		budget,
