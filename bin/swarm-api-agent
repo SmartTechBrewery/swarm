@@ -130,7 +130,8 @@ wait_healthy() {
 
 cmd_install() {
 	# The API serves *this* installation: it needs the npm script, and `dev:api`
-	# passes `--env-file=.env` unconditionally, so a missing .env is an immediate
+	# requires `.env` unconditionally (`--env-file=.env` on its helper steps,
+	# `bin/load-env.js` on the server), so a missing .env is an immediate
 	# crash-loop rather than a degraded start.
 	[ -f "$CHECKOUT/package.json" ] || die "not a SWARM installation checkout: $CHECKOUT"
 	grep -q '"dev:api"' "$CHECKOUT/package.json" || die "no dev:api script in $CHECKOUT/package.json -- is this the SWARM checkout?"
@@ -244,6 +245,12 @@ cmd_reload() {
 	# and the API was on the new build anyway. None of the steps this runs touches
 	# `./src`, so with the watch scoped there, aborting really does leave the old
 	# build serving. Widen that watch and this comment becomes a lie again.
+	#
+	# It became one once without anyone widening it: `node --env-file=.env` under
+	# `--watch` also watches `.env`, which on macOS means recursively watching the
+	# checkout root, so every write anywhere in the checkout still restarted the API
+	# (issue #1051). That is why the watched `node` in `dev:api` loads `.env` through
+	# `bin/load-env.js` and must not carry `--env-file` or `--env-file-if-exists`.
 	printf 'swarm-api-agent: npm run %s in %s\n' "$script" "$CHECKOUT"
 	(cd "$CHECKOUT" && npm run "$script") ||
 		die "npm run $script failed -- the API was left running on the old build"
