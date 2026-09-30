@@ -82,9 +82,15 @@ swarm-api-agent reload --all     # npm run reload:all, then restart, then wait f
 ## What the generated agent does, and why
 
 - **No secret is written into the plist.** `dev:api` reads `.env` from its working
-  directory (`node --env-file=.env`), so the agent only has to set
-  `WorkingDirectory` — a plist is world-readable and belongs nowhere near
-  `DATABASE_URL` or `CREDENTIAL_MASTER_KEY`.
+  directory, so the agent only has to set `WorkingDirectory` — a plist is
+  world-readable and belongs nowhere near `DATABASE_URL` or
+  `CREDENTIAL_MASTER_KEY`.
+- **Only `./src` restarts the server.** The watched `node` loads `.env` through the
+  `bin/load-env.js` preload rather than `--env-file=.env`, because under `--watch`
+  Node also watches the file `--env-file` names, which on macOS means recursively
+  watching the checkout root: `git status`, an editor save or `npm install` then
+  restarted the API and failed every dashboard request in flight (issue #1051). So
+  editing `.env` does not restart the server either; that is what `restart` is for.
 - **`PATH` is derived from the machine, not hard-coded.** launchd starts a job with
   a minimal `PATH` and reads none of the login shell's rc files, while the API
   spawns `npm` (the migrate step) and **`git`** — the worktree retention sweep runs
