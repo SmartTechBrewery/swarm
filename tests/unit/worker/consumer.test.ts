@@ -669,7 +669,14 @@ vi.mock('@/worker/run-cancellation.js', () => ({
 	// Real class so `handlePhaseFailure`'s `instanceof RunTerminatedError` guard is
 	// a valid constructor check — and so `processJob` can throw one itself for a run
 	// whose cancellation was already recorded at pickup (issue #912).
-	RunTerminatedError: class RunTerminatedError extends Error {},
+	// Mirrors the real constructor's `deliveryStarted` option (issue #1053).
+	RunTerminatedError: class RunTerminatedError extends Error {
+		readonly deliveryStarted: boolean;
+		constructor(message: string, options?: { deliveryStarted?: boolean }) {
+			super(message);
+			this.deliveryStarted = options?.deliveryStarted === true;
+		}
+	},
 }));
 
 // Terminated-run checkout settlement (issue #361): mocked at its boundary so the
@@ -712,6 +719,7 @@ import {
 	reportInterruptedJobToBoard,
 	runAssignedPhase,
 } from '@/worker/consumer.js';
+import { RunTerminatedError } from '@/worker/run-cancellation.js';
 
 type ProcessJobArgs = Parameters<typeof processJobWithDeps>;
 
@@ -5024,6 +5032,181 @@ describe('processJob', () => {
 		});
 	});
 
+	// Issue #1053: a cancelled Respond-to-CI kept the PR+SHA claim it had refreshed
+	// to cover its whole wall clock, so the operator's Reset or Retry now — which
+	// cancels the in-flight dispatch and enqueues a new one — was declined
+	// `dispatch-claim-held` by its own cancelled predecessor for ~35 minutes. Live on
+	// `rover#344`, unblocked only by a manual `DEL` of the key.
+	describe('a cancelled dispatch hands back its PR+SHA review slot (issue #1053)', () => {
+		const SLOT = `${PROJECT.repo}:17:deadbeef`;
+		const CANCELLED = 'Run cancelled after a cancellation request.';
+
+		afterEach(() => {
+			releaseReviewDispatch.mockImplementation(async () => {});
+		});
+
+		const failWith = (err: unknown) => {
+			phaseImpl = async () => {
+				throw err;
+			};
+		};
+
+		/** See the #166 cases: the pickup check misses the marker, every later read finds it. */
+		const cancelAfterStartCheck = () => {
+			isRunCancellationRequested.mockResolvedValueOnce(false).mockResolvedValue(true);
+		};
+
+		/**
+		 * A handler that mimics the `pr-review` claim over an in-memory slot: declines
+		 * `dispatch-claim-held` while the key is held, otherwise takes it.
+		 */
+		function registryClaimingSlot(held: Set<string>, result: TriggerResult) {
+			const registry = createTriggerRegistry();
+			registry.register({
+				name: 'test-trigger',
+				description: 'claims the PR+SHA review slot',
+				matches: () => true,
+				handle: async (ctx) => {
+					if (held.has(SLOT)) {
+						ctx.noteDecline?.({
+							kind: 'dispatch-claim-held',
+							reason: HELD_CLAIM_REASON,
+							retryAfterSec: 1980,
+						});
+						return null;
+					}
+					held.add(SLOT);
+					return result;
+				},
+			});
+			return registry;
+		}
+
+		it('lets the reset that follows a cancelled Respond-to-CI re-claim the slot', async () => {
+			const held = new Set<string>();
+			releaseReviewDispatch.mockImplementation(async (key: string) => {
+				held.delete(key);
+			});
+			const registry = registryClaimingSlot(held, RESPOND_TO_CI_TRIGGER);
+
+			// Dispatch 1: the worker reports the cancellation on its result frame.
+			failWith(new RunTerminatedError(CANCELLED));
+			const cancelled = await processJob(createMockScmWebhookJob(), registry);
+
+			expect(cancelled).toMatchObject({ status: 'phase-failed', cancelled: true });
+			expect(held.has(SLOT)).toBe(false);
+
+			// Dispatch 2: the Reset / Retry now continuation for the same run.
+			phaseImpl = async () => ({ agent: agentResult() });
+			const retried = await processJob(createMockScmWebhookJob({ runId: 'run-1' }), registry);
+
+			expect(retried.status).toBe('phase-succeeded');
+			expect(scheduleDispatchRetry).not.toHaveBeenCalledWith(
+				expect.anything(),
+				expect.objectContaining({ waitReason: 'recheck' }),
+			);
+		});
+
+		it('releases the slot of a Respond-to-CI cancelled mid-flight by the marker', async () => {
+			cancelAfterStartCheck();
+			failWith(
+				new AgentRunError('Respond-to-CI agent (claude) exited with code 143 (aborted)', {
+					kind: 'aborted',
+				}),
+			);
+
+			const outcome = await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome).toMatchObject({ status: 'phase-failed', cancelled: true });
+			expect(releaseReviewDispatch).toHaveBeenCalledWith(SLOT);
+		});
+
+		it('releases the slot of a Respond-to-CI cancelled before it started (issue #912)', async () => {
+			isRunCancellationRequested.mockResolvedValue(true);
+
+			const outcome = await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(phaseCalls).toEqual([]);
+			expect(outcome).toMatchObject({ status: 'phase-failed', cancelled: true });
+			expect(releaseReviewDispatch).toHaveBeenCalledWith(SLOT);
+		});
+
+		// The scope boundary: only a cancellation hands a fix's slot back.
+		it('keeps the slot of a Respond-to-CI that failed terminally without a cancel', async () => {
+			failWith(new Error('invalid hand-off'));
+
+			const outcome = await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome).toMatchObject({ status: 'phase-failed' });
+			expect(outcome).not.toHaveProperty('cancelled');
+			expect(releaseReviewDispatch).not.toHaveBeenCalled();
+		});
+
+		it('keeps the slot of a deferred Respond-to-CI', async () => {
+			failWith(new AgentRunError('rate limited', { kind: 'rate-limit' }));
+
+			const outcome = await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-deferred');
+			expect(releaseReviewDispatch).not.toHaveBeenCalled();
+		});
+
+		it('releases the slot of a cancelled Review whose ledger records no verdict', async () => {
+			failWith(new RunTerminatedError(CANCELLED));
+
+			const outcome = await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(outcome).toMatchObject({ status: 'phase-failed', cancelled: true });
+			expect(releaseReviewDispatch).toHaveBeenCalledWith(SLOT);
+		});
+
+		it('keeps the slot of a cancelled Review whose ledger records a submitted verdict', async () => {
+			getSubmittedReviewSlot.mockResolvedValueOnce({
+				ordinal: 1,
+				verdict: 'approve',
+				reviewId: 'review-1',
+			});
+			failWith(new RunTerminatedError(CANCELLED));
+
+			const outcome = await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(outcome).toMatchObject({ status: 'phase-failed', cancelled: true });
+			expect(releaseReviewDispatch).not.toHaveBeenCalled();
+		});
+
+		// The #1019 delivery signal, surviving the cancellation on the federated wire.
+		it('keeps the slot of a Review cancelled after it began delivering', async () => {
+			failWith(new RunTerminatedError(CANCELLED, { deliveryStarted: true }));
+
+			const outcome = await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(outcome).toMatchObject({ status: 'phase-failed', cancelled: true });
+			expect(getSubmittedReviewSlot).not.toHaveBeenCalled();
+			expect(releaseReviewDispatch).not.toHaveBeenCalled();
+		});
+	});
+
 	describe('automation-label gate (issue #131)', () => {
 		// A board-driven phase only starts for a work item a human opted in by
 		// labelling it. The gate sits at this single dispatch choke point, so it is
@@ -6214,6 +6397,57 @@ describe('processJob', () => {
 			expect(completeDispatch).not.toHaveBeenCalled();
 			expect(failDispatch).not.toHaveBeenCalled();
 			expect(cancelClaimedDispatch).not.toHaveBeenCalled();
+		});
+
+		// Issue #1053: the handler already took (or reused) the PR+SHA slot for this
+		// dispatch, and the usual cause of a refusal is a Reset cancelling it — so the
+		// slot goes back, or the replacement collides with the claim it left behind.
+		describe('hands back the PR+SHA review slot it will never use (issue #1053)', () => {
+			const SLOT = `${PROJECT.repo}:17:deadbeef`;
+
+			it('releases a refused Respond-to-CI dispatch’s slot', async () => {
+				markDispatchRunning.mockResolvedValueOnce(false);
+
+				const outcome = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning(RESPOND_TO_CI_TRIGGER),
+				);
+
+				expect(outcome).toMatchObject({ status: 'dispatch-refused' });
+				expect(releaseReviewDispatch).toHaveBeenCalledWith(SLOT);
+				expect(completeDispatch).not.toHaveBeenCalled();
+				expect(failDispatch).not.toHaveBeenCalled();
+				expect(cancelClaimedDispatch).not.toHaveBeenCalled();
+			});
+
+			it('releases a refused Review dispatch’s slot when the ledger is empty', async () => {
+				markDispatchRunning.mockResolvedValueOnce(false);
+
+				await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
+
+				expect(releaseReviewDispatch).toHaveBeenCalledWith(SLOT);
+			});
+
+			it('keeps a refused Review dispatch’s slot when the ledger records a verdict', async () => {
+				markDispatchRunning.mockResolvedValueOnce(false);
+				getSubmittedReviewSlot.mockResolvedValueOnce({
+					ordinal: 1,
+					verdict: 'approve',
+					reviewId: 'review-1',
+				});
+
+				await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
+
+				expect(releaseReviewDispatch).not.toHaveBeenCalled();
+			});
+
+			it('releases nothing for a phase that does not hold the slot', async () => {
+				markDispatchRunning.mockResolvedValueOnce(false);
+
+				await processJob(createMockScmWebhookJob(), registryReturning(RESPOND_TO_REVIEW_TRIGGER));
+
+				expect(releaseReviewDispatch).not.toHaveBeenCalled();
+			});
 		});
 
 		it('still runs the phase on the ordinary path, where the claim is still ours', async () => {

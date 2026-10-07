@@ -461,9 +461,14 @@ export function handleTaskCancel(
  * wording this used to send, and sourcing the constant here would put
  * `../queue/cancellation.ts` — a Redis module — back on a DB-free worker's import
  * path for a string the control plane already owns.
+ *
+ * A cancellation that stopped the phase mid-delivery (a {@link DeliveryDeferredError})
+ * also reports `failureKind: 'delivery'`, so the control plane keeps a Review's
+ * review-dispatch claim when a verdict may already be out there (issue #1053).
  */
 function cancelledResult(
 	dispatch: Pick<TaskAssignment, 'dispatchId' | 'runId' | 'phase' | 'taskId'>,
+	err?: unknown,
 ): TaskExecutionResult {
 	return {
 		type: 'task-execution-result',
@@ -473,6 +478,7 @@ function cancelledResult(
 		taskId: dispatch.taskId,
 		status: 'failed',
 		cancelled: true,
+		...(err instanceof DeliveryDeferredError ? { failureKind: 'delivery' } : {}),
 	};
 }
 
@@ -502,7 +508,7 @@ export function settleAssignmentFailure(
 	assignment: TaskAssignment,
 	worktreePath?: string,
 ): TaskExecutionResult {
-	if (isAssignmentCancelled(assignment.dispatchId)) return cancelledResult(assignment);
+	if (isAssignmentCancelled(assignment.dispatchId)) return cancelledResult(assignment, err);
 	return deferrableOrFailedResult(err, assignment, worktreePath);
 }
 

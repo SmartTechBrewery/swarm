@@ -739,7 +739,10 @@ export const TaskExecutionResultSchema = z.object({
 	// deferrals behave exactly as before.
 	checkpoint: CheckpointSchema.optional(),
 	// One of the `AgentFailureKind`s, `delivery`, or `dependency` — the last being a
-	// wait on an external condition rather than a failure of the run itself.
+	// wait on an external condition rather than a failure of the run itself. A
+	// `failed` + `cancelled` frame may carry `delivery` when the stopped phase had
+	// already begun delivering (issue #1053); the control plane reads it only to keep
+	// a Review's review-dispatch claim — it is still a cancellation, never a deferral.
 	failureKind: z.string().optional(),
 	// `failed` — why the recovery gate refused to adopt this run's preserved checkout
 	// (a `BlockedRecoveryReason`, `../worktree/reclaim.ts`). The worker is the only side

@@ -169,6 +169,34 @@ describe('adaptResultToPhaseRun', () => {
 		).toThrow(RunTerminatedError);
 	});
 
+	// Issue #1053: a worker that stopped the phase mid-delivery says so on the
+	// cancelled frame, so a cancelled Review keeps its review-dispatch claim. Still a
+	// cancellation — never the `delivery` deferral that would re-run the killed phase.
+	it('carries a mid-delivery cancellation as deliveryStarted, never a deferral', () => {
+		let thrown: unknown;
+		try {
+			adaptResultToPhaseRun(
+				base({ status: 'failed', cancelled: true, failureKind: 'delivery' }),
+				SELECTION,
+			);
+		} catch (err) {
+			thrown = err;
+		}
+		expect(thrown).toBeInstanceOf(RunTerminatedError);
+		expect(thrown).not.toBeInstanceOf(DeliveryDeferredError);
+		expect((thrown as RunTerminatedError).deliveryStarted).toBe(true);
+	});
+
+	it('reports deliveryStarted false for a bare cancelled frame', () => {
+		let thrown: unknown;
+		try {
+			adaptResultToPhaseRun(base({ status: 'failed', cancelled: true }), SELECTION);
+		} catch (err) {
+			thrown = err;
+		}
+		expect((thrown as RunTerminatedError).deliveryStarted).toBe(false);
+	});
+
 	it('throws a terminal error for a non-cancelled failure', () => {
 		expect(() =>
 			adaptResultToPhaseRun(base({ status: 'failed', error: 'agent exited 1' }), SELECTION),
