@@ -439,7 +439,15 @@ export function adaptResultToPhaseRun(
 		};
 	}
 	if (result.status === 'failed') {
-		if (result.cancelled) throw new RunTerminatedError(result.error || RUN_CANCELLED_MESSAGE);
+		// A cancelled frame may carry `failureKind: 'delivery'` when the stopped phase
+		// had already begun delivering (issue #1053); it rides on the cancellation so a
+		// cancelled Review keeps its review-dispatch claim. Checked before the
+		// `delivery` deferral below, so a cancelled run is never re-deferred.
+		if (result.cancelled) {
+			throw new RunTerminatedError(result.error || RUN_CANCELLED_MESSAGE, {
+				deliveryStarted: result.failureKind === 'delivery',
+			});
+		}
 		// The recovery gate on the worker refused to adopt this run's preserved checkout
 		// (issue #952). Raised as the error the settle path already knows, so
 		// `finalizeFailedRun` (`../worker/consumer.ts`) writes the same

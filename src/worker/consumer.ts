@@ -1474,7 +1474,9 @@ async function abandonReviewReservation(
  *   (`src/router/dispatcher.ts` rethrows it from a `delivery` frame). It reaches
  *   a terminal settle only once the retry budget behind it is spent, which is
  *   exactly the case the ledger read alone could misjudge: a review delivered to
- *   the provider whose ledger write never landed.
+ *   the provider whose ledger write never landed. A *cancelled* run carries the
+ *   same signal as {@link RunTerminatedError.deliveryStarted}, rebuilt from the
+ *   federated worker's `failureKind: 'delivery'` cancelled frame (issue #1053).
  *
  * Fails **closed**, like the claim itself: an unreadable ledger keeps the claim
  * and lets the TTL reap it, rather than risking the duplicate review this whole
@@ -1488,6 +1490,21 @@ async function releaseFailedReviewClaim(
 ): Promise<void> {
 	if (outcome.status !== 'phase-failed' || trigger.phase !== 'review') return;
 	if (err instanceof DeliveryDeferredError) return;
+	// The same signal, reported through a cancellation (issue #1053).
+	if (err instanceof RunTerminatedError && err.deliveryStarted) return;
+	await releaseUndeliveredReviewClaim(trigger, project);
+}
+
+/**
+ * The ledger-gated half of {@link releaseFailedReviewClaim}: release the Review's
+ * PR+SHA slot unless the ledger records a `submitted` verdict for this exact head,
+ * failing closed when the ledger cannot be read.
+ */
+async function releaseUndeliveredReviewClaim(
+	trigger: TriggerResult,
+	project: ProjectConfig,
+): Promise<void> {
+	if (trigger.phase !== 'review') return;
 	try {
 		const slot = await getSubmittedReviewSlot({
 			projectId: project.id,
@@ -1514,6 +1531,55 @@ async function releaseFailedReviewClaim(
 				error: describeError(readErr),
 			},
 		);
+	}
+}
+
+/**
+ * Hand the PR+SHA review-dispatch slot back after a Respond-to-CI run was
+ * cancelled (issue #1053). Respond-to-CI shares the slot with Review but never
+ * submits a review verdict, so the #815 "never after a verdict" rule cannot apply
+ * to it. It refreshed the claim to cover its whole wall clock, so without this an
+ * operator's Reset or Retry now was declined `dispatch-claim-held` by its own
+ * cancelled predecessor for ~35 minutes (live on `rover#344`). The per-PR
+ * fix-attempt cap still bounds repeated fixes.
+ */
+async function releaseCancelledCiFixClaim(
+	outcome: JobOutcome,
+	trigger: TriggerResult,
+	project: ProjectConfig,
+): Promise<void> {
+	if (outcome.status !== 'phase-failed' || !outcome.cancelled) return;
+	if (trigger.phase !== 'respond-to-ci') return;
+	logger.info('Cancelled Respond-to-CI — releasing its review-dispatch claim', {
+		projectId: project.id,
+		prNumber: trigger.prNumber,
+		headSha: trigger.headSha,
+	});
+	await releaseReviewDispatch(
+		buildReviewDispatchKey(project.repo, trigger.prNumber, trigger.headSha),
+	);
+}
+
+/**
+ * Hand back the PR+SHA review-dispatch slot a dispatch's handler took (or reused)
+ * when the dispatch is refused before its phase started (issue #1053). The usual
+ * cause is a Reset or Terminate cancelling a claimed dispatch
+ * (`cancelClaimedDispatch`); the dispatch will never run, and without this its
+ * replacement collides with the claim it left behind. The dispatch row is already
+ * terminal or gone, so the "terminal first" ordering of the other hand-backs holds.
+ * No agent ran, but a Review still goes through the ledger read so the rule stays
+ * uniform and fails closed.
+ */
+async function handBackRefusedDispatchClaim(
+	trigger: TriggerResult,
+	project: ProjectConfig,
+): Promise<void> {
+	if (trigger.phase === 'respond-to-ci') {
+		await releaseReviewDispatch(
+			buildReviewDispatchKey(project.repo, trigger.prNumber, trigger.headSha),
+		);
+	} else if (trigger.phase === 'review') {
+		await releaseUndeliveredReviewClaim(trigger, project);
 	}
 }
 
@@ -4071,7 +4137,9 @@ async function handlePhaseFailure(
 	// function, which sees only why the run stopped, cannot tell a phase that
 	// delivered from one that never got there. That judgement needs the ledger and
 	// the phase's own delivery signal, and a wrong answer lets a sibling event for
-	// the same PR+SHA post a duplicate review. See review-dispatch-dedup.ts.
+	// the same PR+SHA post a duplicate review. See review-dispatch-dedup.ts. A
+	// cancelled Respond-to-CI hands its claim back in the caller too
+	// ({@link releaseCancelledCiFixClaim}, issue #1053).
 	return {
 		status: 'phase-failed',
 		phase: trigger.phase,
@@ -5091,6 +5159,7 @@ export async function processJob(
 				phase: trigger.phase,
 				taskId: trigger.taskId,
 			});
+			await handBackRefusedDispatchClaim(trigger, project);
 			return { status: 'dispatch-refused', reason };
 		}
 
@@ -5253,6 +5322,9 @@ export async function processJob(
 		// hand-backs are placed where they are: this dispatch is terminal first, so a
 		// sibling event taking the freed slot cannot collide with it.
 		await releaseFailedReviewClaim(outcome, err, trigger, project);
+		// A cancelled Respond-to-CI hands the slot back too — it never posts a verdict
+		// (issue #1053).
+		await releaseCancelledCiFixClaim(outcome, trigger, project);
 		return outcome;
 	} finally {
 		// Detach the shutdown listener and drop this run from the cancellation

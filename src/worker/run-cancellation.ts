@@ -31,9 +31,18 @@ import { isRunCancellationRequested } from '../queue/cancellation.js';
  * on the settling side would find.
  */
 export class RunTerminatedError extends Error {
-	constructor(message: string) {
+	/**
+	 * True when the worker reported that the stopped phase had already begun
+	 * delivering (`failureKind: 'delivery'` on the cancelled frame) — issue #1019's
+	 * "a review may be out there" signal surviving a cancellation (issue #1053), so a
+	 * cancelled Review keeps its PR+SHA review-dispatch claim.
+	 */
+	readonly deliveryStarted: boolean;
+
+	constructor(message: string, options?: { deliveryStarted?: boolean }) {
 		super(message);
 		this.name = 'RunTerminatedError';
+		this.deliveryStarted = options?.deliveryStarted === true;
 	}
 }
 

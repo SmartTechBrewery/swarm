@@ -1657,6 +1657,45 @@ describe('cancelling an in-flight assignment', () => {
 		// frame deliberately carries no `error` of its own.
 		expect(result.error).toBeUndefined();
 		expect(result.retryDelayMs).toBeUndefined();
+		// An ordinary abort began no delivery (issue #1053).
+		expect(result.failureKind).toBeUndefined();
+	});
+
+	// Issue #1053: a phase stopped mid-delivery reports that on the cancelled frame, so
+	// the control plane keeps a Review's review-dispatch claim when a verdict may
+	// already be out there — still a cancellation, never a deferral.
+	it('reports a cancellation that stopped the phase mid-delivery', async () => {
+		const sink = recordingSink();
+		let started: (signal: AbortSignal) => void = () => {};
+		const signalSeen = new Promise<AbortSignal>((resolve) => {
+			started = resolve;
+		});
+		const frame = ciAssignment();
+		const run = runAssignmentDbFree(frame, sink, {
+			...RUN_OPTIONS,
+			deps: depsWith(
+				(inputs: AssignedPhaseInputs) =>
+					new Promise<PhaseRunResult>((_resolve, reject) => {
+						const signal = inputs.signal as AbortSignal;
+						signal.addEventListener('abort', () =>
+							reject(new DeliveryDeferredError('Review delivery deferred for retry')),
+						);
+						started(signal);
+					}),
+			),
+		});
+
+		await signalSeen;
+		expect(cancelAssignment(frame.dispatchId)).toBe(true);
+		await run;
+
+		expect(sink.sent.at(-1)).toMatchObject({
+			type: 'task-execution-result',
+			status: 'failed',
+			cancelled: true,
+			failureKind: 'delivery',
+			dispatchId: frame.dispatchId,
+		});
 	});
 
 	it('never runs the phase for an assignment cancelled before it started (issue #912)', async () => {

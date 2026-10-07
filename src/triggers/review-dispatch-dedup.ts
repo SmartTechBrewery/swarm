@@ -171,7 +171,8 @@ export async function reviewDispatchClaimTtlSec(key: string): Promise<number | u
  *  - a dispatched Respond-to-CI (`handlers/review.ts`), which extends the slot
  *    to cover its own agent wall clock: the default five minutes is shorter than
  *    a fix run, and a lapsed lease lets a delayed sibling completed-check event
- *    start a second fix on the red already being fixed.
+ *    start a second fix on the red already being fixed. The extended lease is
+ *    handed back if the fix is cancelled (issue #1053).
  *  - a `no-fix` hand-over (`src/dispatch/ci-no-fix-recovery.ts`), which passes
  *    that still-held lease from the finished fix to the recovery it enqueues.
  *
@@ -203,7 +204,9 @@ export async function refreshReviewDispatchClaim(key: string, ttlSec: number): P
  * provably delivered no review: one the automation-label gate skipped, one a
  * writing phase's hold dropped, one that re-evaluated to `no-trigger` *without*
  * an already-submitted verdict behind it — and, since issue #1019, a Review run
- * that settled terminally `failed` having delivered nothing.
+ * that settled terminally `failed` having delivered nothing. Since issue #1053
+ * also a Respond-to-CI run that was cancelled (it never posts a verdict), and a
+ * Review or Respond-to-CI dispatch cancelled before its phase started.
  *
  * The rule all of them share is the only one that matters: **it must NOT be
  * called once a verdict may have been posted.** The agent submits the formal
@@ -214,7 +217,9 @@ export async function refreshReviewDispatchClaim(key: string, ttlSec: number): P
  * release is conditioned on that same ledger read *plus* the phase's own
  * delivery signal: a Review that got as far as delivery raises a
  * `DeliveryDeferredError` rather than an ordinary failure, so a terminal failure
- * carrying one keeps its claim too.
+ * carrying one keeps its claim too. A *cancelled* Review is held to the same two
+ * reads, with the delivery signal carried through the cancellation
+ * (`RunTerminatedError.deliveryStarted`, issue #1053).
  *
  * Before #1019 a failed run kept its claim unconditionally, and the TTL was the
  * only thing that freed it — which left the operator's retry of a review that
