@@ -533,6 +533,13 @@
       "when": 1791461251237,
       "tag": "0075_worker_repositories",
       "breakpoints": true
+    },
+    {
+      "idx": 76,
+      "version": "7",
+      "when": 1791470187041,
+      "tag": "0076_repository_auto_merge",
+      "breakpoints": true
     }
   ]
 }

@@ -47,6 +47,7 @@
 import { z } from 'zod';
 import type { ActiveDispatchTaskRef } from '../db/repositories/dispatchesRepository.js';
 import type { TaskActivityRow } from '../db/repositories/runsRepository.js';
+import { repoSlugsMatch } from '../scm/repo-slug.js';
 
 /**
  * How long a unit may be silent before its silence counts as a stall. The one
@@ -120,15 +121,18 @@ export interface ItemLivenessDismissal {
 /**
  * The two project policies the classification consults. Both mirror the
  * *effective* defaults the pipeline itself applies — `planning.autoAdvance`
- * defaults to `false` (`DEFAULT_AUTO_ADVANCE`, `src/pipeline/planning.ts`) and
- * `respondToReview.autoMerge` is opt-in (`!== true` skips it,
+ * defaults to `false` (`DEFAULT_AUTO_ADVANCE`, `src/pipeline/planning.ts`) and a
+ * repository's `autoMerge` is opt-in (`!== true` skips it,
  * `src/worker/consumer.ts`) — so "unset" reads here exactly as the phase reads it.
  */
 export interface ItemLivenessPolicy {
 	/** `project.pipeline.planning.autoAdvance === true`. */
 	planningAutoAdvance: boolean;
-	/** `project.pipeline.respondToReview.autoMerge === true`. */
-	autoMerge: boolean;
+	/**
+	 * The project's repositories with `autoMerge === true` — per repository since
+	 * issue #1066, so an approved PR is judged by its own repository's setting.
+	 */
+	autoMergeRepositories: readonly string[];
 }
 
 /** The `runs.stalled` API/UI contract — Zod is the source of truth for this shape. */
@@ -359,7 +363,8 @@ export function classifyItemLiveness(
 		completed &&
 		latest.phase === 'review' &&
 		latest.reviewVerdict === 'approve' &&
-		(latest.reviewMergeOutcome !== null || !policy.autoMerge)
+		(latest.reviewMergeOutcome !== null ||
+			!policy.autoMergeRepositories.some((repo) => repoSlugsMatch(repo, unit.repository)))
 	) {
 		return 'awaiting-human';
 	}
@@ -479,7 +484,7 @@ export function toStalledItems(
 	for (const unit of foldLivenessUnits(activity, activeDispatches, dismissals)) {
 		const policy = policies[unit.projectId] ?? {
 			planningAutoAdvance: false,
-			autoMerge: false,
+			autoMergeRepositories: [],
 		};
 		if (classifyItemLiveness(unit, policy, now) !== 'stalled') continue;
 		stalled.push(toStalledItem(unit, now));

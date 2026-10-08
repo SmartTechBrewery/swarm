@@ -5,8 +5,8 @@
  * shared across its repositories stated once, plus a `repositories` list carrying
  * what is genuinely per-repository. `ProjectConfig` is that record **scoped to one
  * entry** — the shape every runtime call site already takes, with `repo`,
- * `baseBranch` and `branchPrefix` flattened back to the top level beside the
- * project's own `scm`.
+ * `baseBranch`, `branchPrefix` and `autoMerge` flattened back to the top level beside
+ * the project's own `scm`.
  *
  * Keeping the scoped shape identical to the pre-#684 project config is what makes
  * this a modelling change rather than a rewrite: no pipeline phase, trigger, SCM
@@ -79,7 +79,8 @@ export function requireProjectRepository(record: ProjectRecord, repo: string): P
  * reads. When the project states none it stays **absent** rather than becoming an
  * explicit `undefined` — the same care `rowToProjectConfig` takes for a `NULL`
  * `scm_type` (`src/db/repositories/projectsRepository.ts`), since "states no provider"
- * is a distinct case the registry lookup reports on.
+ * is a distinct case the registry lookup reports on. The entry's `autoMerge` (issue
+ * #1066) is kept absent the same way when the entry states none.
  */
 export function scopeProjectToRepository(record: ProjectRecord, repo?: string): ProjectConfig {
 	const { repositories: _repositories, scm, ...shared } = record;
@@ -90,6 +91,7 @@ export function scopeProjectToRepository(record: ProjectRecord, repo?: string): 
 		repo: entry.repo,
 		baseBranch: entry.baseBranch,
 		branchPrefix: entry.branchPrefix,
+		...(entry.autoMerge !== undefined ? { autoMerge: entry.autoMerge } : {}),
 		...(scm ? { scm } : {}),
 	};
 }

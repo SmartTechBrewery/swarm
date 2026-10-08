@@ -41,13 +41,16 @@ export const CONFIG_TEMPLATE = {
 			id: 'my-project',
 			name: 'My Project',
 			// One entry per repository the project owns, each with its own base branch
-			// and task-branch prefix (issue #684). An entry states no SCM provider: the
-			// project's own `scm` below is the one every repository lives on (issue #727).
+			// and task-branch prefix (issue #684), and its own merge automation (issue
+			// #1066: merge an approved SWARM PR directly; opt-in). An entry states no SCM
+			// provider: the project's own `scm` below is the one every repository lives on
+			// (issue #727).
 			repositories: [
 				{
 					repo: 'owner/repo',
 					baseBranch: PROJECT_DEFAULTS.baseBranch,
 					branchPrefix: PROJECT_DEFAULTS.branchPrefix,
+					autoMerge: false,
 				},
 			],
 			// Required in practice since issue #618 (`github` / `bitbucket` / `gitlab`),

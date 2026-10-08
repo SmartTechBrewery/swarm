@@ -16,7 +16,9 @@ vi.mock('@/db/repositories/runsRepository.js', async (importOriginal) => ({
 }));
 
 vi.mock('@/db/repositories/projectsRepository.js', () => ({
+	findProjectRecordByIdFromDb: vi.fn(),
 	getProjectByIdFromDb: vi.fn(),
+	listAllProjectRecordsFromDb: vi.fn(),
 	listAllProjectsFromDb: vi.fn(),
 }));
 
@@ -184,7 +186,9 @@ import {
 	takeOverStaleDispatchForManualRetry,
 } from '@/db/repositories/dispatchesRepository.js';
 import {
+	findProjectRecordByIdFromDb,
 	getProjectByIdFromDb,
+	listAllProjectRecordsFromDb,
 	listAllProjectsFromDb,
 } from '@/db/repositories/projectsRepository.js';
 import {
@@ -241,6 +245,7 @@ import {
 	createMockPmEvent,
 	createMockPmWebhookJob,
 	createMockProjectConfig,
+	createMockProjectRecord,
 	createMockWorkItem,
 } from '../../../helpers/factories.js';
 
@@ -413,6 +418,9 @@ describe('runsRouter', () => {
 		vi.mocked(getProjectByIdFromDb).mockReset();
 		vi.mocked(listAllProjectsFromDb).mockReset();
 		vi.mocked(listAllProjectsFromDb).mockResolvedValue([]);
+		vi.mocked(findProjectRecordByIdFromDb).mockReset();
+		vi.mocked(listAllProjectRecordsFromDb).mockReset();
+		vi.mocked(listAllProjectRecordsFromDb).mockResolvedValue([]);
 		vi.mocked(getPMProvider).mockReset();
 		vi.mocked(getActiveDispatchByRunId).mockReset();
 		vi.mocked(hasActiveDispatchForCoalesceKeys).mockReset();
@@ -710,13 +718,14 @@ describe('runsRouter', () => {
 			],
 		])('resolves a stalled pull request’s URL through the %s provider', async (_id, spelling, expected) => {
 			vi.mocked(listTaskActivitySince).mockResolvedValue([activityRow()]);
-			const project = createMockProjectConfig({ id: 'p1' });
-			vi.mocked(listAllProjectsFromDb).mockResolvedValue([project]);
+			vi.mocked(listAllProjectRecordsFromDb).mockResolvedValue([
+				createMockProjectRecord({ id: 'p1' }),
+			]);
 			vi.mocked(requireProjectSCMProvider).mockReturnValue(scmProviderSpelling(spelling));
 
 			const [item] = await caller.stalled({});
 
-			expect(requireProjectSCMProvider).toHaveBeenCalledWith(project);
+			expect(requireProjectSCMProvider).toHaveBeenCalledWith(expect.objectContaining({ id: 'p1' }));
 			expect(item.prUrl).toBe(expected);
 		});
 
@@ -733,7 +742,9 @@ describe('runsRouter', () => {
 					workItemId: 'PVTI_abc',
 				}),
 			]);
-			vi.mocked(listAllProjectsFromDb).mockResolvedValue([createMockProjectConfig({ id: 'p1' })]);
+			vi.mocked(listAllProjectRecordsFromDb).mockResolvedValue([
+				createMockProjectRecord({ id: 'p1' }),
+			]);
 			vi.mocked(requireProjectSCMProvider).mockReturnValue(
 				scmProviderSpelling((repo, pr) => `https://example.test/${repo}/${pr}`),
 			);
@@ -750,7 +761,9 @@ describe('runsRouter', () => {
 		// never the report.
 		it('still reports a row whose project resolves no provider', async () => {
 			vi.mocked(listTaskActivitySince).mockResolvedValue([activityRow()]);
-			vi.mocked(listAllProjectsFromDb).mockResolvedValue([createMockProjectConfig({ id: 'p1' })]);
+			vi.mocked(listAllProjectRecordsFromDb).mockResolvedValue([
+				createMockProjectRecord({ id: 'p1' }),
+			]);
 
 			const [item] = await caller.stalled({});
 
@@ -770,8 +783,31 @@ describe('runsRouter', () => {
 			});
 		});
 
+		// Issue #1066: merge automation is per repository, so two repositories of one
+		// project are judged by their own setting — an approval with no merge outcome is
+		// stalled only where merge automation was on.
+		it('classifies each repository’s approval by that repository’s own merge automation', async () => {
+			const approved = { reviewVerdict: 'approve' } as const;
+			vi.mocked(listTaskActivitySince).mockResolvedValue([
+				activityRow({ ...approved, repository: 'acme/widgets' }),
+				activityRow({ ...approved, repository: 'acme/gadgets', runId: 'run-gadgets' }),
+			]);
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(
+				createMockProjectRecord({
+					id: 'p1',
+					repositories: [{ repo: 'acme/widgets', autoMerge: true }, { repo: 'acme/gadgets' }],
+				}),
+			);
+
+			const items = await caller.stalled({ projectId: 'p1' });
+
+			expect(items.map((item) => item.repository)).toEqual(['acme/widgets']);
+		});
+
 		it('scopes all three reads to the requested project', async () => {
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(
+				createMockProjectRecord({ id: 'p1' }),
+			);
 
 			await caller.stalled({ projectId: 'p1' });
 
@@ -842,9 +878,9 @@ describe('runsRouter', () => {
 				activityRow({ projectId: 'p1', taskId: '103', phase: 'planning', prNumber: null }),
 				activityRow({ projectId: 'p2', taskId: '104', phase: 'planning', prNumber: null }),
 			]);
-			vi.mocked(listAllProjectsFromDb).mockResolvedValue([
-				createMockProjectConfig({ id: 'p1' }),
-				createMockProjectConfig({
+			vi.mocked(listAllProjectRecordsFromDb).mockResolvedValue([
+				createMockProjectRecord({ id: 'p1' }),
+				createMockProjectRecord({
 					id: 'p2',
 					pipeline: { planning: { autoAdvance: true } },
 				}),

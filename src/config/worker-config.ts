@@ -53,13 +53,16 @@ export const WORKER_SAFE_KEYS = [
  * need. `pmRoutingToken` (issue #686) belongs with `pm` for the same reason twice
  * over: it is a board-side id, and which repository a card claims is a
  * control-plane decision keyed on the whole repository list — which a worker,
- * holding one scoped config, does not have.
+ * holding one scoped config, does not have. `autoMerge` (issue #1066) is merge policy
+ * like `pipeline`: the merge decision is made by the control plane's consumer, never
+ * on a worker.
  */
 export const SERVER_ONLY_KEYS = [
 	'credentials',
 	'repoRoot',
 	'pm',
 	'pmRoutingToken',
+	'autoMerge',
 	'pipeline',
 	'visibility',
 	'maxConcurrentJobs',

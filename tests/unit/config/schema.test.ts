@@ -217,6 +217,67 @@ describe('ProjectRecordSchema', () => {
 		).toThrow();
 	});
 
+	// Issue #1066: merge automation is per repository. The pre-#1066 project-wide key is
+	// adopted onto every entry stating none, never silently stripped.
+	describe('merge automation (issue #1066)', () => {
+		it('accepts a per-repository autoMerge, independently per entry', () => {
+			const record = ProjectRecordSchema.parse({
+				...shared,
+				repositories: [{ repo: 'acme/one', autoMerge: true }, { repo: 'acme/two' }],
+			});
+			expect(record.repositories.map((entry) => entry.autoMerge)).toEqual([true, undefined]);
+		});
+
+		it('adopts a legacy project-wide true onto every entry and drops the old key', () => {
+			const record = ProjectRecordSchema.parse({
+				...shared,
+				pipeline: { respondToReview: { autoMerge: true, skipOnMinors: false } },
+				repositories: [{ repo: 'acme/one' }, { repo: 'acme/two' }],
+			});
+			expect(record.repositories.map((entry) => entry.autoMerge)).toEqual([true, true]);
+			expect(record.pipeline?.respondToReview).toEqual({ skipOnMinors: false });
+		});
+
+		it('adopts a legacy project-wide false onto every entry', () => {
+			const record = ProjectRecordSchema.parse({
+				...shared,
+				pipeline: { respondToReview: { autoMerge: false } },
+				repositories: [{ repo: 'acme/one' }, { repo: 'acme/two' }],
+			});
+			expect(record.repositories.map((entry) => entry.autoMerge)).toEqual([false, false]);
+		});
+
+		it("keeps an entry's own value over the legacy one", () => {
+			const record = ProjectRecordSchema.parse({
+				...shared,
+				pipeline: { respondToReview: { autoMerge: true } },
+				repositories: [{ repo: 'acme/one', autoMerge: false }, { repo: 'acme/two' }],
+			});
+			expect(record.repositories.map((entry) => entry.autoMerge)).toEqual([false, true]);
+		});
+
+		it('leaves the entries untouched without a legacy key', () => {
+			const record = ProjectRecordSchema.parse({
+				...shared,
+				pipeline: { respondToReview: { skipOnMinors: true } },
+				repositories: [{ repo: 'acme/one' }],
+			});
+			expect(record.repositories[0]).not.toHaveProperty('autoMerge');
+		});
+
+		it('reports a non-boolean legacy value on the entry rather than dropping it', () => {
+			const result = ProjectRecordSchema.safeParse({
+				...shared,
+				pipeline: { respondToReview: { autoMerge: 'yes' } },
+				repositories: [{ repo: 'acme/one' }],
+			});
+			expect(result.success).toBe(false);
+			expect(result.error?.issues.map((issue) => issue.path)).toEqual([
+				['repositories', 0, 'autoMerge'],
+			]);
+		});
+	});
+
 	// The record carries the same cross-field credential checks the scoped config does —
 	// neither reads a repository, so both refine through the same two functions.
 	it('applies the same credential cross-field checks the scoped config does', () => {
@@ -819,9 +880,11 @@ describe('ProjectRecordSchema', () => {
 		});
 	});
 
-	it('accepts an optional respond-to-review autoMerge override', () => {
-		expect(PipelineConfigSchema.parse({ respondToReview: { autoMerge: true } })).toMatchObject({
-			respondToReview: { autoMerge: true },
+	// Issue #1066 moved merge automation onto each repository entry; the pipeline block
+	// no longer carries it (`ProjectRecordSchema` adopts a legacy one before this runs).
+	it('no longer carries a project-wide respond-to-review autoMerge', () => {
+		expect(PipelineConfigSchema.parse({ respondToReview: { autoMerge: true } })).toEqual({
+			respondToReview: {},
 		});
 	});
 

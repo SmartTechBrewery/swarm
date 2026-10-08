@@ -863,11 +863,29 @@ describe('PhaseSettingsDetail — model targets', () => {
 describe('PipelineSettingsForm — Review check policy', () => {
 	const noop = () => {};
 
+	// Issue #1066 moved merge automation to each repository under Source Control.
+	it('no longer offers a project-wide merge automation toggle', () => {
+		render(
+			<PipelineSettingsForm
+				skipRespondToReviewOnMinors={true}
+				setSkipRespondToReviewOnMinors={noop}
+				reviewChecksPolicy="required"
+				setReviewChecksPolicy={noop}
+				handleSubmit={(e) => e.preventDefault()}
+				handleReset={noop}
+				isDirty={false}
+				isPending={false}
+				isSuccess={false}
+				isError={false}
+			/>,
+		);
+
+		expect(screen.queryByText('Merge automation')).toBeNull();
+	});
+
 	it('defaults to Require CI checks selected', () => {
 		render(
 			<PipelineSettingsForm
-				autoMerge={false}
-				setAutoMerge={noop}
 				skipRespondToReviewOnMinors={true}
 				setSkipRespondToReviewOnMinors={noop}
 				reviewChecksPolicy="required"
@@ -894,8 +912,6 @@ describe('PipelineSettingsForm — Review check policy', () => {
 	it('reflects a stored if-present selection', () => {
 		render(
 			<PipelineSettingsForm
-				autoMerge={false}
-				setAutoMerge={noop}
 				skipRespondToReviewOnMinors={true}
 				setSkipRespondToReviewOnMinors={noop}
 				reviewChecksPolicy="if-present"
@@ -923,8 +939,6 @@ describe('PipelineSettingsForm — Review check policy', () => {
 		const setReviewChecksPolicy = vi.fn();
 		render(
 			<PipelineSettingsForm
-				autoMerge={false}
-				setAutoMerge={noop}
 				skipRespondToReviewOnMinors={true}
 				setSkipRespondToReviewOnMinors={noop}
 				reviewChecksPolicy="required"
@@ -945,8 +959,6 @@ describe('PipelineSettingsForm — Review check policy', () => {
 	it('includes explanatory copy limiting the no-CI option to repositories without CI', () => {
 		render(
 			<PipelineSettingsForm
-				autoMerge={false}
-				setAutoMerge={noop}
 				skipRespondToReviewOnMinors={true}
 				setSkipRespondToReviewOnMinors={noop}
 				reviewChecksPolicy="required"
@@ -1410,7 +1422,7 @@ describe('toGeneralSettingsUpdate', () => {
 
 describe('toRepositoriesUpdate', () => {
 	const rows: RepositoryForm[] = [
-		{ id: '1', repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-' },
+		{ id: '1', repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-', autoMerge: true },
 	];
 
 	it('sends only id and repositories — never the Settings fields', () => {
@@ -1419,7 +1431,10 @@ describe('toRepositoriesUpdate', () => {
 		expect(update && Object.keys(update).sort()).toEqual(['id', 'repositories']);
 		expect(update).toEqual({
 			id: 'p1',
-			repositories: [{ repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-' }],
+			// Merge automation rides on the repository list it lives on (issue #1066).
+			repositories: [
+				{ repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-', autoMerge: true },
+			],
 		});
 	});
 
@@ -1549,8 +1564,6 @@ describe('PipelineSettingsForm serialization', () => {
 		// Save — the reverse half of the two-way serialization (#369).
 		render(
 			<PipelineSettingsForm
-				autoMerge={false}
-				setAutoMerge={() => {}}
 				skipRespondToReviewOnMinors={true}
 				setSkipRespondToReviewOnMinors={() => {}}
 				reviewChecksPolicy="required"

@@ -11,6 +11,7 @@ function row(overrides: Partial<RepositoryForm> = {}): RepositoryForm {
 		repo: 'acme/first',
 		baseBranch: 'main',
 		branchPrefix: 'issue-',
+		autoMerge: false,
 		...overrides,
 	};
 }
@@ -145,11 +146,33 @@ describe('RepositoryList', () => {
 		expect(screen.queryByText(/not yet fully usable/)).toBeNull();
 	});
 
+	// Issue #1066: merge automation is per repository, with the copy the Pipeline tab
+	// used to carry for the project-wide toggle.
+	it('gives each row its own merge automation toggle', () => {
+		const { onChange } = renderList({
+			repositories: [row({ id: '1', autoMerge: true }), row({ id: '2', repo: 'acme/second' })],
+		});
+
+		const first = screen.getByLabelText('Merge automation, entry 1') as HTMLInputElement;
+		const second = screen.getByLabelText('Merge automation, entry 2') as HTMLInputElement;
+		expect(first.checked).toBe(true);
+		expect(second.checked).toBe(false);
+		expect(
+			screen.getAllByText(/After a SWARM review approves a pull request, merge it directly/),
+		).toHaveLength(2);
+
+		fireEvent.click(second);
+		expect(onChange).toHaveBeenCalledWith(1, { autoMerge: true });
+	});
+
 	it('disables every control while a save is in flight', () => {
 		renderList({ repositories: TWO, isPending: true });
 
 		expect((screen.getByLabelText('Repository, entry 1') as HTMLInputElement).disabled).toBe(true);
 		expect((screen.getByLabelText('Add repository') as HTMLButtonElement).disabled).toBe(true);
 		expect((screen.getByLabelText('Remove repository 2') as HTMLButtonElement).disabled).toBe(true);
+		expect((screen.getByLabelText('Merge automation, entry 1') as HTMLInputElement).disabled).toBe(
+			true,
+		);
 	});
 });

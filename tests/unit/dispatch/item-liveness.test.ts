@@ -46,7 +46,7 @@ function makeDispatchRef(overrides: Partial<ActiveDispatchTaskRef> = {}): Active
 	return { projectId: 'p1', taskId: '103', phase: 'implementation', ...overrides };
 }
 
-const NO_AUTOMATION: ItemLivenessPolicy = { planningAutoAdvance: false, autoMerge: false };
+const NO_AUTOMATION: ItemLivenessPolicy = { planningAutoAdvance: false, autoMergeRepositories: [] };
 
 /** Classify one activity row on its own, with no active dispatch. */
 function stateOf(
@@ -303,7 +303,7 @@ describe('classifyItemLiveness', () => {
 				{ ...approved, reviewMergeOutcome: 'policy-blocked' },
 				{
 					...NO_AUTOMATION,
-					autoMerge: true,
+					autoMergeRepositories: ['acme/widgets'],
 				},
 			);
 			expect(state).toBe('awaiting-human');
@@ -312,7 +312,23 @@ describe('classifyItemLiveness', () => {
 		// The shape of the incidents this read model exists for: a merge dispatch
 		// that should have written an outcome and did not.
 		it('is stalled for an approval with no merge outcome while auto-merge is on', () => {
-			expect(stateOf(approved, { ...NO_AUTOMATION, autoMerge: true })).toBe('stalled');
+			expect(stateOf(approved, { ...NO_AUTOMATION, autoMergeRepositories: ['acme/widgets'] })).toBe(
+				'stalled',
+			);
+		});
+
+		// Issue #1066: merge automation is per repository, so the approval is judged by
+		// the setting of the repository the run acted on — not by any other entry's.
+		it('is awaiting-human when auto-merge is on only for another repository', () => {
+			expect(stateOf(approved, { ...NO_AUTOMATION, autoMergeRepositories: ['acme/gadgets'] })).toBe(
+				'awaiting-human',
+			);
+		});
+
+		it('matches the repository case-insensitively', () => {
+			expect(stateOf(approved, { ...NO_AUTOMATION, autoMergeRepositories: ['Acme/Widgets'] })).toBe(
+				'stalled',
+			);
 		});
 	});
 

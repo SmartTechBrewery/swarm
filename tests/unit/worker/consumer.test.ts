@@ -29,6 +29,7 @@ import {
 	createMockPhaseRecovery,
 	createMockPmWebhookJob,
 	createMockProjectConfig,
+	createMockProjectRepositoryPair,
 	createMockScmEvent,
 	createMockScmWebhookJob,
 	createMockWorkItem,
@@ -1304,9 +1305,7 @@ describe('processJob', () => {
 		// and the branch above used to write `failed` over a run that had genuinely
 		// approved the PR — losing its merge automation with it.
 		describe('no-trigger redelivery of an already-completed Review run (issue #815)', () => {
-			const autoMergeProject = createMockProjectConfig({
-				pipeline: { respondToReview: { autoMerge: true } },
-			});
+			const autoMergeProject = createMockProjectConfig({ autoMerge: true });
 			const redeliveredJob = () =>
 				createMockScmWebhookJob({
 					runId: 'run-123',
@@ -6725,9 +6724,7 @@ describe('processJob', () => {
 		});
 
 		describe('durable merge dispatch after an eligible approval (issue #292)', () => {
-			const autoMergeProject = createMockProjectConfig({
-				pipeline: { respondToReview: { autoMerge: true } },
-			});
+			const autoMergeProject = createMockProjectConfig({ autoMerge: true });
 
 			it('persists a merge dispatch when the verdict is approve and autoMerge is on', async () => {
 				projectLookup = () => autoMergeProject;
@@ -6750,6 +6747,31 @@ describe('processJob', () => {
 				await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 				expect(requestMergeAutomation).not.toHaveBeenCalled();
+			});
+
+			// Issue #1066: merge automation is per repository, so an approval follows the
+			// setting of the repository its pull request belongs to.
+			it('follows the setting of the approved PR’s own repository', async () => {
+				const [android, backend] = createMockProjectRepositoryPair(
+					['acme/android', 'acme/backend'],
+					{ repositories: [{ repo: 'acme/android', autoMerge: true }, { repo: 'acme/backend' }] },
+				);
+				projectLookup = (_id, repo) => (repo === android.repo ? android : backend);
+				phaseImpl = async () => ({ agent: agentResult(), verdict: 'approve' });
+
+				for (const repo of [android.repo, backend.repo]) {
+					await processJob(
+						createMockScmWebhookJob({
+							projectId: 'acme',
+							event: createMockScmEvent({ repoFullName: repo }),
+						}),
+						registryReturning(REVIEW_TRIGGER),
+					);
+				}
+
+				expect(requestMergeAutomation).toHaveBeenCalledExactlyOnceWith(
+					expect.objectContaining({ project: android }),
+				);
 			});
 
 			it('does not persist a merge dispatch for a non-approve verdict', async () => {
