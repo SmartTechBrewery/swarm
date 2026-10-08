@@ -15,8 +15,9 @@
  * the operator's action is still moving (`in_progress`), stopped itself on a bad
  * build (`halted`), or finished (`completed`); the **member** says where one
  * machine stands inside it. Neither is derivable from the other: a halted rollout
- * still has members mid-flight whose outcome is worth recording, and a rollout
- * whose every member is settled is only `completed` if none of them settled badly.
+ * still has members mid-flight whose outcome is worth recording, and a `completed`
+ * one can carry a `failed` member — since issue #1064 a machine the rollout gave up
+ * on settles badly without stopping the fleet.
  */
 
 import { z } from 'zod';
@@ -28,12 +29,16 @@ import { WorkerUpdateStatusSchema, WorkerUpdateTargetSchema } from '../lib/build
  *
  * - `in_progress` — the operator's action is live: advancing it drains, signals,
  *   verifies and returns machines to the pool.
- * - `halted` — a member reported `failed`/`refused`/`declined`, or applied and
- *   never came back. No further wave is drained or signalled; `haltReason` records
- *   why, in the machine's own words where it had any. **Terminal** — there is no
- *   resume, exactly as issue #933 has no cancel for a single request; the way
- *   forward is to fix the build and start a new rollout.
- * - `completed` — every member settled, none of them badly.
+ * - `halted` — a machine *answered* badly: it reported `failed`/`refused`/`declined`,
+ *   or it came back on the build it was asked to leave. No further wave is drained or
+ *   signalled; `haltReason` records why, in the machine's own words where it had any.
+ *   **Terminal** — there is no resume, exactly as issue #933 has no cancel for a
+ *   single request; the way forward is to fix the build and start a new rollout. A
+ *   machine that merely stopped answering does *not* halt it (issue #1064): the
+ *   rollout gives up on that machine and carries on.
+ * - `completed` — every member settled. Not necessarily every one of them well: a
+ *   machine the rollout gave up on settles `failed` without halting, so a completed
+ *   rollout can carry failures, and the member table is where they are read.
  *
  * Stored as free `text` with this enum as the source of truth, the treatment
  * `worker_project_enrollments.status` already gets.
@@ -61,10 +66,12 @@ export const WorkerUpdateRolloutScopeSchema = z.enum(WORKER_UPDATE_ROLLOUT_SCOPE
 export type WorkerUpdateRolloutScope = z.infer<typeof WorkerUpdateRolloutScopeSchema>;
 
 /**
- * Whether a rollout of this scope puts a member that settled **`failed`** back in the
- * dispatch pool. `true` for `installation`, `false` for `owner` — the one behavioural
- * difference between the two scopes, named once here rather than branched at the
- * three verdicts that read it.
+ * Whether a rollout of this scope puts a member whose machine **answered** and settled
+ * `failed` back in the dispatch pool. `true` for `installation`, `false` for `owner` —
+ * the one behavioural difference between the two scopes, named once here rather than
+ * branched at the two verdicts that read it. A member the rollout *gave up on* is
+ * released whatever the scope (issue #1064) and never asks this: it is being released
+ * precisely because the rollout stopped waiting for it.
  *
  * An owner-scoped rollout leaves *your own* failed machine drained for you to look at
  * (issue #940): it is the machine that could not take the build, you asked for the
@@ -99,10 +106,15 @@ export function rolloutReleasesFailedMembers(scope: WorkerUpdateRolloutScope): b
  * - `done` — settled good: it came back on the new build, or reported
  *   `already-current` — the install root was on the target and the daemon was already
  *   running it — and so needed no restart at all.
- * - `skipped` — settled without being moved, and **not** a failure: the rollout
- *   halted before this machine's wave came up, or another session re-targeted the
- *   machine so there is nothing left for this rollout to verify.
- * - `failed` — settled bad. This is the state that halts the rollout.
+ * - `skipped` — settled without being moved, and **not** a failure: another session
+ *   re-targeted the machine so there is nothing left for this rollout to verify, the
+ *   rollout halted before this machine's wave came up, or the machine was enrolled in
+ *   no project or under no process supervisor.
+ * - `failed` — settled bad, for one of two different reasons. The machine *answered*
+ *   badly — reported `failed`/`refused`/`declined`, or came back on the build it was
+ *   asked to leave — which is what halts the rollout; or it stopped answering and the
+ *   rollout gave up on it (issue #1064), which does not halt and leaves the reason in
+ *   the member's own `message`. Either way it is the machine to go and look at.
  */
 export const WORKER_UPDATE_ROLLOUT_MEMBER_STATES = [
 	'queued',

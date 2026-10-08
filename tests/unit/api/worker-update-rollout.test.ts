@@ -128,7 +128,13 @@ function makeWorker(id: string, overrides: Partial<Worker> = {}): Worker {
 	};
 }
 
-/** A `workers` row carrying the answer a machine gave to the rollout's own request. */
+/**
+ * A `workers` row carrying the answer a machine gave to the rollout's own request.
+ *
+ * It reported half a minute before {@link NOW}, so a machine that said `applied` is
+ * inside the two-minute abandon bound by default and a case about the give-up moves
+ * the clock on itself (issue #1064).
+ */
 function reported(
 	id: string,
 	status: 'applied' | 'adopted' | 'already-current' | 'failed' | 'refused' | 'declined',
@@ -143,7 +149,7 @@ function reported(
 			requestedByUserId: REQUESTER_ID,
 			status,
 			message: status === 'failed' ? 'npm ci exited 1' : 'restarting',
-			reportedAt: new Date('2026-09-13T11:50:00Z'),
+			reportedAt: new Date('2026-09-13T11:59:30Z'),
 		},
 		...overrides,
 	});
@@ -787,16 +793,23 @@ describe('advanceRollout — a signalled machine that stops answering', () => {
 		});
 	}
 
-	// The whole point: before this, such a member waited for ever and its machine stayed
-	// out of the dispatch pool with only a manual undrain — by its owner — to recover it.
+	// The whole point: before this, such a member waited five minutes and settled
+	// `skipped`, which reads to an operator as "nothing failed" for a machine they in
+	// fact have to look at. Now it is given up on after two (issue #1064).
 	it('settles it and puts the machine back in the pool once it has been silent too long', async () => {
 		givenRollout(makeRollout(), [signalled()]);
 		givenWorkers(waiting());
-		silentFor(6);
+		silentFor(3);
 
 		const view = await advanceRollout(ROLLOUT_ID);
 
-		expect(view?.members[0].state).toBe('skipped');
+		expect(view?.members[0]).toMatchObject({
+			state: 'failed',
+			message: expect.stringContaining('2 minutes'),
+			// What tells a readout this `failed` was a give-up and not an answer, so it
+			// does not name an undrain for a machine already back in the pool.
+			abandoned: true,
+		});
 		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_A, false);
 	});
 
@@ -805,14 +818,14 @@ describe('advanceRollout — a signalled machine that stops answering', () => {
 	it('does not halt the rollout, and does not count the machine as done', async () => {
 		givenRollout(makeRollout(), [signalled()]);
 		givenWorkers(waiting());
-		silentFor(6);
+		silentFor(3);
 
 		const view = await advanceRollout(ROLLOUT_ID);
 
 		expect(view?.rollout.haltReason).toBeNull();
 		expect(view?.rollout.status).not.toBe('halted');
 		expect(view?.members[0].state).not.toBe('done');
-		expect(view?.members[0].state).not.toBe('failed');
+		expect(view?.members[0].state).toBe('failed');
 	});
 
 	// Without this the machine is handed the very request it gave up on, by
@@ -821,11 +834,28 @@ describe('advanceRollout — a signalled machine that stops answering', () => {
 	it('withdraws the outstanding request it gave up on', async () => {
 		givenRollout(makeRollout(), [signalled()]);
 		givenWorkers(waiting());
-		silentFor(6);
+		silentFor(3);
 
 		await advanceRollout(ROLLOUT_ID);
 
 		expect(withdrawWorkerUpdateRequest).toHaveBeenCalledWith(WORKER_A, REQUEST_A);
+	});
+
+	// The fleet is not held up by the machine the rollout has given up on: the pass that
+	// abandons it drains and signals the next one, with no tick in between.
+	it('takes the next wave in the same pass it gave up on a machine in', async () => {
+		givenRollout(makeRollout(), [signalled(), makeMember(WORKER_B, 1)]);
+		givenWorkers(waiting(), makeWorker(WORKER_B));
+		silentFor(3);
+		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry(WORKER_B, 'requested')]);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members.map((member) => member.state)).toEqual(['failed', 'signalled']);
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_A, false);
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_B, true);
+		expect(view?.rollout.status).toBe('in_progress');
+		expect(view?.rollout.haltReason).toBeNull();
 	});
 
 	// Slowness is not the failure being caught: the apply itself happens in this state,
@@ -851,7 +881,7 @@ describe('advanceRollout — a signalled machine that stops answering', () => {
 	it('keeps waiting on a machine that has only just gone quiet', async () => {
 		givenRollout(makeRollout(), [signalled()]);
 		givenWorkers(waiting());
-		silentFor(2);
+		silentFor(1);
 
 		const view = await advanceRollout(ROLLOUT_ID);
 
@@ -862,14 +892,14 @@ describe('advanceRollout — a signalled machine that stops answering', () => {
 	// A machine that never connected at all has no heartbeat to measure from, so the
 	// instant it was signalled is what the window runs from.
 	it('measures from the signal for a machine that has never connected', async () => {
-		givenRollout(makeRollout(), [signalled({ signalledAt: new Date(NOW.getTime() - 6 * 60_000) })]);
+		givenRollout(makeRollout(), [signalled({ signalledAt: new Date(NOW.getTime() - 3 * 60_000) })]);
 		givenWorkers(waiting());
 		getLiveSessionForWorker.mockResolvedValue(undefined);
 		getRetainedSessionForWorker.mockResolvedValue(undefined);
 
 		const view = await advanceRollout(ROLLOUT_ID);
 
-		expect(view?.members[0].state).toBe('skipped');
+		expect(view?.members[0].state).toBe('failed');
 		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_A, false);
 	});
 
@@ -877,11 +907,11 @@ describe('advanceRollout — a signalled machine that stops answering', () => {
 	it('never undrains a machine the operator had drained themselves', async () => {
 		givenRollout(makeRollout(), [signalled({ drainedByRollout: false })]);
 		givenWorkers(waiting());
-		silentFor(6);
+		silentFor(3);
 
 		const view = await advanceRollout(ROLLOUT_ID);
 
-		expect(view?.members[0].state).toBe('skipped');
+		expect(view?.members[0].state).toBe('failed');
 		expect(setWorkerDraining).not.toHaveBeenCalledWith(WORKER_A, false);
 	});
 });
@@ -937,32 +967,92 @@ describe('advanceRollout — verifying that a machine came back on the new build
 
 		expect(view?.rollout.status).toBe('halted');
 		expect(view?.rollout.haltReason).toContain('aaaaaaa');
-		expect(view?.members[0].state).toBe('failed');
+		// An answer, not a give-up — still carrying the `applied` it reported — so a
+		// readout keeps naming the undrain for it (it stays drained in an owner scope).
+		expect(view?.members[0]).toMatchObject({
+			state: 'failed',
+			outcome: 'applied',
+			abandoned: false,
+		});
 	});
 
-	it('keeps waiting while the machine is inside its come-back window', async () => {
-		givenRollout(makeRollout(), [verifying()]);
-		givenWorkers(reported(WORKER_A, 'applied'));
-		// Reported `applied` ten minutes before "now" minus a margin — still restarting.
-		vi.setSystemTime(new Date('2026-09-13T11:55:00Z'));
+	// The fixture reported `applied` half a minute ago, so the machine is still inside
+	// the two-minute bound and nothing about it has been decided.
+	it('keeps waiting on a machine that applied a moment ago', async () => {
+		givenRollout(makeRollout(), [verifying(), makeMember(WORKER_B, 1)]);
+		givenWorkers(reported(WORKER_A, 'applied'), makeWorker(WORKER_B));
 
 		const view = await advanceRollout(ROLLOUT_ID);
 
 		expect(view?.members[0].state).toBe('verifying');
 		expect(view?.rollout.status).toBe('in_progress');
+		// The wave bound holds: nothing is drained while this one is still in flight.
+		expect(setWorkerDraining).not.toHaveBeenCalledWith(WORKER_B, true);
 	});
 
-	// A build that cannot start says nothing at all, so silence has to be the verdict.
-	it('halts when the machine never comes back inside the window', async () => {
+	// A machine that cannot start says nothing at all, so silence has to be the verdict —
+	// and since issue #1064 that verdict is about the machine, not about the fleet.
+	it('gives up on a machine that never came back, and takes the next wave', async () => {
 		givenRollout(makeRollout(), [verifying(), makeMember(WORKER_B, 1)]);
 		givenWorkers(reported(WORKER_A, 'applied'), makeWorker(WORKER_B));
+		vi.setSystemTime(new Date('2026-09-13T13:00:00Z'));
+		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry(WORKER_B, 'requested')]);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0]).toMatchObject({
+			state: 'failed',
+			message: expect.stringContaining('2 minutes'),
+			// What tells a readout this `failed` was a give-up and not an answer, so it
+			// does not name an undrain for a machine already back in the pool.
+			abandoned: true,
+		});
+		// Handed back to the dispatch pool, so a machine that comes back late is not
+		// stranded, and the next machine is drained and asked in the very same pass.
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_A, false);
+		expect(view?.members[1].state).toBe('signalled');
+		expect(view?.rollout.status).toBe('in_progress');
+		expect(view?.rollout.haltReason).toBeNull();
+	});
+
+	// Nothing was reported to withdraw: the machine answered, which is how the member
+	// reached `verifying` at all.
+	it('withdraws nothing when it gives up on a machine that had already reported', async () => {
+		givenRollout(makeRollout(), [verifying()]);
+		givenWorkers(reported(WORKER_A, 'applied'));
+		vi.setSystemTime(new Date('2026-09-13T13:00:00Z'));
+
+		await advanceRollout(ROLLOUT_ID);
+
+		expect(withdrawWorkerUpdateRequest).not.toHaveBeenCalled();
+	});
+
+	// A rollout can now finish with a failure in it: the member table is where that is
+	// read, and `completed` no longer promises every machine settled well.
+	it('completes a rollout whose only machine was given up on', async () => {
+		givenRollout(makeRollout(), [verifying()]);
+		givenWorkers(reported(WORKER_A, 'applied'));
 		vi.setSystemTime(new Date('2026-09-13T13:00:00Z'));
 
 		const view = await advanceRollout(ROLLOUT_ID);
 
-		expect(view?.rollout.status).toBe('halted');
-		expect(view?.rollout.haltReason).toContain('has not come back');
-		expect(view?.members.map((member) => member.state)).toEqual(['failed', 'skipped']);
+		expect(view?.members[0].state).toBe('failed');
+		expect(view?.rollout.status).toBe('completed');
+		expect(statusWrites).toEqual([{ status: 'completed', haltReason: undefined }]);
+	});
+
+	// The scope rule is suspended for an abandoned member and for no other: an
+	// owner-scoped rollout keeps a machine that *answered* badly drained (asserted next
+	// door) and still releases one it merely gave up on.
+	it('returns an abandoned machine to the pool in an owner-scoped rollout too', async () => {
+		givenRollout(makeRollout({ scope: 'owner' }), [verifying()]);
+		givenWorkers(reported(WORKER_A, 'applied'));
+		vi.setSystemTime(new Date('2026-09-13T13:00:00Z'));
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0].state).toBe('failed');
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_A, false);
 	});
 
 	// No live session at signal time means there was no token to beat, so any live
@@ -1508,7 +1598,7 @@ describe('advanceRollout — a failed member of an installation rollout', () => 
 				}),
 			],
 		);
-		// Reported `applied` at 11:50 and nothing since — well past the come-back window.
+		// Reported `applied` at 11:59:30 and nothing since — well past the abandon bound.
 		givenWorkers(reported(WORKER_A, 'applied', { ownerUserId: OTHER_OWNER_ID }));
 		vi.setSystemTime(new Date('2026-09-13T13:00:00Z'));
 
@@ -1516,7 +1606,7 @@ describe('advanceRollout — a failed member of an installation rollout', () => 
 
 		expect(view?.members[0]).toMatchObject({
 			state: 'failed',
-			message: 'applied the update and never came back',
+			message: expect.stringContaining('never came back within 2 minutes'),
 		});
 		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_A, false);
 	});

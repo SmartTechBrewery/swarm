@@ -26,9 +26,9 @@ export interface RolloutMemberStateCopy {
 	label: string;
 	/**
 	 * `positive` only for the machine that actually came back on the new build,
-	 * `caution` for one the rollout settled without moving, `negative` for the failure
-	 * that halts it, and `neutral` while it is still in flight — a machine mid-wave is
-	 * not yet good or bad news.
+	 * `caution` for one the rollout settled without moving, `negative` for a machine
+	 * that failed — whether it said so or simply stopped answering — and `neutral`
+	 * while it is still in flight, since a machine mid-wave is not yet good or bad news.
 	 */
 	tone: BadgeTone;
 	/** One sentence saying where the machine stands, shown beside its name. */
@@ -70,10 +70,14 @@ const MEMBER_STATES: Record<string, RolloutMemberStateCopy> = {
 		description:
 			'Settled without being moved — it is still on the build it had, and nothing failed.',
 	},
+	// Two different things settle here, and only one of them stops the fleet (issue
+	// #1064): the machine said it could not take the build, or it stopped answering and
+	// the rollout gave up waiting. Its own line says which.
 	failed: {
 		label: 'Failed',
 		tone: 'negative',
-		description: 'It could not take the build. This is what halts the rollout.',
+		description:
+			'It could not take the build, or the rollout gave up waiting for it — look at this machine.',
 	},
 };
 
@@ -115,7 +119,8 @@ const STATUSES: Record<string, RolloutStatusCopy> = {
 	completed: {
 		label: 'Completed',
 		tone: 'positive',
-		description: 'Every machine settled, none of them badly.',
+		description:
+			'Every machine settled — read the table for any the rollout gave up on along the way.',
 	},
 };
 
