@@ -30,12 +30,15 @@ import { WorkerUpdateStatusSchema, WorkerUpdateTargetSchema } from '../lib/build
  * - `in_progress` — the operator's action is live: advancing it drains, signals,
  *   verifies and returns machines to the pool.
  * - `halted` — a machine *answered* badly: it reported `failed`/`refused`/`declined`,
- *   or it came back on the build it was asked to leave. No further wave is drained or
- *   signalled; `haltReason` records why, in the machine's own words where it had any.
+ *   or it came back on the build it was asked to leave; or the rollout gave up on
+ *   `MAX_CONSECUTIVE_ABANDONED` machines in a row (issue #1064), which is what a build
+ *   that cannot start anywhere looks like. No further wave is drained or signalled;
+ *   `haltReason` records why, in the machine's own words where it had any.
  *   **Terminal** — there is no resume, exactly as issue #933 has no cancel for a
  *   single request; the way forward is to fix the build and start a new rollout. A
  *   machine that merely stopped answering does *not* halt it (issue #1064): the
- *   rollout gives up on that machine and carries on.
+ *   rollout gives up on that machine and carries on — unless it is the latest of a run
+ *   of them, above.
  * - `completed` — every member settled. Not necessarily every one of them well: a
  *   machine the rollout gave up on settles `failed` without halting, so a completed
  *   rollout can carry failures, and the member table is where they are read.
@@ -113,8 +116,10 @@ export function rolloutReleasesFailedMembers(scope: WorkerUpdateRolloutScope): b
  * - `failed` — settled bad, for one of two different reasons. The machine *answered*
  *   badly — reported `failed`/`refused`/`declined`, or came back on the build it was
  *   asked to leave — which is what halts the rollout; or it stopped answering and the
- *   rollout gave up on it (issue #1064), which does not halt and leaves the reason in
- *   the member's own `message`. Either way it is the machine to go and look at.
+ *   rollout gave up on it (issue #1064), which leaves the reason in the member's own
+ *   `message` and does not halt on its own — only the last of a run of
+ *   `MAX_CONSECUTIVE_ABANDONED` such give-ups does. Either way it is the machine to go
+ *   and look at.
  */
 export const WORKER_UPDATE_ROLLOUT_MEMBER_STATES = [
 	'queued',

@@ -657,6 +657,13 @@ later — and the next machine is drained and asked in the same pass. If that wa
 machine, the rollout moved on without it and you move it yourself with `swarm workers
 update <worker-id> <ref>` once it is back.
 
+Three machines given up on **in a row** do halt it, though: a build that cannot start
+anywhere is silent on every machine, and that run is what it looks like from the
+control plane. The halt reads like any other — the reason names how many machines
+were given up on, and the ones it had not reached stay in the pool. A machine that
+comes back on the new build in between resets the count, and one that was skipped
+does not count either way.
+
 **There is no per-host setting to turn this on or off, and since issue #975 there is
 no setting that can refuse it.** What authorizes an update is the mechanism itself,
 and it is worth reading once, because it is what the removed flag was standing in

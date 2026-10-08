@@ -11,7 +11,9 @@
  * `failed` with the reason in its own line, hands its machine back to the dispatch
  * pool and **carries on with the rest of the fleet**. The halts that remain are the
  * two a machine actually *answered* with — a reported `failed`/`refused`/`declined`,
- * and coming back on the build it was asked to leave.
+ * and coming back on the build it was asked to leave — and one the fleet answers
+ * together: {@link MAX_CONSECUTIVE_ABANDONED} machines given up on in a row, which is
+ * what a build that cannot start anywhere looks like from the control plane.
  *
  * It lives here rather than under `src/identity/` for one concrete reason: it
  * drives phase 1's `fanOutWorkerUpdate`, which is `src/api/` policy, and nothing
@@ -138,6 +140,24 @@ const ABANDON_AFTER_MS = 120_000;
 
 /** {@link ABANDON_AFTER_MS} in the whole minutes the operator-facing messages name it by. */
 const ABANDON_AFTER_MINUTES = Math.round(ABANDON_AFTER_MS / 60_000);
+
+/**
+ * How many machines the rollout may give up on **in a row** before it stops trusting
+ * the build rather than the machines (issue #1064).
+ *
+ * {@link ABANDON_AFTER_MS} made one unreachable machine cost the fleet two minutes
+ * instead of a halt, which is right for a laptop that was closed and wrong for a build
+ * that cannot start anywhere — that one is silent on *every* machine, so without a
+ * brake the rollout would march the whole fleet through it. Three is the smallest run
+ * that cannot be a coincidence of one operator's machines going away, and on the
+ * default wave of one it costs about six minutes before the fleet is stood down.
+ *
+ * A flat count rather than a share of the fleet: a share means a four-machine
+ * installation and a forty-machine one stop at wildly different absolute costs, and
+ * the thing being detected — a build that starts nowhere — is not proportional to
+ * fleet size. Coded rather than configurable, like {@link ABANDON_AFTER_MS}.
+ */
+const MAX_CONSECUTIVE_ABANDONED = 3;
 
 /** One machine's line in a rollout readout — its member row plus the label an operator reads it by. */
 export interface RolloutMemberView extends WorkerUpdateRolloutMember {
@@ -391,19 +411,24 @@ async function readRolloutView(rolloutId: string): Promise<RolloutView | undefin
  *    a fresh lease *and* the machine is no longer declaring the build it started
  *    from. Not coming back inside {@link ABANDON_AFTER_MS} is the same give-up —
  *    silence names no cause, so the rollout abandons that machine and carries on.
- * 3. **Return** each member the rollout is finished with to the dispatch pool, but
+ * 3. **Brake** on a run of give-ups: once {@link MAX_CONSECUTIVE_ABANDONED} members
+ *    in a row have been given up on, with none coming back on the new build between
+ *    them, the build rather than the machines is what is silent, so the rollout
+ *    **halts** (issue #1064). One unreachable machine never stops a fleet; a build
+ *    that starts nowhere stops one quickly.
+ * 4. **Return** each member the rollout is finished with to the dispatch pool, but
  *    only one the rollout drained itself: a machine the operator had drained for
  *    their own reasons is left exactly as they left it. A member whose machine
  *    *answered* and settled `failed` is left drained in an owner-scoped rollout and
  *    returned in an installation-scoped one (issue #1024); one the rollout gave up on
  *    is returned either way ({@link abandonVerdict}).
- * 4. **Stand down** every machine the rollout has not committed to yet, if it has
+ * 5. **Stand down** every machine the rollout has not committed to yet, if it has
  *    halted — so a halt leaves the untouched majority of the fleet in the pool.
- * 5. **Advance**, while it is still in progress: take the next `waveSize` queued
+ * 6. **Advance**, while it is still in progress: take the next `waveSize` queued
  *    members only once nothing is in flight, drain them, and signal the ones that
  *    have gone idle. A member still running a phase stays draining and is signalled
  *    on a later advance — draining never interrupts a run.
- * 6. **Complete** when every member has settled.
+ * 7. **Complete** when every member has settled.
  */
 export async function advanceRollout(rolloutId: string): Promise<RolloutView | undefined> {
 	return await advanceUnderRolloutLock(rolloutId, async (loaded, write) => {
@@ -466,6 +491,9 @@ const ABANDON_MESSAGES: ReadonlySet<string> = new Set([SILENT_MESSAGE, NEVER_CAM
  * observed on 2026-10-08, when a machine reported `applied`, released its session and
  * never reconnected, and ten minutes later the rollout stood the rest of the fleet
  * down. With no halt the pass's own `advanceWaves` takes the next wave immediately.
+ * What one give-up does not say, a run of them does: that is the brake
+ * {@link MAX_CONSECUTIVE_ABANDONED} puts on the fleet, decided over the member list
+ * rather than here.
  *
  * **`returnToPool` is unconditional**, for both scopes — the one place
  * `rolloutReleasesFailedMembers` does not apply, and deliberately so. That rule keeps
@@ -673,6 +701,33 @@ function decideComeBack(
 }
 
 /**
+ * How many members the rollout has given up on in a row, reading the member rows in
+ * the order the rollout reaches them (issue #1064).
+ *
+ * A give-up extends the run; a member that came back on the new build (`done`) resets
+ * it, because that build demonstrably starts, so the earlier give-ups were about those
+ * machines rather than about the build; a member settled without being moved
+ * (`skipped`) — and one not settled yet — says nothing about the build and leaves the
+ * run alone.
+ *
+ * A non-halting `failed` member is by construction one the rollout gave up on: every
+ * other `failed` verdict — a reported `failed`/`refused`/`declined`, and a machine
+ * that came back on the build it was asked to leave — halts on the spot, so in a
+ * rollout still in progress it can never be among the members counted here. That is
+ * stated rather than left to the call site, and pinned by its own test, because it is
+ * the one thing that would make this count mean something else if a further `failed`
+ * verdict were ever added without a halt.
+ */
+function consecutiveAbandonments(members: WorkerUpdateRolloutMember[]): number {
+	let run = 0;
+	for (const member of [...members].sort((a, b) => a.position - b.position)) {
+		if (member.state === 'failed') run += 1;
+		else if (member.state === 'done') run = 0;
+	}
+	return run;
+}
+
+/**
  * One advance, as a small state machine over a working copy of the member list.
  *
  * A class rather than a chain of functions because every step reads and writes the
@@ -710,6 +765,7 @@ class AdvancePass {
 		this.workers = await resolveWorkers(this.members);
 		await this.settleSignalled();
 		await this.verifyApplied();
+		await this.brakeOnRepeatedAbandonment();
 		await this.standDownUncommitted();
 		await this.advanceWaves();
 		await this.completeIfSettled();
@@ -773,7 +829,29 @@ class AdvancePass {
 	}
 
 	/**
-	 * Step 4 — once halted, settle every machine the rollout has not committed to.
+	 * Step 3 — halt once the rollout has given up on {@link MAX_CONSECUTIVE_ABANDONED}
+	 * machines in a row ({@link consecutiveAbandonments}).
+	 *
+	 * Here rather than inside the verdict that abandoned the last of them, because the
+	 * run is a fact about the member list and not about one member, and the list is only
+	 * whole once both settling steps have been applied. Before the stand-down, so a halt
+	 * reached on this pass stands the rest of the fleet down on this same pass. Decided
+	 * from the working copy alone — which {@link apply} keeps in step with the rows — so
+	 * re-running an advance re-reaches the same verdict, and {@link halt} keeps the first
+	 * reason if one was already given.
+	 */
+	private async brakeOnRepeatedAbandonment(): Promise<void> {
+		if (this.status !== 'in_progress') return;
+		const run = consecutiveAbandonments(this.members);
+		if (run < MAX_CONSECUTIVE_ABANDONED) return;
+		await this.halt(
+			`${run} machines in a row were given up on without coming back — treat the build ` +
+				'as unable to start',
+		);
+	}
+
+	/**
+	 * Step 5 — once halted, settle every machine the rollout has not committed to.
 	 *
 	 * A `queued` member was never drained, so this only records that it will not be
 	 * reached; a `draining` one was taken out of the pool for a wave that will now
@@ -802,7 +880,7 @@ class AdvancePass {
 	}
 
 	/**
-	 * Step 5 — take waves for as long as this pass can keep taking them.
+	 * Step 6 — take waves for as long as this pass can keep taking them.
 	 *
 	 * **A wave that settles without ever being signalled must not cost a tick.** Some
 	 * members are decided the instant they are asked and never involve the machine at
@@ -1087,7 +1165,7 @@ class AdvancePass {
 		});
 	}
 
-	/** Step 6 — a rollout still in progress with nothing left unsettled is finished. */
+	/** Step 7 — a rollout still in progress with nothing left unsettled is finished. */
 	private async completeIfSettled(): Promise<void> {
 		if (this.status !== 'in_progress') return;
 		if (this.members.some((member) => !isSettledMemberState(member.state))) return;
@@ -1120,7 +1198,7 @@ class AdvancePass {
 	}
 
 	/**
-	 * Step 3 — put a machine back in the dispatch pool, but only one this rollout took
+	 * Step 4 — put a machine back in the dispatch pool, but only one this rollout took
 	 * out of it. A machine the operator had drained for their own reasons keeps their
 	 * drain: the rollout borrowed it, it did not create it.
 	 *
