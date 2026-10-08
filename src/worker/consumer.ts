@@ -3320,8 +3320,9 @@ async function selfEnqueueNextPhase(
  * Persist a durable merge dispatch after an eligible Review approval (issue
  * #292). The eligibility gate lives here, at the composition root, so pipeline
  * code neither merges nor schedules queue work (`ai/RULES.md` §2): only a
- * completed Review run's submitted `approve` verdict with
- * `pipeline.respondToReview.autoMerge` on requests a merge — the sole
+ * completed Review run's submitted `approve` verdict, with merge automation on for
+ * the PR's repository (`repositories[].autoMerge`, scoped onto `project.autoMerge`
+ * since issue #1066), requests a merge — the sole
  * eligibility rule (issue #235); Respond-to-review's own outcomes never do.
  * Execution happens later, when the dispatch's wake-up is claimed
  * (`processMergeAutomationDispatch`), never inline in the Review job.
@@ -3334,7 +3335,7 @@ async function requestMergeAutomationIfEligible(
 ): Promise<void> {
 	if (trigger.phase !== 'review') return;
 	if (verdict !== 'approve') return;
-	if (project.pipeline?.respondToReview?.autoMerge !== true) return;
+	if (project.autoMerge !== true) return;
 	if (!runId) {
 		// The dispatch's dedup identity and outcome persistence both key on the
 		// Review run row; without one (a degraded `tryCreateRun`) there is no safe
@@ -3419,7 +3420,7 @@ async function scheduleCiRecoveryIfNoFix(
  * The eligibility rule itself, split out of {@link requestMergeAutomationIfEligible}
  * so it can be honoured for an approval read back off the review-verdict ledger
  * rather than off a phase result (issue #815) — without inventing a `TriggerResult`
- * to carry it. The decision (`pipeline.respondToReview.autoMerge`) therefore stays
+ * to carry it. The decision (the PR's repository's `autoMerge`) therefore stays
  * in one place whichever path establishes the approval.
  */
 async function requestMergeAutomationForApproval(
@@ -3429,7 +3430,7 @@ async function requestMergeAutomationForApproval(
 	prNumber: string,
 	approvedHeadSha: string,
 ): Promise<void> {
-	if (project.pipeline?.respondToReview?.autoMerge !== true) return;
+	if (project.autoMerge !== true) return;
 	await requestMergeAutomation({ project, reviewRunId, taskId, prNumber, approvedHeadSha });
 }
 

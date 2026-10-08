@@ -27,7 +27,10 @@ const PROJECT_ID = 'proj-liveness';
 const REPO = 'jkwiecien/liveness-repo';
 
 /** The pipeline's own defaults — what an unconfigured project actually does. */
-const DEFAULT_POLICY: ItemLivenessPolicy = { planningAutoAdvance: false, autoMerge: false };
+const DEFAULT_POLICY: ItemLivenessPolicy = {
+	planningAutoAdvance: false,
+	autoMergeRepositories: [],
+};
 
 const HOUR_MS = 60 * 60 * 1000;
 

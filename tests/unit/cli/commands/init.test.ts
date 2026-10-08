@@ -46,6 +46,8 @@ describe('swarm init', () => {
 		// The scaffolded config template must itself be schema-valid.
 		const [, written] = vi.mocked(writeFile).mock.calls[0];
 		expect(() => JSON.parse(written as string)).not.toThrow();
+		// Merge automation is stated per repository, off by default (issue #1066).
+		expect(JSON.parse(written as string).projects[0].repositories[0].autoMerge).toBe(false);
 	});
 
 	it('leaves existing files untouched and validates a valid config', async () => {

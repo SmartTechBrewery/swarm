@@ -51,11 +51,13 @@ export interface RepositoryEntry {
 	 * tab cannot silently drop a token nothing on it renders.
 	 */
 	pmRoutingToken?: string;
+	/** Merge automation for this repository (issue #1066). Unset means off. */
+	autoMerge?: boolean;
 }
 
 /**
- * One row of the repository editor. Every field is a string, so the form state is
- * exactly what its inputs render.
+ * One row of the repository editor. Every text field is a string and the merge
+ * automation toggle a boolean, so the form state is exactly what its inputs render.
  *
  * `id` is form-only and never persisted: it is the row's React key, so a reorder moves
  * the row instead of rewriting two sets of inputs. A value-derived key — the trick
@@ -67,6 +69,8 @@ export interface RepositoryForm {
 	repo: string;
 	baseBranch: string;
 	branchPrefix: string;
+	/** Merge automation for this repository (issue #1066) — an unset entry reads as off. */
+	autoMerge: boolean;
 	/**
 	 * Carried opaquely, never rendered (issue #686). It rides on the row rather than
 	 * being looked up at save time because a save sends the whole list positionally,
@@ -96,6 +100,7 @@ const NEW_REPOSITORY = {
 	repo: '',
 	baseBranch: DEFAULT_BASE_BRANCH,
 	branchPrefix: 'issue-',
+	autoMerge: false,
 } as const;
 
 /** A row id no row in `rows` already uses, so keys stay unique across adds and removes. */
@@ -116,6 +121,7 @@ export function toRepositoryForms(repositories: RepositoryEntry[] | undefined): 
 		repo: entry.repo,
 		baseBranch: entry.baseBranch ?? '',
 		branchPrefix: entry.branchPrefix ?? '',
+		autoMerge: entry.autoMerge === true,
 		...(entry.pmRoutingToken ? { pmRoutingToken: entry.pmRoutingToken } : {}),
 	}));
 	return rows.length > 0 ? rows : [{ id: '1', ...NEW_REPOSITORY }];
@@ -137,6 +143,7 @@ export function toRepositoryEntries(rows: RepositoryForm[]): RepositoryEntry[] {
 		repo: row.repo,
 		baseBranch: row.baseBranch,
 		branchPrefix: row.branchPrefix,
+		autoMerge: row.autoMerge,
 		...(row.pmRoutingToken ? { pmRoutingToken: row.pmRoutingToken } : {}),
 	}));
 }
@@ -221,7 +228,8 @@ export function areRepositoriesDirty(
 		return (
 			row.repo !== other?.repo ||
 			row.baseBranch !== other?.baseBranch ||
-			row.branchPrefix !== other?.branchPrefix
+			row.branchPrefix !== other?.branchPrefix ||
+			row.autoMerge !== other?.autoMerge
 		);
 	});
 }

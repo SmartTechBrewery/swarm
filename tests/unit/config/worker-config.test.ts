@@ -51,6 +51,15 @@ describe('toWorkerConfig', () => {
 		}
 	});
 
+	// Issue #1066: merge automation is control-plane policy, like `pipeline`.
+	it('drops the per-repository merge automation flag', () => {
+		const worker = toWorkerConfig(createMockProjectConfig({ autoMerge: true })) as Record<
+			string,
+			unknown
+		>;
+		expect('autoMerge' in worker).toBe(false);
+	});
+
 	it('strips the board mapping along with the pm block it now lives under', () => {
 		const project = createMockProjectConfig();
 		const pm = requireGitHubProjectsConfig(project);

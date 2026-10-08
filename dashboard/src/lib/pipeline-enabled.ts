@@ -110,7 +110,7 @@ export function isRespondToReviewLocked(form: PipelineEnabledForm): boolean {
  * Build the `pipeline` payload for `projects.update` from the form, preserving
  * every existing pipeline field the Agent Configuration screen doesn't edit
  * (Planning's autoAdvance/autoSplit/maxConcerns/verifyPlan, Respond-to-review's
- * autoMerge/skipOnMinors). `projects.update` shallow-merges, so an omitted field
+ * skipOnMinors). `projects.update` shallow-merges, so an omitted field
  * here would be dropped — hence the spreads. Respond-to-review is forced off when
  * Review is off to satisfy the server-side refinement.
  */
@@ -149,7 +149,7 @@ export function buildPipelineAutoAdvanceUpdate(
  * The complete `pipeline` payload carrying only the Agent Configuration toggles'
  * state (every phase's `enabled` flag, Planning's `autoAdvance` and its
  * `verifyPlan`), layered over the stored config so every field the toggles don't
- * own — Respond-to-review's autoMerge/skipOnMinors, Review's checks policy —
+ * own — Respond-to-review's skipOnMinors, Review's checks policy —
  * survives the write. This is the scoped payload the Agents tab sends when a
  * toggle is flipped: it persists the toggle immediately without dragging along
  * the tab's unsaved non-toggle edits (target lists, timeouts, custom prompts)

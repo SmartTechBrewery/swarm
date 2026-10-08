@@ -24,7 +24,8 @@ interface RepositoryRowProps {
 
 /**
  * One repository in the project's list: its rank, the reorder/remove actions, and the
- * three settings that are genuinely per-repository. Each field's accessible name carries
+ * four settings that are genuinely per-repository — merge automation among them since
+ * issue #1066, which moved it off the Pipeline tab's project-wide toggle. Each field's accessible name carries
  * the rank, since a project can hold several identical-looking rows.
  *
  * The source-control provider is **not** among them (issue #727): it is the project's,
@@ -137,6 +138,26 @@ function RepositoryRow({
 					/>
 				</div>
 			</div>
+
+			<label className="flex items-start gap-3 p-4 border border-zinc-800 rounded-md bg-panel/20 cursor-pointer hover:bg-zinc-800/20 transition-colors">
+				<input
+					type="checkbox"
+					id={`${idBase}-auto-merge`}
+					aria-label={`Merge automation, entry ${rank}`}
+					checked={entry.autoMerge}
+					onChange={(e) => onChange(index, { autoMerge: e.target.checked })}
+					disabled={isPending}
+					className="mt-0.5 h-4 w-4 accent-violet-600 disabled:opacity-50"
+				/>
+				<span>
+					<span className="block text-sm font-medium text-zinc-200">Merge automation</span>
+					<span className="block text-xs text-zinc-400 mt-1">
+						After a SWARM review approves a pull request, merge it directly using the implementer
+						credential, retrying briefly while checks settle. Repository rules still apply; SWARM
+						never uses the provider's native auto-merge.
+					</span>
+				</span>
+			</label>
 		</li>
 	);
 }
@@ -167,7 +188,7 @@ export interface RepositoryListProps {
  *
  * What is *not* here is anything shared by the whole project: the board mapping and the
  * PM credentials on Project Management, the provider and its credentials in the cards
- * above. Only the three settings that are genuinely per-repository are here.
+ * above. Only the four settings that are genuinely per-repository are here.
  */
 export function RepositoryList({
 	repositories,
@@ -185,11 +206,12 @@ export function RepositoryList({
 					Repositories
 				</h2>
 				<p className="text-xs text-zinc-400">
-					Every repository this project operates on, with the branch settings SWARM uses for each.
-					Each piece of work runs against the repository it belongs to — a board card against the
-					repository that claims it — and none of them is a fallback for the others: with several
-					repositories, a card none of them claims is refused rather than run against the first. All
-					of them live on the provider selected above, using the credentials configured with it.
+					Every repository this project operates on, with the branch and merge settings SWARM uses
+					for each. Each piece of work runs against the repository it belongs to — a board card
+					against the repository that claims it — and none of them is a fallback for the others:
+					with several repositories, a card none of them claims is refused rather than run against
+					the first. All of them live on the provider selected above, using the credentials
+					configured with it.
 				</p>
 			</div>
 

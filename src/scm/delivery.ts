@@ -286,8 +286,8 @@ function checkFindingSlots(finding: ReviewFinding, index: number, ctx: z.Refinem
  *
  * Without this the two lists are independent, so a re-review could render a
  * disposition table reading "F1 ❌ not addressed" above the verdict `approve` —
- * clearing the review gate and, with `pipeline.respondToReview.autoMerge` on,
- * merging a PR whose requested changes were never made. Routing the item through
+ * clearing the review gate and, with merge automation on for the PR's repository
+ * (`repositories[].autoMerge`), merging a PR whose requested changes were never made. Routing the item through
  * `findings` instead of coupling it to the verdict directly is deliberate: it
  * lets {@link checkVerdictMatchesSeverities} do the verdict work from the
  * severity the reviewer assigns, so a still-outstanding *nit* from an earlier

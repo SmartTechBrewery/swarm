@@ -97,6 +97,22 @@ describe('project repository scoping (issue #684)', () => {
 			expect(Object.hasOwn(scoped, 'scm')).toBe(false);
 		});
 
+		// Issue #1066: merge automation is the repository's own, so scoping carries the
+		// named entry's value — and keeps the key absent when that entry states none.
+		it("carries the named entry's own autoMerge, absent when the entry states none", () => {
+			const withAutoMerge: ProjectRecord = {
+				...twoRepositoryRecord(),
+				repositories: [
+					{ repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-', autoMerge: true },
+					{ repo: 'acme/second', baseBranch: 'develop', branchPrefix: 'task-' },
+				],
+			};
+			expect(scopeProjectToRepository(withAutoMerge, 'acme/first').autoMerge).toBe(true);
+			expect(
+				Object.hasOwn(scopeProjectToRepository(withAutoMerge, 'acme/second'), 'autoMerge'),
+			).toBe(false);
+		});
+
 		it('throws rather than falling back when the repository is not the project’s', () => {
 			expect(() => scopeProjectToRepository(twoRepositoryRecord(), 'acme/third')).toThrow();
 		});

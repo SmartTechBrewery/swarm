@@ -1577,8 +1577,6 @@ const REVIEW_CHECKS_POLICY_OPTIONS: Array<{
 ];
 
 interface PipelineSettingsFormProps {
-	autoMerge: boolean;
-	setAutoMerge: (value: boolean) => void;
 	skipRespondToReviewOnMinors: boolean;
 	setSkipRespondToReviewOnMinors: (value: boolean) => void;
 	reviewChecksPolicy: ReviewChecksPolicy;
@@ -1593,8 +1591,6 @@ interface PipelineSettingsFormProps {
 }
 
 export function PipelineSettingsForm({
-	autoMerge,
-	setAutoMerge,
 	skipRespondToReviewOnMinors,
 	setSkipRespondToReviewOnMinors,
 	reviewChecksPolicy,
@@ -1614,23 +1610,6 @@ export function PipelineSettingsForm({
 					<h2 className="text-sm font-semibold text-zinc-200 border-b border-zinc-800 pb-2 mb-4">
 						Pipeline Automation
 					</h2>
-					<label className="flex items-start gap-3 p-4 border border-zinc-800 rounded-md bg-panel/20 cursor-pointer hover:bg-zinc-800/20 transition-colors">
-						<input
-							type="checkbox"
-							checked={autoMerge}
-							onChange={(event) => setAutoMerge(event.target.checked)}
-							disabled={isPending}
-							className="mt-0.5 h-4 w-4 accent-violet-600 disabled:opacity-50"
-						/>
-						<span>
-							<span className="block text-sm font-medium text-zinc-200">Merge automation</span>
-							<span className="block text-xs text-zinc-400 mt-1">
-								After a SWARM review approves a pull request, merge it directly using the
-								implementer credential, retrying briefly while checks settle. Repository rules still
-								apply; SWARM never uses the provider's native auto-merge.
-							</span>
-						</span>
-					</label>
 					<label className="flex items-start gap-3 p-4 border border-zinc-800 rounded-md bg-panel/20 cursor-pointer hover:bg-zinc-800/20 transition-colors">
 						<input
 							type="checkbox"
@@ -2081,7 +2060,6 @@ function ProjectDetailRouteComponent() {
 		toPipelineAutoAdvanceForm(undefined),
 	);
 	const [verifyPlan, setVerifyPlan] = useState(() => toVerifyPlanForm(undefined));
-	const [autoMerge, setAutoMerge] = useState(false);
 	const [skipRespondToReviewOnMinors, setSkipRespondToReviewOnMinors] = useState(true);
 	const [reviewChecksPolicy, setReviewChecksPolicy] = useState<ReviewChecksPolicy>(() =>
 		toReviewChecksPolicyForm(undefined),
@@ -2151,7 +2129,6 @@ function ProjectDetailRouteComponent() {
 			setPipelineEnabled(toPipelineEnabledForm(project.pipeline));
 			setPipelineAutoAdvance(toPipelineAutoAdvanceForm(project.pipeline));
 			setVerifyPlan(toVerifyPlanForm(project.pipeline));
-			setAutoMerge(project.pipeline?.respondToReview?.autoMerge ?? false);
 			setSkipRespondToReviewOnMinors(project.pipeline?.respondToReview?.skipOnMinors ?? true);
 			setReviewChecksPolicy(toReviewChecksPolicyForm(project.pipeline));
 		}
@@ -2283,10 +2260,9 @@ function ProjectDetailRouteComponent() {
 
 	const isPipelineDirty = useMemo(
 		() =>
-			autoMerge !== (project?.pipeline?.respondToReview?.autoMerge ?? false) ||
 			skipRespondToReviewOnMinors !== (project?.pipeline?.respondToReview?.skipOnMinors ?? true) ||
 			isReviewChecksPolicyDirty(reviewChecksPolicy, project?.pipeline),
-		[project, autoMerge, skipRespondToReviewOnMinors, reviewChecksPolicy],
+		[project, skipRespondToReviewOnMinors, reviewChecksPolicy],
 	);
 
 	const isBoardMappingFormDirty = useMemo(
@@ -2392,16 +2368,12 @@ function ProjectDetailRouteComponent() {
 			id: projectId,
 			pipeline: {
 				review: { checks: reviewChecksPolicy },
-				respondToReview: {
-					autoMerge,
-					skipOnMinors: skipRespondToReviewOnMinors,
-				},
+				respondToReview: { skipOnMinors: skipRespondToReviewOnMinors },
 			},
 		});
 	};
 
 	const handlePipelineReset = () => {
-		setAutoMerge(project?.pipeline?.respondToReview?.autoMerge ?? false);
 		setSkipRespondToReviewOnMinors(project?.pipeline?.respondToReview?.skipOnMinors ?? true);
 		setReviewChecksPolicy(toReviewChecksPolicyForm(project?.pipeline));
 		updateMutation.reset();
@@ -2683,11 +2655,6 @@ function ProjectDetailRouteComponent() {
 
 				{activeTab === 'pipeline' && (
 					<PipelineSettingsForm
-						autoMerge={autoMerge}
-						setAutoMerge={(value) => {
-							setAutoMerge(value);
-							updateMutation.reset();
-						}}
 						skipRespondToReviewOnMinors={skipRespondToReviewOnMinors}
 						setSkipRespondToReviewOnMinors={(value) => {
 							setSkipRespondToReviewOnMinors(value);

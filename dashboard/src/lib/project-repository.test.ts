@@ -53,8 +53,14 @@ describe('toRepositoryForms', () => {
 				{ repo: 'acme/second', baseBranch: 'trunk', branchPrefix: 'work-' },
 			]),
 		).toEqual([
-			{ id: '1', repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-' },
-			{ id: '2', repo: 'acme/second', baseBranch: 'trunk', branchPrefix: 'work-' },
+			{ id: '1', repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-', autoMerge: false },
+			{
+				id: '2',
+				repo: 'acme/second',
+				baseBranch: 'trunk',
+				branchPrefix: 'work-',
+				autoMerge: false,
+			},
 		]);
 	});
 
@@ -63,14 +69,20 @@ describe('toRepositoryForms', () => {
 	// screen cannot show — the same thing the server does with it on parse.
 	it('ignores a stored per-repository scm', () => {
 		expect(toRepositoryForms(PRE_727_ENTRIES)).toEqual([
-			{ id: '1', repo: 'acme/first', baseBranch: '', branchPrefix: '' },
+			{ id: '1', repo: 'acme/first', baseBranch: '', branchPrefix: '', autoMerge: false },
 		]);
 	});
 
 	// The schema requires at least one entry, so an editor showing none would offer
 	// nothing to fix.
 	it('yields one blank row for an absent or empty list', () => {
-		const blank = { id: '1', repo: '', baseBranch: 'main', branchPrefix: 'issue-' };
+		const blank = {
+			id: '1',
+			repo: '',
+			baseBranch: 'main',
+			branchPrefix: 'issue-',
+			autoMerge: false,
+		};
 		expect(toRepositoryForms(undefined)).toEqual([blank]);
 		expect(toRepositoryForms([])).toEqual([blank]);
 	});
@@ -80,13 +92,35 @@ describe('toRepositoryEntries', () => {
 	it('sends every row, in order', () => {
 		expect(
 			toRepositoryEntries([
-				{ id: '1', repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-' },
-				{ id: '2', repo: 'acme/second', baseBranch: 'trunk', branchPrefix: 'work-' },
+				{
+					id: '1',
+					repo: 'acme/first',
+					baseBranch: 'main',
+					branchPrefix: 'issue-',
+					autoMerge: false,
+				},
+				{
+					id: '2',
+					repo: 'acme/second',
+					baseBranch: 'trunk',
+					branchPrefix: 'work-',
+					autoMerge: false,
+				},
 			]),
 		).toEqual([
-			{ repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-' },
-			{ repo: 'acme/second', baseBranch: 'trunk', branchPrefix: 'work-' },
+			{ repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-', autoMerge: false },
+			{ repo: 'acme/second', baseBranch: 'trunk', branchPrefix: 'work-', autoMerge: false },
 		]);
+	});
+
+	// Issue #1066: each row carries its own merge automation, written explicitly.
+	it('sends each row’s own merge automation', () => {
+		const rows = toRepositoryForms([
+			{ repo: 'acme/first', autoMerge: true },
+			{ repo: 'acme/second' },
+		]);
+		expect(rows.map((row) => row.autoMerge)).toEqual([true, false]);
+		expect(toRepositoryEntries(rows).map((entry) => entry.autoMerge)).toEqual([true, false]);
 	});
 
 	// A save states no provider per repository (issue #727), so a stored one is dropped
@@ -99,7 +133,7 @@ describe('toRepositoryEntries', () => {
 	// The form-only React key is not part of the config.
 	it('does not send the row id', () => {
 		const [entry] = toRepositoryEntries([
-			{ id: '7', repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-' },
+			{ id: '7', repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-', autoMerge: false },
 		]);
 		expect(entry && 'id' in entry).toBe(false);
 	});
@@ -123,23 +157,24 @@ describe('toRepositoryEntries', () => {
 				repo: 'acme/second',
 				baseBranch: 'main',
 				branchPrefix: 'issue-',
+				autoMerge: false,
 				pmRoutingToken: 'component-2',
 			},
-			{ repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-' },
+			{ repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-', autoMerge: false },
 		]);
 	});
 });
 
 describe('repository list mutations', () => {
 	const rows: RepositoryForm[] = [
-		{ id: '1', repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-' },
-		{ id: '2', repo: 'acme/second', baseBranch: 'trunk', branchPrefix: 'work-' },
+		{ id: '1', repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-', autoMerge: false },
+		{ id: '2', repo: 'acme/second', baseBranch: 'trunk', branchPrefix: 'work-', autoMerge: false },
 	];
 
 	it('appends a blank row on the project defaults, with an unused id', () => {
 		expect(addRepository(rows)).toEqual([
 			...rows,
-			{ id: '3', repo: '', baseBranch: 'main', branchPrefix: 'issue-' },
+			{ id: '3', repo: '', baseBranch: 'main', branchPrefix: 'issue-', autoMerge: false },
 		]);
 	});
 
@@ -180,7 +215,7 @@ describe('repository list mutations', () => {
 // check has no server-side twin — it is why Save is blocked client-side.
 describe('duplicateRepositories', () => {
 	function row(repo: string): RepositoryForm {
-		return { id: repo, repo, baseBranch: 'main', branchPrefix: 'issue-' };
+		return { id: repo, repo, baseBranch: 'main', branchPrefix: 'issue-', autoMerge: false };
 	}
 
 	it('names each repository more than one row claims', () => {
@@ -213,6 +248,15 @@ describe('areRepositoriesDirty', () => {
 		).toBe(true);
 		expect(areRepositoriesDirty(addRepository(toRepositoryForms(stored)), stored)).toBe(true);
 		expect(areRepositoriesDirty(removeRepository(toRepositoryForms(stored), 1), stored)).toBe(true);
+	});
+
+	it('reports a merge automation toggle that changes nothing else', () => {
+		expect(
+			areRepositoriesDirty(
+				patchRepository(toRepositoryForms(stored), 1, { autoMerge: true }),
+				stored,
+			),
+		).toBe(true);
 	});
 
 	// Position is part of the value: the first entry is the project's default.

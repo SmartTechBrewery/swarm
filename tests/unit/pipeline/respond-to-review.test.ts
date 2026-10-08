@@ -373,7 +373,7 @@ describe('runRespondToReviewPhase', () => {
 		])('never surfaces mergeOutcome for a %s outcome, even when the setting is on', async (outcome) => {
 			const deps = makeDeps();
 			deps.project = createMockProjectConfig({
-				pipeline: { respondToReview: { autoMerge: true } },
+				autoMerge: true,
 			});
 			writeHandoff(deps.path, nonFixedHandoff(outcome));
 

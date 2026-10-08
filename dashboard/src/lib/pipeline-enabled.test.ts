@@ -41,7 +41,7 @@ describe('auto-advance form mapping', () => {
 		const existing: PipelineConfig = {
 			planning: { autoAdvance: true, autoSplit: false },
 			review: { enabled: false },
-			respondToReview: { enabled: false, autoMerge: true, skipOnMinors: false },
+			respondToReview: { enabled: false, skipOnMinors: false },
 			respondToCi: { enabled: false },
 		};
 		expect(buildPipelineAutoAdvanceUpdate({ planning: false }, existing)).toEqual({
@@ -54,7 +54,7 @@ describe('auto-advance form mapping', () => {
 		const existing: PipelineConfig = {
 			planning: { autoSplit: false },
 			review: {},
-			respondToReview: { autoMerge: true, skipOnMinors: false },
+			respondToReview: { skipOnMinors: false },
 			respondToCi: {},
 		};
 		const enabled = buildPipelineEnabledUpdate(
@@ -65,7 +65,7 @@ describe('auto-advance form mapping', () => {
 		expect(buildPipelineAutoAdvanceUpdate({ planning: true }, enabled)).toEqual({
 			planning: { autoAdvance: true, autoSplit: false },
 			review: { enabled: false },
-			respondToReview: { enabled: false, autoMerge: true, skipOnMinors: false },
+			respondToReview: { enabled: false, skipOnMinors: false },
 			respondToCi: { enabled: false },
 		});
 	});
@@ -92,7 +92,7 @@ describe('verify-plan form mapping', () => {
 		const existing: PipelineConfig = {
 			planning: { autoAdvance: true, autoSplit: false, maxConcerns: 3 },
 			review: { enabled: false },
-			respondToReview: { enabled: false, autoMerge: true, skipOnMinors: false },
+			respondToReview: { enabled: false, skipOnMinors: false },
 			respondToCi: { enabled: false },
 		};
 		expect(buildVerifyPlanUpdate(true, existing)).toEqual({
@@ -116,7 +116,7 @@ describe('toPipelineEnabledForm', () => {
 	});
 
 	it('treats an unset enabled flag as enabled', () => {
-		const pipeline: PipelineConfig = { review: {}, respondToReview: { autoMerge: true } };
+		const pipeline: PipelineConfig = { review: {}, respondToReview: { skipOnMinors: true } };
 		expect(toPipelineEnabledForm(pipeline)).toEqual({
 			review: true,
 			respondToReview: true,
@@ -201,14 +201,13 @@ describe('buildPipelineEnabledUpdate', () => {
 	it('preserves existing pipeline fields the screen does not edit', () => {
 		const existing: PipelineConfig = {
 			planning: { autoAdvance: true, autoSplit: false },
-			respondToReview: { autoMerge: true, skipOnMinors: false },
+			respondToReview: { skipOnMinors: false },
 		};
 		const result = buildPipelineEnabledUpdate(
 			{ review: true, respondToReview: true, respondToCi: true },
 			existing,
 		);
 		expect(result.planning).toEqual({ autoAdvance: true, autoSplit: false });
-		expect(result.respondToReview?.autoMerge).toBe(true);
 		expect(result.respondToReview?.skipOnMinors).toBe(false);
 		expect(result.respondToReview?.enabled).toBe(true);
 	});
@@ -216,12 +215,12 @@ describe('buildPipelineEnabledUpdate', () => {
 	it('forces respond-to-review off when review is off (satisfies the server refinement)', () => {
 		const result = buildPipelineEnabledUpdate(
 			{ review: false, respondToReview: true, respondToCi: true },
-			{ respondToReview: { autoMerge: true } },
+			{ respondToReview: { skipOnMinors: true } },
 		);
 		expect(result.review?.enabled).toBe(false);
 		expect(result.respondToReview?.enabled).toBe(false);
 		// The unrelated field still survives.
-		expect(result.respondToReview?.autoMerge).toBe(true);
+		expect(result.respondToReview?.skipOnMinors).toBe(true);
 	});
 });
 
@@ -242,11 +241,11 @@ describe('buildPipelineToggleUpdate', () => {
 
 	it('preserves every stored pipeline field the Agents-tab toggles do not own', () => {
 		// The scoped toggle save must not drop Pipeline-tab settings (issue #369): a
-		// project's autoMerge/skipOnMinors and Review check policy have to survive.
+		// project's skipOnMinors and Review check policy have to survive.
 		const existing: PipelineConfig = {
 			planning: { autoAdvance: false, autoSplit: true },
 			review: { checks: 'if-present' },
-			respondToReview: { autoMerge: true, skipOnMinors: false },
+			respondToReview: { skipOnMinors: false },
 		};
 		const result = buildPipelineToggleUpdate(
 			{ review: true, respondToReview: true, respondToCi: true },
@@ -257,7 +256,6 @@ describe('buildPipelineToggleUpdate', () => {
 		expect(result.planning).toEqual({ autoAdvance: true, autoSplit: true, verifyPlan: false });
 		expect(result.review?.checks).toBe('if-present');
 		expect(result.review?.enabled).toBe(true);
-		expect(result.respondToReview?.autoMerge).toBe(true);
 		expect(result.respondToReview?.skipOnMinors).toBe(false);
 	});
 
@@ -369,7 +367,7 @@ describe('buildReviewChecksPolicyUpdate', () => {
 		const existing: PipelineConfig = {
 			planning: { autoAdvance: true },
 			review: { enabled: false },
-			respondToReview: { enabled: false, autoMerge: true, skipOnMinors: false },
+			respondToReview: { enabled: false, skipOnMinors: false },
 			respondToCi: { enabled: true },
 		};
 		expect(buildReviewChecksPolicyUpdate('if-present', existing)).toEqual({

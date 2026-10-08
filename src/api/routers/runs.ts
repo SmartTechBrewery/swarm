@@ -1,7 +1,8 @@
 import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 
-import type { ProjectConfig } from '../../config/schema.js';
+import { scopeProjectToRepository } from '../../config/project-repository.js';
+import type { ProjectConfig, ProjectRecord } from '../../config/schema.js';
 import {
 	type DispatchRow,
 	getActiveDispatchByRunId,
@@ -14,7 +15,9 @@ import {
 	WAITING_DISPATCH_STATES,
 } from '../../db/repositories/dispatchesRepository.js';
 import {
+	findProjectRecordByIdFromDb,
 	getProjectByIdFromDb,
+	listAllProjectRecordsFromDb,
 	listAllProjectsFromDb,
 } from '../../db/repositories/projectsRepository.js';
 import {
@@ -1034,15 +1037,19 @@ function resolveReviewCapOverrideOutstanding(
  * The two project policies the liveness classification consults, read exactly as
  * the pipeline itself reads them (issue #840): Planning's `autoAdvance` is off
  * unless set (`DEFAULT_AUTO_ADVANCE`, `src/pipeline/planning.ts`) and merge
- * automation is opt-in (`src/worker/consumer.ts`). A project that no longer
- * resolves gets those same defaults rather than an exception — a stalled-work view
- * that throws because one project row went missing is worse than one that reports
- * that project under the pipeline's own defaults.
+ * automation is opt-in per repository (`src/worker/consumer.ts`, issue #1066) —
+ * which is why this reads the whole **record**, not a config scoped to one of its
+ * repositories. A project that no longer resolves gets those same defaults rather
+ * than an exception — a stalled-work view that throws because one project row went
+ * missing is worse than one that reports that project under the pipeline's own
+ * defaults.
  */
-function itemLivenessPolicyFor(project: ProjectConfig | undefined): ItemLivenessPolicy {
+function itemLivenessPolicyFor(record: ProjectRecord | undefined): ItemLivenessPolicy {
 	return {
-		planningAutoAdvance: project?.pipeline?.planning?.autoAdvance === true,
-		autoMerge: project?.pipeline?.respondToReview?.autoMerge === true,
+		planningAutoAdvance: record?.pipeline?.planning?.autoAdvance === true,
+		autoMergeRepositories:
+			record?.repositories.filter((entry) => entry.autoMerge === true).map((entry) => entry.repo) ??
+			[],
 	};
 }
 
@@ -1207,7 +1214,7 @@ export const runsRouter = router({
 			const since = new Date(Date.now() - ITEM_ACTIVITY_LOOKBACK_MS);
 			if (input?.projectId) {
 				await assertProjectAccess(ctx.user, input.projectId, 'contributor');
-				const project = await getProjectByIdFromDb(input.projectId);
+				const record = await findProjectRecordByIdFromDb(input.projectId);
 				const projectIds = [input.projectId];
 				const [activity, activeDispatches, dismissals] = await Promise.all([
 					listTaskActivitySince({ since, projectIds }),
@@ -1218,25 +1225,25 @@ export const runsRouter = router({
 					toStalledItems(
 						activity,
 						activeDispatches,
-						{ [input.projectId]: itemLivenessPolicyFor(project) },
+						{ [input.projectId]: itemLivenessPolicyFor(record) },
 						toLivenessDismissals(dismissals),
 					),
-					new Map(project ? [[project.id, project]] : []),
+					new Map(record ? [[record.id, scopeProjectToRepository(record)]] : []),
 				);
 			}
 			assertInstanceAdmin(ctx.user, 'stalled work');
-			const [activity, activeDispatches, projects, dismissals] = await Promise.all([
+			const [activity, activeDispatches, records, dismissals] = await Promise.all([
 				listTaskActivitySince({ since }),
 				listActiveDispatchTaskRefs(),
-				listAllProjectsFromDb(),
+				listAllProjectRecordsFromDb(),
 				listStalledDismissals({ since }),
 			]);
 			const policies = Object.fromEntries(
-				projects.map((project) => [project.id, itemLivenessPolicyFor(project)]),
+				records.map((record) => [record.id, itemLivenessPolicyFor(record)]),
 			);
 			return withPullRequestUrls(
 				toStalledItems(activity, activeDispatches, policies, toLivenessDismissals(dismissals)),
-				new Map(projects.map((project) => [project.id, project])),
+				new Map(records.map((record) => [record.id, scopeProjectToRepository(record)])),
 			);
 		}),
 

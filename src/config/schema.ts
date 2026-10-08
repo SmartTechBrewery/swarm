@@ -40,6 +40,7 @@ import { ScmProviderIdSchema } from '../scm/events.js';
 // The value list behind `ScmType` — `../scm/types.js` imports nothing at runtime.
 import { SCM_TYPES } from '../scm/types.js';
 import { CUSTOM_PROMPT_MAX_LENGTH, normalizeCustomPrompt } from './custom-prompt.js';
+import { adoptLegacyAutoMerge } from './legacy-auto-merge.js';
 import {
 	adoptLegacyPmCredentials,
 	PmCredentialReferencesByProviderSchema,
@@ -511,7 +512,6 @@ export const PipelineBaseSchema = z.object({
 	respondToReview: z
 		.object({
 			enabled: z.boolean().optional(),
-			autoMerge: z.boolean().optional(),
 			/** Skip approval/comment reviews so only requested changes consume a response run. */
 			skipOnMinors: z.boolean().optional(),
 		})
@@ -646,7 +646,8 @@ export const ProjectPmSchema = z.discriminatedUnion('type', [
 /**
  * One repository a project owns, with the settings that are genuinely
  * per-repository (issue #684 phase 1): the coordinates themselves, the branch
- * worktrees are cut from, and the task-branch prefix.
+ * worktrees are cut from, the task-branch prefix, and — since issue #1066 — whether
+ * SWARM merges an approved pull request on its own.
  *
  * These fields used to sit at the top level of a project, where they were
  * indistinguishable from the genuinely shared settings beside them. They are the
@@ -707,6 +708,18 @@ export const ProjectRepositorySchema = z.object({
 
 	/** Prefix for task branch names — SWARM's convention is `issue-<n>-<slug>`. */
 	branchPrefix: z.string().default(PROJECT_DEFAULTS.branchPrefix),
+
+	/**
+	 * Merge automation for **this** repository: once a SWARM Review approves a pull
+	 * request here, SWARM persists a durable merge dispatch (issue #292) and merges it
+	 * directly with the implementer credential. Opt-in — unset means off.
+	 *
+	 * Per repository since issue #1066, because branch protection, release process and
+	 * trust in unattended merges differ between a project's repositories. The pre-#1066
+	 * project-wide `pipeline.respondToReview.autoMerge` is adopted onto every entry on
+	 * parse rather than stripped (`adoptLegacyAutoMerge`, `./legacy-auto-merge.ts`).
+	 */
+	autoMerge: z.boolean().optional(),
 });
 
 /**
@@ -1115,9 +1128,14 @@ export const ProjectConfigSchema = z
  * reads a repository, plus the one check only a record can make: repository routing
  * tokens are unique within the project. This is what `validateConfig` /
  * `swarm config apply` parse and what the `projects` table persists.
+ *
+ * It also adopts the one legacy key only a record can place: the pre-#1066
+ * project-wide `pipeline.respondToReview.autoMerge`, copied onto every
+ * `repositories[]` entry that states none (`./legacy-auto-merge.ts`). The scoped
+ * {@link ProjectConfigSchema} does not, since no operator-authored surface parses one.
  */
 export const ProjectRecordSchema = z
-	.preprocess(adoptLegacyPmCredentials, ProjectRecordBaseSchema)
+	.preprocess((raw) => adoptLegacyAutoMerge(adoptLegacyPmCredentials(raw)), ProjectRecordBaseSchema)
 	.transform(adoptLegacyScmCredentials)
 	.superRefine(validatePmCredentialRoles)
 	.superRefine(validateScmCredentialReferences)

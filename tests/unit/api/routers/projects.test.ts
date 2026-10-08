@@ -795,20 +795,28 @@ describe('projectsRouter', () => {
 			});
 		});
 
-		it('saves the opt-in auto merge setting', async () => {
+		// Issue #1066: merge automation is per repository, saved with the list it lives on.
+		it('saves the opt-in merge automation setting per repository', async () => {
 			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
 			vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
 
 			const result = await caller.update({
 				id: 'p1',
-				pipeline: { respondToReview: { autoMerge: true } },
+				repositories: [
+					{ repo: 'jkwiecien/original', autoMerge: true },
+					{ repo: 'jkwiecien/other', autoMerge: false },
+				],
 			});
 
-			expect(result.pipeline?.respondToReview?.autoMerge).toBe(true);
-			expect(upsertProjectToDb).toHaveBeenCalledWith({
-				...existing,
-				pipeline: { respondToReview: { autoMerge: true } },
-			});
+			expect(result.repositories.map((entry) => entry.autoMerge)).toEqual([true, false]);
+			expect(upsertProjectToDb).toHaveBeenCalledWith(
+				expect.objectContaining({
+					repositories: [
+						expect.objectContaining({ repo: 'jkwiecien/original', autoMerge: true }),
+						expect.objectContaining({ repo: 'jkwiecien/other', autoMerge: false }),
+					],
+				}),
+			);
 		});
 
 		it('saves the default-on skip-minors review-response setting', async () => {
@@ -831,7 +839,7 @@ describe('projectsRouter', () => {
 				pipeline: {
 					planning: { autoAdvance: true },
 					review: { enabled: true },
-					respondToReview: { autoMerge: true, skipOnMinors: false },
+					respondToReview: { enabled: true, skipOnMinors: false },
 				},
 			});
 			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(withPipeline);
@@ -849,7 +857,7 @@ describe('projectsRouter', () => {
 			// Unrelated pipeline fields, including the rest of `review`, survive the update.
 			expect(result.pipeline?.review?.enabled).toBe(true);
 			expect(result.pipeline?.planning?.autoAdvance).toBe(true);
-			expect(result.pipeline?.respondToReview).toEqual({ autoMerge: true, skipOnMinors: false });
+			expect(result.pipeline?.respondToReview).toEqual({ enabled: true, skipOnMinors: false });
 		});
 
 		it('merges a nested pipeline patch with the existing pipeline configuration', async () => {
@@ -858,7 +866,7 @@ describe('projectsRouter', () => {
 				pipeline: {
 					planning: { autoAdvance: true },
 					review: { enabled: false },
-					respondToReview: { enabled: false, autoMerge: true, skipOnMinors: false },
+					respondToReview: { enabled: false, skipOnMinors: false },
 				},
 			});
 			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(withPipeline);
@@ -869,10 +877,7 @@ describe('projectsRouter', () => {
 				id: 'p1',
 				pipeline: {
 					review: { checks: 'if-present' },
-					respondToReview: {
-						autoMerge: false,
-						skipOnMinors: true,
-					},
+					respondToReview: { skipOnMinors: true },
 				},
 			});
 
@@ -881,7 +886,6 @@ describe('projectsRouter', () => {
 			expect(result.pipeline?.review?.enabled).toBe(false);
 			expect(result.pipeline?.planning?.autoAdvance).toBe(true);
 			expect(result.pipeline?.respondToReview?.enabled).toBe(false);
-			expect(result.pipeline?.respondToReview?.autoMerge).toBe(false);
 			expect(result.pipeline?.respondToReview?.skipOnMinors).toBe(true);
 		});
 
