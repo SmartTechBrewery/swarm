@@ -675,18 +675,22 @@ export const SUPPORTED_DB_FREE_PHASES: ReadonlySet<TaskPhase> = new Set<TaskPhas
  * what a comment event means (`SCMProvider.personaForActor`, `../scm/types.ts`)
  * would read the wrong persona off it. The composite states `persona: 'reviewer'`
  * explicitly, so the frame carries the identity this Review write runs under
- * rather than leaving the server to infer one (issue #444).
+ * rather than leaving the server to infer one (issue #444). It names the run's
+ * repository too — `project` is already scoped to it by the dispatcher (issue
+ * #699) — so the verdict lands on that repository's PR rather than the project's
+ * default entry's (issue #1055).
  */
 function resolveDbFreeDelivery(
 	phase: TaskPhase,
 	operator: ScmDeliveryProvider,
 	transport: DeliveryClientOptions,
-	projectId: string,
+	project: ProjectConfig,
 ): ScmDeliveryProvider {
 	if (phase !== 'review') return operator;
 	return createTransportScmDeliveryProvider({
 		...transport,
-		projectId,
+		projectId: project.id,
+		repository: project.repo,
 		persona: 'reviewer',
 		localDelegate: operator,
 	});
@@ -1157,7 +1161,7 @@ export async function runAssignmentDbFree(
 			project,
 			signal: controller.signal,
 			sink,
-			delivery: resolveDbFreeDelivery(phase, operatorDelivery, transport, project.id),
+			delivery: resolveDbFreeDelivery(phase, operatorDelivery, transport, project),
 			pm: resolveDbFreePm(phase, project, transport),
 			reviewLedger: resolveDbFreeReviewLedger(phase, project.id, transport),
 			scheduleFollowUpReview: resolveDbFreeFollowUpReview(phase, project.id, transport),

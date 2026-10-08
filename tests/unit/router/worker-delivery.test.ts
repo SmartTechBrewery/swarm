@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { ProjectConfig } from '@/config/schema.js';
+import type { ProjectRecord } from '@/config/schema.js';
 import type { CliQuotaSnapshot } from '@/harness/quota.js';
 import { DEFAULT_WORKER_SUPPORTED_PHASES, type Worker } from '@/identity/worker.js';
 import type { ReviewVerdictLedger } from '@/pipeline/review-ledger.js';
@@ -30,7 +30,12 @@ import {
 } from '@/router/worker-delivery.js';
 import type { ScmDeliveryProvider } from '@/scm/delivery.js';
 import { TRANSPORT_PROTOCOL_VERSION } from '@/transport/protocol.js';
-import { createMockProjectConfig, createMockWorkItem } from '../../helpers/factories.js';
+import {
+	createMockProjectConfig,
+	createMockProjectRecord,
+	createMockWorkItem,
+	toProjectRecord,
+} from '../../helpers/factories.js';
 
 const WORKER_ID = '11111111-1111-4111-8111-111111111111';
 const OWNER_ID = '22222222-2222-4222-8222-222222222222';
@@ -115,12 +120,12 @@ function makeReviewLedger(overrides: Partial<ReviewVerdictLedger> = {}): ReviewV
 }
 
 function makeDeps(overrides: Partial<WorkerDeliveryDeps> = {}): WorkerDeliveryDeps {
-	const project = createMockProjectConfig();
+	const record = toProjectRecord(createMockProjectConfig());
 	return {
 		resolveWorkerByCredential: vi.fn().mockResolvedValue(makeWorker()),
-		findProjectById: vi.fn(
-			async (id: string): Promise<ProjectConfig | undefined> =>
-				id === project.id ? project : undefined,
+		findProjectRecordById: vi.fn(
+			async (id: string): Promise<ProjectRecord | undefined> =>
+				id === record.id ? record : undefined,
 		),
 		isWorkerEnrolled: vi.fn().mockResolvedValue(true),
 		buildScmDelivery: vi.fn().mockResolvedValue(makeDelivery()),
@@ -1873,5 +1878,222 @@ describe('handleReportWorktreeSweep', () => {
 		);
 
 		expect(deps.advanceWorkerRollout).not.toHaveBeenCalled();
+	});
+});
+
+// Issue #1055 — the run-scoped routes act on the repository the run is for, never the
+// project's default (first) entry: a verdict there lands on another repository's PR
+// sharing the number, and the ledger keys a row the control plane never reserved.
+describe("run-scoped routes act on the run's repository (issue #1055)", () => {
+	beforeEach(() => vi.clearAllMocks());
+
+	const DEFAULT_REPO = 'SmartTechBrewery/swarm';
+	const MOBILE_REPO = 'SmartTechBrewery/swarm-mobile';
+
+	/** Deps whose project `swarm` owns two repositories, the default one first. */
+	function twoRepoDeps(overrides: Partial<WorkerDeliveryDeps> = {}): WorkerDeliveryDeps {
+		const record = createMockProjectRecord({
+			repositories: [{ repo: DEFAULT_REPO }, { repo: MOBILE_REPO }],
+		});
+		return makeDeps({
+			findProjectRecordById: vi.fn(async (id: string) => (id === record.id ? record : undefined)),
+			...overrides,
+		});
+	}
+
+	const followUpBody = (overrides: Record<string, unknown> = {}) => ({
+		projectId: 'swarm',
+		prNumber: '42',
+		prBranch: 'issue-21',
+		headSha: 'newsha',
+		protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		...overrides,
+	});
+	const abandonBody = (overrides: Record<string, unknown> = {}) =>
+		priorReviewBody({ headSha: 'deadbeef', currentHeadSha: undefined, ...overrides });
+
+	/** Every run-scoped route, with the body it accepts. */
+	const RUN_ROUTES = [
+		['review', handleSubmitReview, reviewBody],
+		['pr-comment', handlePostComment, commentBody],
+		['follow-up-review', handleScheduleFollowUpReview, followUpBody],
+		['review-ledger/prior', handlePriorReview, priorReviewBody],
+		['review-ledger/mark', handleMarkReviewVerdict, markLedgerBody],
+		['review-ledger/abandon', handleAbandonReviewVerdict, abandonBody],
+	] as const;
+
+	/** Whether any server-side action — an SCM write, a ledger op, an enqueue — ran. */
+	function actedOn(deps: WorkerDeliveryDeps): boolean {
+		return [
+			deps.buildScmDelivery,
+			deps.scheduleFollowUpReview,
+			deps.reviewLedger.getPriorSubmittedReview,
+			deps.reviewLedger.markReviewVerdictSubmitted,
+			deps.reviewLedger.abandonReviewVerdict,
+		].some((fn) => vi.mocked(fn).mock.calls.length > 0);
+	}
+
+	it('submits the review against the run’s repository under the reviewer persona', async () => {
+		const deps = twoRepoDeps();
+
+		const result = await handleSubmitReview(
+			deps,
+			CREDENTIAL,
+			reviewBody({ repository: MOBILE_REPO }),
+		);
+
+		expect(result.status).toBe(200);
+		expect(deps.buildScmDelivery).toHaveBeenCalledWith(
+			expect.objectContaining({ id: 'swarm', repo: MOBILE_REPO }),
+			'reviewer',
+		);
+	});
+
+	it.each([
+		'reviewer',
+		'implementer',
+	] as const)('posts a %s PR comment against the run’s repository', async (persona) => {
+		const deps = twoRepoDeps();
+
+		const result = await handlePostComment(
+			deps,
+			CREDENTIAL,
+			commentBody({ repository: MOBILE_REPO, persona }),
+		);
+
+		expect(result.status).toBe(200);
+		expect(deps.buildScmDelivery).toHaveBeenCalledWith(
+			expect.objectContaining({ id: 'swarm', repo: MOBILE_REPO }),
+			persona,
+		);
+	});
+
+	it('schedules the follow-up Review for the run’s repository', async () => {
+		const deps = twoRepoDeps();
+
+		const result = await handleScheduleFollowUpReview(
+			deps,
+			CREDENTIAL,
+			followUpBody({ repository: MOBILE_REPO }),
+		);
+
+		expect(result.status).toBe(200);
+		expect(deps.scheduleFollowUpReview).toHaveBeenCalledWith(
+			expect.objectContaining({
+				project: expect.objectContaining({ id: 'swarm', repo: MOBILE_REPO }),
+			}),
+		);
+	});
+
+	it('keys every ledger round trip on the run’s repository', async () => {
+		const deps = twoRepoDeps();
+		const key = { projectId: 'swarm', repository: MOBILE_REPO, prNumber: '42' };
+
+		const prior = await handlePriorReview(
+			deps,
+			CREDENTIAL,
+			priorReviewBody({ repository: MOBILE_REPO }),
+		);
+		const mark = await handleMarkReviewVerdict(
+			deps,
+			CREDENTIAL,
+			markLedgerBody({ repository: MOBILE_REPO }),
+		);
+		const abandon = await handleAbandonReviewVerdict(
+			deps,
+			CREDENTIAL,
+			abandonBody({ repository: MOBILE_REPO }),
+		);
+
+		expect([prior.status, mark.status, abandon.status]).toEqual([200, 200, 200]);
+		expect(deps.reviewLedger.getPriorSubmittedReview).toHaveBeenCalledWith(
+			'swarm',
+			MOBILE_REPO,
+			'42',
+			'deadbeef',
+		);
+		expect(deps.reviewLedger.markReviewVerdictSubmitted).toHaveBeenCalledWith(
+			{ ...key, headSha: 'deadbeef' },
+			{ verdict: 'request-changes', reviewId: '9911' },
+		);
+		expect(deps.reviewLedger.abandonReviewVerdict).toHaveBeenCalledWith({
+			...key,
+			headSha: 'deadbeef',
+		});
+	});
+
+	it.each(
+		RUN_ROUTES,
+	)('%s refuses a repository the project does not own, naming both', async (_route, handle, body) => {
+		const deps = twoRepoDeps();
+
+		const result = await handle(deps, CREDENTIAL, body({ repository: 'acme/elsewhere' }));
+
+		expect(result.status).toBe(403);
+		expect(result.json.reason).toContain("'swarm'");
+		expect(result.json.reason).toContain("'acme/elsewhere'");
+		expect(actedOn(deps)).toBe(false);
+	});
+
+	it.each(
+		RUN_ROUTES,
+	)('%s refuses an unowned repository on a single-repository project too, never defaulting', async (_route, handle, body) => {
+		const deps = makeDeps();
+
+		const result = await handle(deps, CREDENTIAL, body({ repository: 'acme/elsewhere' }));
+
+		expect(result.status).toBe(403);
+		expect(actedOn(deps)).toBe(false);
+	});
+
+	it.each(
+		RUN_ROUTES,
+	)('%s tells a worker that names no repository on a multi-repository project to upgrade', async (_route, handle, body) => {
+		const deps = twoRepoDeps();
+
+		const result = await handle(deps, CREDENTIAL, body());
+
+		expect(result.status).toBe(400);
+		expect(result.json.reason).toMatch(/upgrade the worker/);
+		expect(actedOn(deps)).toBe(false);
+	});
+
+	it.each(
+		RUN_ROUTES,
+	)('%s keeps acting on the sole repository of a single-repository project when none is named', async (_route, handle, body) => {
+		const deps = makeDeps();
+
+		const result = await handle(deps, CREDENTIAL, body());
+
+		expect(result.status).toBe(200);
+		expect(actedOn(deps)).toBe(true);
+	});
+
+	it('checks enrollment before the repository, so an unenrolled worker learns nothing about it', async () => {
+		const deps = twoRepoDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+
+		const result = await handleSubmitReview(
+			deps,
+			CREDENTIAL,
+			reviewBody({ repository: 'acme/elsewhere' }),
+		);
+
+		expect(result.status).toBe(403);
+		expect(result.json).toEqual({ reason: 'worker is not enrolled in this project' });
+	});
+
+	// Board routes are out of scope: a card is routed to a repository at ingress
+	// (#686) and the PM provider is project-wide, so they keep the default entry and
+	// must not start refusing on a multi-repository project.
+	it('leaves board routes on the default entry of a multi-repository project', async () => {
+		const buildPmProvider = vi.fn(() => makePmProvider());
+		const deps = twoRepoDeps({ buildPmProvider });
+
+		const result = await handleMoveWorkItem(deps, CREDENTIAL, moveBody());
+
+		expect(result.status).toBe(200);
+		expect(buildPmProvider).toHaveBeenCalledWith(
+			expect.objectContaining({ id: 'swarm', repo: DEFAULT_REPO }),
+		);
 	});
 });

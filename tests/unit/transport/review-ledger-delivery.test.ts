@@ -7,9 +7,11 @@ import { createTransportReviewLedger } from '@/transport/review-ledger-delivery.
 const CONTROL_PLANE = 'https://swarm.example';
 const CREDENTIAL = 'raw-worker-credential-secret';
 const PROJECT_ID = 'swarm';
+/** The run's repository — deliberately not the project's default entry (issue #1055). */
+const REPOSITORY = 'SmartTechBrewery/swarm-mobile';
 const KEY = {
 	projectId: PROJECT_ID,
-	repository: 'SmartTechBrewery/swarm',
+	repository: REPOSITORY,
 	prNumber: '42',
 	headSha: 'deadbeef',
 };
@@ -39,7 +41,7 @@ describe('createTransportReviewLedger', () => {
 
 		const prior = await ledger(fetchImpl).getPriorSubmittedReview(
 			PROJECT_ID,
-			'SmartTechBrewery/swarm',
+			REPOSITORY,
 			'42',
 			'deadbeef',
 		);
@@ -48,10 +50,11 @@ describe('createTransportReviewLedger', () => {
 		const [url, init] = fetchImpl.mock.calls[0];
 		expect(url).toBe('https://swarm.example/worker/delivery/review-ledger/prior');
 		expect(init.headers.authorization).toBe(`Bearer ${CREDENTIAL}`);
-		// The repository is deliberately absent: the server derives it from the
-		// authenticated project, so a worker can't key a row to another repo.
+		// The run's repository is sent — the key the control plane reserved the slot
+		// under — and the server accepts it only when the project owns it (#1055).
 		expect(JSON.parse(init.body)).toEqual({
 			projectId: PROJECT_ID,
+			repository: REPOSITORY,
 			prNumber: '42',
 			currentHeadSha: 'deadbeef',
 			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
@@ -85,6 +88,7 @@ describe('createTransportReviewLedger', () => {
 		expect(url).toBe('https://swarm.example/worker/delivery/review-ledger/mark');
 		expect(JSON.parse(init.body)).toEqual({
 			projectId: PROJECT_ID,
+			repository: REPOSITORY,
 			prNumber: '42',
 			headSha: 'deadbeef',
 			verdict: 'request-changes',
@@ -109,6 +113,7 @@ describe('createTransportReviewLedger', () => {
 		expect(url).toBe('https://swarm.example/worker/delivery/review-ledger/abandon');
 		expect(JSON.parse(init.body)).toEqual({
 			projectId: PROJECT_ID,
+			repository: REPOSITORY,
 			prNumber: '42',
 			headSha: 'deadbeef',
 			protocolVersion: TRANSPORT_PROTOCOL_VERSION,

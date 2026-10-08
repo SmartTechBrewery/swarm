@@ -4,18 +4,23 @@ import { REVIEW_AUTOMATION_OUTCOMES, REVIEW_VERDICTS } from '@/pipeline/review.j
 import { PM_STATUS_KEYS } from '@/pm/pipeline.js';
 import { RecoveryModeSchema } from '@/queue/jobs.js';
 import {
+	AbandonReviewLedgerRequestSchema,
 	ControlPlaneMessageSchema,
 	DisconnectSchema,
+	FollowUpReviewDeliveryRequestSchema,
 	HandshakeRequestSchema,
 	HandshakeResponseSchema,
 	HeartbeatAckSchema,
 	HeartbeatSchema,
+	MarkReviewLedgerRequestSchema,
 	PostCommentDeliveryRequestSchema,
+	PriorReviewLedgerRequestSchema,
 	ReportWorkerUpdateDeliveryRequestSchema,
 	ReportWorkerUpdateDeliveryResponseSchema,
 	ReportWorktreeSweepDeliveryRequestSchema,
 	ReportWorktreeSweepDeliveryResponseSchema,
 	StreamLogSchema,
+	SubmitReviewDeliveryRequestSchema,
 	TaskAssignmentAckSchema,
 	TaskAssignmentSchema,
 	TaskCancelSchema,
@@ -869,6 +874,57 @@ describe('transport protocol schemas', () => {
 			expect(
 				PostCommentDeliveryRequestSchema.safeParse({ ...valid, persona: 'operator' }).success,
 			).toBe(false);
+		});
+	});
+
+	// Issue #1055 — the run-scoped frames name the run's repository. Optional so a
+	// worker predating the field still parses and is answered with the server's
+	// legible "upgrade the worker" refusal rather than a schema-level 400.
+	describe.each([
+		[
+			'SubmitReviewDeliveryRequestSchema',
+			SubmitReviewDeliveryRequestSchema,
+			{ prNumber: 42, verdict: 'approve', body: 'LGTM', deliveryId: 'd-1' },
+		],
+		[
+			'PostCommentDeliveryRequestSchema',
+			PostCommentDeliveryRequestSchema,
+			{ prNumber: 42, body: 'Addressed', deliveryId: 'd-2' },
+		],
+		[
+			'FollowUpReviewDeliveryRequestSchema',
+			FollowUpReviewDeliveryRequestSchema,
+			{ prNumber: '42', prBranch: 'issue-1', headSha: 'abc' },
+		],
+		[
+			'PriorReviewLedgerRequestSchema',
+			PriorReviewLedgerRequestSchema,
+			{ prNumber: '42', currentHeadSha: 'abc' },
+		],
+		[
+			'MarkReviewLedgerRequestSchema',
+			MarkReviewLedgerRequestSchema,
+			{ prNumber: '42', headSha: 'abc', verdict: 'approve' },
+		],
+		[
+			'AbandonReviewLedgerRequestSchema',
+			AbandonReviewLedgerRequestSchema,
+			{ prNumber: '42', headSha: 'abc' },
+		],
+	] as const)('%s repository (issue #1055)', (_name, schema, fields) => {
+		const valid = { projectId: 'swarm', ...fields, protocolVersion: TRANSPORT_PROTOCOL_VERSION };
+
+		it('round-trips the run’s repository', () => {
+			const parsed = schema.parse({ ...valid, repository: 'SmartTechBrewery/swarm-mobile' });
+			expect(parsed.repository).toBe('SmartTechBrewery/swarm-mobile');
+		});
+
+		it('still parses a frame that names no repository', () => {
+			expect(schema.parse(valid).repository).toBeUndefined();
+		});
+
+		it('rejects an empty repository', () => {
+			expect(schema.safeParse({ ...valid, repository: '' }).success).toBe(false);
 		});
 	});
 
