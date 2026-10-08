@@ -124,7 +124,9 @@ loopback:
 # .env on the machine running the worker
 SWARM_CONTROL_PLANE_URL=http://localhost:3100      # remote worker: https://<your-tunnel>
 SWARM_WORKER_CREDENTIAL=<from `swarm workers register`>
-SWARM_WORKER_REPO_ROOT=/path/to/this-hosts/checkout  # optional; defaults to cwd
+SWARM_WORKER_REPO_ROOT=/path/to/this-hosts/checkout  # optional; defaults to cwd.
+                                                     # Takes several, `:`-separated like PATH —
+                                                     # one checkout per repository, first is primary.
 ```
 
 Only the first line has to be there before onboarding, and it need not be typed:

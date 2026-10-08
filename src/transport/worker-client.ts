@@ -196,10 +196,16 @@ const UNREACHABLE_STATUSES: ReadonlySet<number> = new Set([
  * transport made on a caller's behalf: a daemon that later narrows its repertoire
  * would silently keep claiming phases it refuses.
  *
- * `repository` is the checkout this daemon holds (issue #687), omitted entirely
- * when the caller could not identify it — the key is left off the body rather than
- * sent as null, so the request a daemon with an unidentifiable checkout sends is
- * byte-identical to the one a daemon predating the field sends.
+ * `repository` is the **primary** checkout this daemon holds (issue #687), omitted
+ * entirely when the caller could not identify it — the key is left off the body
+ * rather than sent as null, so the request a daemon with an unidentifiable checkout
+ * sends is byte-identical to the one a daemon predating the field sends.
+ *
+ * `repositories` is every checkout it holds, primary first (issues #1056, #1058),
+ * and is omitted the same way when empty. A daemon holding one identified checkout
+ * therefore sends both keys naming the same repository, and one holding a single
+ * unidentifiable checkout sends neither — again byte-identical to what it sent
+ * before the field existed.
  *
  * `build` is the SWARM build this daemon runs (issue #918) and is omitted the same
  * way, for the same reason: a daemon whose install root is not a git checkout sends
@@ -218,6 +224,7 @@ export function buildHandshakeRequest(input: {
 	capabilities: AgentCli[];
 	supportedPhases: readonly TaskPhase[];
 	repository?: string;
+	repositories?: readonly string[];
 	build?: WorkerBuild;
 	supervision?: WorkerSupervision;
 	instanceId?: string;
@@ -229,6 +236,7 @@ export function buildHandshakeRequest(input: {
 		capabilities: input.capabilities,
 		supportedPhases: [...input.supportedPhases],
 		...(input.repository ? { repository: input.repository } : {}),
+		...(input.repositories?.length ? { repositories: [...input.repositories] } : {}),
 		...(input.build ? { build: input.build } : {}),
 		...(input.supervision ? { supervision: input.supervision } : {}),
 		...(input.instanceId ? { instanceId: input.instanceId } : {}),
@@ -779,13 +787,22 @@ export interface WorkerTransportOptions {
 	 */
 	supportedPhases: readonly TaskPhase[];
 	/**
-	 * The `owner/repo` this daemon's one local checkout is (issue #687), declared at
-	 * handshake so the control plane knows which repository the machine can actually
-	 * work in — `repoRoot` itself is host-local and never travels. `./connect-entry.ts`
-	 * resolves it once from the checkout's `origin` remote; omitted when the checkout
-	 * cannot be identified, which declares nothing rather than failing.
+	 * The `owner/repo` this daemon's **primary** local checkout is (issue #687),
+	 * declared at handshake so a control plane predating {@link repositories} still
+	 * knows one repository the machine can work in — `repoRoot` itself is host-local
+	 * and never travels. `./connect-entry.ts` resolves it once from the checkout's
+	 * `origin` remote; omitted when the checkout cannot be identified, which declares
+	 * nothing rather than failing.
 	 */
 	repository?: string;
+	/**
+	 * Every repository this daemon holds a checkout of, primary first (issues #1056,
+	 * #1058) — the declaration the control plane routes and enrolls on. A daemon
+	 * given one checkout sends a one-element set naming the same repository as
+	 * {@link repository}; one whose single checkout cannot be identified sends
+	 * neither key.
+	 */
+	repositories?: readonly string[];
 	/**
 	 * The SWARM build this daemon is running (issue #918) — the commit its install
 	 * root is on plus a dirty/unbuilt flag, declared at handshake so the control

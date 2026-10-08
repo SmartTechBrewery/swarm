@@ -121,9 +121,10 @@ export type TaskPhase = z.infer<typeof TaskPhaseSchema>;
  * additive, backward-compatible frame change (see {@link TRANSPORT_PROTOCOL_VERSION},
  * which is reserved for *incompatible* shape changes).
  *
- * `repository` is the `owner/repo` the daemon's **one local checkout** actually is
- * (`SWARM_WORKER_REPO_ROOT`, defaulting to cwd), resolved from that checkout's
- * `origin` remote at startup (issue #687). The control plane otherwise never learns
+ * `repository` is the `owner/repo` the daemon's **primary local checkout** actually
+ * is — the first entry of `SWARM_WORKER_REPO_ROOT`, which since issue #1058 is a
+ * `path.delimiter`-separated list and defaults to cwd — resolved from that
+ * checkout's `origin` remote at startup (issue #687). The control plane otherwise never learns
  * it: `repoRoot` is host-local and never travels, and `hostname` above is
  * diagnostic. It *is* the shared SCM definition (`RepoSlugSchema`,
  * `../scm/repo-slug.js`) rather than a re-declaration — the same move
@@ -139,11 +140,13 @@ export type TaskPhase = z.infer<typeof TaskPhaseSchema>;
  * no identifiable `origin` declares nothing for the same reason, rather than failing
  * to start. It carries **no secret**: a repository slug is public coordinates, not a
  * credential, and like every handshake field it is never reflected in an error body.
- * Nothing is gated on it here — refusing a mismatched assignment, a second daemon on
- * one checkout, and a dishonest enrollment are the follow-on phases of issue #687.
+ * Nothing is gated on it here — refusing an assignment for a repository the worker
+ * holds no checkout of, a second daemon on one checkout, and a dishonest enrollment
+ * are the follow-on phases of issue #687.
  *
  * `repositories` widens that declaration to a **set** (issue #1056): every
- * `owner/repo` the daemon holds a checkout of. The control plane reads the union of
+ * `owner/repo` the daemon holds a checkout of, primary first — which since issue
+ * #1058 is genuinely several, one per `SWARM_WORKER_REPO_ROOT` entry. The control plane reads the union of
  * the two keys — `repository` first, then `repositories` in order, normalised and
  * deduplicated — and persists it as `workers.repositories`, so an older daemon's lone
  * `repository` is a one-element set and a newer one keeps sending its primary
@@ -537,8 +540,10 @@ export type WorktreeSweepProject = z.infer<typeof WorktreeSweepProjectSchema>;
  *
  * **The frame carries no path that could act.** Per project it names an id, the
  * project's relative `worktreeRoot`, and an age in days — the machine's own
- * checkout root supplies the rest, and the mechanism it drives removes only a
- * direct `task-<id>` child of that root (`../worktree/abandoned.ts`). `projects`
+ * checkout roots supply the rest, and the mechanism it drives removes only a
+ * direct `task-<id>` child of one of them (`../worktree/abandoned.ts`). Each
+ * project is swept under **every** root the machine holds, since the frame names no
+ * repository to narrow that by (issue #1058). `projects`
  * is non-empty because a frame naming nothing asks for nothing: a machine with no
  * approved enrollment is logged and left alone rather than pushed an empty one.
  *

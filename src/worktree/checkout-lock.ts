@@ -4,9 +4,10 @@
  * The session lease (`../identity/worker-session.ts`) already allows at most one
  * live session per *registered* worker, so two daemons cannot share one
  * credential. It says nothing about two daemons holding two *different*
- * credentials while pointing at the same `SWARM_WORKER_REPO_ROOT`: both would run
- * `git worktree add` against the same main repository and contend on its
- * `index.lock`. The control plane cannot police that — `repoRoot` is deliberately
+ * credentials while pointing at the same `SWARM_WORKER_REPO_ROOT` entry — the
+ * setting names a *list* of checkouts since issue #1058, and a daemon takes one of
+ * these locks per entry, all or nothing: both would run `git worktree add` against
+ * the same main repository and contend on its `index.lock`. The control plane cannot police that — `repoRoot` is deliberately
  * host-local and never travels, and two checkouts of one repository (on one
  * machine or two) are legitimate capacity — so the resource being protected is the
  * *checkout*, and the guard has to be host-local.

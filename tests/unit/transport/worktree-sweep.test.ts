@@ -85,7 +85,9 @@ interface Harness {
 function harness(overrides: Partial<WorktreeSweepHandlerOptions> = {}): Harness {
 	const sweep = (overrides.sweep ??
 		vi
-			.fn<(entry: WorktreeSweepProject) => Promise<SweepAbandonedWorktreesResult>>()
+			.fn<
+				(entry: WorktreeSweepProject, repoRoot: string) => Promise<SweepAbandonedWorktreesResult>
+			>()
 			.mockResolvedValue(sweptOne())) as ReturnType<typeof vi.fn>;
 	const report = (overrides.report ?? vi.fn().mockResolvedValue({ recorded: true })) as ReturnType<
 		typeof vi.fn
@@ -95,7 +97,7 @@ function harness(overrides: Partial<WorktreeSweepHandlerOptions> = {}): Harness 
 	const shutdownSignal = new AbortController();
 	const logger = silentLogger();
 	const handle = createWorktreeSweepHandler({
-		repoRoot: '/home/ada/swarm',
+		repoRoots: ['/home/ada/swarm'],
 		controlPlaneUrl: 'https://swarm.example',
 		workerCredential: 'worker-credential',
 		shutdownSignal: shutdownSignal.signal,
@@ -135,13 +137,37 @@ describe('createWorktreeSweepHandler — sweeping and reporting', () => {
 		await settle();
 
 		expect(h.sweep).toHaveBeenCalledTimes(2);
-		expect(h.sweep).toHaveBeenNthCalledWith(1, PROJECT);
-		expect(h.sweep).toHaveBeenNthCalledWith(2, OTHER_PROJECT);
+		expect(h.sweep).toHaveBeenNthCalledWith(1, PROJECT, '/home/ada/swarm');
+		expect(h.sweep).toHaveBeenNthCalledWith(2, OTHER_PROJECT, '/home/ada/swarm');
 		expect(h.reports()[0]).toMatchObject({
 			requestId: REQUEST_ID,
 			status: 'swept',
 			removedCount: 2,
 			keptLiveCount: 2,
+			failedCount: 0,
+		});
+	});
+
+	// Issue #1058. A `task-<id>` checkout sits under whichever root ran the assignment,
+	// and the frame names no repository to narrow that by — so every root is swept and
+	// the counts the control plane reads cover all of them, in one report.
+	it('sweeps each project under every checkout root and merges the counts', async () => {
+		const h = harness({ repoRoots: ['/home/ada/swarm', '/home/ada/cascade'] });
+
+		h.handle(frame({ projects: [PROJECT, OTHER_PROJECT] }));
+		await settle();
+
+		expect(h.sweep.mock.calls).toEqual([
+			[PROJECT, '/home/ada/swarm'],
+			[PROJECT, '/home/ada/cascade'],
+			[OTHER_PROJECT, '/home/ada/swarm'],
+			[OTHER_PROJECT, '/home/ada/cascade'],
+		]);
+		expect(h.reports()).toHaveLength(1);
+		expect(h.reports()[0]).toMatchObject({
+			status: 'swept',
+			removedCount: 4,
+			keptLiveCount: 4,
 			failedCount: 0,
 		});
 	});
@@ -187,7 +213,9 @@ describe('createWorktreeSweepHandler — sweeping and reporting', () => {
 describe('createWorktreeSweepHandler — one project never ends the sweep', () => {
 	it('sweeps the rest and counts the failure when one project throws', async () => {
 		const sweep = vi
-			.fn<(entry: WorktreeSweepProject) => Promise<SweepAbandonedWorktreesResult>>()
+			.fn<
+				(entry: WorktreeSweepProject, repoRoot: string) => Promise<SweepAbandonedWorktreesResult>
+			>()
 			.mockRejectedValueOnce(new Error('worktree root is not a git checkout'))
 			.mockResolvedValueOnce(sweptOne());
 		const h = harness({ sweep });
@@ -198,7 +226,11 @@ describe('createWorktreeSweepHandler — one project never ends the sweep', () =
 		expect(sweep).toHaveBeenCalledTimes(2);
 		const report = h.reports()[0];
 		expect(report).toMatchObject({ status: 'failed', failedCount: 1, removedCount: 1 });
-		expect(report.message).toContain('cascade: worktree root is not a git checkout');
+		// The root is named too, since with several checkouts a project id alone no longer
+		// says which tree failed (issue #1058).
+		expect(report.message).toContain(
+			'cascade (/home/ada/swarm): worktree root is not a git checkout',
+		);
 	});
 
 	// A checkout the mechanism could not remove is the same kind of failure as a
@@ -293,7 +325,9 @@ describe('createWorktreeSweepHandler — one sweep at a time', () => {
 	it('holds a second request until the one in flight finishes, then runs it', async () => {
 		let release: (() => void) | undefined;
 		const sweep = vi
-			.fn<(entry: WorktreeSweepProject) => Promise<SweepAbandonedWorktreesResult>>()
+			.fn<
+				(entry: WorktreeSweepProject, repoRoot: string) => Promise<SweepAbandonedWorktreesResult>
+			>()
 			.mockImplementationOnce(
 				() =>
 					new Promise((resolve) => {
