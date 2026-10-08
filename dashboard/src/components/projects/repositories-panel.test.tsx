@@ -44,8 +44,8 @@ describe('RepositoriesPanel', () => {
 		expect(screen.getByLabelText('Add repository')).toBeDefined();
 		expect(screen.getByLabelText('Remove repository 2')).toBeDefined();
 		expect(screen.getByLabelText('Move repository 2 up')).toBeDefined();
-		// The first entry is the project's default, and the panel says so.
-		expect(screen.getByText('Default')).toBeDefined();
+		// No entry is presented as the project's default (issue #1063).
+		expect(screen.queryByText('Default')).toBeNull();
 	});
 
 	// Its own Save, sending `repositories` alone: the Settings tab keeps a separate one for

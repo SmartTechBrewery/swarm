@@ -68,13 +68,18 @@ describe('RepositoryList', () => {
 		expect(screen.getByText(/live on the provider selected above/)).toBeDefined();
 	});
 
-	// Order is meaningful — the first entry is what board-driven work runs against — so the
-	// screen has to say so rather than leaving the ranking decorative.
-	it('marks the first row as the project default and explains what that means', () => {
-		renderList({ repositories: TWO });
+	// Issue #1063: since #713 a board card runs against the repository that claims it, and an
+	// unclaimed card in a multi-repository project is refused — never sent to the first entry.
+	// So no row is badged as a default, and the copy describes no such fallback.
+	it.each([
+		['one repository', [row()]],
+		['several repositories', TWO],
+	])('singles out no row as a default with %s', (_label, repositories) => {
+		renderList({ repositories });
 
-		expect(screen.getByText('Default')).toBeDefined();
-		expect(screen.getByText(/board-driven Planning and Implementation/)).toBeDefined();
+		expect(screen.queryByText('Default')).toBeNull();
+		expect(screen.queryByText(/default/i)).toBeNull();
+		expect(screen.getByText(/refused rather than run against the first/)).toBeDefined();
 	});
 
 	it('reports edits, adds, removes and moves to its handlers', () => {

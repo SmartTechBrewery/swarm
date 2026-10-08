@@ -50,16 +50,9 @@ function RepositoryRow({
 	return (
 		<li className="p-4 border border-zinc-800 rounded-md bg-panel/20 space-y-3">
 			<div className="flex items-center justify-between gap-2">
-				<div className="flex items-center gap-2">
-					<span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
-						Repository {rank}
-					</span>
-					{index === 0 && (
-						<span className="px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-violet-300 bg-violet-950/40 border border-violet-900/40 rounded">
-							Default
-						</span>
-					)}
-				</div>
+				<span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+					Repository {rank}
+				</span>
 				<div className="flex items-center gap-1">
 					<button
 						type="button"
@@ -165,13 +158,16 @@ export interface RepositoryListProps {
  * provider these repositories live on and the credentials it authenticates with, so one
  * screen answers "which provider, authenticated how, operating on what".
  *
- * Order is what the list means: the **first** entry is the project's default, the one
- * work that names no repository of its own runs against — board-driven Planning and
- * Implementation — so the helper text and the "Default" badge say so rather than leaving
- * the ranking to look decorative. What is *not* here is anything shared by the whole
- * project: the board mapping and the PM credentials on Project Management, the provider
- * and its credentials in the cards above. Only the three settings that are genuinely
- * per-repository are here.
+ * No entry is singled out as a default (issue #1063). Since issue #713 a board card runs
+ * against the repository that claims it, and in a multi-repository project an unrouted or
+ * ambiguous card is refused rather than sent to the first entry
+ * (`src/router/webhook-receiver.ts`), so a "Default" badge and copy describing a fallback
+ * made list order look load-bearing for work it does not route. The reorder controls stay:
+ * order is still persisted, and the Projects list still shows the first entry.
+ *
+ * What is *not* here is anything shared by the whole project: the board mapping and the
+ * PM credentials on Project Management, the provider and its credentials in the cards
+ * above. Only the three settings that are genuinely per-repository are here.
  */
 export function RepositoryList({
 	repositories,
@@ -190,10 +186,10 @@ export function RepositoryList({
 				</h2>
 				<p className="text-xs text-zinc-400">
 					Every repository this project operates on, with the branch settings SWARM uses for each.
-					The first is the project's <strong className="font-semibold">default</strong>: work that
-					names no repository of its own — board-driven Planning and Implementation — runs against
-					it, so reorder the list to change which that is. All of them live on the provider selected
-					above, using the credentials configured with it.
+					Each piece of work runs against the repository it belongs to — a board card against the
+					repository that claims it — and none of them is a fallback for the others: with several
+					repositories, a card none of them claims is refused rather than run against the first. All
+					of them live on the provider selected above, using the credentials configured with it.
 				</p>
 			</div>
 

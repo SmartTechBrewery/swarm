@@ -3,7 +3,6 @@ import type React from 'react';
 import { useState } from 'react';
 import { buttonClass } from '@/components/ui/button.js';
 import { Modal, ModalFooter } from '@/components/ui/modal.js';
-import { projectRepo } from '@/lib/project-repository.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
 import type { AgentCli } from '../../../../src/harness/agent-cli.js';
 
@@ -61,11 +60,15 @@ function newEnrollmentConcurrencyError(draft: string): string | null {
 	return null;
 }
 
-/** One accessible project as the picker needs it: a label, and the repository it names. */
+/**
+ * One accessible project as the picker needs it: an id and a label. No repository
+ * (issue #1063): a project can own several, and naming only its first beside the name
+ * made an operator enrolling a machine that holds another one doubt they had the right
+ * project.
+ */
 interface EnrollableProject {
 	id: string;
 	name: string;
-	repositories?: Array<{ repo: string }>;
 }
 
 /**
@@ -116,7 +119,7 @@ function ProjectPicker({
 			</option>
 			{options.map((project) => (
 				<option key={project.id} value={project.id}>
-					{project.name} — {projectRepo(project)}
+					{project.name}
 				</option>
 			))}
 		</select>
@@ -300,8 +303,8 @@ export function WorkerEnrollDialog({
 					/>
 					<p className="text-xs text-zinc-500 mt-1">
 						Only projects you belong to, and only ones this machine is not already enrolled in. The
-						repository beside each name is the one work for it is checked out from — this machine
-						can only run projects on its own checkout.
+						project must own at least one of the repositories this machine has checked out, and the
+						machine only takes the project's work for those repositories.
 					</p>
 				</div>
 
