@@ -473,6 +473,20 @@ than losing the rest of the fleet to one dead laptop. Because the member settles
 table and the tally are where they are read, and the line under them then names every
 machine that is not on the target instead of saying they all are.
 
+**Three given up on in a row do stop it** (issue #1064). A build that cannot start
+anywhere is silent on *every* machine, so on silence alone the rollout would march
+the whole fleet through it. Once it has given up on **three machines in a row** it
+halts, with a reason naming the count and saying to treat the build as unable to
+start — the same halt as above, so the machines it had not reached are stood down
+into the pool on that same pass. "In a row" is read in the order the rollout reaches
+machines: one that comes back on the new build resets the count (the build
+demonstrably starts, so the earlier give-ups were about those machines), and one
+settled `skipped` neither adds to it nor resets it. Three is the smallest run that
+is not plausibly one operator's laptops going away, and on the default wave of one it
+stops the fleet about six minutes in. It is a flat count rather than a share of the
+fleet, and it is coded rather than configurable. A machine that *reports* a failure
+still halts the rollout on the first one.
+
 `swarm workers update --all` exits 0 whatever the table says, because it is a report
 rather than a pass/fail, and it is strictly owner-scoped: your own machines and
 nothing wider. The unstaged one-shot fan-out issue #921 shipped is still there on the
@@ -492,7 +506,8 @@ installation-wide fan-out, and `swarm workers update --all` stays your own fleet
 It behaves exactly like the rollout above — one bounded wave at a time, never
 interrupting a machine mid-phase, advancing itself off reports and reconnects, halting
 on a machine that reports `failed`/`refused`/`declined` or comes back on the build it
-was asked to leave, and giving up after two minutes on one that stops answering.
+was asked to leave, giving up after two minutes on one that stops answering, and
+halting once three have been given up on in a row.
 **One thing differs, and it is the point: every machine it drained goes back in the
 dispatch pool when the rollout is finished with it — on a halt, and including the
 machine that answered badly.** An

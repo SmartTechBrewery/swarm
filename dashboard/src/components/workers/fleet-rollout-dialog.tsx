@@ -122,8 +122,8 @@ export function FleetRolloutDialog({
  * of the pool itself, a bounded number at a time and never mid-phase; it checks each
  * machine came back on the new build before moving on, and stops the whole fleet on
  * one that *says* it cannot take the build — while a machine that merely stops
- * answering is given up on within two minutes and the rollout carries on (issue
- * #1064); and every machine it drained goes back in the pool, a halt included — which
+ * answering is given up on within two minutes and the rollout carries on, unless three
+ * in a row have gone that way (issue #1064); and every machine it drained goes back in the pool, a halt included — which
  * is the only reason an administrator may drain somebody else's machine at all.
  */
 function FleetRolloutConfirmation({ target }: { target: string }) {
@@ -147,9 +147,10 @@ function FleetRolloutConfirmation({ target }: { target: string }) {
 				<strong className="text-zinc-200">halts</strong> the whole rollout — nothing further is
 				drained or signalled, and there is no resume. A machine that simply stops answering does
 				not: after two minutes the rollout gives up on that one machine, records it failed, and
-				carries on with the rest of the fleet. Every machine it drained goes back in the dispatch
-				pool once it is finished with it, on a halt as well, so no machine is left out of the pool
-				for its owner to discover.
+				carries on with the rest of the fleet — but three given up on in a row halt it too, since
+				that is what a build that cannot start anywhere looks like. Every machine it drained goes
+				back in the dispatch pool once it is finished with it, on a halt as well, so no machine is
+				left out of the pool for its owner to discover.
 			</p>
 			<p className="text-sm text-zinc-400 leading-relaxed">
 				It then advances on its own. Watch it on this screen — the readout above the roster survives

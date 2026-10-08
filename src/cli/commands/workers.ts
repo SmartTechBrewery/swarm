@@ -333,7 +333,10 @@ Usage:
              gives up on that machine alone, records it failed with the reason,
              puts it back in the pool and carries straight on with the next one —
              so one dead laptop costs you a line in the table rather than the rest
-             of the fleet. A machine the rollout had already committed to when a
+             of the fleet. THREE machines given up on IN A ROW do halt it, though,
+             because that is what a build that cannot start anywhere looks like; a
+             machine that comes back on the new build in between resets the count.
+             A machine the rollout had already committed to when a
              halt landed keeps being settled on the advances that follow and
              returns to the pool once it settles without failing; only the one that
              answered badly is left drained. A halted rollout is final — fix the

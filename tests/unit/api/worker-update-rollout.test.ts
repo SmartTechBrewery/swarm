@@ -1193,6 +1193,226 @@ describe('advanceRollout — after a halt', () => {
 	});
 });
 
+describe('advanceRollout — a run of machines it gave up on', () => {
+	const WORKER_D = '44444444-4444-4444-8444-444444444444';
+	const WORKER_E = '55555555-5555-4555-8555-555555555555';
+	/** Past the two-minute bound for every fixture `reported` applied at 11:59:30. */
+	const LATER = new Date('2026-09-13T13:00:00Z');
+
+	/** A member an earlier advance gave up on, as the durable state now records it. */
+	function abandoned(workerId: string, position: number) {
+		return makeMember(workerId, position, {
+			state: 'failed',
+			message: 'applied the update and never came back within 2 minutes',
+			drainedByRollout: true,
+			settledAt: NOW,
+		});
+	}
+
+	function settled(workerId: string, position: number, state: 'done' | 'skipped') {
+		return makeMember(workerId, position, { state, settledAt: NOW });
+	}
+
+	/** A member that applied and has not come back — this pass is the one that gives up on it. */
+	function goingQuiet(workerId: string, position: number) {
+		return makeMember(workerId, position, {
+			state: 'verifying',
+			outcome: 'applied',
+			drainedByRollout: true,
+			fencingTokenAtSignal: 7,
+			buildCommitAtSignal: 'aaaaaaa',
+			signalledAt: new Date('2026-09-13T11:05:00Z'),
+		});
+	}
+
+	it('halts once the third machine in a row is given up on', async () => {
+		givenRollout(makeRollout(), [
+			abandoned(WORKER_A, 0),
+			abandoned(WORKER_B, 1),
+			goingQuiet(WORKER_C, 2),
+			makeMember(WORKER_D, 3),
+		]);
+		givenWorkers(
+			makeWorker(WORKER_A),
+			makeWorker(WORKER_B),
+			reported(WORKER_C, 'applied'),
+			makeWorker(WORKER_D),
+		);
+		vi.setSystemTime(LATER);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[2]).toMatchObject({ state: 'failed', abandoned: true });
+		expect(view?.rollout.status).toBe('halted');
+		expect(view?.rollout.haltReason).toContain('3 machines in a row');
+		expect(view?.rollout.haltReason).toContain('unable to start');
+		expect(statusWrites).toEqual([{ status: 'halted', haltReason: view?.rollout.haltReason }]);
+	});
+
+	it('does not halt on two in a row, and moves on to the next machine', async () => {
+		givenRollout(makeRollout(), [
+			abandoned(WORKER_A, 0),
+			goingQuiet(WORKER_B, 1),
+			makeMember(WORKER_C, 2),
+		]);
+		givenWorkers(makeWorker(WORKER_A), reported(WORKER_B, 'applied'), makeWorker(WORKER_C));
+		vi.setSystemTime(LATER);
+		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry(WORKER_C, 'requested')]);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[1].state).toBe('failed');
+		expect(view?.rollout.status).toBe('in_progress');
+		expect(view?.rollout.haltReason).toBeNull();
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_C, true);
+		expect(view?.members[2].state).toBe('signalled');
+	});
+
+	// The build demonstrably starts, so the give-ups before it were about those machines.
+	it('resets the run on a machine that came back on the new build', async () => {
+		givenRollout(makeRollout(), [
+			abandoned(WORKER_A, 0),
+			settled(WORKER_B, 1, 'done'),
+			abandoned(WORKER_C, 2),
+			goingQuiet(WORKER_D, 3),
+			makeMember(WORKER_E, 4),
+		]);
+		givenWorkers(
+			makeWorker(WORKER_A),
+			makeWorker(WORKER_B),
+			makeWorker(WORKER_C),
+			reported(WORKER_D, 'applied'),
+			makeWorker(WORKER_E),
+		);
+		vi.setSystemTime(LATER);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[3].state).toBe('failed');
+		expect(view?.rollout.status).toBe('in_progress');
+	});
+
+	// Settled without being moved, so it says nothing about the build either way.
+	it('neither extends nor resets the run on a skipped machine', async () => {
+		givenRollout(makeRollout(), [
+			abandoned(WORKER_A, 0),
+			settled(WORKER_B, 1, 'skipped'),
+			abandoned(WORKER_C, 2),
+			goingQuiet(WORKER_D, 3),
+			makeMember(WORKER_E, 4),
+		]);
+		givenWorkers(
+			makeWorker(WORKER_A),
+			makeWorker(WORKER_B),
+			makeWorker(WORKER_C),
+			reported(WORKER_D, 'applied'),
+			makeWorker(WORKER_E),
+		);
+		vi.setSystemTime(LATER);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.rollout.status).toBe('halted');
+		expect(view?.rollout.haltReason).toContain('3 machines in a row');
+	});
+
+	// The run is read in the order the rollout reaches machines, not the order the rows
+	// happen to be loaded in.
+	it('counts the run in position order', async () => {
+		givenRollout(makeRollout(), [
+			abandoned(WORKER_A, 0),
+			goingQuiet(WORKER_D, 3),
+			settled(WORKER_B, 1, 'done'),
+			abandoned(WORKER_C, 2),
+			makeMember(WORKER_E, 4),
+		]);
+		givenWorkers(
+			makeWorker(WORKER_A),
+			makeWorker(WORKER_B),
+			makeWorker(WORKER_C),
+			reported(WORKER_D, 'applied'),
+			makeWorker(WORKER_E),
+		);
+		vi.setSystemTime(LATER);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.rollout.status).toBe('in_progress');
+	});
+
+	// Everything a halt already does, reached on the very pass the brake bites.
+	it('stands the rest of the fleet down on the same pass', async () => {
+		givenRollout(makeRollout({ waveSize: 2 }), [
+			abandoned(WORKER_A, 0),
+			abandoned(WORKER_B, 1),
+			goingQuiet(WORKER_C, 2),
+			makeMember(WORKER_D, 3, { state: 'draining', drainedByRollout: true }),
+			makeMember(WORKER_E, 4),
+		]);
+		givenWorkers(
+			makeWorker(WORKER_A),
+			makeWorker(WORKER_B),
+			reported(WORKER_C, 'applied'),
+			makeWorker(WORKER_D, { drainingSince: NOW }),
+			makeWorker(WORKER_E),
+		);
+		vi.setSystemTime(LATER);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.rollout.status).toBe('halted');
+		expect(view?.members.map((member) => member.state)).toEqual([
+			'failed',
+			'failed',
+			'failed',
+			'skipped',
+			'skipped',
+		]);
+		// The stood-down machines are back in the pool, and nothing further was asked.
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_D, false);
+		expect(setWorkerDraining).not.toHaveBeenCalledWith(WORKER_E, true);
+		expect(fanOutWorkerUpdate).not.toHaveBeenCalled();
+		// Written to the rows, so the next advance reads the stand-down too.
+		expect(memberWrites.get(WORKER_E)?.state).toBe('skipped');
+	});
+
+	// The invariant the count rests on: every `failed` verdict that is not a give-up
+	// halts on the spot, on the very first machine, so a `failed` member in a rollout
+	// still in progress can only ever be one the rollout gave up on.
+	it.each([
+		['reports failed', reported(WORKER_A, 'failed')],
+		['reports refused', reported(WORKER_A, 'refused')],
+		['reports declined', reported(WORKER_A, 'declined')],
+	] as const)('halts on the first machine that %s', async (_label, worker) => {
+		givenRollout(makeRollout(), [
+			makeMember(WORKER_A, 0, {
+				state: 'signalled',
+				requestId: REQUEST_A,
+				drainedByRollout: true,
+				signalledAt: new Date('2026-09-13T11:05:00Z'),
+			}),
+			makeMember(WORKER_B, 1),
+		]);
+		givenWorkers(worker, makeWorker(WORKER_B));
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0]).toMatchObject({ state: 'failed', abandoned: false });
+		expect(view?.rollout.status).toBe('halted');
+	});
+
+	it('halts on the first machine that comes back on the build it was asked to leave', async () => {
+		givenRollout(makeRollout(), [goingQuiet(WORKER_A, 0), makeMember(WORKER_B, 1)]);
+		givenWorkers(reported(WORKER_A, 'applied'), makeWorker(WORKER_B));
+		getLiveSessionForWorker.mockResolvedValue({ fencingToken: 8 });
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0]).toMatchObject({ state: 'failed', abandoned: false });
+		expect(view?.rollout.status).toBe('halted');
+	});
+});
+
 describe('advanceRollout — a machine two of the owner’s rollouts hold', () => {
 	// The other half of the hand-off (issue #1023). The newer rollout takes a machine the
 	// halted one still has drained: that drain is a rollout's, not the operator's, so it
