@@ -559,8 +559,10 @@ unchanged.
   checked before anything is registered: it must exist, be a git checkout whose
   `origin` names a repository, differ (by realpath) from the primary checkout and
   from every other one given, and be a checkout of a repository none of the others
-  is — the daemon would refuse two checkouts of one repository at startup. It is
-  recorded in the primary checkout's cache entry, which is how `run:worker` finds it.
+  is — the daemon would refuse two checkouts of one repository at startup. The
+  primary checkout's own `origin` must name a repository too: alone it may have
+  none, but beside another the daemon could not tell it apart and refuses to start.
+  It is recorded in the primary checkout's cache entry, which is how `run:worker` finds it.
 - **`register-and-enroll`** — the **recommended one-command path for a new machine**
   (issue #786): `register` + `set-scm-credential` + `enroll` in one invocation,
   ending with the exact command that starts the daemon. It composes those three and
@@ -623,7 +625,11 @@ unchanged.
   checkout exists on the machine running this command. `--extra-checkout` is taken
   and validated exactly as `register` takes it, before anything is written, and each
   one follows the primary checkout in the printed
-  `SWARM_WORKER_REPO_ROOT=<primary>:<extra>…`. Everything each step
+  `SWARM_WORKER_REPO_ROOT=<primary>:<extra>…`. Because it is validated against the
+  checkouts themselves, it needs the primary checkout **and** every extra one on the
+  machine running this command: with a `--repo-root` that is not here, it is
+  refused, and the extra checkouts are listed after the primary one in
+  `SWARM_WORKER_REPO_ROOT` on the machine that holds them instead. Everything each step
   refuses is still refused, with nothing written before the refusal wherever
   that is possible: a bad `--cli`, an unknown or inaccessible project, a project whose `scm`
   resolves no provider, and an empty or aborted secret all fail **before** the worker

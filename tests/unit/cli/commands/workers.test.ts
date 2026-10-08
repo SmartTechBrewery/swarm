@@ -953,6 +953,23 @@ describe('swarm workers', () => {
 				expect(errors()).toEqual([expect.stringContaining('already one of this worker')]);
 				expect(calls).toHaveLength(0);
 			});
+
+			// The daemon would refuse it beside another checkout at startup.
+			it('refuses when the primary checkout has no identifiable origin', async () => {
+				slugs.delete(PRIMARY);
+				expect(await run([...REGISTER, '--extra-checkout', mobile])).toBe(1);
+				expect(errors()).toEqual([
+					expect.stringMatching(new RegExp(`${PRIMARY}.*identifiable 'origin'`)),
+				]);
+				expect(calls).toHaveLength(0);
+				expect(writeWorkerCredentialCache).not.toHaveBeenCalled();
+			});
+
+			it('still registers a primary checkout with no origin when given no extra one', async () => {
+				slugs.delete(PRIMARY);
+				expect(await run(REGISTER)).toBe(0);
+				expect(writeWorkerCredentialCache).toHaveBeenCalledOnce();
+			});
 		});
 
 		describe('register-and-enroll --extra-checkout', () => {
@@ -976,6 +993,18 @@ describe('swarm workers', () => {
 				).toBe(1);
 				expect(ensureControlPlaneUrl).not.toHaveBeenCalled();
 				expect(readStdin).not.toHaveBeenCalled();
+				expect(calls).toHaveLength(0);
+			});
+
+			// Every check is made against the checkouts themselves, so a primary checkout
+			// on another machine leaves nothing to check an extra one against.
+			it('refuses an extra checkout when --repo-root is not on this machine', async () => {
+				const elsewhere = join(scratch, 'not-here');
+				expect(
+					await run([...REGISTER_AND_ENROLL, '--repo-root', elsewhere, '--extra-checkout', mobile]),
+				).toBe(1);
+				expect(errors()).toEqual([expect.stringContaining('not on this machine')]);
+				expect(ensureControlPlaneUrl).not.toHaveBeenCalled();
 				expect(calls).toHaveLength(0);
 			});
 		});
@@ -1038,6 +1067,23 @@ describe('swarm workers', () => {
 				slugs.set(otherMobile, 'ACME/Mobile');
 				expect(await run(['add-checkout', otherMobile])).toBe(1);
 				expect(errors()).toEqual([expect.stringContaining('one checkout per repository')]);
+			});
+
+			it('refuses when the primary checkout has no identifiable origin', async () => {
+				registeredHere();
+				slugs.delete(PRIMARY);
+				expect(await run(['add-checkout', mobile])).toBe(1);
+				expect(errors()).toEqual([
+					expect.stringMatching(new RegExp(`${PRIMARY}.*identifiable 'origin'`)),
+				]);
+				expect(updateWorkerCredentialCacheCheckouts).not.toHaveBeenCalled();
+			});
+
+			it('names the file when the cache entry turns unreadable before the write', async () => {
+				registeredHere();
+				updateWorkerCredentialCacheCheckouts.mockReturnValue(undefined);
+				expect(await run(['add-checkout', mobile])).toBe(1);
+				expect(errors()).toEqual([expect.stringContaining('credential.json')]);
 			});
 
 			it('requires a path', async () => {

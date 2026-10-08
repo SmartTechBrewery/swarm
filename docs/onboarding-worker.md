@@ -166,7 +166,10 @@ swarm workers add-checkout ~/code/example-mobile
 
 It checks that `~/code/example-mobile` exists, is a git checkout whose `origin`
 names a repository, and is not the primary checkout, a checkout the worker already
-holds, or another checkout of a repository it already holds. It records the path
+holds, or another checkout of a repository it already holds — and that the primary
+checkout's own `origin` names a repository too: a lone checkout may run without
+one, but beside another the daemon could not tell it apart and would refuse to
+start (`git remote add origin <url>` there first). It records the path
 in this machine's credential cache for the primary checkout — and nothing else:
 checkout paths never leave the machine, so there is no control-plane call and no
 session needed. Then **restart the worker** (stop the foreground `swarm run:worker`
@@ -402,15 +405,17 @@ Notes:
   (issue #901). Use the composable path above when you want the two approvals
   kept as separate human decisions.
 - **Enroll the machine in a project that owns the repository its checkout actually
-  is.** Step 4 is refused (naming the machine's checkout and every repository the
-  project owns) when the worker has already declared a checkout of a repository the
-  project declares nowhere — a worker holds a single checkout, so work for any other
-  repository would only be refused when it got there (issue #690). A project owning
+  is.** Step 4 is refused (naming the machine's checkouts and every repository the
+  project owns) when the worker has already declared its checkouts and the project
+  declares **none** of their repositories — work for a repository the worker holds
+  no checkout of would only be refused when it got there (issues #690, #1056). A
+  worker holding several checkouts ([Serving a second repository](#serving-a-second-repository))
+  is accepted by a project declaring any one of them. A project owning
   several repositories accepts a worker for **any** of them (issue #946), so one
   project can hold one worker per repository. A worker that has not connected yet has
   declared nothing and is enrolled as before; if its first handshake then contradicts
   this enrollment, the control plane **suspends** it, and `/workers/<id>` says which
-  repositories disagree — the machine's checkout on one side, every repository the
+  repositories disagree — the machine's checkouts on one side, every repository the
   project declares on the other, so a multi-repository project shows no banner for a
   worker correctly enrolled on any of them. Fixing the pairing is an operator action —
   point the machine at the right checkout, or enroll it in the right project — and

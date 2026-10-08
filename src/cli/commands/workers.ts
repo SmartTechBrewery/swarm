@@ -870,23 +870,32 @@ function cacheCredentialForCheckout(
  * worker already holds (`existing`) by realpath, and be a git checkout whose
  * `origin` names a repository no other of those checkouts is — the same
  * declarable-slug read the daemon identifies its checkouts with
- * (`../../transport/worker-checkouts.ts`). That last check is the daemon's own
- * startup refusal brought forward: a set it would refuse is better refused here,
- * where the operator is, than in a supervised daemon's log at its next restart.
+ * (`../../transport/worker-checkouts.ts`). The checkouts already held must be
+ * identifiable too, the primary one included: alone it may have no `origin`, but
+ * beside another it cannot be told apart. Those are the daemon's two startup
+ * refusals brought forward: a set it would refuse is better refused here, where
+ * the operator is, than in a supervised daemon's log at its next restart.
  *
- * The primary checkout's own repository is compared only when it can be read on
- * this machine: `register-and-enroll --repo-root` may name a checkout elsewhere.
+ * The primary checkout must be on this machine, since every check above is made
+ * against the checkouts themselves: `register-and-enroll --repo-root` naming a
+ * checkout elsewhere is refused any extra checkout, which the operator lists in
+ * `SWARM_WORKER_REPO_ROOT` on the machine that holds them instead.
  */
 async function validateExtraCheckouts(
 	primary: string,
 	paths: readonly string[],
 	existing: readonly string[] = [],
 ): Promise<string[] | undefined> {
+	if (paths.length === 0) return [];
 	const primaryRoot = canonicalCheckoutPath(primary);
-	const held: { repoRoot: string; repository?: string }[] = [];
-	for (const repoRoot of [primaryRoot, ...existing]) {
-		held.push({ repoRoot, repository: await resolveDeclarableOriginRepoSlug(repoRoot) });
+	if (!existsSync(primaryRoot)) {
+		out.error(
+			`the primary checkout ${primaryRoot} is not on this machine, so no extra checkout can be checked against it — on the machine that holds it, list the extra checkouts after it in SWARM_WORKER_REPO_ROOT instead`,
+		);
+		return undefined;
 	}
+	const held = await identifyHeldCheckouts([primaryRoot, ...existing]);
+	if (!held) return undefined;
 	const accepted: string[] = [];
 	for (const path of paths) {
 		const checkout = checkoutArgument(path);
@@ -911,9 +920,7 @@ async function validateExtraCheckouts(
 			);
 			return undefined;
 		}
-		const clash = held.find(
-			(entry) => entry.repository && repoSlugsMatch(entry.repository, repository),
-		);
+		const clash = held.find((entry) => repoSlugsMatch(entry.repository, repository));
 		if (clash) {
 			out.error(
 				`${checkout} is another checkout of ${repository}, which this worker already holds at ${clash.repoRoot} — a worker holds one checkout per repository`,
@@ -924,6 +931,28 @@ async function validateExtraCheckouts(
 		accepted.push(checkout);
 	}
 	return accepted;
+}
+
+/**
+ * The repository each checkout a worker already holds is — or `undefined`, with
+ * the refusal printed, at the first with no identifiable `origin`: alone it may
+ * have none, but beside an extra checkout the daemon could not tell it apart.
+ */
+async function identifyHeldCheckouts(
+	repoRoots: readonly string[],
+): Promise<{ repoRoot: string; repository: string }[] | undefined> {
+	const held: { repoRoot: string; repository: string }[] = [];
+	for (const repoRoot of repoRoots) {
+		const repository = await resolveDeclarableOriginRepoSlug(repoRoot);
+		if (repository === undefined) {
+			out.error(
+				`the checkout at ${repoRoot} has no identifiable 'origin' remote, so beside another checkout the worker could not tell it apart — add one there first: git remote add origin <url>`,
+			);
+			return undefined;
+		}
+		held.push({ repoRoot, repository });
+	}
+	return held;
 }
 
 /**
@@ -2492,8 +2521,15 @@ function saveExtraCheckouts(
 	extraRepoRoots: string[],
 ): number {
 	try {
-		if (!updateWorkerCredentialCacheCheckouts(worker.repoRoot, extraRepoRoots)) {
+		const updated = updateWorkerCredentialCacheCheckouts(worker.repoRoot, extraRepoRoots);
+		if (updated === null) {
 			out.error(`workers ${command}: this checkout's worker credential cache entry disappeared`);
+			return 1;
+		}
+		if (updated === undefined) {
+			out.error(
+				`workers ${command}: this checkout's cached worker credential could not be read: ${workerCredentialCachePath(worker.repoRoot)}`,
+			);
 			return 1;
 		}
 	} catch (err) {
