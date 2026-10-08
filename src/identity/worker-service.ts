@@ -143,16 +143,18 @@ export async function registerWorker(input: RegisterWorkerInput): Promise<Regist
  * to leave the stored phases as they are; a caller that knows nothing about phases
  * must not reset them to the every-phase default.
  *
- * `repository` (issue #687) is which repository the daemon's one local checkout is,
- * written in that same transaction and validated here — so the service seam, not
- * only the wire, is a boundary that cannot store an unnormalised slug. Three-valued
- * exactly as the repository layer documents: omit it to leave the stored value alone
- * (again the `set-cli` path), pass `null` when the connecting daemon declared none,
- * which clears a previous daemon's statement.
+ * `repositories` (issue #687; a set since issue #1056) is which repositories the
+ * daemon holds a local checkout of, written in that same transaction and validated
+ * here — each entry is parsed (and so normalised) and the set deduplicated in
+ * first-seen order, so the service seam, not only the wire, is a boundary that cannot
+ * store an unnormalised slug. Two-valued exactly as the repository layer documents:
+ * omit it to leave the stored set alone (again the `set-cli` path), pass `[]` when
+ * the connecting daemon declared none, which clears a previous daemon's statement.
  *
- * `build` (issue #918) is the SWARM build that daemon is running, three-valued and
- * validated on exactly the same terms — so the service seam, not only the wire, is a
- * boundary that cannot store a commit id no reader would recognise.
+ * `build` (issue #918) is the SWARM build that daemon is running, validated on
+ * exactly the same terms but three-valued (`null` clears it) — so the service seam,
+ * not only the wire, is a boundary that cannot store a commit id no reader would
+ * recognise.
  *
  * `supervision` (issue #997) is how that daemon is supervised, validated on the same
  * rule for the same reason. Two-valued rather than three, since the column has no
@@ -160,7 +162,7 @@ export async function registerWorker(input: RegisterWorkerInput): Promise<Regist
  * three members to write it.
  *
  * `hostname` is the daemon's self-reported `os.hostname()`, three-valued on
- * `repository`'s contract but diagnostic/display only — not schema-validated against
+ * `build`'s contract but diagnostic/display only — not schema-validated against
  * anything, `version`'s exact treatment, since there is nothing to validate a
  * self-reported machine name against and rejecting one this control plane finds
  * unfamiliar would drop a label from a machine that is otherwise fine.
@@ -169,7 +171,7 @@ export async function refreshWorkerCapabilities(
 	id: string,
 	capabilities: AgentCli[],
 	supportedPhases?: TriggerPhase[],
-	repository?: string | null,
+	repositories?: string[],
 	build?: WorkerBuild | null,
 	supervision?: WorkerSupervision,
 	version?: string | null,
@@ -178,8 +180,10 @@ export async function refreshWorkerCapabilities(
 	const validated = WorkerCapabilitiesSchema.parse(capabilities);
 	const validatedPhases =
 		supportedPhases === undefined ? undefined : WorkerSupportedPhasesSchema.parse(supportedPhases);
-	const validatedRepository =
-		repository === undefined || repository === null ? repository : RepoSlugSchema.parse(repository);
+	const validatedRepositories =
+		repositories === undefined
+			? undefined
+			: [...new Set(repositories.map((repository) => RepoSlugSchema.parse(repository)))];
 	const validatedBuild =
 		build === undefined || build === null ? build : WorkerBuildSchema.parse(build);
 	const validatedSupervision =
@@ -196,7 +200,7 @@ export async function refreshWorkerCapabilities(
 		id,
 		validated,
 		validatedPhases,
-		validatedRepository,
+		validatedRepositories,
 		validatedBuild,
 		validatedSupervision,
 		validatedVersion,

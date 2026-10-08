@@ -51,19 +51,21 @@ export function routabilityBlockers(enrollment: RoutabilityInput): string[] {
 }
 
 /**
- * The repositories that disagree when the machine's declared checkout is not one
- * this enrollment's project declares (issue #690, widened by #946 from the
- * project's default entry to its whole list) — the reason an enrollment was
+ * The repositories that disagree when none of the machine's declared checkouts is
+ * one this enrollment's project declares (issue #690, widened by #946 from the
+ * project's default entry to its whole list, and by #1056 from the machine's one
+ * checkout to its whole set) — the reason an enrollment was
  * refused at enrollment time, or suspended when the declaration arrived later — or
  * `null` when they agree or either side is unknown. Returning the two non-null
  * sides rather than a boolean keeps the rule in one place and gives the caller
  * exactly what it has to render.
  *
- * The project side is a **list**, and agreement is membership in it: a project may
+ * Both sides are **lists**, and agreement is any overlap between them: a project may
  * declare several repositories and hold one worker per repository, so a machine
  * checked out from the project's second repository is correctly enrolled and must
- * not be told otherwise. A genuine mismatch names every repository the project
- * owns, which is what lets an operator tell a typo from a repository the project
+ * not be told otherwise, and a machine holding several checkouts agrees with every
+ * project owning any of them. A genuine mismatch names every repository on both
+ * sides, which is what lets an operator tell a typo from a repository the project
  * simply does not have.
  *
  * Both sides reach the browser in the shared normalised `owner/repo` form, so plain
@@ -84,10 +86,12 @@ export function routabilityBlockers(enrollment: RoutabilityInput): string[] {
  * enrollment's status says.
  */
 export function repositoryMismatch(
-	declaredRepository: string | null,
+	declaredRepositories: string[],
 	projectRepositories: string[],
-): { declaredRepository: string; projectRepositories: string[] } | null {
-	if (!declaredRepository || projectRepositories.length === 0) return null;
-	if (projectRepositories.includes(declaredRepository)) return null;
-	return { declaredRepository, projectRepositories };
+): { declaredRepositories: string[]; projectRepositories: string[] } | null {
+	if (declaredRepositories.length === 0 || projectRepositories.length === 0) return null;
+	if (declaredRepositories.some((repository) => projectRepositories.includes(repository))) {
+		return null;
+	}
+	return { declaredRepositories, projectRepositories };
 }

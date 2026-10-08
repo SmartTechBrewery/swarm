@@ -55,7 +55,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		probedCapabilities: ['claude'],
 		declaredCapabilities: null,
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
-		repository: null,
+		repositories: [],
 		hostname: null,
 		drainingSince: null,
 		update: null,

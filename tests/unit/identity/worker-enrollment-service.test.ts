@@ -148,7 +148,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		probedCapabilities: ['claude'],
 		declaredCapabilities: null,
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
-		repository: null,
+		repositories: [],
 		hostname: null,
 		// In the pool (issue #919) — every case here that says nothing about draining.
 		drainingSince: null,
@@ -907,7 +907,7 @@ describe('listDashboardWorkers (issue #133)', () => {
 				'enrollments',
 				'lastSeenAt',
 				'owner',
-				'repository',
+				'repositories',
 				// Non-secret and diagnostic only: a self-reported machine name, never a path
 				// or credential — it exists purely so an operator can spot two workers
 				// sharing one physical machine.
@@ -1044,13 +1044,48 @@ describe('enrollWorker', () => {
 		);
 	});
 
-	// Issue #690 — an enrollment must name a repository the machine's own checkout is,
-	// because a worker holds exactly one and work for any other repository can only be
-	// refused. Issue #946 widened "the project's repository" to "any repository the
-	// project declares", so one project can hold one worker per repository.
-	describe('the project must declare the worker’s repository (issues #690, #946)', () => {
+	// Issue #690 — an enrollment must name a repository the machine holds a checkout of,
+	// because work for any other repository can only be refused. Issue #946 widened "the
+	// project's repository" to "any repository the project declares", and #1056 widened
+	// "the worker's checkout" to "any checkout the worker declares".
+	describe('the project must declare one of the worker’s repositories (issues #690, #946, #1056)', () => {
+		it('accepts a worker holding several checkouts when any is the project’s', async () => {
+			const worker = makeWorker({ repositories: ['acme/mobile', 'acme/frontend'] });
+			findProjectRecordByIdFromDb.mockResolvedValue(
+				makeProjectRecord('acme/backend', 'acme/frontend'),
+			);
+			createEnrollment.mockImplementation(async (input) => makeEnrollment(input));
+
+			await enrollWorker({ worker, projectId: 'proj-a', allowedClis: ['claude'] });
+
+			expect(createEnrollment).toHaveBeenCalledTimes(1);
+		});
+
+		it('refuses a worker holding several checkouts when none is the project’s, naming them all', async () => {
+			const worker = makeWorker({ repositories: ['acme/mobile', 'acme/docs'] });
+			findProjectRecordByIdFromDb.mockResolvedValue(makeProjectRecord('acme/backend'));
+
+			const error = await enrollWorker({
+				worker,
+				projectId: 'proj-a',
+				allowedClis: ['claude'],
+			}).then(
+				() => undefined,
+				(err: unknown) => err as EnrollmentRepositoryMismatchError,
+			);
+			if (!error) throw new Error('expected the enrollment to be refused');
+
+			expect(createEnrollment).not.toHaveBeenCalled();
+			expect(error.declaredRepositories).toEqual(['acme/mobile', 'acme/docs']);
+			expect(error.message).toBe(
+				`Worker ${WORKER_ID} cannot be enrolled in a project for repository ` +
+					"'acme/backend': its checkouts are 'acme/mobile', 'acme/docs'. Enroll a worker whose " +
+					'checkout is that repository, or give this one a checkout of it.',
+			);
+		});
+
 		it('accepts a project whose second entry is the worker’s checkout', async () => {
-			const worker = makeWorker({ repository: 'acme/frontend' });
+			const worker = makeWorker({ repositories: ['acme/frontend'] });
 			findProjectRecordByIdFromDb.mockResolvedValue(
 				makeProjectRecord('acme/backend', 'acme/frontend'),
 			);
@@ -1062,7 +1097,7 @@ describe('enrollWorker', () => {
 		});
 
 		it('still refuses a project that declares the checkout nowhere, writing nothing', async () => {
-			const worker = makeWorker({ repository: 'acme/mobile' });
+			const worker = makeWorker({ repositories: ['acme/mobile'] });
 			findProjectRecordByIdFromDb.mockResolvedValue(
 				makeProjectRecord('acme/backend', 'acme/frontend'),
 			);
@@ -1074,7 +1109,7 @@ describe('enrollWorker', () => {
 		});
 
 		it('names every repository the project owns on the error itself', async () => {
-			const worker = makeWorker({ repository: 'acme/mobile' });
+			const worker = makeWorker({ repositories: ['acme/mobile'] });
 			findProjectRecordByIdFromDb.mockResolvedValue(
 				makeProjectRecord('acme/backend', 'acme/frontend'),
 			);
@@ -1090,7 +1125,7 @@ describe('enrollWorker', () => {
 			if (!error) throw new Error('expected the enrollment to be refused');
 
 			expect(error.workerId).toBe(WORKER_ID);
-			expect(error.declaredRepository).toBe('acme/mobile');
+			expect(error.declaredRepositories).toEqual(['acme/mobile']);
 			expect(error.projectRepositories).toEqual(['acme/backend', 'acme/frontend']);
 			expect(error.message).toContain('acme/mobile');
 			expect(error.message).toContain('acme/backend');
@@ -1100,7 +1135,7 @@ describe('enrollWorker', () => {
 		// The regression bar (issue #946): a single-repository project refuses in exactly
 		// the words it refused in before the list was consulted at all.
 		it('refuses a single-repository project in the wording it always used', async () => {
-			const worker = makeWorker({ repository: 'acme/frontend' });
+			const worker = makeWorker({ repositories: ['acme/frontend'] });
 			findProjectRecordByIdFromDb.mockResolvedValue(makeProjectRecord('acme/backend'));
 
 			const error = await enrollWorker({
@@ -1121,7 +1156,7 @@ describe('enrollWorker', () => {
 		});
 
 		it('allows a project for that repository, comparing case and .git as noise', async () => {
-			const worker = makeWorker({ repository: 'acme/frontend' });
+			const worker = makeWorker({ repositories: ['acme/frontend'] });
 			findProjectRecordByIdFromDb.mockResolvedValue(makeProjectRecord('Acme/Frontend.git'));
 			createEnrollment.mockImplementation(async (input) => makeEnrollment(input));
 
@@ -1132,7 +1167,7 @@ describe('enrollWorker', () => {
 
 		// Normalisation is not a property of the default entry — it applies down the list.
 		it('normalises a non-default entry too', async () => {
-			const worker = makeWorker({ repository: 'acme/frontend' });
+			const worker = makeWorker({ repositories: ['acme/frontend'] });
 			findProjectRecordByIdFromDb.mockResolvedValue(
 				makeProjectRecord('acme/backend', 'Acme/Frontend.git'),
 			);
@@ -1146,7 +1181,7 @@ describe('enrollWorker', () => {
 		// An unidentifiable checkout must not lock an operator out of enrolling their
 		// own machine — the same rule the daemon's assignment check applies.
 		it('allows a worker that declared no repository', async () => {
-			const worker = makeWorker({ repository: null });
+			const worker = makeWorker({ repositories: [] });
 			findProjectRecordByIdFromDb.mockResolvedValue(makeProjectRecord('acme/backend'));
 			createEnrollment.mockImplementation(async (input) => makeEnrollment(input));
 
@@ -1160,7 +1195,7 @@ describe('enrollWorker', () => {
 		// Not a second not-found path: the enrollment's own FK is what refuses an
 		// unknown project, and answering it here would pre-empt the caller's authz.
 		it('leaves an unresolvable project to the existing write path', async () => {
-			const worker = makeWorker({ repository: 'acme/frontend' });
+			const worker = makeWorker({ repositories: ['acme/frontend'] });
 			findProjectRecordByIdFromDb.mockResolvedValue(undefined);
 			createEnrollment.mockImplementation(async (input) => makeEnrollment(input));
 
@@ -1440,13 +1475,35 @@ describe('the project worker order (issue #750)', () => {
 // Issue #690 — the declaration path. A daemon reconnecting from a different checkout
 // contradicts the enrollments already written for it, and this is what acts on that.
 // Issue #946: "a different checkout" now means one the project declares nowhere.
-describe('suspendEnrollmentsForMismatchedRepository (issues #690, #946)', () => {
+describe('suspendEnrollmentsForMismatchedRepository (issues #690, #946, #1056)', () => {
 	/** Resolve each project id to its own repository list, so one pass can mix matches and mismatches. */
 	function projectsByRepos(repos: Record<string, string[]>) {
 		findProjectRecordByIdFromDb.mockImplementation(async (id: string) =>
 			repos[id] ? { id, repositories: repos[id].map((repo) => ({ repo })) } : undefined,
 		);
 	}
+
+	// Issue #1056: a machine holding several checkouts keeps an enrollment while any of
+	// them is the project's, and loses it only when none is.
+	it('judges a declared set: suspends only where the project owns none of it', async () => {
+		listEnrollmentsForWorker.mockResolvedValue([
+			makeEnrollment({ id: 'e-second', projectId: 'proj-back', status: 'active' }),
+			makeEnrollment({ id: 'e-miss', projectId: 'proj-docs', status: 'active' }),
+		]);
+		projectsByRepos({ 'proj-back': ['acme/backend'], 'proj-docs': ['acme/docs'] });
+		updateEnrollmentStatus.mockResolvedValue(makeEnrollment({ status: 'suspended' }));
+
+		const suspended = await suspendEnrollmentsForMismatchedRepository(WORKER_ID, [
+			'acme/frontend',
+			'Acme/Backend.git',
+		]);
+
+		expect(updateEnrollmentStatus).toHaveBeenCalledTimes(1);
+		expect(updateEnrollmentStatus).toHaveBeenCalledWith('e-miss', 'suspended');
+		expect(suspended).toEqual([
+			{ enrollmentId: 'e-miss', projectId: 'proj-docs', projectRepositories: ['acme/docs'] },
+		]);
+	});
 
 	it('suspends only the enrollments whose project declares the checkout nowhere', async () => {
 		listEnrollmentsForWorker.mockResolvedValue([
@@ -1456,7 +1513,7 @@ describe('suspendEnrollmentsForMismatchedRepository (issues #690, #946)', () => 
 		projectsByRepos({ 'proj-front': ['Acme/Frontend.git'], 'proj-back': ['acme/backend'] });
 		updateEnrollmentStatus.mockResolvedValue(makeEnrollment({ status: 'suspended' }));
 
-		const suspended = await suspendEnrollmentsForMismatchedRepository(WORKER_ID, 'acme/frontend');
+		const suspended = await suspendEnrollmentsForMismatchedRepository(WORKER_ID, ['acme/frontend']);
 
 		expect(updateEnrollmentStatus).toHaveBeenCalledTimes(1);
 		expect(updateEnrollmentStatus).toHaveBeenCalledWith('e-miss', 'suspended');
@@ -1473,7 +1530,7 @@ describe('suspendEnrollmentsForMismatchedRepository (issues #690, #946)', () => 
 		]);
 		projectsByRepos({ 'proj-multi': ['acme/backend', 'acme/frontend'] });
 
-		const suspended = await suspendEnrollmentsForMismatchedRepository(WORKER_ID, 'acme/frontend');
+		const suspended = await suspendEnrollmentsForMismatchedRepository(WORKER_ID, ['acme/frontend']);
 
 		expect(suspended).toEqual([]);
 		expect(updateEnrollmentStatus).not.toHaveBeenCalled();
@@ -1486,7 +1543,7 @@ describe('suspendEnrollmentsForMismatchedRepository (issues #690, #946)', () => 
 		projectsByRepos({ 'proj-multi': ['acme/backend', 'Acme/Frontend.git'] });
 		updateEnrollmentStatus.mockResolvedValue(makeEnrollment({ status: 'suspended' }));
 
-		const suspended = await suspendEnrollmentsForMismatchedRepository(WORKER_ID, 'acme/mobile');
+		const suspended = await suspendEnrollmentsForMismatchedRepository(WORKER_ID, ['acme/mobile']);
 
 		expect(suspended).toEqual([
 			{
@@ -1507,14 +1564,14 @@ describe('suspendEnrollmentsForMismatchedRepository (issues #690, #946)', () => 
 		projectsByRepos({ 'proj-multi': ['acme/backend', 'acme/frontend'] });
 		updateEnrollmentStatus.mockResolvedValue(makeEnrollment({ status: 'suspended' }));
 
-		await suspendEnrollmentsForMismatchedRepository(WORKER_ID, 'acme/mobile');
+		await suspendEnrollmentsForMismatchedRepository(WORKER_ID, ['acme/mobile']);
 
 		expect(warn).toHaveBeenCalledWith(
 			expect.any(String),
 			expect.objectContaining({
 				enrollmentId: 'e-miss',
 				projectId: 'proj-multi',
-				declaredRepository: 'acme/mobile',
+				declaredRepositories: ['acme/mobile'],
 				projectRepositories: ['acme/backend', 'acme/frontend'],
 			}),
 		);
@@ -1528,7 +1585,7 @@ describe('suspendEnrollmentsForMismatchedRepository (issues #690, #946)', () => 
 		projectsByRepos({ 'proj-back': ['acme/backend'] });
 		updateEnrollmentStatus.mockResolvedValue(makeEnrollment({ status: 'suspended' }));
 
-		await suspendEnrollmentsForMismatchedRepository(WORKER_ID, 'acme/frontend');
+		await suspendEnrollmentsForMismatchedRepository(WORKER_ID, ['acme/frontend']);
 
 		expect(createEnrollment).not.toHaveBeenCalled();
 		expect(setEnrollmentSharingConsent).not.toHaveBeenCalled();
@@ -1546,7 +1603,7 @@ describe('suspendEnrollmentsForMismatchedRepository (issues #690, #946)', () => 
 		]);
 		projectsByRepos({ 'proj-multi': ['acme/backend', 'acme/frontend'] });
 
-		const suspended = await suspendEnrollmentsForMismatchedRepository(WORKER_ID, 'acme/frontend');
+		const suspended = await suspendEnrollmentsForMismatchedRepository(WORKER_ID, ['acme/frontend']);
 
 		expect(suspended).toEqual([]);
 		expect(updateEnrollmentStatus).not.toHaveBeenCalled();
@@ -1558,7 +1615,7 @@ describe('suspendEnrollmentsForMismatchedRepository (issues #690, #946)', () => 
 		]);
 		projectsByRepos({ 'proj-back': ['acme/backend'] });
 
-		const suspended = await suspendEnrollmentsForMismatchedRepository(WORKER_ID, 'acme/frontend');
+		const suspended = await suspendEnrollmentsForMismatchedRepository(WORKER_ID, ['acme/frontend']);
 
 		expect(suspended).toEqual([]);
 		expect(updateEnrollmentStatus).not.toHaveBeenCalled();
@@ -1572,13 +1629,16 @@ describe('suspendEnrollmentsForMismatchedRepository (issues #690, #946)', () => 
 		]);
 		projectsByRepos({});
 
-		expect(await suspendEnrollmentsForMismatchedRepository(WORKER_ID, 'acme/frontend')).toEqual([]);
+		expect(await suspendEnrollmentsForMismatchedRepository(WORKER_ID, ['acme/frontend'])).toEqual(
+			[],
+		);
 		expect(updateEnrollmentStatus).not.toHaveBeenCalled();
 	});
 
 	// Defensive: "matches nothing" would otherwise suspend every enrollment at once.
-	it('suspends nothing for a blank declaration', async () => {
-		expect(await suspendEnrollmentsForMismatchedRepository(WORKER_ID, '   ')).toEqual([]);
+	it('suspends nothing for a blank or empty declaration', async () => {
+		expect(await suspendEnrollmentsForMismatchedRepository(WORKER_ID, ['   '])).toEqual([]);
+		expect(await suspendEnrollmentsForMismatchedRepository(WORKER_ID, [])).toEqual([]);
 		expect(listEnrollmentsForWorker).not.toHaveBeenCalled();
 		expect(updateEnrollmentStatus).not.toHaveBeenCalled();
 	});
@@ -1672,7 +1732,7 @@ describe('getDashboardWorkerDetail (issue #477)', () => {
 	// a correctly enrolled worker on the project's *second* repository that it cannot
 	// run the project's work.
 	it('carries every repository the project declares, not just its default entry', async () => {
-		getWorkerById.mockResolvedValue(makeWorker({ repository: 'acme/frontend' }));
+		getWorkerById.mockResolvedValue(makeWorker({ repositories: ['acme/frontend'] }));
 		listEnrollmentsForWorker.mockResolvedValue([makeEnrollment()]);
 		findProjectRecordByIdFromDb.mockResolvedValue(
 			makeProjectRecord('acme/backend', 'Acme/Frontend.git'),
@@ -1683,7 +1743,7 @@ describe('getDashboardWorkerDetail (issue #477)', () => {
 		// Normalised on both sides, so the worker's declaration is a member of this list
 		// by plain equality — no mismatch for the screen to report.
 		expect(detail?.enrollments[0]?.projectRepos).toEqual(['acme/backend', 'acme/frontend']);
-		expect(detail?.enrollments[0]?.projectRepos).toContain(detail?.repository);
+		expect(detail?.enrollments[0]?.projectRepos).toContain(detail?.repositories[0]);
 	});
 
 	// The honest successor to the old `null`: nothing to disagree with, so the screen

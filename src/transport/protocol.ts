@@ -128,19 +128,28 @@ export type TaskPhase = z.infer<typeof TaskPhaseSchema>;
  * diagnostic. It *is* the shared SCM definition (`RepoSlugSchema`,
  * `../scm/repo-slug.js`) rather than a re-declaration — the same move
  * {@link TaskPhaseSchema} and `reclaim` make below — so the wire, the persisted
- * worker row (`workers.repository`), and the provision-time identity check cannot
+ * worker row (`workers.repositories`), and the provision-time identity check cannot
  * drift apart about what `owner/repo` means; the schema normalises, so the control
  * plane records one canonical, host-less, `.git`-less form.
  *
  * **Optional on purpose, and unlike `hostname` it is persisted.** A daemon built
- * before this field simply omits it and the column records NULL — exactly today's
- * behaviour — and an older router ignores a key it does not know, so this too is
+ * before this field simply omits it and the row records no repository — exactly
+ * today's behaviour — and an older router ignores a key it does not know, so this too is
  * additive in both directions and needs no protocol-version bump. A checkout with
  * no identifiable `origin` declares nothing for the same reason, rather than failing
  * to start. It carries **no secret**: a repository slug is public coordinates, not a
  * credential, and like every handshake field it is never reflected in an error body.
  * Nothing is gated on it here — refusing a mismatched assignment, a second daemon on
  * one checkout, and a dishonest enrollment are the follow-on phases of issue #687.
+ *
+ * `repositories` widens that declaration to a **set** (issue #1056): every
+ * `owner/repo` the daemon holds a checkout of. The control plane reads the union of
+ * the two keys — `repository` first, then `repositories` in order, normalised and
+ * deduplicated — and persists it as `workers.repositories`, so an older daemon's lone
+ * `repository` is a one-element set and a newer one keeps sending its primary
+ * checkout there for an older control plane to see. Same element schema, same
+ * public-coordinates contract, same clearing rule: a handshake declaring neither key
+ * clears the stored set. Additive in both directions, so no protocol-version bump.
  *
  * `build` is the SWARM build this daemon is actually running (issue #918): the
  * commit its **install root** is on, plus a flag for a dirty or unbuilt checkout.
@@ -218,6 +227,7 @@ export const HandshakeRequestSchema = z.object({
 	capabilities: z.array(AgentCliSchema).nonempty(),
 	supportedPhases: z.array(TaskPhaseSchema).nonempty().optional(),
 	repository: RepoSlugSchema.optional(),
+	repositories: z.array(RepoSlugSchema).optional(),
 	build: WorkerBuildSchema.optional(),
 	supervision: WorkerSupervisionSchema.optional(),
 	reclaim: WorkerSessionReclaimSchema.optional(),

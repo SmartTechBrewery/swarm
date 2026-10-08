@@ -122,7 +122,7 @@ function makeWorker(overrides: Partial<WorkerDetail> = {}): WorkerDetail {
 		// The comparand the row's `buildIsCurrent` was judged against (issue #925).
 		controlPlaneBuild: { commit: CONTROL_PLANE_COMMIT, dirty: false },
 		supportedPhases: ['planning', 'implementation', 'review'],
-		repository: 'acme/frontend',
+		repositories: ['acme/frontend'],
 		hostname: null,
 		// The daemon's declared SWARM build and the server's verdict on it (issue #925).
 		build: { commit: 'abc1234def5678', dirty: false },
@@ -687,7 +687,7 @@ describe('WorkerDetailView enrollment blocks', () => {
 	describe('a checkout that is not one of the project’s repositories', () => {
 		it('names both repositories on a suspended mismatched enrollment', () => {
 			renderWorker({
-				repository: 'acme/frontend',
+				repositories: ['acme/frontend'],
 				enrollments: [
 					makeEnrollment({
 						status: 'suspended',
@@ -704,7 +704,7 @@ describe('WorkerDetailView enrollment blocks', () => {
 
 		it('says nothing when the machine’s checkout is the project’s repository', () => {
 			renderWorker({
-				repository: 'acme/frontend',
+				repositories: ['acme/frontend'],
 				enrollments: [makeEnrollment({ projectRepos: ['acme/frontend'] })],
 			});
 
@@ -715,7 +715,7 @@ describe('WorkerDetailView enrollment blocks', () => {
 		// The second entry is a correct enrollment and must not be warned about.
 		it('says nothing when the machine holds the project’s second repository', () => {
 			renderWorker({
-				repository: 'acme/frontend',
+				repositories: ['acme/frontend'],
 				enrollments: [makeEnrollment({ projectRepos: ['acme/backend', 'acme/frontend'] })],
 			});
 
@@ -726,7 +726,7 @@ describe('WorkerDetailView enrollment blocks', () => {
 		// so an operator can tell a typo from a repository the project does not have.
 		it('names every project repository on a genuine multi-repository mismatch', () => {
 			renderWorker({
-				repository: 'acme/docs',
+				repositories: ['acme/docs'],
 				enrollments: [
 					makeEnrollment({
 						status: 'suspended',
@@ -746,7 +746,7 @@ describe('WorkerDetailView enrollment blocks', () => {
 		// An unidentifiable checkout is not a wrong one — the same rule the server applies.
 		it('says nothing when the machine declared no repository', () => {
 			renderWorker({
-				repository: null,
+				repositories: [],
 				enrollments: [makeEnrollment({ projectRepos: ['acme/backend'] })],
 			});
 
@@ -756,19 +756,50 @@ describe('WorkerDetailView enrollment blocks', () => {
 		// The project no longer resolves: nothing to disagree with, so no banner.
 		it('says nothing when the project declares no repository the view can read', () => {
 			renderWorker({
-				repository: 'acme/frontend',
+				repositories: ['acme/frontend'],
 				enrollments: [makeEnrollment({ projectRepos: [] })],
 			});
 
 			expect(screen.queryByText(/This machine's checkout is/)).toBeNull();
 		});
 
-		it('reports the declared checkout repository beside the two capability axes', () => {
-			renderWorker({ repository: 'acme/frontend', enrollments: [] });
+		it('reports the declared checkout repositories beside the two capability axes', () => {
+			renderWorker({ repositories: ['acme/frontend', 'acme/mobile'], enrollments: [] });
 
 			const declared = within(section('Declared by the daemon'));
-			expect(declared.getByText('Checkout repository')).toBeDefined();
+			expect(declared.getByText('Checkout repositories')).toBeDefined();
 			expect(declared.getByText('acme/frontend')).toBeDefined();
+			expect(declared.getByText('acme/mobile')).toBeDefined();
+		});
+
+		// Issue #1056: a machine holding several checkouts keeps an enrollment whose
+		// project owns any of them, and a genuine mismatch names every checkout it holds.
+		it('says nothing when any of several checkouts is the project’s repository', () => {
+			renderWorker({
+				repositories: ['acme/docs', 'acme/frontend'],
+				enrollments: [makeEnrollment({ projectRepos: ['acme/frontend'] })],
+			});
+
+			expect(screen.queryByText(/This machine's checkout/)).toBeNull();
+		});
+
+		it('names every checkout the machine holds when none is the project’s', () => {
+			renderWorker({
+				repositories: ['acme/docs', 'acme/mobile'],
+				enrollments: [
+					makeEnrollment({
+						status: 'suspended',
+						isRoutable: false,
+						projectRepos: ['acme/backend'],
+					}),
+				],
+			});
+
+			const reason = screen.getByText(/This machine's checkouts are/);
+			expect(reason.textContent).toContain('acme/docs');
+			expect(reason.textContent).toContain('acme/mobile');
+			expect(reason.textContent).toContain('acme/backend');
+			expect(reason.textContent).toContain('give this one a checkout of it');
 		});
 	});
 

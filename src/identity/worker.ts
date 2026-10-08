@@ -227,12 +227,13 @@ export type WorkerWorktreeSweepState = z.infer<typeof WorkerWorktreeSweepStateSc
  * so a narrower set today means an older build. `id` is generated (`uuid`), not
  * externally supplied.
  *
- * `repository` is the third self-declared fact (issue #687), and the one that is
- * not a *capability*: it states which repository the machine's single local
- * checkout is (`SWARM_WORKER_REPO_ROOT`), resolved from that checkout's `origin`
- * remote and re-declared on every reconnect, in the shared normalised
- * `owner/repo` form (`RepoSlugSchema`, `../scm/repo-slug.ts`) — so comparing it
- * against a `ProjectConfig.repo` must normalise that side too. `null` means no
+ * `repositories` is the third self-declared fact (issue #687; a set since issue
+ * #1056), and the one that is not a *capability*: it states which repositories the
+ * machine holds a local checkout of (`SWARM_WORKER_REPO_ROOT`), each resolved from
+ * its checkout's `origin` remote and re-declared on every reconnect, in the shared
+ * normalised `owner/repo` form (`RepoSlugSchema`, `../scm/repo-slug.ts`) — so
+ * comparing one against a `ProjectConfig.repo` must normalise that side too. The
+ * primary checkout comes first and no slug appears twice. `[]` means no
  * declaration: a worker registered but never connected, a daemon too old to send
  * the field, or a checkout with no identifiable `origin`. Trusted exactly as the
  * two capability axes are — it guards against operator error (a daemon launched in
@@ -251,7 +252,7 @@ export type WorkerWorktreeSweepState = z.infer<typeof WorkerWorktreeSweepStateSc
  * re-declared on every reconnect. It is what `daemonVersion` cannot answer — that
  * resolves to `package.json`'s `version`, which never moves — so this is the only
  * way to tell from the control plane whether a worker is running a given fix. Note
- * that the install root is *not* the machine's `repository` above: one npm-linked
+ * that the install root is *not* one of the machine's `repositories` above: one npm-linked
  * SWARM checkout can serve daemons each working in a different project repository.
  * `null` means no declaration: a worker registered but never connected, a daemon too
  * old to send the field, or an install root that is not a git checkout. Trusted
@@ -307,10 +308,10 @@ export const WorkerSchema = z.object({
 	/** The owner's durable declaration, or `null` when none has been made. */
 	declaredCapabilities: z.array(AgentCliSchema).nullable(),
 	supportedPhases: z.array(TriggerPhaseSchema),
-	repository: RepoSlugSchema.nullable(),
+	repositories: z.array(RepoSlugSchema),
 	/**
 	 * The daemon's self-reported `os.hostname()`, or `null` when none has been
-	 * reported — rewritten at every handshake, `repository`'s exact contract.
+	 * reported — rewritten at every handshake, `build`'s exact contract.
 	 * Diagnostic/display only: an unauthenticated field of the handshake body, so
 	 * nothing may be gated or scoped on it (`src/db/schema/workers.ts` "Diagnostic
 	 * only" note).

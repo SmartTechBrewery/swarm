@@ -64,7 +64,7 @@ function makeWorker(): Worker {
 		probedCapabilities: ['claude'],
 		declaredCapabilities: null,
 		supportedPhases: ['review'],
-		repository: null,
+		repositories: [],
 		hostname: null,
 		drainingSince: new Date('2026-09-13T10:00:00Z'),
 		update: null,

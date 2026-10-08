@@ -221,36 +221,40 @@ export class AllowedClisNotCapableError extends Error {
 
 /**
  * Raised when an enrollment would pair a worker with a project that declares
- * **none** of its repositories as the repository the worker's own checkout is
- * (issue #690, widened by #946) — the enrollment-time twin of the daemon's
- * pre-flight assignment refusal (issue #688). A worker holds a single local
- * checkout, so an enrollment into a project that does not own that repository can
- * only ever produce refused work.
+ * **none** of the repositories the worker holds a checkout of (issue #690, widened
+ * by #946 on the project side and #1056 on the worker side) — the enrollment-time
+ * twin of the daemon's pre-flight assignment refusal (issue #688). An enrollment
+ * into a project that owns none of the machine's checkouts can only ever produce
+ * refused work.
  *
  * Both sides are named so the operator can see *what* disagrees; the declaration
- * is the worker's own normalised `Worker.repository`, the project side is every
+ * is the worker's own normalised `Worker.repositories`, the project side is every
  * repository the project declares (`ProjectRecord.repositories`), normalised —
  * not just its default entry, so a typo reads as a typo rather than as a
  * genuinely unowned repository. A distinct type so the router surfaces it as a
  * `BAD_REQUEST` and the CLI as one actionable line, exactly as
  * {@link AllowedClisNotCapableError} is surfaced.
  *
- * The singular/plural fork is deliberate: for a single-repository project the
- * message is byte-identical to the one this raised before #946 widened it.
+ * The singular/plural forks are deliberate: for a single-repository project and a
+ * worker declaring one checkout, the message is byte-identical to the one this
+ * raised before #946 and #1056 widened it.
  */
 export class EnrollmentRepositoryMismatchError extends Error {
 	constructor(
 		public readonly workerId: string,
-		public readonly declaredRepository: string,
+		public readonly declaredRepositories: string[],
 		public readonly projectRepositories: string[],
 	) {
 		const owned = projectRepositories.map((repo) => `'${repo}'`).join(', ');
+		const held = declaredRepositories.map((repo) => `'${repo}'`).join(', ');
 		const one = projectRepositories.length === 1;
+		const oneHeld = declaredRepositories.length === 1;
 		super(
 			`Worker ${workerId} cannot be enrolled in a project for ` +
-				`${one ? 'repository' : 'repositories'} ${owned}: its checkout is ` +
-				`'${declaredRepository}'. Enroll a worker whose checkout is ` +
-				`${one ? 'that repository' : 'one of those repositories'}, or point this one at it.`,
+				`${one ? 'repository' : 'repositories'} ${owned}: ` +
+				`${oneHeld ? 'its checkout is' : 'its checkouts are'} ${held}. Enroll a worker whose checkout is ` +
+				`${one ? 'that repository' : 'one of those repositories'}, ` +
+				`${oneHeld ? 'or point this one at it.' : 'or give this one a checkout of it.'}`,
 		);
 		this.name = 'EnrollmentRepositoryMismatchError';
 	}

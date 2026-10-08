@@ -9,7 +9,7 @@ function makeWorker(overrides: Partial<WorkerRow> = {}): WorkerRow {
 		owner: { userId: 'u1', identifier: 'ada@example.com', displayName: 'Ada Lovelace' },
 		capabilities: ['claude'],
 		supportedPhases: ['implementation'],
-		repository: 'acme/frontend',
+		repositories: ['acme/frontend'],
 		hostname: null,
 		// The daemon's declared SWARM build and the server's verdict on it (issue #925).
 		build: { commit: 'abc1234def5678', dirty: false },
@@ -45,6 +45,12 @@ describe('workerMatchesSearch', () => {
 		expect(workerMatchesSearch(makeWorker(), 'acme/front')).toBe(true);
 	});
 
+	// Issue #1056: every checkout a machine holds is searchable, not only its first.
+	it('matches a repository beyond the first declared one', () => {
+		const both = makeWorker({ repositories: ['acme/frontend', 'acme/mobile'] });
+		expect(workerMatchesSearch(both, 'acme/mob')).toBe(true);
+	});
+
 	it('treats an empty or whitespace-only query as no filter', () => {
 		expect(workerMatchesSearch(makeWorker(), '')).toBe(true);
 		expect(workerMatchesSearch(makeWorker(), '   ')).toBe(true);
@@ -55,7 +61,7 @@ describe('workerMatchesSearch', () => {
 	});
 
 	it('tolerates a worker with no owner and no repository', () => {
-		const anonymous = makeWorker({ owner: null, repository: null });
+		const anonymous = makeWorker({ owner: null, repositories: [] });
 		expect(workerMatchesSearch(anonymous, 'ada')).toBe(true);
 		expect(workerMatchesSearch(anonymous, 'acme')).toBe(false);
 	});
@@ -72,7 +78,7 @@ describe('filterWorkersBySearch', () => {
 		workerId: 'worker-2',
 		displayName: 'grace-box',
 		owner: { userId: 'u2', identifier: 'grace@example.com', displayName: 'Grace Hopper' },
-		repository: 'acme/backend',
+		repositories: ['acme/backend'],
 	});
 
 	it('keeps only the matching rows', () => {

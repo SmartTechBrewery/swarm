@@ -139,11 +139,11 @@ interface WorkerEnrollmentCardProps {
 	/** The machine's declared phase repertoire — a phase it doesn't declare can't be added. */
 	supportedPhases: string[];
 	/**
-	 * The repository the machine's checkout is (issue #687), or `null` when it
-	 * declared none — read against this enrollment's `projectRepos` to state the
-	 * mismatch that refused or suspended it (issue #690).
+	 * The repositories the machine holds a checkout of (issues #687, #1056), or `[]`
+	 * when it declared none — read against this enrollment's `projectRepos` to state
+	 * the mismatch that refused or suspended it (issue #690).
 	 */
-	declaredRepository: string | null;
+	declaredRepositories: string[];
 	/** Phases this project has turned off for every worker (`pipeline.<phase>.enabled: false`). */
 	projectDisabledPhases: string[];
 	projectName: string;
@@ -180,9 +180,19 @@ function consentSwitchText(
 	};
 }
 
+/** A comma-separated run of monospaced repository slugs. */
+function RepositoryList({ repositories }: { repositories: string[] }) {
+	return repositories.map((repo, index) => (
+		<Fragment key={repo}>
+			{index > 0 ? ', ' : null}
+			<span className="font-mono">{repo}</span>
+		</Fragment>
+	));
+}
+
 /**
- * Why this enrollment was refused or suspended: the machine's checkout is not one
- * of this project's repositories (issue #690, widened by #946). Stated as the
+ * Why this enrollment was refused or suspended: none of the machine's checkouts is
+ * one of this project's repositories (issue #690, widened by #946 and #1056). Stated as the
  * repositories themselves — derived from the live facts on every render rather than
  * from a sentence stored when the mismatch was detected, so it cannot go stale if
  * either side changes.
@@ -190,7 +200,9 @@ function consentSwitchText(
  * A multi-repository project names **every** repository it owns, not just its
  * default entry: the project may legitimately hold one worker per repository, so
  * the operator's question is which of several this machine should have been checked
- * out from. A single-repository project reads exactly as it always has.
+ * out from. A machine holding several checkouts names them all the same way. A
+ * single-repository project and a single-checkout machine read exactly as they
+ * always have.
  *
  * Rendered whatever the enrollment's status is. A mismatch normally *is* a
  * suspension (the handshake's policing pass suspends one it finds), but an active
@@ -198,25 +210,21 @@ function consentSwitchText(
  * dispatch gate routes work there and the daemon then refuses it (issue #688).
  */
 function RepositoryMismatch({
-	declaredRepository,
+	declaredRepositories,
 	projectRepositories,
 }: {
-	declaredRepository: string;
+	declaredRepositories: string[];
 	projectRepositories: string[];
 }) {
 	const several = projectRepositories.length > 1;
+	const severalHeld = declaredRepositories.length > 1;
 	return (
 		<p className="p-3 bg-amber-950/20 border border-amber-900/30 text-xs text-amber-200 rounded leading-relaxed">
-			This machine's checkout is <span className="font-mono">{declaredRepository}</span>, but this
-			project is{' '}
-			{projectRepositories.map((repo, index) => (
-				<Fragment key={repo}>
-					{index > 0 ? ', ' : null}
-					<span className="font-mono">{repo}</span>
-				</Fragment>
-			))}
-			. Work for this project cannot run here — enroll a machine checked out from{' '}
-			{several ? 'one of those repositories' : 'that repository'}, or point this one at{' '}
+			This machine's {severalHeld ? 'checkouts are' : 'checkout is'}{' '}
+			<RepositoryList repositories={declaredRepositories} />, but this project is{' '}
+			<RepositoryList repositories={projectRepositories} />. Work for this project cannot run here —
+			enroll a machine checked out from {several ? 'one of those repositories' : 'that repository'},
+			or {severalHeld ? 'give this one a checkout of' : 'point this one at'}{' '}
 			{several ? 'one of them' : 'it'}.
 		</p>
 	);
@@ -331,7 +339,7 @@ export function WorkerEnrollmentCard({
 	workerName,
 	capabilities,
 	supportedPhases,
-	declaredRepository,
+	declaredRepositories,
 	projectDisabledPhases,
 	projectName,
 	viewerIsOwner,
@@ -392,7 +400,7 @@ export function WorkerEnrollmentCard({
 	});
 
 	const blockers = routabilityBlockers(enrollment);
-	const mismatch = repositoryMismatch(declaredRepository, enrollment.projectRepos);
+	const mismatch = repositoryMismatch(declaredRepositories, enrollment.projectRepos);
 	// A confirmation dialog shows its own action's error; the inline feedback for
 	// that control stays quiet meanwhile so the message isn't stated twice.
 	const confirmOpen = confirm !== null;

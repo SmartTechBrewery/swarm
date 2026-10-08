@@ -59,7 +59,7 @@ function makeCandidate(
 		ownerUserId?: string;
 		capabilities?: Worker['capabilities'];
 		supportedPhases?: Worker['supportedPhases'];
-		repository?: Worker['repository'];
+		repositories?: Worker['repositories'];
 		drainingSince?: Worker['drainingSince'];
 		enrollment?: Partial<WorkerEnrollment>;
 		connected?: boolean;
@@ -81,7 +81,7 @@ function makeCandidate(
 			// A single-repository project, which is the regression bar for every case in this
 			// file that says nothing about repositories: the declared checkout always is the
 			// task's, so the #714 check is satisfied rather than merely skipped.
-			repository: overrides.repository === undefined ? REPOSITORY : overrides.repository,
+			repositories: overrides.repositories ?? [REPOSITORY],
 			hostname: null,
 			// In the pool (issue #919) for every case that says nothing about draining.
 			drainingSince: overrides.drainingSince ?? null,
@@ -1094,14 +1094,14 @@ describe('evaluateDispatchEligibility', () => {
 		});
 	});
 
-	// Issue #714. A machine holds one checkout, so a task for another repository can run
-	// no phase on it. The gate skips such a machine up front rather than selecting it,
+	// Issue #714. A machine holding no checkout of a task's repository can run no phase
+	// of it (a machine may hold several, issue #1056). The gate skips such a machine up front rather than selecting it,
 	// claiming it, and having the worker refuse the assignment terminally (issue #688).
 	describe('the task’s repository (issue #714)', () => {
 		it('selects the machine whose checkout is the task’s repository', async () => {
 			listProjectDispatchCandidates.mockResolvedValue([
-				makeCandidate('w-other', { repository: OTHER_REPOSITORY }),
-				makeCandidate('w-mine', { repository: REPOSITORY }),
+				makeCandidate('w-other', { repositories: [OTHER_REPOSITORY] }),
+				makeCandidate('w-mine', { repositories: [REPOSITORY] }),
 			]);
 
 			const decision = await evaluateDispatchEligibility(gateInput());
@@ -1111,8 +1111,8 @@ describe('evaluateDispatchEligibility', () => {
 
 		it('refuses with repository-mismatch when no machine holds it', async () => {
 			listProjectDispatchCandidates.mockResolvedValue([
-				makeCandidate('w-other', { repository: OTHER_REPOSITORY }),
-				makeCandidate('w-third', { repository: 'smarttechbrewery/cascade' }),
+				makeCandidate('w-other', { repositories: [OTHER_REPOSITORY] }),
+				makeCandidate('w-third', { repositories: ['smarttechbrewery/cascade'] }),
 			]);
 
 			const decision = await evaluateDispatchEligibility(gateInput());
@@ -1131,8 +1131,8 @@ describe('evaluateDispatchEligibility', () => {
 			// The best news available wins: one machine does hold this repository and is only
 			// occupied, so the wait clears by itself and must not read as an authorization one.
 			listProjectDispatchCandidates.mockResolvedValue([
-				makeCandidate('w-other', { repository: OTHER_REPOSITORY }),
-				makeCandidate('w-mine-busy', { repository: REPOSITORY, activeRuns: 1 }),
+				makeCandidate('w-other', { repositories: [OTHER_REPOSITORY] }),
+				makeCandidate('w-mine-busy', { repositories: [REPOSITORY], activeRuns: 1 }),
 			]);
 
 			const decision = await evaluateDispatchEligibility(gateInput());
@@ -1140,12 +1140,35 @@ describe('evaluateDispatchEligibility', () => {
 			expect(decision).toMatchObject({ status: 'ineligible', reason: 'worker-unavailable' });
 		});
 
+		it('selects a machine holding several checkouts for a run of its second repository', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-other', { repositories: [OTHER_REPOSITORY] }),
+				makeCandidate('w-both', { repositories: ['smarttechbrewery/cascade', REPOSITORY] }),
+			]);
+
+			const decision = await evaluateDispatchEligibility(gateInput());
+
+			expect(decision).toMatchObject({ status: 'selected', selection: { workerId: 'w-both' } });
+		});
+
+		it('still skips a machine holding several checkouts, none of them the task’s', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-neither', {
+					repositories: [OTHER_REPOSITORY, 'smarttechbrewery/cascade'],
+				}),
+			]);
+
+			const decision = await evaluateDispatchEligibility(gateInput());
+
+			expect(decision).toMatchObject({ status: 'ineligible', reason: 'repository-mismatch' });
+		});
+
 		it('keeps a machine that declared no repository selectable', async () => {
 			// An unidentifiable checkout must not become unroutable (issues #688, #690): the
 			// provision-time `origin` check is still its guard.
 			listProjectDispatchCandidates.mockResolvedValue([
-				makeCandidate('w-other', { repository: OTHER_REPOSITORY }),
-				makeCandidate('w-undeclared', { repository: null }),
+				makeCandidate('w-other', { repositories: [OTHER_REPOSITORY] }),
+				makeCandidate('w-undeclared', { repositories: [] }),
 			]);
 
 			const decision = await evaluateDispatchEligibility(gateInput());

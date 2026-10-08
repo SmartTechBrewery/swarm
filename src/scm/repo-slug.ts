@@ -17,10 +17,10 @@
  *
  * - the provision-time identity check (`GitWorktreeManager.assertRepoIdentity`),
  *   which refuses a checkout that is a git repository but not the assigned one;
- * - the transport handshake (`HandshakeRequestSchema.repository`,
- *   `../transport/protocol.ts`), where a daemon declares which repository its one
- *   local checkout is ({@link resolveDeclarableOriginRepoSlug});
- * - the persisted worker read model (`Worker.repository`, `../identity/worker.ts`);
+ * - the transport handshake (`HandshakeRequestSchema.repository` and
+ *   `.repositories`, `../transport/protocol.ts`), where a daemon declares which
+ *   repositories its local checkouts are ({@link resolveDeclarableOriginRepoSlug});
+ * - the persisted worker read model (`Worker.repositories`, `../identity/worker.ts`);
  * - the GitHub Projects PM provider's card routing (issue #686), which compares a
  *   card's backing `repository { nameWithOwner }` against the project's repository
  *   entries ({@link repoSlugsMatch}).

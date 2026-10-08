@@ -100,7 +100,7 @@ function rowToWorker(row: WorkerRow): Worker {
 		probedCapabilities,
 		declaredCapabilities,
 		supportedPhases: row.supportedPhases as TriggerPhase[],
-		repository: row.repository ?? null,
+		repositories: (row.repositories as string[]) ?? [],
 		hostname: row.hostname ?? null,
 		drainingSince: row.drainingSince ?? null,
 		// Reassembled as one value so a consumer cannot read a commit without its flag
@@ -194,10 +194,10 @@ export async function createWorker(input: CreateWorkerInput): Promise<Worker> {
 			// a declaration. NULL means "no declaration, use auto-discovery", which is
 			// exactly how registration behaved before the column existed.
 			//
-			// `repository` is deliberately left to the column's NULL (issue #687):
-			// registering a worker is not declaring a checkout. An operator registers a
-			// machine from wherever they happen to be, and only the daemon that connects
-			// can state which repository the machine actually holds.
+			// `repositories` is deliberately left to the column's empty default (issues
+			// #687, #1056): registering a worker is not declaring a checkout. An operator
+			// registers a machine from wherever they happen to be, and only the daemon
+			// that connects can state which repositories the machine actually holds.
 			//
 			// `buildCommit`/`buildDirty` likewise (issue #918): registering a machine is
 			// not declaring a build, and only the program that connects knows its own.
@@ -290,20 +290,20 @@ export async function findWorkerByCredentialHash(hash: string): Promise<Worker |
  * stored phases untouched — the CLI-only path (`swarm workers set-cli`) knows
  * nothing about phases and must not silently reset them.
  *
- * `repository` (issue #687) is the daemon's declaration of which repository its one
- * local checkout is, written in that same transaction for the same reason. It is
- * **three-valued** on purpose: `undefined` leaves the stored value alone (the
- * `swarm workers set-cli` path knows nothing about checkouts and must not clear a
- * declaration it cannot make), `null` records that the connecting daemon declared
- * none, and a slug records it. `null` therefore *clears* an earlier daemon's
- * statement rather than leaving it standing — the row describes the program
- * currently operating it, and a stale-but-wrong checkout is worse than an absent
- * one.
+ * `repositories` (issue #687; a set since issue #1056) is the daemon's declaration
+ * of which repositories it holds a local checkout of, written in that same
+ * transaction for the same reason. It is **two-valued**: `undefined` leaves the
+ * stored set alone (the `swarm workers set-cli` path knows nothing about checkouts
+ * and must not clear a declaration it cannot make), and an array — `[]` included —
+ * writes it. `[]` therefore *clears* an earlier daemon's statement rather than
+ * leaving it standing — the row describes the program currently operating it, and
+ * a stale-but-wrong checkout is worse than an absent one.
  *
  * `build` (issue #918) is the SWARM build that daemon is running, written in the
- * same transaction on the same three-valued rule — with the one divergence that it
- * spans **two** columns: `null` sets both `build_commit` and `build_dirty` to null,
- * and a value writes both, so the pair is never half-set.
+ * same transaction and **three-valued**: `undefined` leaves it alone, `null` clears
+ * it, and a value records it — with the one divergence that it spans **two**
+ * columns: `null` sets both `build_commit` and `build_dirty` to null, and a value
+ * writes both, so the pair is never half-set.
  *
  * `supervision` (issue #997) is how that daemon is supervised, written in the same
  * transaction and **two-valued** rather than three: `undefined` leaves the stored
@@ -348,7 +348,7 @@ export async function updateWorkerCapabilities(
 	id: string,
 	capabilities: AgentCli[],
 	supportedPhases?: TriggerPhase[],
-	repository?: string | null,
+	repositories?: string[],
 	build?: WorkerBuild | null,
 	supervision?: WorkerSupervision,
 	version?: string | null,
@@ -386,7 +386,7 @@ export async function updateWorkerCapabilities(
 		// "omitted means leave it alone" rule once and a fourth axis costs one line.
 		const declaration: Partial<typeof workers.$inferInsert> = { capabilities };
 		if (supportedPhases) declaration.supportedPhases = supportedPhases;
-		if (repository !== undefined) declaration.repository = repository;
+		if (repositories !== undefined) declaration.repositories = repositories;
 		if (build !== undefined) {
 			declaration.buildCommit = build?.commit ?? null;
 			declaration.buildDirty = build?.dirty ?? null;
@@ -396,8 +396,8 @@ export async function updateWorkerCapabilities(
 		// judged on and the version is only the label beside it, so a daemon that
 		// declares one without the other must not have the other cleared.
 		if (version !== undefined) declaration.version = version;
-		// Three-valued on `repository`'s exact pattern (omit to leave the stored value
-		// alone, `null` to clear it) — but unlike `repository`, `hostname` itself is
+		// Three-valued on `build`'s exact pattern (omit to leave the stored value alone,
+		// `null` to clear it) — but unlike the repository set, `hostname` itself is
 		// diagnostic and display-only and is never gated on anywhere
 		// (`src/db/schema/workers.ts` "Diagnostic only" note).
 		if (hostname !== undefined) declaration.hostname = hostname;

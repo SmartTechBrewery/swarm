@@ -238,7 +238,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		probedCapabilities: ['claude'],
 		declaredCapabilities: null,
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
-		repository: null,
+		repositories: [],
 		hostname: null,
 		// In the pool (issue #919) unless a case overrides it.
 		drainingSince: null,

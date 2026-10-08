@@ -28,11 +28,11 @@ const TASK_REPOSITORY = 'smarttechbrewery/swarm';
 
 function makeWorker(
 	overrides: Partial<Worker> = {},
-): Pick<Worker, 'capabilities' | 'supportedPhases' | 'repository' | 'drainingSince'> {
+): Pick<Worker, 'capabilities' | 'supportedPhases' | 'repositories' | 'drainingSince'> {
 	return {
 		capabilities: ['claude', 'codex'],
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
-		repository: TASK_REPOSITORY,
+		repositories: [TASK_REPOSITORY],
 		// In the pool (issue #919), which is what every case that says nothing about
 		// draining assumes.
 		drainingSince: null,
@@ -219,21 +219,33 @@ describe('evaluateWorkerEligibility', () => {
 		});
 	});
 
-	// Issue #714. A worker holds exactly one checkout and declares which repository it
-	// is at handshake (#687); a task for another repository can run no phase there at
-	// all, so the gate must skip the machine rather than select it and have the worker
+	// Issue #714. A worker declares the repositories it holds a checkout of at handshake
+	// (#687, a set since #1056); a task for a repository it does not hold can run no
+	// phase there at all, so the gate must skip the machine rather than select it and have the worker
 	// refuse the assignment terminally on arrival (#688).
-	describe('the repository the machine’s checkout is (issue #714)', () => {
+	describe('the repositories the machine holds a checkout of (issues #714, #1056)', () => {
 		it('repository-mismatch when the declared checkout is a different repository', () => {
-			const worker = makeWorker({ repository: 'smarttechbrewery/other' });
+			const worker = makeWorker({ repositories: ['smarttechbrewery/other'] });
 			expect(evaluate({ worker })).toEqual({
 				eligible: false,
 				reason: 'repository-mismatch',
 			});
 		});
 
+		it('is eligible when one of several declared checkouts is the task’s repository', () => {
+			const worker = makeWorker({ repositories: ['smarttechbrewery/other', TASK_REPOSITORY] });
+			expect(evaluate({ worker })).toEqual({ eligible: true });
+		});
+
+		it('repository-mismatch when none of several declared checkouts is the task’s', () => {
+			const worker = makeWorker({
+				repositories: ['smarttechbrewery/other', 'smarttechbrewery/third'],
+			});
+			expect(evaluate({ worker })).toEqual({ eligible: false, reason: 'repository-mismatch' });
+		});
+
 		it('is eligible when the declaration is the task’s repository', () => {
-			expect(evaluate({ worker: makeWorker({ repository: TASK_REPOSITORY }) })).toEqual({
+			expect(evaluate({ worker: makeWorker({ repositories: [TASK_REPOSITORY] }) })).toEqual({
 				eligible: true,
 			});
 		});
@@ -242,7 +254,7 @@ describe('evaluateWorkerEligibility', () => {
 		// wrote with the host's casing and a `.git` suffix still matches the normalised
 		// declaration the daemon sent.
 		it('normalises both sides — casing and a trailing .git are noise', () => {
-			const worker = makeWorker({ repository: 'smarttechbrewery/swarm' });
+			const worker = makeWorker({ repositories: ['smarttechbrewery/swarm'] });
 			expect(evaluate({ worker, repository: 'SmartTechBrewery/Swarm.git' })).toEqual({
 				eligible: true,
 			});
@@ -252,14 +264,14 @@ describe('evaluateWorkerEligibility', () => {
 		// `origin` check and #688's assignment refusal stay its guards, exactly as #690
 		// decided for enrollment.
 		it('does not refuse a worker that declared no repository', () => {
-			expect(evaluate({ worker: makeWorker({ repository: null }) })).toEqual({ eligible: true });
+			expect(evaluate({ worker: makeWorker({ repositories: [] }) })).toEqual({ eligible: true });
 		});
 
 		// Connection and capacity stay ahead of the repository: "some worker is merely
 		// busy or offline" is the best news available, and a machine that *does* hold this
 		// repository but is offline must report that instead.
 		it('does not preempt an earlier missing signal', () => {
-			const worker = makeWorker({ repository: 'smarttechbrewery/other' });
+			const worker = makeWorker({ repositories: ['smarttechbrewery/other'] });
 			expect(evaluate({ worker, availability: { connected: false, activeRuns: 0 } })).toEqual({
 				eligible: false,
 				reason: 'worker-unavailable',
@@ -270,7 +282,7 @@ describe('evaluateWorkerEligibility', () => {
 		// wrong tree can run no phase and no CLI for this task whatever it declares.
 		it('reports the repository before the phase and the CLI', () => {
 			const worker = makeWorker({
-				repository: 'smarttechbrewery/other',
+				repositories: ['smarttechbrewery/other'],
 				capabilities: ['claude'],
 				supportedPhases: ['implementation'],
 			});

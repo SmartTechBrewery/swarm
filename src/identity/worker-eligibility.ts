@@ -9,7 +9,7 @@
  * with active owner sharing consent, project enrollment, required CLI
  * capability, and available capacity" — in that order: active enrollment →
  * active sharing consent → draining (issue #919) → connection/health → free
- * capacity → the repository the machine's checkout is (issue #714) → declared
+ * capacity → whether the machine holds the repository (issues #714, #1056) → declared
  * phase support (issue #467) → the enrollment's own allowed phases (issue #509) →
  * declared CLI capability → that CLI's own cool-down (issue #981). The first
  * missing signal wins, so a caller always gets
@@ -63,9 +63,9 @@ import { permitsPhase, type WorkerEnrollment } from './worker-enrollment.js';
  * - `worker-unavailable` — the worker is disconnected/unhealthy (no live
  *   session) or already at its enrolled concurrency allocation. One value, since
  *   both resolve the same way: wait for the worker to come back or free a slot.
- * - `repository-mismatch` — the machine's one local checkout is a *different*
- *   repository than this task's (issue #714): it declared one at handshake
- *   (`Worker.repository`, issue #687) and that declaration is not the task's. Its own
+ * - `repository-mismatch` — the machine holds no checkout of this task's repository
+ *   (issue #714): it declared its checkouts at handshake (`Worker.repositories`,
+ *   issues #687 and #1056) and none of them is the task's. Its own
  *   value rather than a reuse of `worker-unavailable` or `missing-enrollment`,
  *   because the fix is one no other reason names — point a worker at this
  *   repository, or enroll one that already holds it — and no machine coming online
@@ -153,11 +153,11 @@ export interface WorkerAvailability {
 /** Everything {@link evaluateWorkerEligibility} judges — one worker, one target. */
 export interface WorkerEligibilityInput {
 	/**
-	 * The worker's declared CLI and phase capabilities, the repository its one local
-	 * checkout is (`./worker.ts`) — `null` when it has declared none — and whether
-	 * its operator has taken it out of the pool (`drainingSince`, issue #919).
+	 * The worker's declared CLI and phase capabilities, the repositories it holds a
+	 * local checkout of (`./worker.ts`) — `[]` when it has declared none — and
+	 * whether its operator has taken it out of the pool (`drainingSince`, issue #919).
 	 */
-	worker: Pick<Worker, 'capabilities' | 'supportedPhases' | 'repository' | 'drainingSince'>;
+	worker: Pick<Worker, 'capabilities' | 'supportedPhases' | 'repositories' | 'drainingSince'>;
 	/** Its enrollment for the project, or `undefined` when it has none. */
 	enrollment: WorkerEnrollment | undefined;
 	availability: WorkerAvailability;
@@ -241,7 +241,8 @@ export function evaluateWorkerEligibility(input: WorkerEligibilityInput): Eligib
 	if (!availability.connected || atCapacity) {
 		return { eligible: false, reason: 'worker-unavailable' };
 	}
-	// Which repository the machine's one checkout actually is (issue #714) — the most
+	// Whether the machine holds a checkout of this task's repository at all (issues
+	// #714, #1056) — the most
 	// fundamental property of the pairing, so it is judged before *any* capability: a
 	// worker holding the wrong tree can run no phase of this task at all, whichever
 	// phases and CLIs it declares. Connection and capacity stay ahead of it because
@@ -250,7 +251,10 @@ export function evaluateWorkerEligibility(input: WorkerEligibilityInput): Eligib
 	//
 	// A worker that declared nothing is not refused: see `repository-mismatch` in
 	// {@link IneligibilityReasonSchema} for why, and where its guards are instead.
-	if (worker.repository && !repoSlugsMatch(repository, worker.repository)) {
+	if (
+		worker.repositories.length > 0 &&
+		!worker.repositories.some((held) => repoSlugsMatch(repository, held))
+	) {
 		return { eligible: false, reason: 'repository-mismatch' };
 	}
 	// Whether this machine runs this phase at all — judged before the CLI because it

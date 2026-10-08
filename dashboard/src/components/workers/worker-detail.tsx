@@ -32,13 +32,13 @@ import type { AgentCli } from '../../../../src/harness/agent-cli.js';
  * ({@link WorkerEnrollmentCard}, which owns the editable values and their
  * authorization).
  *
- * **The daemon's `supportedPhases`, `repository` and `build` are read-only; its CLI
+ * **The daemon's `supportedPhases`, `repositories` and `build` are read-only; its CLI
  * set is not.** A daemon declares them all at handshake and re-declares them on every
- * reconnect, so a phase repertoire, a checkout repository and a SWARM build are
+ * reconnect, so a phase repertoire, the checkout repositories and a SWARM build are
  * reported here and never offered as an edit — editing any of them would only make
  * the dashboard disagree with the machine until its next heartbeat. The checkout
- * repository is here because it is the fact an enrollment for a *different*
- * repository is refused or suspended against (issue #690), which the enrollment
+ * repositories are here because they are the fact an enrollment for a project
+ * owning none of them is refused or suspended against (issues #690, #1056), which the enrollment
  * blocks below then name in full. The **SWARM build** is here (issue #925) because
  * it is the only thing that answers "is this machine running the fix?": it is marked
  * when it is not the control plane's own build, and this screen is the one surface
@@ -843,11 +843,13 @@ export function WorkerDetailView({
 						<SupportedPhases phases={worker.supportedPhases} />
 					</Field>
 					<Field
-						label="Checkout repository"
+						label="Checkout repositories"
 						mono
-						hint="The only repository this machine works in. Work for any other repository is never sent here."
+						hint="The repositories this machine holds a checkout of. Work for any other repository is never sent here."
 					>
-						{worker.repository ?? EM_DASH}
+						{worker.repositories.length > 0
+							? worker.repositories.map((repository) => <div key={repository}>{repository}</div>)
+							: EM_DASH}
 					</Field>
 					<Field
 						label="Hostname"
@@ -929,7 +931,7 @@ export function WorkerDetailView({
 								workerName={worker.displayName}
 								capabilities={worker.capabilities}
 								supportedPhases={worker.supportedPhases}
-								declaredRepository={worker.repository}
+								declaredRepositories={worker.repositories}
 								projectDisabledPhases={projectDisabledPhases.get(enrollment.projectId) ?? []}
 								projectName={projectNames.get(enrollment.projectId) ?? enrollment.projectId}
 								viewerIsOwner={worker.viewerIsOwner}
