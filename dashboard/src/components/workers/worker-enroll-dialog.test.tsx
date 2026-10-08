@@ -82,14 +82,28 @@ describe('WorkerEnrollDialog project picker (issue #764)', () => {
 
 		const select = await projectSelect();
 		const options = Array.from(select.querySelectorAll('option')).map((o) => o.textContent);
-		expect(options).toEqual(['Select a project…', 'Rover — acme/rover']);
+		expect(options).toEqual(['Select a project…', 'Rover']);
 	});
 
-	it('names each project’s repository, so a mismatch is avoidable before submitting', async () => {
+	// Issue #1063: a project can own several repositories, so naming its first beside the
+	// name misled an operator enrolling a machine that holds another one.
+	it('labels each project by name alone, even when it owns several repositories', async () => {
+		projectsListQueryFn.mockResolvedValue([
+			{
+				id: 'proj-c',
+				name: 'Platform',
+				repositories: [{ repo: 'acme/platform' }, { repo: 'acme/mobile' }],
+			},
+		]);
 		renderDialog();
 
 		const select = await projectSelect();
-		expect(select.textContent).toContain('Widgets — acme/frontend');
+		const options = Array.from(select.querySelectorAll('option')).map((o) => o.textContent);
+		expect(options).toEqual(['Select a project…', 'Platform']);
+		expect(select.textContent).not.toContain('acme/');
+		expect(
+			screen.getByText(/at least one of the repositories this machine has checked out/),
+		).toBeDefined();
 	});
 
 	it('says so — and disables submit — when every accessible project is already enrolled', async () => {
