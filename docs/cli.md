@@ -771,10 +771,11 @@ unchanged.
   prints the whole member table: `queued` (not reached yet, still in the pool),
   `draining` (out of the pool, waiting to go idle — draining never interrupts a
   run), `signalled` (asked, awaiting its report), `verifying` (it applied; waiting
-  for a daemon on the new build to take a fresh lease), `done`, `skipped` (settled
-  without being moved — the rollout halted first, another session re-targeted the
-  machine, it is enrolled in no project, or it declared it runs under no process
-  supervisor and so would not come back) and `failed`. A tally line counts them. A
+  for a daemon on the new build to take a lease after its report), `done`, `skipped`
+  (settled without being moved — the rollout halted first, another session
+  re-targeted the machine, it is enrolled in no project, it declared it runs under no
+  process supervisor and so would not come back, or it was offline when its turn
+  came and so was passed over without being drained or asked) and `failed`. A tally line counts them. A
   skipped machine goes back in the dispatch pool and the wave carries on past it.
   **A bad build halts the rollout.** A machine that reports `failed`, `refused` or
   `declined`, or that comes back still on the build it was asked to leave (which is

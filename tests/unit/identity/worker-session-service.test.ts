@@ -78,6 +78,7 @@ function makeSession(overrides: Partial<WorkerSession> = {}): WorkerSession {
 		instanceId: null,
 		fencingToken: 1,
 		lastHeartbeatAt: new Date('2026-01-01T00:00:00Z'),
+		acquiredAt: new Date('2026-01-01T00:00:00Z'),
 		currentRunId: null,
 		createdAt: new Date('2026-01-01T00:00:00Z'),
 		...overrides,

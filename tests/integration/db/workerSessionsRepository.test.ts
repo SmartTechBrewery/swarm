@@ -313,6 +313,63 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 			});
 		});
 
+		// Issue #1071: the rollout's come-back verdict counts only a lease taken after a
+		// machine reported, so every acquire must stamp when it took the lease and nothing
+		// else may move it.
+		describe('acquired_at', () => {
+			/** Set the stored acquisition time well into the past, so a re-stamp is visible. */
+			async function backdateAcquiredAt(workerId: string): Promise<Date> {
+				const past = new Date(Date.now() - 60 * 60_000);
+				await getDb()
+					.update(workerSessions)
+					.set({ acquiredAt: past })
+					.where(eq(workerSessions.workerId, workerId));
+				return past;
+			}
+
+			it('stamps the first acquire, and both reads return it', async () => {
+				const before = Date.now();
+				const session = await acquireLease(workerA, TTL);
+				expect(session.acquiredAt).toBeInstanceOf(Date);
+				expect(session.acquiredAt?.getTime()).toBeGreaterThanOrEqual(before - 1000);
+				expect((await getLiveSession(workerA, TTL))?.acquiredAt).toEqual(session.acquiredAt);
+				expect((await getRetainedSession(workerA))?.acquiredAt).toEqual(session.acquiredAt);
+			});
+
+			it('stamps a strictly later time on a re-acquire after expiry', async () => {
+				await acquireLease(workerA, TTL);
+				const past = await backdateAcquiredAt(workerA);
+				await expireSession(workerA);
+				const second = await acquireLease(workerA, TTL);
+				expect(second.acquiredAt?.getTime()).toBeGreaterThan(past.getTime());
+			});
+
+			it('stamps a strictly later time on a re-acquire after release', async () => {
+				const first = await acquireLease(workerA, TTL);
+				const past = await backdateAcquiredAt(workerA);
+				await releaseLease(workerA, first.fencingToken);
+				const second = await acquireLease(workerA, TTL);
+				expect(second.acquiredAt?.getTime()).toBeGreaterThan(past.getTime());
+			});
+
+			it('stamps a strictly later time on a same-holder reclaim', async () => {
+				const first = await acquireLease(workerA, TTL);
+				const past = await backdateAcquiredAt(workerA);
+				const reclaimed = await acquireLease(workerA, TTL, {
+					sessionId: first.id,
+					fencingToken: first.fencingToken,
+				});
+				expect(reclaimed.acquiredAt?.getTime()).toBeGreaterThan(past.getTime());
+			});
+
+			it('is not moved by a heartbeat', async () => {
+				const session = await acquireLease(workerA, TTL);
+				const past = await backdateAcquiredAt(workerA);
+				expect(await heartbeat(workerA, session.fencingToken, TTL)).toBe(true);
+				expect((await getLiveSession(workerA, TTL))?.acquiredAt).toEqual(past);
+			});
+		});
+
 		describe('heartbeat', () => {
 			it('refreshes a live session with the matching token', async () => {
 				const session = await acquireLease(workerA, TTL);

@@ -408,8 +408,8 @@ async function readRolloutView(rolloutId: string): Promise<RolloutView | undefin
  *    issue #975. A machine that went quiet instead of answering is given up on after
  *    {@link ABANDON_AFTER_MS}, which settles it `failed` *without* halting.
  * 2. **Verify** every member that applied: it has come back when a daemon has taken
- *    a fresh lease *and* the machine is no longer declaring the build it started
- *    from. Not coming back inside {@link ABANDON_AFTER_MS} is the same give-up —
+ *    a lease *after the machine reported* *and* the machine is no longer declaring
+ *    the build it started from. Not coming back inside {@link ABANDON_AFTER_MS} is the same give-up —
  *    silence names no cause, so the rollout abandons that machine and carries on.
  * 3. **Brake** on a run of give-ups: once {@link MAX_CONSECUTIVE_ABANDONED} members
  *    in a row have been given up on, with none coming back on the new build between
@@ -427,7 +427,10 @@ async function readRolloutView(rolloutId: string): Promise<RolloutView | undefin
  * 6. **Advance**, while it is still in progress: take the next `waveSize` queued
  *    members only once nothing is in flight, drain them, and signal the ones that
  *    have gone idle. A member still running a phase stays draining and is signalled
- *    on a later advance — draining never interrupts a run.
+ *    on a later advance — draining never interrupts a run. A queued or drained member
+ *    whose machine is offline when its turn comes is passed over `skipped` without
+ *    being drained or signalled (issue #1071), and the wave fills from the next
+ *    connected machine instead.
  * 7. **Complete** when every member has settled.
  */
 export async function advanceRollout(rolloutId: string): Promise<RolloutView | undefined> {
@@ -515,6 +518,38 @@ function abandonVerdict(message: string, now: Date, requestId: string | null): M
 		patch: { state: 'failed', message, settledAt: now },
 		returnToPool: true,
 		...(requestId ? { withdrawRequest: requestId } : {}),
+	};
+}
+
+/** The message recorded for a member whose machine had no live session when its turn came. */
+const OFFLINE_MESSAGE =
+	'the machine was offline when its turn came, so the rollout passed over it without ' +
+	'draining or asking it — start the fleet update again once it is back';
+
+/**
+ * Pass over a member whose machine holds no live session when the rollout reaches it
+ * (issue #1071): settle it **`skipped`** and move on to a connected machine.
+ *
+ * **`skipped` rather than `failed`**: nothing was asked and nothing failed — the
+ * machine simply was not there to ask. Signalling it anyway is what left a member
+ * with no fencing token to compare against, and what let that machine's ordinary
+ * old-build reconnect read as a come-back (observed 2026-10-08).
+ *
+ * **It does not count toward {@link MAX_CONSECUTIVE_ABANDONED}**, because
+ * {@link consecutiveAbandonments} already leaves `skipped` alone — and rightly: an
+ * offline machine says nothing about the build. Counting it would let one machine
+ * running several daemons, all offline, halt a rollout before any healthy machine was
+ * reached.
+ *
+ * **`returnToPool: true`** is a no-op for a never-drained `queued` member, because
+ * {@link AdvancePass.returnToPool} checks `drainedByRollout`; for a member this
+ * rollout already drained, it puts the machine back. **No `withdrawRequest`**: nothing
+ * was recorded, so there is nothing to withdraw.
+ */
+function passOverOfflineVerdict(now: Date): MemberVerdict {
+	return {
+		patch: { state: 'skipped', message: OFFLINE_MESSAGE, settledAt: now },
+		returnToPool: true,
 	};
 }
 
@@ -639,9 +674,24 @@ function decideReportedOutcome(
  * Whether a machine that applied has come back **on the new build**, which is two
  * facts rather than one, or `undefined` while it is still inside its window.
  *
- * A fresh lease (`worker_sessions.fencing_token`, per-worker monotonic and bumped on
- * every re-acquire) is the exact "a new daemon process took the lease" signal and
- * answers *came back*. It does not answer *on the new build*: a machine that returned
+ * A lease **taken after the machine reported** (`worker_sessions.acquired_at` later
+ * than `workers.update_reported_at`, issue #1071) is the "a new daemon process took
+ * the lease" signal and answers *came back*. Any earlier lease proves nothing, either
+ * way: the daemon that reported is still holding its own session at that instant —
+ * it reports, then releases, then exits — and a machine whose router connection
+ * dropped reconnects on its old build before it has even received the request
+ * (observed 2026-10-08, when exactly that reconnect was read as "came back on the
+ * build it started from" and halted a fleet). Both instants are `new Date()` in the
+ * router process — `recordWorkerUpdateReport` on the delivery route, `acquireLease` on
+ * the stream handshake — which is what makes comparing them sound. When the row has
+ * lost the report (another session re-asked the machine), the anchor falls back to
+ * `signalledAt`, as the window does. The fencing token recorded at signal stays as a
+ * cross-check wherever there is one: signal precedes report and every acquire bumps
+ * the token, so it is implied by the timestamp, never a substitute for it. A session
+ * with no `acquiredAt` (acquired before the column existed) is never proof — the
+ * verdict waits for an acquire that stamps one.
+ *
+ * Coming back does not answer *on the new build*: a machine that returned
  * itself to its last known good build (issue #934) also comes back with a bumped
  * token, and calling that a success would let a rollout march a whole fleet through a
  * build none of them end up running. So the commit the machine declares at handshake
@@ -663,20 +713,26 @@ function decideComeBack(
 	now: Date,
 	releasesFailedMembers: boolean,
 ): MemberVerdict | undefined {
-	// A null token at signal time means the machine had no live session to read one
-	// from, so any live session now is the new daemon.
-	const tookFreshLease =
+	// The window is measured from the instant the machine said `applied`, which is
+	// after its own bounded fetch/install/build, so none of that time is counted
+	// against it — and only a lease taken after that same instant is a come-back.
+	// `signalledAt` is the fallback for a member whose row no longer carries the
+	// report (another session asked it again).
+	const appliedAt = worker.update?.reportedAt ?? member.signalledAt ?? now;
+	const tookLeaseAfterReport =
 		session !== undefined &&
+		session.acquiredAt !== null &&
+		session.acquiredAt.getTime() > appliedAt.getTime() &&
 		(member.fencingTokenAtSignal === null || session.fencingToken > member.fencingTokenAtSignal);
 	const buildMoved =
 		member.buildCommitAtSignal === null || !worker.build
 			? undefined
 			: worker.build.commit !== member.buildCommitAtSignal;
 
-	if (tookFreshLease && buildMoved !== false) {
+	if (tookLeaseAfterReport && buildMoved !== false) {
 		return { patch: { state: 'done', settledAt: now }, returnToPool: true };
 	}
-	if (tookFreshLease) {
+	if (tookLeaseAfterReport) {
 		return {
 			patch: {
 				state: 'failed',
@@ -689,11 +745,6 @@ function decideComeBack(
 				`${member.buildCommitAtSignal} — the build it started from — so it did not stay on the new one`,
 		};
 	}
-	// The window is measured from the instant the machine said `applied`, which is
-	// after its own bounded fetch/install/build, so none of that time is counted
-	// against it. `signalledAt` is the fallback for a member whose row no longer
-	// carries the report (another session asked it again).
-	const appliedAt = worker.update?.reportedAt ?? member.signalledAt ?? now;
 	if (now.getTime() - appliedAt.getTime() <= ABANDON_AFTER_MS) return undefined;
 	// Nothing to withdraw: this machine answered, so its request is already settled on
 	// its own row — the member reached `verifying` by reading that answer.
@@ -708,7 +759,9 @@ function decideComeBack(
  * it, because that build demonstrably starts, so the earlier give-ups were about those
  * machines rather than about the build; a member settled without being moved
  * (`skipped`) — and one not settled yet — says nothing about the build and leaves the
- * run alone.
+ * run alone. That includes a machine passed over for being offline when its turn came
+ * ({@link passOverOfflineVerdict}, issue #1071): it was never asked, so it is no part
+ * of a run of give-ups.
  *
  * A non-halting `failed` member is by construction one the rollout gave up on: every
  * other `failed` verdict — a reported `failed`/`refused`/`declined`, and a machine
@@ -885,8 +938,9 @@ class AdvancePass {
 	 * **A wave that settles without ever being signalled must not cost a tick.** Some
 	 * members are decided the instant they are asked and never involve the machine at
 	 * all: `no-project` and `unsupervised` settle inside {@link recordSignal}, a
-	 * deregistered machine settles inside {@link reassertDrain}, and an `answered` one
-	 * is read straight off its own row. None of those produces an update report or a
+	 * deregistered machine settles inside {@link reassertDrain}, a machine offline when
+	 * its turn came is passed over inside {@link takeNextWave} or {@link signal}, and an
+	 * `answered` one is read straight off its own row. None of those produces an update report or a
 	 * handshake, so before this loop the only thing that could reach the member behind
 	 * them was `ROLLOUT_ADVANCE_TICK_MS` — a full minute of nothing, for a decision
 	 * that needed no machine to answer. Measured on a twelve-machine installation on
@@ -903,7 +957,8 @@ class AdvancePass {
 	 * unchanged: the loop stops there and the next advance picks it up.
 	 *
 	 * Termination is bounded twice over. Every iteration that returns `true` settled
-	 * at least one member that was `queued` when the pass began, and nothing inside a
+	 * at least one member that was `queued` when the pass began (an offline pass-over
+	 * included), and nothing inside a
 	 * pass ever returns a member to `queued`, so the queue strictly shrinks; the
 	 * counter is the belt to that braces, and costs one comparison.
 	 */
@@ -933,8 +988,10 @@ class AdvancePass {
 
 	/**
 	 * The members this pass will try to signal: whatever is already draining, plus the
-	 * next `waveSize` queued machines — but the queued ones **only when nothing at all
-	 * is in flight**. That is what bounds how much of the fleet is out of the pool at
+	 * next `waveSize` queued machines that are **connected** — but the queued ones **only
+	 * when nothing at all is in flight**. A queued machine with no live session is passed
+	 * over on the spot ({@link passOverOfflineVerdict}, issue #1071) without being
+	 * drained, and does not take up a place in the wave. That is what bounds how much of the fleet is out of the pool at
 	 * any instant, and what makes "verified before the next wave moves" true rather
 	 * than hoped for.
 	 *
@@ -950,11 +1007,21 @@ class AdvancePass {
 		const inFlight = this.members.filter((member) => isCommittedMemberState(member.state));
 		const draining = inFlight.filter((member) => member.state === 'draining');
 		if (inFlight.length > 0) return draining;
-		for (const member of this.members
-			.filter((candidate) => candidate.state === 'queued')
-			.slice(0, this.rollout.waveSize)) {
+		// Walked rather than sliced, so a member passed over as offline does not use up a
+		// slot: the rollout moves on to the next connected machine instead of taking a
+		// wave that comes back empty and ends the pass with connected members still queued.
+		for (const member of this.members) {
+			if (draining.length >= this.rollout.waveSize) break;
+			if (member.state !== 'queued') continue;
 			const worker = this.workers.get(member.workerId);
 			if (!worker) continue;
+			// "Connected" is the live lease — the one definition the fan-out, the rosters
+			// and the dispatch gate read — never the router's in-process stream map, which
+			// is empty when an advance runs in the API server.
+			if ((await getLiveSessionForWorker(member.workerId)) === undefined) {
+				await this.apply(member, passOverOfflineVerdict(this.now));
+				continue;
+			}
 			// `drainedByRollout` is decided once, here, from the snapshot taken before this
 			// pass drained anything: only a machine the rollout took out of the pool is put
 			// back into it afterwards. Once this pass has drained it, the same question can
@@ -1045,25 +1112,40 @@ class AdvancePass {
 		return idle;
 	}
 
-	/** Ask the idle members through phase 1's fan-out, and record what it made of each. */
+	/**
+	 * Ask the idle members through phase 1's fan-out, and record what it made of each.
+	 *
+	 * A member whose machine has dropped its session since it was drained is passed over
+	 * here rather than asked ({@link passOverOfflineVerdict}, issue #1071), and its
+	 * machine goes back in the pool — the same rule {@link takeNextWave} applies before
+	 * draining, for a machine that went away while its wave waited to go idle.
+	 */
 	private async signal(
 		idle: WorkerUpdateRolloutMember[],
 		drained: Map<string, Worker>,
 	): Promise<void> {
 		// Read before the fan-out, never after: these are the facts the come-back verdict
 		// is reached against, and by the time the machine has been asked they are already
-		// the facts of a machine on its way out.
+		// the facts of a machine on its way out. The token is therefore always a live
+		// session's, bar a machine that drops between this read and the fan-out's own.
 		const atSignal = new Map<string, MemberPatch>();
+		const connected: WorkerUpdateRolloutMember[] = [];
 		for (const member of idle) {
 			const session = await getLiveSessionForWorker(member.workerId);
+			if (!session) {
+				await this.apply(member, passOverOfflineVerdict(this.now));
+				continue;
+			}
 			atSignal.set(member.workerId, {
-				fencingTokenAtSignal: session?.fencingToken ?? null,
+				fencingTokenAtSignal: session.fencingToken,
 				buildCommitAtSignal: drained.get(member.workerId)?.build?.commit ?? null,
 			});
+			connected.push(member);
 		}
+		if (connected.length === 0) return;
 
 		const entries = await fanOutWorkerUpdate(
-			idle.map((member) => drained.get(member.workerId) as Worker),
+			connected.map((member) => drained.get(member.workerId) as Worker),
 			this.rollout.target,
 			// The operator who started the rollout, not whoever's tick is advancing it
 			// (issue #922): a rollout advances itself off reports, reconnects and a
@@ -1083,7 +1165,12 @@ class AdvancePass {
 	 * `requested` and `queued-offline` both recorded a request, and `already-asked`
 	 * left one standing for this same build, so all three leave the member waiting on
 	 * an answer — the difference between them is only whether a push is on its way,
-	 * which the machine's own report settles either way. `answered` is a machine that
+	 * which the machine's own report settles either way. Since issue #1071 `queued-offline`
+	 * is reachable only when the machine drops between this pass's session read and the
+	 * fan-out's own: {@link signal} passes over a member with no live session rather than
+	 * asking it. Such a member still records `signalled` with the token it had, and the
+	 * come-back's post-report lease rule ({@link decideComeBack}) is what keeps its later
+	 * old-build reconnect from counting. `answered` is a machine that
 	 * had already reported for this exact build before the rollout reached it, so its
 	 * outcome is read straight away rather than waited for; it has no signal-time
 	 * baseline, so if it applied, its come-back verdict falls back to the lease alone.

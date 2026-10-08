@@ -54,6 +54,7 @@ function rowToSession(row: WorkerSessionRow): WorkerSession {
 		instanceId: row.instanceId,
 		fencingToken: row.fencingToken,
 		lastHeartbeatAt: row.lastHeartbeatAt,
+		acquiredAt: row.acquiredAt ?? null,
 		currentRunId: row.currentRunId,
 		createdAt: row.createdAt,
 	};
@@ -91,6 +92,9 @@ function livenessCutoff(ttlMs: number): Date {
  *   with a bumped fencing token, a fresh heartbeat, `released: false`, and no current
  *   run (a new lease on the same row);
  * - **none** → insert the first session at {@link INITIAL_FENCING_TOKEN}.
+ *
+ * Every acquire — all three of the taking branches above — stamps `acquired_at` with
+ * the same `now` as the heartbeat; a heartbeat never moves it (issue #1071).
  *
  * `reclaim` is the reconnecting daemon's proof of possession — the `sessionId` and
  * `fencingToken` this control plane minted for it (`isReclaimOf`, issue #608) — so a
@@ -141,6 +145,7 @@ export async function acquireLease(
 						instanceId: instanceId ?? null,
 						fencingToken: nextFencingToken(existing.fencingToken),
 						lastHeartbeatAt: now,
+						acquiredAt: now,
 						currentRunId: null,
 						released: false,
 					})
@@ -159,6 +164,7 @@ export async function acquireLease(
 					instanceId: instanceId ?? null,
 					fencingToken: INITIAL_FENCING_TOKEN,
 					lastHeartbeatAt: now,
+					acquiredAt: now,
 				})
 				.returning();
 			return acquiredRowToSession(inserted, false);

@@ -77,6 +77,7 @@ function makeAcquired(overrides: Partial<AcquiredSession['session']> = {}): Acqu
 			instanceId: null,
 			fencingToken: 7,
 			lastHeartbeatAt: new Date('2026-01-01T00:00:00Z'),
+			acquiredAt: new Date('2026-01-01T00:00:00Z'),
 			currentRunId: null,
 			createdAt: new Date('2026-01-01T00:00:00Z'),
 			reclaimedBySameInstance: false,

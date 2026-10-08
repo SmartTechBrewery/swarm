@@ -52,6 +52,7 @@ describe('WorkerSessionSchema', () => {
 		instanceId: null,
 		fencingToken: 1,
 		lastHeartbeatAt: BASE,
+		acquiredAt: BASE,
 		currentRunId: null,
 		createdAt: BASE,
 	};
@@ -63,6 +64,11 @@ describe('WorkerSessionSchema', () => {
 	it('accepts a uuid current run reference', () => {
 		const runId = '33333333-3333-4333-8333-333333333333';
 		expect(WorkerSessionSchema.parse({ ...valid, currentRunId: runId }).currentRunId).toBe(runId);
+	});
+
+	// Issue #1071: a row last acquired before `acquired_at` existed reads as unknown.
+	it('accepts a session with no recorded acquisition time', () => {
+		expect(WorkerSessionSchema.parse({ ...valid, acquiredAt: null }).acquiredAt).toBeNull();
 	});
 
 	it('accepts a nullable daemon process identity', () => {
