@@ -317,7 +317,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 	// Issue #687 — the daemon-declared checkout identity, against real Postgres. The
 	// unit tests mock the repository, so only these can catch a wrong `.set()` payload,
 	// a column that is not nullable, or the three-valued argument collapsing.
-	describe('repository', () => {
+	describe('repositories', () => {
 		it('leaves a newly registered worker with no declaration', async () => {
 			const created = await createWorker({
 				ownerUserId: adaId,
@@ -328,11 +328,11 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 
 			// Registering a machine is not declaring a checkout — only a connecting daemon
 			// can state which repository it holds.
-			expect(created.repository).toBeNull();
-			expect((await getWorkerById(created.id))?.repository).toBeNull();
+			expect(created.repositories).toEqual([]);
+			expect((await getWorkerById(created.id))?.repositories).toEqual([]);
 		});
 
-		it('persists a declaration, leaves it alone when omitted, and clears it on null', async () => {
+		it('persists a declared set, leaves it alone when omitted, and clears it on []', async () => {
 			const created = await createWorker({
 				ownerUserId: adaId,
 				displayName: 'ada-declares',
@@ -340,20 +340,26 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 				credentialHash: 'hash-declares',
 			});
 
-			await updateWorkerCapabilities(created.id, ['claude'], undefined, 'smarttechbrewery/swarm');
-			expect((await getWorkerById(created.id))?.repository).toBe('smarttechbrewery/swarm');
+			await updateWorkerCapabilities(created.id, ['claude'], undefined, [
+				'smarttechbrewery/swarm',
+				'acme/api',
+			]);
+			expect((await getWorkerById(created.id))?.repositories).toEqual([
+				'smarttechbrewery/swarm',
+				'acme/api',
+			]);
 
 			// The `swarm workers set-cli` shape: no repository passed, so the declaration must
 			// survive rather than be cleared by a caller that knows nothing about checkouts.
 			await updateWorkerCapabilities(created.id, ['claude', 'codex']);
 			const after = await getWorkerById(created.id);
 			expect(after?.capabilities).toEqual(['claude', 'codex']);
-			expect(after?.repository).toBe('smarttechbrewery/swarm');
+			expect(after?.repositories).toEqual(['smarttechbrewery/swarm', 'acme/api']);
 
-			// An explicit null is a handshake from a daemon that declared none: the stale
+			// An explicit `[]` is a handshake from a daemon that declared none: the stale
 			// statement is cleared rather than left standing.
-			await updateWorkerCapabilities(created.id, ['claude', 'codex'], undefined, null);
-			expect((await getWorkerById(created.id))?.repository).toBeNull();
+			await updateWorkerCapabilities(created.id, ['claude', 'codex'], undefined, []);
+			expect((await getWorkerById(created.id))?.repositories).toEqual([]);
 		});
 
 		it('rolls the repository write back with the capability write when a reduction is refused', async () => {
@@ -377,10 +383,10 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 			// The enrollment still requires codex, so the whole call must fail — and the
 			// declaration it also carried must not have landed (the same-transaction claim).
 			await expect(
-				updateWorkerCapabilities(worker.id, ['claude'], undefined, 'smarttechbrewery/swarm'),
+				updateWorkerCapabilities(worker.id, ['claude'], undefined, ['smarttechbrewery/swarm']),
 			).rejects.toThrow(WorkerCapabilityReductionError);
 
-			expect((await getWorkerById(worker.id))?.repository).toBeNull();
+			expect((await getWorkerById(worker.id))?.repositories).toEqual([]);
 		});
 	});
 
@@ -454,11 +460,11 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 			const id = await freshWorker('ada-sticky');
 			const drained = await setWorkerDraining(id, true);
 
-			await updateWorkerCapabilities(id, ['claude'], [...ALL_TRIGGER_PHASES], 'acme/api');
+			await updateWorkerCapabilities(id, ['claude'], [...ALL_TRIGGER_PHASES], ['acme/api']);
 
 			const after = await getWorkerById(id);
 			expect(after?.drainingSince).toEqual(drained?.drainingSince);
-			expect(after?.repository).toBe('acme/api');
+			expect(after?.repositories).toEqual(['acme/api']);
 		});
 	});
 
@@ -770,7 +776,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('workersRepository (integr
 			const id = await freshWorker('ada-update-sticky');
 			const requested = recorded(await requestWorkerUpdate(id, REQUEST_ID, 'main', adaId));
 
-			await updateWorkerCapabilities(id, ['claude'], [...ALL_TRIGGER_PHASES], 'acme/api');
+			await updateWorkerCapabilities(id, ['claude'], [...ALL_TRIGGER_PHASES], ['acme/api']);
 
 			expect((await getWorkerById(id))?.update).toEqual(requested.update);
 		});

@@ -14,7 +14,7 @@ import type { WorkerRow } from '@/types/workers.js';
  * The fields a query is matched against: the machine's own name plus the two
  * facts an operator uses to tell one machine from another when the names are
  * similar — who owns it (both the display name and the identifier the Owner cell
- * shows on hover) and which repository it checked out.
+ * shows on hover) and which repositories it checked out.
  *
  * Matched field-by-field rather than against one joined string, so a query never
  * matches across a boundary between two unrelated facts.
@@ -24,7 +24,7 @@ function searchableFields(worker: WorkerRow): (string | null | undefined)[] {
 		worker.displayName,
 		worker.owner?.displayName,
 		worker.owner?.identifier,
-		worker.repository,
+		...worker.repositories,
 	];
 }
 

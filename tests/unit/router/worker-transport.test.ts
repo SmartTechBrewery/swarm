@@ -52,7 +52,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		probedCapabilities: ['claude'],
 		declaredCapabilities: null,
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
-		repository: null,
+		repositories: [],
 		hostname: null,
 		// In the pool (issue #919) unless a case overrides it.
 		drainingSince: null,
@@ -149,13 +149,13 @@ describe('handleHandshake', () => {
 		expect(deps.acquireSession).toHaveBeenCalledWith(CREDENTIAL, 60_000, undefined, undefined);
 		// `validBody()` declares no `supportedPhases` — the older-daemon shape — so the
 		// handshake records every phase, the behaviour that pre-dated the field (#467).
-		// It declares no `repository` either, which records NULL (issue #687): the
-		// column's pre-existing value, and the one that clears a stale declaration.
+		// It declares no `repository` either, which records `[]` (issues #687, #1056):
+		// the column's default, and the value that clears a stale declaration.
 		expect(deps.refreshWorkerCapabilities).toHaveBeenCalledWith(
 			WORKER_ID,
 			['claude'],
 			[...DEFAULT_WORKER_SUPPORTED_PHASES],
-			null,
+			[],
 			null,
 			'unknown',
 			'1.0.0',
@@ -174,7 +174,7 @@ describe('handleHandshake', () => {
 			WORKER_ID,
 			['claude'],
 			declared,
-			null,
+			[],
 			null,
 			'unknown',
 			'1.0.0',
@@ -198,7 +198,7 @@ describe('handleHandshake', () => {
 			WORKER_ID,
 			['claude'],
 			[...DEFAULT_WORKER_SUPPORTED_PHASES],
-			'smarttechbrewery/swarm',
+			['smarttechbrewery/swarm'],
 			null,
 			'unknown',
 			'1.0.0',
@@ -222,7 +222,7 @@ describe('handleHandshake', () => {
 			WORKER_ID,
 			['claude'],
 			[...DEFAULT_WORKER_SUPPORTED_PHASES],
-			null,
+			[],
 			{ commit: '9f3a1b2c4d5e6f70819a2b3c4d5e6f7081920a3b', dirty: true },
 			'unknown',
 			'1.0.0',
@@ -242,7 +242,7 @@ describe('handleHandshake', () => {
 			WORKER_ID,
 			['claude'],
 			[...DEFAULT_WORKER_SUPPORTED_PHASES],
-			null,
+			[],
 			null,
 			'unknown',
 			'1.0.0',
@@ -263,7 +263,7 @@ describe('handleHandshake', () => {
 			WORKER_ID,
 			['claude'],
 			[...DEFAULT_WORKER_SUPPORTED_PHASES],
-			null,
+			[],
 			null,
 			'unsupervised',
 			'1.0.0',
@@ -281,7 +281,7 @@ describe('handleHandshake', () => {
 			WORKER_ID,
 			['claude'],
 			[...DEFAULT_WORKER_SUPPORTED_PHASES],
-			null,
+			[],
 			null,
 			'unknown',
 			'1.0.0',
@@ -303,7 +303,7 @@ describe('handleHandshake', () => {
 			WORKER_ID,
 			['claude'],
 			[...DEFAULT_WORKER_SUPPORTED_PHASES],
-			null,
+			[],
 			null,
 			'unknown',
 			'1.0.0',
@@ -353,12 +353,61 @@ describe('handleHandshake', () => {
 		expect(result.status).toBe(200);
 		// The normalised form, and only after the declaration was persisted — the pass
 		// acts on what the row now says.
-		expect(deps.suspendEnrollmentsForMismatchedRepository).toHaveBeenCalledWith(
-			WORKER_ID,
+		expect(deps.suspendEnrollmentsForMismatchedRepository).toHaveBeenCalledWith(WORKER_ID, [
 			'smarttechbrewery/swarm',
-		);
+		]);
 		expect(deps.refreshWorkerCapabilities).toHaveBeenCalledBefore(
 			deps.suspendEnrollmentsForMismatchedRepository as ReturnType<typeof vi.fn>,
+		);
+	});
+
+	// Issue #1056 — the additive `repositories` key, unioned with the legacy one: the
+	// primary (`repository`) first, then the rest in order, normalised and deduplicated.
+	it('records the union of `repository` and `repositories`, primary first and deduplicated', async () => {
+		const deps = makeDeps();
+
+		const result = await handleHandshake(deps, {
+			...validBody(),
+			repository: 'SmartTechBrewery/Swarm.git',
+			repositories: ['acme/api', 'smarttechbrewery/swarm', 'Acme/Web.git'],
+		});
+
+		expect(result.status).toBe(200);
+		const declared = ['smarttechbrewery/swarm', 'acme/api', 'acme/web'];
+		expect(deps.refreshWorkerCapabilities).toHaveBeenCalledWith(
+			WORKER_ID,
+			['claude'],
+			[...DEFAULT_WORKER_SUPPORTED_PHASES],
+			declared,
+			null,
+			'unknown',
+			'1.0.0',
+			'ada-laptop',
+		);
+		expect(deps.suspendEnrollmentsForMismatchedRepository).toHaveBeenCalledWith(
+			WORKER_ID,
+			declared,
+		);
+	});
+
+	it('records `repositories` alone when the daemon sends no `repository`', async () => {
+		const deps = makeDeps();
+
+		const result = await handleHandshake(deps, {
+			...validBody(),
+			repositories: ['acme/api', 'acme/web'],
+		});
+
+		expect(result.status).toBe(200);
+		expect(deps.refreshWorkerCapabilities).toHaveBeenCalledWith(
+			WORKER_ID,
+			['claude'],
+			[...DEFAULT_WORKER_SUPPORTED_PHASES],
+			['acme/api', 'acme/web'],
+			null,
+			'unknown',
+			'1.0.0',
+			'ada-laptop',
 		);
 	});
 

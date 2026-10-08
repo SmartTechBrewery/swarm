@@ -18,10 +18,10 @@ const validWorker = {
 	probedCapabilities: ['claude', 'codex'],
 	declaredCapabilities: null,
 	supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
-	repository: null,
+	repositories: [],
 	hostname: null,
 	// In the pool (issue #919) — nullable, not optional, for the same reason
-	// `repository` is: no reader gets an "absent" case to interpret.
+	// `build` is: no reader gets an "absent" case to interpret.
 	drainingSince: null,
 	build: null,
 	// The fifth self-declared fact (issue #997), and the one that is *not* nullable:
@@ -107,28 +107,31 @@ describe('WorkerSchema', () => {
 		expect(() => WorkerSchema.parse({ ...validWorker, ownerUserId: 'nope' })).toThrow();
 	});
 
-	// Issue #687 — the daemon-declared checkout identity. Nullable, not optional: a
-	// worker that has declared nothing says so explicitly rather than by omission, so
-	// no reader has an "absent" case to interpret.
-	it('accepts a declared repository and normalises it to the stored form', () => {
+	// Issues #687, #1056 — the daemon-declared checkout identities. Required, not
+	// optional: a worker that has declared nothing says so explicitly with `[]` rather
+	// than by omission, so no reader has an "absent" case to interpret.
+	it('accepts declared repositories and normalises them to the stored form', () => {
 		expect(
-			WorkerSchema.parse({ ...validWorker, repository: 'SmartTechBrewery/Swarm.git' }),
-		).toEqual({ ...validWorker, repository: 'smarttechbrewery/swarm' });
+			WorkerSchema.parse({
+				...validWorker,
+				repositories: ['SmartTechBrewery/Swarm.git', 'acme/api'],
+			}),
+		).toEqual({ ...validWorker, repositories: ['smarttechbrewery/swarm', 'acme/api'] });
 	});
 
-	it('rejects an omitted repository, and a host-prefixed one', () => {
-		const { repository, ...withoutRepository } = validWorker;
-		expect(WorkerSchema.safeParse(withoutRepository).success).toBe(false);
+	it('rejects omitted repositories, and a host-prefixed one', () => {
+		const { repositories, ...withoutRepositories } = validWorker;
+		expect(WorkerSchema.safeParse(withoutRepositories).success).toBe(false);
 		expect(
 			WorkerSchema.safeParse({
 				...validWorker,
-				repository: 'https://github.com/SmartTechBrewery/swarm',
+				repositories: ['https://github.com/SmartTechBrewery/swarm'],
 			}).success,
 		).toBe(false);
 	});
 
-	// The daemon's self-reported hostname, on `repository`'s exact nullable contract —
-	// diagnostic/display only, so unlike `repository` there is no shape to normalise or
+	// The daemon's self-reported hostname, on `build`'s exact nullable contract —
+	// diagnostic/display only, so unlike a repository there is no shape to normalise or
 	// reject: any non-empty string is accepted verbatim.
 	it('accepts a declared hostname verbatim', () => {
 		expect(WorkerSchema.parse({ ...validWorker, hostname: 'ada-laptop' })).toEqual({

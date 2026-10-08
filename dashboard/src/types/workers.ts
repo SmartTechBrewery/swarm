@@ -16,7 +16,7 @@
  * constraints (owner) and its approval (project administrator), each
  * offered only where the server-declared capability flag says the viewer may
  * change it. Facts a daemon states at handshake stay read-only everywhere —
- * `supportedPhases`, the checkout `repository`, and the SWARM `build` (issue #925)
+ * `supportedPhases`, the checkout `repositories`, and the SWARM `build` (issue #925)
  * — but the CLI axis is no longer
  * one of them: since issue #787 the worker's *owner* may declare which of the CLIs
  * their machine reported it should run (`declaredCapabilities` on
@@ -134,15 +134,16 @@ export interface WorkerRow {
 	 */
 	supportedPhases: string[];
 	/**
-	 * Which repository the machine's one local checkout is (issue #687), normalised
-	 * `owner/repo`, or `null` when it declared none — a machine that never connected,
-	 * a daemon on a build that predates the field, or a checkout with no readable
-	 * `origin`. Not a path: `SWARM_WORKER_REPO_ROOT` stays on the machine.
+	 * Which repositories the machine holds a local checkout of (issues #687, #1056),
+	 * normalised `owner/repo`, primary first, or `[]` when it declared none — a
+	 * machine that never connected, a daemon on a build that predates the field, or
+	 * a checkout with no readable `origin`. Not a path: `SWARM_WORKER_REPO_ROOT` stays
+	 * on the machine.
 	 *
 	 * Read against an enrollment's own `projectRepos` to explain a refused or
 	 * suspended enrollment (issue #690).
 	 */
-	repository: string | null;
+	repositories: string[];
 	/**
 	 * The machine's self-reported `os.hostname()`, or `null` when it declared none.
 	 * Diagnostic/display only — an unauthenticated field of the daemon's handshake —
@@ -159,7 +160,7 @@ export interface WorkerRow {
 	 * that is not a git checkout. Not a path and not a secret: a commit id is public
 	 * coordinates.
 	 *
-	 * Not the same thing as `repository` above: one npm-linked SWARM checkout can
+	 * Not the same thing as `repositories` above: one npm-linked SWARM checkout can
 	 * serve daemons working in several different project repositories.
 	 */
 	build: { commit: string; dirty: boolean } | null;
@@ -269,7 +270,7 @@ export interface WorkerDetailEnrollment {
 	isRoutable: boolean;
 	/**
 	 * **Every** repository this enrollment's project declares (issue #690, widened
-	 * by #946), in the **same normalised form** as the worker's own `repository`, so
+	 * by #946), in the **same normalised form** as the worker's own `repositories`, so
 	 * membership in this list by plain equality is the comparison the server makes
 	 * (`repoSlugsMatch`, `src/scm/repo-slug.ts` — not imported here, since its slug
 	 * reader spawns `git`). A list because a project may hold one worker per

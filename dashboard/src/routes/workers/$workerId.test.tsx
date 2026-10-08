@@ -141,7 +141,7 @@ function makeRow(overrides: Partial<WorkerRow> = {}): WorkerRow {
 		},
 		capabilities: ['claude'],
 		supportedPhases: ['planning'],
-		repository: 'acme/frontend',
+		repositories: ['acme/frontend'],
 		hostname: null,
 		// The daemon's declared SWARM build and the server's verdict on it (issue #925).
 		build: { commit: 'abc1234def5678', dirty: false },

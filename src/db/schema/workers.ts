@@ -93,19 +93,21 @@ export const workers = pgTable(
 			.notNull()
 			.default(ALL_TRIGGER_PHASES as TriggerPhase[]),
 		/**
-		 * The `owner/repo` the daemon **currently operating this row** declared its one
-		 * local checkout to be (issue #687), resolved from that checkout's `origin`
-		 * remote at handshake. The control plane learns it no other way:
-		 * `SWARM_WORKER_REPO_ROOT` is host-local and never travels.
+		 * The `owner/repo`s the daemon **currently operating this row** declared it
+		 * holds a local checkout of (issue #687; a set since issue #1056), resolved from
+		 * each checkout's `origin` remote at handshake. The control plane learns them no
+		 * other way: `SWARM_WORKER_REPO_ROOT` is host-local and never travels.
 		 *
-		 * Nullable with no default, and that is the point: NULL means "no repository
-		 * declared", which is what every row written before this column existed says and
-		 * what a daemon too old to send the field keeps saying — nothing to backfill, and
-		 * no default that would be honest. The stored form is the normalised, host-less,
-		 * `.git`-less one (`RepoSlugSchema`, `src/scm/repo-slug.ts`), so a comparison
-		 * against `projects.repo` must normalise that side too.
+		 * `NOT NULL` with an empty-array default, `supportedPhases`' pattern, so a reader
+		 * never has a null case: `[]` means "no repository declared", which is what a
+		 * daemon too old to send the field — or one whose checkout has no identifiable
+		 * `origin` — says. The migration that replaced the scalar `repository` column
+		 * backfilled each declared value as a one-element set. The stored form is the
+		 * normalised, host-less, `.git`-less one (`RepoSlugSchema`,
+		 * `src/scm/repo-slug.ts`), deduplicated with the primary checkout first, so a
+		 * comparison against `projects.repo` must normalise that side too.
 		 */
-		repository: text('repository'),
+		repositories: jsonb('repositories').$type<string[]>().notNull().default([]),
 		/**
 		 * The `os.hostname()` the daemon **currently operating this row** reported at
 		 * handshake (`HandshakeRequestSchema.hostname`, `src/transport/protocol.ts`) —
@@ -113,9 +115,9 @@ export const workers = pgTable(
 		 * because it describes whichever machine is connected right now rather than an
 		 * operator's declaration.
 		 *
-		 * Nullable with no default, on `repository`'s exact contract: NULL means "no
-		 * hostname reported", what every row written before this column existed says and
-		 * what a daemon too old to send the field keeps saying. Nothing is backfilled.
+		 * Nullable with no default: NULL means "no hostname reported", what every row
+		 * written before this column existed says and what a daemon too old to send the
+		 * field keeps saying. Nothing is backfilled.
 		 *
 		 * **Diagnostic only, never a security boundary**: unlike `id`, a hostname is
 		 * self-reported by an unauthenticated field of the handshake body — any daemon
@@ -153,11 +155,10 @@ export const workers = pgTable(
 		 * `package.json`'s `version`, which never moves, so it is the same string on
 		 * every daemon whatever code it runs.
 		 *
-		 * Nullable with no default, on `repository`'s exact contract: NULL means "this
-		 * daemon declared no build" — what every row written before this column says,
-		 * what a daemon too old to send the field keeps saying, and what a daemon whose
-		 * install root is not a git checkout says. Nothing is backfilled; no index,
-		 * since nothing queries by it.
+		 * Nullable with no default: NULL means "this daemon declared no build" — what
+		 * every row written before this column says, what a daemon too old to send the
+		 * field keeps saying, and what a daemon whose install root is not a git checkout
+		 * says. Nothing is backfilled; no index, since nothing queries by it.
 		 */
 		buildCommit: text('build_commit'),
 		/**
@@ -193,8 +194,8 @@ export const workers = pgTable(
 		 * row implies it: the four declarations above read identically on a machine that
 		 * comes back from a restart it takes on its own and on one that is simply gone.
 		 *
-		 * `NOT NULL` with an `'unknown'` default, deliberately **not** `repository`/`build`'s
-		 * nullable contract. Those two have a meaningful absent state; this one does not
+		 * `NOT NULL` with an `'unknown'` default, deliberately **not** `build`'s
+		 * nullable contract. That one has a meaningful absent state; this one does not
 		 * — the whole point of the third enum member is that "we do not know" is a value
 		 * every reader must handle, so a NULL beside it would be two spellings of one
 		 * fact and an invitation to read one of them as false. It is the shape

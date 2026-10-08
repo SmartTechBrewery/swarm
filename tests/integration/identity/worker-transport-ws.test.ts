@@ -103,23 +103,23 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 
 		// Issue #687 — the declaration end to end: the real route, the real service, the
 		// real column. A registered-but-never-connected worker states nothing.
-		it('persists the declared repository on the worker row, and clears it when a daemon declares none', async () => {
-			expect((await getWorker(workerId))?.repository).toBeNull();
+		it('persists the declared repositories on the worker row, and clears them when a daemon declares none', async () => {
+			expect((await getWorker(workerId))?.repositories).toEqual([]);
 
 			const declared = await handshake({ repository: 'SmartTechBrewery/Swarm.git' });
 			expect(declared.status).toBe(200);
 			// Normalised at the router boundary, so the row holds one canonical form.
-			expect((await getWorker(workerId))?.repository).toBe('smarttechbrewery/swarm');
+			expect((await getWorker(workerId))?.repositories).toEqual(['smarttechbrewery/swarm']);
 
 			// Let the lease lapse so the next handshake is a plain acquire rather than a 409.
 			await sleep(TTL_MS + 200);
 
 			// The older-daemon shape (and equally a checkout with no identifiable `origin`):
-			// the row records NULL rather than keeping the previous daemon's statement, since
+			// the row records `[]` rather than keeping the previous daemon's statement, since
 			// it describes the program currently operating it.
 			const silent = await handshake();
 			expect(silent.status).toBe(200);
-			expect((await getWorker(workerId))?.repository).toBeNull();
+			expect((await getWorker(workerId))?.repositories).toEqual([]);
 		});
 
 		it('handshakes, keeps the lease live via heartbeats, and expires it once they stop', async () => {

@@ -113,7 +113,7 @@ function makeWorker(id: string, overrides: Partial<Worker> = {}): Worker {
 		probedCapabilities: ['claude'],
 		declaredCapabilities: null,
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
-		repository: null,
+		repositories: [],
 		hostname: null,
 		// In the pool unless a case says otherwise — the rollout is what drains it.
 		drainingSince: null,

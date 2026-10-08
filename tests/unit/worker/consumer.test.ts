@@ -3332,7 +3332,7 @@ describe('processJob', () => {
 				capabilities?: AgentCli[];
 				sharingConsent?: boolean;
 				activeRuns?: number;
-				repository?: string | null;
+				repositories?: string[];
 				drainingSince?: Date | null;
 				rateLimitedClis?: Map<AgentCli, Date>;
 			} = {},
@@ -3348,7 +3348,7 @@ describe('processJob', () => {
 					probedCapabilities: capabilities,
 					declaredCapabilities: null,
 					supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
-					repository: overrides.repository ?? null,
+					repositories: overrides.repositories ?? [],
 					hostname: null,
 					drainingSince: overrides.drainingSince ?? null,
 					update: null,
@@ -3526,7 +3526,7 @@ describe('processJob', () => {
 		// with the wait only a human can clear, naming the repository to point one at.
 		it('records a machine holding another repository as a worker-authorization wait', async () => {
 			listProjectDispatchCandidates.mockResolvedValue([
-				candidate('w-1', { repository: 'smarttechbrewery/dashboard' }),
+				candidate('w-1', { repositories: ['smarttechbrewery/dashboard'] }),
 			]);
 
 			const outcome = await processJob(

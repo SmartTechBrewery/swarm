@@ -60,7 +60,7 @@ function makeWorker(overrides: Partial<Worker> = {}): Worker {
 		probedCapabilities: ['claude'],
 		declaredCapabilities: null,
 		supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
-		repository: null,
+		repositories: [],
 		hostname: null,
 		drainingSince: null,
 		update: null,
@@ -194,25 +194,24 @@ describe('refreshWorkerCapabilities', () => {
 		);
 	});
 
-	// Issue #687 — the daemon's checkout declaration, three-valued at this seam so the
-	// CLI-only path can leave a fact it knows nothing about alone.
-	it('validates and forwards a declared repository, normalised', async () => {
+	// Issues #687, #1056 — the daemon's checkout declaration, two-valued at this seam so
+	// the CLI-only path can leave a fact it knows nothing about alone.
+	it('validates and forwards the declared repositories, normalised and deduplicated in order', async () => {
 		updateWorkerCapabilities.mockImplementation(async (id, capabilities) =>
 			makeWorker({ id, capabilities }),
 		);
 
-		await refreshWorkerCapabilities(
-			'worker-1',
-			['claude'],
-			undefined,
+		await refreshWorkerCapabilities('worker-1', ['claude'], undefined, [
 			'SmartTechBrewery/Swarm.git',
-		);
+			'acme/widgets',
+			'smarttechbrewery/swarm',
+		]);
 
 		expect(updateWorkerCapabilities).toHaveBeenCalledWith(
 			'worker-1',
 			['claude'],
 			undefined,
-			'smarttechbrewery/swarm',
+			['smarttechbrewery/swarm', 'acme/widgets'],
 			undefined,
 			undefined,
 			undefined,
@@ -220,18 +219,37 @@ describe('refreshWorkerCapabilities', () => {
 		);
 	});
 
-	it('forwards null unchanged, which clears an earlier daemon’s declaration', async () => {
+	it('forwards an empty set, which clears an earlier daemon’s declaration', async () => {
 		updateWorkerCapabilities.mockImplementation(async (id, capabilities) =>
 			makeWorker({ id, capabilities }),
 		);
 
-		await refreshWorkerCapabilities('worker-1', ['claude'], undefined, null);
+		await refreshWorkerCapabilities('worker-1', ['claude'], undefined, []);
 
 		expect(updateWorkerCapabilities).toHaveBeenCalledWith(
 			'worker-1',
 			['claude'],
 			undefined,
-			null,
+			[],
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+		);
+	});
+
+	it('forwards an omitted declaration as undefined, leaving the stored set alone', async () => {
+		updateWorkerCapabilities.mockImplementation(async (id, capabilities) =>
+			makeWorker({ id, capabilities }),
+		);
+
+		await refreshWorkerCapabilities('worker-1', ['claude']);
+
+		expect(updateWorkerCapabilities).toHaveBeenCalledWith(
+			'worker-1',
+			['claude'],
+			undefined,
+			undefined,
 			undefined,
 			undefined,
 			undefined,
@@ -241,7 +259,7 @@ describe('refreshWorkerCapabilities', () => {
 
 	it('rejects a malformed repository without hitting the repository layer', async () => {
 		await expect(
-			refreshWorkerCapabilities('worker-1', ['claude'], undefined, 'not-a-slug'),
+			refreshWorkerCapabilities('worker-1', ['claude'], undefined, ['acme/widgets', 'not-a-slug']),
 		).rejects.toThrow();
 		expect(updateWorkerCapabilities).not.toHaveBeenCalled();
 	});
@@ -253,7 +271,7 @@ describe('refreshWorkerCapabilities', () => {
 			makeWorker({ id, capabilities }),
 		);
 
-		await refreshWorkerCapabilities('worker-1', ['claude'], undefined, null, {
+		await refreshWorkerCapabilities('worker-1', ['claude'], undefined, [], {
 			commit: '9F3A1B2C4D5E6F70819A2B3C4D5E6F7081920A3B',
 			dirty: false,
 		});
@@ -262,7 +280,7 @@ describe('refreshWorkerCapabilities', () => {
 			'worker-1',
 			['claude'],
 			undefined,
-			null,
+			[],
 			{ commit: '9f3a1b2c4d5e6f70819a2b3c4d5e6f7081920a3b', dirty: false },
 			undefined,
 			undefined,
@@ -275,13 +293,13 @@ describe('refreshWorkerCapabilities', () => {
 			makeWorker({ id, capabilities }),
 		);
 
-		await refreshWorkerCapabilities('worker-1', ['claude'], undefined, null, null);
+		await refreshWorkerCapabilities('worker-1', ['claude'], undefined, [], null);
 
 		expect(updateWorkerCapabilities).toHaveBeenCalledWith(
 			'worker-1',
 			['claude'],
 			undefined,
-			null,
+			[],
 			null,
 			undefined,
 			undefined,
@@ -291,7 +309,7 @@ describe('refreshWorkerCapabilities', () => {
 
 	it('rejects a malformed build without hitting the repository layer', async () => {
 		await expect(
-			refreshWorkerCapabilities('worker-1', ['claude'], undefined, null, {
+			refreshWorkerCapabilities('worker-1', ['claude'], undefined, [], {
 				commit: 'not-a-commit',
 				dirty: false,
 			}),
@@ -307,13 +325,13 @@ describe('refreshWorkerCapabilities', () => {
 			makeWorker({ id, capabilities }),
 		);
 
-		await refreshWorkerCapabilities('worker-1', ['claude'], undefined, null, null, 'unsupervised');
+		await refreshWorkerCapabilities('worker-1', ['claude'], undefined, [], null, 'unsupervised');
 
 		expect(updateWorkerCapabilities).toHaveBeenCalledWith(
 			'worker-1',
 			['claude'],
 			undefined,
-			null,
+			[],
 			null,
 			'unsupervised',
 			undefined,
@@ -321,7 +339,7 @@ describe('refreshWorkerCapabilities', () => {
 		);
 	});
 
-	// The daemon's self-reported hostname, three-valued at this seam on `repository`'s
+	// The daemon's self-reported hostname, three-valued at this seam on `build`'s
 	// contract, but trimmed rather than schema-validated (`version`'s exact treatment):
 	// diagnostic/display only, so there is nothing to validate a machine name against.
 	it('validates and forwards a declared hostname, trimmed', async () => {
@@ -333,7 +351,7 @@ describe('refreshWorkerCapabilities', () => {
 			'worker-1',
 			['claude'],
 			undefined,
-			null,
+			[],
 			null,
 			undefined,
 			undefined,
@@ -344,7 +362,7 @@ describe('refreshWorkerCapabilities', () => {
 			'worker-1',
 			['claude'],
 			undefined,
-			null,
+			[],
 			null,
 			undefined,
 			undefined,
@@ -361,7 +379,7 @@ describe('refreshWorkerCapabilities', () => {
 			'worker-1',
 			['claude'],
 			undefined,
-			null,
+			[],
 			null,
 			undefined,
 			undefined,
@@ -372,7 +390,7 @@ describe('refreshWorkerCapabilities', () => {
 			'worker-1',
 			['claude'],
 			undefined,
-			null,
+			[],
 			null,
 			undefined,
 			undefined,
@@ -382,7 +400,7 @@ describe('refreshWorkerCapabilities', () => {
 
 	it('rejects a supervision value outside the vocabulary without hitting the repository', async () => {
 		await expect(
-			refreshWorkerCapabilities('worker-1', ['claude'], undefined, null, null, 'launchd' as never),
+			refreshWorkerCapabilities('worker-1', ['claude'], undefined, [], null, 'launchd' as never),
 		).rejects.toThrow();
 		expect(updateWorkerCapabilities).not.toHaveBeenCalled();
 	});

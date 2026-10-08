@@ -46,29 +46,39 @@ describe('routabilityBlockers (issue #477)', () => {
 	});
 });
 
-describe('repositoryMismatch (issue #690, widened by #946)', () => {
+describe('repositoryMismatch (issue #690, widened by #946 and #1056)', () => {
 	it('returns the two repositories that disagree', () => {
-		expect(repositoryMismatch('acme/frontend', ['acme/backend'])).toEqual({
-			declaredRepository: 'acme/frontend',
+		expect(repositoryMismatch(['acme/frontend'], ['acme/backend'])).toEqual({
+			declaredRepositories: ['acme/frontend'],
 			projectRepositories: ['acme/backend'],
 		});
 	});
 
 	it('is null when the machine’s checkout is the project’s repository', () => {
-		expect(repositoryMismatch('acme/frontend', ['acme/frontend'])).toBeNull();
+		expect(repositoryMismatch(['acme/frontend'], ['acme/frontend'])).toBeNull();
 	});
 
 	// The case issue #946 made reachable: one worker per repository, several per
 	// project — a machine on the project's *second* repository is correctly enrolled.
 	it('is null when the project declares the machine’s checkout anywhere in its list', () => {
-		expect(repositoryMismatch('acme/frontend', ['acme/backend', 'acme/frontend'])).toBeNull();
+		expect(repositoryMismatch(['acme/frontend'], ['acme/backend', 'acme/frontend'])).toBeNull();
 	});
 
 	// So an operator can tell a typo from a repository the project simply does not own.
 	it('names every repository the project declares when none of them matches', () => {
-		expect(repositoryMismatch('acme/docs', ['acme/backend', 'acme/frontend'])).toEqual({
-			declaredRepository: 'acme/docs',
+		expect(repositoryMismatch(['acme/docs'], ['acme/backend', 'acme/frontend'])).toEqual({
+			declaredRepositories: ['acme/docs'],
 			projectRepositories: ['acme/backend', 'acme/frontend'],
+		});
+	});
+
+	// Issue #1056: a machine holding several checkouts agrees with any project owning
+	// one of them, and a genuine mismatch names every checkout it holds.
+	it('compares a declared set by overlap, naming the whole set on a mismatch', () => {
+		expect(repositoryMismatch(['acme/docs', 'acme/frontend'], ['acme/frontend'])).toBeNull();
+		expect(repositoryMismatch(['acme/docs', 'acme/mobile'], ['acme/backend'])).toEqual({
+			declaredRepositories: ['acme/docs', 'acme/mobile'],
+			projectRepositories: ['acme/backend'],
 		});
 	});
 
@@ -76,9 +86,9 @@ describe('repositoryMismatch (issue #690, widened by #946)', () => {
 	// declared the wrong thing — the rule the server's own checks apply. An empty list
 	// is the same kind of unknown: the project no longer resolves.
 	it('is null when either side is unknown', () => {
-		expect(repositoryMismatch(null, ['acme/backend'])).toBeNull();
-		expect(repositoryMismatch('acme/frontend', [])).toBeNull();
-		expect(repositoryMismatch(null, [])).toBeNull();
+		expect(repositoryMismatch([], ['acme/backend'])).toBeNull();
+		expect(repositoryMismatch(['acme/frontend'], [])).toBeNull();
+		expect(repositoryMismatch([], [])).toBeNull();
 	});
 });
 

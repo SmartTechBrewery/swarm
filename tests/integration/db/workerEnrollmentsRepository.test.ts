@@ -347,17 +347,13 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 				const matching = await enroll(workerA, PROJECT_A);
 				// PROJECT_A is `jkwiecien/enroll-a`; the machine's checkout is that one, so
 				// only its PROJECT_B (`jkwiecien/enroll-b`) enrollment contradicts it.
-				await updateWorkerCapabilities(
-					workerA,
-					['claude', 'codex'],
-					undefined,
+				await updateWorkerCapabilities(workerA, ['claude', 'codex'], undefined, [
 					'jkwiecien/enroll-a',
-				);
+				]);
 
-				const suspended = await suspendEnrollmentsForMismatchedRepository(
-					workerA,
+				const suspended = await suspendEnrollmentsForMismatchedRepository(workerA, [
 					'jkwiecien/enroll-a',
-				);
+				]);
 
 				expect(suspended).toEqual([
 					{
@@ -384,10 +380,9 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 			it('creates nothing and reactivates nothing when the declaration matches again', async () => {
 				const created = await enroll(workerA, PROJECT_A, { status: 'suspended' });
 
-				const suspended = await suspendEnrollmentsForMismatchedRepository(
-					workerA,
+				const suspended = await suspendEnrollmentsForMismatchedRepository(workerA, [
 					'jkwiecien/enroll-a',
-				);
+				]);
 
 				expect(suspended).toEqual([]);
 				// Re-activation is the project administrator's act — a machine cannot restore
@@ -400,9 +395,9 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 			// declares the checkout anywhere, not only as its default entry.
 			it('leaves an enrollment for a project’s second repository active', async () => {
 				const enrolled = await enroll(workerA, PROJECT_MULTI);
-				await updateWorkerCapabilities(workerA, ['claude', 'codex'], undefined, MULTI_REPO_B);
+				await updateWorkerCapabilities(workerA, ['claude', 'codex'], undefined, [MULTI_REPO_B]);
 
-				const suspended = await suspendEnrollmentsForMismatchedRepository(workerA, MULTI_REPO_B);
+				const suspended = await suspendEnrollmentsForMismatchedRepository(workerA, [MULTI_REPO_B]);
 
 				expect(suspended).toEqual([]);
 				expect(await getEnrollmentById(enrolled.id)).toMatchObject({ status: 'active' });
@@ -413,7 +408,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 		// the record read itself is exercised rather than mocked.
 		describe('enrollWorker against a multi-repository project', () => {
 			it('enrolls a worker whose checkout is the project’s second repository', async () => {
-				await updateWorkerCapabilities(workerA, ['claude', 'codex'], undefined, MULTI_REPO_B);
+				await updateWorkerCapabilities(workerA, ['claude', 'codex'], undefined, [MULTI_REPO_B]);
 				const worker = await getWorkerById(workerA);
 				if (!worker) throw new Error('expected the worker to exist');
 
@@ -430,7 +425,9 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 			});
 
 			it('still refuses a worker whose checkout the project declares nowhere', async () => {
-				await updateWorkerCapabilities(workerA, ['claude', 'codex'], undefined, 'jkwiecien/other');
+				await updateWorkerCapabilities(workerA, ['claude', 'codex'], undefined, [
+					'jkwiecien/other',
+				]);
 				const worker = await getWorkerById(workerA);
 				if (!worker) throw new Error('expected the worker to exist');
 

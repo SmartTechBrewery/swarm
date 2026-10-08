@@ -126,7 +126,7 @@ function makeWorker(overrides: Partial<WorkerRow> = {}): WorkerRow {
 		},
 		capabilities: ['claude'],
 		supportedPhases: ['planning', 'implementation'],
-		repository: 'acme/frontend',
+		repositories: ['acme/frontend'],
 		hostname: null,
 		// The daemon's declared SWARM build and the server's verdict on it (issue #925).
 		build: { commit: 'abc1234def5678', dirty: false },
@@ -335,7 +335,7 @@ describe('WorkersRoster search (issue #897)', () => {
 		workerId: 'worker-2',
 		displayName: 'grace-box',
 		owner: { userId: 'u2', identifier: 'grace@example.com', displayName: 'Grace Hopper' },
-		repository: 'acme/backend',
+		repositories: ['acme/backend'],
 	});
 
 	const searchBox = () => screen.getByRole('searchbox', { name: 'Search workers' });

@@ -71,6 +71,7 @@ import { logger } from '../lib/logger.js';
 import type { WorkerSupervision } from '../lib/worker-supervision.js';
 import {
 	type ControlPlaneMessage,
+	type HandshakeRequest,
 	HandshakeRequestSchema,
 	type StreamLog,
 	type TaskAssignmentAck,
@@ -149,23 +150,24 @@ export interface WorkerTransportDeps {
 		id: string,
 		capabilities: AgentCli[],
 		supportedPhases: TriggerPhase[],
-		repository: string | null,
+		repositories: string[],
 		build: WorkerBuild | null,
 		supervision: WorkerSupervision,
 		version: string | null,
 		hostname: string | null,
 	) => Promise<Worker | undefined>;
 	/**
-	 * Police the worker's existing enrollments against the repository it just
-	 * declared (issue #690) — suspending any whose project is a different repository.
-	 * Called only when a repository *was* declared, and only after the declaration is
+	 * Police the worker's existing enrollments against the repositories it just
+	 * declared (issue #690; a set since issue #1056) — suspending any whose project
+	 * declares none of them. Called only when at least one repository *was* declared,
+	 * and only after the declaration is
 	 * persisted, so it acts on what the row now says. It never creates or activates
 	 * an enrollment: a declaration is the machine's statement, and enrollment stays a
 	 * human decision (ADR-001).
 	 */
 	suspendEnrollmentsForMismatchedRepository: (
 		workerId: string,
-		declaredRepository: string,
+		declaredRepositories: string[],
 	) => Promise<SuspendedMismatchedEnrollment[]>;
 	/**
 	 * A *new* session generation just took this worker's lease (issue #719) — settle
@@ -315,8 +317,8 @@ export interface HandshakeResult {
 
 /**
  * The handshake, as a pure function of its deps and the raw request body:
- * validate → authenticate → acquire lease → declare CLIs and repository → reap the
- * superseded generation's claims → police enrollments against that repository →
+ * validate → authenticate → acquire lease → declare CLIs and repositories → reap the
+ * superseded generation's claims → police enrollments against those repositories →
  * return the session.
  * Returns the status/body for the route to send; never throws for an expected
  * failure (bad request, bad credential, lease held, capability reduction), and
@@ -405,13 +407,14 @@ export async function handleHandshake(
 	// were declarable. Normalizing here, at the boundary, is what keeps the
 	// eligibility gate free of a "declaration unknown" case.
 	//
-	// `repository` (issue #687) is normalized at the same boundary but in the opposite
-	// direction: an omitted field records NULL, which *clears* whatever an earlier
-	// daemon declared. The row states the checkout of the program currently operating
-	// it, so a daemon re-pointed at a checkout it cannot identify — or an older build
-	// that cannot state one — must not leave the previous statement standing for the
-	// later guards to act on. For a row that never carried one that write is a no-op
-	// NULL, i.e. exactly today's behaviour. `build` (issue #918) is normalized on that
+	// The repository set (issues #687, #1056) is normalized at the same boundary but
+	// in the opposite direction: a daemon declaring neither `repository` nor
+	// `repositories` records `[]`, which *clears* whatever an earlier daemon declared.
+	// The row states the checkouts of the program currently operating it, so a daemon
+	// re-pointed at a checkout it cannot identify — or an older build that cannot
+	// state one — must not leave the previous statement standing for the later guards
+	// to act on. For a row that never carried one that write is a no-op `[]`, i.e.
+	// exactly today's behaviour. `build` (issue #918) is normalized on that
 	// same clearing rule and for the same reason — the row states the build of the
 	// program currently operating it, so an older daemon's commit must not outlive it.
 	// `supervision` (issue #997) normalizes the same way once more: an omitted field
@@ -426,13 +429,14 @@ export async function handleHandshake(
 	// dispatch routes on — so this write neither honours nor overwrites the
 	// declaration, and the 409 below now fires on the effective set rather than the
 	// probe alone. Unchanged for a worker with no declaration.
+	const repositories = declaredRepositories(request);
 	let refreshed: Worker | undefined;
 	try {
 		refreshed = await deps.refreshWorkerCapabilities(
 			worker.id,
 			request.capabilities,
 			request.supportedPhases ?? [...DEFAULT_WORKER_SUPPORTED_PHASES],
-			request.repository ?? null,
+			repositories,
 			request.build ?? null,
 			request.supervision ?? 'unknown',
 			// Already on the wire since the field existed, and read here for the first
@@ -499,7 +503,7 @@ export async function handleHandshake(
 		await reapClaimsOfSupersededSession(deps, worker.id, session.fencingToken);
 	}
 	// Only now that the declaration is persisted — the pass acts on what the row says.
-	await policeEnrollmentsAgainstDeclaration(deps, worker.id, request.repository);
+	await policeEnrollmentsAgainstDeclaration(deps, worker.id, repositories);
 
 	return {
 		status: 200,
@@ -515,10 +519,27 @@ export async function handleHandshake(
 }
 
 /**
- * Suspend the enrollments the repository this daemon just declared contradicts
- * (issue #690): one written against a different repository — created before the
- * machine declared anything, or before it was re-pointed at another checkout — is
- * suspended, so the roster states why no work is routed there instead of leaving an
+ * Every repository a handshake declares (issue #1056): the legacy `repository` first
+ * — a daemon's primary checkout — then `repositories` in order, deduplicated. The
+ * union is what keeps every daemon generation reading correctly: an older one sends
+ * `repository` alone (a one-element set), a newer one sends both keys, and one
+ * sending only `repositories` still lands its primary first. Both keys are already
+ * normalised by `RepoSlugSchema`, so a set comparison is enough to dedupe.
+ */
+export function declaredRepositories(request: HandshakeRequest): string[] {
+	return [
+		...new Set([
+			...(request.repository ? [request.repository] : []),
+			...(request.repositories ?? []),
+		]),
+	];
+}
+
+/**
+ * Suspend the enrollments the repositories this daemon just declared contradict
+ * (issue #690; a set since issue #1056): one written against a project declaring
+ * none of them — created before the machine declared anything, or before it was
+ * re-pointed at another checkout — is suspended, so the roster states why no work is routed there instead of leaving an
  * operator to read the reason off refused assignments.
  *
  * **Never throws, and never blocks the handshake.** Policing enrollments is
@@ -534,15 +555,15 @@ export async function handleHandshake(
 async function policeEnrollmentsAgainstDeclaration(
 	deps: WorkerTransportDeps,
 	workerId: string,
-	declaredRepository: string | undefined,
+	declared: string[],
 ): Promise<void> {
-	if (!declaredRepository) return;
+	if (declared.length === 0) return;
 	try {
-		await deps.suspendEnrollmentsForMismatchedRepository(workerId, declaredRepository);
+		await deps.suspendEnrollmentsForMismatchedRepository(workerId, declared);
 	} catch (err) {
 		logger.warn('worker handshake: policing enrollments against the declaration failed', {
 			workerId,
-			repository: declaredRepository,
+			repositories: declared,
 			error: err instanceof Error ? err.message : String(err),
 		});
 	}

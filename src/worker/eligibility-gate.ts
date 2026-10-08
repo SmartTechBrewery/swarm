@@ -41,8 +41,8 @@
  *    supply a record nobody wrote.
  * 3. **Eligibility** — `evaluateWorkerEligibility` (#338 Phase 2) judges one
  *    worker against one target: active enrollment → sharing consent → draining
- *    (issue #919) → connection/health → free capacity → the repository its checkout
- *    is (issue #714) → declared phase support (issue #467) → the enrollment's
+ *    (issue #919) → connection/health → free capacity → whether it holds a checkout
+ *    of the repository (issues #714, #1056) → declared phase support (issue #467) → the enrollment's
  *    allowed phases (issue #509) → declared/allowed CLI → that CLI's own cool-down
  *    (issue #981: a machine whose CLI reported a usage limit is given no more work
  *    on *that* CLI until the recorded instant, and keeps taking work on its others).
@@ -575,11 +575,11 @@ function ineligibilityMessage(
 		case 'phase-not-permitted':
 			return `No enrolled worker for ${owner} is allowed the '${context.phase}' phase in this project. A worker owner chooses which pipeline phases their worker may be given per project enrollment; widen that selection on the worker's detail screen — this work waits until one permits the phase.`;
 		// Names the task's repository, because that is what an operator has to act on:
-		// a machine holds exactly one checkout (`SWARM_WORKER_REPO_ROOT`), so the fix is
+		// no available machine holds a checkout of it (issues #714, #1056), so the fix is
 		// a machine pointed at *this* repository rather than anything about the phase, the
-		// CLI, or the enrollment (issue #714).
+		// CLI, or the enrollment.
 		case 'repository-mismatch':
-			return `No enrolled worker for ${owner} holds a checkout of '${context.repository}' — every available machine's checkout is a different repository. Point a worker at that repository (SWARM_WORKER_REPO_ROOT) or enroll one that already holds it — this work waits until one does.`;
+			return `No enrolled worker for ${owner} holds a checkout of '${context.repository}' — every available machine holds checkouts of other repositories only. Point a worker at that repository (SWARM_WORKER_REPO_ROOT) or enroll one that already holds it — this work waits until one does.`;
 	}
 }
 
@@ -615,9 +615,10 @@ function repositoryForDemand(
 	demand: RunnableDispatchDemand,
 	candidate: WorkerDispatchCandidate,
 ): string {
-	// The `?? ''` tail is unreachable as a comparison: a candidate that declared
+	// Any entry of the candidate's own set matches itself, so its first one is enough;
+	// the `?? ''` tail is unreachable as a comparison: a candidate that declared
 	// nothing clears the predicate's repository check whatever it is given.
-	return demand.repository ?? candidate.worker.repository ?? '';
+	return demand.repository ?? candidate.worker.repositories[0] ?? '';
 }
 
 /**

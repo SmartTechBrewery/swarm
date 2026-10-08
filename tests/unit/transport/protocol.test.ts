@@ -112,6 +112,24 @@ describe('transport protocol schemas', () => {
 			}
 		});
 
+		// Issue #1056: the additive set of every checkout a daemon holds. Optional, so the
+		// shape above (with neither key) stays valid; each entry is normalised exactly as
+		// `repository` is, and one malformed entry rejects the frame.
+		it('accepts declared repositories, normalising each entry', () => {
+			expect(
+				HandshakeRequestSchema.parse({
+					...valid,
+					repositories: ['SmartTechBrewery/Swarm.git', 'acme/api'],
+				}),
+			).toEqual({ ...valid, repositories: ['smarttechbrewery/swarm', 'acme/api'] });
+		});
+
+		it('rejects repositories carrying a malformed entry', () => {
+			expect(
+				HandshakeRequestSchema.safeParse({ ...valid, repositories: ['acme/api', 'swarm'] }).success,
+			).toBe(false);
+		});
+
 		// Issue #918: the daemon declares the SWARM build it is running. Additive and
 		// optional on exactly the same terms as `repository` above — the shape above,
 		// with no `build`, is the older daemon's and stays valid.

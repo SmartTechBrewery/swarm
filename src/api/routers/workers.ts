@@ -1568,8 +1568,8 @@ export const workersRouter = router({
 	// act of enrolling, so it is created `active` and consenting — routable with no
 	// further step.
 	//
-	// A project whose repository is not the worker's declared checkout is refused
-	// as `BAD_REQUEST` naming both repositories (issue #690), exactly as allowed
+	// A project declaring none of the worker's declared checkouts is refused as
+	// `BAD_REQUEST` naming both sides (issues #690, #1056), exactly as allowed
 	// CLIs exceeding the machine's capabilities are.
 	enroll: authedProcedure
 		.input(
