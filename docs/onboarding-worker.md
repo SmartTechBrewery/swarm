@@ -641,14 +641,21 @@ report, off its reconnect, and off a periodic check for the machine that applied
 never came back — so start it and read it, rather than starting it and re-running it.
 Re-running the same command is still allowed, and nudges it as well as printing it.
 
-A machine that reports `failed`, `refused` or `declined`, that comes back still on the
-build it was asked to leave, or that applies and never comes back inside ten minutes
-**halts** the rollout: nothing further is drained or signalled, the reason is printed,
-and the machines it had not reached stay in the pool. Your machine may be in neither
-group — if it was already being moved when the halt landed, the rollout keeps settling
-it on the advances that follow, and it goes back in the pool once it settles without
-failing. The one that failed is left drained so you can look at it. A halt is final —
-fix the build and start a new rollout.
+A machine that reports `failed`, `refused` or `declined`, or that comes back still on
+the build it was asked to leave, **halts** the rollout: nothing further is drained or
+signalled, the reason is printed, and the machines it had not reached stay in the pool.
+Your machine may be in neither group — if it was already being moved when the halt
+landed, the rollout keeps settling it on the advances that follow, and it goes back in
+the pool once it settles without failing. The one that reported a failure is left
+drained so you can look at it. A halt is final — fix the build and start a new rollout.
+
+A machine that simply **stops answering** does not halt anything. After two minutes of
+silence the rollout gives up on that machine alone: it is recorded `failed` with the
+reason, any outstanding request is withdrawn, it goes straight back into the dispatch
+pool — so it is never left drained waiting for you to notice, even if it reconnects
+later — and the next machine is drained and asked in the same pass. If that was your
+machine, the rollout moved on without it and you move it yourself with `swarm workers
+update <worker-id> <ref>` once it is back.
 
 **There is no per-host setting to turn this on or off, and since issue #975 there is
 no setting that can refuse it.** What authorizes an update is the mechanism itself,
@@ -969,7 +976,7 @@ where every machine stands, live and across a page reload.
 | A run fails with `this worker's stored operator credential for provider '<id>' did not authenticate` | The stored credential was revoked or expired. Rotate it with the same command; the provider's own message is appended as the cause. |
 | A run fails with `this assignment carried no operator SCM credential` | The router predates issue #765 while the worker does not. Deploy the router (see the rollout order in Part 2). |
 | `swarm workers update --all <ref>` leaves a machine `queued` | The rollout moves a bounded wave at a time (issue #940) and has not reached it yet — that is what stops a fleet update taking the whole fleet's capacity down. It advances itself from there (issue #941), so nothing is owed: run `swarm workers update --status` again in a minute or two. A machine stuck `draining` is one still finishing a phase, which a rollout never interrupts. |
-| `swarm workers update --all <ref>` says the rollout is **HALTED** | A machine reported `failed`/`refused`/`declined`, came back on the build it was asked to leave, or applied and never came back — so nothing further is drained or signalled and the untouched machines stayed in the pool. A machine the rollout had already committed to is settled on the advances that follow and returns to the pool once it settles without failing (issue #1023), so give it a minute before assuming it is stuck. The line under the table is the reason, in the machine's own words. Fix the build, then start a new rollout: a halt is final, there is no resume, and the machine that failed is left drained on purpose so you can look at it (`swarm workers undrain <worker-id>` when you are done). |
+| `swarm workers update --all <ref>` says the rollout is **HALTED** | A machine reported `failed`/`refused`/`declined`, or came back on the build it was asked to leave — so nothing further is drained or signalled and the untouched machines stayed in the pool. A machine the rollout had already committed to is settled on the advances that follow and returns to the pool once it settles without failing (issue #1023), so give it a minute before assuming it is stuck. The line under the table is the reason, in the machine's own words. Fix the build, then start a new rollout: a halt is final, there is no resume, and the machine that reported the failure is left drained on purpose so you can look at it (`swarm workers undrain <worker-id>` when you are done). A machine that merely stopped answering never halts a rollout, so if the table says HALTED something actually answered badly. |
 | `swarm workers update --all <ref>` is refused because a fleet update is already in progress | Only one rollout runs per operator at a time, so a *different* ref mid-move is refused rather than silently re-targeting the fleet. Run `swarm workers update --status` to see where it stands and wait for it to finish; asking for the **same** ref is never refused, it just nudges and prints it. |
 | `swarm workers request-update <ref>` says it is "available to instance administrators only" | It is (issue #922) — asking machines across the installation is an installation-admin act, while `swarm workers update --all <ref>` moves the machines *you* own and needs no such role. Ask an instance administrator to run it, or run `update --all` for your own fleet. |
 | `swarm workers request-update <ref>` reports `in-pool` for most of the installation | Those machines are not draining, and draining stays strictly the machine owner's own call (issue #919) — this command asks, it never drains. The line under the table names the owners to ask for a `swarm workers drain <worker-id>`; run `request-update` again once they have. |

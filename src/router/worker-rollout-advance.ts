@@ -38,8 +38,9 @@
  * on later advances and returns each well-settled one to the dispatch pool, and until
  * these reads were widened there were no later advances, so those machines stayed
  * drained with nothing but a manual `swarm workers undrain` to put them back. Nothing
- * about the halt itself changes — it is still terminal, a member that settles `failed`
- * still stays drained, and the rollout is never promoted back to `in_progress`.
+ * about the halt itself changes — it is still terminal, a member whose machine answered
+ * badly still stays drained in an owner-scoped rollout, and the rollout is never
+ * promoted back to `in_progress`.
  *
  * Both per-machine triggers are **fire-and-forget and caught**, on exactly the
  * contract `resendPendingWorkerUpdateToWorker` already keeps on the socket-open path
@@ -77,18 +78,24 @@ import { logger } from '../lib/logger.js';
  * A minute, because of what the tick is actually *for*. Both per-machine triggers
  * below fire the instant their event happens, so the tick is not how a rollout
  * normally moves — it exists for the two moves no event announces: a machine that
- * applied and never came back, which the advance halts on only once
- * `COME_BACK_WINDOW_MS` (ten minutes) has passed, and a wave whose members were
- * still mid-phase when they were drained, which the advance signals as soon as they
- * go idle. Against a ten-minute window a minute is a rounding error, and against a
- * phase that runs for many minutes it is the shortest wait worth having.
+ * stopped answering, which the advance gives up on once `ABANDON_AFTER_MS` (two
+ * minutes) has passed and then carries straight on with the rest of the fleet, and a
+ * wave whose members were still mid-phase when they were drained, which the advance
+ * signals as soon as they go idle.
+ *
+ * The tick is therefore what *decides* an abandon, and the two numbers compose:
+ * the rollout commits to waiting two minutes, the decision lands on the next tick, so
+ * an operator sees the give-up between two and three minutes after the machine's last
+ * word. Shortening the tick is a separate cadence question that applies to every
+ * verdict in the module, and is deliberately left alone (issue #1064) — against a
+ * phase that runs for many minutes a minute is still the shortest wait worth having.
  *
  * Seconds would buy nothing and cost a locked transaction per rollout per tick;
  * longer would add its own latency to every wave whose machines were busy, which is
  * the ordinary case on a fleet that is actually working. Coded rather than
- * configurable, like `COME_BACK_WINDOW_MS` and `MAX_FAILED_STARTS` before it: there
- * is no installation for which another number is right, and one more knob would only
- * be a way to stall a rollout by accident.
+ * configurable, like `ABANDON_AFTER_MS` and `MAX_FAILED_STARTS` before it: there is no
+ * installation for which another number is right, and one more knob would only be a
+ * way to stall a rollout by accident.
  */
 export const ROLLOUT_ADVANCE_TICK_MS = 60_000;
 

@@ -121,9 +121,10 @@ export function FleetRolloutDialog({
  * Three things an operator has to know before pressing it: this takes machines out
  * of the pool itself, a bounded number at a time and never mid-phase; it checks each
  * machine came back on the new build before moving on, and stops the whole fleet on
- * one that did not; and every machine it drained goes back in the pool, a halt
- * included — which is the only reason an administrator may drain somebody else's
- * machine at all.
+ * one that *says* it cannot take the build — while a machine that merely stops
+ * answering is given up on within two minutes and the rollout carries on (issue
+ * #1064); and every machine it drained goes back in the pool, a halt included — which
+ * is the only reason an administrator may drain somebody else's machine at all.
  */
 function FleetRolloutConfirmation({ target }: { target: string }) {
 	return (
@@ -142,10 +143,13 @@ function FleetRolloutConfirmation({ target }: { target: string }) {
 				and the rollout waits for it to come back on the new build before starting the next wave.
 			</p>
 			<p className="text-sm text-zinc-400 leading-relaxed">
-				A machine that cannot take the build <strong className="text-zinc-200">halts</strong> the
-				whole rollout — nothing further is drained or signalled, and there is no resume. Every
-				machine it drained goes back in the dispatch pool once it is finished with it, on a halt as
-				well, so no machine is left out of the pool for its owner to discover.
+				A machine that <em>reports</em> it cannot take the build{' '}
+				<strong className="text-zinc-200">halts</strong> the whole rollout — nothing further is
+				drained or signalled, and there is no resume. A machine that simply stops answering does
+				not: after two minutes the rollout gives up on that one machine, records it failed, and
+				carries on with the rest of the fleet. Every machine it drained goes back in the dispatch
+				pool once it is finished with it, on a halt as well, so no machine is left out of the pool
+				for its owner to discover.
 			</p>
 			<p className="text-sm text-zinc-400 leading-relaxed">
 				It then advances on its own. Watch it on this screen — the readout above the roster survives

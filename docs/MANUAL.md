@@ -447,17 +447,29 @@ stands: `queued`, `draining`, `signalled`, `verifying`, `done`, `skipped` or `fa
 A machine enrolled in no project settles `skipped` — advancing the rollout would never
 change that answer, so it is never waited on.
 
-**A bad build stops it.** A machine that reports `failed`, `refused` or `declined`,
-one that comes back still on the build it was asked to leave (what a machine
-returning itself to its last known good build looks like — issue #934), or one that
-applies and never comes back inside ten minutes, halts the rollout: nothing further is
-drained or signalled, the reason is recorded and printed, and every machine it had not
-reached stays in the pool. A machine that was *already* being moved when the halt
-landed still finishes settling on the advances that follow, and goes back in the pool
-once it does; only the machine that **failed** is deliberately left drained, so you
-can look at it. A halt is final — fix the build and start a new rollout; there is no
-resume and no cancel. Only one rollout runs per operator at a time, so asking for a
-different ref mid-move is refused rather than silently re-targeting the fleet.
+**A bad build stops it.** A machine that reports `failed`, `refused` or `declined`, or
+one that comes back still on the build it was asked to leave (what a machine returning
+itself to its last known good build looks like — issue #934), halts the rollout:
+nothing further is drained or signalled, the reason is recorded and printed, and every
+machine it had not reached stays in the pool. A machine that was *already* being moved
+when the halt landed still finishes settling on the advances that follow, and goes back
+in the pool once it does; only the machine that **reported a failure** is deliberately
+left drained, so you can look at it. A halt is final — fix the build and start a new
+rollout; there is no resume and no cancel. Only one rollout runs per operator at a
+time, so asking for a different ref mid-move is refused rather than silently
+re-targeting the fleet.
+
+**A machine that stops answering does not stop it** (issue #1064). Silence says
+nothing about the build — the machine may be asleep, off the network or unplugged — so
+after **two minutes** of it, measured from the machine's last word, the rollout gives
+up on that one machine: the member settles `failed` with the reason in its own line,
+any outstanding request is withdrawn, the machine goes back in the dispatch pool, and
+the next wave is drained and signalled in the same pass. Two minutes is the same
+silence the control plane already calls a machine *probably gone* at, and the decision
+lands on the next periodic advance, so you see it within about three minutes rather
+than losing the rest of the fleet to one dead laptop. Because the member settles
+`failed` without halting, a **`completed` rollout can carry failures** — the member
+table and the tally are where they are read.
 
 `swarm workers update --all` exits 0 whatever the table says, because it is a report
 rather than a pass/fail, and it is strictly owner-scoped: your own machines and
@@ -476,11 +488,12 @@ no CLI command for it (`swarm workers request-update` stays the unstaged
 installation-wide fan-out, and `swarm workers update --all` stays your own fleet).
 
 It behaves exactly like the rollout above — one bounded wave at a time, never
-interrupting a machine mid-phase, advancing itself off reports and reconnects, and
-halting on a machine that reports `failed`/`refused`/`declined`, comes back on the
-build it was asked to leave, or applies and never comes back. **One thing differs, and
-it is the point: every machine it drained goes back in the dispatch pool when the
-rollout is finished with it — on a halt, and including the machine that failed.** An
+interrupting a machine mid-phase, advancing itself off reports and reconnects, halting
+on a machine that reports `failed`/`refused`/`declined` or comes back on the build it
+was asked to leave, and giving up after two minutes on one that stops answering.
+**One thing differs, and it is the point: every machine it drained goes back in the
+dispatch pool when the rollout is finished with it — on a halt, and including the
+machine that reported a failure.** An
 administrator drained machines belonging to people who never asked for the update, so
 none of them is left out of the pool for somebody else to notice; the machine that
 failed is reported in the table rather than held out of service. Draining itself is
@@ -513,7 +526,8 @@ asks for the build the control plane itself is running rather than taking a ref,
 confirms first — and its confirmation says what a rollout actually does: it drains a
 bounded number of machines at a time, never interrupts a phase already running, waits
 for each machine to come back on the new build, halts the whole thing on one that
-cannot take it, and gives every machine it drained back to the dispatch pool, a halt
+*reports* it cannot take the build while giving up within two minutes on one that stops
+answering, and gives every machine it drained back to the dispatch pool, a halt
 included.
 
 **Where it is read from is the page, not the modal.** A rollout advances itself, so

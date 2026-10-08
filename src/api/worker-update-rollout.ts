@@ -1,8 +1,17 @@
 /**
- * Stage a fleet update into **waves that halt on a bad build** (issue #940) — the
- * control-plane policy `workers.startFleetUpdate` / `workers.fleetUpdateStatus`
- * program against, sitting beside the other `src/api/` helper modules
- * (`./worker-update-fanout.ts`, `./worker-access.ts`) rather than inside a router.
+ * Stage a fleet update into **waves that halt on a build a machine says it cannot
+ * take** (issue #940) — the control-plane policy `workers.startFleetUpdate` /
+ * `workers.fleetUpdateStatus` program against, sitting beside the other `src/api/`
+ * helper modules (`./worker-update-fanout.ts`, `./worker-access.ts`) rather than
+ * inside a router.
+ *
+ * **A machine that stops answering is given up on rather than waited for** (issue
+ * #1064). Silence is not a verdict on the build: a machine nobody can reach has said
+ * nothing about it, so after {@link ABANDON_AFTER_MS} the rollout settles that member
+ * `failed` with the reason in its own line, hands its machine back to the dispatch
+ * pool and **carries on with the rest of the fleet**. The halts that remain are the
+ * two a machine actually *answered* with — a reported `failed`/`refused`/`declined`,
+ * and coming back on the build it was asked to leave.
  *
  * It lives here rather than under `src/identity/` for one concrete reason: it
  * drives phase 1's `fanOutWorkerUpdate`, which is `src/api/` policy, and nothing
@@ -45,9 +54,11 @@
  * **A rollout has a scope since issue #1024**, and almost nothing here reads it. The
  * scope decides two things and no third: *which machines* `startRollout` names
  * (`listWorkersForOwner` or `listAllWorkers` grouped by owner), and whether a member
- * that settles `failed` goes back in the dispatch pool
+ * whose machine **answered badly** goes back in the dispatch pool
  * (`rolloutReleasesFailedMembers` — an installation-wide rollout drained a machine
- * belonging to somebody who never asked, so it returns every one of them). Everything
+ * belonging to somebody who never asked, so it returns every one of them). A member
+ * the rollout **gave up on** is released whatever the scope ({@link abandonVerdict}),
+ * which is not an exception to that rule so much as the other side of it. Everything
  * else — the wave bound, the idle wait, the come-back verdict, the halt, the
  * stand-down, the drain hand-off — is scope-blind and is the same code for both. A
  * third rule lives here rather than in an index because no key expresses it: an
@@ -97,58 +108,36 @@ import type { WorkerUpdateStatus } from '../lib/build-identity.js';
 import { fanOutWorkerUpdate } from './worker-update-fanout.js';
 
 /**
- * How long a machine that reported `applied` has to come back on the new build
- * before the rollout calls the build bad and halts.
+ * How long the rollout waits on a machine that has stopped answering before it gives
+ * up on that machine and carries on with the rest of the fleet (issue #1064).
  *
- * By the time this window opens the apply is already **finished and reported** —
- * the daemon reports `applied` and only then releases its session and exits — so
- * none of `src/worker/self-update.ts`'s long command timeouts are inside it. What
- * is left is the process exit, the host supervisor's restart (launchd `KeepAlive` /
- * systemd `Restart=always`), the new build's own start, and the reconnect ladder,
- * which is capped at a jittered 30s (`DEFAULT_BACKOFF.maxMs`,
- * `../transport/worker-client.ts`) — the same ladder `offlineSilenceMs`
- * (`../router/worker-liveness.ts`) sizes its two-minute floor off. Ten minutes
- * clears that by 5x, so an ordinary slow restart never halts a rollout, while a
- * build that cannot start is caught long before issue #934's own three failed
- * starts would have returned the machine to its last known good build.
+ * **One number for the two ways a machine goes quiet** — it applied and never came
+ * back ({@link decideComeBack}), or it was signalled and dropped its session before
+ * reporting anything ({@link decideSilence}) — because they are the same fact: the
+ * control plane cannot reach it, and nothing it could say is going to arrive. Neither
+ * is a verdict on the *build*, which is why neither halts; see
+ * {@link abandonVerdict}.
  *
- * Coded rather than configurable, like `MAX_FAILED_STARTS` next door: a larger
- * number only lengthens how long a fleet keeps rolling onto a build that is already
- * known not to start.
+ * Two minutes is `OFFLINE_SILENCE_FLOOR_MS` (`../router/worker-liveness.ts`) — the
+ * instant the control plane already calls a machine *probably gone* — so the rollout
+ * stops waiting exactly when the rest of the control plane has stopped expecting it.
+ * It still leaves room for a couple of restart attempts: the reconnect ladder is
+ * capped at a jittered 30s (`DEFAULT_BACKOFF.maxMs`,
+ * `../transport/worker-client.ts`) and a LaunchAgent's `ThrottleInterval` is 30s.
+ * Nothing of the machine's own work is inside it either way — the daemon reports
+ * `applied` and only then releases its session and exits, so none of
+ * `src/worker/self-update.ts`'s long command timeouts is being raced — and a machine
+ * that is *holding* its session while it builds is never settled by this at all
+ * ({@link decideSilence}), so this is a bound on silence and never on how long an
+ * apply may take.
+ *
+ * Coded rather than configurable, like `MAX_FAILED_STARTS` next door: a larger number
+ * only lengthens how long one unreachable machine holds a fleet up.
  */
-const COME_BACK_WINDOW_MS = 10 * 60_000;
+const ABANDON_AFTER_MS = 120_000;
 
-/**
- * How long a **signalled** member's machine may be silent before the rollout stops
- * waiting for an answer it is not going to get.
- *
- * This state had no bound at all, which for an owner-scoped rollout was survivable —
- * the stranded machine is your own and `swarm workers undrain` is yours to run — and
- * stopped being so when issue #1024 let an administrator drain a machine belonging to
- * somebody who never asked. A member signalled on a machine that then vanished would
- * stay `signalled` for ever, `drainedByRollout`, and the only thing that could put it
- * back was a manual undrain **by its owner**, since `setDraining` is still strictly
- * owner-only. That is the standing administrative drain issue #919 refused, and it
- * made issue #1024's own promise — nothing left out of the pool once the rollout is
- * terminal — false for exactly the machines it was written for.
- *
- * **It is a silence window, not a duration for the state.** The apply happens inside
- * `signalled` (fetch, `npm ci`, build; the daemon reports only once it is done), so a
- * wall-clock bound on the state would be a guess at how long an apply takes — and
- * nothing here can make that guess honestly: no worker update had ever completed on
- * the installation this was written for. Disconnection is a fact rather than an
- * estimate, and it is the failure actually being caught. A machine holding its session
- * while it builds is healthy however long it takes, and is never settled by this.
- *
- * Five minutes is read off the ladder the machine would come back on, exactly as
- * {@link COME_BACK_WINDOW_MS} is: the reconnect backoff is capped at a jittered 30s
- * (`DEFAULT_BACKOFF.maxMs`), a LaunchAgent's `ThrottleInterval` is 30s, and
- * `offlineSilenceMs` (`../router/worker-liveness.ts`) already calls 120s offline. Five
- * minutes covers something like ten restart attempts, so a daemon that crashed
- * mid-apply and is being restarted by its supervisor has room to come back and finish,
- * while one that is genuinely gone is released in minutes rather than never.
- */
-const SIGNALLED_SILENCE_WINDOW_MS = 5 * 60_000;
+/** {@link ABANDON_AFTER_MS} in the whole minutes the operator-facing messages name it by. */
+const ABANDON_AFTER_MINUTES = Math.round(ABANDON_AFTER_MS / 60_000);
 
 /** One machine's line in a rollout readout — its member row plus the label an operator reads it by. */
 export interface RolloutMemberView extends WorkerUpdateRolloutMember {
@@ -387,16 +376,18 @@ async function readRolloutView(rolloutId: string): Promise<RolloutView | undefin
  *    `already-current` settles it on the spot (nothing restarted, so there is
  *    nothing to come back from), and `failed`/`refused`/`declined` settles it badly
  *    and **halts** — the last of those only ever from a machine on a build predating
- *    issue #975.
+ *    issue #975. A machine that went quiet instead of answering is given up on after
+ *    {@link ABANDON_AFTER_MS}, which settles it `failed` *without* halting.
  * 2. **Verify** every member that applied: it has come back when a daemon has taken
  *    a fresh lease *and* the machine is no longer declaring the build it started
- *    from. Not coming back inside {@link COME_BACK_WINDOW_MS} halts too — a build
- *    that cannot start says nothing, so silence has to be the verdict.
+ *    from. Not coming back inside {@link ABANDON_AFTER_MS} is the same give-up —
+ *    silence names no cause, so the rollout abandons that machine and carries on.
  * 3. **Return** each member the rollout is finished with to the dispatch pool, but
  *    only one the rollout drained itself: a machine the operator had drained for
- *    their own reasons is left exactly as they left it. A member that settled
- *    `failed` is left drained in an owner-scoped rollout and returned in an
- *    installation-scoped one (issue #1024).
+ *    their own reasons is left exactly as they left it. A member whose machine
+ *    *answered* and settled `failed` is left drained in an owner-scoped rollout and
+ *    returned in an installation-scoped one (issue #1024); one the rollout gave up on
+ *    is returned either way ({@link abandonVerdict}).
  * 4. **Stand down** every machine the rollout has not committed to yet, if it has
  *    halted — so a halt leaves the untouched majority of the fleet in the pool.
  * 5. **Advance**, while it is still in progress: take the next `waveSize` queued
@@ -437,8 +428,55 @@ interface MemberVerdict {
 
 /** The message recorded for a member whose machine went quiet before it ever answered. */
 const SILENT_MESSAGE =
-	'the machine stopped answering before it reported what became of the update, so the ' +
-	'request was withdrawn and it was returned to the dispatch pool';
+	`the machine stopped answering for ${ABANDON_AFTER_MINUTES} minutes before it reported ` +
+	'what became of the update, so the rollout gave up on it, withdrew the request and ' +
+	'returned it to the dispatch pool';
+
+/** The message recorded for a member whose machine applied and was never heard from again. */
+const NEVER_CAME_BACK_MESSAGE =
+	`applied the update and never came back within ${ABANDON_AFTER_MINUTES} minutes, so the ` +
+	'rollout gave up on it and carried on';
+
+/**
+ * Give up on a member whose machine has stopped answering: settle it **`failed`** with
+ * the reason in its own line of the readout, hand the machine back to the dispatch
+ * pool, and — crucially — **do not halt** (issue #1064).
+ *
+ * **`failed` rather than `skipped`**, even though nothing said the build is bad: the
+ * operator has to know to go and look at that machine, and `skipped` is this module's
+ * word for "settled without being moved, and nothing failed". The reason is in the
+ * member's own `message` so the table says *why* it failed rather than implying the
+ * build did.
+ *
+ * **No halt**, because silence is not evidence about the build. A machine nobody can
+ * reach has said nothing whatever about the build it was asked to move to, and
+ * stopping the fleet over it would turn one dead laptop into a stalled rollout —
+ * observed on 2026-10-08, when a machine reported `applied`, released its session and
+ * never reconnected, and ten minutes later the rollout stood the rest of the fleet
+ * down. With no halt the pass's own `advanceWaves` takes the next wave immediately.
+ *
+ * **`returnToPool` is unconditional**, for both scopes — the one place
+ * `rolloutReleasesFailedMembers` does not apply, and deliberately so. That rule keeps
+ * *your own machine that answered badly* drained for you to inspect; a machine that
+ * never answered is being released precisely because the rollout has stopped waiting
+ * for it, so leaving it drained is exactly the stranding this is here to end, and it
+ * is also what keeps a machine that comes back late from being drained for ever — it
+ * is already in the pool by the time it reconnects. `returnToPool`'s own two guards
+ * are untouched: an operator's own drain is still never undone, and a machine another
+ * rollout holds is still left to that rollout.
+ *
+ * `requestId` is withdrawn where the member still carries one: without that,
+ * `resendPendingWorkerUpdateToWorker` hands the machine the very request the rollout
+ * gave up on the moment it reconnects *and* is back in the pool. A member abandoned
+ * out of `verifying` has already answered, so it has nothing to withdraw.
+ */
+function abandonVerdict(message: string, now: Date, requestId: string | null): MemberVerdict {
+	return {
+		patch: { state: 'failed', message, settledAt: now },
+		returnToPool: true,
+		...(requestId ? { withdrawRequest: requestId } : {}),
+	};
+}
 
 /** The message recorded for a member whose machine another session asked again. */
 const SUPERSEDED_MESSAGE =
@@ -454,24 +492,25 @@ interface MemberSilence {
 
 /**
  * Give up on a signalled member whose machine has gone quiet, or `undefined` while
- * there is still reason to wait (see {@link SIGNALLED_SILENCE_WINDOW_MS}).
+ * there is still reason to wait (see {@link ABANDON_AFTER_MS}).
  *
  * Both halves are required and neither is sufficient. A machine that holds a session
- * is answerable however long its apply is taking, so a live one is never settled here.
- * A machine that is merely offline may have been offline for seconds — the daemon
- * exits and reconnects as a matter of course — so how long it has been silent is what
- * decides it, measured from the last heartbeat and falling back to the instant it was
- * signalled for a machine that never connected at all.
+ * is answerable however long its apply is taking, so a live one is never settled here —
+ * which is what makes this a **silence window and not a bound on how long an apply may
+ * take**: the apply happens inside `signalled` (fetch, `npm ci`, build; the daemon
+ * reports only once it is done), and a wall-clock bound on the state would be a guess
+ * at its duration where disconnection is a fact. A machine that is merely offline may
+ * have been offline for seconds — the daemon exits and reconnects as a matter of
+ * course — so how long it has been silent is what decides it, measured from the last
+ * heartbeat and falling back to the instant it was signalled for a machine that never
+ * connected at all.
  *
- * It settles `skipped`, never `failed`, and so does not halt: a machine nobody can
- * reach has said nothing whatever about the build it was asked to move to, and
- * stopping the fleet over it would turn one dead laptop into a stalled rollout. It is
- * not counted as `done` either — nothing was installed and nothing came back.
- *
- * `returnToPool` is unconditional rather than scope-dependent, unlike the `failed`
- * verdicts: the machine is being released precisely because this rollout has stopped
- * waiting for it, and leaving an owner's own machine drained to be looked at only
- * makes sense for one that answered.
+ * Before issue #1024 this state had no bound at all, which for an owner-scoped rollout
+ * was survivable — the stranded machine is your own and `swarm workers undrain` is
+ * yours to run — and stopped being so once an administrator could drain a machine
+ * belonging to somebody who never asked. What it settles *to* is
+ * {@link abandonVerdict}, which is where the `failed`, the release and the absent halt
+ * are all explained.
  */
 function decideSilence(
 	member: WorkerUpdateRolloutMember,
@@ -480,15 +519,8 @@ function decideSilence(
 ): MemberVerdict | undefined {
 	if (silence.live) return undefined;
 	const since = silence.lastSeenAt ?? member.signalledAt ?? now;
-	if (now.getTime() - since.getTime() <= SIGNALLED_SILENCE_WINDOW_MS) return undefined;
-	return {
-		patch: { state: 'skipped', message: SILENT_MESSAGE, settledAt: now },
-		returnToPool: true,
-		// Withdraw it, or `resendPendingWorkerUpdateToWorker` hands the machine the very
-		// request this member gave up on the moment it reconnects — and it is back in the
-		// dispatch pool by then, so it would exit to apply an update while holding work.
-		...(member.requestId ? { withdrawRequest: member.requestId } : {}),
-	};
+	if (now.getTime() - since.getTime() <= ABANDON_AFTER_MS) return undefined;
+	return abandonVerdict(SILENT_MESSAGE, now, member.requestId);
 }
 
 /**
@@ -577,9 +609,11 @@ function decideReportedOutcome(
  * build declared on one side or the other) the lease stands alone, rather than a
  * member being failed over a fact nobody recorded.
  *
- * Silence past {@link COME_BACK_WINDOW_MS} is the third verdict, and it has to be:
- * a build that cannot start says nothing at all, so waiting for it to speak would
- * wait forever.
+ * Silence past {@link ABANDON_AFTER_MS} is the third verdict, and it has to be: a
+ * machine that cannot start says nothing at all, so waiting for it to speak would wait
+ * forever. It gives up on that one machine and carries on ({@link abandonVerdict}) —
+ * it does not halt, because silence names no cause and the machine may equally have
+ * been unplugged.
  */
 function decideComeBack(
 	member: WorkerUpdateRolloutMember,
@@ -620,14 +654,10 @@ function decideComeBack(
 	// against it. `signalledAt` is the fallback for a member whose row no longer
 	// carries the report (another session asked it again).
 	const appliedAt = worker.update?.reportedAt ?? member.signalledAt ?? now;
-	if (now.getTime() - appliedAt.getTime() <= COME_BACK_WINDOW_MS) return undefined;
-	return {
-		patch: { state: 'failed', message: 'applied the update and never came back', settledAt: now },
-		returnToPool: releasesFailedMembers,
-		halt:
-			`worker '${worker.displayName}' applied '${target}' and has not come back within ` +
-			`${Math.round(COME_BACK_WINDOW_MS / 60_000)} minutes — treat the build as unable to start`,
-	};
+	if (now.getTime() - appliedAt.getTime() <= ABANDON_AFTER_MS) return undefined;
+	// Nothing to withdraw: this machine answered, so its request is already settled on
+	// its own row — the member reached `verifying` by reading that answer.
+	return abandonVerdict(NEVER_CAME_BACK_MESSAGE, now, null);
 }
 
 /**
@@ -1082,21 +1112,25 @@ class AdvancePass {
 	 * out of it. A machine the operator had drained for their own reasons keeps their
 	 * drain: the rollout borrowed it, it did not create it.
 	 *
-	 * Reached for every member that settles **well** — `done` or `skipped` — and, in an
-	 * **owner-scoped** rollout, deliberately never for one that settles `failed`: a
-	 * machine that could not take the build, or took it and did not come back, is
-	 * exactly the machine an operator needs to look at before it is given work again,
-	 * so it stays out of the pool until they run `swarm workers undrain` themselves.
-	 * That is verbatim what issue #933's single-machine form already leaves them to do.
+	 * Reached for every member that settles **well** — `done` or `skipped` — for every
+	 * member the rollout **gave up on** ({@link abandonVerdict}, issue #1064), and, in
+	 * an **owner-scoped** rollout, deliberately never for one whose machine *answered*
+	 * and settled `failed`: a machine that said it could not take the build, or came
+	 * back on the build it was asked to leave, is exactly the machine an operator needs
+	 * to look at before it is given work again, so it stays out of the pool until they
+	 * run `swarm workers undrain` themselves. That is verbatim what issue #933's
+	 * single-machine form already leaves them to do. A machine that said *nothing* is
+	 * released instead — the rollout stopped waiting for it, so holding its drain open
+	 * would strand it.
 	 *
-	 * **An installation-scoped rollout returns a `failed` member too** (issue #1024,
-	 * {@link rolloutReleasesFailedMembers}), which is the one behaviour the two scopes
-	 * differ on. The machine it drained belongs to somebody who never asked for the
-	 * rollout, so leaving it drained would be a standing administrative drain over
+	 * **An installation-scoped rollout returns an answered `failed` member too** (issue
+	 * #1024, {@link rolloutReleasesFailedMembers}), which is the one behaviour the two
+	 * scopes differ on. The machine it drained belongs to somebody who never asked for
+	 * the rollout, so leaving it drained would be a standing administrative drain over
 	 * another owner's machine — what issue #919 refused by keeping `setDraining`
-	 * owner-only. The verdicts say so rather than this method: all three `failed`
-	 * verdicts carry `returnToPool: releasesFailedMembers`, so what is left here is
-	 * unchanged.
+	 * owner-only. The verdicts say so rather than this method: the two answered `failed`
+	 * verdicts carry `returnToPool: releasesFailedMembers` and the abandoned one carries
+	 * `true`, so what is left here is unchanged.
 	 *
 	 * **Not while another rollout holds the machine** (issue #1023). A halted rollout
 	 * goes on settling the members it had committed to, so it is routinely still

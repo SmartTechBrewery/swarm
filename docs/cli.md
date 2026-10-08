@@ -777,18 +777,26 @@ unchanged.
   supervisor and so would not come back) and `failed`. A tally line counts them. A
   skipped machine goes back in the dispatch pool and the wave carries on past it.
   **A bad build halts the rollout.** A machine that reports `failed`, `refused` or
-  `declined`, that comes back still on the build it was asked to leave (which is what
-  a machine returning itself to its last known good build looks like — issue #934),
-  or that applies and never comes back within ten minutes, stops the whole thing: no
-  further machine is drained or signalled, the reason is recorded verbatim and
-  printed under the table, and every machine the rollout had not committed to yet
-  stays in the pool. A machine the rollout had already committed to when it stopped
-  keeps being settled afterwards — the rollout goes on advancing until every one of
-  them has an answer — and each that settles without failing returns to the dispatch
-  pool by itself. The one machine that failed is deliberately left **drained**, so
-  you can look at it before it is given work again; `swarm workers undrain` is still
-  yours to run. A halt is final — fix the build and start a new rollout; there is no
-  resume and no cancel, exactly as there is none for a single request.
+  `declined`, or that comes back still on the build it was asked to leave (which is
+  what a machine returning itself to its last known good build looks like — issue
+  #934), stops the whole thing: no further machine is drained or signalled, the
+  reason is recorded verbatim and printed under the table, and every machine the
+  rollout had not committed to yet stays in the pool. A machine the rollout had
+  already committed to when it stopped keeps being settled afterwards — the rollout
+  goes on advancing until every one of them has an answer — and each that settles
+  without failing returns to the dispatch pool by itself. The one machine that
+  reported a failure is deliberately left **drained**, so you can look at it before
+  it is given work again; `swarm workers undrain` is still yours to run. A halt is
+  final — fix the build and start a new rollout; there is no resume and no cancel,
+  exactly as there is none for a single request.
+  **A machine that stops answering does not halt it** (issue #1064). After two
+  minutes of silence — the same silence the control plane already calls a machine
+  *probably gone* at — the rollout gives up on that one machine: it settles `failed`
+  with the reason in its own line, any outstanding request is withdrawn, the machine
+  goes back in the dispatch pool whatever the rollout's scope, and the next wave is
+  drained and signalled in the same pass. So a rollout can finish `completed` with a
+  `failed` machine in its table, and one unreachable laptop costs a line rather than
+  the rest of the fleet.
   **One rollout at a time per operator.** Asking for a *different* ref while one is
   under way is refused naming `--status` rather than re-targeting a fleet mid-move;
   asking for the *same* ref simply advances it. A halted or completed rollout no

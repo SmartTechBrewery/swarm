@@ -326,12 +326,17 @@ Usage:
              rollout, and nudges it along too; each run prints where every machine
              stands (queued, draining, signalled, verifying, done, skipped,
              failed). A machine that reports failed, refused or declined, or that
-             applies and never comes back, HALTS the rollout: nothing further is
-             drained or signalled, the reason is recorded, and the untouched
-             machines stay in the pool. A machine the rollout had already
-             committed to keeps being settled on the advances that follow and
-             returns to the pool once it settles without failing; only the one
-             that failed is left drained. A halted rollout is final — fix the
+             comes back on the build it was asked to leave, HALTS the rollout:
+             nothing further is drained or signalled, the reason is recorded, and
+             the untouched machines stay in the pool. A machine that simply STOPS
+             ANSWERING does not halt it: after two minutes of silence the rollout
+             gives up on that machine alone, records it failed with the reason,
+             puts it back in the pool and carries straight on with the next one —
+             so one dead laptop costs you a line in the table rather than the rest
+             of the fleet. A machine the rollout had already committed to when a
+             halt landed keeps being settled on the advances that follow and
+             returns to the pool once it settles without failing; only the one that
+             reported a failure is left drained. A halted rollout is final — fix the
              build and start a new one; there is no resume and no cancel. --status prints
              the same table without advancing anything. One rollout at a time per
              operator: asking for a different ref while one is under way is refused
@@ -722,6 +727,16 @@ const ROLLOUT_MEMBER_STATES = [
  * sentence, never invent it.
  */
 const COMMITTED_ROLLOUT_MEMBER_STATES = ['draining', 'signalled', 'verifying'];
+
+/**
+ * The outcomes a machine itself reports to say the move did not happen
+ * (`HALTING_WORKER_UPDATE_STATUSES`, `src/identity/worker-update-rollout.ts`), restated
+ * here for the reason the two lists above are, and read for one sentence only: which
+ * `failed` machines a halt leaves out of the dispatch pool (issue #1064). A machine the
+ * rollout *gave up on* also settles `failed` and carries no such outcome — it was
+ * returned to the pool as it was abandoned.
+ */
+const REPORTED_FAILURE_OUTCOMES = ['failed', 'refused', 'declined'];
 
 const StoredScmCredentialSchema = z.object({ login: z.string().min(1) });
 const ProjectScmProviderSchema = z.object({ providerId: z.string().min(1) });
@@ -1888,9 +1903,17 @@ function printHaltFooter(rollout: Rollout): void {
 			`  still settling ${machines} the rollout had already committed to; each returns to the pool once it settles without failing`,
 		);
 	}
-	// A machine that failed is left out of the pool on purpose, so the undrain that ends
-	// that is named here rather than left to be remembered.
-	const failed = rollout.members.filter((member) => member.state === 'failed');
+	// A machine that *reported* a failure is left out of the pool on purpose, so the
+	// undrain that ends that is named here rather than left to be remembered. Scoped to
+	// a reported outcome since issue #1064: a member the rollout gave up on settles
+	// `failed` too, and that one is already back in the pool — telling its owner to
+	// undrain it would send them after a machine nobody is holding. A failure this build
+	// cannot recognise as reported is simply not listed, on the same under-report-rather-
+	// than-invent rule {@link COMMITTED_ROLLOUT_MEMBER_STATES} is read with.
+	const failed = rollout.members.filter(
+		(member) =>
+			member.state === 'failed' && REPORTED_FAILURE_OUTCOMES.includes(member.outcome ?? ''),
+	);
 	if (failed.length > 0) {
 		out.info(
 			`  left drained so you can look at ${failed.length === 1 ? 'it' : 'them'}: ${failed
