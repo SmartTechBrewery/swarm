@@ -1,5 +1,5 @@
 import { readFileSync, realpathSync } from 'node:fs';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from 'vitest';
 
 const { runCommand } = vi.hoisted(() => ({ runCommand: vi.fn() }));
@@ -207,6 +207,30 @@ describe('swarm run:worker', () => {
 		expect(error).not.toHaveBeenCalledWith(expect.stringContaining('no worker registered'));
 		expect(runCommand).not.toHaveBeenCalled();
 		expect(execve).not.toHaveBeenCalled();
+	});
+
+	// Issue #1059: one daemon, several checkouts — the primary first, then each extra
+	// the cache records, in the list the daemon reads.
+	it('appends every cached extra checkout to SWARM_WORKER_REPO_ROOT', async () => {
+		readWorkerCredentialCache.mockReturnValue({
+			workerId: WORKER_ID,
+			credential: 'raw-credential-token',
+			repoRoot: CWD,
+			registeredAt: new Date().toISOString(),
+			extraRepoRoots: ['/checkouts/mobile', '/checkouts/web'],
+		});
+		expect(await run([])).toBe(0);
+		expect(execve).toHaveBeenCalledWith(
+			process.execPath,
+			expect.any(Array),
+			expect.objectContaining({
+				SWARM_WORKER_REPO_ROOT: [CWD, '/checkouts/mobile', '/checkouts/web'].join(delimiter),
+			}),
+		);
+		const step = printed().find((line) => line.includes('starting worker')) ?? '';
+		expect(step).toContain(CWD);
+		expect(step).toContain('/checkouts/mobile');
+		expect(step).toContain('/checkouts/web');
 	});
 
 	it('prints usage for --help without starting anything', async () => {

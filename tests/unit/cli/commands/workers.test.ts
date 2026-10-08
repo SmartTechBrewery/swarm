@@ -1,3 +1,6 @@
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { delimiter, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
@@ -28,7 +31,22 @@ const { promptHidden, readStdin } = vi.hoisted(() => ({
 	promptHidden: vi.fn(),
 	readStdin: vi.fn(),
 }));
-const { writeWorkerCredentialCache } = vi.hoisted(() => ({ writeWorkerCredentialCache: vi.fn() }));
+const {
+	writeWorkerCredentialCache,
+	readWorkerCredentialCache,
+	updateWorkerCredentialCacheCheckouts,
+	workerCredentialCachePath,
+} = vi.hoisted(() => ({
+	writeWorkerCredentialCache: vi.fn(),
+	readWorkerCredentialCache: vi.fn(),
+	updateWorkerCredentialCacheCheckouts: vi.fn(),
+	workerCredentialCachePath: vi.fn(),
+}));
+// An extra checkout is identified by its `origin` (issue #1059). Mocked so the suite
+// needs no real git checkout: a directory is a checkout of whatever `slugs` says.
+const { resolveDeclarableOriginRepoSlug } = vi.hoisted(() => ({
+	resolveDeclarableOriginRepoSlug: vi.fn(),
+}));
 // `register-and-enroll` bootstraps the checkout's `.env` before it needs the URL
 // itself. Mocked here so the suite drives that seam rather than the developer's
 // own `.env` — its behaviour is covered by tests/unit/cli/control-plane-env.test.ts.
@@ -40,7 +58,16 @@ vi.mock('@/cli/_shared/operator-client.js', () => ({
 	OperatorApiError,
 }));
 vi.mock('@/cli/_shared/secret-input.js', () => ({ promptHidden, readStdin }));
-vi.mock('@/cli/_shared/worker-credential-cache.js', () => ({ writeWorkerCredentialCache }));
+vi.mock('@/cli/_shared/worker-credential-cache.js', () => ({
+	writeWorkerCredentialCache,
+	readWorkerCredentialCache,
+	updateWorkerCredentialCacheCheckouts,
+	workerCredentialCachePath,
+}));
+vi.mock('@/scm/repo-slug.js', async (importOriginal) => ({
+	...(await importOriginal<typeof import('@/scm/repo-slug.js')>()),
+	resolveDeclarableOriginRepoSlug,
+}));
 vi.mock('@/cli/_shared/control-plane-env.js', () => ({ ensureControlPlaneUrl }));
 
 import { run } from '@/cli/commands/workers.js';
@@ -54,6 +81,9 @@ const ROLLOUT_ID = '99999999-9999-4999-8999-999999999999';
 const ORIGINAL_INIT_CWD = process.env.INIT_CWD;
 
 type Answer = (input: Record<string, unknown>) => unknown;
+
+/** Which repository each checkout directory's `origin` names — absent means none. */
+const slugs = new Map<string, string>();
 
 /** What the control plane answers per procedure path — replaced per test where it matters. */
 const answers = new Map<string, Answer>();
@@ -146,6 +176,23 @@ describe('swarm workers', () => {
 		writeWorkerCredentialCache
 			.mockReset()
 			.mockReturnValue('/home/ada/.swarm/worker-credentials/deadbeef/credential.json');
+		readWorkerCredentialCache.mockReset().mockReturnValue(null);
+		updateWorkerCredentialCacheCheckouts
+			.mockReset()
+			.mockImplementation((repoRoot: string, extraRepoRoots: string[]) => ({
+				workerId: WORKER_ID,
+				credential: 'raw-credential-token',
+				repoRoot,
+				registeredAt: new Date().toISOString(),
+				extraRepoRoots,
+			}));
+		workerCredentialCachePath
+			.mockReset()
+			.mockReturnValue('/home/ada/.swarm/worker-credentials/deadbeef/credential.json');
+		slugs.clear();
+		resolveDeclarableOriginRepoSlug
+			.mockReset()
+			.mockImplementation(async (cwd: string) => slugs.get(cwd));
 
 		answers.set('workers.register', (input) => ({
 			worker: {
@@ -798,6 +845,246 @@ describe('swarm workers', () => {
 			expect(log).toHaveBeenCalledWith(expect.stringContaining('register-and-enroll'));
 			expect(calls).toHaveLength(0);
 			expect(readStdin).not.toHaveBeenCalled();
+		});
+	});
+
+	/**
+	 * Real directories, so the existence check runs for real; which repository each
+	 * is comes from `slugs`. The primary checkout is this test process's own cwd, as
+	 * it is for both registration paths by default.
+	 */
+	describe('extra checkouts (issue #1059)', () => {
+		const PRIMARY = realpathSync(process.cwd());
+		let scratch: string;
+		let mobile: string;
+		let web: string;
+
+		beforeEach(() => {
+			scratch = realpathSync(mkdtempSync(join(tmpdir(), 'swarm-extra-checkout-')));
+			mobile = join(scratch, 'mobile');
+			web = join(scratch, 'web');
+			mkdirSync(mobile);
+			mkdirSync(web);
+			slugs.set(PRIMARY, 'acme/platform');
+			slugs.set(mobile, 'acme/mobile');
+			slugs.set(web, 'acme/web');
+		});
+
+		afterEach(() => {
+			rmSync(scratch, { recursive: true, force: true });
+		});
+
+		const REGISTER = ['register', IDENTIFIER, '--name', 'ada-laptop', '--cli', 'claude'];
+		const REGISTER_AND_ENROLL = [
+			'register-and-enroll',
+			IDENTIFIER,
+			PROJECT_ID,
+			'--name',
+			'ada-laptop',
+			'--cli',
+			'claude',
+		];
+
+		function errors(): string[] {
+			return vi.mocked(console.error).mock.calls.map(([line]) => String(line));
+		}
+
+		/** A worker already registered for the primary checkout, holding `extras`. */
+		function registeredHere(extraRepoRoots?: string[]): void {
+			readWorkerCredentialCache.mockReturnValue({
+				workerId: WORKER_ID,
+				credential: 'raw-credential-token',
+				repoRoot: PRIMARY,
+				registeredAt: new Date().toISOString(),
+				...(extraRepoRoots ? { extraRepoRoots } : {}),
+			});
+		}
+
+		describe('register --extra-checkout', () => {
+			it('caches every extra checkout with the primary one and names them', async () => {
+				expect(await run([...REGISTER, '--extra-checkout', mobile, '--extra-checkout', web])).toBe(
+					0,
+				);
+				expect(writeWorkerCredentialCache).toHaveBeenCalledExactlyOnceWith({
+					repoRoot: process.cwd(),
+					workerId: WORKER_ID,
+					credential: 'raw-credential-token',
+					extraRepoRoots: [mobile, web],
+				});
+				const cacheLine = lines().find((line) => line.includes('credential.json')) ?? '';
+				expect(cacheLine).toContain(mobile);
+				expect(cacheLine).toContain(web);
+			});
+
+			// Each refusal is one actionable line, and lands before anything is registered.
+			it.each([
+				['a path that does not exist', () => join(scratch, 'missing'), 'does not exist'],
+				[
+					'a directory with no identifiable origin',
+					() => {
+						const plain = join(scratch, 'plain');
+						mkdirSync(plain);
+						return plain;
+					},
+					"identifiable 'origin'",
+				],
+				['the primary checkout itself', () => PRIMARY, 'primary checkout'],
+				[
+					'another checkout of a repository the worker already holds',
+					() => {
+						const second = join(scratch, 'platform-two');
+						mkdirSync(second);
+						slugs.set(second, 'acme/platform');
+						return second;
+					},
+					'one checkout per repository',
+				],
+			])('refuses %s before registering anything', async (_case, path, message) => {
+				expect(await run([...REGISTER, '--extra-checkout', path()])).toBe(1);
+				expect(errors()).toEqual([expect.stringContaining(message)]);
+				expect(calls).toHaveLength(0);
+				expect(writeWorkerCredentialCache).not.toHaveBeenCalled();
+			});
+
+			it('refuses the same checkout named twice', async () => {
+				expect(
+					await run([...REGISTER, '--extra-checkout', mobile, '--extra-checkout', `${mobile}/`]),
+				).toBe(1);
+				expect(errors()).toEqual([expect.stringContaining('already one of this worker')]);
+				expect(calls).toHaveLength(0);
+			});
+		});
+
+		describe('register-and-enroll --extra-checkout', () => {
+			it('joins the checkouts in the printed SWARM_WORKER_REPO_ROOT and caches them', async () => {
+				expect(
+					await run([...REGISTER_AND_ENROLL, '--extra-checkout', mobile, '--extra-checkout', web]),
+				).toBe(0);
+				const printed = lines();
+				expect(printed[printed.length - 1] ?? '').toContain(
+					`SWARM_WORKER_REPO_ROOT=${[process.cwd(), mobile, web].join(delimiter)} npm run dev:worker`,
+				);
+				expect(writeWorkerCredentialCache).toHaveBeenCalledExactlyOnceWith(
+					expect.objectContaining({ extraRepoRoots: [mobile, web] }),
+				);
+			});
+
+			// Nothing written — not even the `.env` bootstrap — for a checkout it refuses.
+			it('refuses an unusable checkout before touching anything', async () => {
+				expect(
+					await run([...REGISTER_AND_ENROLL, '--extra-checkout', join(scratch, 'missing')]),
+				).toBe(1);
+				expect(ensureControlPlaneUrl).not.toHaveBeenCalled();
+				expect(readStdin).not.toHaveBeenCalled();
+				expect(calls).toHaveLength(0);
+			});
+		});
+
+		describe('add-checkout', () => {
+			it("appends the checkout to this checkout's cache entry, host-locally", async () => {
+				registeredHere([mobile]);
+				expect(await run(['add-checkout', web])).toBe(0);
+				expect(updateWorkerCredentialCacheCheckouts).toHaveBeenCalledExactlyOnceWith(PRIMARY, [
+					mobile,
+					web,
+				]);
+				// Checkout paths never leave the machine: no session, no control-plane call.
+				expect(requireOperatorSession).not.toHaveBeenCalled();
+				expect(calls).toHaveLength(0);
+				expect(lines().some((line) => line.includes('swarm run:worker'))).toBe(true);
+			});
+
+			it("reads a relative path from npm's caller directory", async () => {
+				process.env.INIT_CWD = scratch;
+				slugs.set(scratch, 'acme/scratch');
+				readWorkerCredentialCache.mockReturnValue({
+					workerId: WORKER_ID,
+					credential: 'raw-credential-token',
+					repoRoot: scratch,
+					registeredAt: new Date().toISOString(),
+				});
+				expect(await run(['add-checkout', 'mobile'])).toBe(0);
+				expect(readWorkerCredentialCache).toHaveBeenCalledWith(scratch);
+				expect(updateWorkerCredentialCacheCheckouts).toHaveBeenCalledExactlyOnceWith(scratch, [
+					mobile,
+				]);
+			});
+
+			it('refuses when no worker is registered for this checkout', async () => {
+				expect(await run(['add-checkout', mobile])).toBe(1);
+				expect(errors()).toEqual([expect.stringContaining('no worker registered')]);
+				expect(lines().some((line) => line.includes('register-and-enroll'))).toBe(true);
+				expect(updateWorkerCredentialCacheCheckouts).not.toHaveBeenCalled();
+			});
+
+			it('names the file when the cache entry is unreadable', async () => {
+				readWorkerCredentialCache.mockReturnValue(undefined);
+				expect(await run(['add-checkout', mobile])).toBe(1);
+				expect(errors()).toEqual([expect.stringContaining('credential.json')]);
+				expect(updateWorkerCredentialCacheCheckouts).not.toHaveBeenCalled();
+			});
+
+			it('refuses a checkout the worker already holds', async () => {
+				registeredHere([mobile]);
+				expect(await run(['add-checkout', mobile])).toBe(1);
+				expect(errors()).toEqual([expect.stringContaining('already one of this worker')]);
+				expect(updateWorkerCredentialCacheCheckouts).not.toHaveBeenCalled();
+			});
+
+			it('refuses a second checkout of a repository an extra checkout already is', async () => {
+				registeredHere([mobile]);
+				const otherMobile = join(scratch, 'mobile-two');
+				mkdirSync(otherMobile);
+				slugs.set(otherMobile, 'ACME/Mobile');
+				expect(await run(['add-checkout', otherMobile])).toBe(1);
+				expect(errors()).toEqual([expect.stringContaining('one checkout per repository')]);
+			});
+
+			it('requires a path', async () => {
+				registeredHere();
+				expect(await run(['add-checkout'])).toBe(1);
+				expect(updateWorkerCredentialCacheCheckouts).not.toHaveBeenCalled();
+			});
+		});
+
+		describe('remove-checkout', () => {
+			it("drops the checkout from this checkout's cache entry", async () => {
+				registeredHere([mobile, web]);
+				expect(await run(['remove-checkout', mobile])).toBe(0);
+				expect(updateWorkerCredentialCacheCheckouts).toHaveBeenCalledExactlyOnceWith(PRIMARY, [
+					web,
+				]);
+				expect(calls).toHaveLength(0);
+				expect(lines().some((line) => line.includes('swarm run:worker'))).toBe(true);
+			});
+
+			// Removing a checkout already deleted from disk is exactly when this is wanted.
+			it('removes a checkout that no longer exists', async () => {
+				const gone = join(scratch, 'gone');
+				registeredHere([gone]);
+				expect(await run(['remove-checkout', gone])).toBe(0);
+				expect(updateWorkerCredentialCacheCheckouts).toHaveBeenCalledExactlyOnceWith(PRIMARY, []);
+			});
+
+			it('refuses the primary checkout', async () => {
+				registeredHere([mobile]);
+				expect(await run(['remove-checkout', PRIMARY])).toBe(1);
+				expect(errors()).toEqual([expect.stringContaining('primary checkout')]);
+				expect(updateWorkerCredentialCacheCheckouts).not.toHaveBeenCalled();
+			});
+
+			it('refuses a checkout the worker does not hold', async () => {
+				registeredHere([mobile]);
+				expect(await run(['remove-checkout', web])).toBe(1);
+				expect(errors()).toEqual([expect.stringContaining('not one of this worker')]);
+				expect(updateWorkerCredentialCacheCheckouts).not.toHaveBeenCalled();
+			});
+
+			it('refuses when no worker is registered for this checkout', async () => {
+				expect(await run(['remove-checkout', mobile])).toBe(1);
+				expect(errors()).toEqual([expect.stringContaining('no worker registered')]);
+				expect(updateWorkerCredentialCacheCheckouts).not.toHaveBeenCalled();
+			});
 		});
 	});
 

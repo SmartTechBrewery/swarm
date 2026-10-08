@@ -40,11 +40,14 @@ substitute your own.
 | `~/code/swarm` | that machine's checkout of SWARM itself |
 | `~/code/example-project` | that machine's checkout of the project's repository |
 
-A worker is permanently paired with one repository checkout, so a teammate who
-works on two repositories gets **two workers**, each registered from its own
-project checkout. Naming them after the person and the project
-(`ada_example_project`, `ada_example_mobile`) is a convention, not a rule — the
-pairing SWARM enforces is the checkout's `origin`, never the name.
+A worker is registered from one repository checkout — its **primary** checkout,
+the one it is started from — and can be given a checkout of each further
+repository it should serve on the same machine (issue #1059, see
+[Serving a second repository](#serving-a-second-repository)). A teammate who works
+on two repositories can therefore run **one worker holding two checkouts**, or two
+workers each registered from its own checkout. Naming workers after the person and
+the project (`ada_example_project`, `ada_example_mobile`) is a convention, not a
+rule — the pairing SWARM enforces is each checkout's `origin`, never the name.
 
 ### Step 1 — on the admin machine (the one with `DATABASE_URL`)
 
@@ -146,6 +149,54 @@ the SWARM checkout); without it, use the explicit form from step 4's last line,
 run in `~/code/swarm`. On macOS,
 [`launchd-worker-autostart.md`](./launchd-worker-autostart.md) runs it at login
 instead of from a terminal tab.
+
+### Serving a second repository
+
+One worker can hold a checkout of each repository it serves (issue #1059) — one
+daemon, one machine, one checkout per repository. That is usually what you want
+when a project owns several repositories (an API and its mobile app, say): one
+worker picks up the cards of both. Clone the second repository on that machine,
+then, **in the worker's primary checkout** (the one it was registered in and is
+started from):
+
+```bash
+cd ~/code/example-project
+swarm workers add-checkout ~/code/example-mobile
+```
+
+It checks that `~/code/example-mobile` exists, is a git checkout whose `origin`
+names a repository, and is not the primary checkout, a checkout the worker already
+holds, or another checkout of a repository it already holds. It records the path
+in this machine's credential cache for the primary checkout — and nothing else:
+checkout paths never leave the machine, so there is no control-plane call and no
+session needed. Then **restart the worker** (stop the foreground `swarm run:worker`
+and start it again, or `swarm-worker-agent install` once more on macOS). `swarm
+run:worker` starts the daemon with `SWARM_WORKER_REPO_ROOT` set to the primary
+checkout followed by every extra one, and the daemon declares both repositories at
+its handshake; the dashboard's `/workers/<worker-id>` lists both. If the second
+repository belongs to a project the worker is not enrolled in, enroll it there as
+usual (`swarm workers enroll`).
+
+This is how an **existing** worker gains a repository. Do not re-register it for
+that: registration issues a new worker, and the old one's enrollments and operator
+source-control credentials would not come with it. A new machine can be given its
+extra checkouts up front instead, with the repeatable `--extra-checkout <path>` on
+`register-and-enroll` (or `register`) — its printed start line then reads
+`SWARM_WORKER_REPO_ROOT=<primary>:<extra>…`.
+
+`swarm workers remove-checkout ~/code/example-mobile`, run in the same primary
+checkout, drops one again (the path need not still exist), and takes effect at the
+next restart too. Two things to keep in mind:
+
+- **Start it only from the primary checkout.** An extra checkout has no cache entry
+  of its own, so `swarm run:worker` there answers "no worker registered for this
+  checkout" — and on macOS, never install a `swarm-worker-agent` in an extra
+  checkout; the primary checkout's one agent serves all of them.
+- **One checkout per repository, everywhere on the machine.** The daemon locks every
+  checkout it holds, so a checkout another running worker already holds refuses to
+  start this one. A machine that ran a separate worker for the second repository
+  stops it first — and once the combined worker is up and has picked up that
+  repository's work, retire the old one (`swarm workers remove <worker-id>`).
 
 ### Adding a second worker later
 
@@ -488,7 +539,8 @@ swarm run:worker            # from inside the checkout
 
 It starts the same daemon, reading `SWARM_WORKER_CREDENTIAL` from the per-checkout
 cache Part 1 wrote here and setting `SWARM_WORKER_REPO_ROOT` to the current
-directory — so `.env` only needs `SWARM_CONTROL_PLANE_URL`, and the credential is
+directory, followed by any extra checkouts recorded for it
+([Serving a second repository](#serving-a-second-repository)) — so `.env` only needs `SWARM_CONTROL_PLANE_URL`, and the credential is
 never typed, pasted, or printed. It is an *additional* start path: the `.env` +
 `npm run dev:worker` form above is unchanged and stays the one to use on a remote
 machine, under a process supervisor, or anywhere the machine that registered the
@@ -905,7 +957,7 @@ where every machine stands, live and across a page reload.
 | `workers enroll --active` (or `register-and-enroll`) says `You do not have permission to perform this action on project "…"` | Approving an enrollment is a `projectAdmin` call, and it is made *after* the enrollment is created — so the enrollment now exists, pending, **with sharing consent already recorded** (that half is the machine owner's own decision and is applied independently of the approval, issue #901). Do **not** enroll again (that reports `This worker is already enrolled in this project.`); the command prints exactly what is left, and a project administrator runs `swarm workers approve <worker-id> <project-id>` — the last step, after which the machine is routable. |
 | `workers remove` says `This worker is running a job right now` | The machine is executing a run, and deleting it mid-run would detach that run from the machine still running it (issue #789). Wait for it, or stop the run from the dashboard, then retry. |
 | `workers list` says `Open a project you are enrolled in to see its workers.` | The unfiltered roster is an installation administrator's view (issue #647). Pass your own login handle — `workers list <email>` — for your own machines. |
-| `swarm run:worker` says `no worker registered for this checkout` | No credential was cached for *this* directory's realpath — the worker was registered on another machine, in another checkout, or before issue #788. Register here, or start the daemon with `SWARM_WORKER_CREDENTIAL` + `SWARM_WORKER_REPO_ROOT` set explicitly, as above. A git *worktree* of the checkout has its own realpath and gets this message too; run the daemon against the main checkout. |
+| `swarm run:worker` says `no worker registered for this checkout` | No credential was cached for *this* directory's realpath — the worker was registered on another machine, in another checkout, or before issue #788. Register here, or start the daemon with `SWARM_WORKER_CREDENTIAL` + `SWARM_WORKER_REPO_ROOT` set explicitly, as above. An *extra* checkout given to a worker with `add-checkout` / `--extra-checkout` has no entry of its own either: start that worker from its primary checkout. A git *worktree* of the checkout has its own realpath and gets this message too; run the daemon against the main checkout. |
 | `Cannot find package 'ws'` (or any other module) on `dev:worker` | `npm ci` was never run on the new machine — its `node_modules` doesn't exist yet. |
 | `Missing required environment variable: SWARM_CONTROL_PLANE_URL` even though it's set somewhere | It's set in the wrong file. `dev:worker` only reads `.env` (see the dotenv block above) — put the two variables there, or invoke node directly with `--env-file=<your file>` instead of the npm script. |
 | Every dispatch to this worker fails at once with `No operator SCM credential stored for worker '<name>' … on provider '<id>'` | Part 1, step 5 was never run for that provider (issue #765). Run `swarm workers set-scm-credential <worker-id> <provider>`, or set it as the worker's owner at `/workers/<worker-id>` → **Operator source-control credential** (issue #766) — either takes effect on the next dispatch, with no worker restart. |

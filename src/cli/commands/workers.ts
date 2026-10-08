@@ -69,6 +69,15 @@
  * paste. Printing stays: a remote machine, or a process supervisor, still needs
  * the value, and this cache only ever answers for the checkout it was written in.
  *
+ * A worker may serve **more than one repository** from one machine (issue #1059):
+ * both registration paths take a repeatable `--extra-checkout <path>`, and
+ * `add-checkout` / `remove-checkout` change an existing worker's set afterwards
+ * without re-registering it — which would issue a new worker and lose its
+ * enrollments and operator credentials. All three only edit the *primary*
+ * checkout's cache entry; checkout paths never leave the machine, so none of this
+ * calls the control plane. The daemon declares the repositories those checkouts
+ * are at its next handshake.
+ *
  * `register` *points at* that second secret's write surfaces rather than taking
  * it (issue #767): a worker's SCM provider is a property of its enrollments and
  * is not known at registration time, so prompting here would have to guess one
@@ -89,8 +98,10 @@
  * #767 recorded as missing at registration time.
  *
  * Subcommands:
- *   swarm workers register <owner-identifier> --name <displayName> --cli <c1,c2,...>
- *   swarm workers register-and-enroll <owner-identifier> <project-id> --name <displayName> --cli <c1,c2,...> [--control-plane-url <url>] [--repo-root <path>]
+ *   swarm workers register <owner-identifier> --name <displayName> --cli <c1,c2,...> [--extra-checkout <path>]...
+ *   swarm workers register-and-enroll <owner-identifier> <project-id> --name <displayName> --cli <c1,c2,...> [--control-plane-url <url>] [--repo-root <path>] [--extra-checkout <path>]...
+ *   swarm workers add-checkout <path>
+ *   swarm workers remove-checkout <path>
  *   swarm workers list [<owner-identifier>]
  *   swarm workers set-cli <worker-id> (--cli <c1,c2,...> | --auto)
  *   swarm workers set-scm-credential <worker-id> <scm-provider-id>
@@ -110,12 +121,15 @@
  */
 
 import { existsSync } from 'node:fs';
+import { delimiter, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { z } from 'zod';
 import { type AgentCli, AgentCliSchema } from '../../harness/agent-cli.js';
 import { describeError } from '../../lib/errors.js';
 import { operatorCredentialCopyFor } from '../../scm/operator-credential-copy.js';
+import { repoSlugsMatch, resolveDeclarableOriginRepoSlug } from '../../scm/repo-slug.js';
 import { SCM_TYPES } from '../../scm/types.js';
+import { canonicalCheckoutPath } from '../../worktree/checkout-key.js';
 import { ensureControlPlaneUrl } from '../_shared/control-plane-env.js';
 import {
 	createOperatorClient,
@@ -126,7 +140,12 @@ import {
 } from '../_shared/operator-client.js';
 import * as out from '../_shared/output.js';
 import { promptHidden, readStdin } from '../_shared/secret-input.js';
-import { writeWorkerCredentialCache } from '../_shared/worker-credential-cache.js';
+import {
+	readWorkerCredentialCache,
+	updateWorkerCredentialCacheCheckouts,
+	workerCredentialCachePath,
+	writeWorkerCredentialCache,
+} from '../_shared/worker-credential-cache.js';
 
 const AGENT_CLIS = AgentCliSchema.options;
 /**
@@ -142,8 +161,10 @@ const SCM_PROVIDER_IDS = SCM_TYPES;
 const USAGE = `swarm workers — register and manage local workers (identity + declared CLIs)
 
 Usage:
-  swarm workers register <owner-identifier> --name <displayName> --cli <c1,c2,...>
-  swarm workers register-and-enroll <owner-identifier> <project-id> --name <displayName> --cli <c1,c2,...> [--control-plane-url <url>] [--repo-root <path>]
+  swarm workers register <owner-identifier> --name <displayName> --cli <c1,c2,...> [--extra-checkout <path>]...
+  swarm workers register-and-enroll <owner-identifier> <project-id> --name <displayName> --cli <c1,c2,...> [--control-plane-url <url>] [--repo-root <path>] [--extra-checkout <path>]...
+  swarm workers add-checkout <path>
+  swarm workers remove-checkout <path>
   swarm workers list [<owner-identifier>]
   swarm workers set-cli <worker-id> (--cli <c1,c2,...> | --auto)
   swarm workers set-scm-credential <worker-id> <scm-provider-id>
@@ -174,7 +195,9 @@ Usage:
              credential is also cached for the checkout this runs in
              (~/.swarm/worker-credentials/), so \`swarm run:worker\` can start
              this worker from here with nothing to paste. Registering for
-             somebody else is an installation-admin act.
+             somebody else is an installation-admin act. --extra-checkout
+             (repeatable) gives the worker a further repository checkout on this
+             machine, served by the same daemon; see add-checkout.
   register-and-enroll
              The one-command path for a NEW machine: points this checkout's .env
              at the control plane, registers the worker, stores its operator
@@ -202,7 +225,27 @@ Usage:
              for) is the directory you run this in, exactly like register; pass
              --repo-root when you are onboarding a machine from somewhere else.
              The worker credential is shown ONCE, in that final line — and cached
-             for that same checkout, exactly as register does.
+             for that same checkout, exactly as register does. --extra-checkout
+             (repeatable) is taken exactly as register takes it, and each one
+             follows the primary checkout in the printed SWARM_WORKER_REPO_ROOT.
+  add-checkout
+             Give the worker registered for the checkout you are standing in (its
+             PRIMARY checkout) another repository checkout on this machine, so the
+             one daemon serves both. <path> must exist, be a git checkout with an
+             'origin' remote, and differ from the primary checkout and from every
+             checkout the worker already has. Host-local: it edits only this
+             machine's credential cache, calls no control plane, and needs no
+             session. Restart the worker afterwards (swarm run:worker, or
+             swarm-worker-agent install) — it declares the new repository at its
+             next handshake. This is how an EXISTING worker gains a repository;
+             re-registering would issue a new worker and lose its enrollments and
+             operator credentials. Enroll it in that repository's project as
+             usual if it is not already.
+  remove-checkout
+             Drop one of the extra checkouts add-checkout or --extra-checkout
+             recorded, from the worker's primary checkout. The primary checkout
+             itself cannot be removed — that is 'remove'. Host-local, and takes
+             effect when the worker is next restarted, exactly like add-checkout.
   list       List workers ('<id>\\t<displayName>\\t<clis>' per line). With your
              own login handle, your machines; with somebody else's, or with none
              at all (prefixed with the owner identifier), the installation-wide
@@ -367,14 +410,17 @@ Usage:
              The machine's owner alone may do it, so sign in as them.
 
 Requires SWARM_CONTROL_PLANE_URL and a \`swarm login\` session — and no
-DATABASE_URL: every subcommand calls the control plane's operator API, so this
-runs from the machine being onboarded. A worker is a local execution environment
-owned by a SWARM user; an enrollment offers it to a project, and it is routable
+DATABASE_URL: every subcommand except add-checkout and remove-checkout calls the
+control plane's operator API, so this runs from the machine being onboarded. A
+worker is a local execution environment owned by a SWARM user; an enrollment
+offers it to a project, and it is routable
 only while active AND sharing consent is on.`;
 
 const SUBCOMMANDS = [
 	'register',
 	'register-and-enroll',
+	'add-checkout',
+	'remove-checkout',
 	'list',
 	'set-cli',
 	'set-scm-credential',
@@ -762,6 +808,15 @@ function invokingCheckout(): string {
 }
 
 /**
+ * A checkout path the operator typed, canonical. A relative one is read from where
+ * they are standing (`invokingCheckout`) rather than from npm's package-root cwd,
+ * so `--extra-checkout ../mobile` means the sibling of *their* checkout.
+ */
+function checkoutArgument(path: string): string {
+	return canonicalCheckoutPath(resolve(invokingCheckout(), path));
+}
+
+/**
  * Cache the freshly issued credential for a checkout,
  * and print the path — never the value (issue #788). Both registration paths call
  * this, so `swarm run:worker` finds a worker made either way.
@@ -777,23 +832,108 @@ function invokingCheckout(): string {
  * the reason registration reports failure — that would strand a registered worker
  * whose credential was never shown.
  */
-function cacheCredentialForCheckout(workerId: string, credential: string, repoRoot: string): void {
+function cacheCredentialForCheckout(
+	workerId: string,
+	credential: string,
+	repoRoot: string,
+	extraRepoRoots: readonly string[],
+): void {
 	try {
 		const cachePath = writeWorkerCredentialCache({
 			repoRoot,
 			workerId,
 			credential,
+			...(extraRepoRoots.length > 0 ? { extraRepoRoots: [...extraRepoRoots] } : {}),
 		});
+		const extras =
+			extraRepoRoots.length > 0 ? ` (with ${extraRepoRoots.join(', ')} as extra checkouts)` : '';
 		if (existsSync(repoRoot)) {
 			out.info(
-				`also cached for ${repoRoot} — start this worker there with: swarm run:worker (${cachePath})`,
+				`also cached for ${repoRoot}${extras} — start this worker there with: swarm run:worker (${cachePath})`,
 			);
 		} else {
-			out.info(`also cached for checkout ${repoRoot}: ${cachePath}`);
+			out.info(`also cached for checkout ${repoRoot}${extras}: ${cachePath}`);
 		}
 	} catch (err) {
 		out.warn(`could not cache the credential for ${repoRoot}: ${describeError(err)}`);
 	}
+}
+
+/**
+ * Validate checkouts a worker is to hold beside its primary one (issue #1059) and
+ * answer them canonical, in the order given — or `undefined`, with one actionable
+ * line printed, at the first that cannot be one. Shared by both registration paths
+ * and `add-checkout`, so a checkout is accepted on the same terms whichever way it
+ * arrives.
+ *
+ * Each must exist, differ from the primary checkout and from every checkout the
+ * worker already holds (`existing`) by realpath, and be a git checkout whose
+ * `origin` names a repository no other of those checkouts is — the same
+ * declarable-slug read the daemon identifies its checkouts with
+ * (`../../transport/worker-checkouts.ts`). That last check is the daemon's own
+ * startup refusal brought forward: a set it would refuse is better refused here,
+ * where the operator is, than in a supervised daemon's log at its next restart.
+ *
+ * The primary checkout's own repository is compared only when it can be read on
+ * this machine: `register-and-enroll --repo-root` may name a checkout elsewhere.
+ */
+async function validateExtraCheckouts(
+	primary: string,
+	paths: readonly string[],
+	existing: readonly string[] = [],
+): Promise<string[] | undefined> {
+	const primaryRoot = canonicalCheckoutPath(primary);
+	const held: { repoRoot: string; repository?: string }[] = [];
+	for (const repoRoot of [primaryRoot, ...existing]) {
+		held.push({ repoRoot, repository: await resolveDeclarableOriginRepoSlug(repoRoot) });
+	}
+	const accepted: string[] = [];
+	for (const path of paths) {
+		const checkout = checkoutArgument(path);
+		if (!existsSync(checkout)) {
+			out.error(`checkout ${checkout} does not exist — clone the repository there first`);
+			return undefined;
+		}
+		if (checkout === primaryRoot) {
+			out.error(
+				`${checkout} is this worker's primary checkout — an extra checkout must be another repository's checkout`,
+			);
+			return undefined;
+		}
+		if (held.some((entry) => entry.repoRoot === checkout)) {
+			out.error(`${checkout} is already one of this worker's checkouts`);
+			return undefined;
+		}
+		const repository = await resolveDeclarableOriginRepoSlug(checkout);
+		if (repository === undefined) {
+			out.error(
+				`${checkout} is not a git checkout with an identifiable 'origin' remote, so the worker could not tell which repository it is — add an origin there first`,
+			);
+			return undefined;
+		}
+		const clash = held.find(
+			(entry) => entry.repository && repoSlugsMatch(entry.repository, repository),
+		);
+		if (clash) {
+			out.error(
+				`${checkout} is another checkout of ${repository}, which this worker already holds at ${clash.repoRoot} — a worker holds one checkout per repository`,
+			);
+			return undefined;
+		}
+		held.push({ repoRoot: checkout, repository });
+		accepted.push(checkout);
+	}
+	return accepted;
+}
+
+/**
+ * The value `SWARM_WORKER_REPO_ROOT` takes for a worker holding these checkouts:
+ * the primary first, then each extra, `path.delimiter`-separated — the list the
+ * daemon reads (`resolveWorkerRepoRoots`, `../../lib/env.ts`) and the one
+ * `swarm run:worker` builds from the cache.
+ */
+function workerRepoRootValue(repoRoot: string, extraRepoRoots: readonly string[]): string {
+	return [repoRoot, ...extraRepoRoots].join(delimiter);
 }
 
 async function registerWorkerCommand(argv: string[]): Promise<number> {
@@ -802,6 +942,7 @@ async function registerWorkerCommand(argv: string[]): Promise<number> {
 		options: {
 			name: { type: 'string' },
 			cli: { type: 'string' },
+			'extra-checkout': { type: 'string', multiple: true },
 			help: { type: 'boolean', short: 'h' },
 		},
 		allowPositionals: true,
@@ -831,6 +972,11 @@ async function registerWorkerCommand(argv: string[]): Promise<number> {
 	const capabilities = parseClis(values.cli);
 	if (!capabilities) return 1;
 
+	// Before anything is registered, so a bad checkout never leaves a worker behind.
+	const repoRoot = invokingCheckout();
+	const extraRepoRoots = await validateExtraCheckouts(repoRoot, values['extra-checkout'] ?? []);
+	if (!extraRepoRoots) return 1;
+
 	const operator = requireOperator();
 	if (!operator) return 1;
 
@@ -842,7 +988,7 @@ async function registerWorkerCommand(argv: string[]): Promise<number> {
 	out.info(
 		`registered worker '${worker.displayName}' for '${identifier}' (id ${worker.id}, CLIs: ${worker.capabilities.join(', ')})`,
 	);
-	cacheCredentialForCheckout(worker.id, credential, invokingCheckout());
+	cacheCredentialForCheckout(worker.id, credential, repoRoot, extraRepoRoots);
 	// Registration issues the worker's *connection* credential and nothing else, so
 	// the machine still has no source-control identity and every dispatch to it
 	// fails until one is stored (issue #765). Name both write surfaces and no
@@ -2046,6 +2192,8 @@ interface RegisterAndEnrollPlan {
 	 * onboarded, not whichever machine last registered the project.
 	 */
 	readonly repoRoot: string;
+	/** `--extra-checkout`, validated and canonical — the worker's other checkouts (issue #1059). */
+	readonly extraRepoRoots: string[];
 }
 
 /**
@@ -2077,6 +2225,7 @@ async function planRegisterAndEnroll(
 			cli: { type: 'string' },
 			'control-plane-url': { type: 'string' },
 			'repo-root': { type: 'string' },
+			'extra-checkout': { type: 'string', multiple: true },
 			help: { type: 'boolean', short: 'h' },
 		},
 		allowPositionals: true,
@@ -2096,6 +2245,10 @@ async function planRegisterAndEnroll(
 
 	const capabilities = parseClis(cli);
 	if (!capabilities) return { ok: false, code: 1 };
+
+	const repoRoot = values['repo-root'] ?? invokingCheckout();
+	const extraRepoRoots = await validateExtraCheckouts(repoRoot, values['extra-checkout'] ?? []);
+	if (!extraRepoRoots) return { ok: false, code: 1 };
 
 	// Before `requireOperator`, which reads SWARM_CONTROL_PLANE_URL: on a machine
 	// being onboarded for its first worker nothing has ever written it, and the
@@ -2132,7 +2285,8 @@ async function planRegisterAndEnroll(
 			capabilities,
 			providerId,
 			operatorCredential,
-			repoRoot: values['repo-root'] ?? invokingCheckout(),
+			repoRoot,
+			extraRepoRoots,
 		},
 	};
 }
@@ -2217,6 +2371,7 @@ async function registerAndEnrollCommand(argv: string[]): Promise<number> {
 		providerId,
 		operatorCredential,
 		repoRoot,
+		extraRepoRoots,
 	} = planned.plan;
 
 	const { worker, credential } = await client.mutate(
@@ -2227,7 +2382,7 @@ async function registerAndEnrollCommand(argv: string[]): Promise<number> {
 	out.info(
 		`registered worker '${worker.displayName}' for '${identifier}' (id ${worker.id}, CLIs: ${worker.capabilities.join(', ')})`,
 	);
-	cacheCredentialForCheckout(worker.id, credential, repoRoot);
+	cacheCredentialForCheckout(worker.id, credential, repoRoot, extraRepoRoots);
 
 	// From here the worker row exists and its credential is a one-time value held
 	// only in memory, so a later failure must still hand it over — losing it means
@@ -2296,9 +2451,139 @@ async function registerAndEnrollCommand(argv: string[]): Promise<number> {
 		'start the worker on that machine — this command does not (its .env must already carry SWARM_CONTROL_PLANE_URL). Run:',
 	);
 	out.info(
-		`SWARM_WORKER_CREDENTIAL=${credential} SWARM_WORKER_REPO_ROOT=${repoRoot} npm run dev:worker`,
+		`SWARM_WORKER_CREDENTIAL=${credential} SWARM_WORKER_REPO_ROOT=${workerRepoRootValue(repoRoot, extraRepoRoots)} npm run dev:worker`,
 	);
 	return 0;
+}
+
+/**
+ * The worker cached for the checkout this command runs in — the worker's primary
+ * checkout — or `undefined` with the refusal printed (issue #1059). The same two
+ * answers `swarm run:worker` gives: no entry is a "register here" problem, an
+ * unreadable entry is a different one and names its file.
+ */
+function cachedWorkerHere(
+	command: string,
+): { repoRoot: string; workerId: string; extraRepoRoots: string[] } | undefined {
+	const repoRoot = canonicalCheckoutPath(invokingCheckout());
+	const cached = readWorkerCredentialCache(repoRoot);
+	if (cached === null) {
+		out.error(
+			`workers ${command}: no worker registered for this checkout (${repoRoot}) — run it in the worker's primary checkout, the one \`swarm run:worker\` starts it from`,
+		);
+		out.info(
+			'  or register a worker here: swarm workers register-and-enroll <owner-identifier> <project-id> --name <name> --cli <clis>',
+		);
+		return undefined;
+	}
+	if (cached === undefined) {
+		out.error(
+			`workers ${command}: this checkout's cached worker credential could not be read: ${workerCredentialCachePath(repoRoot)}`,
+		);
+		return undefined;
+	}
+	return { repoRoot, workerId: cached.workerId, extraRepoRoots: cached.extraRepoRoots ?? [] };
+}
+
+/** Write a worker's new set of extra checkouts and say what the daemon will now hold. */
+function saveExtraCheckouts(
+	command: string,
+	worker: { repoRoot: string; workerId: string },
+	extraRepoRoots: string[],
+): number {
+	try {
+		if (!updateWorkerCredentialCacheCheckouts(worker.repoRoot, extraRepoRoots)) {
+			out.error(`workers ${command}: this checkout's worker credential cache entry disappeared`);
+			return 1;
+		}
+	} catch (err) {
+		out.error(`workers ${command}: could not update the credential cache: ${describeError(err)}`);
+		return 1;
+	}
+	out.info(
+		`worker '${worker.workerId}' now holds: ${[worker.repoRoot, ...extraRepoRoots].join(', ')}`,
+	);
+	out.info(
+		'restart this worker to declare it: swarm run:worker (or swarm-worker-agent install) — it re-declares its repositories at its next handshake',
+	);
+	return 0;
+}
+
+/**
+ * `add-checkout <path>` — give the worker registered for this checkout another
+ * repository checkout on this machine (issue #1059), without re-registering it.
+ *
+ * Host-local by design: the checkout's path never leaves the machine, so this edits
+ * only the primary checkout's cache entry and needs neither a session nor the
+ * control plane. The daemon learns of it when it next starts.
+ */
+async function addCheckoutCommand(argv: string[]): Promise<number> {
+	const { values, positionals } = parseArgs({
+		args: argv,
+		options: { help: { type: 'boolean', short: 'h' } },
+		allowPositionals: true,
+	});
+	if (values.help) {
+		out.info(USAGE);
+		return 0;
+	}
+	const path = positionals[0];
+	if (!path) {
+		out.error('workers add-checkout: a <path> to the other checkout is required');
+		out.info(USAGE);
+		return 1;
+	}
+
+	const worker = cachedWorkerHere('add-checkout');
+	if (!worker) return 1;
+	const added = await validateExtraCheckouts(worker.repoRoot, [path], worker.extraRepoRoots);
+	if (!added) return 1;
+	return saveExtraCheckouts('add-checkout', worker, [...worker.extraRepoRoots, ...added]);
+}
+
+/**
+ * `remove-checkout <path>` — drop one of this worker's extra checkouts (issue
+ * #1059). The path need not exist any more: removing a checkout that was deleted
+ * from disk is exactly when this is wanted.
+ */
+async function removeCheckoutCommand(argv: string[]): Promise<number> {
+	const { values, positionals } = parseArgs({
+		args: argv,
+		options: { help: { type: 'boolean', short: 'h' } },
+		allowPositionals: true,
+	});
+	if (values.help) {
+		out.info(USAGE);
+		return 0;
+	}
+	const path = positionals[0];
+	if (!path) {
+		out.error('workers remove-checkout: a <path> to the checkout to drop is required');
+		out.info(USAGE);
+		return 1;
+	}
+
+	const worker = cachedWorkerHere('remove-checkout');
+	if (!worker) return 1;
+	const checkout = checkoutArgument(path);
+	if (checkout === worker.repoRoot) {
+		out.error(
+			`workers remove-checkout: ${checkout} is this worker's primary checkout and cannot be removed — \`swarm workers remove ${worker.workerId}\` deregisters the worker`,
+		);
+		return 1;
+	}
+	if (!worker.extraRepoRoots.includes(checkout)) {
+		const held = worker.extraRepoRoots.length > 0 ? worker.extraRepoRoots.join(', ') : 'none';
+		out.error(
+			`workers remove-checkout: ${checkout} is not one of this worker's extra checkouts (it has: ${held})`,
+		);
+		return 1;
+	}
+	return saveExtraCheckouts(
+		'remove-checkout',
+		worker,
+		worker.extraRepoRoots.filter((entry) => entry !== checkout),
+	);
 }
 
 async function updateEnrollmentCommand(argv: string[]): Promise<number> {
@@ -2435,6 +2720,10 @@ export async function run(argv: string[]): Promise<number> {
 				return await registerWorkerCommand(rest);
 			case 'register-and-enroll':
 				return await registerAndEnrollCommand(rest);
+			case 'add-checkout':
+				return await addCheckoutCommand(rest);
+			case 'remove-checkout':
+				return await removeCheckoutCommand(rest);
 			case 'list':
 				return await listWorkersCommand(rest);
 			case 'set-cli':

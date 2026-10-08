@@ -157,6 +157,22 @@ The global `swarm run:worker` form uses its current directory; `npm run swarm --
 run:worker` uses npm's caller directory (`INIT_CWD`), so both forms select the
 checkout you invoked them from.
 
+**One worker can serve several repositories on one machine** (issue #1059) — one
+checkout per repository, one daemon. Give it the extra checkouts at registration
+with `--extra-checkout <path>` (repeatable, on `workers register` and
+`register-and-enroll`), or later, from the worker's primary checkout, with:
+
+```bash
+swarm workers add-checkout ~/code/example-mobile     # host-local; no control-plane call
+swarm workers remove-checkout ~/code/example-mobile
+```
+
+then restart it. `swarm run:worker` appends every recorded extra checkout to
+`SWARM_WORKER_REPO_ROOT`, and the daemon declares their repositories at its next
+handshake. Re-registering instead would issue a new worker and lose its enrollments
+and operator credentials. See
+[`docs/onboarding-worker.md`](./onboarding-worker.md#serving-a-second-repository).
+
 The operator's own source-control credential is **not** among them: it is stored
 server-side per `(worker, SCM provider)` — `swarm workers set-scm-credential
 <worker-id> <github|bitbucket|gitlab>`, or from that worker's own page in the

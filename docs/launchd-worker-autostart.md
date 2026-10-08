@@ -32,6 +32,17 @@ from — not this repository, unless a worker happens to be enrolled on SWARM it
 A machine running workers for several repositories installs one agent per checkout;
 they are independent and carry no shared state.
 
+**A worker holding several checkouts still gets one agent** (issue #1059), installed
+in its **primary** checkout — the one it was registered in. The agent runs
+`swarm run:worker` there, which starts the daemon with every extra checkout the
+worker's cache entry records (`swarm workers register --extra-checkout` /
+`swarm workers add-checkout`), so that one agent serves all of them. **Never install
+an agent in an extra checkout**: it has no cache entry of its own, so the agent
+would fail with "no worker registered for this checkout" on every `KeepAlive`
+restart. After `add-checkout` or `remove-checkout`, restart the primary checkout's
+agent (`swarm-worker-agent install` again, or `update <checkout>`) so the daemon
+declares its new set of repositories.
+
 The command ships in this package's `bin`, so a machine that has SWARM installed
 (or `npm link`ed) already has it on `PATH` next to `swarm`.
 

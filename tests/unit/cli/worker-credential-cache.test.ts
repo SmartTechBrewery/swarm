@@ -15,6 +15,7 @@ import { dirname, join, resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
 	readWorkerCredentialCache,
+	updateWorkerCredentialCacheCheckouts,
 	workerCredentialCachePath,
 	writeWorkerCredentialCache,
 } from '@/cli/_shared/worker-credential-cache.js';
@@ -156,5 +157,79 @@ describe('worker credential cache (per checkout)', () => {
 		} finally {
 			lock.release();
 		}
+	});
+	// Issue #1059: a worker's other checkouts ride on its primary checkout's entry.
+	describe('extra checkouts', () => {
+		it('still reads an entry written before extra checkouts existed', () => {
+			const repoRoot = checkout('swarm');
+			const path = write(repoRoot);
+			writeFileSync(
+				path,
+				JSON.stringify({
+					workerId: WORKER_A,
+					credential: 'raw-credential-token',
+					repoRoot,
+					registeredAt: new Date().toISOString(),
+				}),
+				'utf8',
+			);
+
+			const cached = readWorkerCredentialCache(repoRoot, home);
+			expect(cached).toMatchObject({ workerId: WORKER_A, repoRoot });
+			expect(cached?.extraRepoRoots).toBeUndefined();
+		});
+
+		it('round-trips the extra checkouts a registration names, canonical', () => {
+			const repoRoot = checkout('platform');
+			const mobile = checkout('mobile');
+			const link = resolve(home, 'link-to-mobile');
+			symlinkSync(mobile, link);
+
+			writeWorkerCredentialCache({
+				repoRoot,
+				workerId: WORKER_A,
+				credential: 'raw-credential-token',
+				extraRepoRoots: [link],
+				homeDir: home,
+			});
+
+			expect(readWorkerCredentialCache(repoRoot, home)?.extraRepoRoots).toEqual([mobile]);
+		});
+
+		it('replaces only the extra checkouts on an update, keeping the file owner-only', () => {
+			const repoRoot = checkout('platform');
+			const mobile = checkout('mobile');
+			const web = checkout('web');
+			const path = write(repoRoot);
+			const before = readWorkerCredentialCache(repoRoot, home);
+
+			expect(updateWorkerCredentialCacheCheckouts(repoRoot, [mobile, web], home)).toEqual({
+				...before,
+				extraRepoRoots: [mobile, web],
+			});
+			expect(readWorkerCredentialCache(repoRoot, home)).toEqual({
+				...before,
+				extraRepoRoots: [mobile, web],
+			});
+			expect(mode(path)).toBe(0o600);
+			expect(readdirSync(dirname(path))).toEqual(['credential.json']);
+
+			// Down to none, the field goes away rather than lingering as an empty list.
+			updateWorkerCredentialCacheCheckouts(repoRoot, [], home);
+			expect(readWorkerCredentialCache(repoRoot, home)).toEqual(before);
+		});
+
+		it('writes nothing when there is no entry, or an unreadable one, to update', () => {
+			const repoRoot = checkout('platform');
+			expect(updateWorkerCredentialCacheCheckouts(repoRoot, [checkout('mobile')], home)).toBeNull();
+			expect(existsSync(workerCredentialCachePath(repoRoot, home))).toBe(false);
+
+			const path = write(repoRoot);
+			writeFileSync(path, '{ not json', 'utf8');
+			expect(
+				updateWorkerCredentialCacheCheckouts(repoRoot, [checkout('mobile')], home),
+			).toBeUndefined();
+			expect(readWorkerCredentialCache(repoRoot, home)).toBeUndefined();
+		});
 	});
 });
