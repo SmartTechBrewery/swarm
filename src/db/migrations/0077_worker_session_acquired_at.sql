@@ -1,0 +1,14 @@
+-- When the worker's *current* lease was taken (issue #1071). The fleet rollout's
+-- come-back verdict has to tell a lease taken after a machine reported `applied`
+-- from one taken before it: the daemon that reported is still holding its own
+-- session at that instant, and a machine whose router connection dropped
+-- reconnects on its old build before it has even received the request. Neither
+-- `created_at` (the first-ever insert) nor `last_heartbeat_at` (moved by every
+-- heartbeat) answers that, because a re-acquire replaces the row in place.
+--
+-- Stamped on every acquire and never by a heartbeat. Nullable with no backfill:
+-- NULL means the row was last acquired before this column existed, which the
+-- verdict reads as "unknown" and never as proof, and the next acquire sets it.
+-- Every daemon re-acquires when the deploy restarts the router, so such rows are
+-- short-lived.
+ALTER TABLE "worker_sessions" ADD COLUMN "acquired_at" timestamp;

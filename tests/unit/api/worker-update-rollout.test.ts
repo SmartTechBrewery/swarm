@@ -191,6 +191,21 @@ function makeMember(
 	};
 }
 
+/**
+ * A live session as `getLiveSessionForWorker` answers it — only the three fields the
+ * rollout reads. `acquiredAt` is what decides a come-back (issue #1071): only a lease
+ * taken after the machine reported counts.
+ */
+function lease(fencingToken: number, acquiredAt: Date | null) {
+	return { fencingToken, acquiredAt, lastHeartbeatAt: NOW };
+}
+
+/** The lease a connected machine holds by default: taken long before any fixture's report. */
+const OLD_LEASE = lease(1, new Date('2026-09-13T10:00:00Z'));
+
+/** A lease taken after {@link reported}'s `reportedAt` (11:59:30) — a daemon that came back. */
+const AFTER_REPORT = new Date('2026-09-13T11:59:45Z');
+
 /** The member patches one advance wrote, keyed by worker — what the next one would read. */
 const memberWrites = new Map<string, Partial<WorkerUpdateRolloutMember>>();
 /** The rollout status writes one advance made, in order. */
@@ -275,7 +290,11 @@ beforeEach(() => {
 	// No other rollout holds any of these machines unless a test says one does.
 	findRolloutHoldElsewhere.mockResolvedValue(undefined);
 	getWorkers.mockResolvedValue([]);
-	getLiveSessionForWorker.mockResolvedValue(undefined);
+	// Connected unless a test says otherwise — a rollout passes over an offline machine
+	// (issue #1071), so connectivity is the precondition every wave case stands on. The
+	// lease predates every fixture's report, so a `verifying` member has not come back
+	// yet by default, and a case about coming back states the newer lease itself.
+	getLiveSessionForWorker.mockResolvedValue(OLD_LEASE);
 	// Heard from just now unless a test says otherwise, so the silence window never fires
 	// by accident in a case that is about something else.
 	getRetainedSessionForWorker.mockResolvedValue({ fencingToken: 1, lastHeartbeatAt: NOW });
@@ -547,6 +566,95 @@ describe('advanceRollout — taking a wave', () => {
  * `drainedByRollout`, which can only be decided *before* the rollout drains the
  * machine and can never be re-derived afterwards.
  */
+describe('advanceRollout — a machine offline when its turn comes', () => {
+	/** Connected machines answer with the default lease; the ones named here have none. */
+	function offline(...ids: string[]): void {
+		getLiveSessionForWorker.mockImplementation(async (id: string) =>
+			ids.includes(id) ? undefined : OLD_LEASE,
+		);
+	}
+
+	// Issue #1071: signalling an offline machine is what left a member with no token to
+	// compare against, and an offline machine is drained for nothing.
+	it('passes over a queued machine that is offline when its turn comes, without draining or asking it', async () => {
+		givenRollout(makeRollout({ waveSize: 1 }), [makeMember(WORKER_A, 0), makeMember(WORKER_B, 1)]);
+		givenWorkers(makeWorker(WORKER_A), makeWorker(WORKER_B));
+		offline(WORKER_A);
+		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry(WORKER_B, 'requested')]);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(memberWrites.get(WORKER_A)).toMatchObject({
+			state: 'skipped',
+			message: expect.stringContaining('offline when its turn came'),
+			settledAt: NOW,
+		});
+		expect(view?.members[0]).toMatchObject({ state: 'skipped', abandoned: false });
+		expect(setWorkerDraining).not.toHaveBeenCalledWith(WORKER_A, true);
+		// The passed-over machine did not use up the wave: B is taken in its place.
+		expect(fanOutWorkerUpdate).toHaveBeenCalledExactlyOnceWith(
+			[expect.objectContaining({ id: WORKER_B })],
+			'main',
+			OWNER_ID,
+		);
+		expect(view?.members[1].state).toBe('signalled');
+		expect(view?.rollout.status).toBe('in_progress');
+	});
+
+	// Drained while connected, then dropped while its wave waited for it to go idle.
+	it('passes over a drained member that has gone offline by the time it is idle, and returns it to the pool', async () => {
+		givenRollout(makeRollout(), [
+			makeMember(WORKER_A, 0, { state: 'draining', drainedByRollout: true }),
+		]);
+		givenWorkers(makeWorker(WORKER_A, { drainingSince: NOW }));
+		offline(WORKER_A);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0]).toMatchObject({
+			state: 'skipped',
+			message: expect.stringContaining('offline when its turn came'),
+		});
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_A, false);
+		expect(fanOutWorkerUpdate).not.toHaveBeenCalled();
+		expect(view?.rollout.status).toBe('completed');
+	});
+
+	// The incident's starting point: the control plane had just restarted its router,
+	// so every session had dropped when the operator started the fleet update.
+	it('completes a rollout started while every machine is offline, draining and asking none of them', async () => {
+		givenRollout(makeRollout(), [
+			makeMember(WORKER_A, 0),
+			makeMember(WORKER_B, 1),
+			makeMember(WORKER_C, 2),
+		]);
+		givenWorkers(makeWorker(WORKER_A), makeWorker(WORKER_B), makeWorker(WORKER_C));
+		offline(WORKER_A, WORKER_B, WORKER_C);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members.map((member) => member.state)).toEqual(['skipped', 'skipped', 'skipped']);
+		expect(setWorkerDraining).not.toHaveBeenCalled();
+		expect(fanOutWorkerUpdate).not.toHaveBeenCalled();
+		expect(statusWrites).toEqual([{ status: 'completed', haltReason: undefined }]);
+	});
+
+	it('records the live session’s token for a machine it signals', async () => {
+		givenRollout(makeRollout(), [makeMember(WORKER_A, 0)]);
+		givenWorkers(makeWorker(WORKER_A));
+		getLiveSessionForWorker.mockResolvedValue(lease(5, new Date('2026-09-13T10:00:00Z')));
+		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry(WORKER_A, 'requested')]);
+
+		await advanceRollout(ROLLOUT_ID);
+
+		expect(memberWrites.get(WORKER_A)).toMatchObject({
+			state: 'signalled',
+			fencingTokenAtSignal: 5,
+			buildCommitAtSignal: 'aaaaaaa',
+		});
+	});
+});
+
 describe('advanceRollout — what one advance leaves for the next', () => {
 	it('undrains a machine it took from the pool, settled by a later advance', async () => {
 		const queued = [makeMember(WORKER_A, 0)];
@@ -574,7 +682,7 @@ describe('advanceRollout — what one advance leaves for the next', () => {
 		const verifying = reloaded(signalled);
 		givenRollout(makeRollout(), verifying);
 		givenWorkers(reported(WORKER_A, 'applied', { build: { commit: 'bbbbbbb', dirty: false } }));
-		getLiveSessionForWorker.mockResolvedValue({ fencingToken: 8 });
+		getLiveSessionForWorker.mockResolvedValue(lease(8, AFTER_REPORT));
 		expect(verifying[0]).toMatchObject({ state: 'verifying', drainedByRollout: true });
 
 		const view = await advanceRollout(ROLLOUT_ID);
@@ -847,6 +955,10 @@ describe('advanceRollout — a signalled machine that stops answering', () => {
 		givenRollout(makeRollout(), [signalled(), makeMember(WORKER_B, 1)]);
 		givenWorkers(waiting(), makeWorker(WORKER_B));
 		silentFor(3);
+		// Only A has gone quiet; B is connected, so it is the one the next wave takes.
+		getLiveSessionForWorker.mockImplementation(async (id: string) =>
+			id === WORKER_B ? OLD_LEASE : undefined,
+		);
 		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry(WORKER_B, 'requested')]);
 
 		const view = await advanceRollout(ROLLOUT_ID);
@@ -933,7 +1045,7 @@ describe('advanceRollout — verifying that a machine came back on the new build
 	it('settles a machine whose daemon took a fresh lease on a new commit, and undrains it', async () => {
 		givenRollout(makeRollout(), [verifying()]);
 		givenWorkers(reported(WORKER_A, 'applied', { build: { commit: 'bbbbbbb', dirty: false } }));
-		getLiveSessionForWorker.mockResolvedValue({ fencingToken: 8 });
+		getLiveSessionForWorker.mockResolvedValue(lease(8, AFTER_REPORT));
 
 		const view = await advanceRollout(ROLLOUT_ID);
 
@@ -947,7 +1059,7 @@ describe('advanceRollout — verifying that a machine came back on the new build
 	it('settles a machine that adopted a peer build once it comes back on it', async () => {
 		givenRollout(makeRollout(), [verifying({ outcome: 'adopted' })]);
 		givenWorkers(reported(WORKER_A, 'adopted', { build: { commit: 'bbbbbbb', dirty: false } }));
-		getLiveSessionForWorker.mockResolvedValue({ fencingToken: 8 });
+		getLiveSessionForWorker.mockResolvedValue(lease(8, AFTER_REPORT));
 
 		const view = await advanceRollout(ROLLOUT_ID);
 
@@ -961,7 +1073,7 @@ describe('advanceRollout — verifying that a machine came back on the new build
 	it('halts when the machine comes back on the very build it was asked to leave', async () => {
 		givenRollout(makeRollout(), [verifying()]);
 		givenWorkers(reported(WORKER_A, 'applied', { build: { commit: 'aaaaaaa', dirty: false } }));
-		getLiveSessionForWorker.mockResolvedValue({ fencingToken: 8 });
+		getLiveSessionForWorker.mockResolvedValue(lease(8, AFTER_REPORT));
 
 		const view = await advanceRollout(ROLLOUT_ID);
 
@@ -1055,18 +1167,71 @@ describe('advanceRollout — verifying that a machine came back on the new build
 		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_A, false);
 	});
 
-	// No live session at signal time means there was no token to beat, so any live
-	// session afterwards is the daemon that came back.
-	it('accepts any live session when there was no fencing token at signal time', async () => {
-		givenRollout(makeRollout(), [
-			verifying({ fencingTokenAtSignal: null, buildCommitAtSignal: null }),
-		]);
-		givenWorkers(reported(WORKER_A, 'applied', { build: null }));
-		getLiveSessionForWorker.mockResolvedValue({ fencingToken: 1 });
+	// Issue #1071: the daemon that reported is still holding its own session when the
+	// report lands — it reports, then releases, then exits — so a lease from before the
+	// report is that daemon, not the one that came back. A bumped token alone (a
+	// reconnect between signal and report) proves nothing either.
+	it('keeps waiting while the only live session predates the applied report', async () => {
+		givenRollout(makeRollout(), [verifying()]);
+		givenWorkers(reported(WORKER_A, 'applied', { build: { commit: 'aaaaaaa', dirty: false } }));
+		getLiveSessionForWorker.mockResolvedValue(lease(8, new Date('2026-09-13T11:59:00Z')));
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0].state).toBe('verifying');
+		expect(statusWrites).toEqual([]);
+		expect(setWorkerDraining).not.toHaveBeenCalledWith(WORKER_A, false);
+	});
+
+	// The bug this replaces: with no token recorded at signal, any live session used to
+	// count as the new daemon — including the machine's old-build reconnect, which read
+	// as "came back on the build it started from" and halted a fleet (2026-10-08).
+	it('keeps waiting on an old-build session taken before the report even when no token was recorded at signal', async () => {
+		givenRollout(makeRollout(), [verifying({ fencingTokenAtSignal: null })]);
+		givenWorkers(reported(WORKER_A, 'applied', { build: { commit: 'aaaaaaa', dirty: false } }));
+		getLiveSessionForWorker.mockResolvedValue(lease(8, new Date('2026-09-13T11:59:00Z')));
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0].state).toBe('verifying');
+		expect(view?.rollout.status).toBe('in_progress');
+		expect(statusWrites).toEqual([]);
+	});
+
+	it('settles a machine with no recorded token once a lease taken after the report shows the new build', async () => {
+		givenRollout(makeRollout(), [verifying({ fencingTokenAtSignal: null })]);
+		givenWorkers(reported(WORKER_A, 'applied', { build: { commit: 'bbbbbbb', dirty: false } }));
+		getLiveSessionForWorker.mockResolvedValue(lease(8, AFTER_REPORT));
 
 		const view = await advanceRollout(ROLLOUT_ID);
 
 		expect(view?.members[0].state).toBe('done');
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_A, false);
+	});
+
+	it('still halts on a lease taken after the report on the build it was asked to leave', async () => {
+		givenRollout(makeRollout(), [verifying({ fencingTokenAtSignal: null })]);
+		givenWorkers(reported(WORKER_A, 'applied', { build: { commit: 'aaaaaaa', dirty: false } }));
+		getLiveSessionForWorker.mockResolvedValue(lease(8, AFTER_REPORT));
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0].state).toBe('failed');
+		expect(view?.rollout.status).toBe('halted');
+		expect(view?.rollout.haltReason).toContain('aaaaaaa');
+	});
+
+	// A row last acquired before `acquired_at` existed cannot say when its lease was
+	// taken, so it is never proof — the verdict waits for an acquire that stamps one.
+	it('never treats a session with no acquisition time as a come-back', async () => {
+		givenRollout(makeRollout(), [verifying()]);
+		givenWorkers(reported(WORKER_A, 'applied', { build: { commit: 'bbbbbbb', dirty: false } }));
+		getLiveSessionForWorker.mockResolvedValue(lease(8, null));
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0].state).toBe('verifying');
+		expect(statusWrites).toEqual([]);
 	});
 });
 
@@ -1121,7 +1286,7 @@ describe('advanceRollout — after a halt', () => {
 			}),
 		]);
 		givenWorkers(reported(WORKER_A, 'applied', { build: { commit: 'bbbbbbb', dirty: false } }));
-		getLiveSessionForWorker.mockResolvedValue({ fencingToken: 8 });
+		getLiveSessionForWorker.mockResolvedValue(lease(8, AFTER_REPORT));
 
 		const view = await advanceRollout(ROLLOUT_ID);
 
@@ -1183,7 +1348,7 @@ describe('advanceRollout — after a halt', () => {
 			}),
 		]);
 		givenWorkers(reported(WORKER_A, 'applied', { build: { commit: 'bbbbbbb', dirty: false } }));
-		getLiveSessionForWorker.mockResolvedValue({ fencingToken: 8 });
+		getLiveSessionForWorker.mockResolvedValue(lease(8, AFTER_REPORT));
 		findRolloutHoldElsewhere.mockResolvedValue({ drainedByRollout: false });
 
 		const view = await advanceRollout(ROLLOUT_ID);
@@ -1316,6 +1481,54 @@ describe('advanceRollout — a run of machines it gave up on', () => {
 		expect(view?.rollout.haltReason).toContain('3 machines in a row');
 	});
 
+	// Issue #1071: a machine that was offline when its turn came was never asked, so it
+	// says nothing about the build — several daemons on one closed laptop must not halt a
+	// rollout before a healthy machine is reached.
+	it('does not count machines passed over as offline toward the three-in-a-row halt', async () => {
+		givenRollout(makeRollout(), [
+			abandoned(WORKER_A, 0),
+			abandoned(WORKER_B, 1),
+			makeMember(WORKER_C, 2),
+			makeMember(WORKER_D, 3),
+		]);
+		givenWorkers(
+			makeWorker(WORKER_A),
+			makeWorker(WORKER_B),
+			makeWorker(WORKER_C),
+			makeWorker(WORKER_D),
+		);
+		getLiveSessionForWorker.mockImplementation(async (id: string) =>
+			id === WORKER_C ? undefined : OLD_LEASE,
+		);
+		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry(WORKER_D, 'requested')]);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members.map((member) => member.state)).toEqual([
+			'failed',
+			'failed',
+			'skipped',
+			'signalled',
+		]);
+		expect(view?.rollout.status).toBe('in_progress');
+		expect(view?.rollout.haltReason).toBeNull();
+	});
+
+	it('completes rather than halts when the machine after two give-ups is passed over as offline', async () => {
+		givenRollout(makeRollout(), [
+			abandoned(WORKER_A, 0),
+			abandoned(WORKER_B, 1),
+			makeMember(WORKER_C, 2),
+		]);
+		givenWorkers(makeWorker(WORKER_A), makeWorker(WORKER_B), makeWorker(WORKER_C));
+		getLiveSessionForWorker.mockResolvedValue(undefined);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[2].state).toBe('skipped');
+		expect(statusWrites).toEqual([{ status: 'completed', haltReason: undefined }]);
+	});
+
 	// The run is read in the order the rollout reaches machines, not the order the rows
 	// happen to be loaded in.
 	it('counts the run in position order', async () => {
@@ -1404,7 +1617,7 @@ describe('advanceRollout — a run of machines it gave up on', () => {
 	it('halts on the first machine that comes back on the build it was asked to leave', async () => {
 		givenRollout(makeRollout(), [goingQuiet(WORKER_A, 0), makeMember(WORKER_B, 1)]);
 		givenWorkers(reported(WORKER_A, 'applied'), makeWorker(WORKER_B));
-		getLiveSessionForWorker.mockResolvedValue({ fencingToken: 8 });
+		getLiveSessionForWorker.mockResolvedValue(lease(8, AFTER_REPORT));
 
 		const view = await advanceRollout(ROLLOUT_ID);
 
@@ -1845,7 +2058,7 @@ describe('advanceRollout — a failed member of an installation rollout', () => 
 			}),
 		]);
 		givenWorkers(reported(WORKER_A, 'applied', { build: { commit: 'aaaaaaa', dirty: false } }));
-		getLiveSessionForWorker.mockResolvedValue({ fencingToken: 8 });
+		getLiveSessionForWorker.mockResolvedValue(lease(8, AFTER_REPORT));
 
 		const view = await advanceRollout(ROLLOUT_ID);
 
@@ -1893,5 +2106,143 @@ describe('getInstallationRollout', () => {
 
 	it('answers null when no installation-wide rollout has ever run', async () => {
 		expect(await getInstallationRollout()).toBeNull();
+	});
+});
+
+/**
+ * Issue #1071 — the 2026-10-08 incident, replayed pass by pass: `karolina_rover` was
+ * signalled, reconnected on its **old** build before the request reached it, reported
+ * `applied` while that old daemon was still live, and came back on the new build a few
+ * seconds later. The old-build session was read as "came back on the build it started
+ * from" and the whole rollout halted. Each pass reads only what the previous one wrote.
+ */
+describe('advanceRollout — replaying the 2026-10-08 false halt', () => {
+	const OLD_BUILD = 'a9b0a09';
+	const NEW_BUILD = '7f7a1bb';
+	const at = (time: string) => new Date(`2026-10-08T${time}Z`);
+
+	function rover(overrides: Partial<Worker> = {}): Worker {
+		return makeWorker(WORKER_A, {
+			displayName: 'karolina_rover',
+			drainingSince: at('15:25:30'),
+			build: { commit: OLD_BUILD, dirty: false },
+			...overrides,
+		});
+	}
+
+	/** Its row while the rollout's request is still outstanding. */
+	function waitingOnRequest(): Worker {
+		return rover({
+			update: {
+				requestId: REQUEST_A,
+				target: 'main',
+				requestedAt: at('15:25:30'),
+				requestedByUserId: REQUESTER_ID,
+				status: null,
+				message: null,
+				reportedAt: null,
+			},
+		});
+	}
+
+	/** Its row once it reported `applied`, declaring `commit` from its current daemon. */
+	function appliedOn(commit: string): Worker {
+		return rover({
+			build: { commit, dirty: false },
+			update: {
+				requestId: null,
+				target: 'main',
+				requestedAt: at('15:25:30'),
+				requestedByUserId: REQUESTER_ID,
+				status: 'applied',
+				message: 'restarting',
+				reportedAt: at('15:26:57'),
+			},
+		});
+	}
+
+	/** The rover's live session for this pass; B stays connected throughout. */
+	function roverSession(session: ReturnType<typeof lease>): void {
+		getLiveSessionForWorker.mockImplementation(async (id: string) =>
+			id === WORKER_A ? session : lease(3, at('15:24:40')),
+		);
+	}
+
+	/** Passes 2–4, from a rover already signalled — the part the false halt lived in. */
+	async function replayFromSignal(members: WorkerUpdateRolloutMember[]): Promise<void> {
+		// Pass 2 — 15:26:42: the old daemon reconnects, and the request is delivered.
+		vi.setSystemTime(at('15:26:42'));
+		givenRollout(makeRollout(), members);
+		givenWorkers(waitingOnRequest(), makeWorker(WORKER_B));
+		roverSession(lease(8, at('15:26:42')));
+		let view = await advanceRollout(ROLLOUT_ID);
+		expect(view?.members[0].state).toBe('signalled');
+
+		// Pass 3 — 15:26:57: it reports `applied` while the old daemon is still live.
+		vi.setSystemTime(at('15:26:57'));
+		const afterReconnect = reloaded(members);
+		givenRollout(makeRollout(), afterReconnect);
+		givenWorkers(appliedOn(OLD_BUILD), makeWorker(WORKER_B));
+		view = await advanceRollout(ROLLOUT_ID);
+		expect(view?.members[0].state).toBe('verifying');
+		expect(view?.rollout.status).toBe('in_progress');
+		expect(statusWrites).toEqual([]);
+		expect(setWorkerDraining).not.toHaveBeenCalledWith(WORKER_B, true);
+
+		// Pass 4 — 15:27:05: the new daemon takes a lease on the new build.
+		vi.setSystemTime(at('15:27:05'));
+		const afterReport = reloaded(afterReconnect);
+		givenRollout(makeRollout(), afterReport);
+		givenWorkers(appliedOn(NEW_BUILD), makeWorker(WORKER_B));
+		roverSession(lease(9, at('15:27:05')));
+		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry(WORKER_B, 'requested')]);
+		view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0].state).toBe('done');
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_A, false);
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_B, true);
+		expect(view?.members[1].state).toBe('signalled');
+		expect(view?.rollout).toMatchObject({ status: 'in_progress', haltReason: null });
+		expect(statusWrites).toEqual([]);
+	}
+
+	it('settles the rover done and does not halt', async () => {
+		// Pass 1 — 15:25:30: the rover is connected on its old build, so it is signalled.
+		vi.setSystemTime(at('15:25:30'));
+		const queued = [makeMember(WORKER_A, 0), makeMember(WORKER_B, 1)];
+		givenRollout(makeRollout(), queued);
+		givenWorkers(rover({ drainingSince: null }), makeWorker(WORKER_B));
+		roverSession(lease(7, at('15:20:00')));
+		// The drain write answers with the row as it now stands — still on the old build.
+		setWorkerDraining.mockImplementation(async (id: string, draining: boolean) =>
+			id === WORKER_A
+				? rover({ drainingSince: draining ? at('15:25:30') : null })
+				: makeWorker(id, { drainingSince: draining ? NOW : null }),
+		);
+		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry(WORKER_A, 'requested')]);
+		await advanceRollout(ROLLOUT_ID);
+		expect(memberWrites.get(WORKER_A)).toMatchObject({
+			state: 'signalled',
+			fencingTokenAtSignal: 7,
+			buildCommitAtSignal: OLD_BUILD,
+		});
+
+		await replayFromSignal(reloaded(queued));
+	});
+
+	// A member signalled by a build predating issue #1071, while its machine was offline,
+	// carries no token — the exact state that halted the fleet on 2026-10-08.
+	it('reaches the same verdicts for a member signalled with no token recorded', async () => {
+		await replayFromSignal([
+			makeMember(WORKER_A, 0, {
+				state: 'signalled',
+				requestId: REQUEST_A,
+				drainedByRollout: true,
+				fencingTokenAtSignal: null,
+				buildCommitAtSignal: OLD_BUILD,
+				signalledAt: at('15:25:30'),
+			}),
+			makeMember(WORKER_B, 1),
+		]);
 	});
 });

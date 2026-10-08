@@ -41,8 +41,10 @@ export const INITIAL_FENCING_TOKEN = 1;
  * A worker session lease. `workerId` is a `workers.id` (`uuid`); `id` is the
  * session row's own generated `uuid`. `fencingToken` is a per-worker monotonic
  * counter (starts at {@link INITIAL_FENCING_TOKEN}, bumped on each re-acquire);
- * `lastHeartbeatAt` is the instant expiry is measured from; `currentRunId` is a
- * nullable compatibility pointer into `runs`.
+ * `lastHeartbeatAt` is the instant expiry is measured from; `acquiredAt` is when
+ * the current lease was taken — stamped on every acquire, never moved by a heartbeat,
+ * and `null` only for a row last acquired before issue #1071 recorded it;
+ * `currentRunId` is a nullable compatibility pointer into `runs`.
  */
 export const WorkerSessionSchema = z.object({
 	id: z.string().uuid(),
@@ -50,6 +52,7 @@ export const WorkerSessionSchema = z.object({
 	instanceId: z.string().uuid().nullable(),
 	fencingToken: z.number().int().positive(),
 	lastHeartbeatAt: z.date(),
+	acquiredAt: z.date().nullable(),
 	currentRunId: z.string().uuid().nullable(),
 	createdAt: z.date(),
 });

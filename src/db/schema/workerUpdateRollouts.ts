@@ -158,10 +158,11 @@ export const workerUpdateRolloutMembers = pgTable(
 		drainedByRollout: boolean('drained_by_rollout').notNull().default(false),
 		/**
 		 * `worker_sessions.fencing_token` as it stood at signal time — per-worker
-		 * monotonic and bumped on every re-acquire, so a larger one afterwards is the
-		 * exact "a new daemon process took the lease" signal. `bigint` in mode `number`,
-		 * matching the column it is copied from. Null when the machine had no live
-		 * session to read one from.
+		 * monotonic and bumped on every re-acquire, so a larger one afterwards is a
+		 * cross-check that a new daemon took the lease; the come-back itself is decided
+		 * by a lease acquired after the machine reported (`worker_sessions.acquired_at`,
+		 * issue #1071). `bigint` in mode `number`, matching the column it is copied from.
+		 * Null when the machine had no live session to read one from.
 		 */
 		fencingTokenAtSignal: bigint('fencing_token_at_signal', { mode: 'number' }),
 		/**

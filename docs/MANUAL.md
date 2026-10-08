@@ -445,7 +445,14 @@ is one operator action, not one to re-run until the fleet has moved. Re-running 
 still legal and is a nudge as well as a read; either form prints where each machine
 stands: `queued`, `draining`, `signalled`, `verifying`, `done`, `skipped` or `failed`.
 A machine enrolled in no project settles `skipped` — advancing the rollout would never
-change that answer, so it is never waited on.
+change that answer, so it is never waited on. A machine that is **offline when its turn
+comes** is passed over the same way (issue #1071): it settles `skipped` with "offline
+when its turn came" on its own line, is never drained or asked, and the wave is filled
+from the next connected machine instead. Passed-over machines do not count toward the
+three-in-a-row halt. To pick them up, start the fleet update again once they are back —
+machines already on the target settle at once. A machine counts as **back on the new
+build** only through a daemon that took its lease *after* the machine reported
+`applied`; a reconnect of the old daemon before that report proves nothing either way.
 
 **A bad build stops it.** A machine that reports `failed`, `refused` or `declined`, or
 one that comes back still on the build it was asked to leave (what a machine returning

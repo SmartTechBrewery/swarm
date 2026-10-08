@@ -104,15 +104,16 @@ export function rolloutReleasesFailedMembers(scope: WorkerUpdateRolloutScope): b
  * - `signalled` — idle, and asked to move through the same per-machine request
  *   phase 1 sends (`fanOutWorkerUpdate`). Waiting for the machine's own report.
  * - `verifying` — the machine reported `applied` or `adopted`; waiting for a daemon
- *   on the new build to take a fresh lease. This is the state the come-back window
- *   bounds.
+ *   on the new build to take a lease *after its report* (issue #1071). This is the
+ *   state the come-back window bounds.
  * - `done` — settled good: it came back on the new build, or reported
  *   `already-current` — the install root was on the target and the daemon was already
  *   running it — and so needed no restart at all.
  * - `skipped` — settled without being moved, and **not** a failure: another session
  *   re-targeted the machine so there is nothing left for this rollout to verify, the
- *   rollout halted before this machine's wave came up, or the machine was enrolled in
- *   no project or under no process supervisor.
+ *   rollout halted before this machine's wave came up, the machine was enrolled in
+ *   no project or under no process supervisor, or the machine was offline when its
+ *   turn came (issue #1071).
  * - `failed` — settled bad, for one of two different reasons. The machine *answered*
  *   badly — reported `failed`/`refused`/`declined`, or came back on the build it was
  *   asked to leave — which is what halts the rollout; or it stopped answering and the
@@ -255,9 +256,11 @@ export const RolloutWaveSizeSchema = z.number().int().positive();
  *   when the rollout is done with it; only one it drained itself is returned.
  * - `fencingTokenAtSignal` — `worker_sessions.fencing_token` as it stood when the
  *   machine was signalled. It is per-worker monotonic and bumped on every
- *   re-acquire, so a larger one is the exact "a new daemon process took the lease"
- *   signal. `null` when the machine had no live session to read one from, in which
- *   case any live session afterwards is that signal.
+ *   re-acquire, so a larger one afterwards is a cross-check that a new daemon took the
+ *   lease. The come-back itself is decided by a lease acquired *after the machine
+ *   reported* (`worker_sessions.acquired_at`, issue #1071). `null` when the machine had
+ *   no live session to read one from — since that issue only on a member signalled
+ *   before it.
  * - `buildCommitAtSignal` — the commit the machine's install root declared then. A
  *   machine that returned *itself* to its last known good build (issue #934) also
  *   comes back with a bumped token, so the token alone answers "came back" and not
