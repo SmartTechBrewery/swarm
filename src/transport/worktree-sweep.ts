@@ -75,12 +75,18 @@ export interface SweepLogger {
 
 export interface WorktreeSweepHandlerOptions {
 	/**
-	 * This machine's own checkout root (`SWARM_WORKER_REPO_ROOT`). Host-local and
-	 * never on the wire: the frame names a project's *relative* `worktreeRoot`, and
-	 * this is what it is resolved against — so nothing the control plane sends can
-	 * point a sweep at a directory this daemon does not already own.
+	 * This machine's own checkout roots (`SWARM_WORKER_REPO_ROOT`), primary first.
+	 * Host-local and never on the wire: the frame names a project's *relative*
+	 * `worktreeRoot`, and these are what it is resolved against — so nothing the
+	 * control plane sends can point a sweep at a directory this daemon does not
+	 * already own.
+	 *
+	 * Every root is swept (issue #1058), because a `task-<id>` checkout is created
+	 * under whichever root ran the assignment and the frame names no repository to
+	 * narrow that down. A daemon holding one checkout sweeps exactly what it did
+	 * before.
 	 */
-	repoRoot: string;
+	repoRoots: readonly string[];
 	/** Base URL of the control-plane delivery API — where the report goes. */
 	controlPlaneUrl: string;
 	/** Raw registered-worker credential: the only thing that names the reporting worker. */
@@ -103,8 +109,13 @@ export interface WorktreeSweepHandlerOptions {
 	onInFlightChange?: () => void;
 	/** The daemon's graceful-shutdown signal — abandons the sweep rather than racing it. */
 	shutdownSignal: AbortSignal;
-	/** Sweep one project; defaults to phase 1's {@link sweepAbandonedWorktrees}. Injected in tests. */
-	sweep?: (entry: WorktreeSweepProject) => Promise<SweepAbandonedWorktreesResult>;
+	/**
+	 * Sweep one project under one checkout root; defaults to phase 1's
+	 * {@link sweepAbandonedWorktrees}. Injected in tests. Called once per
+	 * `(project, root)` pair — the root is a parameter rather than read off the
+	 * options, so a test sees which root each call was for.
+	 */
+	sweep?: (entry: WorktreeSweepProject, repoRoot: string) => Promise<SweepAbandonedWorktreesResult>;
 	/** Deliver one report; defaults to a `postDelivery` call. Injected in tests. */
 	report?: (report: WorktreeSweepReport) => Promise<ReportWorktreeSweepDeliveryResponse>;
 	logger?: SweepLogger;
@@ -267,7 +278,9 @@ async function sweepProjectsAndReport(
 	logger: SweepLogger,
 	owe: (report: WorktreeSweepReport) => void,
 ): Promise<boolean> {
-	const sweep = options.sweep ?? ((entry: WorktreeSweepProject) => sweepProject(options, entry));
+	const sweep =
+		options.sweep ??
+		((entry: WorktreeSweepProject, repoRoot: string) => sweepProject(options, entry, repoRoot));
 	const removed: WorktreeSweepRemoval[] = [];
 	const failures: string[] = [];
 	let keptLiveCount = 0;
@@ -276,39 +289,50 @@ async function sweepProjectsAndReport(
 	logger.info('sweeping abandoned worktrees on request', {
 		requestId: frame.requestId,
 		projects: frame.projects.length,
+		repoRoots: options.repoRoots.length,
 	});
 
 	for (const entry of frame.projects) {
-		// Checked per project rather than once: a sweep of a large fleet machine can
-		// outlast the SIGTERM that arrives mid-way, and stopping between projects leaves
-		// the remaining ones for the re-push instead of racing the teardown.
-		if (options.shutdownSignal.aborted) {
-			logger.info('abandoning a worktree sweep — this daemon is shutting down', {
-				requestId: frame.requestId,
-			});
-			return false;
-		}
-		try {
-			const result = await sweep(entry);
-			for (const entryRemoval of result.removed) {
-				removed.push({ projectId: entry.projectId, ...entryRemoval });
+		// Every checkout root, because a project's `worktreeRoot` is relative and a
+		// `task-<id>` checkout sits under whichever root ran the assignment (issue
+		// #1058). The frame names no repository, so there is nothing to narrow this by —
+		// and nothing to narrow: a root with no such directory sweeps nothing.
+		for (const repoRoot of options.repoRoots) {
+			// Checked per sweep rather than once: a sweep of a large fleet machine can
+			// outlast the SIGTERM that arrives mid-way, and stopping between projects leaves
+			// the remaining ones for the re-push instead of racing the teardown.
+			if (options.shutdownSignal.aborted) {
+				logger.info('abandoning a worktree sweep — this daemon is shutting down', {
+					requestId: frame.requestId,
+				});
+				return false;
 			}
-			keptLiveCount += result.keptLive.length;
-			// A checkout that could not be removed is a failure of the same kind as a
-			// project that threw — the operator asked for it to be gone and it is not —
-			// so both land in the one count the report carries.
-			failedCount += result.failed.length;
-			for (const failure of result.failed) {
-				failures.push(`${entry.projectId} ${failure.path}: ${failure.error}`);
+			try {
+				const result = await sweep(entry, repoRoot);
+				for (const entryRemoval of result.removed) {
+					removed.push({ projectId: entry.projectId, ...entryRemoval });
+				}
+				keptLiveCount += result.keptLive.length;
+				// A checkout that could not be removed is a failure of the same kind as a
+				// project that threw — the operator asked for it to be gone and it is not —
+				// so both land in the one count the report carries.
+				failedCount += result.failed.length;
+				for (const failure of result.failed) {
+					failures.push(`${entry.projectId} ${failure.path}: ${failure.error}`);
+				}
+			} catch (err) {
+				failedCount += 1;
+				// The root is named because with several checkouts the project id alone no
+				// longer says which tree failed. It is a host-local path, and so is every
+				// `failure.path` above — this report goes to the operator of this machine.
+				failures.push(`${entry.projectId} (${repoRoot}): ${describeError(err)}`);
+				logger.warn('sweeping one project failed — continuing with the rest', {
+					requestId: frame.requestId,
+					projectId: entry.projectId,
+					repoRoot,
+					error: describeError(err),
+				});
 			}
-		} catch (err) {
-			failedCount += 1;
-			failures.push(`${entry.projectId}: ${describeError(err)}`);
-			logger.warn('sweeping one project failed — continuing with the rest', {
-				requestId: frame.requestId,
-				projectId: entry.projectId,
-				error: describeError(err),
-			});
 		}
 	}
 
@@ -362,7 +386,8 @@ function sweepOwnerId(): string {
 }
 
 /**
- * Sweep one project the frame named, against **this machine's own** checkout root.
+ * Sweep one project the frame named, under one of **this machine's own** checkout
+ * roots.
  *
  * `isOwnerLive` is the daemon's in-flight set, which is what makes a checkout a
  * phase here currently holds read as leased and be skipped — the acceptance
@@ -383,17 +408,18 @@ function sweepOwnerId(): string {
 function sweepProject(
 	options: WorktreeSweepHandlerOptions,
 	entry: WorktreeSweepProject,
+	repoRoot: string,
 ): Promise<SweepAbandonedWorktreesResult> {
 	const project = {
 		id: entry.projectId,
-		repoRoot: options.repoRoot,
+		repoRoot,
 		worktreeRoot: entry.worktreeRoot,
 	} as unknown as ProjectConfig;
 	return sweepAbandonedWorktrees(project, {
 		worktrees: new GitWorktreeManager(
 			project,
 			createHostLocalWorktreeRuntime({
-				repoRoot: options.repoRoot,
+				repoRoot,
 				worktreeRoot: entry.worktreeRoot,
 				ownerId: sweepOwnerId(),
 				isOwnerLive: (ownerId) => options.inFlight.has(ownerId),

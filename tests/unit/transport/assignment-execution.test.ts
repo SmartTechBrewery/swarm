@@ -116,8 +116,11 @@ function depsWith(
 /** A resumable session id — UUID-shaped for every CLI (`RecoveryIntentSchema`). */
 const SESSION_UUID = '11111111-1111-4111-8111-111111111111';
 
+/** The default daemon shape: one checkout whose `origin` could not be read. */
+const REPO_ROOT = '/worker-local/swarm';
+
 const RUN_OPTIONS = {
-	repoRoot: '/worker-local/swarm',
+	checkouts: [{ repoRoot: REPO_ROOT }],
 	controlPlaneUrl: CONTROL_PLANE,
 	workerCredential: WORKER_CREDENTIAL,
 } as const;
@@ -387,16 +390,19 @@ describe('runAssignmentDbFree', () => {
 		);
 	});
 
-	it('refuses an assignment for a repository this checkout is not, naming both (issue #688)', async () => {
+	it('refuses an assignment for a repository it holds no checkout of (issues #688, #1058)', async () => {
 		const sink = recordingSink();
 		const runPhase = vi.fn();
 		const buildDelivery = vi.fn(async () => stubDelivery());
 
 		await runAssignmentDbFree(ciAssignment(), sink, {
 			...RUN_OPTIONS,
-			// This daemon's checkout is a different repository from the assigned project's
+			// This daemon's checkouts are of other repositories than the assigned project's
 			// `SmartTechBrewery/swarm` — the second-enrollment case (ADR-003 §2).
-			checkoutRepository: 'acme/backend',
+			checkouts: [
+				{ repoRoot: '/worker-local/backend', repository: 'acme/backend' },
+				{ repoRoot: '/worker-local/cascade', repository: 'acme/cascade' },
+			],
 			deps: depsWith(runPhase as never, buildDelivery),
 		});
 
@@ -405,13 +411,18 @@ describe('runAssignmentDbFree', () => {
 		expect(runPhase).not.toHaveBeenCalled();
 		expect(buildDelivery).not.toHaveBeenCalled();
 		const result = sink.sent.at(-1) as Record<string, unknown>;
-		// Terminal `failed`, never `deferred` — no retry here could make the two match.
+		// Terminal `failed`, never `deferred` — no retry here could give this worker a
+		// checkout it was not started with.
 		expect(result).toMatchObject({ type: 'task-execution-result', status: 'failed' });
 		expect(sink.sent.filter((f) => f.type === 'task-execution-result')).toHaveLength(1);
+		// The assigned repository and every repository this worker does hold.
 		expect(String(result.error)).toContain('SmartTechBrewery/swarm');
 		expect(String(result.error)).toContain('acme/backend');
-		// The checkout path too, as `assertRepoIdentity`'s own refusal already reports it.
-		expect(String(result.error)).toContain(RUN_OPTIONS.repoRoot);
+		expect(String(result.error)).toContain('acme/cascade');
+		// And **no host path**: this message is reported to the control plane and read by
+		// whoever reads the run, where a machine's directory layout is not theirs to know.
+		expect(String(result.error)).not.toContain('/worker-local');
+		expect(String(result.error)).not.toContain('SWARM_WORKER_REPO_ROOT=');
 	});
 
 	it('runs an assignment whose repository differs only in case or a .git suffix', async () => {
@@ -420,7 +431,7 @@ describe('runAssignmentDbFree', () => {
 
 		await runAssignmentDbFree(ciAssignment(), sink, {
 			...RUN_OPTIONS,
-			checkoutRepository: 'SmartTechBrewery/Swarm.git',
+			checkouts: [{ repoRoot: REPO_ROOT, repository: 'SmartTechBrewery/Swarm.git' }],
 			deps: depsWith(runPhase),
 		});
 
@@ -434,16 +445,37 @@ describe('runAssignmentDbFree', () => {
 		const sink = recordingSink();
 		const runPhase = vi.fn(async (_inputs: AssignedPhaseInputs) => ({ agent: agentResult() }));
 
-		// A checkout with no identifiable `origin` declares nothing (issue #687), and
-		// keeps exactly today's behaviour — `assertRepoIdentity` is still the backstop.
+		// A single checkout with no identifiable `origin` declares nothing (issue #687),
+		// and keeps exactly today's behaviour — `assertRepoIdentity` is still the backstop.
 		await runAssignmentDbFree(ciAssignment(), sink, {
 			...RUN_OPTIONS,
-			checkoutRepository: undefined,
+			checkouts: [{ repoRoot: REPO_ROOT }],
 			deps: depsWith(runPhase),
 		});
 
 		expect(runPhase).toHaveBeenCalledTimes(1);
 		expect(sink.sent.at(-1)).toMatchObject({ status: 'succeeded', phase: 'respond-to-ci' });
+	});
+
+	// Issue #1058: the whole point of holding several checkouts — the assignment runs in
+	// the one whose repository it names, not in the primary.
+	it('runs each assignment in the checkout of its own repository', async () => {
+		const sink = recordingSink();
+		const runPhase = vi.fn(async (_inputs: AssignedPhaseInputs) => ({ agent: agentResult() }));
+
+		await runAssignmentDbFree(ciAssignment(), sink, {
+			...RUN_OPTIONS,
+			checkouts: [
+				{ repoRoot: '/worker-local/backend', repository: 'acme/backend' },
+				{ repoRoot: '/worker-local/swarm', repository: 'SmartTechBrewery/swarm' },
+			],
+			deps: depsWith(runPhase),
+		});
+
+		expect(sink.sent.at(-1)).toMatchObject({ status: 'succeeded', phase: 'respond-to-ci' });
+		// Worktree provisioning, the `origin` identity check and cleanup all follow the
+		// reconstructed project's `repoRoot`, so this one value is what moves them all.
+		expect(runPhase.mock.calls[0]?.[0].project.repoRoot).toBe('/worker-local/swarm');
 	});
 
 	it('runs planning with its whole board surface on the delivery API and no PM credential', async () => {

@@ -217,6 +217,42 @@ describe('buildHandshakeRequest', () => {
 		expect(request).not.toHaveProperty('repository');
 	});
 
+	// Issues #1056, #1058 — every checkout this daemon holds, primary first, beside the
+	// primary alone for a control plane predating the set.
+	it('carries the whole declared repository set, normalised and primary first', () => {
+		const request = buildHandshakeRequest({
+			credential: CREDENTIAL,
+			daemonVersion: '0.1.0',
+			hostname: 'ada-laptop',
+			capabilities: ['claude'],
+			supportedPhases: ALL_TRIGGER_PHASES,
+			repository: 'SmartTechBrewery/Swarm.git',
+			repositories: ['SmartTechBrewery/Swarm.git', 'Mongrel-Intelligence/cascade'],
+		});
+		expect(request.repository).toBe('smarttechbrewery/swarm');
+		expect(request.repositories).toEqual([
+			'smarttechbrewery/swarm',
+			'mongrel-intelligence/cascade',
+		]);
+	});
+
+	// Omitted on the same terms as `repository`, so a daemon holding one unidentifiable
+	// checkout sends a body byte-identical to the one it sent before the field existed —
+	// which the whole-object `toEqual` at the top of this block is the proof of.
+	it('omits the repositories key entirely when nothing was declared', () => {
+		for (const repositories of [undefined, []]) {
+			const request = buildHandshakeRequest({
+				credential: CREDENTIAL,
+				daemonVersion: '0.1.0',
+				hostname: 'ada-laptop',
+				capabilities: ['claude'],
+				supportedPhases: ALL_TRIGGER_PHASES,
+				repositories,
+			});
+			expect(request).not.toHaveProperty('repositories');
+		}
+	});
+
 	// Issue #918 — the SWARM build this daemon runs, carried and omitted on exactly the
 	// same terms, so a daemon whose install root is not a git checkout sends the request
 	// a daemon predating the field does. The whole-object `toEqual` above is the

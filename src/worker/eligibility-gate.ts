@@ -579,7 +579,7 @@ function ineligibilityMessage(
 		// a machine pointed at *this* repository rather than anything about the phase, the
 		// CLI, or the enrollment.
 		case 'repository-mismatch':
-			return `No enrolled worker for ${owner} holds a checkout of '${context.repository}' — every available machine holds checkouts of other repositories only. Point a worker at that repository (SWARM_WORKER_REPO_ROOT) or enroll one that already holds it — this work waits until one does.`;
+			return `No enrolled worker for ${owner} holds a checkout of '${context.repository}' — every available machine holds checkouts of other repositories only. Give a worker a checkout of that repository (SWARM_WORKER_REPO_ROOT takes several, separated by ':') or enroll one that already holds it — this work waits until one does.`;
 	}
 }
 

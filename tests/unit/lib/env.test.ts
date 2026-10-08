@@ -1,10 +1,11 @@
+import { delimiter } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import {
 	isSingleUserMode,
 	optionalEnv,
 	requireEnv,
 	resolveWebhookCallbackBaseUrl,
-	resolveWorkerRepoRoot,
+	resolveWorkerRepoRoots,
 } from '@/lib/env.js';
 
 describe('requireEnv', () => {
@@ -71,12 +72,29 @@ describe('resolveWebhookCallbackBaseUrl', () => {
 	});
 });
 
-describe('resolveWorkerRepoRoot', () => {
+describe('resolveWorkerRepoRoots', () => {
 	it('uses the worker-local override when configured', () => {
-		expect(resolveWorkerRepoRoot('  /remote/checkout  ', '/fallback')).toBe('/remote/checkout');
+		expect(resolveWorkerRepoRoots('  /remote/checkout  ', '/fallback')).toEqual([
+			'/remote/checkout',
+		]);
 	});
 
-	it('defaults to the daemon working directory', () => {
-		expect(resolveWorkerRepoRoot('', '/worker/swarm')).toBe('/worker/swarm');
+	it('defaults to the daemon working directory when unset or empty', () => {
+		expect(resolveWorkerRepoRoots('', '/worker/swarm')).toEqual(['/worker/swarm']);
+		vi.stubEnv('SWARM_WORKER_REPO_ROOT', '');
+		expect(resolveWorkerRepoRoots(undefined, '/worker/swarm')).toEqual(['/worker/swarm']);
+	});
+
+	// Issue #1058. Written the way `PATH` is, and the first entry is the primary checkout.
+	it('reads several checkouts from one delimiter-separated value, primary first', () => {
+		expect(resolveWorkerRepoRoots(`/a${delimiter}/b`, '/fallback')).toEqual(['/a', '/b']);
+	});
+
+	// A trailing delimiter, a repeated path, or whitespace around one is not a second
+	// checkout — the daemon would otherwise refuse to start on a duplicate.
+	it('drops blank entries and collapses duplicates, keeping declaration order', () => {
+		expect(
+			resolveWorkerRepoRoots(`/a${delimiter} ${delimiter}/b${delimiter}/a/${delimiter}`),
+		).toEqual(['/a', '/b']);
 	});
 });

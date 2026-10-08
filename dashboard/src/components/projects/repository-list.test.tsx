@@ -129,15 +129,15 @@ describe('RepositoryList', () => {
 		expect(screen.getByText('acme/first')).toBeDefined();
 	});
 
-	// `repoRoot` is still one checkout per project, so a second entry has a consequence the
-	// operator has to be told about — but only once it exists.
-	it('warns about the single checkout only once a second repository is listed', () => {
+	// Issue #1058 made a second repository usable end to end — a worker holds a checkout
+	// per repository — so the warning that said otherwise is gone, with one entry or two.
+	it('no longer warns that a second repository is unusable', () => {
 		const { unmount } = renderList();
 		expect(screen.queryByText(/not yet fully usable/)).toBeNull();
 		unmount();
 
 		renderList({ repositories: TWO });
-		expect(screen.getByText(/not yet fully usable/)).toBeDefined();
+		expect(screen.queryByText(/not yet fully usable/)).toBeNull();
 	});
 
 	it('disables every control while a save is in flight', () => {

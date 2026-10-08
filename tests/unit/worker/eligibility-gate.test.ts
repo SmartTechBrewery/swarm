@@ -1122,9 +1122,12 @@ describe('evaluateDispatchEligibility', () => {
 			// The wait needs a human — a machine connecting cannot re-point a checkout — so
 			// the deferral records `worker-authorization` rather than `worker-eligibility`.
 			expect(isAvailabilityRefusal(decision.reason)).toBe(false);
-			// And the message names the repository plus the action that ends the wait.
+			// And the message names the repository plus the action that ends the wait —
+			// which since issue #1058 is giving a machine *another* checkout, not re-pointing
+			// its only one, so the remedy says the setting takes several.
 			expect(decision.message).toContain(REPOSITORY);
 			expect(decision.message).toContain('SWARM_WORKER_REPO_ROOT');
+			expect(decision.message).toMatch(/takes several/);
 		});
 
 		it('still reports worker-unavailable while a matching machine is merely busy', async () => {

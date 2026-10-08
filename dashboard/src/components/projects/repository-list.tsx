@@ -1,4 +1,4 @@
-import { AlertTriangle, ChevronDown, ChevronUp, Plus, Trash2 } from 'lucide-react';
+import { ChevronDown, ChevronUp, Plus, Trash2 } from 'lucide-react';
 import type { RepositoryForm } from '@/lib/project-repository.js';
 
 /** Input/select recipe shared with the rest of the tab (ai/DESIGN_SYSTEM.md §4). */
@@ -233,27 +233,6 @@ export function RepositoryList({
 					Each repository can appear at most once — remove the duplicate entry for{' '}
 					<span className="font-mono">{duplicates.join(', ')}</span> before saving.
 				</p>
-			)}
-
-			{/* The list routes (issue #684 phase 2), but `repoRoot` is still one checkout per
-			    project and a worker declares the single repository its checkout is, so a run for
-			    a non-default repository is refused at provisioning (docs/configuration.md). Said
-			    only once a second entry exists, where it is actually a consequence. */}
-			{repositories.length > 1 && (
-				<div className="p-4 bg-amber-950/20 border border-amber-900/30 rounded flex gap-3">
-					<AlertTriangle className="w-5 h-5 shrink-0 text-amber-500" aria-hidden="true" />
-					<div>
-						<h4 className="text-xs font-semibold text-amber-200">
-							A second repository is not yet fully usable
-						</h4>
-						<p className="text-xs text-amber-200/70 mt-1">
-							The local repository root is a single checkout per project, and a worker host declares
-							the one repository its checkout actually is. A run for anything other than the default
-							repository is refused at provisioning rather than worked on in the wrong tree.
-							Per-repository checkout roots are a follow-up.
-						</p>
-					</div>
-				</div>
 			)}
 		</div>
 	);

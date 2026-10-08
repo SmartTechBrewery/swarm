@@ -1,4 +1,4 @@
-import { resolve } from 'node:path';
+import { delimiter, resolve } from 'node:path';
 
 /**
  * Read a required environment variable, throwing if it is unset or empty.
@@ -74,11 +74,35 @@ export function isSingleUserMode(): boolean {
 	return process.env.SWARM_SINGLE_USER_MODE === 'true';
 }
 
-/** Resolve the assigned repository checkout on the remote worker's own host. */
-export function resolveWorkerRepoRoot(
+/**
+ * The repository checkouts this worker host holds (`SWARM_WORKER_REPO_ROOT`), in
+ * declaration order — the **first** is the primary one (issue #1058).
+ *
+ * Written the way `PATH` is, separated by `path.delimiter` (`:` on macOS/Linux,
+ * `;` on Windows), because that is the one list spelling an operator already knows
+ * and it needs no escaping rule of SWARM's own for the only character a path may
+ * not contain. Unset or empty means the current working directory, and a single
+ * path therefore behaves exactly as it did when this returned one root.
+ *
+ * Blank entries are dropped and duplicates collapse to their first occurrence, so
+ * a trailing delimiter or a path repeated by a launcher is not a second checkout.
+ * Deduplication is on the *resolved* spelling only; two spellings of one checkout
+ * that differ after `resolve` (a symlink, say) are caught later, where the checkout
+ * lock keys on the realpath (`../worktree/checkout-key.ts`).
+ *
+ * The paths are host-local and never travel: the control plane learns only which
+ * *repositories* these checkouts are (`../transport/worker-checkouts.ts`).
+ */
+export function resolveWorkerRepoRoots(
 	raw = process.env.SWARM_WORKER_REPO_ROOT,
 	cwd = process.cwd(),
-): string {
-	const value = (raw ?? '').trim();
-	return resolve(value === '' ? cwd : value);
+): string[] {
+	const roots: string[] = [];
+	for (const entry of (raw ?? '').split(delimiter)) {
+		const value = entry.trim();
+		if (value === '') continue;
+		const absolute = resolve(value);
+		if (!roots.includes(absolute)) roots.push(absolute);
+	}
+	return roots.length > 0 ? roots : [resolve(cwd)];
 }

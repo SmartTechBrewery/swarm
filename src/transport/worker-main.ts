@@ -16,8 +16,9 @@
  * a code path, and whatever works here works there.
  *
  * The process holds **only** `SWARM_WORKER_CREDENTIAL`,
- * `SWARM_CONTROL_PLANE_URL`, and its host-local checkout path
- * (`SWARM_WORKER_REPO_ROOT`, defaulting to cwd) — never `DATABASE_URL`/`REDIS_URL`,
+ * `SWARM_CONTROL_PLANE_URL`, and its host-local checkout paths
+ * (`SWARM_WORKER_REPO_ROOT`, a `path.delimiter`-separated list defaulting to cwd,
+ * the first entry primary — issue #1058) — never `DATABASE_URL`/`REDIS_URL`,
  * even on a host that has them, and, since issue #765, no operator SCM credential
  * either: that identity is stored per `(worker, scmProvider)` on the control plane
  * and arrives on each assignment, so rotating it needs no restart here and
@@ -36,13 +37,16 @@
  * `pm/find-item` card lookup and `follow-up-review` enqueue seams, and `planning`
  * since issue #536 routed its whole board surface through five more PM delivery
  * routes. The supported-phase gate in `runAssignmentDbFree` stays as the backstop
- * even though it now excludes nothing, and the repository this daemon declares at
- * handshake is handed to the same executor so an assignment for a *different*
- * repository is refused before the checkout is touched (issue #688). Before any of
- * that it takes a host-local lock on that checkout (`../worktree/checkout-lock.ts`,
- * issue #689), so a second daemon pointed at the same `SWARM_WORKER_REPO_ROOT`
- * refuses to start rather than driving git in the same repository as this one, and
- * it registers as a **participant** of the SWARM install root it is loaded from
+ * even though it now excludes nothing, and the repositories this daemon declares at
+ * handshake are handed to the same executor so each assignment runs in the checkout
+ * of *its own* repository and one for a repository this worker holds no checkout of
+ * is refused before any checkout is touched (issues #688, #1058). Before any of
+ * that it takes a host-local lock on **each** checkout
+ * (`../worktree/checkout-lock.ts`, issue #689), all or nothing, so a second daemon
+ * pointed at any of the same `SWARM_WORKER_REPO_ROOT` entries refuses to start
+ * rather than driving git in the same repository as this one — and it refuses to
+ * start at all on duplicate or, with more than one checkout, unidentifiable ones
+ * (`./worker-checkouts.ts`). It registers as a **participant** of the SWARM install root it is loaded from
  * (`../worktree/install-lock.ts`, issue #935) — which, unlike the checkout, several
  * daemons legitimately share, so that record refuses nothing and is read by a
  * self-update on this machine instead. It never opens a database or queue connection.
@@ -84,11 +88,10 @@ import { fileURLToPath } from 'node:url';
 import '../integrations/entrypoint.js';
 import { resolveAgentContainment } from '../harness/containment.js';
 import { resolveOwnBuildIdentity, swarmInstallRoot } from '../lib/build-identity.js';
-import { requireEnv, resolveWorkerRepoRoot } from '../lib/env.js';
+import { requireEnv, resolveWorkerRepoRoots } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { resolveOwnSupervision } from '../lib/worker-supervision.js';
-import { resolveDeclarableOriginRepoSlug } from '../scm/repo-slug.js';
 import {
 	acquireCheckoutLock,
 	CHECKOUT_LOCK_REFRESH_MS,
@@ -108,18 +111,25 @@ import {
 	WORKER_QUOTA_REPORT_INTERVAL_MS,
 	type WorkerQuotaReportingHandle,
 } from './quota-reporting.js';
+import {
+	declaredRepositories,
+	resolveWorkerCheckouts,
+	type WorkerCheckout,
+	WorkerCheckoutConfigError,
+} from './worker-checkouts.js';
 import { connectWorkerTransport } from './worker-client.js';
 import { createWorkerUpdateHandler } from './worker-update.js';
 import { createWorktreeSweepHandler } from './worktree-sweep.js';
 
 /**
- * The two host-local records this process leaves on its own machine: the checkout
- * lock (issue #689) and its participation in the SWARM install root it is loaded
- * from (issue #935), with the one timer that keeps both fresh. Module-scoped so every
- * exit path can drop them — a released record is immediately reclaimable, where one
- * left behind waits for the next daemon to find its pid dead.
+ * The two host-local records this process leaves on its own machine: one checkout
+ * lock per checkout it holds (issues #689, #1058) and its participation in the SWARM
+ * install root it is loaded from (issue #935), with the one timer that keeps them all
+ * fresh. Module-scoped so every exit path can drop them — a released record is
+ * immediately reclaimable, where one left behind waits for the next daemon to find
+ * its pid dead.
  */
-let heldCheckoutLock: CheckoutLock | undefined;
+let heldCheckoutLocks: CheckoutLock[] = [];
 let installParticipation: InstallParticipation | undefined;
 let hostStateRefreshTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -148,40 +158,93 @@ function releaseHostLocalState(): void {
 		});
 	}
 	installParticipation = undefined;
-	try {
-		heldCheckoutLock?.release();
-	} catch (err) {
-		// Never let a filesystem hiccup turn a graceful shutdown into a crash: the lock
-		// is reclaimable on liveness grounds once this process is gone.
-		logger.warn('releasing the checkout lock failed', { error: describeError(err) });
+	// Each lock in its own `try`: a filesystem hiccup on one checkout must not strand
+	// the locks on the others, which an operator would then have to wait out.
+	for (const lock of heldCheckoutLocks) {
+		try {
+			lock.release();
+		} catch (err) {
+			// Never let a filesystem hiccup turn a graceful shutdown into a crash: the lock
+			// is reclaimable on liveness grounds once this process is gone.
+			logger.warn('releasing a checkout lock failed', {
+				lockDir: lock.lockDir,
+				error: describeError(err),
+			});
+		}
 	}
-	heldCheckoutLock = undefined;
+	heldCheckoutLocks = [];
 }
 
 /**
- * Take the host-local lock on this checkout, or refuse to start (issue #689).
+ * Take the host-local lock on **every** checkout this daemon was given, or refuse to
+ * start (issues #689, #1058).
  *
  * Two daemons holding two *different* credentials can still be pointed at one
- * `SWARM_WORKER_REPO_ROOT`, and both would then run `git worktree add` against the
- * same main repository and contend on its `index.lock`. The control plane cannot
- * see that — `repoRoot` is host-local and never travels, and two checkouts of one
- * repository are legitimate capacity — so the guard is a filesystem lock and the
+ * `SWARM_WORKER_REPO_ROOT` entry, and both would then run `git worktree add` against
+ * the same main repository and contend on its `index.lock`. The control plane cannot
+ * see that — a checkout path is host-local and never travels, and two checkouts of
+ * one repository are legitimate capacity — so the guard is a filesystem lock and the
  * refusal happens here, before the handshake.
+ *
+ * **All or nothing.** A daemon that could lock three of its four checkouts would
+ * declare a repository set it cannot actually serve, so the locks already taken are
+ * released and the process exits — the same answer a single-checkout daemon has
+ * always given, applied to the set.
  */
-function acquireCheckoutLockOrExit(repoRoot: string): CheckoutLock {
+function acquireCheckoutLocksOrExit(repoRoots: readonly string[]): CheckoutLock[] {
+	const locks: CheckoutLock[] = [];
+	for (const repoRoot of repoRoots) {
+		try {
+			locks.push(acquireCheckoutLock({ repoRoot }));
+		} catch (err) {
+			for (const lock of locks) {
+				try {
+					lock.release();
+				} catch {
+					// Best-effort: this process is exiting, and the lock is reclaimable on
+					// liveness grounds the moment it does.
+				}
+			}
+			if (!(err instanceof CheckoutHeldError)) throw err;
+			// Names the holding worker (a pid, until that daemon's own handshake told it
+			// which worker it is) so an operator knows which process to stop, and which of
+			// this daemon's checkouts is the contended one.
+			logger.error('refusing to start — another worker already holds this checkout', {
+				repoRoot,
+				lockDir: err.lockDir,
+				holderWorkerId: err.holder?.workerId ?? null,
+				holderPid: err.holder?.pid ?? null,
+				reason: err.message,
+			});
+			process.exit(1);
+		}
+	}
+	return locks;
+}
+
+/**
+ * Resolve which repository each locked checkout is, or refuse to start (issue
+ * #1058) — see `./worker-checkouts.ts` for the two sets no daemon can route on.
+ *
+ * The locks are already held when this runs (they are taken before anything reads
+ * the checkouts), so a refusal here has to drop them: a daemon that exits still
+ * holding them would block the operator's corrected relaunch until the TTL lapsed.
+ */
+async function resolveWorkerCheckoutsOrExit(
+	repoRoots: readonly string[],
+): Promise<WorkerCheckout[]> {
 	try {
-		return acquireCheckoutLock({ repoRoot });
+		return await resolveWorkerCheckouts(repoRoots);
 	} catch (err) {
-		if (!(err instanceof CheckoutHeldError)) throw err;
-		// Names the holding worker (a pid, until that daemon's own handshake told it
-		// which worker it is) so an operator knows which process to stop.
-		logger.error('refusing to start — another worker already holds this checkout', {
-			repoRoot,
-			lockDir: err.lockDir,
-			holderWorkerId: err.holder?.workerId ?? null,
-			holderPid: err.holder?.pid ?? null,
-			reason: err.message,
-		});
+		if (!(err instanceof WorkerCheckoutConfigError)) throw err;
+		logger.error(
+			'refusing to start — SWARM_WORKER_REPO_ROOT names checkouts this worker cannot serve',
+			{
+				repoRoots: [...repoRoots],
+				reason: err.message,
+			},
+		);
+		releaseHostLocalState();
 		process.exit(1);
 	}
 }
@@ -201,12 +264,14 @@ function resolveDaemonVersion(): string {
 async function main(): Promise<void> {
 	const credential = requireEnv('SWARM_WORKER_CREDENTIAL').trim();
 	const controlPlaneUrl = requireEnv('SWARM_CONTROL_PLANE_URL').trim();
-	const repoRoot = resolveWorkerRepoRoot();
-	// Claimed before anything else this daemon does with the checkout, so a second
-	// worker on it exits without ever handshaking. Refreshed below, and released on
-	// every exit path.
-	const checkoutLock = acquireCheckoutLockOrExit(repoRoot);
-	heldCheckoutLock = checkoutLock;
+	// Every checkout this host holds, primary first (issue #1058). A single path — or
+	// none at all, which means cwd — is the shape every earlier daemon had.
+	const repoRoots = resolveWorkerRepoRoots();
+	// Claimed before anything else this daemon does with the checkouts, so a second
+	// worker on any of them exits without ever handshaking. Refreshed below, and
+	// released on every exit path.
+	const checkoutLocks = acquireCheckoutLocksOrExit(repoRoots);
+	heldCheckoutLocks = checkoutLocks;
 	// Say, on this machine, that a daemon is running from this SWARM install root
 	// (issue #935). Not a lock and never a reason to refuse a start: several daemons
 	// sharing one npm-linked checkout is the control-plane host's ordinary shape. It is
@@ -220,20 +285,23 @@ async function main(): Promise<void> {
 	// one timer serves both, which is why they share that TTL.
 	hostStateRefreshTimer = setInterval(() => {
 		installParticipation?.refresh();
-		if (checkoutLock.refresh()) return;
-		logger.warn('this checkout lock is no longer held by this process', {
-			repoRoot,
-			lockDir: checkoutLock.lockDir,
-		});
+		for (const lock of checkoutLocks) {
+			if (lock.refresh()) continue;
+			logger.warn('this checkout lock is no longer held by this process', {
+				lockDir: lock.lockDir,
+			});
+		}
 	}, CHECKOUT_LOCK_REFRESH_MS);
 	hostStateRefreshTimer.unref();
-	// Which repository that one checkout actually is, read from its `origin` remote
-	// (issue #687) — the fact the control plane cannot otherwise learn, since
-	// `repoRoot` is host-local and never travels. Resolved once, because the process
-	// holds exactly one checkout for its whole life and re-reading per assignment
-	// would only invite the two answers to differ. A checkout with no identifiable
-	// `origin` resolves to `undefined` and declares nothing rather than failing startup.
-	const repository = await resolveDeclarableOriginRepoSlug(repoRoot);
+	// Which repository each checkout actually is, read from its `origin` remote
+	// (issues #687, #1058) — the fact the control plane cannot otherwise learn, since
+	// the paths are host-local and never travel. Resolved once, because the process
+	// holds the same checkouts for its whole life and re-reading per assignment would
+	// only invite the two answers to differ. A *single* checkout with no identifiable
+	// `origin` resolves to nothing declared rather than failing startup; with several
+	// there would be no way to route between them, so that is refused here.
+	const checkouts = await resolveWorkerCheckoutsOrExit(repoRoots);
+	const repositories = declaredRepositories(checkouts);
 	// Which SWARM build this daemon is actually running (issue #918) — the commit of
 	// the *install root*, which is anchored on this module's own path and is not
 	// `repoRoot`: one npm-linked checkout serves daemons whose `cwd` is a different
@@ -320,19 +388,22 @@ async function main(): Promise<void> {
 		// it (issue #559); an explicit override is the operator's own declaration.
 		refreshCapabilities: declaredOverride ? undefined : discoverAvailableClis,
 		supportedPhases,
-		repository,
+		// The primary checkout's repository, so a control plane predating the set still
+		// sees one, beside the whole set it routes and enrolls on (issues #1056, #1058).
+		repository: checkouts[0]?.repository,
+		repositories,
 		build,
 		supervision,
 		hostname: host,
 		daemonVersion: resolveDaemonVersion(),
 		onAssignment: (assignment, sink) => {
 			void runAssignmentDbFree(assignment, sink, {
-				repoRoot,
-				// The same declaration the handshake carries, so the executor can refuse an
-				// assignment for a repository this checkout is not before it touches the
-				// checkout (issue #688) — passed from the one startup resolution above
-				// rather than re-read per assignment.
-				checkoutRepository: repository,
+				// The same set the handshake declares, so the executor runs each assignment in
+				// the checkout of *its* repository and refuses one for a repository this
+				// worker holds none of before it touches any checkout (issues #688, #1058) —
+				// passed from the one startup resolution above rather than re-read per
+				// assignment.
+				checkouts,
 				// The delivery seam for the metadata writes this worker holds no
 				// credential for (a review, a board move/comment): POSTed to the control
 				// plane under this worker's own credential (ADR-004 §2).
@@ -383,7 +454,7 @@ async function main(): Promise<void> {
 		// busy while it sweeps, which is the right answer for what that flag guards: a
 		// peer must not swap the install root under a daemon that is mid-removal.
 		onWorktreeSweep: createWorktreeSweepHandler({
-			repoRoot,
+			repoRoots,
 			controlPlaneUrl,
 			workerCredential: credential,
 			inFlight,
@@ -397,7 +468,7 @@ async function main(): Promise<void> {
 		// refused because this daemon is mid-phase has to name a worker an operator can
 		// drain, not a pid they would have to map back themselves.
 		onSession: (session) => {
-			checkoutLock.annotate(session.workerId);
+			for (const lock of checkoutLocks) lock.annotate(session.workerId);
 			installParticipation?.annotate(session.workerId);
 			promoteBuild();
 		},
@@ -416,12 +487,13 @@ async function main(): Promise<void> {
 		quotaReportIntervalMs: WORKER_QUOTA_REPORT_INTERVAL_MS,
 		capabilities,
 		supportedPhases,
-		repoRoot,
-		// Printed beside `repoRoot` so an operator can see what this daemon declared its
-		// checkout to be. Explicitly `null` rather than left undefined when there is no
-		// declaration, since the logger drops an undefined field and "nothing declared" is
-		// precisely what an operator debugging a later phase's refusal needs to see.
-		repository: repository ?? null,
+		repoRoots,
+		// Printed beside `repoRoots` so an operator can see what this daemon declared its
+		// checkouts to be, in the same order. An empty array rather than a dropped field
+		// when there is no declaration, since the logger drops an undefined one and
+		// "nothing declared" is precisely what an operator debugging a later phase's
+		// refusal needs to see.
+		repositories,
 		// Explicitly null for the same reason, and the field an operator reads first when
 		// asking whether this daemon carries a fix (issue #918).
 		build: build ?? null,
