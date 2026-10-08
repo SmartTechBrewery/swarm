@@ -12,10 +12,11 @@
  * (`../router/worker-delivery.ts`), and only the PR coordinates and the resulting
  * slot cross the wire — never the repository tree (ai/RULES.md §1).
  *
- * `projectId`/`repository` in the ledger key are resolved **server-side** from the
- * authenticated project, so the `projectId` this client sends is an
- * authorization input, not a key the worker gets to choose, and the `repository`
- * the phase passes is deliberately not sent at all.
+ * The ledger key's `projectId` is resolved **server-side** from the authenticated
+ * enrollment, so the `projectId` this client sends is an authorization input, not a
+ * key the worker gets to choose. The `repository` the phase passes — the run's own,
+ * the key the control plane reserved the slot under — is sent, and the server
+ * accepts it only when that project owns it (issue #1055).
  *
  * A non-2xx or unparseable response **throws**, exactly as a failed repository
  * call would, so the Review phase's existing handling applies unchanged: a
@@ -46,13 +47,11 @@ export function createTransportReviewLedger(
 	options: TransportReviewLedgerOptions,
 ): ReviewVerdictLedger {
 	return {
-		// `repository` is intentionally unused: the server derives it from the
-		// authenticated project, so a worker cannot key a row to another repo.
-		getPriorSubmittedReview: (_projectId, _repository, prNumber, currentHeadSha) =>
+		getPriorSubmittedReview: (_projectId, repository, prNumber, currentHeadSha) =>
 			postDelivery(
 				options,
 				'/worker/delivery/review-ledger/prior',
-				{ projectId: options.projectId, prNumber, currentHeadSha },
+				{ projectId: options.projectId, repository, prNumber, currentHeadSha },
 				(value) => PriorReviewLedgerResponseSchema.parse(value).record ?? undefined,
 			),
 		markReviewVerdictSubmitted: (key, data) =>
@@ -61,6 +60,7 @@ export function createTransportReviewLedger(
 				'/worker/delivery/review-ledger/mark',
 				{
 					projectId: options.projectId,
+					repository: key.repository,
 					prNumber: key.prNumber,
 					headSha: key.headSha,
 					verdict: data.verdict,
@@ -72,7 +72,12 @@ export function createTransportReviewLedger(
 			postDelivery(
 				options,
 				'/worker/delivery/review-ledger/abandon',
-				{ projectId: options.projectId, prNumber: key.prNumber, headSha: key.headSha },
+				{
+					projectId: options.projectId,
+					repository: key.repository,
+					prNumber: key.prNumber,
+					headSha: key.headSha,
+				},
 				(value) => {
 					AbandonReviewLedgerResponseSchema.parse(value);
 				},

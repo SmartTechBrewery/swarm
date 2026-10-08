@@ -13,10 +13,12 @@
  * the PR coordinates cross the wire — never the repository tree (ai/RULES.md §1).
  *
  * Unlike the metadata-delivery clients, no credential is involved here: what stays
- * server-side is the dispatch store and the queue. `project` is resolved
+ * server-side is the dispatch store and the queue. The project is resolved
  * server-side from the **authenticated** enrollment, so the `projectId` this client
- * sends is an authorization input rather than a target the worker gets to choose,
- * and the `project` the phase passes is deliberately not sent at all.
+ * sends is an authorization input rather than a target the worker gets to choose.
+ * Of the `project` the phase passes only its `repo` is sent — the run's own
+ * repository, which the server accepts only when that project owns it (issue
+ * #1055), so the follow-up Review lands on the PR the fix was pushed to.
  *
  * A non-2xx or unparseable response **throws**, exactly as a failed enqueue would,
  * so the phase's existing handling applies unchanged: the throw happens before the
@@ -43,13 +45,13 @@ export interface TransportFollowUpReviewOptions extends DeliveryClientOptions {
 export function createTransportFollowUpReviewScheduler(
 	options: TransportFollowUpReviewOptions,
 ): ScheduleFollowUpReview {
-	// `project` is intentionally unused: the server derives it from the
-	// authenticated enrollment, so a worker cannot schedule into another project.
-	return ({ prNumber, prBranch, headSha }) =>
+	// Only `project.repo` is sent: the project itself is the authenticated
+	// enrollment's, so a worker cannot schedule into another project.
+	return ({ project, prNumber, prBranch, headSha }) =>
 		postDelivery(
 			options,
 			'/worker/delivery/follow-up-review',
-			{ projectId: options.projectId, prNumber, prBranch, headSha },
+			{ projectId: options.projectId, repository: project.repo, prNumber, prBranch, headSha },
 			(value) => {
 				FollowUpReviewDeliveryResponseSchema.parse(value);
 			},

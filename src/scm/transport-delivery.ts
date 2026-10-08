@@ -46,6 +46,13 @@ export interface TransportScmDeliveryOptions extends DeliveryClientOptions {
 	/** The project id, sent so the server resolves the right reviewer PAT + enrollment. */
 	projectId: string;
 	/**
+	 * The repository the run is for (`owner/repo`, the assignment's scoped
+	 * `projectConfig.repo`), sent so the server addresses that repository's PR rather
+	 * than the project's default entry (issue #1055). Required for the same reason
+	 * `persona` is: every construction site states it.
+	 */
+	repository: string;
+	/**
 	 * Which persona the control plane authors this composite's PR comment as — the
 	 * same persona its `localDelegate` was built for, so a Respond-to-review reply
 	 * is the implementer's rather than the reviewer answering itself (issue #444).
@@ -81,6 +88,7 @@ export function createTransportScmDeliveryProvider(
 				'/worker/delivery/review',
 				{
 					projectId: options.projectId,
+					repository: options.repository,
 					prNumber: input.prNumber,
 					verdict: input.verdict,
 					body: input.body,
@@ -94,6 +102,7 @@ export function createTransportScmDeliveryProvider(
 				'/worker/delivery/pr-comment',
 				{
 					projectId: options.projectId,
+					repository: options.repository,
 					prNumber: input.prNumber,
 					body: input.body,
 					deliveryId: input.deliveryId,

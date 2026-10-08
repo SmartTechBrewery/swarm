@@ -868,6 +868,20 @@ export const ControlPlaneMessageSchema = z.discriminatedUnion('type', [
 export type ControlPlaneMessage = z.infer<typeof ControlPlaneMessageSchema>;
 
 /**
+ * The repository a **run-scoped** delivery request is for (issue #1055) — `owner/repo`,
+ * exactly as the assignment's scoped `projectConfig.repo` names it. Carried by the
+ * review, PR-comment, follow-up-Review and three review-ledger frames, so the server
+ * acts on the run's own repository rather than the project's default (first) entry,
+ * and refuses one the project does not own.
+ *
+ * Optional only so a worker predating #1055 still parses and is answered with a
+ * legible "upgrade the worker" refusal on a multi-repository project, rather than a
+ * schema-level 400 — the same no-protocol-bump precedent as the `comment` verdict and
+ * the `persona` default. On a single-repository project its absence changes nothing.
+ */
+const RunRepositorySchema = z.string().min(1).optional();
+
+/**
  * Control-plane SCM metadata delivery frames (ADR-004 §2). The metadata-only
  * SCM delivery calls — submit a review, post a PR comment — move server-side so
  * the per-project reviewer PAT stays on the router and never reaches a worker: a
@@ -891,6 +905,7 @@ export type ControlPlaneMessage = z.infer<typeof ControlPlaneMessageSchema>;
  */
 export const SubmitReviewDeliveryRequestSchema = z.object({
 	projectId: z.string().min(1),
+	repository: RunRepositorySchema,
 	prNumber: z.number().int().positive(),
 	verdict: z.enum(['approve', 'request-changes', 'comment']),
 	body: z.string().min(1),
@@ -919,6 +934,7 @@ export type SubmitReviewDeliveryResponse = z.infer<typeof SubmitReviewDeliveryRe
  */
 export const PostCommentDeliveryRequestSchema = z.object({
 	projectId: z.string().min(1),
+	repository: RunRepositorySchema,
 	prNumber: z.number().int().positive(),
 	body: z.string().min(1),
 	deliveryId: z.string().min(1),
@@ -1303,10 +1319,12 @@ export type AddBlockedByDeliveryResponse = z.infer<typeof AddBlockedByDeliveryRe
  * rather than a fact reported in the terminal result. The scheduler's own
  * deterministic dedup identity (project, PR, new head) absorbs a retry, so a
  * re-sent request cannot produce a second dispatch. The project is taken from the
- * **authenticated** worker enrollment, never from this body.
+ * **authenticated** worker enrollment, never from this body; the repository is the
+ * body's `repository`, checked against that project's own list (issue #1055).
  */
 export const FollowUpReviewDeliveryRequestSchema = z.object({
 	projectId: z.string().min(1),
+	repository: RunRepositorySchema,
 	prNumber: z.string().min(1),
 	prBranch: z.string().min(1),
 	/** The newly pushed commit SHA the follow-up Review must cover. */
@@ -1328,14 +1346,16 @@ export type FollowUpReviewDeliveryResponse = z.infer<typeof FollowUpReviewDelive
  * prior-submitted-verdict answer that makes a run a re-review (issue #328).
  *
  * The worker sends only the PR coordinates (and, when marking, the verdict it
- * submitted); the server derives the ledger key's `projectId`/`repository` from
- * the **authenticated** project, so a worker can never key a row to a project or
- * repository it isn't enrolled in. Carried by `POST /worker/delivery/review-ledger/*`
+ * submitted) plus the run's `repository`; the server takes the ledger key's
+ * `projectId` from the **authenticated** enrollment and accepts the repository only
+ * when that project owns it (issue #1055), so a worker can never key a row to a
+ * project it isn't enrolled in or a repository that project does not declare. Carried by `POST /worker/delivery/review-ledger/*`
  * (`../router/worker-delivery.ts`), same auth and `protocolVersion` handshake as
  * the delivery routes.
  */
 export const PriorReviewLedgerRequestSchema = z.object({
 	projectId: z.string().min(1),
+	repository: RunRepositorySchema,
 	prNumber: z.string().min(1),
 	/** The head being reviewed now — excluded from the lookup, so a same-head retry isn't a re-review. */
 	currentHeadSha: z.string().min(1),
@@ -1364,6 +1384,7 @@ export type PriorReviewLedgerResponse = z.infer<typeof PriorReviewLedgerResponse
 /** `POST /worker/delivery/review-ledger/mark` request body — the verdict this run submitted. */
 export const MarkReviewLedgerRequestSchema = z.object({
 	projectId: z.string().min(1),
+	repository: RunRepositorySchema,
 	prNumber: z.string().min(1),
 	headSha: z.string().min(1),
 	verdict: z.string().min(1),
@@ -1391,6 +1412,7 @@ export type MarkReviewLedgerResponse = z.infer<typeof MarkReviewLedgerResponseSc
 /** `POST /worker/delivery/review-ledger/abandon` request body — release a pending slot. */
 export const AbandonReviewLedgerRequestSchema = z.object({
 	projectId: z.string().min(1),
+	repository: RunRepositorySchema,
 	prNumber: z.string().min(1),
 	headSha: z.string().min(1),
 	protocolVersion: z.number().int(),

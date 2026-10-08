@@ -6,6 +6,8 @@ import { TRANSPORT_PROTOCOL_VERSION } from '@/transport/protocol.js';
 const CONTROL_PLANE = 'https://swarm.example';
 const CREDENTIAL = 'raw-worker-credential-secret';
 const PROJECT_ID = 'swarm';
+/** The run's repository — deliberately not the project's default entry (issue #1055). */
+const REPOSITORY = 'SmartTechBrewery/swarm-mobile';
 
 /** A local delegate whose every op records that it was called (source ops stay local). */
 function makeLocalDelegate(overrides: Partial<ScmDeliveryProvider> = {}): ScmDeliveryProvider {
@@ -33,6 +35,7 @@ describe('createTransportScmDeliveryProvider', () => {
 			controlPlaneUrl: CONTROL_PLANE,
 			workerCredential: CREDENTIAL,
 			projectId: PROJECT_ID,
+			repository: REPOSITORY,
 			persona: 'reviewer',
 			localDelegate: makeLocalDelegate(),
 			fetchImpl,
@@ -53,6 +56,7 @@ describe('createTransportScmDeliveryProvider', () => {
 		expect(init.headers.authorization).toBe(`Bearer ${CREDENTIAL}`);
 		expect(JSON.parse(init.body)).toEqual({
 			projectId: PROJECT_ID,
+			repository: REPOSITORY,
 			prNumber: 42,
 			verdict: 'approve',
 			body: 'Looks good',
@@ -67,6 +71,7 @@ describe('createTransportScmDeliveryProvider', () => {
 			controlPlaneUrl: CONTROL_PLANE,
 			workerCredential: CREDENTIAL,
 			projectId: PROJECT_ID,
+			repository: REPOSITORY,
 			persona: 'reviewer',
 			localDelegate: makeLocalDelegate(),
 			fetchImpl,
@@ -82,6 +87,7 @@ describe('createTransportScmDeliveryProvider', () => {
 		expect(fetchImpl.mock.calls[0][0]).toBe('https://swarm.example/worker/delivery/pr-comment');
 		expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toEqual({
 			projectId: PROJECT_ID,
+			repository: REPOSITORY,
 			prNumber: 42,
 			body: 'Addressed',
 			deliveryId: 'delivery-2',
@@ -96,6 +102,7 @@ describe('createTransportScmDeliveryProvider', () => {
 			controlPlaneUrl: CONTROL_PLANE,
 			workerCredential: CREDENTIAL,
 			projectId: PROJECT_ID,
+			repository: REPOSITORY,
 			persona: 'implementer',
 			localDelegate: makeLocalDelegate(),
 			fetchImpl,
@@ -114,6 +121,7 @@ describe('createTransportScmDeliveryProvider', () => {
 			controlPlaneUrl: 'https://swarm.example/',
 			workerCredential: CREDENTIAL,
 			projectId: PROJECT_ID,
+			repository: REPOSITORY,
 			persona: 'reviewer',
 			localDelegate: makeLocalDelegate(),
 			fetchImpl,
@@ -128,6 +136,7 @@ describe('createTransportScmDeliveryProvider', () => {
 			controlPlaneUrl: CONTROL_PLANE,
 			workerCredential: CREDENTIAL,
 			projectId: PROJECT_ID,
+			repository: REPOSITORY,
 			persona: 'reviewer',
 			localDelegate: makeLocalDelegate(),
 			fetchImpl,
@@ -143,6 +152,7 @@ describe('createTransportScmDeliveryProvider', () => {
 			controlPlaneUrl: CONTROL_PLANE,
 			workerCredential: CREDENTIAL,
 			projectId: PROJECT_ID,
+			repository: REPOSITORY,
 			persona: 'reviewer',
 			localDelegate: makeLocalDelegate(),
 			fetchImpl,
@@ -159,6 +169,7 @@ describe('createTransportScmDeliveryProvider', () => {
 			controlPlaneUrl: CONTROL_PLANE,
 			workerCredential: CREDENTIAL,
 			projectId: PROJECT_ID,
+			repository: REPOSITORY,
 			persona: 'reviewer',
 			localDelegate: local,
 			fetchImpl,

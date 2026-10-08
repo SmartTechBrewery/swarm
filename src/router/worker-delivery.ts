@@ -37,10 +37,11 @@
  * re-review signal (issue #328). A DB-free remote worker holds no `DATABASE_URL`,
  * so those three calls run here instead (`../transport/review-ledger-delivery.ts`
  * is the client). No credential is involved: what stays server-side is the
- * database. The worker sends only PR coordinates, and the ledger key's
- * `projectId`/`repository` are taken from the **authenticated** project — never
- * from the request — so a worker cannot key a row to a project or repository it
- * isn't enrolled in.
+ * database. The worker sends only PR coordinates and the run's repository; the
+ * ledger key's `projectId` is taken from the **authenticated** enrollment — never
+ * from the request — and the repository is accepted only when that project owns it
+ * (issue #1055), so a worker cannot key a row to a project it isn't enrolled in or
+ * a repository that project does not declare.
  *
  * The last route fronts neither a credential nor a table but the **dispatch store
  * and queue**: a `fixed` Respond-to-review response owes its newly pushed commit
@@ -48,7 +49,8 @@
  * (`../pipeline/follow-up-review.ts`) delivers by writing a dispatch row and
  * enqueueing a synthetic event. A DB-free worker can do neither, so it POSTs the
  * PR coordinates and this route performs that same enqueue — for the
- * **authenticated** project, never one named in the request.
+ * **authenticated** project, never one named in the request, and for the run's own
+ * repository of it (issue #1055).
  *
  * The five `pm/{find-comment,create-item,update-item,label,blocked-by}` routes are
  * the **Planning** phase's board surface (issue #536) — the split that creates
@@ -123,9 +125,10 @@
 
 import type { Context, Hono } from 'hono';
 
-import type { ProjectConfig } from '../config/schema.js';
+import { findProjectRepository, scopeProjectToRepository } from '../config/project-repository.js';
+import type { ProjectConfig, ProjectRecord } from '../config/schema.js';
 import { upsertCliQuota } from '../db/repositories/cliQuotasRepository.js';
-import { findProjectByIdFromDb } from '../db/repositories/projectsRepository.js';
+import { findProjectRecordByIdFromDb } from '../db/repositories/projectsRepository.js';
 import {
 	abandonReviewVerdict,
 	getPriorSubmittedReview,
@@ -189,7 +192,12 @@ import { advanceWorkerRollout } from './worker-rollout-advance.js';
  */
 export interface WorkerDeliveryDeps {
 	resolveWorkerByCredential: (rawCredential: string) => Promise<Worker | undefined>;
-	findProjectById: (id: string) => Promise<ProjectConfig | undefined>;
+	/**
+	 * The whole project **record** — its repository list included — so a run-scoped
+	 * route can scope to the repository the run is for (issue #1055) and a board route
+	 * to the default entry, from one read.
+	 */
+	findProjectRecordById: (id: string) => Promise<ProjectRecord | undefined>;
 	/** Whether `workerId` may deliver to `projectId` — a routable (active + consented) enrollment. */
 	isWorkerEnrolled: (workerId: string, projectId: string) => Promise<boolean>;
 	/** Build the server-side SCM delivery provider for a project + persona (resolves the PAT here). */
@@ -254,7 +262,7 @@ async function isWorkerEnrolledDefault(workerId: string, projectId: string): Pro
 function defaultDeps(): WorkerDeliveryDeps {
 	return {
 		resolveWorkerByCredential,
-		findProjectById: findProjectByIdFromDb,
+		findProjectRecordById: findProjectRecordByIdFromDb,
 		isWorkerEnrolled: isWorkerEnrolledDefault,
 		buildScmDelivery: (project, persona) =>
 			requireProjectSCMProvider(project).deliveryProvider(project, persona),
@@ -331,29 +339,90 @@ async function resolvePersonaDelivery(
 }
 
 /**
- * Authenticate a delivery request and resolve the project it targets — the
- * shared prelude both handlers run before touching a persona credential. Returns the
- * authenticated `{ worker, project }` on success, or a {@link DeliveryResult} to
+ * Authenticate a delivery request and resolve the project **record** it targets —
+ * the part of the prelude every project-scoped route shares. Returns the
+ * authenticated `{ worker, record }` on success, or a {@link DeliveryResult} to
  * return verbatim on any refusal. The credential is never reflected in a body.
+ */
+async function authenticateProject(
+	deps: WorkerDeliveryDeps,
+	credential: string | undefined,
+	projectId: string,
+): Promise<{ worker: Worker; record: ProjectRecord } | DeliveryResult> {
+	const worker = credential ? await deps.resolveWorkerByCredential(credential) : undefined;
+	if (!worker) return { status: 401, json: { authenticated: false } };
+
+	const record = await deps.findProjectRecordById(projectId);
+	if (!record) return { status: 404, json: { reason: 'unknown project' } };
+
+	// A valid worker credential is not enough: the worker must hold a routable
+	// enrollment in *this* project, so one worker can't deliver to a project it
+	// isn't enrolled in. Reuses the existing dispatch routability read model.
+	if (!(await deps.isWorkerEnrolled(worker.id, record.id)))
+		return { status: 403, json: { reason: 'worker is not enrolled in this project' } };
+
+	return { worker, record };
+}
+
+/**
+ * The prelude for a **board** route: the project scoped to its default (first)
+ * repository entry. The PM provider is project-wide and a card is routed to a
+ * repository at ingress (#686), so no board write depends on which entry this is.
  */
 async function authenticateDelivery(
 	deps: WorkerDeliveryDeps,
 	credential: string | undefined,
 	projectId: string,
 ): Promise<{ worker: Worker; project: ProjectConfig } | DeliveryResult> {
-	const worker = credential ? await deps.resolveWorkerByCredential(credential) : undefined;
-	if (!worker) return { status: 401, json: { authenticated: false } };
+	const authed = await authenticateProject(deps, credential, projectId);
+	if ('status' in authed) return authed;
+	return { worker: authed.worker, project: scopeProjectToRepository(authed.record) };
+}
 
-	const project = await deps.findProjectById(projectId);
-	if (!project) return { status: 404, json: { reason: 'unknown project' } };
+/**
+ * The prelude for a **run-scoped** route — review, PR comment, follow-up Review and
+ * the three ledger routes (issue #1055): the project scoped to the repository the
+ * run is for, as the request names it.
+ *
+ * Never falls back to the default entry. Acting there would land a review or comment
+ * on another repository's PR that happens to share the number, and key the ledger on
+ * a row the control plane never reserved — leaving the run's own slot unmarked. So a
+ * repository the project does not own is refused (403), and on a multi-repository
+ * project a request naming none — a worker predating #1055 — is refused with an
+ * "upgrade the worker" reason (400). A single-repository project with no repository
+ * named is today's behaviour. Neither refusal is a 404, which the worker's client
+ * rewrites as "route not served" and would discard this reason with. The check runs
+ * after enrollment, so an unenrolled worker learns nothing about the repositories.
+ */
+async function authenticateRunDelivery(
+	deps: WorkerDeliveryDeps,
+	credential: string | undefined,
+	projectId: string,
+	repository: string | undefined,
+): Promise<{ worker: Worker; project: ProjectConfig } | DeliveryResult> {
+	const authed = await authenticateProject(deps, credential, projectId);
+	if ('status' in authed) return authed;
+	const { worker, record } = authed;
 
-	// A valid worker credential is not enough: the worker must hold a routable
-	// enrollment in *this* project, so one worker can't deliver to a project it
-	// isn't enrolled in. Reuses the existing dispatch routability read model.
-	if (!(await deps.isWorkerEnrolled(worker.id, project.id)))
-		return { status: 403, json: { reason: 'worker is not enrolled in this project' } };
+	if (repository !== undefined) {
+		if (!findProjectRepository(record, repository))
+			return {
+				status: 403,
+				json: { reason: `project '${record.id}' does not own repository '${repository}'` },
+			};
+		return { worker, project: scopeProjectToRepository(record, repository) };
+	}
 
-	return { worker, project };
+	if (record.repositories.length > 1)
+		return {
+			status: 400,
+			json: {
+				reason:
+					`project '${record.id}' has ${record.repositories.length} repositories and this ` +
+					'request names none (issue #1055) — upgrade the worker',
+			},
+		};
+	return { worker, project: scopeProjectToRepository(record) };
 }
 
 /**
@@ -412,7 +481,12 @@ export async function handleSubmitReview(
 			},
 		};
 
-	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	const authed = await authenticateRunDelivery(
+		deps,
+		credential,
+		request.projectId,
+		request.repository,
+	);
 	if ('status' in authed) return authed;
 
 	// The reviewer PAT is resolved inside this process by `buildScmDelivery` and
@@ -464,7 +538,12 @@ export async function handlePostComment(
 			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
 		};
 
-	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	const authed = await authenticateRunDelivery(
+		deps,
+		credential,
+		request.projectId,
+		request.repository,
+	);
 	if ('status' in authed) return authed;
 
 	const delivery = await resolvePersonaDelivery(
@@ -884,11 +963,12 @@ export async function handleAddBlockedBy(
 /**
  * Schedule the one follow-up Review a `fixed` Respond-to-review response owes its
  * newly pushed commit (issue #241) — the dispatch row + queue enqueue a DB-free
- * worker cannot perform. Same prelude and contract as {@link handleMoveWorkItem};
+ * worker cannot perform. Same prelude and contract as {@link handleSubmitReview};
  * the project comes from the **authenticated** enrollment, never from the request,
- * so a worker cannot schedule a dispatch into a project it isn't enrolled in. The
- * scheduler's deterministic dispatch identity absorbs a retried call, so this
- * route is safe to re-send.
+ * so a worker cannot schedule a dispatch into a project it isn't enrolled in, and
+ * the repository is the run's own, checked against that project's list (issue
+ * #1055). The scheduler's deterministic dispatch identity absorbs a retried call,
+ * so this route is safe to re-send.
  */
 export async function handleScheduleFollowUpReview(
 	deps: WorkerDeliveryDeps,
@@ -905,7 +985,12 @@ export async function handleScheduleFollowUpReview(
 			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
 		};
 
-	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	const authed = await authenticateRunDelivery(
+		deps,
+		credential,
+		request.projectId,
+		request.repository,
+	);
 	if ('status' in authed) return authed;
 
 	await deps.scheduleFollowUpReview({
@@ -920,8 +1005,9 @@ export async function handleScheduleFollowUpReview(
 /**
  * Read the PR's prior submitted verdict from the ledger — the re-review signal
  * (issue #328) a DB-free worker cannot look up itself. Same prelude and contract
- * as {@link handleSubmitReview}; the ledger key's project and repository come from
- * the authenticated project, never from the request body. Returns
+ * as {@link handleSubmitReview}; the ledger key's project comes from the
+ * authenticated enrollment and its repository is the run's own, accepted only when
+ * that project owns it (issue #1055). Returns
  * `{ record: null }` when the PR has no earlier submitted verdict.
  */
 export async function handlePriorReview(
@@ -939,7 +1025,12 @@ export async function handlePriorReview(
 			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
 		};
 
-	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	const authed = await authenticateRunDelivery(
+		deps,
+		credential,
+		request.projectId,
+		request.repository,
+	);
 	if ('status' in authed) return authed;
 
 	const record = await deps.reviewLedger.getPriorSubmittedReview(
@@ -972,7 +1063,12 @@ export async function handleMarkReviewVerdict(
 			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
 		};
 
-	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	const authed = await authenticateRunDelivery(
+		deps,
+		credential,
+		request.projectId,
+		request.repository,
+	);
 	if ('status' in authed) return authed;
 
 	const slot = await deps.reviewLedger.markReviewVerdictSubmitted(
@@ -1007,7 +1103,12 @@ export async function handleAbandonReviewVerdict(
 			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
 		};
 
-	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	const authed = await authenticateRunDelivery(
+		deps,
+		credential,
+		request.projectId,
+		request.repository,
+	);
 	if ('status' in authed) return authed;
 
 	await deps.reviewLedger.abandonReviewVerdict({

@@ -202,7 +202,11 @@ must not hold goes up to the control plane's delivery API: Implementation's boar
 moves, comments and dependency lookup; Respond-to-review's card lookup and board
 moves; Review's submitted verdict under the reviewer PAT; and the two things
 backed by the control plane's database — Review's verdict-ledger reads/writes and
-the follow-up Review a pushed fix enqueues. Planning's board surface (its own
+the follow-up Review a pushed fix enqueues. Those run-scoped calls name the run's
+repository, so on a project owning several repositories they act on the one the
+run is for; a worker older than that (issue #1055) is refused on them with an
+"upgrade the worker" reason rather than acting on the project's first repository.
+Planning's board surface (its own
 blocker/dependent lookup for the dependency gate it has run since issue #889 —
 which rides the routes Implementation's already uses — plus creating a split's
 sibling cards, chaining their dependency edges, carrying the split item's own

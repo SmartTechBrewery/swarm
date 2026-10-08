@@ -23,7 +23,8 @@ function scheduler(fetchImpl: FetchLike) {
 }
 
 const INPUT = {
-	project: createMockProjectConfig(),
+	// The run's repository — deliberately not the project's default entry (#1055).
+	project: createMockProjectConfig({ repo: 'SmartTechBrewery/swarm-mobile' }),
 	prNumber: '42',
 	prBranch: 'issue-21',
 	headSha: 'newsha',
@@ -38,10 +39,12 @@ describe('createTransportFollowUpReviewScheduler', () => {
 		const [url, init] = fetchImpl.mock.calls[0];
 		expect(url).toBe('https://swarm.example/worker/delivery/follow-up-review');
 		expect(init.headers.authorization).toBe(`Bearer ${CREDENTIAL}`);
-		// The project object is deliberately not sent: the server resolves it from the
-		// authenticated enrollment, so a worker can't schedule into another project.
+		// Only the project's repository is sent: the server resolves the project from
+		// the authenticated enrollment, so a worker can't schedule into another
+		// project, and checks the repository against that project's list (#1055).
 		expect(JSON.parse(init.body)).toEqual({
 			projectId: PROJECT_ID,
+			repository: 'SmartTechBrewery/swarm-mobile',
 			prNumber: '42',
 			prBranch: 'issue-21',
 			headSha: 'newsha',

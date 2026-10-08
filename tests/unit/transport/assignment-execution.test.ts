@@ -667,8 +667,11 @@ describe('runAssignmentDbFree', () => {
 			urlSuffix: '/issues/17',
 			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
 		});
+		// The follow-up names the run's repository so it lands on that repository's PR
+		// rather than the project's default entry's (issue #1055).
 		expect(JSON.parse(fetchImpl.mock.calls[2][1].body)).toEqual({
 			projectId: PROJECT_ID,
+			repository: 'SmartTechBrewery/swarm',
 			prNumber: '99',
 			prBranch: 'issue-17',
 			headSha: 'fixsha',
@@ -959,6 +962,7 @@ describe('runAssignmentDbFree', () => {
 		expect(init.headers.authorization).toBe(`Bearer ${WORKER_CREDENTIAL}`);
 		expect(JSON.parse(init.body)).toEqual({
 			projectId: PROJECT_ID,
+			repository: 'SmartTechBrewery/swarm',
 			prNumber: 99,
 			verdict: 'approve',
 			body: 'LGTM',
@@ -1017,9 +1021,15 @@ describe('runAssignmentDbFree', () => {
 			`${CONTROL_PLANE}/worker/delivery/review-ledger/mark`,
 		]);
 		// The review-verdict cap and re-review signal keep working because the ledger is
-		// consulted, not skipped — only its storage moved server-side.
+		// consulted, not skipped — only its storage moved server-side. Both calls key
+		// on the run's repository, the one the control plane reserved the slot under
+		// (issue #1055).
+		expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toMatchObject({
+			repository: 'SmartTechBrewery/swarm',
+		});
 		expect(JSON.parse(fetchImpl.mock.calls[1][1].body)).toMatchObject({
 			projectId: PROJECT_ID,
+			repository: 'SmartTechBrewery/swarm',
 			prNumber: '99',
 			headSha: 'deadbeef',
 			verdict: 'request-changes',
