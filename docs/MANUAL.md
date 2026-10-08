@@ -453,8 +453,9 @@ itself to its last known good build looks like — issue #934), halts the rollou
 nothing further is drained or signalled, the reason is recorded and printed, and every
 machine it had not reached stays in the pool. A machine that was *already* being moved
 when the halt landed still finishes settling on the advances that follow, and goes back
-in the pool once it does; only the machine that **reported a failure** is deliberately
-left drained, so you can look at it. A halt is final — fix the build and start a new
+in the pool once it does; only the machine that **answered badly** — reported a
+failure, or came back on the old build — is deliberately left drained, so you can look
+at it, and the halt footer names the `swarm workers undrain` that ends that. A halt is final — fix the build and start a new
 rollout; there is no resume and no cancel. Only one rollout runs per operator at a
 time, so asking for a different ref mid-move is refused rather than silently
 re-targeting the fleet.
@@ -469,7 +470,8 @@ silence the control plane already calls a machine *probably gone* at, and the de
 lands on the next periodic advance, so you see it within about three minutes rather
 than losing the rest of the fleet to one dead laptop. Because the member settles
 `failed` without halting, a **`completed` rollout can carry failures** — the member
-table and the tally are where they are read.
+table and the tally are where they are read, and the line under them then names every
+machine that is not on the target instead of saying they all are.
 
 `swarm workers update --all` exits 0 whatever the table says, because it is a report
 rather than a pass/fail, and it is strictly owner-scoped: your own machines and
@@ -493,7 +495,7 @@ on a machine that reports `failed`/`refused`/`declined` or comes back on the bui
 was asked to leave, and giving up after two minutes on one that stops answering.
 **One thing differs, and it is the point: every machine it drained goes back in the
 dispatch pool when the rollout is finished with it — on a halt, and including the
-machine that reported a failure.** An
+machine that answered badly.** An
 administrator drained machines belonging to people who never asked for the update, so
 none of them is left out of the pool for somebody else to notice; the machine that
 failed is reported in the table rather than held out of service. Draining itself is

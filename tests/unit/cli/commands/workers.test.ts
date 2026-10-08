@@ -1760,6 +1760,66 @@ describe('swarm workers', () => {
 			expect(joined).not.toContain('it advances on its own');
 		});
 
+		// The other halt that leaves a machine drained (issue #934's self-return) carries
+		// the `applied` it reported rather than a failure outcome, so the undrain is keyed
+		// on "the rollout did not give up on it" and not on the outcome vocabulary.
+		it('names the undrain for a machine that came back on the build it was asked to leave', async () => {
+			fleet({
+				status: 'halted',
+				haltReason: "worker 'ada-laptop' applied 'main' and then came back on aaaaaaa",
+				members: [
+					{
+						workerId: WORKER_ID,
+						displayName: 'ada-laptop',
+						state: 'failed',
+						outcome: 'applied',
+						message: 'came back still on aaaaaaa, the build it was asked to move off',
+						abandoned: false,
+					},
+				],
+			});
+
+			expect(await run(['update', '--all', 'main'])).toBe(0);
+			expect(lines().join('\n')).toContain(
+				`left drained so you can look at it: swarm workers undrain ${WORKER_ID}`,
+			);
+		});
+
+		// A machine the rollout gave up on (issue #1064) is already back in the pool, so
+		// telling its owner to undrain it would send them after a machine nobody holds.
+		it('names no undrain for a machine the rollout gave up on', async () => {
+			fleet({
+				status: 'halted',
+				haltReason: "worker 'ada-desktop' reported failed: npm ci exited 1",
+				members: [
+					{
+						workerId: WORKER_ID,
+						displayName: 'ada-laptop',
+						state: 'failed',
+						outcome: 'applied',
+						message: 'applied the update and never came back within 2 minutes',
+						abandoned: true,
+					},
+					{
+						workerId: OTHER_WORKER_ID,
+						displayName: 'ada-desktop',
+						state: 'failed',
+						outcome: 'failed',
+						message: 'npm ci exited 1',
+						abandoned: false,
+					},
+				],
+			});
+
+			expect(await run(['update', '--all', 'main'])).toBe(0);
+
+			const joined = lines().join('\n');
+			expect(joined).toContain(
+				`left drained so you can look at it: swarm workers undrain ${OTHER_WORKER_ID}`,
+			);
+			expect(joined).not.toContain(`swarm workers undrain ${WORKER_ID}`);
+		});
+
 		it('says the fleet is done when the rollout completed', async () => {
 			fleet({
 				status: 'completed',
@@ -1767,7 +1827,36 @@ describe('swarm workers', () => {
 			});
 
 			expect(await run(['update', '--all', 'main'])).toBe(0);
-			expect(lines().join('\n')).toContain("every machine is on 'main'");
+			expect(lines().join('\n')).toContain(
+				"every machine is on 'main' and back in the dispatch pool",
+			);
+		});
+
+		// Since issue #1064 a rollout completes with a machine it gave up on, so the line
+		// under the table names it rather than contradicting the table.
+		it('names the machines a completed rollout did not move rather than claiming all of them', async () => {
+			fleet({
+				status: 'completed',
+				members: [
+					{ workerId: WORKER_ID, displayName: 'ada-laptop', state: 'done' },
+					{
+						workerId: OTHER_WORKER_ID,
+						displayName: 'ada-desktop',
+						state: 'failed',
+						outcome: 'applied',
+						message: 'applied the update and never came back within 2 minutes',
+						abandoned: true,
+					},
+				],
+			});
+
+			expect(await run(['update', '--all', 'main'])).toBe(0);
+
+			const joined = lines().join('\n');
+			expect(joined).not.toContain("every machine is on 'main'");
+			expect(joined).toContain("not every one is on 'main'");
+			expect(joined).toContain('ada-desktop (failed)');
+			expect(joined).not.toContain('ada-laptop (done)');
 		});
 
 		it('says so plainly when the caller owns no machines, and exits 0', async () => {

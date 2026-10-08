@@ -646,8 +646,8 @@ the build it was asked to leave, **halts** the rollout: nothing further is drain
 signalled, the reason is printed, and the machines it had not reached stay in the pool.
 Your machine may be in neither group — if it was already being moved when the halt
 landed, the rollout keeps settling it on the advances that follow, and it goes back in
-the pool once it settles without failing. The one that reported a failure is left
-drained so you can look at it. A halt is final — fix the build and start a new rollout.
+the pool once it settles without failing. The one that answered badly — reported a
+failure, or came back on the old build — is left drained so you can look at it. A halt is final — fix the build and start a new rollout.
 
 A machine that simply **stops answering** does not halt anything. After two minutes of
 silence the rollout gives up on that machine alone: it is recorded `failed` with the

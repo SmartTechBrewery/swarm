@@ -152,6 +152,15 @@ export interface RolloutMemberView extends WorkerUpdateRolloutMember {
 	 * resolves no users.
 	 */
 	ownerUserId: string | null;
+	/**
+	 * Whether the rollout **gave up on** this machine rather than heard it answer badly
+	 * ({@link abandonVerdict}, issue #1064). Both settle `failed`, but only an answer
+	 * can leave the machine drained — one the rollout gave up on was handed back to the
+	 * pool as it was abandoned — so a readout that names the undrain a failure needs
+	 * has to tell the two apart, and is told here rather than left to guess from the
+	 * outcome vocabulary.
+	 */
+	abandoned: boolean;
 }
 
 /** A rollout as the API surfaces answer it. */
@@ -436,6 +445,9 @@ const SILENT_MESSAGE =
 const NEVER_CAME_BACK_MESSAGE =
 	`applied the update and never came back within ${ABANDON_AFTER_MINUTES} minutes, so the ` +
 	'rollout gave up on it and carried on';
+
+/** The messages only {@link abandonVerdict} records — how a view tells a give-up from an answer. */
+const ABANDON_MESSAGES: ReadonlySet<string> = new Set([SILENT_MESSAGE, NEVER_CAME_BACK_MESSAGE]);
 
 /**
  * Give up on a member whose machine has stopped answering: settle it **`failed`** with
@@ -1183,7 +1195,19 @@ function withLabel(
 		...member,
 		displayName: worker?.displayName ?? member.workerId,
 		ownerUserId: worker?.ownerUserId ?? null,
+		abandoned: isAbandoned(member),
 	};
+}
+
+/**
+ * Whether a member was settled by {@link abandonVerdict}. Read off the message it
+ * wrote rather than a column of its own: the two messages are this module's own
+ * constants and nothing else writes either, so they already are the durable record of
+ * a give-up — and a member settled before issue #1064, under messages this build no
+ * longer writes, reads as answered, which is what those were.
+ */
+function isAbandoned(member: WorkerUpdateRolloutMember): boolean {
+	return member.state === 'failed' && ABANDON_MESSAGES.has(member.message ?? '');
 }
 
 function hasUniqueViolationCode(error: unknown): boolean {

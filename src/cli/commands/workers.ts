@@ -336,7 +336,7 @@ Usage:
              of the fleet. A machine the rollout had already committed to when a
              halt landed keeps being settled on the advances that follow and
              returns to the pool once it settles without failing; only the one that
-             reported a failure is left drained. A halted rollout is final — fix the
+             answered badly is left drained. A halted rollout is final — fix the
              build and start a new one; there is no resume and no cancel. --status prints
              the same table without advancing anything. One rollout at a time per
              operator: asking for a different ref while one is under way is refused
@@ -679,6 +679,12 @@ const RolloutMemberSchema = z.object({
 	state: z.string().min(1),
 	outcome: z.string().nullable().optional(),
 	message: z.string().nullable().optional(),
+	/**
+	 * The rollout gave up on this machine rather than heard it answer (issue #1064) —
+	 * optional so a control plane predating the flag reads every `failed` member as
+	 * answered, which is what its own `failed` members were.
+	 */
+	abandoned: z.boolean().optional(),
 });
 type RolloutMember = z.infer<typeof RolloutMemberSchema>;
 
@@ -727,16 +733,6 @@ const ROLLOUT_MEMBER_STATES = [
  * sentence, never invent it.
  */
 const COMMITTED_ROLLOUT_MEMBER_STATES = ['draining', 'signalled', 'verifying'];
-
-/**
- * The outcomes a machine itself reports to say the move did not happen
- * (`HALTING_WORKER_UPDATE_STATUSES`, `src/identity/worker-update-rollout.ts`), restated
- * here for the reason the two lists above are, and read for one sentence only: which
- * `failed` machines a halt leaves out of the dispatch pool (issue #1064). A machine the
- * rollout *gave up on* also settles `failed` and carries no such outcome — it was
- * returned to the pool as it was abandoned.
- */
-const REPORTED_FAILURE_OUTCOMES = ['failed', 'refused', 'declined'];
 
 const StoredScmCredentialSchema = z.object({ login: z.string().min(1) });
 const ProjectScmProviderSchema = z.object({ providerId: z.string().min(1) });
@@ -1868,7 +1864,7 @@ function printRollout(rollout: Rollout, action?: string): void {
 		return;
 	}
 	if (rollout.status === 'completed') {
-		out.info(`  every machine is on '${rollout.target}' and back in the dispatch pool`);
+		printCompletedFooter(rollout);
 		return;
 	}
 	// It advances itself (issue #941), so the line under the table says what will
@@ -1903,16 +1899,14 @@ function printHaltFooter(rollout: Rollout): void {
 			`  still settling ${machines} the rollout had already committed to; each returns to the pool once it settles without failing`,
 		);
 	}
-	// A machine that *reported* a failure is left out of the pool on purpose, so the
-	// undrain that ends that is named here rather than left to be remembered. Scoped to
-	// a reported outcome since issue #1064: a member the rollout gave up on settles
-	// `failed` too, and that one is already back in the pool — telling its owner to
-	// undrain it would send them after a machine nobody is holding. A failure this build
-	// cannot recognise as reported is simply not listed, on the same under-report-rather-
-	// than-invent rule {@link COMMITTED_ROLLOUT_MEMBER_STATES} is read with.
+	// A machine that *answered* badly — reported failed/refused/declined, or came back on
+	// the build it was asked to leave — is left out of the pool on purpose, so the
+	// undrain that ends that is named here rather than left to be remembered. A member
+	// the rollout gave up on settles `failed` too (issue #1064), but that one is already
+	// back in the pool, and telling its owner to undrain it would send them after a
+	// machine nobody is holding.
 	const failed = rollout.members.filter(
-		(member) =>
-			member.state === 'failed' && REPORTED_FAILURE_OUTCOMES.includes(member.outcome ?? ''),
+		(member) => member.state === 'failed' && member.abandoned !== true,
 	);
 	if (failed.length > 0) {
 		out.info(
@@ -1921,6 +1915,25 @@ function printHaltFooter(rollout: Rollout): void {
 				.join('; ')}`,
 		);
 	}
+}
+
+/**
+ * What a completed rollout leaves. "Every machine is on the target" only when every
+ * member settled `done`: since issue #1064 a rollout completes with a machine it gave up
+ * on, and a `skipped` one was never moved either, so the line names the machines that
+ * are not on the target rather than contradicting the table above it.
+ */
+function printCompletedFooter(rollout: Rollout): void {
+	const notMoved = rollout.members.filter((member) => member.state !== 'done');
+	if (notMoved.length === 0) {
+		out.info(`  every machine is on '${rollout.target}' and back in the dispatch pool`);
+		return;
+	}
+	out.info(
+		`  every machine settled, but not every one is on '${rollout.target}' — read the table for why: ${notMoved
+			.map((member) => `${member.displayName} (${member.state})`)
+			.join(', ')}`,
+	);
 }
 
 /** The rollout status in the words an operator reads it in, not the stored token. */

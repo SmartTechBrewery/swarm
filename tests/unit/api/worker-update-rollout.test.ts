@@ -806,6 +806,9 @@ describe('advanceRollout — a signalled machine that stops answering', () => {
 		expect(view?.members[0]).toMatchObject({
 			state: 'failed',
 			message: expect.stringContaining('2 minutes'),
+			// What tells a readout this `failed` was a give-up and not an answer, so it
+			// does not name an undrain for a machine already back in the pool.
+			abandoned: true,
 		});
 		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_A, false);
 	});
@@ -964,7 +967,13 @@ describe('advanceRollout — verifying that a machine came back on the new build
 
 		expect(view?.rollout.status).toBe('halted');
 		expect(view?.rollout.haltReason).toContain('aaaaaaa');
-		expect(view?.members[0].state).toBe('failed');
+		// An answer, not a give-up — still carrying the `applied` it reported — so a
+		// readout keeps naming the undrain for it (it stays drained in an owner scope).
+		expect(view?.members[0]).toMatchObject({
+			state: 'failed',
+			outcome: 'applied',
+			abandoned: false,
+		});
 	});
 
 	// The fixture reported `applied` half a minute ago, so the machine is still inside
@@ -994,6 +1003,9 @@ describe('advanceRollout — verifying that a machine came back on the new build
 		expect(view?.members[0]).toMatchObject({
 			state: 'failed',
 			message: expect.stringContaining('2 minutes'),
+			// What tells a readout this `failed` was a give-up and not an answer, so it
+			// does not name an undrain for a machine already back in the pool.
+			abandoned: true,
 		});
 		// Handed back to the dispatch pool, so a machine that comes back late is not
 		// stranded, and the next machine is drained and asked in the very same pass.
