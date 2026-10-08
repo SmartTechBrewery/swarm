@@ -71,6 +71,19 @@ describe('resolveWorkerCheckouts (issue #1058)', () => {
 		).rejects.toThrow(/\/checkouts\/mystery/);
 	});
 
+	// The primary checkout gets no exemption: `swarm workers add-checkout` mirrors this.
+	it('refuses an unidentifiable primary checkout beside another', async () => {
+		await expect(
+			resolveWorkerCheckouts(
+				['/checkouts/mystery', '/checkouts/swarm'],
+				slugResolver({
+					'/checkouts/mystery': undefined,
+					'/checkouts/swarm': 'smarttechbrewery/swarm',
+				}),
+			),
+		).rejects.toThrow(/\/checkouts\/mystery/);
+	});
+
 	// Today's behaviour (issue #687) and it stays: the daemon declares nothing and
 	// `assertRepoIdentity` is its guard at provision time.
 	it('allows a single unidentifiable checkout, which declares nothing', async () => {

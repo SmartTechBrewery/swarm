@@ -24,6 +24,12 @@
  * Only the operator CLI reads or writes this. The daemon deliberately does not:
  * its env contract is unchanged, and a remote machine (or a process supervisor)
  * still gets the credential from the line `register` prints.
+ *
+ * **A worker may hold more than one checkout** (issue #1059). The entry stays keyed
+ * to the worker's *primary* checkout — the one `register` ran in and `run:worker`
+ * is started from — and lists its other checkouts in `extraRepoRoots`, which
+ * `run:worker` appends to `SWARM_WORKER_REPO_ROOT`. An extra checkout has no entry
+ * of its own: it is not a second worker, and nothing is ever started from it.
  */
 
 import { chmodSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
@@ -43,6 +49,12 @@ export const WorkerCredentialCacheSchema = z.object({
 	/** The canonical checkout path, recorded for an operator reading an opaque `<sha256>` directory. */
 	repoRoot: z.string().min(1),
 	registeredAt: z.string().datetime(),
+	/**
+	 * The worker's other checkouts, canonical, in the order they are declared to the
+	 * daemon after the primary one. Absent means none, so an entry written before
+	 * issue #1059 still reads.
+	 */
+	extraRepoRoots: z.array(z.string().min(1)).optional(),
 });
 export type WorkerCredentialCache = z.infer<typeof WorkerCredentialCacheSchema>;
 
@@ -55,6 +67,8 @@ export interface WriteWorkerCredentialCacheInput {
 	repoRoot: string;
 	workerId: string;
 	credential: string;
+	/** The worker's other checkouts (issue #1059); omitted or empty for none. */
+	extraRepoRoots?: string[];
 	/** Injectable so tests never touch the real home directory or clock. */
 	homeDir?: string;
 	now?: () => number;
@@ -70,7 +84,58 @@ export interface WriteWorkerCredentialCacheInput {
  */
 export function writeWorkerCredentialCache(input: WriteWorkerCredentialCacheInput): string {
 	const now = input.now ?? Date.now;
-	const dir = checkoutStateDir(CACHE_KIND, input.repoRoot, input.homeDir);
+	const extraRepoRoots = (input.extraRepoRoots ?? []).map(canonicalCheckoutPath);
+	return writeRecord(
+		input.repoRoot,
+		{
+			workerId: input.workerId,
+			credential: input.credential,
+			// The same canonicalization the directory name is derived from, so the recorded
+			// path and the `<sha256>` it sits under can never disagree about which checkout
+			// this is.
+			repoRoot: canonicalCheckoutPath(input.repoRoot),
+			registeredAt: new Date(now()).toISOString(),
+			...(extraRepoRoots.length > 0 ? { extraRepoRoots } : {}),
+		},
+		input.homeDir,
+	);
+}
+
+/**
+ * Replace the extra checkouts of the worker cached for `repoRoot`, leaving its
+ * worker id, credential and registration time as they were (issue #1059) — what
+ * `swarm workers add-checkout` / `remove-checkout` write through.
+ *
+ * Answers like {@link readWorkerCredentialCache} when there is nothing to update:
+ * `null` for no entry, `undefined` for an unreadable one, and writes nothing in
+ * either case. Otherwise the updated record, written through the same temporary
+ * file and `rename` as a registration.
+ */
+export function updateWorkerCredentialCacheCheckouts(
+	repoRoot: string,
+	extraRepoRoots: string[],
+	homeDir?: string,
+): WorkerCredentialCache | null | undefined {
+	const cached = readWorkerCredentialCache(repoRoot, homeDir);
+	if (!cached) return cached;
+	const { extraRepoRoots: _previous, ...rest } = cached;
+	const extras = extraRepoRoots.map(canonicalCheckoutPath);
+	const record: WorkerCredentialCache = {
+		...rest,
+		...(extras.length > 0 ? { extraRepoRoots: extras } : {}),
+	};
+	// Keyed on the path that was read, so the file rewritten is the one just read.
+	writeRecord(repoRoot, record, homeDir);
+	return record;
+}
+
+/** Write one checkout's record owner-only, atomically, and return the path written. */
+function writeRecord(
+	repoRoot: string,
+	record: WorkerCredentialCache,
+	homeDir: string | undefined,
+): string {
+	const dir = checkoutStateDir(CACHE_KIND, repoRoot, homeDir);
 	const path = resolve(dir, CREDENTIAL_FILE);
 
 	// `~/.swarm/worker-credentials/` is created owner-only and then chmod'ed
@@ -82,15 +147,6 @@ export function writeWorkerCredentialCache(input: WriteWorkerCredentialCacheInpu
 	mkdirSync(dir, { recursive: true, mode: 0o700 });
 	chmodSync(dir, 0o700);
 
-	const record: WorkerCredentialCache = {
-		workerId: input.workerId,
-		credential: input.credential,
-		// The same canonicalization the directory name is derived from, so the recorded
-		// path and the `<sha256>` it sits under can never disagree about which checkout
-		// this is.
-		repoRoot: canonicalCheckoutPath(input.repoRoot),
-		registeredAt: new Date(now()).toISOString(),
-	};
 	const temp = `${path}.${process.pid}.tmp`;
 	writeFileSync(temp, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 });
 	renameSync(temp, path);

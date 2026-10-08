@@ -19,8 +19,11 @@ Usage:
   swarm-worker-agent update    [<checkout>]   update this SWARM install, restart its agents
 
 <checkout> is the repository checkout the worker was registered for, and defaults
-to the current directory. Each checkout gets its own agent, so a machine running
-workers for several repositories installs one per checkout.
+to the current directory. Each worker gets its own agent, so a machine running
+several workers installs one per worker checkout. A worker holding more than one
+checkout (`swarm workers add-checkout`) gets ONE agent, in its primary checkout --
+the one it was registered in -- which serves all of its checkouts; never install an
+agent in an extra checkout.
 
 `update` is the exception, and the reason is where the code lives: a worker runs the
 *SWARM installation's* build, not its checkout's, so one pull updates every daemon on

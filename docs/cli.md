@@ -257,6 +257,15 @@ For `npm run swarm -- run:worker`, npm exposes that directory through `INIT_CWD`
 the global `swarm run:worker` form uses its current directory. Both forms therefore
 select the same checkout you invoked them from.
 
+A worker serving **more than one repository** (issue #1059) is started the same
+way, from its **primary** checkout — the one it was registered in. Every extra
+checkout recorded with `workers register --extra-checkout` or
+[`workers add-checkout`](#swarm-workers) follows it in `SWARM_WORKER_REPO_ROOT`,
+`path.delimiter`-separated (`:` on macOS/Linux), and the start line names each one.
+An extra checkout has no cache entry of its own, so this command run *in* one
+gets the "no worker registered" refusal — start the worker from its primary
+checkout.
+
 This is an **additional** start path, not a replacement. It is for the case where
 the machine that registered the worker is the machine running it; for a remote
 machine, a process supervisor, or anything else, keep using `npm run dev:worker`
@@ -423,8 +432,10 @@ pair is a no-op; a handle already linked to a different user is rejected. Requir
 ### `swarm workers`
 
 ```bash
-swarm workers register <owner-identifier> --name <displayName> --cli <c1,c2,...>
-swarm workers register-and-enroll <owner-identifier> <project-id> --name <displayName> --cli <c1,c2,...> [--control-plane-url <url>] [--repo-root <path>]
+swarm workers register <owner-identifier> --name <displayName> --cli <c1,c2,...> [--extra-checkout <path>]...
+swarm workers register-and-enroll <owner-identifier> <project-id> --name <displayName> --cli <c1,c2,...> [--control-plane-url <url>] [--repo-root <path>] [--extra-checkout <path>]...
+swarm workers add-checkout <path>
+swarm workers remove-checkout <path>
 swarm workers list [<owner-identifier>]
 swarm workers set-cli <worker-id> (--cli <c1,c2,...> | --auto)
 swarm workers set-scm-credential <worker-id> <scm-provider-id>
@@ -444,7 +455,8 @@ swarm workers consent <worker-id> <project-id> <on|off>
 ```
 
 **Requires `SWARM_CONTROL_PLANE_URL` and a [`swarm login`](#swarm-login) session —
-and no `DATABASE_URL`** (issue #800). Every subcommand calls the control plane's
+and no `DATABASE_URL`** (issue #800). Every subcommand but `add-checkout` and
+`remove-checkout`, which are host-local (below), calls the control plane's
 operator API (`/operator/trpc/*`) over the network, exactly as the worker daemon
 calls the transport, so the whole group runs from the machine being onboarded
 rather than only from the control-plane host. An absent or expired session is one
@@ -542,6 +554,15 @@ unchanged.
   sets that at `/workers/<worker-id>` → **Operator source-control credential**, or
   with `set-scm-credential` below. `register` itself never
   asks for a token — the provider isn't known at registration time.
+  **`--extra-checkout <path>`** (repeatable, issue #1059) gives the worker a further
+  repository checkout on this machine, served by the same daemon. Each one is
+  checked before anything is registered: it must exist, be a git checkout whose
+  `origin` names a repository, differ (by realpath) from the primary checkout and
+  from every other one given, and be a checkout of a repository none of the others
+  is — the daemon would refuse two checkouts of one repository at startup. The
+  primary checkout's own `origin` must name a repository too: alone it may have
+  none, but beside another the daemon could not tell it apart and refuses to start.
+  It is recorded in the primary checkout's cache entry, which is how `run:worker` finds it.
 - **`register-and-enroll`** — the **recommended one-command path for a new machine**
   (issue #786): `register` + `set-scm-credential` + `enroll` in one invocation,
   ending with the exact command that starts the daemon. It composes those three and
@@ -601,7 +622,14 @@ unchanged.
   issue #800 is the normal case; `--repo-root` overrides it for onboarding somebody
   else's machine, whose checkout path this one cannot know. The credential cache
   uses that same resolved checkout; it offers `swarm run:worker` only when that
-  checkout exists on the machine running this command. Everything each step
+  checkout exists on the machine running this command. `--extra-checkout` is taken
+  and validated exactly as `register` takes it, before anything is written, and each
+  one follows the primary checkout in the printed
+  `SWARM_WORKER_REPO_ROOT=<primary>:<extra>…`. Because it is validated against the
+  checkouts themselves, it needs the primary checkout **and** every extra one on the
+  machine running this command: with a `--repo-root` that is not here, it is
+  refused, and the extra checkouts are listed after the primary one in
+  `SWARM_WORKER_REPO_ROOT` on the machine that holds them instead. Everything each step
   refuses is still refused, with nothing written before the refusal wherever
   that is possible: a bad `--cli`, an unknown or inaccessible project, a project whose `scm`
   resolves no provider, and an empty or aborted secret all fail **before** the worker
@@ -611,6 +639,23 @@ unchanged.
   `set-scm-credential` / `enroll` do. If a step after
   registration fails, the command prints what is left to run by hand *and* the worker
   credential once, since that value is otherwise unrecoverable.
+- **`add-checkout <path>`** — give an **existing** worker another repository
+  checkout on this machine (issue #1059), without re-registering it — which would
+  issue a new worker and lose its enrollments and stored operator credentials. Run
+  it in the worker's **primary** checkout (the one `run:worker` starts it from); a
+  directory with no worker registered gets the same "no worker registered for this
+  checkout" refusal `run:worker` gives. `<path>` is validated exactly as
+  `--extra-checkout` is (a relative one is read from where you are standing). It is
+  **host-local**: it edits only that checkout's credential-cache entry, needs no
+  session, and calls no control plane — checkout paths never leave the machine.
+  Restart the worker afterwards (`swarm run:worker`, or `swarm-worker-agent install`
+  / `update`); it declares the new repository at its next handshake, and the
+  dashboard's worker detail then lists it. Enroll the worker in that repository's
+  project as usual if it is not enrolled already.
+- **`remove-checkout <path>`** — drop one of those extra checkouts, from the
+  worker's primary checkout. The path need not still exist. The primary checkout
+  itself cannot be removed — that is `remove`. Host-local, and takes effect at the
+  next restart, exactly like `add-checkout`.
 - **`list`** — list workers (`<id>\t<displayName>\t<clis>` per line, with a trailing
   `draining` on a machine that has been taken out of the dispatch pool, and a trailing
   `unsupervised` on one whose daemon declared that nothing will start it again — so an
@@ -1008,7 +1053,7 @@ half-working.)
 | `swarm-api-agent restart` | `launchctl kickstart -k`, then wait for `/health`. For an `.env` change, a migration, or a wedged server — pulled *source* changes are already picked up by `dev:api`'s `--watch`. |
 | `swarm-api-agent reload [--all]` | Run [`npm run reload`](#services) (`--all`: `reload:all`) in the foreground, then restart and wait for `/health`. A failed migration or build stops the chain before the restart. Workers are still yours to restart (`swarm-worker-agent update`). |
 | `swarm-api-agent logs` | Tail this installation's stdout + stderr logs. |
-| `swarm-worker-agent install` | Write and start the worker's LaunchAgent for a registered worker checkout — a wrapper around [`swarm run:worker`](#swarm-runworker). Refuses while a worker is already running for that checkout. |
+| `swarm-worker-agent install` | Write and start the worker's LaunchAgent for a registered worker checkout — a wrapper around [`swarm run:worker`](#swarm-runworker). Refuses while a worker is already running for that checkout. One agent per **primary** checkout serves every checkout the worker holds (issue #1059); never install one in an extra checkout. |
 | `swarm-worker-agent uninstall` | Stop that agent and remove it (logs are kept). |
 | `swarm-worker-agent status` | Show whether that checkout's agent is loaded and running. |
 | `swarm-worker-agent logs` | Tail that checkout's worker logs. |

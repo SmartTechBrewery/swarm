@@ -68,12 +68,21 @@
  * exposure it already has in `.env`, and unlike an argument it never appears in
  * `ps` output.
  *
+ * **A worker holding several checkouts is still started from one** (issue #1059).
+ * The invocation directory is the worker's *primary* checkout, and every extra
+ * checkout `swarm workers register --extra-checkout` / `add-checkout` recorded in
+ * its cache entry follows it in `SWARM_WORKER_REPO_ROOT`, `path.delimiter`-
+ * separated — the list the daemon reads (`resolveWorkerRepoRoots`,
+ * `../../lib/env.ts`). An extra checkout has no cache entry of its own, so running
+ * this command in one gets the same "no worker registered" answer as any other
+ * unregistered directory.
+ *
  * A git *worktree* of a checkout has its own realpath and therefore its own key,
  * so it has no cache entry and gets the "no worker registered for this checkout"
  * message. That is correct: the daemon must run against the main checkout.
  */
 
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { canonicalCheckoutPath } from '../../worktree/checkout-key.js';
 import { runCommand } from '../_shared/exec.js';
@@ -95,6 +104,11 @@ daemon rather than parenting it, so under launchd or systemd the supervisor's ow
 job is the worker. Nothing is printed, and
 nothing has to be pasted: SWARM_WORKER_REPO_ROOT is the current directory and
 SWARM_WORKER_CREDENTIAL comes from the cache.
+
+A worker serving more than one repository is started the same way, from its
+primary checkout: every extra checkout recorded with \`swarm workers register
+--extra-checkout\` or \`swarm workers add-checkout\` is appended to
+SWARM_WORKER_REPO_ROOT after the current directory.
 
 It needs no DATABASE_URL — the daemon is DB-free and so is this launcher. The
 SWARM installation's own .env still supplies SWARM_CONTROL_PLANE_URL.
@@ -166,13 +180,18 @@ export async function run(argv: string[]): Promise<number> {
 		return 1;
 	}
 
-	// The worker id and the checkout, never the credential.
-	out.step(`starting worker '${cached.workerId}' for ${repoRoot}…`);
 	// `repoRoot` rather than `cached.repoRoot`: they agree by construction (both are
 	// the realpath the cache key was derived from), and the stored field is a
 	// human-readable record for an operator reading an opaque `<sha256>` directory,
-	// exactly as `CheckoutLockOwner.repoRoot` is.
-	const env = { SWARM_WORKER_REPO_ROOT: repoRoot, SWARM_WORKER_CREDENTIAL: cached.credential };
+	// exactly as `CheckoutLockOwner.repoRoot` is. The primary checkout leads, which is
+	// what makes it the primary one to the daemon.
+	const repoRoots = [repoRoot, ...(cached.extraRepoRoots ?? [])];
+	// The worker id and every checkout, never the credential.
+	out.step(`starting worker '${cached.workerId}' for ${repoRoots.join(', ')}…`);
+	const env = {
+		SWARM_WORKER_REPO_ROOT: repoRoots.join(delimiter),
+		SWARM_WORKER_CREDENTIAL: cached.credential,
+	};
 
 	// Become the daemon rather than parenting it, so a supervisor's job *is* the
 	// worker (see this module's header).

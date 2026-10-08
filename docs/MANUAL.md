@@ -157,6 +157,22 @@ The global `swarm run:worker` form uses its current directory; `npm run swarm --
 run:worker` uses npm's caller directory (`INIT_CWD`), so both forms select the
 checkout you invoked them from.
 
+**One worker can serve several repositories on one machine** (issue #1059) — one
+checkout per repository, one daemon. Give it the extra checkouts at registration
+with `--extra-checkout <path>` (repeatable, on `workers register` and
+`register-and-enroll`), or later, from the worker's primary checkout, with:
+
+```bash
+swarm workers add-checkout ~/code/example-mobile     # host-local; no control-plane call
+swarm workers remove-checkout ~/code/example-mobile
+```
+
+then restart it. `swarm run:worker` appends every recorded extra checkout to
+`SWARM_WORKER_REPO_ROOT`, and the daemon declares their repositories at its next
+handshake. Re-registering instead would issue a new worker and lose its enrollments
+and operator credentials. See
+[`docs/onboarding-worker.md`](./onboarding-worker.md#serving-a-second-repository).
+
 The operator's own source-control credential is **not** among them: it is stored
 server-side per `(worker, SCM provider)` — `swarm workers set-scm-credential
 <worker-id> <github|bitbucket|gitlab>`, or from that worker's own page in the
@@ -176,17 +192,18 @@ project-scoped reviewer PAT and the PM credential never leave the server — so 
 submitted review's identity is unchanged.
 
 **How it connects.** It performs the `/worker/session` handshake — declaring the
-CLIs it can run, the pipeline phases it can execute, and which repository its one
-local checkout actually is (read from that checkout's `origin`) — keeps its
+CLIs it can run, the pipeline phases it can execute, and which repositories its
+local checkouts actually are (read from each checkout's `origin`, primary first) — keeps its
 session live over the `/worker/stream` WebSocket, and reconnects with backoff
 (ADR-003 §1). Because it declares its phase repertoire, the control plane never
 routes a phase to a worker that cannot run it; the work waits for one that can.
 
-**How it guards the checkout.** An assignment for a repository this checkout is
-*not* is refused up front, naming both, rather than run. The daemon locks that
-checkout for its whole life, so a second worker pointed at the same path refuses
-to start instead of driving Git in the same repository (give a second worker on
-the machine its own checkout). The control plane polices the same pairing:
+**How it guards its checkouts.** An assignment runs in the checkout of its
+repository; one for a repository the worker holds no checkout of is refused up
+front, naming both, rather than run. The daemon locks every checkout it holds for
+its whole life, so a second worker pointed at any of the same paths refuses to
+start instead of driving Git in the same repository (give a second worker on the
+machine its own checkouts). The control plane polices the same pairing:
 enrolling a worker in a project that does not own its repository is refused, and
 an existing enrollment a reconnecting daemon's declaration contradicts is
 *suspended*, with the machine's checkout and every repository the project owns

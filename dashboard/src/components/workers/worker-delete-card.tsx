@@ -6,10 +6,11 @@ import { trpcClient } from '@/lib/trpc.js';
 
 /**
  * **Delete worker** (issue #789) — the retirement half of "a machine is paired with
- * one repository, for life". A worker's `SWARM_WORKER_REPO_ROOT` checkout binds it
- * to exactly one repository for its whole connected life, so re-pairing it is not a
- * thing that exists; freeing the operator up for a new machine/repository pairing is
- * deleting this one and registering a fresh worker.
+ * its checkouts". A worker's `SWARM_WORKER_REPO_ROOT` checkouts bind it to their
+ * repositories; since issue #1059 it may hold one per repository, and gains or drops
+ * one host-locally (`swarm workers add-checkout` / `remove-checkout`) rather than by
+ * re-registering. Retiring the machine — or freeing the operator up to register a
+ * fresh one in its place — is deleting this one.
  *
  * A self-contained owner-only card, the same shape as
  * `worker-operator-credentials-card.tsx` — worker-scoped state rendered by
@@ -61,9 +62,13 @@ export function WorkerDeleteCard({
 	return (
 		<div className="space-y-4">
 			<p className="text-sm text-zinc-400 leading-relaxed">
-				This machine works in one repository checkout, for as long as it is registered — a different
-				repository means a different worker. Delete it once its checkout is retired, or to free
-				yourself up to register a fresh machine for another repository.
+				This machine works in the repository checkouts it was given on its own host, for as long as
+				it is registered — a further repository is added there with{' '}
+				<code className="font-mono text-zinc-200 bg-zinc-950 px-1 py-0.5 rounded">
+					swarm workers add-checkout
+				</code>
+				, not by registering again. Delete it once its checkouts are retired, or to free yourself up
+				to register a fresh machine in their place.
 			</p>
 			<button
 				type="button"
