@@ -190,6 +190,48 @@ export function phaseRecoveryFromAssignment(intent: RecoveryIntent): PhaseRecove
 	};
 }
 
+/**
+ * The late `succeeded` result an orphaned attempt reported after the control plane
+ * had already given up on its worker (issue #1076), carried on the dispatch's own
+ * scheduled retry so `processJob` settles the run with it instead of running the
+ * phase again (`src/router/transport-loss-reaper.ts`).
+ *
+ * `result` is checked here only for what makes it an adoption — a `succeeded` frame
+ * for this dispatch, naming the phase and task it ran so `processJob` settles only
+ * that phase with it — and passed through otherwise: the full frame schema lives in
+ * `../transport/protocol.ts`, which imports this module, so the control plane
+ * re-parses it there before reading it. `selection` is the worker and target that
+ * attempt was pushed with, structurally the gate's `DispatchSelection`, so the run
+ * records the machine that actually ran the phase.
+ */
+export const AdoptedResultSchema = z.object({
+	result: z
+		.object({
+			type: z.literal('task-execution-result'),
+			dispatchId: z.string().uuid(),
+			status: z.literal('succeeded'),
+			phase: z.string().min(1),
+			taskId: z.string().min(1),
+		})
+		.passthrough(),
+	selection: z.object({
+		workerId: z.string().min(1),
+		workerName: z.string().min(1),
+		ownerUserId: z.string().min(1),
+		assignedUserId: z.string().min(1).optional(),
+		target: z.object({
+			cli: AgentCliSchema.optional(),
+			model: z.string().min(1).optional(),
+			reasoning: ReasoningLevelSchema.optional(),
+		}),
+		targetIndex: z.number().int().nonnegative(),
+		cli: AgentCliSchema,
+		skippedClis: z.array(AgentCliSchema),
+		pinnedToPreservedWorker: z.boolean().optional(),
+	}),
+});
+export type AdoptedResult = z.infer<typeof AdoptedResultSchema>;
+
 const jobBase = z.object({
 	/** The SWARM project (`ProjectConfig.id`) the event was matched to. */
 	projectId: z.string().min(1),
@@ -346,6 +388,14 @@ const jobBase = z.object({
 	 * router's degraded fallback when the dispatch table is unavailable.
 	 */
 	dispatchId: z.string().uuid().optional(),
+	/**
+	 * A late result this dispatch's orphaned attempt reported, adopted into its
+	 * scheduled automatic retry (issue #1076, {@link AdoptedResultSchema}). When set,
+	 * `processJob` neither gates, binds nor pushes: it settles the run with this
+	 * result through its ordinary success path. Never set by a webhook, and dropped
+	 * by a manual Retry now or Reset, which start the phase afresh.
+	 */
+	adoptedResult: AdoptedResultSchema.optional(),
 });
 
 /** A normalized SCM webhook event (a pull request, a review, checks, …) bound for the worker. */

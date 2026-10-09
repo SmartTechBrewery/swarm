@@ -5019,6 +5019,145 @@ describe('processJob', () => {
 
 			expect(outcome.status).toBe('phase-failed');
 		});
+
+		// Issue #1076: the orphan is trusted to finish only while its retry waits, and a
+		// claimed retry can no longer adopt its result — so the control plane is told at
+		// the claim, before the gate or the task claim can defer the retry unpushed.
+		it('reports the claimed dispatch before anything can defer it, and never a refused one', async () => {
+			transportLost();
+			listProjectDispatchCandidates.mockClear();
+			const onDispatchClaimed = vi.fn();
+
+			await processJob(
+				createMockScmWebhookJob({ automaticRetryAttempt: 1 }),
+				registryReturning(REVIEW_TRIGGER),
+				undefined,
+				undefined,
+				{ onDispatchClaimed, federatedOnly: true },
+			);
+			expect(onDispatchClaimed).toHaveBeenCalledExactlyOnceWith('dispatch-1');
+			expect(onDispatchClaimed.mock.invocationCallOrder[0]).toBeLessThan(
+				listProjectDispatchCandidates.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY,
+			);
+
+			onDispatchClaimed.mockClear();
+			claimDispatchForJob.mockResolvedValueOnce({ claimed: false, reason: 'terminal' });
+			await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(REVIEW_TRIGGER),
+				undefined,
+				undefined,
+				{ onDispatchClaimed },
+			);
+			expect(onDispatchClaimed).not.toHaveBeenCalled();
+		});
+	});
+
+	// Issue #1076: the orphaned attempt came back and reported a late success while its
+	// automatic retry still waited. The router adopted it into that retry, and the
+	// wake-up settles the run with it through the ordinary success tail.
+	describe('a dispatch carrying an adopted late result', () => {
+		const SELECTION = {
+			workerId: 'worker-karolina',
+			workerName: 'karolina_swarm',
+			ownerUserId: 'user-karolina',
+			target: { cli: 'claude' as const, model: 'opus' },
+			targetIndex: 0,
+			cli: 'claude' as const,
+			skippedClis: [],
+		};
+		const LATE_SUCCESS = {
+			type: 'task-execution-result' as const,
+			dispatchId: 'ee14c88f-1f88-4b64-a740-4c308ec011e5',
+			status: 'succeeded' as const,
+			phase: 'planning',
+			taskId: '568',
+			movedTo: 'todo',
+			advancedItemIds: ['ITEM_587'],
+		};
+
+		function adoptedJob(): SwarmJob {
+			return {
+				...createMockPmWebhookJob(),
+				runId: 'run-568',
+				resumePmPhase: 'planning',
+				automaticRetryAttempt: 1,
+				adoptedResult: { result: LATE_SUCCESS, selection: SELECTION },
+			};
+		}
+
+		it('settles the run succeeded with no gate, bind, slot or retry, and starts the next phases', async () => {
+			const workItem = createMockWorkItem({ id: 'ITEM_568', statusId: '3fe662f4' });
+			const trigger: TriggerResult = { phase: 'planning', taskId: '568', workItem };
+			// What the control-plane executor returns for an adopted result: the frame,
+			// adapted — nothing is pushed.
+			phaseImpl = async () => ({
+				agent: agentResult(),
+				movedTo: 'todo',
+				advancedItemIds: ['ITEM_587'],
+			});
+			listProjectDispatchCandidates.mockClear();
+			claimWorkerForDispatch.mockClear();
+			acquireProjectSlot.mockClear();
+			scheduleDispatchRetry.mockClear();
+			completeDispatch.mockClear();
+			resetRunBindings.length = 0;
+
+			const outcome = await processJob(
+				adoptedJob(),
+				registryReturning(trigger),
+				undefined,
+				undefined,
+				{ federatedOnly: true },
+			);
+
+			expect(outcome).toMatchObject({
+				status: 'phase-succeeded',
+				phase: 'planning',
+				taskId: '568',
+			});
+			// No gate, no bind, no slot: the phase already ran on the lost machine.
+			expect(listProjectDispatchCandidates).not.toHaveBeenCalled();
+			expect(claimWorkerForDispatch).not.toHaveBeenCalled();
+			expect(acquireProjectSlot).not.toHaveBeenCalled();
+			// The executor sees the carried result and the machine that produced it.
+			const context = phaseCalls.at(-1)?.context;
+			expect(context?.resolution.selection).toEqual(SELECTION);
+			expect(context?.job.adoptedResult?.result).toMatchObject({ status: 'succeeded' });
+			// The run row it carries is reused, recorded against that machine.
+			expect(resetRunToRunning).toHaveBeenCalledWith('run-568', expect.anything(), undefined);
+			expect(resetRunBindings.at(-1)).toMatchObject({
+				workerId: 'worker-karolina',
+				workerUserId: 'user-karolina',
+			});
+			expect(completeRun).toHaveBeenLastCalledWith(
+				'run-568',
+				expect.objectContaining({ status: 'completed' }),
+			);
+			expect(completeDispatch).toHaveBeenCalledWith('dispatch-1', 'phase-succeeded');
+			expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+			// #568 and its split child #587 each get their Implementation dispatch.
+			const itemIds = createAndPublishDispatch.mock.calls.map(
+				([input]) =>
+					(input as { jobPayload: { event: { itemId: string } } }).jobPayload.event.itemId,
+			);
+			expect(itemIds).toEqual(['ITEM_568', 'ITEM_587']);
+		});
+
+		// The trigger is re-resolved from the stored event, so live state can send the
+		// retry down another phase than the one the lost worker ran. That one is run,
+		// never settled with the other phase's success.
+		it('drops the adopted result and runs the phase when the trigger re-resolves elsewhere', async () => {
+			const workItem = createMockWorkItem({ id: 'ITEM_568', statusId: '3fe662f4' });
+			const trigger: TriggerResult = { phase: 'implementation', taskId: '568', workItem };
+			phaseImpl = async () => ({ agent: agentResult() });
+
+			await processJob(adoptedJob(), registryReturning(trigger));
+
+			const context = phaseCalls.at(-1)?.context;
+			expect(context?.job.adoptedResult).toBeUndefined();
+			expect(context?.resolution.selection).not.toEqual(SELECTION);
+		});
 	});
 
 	// Issue #1019: the PR+SHA dispatch claim is taken before a Review starts and used

@@ -47,6 +47,7 @@ import {
 	FailureDiagnosisCallout,
 	ForceReReviewButton,
 	GitHubReferences,
+	LateResultAcceptedNote,
 	PreservedWorkerCallout,
 	RecoverRunButton,
 	RecoveryCallout,
@@ -496,6 +497,40 @@ function makeRecoveryRun(recovery: RunRow['recovery'], overrides: Partial<RunRow
 // The preserved-checkout pin's operator surface (issue #567). A pinned run waits
 // with no timeout, so this callout is the only thing separating "waiting for
 // m3_pro_tp" from "wedged" — its presence on the page is the thing worth pinning.
+// A run settled with its lost worker's late result (issue #1076) has to say so, or a
+// stream ending in "the transport never returned" followed by `completed` reads as a
+// contradiction.
+describe('LateResultAcceptedNote (issue #1076)', () => {
+	it('renders nothing for a run not settled with a late result', () => {
+		const { container } = render(<LateResultAcceptedNote run={makeReviewRun()} />);
+		expect(container.firstChild).toBeNull();
+	});
+
+	it('names the worker whose late result settled the run', () => {
+		render(
+			<LateResultAcceptedNote
+				run={makeReviewRun({
+					status: 'completed',
+					lateResultAccepted: { workerId: 'w-1', workerName: 'm3_pro_tp' },
+				})}
+			/>,
+		);
+		expect(screen.getByText(/Settled with the late result of m3_pro_tp/)).toBeTruthy();
+	});
+
+	it('falls back to the worker id when its name did not resolve', () => {
+		render(
+			<LateResultAcceptedNote
+				run={makeReviewRun({
+					status: 'completed',
+					lateResultAccepted: { workerId: 'w-1', workerName: null },
+				})}
+			/>,
+		);
+		expect(screen.getByText(/Settled with the late result of w-1/)).toBeTruthy();
+	});
+});
+
 describe('PreservedWorkerCallout (issue #567)', () => {
 	const pinned = (
 		overrides: Partial<NonNullable<RunRow['preservedWorker']>> = {},

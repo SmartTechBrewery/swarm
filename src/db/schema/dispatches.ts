@@ -64,7 +64,9 @@ export const dispatches = pgTable(
 		 * ran on could not obtain the commit its checkout must be detached at — issue
 		 * #1018), `transport-lost` (the attempt's worker lost its transport and did not
 		 * return, so the run is retried automatically after its failure type's delay —
-		 * issue #1075), `recheck`, `worker-eligibility`,
+		 * issue #1075), `late-result` (that retry's lost attempt reported a late
+		 * success, which the dispatch now settles the run with — issue #1076),
+		 * `recheck`, `worker-eligibility`,
 		 * `worker-authorization`, `worker-rate-limited` (every candidate machine has
 		 * hit its usage limit on this phase's CLIs — issue #988),
 		 * `preserved-worker`, `task-in-flight` (a later phase

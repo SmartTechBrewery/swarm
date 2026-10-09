@@ -156,6 +156,7 @@ export const queuedWaitReasonSchema = z.enum([
 	'stalled',
 	'commit-unavailable',
 	'transport-lost',
+	'late-result',
 	'recheck',
 	'worker-eligibility',
 	'worker-authorization',
@@ -385,6 +386,17 @@ export interface RunPreservedWorker {
 	waiting: boolean;
 }
 
+/**
+ * Mirrors the server `RunLateResultAccepted` (`src/api/routers/runs.ts`, issue
+ * #1076): the machine whose late `succeeded` result settled this run after its
+ * transport had been lost, so the phase was not run again.
+ */
+export interface RunLateResultAccepted {
+	workerId: string;
+	/** Null when the worker row no longer resolves — fall back to the id. */
+	workerName: string | null;
+}
+
 export interface PendingRunRequest {
 	action: 'terminate' | 'restart';
 	/** ISO 8601 — when the request was recorded; null when only the bare marker exists. */
@@ -586,6 +598,8 @@ export interface RunRow {
 		preservedWorkerId?: string | null;
 		/** The machine whose preserved checkout a "Reset & restart" discarded (issue #567). */
 		abandonedWorkerId?: string | null;
+		/** The machine whose late result settled this run (issue #1076). */
+		lateResultAcceptedFromWorkerId?: string | null;
 	} | null;
 	/**
 	 * Mirrors the server `RunPreservedWorker` (`src/api/routers/runs.ts`, issue
@@ -594,6 +608,11 @@ export interface RunRow {
 	 * only; null when the run records neither.
 	 */
 	preservedWorker?: RunPreservedWorker | null;
+	/**
+	 * The machine whose late result settled this run after its transport was lost
+	 * (issue #1076). Returned by `runs.getById` only; null for every other run.
+	 */
+	lateResultAccepted?: RunLateResultAccepted | null;
 	/**
 	 * Recorded cancellation origin (issue #308); null for a marker-only
 	 * (external/unknown) cancellation, a run never cancelled, and every

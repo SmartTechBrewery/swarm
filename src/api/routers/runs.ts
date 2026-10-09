@@ -676,6 +676,39 @@ export interface RunPreservedWorker {
 }
 
 /**
+ * The machine whose late `succeeded` result settled this run after its transport
+ * was lost (issue #1076) — the read side of `recovery.lateResultAcceptedFromWorkerId`,
+ * resolved to a display label like {@link RunPreservedWorker}.
+ */
+export interface RunLateResultAccepted {
+	workerId: string;
+	/** Null when the worker row no longer resolves — the UI then falls back to the id. */
+	workerName: string | null;
+}
+
+/**
+ * Resolve the run's recorded late-result machine, or `null` for every run that was
+ * not settled with a late result. A failed lookup degrades to a null name rather
+ * than failing the page.
+ */
+async function resolveRunLateResultAccepted(run: {
+	recovery: { lateResultAcceptedFromWorkerId?: string | null } | null;
+}): Promise<RunLateResultAccepted | null> {
+	const workerId = run.recovery?.lateResultAcceptedFromWorkerId ?? null;
+	if (!workerId) return null;
+	try {
+		const worker = await getWorker(workerId);
+		return { workerId, workerName: worker?.displayName ?? null };
+	} catch (error) {
+		logger.warn('runs.getById: late-result worker lookup failed; reporting the id without a name', {
+			workerId,
+			error: describeError(error),
+		});
+		return { workerId, workerName: null };
+	}
+}
+
+/**
  * Resolve the run's recorded preserved/abandoned machine into a display label, or
  * `null` when it records neither (every run that never preserved a checkout, and
  * every row written before issue #567).
@@ -1261,7 +1294,9 @@ export const runsRouter = router({
 	// checkout (issue #567), and `retryScheduled`, which tells a `deferred` run's
 	// callout whether its `nextRetryAt` is still backed by a dispatch (issue #1017).
 	// All five are looked up only after the access check, so a non-member never
-	// triggers an identity, project, or queue read.
+	// triggers an identity, project, or queue read. So is `lateResultAccepted`, naming
+	// the machine whose late result settled the run after its transport was lost
+	// (issue #1076).
 	getById: authedProcedure
 		.input(z.object({ id: z.string().min(1) }))
 		.query(async ({ ctx, input }) => {
@@ -1288,6 +1323,7 @@ export const runsRouter = router({
 				pendingRequest: await resolvePendingRunRequest(run),
 				preservedWorker: await resolveRunPreservedWorker(run),
 				retryScheduled: await resolveRetryScheduled(run),
+				lateResultAccepted: await resolveRunLateResultAccepted(run),
 				reviewCapSpent: resolveReviewCapSpent(run, reviewCapSlots),
 				reviewCapOverrideOutstanding: resolveReviewCapOverrideOutstanding(run, reviewCapSlots),
 			};

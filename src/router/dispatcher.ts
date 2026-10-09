@@ -89,8 +89,13 @@ import {
 import { QUEUE_NAME, recoveryIntentFromJob, type SwarmJob, SwarmJobSchema } from '../queue/jobs.js';
 import { DeliveryDeferredError } from '../scm/delivery.js';
 import { buildTaskAssignment, type TaskAssignmentPr } from '../transport/assignment.js';
-import type { TaskExecutionResult, TaskProgress } from '../transport/protocol.js';
+import {
+	type TaskExecutionResult,
+	TaskExecutionResultSchema,
+	type TaskProgress,
+} from '../transport/protocol.js';
 import { createTriggerRegistry, registerBuiltInTriggers } from '../triggers/index.js';
+import type { TriggerRegistry } from '../triggers/registry.js';
 import type { TriggerResult } from '../triggers/types.js';
 import {
 	type DispatchPhaseContext,
@@ -112,7 +117,16 @@ import { phaseAgentConfig } from '../worker/target-policy.js';
 import { BlockedRecoveryError, type BlockedRecoveryReason } from '../worktree/reclaim.js';
 import { composeSystemPrompt, resolveTargetBranch } from './assignment-composition.js';
 import { cancelRunOnWorker, subscribeDispatchCancellations } from './dispatch-cancellation.js';
-import { awaitDispatchResult, type TransportInterruptions } from './dispatch-results.js';
+import {
+	awaitDispatchResult,
+	awaitOrphanStopAnswer,
+	type TransportInterruptions,
+} from './dispatch-results.js';
+import {
+	endOrphanTrustAtClaim,
+	endOrphanTrustUnlessRetryPending,
+	stopOrphansOfDispatch,
+} from './transport-loss-reaper.js';
 import { isWorkerConnected, sendToWorker } from './worker-connections.js';
 import { pushPendingWorkerUpdate } from './worker-update-dispatch.js';
 
@@ -126,6 +140,14 @@ import { pushPendingWorkerUpdate } from './worker-update-dispatch.js';
  * the worker reconnects (the durable lease reconciler is the backstop either way).
  */
 const RESULT_WAIT_MARGIN_MS = 10 * 60 * 1000;
+
+/**
+ * How long a retry going back to the worker its earlier attempt was orphaned on waits
+ * for that worker to answer the attempt's stop (issue #1076). A connected worker
+ * answers as soon as the agent is aborted, or at once for a phase it no longer runs;
+ * one that stays silent this long defers the retry instead.
+ */
+const ORPHAN_STOP_ANSWER_TIMEOUT_MS = 2 * 60 * 1000;
 
 /** The default agent wall-clock timeout, resolved once (validates the env var at load). */
 const DEFAULT_PHASE_TIMEOUT_MS = resolveAgentTimeoutMs();
@@ -701,6 +723,12 @@ export async function resolveOperatorCredential(
  * this — run-row lifecycle, dispatch settle, self-enqueue, merge automation — is
  * `processJob`'s shared logic; this only performs the push/await and adapts the
  * result.
+ *
+ * Two additions serve the transport-loss recovery (issue #1076). A dispatch carrying
+ * an adopted late result pushes nothing: the phase already ran on the lost worker, so
+ * that result is adapted as if it had just arrived. And a push back to the worker an
+ * earlier attempt was orphaned on first waits for that worker to answer the stop the
+ * claim sent it, so the answer cannot settle the retry's own wait.
  */
 async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseRunResult> {
 	const { trigger, project, resolution, job, runId, signal, implementationUnplanned, dispatch } =
@@ -711,6 +739,20 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 		throw new AgentRunError('Control-plane dispatch reached execution with no selected worker', {
 			kind: 'aborted',
 		});
+	}
+	if (job.adoptedResult) {
+		logger.info('Settling a dispatch with the late result of its lost worker', {
+			projectId: project.id,
+			phase: trigger.phase,
+			taskId: trigger.taskId,
+			dispatchId: dispatch.id,
+			workerId: selection.workerId,
+		});
+		return adaptResultToPhaseRun(
+			TaskExecutionResultSchema.parse(job.adoptedResult.result),
+			selection,
+			'workItem' in trigger ? trigger.workItem : undefined,
+		);
 	}
 
 	const phaseConfig = phaseAgentConfig(project, trigger.phase, implementationUnplanned);
@@ -759,6 +801,27 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 		operatorCredential,
 	});
 
+	// The claim already stopped any earlier attempt this dispatch's worker was lost
+	// under (issue #1076). Going back to that same worker, the retry first waits for
+	// its answer to the stop: that frame carries this dispatch id from this worker, so
+	// once the registration below exists it would settle the new wait. A worker that
+	// stays silent defers the retry rather than risk it.
+	if (
+		!(await awaitOrphanStopAnswer(
+			dispatch.id,
+			selection.workerId,
+			ORPHAN_STOP_ANSWER_TIMEOUT_MS,
+			signal,
+		))
+	) {
+		throw new DeliveryDeferredError(
+			`Worker '${selection.workerName}' has not yet answered the stop of this dispatch's earlier attempt — deferring its retry`,
+		);
+	}
+	// Re-asserted at the push, before the registration: any orphan the claim left
+	// trusted loses its trust now.
+	stopOrphansOfDispatch(dispatch.id, selection.workerId);
+
 	// Register the result wait *before* pushing so a fast worker's ack/progress/
 	// result can't race ahead of the registration.
 	const awaiting = awaitDispatchResult(
@@ -767,7 +830,15 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 		// one back-channel frame that writes durably (`stream-log`), and — since issue
 		// #724 — what a pushed `task-cancel` states so the worker can answer one it
 		// cannot apply with a terminal result naming this phase and task.
-		{ workerId: selection.workerId, runId, phase: trigger.phase, taskId: trigger.taskId },
+		// The selection rides along so a late result from this worker, should its
+		// transport be lost, can be settled as the run it actually ran (issue #1076).
+		{
+			workerId: selection.workerId,
+			runId,
+			phase: trigger.phase,
+			taskId: trigger.taskId,
+			selection,
+		},
 		{
 			onProgress: (progress: TaskProgress) => {
 				if (progress.state === 'branch-provisioned') {
@@ -833,7 +904,8 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
  * durably (no local executor), the fenced claim binds the selected worker's
  * session, the phase runs by pushing an assignment rather than in-process, and a
  * `worker-update` dispatch (issue #972) hands its frame to the machine over the
- * very sockets this process holds.
+ * very sockets this process holds. The orphan fencing that brackets each claimed
+ * job (issue #1076) is added per job by {@link processControlPlaneJob}.
  */
 export function createControlPlaneDispatchDeps(): ProcessJobDeps {
 	return {
@@ -843,6 +915,34 @@ export function createControlPlaneDispatchDeps(): ProcessJobDeps {
 		executePhase: pushAndAwaitResult,
 		pushWorkerUpdate: pushPendingWorkerUpdate,
 	};
+}
+
+/**
+ * Run one wake-up through `processJob`, bracketing the dispatch it claims with the
+ * end of its orphans' trusted window (issue #1076): at the claim, every orphan is
+ * fenced and stopped ({@link endOrphanTrustAtClaim}); once the job is over, any orphan
+ * still trusted is stopped unless the dispatch is again waiting for a transport-lost
+ * retry ({@link endOrphanTrustUnlessRetryPending}). Keyed on the dispatch the job
+ * actually claimed, so a refused wake-up never ends a trust that is still owed.
+ */
+export async function processControlPlaneJob(
+	job: SwarmJob,
+	registry: TriggerRegistry,
+	shutdownSignal: AbortSignal,
+	deps: ProcessJobDeps,
+): Promise<JobOutcome> {
+	let claimedDispatchId: string | undefined;
+	try {
+		return await processJob(job, registry, shutdownSignal, undefined, {
+			...deps,
+			onDispatchClaimed: (dispatchId) => {
+				claimedDispatchId = dispatchId;
+				endOrphanTrustAtClaim(dispatchId);
+			},
+		});
+	} finally {
+		if (claimedDispatchId) await endOrphanTrustUnlessRetryPending(claimedDispatchId);
+	}
 }
 
 /** A running control-plane dispatch consumer — closed on router shutdown. */
@@ -903,11 +1003,10 @@ export async function startControlPlaneDispatch(options: {
 				}
 				return { status: 'no-trigger' } as const;
 			}
-			return await processJob(
+			return await processControlPlaneJob(
 				SwarmJobSchema.parse(job.data),
 				registry,
 				options.shutdownSignal,
-				undefined,
 				deps,
 			);
 		},

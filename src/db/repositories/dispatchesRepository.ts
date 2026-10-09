@@ -112,6 +112,12 @@ export type DispatchWaitReason =
 	 * (`runs.recovery.transportLostWorkerIds`).
 	 */
 	| 'transport-lost'
+	/**
+	 * The `transport-lost` retry's orphaned attempt came back and reported a late
+	 * success while the retry was still waiting (issue #1076), so the dispatch was
+	 * made due at once carrying that result, and runs only to settle the run with it.
+	 */
+	| 'late-result'
 	| 'recheck'
 	/**
 	 * No eligible worker could take the dispatch (issue #339's federated gate)
@@ -1023,6 +1029,47 @@ export async function reopenDispatchForManualRetry(
 			updatedAt: now,
 		})
 		.where(and(eq(dispatches.id, id), inArray(dispatches.state, [...WAITING_DISPATCH_STATES])))
+		.returning();
+	return rows[0] ?? null;
+}
+
+/**
+ * Make a `transport-lost` automatic retry due **now**, carrying the late result its
+ * orphaned attempt reported (issue #1076), so the wake-up settles the run with that
+ * result instead of running the phase again.
+ *
+ * Modelled on {@link reopenDispatchForManualRetry}, with a narrower compare-and-set:
+ * the row must still be the scheduled retry the reap left (`retry-scheduled` with
+ * wait reason `transport-lost`) at the wake sequence the caller read its payload at.
+ * Anything else has moved on — the retry was claimed, the operator pressed Retry now,
+ * or the dispatch was cancelled — and the caller drops the result: whichever got
+ * there first owns the dispatch. The attempt budget is left alone; this settles the
+ * attempt that already ran rather than starting a new one.
+ */
+export async function adoptLateResultIntoScheduledRetry(
+	id: string,
+	expectedWakeSeq: number,
+	jobPayload: SwarmJob,
+): Promise<DispatchRow | null> {
+	const now = new Date();
+	const rows = await getDb()
+		.update(dispatches)
+		.set({
+			state: 'pending',
+			jobPayload,
+			availableAt: now,
+			waitReason: 'late-result',
+			wakeSeq: sql`${dispatches.wakeSeq} + 1`,
+			updatedAt: now,
+		})
+		.where(
+			and(
+				eq(dispatches.id, id),
+				eq(dispatches.state, 'retry-scheduled'),
+				eq(dispatches.waitReason, 'transport-lost'),
+				eq(dispatches.wakeSeq, expectedWakeSeq),
+			),
+		)
 		.returning();
 	return rows[0] ?? null;
 }

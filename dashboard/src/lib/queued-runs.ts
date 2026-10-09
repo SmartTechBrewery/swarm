@@ -67,6 +67,9 @@ const QUEUED_WAIT_REASON_LABELS: Record<QueuedWaitReason, string> = {
 	// An automatic retry (issue #1075): the run's worker dropped off and never came
 	// back, so it is retried after its failure type's delay, preferably elsewhere.
 	'transport-lost': "retrying after the worker's connection was lost",
+	// The lost worker came back and reported a late success before that retry was
+	// due (issue #1076): the run is being settled with it, not run again.
+	'late-result': 'settling with the late result of the lost worker',
 	recheck: 'waiting for checks to settle',
 	// The two halves of the dispatch gate's wait, deliberately worded so an operator
 	// can tell them apart at a glance (issue #607): the first clears on its own once a

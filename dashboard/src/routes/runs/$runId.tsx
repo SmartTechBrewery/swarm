@@ -1324,6 +1324,28 @@ export function PreservedWorkerCallout({ run }: { run: RunRow }) {
 	);
 }
 
+/**
+ * One line saying this run was settled with the late result of the worker whose
+ * transport had been lost (issue #1076). Without it a run whose output ends in "the
+ * transport never returned" and then reads `completed` looks like a contradiction:
+ * the success is the original attempt's, reported when its worker came back, and the
+ * phase was not run again.
+ */
+export function LateResultAcceptedNote({ run }: { run: RunRow }) {
+	const accepted = run.lateResultAccepted;
+	if (!accepted) return null;
+	return (
+		<div className="p-3 bg-zinc-900/40 border border-zinc-800 rounded flex items-start gap-3">
+			<Info className="h-4 w-4 shrink-0 mt-0.5 text-zinc-400" />
+			<p className="text-xs text-zinc-300">
+				Settled with the late result of {accepted.workerName ?? accepted.workerId}: the worker came
+				back after its connection was lost and reported this phase succeeded before the automatic
+				retry was due, so the phase was not run again.
+			</p>
+		</div>
+	);
+}
+
 interface RecoveryCalloutProps {
 	run: RunRow;
 }
@@ -2236,6 +2258,7 @@ export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
 			<RunStatusCallout run={run} onResetSuccess={setResetReport} />
 
 			<PreservedWorkerCallout run={run} />
+			<LateResultAcceptedNote run={run} />
 			<CheckpointPanel run={run} />
 			<RecoveryCallout run={run} />
 			<ReviewCapCallout run={run} project={project} />

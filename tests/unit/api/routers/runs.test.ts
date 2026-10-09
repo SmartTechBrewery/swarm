@@ -1351,6 +1351,7 @@ describe('runsRouter', () => {
 				maxContinuations: null,
 				pendingRequest: null,
 				retryScheduled: null,
+				lateResultAccepted: null,
 				reviewCapSpent: null,
 				reviewCapOverrideOutstanding: null,
 			});
@@ -1682,6 +1683,37 @@ describe('runsRouter', () => {
 				expect(result.preservedWorker).toMatchObject({ waiting: false });
 			});
 
+			it('names the machine whose late result settled the run (issue #1076)', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({
+						id: 'run-1',
+						status: 'completed',
+						recovery: { lateResultAcceptedFromWorkerId: 'w-1' },
+					}),
+				);
+				vi.mocked(getWorker).mockResolvedValue({ id: 'w-1', displayName: 'm3_pro_tp' } as never);
+
+				const result = await caller.getById({ id: 'run-1' });
+
+				expect(result.lateResultAccepted).toEqual({ workerId: 'w-1', workerName: 'm3_pro_tp' });
+				expect(result.preservedWorker).toBeNull();
+			});
+
+			it('reports the late-result machine by id when its lookup fails', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({
+						id: 'run-1',
+						status: 'completed',
+						recovery: { lateResultAcceptedFromWorkerId: 'w-1' },
+					}),
+				);
+				vi.mocked(getWorker).mockRejectedValue(new Error('db unreachable'));
+
+				const result = await caller.getById({ id: 'run-1' });
+
+				expect(result.lateResultAccepted).toEqual({ workerId: 'w-1', workerName: null });
+			});
+
 			it('reports an abandoned machine as history, without consulting the queue', async () => {
 				vi.mocked(getRunByIdFromDb).mockResolvedValue(
 					makeRun({ id: 'run-1', status: 'completed', recovery: { abandonedWorkerId: 'w-1' } }),
@@ -1769,6 +1801,7 @@ describe('runsRouter', () => {
 					maxContinuations: null,
 					pendingRequest: null,
 					retryScheduled: null,
+					lateResultAccepted: null,
 					reviewCapSpent: null,
 					reviewCapOverrideOutstanding: null,
 				});
@@ -3872,6 +3905,7 @@ describe('runsRouter', () => {
 					maxContinuations: null,
 					pendingRequest: null,
 					retryScheduled: null,
+					lateResultAccepted: null,
 					reviewCapSpent: null,
 					reviewCapOverrideOutstanding: null,
 				});

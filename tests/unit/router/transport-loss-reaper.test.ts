@@ -14,6 +14,7 @@ import {
 import {
 	reapDispatchesIfTransportStaysLost,
 	stopOrphanedDispatchesOnReturn,
+	stopOrphansOfDispatch,
 	TRANSPORT_LOST_ORPHAN_REASON,
 } from '@/router/transport-loss-reaper.js';
 import { deregisterConnection, registerConnection } from '@/router/worker-connections.js';
@@ -284,12 +285,17 @@ describe('stopOrphanedDispatchesOnReturn (issue #1073)', () => {
 		vi.clearAllMocks();
 		vi.useFakeTimers();
 		// The reaps above leave their orphans behind (the registry is module state), so
-		// each case here starts from none, the way production forgets one: its answer.
-		answered();
+		// each case here starts from none: a retry back on the orphan's own worker
+		// forgets it, trusted or not.
+		stopOrphansOfDispatch(DISPATCH_ID, WORKER_ID);
 	});
 	afterEach(() => vi.useRealTimers());
 
-	/** The dispatch reaped: pushed here, dropped, never back inside the grace. */
+	/**
+	 * The dispatch reaped: pushed here, dropped, never back inside the grace — and then
+	 * taken over while the worker is still away (its retry pushed elsewhere, or its
+	 * budget spent), which is what ends the trusted window of issue #1076.
+	 */
 	async function reaped(): Promise<void> {
 		const awaiting = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
 		transportLost(WORKER_ID);
@@ -298,7 +304,26 @@ describe('stopOrphanedDispatchesOnReturn (issue #1073)', () => {
 			status: 'deferred',
 			failureKind: 'transport-lost',
 		});
+		stopOrphansOfDispatch(DISPATCH_ID);
 	}
+
+	it('does not stop a phase whose dispatch is still waiting for its automatic retry (issue #1076)', async () => {
+		const awaiting = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
+		transportLost(WORKER_ID);
+		await vi.advanceTimersByTimeAsync(GRACE_MS);
+		await awaiting.result;
+
+		const returned = fakeWs();
+		registerConnection(WORKER_ID, returned);
+		stopOrphanedDispatchesOnReturn(WORKER_ID);
+
+		expect(returned.send).not.toHaveBeenCalled();
+		expect(persistControlPlaneNote).not.toHaveBeenCalledWith(
+			RUN_ID,
+			TRANSPORT_RETURNED_AFTER_ORPHAN_NOTE,
+		);
+		deregisterConnection(WORKER_ID, returned);
+	});
 
 	/** The worker's answer to the stop: the frame that ends the orphan. */
 	function answered(): void {

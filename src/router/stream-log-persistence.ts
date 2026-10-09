@@ -148,6 +148,13 @@ export const TRANSPORT_LOST_ORPHAN_NOTE =
 	'Transport session to the worker never returned — this phase was terminated and the pull request, task and capacity it held were released. It is retried automatically, preferably on another worker, unless its automatic-retry budget is spent.';
 export const TRANSPORT_RETURNED_AFTER_ORPHAN_NOTE =
 	'The worker came back after this phase was terminated — it was told to stop the phase, and any board or review writes it still attempts are refused.';
+/**
+ * The run was settled with the late result its lost worker reported while the
+ * automatic retry was still waiting (issue #1076) — so the phase did not run again,
+ * and the run's success is the original attempt's.
+ */
+export const LATE_RESULT_ACCEPTED_NOTE =
+	'The worker came back and reported this phase succeeded before its automatic retry was due — the run is settled with that result, and the phase is not run again.';
 
 /**
  * Write one control-plane-authored line into a run's output stream. Unlike every
