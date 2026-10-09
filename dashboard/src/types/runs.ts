@@ -519,6 +519,14 @@ export interface RunRow {
 	/** Human-readable detail for `reviewMergeOutcome`; null alongside it. */
 	reviewMergeMessage: string | null;
 	/**
+	 * When this Review run's approval was superseded by the pull request's head
+	 * moving after the review (issue #1079) — so the pass spent no review-cap slot
+	 * and SWARM reviews the new head instead. Stored on the run row by the merge
+	 * dispatch (issue #1080), so the runs list carries it without a ledger read.
+	 * Null for every run that was not superseded, and for pre-existing rows.
+	 */
+	reviewSupersededAt: string | null;
+	/**
 	 * Whether this Review run's verdict is the last one SWARM will produce for its
 	 * pull request without operator action (issue #1038) — the review-verdict
 	 * allowance is spent, no operator grant is outstanding, and this run holds the
@@ -537,6 +545,16 @@ export interface RunRow {
 	 * terms.
 	 */
 	reviewCapOverrideOutstanding?: boolean | null;
+	/**
+	 * Which of the two review bounds stopped this run's pull request (issue #1080):
+	 * `verdict-cap` when every permitted counted verdict was submitted, or
+	 * `superseded-bound` when its head moved out from under too many approvals.
+	 * Resolved server-side from the same ledger read as `reviewCapSpent`, because
+	 * `REVIEW_VERDICT_CAP` and `REVIEW_SUPERSEDED_CAP` live in a DB-bound module this
+	 * bundle cannot import. Null while the pull request is not stopped as seen from
+	 * this run, and absent on the list read model.
+	 */
+	reviewCapStop?: 'verdict-cap' | 'superseded-bound' | null;
 	exitCode: number | null;
 	timedOut: boolean;
 	error: string | null;

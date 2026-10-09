@@ -912,6 +912,23 @@ worker's ledger transport are untouched — at the cost of two slots being able 
 share an ordinal, which is benign because both then resolve to the same Force
 re-review action.
 
+**Both facts are surfaced on the runs surface (issue #1080).** The same branch
+that stamps the ledger slot also stamps the Review run row
+(`runs.review_superseded_at`, `markReviewRunSuperseded`) — written after the
+ledger and whether or not the ledger stamp landed just now, so a retry after a
+crash between the two still reaches the run, and cleared by `resetRunToRunning`
+alongside `reviewVerdict`. Because it lives on the row, the runs list renders a
+superseded approval as **Approved · superseded** (a re-labelled verdict badge, not
+a new status) without a ledger read per row, and run detail adds a one-line note
+that the pass spent no review-cap slot. Which bound stopped a pull request is
+resolved by `runs.getById` as `reviewCapStop` (`verdict-cap` /
+`superseded-bound`) from the one ledger read `reviewCapSpent` already makes,
+through the ledger module's own `reviewCapBoundReached` rather than a re-count;
+the approval cap callout and Force re-review's confirmation copy name the
+superseded bound when that is the stop, and keep the verdict-cap wording
+otherwise. Force re-review's *availability* is unchanged, because one grant
+licenses one review past either bound.
+
 **A `merged` outcome also settles the split siblings this pull request absorbed
 (issue #959),** which is where the Review phase's fold-in declaration above is
 finally acted on. Right after `completeDispatch(…, 'merged')` — never before, and

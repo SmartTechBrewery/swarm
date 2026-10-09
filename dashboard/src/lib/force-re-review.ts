@@ -51,6 +51,12 @@ export interface ForceReReviewRunState {
 	 * scheduled but has not started. Read by {@link isForcedReviewPending} alone.
 	 */
 	reviewCapOverrideOutstanding?: boolean | null;
+	/**
+	 * Which bound stopped the pull request (issue #1080) — server-resolved from the
+	 * same ledger read. Changes no availability rule here: Force re-review licenses
+	 * one review past *either* bound, so it only selects copy.
+	 */
+	reviewCapStop?: 'verdict-cap' | 'superseded-bound' | null;
 }
 
 /**
@@ -200,8 +206,21 @@ export function forceReReviewConfirmMessage(prNumber?: string | null): string {
  * this force schedules no response at all, so promising one would misdescribe
  * what the operator is about to start.
  */
-export function forceReviewOfSupersededHeadConfirmMessage(prNumber?: string | null): string {
+export function forceReviewOfSupersededHeadConfirmMessage(
+	prNumber?: string | null,
+	stop?: ForceReReviewRunState['reviewCapStop'],
+): string {
 	const pr = prNumber ? `PR #${prNumber}` : 'this PR';
+	// Issue #1080: a pull request stopped because its head kept moving has review
+	// allowance left, so naming the review safety cap would misdescribe the bypass.
+	if (stop === 'superseded-bound') {
+		return (
+			`This bypasses SWARM's limit on re-reviewing a pull request whose head keeps moving, for ${pr}, ` +
+			"once: it grants one extra review slot and reviews the pull request's current head — the " +
+			'commit that superseded the one this run approved. Nothing already running is interrupted, and ' +
+			'unless that review leads to a merge, SWARM stops reviewing this pull request again.'
+		);
+	}
 	return (
 		`This bypasses SWARM's review safety cap for ${pr} once: it grants one extra review slot and ` +
 		"reviews the pull request's current head — the commit that superseded the one this run approved. " +

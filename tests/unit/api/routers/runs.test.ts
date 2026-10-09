@@ -194,6 +194,7 @@ import {
 import {
 	listActiveReviewSlotsForPullRequest,
 	type PullRequestReviewSlot,
+	REVIEW_SUPERSEDED_CAP,
 	REVIEW_VERDICT_CAP,
 } from '@/db/repositories/reviewVerdictsRepository.js';
 import {
@@ -285,6 +286,7 @@ function makeRun(overrides: Partial<RunRow> = {}): RunRow {
 		reviewMergeMessage: null,
 		reviewMergeAttempt: null,
 		reviewMergeApprovedHeadSha: null,
+		reviewSupersededAt: null,
 		exitCode: 0,
 		timedOut: false,
 		error: null,
@@ -1354,6 +1356,7 @@ describe('runsRouter', () => {
 				lateResultAccepted: null,
 				reviewCapSpent: null,
 				reviewCapOverrideOutstanding: null,
+				reviewCapStop: null,
 			});
 			expect(result.nextRetryAt).toEqual(nextRetryAt);
 			expect(getRunByIdFromDb).toHaveBeenCalledWith('run-1');
@@ -1804,6 +1807,7 @@ describe('runsRouter', () => {
 					lateResultAccepted: null,
 					reviewCapSpent: null,
 					reviewCapOverrideOutstanding: null,
+					reviewCapStop: null,
 				});
 			});
 		});
@@ -2163,6 +2167,7 @@ describe('runsRouter', () => {
 
 					await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
 						reviewCapOverrideOutstanding: null,
+						reviewCapStop: null,
 					});
 					expect(listActiveReviewSlotsForPullRequest).not.toHaveBeenCalled();
 				});
@@ -2175,6 +2180,100 @@ describe('runsRouter', () => {
 
 					await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
 						reviewCapOverrideOutstanding: null,
+						reviewCapStop: null,
+					});
+				});
+			});
+
+			/**
+			 * Issue #1080: which of the two bounds stopped the pull request, so the
+			 * callout tells "every verdict was spent" apart from "the head kept moving".
+			 */
+			describe('reviewCapStop', () => {
+				/** A pull request stopped by superseded approvals alone: no counted verdict spent. */
+				function supersededSlots(): PullRequestReviewSlot[] {
+					return Array.from({ length: REVIEW_SUPERSEDED_CAP }, (_, i) =>
+						slot({ ordinal: 1, headSha: `head-${i}`, superseded: true }),
+					);
+				}
+
+				it('is verdict-cap for a pull request stopped by counted verdicts', async () => {
+					vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', ...REVIEW_RUN }));
+					vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(spentSlots());
+
+					await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+						reviewCapSpent: true,
+						reviewCapStop: 'verdict-cap',
+					});
+					// Three facts, still one indexed read.
+					expect(listActiveReviewSlotsForPullRequest).toHaveBeenCalledTimes(1);
+				});
+
+				it('is superseded-bound for a pull request stopped by its head moving', async () => {
+					vi.mocked(getRunByIdFromDb).mockResolvedValue(
+						makeRun({ id: 'run-1', ...REVIEW_RUN, reviewOrdinal: 1 }),
+					);
+					vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(supersededSlots());
+
+					await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+						reviewCapSpent: true,
+						reviewCapStop: 'superseded-bound',
+					});
+					expect(listActiveReviewSlotsForPullRequest).toHaveBeenCalledTimes(1);
+				});
+
+				it('is null while the pull request still has allowance left', async () => {
+					vi.mocked(getRunByIdFromDb).mockResolvedValue(
+						makeRun({ id: 'run-1', ...REVIEW_RUN, reviewOrdinal: 1 }),
+					);
+					vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(
+						supersededSlots().slice(0, REVIEW_SUPERSEDED_CAP - 1),
+					);
+
+					await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+						reviewCapSpent: false,
+						reviewCapStop: null,
+					});
+				});
+
+				// The callout stays mounted through its own force (issue #1040), so the
+				// stop it names must survive the grant too.
+				it('keeps naming the bound while a forced review is outstanding', async () => {
+					const slots = supersededSlots();
+					slots[REVIEW_SUPERSEDED_CAP - 1] = {
+						...slots[REVIEW_SUPERSEDED_CAP - 1],
+						capOverrideGrantedAt: new Date(),
+					};
+					vi.mocked(getRunByIdFromDb).mockResolvedValue(
+						makeRun({ id: 'run-1', ...REVIEW_RUN, reviewOrdinal: 1 }),
+					);
+					vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(slots);
+
+					await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+						reviewCapOverrideOutstanding: true,
+						reviewCapStop: 'superseded-bound',
+					});
+				});
+
+				it('is null once the granted review is in flight', async () => {
+					vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', ...REVIEW_RUN }));
+					vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(
+						redeemedGrantSlots(true),
+					);
+
+					await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+						reviewCapStop: null,
+					});
+				});
+
+				it('is null for an earlier verdict on a capped pull request', async () => {
+					vi.mocked(getRunByIdFromDb).mockResolvedValue(
+						makeRun({ id: 'run-1', ...REVIEW_RUN, reviewOrdinal: 1 }),
+					);
+					vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(spentSlots());
+
+					await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+						reviewCapStop: null,
 					});
 				});
 			});
@@ -3909,6 +4008,7 @@ describe('runsRouter', () => {
 					lateResultAccepted: null,
 					reviewCapSpent: null,
 					reviewCapOverrideOutstanding: null,
+					reviewCapStop: null,
 				});
 			});
 		});

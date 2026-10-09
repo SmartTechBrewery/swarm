@@ -28,6 +28,8 @@ import {
 	isReviewAllowanceSpent,
 	listActiveReviewSlotsForPullRequest,
 	type PullRequestReviewSlot,
+	type ReviewCapBound,
+	reviewCapBoundReached,
 } from '../../db/repositories/reviewVerdictsRepository.js';
 import {
 	cancelDeferredRunInDb,
@@ -984,8 +986,9 @@ async function awaitsReviewRecheck(run: RunRow): Promise<boolean> {
  *
  * Resolved here rather than stored on the run, because the answer belongs to the
  * *pull request's* ledger and keeps changing after the run ends (a later grant, a
- * recovered slot). {@link readReviewCapSlots} makes the one indexed read it and
- * {@link resolveReviewCapOverrideOutstanding} share.
+ * recovered slot). {@link readReviewCapSlots} makes the one indexed read it,
+ * {@link resolveReviewCapOverrideOutstanding} and {@link resolveReviewCapStop}
+ * share.
  *
  * `null`, never `false`, when the question does not apply, so the dashboard can
  * tell "not a ledgered Review run" from "still has allowance left".
@@ -1064,6 +1067,30 @@ function resolveReviewCapOverrideOutstanding(
 		hasOutstandingCapOverride(slots) &&
 		!hasReviewInFlightAbove(slots, run.reviewOrdinal)
 	);
+}
+
+/**
+ * Which of the two review bounds stopped this run's pull request (issue #1080):
+ * `verdict-cap` when every permitted counted verdict was submitted, and
+ * `superseded-bound` when the head kept moving out from under its approvals —
+ * the same stop for very different reasons, so the run-detail callout names it.
+ *
+ * Answered on exactly the terms the cap callout is shown on — the union of
+ * {@link resolveReviewCapSpent} and {@link resolveReviewCapOverrideOutstanding},
+ * whatever an operator has since granted — so the callout keeps naming its stop
+ * through its own Force re-review. The bound itself is the ledger module's
+ * ({@link reviewCapBoundReached}), never re-counted here, and it reuses the same
+ * read as its siblings. `null` when the pull request is not stopped as seen from
+ * this run.
+ */
+function resolveReviewCapStop(
+	run: { reviewOrdinal: number | null },
+	slots: readonly PullRequestReviewSlot[] | null,
+): ReviewCapBound | null {
+	if (!slots) return null;
+	if (!isLastPermittedVerdict(slots, run.reviewOrdinal)) return null;
+	if (hasReviewInFlightAbove(slots, run.reviewOrdinal)) return null;
+	return reviewCapBoundReached(slots);
 }
 
 /**
@@ -1313,8 +1340,9 @@ export const runsRouter = router({
 				'contributor',
 				`Run with ID "${input.id}" not found`,
 			);
-			// One ledger read, two facts: the cap stop itself and the window in which an
-			// operator has already forced its continuation (issue #1040).
+			// One ledger read, three facts: the cap stop itself, the window in which an
+			// operator has already forced its continuation (issue #1040), and which of the
+			// two bounds made the stop (issue #1080).
 			const reviewCapSlots = await readReviewCapSlots(run);
 			return {
 				...run,
@@ -1326,6 +1354,7 @@ export const runsRouter = router({
 				lateResultAccepted: await resolveRunLateResultAccepted(run),
 				reviewCapSpent: resolveReviewCapSpent(run, reviewCapSlots),
 				reviewCapOverrideOutstanding: resolveReviewCapOverrideOutstanding(run, reviewCapSlots),
+				reviewCapStop: resolveReviewCapStop(run, reviewCapSlots),
 			};
 		}),
 

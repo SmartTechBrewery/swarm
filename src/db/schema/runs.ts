@@ -239,6 +239,19 @@ export const runs = pgTable(
 		 * retried Review re-submits) can't clobber a newer outcome.
 		 */
 		reviewMergeApprovedHeadSha: text('review_merge_approved_head_sha'),
+		/**
+		 * When this Review run's approval was superseded by the pull request's head
+		 * moving after the review (issue #1079) — most often a Resolve-conflicts
+		 * merge of a fast-moving base — so it spent no `REVIEW_VERDICT_CAP` slot and
+		 * counted against `REVIEW_SUPERSEDED_CAP` instead. The run-row copy of the
+		 * ledger's own `review_verdicts.superseded_at`, written by the same
+		 * merge-dispatch branch (`src/worker/merge-automation.ts`) so the runs list
+		 * can show it without a ledger read per row. Nullable: every run that was
+		 * not superseded, and every pre-existing row, leaves it null. Cleared on a
+		 * retry alongside `reviewVerdict` ({@link resetRunToRunning}), since a
+		 * re-running review has not (yet) been superseded.
+		 */
+		reviewSupersededAt: timestamp('review_superseded_at'),
 		exitCode: integer('exit_code'),
 		timedOut: boolean('timed_out').notNull().default(false),
 		error: text('error'),

@@ -35,6 +35,14 @@ interface RunStatusBadgeProps extends ComponentProps<'span'> {
 	 * (issue #242).
 	 */
 	reviewAutomationOutcome?: string | null;
+	/**
+	 * When this Review run's approval was superseded by the pull request's head
+	 * moving (issue #1080). Only takes effect alongside an `approve`
+	 * {@link reviewVerdict} on a completed Review run, which then reads as
+	 * approved-but-superseded rather than as an approval that counted toward the
+	 * review cap; null/absent keeps the plain verdict badge.
+	 */
+	reviewSupersededAt?: string | null;
 }
 
 interface BadgeConfig {
@@ -176,6 +184,25 @@ const MANUAL_INTERVENTION_CONFIG: BadgeConfig = {
 		'Final changes-requested verdict — SWARM stopped automatic re-review; this PR needs a human decision.',
 };
 
+/**
+ * An approval superseded by a head change (issue #1080): the review happened and
+ * passed, but the pull request's head moved before it could merge — usually
+ * SWARM's own conflict resolution — so it spent no review-cap slot and SWARM
+ * reviews the new head instead. Without this the runs list shows several
+ * identical "Approved" rows, some of which counted and some of which did not.
+ *
+ * Re-labelled rather than a new status, as {@link TIMED_OUT_RETRY_CONFIGS} does,
+ * and in the neutral zinc hue rather than the approval's green: it is no longer
+ * the pull request's standing verdict, and the label — not the hue — says why.
+ */
+const SUPERSEDED_APPROVAL_CONFIG: BadgeConfig = {
+	text: 'Approved · superseded',
+	classes: 'bg-zinc-500/10 text-zinc-400 border-zinc-500/20',
+	dotClass: 'bg-zinc-400',
+	title:
+		"Approved, but the pull request's head moved before it merged — this review did not spend a review-cap slot, and SWARM reviews the new head instead.",
+};
+
 /** Title-case a hyphenated verdict key for a label ('some-verdict' → 'Some verdict'). */
 function humanizeVerdict(verdict: string): string {
 	const spaced = verdict.replace(/-/g, ' ');
@@ -197,6 +224,7 @@ function resolveBadgeConfig(
 	phase: string | undefined,
 	reviewVerdict: string | null | undefined,
 	reviewAutomationOutcome: string | null | undefined,
+	reviewSupersededAt: string | null | undefined,
 ): BadgeConfig {
 	if (status === 'failed' && timedOut) return TIMED_OUT_CONFIG;
 	// A resumable wall-clock kill settles deferred/checkpointed, so the timeout
@@ -216,6 +244,7 @@ function resolveBadgeConfig(
 		) {
 			return MANUAL_INTERVENTION_CONFIG;
 		}
+		if (reviewVerdict === 'approve' && reviewSupersededAt) return SUPERSEDED_APPROVAL_CONFIG;
 		return REVIEW_VERDICT_CONFIGS[reviewVerdict] ?? verdictFallbackConfig(reviewVerdict);
 	}
 	return (
@@ -233,6 +262,7 @@ export function RunStatusBadge({
 	phase,
 	reviewVerdict,
 	reviewAutomationOutcome,
+	reviewSupersededAt,
 	className = '',
 	...props
 }: RunStatusBadgeProps) {
@@ -242,6 +272,7 @@ export function RunStatusBadge({
 		phase,
 		reviewVerdict,
 		reviewAutomationOutcome,
+		reviewSupersededAt,
 	);
 
 	return (

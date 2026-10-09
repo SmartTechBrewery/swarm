@@ -14,9 +14,12 @@ vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
 }));
 
 const updateReviewMergeOutcome = vi.fn(async (_runId: string, _input: unknown) => true);
+// The run-row copy of the superseded stamp (issue #1080), written beside the ledger's.
+const markReviewRunSuperseded = vi.fn(async (_runId: string) => true);
 vi.mock('@/db/repositories/runsRepository.js', () => ({
 	updateReviewMergeOutcome: (runId: string, input: unknown) =>
 		updateReviewMergeOutcome(runId, input),
+	markReviewRunSuperseded: (runId: string) => markReviewRunSuperseded(runId),
 }));
 
 // The review-verdict ledger's superseded stamp (issue #1079). Mocked for the same
@@ -161,6 +164,8 @@ beforeEach(() => {
 	settleAbsorbedChildren.mockResolvedValue([]);
 	markReviewVerdictSuperseded.mockClear();
 	markReviewVerdictSuperseded.mockResolvedValue(true);
+	markReviewRunSuperseded.mockClear();
+	markReviewRunSuperseded.mockResolvedValue(true);
 });
 
 /** The stale-base answer the merge capability gives for a head behind its base. */
@@ -1027,6 +1032,8 @@ describe('processMergeAutomationDispatch: superseded approvals', () => {
 			prNumber: '17',
 			headSha: 'deadbeef',
 		});
+		// The run row is stamped beside the ledger (issue #1080), keyed on the Review run.
+		expect(markReviewRunSuperseded).toHaveBeenCalledExactlyOnceWith('run-1');
 		// The settle itself is untouched — the stamp is bookkeeping beside it.
 		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
 		expect(outcome.result).toBe('not-eligible');
@@ -1041,6 +1048,7 @@ describe('processMergeAutomationDispatch: superseded approvals', () => {
 		});
 
 		expect(markReviewVerdictSuperseded).not.toHaveBeenCalled();
+		expect(markReviewRunSuperseded).not.toHaveBeenCalled();
 		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
 		expect(outcome.result).toBe('not-eligible');
 	});
@@ -1062,6 +1070,7 @@ describe('processMergeAutomationDispatch: superseded approvals', () => {
 			prNumber: '17',
 			headSha: 'deadbeef',
 		});
+		expect(markReviewRunSuperseded).toHaveBeenCalledExactlyOnceWith('run-1');
 		expect(outcome.result).toBe('not-eligible');
 	});
 
@@ -1083,6 +1092,7 @@ describe('processMergeAutomationDispatch: superseded approvals', () => {
 		});
 
 		expect(markReviewVerdictSuperseded).not.toHaveBeenCalled();
+		expect(markReviewRunSuperseded).not.toHaveBeenCalled();
 		expect(outcome.result).toBe('not-eligible');
 	});
 
@@ -1097,6 +1107,7 @@ describe('processMergeAutomationDispatch: superseded approvals', () => {
 		});
 
 		expect(markReviewVerdictSuperseded).not.toHaveBeenCalled();
+		expect(markReviewRunSuperseded).not.toHaveBeenCalled();
 	});
 
 	it.each([
@@ -1111,6 +1122,7 @@ describe('processMergeAutomationDispatch: superseded approvals', () => {
 		});
 
 		expect(markReviewVerdictSuperseded).not.toHaveBeenCalled();
+		expect(markReviewRunSuperseded).not.toHaveBeenCalled();
 	});
 
 	// The ledger slot stays where the review was, so a dispatch that advanced its
@@ -1162,9 +1174,13 @@ describe('processMergeAutomationDispatch: superseded approvals', () => {
 			},
 		],
 		['the ledger write throws', {}],
+		['the run-row write throws', {}],
 	])('settles identically when %s', async (label, capabilities) => {
 		if (label === 'the ledger write throws') {
 			markReviewVerdictSuperseded.mockRejectedValue(new Error('db down'));
+		}
+		if (label === 'the run-row write throws') {
+			markReviewRunSuperseded.mockRejectedValue(new Error('db down'));
 		}
 
 		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
@@ -1191,5 +1207,31 @@ describe('processMergeAutomationDispatch: superseded approvals', () => {
 		});
 
 		expect(outcome.result).toBe('not-eligible');
+	});
+
+	// A retry after a crash between the two writes finds the ledger already stamped;
+	// the run row must still be reached, or the dashboard never shows the stamp.
+	it('still stamps the run row when the ledger slot was already stamped', async () => {
+		markReviewVerdictSuperseded.mockResolvedValue(false);
+
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning({ status: 'not-eligible', message: 'head moved' }),
+			getPullRequest: prAtHead('pushed-head'),
+		});
+
+		expect(markReviewRunSuperseded).toHaveBeenCalledExactlyOnceWith('run-1');
+	});
+
+	// The ledger is the decision; the run row only mirrors it, so a ledger failure
+	// never leaves a run claiming a supersession the cap arithmetic does not know.
+	it('does not stamp the run row when the ledger write fails', async () => {
+		markReviewVerdictSuperseded.mockRejectedValue(new Error('db down'));
+
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning({ status: 'not-eligible', message: 'head moved' }),
+			getPullRequest: prAtHead('pushed-head'),
+		});
+
+		expect(markReviewRunSuperseded).not.toHaveBeenCalled();
 	});
 });

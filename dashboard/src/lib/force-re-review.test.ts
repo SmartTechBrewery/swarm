@@ -196,6 +196,16 @@ describe('canForceReviewOfSupersededHead (issue #1040)', () => {
 			canForceReviewOfSupersededHead(FORCED_REVIEW_PENDING, { review: { enabled: false } }),
 		).toBe(false);
 	});
+
+	// Issue #1080: which bound stopped the pull request selects copy only — a grant
+	// licenses one review past either bound, so the affordance is the same.
+	it.each([
+		'verdict-cap',
+		'superseded-bound',
+	] as const)('is offered identically for the %s stop', (reviewCapStop) => {
+		expect(canForceReviewOfSupersededHead({ ...CAP_SPENT_APPROVAL, reviewCapStop })).toBe(true);
+		expect(canForceReviewOfSupersededHead({ ...FORCED_REVIEW_PENDING, reviewCapStop })).toBe(true);
+	});
 });
 
 describe('forceReReviewButtonLabel', () => {
@@ -230,6 +240,23 @@ describe('forceReviewOfSupersededHeadConfirmMessage (issue #1040)', () => {
 
 	it('falls back to a neutral phrase when the PR number is unknown', () => {
 		expect(forceReviewOfSupersededHeadConfirmMessage(null)).toContain('this PR');
+	});
+
+	it('keeps the verdict-cap copy unchanged for that stop', () => {
+		expect(forceReviewOfSupersededHeadConfirmMessage('508', 'verdict-cap')).toBe(
+			forceReviewOfSupersededHeadConfirmMessage('508'),
+		);
+	});
+
+	// Issue #1080: a pull request stopped because its head kept moving still has
+	// verdict-cap room, so the copy names the bound it actually bypasses.
+	it('names the superseded bound, not the review safety cap, for that stop', () => {
+		const message = forceReviewOfSupersededHeadConfirmMessage('508', 'superseded-bound');
+		expect(message).toContain('PR #508');
+		expect(message).toMatch(/head keeps moving/);
+		expect(message).toMatch(/current head/i);
+		expect(message).not.toMatch(/review safety cap/);
+		expect(message).not.toMatch(/Respond-to-review/);
 	});
 });
 

@@ -743,6 +743,10 @@ export async function resetRunToRunning(
 			reviewMergeMessage: null,
 			reviewMergeAttempt: null,
 			reviewMergeApprovedHeadSha: null,
+			// Same for the superseded-approval stamp (issue #1079): a re-running review
+			// has not been superseded, and its fresh approval is the one the next merge
+			// dispatch judges.
+			reviewSupersededAt: null,
 			// `producedPrUrl` is deliberately *not* cleared (issue #398): the PR is a
 			// real external artifact that outlives the attempt, so a resumed
 			// Implementation retry re-reports the same URL and overwrites it, whereas
@@ -1455,6 +1459,24 @@ export async function updateReviewMergeOutcome(
 				),
 			),
 		)
+		.returning({ id: runs.id });
+	return rows.length > 0;
+}
+
+/**
+ * Stamp a Review run's approval as superseded by a head change (issue #1079) —
+ * the run-row copy of the ledger's `markReviewVerdictSuperseded`, written by the
+ * same merge-dispatch branch (`src/worker/merge-automation.ts`) so the runs list
+ * and run detail can tell a pass that spent no cap slot from one that did.
+ *
+ * Conditional on the row not already being stamped, so a merge retry or a
+ * reconciler re-import keeps the first instant. Returns whether a row changed.
+ */
+export async function markReviewRunSuperseded(runId: string): Promise<boolean> {
+	const rows = await getDb()
+		.update(runs)
+		.set({ reviewSupersededAt: new Date() })
+		.where(and(eq(runs.id, runId), isNull(runs.reviewSupersededAt)))
 		.returning({ id: runs.id });
 	return rows.length > 0;
 }

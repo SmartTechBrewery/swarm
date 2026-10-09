@@ -109,6 +109,7 @@ function makeCappedReviewRun(overrides: Partial<RunRow> = {}): RunRow {
 		reviewMergeMessage: null,
 		reviewMergeAttempt: null,
 		reviewMergeApprovedHeadSha: null,
+		reviewSupersededAt: null,
 		exitCode: 0,
 		timedOut: false,
 		error: null,
