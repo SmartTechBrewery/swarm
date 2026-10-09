@@ -1705,6 +1705,42 @@ export function ReviewCapCallout({ run, project }: ReviewCapCalloutProps) {
 	);
 }
 
+/** {@link CapSpentApprovalCallout}'s heading, by state and by the bound that made the stop. */
+function capSpentApprovalHeading(forcedReviewPending: boolean, supersededBound: boolean): string {
+	if (forcedReviewPending) return 'Forced review pending';
+	return supersededBound
+		? 'Manual action required: head superseded too many times'
+		: 'Manual action required';
+}
+
+/**
+ * {@link CapSpentApprovalCallout}'s body for a pull request stopped by
+ * `REVIEW_SUPERSEDED_CAP` rather than the verdict cap (issue #1080): the same stop,
+ * for the opposite reason — its approvals kept passing and the head kept moving —
+ * so it must not read as "the last verdict the cap allows".
+ */
+function SupersededBoundCopy({ forcedReviewPending }: { forcedReviewPending: boolean }) {
+	return forcedReviewPending ? (
+		<>
+			This pull request's head moved out from under too many of SWARM's approvals for it to keep
+			re-reviewing it, and the automatic merge did not go through. An operator has already forced
+			the continuation: the extra review slot is granted and waiting to be spent, so a review of the
+			pull request's current head is scheduled and has not started yet. Forcing again reports what
+			is already scheduled rather than starting a second one.
+		</>
+	) : (
+		<>
+			This pull request's head moved out from under too many of SWARM's approvals — most often
+			because its base kept moving and SWARM merged it in to resolve a conflict — so SWARM has
+			stopped re-reviewing it, even though the review safety cap itself still has room. The
+			automatic merge did not go through — see the merge result below for the provider's own reason.
+			SWARM will not dispatch another review for this pull request on its own, so it stays here
+			until a person acts. If that decision is to keep going, "Force re-review" reviews the pull
+			request's current head once.
+		</>
+	);
+}
+
 /**
  * Run-detail warning for the review-cap stop that leaves no run behind (issue
  * #1038): a completed Review run that **approved**, whose approval merge
@@ -1752,16 +1788,21 @@ export function CapSpentApprovalCallout({
 	// report is rendered inside it, and unmounting on success would hide the only
 	// confirmation the operator gets (and read as "resolved" while nothing has run).
 	const forcedReviewPending = isForcedReviewPending(run);
+	// Which bound made the stop (issue #1080). Anything but the superseded bound —
+	// including a server that does not report one — keeps the verdict-cap copy.
+	const supersededBound = run.reviewCapStop === 'superseded-bound';
 
 	return (
 		<div className="p-4 bg-red-950/20 border border-red-900/30 rounded flex items-start gap-3">
 			<AlertTriangle className="h-5 w-5 text-red-400 shrink-0 mt-0.5" />
 			<div>
 				<h3 className="text-xs font-semibold text-red-200">
-					{forcedReviewPending ? 'Forced review pending' : 'Manual action required'}
+					{capSpentApprovalHeading(forcedReviewPending, supersededBound)}
 				</h3>
 				<p className="text-xs text-red-400/80 mt-1">
-					{forcedReviewPending ? (
+					{supersededBound ? (
+						<SupersededBoundCopy forcedReviewPending={forcedReviewPending} />
+					) : forcedReviewPending ? (
 						<>
 							This approval was the last review verdict SWARM's review safety cap allows for this
 							pull request
@@ -1797,10 +1838,34 @@ export function CapSpentApprovalCallout({
 				{canForceReviewOfSupersededHead(run, project?.pipeline) && (
 					<ForceReReviewButton
 						run={run}
-						confirmMessage={forceReviewOfSupersededHeadConfirmMessage(run.prNumber)}
+						confirmMessage={forceReviewOfSupersededHeadConfirmMessage(
+							run.prNumber,
+							run.reviewCapStop,
+						)}
 					/>
 				)}
 			</div>
+		</div>
+	);
+}
+
+/**
+ * One line on a Review run whose approval was superseded by a head change (issue
+ * #1080), saying what its "Approved · superseded" badge means: the pass happened
+ * and passed, but it spent no review-cap slot. Without it, several identical
+ * approvals on one pull request read as several spent reviews.
+ */
+export function SupersededApprovalNote({ run }: { run: RunRow }) {
+	if (run.status !== 'completed' || run.phase !== 'review') return null;
+	if (run.reviewVerdict !== 'approve' || !run.reviewSupersededAt) return null;
+	return (
+		<div className="p-3 bg-zinc-900/40 border border-zinc-800 rounded flex items-start gap-3">
+			<Info className="h-4 w-4 shrink-0 mt-0.5 text-zinc-400" />
+			<p className="text-xs text-zinc-300">
+				This approval was superseded: the pull request's head moved after the review — most often
+				because SWARM merged a moving base in to resolve a conflict — so it could not merge as
+				approved. This pass did not spend a review-cap slot; the new head needs a review of its own.
+			</p>
 		</div>
 	);
 }
@@ -2236,6 +2301,7 @@ export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
 						phase={run.phase}
 						reviewVerdict={run.reviewVerdict}
 						reviewAutomationOutcome={run.reviewAutomationOutcome}
+						reviewSupersededAt={run.reviewSupersededAt}
 						className="text-sm px-3 py-1"
 					/>
 				</div>
@@ -2265,6 +2331,7 @@ export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
 			{/* Above the merge callout on purpose (issue #1038): the provider's own
 			    refusal message reads as the detail behind this one. */}
 			<CapSpentApprovalCallout run={run} project={project} />
+			<SupersededApprovalNote run={run} />
 			<ReviewMergeCallout run={run} />
 		</div>
 	);
@@ -2507,6 +2574,7 @@ function RunOverview({ run, project }: RunOverviewProps) {
 								phase={run.phase}
 								reviewVerdict={run.reviewVerdict}
 								reviewAutomationOutcome={run.reviewAutomationOutcome}
+								reviewSupersededAt={run.reviewSupersededAt}
 							/>
 						</span>
 					</div>

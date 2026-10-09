@@ -76,7 +76,10 @@ import {
 	scheduleDispatchRetry,
 } from '../db/repositories/dispatchesRepository.js';
 import { markReviewVerdictSuperseded } from '../db/repositories/reviewVerdictsRepository.js';
-import { updateReviewMergeOutcome } from '../db/repositories/runsRepository.js';
+import {
+	markReviewRunSuperseded,
+	updateReviewMergeOutcome,
+} from '../db/repositories/runsRepository.js';
 import { settleAbsorbedChildren } from '../dispatch/absorbed-child-settle.js';
 import { createAndPublishDispatch, publishDispatchWakeUp } from '../dispatch/dispatcher.js';
 import { requireProjectSCMProvider } from '../integrations/scm/registry.js';
@@ -752,6 +755,9 @@ async function reactToStaleBase(
  * possibly-advanced `approvedHeadSha` (issue #874), because the ledger slot
  * stays where the review was.
  *
+ * The Review run row is stamped too (`runs.review_superseded_at`, issue #1080),
+ * right after the ledger, so the dashboard can show which passes counted.
+ *
  * Best-effort throughout: a read or write failure is logged and the settle is
  * unchanged. The worst case is today's behaviour — the slot keeps counting and
  * the pull request needs an operator's Force re-review.
@@ -781,11 +787,17 @@ async function markApprovalSupersededByHeadChange(
 			prNumber: job.prNumber,
 			headSha: reviewedHeadSha,
 		});
+		// The run-row copy (issue #1080), so the runs list can tell this pass from one
+		// that spent a cap slot without a ledger read per row. Written whether or not
+		// the ledger stamp landed just now: a retry after a crash between the two
+		// writes finds the ledger already stamped, and must still reach the run row.
+		const runStamped = await markReviewRunSuperseded(job.reviewRunId);
 		const context = {
 			runId: job.reviewRunId,
 			prNumber: job.prNumber,
 			reviewedHeadSha,
 			currentHeadSha: details.headSha,
+			runStamped,
 		};
 		if (stamped) {
 			logger.info(

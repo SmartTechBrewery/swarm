@@ -1,0 +1,1 @@
+ALTER TABLE "runs" ADD COLUMN "review_superseded_at" timestamp;

@@ -125,12 +125,22 @@ function countsTowardSupersededCap(slot: CountableSlot): boolean {
 	return slot.state === 'submitted' && slot.superseded;
 }
 
-/** Whether either bound is reached — the shared core of the two cap decisions. */
+/**
+ * Which bound is reached, if either — the shared core of the two cap decisions.
+ * {@link REVIEW_VERDICT_CAP} is named first when both are, because counted
+ * verdicts are the stop the loop protection exists for.
+ */
+function reachedBound(slots: readonly CountableSlot[]): ReviewCapBound | null {
+	if (slots.filter(countsTowardVerdictCap).length >= REVIEW_VERDICT_CAP) return 'verdict-cap';
+	if (slots.filter(countsTowardSupersededCap).length >= REVIEW_SUPERSEDED_CAP) {
+		return 'superseded-bound';
+	}
+	return null;
+}
+
+/** Whether either bound is reached. */
 function reachesEitherBound(slots: readonly CountableSlot[]): boolean {
-	return (
-		slots.filter(countsTowardVerdictCap).length >= REVIEW_VERDICT_CAP ||
-		slots.filter(countsTowardSupersededCap).length >= REVIEW_SUPERSEDED_CAP
-	);
+	return reachedBound(slots) !== null;
 }
 
 /** The natural key identifying one PR's review slots (or one specific head's slot). */
@@ -283,16 +293,13 @@ export async function reserveReviewVerdict(
 		// creates the slot it pays for, so two racing reservations can never both
 		// redeem it. One grant licenses one reservation past *either* bound.
 		let capOverride = false;
-		if (reachesEitherBound(countable)) {
+		const bound = reachedBound(countable);
+		if (bound) {
 			const grant = active.find(
 				(row) => row.capOverrideGrantedAt !== null && row.capOverrideConsumedAt === null,
 			);
 			if (!grant) {
-				const reason: ReviewCapBound =
-					countable.filter(countsTowardVerdictCap).length >= REVIEW_VERDICT_CAP
-						? 'verdict-cap'
-						: 'superseded-bound';
-				return { status: 'capped', reason, ...(recovered ? { recovered } : {}) };
+				return { status: 'capped', reason: bound, ...(recovered ? { recovered } : {}) };
 			}
 			await tx
 				.update(reviewVerdicts)
@@ -764,6 +771,19 @@ export function hasSubmittedEveryPermittedVerdict(
 	slots: readonly PullRequestReviewSlot[],
 ): boolean {
 	return reachesEitherBound(slots);
+}
+
+/**
+ * Which bound {@link hasSubmittedEveryPermittedVerdict} found reached — the
+ * reader's copy of the `reason` a `capped` reservation reports (issue #1080), so
+ * the dashboard can say whether a pull request was stopped by counted verdicts
+ * or by a head that kept moving without the API layer re-counting slots. `null`
+ * exactly when that predicate is `false`.
+ */
+export function reviewCapBoundReached(
+	slots: readonly PullRequestReviewSlot[],
+): ReviewCapBound | null {
+	return reachedBound(slots);
 }
 
 /**

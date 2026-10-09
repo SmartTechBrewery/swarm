@@ -80,6 +80,55 @@ describe('RunStatusBadge', () => {
 		});
 	});
 
+	describe('a superseded approval (issue #1080)', () => {
+		it('reads as approved-but-superseded, with a title saying no cap slot was spent', () => {
+			render(
+				<RunStatusBadge
+					status="completed"
+					phase="review"
+					reviewVerdict="approve"
+					reviewSupersededAt="2026-01-01T00:10:00.000Z"
+				/>,
+			);
+			const badge = screen.getByText('Approved · superseded');
+			expect(badge.getAttribute('title')).toMatch(/did not spend a review-cap slot/);
+			expect(screen.queryByText('Approved')).toBeNull();
+		});
+
+		it('keeps the plain approval badge for an approval that counted', () => {
+			render(
+				<RunStatusBadge
+					status="completed"
+					phase="review"
+					reviewVerdict="approve"
+					reviewSupersededAt={null}
+				/>,
+			);
+			expect(screen.getByText('Approved')).not.toBeNull();
+		});
+
+		it('never relabels a non-approval, or a run that is not completed', () => {
+			const { rerender } = render(
+				<RunStatusBadge
+					status="completed"
+					phase="review"
+					reviewVerdict="request-changes"
+					reviewSupersededAt="2026-01-01T00:10:00.000Z"
+				/>,
+			);
+			expect(screen.getByText('Changes requested')).not.toBeNull();
+			rerender(
+				<RunStatusBadge
+					status="running"
+					phase="review"
+					reviewVerdict="approve"
+					reviewSupersededAt="2026-01-01T00:10:00.000Z"
+				/>,
+			);
+			expect(screen.getByText('Running')).not.toBeNull();
+		});
+	});
+
 	describe('checkpointed runs read distinctly from deferred (issues #503, #504)', () => {
 		it('renders a "Checkpointed" badge in its own hue, not the amber Deferred one', () => {
 			render(<RunStatusBadge status="checkpointed" phase="implementation" />);

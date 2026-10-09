@@ -95,6 +95,7 @@ export function RunsTable({
 									phase={run.phase}
 									reviewVerdict={run.reviewVerdict}
 									reviewAutomationOutcome={run.reviewAutomationOutcome}
+									reviewSupersededAt={run.reviewSupersededAt}
 									className="shrink-0"
 								/>
 							</div>
@@ -233,6 +234,7 @@ export function RunsTable({
 										phase={run.phase}
 										reviewVerdict={run.reviewVerdict}
 										reviewAutomationOutcome={run.reviewAutomationOutcome}
+										reviewSupersededAt={run.reviewSupersededAt}
 									/>
 								</td>
 								<td className="px-2 py-3 text-sm text-zinc-400">

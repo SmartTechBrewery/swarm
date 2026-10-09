@@ -37,6 +37,7 @@ import {
 	listRunsFromDb,
 	listTaskActivitySince,
 	MAX_RUN_OUTPUT_BYTES,
+	markReviewRunSuperseded,
 	markRunUserTerminated,
 	recordRunCleanupBlocked,
 	recordRunCommitUnavailableWorker,
@@ -583,6 +584,17 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			expect(row?.reviewMergeMessage).toBeNull();
 			expect(row?.reviewMergeAttempt).toBeNull();
 			expect(row?.reviewMergeApprovedHeadSha).toBeNull();
+		});
+
+		it('clears a prior superseded-approval stamp so a re-run review is not shown superseded (issue #1080)', async () => {
+			const id = await createRun({ projectId: PROJECT_ID, taskId: '9e1', phase: 'review' });
+			await completeRun(id, { status: 'completed', engine: 'claude', reviewVerdict: 'approve' });
+			await markReviewRunSuperseded(id);
+
+			await resetRunToRunning(id);
+
+			const row = await getRunByIdFromDb(id);
+			expect(row?.reviewSupersededAt).toBeNull();
 		});
 
 		it('clears a prior cancellation origin so a retried run never shows a stale one (issue #308)', async () => {
@@ -2576,6 +2588,24 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			await createRun({ projectId: PROJECT_ID, taskId: '85', phase: 'review' });
 			expect(await hasLiveRunForTask(PROJECT_ID, '86')).toBe(false);
 			expect(await hasLiveRunForTask('proj-other', '85')).toBe(false);
+		});
+	});
+
+	describe('markReviewRunSuperseded (issue #1080)', () => {
+		it('stamps the run once and keeps the first instant across a repeat', async () => {
+			const id = await createRun({ projectId: PROJECT_ID, taskId: '8f', phase: 'review' });
+			await completeRun(id, { status: 'completed', engine: 'claude', reviewVerdict: 'approve' });
+
+			expect(await markReviewRunSuperseded(id)).toBe(true);
+			const first = (await getRunByIdFromDb(id))?.reviewSupersededAt;
+			expect(first).toBeInstanceOf(Date);
+
+			expect(await markReviewRunSuperseded(id)).toBe(false);
+			expect((await getRunByIdFromDb(id))?.reviewSupersededAt).toEqual(first);
+		});
+
+		it('reports a run id that matches no row', async () => {
+			expect(await markReviewRunSuperseded('00000000-0000-0000-0000-000000000000')).toBe(false);
 		});
 	});
 

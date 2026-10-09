@@ -129,6 +129,7 @@ function makeRun(overrides: Partial<RunRow> = {}): RunRow {
 		reviewMergeMessage: null,
 		reviewMergeAttempt: null,
 		reviewMergeApprovedHeadSha: null,
+		reviewSupersededAt: null,
 		exitCode: 1,
 		timedOut: false,
 		error: 'wedged',

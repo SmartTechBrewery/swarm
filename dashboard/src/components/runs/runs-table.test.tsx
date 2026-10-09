@@ -53,6 +53,7 @@ const baseRun: RunRow = {
 	reviewAutomationOutcome: null,
 	reviewMergeOutcome: null,
 	reviewMergeMessage: null,
+	reviewSupersededAt: null,
 	exitCode: 0,
 	timedOut: false,
 	error: null,
@@ -419,6 +420,40 @@ describe('RunsTable', () => {
 			const card = screen.getByTestId('run-card');
 			expect(within(card).getByText('Deferred')).not.toBeNull();
 			expect(within(card).queryByText(/Timed out/)).toBeNull();
+		});
+	});
+
+	// Issue #1080 — two approvals on one pull request, only one of which counted
+	// toward the review cap, must not read as two identical "Approved" rows.
+	describe('superseded approvals', () => {
+		const approval: RunRow = {
+			...baseRun,
+			phase: 'review',
+			status: 'completed',
+			reviewVerdict: 'approve',
+		};
+
+		it('tells a superseded approval apart from one that counted, on desktop and mobile', () => {
+			const { container } = renderTable(
+				<RunsTable
+					runs={[
+						{ ...approval, id: 'run-superseded', reviewSupersededAt: '2026-01-01T00:10:00.000Z' },
+						{ ...approval, id: 'run-counted' },
+					]}
+					totalCount={2}
+					currentPage={1}
+					pageSize={25}
+					onPageChange={vi.fn()}
+				/>,
+			);
+
+			const table = container.querySelector('table') as HTMLElement;
+			expect(within(table).getAllByText('Approved · superseded')).toHaveLength(1);
+			expect(within(table).getAllByText('Approved')).toHaveLength(1);
+
+			const [supersededCard, countedCard] = screen.getAllByTestId('run-card');
+			expect(within(supersededCard).getByText('Approved · superseded')).not.toBeNull();
+			expect(within(countedCard).getByText('Approved')).not.toBeNull();
 		});
 	});
 

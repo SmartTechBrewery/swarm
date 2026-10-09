@@ -56,6 +56,7 @@ import {
 	ReviewMergeCallout,
 	RunAttributionFields,
 	RunDetailHeader,
+	SupersededApprovalNote,
 } from './$runId.js';
 
 function makeReviewRun(overrides: Partial<RunRow> = {}): RunRow {
@@ -85,6 +86,7 @@ function makeReviewRun(overrides: Partial<RunRow> = {}): RunRow {
 		reviewAutomationOutcome: 'manual-intervention-required',
 		reviewMergeOutcome: null,
 		reviewMergeMessage: null,
+		reviewSupersededAt: null,
 		exitCode: 0,
 		timedOut: false,
 		error: null,
@@ -477,6 +479,101 @@ describe('CapSpentApprovalCallout (issue #1038)', () => {
 
 		expect(screen.getAllByRole('heading', { name: 'Manual action required' })).toHaveLength(1);
 		expect(screen.getByRole('button', { name: /force re-review/i })).toBeDefined();
+	});
+
+	/**
+	 * Issue #1080: the two bounds are the same stop for very different reasons, so
+	 * the callout names which one it is. The verdict-cap copy is pinned above and
+	 * stays exactly what it was; this pins the superseded bound's.
+	 */
+	describe('a pull request stopped by the superseded bound (issue #1080)', () => {
+		const supersededStop = { reviewCapStop: 'superseded-bound' as const };
+
+		it('says the head moved too often, not that the verdict cap was spent', () => {
+			renderCapSpentCallout(makeCapSpentApprovalRun(supersededStop));
+
+			expect(
+				screen.getByRole('heading', {
+					name: 'Manual action required: head superseded too many times',
+				}),
+			).toBeDefined();
+			expect(screen.getByText(/head moved out from under too many/i)).toBeDefined();
+			expect(screen.getByText(/will not dispatch another review/i)).toBeDefined();
+			expect(
+				screen.queryByText(/last review verdict SWARM's review safety cap allows/i),
+			).toBeNull();
+		});
+
+		it('keeps the verdict-cap copy for the verdict-cap stop', () => {
+			renderCapSpentCallout(makeCapSpentApprovalRun({ reviewCapStop: 'verdict-cap' }));
+
+			expect(screen.getByRole('heading', { name: 'Manual action required' })).toBeDefined();
+			expect(
+				screen.getByText(/last review verdict SWARM's review safety cap allows/i),
+			).toBeDefined();
+		});
+
+		it('offers Force re-review with confirmation copy naming this bound', () => {
+			renderCapSpentCallout(makeCapSpentApprovalRun(supersededStop));
+			fireEvent.click(screen.getByRole('button', { name: /force re-review/i }));
+
+			expect(screen.getByText(/whose head keeps moving, for PR #42/i)).toBeDefined();
+			expect(screen.queryByText(/review safety cap for PR #42/i)).toBeNull();
+		});
+
+		it('stays mounted, naming the bound, through its own force', () => {
+			renderCapSpentCallout(makeForcedReviewPendingRun(supersededStop));
+
+			expect(screen.getByRole('heading', { name: 'Forced review pending' })).toBeDefined();
+			expect(screen.getByText(/head moved out from under too many/i)).toBeDefined();
+			expect(screen.getByRole('button', { name: /force re-review/i })).toBeDefined();
+		});
+	});
+});
+
+/**
+ * A superseded approval has to read differently from one that counted (issue
+ * #1080) — otherwise several identical "Approved" runs on one pull request look
+ * like several spent reviews.
+ */
+describe('a superseded approval (issue #1080)', () => {
+	function makeSupersededRun(overrides: Partial<RunRow> = {}): RunRow {
+		return makeReviewRun({
+			reviewVerdict: 'approve',
+			reviewAutomationOutcome: null,
+			reviewMergeOutcome: 'not-eligible',
+			reviewMergeMessage: 'pull request head changed since the reviewed commit',
+			reviewSupersededAt: '2026-01-01T00:10:00.000Z',
+			...overrides,
+		});
+	}
+
+	it('says the pass spent no review-cap slot', () => {
+		render(<SupersededApprovalNote run={makeSupersededRun()} />);
+
+		expect(screen.getByText(/This approval was superseded/)).toBeDefined();
+		expect(screen.getByText(/did not spend a review-cap slot/)).toBeDefined();
+	});
+
+	it.each([
+		['an approval that counted', { reviewSupersededAt: null }],
+		['a run that is not completed', { status: 'running' }],
+	])('renders nothing for %s', (_label, overrides) => {
+		const { container } = render(<SupersededApprovalNote run={makeSupersededRun(overrides)} />);
+		expect(container.firstChild).toBeNull();
+	});
+
+	it('badges the header as superseded rather than as a plain approval', () => {
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		render(
+			<QueryClientProvider client={queryClient}>
+				<RunDetailHeader run={makeSupersededRun()} project={null} />
+			</QueryClientProvider>,
+		);
+
+		expect(screen.getByText('Approved · superseded')).toBeDefined();
+		expect(screen.queryByText('Approved')).toBeNull();
+		expect(screen.getByText(/This approval was superseded/)).toBeDefined();
 	});
 });
 
