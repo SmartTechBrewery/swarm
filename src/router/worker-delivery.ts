@@ -108,6 +108,19 @@
  *   - `POST /worker/delivery/worktree-sweep-report` — record what a machine removed
  *     when it was asked to sweep its own abandoned checkouts.
  *
+ * **Every project-scoped route is fenced on the dispatch it is called for** (issue
+ * #1073). An assignment stamps its `dispatchId` on each call
+ * (`../transport/delivery-client.ts`). A call naming a dispatch this router settled
+ * because the calling worker's transport was lost (`./transport-loss-reaper.ts`) is
+ * refused with a `409` before anything else is resolved. That reap ends the control
+ * plane's wait, not the agent, so a worker that only slept would otherwise finish
+ * the phase and apply its board writes for a run already recorded as failed. Its
+ * result is dropped, so nothing would dispatch the follow-up those writes imply,
+ * and the card would strand. A call naming no dispatch (a worker predating #1073)
+ * and a call naming one this router has no record of are served as before. The
+ * three worker-scoped routes act for a machine rather than an assignment, so they
+ * are not fenced.
+ *
  * Mirrors `./worker-transport.ts`: the request logic is factored out of the HTTP
  * glue into pure, injectable functions (`handleSubmitReview`,
  * `handlePostComment`, `handleMoveWorkItem`, `handleAddPmComment`,
@@ -183,7 +196,16 @@ import {
 	TRANSPORT_PROTOCOL_VERSION,
 	UpdateWorkItemDeliveryRequestSchema,
 } from '../transport/protocol.js';
+import { isDispatchOrphanedFrom } from './dispatch-results.js';
 import { advanceWorkerRollout } from './worker-rollout-advance.js';
+
+/**
+ * Why a fenced call is refused (issue #1073). The worker's delivery client puts it in
+ * the thrown error, so the late phase fails with this in its log rather than a bare
+ * status.
+ */
+export const ORPHANED_DISPATCH_DELIVERY_REASON =
+	"this phase's dispatch was already settled when the worker's transport was lost — its run is recorded as failed, so its board and review writes are refused";
 
 /**
  * Collaborators the delivery API depends on, defaulted to the real services so
@@ -200,6 +222,14 @@ export interface WorkerDeliveryDeps {
 	findProjectRecordById: (id: string) => Promise<ProjectRecord | undefined>;
 	/** Whether `workerId` may deliver to `projectId` — a routable (active + consented) enrollment. */
 	isWorkerEnrolled: (workerId: string, projectId: string) => Promise<boolean>;
+	/**
+	 * Whether `dispatchId` is one this router settled because `workerId`'s transport
+	 * was lost, and is not awaiting on that worker again (issue #1073). Defaulted to
+	 * the in-process registry (`./dispatch-results.ts`). It is in-memory, like the
+	 * reap that records it, so it needs no I/O on a hot path every delivery call
+	 * crosses.
+	 */
+	isDispatchOrphaned: (workerId: string, dispatchId: string) => boolean;
 	/** Build the server-side SCM delivery provider for a project + persona (resolves the PAT here). */
 	buildScmDelivery: (project: ProjectConfig, persona: ScmPersona) => Promise<ScmDeliveryProvider>;
 	/** Build the server-side PM provider for a project (resolves the per-project PM credential here). */
@@ -264,6 +294,7 @@ function defaultDeps(): WorkerDeliveryDeps {
 		resolveWorkerByCredential,
 		findProjectRecordById: findProjectRecordByIdFromDb,
 		isWorkerEnrolled: isWorkerEnrolledDefault,
+		isDispatchOrphaned: isDispatchOrphanedFrom,
 		buildScmDelivery: (project, persona) =>
 			requireProjectSCMProvider(project).deliveryProvider(project, persona),
 		buildPmProvider: requireProjectPMProvider,
@@ -283,10 +314,27 @@ function defaultDeps(): WorkerDeliveryDeps {
  * resolve ({@link resolvePersonaDelivery}). It is answered rather than thrown so
  * the worker learns *why* its write failed — an escaped throw becomes the app-level
  * `internal error` 500, whose body carries no reason at all.
+ *
+ * `409` is the dispatch fence (issue #1073): the call is for a dispatch this router
+ * already settled, so it conflicts with the run's recorded state. It is not a `403`,
+ * because the worker is allowed to deliver to this project. This one call was made
+ * for a phase the control plane has given up on.
  */
 export interface DeliveryResult {
-	status: 200 | 400 | 401 | 403 | 404 | 503;
+	status: 200 | 400 | 401 | 403 | 404 | 409 | 503;
 	json: Record<string, unknown>;
+}
+
+/** The fields of a parsed request the project-scoped prelude reads. */
+interface ProjectDeliveryRequest {
+	projectId: string;
+	/** The assignment the call is made for (issue #1073); absent from an older worker. */
+	dispatchId?: string;
+}
+
+/** A run-scoped request also names the repository its run is for (issue #1055). */
+interface RunDeliveryRequest extends ProjectDeliveryRequest {
+	repository?: string;
 }
 
 /**
@@ -343,14 +391,33 @@ async function resolvePersonaDelivery(
  * the part of the prelude every project-scoped route shares. Returns the
  * authenticated `{ worker, record }` on success, or a {@link DeliveryResult} to
  * return verbatim on any refusal. The credential is never reflected in a body.
+ *
+ * The dispatch fence (issue #1073) is checked straight after the worker is known, and
+ * before anything is read: a call for a phase this router already settled is refused
+ * whatever project it names. It runs only for the worker the credential resolved to,
+ * so one worker can never trip another's fence, and an unauthenticated caller
+ * learns nothing about which dispatches were settled.
  */
 async function authenticateProject(
 	deps: WorkerDeliveryDeps,
 	credential: string | undefined,
-	projectId: string,
+	request: ProjectDeliveryRequest,
 ): Promise<{ worker: Worker; record: ProjectRecord } | DeliveryResult> {
 	const worker = credential ? await deps.resolveWorkerByCredential(credential) : undefined;
 	if (!worker) return { status: 401, json: { authenticated: false } };
+
+	const { projectId, dispatchId } = request;
+	if (dispatchId !== undefined && deps.isDispatchOrphaned(worker.id, dispatchId)) {
+		logger.warn(
+			'worker-delivery: refusing a call for a dispatch settled while its worker was away',
+			{
+				workerId: worker.id,
+				dispatchId,
+				projectId,
+			},
+		);
+		return { status: 409, json: { reason: ORPHANED_DISPATCH_DELIVERY_REASON } };
+	}
 
 	const record = await deps.findProjectRecordById(projectId);
 	if (!record) return { status: 404, json: { reason: 'unknown project' } };
@@ -372,9 +439,9 @@ async function authenticateProject(
 async function authenticateDelivery(
 	deps: WorkerDeliveryDeps,
 	credential: string | undefined,
-	projectId: string,
+	request: ProjectDeliveryRequest,
 ): Promise<{ worker: Worker; project: ProjectConfig } | DeliveryResult> {
-	const authed = await authenticateProject(deps, credential, projectId);
+	const authed = await authenticateProject(deps, credential, request);
 	if ('status' in authed) return authed;
 	return { worker: authed.worker, project: scopeProjectToRepository(authed.record) };
 }
@@ -397,12 +464,12 @@ async function authenticateDelivery(
 async function authenticateRunDelivery(
 	deps: WorkerDeliveryDeps,
 	credential: string | undefined,
-	projectId: string,
-	repository: string | undefined,
+	request: RunDeliveryRequest,
 ): Promise<{ worker: Worker; project: ProjectConfig } | DeliveryResult> {
-	const authed = await authenticateProject(deps, credential, projectId);
+	const authed = await authenticateProject(deps, credential, request);
 	if ('status' in authed) return authed;
 	const { worker, record } = authed;
+	const { repository } = request;
 
 	if (repository !== undefined) {
 		if (!findProjectRepository(record, repository))
@@ -481,12 +548,7 @@ export async function handleSubmitReview(
 			},
 		};
 
-	const authed = await authenticateRunDelivery(
-		deps,
-		credential,
-		request.projectId,
-		request.repository,
-	);
+	const authed = await authenticateRunDelivery(deps, credential, request);
 	if ('status' in authed) return authed;
 
 	// The reviewer PAT is resolved inside this process by `buildScmDelivery` and
@@ -538,12 +600,7 @@ export async function handlePostComment(
 			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
 		};
 
-	const authed = await authenticateRunDelivery(
-		deps,
-		credential,
-		request.projectId,
-		request.repository,
-	);
+	const authed = await authenticateRunDelivery(deps, credential, request);
 	if ('status' in authed) return authed;
 
 	const delivery = await resolvePersonaDelivery(
@@ -583,7 +640,7 @@ export async function handleMoveWorkItem(
 			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
 		};
 
-	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	const authed = await authenticateDelivery(deps, credential, request);
 	if ('status' in authed) return authed;
 
 	const pm = deps.buildPmProvider(authed.project);
@@ -611,7 +668,7 @@ export async function handleAddPmComment(
 			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
 		};
 
-	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	const authed = await authenticateDelivery(deps, credential, request);
 	if ('status' in authed) return authed;
 
 	const pm = deps.buildPmProvider(authed.project);
@@ -643,7 +700,7 @@ export async function handleListDependents(
 			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
 		};
 
-	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	const authed = await authenticateDelivery(deps, credential, request);
 	if ('status' in authed) return authed;
 
 	const pm = deps.buildPmProvider(authed.project);
@@ -676,7 +733,7 @@ export async function handleListBlockers(
 			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
 		};
 
-	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	const authed = await authenticateDelivery(deps, credential, request);
 	if ('status' in authed) return authed;
 
 	const pm = deps.buildPmProvider(authed.project);
@@ -710,7 +767,7 @@ export async function handleFindWorkItem(
 			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
 		};
 
-	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	const authed = await authenticateDelivery(deps, credential, request);
 	if ('status' in authed) return authed;
 
 	const pm = deps.buildPmProvider(authed.project);
@@ -758,7 +815,7 @@ export async function handleFindWorkItemByMarker(
 			status: 400,
 			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
 		};
-	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	const authed = await authenticateDelivery(deps, credential, request);
 	if ('status' in authed) return authed;
 	const item = await deps
 		.buildPmProvider(authed.project)
@@ -780,7 +837,7 @@ export async function handleFindWorkItemForArtifact(
 			status: 400,
 			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
 		};
-	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	const authed = await authenticateDelivery(deps, credential, request);
 	if ('status' in authed) return authed;
 	const item = await deps.buildPmProvider(authed.project).findWorkItemForArtifact({
 		repository: request.repository,
@@ -818,7 +875,7 @@ export async function handleFindPmComment(
 			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
 		};
 
-	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	const authed = await authenticateDelivery(deps, credential, request);
 	if ('status' in authed) return authed;
 
 	const pm = deps.buildPmProvider(authed.project);
@@ -853,7 +910,7 @@ export async function handleCreateWorkItem(
 			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
 		};
 
-	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	const authed = await authenticateDelivery(deps, credential, request);
 	if ('status' in authed) return authed;
 
 	const pm = deps.buildPmProvider(authed.project);
@@ -889,7 +946,7 @@ export async function handleUpdateWorkItem(
 			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
 		};
 
-	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	const authed = await authenticateDelivery(deps, credential, request);
 	if ('status' in authed) return authed;
 
 	const pm = deps.buildPmProvider(authed.project);
@@ -922,7 +979,7 @@ export async function handleAddPmLabel(
 			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
 		};
 
-	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	const authed = await authenticateDelivery(deps, credential, request);
 	if ('status' in authed) return authed;
 
 	const pm = deps.buildPmProvider(authed.project);
@@ -952,7 +1009,7 @@ export async function handleAddBlockedBy(
 			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
 		};
 
-	const authed = await authenticateDelivery(deps, credential, request.projectId);
+	const authed = await authenticateDelivery(deps, credential, request);
 	if ('status' in authed) return authed;
 
 	const pm = deps.buildPmProvider(authed.project);
@@ -985,12 +1042,7 @@ export async function handleScheduleFollowUpReview(
 			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
 		};
 
-	const authed = await authenticateRunDelivery(
-		deps,
-		credential,
-		request.projectId,
-		request.repository,
-	);
+	const authed = await authenticateRunDelivery(deps, credential, request);
 	if ('status' in authed) return authed;
 
 	await deps.scheduleFollowUpReview({
@@ -1025,12 +1077,7 @@ export async function handlePriorReview(
 			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
 		};
 
-	const authed = await authenticateRunDelivery(
-		deps,
-		credential,
-		request.projectId,
-		request.repository,
-	);
+	const authed = await authenticateRunDelivery(deps, credential, request);
 	if ('status' in authed) return authed;
 
 	const record = await deps.reviewLedger.getPriorSubmittedReview(
@@ -1063,12 +1110,7 @@ export async function handleMarkReviewVerdict(
 			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
 		};
 
-	const authed = await authenticateRunDelivery(
-		deps,
-		credential,
-		request.projectId,
-		request.repository,
-	);
+	const authed = await authenticateRunDelivery(deps, credential, request);
 	if ('status' in authed) return authed;
 
 	const slot = await deps.reviewLedger.markReviewVerdictSubmitted(
@@ -1103,12 +1145,7 @@ export async function handleAbandonReviewVerdict(
 			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
 		};
 
-	const authed = await authenticateRunDelivery(
-		deps,
-		credential,
-		request.projectId,
-		request.repository,
-	);
+	const authed = await authenticateRunDelivery(deps, credential, request);
 	if ('status' in authed) return authed;
 
 	await deps.reviewLedger.abandonReviewVerdict({

@@ -897,6 +897,23 @@ export type ControlPlaneMessage = z.infer<typeof ControlPlaneMessageSchema>;
 const RunRepositorySchema = z.string().min(1).optional();
 
 /**
+ * The dispatch a **project-scoped** delivery request is made on behalf of (issue
+ * #1073): the `dispatchId` of the assignment whose phase is calling. Every delivery
+ * call an assignment makes carries it (`./delivery-client.ts`). The server refuses a
+ * request naming a dispatch it has already settled because this worker's transport
+ * was lost (`../router/worker-delivery.ts`). That reap ends the control plane's wait
+ * but not the agent, so a worker that only slept could otherwise finish the phase
+ * and write to the board for a run that is recorded as failed.
+ *
+ * Optional, on the same no-protocol-bump terms as {@link RunRepositorySchema}: a
+ * worker predating #1073 sends none and is served exactly as before, and a control
+ * plane predating it strips the key. The worker-scoped routes (quota, update and
+ * sweep reports) carry none, because they act for a machine rather than for an
+ * assignment.
+ */
+const DeliveryDispatchIdSchema = z.string().uuid().optional();
+
+/**
  * Control-plane SCM metadata delivery frames (ADR-004 §2). The metadata-only
  * SCM delivery calls — submit a review, post a PR comment — move server-side so
  * the per-project reviewer PAT stays on the router and never reaches a worker: a
@@ -920,6 +937,7 @@ const RunRepositorySchema = z.string().min(1).optional();
  */
 export const SubmitReviewDeliveryRequestSchema = z.object({
 	projectId: z.string().min(1),
+	dispatchId: DeliveryDispatchIdSchema,
 	repository: RunRepositorySchema,
 	prNumber: z.number().int().positive(),
 	verdict: z.enum(['approve', 'request-changes', 'comment']),
@@ -949,6 +967,7 @@ export type SubmitReviewDeliveryResponse = z.infer<typeof SubmitReviewDeliveryRe
  */
 export const PostCommentDeliveryRequestSchema = z.object({
 	projectId: z.string().min(1),
+	dispatchId: DeliveryDispatchIdSchema,
 	repository: RunRepositorySchema,
 	prNumber: z.number().int().positive(),
 	body: z.string().min(1),
@@ -987,6 +1006,7 @@ export type PostCommentDeliveryResponse = z.infer<typeof PostCommentDeliveryResp
  */
 export const MoveWorkItemDeliveryRequestSchema = z.object({
 	projectId: z.string().min(1),
+	dispatchId: DeliveryDispatchIdSchema,
 	itemId: z.string().min(1),
 	/** Canonical SWARM pipeline status key (`PmStatusKey`), never a board option ID. */
 	status: z.string().min(1),
@@ -1001,6 +1021,7 @@ export type MoveWorkItemDeliveryResponse = z.infer<typeof MoveWorkItemDeliveryRe
 /** `POST /worker/delivery/pm/comment` request body — a comment on the item's backing Issue/PR. */
 export const AddPmCommentDeliveryRequestSchema = z.object({
 	projectId: z.string().min(1),
+	dispatchId: DeliveryDispatchIdSchema,
 	itemId: z.string().min(1),
 	body: z.string().min(1),
 	protocolVersion: z.number().int(),
@@ -1027,6 +1048,7 @@ export type AddPmCommentDeliveryResponse = z.infer<typeof AddPmCommentDeliveryRe
  */
 export const ListBlockersDeliveryRequestSchema = z.object({
 	projectId: z.string().min(1),
+	dispatchId: DeliveryDispatchIdSchema,
 	itemId: z.string().min(1),
 	protocolVersion: z.number().int(),
 });
@@ -1074,6 +1096,7 @@ export type WorkItemDependentFrame = z.infer<typeof WorkItemDependentFrameSchema
  */
 export const ListDependentsDeliveryRequestSchema = z.object({
 	projectId: z.string().min(1),
+	dispatchId: DeliveryDispatchIdSchema,
 	itemId: z.string().min(1),
 	protocolVersion: z.number().int(),
 });
@@ -1106,6 +1129,7 @@ export type ListDependentsDeliveryResponse = z.infer<typeof ListDependentsDelive
  */
 export const FindWorkItemDeliveryRequestSchema = z.object({
 	projectId: z.string().min(1),
+	dispatchId: DeliveryDispatchIdSchema,
 	urlSuffix: z.string().min(1),
 	protocolVersion: z.number().int(),
 });
@@ -1114,6 +1138,7 @@ export type FindWorkItemDeliveryRequest = z.infer<typeof FindWorkItemDeliveryReq
 /** Resolve one board card by a repository-scoped backing artifact. */
 export const FindWorkItemForArtifactDeliveryRequestSchema = z.object({
 	projectId: z.string().min(1),
+	dispatchId: DeliveryDispatchIdSchema,
 	repository: z.string().min(1),
 	kind: z.enum(['issue', 'pullRequest']),
 	number: z.string().min(1),
@@ -1140,6 +1165,7 @@ export type FindWorkItemForArtifactDeliveryRequest = z.infer<
  */
 export const FindWorkItemByMarkerDeliveryRequestSchema = z.object({
 	projectId: z.string().min(1),
+	dispatchId: DeliveryDispatchIdSchema,
 	/** Unique substring identifying at most one card (`PMProvider.findWorkItemByDescriptionMarker`). */
 	marker: z.string().min(1),
 	protocolVersion: z.number().int(),
@@ -1205,6 +1231,7 @@ export type FindWorkItemDeliveryResponse = z.infer<typeof FindWorkItemDeliveryRe
  */
 export const FindPmCommentDeliveryRequestSchema = z.object({
 	projectId: z.string().min(1),
+	dispatchId: DeliveryDispatchIdSchema,
 	itemId: z.string().min(1),
 	/** Unique substring identifying at most one comment (`PMProvider.findComment`). */
 	marker: z.string().min(1),
@@ -1233,6 +1260,7 @@ export type FindPmCommentDeliveryResponse = z.infer<typeof FindPmCommentDelivery
  */
 export const CreateWorkItemDeliveryRequestSchema = z.object({
 	projectId: z.string().min(1),
+	dispatchId: DeliveryDispatchIdSchema,
 	title: z.string().min(1),
 	description: z.string(),
 	/** Canonical SWARM pipeline status key (`PmStatusKey`), never a board option ID. */
@@ -1265,6 +1293,7 @@ export type CreateWorkItemDeliveryResponse = z.infer<typeof CreateWorkItemDelive
 export const UpdateWorkItemDeliveryRequestSchema = z
 	.object({
 		projectId: z.string().min(1),
+		dispatchId: DeliveryDispatchIdSchema,
 		itemId: z.string().min(1),
 		title: z.string().min(1).optional(),
 		description: z.string().optional(),
@@ -1292,6 +1321,7 @@ export type UpdateWorkItemDeliveryResponse = z.infer<typeof UpdateWorkItemDelive
  */
 export const AddPmLabelDeliveryRequestSchema = z.object({
 	projectId: z.string().min(1),
+	dispatchId: DeliveryDispatchIdSchema,
 	itemId: z.string().min(1),
 	name: z.string().min(1),
 	protocolVersion: z.number().int(),
@@ -1311,6 +1341,7 @@ export type AddPmLabelDeliveryResponse = z.infer<typeof AddPmLabelDeliveryRespon
  */
 export const AddBlockedByDeliveryRequestSchema = z.object({
 	projectId: z.string().min(1),
+	dispatchId: DeliveryDispatchIdSchema,
 	itemId: z.string().min(1),
 	blockerId: z.string().min(1),
 	protocolVersion: z.number().int(),
@@ -1339,6 +1370,7 @@ export type AddBlockedByDeliveryResponse = z.infer<typeof AddBlockedByDeliveryRe
  */
 export const FollowUpReviewDeliveryRequestSchema = z.object({
 	projectId: z.string().min(1),
+	dispatchId: DeliveryDispatchIdSchema,
 	repository: RunRepositorySchema,
 	prNumber: z.string().min(1),
 	prBranch: z.string().min(1),
@@ -1370,6 +1402,7 @@ export type FollowUpReviewDeliveryResponse = z.infer<typeof FollowUpReviewDelive
  */
 export const PriorReviewLedgerRequestSchema = z.object({
 	projectId: z.string().min(1),
+	dispatchId: DeliveryDispatchIdSchema,
 	repository: RunRepositorySchema,
 	prNumber: z.string().min(1),
 	/** The head being reviewed now — excluded from the lookup, so a same-head retry isn't a re-review. */
@@ -1399,6 +1432,7 @@ export type PriorReviewLedgerResponse = z.infer<typeof PriorReviewLedgerResponse
 /** `POST /worker/delivery/review-ledger/mark` request body — the verdict this run submitted. */
 export const MarkReviewLedgerRequestSchema = z.object({
 	projectId: z.string().min(1),
+	dispatchId: DeliveryDispatchIdSchema,
 	repository: RunRepositorySchema,
 	prNumber: z.string().min(1),
 	headSha: z.string().min(1),
@@ -1427,6 +1461,7 @@ export type MarkReviewLedgerResponse = z.infer<typeof MarkReviewLedgerResponseSc
 /** `POST /worker/delivery/review-ledger/abandon` request body — release a pending slot. */
 export const AbandonReviewLedgerRequestSchema = z.object({
 	projectId: z.string().min(1),
+	dispatchId: DeliveryDispatchIdSchema,
 	repository: RunRepositorySchema,
 	prNumber: z.string().min(1),
 	headSha: z.string().min(1),

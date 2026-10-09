@@ -99,7 +99,10 @@ import {
 	TRANSPORT_LOST_NOTE,
 	TRANSPORT_RESTORED_NOTE,
 } from './stream-log-persistence.js';
-import { reapDispatchesIfTransportStaysLost } from './transport-loss-reaper.js';
+import {
+	reapDispatchesIfTransportStaysLost,
+	stopOrphanedDispatchesOnReturn,
+} from './transport-loss-reaper.js';
 import {
 	deregisterConnection,
 	isWorkerConnected,
@@ -241,6 +244,14 @@ export interface WorkerTransportDeps {
 	 */
 	resendRunCancellations: (workerId: string) => void;
 	/**
+	 * A phase the transport-loss reap settled while this worker was away may still be
+	 * running there (issue #1073). The reap ends the control plane's wait, not the
+	 * agent, so a machine that only slept resumes the phase and finishes it. The socket
+	 * coming back is the first moment it can be told to stop
+	 * (`./transport-loss-reaper.ts`). Fire-and-forget by contract, like the hooks above.
+	 */
+	stopOrphanedDispatches: (workerId: string) => void;
+	/**
 	 * A self-update requested while this worker's socket was down never reached it
 	 * either (issue #933), and for this feature that is the *ordinary* case rather
 	 * than a blip: the mutation refuses unless the machine is already draining, so an
@@ -303,6 +314,7 @@ function defaultDeps(): WorkerTransportDeps {
 			}
 		},
 		resendRunCancellations: resendRunCancellationsToWorker,
+		stopOrphanedDispatches: stopOrphanedDispatchesOnReturn,
 		resendPendingWorkerUpdate: resendPendingWorkerUpdateToWorker,
 		resendPendingWorktreeSweep: resendPendingWorktreeSweepToWorker,
 		advanceWorkerRollout,
@@ -838,8 +850,11 @@ function runConnectionHook(what: string, workerId: string, hook: () => void): vo
  * first connection reads nothing either. And since issue #941 it is the moment a
  * fleet rollout verifies that a machine it asked to move came back on the new build
  * — the one event that verdict has, and again a no-op when the operator has no
- * rollout under way. All of them are fire-and-forget: the socket must open
- * regardless of what Postgres or Redis are doing.
+ * rollout under way. Since issue #1073 it is also where a worker that comes back
+ * after the transport-loss reap is told to stop the phases that reap settled, which
+ * for a worker reaped of nothing is an in-memory lookup that finds nothing. All of
+ * them are fire-and-forget: the socket must open regardless of what Postgres or Redis
+ * are doing.
  */
 export function handleWorkerStreamOpen(
 	deps: WorkerTransportDeps,
@@ -847,6 +862,12 @@ export function handleWorkerStreamOpen(
 	ws: WSContext,
 ): void {
 	registerConnection(workerId, ws);
+	// First after registration (the push addresses the socket just registered), and
+	// before the wake below, so the stop for a phase this router already settled goes
+	// out ahead of any new work for the same machine (issue #1073).
+	runConnectionHook('stopping phases settled while the worker was away', workerId, () =>
+		deps.stopOrphanedDispatches(workerId),
+	);
 	// The timed re-check still starts the waiting work if this nudge fails.
 	runConnectionHook('waking availability-blocked dispatches', workerId, () =>
 		deps.onWorkerAvailable(workerId),

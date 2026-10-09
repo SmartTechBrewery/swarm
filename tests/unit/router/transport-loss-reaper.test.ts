@@ -3,11 +3,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
 	awaitDispatchResult,
 	deliverDispatchResult,
+	listOrphanedDispatchesForWorker,
 	noteWorkerTransportLost,
+	ORPHANED_DISPATCH_RETENTION_MS,
 } from '@/router/dispatch-results.js';
-import { TRANSPORT_LOST_ORPHAN_NOTE } from '@/router/stream-log-persistence.js';
+import {
+	TRANSPORT_LOST_ORPHAN_NOTE,
+	TRANSPORT_RETURNED_AFTER_ORPHAN_NOTE,
+} from '@/router/stream-log-persistence.js';
 import {
 	reapDispatchesIfTransportStaysLost,
+	stopOrphanedDispatchesOnReturn,
 	TRANSPORT_LOST_ORPHAN_REASON,
 } from '@/router/transport-loss-reaper.js';
 import { deregisterConnection, registerConnection } from '@/router/worker-connections.js';
@@ -266,5 +272,118 @@ describe('reapDispatchesIfTransportStaysLost (issue #859)', () => {
 			"The worker's session was superseded by a newer one while this phase was executing — settled from that signal, not from the lease window",
 		);
 		expect(TRANSPORT_LOST_ORPHAN_REASON).not.toBe('Run cancelled after a cancellation request.');
+	});
+});
+
+describe('stopOrphanedDispatchesOnReturn (issue #1073)', () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		vi.useFakeTimers();
+		// The reaps above leave their orphans behind (the registry is module state), so
+		// each case here starts from none, the way production forgets one: its answer.
+		answered();
+	});
+	afterEach(() => vi.useRealTimers());
+
+	/** The dispatch reaped: pushed here, dropped, never back inside the grace. */
+	async function reaped(): Promise<void> {
+		const awaiting = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
+		transportLost(WORKER_ID);
+		await vi.advanceTimersByTimeAsync(GRACE_MS);
+		await expect(awaiting.result).resolves.toMatchObject({ status: 'failed' });
+	}
+
+	/** The worker's answer to the stop: the frame that ends the orphan. */
+	function answered(): void {
+		deliverDispatchResult({
+			type: 'task-execution-result',
+			dispatchId: DISPATCH_ID,
+			status: 'failed',
+			cancelled: true,
+			phase: 'respond-to-review',
+			taskId: '118',
+		});
+	}
+
+	it('tells a worker that comes back late to stop the phase it was reaped of', async () => {
+		await reaped();
+		persistControlPlaneNote.mockClear();
+
+		const returned = fakeWs();
+		registerConnection(WORKER_ID, returned);
+		stopOrphanedDispatchesOnReturn(WORKER_ID);
+
+		expect(returned.send).toHaveBeenCalledTimes(1);
+		expect(JSON.parse(String(returned.send.mock.calls[0][0]))).toEqual({
+			type: 'task-cancel',
+			dispatchId: DISPATCH_ID,
+			runId: RUN_ID,
+			reason: expect.stringContaining('settled this dispatch while the worker was away'),
+			// From the registration, so the worker can answer for a phase it no longer runs.
+			phase: 'respond-to-review',
+			taskId: '118',
+		});
+		expect(persistControlPlaneNote).toHaveBeenCalledWith(
+			RUN_ID,
+			TRANSPORT_RETURNED_AFTER_ORPHAN_NOTE,
+		);
+
+		// Once the worker has answered, there is nothing left to stop on a later return.
+		answered();
+		returned.send.mockClear();
+		stopOrphanedDispatchesOnReturn(WORKER_ID);
+		expect(returned.send).not.toHaveBeenCalled();
+		deregisterConnection(WORKER_ID, returned);
+	});
+
+	it('keeps the stop for the next reconnect when the push cannot reach the worker', async () => {
+		await reaped();
+		persistControlPlaneNote.mockClear();
+
+		// A socket that closed again before the push: nothing reaches the worker, so the
+		// orphan is kept and no note claims a stop was sent.
+		const closed = fakeWs();
+		closed.readyState = 3;
+		registerConnection(WORKER_ID, closed);
+		stopOrphanedDispatchesOnReturn(WORKER_ID);
+		expect(closed.send).not.toHaveBeenCalled();
+		expect(persistControlPlaneNote).not.toHaveBeenCalled();
+		deregisterConnection(WORKER_ID, closed);
+
+		const reopened = fakeWs();
+		registerConnection(WORKER_ID, reopened);
+		stopOrphanedDispatchesOnReturn(WORKER_ID);
+		expect(reopened.send).toHaveBeenCalledTimes(1);
+
+		answered();
+		deregisterConnection(WORKER_ID, reopened);
+	});
+
+	it('stops nothing for a worker that came back inside the grace', async () => {
+		const awaiting = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
+		transportLost(WORKER_ID);
+		await vi.advanceTimersByTimeAsync(GRACE_MS / 2);
+		const reconnected = fakeWs();
+		registerConnection(WORKER_ID, reconnected);
+		stopOrphanedDispatchesOnReturn(WORKER_ID);
+		await vi.advanceTimersByTimeAsync(GRACE_MS);
+
+		// Not reaped, so not an orphan: the phase is still the control plane's to settle.
+		expect(reconnected.send).not.toHaveBeenCalled();
+		expect(await stillPending(awaiting.result)).toBe(true);
+		awaiting.dispose();
+		deregisterConnection(WORKER_ID, reconnected);
+	});
+
+	it('leaves a worker that never returns exactly as #859 settled it, and forgets it in time', async () => {
+		await reaped();
+
+		// Nothing to push to, and nothing else happens: one settle, one note.
+		expect(persistControlPlaneNote).toHaveBeenCalledTimes(1);
+		expect(persistControlPlaneNote).toHaveBeenCalledWith(RUN_ID, TRANSPORT_LOST_ORPHAN_NOTE);
+		expect(listOrphanedDispatchesForWorker(WORKER_ID)).toHaveLength(1);
+
+		await vi.advanceTimersByTimeAsync(ORPHANED_DISPATCH_RETENTION_MS);
+		expect(listOrphanedDispatchesForWorker(WORKER_ID)).toEqual([]);
 	});
 });

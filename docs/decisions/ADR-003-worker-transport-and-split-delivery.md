@@ -95,7 +95,7 @@ transport was a second front door to the same service. It is now the only one:
 issue #553 deleted that worker, and every worker acquires its session through the
 handshake (`src/router/worker-transport.ts` → `src/identity/worker-session-service.ts`).
 
-### §2 — Split delivery (implemented — issues #392, #405, #406, #407, #394, #417, #418, #536, #551, #544, #718, #724, #719, #827, #859)
+### §2 — Split delivery (implemented — issues #392, #405, #406, #407, #394, #417, #418, #536, #551, #544, #718, #724, #719, #827, #859, #1073)
 
 The rest of PROJECT.md §3 — the control plane assigning jobs and the daemon
 running them without direct Redis access (`TaskAssignment` →
@@ -488,6 +488,48 @@ server-side store) it needs:
    replayed blindly — so re-running such a phase stays `swarm run reset`. A router
    restart inside the grace loses the timer, with the lease reconciler the backstop, the
    same limit item 13 accepts.
+
+15. **#1073** — **a reaped phase whose worker comes back late is stopped and fenced.**
+   Item 14 ends the control plane's *wait*; it never reached the agent. A worker that only
+   slept resumes the phase and finishes it, and then two halves of the system contradict
+   each other. Its board writes land, because the `/worker/delivery/pm/*` routes
+   authorized by credential and enrollment alone. Its terminal result is dropped, because
+   nothing awaits it. Live on 2026-10-08 (`under-control-platform`, Planning for #568,
+   dispatch `ee14c88f`): reaped at 20:46:31, back at ~20:58, and from 21:05 it renamed
+   #568, created #587, moved both to Ready and posted the plan. The run said `failed` and
+   "hasn't moved". The card had moved, and nothing dispatched Implementation, since SWARM's
+   own board writes are loop-suppressed.
+
+   Two halves close it, one on each channel the late phase has. **The stream:** the reap
+   records each dispatch it ends as an orphan of its worker
+   (`failOrphanedDispatchResultWait`, `src/router/dispatch-results.ts`), and the stream
+   opening for that worker pushes a `task-cancel` per orphan *first*, ahead of the wake
+   that could hand it new work (`stopOrphanedDispatchesOnReturn`). This is the frame item
+   12 (#724) already made a question rather than an order. The worker aborts the agent, re-sends a
+   result it held, or answers for a phase it no longer knows. `deliverDispatchResult` drops
+   the answer and forgets the orphan. **The delivery API:** every call an assignment makes
+   names its `dispatchId` (an optional body field on the eighteen project-scoped request
+   schemas, stamped by `postDelivery`), and `authenticateProject` refuses a call naming an
+   orphan of the calling worker with a `409` before it reads anything. Each half covers what
+   the other cannot. The stop is a push, and the phase may already be in its delivery step
+   or reach a route before its socket is back. The fence cannot see Implementation's push
+   and pull request, which run on the operator's own token and never cross the router.
+
+   Decisions worth recording. **Late work is kept off the board, not honoured.** Treating
+   a late `succeeded` as authoritative would need a second settle path outside
+   `processJob`, after its job has unwound, the failure comment been posted and the holds
+   been released. Fencing leaves the one settle that already ran correct: run failed, board
+   unmoved, Retry the recovery. Planning cannot split an item twice, because the late
+   attempt never split it. **The wire stays version-compatible.** The field is optional,
+   so `TRANSPORT_PROTOCOL_VERSION` stays put. An older worker sends none and is not
+   fenced, and an older control plane strips it. **The record is in-memory and bounded**,
+   like item 14's timer: a router restart forgets it, and it expires after
+   `ORPHANED_DISPATCH_RETENTION_MS` (24 h) for a worker that never returns. Long enough
+   for a laptop closed overnight, and normally gone at the first reconnect. A worker that
+   never returns is otherwise exactly item 14. **The orphan is keyed on its worker**, so
+   one worker's orphan never fences another, and a dispatch awaited again is neither
+   fenced on its worker nor stopped. A reaped dispatch settles terminally and its retry
+   opens a new id, so this is defensive only.
 
 Still out of scope: over-the-wire secret delivery, which remains unnecessary — the
 split keeps every project credential server-side instead.

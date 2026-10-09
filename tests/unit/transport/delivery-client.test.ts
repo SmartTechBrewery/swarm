@@ -53,6 +53,41 @@ describe('postDelivery', () => {
 		});
 	});
 
+	it('stamps the dispatch a call is made for onto its body (issue #1073)', async () => {
+		const fetchImpl = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(200, {}));
+		const dispatchId = '44444444-4444-4444-8444-444444444444';
+
+		await postDelivery(
+			{ controlPlaneUrl: CONTROL_PLANE, workerCredential: CREDENTIAL, dispatchId, fetchImpl },
+			'/worker/delivery/pm/move',
+			{ projectId: 'swarm', itemId: 'PVTI_1', status: 'todo' },
+			identity,
+		);
+
+		expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toEqual({
+			projectId: 'swarm',
+			itemId: 'PVTI_1',
+			status: 'todo',
+			dispatchId,
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		});
+	});
+
+	it('sends no dispatch key for a call made for no assignment', async () => {
+		// A machine-scoped report (quota, update, sweep): its body stays exactly what it
+		// was before the field existed.
+		const fetchImpl = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(200, {}));
+
+		await postDelivery(
+			{ controlPlaneUrl: CONTROL_PLANE, workerCredential: CREDENTIAL, fetchImpl },
+			'/worker/delivery/quota',
+			{ snapshots: [] },
+			identity,
+		);
+
+		expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).not.toHaveProperty('dispatchId');
+	});
+
 	it('throws with the status on a non-2xx response, without leaking the credential', async () => {
 		const fetchImpl = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(403, {}));
 

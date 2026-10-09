@@ -46,6 +46,33 @@
  * run terminally. Whether a phase lost this way should be run again is a policy
  * question this does not answer (a Respond-to-review that had already pushed must not
  * be replayed blindly); `swarm run reset` remains the operator's way to do it.
+ *
+ * **A worker that comes back late is stopped, not trusted (issue #1073).** The reap
+ * ends the control plane's wait. It cannot reach the agent, which keeps running on a
+ * machine that only went to sleep. Planning for #568 on `under-control-platform` came
+ * back about 12 minutes after the reap, finished the phase, renamed and split the item
+ * and moved both cards to Ready. Its `succeeded` result was then dropped, because nothing
+ * here was awaiting it. The board said the phase had worked and the run said it had
+ * failed, and the move to Ready dispatched nothing, since SWARM's own board writes are
+ * loop-suppressed. The card stranded. Two things now keep the late phase off the
+ * board:
+ *
+ * - the reap records each dispatch it ends as an *orphan* of its worker
+ *   (`failOrphanedDispatchResultWait`, `./dispatch-results.ts`), and when that worker's
+ *   stream reopens {@link stopOrphanedDispatchesOnReturn} pushes it a `task-cancel` for
+ *   each, so the agent is stopped instead of finishing a phase nobody will settle;
+ * - every delivery call an assignment makes names its dispatch, and the delivery API
+ *   refuses one naming an orphan of the calling worker (`./worker-delivery.ts`). The
+ *   stop is a push, and a phase may already be in its delivery step when it lands, or
+ *   reach a route before its socket is back. The fence covers those cases.
+ *
+ * The alternative was to honour a late success: correct the run and owe the follow-up
+ * it would have earned. It was rejected because that needs a second settle path
+ * outside `processJob`, run after its job has already unwound, the failure comment
+ * posted and the PR hold released. Keeping the phase off the board leaves the one
+ * settle that already ran correct: the run failed, the board did not move, and Retry
+ * is the recovery. Planning in particular cannot split an item twice, because the late
+ * attempt never split it at all.
  */
 
 import { resolveHeartbeatTtlMs } from '../identity/worker-session-service.js';
@@ -53,11 +80,16 @@ import { logger } from '../lib/logger.js';
 import {
 	countDispatchInterruptions,
 	type DispatchTransportLoss,
-	failDispatchResultWait,
+	failOrphanedDispatchResultWait,
+	listOrphanedDispatchesForWorker,
 	resolveDispatchStreamTarget,
 } from './dispatch-results.js';
-import { persistControlPlaneNote, TRANSPORT_LOST_ORPHAN_NOTE } from './stream-log-persistence.js';
-import { isWorkerConnected } from './worker-connections.js';
+import {
+	persistControlPlaneNote,
+	TRANSPORT_LOST_ORPHAN_NOTE,
+	TRANSPORT_RETURNED_AFTER_ORPHAN_NOTE,
+} from './stream-log-persistence.js';
+import { isWorkerConnected, sendToWorker } from './worker-connections.js';
 import { offlineSilenceMs } from './worker-liveness.js';
 
 /**
@@ -69,6 +101,14 @@ import { offlineSilenceMs } from './worker-liveness.js';
  */
 export const TRANSPORT_LOST_ORPHAN_REASON =
 	"The worker's transport session was lost and did not return within the grace — settled from that signal, not from the lease window";
+
+/**
+ * The `reason` on the `task-cancel` a returning worker is sent for each orphan. It is
+ * for the daemon's log only, like a user termination's: the run settled when it was
+ * reaped, and whatever the worker answers is dropped.
+ */
+const ORPHAN_STOP_REASON =
+	'the control plane settled this dispatch while the worker was away — stop the phase';
 
 /**
  * Arm the bounded reap for the dispatches `workerId`'s drop interrupted.
@@ -146,7 +186,9 @@ function settleIfTransportStayedLost(
 		// Before the settle, so the run's own stream corrects the note that promised
 		// output would resume "when it reconnects" — it never did.
 		persistControlPlaneNote(target.runId, TRANSPORT_LOST_ORPHAN_NOTE);
-		if (failDispatchResultWait(dispatchId, TRANSPORT_LOST_ORPHAN_REASON)) {
+		// Remembered as an orphan of this worker, so a late return is stopped and
+		// fenced rather than trusted (issue #1073).
+		if (failOrphanedDispatchResultWait(dispatchId, TRANSPORT_LOST_ORPHAN_REASON)) {
 			logger.warn('worker transport lost: settled a dispatch whose worker never returned', {
 				workerId,
 				dispatchId,
@@ -154,5 +196,50 @@ function settleIfTransportStayedLost(
 				graceMs,
 			});
 		}
+	}
+}
+
+/**
+ * A worker's stream just reopened: stop every phase this router reaped from it while
+ * it was away (issue #1073).
+ *
+ * Each orphan gets a `task-cancel`, the frame the worker already handles for a
+ * termination (issue #549). What it does with it covers every way the late phase can
+ * stand:
+ * - still running: it aborts the agent;
+ * - finished while the socket was down, result held (issue #718): it sends that result;
+ * - unknown to it (the daemon restarted, or the phase had already reported): it
+ *   answers with a synthetic cancelled result (issue #724).
+ * Any of those reaches `deliverDispatchResult`, which drops it and forgets the orphan.
+ * A push that fails, because the socket dropped again, leaves the orphan for the next
+ * reconnect, and the delivery fence holds in between.
+ *
+ * Fire-and-forget by contract, like every connection hook (`./worker-transport.ts`):
+ * synchronous, no I/O beyond the push and the fire-and-forget run note. It is called
+ * before anything that could wake new work for this worker, so the stop goes out
+ * first.
+ */
+export function stopOrphanedDispatchesOnReturn(workerId: string): void {
+	for (const orphan of listOrphanedDispatchesForWorker(workerId)) {
+		const sent = sendToWorker(workerId, {
+			type: 'task-cancel',
+			dispatchId: orphan.dispatchId,
+			runId: orphan.runId,
+			reason: ORPHAN_STOP_REASON,
+			// What the worker needs to answer a stop for a phase it no longer runs (issue
+			// #724). Taken from the registration recorded at push time, never from the
+			// worker.
+			phase: orphan.phase,
+			taskId: orphan.taskId,
+		});
+		if (!sent) continue;
+		persistControlPlaneNote(orphan.runId, TRANSPORT_RETURNED_AFTER_ORPHAN_NOTE);
+		logger.warn('worker transport restored: stopping a phase settled while the worker was away', {
+			workerId,
+			dispatchId: orphan.dispatchId,
+			runId: orphan.runId,
+			phase: orphan.phase,
+			taskId: orphan.taskId,
+		});
 	}
 }
