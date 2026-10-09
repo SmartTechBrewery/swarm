@@ -197,7 +197,8 @@ export function phaseRecoveryFromAssignment(intent: RecoveryIntent): PhaseRecove
  * phase again (`src/router/transport-loss-reaper.ts`).
  *
  * `result` is checked here only for what makes it an adoption — a `succeeded` frame
- * for this dispatch — and passed through otherwise: the full frame schema lives in
+ * for this dispatch, naming the phase and task it ran so `processJob` settles only
+ * that phase with it — and passed through otherwise: the full frame schema lives in
  * `../transport/protocol.ts`, which imports this module, so the control plane
  * re-parses it there before reading it. `selection` is the worker and target that
  * attempt was pushed with, structurally the gate's `DispatchSelection`, so the run
@@ -209,6 +210,8 @@ export const AdoptedResultSchema = z.object({
 			type: z.literal('task-execution-result'),
 			dispatchId: z.string().uuid(),
 			status: z.literal('succeeded'),
+			phase: z.string().min(1),
+			taskId: z.string().min(1),
 		})
 		.passthrough(),
 	selection: z.object({

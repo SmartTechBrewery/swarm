@@ -49,9 +49,10 @@
  * that automatic retry, the late phase is left to finish — it is not stopped on
  * return, its delivery calls are served, and a late `succeeded` result is handed to
  * an injected adoption hook that settles the run with it
- * (`./transport-loss-reaper.ts`). Trust ends when the retry takes over the dispatch
- * ({@link takeOverOrphanedDispatch}) or the run settles terminally instead; from then
- * on the orphan is stopped and fenced exactly as #1073 describes.
+ * (`./transport-loss-reaper.ts`). Trust ends once the dispatch stops waiting for that
+ * retry — the retry is claimed, or the run settles any other way
+ * ({@link takeOverOrphanedDispatch}); from then on the orphan is stopped and fenced
+ * exactly as #1073 describes.
  *
  * The `Map`s are module-private; callers touch them only through the exported
  * functions.
@@ -563,11 +564,14 @@ export function failOrphanedDispatchResultWait(dispatchId: string, reason: strin
  * would cancel the very attempt being started.
  *
  * Only orphans that were still trusted are returned. One already untrusted was listed
- * for a stop when it became so, and its fence already applies.
+ * for a stop when it became so, and its fence already applies. `include` narrows which
+ * trusted orphans lose their trust now; the rest stay trusted (the claim-time call
+ * leaves a connected orphan to the push, which may be going to its own worker).
  */
 export function takeOverOrphanedDispatch(
 	dispatchId: string,
 	newWorkerId?: string,
+	include: (orphan: OrphanedDispatch) => boolean = () => true,
 ): OrphanedDispatch[] {
 	const toStop: OrphanedDispatch[] = [];
 	for (const [key, orphan] of orphaned) {
@@ -576,11 +580,23 @@ export function takeOverOrphanedDispatch(
 			orphaned.delete(key);
 			continue;
 		}
-		if (!orphan.trusted) continue;
+		if (!orphan.trusted || !include(orphan)) continue;
 		orphan.trusted = false;
 		toStop.push({ ...orphan });
 	}
 	return toStop;
+}
+
+/**
+ * Whether any orphan of `dispatchId` is still trusted to finish (issue #1076) — the
+ * in-memory pre-check that lets the control plane skip a dispatch read after every
+ * job that has no orphan to settle.
+ */
+export function hasTrustedOrphans(dispatchId: string): boolean {
+	for (const orphan of orphaned.values()) {
+		if (orphan.dispatchId === dispatchId && orphan.trusted) return true;
+	}
+	return false;
 }
 
 /**

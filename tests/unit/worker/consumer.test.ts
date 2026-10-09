@@ -5020,30 +5020,36 @@ describe('processJob', () => {
 			expect(outcome.status).toBe('phase-failed');
 		});
 
-		// Issue #1076: the orphan was trusted to finish while its retry waited; a spent
-		// budget means no retry is coming, so the control plane is told to stop it.
-		it('ends the orphan’s trusted window when its budget is spent, and only then', async () => {
+		// Issue #1076: the orphan is trusted to finish only while its retry waits, and a
+		// claimed retry can no longer adopt its result — so the control plane is told at
+		// the claim, before the gate or the task claim can defer the retry unpushed.
+		it('reports the claimed dispatch before anything can defer it, and never a refused one', async () => {
 			transportLost();
-			const onTransportLostSettledTerminally = vi.fn();
+			listProjectDispatchCandidates.mockClear();
+			const onDispatchClaimed = vi.fn();
 
 			await processJob(
-				createMockScmWebhookJob({ automaticRetryAttempt: 2 }),
+				createMockScmWebhookJob({ automaticRetryAttempt: 1 }),
 				registryReturning(REVIEW_TRIGGER),
 				undefined,
 				undefined,
-				{ onTransportLostSettledTerminally },
+				{ onDispatchClaimed, federatedOnly: true },
 			);
-			expect(onTransportLostSettledTerminally).toHaveBeenCalledExactlyOnceWith('dispatch-1');
+			expect(onDispatchClaimed).toHaveBeenCalledExactlyOnceWith('dispatch-1');
+			expect(onDispatchClaimed.mock.invocationCallOrder[0]).toBeLessThan(
+				listProjectDispatchCandidates.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY,
+			);
 
-			onTransportLostSettledTerminally.mockClear();
+			onDispatchClaimed.mockClear();
+			claimDispatchForJob.mockResolvedValueOnce({ claimed: false, reason: 'terminal' });
 			await processJob(
 				createMockScmWebhookJob(),
 				registryReturning(REVIEW_TRIGGER),
 				undefined,
 				undefined,
-				{ onTransportLostSettledTerminally },
+				{ onDispatchClaimed },
 			);
-			expect(onTransportLostSettledTerminally).not.toHaveBeenCalled();
+			expect(onDispatchClaimed).not.toHaveBeenCalled();
 		});
 	});
 
@@ -5136,6 +5142,21 @@ describe('processJob', () => {
 					(input as { jobPayload: { event: { itemId: string } } }).jobPayload.event.itemId,
 			);
 			expect(itemIds).toEqual(['ITEM_568', 'ITEM_587']);
+		});
+
+		// The trigger is re-resolved from the stored event, so live state can send the
+		// retry down another phase than the one the lost worker ran. That one is run,
+		// never settled with the other phase's success.
+		it('drops the adopted result and runs the phase when the trigger re-resolves elsewhere', async () => {
+			const workItem = createMockWorkItem({ id: 'ITEM_568', statusId: '3fe662f4' });
+			const trigger: TriggerResult = { phase: 'implementation', taskId: '568', workItem };
+			phaseImpl = async () => ({ agent: agentResult() });
+
+			await processJob(adoptedJob(), registryReturning(trigger));
+
+			const context = phaseCalls.at(-1)?.context;
+			expect(context?.job.adoptedResult).toBeUndefined();
+			expect(context?.resolution.selection).not.toEqual(SELECTION);
 		});
 	});
 

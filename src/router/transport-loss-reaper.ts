@@ -99,10 +99,12 @@
  * succeeded through its ordinary success tail — the next phase for the item and every
  * split child it advanced, merge automation, CI recovery. The phase is not run again
  * and no second run exists. A late failure, or silence, leaves the retry to run when
- * due. Trust ends when the retry takes over — the scheduled retry is pushed, or the
- * operator presses Retry now, whose push does the same — or when the run settles
- * terminally because its budget is spent ({@link stopOrphansOfDispatch}); from then on
- * the orphan is stopped and fenced exactly as above, and a late success is dropped.
+ * due. Trust ends when the dispatch stops waiting for that retry: when the scheduled
+ * retry — or the operator's Retry now — is claimed ({@link endOrphanTrustAtClaim}) and
+ * pushed ({@link stopOrphansOfDispatch}), or when the claimed job ends any other way,
+ * terminally or deferred for another reason ({@link endOrphanTrustUnlessRetryPending});
+ * from then on the orphan is stopped and fenced exactly as above, and a late success
+ * is dropped.
  *
  * A router restart inside the window loses the in-memory orphan record, so the late
  * result is dropped and the scheduled retry runs at its due time.
@@ -123,6 +125,7 @@ import {
 	countDispatchInterruptions,
 	type DispatchTransportLoss,
 	failOrphanedDispatchResultWait,
+	hasTrustedOrphans,
 	listOrphanedDispatchesForWorker,
 	type OrphanedDispatch,
 	resolveDispatchStreamTarget,
@@ -301,8 +304,8 @@ function pushOrphanStop(orphan: OrphanedDispatch, reason: string): boolean {
 /**
  * End the trusted window for `dispatchId` and stop its orphans (issue #1076): the
  * automatic retry is being pushed to `newWorkerId` (`./dispatcher.ts`), or, with no
- * worker named, the run settled terminally because its automatic-retry budget is
- * spent and no retry is coming.
+ * worker named, the dispatch settled without one — terminally, or deferred for some
+ * other reason ({@link endOrphanTrustUnlessRetryPending}).
  *
  * Each orphan that was still trusted is told to stop now if its worker is connected.
  * One that is not is fenced from here on and stopped when it reconnects
@@ -316,7 +319,7 @@ export function stopOrphansOfDispatch(dispatchId: string, newWorkerId?: string):
 		logger.warn(
 			newWorkerId
 				? "automatic retry taking over: stopping the lost worker's earlier attempt"
-				: "transport-lost run settled terminally: stopping the lost worker's attempt",
+				: "transport-lost dispatch moved on without its retry: stopping the lost worker's attempt",
 			{
 				dispatchId,
 				runId: orphan.runId,
@@ -326,6 +329,66 @@ export function stopOrphansOfDispatch(dispatchId: string, newWorkerId?: string):
 			},
 		);
 	}
+}
+
+/**
+ * The scheduled retry of `dispatchId` was just claimed (issue #1076): from here on the
+ * late attempt can no longer be adopted — the dispatch has left `retry-scheduled` —
+ * so its trusted window ends.
+ *
+ * Only orphans whose worker is disconnected lose their trust here. They are fenced at
+ * once and stopped when they reconnect, which is what keeps a retry that defers
+ * before pushing (the gate finds no eligible worker, the task is in flight) from
+ * leaving them free to write while nothing will settle their result. A connected
+ * orphan is left to what the claim leads to: the push forgets it when the retry goes
+ * back to its own worker, whose running phase then answers the new wait, and stops it
+ * when the retry goes elsewhere; a claim that ends without a push stops it in
+ * {@link endOrphanTrustUnlessRetryPending}. Stopping it here instead would race the
+ * push of the same dispatch id to the same worker, whose answer to the stop would
+ * settle the new wait.
+ */
+export function endOrphanTrustAtClaim(dispatchId: string): void {
+	const distrusted = takeOverOrphanedDispatch(
+		dispatchId,
+		undefined,
+		(orphan) => !isWorkerConnected(orphan.workerId),
+	);
+	for (const orphan of distrusted) {
+		logger.info('automatic retry claimed: fencing the lost worker until it reconnects', {
+			dispatchId,
+			runId: orphan.runId,
+			workerId: orphan.workerId,
+		});
+	}
+}
+
+/**
+ * Once a claimed dispatch's job has run its course, end the trusted window of any
+ * orphan still trusted unless the dispatch is again waiting for a transport-lost
+ * automatic retry (issue #1076) — the one state a late success can still be adopted
+ * from. That covers every way the claim can end without the push taking the orphans
+ * over: a terminal settle (the retry budget is spent, a skip, a failure before the
+ * push) and a deferral for any other wait reason (`worker-eligibility`,
+ * `task-in-flight`, …), which the adoption would refuse anyway.
+ *
+ * A deferral this very job made because *its* push lost its transport keeps the new
+ * orphan trusted, which is the point. Never throws: a failed read ends the trust,
+ * because a fenced orphan is the safe side of the trade (#1073's behaviour).
+ */
+export async function endOrphanTrustUnlessRetryPending(dispatchId: string): Promise<void> {
+	if (!hasTrustedOrphans(dispatchId)) return;
+	try {
+		const dispatch = await getDispatchById(dispatchId);
+		if (dispatch?.state === 'retry-scheduled' && dispatch.waitReason === 'transport-lost') {
+			return;
+		}
+	} catch (err) {
+		logger.warn('late result: failed to read the dispatch after its job — ending trust', {
+			dispatchId,
+			error: describeError(err),
+		});
+	}
+	stopOrphansOfDispatch(dispatchId);
 }
 
 /**

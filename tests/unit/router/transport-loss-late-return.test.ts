@@ -13,6 +13,8 @@ import {
 import { LATE_RESULT_ACCEPTED_NOTE } from '@/router/stream-log-persistence.js';
 import {
 	acceptLateOrphanResult,
+	endOrphanTrustAtClaim,
+	endOrphanTrustUnlessRetryPending,
 	reapDispatchesIfTransportStaysLost,
 	stopOrphanedDispatchesOnReturn,
 	stopOrphansOfDispatch,
@@ -468,9 +470,10 @@ describe('a phase reaped on transport loss that finishes on its reconnected work
 	it('behaves as #1073 once the budget is spent: stopped on return, fenced, late success dropped', async () => {
 		await reaped();
 
-		// The run settled terminally instead of deferring; the consumer's settle hook ends
-		// the trust while the worker is still away, so nothing can be pushed yet.
-		stopOrphansOfDispatch(DISPATCH_ID);
+		// The run settled terminally instead of deferring; the job's end ends the trust
+		// while the worker is still away, so nothing can be pushed yet.
+		getDispatchById.mockResolvedValue(scheduledRetry({ state: 'failed', waitReason: null }));
+		await endOrphanTrustUnlessRetryPending(DISPATCH_ID);
 
 		const returned = fakeWs();
 		registerConnection(WORKER_ID, returned);
@@ -507,6 +510,86 @@ describe('a phase reaped on transport loss that finishes on its reconnected work
 		stopOrphanedDispatchesOnReturn(WORKER_ID);
 		expect(returned.send).not.toHaveBeenCalled();
 		deregisterConnection(WORKER_ID, returned);
+	});
+
+	// The review of #1078: a retry claimed and then deferred before it pushes — the gate
+	// found no eligible worker, the only one being the machine still asleep — used to
+	// leave the orphan trusted while nothing could adopt its result any more.
+	it('ends the window at the claim when the retry defers before pushing: stopped on return, fenced, success dropped', async () => {
+		await reaped();
+
+		// 21:16:31Z — the retry is claimed with the lost worker still away, and the gate
+		// defers it as `worker-eligibility` without pushing anything.
+		endOrphanTrustAtClaim(DISPATCH_ID);
+		getDispatchById.mockResolvedValue(scheduledRetry({ waitReason: 'worker-eligibility' }));
+		await endOrphanTrustUnlessRetryPending(DISPATCH_ID);
+		getDispatchById.mockClear();
+
+		// 21:21:31Z — the machine wakes with Planning still running: told to stop, and its
+		// board writes refused.
+		const returned = fakeWs();
+		registerConnection(WORKER_ID, returned);
+		stopOrphanedDispatchesOnReturn(WORKER_ID);
+		expect(JSON.parse(String(returned.send.mock.calls[0][0]))).toMatchObject({
+			type: 'task-cancel',
+			dispatchId: DISPATCH_ID,
+			runId: RUN_ID,
+			phase: 'planning',
+			taskId: '568',
+		});
+		const board = boardSpies();
+		expect(await planningDelivery(deliveryDeps(board))).toEqual([409, 409, 409, 409, 409, 409]);
+		for (const write of Object.values(board)) expect(write).not.toHaveBeenCalled();
+
+		// Its late success is neither adopted nor served.
+		expect(frameFrom(WORKER_ID, LATE_SUCCESS)).toBe(false);
+		await vi.advanceTimersByTimeAsync(0);
+		expect(getDispatchById).not.toHaveBeenCalled();
+		expect(adoptLateResultIntoScheduledRetry).not.toHaveBeenCalled();
+		deregisterConnection(WORKER_ID, returned);
+	});
+
+	it('leaves a connected orphan to the claim’s push, and stops it when the claim defers without one', async () => {
+		await reaped();
+		const returned = fakeWs();
+		registerConnection(WORKER_ID, returned);
+
+		// Claimed while the worker is back: the push may yet go to that same worker, so
+		// the claim neither stops nor fences it.
+		endOrphanTrustAtClaim(DISPATCH_ID);
+		expect(returned.send).not.toHaveBeenCalled();
+		expect(isDispatchOrphanedFrom(WORKER_ID, DISPATCH_ID)).toBe(false);
+
+		// The claim defers instead (the task is in flight): the stop goes out at once.
+		getDispatchById.mockResolvedValue(scheduledRetry({ waitReason: 'task-in-flight' }));
+		await endOrphanTrustUnlessRetryPending(DISPATCH_ID);
+		expect(JSON.parse(String(returned.send.mock.calls[0][0]))).toMatchObject({
+			type: 'task-cancel',
+			dispatchId: DISPATCH_ID,
+		});
+		expect(isDispatchOrphanedFrom(WORKER_ID, DISPATCH_ID)).toBe(true);
+		deregisterConnection(WORKER_ID, returned);
+	});
+
+	it('keeps the trust of an orphan whose job deferred it for its transport-lost retry', async () => {
+		await reaped();
+
+		// The job whose push was reaped ends with the dispatch waiting for that retry.
+		await endOrphanTrustUnlessRetryPending(DISPATCH_ID);
+
+		const board = boardSpies();
+		expect(await planningDelivery(deliveryDeps(board))).toEqual([200, 200, 200, 200, 200, 200]);
+		frameFrom(WORKER_ID, LATE_SUCCESS);
+		await vi.waitFor(() => expect(adoptLateResultIntoScheduledRetry).toHaveBeenCalledTimes(1));
+	});
+
+	it('ends the trust when the dispatch cannot be read after the job', async () => {
+		await reaped();
+		getDispatchById.mockRejectedValue(new Error('connection terminated'));
+
+		await endOrphanTrustUnlessRetryPending(DISPATCH_ID);
+
+		expect(isDispatchOrphanedFrom(WORKER_ID, DISPATCH_ID)).toBe(true);
 	});
 
 	it('pushes the terminal stop at once when the lost worker is already back', async () => {

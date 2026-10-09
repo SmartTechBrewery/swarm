@@ -575,23 +575,30 @@ server-side store) it needs:
    settle path outside `processJob`. Item 16 removed both: the run is only `deferred`,
    and its dispatch is still there to re-enter.
 
-   So the orphan record is **trusted** from the reap until the retry takes over: no stop
+   So the orphan record is **trusted** from the reap until the retry is claimed: no stop
    on return, no `409`, and a late `succeeded` from its own worker is handed to an
    injected hook (`acceptLateOrphanResult`) that compare-and-sets the scheduled retry
    (`retry-scheduled` + `transport-lost`, at the wake sequence read) to `pending`, due
    now, wait reason `late-result`, carrying the frame and the attempt's
-   `DispatchSelection` as `adoptedResult`. `processJob` then skips the gate, the bind and
-   the slot, reuses the run row, and the control-plane executor adapts the carried result
+   `DispatchSelection` as `adoptedResult`. `processJob` then — if the trigger it
+   re-resolves names the frame's own phase and task; otherwise it drops the result and
+   runs that phase — skips the gate, the bind and the slot, reuses the run row, and the control-plane executor adapts the carried result
    instead of pushing — the ordinary success tail runs, next phases and split children
    included. Anything but a success, or silence, leaves the retry to run when due.
 
    Decisions worth recording. **The adoption re-enters `processJob` through the same
    dispatch**, so there is still exactly one settle path and one run. **Trust ends at the
-   takeover**: the retry's push (scheduled or Retry now) untrusts the dispatch's orphans
-   and stops any connected one first; a spent budget does the same through an optional
-   `ProcessJobDeps` hook the consumer calls after settling a `transport-lost` failure
-   terminally. An orphan on the retry's own worker is forgotten rather than stopped — it
-   acks the re-push `duplicate` and its phase answers the new wait. **An SCM adoption
+   claim**, the moment an adoption can no longer succeed, bracketed around each claimed
+   job by the router (`processControlPlaneJob`): the claim (scheduled or Retry now)
+   untrusts every orphan whose worker is disconnected, so a retry that then defers
+   without pushing — no eligible worker, the task in flight — cannot leave it writing;
+   the push untrusts the rest and stops any connected one; and a job that ends any other
+   way — terminally, or deferred for another wait reason — stops whatever is still
+   trusted unless the dispatch is again waiting for its `transport-lost` retry. A
+   connected orphan is not stopped at the claim because the push may be going back to
+   its own worker: there it is forgotten rather than stopped — it acks the re-push
+   `duplicate` and its phase answers the new wait — and a stop sent a moment earlier
+   would answer that wait instead. **An SCM adoption
    reuses its PR+SHA slot** (`continuationDispatchClaimed`), as the pre-run waits do, or
    the claim TTL would drop it as a duplicate. **Visible**: a control-plane note in the
    run's output and a sticky `runs.recovery.lateResultAcceptedFromWorkerId`, shown in the

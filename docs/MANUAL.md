@@ -744,8 +744,9 @@ the run settles `completed` and the next phase starts as if the result had arriv
 time. The Queue briefly shows the dispatch as "settling with the late result of the lost
 worker", and the run detail and the run's output say the late result was accepted. While
 the retry is still waiting the returning worker is allowed to finish, so its board
-writes land; once the retry has started (or Retry now was pressed), the old attempt is
-told to stop and anything it still tries to write is refused.
+writes land; once the retry is picked up (or Retry now was pressed) — even if it then
+has to wait again, say for an eligible worker — the old attempt is told to stop and
+anything it still tries to write is refused.
 
 **Is this worker running the fix?** The dashboard's **Workers** screen answers it.
 Each machine's daemon declares the SWARM build it is actually running — the commit

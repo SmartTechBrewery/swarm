@@ -2289,14 +2289,14 @@ export interface ProcessJobDeps {
 	 */
 	pushWorkerUpdate: (workerId: string, requestId: string) => Promise<WorkerUpdatePushResult>;
 	/**
-	 * A run whose worker transport was lost has just settled **terminally** — its
-	 * automatic-retry budget is spent, so no retry will take its dispatch over
-	 * (issue #1076). The control plane trusted the orphaned attempt to finish while
-	 * that retry was pending; this ends the trust, so the orphan is stopped and fenced
-	 * as issue #1073 describes. Fire-and-forget, and optional because only the side
-	 * holding worker sockets has anything to stop.
+	 * This job has just claimed its dispatch (issue #1076). A dispatch reaped on
+	 * transport loss trusts its orphaned attempt to finish only while it waits for the
+	 * automatic retry; once that retry is claimed the late result can no longer be
+	 * adopted, so the control plane ends the trust here — before the gate or the task
+	 * claim can defer the retry without ever pushing it. Fire-and-forget, and optional
+	 * because only the side holding worker sockets has orphans to fence.
 	 */
-	onTransportLostSettledTerminally?: (dispatchId: string) => void;
+	onDispatchClaimed?: (dispatchId: string) => void;
 }
 
 /** Adapt the federated worker+target selection to the shared target-routing shape. */
@@ -4891,6 +4891,18 @@ async function settleNoTriggerDelivery(
 	return { status: 'no-trigger' };
 }
 
+/**
+ * Whether an adopted late result (issue #1076) is the result of the phase and task
+ * this dispatch re-resolved to. The frame names both, so a mismatch is never settled
+ * as the wrong phase's success.
+ */
+function adoptedResultMatchesTrigger(
+	adopted: NonNullable<SwarmJob['adoptedResult']>,
+	trigger: TriggerResult,
+): boolean {
+	return adopted.result.phase === trigger.phase && adopted.result.taskId === trigger.taskId;
+}
+
 export async function processJob(
 	job: SwarmJob,
 	registry: TriggerRegistry,
@@ -4913,6 +4925,7 @@ export async function processJob(
 		return { status: 'dispatch-refused', reason: claim.reason };
 	}
 	const dispatch = claim.dispatch;
+	deps.onDispatchClaimed?.(dispatch.id);
 	try {
 		// The dispatch row's stored payload is authoritative — a manual retry's
 		// overrides land there, not on the wake-up job.
@@ -5161,7 +5174,22 @@ export async function processJob(
 		// #1076) already ran, on the machine that result came from: it asks the gate
 		// nothing, binds no claim and takes no slot, and `executePhase` adapts the
 		// carried result instead of pushing. Everything after that is the ordinary
-		// success tail, which is the point.
+		// success tail, which is the point. Only for the phase the result came from:
+		// the trigger is re-resolved from the stored event, and live PR state can send
+		// an SCM continuation down a different phase than the one the lost worker ran.
+		// That one runs normally — the scheduled retry is the right fallback.
+		if (job.adoptedResult && !adoptedResultMatchesTrigger(job.adoptedResult, trigger)) {
+			logger.warn('Dropping an adopted late result that names another phase — running it', {
+				projectId: project.id,
+				dispatchId: dispatch.id,
+				phase: trigger.phase,
+				taskId: trigger.taskId,
+				adoptedPhase: job.adoptedResult.result.phase,
+				adoptedTaskId: job.adoptedResult.result.taskId,
+			});
+			const { adoptedResult: _dropped, ...rest } = job;
+			job = rest;
+		}
 		const adoptedSelection = job.adoptedResult?.selection;
 		// The federated dispatch gate (issue #339): confirm an eligible worker may
 		// take this phase — and on which configured target — *before* anything is
@@ -5415,16 +5443,6 @@ export async function processJob(
 				dispatchId: dispatch.id,
 				error: describeError(settleErr),
 			});
-		}
-		// A lost transport that settled terminally rather than deferring — its
-		// automatic-retry budget is spent — has no retry coming to take its orphan
-		// over, so the orphan's trusted window ends here (issue #1076).
-		if (
-			outcome.status === 'phase-failed' &&
-			err instanceof AgentRunError &&
-			err.failure.kind === 'transport-lost'
-		) {
-			deps.onTransportLostSettledTerminally?.(dispatch.id);
 		}
 		// A Review that ended terminally without delivering a verdict owes the PR+SHA
 		// slot back (issue #1019), so the retry this failure invites is evaluated on

@@ -95,6 +95,7 @@ import {
 	type TaskProgress,
 } from '../transport/protocol.js';
 import { createTriggerRegistry, registerBuiltInTriggers } from '../triggers/index.js';
+import type { TriggerRegistry } from '../triggers/registry.js';
 import type { TriggerResult } from '../triggers/types.js';
 import {
 	type DispatchPhaseContext,
@@ -117,7 +118,11 @@ import { BlockedRecoveryError, type BlockedRecoveryReason } from '../worktree/re
 import { composeSystemPrompt, resolveTargetBranch } from './assignment-composition.js';
 import { cancelRunOnWorker, subscribeDispatchCancellations } from './dispatch-cancellation.js';
 import { awaitDispatchResult, type TransportInterruptions } from './dispatch-results.js';
-import { stopOrphansOfDispatch } from './transport-loss-reaper.js';
+import {
+	endOrphanTrustAtClaim,
+	endOrphanTrustUnlessRetryPending,
+	stopOrphansOfDispatch,
+} from './transport-loss-reaper.js';
 import { isWorkerConnected, sendToWorker } from './worker-connections.js';
 import { pushPendingWorkerUpdate } from './worker-update-dispatch.js';
 
@@ -872,8 +877,8 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
  * durably (no local executor), the fenced claim binds the selected worker's
  * session, the phase runs by pushing an assignment rather than in-process, and a
  * `worker-update` dispatch (issue #972) hands its frame to the machine over the
- * very sockets this process holds. A run whose lost transport settled terminally
- * stops its orphan over those same sockets (issue #1076).
+ * very sockets this process holds. The orphan fencing that brackets each claimed
+ * job (issue #1076) is added per job by {@link processControlPlaneJob}.
  */
 export function createControlPlaneDispatchDeps(): ProcessJobDeps {
 	return {
@@ -882,8 +887,36 @@ export function createControlPlaneDispatchDeps(): ProcessJobDeps {
 		resolveBindIdentity: resolveSelectedWorkerIdentity,
 		executePhase: pushAndAwaitResult,
 		pushWorkerUpdate: pushPendingWorkerUpdate,
-		onTransportLostSettledTerminally: (dispatchId) => stopOrphansOfDispatch(dispatchId),
 	};
+}
+
+/**
+ * Run one wake-up through `processJob`, bracketing the dispatch it claims with the
+ * end of its orphans' trusted window (issue #1076): at the claim, an orphan whose
+ * worker is gone is fenced ({@link endOrphanTrustAtClaim}); once the job is over, any
+ * orphan still trusted is stopped unless the dispatch is again waiting for a
+ * transport-lost retry ({@link endOrphanTrustUnlessRetryPending}). Between the two
+ * the push takes the rest over. Keyed on the dispatch the job actually claimed, so a
+ * refused wake-up never ends a trust that is still owed.
+ */
+export async function processControlPlaneJob(
+	job: SwarmJob,
+	registry: TriggerRegistry,
+	shutdownSignal: AbortSignal,
+	deps: ProcessJobDeps,
+): Promise<JobOutcome> {
+	let claimedDispatchId: string | undefined;
+	try {
+		return await processJob(job, registry, shutdownSignal, undefined, {
+			...deps,
+			onDispatchClaimed: (dispatchId) => {
+				claimedDispatchId = dispatchId;
+				endOrphanTrustAtClaim(dispatchId);
+			},
+		});
+	} finally {
+		if (claimedDispatchId) await endOrphanTrustUnlessRetryPending(claimedDispatchId);
+	}
 }
 
 /** A running control-plane dispatch consumer — closed on router shutdown. */
@@ -944,11 +977,10 @@ export async function startControlPlaneDispatch(options: {
 				}
 				return { status: 'no-trigger' } as const;
 			}
-			return await processJob(
+			return await processControlPlaneJob(
 				SwarmJobSchema.parse(job.data),
 				registry,
 				options.shutdownSignal,
-				undefined,
 				deps,
 			);
 		},

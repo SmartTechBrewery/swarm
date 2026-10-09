@@ -8,6 +8,7 @@ import {
 	deliverDispatchResult,
 	failDispatchResultWait,
 	failOrphanedDispatchResultWait,
+	hasTrustedOrphans,
 	isDispatchOrphanedFrom,
 	listAwaitedDispatchesForWorker,
 	listOrphanedDispatchesForWorker,
@@ -725,6 +726,26 @@ describe('trusted orphans', () => {
 		expect(deliverDispatchResult(result(DISPATCH_A), WORKER_A, hook)).toBe(false);
 		expect(hook).toHaveBeenCalledTimes(1);
 		expect(takeOverOrphanedDispatch(DISPATCH_A)).toEqual([]);
+	});
+
+	// The claim-time seam (the review of #1078): trust can end with no push at all, and
+	// only for the orphans the caller names.
+	it('ends the trust of only the orphans the takeover includes, with no push', () => {
+		orphan();
+		expect(hasTrustedOrphans(DISPATCH_A)).toBe(true);
+
+		expect(takeOverOrphanedDispatch(DISPATCH_A, undefined, () => false)).toEqual([]);
+		expect(hasTrustedOrphans(DISPATCH_A)).toBe(true);
+		expect(isDispatchOrphanedFrom(WORKER_A, DISPATCH_A)).toBe(false);
+
+		expect(takeOverOrphanedDispatch(DISPATCH_A, undefined, () => true)).toEqual([
+			expect.objectContaining({ dispatchId: DISPATCH_A, workerId: WORKER_A, trusted: false }),
+		]);
+		expect(hasTrustedOrphans(DISPATCH_A)).toBe(false);
+		expect(isDispatchOrphanedFrom(WORKER_A, DISPATCH_A)).toBe(true);
+		expect(listOrphanedDispatchesForWorker(WORKER_A)).toEqual([
+			expect.objectContaining({ dispatchId: DISPATCH_A }),
+		]);
 	});
 
 	it('never adopts a success sent by another worker', () => {
