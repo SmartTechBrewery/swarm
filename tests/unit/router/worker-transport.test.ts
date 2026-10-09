@@ -113,6 +113,7 @@ function makeDeps(overrides: Partial<WorkerTransportDeps> = {}): WorkerTransport
 		onWorkerTransportLost: vi.fn(),
 		onWorkerTransportRestored: vi.fn(),
 		resendRunCancellations: vi.fn(),
+		stopOrphanedDispatches: vi.fn(),
 		resendPendingWorkerUpdate: vi.fn(),
 		resendPendingWorktreeSweep: vi.fn(),
 		advanceWorkerRollout: vi.fn(),
@@ -1659,5 +1660,68 @@ describe('GET /worker/stream cancellation re-push on reconnect', () => {
 
 		await handlers.onClose?.({}, ws);
 		warnSpy.mockRestore();
+	});
+});
+
+/**
+ * Issue #1073: a worker that comes back after the transport-loss reap may still be
+ * running the phase that reap settled, so its stream opening is where it is told to
+ * stop. The push itself is exercised against the real registries in
+ * `transport-loss-reaper.test.ts`; this suite pins how the open wires it.
+ */
+describe('GET /worker/stream stops phases settled while the worker was away', () => {
+	beforeEach(() => vi.clearAllMocks());
+
+	async function open(deps: WorkerTransportDeps) {
+		const handlers = await openStream(deps, {
+			authorization: `Bearer ${CREDENTIAL}`,
+			fencingToken: '7',
+		});
+		const ws = fakeWs();
+		handlers.onOpen?.({}, ws);
+		return { handlers, ws };
+	}
+
+	it('stops them for the worker that reconnected, before waking new work for it', async () => {
+		const deps = makeDeps();
+
+		const { handlers, ws } = await open(deps);
+
+		expect(deps.stopOrphanedDispatches).toHaveBeenCalledWith(WORKER_ID);
+		// The stop goes out ahead of anything that could push this machine new work.
+		const stop = vi.mocked(deps.stopOrphanedDispatches).mock.invocationCallOrder[0];
+		const wake = vi.mocked(deps.onWorkerAvailable).mock.invocationCallOrder[0];
+		expect(stop).toBeLessThan(wake);
+		await handlers.onClose?.({}, ws);
+	});
+
+	it('keeps the socket registered, and the other hooks running, when the stop throws', async () => {
+		const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+		const deps = makeDeps({
+			stopOrphanedDispatches: vi.fn(() => {
+				throw new Error('boom');
+			}),
+		});
+
+		const { handlers, ws } = await open(deps);
+
+		expect(isWorkerConnected(WORKER_ID)).toBe(true);
+		expect(deps.onWorkerAvailable).toHaveBeenCalledWith(WORKER_ID);
+		expect(deps.resendRunCancellations).toHaveBeenCalledWith(WORKER_ID);
+		expect(warnSpy).toHaveBeenCalled();
+		await handlers.onClose?.({}, ws);
+		warnSpy.mockRestore();
+	});
+
+	it('stops nothing on an unauthenticated open', async () => {
+		const deps = makeDeps({ resolveWorkerByCredential: vi.fn().mockResolvedValue(undefined) });
+		const handlers = await openStream(deps, {
+			authorization: `Bearer ${CREDENTIAL}`,
+			fencingToken: '7',
+		});
+
+		handlers.onOpen?.({}, fakeWs());
+
+		expect(deps.stopOrphanedDispatches).not.toHaveBeenCalled();
 	});
 });

@@ -5,6 +5,7 @@ import { DEFAULT_WORKER_SUPPORTED_PHASES, type Worker } from '@/identity/worker.
 import type { ReviewVerdictLedger } from '@/pipeline/review-ledger.js';
 import type { PMProvider } from '@/pm/types.js';
 import {
+	type DeliveryResult,
 	handleAbandonReviewVerdict,
 	handleAddBlockedBy,
 	handleAddPmComment,
@@ -26,6 +27,7 @@ import {
 	handleScheduleFollowUpReview,
 	handleSubmitReview,
 	handleUpdateWorkItem,
+	ORPHANED_DISPATCH_DELIVERY_REASON,
 	type WorkerDeliveryDeps,
 } from '@/router/worker-delivery.js';
 import type { ScmDeliveryProvider } from '@/scm/delivery.js';
@@ -128,6 +130,8 @@ function makeDeps(overrides: Partial<WorkerDeliveryDeps> = {}): WorkerDeliveryDe
 				id === record.id ? record : undefined,
 		),
 		isWorkerEnrolled: vi.fn().mockResolvedValue(true),
+		// No dispatch is orphaned unless a test says so (issue #1073).
+		isDispatchOrphaned: vi.fn().mockReturnValue(false),
 		buildScmDelivery: vi.fn().mockResolvedValue(makeDelivery()),
 		buildPmProvider: vi.fn(() => makePmProvider()),
 		reviewLedger: makeReviewLedger(),
@@ -2095,5 +2099,148 @@ describe("run-scoped routes act on the run's repository (issue #1055)", () => {
 		expect(buildPmProvider).toHaveBeenCalledWith(
 			expect.objectContaining({ id: 'swarm', repo: DEFAULT_REPO }),
 		);
+	});
+});
+
+/**
+ * The dispatch fence (issue #1073). The transport-loss reap settles a run but cannot
+ * stop its agent, so a worker that only slept comes back, finishes the phase and calls
+ * these routes for a run already recorded as failed. Those calls are refused, so the
+ * board and the run cannot disagree.
+ */
+describe('the dispatch fence on project-scoped routes (issue #1073)', () => {
+	beforeEach(() => vi.clearAllMocks());
+
+	const DISPATCH_ID = '44444444-4444-4444-8444-444444444444';
+	const PR = { prNumber: '42', headSha: 'deadbeef' };
+
+	/** Every project-scoped route, each with a body that would otherwise be served. */
+	const ROUTES: Array<
+		[
+			string,
+			(
+				deps: WorkerDeliveryDeps,
+				credential: string | undefined,
+				body: unknown,
+			) => Promise<DeliveryResult>,
+			Record<string, unknown>,
+		]
+	> = [
+		['review', handleSubmitReview, reviewBody()],
+		['pr-comment', handlePostComment, commentBody()],
+		['pm/move', handleMoveWorkItem, moveBody()],
+		['pm/comment', handleAddPmComment, pmCommentBody()],
+		['pm/blockers', handleListBlockers, { projectId: 'swarm', itemId: 'PVTI_item1' }],
+		['pm/dependents', handleListDependents, { projectId: 'swarm', itemId: 'PVTI_item1' }],
+		['pm/find-item', handleFindWorkItem, { projectId: 'swarm', urlSuffix: '/issues/17' }],
+		['pm/find-item-by-marker', handleFindWorkItemByMarker, { projectId: 'swarm', marker: 'm' }],
+		[
+			'pm/find-artifact',
+			handleFindWorkItemForArtifact,
+			{ projectId: 'swarm', repository: 'SmartTechBrewery/swarm', kind: 'issue', number: '17' },
+		],
+		[
+			'pm/find-comment',
+			handleFindPmComment,
+			{ projectId: 'swarm', itemId: 'PVTI_item1', marker: 'm' },
+		],
+		[
+			'pm/create-item',
+			handleCreateWorkItem,
+			{ projectId: 'swarm', title: 'Phase 2 of 2', description: 'child', status: 'backlog' },
+		],
+		[
+			'pm/update-item',
+			handleUpdateWorkItem,
+			{ projectId: 'swarm', itemId: 'PVTI_item1', title: 'T' },
+		],
+		['pm/label', handleAddPmLabel, { projectId: 'swarm', itemId: 'PVTI_item1', name: 'planned' }],
+		[
+			'pm/blocked-by',
+			handleAddBlockedBy,
+			{ projectId: 'swarm', itemId: 'PVTI_item2', blockerId: 'PVTI_item1' },
+		],
+		[
+			'follow-up-review',
+			handleScheduleFollowUpReview,
+			{ projectId: 'swarm', prNumber: '42', prBranch: 'issue-21', headSha: 'newsha' },
+		],
+		['review-ledger/prior', handlePriorReview, priorReviewBody()],
+		['review-ledger/mark', handleMarkReviewVerdict, markLedgerBody()],
+		['review-ledger/abandon', handleAbandonReviewVerdict, { projectId: 'swarm', ...PR }],
+	];
+
+	function withDispatch(body: Record<string, unknown>, dispatchId?: string) {
+		return {
+			...body,
+			...(dispatchId !== undefined && { dispatchId }),
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		};
+	}
+
+	it.each(
+		ROUTES,
+	)('%s refuses a call for a dispatch settled while its worker was away, touching nothing', async (_route, handle, body) => {
+		const isDispatchOrphaned = vi.fn().mockReturnValue(true);
+		const deps = makeDeps({ isDispatchOrphaned });
+
+		const result = await handle(deps, CREDENTIAL, withDispatch(body, DISPATCH_ID));
+
+		expect(result).toEqual({ status: 409, json: { reason: ORPHANED_DISPATCH_DELIVERY_REASON } });
+		// Fenced on the worker the credential resolved to, never one the body names.
+		expect(isDispatchOrphaned).toHaveBeenCalledWith(WORKER_ID, DISPATCH_ID);
+		// Refused before anything is read or written on the run's behalf.
+		expect(deps.findProjectRecordById).not.toHaveBeenCalled();
+		expect(deps.buildPmProvider).not.toHaveBeenCalled();
+		expect(deps.buildScmDelivery).not.toHaveBeenCalled();
+		expect(deps.scheduleFollowUpReview).not.toHaveBeenCalled();
+		expect(deps.reviewLedger.markReviewVerdictSubmitted).not.toHaveBeenCalled();
+		expect(deps.reviewLedger.abandonReviewVerdict).not.toHaveBeenCalled();
+	});
+
+	it.each(
+		ROUTES,
+	)('%s serves a call for a dispatch that is still live', async (_route, handle, body) => {
+		const isDispatchOrphaned = vi.fn().mockReturnValue(false);
+		const deps = makeDeps({
+			isDispatchOrphaned,
+			// `pm/create-item` answers with the card it created.
+			buildPmProvider: vi.fn(() =>
+				makePmProvider({ createWorkItem: vi.fn().mockResolvedValue(createMockWorkItem()) }),
+			),
+		});
+
+		const result = await handle(deps, CREDENTIAL, withDispatch(body, DISPATCH_ID));
+
+		expect(result.status).toBe(200);
+		expect(isDispatchOrphaned).toHaveBeenCalledWith(WORKER_ID, DISPATCH_ID);
+	});
+
+	it('serves a worker predating the field exactly as before, consulting no fence', async () => {
+		const moveWorkItem = vi.fn().mockResolvedValue(undefined);
+		const isDispatchOrphaned = vi.fn().mockReturnValue(true);
+		const deps = makeDeps({
+			isDispatchOrphaned,
+			buildPmProvider: vi.fn(() => makePmProvider({ moveWorkItem })),
+		});
+
+		const result = await handleMoveWorkItem(deps, CREDENTIAL, moveBody());
+
+		expect(result.status).toBe(200);
+		expect(moveWorkItem).toHaveBeenCalledWith('PVTI_item1', 'inReview');
+		expect(isDispatchOrphaned).not.toHaveBeenCalled();
+	});
+
+	it('answers an unauthenticated call 401, revealing nothing about settled dispatches', async () => {
+		const isDispatchOrphaned = vi.fn().mockReturnValue(true);
+		const deps = makeDeps({
+			isDispatchOrphaned,
+			resolveWorkerByCredential: vi.fn().mockResolvedValue(undefined),
+		});
+
+		const result = await handleMoveWorkItem(deps, 'bogus', withDispatch(moveBody(), DISPATCH_ID));
+
+		expect(result.status).toBe(401);
+		expect(isDispatchOrphaned).not.toHaveBeenCalled();
 	});
 });

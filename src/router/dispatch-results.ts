@@ -28,7 +28,16 @@
  * worker, it records a dropped `/worker/stream` against those dispatches, so an
  * undelivered result can be attributed to the drop rather than to a silent worker.
  *
- * The `Map` is module-private; callers touch it only through the exported
+ * And since issue #1073 it remembers the dispatches the transport-loss reap
+ * (`./transport-loss-reaper.ts`, issue #859) ended, for a while after the wait is
+ * gone. A reap settles the run; it does not stop the agent, and a worker that comes
+ * back late can still be running the phase. Remembering *which* worker each one was
+ * pushed to is what lets the router stop that phase when the worker reconnects and
+ * refuse the delivery calls it still makes (`./worker-delivery.ts`). Without it the
+ * late phase's board writes landed while its result was dropped, so the board said
+ * the phase succeeded and the run said it failed.
+ *
+ * The `Map`s are module-private; callers touch them only through the exported
  * functions.
  */
 
@@ -118,6 +127,25 @@ const byRun = new Map<string, string>();
 function unindexRun(dispatchId: string, runId: string | undefined): void {
 	if (runId !== undefined && byRun.get(runId) === dispatchId) byRun.delete(runId);
 }
+
+/**
+ * How long an orphaned dispatch is remembered after the reap (issue #1073). It has to
+ * outlast the phase the worker may still be running, and a worker that went to sleep
+ * resumes its agent wherever it was: the incident behind this came back about 12
+ * minutes after the reap, and a laptop closed overnight comes back hours later. A day
+ * covers that. Normally the entry goes long before then, when the worker returns and
+ * answers the stop. Only a worker that never returns keeps one this long, and the
+ * expiry is what stops those piling up.
+ */
+export const ORPHANED_DISPATCH_RETENTION_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * dispatchId → the registration of a dispatch the transport-loss reap ended (issue
+ * #1073). Kept apart from `pending` on purpose: that map is "who is awaiting what",
+ * and an orphan is awaited by no one. Its run is already settled, and nothing here
+ * may resolve it again.
+ */
+const orphaned = new Map<string, DispatchRegistration>();
 
 /**
  * What this router observed happening to the worker's transport while it was
@@ -244,9 +272,33 @@ export function awaitDispatchResult(
  * is awaiting it (already settled, timed out, or delivered to another router), in
  * which case the frame is dropped and the durable dispatch state is authoritative.
  * Consuming the entry (deleting it) makes a duplicate result frame a no-op.
+ *
+ * A result for an *orphaned* dispatch (issue #1073) is dropped as well, but it is
+ * expected rather than anomalous: it is how a worker that came back answers the stop
+ * it was sent, or reports a phase that finished while it was away. That result is
+ * the last thing the late phase sends, so the orphan record is forgotten here, and
+ * nothing is left running that its fence or its stop would apply to.
  */
 export function deliverDispatchResult(result: TaskExecutionResult): boolean {
 	const entry = pending.get(result.dispatchId);
+	const orphan = entry ? undefined : orphaned.get(result.dispatchId);
+	if (orphan) {
+		orphaned.delete(result.dispatchId);
+		// Still `warn`: a late `succeeded` means the phase finished its work on the
+		// worker, and the run says it failed. Its board writes after the reap were
+		// refused, so the board agrees with the run. This line is still the one an
+		// operator needs to see before retrying it.
+		logger.warn(
+			'dispatch back-channel: a result for a dispatch settled when its worker was lost — dropping; its run is already settled',
+			{
+				dispatchId: result.dispatchId,
+				status: result.status,
+				workerId: orphan.workerId,
+				runId: orphan.runId,
+			},
+		);
+		return false;
+	}
 	if (!entry) {
 		// `warn`, not `debug`: a dropped terminal result means the run it belongs to is
 		// no longer being settled by anyone, so it waits out `RESULT_WAIT_MARGIN_MS` and
@@ -318,6 +370,80 @@ export function failDispatchResultWait(
 		// caller's frame must stay exactly the shape it is today, with no key at all.
 		...(options.cancelled ? { cancelled: true } : {}),
 	});
+}
+
+/**
+ * {@link failDispatchResultWait} for the transport-loss reap (issue #859), and the
+ * one reap whose worker can come back afterwards with the phase still running (issue
+ * #1073).
+ *
+ * The other two settles that end a wait early do not need this. A superseded
+ * generation (#719) is a different daemon process. A termination settled behind a
+ * silent worker (#827) stops a phase the operator wanted stopped anyway. A transport
+ * reap is the router giving up on a worker it cannot see. If that worker was only
+ * asleep, it resumes the agent and finishes the phase. So before the wait is ended,
+ * its registration is kept as an orphan: who the dispatch was pushed to, and the
+ * phase and task a stop has to name. The settle itself is
+ * {@link failDispatchResultWait} unchanged, so run history and the frame shape are
+ * exactly what #859 writes.
+ *
+ * The record expires after {@link ORPHANED_DISPATCH_RETENTION_MS}. The timer is
+ * unreffed and identity-checked, so a later orphaning of the same id is never
+ * forgotten early.
+ */
+export function failOrphanedDispatchResultWait(dispatchId: string, reason: string): boolean {
+	const entry = pending.get(dispatchId);
+	if (!entry) return false;
+	const orphan: DispatchRegistration = {
+		workerId: entry.workerId,
+		runId: entry.runId,
+		phase: entry.phase,
+		taskId: entry.taskId,
+	};
+	orphaned.set(dispatchId, orphan);
+	const expiry = setTimeout(() => {
+		if (orphaned.get(dispatchId) === orphan) orphaned.delete(dispatchId);
+	}, ORPHANED_DISPATCH_RETENTION_MS);
+	expiry.unref();
+	return failDispatchResultWait(dispatchId, reason);
+}
+
+/** One dispatch the transport-loss reap ended on a worker, as a stop has to name it. */
+export interface OrphanedDispatch extends DispatchRegistration {
+	dispatchId: string;
+}
+
+/**
+ * The dispatches this router reaped from `workerId` that the worker has not answered
+ * for yet (issue #1073). This is what its reconnect is told to stop
+ * (`./transport-loss-reaper.ts`).
+ *
+ * A dispatch awaited here again is left out. A reaped dispatch settles terminally,
+ * and a retry of its run opens a new dispatch, so this should never happen. If it
+ * did, a stop answered on the old phase's behalf would resolve the new wait.
+ */
+export function listOrphanedDispatchesForWorker(workerId: string): OrphanedDispatch[] {
+	const listed: OrphanedDispatch[] = [];
+	for (const [dispatchId, orphan] of orphaned) {
+		if (orphan.workerId !== workerId || pending.has(dispatchId)) continue;
+		listed.push({ dispatchId, ...orphan });
+	}
+	return listed;
+}
+
+/**
+ * Whether `dispatchId` is one this router reaped from `workerId` and is not awaiting
+ * on that worker again. This is the fence the delivery API applies to a request
+ * naming its dispatch (`./worker-delivery.ts`, issue #1073). Work done on a settled
+ * dispatch's behalf is work its run will never account for.
+ *
+ * Keyed on the worker as well as the dispatch, so one worker's orphan never fences
+ * another. Answers `false` for any dispatch it has no record of: a router that
+ * restarted since the reap, or one that never reaped it, keeps today's behaviour.
+ */
+export function isDispatchOrphanedFrom(workerId: string, dispatchId: string): boolean {
+	if (orphaned.get(dispatchId)?.workerId !== workerId) return false;
+	return pending.get(dispatchId)?.workerId !== workerId;
 }
 
 /**

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
 	awaitDispatchResult,
 	countDispatchInterruptions,
@@ -6,9 +6,13 @@ import {
 	deliverDispatchProgress,
 	deliverDispatchResult,
 	failDispatchResultWait,
+	failOrphanedDispatchResultWait,
+	isDispatchOrphanedFrom,
 	listAwaitedDispatchesForWorker,
+	listOrphanedDispatchesForWorker,
 	noteWorkerTransportLost,
 	noteWorkerTransportRestored,
+	ORPHANED_DISPATCH_RETENTION_MS,
 	resolveDispatchStreamTarget,
 	resolveDispatchTargetForRun,
 } from '@/router/dispatch-results.js';
@@ -470,5 +474,129 @@ describe('listAwaitedDispatchesForWorker', () => {
 		awaiting.dispose();
 
 		expect(listAwaitedDispatchesForWorker(WORKER_A)).toEqual([]);
+	});
+});
+
+/**
+ * What the transport-loss reap leaves behind (issue #1073): the dispatches it ended,
+ * remembered against the worker they were pushed to, because that worker can come
+ * back with the phase still running.
+ */
+describe('orphaned dispatches', () => {
+	const REASON = "The worker's transport session was lost and did not return within the grace";
+
+	/** End `dispatchId`'s orphan record the way production does: its late result arrives. */
+	function answer(dispatchId: string): boolean {
+		return deliverDispatchResult(result(dispatchId));
+	}
+
+	afterEach(() => vi.useRealTimers());
+
+	it('settles the wait exactly as failDispatchResultWait does', async () => {
+		const awaiting = awaitDispatchResult(DISPATCH_A, TARGET_A);
+
+		expect(failOrphanedDispatchResultWait(DISPATCH_A, REASON)).toBe(true);
+
+		// The #859 frame, unchanged: a plain terminal failure with no `cancelled` key.
+		await expect(awaiting.result).resolves.toEqual({
+			type: 'task-execution-result',
+			dispatchId: DISPATCH_A,
+			status: 'failed',
+			phase: 'implementation',
+			taskId: '407',
+			error: REASON,
+			reason: REASON,
+		});
+		awaiting.dispose();
+		answer(DISPATCH_A);
+	});
+
+	it('remembers the orphan against the worker it was pushed to, and no other', () => {
+		const awaiting = awaitDispatchResult(DISPATCH_A, TARGET_A);
+		failOrphanedDispatchResultWait(DISPATCH_A, REASON);
+		awaiting.dispose();
+
+		expect(listOrphanedDispatchesForWorker(WORKER_A)).toEqual([
+			{ dispatchId: DISPATCH_A, ...TARGET_A },
+		]);
+		expect(listOrphanedDispatchesForWorker(WORKER_B)).toEqual([]);
+		expect(isDispatchOrphanedFrom(WORKER_A, DISPATCH_A)).toBe(true);
+		// One worker's orphan never fences another worker's calls.
+		expect(isDispatchOrphanedFrom(WORKER_B, DISPATCH_A)).toBe(false);
+		expect(isDispatchOrphanedFrom(WORKER_A, DISPATCH_B)).toBe(false);
+		answer(DISPATCH_A);
+	});
+
+	it('records nothing for a dispatch nobody here is awaiting', () => {
+		expect(failOrphanedDispatchResultWait(DISPATCH_A, REASON)).toBe(false);
+
+		expect(listOrphanedDispatchesForWorker(WORKER_A)).toEqual([]);
+		expect(isDispatchOrphanedFrom(WORKER_A, DISPATCH_A)).toBe(false);
+	});
+
+	it('drops the late result and forgets the orphan — nothing is left to stop or fence', () => {
+		const awaiting = awaitDispatchResult(DISPATCH_A, TARGET_A);
+		failOrphanedDispatchResultWait(DISPATCH_A, REASON);
+		awaiting.dispose();
+
+		// A late `succeeded` resolves nothing: the run already settled on the reap.
+		expect(answer(DISPATCH_A)).toBe(false);
+
+		expect(listOrphanedDispatchesForWorker(WORKER_A)).toEqual([]);
+		expect(isDispatchOrphanedFrom(WORKER_A, DISPATCH_A)).toBe(false);
+	});
+
+	it('lifts the fence and the stop for a dispatch awaited on that worker again', () => {
+		const first = awaitDispatchResult(DISPATCH_A, TARGET_A);
+		failOrphanedDispatchResultWait(DISPATCH_A, REASON);
+		first.dispose();
+
+		// Defensive: a reaped dispatch settles terminally and its retry opens a new id,
+		// but a wait on the same worker again means its calls are that wait's own.
+		const again = awaitDispatchResult(DISPATCH_A, TARGET_A);
+		expect(isDispatchOrphanedFrom(WORKER_A, DISPATCH_A)).toBe(false);
+		expect(listOrphanedDispatchesForWorker(WORKER_A)).toEqual([]);
+		again.dispose();
+
+		// Awaited on another worker: the original one stays fenced, but it is not told to
+		// stop, since its answer would resolve the other worker's wait.
+		const elsewhere = awaitDispatchResult(DISPATCH_A, { ...TARGET_A, workerId: WORKER_B });
+		expect(isDispatchOrphanedFrom(WORKER_A, DISPATCH_A)).toBe(true);
+		expect(listOrphanedDispatchesForWorker(WORKER_A)).toEqual([]);
+		elsewhere.dispose();
+		answer(DISPATCH_A);
+	});
+
+	it('forgets an orphan whose worker never answers once the retention elapses', () => {
+		vi.useFakeTimers();
+		const awaiting = awaitDispatchResult(DISPATCH_B, TARGET_B);
+		failOrphanedDispatchResultWait(DISPATCH_B, REASON);
+		awaiting.dispose();
+
+		vi.advanceTimersByTime(ORPHANED_DISPATCH_RETENTION_MS - 1);
+		expect(isDispatchOrphanedFrom(WORKER_B, DISPATCH_B)).toBe(true);
+
+		vi.advanceTimersByTime(1);
+		expect(isDispatchOrphanedFrom(WORKER_B, DISPATCH_B)).toBe(false);
+		expect(listOrphanedDispatchesForWorker(WORKER_B)).toEqual([]);
+	});
+
+	it('does not let an earlier orphaning’s expiry forget a later one of the same id', () => {
+		vi.useFakeTimers();
+		const first = awaitDispatchResult(DISPATCH_B, TARGET_B);
+		failOrphanedDispatchResultWait(DISPATCH_B, REASON);
+		first.dispose();
+
+		vi.advanceTimersByTime(ORPHANED_DISPATCH_RETENTION_MS / 2);
+		const second = awaitDispatchResult(DISPATCH_B, TARGET_B);
+		failOrphanedDispatchResultWait(DISPATCH_B, REASON);
+		second.dispose();
+
+		// The first record's timer fires here; the second record must survive it.
+		vi.advanceTimersByTime(ORPHANED_DISPATCH_RETENTION_MS / 2);
+		expect(isDispatchOrphanedFrom(WORKER_B, DISPATCH_B)).toBe(true);
+
+		vi.advanceTimersByTime(ORPHANED_DISPATCH_RETENTION_MS / 2);
+		expect(isDispatchOrphanedFrom(WORKER_B, DISPATCH_B)).toBe(false);
 	});
 });

@@ -36,6 +36,14 @@ export interface DeliveryClientOptions {
 	controlPlaneUrl: string;
 	/** Raw registered-worker credential (sent as `Authorization: Bearer`). */
 	workerCredential: string;
+	/**
+	 * The assignment these calls are made for, when they are made for one (issue
+	 * #1073). Stamped into every request body, so the control plane can refuse work
+	 * for a dispatch it already settled when this worker's transport was lost. Set by
+	 * the assignment executor (`./assignment-execution.ts`); a machine-scoped report
+	 * (quota, update, sweep) is made for no assignment and leaves it unset.
+	 */
+	dispatchId?: string;
 	/** Override `fetch` in tests; defaults to the global. */
 	fetchImpl?: FetchLike;
 }
@@ -112,7 +120,13 @@ export async function postDelivery<T>(
 			'content-type': 'application/json',
 			authorization: `Bearer ${options.workerCredential}`,
 		},
-		body: JSON.stringify({ ...body, protocolVersion: TRANSPORT_PROTOCOL_VERSION }),
+		body: JSON.stringify({
+			...body,
+			// Only when the call is made for an assignment, so a machine-scoped report's
+			// body is exactly what it was before issue #1073.
+			...(options.dispatchId !== undefined && { dispatchId: options.dispatchId }),
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		}),
 	});
 	if (!response.ok) throw new Error(await failureMessage(path, response));
 	let payload: unknown;

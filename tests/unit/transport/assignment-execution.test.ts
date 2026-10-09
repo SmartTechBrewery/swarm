@@ -518,16 +518,16 @@ describe('runAssignmentDbFree', () => {
 			return { agent: agentResult() };
 		});
 
-		await runAssignmentDbFree(
-			buildTaskAssignment(
-				createMockTaskAssignmentInput({
-					phase: 'planning',
-					workItem: createMockWorkItem({ id: 'ITEM_60' }),
-				}),
-			),
-			sink,
-			{ ...RUN_OPTIONS, deps: depsWith(runPhase, async () => stubDelivery(), fetchImpl) },
+		const assignment = buildTaskAssignment(
+			createMockTaskAssignmentInput({
+				phase: 'planning',
+				workItem: createMockWorkItem({ id: 'ITEM_60' }),
+			}),
 		);
+		await runAssignmentDbFree(assignment, sink, {
+			...RUN_OPTIONS,
+			deps: depsWith(runPhase, async () => stubDelivery(), fetchImpl),
+		});
 
 		expect(sink.sent.at(-1)).toMatchObject({ status: 'succeeded', phase: 'planning' });
 		expect(posted.map((url) => url.replace(`${CONTROL_PLANE}/worker/delivery`, ''))).toEqual([
@@ -543,9 +543,12 @@ describe('runAssignmentDbFree', () => {
 			'/pm/label',
 		]);
 		// Every board call is scoped to the assignment's project, which the server then
-		// re-derives from the authenticated enrollment rather than trusting this field.
+		// re-derives from the authenticated enrollment rather than trusting this field,
+		// and names the assignment's dispatch, which the server fences a late return on
+		// (issue #1073).
 		for (const [, init] of fetchImpl.mock.calls) {
 			expect(JSON.parse(init.body).projectId).toBe(PROJECT_ID);
+			expect(JSON.parse(init.body).dispatchId).toBe(assignment.dispatchId);
 		}
 	});
 
@@ -674,14 +677,14 @@ describe('runAssignmentDbFree', () => {
 			return { agent: agentResult(), movedTo: 'inReview' as const };
 		});
 
-		await runAssignmentDbFree(
-			ciAssignment({
-				phase: 'respond-to-review',
-				pr: { prNumber: '99', prBranch: 'issue-17', headSha: 'deadbeef', reviewId: '7' },
-			}),
-			sink,
-			{ ...RUN_OPTIONS, deps: depsWith(runPhase, async () => operator, fetchImpl) },
-		);
+		const assignment = ciAssignment({
+			phase: 'respond-to-review',
+			pr: { prNumber: '99', prBranch: 'issue-17', headSha: 'deadbeef', reviewId: '7' },
+		});
+		await runAssignmentDbFree(assignment, sink, {
+			...RUN_OPTIONS,
+			deps: depsWith(runPhase, async () => operator, fetchImpl),
+		});
 
 		expect(sink.sent.at(-1)).toMatchObject({
 			status: 'succeeded',
@@ -696,6 +699,7 @@ describe('runAssignmentDbFree', () => {
 		]);
 		expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toEqual({
 			projectId: PROJECT_ID,
+			dispatchId: assignment.dispatchId,
 			urlSuffix: '/issues/17',
 			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
 		});
@@ -703,6 +707,7 @@ describe('runAssignmentDbFree', () => {
 		// rather than the project's default entry's (issue #1055).
 		expect(JSON.parse(fetchImpl.mock.calls[2][1].body)).toEqual({
 			projectId: PROJECT_ID,
+			dispatchId: assignment.dispatchId,
 			repository: 'SmartTechBrewery/swarm',
 			prNumber: '99',
 			prBranch: 'issue-17',
@@ -766,11 +771,13 @@ describe('runAssignmentDbFree', () => {
 			return { agent: agentResult(), movedTo: 'inReview' as const };
 		});
 
-		await runAssignmentDbFree(
-			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'implementation' })),
-			sink,
-			{ ...RUN_OPTIONS, deps: depsWith(runPhase, async () => operator, fetchImpl) },
+		const assignment = buildTaskAssignment(
+			createMockTaskAssignmentInput({ phase: 'implementation' }),
 		);
+		await runAssignmentDbFree(assignment, sink, {
+			...RUN_OPTIONS,
+			deps: depsWith(runPhase, async () => operator, fetchImpl),
+		});
 
 		expect(sink.sent.at(-1)).toMatchObject({
 			status: 'succeeded',
@@ -778,13 +785,15 @@ describe('runAssignmentDbFree', () => {
 			movedTo: 'inReview',
 		});
 		// Both board writes went up to the control plane, project-scoped, under this
-		// worker's own credential — with a canonical status key, never an option ID.
+		// worker's own credential — with a canonical status key, never an option ID —
+		// and naming the dispatch they are made for (issue #1073).
 		expect(fetchImpl).toHaveBeenCalledTimes(2);
 		const [moveUrl, moveInit] = fetchImpl.mock.calls[0];
 		expect(moveUrl).toBe(`${CONTROL_PLANE}/worker/delivery/pm/move`);
 		expect(moveInit.headers.authorization).toBe(`Bearer ${WORKER_CREDENTIAL}`);
 		expect(JSON.parse(moveInit.body)).toEqual({
 			projectId: PROJECT_ID,
+			dispatchId: assignment.dispatchId,
 			itemId: 'PVTI_item1',
 			status: 'inProgress',
 			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
@@ -976,11 +985,14 @@ describe('runAssignmentDbFree', () => {
 			return { agent: agentResult(), verdict: 'approve' as const };
 		});
 
-		await runAssignmentDbFree(
-			ciAssignment({ phase: 'review', pr: { prNumber: '99', headSha: 'deadbeef' } }),
-			sink,
-			{ ...RUN_OPTIONS, deps: depsWith(runPhase, async () => operator, fetchImpl) },
-		);
+		const assignment = ciAssignment({
+			phase: 'review',
+			pr: { prNumber: '99', headSha: 'deadbeef' },
+		});
+		await runAssignmentDbFree(assignment, sink, {
+			...RUN_OPTIONS,
+			deps: depsWith(runPhase, async () => operator, fetchImpl),
+		});
 
 		expect(sink.sent.at(-1)).toMatchObject({
 			status: 'succeeded',
@@ -994,6 +1006,7 @@ describe('runAssignmentDbFree', () => {
 		expect(init.headers.authorization).toBe(`Bearer ${WORKER_CREDENTIAL}`);
 		expect(JSON.parse(init.body)).toEqual({
 			projectId: PROJECT_ID,
+			dispatchId: assignment.dispatchId,
 			repository: 'SmartTechBrewery/swarm',
 			prNumber: 99,
 			verdict: 'approve',

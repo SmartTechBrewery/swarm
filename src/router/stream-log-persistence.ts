@@ -146,6 +146,8 @@ export const TRANSPORT_LOST_NOTE =
 export const TRANSPORT_RESTORED_NOTE = 'Transport session restored — output resumes.';
 export const TRANSPORT_LOST_ORPHAN_NOTE =
 	'Transport session to the worker never returned — this phase was terminated and the pull request, task and capacity it held were released.';
+export const TRANSPORT_RETURNED_AFTER_ORPHAN_NOTE =
+	'The worker came back after this phase was terminated — it was told to stop the phase, and any board or review writes it still attempts are refused.';
 
 /**
  * Write one control-plane-authored line into a run's output stream. Unlike every

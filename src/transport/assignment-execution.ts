@@ -1128,10 +1128,13 @@ export async function runAssignmentDbFree(
 		);
 		// Where a metadata write this worker cannot perform itself is delivered: the
 		// control plane, authenticated by the worker's own credential (never a
-		// project credential — those stay server-side, ADR-004 §2).
+		// project credential — those stay server-side, ADR-004 §2). Every call names
+		// this assignment's dispatch, so a phase the control plane has already settled
+		// while this machine was away cannot write the board on its behalf (issue #1073).
 		const transport: DeliveryClientOptions = {
 			controlPlaneUrl: options.controlPlaneUrl,
 			workerCredential: options.workerCredential,
+			dispatchId,
 			fetchImpl: deps.fetchImpl,
 		};
 
