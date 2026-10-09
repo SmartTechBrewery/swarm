@@ -23,6 +23,13 @@ import { projects } from './projects.js';
  * retry — the cap counts only `submitted` slots, plus at most one `pending` slot
  * in flight at a time.
  *
+ * {@link reviewVerdicts.supersededAt} is **orthogonal to `state`** (issue
+ * #1079): a superseded slot stays `submitted`, because the review genuinely
+ * happened and every other lookup still needs it, but it stops counting toward
+ * `REVIEW_VERDICT_CAP` and stops consuming an ordinal — exactly as an
+ * `abandoned` slot does — and is counted against the second, larger
+ * `REVIEW_SUPERSEDED_CAP` instead.
+ *
  * `repository` denormalizes the owning project's `repo` (rather than joining
  * `projects` for every lookup), matching `runs.prNumber`/`runs.prTitle`'s
  * precedent of carrying PR-driven-phase context directly on the row.
@@ -61,6 +68,17 @@ export const reviewVerdicts = pgTable(
 		 */
 		dispatchId: uuid('dispatch_id').references(() => dispatches.id, { onDelete: 'set null' }),
 		submittedAt: timestamp('submitted_at'),
+		/**
+		 * When merge automation found this *submitted* approval's merge refused only
+		 * because the pull request's head had moved since the review (issue #1079) —
+		 * in practice a Resolve-conflicts merge of a fast-moving base. A superseded
+		 * slot frees its ordinal and its `REVIEW_VERDICT_CAP` slot, exactly as an
+		 * `abandoned` one does, and is counted against `REVIEW_SUPERSEDED_CAP`
+		 * instead: the pull request's code was approved, so the churn must not spend
+		 * the allowance the request-changes loop protection exists to bound. Set only
+		 * on a `submitted` row, and never cleared.
+		 */
+		supersededAt: timestamp('superseded_at'),
 		/**
 		 * When an operator deliberately forced the corrective cycle to continue past
 		 * this slot's cap-reaching verdict ("Force re-review", issue #511). Set on

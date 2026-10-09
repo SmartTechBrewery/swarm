@@ -48,6 +48,17 @@
  *  - the head the update produces pre-claims its own PR+SHA review-dispatch slot
  *    so re-verification costs no `REVIEW_VERDICT_CAP` slot.
  *
+ * **A refusal the head caused frees the approval's cap slot (issue #1079).**
+ * When a terminal `not-eligible` is explained *only* by the pull request's head
+ * having moved since the review — in practice Resolve-conflicts pushing a merge
+ * of a fast-moving base — the dispatch stamps that approval's review-verdict
+ * slot `superseded_at` ({@link markApprovalSupersededByHeadChange}), so the pass
+ * stops spending one of `REVIEW_VERDICT_CAP`'s three slots and the pull request
+ * is reviewed again at its current head instead of stalling green, mergeable and
+ * permanently unreviewed. Decided by one provider-neutral `getPullRequest` read
+ * rather than a structured refusal reason, and written on the two head-moved
+ * paths only — never on the red-merged-tree refusal, which is a real failure.
+ *
  * **A `merged` outcome also settles what the merge absorbed (issue #959).** When
  * this pull request's Review runs declared they traced a split sibling's whole
  * scope through its diff, that sibling is closed as part of the same merge —
@@ -64,6 +75,7 @@ import {
 	type DispatchRow,
 	scheduleDispatchRetry,
 } from '../db/repositories/dispatchesRepository.js';
+import { markReviewVerdictSuperseded } from '../db/repositories/reviewVerdictsRepository.js';
 import { updateReviewMergeOutcome } from '../db/repositories/runsRepository.js';
 import { settleAbsorbedChildren } from '../dispatch/absorbed-child-settle.js';
 import { createAndPublishDispatch, publishDispatchWakeUp } from '../dispatch/dispatcher.js';
@@ -204,6 +216,10 @@ export async function requestMergeAutomation(input: RequestMergeAutomationInput)
 		repo: input.project.repo,
 		prNumber: input.prNumber,
 		approvedHeadSha: input.approvedHeadSha,
+		// The same SHA today, and deliberately a second field: `approvedHeadSha` is
+		// re-written by a base update (issue #874) while the ledger slot stays where
+		// the review was (issue #1079).
+		reviewedHeadSha: input.approvedHeadSha,
 	};
 	try {
 		const { dispatch, created } = await createAndPublishDispatch({
@@ -651,11 +667,18 @@ async function reactToStaleBase(
 			approvedHeadSha: job.approvedHeadSha,
 			message: update.message,
 		});
+		// The head moved out from under the approval, which is exactly what must not
+		// spend a review-cap slot (issue #1079).
+		await markApprovalSupersededByHeadChange(job, project, capabilities);
 		await completeDispatch(dispatch.id, 'merge-not-eligible');
 		return settle('not-eligible');
 	}
 
 	if (update.status === 'conflict') {
+		// Deliberately *not* stamped superseded (issue #1079): a conflicting update
+		// means the base does not merge into the head, not that the head moved, so
+		// the approval keeps its slot. (This branch would not reach the terminal
+		// `not-eligible` below either — it settles here.)
 		await persistMergeOutcome(job, 'not-eligible', update.message, attempt);
 		await commentOnMergeRefusal(
 			job,
@@ -709,6 +732,80 @@ async function reactToStaleBase(
 			message: `failed to bring the head up to date with the base: ${update.message}`,
 		},
 	};
+}
+
+/**
+ * Record that this approval was superseded, when the pull request's head moved
+ * after the review (issue #1079) — which frees the ledger slot's
+ * `REVIEW_VERDICT_CAP` allowance so the pull request is reviewed again at its
+ * current head instead of stopping green, mergeable and permanently unreviewed.
+ *
+ * Asked only on a terminal `not-eligible`, and answered by one provider read
+ * rather than by a structured refusal reason on `MergePullRequestOutcome`, for
+ * the reason `../dispatch/force-re-review.ts` states for the identical read: the
+ * current head is in no row SWARM holds, the question is "did the head move",
+ * and `not-eligible`'s other causes (drafted, closed, the approval dismissed)
+ * all leave it where it was. Sniffing a provider's own prose for the answer is
+ * what `ai/RULES.md` §2 forbids in shared code.
+ *
+ * The key is `reviewedHeadSha` — the head the Review reviewed — never the
+ * possibly-advanced `approvedHeadSha` (issue #874), because the ledger slot
+ * stays where the review was.
+ *
+ * Best-effort throughout: a read or write failure is logged and the settle is
+ * unchanged. The worst case is today's behaviour — the slot keeps counting and
+ * the pull request needs an operator's Force re-review.
+ */
+async function markApprovalSupersededByHeadChange(
+	job: MergeAutomationJob,
+	project: ProjectConfig,
+	capabilities: MergeAutomationCapabilities,
+): Promise<void> {
+	const reviewedHeadSha = job.reviewedHeadSha ?? job.approvedHeadSha;
+	try {
+		const read = capabilities.getPullRequest ?? scmCapability(project, 'getPullRequest');
+		// Implementer: the persona this dispatch merges as, so one attempt does not
+		// speak as two different accounts.
+		const details = await read(project, Number(job.prNumber), 'implementer');
+		if (details.headSha === reviewedHeadSha) {
+			logger.debug('Merge automation: the head is unchanged — the refusal had another cause', {
+				runId: job.reviewRunId,
+				prNumber: job.prNumber,
+				reviewedHeadSha,
+			});
+			return;
+		}
+		const stamped = await markReviewVerdictSuperseded({
+			projectId: project.id,
+			repository: job.repo,
+			prNumber: job.prNumber,
+			headSha: reviewedHeadSha,
+		});
+		const context = {
+			runId: job.reviewRunId,
+			prNumber: job.prNumber,
+			reviewedHeadSha,
+			currentHeadSha: details.headSha,
+		};
+		if (stamped) {
+			logger.info(
+				'Merge automation: the approval was superseded by a head change — it no longer spends a review-cap slot',
+				context,
+			);
+		} else {
+			logger.warn(
+				'Merge automation: no submitted review slot to mark superseded (already stamped, or never recorded)',
+				context,
+			);
+		}
+	} catch (err) {
+		logger.warn('Merge automation: could not record the superseded approval', {
+			runId: job.reviewRunId,
+			prNumber: job.prNumber,
+			reviewedHeadSha,
+			error: describeError(err),
+		});
+	}
 }
 
 /** What one merge attempt came back with, before any of it is settled. */
@@ -897,6 +994,10 @@ export async function processMergeAutomationDispatch(
 			headSha: job.approvedHeadSha,
 			failedChecks: redFreshChecks,
 		});
+		// Deliberately *not* stamped superseded (issue #1079), and returned before
+		// the terminal branch below that would: this refusal is a genuinely red
+		// merged tree, not a supersession. The approval must keep its slot —
+		// freeing it would buy re-reviews of a combination that is actually broken.
 		await completeDispatch(dispatch.id, 'merge-not-eligible');
 		return {
 			status: 'merge-automation-settled',
@@ -994,6 +1095,13 @@ export async function processMergeAutomationDispatch(
 		status: outcome.status,
 		message: outcome.message,
 	});
+	if (outcome.status === 'not-eligible') {
+		// The one refusal a moved head produces here. The read inside decides
+		// whether that is what happened — `not-eligible`'s other causes (drafted,
+		// closed, the approval dismissed) leave the head where it was and keep
+		// their slot (issue #1079).
+		await markApprovalSupersededByHeadChange(job, project, capabilities);
+	}
 	await completeDispatch(
 		dispatch.id,
 		TERMINAL_MERGE_OUTCOMES[outcome.status] ?? 'merge-not-eligible',

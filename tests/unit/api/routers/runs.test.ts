@@ -1903,6 +1903,7 @@ describe('runsRouter', () => {
 					// Meaningful only on a `pending` slot, so each case that turns on it
 					// says so itself.
 					dispatchActive: false,
+					superseded: false,
 					...overrides,
 				};
 			}

@@ -56,6 +56,16 @@
  * provides** — and it leaves this reason-agnostic for every failure that leaves
  * the ledger consistent, which after #856 includes both live shapes above.
  *
+ * **The same division covers a superseded approval (issue #1079).** Merge
+ * automation stamps an approval whose merge was refused only because the head
+ * moved, which frees that slot's cap allowance — but it stamps it *after* the
+ * new head's own `checks completed` event has typically already been skipped,
+ * and that event never fires twice. So the freeing is #1079's and the
+ * re-dispatch is this sweep's: {@link classifyReviewLedgerForRecovery} is
+ * `isReviewAllowanceSpent`-driven, so a pull request whose spent slots were
+ * superseded now classifies `recover` where it used to classify `capped`, with
+ * no logic of its own to change.
+ *
  * **Provider cost.** One pull-request list read per repository per pass, plus one
  * aggregate-checks read only for a pull request that is genuinely unreviewed at
  * its head. In steady state the per-PR call count is zero. The list read runs

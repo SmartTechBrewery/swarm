@@ -56,6 +56,22 @@
  * can never license two reviews — and the raised ordinal still trips
  * {@link isCapReachingRequestChanges}, so the forced pass stops the automatic
  * cycle again rather than reopening it.
+ *
+ * **Superseded approvals (issue #1079).** A `submitted` approval whose merge was
+ * refused *only* because the pull request's head had moved since the review —
+ * most often because Resolve-conflicts pushed a merge of a fast-moving base —
+ * is stamped {@link markReviewVerdictSuperseded} by the merge dispatch
+ * (`src/worker/merge-automation.ts`). It stays `submitted`, because the review
+ * genuinely happened and the prior-review signal, the force-re-review slot read
+ * and the override grant all still need it; but it stops counting toward
+ * {@link REVIEW_VERDICT_CAP} and stops consuming an ordinal, exactly as an
+ * `abandoned` row does, and is counted against the second, larger
+ * {@link REVIEW_SUPERSEDED_CAP} instead. The reasoning is the abandoned-slot
+ * one: the code *was* approved, and churn the pipeline caused itself must not
+ * spend the allowance the `request-changes` loop protection owns. Supersession
+ * likewise costs the PR nothing and grants it nothing — it frees an ordinal
+ * rather than a verdict, and an operator grant is still evaluated afterwards,
+ * licensing exactly one reservation past *either* bound.
  */
 
 import { and, asc, desc, eq, inArray, isNull, ne, sql } from 'drizzle-orm';
@@ -74,7 +90,48 @@ import { ACTIVE_DISPATCH_STATES } from './dispatchesRepository.js';
  */
 export const REVIEW_VERDICT_CAP = 3;
 
+/**
+ * How many of one pull request's submitted verdicts may be *superseded* by a
+ * head change before SWARM stops reviewing it anyway (issue #1079). The second,
+ * larger bound that replaces {@link REVIEW_VERDICT_CAP} for churn the pipeline
+ * caused itself: a superseded approval proves the code was fine, so it must not
+ * spend a slot the request-changes loop protection owns — but a head that keeps
+ * moving must still not buy unlimited reviews. Not configurable, on
+ * {@link REVIEW_VERDICT_CAP}'s own precedent.
+ */
+export const REVIEW_SUPERSEDED_CAP = 5;
+
 export type ReviewVerdictState = 'pending' | 'submitted' | 'abandoned';
+
+/**
+ * The two arithmetic questions {@link reserveReviewVerdict} and the pure
+ * predicates below both ask, over the smallest shape either has in hand — a DB
+ * row inside the lock, or a {@link PullRequestReviewSlot} a reader projected.
+ * Shared rather than copied because the module's whole point is that reader and
+ * writer cannot drift (issue #1079 added the second bound to both).
+ */
+interface CountableSlot {
+	state: string;
+	superseded: boolean;
+}
+
+/** A slot that still counts toward {@link REVIEW_VERDICT_CAP} — submitted and not superseded. */
+function countsTowardVerdictCap(slot: CountableSlot): boolean {
+	return slot.state === 'submitted' && !slot.superseded;
+}
+
+/** A slot that counts toward {@link REVIEW_SUPERSEDED_CAP} — submitted and superseded. */
+function countsTowardSupersededCap(slot: CountableSlot): boolean {
+	return slot.state === 'submitted' && slot.superseded;
+}
+
+/** Whether either bound is reached — the shared core of the two cap decisions. */
+function reachesEitherBound(slots: readonly CountableSlot[]): boolean {
+	return (
+		slots.filter(countsTowardVerdictCap).length >= REVIEW_VERDICT_CAP ||
+		slots.filter(countsTowardSupersededCap).length >= REVIEW_SUPERSEDED_CAP
+	);
+}
 
 /** The natural key identifying one PR's review slots (or one specific head's slot). */
 export interface ReviewVerdictKey {
@@ -108,7 +165,18 @@ export type ReviewVerdictReservation =
 	  }
 	| { status: 'reused'; id: string; ordinal: number; state: 'pending' | 'submitted' }
 	| { status: 'blocked'; ordinal: number }
-	| { status: 'capped'; recovered?: RecoveredReviewSlot };
+	/**
+	 * `reason` names which bound stopped the pull request (issue #1079):
+	 * `verdict-cap` for {@link REVIEW_VERDICT_CAP} — every permitted verdict was
+	 * actually submitted — and `superseded-bound` for {@link REVIEW_SUPERSEDED_CAP}
+	 * — the head kept moving out from under an approval. The caller logs it,
+	 * because they are the same stop for very different reasons and an operator
+	 * greps that line.
+	 */
+	| { status: 'capped'; reason: ReviewCapBound; recovered?: RecoveredReviewSlot };
+
+/** Which of the two bounds a `capped` reservation hit (issue #1079). */
+export type ReviewCapBound = 'verdict-cap' | 'superseded-bound';
 
 /**
  * Reserve (or reuse) this PR/head's review slot on behalf of `dispatchId` — the
@@ -196,17 +264,36 @@ export async function reserveReviewVerdict(
 			};
 		}
 
-		// Past the automatic cap, the PR proceeds only on an operator's explicit
+		// Superseded slots are excluded from the cap arithmetic and from the ordinal
+		// for the same reason abandoned ones are (issue #1079): the pull request's
+		// code was approved and only a head change — in practice the pipeline's own
+		// conflict resolution — invalidated the pass, so it must not spend a
+		// `REVIEW_VERDICT_CAP` slot. Unlike an abandoned row it stays `submitted`
+		// and stays in `active`, because every other lookup — the prior-review
+		// signal, the force-re-review slot read, the override grant — is still about
+		// a review that genuinely happened.
+		const countable = active.map((row) => ({
+			state: row.state,
+			superseded: row.supersededAt !== null,
+		}));
+		const counted = active.filter((row) => row.supersededAt === null);
+
+		// Past either automatic bound, the PR proceeds only on an operator's explicit
 		// grant (issue #511) — and that grant is spent here, in the same lock that
 		// creates the slot it pays for, so two racing reservations can never both
-		// redeem it.
-		const submittedCount = active.filter((row) => row.state === 'submitted').length;
+		// redeem it. One grant licenses one reservation past *either* bound.
 		let capOverride = false;
-		if (submittedCount >= REVIEW_VERDICT_CAP) {
+		if (reachesEitherBound(countable)) {
 			const grant = active.find(
 				(row) => row.capOverrideGrantedAt !== null && row.capOverrideConsumedAt === null,
 			);
-			if (!grant) return { status: 'capped', ...(recovered ? { recovered } : {}) };
+			if (!grant) {
+				const reason: ReviewCapBound =
+					countable.filter(countsTowardVerdictCap).length >= REVIEW_VERDICT_CAP
+						? 'verdict-cap'
+						: 'superseded-bound';
+				return { status: 'capped', reason, ...(recovered ? { recovered } : {}) };
+			}
 			await tx
 				.update(reviewVerdicts)
 				.set({ capOverrideConsumedAt: new Date() })
@@ -214,7 +301,7 @@ export async function reserveReviewVerdict(
 			capOverride = true;
 		}
 
-		const ordinal = active.length + 1;
+		const ordinal = counted.length + 1;
 		const inserted = await tx
 			.insert(reviewVerdicts)
 			.values({ projectId, repository, prNumber, headSha, ordinal, state: 'pending', dispatchId })
@@ -350,6 +437,36 @@ export async function abandonReviewVerdict(key: ReviewVerdictKey): Promise<void>
 		);
 }
 
+/**
+ * Record that this PR/head's submitted approval was invalidated by the pull
+ * request's head moving after the review (issue #1079) — written by the merge
+ * dispatch (`src/worker/merge-automation.ts`) when its refusal was *only* that
+ * the head changed.
+ *
+ * Conditional and therefore idempotent: it only fires on a `submitted` row that
+ * is not already stamped, so a merge retry, a reconciler re-import and a
+ * redelivered dispatch all resolve to one stamp. Returns whether a row was
+ * stamped, so the caller can log a miss (a key no slot exists for) rather than
+ * assume it landed.
+ */
+export async function markReviewVerdictSuperseded(key: ReviewVerdictKey): Promise<boolean> {
+	const rows = await getDb()
+		.update(reviewVerdicts)
+		.set({ supersededAt: new Date() })
+		.where(
+			and(
+				eq(reviewVerdicts.projectId, key.projectId),
+				eq(reviewVerdicts.repository, key.repository),
+				eq(reviewVerdicts.prNumber, key.prNumber),
+				eq(reviewVerdicts.headSha, key.headSha),
+				eq(reviewVerdicts.state, 'submitted'),
+				isNull(reviewVerdicts.supersededAt),
+			),
+		)
+		.returning({ id: reviewVerdicts.id });
+	return rows.length > 0;
+}
+
 export interface ReviewVerdictRecord {
 	ordinal: number;
 	state: ReviewVerdictState;
@@ -424,8 +541,13 @@ export async function getReviewVerdictByHead(
  *
  * Only `submitted` slots count (a `pending`/`abandoned` one never happened), and
  * the current head is excluded via `currentHeadSha` so a same-head retry of the
- * PR's first review isn't mistaken for a re-review. Returns the highest-ordinal
+ * PR's first review isn't mistaken for a re-review. Returns the most recent
  * prior verdict, or `undefined` when this is the PR's first review.
+ *
+ * Ordered by recency first, ordinal second (issue #1079): a superseded slot
+ * frees its ordinal, so two slots can now share one and `desc(ordinal)` alone
+ * would pick between them arbitrarily. Equivalent on every row written before
+ * that — ordinals were monotonic — and it is the semantics this always meant.
  */
 export async function getPriorSubmittedReview(
 	projectId: string,
@@ -445,7 +567,7 @@ export async function getPriorSubmittedReview(
 				ne(reviewVerdicts.headSha, currentHeadSha),
 			),
 		)
-		.orderBy(desc(reviewVerdicts.ordinal))
+		.orderBy(desc(reviewVerdicts.reservedAt), desc(reviewVerdicts.ordinal))
 		.limit(1);
 	return rows[0] as ReviewVerdictRecord | undefined;
 }
@@ -500,8 +622,9 @@ export async function getSubmittedReviewSlot(
  * The projection deliberately mirrors exactly what {@link reserveReviewVerdict}
  * itself reads inside its advisory lock — the same-head slot, another head's
  * `pending` one *and whether the dispatch owning it is still due to run*, the
- * `submitted` count, and the unconsumed cap-override grant — so the sweep's
- * judgement cannot drift from the writer's. `abandoned` slots are excluded here
+ * `submitted` count split by {@link PullRequestReviewSlot.superseded} (issue
+ * #1079), and the unconsumed cap-override grant — so the sweep's judgement
+ * cannot drift from the writer's. `abandoned` slots are excluded here
  * for the same reason they are filtered there: they free their ordinal without
  * costing the PR a slot.
  *
@@ -531,6 +654,15 @@ export interface PullRequestReviewSlot {
 	 * value carries meaning.
 	 */
 	dispatchActive: boolean;
+	/**
+	 * Whether this `submitted` slot's approval was invalidated by the pull
+	 * request's head moving after the review (issue #1079). A superseded slot is
+	 * excluded from the {@link REVIEW_VERDICT_CAP} arithmetic and counted against
+	 * {@link REVIEW_SUPERSEDED_CAP} instead — the reader's copy of the writer's
+	 * own `superseded_at is not null`. Always `false` for a `pending` slot, which
+	 * has no approval to supersede.
+	 */
+	superseded: boolean;
 }
 
 export async function listActiveReviewSlotsForPullRequest(
@@ -551,6 +683,7 @@ export async function listActiveReviewSlotsForPullRequest(
 			// terminal one. The join is on the dispatch's primary key, so this stays the
 			// one indexed read it was.
 			dispatchActive: sql<boolean>`coalesce(${inArray(dispatches.state, [...ACTIVE_DISPATCH_STATES])}, false)`,
+			superseded: sql<boolean>`${reviewVerdicts.supersededAt} is not null`,
 		})
 		.from(reviewVerdicts)
 		.leftJoin(dispatches, eq(reviewVerdicts.dispatchId, dispatches.id))
@@ -578,6 +711,11 @@ export async function listActiveReviewSlotsForPullRequest(
  * stop the automatic cycle exactly like the one it continued — otherwise a
  * single override would reopen the cycle indefinitely. Below the cap nothing
  * changes.
+ *
+ * Unchanged by issue #1079, and deliberately: `ordinal` is the pull request's
+ * Nth *counted* review pass, and a superseded slot does not advance it, so this
+ * still trips on the third pass the loop protection is bounding rather than on a
+ * pass that only exists because the head moved.
  */
 export function isCapReachingRequestChanges(
 	ordinal: number | undefined,
@@ -587,10 +725,10 @@ export function isCapReachingRequestChanges(
 }
 
 /**
- * Whether this pull request has spent every permitted verdict and holds no
- * unconsumed operator grant — {@link reserveReviewVerdict}'s own cap arithmetic,
- * as a pure predicate, so a reader can reach the writer's conclusion without
- * taking the advisory lock.
+ * Whether this pull request has spent its whole review allowance — either bound
+ * (issue #1079) — and holds no unconsumed operator grant:
+ * {@link reserveReviewVerdict}'s own cap arithmetic, as a pure predicate, so a
+ * reader can reach the writer's conclusion without taking the advisory lock.
  *
  * `abandoned` slots must already be excluded by the caller
  * ({@link listActiveReviewSlotsForPullRequest} does), for the reason the writer
@@ -604,8 +742,14 @@ export function isReviewAllowanceSpent(slots: readonly PullRequestReviewSlot[]):
 }
 
 /**
- * {@link isReviewAllowanceSpent}'s first half alone: every permitted verdict has
- * actually been submitted, whatever an operator has since granted.
+ * {@link isReviewAllowanceSpent}'s first half alone: the pull request's review
+ * allowance is exhausted, whatever an operator has since granted — which since
+ * issue #1079 means *either* bound is reached: {@link REVIEW_VERDICT_CAP}
+ * counted submitted verdicts, or {@link REVIEW_SUPERSEDED_CAP} submitted
+ * verdicts superseded by a head change. Both are a pull request SWARM has
+ * stopped reviewing on its own, which is exactly what every caller here asks,
+ * so the one predicate keeps Force re-review and the cap-spent callout correct
+ * for the new bound without either learning about it.
  *
  * Split out for the caller that *made* the grant (`src/dispatch/force-re-review.ts`,
  * issue #1040). "Force re-review" writes the grant and then enqueues the work it
@@ -619,7 +763,7 @@ export function isReviewAllowanceSpent(slots: readonly PullRequestReviewSlot[]):
 export function hasSubmittedEveryPermittedVerdict(
 	slots: readonly PullRequestReviewSlot[],
 ): boolean {
-	return slots.filter((slot) => slot.state === 'submitted').length >= REVIEW_VERDICT_CAP;
+	return reachesEitherBound(slots);
 }
 
 /**
@@ -641,6 +785,12 @@ export function hasOutstandingCapOverride(slots: readonly PullRequestReviewSlot[
  *
  * Pending slots are ignored: a reservation that has not submitted anything is
  * not a verdict, so it cannot displace the last one that is.
+ *
+ * Since issue #1079 a superseded slot and the replacement that reused its
+ * ordinal can both answer `true`. That is benign and deliberately not
+ * special-cased: both run-detail pages then offer Force re-review, and both
+ * forces resolve to the same correct action — one review of the pull request's
+ * *current* head.
  */
 export function isLastPermittedVerdict(
 	slots: readonly PullRequestReviewSlot[],

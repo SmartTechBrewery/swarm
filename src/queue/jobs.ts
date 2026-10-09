@@ -418,6 +418,15 @@ export const MergeAutomationJobSchema = jobBase.extend({
 	 */
 	approvedHeadSha: z.string().min(1),
 	/**
+	 * The head the Review actually reviewed — the `review_verdicts` slot's key
+	 * (issue #1079). Separate from `approvedHeadSha` because that field is
+	 * deliberately re-written when this dispatch advances the head onto its base
+	 * (issue #874), and the ledger slot stays where the review was. Optional: a row
+	 * written before this existed reads as `approvedHeadSha`, which is correct for
+	 * every dispatch that never advanced.
+	 */
+	reviewedHeadSha: z.string().min(1).optional(),
+	/**
 	 * How many times this dispatch has advanced `approvedHeadSha` by updating the
 	 * pull request's branch (issue #874) — the counter `MAX_BASE_UPDATES`
 	 * (`src/worker/merge-automation.ts`) bounds, so a pull request that keeps

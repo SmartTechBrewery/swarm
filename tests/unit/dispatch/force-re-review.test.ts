@@ -43,6 +43,7 @@ import {
 	grantReviewCapOverride,
 	listActiveReviewSlotsForPullRequest,
 	type PullRequestReviewSlot,
+	REVIEW_SUPERSEDED_CAP,
 	REVIEW_VERDICT_CAP,
 } from '@/db/repositories/reviewVerdictsRepository.js';
 import { getRunByIdFromDb } from '@/db/repositories/runsRepository.js';
@@ -156,12 +157,26 @@ function submittedSlots(count: number): PullRequestReviewSlot[] {
 		capOverrideGrantedAt: null,
 		capOverrideConsumedAt: null,
 		dispatchActive: false,
+		superseded: false,
 	}));
 }
 
 /** A pull request whose whole review allowance is spent and holds no outstanding grant. */
 function spentLedger(): PullRequestReviewSlot[] {
 	return submittedSlots(REVIEW_VERDICT_CAP);
+}
+
+/**
+ * A pull request stopped by the *superseded* bound rather than the verdict cap
+ * (issue #1079): every approval was invalidated by the head moving, so none
+ * counted toward `REVIEW_VERDICT_CAP` and each reused ordinal 1.
+ */
+function supersededLedger(): PullRequestReviewSlot[] {
+	return Array.from({ length: REVIEW_SUPERSEDED_CAP }, (_unused, index) => ({
+		...submittedSlots(1)[0],
+		headSha: index + 1 === REVIEW_SUPERSEDED_CAP ? HEAD_SHA : `superseded-${index}`,
+		superseded: true,
+	}));
 }
 
 /**
@@ -778,6 +793,32 @@ describe('forceReReview (issue #511)', () => {
 				await expect(forceReReview('run-1')).rejects.toMatchObject({
 					reason: 'missing-review-record',
 				});
+			});
+
+			// Issue #1079: the superseded bound is the *other* way a pull request stops
+			// being reviewed automatically, so this action has to rescue it too — which
+			// it does through `hasSubmittedEveryPermittedVerdict` alone, with no branch
+			// of its own.
+			it('forces a review for a pull request stopped by the superseded bound', async () => {
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(supersededLedger());
+				vi.mocked(getSubmittedReviewSlot).mockResolvedValue({ ...approvingSlot, ordinal: 1 });
+
+				await expect(forceReReview('run-1')).resolves.toMatchObject({
+					continuation: 'review',
+					capOverride: 'granted',
+				});
+			});
+
+			// The common case after #1079: merge automation stamped the head-moved
+			// refusal, which freed that slot's allowance — so automation already has the
+			// pull request and the operator is told so rather than spending a grant.
+			it('refuses once a supersession has freed the pull request’s allowance', async () => {
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(
+					spentLedger().map((slot) => ({ ...slot, superseded: true })),
+				);
+
+				await expect(forceReReview('run-1')).rejects.toMatchObject({ reason: 'not-capped' });
+				expect(grantReviewCapOverride).not.toHaveBeenCalled();
 			});
 
 			// `not-capped` keeps the two cases it is really for, and its message claims

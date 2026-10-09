@@ -144,6 +144,7 @@ const { reserveReviewVerdict } = vi.hoisted(() => ({ reserveReviewVerdict: vi.fn
 vi.mock('@/db/repositories/reviewVerdictsRepository.js', () => ({
 	reserveReviewVerdict,
 	REVIEW_VERDICT_CAP: 3,
+	REVIEW_SUPERSEDED_CAP: 5,
 }));
 
 /** Build an `AggregateCheckStatus` from `[name, status, conclusion]` triples. */
@@ -866,9 +867,20 @@ describe('review trigger', () => {
 			expect(await handler.handle(ctx(reviewable))).toBeNull();
 		});
 
-		it('skips the dispatch once every permitted verdict is submitted (capped)', async () => {
-			reserveReviewVerdict.mockResolvedValue({ status: 'capped' });
+		// Both bounds stop the dispatch the same way, and the handler names which one
+		// in the line an operator greps (issue #1079).
+		it.each([
+			['verdict-cap'],
+			['superseded-bound'],
+		])('skips the dispatch once the review allowance is spent (capped: %s)', async (reason) => {
+			reserveReviewVerdict.mockResolvedValue({ status: 'capped', reason });
+
 			expect(await handler.handle(ctx(reviewable))).toBeNull();
+
+			expect(loggerWarn).toHaveBeenCalledWith(
+				expect.stringContaining('safety cap'),
+				expect.objectContaining({ reason, cap: 3, supersededCap: 5 }),
+			);
 		});
 
 		it('reuses a same-head retry reservation and still dispatches', async () => {

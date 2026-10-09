@@ -79,7 +79,10 @@ vi.mock('@/triggers/swarm-managed-pr.js', () => ({
 	) => resolveSwarmManagedPr(project, headBranch, trigger),
 }));
 
-import { REVIEW_VERDICT_CAP } from '@/db/repositories/reviewVerdictsRepository.js';
+import {
+	REVIEW_SUPERSEDED_CAP,
+	REVIEW_VERDICT_CAP,
+} from '@/db/repositories/reviewVerdictsRepository.js';
 import { ciNoFixRecoveryDeliveryId } from '@/dispatch/ci-no-fix-recovery.js';
 import {
 	classifyReviewLedgerForRecovery,
@@ -191,6 +194,7 @@ describe('classifyReviewLedgerForRecovery', () => {
 			// The sweep classifies on slot state alone; owner liveness is the run-detail
 			// read model's question (issue #1038).
 			dispatchActive: false,
+			superseded: false,
 			...overrides,
 		};
 	}
@@ -229,6 +233,31 @@ describe('classifyReviewLedgerForRecovery', () => {
 	it('refuses once the verdict cap is spent with no override granted', () => {
 		const slots = Array.from({ length: REVIEW_VERDICT_CAP }, (_, i) =>
 			slot({ ordinal: i + 1, headSha: `head-${i}` }),
+		);
+		expect(classifyReviewLedgerForRecovery(slots, 'abc123')).toBe('capped');
+	});
+
+	// Issue #1079: the same fixture, with every spent slot superseded by a head
+	// change, is the #606 shape — the pull request is owed a review of its current
+	// head, and this sweep is the backstop that hands it one when the new head's
+	// own `checks completed` event was already skipped.
+	it('recovers when the spent slots were superseded by a head change', () => {
+		const spent = Array.from({ length: REVIEW_VERDICT_CAP }, (_, i) =>
+			slot({ ordinal: i + 1, headSha: `head-${i}` }),
+		);
+		expect(classifyReviewLedgerForRecovery(spent, 'abc123')).toBe('capped');
+		expect(
+			classifyReviewLedgerForRecovery(
+				spent.map((s) => ({ ...s, superseded: true })),
+				'abc123',
+			),
+		).toBe('recover');
+	});
+
+	// ...but a head that keeps being superseded still stops, at the second bound.
+	it('refuses once the superseded bound is spent', () => {
+		const slots = Array.from({ length: REVIEW_SUPERSEDED_CAP }, (_, i) =>
+			slot({ headSha: `head-${i}`, superseded: true }),
 		);
 		expect(classifyReviewLedgerForRecovery(slots, 'abc123')).toBe('capped');
 	});
@@ -397,6 +426,7 @@ describe('recoverUnreviewedPullRequests', () => {
 					capOverrideGrantedAt: null,
 					capOverrideConsumedAt: null,
 					dispatchActive: false,
+					superseded: false,
 				},
 			]);
 

@@ -177,6 +177,7 @@
 import type { ProjectConfig } from '../../config/schema.js';
 import { getActiveDispatchByRunId } from '../../db/repositories/dispatchesRepository.js';
 import {
+	REVIEW_SUPERSEDED_CAP,
 	REVIEW_VERDICT_CAP,
 	reserveReviewVerdict,
 } from '../../db/repositories/reviewVerdictsRepository.js';
@@ -1026,7 +1027,7 @@ async function dispatchRespondToCi(
  * consumes a review verdict.
  *
  * Fails closed: a `blocked` (another head's reservation is still pending) or
- * `capped` (every permitted verdict already submitted) result skips the dispatch, as
+ * `capped` (the review allowance is spent — either bound, issue #1079) result skips the dispatch, as
  * does a persistence error — a re-review the ledger can't currently account
  * for must not run ahead of it. A `reserved`/`reused` result (the common
  * case, including a same-head retry) proceeds.
@@ -1080,11 +1081,22 @@ async function reserveDurableReviewSlot(
 			return false;
 		}
 		if (reservation.status === 'capped') {
-			logger.warn('review: PR already used every permitted verdict — skipping (safety cap)', {
-				prNumber,
-				headSha,
-				cap: REVIEW_VERDICT_CAP,
-			});
+			// Which bound bit is the line an operator greps (issue #1079), so the two
+			// stops are named apart: a spent verdict allowance is the loop protection
+			// doing its job, while a head superseded this many times is a pull request
+			// whose base keeps moving out from under every review.
+			logger.warn(
+				reservation.reason === 'superseded-bound'
+					? "review: PR's head has been superseded too many times — skipping (safety cap)"
+					: 'review: PR already used every permitted verdict — skipping (safety cap)',
+				{
+					prNumber,
+					headSha,
+					reason: reservation.reason,
+					cap: REVIEW_VERDICT_CAP,
+					supersededCap: REVIEW_SUPERSEDED_CAP,
+				},
+			);
 			return false;
 		}
 		logger.debug('review: reserved durable review-verdict slot', {
