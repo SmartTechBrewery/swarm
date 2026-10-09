@@ -726,6 +726,18 @@ provider-oriented diagnosis. Quota, model-capacity, launch/authentication,
 worker-shutdown, and user-termination conditions take precedence and retain
 their specific recovery guidance in both the board comment and run detail.
 
+**A run whose worker's connection was lost retries itself** (issue #1075). When a
+worker drops off the network mid-phase and does not come back within the grace, the
+run is not failed for you any more: it shows as **Deferred — automatic retry
+scheduled**, with the lost connection as its reason and the time it is due, and the
+Queue lists it as "retrying after the worker's connection was lost". It is retried 30
+minutes later, at most twice per run, preferring a worker other than the one that
+dropped (the dropped one is still used when nothing else can take the phase). **Retry
+now** fires that same retry immediately rather than adding a second run, and gives the
+run a fresh automatic budget. Only once both automatic retries are spent does the run
+settle `failed` with the board comment, as it always did. If one machine keeps
+appearing in these, the fleet — not the task — is what needs looking at.
+
 **Is this worker running the fix?** The dashboard's **Workers** screen answers it.
 Each machine's daemon declares the SWARM build it is actually running — the commit
 its SWARM install root is on — and the per-worker detail view shows it, beside the

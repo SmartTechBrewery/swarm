@@ -61,6 +61,8 @@ const GRACE_MS = 120_000;
 const DISPATCH_ID = 'ee14c88f-1f88-4b64-a740-4c308ec011e5';
 const RUN_ID = '8bb1eb3f-5097-41f7-98fb-eda865b2656b';
 const WORKER_ID = '55555555-5555-4555-8555-555555555555';
+/** The worker the automatic retry lands on (issue #1075). */
+const RETRY_WORKER_ID = '66666666-6666-4666-8666-666666666666';
 const CREDENTIAL = 'karolina-uc-platform-credential';
 
 const PLANNING = { workerId: WORKER_ID, runId: RUN_ID, phase: 'planning' as const, taskId: '568' };
@@ -83,10 +85,13 @@ function boardSpies() {
 }
 
 /** The delivery API with its real dispatch fence, and the board behind it. */
-function deliveryDeps(board: ReturnType<typeof boardSpies>): WorkerDeliveryDeps {
+function deliveryDeps(
+	board: ReturnType<typeof boardSpies>,
+	workerId = WORKER_ID,
+): WorkerDeliveryDeps {
 	const record = toProjectRecord(createMockProjectConfig());
 	return {
-		resolveWorkerByCredential: vi.fn().mockResolvedValue({ id: WORKER_ID } as Worker),
+		resolveWorkerByCredential: vi.fn().mockResolvedValue({ id: workerId } as Worker),
 		findProjectRecordById: vi.fn().mockResolvedValue(record),
 		isWorkerEnrolled: vi.fn().mockResolvedValue(true),
 		// The production default: the in-process registry the reap writes.
@@ -149,11 +154,15 @@ describe('a phase reaped on transport loss that finishes on its reconnected work
 		const awaiting = awaitDispatchResult(DISPATCH_ID, PLANNING);
 
 		// 20:44:31Z — the transport drops; 20:46:31Z — the grace expires and the run is
-		// settled `failed` (the shared settle path posts the "hasn't moved" comment).
+		// settled as a `transport-lost` deferral, retried automatically later (#1075).
 		transportLost();
 		await vi.advanceTimersByTimeAsync(GRACE_MS);
 		const settled = await awaiting.result;
-		expect(settled).toMatchObject({ status: 'failed', reason: TRANSPORT_LOST_ORPHAN_REASON });
+		expect(settled).toMatchObject({
+			status: 'deferred',
+			failureKind: 'transport-lost',
+			reason: TRANSPORT_LOST_ORPHAN_REASON,
+		});
 		awaiting.dispose();
 
 		// ~20:58Z — the worker reconnects. Its stream opening tells it to stop the phase.
@@ -188,14 +197,17 @@ describe('a phase reaped on transport loss that finishes on its reconnected work
 		// 21:05:26Z — the late `succeeded` result. Dropped: the run settled once, on the
 		// reap, and nothing settles it a second time.
 		expect(
-			deliverDispatchResult({
-				type: 'task-execution-result',
-				dispatchId: DISPATCH_ID,
-				status: 'succeeded',
-				phase: 'planning',
-				taskId: '568',
-				movedTo: 'todo',
-			}),
+			deliverDispatchResult(
+				{
+					type: 'task-execution-result',
+					dispatchId: DISPATCH_ID,
+					status: 'succeeded',
+					phase: 'planning',
+					taskId: '568',
+					movedTo: 'todo',
+				},
+				WORKER_ID,
+			),
 		).toBe(false);
 		expect(await awaiting.result).toBe(settled);
 
@@ -225,17 +237,81 @@ describe('a phase reaped on transport loss that finishes on its reconnected work
 
 		// And its result settles the run the ordinary way.
 		expect(
-			deliverDispatchResult({
-				type: 'task-execution-result',
-				dispatchId: DISPATCH_ID,
-				status: 'succeeded',
-				phase: 'planning',
-				taskId: '568',
-				movedTo: 'todo',
-			}),
+			deliverDispatchResult(
+				{
+					type: 'task-execution-result',
+					dispatchId: DISPATCH_ID,
+					status: 'succeeded',
+					phase: 'planning',
+					taskId: '568',
+					movedTo: 'todo',
+				},
+				WORKER_ID,
+			),
 		).toBe(true);
 		await expect(awaiting.result).resolves.toMatchObject({ status: 'succeeded', movedTo: 'todo' });
 		awaiting.dispose();
 		deregisterConnection(WORKER_ID, reconnected);
+	});
+
+	it('keeps the orphan off its automatic retry on another worker under the same dispatch id (issue #1075)', async () => {
+		const awaiting = awaitDispatchResult(DISPATCH_ID, PLANNING);
+		transportLost();
+		await vi.advanceTimersByTimeAsync(GRACE_MS);
+		await expect(awaiting.result).resolves.toMatchObject({ status: 'deferred' });
+		awaiting.dispose();
+
+		// The automatic retry reuses the dispatch id and is pushed to another worker.
+		const retry = awaitDispatchResult(DISPATCH_ID, { ...PLANNING, workerId: RETRY_WORKER_ID });
+
+		// The lost worker comes back while the retry runs: it is still told to stop.
+		const returned = fakeWs();
+		registerConnection(WORKER_ID, returned);
+		stopOrphanedDispatchesOnReturn(WORKER_ID);
+		expect(JSON.parse(String(returned.send.mock.calls[0][0]))).toMatchObject({
+			type: 'task-cancel',
+			dispatchId: DISPATCH_ID,
+			runId: RUN_ID,
+		});
+
+		// Its delivery calls are refused, while the retry's worker is served.
+		const lostBoard = boardSpies();
+		expect(await planningDelivery(deliveryDeps(lostBoard))).toEqual([409, 409, 409, 409, 409, 409]);
+		for (const write of Object.values(lostBoard)) expect(write).not.toHaveBeenCalled();
+		const retryBoard = boardSpies();
+		expect(await planningDelivery(deliveryDeps(retryBoard, RETRY_WORKER_ID))).toEqual([
+			200, 200, 200, 200, 200, 200,
+		]);
+
+		// Its answer to the stop does not resolve the retry's wait.
+		expect(
+			deliverDispatchResult(
+				{
+					type: 'task-execution-result',
+					dispatchId: DISPATCH_ID,
+					status: 'failed',
+					cancelled: true,
+					phase: 'planning',
+					taskId: '568',
+				},
+				WORKER_ID,
+			),
+		).toBe(false);
+		expect(
+			deliverDispatchResult(
+				{
+					type: 'task-execution-result',
+					dispatchId: DISPATCH_ID,
+					status: 'succeeded',
+					phase: 'planning',
+					taskId: '568',
+					movedTo: 'todo',
+				},
+				RETRY_WORKER_ID,
+			),
+		).toBe(true);
+		await expect(retry.result).resolves.toMatchObject({ status: 'succeeded', movedTo: 'todo' });
+		retry.dispose();
+		deregisterConnection(WORKER_ID, returned);
 	});
 });

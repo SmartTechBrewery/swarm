@@ -7,6 +7,7 @@ import { RUN_CANCELLED_MESSAGE } from '@/queue/cancellation.js';
 import {
 	awaitDispatchResult,
 	failDispatchResultWait,
+	failOrphanedDispatchResultWait,
 	type TransportInterruptions,
 } from '@/router/dispatch-results.js';
 import { adaptResultToPhaseRun, awaitResultWithGuards } from '@/router/dispatcher.js';
@@ -236,25 +237,21 @@ describe('adaptResultToPhaseRun', () => {
 		awaiting.dispose();
 	});
 
-	it('settles a transport-lost orphan terminally, with no re-dispatch (issue #859)', async () => {
-		// The frame the transport-loss reap actually produces: a plain `failed` with no
-		// `cancelled` key, so it maps to the same non-deferrable terminal error the
-		// supersede does rather than to a `RunTerminatedError` — which is what makes the
-		// issue's Non-goal hold by construction: `error` is not a deferrable kind, so
-		// nothing re-dispatches the phase the vanished worker was running.
+	it('defers a transport-lost orphan for its automatic retry (issues #859, #1075)', async () => {
+		// The frame the transport-loss reap actually produces: a `deferred` one of kind
+		// `transport-lost`, so the shared settle path defers the run under that failure
+		// type's automatic-retry policy rather than failing it terminally.
 		const awaiting = awaitDispatchResult(DISPATCH, {
 			workerId: 'w-1',
 			runId: 'run-859',
 			phase: 'respond-to-review',
 			taskId: '859',
 		});
-		expect(failDispatchResultWait(DISPATCH, TRANSPORT_LOST_ORPHAN_REASON)).toBe(true);
+		expect(failOrphanedDispatchResultWait(DISPATCH, TRANSPORT_LOST_ORPHAN_REASON)).toBe(true);
 		const frame = await awaiting.result;
-		// Both keys carry the reason (`failDispatchResultWait` emits `error` and
-		// `reason`), and neither `cancelled` nor a retry hint is present.
 		expect(frame).toMatchObject({
-			status: 'failed',
-			error: TRANSPORT_LOST_ORPHAN_REASON,
+			status: 'deferred',
+			failureKind: 'transport-lost',
 			reason: TRANSPORT_LOST_ORPHAN_REASON,
 		});
 		expect(frame).not.toHaveProperty('cancelled');
@@ -266,7 +263,7 @@ describe('adaptResultToPhaseRun', () => {
 			expect(err).toBeInstanceOf(AgentRunError);
 			expect(err).not.toBeInstanceOf(RunTerminatedError);
 			const failed = err as AgentRunError;
-			expect(failed.failure.kind).toBe('error');
+			expect(failed.failure.kind).toBe('transport-lost');
 			// The run row records what actually happened, distinguishably from the lease
 			// window's own reason and from an operator termination.
 			expect(failed.message).toBe(TRANSPORT_LOST_ORPHAN_REASON);

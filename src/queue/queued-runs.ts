@@ -90,6 +90,7 @@ export const QueuedWaitReasonSchema = z.enum([
 	'worktree-exists',
 	'stalled',
 	'commit-unavailable',
+	'transport-lost',
 	'recheck',
 	'worker-eligibility',
 	'worker-authorization',

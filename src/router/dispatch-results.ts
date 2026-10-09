@@ -37,6 +37,14 @@
  * late phase's board writes landed while its result was dropped, so the board said
  * the phase succeeded and the run said it failed.
  *
+ * Since issue #1075 that reap *defers* the run, and its automatic retry reuses the
+ * **same dispatch id** — possibly on another worker, possibly while the orphan is
+ * still running on the first. So every frame is matched against the worker that
+ * sent it, not only against its dispatch id: a result, progress or ack frame reaches
+ * a waiter only when it comes from the worker that wait was pushed to, and an orphan
+ * is remembered per dispatch **and** worker, so one dispatch orphaned on two
+ * machines across its retries keeps both records.
+ *
  * The `Map`s are module-private; callers touch them only through the exported
  * functions.
  */
@@ -139,13 +147,31 @@ function unindexRun(dispatchId: string, runId: string | undefined): void {
  */
 export const ORPHANED_DISPATCH_RETENTION_MS = 24 * 60 * 60 * 1000;
 
+/** One dispatch the transport-loss reap ended on a worker, as a stop has to name it. */
+export interface OrphanedDispatch extends DispatchRegistration {
+	dispatchId: string;
+}
+
 /**
- * dispatchId → the registration of a dispatch the transport-loss reap ended (issue
- * #1073). Kept apart from `pending` on purpose: that map is "who is awaiting what",
- * and an orphan is awaited by no one. Its run is already settled, and nothing here
- * may resolve it again.
+ * (dispatchId, workerId) → the registration of a dispatch the transport-loss reap
+ * ended on that worker (issue #1073). Kept apart from `pending` on purpose: that map
+ * is "who is awaiting what", and an orphan is awaited by no one on its worker. Keyed
+ * by the worker as well as the dispatch since issue #1075: an automatic retry reuses
+ * the dispatch id, so the same id can be orphaned on a second worker, and that must
+ * not overwrite the first worker's record.
  */
-const orphaned = new Map<string, DispatchRegistration>();
+const orphaned = new Map<string, OrphanedDispatch>();
+
+/** The {@link orphaned} key for `dispatchId` reaped from `workerId`. */
+function orphanKey(dispatchId: string, workerId: string): string {
+	return `${dispatchId}\u0000${workerId}`;
+}
+
+/** The waiter for `dispatchId`, but only when it was pushed to `workerId`. */
+function pendingFrom(dispatchId: string, workerId: string): PendingDispatch | undefined {
+	const entry = pending.get(dispatchId);
+	return entry?.workerId === workerId ? entry : undefined;
+}
 
 /**
  * What this router observed happening to the worker's transport while it was
@@ -273,17 +299,24 @@ export function awaitDispatchResult(
  * which case the frame is dropped and the durable dispatch state is authoritative.
  * Consuming the entry (deleting it) makes a duplicate result frame a no-op.
  *
+ * `fromWorkerId` is the authenticated worker the frame arrived from, and a waiter is
+ * reached only when its dispatch was pushed to that worker (issue #1075). An
+ * automatic retry reuses the dispatch id, so without the check the orphan still
+ * running on the lost worker could resolve the retry's wait on another worker with
+ * its own frame.
+ *
  * A result for an *orphaned* dispatch (issue #1073) is dropped as well, but it is
  * expected rather than anomalous: it is how a worker that came back answers the stop
  * it was sent, or reports a phase that finished while it was away. That result is
  * the last thing the late phase sends, so the orphan record is forgotten here, and
  * nothing is left running that its fence or its stop would apply to.
  */
-export function deliverDispatchResult(result: TaskExecutionResult): boolean {
-	const entry = pending.get(result.dispatchId);
-	const orphan = entry ? undefined : orphaned.get(result.dispatchId);
+export function deliverDispatchResult(result: TaskExecutionResult, fromWorkerId: string): boolean {
+	const entry = pendingFrom(result.dispatchId, fromWorkerId);
+	const key = orphanKey(result.dispatchId, fromWorkerId);
+	const orphan = entry ? undefined : orphaned.get(key);
 	if (orphan) {
-		orphaned.delete(result.dispatchId);
+		orphaned.delete(key);
 		// Still `warn`: a late `succeeded` means the phase finished its work on the
 		// worker, and the run says it failed. Its board writes after the reap were
 		// refused, so the board agrees with the run. This line is still the one an
@@ -295,6 +328,20 @@ export function deliverDispatchResult(result: TaskExecutionResult): boolean {
 				status: result.status,
 				workerId: orphan.workerId,
 				runId: orphan.runId,
+			},
+		);
+		return false;
+	}
+	if (!entry && pending.has(result.dispatchId)) {
+		// Awaited here, but on another worker — and this one holds no orphan record of
+		// it. Never resolved by a frame the waiter's own worker did not send.
+		logger.warn(
+			'dispatch back-channel: result from a worker the dispatch is not awaited on — dropping',
+			{
+				dispatchId: result.dispatchId,
+				status: result.status,
+				workerId: fromWorkerId,
+				awaitedOnWorkerId: pending.get(result.dispatchId)?.workerId,
 			},
 		);
 		return false;
@@ -358,24 +405,29 @@ export function failDispatchResultWait(
 	// nobody is awaiting is the ordinary reading on this path, not the anomaly that
 	// warn line reports.
 	if (!entry) return false;
-	return deliverDispatchResult({
-		type: 'task-execution-result',
-		dispatchId,
-		status: 'failed',
-		phase: entry.phase,
-		taskId: entry.taskId,
-		error: reason,
-		reason,
-		// Spread rather than `cancelled: options.cancelled`: the superseded-session
-		// caller's frame must stay exactly the shape it is today, with no key at all.
-		...(options.cancelled ? { cancelled: true } : {}),
-	});
+	return deliverDispatchResult(
+		{
+			type: 'task-execution-result',
+			dispatchId,
+			status: 'failed',
+			phase: entry.phase,
+			taskId: entry.taskId,
+			error: reason,
+			reason,
+			// Spread rather than `cancelled: options.cancelled`: the superseded-session
+			// caller's frame must stay exactly the shape it is today, with no key at all.
+			...(options.cancelled ? { cancelled: true } : {}),
+		},
+		// Synthesized here on the registration's behalf, so it is "sent" by the worker
+		// that registration names.
+		entry.workerId,
+	);
 }
 
 /**
- * {@link failDispatchResultWait} for the transport-loss reap (issue #859), and the
- * one reap whose worker can come back afterwards with the phase still running (issue
- * #1073).
+ * End the wait for a dispatch the transport-loss reap (issue #859) settled, and
+ * remember it as an orphan of its worker — the one reap whose worker can come back
+ * afterwards with the phase still running (issue #1073).
  *
  * The other two settles that end a wait early do not need this. A superseded
  * generation (#719) is a different daemon process. A termination settled behind a
@@ -383,34 +435,48 @@ export function failDispatchResultWait(
  * reap is the router giving up on a worker it cannot see. If that worker was only
  * asleep, it resumes the agent and finishes the phase. So before the wait is ended,
  * its registration is kept as an orphan: who the dispatch was pushed to, and the
- * phase and task a stop has to name. The settle itself is
- * {@link failDispatchResultWait} unchanged, so run history and the frame shape are
- * exactly what #859 writes.
+ * phase and task a stop has to name.
+ *
+ * The wait ends with a **`deferred`** frame of kind `transport-lost` (issue #1075),
+ * not {@link failDispatchResultWait}'s `failed` one: the shared settle path defers
+ * the run and retries it automatically after the delay that failure type's registry
+ * entry declares (`../worker/automatic-retry-policy.ts`), and settles it failed only
+ * once that budget is spent. Safe here, unlike in the superseded case, because the
+ * reap writes no durable row before the frame: the dispatch is still claimed by the
+ * job awaiting it, so the deferral reaches it intact.
  *
  * The record expires after {@link ORPHANED_DISPATCH_RETENTION_MS}. The timer is
- * unreffed and identity-checked, so a later orphaning of the same id is never
- * forgotten early.
+ * unreffed and identity-checked, so a later orphaning of the same id on the same
+ * worker is never forgotten early.
  */
 export function failOrphanedDispatchResultWait(dispatchId: string, reason: string): boolean {
 	const entry = pending.get(dispatchId);
 	if (!entry) return false;
-	const orphan: DispatchRegistration = {
+	const key = orphanKey(dispatchId, entry.workerId);
+	const orphan: OrphanedDispatch = {
+		dispatchId,
 		workerId: entry.workerId,
 		runId: entry.runId,
 		phase: entry.phase,
 		taskId: entry.taskId,
 	};
-	orphaned.set(dispatchId, orphan);
+	orphaned.set(key, orphan);
 	const expiry = setTimeout(() => {
-		if (orphaned.get(dispatchId) === orphan) orphaned.delete(dispatchId);
+		if (orphaned.get(key) === orphan) orphaned.delete(key);
 	}, ORPHANED_DISPATCH_RETENTION_MS);
 	expiry.unref();
-	return failDispatchResultWait(dispatchId, reason);
-}
-
-/** One dispatch the transport-loss reap ended on a worker, as a stop has to name it. */
-export interface OrphanedDispatch extends DispatchRegistration {
-	dispatchId: string;
+	pending.delete(dispatchId);
+	unindexRun(dispatchId, entry.runId);
+	entry.resolve({
+		type: 'task-execution-result',
+		dispatchId,
+		status: 'deferred',
+		phase: entry.phase,
+		taskId: entry.taskId,
+		reason,
+		failureKind: 'transport-lost',
+	});
+	return true;
 }
 
 /**
@@ -418,15 +484,17 @@ export interface OrphanedDispatch extends DispatchRegistration {
  * for yet (issue #1073). This is what its reconnect is told to stop
  * (`./transport-loss-reaper.ts`).
  *
- * A dispatch awaited here again is left out. A reaped dispatch settles terminally,
- * and a retry of its run opens a new dispatch, so this should never happen. If it
- * did, a stop answered on the old phase's behalf would resolve the new wait.
+ * A dispatch awaited here again **on this same worker** is left out: its automatic
+ * retry (issue #1075) reuses the dispatch id, and a stop answered on the old phase's
+ * behalf would resolve the new wait. One awaited on *another* worker is listed — the
+ * retry went elsewhere, the orphan here still has to be stopped, and the sender
+ * check in {@link deliverDispatchResult} keeps its answer off the retry's wait.
  */
 export function listOrphanedDispatchesForWorker(workerId: string): OrphanedDispatch[] {
 	const listed: OrphanedDispatch[] = [];
-	for (const [dispatchId, orphan] of orphaned) {
-		if (orphan.workerId !== workerId || pending.has(dispatchId)) continue;
-		listed.push({ dispatchId, ...orphan });
+	for (const orphan of orphaned.values()) {
+		if (orphan.workerId !== workerId || pendingFrom(orphan.dispatchId, workerId)) continue;
+		listed.push({ ...orphan });
 	}
 	return listed;
 }
@@ -442,8 +510,8 @@ export function listOrphanedDispatchesForWorker(workerId: string): OrphanedDispa
  * restarted since the reap, or one that never reaped it, keeps today's behaviour.
  */
 export function isDispatchOrphanedFrom(workerId: string, dispatchId: string): boolean {
-	if (orphaned.get(dispatchId)?.workerId !== workerId) return false;
-	return pending.get(dispatchId)?.workerId !== workerId;
+	if (!orphaned.has(orphanKey(dispatchId, workerId))) return false;
+	return pendingFrom(dispatchId, workerId) === undefined;
 }
 
 /**
@@ -532,14 +600,20 @@ export function listAwaitedDispatchesForWorker(workerId: string): AwaitedDispatc
 	return awaited;
 }
 
-/** Route a progress frame to the awaiting dispatcher, if any (a no-op otherwise). */
-export function deliverDispatchProgress(progress: TaskProgress): void {
-	pending.get(progress.dispatchId)?.onProgress?.(progress);
+/**
+ * Route a progress frame to the awaiting dispatcher, if any, and only when the
+ * dispatch was pushed to the worker that sent it (a no-op otherwise — issue #1075).
+ */
+export function deliverDispatchProgress(progress: TaskProgress, fromWorkerId: string): void {
+	pendingFrom(progress.dispatchId, fromWorkerId)?.onProgress?.(progress);
 }
 
-/** Route an assignment ack to the awaiting dispatcher, if any (a no-op otherwise). */
-export function deliverDispatchAck(ack: TaskAssignmentAck): void {
-	pending.get(ack.dispatchId)?.onAck?.(ack);
+/**
+ * Route an assignment ack to the awaiting dispatcher, if any, and only when the
+ * dispatch was pushed to the worker that sent it (a no-op otherwise — issue #1075).
+ */
+export function deliverDispatchAck(ack: TaskAssignmentAck, fromWorkerId: string): void {
+	pendingFrom(ack.dispatchId, fromWorkerId)?.onAck?.(ack);
 }
 
 /**

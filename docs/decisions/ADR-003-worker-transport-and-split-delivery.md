@@ -95,7 +95,7 @@ transport was a second front door to the same service. It is now the only one:
 issue #553 deleted that worker, and every worker acquires its session through the
 handshake (`src/router/worker-transport.ts` → `src/identity/worker-session-service.ts`).
 
-### §2 — Split delivery (implemented — issues #392, #405, #406, #407, #394, #417, #418, #536, #551, #544, #718, #724, #719, #827, #859, #1073)
+### §2 — Split delivery (implemented — issues #392, #405, #406, #407, #394, #417, #418, #536, #551, #544, #718, #724, #719, #827, #859, #1073, #1075)
 
 The rest of PROJECT.md §3 — the control plane assigning jobs and the daemon
 running them without direct Redis access (`TaskAssignment` →
@@ -483,11 +483,11 @@ server-side store) it needs:
    ambiguous failed push), whereas here the close was observed and the note only fires
    when no replacement socket is registered, so "is there a live socket for this worker
    here again?" is the direct question and needs no Postgres read. Last, **no re-dispatch
-   follows**, by construction: `kind: 'error'` is not a deferrable kind. That is a policy
-   choice, not an oversight — a Respond-to-review that had already pushed must not be
-   replayed blindly — so re-running such a phase stays `swarm run reset`. A router
-   restart inside the grace loses the timer, with the lease reconciler the backstop, the
-   same limit item 13 accepts.
+   followed**, by construction: `kind: 'error'` was not a deferrable kind, and re-running
+   the phase was left to the operator. *Amended by item 16 (#1075):* the reap's frame is
+   now a `transport-lost` deferral and the run is retried automatically after a delay,
+   bounded and preferring another worker. A router restart inside the grace loses the
+   timer, with the lease reconciler the backstop, the same limit item 13 accepts.
 
 15. **#1073** — **a reaped phase whose worker comes back late is stopped and fenced.**
    Item 14 ends the control plane's *wait*; it never reached the agent. A worker that only
@@ -528,8 +528,41 @@ server-side store) it needs:
    for a laptop closed overnight, and normally gone at the first reconnect. A worker that
    never returns is otherwise exactly item 14. **The orphan is keyed on its worker**, so
    one worker's orphan never fences another, and a dispatch awaited again is neither
-   fenced on its worker nor stopped. A reaped dispatch settles terminally and its retry
-   opens a new id, so this is defensive only.
+   fenced on its worker nor stopped. *Amended by item 16 (#1075):* a reaped dispatch's
+   automatic retry reuses its id, so this is no longer defensive only, and the registry
+   is keyed on the worker throughout.
+
+16. **#1075 (phase 1 of 2)** — **a transport-lost run is retried automatically after a
+   per-failure-type delay.** Item 14 left a reaped run terminal, so the overnight
+   pipeline stalled on every network blip until an operator pressed Retry — which, for
+   these runs, reliably worked. The reap's synthetic frame is now `deferred` with
+   `failureKind: 'transport-lost'`, and the shared settle defers the run through the
+   ordinary machinery: run `deferred` with `nextRetryAt`, dispatch `retry-scheduled` with
+   wait reason `transport-lost`. That is safe here and not in item 13's case because this
+   reap writes no durable row before the frame, so the deferral reaches a dispatch still
+   claimed by the job awaiting it.
+
+   Decisions worth recording. **One registry of retryable failure types**
+   (`src/worker/automatic-retry-policy.ts`): each entry declares its delay, its bound,
+   its wait reason and its log label, and a kind not listed behaves as before. The first
+   entry is `transport-lost`: 30 minutes, two automatic retries per run, counted on its
+   own `automaticRetryAttempt` so earlier rate-limit or timeout deferrals cannot spend it.
+   Past the bound the failure takes item 14's terminal path. **Prefer another worker,
+   never require one:** the lost machine joins the sticky
+   `runs.recovery.transportLostWorkerIds`, which the gate reads with #1018's
+   commit-unavailable list as one soft preference (`passedOverWorkerIds`). **Retry now
+   supersedes the scheduled retry** because it reopens the same dispatch, so no second
+   run can exist. **The retry reuses the dispatch id**, which item 15 assumed it would
+   not, so the back-channel now matches every result, progress and ack frame against the
+   worker that sent it, the orphan registry is keyed by dispatch and worker, and a
+   returning worker is still told to stop an orphan whose id is awaited on another
+   worker. The retry is mechanically the operator's Retry now — same run, same dispatch,
+   fresh session — so a pushing phase is exactly as safe as that is: delivery refuses a
+   drifted remote head, PR and comment delivery are idempotent per run, and a Planning
+   split is resumable by its run's markers. Accepted residual: if the lost worker is the
+   only eligible one and reconnects just as its retry is pushed back to it, its answer to
+   the stop can reach the new wait. Item 15's stop-on-return and fence are unchanged;
+   accepting an orphan's late result is phase 2 of #1075.
 
 Still out of scope: over-the-wire secret delivery, which remains unnecessary — the
 split keeps every project credential server-side instead.

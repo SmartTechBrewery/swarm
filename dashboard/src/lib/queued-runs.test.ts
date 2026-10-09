@@ -118,6 +118,14 @@ describe('queuedWaitReasonLabel', () => {
 		);
 	});
 
+	// Issue #1075: an automatic retry after the run's worker dropped off and never came
+	// back — a timed wait, so it names what happened rather than a machine to wait for.
+	it('names the lost connection for an automatic transport-loss retry', () => {
+		expect(queuedWaitReasonLabel('transport-lost')).toBe(
+			"retrying after the worker's connection was lost",
+		);
+	});
+
 	// Issue #759: the wait is on the *task*, so the copy must not read as another
 	// worker/slot wait — nothing but the phase ahead of it settling ends it. Issue
 	// #761 made that phase possibly *queued* rather than running, so the copy says

@@ -63,6 +63,17 @@ describe('deriveRetryJobPayload', () => {
 		expect(next.rateLimitRetryAttempt).toBe(1);
 	});
 
+	it('spends the automatic-retry budget, not the rate-limit one, for an automatic retry (issue #1075)', () => {
+		const next = deriveRetryJobPayload(
+			createMockScmWebhookJob({ automaticRetryAttempt: 1, rateLimitRetryAttempt: 3 }),
+			{ phase: 'review', runId: 'run-1', resumable: false, automaticRetry: true },
+		);
+
+		expect(next.automaticRetryAttempt).toBe(2);
+		expect(next.rateLimitRetryAttempt).toBe(3);
+		expect(next.runId).toBe('run-1');
+	});
+
 	// Issue #567. Both token-free gates refuse *before* anything is provisioned, so
 	// their "retry" is the same attempt still waiting. Re-deriving recovery intent
 	// there would turn the wait into the start-over it exists to prevent.
@@ -359,6 +370,17 @@ describe('reconstructRetryJob', () => {
 		expect(job.rateLimitRetryAttempt).toBe(0);
 	});
 
+	it('zeroes the automatic-retry budget, so a manual retry gets a fresh one (issue #1075)', () => {
+		const job = reconstructRetryJob(
+			createMockScmWebhookJob({ automaticRetryAttempt: 2, rateLimitRetryAttempt: 5 }),
+			'run-1',
+			'review',
+		);
+
+		expect(job.automaticRetryAttempt).toBe(0);
+		expect(job.rateLimitRetryAttempt).toBe(0);
+	});
+
 	it('leaves a current envelope untouched while carrying the run row forward', () => {
 		const job = reconstructRetryJob(createMockScmWebhookJob(), 'run-2', 'review');
 
@@ -489,15 +511,16 @@ describe('reconstructResetJob', () => {
 		expect(job.implementationBranchProvisioned).toBeUndefined();
 	});
 
-	it('carries the run row and zeroes the rate-limit budget', () => {
+	it('carries the run row and zeroes the rate-limit and automatic-retry budgets', () => {
 		const job = reconstructResetJob(
-			createMockScmWebhookJob({ rateLimitRetryAttempt: 4 }),
+			createMockScmWebhookJob({ rateLimitRetryAttempt: 4, automaticRetryAttempt: 2 }),
 			'run-4',
 			'review',
 		);
 
 		expect(job.runId).toBe('run-4');
 		expect(job.rateLimitRetryAttempt).toBe(0);
+		expect(job.automaticRetryAttempt).toBe(0);
 	});
 
 	// Dispatch intent, not resumption: the card has already moved to In progress, so

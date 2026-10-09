@@ -496,6 +496,8 @@ export type RunRecoveryRecord = NonNullable<typeof runs.$inferSelect.recovery>;
  *   settle that records the failure is followed immediately by the deferral's own
  *   recovery write, and the next attempt's is a `null` one, so anything less sticky
  *   than this would be erased before the retry it exists to steer ever reads it.
+ * - `transportLostWorkerIds` — the machines whose transport was lost under this run
+ *   (issue #1075), sticky on exactly the same terms and for the same reason.
  *
  * Written as one SQL expression so the merge reads the row's current value under
  * the same statement that replaces it — no read-modify-write race with a
@@ -506,12 +508,14 @@ function recoveryWriteSql(next: RunRecoveryRecord | null): SQL {
 		next === null
 			? sql`jsonb_build_object(
 					'abandonedWorkerId', ${runs.recovery} -> 'abandonedWorkerId',
-					'commitUnavailableWorkerIds', ${runs.recovery} -> 'commitUnavailableWorkerIds'
+					'commitUnavailableWorkerIds', ${runs.recovery} -> 'commitUnavailableWorkerIds',
+					'transportLostWorkerIds', ${runs.recovery} -> 'transportLostWorkerIds'
 				)`
 			: sql`jsonb_build_object(
 					'abandonedWorkerId', ${runs.recovery} -> 'abandonedWorkerId',
 					'preservedWorkerId', ${runs.recovery} -> 'preservedWorkerId',
-					'commitUnavailableWorkerIds', ${runs.recovery} -> 'commitUnavailableWorkerIds'
+					'commitUnavailableWorkerIds', ${runs.recovery} -> 'commitUnavailableWorkerIds',
+					'transportLostWorkerIds', ${runs.recovery} -> 'transportLostWorkerIds'
 				)`;
 	const base = next === null ? sql`'{}'::jsonb` : sql`${JSON.stringify(next)}::jsonb`;
 	// `jsonb_strip_nulls` drops the absent sticky keys (`jsonb -> key` is SQL NULL
@@ -999,12 +1003,31 @@ export async function recordRunPreservedWorker(runId: string): Promise<void> {
  * rest of run tracking — the caller swallows and logs a throw.
  */
 export async function recordRunCommitUnavailableWorker(runId: string): Promise<void> {
+	await appendRunRecoveryWorker(runId, 'commitUnavailableWorkerIds');
+}
+
+/**
+ * Record that **this attempt's machine** lost its transport session under this run
+ * and did not return within the grace (issue #1075), so its automatic retry prefers
+ * another machine. Taken from the attempt's own `worker_id`, appended and
+ * de-duplicated exactly as {@link recordRunCommitUnavailableWorker} is, and
+ * best-effort on the same terms.
+ */
+export async function recordRunTransportLostWorker(runId: string): Promise<void> {
+	await appendRunRecoveryWorker(runId, 'transportLostWorkerIds');
+}
+
+/** The two sticky worker lists on `runs.recovery` the dispatch gate passes over. */
+type PassedOverWorkerListKey = 'commitUnavailableWorkerIds' | 'transportLostWorkerIds';
+
+/** Append the attempt's own `worker_id` to one of the run's passed-over lists, once. */
+async function appendRunRecoveryWorker(runId: string, key: PassedOverWorkerListKey): Promise<void> {
 	await getDb()
 		.update(runs)
 		.set({
 			recovery: sql`coalesce(${runs.recovery}, '{}'::jsonb) || jsonb_build_object(
-				'commitUnavailableWorkerIds',
-				coalesce(${runs.recovery} -> 'commitUnavailableWorkerIds', '[]'::jsonb)
+				${key}::text,
+				coalesce(${runs.recovery} -> ${key}::text, '[]'::jsonb)
 					|| to_jsonb(${runs.workerId}::text)
 			)`,
 		})
@@ -1012,31 +1035,38 @@ export async function recordRunCommitUnavailableWorker(runId: string): Promise<v
 			and(
 				eq(runs.id, runId),
 				isNotNull(runs.workerId),
-				sql`not coalesce(${runs.recovery} -> 'commitUnavailableWorkerIds', '[]'::jsonb)
+				sql`not coalesce(${runs.recovery} -> ${key}::text, '[]'::jsonb)
 					@> to_jsonb(${runs.workerId}::text)`,
 			),
 		);
 }
 
 /**
- * The machines already known to be unable to obtain this run's commit (issue
- * #1018) — the dispatch gate's read of what {@link recordRunCommitUnavailableWorker}
- * wrote.
+ * The machines this run's next attempt should start somewhere other than — the
+ * dispatch gate's read of what {@link recordRunCommitUnavailableWorker} (issue
+ * #1018) and {@link recordRunTransportLostWorker} (issue #1075) wrote, as one
+ * de-duplicated list.
  *
  * Answers an empty array for a run that has none, for a run that does not exist,
  * and for a malformed record: the list only ever *reorders* a preference the gate
  * would otherwise make blindly, so a value it cannot read must degrade to today's
  * behaviour rather than narrow the roster on a guess.
  */
-export async function listRunCommitUnavailableWorkerIds(runId: string): Promise<string[]> {
+export async function listRunPassedOverWorkerIds(runId: string): Promise<string[]> {
 	const rows = await getDb()
 		.select({ recovery: runs.recovery })
 		.from(runs)
 		.where(eq(runs.id, runId))
 		.limit(1);
-	const recorded = rows[0]?.recovery?.commitUnavailableWorkerIds;
-	if (!Array.isArray(recorded)) return [];
-	return recorded.filter((id): id is string => typeof id === 'string' && id.length > 0);
+	const recovery = rows[0]?.recovery;
+	const ids = new Set<string>();
+	for (const recorded of [recovery?.commitUnavailableWorkerIds, recovery?.transportLostWorkerIds]) {
+		if (!Array.isArray(recorded)) continue;
+		for (const id of recorded) {
+			if (typeof id === 'string' && id.length > 0) ids.add(id);
+		}
+	}
+	return [...ids];
 }
 
 /**
@@ -1060,9 +1090,10 @@ export async function listRunCommitUnavailableWorkerIds(runId: string): Promise<
  * `abandonedWorkerId` is retained when there is no pin to replace it, and a run with
  * neither ends up with a `NULL` column exactly as before.
  *
- * The commit-unavailability list (issue #1018) is cleared with everything else, and
- * that is the action's whole job here: it is the one operator gesture that forgives
- * a machine SWARM has been steering this run away from.
+ * The commit-unavailability list (issue #1018) and the transport-lost list (issue
+ * #1075) are cleared with everything else, and that is the action's whole job here:
+ * it is the one operator gesture that forgives a machine SWARM has been steering this
+ * run away from.
  */
 export async function clearRunRecovery(runId: string): Promise<void> {
 	await getDb()

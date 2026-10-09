@@ -145,7 +145,7 @@ export const TRANSPORT_LOST_NOTE =
 	'Transport session to the worker running this phase dropped — output is paused until it reconnects.';
 export const TRANSPORT_RESTORED_NOTE = 'Transport session restored — output resumes.';
 export const TRANSPORT_LOST_ORPHAN_NOTE =
-	'Transport session to the worker never returned — this phase was terminated and the pull request, task and capacity it held were released.';
+	'Transport session to the worker never returned — this phase was terminated and the pull request, task and capacity it held were released. It is retried automatically, preferably on another worker, unless its automatic-retry budget is spent.';
 export const TRANSPORT_RETURNED_AFTER_ORPHAN_NOTE =
 	'The worker came back after this phase was terminated — it was told to stop the phase, and any board or review writes it still attempts are refused.';
 

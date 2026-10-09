@@ -871,8 +871,10 @@ describe('handleWorkerStreamFrame', () => {
 			}),
 		);
 		expect(action).toEqual({ action: 'ignore' });
+		// With the socket's authenticated worker as the sender (issue #1075).
 		expect(deps.deliverDispatchResult).toHaveBeenCalledWith(
 			expect.objectContaining({ dispatchId: DISPATCH, status: 'succeeded' }),
+			ctx.workerId,
 		);
 		expect(deps.heartbeat).not.toHaveBeenCalled();
 	});
@@ -899,9 +901,11 @@ describe('handleWorkerStreamFrame', () => {
 		expect(ack).toEqual({ action: 'ignore' });
 		expect(deps.deliverDispatchProgress).toHaveBeenCalledWith(
 			expect.objectContaining({ state: 'branch-provisioned' }),
+			ctx.workerId,
 		);
 		expect(deps.deliverDispatchAck).toHaveBeenCalledWith(
 			expect.objectContaining({ dispatchId: DISPATCH }),
+			ctx.workerId,
 		);
 	});
 

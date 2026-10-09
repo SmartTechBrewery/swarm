@@ -103,6 +103,15 @@ export type DispatchWaitReason =
 	 * (`runs.recovery.commitUnavailableWorkerIds`).
 	 */
 	| 'commit-unavailable'
+	/**
+	 * The attempt's worker lost its transport session and did not return within the
+	 * grace, so the control plane settled the run from that signal (issue #859) and
+	 * retries it automatically after the delay `../../worker/automatic-retry-policy.ts`
+	 * declares (issue #1075). A timed wait: a worker connecting does not promote it,
+	 * and the dispatch gate prefers a machine other than the one that was lost
+	 * (`runs.recovery.transportLostWorkerIds`).
+	 */
+	| 'transport-lost'
 	| 'recheck'
 	/**
 	 * No eligible worker could take the dispatch (issue #339's federated gate)

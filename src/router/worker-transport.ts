@@ -189,10 +189,12 @@ export interface WorkerTransportDeps {
 	 * assignment ack / progress / terminal result to the control-plane dispatcher
 	 * awaiting it (`./dispatch-results.ts`). Defaulted to the in-process registry;
 	 * a unit test injects fakes. A frame for a dispatch not awaited here is a no-op.
+	 * Each takes the socket's authenticated worker as the sender, so a frame reaches
+	 * only a waiter whose dispatch was pushed to that worker (issue #1075).
 	 */
-	deliverDispatchResult: (result: TaskExecutionResult) => boolean;
-	deliverDispatchProgress: (progress: TaskProgress) => void;
-	deliverDispatchAck: (ack: TaskAssignmentAck) => void;
+	deliverDispatchResult: (result: TaskExecutionResult, fromWorkerId: string) => boolean;
+	deliverDispatchProgress: (progress: TaskProgress, fromWorkerId: string) => void;
+	deliverDispatchAck: (ack: TaskAssignmentAck, fromWorkerId: string) => void;
 	/**
 	 * Write a batch of streamed agent output to the run's output stream
 	 * (`./stream-log-persistence.ts`). The control plane owns this write for every
@@ -716,15 +718,15 @@ export async function handleWorkerStreamFrame(
 	// A frame for a dispatch not awaited here (already settled, or on another
 	// router) is a no-op. Lease liveness rides the heartbeat handled below.
 	if (frame.type === 'task-execution-result') {
-		deps.deliverDispatchResult(frame);
+		deps.deliverDispatchResult(frame, ctx.workerId);
 		return { action: 'ignore' };
 	}
 	if (frame.type === 'task-progress') {
-		deps.deliverDispatchProgress(frame);
+		deps.deliverDispatchProgress(frame, ctx.workerId);
 		return { action: 'ignore' };
 	}
 	if (frame.type === 'task-assignment-ack') {
-		deps.deliverDispatchAck(frame);
+		deps.deliverDispatchAck(frame, ctx.workerId);
 		return { action: 'ignore' };
 	}
 	if (frame.type === 'stream-log') {

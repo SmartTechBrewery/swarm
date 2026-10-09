@@ -228,6 +228,15 @@ const jobBase = z.object({
 	 */
 	rateLimitRetryAttempt: z.number().int().nonnegative().optional(),
 	/**
+	 * How many automatic retries this job has already had for a failure type in the
+	 * automatic-retry registry (issue #1075, `src/worker/automatic-retry-policy.ts`) —
+	 * a failure that used to be terminal, such as a lost worker transport. Its own
+	 * counter rather than {@link rateLimitRetryAttempt}, so earlier rate-limit or
+	 * timeout deferrals cannot spend this budget and a lost transport does not spend
+	 * theirs. Absent on a fresh webhook; zeroed by a manual Retry now or Reset.
+	 */
+	automaticRetryAttempt: z.number().int().nonnegative().optional(),
+	/**
 	 * How many times this job has been re-checked while waiting on an unfinished
 	 * dependency (issue #330): an Implementation whose work item is `blocked by` an
 	 * open prerequisite is deferred as a token-free `recheck` dispatch — no worktree,

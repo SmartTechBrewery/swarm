@@ -1365,9 +1365,12 @@ export const runsRouter = router({
 	//     surfaces in the dashboard (`retryScheduled` on `getById`): nothing is
 	//     scheduled for it, and this is the button that moves it.
 	//
-	// Cap-bypass: every path resets `rateLimitRetryAttempt` to 0, so a manual
-	// retry always gets a fresh budget — including a run whose next *automatic*
-	// attempt would itself have tripped `MAX_RATE_LIMIT_RETRIES`.
+	// Cap-bypass: every path resets `rateLimitRetryAttempt` and
+	// `automaticRetryAttempt` to 0, so a manual retry always gets a fresh budget —
+	// including a run whose next *automatic* attempt would itself have tripped
+	// `MAX_RATE_LIMIT_RETRIES` or its automatic-retry policy's bound (issue #1075).
+	// Path 1 is also what makes Retry now supersede a pending automatic retry: it
+	// reopens that same `retry-scheduled` dispatch, so no second run is created.
 	//
 	// Only limit: reconstruction needs a stored `jobPayload`. A run recorded
 	// without one (older rows, or a create path that didn't persist it) can't be

@@ -76,7 +76,10 @@
  * clone that did not have it. The list of such machines lives on the run
  * (`runs.recovery.commitUnavailableWorkerIds`) and is applied to each target's
  * *eligible* set only while it leaves somebody, so it changes no refusal and cannot
- * wedge a dispatch — see {@link preferCommitCapableWorkers}.
+ * wedge a dispatch — see {@link preferWorkersNotPassedOver}. A machine whose
+ * transport was lost under this run (issue #1075,
+ * `runs.recovery.transportLostWorkerIds`) is passed over on exactly the same terms,
+ * so its automatic retry starts somewhere more stable when somewhere else can take it.
  *
  * **Every dispatch is gated, including retries and later phases**, because the
  * gate sits on the common dispatch path: consent revoked, an enrollment
@@ -299,22 +302,25 @@ export interface DispatchGateInput {
 	 */
 	preservedWorkerUnknown?: boolean;
 	/**
-	 * Machines that already failed to obtain the commit this run's checkout has to be
-	 * detached at (issue #1018) — read by the caller from
-	 * `runs.recovery.commitUnavailableWorkerIds`.
+	 * Machines this run should start somewhere other than, read by the caller from
+	 * the run's recovery record: those that already failed to obtain the commit its
+	 * checkout has to be detached at (issue #1018,
+	 * `runs.recovery.commitUnavailableWorkerIds`), and those whose transport was lost
+	 * while running it (issue #1075, `runs.recovery.transportLostWorkerIds`).
 	 *
 	 * The **softest** narrowing the gate applies, and deliberately so. It is applied
 	 * per target, to the workers that cleared every other check, and only while it
 	 * leaves at least one of them: a listed machine is passed over when somebody else
 	 * can run the phase, and re-admitted the moment it is the only one who can.
-	 * Anything stricter would turn "one clone is behind" into a run that waits for a
-	 * machine that may never come, and would let a commit *no* worker can fetch walk
-	 * the roster indefinitely instead of spending the ordinary retry budget.
+	 * Anything stricter would turn "one clone is behind" (or "one machine dropped off
+	 * the network once") into a run that waits for a machine that may never come, and
+	 * would let a commit *no* worker can fetch walk the roster indefinitely instead of
+	 * spending the ordinary retry budget.
 	 *
 	 * It therefore changes no refusal reason and no message — a dispatch that finds
 	 * nothing eligible reports exactly what it would have reported without this list.
 	 */
-	commitUnavailableWorkerIds?: readonly string[];
+	passedOverWorkerIds?: readonly string[];
 }
 
 /** Per-call tuning for {@link evaluateDispatchEligibility}. */
@@ -680,8 +686,9 @@ function freeSlotsByWorker(
 }
 
 /**
- * Drop the machines already known not to hold this run's commit (issue #1018) — but
- * only while that leaves somebody.
+ * Drop the machines this run is to be passed over on — those already known not to
+ * hold its commit (issue #1018), and those whose transport was lost under it (issue
+ * #1075) — but only while that leaves somebody.
  *
  * The whole defect this answers is that selection is deterministic: the roster is
  * walked in the project's configured order and the first eligible machine wins, so a
@@ -691,14 +698,14 @@ function freeSlotsByWorker(
  * withholds work, and the empty-result fallback is what keeps a commit no machine can
  * fetch from cycling the roster instead of failing on the ordinary budget.
  */
-function preferCommitCapableWorkers(
+function preferWorkersNotPassedOver(
 	eligible: WorkerDispatchCandidate[],
-	commitUnavailableWorkerIds: readonly string[] | undefined,
+	passedOverWorkerIds: readonly string[] | undefined,
 ): WorkerDispatchCandidate[] {
-	if (!commitUnavailableWorkerIds?.length) return eligible;
-	const excluded = new Set(commitUnavailableWorkerIds);
-	const capable = eligible.filter((candidate) => !excluded.has(candidate.worker.id));
-	return capable.length > 0 ? capable : eligible;
+	if (!passedOverWorkerIds?.length) return eligible;
+	const excluded = new Set(passedOverWorkerIds);
+	const preferred = eligible.filter((candidate) => !excluded.has(candidate.worker.id));
+	return preferred.length > 0 ? preferred : eligible;
 }
 
 /**
@@ -885,17 +892,15 @@ export async function evaluateDispatchEligibility(
 				);
 			}
 		}
-		// Pass over a machine that already failed to obtain this run's commit, while
-		// somebody else can take the phase (issue #1018). Applied here rather than to
+		// Pass over a machine that already failed to obtain this run's commit (issue
+		// #1018) or lost its transport under it (issue #1075), while somebody else can
+		// take the phase. Applied here rather than to
 		// `permitted` above so the fallback means what the acceptance criterion says —
 		// "while another *eligible* worker exists" — and so a list that covers every
 		// eligible machine simply evaporates, leaving the ordinary first-eligible pick
 		// and the ordinary retry budget to bound it.
-		const eligibleAfterCommitPreference = preferCommitCapableWorkers(
-			eligible,
-			input.commitUnavailableWorkerIds,
-		);
-		const [firstEligible, ...alternatives] = eligibleAfterCommitPreference;
+		const eligibleAfterPassOver = preferWorkersNotPassedOver(eligible, input.passedOverWorkerIds);
+		const [firstEligible, ...alternatives] = eligibleAfterPassOver;
 		if (!firstEligible) continue;
 		const chosen = await selectEligibleWorker(
 			[firstEligible, ...alternatives],

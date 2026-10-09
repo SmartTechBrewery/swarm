@@ -605,7 +605,7 @@ describe('evaluateDispatchEligibility', () => {
 	// whose clone cannot serve the reviewed commit won every retry, and the operator's
 	// only escape was suspending its enrollment by hand. These pin the preference and,
 	// just as importantly, its bound.
-	describe('commit-unavailable preference', () => {
+	describe('passed-over preference', () => {
 		it('sends the retry to another eligible worker, not back to the one that failed', async () => {
 			listProjectDispatchCandidates.mockResolvedValue([
 				makeCandidate('w-stale'),
@@ -613,7 +613,7 @@ describe('evaluateDispatchEligibility', () => {
 			]);
 
 			const decision = await evaluateDispatchEligibility(
-				gateInput({ phase: 'review', commitUnavailableWorkerIds: ['w-stale'] }),
+				gateInput({ phase: 'review', passedOverWorkerIds: ['w-stale'] }),
 			);
 
 			expect(decision).toMatchObject({
@@ -630,7 +630,7 @@ describe('evaluateDispatchEligibility', () => {
 
 			expect(
 				await evaluateDispatchEligibility(
-					gateInput({ phase: 'review', commitUnavailableWorkerIds: ['w-stale'] }),
+					gateInput({ phase: 'review', passedOverWorkerIds: ['w-stale'] }),
 				),
 			).toMatchObject({ status: 'selected', selection: { workerId: 'w-stale' } });
 		});
@@ -645,16 +645,45 @@ describe('evaluateDispatchEligibility', () => {
 
 			expect(
 				await evaluateDispatchEligibility(
-					gateInput({ phase: 'review', commitUnavailableWorkerIds: ['w-stale'] }),
+					gateInput({ phase: 'review', passedOverWorkerIds: ['w-stale'] }),
 				),
 			).toMatchObject({ status: 'selected', selection: { workerId: 'w-stale' } });
+		});
+
+		// Issue #1075: a machine whose transport was lost under the run is passed over
+		// on exactly the same terms — the caller unions both lists into one input.
+		it('passes over a machine whose transport was lost, alongside a commit-unavailable one', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-lost'),
+				makeCandidate('w-stale'),
+				makeCandidate('w-stable'),
+			]);
+
+			expect(
+				await evaluateDispatchEligibility(
+					gateInput({ phase: 'planning', passedOverWorkerIds: ['w-stale', 'w-lost'] }),
+				),
+			).toMatchObject({ status: 'selected', selection: { workerId: 'w-stable' } });
+		});
+
+		it('re-admits the lost machine when it is the only eligible one', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-lost'),
+				makeCandidate('w-offline', { connected: false }),
+			]);
+
+			expect(
+				await evaluateDispatchEligibility(
+					gateInput({ phase: 'planning', passedOverWorkerIds: ['w-lost'] }),
+				),
+			).toMatchObject({ status: 'selected', selection: { workerId: 'w-lost' } });
 		});
 
 		it('changes nothing for a dispatch with no such record', async () => {
 			listProjectDispatchCandidates.mockResolvedValue([makeCandidate('w-1'), makeCandidate('w-2')]);
 
 			expect(
-				await evaluateDispatchEligibility(gateInput({ commitUnavailableWorkerIds: [] })),
+				await evaluateDispatchEligibility(gateInput({ passedOverWorkerIds: [] })),
 			).toMatchObject({ status: 'selected', selection: { workerId: 'w-1' } });
 		});
 	});

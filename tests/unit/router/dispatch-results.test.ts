@@ -62,7 +62,7 @@ function ack(dispatchId: string, duplicate = false): TaskAssignmentAck {
 describe('dispatch result correlation registry', () => {
 	it('resolves the awaiting dispatcher with the delivered result', async () => {
 		const awaiting = awaitDispatchResult(DISPATCH_A, TARGET_A);
-		expect(deliverDispatchResult(result(DISPATCH_A))).toBe(true);
+		expect(deliverDispatchResult(result(DISPATCH_A), WORKER_A)).toBe(true);
 		await expect(awaiting.result).resolves.toMatchObject({
 			status: 'succeeded',
 			dispatchId: DISPATCH_A,
@@ -70,15 +70,15 @@ describe('dispatch result correlation registry', () => {
 	});
 
 	it('drops a result for a dispatch not awaited here', () => {
-		expect(deliverDispatchResult(result('unknown-dispatch'))).toBe(false);
+		expect(deliverDispatchResult(result('unknown-dispatch'), WORKER_A)).toBe(false);
 	});
 
 	it('consuming the entry makes a duplicate result frame a no-op', async () => {
 		const awaiting = awaitDispatchResult(DISPATCH_A, TARGET_A);
-		expect(deliverDispatchResult(result(DISPATCH_A))).toBe(true);
+		expect(deliverDispatchResult(result(DISPATCH_A), WORKER_A)).toBe(true);
 		await awaiting.result;
 		// The second frame finds no waiter — the registration was consumed on delivery.
-		expect(deliverDispatchResult(result(DISPATCH_A))).toBe(false);
+		expect(deliverDispatchResult(result(DISPATCH_A), WORKER_A)).toBe(false);
 		awaiting.dispose();
 	});
 
@@ -87,8 +87,8 @@ describe('dispatch result correlation registry', () => {
 		const onAck = vi.fn();
 		const awaiting = awaitDispatchResult(DISPATCH_B, TARGET_B, { onProgress, onAck });
 
-		deliverDispatchProgress(progress(DISPATCH_B));
-		deliverDispatchAck(ack(DISPATCH_B, true));
+		deliverDispatchProgress(progress(DISPATCH_B), WORKER_B);
+		deliverDispatchAck(ack(DISPATCH_B, true), WORKER_B);
 
 		expect(onProgress).toHaveBeenCalledWith(
 			expect.objectContaining({ state: 'branch-provisioned' }),
@@ -98,14 +98,31 @@ describe('dispatch result correlation registry', () => {
 	});
 
 	it('progress/ack for an unknown dispatch are no-ops (never throw)', () => {
-		expect(() => deliverDispatchProgress(progress('nobody'))).not.toThrow();
-		expect(() => deliverDispatchAck(ack('nobody'))).not.toThrow();
+		expect(() => deliverDispatchProgress(progress('nobody'), WORKER_A)).not.toThrow();
+		expect(() => deliverDispatchAck(ack('nobody'), WORKER_A)).not.toThrow();
 	});
 
 	it('dispose unregisters the wait so a later result is dropped', () => {
 		const awaiting = awaitDispatchResult(DISPATCH_A, TARGET_A);
 		awaiting.dispose();
-		expect(deliverDispatchResult(result(DISPATCH_A))).toBe(false);
+		expect(deliverDispatchResult(result(DISPATCH_A), WORKER_A)).toBe(false);
+	});
+
+	it('reaches a waiter only with frames from the worker it was pushed to (issue #1075)', async () => {
+		const onProgress = vi.fn();
+		const onAck = vi.fn();
+		const awaiting = awaitDispatchResult(DISPATCH_A, TARGET_A, { onProgress, onAck });
+
+		expect(deliverDispatchResult(result(DISPATCH_A), WORKER_B)).toBe(false);
+		deliverDispatchProgress(progress(DISPATCH_A), WORKER_B);
+		deliverDispatchAck(ack(DISPATCH_A), WORKER_B);
+		expect(onProgress).not.toHaveBeenCalled();
+		expect(onAck).not.toHaveBeenCalled();
+
+		// The wait is still registered, and its own worker's result still resolves it.
+		expect(deliverDispatchResult(result(DISPATCH_A), WORKER_A)).toBe(true);
+		await expect(awaiting.result).resolves.toMatchObject({ status: 'succeeded' });
+		awaiting.dispose();
 	});
 
 	it('a re-registration for the same dispatch unblocks the superseded waiter', async () => {
@@ -119,7 +136,7 @@ describe('dispatch result correlation registry', () => {
 			phase: 'review',
 			taskId: '724',
 		});
-		expect(deliverDispatchResult(result(DISPATCH_A))).toBe(true);
+		expect(deliverDispatchResult(result(DISPATCH_A), WORKER_A)).toBe(true);
 		await expect(second.result).resolves.toMatchObject({ status: 'succeeded' });
 		first.dispose();
 		second.dispose();
@@ -163,7 +180,7 @@ describe('failDispatchResultWait', () => {
 
 		// A frame the superseded daemon somehow still delivers is dropped, exactly as a
 		// duplicate result is — the settle is already under way on the reap's reason.
-		expect(deliverDispatchResult(result(DISPATCH_A))).toBe(false);
+		expect(deliverDispatchResult(result(DISPATCH_A), WORKER_A)).toBe(false);
 		expect(resolveDispatchTargetForRun('run-a')).toBeUndefined();
 		expect(resolveDispatchStreamTarget(DISPATCH_A)).toBeUndefined();
 
@@ -176,7 +193,7 @@ describe('failDispatchResultWait', () => {
 
 		expect(failDispatchResultWait(DISPATCH_A, REASON)).toBe(true);
 
-		expect(deliverDispatchResult(result(DISPATCH_B))).toBe(true);
+		expect(deliverDispatchResult(result(DISPATCH_B), WORKER_B)).toBe(true);
 		await expect(onB.result).resolves.toMatchObject({ status: 'succeeded' });
 
 		onA.dispose();
@@ -266,7 +283,7 @@ describe('resolveDispatchTargetForRun', () => {
 		expect(resolveDispatchTargetForRun('run-a')).toBeUndefined();
 
 		const settled = awaitDispatchResult(DISPATCH_B, TARGET_B);
-		expect(deliverDispatchResult(result(DISPATCH_B))).toBe(true);
+		expect(deliverDispatchResult(result(DISPATCH_B), WORKER_B)).toBe(true);
 		expect(resolveDispatchTargetForRun('run-b')).toBeUndefined();
 		settled.dispose();
 	});
@@ -400,7 +417,7 @@ describe('transport interruption bookkeeping', () => {
 	it('drops the bookkeeping with the entry on delivery, supersede and dispose', async () => {
 		const delivered = awaitDispatchResult(DISPATCH_A, TARGET_A);
 		noteWorkerTransportLost(WORKER_A);
-		expect(deliverDispatchResult(result(DISPATCH_A))).toBe(true);
+		expect(deliverDispatchResult(result(DISPATCH_A), WORKER_A)).toBe(true);
 		await delivered.result;
 		expect(noteWorkerTransportLost(WORKER_A)).toEqual([]);
 		delivered.dispose();
@@ -486,27 +503,28 @@ describe('orphaned dispatches', () => {
 	const REASON = "The worker's transport session was lost and did not return within the grace";
 
 	/** End `dispatchId`'s orphan record the way production does: its late result arrives. */
-	function answer(dispatchId: string): boolean {
-		return deliverDispatchResult(result(dispatchId));
+	function answer(dispatchId: string, fromWorkerId = WORKER_A): boolean {
+		return deliverDispatchResult(result(dispatchId), fromWorkerId);
 	}
 
 	afterEach(() => vi.useRealTimers());
 
-	it('settles the wait exactly as failDispatchResultWait does', async () => {
+	it('ends the wait with a transport-lost deferral, so the run is retried automatically (issue #1075)', async () => {
 		const awaiting = awaitDispatchResult(DISPATCH_A, TARGET_A);
 
 		expect(failOrphanedDispatchResultWait(DISPATCH_A, REASON)).toBe(true);
 
-		// The #859 frame, unchanged: a plain terminal failure with no `cancelled` key.
 		await expect(awaiting.result).resolves.toEqual({
 			type: 'task-execution-result',
 			dispatchId: DISPATCH_A,
-			status: 'failed',
+			status: 'deferred',
 			phase: 'implementation',
 			taskId: '407',
-			error: REASON,
 			reason: REASON,
+			failureKind: 'transport-lost',
 		});
+		// Consumed like any delivered result: nothing is awaited and no run indexes it.
+		expect(resolveDispatchTargetForRun('run-a')).toBeUndefined();
 		awaiting.dispose();
 		answer(DISPATCH_A);
 	});
@@ -551,20 +569,58 @@ describe('orphaned dispatches', () => {
 		failOrphanedDispatchResultWait(DISPATCH_A, REASON);
 		first.dispose();
 
-		// Defensive: a reaped dispatch settles terminally and its retry opens a new id,
-		// but a wait on the same worker again means its calls are that wait's own.
+		// The automatic retry reuses the dispatch id (issue #1075). Pushed back to the
+		// same worker, its calls and its answer are that wait's own.
 		const again = awaitDispatchResult(DISPATCH_A, TARGET_A);
 		expect(isDispatchOrphanedFrom(WORKER_A, DISPATCH_A)).toBe(false);
 		expect(listOrphanedDispatchesForWorker(WORKER_A)).toEqual([]);
 		again.dispose();
-
-		// Awaited on another worker: the original one stays fenced, but it is not told to
-		// stop, since its answer would resolve the other worker's wait.
-		const elsewhere = awaitDispatchResult(DISPATCH_A, { ...TARGET_A, workerId: WORKER_B });
-		expect(isDispatchOrphanedFrom(WORKER_A, DISPATCH_A)).toBe(true);
-		expect(listOrphanedDispatchesForWorker(WORKER_A)).toEqual([]);
-		elsewhere.dispose();
 		answer(DISPATCH_A);
+	});
+
+	it('still stops and fences the orphan while its retry is awaited on another worker (issue #1075)', async () => {
+		const first = awaitDispatchResult(DISPATCH_A, TARGET_A);
+		failOrphanedDispatchResultWait(DISPATCH_A, REASON);
+		first.dispose();
+
+		const retry = awaitDispatchResult(DISPATCH_A, { ...TARGET_A, workerId: WORKER_B });
+		expect(isDispatchOrphanedFrom(WORKER_A, DISPATCH_A)).toBe(true);
+		expect(isDispatchOrphanedFrom(WORKER_B, DISPATCH_A)).toBe(false);
+		expect(listOrphanedDispatchesForWorker(WORKER_A)).toEqual([
+			{ dispatchId: DISPATCH_A, ...TARGET_A },
+		]);
+
+		// The orphan's answer to its stop is dropped and forgets the orphan; the retry's
+		// wait is untouched and still resolves with its own worker's frame.
+		expect(answer(DISPATCH_A, WORKER_A)).toBe(false);
+		expect(listOrphanedDispatchesForWorker(WORKER_A)).toEqual([]);
+		expect(resolveDispatchTargetForRun('run-a')).toMatchObject({ workerId: WORKER_B });
+		expect(answer(DISPATCH_A, WORKER_B)).toBe(true);
+		await expect(retry.result).resolves.toMatchObject({ status: 'succeeded' });
+		retry.dispose();
+	});
+
+	it('keeps one record per worker when the same dispatch is orphaned on two (issue #1075)', () => {
+		const first = awaitDispatchResult(DISPATCH_A, TARGET_A);
+		failOrphanedDispatchResultWait(DISPATCH_A, REASON);
+		first.dispose();
+		const retry = awaitDispatchResult(DISPATCH_A, { ...TARGET_A, workerId: WORKER_B });
+		failOrphanedDispatchResultWait(DISPATCH_A, REASON);
+		retry.dispose();
+
+		expect(isDispatchOrphanedFrom(WORKER_A, DISPATCH_A)).toBe(true);
+		expect(isDispatchOrphanedFrom(WORKER_B, DISPATCH_A)).toBe(true);
+		expect(listOrphanedDispatchesForWorker(WORKER_A)).toHaveLength(1);
+		expect(listOrphanedDispatchesForWorker(WORKER_B)).toEqual([
+			{ dispatchId: DISPATCH_A, ...TARGET_A, workerId: WORKER_B },
+		]);
+
+		// Each worker's answer forgets only its own record.
+		answer(DISPATCH_A, WORKER_B);
+		expect(isDispatchOrphanedFrom(WORKER_A, DISPATCH_A)).toBe(true);
+		expect(isDispatchOrphanedFrom(WORKER_B, DISPATCH_A)).toBe(false);
+		answer(DISPATCH_A, WORKER_A);
+		expect(isDispatchOrphanedFrom(WORKER_A, DISPATCH_A)).toBe(false);
 	});
 
 	it('forgets an orphan whose worker never answers once the retention elapses', () => {
