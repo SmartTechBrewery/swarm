@@ -357,14 +357,17 @@ describe('cancelRunOnWorker', () => {
 
 		expect(cancelRunOnWorker(RUN_ID)).toBe(false);
 		expect(
-			deliverDispatchResult({
-				type: 'task-execution-result',
-				dispatchId: DISPATCH_ID,
-				status: 'succeeded',
-				phase: 'review',
-				taskId: '724',
-				exitCode: 0,
-			}),
+			deliverDispatchResult(
+				{
+					type: 'task-execution-result',
+					dispatchId: DISPATCH_ID,
+					status: 'succeeded',
+					phase: 'review',
+					taskId: '724',
+					exitCode: 0,
+				},
+				WORKER_ID,
+			),
 		).toBe(true);
 		await vi.advanceTimersByTimeAsync(DEFAULT_OFFLINE_WORKER_CANCEL_TIMEOUT_MS);
 

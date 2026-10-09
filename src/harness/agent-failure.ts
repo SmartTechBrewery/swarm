@@ -56,7 +56,15 @@ export type AgentFailureKind =
 	 * already failed to get it (`../worker/eligibility-gate.ts`).
 	 */
 	| 'commit-unavailable'
-	| 'blocked-recovery';
+	| 'blocked-recovery'
+	/**
+	 * The worker's transport session was lost and did not return within the grace,
+	 * so the control plane settled the run from that signal (issue #859). Never
+	 * produced by {@link classifyAgentFailure}: the transport-loss reap synthesizes it
+	 * on the router (`../router/dispatch-results.ts`). Retried automatically after the
+	 * delay its entry in `../worker/automatic-retry-policy.ts` declares (issue #1075).
+	 */
+	| 'transport-lost';
 
 export interface AgentFailure {
 	kind: AgentFailureKind;

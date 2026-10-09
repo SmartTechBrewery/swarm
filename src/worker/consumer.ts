@@ -62,10 +62,11 @@ import {
 	hasCompletedRunForTask,
 	isPipelineRun,
 	isRetryPendingStatus,
-	listRunCommitUnavailableWorkerIds,
+	listRunPassedOverWorkerIds,
 	type RunStatus,
 	recordRunCommitUnavailableWorker,
 	recordRunPreservedWorker,
+	recordRunTransportLostWorker,
 	resetRunToRunning,
 	storeRunLogs,
 	updateRunJobPayload,
@@ -188,6 +189,7 @@ import {
 import { CommitUnavailableError } from '../worktree/commit-availability.js';
 import { reconcileTerminatedWorktree } from '../worktree/termination-cleanup.js';
 import { DEFAULT_AGENT_TIMEOUT_MS, resolveAgentTimeoutMs } from './agent-timeout.js';
+import { automaticRetryPolicyFor } from './automatic-retry-policy.js';
 import {
 	maxDependencyRechecks,
 	resolveDependencyMaxWaitMs,
@@ -399,6 +401,13 @@ export type JobOutcome =
 			 * refusal only a human can clear — see {@link deferralWaitReason}.
 			 */
 			workerIneligibilityReason?: DispatchIneligibilityReason;
+			/**
+			 * An automatic retry of a failure that used to be terminal (issue #1075,
+			 * `./automatic-retry-policy.ts`): the retry consumes the separate
+			 * {@link SwarmJob.automaticRetryAttempt} budget, leaving the rate-limit one
+			 * untouched, and `attempt` is read from that counter.
+			 */
+			automaticRetry?: boolean;
 	  };
 
 /**
@@ -614,6 +623,10 @@ export type DeferrableFailure = AgentFailure | { kind: 'delivery' };
  * no instant at all it takes the flat {@link DEFAULT_RETRY_DELAY_MS} backoff.
  */
 export function retryDelayForFailure(failure: DeferrableFailure, now: number): number {
+	// A failure type retried automatically (issue #1075) waits exactly the delay its
+	// registry entry declares — still bounded by the longest wait a wake-up survives.
+	const policy = automaticRetryPolicyFor(failure.kind);
+	if (policy) return Math.min(MAX_RETRY_DELAY_MS, policy.delayMs);
 	if (
 		failure.kind === 'aborted' ||
 		failure.kind === 'capacity' ||
@@ -636,6 +649,10 @@ export function retryDelayForFailure(failure: DeferrableFailure, now: number): n
 }
 
 function deferredPhaseMessage(failure: DeferrableFailure, phase: TriggerPhase): string {
+	const policy = automaticRetryPolicyFor(failure.kind);
+	if (policy) {
+		return `Phase stopped - ${phaseLabel(phase)} — ${policy.label}, retrying automatically in ${Math.round(policy.delayMs / 60_000)}m`;
+	}
 	switch (failure.kind) {
 		case 'aborted':
 			return `Phase stopped - ${phaseLabel(phase)} — worker shutdown, deferring retry`;
@@ -783,16 +800,18 @@ function deferAgentRunError(
 	}
 	const checkpointContinuation =
 		checkpointFallback?.kind === 'continue' ? checkpointFallback : undefined;
-	const attempt = job.rateLimitRetryAttempt ?? 0;
-	const maxRetries = failure.kind === 'capacity' ? MAX_CAPACITY_RETRIES : MAX_RATE_LIMIT_RETRIES;
+	const { attempt, maxRetries, automatic } = retryBudgetFor(failure, job);
 	if (attempt >= maxRetries) {
-		logger.error(`Phase failed - ${phaseLabel(trigger.phase)} — retry budget exhausted`, {
-			projectId,
-			phase: trigger.phase,
-			taskId: trigger.taskId,
-			attempt,
-			error,
-		});
+		logger.error(
+			`Phase failed - ${phaseLabel(trigger.phase)} — ${automatic ? 'automatic retry' : 'retry'} budget exhausted`,
+			{
+				projectId,
+				phase: trigger.phase,
+				taskId: trigger.taskId,
+				attempt,
+				error,
+			},
+		);
 		return undefined;
 	}
 
@@ -843,6 +862,32 @@ function deferAgentRunError(
 		pmPhaseStarted:
 			job.type === 'pm' && (trigger.phase === 'planning' || trigger.phase === 'implementation'),
 		failureKind: failure.kind,
+		automaticRetry: automatic || undefined,
+	};
+}
+
+/**
+ * The retry budget a deferrable failure spends. A failure type retried automatically
+ * (issue #1075) is bounded by its own registry entry, on its own counter, so earlier
+ * rate-limit or timeout deferrals of the same run cannot have spent it; every other
+ * kind shares the rate-limit counter, with capacity's shorter bound.
+ */
+function retryBudgetFor(
+	failure: DeferrableFailure,
+	job: SwarmJob,
+): { attempt: number; maxRetries: number; automatic: boolean } {
+	const policy = automaticRetryPolicyFor(failure.kind);
+	if (policy) {
+		return {
+			attempt: job.automaticRetryAttempt ?? 0,
+			maxRetries: policy.maxAttempts,
+			automatic: true,
+		};
+	}
+	return {
+		attempt: job.rateLimitRetryAttempt ?? 0,
+		maxRetries: failure.kind === 'capacity' ? MAX_CAPACITY_RETRIES : MAX_RATE_LIMIT_RETRIES,
+		automatic: false,
 	};
 }
 
@@ -1044,6 +1089,8 @@ async function deferWorkerIneligible(
 
 /** Map a classified deferrable failure onto the dispatch record's wait reason. */
 function waitReasonForDeferral(kind: DeferrableFailure['kind'] | undefined): DispatchWaitReason {
+	const policy = automaticRetryPolicyFor(kind);
+	if (policy) return policy.waitReason;
 	switch (kind) {
 		case 'capacity':
 			return 'agent-capacity';
@@ -1122,6 +1169,7 @@ function deferralAttempt(
 ): number {
 	if (outcome.dependencyRecheck) return next.dependencyRecheckAttempt ?? 0;
 	if (outcome.workerEligibilityRecheck) return next.workerEligibilityRecheckAttempt ?? 0;
+	if (outcome.automaticRetry) return next.automaticRetryAttempt ?? 0;
 	return next.rateLimitRetryAttempt ?? 0;
 }
 
@@ -1151,6 +1199,7 @@ async function settleDispatchRetry(
 		continuationDispatchClaimed: outcome.continuationDispatchClaimed,
 		dependencyRecheck: outcome.dependencyRecheck,
 		workerEligibilityRecheck: outcome.workerEligibilityRecheck,
+		automaticRetry: outcome.automaticRetry,
 	});
 	await persistRetryPayloadOnRun(outcome.runId, next);
 	const updated = await scheduleDispatchRetry(dispatch.id, {
@@ -3908,6 +3957,38 @@ async function tryLoadPlanningScope(
 	}
 }
 
+/**
+ * Record this attempt's machine on the run when its failure is one the next
+ * attempt's gate should steer away from: a commit it could not obtain (issue #1018)
+ * or a transport it lost (issue #1075). Recorded *before* the deferral settles — the
+ * write is sticky across the settle's own recovery rewrite, so the order is not
+ * load-bearing, only the fact that it happens at all. Best-effort: a machine SWARM
+ * merely fails to steer away from is exactly the old behaviour, and must not cost the
+ * run its retry.
+ */
+async function tryRecordPassedOverWorker(
+	failureKind: AgentFailureKind | undefined,
+	runId: string | undefined,
+): Promise<void> {
+	if (!runId) return;
+	const record =
+		failureKind === 'commit-unavailable'
+			? recordRunCommitUnavailableWorker
+			: failureKind === 'transport-lost'
+				? recordRunTransportLostWorker
+				: undefined;
+	if (!record) return;
+	try {
+		await record(runId);
+	} catch (recordErr) {
+		logger.warn('Failed to record the worker this run should pass over next time', {
+			runId,
+			failureKind,
+			error: describeError(recordErr),
+		});
+	}
+}
+
 async function handlePhaseFailure(
 	err: unknown,
 	job: SwarmJob,
@@ -4016,23 +4097,10 @@ async function handlePhaseFailure(
 					? ('commit-unavailable' as const)
 					: undefined;
 
-	// This machine could not obtain the commit the phase's checkout has to be detached
-	// at (issue #1018). Record it against the run *before* the deferral settles, so the
-	// next attempt's gate can prefer a machine that has not already failed to get it —
-	// the write is sticky across the settle's own recovery rewrite, so the order is not
-	// load-bearing, only the fact that it happens at all. Best-effort: a machine SWARM
-	// merely fails to steer away from is exactly today's behaviour, and must not cost
-	// the run its retry.
-	if (failureKind === 'commit-unavailable' && runId) {
-		try {
-			await recordRunCommitUnavailableWorker(runId);
-		} catch (recordErr) {
-			logger.warn('Failed to record the worker that could not obtain the run commit', {
-				runId,
-				error: describeError(recordErr),
-			});
-		}
-	}
+	// A machine that could not obtain the run's commit (issue #1018), or lost its
+	// transport under it (issue #1075), is recorded so the next attempt's gate can
+	// prefer another one.
+	await tryRecordPassedOverWorker(failureKind, runId);
 
 	// A usage/session-limit hit or a worker-shutdown abort is transient/recoverable:
 	// rather than failing the job, we defer it and let the worker re-enqueue it once
@@ -4055,6 +4123,10 @@ async function handlePhaseFailure(
 				// worker reports it as a classified deferral rather than as the error
 				// object.
 				err.failure.kind === 'commit-unavailable' ||
+				// A failure type that used to be terminal and is now retried
+				// automatically after its own delay (issue #1075) — a lost worker
+				// transport, today. `deferAgentRunError` applies its own bound.
+				automaticRetryPolicyFor(err.failure.kind) !== undefined ||
 				// A timeout resumes only when the run was genuinely interrupted: it
 				// carries an agent result whose exit was non-zero/null (the phase threw
 				// and preserved its worktree). A run that trapped SIGTERM and still
@@ -4230,7 +4302,9 @@ async function resolvePreservedWorkerPin(job: SwarmJob): Promise<PreservedWorker
 }
 
 /**
- * The machines this run has already failed to obtain its commit on (issue #1018).
+ * The machines this run's next attempt should pass over: those it has already
+ * failed to obtain its commit on (issue #1018), and those whose transport was lost
+ * under it (issue #1075).
  *
  * Read separately from {@link resolvePreservedWorkerPin}'s run read, and on the
  * opposite failure policy: that one fails **closed**, because dispatching a
@@ -4239,12 +4313,12 @@ async function resolvePreservedWorkerPin(job: SwarmJob): Promise<PreservedWorker
  * exactly today's behaviour, and refusing a dispatch over it would be a worse outcome
  * than the defect it steers around.
  */
-async function resolveCommitUnavailableWorkers(job: SwarmJob): Promise<string[]> {
+async function resolvePassedOverWorkers(job: SwarmJob): Promise<string[]> {
 	if (!job.runId) return [];
 	try {
-		return await listRunCommitUnavailableWorkerIds(job.runId);
+		return await listRunPassedOverWorkerIds(job.runId);
 	} catch (err) {
-		logger.warn('Could not read which workers failed to obtain this run commit (continuing)', {
+		logger.warn('Could not read which workers this run should pass over (continuing)', {
 			runId: job.runId,
 			error: describeError(err),
 		});
@@ -4320,10 +4394,10 @@ async function gateDispatch(
 				// it, but only once it knows the project is federated at all.
 				preservedWorkerUnknown: preservedPin.machineUnknown,
 				// The machines that already failed to obtain this run's commit (issue
-				// #1018) — the softest narrowing the gate applies, and the one that stops
-				// a deterministic roster walk from sending every retry back to the clone
-				// that does not have it.
-				commitUnavailableWorkerIds: await resolveCommitUnavailableWorkers(job),
+				// #1018) or lost their transport under it (issue #1075) — the softest
+				// narrowing the gate applies, and the one that stops a deterministic
+				// roster walk from sending every retry back to the machine that failed it.
+				passedOverWorkerIds: await resolvePassedOverWorkers(job),
 			},
 			{
 				...gateOptions,

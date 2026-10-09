@@ -370,6 +370,17 @@ export const runs = pgTable(
 			 * ({@link clearRunRecovery}).
 			 */
 			commitUnavailableWorkerIds?: string[] | null;
+			/**
+			 * The machines whose transport session was lost while running this run, and
+			 * did not return within the grace (issue #1075) — appended by
+			 * {@link recordRunTransportLostWorker} from the attempt's own `worker_id`.
+			 *
+			 * Read by the dispatch gate together with `commitUnavailableWorkerIds`, on the
+			 * same terms: a **preference**, never a ban, so the automatic retry starts on a
+			 * different eligible machine when there is one and goes back to the lost one
+			 * when it is all that is eligible. Sticky and forgiven exactly as that list is.
+			 */
+			transportLostWorkerIds?: string[] | null;
 		}>(),
 		/**
 		 * This run's recorded cancellation origin (issue #308), mirroring

@@ -2220,6 +2220,31 @@ describe('runsRouter', () => {
 			expect(markRunUserTerminated).not.toHaveBeenCalled();
 		});
 
+		// Issue #1075: Retry now on a run awaiting its automatic transport-loss retry
+		// reopens that same dispatch, so it supersedes the scheduled retry and never
+		// creates a second run — and the manual attempt gets a fresh automatic budget.
+		it('supersedes a pending automatic transport-loss retry by reopening its dispatch', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', status: 'deferred' }));
+			vi.mocked(getActiveDispatchByRunId).mockResolvedValue(
+				makeDispatch({
+					waitReason: 'transport-lost',
+					jobPayload: { ...SCM_PAYLOAD, automaticRetryAttempt: 1 },
+				}),
+			);
+			vi.mocked(reopenDispatchForManualRetry).mockResolvedValue(makeDispatch());
+
+			await expect(caller.retryNow({ runId: 'run-1' })).resolves.toEqual({
+				runId: 'run-1',
+				status: 'retrying',
+			});
+
+			expect(reopenDispatchForManualRetry).toHaveBeenCalledWith(
+				'dispatch-1',
+				expect.objectContaining({ runId: 'run-1', automaticRetryAttempt: 0 }),
+			);
+			expect(createAndPublishDispatch).not.toHaveBeenCalled();
+		});
+
 		it('folds cli/model/reasoning overrides into the dispatch payload', async () => {
 			vi.mocked(getRunByIdFromDb).mockResolvedValue(
 				makeRun({

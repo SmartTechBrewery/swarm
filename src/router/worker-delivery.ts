@@ -205,7 +205,7 @@ import { advanceWorkerRollout } from './worker-rollout-advance.js';
  * status.
  */
 export const ORPHANED_DISPATCH_DELIVERY_REASON =
-	"this phase's dispatch was already settled when the worker's transport was lost — its run is recorded as failed, so its board and review writes are refused";
+	"this phase's dispatch was already settled when the worker's transport was lost — its run is settled without this attempt, so its board and review writes are refused";
 
 /**
  * Collaborators the delivery API depends on, defaulted to the real services so

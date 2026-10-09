@@ -63,12 +63,20 @@ export interface DeferredRetryIntent {
 	 * waits for a worker to free up (or for consent/enrollment to be granted).
 	 */
 	workerEligibilityRecheck?: boolean;
+	/**
+	 * This is an automatic retry of a failure that used to be terminal (issue #1075,
+	 * `../worker/automatic-retry-policy.ts`): it consumes the separate
+	 * {@link SwarmJob.automaticRetryAttempt} budget and leaves the rate-limit one
+	 * untouched.
+	 */
+	automaticRetry?: boolean;
 }
 
 /**
  * Which attempt counter this deferral spends. The two token-free re-checks
  * (dependency, worker eligibility) each have their own budget so a long wait on
- * one can't exhaust the other or the small rate-limit budget; every other
+ * one can't exhaust the other or the small rate-limit budget, and so does an
+ * automatic retry of a failure that used to be terminal (issue #1075); every other
  * deferral is a failure retry and consumes the rate-limit one as before.
  */
 function attemptCounterPatch(
@@ -78,12 +86,16 @@ function attemptCounterPatch(
 	dependencyRecheckAttempt?: number;
 	workerEligibilityRecheckAttempt?: number;
 	rateLimitRetryAttempt?: number;
+	automaticRetryAttempt?: number;
 } {
 	if (intent.dependencyRecheck) {
 		return { dependencyRecheckAttempt: (job.dependencyRecheckAttempt ?? 0) + 1 };
 	}
 	if (intent.workerEligibilityRecheck) {
 		return { workerEligibilityRecheckAttempt: (job.workerEligibilityRecheckAttempt ?? 0) + 1 };
+	}
+	if (intent.automaticRetry) {
+		return { automaticRetryAttempt: (job.automaticRetryAttempt ?? 0) + 1 };
 	}
 	return { rateLimitRetryAttempt: (job.rateLimitRetryAttempt ?? 0) + 1 };
 }
@@ -251,8 +263,9 @@ function applyManualRecoveryIntent(
 
 /**
  * Rebuild a retry job payload from a stored one: carry the originating `runId`
- * forward (so the retry reuses that row) and reset the rate-limit attempt
- * counter to 0 (a manual retry bypasses the automatic cap), applying any
+ * forward (so the retry reuses that row) and reset the rate-limit and
+ * automatic-retry attempt counters to 0 (a manual retry bypasses the automatic
+ * caps), applying any
  * cli/model overrides. Shared by "Retry now"'s reopen-existing-dispatch path,
  * its reconstruct-from-run-row fallback, and "Reset & restart".
  *
@@ -274,6 +287,7 @@ export function reconstructRetryJob(
 	const job = { ...normalizeStoredJobPayload(jobPayload) };
 	job.runId = runId;
 	job.rateLimitRetryAttempt = 0;
+	job.automaticRetryAttempt = 0;
 	if (job.type === 'pm' && (phase === 'planning' || phase === 'implementation')) {
 		job.resumePmPhase = phase;
 	}
@@ -301,8 +315,8 @@ export function reconstructRetryJob(
  * fresh dispatch of the same task ran fine.
  *
  * What *is* carried is dispatch intent rather than resumption: `runId` (so the reset
- * reuses that row), a zeroed rate-limit budget (a manual action bypasses the
- * automatic cap), and `resumePmPhase` for a board phase — which records only *which
+ * reuses that row), zeroed rate-limit and automatic-retry budgets (a manual action
+ * bypasses the automatic caps), and `resumePmPhase` for a board phase — which records only *which
  * phase this dispatch is*, after the card already moved to In progress, and makes the
  * run adopt no checkout, branch, or session.
  *
@@ -325,6 +339,7 @@ export function reconstructResetJob(
 	const job = stripRecoveryIntent(normalizeStoredJobPayload(jobPayload));
 	job.runId = runId;
 	job.rateLimitRetryAttempt = 0;
+	job.automaticRetryAttempt = 0;
 	if (job.type === 'pm' && (phase === 'planning' || phase === 'implementation')) {
 		job.resumePmPhase = phase;
 	}

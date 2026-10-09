@@ -25,8 +25,8 @@
  * it fires — never cancel the timer, exactly as the offline-termination settle does
  * (`./dispatch-cancellation.ts`, issue #827). A worker with a live socket here again
  * is a blip that reconnected and is left alone; a worker still absent has its
- * dispatches ended through the seam both precedents already use,
- * `failDispatchResultWait`. The grace is measured from the **most recent** drop for
+ * dispatches ended through the same registry seam both precedents already use
+ * (`failOrphanedDispatchResultWait`, beside `failDispatchResultWait`). The grace is measured from the **most recent** drop for
  * each dispatch, not from whichever drop armed the firing timer: every drop arms its
  * own grace and carries the generation that identifies it, so a timer that fires
  * while a newer drop's grace is still running steps aside for it.
@@ -40,12 +40,23 @@
  * The single-router MVP assumption both `./worker-connections.ts` and
  * `./dispatch-results.ts` state is what makes that answer complete.
  *
- * **No re-dispatch follows.** The synthetic frame is a plain `failed` — no
- * `cancelled` — so `adaptResultToPhaseRun` raises a non-deferrable
- * `AgentRunError { kind: 'error' }` and the worker's shared failure path settles the
- * run terminally. Whether a phase lost this way should be run again is a policy
- * question this does not answer (a Respond-to-review that had already pushed must not
- * be replayed blindly); `swarm run reset` remains the operator's way to do it.
+ * **The run is retried automatically (issue #1075).** The synthetic frame is a
+ * `deferred` one of kind `transport-lost`, so `adaptResultToPhaseRun` raises an
+ * `AgentRunError { kind: 'transport-lost' }` and the shared failure path defers the
+ * run through the ordinary deferral machinery: the run is `deferred` with a
+ * `nextRetryAt`, the dispatch `retry-scheduled` with wait reason `transport-lost`.
+ * The delay and the bound come from that failure type's entry in the automatic-retry
+ * registry (`../worker/automatic-retry-policy.ts`): 30 minutes, at most two automatic
+ * retries per run on their own counter, after which the run fails for the operator
+ * exactly as it did before. The lost worker is recorded on the run
+ * (`runs.recovery.transportLostWorkerIds`), and the dispatch gate prefers another
+ * eligible worker for the retry. Retry now on the deferred run reopens the same
+ * dispatch, so it supersedes the scheduled retry and never creates a second run.
+ *
+ * The retry is mechanically the operator's Retry now — same run row, same dispatch,
+ * fresh session — so it is exactly as safe for a pushing phase as that is: delivery
+ * refuses a remote head that drifted from the expected SHA, PR and comment delivery
+ * are idempotent per run, and a Planning split is resumable by its run's markers.
  *
  * **A worker that comes back late is stopped, not trusted (issue #1073).** The reap
  * ends the control plane's wait. It cannot reach the agent, which keeps running on a
@@ -66,13 +77,23 @@
  *   stop is a push, and a phase may already be in its delivery step when it lands, or
  *   reach a route before its socket is back. The fence covers those cases.
  *
+ * The automatic retry reuses the dispatch id (issue #1075), so both are keyed on the
+ * worker as well as the dispatch: the back-channel reaches a waiter only with frames
+ * from the worker it was pushed to, and an orphan is remembered per dispatch and
+ * worker. A retry running on W2 is therefore never resolved by W1's answer to its
+ * stop, and W1's delivery calls stay refused while W2's are served. One narrow race
+ * is accepted rather than engineered around: when the lost worker is the only
+ * eligible one and reconnects at the very moment its retry is pushed back to it, its
+ * answer to the stop carries the same dispatch id from the same worker and can reach
+ * the new wait.
+ *
  * The alternative was to honour a late success: correct the run and owe the follow-up
  * it would have earned. It was rejected because that needs a second settle path
- * outside `processJob`, run after its job has already unwound, the failure comment
- * posted and the PR hold released. Keeping the phase off the board leaves the one
- * settle that already ran correct: the run failed, the board did not move, and Retry
- * is the recovery. Planning in particular cannot split an item twice, because the late
- * attempt never split it at all.
+ * outside `processJob`, run after its job has already unwound and the PR hold
+ * released. Keeping the phase off the board leaves the one settle that already ran
+ * correct: the run deferred (or failed, once its automatic-retry budget is spent),
+ * the board did not move, and the retry is the recovery. Planning in particular
+ * cannot split an item twice, because the late attempt never split it at all.
  */
 
 import { resolveHeartbeatTtlMs } from '../identity/worker-session-service.js';

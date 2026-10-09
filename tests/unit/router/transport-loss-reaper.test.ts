@@ -100,16 +100,16 @@ describe('reapDispatchesIfTransportStaysLost (issue #859)', () => {
 		transportLost(WORKER_ID);
 		await vi.advanceTimersByTimeAsync(GRACE_MS);
 
-		// Terminal `failed` with no `cancelled` key: a plain failure, not a
-		// termination, so nothing re-dispatches it.
+		// A `transport-lost` deferral (issue #1075): the shared settle path defers the
+		// run and retries it automatically after that failure type's delay.
 		await expect(awaiting.result).resolves.toEqual({
 			type: 'task-execution-result',
 			dispatchId: DISPATCH_ID,
-			status: 'failed',
+			status: 'deferred',
 			phase: 'respond-to-review',
 			taskId: '118',
-			error: TRANSPORT_LOST_ORPHAN_REASON,
 			reason: TRANSPORT_LOST_ORPHAN_REASON,
+			failureKind: 'transport-lost',
 		});
 		expect(persistControlPlaneNote).toHaveBeenCalledWith(RUN_ID, TRANSPORT_LOST_ORPHAN_NOTE);
 	});
@@ -172,7 +172,8 @@ describe('reapDispatchesIfTransportStaysLost (issue #859)', () => {
 		// And then the second drop's own timer settles it — the worker never returned.
 		await vi.advanceTimersByTimeAsync(1);
 		await expect(awaiting.result).resolves.toMatchObject({
-			status: 'failed',
+			status: 'deferred',
+			failureKind: 'transport-lost',
 			reason: TRANSPORT_LOST_ORPHAN_REASON,
 		});
 		expect(persistControlPlaneNote).toHaveBeenCalledWith(RUN_ID, TRANSPORT_LOST_ORPHAN_NOTE);
@@ -227,13 +228,16 @@ describe('reapDispatchesIfTransportStaysLost (issue #859)', () => {
 		transportLost(WORKER_ID);
 		// The worker came back on another router, or the result had already been
 		// delivered: the wait ends on its own before the grace elapses.
-		deliverDispatchResult({
-			type: 'task-execution-result',
-			dispatchId: DISPATCH_ID,
-			status: 'succeeded',
-			phase: 'respond-to-review',
-			taskId: '118',
-		});
+		deliverDispatchResult(
+			{
+				type: 'task-execution-result',
+				dispatchId: DISPATCH_ID,
+				status: 'succeeded',
+				phase: 'respond-to-review',
+				taskId: '118',
+			},
+			WORKER_ID,
+		);
 		await vi.advanceTimersByTimeAsync(GRACE_MS);
 
 		await expect(awaiting.result).resolves.toMatchObject({ status: 'succeeded' });
@@ -290,19 +294,25 @@ describe('stopOrphanedDispatchesOnReturn (issue #1073)', () => {
 		const awaiting = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
 		transportLost(WORKER_ID);
 		await vi.advanceTimersByTimeAsync(GRACE_MS);
-		await expect(awaiting.result).resolves.toMatchObject({ status: 'failed' });
+		await expect(awaiting.result).resolves.toMatchObject({
+			status: 'deferred',
+			failureKind: 'transport-lost',
+		});
 	}
 
 	/** The worker's answer to the stop: the frame that ends the orphan. */
 	function answered(): void {
-		deliverDispatchResult({
-			type: 'task-execution-result',
-			dispatchId: DISPATCH_ID,
-			status: 'failed',
-			cancelled: true,
-			phase: 'respond-to-review',
-			taskId: '118',
-		});
+		deliverDispatchResult(
+			{
+				type: 'task-execution-result',
+				dispatchId: DISPATCH_ID,
+				status: 'failed',
+				cancelled: true,
+				phase: 'respond-to-review',
+				taskId: '118',
+			},
+			WORKER_ID,
+		);
 	}
 
 	it('tells a worker that comes back late to stop the phase it was reaped of', async () => {

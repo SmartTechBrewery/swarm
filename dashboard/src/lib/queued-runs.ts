@@ -64,6 +64,9 @@ const QUEUED_WAIT_REASON_LABELS: Record<QueuedWaitReason, string> = {
 	// it is on the remote, and the retry is going to a machine that has it (issue
 	// #1018).
 	'commit-unavailable': 'retrying on a worker that has the commit',
+	// An automatic retry (issue #1075): the run's worker dropped off and never came
+	// back, so it is retried after its failure type's delay, preferably elsewhere.
+	'transport-lost': "retrying after the worker's connection was lost",
 	recheck: 'waiting for checks to settle',
 	// The two halves of the dispatch gate's wait, deliberately worded so an operator
 	// can tell them apart at a glance (issue #607): the first clears on its own once a

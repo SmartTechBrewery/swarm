@@ -33,7 +33,7 @@ import {
 	hasLiveRunForTask,
 	hasResumableDeferredRun,
 	hasRunForTask,
-	listRunCommitUnavailableWorkerIds,
+	listRunPassedOverWorkerIds,
 	listRunsFromDb,
 	listTaskActivitySince,
 	MAX_RUN_OUTPUT_BYTES,
@@ -41,6 +41,7 @@ import {
 	recordRunCleanupBlocked,
 	recordRunCommitUnavailableWorker,
 	recordRunPreservedWorker,
+	recordRunTransportLostWorker,
 	resetRunToRunning,
 	settleWorkerUpdateRun,
 	storeRunLogs,
@@ -1042,7 +1043,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			// attempt writes `null` — neither may erase the list.
 			await completeRun(id, { status: 'deferred', error: 'commit not in this clone' });
 
-			expect(await listRunCommitUnavailableWorkerIds(id)).toEqual([worker.id]);
+			expect(await listRunPassedOverWorkerIds(id)).toEqual([worker.id]);
 		});
 
 		it('appends a second machine and never duplicates the first', async () => {
@@ -1076,10 +1077,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			);
 			await recordRunCommitUnavailableWorker(id);
 
-			expect(await listRunCommitUnavailableWorkerIds(id)).toEqual([
-				first.worker.id,
-				second.worker.id,
-			]);
+			expect(await listRunPassedOverWorkerIds(id)).toEqual([first.worker.id, second.worker.id]);
 		});
 
 		it('records nothing for a run with no worker — there is nowhere else to send it', async () => {
@@ -1088,7 +1086,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			await recordRunCommitUnavailableWorker(id);
 
 			expect((await getRunByIdFromDb(id))?.recovery).toBeNull();
-			expect(await listRunCommitUnavailableWorkerIds(id)).toEqual([]);
+			expect(await listRunPassedOverWorkerIds(id)).toEqual([]);
 		});
 
 		it('is forgiven by "Reset & restart", the one gesture that clears it', async () => {
@@ -1104,7 +1102,77 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 
 			await clearRunRecovery(id);
 
-			expect(await listRunCommitUnavailableWorkerIds(id)).toEqual([]);
+			expect(await listRunPassedOverWorkerIds(id)).toEqual([]);
+		});
+	});
+
+	// Issue #1075. The second passed-over list, written by the same jsonb append and
+	// carried across the same wholesale recovery rewrites.
+	describe('transport-lost machines (issue #1075)', () => {
+		it('records the attempt’s own machine, and survives a deferral and a null write', async () => {
+			const { worker, owner } = await seedWorker('transport-a');
+			const id = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '1075a',
+				phase: 'planning',
+				workerId: worker.id,
+				workerUserId: owner.id,
+			});
+
+			await recordRunTransportLostWorker(id);
+			await recordRunTransportLostWorker(id);
+			await completeRun(id, { status: 'deferred', error: 'transport lost' });
+			await completeRun(id, { status: 'completed', recovery: null });
+
+			expect((await getRunByIdFromDb(id))?.recovery?.transportLostWorkerIds).toEqual([worker.id]);
+			expect(await listRunPassedOverWorkerIds(id)).toEqual([worker.id]);
+		});
+
+		it('is read together with the commit-unavailable list, de-duplicated', async () => {
+			const first = await seedWorker('transport-b');
+			const second = await seedWorker('transport-b-two');
+			const id = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '1075b',
+				phase: 'review',
+				workerId: first.worker.id,
+				workerUserId: first.owner.id,
+			});
+			await recordRunCommitUnavailableWorker(id);
+			await recordRunTransportLostWorker(id);
+			await resetRunToRunning(
+				id,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				null,
+				second.worker.id,
+				1,
+				second.owner.id,
+			);
+			await recordRunTransportLostWorker(id);
+
+			expect(await listRunPassedOverWorkerIds(id)).toEqual([first.worker.id, second.worker.id]);
+		});
+
+		it('is forgiven by "Reset & restart"', async () => {
+			const { worker, owner } = await seedWorker('transport-c');
+			const id = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '1075c',
+				phase: 'review',
+				workerId: worker.id,
+				workerUserId: owner.id,
+			});
+			await recordRunTransportLostWorker(id);
+
+			await clearRunRecovery(id);
+
+			expect(await listRunPassedOverWorkerIds(id)).toEqual([]);
 		});
 	});
 

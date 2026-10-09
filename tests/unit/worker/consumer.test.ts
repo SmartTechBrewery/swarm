@@ -21,6 +21,7 @@ import { buildPreplanContract, embedPreplanMarker } from '@/pipeline/preplan.js'
 import { BlockedRecoveryError } from '@/pipeline/resume.js';
 import type { PMProvider, WorkItem, WorkItemAssignee } from '@/pm/types.js';
 import type { CancellationOrigin } from '@/queue/cancellation.js';
+import type { SwarmJob } from '@/queue/jobs.js';
 import { TRANSPORT_LOST_ORPHAN_REASON } from '@/router/transport-loss-reaper.js';
 import { DeliveryDeferredError, HANDOFF_FILENAMES, validatePreparedTree } from '@/scm/delivery.js';
 import { GitWorktreeManager } from '@/worker/git-worktree-manager.js';
@@ -477,7 +478,9 @@ const recordRunPreservedWorker = vi.fn(async (_runId: string) => {});
 // Issue #1018 — the run's record of which machines could not obtain its commit: the
 // write the failure makes, and the read the next dispatch's gate does.
 const recordRunCommitUnavailableWorker = vi.fn(async (_runId: string) => {});
-const listRunCommitUnavailableWorkerIds = vi.fn(async (_runId: string): Promise<string[]> => []);
+const listRunPassedOverWorkerIds = vi.fn(async (_runId: string): Promise<string[]> => []);
+// Issue #1075 — the run's record of which machines lost their transport under it.
+const recordRunTransportLostWorker = vi.fn(async (_runId: string) => {});
 vi.mock('@/db/repositories/runsRepository.js', () => ({
 	createRun: (input: unknown) => createRun(input),
 	completeRun: (id: string, input: unknown) => completeRun(id, input),
@@ -506,7 +509,8 @@ vi.mock('@/db/repositories/runsRepository.js', () => ({
 	getRunByIdFromDb: (id: string) => getRunByIdFromDb(id),
 	recordRunPreservedWorker: (runId: string) => recordRunPreservedWorker(runId),
 	recordRunCommitUnavailableWorker: (runId: string) => recordRunCommitUnavailableWorker(runId),
-	listRunCommitUnavailableWorkerIds: (runId: string) => listRunCommitUnavailableWorkerIds(runId),
+	recordRunTransportLostWorker: (runId: string) => recordRunTransportLostWorker(runId),
+	listRunPassedOverWorkerIds: (runId: string) => listRunPassedOverWorkerIds(runId),
 	// Issue #971 — a pure predicate over the row's own columns, so the real rule is
 	// restated rather than stubbed to a constant: the no-trigger settle must agree with
 	// the repository about what counts as pipeline work.
@@ -4920,6 +4924,103 @@ describe('processJob', () => {
 		});
 	});
 
+	// Issue #1075. A run the transport-loss reap (#859) settled used to be terminal, and
+	// only an operator's Retry brought it back. It now defers through the ordinary
+	// deferral machinery and is retried automatically after its failure type's delay.
+	describe('a run whose worker transport was lost', () => {
+		const THIRTY_MINUTES_MS = 30 * 60 * 1000;
+		const transportLost = () => {
+			phaseImpl = async () => {
+				throw new AgentRunError(TRANSPORT_LOST_ORPHAN_REASON, { kind: 'transport-lost' });
+			};
+		};
+
+		it('defers for an automatic retry in 30 minutes, records the lost machine, and posts no failure', async () => {
+			transportLost();
+			recordRunTransportLostWorker.mockClear();
+			scheduleDispatchRetry.mockClear();
+			commentOnPullRequest.mockClear();
+			failDispatch.mockClear();
+			const before = Date.now();
+
+			const outcome = await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(outcome).toMatchObject({
+				status: 'phase-deferred',
+				retryDelayMs: THIRTY_MINUTES_MS,
+				attempt: 0,
+				resumable: false,
+				failureKind: 'transport-lost',
+				automaticRetry: true,
+			});
+			const [, input] = scheduleDispatchRetry.mock.calls.at(-1) as [
+				string,
+				{ waitReason: string; attempt: number; availableAt: Date; jobPayload: SwarmJob },
+			];
+			expect(input.waitReason).toBe('transport-lost');
+			expect(input.attempt).toBe(1);
+			expect(input.availableAt.getTime()).toBeGreaterThanOrEqual(before + THIRTY_MINUTES_MS);
+			// Its own counter: the rate-limit budget is untouched.
+			expect(input.jobPayload.automaticRetryAttempt).toBe(1);
+			expect(input.jobPayload.rateLimitRetryAttempt).toBeUndefined();
+			const settle = completeRun.mock.calls.at(-1)?.[1] as {
+				status?: string;
+				error?: string;
+				nextRetryAt?: Date;
+				agentSessionId?: string | null;
+			};
+			expect(settle).toMatchObject({ status: 'deferred', agentSessionId: null });
+			expect(settle.error).toContain(TRANSPORT_LOST_ORPHAN_REASON);
+			expect(settle.nextRetryAt?.getTime()).toBeGreaterThanOrEqual(before + THIRTY_MINUTES_MS);
+			expect(recordRunTransportLostWorker).toHaveBeenCalledWith('run-1');
+			expect(failDispatch).not.toHaveBeenCalled();
+			expect(commentOnPullRequest).not.toHaveBeenCalled();
+		});
+
+		it('is not blocked by rate-limit deferrals the run already spent', async () => {
+			transportLost();
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ rateLimitRetryAttempt: 6 }),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-deferred');
+		});
+
+		it('fails for the operator once its automatic-retry budget is spent', async () => {
+			transportLost();
+			failDispatch.mockClear();
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ automaticRetryAttempt: 2 }),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-failed');
+			expect(failDispatch).toHaveBeenCalledWith(
+				'dispatch-1',
+				expect.stringContaining(TRANSPORT_LOST_ORPHAN_REASON),
+			);
+		});
+
+		it('leaves a failure type outside the registry terminal', async () => {
+			phaseImpl = async () => {
+				throw new AgentRunError(TRANSPORT_LOST_ORPHAN_REASON, { kind: 'error' });
+			};
+
+			const outcome = await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-failed');
+		});
+	});
+
 	// Issue #1019: the PR+SHA dispatch claim is taken before a Review starts and used
 	// to survive a run that failed without ever submitting a verdict, so for five
 	// minutes the guard against a *duplicate* review blocked the retry of a review
@@ -6233,20 +6334,34 @@ describe('processJob', () => {
 				);
 
 				// …and when the settle is the transport-loss reap's (issue #859). The
-				// orphaned Respond-to-review of the live incident unwinds as this same
-				// non-deferrable failure, so the pull request it was holding is released and
-				// the phase queued behind it is woken — inside the reap's grace rather than
-				// at the end of the phase's own lease window.
+				// orphaned Respond-to-review of the live incident unwinds as a
+				// `transport-lost` deferral since issue #1075, so the pull request it was
+				// holding is released and the phase queued behind it is woken — inside the
+				// reap's grace rather than at the end of the phase's own lease window.
 				promotePullRequestInFlightWaits.mockClear();
-				failDispatch.mockClear();
 				phaseImpl = async () => {
-					throw new AgentRunError(TRANSPORT_LOST_ORPHAN_REASON, { kind: 'error' });
+					throw new AgentRunError(TRANSPORT_LOST_ORPHAN_REASON, { kind: 'transport-lost' });
 				};
 				const orphaned = await processJob(
 					createMockScmWebhookJob(),
 					registryReturning(RESPOND_TO_REVIEW_TRIGGER),
 				);
-				expect(orphaned.status).toBe('phase-failed');
+				expect(orphaned.status).toBe('phase-deferred');
+				expect(promotePullRequestInFlightWaits).toHaveBeenCalledWith(
+					PROJECT.id,
+					PROJECT.repo,
+					'17',
+				);
+
+				// Once its automatic-retry budget is spent, the same settle fails for good,
+				// and still releases the hold.
+				promotePullRequestInFlightWaits.mockClear();
+				failDispatch.mockClear();
+				const exhausted = await processJob(
+					createMockScmWebhookJob({ automaticRetryAttempt: 2 }),
+					registryReturning(RESPOND_TO_REVIEW_TRIGGER),
+				);
+				expect(exhausted.status).toBe('phase-failed');
 				expect(promotePullRequestInFlightWaits).toHaveBeenCalledWith(
 					PROJECT.id,
 					PROJECT.repo,
