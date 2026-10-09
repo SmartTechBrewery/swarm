@@ -19,6 +19,15 @@ vi.mock('@/db/repositories/runsRepository.js', () => ({
 		updateReviewMergeOutcome(runId, input),
 }));
 
+// The review-verdict ledger's superseded stamp (issue #1079). Mocked for the same
+// reason the merge capability is injected: this suite asserts *which* refusals
+// write it and with which key, while whether the write lands is the ledger's own
+// integration suite.
+const markReviewVerdictSuperseded = vi.fn(async (_key: unknown) => true);
+vi.mock('@/db/repositories/reviewVerdictsRepository.js', () => ({
+	markReviewVerdictSuperseded: (key: unknown) => markReviewVerdictSuperseded(key),
+}));
+
 // The board work a merged pull request triggers (issue #959). Mocked here so this
 // suite keeps knowing only the DB and the merge capability, exactly as the module
 // under test does — the settle's own guards are asserted in its own suite.
@@ -90,6 +99,9 @@ const job: MergeAutomationJob = {
 	repo: project.repo,
 	prNumber: '17',
 	approvedHeadSha: 'deadbeef',
+	// The ledger key the supersession stamp is written on (issue #1079) — the same
+	// SHA until a base update advances `approvedHeadSha` out from under it.
+	reviewedHeadSha: 'deadbeef',
 };
 
 function mergeReturning(outcome: MergePullRequestOutcome) {
@@ -115,7 +127,8 @@ const registeredMergePullRequest = vi.fn(async (_p: unknown, _n: number, _sha: s
  * default `issue-` prefix this branch decodes to task 12.
  */
 const registeredGetPullRequest = vi.fn(
-	async (_p: unknown, _n: number) => ({ number: 17, headBranch: 'issue-12' }) as PullRequestDetails,
+	async (_p: unknown, _n: number) =>
+		({ number: 17, headBranch: 'issue-12', headSha: 'deadbeef' }) as PullRequestDetails,
 );
 
 beforeEach(() => {
@@ -146,6 +159,8 @@ beforeEach(() => {
 	refreshReviewDispatchClaim.mockClear();
 	settleAbsorbedChildren.mockClear();
 	settleAbsorbedChildren.mockResolvedValue([]);
+	markReviewVerdictSuperseded.mockClear();
+	markReviewVerdictSuperseded.mockResolvedValue(true);
 });
 
 /** The stale-base answer the merge capability gives for a head behind its base. */
@@ -978,5 +993,203 @@ describe('processMergeAutomationDispatch: settling what the merge absorbed', () 
 			result: 'merged',
 			prNumber: '17',
 		});
+	});
+});
+
+/**
+ * Issue #1079: a terminal refusal explained *only* by the pull request's head
+ * having moved since the review stamps that approval's ledger slot superseded,
+ * so the pass stops spending one of `REVIEW_VERDICT_CAP`'s three slots. The
+ * question is answered by one provider-neutral `getPullRequest` read rather than
+ * a structured refusal reason — these cases pin which refusals ask it, what key
+ * they write, and that every failure degrades to the old behaviour.
+ */
+describe('processMergeAutomationDispatch: superseded approvals', () => {
+	/** A pull-request read reporting `headSha` as the branch's current head. */
+	function prAtHead(headSha: string) {
+		return vi.fn(
+			async () => ({ number: 17, headBranch: 'issue-12', headSha }) as PullRequestDetails,
+		);
+	}
+
+	it('stamps the slot when a terminal not-eligible is explained by a moved head', async () => {
+		const getPullRequest = prAtHead('pushed-head');
+
+		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning({ status: 'not-eligible', message: 'head moved' }),
+			getPullRequest,
+		});
+
+		expect(getPullRequest).toHaveBeenCalledExactlyOnceWith(project, 17, 'implementer');
+		expect(markReviewVerdictSuperseded).toHaveBeenCalledExactlyOnceWith({
+			projectId: project.id,
+			repository: project.repo,
+			prNumber: '17',
+			headSha: 'deadbeef',
+		});
+		// The settle itself is untouched — the stamp is bookkeeping beside it.
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
+		expect(outcome.result).toBe('not-eligible');
+	});
+
+	// `not-eligible`'s other causes — drafted, closed, the approval dismissed —
+	// all leave the head where it was, and that approval keeps its slot.
+	it('leaves the slot alone when the head is unchanged', async () => {
+		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning({ status: 'not-eligible', message: 'review dismissed' }),
+			getPullRequest: prAtHead('deadbeef'),
+		});
+
+		expect(markReviewVerdictSuperseded).not.toHaveBeenCalled();
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
+		expect(outcome.result).toBe('not-eligible');
+	});
+
+	it('stamps the slot when the head moves while the branch is being updated', async () => {
+		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning(STALE_BASE),
+			updatePullRequestBranch: updateReturning({
+				status: 'head-moved',
+				message: 'The head of #17 is pushed-head, which GitHub did not produce',
+			}),
+			getPullRequest: prAtHead('pushed-head'),
+			commentOnPullRequest: vi.fn(async (_p: unknown, _n: number, _b: string) => 1),
+		});
+
+		expect(markReviewVerdictSuperseded).toHaveBeenCalledExactlyOnceWith({
+			projectId: project.id,
+			repository: project.repo,
+			prNumber: '17',
+			headSha: 'deadbeef',
+		});
+		expect(outcome.result).toBe('not-eligible');
+	});
+
+	// The red merged tree is a genuine failure of the reviewed diff against the
+	// current base, not a supersession: freeing the slot would buy re-reviews of a
+	// combination that is actually broken.
+	it('never stamps the slot for a red updated head', async () => {
+		const advanced: MergeAutomationJob = {
+			...job,
+			approvedHeadSha: 'merged-with-base',
+			baseUpdates: 1,
+		};
+
+		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), advanced, project, {
+			mergePullRequest: mergeReturning({ status: 'merged', message: 'merged' }),
+			getAggregateCheckStatus: checksConcluding('failure'),
+			getPullRequest: prAtHead('pushed-head'),
+			commentOnPullRequest: vi.fn(async (_p: unknown, _n: number, _b: string) => 1),
+		});
+
+		expect(markReviewVerdictSuperseded).not.toHaveBeenCalled();
+		expect(outcome.result).toBe('not-eligible');
+	});
+
+	// A conflicting update means the base does not merge into the head, not that
+	// the head moved.
+	it('never stamps the slot for a conflicting update', async () => {
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning(STALE_BASE),
+			updatePullRequestBranch: updateReturning({ status: 'conflict', message: 'conflict' }),
+			getPullRequest: prAtHead('pushed-head'),
+			commentOnPullRequest: vi.fn(async (_p: unknown, _n: number, _b: string) => 1),
+		});
+
+		expect(markReviewVerdictSuperseded).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		['merged', { status: 'merged', message: 'merged', sha: 'abc' }],
+		['policy-blocked', { status: 'policy-blocked', message: 'branch protection' }],
+		['unsupported', { status: 'unsupported', message: 'merge queue required' }],
+		['not-ready', { status: 'not-ready', message: 'checks pending' }],
+	] as [string, MergePullRequestOutcome][])('never stamps the slot on %s', async (_label, o) => {
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning(o),
+			getPullRequest: prAtHead('pushed-head'),
+		});
+
+		expect(markReviewVerdictSuperseded).not.toHaveBeenCalled();
+	});
+
+	// The ledger slot stays where the review was, so a dispatch that advanced its
+	// `approvedHeadSha` onto a base update (issue #874) must not key the stamp on
+	// the head it produced.
+	it('keys the stamp on the reviewed head, not an advanced approved head', async () => {
+		const advanced: MergeAutomationJob = {
+			...job,
+			approvedHeadSha: 'merged-with-base',
+			baseUpdates: 1,
+		};
+
+		await processMergeAutomationDispatch(mockDispatchRow(), advanced, project, {
+			mergePullRequest: mergeReturning({ status: 'not-eligible', message: 'head moved' }),
+			getAggregateCheckStatus: checksConcluding('success'),
+			getPullRequest: prAtHead('pushed-head'),
+		});
+
+		expect(markReviewVerdictSuperseded).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({ headSha: 'deadbeef' }),
+		);
+	});
+
+	// A payload written before `reviewedHeadSha` existed never advanced, so the
+	// approved head *is* the reviewed one.
+	it('falls back to the approved head on a payload that predates reviewedHeadSha', async () => {
+		const legacy = { ...job, reviewedHeadSha: undefined };
+
+		await processMergeAutomationDispatch(mockDispatchRow(), legacy, project, {
+			mergePullRequest: mergeReturning({ status: 'not-eligible', message: 'head moved' }),
+			getPullRequest: prAtHead('pushed-head'),
+		});
+
+		expect(markReviewVerdictSuperseded).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({ headSha: 'deadbeef' }),
+		);
+	});
+
+	// Best-effort by design: every failure degrades to today's behaviour — the
+	// slot keeps counting and the pull request needs Force re-review — never to a
+	// settle that reports something other than what happened.
+	it.each([
+		[
+			'the provider read throws',
+			{
+				getPullRequest: vi.fn(async () => {
+					throw new Error('provider unreachable');
+				}),
+			},
+		],
+		['the ledger write throws', {}],
+	])('settles identically when %s', async (label, capabilities) => {
+		if (label === 'the ledger write throws') {
+			markReviewVerdictSuperseded.mockRejectedValue(new Error('db down'));
+		}
+
+		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning({ status: 'not-eligible', message: 'head moved' }),
+			getPullRequest: prAtHead('pushed-head'),
+			...capabilities,
+		});
+
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
+		expect(outcome).toEqual({
+			status: 'merge-automation-settled',
+			result: 'not-eligible',
+			prNumber: '17',
+		});
+	});
+
+	// A key no slot exists for is reported rather than assumed to have landed.
+	it('warns rather than assuming the stamp landed when no slot matched', async () => {
+		markReviewVerdictSuperseded.mockResolvedValue(false);
+
+		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning({ status: 'not-eligible', message: 'head moved' }),
+			getPullRequest: prAtHead('pushed-head'),
+		});
+
+		expect(outcome.result).toBe('not-eligible');
 	});
 });

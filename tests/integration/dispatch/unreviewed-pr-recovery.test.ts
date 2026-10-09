@@ -17,6 +17,8 @@ import {
 	abandonReviewVerdict,
 	listActiveReviewSlotsForPullRequest,
 	markReviewVerdictSubmitted,
+	markReviewVerdictSuperseded,
+	REVIEW_VERDICT_CAP,
 	reserveReviewVerdict,
 } from '../../../src/db/repositories/reviewVerdictsRepository.js';
 import { createRun } from '../../../src/db/repositories/runsRepository.js';
@@ -153,6 +155,9 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 						// Its owner is still in `createDispatch`'s default `pending` state;
 						// only a `pending` slot's liveness is read anywhere (issue #1038).
 						dispatchActive: true,
+						// Nothing has stamped it (issue #1079), so it still counts toward
+						// `REVIEW_VERDICT_CAP`.
+						superseded: false,
 					},
 				]);
 			});
@@ -317,6 +322,33 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 				await recoverUnreviewedPullRequests();
 
 				expect(await recoveryDispatches()).toHaveLength(0);
+			});
+
+			// Issue #1079's backstop, end to end: three submitted verdicts used to stop
+			// the sweep outright, and the pull request stayed green, mergeable and
+			// unreviewed until an operator forced a review. Once merge automation has
+			// stamped them superseded, the same fixture is handed back to Review.
+			it('recovers a pull request whose spent slots were all superseded', async () => {
+				const slotKey = (headSha: string) => ({
+					projectId: PROJECT_ID,
+					repository: REPO,
+					prNumber: PR,
+					headSha,
+				});
+				for (let i = 1; i <= REVIEW_VERDICT_CAP; i++) {
+					await reserveReviewVerdict(slotKey(`sha-${i}`), await seedVerdictOwner());
+					await markReviewVerdictSubmitted(slotKey(`sha-${i}`), { verdict: 'approve' });
+				}
+
+				await recoverUnreviewedPullRequests();
+				expect(await recoveryDispatches()).toHaveLength(0);
+
+				for (let i = 1; i <= REVIEW_VERDICT_CAP; i++) {
+					expect(await markReviewVerdictSuperseded(slotKey(`sha-${i}`))).toBe(true);
+				}
+
+				await recoverUnreviewedPullRequests();
+				expect(await recoveryDispatches()).toHaveLength(1);
 			});
 
 			it('publishes the recovery as a wakeable pending dispatch', async () => {

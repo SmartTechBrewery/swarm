@@ -496,6 +496,17 @@ async function continueCorrectiveCycle(
  * `reserveReviewVerdict` looks for any unconsumed grant among the pull request's
  * active slots — so it licenses the review of the new head without the ledger
  * needing a concept of "granted for head X".
+ *
+ * **Both bounds, and a pull request this no longer has to rescue (issue #1079).**
+ * `hasSubmittedEveryPermittedVerdict` now answers for the superseded bound too,
+ * so an approval stopped by `REVIEW_SUPERSEDED_CAP` is just as forceable as one
+ * stopped by `REVIEW_VERDICT_CAP` — this action needed no change to cover it.
+ * The common case moves the other way: merge automation stamps a head-moved
+ * refusal superseded, which frees that slot's allowance, so the predicate
+ * answers `false` and this refuses with `not-capped`. That refusal is the
+ * correct answer — automation has the pull request, and the operator is told so
+ * rather than being handed a button that would spend a grant on work already
+ * scheduled.
  */
 async function forceReviewOfSupersededHead(
 	run: PipelineRunRow,

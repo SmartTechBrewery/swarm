@@ -30,6 +30,7 @@ function slot(overrides: Partial<PullRequestReviewSlot> = {}): PullRequestReview
 		// Only a `pending` slot's owner liveness means anything, so every case that
 		// depends on it says so at the call site rather than inheriting it here.
 		dispatchActive: false,
+		superseded: false,
 		...overrides,
 	};
 }

@@ -18,7 +18,12 @@ import {
 	getReviewVerdictByReviewId,
 	getSubmittedReviewSlot,
 	grantReviewCapOverride,
+	hasSubmittedEveryPermittedVerdict,
+	isReviewAllowanceSpent,
+	listActiveReviewSlotsForPullRequest,
 	markReviewVerdictSubmitted,
+	markReviewVerdictSuperseded,
+	REVIEW_SUPERSEDED_CAP,
 	REVIEW_VERDICT_CAP,
 	reserveReviewVerdict,
 } from '../../../src/db/repositories/reviewVerdictsRepository.js';
@@ -142,7 +147,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 					await markReviewVerdictSubmitted(key(`sha-${i}`), { verdict: 'request-changes' });
 				}
 				const past = await reserveReviewVerdict(key(`sha-${REVIEW_VERDICT_CAP + 1}`), owner);
-				expect(past).toEqual({ status: 'capped' });
+				expect(past).toEqual({ status: 'capped', reason: 'verdict-cap' });
 			});
 
 			it('lets only one distinct head hold the single pending slot at a time', async () => {
@@ -301,6 +306,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 				// Three submitted verdicts in total, not four.
 				expect(await reserveReviewVerdict(key('sha-5'), await seedDispatch('leased'))).toEqual({
 					status: 'capped',
+					reason: 'verdict-cap',
 				});
 			});
 
@@ -454,13 +460,26 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 				expect(await getPriorSubmittedReview(PROJECT_ID, REPO, PR, 'sha-3')).toBeUndefined();
 			});
 
-			it('returns the highest-ordinal prior verdict when two were submitted', async () => {
+			it('returns the most recent prior verdict when two were submitted', async () => {
 				await reserveReviewVerdict(key('sha-1'), owner);
 				await markReviewVerdictSubmitted(key('sha-1'), { verdict: 'request-changes' });
 				await reserveReviewVerdict(key('sha-2'), owner);
 				await markReviewVerdictSubmitted(key('sha-2'), { verdict: 'approve' });
 				const prior = await getPriorSubmittedReview(PROJECT_ID, REPO, PR, 'sha-3');
 				expect(prior).toMatchObject({ ordinal: 2, verdict: 'approve', headSha: 'sha-2' });
+			});
+
+			// Issue #1079: a superseded slot frees its ordinal, so the replacement reuses
+			// it and `desc(ordinal)` alone would pick between the two arbitrarily.
+			it('returns the most recent review when two slots share an ordinal', async () => {
+				await reserveReviewVerdict(key('sha-1'), owner);
+				await markReviewVerdictSubmitted(key('sha-1'), { verdict: 'approve' });
+				await markReviewVerdictSuperseded(key('sha-1'));
+				await reserveReviewVerdict(key('sha-2'), owner);
+				await markReviewVerdictSubmitted(key('sha-2'), { verdict: 'request-changes' });
+
+				const prior = await getPriorSubmittedReview(PROJECT_ID, REPO, PR, 'sha-3');
+				expect(prior).toMatchObject({ ordinal: 1, verdict: 'request-changes', headSha: 'sha-2' });
 			});
 		});
 
@@ -498,6 +517,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 
 				expect(await reserveReviewVerdict(key('sha-forced-2'), owner)).toEqual({
 					status: 'capped',
+					reason: 'verdict-cap',
 				});
 			});
 
@@ -510,6 +530,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 				await markReviewVerdictSubmitted(key('sha-forced'), { verdict: 'request-changes' });
 				expect(await reserveReviewVerdict(key('sha-forced-2'), owner)).toEqual({
 					status: 'capped',
+					reason: 'verdict-cap',
 				});
 			});
 
@@ -534,7 +555,138 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 
 			it('changes nothing while no operator grants an override', async () => {
 				await fillToCap();
-				expect(await reserveReviewVerdict(key('sha-forced'), owner)).toEqual({ status: 'capped' });
+				expect(await reserveReviewVerdict(key('sha-forced'), owner)).toEqual({
+					status: 'capped',
+					reason: 'verdict-cap',
+				});
+			});
+		});
+
+		// Issue #1079 — an approval merge automation refused *only* because the pull
+		// request's head had moved. It stays `submitted`, frees its ordinal and its
+		// `REVIEW_VERDICT_CAP` slot, and is counted against `REVIEW_SUPERSEDED_CAP`
+		// instead.
+		describe('superseded approvals', () => {
+			/** Submit `verdict` at `headSha`, through the real reservation. */
+			async function submit(headSha: string, verdict: string): Promise<void> {
+				await reserveReviewVerdict(key(headSha), owner);
+				await markReviewVerdictSubmitted(key(headSha), { verdict });
+			}
+
+			/** An approval at `headSha` that merge automation then found superseded. */
+			async function submitSuperseded(headSha: string): Promise<void> {
+				await submit(headSha, 'approve');
+				expect(await markReviewVerdictSuperseded(key(headSha))).toBe(true);
+			}
+
+			describe('markReviewVerdictSuperseded', () => {
+				it('stamps a submitted slot once, and is idempotent on a second call', async () => {
+					await submit('sha-1', 'approve');
+
+					expect(await markReviewVerdictSuperseded(key('sha-1'))).toBe(true);
+					const [stamped] = await listActiveReviewSlotsForPullRequest(PROJECT_ID, REPO, PR);
+					expect(stamped).toMatchObject({ state: 'submitted', superseded: true });
+
+					// Already stamped: no row matches, so a merge retry or a redelivered
+					// dispatch resolves to the one stamp.
+					expect(await markReviewVerdictSuperseded(key('sha-1'))).toBe(false);
+				});
+
+				it('reports a miss for a key no submitted slot exists for', async () => {
+					expect(await markReviewVerdictSuperseded(key('never-reserved'))).toBe(false);
+				});
+
+				it('leaves a pending or abandoned slot alone', async () => {
+					await reserveReviewVerdict(key('sha-pending'), owner);
+					expect(await markReviewVerdictSuperseded(key('sha-pending'))).toBe(false);
+
+					await abandonReviewVerdict(key('sha-pending'));
+					expect(await markReviewVerdictSuperseded(key('sha-pending'))).toBe(false);
+				});
+			});
+
+			it('frees the ordinal a superseded approval held', async () => {
+				await submit('sha-1', 'request-changes');
+				await submitSuperseded('sha-2');
+
+				// The pull request has had one *counted* pass, so the next one is its second.
+				expect(await reserveReviewVerdict(key('sha-3'), owner)).toMatchObject({
+					status: 'reserved',
+					ordinal: 2,
+				});
+			});
+
+			// `under-control-platform#606`: request-changes, then two approvals each
+			// superseded by a Resolve-conflicts push. Before this, the fourth
+			// reservation was `capped` and the pull request stopped for ever.
+			it('reserves a further review in the #606 shape', async () => {
+				await submit('sha-1', 'request-changes');
+				await submitSuperseded('sha-2');
+				await submitSuperseded('sha-3');
+
+				expect(await reserveReviewVerdict(key('sha-4'), owner)).toMatchObject({
+					status: 'reserved',
+					ordinal: 2,
+				});
+			});
+
+			// Issue #511's loop protection, asserted rather than merely left unbroken:
+			// three *counted* request-changes verdicts still stop the pull request.
+			it('still caps three counted request-changes verdicts', async () => {
+				for (let i = 1; i <= REVIEW_VERDICT_CAP; i++) await submit(`sha-${i}`, 'request-changes');
+
+				expect(await reserveReviewVerdict(key('sha-past'), owner)).toEqual({
+					status: 'capped',
+					reason: 'verdict-cap',
+				});
+			});
+
+			it('stops at the superseded bound, naming it', async () => {
+				for (let i = 1; i <= REVIEW_SUPERSEDED_CAP; i++) await submitSuperseded(`sha-${i}`);
+
+				expect(await reserveReviewVerdict(key('sha-past'), owner)).toEqual({
+					status: 'capped',
+					reason: 'superseded-bound',
+				});
+			});
+
+			it('lets one operator grant through each bound, and is spent by it', async () => {
+				for (let i = 1; i <= REVIEW_SUPERSEDED_CAP; i++) await submitSuperseded(`sha-${i}`);
+				expect(await grantReviewCapOverride(key(`sha-${REVIEW_SUPERSEDED_CAP}`))).toBe('granted');
+
+				const forced = await reserveReviewVerdict(key('sha-forced'), owner);
+				expect(forced).toMatchObject({ status: 'reserved', capOverride: true });
+				await markReviewVerdictSubmitted(key('sha-forced'), { verdict: 'approve' });
+				await markReviewVerdictSuperseded(key('sha-forced'));
+
+				expect(await reserveReviewVerdict(key('sha-forced-2'), owner)).toEqual({
+					status: 'capped',
+					reason: 'superseded-bound',
+				});
+			});
+
+			// The module's own no-drift requirement: the pure predicates a reader calls
+			// must reach the same conclusion the writer just reached, on the same fixture.
+			it('reports the same verdict to the readers as the writer just reached', async () => {
+				await submit('sha-1', 'request-changes');
+				await submitSuperseded('sha-2');
+				await submitSuperseded('sha-3');
+
+				const slots = await listActiveReviewSlotsForPullRequest(PROJECT_ID, REPO, PR);
+				expect(slots.map((slot) => slot.superseded)).toEqual([false, true, true]);
+				// Three submitted slots, and the allowance is *not* spent — which is the
+				// whole change: before #1079 this read `true` and the sweep gave up.
+				expect(hasSubmittedEveryPermittedVerdict(slots)).toBe(false);
+				expect(isReviewAllowanceSpent(slots)).toBe(false);
+
+				for (let i = 4; i <= REVIEW_SUPERSEDED_CAP + 1; i++) await submitSuperseded(`sha-${i}`);
+				const spent = await listActiveReviewSlotsForPullRequest(PROJECT_ID, REPO, PR);
+				expect(hasSubmittedEveryPermittedVerdict(spent)).toBe(true);
+				expect(isReviewAllowanceSpent(spent)).toBe(true);
+				expect(await reserveReviewVerdict(key('sha-past'), owner)).toMatchObject({
+					status: 'capped',
+					reason: 'superseded-bound',
+				});
 			});
 		});
 

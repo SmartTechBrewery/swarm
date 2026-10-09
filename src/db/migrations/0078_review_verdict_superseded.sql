@@ -1,0 +1,1 @@
+ALTER TABLE "review_verdicts" ADD COLUMN "superseded_at" timestamp;

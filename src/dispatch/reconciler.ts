@@ -337,6 +337,10 @@ async function backfillLegacyMergeFollowUps(): Promise<number> {
 			repo: project.repo,
 			prNumber: run.prNumber,
 			approvedHeadSha: run.reviewMergeApprovedHeadSha,
+			// The head the Review reviewed (issue #1079). The same SHA here: a legacy
+			// follow-up predates the base-update advance that is the only thing which
+			// ever separates the two.
+			reviewedHeadSha: run.reviewMergeApprovedHeadSha,
 		};
 		try {
 			const { dispatch, created } = await createDispatch({
