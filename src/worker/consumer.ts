@@ -2288,6 +2288,15 @@ export interface ProcessJobDeps {
 	 * never arrives.
 	 */
 	pushWorkerUpdate: (workerId: string, requestId: string) => Promise<WorkerUpdatePushResult>;
+	/**
+	 * A run whose worker transport was lost has just settled **terminally** — its
+	 * automatic-retry budget is spent, so no retry will take its dispatch over
+	 * (issue #1076). The control plane trusted the orphaned attempt to finish while
+	 * that retry was pending; this ends the trust, so the orphan is stopped and fenced
+	 * as issue #1073 describes. Fire-and-forget, and optional because only the side
+	 * holding worker sockets has anything to stop.
+	 */
+	onTransportLostSettledTerminally?: (dispatchId: string) => void;
 }
 
 /** Adapt the federated worker+target selection to the shared target-routing shape. */
@@ -5148,18 +5157,26 @@ export async function processJob(
 			trigger.phase === 'implementation' &&
 			!(await isPlannedForImplementation(project.id, trigger.taskId, trigger.workItem));
 
+		// A dispatch settling with the late result its lost worker reported (issue
+		// #1076) already ran, on the machine that result came from: it asks the gate
+		// nothing, binds no claim and takes no slot, and `executePhase` adapts the
+		// carried result instead of pushing. Everything after that is the ordinary
+		// success tail, which is the point.
+		const adoptedSelection = job.adoptedResult?.selection;
 		// The federated dispatch gate (issue #339): confirm an eligible worker may
 		// take this phase — and on which configured target — *before* anything is
 		// provisioned or invoked. Runs on every (re)dispatch, so a revocation between
 		// attempts blocks the next one; it never touches a run already in flight.
-		const selection = await gateDispatch(
-			project,
-			trigger,
-			job,
-			implementationUnplanned,
-			dispatch.id,
-			deps.gateOptions,
-		);
+		const selection =
+			adoptedSelection ??
+			(await gateDispatch(
+				project,
+				trigger,
+				job,
+				implementationUnplanned,
+				dispatch.id,
+				deps.gateOptions,
+			));
 		// Control-plane transport dispatch has no local executor (issue #407): an
 		// unfederated project resolves no selection and has nowhere to run, so defer
 		// durably rather than falling through to the host's local path. The throw
@@ -5178,8 +5195,9 @@ export async function processJob(
 		// Bind on the selected worker's identity: the host's own for the in-process
 		// path, or the selected worker's live session for the control-plane transport
 		// path, which claims the fenced execution slot on that worker's behalf.
-		const bindIdentity =
-			selection && deps.resolveBindIdentity
+		const bindIdentity = adoptedSelection
+			? undefined
+			: selection && deps.resolveBindIdentity
 				? await deps.resolveBindIdentity(selection)
 				: executionIdentity;
 		const resolution: PhaseResolution = {
@@ -5187,7 +5205,15 @@ export async function processJob(
 			selection,
 			executionIdentity: selection ? bindIdentity : undefined,
 		};
-		if (selection) {
+		if (adoptedSelection) {
+			logger.info('Settling a dispatch with an adopted late result — no gate, bind or slot', {
+				projectId: project.id,
+				dispatchId: dispatch.id,
+				phase: trigger.phase,
+				taskId: trigger.taskId,
+				workerId: adoptedSelection.workerId,
+			});
+		} else if (selection) {
 			await bindSelectedWorker(dispatch, selection, bindIdentity);
 			// The claim that bind persisted *is* the worker's capacity (an active,
 			// unexpired dispatch claim), so from here on this dispatch settling frees a
@@ -5389,6 +5415,16 @@ export async function processJob(
 				dispatchId: dispatch.id,
 				error: describeError(settleErr),
 			});
+		}
+		// A lost transport that settled terminally rather than deferring — its
+		// automatic-retry budget is spent — has no retry coming to take its orphan
+		// over, so the orphan's trusted window ends here (issue #1076).
+		if (
+			outcome.status === 'phase-failed' &&
+			err instanceof AgentRunError &&
+			err.failure.kind === 'transport-lost'
+		) {
+			deps.onTransportLostSettledTerminally?.(dispatch.id);
 		}
 		// A Review that ended terminally without delivering a verdict owes the PR+SHA
 		// slot back (issue #1019), so the retry this failure invites is evaluated on

@@ -100,6 +100,7 @@ import {
 	TRANSPORT_RESTORED_NOTE,
 } from './stream-log-persistence.js';
 import {
+	acceptLateOrphanResult,
 	reapDispatchesIfTransportStaysLost,
 	stopOrphanedDispatchesOnReturn,
 } from './transport-loss-reaper.js';
@@ -190,7 +191,9 @@ export interface WorkerTransportDeps {
 	 * awaiting it (`./dispatch-results.ts`). Defaulted to the in-process registry;
 	 * a unit test injects fakes. A frame for a dispatch not awaited here is a no-op.
 	 * Each takes the socket's authenticated worker as the sender, so a frame reaches
-	 * only a waiter whose dispatch was pushed to that worker (issue #1075).
+	 * only a waiter whose dispatch was pushed to that worker (issue #1075). The
+	 * default result sink also hands a trusted orphan's late success to the adoption
+	 * (`./transport-loss-reaper.ts`, issue #1076).
 	 */
 	deliverDispatchResult: (result: TaskExecutionResult, fromWorkerId: string) => boolean;
 	deliverDispatchProgress: (progress: TaskProgress, fromWorkerId: string) => void;
@@ -295,7 +298,10 @@ function defaultDeps(): WorkerTransportDeps {
 		reapSupersededWorkerClaims,
 		resolveHeartbeatTtlMs,
 		validateFencingToken,
-		deliverDispatchResult,
+		// A trusted orphan's late success is adopted into its scheduled retry rather
+		// than dropped (issue #1076).
+		deliverDispatchResult: (result, fromWorkerId) =>
+			deliverDispatchResult(result, fromWorkerId, acceptLateOrphanResult),
 		deliverDispatchProgress,
 		deliverDispatchAck,
 		persistStreamLog,

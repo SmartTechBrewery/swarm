@@ -126,6 +126,14 @@ describe('queuedWaitReasonLabel', () => {
 		);
 	});
 
+	// Issue #1076: the lost worker's late success is settling the run — not a wait for
+	// anything, so the copy says the result is being used rather than retried.
+	it('names the adopted late result', () => {
+		expect(queuedWaitReasonLabel('late-result')).toBe(
+			'settling with the late result of the lost worker',
+		);
+	});
+
 	// Issue #759: the wait is on the *task*, so the copy must not read as another
 	// worker/slot wait — nothing but the phase ahead of it settling ends it. Issue
 	// #761 made that phase possibly *queued* rather than running, so the copy says

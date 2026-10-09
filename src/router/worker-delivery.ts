@@ -119,7 +119,9 @@
  * and the card would strand. A call naming no dispatch (a worker predating #1073)
  * and a call naming one this router has no record of are served as before. The
  * three worker-scoped routes act for a machine rather than an assignment, so they
- * are not fenced.
+ * are not fenced. Nor is a call for a *trusted* orphan (issue #1076): while its
+ * dispatch waits for the automatic retry the late phase may still settle the run, so
+ * its board writes are the run's own; the fence applies once the retry takes over.
  *
  * Mirrors `./worker-transport.ts`: the request logic is factored out of the HTTP
  * glue into pure, injectable functions (`handleSubmitReview`,
@@ -224,7 +226,8 @@ export interface WorkerDeliveryDeps {
 	isWorkerEnrolled: (workerId: string, projectId: string) => Promise<boolean>;
 	/**
 	 * Whether `dispatchId` is one this router settled because `workerId`'s transport
-	 * was lost, and is not awaiting on that worker again (issue #1073). Defaulted to
+	 * was lost, is not awaiting on that worker again (issue #1073), and no longer
+	 * trusts to finish while its automatic retry is pending (issue #1076). Defaulted to
 	 * the in-process registry (`./dispatch-results.ts`). It is in-memory, like the
 	 * reap that records it, so it needs no I/O on a hot path every delivery call
 	 * crosses.

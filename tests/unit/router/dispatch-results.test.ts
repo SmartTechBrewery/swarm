@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
 	awaitDispatchResult,
 	countDispatchInterruptions,
+	type DispatchRegistration,
 	deliverDispatchAck,
 	deliverDispatchProgress,
 	deliverDispatchResult,
@@ -15,6 +16,7 @@ import {
 	ORPHANED_DISPATCH_RETENTION_MS,
 	resolveDispatchStreamTarget,
 	resolveDispatchTargetForRun,
+	takeOverOrphanedDispatch,
 } from '@/router/dispatch-results.js';
 import type { TaskAssignmentAck, TaskExecutionResult, TaskProgress } from '@/transport/protocol.js';
 
@@ -533,9 +535,11 @@ describe('orphaned dispatches', () => {
 		const awaiting = awaitDispatchResult(DISPATCH_A, TARGET_A);
 		failOrphanedDispatchResultWait(DISPATCH_A, REASON);
 		awaiting.dispose();
+		// The retry took the dispatch over, so the orphan is no longer trusted (#1076).
+		takeOverOrphanedDispatch(DISPATCH_A);
 
 		expect(listOrphanedDispatchesForWorker(WORKER_A)).toEqual([
-			{ dispatchId: DISPATCH_A, ...TARGET_A },
+			{ dispatchId: DISPATCH_A, ...TARGET_A, trusted: false },
 		]);
 		expect(listOrphanedDispatchesForWorker(WORKER_B)).toEqual([]);
 		expect(isDispatchOrphanedFrom(WORKER_A, DISPATCH_A)).toBe(true);
@@ -556,6 +560,7 @@ describe('orphaned dispatches', () => {
 		const awaiting = awaitDispatchResult(DISPATCH_A, TARGET_A);
 		failOrphanedDispatchResultWait(DISPATCH_A, REASON);
 		awaiting.dispose();
+		takeOverOrphanedDispatch(DISPATCH_A);
 
 		// A late `succeeded` resolves nothing: the run already settled on the reap.
 		expect(answer(DISPATCH_A)).toBe(false);
@@ -583,11 +588,15 @@ describe('orphaned dispatches', () => {
 		failOrphanedDispatchResultWait(DISPATCH_A, REASON);
 		first.dispose();
 
+		// The retry's push takes the dispatch over before it registers (issue #1076).
+		expect(takeOverOrphanedDispatch(DISPATCH_A, WORKER_B)).toEqual([
+			{ dispatchId: DISPATCH_A, ...TARGET_A, trusted: false },
+		]);
 		const retry = awaitDispatchResult(DISPATCH_A, { ...TARGET_A, workerId: WORKER_B });
 		expect(isDispatchOrphanedFrom(WORKER_A, DISPATCH_A)).toBe(true);
 		expect(isDispatchOrphanedFrom(WORKER_B, DISPATCH_A)).toBe(false);
 		expect(listOrphanedDispatchesForWorker(WORKER_A)).toEqual([
-			{ dispatchId: DISPATCH_A, ...TARGET_A },
+			{ dispatchId: DISPATCH_A, ...TARGET_A, trusted: false },
 		]);
 
 		// The orphan's answer to its stop is dropped and forgets the orphan; the retry's
@@ -604,15 +613,20 @@ describe('orphaned dispatches', () => {
 		const first = awaitDispatchResult(DISPATCH_A, TARGET_A);
 		failOrphanedDispatchResultWait(DISPATCH_A, REASON);
 		first.dispose();
+		takeOverOrphanedDispatch(DISPATCH_A, WORKER_B);
 		const retry = awaitDispatchResult(DISPATCH_A, { ...TARGET_A, workerId: WORKER_B });
 		failOrphanedDispatchResultWait(DISPATCH_A, REASON);
 		retry.dispose();
+		// The second retry's budget is spent: the run settles terminally (#1076).
+		expect(takeOverOrphanedDispatch(DISPATCH_A)).toEqual([
+			{ dispatchId: DISPATCH_A, ...TARGET_A, workerId: WORKER_B, trusted: false },
+		]);
 
 		expect(isDispatchOrphanedFrom(WORKER_A, DISPATCH_A)).toBe(true);
 		expect(isDispatchOrphanedFrom(WORKER_B, DISPATCH_A)).toBe(true);
 		expect(listOrphanedDispatchesForWorker(WORKER_A)).toHaveLength(1);
 		expect(listOrphanedDispatchesForWorker(WORKER_B)).toEqual([
-			{ dispatchId: DISPATCH_A, ...TARGET_A, workerId: WORKER_B },
+			{ dispatchId: DISPATCH_A, ...TARGET_A, workerId: WORKER_B, trusted: false },
 		]);
 
 		// Each worker's answer forgets only its own record.
@@ -628,6 +642,7 @@ describe('orphaned dispatches', () => {
 		const awaiting = awaitDispatchResult(DISPATCH_B, TARGET_B);
 		failOrphanedDispatchResultWait(DISPATCH_B, REASON);
 		awaiting.dispose();
+		takeOverOrphanedDispatch(DISPATCH_B);
 
 		vi.advanceTimersByTime(ORPHANED_DISPATCH_RETENTION_MS - 1);
 		expect(isDispatchOrphanedFrom(WORKER_B, DISPATCH_B)).toBe(true);
@@ -647,12 +662,124 @@ describe('orphaned dispatches', () => {
 		const second = awaitDispatchResult(DISPATCH_B, TARGET_B);
 		failOrphanedDispatchResultWait(DISPATCH_B, REASON);
 		second.dispose();
+		takeOverOrphanedDispatch(DISPATCH_B);
 
 		// The first record's timer fires here; the second record must survive it.
 		vi.advanceTimersByTime(ORPHANED_DISPATCH_RETENTION_MS / 2);
 		expect(isDispatchOrphanedFrom(WORKER_B, DISPATCH_B)).toBe(true);
 
 		vi.advanceTimersByTime(ORPHANED_DISPATCH_RETENTION_MS / 2);
+		expect(isDispatchOrphanedFrom(WORKER_B, DISPATCH_B)).toBe(false);
+	});
+});
+
+// Issue #1076: while its dispatch waits for the automatic retry, an orphan is trusted
+// to finish, and its late success settles the run.
+describe('trusted orphans', () => {
+	const REASON = "The worker's transport session was lost and did not return within the grace";
+
+	function orphan(dispatchId = DISPATCH_A, target: DispatchRegistration = TARGET_A): void {
+		const awaiting = awaitDispatchResult(dispatchId, target);
+		failOrphanedDispatchResultWait(dispatchId, REASON);
+		awaiting.dispose();
+	}
+
+	function failedFrame(dispatchId: string): TaskExecutionResult {
+		return { ...result(dispatchId), status: 'failed', error: 'agent exited 1' };
+	}
+
+	afterEach(() => {
+		// Leave no record behind for the next test.
+		takeOverOrphanedDispatch(DISPATCH_A, WORKER_A);
+		takeOverOrphanedDispatch(DISPATCH_A, WORKER_B);
+		takeOverOrphanedDispatch(DISPATCH_B, WORKER_B);
+	});
+
+	it('is neither listed for a stop nor fenced while the retry is pending', () => {
+		orphan();
+
+		expect(listOrphanedDispatchesForWorker(WORKER_A)).toEqual([]);
+		expect(isDispatchOrphanedFrom(WORKER_A, DISPATCH_A)).toBe(false);
+	});
+
+	it('hands a late success to the adoption hook and forgets the orphan', () => {
+		const selection = {
+			workerId: WORKER_A,
+			workerName: 'w1',
+			ownerUserId: 'user-1',
+			target: { cli: 'claude' as const },
+			targetIndex: 0,
+			cli: 'claude' as const,
+			skippedClis: [],
+		};
+		orphan(DISPATCH_A, { ...TARGET_A, selection });
+		const hook = vi.fn();
+
+		expect(deliverDispatchResult(result(DISPATCH_A), WORKER_A, hook)).toBe(false);
+
+		expect(hook).toHaveBeenCalledWith(
+			{ dispatchId: DISPATCH_A, ...TARGET_A, selection, trusted: true },
+			result(DISPATCH_A),
+		);
+		// Its last frame: nothing is left to stop, fence or adopt twice.
+		expect(deliverDispatchResult(result(DISPATCH_A), WORKER_A, hook)).toBe(false);
+		expect(hook).toHaveBeenCalledTimes(1);
+		expect(takeOverOrphanedDispatch(DISPATCH_A)).toEqual([]);
+	});
+
+	it('never adopts a success sent by another worker', () => {
+		orphan();
+		const hook = vi.fn();
+
+		deliverDispatchResult(result(DISPATCH_A), WORKER_B, hook);
+
+		expect(hook).not.toHaveBeenCalled();
+	});
+
+	it('drops a late failure and keeps the orphan trusted, for the retry to stop when it takes over', () => {
+		orphan();
+		const hook = vi.fn();
+
+		expect(deliverDispatchResult(failedFrame(DISPATCH_A), WORKER_A, hook)).toBe(false);
+
+		expect(hook).not.toHaveBeenCalled();
+		expect(isDispatchOrphanedFrom(WORKER_A, DISPATCH_A)).toBe(false);
+		expect(takeOverOrphanedDispatch(DISPATCH_A, WORKER_B)).toEqual([
+			{ dispatchId: DISPATCH_A, ...TARGET_A, trusted: false },
+		]);
+		expect(isDispatchOrphanedFrom(WORKER_A, DISPATCH_A)).toBe(true);
+	});
+
+	it('is untrusted once the retry takes over: stopped, fenced, and its late success dropped', () => {
+		orphan();
+		const hook = vi.fn();
+
+		expect(takeOverOrphanedDispatch(DISPATCH_A, WORKER_B)).toHaveLength(1);
+		// Already untrusted: a second takeover has nothing new to stop.
+		expect(takeOverOrphanedDispatch(DISPATCH_A, WORKER_B)).toEqual([]);
+		expect(listOrphanedDispatchesForWorker(WORKER_A)).toHaveLength(1);
+		expect(isDispatchOrphanedFrom(WORKER_A, DISPATCH_A)).toBe(true);
+
+		deliverDispatchResult(result(DISPATCH_A), WORKER_A, hook);
+		expect(hook).not.toHaveBeenCalled();
+		expect(isDispatchOrphanedFrom(WORKER_A, DISPATCH_A)).toBe(false);
+	});
+
+	it('forgets rather than stops the orphan when the retry goes back to its own worker', () => {
+		orphan();
+
+		expect(takeOverOrphanedDispatch(DISPATCH_A, WORKER_A)).toEqual([]);
+		expect(listOrphanedDispatchesForWorker(WORKER_A)).toEqual([]);
+		expect(isDispatchOrphanedFrom(WORKER_A, DISPATCH_A)).toBe(false);
+	});
+
+	it('leaves other dispatches’ orphans alone', () => {
+		orphan(DISPATCH_A, TARGET_A);
+		orphan(DISPATCH_B, TARGET_B);
+
+		takeOverOrphanedDispatch(DISPATCH_A);
+
+		expect(isDispatchOrphanedFrom(WORKER_A, DISPATCH_A)).toBe(true);
 		expect(isDispatchOrphanedFrom(WORKER_B, DISPATCH_B)).toBe(false);
 	});
 });

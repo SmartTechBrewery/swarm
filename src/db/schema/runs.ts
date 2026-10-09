@@ -381,6 +381,14 @@ export const runs = pgTable(
 			 * when it is all that is eligible. Sticky and forgiven exactly as that list is.
 			 */
 			transportLostWorkerIds?: string[] | null;
+			/**
+			 * The machine whose late `succeeded` result settled this run after its
+			 * transport had been lost (issue #1076) — written by
+			 * {@link recordRunLateResultAccepted} when the result is adopted into the
+			 * run's scheduled automatic retry. A historical fact, sticky like
+			 * `abandonedWorkerId`, and what the run detail names.
+			 */
+			lateResultAcceptedFromWorkerId?: string | null;
 		}>(),
 		/**
 		 * This run's recorded cancellation origin (issue #308), mirroring

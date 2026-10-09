@@ -95,7 +95,7 @@ transport was a second front door to the same service. It is now the only one:
 issue #553 deleted that worker, and every worker acquires its session through the
 handshake (`src/router/worker-transport.ts` → `src/identity/worker-session-service.ts`).
 
-### §2 — Split delivery (implemented — issues #392, #405, #406, #407, #394, #417, #418, #536, #551, #544, #718, #724, #719, #827, #859, #1073, #1075)
+### §2 — Split delivery (implemented — issues #392, #405, #406, #407, #394, #417, #418, #536, #551, #544, #718, #724, #719, #827, #859, #1073, #1075, #1076)
 
 The rest of PROJECT.md §3 — the control plane assigning jobs and the daemon
 running them without direct Redis access (`TaskAssignment` →
@@ -519,7 +519,9 @@ server-side store) it needs:
    a late `succeeded` as authoritative would need a second settle path outside
    `processJob`, after its job has unwound, the failure comment been posted and the holds
    been released. Fencing leaves the one settle that already ran correct: run failed, board
-   unmoved, Retry the recovery. Planning cannot split an item twice, because the late
+   unmoved, Retry the recovery. *Amended by item 17 (#1076):* once item 16 deferred the
+   run, neither objection held, so the late success is now honoured while the automatic
+   retry waits, and the stop and the fence apply from the retry's takeover on. Planning cannot split an item twice, because the late
    attempt never split it. **The wire stays version-compatible.** The field is optional,
    so `TRANSPORT_PROTOCOL_VERSION` stays put. An older worker sends none and is not
    fenced, and an older control plane strips it. **The record is in-memory and bounded**,
@@ -563,6 +565,40 @@ server-side store) it needs:
    only eligible one and reconnects just as its retry is pushed back to it, its answer to
    the stop can reach the new wait. Item 15's stop-on-return and fence are unchanged;
    accepting an orphan's late result is phase 2 of #1075.
+
+17. **#1076 (phase 2 of 2 of #1075)** — **an orphaned run's late success is accepted
+   while its automatic retry waits.** The #568 incident again, now with item 16 in
+   place: the reap deferred Planning for a retry 30 minutes out, the machine came back,
+   created #587 and moved both cards to Ready — and item 15 refused those writes and
+   dropped the `succeeded` that followed, so the work was done twice. Item 15 rejected
+   honouring that result for two reasons, a failure comment already posted and a second
+   settle path outside `processJob`. Item 16 removed both: the run is only `deferred`,
+   and its dispatch is still there to re-enter.
+
+   So the orphan record is **trusted** from the reap until the retry takes over: no stop
+   on return, no `409`, and a late `succeeded` from its own worker is handed to an
+   injected hook (`acceptLateOrphanResult`) that compare-and-sets the scheduled retry
+   (`retry-scheduled` + `transport-lost`, at the wake sequence read) to `pending`, due
+   now, wait reason `late-result`, carrying the frame and the attempt's
+   `DispatchSelection` as `adoptedResult`. `processJob` then skips the gate, the bind and
+   the slot, reuses the run row, and the control-plane executor adapts the carried result
+   instead of pushing — the ordinary success tail runs, next phases and split children
+   included. Anything but a success, or silence, leaves the retry to run when due.
+
+   Decisions worth recording. **The adoption re-enters `processJob` through the same
+   dispatch**, so there is still exactly one settle path and one run. **Trust ends at the
+   takeover**: the retry's push (scheduled or Retry now) untrusts the dispatch's orphans
+   and stops any connected one first; a spent budget does the same through an optional
+   `ProcessJobDeps` hook the consumer calls after settling a `transport-lost` failure
+   terminally. An orphan on the retry's own worker is forgotten rather than stopped — it
+   acks the re-push `duplicate` and its phase answers the new wait. **An SCM adoption
+   reuses its PR+SHA slot** (`continuationDispatchClaimed`), as the pre-run waits do, or
+   the claim TTL would drop it as a duplicate. **Visible**: a control-plane note in the
+   run's output and a sticky `runs.recovery.lateResultAcceptedFromWorkerId`, shown in the
+   run detail. Accepted limits: the trust is in-memory, so a router restart in the window
+   drops the late result and the retry runs as scheduled; a terminally `failed` run never
+   adopts one; and a dispatch cancelled inside the window leaves its orphan trusted until
+   the record expires.
 
 Still out of scope: over-the-wire secret delivery, which remains unnecessary — the
 split keeps every project credential server-side instead.

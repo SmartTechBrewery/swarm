@@ -58,8 +58,8 @@
  * refuses a remote head that drifted from the expected SHA, PR and comment delivery
  * are idempotent per run, and a Planning split is resumable by its run's markers.
  *
- * **A worker that comes back late is stopped, not trusted (issue #1073).** The reap
- * ends the control plane's wait. It cannot reach the agent, which keeps running on a
+ * **A worker that comes back after the retry took over is stopped, not trusted (issue
+ * #1073).** The reap ends the control plane's wait. It cannot reach the agent, which keeps running on a
  * machine that only went to sleep. Planning for #568 on `under-control-platform` came
  * back about 12 minutes after the reap, finished the phase, renamed and split the item
  * and moved both cards to Ready. Its `succeeded` result was then dropped, because nothing
@@ -87,25 +87,49 @@
  * answer to the stop carries the same dispatch id from the same worker and can reach
  * the new wait.
  *
- * The alternative was to honour a late success: correct the run and owe the follow-up
- * it would have earned. It was rejected because that needs a second settle path
- * outside `processJob`, run after its job has already unwound and the PR hold
- * released. Keeping the phase off the board leaves the one settle that already ran
- * correct: the run deferred (or failed, once its automatic-retry budget is spent),
- * the board did not move, and the retry is the recovery. Planning in particular
- * cannot split an item twice, because the late attempt never split it at all.
+ * **Until then, a late success is honoured (issue #1076).** #1073 rejected that
+ * because it needed a second settle path outside `processJob`, after the run had
+ * already failed and posted its failure. The deferral removes both objections: no
+ * failure was posted, and the run can be settled by re-entering `processJob` through
+ * the same dispatch. So while the dispatch is still waiting for its automatic retry
+ * (`retry-scheduled` with wait reason `transport-lost`), the orphan is *trusted*: its
+ * returning worker is not told to stop, its delivery calls are served, and a late
+ * `succeeded` result is adopted by {@link acceptLateOrphanResult}. That makes the
+ * scheduled retry due at once, carrying the result, and `processJob` settles the run
+ * succeeded through its ordinary success tail — the next phase for the item and every
+ * split child it advanced, merge automation, CI recovery. The phase is not run again
+ * and no second run exists. A late failure, or silence, leaves the retry to run when
+ * due. Trust ends when the retry takes over — the scheduled retry is pushed, or the
+ * operator presses Retry now, whose push does the same — or when the run settles
+ * terminally because its budget is spent ({@link stopOrphansOfDispatch}); from then on
+ * the orphan is stopped and fenced exactly as above, and a late success is dropped.
+ *
+ * A router restart inside the window loses the in-memory orphan record, so the late
+ * result is dropped and the scheduled retry runs at its due time.
  */
 
+import {
+	adoptLateResultIntoScheduledRetry,
+	getDispatchById,
+} from '../db/repositories/dispatchesRepository.js';
+import { recordRunLateResultAccepted } from '../db/repositories/runsRepository.js';
+import { parseDispatchPayload, publishDispatchWakeUp } from '../dispatch/dispatcher.js';
 import { resolveHeartbeatTtlMs } from '../identity/worker-session-service.js';
+import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
+import type { SwarmJob } from '../queue/jobs.js';
+import type { TaskExecutionResult } from '../transport/protocol.js';
 import {
 	countDispatchInterruptions,
 	type DispatchTransportLoss,
 	failOrphanedDispatchResultWait,
 	listOrphanedDispatchesForWorker,
+	type OrphanedDispatch,
 	resolveDispatchStreamTarget,
+	takeOverOrphanedDispatch,
 } from './dispatch-results.js';
 import {
+	LATE_RESULT_ACCEPTED_NOTE,
 	persistControlPlaneNote,
 	TRANSPORT_LOST_ORPHAN_NOTE,
 	TRANSPORT_RETURNED_AFTER_ORPHAN_NOTE,
@@ -130,6 +154,10 @@ export const TRANSPORT_LOST_ORPHAN_REASON =
  */
 const ORPHAN_STOP_REASON =
 	'the control plane settled this dispatch while the worker was away — stop the phase';
+
+/** The `reason` on the `task-cancel` an orphan is sent when its dispatch moves on without it. */
+const ORPHAN_TAKEN_OVER_REASON =
+	'the control plane retried this dispatch after the worker was lost — stop the earlier attempt';
 
 /**
  * Arm the bounded reap for the dispatches `workerId`'s drop interrupted.
@@ -242,17 +270,7 @@ function settleIfTransportStayedLost(
  */
 export function stopOrphanedDispatchesOnReturn(workerId: string): void {
 	for (const orphan of listOrphanedDispatchesForWorker(workerId)) {
-		const sent = sendToWorker(workerId, {
-			type: 'task-cancel',
-			dispatchId: orphan.dispatchId,
-			runId: orphan.runId,
-			reason: ORPHAN_STOP_REASON,
-			// What the worker needs to answer a stop for a phase it no longer runs (issue
-			// #724). Taken from the registration recorded at push time, never from the
-			// worker.
-			phase: orphan.phase,
-			taskId: orphan.taskId,
-		});
+		const sent = pushOrphanStop(orphan, ORPHAN_STOP_REASON);
 		if (!sent) continue;
 		persistControlPlaneNote(orphan.runId, TRANSPORT_RETURNED_AFTER_ORPHAN_NOTE);
 		logger.warn('worker transport restored: stopping a phase settled while the worker was away', {
@@ -263,4 +281,147 @@ export function stopOrphanedDispatchesOnReturn(workerId: string): void {
 			taskId: orphan.taskId,
 		});
 	}
+}
+
+/** Push one orphan its `task-cancel`, returning whether the worker's socket took it. */
+function pushOrphanStop(orphan: OrphanedDispatch, reason: string): boolean {
+	return sendToWorker(orphan.workerId, {
+		type: 'task-cancel',
+		dispatchId: orphan.dispatchId,
+		runId: orphan.runId,
+		reason,
+		// What the worker needs to answer a stop for a phase it no longer runs (issue
+		// #724). Taken from the registration recorded at push time, never from the
+		// worker.
+		phase: orphan.phase,
+		taskId: orphan.taskId,
+	});
+}
+
+/**
+ * End the trusted window for `dispatchId` and stop its orphans (issue #1076): the
+ * automatic retry is being pushed to `newWorkerId` (`./dispatcher.ts`), or, with no
+ * worker named, the run settled terminally because its automatic-retry budget is
+ * spent and no retry is coming.
+ *
+ * Each orphan that was still trusted is told to stop now if its worker is connected.
+ * One that is not is fenced from here on and stopped when it reconnects
+ * ({@link stopOrphanedDispatchesOnReturn}), exactly as under #1073. An orphan on the
+ * retry's own worker is forgotten instead (`takeOverOrphanedDispatch`). Synchronous
+ * and I/O-free beyond the push, so the dispatcher can call it right before its own.
+ */
+export function stopOrphansOfDispatch(dispatchId: string, newWorkerId?: string): void {
+	for (const orphan of takeOverOrphanedDispatch(dispatchId, newWorkerId)) {
+		const sent = pushOrphanStop(orphan, ORPHAN_TAKEN_OVER_REASON);
+		logger.warn(
+			newWorkerId
+				? "automatic retry taking over: stopping the lost worker's earlier attempt"
+				: "transport-lost run settled terminally: stopping the lost worker's attempt",
+			{
+				dispatchId,
+				runId: orphan.runId,
+				workerId: orphan.workerId,
+				newWorkerId,
+				stopSent: sent,
+			},
+		);
+	}
+}
+
+/**
+ * The adoption hook a trusted orphan's late `succeeded` result is handed to (issue
+ * #1076, `deliverDispatchResult` in `./dispatch-results.ts`). Fire-and-forget by
+ * contract, like every frame handler's hook: the work is queued and any failure is
+ * logged, so the socket never waits on Postgres.
+ */
+export function acceptLateOrphanResult(
+	orphan: OrphanedDispatch,
+	result: TaskExecutionResult,
+): void {
+	void adoptLateOrphanResult(orphan, result).catch((err) => {
+		logger.error('late result: failed to adopt — the automatic retry goes ahead', {
+			dispatchId: orphan.dispatchId,
+			workerId: orphan.workerId,
+			runId: orphan.runId,
+			error: describeError(err),
+		});
+	});
+}
+
+/**
+ * Adopt the late success into the dispatch's scheduled automatic retry: compare-and-set
+ * it from `retry-scheduled`/`transport-lost` to `pending`, due now and carrying the
+ * result (`adoptLateResultIntoScheduledRetry`), then publish its wake-up. `processJob`
+ * then settles the run with the result rather than pushing the phase again.
+ *
+ * A miss is dropped with a line: the retry already took over, the operator retried
+ * or cancelled, or the run settled terminally — whichever got there first owns the
+ * dispatch. Only the worker's own result is ever adopted: the frame reached this hook
+ * from the orphan record keyed by the socket's authenticated worker.
+ */
+async function adoptLateOrphanResult(
+	orphan: OrphanedDispatch,
+	result: TaskExecutionResult,
+): Promise<void> {
+	const context = {
+		dispatchId: orphan.dispatchId,
+		workerId: orphan.workerId,
+		runId: orphan.runId,
+	};
+	if (!orphan.selection) {
+		logger.warn('late result: no recorded selection for the orphan — dropping', context);
+		return;
+	}
+	const dispatch = await getDispatchById(orphan.dispatchId);
+	if (dispatch?.state !== 'retry-scheduled' || dispatch.waitReason !== 'transport-lost') {
+		logger.warn(
+			'late result: the dispatch is no longer waiting for its automatic retry — dropping',
+			{
+				...context,
+				state: dispatch?.state,
+				waitReason: dispatch?.waitReason,
+			},
+		);
+		return;
+	}
+	const job = parseDispatchPayload(dispatch);
+	const payload: SwarmJob = {
+		...job,
+		adoptedResult: { result: { ...result, status: 'succeeded' }, selection: orphan.selection },
+		// The reaped attempt still holds its PR+SHA review-dispatch slot, so the
+		// SCM continuation handlers must reuse it rather than drop this as a
+		// duplicate inside the claim's TTL — as the pre-run waits do.
+		...(job.type === 'scm' ? { continuationDispatchClaimed: true } : {}),
+	};
+	const adopted = await adoptLateResultIntoScheduledRetry(dispatch.id, dispatch.wakeSeq, payload);
+	if (!adopted) {
+		logger.warn(
+			'late result: the automatic retry moved on before the result was adopted — dropping',
+			context,
+		);
+		return;
+	}
+	persistControlPlaneNote(orphan.runId, LATE_RESULT_ACCEPTED_NOTE);
+	if (orphan.runId) {
+		try {
+			await recordRunLateResultAccepted(orphan.runId, orphan.workerId);
+		} catch (err) {
+			logger.warn('late result: failed to record it on the run (continuing)', {
+				...context,
+				error: describeError(err),
+			});
+		}
+	}
+	try {
+		await publishDispatchWakeUp(adopted);
+	} catch (err) {
+		logger.warn('late result: failed to publish the wake-up (reconciler will repair)', {
+			...context,
+			error: describeError(err),
+		});
+	}
+	logger.warn(
+		'late result: a lost worker reported success before its retry — settling the run with it',
+		context,
+	);
 }

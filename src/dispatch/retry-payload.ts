@@ -265,7 +265,7 @@ function applyManualRecoveryIntent(
  * Rebuild a retry job payload from a stored one: carry the originating `runId`
  * forward (so the retry reuses that row) and reset the rate-limit and
  * automatic-retry attempt counters to 0 (a manual retry bypasses the automatic
- * caps), applying any
+ * caps), drop any adopted late result (issue #1076), applying any
  * cli/model overrides. Shared by "Retry now"'s reopen-existing-dispatch path,
  * its reconstruct-from-run-row fallback, and "Reset & restart".
  *
@@ -288,6 +288,9 @@ export function reconstructRetryJob(
 	job.runId = runId;
 	job.rateLimitRetryAttempt = 0;
 	job.automaticRetryAttempt = 0;
+	// A manual retry runs the phase; it never re-settles a late result an earlier
+	// attempt was adopted with (issue #1076).
+	delete job.adoptedResult;
 	if (job.type === 'pm' && (phase === 'planning' || phase === 'implementation')) {
 		job.resumePmPhase = phase;
 	}
@@ -340,6 +343,7 @@ export function reconstructResetJob(
 	job.runId = runId;
 	job.rateLimitRetryAttempt = 0;
 	job.automaticRetryAttempt = 0;
+	delete job.adoptedResult;
 	if (job.type === 'pm' && (phase === 'planning' || phase === 'implementation')) {
 		job.resumePmPhase = phase;
 	}

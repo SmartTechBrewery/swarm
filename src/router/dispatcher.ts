@@ -89,7 +89,11 @@ import {
 import { QUEUE_NAME, recoveryIntentFromJob, type SwarmJob, SwarmJobSchema } from '../queue/jobs.js';
 import { DeliveryDeferredError } from '../scm/delivery.js';
 import { buildTaskAssignment, type TaskAssignmentPr } from '../transport/assignment.js';
-import type { TaskExecutionResult, TaskProgress } from '../transport/protocol.js';
+import {
+	type TaskExecutionResult,
+	TaskExecutionResultSchema,
+	type TaskProgress,
+} from '../transport/protocol.js';
 import { createTriggerRegistry, registerBuiltInTriggers } from '../triggers/index.js';
 import type { TriggerResult } from '../triggers/types.js';
 import {
@@ -113,6 +117,7 @@ import { BlockedRecoveryError, type BlockedRecoveryReason } from '../worktree/re
 import { composeSystemPrompt, resolveTargetBranch } from './assignment-composition.js';
 import { cancelRunOnWorker, subscribeDispatchCancellations } from './dispatch-cancellation.js';
 import { awaitDispatchResult, type TransportInterruptions } from './dispatch-results.js';
+import { stopOrphansOfDispatch } from './transport-loss-reaper.js';
 import { isWorkerConnected, sendToWorker } from './worker-connections.js';
 import { pushPendingWorkerUpdate } from './worker-update-dispatch.js';
 
@@ -701,6 +706,12 @@ export async function resolveOperatorCredential(
  * this — run-row lifecycle, dispatch settle, self-enqueue, merge automation — is
  * `processJob`'s shared logic; this only performs the push/await and adapts the
  * result.
+ *
+ * Two additions serve the transport-loss recovery (issue #1076). A dispatch carrying
+ * an adopted late result pushes nothing: the phase already ran on the lost worker, so
+ * that result is adapted as if it had just arrived. And every push first ends the
+ * trusted window of the dispatch's orphans, so an earlier attempt still running on a
+ * lost worker is stopped before its retry starts.
  */
 async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseRunResult> {
 	const { trigger, project, resolution, job, runId, signal, implementationUnplanned, dispatch } =
@@ -711,6 +722,20 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 		throw new AgentRunError('Control-plane dispatch reached execution with no selected worker', {
 			kind: 'aborted',
 		});
+	}
+	if (job.adoptedResult) {
+		logger.info('Settling a dispatch with the late result of its lost worker', {
+			projectId: project.id,
+			phase: trigger.phase,
+			taskId: trigger.taskId,
+			dispatchId: dispatch.id,
+			workerId: selection.workerId,
+		});
+		return adaptResultToPhaseRun(
+			TaskExecutionResultSchema.parse(job.adoptedResult.result),
+			selection,
+			'workItem' in trigger ? trigger.workItem : undefined,
+		);
 	}
 
 	const phaseConfig = phaseAgentConfig(project, trigger.phase, implementationUnplanned);
@@ -759,6 +784,12 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 		operatorCredential,
 	});
 
+	// This push takes the dispatch over from any earlier attempt its worker was lost
+	// under (issue #1076): that orphan is no longer trusted to finish, so it is told to
+	// stop now if connected and fenced from here on. Before the registration below, so
+	// the stop and the new wait can never be confused on the orphan's own worker.
+	stopOrphansOfDispatch(dispatch.id, selection.workerId);
+
 	// Register the result wait *before* pushing so a fast worker's ack/progress/
 	// result can't race ahead of the registration.
 	const awaiting = awaitDispatchResult(
@@ -767,7 +798,15 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 		// one back-channel frame that writes durably (`stream-log`), and — since issue
 		// #724 — what a pushed `task-cancel` states so the worker can answer one it
 		// cannot apply with a terminal result naming this phase and task.
-		{ workerId: selection.workerId, runId, phase: trigger.phase, taskId: trigger.taskId },
+		// The selection rides along so a late result from this worker, should its
+		// transport be lost, can be settled as the run it actually ran (issue #1076).
+		{
+			workerId: selection.workerId,
+			runId,
+			phase: trigger.phase,
+			taskId: trigger.taskId,
+			selection,
+		},
 		{
 			onProgress: (progress: TaskProgress) => {
 				if (progress.state === 'branch-provisioned') {
@@ -833,7 +872,8 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
  * durably (no local executor), the fenced claim binds the selected worker's
  * session, the phase runs by pushing an assignment rather than in-process, and a
  * `worker-update` dispatch (issue #972) hands its frame to the machine over the
- * very sockets this process holds.
+ * very sockets this process holds. A run whose lost transport settled terminally
+ * stops its orphan over those same sockets (issue #1076).
  */
 export function createControlPlaneDispatchDeps(): ProcessJobDeps {
 	return {
@@ -842,6 +882,7 @@ export function createControlPlaneDispatchDeps(): ProcessJobDeps {
 		resolveBindIdentity: resolveSelectedWorkerIdentity,
 		executePhase: pushAndAwaitResult,
 		pushWorkerUpdate: pushPendingWorkerUpdate,
+		onTransportLostSettledTerminally: (dispatchId) => stopOrphansOfDispatch(dispatchId),
 	};
 }
 

@@ -45,6 +45,14 @@
  * is remembered per dispatch **and** worker, so one dispatch orphaned on two
  * machines across its retries keeps both records.
  *
+ * Since issue #1076 an orphan starts out **trusted**: while its dispatch waits for
+ * that automatic retry, the late phase is left to finish — it is not stopped on
+ * return, its delivery calls are served, and a late `succeeded` result is handed to
+ * an injected adoption hook that settles the run with it
+ * (`./transport-loss-reaper.ts`). Trust ends when the retry takes over the dispatch
+ * ({@link takeOverOrphanedDispatch}) or the run settles terminally instead; from then
+ * on the orphan is stopped and fenced exactly as #1073 describes.
+ *
  * The `Map`s are module-private; callers touch them only through the exported
  * functions.
  */
@@ -56,6 +64,7 @@ import type {
 	TaskPhase,
 	TaskProgress,
 } from '../transport/protocol.js';
+import type { DispatchSelection } from '../worker/eligibility-gate.js';
 
 /** Non-terminal frame handlers a waiting dispatcher may register alongside its result wait. */
 export interface DispatchResultHandlers {
@@ -96,6 +105,12 @@ export interface DispatchRegistration extends DispatchStreamTarget {
 	phase: TaskPhase;
 	/** The SCM-derived task id the pushed assignment names. */
 	taskId: string;
+	/**
+	 * The worker and target the dispatch gate selected for the push (issue #1076).
+	 * Kept so a late result from that worker can be settled as the run the machine
+	 * actually ran, without asking the gate again.
+	 */
+	selection?: DispatchSelection;
 }
 
 interface PendingDispatch extends DispatchResultHandlers, DispatchRegistration {
@@ -150,7 +165,23 @@ export const ORPHANED_DISPATCH_RETENTION_MS = 24 * 60 * 60 * 1000;
 /** One dispatch the transport-loss reap ended on a worker, as a stop has to name it. */
 export interface OrphanedDispatch extends DispatchRegistration {
 	dispatchId: string;
+	/**
+	 * Whether the late phase is still allowed to finish (issue #1076). Set at the reap,
+	 * whose deferral schedules an automatic retry; cleared by
+	 * {@link takeOverOrphanedDispatch} once that retry takes over or the run settles
+	 * terminally. A trusted orphan is neither stopped nor fenced, and its late success
+	 * is adopted rather than dropped.
+	 */
+	trusted: boolean;
 }
+
+/**
+ * Settle a run with the late `succeeded` result of its trusted orphan (issue #1076).
+ * Injected by the caller of {@link deliverDispatchResult} so this module keeps no
+ * database dependency. Fire-and-forget: it returns `void`, like every hook a frame
+ * handler calls.
+ */
+export type LateOrphanResultHook = (orphan: OrphanedDispatch, result: TaskExecutionResult) => void;
 
 /**
  * (dispatchId, workerId) → the registration of a dispatch the transport-loss reap
@@ -269,6 +300,7 @@ export function awaitDispatchResult(
 		runId: target.runId,
 		phase: target.phase,
 		taskId: target.taskId,
+		selection: target.selection,
 		onProgress: handlers.onProgress,
 		onAck: handlers.onAck,
 		interruptions: 0,
@@ -310,11 +342,44 @@ export function awaitDispatchResult(
  * it was sent, or reports a phase that finished while it was away. That result is
  * the last thing the late phase sends, so the orphan record is forgotten here, and
  * nothing is left running that its fence or its stop would apply to.
+ *
+ * A **trusted** orphan's result is the exception (issue #1076). A `succeeded` one is
+ * passed to `onTrustedLateSuccess`, which settles the run with it, and the orphan is
+ * forgotten. Anything else — `failed`, `deferred`, a cancellation — is dropped and
+ * the record kept, still trusted: the automatic retry goes ahead when it is due, and
+ * its takeover is what stops the worker and fences it.
  */
-export function deliverDispatchResult(result: TaskExecutionResult, fromWorkerId: string): boolean {
+export function deliverDispatchResult(
+	result: TaskExecutionResult,
+	fromWorkerId: string,
+	onTrustedLateSuccess?: LateOrphanResultHook,
+): boolean {
 	const entry = pendingFrom(result.dispatchId, fromWorkerId);
 	const key = orphanKey(result.dispatchId, fromWorkerId);
 	const orphan = entry ? undefined : orphaned.get(key);
+	if (orphan?.trusted) {
+		if (result.status !== 'succeeded') {
+			logger.info(
+				'dispatch back-channel: a late unsuccessful result for a dispatch awaiting its automatic retry — dropping; the retry goes ahead',
+				{ dispatchId: result.dispatchId, status: result.status, workerId: orphan.workerId },
+			);
+			return false;
+		}
+		orphaned.delete(key);
+		logger.info(
+			'dispatch back-channel: a late success for a dispatch awaiting its automatic retry — handing it to the adoption',
+			{ dispatchId: result.dispatchId, workerId: orphan.workerId, runId: orphan.runId },
+		);
+		try {
+			onTrustedLateSuccess?.({ ...orphan }, result);
+		} catch (err) {
+			logger.warn('dispatch back-channel: the late-result adoption hook threw', {
+				dispatchId: result.dispatchId,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+		return false;
+	}
 	if (orphan) {
 		orphaned.delete(key);
 		// Still `warn`: a late `succeeded` means the phase finished its work on the
@@ -445,6 +510,12 @@ export function failDispatchResultWait(
  * reap writes no durable row before the frame: the dispatch is still claimed by the
  * job awaiting it, so the deferral reaches it intact.
  *
+ * The record starts out **trusted** (issue #1076): the deferral this frame causes
+ * schedules the automatic retry, and until that retry takes over the late phase is
+ * allowed to finish. A run whose retry budget is already spent settles terminally
+ * instead, and the consumer's settle hook ends the trust straight away
+ * ({@link takeOverOrphanedDispatch}).
+ *
  * The record expires after {@link ORPHANED_DISPATCH_RETENTION_MS}. The timer is
  * unreffed and identity-checked, so a later orphaning of the same id on the same
  * worker is never forgotten early.
@@ -459,6 +530,8 @@ export function failOrphanedDispatchResultWait(dispatchId: string, reason: strin
 		runId: entry.runId,
 		phase: entry.phase,
 		taskId: entry.taskId,
+		selection: entry.selection,
+		trusted: true,
 	};
 	orphaned.set(key, orphan);
 	const expiry = setTimeout(() => {
@@ -480,9 +553,41 @@ export function failOrphanedDispatchResultWait(dispatchId: string, reason: strin
 }
 
 /**
+ * End the trust of every orphan of `dispatchId` and return the ones to stop now
+ * (issue #1076): the automatic retry is taking the dispatch over, or the run settled
+ * terminally and no retry is coming.
+ *
+ * `newWorkerId` names the worker the retry is being pushed to. An orphan on that same
+ * worker is forgotten rather than stopped: the worker acks the re-pushed dispatch id
+ * as `duplicate`, and the phase still running there answers the new wait. Stopping it
+ * would cancel the very attempt being started.
+ *
+ * Only orphans that were still trusted are returned. One already untrusted was listed
+ * for a stop when it became so, and its fence already applies.
+ */
+export function takeOverOrphanedDispatch(
+	dispatchId: string,
+	newWorkerId?: string,
+): OrphanedDispatch[] {
+	const toStop: OrphanedDispatch[] = [];
+	for (const [key, orphan] of orphaned) {
+		if (orphan.dispatchId !== dispatchId) continue;
+		if (orphan.workerId === newWorkerId) {
+			orphaned.delete(key);
+			continue;
+		}
+		if (!orphan.trusted) continue;
+		orphan.trusted = false;
+		toStop.push({ ...orphan });
+	}
+	return toStop;
+}
+
+/**
  * The dispatches this router reaped from `workerId` that the worker has not answered
  * for yet (issue #1073). This is what its reconnect is told to stop
- * (`./transport-loss-reaper.ts`).
+ * (`./transport-loss-reaper.ts`). A trusted orphan is left out (issue #1076): its
+ * dispatch is still waiting for the automatic retry, and the late phase may finish.
  *
  * A dispatch awaited here again **on this same worker** is left out: its automatic
  * retry (issue #1075) reuses the dispatch id, and a stop answered on the old phase's
@@ -493,7 +598,8 @@ export function failOrphanedDispatchResultWait(dispatchId: string, reason: strin
 export function listOrphanedDispatchesForWorker(workerId: string): OrphanedDispatch[] {
 	const listed: OrphanedDispatch[] = [];
 	for (const orphan of orphaned.values()) {
-		if (orphan.workerId !== workerId || pendingFrom(orphan.dispatchId, workerId)) continue;
+		if (orphan.workerId !== workerId || orphan.trusted) continue;
+		if (pendingFrom(orphan.dispatchId, workerId)) continue;
 		listed.push({ ...orphan });
 	}
 	return listed;
@@ -508,9 +614,12 @@ export function listOrphanedDispatchesForWorker(workerId: string): OrphanedDispa
  * Keyed on the worker as well as the dispatch, so one worker's orphan never fences
  * another. Answers `false` for any dispatch it has no record of: a router that
  * restarted since the reap, or one that never reaped it, keeps today's behaviour.
+ * It answers `false` for a trusted orphan too (issue #1076): until the retry takes
+ * over, the late phase's delivery is work the run may still be settled with.
  */
 export function isDispatchOrphanedFrom(workerId: string, dispatchId: string): boolean {
-	if (!orphaned.has(orphanKey(dispatchId, workerId))) return false;
+	const orphan = orphaned.get(orphanKey(dispatchId, workerId));
+	if (!orphan || orphan.trusted) return false;
 	return pendingFrom(dispatchId, workerId) === undefined;
 }
 

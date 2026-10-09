@@ -498,6 +498,9 @@ export type RunRecoveryRecord = NonNullable<typeof runs.$inferSelect.recovery>;
  *   than this would be erased before the retry it exists to steer ever reads it.
  * - `transportLostWorkerIds` — the machines whose transport was lost under this run
  *   (issue #1075), sticky on exactly the same terms and for the same reason.
+ * - `lateResultAcceptedFromWorkerId` — the machine whose late result settled this run
+ *   (issue #1076), a historical fact like `abandonedWorkerId`: it is written just
+ *   before the adopted wake-up resets the row to `running` with a `null` write.
  *
  * Written as one SQL expression so the merge reads the row's current value under
  * the same statement that replaces it — no read-modify-write race with a
@@ -509,13 +512,15 @@ function recoveryWriteSql(next: RunRecoveryRecord | null): SQL {
 			? sql`jsonb_build_object(
 					'abandonedWorkerId', ${runs.recovery} -> 'abandonedWorkerId',
 					'commitUnavailableWorkerIds', ${runs.recovery} -> 'commitUnavailableWorkerIds',
-					'transportLostWorkerIds', ${runs.recovery} -> 'transportLostWorkerIds'
+					'transportLostWorkerIds', ${runs.recovery} -> 'transportLostWorkerIds',
+					'lateResultAcceptedFromWorkerId', ${runs.recovery} -> 'lateResultAcceptedFromWorkerId'
 				)`
 			: sql`jsonb_build_object(
 					'abandonedWorkerId', ${runs.recovery} -> 'abandonedWorkerId',
 					'preservedWorkerId', ${runs.recovery} -> 'preservedWorkerId',
 					'commitUnavailableWorkerIds', ${runs.recovery} -> 'commitUnavailableWorkerIds',
-					'transportLostWorkerIds', ${runs.recovery} -> 'transportLostWorkerIds'
+					'transportLostWorkerIds', ${runs.recovery} -> 'transportLostWorkerIds',
+					'lateResultAcceptedFromWorkerId', ${runs.recovery} -> 'lateResultAcceptedFromWorkerId'
 				)`;
 	const base = next === null ? sql`'{}'::jsonb` : sql`${JSON.stringify(next)}::jsonb`;
 	// `jsonb_strip_nulls` drops the absent sticky keys (`jsonb -> key` is SQL NULL
@@ -1015,6 +1020,24 @@ export async function recordRunCommitUnavailableWorker(runId: string): Promise<v
  */
 export async function recordRunTransportLostWorker(runId: string): Promise<void> {
 	await appendRunRecoveryWorker(runId, 'transportLostWorkerIds');
+}
+
+/**
+ * Record that this run is being settled with the late result `workerId` reported
+ * after its transport was lost (issue #1076), so the run detail can say so. Sticky
+ * across the settle's own recovery writes ({@link recoveryWriteSql}). Best-effort on
+ * the same terms as the lists below: the caller swallows and logs a throw, since a
+ * missing marker costs the run nothing but the line that explains it.
+ */
+export async function recordRunLateResultAccepted(runId: string, workerId: string): Promise<void> {
+	await getDb()
+		.update(runs)
+		.set({
+			recovery: sql`coalesce(${runs.recovery}, '{}'::jsonb) || jsonb_build_object(
+				'lateResultAcceptedFromWorkerId', ${workerId}::text
+			)`,
+		})
+		.where(eq(runs.id, runId));
 }
 
 /** The two sticky worker lists on `runs.recovery` the dispatch gate passes over. */
