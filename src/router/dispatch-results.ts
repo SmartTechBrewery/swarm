@@ -194,9 +194,25 @@ export type LateOrphanResultHook = (orphan: OrphanedDispatch, result: TaskExecut
  */
 const orphaned = new Map<string, OrphanedDispatch>();
 
+/**
+ * {@link orphaned} key → the re-pushes waiting for that record to go
+ * ({@link awaitOrphanStopAnswer}): an automatic retry about to go back to the worker
+ * its earlier attempt was orphaned on.
+ */
+const orphanAnswerWaiters = new Map<string, Set<() => void>>();
+
 /** The {@link orphaned} key for `dispatchId` reaped from `workerId`. */
 function orphanKey(dispatchId: string, workerId: string): string {
 	return `${dispatchId}\u0000${workerId}`;
+}
+
+/** Forget one orphan record and wake every re-push waiting for it to go. */
+function forgetOrphan(key: string): void {
+	orphaned.delete(key);
+	const waiters = orphanAnswerWaiters.get(key);
+	if (!waiters) return;
+	orphanAnswerWaiters.delete(key);
+	for (const notify of waiters) notify();
 }
 
 /** The waiter for `dispatchId`, but only when it was pushed to `workerId`. */
@@ -366,7 +382,7 @@ export function deliverDispatchResult(
 			);
 			return false;
 		}
-		orphaned.delete(key);
+		forgetOrphan(key);
 		logger.info(
 			'dispatch back-channel: a late success for a dispatch awaiting its automatic retry — handing it to the adoption',
 			{ dispatchId: result.dispatchId, workerId: orphan.workerId, runId: orphan.runId },
@@ -382,7 +398,7 @@ export function deliverDispatchResult(
 		return false;
 	}
 	if (orphan) {
-		orphaned.delete(key);
+		forgetOrphan(key);
 		// Still `warn`: a late `succeeded` means the phase finished its work on the
 		// worker, and the run says it failed. Its board writes after the reap were
 		// refused, so the board agrees with the run. This line is still the one an
@@ -536,7 +552,7 @@ export function failOrphanedDispatchResultWait(dispatchId: string, reason: strin
 	};
 	orphaned.set(key, orphan);
 	const expiry = setTimeout(() => {
-		if (orphaned.get(key) === orphan) orphaned.delete(key);
+		if (orphaned.get(key) === orphan) forgetOrphan(key);
 	}, ORPHANED_DISPATCH_RETENTION_MS);
 	expiry.unref();
 	pending.delete(dispatchId);
@@ -558,33 +574,69 @@ export function failOrphanedDispatchResultWait(dispatchId: string, reason: strin
  * (issue #1076): the automatic retry is taking the dispatch over, or the run settled
  * terminally and no retry is coming.
  *
- * `newWorkerId` names the worker the retry is being pushed to. An orphan on that same
- * worker is forgotten rather than stopped: the worker acks the re-pushed dispatch id
- * as `duplicate`, and the phase still running there answers the new wait. Stopping it
- * would cancel the very attempt being started.
+ * `newWorkerId` names the worker the retry is being pushed to, and an orphan on that
+ * same worker is forgotten rather than stopped. By then it has normally gone already:
+ * the claim stopped it, and the push waited for its answer
+ * ({@link awaitOrphanStopAnswer}) so that answer could not settle the new wait.
  *
  * Only orphans that were still trusted are returned. One already untrusted was listed
- * for a stop when it became so, and its fence already applies. `include` narrows which
- * trusted orphans lose their trust now; the rest stay trusted (the claim-time call
- * leaves a connected orphan to the push, which may be going to its own worker).
+ * for a stop when it became so, and its fence already applies.
  */
 export function takeOverOrphanedDispatch(
 	dispatchId: string,
 	newWorkerId?: string,
-	include: (orphan: OrphanedDispatch) => boolean = () => true,
 ): OrphanedDispatch[] {
 	const toStop: OrphanedDispatch[] = [];
 	for (const [key, orphan] of orphaned) {
 		if (orphan.dispatchId !== dispatchId) continue;
 		if (orphan.workerId === newWorkerId) {
-			orphaned.delete(key);
+			forgetOrphan(key);
 			continue;
 		}
-		if (!orphan.trusted || !include(orphan)) continue;
+		if (!orphan.trusted) continue;
 		orphan.trusted = false;
 		toStop.push({ ...orphan });
 	}
 	return toStop;
+}
+
+/**
+ * Wait until `workerId` has answered for its orphaned attempt at `dispatchId` — the
+ * record is gone — before the automatic retry is pushed back to that same worker
+ * (issue #1076). The claim stopped that attempt, and the worker answers the stop with
+ * a terminal frame under the same dispatch id; a wait registered before that frame
+ * arrives would be settled by it. Resolves `true` at once when there is no record,
+ * or only a trusted one (nothing was stopped, so no answer is owed), and `false` when
+ * `timeoutMs` elapses or `signal` aborts first.
+ */
+export function awaitOrphanStopAnswer(
+	dispatchId: string,
+	workerId: string,
+	timeoutMs: number,
+	signal?: AbortSignal,
+): Promise<boolean> {
+	const key = orphanKey(dispatchId, workerId);
+	const orphan = orphaned.get(key);
+	if (!orphan || orphan.trusted) return Promise.resolve(true);
+	if (signal?.aborted) return Promise.resolve(false);
+	return new Promise<boolean>((resolve) => {
+		const waiters = orphanAnswerWaiters.get(key) ?? new Set<() => void>();
+		orphanAnswerWaiters.set(key, waiters);
+		const finish = (answered: boolean): void => {
+			clearTimeout(timer);
+			signal?.removeEventListener('abort', onAbort);
+			waiters.delete(onAnswer);
+			if (waiters.size === 0 && orphanAnswerWaiters.get(key) === waiters) {
+				orphanAnswerWaiters.delete(key);
+			}
+			resolve(answered);
+		};
+		const onAnswer = (): void => finish(true);
+		const onAbort = (): void => finish(false);
+		const timer = setTimeout(onAbort, timeoutMs);
+		waiters.add(onAnswer);
+		signal?.addEventListener('abort', onAbort, { once: true });
+	});
 }
 
 /**

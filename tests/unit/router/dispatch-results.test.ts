@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
 	awaitDispatchResult,
+	awaitOrphanStopAnswer,
 	countDispatchInterruptions,
 	type DispatchRegistration,
 	deliverDispatchAck,
@@ -728,17 +729,12 @@ describe('trusted orphans', () => {
 		expect(takeOverOrphanedDispatch(DISPATCH_A)).toEqual([]);
 	});
 
-	// The claim-time seam (the review of #1078): trust can end with no push at all, and
-	// only for the orphans the caller names.
-	it('ends the trust of only the orphans the takeover includes, with no push', () => {
+	// The claim-time seam (the review of #1078): trust can end with no push at all.
+	it('ends the trust with no push', () => {
 		orphan();
 		expect(hasTrustedOrphans(DISPATCH_A)).toBe(true);
 
-		expect(takeOverOrphanedDispatch(DISPATCH_A, undefined, () => false)).toEqual([]);
-		expect(hasTrustedOrphans(DISPATCH_A)).toBe(true);
-		expect(isDispatchOrphanedFrom(WORKER_A, DISPATCH_A)).toBe(false);
-
-		expect(takeOverOrphanedDispatch(DISPATCH_A, undefined, () => true)).toEqual([
+		expect(takeOverOrphanedDispatch(DISPATCH_A)).toEqual([
 			expect.objectContaining({ dispatchId: DISPATCH_A, workerId: WORKER_A, trusted: false }),
 		]);
 		expect(hasTrustedOrphans(DISPATCH_A)).toBe(false);
@@ -802,5 +798,74 @@ describe('trusted orphans', () => {
 
 		expect(isDispatchOrphanedFrom(WORKER_A, DISPATCH_A)).toBe(true);
 		expect(isDispatchOrphanedFrom(WORKER_B, DISPATCH_B)).toBe(false);
+	});
+});
+
+// The review of #1078: the claim stops a connected orphan, and a retry going back to
+// that same worker must not register its wait until the worker has answered the stop.
+describe('awaitOrphanStopAnswer', () => {
+	const REASON = "The worker's transport session was lost and did not return within the grace";
+
+	function stoppedOrphan(): void {
+		const awaiting = awaitDispatchResult(DISPATCH_A, TARGET_A);
+		failOrphanedDispatchResultWait(DISPATCH_A, REASON);
+		awaiting.dispose();
+		takeOverOrphanedDispatch(DISPATCH_A);
+	}
+
+	function cancelledAnswer(): TaskExecutionResult {
+		return { ...result(DISPATCH_A), status: 'failed', error: 'cancelled', cancelled: true };
+	}
+
+	afterEach(() => {
+		vi.useRealTimers();
+		takeOverOrphanedDispatch(DISPATCH_A, WORKER_A);
+	});
+
+	it('resolves at once when the worker owes no answer', async () => {
+		await expect(awaitOrphanStopAnswer(DISPATCH_A, WORKER_A, 1_000)).resolves.toBe(true);
+
+		// A trusted orphan was never stopped, so nothing is owed for it either.
+		const awaiting = awaitDispatchResult(DISPATCH_A, TARGET_A);
+		failOrphanedDispatchResultWait(DISPATCH_A, REASON);
+		awaiting.dispose();
+		await expect(awaitOrphanStopAnswer(DISPATCH_A, WORKER_A, 1_000)).resolves.toBe(true);
+	});
+
+	it('resolves once the stopped worker answers, and that answer settles nothing', async () => {
+		stoppedOrphan();
+		const answered = awaitOrphanStopAnswer(DISPATCH_A, WORKER_A, 60_000);
+		// Another worker's orphan of the same dispatch is not this one.
+		expect(await awaitOrphanStopAnswer(DISPATCH_A, WORKER_B, 60_000)).toBe(true);
+
+		expect(deliverDispatchResult(cancelledAnswer(), WORKER_A)).toBe(false);
+
+		await expect(answered).resolves.toBe(true);
+		// Only now does the retry register; the worker's next result is its own.
+		const retry = awaitDispatchResult(DISPATCH_A, TARGET_A);
+		expect(deliverDispatchResult(result(DISPATCH_A), WORKER_A)).toBe(true);
+		await expect(retry.result).resolves.toMatchObject({ status: 'succeeded' });
+		retry.dispose();
+	});
+
+	it('gives up when the worker stays silent', async () => {
+		vi.useFakeTimers();
+		stoppedOrphan();
+		const answered = awaitOrphanStopAnswer(DISPATCH_A, WORKER_A, 60_000);
+
+		await vi.advanceTimersByTimeAsync(60_000);
+
+		await expect(answered).resolves.toBe(false);
+		expect(isDispatchOrphanedFrom(WORKER_A, DISPATCH_A)).toBe(true);
+	});
+
+	it('gives up when its signal aborts', async () => {
+		stoppedOrphan();
+		const controller = new AbortController();
+		const answered = awaitOrphanStopAnswer(DISPATCH_A, WORKER_A, 60_000, controller.signal);
+
+		controller.abort();
+
+		await expect(answered).resolves.toBe(false);
 	});
 });

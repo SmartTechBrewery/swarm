@@ -23,6 +23,7 @@ import {
 	takeOverOrphanedDispatch,
 } from '@/router/dispatch-results.js';
 import { createControlPlaneDispatchDeps } from '@/router/dispatcher.js';
+import { endOrphanTrustAtClaim } from '@/router/transport-loss-reaper.js';
 import { deregisterConnection, registerConnection } from '@/router/worker-connections.js';
 import { DeliveryDeferredError } from '@/scm/delivery.js';
 import type { TaskExecutionResult } from '@/transport/protocol.js';
@@ -36,8 +37,8 @@ import {
 
 /**
  * The control-plane executor's two transport-loss additions (issue #1076): a dispatch
- * carrying an adopted late result settles with it and pushes nothing, and every push
- * first takes the dispatch over from an orphan still trusted on a lost worker.
+ * carrying an adopted late result settles with it and pushes nothing, and a push back
+ * to the worker an earlier attempt was orphaned on waits for its answer to the stop.
  */
 
 const DISPATCH_ID = 'ee14c88f-1f88-4b64-a740-4c308ec011e5';
@@ -161,6 +162,79 @@ describe('control-plane executePhase and the transport-loss recovery (issue #107
 		});
 		expect(isDispatchOrphanedFrom(LOST_WORKER_ID, DISPATCH_ID)).toBe(true);
 		deregisterConnection(LOST_WORKER_ID, lost);
+	});
+
+	/** Planning orphaned on the lost worker, which is back, and the retry just claimed. */
+	function claimedWithConnectedOrphan(): FakeWs {
+		const reaped = awaitDispatchResult(DISPATCH_ID, {
+			workerId: LOST_WORKER_ID,
+			runId: RUN_ID,
+			phase: 'planning',
+			taskId: '568',
+		});
+		failOrphanedDispatchResultWait(DISPATCH_ID, 'transport lost');
+		reaped.dispose();
+		const lost = fakeWs();
+		registerConnection(LOST_WORKER_ID, lost);
+		endOrphanTrustAtClaim(DISPATCH_ID);
+		expect(JSON.parse(String(lost.send.mock.calls[0][0]))).toMatchObject({
+			type: 'task-cancel',
+			dispatchId: DISPATCH_ID,
+		});
+		return lost;
+	}
+
+	// The re-review of #1078: the claim stops a connected orphan, and the stop is answered
+	// under the same dispatch id. A retry pushed back to that worker must not be settled
+	// by that answer.
+	it('waits for the stopped worker’s answer before pushing the retry back to it', async () => {
+		const lost = claimedWithConnectedOrphan();
+		const job: SwarmJob = { ...createMockPmWebhookJob(), dispatchId: DISPATCH_ID };
+		const running = executePhase(context(selectionFor(LOST_WORKER_ID, 'karolina_swarm'), job));
+
+		// Nothing is pushed or awaited until the worker answers the stop.
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(lost.send).toHaveBeenCalledTimes(1);
+		expect(resolveDispatchStreamTarget(DISPATCH_ID)).toBeUndefined();
+
+		// The answer is dropped as the orphan's last frame; only then is the retry pushed.
+		expect(
+			deliverDispatchResult(
+				{ ...LATE_SUCCESS, status: 'failed', error: 'cancelled', cancelled: true },
+				LOST_WORKER_ID,
+			),
+		).toBe(false);
+		await vi.waitFor(() => expect(lost.send).toHaveBeenCalledTimes(2));
+		expect(JSON.parse(String(lost.send.mock.calls[1][0]))).toMatchObject({
+			type: 'task-assignment',
+			dispatchId: DISPATCH_ID,
+		});
+		expect(resolveDispatchStreamTarget(DISPATCH_ID)).toMatchObject({ workerId: LOST_WORKER_ID });
+		expect(isDispatchOrphanedFrom(LOST_WORKER_ID, DISPATCH_ID)).toBe(false);
+
+		failOrphanedDispatchResultWait(DISPATCH_ID, 'transport lost');
+		await expect(running).rejects.toMatchObject({ failure: { kind: 'transport-lost' } });
+		takeOverOrphanedDispatch(DISPATCH_ID);
+		deregisterConnection(LOST_WORKER_ID, lost);
+	});
+
+	it('defers the retry when the stopped worker never answers', async () => {
+		vi.useFakeTimers();
+		try {
+			const lost = claimedWithConnectedOrphan();
+			const job: SwarmJob = { ...createMockPmWebhookJob(), dispatchId: DISPATCH_ID };
+			const running = executePhase(context(selectionFor(LOST_WORKER_ID, 'karolina_swarm'), job));
+			const settled = expect(running).rejects.toBeInstanceOf(DeliveryDeferredError);
+
+			await vi.advanceTimersByTimeAsync(2 * 60 * 1000);
+
+			await settled;
+			expect(lost.send).toHaveBeenCalledTimes(1);
+			expect(resolveDispatchStreamTarget(DISPATCH_ID)).toBeUndefined();
+			deregisterConnection(LOST_WORKER_ID, lost);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it('records the selection on the wait, so a later reap can adopt that worker’s late result', async () => {

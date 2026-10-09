@@ -590,15 +590,17 @@ server-side store) it needs:
    dispatch**, so there is still exactly one settle path and one run. **Trust ends at the
    claim**, the moment an adoption can no longer succeed, bracketed around each claimed
    job by the router (`processControlPlaneJob`): the claim (scheduled or Retry now)
-   untrusts every orphan whose worker is disconnected, so a retry that then defers
-   without pushing — no eligible worker, the task in flight — cannot leave it writing;
-   the push untrusts the rest and stops any connected one; and a job that ends any other
-   way — terminally, or deferred for another wait reason — stops whatever is still
-   trusted unless the dispatch is again waiting for its `transport-lost` retry. A
-   connected orphan is not stopped at the claim because the push may be going back to
-   its own worker: there it is forgotten rather than stopped — it acks the re-push
-   `duplicate` and its phase answers the new wait — and a stop sent a moment earlier
-   would answer that wait instead. **An SCM adoption
+   untrusts **every** orphan, fencing it at once and pushing it a `task-cancel` if its
+   worker is connected (otherwise on reconnect), so a retry that then defers without
+   pushing — no eligible worker, the task in flight — cannot leave it writing; and a job
+   that ends any other way stops whatever is still trusted unless the dispatch is again
+   waiting for its `transport-lost` retry. **A retry pushed back to the orphan's own
+   worker waits for that worker's answer to the stop** (`awaitOrphanStopAnswer`, at most
+   two minutes, else the retry defers): the answer carries the same dispatch id from the
+   same worker, so a wait registered before it arrived would be settled by it. That
+   gives up the old attempt's progress on that machine — it is stopped rather than
+   adopted as the retry — in exchange for no window in which its writes are served
+   while nothing will settle it. **An SCM adoption
    reuses its PR+SHA slot** (`continuationDispatchClaimed`), as the pre-run waits do, or
    the claim TTL would drop it as a duplicate. **Visible**: a control-plane note in the
    run's output and a sticky `runs.recovery.lateResultAcceptedFromWorkerId`, shown in the

@@ -81,11 +81,10 @@
  * worker as well as the dispatch: the back-channel reaches a waiter only with frames
  * from the worker it was pushed to, and an orphan is remembered per dispatch and
  * worker. A retry running on W2 is therefore never resolved by W1's answer to its
- * stop, and W1's delivery calls stay refused while W2's are served. One narrow race
- * is accepted rather than engineered around: when the lost worker is the only
- * eligible one and reconnects at the very moment its retry is pushed back to it, its
- * answer to the stop carries the same dispatch id from the same worker and can reach
- * the new wait.
+ * stop, and W1's delivery calls stay refused while W2's are served. A retry pushed
+ * back to W1 itself first waits for W1 to answer the stop (`awaitOrphanStopAnswer`,
+ * `./dispatcher.ts`), since that answer carries the same dispatch id from the same
+ * worker and would otherwise reach the new wait.
  *
  * **Until then, a late success is honoured (issue #1076).** #1073 rejected that
  * because it needed a second settle path outside `processJob`, after the run had
@@ -100,11 +99,10 @@
  * split child it advanced, merge automation, CI recovery. The phase is not run again
  * and no second run exists. A late failure, or silence, leaves the retry to run when
  * due. Trust ends when the dispatch stops waiting for that retry: when the scheduled
- * retry — or the operator's Retry now — is claimed ({@link endOrphanTrustAtClaim}) and
- * pushed ({@link stopOrphansOfDispatch}), or when the claimed job ends any other way,
- * terminally or deferred for another reason ({@link endOrphanTrustUnlessRetryPending});
- * from then on the orphan is stopped and fenced exactly as above, and a late success
- * is dropped.
+ * retry — or the operator's Retry now — is claimed ({@link endOrphanTrustAtClaim}), or
+ * when the run settles without a claim ({@link stopOrphansOfDispatch}, through
+ * {@link endOrphanTrustUnlessRetryPending}); from then on the orphan is stopped and
+ * fenced exactly as above, and a late success is dropped.
  *
  * A router restart inside the window loses the in-memory orphan record, so the late
  * result is dropped and the scheduled retry runs at its due time.
@@ -302,16 +300,17 @@ function pushOrphanStop(orphan: OrphanedDispatch, reason: string): boolean {
 }
 
 /**
- * End the trusted window for `dispatchId` and stop its orphans (issue #1076): the
- * automatic retry is being pushed to `newWorkerId` (`./dispatcher.ts`), or, with no
- * worker named, the dispatch settled without one — terminally, or deferred for some
- * other reason ({@link endOrphanTrustUnlessRetryPending}).
+ * End the trusted window for `dispatchId` and stop its orphans (issue #1076): its
+ * retry was claimed ({@link endOrphanTrustAtClaim}), the claimed job ended without
+ * the dispatch waiting for that retry again ({@link endOrphanTrustUnlessRetryPending}),
+ * or the retry is being pushed to `newWorkerId` (`./dispatcher.ts`), by which time the
+ * claim has normally done this already.
  *
- * Each orphan that was still trusted is told to stop now if its worker is connected.
- * One that is not is fenced from here on and stopped when it reconnects
- * ({@link stopOrphanedDispatchesOnReturn}), exactly as under #1073. An orphan on the
- * retry's own worker is forgotten instead (`takeOverOrphanedDispatch`). Synchronous
- * and I/O-free beyond the push, so the dispatcher can call it right before its own.
+ * Each orphan that was still trusted is fenced from now on and told to stop at once
+ * if its worker is connected. One that is not is stopped when it reconnects
+ * ({@link stopOrphanedDispatchesOnReturn}), exactly as under #1073. An orphan on
+ * `newWorkerId` is forgotten instead (`takeOverOrphanedDispatch`). Synchronous and
+ * I/O-free beyond the push.
  */
 export function stopOrphansOfDispatch(dispatchId: string, newWorkerId?: string): void {
 	for (const orphan of takeOverOrphanedDispatch(dispatchId, newWorkerId)) {
@@ -319,7 +318,7 @@ export function stopOrphansOfDispatch(dispatchId: string, newWorkerId?: string):
 		logger.warn(
 			newWorkerId
 				? "automatic retry taking over: stopping the lost worker's earlier attempt"
-				: "transport-lost dispatch moved on without its retry: stopping the lost worker's attempt",
+				: "transport-lost dispatch no longer waiting for its retry: stopping the lost worker's attempt",
 			{
 				dispatchId,
 				runId: orphan.runId,
@@ -334,32 +333,17 @@ export function stopOrphansOfDispatch(dispatchId: string, newWorkerId?: string):
 /**
  * The scheduled retry of `dispatchId` was just claimed (issue #1076): from here on the
  * late attempt can no longer be adopted — the dispatch has left `retry-scheduled` —
- * so its trusted window ends.
+ * so its trusted window ends, before `processJob` goes any further.
  *
- * Only orphans whose worker is disconnected lose their trust here. They are fenced at
- * once and stopped when they reconnect, which is what keeps a retry that defers
- * before pushing (the gate finds no eligible worker, the task is in flight) from
- * leaving them free to write while nothing will settle their result. A connected
- * orphan is left to what the claim leads to: the push forgets it when the retry goes
- * back to its own worker, whose running phase then answers the new wait, and stops it
- * when the retry goes elsewhere; a claim that ends without a push stops it in
- * {@link endOrphanTrustUnlessRetryPending}. Stopping it here instead would race the
- * push of the same dispatch id to the same worker, whose answer to the stop would
- * settle the new wait.
+ * Every orphan loses its trust here, connected or not. It is fenced at once and
+ * stopped now, or when it reconnects, so a retry that defers before pushing (the gate
+ * finds no eligible worker, the task is in flight) can never leave it free to write
+ * while nothing will settle its result. The stop is answered with a terminal frame
+ * under the same dispatch id; a retry that is pushed back to that same worker waits
+ * for the answer first, so it can never settle the retry's wait (`./dispatcher.ts`).
  */
 export function endOrphanTrustAtClaim(dispatchId: string): void {
-	const distrusted = takeOverOrphanedDispatch(
-		dispatchId,
-		undefined,
-		(orphan) => !isWorkerConnected(orphan.workerId),
-	);
-	for (const orphan of distrusted) {
-		logger.info('automatic retry claimed: fencing the lost worker until it reconnects', {
-			dispatchId,
-			runId: orphan.runId,
-			workerId: orphan.workerId,
-		});
-	}
+	stopOrphansOfDispatch(dispatchId);
 }
 
 /**

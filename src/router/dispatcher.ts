@@ -117,7 +117,11 @@ import { phaseAgentConfig } from '../worker/target-policy.js';
 import { BlockedRecoveryError, type BlockedRecoveryReason } from '../worktree/reclaim.js';
 import { composeSystemPrompt, resolveTargetBranch } from './assignment-composition.js';
 import { cancelRunOnWorker, subscribeDispatchCancellations } from './dispatch-cancellation.js';
-import { awaitDispatchResult, type TransportInterruptions } from './dispatch-results.js';
+import {
+	awaitDispatchResult,
+	awaitOrphanStopAnswer,
+	type TransportInterruptions,
+} from './dispatch-results.js';
 import {
 	endOrphanTrustAtClaim,
 	endOrphanTrustUnlessRetryPending,
@@ -136,6 +140,14 @@ import { pushPendingWorkerUpdate } from './worker-update-dispatch.js';
  * the worker reconnects (the durable lease reconciler is the backstop either way).
  */
 const RESULT_WAIT_MARGIN_MS = 10 * 60 * 1000;
+
+/**
+ * How long a retry going back to the worker its earlier attempt was orphaned on waits
+ * for that worker to answer the attempt's stop (issue #1076). A connected worker
+ * answers as soon as the agent is aborted, or at once for a phase it no longer runs;
+ * one that stays silent this long defers the retry instead.
+ */
+const ORPHAN_STOP_ANSWER_TIMEOUT_MS = 2 * 60 * 1000;
 
 /** The default agent wall-clock timeout, resolved once (validates the env var at load). */
 const DEFAULT_PHASE_TIMEOUT_MS = resolveAgentTimeoutMs();
@@ -714,9 +726,9 @@ export async function resolveOperatorCredential(
  *
  * Two additions serve the transport-loss recovery (issue #1076). A dispatch carrying
  * an adopted late result pushes nothing: the phase already ran on the lost worker, so
- * that result is adapted as if it had just arrived. And every push first ends the
- * trusted window of the dispatch's orphans, so an earlier attempt still running on a
- * lost worker is stopped before its retry starts.
+ * that result is adapted as if it had just arrived. And a push back to the worker an
+ * earlier attempt was orphaned on first waits for that worker to answer the stop the
+ * claim sent it, so the answer cannot settle the retry's own wait.
  */
 async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseRunResult> {
 	const { trigger, project, resolution, job, runId, signal, implementationUnplanned, dispatch } =
@@ -789,10 +801,25 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 		operatorCredential,
 	});
 
-	// This push takes the dispatch over from any earlier attempt its worker was lost
-	// under (issue #1076): that orphan is no longer trusted to finish, so it is told to
-	// stop now if connected and fenced from here on. Before the registration below, so
-	// the stop and the new wait can never be confused on the orphan's own worker.
+	// The claim already stopped any earlier attempt this dispatch's worker was lost
+	// under (issue #1076). Going back to that same worker, the retry first waits for
+	// its answer to the stop: that frame carries this dispatch id from this worker, so
+	// once the registration below exists it would settle the new wait. A worker that
+	// stays silent defers the retry rather than risk it.
+	if (
+		!(await awaitOrphanStopAnswer(
+			dispatch.id,
+			selection.workerId,
+			ORPHAN_STOP_ANSWER_TIMEOUT_MS,
+			signal,
+		))
+	) {
+		throw new DeliveryDeferredError(
+			`Worker '${selection.workerName}' has not yet answered the stop of this dispatch's earlier attempt — deferring its retry`,
+		);
+	}
+	// Re-asserted at the push, before the registration: any orphan the claim left
+	// trusted loses its trust now.
 	stopOrphansOfDispatch(dispatch.id, selection.workerId);
 
 	// Register the result wait *before* pushing so a fast worker's ack/progress/
@@ -892,12 +919,11 @@ export function createControlPlaneDispatchDeps(): ProcessJobDeps {
 
 /**
  * Run one wake-up through `processJob`, bracketing the dispatch it claims with the
- * end of its orphans' trusted window (issue #1076): at the claim, an orphan whose
- * worker is gone is fenced ({@link endOrphanTrustAtClaim}); once the job is over, any
- * orphan still trusted is stopped unless the dispatch is again waiting for a
- * transport-lost retry ({@link endOrphanTrustUnlessRetryPending}). Between the two
- * the push takes the rest over. Keyed on the dispatch the job actually claimed, so a
- * refused wake-up never ends a trust that is still owed.
+ * end of its orphans' trusted window (issue #1076): at the claim, every orphan is
+ * fenced and stopped ({@link endOrphanTrustAtClaim}); once the job is over, any orphan
+ * still trusted is stopped unless the dispatch is again waiting for a transport-lost
+ * retry ({@link endOrphanTrustUnlessRetryPending}). Keyed on the dispatch the job
+ * actually claimed, so a refused wake-up never ends a trust that is still owed.
  */
 export async function processControlPlaneJob(
 	job: SwarmJob,

@@ -549,25 +549,38 @@ describe('a phase reaped on transport loss that finishes on its reconnected work
 		deregisterConnection(WORKER_ID, returned);
 	});
 
-	it('leaves a connected orphan to the claim’s push, and stops it when the claim defers without one', async () => {
+	// The re-review of #1078: a connected orphan used to be left trusted from the claim
+	// until the push or the job's end, so a retry that deferred before pushing left its
+	// board writes served in between, with nothing left to settle its result.
+	it('stops and fences a connected orphan at the claim, before the retry can defer without a push', async () => {
 		await reaped();
 		const returned = fakeWs();
 		registerConnection(WORKER_ID, returned);
 
-		// Claimed while the worker is back: the push may yet go to that same worker, so
-		// the claim neither stops nor fences it.
+		// 21:16:31Z — the retry is claimed while the worker is back with Planning still
+		// running. The stop goes out at once, and every board write is refused from now.
 		endOrphanTrustAtClaim(DISPATCH_ID);
-		expect(returned.send).not.toHaveBeenCalled();
-		expect(isDispatchOrphanedFrom(WORKER_ID, DISPATCH_ID)).toBe(false);
-
-		// The claim defers instead (the task is in flight): the stop goes out at once.
-		getDispatchById.mockResolvedValue(scheduledRetry({ waitReason: 'task-in-flight' }));
-		await endOrphanTrustUnlessRetryPending(DISPATCH_ID);
 		expect(JSON.parse(String(returned.send.mock.calls[0][0]))).toMatchObject({
 			type: 'task-cancel',
 			dispatchId: DISPATCH_ID,
+			runId: RUN_ID,
+			phase: 'planning',
+			taskId: '568',
 		});
-		expect(isDispatchOrphanedFrom(WORKER_ID, DISPATCH_ID)).toBe(true);
+		const board = boardSpies();
+		expect(await planningDelivery(deliveryDeps(board))).toEqual([409, 409, 409, 409, 409, 409]);
+		for (const write of Object.values(board)) expect(write).not.toHaveBeenCalled();
+
+		// Its late success, arriving while the claimed job is still resolving its task,
+		// is neither adopted nor allowed to settle anything.
+		expect(frameFrom(WORKER_ID, LATE_SUCCESS)).toBe(false);
+		await vi.advanceTimersByTimeAsync(0);
+		expect(adoptLateResultIntoScheduledRetry).not.toHaveBeenCalled();
+
+		// The claim then defers (the task is in flight): there is nothing left to stop.
+		getDispatchById.mockResolvedValue(scheduledRetry({ waitReason: 'task-in-flight' }));
+		await endOrphanTrustUnlessRetryPending(DISPATCH_ID);
+		expect(returned.send).toHaveBeenCalledTimes(1);
 		deregisterConnection(WORKER_ID, returned);
 	});
 
