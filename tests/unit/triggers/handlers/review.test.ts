@@ -225,6 +225,7 @@ function ctx(
 		ciNoFixRecovery?: boolean;
 		noteDecline?: (decline: TriggerDecline) => void;
 		runId?: string;
+		project?: ProjectConfig;
 	} = {},
 ): TriggerContext {
 	return createMockScmTriggerContext({
@@ -1561,6 +1562,108 @@ describe('review trigger — durable trace when a review is abandoned (issue #74
 });
 
 /**
+ * How long Review waits for a head's CI is per project (issue #1083). The
+ * `state-pending` cap is derived from `pipeline.review.checksWaitMinutes` at the
+ * fixed 30 s cadence — 10 minutes (20 attempts) when unset — and only that budget
+ * moves with it: the `read-failed` one (#720) stays fixed.
+ */
+describe('review trigger — per-project CI wait (issue #1083)', () => {
+	const checks = { kind: 'checks', action: 'completed', workItemId: '9' } as const;
+	/** 20 minutes buys 40 rechecks at 30 s. */
+	const LONG_WAIT = createMockProjectConfig({ pipeline: { review: { checksWaitMinutes: 20 } } });
+	const stillRunning = () =>
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'in_progress', null]]));
+
+	it('keeps waiting past the default cap on a project with a longer wait', async () => {
+		stillRunning();
+		const noteDecline = vi.fn();
+
+		expect(
+			await handler.handle(
+				ctx(
+					{ ...checks, headSha: 'cafe' },
+					{ recheckAttempt: 20, project: LONG_WAIT, noteDecline },
+				),
+			),
+		).toBeNull();
+
+		expect(scheduleCoalescedJob).toHaveBeenCalledOnce();
+		const [job, , delayMs] = scheduleCoalescedJob.mock.calls[0];
+		expect(job).toMatchObject({ recheckAttempt: 21 });
+		expect(delayMs).toBe(30_000);
+		expect(createFailedRun).not.toHaveBeenCalled();
+		expect((noteDecline.mock.calls[0][0] as TriggerDecline).reason).toContain('attempt 21 of 40');
+	});
+
+	it('gives up at its own cap, naming the setting as the lever', async () => {
+		stillRunning();
+
+		expect(
+			await handler.handle(
+				ctx({ ...checks, headSha: 'cafe' }, { recheckAttempt: 40, project: LONG_WAIT }),
+			),
+		).toBeNull();
+
+		expect(scheduleCoalescedJob).not.toHaveBeenCalled();
+		expect(createFailedRun).toHaveBeenCalledOnce();
+		const { error } = createFailedRun.mock.calls[0][0];
+		expect(error).toContain('state-pending');
+		expect(error).toContain('40/40 attempts');
+		expect(error).toContain('`pipeline.review.checksWaitMinutes`');
+		expect(error).toContain('20 minutes');
+	});
+
+	it('names the default wait on a give-up when the project sets nothing', async () => {
+		stillRunning();
+
+		await handler.handle(ctx({ ...checks, headSha: 'cafe' }, { recheckAttempt: 20 }));
+
+		const { error } = createFailedRun.mock.calls[0][0];
+		expect(error).toContain('20/20 attempts');
+		expect(error).toContain('`pipeline.review.checksWaitMinutes`');
+		expect(error).toContain('10 minutes');
+	});
+
+	it('bounds the mergeability wait too — the two share one budget', async () => {
+		getPullRequest.mockResolvedValue({
+			number: 9,
+			headBranch: 'issue-9',
+			headSha: 'cafe',
+			baseBranch: 'main',
+			baseSha: 'base-sha-123',
+			mergeable: null,
+			authorLogin: 'operator-human',
+			state: 'open',
+		});
+
+		await handler.handle(
+			ctx({ ...checks, headSha: 'cafe' }, { recheckAttempt: 20, project: LONG_WAIT }),
+		);
+
+		expect(scheduleCoalescedJob).toHaveBeenCalledOnce();
+		expect(scheduleCoalescedJob.mock.calls[0][0]).toMatchObject({ recheckAttempt: 21 });
+		expect(createFailedRun).not.toHaveBeenCalled();
+	});
+
+	it('leaves the read-failed budget and its backoff unchanged', async () => {
+		getAggregateCheckStatus.mockRejectedValue(new Error('502 Bad Gateway'));
+
+		await handler.handle(
+			ctx({ ...checks, headSha: 'cafe' }, { readFailureRecheckAttempt: 2, project: LONG_WAIT }),
+		);
+		expect(scheduleCoalescedJob.mock.calls[0][2]).toBe(120_000);
+
+		await handler.handle(
+			ctx({ ...checks, headSha: 'cafe' }, { readFailureRecheckAttempt: 15, project: LONG_WAIT }),
+		);
+		expect(createFailedRun).toHaveBeenCalledOnce();
+		const { error } = createFailedRun.mock.calls[0][0];
+		expect(error).toContain('15/15 attempts');
+		expect(error).not.toContain('checksWaitMinutes');
+	});
+});
+
+/**
  * A retry that meets a defer is a wait, and says what for (issue #1049).
  *
  * The observed case: a PR touching only paths every CI workflow `paths-ignore`s
@@ -1615,6 +1718,8 @@ describe('review trigger — a retry that meets a defer names its wait (issue #1
 		expect(reason).toContain('still running: test');
 		expect(reason).toContain('attempt 5 of 20');
 		expect(reason).not.toContain('if-present');
+		// The CI-wait lever belongs to the give-up record only (issue #1083).
+		expect(reason).not.toContain('checksWaitMinutes');
 	});
 
 	it('names an unknown mergeability on the mergeability recheck', async () => {
@@ -1671,6 +1776,8 @@ describe('review trigger — a retry that meets a defer names its wait (issue #1
 
 			expect(createFailedRun).toHaveBeenCalledOnce();
 			expect(createFailedRun.mock.calls[0][0].error).toContain('`if-present`');
+			// Raising the wait cannot help a head no workflow runs on (issue #1083).
+			expect(createFailedRun.mock.calls[0][0].error).not.toContain('checksWaitMinutes');
 		});
 
 		/** Only the named phase's task has a run waiting; the other has none. */

@@ -136,9 +136,9 @@ describe('scheduleCiNoFixRecovery', () => {
 	});
 
 	// A recovery that has to wait out a lagging checks/mergeability read re-enters
-	// the handler on the `state-pending` recheck cadence (20 × 30s), carrying the
-	// marker — and so still reusing this claim. A TTL shorter than that chain would
-	// hand the slot back to a delayed sibling mid-wait.
+	// the handler on the `state-pending` recheck cadence (20 × 30s by default),
+	// carrying the marker — and so still reusing this claim. A TTL shorter than that
+	// chain would hand the slot back to a delayed sibling mid-wait.
 	it("holds the claim long enough to outlast the handler's state-pending recheck chain", async () => {
 		refreshReviewDispatchClaim.mockClear();
 
@@ -146,6 +146,19 @@ describe('scheduleCiNoFixRecovery', () => {
 
 		const [, ttlSec] = refreshReviewDispatchClaim.mock.calls[0] as [string, number];
 		expect(ttlSec).toBeGreaterThan((20 * 30_000) / 1000);
+		expect(ttlSec).toBe(12 * 60);
+	});
+
+	// Issue #1083: a project that raises its CI wait lengthens that chain, so the
+	// claim must follow it rather than lapse at the default's 12 minutes.
+	it("follows a project's longer CI wait", async () => {
+		refreshReviewDispatchClaim.mockClear();
+		const project = createMockProjectConfig({ pipeline: { review: { checksWaitMinutes: 30 } } });
+
+		await scheduleCiNoFixRecovery({ ...input, project });
+
+		const [, ttlSec] = refreshReviewDispatchClaim.mock.calls[0] as [string, number];
+		expect(ttlSec).toBeGreaterThan(30 * 60);
 	});
 
 	it('re-enqueuing the same (project, PR, head) reuses the same dedup identity — the dispatch layer absorbs the repeat', async () => {
