@@ -910,6 +910,16 @@ describe('ProjectRecordSchema', () => {
 		});
 	});
 
+	it.each([1, 15, 120])('accepts a review CI wait of %i minutes', (checksWaitMinutes) => {
+		expect(PipelineConfigSchema.parse({ review: { checksWaitMinutes } })).toMatchObject({
+			review: { checksWaitMinutes },
+		});
+	});
+
+	it.each([0, -1, 121, 1.5])('rejects a review CI wait of %d minutes', (checksWaitMinutes) => {
+		expect(PipelineConfigSchema.safeParse({ review: { checksWaitMinutes } }).success).toBe(false);
+	});
+
 	it('limits per-phase timeouts to five through forty-five minutes', () => {
 		expect(() => AgentConfigSchema.parse({ timeoutMs: 5 * 60 * 1000 })).not.toThrow();
 		expect(() => AgentConfigSchema.parse({ timeoutMs: 45 * 60 * 1000 })).not.toThrow();

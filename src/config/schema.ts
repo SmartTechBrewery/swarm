@@ -507,6 +507,14 @@ export const PipelineBaseSchema = z.object({
 			enabled: z.boolean().optional(),
 			/** See {@link ReviewChecksPolicySchema}. Unset defaults to `required`. */
 			checks: ReviewChecksPolicySchema.optional(),
+			/**
+			 * How long Review waits for a head to reach a final state — every check
+			 * complete, `mergeable` computed — before giving up on that head's recheck
+			 * chain (issue #1083). Minutes, 1–120; unset defaults to
+			 * `DEFAULT_CHECKS_WAIT_MINUTES` (10, `src/triggers/review-checks-wait.ts`).
+			 * Bounds the `state-pending` budget only; the `read-failed` one (#720) is fixed.
+			 */
+			checksWaitMinutes: z.number().int().min(1).max(120).optional(),
 		})
 		.optional(),
 	respondToReview: z

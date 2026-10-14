@@ -53,7 +53,9 @@
  *    still `null`. Guards the case where the provider's checks API lags webhook
  *    delivery (the suite reports complete over the webhook, but a query moments
  *    later still shows it running, and no further webhook will arrive to wake
- *    us). Fixed ~30s cadence, capped by `recheckAttempt`/{@link MAX_CHECK_RECHECKS}.
+ *    us). Fixed ~30s cadence, capped by `recheckAttempt`/`stateRecheckCap` — the
+ *    project's `pipeline.review.checksWaitMinutes` (default 10 min → 20 attempts,
+ *    issue #1083; `../review-checks-wait.ts`).
  *  - `read-failed` — the read never answered at all: the provider threw (a
  *    transient checks-API error, a 5xx/rate-limit, an unresolvable reviewer
  *    token) or the run-history lookup threw. Degrading to a defer keeps the
@@ -203,6 +205,11 @@ import {
 	MAX_FIX_ATTEMPTS,
 } from '../respond-to-ci-attempts.js';
 import {
+	RECHECK_DELAY_MS,
+	resolveChecksWaitMinutes,
+	stateRecheckCap,
+} from '../review-checks-wait.js';
+import {
 	buildReviewDispatchKey,
 	claimReviewDispatch,
 	refreshReviewDispatchClaim,
@@ -258,30 +265,12 @@ function isDispositionDisabled(
 	return false;
 }
 
-/** How long to wait before re-querying check state when the checks API looks stale. */
-const RECHECK_DELAY_MS = 30_000;
-
-/**
- * Cap on deferred rechecks per job for a `state-pending` defer — the provider
- * answered, its answer is not final yet. ~10 min of checks-API lag at
- * {@link RECHECK_DELAY_MS}, well beyond any real lag.
- *
- * Past it a *webhook-driven* review is re-triggered anyway by the fresh `checks`
- * webhook every completing suite emits, so there the cap only stops a
- * pathological self-reschedule loop. That argument does **not** cover the
- * synthetic follow-up Review a `fixed` Respond-to-review enqueues
- * (`src/pipeline/follow-up-review.ts`, issue #241): SWARM enqueues that one
- * itself and no later webhook is guaranteed, so exhausting this budget there
- * does drop a legitimate review. Which is exactly why a *failed read* no longer
- * spends it (issue #720) — it draws on {@link MAX_READ_FAILURE_RECHECKS}.
- */
-const MAX_CHECK_RECHECKS = 20;
-
 /**
  * Cap on deferred rechecks per job for a `read-failed` defer — the read never
  * answered (issue #720). Its own budget, so a source-control outage can no
- * longer draw down the CI-lag allowance above: on PR #694 seventeen of twenty
- * attempts went to a DNS failure and the follow-up Review was dropped with it.
+ * longer draw down the CI wait (`stateRecheckCap`, `../review-checks-wait.ts`):
+ * on PR #694 seventeen of twenty attempts went to a DNS failure and the
+ * follow-up Review was dropped with it.
  * Still bounded — a provider that never comes back must wind down to one warn
  * rather than reschedule forever.
  */
@@ -335,6 +324,12 @@ interface RecheckWait {
 	 * nothing will ever satisfy ends up.
 	 */
 	lever?: string;
+	/**
+	 * Named only in the give-up record: the lever for a wait that ends by itself but
+	 * outlasted this project's budget (issue #1083) — never in the in-flight reason,
+	 * which needs no advice while the checks are still running.
+	 */
+	exhaustedLever?: string;
 }
 
 /**
@@ -569,7 +564,7 @@ async function scheduleReviewRecheck(
 	const checkAttempt = ctx.recheckAttempt ?? 0;
 	const readFailureAttempt = ctx.readFailureRecheckAttempt ?? 0;
 	const attemptsSpent = readFailed ? readFailureAttempt : checkAttempt;
-	const cap = readFailed ? MAX_READ_FAILURE_RECHECKS : MAX_CHECK_RECHECKS;
+	const cap = readFailed ? MAX_READ_FAILURE_RECHECKS : stateRecheckCap(ctx.project);
 	if (attemptsSpent >= cap) {
 		logger.warn('review: giving up on deferred recheck (cap reached)', {
 			budget,
@@ -591,7 +586,7 @@ async function scheduleReviewRecheck(
 			attemptsSpent,
 			cap,
 			details,
-			wait.lever,
+			[wait.lever, wait.exhaustedLever].filter(Boolean).join(' ') || undefined,
 		);
 		return false;
 	}
@@ -699,13 +694,20 @@ async function scheduleCheckRecheck(
  * That is the case the operator holds the lever for, so it is named outright.
  */
 function aggregateCheckWait(
+	project: ProjectConfig,
 	prNumber: string,
 	headSha: string,
 	incompleteChecks: string[],
 ): RecheckWait {
 	const subject = `checks on pull request #${prNumber} at head '${headSha}'`;
 	if (incompleteChecks.length > 0) {
-		return { waitingFor: `${subject} to finish (still running: ${incompleteChecks.join(', ')})` };
+		return {
+			waitingFor: `${subject} to finish (still running: ${incompleteChecks.join(', ')})`,
+			exhaustedLever:
+				`Checks were still running when this project's CI wait ran out ` +
+				`(${resolveChecksWaitMinutes(project)} minutes, \`pipeline.review.checksWaitMinutes\`) — ` +
+				"raise it if this project's CI routinely takes longer.",
+		};
 	}
 	return {
 		waitingFor: `${subject}: none are registered on this head yet`,
@@ -868,7 +870,7 @@ async function resolveAggregateCheckReview(
 		prNumber,
 		headSha,
 		{ incompleteChecks: decision.incompleteChecks },
-		aggregateCheckWait(prNumber, headSha, decision.incompleteChecks),
+		aggregateCheckWait(ctx.project, prNumber, headSha, decision.incompleteChecks),
 	);
 }
 

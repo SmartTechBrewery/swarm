@@ -47,22 +47,29 @@ import type { ProjectConfig } from '../config/schema.js';
 import { requireProjectSCMProvider } from '../integrations/scm/registry.js';
 import { deliveryIdentity } from '../scm/delivery.js';
 import type { ScmEvent } from '../scm/events.js';
+import { resolveChecksWaitMinutes } from '../triggers/review-checks-wait.js';
 import {
 	buildReviewDispatchKey,
 	refreshReviewDispatchClaim,
 } from '../triggers/review-dispatch-dedup.js';
 import { createAndPublishDispatch, deliveryDedupKey } from './dispatcher.js';
 
+/** Slack on top of the `state-pending` chain in {@link recoveryClaimTtlSec}. */
+const RECOVERY_CLAIM_MARGIN_SEC = 2 * 60;
+
 /**
  * TTL the PR+SHA dispatch claim is re-established for while a recovery is in
  * flight — long enough to outlast the `pr-review` handler's own `state-pending`
- * recheck chain (`MAX_CHECK_RECHECKS` × `RECHECK_DELAY_MS` = 20 × 30s,
- * `src/triggers/handlers/review.ts`) plus margin, so a recovery that has to wait
- * out a lagging checks or mergeability read still holds the slot when it finally
- * decides. Sized here rather than imported from the handler to keep this
- * composition-root module off that module's graph.
+ * recheck chain (the project's `pipeline.review.checksWaitMinutes`, default 10
+ * minutes, issue #1083) plus margin, so a recovery that has to wait out a
+ * still-running checks or mergeability read still holds the slot when it
+ * finally decides. Derived from the leaf `review-checks-wait.ts` rather than
+ * imported from the handler to keep this composition-root module off that
+ * module's graph. Exported for tests.
  */
-const RECOVERY_CLAIM_TTL_SEC = 12 * 60;
+export function recoveryClaimTtlSec(project: ProjectConfig): number {
+	return resolveChecksWaitMinutes(project) * 60 + RECOVERY_CLAIM_MARGIN_SEC;
+}
 
 export interface CiNoFixRecoveryInput {
 	project: ProjectConfig;
@@ -137,7 +144,7 @@ export async function scheduleCiNoFixRecovery({
 }: CiNoFixRecoveryInput): Promise<void> {
 	await refreshReviewDispatchClaim(
 		buildReviewDispatchKey(project.repo, prNumber, headSha),
-		RECOVERY_CLAIM_TTL_SEC,
+		recoveryClaimTtlSec(project),
 	);
 
 	const provider = requireProjectSCMProvider(project);
