@@ -1149,6 +1149,21 @@ export type FindWorkItemForArtifactDeliveryRequest = z.infer<
 >;
 
 /**
+ * The repository a split child's backing artifact belongs in (issue #1085) —
+ * `owner/repo`, exactly as the assignment's scoped `projectConfig.repo` names it,
+ * which is the repository of the item being split. Carried by the two frames that
+ * create and re-find a child (`create-item`, `find-item-by-marker`), so on a
+ * multi-repository project the child lands beside its parent rather than in the
+ * project's default (first) entry; the server refuses one the project does not own.
+ *
+ * Optional because the provider contract's own field is (`CreateWorkItemInput.repository`,
+ * `../pm/types.ts`) and because a worker predating #1085 omits it — which keeps that
+ * worker's behaviour exactly what it was, the default entry, rather than failing its
+ * Planning run. No protocol bump, on the run-scoped `repository`'s precedent.
+ */
+const PmItemRepositorySchema = z.string().min(1).optional();
+
+/**
  * `POST /worker/delivery/pm/find-item-by-marker` request body — resolve the single
  * board card whose `description` contains `marker` (issue #543). The read that makes
  * Planning's split **resumable**: each child is created carrying a marker keyed on
@@ -1168,6 +1183,8 @@ export const FindWorkItemByMarkerDeliveryRequestSchema = z.object({
 	dispatchId: DeliveryDispatchIdSchema,
 	/** Unique substring identifying at most one card (`PMProvider.findWorkItemByDescriptionMarker`). */
 	marker: z.string().min(1),
+	/** Where to look — the repository the card was created in ({@link PmItemRepositorySchema}). */
+	repository: PmItemRepositorySchema,
 	protocolVersion: z.number().int(),
 });
 export type FindWorkItemByMarkerDeliveryRequest = z.infer<
@@ -1266,6 +1283,8 @@ export const CreateWorkItemDeliveryRequestSchema = z.object({
 	/** Canonical SWARM pipeline status key (`PmStatusKey`), never a board option ID. */
 	status: z.string().min(1),
 	labels: z.array(z.string().min(1)).optional(),
+	/** Where to create the card's backing artifact ({@link PmItemRepositorySchema}). */
+	repository: PmItemRepositorySchema,
 	protocolVersion: z.number().int(),
 });
 export type CreateWorkItemDeliveryRequest = z.infer<typeof CreateWorkItemDeliveryRequestSchema>;

@@ -685,9 +685,13 @@ export class GitHubProjectsPMProvider implements PMProvider {
 		return this.resolveArtifactItem(artifact);
 	}
 
-	async findWorkItemByDescriptionMarker(marker: string): Promise<WorkItem | undefined> {
+	async findWorkItemByDescriptionMarker(
+		marker: string,
+		repository: string = this.project.repo,
+	): Promise<WorkItem | undefined> {
 		// Two narrow reads instead of a whole board (issue #735): the newest issues of
-		// this project's repository, then the matched issue's own card.
+		// the repository the caller created its card in, then the matched issue's own
+		// card.
 		//
 		// Deliberately **not** GitHub's issue search API, which is an
 		// eventually-consistent index: the caller asking is Planning's retried split,
@@ -697,11 +701,12 @@ export class GitHubProjectsPMProvider implements PMProvider {
 		// what it costs instead is the {@link RECENT_ISSUE_WINDOW} bound, which the
 		// split's own children are never near.
 		//
-		// It reaches the project's repository rather than the board, so a marker on a
-		// draft card, on a pull request, or on an issue from another repository is not
-		// found. Every one of those is outside what `createWorkItem` can produce, and
-		// this lookup exists to recognise what `createWorkItem` produced.
-		const slug = splitRepositorySlug(this.project.repo);
+		// It reaches one repository rather than the board, so a marker on a draft card,
+		// on a pull request, or on an issue from any other repository is not found.
+		// Every one of those is outside what `createWorkItem` can produce *for the same
+		// `repository`* — which is why the caller passes the one it created in (issue
+		// #1085) — and this lookup exists to recognise what `createWorkItem` produced.
+		const slug = splitRepositorySlug(repository);
 		if (!slug) return undefined;
 		const number = await this.run(async () => {
 			const data = await this.readOrMiss<RecentIssueBodiesResponse>(RECENT_ISSUE_BODIES_QUERY, {
@@ -711,7 +716,7 @@ export class GitHubProjectsPMProvider implements PMProvider {
 			const nodes = data?.repository?.issues?.nodes ?? [];
 			if (nodes.length >= RECENT_ISSUE_WINDOW) {
 				logger.debug('pm: marker lookup read a full window of recent issues', {
-					repository: this.project.repo,
+					repository,
 					window: RECENT_ISSUE_WINDOW,
 				});
 			}
@@ -720,7 +725,7 @@ export class GitHubProjectsPMProvider implements PMProvider {
 		});
 		if (number === undefined) return undefined;
 		return this.resolveArtifactItem({
-			repository: this.project.repo,
+			repository,
 			kind: 'issue',
 			number: String(number),
 		});
@@ -912,7 +917,15 @@ export class GitHubProjectsPMProvider implements PMProvider {
 	}
 
 	async createWorkItem(input: CreateWorkItemInput): Promise<WorkItem> {
-		const [owner, repo] = this.project.repo.split('/');
+		// The caller's repository when it names one — a split child belongs beside its
+		// parent, which on a multi-repository project need not be this provider's
+		// scoped default entry (issue #1085).
+		const repository = input.repository ?? this.project.repo;
+		const slug = splitRepositorySlug(repository);
+		if (!slug) {
+			throw new Error(`Cannot create item: '${repository}' is not an owner/name repository`);
+		}
+		const { owner, name: repo } = slug;
 		const { projectId, statusFieldId, statusOptions } = this.config;
 		const optionId = statusOptions[input.status];
 		if (!optionId) {
@@ -964,13 +977,12 @@ export class GitHubProjectsPMProvider implements PMProvider {
 				description: issue.body ?? '',
 				url: issue.html_url,
 				// The Issue this card was just created around is its SCM artifact, in the
-				// repository it was just created in — which is this provider's scoped one
-				// because that is where `issues.create` above addressed it, not because a
-				// scoped repo is assumed to be a card's repo (issue #710). Planning's split
-				// children belong beside their parent, and the parent card's repository is
-				// what the job was scoped to.
+				// repository it was just created in — because that is where `issues.create`
+				// above addressed it, not because a scoped repo is assumed to be a card's
+				// repo (issue #710). Planning's split children belong beside their parent,
+				// so the split names the parent's repository (issue #1085).
 				taskRef: String(issue.number),
-				taskRepository: this.project.repo,
+				taskRepository: repository,
 				statusId: optionId,
 				// The caller named the canonical key, and `optionId` is its resolution —
 				// carry it back so the fresh item reads like one off a board read.

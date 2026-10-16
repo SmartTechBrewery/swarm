@@ -266,6 +266,20 @@ export interface CreateWorkItemInput {
 	status: string;
 	/** Label names to apply to the new item's backing Issue at creation. */
 	labels?: string[];
+	/**
+	 * The repository (`owner/name`, as the project's own config spells it) the new
+	 * item's backing artifact belongs in. Planning's split fills it with the
+	 * repository of the item being split, so on a multi-repository project a child
+	 * lands beside its parent rather than in the project's default entry (issue
+	 * #1085). Omitted, a provider creates where it always has — its own scoped
+	 * `ProjectConfig.repo`.
+	 *
+	 * A provider whose items have no backing repository (Linear, Jira, Trello)
+	 * ignores it. Deciding that the project owns the repository is the caller's job,
+	 * as it is for {@link WorkItem.taskRepository}: the control plane refuses a
+	 * worker naming one the project does not (`src/router/worker-delivery.ts`).
+	 */
+	repository?: string;
 }
 
 /** A patch of mutable work-item fields for {@link PMProvider.updateWorkItem}. */
@@ -533,8 +547,18 @@ export interface PMProvider {
 	 * it creates with one keyed on the delivery and the child's index, so a retried
 	 * delivery recognises the child it already created instead of spawning a second
 	 * one (`applySplit`, `src/pipeline/planning.ts`).
+	 *
+	 * `repository` is where to look, and it is the same value the split passed to
+	 * {@link createWorkItem} as {@link CreateWorkItemInput.repository} — a child is
+	 * created beside its parent, so on a multi-repository project the guard has to
+	 * read *that* repository or it misses the child and makes a second one (issue
+	 * #1085). Omitted, a provider looks where it creates by default. A provider
+	 * whose items have no backing repository ignores it.
 	 */
-	findWorkItemByDescriptionMarker(marker: string): Promise<WorkItem | undefined>;
+	findWorkItemByDescriptionMarker(
+		marker: string,
+		repository?: string,
+	): Promise<WorkItem | undefined>;
 
 	/**
 	 * Move a work item to a new pipeline status. `status` is a canonical SWARM

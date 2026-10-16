@@ -308,7 +308,39 @@ describe('createWriteOnlyTransportPmProvider', () => {
 			.fn<FetchLike>()
 			.mockResolvedValue(jsonResponse(200, { item: { id: 'i', title: 't', url: 'u' } }));
 		await writeOnly(fetchImpl).createWorkItem({ title: 't', description: 'd', status: 'planning' });
-		expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).not.toHaveProperty('labels');
+		const body = JSON.parse(fetchImpl.mock.calls[0][1].body);
+		expect(body).not.toHaveProperty('labels');
+		expect(body).not.toHaveProperty('repository');
+	});
+
+	// A split child is created, and re-found on a retry, in its parent's repository —
+	// which the server must be told, since it scopes a board route to the project's
+	// default entry otherwise (issue #1085).
+	it("sends the split parent's repository on the create and on the resume lookup", async () => {
+		const fetchImpl = vi
+			.fn<FetchLike>()
+			.mockResolvedValue(jsonResponse(200, { item: { id: 'i', title: 't', url: 'u' } }));
+		const provider = writeOnly(fetchImpl);
+
+		await provider.findWorkItemByDescriptionMarker('marker', 'SmartTechBrewery/swarm-mobile');
+		await provider.createWorkItem({
+			title: 't',
+			description: 'd',
+			status: 'backlog',
+			repository: 'SmartTechBrewery/swarm-mobile',
+		});
+
+		expect(fetchImpl.mock.calls[0][0]).toBe(
+			'https://swarm.example/worker/delivery/pm/find-item-by-marker',
+		);
+		expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toMatchObject({
+			marker: 'marker',
+			repository: 'SmartTechBrewery/swarm-mobile',
+		});
+		expect(fetchImpl.mock.calls[1][0]).toBe('https://swarm.example/worker/delivery/pm/create-item');
+		expect(JSON.parse(fetchImpl.mock.calls[1][1].body)).toMatchObject({
+			repository: 'SmartTechBrewery/swarm-mobile',
+		});
 	});
 
 	it('sends only the patch fields a caller actually set, so an omitted field stays unchanged', async () => {

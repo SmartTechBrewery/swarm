@@ -234,11 +234,15 @@ export function createWriteOnlyTransportPmProvider(
 					return item ? hydrateWorkItem(item) : undefined;
 				},
 			),
-		findWorkItemByDescriptionMarker: (marker) =>
+		findWorkItemByDescriptionMarker: (marker, repository) =>
 			postDelivery(
 				options,
 				'/worker/delivery/pm/find-item-by-marker',
-				{ projectId: options.projectId, marker },
+				{
+					projectId: options.projectId,
+					marker,
+					...(repository !== undefined && { repository }),
+				},
 				// Same `null` → `undefined` mapping as the sibling card lookups: "no card
 				// carries that marker" is the answer the caller acts on by creating one.
 				(value) => {
@@ -280,6 +284,7 @@ export function createWriteOnlyTransportPmProvider(
 					description: input.description,
 					status: input.status,
 					...(input.labels !== undefined && { labels: input.labels }),
+					...(input.repository !== undefined && { repository: input.repository }),
 				},
 				(value) => hydrateWorkItem(CreateWorkItemDeliveryResponseSchema.parse(value).item),
 			),

@@ -496,6 +496,38 @@ async function authenticateRunDelivery(
 }
 
 /**
+ * The prelude for a **board** route that names the repository a card's backing
+ * artifact belongs in — Planning's split child, created and re-found beside the item
+ * it was split from (issue #1085). A named repository the project does not own is
+ * refused (403), exactly as on a run-scoped route, since the provider would otherwise
+ * create an issue wherever the board credential can write; the project is then scoped
+ * to it, so the provider and the repository it is handed agree.
+ *
+ * Naming none is {@link authenticateDelivery} unchanged — the default entry — and,
+ * unlike {@link authenticateRunDelivery}, not a refusal on a multi-repository
+ * project: the default entry is the provider contract's own answer for an unnamed
+ * repository (`CreateWorkItemInput.repository`, `../pm/types.ts`), and refusing would
+ * fail a worker predating #1085 on every split, including the primary repository's.
+ */
+async function authenticateItemRepositoryDelivery(
+	deps: WorkerDeliveryDeps,
+	credential: string | undefined,
+	request: RunDeliveryRequest,
+): Promise<{ worker: Worker; project: ProjectConfig } | DeliveryResult> {
+	const authed = await authenticateProject(deps, credential, request);
+	if ('status' in authed) return authed;
+	const { worker, record } = authed;
+	const { repository } = request;
+	if (repository === undefined) return { worker, project: scopeProjectToRepository(record) };
+	if (!findProjectRepository(record, repository))
+		return {
+			status: 403,
+			json: { reason: `project '${record.id}' does not own repository '${repository}'` },
+		};
+	return { worker, project: scopeProjectToRepository(record, repository) };
+}
+
+/**
  * Authenticate a delivery request that targets **no project** — the prelude for a
  * route whose subject is the worker itself rather than something it is enrolled
  * in. Returns the authenticated worker, or a {@link DeliveryResult} to return
@@ -803,7 +835,9 @@ function projectFoundWorkItem(item: WorkItem): FoundWorkItem {
  * narrow card projection as {@link handleFindWorkItem}: the match runs inside the
  * provider, so nothing here knows how a provider stores a description, and
  * `item: null` is the ordinary "no card carries that marker" answer the caller acts
- * on by creating one.
+ * on by creating one. It looks in the repository the request names — the one
+ * {@link handleCreateWorkItem} created the child in — under the same ownership check
+ * ({@link authenticateItemRepositoryDelivery}, issue #1085).
  */
 export async function handleFindWorkItemByMarker(
 	deps: WorkerDeliveryDeps,
@@ -818,11 +852,11 @@ export async function handleFindWorkItemByMarker(
 			status: 400,
 			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
 		};
-	const authed = await authenticateDelivery(deps, credential, request);
+	const authed = await authenticateItemRepositoryDelivery(deps, credential, request);
 	if ('status' in authed) return authed;
 	const item = await deps
 		.buildPmProvider(authed.project)
-		.findWorkItemByDescriptionMarker(request.marker);
+		.findWorkItemByDescriptionMarker(request.marker, request.repository);
 	return { status: 200, json: { item: item ? projectFoundWorkItem(item) : null } };
 }
 
@@ -897,6 +931,11 @@ export async function handleFindPmComment(
  * a board option id and to provider label objects stays inside the adapter
  * (ai/RULES.md §2). The created card comes back on the same narrow frame the
  * lookups use, which is all Planning reads off a fresh sibling.
+ *
+ * The repository the request names — the split parent's — is where the backing
+ * artifact is created, and is held to the same rule as the board: a worker cannot
+ * mint an issue in a repository its project does not own
+ * ({@link authenticateItemRepositoryDelivery}, issue #1085).
  */
 export async function handleCreateWorkItem(
 	deps: WorkerDeliveryDeps,
@@ -913,7 +952,7 @@ export async function handleCreateWorkItem(
 			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
 		};
 
-	const authed = await authenticateDelivery(deps, credential, request);
+	const authed = await authenticateItemRepositoryDelivery(deps, credential, request);
 	if ('status' in authed) return authed;
 
 	const pm = deps.buildPmProvider(authed.project);
@@ -922,6 +961,7 @@ export async function handleCreateWorkItem(
 		description: request.description,
 		status: request.status,
 		...(request.labels !== undefined && { labels: request.labels }),
+		...(request.repository !== undefined && { repository: request.repository }),
 	});
 	return { status: 200, json: { item: projectFoundWorkItem(item) } };
 }
