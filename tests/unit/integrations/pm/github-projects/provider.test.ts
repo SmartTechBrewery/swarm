@@ -763,6 +763,30 @@ describe('GitHubProjectsPMProvider', () => {
 				expect(graphql).toHaveBeenCalledTimes(1);
 			});
 
+			// A split child is created beside its parent, which on a multi-repository
+			// project is not this provider's scoped repository — so the retry has to look
+			// where the first attempt created, or it duplicates the child (issue #1085).
+			it('reads the repository it is given, not its own scoped one', async () => {
+				graphql
+					.mockResolvedValueOnce({
+						repository: { issues: { nodes: [{ number: 7, body: `Phase 2.\n\n${MARKER}` }] } },
+					})
+					.mockResolvedValueOnce(artifactItems('Issue', [ON_THIS_BOARD]));
+
+				await expect(
+					provider.findWorkItemByDescriptionMarker(MARKER, 'SmartTechBrewery/swarm-mobile'),
+				).resolves.toMatchObject({ id: 'PVTI_x' });
+				expect(graphql).toHaveBeenNthCalledWith(1, expect.stringContaining('CREATED_AT'), {
+					owner: 'SmartTechBrewery',
+					name: 'swarm-mobile',
+				});
+				expect(graphql).toHaveBeenNthCalledWith(2, expect.anything(), {
+					owner: 'SmartTechBrewery',
+					name: 'swarm-mobile',
+					number: 7,
+				});
+			});
+
 			// Deliberately the strongly consistent listing, not `search`: Planning's
 			// retried split has to find a child created seconds ago.
 			it('reads a listing rather than the search index', async () => {
@@ -1064,6 +1088,70 @@ describe('GitHubProjectsPMProvider', () => {
 					name: 'swarm:split-child',
 				}),
 			);
+		});
+
+		// A split of an item from a project's non-default repository names that
+		// repository, and the child is created there rather than in the provider's
+		// scoped default entry (issue #1085) — labels, board, status as usual.
+		it('creates the Issue in the repository it is given', async () => {
+			getLabel.mockResolvedValue({ data: {} });
+			createIssue.mockResolvedValue({
+				data: {
+					node_id: 'I_mobile',
+					number: 8,
+					title: 'Phase 2',
+					body: 'Second half',
+					html_url: 'https://github.com/SmartTechBrewery/swarm-mobile/issues/8',
+					labels: [{ id: 1, name: 'swarm', color: 'ededed' }],
+				},
+			});
+			graphql
+				.mockResolvedValueOnce({ addProjectV2ItemById: { item: { id: 'PVTI_mobile' } } })
+				.mockResolvedValueOnce({});
+
+			const created = await provider.createWorkItem({
+				title: 'Phase 2',
+				description: 'Second half',
+				status: 'backlog',
+				labels: ['swarm'],
+				repository: 'SmartTechBrewery/swarm-mobile',
+			});
+
+			expect(getLabel).toHaveBeenCalledWith({
+				owner: 'SmartTechBrewery',
+				repo: 'swarm-mobile',
+				name: 'swarm',
+			});
+			expect(createIssue).toHaveBeenCalledWith(
+				expect.objectContaining({ owner: 'SmartTechBrewery', repo: 'swarm-mobile' }),
+			);
+			expect(graphql).toHaveBeenNthCalledWith(1, expect.stringContaining('addProjectV2ItemById'), {
+				projectId: PROJECT_PM.projectId,
+				contentId: 'I_mobile',
+			});
+			expect(graphql).toHaveBeenNthCalledWith(
+				2,
+				expect.stringContaining('updateProjectV2ItemFieldValue'),
+				expect.objectContaining({ itemId: 'PVTI_mobile' }),
+			);
+			expect(created).toMatchObject({
+				id: 'PVTI_mobile',
+				taskRef: '8',
+				taskRepository: 'SmartTechBrewery/swarm-mobile',
+			});
+		});
+
+		it('refuses a repository that is not owner/name without creating anything', async () => {
+			await expect(
+				provider.createWorkItem({
+					title: 'T',
+					description: '',
+					status: 'planning',
+					repository: 'not-a-slug',
+				}),
+			).rejects.toThrow("'not-a-slug' is not an owner/name repository");
+			expect(createIssue).not.toHaveBeenCalled();
+			expect(graphql).not.toHaveBeenCalled();
 		});
 
 		it('throws for a status with no option mapping without creating anything', async () => {

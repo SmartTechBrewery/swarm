@@ -77,7 +77,11 @@ import type {
 } from '@/pm/types.js';
 import { isSwarmGeneratedBody } from '@/scm/swarm-origin.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
-import { createMockProjectConfig, createMockWorkItem } from '../../helpers/factories.js';
+import {
+	createMockProjectConfig,
+	createMockProjectRepositoryPair,
+	createMockWorkItem,
+} from '../../helpers/factories.js';
 
 /**
  * Build a split-child work item whose issue body carries a valid preplanned
@@ -173,9 +177,9 @@ function makeDeps() {
 			async () => undefined,
 		),
 		findWorkItemForArtifact: vi.fn(async () => undefined),
-		findWorkItemByDescriptionMarker: vi.fn<(marker: string) => Promise<WorkItem | undefined>>(
-			async () => undefined,
-		),
+		findWorkItemByDescriptionMarker: vi.fn<
+			(marker: string, repository?: string) => Promise<WorkItem | undefined>
+		>(async () => undefined),
 		addComment: vi.fn<(id: string, text: string) => Promise<string>>(async () => 'comment-1'),
 		findComment: vi.fn<(id: string, marker: string) => Promise<string | undefined>>(
 			async () => undefined,
@@ -2309,6 +2313,143 @@ describe('runPlanningPhase', () => {
 				PVTI_dep: ['PVTI_child1', 'PVTI_child2', 'PVTI_item18'],
 			});
 			expect(snapshot(retriedBoard)).toEqual(snapshot(cleanBoard));
+		});
+	});
+
+	/**
+	 * A split of an item from a multi-repository project's non-default repository
+	 * creates its children in that repository, not the project's first entry (issue
+	 * #1085) — and a retried delivery re-finds them there.
+	 */
+	describe('a split creates its children in the parent’s repository (issue #1085)', () => {
+		const [PLATFORM, MOBILE] = createMockProjectRepositoryPair([
+			'SmartTechBrewery/under-control-platform',
+			'SmartTechBrewery/under-control-mobile',
+		]);
+
+		beforeEach(() => {
+			splitExists = true;
+			splitContents = JSON.stringify({
+				sharedName: SHARED_NAME,
+				mainTask: { title: 'First slice', description: 'Shared module' },
+				subTasks: [
+					{ title: 'Second slice', description: 'Android', plan: '# Plan 2\n\nBuild it.' },
+					{ title: 'Third slice', description: 'iOS', plan: '# Plan 3\n\nShip it.' },
+				],
+			});
+		});
+
+		/**
+		 * A provider whose cards live in repositories: created where the input names
+		 * (else the provider's default entry, as GitHub Projects does), and found by
+		 * marker only in the repository asked about.
+		 */
+		function repositoryBoard(deps: ReturnType<typeof makeDeps>, items: WorkItem[]) {
+			deps.pm.createWorkItem.mockImplementation(async (input) => {
+				const id = `PVTI_child${items.length + 1}`;
+				const item = createMockWorkItem({
+					id,
+					title: input.title,
+					description: input.description,
+					url: `https://example.test/${id}`,
+					taskRepository: input.repository ?? PLATFORM.repo,
+				});
+				items.push(item);
+				return item;
+			});
+			deps.pm.findWorkItemByDescriptionMarker.mockImplementation(async (marker, repository) =>
+				items.find(
+					(item) =>
+						item.taskRepository === (repository ?? PLATFORM.repo) &&
+						item.description.includes(marker),
+				),
+			);
+			return deps;
+		}
+
+		it('creates every child of a non-default repository’s item in that repository, wired as usual', async () => {
+			const items: WorkItem[] = [];
+			const deps = repositoryBoard(makeDeps(), items);
+
+			await runPlanningPhase({ ...deps, project: MOBILE, runId: 'run-A' });
+
+			expect(deps.pm.createWorkItem).toHaveBeenCalledTimes(2);
+			for (const call of deps.pm.createWorkItem.mock.calls) {
+				expect(call[0]).toMatchObject({
+					repository: MOBILE.repo,
+					status: 'backlog',
+					labels: ['swarm', SPLIT_CHILD_LABEL],
+				});
+			}
+			expect(items.map((item) => item.taskRepository)).toEqual([MOBILE.repo, MOBILE.repo]);
+			// The replay guard looked where the children are created.
+			for (const call of deps.pm.findWorkItemByDescriptionMarker.mock.calls) {
+				expect(call[1]).toBe(MOBILE.repo);
+			}
+			// Placed in their starting status, labelled planned, and chained behind
+			// their predecessors exactly as a single-repository split is.
+			expect(deps.pm.moveWorkItem).toHaveBeenCalledWith('PVTI_child1', 'planning');
+			expect(deps.pm.moveWorkItem).toHaveBeenCalledWith('PVTI_child2', 'planning');
+			expect(deps.pm.addLabel).toHaveBeenCalledWith('PVTI_child1', PLANNED_LABEL);
+			expect(deps.pm.addBlockedBy).toHaveBeenCalledWith('PVTI_child1', 'PVTI_item18');
+			expect(deps.pm.addBlockedBy).toHaveBeenCalledWith('PVTI_child2', 'PVTI_item18');
+			expect(deps.pm.addBlockedBy).toHaveBeenCalledWith('PVTI_child2', 'PVTI_child1');
+		});
+
+		it('keeps creating children in the default repository for its own items', async () => {
+			const items: WorkItem[] = [];
+			const deps = repositoryBoard(makeDeps(), items);
+
+			await runPlanningPhase({ ...deps, project: PLATFORM, runId: 'run-A' });
+
+			for (const call of deps.pm.createWorkItem.mock.calls) {
+				expect(call[0].repository).toBe(PLATFORM.repo);
+			}
+			expect(items.map((item) => item.taskRepository)).toEqual([PLATFORM.repo, PLATFORM.repo]);
+		});
+
+		it('re-finds a child it already created in that repository instead of duplicating it', async () => {
+			const items: WorkItem[] = [];
+			const first = repositoryBoard(makeDeps(), items);
+			const create = first.pm.createWorkItem.getMockImplementation();
+			let calls = 0;
+			first.pm.createWorkItem.mockImplementation(async (input) => {
+				calls += 1;
+				if (calls === 2) throw new Error('create-item failed: 502');
+				return create?.(input) as ReturnType<NonNullable<typeof create>>;
+			});
+			await expect(runPlanningPhase({ ...first, project: MOBILE, runId: 'run-A' })).rejects.toThrow(
+				'create-item failed: 502',
+			);
+			expect(items).toHaveLength(1);
+
+			const retry = repositoryBoard(makeDeps(), items);
+			await runPlanningPhase({ ...retry, project: MOBILE, runId: 'run-A' });
+
+			// Phase 2 was adopted from the mobile repository; only phase 3 was created.
+			expect(retry.pm.createWorkItem).toHaveBeenCalledTimes(1);
+			expect(items.map((item) => item.title)).toEqual([
+				splitTitle(2, 3, 'Second slice'),
+				splitTitle(3, 3, 'Third slice'),
+			]);
+			expect(items.map((item) => item.taskRepository)).toEqual([MOBILE.repo, MOBILE.repo]);
+		});
+
+		it('recovers advanced children from that repository when the split was already applied', async () => {
+			const deps = makeDeps();
+			// This delivery already posted its plan comment, so the split is skipped and
+			// only the children it advanced are recovered (issue #911).
+			deps.pm.findComment.mockImplementation(async (itemId, marker) =>
+				itemId === 'PVTI_item18' && marker.includes('run-A') ? 'existing-comment' : undefined,
+			);
+
+			await runPlanningPhase({ ...deps, project: MOBILE, runId: 'run-A', autoAdvance: true });
+
+			expect(deps.pm.createWorkItem).not.toHaveBeenCalled();
+			expect(deps.pm.findWorkItemByDescriptionMarker).toHaveBeenCalledWith(
+				splitChildMarker('run-A', 0),
+				MOBILE.repo,
+			);
 		});
 	});
 

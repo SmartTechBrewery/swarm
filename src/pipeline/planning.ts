@@ -965,6 +965,12 @@ function readPlanOrThrow(
  * The board *writes* keep their order exactly (issues #431, #436, #536); the only new
  * call is the lookup that precedes each creation.
  *
+ * **Children are created in the parent's repository (issue #1085).** `repository` is
+ * the run's scoped `project.repo` — the repository the parent's artifact lives in, and
+ * the one this plan was written against — and both the creation and the marker lookup
+ * are handed it. Left to the provider's default, a multi-repository project filed every
+ * child in its first entry, where Implementation then checked out the wrong codebase.
+ *
  * **Guard 3 — the outward direction (issue #890).** {@link linkBlockedBy} is only the
  * *inward* half of the split's dependency wiring: it chains the phases behind each
  * other and looks no further than the cards this split just made. An item entering
@@ -1005,6 +1011,7 @@ async function applySplit(
 	automationLabel: string | undefined,
 	deliveryId: string | undefined,
 	autoAdvance: boolean,
+	repository: string,
 ): Promise<{ subTaskItemIds: string[]; mainTaskUpdated: boolean; advancedItemIds: string[] }> {
 	// One shared name for the whole split, applied to the original and every child
 	// (issue #594), so the phases of one issue are recognisable as a set on the board.
@@ -1054,6 +1061,7 @@ async function applySplit(
 			labels: childLabels,
 			deliveryId,
 			autoAdvance,
+			repository,
 		});
 		subTaskItemIds.push(sibling.id);
 		if (advanced) advancedItemIds.push(sibling.id);
@@ -1093,6 +1101,8 @@ interface SpawnSplitChildOptions {
 	 * {@link NEXT_STATUS} with the source task ({@link advanceSplitChild}, issue #911).
 	 */
 	autoAdvance: boolean;
+	/** The repository every child is created in — the parent's ({@link acquireSplitChild}). */
+	repository: string;
 }
 
 /**
@@ -1125,6 +1135,7 @@ async function spawnSplitChild(
 		labels,
 		deliveryId,
 		autoAdvance,
+		repository,
 	} = options;
 	// Only a delivery with an identity can be replayed, so only one stamps its
 	// children — and `description` is the human description *plus* that stamp, the
@@ -1138,6 +1149,7 @@ async function spawnSplitChild(
 		labels,
 		parentId: parent.id,
 		childIndex,
+		repository,
 	});
 	let prepared = false;
 	let preplanPublished = false;
@@ -1220,6 +1232,12 @@ interface AcquireSplitChildOptions {
 	labels: readonly string[];
 	parentId: string;
 	childIndex: number;
+	/**
+	 * The repository the child belongs in: the run's own scoped `project.repo`, which is
+	 * the parent's (issue #1085). Both the lookup and the creation are given it, so the
+	 * retry looks where the first attempt created.
+	 */
+	repository: string;
 }
 
 /**
@@ -1251,9 +1269,9 @@ async function acquireSplitChild(
 	pm: PMProvider,
 	options: AcquireSplitChildOptions,
 ): Promise<{ sibling: WorkItem; resumed: boolean }> {
-	const { marker, title, description, labels, parentId, childIndex } = options;
+	const { marker, title, description, labels, parentId, childIndex, repository } = options;
 	if (marker) {
-		const existing = await pm.findWorkItemByDescriptionMarker(marker);
+		const existing = await pm.findWorkItemByDescriptionMarker(marker, repository);
 		if (existing) {
 			logger.info('Planning — resuming a split child this delivery already created', {
 				parentId,
@@ -1275,6 +1293,10 @@ async function acquireSplitChild(
 		// PLANNED_LABEL is applied by the caller, once the child really holds its plan
 		// (issue #436) and before the move that dispatches on it (issue #737).
 		labels: [...labels],
+		// Beside its parent, not in whatever repository the provider defaults to: on a
+		// multi-repository project those differ, and a child filed in the wrong one is
+		// implemented against the wrong codebase (issue #1085).
+		repository,
 	});
 	return { sibling, resumed: false };
 }
@@ -1464,11 +1486,16 @@ async function advanceSplitChild(
  * complete answer — a partial success here is indistinguishable, to the worker, from a
  * split whose later children were never advanced.
  */
-async function recoverAdvancedSplitChildren(pm: PMProvider, deliveryId: string): Promise<string[]> {
+async function recoverAdvancedSplitChildren(
+	pm: PMProvider,
+	deliveryId: string,
+	repository: string,
+): Promise<string[]> {
 	const advancedItemIds: string[] = [];
 	for (let childIndex = 0; childIndex < MAX_SPLIT_CHILDREN; childIndex++) {
 		const child = await pm.findWorkItemByDescriptionMarker(
 			splitChildMarker(deliveryId, childIndex),
+			repository,
 		);
 		// Children are created in order with dense indices, so the first gap is the end
 		// of the split — and a delivery that never split has no child `0` to find, which
@@ -1482,7 +1509,12 @@ async function recoverAdvancedSplitChildren(pm: PMProvider, deliveryId: string):
 	// past the cap. One extra lookup — reached only by a split of exactly the maximum
 	// size, which is to say never in practice — separates "the largest legal split,
 	// completely recovered" from "a split this build's contract says cannot exist".
-	if (await pm.findWorkItemByDescriptionMarker(splitChildMarker(deliveryId, MAX_SPLIT_CHILDREN))) {
+	if (
+		await pm.findWorkItemByDescriptionMarker(
+			splitChildMarker(deliveryId, MAX_SPLIT_CHILDREN),
+			repository,
+		)
+	) {
 		throw new Error(
 			`Planning delivery ${deliveryId} has more than ${MAX_SPLIT_CHILDREN} split children; ` +
 				`cannot recover which of them were advanced without leaving one parked in "${NEXT_STATUS}".`,
@@ -2328,7 +2360,7 @@ async function applySplitOrRecoverAdvanced(options: ApplySplitOrRecoverAdvancedO
 			splitResult: undefined,
 			recoveredItemIds:
 				effectiveAutoAdvance && deliveryId
-					? await recoverAdvancedSplitChildren(pm, deliveryId)
+					? await recoverAdvancedSplitChildren(pm, deliveryId, project.repo)
 					: undefined,
 		};
 	}
@@ -2344,6 +2376,11 @@ async function applySplitOrRecoverAdvanced(options: ApplySplitOrRecoverAdvancedO
 				// The same auto-advance policy the source task's move obeys, applied to
 				// every child the split prepared (issue #911).
 				effectiveAutoAdvance,
+				// The run's own repository, which is the parent's: Planning is dispatched
+				// only for a card whose artifact is in the repository the run is scoped to
+				// (`resolveTaskIdForItem`, `../triggers/handlers/pm-status.ts`), and spelled
+				// as the project config names it (issue #1085).
+				project.repo,
 			)
 		: undefined;
 	return {

@@ -1064,7 +1064,8 @@ describe('handleFindWorkItemByMarker', () => {
 		});
 
 		expect(result.status).toBe(200);
-		expect(findWorkItemByDescriptionMarker).toHaveBeenCalledWith(MARKER);
+		// No repository named, so none is passed: the provider looks in its default.
+		expect(findWorkItemByDescriptionMarker).toHaveBeenCalledWith(MARKER, undefined);
 		// The description the marker was matched on is deliberately not sent back.
 		expect(result.json).toMatchObject({ item: { id: 'ITEM_61' } });
 		expect((result.json as { item: Record<string, unknown> }).item).not.toHaveProperty(
@@ -2096,6 +2097,111 @@ describe("run-scoped routes act on the run's repository (issue #1055)", () => {
 		const result = await handleMoveWorkItem(deps, CREDENTIAL, moveBody());
 
 		expect(result.status).toBe(200);
+		expect(buildPmProvider).toHaveBeenCalledWith(
+			expect.objectContaining({ id: 'swarm', repo: DEFAULT_REPO }),
+		);
+	});
+});
+
+/**
+ * Planning's split child is created — and re-found on a retried delivery — in the
+ * repository of the item it was split from, which the worker names (issue #1085).
+ */
+describe("split-child routes act on the parent's repository (issue #1085)", () => {
+	beforeEach(() => vi.clearAllMocks());
+
+	const DEFAULT_REPO = 'SmartTechBrewery/swarm';
+	const MOBILE_REPO = 'SmartTechBrewery/swarm-mobile';
+	const MARKER = '<!-- swarm-split-child:run-1:0 -->';
+
+	/** Deps whose project `swarm` owns two repositories, the default one first. */
+	function twoRepoDeps(overrides: Partial<WorkerDeliveryDeps> = {}): WorkerDeliveryDeps {
+		const record = createMockProjectRecord({
+			repositories: [{ repo: DEFAULT_REPO }, { repo: MOBILE_REPO }],
+		});
+		return makeDeps({
+			findProjectRecordById: vi.fn(async (id: string) => (id === record.id ? record : undefined)),
+			...overrides,
+		});
+	}
+
+	const createBody = (overrides: Record<string, unknown> = {}) => ({
+		projectId: 'swarm',
+		title: 'Phase 2 of 2',
+		description: `child body\n\n${MARKER}`,
+		status: 'backlog',
+		protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		...overrides,
+	});
+	const markerBody = (overrides: Record<string, unknown> = {}) => ({
+		projectId: 'swarm',
+		marker: MARKER,
+		protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+		...overrides,
+	});
+
+	it('creates the child in the named non-default repository', async () => {
+		const createWorkItem = vi.fn().mockResolvedValue(createMockWorkItem({ id: 'ITEM_8' }));
+		const buildPmProvider = vi.fn(() => makePmProvider({ createWorkItem }));
+		const deps = twoRepoDeps({ buildPmProvider });
+
+		const result = await handleCreateWorkItem(
+			deps,
+			CREDENTIAL,
+			createBody({ repository: MOBILE_REPO }),
+		);
+
+		expect(result.status).toBe(200);
+		expect(createWorkItem).toHaveBeenCalledWith(
+			expect.objectContaining({ repository: MOBILE_REPO }),
+		);
+		expect(buildPmProvider).toHaveBeenCalledWith(
+			expect.objectContaining({ id: 'swarm', repo: MOBILE_REPO }),
+		);
+	});
+
+	it('re-finds the child in the named non-default repository', async () => {
+		const findWorkItemByDescriptionMarker = vi
+			.fn()
+			.mockResolvedValue(createMockWorkItem({ id: 'ITEM_8' }));
+		const deps = twoRepoDeps({
+			buildPmProvider: vi.fn(() => makePmProvider({ findWorkItemByDescriptionMarker })),
+		});
+
+		const result = await handleFindWorkItemByMarker(
+			deps,
+			CREDENTIAL,
+			markerBody({ repository: MOBILE_REPO }),
+		);
+
+		expect(result).toMatchObject({ status: 200, json: { item: { id: 'ITEM_8' } } });
+		expect(findWorkItemByDescriptionMarker).toHaveBeenCalledWith(MARKER, MOBILE_REPO);
+	});
+
+	it.each([
+		['create-item', handleCreateWorkItem, createBody],
+		['find-item-by-marker', handleFindWorkItemByMarker, markerBody],
+	] as const)('%s refuses a repository the project does not own, touching nothing', async (_route, handle, body) => {
+		const deps = twoRepoDeps();
+
+		const result = await handle(deps, CREDENTIAL, body({ repository: 'acme/elsewhere' }));
+
+		expect(result.status).toBe(403);
+		expect(result.json.reason).toMatch(/does not own repository 'acme\/elsewhere'/);
+		expect(deps.buildPmProvider).not.toHaveBeenCalled();
+	});
+
+	// A worker predating #1085 names none; it keeps the default entry rather than
+	// failing every split, the primary repository's included.
+	it('keeps the default entry when no repository is named', async () => {
+		const createWorkItem = vi.fn().mockResolvedValue(createMockWorkItem());
+		const buildPmProvider = vi.fn(() => makePmProvider({ createWorkItem }));
+		const deps = twoRepoDeps({ buildPmProvider });
+
+		const result = await handleCreateWorkItem(deps, CREDENTIAL, createBody());
+
+		expect(result.status).toBe(200);
+		expect(createWorkItem.mock.calls[0]?.[0]).not.toHaveProperty('repository');
 		expect(buildPmProvider).toHaveBeenCalledWith(
 			expect.objectContaining({ id: 'swarm', repo: DEFAULT_REPO }),
 		);
