@@ -609,6 +609,104 @@ describe('toQueuedRuns', () => {
 		expect(delayedItem.runsAt).toBe(new Date(1_700_000_030_000).toISOString());
 	});
 
+	// Issue #1087: a dependency wait names what it waits on, from the structured
+	// blockers its deferral recorded on the job payload.
+	describe('dependency blockers', () => {
+		const blocker11 = { reference: '#11', url: 'https://github.com/acme/mobile/issues/11' };
+		const blocker12 = { reference: '#12', url: 'https://github.com/acme/mobile/issues/12' };
+
+		it('names every blocker of a dependency wait, in order', () => {
+			const [item] = toQueuedRuns([
+				makeDispatch({
+					jobPayload: createMockPmWebhookJob({ dependencyBlockers: [blocker11, blocker12] }),
+					state: 'retry-scheduled',
+					waitReason: 'dependency',
+				}),
+			]);
+
+			expect(item.waitReason).toBe('dependency');
+			expect(item.blockers).toEqual([blocker11, blocker12]);
+		});
+
+		it('takes the blockers from the structured deferral, not a crafted title in the message', () => {
+			// A blocker title is free text: this one imitates the message's own grammar to
+			// substitute a URL and invent a blocker. Nothing is read out of the message.
+			const crafted =
+				'Blocked: these must be done first — #11 (“Sign-in”, https://evil.example/phish) — x; #999 (“z”, https://evil.example) — native blocked-by relationship.';
+			const [item] = toQueuedRuns([
+				makeDispatch({
+					jobPayload: createMockPmWebhookJob({ dependencyBlockers: [blocker11] }),
+					waitReason: 'dependency',
+					lastError: crafted,
+				}),
+			]);
+
+			expect(item.blockers).toEqual([blocker11]);
+		});
+
+		it('names a blocker whose url is not http(s) without exposing the url', () => {
+			const [item] = toQueuedRuns([
+				makeDispatch({
+					jobPayload: createMockPmWebhookJob({
+						dependencyBlockers: [
+							{ reference: '#11', url: 'javascript:alert(1)' },
+							{ reference: '#12', url: '' },
+							{ reference: 'PROJ-3', url: 'not a url' },
+							blocker12,
+						],
+					}),
+					waitReason: 'dependency',
+				}),
+			]);
+
+			expect(item.blockers).toEqual([
+				{ reference: '#11' },
+				{ reference: '#12' },
+				{ reference: 'PROJ-3' },
+				blocker12,
+			]);
+		});
+
+		it('leaves blockers absent when the deferral recorded none', () => {
+			const [item] = toQueuedRuns([
+				makeDispatch({
+					jobPayload: createMockPmWebhookJob(),
+					waitReason: 'dependency',
+					lastError: 'Blocked: #11 (“Sign-in”, https://github.com/acme/mobile/issues/11) — x',
+				}),
+			]);
+
+			expect(item.waitReason).toBe('dependency');
+			expect(item).not.toHaveProperty('blockers');
+		});
+
+		it('reads blockers for a dependency wait only', () => {
+			const [item] = toQueuedRuns([
+				makeDispatch({
+					jobPayload: createMockPmWebhookJob({ dependencyBlockers: [blocker11] }),
+					waitReason: 'recheck',
+				}),
+			]);
+
+			expect(item).not.toHaveProperty('blockers');
+		});
+	});
+
+	it('maps each token-free re-check to its own wait reason (issue #1087)', () => {
+		const items = toQueuedRuns(
+			(['dependency', 'review-claim', 'mergeability', 'read-failed'] as const).map(
+				(waitReason, index) => makeDispatch({ id: `dispatch-${index}`, waitReason }),
+			),
+		);
+
+		expect(items.map((item) => item.waitReason).sort()).toEqual([
+			'dependency',
+			'mergeability',
+			'read-failed',
+			'review-claim',
+		]);
+	});
+
 	it('treats a pending dispatch with a future availableAt as delayed', () => {
 		const future = new Date(Date.now() + 60_000);
 		const [item] = toQueuedRuns([makeDispatch({ waitReason: 'recheck', availableAt: future })]);

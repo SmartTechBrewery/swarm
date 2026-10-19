@@ -115,7 +115,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 		});
 
 		it('a superseded holder does not refuse the coalesced replacement that took its place', async () => {
-			await scheduleCoalescedDispatch(job({ recheckAttempt: 1 }), COALESCE_KEY, 0);
+			await scheduleCoalescedDispatch(job({ recheckAttempt: 1 }), COALESCE_KEY, 0, null);
 			const holder = await waitingOnCoalesceKey();
 			await claimAndDeferForWorker(holder);
 
@@ -125,7 +125,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 			expect(await claimConflictResolution(STATE_KEY, sibling.id)).toBe(false);
 
 			// Another merge into the base fans out again and supersedes the holder.
-			await scheduleCoalescedDispatch(job({ recheckAttempt: 1 }), COALESCE_KEY, 0);
+			await scheduleCoalescedDispatch(job({ recheckAttempt: 1 }), COALESCE_KEY, 0, null);
 			expect(await getDispatchById(holder.id)).toMatchObject({
 				state: 'completed',
 				outcome: 'superseded',
@@ -156,10 +156,10 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 		});
 
 		it('lets exactly one of two checks take over from an ended holder', async () => {
-			await scheduleCoalescedDispatch(job(), COALESCE_KEY, 0);
+			await scheduleCoalescedDispatch(job(), COALESCE_KEY, 0, null);
 			const holder = await waitingOnCoalesceKey();
 			await claimAndDeferForWorker(holder);
-			await scheduleCoalescedDispatch(job(), COALESCE_KEY, 0);
+			await scheduleCoalescedDispatch(job(), COALESCE_KEY, 0, null);
 
 			const a = await otherDispatch();
 			const b = await otherDispatch();

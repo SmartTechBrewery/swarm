@@ -57,6 +57,11 @@ export interface DeferredRetryIntent {
 	 */
 	dependencyRecheck?: boolean;
 	/**
+	 * The prerequisites a {@link dependencyRecheck} deferral waits on (issue #1087),
+	 * recorded on the payload as {@link SwarmJob.dependencyBlockers}.
+	 */
+	dependencyBlockers?: NonNullable<SwarmJob['dependencyBlockers']>;
+	/**
 	 * This is a worker-eligibility re-check deferral (issue #339), not an agent
 	 * failure: no eligible worker could take the dispatch, so it consumes the
 	 * separate {@link SwarmJob.workerEligibilityRecheckAttempt} budget while it
@@ -145,7 +150,23 @@ function pmIntentPatch(
 	return { resumePmPhase: intent.phase };
 }
 
+/**
+ * The blockers a dependency deferral records on the payload (issue #1087), so the
+ * Queue can name and link them without parsing the gate's free-text message.
+ */
+function dependencyBlockersPatch(
+	intent: DeferredRetryIntent,
+): Pick<SwarmJob, 'dependencyBlockers'> {
+	return intent.dependencyRecheck && intent.dependencyBlockers
+		? { dependencyBlockers: intent.dependencyBlockers }
+		: {};
+}
+
 export function deriveRetryJobPayload(parsed: SwarmJob, intent: DeferredRetryIntent): SwarmJob {
+	// The blockers a dependency wait names (issue #1087) describe the deferral that
+	// recorded them, so they are dropped here and re-recorded only when this deferral
+	// is itself a dependency wait.
+	const { dependencyBlockers: _priorBlockers, ...carried } = parsed;
 	// A **token-free re-check** deferral (issue #330's dependency gate, issue #339's
 	// eligibility gate) is not a retry of an attempt — it is the *same* attempt still
 	// waiting. Both gates run before any worktree is provisioned or any agent is
@@ -158,8 +179,9 @@ export function deriveRetryJobPayload(parsed: SwarmJob, intent: DeferredRetryInt
 	// verbatim instead; only the wait's own bookkeeping changes.
 	if (intent.dependencyRecheck || intent.workerEligibilityRecheck) {
 		return {
-			...parsed,
+			...carried,
 			...attemptCounterPatch(parsed, intent),
+			...dependencyBlockersPatch(intent),
 			...(intent.runId ? { runId: intent.runId } : {}),
 			...pmIntentPatch(parsed, intent, parsed.resumePmPhase),
 			...(intent.continuationDispatchClaimed ? { continuationDispatchClaimed: true } : {}),
@@ -172,7 +194,7 @@ export function deriveRetryJobPayload(parsed: SwarmJob, intent: DeferredRetryInt
 		recoveryMode,
 		agentSessionId: priorSessionId,
 		...job
-	} = parsed;
+	} = carried;
 	return {
 		...job,
 		...(recoveryMode && recoveryMode !== 'checkpoint' && recoveryMode !== 'discard'

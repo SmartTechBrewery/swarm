@@ -11,7 +11,7 @@ import {
 	noTriggerGroupLabel,
 	queuedPhaseLabel,
 	queuedRunKey,
-	queuedWaitReasonLabel,
+	queuedWaitLabelParts,
 	queuedWorkItemLabel,
 	queuedWorkItemTitle,
 	queuedWorkItemUrl,
@@ -125,16 +125,42 @@ function ContinuationBadge({ item }: { item: QueuedRun }) {
 	);
 }
 
-/** Enqueued / delayed / wait-reason text for one queued row, shared by both presentations. */
+/**
+ * Enqueued / delayed / wait-reason text for one queued row, shared by both
+ * presentations. A blocker a `dependency` wait names is linked (issue #1087), or
+ * shown as plain text when the server gave it no linkable URL.
+ */
 function QueuedEnqueuedContent({ item }: { item: QueuedRun }) {
+	const waitLabelParts = queuedWaitLabelParts(item);
 	return (
 		<>
 			{formatRelativeTime(item.enqueuedAt)}
 			{item.state === 'delayed' && item.runsAt && (
 				<span className="text-zinc-500"> · runs {formatTimeUntil(item.runsAt)}</span>
 			)}
-			{item.waitReason && (
-				<span className="text-zinc-500"> · {queuedWaitReasonLabel(item.waitReason)}</span>
+			{waitLabelParts && (
+				<span className="text-zinc-500">
+					{' · '}
+					{waitLabelParts.map((part) =>
+						typeof part === 'string' ? (
+							part
+						) : part.url ? (
+							<a
+								key={`${part.reference} ${part.url}`}
+								href={part.url}
+								target="_blank"
+								rel="noopener noreferrer"
+								className="font-mono hover:text-zinc-300 hover:underline"
+							>
+								{part.reference}
+							</a>
+						) : (
+							<span key={part.reference} className="font-mono">
+								{part.reference}
+							</span>
+						),
+					)}
+				</span>
 			)}
 		</>
 	);

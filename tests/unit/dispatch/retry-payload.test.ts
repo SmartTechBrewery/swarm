@@ -41,6 +41,53 @@ describe('deriveRetryJobPayload', () => {
 		expect(next).toMatchObject({ resumePmPhase: 'implementation', runId: 'run-1' });
 	});
 
+	// Issue #1087: the Queue names a dependency wait's blockers from this field, so it
+	// must describe the latest deferral — recorded by a dependency wait, dropped by any
+	// other.
+	describe('dependency blockers', () => {
+		const blockers = [{ reference: '#11', url: 'https://github.com/acme/mobile/issues/11' }];
+
+		it('records the blockers a dependency deferral waits on', () => {
+			const next = deriveRetryJobPayload(createMockPmWebhookJob(), {
+				phase: 'implementation',
+				resumable: false,
+				dependencyRecheck: true,
+				dependencyBlockers: blockers,
+			});
+
+			expect(next.dependencyBlockers).toEqual(blockers);
+		});
+
+		it('replaces the blockers an earlier dependency deferral recorded', () => {
+			const next = deriveRetryJobPayload(
+				createMockPmWebhookJob({
+					dependencyBlockers: [{ reference: '#9', url: 'https://github.com/acme/mobile/issues/9' }],
+				}),
+				{
+					phase: 'implementation',
+					resumable: false,
+					dependencyRecheck: true,
+					dependencyBlockers: blockers,
+				},
+			);
+
+			expect(next.dependencyBlockers).toEqual(blockers);
+		});
+
+		it.each([
+			['a worker-eligibility wait', { workerEligibilityRecheck: true }],
+			['a failure retry', {}],
+		] as const)('drops stale blockers on %s', (_label, flags) => {
+			const next = deriveRetryJobPayload(createMockPmWebhookJob({ dependencyBlockers: blockers }), {
+				phase: 'implementation',
+				resumable: false,
+				...flags,
+			});
+
+			expect(next).not.toHaveProperty('dependencyBlockers');
+		});
+	});
+
 	it('spends the worker-eligibility budget for a gate deferral, leaving the others alone', () => {
 		const next = deriveRetryJobPayload(
 			createMockPmWebhookJob({

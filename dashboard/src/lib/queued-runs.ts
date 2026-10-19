@@ -70,7 +70,20 @@ const QUEUED_WAIT_REASON_LABELS: Record<QueuedWaitReason, string> = {
 	// The lost worker came back and reported a late success before that retry was
 	// due (issue #1076): the run is being settled with it, not run again.
 	'late-result': 'settling with the late result of the lost worker',
+	// A wait on CI (issue #1087): merge automation retrying a pull request that is
+	// not ready, and the review gate re-checking a head whose checks are running.
+	// Each other token-free re-check below names its own wait, because this one sent
+	// operators looking at CI for runs waiting on something else entirely. (Merge
+	// automation's retry after a provider error still records it too — issue #923.)
 	recheck: 'waiting for checks to settle',
+	// The dependency gate. The row names its blockers when the server could read them
+	// (see `queuedWaitLabelParts`); this is the wording when it could not.
+	dependency: 'waiting for a blocking work item to be done',
+	// The holder may be another Review or merge automation's claim on an updated
+	// head, so it names the slot rather than guessing which.
+	'review-claim': 'waiting for another dispatch to release the review slot',
+	mergeability: "waiting for the pull request's mergeability to be computed",
+	'read-failed': 'retrying after a failed lookup',
 	// The two halves of the dispatch gate's wait, deliberately worded so an operator
 	// can tell them apart at a glance (issue #607): the first clears on its own once a
 	// machine is free, the second only when a human acts (grant sharing consent,
@@ -104,6 +117,39 @@ const QUEUED_WAIT_REASON_LABELS: Record<QueuedWaitReason, string> = {
 
 export function queuedWaitReasonLabel(reason: QueuedWaitReason): string {
 	return QUEUED_WAIT_REASON_LABELS[reason] ?? reason;
+}
+
+/** One blocker a `dependency` wait names. */
+export type QueuedBlocker = NonNullable<QueuedRun['blockers']>[number];
+
+/** A segment of a row's wait label: literal text, or a blocker to name and link. */
+export type QueuedWaitLabelPart = string | QueuedBlocker;
+
+/**
+ * A row's wait label in segments (issue #1087), or `undefined` for a row that
+ * recorded no reason. A `dependency` wait whose blockers the server could read
+ * names them — "waiting for #11 and #12 to be done" — with each blocker kept
+ * whole so the Queue can link it: a bare `#11` may belong to another repository
+ * than the row's. Every other row is its {@link queuedWaitReasonLabel}.
+ */
+export function queuedWaitLabelParts(item: QueuedRun): QueuedWaitLabelPart[] | undefined {
+	if (!item.waitReason) return undefined;
+	const blockers = item.waitReason === 'dependency' ? (item.blockers ?? []) : [];
+	if (blockers.length === 0) return [queuedWaitReasonLabel(item.waitReason)];
+	const parts: QueuedWaitLabelPart[] = ['waiting for '];
+	blockers.forEach((blocker, index) => {
+		if (index > 0) parts.push(index === blockers.length - 1 ? ' and ' : ', ');
+		parts.push(blocker);
+	});
+	parts.push(' to be done');
+	return parts;
+}
+
+/** {@link queuedWaitLabelParts} as plain text. */
+export function queuedWaitLabel(item: QueuedRun): string | undefined {
+	return queuedWaitLabelParts(item)
+		?.map((part) => (typeof part === 'string' ? part : part.reference))
+		.join('');
 }
 
 /**

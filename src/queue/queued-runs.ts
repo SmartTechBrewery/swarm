@@ -93,6 +93,10 @@ export const QueuedWaitReasonSchema = z.enum([
 	'transport-lost',
 	'late-result',
 	'recheck',
+	'dependency',
+	'review-claim',
+	'mergeability',
+	'read-failed',
 	'worker-eligibility',
 	'worker-authorization',
 	'worker-rate-limited',
@@ -157,6 +161,13 @@ export const QueuedRunSchema = z.object({
 	phaseHint: QueuedPhaseHintSchema,
 	/** Why this dispatch is waiting, when it recorded a reason. */
 	waitReason: QueuedWaitReasonSchema.optional(),
+	/**
+	 * A `dependency` wait only — the unfinished prerequisites it waits on, from the
+	 * deferral's own `dependencyBlockers` (issue #1087), so the Queue can name them.
+	 * `url` is present only when it is an `http:`/`https:` URL the Queue may link.
+	 * Absent when the deferral recorded none (a row written before the field existed).
+	 */
+	blockers: z.array(z.object({ reference: z.string(), url: z.string().optional() })).optional(),
 	/** The `runs` row this dispatch retries, when one exists (deferred runs). */
 	runId: z.string().optional(),
 	/** Deferred-retry attempt counter. */
@@ -304,6 +315,31 @@ export function deriveDispatchPhaseHint(dispatch: DispatchRow): QueuedPhaseHint 
 		: deriveQueuedPhaseHint(normalizeStoredJobPayload(dispatch.jobPayload));
 }
 
+/** `url` when it parses as an `http:`/`https:` URL, the only kind the Queue links. */
+function linkableUrl(url: string): string | undefined {
+	try {
+		const { protocol } = new URL(url);
+		return protocol === 'http:' || protocol === 'https:' ? url : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * The `blockers` field of a `dependency` wait (issue #1087), read from the
+ * structured blockers its deferral recorded — never parsed out of `last_error`,
+ * whose blocker titles are free text — or nothing for any other row.
+ */
+function dependencyBlockersFor(dispatch: DispatchRow, data: SwarmJob): Pick<QueuedRun, 'blockers'> {
+	if (dispatch.waitReason !== 'dependency' || !data.dependencyBlockers?.length) return {};
+	return {
+		blockers: data.dependencyBlockers.map(({ reference, url }) => {
+			const href = linkableUrl(url);
+			return href ? { reference, url: href } : { reference };
+		}),
+	};
+}
+
 function toQueuedRun(dispatch: DispatchRow, prioritizeContinuations: boolean): QueuedRun {
 	// A row written before issue #385/#297 still carries the legacy envelope, and the
 	// `jsonb` column is typed rather than validated — normalize before reading.
@@ -326,6 +362,7 @@ function toQueuedRun(dispatch: DispatchRow, prioritizeContinuations: boolean): Q
 		state,
 		phaseHint: deriveDispatchPhaseHint(dispatch),
 		waitReason: dispatch.waitReason ?? undefined,
+		...dependencyBlockersFor(dispatch, data),
 		runId: dispatch.runId ?? undefined,
 		attempt: dispatch.attempt,
 		priority: dispatch.priority,

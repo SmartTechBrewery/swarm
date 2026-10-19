@@ -281,13 +281,22 @@ const jobBase = z.object({
 	/**
 	 * How many times this job has been re-checked while waiting on an unfinished
 	 * dependency (issue #330): an Implementation whose work item is `blocked by` an
-	 * open prerequisite is deferred as a token-free `recheck` dispatch — no worktree,
+	 * open prerequisite is deferred as a token-free `dependency` dispatch — no worktree,
 	 * no agent — and re-evaluated on {@link DEPENDENCY_RECHECK_INTERVAL_MS}. Absent
 	 * on a fresh webhook; incremented on each dependency re-check so the consumer can
 	 * cap the wait (`MAX_DEPENDENCY_RECHECKS`) and finally fail with an actionable
 	 * "must be done first" message rather than polling forever.
 	 */
 	dependencyRecheckAttempt: z.number().int().nonnegative().optional(),
+	/**
+	 * The unfinished prerequisites the latest dependency re-check deferred on
+	 * (issue #1087), recorded by `deriveRetryJobPayload` so the Queue can name and
+	 * link them. Carried as data rather than read back out of the gate's "must be
+	 * done first" message, whose blocker titles are free text anyone able to edit a
+	 * blocking issue can shape. Dropped by every deferral that is not a dependency
+	 * wait.
+	 */
+	dependencyBlockers: z.array(z.object({ reference: z.string(), url: z.string() })).optional(),
 	/**
 	 * How many times this job has been re-checked while no eligible worker could
 	 * take it (issue #339): the federated dispatch gate

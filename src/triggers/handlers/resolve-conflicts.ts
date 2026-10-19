@@ -10,6 +10,7 @@
  * identity carries no signal under the federated model.
  */
 
+import type { DispatchWaitReason } from '../../db/repositories/dispatchesRepository.js';
 import { scheduleCoalescedDispatch } from '../../dispatch/dispatcher.js';
 import { logger } from '../../lib/logger.js';
 import type { ScmEvent } from '../../scm/events.js';
@@ -27,6 +28,7 @@ async function scheduleCandidate(
 	ctx: ScmTriggerContext,
 	prNumber: string,
 	delay: number,
+	waitReason: DispatchWaitReason | null,
 ): Promise<void> {
 	const event: ScmEvent = { ...ctx.event, conflictPrNumber: prNumber };
 	await scheduleCoalescedDispatch(
@@ -39,6 +41,7 @@ async function scheduleCandidate(
 		},
 		`resolve-conflicts:${ctx.project.repo}:${prNumber}:${ctx.event.baseBranch}`,
 		delay,
+		waitReason,
 	);
 }
 
@@ -121,7 +124,7 @@ async function checkCandidate(
 
 async function deferUnknownMergeability(ctx: ScmTriggerContext, prNumber: number): Promise<void> {
 	if ((ctx.recheckAttempt ?? 0) < MAX_RECHECKS) {
-		await scheduleCandidate(ctx, String(prNumber), RECHECK_DELAY_MS);
+		await scheduleCandidate(ctx, String(prNumber), RECHECK_DELAY_MS, 'mergeability');
 		return;
 	}
 	logger.warn('resolve-conflicts: mergeability remained unknown; manual intervention required', {
@@ -174,7 +177,8 @@ async function fanOutCandidates(
 	await Promise.all(
 		decided
 			.filter(({ decision }) => decision === 'error' || decision.managed)
-			.map(({ pr }) => scheduleCandidate(ctx, String(pr.number), 0)),
+			// Due now and waiting on nothing, so it records no wait reason.
+			.map(({ pr }) => scheduleCandidate(ctx, String(pr.number), 0, null)),
 	);
 }
 
@@ -188,7 +192,7 @@ async function fanOutCandidates(
  */
 async function deferUnresolvedOwnership(ctx: ScmTriggerContext, prNumber: number): Promise<void> {
 	if ((ctx.recheckAttempt ?? 0) < MAX_RECHECKS) {
-		await scheduleCandidate(ctx, String(prNumber), RECHECK_DELAY_MS);
+		await scheduleCandidate(ctx, String(prNumber), RECHECK_DELAY_MS, 'read-failed');
 		return;
 	}
 	logger.warn('resolve-conflicts: PR ownership stayed unresolved; giving up', {
