@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import type { DispatchRow } from '@/db/repositories/dispatchesRepository.js';
-import { blockedRunMessage } from '@/pm/dependencies.js';
 import type { SwarmJob } from '@/queue/jobs.js';
 import {
 	deriveDispatchPhaseHint,
@@ -610,60 +609,71 @@ describe('toQueuedRuns', () => {
 		expect(delayedItem.runsAt).toBe(new Date(1_700_000_030_000).toISOString());
 	});
 
-	// Issue #1087: a dependency wait names what it waits on, read out of the gate's own
-	// "must be done first" message — the only place the dispatch row records it.
+	// Issue #1087: a dependency wait names what it waits on, from the structured
+	// blockers its deferral recorded on the job payload.
 	describe('dependency blockers', () => {
-		const blockers = [
-			{
-				reference: '#11',
-				url: 'https://github.com/acme/mobile/issues/11',
-				title: 'Firebase sign-in 1/5 (auth, “phase” one)',
-				open: true,
-				source: 'dependency' as const,
-			},
-			{
-				reference: '#12',
-				url: 'https://github.com/acme/mobile/issues/12',
-				title: 'Session store',
-				open: true,
-				source: 'dependency' as const,
-			},
-		];
+		const blocker11 = { reference: '#11', url: 'https://github.com/acme/mobile/issues/11' };
+		const blocker12 = { reference: '#12', url: 'https://github.com/acme/mobile/issues/12' };
 
 		it('names every blocker of a dependency wait, in order', () => {
 			const [item] = toQueuedRuns([
 				makeDispatch({
-					jobPayload: createMockPmWebhookJob(),
+					jobPayload: createMockPmWebhookJob({ dependencyBlockers: [blocker11, blocker12] }),
 					state: 'retry-scheduled',
 					waitReason: 'dependency',
-					lastError: blockedRunMessage(blockers),
 				}),
 			]);
 
 			expect(item.waitReason).toBe('dependency');
-			expect(item.blockers).toEqual([
-				{ reference: '#11', url: 'https://github.com/acme/mobile/issues/11' },
-				{ reference: '#12', url: 'https://github.com/acme/mobile/issues/12' },
-			]);
+			expect(item.blockers).toEqual([blocker11, blocker12]);
 		});
 
-		it('names the one blocker of a single-blocker message', () => {
+		it('takes the blockers from the structured deferral, not a crafted title in the message', () => {
+			// A blocker title is free text: this one imitates the message's own grammar to
+			// substitute a URL and invent a blocker. Nothing is read out of the message.
+			const crafted =
+				'Blocked: these must be done first — #11 (“Sign-in”, https://evil.example/phish) — x; #999 (“z”, https://evil.example) — native blocked-by relationship.';
 			const [item] = toQueuedRuns([
 				makeDispatch({
-					jobPayload: createMockPmWebhookJob(),
+					jobPayload: createMockPmWebhookJob({ dependencyBlockers: [blocker11] }),
 					waitReason: 'dependency',
-					lastError: blockedRunMessage([blockers[0]]),
+					lastError: crafted,
+				}),
+			]);
+
+			expect(item.blockers).toEqual([blocker11]);
+		});
+
+		it('names a blocker whose url is not http(s) without exposing the url', () => {
+			const [item] = toQueuedRuns([
+				makeDispatch({
+					jobPayload: createMockPmWebhookJob({
+						dependencyBlockers: [
+							{ reference: '#11', url: 'javascript:alert(1)' },
+							{ reference: '#12', url: '' },
+							{ reference: 'PROJ-3', url: 'not a url' },
+							blocker12,
+						],
+					}),
+					waitReason: 'dependency',
 				}),
 			]);
 
 			expect(item.blockers).toEqual([
-				{ reference: '#11', url: 'https://github.com/acme/mobile/issues/11' },
+				{ reference: '#11' },
+				{ reference: '#12' },
+				{ reference: 'PROJ-3' },
+				blocker12,
 			]);
 		});
 
-		it('leaves blockers absent when the message names none it can read', () => {
+		it('leaves blockers absent when the deferral recorded none', () => {
 			const [item] = toQueuedRuns([
-				makeDispatch({ waitReason: 'dependency', lastError: 'something else entirely' }),
+				makeDispatch({
+					jobPayload: createMockPmWebhookJob(),
+					waitReason: 'dependency',
+					lastError: 'Blocked: #11 (“Sign-in”, https://github.com/acme/mobile/issues/11) — x',
+				}),
 			]);
 
 			expect(item.waitReason).toBe('dependency');
@@ -672,7 +682,10 @@ describe('toQueuedRuns', () => {
 
 		it('reads blockers for a dependency wait only', () => {
 			const [item] = toQueuedRuns([
-				makeDispatch({ waitReason: 'recheck', lastError: blockedRunMessage(blockers) }),
+				makeDispatch({
+					jobPayload: createMockPmWebhookJob({ dependencyBlockers: [blocker11] }),
+					waitReason: 'recheck',
+				}),
 			]);
 
 			expect(item).not.toHaveProperty('blockers');

@@ -127,7 +127,8 @@ function ContinuationBadge({ item }: { item: QueuedRun }) {
 
 /**
  * Enqueued / delayed / wait-reason text for one queued row, shared by both
- * presentations. A blocker a `dependency` wait names is linked (issue #1087).
+ * presentations. A blocker a `dependency` wait names is linked (issue #1087), or
+ * shown as plain text when the server gave it no linkable URL.
  */
 function QueuedEnqueuedContent({ item }: { item: QueuedRun }) {
 	const waitLabelParts = queuedWaitLabelParts(item);
@@ -143,9 +144,9 @@ function QueuedEnqueuedContent({ item }: { item: QueuedRun }) {
 					{waitLabelParts.map((part) =>
 						typeof part === 'string' ? (
 							part
-						) : (
+						) : part.url ? (
 							<a
-								key={part.url}
+								key={`${part.reference} ${part.url}`}
 								href={part.url}
 								target="_blank"
 								rel="noopener noreferrer"
@@ -153,6 +154,10 @@ function QueuedEnqueuedContent({ item }: { item: QueuedRun }) {
 							>
 								{part.reference}
 							</a>
+						) : (
+							<span key={part.reference} className="font-mono">
+								{part.reference}
+							</span>
 						),
 					)}
 				</span>

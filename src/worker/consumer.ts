@@ -381,6 +381,11 @@ export type JobOutcome =
 			 */
 			dependencyRecheck?: boolean;
 			/**
+			 * The prerequisites a {@link dependencyRecheck} deferral waits on, recorded on
+			 * the retry payload so the Queue can name and link them (issue #1087).
+			 */
+			dependencyBlockers?: NonNullable<SwarmJob['dependencyBlockers']>;
+			/**
 			 * A worker-eligibility re-check deferral (issue #339): the federated
 			 * dispatch gate found no eligible worker for this phase, so the dispatch
 			 * waits (`worker-eligibility`) on its own budget — again token-free, since
@@ -937,6 +942,7 @@ function deferDependencyBlock(
 		attempt,
 		resumable: false,
 		dependencyRecheck: true,
+		dependencyBlockers: err.blockers.map((b) => ({ reference: b.reference, url: b.url })),
 		// The phase was entered (its gate ran) — preserve board dispatch intent so the
 		// re-check re-enters the same board-driven phase (Planning since issue #889,
 		// Implementation since #330) even though the card never moved.
@@ -1200,6 +1206,7 @@ async function settleDispatchRetry(
 		pmPhaseStarted: outcome.pmPhaseStarted,
 		continuationDispatchClaimed: outcome.continuationDispatchClaimed,
 		dependencyRecheck: outcome.dependencyRecheck,
+		dependencyBlockers: outcome.dependencyBlockers,
 		workerEligibilityRecheck: outcome.workerEligibilityRecheck,
 		automaticRetry: outcome.automaticRetry,
 	});

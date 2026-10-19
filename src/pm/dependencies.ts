@@ -469,35 +469,6 @@ export function blockedRunMessage(openBlockers: readonly WorkItemBlocker[]): str
 	return `Blocked: these must be done first — ${list}.`;
 }
 
-/** One blocker read back out of a {@link blockedRunMessage}. */
-export interface BlockedRunMessageBlocker {
-	reference: string;
-	url: string;
-}
-
-/**
- * One entry of {@link blockedRunMessage}'s grammar — `<reference> (“<title>”, <url>) — `
- * — opening the message or following the `; ` separator. The title is matched
- * lazily up to the `”, <url>) — ` that closes it, so a title holding commas,
- * brackets or quotes of its own still parses.
- */
-const BLOCKED_RUN_MESSAGE_ENTRY =
-	/(?:^Blocked: (?:these must be done first — )?|; )(\S+) \(“[\s\S]*?”, (\S+)\) — /g;
-
-/**
- * The blockers a {@link blockedRunMessage} names, in its own order (issue #1087).
- * A dependency-deferred dispatch stores that message as its `last_error` and
- * nothing more structured, so this is how the Queue names what the item waits on.
- * Kept beside the formatter so the two share one grammar; anything that is not
- * such a message yields `[]`.
- */
-export function blockersFromBlockedRunMessage(message: string): BlockedRunMessageBlocker[] {
-	return Array.from(message.matchAll(BLOCKED_RUN_MESSAGE_ENTRY), ([, reference, url]) => ({
-		reference,
-		url,
-	}));
-}
-
 /**
  * Idempotency marker for the prose-advisory notice, keyed on the **set of
  * references** it names rather than on the item: a later, different unrecorded

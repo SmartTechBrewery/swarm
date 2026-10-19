@@ -15,7 +15,6 @@
 
 import { z } from 'zod';
 import type { DispatchRow } from '../db/repositories/dispatchesRepository.js';
-import { blockersFromBlockedRunMessage } from '../pm/dependencies.js';
 import { PmProviderIdSchema } from '../pm/events.js';
 import { ScmProviderIdSchema } from '../scm/events.js';
 import { normalizeStoredJobPayload, repositoryForJob, type SwarmJob } from './jobs.js';
@@ -163,11 +162,12 @@ export const QueuedRunSchema = z.object({
 	/** Why this dispatch is waiting, when it recorded a reason. */
 	waitReason: QueuedWaitReasonSchema.optional(),
 	/**
-	 * A `dependency` wait only — the unfinished prerequisites it waits on, read out of
-	 * the gate's own "must be done first" message on the dispatch (issue #1087), so
-	 * the Queue can name them. Absent when that message names none it can read.
+	 * A `dependency` wait only — the unfinished prerequisites it waits on, from the
+	 * deferral's own `dependencyBlockers` (issue #1087), so the Queue can name them.
+	 * `url` is present only when it is an `http:`/`https:` URL the Queue may link.
+	 * Absent when the deferral recorded none (a row written before the field existed).
 	 */
-	blockers: z.array(z.object({ reference: z.string(), url: z.string() })).optional(),
+	blockers: z.array(z.object({ reference: z.string(), url: z.string().optional() })).optional(),
 	/** The `runs` row this dispatch retries, when one exists (deferred runs). */
 	runId: z.string().optional(),
 	/** Deferred-retry attempt counter. */
@@ -315,6 +315,31 @@ export function deriveDispatchPhaseHint(dispatch: DispatchRow): QueuedPhaseHint 
 		: deriveQueuedPhaseHint(normalizeStoredJobPayload(dispatch.jobPayload));
 }
 
+/** `url` when it parses as an `http:`/`https:` URL, the only kind the Queue links. */
+function linkableUrl(url: string): string | undefined {
+	try {
+		const { protocol } = new URL(url);
+		return protocol === 'http:' || protocol === 'https:' ? url : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * The `blockers` field of a `dependency` wait (issue #1087), read from the
+ * structured blockers its deferral recorded — never parsed out of `last_error`,
+ * whose blocker titles are free text — or nothing for any other row.
+ */
+function dependencyBlockersFor(dispatch: DispatchRow, data: SwarmJob): Pick<QueuedRun, 'blockers'> {
+	if (dispatch.waitReason !== 'dependency' || !data.dependencyBlockers?.length) return {};
+	return {
+		blockers: data.dependencyBlockers.map(({ reference, url }) => {
+			const href = linkableUrl(url);
+			return href ? { reference, url: href } : { reference };
+		}),
+	};
+}
+
 function toQueuedRun(dispatch: DispatchRow, prioritizeContinuations: boolean): QueuedRun {
 	// A row written before issue #385/#297 still carries the legacy envelope, and the
 	// `jsonb` column is typed rather than validated — normalize before reading.
@@ -328,10 +353,6 @@ function toQueuedRun(dispatch: DispatchRow, prioritizeContinuations: boolean): Q
 	// before issue #686 phase 2 carries none and keeps the field absent: it runs against
 	// the project's default entry and its link comes from `workItemUrl` instead.
 	const repo = repositoryForJob(data);
-	const blockers =
-		dispatch.waitReason === 'dependency' && dispatch.lastError
-			? blockersFromBlockedRunMessage(dispatch.lastError)
-			: [];
 	const shared = {
 		jobId: dispatch.id,
 		projectId: dispatch.projectId,
@@ -341,7 +362,7 @@ function toQueuedRun(dispatch: DispatchRow, prioritizeContinuations: boolean): Q
 		state,
 		phaseHint: deriveDispatchPhaseHint(dispatch),
 		waitReason: dispatch.waitReason ?? undefined,
-		...(blockers.length > 0 ? { blockers } : {}),
+		...dependencyBlockersFor(dispatch, data),
 		runId: dispatch.runId ?? undefined,
 		attempt: dispatch.attempt,
 		priority: dispatch.priority,

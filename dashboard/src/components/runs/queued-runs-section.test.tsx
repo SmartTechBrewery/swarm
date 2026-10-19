@@ -243,6 +243,26 @@ describe('QueuedRunsSection', () => {
 		);
 	});
 
+	it('names a blocker the server gave no linkable url as text, not a link', () => {
+		const blocked: QueuedRun = {
+			...boardItem,
+			jobId: 'job-dependency-no-url',
+			waitReason: 'dependency',
+			blockers: [
+				{ reference: '#11' },
+				{ reference: '#12', url: 'https://github.com/acme/mobile/issues/12' },
+			],
+		};
+		renderSection(<QueuedRunsSection items={[blocked]} />);
+
+		const card = cards()[0];
+		expect(card.textContent).toContain('waiting for #11 and #12 to be done');
+		expect(within(card).queryByRole('link', { name: '#11' })).toBeNull();
+		expect(within(card).getByRole('link', { name: '#12' }).getAttribute('href')).toBe(
+			'https://github.com/acme/mobile/issues/12',
+		);
+	});
+
 	describe('continuation badge (issue #374)', () => {
 		const blockedContinuation: QueuedRun = {
 			...githubItem,

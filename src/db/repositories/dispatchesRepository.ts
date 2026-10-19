@@ -124,13 +124,17 @@ export type DispatchWaitReason =
 	 * are still running or not registered yet. Narrowed to that meaning by issue
 	 * #1087 — every other token-free re-check used to record it too, so the Queue
 	 * told an operator to look at CI for a run that was waiting on something else.
+	 * One exception predates that and remains: merge automation's retry of a
+	 * `provider-error` merge (issue #923) is scheduled through the same
+	 * `scheduleMergeRetry` and so records `recheck` too, although it waits on the
+	 * forge rather than on CI.
 	 */
 	| 'recheck'
 	/**
 	 * The dependency gate deferred the phase because its work item is `blocked by`
 	 * an unfinished prerequisite (issues #330, #889). Its `last_error` is the
-	 * gate's own "must be done first" message, which the Queue reads the blockers
-	 * from (issue #1087).
+	 * gate's own "must be done first" message; the blockers the Queue names come
+	 * from the job payload's structured `dependencyBlockers` (issue #1087).
 	 */
 	| 'dependency'
 	/**

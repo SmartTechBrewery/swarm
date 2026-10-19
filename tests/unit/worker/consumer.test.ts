@@ -3178,10 +3178,14 @@ describe('processJob', () => {
 		expect(outcome.reason).toContain('#319');
 		expect(addComment).not.toHaveBeenCalled();
 		// Recorded as its own wait reason (issue #1087), not `recheck` — which the Queue
-		// reads as a wait on CI — with the blocker named in the dispatch's last error.
+		// reads as a wait on CI — with the blocker named in the dispatch's last error and
+		// carried as structured data on the retry payload for the Queue to link.
 		const [, input] = scheduleDispatchRetry.mock.calls[0] as [string, Record<string, unknown>];
 		expect(input).toMatchObject({ waitReason: 'dependency' });
 		expect(input.lastError).toContain('#319');
+		expect(input.jobPayload).toMatchObject({
+			dependencyBlockers: [{ reference: '#319', url: 'https://github.com/o/r/issues/319' }],
+		});
 	});
 
 	// The Planning half of the same gate (issue #889). The deferral path is keyed on

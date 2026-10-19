@@ -289,6 +289,15 @@ const jobBase = z.object({
 	 */
 	dependencyRecheckAttempt: z.number().int().nonnegative().optional(),
 	/**
+	 * The unfinished prerequisites the latest dependency re-check deferred on
+	 * (issue #1087), recorded by `deriveRetryJobPayload` so the Queue can name and
+	 * link them. Carried as data rather than read back out of the gate's "must be
+	 * done first" message, whose blocker titles are free text anyone able to edit a
+	 * blocking issue can shape. Dropped by every deferral that is not a dependency
+	 * wait.
+	 */
+	dependencyBlockers: z.array(z.object({ reference: z.string(), url: z.string() })).optional(),
+	/**
 	 * How many times this job has been re-checked while no eligible worker could
 	 * take it (issue #339): the federated dispatch gate
 	 * (`src/worker/eligibility-gate.ts`) refused it — an assignee's worker is

@@ -219,9 +219,10 @@ export const queuedRunSchema = z.object({
 	waitReason: queuedWaitReasonSchema.optional(),
 	/**
 	 * A `dependency` wait only — the unfinished prerequisites it waits on (mirrors the
-	 * server field, issue #1087). Absent when the server could read none.
+	 * server field, issue #1087). `url` is present only when the server judged it a
+	 * linkable `http:`/`https:` URL. Absent when the server recorded none.
 	 */
-	blockers: z.array(z.object({ reference: z.string(), url: z.string() })).optional(),
+	blockers: z.array(z.object({ reference: z.string(), url: z.string().optional() })).optional(),
 	/** The run row this dispatch retries, when one exists (deferred runs). */
 	runId: z.string().optional(),
 	/** Deferred-retry attempt counter. */
