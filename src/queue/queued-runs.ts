@@ -15,6 +15,7 @@
 
 import { z } from 'zod';
 import type { DispatchRow } from '../db/repositories/dispatchesRepository.js';
+import { blockersFromBlockedRunMessage } from '../pm/dependencies.js';
 import { PmProviderIdSchema } from '../pm/events.js';
 import { ScmProviderIdSchema } from '../scm/events.js';
 import { normalizeStoredJobPayload, repositoryForJob, type SwarmJob } from './jobs.js';
@@ -93,6 +94,10 @@ export const QueuedWaitReasonSchema = z.enum([
 	'transport-lost',
 	'late-result',
 	'recheck',
+	'dependency',
+	'review-claim',
+	'mergeability',
+	'read-failed',
 	'worker-eligibility',
 	'worker-authorization',
 	'worker-rate-limited',
@@ -157,6 +162,12 @@ export const QueuedRunSchema = z.object({
 	phaseHint: QueuedPhaseHintSchema,
 	/** Why this dispatch is waiting, when it recorded a reason. */
 	waitReason: QueuedWaitReasonSchema.optional(),
+	/**
+	 * A `dependency` wait only — the unfinished prerequisites it waits on, read out of
+	 * the gate's own "must be done first" message on the dispatch (issue #1087), so
+	 * the Queue can name them. Absent when that message names none it can read.
+	 */
+	blockers: z.array(z.object({ reference: z.string(), url: z.string() })).optional(),
 	/** The `runs` row this dispatch retries, when one exists (deferred runs). */
 	runId: z.string().optional(),
 	/** Deferred-retry attempt counter. */
@@ -317,6 +328,10 @@ function toQueuedRun(dispatch: DispatchRow, prioritizeContinuations: boolean): Q
 	// before issue #686 phase 2 carries none and keeps the field absent: it runs against
 	// the project's default entry and its link comes from `workItemUrl` instead.
 	const repo = repositoryForJob(data);
+	const blockers =
+		dispatch.waitReason === 'dependency' && dispatch.lastError
+			? blockersFromBlockedRunMessage(dispatch.lastError)
+			: [];
 	const shared = {
 		jobId: dispatch.id,
 		projectId: dispatch.projectId,
@@ -326,6 +341,7 @@ function toQueuedRun(dispatch: DispatchRow, prioritizeContinuations: boolean): Q
 		state,
 		phaseHint: deriveDispatchPhaseHint(dispatch),
 		waitReason: dispatch.waitReason ?? undefined,
+		...(blockers.length > 0 ? { blockers } : {}),
 		runId: dispatch.runId ?? undefined,
 		attempt: dispatch.attempt,
 		priority: dispatch.priority,

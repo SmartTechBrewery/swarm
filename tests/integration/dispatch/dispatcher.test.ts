@@ -1,6 +1,7 @@
 import { Queue } from 'bullmq';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 
+import { getDb } from '../../../src/db/client.js';
 import {
 	claimDispatch,
 	createDispatch,
@@ -11,6 +12,7 @@ import { completeRun, createRun } from '../../../src/db/repositories/runsReposit
 import { createUser } from '../../../src/db/repositories/usersRepository.js';
 import { createEnrollment } from '../../../src/db/repositories/workerEnrollmentsRepository.js';
 import { createWorker } from '../../../src/db/repositories/workersRepository.js';
+import { dispatches } from '../../../src/db/schema/dispatches.js';
 import {
 	cancelAllWaitingWork,
 	cancelDispatchAndWake,
@@ -242,15 +244,47 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 		});
 
 		it('coalesced rechecks supersede the prior dispatch and its wake-up', async () => {
-			await scheduleCoalescedDispatch(job({ recheckAttempt: 1 }), 'check-suite:r:1:sha', 50);
+			await scheduleCoalescedDispatch(
+				job({ recheckAttempt: 1 }),
+				'check-suite:r:1:sha',
+				50,
+				'recheck',
+			);
 			const firstIds = await pendingJobIds();
 			expect(firstIds).toHaveLength(1);
 
-			await scheduleCoalescedDispatch(job({ recheckAttempt: 2 }), 'check-suite:r:1:sha', 50);
+			await scheduleCoalescedDispatch(
+				job({ recheckAttempt: 2 }),
+				'check-suite:r:1:sha',
+				50,
+				'read-failed',
+			);
 
 			const ids = await pendingJobIds();
 			expect(ids).toHaveLength(1);
 			expect(ids[0]).not.toBe(firstIds[0]);
+		});
+
+		// Issue #1087: each caller names what its re-check waits on, rather than every
+		// coalesced re-check recording `recheck` (which the Queue reads as CI).
+		it('records the wait reason a coalesced recheck is scheduled with, or none', async () => {
+			await scheduleCoalescedDispatch(
+				job(),
+				'review-mergeability:r:1:sha:checks',
+				60_000,
+				'mergeability',
+			);
+			await scheduleCoalescedDispatch(job(), 'resolve-conflicts:r:2:main', 0, null);
+
+			const rows = await getDb()
+				.select({ coalesceKey: dispatches.coalesceKey, waitReason: dispatches.waitReason })
+				.from(dispatches);
+			expect(rows).toEqual(
+				expect.arrayContaining([
+					{ coalesceKey: 'review-mergeability:r:1:sha:checks', waitReason: 'mergeability' },
+					{ coalesceKey: 'resolve-conflicts:r:2:main', waitReason: null },
+				]),
+			);
 		});
 
 		it('queue clear cancels canonical dispatches first, then drains the transport', async () => {

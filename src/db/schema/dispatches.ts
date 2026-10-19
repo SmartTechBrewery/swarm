@@ -66,7 +66,10 @@ export const dispatches = pgTable(
 		 * return, so the run is retried automatically after its failure type's delay —
 		 * issue #1075), `late-result` (that retry's lost attempt reported a late
 		 * success, which the dispatch now settles the run with — issue #1076),
-		 * `recheck`, `worker-eligibility`,
+		 * `recheck` (a wait on CI), `dependency` (an unfinished prerequisite — issue
+		 * #1087), `review-claim` (another dispatch holds the head's review slot),
+		 * `mergeability` (the provider has not computed it yet), `read-failed` (a
+		 * re-check retrying a read that never answered), `worker-eligibility`,
 		 * `worker-authorization`, `worker-rate-limited` (every candidate machine has
 		 * hit its usage limit on this phase's CLIs — issue #988),
 		 * `preserved-worker`, `task-in-flight` (a later phase

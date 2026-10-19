@@ -550,6 +550,11 @@ async function recordAbandonedCiFix(
  * abandoned review whose head still has no final check state — is *waiting*, and
  * the settle defers its run with this sentence instead of failing it as a changed
  * disposition.
+ *
+ * `pendingWaitReason` is the dispatch wait reason a `state-pending` defer records
+ * — `recheck` (CI) for the aggregate-check path, `mergeability` for the
+ * mergeability path; a `read-failed` defer records `read-failed` on either
+ * (issue #1087).
  */
 async function scheduleReviewRecheck(
 	ctx: ScmTriggerContext,
@@ -559,6 +564,7 @@ async function scheduleReviewRecheck(
 	headSha: string,
 	details: Record<string, unknown>,
 	wait: RecheckWait,
+	pendingWaitReason: 'recheck' | 'mergeability',
 ): Promise<boolean> {
 	const readFailed = budget === 'read-failed';
 	const checkAttempt = ctx.recheckAttempt ?? 0;
@@ -601,6 +607,9 @@ async function scheduleReviewRecheck(
 		},
 		coalesceKey,
 		delayMs,
+		// What the Queue tells the operator this waits on (issue #1087): a read that
+		// never answered is not CI, nor the provider still computing mergeability.
+		readFailed ? 'read-failed' : pendingWaitReason,
 	);
 	// After the schedule, never before: the settle defers the run on the strength of
 	// this note, so it must only ever describe a recheck that actually exists.
@@ -682,7 +691,16 @@ async function scheduleCheckRecheck(
 	wait: RecheckWait,
 ): Promise<ReviewDisposition> {
 	const coalesceKey = checkRecheckCoalesceKey(ctx.project.repo, prNumber, headSha);
-	await scheduleReviewRecheck(ctx, budget, coalesceKey, prNumber, headSha, details, wait);
+	await scheduleReviewRecheck(
+		ctx,
+		budget,
+		coalesceKey,
+		prNumber,
+		headSha,
+		details,
+		wait,
+		'recheck',
+	);
 	return { kind: 'none' };
 }
 
@@ -1358,6 +1376,7 @@ async function scheduleMergeabilityRecheck(
 		headSha,
 		details,
 		wait,
+		'mergeability',
 	);
 	if (!scheduled) {
 		await scmCommentReviewGaveUp(ctx.scm, ctx.project, Number(prNumber), budget);

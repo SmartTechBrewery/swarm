@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { DispatchRow } from '@/db/repositories/dispatchesRepository.js';
+import { blockedRunMessage } from '@/pm/dependencies.js';
 import type { SwarmJob } from '@/queue/jobs.js';
 import {
 	deriveDispatchPhaseHint,
@@ -607,6 +608,90 @@ describe('toQueuedRuns', () => {
 		]);
 		expect(delayedItem.state).toBe('delayed');
 		expect(delayedItem.runsAt).toBe(new Date(1_700_000_030_000).toISOString());
+	});
+
+	// Issue #1087: a dependency wait names what it waits on, read out of the gate's own
+	// "must be done first" message — the only place the dispatch row records it.
+	describe('dependency blockers', () => {
+		const blockers = [
+			{
+				reference: '#11',
+				url: 'https://github.com/acme/mobile/issues/11',
+				title: 'Firebase sign-in 1/5 (auth, “phase” one)',
+				open: true,
+				source: 'dependency' as const,
+			},
+			{
+				reference: '#12',
+				url: 'https://github.com/acme/mobile/issues/12',
+				title: 'Session store',
+				open: true,
+				source: 'dependency' as const,
+			},
+		];
+
+		it('names every blocker of a dependency wait, in order', () => {
+			const [item] = toQueuedRuns([
+				makeDispatch({
+					jobPayload: createMockPmWebhookJob(),
+					state: 'retry-scheduled',
+					waitReason: 'dependency',
+					lastError: blockedRunMessage(blockers),
+				}),
+			]);
+
+			expect(item.waitReason).toBe('dependency');
+			expect(item.blockers).toEqual([
+				{ reference: '#11', url: 'https://github.com/acme/mobile/issues/11' },
+				{ reference: '#12', url: 'https://github.com/acme/mobile/issues/12' },
+			]);
+		});
+
+		it('names the one blocker of a single-blocker message', () => {
+			const [item] = toQueuedRuns([
+				makeDispatch({
+					jobPayload: createMockPmWebhookJob(),
+					waitReason: 'dependency',
+					lastError: blockedRunMessage([blockers[0]]),
+				}),
+			]);
+
+			expect(item.blockers).toEqual([
+				{ reference: '#11', url: 'https://github.com/acme/mobile/issues/11' },
+			]);
+		});
+
+		it('leaves blockers absent when the message names none it can read', () => {
+			const [item] = toQueuedRuns([
+				makeDispatch({ waitReason: 'dependency', lastError: 'something else entirely' }),
+			]);
+
+			expect(item.waitReason).toBe('dependency');
+			expect(item).not.toHaveProperty('blockers');
+		});
+
+		it('reads blockers for a dependency wait only', () => {
+			const [item] = toQueuedRuns([
+				makeDispatch({ waitReason: 'recheck', lastError: blockedRunMessage(blockers) }),
+			]);
+
+			expect(item).not.toHaveProperty('blockers');
+		});
+	});
+
+	it('maps each token-free re-check to its own wait reason (issue #1087)', () => {
+		const items = toQueuedRuns(
+			(['dependency', 'review-claim', 'mergeability', 'read-failed'] as const).map(
+				(waitReason, index) => makeDispatch({ id: `dispatch-${index}`, waitReason }),
+			),
+		);
+
+		expect(items.map((item) => item.waitReason).sort()).toEqual([
+			'dependency',
+			'mergeability',
+			'read-failed',
+			'review-claim',
+		]);
 	});
 
 	it('treats a pending dispatch with a future availableAt as delayed', () => {

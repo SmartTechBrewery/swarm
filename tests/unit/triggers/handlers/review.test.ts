@@ -647,9 +647,11 @@ describe('review trigger', () => {
 			).toBeNull();
 			expect(claimReviewDispatch).not.toHaveBeenCalled();
 			expect(scheduleCoalescedJob).toHaveBeenCalledTimes(1);
-			const [job, coalesceKey, delayMs] = scheduleCoalescedJob.mock.calls[0];
+			const [job, coalesceKey, delayMs, waitReason] = scheduleCoalescedJob.mock.calls[0];
 			expect(coalesceKey).toBe(`check-suite:${PROJECT.repo}:9:cafe`);
 			expect(delayMs).toBe(30_000);
+			// The one coalesced recheck that *is* a wait on CI (issue #1087).
+			expect(waitReason).toBe('recheck');
 			expect(job).toMatchObject({
 				type: 'scm',
 				providerId: 'github',
@@ -683,9 +685,11 @@ describe('review trigger', () => {
 			).toBeNull();
 			expect(claimReviewDispatch).not.toHaveBeenCalled();
 			expect(scheduleCoalescedJob).toHaveBeenCalledTimes(1);
-			const [job, coalesceKey] = scheduleCoalescedJob.mock.calls[0];
+			const [job, coalesceKey, , waitReason] = scheduleCoalescedJob.mock.calls[0];
 			expect(coalesceKey).toBe(`check-suite:${PROJECT.repo}:9:cafe`);
 			expect(job).toMatchObject({ readFailureRecheckAttempt: 1, deliveryId: 'd-9' });
+			// A read that never answered is not CI still running (issue #1087).
+			expect(waitReason).toBe('read-failed');
 		});
 
 		it('degrades to a bounded recheck when the reviewer token cannot be resolved', async () => {
@@ -1009,6 +1013,7 @@ describe('review trigger', () => {
 				}),
 				'review-mergeability:SmartTechBrewery/swarm:42:abc123:pull-request',
 				30000,
+				'mergeability',
 			);
 		});
 
@@ -1040,12 +1045,14 @@ describe('review trigger', () => {
 				expect.any(Object),
 				'review-mergeability:SmartTechBrewery/swarm:42:abc123:checks',
 				30000,
+				'mergeability',
 			);
 			expect(scheduleCoalescedJob).toHaveBeenNthCalledWith(
 				2,
 				expect.any(Object),
 				'review-mergeability:SmartTechBrewery/swarm:42:abc123:pull-request',
 				30000,
+				'mergeability',
 			);
 		});
 
@@ -1191,6 +1198,7 @@ describe('review trigger', () => {
 				expect.objectContaining({ recheckAttempt: 1 }),
 				'review-mergeability:SmartTechBrewery/swarm:42:abc123:pull-request',
 				30000,
+				'mergeability',
 			);
 		});
 	});

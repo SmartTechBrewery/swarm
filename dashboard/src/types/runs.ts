@@ -158,6 +158,10 @@ export const queuedWaitReasonSchema = z.enum([
 	'transport-lost',
 	'late-result',
 	'recheck',
+	'dependency',
+	'review-claim',
+	'mergeability',
+	'read-failed',
 	'worker-eligibility',
 	'worker-authorization',
 	'worker-rate-limited',
@@ -213,6 +217,11 @@ export const queuedRunSchema = z.object({
 	phaseHint: queuedPhaseHintSchema,
 	/** Why this dispatch is waiting, when it recorded a reason. */
 	waitReason: queuedWaitReasonSchema.optional(),
+	/**
+	 * A `dependency` wait only — the unfinished prerequisites it waits on (mirrors the
+	 * server field, issue #1087). Absent when the server could read none.
+	 */
+	blockers: z.array(z.object({ reference: z.string(), url: z.string() })).optional(),
 	/** The run row this dispatch retries, when one exists (deferred runs). */
 	runId: z.string().optional(),
 	/** Deferred-retry attempt counter. */

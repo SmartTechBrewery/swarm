@@ -1,11 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import type { QueuedRun } from '@/types/runs.js';
+import type { QueuedRun, QueuedWaitReason } from '@/types/runs.js';
 import {
 	groupQueuedRuns,
 	hideBoardRowsWithActiveRun,
 	noTriggerGroupLabel,
 	queuedPhaseLabel,
 	queuedRunKey,
+	queuedWaitLabel,
+	queuedWaitLabelParts,
 	queuedWaitReasonLabel,
 	queuedWorkItemLabel,
 	queuedWorkItemTitle,
@@ -151,6 +153,80 @@ describe('queuedWaitReasonLabel', () => {
 		expect(queuedWaitReasonLabel('pr-in-flight')).toBe(
 			'waiting for another phase of its pull request to finish',
 		);
+	});
+
+	// Issue #1087: `recheck` used to cover every token-free re-check, so a run blocked
+	// on an unfinished prerequisite read "waiting for checks to settle" and sent the
+	// operator to look at CI. Only a wait on CI may say so now.
+	it('keeps the checks wording for a wait on CI', () => {
+		expect(queuedWaitReasonLabel('recheck')).toBe('waiting for checks to settle');
+	});
+
+	it.each([
+		['dependency', 'waiting for a blocking work item to be done'],
+		['review-claim', 'waiting for another dispatch to release the review slot'],
+		['mergeability', "waiting for the pull request's mergeability to be computed"],
+		['read-failed', 'retrying after a failed lookup'],
+	] as const)('does not claim a %s wait is waiting on checks', (reason, label) => {
+		expect(queuedWaitReasonLabel(reason)).toBe(label);
+		expect(queuedWaitReasonLabel(reason)).not.toMatch(/check/i);
+	});
+
+	it('falls back to the raw reason for one this bundle does not know, never a blank', () => {
+		expect(queuedWaitReasonLabel('brand-new-reason' as unknown as QueuedWaitReason)).toBe(
+			'brand-new-reason',
+		);
+	});
+});
+
+// Issue #1087: a dependency wait names what it is waiting on.
+describe('queuedWaitLabel', () => {
+	const blocker11 = { reference: '#11', url: 'https://github.com/acme/mobile/issues/11' };
+	const blocker12 = { reference: '#12', url: 'https://github.com/acme/mobile/issues/12' };
+	const blocker13 = { reference: '#13', url: 'https://github.com/acme/mobile/issues/13' };
+
+	it('names the blocker of a dependency wait', () => {
+		expect(queuedWaitLabel(boardRun({ waitReason: 'dependency', blockers: [blocker11] }))).toBe(
+			'waiting for #11 to be done',
+		);
+	});
+
+	it('names every blocker, in order', () => {
+		expect(
+			queuedWaitLabel(boardRun({ waitReason: 'dependency', blockers: [blocker11, blocker12] })),
+		).toBe('waiting for #11 and #12 to be done');
+		expect(
+			queuedWaitLabel(
+				boardRun({ waitReason: 'dependency', blockers: [blocker11, blocker12, blocker13] }),
+			),
+		).toBe('waiting for #11, #12 and #13 to be done');
+	});
+
+	it('keeps each blocker whole so the Queue can link it', () => {
+		expect(
+			queuedWaitLabelParts(
+				boardRun({ waitReason: 'dependency', blockers: [blocker11, blocker12] }),
+			),
+		).toEqual(['waiting for ', blocker11, ' and ', blocker12, ' to be done']);
+	});
+
+	it('falls back to the generic dependency wording when no blocker could be read', () => {
+		expect(queuedWaitLabel(boardRun({ waitReason: 'dependency' }))).toBe(
+			'waiting for a blocking work item to be done',
+		);
+		expect(queuedWaitLabel(boardRun({ waitReason: 'dependency', blockers: [] }))).toBe(
+			'waiting for a blocking work item to be done',
+		);
+	});
+
+	it('is the plain reason label for every other wait, and absent for none', () => {
+		expect(queuedWaitLabel(githubRun({ waitReason: 'recheck' }))).toBe(
+			'waiting for checks to settle',
+		);
+		expect(queuedWaitLabelParts(githubRun({ waitReason: 'timeout' }))).toEqual([
+			'retrying after a timeout',
+		]);
+		expect(queuedWaitLabel(githubRun())).toBeUndefined();
 	});
 });
 

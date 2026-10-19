@@ -1569,7 +1569,7 @@ describe('processJob', () => {
 				expect(scheduleDispatchRetry).toHaveBeenCalledOnce();
 				const [, input] = scheduleDispatchRetry.mock.calls[0] as [string, Record<string, unknown>];
 				expect(input).toMatchObject({
-					waitReason: 'recheck',
+					waitReason: 'review-claim',
 					lastError: HELD_CLAIM_REASON,
 					runId: 'run-123',
 					attempt: 1,
@@ -3177,6 +3177,11 @@ describe('processJob', () => {
 		if (outcome.status !== 'phase-deferred') throw new Error('expected phase-deferred');
 		expect(outcome.reason).toContain('#319');
 		expect(addComment).not.toHaveBeenCalled();
+		// Recorded as its own wait reason (issue #1087), not `recheck` — which the Queue
+		// reads as a wait on CI — with the blocker named in the dispatch's last error.
+		const [, input] = scheduleDispatchRetry.mock.calls[0] as [string, Record<string, unknown>];
+		expect(input).toMatchObject({ waitReason: 'dependency' });
+		expect(input.lastError).toContain('#319');
 	});
 
 	// The Planning half of the same gate (issue #889). The deferral path is keyed on
@@ -5342,7 +5347,7 @@ describe('processJob', () => {
 			expect(retried.status).toBe('phase-succeeded');
 			expect(scheduleDispatchRetry).not.toHaveBeenCalledWith(
 				expect.anything(),
-				expect.objectContaining({ waitReason: 'recheck' }),
+				expect.objectContaining({ waitReason: 'review-claim' }),
 			);
 		});
 

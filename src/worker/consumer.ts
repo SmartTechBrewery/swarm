@@ -375,7 +375,7 @@ export type JobOutcome =
 			failureKind?: DeferrableFailure['kind'];
 			/**
 			 * A dependency re-check deferral (issue #330), not an agent failure: the
-			 * dispatch waits (`recheck`) on an unfinished prerequisite and consumes the
+			 * dispatch waits (`dependency`) on an unfinished prerequisite and consumes the
 			 * separate {@link SwarmJob.dependencyRecheckAttempt} budget, leaving the
 			 * rate-limit budget untouched.
 			 */
@@ -893,7 +893,7 @@ function retryBudgetFor(
 
 /**
  * Handle a {@link DependencyBlockedError} (issue #330): build the token-free
- * `recheck` deferral while the dependency-recheck budget lasts, or return
+ * `dependency` deferral while the dependency-recheck budget lasts, or return
  * `undefined` once it's exhausted so the caller falls through to a terminal
  * `phase-failed` that posts the "must be done first" message on the item. Split
  * out of {@link handlePhaseFailure} to keep its branching within budget, mirroring
@@ -1131,13 +1131,15 @@ async function persistRetryPayloadOnRun(runId: string | undefined, job: SwarmJob
 /**
  * The dispatch record's wait reason for a deferral. The two token-free
  * re-checks wait on an external condition rather than on a failure, so each
- * reads as its own reason (like merge-automation's `recheck`) instead of a
- * failure-driven one.
+ * reads as its own reason instead of a failure-driven one. A dependency wait is
+ * `dependency`, not merge automation's `recheck` (issue #1087): `recheck` reads as
+ * a wait on CI, and sent an operator looking at checks for a run that was waiting
+ * on an unfinished prerequisite.
  */
 function deferralWaitReason(
 	outcome: Extract<JobOutcome, { status: 'phase-deferred' }>,
 ): DispatchWaitReason {
-	if (outcome.dependencyRecheck) return 'recheck';
+	if (outcome.dependencyRecheck) return 'dependency';
 	// Checked first: a preserved-checkout wait is an eligibility re-check too, but it
 	// is the one with no budget, and the dispatch row is where an operator sees the
 	// difference between "no capable worker" and "waiting for one specific machine".
@@ -4069,7 +4071,7 @@ async function handlePhaseFailure(
 
 	// A dependency block (issue #330) is neither a failure nor a rate-limit: the
 	// work item is `blocked by` an unfinished prerequisite. Defer as a token-free
-	// `recheck` on its own budget while the budget lasts; once exhausted, fall
+	// `dependency` wait on its own budget while the budget lasts; once exhausted, fall
 	// through to the terminal path below, which posts this "must be done first"
 	// message on the item. Placed after the cancellation check so a user can still
 	// cancel a run that is merely waiting on a dependency.
@@ -4655,9 +4657,10 @@ async function deferHeldDispatchClaim(
 	const updated = await scheduleDispatchRetry(dispatch.id, {
 		jobPayload: next,
 		availableAt: new Date(Date.now() + delayMs),
-		// The same reason the two other token-free re-checks record: this waits on an
-		// external condition, and spends no attempt of any failure budget.
-		waitReason: 'recheck',
+		// Its own reason (issue #1087), like the two other token-free re-checks: this
+		// waits on an external condition — the holder's lease — and spends no attempt
+		// of any failure budget. Not `recheck`, which reads as a wait on CI.
+		waitReason: 'review-claim',
 		attempt: attempt + 1,
 		lastError: decline.reason,
 		runId: job.runId,

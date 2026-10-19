@@ -281,7 +281,7 @@ const jobBase = z.object({
 	/**
 	 * How many times this job has been re-checked while waiting on an unfinished
 	 * dependency (issue #330): an Implementation whose work item is `blocked by` an
-	 * open prerequisite is deferred as a token-free `recheck` dispatch — no worktree,
+	 * open prerequisite is deferred as a token-free `dependency` dispatch — no worktree,
 	 * no agent — and re-evaluated on {@link DEPENDENCY_RECHECK_INTERVAL_MS}. Absent
 	 * on a fresh webhook; incremented on each dependency re-check so the consumer can
 	 * cap the wait (`MAX_DEPENDENCY_RECHECKS`) and finally fail with an actionable

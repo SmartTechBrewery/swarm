@@ -310,7 +310,7 @@ export function livenessUnitKeysForDispatch(ref: ActiveDispatchTaskRef): string[
  * 1. `liveRunCount > 0` or an active dispatch → `active`. This covers three of the
  *    four kinds of legitimate waiting for free, because all three are non-terminal
  *    dispatch rows: a capacity-blocked dispatch (`wait_reason: 'project-capacity'`),
- *    a dependency-gated one (`'task-in-flight'`/`'recheck'`), and a bounded retry
+ *    a dependency-gated one (`'task-in-flight'`/`'dependency'`), and a bounded retry
  *    still inside its budget (`state: 'retry-scheduled'`).
  * 2. An operator's dismissal the unit has not moved past → `dismissed` (issue #880).
  *    After `active` on purpose: a unit with a live run or a non-terminal dispatch is

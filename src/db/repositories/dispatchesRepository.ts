@@ -118,7 +118,39 @@ export type DispatchWaitReason =
 	 * made due at once carrying that result, and runs only to settle the run with it.
 	 */
 	| 'late-result'
+	/**
+	 * A token-free wait on **CI**: merge automation retrying a pull request that is
+	 * not ready to merge yet, and the review gate re-checking a head whose checks
+	 * are still running or not registered yet. Narrowed to that meaning by issue
+	 * #1087 — every other token-free re-check used to record it too, so the Queue
+	 * told an operator to look at CI for a run that was waiting on something else.
+	 */
 	| 'recheck'
+	/**
+	 * The dependency gate deferred the phase because its work item is `blocked by`
+	 * an unfinished prerequisite (issues #330, #889). Its `last_error` is the
+	 * gate's own "must be done first" message, which the Queue reads the blockers
+	 * from (issue #1087).
+	 */
+	| 'dependency'
+	/**
+	 * A continuation found this pull request head's review slot genuinely held by
+	 * another dispatch, and waits out the holder's lease rather than failing
+	 * (`deferHeldDispatchClaim`, `../../worker/consumer.ts`, issue #1087).
+	 */
+	| 'review-claim'
+	/**
+	 * A coalesced re-check waiting for the source-control provider to compute a
+	 * pull request's mergeability — the review gate's and Resolve-conflicts' wait on
+	 * `mergeable: null` (issue #1087).
+	 */
+	| 'mergeability'
+	/**
+	 * A coalesced re-check retrying a read that never answered — the provider threw,
+	 * or SWARM's own run-history lookup did (the review gate's `read-failed` budget,
+	 * and Resolve-conflicts' unresolved ownership; issue #1087).
+	 */
+	| 'read-failed'
 	/**
 	 * No eligible worker could take the dispatch (issue #339's federated gate)
 	 * because none is *available*: some worker cleared every structural check and

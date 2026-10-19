@@ -19,6 +19,7 @@ import {
 	claimDispatch,
 	createDispatch,
 	type DispatchRow,
+	type DispatchWaitReason,
 	findWakeableWorkerUpdateDispatch,
 	getActiveDispatchByRunId,
 	listAvailabilityWaitsForWorker,
@@ -176,11 +177,17 @@ export async function claimDispatchForJob(
  * claim-time refusal covers any that survive), then create and publish the
  * replacement, due after `delayMs`. The replacement's payload carries the
  * bumped `recheckAttempt`, exactly like the BullMQ-era `scheduleCoalescedJob`.
+ *
+ * `waitReason` is what the replacement waits on, and every caller names it
+ * (issue #1087): a single shared `recheck` read as a wait on CI in the Queue for
+ * re-checks that were waiting on mergeability or on a read that failed. `null` is a
+ * check scheduled to run now, which waits on nothing.
  */
 export async function scheduleCoalescedDispatch(
 	job: SwarmJob,
 	coalesceKey: string,
 	delayMs: number,
+	waitReason: DispatchWaitReason | null,
 ): Promise<void> {
 	const superseded = await supersedeDispatchesByCoalesceKey(coalesceKey);
 	for (const row of superseded) {
@@ -192,7 +199,7 @@ export async function scheduleCoalescedDispatch(
 		coalesceKey,
 		priority: priorityFor(job) ?? 0,
 		source: 'recheck',
-		waitReason: 'recheck',
+		...(waitReason ? { waitReason } : {}),
 		availableAt: new Date(Date.now() + delayMs),
 	});
 }

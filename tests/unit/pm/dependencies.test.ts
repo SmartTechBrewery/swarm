@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
 	blockedRunMessage,
+	blockersFromBlockedRunMessage,
 	dedupeBlockers,
 	dependencyProse,
 	findDependencyReferences,
@@ -450,5 +451,44 @@ describe('blockedRunMessage', () => {
 		expect(msg).toContain(
 			'#5 (“DB”, https://github.com/o/r/issues/319) — prose mention in the item description or comments',
 		);
+	});
+});
+
+// Issue #1087: the Queue reads a dependency wait's blockers back out of this message,
+// the only thing the dispatch row records — so the two must agree on one grammar.
+describe('blockersFromBlockedRunMessage', () => {
+	it('reads back the one blocker a single-blocker message names', () => {
+		expect(blockersFromBlockedRunMessage(blockedRunMessage([blocker()]))).toEqual([
+			{ reference: '#319', url: 'https://github.com/o/r/issues/319' },
+		]);
+	});
+
+	it('reads back every blocker of a multi-blocker message, in order and whatever its source', () => {
+		const msg = blockedRunMessage([
+			blocker({ source: 'dependency' }),
+			blocker({ reference: '#5', url: 'https://github.com/o/r/issues/5', source: 'mention' }),
+			blocker({ reference: 'PROJ-12', url: 'https://acme.atlassian.net/browse/PROJ-12' }),
+		]);
+		expect(blockersFromBlockedRunMessage(msg)).toEqual([
+			{ reference: '#319', url: 'https://github.com/o/r/issues/319' },
+			{ reference: '#5', url: 'https://github.com/o/r/issues/5' },
+			{ reference: 'PROJ-12', url: 'https://acme.atlassian.net/browse/PROJ-12' },
+		]);
+	});
+
+	it('is not thrown by a title holding its own commas, brackets, quotes or separators', () => {
+		const msg = blockedRunMessage([
+			blocker({ title: 'Sign-in (1/5): “auth”, tokens; refresh — part one' }),
+			blocker({ reference: '#5', url: 'https://github.com/o/r/issues/5', title: 'DB' }),
+		]);
+		expect(blockersFromBlockedRunMessage(msg)).toEqual([
+			{ reference: '#319', url: 'https://github.com/o/r/issues/319' },
+			{ reference: '#5', url: 'https://github.com/o/r/issues/5' },
+		]);
+	});
+
+	it('reads nothing out of a message that is not a blocked-run message', () => {
+		expect(blockersFromBlockedRunMessage('Phase failed on the worker')).toEqual([]);
+		expect(blockersFromBlockedRunMessage('')).toEqual([]);
 	});
 });

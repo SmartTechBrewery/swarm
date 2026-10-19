@@ -137,6 +137,8 @@ describe('resolve-conflicts trigger', () => {
 		});
 		expect(result).toBeNull();
 		expect(scheduleCoalescedJob).toHaveBeenCalledOnce();
+		// Recorded as a wait on mergeability, not on CI (issue #1087).
+		expect(scheduleCoalescedJob.mock.calls[0][3]).toBe('mergeability');
 	});
 
 	it('bypasses conflict resolution claim on retry (when runId is present)', async () => {
@@ -214,6 +216,8 @@ describe('resolve-conflicts trigger', () => {
 				}),
 				'resolve-conflicts:acme/widgets:42:main',
 				0,
+				// Due now, so it waits on nothing (issue #1087).
+				null,
 			);
 		});
 
@@ -246,6 +250,7 @@ describe('resolve-conflicts trigger', () => {
 				expect.anything(),
 				'resolve-conflicts:acme/widgets:42:main',
 				30_000,
+				'read-failed',
 			);
 			expect(claimConflictResolution).not.toHaveBeenCalled();
 		});

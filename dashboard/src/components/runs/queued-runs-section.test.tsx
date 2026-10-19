@@ -224,6 +224,25 @@ describe('QueuedRunsSection', () => {
 		).not.toBeNull();
 	});
 
+	// Issue #1087: a row blocked on an unfinished prerequisite says so, and links the
+	// blocker — a bare `#11` may belong to another repository than the row's.
+	it('names and links the blocker of a dependency wait instead of claiming to wait on checks', () => {
+		const blocked: QueuedRun = {
+			...boardItem,
+			jobId: 'job-dependency',
+			waitReason: 'dependency',
+			blockers: [{ reference: '#11', url: 'https://github.com/acme/mobile/issues/11' }],
+		};
+		renderSection(<QueuedRunsSection items={[blocked]} />);
+
+		const card = cards()[0];
+		expect(card.textContent).toContain('waiting for #11 to be done');
+		expect(card.textContent).not.toMatch(/checks to settle/);
+		expect(within(card).getByRole('link', { name: '#11' }).getAttribute('href')).toBe(
+			'https://github.com/acme/mobile/issues/11',
+		);
+	});
+
 	describe('continuation badge (issue #374)', () => {
 		const blockedContinuation: QueuedRun = {
 			...githubItem,
