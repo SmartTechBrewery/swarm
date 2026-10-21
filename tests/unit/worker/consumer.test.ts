@@ -303,6 +303,11 @@ const getDispatchById = vi.fn(
 	async (_id: string): Promise<MockDispatchRow | undefined> => mockDispatchRow({}),
 );
 const deferDispatchToPending = vi.fn(async (_id: string, _input: unknown) => mockDispatchRow({}));
+/**
+ * The claim-side bind onto a reused run row (issue #1102). Defaults to "bound", so
+ * every pre-existing reuse case keeps taking the row over.
+ */
+const bindDispatchToRun = vi.fn(async (_id: string, _runId: string) => true);
 const scheduleDispatchRetry = vi.fn(
 	async (_id: string, input: { jobPayload: Record<string, unknown> }) => ({
 		...mockDispatchRow(input.jobPayload),
@@ -353,6 +358,7 @@ vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
 		excludeDispatchId?: string,
 	) => findActivePlanningDispatchForTask(projectId, taskId, excludeDispatchId),
 	deferDispatchToPending: (id: string, input: unknown) => deferDispatchToPending(id, input),
+	bindDispatchToRun: (id: string, runId: string) => bindDispatchToRun(id, runId),
 	scheduleDispatchRetry: (id: string, input: { jobPayload: Record<string, unknown> }) =>
 		scheduleDispatchRetry(id, input),
 }));
@@ -959,6 +965,8 @@ describe('processJob', () => {
 		getDispatchById.mockReset();
 		getDispatchById.mockImplementation(async (_id: string) => mockDispatchRow({}));
 		deferDispatchToPending.mockClear();
+		bindDispatchToRun.mockClear();
+		bindDispatchToRun.mockResolvedValue(true);
 		scheduleDispatchRetry.mockClear();
 		claimWorkerForDispatch.mockClear();
 		claimWorkerForDispatch.mockResolvedValue({
@@ -6901,6 +6909,69 @@ describe('processJob', () => {
 				expect.objectContaining({
 					jobPayload: expect.not.objectContaining({ runId: 'run-failed' }),
 				}),
+			);
+		});
+
+		// Issue #1102: a newer review arrived while an earlier review's Respond-to-review
+		// dispatch still owned the shared `<pr>-respond` run row (`retry-scheduled`).
+		// The takeover used to reset that row first and then fail on
+		// `uq_dispatches_active_run`, writing the failure over a run it never owned.
+		it('records the attempt on a fresh row when another active dispatch still owns the latest row', async () => {
+			getLatestRunForTask.mockResolvedValueOnce({ id: 'run-held', status: 'deferred' } as never);
+			bindDispatchToRun.mockResolvedValueOnce(false);
+
+			const outcome = await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(RESPOND_TO_REVIEW_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-succeeded');
+			expect(bindDispatchToRun).toHaveBeenCalledWith('dispatch-1', 'run-held');
+			expect(resetRunToRunning).not.toHaveBeenCalled();
+			expect(createRun).toHaveBeenCalledOnce();
+			expect(markDispatchRunning).toHaveBeenCalledWith(
+				'dispatch-1',
+				'run-1',
+				expect.any(Date),
+				expect.anything(),
+			);
+			expect(failDispatch).not.toHaveBeenCalled();
+			expect(completeRun.mock.calls.map(([id]) => id)).not.toContain('run-held');
+		});
+
+		it('binds the dispatch to the reused row before writing anything to it (issue #1102)', async () => {
+			getLatestRunForTask.mockResolvedValueOnce({ id: 'run-failed', status: 'failed' } as never);
+			const job = createMockScmWebhookJob();
+
+			await processJob(job, registryReturning(RESPOND_TO_REVIEW_TRIGGER));
+
+			expect(bindDispatchToRun).toHaveBeenCalledWith('dispatch-1', 'run-failed');
+			expect(bindDispatchToRun.mock.invocationCallOrder[0]).toBeLessThan(
+				resetRunToRunning.mock.invocationCallOrder[0],
+			);
+			// The row is reset with this attempt's own payload — the newer review.
+			expect(resetRunToRunning).toHaveBeenCalledWith(
+				'run-failed',
+				expect.objectContaining({ event: job.event, runId: 'run-failed' }),
+				'failed',
+			);
+		});
+
+		it('never parks a pre-run wait on a row another active dispatch owns (issue #1102)', async () => {
+			getLatestRunForTask.mockResolvedValueOnce({ id: 'run-held', status: 'deferred' } as never);
+			bindDispatchToRun.mockResolvedValueOnce(false);
+			acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ runId: undefined }),
+				registryReturning(RESPOND_TO_REVIEW_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-deferred');
+			expect(resetRunToRunning).not.toHaveBeenCalled();
+			expect(deferDispatchToPending).toHaveBeenCalledWith(
+				'dispatch-1',
+				expect.objectContaining({ runId: 'run-1' }),
 			);
 		});
 

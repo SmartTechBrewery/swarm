@@ -1,6 +1,7 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ProjectConfig } from '@/config/schema.js';
 import { REVIEW_VERDICT_CAP } from '@/db/repositories/reviewVerdictsRepository.js';
+import { retireSupersededReviewResponses } from '@/dispatch/review-response-supersession.js';
 import { getPersonaForLogin } from '@/integrations/scm/github/personas.js';
 import { parseGitHubWebhook } from '@/integrations/scm/github/webhook.js';
 import { gitLabRequestChangesMarker } from '@/integrations/scm/gitlab/review-marker.js';
@@ -15,6 +16,12 @@ import {
 	createMockScmEvent,
 	createMockScmTriggerContext,
 } from '../../../helpers/factories.js';
+
+// The supersession of earlier waiting responses (issue #1102) reaches the dispatch
+// table; it is mocked so every case here stays DB-free, and asserted on below.
+vi.mock('@/dispatch/review-response-supersession.js', () => ({
+	retireSupersededReviewResponses: vi.fn(async () => 0),
+}));
 
 const PROJECT = createMockProjectConfig();
 const IDENTITIES: ScmPersonaIdentities = { implementer: 'swarm-impl', reviewer: 'swarm-rev' };
@@ -266,6 +273,46 @@ describe('respond-to-review trigger', () => {
 
 		it('skips when the review has no author', async () => {
 			expect(await handler.handle(ctx({ actorLogin: undefined }))).toBeNull();
+		});
+	});
+
+	describe('superseding earlier waiting responses (issue #1102)', () => {
+		beforeEach(() => {
+			vi.mocked(retireSupersededReviewResponses).mockClear();
+		});
+
+		it('retires earlier waiting responses for the PR when a fresh review dispatches', async () => {
+			expect(await handler.handle(ctx())).toMatchObject({ taskId: '17-respond' });
+			expect(retireSupersededReviewResponses).toHaveBeenCalledWith({
+				projectId: PROJECT.id,
+				taskId: '17-respond',
+				excludeDispatchId: 'dispatch-1',
+			});
+		});
+
+		it('retires nothing for a dispatch carrying a run — a retry of its own review', async () => {
+			expect(await handler.handle({ ...ctx(), runId: 'run-1' })).toMatchObject({
+				phase: 'respond-to-review',
+			});
+			expect(retireSupersededReviewResponses).not.toHaveBeenCalled();
+		});
+
+		it('retires nothing when the handler declines to dispatch', async () => {
+			await handler.handle(ctx({ reviewState: 'approved' }));
+			await handler.handle(ctx({ actorLogin: 'a-human' }));
+			await cappedHandler().handle(ctx());
+			await handler.handle({
+				...ctx(),
+				project: createMockProjectConfig({ pipeline: { respondToReview: { enabled: false } } }),
+			});
+			expect(retireSupersededReviewResponses).not.toHaveBeenCalled();
+		});
+
+		it('supersedes on an operator-forced re-review too', async () => {
+			expect(await cappedHandler().handle(forcedCtx())).toMatchObject({
+				phase: 'respond-to-review',
+			});
+			expect(retireSupersededReviewResponses).toHaveBeenCalledTimes(1);
 		});
 	});
 

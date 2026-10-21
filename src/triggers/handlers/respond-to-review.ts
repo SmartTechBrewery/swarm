@@ -38,6 +38,17 @@
  * webhook whose author still has to be established. The extra Review slot the
  * follow-up needs is granted separately, on the ledger record itself, so nothing
  * about the automatic cap changes for events SWARM produces on its own.
+ *
+ * **A newer review supersedes a waiting older one (issue #1102).** Every
+ * Respond-to-review dispatch for a pull request shares the `<pr>-respond` task id
+ * and therefore its run row, so an earlier review's dispatch still waiting
+ * (`pending` or `retry-scheduled`) would both hold that row and, once it ran,
+ * answer an outdated review. A fresh delivery — one carrying no `ctx.runId`, which
+ * Retry now, Reset and the reconciler backfill all carry — therefore retires those
+ * earlier waiting dispatches together with their run rows
+ * (`src/dispatch/review-response-supersession.ts`). Like the board-move rule
+ * (#909) it runs before `processJob`'s gates; an operator-forced re-review is a
+ * fresh delivery and supersedes too.
  */
 
 import type { ProjectConfig } from '../../config/schema.js';
@@ -46,6 +57,7 @@ import {
 	getReviewVerdictByReviewId as getReviewVerdictByReviewIdDefault,
 	isCapReachingRequestChanges,
 } from '../../db/repositories/reviewVerdictsRepository.js';
+import { retireSupersededReviewResponses } from '../../dispatch/review-response-supersession.js';
 import { logger } from '../../lib/logger.js';
 import type { ScmEvent } from '../../scm/events.js';
 import type { ScmTriggerContext, TriggerContext, TriggerHandler, TriggerResult } from '../types.js';
@@ -131,6 +143,21 @@ async function isReviewerPersonaReview(ctx: ScmTriggerContext): Promise<boolean>
 		return false;
 	}
 	return true;
+}
+
+/**
+ * A fresh review delivery supersedes whatever earlier review of this pull request
+ * is still waiting to be answered (issue #1102), so the newest review is the one the
+ * shared run row answers. A dispatch carrying a run is a retry of its own review,
+ * not a newer one, so it retires nothing.
+ */
+async function supersedeEarlierResponses(ctx: ScmTriggerContext, taskId: string): Promise<void> {
+	if (ctx.runId) return;
+	await retireSupersededReviewResponses({
+		projectId: ctx.project.id,
+		taskId,
+		excludeDispatchId: ctx.dispatchId,
+	});
 }
 
 export function createRespondToReviewTrigger(
@@ -266,9 +293,11 @@ export function createRespondToReviewTrigger(
 			// review agent's process (and its worktree cleanup) actually exits. A
 			// shared taskId would make the two `provision` calls race for one
 			// worktree path (see git history for the incident this fixed).
+			const taskId = `${prNumber}-respond`;
+			await supersedeEarlierResponses(ctx, taskId);
 			return {
 				phase: 'respond-to-review',
-				taskId: `${prNumber}-respond`,
+				taskId,
 				prNumber,
 				prBranch,
 				reviewId,
