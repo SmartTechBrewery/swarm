@@ -99,8 +99,9 @@ describe('azure devops persona credentials', () => {
 			vi.mocked(resolveProjectCredential).mockResolvedValue(null);
 
 			await expect(getAzureDevOpsToken(project, 'reviewer')).rejects.toThrow(
-				`No azure-devops reviewer credential configured for project '${project.id}' ` +
-					'(set credentials.scm.azure-devops.reviewer to a stored reference)',
+				`No Azure DevOps reviewer credential configured for project '${project.id}' ` +
+					'(set credentials.scm.azure-devops.reviewer to a stored reference; ' +
+					'AZURE_DEVOPS_TOKEN_REVIEWER is its conventional config-apply key)',
 			);
 		});
 	});

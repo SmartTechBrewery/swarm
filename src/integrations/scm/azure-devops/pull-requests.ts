@@ -4,7 +4,7 @@
  * `getAzureDevOpsPullRequest`, `getAzureDevOpsPullRequestTitle`,
  * `getAzureDevOpsPullRequestMergeState`, `getAzureDevOpsBranchHead`,
  * `getAzureDevOpsCommitChecks`, `listAzureDevOpsPullRequestsForCommit`,
- * `listActiveAzureDevOpsPullRequestsForBase`.
+ * `listActiveAzureDevOpsPullRequestsForBase`, `findActiveAzureDevOpsPullRequest`.
  *
  * They live in their own file rather than in `./client.ts` because that module is
  * the credential/transport primitive (token scoping, auth header, error envelope,
@@ -23,7 +23,10 @@
  *   stand-in.
  *
  * Out of scope here: branch-policy evaluations (a policy is not CI — see
- * {@link getAzureDevOpsCommitChecks}) and every write (phase 5/6).
+ * {@link getAzureDevOpsCommitChecks}). Every write — threads, votes, pull-request
+ * creation, completion — lives next door in `./writes.ts` (phase 5/6), which shares
+ * {@link AzureDevOpsPullRequestReference} so a found and a created pull request are
+ * the same shape to the delivery seam.
  */
 
 import { logger } from '../../../lib/logger.js';
@@ -40,6 +43,7 @@ import {
 	paginateAzureDevOps,
 	repositoryApiPath,
 } from './client.js';
+import { pullRequestWebUrl } from './webhook.js';
 
 /** Prefix a branch ref carries in `sourceRefName` / `targetRefName` / a ref listing. */
 const BRANCH_REF_PREFIX = 'refs/heads/';
@@ -77,6 +81,8 @@ interface AzureDevOpsPullRequest {
 	lastMergeSourceCommit?: { commitId?: string } | null;
 	/** The target commit Azure last evaluated the merge against. */
 	lastMergeTargetCommit?: { commitId?: string } | null;
+	/** The commit a completed pull request landed as on the target branch. */
+	lastMergeCommit?: { commitId?: string } | null;
 	/** Present only when the source branch lives in a fork. */
 	forkSource?: unknown;
 	reviewers?: Array<{ id?: string; vote?: number; isRequired?: boolean }> | null;
@@ -128,6 +134,16 @@ export interface AzureDevOpsPullRequestMergeState {
 	 * decides which of them block; this read only reports them.
 	 */
 	reviewers: Array<{ id: string; vote: number; isRequired: boolean }>;
+	/** Azure's last merge evaluation, verbatim (`conflicts`, `succeeded`, …), or `null` when unreported. */
+	mergeStatus: string | null;
+	/** The commit a completed pull request landed as, or `null` while it has not. */
+	mergeCommitSha: string | null;
+}
+
+/** A pull request as the delivery seam names it: its id and its web URL. */
+export interface AzureDevOpsPullRequestReference {
+	number: number;
+	url: string;
 }
 
 /** Strip `refs/heads/` off a branch ref; any other ref passes through verbatim. */
@@ -276,7 +292,51 @@ export async function getAzureDevOpsPullRequestMergeState(
 				? [{ id: reviewer.id, vote: reviewer.vote ?? 0, isRequired: Boolean(reviewer.isRequired) }]
 				: [],
 		),
+		mergeStatus: pr.mergeStatus ?? null,
+		mergeCommitSha: pr.lastMergeCommit?.commitId ?? null,
 	};
+}
+
+/**
+ * The delivery seam's `{ number, url }` for a pull-request response. A missing id
+ * throws — every pull-request path is addressed by it. The URL is always derived
+ * ({@link pullRequestWebUrl}): Azure's own `url` field is the REST resource, not a
+ * page a human can open.
+ */
+export function toAzureDevOpsPullRequestReference(
+	repo: string,
+	pr: { pullRequestId?: number },
+): AzureDevOpsPullRequestReference {
+	if (pr.pullRequestId === undefined) {
+		throw new Error(
+			`Azure DevOps pull-request response for ${repo} carries no pullRequestId, so it cannot be referenced`,
+		);
+	}
+	return { number: pr.pullRequestId, url: pullRequestWebUrl(repo, pr.pullRequestId) };
+}
+
+/**
+ * The active pull request whose **source** branch is `branch`, or `undefined` when
+ * none is — the delivery seam's "has this branch already got a pull request?"
+ * lookup, which is what makes a resumed delivery reuse its own pull request instead
+ * of opening a second one. Filtered server-side on the exact source ref; Azure
+ * refuses a second active pull request for the same source/target pair, so the
+ * first match is the one to reuse and a single page suffices.
+ */
+export async function findActiveAzureDevOpsPullRequest(
+	repo: string,
+	branch: string,
+): Promise<AzureDevOpsPullRequestReference | undefined> {
+	const query = new URLSearchParams({
+		'searchCriteria.sourceRefName': `${BRANCH_REF_PREFIX}${branch}`,
+		'searchCriteria.status': 'active',
+	});
+	const listed = await azureDevOpsRequest<AzureDevOpsList<AzureDevOpsPullRequest> | undefined>(
+		'GET',
+		`${repositoryApiPath(repo)}/pullrequests?${query}`,
+	);
+	const pr = listed?.value?.[0];
+	return pr ? toAzureDevOpsPullRequestReference(repo, pr) : undefined;
 }
 
 /**

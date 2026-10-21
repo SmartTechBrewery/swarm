@@ -20,23 +20,43 @@ vi.mock('@/integrations/scm/azure-devops/credentials.js', () => ({
 // here they are stubs, so these tests assert only the wiring and persona defaults.
 vi.mock('@/integrations/scm/azure-devops/pull-requests.js', () => ({
 	getAzureDevOpsPullRequest: vi.fn(),
+	getAzureDevOpsPullRequestMergeState: vi.fn(),
 	getAzureDevOpsPullRequestTitle: vi.fn(),
 	getAzureDevOpsBranchHead: vi.fn(),
 	getAzureDevOpsCommitChecks: vi.fn(),
 	listAzureDevOpsPullRequestsForCommit: vi.fn(),
 	listActiveAzureDevOpsPullRequestsForBase: vi.fn(),
 }));
+// The writes' and delivery builders' own suites prove their requests; here they are
+// stubs, so the merge recheck, completion poll and classification are what is tested.
+vi.mock('@/integrations/scm/azure-devops/writes.js', () => ({
+	completeAzureDevOpsPullRequest: vi.fn(),
+	postAzureDevOpsPullRequestThread: vi.fn(),
+}));
+vi.mock('@/integrations/scm/azure-devops/operator-delivery.js', () => ({
+	createAzureDevOpsDeliveryProvider: vi.fn(),
+	createAzureDevOpsOperatorDeliveryProvider: vi.fn(),
+}));
+// The completion poll waits between reads; the tests count reads, not seconds.
+vi.mock('node:timers/promises', () => ({ setTimeout: vi.fn(async () => undefined) }));
 vi.mock('@/integrations/scm/azure-devops/personas.js', () => ({
 	resolveAzureDevOpsPersonaIdentities: vi.fn(),
 	isSwarmAzureDevOpsActor: vi.fn(),
 	getAzureDevOpsPersonaForLogin: vi.fn(),
 }));
 
-import { withAzureDevOpsToken } from '@/integrations/scm/azure-devops/client.js';
+import {
+	AzureDevOpsApiError,
+	withAzureDevOpsToken,
+} from '@/integrations/scm/azure-devops/client.js';
 import {
 	getAzureDevOpsToken,
 	getAzureDevOpsTokenOrNull,
 } from '@/integrations/scm/azure-devops/credentials.js';
+import {
+	createAzureDevOpsDeliveryProvider,
+	createAzureDevOpsOperatorDeliveryProvider,
+} from '@/integrations/scm/azure-devops/operator-delivery.js';
 import {
 	getAzureDevOpsPersonaForLogin,
 	isSwarmAzureDevOpsActor,
@@ -46,11 +66,19 @@ import {
 	getAzureDevOpsBranchHead,
 	getAzureDevOpsCommitChecks,
 	getAzureDevOpsPullRequest,
+	getAzureDevOpsPullRequestMergeState,
 	getAzureDevOpsPullRequestTitle,
 	listActiveAzureDevOpsPullRequestsForBase,
 	listAzureDevOpsPullRequestsForCommit,
 } from '@/integrations/scm/azure-devops/pull-requests.js';
-import { AzureDevOpsSCMIntegration } from '@/integrations/scm/azure-devops/scm-integration.js';
+import {
+	AzureDevOpsSCMIntegration,
+	MERGE_COMPLETION_POLL,
+} from '@/integrations/scm/azure-devops/scm-integration.js';
+import {
+	completeAzureDevOpsPullRequest,
+	postAzureDevOpsPullRequestThread,
+} from '@/integrations/scm/azure-devops/writes.js';
 import { SWARM_GENERATED_FOOTER } from '@/scm/swarm-origin.js';
 import type { ScmPersonaIdentities } from '@/scm/types.js';
 
@@ -294,32 +322,240 @@ describe('AzureDevOpsSCMIntegration', () => {
 		});
 	});
 
-	// Every contract method this phase leaves unbuilt must fail loudly and name its
-	// follow-up phase — never return a misleading `null`/`[]`/no-op that a caller would
-	// mistake for a real answer (issue #1089).
-	describe('deferred contract methods', () => {
-		const deferred: Array<[method: string, phase: string, call: () => unknown]> = [
-			['commentOnPullRequest', 'phase 5/6', () => scm.commentOnPullRequest()],
-			['deliveryProvider', 'phase 5/6', () => scm.deliveryProvider()],
-			['operatorDeliveryProvider', 'phase 5/6', () => scm.operatorDeliveryProvider()],
-			['mergePullRequest', 'phase 5/6', () => scm.mergePullRequest()],
-			['updatePullRequestBranch', 'phase 5/6', () => scm.updatePullRequestBranch()],
-		];
+	describe('commentOnPullRequest', () => {
+		it('posts a thread as the implementer by default and returns its id', async () => {
+			vi.mocked(getAzureDevOpsToken).mockImplementation(async (_p, persona) => `pat-${persona}`);
+			vi.mocked(postAzureDevOpsPullRequestThread).mockResolvedValue(55);
 
-		for (const [method, phase, call] of deferred) {
-			it(`${method} throws naming itself and ${phase}`, async () => {
-				// Sync methods throw, async ones reject — assert on whichever happens.
-				const thrown = await Promise.resolve()
-					.then(call)
-					.then(
-						() => null,
-						(err: unknown) => err,
-					);
+			await expect(scm.commentOnPullRequest(project, 17, 'hello')).resolves.toBe(55);
+			expect(postAzureDevOpsPullRequestThread).toHaveBeenCalledWith(
+				'fabrikam/proj/web',
+				17,
+				'hello',
+			);
+			expect(vi.mocked(withAzureDevOpsToken).mock.calls[0]?.[0]).toBe('pat-implementer');
+		});
+	});
 
-				expect(String(thrown)).toContain(`${method}() is not implemented yet`);
-				expect(String(thrown)).toContain(phase);
-				expect(String(thrown)).toContain('issue #1089');
+	describe('delivery providers', () => {
+		it('builds the per-persona provider over that persona’s own PAT, with reviews', async () => {
+			vi.mocked(getAzureDevOpsToken).mockResolvedValue('pat-rev');
+			const delivery = {} as never;
+			vi.mocked(createAzureDevOpsDeliveryProvider).mockResolvedValue(delivery);
+
+			await expect(scm.deliveryProvider(project, 'reviewer')).resolves.toBe(delivery);
+			expect(getAzureDevOpsToken).toHaveBeenCalledWith(project, 'reviewer');
+			expect(createAzureDevOpsDeliveryProvider).toHaveBeenCalledWith(
+				'fabrikam/proj/web',
+				'pat-rev',
+				{
+					reviews: true,
+				},
+			);
+		});
+
+		it('builds the operator provider from the worker’s own credential', async () => {
+			const delivery = {} as never;
+			vi.mocked(createAzureDevOpsOperatorDeliveryProvider).mockResolvedValue(delivery);
+
+			await expect(scm.operatorDeliveryProvider('fabrikam/proj/web', 'op-pat')).resolves.toBe(
+				delivery,
+			);
+			expect(createAzureDevOpsOperatorDeliveryProvider).toHaveBeenCalledWith(
+				'fabrikam/proj/web',
+				'op-pat',
+			);
+			expect(getAzureDevOpsToken).not.toHaveBeenCalled();
+		});
+	});
+
+	describe('mergePullRequest', () => {
+		const APPROVED = 'da1560886d4f094c3e6c9ef40349f7d38b5d27d7';
+		const MERGE_COMMIT = 'feedfacefeedfacefeedfacefeedfacefeedface';
+
+		type MergeState = Awaited<ReturnType<typeof getAzureDevOpsPullRequestMergeState>>;
+		const state = (overrides: Partial<MergeState> = {}): MergeState => ({
+			merged: false,
+			state: 'open',
+			draft: false,
+			headSha: APPROVED,
+			reviewers: [{ id: IDENTITIES.reviewer, vote: 10, isRequired: false }],
+			mergeStatus: 'succeeded',
+			mergeCommitSha: null,
+			...overrides,
+		});
+		const merge = () => scm.mergePullRequest(project, 17, APPROVED);
+
+		beforeEach(() => {
+			vi.mocked(getAzureDevOpsToken).mockImplementation(async (_p, persona) => `pat-${persona}`);
+			vi.mocked(resolveAzureDevOpsPersonaIdentities).mockResolvedValue(IDENTITIES);
+			vi.mocked(getAzureDevOpsPullRequestMergeState).mockReset();
+			vi.mocked(completeAzureDevOpsPullRequest).mockReset();
+			vi.mocked(completeAzureDevOpsPullRequest).mockResolvedValue(undefined);
+		});
+
+		it('reports an already-completed pull request as merged without completing again', async () => {
+			vi.mocked(getAzureDevOpsPullRequestMergeState).mockResolvedValue(
+				state({ merged: true, state: 'closed', mergeCommitSha: MERGE_COMMIT }),
+			);
+
+			await expect(merge()).resolves.toEqual({
+				status: 'merged',
+				message: 'pull request already completed',
+				sha: MERGE_COMMIT,
 			});
-		}
+			expect(completeAzureDevOpsPullRequest).not.toHaveBeenCalled();
+		});
+
+		it.each([
+			['the head moved', { headSha: 'abc' }, /head changed since the reviewed commit/],
+			['it is a draft again', { draft: true }, /draft/],
+			['it was abandoned', { state: 'closed' as const }, /abandoned/],
+			[
+				'the reviewer persona’s vote no longer approves',
+				{ reviewers: [{ id: IDENTITIES.reviewer, vote: -5, isRequired: false }] },
+				/vote no longer approves/,
+			],
+			['the reviewer persona never voted', { reviewers: [] }, /vote no longer approves/],
+			[
+				'another reviewer rejected it',
+				{
+					reviewers: [
+						{ id: IDENTITIES.reviewer, vote: 10, isRequired: false },
+						{ id: 'guid-human', vote: -10, isRequired: false },
+					],
+				},
+				/rejected/,
+			],
+		])('is not-eligible when %s', async (_case, overrides, message) => {
+			vi.mocked(getAzureDevOpsPullRequestMergeState).mockResolvedValue(state(overrides));
+
+			const outcome = await merge();
+
+			expect(outcome.status).toBe('not-eligible');
+			expect(outcome.message).toMatch(message);
+			expect(completeAzureDevOpsPullRequest).not.toHaveBeenCalled();
+		});
+
+		it('accepts "approved with suggestions" and an upper-cased identity', async () => {
+			vi.mocked(getAzureDevOpsPullRequestMergeState)
+				.mockResolvedValueOnce(
+					state({
+						reviewers: [{ id: IDENTITIES.reviewer.toUpperCase(), vote: 5, isRequired: false }],
+					}),
+				)
+				.mockResolvedValueOnce(
+					state({ merged: true, state: 'closed', mergeCommitSha: MERGE_COMMIT }),
+				);
+
+			await expect(merge()).resolves.toMatchObject({ status: 'merged', sha: MERGE_COMMIT });
+		});
+
+		it('is not-ready while Azure reports merge conflicts', async () => {
+			vi.mocked(getAzureDevOpsPullRequestMergeState).mockResolvedValue(
+				state({ mergeStatus: 'conflicts' }),
+			);
+
+			await expect(merge()).resolves.toMatchObject({ status: 'not-ready' });
+			expect(completeAzureDevOpsPullRequest).not.toHaveBeenCalled();
+		});
+
+		it('completes as the implementer pinned to the approved head, then polls for the result', async () => {
+			vi.mocked(getAzureDevOpsPullRequestMergeState)
+				.mockResolvedValueOnce(state())
+				.mockResolvedValueOnce(state({ mergeStatus: 'queued' }))
+				.mockResolvedValueOnce(
+					state({ merged: true, state: 'closed', mergeCommitSha: MERGE_COMMIT }),
+				);
+
+			await expect(merge()).resolves.toEqual({
+				status: 'merged',
+				message: 'pull request completed',
+				sha: MERGE_COMMIT,
+			});
+			expect(completeAzureDevOpsPullRequest).toHaveBeenCalledWith(
+				'fabrikam/proj/web',
+				17,
+				APPROVED,
+			);
+			expect(vi.mocked(withAzureDevOpsToken).mock.calls[0]?.[0]).toBe('pat-implementer');
+		});
+
+		it('is not-ready when the completion is still running after the bounded poll', async () => {
+			vi.mocked(getAzureDevOpsPullRequestMergeState).mockResolvedValue(state());
+
+			await expect(merge()).resolves.toMatchObject({
+				status: 'not-ready',
+				message: expect.stringMatching(/has not finished merging yet/),
+			});
+			// One recheck plus every poll attempt — and no more.
+			expect(getAzureDevOpsPullRequestMergeState).toHaveBeenCalledTimes(
+				1 + MERGE_COMPLETION_POLL.attempts,
+			);
+		});
+
+		it.each([
+			['a policy rejection', { mergeStatus: 'rejectedByPolicy' }, 'policy-blocked'],
+			['an abandonment', { state: 'closed' as const }, 'not-eligible'],
+			['a conflict', { mergeStatus: 'conflicts' }, 'not-ready'],
+		])('reports %s seen while polling', async (_case, overrides, status) => {
+			vi.mocked(getAzureDevOpsPullRequestMergeState)
+				.mockResolvedValueOnce(state())
+				.mockResolvedValueOnce(state(overrides));
+
+			await expect(merge()).resolves.toMatchObject({ status });
+		});
+
+		it('is not-ready when a poll read fails after the completion was accepted', async () => {
+			vi.mocked(getAzureDevOpsPullRequestMergeState)
+				.mockResolvedValueOnce(state())
+				.mockRejectedValueOnce(new Error('socket hang up'));
+
+			await expect(merge()).resolves.toMatchObject({ status: 'not-ready' });
+		});
+
+		it.each([
+			[409, 'TF401179: conflict', 'not-eligible'],
+			[400, 'lastMergeSourceCommit does not match the source branch', 'not-eligible'],
+			[
+				400,
+				'TF401028: The pull request cannot be completed because of a policy (PolicyViolation)',
+				'policy-blocked',
+			],
+			[403, 'TF401027: You need the Git ContributeToPullRequest permission', 'policy-blocked'],
+			[400, 'Invalid argument', 'provider-error'],
+			[500, 'Internal error', 'provider-error'],
+		])('classifies a %s completion refusal (%s) as %s', async (status, detail, outcome) => {
+			vi.mocked(getAzureDevOpsPullRequestMergeState).mockResolvedValue(state());
+			vi.mocked(completeAzureDevOpsPullRequest).mockRejectedValue(
+				new AzureDevOpsApiError(status, 'PATCH', '/x', detail),
+			);
+
+			await expect(merge()).resolves.toMatchObject({ status: outcome });
+		});
+
+		it('is a provider-error, never a throw, when the recheck read fails', async () => {
+			vi.mocked(getAzureDevOpsPullRequestMergeState).mockRejectedValue(new Error('boom'));
+
+			await expect(merge()).resolves.toEqual({ status: 'provider-error', message: 'boom' });
+		});
+
+		it('is a provider-error, never a throw, when persona identities do not resolve', async () => {
+			vi.mocked(resolveAzureDevOpsPersonaIdentities).mockRejectedValue(
+				new Error('Failed to resolve Azure DevOps identity for reviewer token'),
+			);
+
+			await expect(merge()).resolves.toMatchObject({ status: 'provider-error' });
+			expect(getAzureDevOpsPullRequestMergeState).not.toHaveBeenCalled();
+		});
+	});
+
+	describe('updatePullRequestBranch', () => {
+		it('is a declared unsupported, touching no credential', async () => {
+			await expect(scm.updatePullRequestBranch(project, 17, 'abc')).resolves.toMatchObject({
+				status: 'unsupported',
+			});
+			expect(getAzureDevOpsToken).not.toHaveBeenCalled();
+		});
 	});
 });

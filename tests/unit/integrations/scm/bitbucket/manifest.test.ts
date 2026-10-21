@@ -13,8 +13,13 @@ describe('bitbucket SCM manifest registration', () => {
 		expect(getSCMProvider('bitbucket')).toBe(bitbucketScmManifest);
 	});
 
-	it('registers exactly once, alongside GitHub and GitLab', () => {
-		expect(listSCMProviders().map((m) => m.id)).toEqual(['github', 'bitbucket', 'gitlab']);
+	it('registers exactly once, alongside GitHub, GitLab and Azure DevOps', () => {
+		expect(listSCMProviders().map((m) => m.id)).toEqual([
+			'github',
+			'bitbucket',
+			'gitlab',
+			'azure-devops',
+		]);
 	});
 
 	it('declares the expected identity and its served webhook route', () => {
