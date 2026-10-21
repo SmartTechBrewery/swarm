@@ -191,8 +191,8 @@ describe('classifyReviewLedgerForRecovery', () => {
 			headSha: 'abc123',
 			capOverrideGrantedAt: null,
 			capOverrideConsumedAt: null,
-			// The sweep classifies on slot state alone; owner liveness is the run-detail
-			// read model's question (issue #1038).
+			// A settled owner by default; a `pending` slot blocks only while its owner is
+			// live (issue #1105), so those cases set this explicitly.
 			dispatchActive: false,
 			superseded: false,
 			...overrides,
@@ -204,17 +204,51 @@ describe('classifyReviewLedgerForRecovery', () => {
 	});
 
 	it('reports a pending slot at this head as a review in flight', () => {
-		expect(classifyReviewLedgerForRecovery([slot({ state: 'pending' })], 'abc123')).toBe(
-			'review-in-flight',
-		);
+		expect(
+			classifyReviewLedgerForRecovery([slot({ state: 'pending', dispatchActive: true })], 'abc123'),
+		).toBe('review-in-flight');
 	});
 
-	// The #856/#857 boundary: a leaked reservation is indistinguishable from a live
-	// one here, and criterion 5 forbids disturbing a Review that is in flight.
-	it('reports a pending slot at another head as a review in flight', () => {
+	// Criterion 5 forbids disturbing a Review that is in flight: a pending slot whose
+	// owning dispatch is still due to run blocks, at any head.
+	it('reports a live pending slot at another head as a review in flight', () => {
+		expect(
+			classifyReviewLedgerForRecovery(
+				[slot({ state: 'pending', headSha: 'older', dispatchActive: true })],
+				'abc123',
+			),
+		).toBe('review-in-flight');
+	});
+
+	// Issue #1105: a slot leaked by a dispatch that settled without a Review is not a
+	// review in flight. The reservation reuses it at this head, and abandons it at
+	// another (#857), so the sweep must not skip the pull request behind it forever.
+	it('recovers past a pending slot at this head whose dispatch has settled', () => {
+		expect(classifyReviewLedgerForRecovery([slot({ state: 'pending' })], 'abc123')).toBe('recover');
+	});
+
+	it('recovers past a pending slot at another head whose dispatch has settled', () => {
 		expect(
 			classifyReviewLedgerForRecovery([slot({ state: 'pending', headSha: 'older' })], 'abc123'),
-		).toBe('review-in-flight');
+		).toBe('recover');
+	});
+
+	it('still reports a spent allowance beside a settled pending slot as capped', () => {
+		const slots = [
+			slot({ ordinal: 1, headSha: 'a' }),
+			slot({ ordinal: 2, headSha: 'b' }),
+			slot({ ordinal: 3, headSha: 'c' }),
+			slot({ ordinal: 4, headSha: 'older', state: 'pending' }),
+		];
+		expect(classifyReviewLedgerForRecovery(slots, 'abc123')).toBe('capped');
+	});
+
+	it('reports a live pending slot beside a settled one as a review in flight', () => {
+		const slots = [
+			slot({ ordinal: 1, headSha: 'stale', state: 'pending' }),
+			slot({ ordinal: 2, headSha: 'older', state: 'pending', dispatchActive: true }),
+		];
+		expect(classifyReviewLedgerForRecovery(slots, 'abc123')).toBe('review-in-flight');
 	});
 
 	// `rover#116`'s shape (no slot at the head, no run row) and `swarm#860`'s
@@ -425,7 +459,7 @@ describe('recoverUnreviewedPullRequests', () => {
 					headSha,
 					capOverrideGrantedAt: null,
 					capOverrideConsumedAt: null,
-					dispatchActive: false,
+					dispatchActive: true,
 					superseded: false,
 				},
 			]);

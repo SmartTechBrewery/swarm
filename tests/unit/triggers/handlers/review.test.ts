@@ -28,6 +28,7 @@ vi.mock('@/triggers/review-dispatch-dedup.js', () => ({
 	claimReviewDispatch,
 	refreshReviewDispatchClaim,
 	reviewDispatchClaimTtlSec,
+	reviewDispatchClaimOwner: (dispatchId: string) => `pr-review:${dispatchId}`,
 	buildReviewDispatchKey: (repo: string, prNumber: string, headSha: string) =>
 		`${repo}:${prNumber}:${headSha}`,
 }));
@@ -280,6 +281,7 @@ describe('review trigger', () => {
 				// automation-label gate can resolve the backing board item (issue #354).
 				prBranch: 'issue-42',
 				headSha: 'abc123',
+				verdictSlotReserved: true,
 			});
 		});
 
@@ -394,6 +396,7 @@ describe('review trigger', () => {
 				// The fetched PR's head branch (the default mock's), not the event's.
 				prBranch: 'issue-42',
 				headSha: 'cafe',
+				verdictSlotReserved: true,
 			});
 			// The ownership gate ran off the fetched PR's head branch — no extra
 			// author round trip on this path any more.
@@ -440,6 +443,7 @@ describe('review trigger', () => {
 				// The fetched PR's head branch (the default mock's), not the event's.
 				prBranch: 'issue-42',
 				headSha: 'cafe',
+				verdictSlotReserved: true,
 			});
 			expect(claimReviewDispatch).toHaveBeenCalledTimes(1);
 			expect(scheduleCoalescedJob).not.toHaveBeenCalled();
@@ -556,10 +560,13 @@ describe('review trigger', () => {
 				prBranch: 'issue-9',
 				headSha: 'cafe',
 			});
-			// Same PR+SHA dedup slot as review, plus the per-PR attempt cap.
+			// Same PR+SHA dedup slot as review, plus the per-PR attempt cap. The claim
+			// carries its dispatch's token, so only that dispatch can hand it back
+			// through the owner-fenced release (issue #1105).
 			expect(claimReviewDispatch).toHaveBeenCalledWith(`${PROJECT.repo}:9:cafe`, 'pr-review', {
 				prNumber: '9',
 				headSha: 'cafe',
+				owner: 'pr-review:dispatch-1',
 			});
 			expect(claimRespondToCiAttempt).toHaveBeenCalledWith(`${PROJECT.repo}:9`, {
 				prNumber: '9',
@@ -744,11 +751,12 @@ describe('review trigger', () => {
 			prAuthorLogin: 'operator-human',
 		} as const;
 
-		it('claims the PR+SHA slot before dispatching', async () => {
+		it('claims the PR+SHA slot before dispatching, under its own dispatch token', async () => {
 			await handler.handle(ctx(reviewable));
 			expect(claimReviewDispatch).toHaveBeenCalledWith(`${PROJECT.repo}:42:abc123`, 'pr-review', {
 				prNumber: '42',
 				headSha: 'abc123',
+				owner: 'pr-review:dispatch-1',
 			});
 		});
 
@@ -826,6 +834,7 @@ describe('review trigger', () => {
 				prNumber: '42',
 				prBranch: 'issue-42',
 				headSha: 'abc123',
+				verdictSlotReserved: true,
 			});
 			expect(claimReviewDispatch).not.toHaveBeenCalled();
 		});
@@ -855,6 +864,7 @@ describe('review trigger', () => {
 				prNumber: '42',
 				prBranch: 'issue-42',
 				headSha: 'abc123',
+				verdictSlotReserved: true,
 			});
 			expect(reserveReviewVerdict).toHaveBeenCalledWith(
 				{
@@ -897,6 +907,9 @@ describe('review trigger', () => {
 			});
 			const result = await handler.handle(ctx(reviewable));
 			expect(result).toMatchObject({ phase: 'review' });
+			// The slot was not this evaluation's to create, so a drop before the phase
+			// starts must not hand it back (issue #1105).
+			expect(result).not.toHaveProperty('verdictSlotReserved');
 		});
 
 		it('skips the dispatch when a same-head retry is already submitted', async () => {
@@ -2212,6 +2225,7 @@ describe('review trigger — the no-fix hand-back to Review (issue #841)', () =>
 			// The fetched PR's head branch (the default mock's), not the event's.
 			prBranch: 'issue-42',
 			headSha: 'cafe',
+			verdictSlotReserved: true,
 		});
 		expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
 	});

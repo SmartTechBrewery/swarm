@@ -86,9 +86,21 @@ export function buildReviewDispatchKey(repo: string, prNumber: string, headSha: 
 }
 
 /**
+ * The value a Review's claim is stored under — its owning dispatch (issue #1105),
+ * so a hand-back can prove the claim it is about to release is still its own
+ * ({@link releaseReviewDispatchHeldBy}).
+ */
+export function reviewDispatchClaimOwner(dispatchId: string): string {
+	return `pr-review:${dispatchId}`;
+}
+
+/**
  * Atomically claim the review-dispatch slot for `key`. Returns `true` exactly
  * once per key within the TTL window across all connected processes; every later
  * call returns `false` until the claim expires or is released.
+ *
+ * `context.owner` is stored as the claim's value when given (otherwise the
+ * trigger name is) — the token {@link releaseReviewDispatchHeldBy} compares.
  *
  * Fails closed on Redis errors: logs and returns `false` so the caller skips the
  * dispatch rather than risk a duplicate review.
@@ -96,11 +108,17 @@ export function buildReviewDispatchKey(repo: string, prNumber: string, headSha: 
 export async function claimReviewDispatch(
 	key: string,
 	triggerName: string,
-	context: { prNumber: string; headSha: string },
+	context: { prNumber: string; headSha: string; owner?: string },
 ): Promise<boolean> {
 	const namespacedKey = `${KEY_NS}${key}`;
 	try {
-		const result = await getRedis().set(namespacedKey, triggerName, 'EX', DEDUP_TTL_SEC, 'NX');
+		const result = await getRedis().set(
+			namespacedKey,
+			context.owner ?? triggerName,
+			'EX',
+			DEDUP_TTL_SEC,
+			'NX',
+		);
 		if (result === 'OK') {
 			logger.debug('review-dispatch dedup: claimed review for PR+SHA', {
 				trigger: triggerName,
@@ -206,7 +224,10 @@ export async function refreshReviewDispatchClaim(key: string, ttlSec: number): P
  * an already-submitted verdict behind it — and, since issue #1019, a Review run
  * that settled terminally `failed` having delivered nothing. Since issue #1053
  * also a Respond-to-CI run that was cancelled (it never posts a verdict), and a
- * Review or Respond-to-CI dispatch cancelled before its phase started.
+ * Review or Respond-to-CI dispatch cancelled before its phase started. Since
+ * issue #1105 also a Review dropped as a same-phase duplicate after its own
+ * evaluation created the head's verdict slot — through the owner-fenced
+ * {@link releaseReviewDispatchHeldBy}.
  *
  * The rule all of them share is the only one that matters: **it must NOT be
  * called once a verdict may have been posted.** The agent submits the formal
@@ -234,6 +255,32 @@ export async function releaseReviewDispatch(key: string): Promise<void> {
 		await getRedis().del(namespacedKey);
 	} catch (err) {
 		logger.warn('review-dispatch dedup: release failed (TTL will reap)', {
+			reviewDispatchKey: key,
+			error: String(err),
+		});
+	}
+}
+
+// Compare-and-delete: DEL only while the key still carries the caller's token.
+const RELEASE_IF_HELD_BY = `if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) end return 0`;
+
+/**
+ * Release a claim only while `owner` still holds it (issue #1105) — the
+ * ownership-fenced form of {@link releaseReviewDispatch}, for a hand-back that
+ * can run long after its own claim was taken. A claim lapses after five minutes,
+ * so by then a later dispatch may have re-claimed the key; an unconditional DEL
+ * would erase *its* claim and let a further event start a duplicate review. Any
+ * other value — a later dispatch's token, a refreshed continuation's — is left
+ * alone, as is an expired key.
+ *
+ * Best-effort, like the unconditional release: errors are logged, never thrown.
+ */
+export async function releaseReviewDispatchHeldBy(key: string, owner: string): Promise<void> {
+	const namespacedKey = `${KEY_NS}${key}`;
+	try {
+		await getRedis().eval(RELEASE_IF_HELD_BY, 1, namespacedKey, owner);
+	} catch (err) {
+		logger.warn('review-dispatch dedup: owner-fenced release failed (TTL will reap)', {
 			reviewDispatchKey: key,
 			error: String(err),
 		});

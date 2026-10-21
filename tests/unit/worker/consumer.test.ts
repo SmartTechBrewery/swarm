@@ -392,8 +392,12 @@ const getSubmittedReviewSlot = vi.fn(
 	async (_key: unknown) =>
 		undefined as { ordinal: number; verdict: string | null; reviewId: string | null } | undefined,
 );
+/** The owner-fenced hand-back of a same-phase duplicate Review (issue #1105). */
+const abandonReviewVerdictOwnedBy = vi.fn(async (_key: unknown, _dispatchId: string) => true);
 vi.mock('@/db/repositories/reviewVerdictsRepository.js', () => ({
 	abandonReviewVerdict: (key: unknown) => abandonReviewVerdict(key),
+	abandonReviewVerdictOwnedBy: (key: unknown, dispatchId: string) =>
+		abandonReviewVerdictOwnedBy(key, dispatchId),
 	getSubmittedReviewSlot: (key: unknown) => getSubmittedReviewSlot(key),
 	// The one-line rule itself, re-implemented rather than proxied: the real
 	// module is fully mocked here, and `REVIEW_VERDICT_CAP` is 3.
@@ -403,10 +407,14 @@ vi.mock('@/db/repositories/reviewVerdictsRepository.js', () => ({
 
 const refreshReviewDispatchClaim = vi.fn(async (_key: string, _ttlSec: number) => {});
 const releaseReviewDispatch = vi.fn(async (_key: string) => {});
+const releaseReviewDispatchHeldBy = vi.fn(async (_key: string, _owner: string) => {});
 vi.mock('@/triggers/review-dispatch-dedup.js', () => ({
 	refreshReviewDispatchClaim: (key: string, ttlSec: number) =>
 		refreshReviewDispatchClaim(key, ttlSec),
 	releaseReviewDispatch: (key: string) => releaseReviewDispatch(key),
+	releaseReviewDispatchHeldBy: (key: string, owner: string) =>
+		releaseReviewDispatchHeldBy(key, owner),
+	reviewDispatchClaimOwner: (dispatchId: string) => `pr-review:${dispatchId}`,
 	buildReviewDispatchKey: (repo: string, prNumber: string, headSha: string) =>
 		`${repo}:${prNumber}:${headSha}`,
 }));
@@ -939,6 +947,8 @@ describe('processJob', () => {
 		releaseConflictResolution.mockClear();
 		releaseRespondToCiAttempt.mockClear();
 		abandonReviewVerdict.mockClear();
+		abandonReviewVerdictOwnedBy.mockReset();
+		abandonReviewVerdictOwnedBy.mockResolvedValue(true);
 		claimDispatchForJob.mockClear();
 		claimDispatchForJob.mockImplementation(async (job: Record<string, unknown>) => ({
 			claimed: true,
@@ -976,6 +986,8 @@ describe('processJob', () => {
 		refreshConflictResolutionClaim.mockClear();
 		refreshReviewDispatchClaim.mockClear();
 		releaseReviewDispatch.mockClear();
+		releaseReviewDispatchHeldBy.mockReset();
+		releaseReviewDispatchHeldBy.mockResolvedValue(undefined);
 		createRun.mockClear();
 		createRun.mockResolvedValue('run-1');
 		completeRun.mockClear();
@@ -6233,6 +6245,159 @@ describe('processJob', () => {
 					registryReturning(REVIEW_TRIGGER),
 				);
 				expect(afterFailure.status).toBe('phase-succeeded');
+			});
+		});
+
+		// Issue #1105. A Review dropped behind a same-phase holder used to settle
+		// `skipped-duplicate` with its PR+SHA claim held and its freshly reserved verdict
+		// slot `pending`, so the holder — the unreviewed-PR sweep's own dispatch, its
+		// task/phase preset — found the claim taken and settled `no-trigger`, and
+		// neither ran a Review.
+		describe('a Review dropped as a same-phase duplicate (issue #1105)', () => {
+			const DISPATCH_KEY = `${PROJECT.repo}:17:deadbeef`;
+			const claimNextDispatchAs = (id: string) => {
+				claimDispatchForJob.mockImplementationOnce(async (job: Record<string, unknown>) => ({
+					claimed: true,
+					dispatch: { ...mockDispatchRow(job), id },
+				}));
+			};
+
+			it('hands back the claim and the slot it created, after settling', async () => {
+				findExecutingDispatchForTask.mockResolvedValue({ id: 'other', phase: 'review' });
+
+				const outcome = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning({ ...REVIEW_TRIGGER, verdictSlotReserved: true }),
+				);
+
+				expect(outcome.status).toBe('skipped-in-flight');
+				expect(completeDispatch).toHaveBeenCalledWith('dispatch-1', 'skipped-duplicate');
+				// Both fenced on this dispatch: a later owner's claim and slot survive.
+				expect(releaseReviewDispatchHeldBy).toHaveBeenCalledExactlyOnceWith(
+					DISPATCH_KEY,
+					'pr-review:dispatch-1',
+				);
+				expect(abandonReviewVerdictOwnedBy).toHaveBeenCalledExactlyOnceWith(
+					{ projectId: PROJECT.id, repository: PROJECT.repo, prNumber: '17', headSha: 'deadbeef' },
+					'dispatch-1',
+				);
+				expect(releaseReviewDispatch).not.toHaveBeenCalled();
+				expect(abandonReviewVerdict).not.toHaveBeenCalled();
+				// Terminal first: until this dispatch settles it still reads as an executing
+				// Review to whichever dispatch takes the freed claim next.
+				const settled = completeDispatch.mock.invocationCallOrder[0];
+				expect(releaseReviewDispatchHeldBy.mock.invocationCallOrder[0]).toBeGreaterThan(settled);
+				expect(abandonReviewVerdictOwnedBy.mock.invocationCallOrder[0]).toBeGreaterThan(settled);
+			});
+
+			// Terminal first is a checked precondition, not just an ordering: a completion
+			// that did not settle the row (or threw) hands back nothing.
+			it.each([
+				['settled nothing', () => completeDispatch.mockResolvedValueOnce(false)],
+				['threw', () => completeDispatch.mockRejectedValueOnce(new Error('db down'))],
+			])('hands back nothing when its completion %s', async (_label, arrange) => {
+				findExecutingDispatchForTask.mockResolvedValue({ id: 'other', phase: 'review' });
+				arrange();
+
+				const outcome = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning({ ...REVIEW_TRIGGER, verdictSlotReserved: true }),
+				);
+
+				expect(outcome.status).toBe('skipped-in-flight');
+				expect(releaseReviewDispatchHeldBy).not.toHaveBeenCalled();
+				expect(abandonReviewVerdictOwnedBy).not.toHaveBeenCalled();
+			});
+
+			// A reused slot may belong to a same-head Review that is still running;
+			// abandoning it would make that Review's verdict write miss.
+			it('hands back nothing for a slot it reused', async () => {
+				findExecutingDispatchForTask.mockResolvedValue({ id: 'other', phase: 'review' });
+
+				const outcome = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning(REVIEW_TRIGGER),
+				);
+
+				expect(outcome.status).toBe('skipped-in-flight');
+				expect(completeDispatch).toHaveBeenCalledWith('dispatch-1', 'skipped-duplicate');
+				expect(releaseReviewDispatchHeldBy).not.toHaveBeenCalled();
+				expect(abandonReviewVerdictOwnedBy).not.toHaveBeenCalled();
+			});
+
+			// Review F1 on #1106: D2 reserved, then stalled past the claim's TTL; D3
+			// re-claimed the key and the same-head reservation re-pointed the pending
+			// slot to D3. D2's late duplicate drop must leave D3's claim and slot live.
+			it('leaves a later owner’s claim and slot alone', async () => {
+				const claimOwner = new Map([[DISPATCH_KEY, 'pr-review:d3']]);
+				const slotOwner = new Map([[DISPATCH_KEY, 'd3']]);
+				releaseReviewDispatchHeldBy.mockImplementation(async (key, owner) => {
+					if (claimOwner.get(key) === owner) claimOwner.delete(key);
+				});
+				abandonReviewVerdictOwnedBy.mockImplementation(async (_key, dispatchId) => {
+					if (slotOwner.get(DISPATCH_KEY) !== dispatchId) return false;
+					slotOwner.delete(DISPATCH_KEY);
+					return true;
+				});
+				findExecutingDispatchForTask.mockResolvedValue({ id: 'd3', phase: 'review' });
+				claimNextDispatchAs('d2');
+
+				const outcome = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning({ ...REVIEW_TRIGGER, verdictSlotReserved: true }),
+				);
+
+				expect(outcome.status).toBe('skipped-in-flight');
+				expect(releaseReviewDispatchHeldBy).toHaveBeenCalledWith(DISPATCH_KEY, 'pr-review:d2');
+				expect(abandonReviewVerdictOwnedBy).toHaveBeenCalledWith(expect.anything(), 'd2');
+				expect(claimOwner.get(DISPATCH_KEY)).toBe('pr-review:d3');
+				expect(slotOwner.get(DISPATCH_KEY)).toBe('d3');
+			});
+
+			// Acceptance criterion: the live `under-control-mobile#115` interleaving.
+			it('runs exactly one Review when a webhook and the sweep race for one PR+SHA', async () => {
+				// The PR+SHA claim as the SET-NX it is: the first evaluation to reach it
+				// takes it under its dispatch's token and reserves a fresh slot, any other
+				// declines.
+				const claims = new Map<string, string>();
+				const registry = createTriggerRegistry();
+				registry.register({
+					name: 'pr-review',
+					description: 'claims the PR+SHA slot, then reserves the verdict slot',
+					matches: () => true,
+					handle: async (ctx) => {
+						if (claims.has(DISPATCH_KEY)) return null;
+						claims.set(DISPATCH_KEY, `pr-review:${ctx.dispatchId}`);
+						return { ...REVIEW_TRIGGER, verdictSlotReserved: true };
+					},
+				});
+				releaseReviewDispatchHeldBy.mockImplementation(async (key, owner) => {
+					if (claims.get(key) === owner) claims.delete(key);
+				});
+
+				// The sweep's dispatch is `leased` with its preset task and phase, so the
+				// webhook dispatch evaluating first finds it as an executing Review.
+				findExecutingDispatchForTask.mockResolvedValueOnce({
+					id: 'sweep-dispatch',
+					phase: 'review',
+				});
+				claimNextDispatchAs('webhook-dispatch');
+				const webhook = await processJob(createMockScmWebhookJob(), registry);
+				expect(webhook.status).toBe('skipped-in-flight');
+
+				// Now the webhook dispatch is terminal and the asker is excluded, so the
+				// sweep's dispatch finds no hold — and the claim free to take.
+				claimNextDispatchAs('sweep-dispatch');
+				const sweep = await processJob(createMockScmWebhookJob(), registry);
+
+				expect(sweep.status).toBe('phase-succeeded');
+				expect(phaseCalls).toHaveLength(1);
+				expect(completeDispatch).toHaveBeenCalledWith('webhook-dispatch', 'skipped-duplicate');
+				expect(completeDispatch).not.toHaveBeenCalledWith('sweep-dispatch', 'no-trigger');
+				expect(abandonReviewVerdictOwnedBy).toHaveBeenCalledExactlyOnceWith(
+					expect.anything(),
+					'webhook-dispatch',
+				);
 			});
 		});
 

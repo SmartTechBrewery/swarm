@@ -213,6 +213,7 @@ import {
 	buildReviewDispatchKey,
 	claimReviewDispatch,
 	refreshReviewDispatchClaim,
+	reviewDispatchClaimOwner,
 	reviewDispatchClaimTtlSec,
 } from '../review-dispatch-dedup.js';
 import { checkRecheckCoalesceKey, mergeabilityRecheckCoalesceKey } from '../review-recheck-keys.js';
@@ -1049,8 +1050,10 @@ async function dispatchRespondToCi(
  * Fails closed: a `blocked` (another head's reservation is still pending) or
  * `capped` (the review allowance is spent — either bound, issue #1079) result skips the dispatch, as
  * does a persistence error — a re-review the ledger can't currently account
- * for must not run ahead of it. A `reserved`/`reused` result (the common
- * case, including a same-head retry) proceeds.
+ * for must not run ahead of it — each answers `null`. A `reserved`/`reused`
+ * result (the common case, including a same-head retry) proceeds, and is
+ * returned so the caller can tell a slot this evaluation created from one it
+ * reused (issue #1105).
  *
  * The slot is owned by `dispatchId` — this evaluation's own dispatch (issue
  * #857) — so it stops blocking the PR once that dispatch settles without a
@@ -1061,7 +1064,7 @@ async function reserveDurableReviewSlot(
 	prNumber: string,
 	headSha: string,
 	dispatchId: string,
-): Promise<boolean> {
+): Promise<'reserved' | 'reused' | null> {
 	try {
 		const reservation = await reserveReviewVerdict(
 			{
@@ -1090,7 +1093,7 @@ async function reserveDurableReviewSlot(
 				headSha,
 				pendingOrdinal: reservation.ordinal,
 			});
-			return false;
+			return null;
 		}
 		if (reservation.status === 'reused' && reservation.state === 'submitted') {
 			logger.debug('review: slot already submitted for this head SHA — skipping same-head retry', {
@@ -1098,7 +1101,7 @@ async function reserveDurableReviewSlot(
 				headSha,
 				ordinal: reservation.ordinal,
 			});
-			return false;
+			return null;
 		}
 		if (reservation.status === 'capped') {
 			// Which bound bit is the line an operator greps (issue #1079), so the two
@@ -1117,7 +1120,7 @@ async function reserveDurableReviewSlot(
 					supersededCap: REVIEW_SUPERSEDED_CAP,
 				},
 			);
-			return false;
+			return null;
 		}
 		logger.debug('review: reserved durable review-verdict slot', {
 			prNumber,
@@ -1126,14 +1129,14 @@ async function reserveDurableReviewSlot(
 			reused: reservation.status === 'reused',
 			capOverride: reservation.status === 'reserved' && reservation.capOverride === true,
 		});
-		return true;
+		return reservation.status;
 	} catch (err) {
 		logger.error('review: failed to reserve review-verdict slot — failing closed', {
 			prNumber,
 			headSha,
 			error: err instanceof Error ? err.message : String(err),
 		});
-		return false;
+		return null;
 	}
 }
 
@@ -1699,6 +1702,7 @@ export function createReviewTrigger(): TriggerHandler {
 				const claimed = await claimReviewDispatch(dispatchKey, 'pr-review', {
 					prNumber,
 					headSha,
+					owner: reviewDispatchClaimOwner(ctx.dispatchId),
 				});
 				if (!claimed) {
 					// A decline the operator would otherwise have to diagnose off the
@@ -1712,8 +1716,8 @@ export function createReviewTrigger(): TriggerHandler {
 				return dispatchRespondToCi(ctx, prNumber, headSha, disposition.failedChecks);
 			}
 
-			if (!(await reserveDurableReviewSlot(ctx.project, prNumber, headSha, ctx.dispatchId)))
-				return null;
+			const slot = await reserveDurableReviewSlot(ctx.project, prNumber, headSha, ctx.dispatchId);
+			if (!slot) return null;
 
 			logger.debug('review: dispatching Review phase', { prNumber, headSha });
 			return {
@@ -1722,6 +1726,7 @@ export function createReviewTrigger(): TriggerHandler {
 				prNumber,
 				prBranch: mergeCheck.prBranch,
 				headSha,
+				...(slot === 'reserved' ? { verdictSlotReserved: true as const } : {}),
 			};
 		},
 	};
