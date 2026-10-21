@@ -22,6 +22,7 @@ import {
 	inArray,
 	isNotNull,
 	isNull,
+	lt,
 	lte,
 	ne,
 	notInArray,
@@ -362,6 +363,8 @@ type DispatchWriteExecutor = Pick<ReturnType<typeof getDb>, 'insert' | 'select' 
  * webhook or a crash-retried synthetic enqueue can never mint a second
  * dispatch. A `runId` conflict (the partial unique active-run index) throws —
  * callers treat that as "a retry for this run is already in flight".
+ * {@link bindDispatchToRun} is the claim-side counterpart, for a dispatch taking
+ * over a run row it was not created with.
  */
 export async function createDispatch(
 	input: CreateDispatchInput,
@@ -499,6 +502,47 @@ export async function markDispatchRunning(
 		.where(and(eq(dispatches.id, id), inArray(dispatches.state, ['leased', 'running'])))
 		.returning({ id: dispatches.id });
 	return rows.length > 0;
+}
+
+/**
+ * Whether a write failed on a unique index. Drizzle wraps the driver error as
+ * `Failed query: …`, so the Postgres `23505` code can sit on the error itself or
+ * on its `cause`.
+ */
+function isUniqueViolation(err: unknown): boolean {
+	if (typeof err !== 'object' || err === null) return false;
+	if ((err as { code?: string }).code === '23505') return true;
+	const cause = (err as { cause?: unknown }).cause;
+	return (
+		typeof cause === 'object' && cause !== null && (cause as { code?: string }).code === '23505'
+	);
+}
+
+/**
+ * Bind a claimed dispatch to the run row it is about to take over, **before
+ * anything is written to that row** (issue #1102). The partial unique
+ * `uq_dispatches_active_run` index is the arbiter: when another active dispatch
+ * still owns the run — a `retry-scheduled` retry of an earlier review, say — the
+ * update raises, and this answers `false` so the caller leaves the run alone and
+ * records its attempt on a fresh row instead of overwriting the owner's status,
+ * error, worker and payload. The update writes only `run_id`, so that index is the
+ * only unique constraint it can violate.
+ *
+ * Also `false` when this dispatch is no longer a `leased`/`running` claim;
+ * {@link markDispatchRunning} then refuses it the same way.
+ */
+export async function bindDispatchToRun(id: string, runId: string): Promise<boolean> {
+	try {
+		const rows = await getDb()
+			.update(dispatches)
+			.set({ runId, updatedAt: new Date() })
+			.where(and(eq(dispatches.id, id), inArray(dispatches.state, ['leased', 'running'])))
+			.returning({ id: dispatches.id });
+		return rows.length > 0;
+	} catch (err) {
+		if (isUniqueViolation(err)) return false;
+		throw err;
+	}
 }
 
 /**
@@ -855,9 +899,12 @@ export async function cancelWaitingDispatch(
 }
 
 /**
- * Retire one **waiting board-driven dispatch together with its run row** — the
- * settle behind a board move superseding the phase an earlier move left queued
- * (issue #909), applied to each row {@link listRetirableBoardDispatchesForTask}
+ * Retire one **waiting dispatch together with its run row** — the settle behind
+ * a newer event superseding work an earlier one left queued. Two callers apply it:
+ * a board move retiring the phase an earlier move left queued (issue #909), to
+ * each row {@link listRetirableBoardDispatchesForTask} returns, and a newer review
+ * of a pull request retiring the Respond-to-review an earlier review left queued
+ * (issue #1102), to each row {@link listEarlierWaitingRespondToReviewDispatches}
  * returns.
  *
  * Both writes happen in one transaction, and that pairing is the acceptance
@@ -891,12 +938,12 @@ export async function cancelWaitingDispatch(
  * the session — so a `retry-scheduled` board dispatch that held a preserved
  * session stays resumable. `cancellation` is left unset because its origin
  * vocabulary describes an operator acting through the dashboard or API, and this
- * is the board's own bookkeeping. And no `failureDiagnosis` is recorded: no known
- * failure condition describes "the card asks for something else now", and the
- * reason string already says it — the automation-label gate settles without one
- * for the same reason.
+ * is SWARM's own bookkeeping. And no `failureDiagnosis` is recorded: no known
+ * failure condition describes "the card asks for something else now" or "a newer
+ * review is waiting", and the reason string already says it — the
+ * automation-label gate settles without one for the same reason.
  */
-export async function retireWaitingBoardDispatch(
+export async function retireWaitingDispatch(
 	id: string,
 	reason: string,
 ): Promise<{ dispatch: DispatchRow; runSettled: boolean } | null> {
@@ -1423,6 +1470,47 @@ export async function listRetirableBoardDispatchesForTask(
 				inArray(dispatches.phase, [...BOARD_DRIVEN_PHASES]),
 				ne(dispatches.id, excludeDispatchId),
 				...(keepPhase ? [ne(dispatches.phase, keepPhase)] : []),
+			),
+		)
+		.orderBy(asc(dispatches.createdAt));
+}
+
+/**
+ * The **still-waiting Respond-to-review dispatches a newer review of the same pull
+ * request supersedes** (issue #1102). Every Respond-to-review dispatch for a pull
+ * request shares the `<pr>-respond` task id and therefore its run row, so an
+ * earlier review's dispatch left waiting would otherwise both hold that row and,
+ * once it ran, answer a review that is no longer the latest.
+ *
+ * Keyed on the normalized `(project_id, task_id, phase, state)` columns, never on
+ * a payload path (ai/RULES.md §2), exactly as {@link listRetirableBoardDispatchesForTask}
+ * is. Two further things the predicate is, deliberately:
+ *
+ * - **Only {@link WAITING_DISPATCH_STATES}.** A `leased`/`running` attempt is
+ *   executing against the checkout, and stopping one stays Terminate's job.
+ * - **Strictly `created_at < createdBefore`** — the asking dispatch's own creation
+ *   time. A *re-evaluated* older dispatch (a retry of its own review) must never
+ *   retire the newer review's dispatch, and the strict bound is what stops it.
+ *
+ * One indexed scan on `(project_id, state)`, the same read cost the task guards pay.
+ */
+export async function listEarlierWaitingRespondToReviewDispatches(
+	projectId: string,
+	taskId: string,
+	excludeDispatchId: string,
+	createdBefore: Date,
+): Promise<DispatchRow[]> {
+	return getDb()
+		.select()
+		.from(dispatches)
+		.where(
+			and(
+				eq(dispatches.projectId, projectId),
+				eq(dispatches.taskId, taskId),
+				eq(dispatches.phase, 'respond-to-review'),
+				inArray(dispatches.state, [...WAITING_DISPATCH_STATES]),
+				ne(dispatches.id, excludeDispatchId),
+				lt(dispatches.createdAt, createdBefore),
 			),
 		)
 		.orderBy(asc(dispatches.createdAt));

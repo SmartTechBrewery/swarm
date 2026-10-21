@@ -37,7 +37,7 @@
 
 import {
 	listRetirableBoardDispatchesForTask,
-	retireWaitingBoardDispatch,
+	retireWaitingDispatch,
 } from '../db/repositories/dispatchesRepository.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
@@ -103,10 +103,7 @@ export async function retireSupersededBoardPhases(input: RetireBoardPhasesInput)
 
 		const retired: { id: string; phase: string | null; runId: string | null }[] = [];
 		for (const row of stale) {
-			const settled = await retireWaitingBoardDispatch(
-				row.id,
-				retirementReason(row.phase, keepPhase),
-			);
+			const settled = await retireWaitingDispatch(row.id, retirementReason(row.phase, keepPhase));
 			// `null` means a worker claimed it between the read and the conditional
 			// cancel — it is executing now, and stopping it stays Terminate's job.
 			if (!settled) continue;

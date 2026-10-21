@@ -29,6 +29,7 @@ import { getAppSettings } from '../db/repositories/appSettingsRepository.js';
 import {
 	ACTIVE_DISPATCH_STATES,
 	BRANCH_WRITING_PHASES,
+	bindDispatchToRun,
 	cancelClaimedDispatch,
 	claimWorkerForDispatch,
 	completeDispatch,
@@ -1312,6 +1313,7 @@ async function deferBeforeRun(
 		{ globalDefaults: await loadGlobalDefaults() },
 		trigger,
 		job,
+		dispatch.id,
 	);
 	if (runId) deferred.runId = runId;
 
@@ -2828,11 +2830,33 @@ async function tryReuseLatestRun(
 	resolution: PhaseResolution,
 	trigger: TriggerResult,
 	job: SwarmJob,
+	dispatchId: string,
 	implementationUnplanned = false,
 ): Promise<string | undefined> {
 	const prior = await getLatestRunForTask(project.id, trigger.taskId, trigger.phase);
 	if (!prior || (!isRetryPendingStatus(prior.status) && prior.status !== 'failed'))
 		return undefined;
+	// Take the row over before writing anything to it (issue #1102). A retry-pending
+	// row can still be owned by another active dispatch — an earlier review's
+	// `retry-scheduled` Respond-to-review, say — and resetting it first would write
+	// this attempt's status, worker and payload over a run that is not ours, then
+	// fail on `uq_dispatches_active_run` at `markDispatchRunning`. The bind lets the
+	// index refuse up front, and this attempt is recorded on a fresh row instead. No
+	// unbind is needed if the reset below then matches nothing: `markDispatchRunning`
+	// / `deferDispatchToPending` rebind the dispatch to the row actually used.
+	if (!(await bindDispatchToRun(dispatchId, prior.id))) {
+		logger.info(
+			'Latest run row is still owned by another active dispatch — recording this attempt on a fresh row',
+			{
+				projectId: project.id,
+				phase: trigger.phase,
+				taskId: trigger.taskId,
+				runId: prior.id,
+				dispatchId,
+			},
+		);
+		return undefined;
+	}
 	if (job.resumeSession && prior.agentSessionId) {
 		job.agentSessionId = prior.agentSessionId;
 	} else if (!job.resumeSession) {
@@ -2961,7 +2985,8 @@ async function tryFetchPrTitle(
 /**
  * Reuse an existing `runs` row for this job rather than inserting a new one:
  * the carried row when the job names one (a re-enqueued deferral or manual
- * retry — issue #136), otherwise the latest terminal row for the task. Returns
+ * retry — issue #136), otherwise the latest terminal row for the task that no
+ * other active dispatch owns (issue #1102). Returns
  * the reused row's id, or `undefined` when there's nothing to reuse (the caller
  * then creates a fresh row). Restores a resumable Claude session id from the
  * carried row onto the job before resetting it, so a resumed retry threads the
@@ -2972,6 +2997,7 @@ async function reuseRunRow(
 	resolution: PhaseResolution,
 	trigger: TriggerResult,
 	job: SwarmJob,
+	dispatchId: string,
 	implementationUnplanned = false,
 ): Promise<string | undefined> {
 	const existingRunId = job.runId;
@@ -2999,7 +3025,14 @@ async function reuseRunRow(
 		return tryResetCarriedRun(project, resolution, trigger, job, implementationUnplanned);
 	}
 	try {
-		return await tryReuseLatestRun(project, resolution, trigger, job, implementationUnplanned);
+		return await tryReuseLatestRun(
+			project,
+			resolution,
+			trigger,
+			job,
+			dispatchId,
+			implementationUnplanned,
+		);
 	} catch (err) {
 		logger.error('Failed to reuse terminal run row (creating a new one)', {
 			projectId: project.id,
@@ -3016,9 +3049,17 @@ async function tryCreateRun(
 	resolution: PhaseResolution,
 	trigger: TriggerResult,
 	job: SwarmJob,
+	dispatchId: string,
 	implementationUnplanned = false,
 ): Promise<string | undefined> {
-	const reusedRunId = await reuseRunRow(project, resolution, trigger, job, implementationUnplanned);
+	const reusedRunId = await reuseRunRow(
+		project,
+		resolution,
+		trigger,
+		job,
+		dispatchId,
+		implementationUnplanned,
+	);
 	if (reusedRunId) return reusedRunId;
 	const prNumber = 'prNumber' in trigger ? trigger.prNumber : undefined;
 	try {
@@ -5265,7 +5306,14 @@ export async function processJob(
 		// Record a run-history row for this agent-CLI invocation. Everything here is
 		// best-effort (own try/catch inside the helpers, logged not thrown): the
 		// dashboard is a secondary view, so a DB hiccup must never fail a real run.
-		runId = await tryCreateRun(project, resolution, trigger, job, implementationUnplanned);
+		runId = await tryCreateRun(
+			project,
+			resolution,
+			trigger,
+			job,
+			dispatch.id,
+			implementationUnplanned,
+		);
 
 		// The dispatch is now `running` against its run row; renew the lease to
 		// cover this phase's own wall-clock timeout so a live run is never

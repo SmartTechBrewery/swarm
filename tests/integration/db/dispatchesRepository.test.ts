@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 
 import { getDb } from '../../../src/db/client.js';
 import {
+	bindDispatchToRun,
 	cancelAllWaitingDispatches,
 	cancelClaimedDispatch,
 	cancelWaitingDispatch,
@@ -217,6 +218,60 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 				runId,
 			});
 			expect(second.created).toBe(true);
+		});
+	});
+
+	describe('bindDispatchToRun (issue #1102)', () => {
+		const TASK = '1439-respond';
+
+		async function seedRun(): Promise<string> {
+			return createRun({
+				projectId: PROJECT_ID,
+				repository: REPO,
+				taskId: TASK,
+				phase: 'respond-to-review',
+			});
+		}
+
+		it('binds a leased dispatch to a run no other dispatch owns', async () => {
+			const runId = await seedRun();
+			const claimant = await seedDispatchInState(TASK, 'leased', undefined, 'respond-to-review');
+
+			expect(await bindDispatchToRun(claimant, runId)).toBe(true);
+			expect(await getDispatchById(claimant)).toMatchObject({ runId });
+		});
+
+		it.each([
+			'retry-scheduled',
+			'pending',
+			'running',
+		] as const)('refuses, without throwing, while a %s dispatch owns the run', async (state) => {
+			const runId = await seedRun();
+			await seedDispatchInState(TASK, state, runId, 'respond-to-review');
+			const claimant = await seedDispatchInState(TASK, 'leased', undefined, 'respond-to-review');
+
+			expect(await bindDispatchToRun(claimant, runId)).toBe(false);
+			expect((await getDispatchById(claimant))?.runId).toBeNull();
+		});
+
+		it('refuses a dispatch that is no longer a claim', async () => {
+			const runId = await seedRun();
+			const cancelled = await seedDispatchInState(
+				TASK,
+				'cancelled',
+				undefined,
+				'respond-to-review',
+			);
+
+			expect(await bindDispatchToRun(cancelled, runId)).toBe(false);
+		});
+
+		it('binds once the previous owner has gone terminal', async () => {
+			const runId = await seedRun();
+			await seedDispatchInState(TASK, 'failed', runId, 'respond-to-review');
+			const claimant = await seedDispatchInState(TASK, 'leased', undefined, 'respond-to-review');
+
+			expect(await bindDispatchToRun(claimant, runId)).toBe(true);
 		});
 	});
 

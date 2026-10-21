@@ -3,12 +3,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
 	DispatchRow,
 	listRetirableBoardDispatchesForTask as ListRetirable,
-	retireWaitingBoardDispatch as RetireWaiting,
+	retireWaitingDispatch as RetireWaiting,
 } from '@/db/repositories/dispatchesRepository.js';
 
 vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
 	listRetirableBoardDispatchesForTask: vi.fn<typeof ListRetirable>(),
-	retireWaitingBoardDispatch: vi.fn<typeof RetireWaiting>(),
+	retireWaitingDispatch: vi.fn<typeof RetireWaiting>(),
 }));
 
 vi.mock('@/queue/producer.js', () => ({
@@ -24,7 +24,7 @@ vi.mock('@/dispatch/dispatcher.js', () => ({
 
 import {
 	listRetirableBoardDispatchesForTask,
-	retireWaitingBoardDispatch,
+	retireWaitingDispatch,
 } from '@/db/repositories/dispatchesRepository.js';
 import { retireSupersededBoardPhases } from '@/dispatch/board-phase-retirement.js';
 import { removePendingJobById } from '@/queue/producer.js';
@@ -54,7 +54,7 @@ const INPUT = {
  */
 function stage(rows: DispatchRow[]): void {
 	vi.mocked(listRetirableBoardDispatchesForTask).mockResolvedValue(rows);
-	vi.mocked(retireWaitingBoardDispatch).mockImplementation(async (id) => {
+	vi.mocked(retireWaitingDispatch).mockImplementation(async (id) => {
 		const found = rows.find((candidate) => candidate.id === id);
 		return found ? { dispatch: found, runSettled: true } : null;
 	});
@@ -62,7 +62,7 @@ function stage(rows: DispatchRow[]): void {
 
 beforeEach(() => {
 	vi.mocked(listRetirableBoardDispatchesForTask).mockReset();
-	vi.mocked(retireWaitingBoardDispatch).mockReset();
+	vi.mocked(retireWaitingDispatch).mockReset();
 	vi.mocked(removePendingJobById).mockReset().mockResolvedValue(true);
 	stage([]);
 });
@@ -77,7 +77,7 @@ describe('retireSupersededBoardPhases', () => {
 			'd-current',
 		);
 		// Nothing waiting — no settle, no wake-up removal, nothing logged.
-		expect(retireWaitingBoardDispatch).not.toHaveBeenCalled();
+		expect(retireWaitingDispatch).not.toHaveBeenCalled();
 		expect(removePendingJobById).not.toHaveBeenCalled();
 	});
 
@@ -97,10 +97,7 @@ describe('retireSupersededBoardPhases', () => {
 		stage([row({ id: 'd-1', wakeSeq: 0 }), row({ id: 'd-2', wakeSeq: 7 })]);
 
 		expect(await retireSupersededBoardPhases(INPUT)).toBe(2);
-		expect(vi.mocked(retireWaitingBoardDispatch).mock.calls.map(([id]) => id)).toEqual([
-			'd-1',
-			'd-2',
-		]);
+		expect(vi.mocked(retireWaitingDispatch).mock.calls.map(([id]) => id)).toEqual(['d-1', 'd-2']);
 		expect(vi.mocked(removePendingJobById).mock.calls.map(([id]) => id)).toEqual([
 			'dispatch_d-1_w0',
 			'dispatch_d-2_w7',
@@ -112,8 +109,8 @@ describe('retireSupersededBoardPhases', () => {
 	it('counts out a row that was claimed between the read and the settle', async () => {
 		stage([row({ id: 'd-claimed' }), row({ id: 'd-waiting' })]);
 		// The conditional cancel loses for the one a worker took.
-		const settle = vi.mocked(retireWaitingBoardDispatch).getMockImplementation();
-		vi.mocked(retireWaitingBoardDispatch).mockImplementation(async (id, reason) =>
+		const settle = vi.mocked(retireWaitingDispatch).getMockImplementation();
+		vi.mocked(retireWaitingDispatch).mockImplementation(async (id, reason) =>
 			id === 'd-claimed' ? null : ((await settle?.(id, reason)) ?? null),
 		);
 
@@ -139,7 +136,7 @@ describe('retireSupersededBoardPhases', () => {
 
 	it('swallows a settle failure and reports nothing retired', async () => {
 		stage([row()]);
-		vi.mocked(retireWaitingBoardDispatch).mockRejectedValue(new Error('deadlock'));
+		vi.mocked(retireWaitingDispatch).mockRejectedValue(new Error('deadlock'));
 		expect(await retireSupersededBoardPhases(INPUT)).toBe(0);
 	});
 
@@ -147,7 +144,7 @@ describe('retireSupersededBoardPhases', () => {
 		async function reasonFor(keepPhase: 'planning' | undefined): Promise<string> {
 			stage([row({ id: 'd-1', phase: 'implementation' })]);
 			await retireSupersededBoardPhases({ ...INPUT, keepPhase });
-			return vi.mocked(retireWaitingBoardDispatch).mock.calls[0][1];
+			return vi.mocked(retireWaitingDispatch).mock.calls[0][1];
 		}
 
 		it('names both the retired phase and the one the column now asks for', async () => {
