@@ -6,14 +6,16 @@
  * **The terminal state this exists to break.** In practice `pr-review`
  * (`src/triggers/handlers/review.ts`) dispatches Review from exactly one event: a
  * `checks`/`completed` whose aggregate is green. A mergeable pull request
- * arriving on `pull-request updated` is deliberately skipped, and `checks
- * completed` never fires twice for one head SHA. So every way a Review can die
- * after that event lands in the same place — green, mergeable, permanently
- * unreviewed, with nothing scheduled and no human signal. It happened twice in
- * two days from unrelated causes: `SmartTechBrewery/rover#116`, where a leaked
- * `pending` ledger row blocked the dispatch before any run row existed (issue
- * #856), and `SmartTechBrewery/swarm#860`, where the Review run itself failed
- * terminally (issue #861). Both needed a human to re-run CI or reset the run.
+ * arriving on `pull-request updated` is deliberately skipped — bar a zero-check
+ * head under `pipeline.review.checks: 'if-present'`, reviewed off the push since
+ * issue #1107 — and `checks completed` never fires twice for one head SHA. So
+ * every way a Review can die after that event lands in the same place — green,
+ * mergeable, permanently unreviewed, with nothing scheduled and no human
+ * signal. It happened twice in two days from unrelated causes:
+ * `SmartTechBrewery/rover#116`, where a leaked `pending` ledger row blocked the
+ * dispatch before any run row existed (issue #856), and
+ * `SmartTechBrewery/swarm#860`, where the Review run itself failed terminally
+ * (issue #861). Both needed a human to re-run CI or reset the run.
  *
  * **Why the periodic shape rather than a terminal-failure hand-back.** The
  * `no-fix` pattern (`./ci-no-fix-recovery.ts`, issue #841) needs a run to hand
