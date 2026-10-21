@@ -60,8 +60,8 @@ const RECOVERY_CLAIM_MARGIN_SEC = 2 * 60;
 /**
  * TTL the PR+SHA dispatch claim is re-established for while a recovery is in
  * flight — long enough to outlast the `pr-review` handler's own `state-pending`
- * recheck chain (the project's `pipeline.review.checksWaitMinutes`, default 10
- * minutes, issue #1083) plus margin, so a recovery that has to wait out a
+ * recheck chain (the PR's repository's `reviewChecksWaitMinutes`, default 10
+ * minutes, issues #1083 and #1109) plus margin, so a recovery that has to wait out a
  * still-running checks or mergeability read still holds the slot when it
  * finally decides. Derived from the leaf `review-checks-wait.ts` rather than
  * imported from the handler to keep this composition-root module off that

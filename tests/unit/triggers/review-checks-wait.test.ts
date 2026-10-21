@@ -7,7 +7,7 @@ import {
 import { createMockProjectConfig } from '../../helpers/factories.js';
 
 function projectWaiting(checksWaitMinutes: number) {
-	return createMockProjectConfig({ pipeline: { review: { checksWaitMinutes } } });
+	return createMockProjectConfig({ reviewChecksWaitMinutes: checksWaitMinutes });
 }
 
 describe('review CI wait (issue #1083)', () => {

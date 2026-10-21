@@ -172,14 +172,9 @@ describe('readBaseBranchHealth', () => {
 		});
 	});
 
-	it("reports green for zero checks under the project's `if-present` policy", async () => {
+	it("reports green for zero checks under the repository's `if-present` policy", async () => {
 		getAggregateCheckStatus.mockResolvedValue(checks([]));
-		const project = createMockProjectConfig({
-			pipeline: {
-				...PROJECT.pipeline,
-				review: { ...PROJECT.pipeline?.review, checks: 'if-present' },
-			},
-		});
+		const project = createMockProjectConfig({ reviewChecks: 'if-present' });
 
 		await expect(readBaseBranchHealth(project, SCM, project.baseBranch)).resolves.toEqual({
 			status: 'green',

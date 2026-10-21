@@ -9,7 +9,7 @@
  *  - `pull-request` `opened` (non-draft) — review the freshly opened PR.
  *  - `pull-request` `updated` (a push) — route a conflicting head to
  *    Resolve-conflicts; a mergeable one waits for its checks, bar a head
- *    reporting zero checks under `pipeline.review.checks: 'if-present'`, which is
+ *    reporting zero checks under its repository's `reviewChecks: 'if-present'`, which is
  *    reviewed off the push itself, since no `checks` event will ever arrive for
  *    it (issue #1107).
  *  - `checks` `completed` — review the commit CI just validated (why the phase
@@ -39,9 +39,10 @@
  * complete and none failed, respond-to-ci if a check failed, or **defer** if some
  * check is still incomplete. Ported from Cascade's `check-suite-success`/`-failure`
  * triggers. A zero-check head defers too, under the default
- * `pipeline.review.checks: 'required'` policy — a project with no CI at all can
- * instead set `'if-present'` to review immediately on zero checks (issue #274),
- * on a push as well as on a `checks` event (issue #1107).
+ * `reviewChecks: 'required'` policy of the PR's repository (per repository since
+ * issue #1109) — a repository with no CI at all can instead set `'if-present'` to
+ * review immediately on zero checks (issue #274), on a push as well as on a
+ * `checks` event (issue #1107).
  *
  * **Respond-to-CI loop guard.** Fixing a build pushes a commit → a new head SHA
  * → a fresh `checks` event, so if the fix doesn't stick the same PR routes back
@@ -60,8 +61,8 @@
  *    delivery (the suite reports complete over the webhook, but a query moments
  *    later still shows it running, and no further webhook will arrive to wake
  *    us). Fixed ~30s cadence, capped by `recheckAttempt`/`stateRecheckCap` — the
- *    project's `pipeline.review.checksWaitMinutes` (default 10 min → 20 attempts,
- *    issue #1083; `../review-checks-wait.ts`).
+ *    PR's repository's `reviewChecksWaitMinutes` (default 10 min → 20 attempts,
+ *    issue #1083, per repository since #1109; `../review-checks-wait.ts`).
  *  - `read-failed` — the read never answered at all: the provider threw (a
  *    transient checks-API error, a 5xx/rate-limit, an unresolvable reviewer
  *    token) or the run-history lookup threw. Degrading to a defer keeps the
@@ -112,8 +113,8 @@
  * a `review` disposition instead of routing back to the phase that just
  * declined. It is safe because the red was already adjudicated by SWARM's own
  * CI agent rather than left unexamined, and reviewing without a green `checks`
- * event is precedented: `pipeline.review.checks: 'if-present'` (issue #274)
- * already does it for a project whose head carries no checks at all. The bypass
+ * event is precedented: `reviewChecks: 'if-present'` (issue #274) already does
+ * it for a repository whose head carries no checks at all. The bypass
  * is opt-in and narrow — it changes nothing for an ordinary red check, and every
  * gate around it (closed-PR, work-item origin, draft/fork, mergeability, the
  * `state-pending` defer, the verdict reservation) still runs. The one gate it
@@ -326,7 +327,7 @@ interface RecheckWait {
 	waitingFor: string;
 	/**
 	 * The operator's own lever, for a wait that may never end by itself — a
-	 * zero-check head under `pipeline.review.checks: 'required'`. Named in the
+	 * zero-check head under its repository's `reviewChecks: 'required'`. Named in the
 	 * deferred run's reason *and* in the give-up record, which is where a wait
 	 * nothing will ever satisfy ends up.
 	 */
@@ -729,17 +730,19 @@ function aggregateCheckWait(
 		return {
 			waitingFor: `${subject} to finish (still running: ${incompleteChecks.join(', ')})`,
 			exhaustedLever:
-				`Checks were still running when this project's CI wait ran out ` +
-				`(${resolveChecksWaitMinutes(project)} minutes, \`pipeline.review.checksWaitMinutes\`) — ` +
-				"raise it if this project's CI routinely takes longer.",
+				`Checks were still running when this repository's CI wait ran out ` +
+				`(${resolveChecksWaitMinutes(project)} minutes, \`reviewChecksWaitMinutes\` on this ` +
+				"repository's Source Control entry) — raise it if this repository's CI routinely " +
+				'takes longer.',
 		};
 	}
 	return {
 		waitingFor: `${subject}: none are registered on this head yet`,
 		lever:
-			"This project's `pipeline.review.checks` is `required`, so a head no CI workflow runs on " +
-			'(for example a change every workflow `paths-ignore`s) is never reviewed — set it to ' +
-			'`if-present` to review a head that has no checks.',
+			"This repository's `reviewChecks` policy is `required`, so a head no CI workflow runs " +
+			'on (for example a change every workflow `paths-ignore`s) is never reviewed — set it ' +
+			"to `if-present` on this repository's Source Control entry to review a head that has " +
+			'no checks.',
 	};
 }
 
@@ -860,7 +863,7 @@ async function resolveAggregateCheckReview(
 		);
 	}
 
-	const checksPolicy = project.pipeline?.review?.checks ?? 'required';
+	const checksPolicy = project.reviewChecks ?? 'required';
 	const decision = decideAggregateCheckOutcome(checkStatus, prNumber, checksPolicy);
 	if (decision.action === 'review') return { kind: 'review' };
 
@@ -901,7 +904,7 @@ async function resolveAggregateCheckReview(
 
 /**
  * Decide a mergeable `pull-request` `updated` event — a push — under the
- * project's `pipeline.review.checks` policy (issue #1107). Returns `review` only
+ * `reviewChecks` policy of the PR's repository (issues #1107, #1109). Returns `review` only
  * for a head reporting **zero** checks under `if-present`, the one case no
  * `checks` event will ever arrive to decide; every other head waits for its own
  * completed-checks event exactly as before, so this resolves `none` with no
@@ -921,7 +924,7 @@ async function resolveUpdatedPullRequestReview(
 	headSha: string,
 ): Promise<ReviewDisposition> {
 	const { project } = ctx;
-	const checksPolicy = project.pipeline?.review?.checks ?? 'required';
+	const checksPolicy = project.reviewChecks ?? 'required';
 	if (checksPolicy === 'required') {
 		logger.debug('review: PR is mergeable on updated event; waiting for checks — skipping', {
 			prNumber,

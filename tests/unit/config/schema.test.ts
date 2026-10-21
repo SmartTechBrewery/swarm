@@ -368,6 +368,119 @@ describe('ProjectRecordSchema', () => {
 		});
 	});
 
+	// Issue #1109: Review's check policy and wait are per repository. The pre-#1109
+	// project-wide keys are adopted onto every entry stating none, never silently stripped.
+	describe('review check policy and wait (issue #1109)', () => {
+		it('accepts a per-repository policy and wait, independently per entry', () => {
+			const record = ProjectRecordSchema.parse({
+				...shared,
+				repositories: [
+					{ repo: 'acme/mobile', reviewChecks: 'if-present' },
+					{ repo: 'acme/platform', reviewChecks: 'required', reviewChecksWaitMinutes: 30 },
+				],
+			});
+			expect(record.repositories.map((entry) => entry.reviewChecks)).toEqual([
+				'if-present',
+				'required',
+			]);
+			expect(record.repositories.map((entry) => entry.reviewChecksWaitMinutes)).toEqual([
+				undefined,
+				30,
+			]);
+		});
+
+		it('rejects an unsupported policy', () => {
+			expect(
+				ProjectRecordSchema.safeParse({
+					...shared,
+					repositories: [{ repo: 'acme/one', reviewChecks: 'always' }],
+				}).success,
+			).toBe(false);
+		});
+
+		it.each([1, 15, 120])('accepts a check wait of %i minutes', (reviewChecksWaitMinutes) => {
+			const record = ProjectRecordSchema.parse({
+				...shared,
+				repositories: [{ repo: 'acme/one', reviewChecksWaitMinutes }],
+			});
+			expect(record.repositories[0]?.reviewChecksWaitMinutes).toBe(reviewChecksWaitMinutes);
+		});
+
+		it.each([0, -1, 121, 1.5])('rejects a check wait of %d minutes', (reviewChecksWaitMinutes) => {
+			expect(
+				ProjectRecordSchema.safeParse({
+					...shared,
+					repositories: [{ repo: 'acme/one', reviewChecksWaitMinutes }],
+				}).success,
+			).toBe(false);
+		});
+
+		it('adopts a legacy policy and wait onto every entry and drops the old keys', () => {
+			const record = ProjectRecordSchema.parse({
+				...shared,
+				pipeline: { review: { enabled: true, checks: 'if-present', checksWaitMinutes: 20 } },
+				repositories: [{ repo: 'acme/one' }, { repo: 'acme/two' }],
+			});
+			expect(record.repositories.map((entry) => entry.reviewChecks)).toEqual([
+				'if-present',
+				'if-present',
+			]);
+			expect(record.repositories.map((entry) => entry.reviewChecksWaitMinutes)).toEqual([20, 20]);
+			expect(record.pipeline?.review).toEqual({ enabled: true });
+		});
+
+		it("keeps an entry's own values over the legacy ones", () => {
+			const record = ProjectRecordSchema.parse({
+				...shared,
+				pipeline: { review: { checks: 'if-present', checksWaitMinutes: 20 } },
+				repositories: [
+					{ repo: 'acme/one', reviewChecks: 'required', reviewChecksWaitMinutes: 5 },
+					{ repo: 'acme/two' },
+				],
+			});
+			expect(record.repositories.map((entry) => entry.reviewChecks)).toEqual([
+				'required',
+				'if-present',
+			]);
+			expect(record.repositories.map((entry) => entry.reviewChecksWaitMinutes)).toEqual([5, 20]);
+		});
+
+		it('adopts the two legacy keys independently', () => {
+			const record = ProjectRecordSchema.parse({
+				...shared,
+				pipeline: { review: { checksWaitMinutes: 25 } },
+				repositories: [{ repo: 'acme/one', reviewChecks: 'if-present' }],
+			});
+			expect(record.repositories[0]).toMatchObject({
+				reviewChecks: 'if-present',
+				reviewChecksWaitMinutes: 25,
+			});
+			expect(record.pipeline?.review).toEqual({});
+		});
+
+		it('leaves the entries untouched without a legacy key', () => {
+			const record = ProjectRecordSchema.parse({
+				...shared,
+				pipeline: { review: { enabled: true } },
+				repositories: [{ repo: 'acme/one' }],
+			});
+			expect(record.repositories[0]).not.toHaveProperty('reviewChecks');
+			expect(record.repositories[0]).not.toHaveProperty('reviewChecksWaitMinutes');
+		});
+
+		it('reports an invalid legacy value on the entry rather than dropping it', () => {
+			const result = ProjectRecordSchema.safeParse({
+				...shared,
+				pipeline: { review: { checks: 'always' } },
+				repositories: [{ repo: 'acme/one' }],
+			});
+			expect(result.success).toBe(false);
+			expect(result.error?.issues.map((issue) => issue.path)).toEqual([
+				['repositories', 0, 'reviewChecks'],
+			]);
+		});
+	});
+
 	// The record carries the same cross-field credential checks the scoped config does —
 	// neither reads a repository, so both refine through the same two functions.
 	it('applies the same credential cross-field checks the scoped config does', () => {
@@ -986,30 +1099,14 @@ describe('ProjectRecordSchema', () => {
 		});
 	});
 
-	it.each(['required', 'if-present'])('accepts the review checks policy %s', (checks) => {
-		expect(PipelineConfigSchema.parse({ review: { checks } })).toMatchObject({
-			review: { checks },
-		});
-	});
-
-	it('rejects an unsupported review checks policy', () => {
-		expect(PipelineConfigSchema.safeParse({ review: { checks: 'always' } }).success).toBe(false);
-	});
-
-	it('omits the review checks policy when unset, leaving the required default to the consumer', () => {
-		expect(PipelineConfigSchema.parse({ review: { enabled: true } })).toEqual({
-			review: { enabled: true },
-		});
-	});
-
-	it.each([1, 15, 120])('accepts a review CI wait of %i minutes', (checksWaitMinutes) => {
-		expect(PipelineConfigSchema.parse({ review: { checksWaitMinutes } })).toMatchObject({
-			review: { checksWaitMinutes },
-		});
-	});
-
-	it.each([0, -1, 121, 1.5])('rejects a review CI wait of %d minutes', (checksWaitMinutes) => {
-		expect(PipelineConfigSchema.safeParse({ review: { checksWaitMinutes } }).success).toBe(false);
+	// Issue #1109 moved Review's check policy and wait onto each repository entry; the
+	// pipeline block no longer carries them (`ProjectRecordSchema` adopts legacy ones first).
+	it('no longer carries a project-wide review checks policy or wait', () => {
+		expect(
+			PipelineConfigSchema.parse({
+				review: { enabled: true, checks: 'if-present', checksWaitMinutes: 20 },
+			}),
+		).toEqual({ review: { enabled: true } });
 	});
 
 	it('limits per-phase timeouts to five through forty-five minutes', () => {

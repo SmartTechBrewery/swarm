@@ -20,7 +20,7 @@ export function checkRecheckCoalesceKey(repo: string, prNumber: string, headSha:
 /**
  * The mergeability recheck for one pull request head. Keyed on the event kind as
  * well: a PR-updated event dispatches Review only for a zero-check head under
- * `pipeline.review.checks: 'if-present'` (issue #1107), while a completed checks
+ * `reviewChecks: 'if-present'` (issue #1107), while a completed checks
  * event is the dispatch path in every other case, so a later PR-updated delivery
  * must not replace the follow-up Review's dispatch-capable recheck.
  */

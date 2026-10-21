@@ -25,6 +25,7 @@
  * on — with nothing here changing either time.
  */
 
+import type { ReviewChecksPolicy } from '../../../src/config/schema.js';
 import { SCM_REPO_COORDINATES } from '../../../src/scm/repo-coordinates.js';
 import type { ScmType } from '../../../src/scm/types.js';
 
@@ -56,11 +57,16 @@ export interface RepositoryEntry {
 	pmRoutingToken?: string;
 	/** Merge automation for this repository (issue #1066). Unset means off. */
 	autoMerge?: boolean;
+	/** Review's zero-check policy for this repository (issue #1109). Unset means `required`. */
+	reviewChecks?: ReviewChecksPolicy;
+	/** Review's check wait for this repository, in minutes (issue #1109). Unset means 10. */
+	reviewChecksWaitMinutes?: number;
 }
 
 /**
- * One row of the repository editor. Every text field is a string and the merge
- * automation toggle a boolean, so the form state is exactly what its inputs render.
+ * One row of the repository editor. Every text field is a string — the check wait's
+ * number input included — the merge automation toggle a boolean and the check policy
+ * its select's value, so the form state is exactly what its inputs render.
  *
  * `id` is form-only and never persisted: it is the row's React key, so a reorder moves
  * the row instead of rewriting two sets of inputs. A value-derived key — the trick
@@ -74,6 +80,13 @@ export interface RepositoryForm {
 	branchPrefix: string;
 	/** Merge automation for this repository (issue #1066) — an unset entry reads as off. */
 	autoMerge: boolean;
+	/** Review's check policy (issue #1109) — an unset entry reads as `required`. */
+	reviewChecks: ReviewChecksPolicy;
+	/**
+	 * Review's check wait in minutes (issue #1109), as typed. `''` states none, so the
+	 * server's default (10 minutes) applies and the entry is saved without the key.
+	 */
+	reviewChecksWaitMinutes: string;
 	/**
 	 * Carried opaquely, never rendered (issue #686). It rides on the row rather than
 	 * being looked up at save time because a save sends the whole list positionally,
@@ -93,6 +106,13 @@ export interface RepositoryForm {
 export const DEFAULT_BASE_BRANCH = 'main';
 
 /**
+ * The Review check policy an entry stating none runs under — the Review trigger's own
+ * fallback (`src/triggers/handlers/review.ts`), restated for the reason
+ * {@link NEW_REPOSITORY} states.
+ */
+export const DEFAULT_REVIEW_CHECKS_POLICY: ReviewChecksPolicy = 'required';
+
+/**
  * What a row added here starts on — the same values `PROJECT_DEFAULTS`
  * (`src/config/schema.ts`) applies to an entry stating neither, so a repository added
  * on this screen and one added to `swarm.config.json` land identically. Spelled out
@@ -104,6 +124,8 @@ const NEW_REPOSITORY = {
 	baseBranch: DEFAULT_BASE_BRANCH,
 	branchPrefix: 'issue-',
 	autoMerge: false,
+	reviewChecks: DEFAULT_REVIEW_CHECKS_POLICY,
+	reviewChecksWaitMinutes: '',
 } as const;
 
 /** A row id no row in `rows` already uses, so keys stay unique across adds and removes. */
@@ -125,6 +147,8 @@ export function toRepositoryForms(repositories: RepositoryEntry[] | undefined): 
 		baseBranch: entry.baseBranch ?? '',
 		branchPrefix: entry.branchPrefix ?? '',
 		autoMerge: entry.autoMerge === true,
+		reviewChecks: entry.reviewChecks ?? DEFAULT_REVIEW_CHECKS_POLICY,
+		reviewChecksWaitMinutes: entry.reviewChecksWaitMinutes?.toString() ?? '',
 		...(entry.pmRoutingToken ? { pmRoutingToken: entry.pmRoutingToken } : {}),
 	}));
 	return rows.length > 0 ? rows : [{ id: '1', ...NEW_REPOSITORY }];
@@ -140,15 +164,23 @@ export function toRepositoryForms(repositories: RepositoryEntry[] | undefined): 
  * A pre-#727 per-repository `scm` is deliberately *not* one of those: it is dropped
  * here exactly as the server drops it on parse, so the two surfaces agree that a
  * repository states no provider of its own.
+ *
+ * The check policy is always written, explicit like `autoMerge`; a blank check wait is
+ * omitted, so the entry keeps running on the server's default rather than a copy of it.
  */
 export function toRepositoryEntries(rows: RepositoryForm[]): RepositoryEntry[] {
-	return rows.map((row) => ({
-		repo: row.repo,
-		baseBranch: row.baseBranch,
-		branchPrefix: row.branchPrefix,
-		autoMerge: row.autoMerge,
-		...(row.pmRoutingToken ? { pmRoutingToken: row.pmRoutingToken } : {}),
-	}));
+	return rows.map((row) => {
+		const wait = row.reviewChecksWaitMinutes.trim();
+		return {
+			repo: row.repo,
+			baseBranch: row.baseBranch,
+			branchPrefix: row.branchPrefix,
+			autoMerge: row.autoMerge,
+			reviewChecks: row.reviewChecks,
+			...(wait ? { reviewChecksWaitMinutes: Number(wait) } : {}),
+			...(row.pmRoutingToken ? { pmRoutingToken: row.pmRoutingToken } : {}),
+		};
+	});
 }
 
 /** Append a blank row at the end — the lowest-priority position, never the default. */
@@ -232,7 +264,9 @@ export function areRepositoriesDirty(
 			row.repo !== other?.repo ||
 			row.baseBranch !== other?.baseBranch ||
 			row.branchPrefix !== other?.branchPrefix ||
-			row.autoMerge !== other?.autoMerge
+			row.autoMerge !== other?.autoMerge ||
+			row.reviewChecks !== other?.reviewChecks ||
+			row.reviewChecksWaitMinutes.trim() !== other?.reviewChecksWaitMinutes
 		);
 	});
 }

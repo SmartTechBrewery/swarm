@@ -7,7 +7,7 @@
  * (`src/triggers/handlers/review.ts`) dispatches Review from exactly one event: a
  * `checks`/`completed` whose aggregate is green. A mergeable pull request
  * arriving on `pull-request updated` is deliberately skipped — bar a zero-check
- * head under `pipeline.review.checks: 'if-present'`, reviewed off the push since
+ * head under its repository's `reviewChecks: 'if-present'`, reviewed off the push since
  * issue #1107 — and `checks completed` never fires twice for one head SHA. So
  * every way a Review can die after that event lands in the same place — green,
  * mergeable, permanently unreviewed, with nothing scheduled and no human
@@ -347,14 +347,14 @@ async function recoverCandidate(
 		});
 		return;
 	}
-	// Read with the project's own policy, exactly as the handler reads it. `defer`
+	// Read with the repository's own policy, exactly as the handler reads it. `defer`
 	// is a pull request legitimately waiting on CI — the case the sweep must not
 	// disturb, and the reason it must not spend an attempt yet. `respond-to-ci` is a
 	// red that belongs to Respond-to-CI and to #841's hand-back, not here.
 	const decision = decideAggregateCheckOutcome(
 		checkStatus,
 		prNumber,
-		project.pipeline?.review?.checks ?? 'required',
+		project.reviewChecks ?? 'required',
 	);
 	if (decision.action !== 'review') {
 		logger.debug('review recovery: checks are not a green completed aggregate — skipping', {

@@ -13,10 +13,10 @@
  * (`src/pipeline/follow-up-review.ts`, issue #241): SWARM enqueues that one
  * itself and no later webhook is guaranteed, so exhausting this budget there
  * does drop a legitimate review. Which is why a *failed read* never spends it
- * (issue #720), and why it is now per project (issue #1083): real CI runs
- * outlast the lag allowance — `under-control-platform`'s `Verify` reaches
- * ~13 minutes — so a project whose CI takes longer sets
- * `pipeline.review.checksWaitMinutes` instead of seeing spurious `failed`
+ * (issue #720), and why it is configurable (issue #1083) — per repository since
+ * issue #1109: real CI runs outlast the lag allowance — `under-control-platform`'s
+ * `Verify` reaches ~13 minutes — so a repository whose CI takes longer sets its
+ * `repositories[].reviewChecksWaitMinutes` instead of seeing spurious `failed`
  * Review runs and dropped follow-ups.
  */
 
@@ -28,9 +28,13 @@ export const RECHECK_DELAY_MS = 30_000;
 /** Today's allowance, kept as the default: 20 rechecks at {@link RECHECK_DELAY_MS}. */
 export const DEFAULT_CHECKS_WAIT_MINUTES = 10;
 
-/** The project's effective wait for a head to reach a final state, in minutes. */
+/**
+ * The effective wait for a head to reach a final state, in minutes — the setting of
+ * the repository `project` is scoped to (issue #1109), so a pull request is waited on
+ * under its own repository's budget.
+ */
 export function resolveChecksWaitMinutes(project: ProjectConfig): number {
-	return project.pipeline?.review?.checksWaitMinutes ?? DEFAULT_CHECKS_WAIT_MINUTES;
+	return project.reviewChecksWaitMinutes ?? DEFAULT_CHECKS_WAIT_MINUTES;
 }
 
 /** The `state-pending` recheck cap that wait buys at {@link RECHECK_DELAY_MS}. */

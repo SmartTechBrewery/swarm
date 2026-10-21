@@ -44,6 +44,7 @@ import { repoCoordinatesIssue } from '../scm/repo-coordinates.js';
 import { SCM_TYPES, type ScmType } from '../scm/types.js';
 import { CUSTOM_PROMPT_MAX_LENGTH, normalizeCustomPrompt } from './custom-prompt.js';
 import { adoptLegacyAutoMerge } from './legacy-auto-merge.js';
+import { adoptLegacyReviewChecks } from './legacy-review-checks.js';
 import {
 	adoptLegacyPmCredentials,
 	PmCredentialReferencesByProviderSchema,
@@ -456,6 +457,7 @@ export const AgentsConfigSchema = z
  * having caught up yet. `if-present` dispatches Review immediately on zero
  * checks — for projects with no CI at all — while still waiting on any
  * checks that are present and routing a failure to Respond-to-CI (issue #274).
+ * Applied per repository (`repositories[].reviewChecks`) since issue #1109.
  */
 export const ReviewChecksPolicySchema = z.enum(['required', 'if-present']);
 export type ReviewChecksPolicy = z.infer<typeof ReviewChecksPolicySchema>;
@@ -508,16 +510,6 @@ export const PipelineBaseSchema = z.object({
 	review: z
 		.object({
 			enabled: z.boolean().optional(),
-			/** See {@link ReviewChecksPolicySchema}. Unset defaults to `required`. */
-			checks: ReviewChecksPolicySchema.optional(),
-			/**
-			 * How long Review waits for a head to reach a final state — every check
-			 * complete, `mergeable` computed — before giving up on that head's recheck
-			 * chain (issue #1083). Minutes, 1–120; unset defaults to
-			 * `DEFAULT_CHECKS_WAIT_MINUTES` (10, `src/triggers/review-checks-wait.ts`).
-			 * Bounds the `state-pending` budget only; the `read-failed` one (#720) is fixed.
-			 */
-			checksWaitMinutes: z.number().int().min(1).max(120).optional(),
 		})
 		.optional(),
 	respondToReview: z
@@ -657,8 +649,9 @@ export const ProjectPmSchema = z.discriminatedUnion('type', [
 /**
  * One repository a project owns, with the settings that are genuinely
  * per-repository (issue #684 phase 1): the coordinates themselves, the branch
- * worktrees are cut from, the task-branch prefix, and — since issue #1066 — whether
- * SWARM merges an approved pull request on its own.
+ * worktrees are cut from, the task-branch prefix, whether SWARM merges an approved
+ * pull request on its own (since issue #1066), and Review's check policy and check
+ * wait for its pull requests (since issue #1109).
  *
  * These fields used to sit at the top level of a project, where they were
  * indistinguishable from the genuinely shared settings beside them. They are the
@@ -741,6 +734,31 @@ export const ProjectRepositorySchema = z.object({
 	 * parse rather than stripped (`adoptLegacyAutoMerge`, `./legacy-auto-merge.ts`).
 	 */
 	autoMerge: z.boolean().optional(),
+
+	/**
+	 * Review's policy for a head of **this** repository's pull requests that has zero
+	 * registered checks — see {@link ReviewChecksPolicySchema}. Unset defaults to
+	 * `required`; set `if-present` for a repository with no CI on pull requests.
+	 *
+	 * Per repository since issue #1109, because whether a repository has CI is a
+	 * property of the repository, not of the project. The pre-#1109 project-wide
+	 * `pipeline.review.checks` is adopted onto every entry on parse rather than
+	 * stripped (`adoptLegacyReviewChecks`, `./legacy-review-checks.ts`).
+	 */
+	reviewChecks: ReviewChecksPolicySchema.optional(),
+
+	/**
+	 * How long Review waits for a head of this repository's pull requests to reach a
+	 * final state — every check complete, `mergeable` computed — before giving up on
+	 * that head's recheck chain (issue #1083). Minutes, 1–120; unset defaults to
+	 * `DEFAULT_CHECKS_WAIT_MINUTES` (10, `src/triggers/review-checks-wait.ts`). Bounds
+	 * the `state-pending` budget only; the `read-failed` one (#720) is fixed.
+	 *
+	 * Per repository since issue #1109, since one repository's CI can run far longer
+	 * than another's; the pre-#1109 `pipeline.review.checksWaitMinutes` is adopted the
+	 * same way as {@link reviewChecks}.
+	 */
+	reviewChecksWaitMinutes: z.number().int().min(1).max(120).optional(),
 });
 
 /**
@@ -1187,13 +1205,18 @@ export const ProjectConfigSchema = z
  * tokens are unique within the project. This is what `validateConfig` /
  * `swarm config apply` parse and what the `projects` table persists.
  *
- * It also adopts the one legacy key only a record can place: the pre-#1066
- * project-wide `pipeline.respondToReview.autoMerge`, copied onto every
- * `repositories[]` entry that states none (`./legacy-auto-merge.ts`). The scoped
- * {@link ProjectConfigSchema} does not, since no operator-authored surface parses one.
+ * It also adopts the legacy keys only a record can place: the pre-#1066
+ * project-wide `pipeline.respondToReview.autoMerge` and the pre-#1109
+ * `pipeline.review.checks` / `checksWaitMinutes`, each copied onto every
+ * `repositories[]` entry that states none (`./legacy-auto-merge.ts`,
+ * `./legacy-review-checks.ts`). The scoped {@link ProjectConfigSchema} does not, since
+ * no operator-authored surface parses one.
  */
 export const ProjectRecordSchema = z
-	.preprocess((raw) => adoptLegacyAutoMerge(adoptLegacyPmCredentials(raw)), ProjectRecordBaseSchema)
+	.preprocess(
+		(raw) => adoptLegacyReviewChecks(adoptLegacyAutoMerge(adoptLegacyPmCredentials(raw))),
+		ProjectRecordBaseSchema,
+	)
 	.transform(adoptLegacyScmCredentials)
 	.superRefine(validatePmCredentialRoles)
 	.superRefine(validateScmCredentialReferences)

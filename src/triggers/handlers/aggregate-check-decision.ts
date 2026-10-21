@@ -36,8 +36,8 @@ export type AggregateCheckDecision =
  *  - `review` — every check completed and none failed. A zero-check result
  *    defers under the default `required` policy: the provider's checks API can
  *    temporarily return no runs just after a new commit, and treating that as
- *    green would bypass CI. Projects with no CI at all opt into `if-present`
- *    (`pipeline.review.checks`, `src/config/schema.ts`), where a zero-check
+ *    green would bypass CI. A repository with no CI at all opts into `if-present`
+ *    (`repositories[].reviewChecks`, `src/config/schema.ts`), where a zero-check
  *    result reviews immediately instead — see the `policy` parameter (issue #274).
  *    `basis` says which of the two it was: every check passed, or there were none.
  *
