@@ -6,7 +6,8 @@ import {
 	createMockScmEvent,
 } from '../../../../helpers/factories.js';
 
-vi.mock('@/integrations/scm/azure-devops/client.js', () => ({
+vi.mock('@/integrations/scm/azure-devops/client.js', async (importOriginal) => ({
+	...(await importOriginal<typeof import('@/integrations/scm/azure-devops/client.js')>()),
 	// Pass-through so a probe inside the scope can observe the token that would have
 	// been bound, without a real API call.
 	withAzureDevOpsToken: vi.fn((_pat: string, fn: () => Promise<unknown>): Promise<unknown> => fn()),
@@ -14,6 +15,16 @@ vi.mock('@/integrations/scm/azure-devops/client.js', () => ({
 vi.mock('@/integrations/scm/azure-devops/credentials.js', () => ({
 	getAzureDevOpsToken: vi.fn<(project: unknown, persona: string) => Promise<string>>(),
 	getAzureDevOpsTokenOrNull: vi.fn<(project: unknown, persona: string) => Promise<string | null>>(),
+}));
+// The reads' own suite (`pull-requests.test.ts`) proves every endpoint and mapping;
+// here they are stubs, so these tests assert only the wiring and persona defaults.
+vi.mock('@/integrations/scm/azure-devops/pull-requests.js', () => ({
+	getAzureDevOpsPullRequest: vi.fn(),
+	getAzureDevOpsPullRequestTitle: vi.fn(),
+	getAzureDevOpsBranchHead: vi.fn(),
+	getAzureDevOpsCommitChecks: vi.fn(),
+	listAzureDevOpsPullRequestsForCommit: vi.fn(),
+	listActiveAzureDevOpsPullRequestsForBase: vi.fn(),
 }));
 vi.mock('@/integrations/scm/azure-devops/personas.js', () => ({
 	resolveAzureDevOpsPersonaIdentities: vi.fn(),
@@ -31,6 +42,14 @@ import {
 	isSwarmAzureDevOpsActor,
 	resolveAzureDevOpsPersonaIdentities,
 } from '@/integrations/scm/azure-devops/personas.js';
+import {
+	getAzureDevOpsBranchHead,
+	getAzureDevOpsCommitChecks,
+	getAzureDevOpsPullRequest,
+	getAzureDevOpsPullRequestTitle,
+	listActiveAzureDevOpsPullRequestsForBase,
+	listAzureDevOpsPullRequestsForCommit,
+} from '@/integrations/scm/azure-devops/pull-requests.js';
 import { AzureDevOpsSCMIntegration } from '@/integrations/scm/azure-devops/scm-integration.js';
 import { SWARM_GENERATED_FOOTER } from '@/scm/swarm-origin.js';
 import type { ScmPersonaIdentities } from '@/scm/types.js';
@@ -185,18 +204,101 @@ describe('AzureDevOpsSCMIntegration', () => {
 		});
 	});
 
+	describe('pull-request and CI reads', () => {
+		/** The persona whose token each read was scoped to, via the bound PAT. */
+		const boundPersona = () => vi.mocked(withAzureDevOpsToken).mock.calls[0]?.[0];
+
+		beforeEach(() => {
+			vi.mocked(getAzureDevOpsToken).mockImplementation(async (_p, persona) => `pat-${persona}`);
+		});
+
+		const reads: Array<
+			[
+				method: string,
+				persona: string,
+				call: () => Promise<unknown>,
+				read: (...args: never[]) => unknown,
+				args: unknown[],
+			]
+		> = [
+			[
+				'getPullRequest',
+				'reviewer',
+				() => scm.getPullRequest(project, 17),
+				getAzureDevOpsPullRequest,
+				[project.repo, 17],
+			],
+			[
+				'getPullRequestTitle',
+				'implementer',
+				() => scm.getPullRequestTitle(project, 17),
+				getAzureDevOpsPullRequestTitle,
+				[project.repo, 17],
+			],
+			[
+				'getBranchHead',
+				'implementer',
+				() => scm.getBranchHead(project, 'main'),
+				getAzureDevOpsBranchHead,
+				[project.repo, 'main'],
+			],
+			[
+				'getAggregateCheckStatus',
+				'reviewer',
+				() => scm.getAggregateCheckStatus(project, 'abc123'),
+				getAzureDevOpsCommitChecks,
+				[project.repo, 'abc123'],
+			],
+			[
+				'listPullRequestsForCommit',
+				'reviewer',
+				() => scm.listPullRequestsForCommit(project, 'abc123'),
+				listAzureDevOpsPullRequestsForCommit,
+				[project.repo, 'abc123'],
+			],
+			[
+				'listConflictCandidates',
+				'implementer',
+				() => scm.listConflictCandidates(project, 'main'),
+				listActiveAzureDevOpsPullRequestsForBase,
+				[project.repo, 'main'],
+			],
+		];
+
+		for (const [method, persona, call, read, args] of reads) {
+			it(`${method} reads as the ${persona} by default`, async () => {
+				vi.mocked(read).mockResolvedValue('answer' as never);
+
+				await expect(call()).resolves.toBe('answer');
+				expect(vi.mocked(read)).toHaveBeenCalledWith(...args);
+				expect(boundPersona()).toBe(`pat-${persona}`);
+			});
+		}
+
+		it('honours an explicit persona', async () => {
+			vi.mocked(getAzureDevOpsPullRequest).mockResolvedValue({} as never);
+
+			await scm.getPullRequest(project, 17, 'implementer');
+
+			expect(boundPersona()).toBe('pat-implementer');
+		});
+
+		it('builds the pull request’s web URL with no credential, encoding every segment', () => {
+			expect(scm.pullRequestUrl('Fabrikam/Fiber Team/Web', 17)).toBe(
+				'https://dev.azure.com/Fabrikam/Fiber%20Team/_git/Web/pullrequest/17',
+			);
+			expect(vi.mocked(getAzureDevOpsToken)).not.toHaveBeenCalled();
+			expect(() => scm.pullRequestUrl('fabrikam/web', 17)).toThrow(
+				/organization\/project\/repository/,
+			);
+		});
+	});
+
 	// Every contract method this phase leaves unbuilt must fail loudly and name its
 	// follow-up phase — never return a misleading `null`/`[]`/no-op that a caller would
 	// mistake for a real answer (issue #1089).
 	describe('deferred contract methods', () => {
 		const deferred: Array<[method: string, phase: string, call: () => unknown]> = [
-			['getPullRequest', 'phase 4/6', () => scm.getPullRequest()],
-			['getPullRequestTitle', 'phase 4/6', () => scm.getPullRequestTitle()],
-			['pullRequestUrl', 'phase 4/6', () => scm.pullRequestUrl()],
-			['getBranchHead', 'phase 4/6', () => scm.getBranchHead()],
-			['getAggregateCheckStatus', 'phase 4/6', () => scm.getAggregateCheckStatus()],
-			['listPullRequestsForCommit', 'phase 4/6', () => scm.listPullRequestsForCommit()],
-			['listConflictCandidates', 'phase 4/6', () => scm.listConflictCandidates()],
 			['commentOnPullRequest', 'phase 5/6', () => scm.commentOnPullRequest()],
 			['deliveryProvider', 'phase 5/6', () => scm.deliveryProvider()],
 			['operatorDeliveryProvider', 'phase 5/6', () => scm.operatorDeliveryProvider()],

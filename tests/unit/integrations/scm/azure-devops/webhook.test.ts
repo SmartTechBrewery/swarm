@@ -326,7 +326,8 @@ describe('Azure DevOps webhook ingress', () => {
 				parse(createMockAzureDevOpsBuildPayload({ build: { result } })).checkConclusion;
 			expect(conclusion('failed')).toBe('failure');
 			expect(conclusion('canceled')).toBe('cancelled');
-			expect(conclusion('partiallySucceeded')).toBe('partiallySucceeded');
+			expect(conclusion('partiallySucceeded')).toBe('neutral');
+			expect(conclusion('none')).toBe('none');
 		});
 
 		it('reads the organization from the envelope when the repository URL does not name it', () => {

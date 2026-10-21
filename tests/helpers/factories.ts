@@ -787,6 +787,58 @@ export function createMockAzureDevOpsBuildPayload(
 }
 
 /**
+ * An Azure DevOps **REST** pull-request object, as `GET …/pullrequests/{id}` and the
+ * pull-request listing return it — the same shape the service hook nests as its
+ * `resource`, so it shares that factory's defaults: an active pull request with both
+ * merge commits populated and `mergeStatus: 'succeeded'`. Top-level overrides are
+ * shallow-merged; pass `undefined` to drop a field.
+ */
+export function createMockAzureDevOpsPullRequestResponse(
+	overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+	return azureDevOpsPullRequest(overrides);
+}
+
+/**
+ * One Azure Pipelines build, as `GET /{org}/{project}/_apis/build/builds` lists it:
+ * a completed, succeeded **branch** build of `sourceVersion`. Pass `triggerInfo` and a
+ * merge-commit `sourceVersion` for a pull-request build.
+ */
+export function createMockAzureDevOpsBuildResponse(
+	overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+	return {
+		id: 31,
+		buildNumber: '20261021.1',
+		status: 'completed',
+		result: 'succeeded',
+		queueTime: '2026-10-21T08:00:00.000Z',
+		sourceBranch: 'refs/heads/swarm/issue-17',
+		sourceVersion: 'da1560886d4f094c3e6c9ef40349f7d38b5d27d7',
+		definition: { id: 5, name: 'Web CI' },
+		triggerInfo: {},
+		...overrides,
+	};
+}
+
+/**
+ * One Git commit status, as `GET …/commits/{sha}/statuses` lists it — what an external
+ * CI posts to Azure Repos, identified across re-posts by `context.genre/context.name`.
+ */
+export function createMockAzureDevOpsCommitStatusResponse(
+	overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+	return {
+		id: 1,
+		state: 'succeeded',
+		description: 'Build passed',
+		context: { name: 'build', genre: 'jenkins' },
+		creationDate: '2026-10-21T08:00:00.000Z',
+		...overrides,
+	};
+}
+
+/**
  * A GitLab **REST** merge-request object, as
  * `GET /projects/:id/merge_requests/:iid` returns it — the read counterpart of
  * {@link createMockGitLabMergeRequestPayload}'s webhook body. Unlike the webhook
