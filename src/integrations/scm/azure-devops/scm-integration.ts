@@ -1,9 +1,9 @@
 /**
  * AzureDevOpsSCMIntegration — Azure DevOps Services' implementation of the
  * provider-neutral {@link SCMProvider} contract (`src/scm/types.ts`), built out over
- * six phases (issue #1089) along the same seams GitLab used. This is phase 2/6:
+ * six phases (issue #1089) along the same seams GitLab used. Built so far:
  * availability probing, persona credential scoping, and persona identity / actor
- * resolution.
+ * resolution (phase 2/6), and webhook ingress (phase 3/6, `./webhook.ts`).
  *
  * Its core job is the same as the other providers' classes: run a block of Azure
  * DevOps operations under the correct persona's PAT. Callers hand it a project +
@@ -12,11 +12,10 @@
  * review as the reviewer and push as the implementer without either token appearing
  * in a signature (ai/CODING_STANDARDS.md "Scope credentials with AsyncLocalStorage").
  *
- * **Every method this phase does not implement throws** — loudly, naming the method
- * and the phase that fills it in — rather than returning `null`, `[]`, or a no-op
- * that would read as a real answer. The contract's synchronous methods
- * (`verifyWebhookSignature`, `readWebhookRequest`, `parseWebhookEvent`,
- * `pullRequestUrl`) throw synchronously rather than rejecting.
+ * **Every method not yet implemented throws** — loudly, naming the method and the
+ * phase that fills it in — rather than returning `null`, `[]`, or a no-op that
+ * would read as a real answer. The contract's synchronous `pullRequestUrl` throws
+ * synchronously rather than rejecting.
  *
  * Like GitLab's build-out, **nothing registers this provider yet**: the
  * multi-provider conformance suite (`tests/unit/integrations/scm/scm-conformance.test.ts`)
@@ -40,6 +39,7 @@ import type {
 	ScmPersona,
 	ScmPersonaIdentities,
 	ScmWebhookRequest,
+	WebhookHeaderReader,
 } from '../../../scm/types.js';
 import { withAzureDevOpsToken } from './client.js';
 import { getAzureDevOpsToken, getAzureDevOpsTokenOrNull } from './credentials.js';
@@ -48,6 +48,12 @@ import {
 	isSwarmAzureDevOpsActor,
 	resolveAzureDevOpsPersonaIdentities,
 } from './personas.js';
+import {
+	isSwarmGeneratedAzureDevOpsEvent,
+	parseAzureDevOpsWebhook,
+	readAzureDevOpsWebhookRequest,
+	verifyAzureDevOpsWebhookAuth,
+} from './webhook.js';
 
 /**
  * The single exit for every contract method this phase leaves unbuilt. `phase`
@@ -60,7 +66,6 @@ function notImplementedYet(method: string, phase: string): never {
 	);
 }
 
-const WEBHOOK_PHASE = 'phase 3/6 (webhook ingress)';
 const READ_PHASE = 'phase 4/6 (pull-request reads)';
 const WRITE_PHASE = 'phase 5/6 (comments, delivery, merge)';
 
@@ -116,23 +121,34 @@ export class AzureDevOpsSCMIntegration implements SCMProvider {
 	}
 
 	// ==========================================================================
-	// Deferred: webhook ingress — phase 3/6
+	// Webhook ingress — phase 3/6, in `./webhook.ts`
 	// ==========================================================================
 
-	verifyWebhookSignature(): boolean {
-		notImplementedYet('verifyWebhookSignature', WEBHOOK_PHASE);
+	/**
+	 * {@link SCMProvider.verifyWebhookSignature} — a timing-safe comparison of the
+	 * `Authorization: Basic` password against the project's secret, *not* an HMAC
+	 * over the body: service hooks sign nothing, and basic auth is what they offer.
+	 */
+	verifyWebhookSignature(rawBody: string, signature: string, secret: string): boolean {
+		return verifyAzureDevOpsWebhookAuth(rawBody, signature, secret);
 	}
 
-	readWebhookRequest(): ScmWebhookRequest {
-		notImplementedYet('readWebhookRequest', WEBHOOK_PHASE);
+	/**
+	 * {@link SCMProvider.readWebhookRequest} — the event type and per-event id from
+	 * the body (Azure sends neither in a header), the credential from `Authorization`.
+	 */
+	readWebhookRequest(header: WebhookHeaderReader, payload: unknown): ScmWebhookRequest {
+		return readAzureDevOpsWebhookRequest(header, payload);
 	}
 
-	parseWebhookEvent(): ScmEvent | null {
-		notImplementedYet('parseWebhookEvent', WEBHOOK_PHASE);
+	/** {@link SCMProvider.parseWebhookEvent} — pull-request, comment and build events; `null` otherwise. */
+	parseWebhookEvent(eventName: string, payload: unknown): ScmEvent | null {
+		return parseAzureDevOpsWebhook(eventName, payload);
 	}
 
-	async isSwarmGeneratedEvent(): Promise<boolean> {
-		notImplementedYet('isSwarmGeneratedEvent', WEBHOOK_PHASE);
+	/** {@link SCMProvider.isSwarmGeneratedEvent} — the comment-scoped loop-prevention gate. */
+	async isSwarmGeneratedEvent(event: ScmEvent, project: ProjectConfig): Promise<boolean> {
+		return isSwarmGeneratedAzureDevOpsEvent(event, project);
 	}
 
 	// ==========================================================================

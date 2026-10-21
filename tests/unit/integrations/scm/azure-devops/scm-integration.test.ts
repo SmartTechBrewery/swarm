@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { createMockProjectConfig } from '../../../../helpers/factories.js';
+import {
+	createMockAzureDevOpsPullRequestPayload,
+	createMockProjectConfig,
+	createMockScmEvent,
+} from '../../../../helpers/factories.js';
 
 vi.mock('@/integrations/scm/azure-devops/client.js', () => ({
 	// Pass-through so a probe inside the scope can observe the token that would have
@@ -28,6 +32,7 @@ import {
 	resolveAzureDevOpsPersonaIdentities,
 } from '@/integrations/scm/azure-devops/personas.js';
 import { AzureDevOpsSCMIntegration } from '@/integrations/scm/azure-devops/scm-integration.js';
+import { SWARM_GENERATED_FOOTER } from '@/scm/swarm-origin.js';
 import type { ScmPersonaIdentities } from '@/scm/types.js';
 
 const project = createMockProjectConfig({ scm: 'azure-devops', repo: 'fabrikam/proj/web' });
@@ -130,15 +135,61 @@ describe('AzureDevOpsSCMIntegration', () => {
 		});
 	});
 
+	// The four webhook-ingress methods delegate to `./webhook.ts`, whose own suite
+	// covers the body fields, every event mapping, and the Basic-auth comparison. These
+	// assert only that the contract methods are wired to it rather than still throwing
+	// their phase-2 stub.
+	describe('webhook ingress', () => {
+		it('reads the event and delivery from the body and the credential from the header', () => {
+			const payload = createMockAzureDevOpsPullRequestPayload({ id: 'event-guid' });
+			const headers: Record<string, string> = { authorization: 'Basic abc=' };
+			expect(scm.readWebhookRequest((name) => headers[name.toLowerCase()], payload)).toEqual({
+				eventName: 'git.pullrequest.created',
+				deliveryId: 'event-guid',
+				signature: 'Basic abc=',
+			});
+		});
+
+		it('accepts the configured Basic password and rejects anything else', () => {
+			const credential = (password: string) =>
+				`Basic ${Buffer.from(`swarm:${password}`).toString('base64')}`;
+			expect(scm.verifyWebhookSignature('{}', credential('s3cret'), 's3cret')).toBe(true);
+			expect(scm.verifyWebhookSignature('{}', credential('other'), 's3cret')).toBe(false);
+			expect(scm.verifyWebhookSignature('{}', '', 's3cret')).toBe(false);
+		});
+
+		it('normalizes a supported event and drops an unsupported one', () => {
+			const payload = createMockAzureDevOpsPullRequestPayload();
+			expect(scm.parseWebhookEvent('git.pullrequest.created', payload)).toMatchObject({
+				kind: 'pull-request',
+				action: 'opened',
+				workItemId: '17',
+			});
+			expect(scm.parseWebhookEvent('git.push', { ...payload, eventType: 'git.push' })).toBeNull();
+		});
+
+		it('applies the comment-scoped SWARM-origin gate', async () => {
+			const marked = createMockScmEvent({
+				kind: 'work-item-comment',
+				isCommentEvent: true,
+				commentBody: `Done.\n\n${SWARM_GENERATED_FOOTER}`,
+			});
+			await expect(scm.isSwarmGeneratedEvent(marked, project)).resolves.toBe(true);
+
+			const human = createMockScmEvent({
+				kind: 'work-item-comment',
+				isCommentEvent: true,
+				commentBody: 'please rebase',
+			});
+			await expect(scm.isSwarmGeneratedEvent(human, project)).resolves.toBe(false);
+		});
+	});
+
 	// Every contract method this phase leaves unbuilt must fail loudly and name its
 	// follow-up phase — never return a misleading `null`/`[]`/no-op that a caller would
 	// mistake for a real answer (issue #1089).
 	describe('deferred contract methods', () => {
 		const deferred: Array<[method: string, phase: string, call: () => unknown]> = [
-			['verifyWebhookSignature', 'phase 3/6', () => scm.verifyWebhookSignature()],
-			['readWebhookRequest', 'phase 3/6', () => scm.readWebhookRequest()],
-			['parseWebhookEvent', 'phase 3/6', () => scm.parseWebhookEvent()],
-			['isSwarmGeneratedEvent', 'phase 3/6', () => scm.isSwarmGeneratedEvent()],
 			['getPullRequest', 'phase 4/6', () => scm.getPullRequest()],
 			['getPullRequestTitle', 'phase 4/6', () => scm.getPullRequestTitle()],
 			['pullRequestUrl', 'phase 4/6', () => scm.pullRequestUrl()],

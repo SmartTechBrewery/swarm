@@ -22,6 +22,7 @@ vi.mock('node:child_process', () => ({
 }));
 
 import {
+	azureDevOpsOrganizationFromUrl,
 	normalizeRepoSlug,
 	RepoSlugSchema,
 	repoSlugFromRemoteUrl,
@@ -142,6 +143,33 @@ describe('repoSlugFromRemoteUrl', () => {
 		expect(repoSlugFromRemoteUrl('')).toBeNull();
 		expect(repoSlugFromRemoteUrl('   ')).toBeNull();
 		expect(repoSlugFromRemoteUrl('not-a-url')).toBeNull();
+	});
+});
+
+// The webhook adapter builds an exact-match `repo` from this, so unlike the slugs above
+// it keeps Azure's casing (issue #1089 phase 3).
+describe('azureDevOpsOrganizationFromUrl', () => {
+	it('reads the organization from a dev.azure.com clone or REST URL, casing preserved', () => {
+		expect(
+			azureDevOpsOrganizationFromUrl('https://Fabrikam@dev.azure.com/Fabrikam/Fiber/_git/Web'),
+		).toBe('Fabrikam');
+		expect(
+			azureDevOpsOrganizationFromUrl('https://dev.azure.com/My%20Org/abc/_apis/git/repositories/x'),
+		).toBe('My Org');
+	});
+
+	it('reads a legacy visualstudio.com organization from its hostname', () => {
+		expect(
+			azureDevOpsOrganizationFromUrl(
+				'https://fabrikam.visualstudio.com/DefaultCollection/_git/Web',
+			),
+		).toBe('fabrikam');
+	});
+
+	it('returns null for any other host or an unparseable URL', () => {
+		expect(azureDevOpsOrganizationFromUrl('https://github.com/Fabrikam/web')).toBeNull();
+		expect(azureDevOpsOrganizationFromUrl('https://dev.azure.com/')).toBeNull();
+		expect(azureDevOpsOrganizationFromUrl('not-a-url')).toBeNull();
 	});
 });
 
