@@ -453,6 +453,11 @@ export async function findWorkerUpdateRunIdByRequestId(
  * would exclude it — and pruning it would delete the very working tree its
  * checkpoint describes, turning the continuation into a `checkpoint-divergent`
  * block. Hence the OR: a session id *or* the status itself is evidence of intent.
+ *
+ * Keyed on `(project, task)` on purpose, like the worktree lease it sits beside
+ * (`buildLeaseKey`, `src/worktree/worktree-lease.ts`): a same-numbered task in
+ * another repository can only over-retain a checkout, never supply a session or
+ * checkpoint (issue #1108).
  */
 export async function hasResumableDeferredRun(projectId: string, taskId: string): Promise<boolean> {
 	const rows = await getDb()
@@ -1159,6 +1164,12 @@ export async function clearRunRecovery(runId: string): Promise<void> {
  * always see itself. A zombie `running` row (a worker killed without settling it)
  * deliberately still counts as live; `failOrphanedRunningRuns` /
  * `failStaleRunningRuns` reap those, after which the next attempt recovers.
+ *
+ * Keyed on `(project, task)` on purpose: it answers for the `(project, task)`-keyed
+ * worktree lease (`buildLeaseKey`, `src/worktree/worktree-lease.ts`), so a
+ * same-numbered task in another repository can only make the answer "live" — the
+ * fail-closed direction. Scoping it without re-keying the lease would let a reset
+ * clear a lease another repository's live run holds (issue #1108).
  */
 export async function hasLiveRunForTask(
 	projectId: string,
@@ -1221,18 +1232,35 @@ export async function countRunningRunsForProject(
 }
 
 /**
- * Resolve the most recent run for one project task and phase. Fresh webhook
- * reruns use this to find a deferred or failed row that can be reused.
+ * Resolve the most recent run for one project task and phase **in one
+ * repository**. Fresh webhook reruns use this to find a deferred or failed row
+ * that can be reused.
+ *
+ * Repository-scoped because issue numbers are per repository: `(project, task)`
+ * names a task only while a project holds one repository, and a reused row keeps
+ * its `repository`, title, URL, checkpoint and continuation count through
+ * `resetRunToRunning` — so a cross-repository hit hands one task another's
+ * identity (issue #1108). The match is exact, as
+ * {@link getReviewAbsorbedForPullRequest}'s is, because `createRun` writes the
+ * same scoped `project.repo` callers pass here.
  */
 export async function getLatestRunForTask(
 	projectId: string,
+	repository: string,
 	taskId: string,
 	phase: TriggerPhase,
 ): Promise<RunRow | undefined> {
 	const rows = await getDb()
 		.select()
 		.from(runs)
-		.where(and(eq(runs.projectId, projectId), eq(runs.taskId, taskId), eq(runs.phase, phase)))
+		.where(
+			and(
+				eq(runs.projectId, projectId),
+				eq(runs.repository, repository),
+				eq(runs.taskId, taskId),
+				eq(runs.phase, phase),
+			),
+		)
 		.orderBy(desc(runs.startedAt))
 		.limit(1);
 	return rows[0];
@@ -1276,12 +1304,15 @@ export async function findBoardItemIdForTask(
 }
 
 /**
- * Resolve the newest successful Planning scope for this exact project/task.
- * Failed, deferred, unrelated, and pre-scope historical runs are intentionally
- * ignored: absence is evidence we do not have, never evidence of oversized work.
+ * Resolve the newest successful Planning scope for this exact
+ * project/repository/task. Failed, deferred, unrelated, and pre-scope historical
+ * runs are intentionally ignored: absence is evidence we do not have, never
+ * evidence of oversized work. Repository-scoped because a same-numbered task in
+ * another repository of the project is different work (issue #1108).
  */
 export async function getLatestCompletedPlanningScope(
 	projectId: string,
+	repository: string,
 	taskId: string,
 ): Promise<ProposedScope | undefined> {
 	const rows = await getDb()
@@ -1290,6 +1321,7 @@ export async function getLatestCompletedPlanningScope(
 		.where(
 			and(
 				eq(runs.projectId, projectId),
+				eq(runs.repository, repository),
 				eq(runs.taskId, taskId),
 				eq(runs.phase, 'planning'),
 				eq(runs.status, 'completed'),

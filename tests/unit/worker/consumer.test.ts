@@ -435,11 +435,16 @@ const failRunFromStatus = vi.fn(
 const storeRunLogs = vi.fn(async (_id: string, _stdout: string, _stderr: string) => {});
 const updateRunJobPayload = vi.fn(async (_id: string, _job: unknown) => {});
 const getLatestRunForTask = vi.fn(
-	async (_projectId: string, _taskId: string, _phase: string) => undefined,
+	async (
+		_projectId: string,
+		_repository: string,
+		_taskId: string,
+		_phase: string,
+	): Promise<unknown> => undefined,
 );
 const getLatestCompletedPlanningScope = vi.fn<
-	(projectId: string, taskId: string) => Promise<ProposedScope | undefined>
->(async (_projectId: string, _taskId: string) => undefined);
+	(projectId: string, repository: string, taskId: string) => Promise<ProposedScope | undefined>
+>(async (_projectId: string, _repository: string, _taskId: string) => undefined);
 const hasCompletedRunForTask = vi.fn(
 	async (_projectId: string, _taskId: string, _phase: string) => false,
 );
@@ -502,10 +507,10 @@ vi.mock('@/db/repositories/runsRepository.js', () => ({
 		failRunFromStatus(id, reason, fromStatus, diagnosis),
 	storeRunLogs: (id: string, stdout: string, stderr: string) => storeRunLogs(id, stdout, stderr),
 	updateRunJobPayload: (id: string, job: unknown) => updateRunJobPayload(id, job),
-	getLatestRunForTask: (projectId: string, taskId: string, phase: string) =>
-		getLatestRunForTask(projectId, taskId, phase),
-	getLatestCompletedPlanningScope: (projectId: string, taskId: string) =>
-		getLatestCompletedPlanningScope(projectId, taskId),
+	getLatestRunForTask: (projectId: string, repository: string, taskId: string, phase: string) =>
+		getLatestRunForTask(projectId, repository, taskId, phase),
+	getLatestCompletedPlanningScope: (projectId: string, repository: string, taskId: string) =>
+		getLatestCompletedPlanningScope(projectId, repository, taskId),
 	hasCompletedRunForTask: (projectId: string, taskId: string, phase: string) =>
 		hasCompletedRunForTask(projectId, taskId, phase),
 	isRetryPendingStatus: (status: string) => status === 'deferred' || status === 'checkpointed',
@@ -2995,7 +3000,7 @@ describe('processJob', () => {
 			status: 'phase-failed',
 			failureDiagnosis: { kind: 'likely-scope-exceeded' },
 		});
-		expect(getLatestCompletedPlanningScope).toHaveBeenCalledWith(PROJECT.id, '100');
+		expect(getLatestCompletedPlanningScope).toHaveBeenCalledWith(PROJECT.id, PROJECT.repo, '100');
 		const [, body] = addComment.mock.calls[0];
 		expect(body).toContain('Likely scope exceeded');
 		expect(body).toContain(
@@ -7038,7 +7043,7 @@ describe('processJob', () => {
 
 			await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
-			expect(getLatestRunForTask).toHaveBeenCalledWith(PROJECT.id, '17', 'review');
+			expect(getLatestRunForTask).toHaveBeenCalledWith(PROJECT.id, PROJECT.repo, '17', 'review');
 			expect(resetRunToRunning).toHaveBeenCalledWith(
 				`run-${status}`,
 				expect.objectContaining({ runId: `run-${status}` }),
@@ -7049,6 +7054,56 @@ describe('processJob', () => {
 				`run-${status}`,
 				expect.objectContaining({ status: 'completed' }),
 			);
+		});
+
+		// Issue #1108: issue numbers are per repository, so two repositories of one
+		// project share task ids. Live on `under-control-platform`: mobile#131's
+		// Implementation reset platform#131's failed row and ran under its identity,
+		// checkpoint and continuation count.
+		describe('two repositories of one project with the same task id and phase', () => {
+			const [platform, mobile] = createMockProjectRepositoryPair(['acme/platform', 'acme/mobile']);
+			const jobFor = (repo: string) =>
+				createMockScmWebhookJob({
+					projectId: 'acme',
+					event: createMockScmEvent({ repoFullName: repo }),
+				});
+
+			beforeEach(() => {
+				projectLookup = (_id, repo) => (repo === mobile.repo ? mobile : platform);
+				getLatestRunForTask.mockImplementation(async (_projectId, repository) =>
+					repository === platform.repo
+						? { id: 'run-platform', status: 'failed', repository: platform.repo }
+						: undefined,
+				);
+			});
+
+			it("records the second repository's attempt on a fresh row", async () => {
+				await processJob(jobFor(mobile.repo), registryReturning(REVIEW_TRIGGER));
+
+				expect(getLatestRunForTask).toHaveBeenCalledWith('acme', mobile.repo, '17', 'review');
+				expect(bindDispatchToRun).not.toHaveBeenCalledWith(expect.anything(), 'run-platform');
+				expect(resetRunToRunning).not.toHaveBeenCalled();
+				expect(createRun).toHaveBeenCalledExactlyOnceWith(
+					expect.objectContaining({
+						projectId: 'acme',
+						repository: mobile.repo,
+						taskId: '17',
+						phase: 'review',
+					}),
+				);
+			});
+
+			it("still reuses the first repository's own row for its own dispatch", async () => {
+				await processJob(jobFor(platform.repo), registryReturning(REVIEW_TRIGGER));
+
+				expect(getLatestRunForTask).toHaveBeenCalledWith('acme', platform.repo, '17', 'review');
+				expect(resetRunToRunning).toHaveBeenCalledWith(
+					'run-platform',
+					expect.objectContaining({ runId: 'run-platform' }),
+					'failed',
+				);
+				expect(createRun).not.toHaveBeenCalled();
+			});
 		});
 
 		it('creates a fresh row when the latest row is completed', async () => {

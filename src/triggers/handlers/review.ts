@@ -461,7 +461,7 @@ async function settleRunAwaitingRecheck(
 ): Promise<boolean> {
 	let settledAny = false;
 	for (const [taskId, phase] of recheckWaiterTasks(prNumber)) {
-		const run = await getLatestRunForTask(ctx.project.id, taskId, phase);
+		const run = await getLatestRunForTask(ctx.project.id, ctx.project.repo, taskId, phase);
 		if (!run || run.status !== 'deferred') continue;
 		if (!run.repository || !repoSlugsMatch(run.repository, ctx.project.repo)) continue;
 		const payload = run.jobPayload;

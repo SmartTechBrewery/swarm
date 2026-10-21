@@ -1803,7 +1803,7 @@ describe('review trigger — a retry that meets a defer names its wait (issue #1
 
 		/** Only the named phase's task has a run waiting; the other has none. */
 		const waitingOnly = (phase: 'review' | 'respond-to-ci') =>
-			getLatestRunForTask.mockImplementation(async (_projectId, _taskId, asked) =>
+			getLatestRunForTask.mockImplementation(async (_projectId, _repository, _taskId, asked) =>
 				asked === phase ? waitingRun() : undefined,
 			);
 
@@ -1813,7 +1813,7 @@ describe('review trigger — a retry that meets a defer names its wait (issue #1
 
 			await exhaustedChain();
 
-			expect(getLatestRunForTask).toHaveBeenCalledWith(PROJECT.id, '9', 'review');
+			expect(getLatestRunForTask).toHaveBeenCalledWith(PROJECT.id, PROJECT.repo, '9', 'review');
 			expect(getActiveDispatchByRunId).toHaveBeenCalledWith('run-abandoned');
 			expect(failRunFromStatus).toHaveBeenCalledExactlyOnceWith(
 				'run-abandoned',
@@ -1833,7 +1833,12 @@ describe('review trigger — a retry that meets a defer names its wait (issue #1
 
 			await exhaustedChain();
 
-			expect(getLatestRunForTask).toHaveBeenCalledWith(PROJECT.id, '9-ci', 'respond-to-ci');
+			expect(getLatestRunForTask).toHaveBeenCalledWith(
+				PROJECT.id,
+				PROJECT.repo,
+				'9-ci',
+				'respond-to-ci',
+			);
 			expect(failRunFromStatus).toHaveBeenCalledExactlyOnceWith(
 				'run-abandoned',
 				expect.stringContaining('Review abandoned'),
