@@ -21,7 +21,7 @@ const FAILURE_CONCLUSIONS = new Set(['failure', 'timed_out', 'action_required'])
 export type AggregateCheckDecision =
 	| { action: 'defer'; incompleteChecks: string[]; message: string }
 	| { action: 'respond-to-ci'; failedChecks: string[] }
-	| { action: 'review' };
+	| { action: 'review'; basis: 'checks-passed' | 'no-checks' };
 
 /**
  * Decide what to do with a PR's aggregate CI state:
@@ -39,6 +39,16 @@ export type AggregateCheckDecision =
  *    green would bypass CI. Projects with no CI at all opt into `if-present`
  *    (`pipeline.review.checks`, `src/config/schema.ts`), where a zero-check
  *    result reviews immediately instead — see the `policy` parameter (issue #274).
+ *    `basis` says which of the two it was: every check passed, or there were none.
+ *
+ * Zero checks means zero check **runs** — `totalCount` counts runs, not suites —
+ * so a head whose only check suite has no runs, or carries a suite the provider's
+ * read does not list at all (an Xcode Cloud suite stuck in `queued` on GitHub,
+ * issue #1107), is a zero-check head. That is decided here once, so the
+ * `updated` and `checks` paths of the `pr-review` handler, the unreviewed-PR
+ * sweep, base-branch health and merge automation can never classify the same head
+ * differently; `basis` lets the `updated` path act on the zero-check case alone
+ * without re-testing `totalCount` itself.
  */
 export function decideAggregateCheckOutcome(
 	checkStatus: AggregateCheckStatus,
@@ -46,7 +56,7 @@ export function decideAggregateCheckOutcome(
 	policy: ReviewChecksPolicy = 'required',
 ): AggregateCheckDecision {
 	if (checkStatus.totalCount === 0) {
-		if (policy === 'if-present') return { action: 'review' };
+		if (policy === 'if-present') return { action: 'review', basis: 'no-checks' };
 		return {
 			action: 'defer',
 			incompleteChecks: [],
@@ -72,5 +82,5 @@ export function decideAggregateCheckOutcome(
 		return { action: 'respond-to-ci', failedChecks };
 	}
 
-	return { action: 'review' };
+	return { action: 'review', basis: 'checks-passed' };
 }

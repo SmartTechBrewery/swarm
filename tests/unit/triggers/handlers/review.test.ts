@@ -1218,6 +1218,163 @@ describe('review trigger', () => {
 });
 
 /**
+ * A push to a mergeable head under `pipeline.review.checks` (issue #1107).
+ *
+ * The `updated` event used to end in an unconditional "waiting for checks" skip,
+ * so an `if-present` project's head that no CI ever runs on — no `checks` event
+ * will arrive for it — waited for the 15-minute unreviewed-PR sweep. Live on
+ * `under-control-mobile#135`: the head carried 0 statuses and 0 check runs, its
+ * only check suite an Xcode Cloud one stuck in `queued` with no runs, which the
+ * provider's aggregate reports as empty. Such a head is now reviewed off the push
+ * itself; every other head, and every `required` project, keeps waiting for its
+ * own completed-checks event.
+ */
+describe('review trigger — pull-request updated under pipeline.review.checks (issue #1107)', () => {
+	const updated = {
+		kind: 'pull-request',
+		action: 'updated',
+		workItemId: '42',
+		headSha: 'abc123',
+		isDraft: false,
+		isCrossRepo: false,
+	} as const;
+	const IF_PRESENT = createMockProjectConfig({ pipeline: { review: { checks: 'if-present' } } });
+	const REQUIRED = createMockProjectConfig({ pipeline: { review: { checks: 'required' } } });
+
+	beforeEach(() => {
+		getPullRequest.mockResolvedValue({
+			number: 42,
+			headBranch: 'issue-42',
+			headSha: 'abc123',
+			baseBranch: 'main',
+			baseSha: 'base123',
+			mergeable: true,
+			authorLogin: 'operator-human',
+			state: 'open',
+		});
+	});
+
+	it('reviews a zero-check head off the push under if-present', async () => {
+		// The live shape: a queued third-party suite with no runs, which the
+		// provider reports as an empty aggregate.
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([]));
+
+		const result = await handler.handle(ctx(updated, { project: IF_PRESENT }));
+
+		expect(result).toEqual({
+			phase: 'review',
+			taskId: '42',
+			prNumber: '42',
+			prBranch: 'issue-42',
+			headSha: 'abc123',
+			verdictSlotReserved: true,
+		});
+		expect(getAggregateCheckStatus).toHaveBeenCalledWith(IF_PRESENT, 'abc123');
+		expect(claimReviewDispatch).toHaveBeenCalledTimes(1);
+		expect(scheduleCoalescedJob).not.toHaveBeenCalled();
+	});
+
+	// The path the live log took: `mergeable` was still `null` on the first read
+	// after the push, so the event came back through a mergeability recheck.
+	it('reviews a zero-check head on a mergeability-recheck re-entry too', async () => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([]));
+
+		const result = await handler.handle(ctx(updated, { project: IF_PRESENT, recheckAttempt: 3 }));
+
+		expect(result).toMatchObject({ phase: 'review', taskId: '42', headSha: 'abc123' });
+	});
+
+	// The push races a follow-up `checks` event or the sweep for the same head;
+	// the PR+SHA claim settles it to one Review.
+	it('drops the push when the PR+SHA dispatch slot is already held', async () => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([]));
+		claimReviewDispatch.mockResolvedValue(false);
+
+		const result = await handler.handle(ctx(updated, { project: IF_PRESENT }));
+
+		expect(result).toBeNull();
+		expect(reserveReviewVerdict).not.toHaveBeenCalled();
+	});
+
+	const policies = [
+		['if-present', IF_PRESENT],
+		['required', REQUIRED],
+	] as const;
+	const heads = [
+		['pending', [['test', 'in_progress', null]]],
+		['passing', [['build', 'completed', 'success']]],
+		['failing', [['test', 'completed', 'failure']]],
+	] as const;
+	const cases = policies.flatMap(([policy, project]) =>
+		heads.map(([head, runs]) => [policy, head, project, runs] as const),
+	);
+
+	it.each(
+		cases,
+	)('under %s, a %s head still waits for its checks event', async (policy, _head, project, runs) => {
+		getAggregateCheckStatus.mockResolvedValue(
+			checkStatus(runs.map((run) => [...run] as [string, string, string | null])),
+		);
+
+		const result = await handler.handle(ctx(updated, { project }));
+
+		expect(result).toBeNull();
+		expect(claimReviewDispatch).not.toHaveBeenCalled();
+		expect(scheduleCoalescedJob).not.toHaveBeenCalled();
+		expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+		expect(getBranchHead).not.toHaveBeenCalled();
+		expect(reserveReviewVerdict).not.toHaveBeenCalled();
+		expect(getAggregateCheckStatus).toHaveBeenCalledTimes(policy === 'if-present' ? 1 : 0);
+	});
+
+	it.each([
+		['the default', PROJECT],
+		['an explicit', REQUIRED],
+	])('keeps waiting on a zero-check head under %s required policy', async (_label, project) => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([]));
+
+		const result = await handler.handle(ctx(updated, { project }));
+
+		expect(result).toBeNull();
+		expect(getAggregateCheckStatus).not.toHaveBeenCalled();
+		expect(scheduleCoalescedJob).not.toHaveBeenCalled();
+		expect(loggerDebug).toHaveBeenCalledWith(
+			'review: PR is mergeable on updated event; waiting for checks — skipping',
+			expect.objectContaining({ prNumber: '42', headSha: 'abc123', checksPolicy: 'required' }),
+		);
+	});
+
+	// A failed read leaves the head exactly where it was before issue #1107: to
+	// the checks event and the sweep — no recheck, no give-up trace.
+	it('skips without rescheduling when the aggregate read throws under if-present', async () => {
+		getAggregateCheckStatus.mockRejectedValue(new Error('502 Bad Gateway'));
+
+		const result = await handler.handle(ctx(updated, { project: IF_PRESENT }));
+
+		expect(result).toBeNull();
+		expect(scheduleCoalescedJob).not.toHaveBeenCalled();
+		expect(createFailedRun).not.toHaveBeenCalled();
+		expect(commentOnPullRequest).not.toHaveBeenCalled();
+		expect(loggerWarn).toHaveBeenCalled();
+	});
+
+	it('does not read checks when Review is disabled', async () => {
+		const project = createMockProjectConfig({
+			pipeline: {
+				review: { enabled: false, checks: 'if-present' },
+				respondToReview: { enabled: false },
+			},
+		});
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([]));
+
+		const result = await handler.handle(ctx(updated, { project }));
+
+		expect(result).toBeNull();
+		expect(getAggregateCheckStatus).not.toHaveBeenCalled();
+	});
+});
+
+/**
  * Separate CI-lag and read-failure recheck budgets (issue #720).
  *
  * The two defer reasons used to share one 20-attempt allowance, so a transient

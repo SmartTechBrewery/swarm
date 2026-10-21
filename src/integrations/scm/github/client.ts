@@ -71,6 +71,11 @@ export type CheckSuiteStatus = AggregateCheckStatus;
  * `listWorkflowRunsForRepo` returns newest-first): a failed-then-rerun workflow
  * would otherwise leak its stale failing run into the aggregate and make a green
  * PR look failed.
+ *
+ * Only Actions workflow runs are read, so a check suite another GitHub App
+ * creates (Xcode Cloud's) is invisible here, and a workflow run with no jobs
+ * contributes nothing; either way such a head aggregates to zero checks, which
+ * `decideAggregateCheckOutcome` classifies (issue #1107).
  */
 export async function getCheckSuiteStatus(
 	owner: string,

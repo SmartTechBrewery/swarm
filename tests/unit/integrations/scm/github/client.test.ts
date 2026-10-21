@@ -196,8 +196,21 @@ describe('github client', () => {
 			);
 		});
 
+		// A check suite another GitHub App creates (Xcode Cloud's, queued with no
+		// runs) is never listed by `listWorkflowRunsForRepo`, so this is the GitHub
+		// shape of the issue #1107 head: a zero-check aggregate.
 		it('returns an empty aggregate when the ref has no workflow runs', async () => {
 			paginate.mockResolvedValue([]);
+			const result = await withGitHubToken('tok', () =>
+				getCheckSuiteStatus('jkwiecien', 'swarm', 'deadbeef'),
+			);
+			expect(result).toEqual({ totalCount: 0, checkRuns: [] });
+		});
+
+		it('a workflow run with no jobs contributes no checks', async () => {
+			paginate.mockImplementation(async (endpoint: unknown) =>
+				endpoint === listWorkflowRunsForRepo ? [{ id: 7, workflow_id: 300 }] : [],
+			);
 			const result = await withGitHubToken('tok', () =>
 				getCheckSuiteStatus('jkwiecien', 'swarm', 'deadbeef'),
 			);

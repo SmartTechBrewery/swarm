@@ -5,8 +5,13 @@
  * mirroring Cascade's review-agent + respond-to-ci triggers on `check_suite`
  * completion (ai/ARCHITECTURE.md "Pipeline phases" #3 / respond-to-ci).
  *
- * Two entry events, one handler:
+ * Three entry events, one handler:
  *  - `pull-request` `opened` (non-draft) — review the freshly opened PR.
+ *  - `pull-request` `updated` (a push) — route a conflicting head to
+ *    Resolve-conflicts; a mergeable one waits for its checks, bar a head
+ *    reporting zero checks under `pipeline.review.checks: 'if-present'`, which is
+ *    reviewed off the push itself, since no `checks` event will ever arrive for
+ *    it (issue #1107).
  *  - `checks` `completed` — review the commit CI just validated (why the phase
  *    pins its checkout to the head SHA), or fix it if CI failed.
  *
@@ -35,7 +40,8 @@
  * check is still incomplete. Ported from Cascade's `check-suite-success`/`-failure`
  * triggers. A zero-check head defers too, under the default
  * `pipeline.review.checks: 'required'` policy — a project with no CI at all can
- * instead set `'if-present'` to review immediately on zero checks (issue #274).
+ * instead set `'if-present'` to review immediately on zero checks (issue #274),
+ * on a push as well as on a `checks` event (issue #1107).
  *
  * **Respond-to-CI loop guard.** Fixing a build pushes a commit → a new head SHA
  * → a fresh `checks` event, so if the fix doesn't stick the same PR routes back
@@ -894,11 +900,73 @@ async function resolveAggregateCheckReview(
 }
 
 /**
+ * Decide a mergeable `pull-request` `updated` event — a push — under the
+ * project's `pipeline.review.checks` policy (issue #1107). Returns `review` only
+ * for a head reporting **zero** checks under `if-present`, the one case no
+ * `checks` event will ever arrive to decide; every other head waits for its own
+ * completed-checks event exactly as before, so this resolves `none` with no
+ * recheck, no Respond-to-CI dispatch and no base-branch read.
+ *
+ * Under `required` the checks are not read at all: `decideAggregateCheckOutcome`
+ * can never answer `no-checks` there, so the read would be a wasted provider call.
+ * A failed read under `if-present` also resolves `none` rather than scheduling a
+ * recheck — the outcome this event always had, left to the `checks` event and the
+ * unreviewed-PR sweep — because {@link scheduleCheckRecheck}'s key is shared with
+ * the `checks` path, whose dispatch-capable recheck a coalesced `updated` payload
+ * must not replace.
+ */
+async function resolveUpdatedPullRequestReview(
+	ctx: ScmTriggerContext,
+	prNumber: string,
+	headSha: string,
+): Promise<ReviewDisposition> {
+	const { project } = ctx;
+	const checksPolicy = project.pipeline?.review?.checks ?? 'required';
+	if (checksPolicy === 'required') {
+		logger.debug('review: PR is mergeable on updated event; waiting for checks — skipping', {
+			prNumber,
+			headSha,
+			checksPolicy,
+		});
+		return { kind: 'none' };
+	}
+
+	let checkStatus: AggregateCheckStatus;
+	try {
+		checkStatus = await ctx.scm.getAggregateCheckStatus(project, headSha);
+	} catch (err) {
+		logger.warn(
+			'review: aggregate check read failed on updated event — leaving it to the checks event and the unreviewed-PR sweep',
+			{ prNumber, headSha, error: err instanceof Error ? err.message : String(err) },
+		);
+		return { kind: 'none' };
+	}
+
+	const decision = decideAggregateCheckOutcome(checkStatus, prNumber, checksPolicy);
+	if (decision.action === 'review' && decision.basis === 'no-checks') {
+		logger.info(
+			'review: head reports no checks under if-present — reviewing on the updated event',
+			{ prNumber, headSha },
+		);
+		return { kind: 'review' };
+	}
+	logger.debug('review: PR is mergeable on updated event; waiting for checks — skipping', {
+		prNumber,
+		headSha,
+		checksPolicy,
+		checks: decision.action,
+	});
+	return { kind: 'none' };
+}
+
+/**
  * What a shape-matched event resolves to, routing to the per-event-kind gate: a
- * `pull-request`'s draft/fork check (`review`/`none`), or a `checks` event's
- * aggregate-CI decision (`review`/`respond-to-ci`/`blocked-by-base`/`none`, and
- * it may defer a recheck in place). `baseBranch` is the pull request's own base,
- * carried from the mergeability gate for the base-attribution read.
+ * `pull-request`'s draft/fork check (`review`/`none`) — for an `updated` event
+ * then {@link resolveUpdatedPullRequestReview}'s checks-policy decision — or a
+ * `checks` event's aggregate-CI decision (`review`/`respond-to-ci`/
+ * `blocked-by-base`/`none`, and it may defer a recheck in place). `baseBranch` is
+ * the pull request's own base, carried from the mergeability gate for the
+ * base-attribution read.
  */
 function resolveDisposition(
 	ctx: ScmTriggerContext,
@@ -907,7 +975,9 @@ function resolveDisposition(
 	baseBranch: string,
 ): ReviewDisposition | Promise<ReviewDisposition> {
 	if (ctx.event.kind === 'pull-request') {
-		return isReviewablePullRequest(ctx.event, prNumber);
+		const reviewable = isReviewablePullRequest(ctx.event, prNumber);
+		if (reviewable.kind !== 'review' || ctx.event.action !== 'updated') return reviewable;
+		return resolveUpdatedPullRequestReview(ctx, prNumber, headSha);
 	}
 	return resolveAggregateCheckReview(ctx, prNumber, headSha, baseBranch);
 }
@@ -1362,8 +1432,9 @@ async function scheduleMergeabilityRecheck(
 	details: Record<string, unknown>,
 	wait: RecheckWait,
 ): Promise<null> {
-	// A PR-updated event intentionally never dispatches Review; a completed
-	// checks event can. Keep their rechecks separate so a later PR-updated
+	// A PR-updated event dispatches Review only for a zero-check head under
+	// `if-present` (issue #1107); a completed checks event is the dispatch path in
+	// every other case. Keep their rechecks separate so a later PR-updated
 	// delivery cannot replace the follow-up Review's dispatch-capable recheck.
 	const coalesceKey = mergeabilityRecheckCoalesceKey(
 		ctx.project.repo,
@@ -1522,14 +1593,6 @@ async function checkMergeabilityAndConflicts(
 
 	if (prDetails.mergeable === false) {
 		return handleConflictingPullRequest(ctx, project, prDetails, prNumber, headSha);
-	}
-
-	if (event.kind === 'pull-request' && event.action === 'updated') {
-		logger.debug('review: PR is mergeable on updated event; waiting for checks — skipping', {
-			prNumber,
-			headSha,
-		});
-		return null;
 	}
 
 	return { cleared: true, prBranch: prDetails.headBranch, baseBranch: prDetails.baseBranch };

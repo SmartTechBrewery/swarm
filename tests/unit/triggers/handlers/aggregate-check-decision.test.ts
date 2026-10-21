@@ -19,7 +19,7 @@ describe('decideAggregateCheckOutcome', () => {
 			]),
 			'9',
 		);
-		expect(decision).toEqual({ action: 'review' });
+		expect(decision).toEqual({ action: 'review', basis: 'checks-passed' });
 	});
 
 	it('defers when no checks are registered yet', () => {
@@ -41,7 +41,19 @@ describe('decideAggregateCheckOutcome', () => {
 	it('reviews on zero checks under the if-present policy (issue #274)', () => {
 		expect(decideAggregateCheckOutcome(status([]), '9', 'if-present')).toEqual({
 			action: 'review',
+			basis: 'no-checks',
 		});
+	});
+
+	it('reports checks-passed, not no-checks, for passing checks under the if-present policy', () => {
+		// Only a truly empty aggregate is `no-checks` — the basis the `updated`
+		// event acts on (issue #1107).
+		const decision = decideAggregateCheckOutcome(
+			status([['build', 'completed', 'success']]),
+			'9',
+			'if-present',
+		);
+		expect(decision).toEqual({ action: 'review', basis: 'checks-passed' });
 	});
 
 	it('still defers present-but-incomplete checks under the if-present policy', () => {
@@ -70,7 +82,7 @@ describe('decideAggregateCheckOutcome', () => {
 			]),
 			'9',
 		);
-		expect(decision).toEqual({ action: 'review' });
+		expect(decision).toEqual({ action: 'review', basis: 'checks-passed' });
 	});
 
 	it('defers, listing the incomplete checks, when a check is still running', () => {
