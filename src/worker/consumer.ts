@@ -83,7 +83,10 @@ import {
 	promoteTaskInFlightWaits,
 	publishDispatchWakeUp,
 } from '../dispatch/dispatcher.js';
-import { jobContinuesPreservedCheckout } from '../dispatch/preserved-worker.js';
+import {
+	jobContinuesPreservedCheckout,
+	preservedCheckoutMachineUnknown,
+} from '../dispatch/preserved-worker.js';
 import { deriveCapacityPendingPayload, deriveRetryJobPayload } from '../dispatch/retry-payload.js';
 import type {
 	AgentCli,
@@ -4275,7 +4278,9 @@ interface PreservedWorkerPin {
  * is the half that is genuinely safe — a run whose `worker_id` is `NULL` never
  * bound a machine, so there is no machine that *could* have been recorded and
  * nothing to have lost. A run whose last attempt did bind one, and yet records no
- * pin, is a continuation nobody can place: `machineUnknown`.
+ * pin, is a continuation nobody can place: `machineUnknown`
+ * ({@link preservedCheckoutMachineUnknown}, which "Retry now" applies at click time
+ * too — issue #1101).
  *
  * That case is deliberately reported rather than thrown. Only the gate knows
  * whether the project is federated at all, and an unfederated project has no other
@@ -4303,7 +4308,7 @@ async function resolvePreservedWorkerPin(job: SwarmJob): Promise<PreservedWorker
 		);
 	}
 	const workerId = run?.recovery?.preservedWorkerId;
-	if (!workerId) return { machineUnknown: run?.workerId != null };
+	if (!workerId) return { machineUnknown: preservedCheckoutMachineUnknown(run) };
 	try {
 		return {
 			worker: { id: workerId, name: (await getWorker(workerId))?.displayName },

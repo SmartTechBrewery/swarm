@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
+import { jobContinuesPreservedCheckout } from '@/dispatch/preserved-worker.js';
 import {
 	deriveCapacityPendingPayload,
 	deriveRetryJobPayload,
+	dropCheckoutContinuation,
 	reconstructResetJob,
 	reconstructRetryJob,
 } from '@/dispatch/retry-payload.js';
@@ -610,5 +612,38 @@ describe('reconstructResetJob', () => {
 
 		expect(stored.implementationBranchProvisioned).toBe(true);
 		expect(stored.agentSessionId).toBe(STORED_SESSION);
+	});
+});
+
+// Issue #1101: a fresh-start "Retry now" that merely inherited a continuation intent
+// drops it when the run records no machine for the checkout, so the restart is placeable
+// on any worker.
+describe('dropCheckoutContinuation', () => {
+	it.each(['checkpoint', 'resume'] as const)('removes a %s continuation', (recoveryMode) => {
+		const next = dropCheckoutContinuation(
+			createMockPmWebhookJob({ recoveryMode, resumeSession: true, resumeDelivery: true }),
+		);
+		expect(next.recoveryMode).toBeUndefined();
+		expect(next.resumeSession).toBeUndefined();
+		expect(next.resumeDelivery).toBeUndefined();
+		expect(jobContinuesPreservedCheckout(next)).toBe(false);
+	});
+
+	it('keeps everything that is not checkout-continuation intent', () => {
+		const job = createMockPmWebhookJob({
+			recoveryMode: 'fresh',
+			agentSessionId: 'a1b2c3d4-0000-4000-8000-000000000000',
+			resumePmPhase: 'implementation',
+			implementationBranchProvisioned: true,
+			cliOverride: 'codex',
+			rateLimitRetryAttempt: 0,
+		});
+		expect(dropCheckoutContinuation(job)).toEqual(job);
+	});
+
+	it('does not mutate its input', () => {
+		const job = createMockPmWebhookJob({ recoveryMode: 'checkpoint', resumeDelivery: true });
+		dropCheckoutContinuation(job);
+		expect(job).toMatchObject({ recoveryMode: 'checkpoint', resumeDelivery: true });
 	});
 });

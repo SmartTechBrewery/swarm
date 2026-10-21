@@ -70,7 +70,11 @@ import {
 	type StalledItem,
 	toStalledItems,
 } from '../../dispatch/item-liveness.js';
-import { reconstructRetryJob } from '../../dispatch/retry-payload.js';
+import {
+	jobContinuesPreservedCheckout,
+	preservedCheckoutMachineUnknown,
+} from '../../dispatch/preserved-worker.js';
+import { dropCheckoutContinuation, reconstructRetryJob } from '../../dispatch/retry-payload.js';
 import { RunResetError, type RunResetRefusal, resetRun } from '../../dispatch/run-reset.js';
 import { AgentCliSchema } from '../../harness/agent-cli.js';
 import { ReasoningLevelSchema } from '../../harness/models.js';
@@ -458,6 +462,45 @@ function alreadyRetrying(): TRPCError {
 	return new TRPCError({
 		code: 'CONFLICT',
 		message: 'This run is already retrying. Refresh to see its current status.',
+	});
+}
+
+/**
+ * Make sure "Retry now" never dispatches a continuation the eligibility gate will
+ * refuse as `preserved-worker-unknown` (issue #1101): a payload that adopts a
+ * preserved checkout, on a run that bound a machine but records none for that
+ * checkout. The verdict is the worker's own pin-read predicate, so the API and the
+ * gate cannot disagree about which rows are unplaceable.
+ *
+ * A **fresh-start** retry (`startFresh`, what the dashboard labels "Retry now" /
+ * "Recheck and retry") never asked to continue anything — the intent was only
+ * inherited from the stored payload, typically a `'checkpoint'` the run's earlier
+ * continuation left on `runs.job_payload`. It is dropped, so the phase restarts on any
+ * eligible worker, as the label promises. A retry that is **itself** a continuation
+ * ("Continue now", "Resume") cannot be placed at all, so it is refused up front with
+ * the gate's reason and the one action that ends it, instead of parking a dispatch on
+ * `worker-authorization` until its budget runs out.
+ */
+function placeableRetryJob(
+	job: SwarmJob,
+	run: {
+		id: string;
+		workerId: string | null;
+		recovery: { preservedWorkerId?: string | null } | null;
+	},
+	startFresh: boolean,
+): SwarmJob {
+	if (!jobContinuesPreservedCheckout(job) || !preservedCheckoutMachineUnknown(run)) return job;
+	if (startFresh) {
+		logger.info(
+			'retryNow: dropping an inherited checkout continuation whose machine is not recorded; restarting the phase',
+			{ runId: run.id, recoveryMode: job.recoveryMode },
+		);
+		return dropCheckoutContinuation(job);
+	}
+	throw new TRPCError({
+		code: 'PRECONDITION_FAILED',
+		message: `Cannot continue run "${run.id}" — it continues work preserved in a checkout on one specific machine, but SWARM has no record of which machine holds that checkout, so no worker could take it. To give up the preserved work and restart this phase from scratch on any worker, use "Reset & restart".`,
 	});
 }
 
@@ -1437,6 +1480,13 @@ export const runsRouter = router({
 	// Path 1 is also what makes Retry now supersede a pending automatic retry: it
 	// reopens that same `retry-scheduled` dispatch, so no second run is created.
 	//
+	// Placement (issue #1101): neither path dispatches a continuation of a preserved
+	// checkout whose machine the run never recorded — the eligibility gate would
+	// refuse it as `preserved-worker-unknown` on every re-check (issue #954). A
+	// fresh-start retry that merely inherited that intent restarts the phase instead;
+	// a retry that is itself a continuation is refused, pointing at "Reset & restart"
+	// (`placeableRetryJob`).
+	//
 	// Only limit: reconstruction needs a stored `jobPayload`. A run recorded
 	// without one (older rows, or a create path that didn't persist it) can't be
 	// rebuilt and is rejected with a clear message.
@@ -1513,16 +1563,20 @@ export const runsRouter = router({
 						message: `Cannot retry run "${input.runId}" — its dispatch payload no longer validates.`,
 					});
 				}
-				const job = reconstructRetryJob(
-					stored.data,
-					run.id,
-					run.phase,
-					input.cli,
-					input.model,
-					input.reasoning,
+				const job = placeableRetryJob(
+					reconstructRetryJob(
+						stored.data,
+						run.id,
+						run.phase,
+						input.cli,
+						input.model,
+						input.reasoning,
+						startFresh,
+						recoveryMode,
+						run.recovery?.agentSessionId ?? run.agentSessionId,
+					),
+					run,
 					startFresh,
-					recoveryMode,
-					run.recovery?.agentSessionId ?? run.agentSessionId,
 				);
 				const reopened = await reopenActiveDispatchForRetry(active, job);
 				if (!reopened) throw alreadyRetrying();
@@ -1545,16 +1599,20 @@ export const runsRouter = router({
 					message: `Cannot retry run "${input.runId}" — it was created without a job payload.`,
 				});
 			}
-			const job = reconstructRetryJob(
-				run.jobPayload,
-				run.id,
-				run.phase,
-				input.cli,
-				input.model,
-				input.reasoning,
+			const job = placeableRetryJob(
+				reconstructRetryJob(
+					run.jobPayload,
+					run.id,
+					run.phase,
+					input.cli,
+					input.model,
+					input.reasoning,
+					startFresh,
+					recoveryMode,
+					run.recovery?.agentSessionId ?? run.agentSessionId,
+				),
+				run,
 				startFresh,
-				recoveryMode,
-				run.recovery?.agentSessionId ?? run.agentSessionId,
 			);
 			try {
 				await createAndPublishDispatch({

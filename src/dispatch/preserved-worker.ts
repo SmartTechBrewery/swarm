@@ -47,3 +47,25 @@ export function jobContinuesPreservedCheckout(job: SwarmJob): boolean {
 		job.resumeDelivery === true
 	);
 }
+
+/**
+ * Whether a run records **no** machine for its preserved checkout although its last
+ * attempt did bind one (issue #954) — the run-row half of the eligibility gate's
+ * `preserved-worker-unknown` verdict.
+ *
+ * A run whose `worker_id` is `NULL` never bound a machine, so nothing could have been
+ * recorded and nothing was lost: it is not "unknown", which is the carve-out that keeps
+ * an unfederated project's continuations running. `worker_id` is never a substitute
+ * pin — it is the *last bind's* worker, so an already mis-routed continuation would name
+ * the wrong machine.
+ *
+ * Shared by the worker's pin read and "Retry now" (issue #1101), so the API restarts or
+ * refuses on exactly the rows the gate would refuse.
+ */
+export function preservedCheckoutMachineUnknown(
+	run:
+		| { workerId: string | null; recovery: { preservedWorkerId?: string | null } | null }
+		| undefined,
+): boolean {
+	return !run?.recovery?.preservedWorkerId && run?.workerId != null;
+}

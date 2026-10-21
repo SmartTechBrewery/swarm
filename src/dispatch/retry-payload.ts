@@ -253,6 +253,9 @@ export function deriveRetryJobPayload(parsed: SwarmJob, intent: DeferredRetryInt
  * opt-in and promises nothing of the sort. `'fresh'` and `'checkpoint'` are carried as
  * before: both still refuse a dirty or unpushed checkout, so inheriting either is
  * harmless, and one-shot-ness is a property of the only mode allowed to destroy work.
+ * An inherited `'checkpoint'` does also pin the dispatch to the machine holding the
+ * checkout (issue #567), so `runs.retryNow` drops it when the run records no such
+ * machine (issue #1101, {@link dropCheckoutContinuation}).
  */
 function applyManualRecoveryIntent(
 	job: SwarmJob,
@@ -321,6 +324,25 @@ export function reconstructRetryJob(
 	if (reasoning) job.reasoningOverride = reasoning;
 	applyManualRecoveryIntent(job, freshSession, recoveryMode, expectedSessionId);
 	return job;
+}
+
+/**
+ * The manual retry's payload with every **checkout-continuation** intent removed
+ * (issue #1101): `recoveryMode` when it is `'resume'`/`'checkpoint'`, `resumeSession`,
+ * and `resumeDelivery` — exactly the fields `jobContinuesPreservedCheckout` reads, so
+ * the result is never pinned to a machine. Everything else (the fresh `agentSessionId`
+ * {@link reconstructRetryJob} minted, `resumePmPhase`, overrides, zeroed budgets) is
+ * kept: the attempt is the ordinary from-scratch retry a fresh-start "Retry now"
+ * already is. `'fresh'` is left in place — it is the escape hatch, not a continuation.
+ */
+export function dropCheckoutContinuation(job: SwarmJob): SwarmJob {
+	const next = { ...job };
+	if (next.recoveryMode === 'resume' || next.recoveryMode === 'checkpoint') {
+		delete next.recoveryMode;
+	}
+	delete next.resumeSession;
+	delete next.resumeDelivery;
+	return next;
 }
 
 /**
