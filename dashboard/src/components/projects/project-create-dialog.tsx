@@ -5,12 +5,29 @@ import { useEffect, useRef, useState } from 'react';
 import { buttonClass } from '@/components/ui/button.js';
 import { DEFAULT_SCM_PROVIDER_ID, SCM_PROVIDERS, type ScmProviderId } from '@/lib/credentials.js';
 import { parseRepoUrl } from '@/lib/parse-repo-url.js';
-import { DEFAULT_BASE_BRANCH } from '@/lib/project-repository.js';
+import { DEFAULT_BASE_BRANCH, repoInputShape } from '@/lib/project-repository.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
+import { repoCoordinatesIssue } from '../../../../src/scm/repo-coordinates.js';
 import { Modal, ModalFooter } from '../ui/modal.js';
 
-/** `owner/repo` — the shape both the Repo input's own `pattern` and `scm.defaultBranch` require. */
-const REPO_SLUG = /^[^/]+\/[^/]+$/;
+/**
+ * Whether `slug` is a complete repository on `provider` — every segment non-empty, and as
+ * many of them as that provider addresses a repository by (`SCM_REPO_COORDINATES`: two
+ * for most, three for Azure DevOps' `organization/project/repository`, issue #1089
+ * phase 6/6). The same per-provider rule `scm.defaultBranch` and `projects.create` apply
+ * server-side, read from the same runtime-free catalogue.
+ */
+function isRepoSlugFor(provider: ScmProviderId, slug: string): boolean {
+	return !slug.split('/').includes('') && repoCoordinatesIssue(provider, slug) === null;
+}
+
+/** An example of each provider's repository URL, for the Repository URL placeholder. */
+const REPO_URL_PLACEHOLDERS: Record<ScmProviderId, string> = {
+	github: 'https://github.com/owner/repo',
+	bitbucket: 'https://bitbucket.org/workspace/repo_slug',
+	gitlab: 'https://gitlab.com/namespace/project',
+	'azure-devops': 'https://dev.azure.com/organization/project/_git/repository',
+};
 
 interface ProjectCreateDialogProps {
 	open: boolean;
@@ -144,7 +161,7 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 		invalidateBaseBranchDetection();
 		const detection = activeDetection.current;
 		const superseded = () => activeDetection.current !== detection || baseBranchTouched.current;
-		if (!REPO_SLUG.test(repoSlug) || baseBranchTouched.current) return;
+		if (!isRepoSlugFor(provider, repoSlug) || baseBranchTouched.current) return;
 		setBaseBranchNote(`Reading ${repoSlug}'s default branch…`);
 		try {
 			const { branch } = await trpcClient.scm.defaultBranch.query({
@@ -201,7 +218,7 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 									setRepoUrl(e.target.value);
 									setUrlError('');
 								}}
-								placeholder="https://github.com/owner/repo"
+								placeholder={REPO_URL_PLACEHOLDERS[scm]}
 								className="block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 font-mono"
 							/>
 							<button
@@ -260,10 +277,17 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 							}}
 							onBlur={() => void detectBaseBranch(repo, scm)}
 							required
-							pattern="[^/]+/[^/]+"
-							placeholder="owner/repo"
+							pattern={repoInputShape(scm).pattern}
+							title={`Must be in format "${repoInputShape(scm).placeholder}"`}
+							placeholder={repoInputShape(scm).placeholder}
+							aria-describedby="project-repo-hint"
 							className="block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 font-mono"
 						/>
+						<p id="project-repo-hint" className="mt-1 text-xs text-zinc-500">
+							{/* Every provider's webhook names the repository in its own casing, and the
+							    receiver resolves a project by exact match on this value. */}
+							Format: {repoInputShape(scm).placeholder}, in the provider’s own casing.
+						</p>
 					</div>
 					<div>
 						<label

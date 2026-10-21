@@ -78,6 +78,13 @@ describe('instanceCredentialsRouter (issues #769, #778)', () => {
 					envVarKey: 'GITLAB_TOKEN_REVIEWER',
 					isConfigured: false,
 				},
+				{
+					providerId: 'azure-devops',
+					providerLabel: 'Azure DevOps',
+					role: 'reviewer',
+					envVarKey: 'AZURE_DEVOPS_TOKEN_REVIEWER',
+					isConfigured: false,
+				},
 			]);
 		});
 
@@ -85,7 +92,7 @@ describe('instanceCredentialsRouter (issues #769, #778)', () => {
 			vi.mocked(listConfiguredInstanceScmCredentials).mockResolvedValue([]);
 
 			const result = await caller.list();
-			expect(result.roles).toHaveLength(3);
+			expect(result.roles).toHaveLength(4);
 			expect(result.roles.every((entry) => entry.isConfigured)).toBe(false);
 		});
 

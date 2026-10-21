@@ -1,8 +1,9 @@
 import { z } from 'zod';
-
+import { ProjectRepositorySchema } from '../../config/schema.js';
 import { resolveInstanceScmCredential } from '../../db/repositories/instanceCredentialsRepository.js';
 import { listInstanceDefaultScmRoles } from '../../integrations/scm/registry.js';
 import { ScmProviderIdSchema } from '../../scm/events.js';
+import { repoCoordinatesIssue } from '../../scm/repo-coordinates.js';
 import { resolveScmDefaultBranch } from '../scm-default-branch.js';
 import { verifyScmCredentialSecret } from '../scm-verification.js';
 import { authedProcedure, router } from '../trpc.js';
@@ -28,13 +29,13 @@ import { authedProcedure, router } from '../trpc.js';
  * (ai/RULES.md §2 names this as a deliberate exception): the caller has a pasted
  * secret and a provider *name* but no project yet, so there is nothing to resolve a
  * `SCMProvider` from — `hasIntegration`/`resolvePersonaIdentities` both take a
- * `ProjectConfig`. Bitbucket joined GitHub with issue #618 and GitLab with issue
- * #619, each when it became runtime-selectable.
+ * `ProjectConfig`. Bitbucket joined GitHub with issue #618, GitLab with issue #619,
+ * and Azure DevOps with issue #1089 phase 6/6, each when it became runtime-selectable.
  *
  * The provider-id → identity-lookup mapping itself moved to
  * `../scm-verification.ts` with issue #766, so the worker operator credential's own
  * write path verifies through the same one branch per provider rather than a second
- * copy of it. The three procedures below are unchanged in input, output, and
+ * copy of it. The four procedures below are unchanged in input, output, and
  * behaviour — the per-provider surface is still what a client addresses.
  */
 export const scmRouter = router({
@@ -67,6 +68,30 @@ export const scmRouter = router({
 		.mutation(async ({ input }) => await verifyScmCredentialSecret('gitlab', input.token)),
 
 	/**
+	 * Azure DevOps' twin (issue #1089 phase 6/6). It takes the **repository** as well as
+	 * the PAT, unlike its siblings: Azure's identity endpoint is organization-scoped and
+	 * a PAT is scoped to one organization by default, so a token alone names no account
+	 * (`getAzureDevOpsUserForToken`). The repository is the project's own
+	 * `organization/project/repository`, which carries the organization the token is
+	 * resolved in. The login reported back is the identity GUID — the value persona
+	 * identities and loop prevention compare
+	 * (`src/integrations/scm/azure-devops/personas.ts`).
+	 */
+	verifyAzureDevOpsToken: authedProcedure
+		.input(
+			z.object({
+				token: z.string().min(1),
+				repo: ProjectRepositorySchema.shape.repo.refine(
+					(repo) => repoCoordinatesIssue('azure-devops', repo) === null,
+					'Must be in format "organization/project/repository"',
+				),
+			}),
+		)
+		.mutation(
+			async ({ input }) => await verifyScmCredentialSecret('azure-devops', input.token, input.repo),
+		),
+
+	/**
 	 * The branch a repository reports as its default, so the New Project dialog can
 	 * pre-fill its Base Branch input with the repository's *real* one instead of a
 	 * plain `main` (issue #884). A **query**: it reads and stores nothing.
@@ -78,7 +103,7 @@ export const scmRouter = router({
 	 * yet, and this is the one credential that is guaranteed to exist for a provider a
 	 * project can be created on, so no new configuration, env var or role is
 	 * introduced. Which role is resolved comes off the manifests rather than a
-	 * hardcoded `'reviewer'`, so a fourth provider needs no edit here.
+	 * hardcoded `'reviewer'`, so a fifth provider needs no edit here.
 	 *
 	 * `{ branch: null }` covers every way the read can fail to answer — no instance
 	 * credential recorded, an unreachable provider, a repository the credential cannot
@@ -87,8 +112,13 @@ export const scmRouter = router({
 	 * failed. Nothing here throws for a repository it cannot read, since creation must
 	 * never fail on a pre-fill.
 	 *
+	 * The repository is validated against the **selected provider's** coordinates
+	 * (`repoCoordinatesIssue`, `src/scm/repo-coordinates.ts`) on top of the config
+	 * schema's two-or-three-segment shape, rather than a fixed two-segment pattern,
+	 * since an Azure DevOps repository has three segments.
+	 *
 	 * **Accepted trade-off:** any authenticated user may create a project, so any
-	 * authenticated user may ask this for an arbitrary `owner/repo`'s default branch as
+	 * authenticated user may ask this for an arbitrary repository's default branch as
 	 * read by the installation credential. That is the same capability creating a
 	 * project already grants — it seeds that credential into a project the caller
 	 * administers — and the answer is a branch name, not repository content, so
@@ -97,10 +127,12 @@ export const scmRouter = router({
 	 */
 	defaultBranch: authedProcedure
 		.input(
-			z.object({
-				scm: ScmProviderIdSchema,
-				repo: z.string().regex(/^[^/]+\/[^/]+$/, 'Must be in format "owner/repo"'),
-			}),
+			z
+				.object({ scm: ScmProviderIdSchema, repo: ProjectRepositorySchema.shape.repo })
+				.superRefine((input, ctx) => {
+					const issue = repoCoordinatesIssue(input.scm, input.repo);
+					if (issue) ctx.addIssue({ code: 'custom', path: ['repo'], message: issue });
+				}),
 		)
 		.query(async ({ input }): Promise<{ branch: string | null }> => {
 			// The first role the selected provider declares eligible for an instance

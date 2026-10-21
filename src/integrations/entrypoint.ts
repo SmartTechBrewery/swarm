@@ -45,11 +45,11 @@ import './scm/github/index.js';
 import './scm/bitbucket/index.js';
 // SCM: GitLab (issue #295, contract complete as of its phase 4/4). Runtime-ready
 // since issue #619, the way #618 did it for Bitbucket: routable from `project.scm`
-// and served at `/gitlab/webhook`. All three registered providers now carry traffic.
+// and served at `/gitlab/webhook`.
 import './scm/gitlab/index.js';
-// SCM: Azure DevOps (issue #1089, contract complete as of its phase 5/6). Registered
-// but **not** runtime-ready: no project routes to it and `/azure-devops/webhook` is
-// not served until phase 6/6 declares it ready.
+// SCM: Azure DevOps (issue #1089, contract complete as of its phase 5/6). Runtime-ready
+// since phase 6/6, the way #619 did it for GitLab: routable from `project.scm` and
+// served at `/azure-devops/webhook`. All four registered providers now carry traffic.
 import './scm/azure-devops/index.js';
 
 /**

@@ -22,6 +22,7 @@ import {
 } from '@/config/provider.js';
 import type { ProjectConfig } from '@/config/schema.js';
 import { PM_WEBHOOK_SECRET_ROLE, type PMProviderManifest } from '@/integrations/pm/manifest.js';
+import { azureDevOpsScmManifest } from '@/integrations/scm/azure-devops/index.js';
 import { gitlabScmManifest } from '@/integrations/scm/gitlab/index.js';
 import type { SCMProviderManifest } from '@/integrations/scm/manifest.js';
 import { logger } from '@/lib/logger.js';
@@ -33,6 +34,8 @@ import type { ScmEvent } from '@/scm/events.js';
 import type { SCMProvider } from '@/scm/types.js';
 import {
 	createFakeScmProvider,
+	createMockAzureDevOpsBuildPayload,
+	createMockAzureDevOpsPullRequestPayload,
 	createMockJiraProjectConfig,
 	createMockLinearProjectConfig,
 	createMockProjectConfig,
@@ -1748,6 +1751,151 @@ describe('createWebhookApp', () => {
 				expect.objectContaining({ kind: 'checks', workItemId: '8', prBranch: 'issue-8' }),
 				gitlabProject,
 				'delivery-gl-1',
+			);
+			listPullRequestsForCommit.mockRestore();
+		});
+	});
+	// The fourth runtime-ready SCM provider (issue #1089 phase 6/6). As with GitLab,
+	// nothing in the receiver names it: declaring `runtimeReady: true` is the whole
+	// change, and the same loop mounts `/azure-devops/webhook`. Driven through the real
+	// registry with only the project + secret lookups faked, so the assertions cover
+	// Azure's genuine shape: the event and delivery id named in the **body** (no header
+	// does), and HTTP Basic *sender* authentication rather than an HMAC over the body.
+	describe('real registered Azure DevOps provider (defaultDeps wiring)', () => {
+		const secret = 'ado-hook-password';
+		const headSha = 'da1560886d4f094c3e6c9ef40349f7d38b5d27d7';
+		const azureProject = createMockProjectConfig({
+			id: 'ado-project',
+			repo: 'Fabrikam/Fiber/Web',
+			scm: 'azure-devops',
+		});
+		const pullRequestBody = JSON.stringify(
+			createMockAzureDevOpsPullRequestPayload({ id: 'event-guid-ado-1' }),
+		);
+
+		/** `Authorization: Basic base64(user:password)`; the username is free text. */
+		const basic = (credential: string) =>
+			`Basic ${Buffer.from(credential, 'utf8').toString('base64')}`;
+
+		function realAzureApp() {
+			const enqueue = vi.fn<WebhookReceiverDeps['enqueue']>().mockResolvedValue(undefined);
+			const findProject = vi
+				.fn<(repo: string) => Promise<ProjectConfig | undefined>>()
+				.mockResolvedValue(azureProject);
+			// Fake only the secret + project lookups; the manifest comes from the registry.
+			const app = createWebhookApp({
+				findProject,
+				getWebhookSecret: vi
+					.fn<WebhookReceiverDeps['getWebhookSecret']>()
+					.mockResolvedValue(secret),
+				enqueue,
+			});
+			return { app, enqueue, findProject };
+		}
+
+		function postAzure(
+			app: ReturnType<typeof createWebhookApp>,
+			body: string,
+			headers: Record<string, string> = {},
+		) {
+			return app.request('/azure-devops/webhook', {
+				method: 'POST',
+				headers: {
+					authorization: basic(`swarm:${secret}`),
+					'content-type': 'application/json',
+					...headers,
+				},
+				body,
+			});
+		}
+
+		it("serves the registered manifest's `/azure-devops/webhook` GET ping", async () => {
+			const { app } = realAzureApp();
+			expect((await app.request('/azure-devops/webhook')).status).toBe(200);
+		});
+
+		// The dedup key is the envelope's own `id` — one GUID per event, kept across
+		// Azure's retries — so a redelivery collapses onto the same queue job.
+		it("enqueues an authenticated delivery under providerId 'azure-devops', keyed by the body id", async () => {
+			const { app, enqueue, findProject } = realAzureApp();
+			const res = await postAzure(app, pullRequestBody);
+			expect(res.status).toBe(202);
+			expect(findProject).toHaveBeenCalledWith('Fabrikam/Fiber/Web');
+			expect(enqueue).toHaveBeenCalledWith(
+				'azure-devops',
+				expect.objectContaining({
+					kind: 'pull-request',
+					action: 'opened',
+					repoFullName: 'Fabrikam/Fiber/Web',
+					workItemId: '17',
+					prBranch: 'swarm/issue-17',
+					headSha,
+				}),
+				azureProject,
+				'event-guid-ado-1',
+			);
+		});
+
+		it('rejects a delivery whose password does not match with 401', async () => {
+			const { app, enqueue } = realAzureApp();
+			const res = await postAzure(app, pullRequestBody, {
+				authorization: basic('swarm:wrong-password'),
+			});
+			expect(res.status).toBe(401);
+			expect(enqueue).not.toHaveBeenCalled();
+		});
+
+		// A subscription configured without basic auth sends no Authorization header;
+		// the provider's verifier fails closed on it rather than trusting the payload.
+		it('rejects a delivery carrying no credential with 401', async () => {
+			const { app, enqueue } = realAzureApp();
+			const res = await app.request('/azure-devops/webhook', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: pullRequestBody,
+			});
+			expect(res.status).toBe(401);
+			expect(enqueue).not.toHaveBeenCalled();
+		});
+
+		it("acknowledges an event SWARM doesn't act on without enqueueing", async () => {
+			const { app, enqueue } = realAzureApp();
+			const res = await postAzure(
+				app,
+				JSON.stringify(createMockAzureDevOpsPullRequestPayload({ eventType: 'git.push' })),
+			);
+			expect(res.status).toBe(202);
+			expect(await res.json()).toMatchObject({ ok: true, ignored: true });
+			expect(enqueue).not.toHaveBeenCalled();
+		});
+
+		// A branch build names no pull request, so — exactly as a GitLab branch pipeline —
+		// the pull request can only come from the ingress path's commit→PR contract read.
+		it('resolves a branch build to its pull request through the contract read', async () => {
+			const listPullRequestsForCommit = vi
+				.spyOn(azureDevOpsScmManifest.provider, 'listPullRequestsForCommit')
+				.mockResolvedValue([{ number: 17, headBranch: 'swarm/issue-17', state: 'open' }]);
+			const { app, enqueue } = realAzureApp();
+
+			const res = await postAzure(
+				app,
+				JSON.stringify(
+					createMockAzureDevOpsBuildPayload({ id: 'event-guid-ado-2', branchBuild: true }),
+				),
+			);
+
+			expect(res.status).toBe(202);
+			expect(listPullRequestsForCommit).toHaveBeenCalledWith(azureProject, headSha);
+			expect(enqueue).toHaveBeenCalledWith(
+				'azure-devops',
+				expect.objectContaining({
+					kind: 'checks',
+					checkConclusion: 'success',
+					workItemId: '17',
+					prBranch: 'swarm/issue-17',
+				}),
+				azureProject,
+				'event-guid-ado-2',
 			);
 			listPullRequestsForCommit.mockRestore();
 		});

@@ -19,6 +19,7 @@ function row(overrides: Partial<RepositoryForm> = {}): RepositoryForm {
 function renderList({
 	repositories = [row()],
 	duplicates = [] as string[],
+	scm,
 	isPending = false,
 	onChange = vi.fn(),
 	onAdd = vi.fn(),
@@ -29,6 +30,7 @@ function renderList({
 		<RepositoryList
 			repositories={repositories}
 			duplicates={duplicates}
+			scm={scm}
 			isPending={isPending}
 			onChange={onChange}
 			onAdd={onAdd}
@@ -81,6 +83,21 @@ describe('RepositoryList', () => {
 		expect(screen.queryByText('Default')).toBeNull();
 		expect(screen.queryByText(/default/i)).toBeNull();
 		expect(screen.getByText(/refused rather than run against the first/)).toBeDefined();
+	});
+
+	// Issue #1089 phase 6/6: an Azure DevOps repository has three segments, so a row
+	// takes its project provider's shape rather than a fixed `owner/repo` pattern.
+	it("shapes each row's repository input after the project's provider", () => {
+		const { unmount } = renderList({ scm: 'azure-devops' });
+		const azureInput = screen.getByLabelText('Repository, entry 1');
+		expect(azureInput.getAttribute('pattern')).toBe('[^/]+/[^/]+/[^/]+');
+		expect(azureInput.getAttribute('placeholder')).toBe('organization/project/repository');
+		unmount();
+
+		renderList({ scm: 'gitlab' });
+		const gitlabInput = screen.getByLabelText('Repository, entry 1');
+		expect(gitlabInput.getAttribute('pattern')).toBe('[^/]+/[^/]+');
+		expect(gitlabInput.getAttribute('placeholder')).toBe('namespace/project');
 	});
 
 	it('reports edits, adds, removes and moves to its handlers', () => {

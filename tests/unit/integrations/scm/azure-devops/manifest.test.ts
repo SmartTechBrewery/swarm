@@ -26,7 +26,7 @@ describe('azure-devops SCM manifest registration', () => {
 		]);
 	});
 
-	it('declares the expected identity and its (not yet served) webhook route', () => {
+	it('declares the expected identity and its served webhook route', () => {
 		expect(azureDevOpsScmManifest).toMatchObject({
 			id: 'azure-devops',
 			label: 'Azure DevOps',
@@ -35,13 +35,15 @@ describe('azure-devops SCM manifest registration', () => {
 		});
 	});
 
-	// Issue #1089 phase 5/6 registers the complete contract; phase 6/6 serves the route
-	// and flips this. Until then no project routes here and no instance default is offered.
-	it('does not carry runtime traffic yet', () => {
-		expect(azureDevOpsScmManifest.runtimeReady).toBe(false);
-		expect(isRuntimeReadySCMProvider(azureDevOpsScmManifest)).toBe(false);
-		expect(listInstanceDefaultScmRoles().map((entry) => entry.providerId)).not.toContain(
-			'azure-devops',
+	// The flip issue #1089 phase 6/6 owns: the contract has been complete since phase 5/6,
+	// and this is what makes it reachable — `requireProjectSCMProvider` routes a project
+	// stating `"scm": "azure-devops"` here, the receiver mounts the route above, and the
+	// reviewer role becomes eligible for an installation-wide default.
+	it('carries runtime traffic', () => {
+		expect(azureDevOpsScmManifest.runtimeReady).toBe(true);
+		expect(isRuntimeReadySCMProvider(azureDevOpsScmManifest)).toBe(true);
+		expect(listInstanceDefaultScmRoles()).toContainEqual(
+			expect.objectContaining({ providerId: 'azure-devops', role: 'reviewer' }),
 		);
 	});
 

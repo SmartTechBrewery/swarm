@@ -18,11 +18,12 @@
  * repository the credential cannot see, and a provider that names no default branch
  * are one answer: "cannot be determined". That is the outcome the caller degrades to
  * (keep the branch already in the field, and say the read failed), so it fails **open**
- * — project creation never waits on or fails because of this read. A fourth provider
+ * — project creation never waits on or fails because of this read. A fifth provider
  * registering without adding its branch below must read the same way, never as a wrong
  * answer.
  */
 
+import { getAzureDevOpsRepositoryDefaultBranch } from '../integrations/scm/azure-devops/client.js';
 import { getBitbucketRepositoryDefaultBranch } from '../integrations/scm/bitbucket/client.js';
 import { getGitHubRepositoryDefaultBranch } from '../integrations/scm/github/client.js';
 import { getGitLabRepositoryDefaultBranch } from '../integrations/scm/gitlab/client.js';
@@ -30,9 +31,10 @@ import type { ScmType } from '../scm/types.js';
 
 /**
  * The branch `providerId` reports as `repo`'s default when read with `secret`, or
- * `null` when it cannot be determined. `repo` is the `owner/repo` slug each provider
- * interprets in its own vocabulary (Bitbucket's `workspace/repo_slug`, GitLab's
- * `namespace/project`), exactly as `ProjectConfig.repo` is.
+ * `null` when it cannot be determined. `repo` is the slug each provider interprets in
+ * its own vocabulary (Bitbucket's `workspace/repo_slug`, GitLab's `namespace/project`,
+ * Azure DevOps' three-segment `organization/project/repository`), exactly as
+ * `ProjectConfig.repo` is.
  */
 export async function resolveScmDefaultBranch(
 	providerId: ScmType,
@@ -46,9 +48,11 @@ export async function resolveScmDefaultBranch(
 			return await getBitbucketRepositoryDefaultBranch(repo, secret);
 		case 'gitlab':
 			return await getGitLabRepositoryDefaultBranch(repo, secret);
+		case 'azure-devops':
+			return await getAzureDevOpsRepositoryDefaultBranch(repo, secret);
 		default:
 			// A provider id from the closed `ScmType` list that no branch above serves —
-			// unreachable today, and a fourth provider registering without adding its read
+			// unreachable today, and a fifth provider registering without adding its read
 			// here must read as "cannot be determined" rather than as another provider's
 			// answer.
 			return null;

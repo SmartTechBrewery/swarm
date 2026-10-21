@@ -13,8 +13,9 @@
  * supply a field it stays `undefined` rather than being guessed.
  *
  * Payload shapes follow the samples in Microsoft's service-hook event reference
- * (learn.microsoft.com/azure/devops/service-hooks/events). They have not yet been
- * checked against live deliveries — no route serves this provider until phase 6/6.
+ * (learn.microsoft.com/azure/devops/service-hooks/events). The receiver serves them at
+ * `/azure-devops/webhook` since phase 6/6, but they have not yet been checked against
+ * live deliveries from a real Azure DevOps organization.
  *
  * ## The event and the delivery are named in the body, not a header
  *

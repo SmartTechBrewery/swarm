@@ -25,7 +25,7 @@ issue metadata, comments, and logs.
 ```text
    ┌──────────────────────────────────────────────────────────────────────┐
    │  Board: GitHub Projects · Linear · Jira · Trello                     │
-   │  Code:  GitHub · Bitbucket Cloud · GitLab                            │
+   │  Code:  GitHub · Bitbucket Cloud · GitLab · Azure DevOps             │
    └───────────────┬──────────────────────────────────────────────────────┘
                    │  signed webhook (HTTPS, usually a Cloudflare Tunnel)
                    ▼
@@ -124,7 +124,7 @@ being silently started over somewhere else.
 
 | Axis | Supported today |
 | --- | --- |
-| **Source control** | GitHub · Bitbucket Cloud · gitlab.com |
+| **Source control** | GitHub · Bitbucket Cloud · gitlab.com · Azure DevOps Services |
 | **Project boards** | GitHub Projects v2 · Linear · Jira Cloud · Trello |
 | **Agent CLIs** | `claude` (Claude Code) · `agy` (Antigravity) · `codex` |
 | **Runtime** | Node 22+ · Postgres · Redis · Docker Compose |

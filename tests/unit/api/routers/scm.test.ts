@@ -8,6 +8,10 @@ vi.mock('@/integrations/scm/gitlab/client.js', () => ({
 	getGitLabUserForToken: vi.fn(),
 }));
 
+vi.mock('@/integrations/scm/azure-devops/client.js', () => ({
+	getAzureDevOpsUserForToken: vi.fn(),
+}));
+
 // The default-branch read's two collaborators (issue #884): the provider dispatch and
 // the instance-credential tier the secret comes from. Mocked the way
 // `projects.test.ts` mocks the latter — the procedure's job is which credential it
@@ -23,6 +27,7 @@ vi.mock('@/db/repositories/instanceCredentialsRepository.js', () => ({
 import { scmRouter } from '@/api/routers/scm.js';
 import { resolveScmDefaultBranch } from '@/api/scm-default-branch.js';
 import { resolveInstanceScmCredential } from '@/db/repositories/instanceCredentialsRepository.js';
+import { getAzureDevOpsUserForToken } from '@/integrations/scm/azure-devops/client.js';
 import { getGitHubUserForToken } from '@/integrations/scm/github/client.js';
 import { getGitLabUserForToken } from '@/integrations/scm/gitlab/client.js';
 import type { SCMProviderManifest } from '@/integrations/scm/manifest.js';
@@ -45,6 +50,7 @@ describe('scmRouter', () => {
 	beforeEach(() => {
 		vi.mocked(getGitHubUserForToken).mockReset();
 		vi.mocked(getGitLabUserForToken).mockReset();
+		vi.mocked(getAzureDevOpsUserForToken).mockReset();
 		vi.mocked(resolveScmDefaultBranch).mockReset();
 		vi.mocked(resolveInstanceScmCredential).mockReset();
 	});
@@ -96,6 +102,42 @@ describe('scmRouter', () => {
 		it('rejects an empty token before calling GitLab', async () => {
 			await expect(caller.verifyGitLabToken({ token: '' })).rejects.toThrow();
 			expect(getGitLabUserForToken).not.toHaveBeenCalled();
+		});
+	});
+
+	// Azure DevOps' procedure (issue #1089 phase 6/6). Unlike its siblings it takes the
+	// project's repository too: Azure's identity endpoint is organization-scoped, so a
+	// bare PAT names no account, and the organization is the repository's first segment.
+	describe('verifyAzureDevOpsToken', () => {
+		it('resolves the PAT within the repository’s organization', async () => {
+			vi.mocked(getAzureDevOpsUserForToken).mockResolvedValue('guid-reviewer');
+
+			const result = await caller.verifyAzureDevOpsToken({
+				token: 'ado-pat',
+				repo: 'Fabrikam/Fiber/Web',
+			});
+
+			expect(result).toEqual({ valid: true, login: 'guid-reviewer' });
+			expect(getAzureDevOpsUserForToken).toHaveBeenCalledWith('ado-pat', 'Fabrikam');
+			expect(getGitHubUserForToken).not.toHaveBeenCalled();
+		});
+
+		it('returns a not-valid result when the PAT does not resolve', async () => {
+			vi.mocked(getAzureDevOpsUserForToken).mockResolvedValue(null);
+
+			expect(
+				await caller.verifyAzureDevOpsToken({ token: 'ado-bad', repo: 'Fabrikam/Fiber/Web' }),
+			).toEqual({ valid: false });
+		});
+
+		it('rejects an empty token or a repository that is not organization/project/repository', async () => {
+			await expect(
+				caller.verifyAzureDevOpsToken({ token: '', repo: 'Fabrikam/Fiber/Web' }),
+			).rejects.toThrow();
+			await expect(
+				caller.verifyAzureDevOpsToken({ token: 'ado-pat', repo: 'Fabrikam/Web' }),
+			).rejects.toThrow(/organization\/project\/repository/);
+			expect(getAzureDevOpsUserForToken).not.toHaveBeenCalled();
 		});
 	});
 
@@ -171,6 +213,42 @@ describe('scmRouter', () => {
 		it('rejects a repo that is not owner/repo before resolving anything', async () => {
 			await expect(caller.defaultBranch({ scm: 'github', repo: 'swarm' })).rejects.toThrow();
 			expect(resolveInstanceScmCredential).not.toHaveBeenCalled();
+			expect(resolveScmDefaultBranch).not.toHaveBeenCalled();
+		});
+
+		// The repository is validated against the selected provider's coordinates
+		// (issue #1089 phase 6/6), not a fixed two-segment pattern: three segments are
+		// Azure DevOps' shape and nobody else's.
+		it("validates the repository against the selected provider's segment count", async () => {
+			registerSCMProvider({
+				id: 'azure-devops',
+				label: 'Stub',
+				category: 'scm',
+				webhookRoute: '/stub-ado/webhook',
+				credentialRoles: [
+					{ role: 'reviewer', envVarKey: 'SCM_STUB_ADO_REVIEWER', instanceDefault: true },
+					{ role: 'webhookSecret', envVarKey: 'SCM_STUB_ADO_WEBHOOK_SECRET' },
+				],
+			} as unknown as SCMProviderManifest);
+			vi.mocked(resolveInstanceScmCredential).mockResolvedValue('ado-instance-default');
+			vi.mocked(resolveScmDefaultBranch).mockResolvedValue('develop');
+
+			expect(
+				await caller.defaultBranch({ scm: 'azure-devops', repo: 'Fabrikam/Fiber/Web' }),
+			).toEqual({ branch: 'develop' });
+			expect(resolveScmDefaultBranch).toHaveBeenCalledWith(
+				'azure-devops',
+				'Fabrikam/Fiber/Web',
+				'ado-instance-default',
+			);
+
+			vi.mocked(resolveScmDefaultBranch).mockClear();
+			await expect(
+				caller.defaultBranch({ scm: 'azure-devops', repo: 'Fabrikam/Web' }),
+			).rejects.toThrow(/expects 3/);
+			await expect(caller.defaultBranch({ scm: 'github', repo: 'a/b/c' })).rejects.toThrow(
+				/expects 2/,
+			);
 			expect(resolveScmDefaultBranch).not.toHaveBeenCalled();
 		});
 

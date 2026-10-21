@@ -10,7 +10,7 @@ import { RepositoryList } from './repository-list.js';
  * It lived on the Settings tab between issues #700 and #729, which meant configuring
  * source control took two tabs — one to say *which* provider, another to say what it
  * operates on. Nothing in a row is project identity or host layout: `repo` is an
- * `owner/repo` slug, `baseBranch` is what pull requests target and worktrees are cut
+ * `owner/repo` slug (three segments on Azure DevOps), `baseBranch` is what pull requests target and worktrees are cut
  * from, `branchPrefix` names task branches. So the tab now reads top-to-bottom as
  * provider → credentials → repositories, the shape issue #630 gave Project Management.
  * Settings keeps `name`, `repoRoot`, `worktreeRoot` and `maxConcurrentJobs`.
@@ -32,6 +32,8 @@ export interface RepositoriesPanelProps {
 	repositories: RepositoryForm[];
 	/** Repositories more than one row claims; Save is blocked while this is non-empty. */
 	duplicates: string[];
+	/** The project's SCM provider, which decides each row's repository shape. */
+	scm?: string | null;
 	onChange: (index: number, patch: Partial<Omit<RepositoryForm, 'id'>>) => void;
 	onAdd: () => void;
 	onRemove: (index: number) => void;
@@ -48,6 +50,7 @@ export interface RepositoriesPanelProps {
 export function RepositoriesPanel({
 	repositories,
 	duplicates,
+	scm,
 	onChange,
 	onAdd,
 	onRemove,
@@ -66,6 +69,7 @@ export function RepositoriesPanel({
 				<RepositoryList
 					repositories={repositories}
 					duplicates={duplicates}
+					scm={scm}
 					isPending={isPending}
 					onChange={onChange}
 					onAdd={onAdd}

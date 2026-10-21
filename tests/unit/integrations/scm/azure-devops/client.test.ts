@@ -5,6 +5,7 @@ import {
 	AzureDevOpsApiError,
 	azureDevOpsRequest,
 	azureRepoCoordinates,
+	getAzureDevOpsRepositoryDefaultBranch,
 	getAzureDevOpsUserForToken,
 	getScopedAzureDevOpsUser,
 	getScopedToken,
@@ -400,6 +401,42 @@ describe('azure devops client', () => {
 		it('returns null for an absent token without calling the API', async () => {
 			await expect(getAzureDevOpsUserForToken(null, 'org')).resolves.toBeNull();
 			expect(fetchMock).not.toHaveBeenCalled();
+		});
+	});
+
+	// The New Project dialog's Base Branch pre-fill (issue #1089 phase 6/6): a full ref
+	// becomes the bare branch every other provider answers with, and any failure is the
+	// ordinary "cannot be determined" answer rather than a throw.
+	describe('getAzureDevOpsRepositoryDefaultBranch', () => {
+		it("reads the repository's default ref and strips refs/heads/", async () => {
+			fetchMock.mockResolvedValue(
+				jsonResponse({ id: 'repo-guid', defaultBranch: 'refs/heads/develop' }),
+			);
+
+			await expect(
+				getAzureDevOpsRepositoryDefaultBranch('Fabrikam/Fiber Project/Web', 'pat-abc'),
+			).resolves.toBe('develop');
+			expect(urlOf(fetchMock).pathname).toBe(
+				'/Fabrikam/Fiber%20Project/_apis/git/repositories/Web',
+			);
+			expect(headersOf(fetchMock).authorization).toBe(basic('pat-abc'));
+		});
+
+		it('returns null for a repository with no default branch (no commits yet)', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ id: 'repo-guid' }));
+
+			await expect(getAzureDevOpsRepositoryDefaultBranch('o/p/r', 'pat-abc')).resolves.toBeNull();
+		});
+
+		it('returns null — never throws — for an unreadable repository or a malformed repo', async () => {
+			fetchMock.mockResolvedValue(
+				jsonResponse({ message: 'not found', typeKey: 'GitRepositoryNotFoundException' }, 404),
+			);
+			await expect(getAzureDevOpsRepositoryDefaultBranch('o/p/r', 'pat-abc')).resolves.toBeNull();
+
+			await expect(
+				getAzureDevOpsRepositoryDefaultBranch('owner/repo', 'pat-abc'),
+			).resolves.toBeNull();
 		});
 	});
 

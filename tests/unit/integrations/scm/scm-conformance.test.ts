@@ -90,20 +90,20 @@ describe('SCM provider conformance', () => {
 		expect(new Set(ids).size).toBe(ids.length);
 	});
 
-	// All three registered providers are runtime-ready as of issue #619, which served
-	// `/gitlab/webhook` the way #618 served Bitbucket's; the several-projects-several-
-	// providers routing itself is asserted in `registry.test.ts`, against fake
+	// All four registered providers are runtime-ready as of issue #1089 phase 6/6, which
+	// served `/azure-devops/webhook` the way #619 served GitLab's; the several-projects-
+	// several-providers routing itself is asserted in `registry.test.ts`, against fake
 	// manifests, because this suite runs over the real registrations. The tripwire is
 	// unchanged in spirit: this list is the exhaustive set of providers declared ready
-	// to carry traffic, so a fourth provider flipping its flag has to update it
+	// to carry traffic, so a fifth provider flipping its flag has to update it
 	// deliberately — in the issue that serves that provider's ingress route — rather
-	// than as a side effect of unrelated work. Azure DevOps is registered but absent
-	// here on purpose: its route is served by issue #1089's phase 6/6.
+	// than as a side effect of unrelated work.
 	it('declares exactly the providers that have been made runtime-reachable', () => {
 		expect(manifests.filter(isRuntimeReadySCMProvider).map((m) => m.id)).toEqual([
 			'github',
 			'bitbucket',
 			'gitlab',
+			'azure-devops',
 		]);
 	});
 
@@ -167,34 +167,35 @@ describe('SCM provider conformance', () => {
 			});
 		}
 
-		// The "not registered" throw has no real manifest to run against: `ScmType` is a
-		// closed enum, so an unregistered id cannot even be put on a `ProjectConfig`. It
-		// stays asserted against fake manifests in `registry.test.ts`. The "registered but
-		// not runtime-ready" one has a real manifest again since Azure DevOps registered
-		// (issue #1089 phase 5/6) ahead of its served route — and it must refuse, never
-		// fall back to another provider.
-		it('refuses a project selecting the registered-but-not-ready azure-devops', () => {
-			expect(() =>
+		// Azure DevOps addresses a repository by three segments, so its routing case uses
+		// an Azure-shaped repository rather than the factory's two-segment default.
+		it("routes a project that selects 'azure-devops' to that provider", () => {
+			const manifest = manifests.find((candidate) => candidate.id === 'azure-devops');
+			expect(
 				requireProjectSCMProvider(
-					createMockProjectConfig({ scm: 'azure-devops', repo: 'fabrikam/proj/web' }),
+					createMockProjectConfig({ scm: 'azure-devops', repo: 'Fabrikam/Fiber/Web' }),
 				),
-			).toThrow(/selects 'azure-devops', which is registered but not runtime-ready/);
+			).toBe(manifest?.provider);
 		});
+
+		// The two "selected but unusable" throws have no real manifest to run against any
+		// more: `ScmType` is a closed enum, so an unregistered id cannot even be put on a
+		// `ProjectConfig`, and every registered provider carries traffic since issue #1089
+		// phase 6/6. Both stay asserted against fake manifests in `registry.test.ts`.
 
 		// The migration issue #618 created: the sole-runtime-ready fallback stopped
 		// resolving the moment Bitbucket became the second ready provider, so an
 		// installation predating `ProjectConfig.scm` must set the field. The error is
-		// the notice, so it has to name the field and list the choices — all three of
-		// them now that GitLab is ready too.
+		// the notice, so it has to name the field and list the choices — all four of
+		// them now that Azure DevOps is ready too.
 		it('tells an unmigrated project to set scm rather than picking a provider for it', () => {
 			const unmigrated = createMockProjectConfig();
 			expect(unmigrated.scm).toBeUndefined();
-			// Four registered, three ready: Azure DevOps is not offered as a choice.
 			expect(() => requireProjectSCMProvider(unmigrated)).toThrow(
-				/it selects no provider and 3 of 4 registered are runtime-ready/,
+				/it selects no provider and 4 of 4 registered are runtime-ready/,
 			);
 			expect(() => requireProjectSCMProvider(unmigrated)).toThrow(
-				/set "scm" on the project config to one of: github, bitbucket, gitlab/,
+				/set "scm" on the project config to one of: github, bitbucket, gitlab, azure-devops/,
 			);
 		});
 	});

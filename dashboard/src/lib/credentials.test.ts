@@ -34,13 +34,14 @@ describe('maskedPreview', () => {
 describe('SCM_PROVIDERS', () => {
 	// The list mirrors the server's runtime-ready manifests: offering a provider a
 	// project cannot resolve would only earn the operator a loud lookup error.
-	// Bitbucket joined with issue #618 and GitLab with #619, so all three registered
-	// providers are offered.
+	// Bitbucket joined with issue #618, GitLab with #619 and Azure DevOps with #1089
+	// phase 6/6, so all four registered providers are offered.
 	it('lists exactly the providers a project can be routed to', () => {
 		expect(SCM_PROVIDERS).toEqual([
 			{ id: 'github', label: 'GitHub', available: true },
 			{ id: 'bitbucket', label: 'Bitbucket Cloud', available: true },
 			{ id: 'gitlab', label: 'GitLab', available: true },
+			{ id: 'azure-devops', label: 'Azure DevOps', available: true },
 		]);
 	});
 
@@ -54,8 +55,9 @@ describe('toSelectableScmProvider', () => {
 		expect(toSelectableScmProvider('bitbucket')).toBe('bitbucket');
 	});
 
-	it('keeps GitLab now that the selector offers it', () => {
+	it('keeps GitLab and Azure DevOps now that the selector offers them', () => {
 		expect(toSelectableScmProvider('gitlab')).toBe('gitlab');
+		expect(toSelectableScmProvider('azure-devops')).toBe('azure-devops');
 	});
 
 	// A project predating issue #478's discriminator names nothing; one naming a
@@ -162,6 +164,43 @@ describe('getScmProviderCopy — GitLab', () => {
 	});
 });
 
+describe('getScmProviderCopy — Azure DevOps', () => {
+	const copy = getScmProviderCopy('azure-devops');
+
+	// Like GitLab's, the webhook value differs in kind: Azure sends a Basic-auth password
+	// rather than signing the body, so the copy must not promise an HMAC.
+	it('describes a Basic-auth password rather than an HMAC signature', () => {
+		expect(copy.roleDescriptions.webhookSecret).toMatch(/HTTP Basic auth/);
+		expect(copy.roleDescriptions.webhookSecret).not.toMatch(/HMAC/);
+		expect(copy.roleLabels).toEqual({
+			reviewer: 'Reviewer PAT',
+			webhookSecret: 'Service hook password',
+		});
+	});
+
+	// The four service-hook subscriptions the webhook adapter acts on, and the route.
+	it('tells the operator which service hooks to create and where to point them', () => {
+		for (const event of [
+			'Pull request created',
+			'Pull request updated',
+			'Pull request commented on',
+			'Build completed',
+		]) {
+			expect(copy.intro).toContain(event);
+		}
+		expect(copy.intro).toMatch(/\/azure-devops\/webhook/);
+		expect(copy.intro).toMatch(/basic authentication: any username/);
+		expect(copy.intro).toMatch(/set per worker on that worker's own page/);
+	});
+
+	it('names the PAT scopes and the organization the PAT is verified in', () => {
+		expect(copy.roleDescriptions.reviewer).toMatch(/Code \(Read & write\)/);
+		expect(copy.roleDescriptions.reviewer).toMatch(/Identity \/ User Profile \(Read\)/);
+		expect(copy.verifyFailureMessage).toMatch(/organization/);
+		expect(copy.operatorLabel).toBe('Operator PAT');
+	});
+});
+
 // The cheap guard that keeps one provider's vocabulary from creeping into another's
 // copy — "Reviewer PAT" for a Bitbucket app password is the symptom issue #632 reports.
 describe('per-provider credential copy', () => {
@@ -177,13 +216,20 @@ describe('per-provider credential copy', () => {
 	});
 
 	it('names no other provider in any label or role description', () => {
-		const BRANDS = ['github', 'bitbucket', 'gitlab'] as const;
+		// Each provider's id → the word its brand shows up as in copy.
+		const BRANDS: Record<string, string> = {
+			github: 'github',
+			bitbucket: 'bitbucket',
+			gitlab: 'gitlab',
+			'azure-devops': 'azure',
+		};
 		for (const provider of SCM_PROVIDERS) {
 			const copy = getScmProviderCopy(provider.id);
 			const text = ROLES.flatMap((role) => [copy.roleLabels[role], copy.roleDescriptions[role]])
 				.join(' ')
 				.toLowerCase();
-			for (const brand of BRANDS.filter((brand) => brand !== provider.id)) {
+			const foreign = Object.entries(BRANDS).filter(([id]) => id !== provider.id);
+			for (const [, brand] of foreign) {
 				expect(text, `${provider.id} copy mentions ${brand}`).not.toContain(brand);
 			}
 		}
@@ -194,6 +240,7 @@ describe('per-provider credential copy', () => {
 			github: ['app password', 'secret token'],
 			bitbucket: ['pat', 'access token'],
 			gitlab: ['pat', 'app password'],
+			'azure-devops': ['app password', 'access token', 'secret token'],
 		};
 		for (const provider of SCM_PROVIDERS) {
 			const labels = ROLES.map((role) => getScmProviderCopy(provider.id).roleLabels[role])

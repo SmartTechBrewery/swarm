@@ -353,8 +353,8 @@ interface ConnectionData {
  * organization by default, and the organization-less profile endpoints accept only
  * a PAT created for "all accessible organizations". Every caller has a project — and
  * so an organization — in hand, so the scoped endpoint serves both kinds of PAT. The
- * consequence is recorded for phase 6/6: the dashboard's pre-project verify procedure
- * must take the organization too, not just the token.
+ * consequence: the pre-project verify procedure (`scm.verifyAzureDevOpsToken`,
+ * `src/api/routers/scm.ts`) takes the organization too, not just the token.
  *
  * The endpoint is unversioned, so no `api-version` is sent.
  */
@@ -433,4 +433,44 @@ export async function getScopedAzureDevOpsUser(
 		displayName: user?.providerDisplayName?.trim() || user?.customDisplayName?.trim() || null,
 		email: account.includes('@') ? account : null,
 	};
+}
+
+/** The `refs/heads/` prefix Azure DevOps reports a repository's default branch under. */
+const BRANCH_REF_PREFIX = 'refs/heads/';
+
+/**
+ * The branch `repo` reports as its default when read with `pat`, or `null` when it
+ * cannot be determined — the pre-project read behind the New Project dialog's Base
+ * Branch pre-fill (`src/api/scm-default-branch.ts`, issue #1089 phase 6/6), the twin
+ * of `getGitLabRepositoryDefaultBranch`. Like that one it takes the token as an
+ * argument, because it runs before a project exists to scope one from.
+ *
+ * Azure reports the default as a full ref (`refs/heads/main`), so the prefix is
+ * stripped to the bare branch name every other provider answers with. A repository
+ * with no commits reports no `defaultBranch` at all, which reads as `null`.
+ *
+ * Failures flatten to `null` rather than throwing: the caller's degraded outcome is
+ * "keep the branch already in the field and say the read failed", so a malformed
+ * `repo`, a repository the PAT cannot see, a rejected PAT and an unreachable API are
+ * all the same ordinary answer. {@link AzureDevOpsApiError} is built from
+ * method/path/status/response body only, so the log cannot leak the token.
+ */
+export async function getAzureDevOpsRepositoryDefaultBranch(
+	repo: string,
+	pat: string,
+): Promise<string | null> {
+	try {
+		const repository = await withAzureDevOpsToken(pat, () =>
+			azureDevOpsRequest<{ defaultBranch?: string } | undefined>('GET', repositoryApiPath(repo)),
+		);
+		const ref = repository?.defaultBranch?.trim() ?? '';
+		const branch = ref.startsWith(BRANCH_REF_PREFIX) ? ref.slice(BRANCH_REF_PREFIX.length) : ref;
+		return branch || null;
+	} catch (err) {
+		logger.warn('Failed to read the Azure DevOps default branch for a repository', {
+			repo,
+			error: String(err),
+		});
+		return null;
+	}
 }

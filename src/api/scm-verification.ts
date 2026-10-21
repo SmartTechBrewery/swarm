@@ -6,7 +6,7 @@
  * (`./routers/workerScmCredentials.ts`, which validates one *as* it is stored,
  * issue #766).
  *
- * Extracted so the mapping exists once: a second copy is exactly the drift a fourth
+ * Extracted so the mapping exists once: a second copy is exactly the drift a fifth
  * provider would hit, since only one of the two call sites would be updated.
  *
  * **One branch per provider, not one lookup generalised over the registry**
@@ -14,15 +14,24 @@
  * identity method takes a `ProjectConfig`, and a caller holding a pasted secret has
  * no project to resolve one from.
  *
+ * **Azure DevOps needs a repository as well as the secret** (issue #1089 phase 6/6):
+ * its identity endpoint is organization-scoped (`getAzureDevOpsUserForToken`), and a
+ * PAT is scoped to one organization by default, so a bare secret identifies no
+ * account. The caller passes a repository the secret is meant to reach and the
+ * organization is read off it; the other providers ignore it. Without one, an Azure
+ * DevOps secret reads as "cannot be verified" — never as verified.
+ *
  * Each lookup already swallows a failed call to `null`, so an unreachable provider
  * is reported as an invalid credential rather than as an inconclusive check. That is
  * the behaviour the `scm.verify…` procedures have always had, and it fails closed,
  * which is the right side to err on for a write.
  */
 
+import { getAzureDevOpsUserForToken } from '../integrations/scm/azure-devops/client.js';
 import { getBitbucketUserForCredential } from '../integrations/scm/bitbucket/client.js';
 import { getGitHubUserForToken } from '../integrations/scm/github/client.js';
 import { getGitLabUserForToken } from '../integrations/scm/gitlab/client.js';
+import { repoCoordinatesIssue } from '../scm/repo-coordinates.js';
 import type { ScmType } from '../scm/types.js';
 
 /**
@@ -33,16 +42,25 @@ import type { ScmType } from '../scm/types.js';
  */
 export type ScmCredentialVerification = { valid: true; login: string } | { valid: false };
 
-/** Resolve `secret` to an account on `providerId`, or report it as invalid. */
+/**
+ * Resolve `secret` to an account on `providerId`, or report it as invalid. `repo` is a
+ * repository on that provider the secret is meant to reach (`ProjectConfig.repo`'s
+ * shape); only a provider whose identity is scoped below the account reads it.
+ */
 export async function verifyScmCredentialSecret(
 	providerId: ScmType,
 	secret: string,
+	repo?: string,
 ): Promise<ScmCredentialVerification> {
-	const login = await resolveLogin(providerId, secret);
+	const login = await resolveLogin(providerId, secret, repo);
 	return login ? { valid: true, login } : { valid: false };
 }
 
-async function resolveLogin(providerId: ScmType, secret: string): Promise<string | null> {
+async function resolveLogin(
+	providerId: ScmType,
+	secret: string,
+	repo: string | undefined,
+): Promise<string | null> {
 	switch (providerId) {
 		case 'github':
 			return await getGitHubUserForToken(secret);
@@ -50,9 +68,15 @@ async function resolveLogin(providerId: ScmType, secret: string): Promise<string
 			return await getBitbucketUserForCredential(secret);
 		case 'gitlab':
 			return await getGitLabUserForToken(secret);
+		case 'azure-devops': {
+			// No repository, or one not in Azure's three-segment shape, names no
+			// organization to resolve the PAT in.
+			if (!repo || repoCoordinatesIssue('azure-devops', repo) !== null) return null;
+			return await getAzureDevOpsUserForToken(secret, repo.split('/')[0] as string);
+		}
 		default:
 			// A provider id from the closed `ScmType` list that no branch above serves —
-			// unreachable today, and a fourth provider registering without adding its
+			// unreachable today, and a fifth provider registering without adding its
 			// lookup here must read as "cannot be verified" rather than as verified.
 			return null;
 	}

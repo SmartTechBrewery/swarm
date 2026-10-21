@@ -29,8 +29,10 @@ their own subjects; this manual is the operator's path through them.
 - Docker Compose
 - Git
 - Authenticated agent CLIs (`claude`, `agy`, and/or `codex`)
-- A source-control repository on GitHub, Bitbucket Cloud, or gitlab.com — named by the
-  project's `scm` field, which every project must set — and a project-management board with a
+- A source-control repository on GitHub, Bitbucket Cloud, gitlab.com, or Azure DevOps
+  Services (`dev.azure.com`; its `repo` is the three-segment
+  `organization/project/repository`, in Azure's own casing) — named by the project's
+  `scm` field, which every project must set — and a project-management board with a
   webhook: a GitHub Projects v2 board, a Linear team, a Jira Cloud project, or a
   Trello board. The first three are configured in the provider's own UI; a Trello
   webhook is a resource SWARM creates for you, with
@@ -175,11 +177,13 @@ and operator credentials. See
 
 The operator's own source-control credential is **not** among them: it is stored
 server-side per `(worker, SCM provider)` — `swarm workers set-scm-credential
-<worker-id> <github|bitbucket|gitlab>`, or from that worker's own page in the
-dashboard (`/workers/<worker-id>`, which verifies the value against the provider
+<worker-id> <github|bitbucket|gitlab|azure-devops>`, or from that worker's own page in
+the dashboard (`/workers/<worker-id>`, which verifies the value against the provider
 before storing it) — and travels with each assignment, so rotating it needs no worker
-restart and a Bitbucket or GitLab project resolves its own credential rather than a
-GitHub-named one.
+restart and a Bitbucket, GitLab, or Azure DevOps project resolves its own credential
+rather than a GitHub-named one. An Azure DevOps PAT is verified in the organization of
+an Azure DevOps project the worker is enrolled in, so enroll the worker before setting
+it.
 
 It is intentionally host-run: it needs local Git worktrees, agent CLI
 authentication, and the developer's PATH.

@@ -4,11 +4,13 @@
  * concrete provider or speak a provider's own vocabulary (ai/RULES.md §2
  * "Source-control features must not hard-code GitHub").
  *
- * All three implementations carry runtime traffic: `GitHubSCMIntegration`
+ * All four implementations carry runtime traffic: `GitHubSCMIntegration`
  * (`src/integrations/scm/github/scm-integration.ts`), `BitbucketSCMIntegration`
- * (`src/integrations/scm/bitbucket/scm-integration.ts`, since issue #618), and
+ * (`src/integrations/scm/bitbucket/scm-integration.ts`, since issue #618),
  * `GitLabSCMIntegration` (`src/integrations/scm/gitlab/scm-integration.ts`, since
- * issue #619) — each registered through the SCM manifest + registry
+ * issue #619), and `AzureDevOpsSCMIntegration`
+ * (`src/integrations/scm/azure-devops/scm-integration.ts`, since issue #1089 phase
+ * 6/6) — each registered through the SCM manifest + registry
  * (`src/integrations/scm/{manifest,registry}.ts`) exactly as the PM side
  * registers GitHub Projects, and each project routing to the one it names
  * (`ProjectConfig.scm`, issue #478).
@@ -37,8 +39,8 @@
  *   (issue #478) is a bare provider id rather than a discriminated union's `type`.
  *   Selection itself is no longer missing: `requireProjectSCMProvider`
  *   (`src/integrations/scm/registry.ts`) resolves the manifest a project names,
- *   which is what lets GitHub, Bitbucket, and GitLab serve one installation side
- *   by side.
+ *   which is what lets GitHub, Bitbucket, GitLab, and Azure DevOps serve one
+ *   installation side by side.
  * - **`withCredentials`** — the implementer-persona convenience wrapper on the
  *   GitHub class. It is sugar over {@link SCMProvider.withPersonaCredentials};
  *   putting it in the contract would oblige a second provider to implement two
@@ -56,10 +58,9 @@ import type { ScmMergeProvider } from './merge.js';
  * schema's `credentials.scm` key check (`src/config/schema.ts`), which validates a
  * provider *id* without depending on which provider modules a process imported.
  *
- * `azure-devops` is a fourth id named ahead of its provider (issue #1089), exactly as
- * `gitlab` was during issue #295's build-out: nothing registers it yet, so
- * `requireProjectSCMProvider` throws its existing "not registered" message for a
- * project that selects it.
+ * `azure-devops` was a fourth id named ahead of its provider (issue #1089), exactly as
+ * `gitlab` was during issue #295's build-out; its provider registered in phase 5/6 and
+ * became runtime-ready in phase 6/6, so every id here now resolves.
  */
 export const SCM_TYPES = ['github', 'bitbucket', 'gitlab', 'azure-devops'] as const;
 export type ScmType = (typeof SCM_TYPES)[number];

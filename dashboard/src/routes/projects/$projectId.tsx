@@ -2755,6 +2755,7 @@ function ProjectDetailRouteComponent() {
 						<RepositoriesPanel
 							repositories={repositories}
 							duplicates={duplicateRepos}
+							scm={project?.scm}
 							onChange={handleRepositoryChange}
 							onAdd={handleAddRepository}
 							onRemove={handleRemoveRepository}

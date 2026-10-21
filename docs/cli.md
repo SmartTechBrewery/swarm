@@ -590,7 +590,7 @@ unchanged.
   project** server-side (`workers.projectScmProvider`, which resolves it through the
   same lookup the dispatcher uses — never assumed to be GitHub), so the
   credential prompt names the provider that project actually runs on and any of
-  `github | bitbucket | gitlab` works. That lookup is also the one place in the API
+  `github | bitbucket | gitlab | azure-devops` works. That lookup is also the one place in the API
   where a refused project says *which* of the two things went wrong (issue #899):
   `Project with ID "…" not found` means no project carries that id, while
   `You are not a member of project "…"` means the id is right and the membership is
@@ -670,15 +670,18 @@ unchanged.
   reconnect, and it may only *narrow* what that machine's daemon last reported. The
   machine's owner alone may do it.
 - **`set-scm-credential`** — store (or rotate) this worker's **operator** credential
-  for one SCM provider (`github | bitbucket | gitlab`) — the account every phase it
+  for one SCM provider (`github | bitbucket | gitlab | azure-devops`) — the account every phase it
   runs against a project on that provider commits, pushes, opens pull requests and
   comments as (issue #765). One credential per `(worker, provider)`, encrypted at
   rest and resolved at dispatch, so a rotation takes effect on the next phase with no
   worker restart. The secret is prompted for without echo on a TTY and otherwise read
   from stdin — never taken as an argument (shell history, `ps`) and never printed
-  back — and it is verified against the provider before anything is stored. The prompt
+  back — and it is verified against the provider before anything is stored (an Azure
+  DevOps PAT in the organization of an Azure DevOps project the worker is enrolled
+  in, so enroll it first). The prompt
   names the kind of secret that provider expects (a GitHub personal access token, a
-  Bitbucket app password, a GitLab access token) in the same words the worker page's
+  Bitbucket app password, a GitLab access token, an Azure DevOps personal access
+  token) in the same words the worker page's
   **Operator source-control credential** card uses, from one shared catalogue
   (`src/scm/operator-credential-copy.ts`, issue #807). A worker with none stored for
   the provider a dispatch needs fails that dispatch immediately, naming the worker

@@ -1,5 +1,5 @@
 import { ChevronDown, ChevronUp, Plus, Trash2 } from 'lucide-react';
-import type { RepositoryForm } from '@/lib/project-repository.js';
+import { type RepositoryForm, repoInputShape } from '@/lib/project-repository.js';
 
 /** Input/select recipe shared with the rest of the tab (ai/DESIGN_SYSTEM.md §4). */
 const FIELD_CLASS =
@@ -16,6 +16,8 @@ interface RepositoryRowProps {
 	index: number;
 	/** Total number of rows — the last one can't move down, or be removed at all. */
 	total: number;
+	/** The project's SCM provider, which decides how many segments `repo` has. */
+	scm: string | null | undefined;
 	isPending: boolean;
 	onChange: (index: number, patch: Partial<Omit<RepositoryForm, 'id'>>) => void;
 	onRemove: (index: number) => void;
@@ -39,12 +41,14 @@ function RepositoryRow({
 	entry,
 	index,
 	total,
+	scm,
 	isPending,
 	onChange,
 	onRemove,
 	onMove,
 }: RepositoryRowProps) {
 	const rank = index + 1;
+	const repoShape = repoInputShape(scm);
 	const idBase = `repository-${index}`;
 	const isOnly = total === 1;
 
@@ -101,8 +105,9 @@ function RepositoryRow({
 						onChange={(e) => onChange(index, { repo: e.target.value })}
 						disabled={isPending}
 						required
-						pattern="[^/]+/[^/]+"
-						placeholder="owner/repo"
+						pattern={repoShape.pattern}
+						title={`Must be in format "${repoShape.placeholder}"`}
+						placeholder={repoShape.placeholder}
 						className={`${FIELD_CLASS} font-mono`}
 					/>
 				</div>
@@ -166,6 +171,11 @@ export interface RepositoryListProps {
 	repositories: RepositoryForm[];
 	/** Repositories more than one row claims; Save is blocked while this is non-empty. */
 	duplicates: string[];
+	/**
+	 * The project's SCM provider — every repository it owns lives on it (issue #727) —
+	 * so each row's input takes that provider's shape: three segments on Azure DevOps.
+	 */
+	scm?: string | null;
 	isPending: boolean;
 	onChange: (index: number, patch: Partial<Omit<RepositoryForm, 'id'>>) => void;
 	onAdd: () => void;
@@ -193,6 +203,7 @@ export interface RepositoryListProps {
 export function RepositoryList({
 	repositories,
 	duplicates,
+	scm,
 	isPending,
 	onChange,
 	onAdd,
@@ -222,6 +233,7 @@ export function RepositoryList({
 						entry={entry}
 						index={index}
 						total={repositories.length}
+						scm={scm}
 						isPending={isPending}
 						onChange={onChange}
 						onRemove={onRemove}
