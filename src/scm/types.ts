@@ -165,7 +165,8 @@ export interface CommitPullRequest {
 export type WebhookHeaderReader = (name: string) => string | undefined;
 
 /**
- * What a provider reads out of an inbound webhook's headers.
+ * What a provider reads out of an inbound webhook's headers (or, for a provider
+ * that sends neither in a header, its body — see {@link SCMProvider.readWebhookRequest}).
  *
  * `eventName` stays the provider's *own* event name (GitHub's `pull_request`,
  * `projects_v2_item`, …), deliberately opaque to the receiver: it is only ever
@@ -255,11 +256,15 @@ export interface SCMProvider extends ScmMergeProvider {
 	verifyWebhookSignature(rawBody: string, signature: string, secret: string): boolean;
 
 	/**
-	 * Interpret an inbound webhook's headers — which one names the event, which
-	 * carries the per-delivery id, which carries the signature. Pure header
-	 * reading, so it runs before the body is authenticated.
+	 * Interpret an inbound webhook request — which header (or body field) names the
+	 * event, which carries the per-delivery id, which header carries the signature.
+	 * Most providers read headers alone; `payload` (the parsed body) is there for
+	 * one that names the event and delivery only in the body, as Azure DevOps's
+	 * service hooks do (issue #1089), and a provider that has no use for it simply
+	 * declares the one parameter. Runs before the body is authenticated, so neither
+	 * source is trusted at this point — exactly as a header is not.
 	 */
-	readWebhookRequest(header: WebhookHeaderReader): ScmWebhookRequest;
+	readWebhookRequest(header: WebhookHeaderReader, payload: unknown): ScmWebhookRequest;
 
 	/**
 	 * Normalize a raw webhook body into an {@link ScmEvent}. `eventName` is the

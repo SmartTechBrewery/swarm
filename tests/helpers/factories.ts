@@ -600,6 +600,192 @@ export function createMockGitLabPipelinePayload(
 	return payload;
 }
 
+/** An Azure DevOps identity as a service-hook body names one (`createdBy`, `comment.author`). */
+function azureDevOpsIdentity(displayName: string, id: string): Record<string, unknown> {
+	return {
+		displayName,
+		id,
+		uniqueName: `${displayName}@example.com`,
+		url: `https://vssps.dev.azure.com/Fabrikam/_apis/Identities/${id}`,
+	};
+}
+
+/**
+ * The repository object an Azure DevOps pull-request resource nests — `remoteUrl`
+ * names the organization, `project.name` and `name` the other two segments.
+ */
+function azureDevOpsRepository(): Record<string, unknown> {
+	return {
+		id: 'c2c2c2c2-dddd-eeee-ffff-a3a3a3a3a3a3',
+		name: 'Web',
+		url: 'https://dev.azure.com/Fabrikam/d3d3d3d3-eeee-ffff-aaaa-b4b4b4b4b4b4/_apis/git/repositories/c2c2c2c2-dddd-eeee-ffff-a3a3a3a3a3a3',
+		project: {
+			id: 'd3d3d3d3-eeee-ffff-aaaa-b4b4b4b4b4b4',
+			name: 'Fiber',
+			state: 'wellFormed',
+		},
+		defaultBranch: 'refs/heads/main',
+		remoteUrl: 'https://Fabrikam@dev.azure.com/Fabrikam/Fiber/_git/Web',
+	};
+}
+
+/** The envelope every service-hook delivery wraps its `resource` in. */
+function azureDevOpsEnvelope(
+	eventType: string,
+	resource: Record<string, unknown>,
+	id: string,
+): Record<string, unknown> {
+	return {
+		subscriptionId: '00000000-0000-0000-0000-00000000aaaa',
+		notificationId: 7,
+		id,
+		eventType,
+		publisherId: 'tfs',
+		message: { text: '' },
+		resource,
+		resourceVersion: '1.0',
+		resourceContainers: {
+			collection: {
+				id: 'e4e4e4e4-ffff-aaaa-bbbb-c5c5c5c5c5c5',
+				baseUrl: 'https://dev.azure.com/Fabrikam/',
+			},
+			account: {
+				id: 'f5f5f5f5-aaaa-bbbb-cccc-d6d6d6d6d6d6',
+				baseUrl: 'https://dev.azure.com/Fabrikam/',
+			},
+			project: {
+				id: 'd3d3d3d3-eeee-ffff-aaaa-b4b4b4b4b4b4',
+				baseUrl: 'https://dev.azure.com/Fabrikam/',
+			},
+		},
+		createdDate: '2026-10-21T08:00:00.000Z',
+	};
+}
+
+/** An Azure DevOps pull-request resource, as service hooks and the REST API shape one. */
+function azureDevOpsPullRequest(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+	return {
+		repository: azureDevOpsRepository(),
+		pullRequestId: 17,
+		status: 'active',
+		createdBy: azureDevOpsIdentity('human-dev', '11bb11bb-cc22-dd33-ee44-55ff55ff55ff'),
+		creationDate: '2026-10-21T07:55:00.000Z',
+		title: 'Add a thing',
+		sourceRefName: 'refs/heads/swarm/issue-17',
+		targetRefName: 'refs/heads/main',
+		mergeStatus: 'succeeded',
+		isDraft: false,
+		lastMergeSourceCommit: {
+			commitId: 'da1560886d4f094c3e6c9ef40349f7d38b5d27d7',
+			url: 'https://dev.azure.com/Fabrikam/_apis/git/repositories/c2c2c2c2/commits/da1560886d4f094c3e6c9ef40349f7d38b5d27d7',
+		},
+		lastMergeTargetCommit: { commitId: '0123456789abcdef0123456789abcdef01234567' },
+		reviewers: [],
+		url: 'https://dev.azure.com/Fabrikam/d3d3d3d3-eeee-ffff-aaaa-b4b4b4b4b4b4/_apis/git/repositories/c2c2c2c2-dddd-eeee-ffff-a3a3a3a3a3a3/pullRequests/17',
+		...overrides,
+	};
+}
+
+/**
+ * A raw Azure DevOps `git.pullrequest.created` / `git.pullrequest.updated` service-hook
+ * body, shaped after Microsoft's service-hook event reference: the pull request *is*
+ * the `resource`. Pass `eventType` for the updated event and `pullRequest` to override
+ * resource fields (shallow merge). Returns a plain object — a webhook payload is
+ * untrusted input the adapter parses.
+ */
+export function createMockAzureDevOpsPullRequestPayload(
+	overrides: { eventType?: string; id?: string; pullRequest?: Record<string, unknown> } = {},
+): Record<string, unknown> {
+	return azureDevOpsEnvelope(
+		overrides.eventType ?? 'git.pullrequest.created',
+		azureDevOpsPullRequest(overrides.pullRequest),
+		overrides.id ?? 'a1a1a1a1-0000-0000-0000-000000000001',
+	);
+}
+
+/**
+ * A raw Azure DevOps `ms.vss-code.git-pullrequest-comment-event` body: the `resource`
+ * holds the `comment` and the `pullRequest` it was posted on. `comment` overrides
+ * merge into the comment; `pullRequest` overrides into the nested pull request.
+ */
+export function createMockAzureDevOpsCommentPayload(
+	overrides: {
+		id?: string;
+		comment?: Record<string, unknown>;
+		pullRequest?: Record<string, unknown>;
+	} = {},
+): Record<string, unknown> {
+	return azureDevOpsEnvelope(
+		'ms.vss-code.git-pullrequest-comment-event',
+		{
+			comment: {
+				id: 2,
+				parentCommentId: 0,
+				author: azureDevOpsIdentity('human-dev', '11bb11bb-cc22-dd33-ee44-55ff55ff55ff'),
+				content: 'can you rebase this?',
+				publishedDate: '2026-10-21T08:00:00.000Z',
+				lastUpdatedDate: '2026-10-21T08:00:00.000Z',
+				lastContentUpdatedDate: '2026-10-21T08:00:00.000Z',
+				commentType: 'text',
+				...overrides.comment,
+			},
+			pullRequest: azureDevOpsPullRequest(overrides.pullRequest),
+		},
+		overrides.id ?? 'a1a1a1a1-0000-0000-0000-000000000002',
+	);
+}
+
+/**
+ * A raw Azure DevOps `build.complete` body (`resourceVersion` 2.0 build shape). The
+ * default is a **pull-request** build — `sourceBranch` is the merge ref and
+ * `triggerInfo` names the pull request's own head; pass `branchBuild: true` for a
+ * branch build, which carries neither.
+ */
+export function createMockAzureDevOpsBuildPayload(
+	overrides: { id?: string; branchBuild?: boolean; build?: Record<string, unknown> } = {},
+): Record<string, unknown> {
+	const pullRequestSource = {
+		sourceBranch: 'refs/pull/17/merge',
+		// A pull-request build runs on Azure's merge commit, not the head.
+		sourceVersion: 'feedfacefeedfacefeedfacefeedfacefeedface',
+		triggerInfo: {
+			'pr.number': '17',
+			'pr.sourceBranch': 'refs/heads/swarm/issue-17',
+			'pr.sourceSha': 'da1560886d4f094c3e6c9ef40349f7d38b5d27d7',
+			'pr.isFork': 'False',
+		},
+	};
+	const branchSource = {
+		sourceBranch: 'refs/heads/swarm/issue-17',
+		sourceVersion: 'da1560886d4f094c3e6c9ef40349f7d38b5d27d7',
+		triggerInfo: {},
+	};
+	return {
+		...azureDevOpsEnvelope(
+			'build.complete',
+			{
+				id: 31,
+				buildNumber: '20261021.1',
+				status: 'completed',
+				result: 'succeeded',
+				url: 'https://dev.azure.com/Fabrikam/d3d3d3d3-eeee-ffff-aaaa-b4b4b4b4b4b4/_apis/build/Builds/31',
+				definition: { id: 5, name: 'Web CI' },
+				project: { id: 'd3d3d3d3-eeee-ffff-aaaa-b4b4b4b4b4b4', name: 'Fiber' },
+				...(overrides.branchBuild ? branchSource : pullRequestSource),
+				repository: {
+					id: 'c2c2c2c2-dddd-eeee-ffff-a3a3a3a3a3a3',
+					type: 'TfsGit',
+					name: 'Web',
+					url: 'https://dev.azure.com/Fabrikam/Fiber/_git/Web',
+				},
+				...overrides.build,
+			},
+			overrides.id ?? 'a1a1a1a1-0000-0000-0000-000000000003',
+		),
+		resourceVersion: '2.0',
+	};
+}
+
 /**
  * A GitLab **REST** merge-request object, as
  * `GET /projects/:id/merge_requests/:iid` returns it — the read counterpart of

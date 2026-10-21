@@ -631,9 +631,10 @@ export function createWebhookApp(overrides: Partial<WebhookReceiverDeps> = {}): 
 			if (body instanceof Response) return body;
 			const { rawBody, payload } = body;
 
-			// Only the provider knows which of its headers names the event, carries the
-			// delivery id, and carries the signature.
-			const request = manifest.provider.readWebhookRequest((name) => c.req.header(name));
+			// Only the provider knows which of its headers (or, for Azure DevOps, which
+			// body fields) names the event, carries the delivery id, and carries the
+			// signature.
+			const request = manifest.provider.readWebhookRequest((name) => c.req.header(name), payload);
 
 			// A board event carries no repo, so it routes through its PM manifest
 			// (which resolves by container id); everything else is a repo-scoped SCM

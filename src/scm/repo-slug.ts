@@ -154,6 +154,35 @@ function azureDevOpsGitPath(org: string, rest: readonly string[]): string | null
 	return null;
 }
 
+/**
+ * The organization an Azure DevOps HTTPS URL names, **casing preserved** — or `null`
+ * when the URL is not on an Azure DevOps host. The HTTPS hosts of
+ * {@link azureDevOpsRepoPath}, read for the organization alone so it also serves the
+ * REST URLs (`…/_apis/git/repositories/{id}`) a service-hook payload carries next to
+ * a clone URL (issue #1089 phase 3). Not normalised, unlike every slug above: the
+ * webhook adapter builds the `ProjectConfig.repo` an exact lookup matches, so the
+ * organization has to read as Azure spells it. A legacy `{org}.visualstudio.com`
+ * host is the exception — a hostname has no casing to keep, so it reads lower-case.
+ */
+export function azureDevOpsOrganizationFromUrl(url: string): string | null {
+	let parsed: URL;
+	try {
+		parsed = new URL(url.trim());
+	} catch {
+		return null;
+	}
+	const hostname = parsed.hostname.toLowerCase();
+	if (hostname === AZURE_DEVOPS_HOST) {
+		const first = parsed.pathname.split('/').find((segment) => segment !== '');
+		return first ? decodePathSegment(first) : null;
+	}
+	if (hostname.endsWith(AZURE_DEVOPS_LEGACY_HOST_SUFFIX)) {
+		const org = hostname.slice(0, -AZURE_DEVOPS_LEGACY_HOST_SUFFIX.length);
+		return org === '' || org.includes('.') ? null : org;
+	}
+	return null;
+}
+
 function decodePathSegment(segment: string): string {
 	try {
 		return decodeURIComponent(segment);

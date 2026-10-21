@@ -304,6 +304,27 @@ describe('createWebhookApp', () => {
 			expect(enqueue).not.toHaveBeenCalled();
 		});
 
+		// Issue #1089: Azure DevOps names the event and delivery only in the body, so the
+		// request reader gets the parsed payload alongside the headers.
+		it('hands the parsed payload to the provider’s request reader', async () => {
+			const readWebhookRequest = vi.fn<SCMProvider['readWebhookRequest']>((_header, payload) => ({
+				eventName: String((payload as { eventType: string }).eventType),
+				deliveryId: String((payload as { id: string }).id),
+				signature: 'Basic abc',
+			}));
+			const { app, enqueue } = makeApp({}, { readWebhookRequest });
+			const res = await post(
+				app,
+				JSON.stringify({ id: 'event-guid', eventType: 'git.pullrequest.created' }),
+			);
+			expect(res.status).toBe(202);
+			expect(readWebhookRequest.mock.calls[0]?.[1]).toEqual({
+				id: 'event-guid',
+				eventType: 'git.pullrequest.created',
+			});
+			expect(enqueue).toHaveBeenCalledWith('github', prEvent, project, 'event-guid');
+		});
+
 		it("passes the raw body (not a re-serialized copy) to the provider's verifier", async () => {
 			// A body with unusual spacing would not survive a JSON round-trip; assert
 			// the exact received bytes reach the verifier.
