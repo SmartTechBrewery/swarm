@@ -70,6 +70,7 @@ import type { ScmEvent, ScmEventAction, ScmReviewState } from '../../../scm/even
 import { azureDevOpsOrganizationFromUrl } from '../../../scm/repo-slug.js';
 import { isSwarmGeneratedBody } from '../../../scm/swarm-origin.js';
 import type { ScmWebhookRequest, WebhookHeaderReader } from '../../../scm/types.js';
+import { buildResultConclusion } from './builds.js';
 import { isAzureDevOpsRequestChangesMarker } from './review-marker.js';
 
 /**
@@ -115,18 +116,6 @@ const BRANCH_REF_PREFIX = 'refs/heads/';
 
 /** A pull-request build's `sourceBranch` — the merge ref Azure builds a PR on. */
 const PULL_REQUEST_MERGE_REF = /^refs\/pull\/(\d+)\/merge$/;
-
-/**
- * Build `result` → the neutral check conclusion. Anything unlisted
- * (`partiallySucceeded`, `none`) rides through verbatim — the conclusion is tracing
- * only, since the Review handler re-reads every check on the head (see
- * {@link ScmEvent.checkConclusion}).
- */
-const BUILD_CONCLUSIONS: Readonly<Record<string, string>> = {
-	succeeded: 'success',
-	failed: 'failure',
-	canceled: 'cancelled',
-};
 
 /** Stand-in for a missing component of the synthetic review id (see {@link synthesizeReviewId}). */
 const UNKNOWN_ID_PART = 'unknown';
@@ -293,9 +282,11 @@ function repoFullNameOf(
 /**
  * A pull request's web URL. Service-hook pull-request resources carry only REST
  * URLs, so it is built from the repository's coordinates — the `dev.azure.com`
- * form, which also serves an organization still on a legacy host.
+ * form, which also serves an organization still on a legacy host. Exported as the
+ * one spelling of the grammar, which `AzureDevOpsSCMIntegration.pullRequestUrl`
+ * (phase 4/6) shares, so an event's `workItemUrl` and a read's URL cannot drift.
  */
-function pullRequestWebUrl(repoFullName: string, pullRequestId: string): string {
+export function pullRequestWebUrl(repoFullName: string, pullRequestId: number | string): string {
 	const segments = repoFullName.split('/').map(encodeURIComponent);
 	const [organization, project, repository] = segments;
 	return `${AZURE_DEVOPS_WEB_BASE}/${organization}/${project}/_git/${repository}/pullrequest/${pullRequestId}`;
@@ -398,7 +389,10 @@ function buildFields(resource: Record<string, unknown>): LifecycleFields {
 		// Present for a pull-request build only. A branch build's pull request — and
 		// its branch — is completed by the receiver's commit→pull-request lookup.
 		prBranch: branchOf(triggerInfo?.['pr.sourceBranch']),
-		checkConclusion: result === undefined ? undefined : (BUILD_CONCLUSIONS[result] ?? result),
+		// One spelling with the aggregate read (`./builds.ts`); the conclusion is tracing
+		// only, since the Review handler re-reads every check on the head (see
+		// {@link ScmEvent.checkConclusion}).
+		checkConclusion: result === undefined ? undefined : buildResultConclusion(result),
 	};
 }
 

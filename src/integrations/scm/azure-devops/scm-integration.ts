@@ -3,7 +3,8 @@
  * provider-neutral {@link SCMProvider} contract (`src/scm/types.ts`), built out over
  * six phases (issue #1089) along the same seams GitLab used. Built so far:
  * availability probing, persona credential scoping, and persona identity / actor
- * resolution (phase 2/6), and webhook ingress (phase 3/6, `./webhook.ts`).
+ * resolution (phase 2/6), webhook ingress (phase 3/6, `./webhook.ts`), and the
+ * pull-request and CI reads (phase 4/6, `./pull-requests.ts`).
  *
  * Its core job is the same as the other providers' classes: run a block of Azure
  * DevOps operations under the correct persona's PAT. Callers hand it a project +
@@ -14,8 +15,7 @@
  *
  * **Every method not yet implemented throws** — loudly, naming the method and the
  * phase that fills it in — rather than returning `null`, `[]`, or a no-op that
- * would read as a real answer. The contract's synchronous `pullRequestUrl` throws
- * synchronously rather than rejecting.
+ * would read as a real answer.
  *
  * Like GitLab's build-out, **nothing registers this provider yet**: the
  * multi-provider conformance suite (`tests/unit/integrations/scm/scm-conformance.test.ts`)
@@ -41,7 +41,7 @@ import type {
 	ScmWebhookRequest,
 	WebhookHeaderReader,
 } from '../../../scm/types.js';
-import { withAzureDevOpsToken } from './client.js';
+import { azureRepoCoordinates, withAzureDevOpsToken } from './client.js';
 import { getAzureDevOpsToken, getAzureDevOpsTokenOrNull } from './credentials.js';
 import {
 	getAzureDevOpsPersonaForLogin,
@@ -49,8 +49,17 @@ import {
 	resolveAzureDevOpsPersonaIdentities,
 } from './personas.js';
 import {
+	getAzureDevOpsBranchHead,
+	getAzureDevOpsCommitChecks,
+	getAzureDevOpsPullRequest,
+	getAzureDevOpsPullRequestTitle,
+	listActiveAzureDevOpsPullRequestsForBase,
+	listAzureDevOpsPullRequestsForCommit,
+} from './pull-requests.js';
+import {
 	isSwarmGeneratedAzureDevOpsEvent,
 	parseAzureDevOpsWebhook,
+	pullRequestWebUrl,
 	readAzureDevOpsWebhookRequest,
 	verifyAzureDevOpsWebhookAuth,
 } from './webhook.js';
@@ -66,7 +75,6 @@ function notImplementedYet(method: string, phase: string): never {
 	);
 }
 
-const READ_PHASE = 'phase 4/6 (pull-request reads)';
 const WRITE_PHASE = 'phase 5/6 (comments, delivery, merge)';
 
 export class AzureDevOpsSCMIntegration implements SCMProvider {
@@ -152,35 +160,110 @@ export class AzureDevOpsSCMIntegration implements SCMProvider {
 	}
 
 	// ==========================================================================
-	// Deferred: pull-request reads — phase 4/6
+	// Pull-request and CI reads — phase 4/6, in `./pull-requests.ts`
 	// ==========================================================================
 
-	async getPullRequest(): Promise<PullRequestDetails> {
-		notImplementedYet('getPullRequest', READ_PHASE);
+	/**
+	 * {@link SCMProvider.getPullRequest}. Reads under the **reviewer** persona by
+	 * default, the persona the other adapters read one as on the review path.
+	 * `mergeable` carries Azure's git-only merge evaluation; `baseSha` is the target
+	 * tip Azure last evaluated against, not a merge base (`./pull-requests.ts`).
+	 */
+	async getPullRequest(
+		project: ProjectConfig,
+		prNumber: number,
+		persona: ScmPersona = 'reviewer',
+	): Promise<PullRequestDetails> {
+		return this.withPersonaCredentials(project, persona, () =>
+			getAzureDevOpsPullRequest(project.repo, prNumber),
+		);
 	}
 
-	async getPullRequestTitle(): Promise<string | null> {
-		notImplementedYet('getPullRequestTitle', READ_PHASE);
+	/**
+	 * {@link SCMProvider.getPullRequestTitle}. Defaults to the **implementer** — the
+	 * pull request's author, whose credential is always configured for a project that
+	 * opens them — matching the other adapters' default for the same read.
+	 */
+	async getPullRequestTitle(
+		project: ProjectConfig,
+		prNumber: number,
+		persona: ScmPersona = 'implementer',
+	): Promise<string | null> {
+		return this.withPersonaCredentials(project, persona, () =>
+			getAzureDevOpsPullRequestTitle(project.repo, prNumber),
+		);
 	}
 
-	pullRequestUrl(): string {
-		notImplementedYet('pullRequestUrl', READ_PHASE);
+	/**
+	 * {@link SCMProvider.pullRequestUrl} — `dev.azure.com/{org}/{project}/_git/{repo}/pullrequest/{n}`,
+	 * every segment encoded. Pure: shares the webhook's grammar, needs no credential.
+	 */
+	pullRequestUrl(repo: string, prNumber: number | string): string {
+		// Throws on a repo not in `organization/project/repository` form rather than
+		// building a URL that addresses the wrong repository.
+		azureRepoCoordinates(repo);
+		return pullRequestWebUrl(repo, prNumber);
 	}
 
-	async getBranchHead(): Promise<string | null> {
-		notImplementedYet('getBranchHead', READ_PHASE);
+	/**
+	 * {@link SCMProvider.getBranchHead}. Defaults to the **implementer** persona for
+	 * the reason the other adapters state: it is a repository-level read, and its
+	 * caller today is a router sweep holding only the operator's own credential.
+	 */
+	async getBranchHead(
+		project: ProjectConfig,
+		branch: string,
+		persona: ScmPersona = 'implementer',
+	): Promise<string | null> {
+		return this.withPersonaCredentials(project, persona, () =>
+			getAzureDevOpsBranchHead(project.repo, branch),
+		);
 	}
 
-	async getAggregateCheckStatus(): Promise<AggregateCheckStatus> {
-		notImplementedYet('getAggregateCheckStatus', READ_PHASE);
+	/**
+	 * {@link SCMProvider.getAggregateCheckStatus} — Git commit statuses plus Azure
+	 * Pipelines builds on `ref`. Reads under the **reviewer** persona by default, the
+	 * scope the other adapters use for the review handler's aggregate query.
+	 */
+	async getAggregateCheckStatus(
+		project: ProjectConfig,
+		ref: string,
+		persona: ScmPersona = 'reviewer',
+	): Promise<AggregateCheckStatus> {
+		return this.withPersonaCredentials(project, persona, () =>
+			getAzureDevOpsCommitChecks(project.repo, ref),
+		);
 	}
 
-	async listPullRequestsForCommit(): Promise<CommitPullRequest[]> {
-		notImplementedYet('listPullRequestsForCommit', READ_PHASE);
+	/**
+	 * {@link SCMProvider.listPullRequestsForCommit} — the read a **branch** build's
+	 * `checks` event depends on, since only a pull-request build names its pull
+	 * request. Reads under the **reviewer** persona by default, the same scope
+	 * {@link AzureDevOpsSCMIntegration.getAggregateCheckStatus} uses for the query
+	 * that follows it on the review path.
+	 */
+	async listPullRequestsForCommit(
+		project: ProjectConfig,
+		sha: string,
+		persona: ScmPersona = 'reviewer',
+	): Promise<CommitPullRequest[]> {
+		return this.withPersonaCredentials(project, persona, () =>
+			listAzureDevOpsPullRequestsForCommit(project.repo, sha),
+		);
 	}
 
-	async listConflictCandidates(): Promise<PullRequestDetails[]> {
-		notImplementedYet('listConflictCandidates', READ_PHASE);
+	/**
+	 * {@link SCMProvider.listConflictCandidates} — active same-repository pull
+	 * requests targeting `baseBranch`, read as the **implementer** (the persona that
+	 * would push the resolution), same as the other adapters.
+	 */
+	async listConflictCandidates(
+		project: ProjectConfig,
+		baseBranch: string,
+	): Promise<PullRequestDetails[]> {
+		return this.withPersonaCredentials(project, 'implementer', () =>
+			listActiveAzureDevOpsPullRequestsForBase(project.repo, baseBranch),
+		);
 	}
 
 	// ==========================================================================
