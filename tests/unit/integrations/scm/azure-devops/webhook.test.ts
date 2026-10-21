@@ -321,13 +321,14 @@ describe('Azure DevOps webhook ingress', () => {
 			expect(event.prBranch).toBeUndefined();
 		});
 
-		it('maps the build result onto the neutral conclusion, passing unknown results through', () => {
+		it('maps the build result onto the neutral conclusion, leaving a no-verdict result without one', () => {
 			const conclusion = (result: string) =>
 				parse(createMockAzureDevOpsBuildPayload({ build: { result } })).checkConclusion;
 			expect(conclusion('failed')).toBe('failure');
 			expect(conclusion('canceled')).toBe('cancelled');
 			expect(conclusion('partiallySucceeded')).toBe('neutral');
-			expect(conclusion('none')).toBe('none');
+			expect(conclusion('none')).toBeUndefined();
+			expect(conclusion('somethingNew')).toBeUndefined();
 		});
 
 		it('reads the organization from the envelope when the repository URL does not name it', () => {

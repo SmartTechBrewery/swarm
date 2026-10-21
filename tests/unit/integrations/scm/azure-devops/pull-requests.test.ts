@@ -15,6 +15,7 @@ import {
 	listAzureDevOpsPullRequestsForCommit,
 } from '@/integrations/scm/azure-devops/pull-requests.js';
 import { logger } from '@/lib/logger.js';
+import { decideAggregateCheckOutcome } from '@/triggers/handlers/aggregate-check-decision.js';
 
 import {
 	createMockAzureDevOpsBuildResponse,
@@ -338,11 +339,28 @@ describe('azure devops pull-request reads', () => {
 			['cancelling', undefined, 'in_progress', null],
 			['completed', 'partiallySucceeded', 'completed', 'neutral'],
 			['completed', 'canceled', 'completed', 'cancelled'],
+			['completed', 'none', 'in_progress', null],
+			['completed', undefined, 'in_progress', null],
+			['completed', 'somethingNew', 'in_progress', null],
 		])('maps build %s/%s to %s/%s', async (status, result, checkStatus, conclusion) => {
 			routeChecks([], [createMockAzureDevOpsBuildResponse({ status, result })]);
 
 			const aggregate = await scoped(() => getAzureDevOpsCommitChecks(REPO, HEAD_SHA));
 			expect(aggregate.checkRuns).toEqual([{ name: 'Web CI', status: checkStatus, conclusion }]);
+		});
+
+		it.each([
+			'none',
+			undefined,
+			'somethingNew',
+		])('defers the aggregate decision on a completed build with result %s', async (result) => {
+			routeChecks([], [createMockAzureDevOpsBuildResponse({ status: 'completed', result })]);
+
+			const aggregate = await scoped(() => getAzureDevOpsCommitChecks(REPO, HEAD_SHA));
+			expect(decideAggregateCheckOutcome(aggregate, '17')).toMatchObject({
+				action: 'defer',
+				incompleteChecks: ['Web CI'],
+			});
 		});
 
 		it.each([

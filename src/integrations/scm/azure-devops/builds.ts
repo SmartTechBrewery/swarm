@@ -17,11 +17,11 @@
 import type { CheckRunState } from '../../../scm/types.js';
 
 /**
- * Build `result` → the neutral conclusion. An unrecognized result (`none`) rides
- * through verbatim, same as GitLab's unmapped pipeline statuses: the aggregate
- * decision only fails on the conclusions it names, and a guess would be worse.
- * `partiallySucceeded` — a build some task of which was allowed to fail — is
- * `neutral`: finished, and not a failure Respond-to-CI could act on.
+ * Build `result` → the neutral conclusion. `partiallySucceeded` — a build some
+ * task of which was allowed to fail — is `neutral`: finished, and not a failure
+ * Respond-to-CI could act on. `none` is absent on purpose: Azure documents it as
+ * "no result", not an outcome, so — like any result this table does not know — it
+ * has no conclusion (see {@link buildCheckRun}).
  */
 const BUILD_RESULT_CONCLUSIONS: Readonly<Record<string, string>> = {
 	succeeded: 'success',
@@ -57,24 +57,32 @@ const COMMIT_STATUS_CONCLUSIONS: Readonly<Record<string, string>> = {
 	notApplicable: 'skipped',
 };
 
-/** The neutral conclusion a build `result` means; an unknown result passes through. */
-export function buildResultConclusion(result: string): string {
-	return BUILD_RESULT_CONCLUSIONS[result] ?? result;
+/**
+ * The neutral conclusion a build `result` means, or `undefined` when it carries no
+ * verdict — `none`, or a result this table does not know.
+ */
+export function buildResultConclusion(result: string): string | undefined {
+	return BUILD_RESULT_CONCLUSIONS[result];
 }
 
 /**
- * One Azure Pipelines build as a neutral {@link CheckRunState}. A conclusion is
- * reported only once the build is `completed`; a completed build with no `result`
- * keeps a `null` conclusion, which the aggregate decision reads as "not a failure".
+ * One Azure Pipelines build as a neutral {@link CheckRunState}. A build is
+ * `completed` only once it is finished *and* its `result` is a verdict: a finished
+ * build whose result is absent, `none`, or unrecognized is an in-progress check,
+ * so the aggregate decision defers and re-reads rather than reading a build that
+ * reported nothing as green.
  */
 export function buildCheckRun(name: string, status?: string, result?: string): CheckRunState {
 	const checkStatus = (status && BUILD_CHECK_STATUSES[status]) || 'in_progress';
-	if (checkStatus !== 'completed') return { name, status: checkStatus, conclusion: null };
-	return {
-		name,
-		status: 'completed',
-		conclusion: result === undefined ? null : buildResultConclusion(result),
-	};
+	const conclusion = result === undefined ? undefined : buildResultConclusion(result);
+	if (checkStatus !== 'completed' || conclusion === undefined) {
+		return {
+			name,
+			status: checkStatus === 'completed' ? 'in_progress' : checkStatus,
+			conclusion: null,
+		};
+	}
+	return { name, status: 'completed', conclusion };
 }
 
 /**
