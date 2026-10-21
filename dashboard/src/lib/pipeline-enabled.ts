@@ -1,4 +1,4 @@
-import type { PipelineConfig, ReviewChecksPolicy } from '../../../src/config/schema.js';
+import type { PipelineConfig } from '../../../src/config/schema.js';
 
 /**
  * The three optional, SCM-event-driven pipeline phases a project can turn off
@@ -149,7 +149,7 @@ export function buildPipelineAutoAdvanceUpdate(
  * The complete `pipeline` payload carrying only the Agent Configuration toggles'
  * state (every phase's `enabled` flag, Planning's `autoAdvance` and its
  * `verifyPlan`), layered over the stored config so every field the toggles don't
- * own — Respond-to-review's skipOnMinors, Review's checks policy —
+ * own — Respond-to-review's skipOnMinors among them —
  * survives the write. This is the scoped payload the Agents tab sends when a
  * toggle is flipped: it persists the toggle immediately without dragging along
  * the tab's unsaved non-toggle edits (target lists, timeouts, custom prompts)
@@ -204,42 +204,6 @@ export function isAutoAdvancePhase(phase: string): phase is PipelineAutoAdvanceP
  */
 export function autoAdvanceConfigPhase(phase: string): PipelineAutoAdvancePhase | undefined {
 	return isAutoAdvancePhase(phase) ? phase : undefined;
-}
-
-/** The safe default Review check policy — matches the Review trigger's own fallback. */
-export const DEFAULT_REVIEW_CHECKS_POLICY: ReviewChecksPolicy = 'required';
-
-/**
- * Resolve the effective Review check policy for the dashboard's radio group,
- * falling back to the safe `required` default when the project has no stored
- * value (new project, or one that predates #283).
- */
-export function toReviewChecksPolicyForm(pipeline: PipelineConfig | undefined): ReviewChecksPolicy {
-	return pipeline?.review?.checks ?? DEFAULT_REVIEW_CHECKS_POLICY;
-}
-
-/** Whether the selected Review check policy differs from the effective stored value. */
-export function isReviewChecksPolicyDirty(
-	policy: ReviewChecksPolicy,
-	pipeline: PipelineConfig | undefined,
-): boolean {
-	return policy !== toReviewChecksPolicyForm(pipeline);
-}
-
-/**
- * Build the `pipeline` payload for `projects.update`, changing only
- * `review.checks` while preserving every other stored pipeline field —
- * `projects.update` replaces the whole `pipeline` object rather than merging
- * it, so an omitted field here would be dropped.
- */
-export function buildReviewChecksPolicyUpdate(
-	policy: ReviewChecksPolicy,
-	existing: PipelineConfig | undefined,
-): PipelineConfig {
-	return {
-		...existing,
-		review: { ...existing?.review, checks: policy },
-	};
 }
 
 /** Summary string describing the auto-advance behavior for the phase and its setting. */

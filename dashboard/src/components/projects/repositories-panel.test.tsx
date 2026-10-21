@@ -6,8 +6,24 @@ import type { RepositoryForm } from '@/lib/project-repository.js';
 import { RepositoriesPanel } from './repositories-panel.js';
 
 const REPOSITORIES: RepositoryForm[] = [
-	{ id: '1', repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-', autoMerge: false },
-	{ id: '2', repo: 'acme/second', baseBranch: 'main', branchPrefix: 'issue-', autoMerge: false },
+	{
+		id: '1',
+		repo: 'acme/first',
+		baseBranch: 'main',
+		branchPrefix: 'issue-',
+		autoMerge: false,
+		reviewChecks: 'required',
+		reviewChecksWaitMinutes: '',
+	},
+	{
+		id: '2',
+		repo: 'acme/second',
+		baseBranch: 'main',
+		branchPrefix: 'issue-',
+		autoMerge: false,
+		reviewChecks: 'required',
+		reviewChecksWaitMinutes: '',
+	},
 ];
 
 function renderPanel(overrides: Partial<Parameters<typeof RepositoriesPanel>[0]> = {}) {

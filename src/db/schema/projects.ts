@@ -32,8 +32,10 @@ export const projects = pgTable('projects', {
 	name: text('name').notNull(),
 	/**
 	 * The project's repositories, each with its own `repo` / `baseBranch` /
-	 * `branchPrefix` (`ProjectRepository`, issue #684) and, since issue #1066, its own
-	 * `autoMerge` (migration 0076 moved it off `pipeline`) — the three per-repository
+	 * `branchPrefix` (`ProjectRepository`, issue #684), since issue #1066 its own
+	 * `autoMerge` (migration 0076 moved it off `pipeline`) and, since issue #1109, its
+	 * own `reviewChecks` / `reviewChecksWaitMinutes` (migration 0080 moved them off
+	 * `pipeline`) — the three per-repository
 	 * `text` columns this replaced, as one list. An entry written before issue #727
 	 * may still carry an `scm` key; nothing reads it, and the next write of the list
 	 * drops it (`ProjectRepositorySchema`, `src/config/schema.ts`).

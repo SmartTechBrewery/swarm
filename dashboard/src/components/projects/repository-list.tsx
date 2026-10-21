@@ -1,11 +1,36 @@
 import { ChevronDown, ChevronUp, Plus, Trash2 } from 'lucide-react';
 import { type RepositoryForm, repoInputShape } from '@/lib/project-repository.js';
+import type { ReviewChecksPolicy } from '../../../../src/config/schema.js';
 
 /** Input/select recipe shared with the rest of the tab (ai/DESIGN_SYSTEM.md §4). */
 const FIELD_CLASS =
 	'block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 transition-shadow disabled:opacity-50 disabled:cursor-not-allowed';
 
 const LABEL_CLASS = 'block text-xs font-medium text-zinc-400 mb-1';
+
+/**
+ * Review's two zero-check policies (issue #274), offered per repository since issue
+ * #1109 — whether a repository has CI on its pull requests is that repository's own
+ * property, so it is decided here rather than on the Pipeline tab.
+ */
+const REVIEW_CHECKS_POLICY_OPTIONS: Array<{
+	value: ReviewChecksPolicy;
+	label: string;
+	description: string;
+}> = [
+	{
+		value: 'required',
+		label: 'Require CI checks',
+		description:
+			'A pull request whose head commit reports zero checks stays pending and is rechecked. Use this when the repository runs CI on pull requests.',
+	},
+	{
+		value: 'if-present',
+		label: 'Review when no checks exist',
+		description:
+			'Dispatches Review immediately when the source-control provider reports zero checks at all. Only for repositories with no CI on pull requests — a pull request with real pending, passing, or failing checks keeps the same behavior either way; this is not a way to bypass CI that exists.',
+	},
+];
 
 /** Icon-button recipe for a row's reorder/remove actions (ai/DESIGN_SYSTEM.md §4). */
 const ROW_ACTION_CLASS =
@@ -26,9 +51,10 @@ interface RepositoryRowProps {
 
 /**
  * One repository in the project's list: its rank, the reorder/remove actions, and the
- * four settings that are genuinely per-repository — merge automation among them since
- * issue #1066, which moved it off the Pipeline tab's project-wide toggle. Each field's accessible name carries
- * the rank, since a project can hold several identical-looking rows.
+ * settings that are genuinely per-repository — merge automation among them since issue
+ * #1066, and Review's check policy and check wait since issue #1109, each moved off the
+ * Pipeline tab's project-wide control. Each field's accessible name carries the rank,
+ * since a project can hold several identical-looking rows.
  *
  * The source-control provider is **not** among them (issue #727): it is the project's,
  * stated once for the whole project, and every repository the project owns lives on it.
@@ -51,6 +77,7 @@ function RepositoryRow({
 	const repoShape = repoInputShape(scm);
 	const idBase = `repository-${index}`;
 	const isOnly = total === 1;
+	const policy = REVIEW_CHECKS_POLICY_OPTIONS.find(({ value }) => value === entry.reviewChecks);
 
 	return (
 		<li className="p-4 border border-zinc-800 rounded-md bg-panel/20 space-y-3">
@@ -163,6 +190,53 @@ function RepositoryRow({
 					</span>
 				</span>
 			</label>
+
+			<div className="grid gap-4 sm:grid-cols-2">
+				<div>
+					<label htmlFor={`${idBase}-review-checks`} className={LABEL_CLASS}>
+						Review Check Policy
+					</label>
+					<select
+						id={`${idBase}-review-checks`}
+						aria-label={`Review check policy, entry ${rank}`}
+						value={entry.reviewChecks}
+						onChange={(e) =>
+							onChange(index, { reviewChecks: e.target.value as ReviewChecksPolicy })
+						}
+						disabled={isPending}
+						className={FIELD_CLASS}
+					>
+						{REVIEW_CHECKS_POLICY_OPTIONS.map(({ value, label }) => (
+							<option key={value} value={value}>
+								{label}
+							</option>
+						))}
+					</select>
+					{policy && <p className="text-xs text-zinc-400 mt-1">{policy.description}</p>}
+				</div>
+				<div>
+					<label htmlFor={`${idBase}-checks-wait`} className={LABEL_CLASS}>
+						Check Wait (minutes)
+					</label>
+					<input
+						type="number"
+						id={`${idBase}-checks-wait`}
+						aria-label={`Check wait in minutes, entry ${rank}`}
+						value={entry.reviewChecksWaitMinutes}
+						onChange={(e) => onChange(index, { reviewChecksWaitMinutes: e.target.value })}
+						disabled={isPending}
+						min={1}
+						max={120}
+						step={1}
+						placeholder="10"
+						className={FIELD_CLASS}
+					/>
+					<p className="text-xs text-zinc-400 mt-1">
+						How long Review waits for this repository's checks to finish before giving up. Leave
+						blank for 10 minutes.
+					</p>
+				</div>
+			</div>
 		</li>
 	);
 }
@@ -198,7 +272,7 @@ export interface RepositoryListProps {
  *
  * What is *not* here is anything shared by the whole project: the board mapping and the
  * PM credentials on Project Management, the provider and its credentials in the cards
- * above. Only the four settings that are genuinely per-repository are here.
+ * above. Only the settings that are genuinely per-repository are here.
  */
 export function RepositoryList({
 	repositories,
@@ -217,12 +291,12 @@ export function RepositoryList({
 					Repositories
 				</h2>
 				<p className="text-xs text-zinc-400">
-					Every repository this project operates on, with the branch and merge settings SWARM uses
-					for each. Each piece of work runs against the repository it belongs to — a board card
-					against the repository that claims it — and none of them is a fallback for the others:
-					with several repositories, a card none of them claims is refused rather than run against
-					the first. All of them live on the provider selected above, using the credentials
-					configured with it.
+					Every repository this project operates on, with the branch, merge and Review check
+					settings SWARM uses for each. Each piece of work runs against the repository it belongs to
+					— a board card against the repository that claims it — and none of them is a fallback for
+					the others: with several repositories, a card none of them claims is refused rather than
+					run against the first. All of them live on the provider selected above, using the
+					credentials configured with it.
 				</p>
 			</div>
 

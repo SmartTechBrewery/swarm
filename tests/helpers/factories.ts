@@ -1075,10 +1075,11 @@ type ProjectRecordOverrides = Partial<Omit<ProjectRecord, 'repositories'>> & {
  * Lets the PM-provider fixtures above serve the record-shaped call sites unchanged.
  */
 export function toProjectRecord(config: ProjectConfig): ProjectRecord {
-	const { repo, baseBranch, branchPrefix, ...shared } = config;
+	const { repo, baseBranch, branchPrefix, reviewChecks, reviewChecksWaitMinutes, ...shared } =
+		config;
 	return ProjectRecordSchema.parse({
 		...shared,
-		repositories: [{ repo, baseBranch, branchPrefix }],
+		repositories: [{ repo, baseBranch, branchPrefix, reviewChecks, reviewChecksWaitMinutes }],
 	});
 }
 

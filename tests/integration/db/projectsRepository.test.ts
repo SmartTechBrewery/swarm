@@ -65,21 +65,35 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('projectsRepository (integ
 			expect(resolved?.maxConcurrentJobs).toBe(4);
 		});
 
-		it('round-trips the Review check policy alongside another pipeline value through JSONB', async () => {
-			const config = createMockProjectConfig({
-				id: 'proj-review-checks',
-				name: 'Review Checks Project',
-				repo: 'jkwiecien/review-checks',
-				pipeline: {
-					planning: { autoAdvance: true },
-					review: { checks: 'if-present' },
-				},
-			});
-			await createProjectInDb(toProjectRecord(config));
+		// Issue #1109: the policy and wait live on each repository entry, and a read
+		// scoped to one entry carries that entry's own values.
+		it('round-trips per-repository Review check policies and scopes each one its own', async () => {
+			await createProjectInDb(
+				createMockProjectRecord({
+					id: 'proj-review-checks',
+					name: 'Review Checks Project',
+					pipeline: { planning: { autoAdvance: true } },
+					repositories: [
+						{ repo: 'jkwiecien/review-mobile', reviewChecks: 'if-present' },
+						{
+							repo: 'jkwiecien/review-platform',
+							reviewChecks: 'required',
+							reviewChecksWaitMinutes: 30,
+						},
+					],
+				}),
+			);
 
-			const resolved = await findProjectByIdFromDb('proj-review-checks');
-			expect(resolved?.pipeline?.review?.checks).toBe('if-present');
-			expect(resolved?.pipeline?.planning?.autoAdvance).toBe(true);
+			const mobile = await findProjectByIdFromDb('proj-review-checks', 'jkwiecien/review-mobile');
+			const platform = await findProjectByIdFromDb(
+				'proj-review-checks',
+				'jkwiecien/review-platform',
+			);
+			expect(mobile?.reviewChecks).toBe('if-present');
+			expect(mobile?.reviewChecksWaitMinutes).toBeUndefined();
+			expect(platform?.reviewChecks).toBe('required');
+			expect(platform?.reviewChecksWaitMinutes).toBe(30);
+			expect(platform?.pipeline?.planning?.autoAdvance).toBe(true);
 		});
 
 		// The `scm_type` column added by issue #478. What a stubbed-DB unit test cannot

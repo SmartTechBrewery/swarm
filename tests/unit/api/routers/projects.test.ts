@@ -839,6 +839,39 @@ describe('projectsRouter', () => {
 			);
 		});
 
+		// Issue #1109: Review's check policy and wait are per repository too.
+		it('saves the Review check policy and check wait per repository', async () => {
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
+			vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
+
+			const result = await caller.update({
+				id: 'p1',
+				repositories: [
+					{ repo: 'jkwiecien/original', reviewChecks: 'required', reviewChecksWaitMinutes: 30 },
+					{ repo: 'jkwiecien/other', reviewChecks: 'if-present' },
+				],
+			});
+
+			expect(result.repositories.map((entry) => entry.reviewChecks)).toEqual([
+				'required',
+				'if-present',
+			]);
+			expect(result.repositories.map((entry) => entry.reviewChecksWaitMinutes)).toEqual([
+				30,
+				undefined,
+			]);
+		});
+
+		it('rejects a per-repository check wait outside its bounds', async () => {
+			await expect(
+				caller.update({
+					id: 'p1',
+					repositories: [{ repo: 'jkwiecien/original', reviewChecksWaitMinutes: 0 }],
+				}),
+			).rejects.toThrow();
+			expect(upsertProjectToDb).not.toHaveBeenCalled();
+		});
+
 		it('saves the default-on skip-minors review-response setting', async () => {
 			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
 			vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
@@ -849,35 +882,6 @@ describe('projectsRouter', () => {
 			});
 
 			expect(result.pipeline?.respondToReview?.skipOnMinors).toBe(false);
-		});
-
-		it('saves the Review check policy while leaving unrelated pipeline fields intact', async () => {
-			const withPipeline = createMockProjectRecord({
-				id: 'p1',
-				name: 'Original Name',
-				repositories: [{ repo: 'jkwiecien/original', baseBranch: 'main', branchPrefix: 'issue-' }],
-				pipeline: {
-					planning: { autoAdvance: true },
-					review: { enabled: true },
-					respondToReview: { enabled: true, skipOnMinors: false },
-				},
-			});
-			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(withPipeline);
-			vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
-
-			const result = await caller.update({
-				id: 'p1',
-				pipeline: {
-					...withPipeline.pipeline,
-					review: { ...withPipeline.pipeline?.review, checks: 'if-present' },
-				},
-			});
-
-			expect(result.pipeline?.review?.checks).toBe('if-present');
-			// Unrelated pipeline fields, including the rest of `review`, survive the update.
-			expect(result.pipeline?.review?.enabled).toBe(true);
-			expect(result.pipeline?.planning?.autoAdvance).toBe(true);
-			expect(result.pipeline?.respondToReview).toEqual({ enabled: true, skipOnMinors: false });
 		});
 
 		it('merges a nested pipeline patch with the existing pipeline configuration', async () => {
@@ -896,26 +900,16 @@ describe('projectsRouter', () => {
 			const result = await caller.update({
 				id: 'p1',
 				pipeline: {
-					review: { checks: 'if-present' },
+					review: { enabled: true },
 					respondToReview: { skipOnMinors: true },
 				},
 			});
 
-			expect(result.pipeline?.review?.checks).toBe('if-present');
+			expect(result.pipeline?.review?.enabled).toBe(true);
 			// Unrelated/omitted pipeline fields are preserved
-			expect(result.pipeline?.review?.enabled).toBe(false);
 			expect(result.pipeline?.planning?.autoAdvance).toBe(true);
 			expect(result.pipeline?.respondToReview?.enabled).toBe(false);
 			expect(result.pipeline?.respondToReview?.skipOnMinors).toBe(true);
-		});
-
-		it('does not invent a Review check policy for an unrelated update on a project with none stored', async () => {
-			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
-			vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
-
-			const result = await caller.update({ id: 'p1', name: 'Renamed' });
-
-			expect(result.pipeline?.review?.checks).toBeUndefined();
 		});
 
 		it.each([0, -1, 1.5, 'many'])('rejects invalid maximum concurrent jobs: %s', async (value) => {

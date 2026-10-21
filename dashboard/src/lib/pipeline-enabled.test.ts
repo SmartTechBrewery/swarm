@@ -6,19 +6,16 @@ import {
 	buildPipelineAutoAdvanceUpdate,
 	buildPipelineEnabledUpdate,
 	buildPipelineToggleUpdate,
-	buildReviewChecksPolicyUpdate,
 	buildVerifyPlanUpdate,
 	isAutoAdvancePhase,
 	isPipelineAutoAdvanceDirty,
 	isPipelineEnabledDirty,
 	isRespondToReviewLocked,
-	isReviewChecksPolicyDirty,
 	isVerifyPlanDirty,
 	setAutoAdvanceEnabled,
 	setPhaseEnabled,
 	toPipelineAutoAdvanceForm,
 	toPipelineEnabledForm,
-	toReviewChecksPolicyForm,
 	toVerifyPlanForm,
 } from './pipeline-enabled.js';
 
@@ -241,10 +238,9 @@ describe('buildPipelineToggleUpdate', () => {
 
 	it('preserves every stored pipeline field the Agents-tab toggles do not own', () => {
 		// The scoped toggle save must not drop Pipeline-tab settings (issue #369): a
-		// project's skipOnMinors and Review check policy have to survive.
+		// project's skipOnMinors has to survive.
 		const existing: PipelineConfig = {
 			planning: { autoAdvance: false, autoSplit: true },
-			review: { checks: 'if-present' },
 			respondToReview: { skipOnMinors: false },
 		};
 		const result = buildPipelineToggleUpdate(
@@ -254,7 +250,6 @@ describe('buildPipelineToggleUpdate', () => {
 			existing,
 		);
 		expect(result.planning).toEqual({ autoAdvance: true, autoSplit: true, verifyPlan: false });
-		expect(result.review?.checks).toBe('if-present');
 		expect(result.review?.enabled).toBe(true);
 		expect(result.respondToReview?.skipOnMinors).toBe(false);
 	});
@@ -325,55 +320,6 @@ describe('autoAdvanceConfigPhase', () => {
 		expect(autoAdvanceConfigPhase('implementation')).toBeUndefined();
 		expect(autoAdvanceConfigPhase('implementationUnplanned')).toBeUndefined();
 		expect(autoAdvanceConfigPhase('review')).toBeUndefined();
-	});
-});
-
-describe('toReviewChecksPolicyForm', () => {
-	it('defaults to required when the pipeline is undefined', () => {
-		expect(toReviewChecksPolicyForm(undefined)).toBe('required');
-	});
-
-	it('defaults to required when review.checks is unset', () => {
-		expect(toReviewChecksPolicyForm({ review: { enabled: true } })).toBe('required');
-	});
-
-	it('reads a stored if-present value', () => {
-		expect(toReviewChecksPolicyForm({ review: { checks: 'if-present' } })).toBe('if-present');
-	});
-});
-
-describe('isReviewChecksPolicyDirty', () => {
-	it('is clean when the selection matches the effective stored value', () => {
-		expect(isReviewChecksPolicyDirty('required', undefined)).toBe(false);
-		expect(isReviewChecksPolicyDirty('if-present', { review: { checks: 'if-present' } })).toBe(
-			false,
-		);
-	});
-
-	it('is dirty when the selection differs from the effective stored value', () => {
-		expect(isReviewChecksPolicyDirty('if-present', undefined)).toBe(true);
-		expect(isReviewChecksPolicyDirty('required', { review: { checks: 'if-present' } })).toBe(true);
-	});
-});
-
-describe('buildReviewChecksPolicyUpdate', () => {
-	it('sets the policy when no pipeline config exists yet', () => {
-		expect(buildReviewChecksPolicyUpdate('if-present', undefined)).toEqual({
-			review: { checks: 'if-present' },
-		});
-	});
-
-	it('preserves unrelated pipeline fields and the existing review.enabled flag', () => {
-		const existing: PipelineConfig = {
-			planning: { autoAdvance: true },
-			review: { enabled: false },
-			respondToReview: { enabled: false, skipOnMinors: false },
-			respondToCi: { enabled: true },
-		};
-		expect(buildReviewChecksPolicyUpdate('if-present', existing)).toEqual({
-			...existing,
-			review: { enabled: false, checks: 'if-present' },
-		});
 	});
 });
 

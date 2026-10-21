@@ -118,7 +118,7 @@ describe('scheduleFollowUpReviewDefault', () => {
 	it('carries no check-run data of its own — a no-CI project relies entirely on the pr-review handler policy', async () => {
 		// This module only ever builds and dedups the delivery; whether a fixed
 		// response on a PR with zero checks reaches Review is decided by
-		// `decideAggregateCheckOutcome`'s `pipeline.review.checks` policy once the
+		// `decideAggregateCheckOutcome`'s `reviewChecks` policy once the
 		// `pr-review` handler re-queries live check state for this event
 		// (see `tests/unit/triggers/handlers/review.test.ts`'s "if-present" cases,
 		// issue #274) — never by anything encoded on this synthetic event.

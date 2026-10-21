@@ -55,7 +55,8 @@ export const WORKER_SAFE_KEYS = [
  * control-plane decision keyed on the whole repository list — which a worker,
  * holding one scoped config, does not have. `autoMerge` (issue #1066) is merge policy
  * like `pipeline`: the merge decision is made by the control plane's consumer, never
- * on a worker.
+ * on a worker. `reviewChecks` / `reviewChecksWaitMinutes` (issue #1109) are Review
+ * dispatch policy, decided control-plane side like the `pipeline` block they left.
  */
 export const SERVER_ONLY_KEYS = [
 	'credentials',
@@ -63,6 +64,8 @@ export const SERVER_ONLY_KEYS = [
 	'pm',
 	'pmRoutingToken',
 	'autoMerge',
+	'reviewChecks',
+	'reviewChecksWaitMinutes',
 	'pipeline',
 	'visibility',
 	'maxConcurrentJobs',

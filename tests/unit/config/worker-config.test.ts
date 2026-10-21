@@ -60,6 +60,15 @@ describe('toWorkerConfig', () => {
 		expect('autoMerge' in worker).toBe(false);
 	});
 
+	// Issue #1109: Review's check policy and wait are control-plane policy too.
+	it('drops the per-repository Review check policy and wait', () => {
+		const worker = toWorkerConfig(
+			createMockProjectConfig({ reviewChecks: 'if-present', reviewChecksWaitMinutes: 30 }),
+		) as Record<string, unknown>;
+		expect('reviewChecks' in worker).toBe(false);
+		expect('reviewChecksWaitMinutes' in worker).toBe(false);
+	});
+
 	it('strips the board mapping along with the pm block it now lives under', () => {
 		const project = createMockProjectConfig();
 		const pm = requireGitHubProjectsConfig(project);

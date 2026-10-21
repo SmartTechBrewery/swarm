@@ -507,16 +507,38 @@ describe('recoverUnreviewedPullRequests', () => {
 		});
 	});
 
-	// The policy is the project's, read here exactly as the handler reads it.
-	it('recovers a zero-check pull request when the project opts into `if-present`', async () => {
+	// The policy is the repository's, read here exactly as the handler reads it.
+	it('recovers a zero-check pull request when the repository opts into `if-present`', async () => {
 		listAllProjectRecordsFromDb.mockResolvedValue([
-			toProjectRecord(createMockProjectConfig({ pipeline: { review: { checks: 'if-present' } } })),
+			toProjectRecord(createMockProjectConfig({ reviewChecks: 'if-present' })),
 		]);
 		getAggregateCheckStatus.mockResolvedValue({ totalCount: 0, checkRuns: [] });
 
 		await recoverUnreviewedPullRequests();
 
 		expect(createAndPublishDispatch).toHaveBeenCalledTimes(1);
+	});
+
+	// Issue #1109: each repository's pull requests are swept under that repository's own
+	// policy, so a zero-check head is recovered only where `if-present` is set.
+	it('recovers zero-check pull requests only in the repository whose own policy is `if-present`', async () => {
+		listAllProjectRecordsFromDb.mockResolvedValue([
+			createMockProjectRecord({
+				id: 'acme',
+				repositories: [
+					{ repo: 'acme/mobile', reviewChecks: 'if-present' },
+					{ repo: 'acme/platform', reviewChecks: 'required' },
+				],
+			}),
+		]);
+		getAggregateCheckStatus.mockResolvedValue({ totalCount: 0, checkRuns: [] });
+
+		await recoverUnreviewedPullRequests();
+
+		expect(getAggregateCheckStatus).toHaveBeenCalledTimes(2);
+		const input = createdDispatch();
+		const payload = input.jobPayload as Extract<typeof input.jobPayload, { type: 'scm' }>;
+		expect(payload.event).toMatchObject({ repoFullName: 'acme/mobile' });
 	});
 
 	describe('the recovery bound', () => {

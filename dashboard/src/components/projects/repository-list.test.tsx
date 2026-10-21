@@ -12,6 +12,8 @@ function row(overrides: Partial<RepositoryForm> = {}): RepositoryForm {
 		baseBranch: 'main',
 		branchPrefix: 'issue-',
 		autoMerge: false,
+		reviewChecks: 'required',
+		reviewChecksWaitMinutes: '',
 		...overrides,
 	};
 }
@@ -67,7 +69,8 @@ describe('RepositoryList', () => {
 		renderList({ repositories: TWO });
 
 		expect(screen.queryByLabelText(/Source control provider/)).toBeNull();
-		expect(screen.queryByRole('combobox')).toBeNull();
+		// The only per-row select is Review's check policy (issue #1109), never a provider.
+		expect(screen.queryByRole('combobox', { name: /provider/i })).toBeNull();
 		expect(screen.getByText(/live on the provider selected above/)).toBeDefined();
 	});
 
@@ -182,6 +185,35 @@ describe('RepositoryList', () => {
 		expect(onChange).toHaveBeenCalledWith(1, { autoMerge: true });
 	});
 
+	// Issue #1109: Review's check policy and check wait are per repository too, moved
+	// off the Pipeline tab's project-wide radio group.
+	it('gives each row its own Review check policy and check wait', () => {
+		const { onChange } = renderList({
+			repositories: [
+				row({ id: '1', reviewChecks: 'if-present' }),
+				row({ id: '2', repo: 'acme/second', reviewChecksWaitMinutes: '30' }),
+			],
+		});
+
+		const firstPolicy = screen.getByLabelText('Review check policy, entry 1') as HTMLSelectElement;
+		const secondPolicy = screen.getByLabelText('Review check policy, entry 2') as HTMLSelectElement;
+		expect(firstPolicy.value).toBe('if-present');
+		expect(secondPolicy.value).toBe('required');
+		expect(screen.getAllByText(/Dispatches Review immediately/)).toHaveLength(1);
+		expect(screen.getAllByText(/stays pending and is rechecked/)).toHaveLength(1);
+
+		const firstWait = screen.getByLabelText('Check wait in minutes, entry 1') as HTMLInputElement;
+		const secondWait = screen.getByLabelText('Check wait in minutes, entry 2') as HTMLInputElement;
+		expect(firstWait.value).toBe('');
+		expect(firstWait.placeholder).toBe('10');
+		expect(secondWait.value).toBe('30');
+
+		fireEvent.change(secondPolicy, { target: { value: 'if-present' } });
+		expect(onChange).toHaveBeenCalledWith(1, { reviewChecks: 'if-present' });
+		fireEvent.change(firstWait, { target: { value: '45' } });
+		expect(onChange).toHaveBeenCalledWith(0, { reviewChecksWaitMinutes: '45' });
+	});
+
 	it('disables every control while a save is in flight', () => {
 		renderList({ repositories: TWO, isPending: true });
 
@@ -191,5 +223,11 @@ describe('RepositoryList', () => {
 		expect((screen.getByLabelText('Merge automation, entry 1') as HTMLInputElement).disabled).toBe(
 			true,
 		);
+		expect(
+			(screen.getByLabelText('Review check policy, entry 1') as HTMLSelectElement).disabled,
+		).toBe(true);
+		expect(
+			(screen.getByLabelText('Check wait in minutes, entry 1') as HTMLInputElement).disabled,
+		).toBe(true);
 	});
 });

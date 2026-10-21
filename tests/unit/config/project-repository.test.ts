@@ -113,6 +113,30 @@ describe('project repository scoping (issue #684)', () => {
 			).toBe(false);
 		});
 
+		// Issue #1109: so are Review's check policy and wait.
+		it("carries the named entry's own Review check policy and wait, absent when unstated", () => {
+			const withChecks: ProjectRecord = {
+				...twoRepositoryRecord(),
+				repositories: [
+					{
+						repo: 'acme/first',
+						baseBranch: 'main',
+						branchPrefix: 'issue-',
+						reviewChecks: 'if-present',
+						reviewChecksWaitMinutes: 30,
+					},
+					{ repo: 'acme/second', baseBranch: 'develop', branchPrefix: 'task-' },
+				],
+			};
+			expect(scopeProjectToRepository(withChecks, 'acme/first')).toMatchObject({
+				reviewChecks: 'if-present',
+				reviewChecksWaitMinutes: 30,
+			});
+			const second = scopeProjectToRepository(withChecks, 'acme/second');
+			expect(Object.hasOwn(second, 'reviewChecks')).toBe(false);
+			expect(Object.hasOwn(second, 'reviewChecksWaitMinutes')).toBe(false);
+		});
+
 		it('throws rather than falling back when the repository is not the project’s', () => {
 			expect(() => scopeProjectToRepository(twoRepositoryRecord(), 'acme/third')).toThrow();
 		});

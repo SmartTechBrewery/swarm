@@ -860,17 +860,14 @@ describe('PhaseSettingsDetail — model targets', () => {
 	});
 });
 
-describe('PipelineSettingsForm — Review check policy', () => {
+describe('PipelineSettingsForm — per-repository settings', () => {
 	const noop = () => {};
 
-	// Issue #1066 moved merge automation to each repository under Source Control.
-	it('no longer offers a project-wide merge automation toggle', () => {
+	function renderForm() {
 		render(
 			<PipelineSettingsForm
 				skipRespondToReviewOnMinors={true}
 				setSkipRespondToReviewOnMinors={noop}
-				reviewChecksPolicy="required"
-				setReviewChecksPolicy={noop}
 				handleSubmit={(e) => e.preventDefault()}
 				handleReset={noop}
 				isDirty={false}
@@ -879,101 +876,22 @@ describe('PipelineSettingsForm — Review check policy', () => {
 				isError={false}
 			/>,
 		);
+	}
+
+	// Issue #1066 moved merge automation to each repository under Source Control.
+	it('no longer offers a project-wide merge automation toggle', () => {
+		renderForm();
 
 		expect(screen.queryByText('Merge automation')).toBeNull();
 	});
 
-	it('defaults to Require CI checks selected', () => {
-		render(
-			<PipelineSettingsForm
-				skipRespondToReviewOnMinors={true}
-				setSkipRespondToReviewOnMinors={noop}
-				reviewChecksPolicy="required"
-				setReviewChecksPolicy={noop}
-				handleSubmit={(e) => e.preventDefault()}
-				handleReset={noop}
-				isDirty={false}
-				isPending={false}
-				isSuccess={false}
-				isError={false}
-			/>,
-		);
+	// Issue #1109 moved Review's check policy and wait there too; the tab says where.
+	it('no longer offers a project-wide Review check policy, and points to Source Control', () => {
+		renderForm();
 
-		const required = screen.getByRole('radio', {
-			name: /^Require CI checks/,
-		}) as HTMLInputElement;
-		const ifPresent = screen.getByRole('radio', {
-			name: /^Review when no checks exist/,
-		}) as HTMLInputElement;
-		expect(required.checked).toBe(true);
-		expect(ifPresent.checked).toBe(false);
-	});
-
-	it('reflects a stored if-present selection', () => {
-		render(
-			<PipelineSettingsForm
-				skipRespondToReviewOnMinors={true}
-				setSkipRespondToReviewOnMinors={noop}
-				reviewChecksPolicy="if-present"
-				setReviewChecksPolicy={noop}
-				handleSubmit={(e) => e.preventDefault()}
-				handleReset={noop}
-				isDirty={false}
-				isPending={false}
-				isSuccess={false}
-				isError={false}
-			/>,
-		);
-
-		const required = screen.getByRole('radio', {
-			name: /^Require CI checks/,
-		}) as HTMLInputElement;
-		const ifPresent = screen.getByRole('radio', {
-			name: /^Review when no checks exist/,
-		}) as HTMLInputElement;
-		expect(required.checked).toBe(false);
-		expect(ifPresent.checked).toBe(true);
-	});
-
-	it('calls setReviewChecksPolicy when a different option is picked', () => {
-		const setReviewChecksPolicy = vi.fn();
-		render(
-			<PipelineSettingsForm
-				skipRespondToReviewOnMinors={true}
-				setSkipRespondToReviewOnMinors={noop}
-				reviewChecksPolicy="required"
-				setReviewChecksPolicy={setReviewChecksPolicy}
-				handleSubmit={(e) => e.preventDefault()}
-				handleReset={noop}
-				isDirty={false}
-				isPending={false}
-				isSuccess={false}
-				isError={false}
-			/>,
-		);
-
-		fireEvent.click(screen.getByRole('radio', { name: /^Review when no checks exist/ }));
-		expect(setReviewChecksPolicy).toHaveBeenCalledWith('if-present');
-	});
-
-	it('includes explanatory copy limiting the no-CI option to repositories without CI', () => {
-		render(
-			<PipelineSettingsForm
-				skipRespondToReviewOnMinors={true}
-				setSkipRespondToReviewOnMinors={noop}
-				reviewChecksPolicy="required"
-				setReviewChecksPolicy={noop}
-				handleSubmit={(e) => e.preventDefault()}
-				handleReset={noop}
-				isDirty={false}
-				isPending={false}
-				isSuccess={false}
-				isError={false}
-			/>,
-		);
-
-		expect(screen.getByText(/Only for repositories with no CI/)).toBeDefined();
-		expect(screen.getByText(/not a way to bypass CI that exists/)).toBeDefined();
+		expect(screen.queryByRole('radio')).toBeNull();
+		expect(screen.queryByText(/Require CI checks/)).toBeNull();
+		expect(screen.getByText(/set per repository, on Source Control/)).toBeDefined();
 	});
 });
 
@@ -1422,7 +1340,15 @@ describe('toGeneralSettingsUpdate', () => {
 
 describe('toRepositoriesUpdate', () => {
 	const rows: RepositoryForm[] = [
-		{ id: '1', repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-', autoMerge: true },
+		{
+			id: '1',
+			repo: 'acme/first',
+			baseBranch: 'main',
+			branchPrefix: 'issue-',
+			autoMerge: true,
+			reviewChecks: 'if-present',
+			reviewChecksWaitMinutes: '',
+		},
 	];
 
 	it('sends only id and repositories — never the Settings fields', () => {
@@ -1431,9 +1357,16 @@ describe('toRepositoriesUpdate', () => {
 		expect(update && Object.keys(update).sort()).toEqual(['id', 'repositories']);
 		expect(update).toEqual({
 			id: 'p1',
-			// Merge automation rides on the repository list it lives on (issue #1066).
+			// Merge automation (issue #1066) and Review's check policy (issue #1109) ride on
+			// the repository list they live on.
 			repositories: [
-				{ repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-', autoMerge: true },
+				{
+					repo: 'acme/first',
+					baseBranch: 'main',
+					branchPrefix: 'issue-',
+					autoMerge: true,
+					reviewChecks: 'if-present',
+				},
 			],
 		});
 	});
@@ -1566,8 +1499,6 @@ describe('PipelineSettingsForm serialization', () => {
 			<PipelineSettingsForm
 				skipRespondToReviewOnMinors={true}
 				setSkipRespondToReviewOnMinors={() => {}}
-				reviewChecksPolicy="required"
-				setReviewChecksPolicy={() => {}}
 				handleSubmit={(e) => e.preventDefault()}
 				handleReset={() => {}}
 				isDirty={true}

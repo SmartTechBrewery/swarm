@@ -53,13 +53,23 @@ describe('toRepositoryForms', () => {
 				{ repo: 'acme/second', baseBranch: 'trunk', branchPrefix: 'work-' },
 			]),
 		).toEqual([
-			{ id: '1', repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-', autoMerge: false },
+			{
+				id: '1',
+				repo: 'acme/first',
+				baseBranch: 'main',
+				branchPrefix: 'issue-',
+				autoMerge: false,
+				reviewChecks: 'required',
+				reviewChecksWaitMinutes: '',
+			},
 			{
 				id: '2',
 				repo: 'acme/second',
 				baseBranch: 'trunk',
 				branchPrefix: 'work-',
 				autoMerge: false,
+				reviewChecks: 'required',
+				reviewChecksWaitMinutes: '',
 			},
 		]);
 	});
@@ -69,7 +79,15 @@ describe('toRepositoryForms', () => {
 	// screen cannot show — the same thing the server does with it on parse.
 	it('ignores a stored per-repository scm', () => {
 		expect(toRepositoryForms(PRE_727_ENTRIES)).toEqual([
-			{ id: '1', repo: 'acme/first', baseBranch: '', branchPrefix: '', autoMerge: false },
+			{
+				id: '1',
+				repo: 'acme/first',
+				baseBranch: '',
+				branchPrefix: '',
+				autoMerge: false,
+				reviewChecks: 'required',
+				reviewChecksWaitMinutes: '',
+			},
 		]);
 	});
 
@@ -82,6 +100,8 @@ describe('toRepositoryForms', () => {
 			baseBranch: 'main',
 			branchPrefix: 'issue-',
 			autoMerge: false,
+			reviewChecks: 'required',
+			reviewChecksWaitMinutes: '',
 		};
 		expect(toRepositoryForms(undefined)).toEqual([blank]);
 		expect(toRepositoryForms([])).toEqual([blank]);
@@ -98,6 +118,8 @@ describe('toRepositoryEntries', () => {
 					baseBranch: 'main',
 					branchPrefix: 'issue-',
 					autoMerge: false,
+					reviewChecks: 'required',
+					reviewChecksWaitMinutes: '',
 				},
 				{
 					id: '2',
@@ -105,22 +127,58 @@ describe('toRepositoryEntries', () => {
 					baseBranch: 'trunk',
 					branchPrefix: 'work-',
 					autoMerge: false,
+					reviewChecks: 'required',
+					reviewChecksWaitMinutes: '',
 				},
 			]),
 		).toEqual([
-			{ repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-', autoMerge: false },
-			{ repo: 'acme/second', baseBranch: 'trunk', branchPrefix: 'work-', autoMerge: false },
+			{
+				repo: 'acme/first',
+				baseBranch: 'main',
+				branchPrefix: 'issue-',
+				autoMerge: false,
+				reviewChecks: 'required',
+			},
+			{
+				repo: 'acme/second',
+				baseBranch: 'trunk',
+				branchPrefix: 'work-',
+				autoMerge: false,
+				reviewChecks: 'required',
+			},
 		]);
 	});
 
 	// Issue #1066: each row carries its own merge automation, written explicitly.
 	it('sends each row’s own merge automation', () => {
 		const rows = toRepositoryForms([
-			{ repo: 'acme/first', autoMerge: true },
+			{ repo: 'acme/first', autoMerge: true, reviewChecks: 'required' },
 			{ repo: 'acme/second' },
 		]);
 		expect(rows.map((row) => row.autoMerge)).toEqual([true, false]);
 		expect(toRepositoryEntries(rows).map((entry) => entry.autoMerge)).toEqual([true, false]);
+	});
+
+	// Issue #1109: each row carries its own Review check policy and wait. The policy is
+	// always written; a blank wait is omitted so the server's default applies.
+	it('sends each row’s own Review check policy and wait, omitting a blank wait', () => {
+		const rows = toRepositoryForms([
+			{ repo: 'acme/mobile', reviewChecks: 'if-present' },
+			{ repo: 'acme/platform', reviewChecksWaitMinutes: 30 },
+		]);
+		expect(rows.map((row) => [row.reviewChecks, row.reviewChecksWaitMinutes])).toEqual([
+			['if-present', ''],
+			['required', '30'],
+		]);
+		const entries = toRepositoryEntries(
+			patchRepository(rows, 0, { reviewChecksWaitMinutes: ' 45 ' }),
+		);
+		expect(entries[0]).toMatchObject({ reviewChecks: 'if-present', reviewChecksWaitMinutes: 45 });
+		expect(entries[1]).toMatchObject({ reviewChecks: 'required', reviewChecksWaitMinutes: 30 });
+		const [blank] = toRepositoryEntries(
+			patchRepository(rows, 1, { reviewChecksWaitMinutes: '' }).slice(1),
+		);
+		expect(blank && 'reviewChecksWaitMinutes' in blank).toBe(false);
 	});
 
 	// A save states no provider per repository (issue #727), so a stored one is dropped
@@ -133,7 +191,15 @@ describe('toRepositoryEntries', () => {
 	// The form-only React key is not part of the config.
 	it('does not send the row id', () => {
 		const [entry] = toRepositoryEntries([
-			{ id: '7', repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-', autoMerge: false },
+			{
+				id: '7',
+				repo: 'acme/first',
+				baseBranch: 'main',
+				branchPrefix: 'issue-',
+				autoMerge: false,
+				reviewChecks: 'required',
+				reviewChecksWaitMinutes: '',
+			},
 		]);
 		expect(entry && 'id' in entry).toBe(false);
 	});
@@ -158,23 +224,54 @@ describe('toRepositoryEntries', () => {
 				baseBranch: 'main',
 				branchPrefix: 'issue-',
 				autoMerge: false,
+				reviewChecks: 'required',
 				pmRoutingToken: 'component-2',
 			},
-			{ repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-', autoMerge: false },
+			{
+				repo: 'acme/first',
+				baseBranch: 'main',
+				branchPrefix: 'issue-',
+				autoMerge: false,
+				reviewChecks: 'required',
+			},
 		]);
 	});
 });
 
 describe('repository list mutations', () => {
 	const rows: RepositoryForm[] = [
-		{ id: '1', repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-', autoMerge: false },
-		{ id: '2', repo: 'acme/second', baseBranch: 'trunk', branchPrefix: 'work-', autoMerge: false },
+		{
+			id: '1',
+			repo: 'acme/first',
+			baseBranch: 'main',
+			branchPrefix: 'issue-',
+			autoMerge: false,
+			reviewChecks: 'required',
+			reviewChecksWaitMinutes: '',
+		},
+		{
+			id: '2',
+			repo: 'acme/second',
+			baseBranch: 'trunk',
+			branchPrefix: 'work-',
+			autoMerge: false,
+			reviewChecks: 'required',
+			reviewChecksWaitMinutes: '',
+		},
 	];
 
 	it('appends a blank row on the project defaults, with an unused id', () => {
 		expect(addRepository(rows)).toEqual([
 			...rows,
-			{ id: '3', repo: '', baseBranch: 'main', branchPrefix: 'issue-', autoMerge: false },
+			{
+				id: '3',
+				repo: '',
+				baseBranch: 'main',
+				branchPrefix: 'issue-',
+				autoMerge: false,
+				reviewChecks: 'required',
+				reviewChecksWaitMinutes: '',
+			},
 		]);
 	});
 
@@ -215,7 +312,15 @@ describe('repository list mutations', () => {
 // check has no server-side twin — it is why Save is blocked client-side.
 describe('duplicateRepositories', () => {
 	function row(repo: string): RepositoryForm {
-		return { id: repo, repo, baseBranch: 'main', branchPrefix: 'issue-', autoMerge: false };
+		return {
+			id: repo,
+			repo,
+			baseBranch: 'main',
+			branchPrefix: 'issue-',
+			autoMerge: false,
+			reviewChecks: 'required',
+			reviewChecksWaitMinutes: '',
+		};
 	}
 
 	it('names each repository more than one row claims', () => {
@@ -253,7 +358,25 @@ describe('areRepositoriesDirty', () => {
 	it('reports a merge automation toggle that changes nothing else', () => {
 		expect(
 			areRepositoriesDirty(
-				patchRepository(toRepositoryForms(stored), 1, { autoMerge: true }),
+				patchRepository(toRepositoryForms(stored), 1, {
+					autoMerge: true,
+					reviewChecks: 'required',
+				}),
+				stored,
+			),
+		).toBe(true);
+	});
+
+	it('reports a Review check policy or wait change that changes nothing else', () => {
+		expect(
+			areRepositoriesDirty(
+				patchRepository(toRepositoryForms(stored), 1, { reviewChecks: 'if-present' }),
+				stored,
+			),
+		).toBe(true);
+		expect(
+			areRepositoriesDirty(
+				patchRepository(toRepositoryForms(stored), 0, { reviewChecksWaitMinutes: '20' }),
 				stored,
 			),
 		).toBe(true);

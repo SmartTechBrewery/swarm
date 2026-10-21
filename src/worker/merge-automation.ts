@@ -386,9 +386,9 @@ function baseUpdatesSpent(job: MergeAutomationJob): number {
  * would make the guarantee a property of the repository's branch protection —
  * the alternative issue #872 explicitly set aside.
  *
- * Judged with the *same* classifier and the same project policy the `pr-review`
+ * Judged with the *same* classifier and the same repository policy the `pr-review`
  * handler uses ({@link decideAggregateCheckOutcome}), so a head is never green
- * to merge automation and red to the pipeline. A project that opts into
+ * to merge automation and red to the pipeline. A repository that opts into
  * `if-present` accepts a zero-check answer here exactly as it does there.
  */
 type FreshCheckVerdict =
@@ -410,7 +410,7 @@ async function readFreshCheckVerdict(
 	const decision = decideAggregateCheckOutcome(
 		checks,
 		job.prNumber,
-		project.pipeline?.review?.checks ?? 'required',
+		project.reviewChecks ?? 'required',
 	);
 	if (decision.action === 'defer') return { kind: 'pending', message: decision.message };
 	if (decision.action === 'respond-to-ci')

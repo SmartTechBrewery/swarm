@@ -147,7 +147,7 @@ export async function readBaseBranchHealth(
 	}
 
 	// The *same* classifier the `pr-review` handler judges a pull request's head
-	// with, under the project's own `pipeline.review.checks` policy — so a base
+	// with, under the base branch's repository's own `reviewChecks` policy — so a base
 	// branch and a pull request are never judged red by two different rules. Its
 	// `prNumber` parameter is only ever interpolated into a `defer` message this
 	// caller does not read, so the base branch's name goes there instead of a
@@ -155,7 +155,7 @@ export async function readBaseBranchHealth(
 	const decision = decideAggregateCheckOutcome(
 		checkStatus,
 		baseBranch,
-		project.pipeline?.review?.checks ?? 'required',
+		project.reviewChecks ?? 'required',
 	);
 	if (decision.action === 'respond-to-ci') {
 		return { status: 'red', headSha, failedChecks: decision.failedChecks };

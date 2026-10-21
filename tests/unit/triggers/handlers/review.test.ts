@@ -431,7 +431,7 @@ describe('review trigger', () => {
 			// PR branch, no check-run data of its own — the real decision happens
 			// here once the handler re-queries live Actions-API state (issue #274).
 			getAggregateCheckStatus.mockResolvedValue(checkStatus([]));
-			const project = createMockProjectConfig({ pipeline: { review: { checks: 'if-present' } } });
+			const project = createMockProjectConfig({ reviewChecks: 'if-present' });
 			const result = await handler.handle({
 				...ctx({ ...base, headSha: 'cafe', prBranch: 'issue-9' }),
 				project,
@@ -454,7 +454,7 @@ describe('review trigger', () => {
 			// check_suite for the same commit) must not burn a second Review.
 			claimReviewDispatch.mockResolvedValue(false);
 			getAggregateCheckStatus.mockResolvedValue(checkStatus([]));
-			const project = createMockProjectConfig({ pipeline: { review: { checks: 'if-present' } } });
+			const project = createMockProjectConfig({ reviewChecks: 'if-present' });
 			const result = await handler.handle({
 				...ctx({ ...base, headSha: 'cafe', prBranch: 'issue-9' }),
 				project,
@@ -465,7 +465,7 @@ describe('review trigger', () => {
 
 		it('still defers a present but incomplete check under if-present', async () => {
 			getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'in_progress', null]]));
-			const project = createMockProjectConfig({ pipeline: { review: { checks: 'if-present' } } });
+			const project = createMockProjectConfig({ reviewChecks: 'if-present' });
 			expect(await handler.handle({ ...ctx({ ...base, headSha: 'cafe' }), project })).toBeNull();
 			expect(claimReviewDispatch).not.toHaveBeenCalled();
 			expect(scheduleCoalescedJob).toHaveBeenCalledTimes(1);
@@ -473,7 +473,7 @@ describe('review trigger', () => {
 
 		it('still routes a present failed check to Respond-to-CI under if-present', async () => {
 			getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'completed', 'failure']]));
-			const project = createMockProjectConfig({ pipeline: { review: { checks: 'if-present' } } });
+			const project = createMockProjectConfig({ reviewChecks: 'if-present' });
 			const result = await handler.handle({
 				...ctx({ ...base, headSha: 'cafe', prBranch: 'issue-9' }),
 				project,
@@ -1218,7 +1218,7 @@ describe('review trigger', () => {
 });
 
 /**
- * A push to a mergeable head under `pipeline.review.checks` (issue #1107).
+ * A push to a mergeable head under `reviewChecks` (issue #1107).
  *
  * The `updated` event used to end in an unconditional "waiting for checks" skip,
  * so an `if-present` project's head that no CI ever runs on — no `checks` event
@@ -1229,7 +1229,7 @@ describe('review trigger', () => {
  * itself; every other head, and every `required` project, keeps waiting for its
  * own completed-checks event.
  */
-describe('review trigger — pull-request updated under pipeline.review.checks (issue #1107)', () => {
+describe('review trigger — pull-request updated under reviewChecks (issue #1107)', () => {
 	const updated = {
 		kind: 'pull-request',
 		action: 'updated',
@@ -1238,8 +1238,8 @@ describe('review trigger — pull-request updated under pipeline.review.checks (
 		isDraft: false,
 		isCrossRepo: false,
 	} as const;
-	const IF_PRESENT = createMockProjectConfig({ pipeline: { review: { checks: 'if-present' } } });
-	const REQUIRED = createMockProjectConfig({ pipeline: { review: { checks: 'required' } } });
+	const IF_PRESENT = createMockProjectConfig({ reviewChecks: 'if-present' });
+	const REQUIRED = createMockProjectConfig({ reviewChecks: 'required' });
 
 	beforeEach(() => {
 		getPullRequest.mockResolvedValue({
@@ -1360,8 +1360,9 @@ describe('review trigger — pull-request updated under pipeline.review.checks (
 
 	it('does not read checks when Review is disabled', async () => {
 		const project = createMockProjectConfig({
+			reviewChecks: 'if-present',
 			pipeline: {
-				review: { enabled: false, checks: 'if-present' },
+				review: { enabled: false },
 				respondToReview: { enabled: false },
 			},
 		});
@@ -1741,14 +1742,14 @@ describe('review trigger — durable trace when a review is abandoned (issue #74
 
 /**
  * How long Review waits for a head's CI is per project (issue #1083). The
- * `state-pending` cap is derived from `pipeline.review.checksWaitMinutes` at the
+ * `state-pending` cap is derived from the repository's `reviewChecksWaitMinutes` at the
  * fixed 30 s cadence — 10 minutes (20 attempts) when unset — and only that budget
  * moves with it: the `read-failed` one (#720) stays fixed.
  */
 describe('review trigger — per-project CI wait (issue #1083)', () => {
 	const checks = { kind: 'checks', action: 'completed', workItemId: '9' } as const;
 	/** 20 minutes buys 40 rechecks at 30 s. */
-	const LONG_WAIT = createMockProjectConfig({ pipeline: { review: { checksWaitMinutes: 20 } } });
+	const LONG_WAIT = createMockProjectConfig({ reviewChecksWaitMinutes: 20 });
 	const stillRunning = () =>
 		getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'in_progress', null]]));
 
@@ -1787,7 +1788,7 @@ describe('review trigger — per-project CI wait (issue #1083)', () => {
 		const { error } = createFailedRun.mock.calls[0][0];
 		expect(error).toContain('state-pending');
 		expect(error).toContain('40/40 attempts');
-		expect(error).toContain('`pipeline.review.checksWaitMinutes`');
+		expect(error).toContain('`reviewChecksWaitMinutes`');
 		expect(error).toContain('20 minutes');
 	});
 
@@ -1798,7 +1799,7 @@ describe('review trigger — per-project CI wait (issue #1083)', () => {
 
 		const { error } = createFailedRun.mock.calls[0][0];
 		expect(error).toContain('20/20 attempts');
-		expect(error).toContain('`pipeline.review.checksWaitMinutes`');
+		expect(error).toContain('`reviewChecksWaitMinutes`');
 		expect(error).toContain('10 minutes');
 	});
 
@@ -1845,7 +1846,7 @@ describe('review trigger — per-project CI wait (issue #1083)', () => {
  * A retry that meets a defer is a wait, and says what for (issue #1049).
  *
  * The observed case: a PR touching only paths every CI workflow `paths-ignore`s
- * has **zero** checks, under `pipeline.review.checks: 'required'` the
+ * has **zero** checks, under the repository's `reviewChecks: 'required'` the
  * `state-pending` chain spent its budget and recorded an abandoned review, and each
  * "Retry now" on that record re-entered here as a continuation, deferred again —
  * and was settled `failed` as a changed disposition while its own recheck went on
@@ -2817,5 +2818,106 @@ describe('review trigger — a red the base branch explains (issue #873)', () =>
 			phase: 'review',
 		});
 		expect(getBranchHead).not.toHaveBeenCalled();
+	});
+});
+
+/**
+ * Two repositories of one project with different check policies (issue #1109).
+ *
+ * Whether a repository has CI is that repository's property: the live
+ * `under-control-platform` project pairs a backend with PR CI (`required`) and a
+ * mobile app with none (`if-present`). Each pull request is decided under its own
+ * repository's `reviewChecks` and `reviewChecksWaitMinutes`, never the other's.
+ */
+describe('review trigger — two repositories with different check policies (issue #1109)', () => {
+	const [MOBILE, PLATFORM] = createMockProjectRepositoryPair(['acme/mobile', 'acme/platform'], {
+		repositories: [
+			{ repo: 'acme/mobile', reviewChecks: 'if-present' },
+			{ repo: 'acme/platform', reviewChecks: 'required', reviewChecksWaitMinutes: 30 },
+		],
+	});
+	const checks = { kind: 'checks', action: 'completed', workItemId: '42' } as const;
+	const updated = {
+		kind: 'pull-request',
+		action: 'updated',
+		workItemId: '42',
+		headSha: 'abc123',
+		isDraft: false,
+		isCrossRepo: false,
+	} as const;
+
+	beforeEach(() => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([]));
+	});
+
+	it('scopes each repository to its own policy and wait', () => {
+		expect(MOBILE).toMatchObject({ repo: 'acme/mobile', reviewChecks: 'if-present' });
+		expect(MOBILE.reviewChecksWaitMinutes).toBeUndefined();
+		expect(PLATFORM).toMatchObject({
+			repo: 'acme/platform',
+			reviewChecks: 'required',
+			reviewChecksWaitMinutes: 30,
+		});
+	});
+
+	it('reviews a zero-check head immediately in the if-present repository', async () => {
+		const result = await handler.handle(ctx({ ...checks, headSha: 'abc123' }, { project: MOBILE }));
+
+		expect(result).toMatchObject({ phase: 'review', prNumber: '42', headSha: 'abc123' });
+		expect(claimReviewDispatch).toHaveBeenCalledOnce();
+		expect(scheduleCoalescedJob).not.toHaveBeenCalled();
+	});
+
+	it('waits on a zero-check head in the required repository, naming its own lever', async () => {
+		const noteDecline = vi.fn();
+
+		const result = await handler.handle(
+			ctx({ ...checks, headSha: 'abc123' }, { project: PLATFORM, noteDecline }),
+		);
+
+		expect(result).toBeNull();
+		expect(claimReviewDispatch).not.toHaveBeenCalled();
+		expect(scheduleCoalescedJob).toHaveBeenCalledOnce();
+		const { reason } = noteDecline.mock.calls[0][0] as TriggerDecline;
+		expect(reason).toContain('`reviewChecks`');
+		expect(reason).toContain('`if-present`');
+		// The platform's own 30-minute wait buys 60 rechecks at 30 s, not the default 20.
+		expect(reason).toContain('attempt 1 of 60');
+	});
+
+	it('reviews a zero-check push in the if-present repository and not in the required one', async () => {
+		const mobile = await handler.handle(ctx(updated, { project: MOBILE }));
+		expect(mobile).toMatchObject({ phase: 'review', prNumber: '42', headSha: 'abc123' });
+
+		claimReviewDispatch.mockClear();
+		getAggregateCheckStatus.mockClear();
+
+		const platform = await handler.handle(ctx(updated, { project: PLATFORM }));
+		expect(platform).toBeNull();
+		expect(getAggregateCheckStatus).not.toHaveBeenCalled();
+		expect(claimReviewDispatch).not.toHaveBeenCalled();
+	});
+
+	it("gives up at each repository's own wait, naming that repository's minutes", async () => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'in_progress', null]]));
+
+		await handler.handle(
+			ctx({ ...checks, headSha: 'abc123' }, { project: MOBILE, recheckAttempt: 20 }),
+		);
+		expect(createFailedRun).toHaveBeenCalledOnce();
+		expect(createFailedRun.mock.calls[0][0].error).toContain('10 minutes');
+
+		createFailedRun.mockClear();
+		await handler.handle(
+			ctx({ ...checks, headSha: 'abc123' }, { project: PLATFORM, recheckAttempt: 20 }),
+		);
+		// Attempt 20 is well inside the platform's 60-attempt budget.
+		expect(createFailedRun).not.toHaveBeenCalled();
+
+		await handler.handle(
+			ctx({ ...checks, headSha: 'abc123' }, { project: PLATFORM, recheckAttempt: 60 }),
+		);
+		expect(createFailedRun).toHaveBeenCalledOnce();
+		expect(createFailedRun.mock.calls[0][0].error).toContain('30 minutes');
 	});
 });

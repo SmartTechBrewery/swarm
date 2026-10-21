@@ -153,7 +153,7 @@ describe('scheduleCiNoFixRecovery', () => {
 	// claim must follow it rather than lapse at the default's 12 minutes.
 	it("follows a project's longer CI wait", async () => {
 		refreshReviewDispatchClaim.mockClear();
-		const project = createMockProjectConfig({ pipeline: { review: { checksWaitMinutes: 30 } } });
+		const project = createMockProjectConfig({ reviewChecksWaitMinutes: 30 });
 
 		await scheduleCiNoFixRecovery({ ...input, project });
 
