@@ -2909,7 +2909,9 @@ async function tryReuseLatestRun(
 	dispatchId: string,
 	implementationUnplanned = false,
 ): Promise<string | undefined> {
-	const prior = await getLatestRunForTask(project.id, trigger.taskId, trigger.phase);
+	// `project` is already scoped to this job's repository (`processJob`), and a reset
+	// keeps the row's repository and identity, so the lookup must not leave it (issue #1108).
+	const prior = await getLatestRunForTask(project.id, project.repo, trigger.taskId, trigger.phase);
 	if (!prior || (!isRetryPendingStatus(prior.status) && prior.status !== 'failed'))
 		return undefined;
 	// Take the row over before writing anything to it (issue #1102). A retry-pending
@@ -3061,9 +3063,9 @@ async function tryFetchPrTitle(
 /**
  * Reuse an existing `runs` row for this job rather than inserting a new one:
  * the carried row when the job names one (a re-enqueued deferral or manual
- * retry — issue #136), otherwise the latest terminal row for the task that no
- * other active dispatch owns (issue #1102). Returns
- * the reused row's id, or `undefined` when there's nothing to reuse (the caller
+ * retry — issue #136), otherwise the latest terminal row for the task in this
+ * repository (issue #1108) that no other active dispatch owns (issue #1102).
+ * Returns the reused row's id, or `undefined` when there's nothing to reuse (the caller
  * then creates a fresh row). Restores a resumable Claude session id from the
  * carried row onto the job before resetting it, so a resumed retry threads the
  * session through to the phase.
@@ -4076,15 +4078,17 @@ function knownFailureCondition(
 
 async function tryLoadPlanningScope(
 	projectId: string,
+	repository: string,
 	taskId: string,
 	failureKind: AgentFailureKind | undefined,
 ): Promise<ProposedScope | undefined> {
 	if (failureKind !== 'stalled') return undefined;
 	try {
-		return await getLatestCompletedPlanningScope(projectId, taskId);
+		return await getLatestCompletedPlanningScope(projectId, repository, taskId);
 	} catch (err) {
 		logger.debug('Failed to load Planning scope for terminal stall diagnosis', {
 			projectId,
+			repository,
 			taskId,
 			error: describeError(err),
 		});
@@ -4324,7 +4328,12 @@ async function handlePhaseFailure(
 		taskId: trigger.taskId,
 		error: terminalError,
 	});
-	const planningScope = await tryLoadPlanningScope(project.id, trigger.taskId, failureKind);
+	const planningScope = await tryLoadPlanningScope(
+		project.id,
+		project.repo,
+		trigger.taskId,
+		failureKind,
+	);
 	const failureDiagnosis = diagnoseFailure({
 		failureKind,
 		agent: err instanceof AgentRunError ? err.agent : undefined,

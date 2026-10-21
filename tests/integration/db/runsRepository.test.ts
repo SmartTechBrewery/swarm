@@ -67,6 +67,11 @@ import { seedProject } from '../helpers/seed.js';
 const PROJECT_ID = 'proj-runs';
 /** The repository `seedProject` below gives `PROJECT_ID`, i.e. what its runs act on. */
 const REPO = 'jkwiecien/runs-repo';
+/**
+ * A second repository of the same project (issue #1108): `runs.repository` is free
+ * text with no FK, so it needs no seed of its own.
+ */
+const OTHER_REPO = 'jkwiecien/runs-repo-mobile';
 
 /**
  * `createRun` with the run's repository defaulted (issue #683), so the cases below
@@ -1392,8 +1397,42 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			await createRun({ projectId: PROJECT_ID, taskId: 'other', phase: 'review' });
 			await createRun({ projectId: 'proj-other', taskId: '42', phase: 'review' });
 
-			expect((await getLatestRunForTask(PROJECT_ID, '42', 'review'))?.id).toBe(newest);
-			expect(await getLatestRunForTask(PROJECT_ID, 'missing', 'review')).toBeUndefined();
+			expect((await getLatestRunForTask(PROJECT_ID, REPO, '42', 'review'))?.id).toBe(newest);
+			expect(await getLatestRunForTask(PROJECT_ID, REPO, 'missing', 'review')).toBeUndefined();
+		});
+
+		// Issue numbers are per repository, so two repositories of one project share task
+		// ids; reusing the other repository's row handed one task the other's identity.
+		it("never returns another repository's row for the same project, task and phase (issue #1108)", async () => {
+			const other = await createRun({
+				projectId: PROJECT_ID,
+				repository: OTHER_REPO,
+				taskId: '131',
+				phase: 'implementation',
+			});
+			await completeRun(other, { status: 'failed', error: 'boom' });
+
+			expect(await getLatestRunForTask(PROJECT_ID, REPO, '131', 'implementation')).toBeUndefined();
+
+			// A newer row from the other repository must not mask this repository's own.
+			const own = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '131',
+				phase: 'implementation',
+			});
+			await getDb()
+				.update(runs)
+				.set({ startedAt: new Date('2026-01-01') })
+				.where(eq(runs.id, own));
+			await getDb()
+				.update(runs)
+				.set({ startedAt: new Date('2026-02-01') })
+				.where(eq(runs.id, other));
+
+			expect((await getLatestRunForTask(PROJECT_ID, REPO, '131', 'implementation'))?.id).toBe(own);
+			expect((await getLatestRunForTask(PROJECT_ID, OTHER_REPO, '131', 'implementation'))?.id).toBe(
+				other,
+			);
 		});
 	});
 
@@ -1523,11 +1562,36 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 				.set({ completedAt: new Date('2026-01-02T00:00:00.000Z') })
 				.where(eq(runs.id, newest));
 
-			expect(await getLatestCompletedPlanningScope(PROJECT_ID, 'scope-1')).toMatchObject({
+			expect(await getLatestCompletedPlanningScope(PROJECT_ID, REPO, 'scope-1')).toMatchObject({
 				whyOneTask: 'Newest scope.',
 				independentConcerns: ['worker change', 'dashboard change'],
 			});
-			expect(await getLatestCompletedPlanningScope(PROJECT_ID, 'missing')).toBeUndefined();
+			expect(await getLatestCompletedPlanningScope(PROJECT_ID, REPO, 'missing')).toBeUndefined();
+		});
+
+		it("never returns another repository's Planning scope for the same task (issue #1108)", async () => {
+			const other = await createRun({
+				projectId: PROJECT_ID,
+				repository: OTHER_REPO,
+				taskId: 'scope-2',
+				phase: 'planning',
+			});
+			await completeRun(other, {
+				status: 'completed',
+				planningScope: {
+					whyOneTask: 'Other repository scope.',
+					independentConcerns: ['mobile change'],
+					affectedAreas: ['mobile'],
+					outOfScope: [],
+				},
+			});
+
+			expect(await getLatestCompletedPlanningScope(PROJECT_ID, REPO, 'scope-2')).toBeUndefined();
+			expect(
+				await getLatestCompletedPlanningScope(PROJECT_ID, OTHER_REPO, 'scope-2'),
+			).toMatchObject({
+				whyOneTask: 'Other repository scope.',
+			});
 		});
 	});
 
@@ -2212,7 +2276,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 				expect(await hasResumableDeferredRun(PROJECT_ID, WORKER_UPDATE_RUN_PHASE)).toBe(false);
 				// The review ledger and the board-card link.
 				expect(
-					await getLatestRunForTask(PROJECT_ID, WORKER_UPDATE_RUN_PHASE, 'review'),
+					await getLatestRunForTask(PROJECT_ID, REPO, WORKER_UPDATE_RUN_PHASE, 'review'),
 				).toBeUndefined();
 				expect(await hasRunForTask(PROJECT_ID, WORKER_UPDATE_RUN_PHASE, 'review')).toBe(false);
 				expect(await findBoardItemIdForTask(PROJECT_ID, WORKER_UPDATE_RUN_PHASE)).toBeUndefined();
