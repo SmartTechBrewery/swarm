@@ -14,6 +14,8 @@ const {
 	projectScm,
 	verifyGithubToken,
 	verifyGitLabToken,
+	verifyAzureDevOpsToken,
+	projectRepo,
 	setCredential,
 	deleteCredential,
 	listedProviderIds,
@@ -24,6 +26,8 @@ const {
 	projectScm: { current: undefined as string | undefined },
 	verifyGithubToken: vi.fn(),
 	verifyGitLabToken: vi.fn(),
+	verifyAzureDevOpsToken: vi.fn(),
+	projectRepo: { current: 'team/swarm' },
 	setCredential: vi.fn(),
 	deleteCredential: vi.fn(),
 	listedProviderIds: { current: [] as (string | undefined)[] },
@@ -76,6 +80,27 @@ const {
 					},
 				],
 			},
+			'azure-devops': {
+				providerId: 'azure-devops',
+				providerLabel: 'Azure DevOps',
+				providerRegistered: true,
+				roles: [
+					{
+						role: 'reviewer',
+						envVarKey: 'AZURE_DEVOPS_TOKEN_REVIEWER',
+						referenceKey: 'AZURE_DEVOPS_TOKEN_REVIEWER',
+						isConfigured: false,
+						maskedValue: 'not set',
+					},
+					{
+						role: 'webhookSecret',
+						envVarKey: 'AZURE_DEVOPS_WEBHOOK_SECRET',
+						referenceKey: 'AZURE_DEVOPS_WEBHOOK_SECRET',
+						isConfigured: false,
+						maskedValue: 'not set',
+					},
+				],
+			},
 			bitbucket: {
 				providerId: 'bitbucket',
 				providerLabel: 'Bitbucket Cloud',
@@ -107,6 +132,7 @@ vi.mock('@/lib/trpc.js', () => ({
 			verifyGithubToken: { mutate: verifyGithubToken },
 			verifyBitbucketCredential: { mutate: vi.fn() },
 			verifyGitLabToken: { mutate: verifyGitLabToken },
+			verifyAzureDevOpsToken: { mutate: verifyAzureDevOpsToken },
 		},
 		projects: {
 			update: { mutate: updateProject },
@@ -122,7 +148,12 @@ vi.mock('@/lib/trpc.js', () => ({
 			getById: {
 				queryOptions: ({ id }: { id: string }) => ({
 					queryKey: ['projects.getById', id],
-					queryFn: () => Promise.resolve({ id, scm: projectScm.current }),
+					queryFn: () =>
+						Promise.resolve({
+							id,
+							scm: projectScm.current,
+							repositories: [{ repo: projectRepo.current }],
+						}),
 				}),
 			},
 			credentials: {
@@ -173,6 +204,9 @@ describe('CredentialsPanel (issue #200 — Source Control tab)', () => {
 		verifyGithubToken.mockResolvedValue({ valid: false });
 		verifyGitLabToken.mockReset();
 		verifyGitLabToken.mockResolvedValue({ valid: true, login: 'reviewer-bot' });
+		verifyAzureDevOpsToken.mockReset();
+		verifyAzureDevOpsToken.mockResolvedValue({ valid: true, login: 'guid-reviewer' });
+		projectRepo.current = 'team/swarm';
 		setCredential.mockReset();
 		setCredential.mockResolvedValue(undefined);
 		deleteCredential.mockReset();
@@ -193,6 +227,7 @@ describe('CredentialsPanel (issue #200 — Source Control tab)', () => {
 		expect(screen.getByRole('option', { name: 'GitHub' })).not.toBeNull();
 		expect(screen.getByRole('option', { name: 'Bitbucket Cloud' })).not.toBeNull();
 		expect(screen.getByRole('option', { name: 'GitLab' })).not.toBeNull();
+		expect(screen.getByRole('option', { name: 'Azure DevOps' })).not.toBeNull();
 
 		fireEvent.change(select, { target: { value: 'github' } });
 		await waitFor(() =>
@@ -284,6 +319,48 @@ describe('CredentialsPanel (issue #200 — Source Control tab)', () => {
 		await waitFor(() => expect(verifyGitLabToken).toHaveBeenCalledWith({ token: 'glpat-secret' }));
 		expect(verifyGithubToken).not.toHaveBeenCalled();
 		expect(await screen.findByText(/Verified as @reviewer-bot/)).not.toBeNull();
+	});
+
+	// Issue #1089 phase 6/6: an Azure DevOps PAT resolves only within an organization, so
+	// Verify hands the procedure the project's own three-segment repository too.
+	it('verifies an Azure DevOps PAT within the project’s repository', async () => {
+		projectScm.current = 'azure-devops';
+		projectRepo.current = 'Fabrikam/Fiber/Web';
+		renderPanel(<CredentialsPanel projectId="proj-a" />);
+
+		await waitFor(() => expect(screen.getByText(/\/azure-devops\/webhook/)).not.toBeNull());
+		expect(screen.getByText('Service hook password')).not.toBeNull();
+
+		fireEvent.change(screen.getByLabelText('Reviewer PAT value'), {
+			target: { value: 'ado-pat' },
+		});
+		fireEvent.click(screen.getAllByRole('button', { name: /Verify/ })[0]);
+
+		await waitFor(() =>
+			expect(verifyAzureDevOpsToken).toHaveBeenCalledWith({
+				token: 'ado-pat',
+				repo: 'Fabrikam/Fiber/Web',
+			}),
+		);
+		expect(verifyGithubToken).not.toHaveBeenCalled();
+		expect(await screen.findByText(/Verified as @guid-reviewer/)).not.toBeNull();
+	});
+
+	// A switch to Azure DevOps is refused server-side while the project's repositories are
+	// two-segment (issue #1089 phase 1); the panel surfaces that refusal verbatim.
+	it('surfaces the server’s refusal of a switch the repositories do not fit', async () => {
+		projectScm.current = 'github';
+		updateProject.mockRejectedValue(
+			new Error(
+				"Repository 'team/swarm' has 2 segments, but SCM provider 'azure-devops' expects 3",
+			),
+		);
+		renderPanel(<CredentialsPanel projectId="proj-a" />);
+
+		const select = (await screen.findByLabelText('Provider')) as HTMLSelectElement;
+		fireEvent.change(select, { target: { value: 'azure-devops' } });
+
+		expect(await screen.findByText(/Failed to save the provider: .*expects 3/)).not.toBeNull();
 	});
 
 	// Issue #632: the fields belong to the selected provider, and the key each one names

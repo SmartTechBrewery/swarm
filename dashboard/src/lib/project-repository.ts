@@ -25,6 +25,9 @@
  * on — with nothing here changing either time.
  */
 
+import { SCM_REPO_COORDINATES } from '../../../src/scm/repo-coordinates.js';
+import type { ScmType } from '../../../src/scm/types.js';
+
 /** The narrow shape these helpers need — anything carrying the repository list. */
 interface ProjectWithRepositories {
 	repositories?: Array<{ repo: string }>;
@@ -241,4 +244,29 @@ export function areRepositoriesDirty(
  */
 export function projectRepo(project: ProjectWithRepositories | null | undefined): string {
 	return project?.repositories?.[0]?.repo ?? '';
+}
+
+/** The Repo input attributes for a project on one SCM provider. */
+export interface RepoInputShape {
+	/** The input's `pattern`: exactly the provider's segment count, none empty. */
+	pattern: string;
+	/** The provider's own names for those segments (`owner/repo`, …). */
+	placeholder: string;
+}
+
+/**
+ * How a repository input should read for a project on `scm` — two segments on most
+ * providers, three on Azure DevOps (`organization/project/repository`, issue #1089
+ * phase 6/6). Read off `SCM_REPO_COORDINATES` (`src/scm/repo-coordinates.ts`, runtime-free),
+ * the catalogue the server validates the same field against, so the browser never
+ * refuses a repository the server would accept. A project naming no provider — or one
+ * this bundle does not know — gets the two-segment shape the server expects of it.
+ */
+export function repoInputShape(scm: string | null | undefined): RepoInputShape {
+	const known = scm && Object.hasOwn(SCM_REPO_COORDINATES, scm);
+	const coordinates = SCM_REPO_COORDINATES[known ? (scm as ScmType) : 'github'];
+	return {
+		pattern: Array.from({ length: coordinates.segments }, () => '[^/]+').join('/'),
+		placeholder: coordinates.format,
+	};
 }

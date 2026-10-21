@@ -5,7 +5,10 @@ import {
 	listWorkerScmCredentialStates,
 	writeWorkerScmCredential,
 } from '../../db/repositories/workerScmCredentialsRepository.js';
-import { listWorkerScmProviders } from '../../identity/worker-scm-credential.js';
+import {
+	findWorkerScmRepository,
+	listWorkerScmProviders,
+} from '../../identity/worker-scm-credential.js';
 import { isRuntimeReadySCMProvider } from '../../integrations/scm/manifest.js';
 import { getSCMProvider } from '../../integrations/scm/registry.js';
 import type { ScmType } from '../../scm/types.js';
@@ -136,6 +139,13 @@ export const workerScmCredentialsRouter = router({
 	 * as an invalid credential. Failing closed is the right side to err on for a write
 	 * — storing on an inconclusive check is exactly what the criteria rule out.
 	 *
+	 * The verification is handed a repository this worker is enrolled on through the
+	 * provider (`findWorkerScmRepository`), for a provider whose identity is scoped
+	 * below the account: an Azure DevOps PAT resolves only within an organization
+	 * (issue #1089 phase 6/6), so a worker not yet enrolled in an Azure DevOps project
+	 * cannot have its Azure DevOps credential verified, and so cannot store one. The
+	 * other providers ignore it.
+	 *
 	 * Returns the login the secret resolved to, so the form can confirm the account
 	 * this machine will commit, push and comment as. It is not persisted.
 	 */
@@ -151,7 +161,8 @@ export const workerScmCredentialsRouter = router({
 			await resolveStrictlyOwnedWorker(ctx.user, input.workerId);
 			const provider = requireRuntimeReadyProvider(input.providerId);
 
-			const verification = await verifyScmCredentialSecret(provider.id, input.value);
+			const repo = await findWorkerScmRepository(input.workerId, provider.id);
+			const verification = await verifyScmCredentialSecret(provider.id, input.value, repo);
 			if (!verification.valid) {
 				throw new TRPCError({
 					code: 'BAD_REQUEST',

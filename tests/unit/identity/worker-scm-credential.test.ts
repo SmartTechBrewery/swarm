@@ -21,6 +21,7 @@ import { listEnrollmentsForWorker } from '@/db/repositories/workerEnrollmentsRep
 import { resolveWorkerScmCredential } from '@/db/repositories/workerScmCredentialsRepository.js';
 import type { WorkerEnrollment } from '@/identity/worker-enrollment.js';
 import {
+	findWorkerScmRepository,
 	listWorkerScmProviders,
 	MissingWorkerScmCredentialError,
 	requireWorkerScmCredential,
@@ -153,5 +154,34 @@ describe('listWorkerScmProviders', () => {
 		vi.mocked(findProjectByIdFromDb).mockResolvedValue(undefined);
 
 		await expect(listWorkerScmProviders(WORKER_ID)).resolves.toEqual([]);
+	});
+});
+
+describe('findWorkerScmRepository', () => {
+	const WORKER_ID = REQUEST.workerId;
+
+	beforeEach(() => {
+		vi.mocked(listEnrollmentsForWorker).mockReset();
+		vi.mocked(findProjectByIdFromDb).mockReset();
+	});
+
+	// The scope an Azure DevOps PAT is verified in (issue #1089 phase 6/6): the first
+	// enrolled project that resolves to the provider asked for, never another provider's.
+	it("returns the first enrolled repository on the provider asked for, skipping other providers'", async () => {
+		vi.mocked(listEnrollmentsForWorker).mockResolvedValue([
+			{ id: 'enr-a', workerId: WORKER_ID, projectId: 'proj-a', status: 'active' },
+			{ id: 'enr-b', workerId: WORKER_ID, projectId: 'proj-b', status: 'pending' },
+		] as WorkerEnrollment[]);
+		vi.mocked(findProjectByIdFromDb).mockImplementation(
+			async (id: string) =>
+				(id === 'proj-a'
+					? { id, repo: 'acme/app', scm: 'github' }
+					: { id, repo: 'Fabrikam/Fiber/Web', scm: 'azure-devops' }) as unknown as ProjectConfig,
+		);
+
+		await expect(findWorkerScmRepository(WORKER_ID, 'azure-devops')).resolves.toBe(
+			'Fabrikam/Fiber/Web',
+		);
+		await expect(findWorkerScmRepository(WORKER_ID, 'gitlab')).resolves.toBeUndefined();
 	});
 });

@@ -29,10 +29,11 @@
  * on the repo side and behind `PMRouterAdapter` plus the manifest's own
  * `verifyWebhookSignature` (`src/pm/router-adapter.ts`,
  * `src/integrations/pm/manifest.ts`, issues #297/#496/#529) on the board side.
- * Adding Trello or a fourth SCM provider adds a manifest, not a branch here —
- * which is exactly what serving Bitbucket (issue #618) and then GitLab (issue
- * #619) took: each manifest declared itself runtime-ready and its route started
- * being mounted by the same loop that mounts GitHub's, with no receiver edit.
+ * Adding a fifth SCM provider adds a manifest, not a branch here — which is
+ * exactly what serving Bitbucket (issue #618), GitLab (issue #619), and Azure
+ * DevOps (issue #1089 phase 6/6) took: each manifest declared itself runtime-ready
+ * and its route started being mounted by the same loop that mounts GitHub's, with
+ * no receiver edit.
  *
  * **A shared path makes a PM manifest a co-tenant, never a second handler.**
  * GitHub delivers `projects_v2_item` to the *same* URL with the same secret as its
@@ -329,8 +330,9 @@ async function authenticatePmWebhook(
  * it matches no trigger, rather than rejecting the delivery. A provider fires one
  * CI event per build definition and re-runs fire more, so the next delivery for
  * the same commit retries the resolution; turning a transient API blip into a 500
- * would instead need an operator to hand-replay the delivery, since none of the
- * three providers redelivers a failed webhook on its own.
+ * would instead need an operator to hand-replay the delivery, since GitHub,
+ * Bitbucket and GitLab do not redeliver a failed webhook on their own, and Azure
+ * DevOps' retries end by putting a failing subscription on probation.
  */
 async function resolveChecksPullRequest(
 	manifest: SCMProviderManifest,
@@ -611,9 +613,9 @@ export function createWebhookApp(overrides: Partial<WebhookReceiverDeps> = {}): 
 
 	// A provider that has not declared itself ready to carry traffic gets no route:
 	// serving one would expose an endpoint for a provider no project can select
-	// (`manifest.runtimeReady`). All three registered providers are mounted since
-	// issue #619 — GitHub, Bitbucket, and GitLab — so the filter guards a fourth
-	// provider under construction rather than any of them.
+	// (`manifest.runtimeReady`). All four registered providers are mounted since
+	// issue #1089 phase 6/6 — GitHub, Bitbucket, GitLab, and Azure DevOps — so the
+	// filter guards a fifth provider under construction rather than any of them.
 	const scmManifests = deps.scmProviders.filter(isRuntimeReadySCMProvider);
 	const scmRoutes = new Set(scmManifests.map((manifest) => manifest.webhookRoute));
 	const pmByRoute = pmManifestsByRoute(deps.pmProviders);

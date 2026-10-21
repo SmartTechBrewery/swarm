@@ -64,7 +64,7 @@ const GITHUB_ROLE_DESCRIPTIONS: Record<CredentialRole, string> = {
  * subset of the contract's `ScmType`, so a value picked here is exactly what
  * `project.scm` (`src/config/schema.ts`) stores.
  */
-export type ScmProviderId = Extract<ScmType, 'github' | 'bitbucket' | 'gitlab'>;
+export type ScmProviderId = Extract<ScmType, 'github' | 'bitbucket' | 'gitlab' | 'azure-devops'>;
 
 export interface ScmProviderOption {
 	id: ScmProviderId;
@@ -78,8 +78,8 @@ export interface ScmProviderOption {
  * are **runtime-ready** server-side (`SCMProviderManifest.runtimeReady`), since
  * selecting anything else would only earn the project a loud resolution error.
  * GitHub was alone here until issue #618 made Bitbucket routable and served its
- * ingress; issue #619 did the same for GitLab, so all three registered providers
- * are offered.
+ * ingress; issue #619 did the same for GitLab and issue #1089 phase 6/6 for Azure
+ * DevOps, so all four registered providers are offered.
  *
  * Deliberately a hand-kept list rather than a registry read: the dashboard is a
  * browser bundle and does not load `src/integrations/entrypoint.js`, so there is no
@@ -89,6 +89,7 @@ export const SCM_PROVIDERS: readonly ScmProviderOption[] = [
 	{ id: 'github', label: 'GitHub', available: true },
 	{ id: 'bitbucket', label: 'Bitbucket Cloud', available: true },
 	{ id: 'gitlab', label: 'GitLab', available: true },
+	{ id: 'azure-devops', label: 'Azure DevOps', available: true },
 ];
 
 export const DEFAULT_SCM_PROVIDER_ID: ScmProviderId = SCM_PROVIDERS[0].id;
@@ -96,7 +97,7 @@ export const DEFAULT_SCM_PROVIDER_ID: ScmProviderId = SCM_PROVIDERS[0].id;
 /**
  * Narrow a project's stored `scm` to a provider this screen can render. A project
  * that names nothing predates issue #478's discriminator; one that names a provider
- * the selector doesn't offer — a fourth provider registered but not yet added to
+ * the selector doesn't offer — a fifth provider registered but not yet added to
  * {@link SCM_PROVIDERS} — is left unset so the tab never presents GitHub as a value
  * that has not actually been saved.
  */
@@ -178,6 +179,29 @@ const GITLAB_ROLE_DESCRIPTIONS: Record<CredentialRole, string> = {
 		'Secret token GitLab echoes verbatim in the X-Gitlab-Token header — GitLab does not sign the body, so this authenticates the sender rather than the payload. A hook configured without one is rejected: SWARM fails closed rather than trusting an unauthenticated delivery.',
 };
 
+/**
+ * Azure DevOps' name for each role. The reviewer credential is a PAT, as on GitHub; the
+ * webhook one is the password a service-hook subscription sends as HTTP Basic auth, so
+ * it is named for what the operator types into that subscription.
+ */
+const AZURE_DEVOPS_ROLE_LABELS: Record<CredentialRole, string> = {
+	reviewer: 'Reviewer PAT',
+	webhookSecret: 'Service hook password',
+};
+
+/**
+ * Azure DevOps' wording for the same two references. Like GitLab's, the webhook line
+ * differs in kind: Azure does not sign a service-hook delivery, it sends the password as
+ * HTTP Basic auth, so the copy promises sender authentication rather than an HMAC (see
+ * `src/integrations/scm/azure-devops/webhook.ts`).
+ */
+const AZURE_DEVOPS_ROLE_DESCRIPTIONS: Record<CredentialRole, string> = {
+	reviewer:
+		'Azure DevOps personal access token the reviewer persona reviews with, scoped to the project’s organization with Code (Read & write), Pull Request Threads (Read & write), Build (Read) and Identity / User Profile (Read). Must resolve to a different Azure DevOps identity than the worker operator (the implementer identity) for loop prevention to work.',
+	webhookSecret:
+		'Password each service-hook subscription sends as HTTP Basic auth (any username) — Azure DevOps does not sign the body, so this authenticates the sender rather than the payload. A subscription configured without it is rejected: SWARM fails closed rather than trusting an unauthenticated delivery.',
+};
+
 const SCM_PROVIDER_COPY: Record<ScmProviderId, ScmProviderCopy> = {
 	github: {
 		intro:
@@ -211,6 +235,17 @@ const SCM_PROVIDER_COPY: Record<ScmProviderId, ScmProviderCopy> = {
 		operatorDescription:
 			'GitLab access token (personal, group, or project) this machine acts as, needing the api scope. Must resolve to a different GitLab account than any project\u2019s reviewer token for loop prevention to work. A token whose scope withholds the account email still delivers, but its commits stay unlinked.',
 	},
+	'azure-devops': {
+		intro:
+			"The reviewer persona authenticates to Azure DevOps Services (dev.azure.com) with this project-scoped personal access token. The implementer persona uses the worker operator's own PAT, which is set per worker on that worker's own page — not here — so its pull requests are attributed to the operator's identity, distinct from the reviewer. In the Azure DevOps project's Service hooks settings, create a Web Hooks subscription for each of Pull request created, Pull request updated, Pull request commented on and Build completed, pointing at /azure-devops/webhook with basic authentication: any username, and the service hook password below as the password. Verify the PAT to confirm the identity it resolves to in this project's organization before saving. Secrets are stored encrypted and only ever shown as a masked preview.",
+		roleLabels: AZURE_DEVOPS_ROLE_LABELS,
+		roleDescriptions: AZURE_DEVOPS_ROLE_DESCRIPTIONS,
+		verifyFailureMessage:
+			'PAT did not resolve to an Azure DevOps identity in this project’s organization. Check that it is unexpired, authorized for that organization, and carries the Identity / User Profile (Read) scope — only Azure DevOps Services (dev.azure.com) is supported.',
+		operatorLabel: SCM_OPERATOR_CREDENTIAL_COPY['azure-devops'].label,
+		operatorDescription:
+			'Azure DevOps personal access token this machine acts as, with Code (Read & write), Pull Request Threads (Read & write), Build (Read) and Identity / User Profile (Read). It is verified in the organization of an Azure DevOps project this worker is enrolled in, so enroll the worker first. Must resolve to a different Azure DevOps identity than any project\u2019s reviewer PAT for loop prevention to work.',
+	},
 };
 
 /** Project the selected provider onto the Source Control tab's display copy. */
@@ -222,8 +257,9 @@ export function getScmProviderCopy(providerId: ScmProviderId): ScmProviderCopy {
  * Whether a role's secret maps to a provider identity and can be verified through
  * that provider's `scm.verify…` procedure. The webhook role's secret authenticates a
  * delivery rather than an account — an HMAC key for GitHub and Bitbucket, an echoed
- * token for GitLab — so it has no login to resolve and no Verify affordance, which is
- * true of all three providers and why this takes no provider id.
+ * token for GitLab, a Basic-auth password for Azure DevOps — so it has no login to
+ * resolve and no Verify affordance, which is true of all four providers and why this
+ * takes no provider id.
  */
 export function isVerifiableRole(role: CredentialRole): boolean {
 	return role === 'reviewer';

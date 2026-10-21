@@ -107,25 +107,53 @@ export async function requireWorkerScmCredential({
  * it fails with the registry's own specific message either way.
  */
 export async function listWorkerScmProviders(workerId: string): Promise<ScmType[]> {
-	const enrollments = await listEnrollmentsForWorker(workerId);
 	const providerIds: ScmType[] = [];
+	for (const { providerId } of await listEnrolledProjectProviders(workerId)) {
+		if (!providerIds.includes(providerId)) providerIds.push(providerId);
+	}
+	return providerIds;
+}
+
+/**
+ * A repository this worker is enrolled to work on through `providerId`, or
+ * `undefined` when none of its enrollments resolves to that provider — the first one,
+ * in enrollment order.
+ *
+ * Read when the operator credential is **verified** (`workers.scmCredentials.set`):
+ * a provider whose identity endpoint is scoped below the account — Azure DevOps',
+ * which is organization-scoped (issue #1089 phase 6/6) — cannot resolve a bare secret,
+ * and the repository is what names the scope. Resolved exactly as
+ * {@link listWorkerScmProviders} resolves a provider, so the two cannot disagree on
+ * which enrollments count.
+ */
+export async function findWorkerScmRepository(
+	workerId: string,
+	providerId: ScmType,
+): Promise<string | undefined> {
+	const enrolled = await listEnrolledProjectProviders(workerId);
+	return enrolled.find((entry) => entry.providerId === providerId)?.repo;
+}
+
+/** Each enrolled project's resolved SCM provider and primary repository, in enrollment order. */
+async function listEnrolledProjectProviders(
+	workerId: string,
+): Promise<Array<{ providerId: ScmType; repo: string }>> {
+	const enrollments = await listEnrollmentsForWorker(workerId);
+	const resolved: Array<{ providerId: ScmType; repo: string }> = [];
 
 	for (const enrollment of enrollments) {
 		const project = await findProjectByIdFromDb(enrollment.projectId);
 		if (!project) continue;
-		let providerId: ScmType;
 		try {
-			providerId = requireProjectSCMProviderId(project);
+			resolved.push({ providerId: requireProjectSCMProviderId(project), repo: project.repo });
 		} catch (error) {
 			logger.debug('skipping a worker enrollment whose project resolves no SCM provider', {
 				workerId,
 				projectId: enrollment.projectId,
 				reason: error instanceof Error ? error.message : String(error),
 			});
-			continue;
 		}
-		if (!providerIds.includes(providerId)) providerIds.push(providerId);
 	}
 
-	return providerIds;
+	return resolved;
 }

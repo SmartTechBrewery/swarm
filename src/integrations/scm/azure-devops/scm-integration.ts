@@ -18,9 +18,9 @@
  * review as the reviewer and push as the implementer without either token appearing
  * in a signature (ai/CODING_STANDARDS.md "Scope credentials with AsyncLocalStorage").
  *
- * **Implemented is still not reachable.** The manifest keeps `runtimeReady: false`
- * (`./index.ts`): no project routes here and no `/azure-devops/webhook` route is
- * served until phase 6/6 flips it.
+ * **Reachable since phase 6/6.** The manifest declares `runtimeReady: true`
+ * (`./index.ts`): a project stating `"scm": "azure-devops"` routes here and the
+ * receiver serves `/azure-devops/webhook`.
  */
 
 import { setTimeout as sleep } from 'node:timers/promises';

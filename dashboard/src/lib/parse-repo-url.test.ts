@@ -108,4 +108,53 @@ describe('parseRepoUrl', () => {
 		expect(parseRepoUrl('github.com/owner')).toBeNull(); // missing repo name
 		expect(parseRepoUrl('https://github.com/')).toBeNull();
 	});
+
+	// Issue #1089 phase 6/6: Azure DevOps addresses a repository by three segments, and a
+	// clone URL decorates the path (`_git`, `v3/`, a legacy host carrying the organization).
+	describe('Azure DevOps URLs', () => {
+		const fiberWeb = {
+			owner: 'Fabrikam/Fiber',
+			repo: 'Fabrikam/Fiber/Web',
+			id: 'web',
+			name: 'Web',
+		};
+
+		it.each([
+			'https://dev.azure.com/Fabrikam/Fiber/_git/Web',
+			'https://Fabrikam@dev.azure.com/Fabrikam/Fiber/_git/Web',
+			'git@ssh.dev.azure.com:v3/Fabrikam/Fiber/Web',
+			'Fabrikam@vs-ssh.visualstudio.com:v3/Fabrikam/Fiber/Web',
+		])('reads %s as organization/project/repository, keeping its casing', (url) => {
+			expect(parseRepoUrl(url)).toEqual(fiberWeb);
+		});
+
+		it('decodes a project name carrying a space', () => {
+			expect(parseRepoUrl('https://dev.azure.com/Fabrikam/Fiber%20Project/_git/Web')).toEqual({
+				owner: 'Fabrikam/Fiber Project',
+				repo: 'Fabrikam/Fiber Project/Web',
+				id: 'web',
+				name: 'Web',
+			});
+		});
+
+		it('reads the short form for a repository named like its project', () => {
+			expect(parseRepoUrl('https://dev.azure.com/Fabrikam/_git/Fiber')?.repo).toBe(
+				'Fabrikam/Fiber/Fiber',
+			);
+		});
+
+		// A hostname has no casing, so a legacy host's organization reads lower-case.
+		it('reads a legacy visualstudio.com host, with or without DefaultCollection', () => {
+			expect(parseRepoUrl('https://fabrikam.visualstudio.com/Fiber/_git/Web')?.repo).toBe(
+				'fabrikam/Fiber/Web',
+			);
+			expect(
+				parseRepoUrl('https://fabrikam.visualstudio.com/DefaultCollection/Fiber/_git/Web')?.repo,
+			).toBe('fabrikam/Fiber/Web');
+		});
+
+		it('falls back to the generic reading for an Azure path it does not recognize', () => {
+			expect(parseRepoUrl('https://dev.azure.com/Fabrikam/Fiber')?.repo).toBe('Fabrikam/Fiber');
+		});
+	});
 });

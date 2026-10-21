@@ -424,7 +424,7 @@ Notes:
 - **Step 5 is what the machine actually runs as** (issue #765). One credential per
   `(worker, SCM provider)`, stored encrypted server-side and resolved at dispatch —
   so a worker enrolled in projects on two providers needs one command per provider
-  (`github` | `bitbucket` | `gitlab`), and a rotation takes effect on the next phase
+  (`github` | `bitbucket` | `gitlab` | `azure-devops`), and a rotation takes effect on the next phase
   with no worker restart. Without it, every Planning/Implementation/Review dispatch
   to this worker fails immediately with a message naming the worker and the provider.
   It replaces the worker-local `SWARM_OPERATOR_GH_TOKEN`, which no worker reads any

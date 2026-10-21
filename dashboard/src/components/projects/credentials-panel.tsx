@@ -13,6 +13,7 @@ import {
 	type ScmProviderId,
 	toSelectableScmProvider,
 } from '@/lib/credentials.js';
+import { projectRepo } from '@/lib/project-repository.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
 import { Modal, ModalFooter } from '../ui/modal.js';
 
@@ -44,13 +45,23 @@ type VerifyResult = { valid: true; login: string } | { valid: false };
  * Verify a pasted secret against the selected provider. One procedure per provider
  * rather than one generalised call: there is no project yet to resolve an
  * `SCMProvider` from, which is why `src/api/routers/scm.ts` keeps them separate.
+ *
+ * `repo` is the project's default repository. Only Azure DevOps reads it: its identity
+ * endpoint is organization-scoped, so a PAT is resolved in the organization the
+ * repository names (issue #1089 phase 6/6).
  */
-function verifyScmCredential(providerId: ScmProviderId, secret: string): Promise<VerifyResult> {
+function verifyScmCredential(
+	providerId: ScmProviderId,
+	secret: string,
+	repo: string,
+): Promise<VerifyResult> {
 	switch (providerId) {
 		case 'bitbucket':
 			return trpcClient.scm.verifyBitbucketCredential.mutate({ credential: secret });
 		case 'gitlab':
 			return trpcClient.scm.verifyGitLabToken.mutate({ token: secret });
+		case 'azure-devops':
+			return trpcClient.scm.verifyAzureDevOpsToken.mutate({ token: secret, repo });
 		default:
 			return trpcClient.scm.verifyGithubToken.mutate({ token: secret });
 	}
@@ -219,6 +230,8 @@ function CredentialFieldPreview({
 interface CredentialFieldProps {
 	projectId: string;
 	providerId: ScmProviderId;
+	/** The project's default repository — the scope an Azure DevOps PAT is verified in. */
+	repo: string;
 	entry: CredentialEntry;
 	roleLabel: string;
 	roleDescription: string;
@@ -237,6 +250,7 @@ interface CredentialFieldProps {
 function CredentialField({
 	projectId,
 	providerId,
+	repo,
 	entry,
 	roleLabel,
 	roleDescription,
@@ -253,7 +267,7 @@ function CredentialField({
 	const [value, setValue] = useState('');
 
 	const verifyMutation = useMutation({
-		mutationFn: (secret: string) => verifyScmCredential(providerId, secret),
+		mutationFn: (secret: string) => verifyScmCredential(providerId, secret, repo),
 		onSuccess: (result) => {
 			onVerified(entry.role, result.valid ? result.login : undefined);
 		},
@@ -609,6 +623,7 @@ export function CredentialsPanel({
 							key={`${selectedProviderId}:${entry.role}`}
 							projectId={projectId}
 							providerId={selectedProviderId}
+							repo={projectRepo(projectQuery.data)}
 							entry={entry}
 							roleLabel={providerCopy.roleLabels[entry.role]}
 							roleDescription={providerCopy.roleDescriptions[entry.role]}

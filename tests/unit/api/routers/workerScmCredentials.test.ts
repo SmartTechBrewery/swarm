@@ -6,6 +6,7 @@ vi.mock('@/db/repositories/workerScmCredentialsRepository.js', () => ({
 }));
 
 vi.mock('@/identity/worker-scm-credential.js', () => ({
+	findWorkerScmRepository: vi.fn(),
 	listWorkerScmProviders: vi.fn(),
 }));
 
@@ -28,7 +29,10 @@ import {
 	writeWorkerScmCredential,
 } from '@/db/repositories/workerScmCredentialsRepository.js';
 import type { SwarmUser } from '@/identity/schema.js';
-import { listWorkerScmProviders } from '@/identity/worker-scm-credential.js';
+import {
+	findWorkerScmRepository,
+	listWorkerScmProviders,
+} from '@/identity/worker-scm-credential.js';
 import { getWorker } from '@/identity/worker-service.js';
 
 const WORKER_ID = '11111111-1111-4111-8111-111111111111';
@@ -68,6 +72,7 @@ describe('workerScmCredentialsRouter (issue #766)', () => {
 		vi.mocked(getWorker).mockReset();
 		vi.mocked(listWorkerScmCredentialStates).mockReset();
 		vi.mocked(listWorkerScmProviders).mockReset();
+		vi.mocked(findWorkerScmRepository).mockReset();
 		vi.mocked(writeWorkerScmCredential).mockReset();
 		vi.mocked(verifyScmCredentialSecret).mockReset();
 
@@ -188,7 +193,7 @@ describe('workerScmCredentialsRouter (issue #766)', () => {
 				value: 'glpat-real',
 			});
 
-			expect(verifyScmCredentialSecret).toHaveBeenCalledWith('gitlab', 'glpat-real');
+			expect(verifyScmCredentialSecret).toHaveBeenCalledWith('gitlab', 'glpat-real', undefined);
 			expect(writeWorkerScmCredential).toHaveBeenCalledTimes(1);
 			expect(writeWorkerScmCredential).toHaveBeenCalledWith(WORKER_ID, 'gitlab', 'glpat-real');
 			expect(result).toEqual({ login: 'ada-ops' });
@@ -221,6 +226,23 @@ describe('workerScmCredentialsRouter (issue #766)', () => {
 			await caller.set({ workerId: WORKER_ID, providerId: 'bitbucket', value: 'ada:app-pw' });
 
 			expect(writeWorkerScmCredential).toHaveBeenCalledWith(WORKER_ID, 'bitbucket', 'ada:app-pw');
+		});
+
+		// An Azure DevOps PAT resolves only within an organization (issue #1089 phase 6/6),
+		// so verification is handed a repository the worker is enrolled on through it.
+		it('verifies against a repository the worker is enrolled on through the provider', async () => {
+			vi.mocked(findWorkerScmRepository).mockResolvedValue('Fabrikam/Fiber/Web');
+			vi.mocked(verifyScmCredentialSecret).mockResolvedValue({ valid: true, login: 'guid-1' });
+
+			await caller.set({ workerId: WORKER_ID, providerId: 'azure-devops', value: 'ado-pat' });
+
+			expect(findWorkerScmRepository).toHaveBeenCalledWith(WORKER_ID, 'azure-devops');
+			expect(verifyScmCredentialSecret).toHaveBeenCalledWith(
+				'azure-devops',
+				'ado-pat',
+				'Fabrikam/Fiber/Web',
+			);
+			expect(writeWorkerScmCredential).toHaveBeenCalledWith(WORKER_ID, 'azure-devops', 'ado-pat');
 		});
 	});
 });

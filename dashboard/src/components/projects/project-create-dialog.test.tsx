@@ -309,4 +309,65 @@ describe('ProjectCreateDialog', () => {
 			await waitFor(() => expect(defaultBranchQuery).not.toHaveBeenCalled());
 		});
 	});
+
+	// Issue #1089 phase 6/6: an Azure DevOps repository has three segments, so the Repo
+	// field validates per the selected provider's coordinates rather than `owner/repo`.
+	describe('Azure DevOps repositories', () => {
+		it('autofills an Azure DevOps URL as organization/project/repository and detects under it', async () => {
+			createProject.mockResolvedValue({});
+			defaultBranchQuery.mockResolvedValue({ branch: 'develop' });
+			renderDialog(<ProjectCreateDialog open onOpenChange={vi.fn()} />);
+
+			fireEvent.change(screen.getByRole('combobox'), { target: { value: 'azure-devops' } });
+			expect(
+				screen.getByPlaceholderText('https://dev.azure.com/organization/project/_git/repository'),
+			).toBeTruthy();
+			const repoInput = screen.getByPlaceholderText(
+				'organization/project/repository',
+			) as HTMLInputElement;
+			expect(repoInput.getAttribute('pattern')).toBe('[^/]+/[^/]+/[^/]+');
+
+			fireEvent.change(screen.getByLabelText('Repository URL'), {
+				target: { value: 'https://Fabrikam@dev.azure.com/Fabrikam/Fiber%20Project/_git/Web' },
+			});
+			fireEvent.click(screen.getByRole('button', { name: 'Autofill from repository URL' }));
+
+			expect(repoInput.value).toBe('Fabrikam/Fiber Project/Web');
+			await waitFor(() =>
+				expect(defaultBranchQuery).toHaveBeenCalledWith({
+					scm: 'azure-devops',
+					repo: 'Fabrikam/Fiber Project/Web',
+				}),
+			);
+			await waitFor(() =>
+				expect((screen.getByLabelText(/^Base Branch/) as HTMLInputElement).value).toBe('develop'),
+			);
+
+			fireEvent.change(screen.getByLabelText(/^Repo Local Path/), {
+				target: { value: '/work/web' },
+			});
+			fireEvent.click(screen.getByRole('button', { name: 'Create Project' }));
+
+			await waitFor(() =>
+				expect(createProject).toHaveBeenCalledWith(
+					expect.objectContaining({
+						repositories: [{ repo: 'Fabrikam/Fiber Project/Web', baseBranch: 'develop' }],
+						scm: 'azure-devops',
+					}),
+				),
+			);
+		});
+
+		it('does not query for a two-segment repository under Azure DevOps', async () => {
+			renderDialog(<ProjectCreateDialog open onOpenChange={vi.fn()} />);
+
+			fireEvent.change(screen.getByPlaceholderText('owner/repo'), {
+				target: { value: 'team/new-project' },
+			});
+			fireEvent.change(screen.getByRole('combobox'), { target: { value: 'azure-devops' } });
+
+			await flush();
+			expect(defaultBranchQuery).not.toHaveBeenCalled();
+		});
+	});
 });
