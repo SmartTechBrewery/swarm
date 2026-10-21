@@ -3,13 +3,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 // Mock ioredis so nothing touches a real Redis — capture the constructor and the
 // set()/del() calls the helper makes. Hoisted so the vi.mock factory (itself
 // hoisted above imports) can reference them.
-const { RedisMock, set, del, on, ttl } = vi.hoisted(() => {
+const { RedisMock, set, del, on, ttl, evalScript } = vi.hoisted(() => {
 	const set = vi.fn();
 	const del = vi.fn();
 	const on = vi.fn();
 	const ttl = vi.fn();
-	const RedisMock = vi.fn(() => ({ set, del, on, ttl }));
-	return { RedisMock, set, del, on, ttl };
+	const evalScript = vi.fn();
+	const RedisMock = vi.fn(() => ({ set, del, on, ttl, eval: evalScript }));
+	return { RedisMock, set, del, on, ttl, evalScript };
 });
 
 vi.mock('ioredis', () => ({ Redis: RedisMock }));
@@ -26,6 +27,8 @@ beforeEach(() => {
 	on.mockReset();
 	ttl.mockReset();
 	ttl.mockResolvedValue(-2);
+	evalScript.mockReset();
+	evalScript.mockResolvedValue(1);
 	process.env.REDIS_URL = 'redis://localhost:6379';
 });
 
@@ -76,6 +79,28 @@ describe('claimReviewDispatch', () => {
 
 		expect(claimed).toBe(true);
 		expect(set).toHaveBeenCalledWith(`${NS}acme/widgets:42:abc`, 'pr-review', 'EX', 300, 'NX');
+	});
+
+	// Issue #1105: the owner token, when given, is the stored value the
+	// owner-fenced release compares against.
+	it('stores the owner token as the claim value when one is given', async () => {
+		const { claimReviewDispatch, reviewDispatchClaimOwner } = await import(
+			'@/triggers/review-dispatch-dedup.js'
+		);
+
+		await claimReviewDispatch('acme/widgets:42:abc', 'pr-review', {
+			prNumber: '42',
+			headSha: 'abc',
+			owner: reviewDispatchClaimOwner('dispatch-7'),
+		});
+
+		expect(set).toHaveBeenCalledWith(
+			`${NS}acme/widgets:42:abc`,
+			'pr-review:dispatch-7',
+			'EX',
+			300,
+			'NX',
+		);
 	});
 
 	it('returns false when the key is already claimed (SET NX returns null)', async () => {
@@ -153,6 +178,33 @@ describe('releaseReviewDispatch', () => {
 		const { releaseReviewDispatch } = await import('@/triggers/review-dispatch-dedup.js');
 
 		await expect(releaseReviewDispatch('acme/widgets:42:abc')).resolves.toBeUndefined();
+	});
+});
+
+// Issue #1105: a late hand-back must not erase a claim a later dispatch re-took
+// after this one's lapsed.
+describe('releaseReviewDispatchHeldBy', () => {
+	it('compare-and-deletes the namespaced key against the owner token', async () => {
+		const { releaseReviewDispatchHeldBy } = await import('@/triggers/review-dispatch-dedup.js');
+
+		await releaseReviewDispatchHeldBy('acme/widgets:42:abc', 'pr-review:dispatch-7');
+
+		expect(evalScript).toHaveBeenCalledWith(
+			expect.stringContaining("redis.call('get', KEYS[1]) == ARGV[1]"),
+			1,
+			`${NS}acme/widgets:42:abc`,
+			'pr-review:dispatch-7',
+		);
+		expect(del).not.toHaveBeenCalled();
+	});
+
+	it('swallows Redis errors (TTL is the safety net)', async () => {
+		evalScript.mockRejectedValue(new Error('ECONNREFUSED'));
+		const { releaseReviewDispatchHeldBy } = await import('@/triggers/review-dispatch-dedup.js');
+
+		await expect(
+			releaseReviewDispatchHeldBy('acme/widgets:42:abc', 'pr-review:dispatch-7'),
+		).resolves.toBeUndefined();
 	});
 });
 

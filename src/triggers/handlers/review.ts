@@ -213,6 +213,7 @@ import {
 	buildReviewDispatchKey,
 	claimReviewDispatch,
 	refreshReviewDispatchClaim,
+	reviewDispatchClaimOwner,
 	reviewDispatchClaimTtlSec,
 } from '../review-dispatch-dedup.js';
 import { checkRecheckCoalesceKey, mergeabilityRecheckCoalesceKey } from '../review-recheck-keys.js';
@@ -1701,6 +1702,7 @@ export function createReviewTrigger(): TriggerHandler {
 				const claimed = await claimReviewDispatch(dispatchKey, 'pr-review', {
 					prNumber,
 					headSha,
+					owner: reviewDispatchClaimOwner(ctx.dispatchId),
 				});
 				if (!claimed) {
 					// A decline the operator would otherwise have to diagnose off the

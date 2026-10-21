@@ -754,8 +754,12 @@ event-woken `pending` wait sequences the phases of one task** (issues #759 and
 (`promoteTaskInFlightWaits`, from `processJob`'s `finally` — every settle path,
 success or not), rather than being discarded. The *same* phase arriving twice is
 still completed `skipped-duplicate` — a Review dropped there hands back the PR+SHA
-claim and the verdict slot its own evaluation *created*, only after the dispatch
-is terminal and never for a slot it reused (issue #1105) — **unless the in-process holder's own dispatch
+claim and the verdict slot its own evaluation *created*, never for a slot it reused,
+only once its own completion confirmed the dispatch settled, and only what this
+dispatch still owns: the claim is compare-and-deleted against the dispatch's token
+and the slot abandoned only while it is still owned by this dispatch, so a later
+dispatch that re-claimed a lapsed key and re-pointed the slot keeps both (issue
+#1105) — **unless the in-process holder's own dispatch
 has already settled** (issue #858), in which case the collision is not a repeated
 delivery but a replacement dispatch racing a job the router has not given up on yet,
 and it waits as `task-in-flight` too. So the two halves of that collision stay

@@ -445,6 +445,36 @@ export async function abandonReviewVerdict(key: ReviewVerdictKey): Promise<void>
 }
 
 /**
+ * {@link abandonReviewVerdict}, fenced on the slot's owner (issue #1105): abandons
+ * this PR/head's `pending` slot only while `dispatchId` still owns it. For a
+ * hand-back that can run after its own reservation has been re-pointed — a
+ * same-head reservation reuses a `pending` slot by re-owning it to the later
+ * dispatch ({@link reserveReviewVerdict}) — where the unfenced form would abandon
+ * the later dispatch's slot and make its verdict write miss. Returns whether a
+ * slot was abandoned.
+ */
+export async function abandonReviewVerdictOwnedBy(
+	key: ReviewVerdictKey,
+	dispatchId: string,
+): Promise<boolean> {
+	const rows = await getDb()
+		.update(reviewVerdicts)
+		.set({ state: 'abandoned' })
+		.where(
+			and(
+				eq(reviewVerdicts.projectId, key.projectId),
+				eq(reviewVerdicts.repository, key.repository),
+				eq(reviewVerdicts.prNumber, key.prNumber),
+				eq(reviewVerdicts.headSha, key.headSha),
+				eq(reviewVerdicts.state, 'pending'),
+				eq(reviewVerdicts.dispatchId, dispatchId),
+			),
+		)
+		.returning({ id: reviewVerdicts.id });
+	return rows.length > 0;
+}
+
+/**
  * Record that this PR/head's submitted approval was invalidated by the pull
  * request's head moving after the review (issue #1079) — written by the merge
  * dispatch (`src/worker/merge-automation.ts`) when its refusal was *only* that

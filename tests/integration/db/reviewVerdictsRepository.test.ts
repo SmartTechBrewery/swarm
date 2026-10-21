@@ -13,6 +13,7 @@ import {
 } from '../../../src/db/repositories/dispatchesRepository.js';
 import {
 	abandonReviewVerdict,
+	abandonReviewVerdictOwnedBy,
 	getPriorSubmittedReview,
 	getReviewVerdictByHead,
 	getReviewVerdictByReviewId,
@@ -418,6 +419,37 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 
 			it('is a no-op when no reservation exists', async () => {
 				await expect(abandonReviewVerdict(key('never-reserved'))).resolves.toBeUndefined();
+			});
+		});
+
+		// Issue #1105: a same-phase duplicate's hand-back can run after a later
+		// dispatch re-owned the head's pending slot; it must not abandon that slot.
+		describe('abandonReviewVerdictOwnedBy', () => {
+			it('abandons the pending slot its dispatch still owns', async () => {
+				await reserveReviewVerdict(key('sha-1'), owner);
+
+				expect(await abandonReviewVerdictOwnedBy(key('sha-1'), owner)).toBe(true);
+				expect(await slotStates('sha-1')).toEqual(['abandoned']);
+			});
+
+			it('leaves a slot a later same-head reservation re-pointed to itself', async () => {
+				await reserveReviewVerdict(key('sha-1'), owner);
+				const later = await seedDispatch('leased');
+				await reserveReviewVerdict(key('sha-1'), later);
+
+				expect(await abandonReviewVerdictOwnedBy(key('sha-1'), owner)).toBe(false);
+				expect(await slotStates('sha-1')).toEqual(['pending']);
+				expect(
+					await markReviewVerdictSubmitted(key('sha-1'), { verdict: 'approve' }),
+				).toBeDefined();
+			});
+
+			it('never abandons a submitted verdict, even its own', async () => {
+				await reserveReviewVerdict(key('sha-1'), owner);
+				await markReviewVerdictSubmitted(key('sha-1'), { verdict: 'approve' });
+
+				expect(await abandonReviewVerdictOwnedBy(key('sha-1'), owner)).toBe(false);
+				expect(await slotStates('sha-1')).toEqual(['submitted']);
 			});
 		});
 
