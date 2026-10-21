@@ -1,10 +1,15 @@
 /**
  * AzureDevOpsSCMIntegration — Azure DevOps Services' implementation of the
  * provider-neutral {@link SCMProvider} contract (`src/scm/types.ts`), built out over
- * six phases (issue #1089) along the same seams GitLab used. Built so far:
+ * six phases (issue #1089) along the same seams GitLab used, and now complete:
  * availability probing, persona credential scoping, and persona identity / actor
- * resolution (phase 2/6), webhook ingress (phase 3/6, `./webhook.ts`), and the
- * pull-request and CI reads (phase 4/6, `./pull-requests.ts`).
+ * resolution (phase 2/6), webhook ingress (phase 3/6, `./webhook.ts`), the
+ * pull-request and CI reads (phase 4/6, `./pull-requests.ts`), and comment threads,
+ * review votes, the delivery seam, and pull-request completion (phase 5/6,
+ * `./writes.ts` / `./operator-delivery.ts`). No contract method is stubbed — the
+ * multi-provider conformance suite (`tests/unit/integrations/scm/scm-conformance.test.ts`)
+ * asserts that for every registered manifest, which is why the manifest
+ * (`./index.ts`) could only land with phase 5/6.
  *
  * Its core job is the same as the other providers' classes: run a block of Azure
  * DevOps operations under the correct persona's PAT. Callers hand it a project +
@@ -13,17 +18,12 @@
  * review as the reviewer and push as the implementer without either token appearing
  * in a signature (ai/CODING_STANDARDS.md "Scope credentials with AsyncLocalStorage").
  *
- * **Every method not yet implemented throws** — loudly, naming the method and the
- * phase that fills it in — rather than returning `null`, `[]`, or a no-op that
- * would read as a real answer.
- *
- * Like GitLab's build-out, **nothing registers this provider yet**: the
- * multi-provider conformance suite (`tests/unit/integrations/scm/scm-conformance.test.ts`)
- * asserts that no *registered* manifest stubs a contract method, so the manifest
- * lands in phase 6/6 together with the last stub's removal. A throw here therefore
- * means a caller constructed the class directly and called too early.
+ * **Implemented is still not reachable.** The manifest keeps `runtimeReady: false`
+ * (`./index.ts`): no project routes here and no `/azure-devops/webhook` route is
+ * served until phase 6/6 flips it.
  */
 
+import { setTimeout as sleep } from 'node:timers/promises';
 import type { ProjectConfig } from '../../../config/schema.js';
 import type { ScmDeliveryProvider } from '../../../scm/delivery.js';
 import type { ScmEvent } from '../../../scm/events.js';
@@ -44,14 +44,20 @@ import type {
 import { azureRepoCoordinates, withAzureDevOpsToken } from './client.js';
 import { getAzureDevOpsToken, getAzureDevOpsTokenOrNull } from './credentials.js';
 import {
+	createAzureDevOpsDeliveryProvider,
+	createAzureDevOpsOperatorDeliveryProvider,
+} from './operator-delivery.js';
+import {
 	getAzureDevOpsPersonaForLogin,
 	isSwarmAzureDevOpsActor,
 	resolveAzureDevOpsPersonaIdentities,
 } from './personas.js';
 import {
+	type AzureDevOpsPullRequestMergeState,
 	getAzureDevOpsBranchHead,
 	getAzureDevOpsCommitChecks,
 	getAzureDevOpsPullRequest,
+	getAzureDevOpsPullRequestMergeState,
 	getAzureDevOpsPullRequestTitle,
 	listActiveAzureDevOpsPullRequestsForBase,
 	listAzureDevOpsPullRequestsForCommit,
@@ -63,19 +69,180 @@ import {
 	readAzureDevOpsWebhookRequest,
 	verifyAzureDevOpsWebhookAuth,
 } from './webhook.js';
+import { completeAzureDevOpsPullRequest, postAzureDevOpsPullRequestThread } from './writes.js';
+
+/** The lowest vote that approves: `5` is "approved with suggestions", `10` "approved". */
+const APPROVING_VOTE = 5;
+
+/** The "rejected" vote — a standing veto, whoever cast it. */
+const REJECTED_VOTE = -10;
 
 /**
- * The single exit for every contract method this phase leaves unbuilt. `phase`
- * names the follow-up that implements it, so the error tells a caller what to wait
- * for rather than just that something is missing.
+ * How many times, and how far apart, {@link mergeReadyAzureDevOpsPullRequest} reads
+ * the pull request back after asking for its completion. Azure completes a pull
+ * request in the background, so the PATCH's answer is not the outcome; the bound
+ * keeps one merge attempt to roughly ten seconds, and a completion still running
+ * after it is reported `not-ready`, which the durable merge dispatch retries — at
+ * which point the recheck finds it `completed`.
  */
-function notImplementedYet(method: string, phase: string): never {
-	throw new Error(
-		`Azure DevOps SCM: ${method}() is not implemented yet — it lands in ${phase} of issue #1089`,
-	);
+export const MERGE_COMPLETION_POLL = { attempts: 5, intervalMs: 2_000 } as const;
+
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }
 
-const WRITE_PHASE = 'phase 5/6 (comments, delivery, merge)';
+/** `AzureDevOpsApiError#status`, if `error` carries one (it mirrors Octokit's field name). */
+function errorStatus(error: unknown): number | undefined {
+	const status = (error as { status?: unknown } | null)?.status;
+	return typeof status === 'number' ? status : undefined;
+}
+
+/**
+ * Classify a thrown error from the completion request into the provider-neutral
+ * outcome — the Azure DevOps twin of `classifyGitLabDirectMergeError`. The error's
+ * message carries Azure's own `message (typeKey)` (`./client.ts`), so a refusal is
+ * read off both the status and that text:
+ *
+ * - **409**, or any refusal naming `lastMergeSourceCommit`, is Azure's "the expected
+ *   head no longer matches the source branch". The recheck just verified that head
+ *   against the reviewed commit, so the branch moved inside that window and nobody
+ *   has reviewed the current head — `not-eligible`, a fresh review.
+ * - **403**, or a **400** naming a policy (a branch policy's `TF…` refusal, or a
+ *   `…Policy…` type key), is a repository policy or permission refusing the
+ *   completion outright — `policy-blocked`, a human's call. SWARM never sends
+ *   `bypassPolicy`.
+ *
+ * Anything else (another 400, 404, 5xx, a transport failure) is an unexpected
+ * `provider-error`. These codes are read from Azure's REST reference, not yet
+ * observed live — the outcome a misread one costs is a terminal refusal reported
+ * under the wrong reason, never a merge.
+ */
+function classifyAzureDevOpsCompletionError(error: unknown): MergePullRequestOutcome {
+	const message = errorMessage(error);
+	const status = errorStatus(error);
+	if (status === 409 || /lastMergeSourceCommit/i.test(message))
+		return { status: 'not-eligible', message };
+	if (status === 403 || (status === 400 && /polic/i.test(message)))
+		return { status: 'policy-blocked', message };
+	return { status: 'provider-error', message };
+}
+
+/**
+ * Whether the approval this merge was requested for still stands: the reviewer
+ * persona's own vote approves, and nobody — the reviewer or any other account —
+ * holds a "rejected" veto. A reason string when it does not.
+ */
+function voteRefusal(state: AzureDevOpsPullRequestMergeState, reviewerId: string): string | null {
+	if (state.reviewers.some((reviewer) => reviewer.vote <= REJECTED_VOTE))
+		return 'a reviewer has rejected the pull request since it was approved';
+	const own = state.reviewers.find(
+		(reviewer) => reviewer.id.toLowerCase() === reviewerId.toLowerCase(),
+	);
+	if ((own?.vote ?? 0) < APPROVING_VOTE)
+		return 'the approving review is no longer in effect — the reviewer’s vote no longer approves';
+	return null;
+}
+
+/**
+ * Read the pull request back until Azure reports the completion's result, at most
+ * {@link MERGE_COMPLETION_POLL} times. A read that fails here is `not-ready`, not a
+ * `provider-error`: the completion was already accepted, so the retry's recheck is
+ * the place to learn how it ended.
+ */
+async function awaitAzureDevOpsCompletion(
+	repo: string,
+	pullRequestId: number,
+): Promise<MergePullRequestOutcome> {
+	for (let attempt = 0; attempt < MERGE_COMPLETION_POLL.attempts; attempt++) {
+		await sleep(MERGE_COMPLETION_POLL.intervalMs);
+		let state: AzureDevOpsPullRequestMergeState;
+		try {
+			state = await getAzureDevOpsPullRequestMergeState(repo, pullRequestId);
+		} catch (error) {
+			return {
+				status: 'not-ready',
+				message: `Azure DevOps accepted the completion, but reading its result failed: ${errorMessage(error)}`,
+			};
+		}
+		if (state.merged)
+			return {
+				status: 'merged',
+				message: 'pull request completed',
+				sha: state.mergeCommitSha ?? undefined,
+			};
+		if (state.state !== 'open')
+			return { status: 'not-eligible', message: 'pull request was abandoned during completion' };
+		if (state.mergeStatus === 'rejectedByPolicy')
+			return { status: 'policy-blocked', message: 'a branch policy rejected the merge' };
+		if (state.mergeStatus === 'conflicts')
+			return { status: 'not-ready', message: 'pull request has merge conflicts' };
+	}
+	return {
+		status: 'not-ready',
+		message: 'Azure DevOps accepted the completion but has not finished merging yet',
+	};
+}
+
+/**
+ * The token-scoped body of {@link AzureDevOpsSCMIntegration.mergePullRequest},
+ * mirroring GitLab's `mergeReadyGitLabMergeRequest`: re-read the pull request's
+ * current state on every call, so a durable retry re-evaluates eligibility from
+ * scratch rather than merging on stale approval context.
+ *
+ * Azure's completion takes an expected head (`lastMergeSourceCommit`), so these
+ * checks are defence in depth rather than the only line; they turn refusals Azure
+ * would answer with one opaque error into the specific outcomes the merge dispatch
+ * needs, and distinguish "the approval no longer holds" (never retry) from "not
+ * ready yet" (retry).
+ *
+ * There is no `stale-base` check: Azure reports no "behind its target" count on the
+ * pull request, so — like Bitbucket — a head behind its base merges as before.
+ */
+async function mergeReadyAzureDevOpsPullRequest(
+	repo: string,
+	pullRequestId: number,
+	approvedHeadSha: string,
+	reviewerId: string,
+): Promise<MergePullRequestOutcome> {
+	let state: AzureDevOpsPullRequestMergeState;
+	try {
+		state = await getAzureDevOpsPullRequestMergeState(repo, pullRequestId);
+	} catch (error) {
+		return { status: 'provider-error', message: errorMessage(error) };
+	}
+	if (state.merged)
+		return {
+			status: 'merged',
+			message: 'pull request already completed',
+			sha: state.mergeCommitSha ?? undefined,
+		};
+	// The approval covers one exact commit; a push since then means nobody has
+	// reviewed the current head. Azure spells the same commit in either case
+	// depending on the API, so the comparison ignores case.
+	if (state.headSha.toLowerCase() !== approvedHeadSha.toLowerCase())
+		return {
+			status: 'not-eligible',
+			message: `pull request head changed since the reviewed commit (reviewed ${approvedHeadSha}, now ${state.headSha}); a fresh review is required before merge automation can proceed`,
+		};
+	if (state.draft)
+		return {
+			status: 'not-eligible',
+			message: 'pull request was converted back to a draft after the review was approved',
+		};
+	if (state.state !== 'open')
+		return { status: 'not-eligible', message: 'pull request is abandoned' };
+	const refusal = voteRefusal(state, reviewerId);
+	if (refusal) return { status: 'not-eligible', message: refusal };
+	if (state.mergeStatus === 'conflicts')
+		return { status: 'not-ready', message: 'pull request has merge conflicts' };
+
+	try {
+		await completeAzureDevOpsPullRequest(repo, pullRequestId, approvedHeadSha);
+	} catch (error) {
+		return classifyAzureDevOpsCompletionError(error);
+	}
+	return awaitAzureDevOpsCompletion(repo, pullRequestId);
+}
 
 export class AzureDevOpsSCMIntegration implements SCMProvider {
 	readonly type = 'azure-devops' as const;
@@ -267,26 +434,94 @@ export class AzureDevOpsSCMIntegration implements SCMProvider {
 	}
 
 	// ==========================================================================
-	// Deferred: comments, delivery, merge — phase 5/6
+	// Writes: threads, delivery, merge — phase 5/6, in `./writes.ts`
 	// ==========================================================================
 
-	async commentOnPullRequest(): Promise<number> {
-		notImplementedYet('commentOnPullRequest', WRITE_PHASE);
+	/**
+	 * {@link SCMProvider.commentOnPullRequest} — a new comment thread on the pull
+	 * request as `persona`, returning the id of the comment it was created with
+	 * (`./writes.ts`). The out-of-band path for the worker's
+	 * stalled-job safety net. Defaults to the **implementer** for the same reason the
+	 * other adapters do: a comment triggers no pipeline phase, so the persona choice
+	 * is immaterial to loop prevention.
+	 */
+	async commentOnPullRequest(
+		project: ProjectConfig,
+		prNumber: number,
+		body: string,
+		persona: ScmPersona = 'implementer',
+	): Promise<number> {
+		return this.withPersonaCredentials(project, persona, () =>
+			postAzureDevOpsPullRequestThread(project.repo, prNumber, body),
+		);
 	}
 
-	async deliveryProvider(): Promise<ScmDeliveryProvider> {
-		notImplementedYet('deliveryProvider', WRITE_PHASE);
+	/**
+	 * {@link ScmMergeProvider.mergePullRequest} for Azure DevOps: complete an
+	 * approved, ready pull request as the **implementer**, pinned to
+	 * `approvedHeadSha` ({@link mergeReadyAzureDevOpsPullRequest}). Whether the
+	 * approval still stands is read off the **reviewer persona's** own vote, so its
+	 * identity is resolved first. Never throws: every refusal or unexpected failure
+	 * comes back as a non-`merged` {@link MergePullRequestOutcome}, so a completed,
+	 * already-submitted Review can't be retroactively failed by this call.
+	 */
+	async mergePullRequest(
+		project: ProjectConfig,
+		prNumber: number,
+		approvedHeadSha: string,
+	): Promise<MergePullRequestOutcome> {
+		try {
+			const { reviewer } = await resolveAzureDevOpsPersonaIdentities(project);
+			return await this.withPersonaCredentials(project, 'implementer', () =>
+				mergeReadyAzureDevOpsPullRequest(project.repo, prNumber, approvedHeadSha, reviewer),
+			);
+		} catch (error) {
+			// Identity and token resolution run *outside* the recheck's own try/catch,
+			// so an unconfigured persona would otherwise be the one way this throws.
+			return { status: 'provider-error', message: errorMessage(error) };
+		}
 	}
 
-	async operatorDeliveryProvider(): Promise<ScmDeliveryProvider> {
-		notImplementedYet('operatorDeliveryProvider', WRITE_PHASE);
+	/**
+	 * {@link ScmMergeProvider.updatePullRequestBranch} for Azure DevOps — a
+	 * **declared** `unsupported`, not a gap, on Bitbucket's rationale: Azure's REST
+	 * API has no operation that merges the target branch into a pull request's source
+	 * branch pinned to an expected head. Doing it through a git push would make SWARM
+	 * the author of an unreviewed merge commit with nothing to prove it was built from
+	 * the reviewed head. Answering `unsupported` makes the merge dispatch refuse a
+	 * stale head visibly instead — the safe half of the guarantee.
+	 */
+	async updatePullRequestBranch(
+		project: ProjectConfig,
+		prNumber: number,
+		_expectedHeadSha: string,
+	): Promise<UpdatePullRequestBranchOutcome> {
+		return {
+			status: 'unsupported',
+			message: `Azure DevOps exposes no way to merge the target branch into pull request !${prNumber} of ${project.repo} pinned to its reviewed head, so its head cannot be brought up to date automatically`,
+		};
 	}
 
-	async mergePullRequest(): Promise<MergePullRequestOutcome> {
-		notImplementedYet('mergePullRequest', WRITE_PHASE);
+	/**
+	 * {@link SCMProvider.deliveryProvider} — the same-host, per-persona delivery seam.
+	 * The persona's PAT is resolved once and bound to every operation; the account it
+	 * authenticates as is the commit identity and the identity a verdict's vote is
+	 * cast as (`./operator-delivery.ts`).
+	 */
+	async deliveryProvider(
+		project: ProjectConfig,
+		persona: ScmPersona,
+	): Promise<ScmDeliveryProvider> {
+		const token = await getAzureDevOpsToken(project, persona);
+		return createAzureDevOpsDeliveryProvider(project.repo, token, { reviews: true });
 	}
 
-	async updatePullRequestBranch(): Promise<UpdatePullRequestBranchOutcome> {
-		notImplementedYet('updatePullRequestBranch', WRITE_PHASE);
+	/**
+	 * {@link SCMProvider.operatorDeliveryProvider} — operator-credential delivery for
+	 * DB-free workers. The worker supplies its own PAT, so no project secret-store
+	 * lookup is involved.
+	 */
+	async operatorDeliveryProvider(repo: string, credential: string): Promise<ScmDeliveryProvider> {
+		return createAzureDevOpsOperatorDeliveryProvider(repo, credential);
 	}
 }

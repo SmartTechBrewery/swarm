@@ -6,6 +6,7 @@ import {
 } from '@/integrations/scm/azure-devops/client.js';
 import {
 	BUILD_SCAN_LIMIT,
+	findActiveAzureDevOpsPullRequest,
 	getAzureDevOpsBranchHead,
 	getAzureDevOpsCommitChecks,
 	getAzureDevOpsPullRequest,
@@ -177,17 +178,24 @@ describe('azure devops pull-request reads', () => {
 					{ id: 'guid-rev', vote: 10, isRequired: true },
 					{ id: 'guid-other', vote: -10, isRequired: false },
 				],
+				mergeStatus: 'succeeded',
+				mergeCommitSha: null,
 			});
 		});
 
-		it('reads a completed pull request as merged and closed', async () => {
+		it('reads a completed pull request as merged and closed, with its merge commit', async () => {
 			fetchMock.mockResolvedValue(
-				jsonResponse(createMockAzureDevOpsPullRequestResponse({ status: 'completed' })),
+				jsonResponse(
+					createMockAzureDevOpsPullRequestResponse({
+						status: 'completed',
+						lastMergeCommit: { commitId: OTHER_SHA },
+					}),
+				),
 			);
 
 			await expect(
 				scoped(() => getAzureDevOpsPullRequestMergeState(REPO, 17)),
-			).resolves.toMatchObject({ merged: true, state: 'closed' });
+			).resolves.toMatchObject({ merged: true, state: 'closed', mergeCommitSha: OTHER_SHA });
 		});
 
 		it('throws when the head commit is not populated yet', async () => {
@@ -198,6 +206,35 @@ describe('azure devops pull-request reads', () => {
 			await expect(scoped(() => getAzureDevOpsPullRequestMergeState(REPO, 17))).rejects.toThrow(
 				/missing required fields/,
 			);
+		});
+	});
+
+	describe('findActiveAzureDevOpsPullRequest', () => {
+		it('looks the branch up by its exact source ref among active pull requests', async () => {
+			fetchMock.mockResolvedValue(
+				jsonResponse({ count: 1, value: [createMockAzureDevOpsPullRequestResponse()] }),
+			);
+
+			await expect(
+				scoped(() => findActiveAzureDevOpsPullRequest(REPO, 'swarm/issue-17')),
+			).resolves.toEqual({
+				number: 17,
+				url: 'https://dev.azure.com/Fabrikam/Fiber%20Team/_git/Web/pullrequest/17',
+			});
+			const url = requestedUrl(fetchMock);
+			expect(url.pathname).toBe(`${REPO_API}/pullrequests`);
+			expect(url.searchParams.get('searchCriteria.sourceRefName')).toBe(
+				'refs/heads/swarm/issue-17',
+			);
+			expect(url.searchParams.get('searchCriteria.status')).toBe('active');
+		});
+
+		it('answers undefined when the branch has no active pull request', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ count: 0, value: [] }));
+
+			await expect(
+				scoped(() => findActiveAzureDevOpsPullRequest(REPO, 'swarm/issue-17')),
+			).resolves.toBeUndefined();
 		});
 	});
 

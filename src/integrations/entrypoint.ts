@@ -14,7 +14,7 @@
  * (ai/CODING_STANDARDS.md "Module shape for a provider").
  *
  * This imports each provider index directly. A `src/integrations/<kind>/index.ts`
- * barrel (mirroring Cascade's) is still deferred: with seven imports the list is
+ * barrel (mirroring Cascade's) is still deferred: with eight imports the list is
  * shorter than the barrel that would front it, and each line's comment is where
  * a reader learns which providers actually carry traffic — a distinction an
  * aggregate would hide.
@@ -47,6 +47,10 @@ import './scm/bitbucket/index.js';
 // since issue #619, the way #618 did it for Bitbucket: routable from `project.scm`
 // and served at `/gitlab/webhook`. All three registered providers now carry traffic.
 import './scm/gitlab/index.js';
+// SCM: Azure DevOps (issue #1089, contract complete as of its phase 5/6). Registered
+// but **not** runtime-ready: no project routes to it and `/azure-devops/webhook` is
+// not served until phase 6/6 declares it ready.
+import './scm/azure-devops/index.js';
 
 /**
  * Explicit no-op for call sites that want registration to be visible rather than

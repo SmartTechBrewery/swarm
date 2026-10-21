@@ -14,7 +14,11 @@
  * contract over four phases while registering nothing, precisely so it could not
  * claim an exemption from the no-stub assertion, and registered in its phase 4/4
  * together with the last stub's removal; issue #619 then declared it runtime-ready.
- * A fourth provider adds a manifest to the list below and inherits every assertion
+ * **So has the fourth.** Azure DevOps (issue #1089) took GitLab's route: phases 1–4
+ * built its contract with nothing registered, and phase 5/6 landed its manifest
+ * together with the last stub's removal — with its own fixture below and no
+ * exemption — while still `runtimeReady: false` until phase 6/6 serves its route.
+ * A fifth provider adds a manifest to the list below and inherits every assertion
  * unchanged.
  */
 
@@ -73,7 +77,12 @@ const manifests = listSCMProviders();
 
 describe('SCM provider conformance', () => {
 	it('registers every provider the suite runs over', () => {
-		expect(manifests.map((manifest) => manifest.id)).toEqual(['github', 'bitbucket', 'gitlab']);
+		expect(manifests.map((manifest) => manifest.id)).toEqual([
+			'github',
+			'bitbucket',
+			'gitlab',
+			'azure-devops',
+		]);
 	});
 
 	it('gives every provider a unique id', () => {
@@ -88,7 +97,8 @@ describe('SCM provider conformance', () => {
 	// unchanged in spirit: this list is the exhaustive set of providers declared ready
 	// to carry traffic, so a fourth provider flipping its flag has to update it
 	// deliberately — in the issue that serves that provider's ingress route — rather
-	// than as a side effect of unrelated work.
+	// than as a side effect of unrelated work. Azure DevOps is registered but absent
+	// here on purpose: its route is served by issue #1089's phase 6/6.
 	it('declares exactly the providers that have been made runtime-reachable', () => {
 		expect(manifests.filter(isRuntimeReadySCMProvider).map((m) => m.id)).toEqual([
 			'github',
@@ -157,12 +167,19 @@ describe('SCM provider conformance', () => {
 			});
 		}
 
-		// The two "selected but unusable" throws have no real manifest to run against any
-		// more: `ScmType` is a closed enum, so an unregistered id cannot even be put on a
-		// `ProjectConfig`, and every registered provider carries traffic since issue #619.
-		// Both stay asserted against fake manifests in `registry.test.ts` ('throws naming
-		// the project and the selected id when that provider is not registered' and
-		// 'throws when the selected provider is registered but not runtime-ready').
+		// The "not registered" throw has no real manifest to run against: `ScmType` is a
+		// closed enum, so an unregistered id cannot even be put on a `ProjectConfig`. It
+		// stays asserted against fake manifests in `registry.test.ts`. The "registered but
+		// not runtime-ready" one has a real manifest again since Azure DevOps registered
+		// (issue #1089 phase 5/6) ahead of its served route — and it must refuse, never
+		// fall back to another provider.
+		it('refuses a project selecting the registered-but-not-ready azure-devops', () => {
+			expect(() =>
+				requireProjectSCMProvider(
+					createMockProjectConfig({ scm: 'azure-devops', repo: 'fabrikam/proj/web' }),
+				),
+			).toThrow(/selects 'azure-devops', which is registered but not runtime-ready/);
+		});
 
 		// The migration issue #618 created: the sole-runtime-ready fallback stopped
 		// resolving the moment Bitbucket became the second ready provider, so an
@@ -172,8 +189,9 @@ describe('SCM provider conformance', () => {
 		it('tells an unmigrated project to set scm rather than picking a provider for it', () => {
 			const unmigrated = createMockProjectConfig();
 			expect(unmigrated.scm).toBeUndefined();
+			// Four registered, three ready: Azure DevOps is not offered as a choice.
 			expect(() => requireProjectSCMProvider(unmigrated)).toThrow(
-				/it selects no provider and 3 of 3 registered are runtime-ready/,
+				/it selects no provider and 3 of 4 registered are runtime-ready/,
 			);
 			expect(() => requireProjectSCMProvider(unmigrated)).toThrow(
 				/set "scm" on the project config to one of: github, bitbucket, gitlab/,
