@@ -12,13 +12,13 @@
  * (`./scm-integration.ts`) is what turns a refusal into an outcome, and it needs the
  * status.
  *
- * ## A comment is a thread, and the thread id is the neutral id
+ * ## A comment is a thread, and its comment id is the neutral id
  *
  * Azure DevOps has no free-standing pull-request comment: every comment lives in a
- * thread, and a top-level comment is a new thread holding one comment. Comment ids
- * are **thread-scoped** — a thread's first comment is always id `1` — so the
- * neutral comment / review id this module returns is the **thread id**, the only
- * number that identifies one write within the pull request.
+ * thread, and a top-level comment is a new thread holding one comment. The neutral
+ * comment / review id this module returns is that **comment's** id — Azure
+ * documents comment ids as unique within the pull request — not the id of the
+ * thread around it.
  *
  * ## The delivery marker is the idempotency anchor
  *
@@ -75,15 +75,18 @@ export const AZURE_DEVOPS_REVIEW_VOTES = {
 /** One pull-request thread, as Azure returns and lists it. */
 interface AzureDevOpsThread {
 	id?: number;
-	comments?: Array<{
-		id?: number;
-		content?: string;
-		/**
-		 * `text` | `system` | `codeChange` — Azure's own activity entries ("updated the
-		 * pull request status", "voted") are comments too, and they quote what changed.
-		 */
-		commentType?: string;
-	}> | null;
+	comments?: AzureDevOpsThreadComment[] | null;
+}
+
+/** One comment of a {@link AzureDevOpsThread}. */
+interface AzureDevOpsThreadComment {
+	id?: number;
+	content?: string;
+	/**
+	 * `text` | `system` | `codeChange` — Azure's own activity entries ("updated the
+	 * pull request status", "voted") are comments too, and they quote what changed.
+	 */
+	commentType?: string;
 }
 
 function pullRequestPath(repo: string, pullRequestId: number): string {
@@ -91,7 +94,8 @@ function pullRequestPath(repo: string, pullRequestId: number): string {
 }
 
 /**
- * Post a new top-level comment thread on a pull request, returning the thread id.
+ * Post a new top-level comment thread on a pull request, returning the id of the
+ * comment it was created with.
  *
  * The content goes out verbatim — appending the SWARM attribution footer is the
  * caller's job, exactly as for the other providers' comment writes, because a body
@@ -110,16 +114,17 @@ export async function postAzureDevOpsPullRequestThread(
 			status: 'active',
 		},
 	);
-	if (thread.id === undefined) {
+	const commentId = thread.comments?.[0]?.id;
+	if (commentId === undefined) {
 		throw new Error(
-			`Azure DevOps accepted a thread on ${repo}!${pullRequestId} but returned no thread id`,
+			`Azure DevOps accepted a thread on ${repo}!${pullRequestId} but returned no comment id`,
 		);
 	}
-	return thread.id;
+	return commentId;
 }
 
 /**
- * The id of the thread on `pullRequestId` carrying `marker`, or `undefined` when
+ * The id of the comment on `pullRequestId` carrying `marker`, or `undefined` when
  * this delivery hasn't posted yet. The threads endpoint answers every thread of the
  * pull request in one response — it is not paged.
  *
@@ -127,7 +132,7 @@ export async function postAzureDevOpsPullRequestThread(
  * threads too, and one that quotes a comment's text would otherwise let a retry
  * return an id it never created and leave the real body unposted.
  */
-async function findMarkedThread(
+async function findMarkedComment(
 	repo: string,
 	pullRequestId: number,
 	marker: string,
@@ -136,16 +141,16 @@ async function findMarkedThread(
 		'GET',
 		`${pullRequestPath(repo, pullRequestId)}/threads`,
 	);
-	return (listed?.value ?? []).find((thread) =>
-		(thread.comments ?? []).some(
+	return (listed?.value ?? [])
+		.flatMap((thread) => thread.comments ?? [])
+		.find(
 			(comment) => comment.commentType !== SYSTEM_COMMENT_TYPE && comment.content?.includes(marker),
-		),
-	)?.id;
+		)?.id;
 }
 
 /**
  * Post a marker-carrying thread on a pull request **once**: a retried delivery
- * finds the marker from its earlier attempt and returns that thread's id without
+ * finds the marker from its earlier attempt and returns that comment's id without
  * posting again. Azure DevOps twin of GitHub's `postIdempotentPullRequestComment`.
  */
 export async function postIdempotentAzureDevOpsPullRequestThread(
@@ -153,13 +158,13 @@ export async function postIdempotentAzureDevOpsPullRequestThread(
 	input: { pullRequestId: number; body: string; deliveryId: string },
 ): Promise<number> {
 	const marker = deliveryMarker(input.deliveryId);
-	const existing = await findMarkedThread(repo, input.pullRequestId, marker);
+	const existing = await findMarkedComment(repo, input.pullRequestId, marker);
 	if (existing !== undefined) return existing;
 	return postAzureDevOpsPullRequestThread(repo, input.pullRequestId, `${input.body}\n\n${marker}`);
 }
 
 /**
- * Submit a reviewer verdict on a pull request, returning the id of the thread that
+ * Submit a reviewer verdict on a pull request, returning the id of the comment that
  * carries its findings — the neutral review id, since Azure has no review object to
  * take one from (see this module's header).
  *
@@ -197,7 +202,7 @@ export async function submitAzureDevOpsReview(
 	},
 ): Promise<number> {
 	const marker = deliveryMarker(input.deliveryId);
-	const existing = await findMarkedThread(repo, input.pullRequestId, marker);
+	const existing = await findMarkedComment(repo, input.pullRequestId, marker);
 	if (existing !== undefined) return existing;
 	await azureDevOpsRequest<unknown>(
 		'PUT',

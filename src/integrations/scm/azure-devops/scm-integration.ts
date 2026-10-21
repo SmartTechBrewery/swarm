@@ -439,8 +439,8 @@ export class AzureDevOpsSCMIntegration implements SCMProvider {
 
 	/**
 	 * {@link SCMProvider.commentOnPullRequest} — a new comment thread on the pull
-	 * request as `persona`, returning the thread id (Azure's comment ids are
-	 * thread-scoped, `./writes.ts`). The out-of-band path for the worker's
+	 * request as `persona`, returning the id of the comment it was created with
+	 * (`./writes.ts`). The out-of-band path for the worker's
 	 * stalled-job safety net. Defaults to the **implementer** for the same reason the
 	 * other adapters do: a comment triggers no pipeline phase, so the persona choice
 	 * is immaterial to loop prevention.

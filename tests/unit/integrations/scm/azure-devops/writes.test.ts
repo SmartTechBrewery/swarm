@@ -51,9 +51,14 @@ function requestBody(fetchMock: FetchMock, call = 0): unknown {
 	return JSON.parse(String((fetchMock.mock.calls[call]?.[1] as RequestInit | undefined)?.body));
 }
 
-/** A thread listing holding `threads`, each `[threadId, comments]`. */
+/**
+ * A thread listing holding `threads`, each `[threadId, comments]`. A comment's id
+ * defaults to its position in the thread; pass one to give it a distinct id.
+ */
 function threadListing(
-	threads: Array<[id: number, comments: Array<{ content: string; commentType?: string }>]>,
+	threads: Array<
+		[id: number, comments: Array<{ id?: number; content: string; commentType?: string }>]
+	>,
 ): unknown {
 	return {
 		count: threads.length,
@@ -68,6 +73,11 @@ function threadListing(
 	};
 }
 
+/** The POST response for a created thread: thread `threadId` holding comment `commentId`. */
+function createdThread(threadId: number, commentId: number): unknown {
+	return { id: threadId, comments: [{ id: commentId, commentType: 'text' }] };
+}
+
 describe('azure devops pull-request writes', () => {
 	let fetchMock: FetchMock;
 
@@ -77,11 +87,11 @@ describe('azure devops pull-request writes', () => {
 	});
 
 	describe('postAzureDevOpsPullRequestThread', () => {
-		it('posts the content verbatim as a new active thread and returns the thread id', async () => {
-			fetchMock.mockResolvedValue(jsonResponse({ id: 88, comments: [{ id: 1 }] }));
+		it('posts the content verbatim as a new active thread and returns its comment id', async () => {
+			fetchMock.mockResolvedValue(jsonResponse(createdThread(88, 241)));
 
 			await expect(scoped(() => postAzureDevOpsPullRequestThread(REPO, 17, 'hello'))).resolves.toBe(
-				88,
+				241,
 			);
 			expect(requestSequence(fetchMock)).toEqual([['POST', `${PR_PATH}/threads`]]);
 			expect(requestBody(fetchMock)).toEqual({
@@ -90,11 +100,11 @@ describe('azure devops pull-request writes', () => {
 			});
 		});
 
-		it('throws when Azure answers without a thread id', async () => {
-			fetchMock.mockResolvedValue(jsonResponse({ comments: [] }));
+		it('throws when Azure answers without a comment id', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ id: 88, comments: [] }));
 
 			await expect(scoped(() => postAzureDevOpsPullRequestThread(REPO, 17, 'x'))).rejects.toThrow(
-				/returned no thread id/,
+				/returned no comment id/,
 			);
 		});
 	});
@@ -112,9 +122,9 @@ describe('azure devops pull-request writes', () => {
 		it('posts the body with the delivery marker when no thread carries it yet', async () => {
 			fetchMock
 				.mockResolvedValueOnce(jsonResponse(threadListing([[5, [{ content: 'a human' }]]])))
-				.mockResolvedValueOnce(jsonResponse({ id: 6 }));
+				.mockResolvedValueOnce(jsonResponse(createdThread(6, 106)));
 
-			await expect(post()).resolves.toBe(6);
+			await expect(post()).resolves.toBe(106);
 			expect(requestSequence(fetchMock)).toEqual([
 				['GET', `${PR_PATH}/threads`],
 				['POST', `${PR_PATH}/threads`],
@@ -124,12 +134,23 @@ describe('azure devops pull-request writes', () => {
 			});
 		});
 
-		it('returns the earlier thread on a retry instead of posting again', async () => {
+		it('returns the earlier comment on a retry instead of posting again', async () => {
 			fetchMock.mockResolvedValueOnce(
-				jsonResponse(threadListing([[9, [{ content: `summary\n\n${MARKER}` }]]])),
+				jsonResponse(
+					threadListing([
+						[8, [{ id: 108, content: 'a human' }]],
+						[
+							9,
+							[
+								{ id: 207, content: 'an earlier reply' },
+								{ id: 209, content: `summary\n\n${MARKER}` },
+							],
+						],
+					]),
+				),
 			);
 
-			await expect(post()).resolves.toBe(9);
+			await expect(post()).resolves.toBe(209);
 			expect(fetchMock).toHaveBeenCalledTimes(1);
 		});
 
@@ -140,9 +161,9 @@ describe('azure devops pull-request writes', () => {
 						threadListing([[3, [{ content: `edited: ${MARKER}`, commentType: 'system' }]]]),
 					),
 				)
-				.mockResolvedValueOnce(jsonResponse({ id: 4 }));
+				.mockResolvedValueOnce(jsonResponse(createdThread(4, 104)));
 
-			await expect(post()).resolves.toBe(4);
+			await expect(post()).resolves.toBe(104);
 			expect(requestSequence(fetchMock)[1]).toEqual(['POST', `${PR_PATH}/threads`]);
 		});
 	});
@@ -166,9 +187,9 @@ describe('azure devops pull-request writes', () => {
 			fetchMock
 				.mockResolvedValueOnce(jsonResponse(threadListing([])))
 				.mockResolvedValueOnce(jsonResponse({ id: REVIEWER_ID, vote }))
-				.mockResolvedValueOnce(jsonResponse({ id: 21 }));
+				.mockResolvedValueOnce(jsonResponse(createdThread(21, 121)));
 
-			await expect(submit(verdict)).resolves.toBe(21);
+			await expect(submit(verdict)).resolves.toBe(121);
 			expect(requestSequence(fetchMock)).toEqual([
 				['GET', `${PR_PATH}/threads`],
 				['PUT', `${PR_PATH}/reviewers/${REVIEWER_ID}`],
@@ -181,7 +202,7 @@ describe('azure devops pull-request writes', () => {
 			fetchMock
 				.mockResolvedValueOnce(jsonResponse(threadListing([])))
 				.mockResolvedValueOnce(jsonResponse({}))
-				.mockResolvedValueOnce(jsonResponse({ id: 21 }));
+				.mockResolvedValueOnce(jsonResponse(createdThread(21, 121)));
 			await submit('request-changes');
 			expect(requestBody(fetchMock, 2)).toMatchObject({
 				comments: [
@@ -195,7 +216,7 @@ describe('azure devops pull-request writes', () => {
 			fetchMock
 				.mockResolvedValueOnce(jsonResponse(threadListing([])))
 				.mockResolvedValueOnce(jsonResponse({}))
-				.mockResolvedValueOnce(jsonResponse({ id: 22 }));
+				.mockResolvedValueOnce(jsonResponse(createdThread(22, 122)));
 			await submit('approve');
 			expect(requestBody(fetchMock, 2)).toMatchObject({
 				comments: [{ content: `findings\n\n${MARKER}` }],
@@ -204,10 +225,10 @@ describe('azure devops pull-request writes', () => {
 
 		it('neither re-votes nor re-posts once the findings thread exists', async () => {
 			fetchMock.mockResolvedValueOnce(
-				jsonResponse(threadListing([[30, [{ content: `findings\n\n${MARKER}` }]]])),
+				jsonResponse(threadListing([[30, [{ id: 130, content: `findings\n\n${MARKER}` }]]])),
 			);
 
-			await expect(submit('approve')).resolves.toBe(30);
+			await expect(submit('approve')).resolves.toBe(130);
 			expect(fetchMock).toHaveBeenCalledTimes(1);
 		});
 
@@ -224,8 +245,8 @@ describe('azure devops pull-request writes', () => {
 			fetchMock
 				.mockResolvedValueOnce(jsonResponse(threadListing([])))
 				.mockResolvedValueOnce(jsonResponse({}))
-				.mockResolvedValueOnce(jsonResponse({ id: 40 }));
-			await expect(submit('approve')).resolves.toBe(40);
+				.mockResolvedValueOnce(jsonResponse(createdThread(40, 140)));
+			await expect(submit('approve')).resolves.toBe(140);
 			expect(requestSequence(fetchMock).map(([method]) => method)).toEqual(['GET', 'PUT', 'POST']);
 		});
 	});
