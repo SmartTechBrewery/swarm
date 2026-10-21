@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { jobContinuesPreservedCheckout } from '@/dispatch/preserved-worker.js';
+import {
+	jobContinuesPreservedCheckout,
+	preservedCheckoutMachineUnknown,
+} from '@/dispatch/preserved-worker.js';
 import { createMockPmWebhookJob, createMockScmWebhookJob } from '../../helpers/factories.js';
 
 // Issue #567. The predicate that decides whether a dispatch must be pinned to the
@@ -45,5 +48,25 @@ describe('jobContinuesPreservedCheckout', () => {
 				createMockPmWebhookJob({ recoveryMode: 'fresh', resumeSession: true }),
 			),
 		).toBe(false);
+	});
+});
+
+// Issue #954's "machine unknown" verdict, shared by the worker's pin read and
+// "Retry now" (issue #1101) so the two can never disagree about a row.
+describe('preservedCheckoutMachineUnknown', () => {
+	it('is true when the run bound a machine but recorded no pin', () => {
+		expect(preservedCheckoutMachineUnknown({ workerId: 'w', recovery: null })).toBe(true);
+		expect(preservedCheckoutMachineUnknown({ workerId: 'w', recovery: {} })).toBe(true);
+	});
+
+	it('is false when the run records the machine holding the checkout', () => {
+		expect(
+			preservedCheckoutMachineUnknown({ workerId: 'w', recovery: { preservedWorkerId: 'w' } }),
+		).toBe(false);
+	});
+
+	it('is false for a run that never bound a machine, or no run at all', () => {
+		expect(preservedCheckoutMachineUnknown({ workerId: null, recovery: null })).toBe(false);
+		expect(preservedCheckoutMachineUnknown(undefined)).toBe(false);
 	});
 });

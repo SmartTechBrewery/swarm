@@ -223,6 +223,7 @@ import {
 } from '@/dispatch/dispatcher.js';
 import { ForceReReviewError, forceReReview } from '@/dispatch/force-re-review.js';
 import { ITEM_ACTIVITY_LOOKBACK_MS, ITEM_STALL_AFTER_MS } from '@/dispatch/item-liveness.js';
+import { jobContinuesPreservedCheckout } from '@/dispatch/preserved-worker.js';
 import { RunResetError, resetRun } from '@/dispatch/run-reset.js';
 import type { ProjectMembership, ProjectRole } from '@/identity/membership.js';
 import { getMembership, listAccessibleProjectIds } from '@/identity/membership-service.js';
@@ -2771,6 +2772,126 @@ describe('runsRouter', () => {
 				projectId: 'p1',
 				taskId: '103',
 				phase: 'implementation',
+			});
+		});
+
+		// Issue #1101, live 2026-10-21: a respond-to-review run failed at delivery and kept
+		// the agent's Tier 2 checkpoint, a stored `recoveryMode: 'checkpoint'` from its
+		// earlier continuation, `recovery = NULL` and a bound `worker_id`. "Retry now"
+		// inherited the stored mode, so the dispatch continued a checkout on a machine the
+		// run never recorded, and the gate parked it on `worker-authorization` for good.
+		describe('a preserved checkout whose machine is not recorded (issue #1101)', () => {
+			const STORED_SESSION = 'a1b2c3d4-0000-0000-0000-000000000000';
+			const unrecordedFailedRun = (overrides: Partial<RunRow> = {}) =>
+				makeRun({
+					id: 'run-1',
+					status: 'failed',
+					phase: 'respond-to-review',
+					checkpoint: CHECKPOINT,
+					recovery: null,
+					workerId: 'worker-a',
+					jobPayload: {
+						...SCM_PAYLOAD,
+						recoveryMode: 'checkpoint',
+						agentSessionId: STORED_SESSION,
+					},
+					...overrides,
+				});
+
+			it('restarts a failed run instead of dispatching a continuation no worker can take', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(unrecordedFailedRun());
+				vi.mocked(getActiveDispatchByRunId).mockResolvedValue(undefined);
+				vi.mocked(createAndPublishDispatch).mockResolvedValue({
+					dispatch: makeDispatch(),
+					created: true,
+				});
+
+				await expect(caller.retryNow({ runId: 'run-1' })).resolves.toEqual({
+					runId: 'run-1',
+					status: 'retrying',
+				});
+
+				const [{ jobPayload }] = vi.mocked(createAndPublishDispatch).mock.calls[0];
+				expect(jobPayload.recoveryMode).toBeUndefined();
+				expect(jobPayload.resumeSession).toBeUndefined();
+				expect(jobPayload.resumeDelivery).toBeUndefined();
+				expect(jobPayload.agentSessionId).toEqual(expect.any(String));
+				expect(jobPayload.agentSessionId).not.toBe(STORED_SESSION);
+				expect(jobContinuesPreservedCheckout(jobPayload)).toBe(false);
+			});
+
+			it('un-wedges an already-parked dispatch by reopening it as a restart', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(unrecordedFailedRun());
+				vi.mocked(getActiveDispatchByRunId).mockResolvedValue(
+					makeDispatch({
+						waitReason: 'worker-authorization',
+						jobPayload: { ...SCM_PAYLOAD, recoveryMode: 'checkpoint' },
+					}),
+				);
+				vi.mocked(reopenDispatchForManualRetry).mockResolvedValue(makeDispatch());
+
+				await caller.retryNow({ runId: 'run-1' });
+
+				const [, job] = vi.mocked(reopenDispatchForManualRetry).mock.calls[0];
+				expect(job.recoveryMode).toBeUndefined();
+				expect(jobContinuesPreservedCheckout(job)).toBe(false);
+				expect(createAndPublishDispatch).not.toHaveBeenCalled();
+			});
+
+			it('refuses "Continue now" on a checkpointed run up front, pointing at Reset & restart', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({
+						id: 'run-1',
+						status: 'checkpointed',
+						checkpoint: CHECKPOINT,
+						recovery: null,
+						workerId: 'worker-a',
+					}),
+				);
+				vi.mocked(getActiveDispatchByRunId).mockResolvedValue(makeDispatch());
+
+				await expect(caller.retryNow({ runId: 'run-1' })).rejects.toThrowError(
+					expect.objectContaining({
+						code: 'PRECONDITION_FAILED',
+						message: expect.stringMatching(/no record of which machine.*Reset & restart/s),
+					}),
+				);
+				expect(reopenDispatchForManualRetry).not.toHaveBeenCalled();
+				expect(createAndPublishDispatch).not.toHaveBeenCalled();
+			});
+
+			it('refuses "Resume" on a preserved failed run that recorded no machine', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					unrecordedFailedRun({
+						recovery: { state: 'preserved', agentSessionId: STORED_SESSION },
+						jobPayload: SCM_PAYLOAD,
+					}),
+				);
+				vi.mocked(getActiveDispatchByRunId).mockResolvedValue(undefined);
+
+				await expect(caller.retryNow({ runId: 'run-1' })).rejects.toThrowError(
+					expect.objectContaining({ code: 'PRECONDITION_FAILED' }),
+				);
+				expect(createAndPublishDispatch).not.toHaveBeenCalled();
+			});
+
+			it.each([
+				['the run records the machine', { recovery: { preservedWorkerId: 'worker-a' } }],
+				['the run never bound a machine (unfederated)', { workerId: null }],
+			] as const)('keeps the inherited checkpoint mode when %s', async (_label, overrides) => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					unrecordedFailedRun(overrides as Partial<RunRow>),
+				);
+				vi.mocked(getActiveDispatchByRunId).mockResolvedValue(undefined);
+				vi.mocked(createAndPublishDispatch).mockResolvedValue({
+					dispatch: makeDispatch(),
+					created: true,
+				});
+
+				await caller.retryNow({ runId: 'run-1' });
+
+				const [{ jobPayload }] = vi.mocked(createAndPublishDispatch).mock.calls[0];
+				expect(jobPayload.recoveryMode).toBe('checkpoint');
 			});
 		});
 	});
