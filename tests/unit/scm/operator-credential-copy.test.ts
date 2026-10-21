@@ -33,6 +33,9 @@ describe('operatorCredentialCopyFor', () => {
 		expect(operatorCredentialCopyFor('github')?.credentialType).toBe('Personal Access Token');
 		expect(operatorCredentialCopyFor('bitbucket')?.credentialType).toBe('App Password');
 		expect(operatorCredentialCopyFor('gitlab')?.credentialType).toBe('Access Token');
+		expect(operatorCredentialCopyFor('azure-devops')?.credentialType).toBe(
+			'Azure DevOps Personal Access Token',
+		);
 	});
 
 	// A provider the control plane's registry resolves but this catalogue does not name

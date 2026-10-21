@@ -86,6 +86,58 @@ describe('repoSlugFromRemoteUrl', () => {
 		expect(repoSlugFromRemoteUrl('git@gitlab.com:group/sub/project.git')).toBe('group/sub/project');
 	});
 
+	// Issue #1089: an Azure DevOps remote reads as the `organization/project/repository`
+	// its `ProjectConfig.repo` states, not as the decorated clone path.
+	it.each([
+		['https url', 'https://dev.azure.com/Org/Project/_git/Repo'],
+		['https url with a user', 'https://Org@dev.azure.com/Org/Project/_git/Repo'],
+		['scp-style ssh', 'git@ssh.dev.azure.com:v3/Org/Project/Repo'],
+		['ssh url', 'ssh://git@ssh.dev.azure.com/v3/Org/Project/Repo'],
+		['legacy scp-style ssh', 'Org@vs-ssh.visualstudio.com:v3/Org/Project/Repo'],
+		['legacy ssh url', 'ssh://Org@vs-ssh.visualstudio.com:22/v3/Org/Project/Repo'],
+		['legacy https url', 'https://org.visualstudio.com/Project/_git/Repo'],
+		[
+			'legacy DefaultCollection url',
+			'https://org.visualstudio.com/DefaultCollection/Project/_git/Repo',
+		],
+	])('reads organization/project/repository from an Azure DevOps %s', (_form, url) => {
+		expect(repoSlugFromRemoteUrl(url)).toBe('org/project/repo');
+	});
+
+	it('decodes a percent-encoded Azure DevOps project or repository name', () => {
+		expect(repoSlugFromRemoteUrl('https://dev.azure.com/org/My%20Project/_git/My%20Repo')).toBe(
+			'org/my project/my repo',
+		);
+		expect(repoSlugFromRemoteUrl('git@ssh.dev.azure.com:v3/org/My%20Project/Repo')).toBe(
+			'org/my project/repo',
+		);
+	});
+
+	// Azure's short form for a repository named like its project.
+	it('reads the _git/{repo} short form as the project-named repository', () => {
+		expect(repoSlugFromRemoteUrl('https://dev.azure.com/org/_git/Repo')).toBe('org/repo/repo');
+		expect(repoSlugFromRemoteUrl('https://org.visualstudio.com/_git/Repo')).toBe('org/repo/repo');
+	});
+
+	it('falls back to the plain path for an Azure DevOps host with an unrecognised path', () => {
+		expect(repoSlugFromRemoteUrl('https://dev.azure.com/org/project/repo')).toBe(
+			'org/project/repo',
+		);
+		expect(repoSlugFromRemoteUrl('https://dev.azure.com/org/project/_build/repo')).toBe(
+			'org/project/_build/repo',
+		);
+		expect(repoSlugFromRemoteUrl('git@ssh.dev.azure.com:v2/org/project/repo')).toBe(
+			'v2/org/project/repo',
+		);
+	});
+
+	it('leaves every other host alone, even on Azure-looking paths', () => {
+		expect(repoSlugFromRemoteUrl('git@github.com:v3/swarm.git')).toBe('v3/swarm');
+		expect(repoSlugFromRemoteUrl('https://gitlab.com/group/_git/My%20Repo')).toBe(
+			'group/_git/my%20repo',
+		);
+	});
+
 	it('returns null for an empty or unparseable URL', () => {
 		expect(repoSlugFromRemoteUrl('')).toBeNull();
 		expect(repoSlugFromRemoteUrl('   ')).toBeNull();
@@ -158,6 +210,11 @@ describe('resolveDeclarableOriginRepoSlug', () => {
 		expect(await resolveDeclarableOriginRepoSlug('/checkouts/swarm')).toBe(
 			'smarttechbrewery/swarm',
 		);
+	});
+
+	it('declares an Azure DevOps checkout by its three-segment slug', async () => {
+		gitHandler = () => ({ stdout: 'https://dev.azure.com/Org/Project/_git/Repo\n' });
+		expect(await resolveDeclarableOriginRepoSlug('/checkouts/azure')).toBe('org/project/repo');
 	});
 
 	it('declares nothing when the checkout has no identifiable origin', async () => {

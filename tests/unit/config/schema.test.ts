@@ -14,6 +14,7 @@ import {
 } from '@/config/schema.js';
 import { ANTIGRAVITY_MODEL_SLUGS, resolveModelLaunch } from '@/harness/models.js';
 import { requireGitHubProjectsConfig } from '@/integrations/pm/github-projects/config-schema.js';
+import { SCM_TYPES } from '@/scm/types.js';
 import {
 	createMockJiraProjectConfig,
 	createMockLinearProjectConfig,
@@ -132,6 +133,95 @@ describe('ProjectRecordSchema', () => {
 		expect(() =>
 			ProjectRecordSchema.parse({ ...shared, repositories: [{ repo: 'not-a-slug' }] }),
 		).toThrow(/owner\/repo/);
+	});
+
+	// Issue #1089: the segment count is the provider's, checked against `project.scm`.
+	describe('repository coordinates (issue #1089)', () => {
+		it('accepts an Azure DevOps organization/project/repository', () => {
+			const record = ProjectRecordSchema.parse({
+				...shared,
+				scm: 'azure-devops',
+				repositories: [{ repo: 'Org/My Project/Repo' }],
+			});
+			expect(record.repositories[0]?.repo).toBe('Org/My Project/Repo');
+		});
+
+		it.each([
+			['github'],
+			['bitbucket'],
+			['gitlab'],
+			[undefined],
+		] as const)('rejects three segments on %s, naming the expected format', (scm) => {
+			expect(() =>
+				ProjectRecordSchema.parse({
+					...shared,
+					...(scm ? { scm } : {}),
+					repositories: [{ repo: 'org/project/repo' }],
+				}),
+			).toThrow(/has 3 segments, but .* expects 2: .*\//);
+		});
+
+		it('rejects two segments on Azure DevOps', () => {
+			expect(() =>
+				ProjectRecordSchema.parse({
+					...shared,
+					scm: 'azure-devops',
+					repositories: [{ repo: 'project/repo' }],
+				}),
+			).toThrow(/expects 3: .*organization\/project\/repository/);
+		});
+
+		it('rejects four segments on any provider', () => {
+			expect(() =>
+				ProjectRecordSchema.parse({
+					...shared,
+					scm: 'azure-devops',
+					repositories: [{ repo: 'a/b/c/d' }],
+				}),
+			).toThrow(/organization\/project\/repository/);
+		});
+
+		it('reports a mismatch at the offending entry’s own path', () => {
+			const result = ProjectRecordSchema.safeParse({
+				...shared,
+				scm: 'github',
+				repositories: [{ repo: 'acme/one' }, { repo: 'acme/two/three' }],
+			});
+			expect(result.success).toBe(false);
+			expect(result.error?.issues.map((issue) => issue.path)).toEqual([
+				['repositories', 1, 'repo'],
+			]);
+		});
+
+		it('checks the scoped config’s one repo the same way', () => {
+			expect(createMockProjectConfig({ scm: 'azure-devops', repo: 'org/project/repo' }).repo).toBe(
+				'org/project/repo',
+			);
+			const result = ProjectConfigSchema.safeParse({
+				...createMockProjectConfig(),
+				scm: 'gitlab',
+				repo: 'group/sub/project',
+			});
+			expect(result.success).toBe(false);
+			expect(result.error?.issues.map((issue) => [issue.path, issue.message])).toEqual([
+				[['repo'], expect.stringMatching(/SCM provider 'gitlab' expects 2: "namespace\/project"/)],
+			]);
+		});
+
+		// Nothing registers `azure-devops` yet, so its role check (rule 2) is skipped.
+		it('accepts an azure-devops credentials.scm block', () => {
+			const project = createMockProjectConfig({
+				scm: 'azure-devops',
+				repo: 'org/project/repo',
+				credentials: {
+					scm: { 'azure-devops': { reviewer: 'AZURE_DEVOPS_TOKEN_REVIEWER' } },
+					pm: { 'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' } },
+				},
+			});
+			expect(project.credentials.scm?.['azure-devops']?.reviewer).toBe(
+				'AZURE_DEVOPS_TOKEN_REVIEWER',
+			);
+		});
 	});
 
 	// Issue #684 phase 2 lifted phase 1's one-entry cap: the chosen repository now
@@ -295,8 +385,10 @@ describe('ProjectRecordSchema', () => {
 	// (ai/CODING_STANDARDS.md "Zod is the source of truth").
 	describe('scm discriminator (issue #478)', () => {
 		it('accepts every provider id the contract names', () => {
-			for (const scm of ['github', 'bitbucket', 'gitlab'] as const) {
-				expect(createMockProjectConfig({ scm }).scm).toBe(scm);
+			for (const scm of SCM_TYPES) {
+				// Each in its own repository shape — Azure DevOps addresses one by three segments.
+				const repo = scm === 'azure-devops' ? 'org/project/repo' : 'owner/repo';
+				expect(createMockProjectConfig({ scm, repo }).scm).toBe(scm);
 			}
 		});
 

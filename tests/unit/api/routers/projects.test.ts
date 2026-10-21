@@ -376,6 +376,26 @@ describe('projectsRouter', () => {
 			});
 		});
 
+		// Issue #1089: the write input inherits the record's two-or-three-segment regex
+		// without its per-provider count, so the router checks the count itself.
+		it('refuses a repository the provider does not address that way, writing nothing', async () => {
+			await expect(
+				caller.create({
+					...validProjectInput,
+					scm: 'github',
+					repositories: [{ repo: 'org/project/repo' }],
+				}),
+			).rejects.toThrowError(
+				expect.objectContaining({
+					code: 'BAD_REQUEST',
+					message: expect.stringMatching(/SCM provider 'github' expects 2: "owner\/repo"/),
+				}),
+			);
+
+			expect(resolveInstanceScmCredential).not.toHaveBeenCalled();
+			expect(createProjectWithMemberInDb).not.toHaveBeenCalled();
+		});
+
 		it('strips client-supplied credentials and uses defaults instead', async () => {
 			vi.mocked(createProjectWithMemberInDb).mockResolvedValue(undefined);
 
@@ -1100,6 +1120,57 @@ describe('projectsRouter', () => {
 				const result = await caller.update({ id: 'p1', pm: samePm });
 
 				expect(result.pm).toEqual(samePm);
+				expect(upsertProjectToDb).toHaveBeenCalledTimes(1);
+			});
+		});
+
+		// Issue #1089: checked on a change to either the repositories or the provider,
+		// against the merged record.
+		describe('repository coordinates', () => {
+			const githubProject = { ...existing, scm: 'github' as const };
+
+			it('refuses a three-segment repository on a GitHub project', async () => {
+				vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(githubProject);
+
+				await expect(
+					caller.update({ id: 'p1', repositories: [{ repo: 'org/project/repo' }] }),
+				).rejects.toThrowError(expect.objectContaining({ code: 'BAD_REQUEST' }));
+				expect(upsertProjectToDb).not.toHaveBeenCalled();
+			});
+
+			it('refuses a switch to Azure DevOps while the repositories are still two-segment', async () => {
+				vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(githubProject);
+
+				await expect(caller.update({ id: 'p1', scm: 'azure-devops' })).rejects.toThrowError(
+					expect.objectContaining({
+						code: 'BAD_REQUEST',
+						message: expect.stringMatching(/'jkwiecien\/original' has 2 segments/),
+					}),
+				);
+				expect(upsertProjectToDb).not.toHaveBeenCalled();
+			});
+
+			it('accepts the switch together with three-segment repositories', async () => {
+				vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(githubProject);
+				vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
+
+				const result = await caller.update({
+					id: 'p1',
+					scm: 'azure-devops',
+					repositories: [{ repo: 'org/project/repo' }],
+				});
+
+				expect(result.scm).toBe('azure-devops');
+				expect(upsertProjectToDb).toHaveBeenCalledTimes(1);
+			});
+
+			it('leaves an unrelated edit unaffected', async () => {
+				vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(githubProject);
+				vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
+
+				const result = await caller.update({ id: 'p1', name: 'Renamed' });
+
+				expect(result.name).toBe('Renamed');
 				expect(upsertProjectToDb).toHaveBeenCalledTimes(1);
 			});
 		});

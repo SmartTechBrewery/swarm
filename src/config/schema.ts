@@ -37,8 +37,11 @@ import { PM_TYPES, type PMType } from '../pm/types.js';
 // The Zod mirror of `ScmType`; `../scm/events.js` imports only zod plus a type-only
 // `ScmType`, so this stays a leaf import too.
 import { ScmProviderIdSchema } from '../scm/events.js';
+// The per-provider repository shape — `../scm/repo-coordinates.js` imports nothing at
+// runtime either.
+import { repoCoordinatesIssue } from '../scm/repo-coordinates.js';
 // The value list behind `ScmType` — `../scm/types.js` imports nothing at runtime.
-import { SCM_TYPES } from '../scm/types.js';
+import { SCM_TYPES, type ScmType } from '../scm/types.js';
 import { CUSTOM_PROMPT_MAX_LENGTH, normalizeCustomPrompt } from './custom-prompt.js';
 import { adoptLegacyAutoMerge } from './legacy-auto-merge.js';
 import {
@@ -685,8 +688,18 @@ export const ProjectPmSchema = z.discriminatedUnion('type', [
  * instead would fail `swarm config apply` over a setting that could never have run.
  */
 export const ProjectRepositorySchema = z.object({
-	/** The repository this entry names, as `owner/repo`. */
-	repo: z.string().regex(/^[^/]+\/[^/]+$/, 'Must be in format "owner/repo"'),
+	/**
+	 * The repository this entry names, as `owner/repo` — or, on Azure DevOps,
+	 * `organization/project/repository` (issue #1089). The regex bounds the shape to two
+	 * or three segments; the exact count is the provider's, checked against
+	 * `project.scm` by {@link validateRepositoryCoordinates}.
+	 */
+	repo: z
+		.string()
+		.regex(
+			/^[^/]+\/[^/]+(?:\/[^/]+)?$/,
+			'Must be in format "owner/repo" (or "organization/project/repository" on Azure DevOps)',
+		),
 
 	/**
 	 * The provider-native id a board card carries to claim it for **this**
@@ -768,9 +781,11 @@ export const ProjectRecordBaseSchema = z.object({
 	 * `requireProjectSCMProvider` (`src/integrations/scm/registry.ts`) resolves, and
 	 * the SCM twin of `pm`'s `type` (issue #478). An entry's `repo` is the coordinates
 	 * *this* provider interprets (`owner/repo`, a Bitbucket `workspace/repo_slug`, a
-	 * GitLab `namespace/project`), which is why the discriminator is stated rather than
-	 * inferred from the repo string: there is nothing in a bare `owner/repo` to tell two
-	 * providers apart.
+	 * GitLab `namespace/project`, an Azure DevOps `organization/project/repository`),
+	 * which is why the discriminator is stated rather than inferred from the repo
+	 * string: there is nothing in a bare `owner/repo` to tell two providers apart. The
+	 * segment count is checked against this field
+	 * ({@link validateRepositoryCoordinates}, `src/scm/repo-coordinates.ts`).
 	 *
 	 * **One provider for the whole project**, every repository it owns included: a
 	 * repository states no provider of its own, and a project spanning two is expressed
@@ -1110,6 +1125,40 @@ function validateRepositoryRoutingTokens(
 }
 
 /**
+ * Refuse a repository whose segment count is not the one `project.scm` addresses a
+ * repository by (issue #1089) — three on Azure DevOps, two everywhere else, and two
+ * for a project that names no provider. The count is data in
+ * `src/scm/repo-coordinates.ts`, not a provider branch here (ai/RULES.md §2).
+ *
+ * Two entry points, as the credential refinements serve both schemas: the record form
+ * checks every `repositories[i].repo`, the scoped form its one flattened `repo`.
+ */
+function validateRepositoryCoordinates(
+	project: { scm?: ScmType; repositories: Array<{ repo: string }> },
+	ctx: z.RefinementCtx,
+): void {
+	project.repositories.forEach((entry, index) => {
+		const issue = repoCoordinatesIssue(project.scm, entry.repo);
+		if (issue) {
+			ctx.addIssue({
+				code: z.ZodIssueCode.custom,
+				path: ['repositories', index, 'repo'],
+				message: issue,
+			});
+		}
+	});
+}
+
+/** {@link validateRepositoryCoordinates} for a scoped `ProjectConfig`'s one `repo`. */
+function validateScopedRepositoryCoordinates(
+	project: { scm?: ScmType; repo: string },
+	ctx: z.RefinementCtx,
+): void {
+	const issue = repoCoordinatesIssue(project.scm, project.repo);
+	if (issue) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['repo'], message: issue });
+}
+
+/**
  * A whole project config: {@link ProjectConfigBaseSchema}'s fields, the two legacy
  * credential adoptions, and the two cross-field credential checks. This is what
  * `validateConfig` and every config-parsing call site uses.
@@ -1128,7 +1177,8 @@ export const ProjectConfigSchema = z
 	.preprocess(adoptLegacyPmCredentials, ProjectConfigBaseSchema)
 	.transform(adoptLegacyScmCredentials)
 	.superRefine(validatePmCredentialRoles)
-	.superRefine(validateScmCredentialReferences);
+	.superRefine(validateScmCredentialReferences)
+	.superRefine(validateScopedRepositoryCoordinates);
 
 /**
  * A whole project **record** — {@link ProjectRecordBaseSchema}'s fields plus the same
@@ -1147,6 +1197,7 @@ export const ProjectRecordSchema = z
 	.transform(adoptLegacyScmCredentials)
 	.superRefine(validatePmCredentialRoles)
 	.superRefine(validateScmCredentialReferences)
+	.superRefine(validateRepositoryCoordinates)
 	.superRefine(validateRepositoryRoutingTokens);
 
 export const SwarmConfigSchema = z.object({
