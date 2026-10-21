@@ -42,6 +42,7 @@ export const SCM_OPERATOR_CREDENTIAL_COPY: Record<ScmType, ScmOperatorCredential
 	github: { credentialType: 'Personal Access Token', label: 'Operator PAT' },
 	bitbucket: { credentialType: 'App Password', label: 'Operator App Password' },
 	gitlab: { credentialType: 'Access Token', label: 'Operator Access Token' },
+	'azure-devops': { credentialType: 'Azure DevOps Personal Access Token', label: 'Operator PAT' },
 };
 
 /**

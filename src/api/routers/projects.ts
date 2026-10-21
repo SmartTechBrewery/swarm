@@ -37,6 +37,7 @@ import { getPMProvider } from '../../integrations/pm/registry.js';
 import { getSCMProvider, listInstanceDefaultScmRoles } from '../../integrations/scm/registry.js';
 import { describeError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
+import { repoCoordinatesIssue } from '../../scm/repo-coordinates.js';
 import type { ScmCredentialRole, ScmType } from '../../scm/types.js';
 import {
 	accessibleProjectScope,
@@ -265,6 +266,23 @@ function mergePipelineConfig(
 }
 
 /**
+ * Refuse repositories whose segment count is not the one `scm` addresses a repository
+ * by (issue #1089) — the API twin of the config schema's coordinate refinement.
+ * {@link ProjectWriteInputSchema} derives from the *base* record schema, so it inherits
+ * the two-or-three-segment regex without the per-provider count, and `upsertProjectToDb`
+ * does not parse: without this a GitHub project could be given `a/b/c` here.
+ */
+function assertRepositoryCoordinates(
+	scm: ScmType | undefined,
+	repositories: ReadonlyArray<{ repo: string }>,
+): void {
+	for (const { repo } of repositories) {
+		const message = repoCoordinatesIssue(scm, repo);
+		if (message) throw new TRPCError({ code: 'BAD_REQUEST', message });
+	}
+}
+
+/**
  * Refuse a `pm` update that would move the project onto a provider it cannot actually
  * run on — the server-side half of the switch guarantee (issue #642).
  *
@@ -456,6 +474,9 @@ export const projectsRouter = router({
 		// always submits its explicit picker value, while non-dashboard callers remain
 		// routable instead of creating a project with no SCM provider.
 		const scm: ScmType = input.scm ?? 'github';
+		// First of all, for the same reason as the instance-default check below: a refused
+		// creation does no work at all.
+		assertRepositoryCoordinates(scm, input.repositories);
 		// Issue #778: the instance reviewer credential is an installation-wide requirement,
 		// so a provider declaring an `instanceDefault`-eligible role with nothing stored
 		// refuses creation here — before any row is written, and before the config below is
@@ -531,6 +552,12 @@ export const projectsRouter = router({
 				...existing,
 				...updates,
 			};
+			// Only on a change to either side, as the PM switch check: an ordinary edit is
+			// unaffected, while a three-segment repository on GitHub — or a switch to Azure
+			// DevOps with two-segment repositories still stored — is refused unwritten.
+			if (updates.repositories || updates.scm) {
+				assertRepositoryCoordinates(config.scm, config.repositories);
+			}
 			if (updates.pipeline) {
 				config.pipeline = PipelineConfigSchema.parse(
 					mergePipelineConfig(existing.pipeline, updates.pipeline),

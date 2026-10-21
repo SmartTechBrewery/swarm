@@ -55,8 +55,13 @@ import type { ScmMergeProvider } from './merge.js';
  * from, so the type and the list cannot drift. Needed as a runtime list by the config
  * schema's `credentials.scm` key check (`src/config/schema.ts`), which validates a
  * provider *id* without depending on which provider modules a process imported.
+ *
+ * `azure-devops` is a fourth id named ahead of its provider (issue #1089), exactly as
+ * `gitlab` was during issue #295's build-out: nothing registers it yet, so
+ * `requireProjectSCMProvider` throws its existing "not registered" message for a
+ * project that selects it.
  */
-export const SCM_TYPES = ['github', 'bitbucket', 'gitlab'] as const;
+export const SCM_TYPES = ['github', 'bitbucket', 'gitlab', 'azure-devops'] as const;
 export type ScmType = (typeof SCM_TYPES)[number];
 
 /**
