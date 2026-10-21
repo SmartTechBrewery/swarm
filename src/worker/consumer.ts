@@ -1477,10 +1477,11 @@ async function handleTaskInFlightDeferral(
 
 /**
  * Hand back the review-verdict reservation a Review took before it ran (issue
- * #235), so a phase that reviewed nothing spends no ledger slot. Shared by the two
- * gates that drop a Review before it runs — the automation-label opt-out, and the
- * PR-scoped hold (issue #850) — so the two cannot drift on what a dropped Review
- * owes back.
+ * #235), so a phase that reviewed nothing spends no ledger slot. Shared by the
+ * three gates that drop a Review before it runs — the automation-label opt-out,
+ * the PR-scoped hold (issue #850), and the same-phase duplicate drop
+ * ({@link handBackDuplicateReviewClaims}, issue #1105) — so they cannot drift on
+ * what a dropped Review owes back.
  *
  * Best-effort and logged rather than thrown: the reservation is keyed on the head
  * SHA, so a failed hand-back costs at worst one slot on a commit nothing is going
@@ -1644,6 +1645,43 @@ async function handBackRefusedDispatchClaim(
 	} else if (trigger.phase === 'review') {
 		await releaseUndeliveredReviewClaim(trigger, project);
 	}
+}
+
+/**
+ * Hand back what a Review dropped as a same-phase duplicate *created* (issue
+ * #1105): the PR+SHA dispatch claim and the verdict slot its handler reserved.
+ * Without it the slot stayed `pending` behind a settled dispatch, and a webhook
+ * Review racing the unreviewed-PR sweep's dispatch for the same head ended with
+ * neither running — the sweep's handler found the claim taken — and the PR
+ * unreviewed (`under-control-mobile#115`).
+ *
+ * - **Called after the dispatch settles.** This dispatch already recorded its
+ *   resolution (`task_id`, `phase = 'review'`); until it is terminal,
+ *   `findExecutingDispatchForTask` reports it as an executing Review to whichever
+ *   dispatch takes the freed claim next, which would then be dropped as a
+ *   duplicate in turn. The same "terminal first" rule as the failed-run hand-back.
+ * - **Only a slot this evaluation reserved** (`verdictSlotReserved`). The writer
+ *   answers `reused` for any non-abandoned same-head row, so `reserved` proves
+ *   nothing at this head relied on a slot, and the hand-back restores exactly the
+ *   pre-evaluation state. A `reused` slot may belong to a same-head Review still
+ *   running — a running Review does not refresh its claim, so a sibling event past
+ *   the claim's TTL can reach the reservation — and abandoning it would make that
+ *   Review's verdict write miss and open the head to a duplicate. A reused slot
+ *   this drop leaves behind is `pending` under a settled dispatch, which the
+ *   reservation's own recovery (#857) and the sweep both read as recoverable.
+ *
+ * Both calls are best-effort and never throw. This dispatch never ran, so it
+ * cannot have posted a verdict either.
+ */
+async function handBackDuplicateReviewClaims(
+	trigger: TriggerResult,
+	project: ProjectConfig,
+): Promise<void> {
+	if (trigger.phase !== 'review' || !trigger.verdictSlotReserved) return;
+	await releaseReviewDispatch(
+		buildReviewDispatchKey(project.repo, trigger.prNumber, trigger.headSha),
+	);
+	await abandonReviewReservation(project, trigger.prNumber, trigger.headSha);
 }
 
 /**
@@ -5196,6 +5234,7 @@ export async function processJob(
 			await finalizeRun(job.runId, { status: 'failed', error: reason });
 		}
 		await tryCompleteDispatch(dispatch.id, 'skipped-duplicate');
+		await handBackDuplicateReviewClaims(trigger, project);
 		return { status: 'skipped-in-flight', phase: trigger.phase, taskId: trigger.taskId };
 	}
 	let slot: SlotAcquisition = { acquired: true, tracked: false };

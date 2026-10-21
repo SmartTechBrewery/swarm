@@ -259,6 +259,16 @@ export type TriggerResult =
 			prBranch: string;
 			/** The PR head commit the review is pinned to (`src/pipeline/review.ts`). */
 			headSha: string;
+			/**
+			 * Set only when this evaluation *created* the pull request's verdict slot
+			 * for this head — a `reserved` reservation, not a `reused` one (issue
+			 * #1105). It tells a drop before the phase starts whether the slot is its
+			 * own to hand back: a reused `pending` slot may belong to a same-head
+			 * Review that is still running, and abandoning it would make that
+			 * Review's verdict write miss. Read only by the consumer; never carried
+			 * onto the transport frame.
+			 */
+			verdictSlotReserved?: true;
 	  })
 	| (TriggerResultBase & {
 			phase: 'respond-to-review';

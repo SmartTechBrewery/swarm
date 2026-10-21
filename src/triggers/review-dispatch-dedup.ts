@@ -206,7 +206,9 @@ export async function refreshReviewDispatchClaim(key: string, ttlSec: number): P
  * an already-submitted verdict behind it — and, since issue #1019, a Review run
  * that settled terminally `failed` having delivered nothing. Since issue #1053
  * also a Respond-to-CI run that was cancelled (it never posts a verdict), and a
- * Review or Respond-to-CI dispatch cancelled before its phase started.
+ * Review or Respond-to-CI dispatch cancelled before its phase started. Since
+ * issue #1105 also a Review dropped as a same-phase duplicate after its own
+ * evaluation created the head's verdict slot.
  *
  * The rule all of them share is the only one that matters: **it must NOT be
  * called once a verdict may have been posted.** The agent submits the formal

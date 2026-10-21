@@ -8,6 +8,7 @@ import {
 	completeDispatch,
 	createDispatch,
 	type DispatchRow,
+	failDispatch,
 	getDispatchById,
 	hasActiveDispatchForPullRequest,
 	markDispatchRunning,
@@ -86,6 +87,26 @@ async function seedVerdictOwner(): Promise<string> {
 		source: 'webhook',
 	});
 	return dispatch.id;
+}
+
+/**
+ * Settle a verdict owner without it ever producing a run — the three terminal
+ * shapes a leaked `pending` slot was observed behind (issue #1105).
+ */
+async function settleVerdictOwner(
+	id: string,
+	state: 'completed' | 'failed' | 'cancelled',
+): Promise<void> {
+	if (state === 'cancelled') {
+		expect(await cancelWaitingDispatch(id, 'test: cancelled before it ran')).not.toBeNull();
+		return;
+	}
+	expect(await claimDispatch(id, 'test-owner', 60_000)).not.toBeNull();
+	const settled =
+		state === 'completed'
+			? await completeDispatch(id, 'skipped-duplicate')
+			: await failDispatch(id, 'test: failed before it ran');
+	expect(settled).toBe(true);
 }
 
 /**
@@ -301,8 +322,8 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 				expect(await recoveryDispatches()).toHaveLength(2);
 			});
 
-			// The #856/#857 boundary, asserted rather than assumed: freeing a leaked
-			// reservation is their job; this sweep must never step over a `pending` slot.
+			// Criterion 5, asserted rather than assumed: the sweep never steps over a
+			// *live* `pending` slot — its owner here is a `pending` dispatch, still due to run.
 			it('does not recover while a review is pending at an earlier head', async () => {
 				await reserveReviewVerdict(
 					{ projectId: PROJECT_ID, repository: REPO, prNumber: PR, headSha: 'sha-earlier' },
@@ -312,6 +333,34 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 				await recoverUnreviewedPullRequests();
 
 				expect(await recoveryDispatches()).toHaveLength(0);
+			});
+
+			// Issue #1105: a slot leaked by a dispatch that settled without a Review —
+			// `under-control-mobile#115`'s dropped duplicate, and the `failed`/`cancelled`
+			// relics beside it — must not stall the pull request at any later head.
+			it.each([
+				['completed', HEAD],
+				['completed', 'sha-earlier'],
+				['failed', HEAD],
+				['failed', 'sha-earlier'],
+				['cancelled', HEAD],
+				['cancelled', 'sha-earlier'],
+			] as const)('recovers a pull request whose only pending slot belongs to a %s dispatch, at %s', async (state, headSha) => {
+				const owner = await seedVerdictOwner();
+				await reserveReviewVerdict(
+					{ projectId: PROJECT_ID, repository: REPO, prNumber: PR, headSha },
+					owner,
+				);
+				await settleVerdictOwner(owner, state);
+
+				await recoverUnreviewedPullRequests();
+
+				expect(await recoveryDispatches()).toHaveLength(1);
+				// The sweep writes no ledger rows: freeing the relic is the re-entered
+				// handler's reservation's job (#857, or same-head reuse).
+				expect(await listActiveReviewSlotsForPullRequest(PROJECT_ID, REPO, PR)).toMatchObject([
+					{ ordinal: 1, state: 'pending', headSha, dispatchActive: false },
+				]);
 			});
 
 			it('does not recover a pull request that already has a submitted verdict at this head', async () => {

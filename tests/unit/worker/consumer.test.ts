@@ -6236,6 +6236,104 @@ describe('processJob', () => {
 			});
 		});
 
+		// Issue #1105. A Review dropped behind a same-phase holder used to settle
+		// `skipped-duplicate` with its PR+SHA claim held and its freshly reserved verdict
+		// slot `pending`, so the holder — the unreviewed-PR sweep's own dispatch, its
+		// task/phase preset — found the claim taken and settled `no-trigger`, and
+		// neither ran a Review.
+		describe('a Review dropped as a same-phase duplicate (issue #1105)', () => {
+			const DISPATCH_KEY = `${PROJECT.repo}:17:deadbeef`;
+			const claimNextDispatchAs = (id: string) => {
+				claimDispatchForJob.mockImplementationOnce(async (job: Record<string, unknown>) => ({
+					claimed: true,
+					dispatch: { ...mockDispatchRow(job), id },
+				}));
+			};
+
+			it('hands back the claim and the slot it created, after settling', async () => {
+				findExecutingDispatchForTask.mockResolvedValue({ id: 'other', phase: 'review' });
+
+				const outcome = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning({ ...REVIEW_TRIGGER, verdictSlotReserved: true }),
+				);
+
+				expect(outcome.status).toBe('skipped-in-flight');
+				expect(completeDispatch).toHaveBeenCalledWith('dispatch-1', 'skipped-duplicate');
+				expect(releaseReviewDispatch).toHaveBeenCalledWith(DISPATCH_KEY);
+				expect(abandonReviewVerdict).toHaveBeenCalledTimes(1);
+				expect(abandonReviewVerdict).toHaveBeenCalledWith({
+					projectId: PROJECT.id,
+					repository: PROJECT.repo,
+					prNumber: '17',
+					headSha: 'deadbeef',
+				});
+				// Terminal first: until this dispatch settles it still reads as an executing
+				// Review to whichever dispatch takes the freed claim next.
+				const settled = completeDispatch.mock.invocationCallOrder[0];
+				expect(releaseReviewDispatch.mock.invocationCallOrder[0]).toBeGreaterThan(settled);
+				expect(abandonReviewVerdict.mock.invocationCallOrder[0]).toBeGreaterThan(settled);
+			});
+
+			// A reused slot may belong to a same-head Review that is still running;
+			// abandoning it would make that Review's verdict write miss.
+			it('hands back nothing for a slot it reused', async () => {
+				findExecutingDispatchForTask.mockResolvedValue({ id: 'other', phase: 'review' });
+
+				const outcome = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning(REVIEW_TRIGGER),
+				);
+
+				expect(outcome.status).toBe('skipped-in-flight');
+				expect(completeDispatch).toHaveBeenCalledWith('dispatch-1', 'skipped-duplicate');
+				expect(releaseReviewDispatch).not.toHaveBeenCalled();
+				expect(abandonReviewVerdict).not.toHaveBeenCalled();
+			});
+
+			// Acceptance criterion: the live `under-control-mobile#115` interleaving.
+			it('runs exactly one Review when a webhook and the sweep race for one PR+SHA', async () => {
+				// The PR+SHA claim as the SET-NX it is: the first evaluation to reach it
+				// takes it and reserves a fresh slot, any other declines.
+				const claims = new Set<string>();
+				const registry = createTriggerRegistry();
+				registry.register({
+					name: 'pr-review',
+					description: 'claims the PR+SHA slot, then reserves the verdict slot',
+					matches: () => true,
+					handle: async () => {
+						if (claims.has(DISPATCH_KEY)) return null;
+						claims.add(DISPATCH_KEY);
+						return { ...REVIEW_TRIGGER, verdictSlotReserved: true };
+					},
+				});
+				releaseReviewDispatch.mockImplementationOnce(async (key: string) => {
+					claims.delete(key);
+				});
+
+				// The sweep's dispatch is `leased` with its preset task and phase, so the
+				// webhook dispatch evaluating first finds it as an executing Review.
+				findExecutingDispatchForTask.mockResolvedValueOnce({
+					id: 'sweep-dispatch',
+					phase: 'review',
+				});
+				claimNextDispatchAs('webhook-dispatch');
+				const webhook = await processJob(createMockScmWebhookJob(), registry);
+				expect(webhook.status).toBe('skipped-in-flight');
+
+				// Now the webhook dispatch is terminal and the asker is excluded, so the
+				// sweep's dispatch finds no hold — and the claim free to take.
+				claimNextDispatchAs('sweep-dispatch');
+				const sweep = await processJob(createMockScmWebhookJob(), registry);
+
+				expect(sweep.status).toBe('phase-succeeded');
+				expect(phaseCalls).toHaveLength(1);
+				expect(completeDispatch).toHaveBeenCalledWith('webhook-dispatch', 'skipped-duplicate');
+				expect(completeDispatch).not.toHaveBeenCalledWith('sweep-dispatch', 'no-trigger');
+				expect(abandonReviewVerdict).toHaveBeenCalledTimes(1);
+			});
+		});
+
 		// Issue #761. The executing read above cannot see a Planning dispatch that is
 		// merely *queued* — it owns no checkout — so an Implementation delivery that
 		// arrived while Planning still sat in the queue used to claim first and run

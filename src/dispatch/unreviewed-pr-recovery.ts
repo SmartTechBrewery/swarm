@@ -46,15 +46,23 @@
  *  - the review-verdict ledger, pre-checked here
  *    ({@link classifyReviewLedgerForRecovery}) and decided authoritatively there.
  *
- * **The boundary with #856/#857.** A `pending` slot reads as `review-in-flight`,
- * so a *leaked* reservation still blocks recovery. That is deliberate: a
- * `pending` slot means a Review is in flight, and disturbing one is exactly what
- * this must not do. Telling a live reservation from a leaked one is #856's fix
- * (a `no-trigger` Review settle now hands back both the claim and the
- * reservation) plus #857's durable safety net. The division is clean —
- * **#856/#857 free the slot; this sweep supplies the re-dispatch neither of them
- * provides** — and it leaves this reason-agnostic for every failure that leaves
- * the ledger consistent, which after #856 includes both live shapes above.
+ * **The boundary with #856/#857.** A `pending` slot reads as `review-in-flight`
+ * only while the dispatch that owns it is still due to run — the writer's own
+ * liveness question (#857's `isDispatchActive`), asked through the reader's copy
+ * of it, {@link PullRequestReviewSlot.dispatchActive}, exactly as
+ * `hasReviewInFlightAbove` does. Disturbing a live Review is what this must never
+ * do; a slot whose owner has settled is not one. This used to read *every*
+ * `pending` slot as in flight, on the assumption that #856's hand-backs and
+ * #857's safety net always free a leaked slot — but #857's net runs only inside
+ * the reservation, which the sweep never reached once it had skipped. Issue #1105
+ * is the live shape (`under-control-mobile#115`): a webhook Review dropped as a
+ * duplicate of the sweep's own dispatch left its slot `pending`, and the sweep
+ * then skipped the pull request at every later head, while older relics owned by
+ * `failed` and `cancelled` dispatches sat the same way. So a relic now classifies
+ * `recover`, and the re-entered handler's reservation frees it — abandoning it
+ * at another head (#857), reusing it at this one. **#856/#857 free the slot; this
+ * sweep supplies the re-dispatch neither of them provides**, and no longer waits
+ * for them to have done so first.
  *
  * **The same division covers a superseded approval (issue #1079).** Merge
  * automation stamps an approval whose merge was refused only because the head
@@ -157,7 +165,13 @@ export type LedgerRecoveryVerdict = 'recover' | 'reviewed-at-head' | 'review-in-
  * so the sweep can never reach a conclusion the reservation would contradict.
  * Pure, so it unit-tests without a database.
  *
- * Rule 3 is `isReviewAllowanceSpent` — the writer's own cap arithmetic, called
+ * A `pending` slot blocks only while its owning dispatch is live
+ * (`dispatchActive`, issue #1105): the writer abandons another head's relic
+ * before any cap arithmetic and reuses a same-head one without any, so a relic
+ * at this head is `recover` outright and one at another head falls through to
+ * the cap — where it never counted, since only `submitted` slots do.
+ *
+ * The cap rule is `isReviewAllowanceSpent` — the writer's own cap arithmetic, called
  * rather than copied (issue #1038), so the sweep's judgement cannot drift from
  * `reserveReviewVerdict`'s as the module header requires. It mirrors issue #511
  * exactly: a granted, unconsumed cap override makes a capped pull request
@@ -171,8 +185,14 @@ export function classifyReviewLedgerForRecovery(
 	headSha: string,
 ): LedgerRecoveryVerdict {
 	const sameHead = slots.find((slot) => slot.headSha === headSha);
-	if (sameHead) return sameHead.state === 'submitted' ? 'reviewed-at-head' : 'review-in-flight';
-	if (slots.some((slot) => slot.state === 'pending')) return 'review-in-flight';
+	if (sameHead?.state === 'submitted') return 'reviewed-at-head';
+	if (sameHead?.dispatchActive) return 'review-in-flight';
+	// A relic at this head: the reservation reuses it (re-pointing it at the asking
+	// dispatch) before any cap arithmetic, so neither may this.
+	if (sameHead) return 'recover';
+	if (slots.some((slot) => slot.state === 'pending' && slot.dispatchActive)) {
+		return 'review-in-flight';
+	}
 
 	return isReviewAllowanceSpent(slots) ? 'capped' : 'recover';
 }
@@ -188,10 +208,14 @@ type RecoveryEnqueueOutcome = 'scheduled' | 'already-scheduled' | 'exhausted';
  * row-id: it is the same policy with a simpler, deterministic key set, three rows
  * worst case, and the sweep is single-instance so there is no concurrent-minting
  * problem to solve. `taskId`/`phase` are preset for the Queue read model's
- * benefit (`force-re-review.ts` does the same) and are not a gate —
- * `createDispatch` records no `repository`/`pr_number`, so the row stays
- * invisible to {@link hasActiveDispatchForPullRequest} until the trigger resolves
- * it, and the dedup key is what prevents a same-head duplicate meanwhile.
+ * benefit (`force-re-review.ts` does the same). `createDispatch` records no
+ * `repository`/`pr_number`, so the row stays invisible to
+ * {@link hasActiveDispatchForPullRequest} until the trigger resolves it, and the
+ * dedup key is what prevents a same-head duplicate meanwhile. Once `leased`,
+ * though, the preset columns make it visible to the task in-flight hold, so a
+ * webhook Review racing it is dropped as a same-phase duplicate — which now
+ * hands back the claim and slot it created (issue #1105), letting this
+ * dispatch's handler take the claim and run.
  */
 async function enqueueRecovery(
 	project: ProjectConfig,
