@@ -755,7 +755,10 @@ function joinPaths(output: string): string {
  * the retry budget re-validating a tree nothing between attempts can change. A
  * refusal added here inherits that; keep it going through the same helper.
  */
-export async function validatePreparedTree(cwd: string): Promise<void> {
+export async function validatePreparedTree(
+	cwd: string,
+	options: PreparedTreeOptions = {},
+): Promise<void> {
 	const unresolved = await git(cwd, ['diff', '--name-only', '--diff-filter=U']);
 	if (unresolved)
 		refuseDelivery(
@@ -763,7 +766,7 @@ export async function validatePreparedTree(cwd: string): Promise<void> {
 			"Nothing runs between delivery attempts that could stage them, so this was not retried. Mark each resolved path with 'git add' ('git rm' for a delete/delete conflict), then re-run this phase.",
 		);
 	const status = await git(cwd, ['status', '--porcelain']);
-	if (!status)
+	if (!status && !(await unchangedMergeAllowed(cwd, options)))
 		refuseDelivery(
 			'the phase reported a deliverable result but the working tree holds no changes at all',
 			'Nothing was committed, pushed, or commented; re-run the phase.',
@@ -776,18 +779,42 @@ export async function validatePreparedTree(cwd: string): Promise<void> {
 		);
 }
 
+/** How {@link commitPreparedTree} may relax its refusals for one caller. */
+export interface PreparedTreeOptions {
+	/**
+	 * Commit a pending merge (`MERGE_HEAD` present) even when its tree equals
+	 * `HEAD`'s — a base that advanced only by a change the head already holds, or
+	 * by a commit and its revert (issue #1117). The merge commit is still the whole
+	 * point there: it is what makes the base an ancestor of the head. Without a
+	 * pending merge the ordinary "no changes" refusals stand.
+	 */
+	allowUnchangedMerge?: boolean;
+}
+
+/** Whether a tree with no changes may still be committed, per {@link PreparedTreeOptions}. */
+async function unchangedMergeAllowed(cwd: string, options: PreparedTreeOptions): Promise<boolean> {
+	if (!options.allowUnchangedMerge) return false;
+	try {
+		await git(cwd, ['rev-parse', '--verify', '--quiet', 'MERGE_HEAD']);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 export async function commitPreparedTree(
 	cwd: string,
 	subject: string,
 	identity: { name: string; email: string },
+	options: PreparedTreeOptions = {},
 ): Promise<string> {
-	await validatePreparedTree(cwd);
+	await validatePreparedTree(cwd, options);
 	await git(cwd, ['add', '--all', '--', '.']);
 	// `git add` treats an explicitly named ignored path as an error, even when it
 	// is an exclude pathspec. Unstage hand-off files after adding instead.
 	await git(cwd, ['reset', '--quiet', '--', ...SCRATCH_PATHSPECS]);
 	const staged = await git(cwd, ['diff', '--cached', '--name-only']);
-	if (!staged)
+	if (!staged && !(await unchangedMergeAllowed(cwd, options)))
 		refuseDelivery(
 			'every change in the working tree is a SWARM hand-off artifact, so there is nothing to deliver',
 			'Nothing was committed or pushed; re-run the phase.',
@@ -803,6 +830,20 @@ export async function commitPreparedTree(
 		subject,
 	]);
 	return git(cwd, ['rev-parse', 'HEAD']);
+}
+
+/**
+ * The full object name of the commit `ref` names in this checkout, or `undefined`
+ * when git cannot resolve it to a commit. A provider may spell a SHA abbreviated
+ * (Bitbucket's 12 characters), so an exact compare against git's own output has
+ * to go through this first.
+ */
+export async function resolveCommitSha(cwd: string, ref: string): Promise<string | undefined> {
+	try {
+		return await git(cwd, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]);
+	} catch {
+		return undefined;
+	}
 }
 
 /** The branch's head on `origin`, fetched fresh. */

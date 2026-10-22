@@ -1046,7 +1046,8 @@ async function settleConflictingUpdate(
  * Asked once per approved head (`workerCatchUp.requestedFor`): the first ask
  * parks this dispatch with the attempt budget reset — the update is a new wait,
  * sized like the one after the provider's own update — and every attempt after
- * it, until the result arrives, is an ordinary `not-ready` on that budget. The
+ * it, until the result arrives, is an ordinary `not-ready` on that budget that
+ * does not offer the merge at all ({@link awaitingWorkerBranchUpdate}). The
  * budget is therefore what bounds the wait for a worker that never answers, and
  * this dispatch keeps the merge queue's turn throughout.
  */
@@ -1068,7 +1069,7 @@ async function requestWorkerBranchUpdate(
 				message:
 					requested.result?.status === 'up-to-date'
 						? 'the provider reports the head behind its base, but the SWARM worker that went to update it found the base already merged in'
-						: 'waiting for a SWARM worker to bring the head up to date with the base',
+						: WAITING_FOR_WORKER_UPDATE,
 			},
 		};
 	}
@@ -1173,6 +1174,24 @@ function handedBackBranchUpdate(job: MergeAutomationJob): ProducedBranchUpdate |
 	const catchUp = job.workerCatchUp;
 	if (!catchUp?.result || catchUp.requestedFor !== job.approvedHeadSha) return undefined;
 	return catchUp.result.status === 'up-to-date' ? undefined : catchUp.result;
+}
+
+/** The `not-ready` reason while the worker-side branch update is still out. */
+const WAITING_FOR_WORKER_UPDATE =
+	'waiting for a SWARM worker to bring the head up to date with the base';
+
+/**
+ * Whether the worker-side branch update this dispatch asked for its approved head
+ * has not reported yet. While it has not, the merge is not offered at all: the
+ * worker may already have pushed its merge commit, and a merge capability asked
+ * to merge the approved head would read that commit as a push nobody reviewed —
+ * a terminal `not-eligible` that supersedes the approval and drops the update the
+ * hand-back is about to deliver. A head behind its base cannot merge anyway, so
+ * the wait costs nothing; the attempt budget still bounds it.
+ */
+function awaitingWorkerBranchUpdate(job: MergeAutomationJob): boolean {
+	const catchUp = job.workerCatchUp;
+	return catchUp?.requestedFor === job.approvedHeadSha && !catchUp.result;
 }
 
 /** How often, and how far apart, the hand-back retries a merge dispatch caught mid-attempt. */
@@ -1657,6 +1676,16 @@ export async function processMergeAutomationDispatch(
 	const handedBack = handedBackBranchUpdate(job);
 	if (handedBack) {
 		return applyBranchUpdate(dispatch, job, project, handedBack, attempt, capabilities, 'worker');
+	}
+	if (awaitingWorkerBranchUpdate(job)) {
+		return retryOrExhaust(
+			dispatch,
+			job,
+			project,
+			{ status: 'not-ready', message: WAITING_FOR_WORKER_UPDATE },
+			MERGE_RETRY_EXHAUSTED,
+			attempt,
+		);
 	}
 	const attempted = await attemptMerge(job, project, capabilities);
 	const redFreshChecks = attempted.redFreshChecks;

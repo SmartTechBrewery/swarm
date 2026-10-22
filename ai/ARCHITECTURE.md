@@ -926,16 +926,26 @@ the phase with `mergeCatchUp` on the trigger. The merge dispatch records
 run, and parks `retry-scheduled` with the attempt budget reset to 0 and the
 ordinary 15 s first delay — no comment, no terminal settle, and it keeps the merge
 queue's turn. Every attempt until the result lands is an ordinary `not-ready` on
-that budget, which is what bounds the wait for a worker that never answers (it
-then settles `merge-retry-exhausted`, saying it was waiting on the worker).
+that budget that does not offer the merge at all (`awaitingWorkerBranchUpdate`):
+the worker may already have pushed its commit, and a merge asked for the approved
+head would read that commit as an unreviewed push — a terminal `not-eligible`
+that would throw the update away. The budget is what bounds the wait for a worker
+that never answers (it then settles `merge-retry-exhausted`, saying it was
+waiting on the worker).
 (2) **The pass.** The dispatcher carries only `catchUpOnly: true` on the
 `TaskAssignment`, so the worker runs `runResolveConflictsCatchUp`
-(`src/pipeline/resolve-conflicts.ts`) instead of an agent: assert the checkout
-holds the approved head (`assertCheckoutHoldsHead`), merge the freshly fetched
+(`src/pipeline/resolve-conflicts.ts`) instead of an agent: resolve the approved
+head to git's full spelling (`resolveCommitSha` — Bitbucket dispatches it
+abbreviated to 12 characters), assert the checkout holds it
+(`assertCheckoutHoldsHead`), merge the freshly fetched
 base with `git merge --no-ff --no-commit` (`mergeBaseIntoCheckout`,
 `src/scm/delivery.ts`), and — when clean — re-read the remote branch, commit as the
-implementer through `commitPreparedTree` and push through `pushDeliveredBranch`,
-reporting `updated` with the commit. A merge git cannot complete is aborted and
+implementer through `commitPreparedTree` — with `allowUnchangedMerge`, so a merge
+whose tree equals the head's (a base that advanced by a change the head already
+holds) is still committed — and push through `pushDeliveredBranch`, reporting
+`updated` with the commit in the spelling the head was dispatched in, so the
+re-pinned approval and the review slot pre-claimed for it match the provider's
+own keys. A merge git cannot complete is aborted and
 reported `conflict` with its paths; a branch that is no longer the approved head
 — in the checkout, on the re-read, or as a push refused as diverged — is
 `head-moved`; a head that already contains the base is `up-to-date`. Nothing is

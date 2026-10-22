@@ -515,6 +515,41 @@ describe('resolve-conflicts catch-up (merge automation’s worker-side update, i
 		expect(options.cleanup).toHaveBeenCalledTimes(1);
 	});
 
+	it("treats an abbreviated (Bitbucket 12-char) approved head as the checkout's own head and merges", async () => {
+		const { worktreePath, origin, headSha, baseSha } = makeStaleCheckout();
+		const abbreviated = headSha.slice(0, 12);
+		const options = makeCatchUpOptions(worktreePath, abbreviated, baseSha);
+
+		const { catchUp } = await runResolveConflictsCatchUp(options);
+
+		expect(catchUp.status).toBe('updated');
+		const reported = catchUp.status === 'updated' ? catchUp.headSha : '';
+		const pushed = git(origin, 'rev-parse', `refs/heads/${PR_BRANCH}`).trim();
+		// Reported in the spelling it was dispatched in, naming the commit pushed.
+		expect(reported).toBe(pushed.slice(0, 12));
+		expect(git(worktreePath, 'rev-parse', `${pushed}^1`).trim()).toBe(headSha);
+	});
+
+	it('commits and pushes a clean merge whose tree is unchanged (base advanced by a commit and its revert)', async () => {
+		const { worktreePath, seed, origin, headSha } = makeStaleCheckout();
+		git(seed, 'revert', '--no-edit', 'HEAD');
+		git(seed, 'push', '-q', 'origin', 'main');
+		const baseSha = git(seed, 'rev-parse', 'HEAD').trim();
+		const options = makeCatchUpOptions(worktreePath, headSha, baseSha);
+
+		const { catchUp } = await runResolveConflictsCatchUp(options);
+
+		expect(catchUp.status).toBe('updated');
+		const produced = catchUp.status === 'updated' ? catchUp.headSha : '';
+		expect(git(origin, 'rev-parse', `refs/heads/${PR_BRANCH}`).trim()).toBe(produced);
+		expect(
+			git(worktreePath, 'rev-parse', `${produced}^1`, `${produced}^2`).trim().split('\n'),
+		).toEqual([headSha, baseSha]);
+		expect(git(worktreePath, 'rev-parse', `${produced}^{tree}`).trim()).toBe(
+			git(worktreePath, 'rev-parse', `${headSha}^{tree}`).trim(),
+		);
+	});
+
 	it('aborts and reports a conflicting merge without pushing anything', async () => {
 		const { worktreePath, origin, headSha, baseSha } = makeStaleCheckout(true);
 		const options = makeCatchUpOptions(worktreePath, headSha, baseSha);

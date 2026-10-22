@@ -32,6 +32,7 @@ import {
 	pushDeliveredBranch,
 	readHandoff,
 	remoteBranchHead,
+	resolveCommitSha,
 	resumedDeliveryAgent,
 	type ScmDeliveryProvider,
 	saveDeliveryProgress,
@@ -828,9 +829,9 @@ export async function runResolveConflictsPhase(
  *    head that already contains it is `up-to-date`, and a merge git cannot
  *    complete is aborted and reported as `conflict` — resolving it is the
  *    ordinary Resolve-conflicts run's job, never this one's;
- *  - a clean merge is committed through {@link commitPreparedTree} as the
- *    implementer, after the remote branch is re-read and found still at
- *    `headSha`, and pushed through {@link pushDeliveredBranch} as a
+ *  - a clean merge — even one whose tree equals the head's — is committed
+ *    through {@link commitPreparedTree} as the implementer, after the remote
+ *    branch is re-read and found still at `headSha`, and pushed through {@link pushDeliveredBranch} as a
  *    fast-forward of that head; a push refused because the branch moved
  *    meanwhile is `head-moved` too, so the approval is never carried onto a
  *    commit that is not this one.
@@ -891,9 +892,14 @@ async function catchUpCheckout(
 		message: `branch '${prBranch}' is at ${found}, not the approved head ${headSha}, so SWARM did not merge '${baseBranch}' into it and pushed nothing`,
 	});
 
+	// Compared in git's own spelling: a provider may have dispatched the head
+	// abbreviated (Bitbucket's 12 characters), and an exact compare of that against
+	// a full SHA would read the very same commit as a moved branch. An approved head
+	// git cannot resolve is left as dispatched for the check below to classify.
+	const approvedHead = (await resolveCommitSha(cwd, headSha)) ?? headSha;
 	let held: Awaited<ReturnType<typeof assertCheckoutHoldsHead>>;
 	try {
-		held = await assertCheckoutHoldsHead(cwd, prBranch, headSha);
+		held = await assertCheckoutHoldsHead(cwd, prBranch, approvedHead);
 	} catch (error) {
 		// The approved head was rewritten out of the branch.
 		if (isUnretryableDeliveryFailure(error))
@@ -916,11 +922,14 @@ async function catchUpCheckout(
 	// Asked again on the remote, immediately before anything is built on top of the
 	// head: the checkout was provisioned minutes ago at the earliest.
 	const remote = await remoteBranchHead(cwd, prBranch);
-	if (remote !== headSha) return moved(remote);
+	if (remote !== approvedHead) return moved(remote);
+	// A clean merge whose tree equals the head's (the base advanced only by a change
+	// the head already holds) is still committed: the merge commit is the update.
 	const commitSha = await commitPreparedTree(
 		cwd,
 		mergeCommitSubject(baseBranch, prBranch),
 		delivery.commitIdentity,
+		{ allowUnchangedMerge: true },
 	);
 	try {
 		await pushDeliveredBranch(delivery, cwd, prBranch, commitSha);
@@ -929,5 +938,9 @@ async function catchUpCheckout(
 			return { status: 'head-moved', message: describeError(error) };
 		throw error;
 	}
-	return { status: 'updated', headSha: commitSha };
+	// Reported in the spelling the head was dispatched in, so the approval it is
+	// re-pinned to — and every exact-match key built from it (the review-dispatch
+	// slot, the next catch-up's dedup key) — names it the way the provider does.
+	const spelled = approvedHead.startsWith(headSha) ? commitSha.slice(0, headSha.length) : commitSha;
+	return { status: 'updated', headSha: spelled };
 }

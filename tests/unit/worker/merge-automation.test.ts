@@ -1127,19 +1127,22 @@ describe('processMergeAutomationDispatch: a provider that cannot update a branch
 
 	it('waits on the ordinary budget, asking nothing again, once the update is requested', async () => {
 		const requestMergeCatchUp = vi.fn(async (_input: unknown) => {});
+		const mergePullRequest = mergeReturning(STALE_BASE);
 
 		const outcome = await processMergeAutomationDispatch(
 			mockDispatchRow({ attempt: 2 }),
 			waitingOnWorker(),
 			project,
 			{
-				mergePullRequest: mergeReturning(STALE_BASE),
+				mergePullRequest,
 				updatePullRequestBranch: updateReturning(UNSUPPORTED),
 				requestMergeCatchUp,
 			},
 		);
 
 		expect(requestMergeCatchUp).not.toHaveBeenCalled();
+		// Not offered while the update is out (see the next test for why).
+		expect(mergePullRequest).not.toHaveBeenCalled();
 		expect(lastRetryInput().attempt).toBe(3);
 		expect(updateReviewMergeOutcome).toHaveBeenLastCalledWith('run-1', {
 			status: 'not-ready',
@@ -1148,6 +1151,33 @@ describe('processMergeAutomationDispatch: a provider that cannot update a branch
 			approvedHeadSha: 'deadbeef',
 			advancedFrom: undefined,
 		});
+		expect(outcome.result).toBe('retry-scheduled');
+	});
+
+	it('a head the worker already pushed before the hand-back landed does not settle not-eligible', async () => {
+		const commentOnPullRequest = vi.fn(async (_p: unknown, _n: number, _body: string) => 1);
+		// What the provider would answer for the approved head once the worker's
+		// merge commit is the branch's head.
+		const mergePullRequest = mergeReturning({
+			status: 'not-eligible',
+			message: 'pull request head changed since the reviewed commit',
+		});
+
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow({ attempt: 1 }),
+			waitingOnWorker(),
+			project,
+			{ mergePullRequest, commentOnPullRequest, getPullRequest: prAtHead('worker-merge') },
+		);
+
+		expect(mergePullRequest).not.toHaveBeenCalled();
+		expect(commentOnPullRequest).not.toHaveBeenCalled();
+		expect(completeDispatch).not.toHaveBeenCalled();
+		expect(markReviewVerdictSuperseded).not.toHaveBeenCalled();
+		const input = lastRetryInput();
+		expect(input.attempt).toBe(2);
+		// Still waiting for that same update, so the hand-back can adopt it.
+		expect(input.jobPayload.workerCatchUp).toEqual({ requestedFor: 'deadbeef' });
 		expect(outcome.result).toBe('retry-scheduled');
 	});
 
