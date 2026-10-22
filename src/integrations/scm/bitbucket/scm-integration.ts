@@ -70,6 +70,7 @@ import {
 	getBitbucketPullRequestApprovals,
 	getBitbucketPullRequestMergeState,
 	getBitbucketPullRequestTitle,
+	isBitbucketBaseContainedInHead,
 	listBitbucketPullRequestsForCommit,
 	listOpenBitbucketPullRequestsForBase,
 } from './pull-requests.js';
@@ -150,7 +151,8 @@ function classifyBitbucketDirectMergeError(error: unknown): MergePullRequestOutc
  *
  * Two reads of the same pull request (state, then participant verdicts) rather than
  * one: they are the phase-3 reads the adapter already exposes, and a merge attempt is
- * not a hot path.
+ * not a hot path. A third, the commit-graph staleness read, runs only once both
+ * have passed.
  */
 async function mergeReadyBitbucketPullRequest(
 	workspace: string,
@@ -206,6 +208,30 @@ async function mergeReadyBitbucketPullRequest(
 		return {
 			status: 'not-eligible',
 			message: 'the approving review is no longer in effect — it has since been dismissed',
+		};
+
+	// The approval holds — but the head's builds may have run against a base that
+	// has since moved, so nothing has verified the tree this merge would produce
+	// (issue #874). Bitbucket's pull request does not say whether its head is
+	// behind, so the commit graph decides (issue #1116). Deliberately last, after
+	// every eligibility check above, exactly as on GitHub: a pull request whose
+	// approval no longer holds must report that, and must not spend the read. A
+	// failed read is `provider-error`, never "up to date".
+	let containsBase: boolean;
+	try {
+		containsBase = await isBitbucketBaseContainedInHead(
+			workspace,
+			slug,
+			state.baseBranch,
+			state.headSha,
+		);
+	} catch (error) {
+		return { status: 'provider-error', message: errorMessage(error) };
+	}
+	if (!containsBase)
+		return {
+			status: 'stale-base',
+			message: `pull request head ${state.headSha} is behind its destination branch, so its builds did not build the tree this merge would produce`,
 		};
 
 	try {
@@ -485,11 +511,10 @@ export class BitbucketSCMIntegration implements SCMProvider {
 	 * merge commit to the source branch over git, which this contract deliberately
 	 * does not do — it takes no expected-head parameter, so nothing would keep the
 	 * approval SWARM carries forward pinned to a head SWARM itself produced.
-	 * Bitbucket cannot say whether a head is behind its base either
-	 * ({@link getBitbucketPullRequestMergeState}'s `behindBase`), so in practice this
-	 * answer is only ever reached by a dispatch that learnt of the staleness some
-	 * other way; either way the merge dispatch refuses visibly rather than merging
-	 * on stale evidence.
+	 * Since issue #1116 the merge path detects a head behind its base from the
+	 * commit graph and answers `stale-base`, so this answer is what such a head
+	 * reaches: the merge dispatch refuses it visibly rather than merging on stale
+	 * evidence — the safe half of the guarantee.
 	 */
 	async updatePullRequestBranch(
 		project: ProjectConfig,

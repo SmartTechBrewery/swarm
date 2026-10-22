@@ -13,6 +13,7 @@ import {
 	getGitLabMergeRequestApprovals,
 	getGitLabMergeRequestMergeState,
 	getGitLabMergeRequestTitle,
+	isGitLabBaseContainedInHead,
 	listGitLabMergeRequestsForCommit,
 	listOpenGitLabMergeRequestsForBase,
 } from '@/integrations/scm/gitlab/merge-requests.js';
@@ -275,6 +276,7 @@ describe('gitlab merge-request reads', () => {
 					headSha: HEAD_SHA,
 					changesRequested: false,
 					behindBase: null,
+					baseBranch: 'main',
 				});
 			});
 		}
@@ -322,7 +324,9 @@ describe('gitlab merge-request reads', () => {
 			expect(url.searchParams.get('include_diverged_commits_count')).toBe('true');
 		});
 
-		it('reports a zero divergence count as up to date', async () => {
+		// Not proof of freshness on its own: the merge path verifies a `false`
+		// against the commit graph (issue #1116).
+		it('reports a zero divergence count as not behind', async () => {
 			fetchMock.mockResolvedValue(
 				jsonResponse(createMockGitLabMergeRequestResponse({ diverged_commits_count: 0 })),
 			);
@@ -338,8 +342,63 @@ describe('gitlab merge-request reads', () => {
 			);
 
 			await expect(scoped(() => getGitLabMergeRequestMergeState(REPO, 17))).rejects.toThrow(
-				/carries no sha/,
+				/sha=undefined/,
 			);
+		});
+
+		it('throws rather than reporting a merge state with no target branch', async () => {
+			fetchMock.mockResolvedValue(
+				jsonResponse(createMockGitLabMergeRequestResponse({ target_branch: undefined })),
+			);
+
+			await expect(scoped(() => getGitLabMergeRequestMergeState(REPO, 17))).rejects.toThrow(
+				/target_branch=undefined/,
+			);
+		});
+	});
+
+	// Issue #1116: the commit-graph answer to "is this head behind its base?".
+	describe('isGitLabBaseContainedInHead', () => {
+		it('compares from the head to the target branch through the merge base', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ commits: [] }));
+
+			await scoped(() => isGitLabBaseContainedInHead(REPO, 'release/1.0', HEAD_SHA));
+
+			const url = new URL(requestedUrl(fetchMock));
+			expect(url.pathname).toBe(`/api/v4${PROJECT_PATH}/repository/compare`);
+			expect(Object.fromEntries(url.searchParams)).toEqual({ from: HEAD_SHA, to: 'release/1.0' });
+		});
+
+		it('answers true when the target branch has no commit the head lacks', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ commits: [], diffs: [] }));
+
+			await expect(scoped(() => isGitLabBaseContainedInHead(REPO, 'main', HEAD_SHA))).resolves.toBe(
+				true,
+			);
+		});
+
+		it('answers false when the target branch has commits the head lacks', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ commits: [{ id: BASE_SHA }], diffs: [] }));
+
+			await expect(scoped(() => isGitLabBaseContainedInHead(REPO, 'main', HEAD_SHA))).resolves.toBe(
+				false,
+			);
+		});
+
+		it('throws on a response with no commits rather than reading it as up to date', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({}));
+
+			await expect(
+				scoped(() => isGitLabBaseContainedInHead(REPO, 'main', HEAD_SHA)),
+			).rejects.toThrow(/no commits array/);
+		});
+
+		it('propagates an API error', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ message: '404 Not found' }, 404));
+
+			await expect(
+				scoped(() => isGitLabBaseContainedInHead(REPO, 'main', HEAD_SHA)),
+			).rejects.toBeInstanceOf(GitLabApiError);
 		});
 	});
 

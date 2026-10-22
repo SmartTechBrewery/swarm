@@ -62,6 +62,7 @@ vi.mock('@/integrations/scm/gitlab/merge-requests.js', async (importOriginal) =>
 		findOpenGitLabMergeRequest: vi.fn(actual.findOpenGitLabMergeRequest),
 		getGitLabMergeRequestApprovals: vi.fn(actual.getGitLabMergeRequestApprovals),
 		getGitLabMergeRequestMergeState: vi.fn(actual.getGitLabMergeRequestMergeState),
+		isGitLabBaseContainedInHead: vi.fn(actual.isGitLabBaseContainedInHead),
 	};
 });
 vi.mock('@/integrations/scm/gitlab/writes.js', () => ({
@@ -82,6 +83,7 @@ import {
 	findOpenGitLabMergeRequest,
 	getGitLabMergeRequestApprovals,
 	getGitLabMergeRequestMergeState,
+	isGitLabBaseContainedInHead,
 } from '@/integrations/scm/gitlab/merge-requests.js';
 import { createGitLabOperatorDeliveryProvider } from '@/integrations/scm/gitlab/operator-delivery.js';
 import {
@@ -449,6 +451,7 @@ describe('GitLabSCMIntegration', () => {
 				headSha,
 				changesRequested: false,
 				behindBase: false,
+				baseBranch: 'main',
 			};
 		}
 
@@ -457,9 +460,11 @@ describe('GitLabSCMIntegration', () => {
 			vi.mocked(getGitLabMergeRequestMergeState).mockReset();
 			vi.mocked(getGitLabMergeRequestApprovals).mockReset();
 			vi.mocked(mergeGitLabMergeRequestDirect).mockReset();
+			vi.mocked(isGitLabBaseContainedInHead).mockReset();
 			vi.mocked(getGitLabMergeRequestApprovals).mockResolvedValue([
 				{ state: 'APPROVED', commitId: APPROVED_SHA },
 			]);
+			vi.mocked(isGitLabBaseContainedInHead).mockResolvedValue(true);
 		});
 
 		it('merges as the implementer, pinned to the approved head', async () => {
@@ -637,22 +642,70 @@ describe('GitLabSCMIntegration', () => {
 				status: 'stale-base',
 			});
 			expect(mergeGitLabMergeRequestDirect).not.toHaveBeenCalled();
+			// A positive count is trusted, so it costs no graph read.
+			expect(vi.mocked(isGitLabBaseContainedInHead)).not.toHaveBeenCalled();
 		});
 
-		// "GitLab did not say" is not "behind": an unanswerable divergence count
-		// merges exactly as it did before base freshness existed.
-		it('merges when GitLab reports no divergence count at all', async () => {
-			vi.mocked(getGitLabMergeRequestMergeState).mockResolvedValue({
-				...openAt(APPROVED_SHA),
-				behindBase: null,
-			});
-			vi.mocked(mergeGitLabMergeRequestDirect).mockResolvedValue({
-				merged: true,
-				message: 'merge request merged',
+		// Issue #1116: a zero or absent divergence count is not evidence of
+		// freshness, so the commit graph decides — after every eligibility check.
+		describe('base freshness from the commit graph', () => {
+			for (const behindBase of [false, null]) {
+				it(`merges a head containing its target branch when the count is ${behindBase}`, async () => {
+					vi.mocked(getGitLabMergeRequestMergeState).mockResolvedValue({
+						...openAt(APPROVED_SHA),
+						behindBase,
+						baseBranch: 'release/1.0',
+					});
+					vi.mocked(mergeGitLabMergeRequestDirect).mockResolvedValue({
+						merged: true,
+						message: 'merge request merged',
+					});
+
+					await expect(scm.mergePullRequest(project, 17, APPROVED_SHA)).resolves.toMatchObject({
+						status: 'merged',
+					});
+					expect(vi.mocked(isGitLabBaseContainedInHead)).toHaveBeenCalledWith(
+						'SmartTechBrewery/swarm',
+						'release/1.0',
+						APPROVED_SHA,
+					);
+				});
+
+				it(`answers stale-base for a head missing target commits when the count is ${behindBase}`, async () => {
+					vi.mocked(getGitLabMergeRequestMergeState).mockResolvedValue({
+						...openAt(APPROVED_SHA),
+						behindBase,
+					});
+					vi.mocked(isGitLabBaseContainedInHead).mockResolvedValue(false);
+
+					await expect(scm.mergePullRequest(project, 17, APPROVED_SHA)).resolves.toMatchObject({
+						status: 'stale-base',
+						message: expect.stringContaining('behind its target branch'),
+					});
+					expect(mergeGitLabMergeRequestDirect).not.toHaveBeenCalled();
+				});
+			}
+
+			it('reports a failed graph read as provider-error, never as up to date', async () => {
+				vi.mocked(getGitLabMergeRequestMergeState).mockResolvedValue(openAt(APPROVED_SHA));
+				vi.mocked(isGitLabBaseContainedInHead).mockRejectedValue(
+					new GitLabApiError(500, 'GET', '/repository/compare', 'boom'),
+				);
+
+				await expect(scm.mergePullRequest(project, 17, APPROVED_SHA)).resolves.toMatchObject({
+					status: 'provider-error',
+				});
+				expect(mergeGitLabMergeRequestDirect).not.toHaveBeenCalled();
 			});
 
-			await expect(scm.mergePullRequest(project, 17, APPROVED_SHA)).resolves.toMatchObject({
-				status: 'merged',
+			it('never spends the graph read on an ineligible merge request', async () => {
+				vi.mocked(getGitLabMergeRequestMergeState).mockResolvedValue(openAt(APPROVED_SHA));
+				vi.mocked(getGitLabMergeRequestApprovals).mockResolvedValue([]);
+
+				await expect(scm.mergePullRequest(project, 17, APPROVED_SHA)).resolves.toMatchObject({
+					status: 'not-eligible',
+				});
+				expect(vi.mocked(isGitLabBaseContainedInHead)).not.toHaveBeenCalled();
 			});
 		});
 	});
@@ -725,6 +778,7 @@ describe('GitLabSCMIntegration', () => {
 				headSha: APPROVED_SHA,
 				changesRequested: false,
 				behindBase: false,
+				baseBranch: 'main',
 			});
 			vi.mocked(submitGitLabReview).mockResolvedValue(55);
 			vi.mocked(postIdempotentGitLabMergeRequestNote).mockResolvedValue(42);

@@ -11,6 +11,7 @@ import {
 	getBitbucketPullRequestApprovals,
 	getBitbucketPullRequestMergeState,
 	getBitbucketPullRequestTitle,
+	isBitbucketBaseContainedInHead,
 	listBitbucketPullRequestsForCommit,
 	listOpenBitbucketPullRequestsForBase,
 } from '@/integrations/scm/bitbucket/pull-requests.js';
@@ -190,6 +191,7 @@ describe('bitbucket pull-request reads', () => {
 					draft: false,
 					headSha: 'd3022fc0ca3d',
 					behindBase: null,
+					baseBranch: 'main',
 				});
 			});
 		}
@@ -204,15 +206,76 @@ describe('bitbucket pull-request reads', () => {
 			).resolves.toMatchObject({ draft: true });
 		});
 
-		// Bitbucket Cloud exposes no behind/ahead state at all, so base freshness is
-		// permanently "cannot determine" here (issue #874) — which the merge path
-		// treats exactly as it did before the concept existed.
+		// Bitbucket Cloud exposes no behind/ahead state at all, so the pull request
+		// never answers base freshness (issue #874); the merge path asks the commit
+		// graph instead (issue #1116).
 		it('never claims to know whether the head is behind its base', async () => {
 			fetchMock.mockResolvedValue(jsonResponse(createMockBitbucketPullRequestResponse({})));
 
 			await expect(
 				scoped(() => getBitbucketPullRequestMergeState(WORKSPACE, SLUG, 17)),
 			).resolves.toMatchObject({ behindBase: null });
+		});
+
+		it('throws rather than reporting a merge state with no destination branch', async () => {
+			fetchMock.mockResolvedValue(
+				jsonResponse(createMockBitbucketPullRequestResponse({ destination: {} })),
+			);
+
+			await expect(
+				scoped(() => getBitbucketPullRequestMergeState(WORKSPACE, SLUG, 17)),
+			).rejects.toThrow(/destination\.branch\.name/);
+		});
+	});
+
+	// Issue #1116: the commit-graph answer to "is this head behind its base?".
+	describe('isBitbucketBaseContainedInHead', () => {
+		it('lists base commits the head lacks, one at most, with the branch as a query parameter', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ values: [] }));
+
+			await scoped(() =>
+				isBitbucketBaseContainedInHead(WORKSPACE, SLUG, 'release/1.0', 'd3022fc0ca3d'),
+			);
+
+			const url = new URL(requestedUrl(fetchMock));
+			expect(`${url.origin}${url.pathname}`).toBe(`${REPO_PATH}/commits`);
+			expect(Object.fromEntries(url.searchParams)).toEqual({
+				include: 'release/1.0',
+				exclude: 'd3022fc0ca3d',
+				pagelen: '1',
+			});
+		});
+
+		it('answers true when no base commit is missing from the head', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ values: [] }));
+
+			await expect(
+				scoped(() => isBitbucketBaseContainedInHead(WORKSPACE, SLUG, 'main', 'd3022fc0ca3d')),
+			).resolves.toBe(true);
+		});
+
+		it('answers false when the base has a commit the head lacks', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ values: [{ hash: FULL_SHA }] }));
+
+			await expect(
+				scoped(() => isBitbucketBaseContainedInHead(WORKSPACE, SLUG, 'main', 'd3022fc0ca3d')),
+			).resolves.toBe(false);
+		});
+
+		it('throws on a response with no values rather than reading it as up to date', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({}));
+
+			await expect(
+				scoped(() => isBitbucketBaseContainedInHead(WORKSPACE, SLUG, 'main', 'd3022fc0ca3d')),
+			).rejects.toThrow(/no values array/);
+		});
+
+		it('propagates an API error', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ error: { message: 'Not found' } }, 404));
+
+			await expect(
+				scoped(() => isBitbucketBaseContainedInHead(WORKSPACE, SLUG, 'main', 'd3022fc0ca3d')),
+			).rejects.toBeInstanceOf(BitbucketApiError);
 		});
 	});
 

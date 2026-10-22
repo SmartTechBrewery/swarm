@@ -4,7 +4,9 @@
  * `getAzureDevOpsPullRequest`, `getAzureDevOpsPullRequestTitle`,
  * `getAzureDevOpsPullRequestMergeState`, `getAzureDevOpsBranchHead`,
  * `getAzureDevOpsCommitChecks`, `listAzureDevOpsPullRequestsForCommit`,
- * `listActiveAzureDevOpsPullRequestsForBase`, `findActiveAzureDevOpsPullRequest`.
+ * `listActiveAzureDevOpsPullRequestsForBase`, `findActiveAzureDevOpsPullRequest`,
+ * plus the merge path's commit-graph staleness read,
+ * `isAzureDevOpsBaseContainedInHead`.
  *
  * They live in their own file rather than in `./client.ts` because that module is
  * the credential/transport primitive (token scoping, auth header, error envelope,
@@ -138,6 +140,11 @@ export interface AzureDevOpsPullRequestMergeState {
 	mergeStatus: string | null;
 	/** The commit a completed pull request landed as, or `null` while it has not. */
 	mergeCommitSha: string | null;
+	/**
+	 * The branch the pull request targets, without `refs/heads/`, as Azure reports
+	 * it *now* — the base the commit-graph staleness read compares the head against.
+	 */
+	baseBranch: string;
 }
 
 /** A pull request as the delivery seam names it: its id and its web URL. */
@@ -277,9 +284,9 @@ export async function getAzureDevOpsPullRequestMergeState(
 	const pr = await getPullRequestObject(repo, pullRequestId);
 	const headSha = pr.lastMergeSourceCommit?.commitId;
 	const state = neutralState(pr.status);
-	if (!headSha || !state) {
+	if (!headSha || !state || !pr.targetRefName) {
 		throw new Error(
-			`Azure DevOps pull request ${repo}!${pullRequestId} response is missing required fields (status=${pr.status}, lastMergeSourceCommit=${headSha})`,
+			`Azure DevOps pull request ${repo}!${pullRequestId} response is missing required fields (status=${pr.status}, lastMergeSourceCommit=${headSha}, targetRefName=${pr.targetRefName})`,
 		);
 	}
 	return {
@@ -294,7 +301,47 @@ export async function getAzureDevOpsPullRequestMergeState(
 		),
 		mergeStatus: pr.mergeStatus ?? null,
 		mergeCommitSha: pr.lastMergeCommit?.commitId ?? null,
+		baseBranch: branchName(pr.targetRefName),
 	};
+}
+
+/**
+ * Whether a pull request's head already contains the current head of its target
+ * branch — the commit-graph answer to "is this head behind its base?" (issue
+ * #1116), Azure's twin of GitHub's `isBaseContainedInHead`.
+ *
+ * `GET /diffs/commits` with the head as `baseVersion` (a commit) and the target
+ * branch as `targetVersion` (a branch, resolved to its head at read time) answers
+ * an `aheadCount`/`behindCount` pair. **`aheadCount` counts the commits the
+ * target has that the base lacks** — the 7.1 reference's "between commit IDs"
+ * sample, where the base commit is itself the common commit, answers
+ * `aheadCount: 22, behindCount: 0` — so here it is the number of target-branch
+ * commits missing from the head, and zero means the head contains the base.
+ * `$top=1` because the changed-file list is not read. A response with no numeric
+ * `aheadCount` throws rather than reading as "up to date".
+ */
+export async function isAzureDevOpsBaseContainedInHead(
+	repo: string,
+	baseBranch: string,
+	headSha: string,
+): Promise<boolean> {
+	const query = new URLSearchParams({
+		baseVersion: headSha,
+		baseVersionType: 'commit',
+		targetVersion: baseBranch,
+		targetVersionType: 'branch',
+		$top: '1',
+	});
+	const diff = await azureDevOpsRequest<{ aheadCount?: unknown } | undefined>(
+		'GET',
+		`${repositoryApiPath(repo)}/diffs/commits?${query}`,
+	);
+	if (typeof diff?.aheadCount !== 'number') {
+		throw new Error(
+			`Azure DevOps commit diff of ${repo} (${headSha} against ${baseBranch}) carries no aheadCount`,
+		);
+	}
+	return diff.aheadCount === 0;
 }
 
 /**

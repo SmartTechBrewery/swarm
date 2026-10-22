@@ -12,6 +12,7 @@ import {
 	getAzureDevOpsPullRequest,
 	getAzureDevOpsPullRequestMergeState,
 	getAzureDevOpsPullRequestTitle,
+	isAzureDevOpsBaseContainedInHead,
 	listActiveAzureDevOpsPullRequestsForBase,
 	listAzureDevOpsPullRequestsForCommit,
 } from '@/integrations/scm/azure-devops/pull-requests.js';
@@ -180,6 +181,7 @@ describe('azure devops pull-request reads', () => {
 				],
 				mergeStatus: 'succeeded',
 				mergeCommitSha: null,
+				baseBranch: 'main',
 			});
 		});
 
@@ -206,6 +208,72 @@ describe('azure devops pull-request reads', () => {
 			await expect(scoped(() => getAzureDevOpsPullRequestMergeState(REPO, 17))).rejects.toThrow(
 				/missing required fields/,
 			);
+		});
+
+		it('throws when the target branch is absent', async () => {
+			fetchMock.mockResolvedValue(
+				jsonResponse(createMockAzureDevOpsPullRequestResponse({ targetRefName: undefined })),
+			);
+
+			await expect(scoped(() => getAzureDevOpsPullRequestMergeState(REPO, 17))).rejects.toThrow(
+				/targetRefName=undefined/,
+			);
+		});
+	});
+
+	// Issue #1116: the commit-graph answer to "is this head behind its base?".
+	describe('isAzureDevOpsBaseContainedInHead', () => {
+		it('diffs the head commit against the target branch, skipping the change list', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ aheadCount: 0, behindCount: 2 }));
+
+			await scoped(() => isAzureDevOpsBaseContainedInHead(REPO, 'release/1.0', HEAD_SHA));
+
+			const url = requestedUrl(fetchMock);
+			expect(url.pathname).toBe(`${REPO_API}/diffs/commits`);
+			expect(Object.fromEntries(url.searchParams)).toEqual({
+				baseVersion: HEAD_SHA,
+				baseVersionType: 'commit',
+				targetVersion: 'release/1.0',
+				targetVersionType: 'branch',
+				$top: '1',
+				'api-version': '7.1',
+			});
+		});
+
+		// `aheadCount` counts the target's commits the base lacks; `behindCount` (the
+		// head's own commits) must not decide.
+		it('answers true when the target branch is not ahead of the head', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ aheadCount: 0, behindCount: 5 }));
+
+			await expect(
+				scoped(() => isAzureDevOpsBaseContainedInHead(REPO, 'main', HEAD_SHA)),
+			).resolves.toBe(true);
+		});
+
+		it('answers false when the target branch has commits the head lacks', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ aheadCount: 3, behindCount: 0 }));
+
+			await expect(
+				scoped(() => isAzureDevOpsBaseContainedInHead(REPO, 'main', HEAD_SHA)),
+			).resolves.toBe(false);
+		});
+
+		it('throws on a response with no aheadCount rather than reading it as up to date', async () => {
+			fetchMock.mockResolvedValue(jsonResponse({ behindCount: 0 }));
+
+			await expect(
+				scoped(() => isAzureDevOpsBaseContainedInHead(REPO, 'main', HEAD_SHA)),
+			).rejects.toThrow(/no aheadCount/);
+		});
+
+		it('propagates an API error', async () => {
+			fetchMock.mockResolvedValue(
+				jsonResponse({ message: 'TF401175: not found', typeKey: 'GitItemNotFoundException' }, 404),
+			);
+
+			await expect(
+				scoped(() => isAzureDevOpsBaseContainedInHead(REPO, 'main', HEAD_SHA)),
+			).rejects.toBeInstanceOf(AzureDevOpsApiError);
 		});
 	});
 
