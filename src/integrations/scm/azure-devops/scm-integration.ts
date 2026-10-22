@@ -59,6 +59,7 @@ import {
 	getAzureDevOpsPullRequest,
 	getAzureDevOpsPullRequestMergeState,
 	getAzureDevOpsPullRequestTitle,
+	isAzureDevOpsBaseContainedInHead,
 	listActiveAzureDevOpsPullRequestsForBase,
 	listAzureDevOpsPullRequestsForCommit,
 } from './pull-requests.js';
@@ -194,9 +195,6 @@ async function awaitAzureDevOpsCompletion(
  * would answer with one opaque error into the specific outcomes the merge dispatch
  * needs, and distinguish "the approval no longer holds" (never retry) from "not
  * ready yet" (retry).
- *
- * There is no `stale-base` check: Azure reports no "behind its target" count on the
- * pull request, so — like Bitbucket — a head behind its base merges as before.
  */
 async function mergeReadyAzureDevOpsPullRequest(
 	repo: string,
@@ -235,6 +233,25 @@ async function mergeReadyAzureDevOpsPullRequest(
 	if (refusal) return { status: 'not-eligible', message: refusal };
 	if (state.mergeStatus === 'conflicts')
 		return { status: 'not-ready', message: 'pull request has merge conflicts' };
+
+	// The approval holds — but the head's builds may have run against a target
+	// branch that has since moved, so nothing has verified the tree this merge
+	// would produce (issue #874). Azure's pull request reports no "behind its
+	// target" count, so the commit graph decides (issue #1116). Deliberately last,
+	// exactly as on GitHub: a pull request whose approval no longer holds must
+	// report that, and must not spend the read. A failed read is `provider-error`,
+	// never "up to date".
+	let containsBase: boolean;
+	try {
+		containsBase = await isAzureDevOpsBaseContainedInHead(repo, state.baseBranch, state.headSha);
+	} catch (error) {
+		return { status: 'provider-error', message: errorMessage(error) };
+	}
+	if (!containsBase)
+		return {
+			status: 'stale-base',
+			message: `pull request head ${state.headSha} is behind its target branch, so its builds did not build the tree this merge would produce`,
+		};
 
 	try {
 		await completeAzureDevOpsPullRequest(repo, pullRequestId, approvedHeadSha);
@@ -489,7 +506,8 @@ export class AzureDevOpsSCMIntegration implements SCMProvider {
 	 * branch pinned to an expected head. Doing it through a git push would make SWARM
 	 * the author of an unreviewed merge commit with nothing to prove it was built from
 	 * the reviewed head. Answering `unsupported` makes the merge dispatch refuse a
-	 * stale head visibly instead — the safe half of the guarantee.
+	 * stale head — which the merge path detects from the commit graph since issue
+	 * #1116 — visibly instead: the safe half of the guarantee.
 	 */
 	async updatePullRequestBranch(
 		project: ProjectConfig,

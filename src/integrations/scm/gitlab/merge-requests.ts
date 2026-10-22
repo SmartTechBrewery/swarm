@@ -5,7 +5,8 @@
  * `getGitLabMergeRequest`, `getGitLabMergeRequestTitle`,
  * `getGitLabMergeRequestMergeState`, `getGitLabMergeRequestApprovals`,
  * `listOpenGitLabMergeRequestsForBase`, `getGitLabCommitStatuses`,
- * `listGitLabMergeRequestsForCommit`, `findOpenGitLabMergeRequest`.
+ * `listGitLabMergeRequestsForCommit`, `findOpenGitLabMergeRequest`, plus the
+ * merge path's commit-graph staleness read, `isGitLabBaseContainedInHead`.
  *
  * They live in their own file rather than in `./client.ts` because that module is
  * the credential/transport primitive (token scoping, auth header, error envelope,
@@ -126,8 +127,18 @@ export interface GitLabMergeRequestMergeState {
 	 * `null` when the response carries no count at all: GitLab omits the field for a
 	 * merge request it cannot compute one for (a closed or merged one, most often),
 	 * and "cannot say" must not read as "up to date".
+	 *
+	 * Only `true` is trusted as-is (issue #1116). `false` and `null` are verified
+	 * against the commit graph ({@link isGitLabBaseContainedInHead}) by the merge
+	 * path, the same rule GitHub applies to its own `behind` signal, so an absent or
+	 * stale count can never merge a head behind its target branch.
 	 */
 	behindBase: boolean | null;
+	/**
+	 * The branch the merge request targets, as GitLab reports it *now* — the base
+	 * the commit-graph staleness read compares the head against.
+	 */
+	baseBranch: string;
 }
 
 /**
@@ -322,8 +333,10 @@ export async function getGitLabMergeRequestMergeState(
 		'GET',
 		`${mergeRequestPath(repo, iid)}?include_diverged_commits_count=true`,
 	);
-	if (!mr.sha) {
-		throw new Error(`GitLab merge request ${repo}!${iid} response carries no sha`);
+	if (!mr.sha || !mr.target_branch) {
+		throw new Error(
+			`GitLab merge request ${repo}!${iid} response is missing required fields (sha=${mr.sha}, target_branch=${mr.target_branch})`,
+		);
 	}
 	return {
 		merged: mr.state === 'merged',
@@ -332,7 +345,39 @@ export async function getGitLabMergeRequestMergeState(
 		headSha: mr.sha,
 		changesRequested: mr.detailed_merge_status === 'requested_changes',
 		behindBase: mr.diverged_commits_count === undefined ? null : mr.diverged_commits_count > 0,
+		baseBranch: mr.target_branch,
 	};
+}
+
+/**
+ * Whether a merge request's head already contains the current head of its target
+ * branch — the commit-graph answer to "is this head behind its base?" (issue
+ * #1116), GitLab's twin of GitHub's `isBaseContainedInHead`.
+ *
+ * `GET /repository/compare?from={headSha}&to={baseBranch}` compares through the
+ * merge base (the default `straight=false`), so `commits` lists exactly the
+ * commits on the target branch that the head lacks; an empty list means the head
+ * contains the base. The response also carries the diff, which nothing here
+ * reads — GitLab offers no way to leave it out, and a merge attempt is not a hot
+ * path. A response with no `commits` array throws rather than reading as "up to
+ * date".
+ */
+export async function isGitLabBaseContainedInHead(
+	repo: string,
+	baseBranch: string,
+	headSha: string,
+): Promise<boolean> {
+	const query = new URLSearchParams({ from: headSha, to: baseBranch });
+	const compare = await gitlabRequest<{ commits?: unknown[] }>(
+		'GET',
+		`${projectPath(repo)}/repository/compare?${query}`,
+	);
+	if (!Array.isArray(compare.commits)) {
+		throw new Error(
+			`GitLab compare of ${repo} (${headSha}...${baseBranch}) carries no commits array`,
+		);
+	}
+	return compare.commits.length === 0;
 }
 
 /**

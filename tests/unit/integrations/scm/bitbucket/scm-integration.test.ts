@@ -54,6 +54,7 @@ vi.mock('@/integrations/scm/bitbucket/pull-requests.js', async (importOriginal) 
 	getBitbucketPullRequestMergeState: vi.fn(),
 	getBitbucketPullRequestTitle: vi.fn(),
 	getBitbucketCommitBuildStatus: vi.fn(),
+	isBitbucketBaseContainedInHead: vi.fn(),
 	listBitbucketPullRequestsForCommit: vi.fn(),
 	listOpenBitbucketPullRequestsForBase: vi.fn(),
 }));
@@ -88,6 +89,7 @@ import {
 	getBitbucketPullRequestApprovals,
 	getBitbucketPullRequestMergeState,
 	getBitbucketPullRequestTitle,
+	isBitbucketBaseContainedInHead,
 	listBitbucketPullRequestsForCommit,
 	listOpenBitbucketPullRequestsForBase,
 } from '@/integrations/scm/bitbucket/pull-requests.js';
@@ -435,7 +437,14 @@ describe('BitbucketSCMIntegration', () => {
 		const FULL_SHA = 'd3022fc0ca3d65c7f6654eea129d6bf0cf0ee08e';
 
 		function openAt(headSha: string) {
-			return { merged: false, state: 'open', draft: false, headSha, behindBase: null };
+			return {
+				merged: false,
+				state: 'open',
+				draft: false,
+				headSha,
+				behindBase: null,
+				baseBranch: 'main',
+			};
 		}
 
 		beforeEach(() => {
@@ -445,9 +454,11 @@ describe('BitbucketSCMIntegration', () => {
 			vi.mocked(getBitbucketPullRequestMergeState).mockReset();
 			vi.mocked(getBitbucketPullRequestApprovals).mockReset();
 			vi.mocked(mergeBitbucketPullRequestDirect).mockReset();
+			vi.mocked(isBitbucketBaseContainedInHead).mockReset();
 			vi.mocked(getBitbucketPullRequestApprovals).mockResolvedValue([
 				{ state: 'APPROVED', commitId: APPROVED_SHA },
 			]);
+			vi.mocked(isBitbucketBaseContainedInHead).mockResolvedValue(true);
 		});
 
 		it('merges as the implementer and reports the merge commit', async () => {
@@ -473,6 +484,7 @@ describe('BitbucketSCMIntegration', () => {
 				draft: false,
 				headSha: APPROVED_SHA,
 				behindBase: null,
+				baseBranch: 'main',
 			});
 
 			await expect(scm.mergePullRequest(project, 17, APPROVED_SHA)).resolves.toEqual({
@@ -627,17 +639,61 @@ describe('BitbucketSCMIntegration', () => {
 			});
 		});
 
-		// Issue #874: Bitbucket cannot say whether a head is behind its base, and a
-		// "cannot determine" merges exactly as it did before base freshness existed.
-		it('still merges, since Bitbucket never reports a behind head', async () => {
-			vi.mocked(getBitbucketPullRequestMergeState).mockResolvedValue(openAt(APPROVED_SHA));
-			vi.mocked(mergeBitbucketPullRequestDirect).mockResolvedValue({
-				merged: true,
-				message: 'pull request merged',
+		// Issue #1116: the pull request never says whether its head is behind its
+		// base, so the commit graph decides — after every eligibility check.
+		describe('base freshness', () => {
+			it('merges a head that contains its destination branch, asking the graph about the current destination', async () => {
+				vi.mocked(getBitbucketPullRequestMergeState).mockResolvedValue({
+					...openAt(APPROVED_SHA),
+					baseBranch: 'release/1.0',
+				});
+				vi.mocked(mergeBitbucketPullRequestDirect).mockResolvedValue({
+					merged: true,
+					message: 'pull request merged',
+				});
+
+				await expect(scm.mergePullRequest(project, 17, APPROVED_SHA)).resolves.toMatchObject({
+					status: 'merged',
+				});
+				expect(vi.mocked(isBitbucketBaseContainedInHead)).toHaveBeenCalledWith(
+					'SmartTechBrewery',
+					'swarm',
+					'release/1.0',
+					APPROVED_SHA,
+				);
 			});
 
-			await expect(scm.mergePullRequest(project, 17, APPROVED_SHA)).resolves.toMatchObject({
-				status: 'merged',
+			it('answers stale-base for a head missing destination commits, without merging', async () => {
+				vi.mocked(getBitbucketPullRequestMergeState).mockResolvedValue(openAt(APPROVED_SHA));
+				vi.mocked(isBitbucketBaseContainedInHead).mockResolvedValue(false);
+
+				await expect(scm.mergePullRequest(project, 17, APPROVED_SHA)).resolves.toMatchObject({
+					status: 'stale-base',
+					message: expect.stringContaining('behind its destination branch'),
+				});
+				expect(vi.mocked(mergeBitbucketPullRequestDirect)).not.toHaveBeenCalled();
+			});
+
+			it('reports a failed graph read as provider-error, never as up to date', async () => {
+				vi.mocked(getBitbucketPullRequestMergeState).mockResolvedValue(openAt(APPROVED_SHA));
+				vi.mocked(isBitbucketBaseContainedInHead).mockRejectedValue(
+					new BitbucketApiError(500, 'GET', '/commits', 'boom'),
+				);
+
+				await expect(scm.mergePullRequest(project, 17, APPROVED_SHA)).resolves.toMatchObject({
+					status: 'provider-error',
+				});
+				expect(vi.mocked(mergeBitbucketPullRequestDirect)).not.toHaveBeenCalled();
+			});
+
+			it('never spends the graph read on an ineligible pull request', async () => {
+				vi.mocked(getBitbucketPullRequestMergeState).mockResolvedValue(openAt(APPROVED_SHA));
+				vi.mocked(getBitbucketPullRequestApprovals).mockResolvedValue([]);
+
+				await expect(scm.mergePullRequest(project, 17, APPROVED_SHA)).resolves.toMatchObject({
+					status: 'not-eligible',
+				});
+				expect(vi.mocked(isBitbucketBaseContainedInHead)).not.toHaveBeenCalled();
 			});
 		});
 	});

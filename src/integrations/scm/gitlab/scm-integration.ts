@@ -57,6 +57,7 @@ import {
 	getGitLabMergeRequestMergeState,
 	getGitLabMergeRequestTitle,
 	gitLabMergeRequestUrl,
+	isGitLabBaseContainedInHead,
 	listGitLabMergeRequestsForCommit,
 	listOpenGitLabMergeRequestsForBase,
 } from './merge-requests.js';
@@ -148,6 +149,22 @@ function classifyGitLabDirectMergeError(error: unknown): MergePullRequestOutcome
 }
 
 /**
+ * Whether a merge request's head is behind its target branch (issue #1116),
+ * decided from the commit graph rather than from `diverged_commits_count` alone —
+ * GitLab's twin of GitHub's `isBehindBase`. A positive count is trusted as-is, so
+ * it costs no extra request; a zero or absent count is verified by one
+ * `GET /repository/compare`. Throws on a failed read; the caller maps that to
+ * `provider-error`, never to "up to date".
+ */
+async function isGitLabBehindBase(
+	repo: string,
+	state: Awaited<ReturnType<typeof getGitLabMergeRequestMergeState>>,
+): Promise<boolean> {
+	if (state.behindBase === true) return true;
+	return !(await isGitLabBaseContainedInHead(repo, state.baseBranch, state.headSha));
+}
+
+/**
  * The token-scoped body of {@link GitLabSCMIntegration.mergePullRequest},
  * mirroring GitHub's `mergeReadyPullRequest` and Bitbucket's equivalent: re-read
  * the merge request's current state on every call, so a durable retry re-evaluates
@@ -223,9 +240,17 @@ async function mergeReadyGitLabMergeRequest(
 	// pipeline ran against a target branch that has since moved, so nothing has
 	// verified the tree this merge would produce (issue #874). Last, after every
 	// eligibility check above, for GitHub's reason: an approval that no longer
-	// holds must report that rather than be brought up to date for nothing. A
-	// `null` count is "GitLab did not say", which merges exactly as before.
-	if (state.behindBase === true)
+	// holds must report that rather than be brought up to date for nothing, and
+	// must not spend the graph read either. Decided from the commit graph (issue
+	// #1116), so a zero or absent `diverged_commits_count` no longer merges a head
+	// GitLab did not vouch for.
+	let behind: boolean;
+	try {
+		behind = await isGitLabBehindBase(repo, state);
+	} catch (error) {
+		return { status: 'provider-error', message: errorMessage(error) };
+	}
+	if (behind)
 		return {
 			status: 'stale-base',
 			message: `merge request head ${state.headSha} is behind its target branch, so its pipeline did not build the tree this merge would produce`,

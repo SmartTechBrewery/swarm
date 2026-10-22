@@ -100,16 +100,21 @@ export interface BitbucketPullRequestMergeState {
 	headSha: string;
 	/**
 	 * Whether the head has not been built against the base it would land on
-	 * (issue #874) — always `null` here, meaning "cannot determine".
+	 * (issue #874) — always `null` here: the pull request response does not say.
 	 *
 	 * Bitbucket Cloud exposes no such state, the same way it reports no
 	 * mergeability at all (`toPullRequestDetails`'s `mergeable: null` below): a
 	 * pull request response carries neither a divergence count nor a
-	 * behind/ahead flag, and deriving one would take a separate commit
-	 * comparison per merge attempt. The merge path treats a `null` exactly as it
-	 * did before base freshness existed, so Bitbucket's behaviour is unchanged.
+	 * behind/ahead flag. The merge path therefore decides staleness from the
+	 * commit graph instead ({@link isBitbucketBaseContainedInHead}, issue #1116),
+	 * so this field never answers it.
 	 */
 	behindBase: null;
+	/**
+	 * The branch the pull request targets, as Bitbucket reports it *now* — the
+	 * base the commit-graph staleness read compares the head against.
+	 */
+	baseBranch: string;
 }
 
 /**
@@ -233,9 +238,10 @@ export async function getBitbucketPullRequestMergeState(
 ): Promise<BitbucketPullRequestMergeState> {
 	const pr = await getPullRequestObject(workspace, slug, prNumber);
 	const headSha = pr.source?.commit?.hash;
-	if (!headSha) {
+	const baseBranch = pr.destination?.branch?.name;
+	if (!headSha || !baseBranch) {
 		throw new Error(
-			`Bitbucket pull request ${workspace}/${slug}#${prNumber} response carries no source.commit.hash`,
+			`Bitbucket pull request ${workspace}/${slug}#${prNumber} response is missing required fields (source.commit.hash=${headSha}, destination.branch.name=${baseBranch})`,
 		);
 	}
 	return {
@@ -244,7 +250,40 @@ export async function getBitbucketPullRequestMergeState(
 		draft: Boolean(pr.draft),
 		headSha: abbreviateBitbucketSha(headSha),
 		behindBase: null,
+		baseBranch,
 	};
+}
+
+/**
+ * Whether a pull request's head already contains the current head of its base
+ * branch — the commit-graph answer to "is this head behind its base?" (issue
+ * #1116), Bitbucket's twin of GitHub's `isBaseContainedInHead`.
+ *
+ * `GET /commits?include={baseBranch}&exclude={headSha}` lists the commits
+ * reachable from the base branch but not from the head (`git log
+ * headSha..baseBranch`); an empty page means every base commit is already in the
+ * head. `pagelen=1` because only emptiness matters. The pair travels as query
+ * parameters rather than as the `/commits/{revision}` path segment so a branch
+ * name containing `/` needs no path encoding. A response with no `values` array
+ * throws rather than reading as "up to date".
+ */
+export async function isBitbucketBaseContainedInHead(
+	workspace: string,
+	slug: string,
+	baseBranch: string,
+	headSha: string,
+): Promise<boolean> {
+	const query = new URLSearchParams({ include: baseBranch, exclude: headSha, pagelen: '1' });
+	const page = await bitbucketRequest<{ values?: unknown[] }>(
+		'GET',
+		`${repositoryPath(workspace, slug)}/commits?${query}`,
+	);
+	if (!Array.isArray(page.values)) {
+		throw new Error(
+			`Bitbucket commit listing for ${workspace}/${slug} (${baseBranch} excluding ${headSha}) carries no values array`,
+		);
+	}
+	return page.values.length === 0;
 }
 
 /**

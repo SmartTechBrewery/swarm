@@ -24,6 +24,7 @@ vi.mock('@/integrations/scm/azure-devops/pull-requests.js', () => ({
 	getAzureDevOpsPullRequestTitle: vi.fn(),
 	getAzureDevOpsBranchHead: vi.fn(),
 	getAzureDevOpsCommitChecks: vi.fn(),
+	isAzureDevOpsBaseContainedInHead: vi.fn(),
 	listAzureDevOpsPullRequestsForCommit: vi.fn(),
 	listActiveAzureDevOpsPullRequestsForBase: vi.fn(),
 }));
@@ -68,6 +69,7 @@ import {
 	getAzureDevOpsPullRequest,
 	getAzureDevOpsPullRequestMergeState,
 	getAzureDevOpsPullRequestTitle,
+	isAzureDevOpsBaseContainedInHead,
 	listActiveAzureDevOpsPullRequestsForBase,
 	listAzureDevOpsPullRequestsForCommit,
 } from '@/integrations/scm/azure-devops/pull-requests.js';
@@ -382,6 +384,7 @@ describe('AzureDevOpsSCMIntegration', () => {
 			reviewers: [{ id: IDENTITIES.reviewer, vote: 10, isRequired: false }],
 			mergeStatus: 'succeeded',
 			mergeCommitSha: null,
+			baseBranch: 'main',
 			...overrides,
 		});
 		const merge = () => scm.mergePullRequest(project, 17, APPROVED);
@@ -392,6 +395,8 @@ describe('AzureDevOpsSCMIntegration', () => {
 			vi.mocked(getAzureDevOpsPullRequestMergeState).mockReset();
 			vi.mocked(completeAzureDevOpsPullRequest).mockReset();
 			vi.mocked(completeAzureDevOpsPullRequest).mockResolvedValue(undefined);
+			vi.mocked(isAzureDevOpsBaseContainedInHead).mockReset();
+			vi.mocked(isAzureDevOpsBaseContainedInHead).mockResolvedValue(true);
 		});
 
 		it('reports an already-completed pull request as merged without completing again', async () => {
@@ -435,6 +440,8 @@ describe('AzureDevOpsSCMIntegration', () => {
 			expect(outcome.status).toBe('not-eligible');
 			expect(outcome.message).toMatch(message);
 			expect(completeAzureDevOpsPullRequest).not.toHaveBeenCalled();
+			// An ineligible head never spends the commit-graph read (issue #1116).
+			expect(isAzureDevOpsBaseContainedInHead).not.toHaveBeenCalled();
 		});
 
 		it('accepts "approved with suggestions" and an upper-cased identity', async () => {
@@ -532,6 +539,55 @@ describe('AzureDevOpsSCMIntegration', () => {
 			);
 
 			await expect(merge()).resolves.toMatchObject({ status: outcome });
+		});
+
+		// Issue #1116: Azure's pull request reports no "behind its target" count, so
+		// the commit graph decides — after every eligibility check.
+		describe('base freshness', () => {
+			it('completes a head that contains its target branch, asking the graph about the current target', async () => {
+				vi.mocked(getAzureDevOpsPullRequestMergeState)
+					.mockResolvedValueOnce(state({ baseBranch: 'release/1.0' }))
+					.mockResolvedValueOnce(
+						state({ merged: true, state: 'closed', mergeCommitSha: MERGE_COMMIT }),
+					);
+
+				await expect(merge()).resolves.toMatchObject({ status: 'merged' });
+				expect(isAzureDevOpsBaseContainedInHead).toHaveBeenCalledWith(
+					'fabrikam/proj/web',
+					'release/1.0',
+					APPROVED,
+				);
+			});
+
+			it('answers stale-base for a head missing target commits, without completing', async () => {
+				vi.mocked(getAzureDevOpsPullRequestMergeState).mockResolvedValue(state());
+				vi.mocked(isAzureDevOpsBaseContainedInHead).mockResolvedValue(false);
+
+				await expect(merge()).resolves.toMatchObject({
+					status: 'stale-base',
+					message: expect.stringContaining('behind its target branch'),
+				});
+				expect(completeAzureDevOpsPullRequest).not.toHaveBeenCalled();
+			});
+
+			it('reports a failed graph read as provider-error, never as up to date', async () => {
+				vi.mocked(getAzureDevOpsPullRequestMergeState).mockResolvedValue(state());
+				vi.mocked(isAzureDevOpsBaseContainedInHead).mockRejectedValue(
+					new AzureDevOpsApiError(500, 'GET', '/diffs/commits', 'boom'),
+				);
+
+				await expect(merge()).resolves.toMatchObject({ status: 'provider-error' });
+				expect(completeAzureDevOpsPullRequest).not.toHaveBeenCalled();
+			});
+
+			it('never spends the graph read while Azure reports merge conflicts', async () => {
+				vi.mocked(getAzureDevOpsPullRequestMergeState).mockResolvedValue(
+					state({ mergeStatus: 'conflicts' }),
+				);
+
+				await expect(merge()).resolves.toMatchObject({ status: 'not-ready' });
+				expect(isAzureDevOpsBaseContainedInHead).not.toHaveBeenCalled();
+			});
 		});
 
 		it('is a provider-error, never a throw, when the recheck read fails', async () => {
