@@ -73,8 +73,9 @@ export type QueuedBoardOutcome = z.infer<typeof QueuedBoardOutcomeSchema>;
  * The queue-facing view of a dispatch's state: `waiting`/`prioritized` for an
  * eligible-now pending dispatch (by queue priority), `blocked` for one an *event*
  * has to wake rather than a timer — a freed project slot, the task's own checkout
- * freeing (issue #759), or a pull request's head branch freeing (issue #850) — and
- * `delayed` for a scheduled retry.
+ * freeing (issue #759), a pull request's head branch freeing (issue #850), or the
+ * repository's merge queue moving on (issue #1114) — and `delayed` for a scheduled
+ * retry.
  */
 export const PendingJobStateSchema = z.enum(['waiting', 'prioritized', 'delayed', 'blocked']);
 export type PendingJobState = z.infer<typeof PendingJobStateSchema>;
@@ -103,6 +104,7 @@ export const QueuedWaitReasonSchema = z.enum([
 	'preserved-worker',
 	'task-in-flight',
 	'pr-in-flight',
+	'merge-queue',
 	'manual-retry',
 	'recovered',
 ]);
@@ -282,6 +284,10 @@ export function deriveReviewGate(job: SwarmJob): QueuedReviewGate | undefined {
 
 /** The queue-facing state of a waiting dispatch (see {@link PendingJobStateSchema}). */
 export function deriveQueuedState(dispatch: DispatchRow): PendingJobState {
+	// A merge waiting for its turn (issue #1114) is a `retry-scheduled` row only so it
+	// can carry its fallback timer; what ends the wait is the merge ahead of it
+	// settling, so it reads as `blocked` like the event-woken pending waits below.
+	if (dispatch.waitReason === 'merge-queue') return 'blocked';
 	if (dispatch.state === 'retry-scheduled') return 'delayed';
 	// The three event-woken pending waits read as `blocked` rather than `waiting`: all
 	// are eligible *now* and none will be picked up until something frees — a project
@@ -404,7 +410,9 @@ function toQueuedRun(dispatch: DispatchRow, prioritizeContinuations: boolean): Q
  * is `listTaskInFlightWaits`' own order — its wake-up doesn't compete for a slot
  * with the capacity rows, it waits on one specific task. A `pr-in-flight` row
  * (issue #850) shares it on exactly the same terms, ordered on `availableAt`, which
- * is `listPullRequestInFlightWaits`' own order.
+ * is `listPullRequestInFlightWaits`' own order. A `merge-queue` row (issue #1114)
+ * shares it too, ordered on its re-check time, which follows arrival order closely
+ * enough for display — its true wake order is `listMergeQueueWaits`' `created_at`.
  */
 export function sortQueuedRuns(items: QueuedRun[]): QueuedRun[] {
 	const stateRank = (state: PendingJobState): number =>

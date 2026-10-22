@@ -1187,6 +1187,23 @@ describe('ReviewMergeCallout (issue #278)', () => {
 		expect(screen.getByText('502 Bad Gateway')).toBeDefined();
 	});
 
+	// Issue #1114: the merge has not been attempted because another pull request in the
+	// repository holds the merge queue — a wait, never a refusal.
+	it('shows a waiting callout for a queued outcome', () => {
+		const message =
+			'Waiting for the merge queue of acme/demo (main): 1 pull request ahead, next #41 (dispatch d-0, retry-scheduled), which has held the queue for 4m07s.';
+		render(
+			<ReviewMergeCallout
+				run={makeReviewRun({ reviewMergeOutcome: 'queued', reviewMergeMessage: message })}
+			/>,
+		);
+
+		expect(
+			screen.getByRole('heading', { name: /waiting for its turn in the merge queue/i }),
+		).toBeDefined();
+		expect(screen.getByText(message)).toBeDefined();
+	});
+
 	it.each([
 		['not-eligible', 'No longer eligible for automatic merge'],
 		['policy-blocked', 'Blocked by repository policy'],

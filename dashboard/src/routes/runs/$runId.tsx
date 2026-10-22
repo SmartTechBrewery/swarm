@@ -1879,6 +1879,13 @@ const MERGE_TERMINAL_LABELS: Record<string, string> = {
 	'provider-error-exhausted': 'The source-control provider kept failing the merge',
 };
 
+/** Heading for each *waiting* merge-automation outcome — the ones a later attempt overwrites. */
+const MERGE_WAITING_LABELS: Record<string, string> = {
+	'not-ready': 'Merge automation waiting — retrying automatically',
+	'provider-error': 'Merge automation hit a provider error — retrying automatically',
+	queued: 'Merge automation waiting for its turn in the merge queue',
+};
+
 interface ReviewMergeCalloutProps {
 	run: RunRow;
 }
@@ -1894,6 +1901,9 @@ interface ReviewMergeCalloutProps {
  * A pre-#923 row stranded at `provider-error` therefore also reads as retrying;
  * that is the same aliasing `not-ready` has always had, and telling them apart
  * would mean handing this callout the dispatch state it is not given.
+ *
+ * `queued` (issue #1114) renders on the same waiting branch: the merge has not been
+ * attempted because another pull request holds the repository's merge queue.
  */
 export function ReviewMergeCallout({ run }: ReviewMergeCalloutProps) {
 	if (run.phase !== 'review' || !run.reviewMergeOutcome) return null;
@@ -1927,11 +1937,8 @@ export function ReviewMergeCallout({ run }: ReviewMergeCalloutProps) {
 		);
 	}
 
-	if (run.reviewMergeOutcome === 'not-ready' || run.reviewMergeOutcome === 'provider-error') {
-		const waitingHeading =
-			run.reviewMergeOutcome === 'provider-error'
-				? 'Merge automation hit a provider error — retrying automatically'
-				: 'Merge automation waiting — retrying automatically';
+	const waitingHeading = MERGE_WAITING_LABELS[run.reviewMergeOutcome];
+	if (waitingHeading) {
 		return (
 			<div className="p-4 bg-amber-950/20 border border-amber-900/30 rounded flex items-start gap-3">
 				<AlertTriangle className="h-5 w-5 text-amber-500 shrink-0 mt-0.5" />

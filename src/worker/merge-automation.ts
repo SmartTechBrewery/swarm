@@ -38,8 +38,8 @@
  * green. Everything about it is bounded and per-pull-request:
  *
  *  - the update happens at the moment *this* pull request's own merge is
- *    attempted, so several stay in flight — nothing is serialized behind a
- *    queue, and no open pull request is kept continuously up to date;
+ *    attempted — no open pull request is kept continuously up to date, and the
+ *    merge queue below is what stops two of them doing it at once;
  *  - it is allowed {@link MAX_BASE_UPDATES} times, after which the pull request
  *    is handed to a human rather than looping against a faster-moving base;
  *  - a provider that cannot update a branch, a conflicting update, and a red
@@ -59,6 +59,37 @@
  * rather than a structured refusal reason, and written on the two head-moved
  * paths only — never on the red-merged-tree refusal, which is a real failure.
  *
+ * **One merge per repository at a time (issue #1114).** Freshness checked per
+ * pull request is not enough on its own: two approved pull requests can each read
+ * "up to date", merge seconds apart, and land a combination nothing built. So the
+ * critical section — staleness check → update → fresh CI → merge — runs for at
+ * most one merge dispatch per `(project, repository)` at a time, which is
+ * `(project, repository, base branch)` in practice: every SWARM-managed pull
+ * request targets its repository's configured base (one that targets another
+ * branch is over-serialized, never under).
+ *
+ *  - **The lock is derived, not stored.** The queue's head is the earliest-created
+ *    live merge dispatch for the key ({@link resolveMergeQueueTurn}) — arrival
+ *    order, the instant each approval recorded its intent. Every contender already
+ *    is a durable dispatch with a lease and a reaper, so a second store would only
+ *    add a release step that can be forgotten and a TTL that can disagree with the
+ *    dispatch's own. A holder whose lease has lapsed (`classifyDispatchClaim`) is
+ *    bypassed at once, which is how a dead holder's turn is reclaimed.
+ *  - **A holder keeps its turn across its own retries** — a `retry-scheduled`
+ *    holder waiting on its updated head's CI is still the head. That is the point,
+ *    and the cost: about one merge per CI duration per base branch.
+ *  - **Everyone else waits as `merge-queue`**, re-checked every
+ *    {@link MERGE_QUEUE_RECHECK_MS} and woken earlier by every terminal ending of
+ *    the holder ({@link settleMergeDispatch}), with no retry budget spent and a
+ *    {@link MERGE_QUEUED} outcome on the Review run naming the pull request ahead.
+ *  - **Head-of-line blocking is bounded by the budgets that already exist**: each
+ *    head gets {@link MAX_MERGE_RETRIES} retries and there are at most
+ *    {@link MAX_BASE_UPDATES} + 1 heads, while every refusal settles at once.
+ *  - **Dependencies cannot be inverted by arrival order**: Implementation's
+ *    dependency gate does not start a blocked item until its blockers are done, so
+ *    a dependent's pull request — let alone its approval — never exists before its
+ *    blocker merged.
+ *
  * **A `merged` outcome also settles what the merge absorbed (issue #959).** When
  * this pull request's Review runs declared they traced a split sibling's whole
  * scope through its diff, that sibling is closed as part of the same merge —
@@ -73,6 +104,8 @@ import {
 	completeDispatch,
 	type DispatchOutcome,
 	type DispatchRow,
+	type DispatchWaitReason,
+	listActiveMergeDispatchesForRepository,
 	scheduleDispatchRetry,
 } from '../db/repositories/dispatchesRepository.js';
 import { markReviewVerdictSuperseded } from '../db/repositories/reviewVerdictsRepository.js';
@@ -81,7 +114,12 @@ import {
 	updateReviewMergeOutcome,
 } from '../db/repositories/runsRepository.js';
 import { settleAbsorbedChildren } from '../dispatch/absorbed-child-settle.js';
-import { createAndPublishDispatch, publishDispatchWakeUp } from '../dispatch/dispatcher.js';
+import { classifyDispatchClaim } from '../dispatch/claim-liveness.js';
+import {
+	createAndPublishDispatch,
+	promoteMergeQueueWaits,
+	publishDispatchWakeUp,
+} from '../dispatch/dispatcher.js';
 import { requireProjectSCMProvider } from '../integrations/scm/registry.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
@@ -119,11 +157,21 @@ export const MERGE_RETRY_EXHAUSTED = 'retry-exhausted' as const;
  */
 export const MERGE_PROVIDER_ERROR_EXHAUSTED = 'provider-error-exhausted' as const;
 
+/**
+ * The one *waiting* outcome that is not a provider answer (issue #1114): the
+ * dispatch has not attempted its merge because another pull request in the same
+ * repository holds the merge queue. Its message names that pull request and how
+ * long it has held the queue; it is overwritten by the dispatch's own first
+ * attempt once its turn comes.
+ */
+export const MERGE_QUEUED = 'queued' as const;
+
 /** Every value the `runs.review_merge_outcome` column can hold. */
 export type ReviewMergeOutcomeStatus =
 	| MergePullRequestOutcome['status']
 	| typeof MERGE_RETRY_EXHAUSTED
-	| typeof MERGE_PROVIDER_ERROR_EXHAUSTED;
+	| typeof MERGE_PROVIDER_ERROR_EXHAUSTED
+	| typeof MERGE_QUEUED;
 
 /**
  * Bounded backoff, coded constants — merge retry policy is intentionally not
@@ -151,6 +199,16 @@ const MERGE_RETRY_MAX_DELAY_MS = 5 * 60_000;
  * a human should see.
  */
 export const MAX_BASE_UPDATES = 2;
+
+/**
+ * How often a dispatch waiting for its turn on the merge queue re-reads it
+ * (issue #1114). A fallback, not the signal: every terminal ending of the holder
+ * wakes the next waiter at once ({@link settleMergeDispatch}), so this only paces
+ * the endings that do not — a holder cancelled from the Queue or reaped on a
+ * lapsed lease. One Postgres read per waiter per minute, and no provider call.
+ * Coded on {@link MAX_MERGE_RETRIES}'s precedent.
+ */
+export const MERGE_QUEUE_RECHECK_MS = 60_000;
 
 /**
  * TTL the updated head's PR+SHA review-dispatch claim is held for, sized to
@@ -530,12 +588,14 @@ async function scheduleMergeRetry(
 	jobPayload: MergeAutomationJob,
 	attempt: number,
 	delayMs: number,
+	wait: { waitReason: DispatchWaitReason; lastError?: string } = { waitReason: 'recheck' },
 ): Promise<void> {
 	const updated = await scheduleDispatchRetry(dispatchId, {
 		jobPayload,
 		availableAt: new Date(Date.now() + delayMs),
-		waitReason: 'recheck',
+		waitReason: wait.waitReason,
 		attempt,
+		lastError: wait.lastError,
 	});
 	if (!updated) return;
 	try {
@@ -546,6 +606,127 @@ async function scheduleMergeRetry(
 			error: describeError(err),
 		});
 	}
+}
+
+/**
+ * End this dispatch's turn on the merge queue: complete it, then wake the next
+ * dispatch waiting for the same repository (issue #1114). Every terminal ending
+ * goes through here so none can forget the second half — a forgotten wake-up
+ * would cost the next pull request a {@link MERGE_QUEUE_RECHECK_MS} wait, never a
+ * stuck queue, since the waiters' own timers are underneath. A `retry-scheduled`
+ * ending deliberately does not: the dispatch is still the queue's holder.
+ */
+async function settleMergeDispatch(
+	dispatch: DispatchRow,
+	job: MergeAutomationJob,
+	project: ProjectConfig,
+	outcome: DispatchOutcome,
+): Promise<void> {
+	await completeDispatch(dispatch.id, outcome);
+	await promoteMergeQueueWaits(project.id, job.repo);
+}
+
+/**
+ * Whether this dispatch may run the merge's critical section now (issue #1114):
+ * `head` carries the job with its turn stamped, `behind` the sentence that says
+ * what it is waiting for.
+ */
+type MergeQueueTurn =
+	| { kind: 'head'; job: MergeAutomationJob }
+	| { kind: 'behind'; message: string; context: Record<string, unknown> };
+
+/** `4m07s` — the "has held the queue for" clause; minutes are not rolled into hours. */
+function formatQueueDuration(ms: number): string {
+	const seconds = Math.max(0, Math.floor(ms / 1000));
+	return `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, '0')}s`;
+}
+
+/**
+ * Decide whether this dispatch holds its repository's merge queue (issue #1114).
+ *
+ * The queue is the project's non-terminal merge dispatches for the repository in
+ * arrival order ({@link listActiveMergeDispatchesForRepository}), minus any
+ * `leased`/`running` row whose lease has lapsed — `classifyDispatchClaim`'s
+ * `stale`, the reaper's own verdict reached without waiting for its cadence, so a
+ * holder whose worker died stops blocking the moment its lease does. This
+ * dispatch is the head when nothing live precedes it.
+ *
+ * Fails **open**: a queue read that throws, or an answer that somehow lacks this
+ * dispatch's own just-claimed row, lets it proceed. The worst case is the
+ * unserialized merge every dispatch made before the queue existed, whereas failing
+ * closed would wedge every merge in the repository on a Postgres hiccup.
+ *
+ * The holder's turn length reads its own stamp, or — before its stamp is persisted
+ * by a retry — when its row last changed state, which for a claimed holder is its
+ * claim.
+ */
+async function resolveMergeQueueTurn(
+	dispatch: DispatchRow,
+	job: MergeAutomationJob,
+	project: ProjectConfig,
+	now = new Date(),
+): Promise<MergeQueueTurn> {
+	const head = (): MergeQueueTurn => {
+		if (!job.queueTurnStartedAt) {
+			logger.info('Merge automation: at the head of the merge queue', {
+				dispatchId: dispatch.id,
+				runId: job.reviewRunId,
+				prNumber: job.prNumber,
+				repo: job.repo,
+				baseBranch: project.baseBranch,
+			});
+		}
+		return {
+			kind: 'head',
+			job: { ...job, queueTurnStartedAt: job.queueTurnStartedAt ?? now.toISOString() },
+		};
+	};
+
+	let queue: DispatchRow[];
+	try {
+		queue = await listActiveMergeDispatchesForRepository(project.id, job.repo);
+	} catch (err) {
+		logger.warn('Merge automation: could not read the merge queue — merging unserialized', {
+			dispatchId: dispatch.id,
+			runId: job.reviewRunId,
+			prNumber: job.prNumber,
+			repo: job.repo,
+			error: describeError(err),
+		});
+		return head();
+	}
+
+	const live = queue.filter(
+		(row) => row.id === dispatch.id || classifyDispatchClaim(row, now) !== 'stale',
+	);
+	const position = live.findIndex((row) => row.id === dispatch.id);
+	const ahead = position === -1 ? [] : live.slice(0, position);
+	const holder = ahead[0];
+	if (!holder) return head();
+
+	const holderJob = holder.jobPayload.type === 'merge-automation' ? holder.jobPayload : undefined;
+	const holderPr = holderJob ? `#${holderJob.prNumber}` : 'an unknown pull request';
+	const turnStartedAt = holderJob?.queueTurnStartedAt
+		? new Date(holderJob.queueTurnStartedAt)
+		: holder.updatedAt;
+	const holderTurnMs = now.getTime() - turnStartedAt.getTime();
+	const count = ahead.length === 1 ? '1 pull request' : `${ahead.length} pull requests`;
+	return {
+		kind: 'behind',
+		message: `Waiting for the merge queue of ${job.repo} (${project.baseBranch}): ${count} ahead, next ${holderPr} (dispatch ${holder.id}, ${holder.state}), which has held the queue for ${formatQueueDuration(holderTurnMs)}.`,
+		context: {
+			dispatchId: dispatch.id,
+			runId: job.reviewRunId,
+			prNumber: job.prNumber,
+			repo: job.repo,
+			baseBranch: project.baseBranch,
+			queuePosition: ahead.length,
+			holderDispatchId: holder.id,
+			holderPrNumber: holderJob?.prNumber,
+			holderState: holder.state,
+			holderTurnMs,
+		},
+	};
 }
 
 /**
@@ -601,7 +782,7 @@ async function reactToStaleBase(
 			prNumber: job.prNumber,
 			baseUpdates: spent,
 		});
-		await completeDispatch(dispatch.id, 'merge-retry-exhausted');
+		await settleMergeDispatch(dispatch, job, project, 'merge-retry-exhausted');
 		return settle('stale-base');
 	}
 
@@ -626,17 +807,21 @@ async function reactToStaleBase(
 			approvedHeadSha: update.headSha,
 			baseUpdates: spent + 1,
 		};
+		const advancedMessage = `Brought the head up to date with the base (${job.approvedHeadSha} → ${update.headSha}); the approval carries forward and the merge waits for this head's own checks.`;
 		await persistMergeOutcome(
 			advanced,
 			'stale-base',
-			`Brought the head up to date with the base (${job.approvedHeadSha} → ${update.headSha}); the approval carries forward and the merge waits for this head's own checks.`,
+			advancedMessage,
 			attempt,
 			job.approvedHeadSha,
 		);
 		await claimUpdatedHeadReviewSlot(project, job, update.headSha);
 		// `attempt: 0` resets the not-ready budget: the fresh CI is a new wait, not
 		// a continuation of whatever the old head was waiting for.
-		await scheduleMergeRetry(dispatch.id, advanced, 0, mergeRetryDelayMs(1));
+		await scheduleMergeRetry(dispatch.id, advanced, 0, mergeRetryDelayMs(1), {
+			waitReason: 'recheck',
+			lastError: advancedMessage,
+		});
 		logger.info('Merge automation: advanced the approved head onto the base', {
 			dispatchId: dispatch.id,
 			runId: job.reviewRunId,
@@ -686,7 +871,7 @@ async function reactToStaleBase(
 		// The head moved out from under the approval, which is exactly what must not
 		// spend a review-cap slot (issue #1079).
 		await markApprovalSupersededByHeadChange(job, project, capabilities);
-		await completeDispatch(dispatch.id, 'merge-not-eligible');
+		await settleMergeDispatch(dispatch, job, project, 'merge-not-eligible');
 		return settle('not-eligible');
 	}
 
@@ -711,7 +896,7 @@ async function reactToStaleBase(
 			prNumber: job.prNumber,
 			message: update.message,
 		});
-		await completeDispatch(dispatch.id, 'merge-not-eligible');
+		await settleMergeDispatch(dispatch, job, project, 'merge-not-eligible');
 		return settle('not-eligible');
 	}
 
@@ -732,7 +917,7 @@ async function reactToStaleBase(
 			prNumber: job.prNumber,
 			message: update.message,
 		});
-		await completeDispatch(dispatch.id, 'merge-unsupported');
+		await settleMergeDispatch(dispatch, job, project, 'merge-unsupported');
 		return settle('unsupported');
 	}
 
@@ -984,14 +1169,37 @@ async function settleChildrenThisMergeAbsorbed(
  * this dispatch itself brought up to date is still being verified (issue #874).
  * Never `failed`: a spent budget completes as `merge-retry-exhausted` with the
  * reason on the Review run.
+ *
+ * None of that starts until this dispatch holds its repository's merge queue
+ * (issue #1114); until then it defers as `merge-queue` with its attempt counter
+ * untouched, and records {@link MERGE_QUEUED} on the Review run.
  */
 export async function processMergeAutomationDispatch(
 	dispatch: DispatchRow,
-	job: MergeAutomationJob,
+	claimedJob: MergeAutomationJob,
 	project: ProjectConfig,
 	capabilities: MergeAutomationCapabilities = {},
 ): Promise<MergeAutomationSettledOutcome> {
 	const attempt = dispatch.attempt;
+	const turn = await resolveMergeQueueTurn(dispatch, claimedJob, project);
+	if (turn.kind === 'behind') {
+		// Waiting spends none of the merge's own budget: `attempt` is persisted as
+		// it was claimed, so the turn starts with every retry still available.
+		await persistMergeOutcome(claimedJob, MERGE_QUEUED, turn.message, attempt);
+		await scheduleMergeRetry(dispatch.id, claimedJob, attempt, MERGE_QUEUE_RECHECK_MS, {
+			waitReason: 'merge-queue',
+			lastError: turn.message,
+		});
+		logger.info('Merge automation: waiting for its turn on the merge queue', turn.context);
+		return {
+			status: 'merge-automation-settled',
+			result: 'retry-scheduled',
+			prNumber: claimedJob.prNumber,
+		};
+	}
+	// Stamped with the turn's start, so every retry this dispatch schedules from
+	// here carries it to the waiters reading the queue behind it.
+	const job = turn.job;
 	const attempted = await attemptMerge(job, project, capabilities);
 	const redFreshChecks = attempted.redFreshChecks;
 	let outcome: MergePullRequestOutcome = attempted.outcome;
@@ -1023,7 +1231,7 @@ export async function processMergeAutomationDispatch(
 		// the terminal branch below that would: this refusal is a genuinely red
 		// merged tree, not a supersession. The approval must keep its slot —
 		// freeing it would buy re-reviews of a combination that is actually broken.
-		await completeDispatch(dispatch.id, 'merge-not-eligible');
+		await settleMergeDispatch(dispatch, job, project, 'merge-not-eligible');
 		return {
 			status: 'merge-automation-settled',
 			result: 'not-eligible',
@@ -1062,7 +1270,7 @@ export async function processMergeAutomationDispatch(
 			prNumber: job.prNumber,
 			attempt,
 		});
-		await completeDispatch(dispatch.id, 'merged');
+		await settleMergeDispatch(dispatch, job, project, 'merged');
 		await settleChildrenThisMergeAbsorbed(dispatch, job, project, capabilities);
 		return { status: 'merge-automation-settled', result: 'merged', prNumber: job.prNumber };
 	}
@@ -1083,7 +1291,7 @@ export async function processMergeAutomationDispatch(
 				outcome: retryExhaustion,
 				reason: outcome.message,
 			});
-			await completeDispatch(dispatch.id, 'merge-retry-exhausted');
+			await settleMergeDispatch(dispatch, job, project, 'merge-retry-exhausted');
 			return {
 				status: 'merge-automation-settled',
 				result: retryExhaustion,
@@ -1091,7 +1299,11 @@ export async function processMergeAutomationDispatch(
 			};
 		}
 		await persistMergeOutcome(job, outcome.status, outcome.message, attempt);
-		await scheduleMergeRetry(dispatch.id, job, nextAttempt, mergeRetryDelayMs(nextAttempt));
+		await scheduleMergeRetry(dispatch.id, job, nextAttempt, mergeRetryDelayMs(nextAttempt), {
+			waitReason: 'recheck',
+			// Replaces whatever the row last said — a `merge-queue` sentence included.
+			lastError: outcome.message,
+		});
 		const scheduled = {
 			dispatchId: dispatch.id,
 			runId: job.reviewRunId,
@@ -1127,8 +1339,10 @@ export async function processMergeAutomationDispatch(
 		// their slot (issue #1079).
 		await markApprovalSupersededByHeadChange(job, project, capabilities);
 	}
-	await completeDispatch(
-		dispatch.id,
+	await settleMergeDispatch(
+		dispatch,
+		job,
+		project,
 		TERMINAL_MERGE_OUTCOMES[outcome.status] ?? 'merge-not-eligible',
 	);
 	return { status: 'merge-automation-settled', result: outcome.status, prNumber: job.prNumber };

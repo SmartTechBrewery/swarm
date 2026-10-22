@@ -122,6 +122,22 @@ retry, a cancel and a slot release) resolve to exactly one winner.
   holder nor a waiter, so no pair of dispatches of one pull request can defer to each
   other. Both new reads fail open — a DB hiccup must never turn into a dropped or
   stalled dispatch.
+- **Merge serialization per repository** is the fourth (`wait_reason = 'merge-queue'`,
+  issue #1114). At most one `merge-automation` dispatch per `(project, repository)` —
+  per base branch in practice — runs the merge's critical section (staleness check →
+  update → fresh CI → merge) at a time. The lock is **derived from the rows, not
+  stored**: the head is the earliest-created non-terminal merge dispatch for the key
+  (keyed on the payload's `repo`, since merge dispatches never write the `repository`
+  column), minus any `leased`/`running` row whose lease has lapsed
+  (`classifyDispatchClaim`), so a dead holder is bypassed the moment its lease does and
+  no release step exists to be forgotten. Anything behind the head moves to
+  `retry-scheduled` with this reason and its attempt counter untouched — it holds a
+  60-second fallback wake-up, while every terminal ending of the holder re-dates the
+  earliest waiter to now (`promoteMergeQueueWaits`, through the same conditional
+  re-date as the availability promotion). The holder keeps its turn across its own
+  `retry-scheduled` CI waits, so head-of-line blocking is bounded by the merge's
+  existing budgets rather than a new timer. The Queue buckets it as `blocked`. No new
+  state, column, or migration.
 - **Retries.** Rate-limit/capacity/timeout/abort/delivery deferrals derive the next
   attempt's payload (session resume, PM dispatch intent, attempt counter) **inside the
   worker's settle path** and persist it on the dispatch as `retry-scheduled` before any

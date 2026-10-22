@@ -155,6 +155,14 @@ describe('queuedWaitReasonLabel', () => {
 		);
 	});
 
+	// Issue #1114: an approved merge waiting for the one ahead of it in the same
+	// repository — named as the repository's queue, not as CI or the pull request.
+	it("names the repository's merge queue for a merge waiting for its turn", () => {
+		expect(queuedWaitReasonLabel('merge-queue')).toBe(
+			"waiting for its turn in the repository's merge queue",
+		);
+	});
+
 	// Issue #1087: `recheck` used to cover every token-free re-check, so a run blocked
 	// on an unfinished prerequisite read "waiting for checks to settle" and sent the
 	// operator to look at CI. Only a wait on CI may say so now.
