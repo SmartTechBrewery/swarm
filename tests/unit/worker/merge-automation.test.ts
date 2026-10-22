@@ -61,7 +61,27 @@ vi.mock('@/triggers/review-dispatch-dedup.js', () => ({
 	refreshReviewDispatchClaim: (key: string, ttl: number) => refreshReviewDispatchClaim(key, ttl),
 }));
 
+// The real GitHub adapter over a stubbed Octokit (issue #1113), for the one case
+// that must prove `mergeable_state: clean` on a behind head reaches the update
+// path — an injected merge capability would only restate the adapter's answer.
+const octokitPullsGet = vi.fn();
+const octokitPullsMerge = vi.fn();
+const octokitCompare = vi.fn();
+const octokitGraphql = vi.fn();
+vi.mock('@octokit/rest', () => ({
+	Octokit: class {
+		pulls = { get: octokitPullsGet, merge: octokitPullsMerge };
+		repos = { compareCommitsWithBasehead: octokitCompare };
+		graphql = octokitGraphql;
+	},
+}));
+vi.mock('@/config/provider.js', async (importOriginal) => ({
+	...(await importOriginal<typeof import('@/config/provider.js')>()),
+	getPersonaToken: vi.fn(async () => 'tok-impl'),
+}));
+
 import type { DispatchRow } from '@/db/repositories/dispatchesRepository.js';
+import { GitHubSCMIntegration } from '@/integrations/scm/github/scm-integration.js';
 import type { SCMProviderManifest } from '@/integrations/scm/manifest.js';
 import {
 	_resetSCMProviderRegistryForTesting,
@@ -329,7 +349,9 @@ describe('processMergeAutomationDispatch', () => {
 		expect(scheduleDispatchRetry).not.toHaveBeenCalled();
 		expect(updateReviewMergeOutcome).toHaveBeenLastCalledWith('run-1', {
 			status: MERGE_RETRY_EXHAUSTED,
-			message: expect.stringContaining('left open for a manual merge'),
+			// Unchanged byte-for-byte: this wording is already in run history.
+			message:
+				'Merge automation gave up after repeated not-ready results; the pull request is approved but was left open for a manual merge.',
 			attempt: MAX_MERGE_RETRIES,
 			approvedHeadSha: 'deadbeef',
 		});
@@ -708,6 +730,71 @@ describe('processMergeAutomationDispatch: a stale approved head', () => {
 		expect(outcome.result).toBe('retry-scheduled');
 	});
 
+	// Issue #1113: a repository that opts into `if-present` and has no checks at
+	// all merges the updated head straight away instead of waiting out a budget.
+	it('merges an updated head with no checks under if-present without waiting', async () => {
+		const advanced: MergeAutomationJob = {
+			...job,
+			approvedHeadSha: 'merged-with-base',
+			baseUpdates: 1,
+		};
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged' });
+
+		await processMergeAutomationDispatch(
+			mockDispatchRow(),
+			advanced,
+			{ ...project, reviewChecks: 'if-present' },
+			{
+				mergePullRequest,
+				getAggregateCheckStatus: vi.fn(async () => ({ totalCount: 0, checkRuns: [] })),
+			},
+		);
+
+		expect(mergePullRequest).toHaveBeenCalledExactlyOnceWith(
+			expect.anything(),
+			17,
+			'merged-with-base',
+		);
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merged');
+		expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+	});
+
+	// Issue #1113: CI that never starts on the updated head (a self-hosted runner
+	// that is offline) settles within the existing budget, naming what it waited for.
+	it('settles naming the pending checks when the updated head’s CI never starts', async () => {
+		const advanced: MergeAutomationJob = {
+			...job,
+			approvedHeadSha: 'merged-with-base',
+			baseUpdates: 1,
+		};
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged' });
+
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow({ attempt: MAX_MERGE_RETRIES }),
+			advanced,
+			project,
+			{
+				mergePullRequest,
+				getAggregateCheckStatus: vi.fn(async () => ({
+					totalCount: 1,
+					checkRuns: [{ name: 'build', status: 'queued', conclusion: null }],
+				})),
+			},
+		);
+
+		expect(mergePullRequest).not.toHaveBeenCalled();
+		expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-retry-exhausted');
+		const recorded = updateReviewMergeOutcome.mock.calls.at(-1)?.[1] as {
+			status: string;
+			message: string;
+		};
+		expect(recorded.status).toBe(MERGE_RETRY_EXHAUSTED);
+		expect(recorded.message).toContain('up to date with its base');
+		expect(recorded.message).toContain('build');
+		expect(outcome.result).toBe(MERGE_RETRY_EXHAUSTED);
+	});
+
 	// The whole point of the exercise: each side is green on its own and the
 	// combination is not, so the merge is refused out loud rather than landed.
 	it('refuses and comments when the updated head’s own checks fail', async () => {
@@ -753,7 +840,16 @@ describe('processMergeAutomationDispatch: a stale approved head', () => {
 			approvedHeadSha: 'deadbeef',
 			advancedFrom: undefined,
 		});
+		// Issue #1113: a moving base is told apart from a red build — both the run's
+		// outcome and the comment say the base kept moving and how many updates it cost.
+		const recorded = updateReviewMergeOutcome.mock.calls.at(-1)?.[1] as { message: string };
+		expect(recorded.message).toContain(`${MAX_BASE_UPDATES} times`);
+		expect(recorded.message).toContain('base is moving faster');
 		expect(commentOnPullRequest).toHaveBeenCalledOnce();
+		const body = commentOnPullRequest.mock.calls[0]?.[2] ?? '';
+		expect(body).toContain(`${MAX_BASE_UPDATES} times`);
+		expect(body).toContain('base moved again');
+		expect(body).not.toContain('fails its checks');
 		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-retry-exhausted');
 		expect(outcome.result).toBe('stale-base');
 	});
@@ -902,6 +998,80 @@ describe('processMergeAutomationDispatch: a stale approved head', () => {
 
 		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-unsupported');
 		expect(outcome.result).toBe('unsupported');
+	});
+});
+
+// Issue #1113: a private repository on GitHub's free plan cannot require
+// up-to-date branches, so GitHub reports `mergeable_state: clean` for a head
+// many commits behind its base. The real adapter must still answer `stale-base`.
+describe('processMergeAutomationDispatch: GitHub reporting clean for a behind head', () => {
+	const github = new GitHubSCMIntegration();
+
+	beforeEach(() => {
+		octokitPullsGet.mockReset().mockResolvedValue({
+			data: {
+				merged: false,
+				state: 'open',
+				draft: false,
+				head: { sha: 'deadbeef' },
+				base: { ref: 'main' },
+				mergeable_state: 'clean',
+			},
+		});
+		octokitGraphql
+			.mockReset()
+			.mockResolvedValue({ repository: { pullRequest: { reviewDecision: 'APPROVED' } } });
+		octokitPullsMerge.mockReset().mockResolvedValue({
+			data: { merged: true, message: 'Pull Request successfully merged', sha: 'merge-sha' },
+		});
+		octokitCompare.mockReset();
+	});
+
+	function realMerge() {
+		return (p: Parameters<typeof github.mergePullRequest>[0], n: number, sha: string) =>
+			github.mergePullRequest(p, n, sha);
+	}
+
+	it('brings a head that lacks its base up to date instead of merging it', async () => {
+		octokitCompare.mockResolvedValue({ data: { status: 'diverged' } });
+		const updatePullRequestBranch = updateReturning({
+			status: 'updated',
+			headSha: 'merged-with-base',
+		});
+
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: realMerge(),
+			updatePullRequestBranch,
+		});
+
+		expect(octokitPullsMerge).not.toHaveBeenCalled();
+		expect(octokitCompare).toHaveBeenCalledExactlyOnceWith({
+			owner: 'SmartTechBrewery',
+			repo: 'swarm',
+			basehead: 'main...deadbeef',
+		});
+		expect(updatePullRequestBranch).toHaveBeenCalledExactlyOnceWith(project, 17, 'deadbeef');
+		expect(lastRetryInput().jobPayload).toMatchObject({
+			approvedHeadSha: 'merged-with-base',
+			baseUpdates: 1,
+		});
+	});
+
+	it('merges a head that already contains its base exactly as before', async () => {
+		octokitCompare.mockResolvedValue({ data: { status: 'ahead' } });
+		const updatePullRequestBranch = updateReturning({ status: 'up-to-date' });
+
+		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: realMerge(),
+			updatePullRequestBranch,
+		});
+
+		expect(octokitPullsMerge).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({ pull_number: 17, sha: 'deadbeef' }),
+		);
+		expect(updatePullRequestBranch).not.toHaveBeenCalled();
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merged');
+		expect(outcome.result).toBe('merged');
 	});
 });
 

@@ -150,19 +150,21 @@ export interface PullRequestMergeState {
 	/** The exact head commit this merge attempt is allowed to merge. */
 	headSha: string;
 	/**
-	 * Whether the head has *not* been built against the base it would land on
-	 * (issue #874) — read from the same `pulls.get` as everything else here, so
-	 * base freshness costs no extra request.
+	 * Whether GitHub itself reports the head as behind its base (issue #874) —
+	 * `mergeable_state === 'behind'`, read from the same `pulls.get` as
+	 * everything else here, so a positive answer costs no extra request.
 	 *
-	 * `mergeable_state === 'behind'` is GitHub's own word for it. Two properties
-	 * of that field are worth stating rather than rediscovering: it is computed
-	 * asynchronously alongside `mergeable` (so `unknown` right after a push is an
-	 * ordinary answer, not staleness), and GitHub only *reports* `behind` where
-	 * being behind actually blocks the merge — a repository that does not require
-	 * branches to be up to date reports `clean`/`unstable` for the same commit.
-	 * So this is a conservative signal: `false` never means "provably up to
-	 * date", only "GitHub is not refusing over it", which is why the merge path
-	 * treats anything but `true` exactly as it did before.
+	 * `true` is trusted as-is, but `false` is **not** evidence of freshness.
+	 * `mergeable_state` is computed asynchronously alongside `mergeable` (so
+	 * `unknown` right after a push is an ordinary answer, not staleness), and
+	 * GitHub only *reports* `behind` where being behind actually blocks the
+	 * merge: a repository that does not require branches to be up to date — every
+	 * private repository on the free plan, where the rule cannot be enabled —
+	 * reports `clean`/`unstable` for a head many commits behind. Reading only this
+	 * field merged a head 16 commits behind `main` there and broke it (issue
+	 * #1113). So whenever it is `false`, the adapter decides staleness from the
+	 * commit graph instead — {@link isBaseContainedInHead}, one `GET /compare` —
+	 * and branch-protection settings no longer change the answer.
 	 */
 	behindBase: boolean;
 	/**
@@ -248,6 +250,33 @@ export async function isContainedInBranch(
 		basehead: `${branch}...${sha}`,
 	});
 	return data.status === 'identical' || data.status === 'behind';
+}
+
+/**
+ * Whether a pull request's head already contains the current head of its base
+ * branch — the commit-graph answer to "is this head behind its base?" (issue
+ * #1113). `GET /compare/{baseRef}...{headSha}` reads from the head's side:
+ * `identical` (the head is the base) and `ahead` (the head adds commits on top
+ * of it) both contain the base, while `behind` and `diverged` mean the base has
+ * commits the head lacks, so the head's checks never built the tree a merge
+ * would produce. Unlike `mergeable_state`, the answer does not depend on
+ * whether the repository requires branches to be up to date. `baseRef` is a
+ * branch name, so it resolves to that branch's head at read time. The mirror of
+ * {@link isContainedInBranch}.
+ */
+export async function isBaseContainedInHead(
+	owner: string,
+	repo: string,
+	baseRef: string,
+	headSha: string,
+): Promise<boolean> {
+	const client = getScopedClient();
+	const { data } = await client.repos.compareCommitsWithBasehead({
+		owner,
+		repo,
+		basehead: `${baseRef}...${headSha}`,
+	});
+	return data.status === 'identical' || data.status === 'ahead';
 }
 
 /**

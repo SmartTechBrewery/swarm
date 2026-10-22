@@ -54,6 +54,7 @@ import {
 	getPullRequestReviewDecision,
 	getPullRequestReviews,
 	getPullRequestTitle,
+	isBaseContainedInHead,
 	isContainedInBranch,
 	listOpenPullRequestsForBase,
 	listPullRequestsForCommit,
@@ -102,6 +103,24 @@ function classifyDirectMergeError(error: unknown): MergePullRequestOutcome {
 	if (status === 405 || status === 409) return { status: 'not-ready', message };
 	if (status === 403) return { status: 'policy-blocked', message };
 	return { status: 'provider-error', message };
+}
+
+/**
+ * Whether a pull request's head is behind its base (issue #1113), decided from
+ * the commit graph rather than from branch protection. GitHub's own `behind` is
+ * trusted as-is: it is only ever reported where the head really lacks base
+ * commits, and skipping the read keeps a repository that requires up-to-date
+ * branches exactly as it was. Otherwise one `GET /compare` decides, so this
+ * costs at most one extra read. Throws on a failed read; every caller maps that
+ * to `provider-error`, never to "up to date".
+ */
+async function isBehindBase(
+	owner: string,
+	repo: string,
+	state: Awaited<ReturnType<typeof getPullRequestMergeState>>,
+): Promise<boolean> {
+	if (state.behindBase) return true;
+	return !(await isBaseContainedInHead(owner, repo, state.baseRef, state.headSha));
 }
 
 /**
@@ -177,12 +196,21 @@ async function mergeReadyPullRequest(
 		}
 	}
 
-	// The approval holds and the request is otherwise ready — but its checks ran
-	// against a base that has since moved, so nothing has verified the tree this
-	// merge would actually produce (issue #874). Deliberately last, after every
-	// eligibility check above: a request whose approval no longer holds must
-	// report that rather than be brought up to date and re-verified for nothing.
-	if (state.behindBase)
+	// The approval holds and the request is otherwise ready — but its checks may
+	// have run against a base that has since moved, so nothing has verified the
+	// tree this merge would actually produce (issue #874). Decided from the
+	// commit graph (issue #1113), so this fires whatever the repository's branch
+	// protection says. Deliberately last, after every eligibility check above: a
+	// request whose approval no longer holds must report that rather than be
+	// brought up to date and re-verified for nothing — and must not spend the
+	// graph read either.
+	let behind: boolean;
+	try {
+		behind = await isBehindBase(owner, repo, state);
+	} catch (error) {
+		return { status: 'provider-error', message: errorMessage(error) };
+	}
+	if (behind)
 		return {
 			status: 'stale-base',
 			message: `pull request head ${state.headSha} is behind its base branch, so its checks did not build the tree this merge would produce`,
@@ -333,10 +361,20 @@ async function updateGitHubPullRequestBranch(
 	}
 	// The head never moved. Either the base was already contained in it — GitHub
 	// accepts the request and produces no commit — or the background job has not
-	// published one yet. `behindBase` is what tells those apart, and only *after*
-	// the wait above: it is computed asynchronously too, so reading it earlier
-	// would call an in-progress update "up to date".
-	if (last && !last.behindBase) return { status: 'up-to-date' };
+	// published one yet. The commit graph tells those apart, by the same check the
+	// merge path uses (issue #1113): `mergeable_state` alone could not, since a
+	// repository that does not require up-to-date branches never reports `behind`.
+	// Asked once, *after* the wait above, so an in-progress update is not called
+	// "up to date" and the readback costs at most one extra read.
+	if (last) {
+		let behind: boolean;
+		try {
+			behind = await isBehindBase(owner, repo, last);
+		} catch (error) {
+			return { status: 'provider-error', message: errorMessage(error) };
+		}
+		if (!behind) return { status: 'up-to-date' };
+	}
 	// Reported rather than assumed: answering `updated` with the old SHA would
 	// re-pin the approval to a commit the update is about to replace, and the
 	// next attempt would then read a moved head and refuse the merge outright.
