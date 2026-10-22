@@ -161,6 +161,21 @@ describe('adaptResultToPhaseRun', () => {
 		expect(run.ciOutcome).toBeUndefined();
 	});
 
+	it('maps a catch-up pass’s branch-update result for the merge hand-back (issue #1117)', () => {
+		const run = adaptResultToPhaseRun(
+			base({
+				status: 'succeeded',
+				exitCode: 0,
+				mergeCatchUp: { status: 'conflict', message: 'conflicts in a.ts' },
+			}),
+			SELECTION,
+		);
+		expect(run.mergeCatchUp).toEqual({ status: 'conflict', message: 'conflicts in a.ts' });
+		expect(
+			adaptResultToPhaseRun(base({ status: 'succeeded', exitCode: 0 }), SELECTION).mergeCatchUp,
+		).toBeUndefined();
+	});
+
 	it('throws RunTerminatedError for a cancelled failure (never a deferral)', () => {
 		expect(() =>
 			adaptResultToPhaseRun(

@@ -53,6 +53,8 @@ export interface TaskAssignmentPr {
 	/** Only resolve-conflicts carries the base branch/SHA it rebases onto. */
 	baseBranch?: string;
 	baseSha?: string;
+	/** Only a resolve-conflicts catch-up pass (issue #1117) sets it. */
+	catchUpOnly?: true;
 }
 
 /**

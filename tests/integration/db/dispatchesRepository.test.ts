@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 
 import { getDb } from '../../../src/db/client.js';
 import {
+	adoptWorkerBranchUpdateIntoWaitingMerge,
 	bindDispatchToRun,
 	cancelAllWaitingDispatches,
 	cancelClaimedDispatch,
@@ -676,6 +677,59 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 
 			const promoted = await promoteDispatchToImmediateWake(waiting.id, waiting.wakeSeq);
 			expect(promoted?.wakeSeq).toBe(waiting.wakeSeq + 1);
+		});
+
+		// Issue #1117: the hand-back of a worker-side branch update.
+		it('adopts a branch-update result into a waiting merge dispatch, due now', async () => {
+			const waiting = await seedMerge('1', {
+				state: 'retry-scheduled',
+				waitReason: 'recheck',
+				attempt: 3,
+				availableAt: new Date(Date.now() + 60_000),
+			});
+			const payload = {
+				...waiting.jobPayload,
+				workerCatchUp: {
+					requestedFor: 'deadbeef',
+					result: { status: 'updated', headSha: 'worker-merge' },
+				},
+			} as SwarmJob;
+
+			const adopted = await adoptWorkerBranchUpdateIntoWaitingMerge(
+				waiting.id,
+				waiting.wakeSeq,
+				payload,
+			);
+
+			expect(adopted?.jobPayload).toEqual(payload);
+			expect(adopted?.wakeSeq).toBe(waiting.wakeSeq + 1);
+			expect(adopted?.availableAt.getTime()).toBeLessThanOrEqual(Date.now());
+			// Only the input is delivered: the wait itself is the dispatch's own.
+			expect(adopted).toMatchObject({
+				state: 'retry-scheduled',
+				waitReason: 'recheck',
+				attempt: 3,
+			});
+		});
+
+		it('refuses the adoption once the merge dispatch has moved on', async () => {
+			const waiting = await seedMerge('1', { state: 'retry-scheduled', waitReason: 'recheck' });
+			const claimed = await seedMerge('2', { state: 'leased', leaseOwner: OWNER });
+
+			expect(
+				await adoptWorkerBranchUpdateIntoWaitingMerge(
+					waiting.id,
+					waiting.wakeSeq + 1,
+					waiting.jobPayload,
+				),
+			).toBeNull();
+			expect(
+				await adoptWorkerBranchUpdateIntoWaitingMerge(
+					claimed.id,
+					claimed.wakeSeq,
+					claimed.jobPayload,
+				),
+			).toBeNull();
 		});
 	});
 

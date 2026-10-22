@@ -124,7 +124,10 @@ import { runImplementationPhase } from '../pipeline/implementation.js';
 import { phaseLabel } from '../pipeline/phase-label.js';
 import { type ProposedScope, runPlanningPhase } from '../pipeline/planning.js';
 import { evaluatePreplan, hasPlannedLabel, isPreplanSkip } from '../pipeline/preplan.js';
-import { runResolveConflictsPhase } from '../pipeline/resolve-conflicts.js';
+import {
+	runResolveConflictsCatchUp,
+	runResolveConflictsPhase,
+} from '../pipeline/resolve-conflicts.js';
 import { type RespondCiOutcome, runRespondToCiPhase } from '../pipeline/respond-to-ci.js';
 import { runRespondToReviewPhase } from '../pipeline/respond-to-review.js';
 import { BlockedRecoveryError, checkpointFallbackApplies } from '../pipeline/resume.js';
@@ -168,6 +171,7 @@ import {
 	type ReviewAbsorbed,
 	type ScmDeliveryProvider,
 } from '../scm/delivery.js';
+import type { WorkerBranchUpdateOutcome } from '../scm/merge.js';
 import { SWARM_GENERATED_FOOTER } from '../scm/swarm-origin.js';
 import type { TriggerRegistry } from '../triggers/registry.js';
 import {
@@ -220,6 +224,7 @@ import {
 import { GitWorktreeManager } from './git-worktree-manager.js';
 import { resolveMaxJobAgeMs } from './job-freshness.js';
 import {
+	adoptWorkerBranchUpdate,
 	type MergeAutomationSettledOutcome,
 	processMergeAutomationDispatch,
 	requestMergeAutomation,
@@ -2451,6 +2456,12 @@ export interface PhaseRunResult {
 	 * all of them — that declared none.
 	 */
 	absorbed?: ReviewAbsorbed[];
+	/**
+	 * What a Resolve-conflicts catch-up pass produced (issue #1117) — merge
+	 * automation's worker-side branch update, handed back to the merge dispatch
+	 * waiting on it ({@link handBackWorkerBranchUpdate}). Absent for every other run.
+	 */
+	mergeCatchUp?: WorkerBranchUpdateOutcome;
 }
 
 /**
@@ -2531,6 +2542,11 @@ export interface AssignedPhaseInputs {
 	/** resolve-conflicts only. */
 	baseBranch?: string;
 	baseSha?: string;
+	/**
+	 * resolve-conflicts only: run merge automation's worker-side branch update
+	 * (issue #1117, `runResolveConflictsCatchUp`) instead of a conflict resolution.
+	 */
+	catchUpOnly?: boolean;
 	/**
 	 * review / respond-to-review only: the resolved control-plane SCM delivery
 	 * provider (ADR-004 §2, {@link resolveScmDelivery}) or DB-free dispatch
@@ -2773,6 +2789,26 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 				throw new Error(
 					'resolve-conflicts phase requires prNumber, prBranch, headSha, baseBranch and baseSha',
 				);
+			}
+			if (inputs.catchUpOnly) {
+				// No agent, no prompt, no session: git alone merges the base, and what it
+				// produced travels back as the run's result.
+				const { agent, catchUp } = await runResolveConflictsCatchUp({
+					project,
+					worktrees: inputs.worktrees,
+					prNumber: inputs.prNumber,
+					prBranch: inputs.prBranch,
+					headSha: inputs.headSha,
+					baseBranch: inputs.baseBranch,
+					baseSha: inputs.baseSha,
+					taskId,
+					delivery,
+					cli,
+					runId,
+					recoveryMode: session.recoveryMode,
+					signal,
+				});
+				return { agent, mergeCatchUp: catchUp };
 			}
 			return runResolveConflictsPhase({
 				project,
@@ -3603,6 +3639,49 @@ async function scheduleCiRecoveryIfNoFix(
 }
 
 /**
+ * Hand a Resolve-conflicts catch-up pass's result back to the merge dispatch that
+ * asked for it (issue #1117) — the worker-side branch update merge automation
+ * falls back to when the provider cannot update a branch itself.
+ *
+ * Here, at the composition root, for the reason {@link scheduleCiRecoveryIfNoFix}
+ * states: the DB-free worker that ran the pass has no database to reach the merge
+ * dispatch through, so what it produced rides back on the ordinary result frame
+ * and the control plane adopts it. Best-effort and never thrown — the merge
+ * dispatch's own bounded wait is what covers a hand-back that did not land.
+ */
+async function handBackWorkerBranchUpdate(
+	trigger: TriggerResult,
+	project: ProjectConfig,
+	result: PhaseRunResult,
+): Promise<void> {
+	if (trigger.phase !== 'resolve-conflicts' || !trigger.mergeCatchUp) return;
+	if (!result.mergeCatchUp) {
+		// A worker predating the catch-up mode ran an ordinary resolution instead.
+		logger.warn('resolve-conflicts: the catch-up pass reported no branch-update result', {
+			projectId: project.id,
+			prNumber: trigger.prNumber,
+			reviewRunId: trigger.mergeCatchUp.reviewRunId,
+		});
+		return;
+	}
+	try {
+		await adoptWorkerBranchUpdate({
+			project,
+			reviewRunId: trigger.mergeCatchUp.reviewRunId,
+			headSha: trigger.mergeCatchUp.headSha,
+			outcome: result.mergeCatchUp,
+		});
+	} catch (err) {
+		logger.error('Failed to hand the worker-side branch update back to merge automation', {
+			projectId: project.id,
+			prNumber: trigger.prNumber,
+			reviewRunId: trigger.mergeCatchUp.reviewRunId,
+			error: describeError(err),
+		});
+	}
+}
+
+/**
  * The eligibility rule itself, split out of {@link requestMergeAutomationIfEligible}
  * so it can be honoured for an approval read back off the review-verdict ledger
  * rather than off a phase result (issue #815) — without inventing a `TriggerResult`
@@ -3974,6 +4053,7 @@ function buildTriggerContext(
 				continuationDispatchClaimed: job.continuationDispatchClaimed,
 				forcedReReview: job.forcedReReview,
 				ciNoFixRecovery: job.ciNoFixRecovery,
+				mergeCatchUp: job.mergeCatchUp,
 				source: 'scm',
 				providerId: job.providerId,
 				event: job.event,
@@ -5551,6 +5631,9 @@ export async function processJob(
 		// `pr-review` handler for the very PR+head this dispatch is settling — so
 		// this one is made terminal first rather than left racing its own successor.
 		await scheduleCiRecoveryIfNoFix(trigger, project, result);
+		// After `tryCompleteDispatch` too: the merge dispatch this wakes is the one
+		// that asked for the catch-up, and it must not find this run still active.
+		await handBackWorkerBranchUpdate(trigger, project, result);
 		return {
 			status: 'phase-succeeded',
 			phase: trigger.phase,

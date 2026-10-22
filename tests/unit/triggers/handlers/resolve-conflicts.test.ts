@@ -35,6 +35,7 @@ vi.mock('@/triggers/resolve-conflicts-dedup.js', () => ({
 		`${repo}:${prNumber}:${headSha}:${baseSha}`,
 }));
 
+import { MERGE_CATCH_UP_ACTION } from '@/queue/jobs.js';
 import { createResolveConflictsTrigger } from '@/triggers/handlers/resolve-conflicts.js';
 
 const project = createMockProjectConfig({ repo: 'acme/widgets' });
@@ -44,9 +45,11 @@ const project = createMockProjectConfig({ repo: 'acme/widgets' });
 // `createFakeScmProvider` throws on any unstubbed method, so leaving
 // `resolvePersonaIdentities` / `isSwarmActor` unstubbed asserts the handler no
 // longer consults persona identity at all (issue #836).
+const getPullRequest = vi.fn();
 const scm = createFakeScmProvider({
 	listConflictCandidates,
 	commentOnPullRequest,
+	getPullRequest,
 });
 
 const mergedEvent = createMockScmTriggerContext({
@@ -267,5 +270,72 @@ describe('resolve-conflicts trigger', () => {
 			expect(claimConflictResolution).not.toHaveBeenCalled();
 			expect(commentOnPullRequest).not.toHaveBeenCalled();
 		});
+	});
+});
+
+// Issue #1117: merge automation's worker-side branch update rides this phase as a
+// catch-up pass, dispatched from a synthetic job rather than from a merge event.
+describe('resolve-conflicts trigger: merge automation catch-up', () => {
+	const catchUpEvent = createMockScmTriggerContext({
+		project,
+		scm,
+		mergeCatchUp: { reviewRunId: 'review-run-1', headSha: 'approved1' },
+		event: {
+			kind: 'pull-request',
+			action: MERGE_CATCH_UP_ACTION,
+			repoFullName: project.repo,
+			workItemId: '42',
+			isCommentEvent: false,
+			headSha: 'approved1',
+		},
+	});
+
+	beforeEach(() => {
+		vi.clearAllMocks();
+		claimConflictResolution.mockResolvedValue(true);
+		// Mergeable — a stale head is, which is why the ordinary gate is skipped.
+		getPullRequest.mockResolvedValue({ ...candidate, headSha: 'approved1', mergeable: true });
+	});
+
+	it('matches the catch-up job, and only through its marker', () => {
+		const trigger = createResolveConflictsTrigger();
+		expect(trigger.matches(catchUpEvent)).toBe(true);
+		expect(trigger.matches({ ...catchUpEvent, mergeCatchUp: undefined })).toBe(false);
+	});
+
+	it('dispatches a catch-up pass pinned to the approved head and claims its state', async () => {
+		const result = await createResolveConflictsTrigger().handle(catchUpEvent);
+
+		expect(getPullRequest).toHaveBeenCalledWith(project, 42, 'implementer');
+		expect(claimConflictResolution).toHaveBeenCalledWith(
+			'acme/widgets:42:approved1:base456',
+			catchUpEvent.dispatchId,
+		);
+		expect(result).toEqual({
+			phase: 'resolve-conflicts',
+			taskId: '42-conflicts',
+			prNumber: '42',
+			prBranch: 'issue-42',
+			headSha: 'approved1',
+			baseBranch: 'main',
+			baseSha: 'base456',
+			mergeCatchUp: { reviewRunId: 'review-run-1', headSha: 'approved1' },
+		});
+		// No mergeability fan-out and no ownership read: SWARM asked for this itself.
+		expect(listConflictCandidates).not.toHaveBeenCalled();
+		expect(hasRunForTask).not.toHaveBeenCalled();
+	});
+
+	it('does not update a pull request that has closed', async () => {
+		getPullRequest.mockResolvedValue({ ...candidate, state: 'closed' });
+
+		expect(await createResolveConflictsTrigger().handle(catchUpEvent)).toBeNull();
+		expect(claimConflictResolution).not.toHaveBeenCalled();
+	});
+
+	it('defers to an ordinary resolution already holding the same state', async () => {
+		claimConflictResolution.mockResolvedValue(false);
+
+		expect(await createResolveConflictsTrigger().handle(catchUpEvent)).toBeNull();
 	});
 });

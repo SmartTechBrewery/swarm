@@ -236,6 +236,8 @@ function prCoordinates(trigger: TriggerResult): TaskAssignmentPr | undefined {
 				headSha: trigger.headSha,
 				baseBranch: trigger.baseBranch,
 				baseSha: trigger.baseSha,
+				// The hand-back's Review run stays here; the worker needs only the mode.
+				...(trigger.mergeCatchUp ? { catchUpOnly: true as const } : {}),
 			};
 	}
 }
@@ -458,6 +460,10 @@ export function adaptResultToPhaseRun(
 			// Feeds the shared settle path's `runs.review_absorbed` write (issue #953);
 			// absent from a review that declared nothing, and from an older worker's frame.
 			absorbed: result.absorbed,
+			// Feeds the shared settle path's hand-back to the waiting merge dispatch
+			// (issue #1117); absent from every run but a catch-up pass, and from an
+			// older worker's frame.
+			mergeCatchUp: result.mergeCatchUp,
 		};
 	}
 	if (result.status === 'failed') {

@@ -1170,6 +1170,44 @@ export async function adoptLateResultIntoScheduledRetry(
 }
 
 /**
+ * Hand a waiting merge dispatch the result of the worker-side branch update it
+ * asked for, and make it due **now** (issue #1117) — so the dispatch applies it
+ * under its own claim on its next attempt rather than this write deciding the
+ * merge's fate from outside.
+ *
+ * {@link adoptLateResultIntoScheduledRetry}'s compare-and-set, keyed the same way:
+ * the row must still be waiting at the wake sequence the caller read its payload
+ * at. A row that was claimed, cancelled or settled in the meantime is left alone
+ * and the caller decides whether to read it again. The state, wait reason and
+ * attempt budget are untouched — this only delivers an input to the wait the
+ * dispatch is already in.
+ */
+export async function adoptWorkerBranchUpdateIntoWaitingMerge(
+	id: string,
+	expectedWakeSeq: number,
+	jobPayload: SwarmJob,
+): Promise<DispatchRow | null> {
+	const now = new Date();
+	const rows = await getDb()
+		.update(dispatches)
+		.set({
+			jobPayload,
+			availableAt: now,
+			wakeSeq: sql`${dispatches.wakeSeq} + 1`,
+			updatedAt: now,
+		})
+		.where(
+			and(
+				eq(dispatches.id, id),
+				inArray(dispatches.state, [...WAITING_DISPATCH_STATES]),
+				eq(dispatches.wakeSeq, expectedWakeSeq),
+			),
+		)
+		.returning();
+	return rows[0] ?? null;
+}
+
+/**
  * The claim columns a stale-claim take-over was decided against, re-asserted in
  * its own UPDATE (issue #1017). Read off the same row the caller classified, so
  * "nothing has changed since I judged this claim dead" is a compare-and-set rather

@@ -23,6 +23,7 @@ import { ReasoningLevelSchema } from '../harness/models.js';
 import { WorkerUpdateTargetSchema } from '../lib/build-identity.js';
 import { PmEventSchema, PmProviderIdSchema } from '../pm/events.js';
 import { ScmEventSchema, ScmProviderIdSchema } from '../scm/events.js';
+import type { WorkerBranchUpdateOutcome } from '../scm/merge.js';
 
 /** The single BullMQ queue the router produces onto and the worker consumes. */
 export const QUEUE_NAME = 'swarm-jobs';
@@ -53,6 +54,37 @@ export const QUEUE_NAME = 'swarm-jobs';
  */
 export const RecoveryModeSchema = z.enum(['resume', 'fresh', 'checkpoint', 'discard']);
 export type RecoveryMode = z.infer<typeof RecoveryModeSchema>;
+
+/**
+ * The catch-up a merge dispatch asks a worker for (issue #1117,
+ * `SwarmJob.mergeCatchUp`): the Review run whose merge dispatch is waiting on it,
+ * and the approved head the update must start from.
+ */
+export const MergeCatchUpRequestSchema = z.object({
+	reviewRunId: z.string().min(1),
+	headSha: z.string().min(1),
+});
+export type MergeCatchUpRequest = z.infer<typeof MergeCatchUpRequestSchema>;
+
+/**
+ * The `pull-request` event action a catch-up job carries (issue #1117). Outside
+ * the neutral action vocabulary on purpose (`ScmEventAction`, `../scm/events.ts`):
+ * an action no trigger knows matches none, so only the `mergeCatchUp` marker the
+ * `resolve-conflicts` handler reads can route it.
+ */
+export const MERGE_CATCH_UP_ACTION = 'merge-catch-up';
+
+/**
+ * {@link WorkerBranchUpdateOutcome}'s durable shape — what a catch-up reported,
+ * as the merge dispatch's payload carries it until its next attempt applies it.
+ */
+export const WorkerBranchUpdateOutcomeSchema: z.ZodType<WorkerBranchUpdateOutcome> =
+	z.discriminatedUnion('status', [
+		z.object({ status: z.literal('updated'), headSha: z.string().min(1) }),
+		z.object({ status: z.literal('up-to-date') }),
+		z.object({ status: z.literal('head-moved'), message: z.string() }),
+		z.object({ status: z.literal('conflict'), message: z.string() }),
+	]);
 
 /**
  * **One declaration of how an attempt treats the work a prior attempt left
@@ -389,6 +421,17 @@ const jobBase = z.object({
 	 */
 	ciNoFixRecovery: z.boolean().optional(),
 	/**
+	 * Set on the synthetic job merge automation enqueues when the provider cannot
+	 * bring a stale approved head up to date itself (issue #1117): the
+	 * `resolve-conflicts` handler dispatches a **catch-up** pass of that phase —
+	 * merge the base into the pull request's branch on a worker, with no agent —
+	 * pinned to `headSha`, the approved head the merge dispatch is waiting on. The
+	 * Review run is how the result finds its way back: the merge dispatch it hands
+	 * the outcome to is keyed on it (`merge:<reviewRunId>`). Never set by an
+	 * inbound webhook.
+	 */
+	mergeCatchUp: MergeCatchUpRequestSchema.optional(),
+	/**
 	 * The durable dispatch record this job wakes up (issue #284, ADR-002). Every
 	 * queue job produced by the dispatch layer carries it; the worker acts only
 	 * after atomically claiming that record, so a cancelled/completed dispatch
@@ -501,6 +544,22 @@ export const MergeAutomationJobSchema = jobBase.extend({
 	 * every row written before the queue existed.
 	 */
 	queueTurnStartedAt: z.string().datetime().optional(),
+	/**
+	 * The worker-side branch update this dispatch asked for, when the provider
+	 * could not update the branch itself (issue #1117). `requestedFor` is the
+	 * approved head the catch-up was requested for — so a later attempt on the same
+	 * head waits for it instead of requesting another — and `result` is what that
+	 * catch-up reported, adopted into this payload by the hand-back
+	 * (`adoptWorkerBranchUpdate`, `src/worker/merge-automation.ts`) and applied by
+	 * the dispatch's next attempt under its own claim. Both are meaningless once
+	 * `approvedHeadSha` moves on, which is how a stale one is recognised.
+	 */
+	workerCatchUp: z
+		.object({
+			requestedFor: z.string().min(1),
+			result: WorkerBranchUpdateOutcomeSchema.optional(),
+		})
+		.optional(),
 });
 
 /**

@@ -4,7 +4,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AgentCliResult } from '@/harness/agent-cli.js';
-import { runResolveConflictsPhase } from '@/pipeline/resolve-conflicts.js';
+import {
+	runResolveConflictsCatchUp,
+	runResolveConflictsPhase,
+} from '@/pipeline/resolve-conflicts.js';
 import {
 	DeliveryDeferredError,
 	HANDOFF_FILENAMES,
@@ -415,4 +418,211 @@ describe('resolve-conflicts when the base advances mid-run', () => {
 		},
 		RACE_CASE_TIMEOUT_MS,
 	);
+});
+
+/**
+ * A bare `origin` with a PR branch one commit ahead of an older `main`, a `main`
+ * that has since moved on, and a clean checkout of the PR branch at its tip — the
+ * state merge automation hands a worker when the provider cannot update a branch
+ * itself (issue #1117). `conflicting` makes both sides touch the same line.
+ */
+function makeStaleCheckout(conflicting = false): {
+	worktreePath: string;
+	seed: string;
+	origin: string;
+	headSha: string;
+	baseSha: string;
+} {
+	const root = mkdtempSync(join(tmpdir(), 'swarm-catch-up-'));
+	roots.push(root);
+	const origin = join(root, 'origin.git');
+	const seed = join(root, 'seed');
+	const worktreePath = join(root, 'work');
+	execFileSync('git', ['init', '--bare', '-b', 'main', origin], { env: testGitEnvironment });
+	execFileSync('git', ['clone', '-q', origin, seed], { env: testGitEnvironment });
+	git(seed, 'config', 'user.email', 'test@example.com');
+	git(seed, 'config', 'user.name', 'Test');
+	writeFileSync(join(seed, 'shared.txt'), 'base\n');
+	git(seed, 'add', '.');
+	git(seed, 'commit', '-q', '--no-verify', '-m', 'base');
+	git(seed, 'push', '-q', 'origin', 'main');
+	git(seed, 'checkout', '-q', '-b', PR_BRANCH);
+	writeFileSync(join(seed, conflicting ? 'shared.txt' : 'feature.txt'), 'the pull request\n');
+	git(seed, 'add', '.');
+	git(seed, 'commit', '-q', '--no-verify', '-m', 'pr change');
+	git(seed, 'push', '-q', 'origin', PR_BRANCH);
+	const headSha = git(seed, 'rev-parse', 'HEAD').trim();
+	const baseSha = advanceBaseFile(seed, conflicting ? 'shared.txt' : 'base-only.txt');
+	execFileSync('git', ['clone', '-q', '-b', PR_BRANCH, origin, worktreePath], {
+		env: testGitEnvironment,
+	});
+	git(worktreePath, 'config', 'user.email', 'test@example.com');
+	git(worktreePath, 'config', 'user.name', 'Test');
+	return { worktreePath, seed, origin, headSha, baseSha };
+}
+
+/** Another pull request landing on `main`. */
+function advanceBaseFile(seed: string, file: string): string {
+	git(seed, 'checkout', '-q', 'main');
+	writeFileSync(join(seed, file), 'main moved on\n');
+	git(seed, 'add', '.');
+	git(seed, 'commit', '-q', '--no-verify', '-m', `main change to ${file}`);
+	git(seed, 'push', '-q', 'origin', 'main');
+	return git(seed, 'rev-parse', 'HEAD').trim();
+}
+
+/** Somebody pushing to the pull request's branch. */
+function pushToPrBranch(seed: string): string {
+	git(seed, 'checkout', '-q', PR_BRANCH);
+	git(seed, 'pull', '-q', '--ff-only', 'origin', PR_BRANCH);
+	writeFileSync(join(seed, 'pushed.txt'), 'a human pushed\n');
+	git(seed, 'add', '.');
+	git(seed, 'commit', '-q', '--no-verify', '-m', 'pushed by a human');
+	git(seed, 'push', '-q', 'origin', PR_BRANCH);
+	return git(seed, 'rev-parse', 'HEAD').trim();
+}
+
+/** The catch-up's options, delivering through a real fast-forward-only push. */
+function makeCatchUpOptions(worktreePath: string, headSha: string, baseSha: string) {
+	const options = makeOptions(worktreePath, headSha, baseSha);
+	const pushBranch = vi.fn(async (cwd: string, branch: string, sha: string) => {
+		execFileSync('git', ['push', '-q', 'origin', `${sha}:refs/heads/${branch}`], {
+			cwd,
+			env: testGitEnvironment,
+			stdio: 'pipe',
+		});
+	});
+	options.delivery = { ...options.delivery, pushBranch } as unknown as ScmDeliveryProvider;
+	return { ...options, pushBranch };
+}
+
+describe('resolve-conflicts catch-up (merge automation’s worker-side update, issue #1117)', () => {
+	it('merges the base cleanly with no agent and pushes the merge pinned to the head', async () => {
+		const { worktreePath, origin, headSha, baseSha } = makeStaleCheckout();
+		const options = makeCatchUpOptions(worktreePath, headSha, baseSha);
+
+		const { catchUp } = await runResolveConflictsCatchUp(options);
+
+		expect(catchUp.status).toBe('updated');
+		const produced = catchUp.status === 'updated' ? catchUp.headSha : '';
+		expect(options.runAgent).not.toHaveBeenCalled();
+		expect(options.postComment).not.toHaveBeenCalled();
+		expect(options.pushBranch).toHaveBeenCalledExactlyOnceWith(worktreePath, PR_BRANCH, produced);
+		expect(git(origin, 'rev-parse', `refs/heads/${PR_BRANCH}`).trim()).toBe(produced);
+		// First parent the reviewed head, second the base head read at merge time.
+		expect(
+			git(worktreePath, 'rev-parse', `${produced}^1`, `${produced}^2`).trim().split('\n'),
+		).toEqual([headSha, baseSha]);
+		expect(git(worktreePath, 'show', '-s', '--format=%an', produced).trim()).toBe('implementer');
+		expect(options.cleanup).toHaveBeenCalledTimes(1);
+	});
+
+	it("treats an abbreviated (Bitbucket 12-char) approved head as the checkout's own head and merges", async () => {
+		const { worktreePath, origin, headSha, baseSha } = makeStaleCheckout();
+		const abbreviated = headSha.slice(0, 12);
+		const options = makeCatchUpOptions(worktreePath, abbreviated, baseSha);
+
+		const { catchUp } = await runResolveConflictsCatchUp(options);
+
+		expect(catchUp.status).toBe('updated');
+		const reported = catchUp.status === 'updated' ? catchUp.headSha : '';
+		const pushed = git(origin, 'rev-parse', `refs/heads/${PR_BRANCH}`).trim();
+		// Reported in the spelling it was dispatched in, naming the commit pushed.
+		expect(reported).toBe(pushed.slice(0, 12));
+		expect(git(worktreePath, 'rev-parse', `${pushed}^1`).trim()).toBe(headSha);
+	});
+
+	it('commits and pushes a clean merge whose tree is unchanged (base advanced by a commit and its revert)', async () => {
+		const { worktreePath, seed, origin, headSha } = makeStaleCheckout();
+		git(seed, 'revert', '--no-edit', 'HEAD');
+		git(seed, 'push', '-q', 'origin', 'main');
+		const baseSha = git(seed, 'rev-parse', 'HEAD').trim();
+		const options = makeCatchUpOptions(worktreePath, headSha, baseSha);
+
+		const { catchUp } = await runResolveConflictsCatchUp(options);
+
+		expect(catchUp.status).toBe('updated');
+		const produced = catchUp.status === 'updated' ? catchUp.headSha : '';
+		expect(git(origin, 'rev-parse', `refs/heads/${PR_BRANCH}`).trim()).toBe(produced);
+		expect(
+			git(worktreePath, 'rev-parse', `${produced}^1`, `${produced}^2`).trim().split('\n'),
+		).toEqual([headSha, baseSha]);
+		expect(git(worktreePath, 'rev-parse', `${produced}^{tree}`).trim()).toBe(
+			git(worktreePath, 'rev-parse', `${headSha}^{tree}`).trim(),
+		);
+	});
+
+	it('aborts and reports a conflicting merge without pushing anything', async () => {
+		const { worktreePath, origin, headSha, baseSha } = makeStaleCheckout(true);
+		const options = makeCatchUpOptions(worktreePath, headSha, baseSha);
+
+		const { catchUp } = await runResolveConflictsCatchUp(options);
+
+		expect(catchUp).toEqual({
+			status: 'conflict',
+			message: expect.stringContaining('conflicts in shared.txt'),
+		});
+		expect(options.runAgent).not.toHaveBeenCalled();
+		expect(options.pushBranch).not.toHaveBeenCalled();
+		expect(git(origin, 'rev-parse', `refs/heads/${PR_BRANCH}`).trim()).toBe(headSha);
+		// Aborted, not left mid-merge.
+		expect(git(worktreePath, 'status', '--porcelain').trim()).toBe('');
+	});
+
+	it('reports head-moved when the branch moved before the merge was committed', async () => {
+		const { worktreePath, seed, origin, headSha, baseSha } = makeStaleCheckout();
+		const pushed = pushToPrBranch(seed);
+		const options = makeCatchUpOptions(worktreePath, headSha, baseSha);
+
+		const { catchUp } = await runResolveConflictsCatchUp(options);
+
+		expect(catchUp).toEqual({ status: 'head-moved', message: expect.stringContaining(pushed) });
+		expect(options.pushBranch).not.toHaveBeenCalled();
+		expect(git(origin, 'rev-parse', `refs/heads/${PR_BRANCH}`).trim()).toBe(pushed);
+	});
+
+	it('reports head-moved when the pinned push is refused because the branch moved', async () => {
+		const { worktreePath, seed, origin, headSha, baseSha } = makeStaleCheckout();
+		const options = makeCatchUpOptions(worktreePath, headSha, baseSha);
+		let pushed = '';
+		const realPush = options.pushBranch.getMockImplementation();
+		options.pushBranch.mockImplementation(async (cwd, branch, sha) => {
+			// Somebody lands a commit between the remote re-read and the push.
+			pushed = pushToPrBranch(seed);
+			await realPush?.(cwd, branch, sha);
+		});
+
+		const { catchUp } = await runResolveConflictsCatchUp(options);
+
+		expect(catchUp).toEqual({ status: 'head-moved', message: expect.stringContaining('diverged') });
+		expect(git(origin, 'rev-parse', `refs/heads/${PR_BRANCH}`).trim()).toBe(pushed);
+	});
+
+	it('reports head-moved when the checkout is not at the approved head', async () => {
+		const { worktreePath, headSha, baseSha } = makeStaleCheckout();
+		const parent = git(worktreePath, 'rev-parse', `${headSha}^`).trim();
+		const options = makeCatchUpOptions(worktreePath, parent, baseSha);
+
+		const { catchUp } = await runResolveConflictsCatchUp(options);
+
+		expect(catchUp).toEqual({ status: 'head-moved', message: expect.stringContaining(headSha) });
+		expect(options.pushBranch).not.toHaveBeenCalled();
+	});
+
+	it('reports up-to-date for a head that already contains the base', async () => {
+		const { worktreePath, seed, headSha, baseSha } = makeStaleCheckout();
+		// Bring the PR branch up to date on the remote first, then check it out afresh.
+		git(seed, 'checkout', '-q', PR_BRANCH);
+		git(seed, 'merge', '-q', '--no-verify', '--no-edit', 'main');
+		git(seed, 'push', '-q', 'origin', PR_BRANCH);
+		const current = git(seed, 'rev-parse', 'HEAD').trim();
+		git(worktreePath, 'pull', '-q', '--ff-only', 'origin', PR_BRANCH);
+		const options = makeCatchUpOptions(worktreePath, current, baseSha);
+
+		const { catchUp } = await runResolveConflictsCatchUp(options);
+
+		expect(catchUp).toEqual({ status: 'up-to-date' });
+		expect(options.pushBranch).not.toHaveBeenCalled();
+		expect(headSha).not.toBe(current);
+	});
 });
