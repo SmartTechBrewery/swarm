@@ -885,9 +885,10 @@ the updated head's PR+SHA review-dispatch slot** (`claimReviewDispatch`, then
 refreshed to 15 minutes so it outlasts CI): without it the head's own `checks
 completed` event dispatches a Review, spending one of `REVIEW_VERDICT_CAP`'s
 three verdicts per update on an unchanged diff, and a pull request bumped twice
-would reach its merge unable to be reviewed at all. Nothing here is serialized —
-the update happens at the moment one pull request's own merge is attempted, so
-several stay in flight — and the outcome vocabulary needs no migration, since
+would reach its merge unable to be reviewed at all. The update happens at the
+moment one pull request's own merge is attempted, never as a standing job, and
+only for the pull request holding its repository's merge queue (issue #1114,
+below) — and the outcome vocabulary needs no migration, since
 `dispatches.outcome` and `runs.review_merge_outcome` are plain `text`. The one
 schema-adjacent change is `updateReviewMergeOutcome`'s new `advancedFrom`: the
 row's generation guard refuses a write whose approved head differs from the one
@@ -902,6 +903,62 @@ build. A fresh CI that never starts on the updated head (an offline self-hosted
 runner) defers on the ordinary backoff and, once the budget is spent, settles
 `merge-retry-exhausted` with the pending checks named in the run's outcome —
 never a merge, and no wait beyond the existing budget.
+
+**One merge per repository at a time (issue #1114).** Freshness checked per pull
+request is not freshness: two approved pull requests could each read "up to date",
+both merge seconds apart, and land a combination no CI ever built — the
+`under-control-platform` incident that motivated the queue. So the critical
+section — staleness check → update → fresh CI → merge — runs for **at most one
+merge-automation dispatch per `(project, repository)`** at a time, which is
+`(project, repository, base branch)` in practice: every SWARM-managed pull request
+targets its repository's configured `baseBranch`, so one that targets another
+branch is over-serialized, never under. Different repositories and different
+projects never block each other. It is provider-independent by construction —
+the queue lives entirely in SWARM's own dispatch rows — so it serializes merges on
+Bitbucket, GitLab and Azure DevOps as well as GitHub; what still differs per
+provider is whether the staleness check *sees* a stale head (graph-based
+staleness off GitHub is merge queue 2/3) and whether the head can be updated
+(the worker-side fallback is 3/3). **The lock is derived, not stored**: the
+queue's head is the earliest-created live `merge-automation` dispatch for the
+key (`listActiveMergeDispatchesForRepository`, keyed on the payload's `repo`
+because a merge dispatch never writes the `repository` column, ordered
+`created_at, id`). Every contender is already a durable dispatch with a lease, a
+state machine and a reaper, so a second store (the Redis-lease shape of
+`review-dispatch-dedup.ts`) would only add a release step that can be forgotten
+and a TTL that can disagree with the dispatch's own. A `leased`/`running` holder
+whose lease has lapsed reads `stale` under `classifyDispatchClaim` (#1017) and is
+bypassed at once, which is how a dead holder's turn is reclaimed without waiting
+for the reaper. The holder keeps its turn across its own `retry-scheduled`
+waits — the CI on a head it updated is the point — so throughput is about **one
+merge per CI duration per base branch**, which is the trade-off accepted for
+never landing an unbuilt combination. A dispatch that is not at the head defers
+as wait reason **`merge-queue`** with its attempt counter untouched, re-checked
+every `MERGE_QUEUE_RECHECK_MS` (60 s), and records a **`queued`** outcome on its
+Review run naming the pull request ahead, how many are ahead, and how long the
+holder has held the queue (from the payload's `queueTurnStartedAt` stamp, or the
+holder row's last transition before the stamp is persisted). Every terminal
+ending of a holder goes through `settleMergeDispatch`, which completes it and
+then wakes the earliest waiter (`promoteMergeQueueWaits`, the merge twin of
+#850's promotion: remove the delayed wake-up, re-date via
+`promoteDispatchToImmediateWake` — `merge-queue` joins
+`PROMOTABLE_AVAILABILITY_WAIT_REASONS` for that — publish); a holder that ends
+any other way (cancelled from the Queue, reaped on a lapsed lease) is covered by
+the waiters' own timers. The gate fails **open** on a queue read that throws —
+the worst case is the unserialized merge every dispatch made before — because
+failing closed would wedge every merge in the repository on a Postgres hiccup.
+**Head-of-line blocking is bounded by the budgets that already existed**, not a
+new timer: each head gets `MAX_MERGE_RETRIES` retries (~17 minutes of
+`not-ready`/`provider-error`, which is also what bounds an offline runner), at
+most `MAX_BASE_UPDATES + 1` heads, and every refusal settles at once — so a
+holder's turn is at worst about `(MAX_BASE_UPDATES + 1) × 17` minutes. Ordering
+is **arrival order**, and that cannot invert a dependency: Implementation's
+dependency gate does not start a blocked item until its blockers are done, so a
+dependent's pull request — let alone its approval — never exists before its
+blocker merged. Merges made outside SWARM need nothing new: the head's own merge
+attempt re-reads the commit graph, so a human push to the base is seen as
+`stale-base` by the next pull request in line. The Queue buckets `merge-queue` as
+`blocked` (it is event-woken, despite being `retry-scheduled` for its fallback
+timer), and the run detail renders `queued` on its waiting branch.
 
 **A refusal the head itself caused no longer spends a review-cap slot (issue
 #1079).** `REVIEW_VERDICT_CAP` counted approvals merge automation then refused

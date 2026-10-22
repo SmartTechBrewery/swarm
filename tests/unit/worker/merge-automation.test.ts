@@ -7,10 +7,21 @@ const failDispatch = vi.fn(async (_id: string, _error: string) => true);
 const scheduleDispatchRetry = vi.fn(
 	async (_id: string, _input: unknown): Promise<DispatchRow | null> => mockDispatchRow(),
 );
-vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
+// The merge queue (issue #1114): empty by default, which reads as "this dispatch is
+// the head" — every case outside the queue's own describe merges exactly as before.
+const listActiveMergeDispatchesForRepository = vi.fn(
+	async (_projectId: string, _repo: string): Promise<DispatchRow[]> => [],
+);
+vi.mock('@/db/repositories/dispatchesRepository.js', async (importOriginal) => ({
+	// The real lifecycle constants, which `classifyDispatchClaim` reads.
+	EXECUTING_DISPATCH_STATES: (
+		await importOriginal<typeof import('@/db/repositories/dispatchesRepository.js')>()
+	).EXECUTING_DISPATCH_STATES,
 	completeDispatch: (id: string, outcome: string) => completeDispatch(id, outcome),
 	failDispatch: (id: string, error: string) => failDispatch(id, error),
 	scheduleDispatchRetry: (id: string, input: unknown) => scheduleDispatchRetry(id, input),
+	listActiveMergeDispatchesForRepository: (projectId: string, repo: string) =>
+		listActiveMergeDispatchesForRepository(projectId, repo),
 }));
 
 const updateReviewMergeOutcome = vi.fn(async (_runId: string, _input: unknown) => true);
@@ -44,9 +55,12 @@ const createAndPublishDispatch = vi.fn(async (_input: unknown) => ({
 	created: true,
 }));
 const publishDispatchWakeUp = vi.fn(async (_dispatch: unknown) => {});
+const promoteMergeQueueWaits = vi.fn(async (_projectId: string, _repo: string) => false);
 vi.mock('@/dispatch/dispatcher.js', () => ({
 	createAndPublishDispatch: (input: unknown) => createAndPublishDispatch(input),
 	publishDispatchWakeUp: (dispatch: unknown) => publishDispatchWakeUp(dispatch),
+	promoteMergeQueueWaits: (projectId: string, repo: string) =>
+		promoteMergeQueueWaits(projectId, repo),
 }));
 
 // The review-dispatch dedup is Redis-backed; the updated head's claim (issue
@@ -94,6 +108,8 @@ import {
 	MAX_BASE_UPDATES,
 	MAX_MERGE_RETRIES,
 	MERGE_PROVIDER_ERROR_EXHAUSTED,
+	MERGE_QUEUE_RECHECK_MS,
+	MERGE_QUEUED,
 	MERGE_RETRY_EXHAUSTED,
 	mergeDispatchDedupKey,
 	mergeRetryDelayMs,
@@ -172,6 +188,9 @@ beforeEach(() => {
 	failDispatch.mockClear();
 	scheduleDispatchRetry.mockClear();
 	scheduleDispatchRetry.mockImplementation(async () => mockDispatchRow());
+	listActiveMergeDispatchesForRepository.mockReset();
+	listActiveMergeDispatchesForRepository.mockResolvedValue([]);
+	promoteMergeQueueWaits.mockClear();
 	updateReviewMergeOutcome.mockClear();
 	updateReviewMergeOutcome.mockResolvedValue(true);
 	createAndPublishDispatch.mockClear();
@@ -209,6 +228,14 @@ function checksConcluding(...conclusions: string[]) {
 		})),
 	};
 	return vi.fn(async () => checks);
+}
+
+/**
+ * A payload as the head of the merge queue persists it (issue #1114): the job it
+ * was handed, plus the instant its turn started.
+ */
+function onTurn(payload: MergeAutomationJob) {
+	return { ...payload, queueTurnStartedAt: expect.any(String) };
 }
 
 /** The retry input `scheduleDispatchRetry` was last called with. */
@@ -312,7 +339,7 @@ describe('processMergeAutomationDispatch', () => {
 			{ jobPayload: unknown; availableAt: Date; waitReason: string; attempt: number },
 		];
 		expect(id).toBe('dispatch-1');
-		expect(input.jobPayload).toEqual(job);
+		expect(input.jobPayload).toEqual(onTurn(job));
 		expect(input.waitReason).toBe('recheck');
 		expect(input.attempt).toBe(3);
 		const delay = input.availableAt.getTime() - before;
@@ -404,7 +431,7 @@ describe('processMergeAutomationDispatch', () => {
 		expect(scheduleDispatchRetry).toHaveBeenCalledTimes(1);
 		const input = lastRetryInput();
 		// The payload travels unchanged — a provider failure advances no head.
-		expect(input.jobPayload).toEqual(job);
+		expect(input.jobPayload).toEqual(onTurn(job));
 		expect(input.waitReason).toBe('recheck');
 		expect(input.attempt).toBe(3);
 		const delay = input.availableAt.getTime() - before;
@@ -490,7 +517,7 @@ describe('processMergeAutomationDispatch', () => {
 		});
 
 		expect(scheduleDispatchRetry).toHaveBeenCalledTimes(1);
-		expect(lastRetryInput().jobPayload).toEqual(job);
+		expect(lastRetryInput().jobPayload).toEqual(onTurn(job));
 
 		const outcome = await processMergeAutomationDispatch(
 			mockDispatchRow({ attempt: 1 }),
@@ -635,11 +662,13 @@ describe('processMergeAutomationDispatch: a stale approved head', () => {
 		);
 
 		const input = lastRetryInput();
-		expect(input.jobPayload).toEqual({
-			...job,
-			approvedHeadSha: 'merged-with-base',
-			baseUpdates: 1,
-		});
+		expect(input.jobPayload).toEqual(
+			onTurn({
+				...job,
+				approvedHeadSha: 'merged-with-base',
+				baseUpdates: 1,
+			}),
+		);
 		expect(input.waitReason).toBe('recheck');
 		// Reset, not incremented: the fresh CI is a new wait and gets the full budget.
 		expect(input.attempt).toBe(0);
@@ -862,7 +891,7 @@ describe('processMergeAutomationDispatch: a stale approved head', () => {
 
 		expect(lastRetryInput().attempt).toBe(1);
 		// No head advanced, so the payload — and the base-update budget — is untouched.
-		expect(lastRetryInput().jobPayload).toEqual(job);
+		expect(lastRetryInput().jobPayload).toEqual(onTurn(job));
 		expect(claimReviewDispatch).not.toHaveBeenCalled();
 		expect(outcome.result).toBe('retry-scheduled');
 	});
@@ -1403,5 +1432,251 @@ describe('processMergeAutomationDispatch: superseded approvals', () => {
 		});
 
 		expect(markReviewRunSuperseded).not.toHaveBeenCalled();
+	});
+});
+
+describe('processMergeAutomationDispatch: the merge queue (issue #1114)', () => {
+	const ownRow = (overrides: Partial<DispatchRow> = {}) =>
+		mockDispatchRow({
+			leaseExpiresAt: new Date(Date.now() + 15 * 60_000),
+			jobPayload: job,
+			...overrides,
+		});
+
+	/** An earlier merge dispatch for the same repository, for pull request #11. */
+	function holderRow(
+		overrides: Partial<DispatchRow> = {},
+		payload: Partial<MergeAutomationJob> = {},
+	) {
+		return mockDispatchRow({
+			id: 'dispatch-0',
+			state: 'retry-scheduled',
+			createdAt: new Date(Date.now() - 10 * 60_000),
+			updatedAt: new Date(Date.now() - 3 * 60_000),
+			jobPayload: { ...job, reviewRunId: 'run-0', prNumber: '11', ...payload },
+			...overrides,
+		});
+	}
+
+	function queueOf(...rows: DispatchRow[]) {
+		listActiveMergeDispatchesForRepository.mockResolvedValue(rows);
+	}
+
+	it('merges as before when it is alone on the queue, then wakes the next waiter', async () => {
+		const own = ownRow();
+		queueOf(own);
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged', sha: 'abc' });
+
+		const outcome = await processMergeAutomationDispatch(own, job, project, { mergePullRequest });
+
+		expect(listActiveMergeDispatchesForRepository).toHaveBeenCalledExactlyOnceWith(
+			project.id,
+			job.repo,
+		);
+		expect(mergePullRequest).toHaveBeenCalledTimes(1);
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merged');
+		expect(promoteMergeQueueWaits).toHaveBeenCalledExactlyOnceWith(project.id, job.repo);
+		expect(completeDispatch.mock.invocationCallOrder[0]).toBeLessThan(
+			promoteMergeQueueWaits.mock.invocationCallOrder[0] as number,
+		);
+		expect(outcome.result).toBe('merged');
+	});
+
+	it('defers behind an earlier holder without spending its budget or calling the provider', async () => {
+		const own = ownRow({ attempt: 2 });
+		queueOf(holderRow(), own);
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged', sha: 'abc' });
+		const before = Date.now();
+
+		const outcome = await processMergeAutomationDispatch(own, job, project, { mergePullRequest });
+
+		expect(mergePullRequest).not.toHaveBeenCalled();
+		const input = lastRetryInput() as ReturnType<typeof lastRetryInput> & { lastError: string };
+		expect(input.waitReason).toBe('merge-queue');
+		// Untouched: waiting for a turn is not a not-ready attempt.
+		expect(input.attempt).toBe(2);
+		expect(input.jobPayload).toEqual(job);
+		const delay = input.availableAt.getTime() - before;
+		expect(delay).toBeGreaterThanOrEqual(MERGE_QUEUE_RECHECK_MS - 1000);
+		expect(delay).toBeLessThanOrEqual(MERGE_QUEUE_RECHECK_MS + 1000);
+		expect(input.lastError).toContain(`merge queue of ${job.repo} (${project.baseBranch})`);
+		expect(input.lastError).toContain('1 pull request ahead, next #11 (dispatch dispatch-0');
+		expect(publishDispatchWakeUp).toHaveBeenCalledTimes(1);
+		expect(updateReviewMergeOutcome).toHaveBeenCalledExactlyOnceWith('run-1', {
+			status: MERGE_QUEUED,
+			message: input.lastError,
+			attempt: 2,
+			approvedHeadSha: 'deadbeef',
+		});
+		expect(completeDispatch).not.toHaveBeenCalled();
+		expect(promoteMergeQueueWaits).not.toHaveBeenCalled();
+		expect(outcome).toEqual({
+			status: 'merge-automation-settled',
+			result: 'retry-scheduled',
+			prNumber: '17',
+		});
+	});
+
+	it('counts every live dispatch ahead of it, not only the holder', async () => {
+		const own = ownRow();
+		queueOf(holderRow(), holderRow({ id: 'dispatch-0b', state: 'pending' }), own);
+
+		await processMergeAutomationDispatch(own, job, project, {
+			mergePullRequest: mergeReturning({ status: 'merged', message: 'merged', sha: 'abc' }),
+		});
+
+		expect((lastRetryInput() as unknown as { lastError: string }).lastError).toContain(
+			'2 pull requests ahead, next #11',
+		);
+	});
+
+	it('bypasses a holder whose lease has lapsed — a dead holder does not keep the queue', async () => {
+		const own = ownRow();
+		queueOf(holderRow({ state: 'leased', leaseExpiresAt: new Date(Date.now() - 1000) }), own);
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged', sha: 'abc' });
+
+		const outcome = await processMergeAutomationDispatch(own, job, project, { mergePullRequest });
+
+		expect(mergePullRequest).toHaveBeenCalledTimes(1);
+		expect(outcome.result).toBe('merged');
+	});
+
+	it('honours a holder whose lease is still live', async () => {
+		const own = ownRow();
+		queueOf(holderRow({ state: 'running', leaseExpiresAt: new Date(Date.now() + 60_000) }), own);
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged', sha: 'abc' });
+
+		const outcome = await processMergeAutomationDispatch(own, job, project, { mergePullRequest });
+
+		expect(mergePullRequest).not.toHaveBeenCalled();
+		expect(lastRetryInput().waitReason).toBe('merge-queue');
+		expect(outcome.result).toBe('retry-scheduled');
+	});
+
+	it('ignores dispatches that arrived after it', async () => {
+		const own = ownRow();
+		queueOf(own, holderRow({ id: 'dispatch-2', state: 'retry-scheduled' }));
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged', sha: 'abc' });
+
+		await processMergeAutomationDispatch(own, job, project, { mergePullRequest });
+
+		expect(mergePullRequest).toHaveBeenCalledTimes(1);
+	});
+
+	it('stamps the start of its turn into the payload its retries persist, once', async () => {
+		const own = ownRow();
+		queueOf(own);
+		const before = Date.now();
+
+		await processMergeAutomationDispatch(own, job, project, {
+			mergePullRequest: mergeReturning({ status: 'not-ready', message: 'pending' }),
+		});
+
+		const stamped = lastRetryInput().jobPayload.queueTurnStartedAt;
+		expect(stamped).toBeDefined();
+		expect(Date.parse(stamped as string)).toBeGreaterThanOrEqual(before - 1000);
+
+		const later = { ...job, queueTurnStartedAt: '2026-01-01T00:00:00.000Z' };
+		await processMergeAutomationDispatch(
+			ownRow({ attempt: 1, jobPayload: later }),
+			later,
+			project,
+			{
+				mergePullRequest: mergeReturning({ status: 'not-ready', message: 'pending' }),
+			},
+		);
+		expect(lastRetryInput().jobPayload.queueTurnStartedAt).toBe('2026-01-01T00:00:00.000Z');
+	});
+
+	it('reports how long the holder has held the queue from its own stamp', async () => {
+		const own = ownRow();
+		queueOf(
+			holderRow(
+				{},
+				{ queueTurnStartedAt: new Date(Date.now() - (4 * 60_000 + 7_000)).toISOString() },
+			),
+			own,
+		);
+
+		await processMergeAutomationDispatch(own, job, project, {
+			mergePullRequest: mergeReturning({ status: 'merged', message: 'merged', sha: 'abc' }),
+		});
+
+		expect((lastRetryInput() as unknown as { lastError: string }).lastError).toContain(
+			'which has held the queue for 4m07s',
+		);
+	});
+
+	it('falls back to when the holder last changed state before its stamp is persisted', async () => {
+		const own = ownRow();
+		queueOf(holderRow({ updatedAt: new Date(Date.now() - 3 * 60_000) }), own);
+
+		await processMergeAutomationDispatch(own, job, project, {
+			mergePullRequest: mergeReturning({ status: 'merged', message: 'merged', sha: 'abc' }),
+		});
+
+		expect((lastRetryInput() as unknown as { lastError: string }).lastError).toContain(
+			'which has held the queue for 3m00s',
+		);
+	});
+
+	it.each<[string, MergePullRequestOutcome, number]>([
+		['merged', { status: 'merged', message: 'merged', sha: 'abc' }, 0],
+		['not-eligible', { status: 'not-eligible', message: 'closed' }, 0],
+		['policy-blocked', { status: 'policy-blocked', message: 'protected' }, 0],
+		['unsupported', { status: 'unsupported', message: 'merge queue required' }, 0],
+		['a spent not-ready budget', { status: 'not-ready', message: 'pending' }, MAX_MERGE_RETRIES],
+	])('releases the queue on a terminal ending: %s', async (_label, mergeOutcome, attempt) => {
+		const own = ownRow({ attempt });
+		queueOf(own);
+
+		await processMergeAutomationDispatch(own, job, project, {
+			mergePullRequest: mergeReturning(mergeOutcome),
+			getPullRequest: vi.fn(
+				async () =>
+					({ number: 17, headBranch: 'issue-12', headSha: 'deadbeef' }) as PullRequestDetails,
+			),
+		});
+
+		expect(completeDispatch).toHaveBeenCalledTimes(1);
+		expect(promoteMergeQueueWaits).toHaveBeenCalledExactlyOnceWith(project.id, job.repo);
+	});
+
+	it('releases the queue when a stale head cannot be updated', async () => {
+		const own = ownRow();
+		queueOf(own);
+
+		await processMergeAutomationDispatch(own, job, project, {
+			mergePullRequest: mergeReturning(STALE_BASE),
+			updatePullRequestBranch: updateReturning({ status: 'conflict', message: 'conflicts' }),
+			commentOnPullRequest: vi.fn(async () => 1),
+		});
+
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
+		expect(promoteMergeQueueWaits).toHaveBeenCalledExactlyOnceWith(project.id, job.repo);
+	});
+
+	it('keeps the queue across its own retries — a scheduled retry releases nothing', async () => {
+		const own = ownRow();
+		queueOf(own);
+
+		await processMergeAutomationDispatch(own, job, project, {
+			mergePullRequest: mergeReturning({ status: 'not-ready', message: 'pending' }),
+		});
+
+		expect(lastRetryInput().waitReason).toBe('recheck');
+		expect(promoteMergeQueueWaits).not.toHaveBeenCalled();
+	});
+
+	it('fails open when the queue cannot be read', async () => {
+		listActiveMergeDispatchesForRepository.mockRejectedValue(new Error('db down'));
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged', sha: 'abc' });
+
+		const outcome = await processMergeAutomationDispatch(ownRow(), job, project, {
+			mergePullRequest,
+		});
+
+		expect(mergePullRequest).toHaveBeenCalledTimes(1);
+		expect(outcome.result).toBe('merged');
 	});
 });

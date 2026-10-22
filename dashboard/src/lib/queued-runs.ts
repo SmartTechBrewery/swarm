@@ -111,6 +111,10 @@ const QUEUED_WAIT_REASON_LABELS: Record<QueuedWaitReason, string> = {
 	// branch run in separate worktrees on purpose (issue #850), so "waiting for that
 	// checkout to free" would describe something that is not happening.
 	'pr-in-flight': 'waiting for another phase of its pull request to finish',
+	// Names the *repository's* queue, not the pull request: this merge is approved and
+	// only waits for the merge ahead of it to settle (issue #1114). Which pull request
+	// that is, and for how long it has held the queue, is on the Review run's detail.
+	'merge-queue': "waiting for its turn in the repository's merge queue",
 	'manual-retry': 'manual retry',
 	recovered: 'recovered after a restart',
 };

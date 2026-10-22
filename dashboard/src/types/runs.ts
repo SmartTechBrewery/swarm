@@ -168,6 +168,7 @@ export const queuedWaitReasonSchema = z.enum([
 	'preserved-worker',
 	'task-in-flight',
 	'pr-in-flight',
+	'merge-queue',
 	'manual-retry',
 	'recovered',
 ]);
@@ -519,9 +520,11 @@ export interface RunRow {
 	 * Provider-neutral merge-automation outcome for a completed Review run's
 	 * `approve` verdict (issue #278): one of `merged`/`not-ready`/
 	 * `not-eligible`/`policy-blocked`/`unsupported`/`provider-error`/
-	 * `retry-exhausted`/`provider-error-exhausted`. `provider-error` is transient
-	 * since issue #923 — an attempt failed and a retry is scheduled — while
-	 * `provider-error-exhausted` is the terminal "the forge kept failing". Null
+	 * `retry-exhausted`/`provider-error-exhausted`/`queued`. `provider-error` is
+	 * transient since issue #923 — an attempt failed and a retry is scheduled — while
+	 * `provider-error-exhausted` is the terminal "the forge kept failing". `queued`
+	 * (issue #1114) is waiting too: another pull request in the repository holds the
+	 * merge queue, and the message names it. Null
 	 * when merge automation never ran (disabled, or the verdict wasn't an
 	 * approval) and for pre-existing rows.
 	 */

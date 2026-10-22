@@ -26,8 +26,10 @@ import {
 	getWorkerDispatchClaimState,
 	hasExecutingDispatchForTask,
 	listActiveDispatchTaskRefs,
+	listActiveMergeDispatchesForRepository,
 	listAvailabilityWaitsForWorker,
 	listDeferredRunsWithoutActiveDispatch,
+	listMergeQueueWaits,
 	listPullRequestInFlightWaits,
 	listRunnableDispatchesForPool,
 	listTaskInFlightWaits,
@@ -594,6 +596,86 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 			expect(
 				await findExecutingWritingDispatchForPullRequest('proj-other', android.repo, '42'),
 			).toBeUndefined();
+		});
+	});
+
+	describe('the merge queue reads (issue #1114)', () => {
+		/** A merge-automation dispatch for `repo`, created now — arrival order is creation order. */
+		async function seedMerge(
+			prNumber: string,
+			overrides: Partial<Parameters<typeof createDispatch>[0]> = {},
+			repo = REPO,
+		) {
+			const { dispatch } = await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: {
+					type: 'merge-automation',
+					projectId: PROJECT_ID,
+					reviewRunId: `run-${prNumber}`,
+					repo,
+					prNumber,
+					approvedHeadSha: 'deadbeef',
+				},
+				source: 'synthetic',
+				taskId: prNumber,
+				phase: 'merge-automation',
+				...overrides,
+			});
+			// Distinct creation instants, so the expected order is the seeding order.
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			return dispatch;
+		}
+
+		it("lists a repository's live merge dispatches in arrival order", async () => {
+			const first = await seedMerge('1', { state: 'retry-scheduled', waitReason: 'recheck' });
+			const second = await seedMerge('2', { state: 'leased', leaseOwner: OWNER });
+			const third = await seedMerge('3');
+
+			const queue = await listActiveMergeDispatchesForRepository(PROJECT_ID, REPO);
+			expect(queue.map((row) => row.id)).toEqual([first.id, second.id, third.id]);
+		});
+
+		it('excludes terminal rows, other repositories, and other phases', async () => {
+			const wanted = await seedMerge('1');
+			const done = await seedMerge('2', { state: 'leased', leaseOwner: OWNER });
+			await completeDispatch(done.id, 'merged');
+			await seedMerge('3', {}, 'jkwiecien/second-repo');
+			await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: job({ repo: REPO } as Partial<SwarmJob>),
+				source: 'webhook',
+				taskId: '4',
+				phase: 'review',
+			});
+
+			const queue = await listActiveMergeDispatchesForRepository(PROJECT_ID, REPO);
+			expect(queue.map((row) => row.id)).toEqual([wanted.id]);
+		});
+
+		it('lists only the merge-queue waiters, in arrival order', async () => {
+			const first = await seedMerge('1', { state: 'retry-scheduled', waitReason: 'merge-queue' });
+			await seedMerge('2', { state: 'retry-scheduled', waitReason: 'recheck' });
+			await seedMerge('3');
+			const fourth = await seedMerge('4', { state: 'retry-scheduled', waitReason: 'merge-queue' });
+			await seedMerge(
+				'5',
+				{ state: 'retry-scheduled', waitReason: 'merge-queue' },
+				'jkwiecien/second-repo',
+			);
+
+			const waits = await listMergeQueueWaits(PROJECT_ID, REPO);
+			expect(waits.map((row) => row.id)).toEqual([first.id, fourth.id]);
+		});
+
+		it('lets a merge-queue waiter be promoted to an immediate wake', async () => {
+			const waiting = await seedMerge('1', {
+				state: 'retry-scheduled',
+				waitReason: 'merge-queue',
+				availableAt: new Date(Date.now() + 60_000),
+			});
+
+			const promoted = await promoteDispatchToImmediateWake(waiting.id, waiting.wakeSeq);
+			expect(promoted?.wakeSeq).toBe(waiting.wakeSeq + 1);
 		});
 	});
 

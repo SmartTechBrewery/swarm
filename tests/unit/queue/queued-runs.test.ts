@@ -389,6 +389,20 @@ describe('toQueuedRuns', () => {
 		expect(item.runsAt).toBeUndefined();
 	});
 
+	// Issue #1114: a merge waiting for its turn is a `retry-scheduled` row only so it can
+	// carry a fallback timer; the merge ahead of it settling is what wakes it, so it
+	// reads as `blocked` rather than `delayed`.
+	it('maps a merge-queue wait to the blocked state with its wait reason', () => {
+		const [item] = toQueuedRuns([
+			makeDispatch({
+				state: 'retry-scheduled',
+				waitReason: 'merge-queue',
+				availableAt: new Date(Date.now() + 60_000),
+			}),
+		]);
+		expect(item).toMatchObject({ state: 'blocked', waitReason: 'merge-queue' });
+	});
+
 	it('carries the dispatch continuation flag and exact availability timestamp through', () => {
 		const [continuationItem] = toQueuedRuns([
 			makeDispatch({ continuation: true, availableAt: new Date(1_700_000_030_000) }),

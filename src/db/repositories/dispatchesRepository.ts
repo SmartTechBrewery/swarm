@@ -245,6 +245,18 @@ export type DispatchWaitReason =
 	 * to free" would be a lie about what this dispatch is waiting for.
 	 */
 	| 'pr-in-flight'
+	/**
+	 * A **merge-automation dispatch waiting for its turn on its repository's merge
+	 * queue** (issue #1114): an earlier live merge dispatch for the same
+	 * `(project, repository)` holds the queue, and only one runs the staleness check
+	 * → update → fresh CI → merge critical section at a time
+	 * ({@link listActiveMergeDispatchesForRepository}). Woken by that holder settling
+	 * (`promoteMergeQueueWaits`, `../../dispatch/dispatcher.ts`), and re-checked on a
+	 * timer underneath. Spends none of the merge's retry budget — the attempt counter
+	 * is left where it was. Its `last_error` names the pull request ahead and how
+	 * long it has held the queue.
+	 */
+	| 'merge-queue'
 	| 'manual-retry'
 	| 'recovered';
 
@@ -1648,6 +1660,72 @@ export async function listPullRequestInFlightWaits(
 }
 
 /**
+ * The merge-automation key both merge-queue reads share (issue #1114): one
+ * project's merge dispatches for one repository. Keyed on the stored payload's
+ * `repo` because a merge dispatch never writes the `repository` column — that is
+ * written by `recordDispatchResolution`, which only trigger dispatches reach.
+ */
+function mergeQueueKey(projectId: string, repository: string) {
+	return and(
+		eq(dispatches.projectId, projectId),
+		eq(dispatches.phase, 'merge-automation'),
+		sql`${dispatches.jobPayload} ->> 'repo' = ${repository}`,
+	);
+}
+
+/**
+ * Every non-terminal merge-automation dispatch for one repository of one project,
+ * in **arrival order** (`created_at`, then `id` so the order is total) — the merge
+ * queue itself (issue #1114). Its head is the dispatch allowed to run the merge's
+ * critical section; no lock is stored anywhere else.
+ *
+ * Lease liveness is deliberately *not* filtered here: the caller decides which
+ * `leased`/`running` rows are dead (`classifyDispatchClaim`,
+ * `../../dispatch/claim-liveness.ts`), which keeps that one judgement shared with
+ * the manual-retry take-over rather than re-stated in SQL.
+ *
+ * No index of its own, for the reason {@link hasActiveDispatchForPullRequest}
+ * states: `idx_dispatches_project_state` already narrows to a project's
+ * non-terminal rows.
+ */
+export async function listActiveMergeDispatchesForRepository(
+	projectId: string,
+	repository: string,
+): Promise<DispatchRow[]> {
+	return getDb()
+		.select()
+		.from(dispatches)
+		.where(
+			and(
+				mergeQueueKey(projectId, repository),
+				inArray(dispatches.state, [...ACTIVE_DISPATCH_STATES]),
+			),
+		)
+		.orderBy(asc(dispatches.createdAt), asc(dispatches.id));
+}
+
+/**
+ * The merge dispatches waiting for their turn on this repository's merge queue
+ * (issue #1114), in arrival order — what a settling holder wakes the first of.
+ */
+export async function listMergeQueueWaits(
+	projectId: string,
+	repository: string,
+): Promise<DispatchRow[]> {
+	return getDb()
+		.select()
+		.from(dispatches)
+		.where(
+			and(
+				mergeQueueKey(projectId, repository),
+				eq(dispatches.state, 'retry-scheduled'),
+				eq(dispatches.waitReason, 'merge-queue'),
+			),
+		)
+		.orderBy(asc(dispatches.createdAt), asc(dispatches.id));
+}
+
+/**
  * The dispatches waiting for this task's checkout to free (issue #759) — what a
  * settling phase wakes, the task-level twin of {@link selectNextCapacityDispatch}.
  *
@@ -1913,11 +1991,18 @@ export async function selectNextCapacityDispatch(
  * removes the live wake-up between them: a reason listed but not promotable is
  * stripped of its wake-up, refused by the re-date, and left to the reconciler's
  * republish — silently.
+ *
+ * `merge-queue` (issue #1114) is here for the re-date, not the worker listing:
+ * it is the same "a `retry-scheduled` row holding a delayed wake-up is woken
+ * early" move, made by a merge-queue holder settling
+ * (`promoteMergeQueueWaits`) rather than by a worker becoming available, with
+ * its own candidate read ({@link listMergeQueueWaits}).
  */
 export const PROMOTABLE_AVAILABILITY_WAIT_REASONS = [
 	'worker-eligibility',
 	'worker-rate-limited',
 	'preserved-worker',
+	'merge-queue',
 ] as const satisfies readonly DispatchWaitReason[];
 
 /**

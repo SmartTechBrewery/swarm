@@ -23,6 +23,7 @@ import {
 	findWakeableWorkerUpdateDispatch,
 	getActiveDispatchByRunId,
 	listAvailabilityWaitsForWorker,
+	listMergeQueueWaits,
 	listPullRequestInFlightWaits,
 	listTaskInFlightWaits,
 	promoteDispatchToImmediateWake,
@@ -317,6 +318,52 @@ export async function promotePullRequestInFlightWaits(
 			error: describeError(err),
 		});
 		return 0;
+	}
+}
+
+/**
+ * After a merge-automation dispatch's turn ends — merged, refused, or a spent
+ * budget — wake the next dispatch waiting on the same repository's merge queue
+ * (issue #1114), the merge twin of {@link promotePullRequestInFlightWaits}.
+ *
+ * Only the **first** waiter in arrival order is woken: it is the next head, and
+ * waking the rest would only have them read the queue and re-defer. They keep
+ * their own timed re-check, which is also what covers a holder that ends without
+ * calling this at all (cancelled from the Queue, or reaped on a lapsed lease).
+ *
+ * The waiter is a `retry-scheduled` row already holding a *delayed* wake-up, so
+ * this follows {@link promoteAvailabilityWaitsForWorker}'s per-row order for its
+ * reasons: remove the delayed wake-up, re-date the row, publish the replacement.
+ * Best-effort and fully swallowed — it runs off a settled merge, which a queue
+ * hiccup must never fail. Returns whether a waiter was woken.
+ */
+export async function promoteMergeQueueWaits(
+	projectId: string,
+	repository: string,
+): Promise<boolean> {
+	try {
+		const [next] = await listMergeQueueWaits(projectId, repository);
+		if (!next) return false;
+		await removePendingJobById(wakeJobId(next));
+		const updated = await promoteDispatchToImmediateWake(next.id, next.wakeSeq);
+		// Claimed by its own timer, cancelled, or already promoted between the read
+		// and here — leave it to whoever won.
+		if (!updated) return false;
+		await publishDispatchWakeUp(updated);
+		logger.info('dispatch: merge queue released — woke the next merge waiting for its turn', {
+			projectId,
+			repository,
+			dispatchId: updated.id,
+			runId: updated.runId,
+		});
+		return true;
+	} catch (err) {
+		logger.warn('dispatch: merge-queue promotion failed', {
+			projectId,
+			repository,
+			error: describeError(err),
+		});
+		return false;
 	}
 }
 

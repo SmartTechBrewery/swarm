@@ -493,6 +493,14 @@ export const MergeAutomationJobSchema = jobBase.extend({
 	 * Absent on every row written before that existed, which reads as none.
 	 */
 	baseUpdates: z.number().int().min(0).optional(),
+	/**
+	 * When this dispatch first found itself at the head of its repository's merge
+	 * queue (issue #1114) — stamped by the dispatch, carried through every retry it
+	 * schedules, and read by the dispatches waiting behind it for the "has held the
+	 * queue for" clause they report. Absent until the dispatch's first turn, and on
+	 * every row written before the queue existed.
+	 */
+	queueTurnStartedAt: z.string().datetime().optional(),
 });
 
 /**
