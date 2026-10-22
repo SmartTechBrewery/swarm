@@ -456,6 +456,8 @@ function makeStaleCheckout(conflicting = false): {
 	execFileSync('git', ['clone', '-q', '-b', PR_BRANCH, origin, worktreePath], {
 		env: testGitEnvironment,
 	});
+	git(worktreePath, 'config', 'user.email', 'test@example.com');
+	git(worktreePath, 'config', 'user.name', 'Test');
 	return { worktreePath, seed, origin, headSha, baseSha };
 }
 
