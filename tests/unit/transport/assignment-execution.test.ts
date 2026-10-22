@@ -852,6 +852,42 @@ describe('runAssignmentDbFree', () => {
 		expect(sink.sent.at(-1)).toMatchObject({ status: 'succeeded', ciOutcome: 'no-fix' });
 	});
 
+	// Issue #1117: merge automation's worker-side branch update runs here, on the
+	// worker holding the checkout, and its result rides back on the frame.
+	it('runs a catch-up assignment as one and reports its branch-update result', async () => {
+		const sink = recordingSink();
+		const runPhase = vi.fn(async (_inputs: unknown) => ({
+			agent: agentResult(),
+			mergeCatchUp: { status: 'updated' as const, headSha: 'worker-merge' },
+		}));
+
+		await runAssignmentDbFree(
+			buildTaskAssignment(
+				createMockTaskAssignmentInput({
+					phase: 'resolve-conflicts',
+					taskId: '99-conflicts',
+					workItem: undefined,
+					pr: {
+						prNumber: '99',
+						prBranch: 'issue-17',
+						headSha: 'deadbeef',
+						baseBranch: 'main',
+						baseSha: 'cafe',
+						catchUpOnly: true,
+					},
+				}),
+			),
+			sink,
+			{ ...RUN_OPTIONS, deps: depsWith(runPhase) },
+		);
+
+		expect(runPhase).toHaveBeenCalledWith(expect.objectContaining({ catchUpOnly: true }));
+		expect(sink.sent.at(-1)).toMatchObject({
+			status: 'succeeded',
+			mergeCatchUp: { status: 'updated', headSha: 'worker-merge' },
+		});
+	});
+
 	it('reports no CI outcome for a phase that produces none', async () => {
 		const sink = recordingSink();
 		const runPhase = vi.fn(async () => ({ agent: agentResult() }));

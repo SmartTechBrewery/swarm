@@ -52,6 +52,25 @@
  *     has attributed to its own update of the reviewed head onto the base, and
  *     reports {@link UpdatePullRequestBranchOutcome} `head-moved` for anything
  *     else, which needs a fresh review exactly as a pushed head always did.
+ *
+ * **When the provider cannot update a branch (issue #1117).** Bitbucket Cloud,
+ * gitlab.com and Azure DevOps Services answer `updatePullRequestBranch` with a
+ * declared `unsupported`, and they keep doing so: the fallback is merge
+ * automation's, not a provider capability pretending to exist. The dispatch asks
+ * a SWARM worker that holds the repository to do the update instead — a
+ * catch-up pass of the Resolve-conflicts phase that runs no agent
+ * (`runResolveConflictsCatchUp`, `src/pipeline/resolve-conflicts.ts`) — and
+ * carries the approval onto what it produced. All three properties hold for that
+ * commit by construction rather than by a provider read: SWARM's implementer
+ * identity authored it on the worker from a checkout asserted to hold the
+ * reviewed head, its first parent is that reviewed head and its second the base
+ * head the worker read at merge time, git merged the two with no conflict and no
+ * hand edit (a conflict is reported, never committed), and the remote branch is
+ * re-read and must still *be* the reviewed head immediately before the commit,
+ * which is then pushed only as a fast-forward of it — a branch that moved at
+ * either point comes back as `head-moved`. So the approval only ever travels onto a commit
+ * SWARM itself built from the reviewed diff plus the base, exactly as it does for
+ * GitHub's own update.
  */
 
 import type { ProjectConfig } from '../config/schema.js';
@@ -128,8 +147,9 @@ export type MergePullRequestOutcome =
  *   phase's job, not merge automation's.
  * - `unsupported` — this provider exposes no way to update a pull request's
  *   branch. A *declared* answer, not a stub: the capability genuinely does not
- *   exist in the provider's API, so the dispatch refuses the merge visibly
- *   instead of merging on stale evidence.
+ *   exist in the provider's API, so the dispatch brings the head up to date on
+ *   a SWARM worker instead ({@link WorkerBranchUpdateOutcome}, issue #1117) —
+ *   never merging on stale evidence.
  * - `provider-error` — an unexpected API, authentication, rate-limit, or
  *   transport failure, exactly as on the merge side.
  */
@@ -140,6 +160,20 @@ export type UpdatePullRequestBranchOutcome =
 	| { status: 'conflict'; message: string }
 	| { status: 'unsupported'; message: string }
 	| { status: 'provider-error'; message: string };
+
+/**
+ * What SWARM's own worker-side update of a pull request's branch answers (issue
+ * #1117) — the fallback merge automation takes when the provider's
+ * {@link ScmMergeProvider.updatePullRequestBranch} is `unsupported`. Deliberately
+ * the subset of {@link UpdatePullRequestBranchOutcome} a checkout can produce, so
+ * the dispatch settles each status exactly as it settles the provider's: a worker
+ * that has the repository either produced the merge commit, found nothing to do,
+ * found the branch moved, or found the base does not merge cleanly.
+ */
+export type WorkerBranchUpdateOutcome = Extract<
+	UpdatePullRequestBranchOutcome,
+	{ status: 'updated' | 'up-to-date' | 'head-moved' | 'conflict' }
+>;
 
 /**
  * Provider-neutral capability: merge an approved, ready pull/merge request.

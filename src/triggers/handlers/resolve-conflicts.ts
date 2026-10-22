@@ -8,11 +8,17 @@
  * Both gate on the shared work-item origin gate (`../swarm-managed-pr.ts`, issue
  * #836) rather than on the PR's author — see that module's header for why author
  * identity carries no signal under the federated model.
+ *
+ * A third path is not about conflicts at all (issue #1117): merge automation's
+ * worker-side branch update for a provider that cannot update a branch itself
+ * arrives as a synthetic job carrying `mergeCatchUp`, and is dispatched as a
+ * catch-up pass of this phase — see {@link checkCatchUp}.
  */
 
 import type { DispatchWaitReason } from '../../db/repositories/dispatchesRepository.js';
 import { scheduleCoalescedDispatch } from '../../dispatch/dispatcher.js';
 import { logger } from '../../lib/logger.js';
+import type { MergeCatchUpRequest } from '../../queue/jobs.js';
 import type { ScmEvent } from '../../scm/events.js';
 import { SWARM_GENERATED_FOOTER } from '../../scm/swarm-origin.js';
 import type { PullRequestDetails } from '../../scm/types.js';
@@ -53,12 +59,14 @@ export function createResolveConflictsTrigger(): TriggerHandler {
 			return (
 				ctx.source === 'scm' &&
 				ctx.event.kind === 'pull-request' &&
-				ctx.event.action === 'closed' &&
-				ctx.event.merged === true
+				(ctx.mergeCatchUp !== undefined ||
+					(ctx.event.action === 'closed' && ctx.event.merged === true))
 			);
 		},
 		async handle(ctx): Promise<TriggerResult | null> {
-			if (ctx.source !== 'scm' || !ctx.event.baseBranch) return null;
+			if (ctx.source !== 'scm') return null;
+			if (ctx.mergeCatchUp) return checkCatchUp(ctx, ctx.mergeCatchUp);
+			if (!ctx.event.baseBranch) return null;
 			const candidates = await ctx.scm.listConflictCandidates(ctx.project, ctx.event.baseBranch);
 
 			if (!ctx.event.conflictPrNumber) {
@@ -119,6 +127,63 @@ async function checkCandidate(
 		headSha: candidate.headSha,
 		baseBranch: candidate.baseBranch,
 		baseSha: candidate.baseSha,
+	};
+}
+
+/**
+ * Merge automation's worker-side branch update (issue #1117): dispatch a catch-up
+ * pass pinned to the approved head the merge dispatch is waiting on.
+ *
+ * No ownership or mergeability gate — SWARM's own Review approved this pull
+ * request and SWARM's own merge dispatch asked for the update, and a stale head
+ * is *mergeable* by definition, which is exactly what the ordinary path would
+ * turn away. The pull request is read once for the coordinates the phase needs
+ * (its head branch and the base it targets), and a closed one is not updated.
+ *
+ * The run takes the resolve-conflicts dedup claim like any other pass, keyed on
+ * the pinned head and the base head read here, so it cannot run beside an
+ * ordinary resolution of the very same state; the PR-scoped hold (#850) applies
+ * downstream, as for every branch-writing phase.
+ */
+async function checkCatchUp(
+	ctx: ScmTriggerContext,
+	request: MergeCatchUpRequest,
+): Promise<TriggerResult | null> {
+	const prNumber = ctx.event.workItemId;
+	if (!prNumber) return null;
+	const pr = await ctx.scm.getPullRequest(ctx.project, Number(prNumber), 'implementer');
+	if (pr.state !== 'open') {
+		logger.info(
+			'resolve-conflicts: catch-up requested for a pull request that is closed — skipping',
+			{
+				prNumber,
+				reviewRunId: request.reviewRunId,
+			},
+		);
+		return null;
+	}
+	const stateKey = buildConflictResolutionKey(
+		ctx.project.repo,
+		prNumber,
+		request.headSha,
+		pr.baseSha,
+	);
+	if (
+		!ctx.runId &&
+		!ctx.continuationDispatchClaimed &&
+		!(await claimConflictResolution(stateKey, ctx.dispatchId))
+	) {
+		return null;
+	}
+	return {
+		phase: 'resolve-conflicts',
+		taskId: `${prNumber}-conflicts`,
+		prNumber,
+		prBranch: pr.headBranch,
+		headSha: request.headSha,
+		baseBranch: pr.baseBranch,
+		baseSha: pr.baseSha,
+		mergeCatchUp: request,
 	};
 }
 

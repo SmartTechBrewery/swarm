@@ -12,11 +12,26 @@ const scheduleDispatchRetry = vi.fn(
 const listActiveMergeDispatchesForRepository = vi.fn(
 	async (_projectId: string, _repo: string): Promise<DispatchRow[]> => [],
 );
+// The worker-side branch update's hand-back (issue #1117): the read of the merge
+// dispatch it adopts into, and the compare-and-set write itself.
+const findDispatchByDedupKey = vi.fn(
+	async (_key: string): Promise<DispatchRow | undefined> => undefined,
+);
+const adoptWorkerBranchUpdateIntoWaitingMerge = vi.fn(
+	async (_id: string, _wakeSeq: number, _payload: unknown): Promise<DispatchRow | null> =>
+		mockDispatchRow({ state: 'retry-scheduled' }),
+);
 vi.mock('@/db/repositories/dispatchesRepository.js', async (importOriginal) => ({
 	// The real lifecycle constants, which `classifyDispatchClaim` reads.
 	EXECUTING_DISPATCH_STATES: (
 		await importOriginal<typeof import('@/db/repositories/dispatchesRepository.js')>()
 	).EXECUTING_DISPATCH_STATES,
+	WAITING_DISPATCH_STATES: (
+		await importOriginal<typeof import('@/db/repositories/dispatchesRepository.js')>()
+	).WAITING_DISPATCH_STATES,
+	findDispatchByDedupKey: (key: string) => findDispatchByDedupKey(key),
+	adoptWorkerBranchUpdateIntoWaitingMerge: (id: string, wakeSeq: number, payload: unknown) =>
+		adoptWorkerBranchUpdateIntoWaitingMerge(id, wakeSeq, payload),
 	completeDispatch: (id: string, outcome: string) => completeDispatch(id, outcome),
 	failDispatch: (id: string, error: string) => failDispatch(id, error),
 	scheduleDispatchRetry: (id: string, input: unknown) => scheduleDispatchRetry(id, input),
@@ -101,16 +116,22 @@ import {
 	_resetSCMProviderRegistryForTesting,
 	registerSCMProvider,
 } from '@/integrations/scm/registry.js';
-import type { MergeAutomationJob } from '@/queue/jobs.js';
-import type { MergePullRequestOutcome, UpdatePullRequestBranchOutcome } from '@/scm/merge.js';
+import { MERGE_CATCH_UP_ACTION, type MergeAutomationJob } from '@/queue/jobs.js';
+import type {
+	MergePullRequestOutcome,
+	UpdatePullRequestBranchOutcome,
+	WorkerBranchUpdateOutcome,
+} from '@/scm/merge.js';
 import type { AggregateCheckStatus, PullRequestDetails } from '@/scm/types.js';
 import {
+	adoptWorkerBranchUpdate,
 	MAX_BASE_UPDATES,
 	MAX_MERGE_RETRIES,
 	MERGE_PROVIDER_ERROR_EXHAUSTED,
 	MERGE_QUEUE_RECHECK_MS,
 	MERGE_QUEUED,
 	MERGE_RETRY_EXHAUSTED,
+	mergeCatchUpDedupKey,
 	mergeDispatchDedupKey,
 	mergeRetryDelayMs,
 	processMergeAutomationDispatch,
@@ -180,6 +201,7 @@ beforeEach(() => {
 		category: 'scm',
 		webhookRoute: '/github/webhook',
 		provider: {
+			type: 'github',
 			mergePullRequest: registeredMergePullRequest,
 			getPullRequest: registeredGetPullRequest,
 		},
@@ -205,6 +227,12 @@ beforeEach(() => {
 	markReviewVerdictSuperseded.mockResolvedValue(true);
 	markReviewRunSuperseded.mockClear();
 	markReviewRunSuperseded.mockResolvedValue(true);
+	findDispatchByDedupKey.mockReset();
+	findDispatchByDedupKey.mockResolvedValue(undefined);
+	adoptWorkerBranchUpdateIntoWaitingMerge.mockReset();
+	adoptWorkerBranchUpdateIntoWaitingMerge.mockResolvedValue(
+		mockDispatchRow({ state: 'retry-scheduled' }),
+	);
 });
 
 /** The stale-base answer the merge capability gives for a head behind its base. */
@@ -954,23 +982,6 @@ describe('processMergeAutomationDispatch: a stale approved head', () => {
 		expect(outcome.result).toBe('not-eligible');
 	});
 
-	it('settles a provider that cannot update a branch terminally, with a comment', async () => {
-		const commentOnPullRequest = vi.fn(async (_p: unknown, _n: number, _body: string) => 1);
-
-		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
-			mergePullRequest: mergeReturning(STALE_BASE),
-			updatePullRequestBranch: updateReturning({
-				status: 'unsupported',
-				message: 'Bitbucket Cloud exposes no API for merging the destination branch',
-			}),
-			commentOnPullRequest,
-		});
-
-		expect(commentOnPullRequest).toHaveBeenCalledOnce();
-		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-unsupported');
-		expect(outcome.result).toBe('unsupported');
-	});
-
 	// The update call's own provider error takes the same shared budget as the
 	// merge call's (issue #923) — leaving it terminal would half-fix the
 	// lifecycle, since an identical 502 would still strand the pull request.
@@ -1019,14 +1030,380 @@ describe('processMergeAutomationDispatch: a stale approved head', () => {
 	it('settles even when the refusal comment cannot be posted', async () => {
 		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
 			mergePullRequest: mergeReturning(STALE_BASE),
-			updatePullRequestBranch: updateReturning({ status: 'unsupported', message: 'no' }),
+			updatePullRequestBranch: updateReturning({ status: 'conflict', message: 'conflicts' }),
 			commentOnPullRequest: vi.fn(async (_p: unknown, _n: number, _body: string) => {
 				throw new Error('provider unreachable');
 			}),
 		});
 
-		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-unsupported');
-		expect(outcome.result).toBe('unsupported');
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
+		expect(outcome.result).toBe('not-eligible');
+	});
+});
+
+// Issue #1117: Bitbucket Cloud, gitlab.com and Azure DevOps Services declare
+// `updatePullRequestBranch` unsupported, so a SWARM worker does the update and
+// hands its result back to the dispatch waiting on it.
+describe('processMergeAutomationDispatch: a provider that cannot update a branch', () => {
+	const prAtHead = (headSha: string) =>
+		vi.fn(async () => ({ number: 17, headBranch: 'issue-12', headSha }) as PullRequestDetails);
+	const UNSUPPORTED: UpdatePullRequestBranchOutcome = {
+		status: 'unsupported',
+		message: 'Bitbucket Cloud exposes no API for merging the destination branch',
+	};
+	/** The payload once the catch-up was asked for this head, optionally with its result. */
+	function waitingOnWorker(result?: WorkerBranchUpdateOutcome): MergeAutomationJob {
+		return { ...job, workerCatchUp: { requestedFor: 'deadbeef', ...(result ? { result } : {}) } };
+	}
+
+	it('asks a SWARM worker for the update and parks, with no comment and no terminal settle', async () => {
+		const requestMergeCatchUp = vi.fn(async (_input: unknown) => {});
+		const commentOnPullRequest = vi.fn(async (_p: unknown, _n: number, _body: string) => 1);
+
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow({ attempt: 3 }),
+			job,
+			project,
+			{
+				mergePullRequest: mergeReturning(STALE_BASE),
+				updatePullRequestBranch: updateReturning(UNSUPPORTED),
+				commentOnPullRequest,
+				requestMergeCatchUp,
+			},
+		);
+
+		expect(requestMergeCatchUp).toHaveBeenCalledExactlyOnceWith({
+			project,
+			job: onTurn(job),
+		});
+		const input = lastRetryInput();
+		expect(input.jobPayload).toEqual(onTurn(waitingOnWorker()));
+		expect(input.waitReason).toBe('recheck');
+		// A new wait: the budget restarts, sized like the one after GitHub's own update.
+		expect(input.attempt).toBe(0);
+		expect(input.availableAt.getTime() - Date.now()).toBeLessThanOrEqual(mergeRetryDelayMs(1));
+		expect(updateReviewMergeOutcome).toHaveBeenCalledExactlyOnceWith('run-1', {
+			status: 'stale-base',
+			message: expect.stringContaining('a SWARM worker is merging the base into it'),
+			attempt: 3,
+			approvedHeadSha: 'deadbeef',
+			advancedFrom: undefined,
+		});
+		expect(commentOnPullRequest).not.toHaveBeenCalled();
+		expect(completeDispatch).not.toHaveBeenCalled();
+		expect(promoteMergeQueueWaits).not.toHaveBeenCalled();
+		expect(outcome.result).toBe('retry-scheduled');
+	});
+
+	it('persists the catch-up as a deduped resolve-conflicts dispatch by default', async () => {
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning(STALE_BASE),
+			updatePullRequestBranch: updateReturning(UNSUPPORTED),
+		});
+
+		expect(createAndPublishDispatch).toHaveBeenCalledExactlyOnceWith({
+			projectId: project.id,
+			jobPayload: {
+				type: 'scm',
+				providerId: 'github',
+				projectId: project.id,
+				mergeCatchUp: { reviewRunId: 'run-1', headSha: 'deadbeef' },
+				event: {
+					kind: 'pull-request',
+					action: MERGE_CATCH_UP_ACTION,
+					repoFullName: project.repo,
+					workItemId: '17',
+					isCommentEvent: false,
+					headSha: 'deadbeef',
+				},
+			},
+			dedupKey: mergeCatchUpDedupKey('run-1', 'deadbeef'),
+			source: 'synthetic',
+			taskId: '17-conflicts',
+			phase: 'resolve-conflicts',
+		});
+		expect(mergeCatchUpDedupKey('run-1', 'deadbeef')).toBe('merge-catch-up:run-1:deadbeef');
+	});
+
+	it('waits on the ordinary budget, asking nothing again, once the update is requested', async () => {
+		const requestMergeCatchUp = vi.fn(async (_input: unknown) => {});
+
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow({ attempt: 2 }),
+			waitingOnWorker(),
+			project,
+			{
+				mergePullRequest: mergeReturning(STALE_BASE),
+				updatePullRequestBranch: updateReturning(UNSUPPORTED),
+				requestMergeCatchUp,
+			},
+		);
+
+		expect(requestMergeCatchUp).not.toHaveBeenCalled();
+		expect(lastRetryInput().attempt).toBe(3);
+		expect(updateReviewMergeOutcome).toHaveBeenLastCalledWith('run-1', {
+			status: 'not-ready',
+			message: 'waiting for a SWARM worker to bring the head up to date with the base',
+			attempt: 2,
+			approvedHeadSha: 'deadbeef',
+			advancedFrom: undefined,
+		});
+		expect(outcome.result).toBe('retry-scheduled');
+	});
+
+	it('gives up on the bounded budget when the worker never answers', async () => {
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow({ attempt: MAX_MERGE_RETRIES }),
+			waitingOnWorker(),
+			project,
+			{
+				mergePullRequest: mergeReturning(STALE_BASE),
+				updatePullRequestBranch: updateReturning(UNSUPPORTED),
+			},
+		);
+
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-retry-exhausted');
+		expect(updateReviewMergeOutcome).toHaveBeenLastCalledWith(
+			'run-1',
+			expect.objectContaining({
+				status: MERGE_RETRY_EXHAUSTED,
+				message: expect.stringContaining('asked a SWARM worker'),
+			}),
+		);
+		expect(outcome.result).toBe(MERGE_RETRY_EXHAUSTED);
+	});
+
+	it('retries the request on the ordinary budget when it cannot be persisted', async () => {
+		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning(STALE_BASE),
+			updatePullRequestBranch: updateReturning(UNSUPPORTED),
+			requestMergeCatchUp: vi.fn(async () => {
+				throw new Error('db down');
+			}),
+		});
+
+		const input = lastRetryInput();
+		expect(input.attempt).toBe(1);
+		// Not marked requested, so the next attempt asks again.
+		expect(input.jobPayload.workerCatchUp).toBeUndefined();
+		expect(outcome.result).toBe('retry-scheduled');
+	});
+
+	it('advances onto the head the worker produced, pre-claims its review slot and resets the budget', async () => {
+		const mergePullRequest = mergeReturning(STALE_BASE);
+
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow({ attempt: 4 }),
+			waitingOnWorker({ status: 'updated', headSha: 'worker-merge' }),
+			project,
+			{ mergePullRequest },
+		);
+
+		expect(mergePullRequest).not.toHaveBeenCalled();
+		const input = lastRetryInput();
+		expect(input.jobPayload).toEqual(
+			onTurn({ ...job, approvedHeadSha: 'worker-merge', baseUpdates: 1 }),
+		);
+		expect(input.attempt).toBe(0);
+		expect(claimReviewDispatch).toHaveBeenCalledWith(
+			`${project.repo}:17:worker-merge`,
+			'merge-automation',
+			{ prNumber: '17', headSha: 'worker-merge' },
+		);
+		expect(updateReviewMergeOutcome).toHaveBeenCalledExactlyOnceWith('run-1', {
+			status: 'stale-base',
+			message: expect.stringContaining('on a SWARM worker (deadbeef → worker-merge)'),
+			attempt: 4,
+			approvedHeadSha: 'worker-merge',
+			advancedFrom: 'deadbeef',
+		});
+		expect(outcome.result).toBe('retry-scheduled');
+	});
+
+	it('merges the worker-produced head once its own checks are green', async () => {
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged', sha: 'm' });
+
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow(),
+			{ ...job, approvedHeadSha: 'worker-merge', baseUpdates: 1 },
+			project,
+			{ mergePullRequest, getAggregateCheckStatus: checksConcluding('success') },
+		);
+
+		expect(mergePullRequest).toHaveBeenCalledExactlyOnceWith(project, 17, 'worker-merge');
+		expect(outcome.result).toBe('merged');
+	});
+
+	it('settles a conflicting worker merge terminally, with the conflict comment', async () => {
+		const commentOnPullRequest = vi.fn(async (_p: unknown, _n: number, _body: string) => 1);
+		const mergePullRequest = mergeReturning(STALE_BASE);
+
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow(),
+			waitingOnWorker({ status: 'conflict', message: 'conflicts in a.ts' }),
+			project,
+			{ mergePullRequest, commentOnPullRequest, getPullRequest: prAtHead('deadbeef') },
+		);
+
+		expect(mergePullRequest).not.toHaveBeenCalled();
+		expect(commentOnPullRequest.mock.calls[0]?.[2]).toContain(
+			'the base does not merge into it cleanly: conflicts in a.ts',
+		);
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
+		expect(markReviewVerdictSuperseded).not.toHaveBeenCalled();
+		expect(promoteMergeQueueWaits).toHaveBeenCalledExactlyOnceWith(project.id, job.repo);
+		expect(outcome.result).toBe('not-eligible');
+	});
+
+	it('settles a head that moved under the worker terminally and frees the approval’s slot', async () => {
+		const commentOnPullRequest = vi.fn(async (_p: unknown, _n: number, _body: string) => 1);
+
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow(),
+			waitingOnWorker({ status: 'head-moved', message: 'branch is at pushed-head' }),
+			project,
+			{
+				mergePullRequest: mergeReturning(STALE_BASE),
+				commentOnPullRequest,
+				getPullRequest: prAtHead('pushed-head'),
+			},
+		);
+
+		expect(commentOnPullRequest.mock.calls[0]?.[2]).toContain(
+			'the branch moved to a commit SWARM did not ask for: branch is at pushed-head',
+		);
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
+		expect(markReviewVerdictSuperseded).toHaveBeenCalledOnce();
+		expect(outcome.result).toBe('not-eligible');
+	});
+
+	it('merges as usual when the worker found the head already up to date', async () => {
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged', sha: 'm' });
+
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow(),
+			waitingOnWorker({ status: 'up-to-date' }),
+			project,
+			{ mergePullRequest },
+		);
+
+		expect(mergePullRequest).toHaveBeenCalledOnce();
+		expect(outcome.result).toBe('merged');
+	});
+
+	it('ignores a result recorded for a head the dispatch has moved past', async () => {
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged', sha: 'm' });
+
+		await processMergeAutomationDispatch(
+			mockDispatchRow(),
+			{
+				...job,
+				approvedHeadSha: 'later-head',
+				workerCatchUp: {
+					requestedFor: 'deadbeef',
+					result: { status: 'conflict', message: 'stale' },
+				},
+			},
+			project,
+			{ mergePullRequest, getAggregateCheckStatus: checksConcluding('success') },
+		);
+
+		expect(mergePullRequest).toHaveBeenCalledOnce();
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merged');
+	});
+
+	// Acceptance (d): GitHub keeps its own update; the fallback is `unsupported`'s alone.
+	it('never asks a worker when the provider can update the branch itself', async () => {
+		const requestMergeCatchUp = vi.fn(async (_input: unknown) => {});
+
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning(STALE_BASE),
+			updatePullRequestBranch: updateReturning({ status: 'updated', headSha: 'gh-merge' }),
+			requestMergeCatchUp,
+		});
+
+		expect(requestMergeCatchUp).not.toHaveBeenCalled();
+		expect(lastRetryInput().jobPayload.approvedHeadSha).toBe('gh-merge');
+	});
+});
+
+describe('adoptWorkerBranchUpdate', () => {
+	const waiting: MergeAutomationJob = { ...job, workerCatchUp: { requestedFor: 'deadbeef' } };
+	const input = {
+		project,
+		reviewRunId: 'run-1',
+		headSha: 'deadbeef',
+		outcome: { status: 'updated', headSha: 'worker-merge' } as const,
+	};
+	const noSleep = vi.fn(async (_ms: number) => {});
+
+	beforeEach(() => noSleep.mockClear());
+
+	it('adopts the result into the waiting merge dispatch and wakes it', async () => {
+		findDispatchByDedupKey.mockResolvedValue(
+			mockDispatchRow({ state: 'retry-scheduled', wakeSeq: 7, jobPayload: waiting }),
+		);
+
+		expect(await adoptWorkerBranchUpdate(input, noSleep)).toBe(true);
+
+		expect(findDispatchByDedupKey).toHaveBeenCalledWith(mergeDispatchDedupKey('run-1'));
+		expect(adoptWorkerBranchUpdateIntoWaitingMerge).toHaveBeenCalledExactlyOnceWith(
+			'dispatch-1',
+			7,
+			{
+				...waiting,
+				workerCatchUp: { requestedFor: 'deadbeef', result: input.outcome },
+			},
+		);
+		expect(publishDispatchWakeUp).toHaveBeenCalledOnce();
+		// Settling is the merge dispatch's own job, under its own claim.
+		expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+		expect(completeDispatch).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		['no merge dispatch', undefined],
+		['a settled merge dispatch', mockDispatchRow({ state: 'completed', jobPayload: waiting })],
+		[
+			'one that moved past this head',
+			mockDispatchRow({
+				state: 'retry-scheduled',
+				jobPayload: { ...waiting, approvedHeadSha: 'later' },
+			}),
+		],
+		[
+			'one that never asked for this update',
+			mockDispatchRow({ state: 'retry-scheduled', jobPayload: job }),
+		],
+	])('drops the result for %s', async (_label, row) => {
+		findDispatchByDedupKey.mockResolvedValue(row);
+
+		expect(await adoptWorkerBranchUpdate(input, noSleep)).toBe(false);
+
+		expect(adoptWorkerBranchUpdateIntoWaitingMerge).not.toHaveBeenCalled();
+		expect(noSleep).not.toHaveBeenCalled();
+	});
+
+	it('reads a merge dispatch caught mid-attempt again until it is waiting', async () => {
+		findDispatchByDedupKey
+			.mockResolvedValueOnce(mockDispatchRow({ state: 'running', jobPayload: waiting }))
+			.mockResolvedValueOnce(mockDispatchRow({ state: 'retry-scheduled', jobPayload: waiting }));
+
+		expect(await adoptWorkerBranchUpdate(input, noSleep)).toBe(true);
+
+		expect(noSleep).toHaveBeenCalledOnce();
+		expect(adoptWorkerBranchUpdateIntoWaitingMerge).toHaveBeenCalledOnce();
+	});
+
+	it('gives up, bounded, on a merge dispatch that stays busy', async () => {
+		findDispatchByDedupKey.mockResolvedValue(
+			mockDispatchRow({ state: 'leased', jobPayload: waiting }),
+		);
+
+		expect(await adoptWorkerBranchUpdate(input, noSleep)).toBe(false);
+
+		expect(findDispatchByDedupKey).toHaveBeenCalledTimes(5);
+		expect(noSleep).toHaveBeenCalledTimes(4);
 	});
 });
 

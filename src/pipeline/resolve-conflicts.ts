@@ -16,23 +16,29 @@ import { logger } from '../lib/logger.js';
 import type { RecoveryMode } from '../queue/jobs.js';
 import {
 	advancedBaseHead,
+	assertCheckoutHoldsHead,
 	assertRemoteHead,
 	type ConflictHandoff,
 	ConflictHandoffSchema,
 	type ConflictVerification,
 	commitPreparedTree,
 	DeliveryDeferredError,
+	DeliveryDivergedError,
 	deliveryIdentity,
 	HANDOFF_FILENAMES,
+	isUnretryableDeliveryFailure,
 	loadDeliveryProgress,
+	mergeBaseIntoCheckout,
 	pushDeliveredBranch,
 	readHandoff,
+	remoteBranchHead,
 	resumedDeliveryAgent,
 	type ScmDeliveryProvider,
 	saveDeliveryProgress,
 	shouldDeferDeliveryFailure,
 	UnretryableDeliveryError,
 } from '../scm/delivery.js';
+import type { WorkerBranchUpdateOutcome } from '../scm/merge.js';
 import { GitWorktreeManager } from '../worker/git-worktree-manager.js';
 import { graftEnvironment } from '../worktree/graft.js';
 import { settleMergeResolution } from './merge-resolution.js';
@@ -806,4 +812,122 @@ export async function runResolveConflictsPhase(
 			runId,
 		);
 	}
+}
+
+/**
+ * The worker-side branch update merge automation falls back to when the
+ * provider cannot update a pull request's branch itself (issue #1117): a
+ * **catch-up** pass of this phase that runs no agent at all. It is this phase
+ * because this phase already *is* "merge the base into the pull request's branch
+ * on a worker and push" — the same `<pr>-conflicts` task, run row, PR-scoped hold
+ * and dedup claim — minus the part only an agent can do. So git alone decides:
+ *
+ *  - the checkout must hold `headSha`, the approved head the merge dispatch is
+ *    pinned to; a branch that moved is `head-moved`, and nothing is merged;
+ *  - the base is merged in with `--no-ff` ({@link mergeBaseIntoCheckout}); a
+ *    head that already contains it is `up-to-date`, and a merge git cannot
+ *    complete is aborted and reported as `conflict` — resolving it is the
+ *    ordinary Resolve-conflicts run's job, never this one's;
+ *  - a clean merge is committed through {@link commitPreparedTree} as the
+ *    implementer, after the remote branch is re-read and found still at
+ *    `headSha`, and pushed through {@link pushDeliveredBranch} as a
+ *    fast-forward of that head; a push refused because the branch moved
+ *    meanwhile is `head-moved` too, so the approval is never carried onto a
+ *    commit that is not this one.
+ *
+ * What it produced is the whole answer — reported as a
+ * {@link WorkerBranchUpdateOutcome} for the control plane to hand back to the
+ * waiting merge dispatch — so it posts no comment and records no delivery
+ * progress: a run that dies before pushing leaves the branch untouched, and the
+ * merge dispatch's own bounded wait covers it. `src/scm/merge.ts`'s header
+ * states why the commit is attributable to SWARM by construction.
+ */
+export async function runResolveConflictsCatchUp(
+	options: RunResolveConflictsPhaseOptions,
+): Promise<{ agent: AgentCliResult; catchUp: WorkerBranchUpdateOutcome }> {
+	const {
+		project,
+		prNumber,
+		prBranch,
+		headSha,
+		baseBranch,
+		taskId,
+		cli = DEFAULT_RESOLVE_CONFLICTS_CLI,
+		runId,
+		recoveryMode,
+	} = options;
+	const worktrees = options.worktrees ?? new GitWorktreeManager(project);
+	const context = { taskId, prNumber, headSha, baseBranch };
+	logger.info('Phase started - Resolve-conflicts (catch-up) — merging the base, no agent', context);
+	const { handle } = await acquireResumableWorktree(
+		worktrees,
+		taskId,
+		'resolve-conflicts',
+		prBranch,
+		false,
+		undefined,
+		() => worktrees.provision(taskId, { createBranch: false, branch: prBranch, runId }),
+		false,
+		recoveryMode,
+		runId,
+	);
+	try {
+		const catchUp = await catchUpCheckout(handle.path, options);
+		logger.info('Phase finished - Resolve-conflicts (catch-up)', { ...context, ...catchUp });
+		return { agent: resumedDeliveryAgent(cli), catchUp };
+	} finally {
+		await cleanupUnlessPreserved(worktrees, taskId, false, 'resolve-conflicts catch-up', runId);
+	}
+}
+
+/** The git half of {@link runResolveConflictsCatchUp}, against a provisioned checkout. */
+async function catchUpCheckout(
+	cwd: string,
+	options: RunResolveConflictsPhaseOptions,
+): Promise<WorkerBranchUpdateOutcome> {
+	const { project, prBranch, headSha, baseBranch } = options;
+	const moved = (found: string): WorkerBranchUpdateOutcome => ({
+		status: 'head-moved',
+		message: `branch '${prBranch}' is at ${found}, not the approved head ${headSha}, so SWARM did not merge '${baseBranch}' into it and pushed nothing`,
+	});
+
+	let held: Awaited<ReturnType<typeof assertCheckoutHoldsHead>>;
+	try {
+		held = await assertCheckoutHoldsHead(cwd, prBranch, headSha);
+	} catch (error) {
+		// The approved head was rewritten out of the branch.
+		if (isUnretryableDeliveryFailure(error))
+			return { status: 'head-moved', message: describeError(error) };
+		throw error;
+	}
+	if (held !== 'unchanged') return moved(held.advancedTo);
+
+	const merge = await mergeBaseIntoCheckout(cwd, baseBranch);
+	if (merge.status === 'up-to-date') return { status: 'up-to-date' };
+	if (merge.status === 'conflict')
+		return {
+			status: 'conflict',
+			message: `merging '${baseBranch}' (${merge.baseSha}) into '${prBranch}' conflicts in ${merge.paths.join(', ')}; the merge was aborted and nothing was pushed`,
+		};
+
+	const delivery =
+		options.delivery ??
+		(await requireProjectSCMProvider(project).deliveryProvider(project, 'implementer'));
+	// Asked again on the remote, immediately before anything is built on top of the
+	// head: the checkout was provisioned minutes ago at the earliest.
+	const remote = await remoteBranchHead(cwd, prBranch);
+	if (remote !== headSha) return moved(remote);
+	const commitSha = await commitPreparedTree(
+		cwd,
+		mergeCommitSubject(baseBranch, prBranch),
+		delivery.commitIdentity,
+	);
+	try {
+		await pushDeliveredBranch(delivery, cwd, prBranch, commitSha);
+	} catch (error) {
+		if (error instanceof DeliveryDivergedError)
+			return { status: 'head-moved', message: describeError(error) };
+		throw error;
+	}
+	return { status: 'updated', headSha: commitSha };
 }

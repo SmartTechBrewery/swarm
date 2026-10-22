@@ -405,6 +405,17 @@ export const TaskAssignmentSchema = z.object({
 	baseBranch: z.string().optional(),
 	baseSha: z.string().optional(),
 	/**
+	 * resolve-conflicts only: run the phase as merge automation's worker-side
+	 * branch update (issue #1117) — merge the base with no agent and report what it
+	 * produced on the result frame's `mergeCatchUp` — rather than as a conflict
+	 * resolution. Optional and additive in both directions, so
+	 * `TRANSPORT_PROTOCOL_VERSION` is deliberately not bumped: an older router never
+	 * sets it, and an older worker ignores it and runs an ordinary resolution, which
+	 * reports no `mergeCatchUp` and leaves the waiting merge dispatch to its own
+	 * bounded wait.
+	 */
+	catchUpOnly: z.boolean().optional(),
+	/**
 	 * The **worker operator's own** SCM credential for the provider this project runs
 	 * on, resolved control-plane side per `(worker, project.scm)` from the durable
 	 * store (issue #765) — the identity the phase's commits, push, pull request and
@@ -838,6 +849,21 @@ export const TaskExecutionResultSchema = z.object({
 	// `TRANSPORT_PROTOCOL_VERSION` is deliberately **not** bumped: an older worker
 	// simply omits it and the control plane records nothing, exactly as today.
 	absorbed: z.array(ReviewAbsorbedFrameSchema).optional(),
+	// `succeeded` — what a Resolve-conflicts catch-up pass produced (issue #1117):
+	// merge automation's worker-side branch update, which the control plane hands
+	// back to the waiting merge dispatch (`adoptWorkerBranchUpdate`,
+	// `../worker/merge-automation.ts`). Only a `catchUpOnly` run sends it. Declared
+	// here rather than imported, for the same reason `ReviewAbsorbedFrameSchema` is.
+	// Optional and additive in both directions, so `TRANSPORT_PROTOCOL_VERSION` is
+	// deliberately **not** bumped.
+	mergeCatchUp: z
+		.discriminatedUnion('status', [
+			z.object({ status: z.literal('updated'), headSha: z.string().min(1) }),
+			z.object({ status: z.literal('up-to-date') }),
+			z.object({ status: z.literal('head-moved'), message: z.string() }),
+			z.object({ status: z.literal('conflict'), message: z.string() }),
+		])
+		.optional(),
 });
 export type TaskExecutionResult = z.infer<typeof TaskExecutionResultSchema>;
 

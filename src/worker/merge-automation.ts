@@ -42,9 +42,15 @@
  *    merge queue below is what stops two of them doing it at once;
  *  - it is allowed {@link MAX_BASE_UPDATES} times, after which the pull request
  *    is handed to a human rather than looping against a faster-moving base;
- *  - a provider that cannot update a branch, a conflicting update, and a red
- *    fresh CI each settle terminally *and comment on the pull request* —
- *    refused rather than merged on stale evidence;
+ *  - a conflicting update and a red fresh CI each settle terminally *and comment
+ *    on the pull request* — refused rather than merged on stale evidence;
+ *  - a provider that cannot update a branch at all (Bitbucket Cloud, gitlab.com,
+ *    Azure DevOps Services) has the update done on a SWARM worker instead (issue
+ *    #1117): a catch-up pass of the Resolve-conflicts phase merges the base into
+ *    the branch with no agent and pushes it pinned to the approved head, and its
+ *    result comes back to this dispatch to be settled exactly as the provider's
+ *    own update would be ({@link requestWorkerBranchUpdate},
+ *    {@link adoptWorkerBranchUpdate});
  *  - the head the update produces pre-claims its own PR+SHA review-dispatch slot
  *    so re-verification costs no `REVIEW_VERDICT_CAP` slot.
  *
@@ -101,12 +107,16 @@
 
 import type { ProjectConfig } from '../config/schema.js';
 import {
+	adoptWorkerBranchUpdateIntoWaitingMerge,
 	completeDispatch,
 	type DispatchOutcome,
 	type DispatchRow,
 	type DispatchWaitReason,
+	EXECUTING_DISPATCH_STATES,
+	findDispatchByDedupKey,
 	listActiveMergeDispatchesForRepository,
 	scheduleDispatchRetry,
+	WAITING_DISPATCH_STATES,
 } from '../db/repositories/dispatchesRepository.js';
 import { markReviewVerdictSuperseded } from '../db/repositories/reviewVerdictsRepository.js';
 import {
@@ -124,12 +134,18 @@ import { requireProjectSCMProvider } from '../integrations/scm/registry.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { issueNumberFromBranch } from '../pipeline/task-branch.js';
-import type { MergeAutomationJob } from '../queue/jobs.js';
+import {
+	MERGE_CATCH_UP_ACTION,
+	type MergeAutomationJob,
+	type MergeCatchUpRequest,
+	normalizeStoredJobPayload,
+} from '../queue/jobs.js';
 import type {
 	MergePullRequest,
 	MergePullRequestOutcome,
 	UpdatePullRequestBranch,
 	UpdatePullRequestBranchOutcome,
+	WorkerBranchUpdateOutcome,
 } from '../scm/merge.js';
 import { SWARM_GENERATED_FOOTER } from '../scm/swarm-origin.js';
 import type { SCMProvider } from '../scm/types.js';
@@ -375,6 +391,10 @@ function exhaustionMessage(
 ): string {
 	if (exhaustion === MERGE_PROVIDER_ERROR_EXHAUSTED)
 		return `Merge automation gave up after ${MAX_MERGE_RETRIES + 1} attempts against a source-control provider that kept failing; the pull request is approved but was left open for a manual merge. Last provider error: ${lastMessage}`;
+	// The worker-side update this dispatch asked for never landed (issue #1117) —
+	// a worker that never picked it up, or a catch-up run that failed.
+	if (job.workerCatchUp?.requestedFor === job.approvedHeadSha)
+		return `Merge automation asked a SWARM worker to bring this pull request's head up to date with its base and gave up after ${MAX_MERGE_RETRIES + 1} attempts waiting for that update; the pull request is approved but was left open for a manual merge. Last reason: ${lastMessage}`;
 	if (baseUpdatesSpent(job) > 0)
 		return `Merge automation brought this pull request's head up to date with its base and gave up after ${MAX_MERGE_RETRIES + 1} attempts waiting for that head to become mergeable; the pull request is approved but was left open for a manual merge. Last reason: ${lastMessage}`;
 	return 'Merge automation gave up after repeated not-ready results; the pull request is approved but was left open for a manual merge.';
@@ -424,6 +444,12 @@ export interface MergeAutomationCapabilities {
 	getAggregateCheckStatus?: SCMProvider['getAggregateCheckStatus'];
 	commentOnPullRequest?: SCMProvider['commentOnPullRequest'];
 	getPullRequest?: SCMProvider['getPullRequest'];
+	/**
+	 * Not a provider capability: how a stale head is handed to a SWARM worker when
+	 * the provider cannot update the branch itself (issue #1117). Defaults to
+	 * {@link requestMergeCatchUp}, and is injectable for the same reason the rest is.
+	 */
+	requestMergeCatchUp?: (input: RequestMergeCatchUpInput) => Promise<void>;
 }
 
 /**
@@ -433,7 +459,7 @@ export interface MergeAutomationCapabilities {
  * and that has to land on the same `provider-error` path as any other provider
  * failure rather than escaping `processJob`.
  */
-function scmCapability<K extends keyof MergeAutomationCapabilities>(
+function scmCapability<K extends Exclude<keyof MergeAutomationCapabilities, 'requestMergeCatchUp'>>(
 	project: ProjectConfig,
 	key: K,
 ): NonNullable<MergeAutomationCapabilities[K]> {
@@ -740,11 +766,29 @@ type StaleBaseReaction =
 	| { kind: 'settled'; outcome: MergeAutomationSettledOutcome }
 	| { kind: 'retry'; outcome: MergePullRequestOutcome };
 
+/** A branch update that produced something to act on — every status but `up-to-date`. */
+type ProducedBranchUpdate = Exclude<WorkerBranchUpdateOutcome, { status: 'up-to-date' }>;
+
+/** Who brought the head up to date: the provider's own update, or a SWARM worker (issue #1117). */
+type BranchUpdateSource = 'provider' | 'worker';
+
+function settledOutcome(
+	job: MergeAutomationJob,
+	result: MergeAutomationSettledOutcome['result'],
+): MergeAutomationSettledOutcome {
+	return { status: 'merge-automation-settled', result, prNumber: job.prNumber };
+}
+
 /**
  * React to a head that is behind its base: bring it up to date, re-pin the
  * approval to the commit that produced, and let the fresh CI decide (issue
  * #874). Every exit is either a scheduled retry or a *visible* terminal
  * settlement — never a merge.
+ *
+ * A provider that cannot update a branch at all hands the update to a SWARM
+ * worker instead (issue #1117, {@link requestWorkerBranchUpdate}), and the
+ * result that worker reports later is settled by {@link applyBranchUpdate}
+ * exactly as the provider's own would have been.
  */
 async function reactToStaleBase(
 	dispatch: DispatchRow,
@@ -755,10 +799,6 @@ async function reactToStaleBase(
 	capabilities: MergeAutomationCapabilities,
 ): Promise<StaleBaseReaction> {
 	const spent = baseUpdatesSpent(job);
-	const settle = (result: MergeAutomationSettledOutcome['result']): StaleBaseReaction => ({
-		kind: 'settled',
-		outcome: { status: 'merge-automation-settled', result, prNumber: job.prNumber },
-	});
 
 	if (spent >= MAX_BASE_UPDATES) {
 		// Settled as `merge-retry-exhausted` — the queue's existing vocabulary for
@@ -783,7 +823,7 @@ async function reactToStaleBase(
 			baseUpdates: spent,
 		});
 		await settleMergeDispatch(dispatch, job, project, 'merge-retry-exhausted');
-		return settle('stale-base');
+		return { kind: 'settled', outcome: settledOutcome(job, 'stale-base') };
 	}
 
 	let update: UpdatePullRequestBranchOutcome;
@@ -793,44 +833,6 @@ async function reactToStaleBase(
 		update = await updateBranch(project, Number(job.prNumber), job.approvedHeadSha);
 	} catch (err) {
 		update = { status: 'provider-error', message: describeError(err) };
-	}
-
-	if (update.status === 'updated') {
-		// The approval is carried onto a commit the *provider* built from the
-		// reviewed diff plus the base, at SWARM's request and attributed to that
-		// request before it was reported (`src/scm/merge.ts`'s header states why
-		// that is sound, and `head-moved` below is what an unattributable head gets
-		// instead). What the advance invalidates is the verification, and the reset
-		// budget below is this dispatch waiting for the replacement.
-		const advanced: MergeAutomationJob = {
-			...job,
-			approvedHeadSha: update.headSha,
-			baseUpdates: spent + 1,
-		};
-		const advancedMessage = `Brought the head up to date with the base (${job.approvedHeadSha} → ${update.headSha}); the approval carries forward and the merge waits for this head's own checks.`;
-		await persistMergeOutcome(
-			advanced,
-			'stale-base',
-			advancedMessage,
-			attempt,
-			job.approvedHeadSha,
-		);
-		await claimUpdatedHeadReviewSlot(project, job, update.headSha);
-		// `attempt: 0` resets the not-ready budget: the fresh CI is a new wait, not
-		// a continuation of whatever the old head was waiting for.
-		await scheduleMergeRetry(dispatch.id, advanced, 0, mergeRetryDelayMs(1), {
-			waitReason: 'recheck',
-			lastError: advancedMessage,
-		});
-		logger.info('Merge automation: advanced the approved head onto the base', {
-			dispatchId: dispatch.id,
-			runId: job.reviewRunId,
-			prNumber: job.prNumber,
-			previousHeadSha: job.approvedHeadSha,
-			headSha: update.headSha,
-			baseUpdates: advanced.baseUpdates,
-		});
-		return settle('retry-scheduled');
 	}
 
 	if (update.status === 'up-to-date') {
@@ -846,93 +848,441 @@ async function reactToStaleBase(
 		};
 	}
 
-	if (update.status === 'head-moved') {
-		// The branch's head is not the reviewed commit and not this update's
-		// commit either — somebody pushed. `approvedHeadSha` deliberately stays
-		// where it is: this is the same `not-eligible` a pushed head has always
-		// produced, and the push's own Review is what clears it.
-		await persistMergeOutcome(job, 'not-eligible', update.message, attempt);
-		await commentOnMergeRefusal(
-			job,
-			project,
-			capabilities,
-			mergeRefusalCommentBody(
-				`Its head is behind the base, and while SWARM was bringing it up to date the branch moved to a commit SWARM did not ask for: ${update.message}`,
-				'SWARM will pick the pull request up again from the review of the head that is there now.',
-			),
-		);
-		logger.warn('Merge automation: the head moved while it was being updated', {
-			dispatchId: dispatch.id,
-			runId: job.reviewRunId,
-			prNumber: job.prNumber,
-			approvedHeadSha: job.approvedHeadSha,
-			message: update.message,
-		});
-		// The head moved out from under the approval, which is exactly what must not
-		// spend a review-cap slot (issue #1079).
-		await markApprovalSupersededByHeadChange(job, project, capabilities);
-		await settleMergeDispatch(dispatch, job, project, 'merge-not-eligible');
-		return settle('not-eligible');
-	}
-
-	if (update.status === 'conflict') {
-		// Deliberately *not* stamped superseded (issue #1079): a conflicting update
-		// means the base does not merge into the head, not that the head moved, so
-		// the approval keeps its slot. (This branch would not reach the terminal
-		// `not-eligible` below either — it settles here.)
-		await persistMergeOutcome(job, 'not-eligible', update.message, attempt);
-		await commentOnMergeRefusal(
-			job,
-			project,
-			capabilities,
-			mergeRefusalCommentBody(
-				`Its head is behind the base and the base does not merge into it cleanly: ${update.message}`,
-				'Resolve the conflict on the branch; SWARM will pick the pull request up again from its next review.',
-			),
-		);
-		logger.warn('Merge automation: cannot update a conflicting head', {
-			dispatchId: dispatch.id,
-			runId: job.reviewRunId,
-			prNumber: job.prNumber,
-			message: update.message,
-		});
-		await settleMergeDispatch(dispatch, job, project, 'merge-not-eligible');
-		return settle('not-eligible');
-	}
-
 	if (update.status === 'unsupported') {
-		await persistMergeOutcome(job, 'unsupported', update.message, attempt);
-		await commentOnMergeRefusal(
+		return requestWorkerBranchUpdate(dispatch, job, project, update.message, attempt, capabilities);
+	}
+
+	if (update.status === 'provider-error') {
+		// The same transient class the merge call itself can meet, in the same
+		// dispatch during the same merge — so it is handed back to the one shared
+		// bounded budget instead of stranding the pull request here. Which call
+		// failed travels in the message, preserving the diagnostic the removed
+		// `logger.error` carried without logging the same failure twice.
+		return {
+			kind: 'retry',
+			outcome: {
+				status: 'provider-error',
+				message: `failed to bring the head up to date with the base: ${update.message}`,
+			},
+		};
+	}
+
+	return {
+		kind: 'settled',
+		outcome: await applyBranchUpdate(
+			dispatch,
 			job,
 			project,
+			update,
+			attempt,
 			capabilities,
-			mergeRefusalCommentBody(
-				`Its head is behind the base, and this source-control provider cannot bring it up to date automatically: ${update.message}`,
-				'Update the branch yourself and let its checks run, then merge it manually.',
-			),
-		);
-		logger.warn('Merge automation: provider cannot update a stale head', {
+			'provider',
+		),
+	};
+}
+
+/**
+ * Settle a branch update that produced something — the provider's own (issue
+ * #874) or a SWARM worker's (issue #1117), through the same three branches, so a
+ * pull request on Bitbucket, GitLab or Azure DevOps is advanced, refused and
+ * commented on exactly as one on GitHub is.
+ */
+async function applyBranchUpdate(
+	dispatch: DispatchRow,
+	job: MergeAutomationJob,
+	project: ProjectConfig,
+	update: ProducedBranchUpdate,
+	attempt: number,
+	capabilities: MergeAutomationCapabilities,
+	source: BranchUpdateSource,
+): Promise<MergeAutomationSettledOutcome> {
+	switch (update.status) {
+		case 'updated':
+			return advanceOntoUpdatedHead(dispatch, job, project, update.headSha, attempt, source);
+		case 'head-moved':
+			return settleHeadMovedDuringUpdate(
+				dispatch,
+				job,
+				project,
+				update.message,
+				attempt,
+				capabilities,
+			);
+		case 'conflict':
+			return settleConflictingUpdate(dispatch, job, project, update.message, attempt, capabilities);
+	}
+}
+
+/**
+ * Re-pin the approval onto the head an update produced and wait for that head's
+ * own CI. The approval is carried onto a commit built from the reviewed diff plus
+ * the base, at SWARM's request and attributed to that request before it was
+ * reported (`src/scm/merge.ts`'s header states why that is sound for both the
+ * provider's update and a SWARM worker's, and `head-moved` is what an
+ * unattributable head gets instead). What the advance invalidates is the
+ * verification, and the reset budget below is this dispatch waiting for the
+ * replacement.
+ */
+async function advanceOntoUpdatedHead(
+	dispatch: DispatchRow,
+	job: MergeAutomationJob,
+	project: ProjectConfig,
+	headSha: string,
+	attempt: number,
+	source: BranchUpdateSource,
+): Promise<MergeAutomationSettledOutcome> {
+	// `workerCatchUp` belonged to the head being replaced, so it is not carried.
+	const { workerCatchUp: _consumed, ...rest } = job;
+	const advanced: MergeAutomationJob = {
+		...rest,
+		approvedHeadSha: headSha,
+		baseUpdates: baseUpdatesSpent(job) + 1,
+	};
+	const where = source === 'worker' ? ' on a SWARM worker' : '';
+	const advancedMessage = `Brought the head up to date with the base${where} (${job.approvedHeadSha} → ${headSha}); the approval carries forward and the merge waits for this head's own checks.`;
+	await persistMergeOutcome(advanced, 'stale-base', advancedMessage, attempt, job.approvedHeadSha);
+	await claimUpdatedHeadReviewSlot(project, job, headSha);
+	// `attempt: 0` resets the not-ready budget: the fresh CI is a new wait, not
+	// a continuation of whatever the old head was waiting for.
+	await scheduleMergeRetry(dispatch.id, advanced, 0, mergeRetryDelayMs(1), {
+		waitReason: 'recheck',
+		lastError: advancedMessage,
+	});
+	logger.info('Merge automation: advanced the approved head onto the base', {
+		dispatchId: dispatch.id,
+		runId: job.reviewRunId,
+		prNumber: job.prNumber,
+		previousHeadSha: job.approvedHeadSha,
+		headSha,
+		baseUpdates: advanced.baseUpdates,
+		source,
+	});
+	return settledOutcome(job, 'retry-scheduled');
+}
+
+/**
+ * The branch's head is not the reviewed commit and not the update's commit either
+ * — somebody pushed. `approvedHeadSha` deliberately stays where it is: this is the
+ * same `not-eligible` a pushed head has always produced, and the push's own Review
+ * is what clears it.
+ */
+async function settleHeadMovedDuringUpdate(
+	dispatch: DispatchRow,
+	job: MergeAutomationJob,
+	project: ProjectConfig,
+	message: string,
+	attempt: number,
+	capabilities: MergeAutomationCapabilities,
+): Promise<MergeAutomationSettledOutcome> {
+	await persistMergeOutcome(job, 'not-eligible', message, attempt);
+	await commentOnMergeRefusal(
+		job,
+		project,
+		capabilities,
+		mergeRefusalCommentBody(
+			`Its head is behind the base, and while SWARM was bringing it up to date the branch moved to a commit SWARM did not ask for: ${message}`,
+			'SWARM will pick the pull request up again from the review of the head that is there now.',
+		),
+	);
+	logger.warn('Merge automation: the head moved while it was being updated', {
+		dispatchId: dispatch.id,
+		runId: job.reviewRunId,
+		prNumber: job.prNumber,
+		approvedHeadSha: job.approvedHeadSha,
+		message,
+	});
+	// The head moved out from under the approval, which is exactly what must not
+	// spend a review-cap slot (issue #1079).
+	await markApprovalSupersededByHeadChange(job, project, capabilities);
+	await settleMergeDispatch(dispatch, job, project, 'merge-not-eligible');
+	return settledOutcome(job, 'not-eligible');
+}
+
+/**
+ * The base does not merge into the head cleanly. Deliberately *not* stamped
+ * superseded (issue #1079): a conflicting update means the base does not merge
+ * into the head, not that the head moved, so the approval keeps its slot.
+ * Resolving it is the Resolve-conflicts phase's job, not merge automation's.
+ */
+async function settleConflictingUpdate(
+	dispatch: DispatchRow,
+	job: MergeAutomationJob,
+	project: ProjectConfig,
+	message: string,
+	attempt: number,
+	capabilities: MergeAutomationCapabilities,
+): Promise<MergeAutomationSettledOutcome> {
+	await persistMergeOutcome(job, 'not-eligible', message, attempt);
+	await commentOnMergeRefusal(
+		job,
+		project,
+		capabilities,
+		mergeRefusalCommentBody(
+			`Its head is behind the base and the base does not merge into it cleanly: ${message}`,
+			'Resolve the conflict on the branch; SWARM will pick the pull request up again from its next review.',
+		),
+	);
+	logger.warn('Merge automation: cannot update a conflicting head', {
+		dispatchId: dispatch.id,
+		runId: job.reviewRunId,
+		prNumber: job.prNumber,
+		message,
+	});
+	await settleMergeDispatch(dispatch, job, project, 'merge-not-eligible');
+	return settledOutcome(job, 'not-eligible');
+}
+
+/**
+ * The provider cannot update the branch itself (issue #1117): ask a SWARM worker
+ * that holds the repository to merge the base into it, and wait for that.
+ *
+ * The update has to run where a checkout is. This dispatch runs agent-less on
+ * the control plane, which may have none, and a federated worker may have no
+ * database — so the update is its own dispatch (a catch-up pass of the
+ * Resolve-conflicts phase, {@link requestMergeCatchUp}) and its result reaches
+ * this one through {@link adoptWorkerBranchUpdate}, which hands it in for the next
+ * attempt to settle with {@link applyBranchUpdate}.
+ *
+ * Asked once per approved head (`workerCatchUp.requestedFor`): the first ask
+ * parks this dispatch with the attempt budget reset — the update is a new wait,
+ * sized like the one after the provider's own update — and every attempt after
+ * it, until the result arrives, is an ordinary `not-ready` on that budget. The
+ * budget is therefore what bounds the wait for a worker that never answers, and
+ * this dispatch keeps the merge queue's turn throughout.
+ */
+async function requestWorkerBranchUpdate(
+	dispatch: DispatchRow,
+	job: MergeAutomationJob,
+	project: ProjectConfig,
+	providerMessage: string,
+	attempt: number,
+	capabilities: MergeAutomationCapabilities,
+): Promise<StaleBaseReaction> {
+	const requested =
+		job.workerCatchUp?.requestedFor === job.approvedHeadSha ? job.workerCatchUp : undefined;
+	if (requested) {
+		return {
+			kind: 'retry',
+			outcome: {
+				status: 'not-ready',
+				message:
+					requested.result?.status === 'up-to-date'
+						? 'the provider reports the head behind its base, but the SWARM worker that went to update it found the base already merged in'
+						: 'waiting for a SWARM worker to bring the head up to date with the base',
+			},
+		};
+	}
+
+	try {
+		await (capabilities.requestMergeCatchUp ?? requestMergeCatchUp)({ project, job });
+	} catch (err) {
+		return {
+			kind: 'retry',
+			outcome: {
+				status: 'not-ready',
+				message: `could not ask a SWARM worker to bring the head up to date with the base: ${describeError(err)}`,
+			},
+		};
+	}
+
+	const parked: MergeAutomationJob = {
+		...job,
+		workerCatchUp: { requestedFor: job.approvedHeadSha },
+	};
+	const message = `This source-control provider cannot bring the head up to date with the base itself (${providerMessage}), so a SWARM worker is merging the base into it; the merge waits for that head and its own checks.`;
+	await persistMergeOutcome(parked, 'stale-base', message, attempt);
+	await scheduleMergeRetry(dispatch.id, parked, 0, mergeRetryDelayMs(1), {
+		waitReason: 'recheck',
+		lastError: message,
+	});
+	logger.info('Merge automation: asked a SWARM worker to bring the stale head up to date', {
+		dispatchId: dispatch.id,
+		runId: job.reviewRunId,
+		prNumber: job.prNumber,
+		approvedHeadSha: job.approvedHeadSha,
+	});
+	return { kind: 'settled', outcome: settledOutcome(job, 'retry-scheduled') };
+}
+
+/** The dedup identity of the catch-up one merge dispatch asks for one approved head. */
+export function mergeCatchUpDedupKey(reviewRunId: string, approvedHeadSha: string): string {
+	return `merge-catch-up:${reviewRunId}:${approvedHeadSha}`;
+}
+
+export interface RequestMergeCatchUpInput {
+	project: ProjectConfig;
+	/** The merge dispatch's payload — the head to update and the Review run to hand back to. */
+	job: MergeAutomationJob;
+}
+
+/**
+ * Persist the worker-side branch update a merge dispatch needs (issue #1117) as a
+ * durable dispatch of its own: a synthetic `scm` job the `resolve-conflicts`
+ * handler turns into a catch-up pass of that phase, pinned to the approved head.
+ * Deduped per (Review run, approved head), so a crash-retried request can never
+ * mint a second. Throws on failure — the caller treats it as a transient wait.
+ */
+export async function requestMergeCatchUp({
+	project,
+	job,
+}: RequestMergeCatchUpInput): Promise<void> {
+	const request: MergeCatchUpRequest = {
+		reviewRunId: job.reviewRunId,
+		headSha: job.approvedHeadSha,
+	};
+	const { dispatch, created } = await createAndPublishDispatch({
+		projectId: project.id,
+		jobPayload: {
+			type: 'scm',
+			providerId: requireProjectSCMProvider(project).type,
+			projectId: project.id,
+			mergeCatchUp: request,
+			event: {
+				kind: 'pull-request',
+				action: MERGE_CATCH_UP_ACTION,
+				repoFullName: job.repo,
+				workItemId: job.prNumber,
+				isCommentEvent: false,
+				headSha: job.approvedHeadSha,
+			},
+		},
+		dedupKey: mergeCatchUpDedupKey(job.reviewRunId, job.approvedHeadSha),
+		source: 'synthetic',
+		taskId: `${job.prNumber}-conflicts`,
+		phase: 'resolve-conflicts',
+	});
+	logger.info(
+		created
+			? 'Merge automation: persisted the worker-side branch update dispatch'
+			: 'Merge automation: worker-side branch update dispatch already exists — not duplicating',
+		{
 			dispatchId: dispatch.id,
 			runId: job.reviewRunId,
 			prNumber: job.prNumber,
-			message: update.message,
-		});
-		await settleMergeDispatch(dispatch, job, project, 'merge-unsupported');
-		return settle('unsupported');
-	}
-
-	// The same transient class the merge call itself can meet, in the same
-	// dispatch during the same merge — so it is handed back to the one shared
-	// bounded budget instead of stranding the pull request here. Which call
-	// failed travels in the message, preserving the diagnostic the removed
-	// `logger.error` carried without logging the same failure twice.
-	return {
-		kind: 'retry',
-		outcome: {
-			status: 'provider-error',
-			message: `failed to bring the head up to date with the base: ${update.message}`,
+			headSha: job.approvedHeadSha,
 		},
+	);
+}
+
+/**
+ * The worker-side branch update handed back into this payload that is still to
+ * be settled — `up-to-date` excepted, which has nothing to apply and lets the
+ * attempt merge as usual.
+ */
+function handedBackBranchUpdate(job: MergeAutomationJob): ProducedBranchUpdate | undefined {
+	const catchUp = job.workerCatchUp;
+	if (!catchUp?.result || catchUp.requestedFor !== job.approvedHeadSha) return undefined;
+	return catchUp.result.status === 'up-to-date' ? undefined : catchUp.result;
+}
+
+/** How often, and how far apart, the hand-back retries a merge dispatch caught mid-attempt. */
+const HAND_BACK_ATTEMPTS = 5;
+const HAND_BACK_RETRY_MS = 2_000;
+
+export interface AdoptWorkerBranchUpdateInput {
+	project: ProjectConfig;
+	/** The Review run whose merge dispatch asked for the update. */
+	reviewRunId: string;
+	/** The approved head the update was asked for. */
+	headSha: string;
+	outcome: WorkerBranchUpdateOutcome;
+}
+
+/**
+ * Hand a worker-side branch update's result to the merge dispatch waiting on it
+ * (issue #1117) — called at the composition root once the catch-up run settles.
+ *
+ * It does not settle anything itself. The merge dispatch owns its payload and its
+ * lifecycle, and every write that settles one is conditional on the claim it
+ * holds, so the result is adopted into the waiting row ({@link
+ * adoptWorkerBranchUpdateIntoWaitingMerge}) and the dispatch is woken to apply it
+ * under its own claim with {@link applyBranchUpdate}: the advance, the review-slot
+ * pre-claim and the reset budget for `updated`, and the same terminal outcome and
+ * comment as the provider's own update for `conflict` and `head-moved`.
+ *
+ * Adopted only while the dispatch is still waiting for *this* update — the same
+ * approved head, the catch-up recorded as requested for it. A merge dispatch
+ * caught mid-attempt is read again a few times, {@link HAND_BACK_RETRY_MS} apart,
+ * since an attempt is a handful of provider reads; anything else — no dispatch,
+ * a settled one, one that has moved past this head — drops the result with a
+ * line, and the dispatch's own budget is what covers it. Returns whether it was
+ * adopted.
+ */
+export async function adoptWorkerBranchUpdate(
+	input: AdoptWorkerBranchUpdateInput,
+	sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+): Promise<boolean> {
+	const context = {
+		projectId: input.project.id,
+		runId: input.reviewRunId,
+		headSha: input.headSha,
+		status: input.outcome.status,
 	};
+	for (let tries = 1; ; tries += 1) {
+		const handed = await tryAdoptWorkerBranchUpdate(input, context);
+		if (handed !== 'busy') return handed === 'adopted';
+		if (tries >= HAND_BACK_ATTEMPTS) {
+			logger.warn(
+				'Merge automation: the merge dispatch stayed busy — dropping the branch update',
+				context,
+			);
+			return false;
+		}
+		await sleep(HAND_BACK_RETRY_MS);
+	}
+}
+
+/**
+ * One read-and-adopt pass of {@link adoptWorkerBranchUpdate}: `busy` when the merge
+ * dispatch is mid-attempt (or won the compare-and-set race) and is worth reading
+ * again, `dropped` when it is not waiting for this update at all.
+ */
+async function tryAdoptWorkerBranchUpdate(
+	input: AdoptWorkerBranchUpdateInput,
+	context: Record<string, unknown>,
+): Promise<'adopted' | 'dropped' | 'busy'> {
+	const dispatch = await findDispatchByDedupKey(mergeDispatchDedupKey(input.reviewRunId));
+	const payload = dispatch ? normalizeStoredJobPayload(dispatch.jobPayload) : undefined;
+	const waiting = WAITING_DISPATCH_STATES.some((state) => state === dispatch?.state);
+	const executing = EXECUTING_DISPATCH_STATES.some((state) => state === dispatch?.state);
+	if (!dispatch || payload?.type !== 'merge-automation' || (!waiting && !executing)) {
+		logger.warn('Merge automation: no active merge dispatch to hand the branch update to', {
+			...context,
+			state: dispatch?.state,
+		});
+		return 'dropped';
+	}
+	if (
+		payload.approvedHeadSha !== input.headSha ||
+		payload.workerCatchUp?.requestedFor !== input.headSha
+	) {
+		logger.warn('Merge automation: the merge dispatch has moved past this branch update', {
+			...context,
+			dispatchId: dispatch.id,
+			approvedHeadSha: payload.approvedHeadSha,
+		});
+		return 'dropped';
+	}
+	if (!waiting) return 'busy';
+	const adopted = await adoptWorkerBranchUpdateIntoWaitingMerge(dispatch.id, dispatch.wakeSeq, {
+		...payload,
+		workerCatchUp: { requestedFor: input.headSha, result: input.outcome },
+	});
+	if (!adopted) return 'busy';
+	try {
+		await publishDispatchWakeUp(adopted);
+	} catch (err) {
+		logger.warn('Failed to publish the merge wake-up (reconciler will repair)', {
+			...context,
+			dispatchId: dispatch.id,
+			error: describeError(err),
+		});
+	}
+	logger.info('Merge automation: handed the worker-side branch update to its merge', {
+		...context,
+		dispatchId: dispatch.id,
+	});
+	return 'adopted';
 }
 
 /**
@@ -1160,6 +1510,108 @@ async function settleChildrenThisMergeAbsorbed(
 }
 
 /**
+ * The point of the whole exercise: the reviewed diff and the current base are
+ * each fine and their combination is not. Refused, and said out loud on the pull
+ * request — merging it would be exactly the red base this exists to prevent.
+ */
+async function refuseRedUpdatedHead(
+	dispatch: DispatchRow,
+	job: MergeAutomationJob,
+	project: ProjectConfig,
+	message: string,
+	redFreshChecks: string[],
+	attempt: number,
+	capabilities: MergeAutomationCapabilities,
+): Promise<MergeAutomationSettledOutcome> {
+	const failed = redFreshChecks.join(', ');
+	await persistMergeOutcome(job, 'not-eligible', message, attempt);
+	await commentOnMergeRefusal(
+		job,
+		project,
+		capabilities,
+		mergeRefusalCommentBody(
+			`SWARM brought this pull request's head up to date with the base and the resulting commit fails its checks: ${failed}. Each side is green on its own; together they are not.`,
+			'Fix the combination on this branch — the failure is real, and it is what this pull request would have landed.',
+		),
+	);
+	logger.warn('Merge automation: the updated head is red — refusing the merge', {
+		dispatchId: dispatch.id,
+		runId: job.reviewRunId,
+		prNumber: job.prNumber,
+		headSha: job.approvedHeadSha,
+		failedChecks: redFreshChecks,
+	});
+	// Deliberately *not* stamped superseded (issue #1079), and returned before
+	// the terminal branch that would: this refusal is a genuinely red merged
+	// tree, not a supersession. The approval must keep its slot — freeing it
+	// would buy re-reviews of a combination that is actually broken.
+	await settleMergeDispatch(dispatch, job, project, 'merge-not-eligible');
+	return settledOutcome(job, 'not-eligible');
+}
+
+/**
+ * A retryable outcome: schedule the next attempt on the bounded, doubling
+ * backoff, or — on the attempt that spends the budget — settle with the
+ * exhaustion outcome that names why.
+ */
+async function retryOrExhaust(
+	dispatch: DispatchRow,
+	job: MergeAutomationJob,
+	project: ProjectConfig,
+	outcome: MergePullRequestOutcome,
+	retryExhaustion: ReviewMergeOutcomeStatus,
+	attempt: number,
+): Promise<MergeAutomationSettledOutcome> {
+	const nextAttempt = attempt + 1;
+	if (nextAttempt > MAX_MERGE_RETRIES) {
+		await persistMergeOutcome(
+			job,
+			retryExhaustion,
+			exhaustionMessage(job, retryExhaustion, outcome.message),
+			attempt,
+		);
+		logger.warn('Merge automation: retry budget exhausted, leaving the PR open', {
+			dispatchId: dispatch.id,
+			runId: job.reviewRunId,
+			prNumber: job.prNumber,
+			outcome: retryExhaustion,
+			reason: outcome.message,
+		});
+		await settleMergeDispatch(dispatch, job, project, 'merge-retry-exhausted');
+		return {
+			status: 'merge-automation-settled',
+			result: retryExhaustion,
+			prNumber: job.prNumber,
+		};
+	}
+	await persistMergeOutcome(job, outcome.status, outcome.message, attempt);
+	await scheduleMergeRetry(dispatch.id, job, nextAttempt, mergeRetryDelayMs(nextAttempt), {
+		waitReason: 'recheck',
+		// Replaces whatever the row last said — a `merge-queue` sentence included.
+		lastError: outcome.message,
+	});
+	const scheduled = {
+		dispatchId: dispatch.id,
+		runId: job.reviewRunId,
+		prNumber: job.prNumber,
+		attempt: nextAttempt,
+		reason: outcome.message,
+	};
+	// A failing forge keeps the severity its terminal settle used to carry;
+	// a pull request that is simply not ready yet is ordinary progress.
+	if (outcome.status === 'provider-error') {
+		logger.error('Merge automation: provider failure — retry scheduled', scheduled);
+	} else {
+		logger.info('Merge automation: pull request not ready — retry scheduled', scheduled);
+	}
+	return {
+		status: 'merge-automation-settled',
+		result: 'retry-scheduled',
+		prNumber: job.prNumber,
+	};
+}
+
+/**
  * Execute one claimed merge-automation dispatch: invoke the provider-neutral
  * merge capability (fresh PR state and approval re-checked from scratch),
  * persist the outcome on the originating Review run, and settle the dispatch —
@@ -1200,43 +1652,26 @@ export async function processMergeAutomationDispatch(
 	// Stamped with the turn's start, so every retry this dispatch schedules from
 	// here carries it to the waiters reading the queue behind it.
 	const job = turn.job;
+	// A worker-side branch update this dispatch asked for has reported (issue
+	// #1117): settle it exactly as the provider's own update would have been.
+	const handedBack = handedBackBranchUpdate(job);
+	if (handedBack) {
+		return applyBranchUpdate(dispatch, job, project, handedBack, attempt, capabilities, 'worker');
+	}
 	const attempted = await attemptMerge(job, project, capabilities);
 	const redFreshChecks = attempted.redFreshChecks;
 	let outcome: MergePullRequestOutcome = attempted.outcome;
 
 	if (redFreshChecks) {
-		// The point of the whole exercise: the reviewed diff and the current base
-		// are each fine and their combination is not. Refused, and said out loud on
-		// the pull request — merging it would be exactly the red base this exists
-		// to prevent.
-		const failed = redFreshChecks.join(', ');
-		await persistMergeOutcome(job, 'not-eligible', outcome.message, attempt);
-		await commentOnMergeRefusal(
+		return refuseRedUpdatedHead(
+			dispatch,
 			job,
 			project,
+			outcome.message,
+			redFreshChecks,
+			attempt,
 			capabilities,
-			mergeRefusalCommentBody(
-				`SWARM brought this pull request's head up to date with the base and the resulting commit fails its checks: ${failed}. Each side is green on its own; together they are not.`,
-				'Fix the combination on this branch — the failure is real, and it is what this pull request would have landed.',
-			),
 		);
-		logger.warn('Merge automation: the updated head is red — refusing the merge', {
-			dispatchId: dispatch.id,
-			runId: job.reviewRunId,
-			prNumber: job.prNumber,
-			headSha: job.approvedHeadSha,
-			failedChecks: redFreshChecks,
-		});
-		// Deliberately *not* stamped superseded (issue #1079), and returned before
-		// the terminal branch below that would: this refusal is a genuinely red
-		// merged tree, not a supersession. The approval must keep its slot —
-		// freeing it would buy re-reviews of a combination that is actually broken.
-		await settleMergeDispatch(dispatch, job, project, 'merge-not-eligible');
-		return {
-			status: 'merge-automation-settled',
-			result: 'not-eligible',
-			prNumber: job.prNumber,
-		};
 	}
 
 	if (outcome.status === 'stale-base') {
@@ -1276,53 +1711,7 @@ export async function processMergeAutomationDispatch(
 	}
 
 	if (retryExhaustion) {
-		const nextAttempt = attempt + 1;
-		if (nextAttempt > MAX_MERGE_RETRIES) {
-			await persistMergeOutcome(
-				job,
-				retryExhaustion,
-				exhaustionMessage(job, retryExhaustion, outcome.message),
-				attempt,
-			);
-			logger.warn('Merge automation: retry budget exhausted, leaving the PR open', {
-				dispatchId: dispatch.id,
-				runId: job.reviewRunId,
-				prNumber: job.prNumber,
-				outcome: retryExhaustion,
-				reason: outcome.message,
-			});
-			await settleMergeDispatch(dispatch, job, project, 'merge-retry-exhausted');
-			return {
-				status: 'merge-automation-settled',
-				result: retryExhaustion,
-				prNumber: job.prNumber,
-			};
-		}
-		await persistMergeOutcome(job, outcome.status, outcome.message, attempt);
-		await scheduleMergeRetry(dispatch.id, job, nextAttempt, mergeRetryDelayMs(nextAttempt), {
-			waitReason: 'recheck',
-			// Replaces whatever the row last said — a `merge-queue` sentence included.
-			lastError: outcome.message,
-		});
-		const scheduled = {
-			dispatchId: dispatch.id,
-			runId: job.reviewRunId,
-			prNumber: job.prNumber,
-			attempt: nextAttempt,
-			reason: outcome.message,
-		};
-		// A failing forge keeps the severity its terminal settle used to carry;
-		// a pull request that is simply not ready yet is ordinary progress.
-		if (outcome.status === 'provider-error') {
-			logger.error('Merge automation: provider failure — retry scheduled', scheduled);
-		} else {
-			logger.info('Merge automation: pull request not ready — retry scheduled', scheduled);
-		}
-		return {
-			status: 'merge-automation-settled',
-			result: 'retry-scheduled',
-			prNumber: job.prNumber,
-		};
+		return retryOrExhaust(dispatch, job, project, outcome, retryExhaustion, attempt);
 	}
 
 	logger.warn('Merge automation: terminal non-merge outcome', {

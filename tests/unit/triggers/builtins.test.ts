@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
+import { MERGE_CATCH_UP_ACTION } from '@/queue/jobs.js';
 import { registerBuiltInTriggers } from '@/triggers/builtins.js';
 import { createTriggerRegistry } from '@/triggers/registry.js';
+import { createFakeScmProvider, createMockScmTriggerContext } from '../../helpers/factories.js';
 
 describe('registerBuiltInTriggers', () => {
 	it('registers all pipeline-phase handlers', () => {
@@ -34,5 +36,31 @@ describe('registerBuiltInTriggers', () => {
 		for (const handler of registry.getHandlers()) {
 			expect(handler.description.length).toBeGreaterThan(0);
 		}
+	});
+
+	// Issue #1117: merge automation's catch-up job must reach the one handler that
+	// knows its marker — first-match-wins would otherwise let another take it.
+	it('routes the merge catch-up job to resolve-conflicts alone', () => {
+		const registry = createTriggerRegistry();
+		registerBuiltInTriggers(registry);
+		const ctx = createMockScmTriggerContext({
+			scm: createFakeScmProvider({}),
+			mergeCatchUp: { reviewRunId: 'run-1', headSha: 'abc' },
+			event: {
+				kind: 'pull-request',
+				action: MERGE_CATCH_UP_ACTION,
+				repoFullName: 'acme/widgets',
+				workItemId: '42',
+				isCommentEvent: false,
+				headSha: 'abc',
+			},
+		});
+
+		expect(
+			registry
+				.getHandlers()
+				.filter((handler) => handler.matches(ctx))
+				.map((handler) => handler.name),
+		).toEqual(['resolve-conflicts']);
 	});
 });

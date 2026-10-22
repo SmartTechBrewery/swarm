@@ -113,6 +113,7 @@ type StubPhaseResult = {
 	automationOutcome?: string;
 	ciOutcome?: string;
 	absorbed?: Array<{ url: string; reference: string; evidence: string }>;
+	mergeCatchUp?: { status: string; headSha?: string; message?: string };
 };
 
 /**
@@ -166,6 +167,10 @@ vi.mock('@/pipeline/respond-to-ci.js', () => ({
 }));
 vi.mock('@/pipeline/resolve-conflicts.js', () => ({
 	runResolveConflictsPhase: mockPhase('resolve-conflicts'),
+	runResolveConflictsCatchUp: async (args: Record<string, unknown>) => {
+		const result = await mockPhase('resolve-conflicts-catch-up')(args);
+		return { agent: result.agent, catchUp: { status: 'updated', headSha: 'worker-merge' } };
+	},
 	DEFAULT_RESOLVE_CONFLICTS_CLI: 'claude',
 }));
 
@@ -590,7 +595,12 @@ const processMergeAutomationDispatch = vi.fn(async (_d: unknown, _j: unknown, _p
 	result: 'merged' as const,
 	prNumber: '17',
 }));
+// The worker-side branch update's hand-back (issue #1117), mocked at the same
+// boundary: these tests assert the consumer hands a catch-up result over, not how
+// merge automation adopts it (that is `merge-automation.test.ts`).
+const adoptWorkerBranchUpdate = vi.fn(async (_input: unknown) => true);
 vi.mock('@/worker/merge-automation.js', () => ({
+	adoptWorkerBranchUpdate: (input: unknown) => adoptWorkerBranchUpdate(input),
 	requestMergeAutomation: (input: unknown) => requestMergeAutomation(input),
 	processMergeAutomationDispatch: (dispatch: unknown, job: unknown, project: unknown) =>
 		processMergeAutomationDispatch(dispatch, job, project),
@@ -1040,6 +1050,8 @@ describe('processJob', () => {
 		processMergeAutomationDispatch.mockClear();
 		scheduleCiNoFixRecovery.mockClear();
 		scheduleCiNoFixRecovery.mockResolvedValue(undefined);
+		adoptWorkerBranchUpdate.mockClear();
+		adoptWorkerBranchUpdate.mockResolvedValue(true);
 		getSubmittedReviewSlot.mockClear();
 		getSubmittedReviewSlot.mockResolvedValue(undefined);
 	});
@@ -7351,6 +7363,83 @@ describe('processJob', () => {
 			});
 		});
 
+		describe('the worker-side branch update hand-back (issue #1117)', () => {
+			const CATCH_UP_TRIGGER: TriggerResult = {
+				...RESOLVE_CONFLICTS_TRIGGER,
+				mergeCatchUp: { reviewRunId: 'review-run-1', headSha: 'deadbeef' },
+			} as TriggerResult;
+
+			it('hands what the catch-up produced to the merge dispatch waiting on it', async () => {
+				phaseImpl = async () => ({
+					agent: agentResult(),
+					mergeCatchUp: { status: 'updated', headSha: 'worker-merge' },
+				});
+
+				const outcome = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning(CATCH_UP_TRIGGER),
+				);
+
+				expect(outcome.status).toBe('phase-succeeded');
+				expect(adoptWorkerBranchUpdate).toHaveBeenCalledExactlyOnceWith({
+					project: PROJECT,
+					reviewRunId: 'review-run-1',
+					headSha: 'deadbeef',
+					outcome: { status: 'updated', headSha: 'worker-merge' },
+				});
+				// The catch-up run is terminal before the merge dispatch it wakes runs.
+				expect(completeDispatch.mock.invocationCallOrder[0]).toBeLessThan(
+					adoptWorkerBranchUpdate.mock.invocationCallOrder[0] as number,
+				);
+			});
+
+			it('hands back a conflict for the merge dispatch to settle', async () => {
+				phaseImpl = async () => ({
+					agent: agentResult(),
+					mergeCatchUp: { status: 'conflict', message: 'conflicts in a.ts' },
+				});
+
+				await processJob(createMockScmWebhookJob(), registryReturning(CATCH_UP_TRIGGER));
+
+				expect(adoptWorkerBranchUpdate).toHaveBeenCalledExactlyOnceWith(
+					expect.objectContaining({
+						outcome: { status: 'conflict', message: 'conflicts in a.ts' },
+					}),
+				);
+			});
+
+			it('hands nothing back from an ordinary conflict resolution', async () => {
+				phaseImpl = async () => ({ agent: agentResult() });
+
+				await processJob(createMockScmWebhookJob(), registryReturning(RESOLVE_CONFLICTS_TRIGGER));
+
+				expect(adoptWorkerBranchUpdate).not.toHaveBeenCalled();
+			});
+
+			it('hands nothing back when the worker reported no branch-update result', async () => {
+				phaseImpl = async () => ({ agent: agentResult() });
+
+				await processJob(createMockScmWebhookJob(), registryReturning(CATCH_UP_TRIGGER));
+
+				expect(adoptWorkerBranchUpdate).not.toHaveBeenCalled();
+			});
+
+			it('logs a hand-back failure and still settles phase-succeeded', async () => {
+				phaseImpl = async () => ({
+					agent: agentResult(),
+					mergeCatchUp: { status: 'updated', headSha: 'worker-merge' },
+				});
+				adoptWorkerBranchUpdate.mockRejectedValue(new Error('db down'));
+
+				const outcome = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning(CATCH_UP_TRIGGER),
+				);
+
+				expect(outcome.status).toBe('phase-succeeded');
+			});
+		});
+
 		describe('the no-fix hand-back to Review (issue #841)', () => {
 			it('schedules exactly one recovery for the PR the no-fix run declined to fix', async () => {
 				phaseImpl = async () => ({ agent: agentResult(), ciOutcome: 'no-fix' });
@@ -8262,6 +8351,29 @@ describe('runAssignedPhase (shared per-phase runner switch)', () => {
 		expect(assignedPhaseCalls[0].phase).toBe('resolve-conflicts');
 		expect(assignedPhaseCalls[0].args.baseBranch).toBe('main');
 		expect(assignedPhaseCalls[0].args.baseSha).toBe('cafe');
+	});
+
+	// Issue #1117: the same phase, run as merge automation's worker-side update.
+	it('routes a resolve-conflicts catch-up to the agent-less pass and reports its result', async () => {
+		const result = await runAssignedPhase(
+			baseInputs({
+				phase: 'resolve-conflicts',
+				prNumber: '42',
+				prBranch: 'issue-17',
+				headSha: 'dead',
+				baseBranch: 'main',
+				baseSha: 'cafe',
+				catchUpOnly: true,
+			}),
+		);
+		expect(assignedPhaseCalls.map((call) => call.phase)).toEqual(['resolve-conflicts-catch-up']);
+		expect(assignedPhaseCalls[0].args).toMatchObject({
+			prNumber: '42',
+			prBranch: 'issue-17',
+			headSha: 'dead',
+			baseBranch: 'main',
+		});
+		expect(result.mergeCatchUp).toEqual({ status: 'updated', headSha: 'worker-merge' });
 	});
 
 	it('threads a fresh session id as sessionId and a resume as resumeSessionId', async () => {

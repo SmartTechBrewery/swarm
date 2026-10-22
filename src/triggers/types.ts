@@ -25,6 +25,7 @@ import { z } from 'zod';
 import type { ProjectConfig } from '../config/schema.js';
 import type { PmEvent } from '../pm/events.js';
 import type { PMProvider, PMType, WorkItem } from '../pm/types.js';
+import type { MergeCatchUpRequest } from '../queue/jobs.js';
 import type { ScmEvent } from '../scm/events.js';
 import type { SCMProvider, ScmType } from '../scm/types.js';
 
@@ -147,6 +148,13 @@ export type TriggerContext = {
 	 * rather than routing back to Respond-to-CI.
 	 */
 	ciNoFixRecovery?: boolean;
+	/**
+	 * Set on the synthetic job merge automation enqueues when the provider cannot
+	 * bring a stale approved head up to date itself (issue #1117): the
+	 * `resolve-conflicts` handler dispatches a catch-up pass of that phase pinned
+	 * to this head, instead of reading mergeability.
+	 */
+	mergeCatchUp?: MergeCatchUpRequest;
 	/**
 	 * Records why this handler declined the delivery, for the settle to report in
 	 * place of its generic "re-evaluated to no-trigger" wording ({@link
@@ -301,6 +309,15 @@ export type TriggerResult =
 			headSha: string;
 			baseBranch: string;
 			baseSha: string;
+			/**
+			 * Set when this is merge automation's worker-side branch update (issue
+			 * #1117) rather than a conflict resolution: the phase merges the base with
+			 * no agent (`runResolveConflictsCatchUp`), and the consumer hands what it
+			 * produced back to the merge dispatch keyed on this Review run. Only the
+			 * `catchUpOnly` flag travels to a worker; the hand-back stays on the
+			 * control plane.
+			 */
+			mergeCatchUp?: MergeCatchUpRequest;
 	  });
 
 export interface TriggerHandler {

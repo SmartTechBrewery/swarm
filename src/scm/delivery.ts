@@ -805,13 +805,18 @@ export async function commitPreparedTree(
 	return git(cwd, ['rev-parse', 'HEAD']);
 }
 
+/** The branch's head on `origin`, fetched fresh. */
+export async function remoteBranchHead(cwd: string, branch: string): Promise<string> {
+	await git(cwd, ['fetch', 'origin', branch]);
+	return git(cwd, ['rev-parse', `origin/${branch}`]);
+}
+
 export async function assertRemoteHead(
 	cwd: string,
 	branch: string,
 	expectedSha: string,
 ): Promise<void> {
-	await git(cwd, ['fetch', 'origin', branch]);
-	const remote = await git(cwd, ['rev-parse', `origin/${branch}`]);
+	const remote = await remoteBranchHead(cwd, branch);
 	if (remote !== expectedSha)
 		throw new Error(`Remote head drift for ${branch}: expected ${expectedSha}, found ${remote}`);
 }
@@ -1113,6 +1118,46 @@ export async function advancedBaseHead(
 	}
 	if (!base) return null;
 	return (await isAncestor(cwd, base, deliveredSha)) === true ? null : base;
+}
+
+/** What {@link mergeBaseIntoCheckout} found, with the base head it merged (or would have). */
+export type BaseMergeResult =
+	| { status: 'merged'; baseSha: string }
+	| { status: 'up-to-date'; baseSha: string }
+	| { status: 'conflict'; baseSha: string; paths: string[] };
+
+/**
+ * Merge the base branch's current head into the checkout, **without committing** —
+ * the deterministic half of a worker-side branch update (issue #1117), where no
+ * agent runs and git alone decides whether the base merges cleanly.
+ *
+ * The base is fetched and pinned to one SHA first, so the merge — and the second
+ * parent of the commit the caller then builds from it — is exactly the base head
+ * read here, not whatever `origin/<base>` names a moment later. A head that
+ * already contains that base is `up-to-date` and nothing is merged. A merge git
+ * cannot complete on its own is aborted before returning, so a `conflict` leaves
+ * the checkout exactly where it was and nothing for a commit to pick up; the
+ * conflicted paths are reported for the message an operator reads.
+ *
+ * Anything else git refuses (a fetch that fails, a merge that dies for a reason
+ * other than conflicts) is thrown untouched: it is not an answer about the merge.
+ */
+export async function mergeBaseIntoCheckout(
+	cwd: string,
+	baseBranch: string,
+): Promise<BaseMergeResult> {
+	await git(cwd, ['fetch', 'origin', baseBranch]);
+	const baseSha = await git(cwd, ['rev-parse', `origin/${baseBranch}`]);
+	if ((await isAncestor(cwd, baseSha, 'HEAD')) === true) return { status: 'up-to-date', baseSha };
+	try {
+		await git(cwd, ['merge', '--no-ff', '--no-commit', baseSha]);
+		return { status: 'merged', baseSha };
+	} catch (error) {
+		const unresolved = await git(cwd, ['diff', '--name-only', '--diff-filter=U']).catch(() => '');
+		if (!unresolved) throw error;
+		await git(cwd, ['merge', '--abort']);
+		return { status: 'conflict', baseSha, paths: unresolved.split('\n') };
+	}
 }
 
 /**

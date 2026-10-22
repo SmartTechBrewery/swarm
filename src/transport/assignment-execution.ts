@@ -344,6 +344,10 @@ export function succeededResult(
 		// every other phase, and for the reviews — essentially all of them — that
 		// declared nothing.
 		absorbed: result.absorbed,
+		// What a Resolve-conflicts catch-up pass produced, so the control plane can
+		// hand it to the merge dispatch waiting on it (issue #1117). Absent for every
+		// other run.
+		mergeCatchUp: result.mergeCatchUp,
 	};
 }
 
@@ -964,6 +968,7 @@ function buildDbFreePhaseInputs({
 		boardItemId: assignment.boardItemId,
 		baseBranch: assignment.baseBranch,
 		baseSha: assignment.baseSha,
+		catchUpOnly: assignment.catchUpOnly,
 		// The DB-free injection seam: the phase's resolved delivery/PM providers plus
 		// the operator credential as the agent's `getToken`, so no phase reaches the
 		// secret store or DB. Source ops run under the operator's own account; the
