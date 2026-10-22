@@ -28,6 +28,7 @@ vi.mock('@/integrations/scm/github/client.js', () => ({
 	getPullRequestReviewDecision: vi.fn(),
 	getPullRequestReviews: vi.fn(),
 	getCommitProvenance: vi.fn(),
+	isBaseContainedInHead: vi.fn(),
 	isContainedInBranch: vi.fn(),
 	mergePullRequestDirect: vi.fn(),
 	updatePullRequestBranchDirect: vi.fn(),
@@ -42,6 +43,7 @@ import {
 	getPullRequestMergeState,
 	getPullRequestReviewDecision,
 	getPullRequestReviews,
+	isBaseContainedInHead,
 	isContainedInBranch,
 	mergePullRequestDirect,
 	updatePullRequestBranchDirect,
@@ -277,6 +279,8 @@ describe('GitHubSCMIntegration', () => {
 			vi.mocked(mergePullRequestDirect).mockReset();
 			vi.mocked(getPullRequestReviewDecision).mockReset();
 			vi.mocked(getPullRequestReviews).mockReset();
+			// A head that already contains its base, unless a test says otherwise.
+			vi.mocked(isBaseContainedInHead).mockReset().mockResolvedValue(true);
 			// The default fixture models an unambiguously-approved PR, so every test
 			// that doesn't care about the review-decision recheck proceeds past it.
 			vi.mocked(getPullRequestReviewDecision).mockResolvedValue('APPROVED');
@@ -323,6 +327,7 @@ describe('GitHubSCMIntegration', () => {
 				message: 'pull request already merged',
 			});
 			expect(mergePullRequestDirect).not.toHaveBeenCalled();
+			expect(isBaseContainedInHead).not.toHaveBeenCalled();
 		});
 
 		it('is not-eligible when the current head no longer matches the approved head', async () => {
@@ -681,6 +686,81 @@ describe('GitHubSCMIntegration', () => {
 				status: 'stale-base',
 			});
 			expect(mergePullRequestDirect).not.toHaveBeenCalled();
+			// GitHub's own `behind` is trusted as-is (issue #1113): a repository that
+			// requires up-to-date branches costs no extra read and answers as before.
+			expect(isBaseContainedInHead).not.toHaveBeenCalled();
+		});
+
+		// Issue #1113: a repository that does not require up-to-date branches
+		// reports `clean` for a head many commits behind, so the commit graph decides.
+		it('refuses a head GitHub calls clean when it does not contain its base', async () => {
+			vi.mocked(getPullRequestMergeState).mockResolvedValue({
+				merged: false,
+				state: 'open',
+				draft: false,
+				headSha: 'reviewed-head',
+				behindBase: false,
+				baseRef: 'main',
+			});
+			vi.mocked(isBaseContainedInHead).mockResolvedValue(false);
+
+			await expect(scm.mergePullRequest(project, 42, 'reviewed-head')).resolves.toEqual({
+				status: 'stale-base',
+				message:
+					'pull request head reviewed-head is behind its base branch, so its checks did not build the tree this merge would produce',
+			});
+			expect(isBaseContainedInHead).toHaveBeenCalledExactlyOnceWith(
+				'SmartTechBrewery',
+				'swarm',
+				'main',
+				'reviewed-head',
+			);
+			expect(mergePullRequestDirect).not.toHaveBeenCalled();
+		});
+
+		it('merges a head that contains its base after exactly one graph read', async () => {
+			vi.mocked(getPullRequestMergeState).mockResolvedValue({
+				merged: false,
+				state: 'open',
+				draft: false,
+				headSha: 'reviewed-head',
+				behindBase: false,
+				baseRef: 'main',
+			});
+			vi.mocked(mergePullRequestDirect).mockResolvedValue({
+				merged: true,
+				message: 'Pull Request successfully merged',
+				sha: 'merge-sha',
+			});
+
+			await expect(scm.mergePullRequest(project, 42, 'reviewed-head')).resolves.toMatchObject({
+				status: 'merged',
+			});
+			expect(isBaseContainedInHead).toHaveBeenCalledTimes(1);
+			expect(mergePullRequestDirect).toHaveBeenCalledExactlyOnceWith(
+				'SmartTechBrewery',
+				'swarm',
+				42,
+				'reviewed-head',
+			);
+		});
+
+		it('reports a failed graph read as a provider error, never as up to date', async () => {
+			vi.mocked(getPullRequestMergeState).mockResolvedValue({
+				merged: false,
+				state: 'open',
+				draft: false,
+				headSha: 'reviewed-head',
+				behindBase: false,
+				baseRef: 'main',
+			});
+			vi.mocked(isBaseContainedInHead).mockRejectedValue(new Error('compare unavailable'));
+
+			await expect(scm.mergePullRequest(project, 42, 'reviewed-head')).resolves.toEqual({
+				status: 'provider-error',
+				message: 'compare unavailable',
+			});
+			expect(mergePullRequestDirect).not.toHaveBeenCalled();
 		});
 
 		// Ordering matters: an approval that no longer holds must report *that*,
@@ -698,6 +778,7 @@ describe('GitHubSCMIntegration', () => {
 			await expect(scm.mergePullRequest(project, 42, 'reviewed-head')).resolves.toMatchObject({
 				status: 'not-eligible',
 			});
+			expect(isBaseContainedInHead).not.toHaveBeenCalled();
 		});
 	});
 
@@ -718,6 +799,7 @@ describe('GitHubSCMIntegration', () => {
 				signedByGitHub: true,
 			});
 			vi.mocked(isContainedInBranch).mockResolvedValue(true);
+			vi.mocked(isBaseContainedInHead).mockReset().mockResolvedValue(true);
 		});
 
 		function mergeStateAt(headSha: string, behindBase = false) {
@@ -764,6 +846,8 @@ describe('GitHubSCMIntegration', () => {
 				'main',
 				'base-head',
 			);
+			// A moved head is judged by attribution alone; no staleness read.
+			expect(isBaseContainedInHead).not.toHaveBeenCalled();
 		});
 
 		// The blocker this capability exists to avoid: `PUT .../update-branch`
@@ -894,16 +978,43 @@ describe('GitHubSCMIntegration', () => {
 			await vi.advanceTimersByTimeAsync(10_000);
 			await expect(outcome).resolves.toMatchObject({ status: 'provider-error' });
 			vi.useRealTimers();
+			expect(isBaseContainedInHead).not.toHaveBeenCalled();
 		});
 
-		it('reports up-to-date when the head never moves and is no longer behind', async () => {
+		it('reports up-to-date when the head never moves and already contains its base', async () => {
 			vi.mocked(getPullRequestMergeState).mockResolvedValue(mergeStateAt('reviewed-head', false));
 
-			vi.useFakeTimers();
-			const outcome = scm.updatePullRequestBranch(project, 42, 'reviewed-head');
-			await vi.advanceTimersByTimeAsync(10_000);
-			await expect(outcome).resolves.toEqual({ status: 'up-to-date' });
-			vi.useRealTimers();
+			await expect(updateAndSettle()).resolves.toEqual({ status: 'up-to-date' });
+			// Asked once, after the wait — not once per read-back attempt.
+			expect(isBaseContainedInHead).toHaveBeenCalledExactlyOnceWith(
+				'SmartTechBrewery',
+				'swarm',
+				'main',
+				'reviewed-head',
+			);
+		});
+
+		// Issue #1113: GitHub says `clean` in a repository that does not require
+		// up-to-date branches, so `mergeable_state` cannot call this up to date.
+		it('reports a provider error when the head never moves and still lacks the base', async () => {
+			vi.mocked(getPullRequestMergeState).mockResolvedValue(mergeStateAt('reviewed-head', false));
+			vi.mocked(isBaseContainedInHead).mockResolvedValue(false);
+
+			await expect(updateAndSettle()).resolves.toEqual({
+				status: 'provider-error',
+				message:
+					'GitHub accepted the branch update for #42 but had not published the new head after 5s',
+			});
+		});
+
+		it('reports a provider error when the graph read fails after the head never moved', async () => {
+			vi.mocked(getPullRequestMergeState).mockResolvedValue(mergeStateAt('reviewed-head', false));
+			vi.mocked(isBaseContainedInHead).mockRejectedValue(new Error('compare unavailable'));
+
+			await expect(updateAndSettle()).resolves.toEqual({
+				status: 'provider-error',
+				message: 'compare unavailable',
+			});
 		});
 
 		it('never throws — an unresolvable credential comes back as provider-error', async () => {

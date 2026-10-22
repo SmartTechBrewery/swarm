@@ -53,6 +53,7 @@ import {
 	getPullRequestMergeState,
 	getPullRequestReviewDecision,
 	getScopedClient,
+	isBaseContainedInHead,
 	isContainedInBranch,
 	listPullRequestsForCommit,
 	mergePullRequestDirect,
@@ -479,6 +480,38 @@ describe('github client', () => {
 				repo: 'swarm',
 				basehead: 'main...some-sha',
 			});
+		});
+	});
+
+	describe('isBaseContainedInHead (issue #1113)', () => {
+		it.each([
+			['identical', true],
+			['ahead', true],
+			['behind', false],
+			['diverged', false],
+		])('reads a %s comparison as base-contained=%s', async (status, contained) => {
+			compareCommitsWithBasehead.mockResolvedValue({ data: { status } });
+
+			await expect(
+				withGitHubToken('tok', () =>
+					isBaseContainedInHead('jkwiecien', 'swarm', 'main', 'reviewed-head'),
+				),
+			).resolves.toBe(contained);
+			expect(compareCommitsWithBasehead).toHaveBeenCalledWith({
+				owner: 'jkwiecien',
+				repo: 'swarm',
+				basehead: 'main...reviewed-head',
+			});
+		});
+
+		it('lets a failed comparison read throw rather than answer either way', async () => {
+			compareCommitsWithBasehead.mockRejectedValue(new Error('compare unavailable'));
+
+			await expect(
+				withGitHubToken('tok', () =>
+					isBaseContainedInHead('jkwiecien', 'swarm', 'main', 'reviewed-head'),
+				),
+			).rejects.toThrow('compare unavailable');
 		});
 	});
 

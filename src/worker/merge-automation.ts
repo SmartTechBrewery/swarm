@@ -298,15 +298,28 @@ function retryableExhaustion(
 }
 
 /**
- * What the Review run records once the budget is spent. The `not-ready` wording
- * is unchanged byte-for-byte — it is already in run history — while the
+ * What the Review run records once the budget is spent. The plain `not-ready`
+ * wording is unchanged byte-for-byte — it is already in run history — while the
  * provider-error one names the forge, the attempts spent, and the provider's own
  * last error, which is the only place that detail would otherwise be lost.
+ *
+ * A `not-ready` budget spent on a head **this dispatch produced** keeps the last
+ * reason too (issue #1113): there it is the fresh CI nothing else watches — a
+ * self-hosted runner that is offline never starts it — and the reason names the
+ * checks still pending, so the operator can tell a stuck runner from a moving
+ * base or a red build. The existing budget still bounds that wait; nothing here
+ * waits longer for it.
  */
-function exhaustionMessage(exhaustion: ReviewMergeOutcomeStatus, lastMessage: string): string {
-	return exhaustion === MERGE_PROVIDER_ERROR_EXHAUSTED
-		? `Merge automation gave up after ${MAX_MERGE_RETRIES + 1} attempts against a source-control provider that kept failing; the pull request is approved but was left open for a manual merge. Last provider error: ${lastMessage}`
-		: 'Merge automation gave up after repeated not-ready results; the pull request is approved but was left open for a manual merge.';
+function exhaustionMessage(
+	job: MergeAutomationJob,
+	exhaustion: ReviewMergeOutcomeStatus,
+	lastMessage: string,
+): string {
+	if (exhaustion === MERGE_PROVIDER_ERROR_EXHAUSTED)
+		return `Merge automation gave up after ${MAX_MERGE_RETRIES + 1} attempts against a source-control provider that kept failing; the pull request is approved but was left open for a manual merge. Last provider error: ${lastMessage}`;
+	if (baseUpdatesSpent(job) > 0)
+		return `Merge automation brought this pull request's head up to date with its base and gave up after ${MAX_MERGE_RETRIES + 1} attempts waiting for that head to become mergeable; the pull request is approved but was left open for a manual merge. Last reason: ${lastMessage}`;
+	return 'Merge automation gave up after repeated not-ready results; the pull request is approved but was left open for a manual merge.';
 }
 
 /**
@@ -1060,7 +1073,7 @@ export async function processMergeAutomationDispatch(
 			await persistMergeOutcome(
 				job,
 				retryExhaustion,
-				exhaustionMessage(retryExhaustion, outcome.message),
+				exhaustionMessage(job, retryExhaustion, outcome.message),
 				attempt,
 			);
 			logger.warn('Merge automation: retry budget exhausted, leaving the PR open', {
