@@ -119,6 +119,22 @@ function resolveTaskIdForItem(workItem: WorkItem, project: ProjectConfig): strin
 }
 
 /**
+ * Record a board event's freshly re-read status in the status dedup and report
+ * whether it changed. A resumed dispatch (`resumePmPhase` — a deferred retry, or
+ * a lost worker's adopted late result, issue #1076) replays the event that
+ * started its phase rather than observing one, so it records nothing (issue
+ * #1121): by now its own phase may have moved the card on — a late Planning
+ * result lands with the card already in ToDo — and recording that would make
+ * SWARM's own follow-up for the move (`selfEnqueueNextPhase`) read as
+ * "unchanged" and never start the next phase. Neither consumer of the answer
+ * reads it on a resume.
+ */
+async function observeStatus(ctx: PmTriggerContext, statusId: string): Promise<boolean> {
+	if (ctx.resumePmPhase) return false;
+	return recordStatusAndDetectChange(ctx.event.itemId, statusId);
+}
+
+/**
  * Make the card's current column the single source of truth for which
  * board-driven phase is queued for it (issue #909): retire whatever board-driven
  * phase an *earlier* move left waiting, so only the phase this column calls for
@@ -197,12 +213,13 @@ export function createPmStatusTrigger(): TriggerHandler {
 			}
 
 			// Record the freshly re-read status as this item's latest observed status
-			// and learn whether it *changed*. Done for every status — including ones
-			// that start no phase (backlog, inProgress, …), before the phase gate below
-			// — so that a departure to such a status is remembered: leaving "ToDo" and
-			// dragging back later then reads as a genuine change rather than a
-			// same-status no-op that gets silently skipped (`pm-status-dedup.ts`).
-			const statusChanged = await recordStatusAndDetectChange(event.itemId, workItem.statusId);
+			// and learn whether it *changed*. Done for every status a board event
+			// observes — including ones that start no phase (backlog, inProgress, …),
+			// before the phase gate below — so that a departure to such a status is
+			// remembered: leaving "ToDo" and dragging back later then reads as a
+			// genuine change rather than a same-status no-op that gets silently
+			// skipped (`pm-status-dedup.ts`).
+			const statusChanged = await observeStatus(ctx, workItem.statusId);
 
 			const phase = ctx.resumePmPhase ?? resolvePhaseForItem(workItem);
 
