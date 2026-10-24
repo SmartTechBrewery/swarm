@@ -22,7 +22,11 @@
  * dispatch again: leaving "ToDo" for "Backlog" and dragging back to "ToDo"
  * records `Backlog` in between, so the return reads as a real change. Only a
  * same-status no-op (a within-column reorder, or a duplicate webhook delivery)
- * reports "unchanged".
+ * reports "unchanged". "Observes" means a board event: a resumed dispatch
+ * (`resumePmPhase` — a deferred retry, or a lost worker's adopted late result)
+ * replays its phase's original event, so it records nothing and is not deduped
+ * either. Recording the column its own phase has since moved the card to would
+ * make SWARM's self-enqueued next phase read as "unchanged" (issue #1121).
  *
  * Recording *every* observed status — rather than only the phase-start statuses
  * actually dispatched — is deliberate, and fixes a class of silently-stuck
@@ -102,7 +106,8 @@ function getRedis(): Redis {
  * observation (no stored value yet) — and `false` when it matches (a
  * within-column reorder, or a duplicate webhook delivery).
  *
- * Call this for **every** observed status, not only the phase-start ones the
+ * Call this for **every** status a board event observes (a resumed dispatch
+ * observes none — see the module doc), not only the phase-start ones the
  * caller dispatches on: recording the statuses in between (Backlog, In
  * progress, …) is exactly what lets a return to a phase-start status read as a
  * real change rather than a same-status no-op (see the module doc above). The

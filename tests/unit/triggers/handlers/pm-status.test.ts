@@ -240,7 +240,9 @@ describe('pm-status trigger', () => {
 			expect(result).toEqual({ phase: 'implementation', taskId: '138', workItem });
 		});
 
-		it('resumes a deferred phase even when status dedup says unchanged', async () => {
+		// Issue #1121 — a resume replays its phase's original event rather than
+		// observing a column change, so it neither consults nor records the dedup.
+		it('resumes a deferred phase without consulting or recording the status dedup', async () => {
 			vi.mocked(recordStatusAndDetectChange).mockResolvedValue(false);
 			const workItem = createMockWorkItem({
 				statusId: '47fc9ee4',
@@ -251,6 +253,17 @@ describe('pm-status trigger', () => {
 				resumePmPhase: 'implementation',
 			});
 			expect(result).toEqual({ phase: 'implementation', taskId: '138', workItem });
+			expect(recordStatusAndDetectChange).not.toHaveBeenCalled();
+		});
+
+		it('records nothing for a resumed Planning whose card its own phase already moved to ToDo', async () => {
+			const workItem = createMockWorkItem({
+				statusId: '3121a97d', // ToDo — where the late Planning result left it
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/1567',
+			});
+			const result = await trigger.handle({ ...ctx(workItem), resumePmPhase: 'planning' });
+			expect(result).toEqual({ phase: 'planning', taskId: '1567', workItem });
+			expect(recordStatusAndDetectChange).not.toHaveBeenCalled();
 		});
 
 		it('records a status that starts no phase (so a later return to a phase reads as a change)', async () => {
@@ -365,6 +378,83 @@ describe('pm-status trigger', () => {
 	// board-driven phase is queued for it. Every case here asserts on the call the
 	// handler makes into the dispatch layer; what that call then settles is the
 	// retirement module's own suite (unit + integration).
+	// Issue #1121: adopting a lost worker's late Planning result (issue #1076)
+	// replays the original dispatch with `resumePmPhase` after the returning worker
+	// has already moved the card to ToDo. That replay must not record ToDo, or
+	// SWARM's own self-enqueued Implementation for the move reads as "unchanged".
+	describe("a lost worker's adopted late result (issue #1121)", () => {
+		const ITEM_ID = 'PVTI_1567';
+		const URL = 'https://github.com/SmartTechBrewery/swarm/issues/1567';
+		const PLANNING = '61e4505c';
+		const TODO = '3121a97d';
+		const BACKLOG = 'f75ad846';
+		const observed = new Map<string, string>();
+
+		beforeEach(() => {
+			observed.clear();
+			// An in-memory stand-in for the dedup's atomic `SET … GET`.
+			vi.mocked(recordStatusAndDetectChange).mockImplementation(async (itemId, statusId) => {
+				const previous = observed.get(itemId);
+				observed.set(itemId, statusId);
+				return previous !== statusId;
+			});
+		});
+
+		function boardEvent(statusId: string) {
+			const workItem = createMockWorkItem({ id: ITEM_ID, statusId, url: URL });
+			return { workItem, context: ctx(workItem, { itemId: ITEM_ID }) };
+		}
+
+		async function runOriginalPlanningThenAdoption(options: { recordExpired: boolean }) {
+			const original = boardEvent(PLANNING);
+			expect(await trigger.handle(original.context)).toEqual({
+				phase: 'planning',
+				taskId: '1567',
+				workItem: original.workItem,
+			});
+			if (options.recordExpired) observed.clear();
+
+			const adopted = boardEvent(TODO);
+			expect(await trigger.handle({ ...adopted.context, resumePmPhase: 'planning' })).toEqual({
+				phase: 'planning',
+				taskId: '1567',
+				workItem: adopted.workItem,
+			});
+		}
+
+		it.each([
+			{ recordExpired: false, label: 'the original record still live' },
+			{ recordExpired: true, label: 'the original record already expired' },
+		])('dispatches the source card Implementation after the adoption, with $label', async ({
+			recordExpired,
+		}) => {
+			await runOriginalPlanningThenAdoption({ recordExpired });
+
+			// `selfEnqueueNextPhase`'s synthetic event for the move to ToDo.
+			const selfEnqueued = boardEvent(TODO);
+			expect(await trigger.handle(selfEnqueued.context)).toEqual({
+				phase: 'implementation',
+				taskId: '1567',
+				workItem: selfEnqueued.workItem,
+			});
+
+			// A later within-column reorder or duplicate delivery still dispatches nothing.
+			expect(await trigger.handle(boardEvent(TODO).context)).toBeNull();
+		});
+
+		it('leaves a later operator move out of ToDo and back reading as a change', async () => {
+			await runOriginalPlanningThenAdoption({ recordExpired: false });
+
+			expect(await trigger.handle(boardEvent(BACKLOG).context)).toBeNull();
+			const back = boardEvent(TODO);
+			expect(await trigger.handle(back.context)).toEqual({
+				phase: 'implementation',
+				taskId: '1567',
+				workItem: back.workItem,
+			});
+		});
+	});
+
 	describe('retiring the board phase an earlier move left queued', () => {
 		it('Planning → ToDo: keeps Implementation and retires the rest', async () => {
 			const workItem = createMockWorkItem({
