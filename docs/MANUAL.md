@@ -453,12 +453,12 @@ change that answer, so it is never waited on. A machine that is **offline when i
 comes** is passed over the same way (issue #1071): it settles `skipped` with "offline
 when its turn came" on its own line, is never drained or asked, and the wave is filled
 from the next connected machine instead. Passed-over machines do not count toward the
-three-in-a-row halt. To pick them up, start the fleet update again once they are back —
+three-hosts-in-a-row halt. To pick them up, start the fleet update again once they are back —
 machines already on the target settle at once. A machine counts as **back on the new
 build** only through a daemon that took its lease *after* the machine reported
 `applied`; a reconnect of the old daemon before that report proves nothing either way.
 
-**A bad build stops it.** A machine that reports `failed`, `refused` or `declined`, or
+**A bad build stops it.** A machine that reports `failed` — the build broke on it — or
 one that comes back still on the build it was asked to leave (what a machine returning
 itself to its last known good build looks like — issue #934), halts the rollout:
 nothing further is drained or signalled, the reason is recorded and printed, and every
@@ -470,6 +470,14 @@ at it, and the halt footer names the `swarm workers undrain` that ends that. A h
 rollout; there is no resume and no cancel. Only one rollout runs per operator at a
 time, so asking for a different ref mid-move is refused rather than silently
 re-targeting the fleet.
+
+**A machine that refuses does not stop it.** `refused` (and the legacy `declined`) is
+almost always about that machine rather than the build — its `git fetch` failed, its
+install root has uncommitted changes, a peer on the same install root is mid-phase —
+so the member settles `failed` with the machine's own reason and the rollout moves on
+to the next machine. The refusing machine follows the same scope rule as any machine
+that answered badly: left drained in an owner-scoped rollout, returned to the pool in
+an installation-wide one.
 
 **A machine that stops answering does not stop it** (issue #1064). Silence says
 nothing about the build — the machine may be asleep, off the network or unplugged — so
@@ -484,19 +492,21 @@ than losing the rest of the fleet to one dead laptop. Because the member settles
 table and the tally are where they are read, and the line under them then names every
 machine that is not on the target instead of saying they all are.
 
-**Three given up on in a row do stop it** (issue #1064). A build that cannot start
-anywhere is silent on *every* machine, so on silence alone the rollout would march
-the whole fleet through it. Once it has given up on **three machines in a row** it
-halts, with a reason naming the count and saying to treat the build as unable to
-start — the same halt as above, so the machines it had not reached are stood down
-into the pool on that same pass. "In a row" is read in the order the rollout reaches
+**Failures on three different hosts in a row do stop it** (issue #1064). A build that
+cannot start anywhere is silent on *every* machine, and a target no machine can
+resolve is refused by every one, so on those alone the rollout would march the whole
+fleet through it. Once machines on **three different hosts in a row** have been given
+up on or have refused, it halts, with a reason naming the count and saying to treat
+the build as unable to start — the same halt as above, so the machines it had not
+reached are stood down into the pool on that same pass. The count is per **host**
+(the daemon's reported hostname), not per worker: several daemons on one host share
+its network, credentials and install root, so one host's trouble counts once however
+many of its workers fail. "In a row" is read in the order the rollout reaches
 machines: one that comes back on the new build resets the count (the build
-demonstrably starts, so the earlier give-ups were about those machines), and one
-settled `skipped` neither adds to it nor resets it. Three is the smallest run that
-is not plausibly one operator's laptops going away, and on the default wave of one it
-stops the fleet about six minutes in. It is a flat count rather than a share of the
-fleet, and it is coded rather than configurable. A machine that *reports* a failure
-still halts the rollout on the first one.
+demonstrably starts, so the earlier failures were about those machines), and one
+settled `skipped` neither adds to it nor resets it. It is a flat count rather than a
+share of the fleet, and it is coded rather than configurable. A machine that
+*reports* `failed` still halts the rollout on the first one.
 
 `swarm workers update --all` exits 0 whatever the table says, because it is a report
 rather than a pass/fail, and it is strictly owner-scoped: your own machines and

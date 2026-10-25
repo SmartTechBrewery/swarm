@@ -641,13 +641,22 @@ report, off its reconnect, and off a periodic check for the machine that applied
 never came back — so start it and read it, rather than starting it and re-running it.
 Re-running the same command is still allowed, and nudges it as well as printing it.
 
-A machine that reports `failed`, `refused` or `declined`, or that comes back still on
+A machine that reports `failed` — the build broke on it — or that comes back still on
 the build it was asked to leave, **halts** the rollout: nothing further is drained or
 signalled, the reason is printed, and the machines it had not reached stay in the pool.
 Your machine may be in neither group — if it was already being moved when the halt
 landed, the rollout keeps settling it on the advances that follow, and it goes back in
 the pool once it settles without failing. The one that answered badly — reported a
 failure, or came back on the old build — is left drained so you can look at it. A halt is final — fix the build and start a new rollout.
+
+A machine that reports `refused` or `declined` does **not** halt anything. A refusal is
+almost always that machine's own trouble — its `git fetch` failed (network, or the
+remote's credentials on that host), its install root has uncommitted changes, a peer
+on the same install root is mid-phase — so the rollout records it `failed` with the
+machine's own reason and moves on to the next machine. It is left drained in an
+owner-scoped rollout so you can look at it, and returned to the pool in an
+installation-wide one. Fix that machine and move it yourself with `swarm workers
+update <worker-id> <ref>`.
 
 A machine that simply **stops answering** does not halt anything. After two minutes of
 silence the rollout gives up on that machine alone: it is recorded `failed` with the
@@ -657,12 +666,15 @@ later — and the next machine is drained and asked in the same pass. If that wa
 machine, the rollout moved on without it and you move it yourself with `swarm workers
 update <worker-id> <ref>` once it is back.
 
-Three machines given up on **in a row** do halt it, though: a build that cannot start
-anywhere is silent on every machine, and that run is what it looks like from the
-control plane. The halt reads like any other — the reason names how many machines
-were given up on, and the ones it had not reached stay in the pool. A machine that
-comes back on the new build in between resets the count, and one that was skipped
-does not count either way.
+Failures on **three different hosts in a row** — machines given up on or refusing,
+in any mix — do halt it, though: a build that cannot start anywhere is silent on every
+machine, a target no machine can resolve is refused by every one, and that run is
+what it looks like from the control plane. The count is per **host**, not per worker:
+several daemons on one host share its network, credentials and install root, so one
+host's trouble counts once however many of its workers fail. The halt reads like any
+other — the reason names how many hosts failed, and the ones it had not reached stay
+in the pool. A machine that comes back on the new build in between resets the count,
+and one that was skipped does not count either way.
 
 **There is no per-host setting to turn this on or off, and since issue #975 there is
 no setting that can refuse it.** What authorizes an update is the mechanism itself,

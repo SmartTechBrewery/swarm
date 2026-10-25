@@ -9,11 +9,14 @@
  * #1064). Silence is not a verdict on the build: a machine nobody can reach has said
  * nothing about it, so after {@link ABANDON_AFTER_MS} the rollout settles that member
  * `failed` with the reason in its own line, hands its machine back to the dispatch
- * pool and **carries on with the rest of the fleet**. The halts that remain are the
- * two a machine actually *answered* with — a reported `failed`/`refused`/`declined`,
- * and coming back on the build it was asked to leave — and one the fleet answers
- * together: {@link MAX_CONSECUTIVE_ABANDONED} machines given up on in a row, which is
- * what a build that cannot start anywhere looks like from the control plane.
+ * pool and **carries on with the rest of the fleet**. A machine that *refuses* for
+ * reasons of its own — a failed fetch, a dirty install root, a busy peer — is treated
+ * the same way: settled `failed` in its own words, and the rollout carries on. The
+ * halts that remain are the two a machine answered about the *build* — a reported
+ * `failed`, and coming back on the build it was asked to leave — and one the fleet
+ * answers together: machines on {@link MAX_CONSECUTIVE_FAILED_HOSTS} different hosts
+ * failing in a row, which is what a build or a target no machine can take looks like
+ * from the control plane.
  *
  * It lives here rather than under `src/identity/` for one concrete reason: it
  * drives phase 1's `fanOutWorkerUpdate`, which is `src/api/` policy, and nothing
@@ -99,6 +102,7 @@ import {
 	DEFAULT_ROLLOUT_WAVE_SIZE,
 	isCommittedMemberState,
 	isHaltingUpdateStatus,
+	isMachineLocalUpdateStatus,
 	isRestartingUpdateStatus,
 	isSettledMemberState,
 	rolloutReleasesFailedMembers,
@@ -142,22 +146,30 @@ const ABANDON_AFTER_MS = 120_000;
 const ABANDON_AFTER_MINUTES = Math.round(ABANDON_AFTER_MS / 60_000);
 
 /**
- * How many machines the rollout may give up on **in a row** before it stops trusting
- * the build rather than the machines (issue #1064).
+ * On how many **different hosts** machines may fail in a row — given up on, or
+ * refusing for reasons of their own — before the rollout stops trusting the build
+ * rather than the machines (issue #1064).
  *
  * {@link ABANDON_AFTER_MS} made one unreachable machine cost the fleet two minutes
- * instead of a halt, which is right for a laptop that was closed and wrong for a build
- * that cannot start anywhere — that one is silent on *every* machine, so without a
- * brake the rollout would march the whole fleet through it. Three is the smallest run
- * that cannot be a coincidence of one operator's machines going away, and on the
- * default wave of one it costs about six minutes before the fleet is stood down.
+ * instead of a halt, and a machine-local refusal costs it nothing at all, which is
+ * right for a laptop that was closed or a host whose fetch broke and wrong for a build
+ * that cannot start anywhere — that one is silent, or refused, on *every* machine, so
+ * without a brake the rollout would march the whole fleet through it. Three is the
+ * smallest run that cannot be a coincidence of one operator's machines going away.
  *
- * A flat count rather than a share of the fleet: a share means a four-machine
- * installation and a forty-machine one stop at wildly different absolute costs, and
- * the thing being detected — a build that starts nowhere — is not proportional to
- * fleet size. Coded rather than configurable, like {@link ABANDON_AFTER_MS}.
+ * **Hosts, not workers.** Several daemons often share one host and one install root,
+ * so one host's trouble — a closed lid, a broken fetch — fails each of them in turn.
+ * Counted per worker, a single host with three daemons reached the threshold on its
+ * own and stood the rest of the fleet down (observed 2026-10-25). A host is read off
+ * the daemon's self-reported `hostname`, falling back to the worker itself when it
+ * declared none, so an unknown host is never merged with another.
+ *
+ * A flat count rather than a share of the fleet: a share means a four-host
+ * installation and a forty-host one stop at wildly different absolute costs, and the
+ * thing being detected — a build that starts nowhere — is not proportional to fleet
+ * size. Coded rather than configurable, like {@link ABANDON_AFTER_MS}.
  */
-const MAX_CONSECUTIVE_ABANDONED = 3;
+const MAX_CONSECUTIVE_FAILED_HOSTS = 3;
 
 /** One machine's line in a rollout readout — its member row plus the label an operator reads it by. */
 export interface RolloutMemberView extends WorkerUpdateRolloutMember {
@@ -403,19 +415,20 @@ async function readRolloutView(rolloutId: string): Promise<RolloutView | undefin
  * 1. **Settle** every member that was signalled, from the answer on its own
  *    `workers` row. `applied` and `adopted` move it on to verification,
  *    `already-current` settles it on the spot (nothing restarted, so there is
- *    nothing to come back from), and `failed`/`refused`/`declined` settles it badly
- *    and **halts** — the last of those only ever from a machine on a build predating
- *    issue #975. A machine that went quiet instead of answering is given up on after
- *    {@link ABANDON_AFTER_MS}, which settles it `failed` *without* halting.
+ *    nothing to come back from), `failed` settles it badly and **halts**, and
+ *    `refused`/`declined` — a reason of that machine's own — settles it badly
+ *    *without* halting. A machine that went quiet instead of answering is given up on
+ *    after {@link ABANDON_AFTER_MS}, which settles it `failed` *without* halting too.
  * 2. **Verify** every member that applied: it has come back when a daemon has taken
  *    a lease *after the machine reported* *and* the machine is no longer declaring
  *    the build it started from. Not coming back inside {@link ABANDON_AFTER_MS} is the same give-up —
  *    silence names no cause, so the rollout abandons that machine and carries on.
- * 3. **Brake** on a run of give-ups: once {@link MAX_CONSECUTIVE_ABANDONED} members
- *    in a row have been given up on, with none coming back on the new build between
- *    them, the build rather than the machines is what is silent, so the rollout
- *    **halts** (issue #1064). One unreachable machine never stops a fleet; a build
- *    that starts nowhere stops one quickly.
+ * 3. **Brake** on a run of failures: once machines on {@link MAX_CONSECUTIVE_FAILED_HOSTS}
+ *    different hosts in a row have failed without halting — given up on, or refused —
+ *    with none coming back on the new build between them, the build rather than the
+ *    machines is what is failing, so the rollout **halts** (issue #1064). One
+ *    unreachable or misconfigured host never stops a fleet, however many daemons it
+ *    runs; a build that starts nowhere stops one quickly.
  * 4. **Return** each member the rollout is finished with to the dispatch pool, but
  *    only one the rollout drained itself: a machine the operator had drained for
  *    their own reasons is left exactly as they left it. A member whose machine
@@ -494,8 +507,8 @@ const ABANDON_MESSAGES: ReadonlySet<string> = new Set([SILENT_MESSAGE, NEVER_CAM
  * observed on 2026-10-08, when a machine reported `applied`, released its session and
  * never reconnected, and ten minutes later the rollout stood the rest of the fleet
  * down. With no halt the pass's own `advanceWaves` takes the next wave immediately.
- * What one give-up does not say, a run of them does: that is the brake
- * {@link MAX_CONSECUTIVE_ABANDONED} puts on the fleet, decided over the member list
+ * What one give-up does not say, a run of them across hosts does: that is the brake
+ * {@link MAX_CONSECUTIVE_FAILED_HOSTS} puts on the fleet, decided over the member list
  * rather than here.
  *
  * **`returnToPool` is unconditional**, for both scopes — the one place
@@ -535,8 +548,8 @@ const OFFLINE_MESSAGE =
  * with no fencing token to compare against, and what let that machine's ordinary
  * old-build reconnect read as a come-back (observed 2026-10-08).
  *
- * **It does not count toward {@link MAX_CONSECUTIVE_ABANDONED}**, because
- * {@link consecutiveAbandonments} already leaves `skipped` alone — and rightly: an
+ * **It does not count toward {@link MAX_CONSECUTIVE_FAILED_HOSTS}**, because
+ * {@link consecutiveFailedHosts} already leaves `skipped` alone — and rightly: an
  * offline machine says nothing about the build. Counting it would let one machine
  * running several daemons, all offline, halt a rollout before any healthy machine was
  * reached.
@@ -642,9 +655,16 @@ function decideSettlement(
  * asks the vocabulary rather than naming them. `already-current` settles at once,
  * because nothing was installed and nothing restarted, so there is nothing to wait for.
  *
+ * `failed` halts: the build did not survive the move on this machine. `refused` and
+ * `declined` settle the member just as badly but **do not halt** — they are that
+ * machine's own trouble (a failed fetch, a dirty install root, a busy peer), and the
+ * next machine has every chance of taking the build; a refusal no machine can get past
+ * is caught by the per-host brake instead ({@link consecutiveFailedHosts}).
+ *
  * `releasesFailedMembers` is the rollout's scope, already answered
- * (`rolloutReleasesFailedMembers`, issue #1024) — the one fact that makes the `failed`
- * verdict below differ between an owner-scoped rollout and an installation-wide one.
+ * (`rolloutReleasesFailedMembers`, issue #1024) — the one fact that makes the two
+ * badly-answered verdicts below differ between an owner-scoped rollout and an
+ * installation-wide one.
  */
 function decideReportedOutcome(
 	worker: Worker,
@@ -661,6 +681,12 @@ function decideReportedOutcome(
 			patch: { state: 'failed', outcome, message, settledAt: now },
 			returnToPool: releasesFailedMembers,
 			halt: `worker '${worker.displayName}' reported ${outcome}${message ? `: ${message}` : ''}`,
+		};
+	}
+	if (outcome && isMachineLocalUpdateStatus(outcome)) {
+		return {
+			patch: { state: 'failed', outcome, message, settledAt: now },
+			returnToPool: releasesFailedMembers,
 		};
 	}
 	// `already-current` — the install root was on the target and the daemon reporting it
@@ -752,32 +778,41 @@ function decideComeBack(
 }
 
 /**
- * How many members the rollout has given up on in a row, reading the member rows in
- * the order the rollout reaches them (issue #1064).
+ * On how many different hosts the rollout has seen machines fail in a row, reading the
+ * member rows in the order the rollout reaches them (issue #1064).
  *
- * A give-up extends the run; a member that came back on the new build (`done`) resets
- * it, because that build demonstrably starts, so the earlier give-ups were about those
- * machines rather than about the build; a member settled without being moved
+ * A non-halting failure — a machine given up on, or one that refused for reasons of its
+ * own — adds its host to the run; a member that came back on the new build (`done`)
+ * resets it, because that build demonstrably starts, so the earlier failures were about
+ * those machines rather than about the build; a member settled without being moved
  * (`skipped`) — and one not settled yet — says nothing about the build and leaves the
  * run alone. That includes a machine passed over for being offline when its turn came
  * ({@link passOverOfflineVerdict}, issue #1071): it was never asked, so it is no part
- * of a run of give-ups.
+ * of a run.
  *
- * A non-halting `failed` member is by construction one the rollout gave up on: every
- * other `failed` verdict — a reported `failed`/`refused`/`declined`, and a machine
- * that came back on the build it was asked to leave — halts on the spot, so in a
- * rollout still in progress it can never be among the members counted here. That is
- * stated rather than left to the call site, and pinned by its own test, because it is
- * the one thing that would make this count mean something else if a further `failed`
- * verdict were ever added without a halt.
+ * **Distinct hosts, not members** ({@link MAX_CONSECUTIVE_FAILED_HOSTS}): several
+ * daemons on one host share its network, its credentials and its install root, so the
+ * same trouble fails each of them, and that is one piece of evidence rather than
+ * several. A worker that declared no `hostname` is its own host. A member whose worker
+ * row has gone is keyed by its id the same way.
+ *
+ * Every `failed` member is counted, the halting ones included: a halting verdict halts
+ * on the spot, so in a rollout still in progress it can never be among the members
+ * counted here, and once halted the brake is not consulted.
  */
-function consecutiveAbandonments(members: WorkerUpdateRolloutMember[]): number {
-	let run = 0;
+function consecutiveFailedHosts(
+	members: WorkerUpdateRolloutMember[],
+	workers: ReadonlyMap<string, Worker>,
+): number {
+	const hosts = new Set<string>();
 	for (const member of [...members].sort((a, b) => a.position - b.position)) {
-		if (member.state === 'failed') run += 1;
-		else if (member.state === 'done') run = 0;
+		if (member.state === 'failed') {
+			hosts.add(workers.get(member.workerId)?.hostname ?? `worker:${member.workerId}`);
+		} else if (member.state === 'done') {
+			hosts.clear();
+		}
 	}
-	return run;
+	return hosts.size;
 }
 
 /**
@@ -818,7 +853,7 @@ class AdvancePass {
 		this.workers = await resolveWorkers(this.members);
 		await this.settleSignalled();
 		await this.verifyApplied();
-		await this.brakeOnRepeatedAbandonment();
+		await this.brakeOnRepeatedFailures();
 		await this.standDownUncommitted();
 		await this.advanceWaves();
 		await this.completeIfSettled();
@@ -882,10 +917,10 @@ class AdvancePass {
 	}
 
 	/**
-	 * Step 3 — halt once the rollout has given up on {@link MAX_CONSECUTIVE_ABANDONED}
-	 * machines in a row ({@link consecutiveAbandonments}).
+	 * Step 3 — halt once machines on {@link MAX_CONSECUTIVE_FAILED_HOSTS} different hosts
+	 * have failed in a row ({@link consecutiveFailedHosts}).
 	 *
-	 * Here rather than inside the verdict that abandoned the last of them, because the
+	 * Here rather than inside the verdict that failed the last of them, because the
 	 * run is a fact about the member list and not about one member, and the list is only
 	 * whole once both settling steps have been applied. Before the stand-down, so a halt
 	 * reached on this pass stands the rest of the fleet down on this same pass. Decided
@@ -893,13 +928,13 @@ class AdvancePass {
 	 * re-running an advance re-reaches the same verdict, and {@link halt} keeps the first
 	 * reason if one was already given.
 	 */
-	private async brakeOnRepeatedAbandonment(): Promise<void> {
+	private async brakeOnRepeatedFailures(): Promise<void> {
 		if (this.status !== 'in_progress') return;
-		const run = consecutiveAbandonments(this.members);
-		if (run < MAX_CONSECUTIVE_ABANDONED) return;
+		const run = consecutiveFailedHosts(this.members, this.workers);
+		if (run < MAX_CONSECUTIVE_FAILED_HOSTS) return;
 		await this.halt(
-			`${run} machines in a row were given up on without coming back — treat the build ` +
-				'as unable to start',
+			`machines on ${run} different hosts in a row refused the update or were given up on ` +
+				'without one coming back on the new build — treat the build as unable to start',
 		);
 	}
 

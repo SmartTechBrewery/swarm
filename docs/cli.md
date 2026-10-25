@@ -780,8 +780,8 @@ unchanged.
   process supervisor and so would not come back, or it was offline when its turn
   came and so was passed over without being drained or asked) and `failed`. A tally line counts them. A
   skipped machine goes back in the dispatch pool and the wave carries on past it.
-  **A bad build halts the rollout.** A machine that reports `failed`, `refused` or
-  `declined`, or that comes back still on the build it was asked to leave (which is
+  **A bad build halts the rollout.** A machine that reports `failed` — the build broke
+  on it — or that comes back still on the build it was asked to leave (which is
   what a machine returning itself to its last known good build looks like — issue
   #934), stops the whole thing: no further machine is drained or signalled, the
   reason is recorded verbatim and printed under the table, and every machine the
@@ -795,6 +795,11 @@ unchanged.
   run. A halt is
   final — fix the build and start a new rollout; there is no resume and no cancel,
   exactly as there is none for a single request.
+  **A machine that refuses does not halt it.** `refused` (or the legacy `declined`)
+  is that machine's own trouble — a failed `git fetch`, a dirty install root, a peer
+  mid-phase — so it settles `failed` with the machine's reason under the table and the
+  rollout moves on to the next machine; the refusing machine is left drained, like
+  any machine of yours that answered badly.
   **A machine that stops answering does not halt it** (issue #1064). After two
   minutes of silence — the same silence the control plane already calls a machine
   *probably gone* at — the rollout gives up on that one machine: it settles `failed`
@@ -803,7 +808,10 @@ unchanged.
   drained and signalled in the same pass. So a rollout can finish `completed` with a
   `failed` machine in its table — the line under the table then names every machine
   that is not on the target instead of saying they all are — and one unreachable
-  laptop costs a line rather than the rest of the fleet.
+  laptop costs a line rather than the rest of the fleet. Machines on **three
+  different hosts in a row** refusing or given up on do halt it — that is what a build
+  or a target no machine can take looks like — and several workers on one host count
+  as one.
   **One rollout at a time per operator.** Asking for a *different* ref while one is
   under way is refused naming `--status` rather than re-targeting a fleet mid-move;
   asking for the *same* ref simply advances it. A halted or completed rollout no
