@@ -191,10 +191,26 @@ const registeredGetPullRequest = vi.fn(
 		({ number: 17, headBranch: 'issue-12', headSha: 'deadbeef' }) as PullRequestDetails,
 );
 
+/**
+ * The same registry's aggregate check read, which every merge attempt consults
+ * before merging (issue #1124). Green by default, so a case that is not about
+ * checks merges exactly as it did before the gate existed.
+ */
+const GREEN_CHECKS: AggregateCheckStatus = {
+	totalCount: 1,
+	checkRuns: [{ name: 'ci', status: 'completed', conclusion: 'success' }],
+};
+const registeredGetAggregateCheckStatus = vi.fn(
+	async (_p: unknown, _sha: string, _persona?: string): Promise<AggregateCheckStatus> =>
+		GREEN_CHECKS,
+);
+
 beforeEach(() => {
 	_resetSCMProviderRegistryForTesting();
 	registeredMergePullRequest.mockClear();
 	registeredGetPullRequest.mockClear();
+	registeredGetAggregateCheckStatus.mockReset();
+	registeredGetAggregateCheckStatus.mockResolvedValue(GREEN_CHECKS);
 	registerSCMProvider({
 		id: 'github',
 		label: 'GitHub',
@@ -204,6 +220,7 @@ beforeEach(() => {
 			type: 'github',
 			mergePullRequest: registeredMergePullRequest,
 			getPullRequest: registeredGetPullRequest,
+			getAggregateCheckStatus: registeredGetAggregateCheckStatus,
 		},
 	} as unknown as SCMProviderManifest);
 	completeDispatch.mockClear();
@@ -640,21 +657,256 @@ describe('processMergeAutomationDispatch', () => {
 		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merged');
 	});
 
-	// A merge that is *not* behind its base must behave exactly as it did before
-	// issue #874: no branch update, no extra check read, one merge call.
-	it('leaves an up-to-date head on the pre-existing path', async () => {
+	// A merge that is *not* behind its base behaves as it did before issue #874 —
+	// no branch update, one merge call — except that since issue #1124 the
+	// approved head's own checks are read first, as the implementer.
+	it('merges a green approved head as today, after one check read', async () => {
 		const updatePullRequestBranch = updateReturning({ status: 'up-to-date' });
 		const getAggregateCheckStatus = checksConcluding('success');
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged' });
 
 		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
-			mergePullRequest: mergeReturning({ status: 'merged', message: 'merged' }),
+			mergePullRequest,
 			updatePullRequestBranch,
 			getAggregateCheckStatus,
 		});
 
+		expect(getAggregateCheckStatus).toHaveBeenCalledExactlyOnceWith(
+			project,
+			'deadbeef',
+			'implementer',
+		);
+		expect(getAggregateCheckStatus.mock.invocationCallOrder[0]).toBeLessThan(
+			mergePullRequest.mock.invocationCallOrder[0] as number,
+		);
 		expect(updatePullRequestBranch).not.toHaveBeenCalled();
-		expect(getAggregateCheckStatus).not.toHaveBeenCalled();
 		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merged');
+	});
+});
+
+// Issue #1124 — an approval does not prove the approved head is green: a Review
+// dispatched off `opened`, or one that queued while CI changed, can approve a
+// head whose checks are still running or already red.
+describe('processMergeAutomationDispatch: an approved head whose checks are not green (issue #1124)', () => {
+	/** One finished green run plus one still running — the head is pending. */
+	function checksPending(state: 'in_progress' | 'queued' = 'in_progress', name = 'test') {
+		return vi.fn(
+			async (): Promise<AggregateCheckStatus> => ({
+				totalCount: 2,
+				checkRuns: [
+					{ name: 'lint', status: 'completed', conclusion: 'success' },
+					{ name, status: state, conclusion: null },
+				],
+			}),
+		);
+	}
+
+	function commentSpy() {
+		return vi.fn(async (_p: unknown, _n: number, _body: string, _persona?: string) => 1);
+	}
+
+	it('does not merge a red approved head, and says so on the run and the pull request', async () => {
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged' });
+		const updatePullRequestBranch = updateReturning({ status: 'updated', headSha: 'never' });
+		const commentOnPullRequest = commentSpy();
+
+		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest,
+			updatePullRequestBranch,
+			getAggregateCheckStatus: checksConcluding('success', 'failure'),
+			commentOnPullRequest,
+		});
+
+		expect(mergePullRequest).not.toHaveBeenCalled();
+		expect(updatePullRequestBranch).not.toHaveBeenCalled();
+		expect(updateReviewMergeOutcome).toHaveBeenCalledExactlyOnceWith('run-1', {
+			status: 'not-eligible',
+			message: expect.stringMatching(/approved head.*check-1/),
+			attempt: 0,
+			approvedHeadSha: 'deadbeef',
+		});
+		expect(commentOnPullRequest).toHaveBeenCalledOnce();
+		const body = commentOnPullRequest.mock.calls[0]?.[2] as string;
+		expect(body).toContain('check-1');
+		expect(body).toContain('`deadbeef`');
+		expect(body).toContain('Respond-to-CI');
+		expect(body).toContain('Generated by SWARM');
+		// Not the stale-base wording: nothing here is about the base.
+		expect(body).not.toContain('nothing has built against the');
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
+		expect(promoteMergeQueueWaits).toHaveBeenCalledExactlyOnceWith(project.id, project.repo);
+		// A genuinely red head keeps its approval's slot (issue #1079).
+		expect(markReviewVerdictSuperseded).not.toHaveBeenCalled();
+		expect(markReviewRunSuperseded).not.toHaveBeenCalled();
+		expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+		expect(outcome).toEqual({
+			status: 'merge-automation-settled',
+			result: 'not-eligible',
+			prNumber: '17',
+		});
+	});
+
+	it('refuses a red approved head without first bringing it up to date with its base', async () => {
+		const updatePullRequestBranch = updateReturning({ status: 'updated', headSha: 'never' });
+		const mergePullRequest = mergeReturning(STALE_BASE);
+
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest,
+			updatePullRequestBranch,
+			getAggregateCheckStatus: checksConcluding('failure'),
+			commentOnPullRequest: commentSpy(),
+		});
+
+		expect(mergePullRequest).not.toHaveBeenCalled();
+		expect(updatePullRequestBranch).not.toHaveBeenCalled();
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
+	});
+
+	it('waits, without merging, while the approved head’s checks are still running', async () => {
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged' });
+
+		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest,
+			getAggregateCheckStatus: checksPending(),
+		});
+
+		expect(mergePullRequest).not.toHaveBeenCalled();
+		expect(completeDispatch).not.toHaveBeenCalled();
+		const input = lastRetryInput();
+		expect(input.attempt).toBe(1);
+		expect(input.waitReason).toBe('recheck');
+		expect(input.jobPayload).toEqual(onTurn(job));
+		const recorded = updateReviewMergeOutcome.mock.calls.at(-1)?.[1] as {
+			status: string;
+			message: string;
+		};
+		expect(recorded.status).toBe('not-ready');
+		expect(recorded.message).toMatch(/^waiting for the checks on the approved head/);
+		expect(recorded.message).toContain('test');
+		expect(outcome.result).toBe('retry-scheduled');
+	});
+
+	it('merges a pending approved head once its checks turn green', async () => {
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged' });
+
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest,
+			getAggregateCheckStatus: checksPending(),
+		});
+		expect(mergePullRequest).not.toHaveBeenCalled();
+
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow({ attempt: 1 }),
+			job,
+			project,
+			{ mergePullRequest, getAggregateCheckStatus: checksConcluding('success', 'success') },
+		);
+
+		expect(mergePullRequest).toHaveBeenCalledExactlyOnceWith(project, 17, 'deadbeef');
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merged');
+		expect(outcome.result).toBe('merged');
+	});
+
+	it('refuses a pending approved head that turns red, as red', async () => {
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged' });
+		const commentOnPullRequest = commentSpy();
+
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest,
+			getAggregateCheckStatus: checksPending(),
+			commentOnPullRequest,
+		});
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow({ attempt: 1 }),
+			job,
+			project,
+			{
+				mergePullRequest,
+				getAggregateCheckStatus: checksConcluding('success', 'failure'),
+				commentOnPullRequest,
+			},
+		);
+
+		expect(mergePullRequest).not.toHaveBeenCalled();
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
+		expect(commentOnPullRequest).toHaveBeenCalledOnce();
+		expect(markReviewVerdictSuperseded).not.toHaveBeenCalled();
+		expect(outcome.result).toBe('not-eligible');
+	});
+
+	it('bounds the wait, settling with the pending checks named once the budget is spent', async () => {
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged' });
+
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow({ attempt: MAX_MERGE_RETRIES }),
+			job,
+			project,
+			{ mergePullRequest, getAggregateCheckStatus: checksPending('queued', 'build') },
+		);
+
+		expect(mergePullRequest).not.toHaveBeenCalled();
+		expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-retry-exhausted');
+		const recorded = updateReviewMergeOutcome.mock.calls.at(-1)?.[1] as {
+			status: string;
+			message: string;
+		};
+		expect(recorded.status).toBe(MERGE_RETRY_EXHAUSTED);
+		expect(recorded.message).toContain("approved head's checks");
+		expect(recorded.message).toContain('build');
+		expect(outcome.result).toBe(MERGE_RETRY_EXHAUSTED);
+	});
+
+	it('merges a zero-check approved head under if-present without waiting', async () => {
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged' });
+
+		await processMergeAutomationDispatch(
+			mockDispatchRow(),
+			job,
+			{ ...project, reviewChecks: 'if-present' },
+			{
+				mergePullRequest,
+				getAggregateCheckStatus: vi.fn(async () => ({ totalCount: 0, checkRuns: [] })),
+			},
+		);
+
+		expect(mergePullRequest).toHaveBeenCalledExactlyOnceWith(expect.anything(), 17, 'deadbeef');
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merged');
+		expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+	});
+
+	it('waits on a zero-check approved head under the default required policy', async () => {
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged' });
+
+		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest,
+			getAggregateCheckStatus: vi.fn(async () => ({ totalCount: 0, checkRuns: [] })),
+		});
+
+		expect(mergePullRequest).not.toHaveBeenCalled();
+		expect(lastRetryInput().attempt).toBe(1);
+		expect(outcome.result).toBe('retry-scheduled');
+	});
+
+	it('treats a failing check read as a retried provider error, never a merge', async () => {
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged' });
+
+		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest,
+			getAggregateCheckStatus: vi.fn(async () => {
+				throw new Error('checks API 502');
+			}),
+		});
+
+		expect(mergePullRequest).not.toHaveBeenCalled();
+		expect(updateReviewMergeOutcome).toHaveBeenLastCalledWith('run-1', {
+			status: 'provider-error',
+			message: 'checks API 502',
+			attempt: 0,
+			approvedHeadSha: 'deadbeef',
+		});
+		expect(scheduleDispatchRetry).toHaveBeenCalledTimes(1);
+		expect(outcome.result).toBe('retry-scheduled');
 	});
 });
 

@@ -866,8 +866,9 @@ continuation of the old head's. (2) `MAX_BASE_UPDATES` (2, coded on
 `MAX_MERGE_RETRIES`'s precedent) caps it; beyond that the dispatch completes
 `merge-retry-exhausted` — the queue's existing vocabulary for a spent budget —
 while the Review run records `stale-base`, so the two give-ups stay
-distinguishable by outcome as well as by message. (3) Every attempt on a head
-*this dispatch produced* (`baseUpdates > 0`) first reads that head's aggregate
+distinguishable by outcome as well as by message. (3) Every attempt — since
+issue #1124 on the approved head too, not only on a head *this dispatch
+produced* (`baseUpdates > 0`) — first reads that head's aggregate
 checks and judges them with `decideAggregateCheckOutcome` under the PR's repository's
 own `reviewChecks` policy — the same classifier `pr-review` and the
 base-branch sweep use — so "merges only once the fresh CI is green" is SWARM's
@@ -904,6 +905,28 @@ build. A fresh CI that never starts on the updated head (an offline self-hosted
 runner) defers on the ordinary backoff and, once the budget is spent, settles
 `merge-retry-exhausted` with the pending checks named in the run's outcome —
 never a merge, and no wait beyond the existing budget.
+
+**The approved head is checked before it is merged too (issue #1124).** The
+check read in (3) used to run only on a head the dispatch produced, on the
+premise that a Review is only dispatched once its head's checks completed. That
+premise is false for a Review dispatched off a pull request's opening (issue
+#1123) and for one that waited for a worker while CI changed underneath it — and
+on a private repository without branch protection nothing else refuses the
+merge, so a red head was merged. Now every attempt reads the head's checks before
+the merge capability (and so before any staleness update): **red** persists
+`not-eligible`, posts one best-effort comment naming the failing checks, and
+settles `merge-not-eligible` — *not* stamped superseded (issue #1079), and left to
+Respond-to-CI, which the `pr-review` trigger routes a red head to on its own;
+**pending** is a `not-ready` on the ordinary bounded budget, holding the merge
+queue's turn, and its exhaustion names the pending checks; only **green** merges.
+There is no race with Respond-to-CI: it is dispatched only for a red head, merge
+automation merges only a head it has just read green, and the merge stays pinned
+to the approved SHA, so a fix Respond-to-CI pushes is never merged underneath it.
+Three consequences are deliberate: a repository under `reviewChecks: 'required'`
+whose heads carry no checks no longer auto-merges (it needs `if-present`); a
+Review the no-fix recovery bypass (#841) dispatches on a still-red head can
+approve, but the merge waits for a green head; and a red head later re-run green
+at the same SHA is merged by hand — the refusal is terminal.
 
 **A provider that cannot update a branch has a SWARM worker do it (issue #1117,
 merge queue 3/3).** Bitbucket Cloud, gitlab.com and Azure DevOps Services answer
