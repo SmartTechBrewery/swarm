@@ -54,6 +54,17 @@
  *  - the head the update produces pre-claims its own PR+SHA review-dispatch slot
  *    so re-verification costs no `REVIEW_VERDICT_CAP` slot.
  *
+ * **Every head is checked before it is merged (issue #1124).** An approval
+ * proves the diff was read; it does not prove CI passed. A Review dispatched off
+ * `opened` (issue #1123), or one that waited for a worker while CI changed under
+ * it, can approve a head whose checks are still running or already red — and on
+ * a repository with no branch protection nothing else refuses that merge. So
+ * every attempt reads the head's aggregate checks first, with the classifier and
+ * per-repository `reviewChecks` policy the pipeline itself uses: a red head is
+ * refused terminally with a PR comment and left to Respond-to-CI, a pending one
+ * waits on the ordinary bounded budget (keeping its merge-queue turn), and only a
+ * green one is offered to the merge capability.
+ *
  * **A refusal the head caused frees the approval's cap slot (issue #1079).**
  * When a terminal `not-eligible` is explained *only* by the pull request's head
  * having moved since the review — in practice Resolve-conflicts pushing a merge
@@ -63,7 +74,7 @@
  * is reviewed again at its current head instead of stalling green, mergeable and
  * permanently unreviewed. Decided by one provider-neutral `getPullRequest` read
  * rather than a structured refusal reason, and written on the two head-moved
- * paths only — never on the red-merged-tree refusal, which is a real failure.
+ * paths only — never on a red-head refusal, which is a real failure.
  *
  * **One merge per repository at a time (issue #1114).** Freshness checked per
  * pull request is not enough on its own: two approved pull requests can each read
@@ -382,7 +393,8 @@ function retryableExhaustion(
  * self-hosted runner that is offline never starts it — and the reason names the
  * checks still pending, so the operator can tell a stuck runner from a moving
  * base or a red build. The existing budget still bounds that wait; nothing here
- * waits longer for it.
+ * waits longer for it. The approved head's own checks (issue #1124) are waited
+ * for on the same budget and named the same way.
  */
 function exhaustionMessage(
 	job: MergeAutomationJob,
@@ -397,6 +409,8 @@ function exhaustionMessage(
 		return `Merge automation asked a SWARM worker to bring this pull request's head up to date with its base and gave up after ${MAX_MERGE_RETRIES + 1} attempts waiting for that update; the pull request is approved but was left open for a manual merge. Last reason: ${lastMessage}`;
 	if (baseUpdatesSpent(job) > 0)
 		return `Merge automation brought this pull request's head up to date with its base and gave up after ${MAX_MERGE_RETRIES + 1} attempts waiting for that head to become mergeable; the pull request is approved but was left open for a manual merge. Last reason: ${lastMessage}`;
+	if (lastMessage.startsWith(WAITING_FOR_APPROVED_HEAD_CHECKS))
+		return `Merge automation waited ${MAX_MERGE_RETRIES + 1} attempts for the approved head's checks to finish and gave up; the pull request is approved but was left open for a manual merge once its checks are green. Last reason: ${lastMessage}`;
 	return 'Merge automation gave up after repeated not-ready results; the pull request is approved but was left open for a manual merge.';
 }
 
@@ -473,15 +487,17 @@ function baseUpdatesSpent(job: MergeAutomationJob): number {
 }
 
 /**
- * What the fresh CI on a head **this dispatch produced** says right now.
+ * What the CI on the head this dispatch is about to merge says right now.
  *
- * Only ever asked about an updated head, and that is the whole point: an
- * ordinary merge is requested by a Review the provider only dispatched once
- * every check on that commit had completed, so its checks are already known
- * good. The commit an update produces has never been judged by anything, and
- * relying on the provider's own merge endpoint to refuse a pending or red one
- * would make the guarantee a property of the repository's branch protection —
- * the alternative issue #872 explicitly set aside.
+ * Asked about every head before it is merged — the approved one as much as one
+ * this dispatch produced by updating the branch (issue #874). An approval does
+ * not prove the approved head is green (issue #1124): a Review dispatched off
+ * `opened`, or one that queued while CI changed, can approve a head whose checks
+ * are still running or already red, and the commit an update produces has never
+ * been judged by anything. Relying on the provider's own merge endpoint to refuse
+ * a pending or red head would make the guarantee a property of the repository's
+ * branch protection — the alternative issue #872 explicitly set aside, and one a
+ * private repository on a free plan cannot even configure.
  *
  * Judged with the *same* classifier and the same repository policy the `pr-review`
  * handler uses ({@link decideAggregateCheckOutcome}), so a head is never green
@@ -521,7 +537,8 @@ async function readFreshCheckVerdict(
  * top of the durable outcome, so a provider that cannot be reached costs the
  * comment and not the record. Never throws.
  *
- * Only the refusals issue #874 introduces comment. The pre-existing terminal
+ * Only the refusals issue #874 introduces comment, plus the red approved head
+ * issue #1124 refuses on the same grounds. The pre-existing terminal
  * outcomes (a moved head, a policy block, …) are left exactly as they were —
  * they are reported on the dashboard, and adding a comment to them is a separate
  * decision from this one.
@@ -550,16 +567,32 @@ async function commentOnMergeRefusal(
 	}
 }
 
+/** Why a refusal over a head behind its base matters — the default middle paragraph. */
+const BEHIND_BASE_CONSEQUENCE = [
+	'Merging it as it stands would land a change nothing has built against the',
+	'current base, which is how two independently green pull requests combine',
+	'into a red base branch. No branch changes were made by this attempt.',
+].join('\n');
+
+/** Why a refusal over a red approved head matters (issue #1124). */
+const RED_HEAD_CONSEQUENCE = [
+	'Merge automation merges only a head whose checks are green under this',
+	"repository's `reviewChecks` policy, however its approving review was started.",
+	'No branch changes were made by this attempt.',
+].join('\n');
+
 /** The notice for a refusal SWARM will not retry — one paragraph plus what a human should do. */
-function mergeRefusalCommentBody(reason: string, nextStep: string): string {
+function mergeRefusalCommentBody(
+	reason: string,
+	nextStep: string,
+	consequence: string = BEHIND_BASE_CONSEQUENCE,
+): string {
 	return [
 		'## ⚠️ SWARM refused to merge this pull request',
 		'',
 		reason,
 		'',
-		'Merging it as it stands would land a change nothing has built against the',
-		'current base, which is how two independently green pull requests combine',
-		'into a red base branch. No branch changes were made by this attempt.',
+		consequence,
 		'',
 		nextStep,
 	].join('\n');
@@ -1180,6 +1213,9 @@ function handedBackBranchUpdate(job: MergeAutomationJob): ProducedBranchUpdate |
 const WAITING_FOR_WORKER_UPDATE =
 	'waiting for a SWARM worker to bring the head up to date with the base';
 
+/** The `not-ready` reason while the approved head's own checks are still running (issue #1124). */
+const WAITING_FOR_APPROVED_HEAD_CHECKS = 'waiting for the checks on the approved head';
+
 /**
  * Whether the worker-side branch update this dispatch asked for its approved head
  * has not reported yet. While it has not, the merge is not offered at all: the
@@ -1390,12 +1426,12 @@ async function markApprovalSupersededByHeadChange(
 /** What one merge attempt came back with, before any of it is settled. */
 interface MergeAttempt {
 	outcome: MergePullRequestOutcome;
-	/** Set only when the attempt refused because the head *it* produced is red. */
+	/** Set only when the attempt refused because the head it was about to merge is red. */
 	redFreshChecks: string[] | null;
 }
 
 /**
- * Ask for the merge: verify a head this dispatch itself produced first, then
+ * Ask for the merge: verify the head's checks first, then
  * hand the pull request to the provider-neutral merge capability. Never throws
  * — an unreachable provider comes back as `provider-error` so the caller
  * settles it the way it settles every other provider failure.
@@ -1414,28 +1450,34 @@ async function attemptMerge(
 	// `processJob` and leaving a claimed dispatch in flight.
 	try {
 		const merge = capabilities.mergePullRequest ?? scmCapability(project, 'mergePullRequest');
-		// A head this dispatch produced has to be verified before it is offered to
-		// the merge capability at all; an ordinary approved head skips this read.
-		const freshChecks: FreshCheckVerdict =
-			baseUpdatesSpent(job) > 0
-				? await readFreshCheckVerdict(job, project, capabilities)
-				: { kind: 'green' };
+		// Every head is verified before it is offered to the merge capability at
+		// all — before the staleness check too, so a red approved head is refused
+		// without first being brought up to date. A head this dispatch produced has
+		// never been judged by anything, and an approval does not prove the approved
+		// head is green either (issue #1124).
+		const updated = baseUpdatesSpent(job) > 0;
+		const freshChecks = await readFreshCheckVerdict(job, project, capabilities);
 		if (freshChecks.kind === 'pending') {
-			// The updated head's own CI has not finished. Ordinary backoff — the
-			// budget was reset when the head advanced, so this is the wait it exists for.
+			// The head's own CI has not finished. Ordinary backoff — for an updated
+			// head the budget was reset when it advanced, so this is the wait it exists for.
 			return {
 				outcome: {
 					status: 'not-ready',
-					message: `waiting for the checks on the head brought up to date with the base: ${freshChecks.message}`,
+					message: updated
+						? `waiting for the checks on the head brought up to date with the base: ${freshChecks.message}`
+						: `${WAITING_FOR_APPROVED_HEAD_CHECKS}: ${freshChecks.message}`,
 				},
 				redFreshChecks: null,
 			};
 		}
 		if (freshChecks.kind === 'red') {
+			const failed = freshChecks.failedChecks.join(', ');
 			return {
 				outcome: {
 					status: 'not-eligible',
-					message: `the head brought up to date with the base fails its checks (${freshChecks.failedChecks.join(', ')}); the reviewed diff and the current base do not combine cleanly`,
+					message: updated
+						? `the head brought up to date with the base fails its checks (${failed}); the reviewed diff and the current base do not combine cleanly`
+						: `the approved head fails its checks (${failed}); merge automation does not merge a head whose checks are red`,
 				},
 				redFreshChecks: freshChecks.failedChecks,
 			};
@@ -1529,11 +1571,16 @@ async function settleChildrenThisMergeAbsorbed(
 }
 
 /**
- * The point of the whole exercise: the reviewed diff and the current base are
- * each fine and their combination is not. Refused, and said out loud on the pull
+ * The head about to be merged is red. Refused, and said out loud on the pull
  * request — merging it would be exactly the red base this exists to prevent.
+ *
+ * For a head this dispatch produced that is the point of the whole exercise: the
+ * reviewed diff and the current base are each fine and their combination is not.
+ * For the approved head itself (issue #1124) the review approved a commit whose
+ * CI failed; the failure belongs to Respond-to-CI, which the `pr-review` trigger
+ * routes this head to on its own, so nothing here races it.
  */
-async function refuseRedUpdatedHead(
+async function refuseRedHead(
 	dispatch: DispatchRow,
 	job: MergeAutomationJob,
 	project: ProjectConfig,
@@ -1543,27 +1590,40 @@ async function refuseRedUpdatedHead(
 	capabilities: MergeAutomationCapabilities,
 ): Promise<MergeAutomationSettledOutcome> {
 	const failed = redFreshChecks.join(', ');
+	const updated = baseUpdatesSpent(job) > 0;
 	await persistMergeOutcome(job, 'not-eligible', message, attempt);
 	await commentOnMergeRefusal(
 		job,
 		project,
 		capabilities,
-		mergeRefusalCommentBody(
-			`SWARM brought this pull request's head up to date with the base and the resulting commit fails its checks: ${failed}. Each side is green on its own; together they are not.`,
-			'Fix the combination on this branch — the failure is real, and it is what this pull request would have landed.',
-		),
+		updated
+			? mergeRefusalCommentBody(
+					`SWARM brought this pull request's head up to date with the base and the resulting commit fails its checks: ${failed}. Each side is green on its own; together they are not.`,
+					'Fix the combination on this branch — the failure is real, and it is what this pull request would have landed.',
+				)
+			: mergeRefusalCommentBody(
+					`The review approved head \`${job.approvedHeadSha}\`, but that head fails its checks: ${failed}.`,
+					'SWARM handles the failing checks the same way as for any red pull request (Respond-to-CI, when it is enabled for this repository), and a fixed head gets its own review before it can merge. If the failure was spurious, re-run the failing checks and merge by hand once they are green — SWARM does not retry this merge for the same head.',
+					RED_HEAD_CONSEQUENCE,
+				),
 	);
-	logger.warn('Merge automation: the updated head is red — refusing the merge', {
-		dispatchId: dispatch.id,
-		runId: job.reviewRunId,
-		prNumber: job.prNumber,
-		headSha: job.approvedHeadSha,
-		failedChecks: redFreshChecks,
-	});
+	logger.warn(
+		updated
+			? 'Merge automation: the updated head is red — refusing the merge'
+			: 'Merge automation: the approved head is red — refusing the merge',
+		{
+			dispatchId: dispatch.id,
+			runId: job.reviewRunId,
+			prNumber: job.prNumber,
+			headSha: job.approvedHeadSha,
+			failedChecks: redFreshChecks,
+		},
+	);
 	// Deliberately *not* stamped superseded (issue #1079), and returned before
-	// the terminal branch that would: this refusal is a genuinely red merged
-	// tree, not a supersession. The approval must keep its slot — freeing it
-	// would buy re-reviews of a combination that is actually broken.
+	// the terminal branch that would: this refusal is a genuinely red head — a
+	// merged tree, or the approved commit itself — not a supersession. The
+	// approval must keep its slot — freeing it would buy re-reviews of a head
+	// that is actually broken.
 	await settleMergeDispatch(dispatch, job, project, 'merge-not-eligible');
 	return settledOutcome(job, 'not-eligible');
 }
@@ -1636,8 +1696,9 @@ async function retryOrExhaust(
  * persist the outcome on the originating Review run, and settle the dispatch —
  * `completed` for a merge or a terminal functional refusal, or
  * `retry-scheduled` (bounded, doubling backoff) while the PR is transiently
- * `not-ready`, while the provider is failing (issue #923), or while the head
- * this dispatch itself brought up to date is still being verified (issue #874).
+ * `not-ready`, while the provider is failing (issue #923), while the head
+ * this dispatch itself brought up to date is still being verified (issue #874),
+ * or while the approved head's own checks are still running (issue #1124).
  * Never `failed`: a spent budget completes as `merge-retry-exhausted` with the
  * reason on the Review run.
  *
@@ -1692,7 +1753,7 @@ export async function processMergeAutomationDispatch(
 	let outcome: MergePullRequestOutcome = attempted.outcome;
 
 	if (redFreshChecks) {
-		return refuseRedUpdatedHead(
+		return refuseRedHead(
 			dispatch,
 			job,
 			project,
