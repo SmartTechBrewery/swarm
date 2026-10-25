@@ -45,7 +45,7 @@ export type AggregateCheckDecision =
  * so a head whose only check suite has no runs, or carries a suite the provider's
  * read does not list at all (an Xcode Cloud suite stuck in `queued` on GitHub,
  * issue #1107), is a zero-check head. That is decided here once, so the
- * `updated` and `checks` paths of the `pr-review` handler, the unreviewed-PR
+ * `updated`, `opened` and `checks` paths of the `pr-review` handler, the unreviewed-PR
  * sweep, base-branch health and merge automation can never classify the same head
  * differently; `basis` lets the `updated` path act on the zero-check case alone
  * without re-testing `totalCount` itself.

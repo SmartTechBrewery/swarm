@@ -1,12 +1,16 @@
 /**
  * `pr-review` trigger — the PR-lifecycle handler. It starts the Review phase
- * (`src/pipeline/review.ts`) when a PR is opened or its checks pass, and routes
+ * (`src/pipeline/review.ts`) when a PR's checks pass — on its opening or on their
+ * completion — and routes
  * a *failing* check suite to the Respond-to-CI phase (`src/pipeline/respond-to-ci.ts`),
  * mirroring Cascade's review-agent + respond-to-ci triggers on `check_suite`
  * completion (ai/ARCHITECTURE.md "Pipeline phases" #3 / respond-to-ci).
  *
  * Three entry events, one handler:
- *  - `pull-request` `opened` (non-draft) — review the freshly opened PR.
+ *  - `pull-request` `opened` (non-draft) — takes the same aggregate decision a
+ *    completed checks event does (issue #1123): review a green head (or a
+ *    zero-check head under `if-present`), route a red one to Respond-to-CI, wait
+ *    otherwise.
  *  - `pull-request` `updated` (a push) — route a conflicting head to
  *    Resolve-conflicts; a mergeable one waits for its checks, bar a head
  *    reporting zero checks under its repository's `reviewChecks: 'if-present'`, which is
@@ -15,25 +19,25 @@
  *  - `checks` `completed` — review the commit CI just validated (why the phase
  *    pins its checkout to the head SHA), or fix it if CI failed.
  *
- * **The `opened` dispatch races the Implementation phase's own wrap-up — by
- * design.** The implementer opens the PR (`gh pr create`) as one of its last
- * actions *inside* its still-running agent process, so GitHub delivers
- * a `pull-request` `opened` event — and this handler dispatches Review — a few
- * seconds before the Implementation phase logs its own `Phase finished` and moves
- * the board. In an interleaved log, when several phases run concurrently, that
- * reads as "Review started before Implementation finished", which looks like an
- * out-of-order pipeline but isn't: Review provisions its *own* detached worktree
- * at the head SHA and touches nothing the implementer owns, and if the implementer
- * pushes further commits after opening the PR, their `checks` event re-enters here
- * and re-reviews at the final SHA (the PR+SHA dedup keys on the new commit, so the
- * later review isn't dropped). No serialization needed; the per-run `logContext`
- * (`taskId`/`phase` on every `agent run finished` line) is what disambiguates the
- * interleave.
+ * **An `opened` PR waits for its checks** (issue #1123). `opened` used to
+ * dispatch Review at once, so on a repository with CI it reviewed heads CI was
+ * about to reject: `under-control-platform` PR #1667's Review started while
+ * "Lint, typecheck, and test" was still running, and the CI fix that followed
+ * queued behind it. It now takes the aggregate decision below, waiting in the
+ * same `state-pending` checks wait a `checks` event does — the two share one
+ * recheck key per head, so a head has a single wait — and because every wake-up
+ * of a deferred dispatch re-runs this handler, a Review that waited for a worker
+ * re-reads the checks and goes to Respond-to-CI if they went red meanwhile. A
+ * head already green (or carrying no checks under `if-present`) at open time is
+ * still dispatched off the `opened` event itself, a few seconds before the
+ * Implementation phase logs its own `Phase finished`. That interleave is
+ * harmless: Review provisions its *own* detached worktree at the head SHA and
+ * touches nothing the implementer owns.
  *
  * **Aggregate check state, not this event's conclusion.** A provider fires one
  * check-completion event per workflow, so any single event's own `conclusion`
  * describes only its own suite while siblings may still be running. On a `checks`
- * event the handler re-queries *every* check on the head SHA
+ * or `opened` event the handler re-queries *every* check on the head SHA
  * (`SCMProvider.getAggregateCheckStatus`) and decides via
  * `decideAggregateCheckOutcome` (`aggregate-check-decision.ts`): review if all
  * complete and none failed, respond-to-ci if a check failed, or **defer** if some
@@ -186,6 +190,7 @@
 import type { ProjectConfig } from '../../config/schema.js';
 import { getActiveDispatchByRunId } from '../../db/repositories/dispatchesRepository.js';
 import {
+	abandonReviewVerdictOwnedBy,
 	REVIEW_SUPERSEDED_CAP,
 	REVIEW_VERDICT_CAP,
 	reserveReviewVerdict,
@@ -236,7 +241,7 @@ import { decideAggregateCheckOutcome } from './aggregate-check-decision.js';
 
 /**
  * What a shape-matched event resolves to once its per-event-kind gate has run.
- * A `checks` event whose checks all passed → `review`; one where a check failed →
+ * A `checks` (or `opened`) event whose checks all passed → `review`; one where a check failed →
  * `respond-to-ci` (carrying the failing run names for the dispatch log) or
  * `blocked-by-base` when the base branch's own red already explains it (issue
  * #873, carrying that base branch, its head and the checks the two have in
@@ -662,8 +667,8 @@ function matchesReviewShape(ctx: TriggerContext): boolean {
 /**
  * The `pull-request`-only gate: a non-draft, same-repo PR is reviewable. Logs
  * and returns `none` on a near-miss so `handle` can fall through to the
- * registry's next handler. A `pull-request` event never routes to Respond-to-CI
- * — that path is driven only by failed `checks`.
+ * registry's next handler. Whether a reviewable PR is then reviewed, routed to
+ * Respond-to-CI or left waiting is the caller's decision.
  *
  * Defensively duplicates `checkMergeabilityAndConflicts`'s own draft/fork early
  * return; the work-item origin gate already ran there for both entry events.
@@ -915,8 +920,10 @@ async function resolveAggregateCheckReview(
  * A failed read under `if-present` also resolves `none` rather than scheduling a
  * recheck — the outcome this event always had, left to the `checks` event and the
  * unreviewed-PR sweep — because {@link scheduleCheckRecheck}'s key is shared with
- * the `checks` path, whose dispatch-capable recheck a coalesced `updated` payload
- * must not replace.
+ * the `checks` and `opened` paths, whose dispatch-capable recheck a coalesced
+ * `updated` payload must not replace. (`opened` may share it because it re-enters
+ * through the same aggregate decision as `checks`, so whichever payload supersedes
+ * the other, the head reaches the same answer.)
  */
 async function resolveUpdatedPullRequestReview(
 	ctx: ScmTriggerContext,
@@ -965,9 +972,10 @@ async function resolveUpdatedPullRequestReview(
 /**
  * What a shape-matched event resolves to, routing to the per-event-kind gate: a
  * `pull-request`'s draft/fork check (`review`/`none`) — for an `updated` event
- * then {@link resolveUpdatedPullRequestReview}'s checks-policy decision — or a
- * `checks` event's aggregate-CI decision (`review`/`respond-to-ci`/
- * `blocked-by-base`/`none`, and it may defer a recheck in place). `baseBranch` is
+ * then {@link resolveUpdatedPullRequestReview}'s checks-policy decision, while an
+ * `opened` event falls through (issue #1123) — and then the aggregate-CI decision
+ * a `checks` event takes (`review`/`respond-to-ci`/`blocked-by-base`/`none`, and
+ * it may defer a recheck in place). `baseBranch` is
  * the pull request's own base, carried from the mergeability gate for the
  * base-attribution read.
  */
@@ -979,8 +987,10 @@ function resolveDisposition(
 ): ReviewDisposition | Promise<ReviewDisposition> {
 	if (ctx.event.kind === 'pull-request') {
 		const reviewable = isReviewablePullRequest(ctx.event, prNumber);
-		if (reviewable.kind !== 'review' || ctx.event.action !== 'updated') return reviewable;
-		return resolveUpdatedPullRequestReview(ctx, prNumber, headSha);
+		if (reviewable.kind !== 'review') return reviewable;
+		if (ctx.event.action === 'updated')
+			return resolveUpdatedPullRequestReview(ctx, prNumber, headSha);
+		// `opened` (issue #1123): fall through to the decision a completed checks event takes.
 	}
 	return resolveAggregateCheckReview(ctx, prNumber, headSha, baseBranch);
 }
@@ -1698,6 +1708,45 @@ async function noteDispatchClaimHeld(
 	});
 }
 
+/**
+ * Abandon the review-verdict slot this dispatch reserved for the head on an
+ * earlier evaluation, now that the head went red and the dispatch becomes a CI
+ * fix instead (issue #1123). Only a prioritized continuation can have reserved
+ * one, so any other dispatch returns at once. A Review deferred for a worker
+ * keeps its slot `pending` across the wait; left there, the fix's own
+ * still-active dispatch would hold it and block the Review of the head the fix
+ * pushes. Fenced on this dispatch, so it is a no-op for a CI-fix continuation
+ * that never reserved one, and best-effort: a slot it misses is recovered once
+ * its dispatch settles (issue #857).
+ */
+async function handBackContinuationReviewSlot(
+	ctx: ScmTriggerContext,
+	heldClaim: string | null,
+	prNumber: string,
+	headSha: string,
+): Promise<void> {
+	if (heldClaim !== 'prioritized-continuation-retry') return;
+	const { project } = ctx;
+	try {
+		const abandoned = await abandonReviewVerdictOwnedBy(
+			{ projectId: project.id, repository: project.repo, prNumber, headSha },
+			ctx.dispatchId,
+		);
+		if (abandoned) {
+			logger.info('review: head went red while this Review waited — handing back its slot', {
+				prNumber,
+				headSha,
+			});
+		}
+	} catch (err) {
+		logger.warn('review: could not hand back the review-verdict slot of a red head', {
+			prNumber,
+			headSha,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	}
+}
+
 export function createReviewTrigger(): TriggerHandler {
 	return {
 		name: 'pr-review',
@@ -1779,6 +1828,7 @@ export function createReviewTrigger(): TriggerHandler {
 			}
 
 			if (disposition.kind === 'respond-to-ci') {
+				await handBackContinuationReviewSlot(ctx, heldClaim, prNumber, headSha);
 				return dispatchRespondToCi(ctx, prNumber, headSha, disposition.failedChecks);
 			}
 

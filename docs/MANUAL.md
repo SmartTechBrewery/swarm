@@ -822,6 +822,20 @@ explanation for one that vanished mid-run. Raise `abandonedAfterDays` for a proj
 whose checkouts are meant to sit untouched for longer, or lengthen
 `SWARM_WORKTREE_ABANDONED_SWEEP_INTERVAL_MS` to sweep the fleet less often.
 
+**A newly opened pull request waits for its checks before Review starts** (issue
+#1123). Opening a pull request no longer starts its Review straight away. SWARM
+reads the head's checks first, exactly as it does when they complete. A green head
+goes to Review. A red one goes to Respond-to-CI, and that head is never reviewed.
+A head whose checks are still running, or (under `reviewChecks: 'required'`) have
+not registered yet, waits. The Queue shows that wait as a re-check waiting on CI,
+for up to the repository's `reviewChecksWaitMinutes`. A repository with no CI on
+pull requests sets `reviewChecks: 'if-present'` and is reviewed as soon as the pull
+request opens. A Review that was queued, waiting for a worker for example, reads
+the checks again when it is picked up, so it never starts on a head that went red
+in the meantime. If this repository's CI routinely outlasts the wait, an abandoned
+Review run naming `reviewChecksWaitMinutes` appears. The completed-checks event
+still reviews the head, and raising the setting removes the noise.
+
 **A renamed repository produces no failure at all.** Cards stop dispatching and
 nothing is marked failed: the router logs `pm-status: work item has no backing SCM
 artifact reference` and completes the job as a no-op, because the card's repository

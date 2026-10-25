@@ -141,9 +141,16 @@ vi.mock('@/db/repositories/dispatchesRepository.js', () => ({ getActiveDispatchB
 // dispatching (issue #235); mock the ledger so these tests need no database.
 // Defaults to granting a fresh reservation (the common path); individual
 // tests flip it to exercise `blocked`/`capped`/a persistence error.
-const { reserveReviewVerdict } = vi.hoisted(() => ({ reserveReviewVerdict: vi.fn() }));
+//
+// `abandonReviewVerdictOwnedBy` is the hand-back a Review continuation takes
+// when its head went red while it waited (issue #1123).
+const { reserveReviewVerdict, abandonReviewVerdictOwnedBy } = vi.hoisted(() => ({
+	reserveReviewVerdict: vi.fn(),
+	abandonReviewVerdictOwnedBy: vi.fn(),
+}));
 vi.mock('@/db/repositories/reviewVerdictsRepository.js', () => ({
 	reserveReviewVerdict,
+	abandonReviewVerdictOwnedBy,
 	REVIEW_VERDICT_CAP: 3,
 	REVIEW_SUPERSEDED_CAP: 5,
 }));
@@ -168,6 +175,10 @@ beforeEach(() => {
 	claimConflictResolution.mockReset();
 	claimConflictResolution.mockResolvedValue(true);
 	getAggregateCheckStatus.mockReset();
+	// A head CI already passed: a PR opening reads the checks too (issue #1123),
+	// so suites using an `opened` event as their reviewable event keep
+	// dispatching. Suites that care about the aggregate set their own.
+	getAggregateCheckStatus.mockResolvedValue(checkStatus([['ci', 'completed', 'success']]));
 	scheduleCoalescedJob.mockReset();
 	// Ownership-gate default: SWARM has an Implementation run for the work item the
 	// PR's branch decodes to. Tests flip it to exercise an unrelated PR or a
@@ -184,6 +195,8 @@ beforeEach(() => {
 	getActiveDispatchByRunId.mockResolvedValue(undefined);
 	reserveReviewVerdict.mockReset();
 	reserveReviewVerdict.mockResolvedValue({ status: 'reserved', id: 'v1', ordinal: 1 });
+	abandonReviewVerdictOwnedBy.mockReset();
+	abandonReviewVerdictOwnedBy.mockResolvedValue(true);
 	hasPersonaToken.mockReset();
 	hasPersonaToken.mockResolvedValue(true);
 	getPullRequest.mockReset();
@@ -269,7 +282,7 @@ describe('review trigger', () => {
 			prAuthorLogin: 'operator-human',
 		} as const;
 
-		it('dispatches Review for a non-draft same-repo PR linked to a SWARM work item', async () => {
+		it("dispatches Review once the head's checks have all passed", async () => {
 			const result = await handler.handle(
 				ctx({ ...base, headSha: 'abc123', isDraft: false, isCrossRepo: false }),
 			);
@@ -283,6 +296,12 @@ describe('review trigger', () => {
 				headSha: 'abc123',
 				verdictSlotReserved: true,
 			});
+			// The opening reads the head's checks like a completed-checks event (issue #1123).
+			expect(getAggregateCheckStatus).toHaveBeenCalledWith(
+				expect.objectContaining({ id: PROJECT.id }),
+				'abc123',
+			);
+			expect(scheduleCoalescedJob).not.toHaveBeenCalled();
 		});
 
 		it('dispatches when no pipeline config is present', async () => {
@@ -372,9 +391,90 @@ describe('review trigger', () => {
 			expect(await handler.handle(ctx({ ...base, isCrossRepo: false }))).toBeNull();
 		});
 
-		it('does not query check state for a PR event', async () => {
-			await handler.handle(ctx({ ...base, headSha: 'abc123', isDraft: false, isCrossRepo: false }));
-			expect(getAggregateCheckStatus).not.toHaveBeenCalled();
+		describe("waits for the head's checks (issue #1123)", () => {
+			const opened = (extra: Parameters<typeof ctx>[1] = {}) =>
+				ctx({ ...base, headSha: 'abc123', isCrossRepo: false, prBranch: 'issue-42' }, extra);
+
+			it('defers a head whose check is still running, on the shared checks recheck', async () => {
+				getAggregateCheckStatus.mockResolvedValue(checkStatus([['ci', 'in_progress', null]]));
+				expect(await handler.handle(opened())).toBeNull();
+				expect(claimReviewDispatch).not.toHaveBeenCalled();
+				expect(reserveReviewVerdict).not.toHaveBeenCalled();
+				expect(scheduleCoalescedJob).toHaveBeenCalledOnce();
+				const [payload, key, , waitReason] = scheduleCoalescedJob.mock.calls[0];
+				expect(key).toBe(`check-suite:${PROJECT.repo}:42:abc123`);
+				expect(payload).toMatchObject({
+					event: expect.objectContaining({ kind: 'pull-request', action: 'opened' }),
+					recheckAttempt: 1,
+				});
+				expect(waitReason).toBe('recheck');
+			});
+
+			it('defers a head with no checks registered yet under required', async () => {
+				getAggregateCheckStatus.mockResolvedValue(checkStatus([]));
+				const noteDecline = vi.fn();
+				expect(await handler.handle(opened({ noteDecline }))).toBeNull();
+				expect(claimReviewDispatch).not.toHaveBeenCalled();
+				expect(scheduleCoalescedJob).toHaveBeenCalledOnce();
+				expect(noteDecline).toHaveBeenCalledOnce();
+				const decline = noteDecline.mock.calls[0][0] as TriggerDecline;
+				expect(decline.kind).toBe('recheck-scheduled');
+				expect(decline.reason).toContain('none are registered');
+				expect(decline.reason).toContain('`if-present`');
+			});
+
+			it('routes a failed check to Respond-to-CI without reserving a review', async () => {
+				getAggregateCheckStatus.mockResolvedValue(checkStatus([['ci', 'completed', 'failure']]));
+				const result = await handler.handle(opened());
+				expect(result).toEqual({
+					phase: 'respond-to-ci',
+					taskId: '42-ci',
+					prNumber: '42',
+					prBranch: 'issue-42',
+					headSha: 'abc123',
+				});
+				expect(reserveReviewVerdict).not.toHaveBeenCalled();
+				expect(claimRespondToCiAttempt).toHaveBeenCalledOnce();
+			});
+
+			it('reviews a zero-check head at once under if-present', async () => {
+				getAggregateCheckStatus.mockResolvedValue(checkStatus([]));
+				const project = createMockProjectConfig({ reviewChecks: 'if-present' });
+				const result = await handler.handle({ ...opened(), project });
+				expect(result).toMatchObject({ phase: 'review', prNumber: '42', headSha: 'abc123' });
+				expect(scheduleCoalescedJob).not.toHaveBeenCalled();
+			});
+
+			it('defers a present running check under if-present', async () => {
+				getAggregateCheckStatus.mockResolvedValue(checkStatus([['ci', 'queued', null]]));
+				const project = createMockProjectConfig({ reviewChecks: 'if-present' });
+				expect(await handler.handle({ ...opened(), project })).toBeNull();
+				expect(claimReviewDispatch).not.toHaveBeenCalled();
+				expect(scheduleCoalescedJob).toHaveBeenCalledOnce();
+			});
+
+			it('routes a present failed check to Respond-to-CI under if-present', async () => {
+				getAggregateCheckStatus.mockResolvedValue(checkStatus([['ci', 'completed', 'failure']]));
+				const project = createMockProjectConfig({ reviewChecks: 'if-present' });
+				const result = await handler.handle({ ...opened(), project });
+				expect(result).toMatchObject({ phase: 'respond-to-ci', taskId: '42-ci' });
+			});
+
+			it('defers on the read-failure budget when the checks read throws', async () => {
+				getAggregateCheckStatus.mockRejectedValue(new Error('502 Bad Gateway'));
+				expect(await handler.handle(opened())).toBeNull();
+				expect(claimReviewDispatch).not.toHaveBeenCalled();
+				expect(scheduleCoalescedJob).toHaveBeenCalledOnce();
+				expect(scheduleCoalescedJob.mock.calls[0][0]).toMatchObject({
+					readFailureRecheckAttempt: 1,
+				});
+				expect(scheduleCoalescedJob.mock.calls[0][0]).not.toHaveProperty('recheckAttempt');
+			});
+
+			it('dispatches Review from a recheck once the checks have passed', async () => {
+				const result = await handler.handle(opened({ recheckAttempt: 3 }));
+				expect(result).toMatchObject({ phase: 'review', prNumber: '42', headSha: 'abc123' });
+			});
 		});
 	});
 
@@ -1386,6 +1486,100 @@ describe('review trigger — pull-request updated under reviewChecks (issue #110
  * is the classification: a defer spends the budget its *reason* names, whichever
  * scheduler runs.
  */
+describe('review trigger — a PR opening and its completed checks (issue #1123)', () => {
+	const opened = {
+		kind: 'pull-request',
+		action: 'opened',
+		workItemId: '42',
+		headSha: 'abc123',
+		isCrossRepo: false,
+		prBranch: 'issue-42',
+	} as const;
+	const checksCompleted = {
+		kind: 'checks',
+		action: 'completed',
+		workItemId: '42',
+		headSha: 'abc123',
+		prBranch: 'issue-42',
+	} as const;
+
+	describe('exactly one Review per head', () => {
+		beforeEach(() => {
+			// The real PR+SHA slot: granted to the first claimant only.
+			const claimed = new Set<string>();
+			claimReviewDispatch.mockImplementation(async (key: string) => {
+				if (claimed.has(key)) return false;
+				claimed.add(key);
+				return true;
+			});
+		});
+
+		it('reviews off the opening and drops the later completed checks', async () => {
+			expect(await handler.handle(ctx(opened))).toMatchObject({ phase: 'review' });
+			expect(await handler.handle(ctx(checksCompleted))).toBeNull();
+			expect(reserveReviewVerdict).toHaveBeenCalledOnce();
+		});
+
+		it('reviews off the completed checks and drops a late opening', async () => {
+			expect(await handler.handle(ctx(checksCompleted))).toMatchObject({ phase: 'review' });
+			expect(await handler.handle(ctx(opened))).toBeNull();
+			expect(reserveReviewVerdict).toHaveBeenCalledOnce();
+		});
+
+		it('keeps one recheck chain per head when both wait', async () => {
+			getAggregateCheckStatus.mockResolvedValue(checkStatus([['ci', 'in_progress', null]]));
+			await handler.handle(ctx(opened));
+			await handler.handle(ctx(checksCompleted));
+			expect(scheduleCoalescedJob).toHaveBeenCalledTimes(2);
+			expect(scheduleCoalescedJob.mock.calls[0][1]).toBe(scheduleCoalescedJob.mock.calls[1][1]);
+		});
+	});
+
+	describe('a Review that waited re-reads the checks when it is picked up', () => {
+		/** A held-claim continuation of an `opened` Review, e.g. one that waited for a worker. */
+		const continuation = (noteDecline?: (decline: TriggerDecline) => void) =>
+			ctx(opened, { continuationDispatchClaimed: true, runId: 'run-7', noteDecline });
+
+		it('goes to Respond-to-CI, handing back its review slot, once the head went red', async () => {
+			getAggregateCheckStatus.mockResolvedValue(checkStatus([['ci', 'completed', 'failure']]));
+			const result = await handler.handle(continuation());
+			expect(result).toMatchObject({
+				phase: 'respond-to-ci',
+				taskId: '42-ci',
+				prNumber: '42',
+				headSha: 'abc123',
+			});
+			expect(claimReviewDispatch).not.toHaveBeenCalled();
+			expect(reserveReviewVerdict).not.toHaveBeenCalled();
+			// The slot the earlier evaluation reserved, fenced on this dispatch.
+			expect(abandonReviewVerdictOwnedBy).toHaveBeenCalledWith(
+				{ projectId: PROJECT.id, repository: PROJECT.repo, prNumber: '42', headSha: 'abc123' },
+				'dispatch-1',
+			);
+		});
+
+		it('still routes to Respond-to-CI when the slot hand-back fails', async () => {
+			getAggregateCheckStatus.mockResolvedValue(checkStatus([['ci', 'completed', 'failure']]));
+			abandonReviewVerdictOwnedBy.mockRejectedValue(new Error('connection reset'));
+			expect(await handler.handle(continuation())).toMatchObject({ phase: 'respond-to-ci' });
+		});
+
+		it('waits again, as a scheduled recheck, when checks registered meanwhile', async () => {
+			// An if-present zero-check head whose CI registered while it waited.
+			getAggregateCheckStatus.mockResolvedValue(checkStatus([['ci', 'in_progress', null]]));
+			const project = createMockProjectConfig({ reviewChecks: 'if-present' });
+			const noteDecline = vi.fn();
+			expect(await handler.handle({ ...continuation(noteDecline), project })).toBeNull();
+			expect(scheduleCoalescedJob).toHaveBeenCalledOnce();
+			// The decline the consumer settles the carried run `deferred` on.
+			expect(noteDecline).toHaveBeenCalledWith(
+				expect.objectContaining({ kind: 'recheck-scheduled' }),
+			);
+			expect(abandonReviewVerdictOwnedBy).not.toHaveBeenCalled();
+		});
+	});
+});
+
 describe('review trigger — CI-lag vs read-failure recheck budgets (issue #720)', () => {
 	const checks = { kind: 'checks', action: 'completed', workItemId: '9' } as const;
 	const updated = {

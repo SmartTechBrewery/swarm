@@ -7,7 +7,8 @@
  * (ai/ARCHITECTURE.md "Pipeline phases"): a board card entering Planning / In
  * progress starts Planning / Implementation (`pm-status-changed` — one handler
  * covers both, since which phase to start comes from an authoritative board
- * re-read); a PR opening or its checks passing starts Review, while a check
+ * re-read); a PR's checks passing (on its opening or on their completion)
+ * starts Review, while a check
  * suite that *failed* starts Respond-to-CI (`pr-review` — one handler covers
  * both, since the review-vs-fix split comes from one aggregate-CI query); and
  * the reviewer persona requesting changes starts Respond-to-review
