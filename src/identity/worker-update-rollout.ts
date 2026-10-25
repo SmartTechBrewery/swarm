@@ -29,19 +29,21 @@ import { WorkerUpdateStatusSchema, WorkerUpdateTargetSchema } from '../lib/build
  *
  * - `in_progress` — the operator's action is live: advancing it drains, signals,
  *   verifies and returns machines to the pool.
- * - `halted` — a machine *answered* badly: it reported `failed`/`refused`/`declined`,
- *   or it came back on the build it was asked to leave; or the rollout gave up on
- *   `MAX_CONSECUTIVE_ABANDONED` machines in a row (issue #1064), which is what a build
- *   that cannot start anywhere looks like. No further wave is drained or signalled;
- *   `haltReason` records why, in the machine's own words where it had any.
- *   **Terminal** — there is no resume, exactly as issue #933 has no cancel for a
- *   single request; the way forward is to fix the build and start a new rollout. A
- *   machine that merely stopped answering does *not* halt it (issue #1064): the
- *   rollout gives up on that machine and carries on — unless it is the latest of a run
- *   of them, above.
+ * - `halted` — a machine said the *build* is bad: it reported `failed`, or it came back
+ *   on the build it was asked to leave; or machines on `MAX_CONSECUTIVE_FAILED_HOSTS`
+ *   different hosts in a row failed without one coming back on the new build in
+ *   between (issue #1064), which is what a build — or a target — no machine can take
+ *   looks like. No further wave is drained or signalled; `haltReason` records why, in
+ *   the machine's own words where it had any. **Terminal** — there is no resume,
+ *   exactly as issue #933 has no cancel for a single request; the way forward is to fix
+ *   the build and start a new rollout. A machine that merely stopped answering, or that
+ *   refused for its own reasons (`refused`/`declined` — a failed fetch, a dirty install
+ *   root), does *not* halt it: the rollout settles that machine `failed` and carries on
+ *   — unless it completes a run of failing hosts, above.
  * - `completed` — every member settled. Not necessarily every one of them well: a
- *   machine the rollout gave up on settles `failed` without halting, so a completed
- *   rollout can carry failures, and the member table is where they are read.
+ *   machine that refused, or that the rollout gave up on, settles `failed` without
+ *   halting, so a completed rollout can carry failures, and the member table is where
+ *   they are read.
  *
  * Stored as free `text` with this enum as the source of truth, the treatment
  * `worker_project_enrollments.status` already gets.
@@ -114,13 +116,14 @@ export function rolloutReleasesFailedMembers(scope: WorkerUpdateRolloutScope): b
  *   rollout halted before this machine's wave came up, the machine was enrolled in
  *   no project or under no process supervisor, or the machine was offline when its
  *   turn came (issue #1071).
- * - `failed` — settled bad, for one of two different reasons. The machine *answered*
- *   badly — reported `failed`/`refused`/`declined`, or came back on the build it was
- *   asked to leave — which is what halts the rollout; or it stopped answering and the
- *   rollout gave up on it (issue #1064), which leaves the reason in the member's own
- *   `message` and does not halt on its own — only the last of a run of
- *   `MAX_CONSECUTIVE_ABANDONED` such give-ups does. Either way it is the machine to go
- *   and look at.
+ * - `failed` — settled bad, for one of three different reasons. The machine said the
+ *   *build* is bad — reported `failed`, or came back on the build it was asked to
+ *   leave — which is what halts the rollout; it refused for reasons of its own
+ *   (`refused`/`declined`); or it stopped answering and the rollout gave up on it
+ *   (issue #1064). The last two leave the reason in the member's own `message` and do
+ *   not halt on their own — only the last of a run of them across
+ *   `MAX_CONSECUTIVE_FAILED_HOSTS` hosts does. Whichever it was, it is the machine to
+ *   go and look at.
  */
 export const WORKER_UPDATE_ROLLOUT_MEMBER_STATES = [
 	'queued',
@@ -180,27 +183,47 @@ export function isCommittedMemberState(state: WorkerUpdateRolloutMemberState): b
 }
 
 /**
- * The reported outcomes that halt a rollout. `failed` and `refused` are the machine
- * saying the move did not happen; `declined` is the legacy answer from a machine
- * still on a build predating issue #975, whose host had not set the per-host opt-in
- * that issue removed (`../lib/build-identity.ts`).
+ * The reported outcome that halts a rollout: `failed` — the machine tried the move and
+ * the build itself did not survive it (the checkout, `npm ci` or the build broke).
+ * That says something about the *build*, and the next machine would only say it again.
  *
- * `declined` halts for the same reason the other two do, even though it says nothing
- * about the *build*: a fleet whose next machine cannot be moved is a fleet the
- * rollout cannot finish, and carrying on would drain machine after machine only to
- * be declined by each in turn. Halting says so once, on the first one. The remedy is
- * now to update that machine by hand once — after which it is on a build with no
- * opt-in to decline from, and never declines again.
- *
- * `applied`, `adopted` and `already-current` are the three that do not halt — the
- * first two move the member to `verifying`, the third settles it on the spot.
+ * `applied`, `adopted` and `already-current` do not halt — the first two move the
+ * member to `verifying`, the third settles it on the spot — and neither do the
+ * {@link MACHINE_LOCAL_WORKER_UPDATE_STATUSES} below.
  */
-export const HALTING_WORKER_UPDATE_STATUSES = ['failed', 'refused', 'declined'] as const;
+export const HALTING_WORKER_UPDATE_STATUSES = ['failed'] as const;
 const HALTING_STATUSES = new Set<string>(HALTING_WORKER_UPDATE_STATUSES);
 
 /** Whether a machine's reported outcome is one that stops the rollout. */
 export function isHaltingUpdateStatus(status: string): boolean {
 	return HALTING_STATUSES.has(status);
+}
+
+/**
+ * The reported outcomes that fail **one machine** without stopping the rollout.
+ *
+ * `refused` is the daemon saying nothing was attempted, and almost every reason it
+ * gives is about that machine rather than the build: its fetch failed (the network, or
+ * the remote's credentials on that host), its install root is dirty or not a usable
+ * checkout, a peer on the same install root is mid-phase, its update state is
+ * unreadable. `declined` is the legacy answer from a machine still on a build
+ * predating issue #975, whose host had not set the per-host opt-in that issue removed
+ * (`../lib/build-identity.ts`) — about that host alone, too.
+ *
+ * Both used to halt the rollout, which turned one machine's broken fetch into a fleet
+ * left on the old build (observed 2026-10-25: one host's `git fetch` failed and every
+ * machine queued behind it was stood down). Now the member settles `failed` with the
+ * machine's own words and the rollout carries on. A refusal that *is* about the target
+ * — one no machine can resolve — repeats on every host, and that is what the
+ * rollout's per-host brake catches (`MAX_CONSECUTIVE_FAILED_HOSTS`,
+ * `../api/worker-update-rollout.ts`).
+ */
+export const MACHINE_LOCAL_WORKER_UPDATE_STATUSES = ['refused', 'declined'] as const;
+const MACHINE_LOCAL_STATUSES = new Set<string>(MACHINE_LOCAL_WORKER_UPDATE_STATUSES);
+
+/** Whether a machine's reported outcome fails that machine alone, without halting. */
+export function isMachineLocalUpdateStatus(status: string): boolean {
+	return MACHINE_LOCAL_STATUSES.has(status);
 }
 
 /**

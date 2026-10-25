@@ -70,15 +70,16 @@ const MEMBER_STATES: Record<string, RolloutMemberStateCopy> = {
 		description:
 			'Settled without being moved — it is still on the build it had, and nothing failed.',
 	},
-	// Two different things settle here, and only one of them stops the fleet on its own
-	// (issue #1064): the machine said it could not take the build, or it stopped
-	// answering and the rollout gave up waiting — which stops the fleet only once three
-	// machines in a row have gone that way. Its own line says which.
+	// Three different things settle here, and only one of them stops the fleet on its own
+	// (issue #1064): the build broke on the machine; the machine refused for reasons of
+	// its own (a failed fetch, a dirty install root); or it stopped answering and the
+	// rollout gave up waiting. The last two stop the fleet only once three different
+	// hosts in a row have gone that way. Its own line says which.
 	failed: {
 		label: 'Failed',
 		tone: 'negative',
 		description:
-			'It could not take the build, or the rollout gave up waiting for it — look at this machine.',
+			'It could not take the build, refused it for a reason of its own, or the rollout gave up waiting for it — look at this machine.',
 	},
 };
 
@@ -115,7 +116,7 @@ const STATUSES: Record<string, RolloutStatusCopy> = {
 		label: 'Halted',
 		tone: 'negative',
 		description:
-			'It stopped itself on a bad build — a machine said it could not take it, or three machines in a row were given up on. Nothing further is drained or signalled, and there is no resume — fix the build and start a new rollout.',
+			'It stopped itself on a bad build — a machine said the build broke, or machines on three different hosts in a row refused it or were given up on. Nothing further is drained or signalled, and there is no resume — fix the build and start a new rollout.',
 	},
 	completed: {
 		label: 'Completed',

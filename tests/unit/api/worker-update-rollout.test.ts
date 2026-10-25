@@ -804,23 +804,89 @@ describe('advanceRollout — settling what a machine reported', () => {
 		expect(statusWrites).toEqual([{ status: 'completed', haltReason: undefined }]);
 	});
 
-	it.each([
-		'failed',
-		'refused',
-		'declined',
-	] as const)('halts the whole rollout when a machine reports %s, quoting the machine', async (status) => {
+	it('halts the whole rollout when a machine reports failed, quoting the machine', async () => {
 		givenRollout(makeRollout(), [signalled(), makeMember(WORKER_B, 1)]);
-		givenWorkers(reported(WORKER_A, status), makeWorker(WORKER_B));
+		givenWorkers(reported(WORKER_A, 'failed'), makeWorker(WORKER_B));
 
 		const view = await advanceRollout(ROLLOUT_ID);
 
 		expect(view?.rollout.status).toBe('halted');
-		expect(view?.rollout.haltReason).toContain(status);
-		expect(view?.members[0]).toMatchObject({ state: 'failed', outcome: status });
+		expect(view?.rollout.haltReason).toContain('failed');
+		expect(view?.rollout.haltReason).toContain('npm ci exited 1');
+		expect(view?.members[0]).toMatchObject({ state: 'failed', outcome: 'failed' });
 		// Nothing further is drained or signalled, and the untouched machine is settled
 		// as skipped rather than left looking like it is still coming.
 		expect(fanOutWorkerUpdate).not.toHaveBeenCalled();
 		expect(view?.members[1].state).toBe('skipped');
+	});
+
+	// A refusal is the machine's own trouble — its fetch failed, its install root is
+	// dirty, a peer on it is mid-phase — so it fails that machine alone and the rollout
+	// moves on to the next one (observed 2026-10-25: one host's broken fetch stood the
+	// whole queue behind it down).
+	it.each([
+		'refused',
+		'declined',
+	] as const)('fails only the machine that reports %s and moves on to the next', async (status) => {
+		givenRollout(makeRollout(), [signalled(), makeMember(WORKER_B, 1)]);
+		givenWorkers(
+			reported(WORKER_A, status, {
+				update: {
+					requestId: null,
+					target: 'main',
+					requestedAt: new Date('2026-09-13T11:05:00Z'),
+					requestedByUserId: REQUESTER_ID,
+					status,
+					message: "Fetching remote 'origin' failed",
+					reportedAt: new Date('2026-09-13T11:59:30Z'),
+				},
+			}),
+			makeWorker(WORKER_B),
+		);
+		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry(WORKER_B, 'requested')]);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.rollout.status).toBe('in_progress');
+		expect(view?.rollout.haltReason).toBeNull();
+		expect(view?.members[0]).toMatchObject({
+			state: 'failed',
+			outcome: status,
+			message: "Fetching remote 'origin' failed",
+			abandoned: false,
+		});
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_B, true);
+		expect(view?.members[1].state).toBe('signalled');
+	});
+
+	it('completes rather than halts when the last machine refuses', async () => {
+		givenRollout(makeRollout(), [signalled()]);
+		givenWorkers(reported(WORKER_A, 'refused'));
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0]).toMatchObject({ state: 'failed', outcome: 'refused' });
+		expect(statusWrites).toEqual([{ status: 'completed', haltReason: undefined }]);
+	});
+
+	// A refusing machine answered badly, so the scope rule for an answer applies: your
+	// own stays drained for you to look at; somebody else's is handed back.
+	it('leaves a refusing machine drained in an owner-scoped rollout', async () => {
+		givenRollout(makeRollout(), [signalled()]);
+		givenWorkers(reported(WORKER_A, 'refused'));
+
+		await advanceRollout(ROLLOUT_ID);
+
+		expect(setWorkerDraining).not.toHaveBeenCalledWith(WORKER_A, false);
+	});
+
+	it('returns a refusing machine to the pool in an installation-scoped rollout', async () => {
+		givenRollout(makeRollout({ scope: 'installation' }), [signalled()]);
+		givenWorkers(reported(WORKER_A, 'refused'));
+
+		await advanceRollout(ROLLOUT_ID);
+
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_A, false);
 	});
 
 	// The machine that could not take the build is exactly the one an operator has to
@@ -1409,7 +1475,7 @@ describe('advanceRollout — a run of machines it gave up on', () => {
 
 		expect(view?.members[2]).toMatchObject({ state: 'failed', abandoned: true });
 		expect(view?.rollout.status).toBe('halted');
-		expect(view?.rollout.haltReason).toContain('3 machines in a row');
+		expect(view?.rollout.haltReason).toContain('3 different hosts in a row');
 		expect(view?.rollout.haltReason).toContain('unable to start');
 		expect(statusWrites).toEqual([{ status: 'halted', haltReason: view?.rollout.haltReason }]);
 	});
@@ -1478,7 +1544,7 @@ describe('advanceRollout — a run of machines it gave up on', () => {
 		const view = await advanceRollout(ROLLOUT_ID);
 
 		expect(view?.rollout.status).toBe('halted');
-		expect(view?.rollout.haltReason).toContain('3 machines in a row');
+		expect(view?.rollout.haltReason).toContain('3 different hosts in a row');
 	});
 
 	// Issue #1071: a machine that was offline when its turn came was never asked, so it
@@ -1589,14 +1655,7 @@ describe('advanceRollout — a run of machines it gave up on', () => {
 		expect(memberWrites.get(WORKER_E)?.state).toBe('skipped');
 	});
 
-	// The invariant the count rests on: every `failed` verdict that is not a give-up
-	// halts on the spot, on the very first machine, so a `failed` member in a rollout
-	// still in progress can only ever be one the rollout gave up on.
-	it.each([
-		['reports failed', reported(WORKER_A, 'failed')],
-		['reports refused', reported(WORKER_A, 'refused')],
-		['reports declined', reported(WORKER_A, 'declined')],
-	] as const)('halts on the first machine that %s', async (_label, worker) => {
+	it('halts on the first machine that reports failed', async () => {
 		givenRollout(makeRollout(), [
 			makeMember(WORKER_A, 0, {
 				state: 'signalled',
@@ -1606,12 +1665,91 @@ describe('advanceRollout — a run of machines it gave up on', () => {
 			}),
 			makeMember(WORKER_B, 1),
 		]);
-		givenWorkers(worker, makeWorker(WORKER_B));
+		givenWorkers(reported(WORKER_A, 'failed'), makeWorker(WORKER_B));
 
 		const view = await advanceRollout(ROLLOUT_ID);
 
 		expect(view?.members[0]).toMatchObject({ state: 'failed', abandoned: false });
 		expect(view?.rollout.status).toBe('halted');
+	});
+
+	// A refusal no machine can get past — a target nobody can resolve — repeats on every
+	// host, and the brake is what stops the fleet being marched through it.
+	it('counts machines that refused toward the run, alongside give-ups', async () => {
+		givenRollout(makeRollout(), [
+			abandoned(WORKER_A, 0),
+			abandoned(WORKER_B, 1),
+			makeMember(WORKER_C, 2, {
+				state: 'signalled',
+				requestId: REQUEST_A,
+				drainedByRollout: true,
+				signalledAt: new Date('2026-09-13T11:05:00Z'),
+			}),
+			makeMember(WORKER_D, 3),
+		]);
+		givenWorkers(
+			makeWorker(WORKER_A),
+			makeWorker(WORKER_B),
+			reported(WORKER_C, 'refused'),
+			makeWorker(WORKER_D),
+		);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[2]).toMatchObject({ state: 'failed', outcome: 'refused' });
+		expect(view?.rollout.status).toBe('halted');
+		expect(view?.rollout.haltReason).toContain('3 different hosts in a row');
+	});
+
+	// Several daemons on one host share its network, credentials and install root, so
+	// one host's trouble fails each of them in turn — one piece of evidence, not three
+	// (observed 2026-10-25: three daemons on one host halted the whole fleet).
+	it('counts machines on one host once, and moves on to the next host', async () => {
+		const host = 'shared-laptop.local';
+		givenRollout(makeRollout(), [
+			abandoned(WORKER_A, 0),
+			abandoned(WORKER_B, 1),
+			goingQuiet(WORKER_C, 2),
+			makeMember(WORKER_D, 3),
+		]);
+		givenWorkers(
+			makeWorker(WORKER_A, { hostname: host }),
+			makeWorker(WORKER_B, { hostname: host }),
+			reported(WORKER_C, 'applied', { hostname: host }),
+			makeWorker(WORKER_D, { hostname: 'other.local' }),
+		);
+		vi.setSystemTime(LATER);
+		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry(WORKER_D, 'requested')]);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[2].state).toBe('failed');
+		expect(view?.rollout.status).toBe('in_progress');
+		expect(view?.rollout.haltReason).toBeNull();
+		expect(view?.members[3].state).toBe('signalled');
+	});
+
+	it('halts once failures span three different hosts, however many machines each has', async () => {
+		givenRollout(makeRollout(), [
+			abandoned(WORKER_A, 0),
+			abandoned(WORKER_B, 1),
+			abandoned(WORKER_C, 2),
+			goingQuiet(WORKER_D, 3),
+			makeMember(WORKER_E, 4),
+		]);
+		givenWorkers(
+			makeWorker(WORKER_A, { hostname: 'one.local' }),
+			makeWorker(WORKER_B, { hostname: 'one.local' }),
+			makeWorker(WORKER_C, { hostname: 'two.local' }),
+			reported(WORKER_D, 'applied', { hostname: 'three.local' }),
+			makeWorker(WORKER_E, { hostname: 'four.local' }),
+		);
+		vi.setSystemTime(LATER);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.rollout.status).toBe('halted');
+		expect(view?.rollout.haltReason).toContain('3 different hosts in a row');
 	});
 
 	it('halts on the first machine that comes back on the build it was asked to leave', async () => {
