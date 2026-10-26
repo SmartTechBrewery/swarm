@@ -183,6 +183,7 @@ function makeDetail(overrides: Partial<WorkerDetail> = {}): WorkerDetail {
 				concurrencyAllocation: 1,
 				sharingConsent: true,
 				isRoutable: true,
+				activeRuns: 0,
 				projectRepos: ['acme/frontend'],
 				viewerCanAdminister: false,
 			},

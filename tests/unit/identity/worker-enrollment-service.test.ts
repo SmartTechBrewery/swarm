@@ -1713,6 +1713,7 @@ describe('getDashboardWorkerDetail (issue #477)', () => {
 				concurrencyAllocation: 2,
 				sharingConsent: true,
 				isRoutable: true,
+				activeRuns: 0,
 				// Normalised, so the screen can compare the worker's own declaration against
 				// this list by plain equality — the comparison the write path makes (#690).
 				projectRepos: ['smarttechbrewery/swarm'],
@@ -1744,6 +1745,20 @@ describe('getDashboardWorkerDetail (issue #477)', () => {
 		// by plain equality — no mismatch for the screen to report.
 		expect(detail?.enrollments[0]?.projectRepos).toEqual(['acme/backend', 'acme/frontend']);
 		expect(detail?.enrollments[0]?.projectRepos).toContain(detail?.repositories[0]);
+	});
+
+	// Issue #1129: a suspended enrollment still finishes the phase already in flight, so
+	// the read model carries this worker's live claims in the project for the screen to
+	// say so — read per enrollment, scoped to that enrollment's own project.
+	it('carries the worker’s active claims in the project for a suspended enrollment', async () => {
+		getWorkerById.mockResolvedValue(makeWorker());
+		listEnrollmentsForWorker.mockResolvedValue([makeEnrollment({ status: 'suspended' })]);
+		getWorkerDispatchClaimState.mockResolvedValue({ activeRuns: 1, currentRunId: 'run-1' });
+
+		const detail = await getDashboardWorkerDetail(WORKER_ID, null);
+
+		expect(detail?.enrollments[0]).toMatchObject({ isRoutable: false, activeRuns: 1 });
+		expect(getWorkerDispatchClaimState).toHaveBeenCalledWith(WORKER_ID, 'proj-a');
 	});
 
 	// The honest successor to the old `null`: nothing to disagree with, so the screen

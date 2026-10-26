@@ -269,6 +269,13 @@ export interface WorkerDetailEnrollment {
 	/** Server-derived: `active` **and** consented. The only field the dispatch gate reads. */
 	isRoutable: boolean;
 	/**
+	 * Server-derived: this worker's active, unexpired dispatch claims in this project
+	 * (issue #1129). A suspended or no-longer-shared enrollment still finishes the
+	 * phase already in flight, so a non-routable enrollment with runs here is
+	 * finishing work rather than idle.
+	 */
+	activeRuns: number;
+	/**
 	 * **Every** repository this enrollment's project declares (issue #690, widened
 	 * by #946), in the **same normalised form** as the worker's own `repositories`, so
 	 * membership in this list by plain equality is the comparison the server makes

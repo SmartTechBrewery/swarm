@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
 	ENROLLMENT_STATUS_LABELS,
+	finishingWorkNote,
 	type RoutabilityInput,
 	repositoryMismatch,
 	routabilityBlockers,
@@ -42,6 +43,28 @@ describe('routabilityBlockers (issue #477)', () => {
 		// Impossible per the server's own derivation, but the verdict is authoritative.
 		expect(routabilityBlockers(enrollment({ sharingConsent: false, isRoutable: true }))).toEqual(
 			[],
+		);
+	});
+});
+
+describe('finishingWorkNote (issue #1129)', () => {
+	it('says nothing for a routable enrollment, whatever it is running', () => {
+		expect(finishingWorkNote({ isRoutable: true, activeRuns: 2 })).toBeNull();
+	});
+
+	it('says nothing for a non-routable enrollment with no run in flight', () => {
+		expect(finishingWorkNote({ isRoutable: false, activeRuns: 0 })).toBeNull();
+	});
+
+	it('names the one run a non-routable enrollment is still finishing', () => {
+		expect(finishingWorkNote({ isRoutable: false, activeRuns: 1 })).toBe(
+			'Still finishing 1 run already in progress here — no new work is routed to this machine for this project.',
+		);
+	});
+
+	it('pluralises several runs', () => {
+		expect(finishingWorkNote({ isRoutable: false, activeRuns: 3 })).toMatch(
+			/^Still finishing 3 runs already in progress here/,
 		);
 	});
 });

@@ -11,6 +11,7 @@ import { useDraftSync } from '@/lib/use-draft-sync.js';
 import { enrollmentPhaseOptions } from '@/lib/worker-enrollment-phases.js';
 import {
 	ENROLLMENT_STATUS_LABELS,
+	finishingWorkNote,
 	repositoryMismatch,
 	routabilityBlockers,
 } from '@/lib/worker-enrollment-view.js';
@@ -230,13 +231,19 @@ function RepositoryMismatch({
 	);
 }
 
-/** The project, its approval state, and the routing verdict the two combine into. */
+/**
+ * The project, its approval state, the routing verdict the two combine into, and —
+ * while a non-routable enrollment still has a run in flight here — that it is
+ * finishing that work (issue #1129).
+ */
 function EnrollmentHeader({
 	enrollment,
 	projectName,
+	finishing,
 }: {
 	enrollment: WorkerDetailEnrollment;
 	projectName: string;
+	finishing: boolean;
 }) {
 	return (
 		<div className="flex flex-wrap items-center gap-2">
@@ -255,6 +262,7 @@ function EnrollmentHeader({
 			>
 				{enrollment.isRoutable ? 'Routable' : 'Not routable'}
 			</Badge>
+			{finishing ? <Badge tone="caution">Finishing current work</Badge> : null}
 		</div>
 	);
 }
@@ -400,6 +408,7 @@ export function WorkerEnrollmentCard({
 	});
 
 	const blockers = routabilityBlockers(enrollment);
+	const finishingNote = finishingWorkNote(enrollment);
 	const mismatch = repositoryMismatch(declaredRepositories, enrollment.projectRepos);
 	// A confirmation dialog shows its own action's error; the inline feedback for
 	// that control stays quiet meanwhile so the message isn't stated twice.
@@ -409,7 +418,11 @@ export function WorkerEnrollmentCard({
 
 	return (
 		<li className={`${SUBPANEL_CLASS} space-y-4`}>
-			<EnrollmentHeader enrollment={enrollment} projectName={projectName} />
+			<EnrollmentHeader
+				enrollment={enrollment}
+				projectName={projectName}
+				finishing={finishingNote !== null}
+			/>
 
 			<p className="text-xs text-zinc-500 font-mono break-all select-all">{enrollment.projectId}</p>
 
@@ -422,6 +435,8 @@ export function WorkerEnrollmentCard({
 					))}
 				</ul>
 			) : null}
+
+			{finishingNote ? <p className="text-xs text-amber-200/70">{finishingNote}</p> : null}
 
 			<div className="grid gap-5 md:grid-cols-2">
 				<div className="space-y-2">
