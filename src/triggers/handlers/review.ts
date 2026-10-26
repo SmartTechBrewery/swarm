@@ -130,6 +130,16 @@
  * reuses the held claim, and a delayed ordinary completed-check event for the
  * same head is locked out of starting a second CI fix.
  *
+ * **A green head this PR already approved re-arms its merge** (issue #1128).
+ * When a green aggregate meets a review-verdict slot already `submitted` for
+ * the head, the head is not reviewed again — but its approval's merge may have
+ * stopped while the head was red or pending (issue #1124), under a dedup key
+ * nothing can create twice. So the handler asks
+ * `rearmMergeAutomationForGreenHead` to re-create that merge, at most once per
+ * (approving run, head); the merge re-reads the checks before merging, so a red
+ * head is still never merged. The #841 bypass above never re-arms: its head is
+ * still red.
+ *
  * **A red the base branch already explains is attributed to the base, not to
  * the PR** (issue #873). Beside the bypass above — the same branch, a second
  * judgement about *whose* red this is — `resolveAggregateCheckReview` reads the
@@ -210,6 +220,7 @@ import { repoSlugsMatch } from '../../scm/repo-slug.js';
 import { SWARM_GENERATED_FOOTER } from '../../scm/swarm-origin.js';
 import type { AggregateCheckStatus, PullRequestDetails, SCMProvider } from '../../scm/types.js';
 import { resolveAgentTimeoutMs } from '../../worker/agent-timeout.js';
+import { rearmMergeAutomationForGreenHead } from '../../worker/merge-automation.js';
 import { buildConflictResolutionKey, claimConflictResolution } from '../resolve-conflicts-dedup.js';
 import {
 	buildRespondToCiAttemptKey,
@@ -246,10 +257,11 @@ import { decideAggregateCheckOutcome } from './aggregate-check-decision.js';
  * `blocked-by-base` when the base branch's own red already explains it (issue
  * #873, carrying that base branch, its head and the checks the two have in
  * common); a
- * draft/fork PR or an incomplete/deferred suite → `none`.
+ * draft/fork PR or an incomplete/deferred suite → `none`. A `review` the #841
+ * `no-fix` bypass produced is marked `adjudicatedRed`: its head is still red.
  */
 type ReviewDisposition =
-	| { kind: 'review' }
+	| { kind: 'review'; adjudicatedRed?: true }
 	| { kind: 'respond-to-ci'; failedChecks: string[] }
 	| { kind: 'blocked-by-base'; baseBranch: string; baseHeadSha: string; sharedChecks: string[] }
 	| { kind: 'none' };
@@ -881,7 +893,7 @@ async function resolveAggregateCheckReview(
 				headSha,
 				failedChecks: decision.failedChecks,
 			});
-			return { kind: 'review' };
+			return { kind: 'review', adjudicatedRed: true };
 		}
 		// Beside the bypass above, and the same shape: a second judgement about
 		// *whose* red this is, taken before any fix attempt is spent (issue #873).
@@ -1136,7 +1148,9 @@ async function dispatchRespondToCi(
  * for must not run ahead of it — each answers `null`. A `reserved`/`reused`
  * result (the common case, including a same-head retry) proceeds, and is
  * returned so the caller can tell a slot this evaluation created from one it
- * reused (issue #1105).
+ * reused (issue #1105). A slot already `submitted` for this head answers
+ * `submitted`: the head is never reviewed twice, but a green head this PR already
+ * approved is a merge for the caller to re-arm (issue #1128).
  *
  * The slot is owned by `dispatchId` — this evaluation's own dispatch (issue
  * #857) — so it stops blocking the PR once that dispatch settles without a
@@ -1147,7 +1161,7 @@ async function reserveDurableReviewSlot(
 	prNumber: string,
 	headSha: string,
 	dispatchId: string,
-): Promise<'reserved' | 'reused' | null> {
+): Promise<'reserved' | 'reused' | 'submitted' | null> {
 	try {
 		const reservation = await reserveReviewVerdict(
 			{
@@ -1179,12 +1193,12 @@ async function reserveDurableReviewSlot(
 			return null;
 		}
 		if (reservation.status === 'reused' && reservation.state === 'submitted') {
-			logger.debug('review: slot already submitted for this head SHA — skipping same-head retry', {
+			logger.debug('review: slot already submitted for this head SHA — not re-reviewing', {
 				prNumber,
 				headSha,
 				ordinal: reservation.ordinal,
 			});
-			return null;
+			return 'submitted';
 		}
 		if (reservation.status === 'capped') {
 			// Which bound bit is the line an operator greps (issue #1079), so the two
@@ -1747,6 +1761,23 @@ async function handBackContinuationReviewSlot(
 	}
 }
 
+/**
+ * A head whose review-verdict slot is already `submitted` is never reviewed again,
+ * but a green one this PR approved is a merge to re-arm (issue #1128): its merge
+ * may have been refused while it was red or pending. The adjudicated-red bypass
+ * (issue #841) is excluded — its head is still red, so the merge would only be
+ * refused again.
+ */
+async function rearmMergeForReviewedHead(
+	project: ProjectConfig,
+	disposition: Extract<ReviewDisposition, { kind: 'review' }>,
+	prNumber: string,
+	headSha: string,
+): Promise<void> {
+	if (disposition.adjudicatedRed === true) return;
+	await rearmMergeAutomationForGreenHead({ project, prNumber, headSha });
+}
+
 export function createReviewTrigger(): TriggerHandler {
 	return {
 		name: 'pr-review',
@@ -1833,6 +1864,10 @@ export function createReviewTrigger(): TriggerHandler {
 			}
 
 			const slot = await reserveDurableReviewSlot(ctx.project, prNumber, headSha, ctx.dispatchId);
+			if (slot === 'submitted') {
+				await rearmMergeForReviewedHead(ctx.project, disposition, prNumber, headSha);
+				return null;
+			}
 			if (!slot) return null;
 
 			logger.debug('review: dispatching Review phase', { prNumber, headSha });

@@ -155,6 +155,13 @@ vi.mock('@/db/repositories/reviewVerdictsRepository.js', () => ({
 	REVIEW_SUPERSEDED_CAP: 5,
 }));
 
+// A green head this PR already approved re-arms its merge (issue #1128); the
+// re-arm's own guards are asserted in the merge-automation suite.
+const { rearmMergeAutomationForGreenHead } = vi.hoisted(() => ({
+	rearmMergeAutomationForGreenHead: vi.fn(),
+}));
+vi.mock('@/worker/merge-automation.js', () => ({ rearmMergeAutomationForGreenHead }));
+
 /** Build an `AggregateCheckStatus` from `[name, status, conclusion]` triples. */
 function checkStatus(runs: Array<[string, string, string | null]>): AggregateCheckStatus {
 	return {
@@ -197,6 +204,8 @@ beforeEach(() => {
 	reserveReviewVerdict.mockResolvedValue({ status: 'reserved', id: 'v1', ordinal: 1 });
 	abandonReviewVerdictOwnedBy.mockReset();
 	abandonReviewVerdictOwnedBy.mockResolvedValue(true);
+	rearmMergeAutomationForGreenHead.mockReset();
+	rearmMergeAutomationForGreenHead.mockResolvedValue(undefined);
 	hasPersonaToken.mockReset();
 	hasPersonaToken.mockResolvedValue(true);
 	getPullRequest.mockReset();
@@ -980,6 +989,7 @@ describe('review trigger', () => {
 		it('skips the dispatch when another head is still pending (blocked)', async () => {
 			reserveReviewVerdict.mockResolvedValue({ status: 'blocked', ordinal: 1 });
 			expect(await handler.handle(ctx(reviewable))).toBeNull();
+			expect(rearmMergeAutomationForGreenHead).not.toHaveBeenCalled();
 		});
 
 		// Both bounds stop the dispatch the same way, and the handler names which one
@@ -996,6 +1006,7 @@ describe('review trigger', () => {
 				expect.stringContaining('safety cap'),
 				expect.objectContaining({ reason, cap: 3, supersededCap: 5 }),
 			);
+			expect(rearmMergeAutomationForGreenHead).not.toHaveBeenCalled();
 		});
 
 		it('reuses a same-head retry reservation and still dispatches', async () => {
@@ -1010,9 +1021,10 @@ describe('review trigger', () => {
 			// The slot was not this evaluation's to create, so a drop before the phase
 			// starts must not hand it back (issue #1105).
 			expect(result).not.toHaveProperty('verdictSlotReserved');
+			expect(rearmMergeAutomationForGreenHead).not.toHaveBeenCalled();
 		});
 
-		it('skips the dispatch when a same-head retry is already submitted', async () => {
+		it('does not re-review a head whose slot is already submitted — it re-arms the merge (issue #1128)', async () => {
 			reserveReviewVerdict.mockResolvedValue({
 				status: 'reused',
 				id: 'v1',
@@ -1020,11 +1032,44 @@ describe('review trigger', () => {
 				state: 'submitted',
 			});
 			expect(await handler.handle(ctx(reviewable))).toBeNull();
+			expect(rearmMergeAutomationForGreenHead).toHaveBeenCalledExactlyOnceWith({
+				project: PROJECT,
+				prNumber: '42',
+				headSha: 'abc123',
+			});
+		});
+
+		it('re-arms on a green completed-checks event for an already-approved head', async () => {
+			reserveReviewVerdict.mockResolvedValue({
+				status: 'reused',
+				id: 'v1',
+				ordinal: 1,
+				state: 'submitted',
+			});
+			getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'completed', 'success']]));
+
+			const result = await handler.handle(
+				ctx({
+					kind: 'checks',
+					action: 'completed',
+					workItemId: '42',
+					headSha: 'abc123',
+					prBranch: 'issue-42',
+				}),
+			);
+
+			expect(result).toBeNull();
+			expect(rearmMergeAutomationForGreenHead).toHaveBeenCalledExactlyOnceWith({
+				project: PROJECT,
+				prNumber: '42',
+				headSha: 'abc123',
+			});
 		});
 
 		it('fails closed (skips) when the reservation call throws', async () => {
 			reserveReviewVerdict.mockRejectedValue(new Error('connection reset'));
 			expect(await handler.handle(ctx(reviewable))).toBeNull();
+			expect(rearmMergeAutomationForGreenHead).not.toHaveBeenCalled();
 		});
 
 		it('does not reserve a slot for the Respond-to-CI disposition', async () => {
@@ -1040,6 +1085,7 @@ describe('review trigger', () => {
 			);
 			expect(result).toMatchObject({ phase: 'respond-to-ci' });
 			expect(reserveReviewVerdict).not.toHaveBeenCalled();
+			expect(rearmMergeAutomationForGreenHead).not.toHaveBeenCalled();
 		});
 	});
 
@@ -2600,6 +2646,21 @@ describe('review trigger — the no-fix hand-back to Review (issue #841)', () =>
 			headSha: 'cafe',
 		});
 		expect(claimRespondToCiAttempt).toHaveBeenCalledTimes(1);
+	});
+
+	// Issue #1128: the adjudicated red is still red, so its merge would only be
+	// refused again — the re-arm belongs to a genuinely green head.
+	it('does not re-arm the merge when the adjudicated head’s slot is already submitted', async () => {
+		reserveReviewVerdict.mockResolvedValue({
+			status: 'reused',
+			id: 'v1',
+			ordinal: 1,
+			state: 'submitted',
+		});
+
+		expect(await handler.handle(ctx(checks, { ciNoFixRecovery: true }))).toBeNull();
+
+		expect(rearmMergeAutomationForGreenHead).not.toHaveBeenCalled();
 	});
 
 	it('still reserves the durable review-verdict slot, and a capped reservation still skips', async () => {
