@@ -18,6 +18,12 @@ vi.mock('@/triggers/review-dispatch-dedup.js', () => ({
 		refreshReviewDispatchClaim(key, ttlSec),
 }));
 
+// The durable recovery dispatch `hasCiNoFixRecovery` reads back (issue #1128).
+const findDispatchByDedupKey = vi.fn(async (_key: string): Promise<unknown> => undefined);
+vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
+	findDispatchByDedupKey: (key: string) => findDispatchByDedupKey(key),
+}));
+
 const requireProjectSCMProvider = vi.fn((_project?: unknown) => ({ type: 'github' as const }));
 vi.mock('@/integrations/scm/registry.js', () => ({
 	requireProjectSCMProvider: (project: unknown) => requireProjectSCMProvider(project),
@@ -28,6 +34,7 @@ vi.mock('@/integrations/scm/registry.js', () => ({
 
 import {
 	ciNoFixRecoveryDeliveryId,
+	hasCiNoFixRecovery,
 	scheduleCiNoFixRecovery,
 } from '@/dispatch/ci-no-fix-recovery.js';
 import { followUpReviewDeliveryId } from '@/pipeline/follow-up-review.js';
@@ -171,5 +178,22 @@ describe('scheduleCiNoFixRecovery', () => {
 		expect((firstCall[0] as { dedupKey: string }).dedupKey).toBe(
 			(secondCall[0] as { dedupKey: string }).dedupKey,
 		);
+	});
+});
+
+// Issue #1128: the recovery dispatch's dedup key is the durable record that SWARM's
+// CI agent adjudicated this head's red as `no-fix`.
+describe('hasCiNoFixRecovery', () => {
+	it('reads the recovery dispatch under its own dedup key', async () => {
+		findDispatchByDedupKey.mockResolvedValueOnce({ id: 'dispatch-1' });
+		expect(await hasCiNoFixRecovery(PROJECT, '42', 'abc123')).toBe(true);
+		expect(findDispatchByDedupKey).toHaveBeenLastCalledWith(
+			`delivery:${ciNoFixRecoveryDeliveryId(PROJECT, '42', 'abc123')}`,
+		);
+	});
+
+	it('is false when no recovery was ever recorded for the head', async () => {
+		findDispatchByDedupKey.mockResolvedValueOnce(undefined);
+		expect(await hasCiNoFixRecovery(PROJECT, '42', 'def456')).toBe(false);
 	});
 });

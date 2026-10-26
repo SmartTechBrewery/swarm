@@ -95,6 +95,23 @@ export const reviewVerdicts = pgTable(
 		 * creates that slot, so one grant can never license two reviews.
 		 */
 		capOverrideConsumedAt: timestamp('cap_override_consumed_at'),
+		/**
+		 * When SWARM re-ran the failed checks of this *submitted approval's* head
+		 * because its own Respond-to-CI agent had judged the red not to be the pull
+		 * request's fault (issue #1128, `src/dispatch/approved-head-checks-rerun.ts`).
+		 * The bound on that re-run: claimed by a conditional update that fires only on
+		 * a `submitted` `approve` row with no stamp yet, so an approved head gets one
+		 * automatic re-run, however many events reach it. Never cleared.
+		 */
+		checksRerunAt: timestamp('checks_rerun_at'),
+		/**
+		 * When SWARM handed this approved head to the operator — the re-run failed
+		 * again, or could not be made — with a durable `failed` Respond-to-CI run and
+		 * a pull-request comment (issue #1128). The bound on that notice, claimed the
+		 * same conditional way as {@link checksRerunAt}, so it is written once per
+		 * head. Never cleared.
+		 */
+		operatorNotifiedAt: timestamp('operator_notified_at'),
 	},
 	(table) => [
 		// One *active* record per head — the same-head retry/reuse identity the

@@ -144,13 +144,20 @@ vi.mock('@/db/repositories/dispatchesRepository.js', () => ({ getActiveDispatchB
 //
 // `abandonReviewVerdictOwnedBy` is the hand-back a Review continuation takes
 // when its head went red while it waited (issue #1123).
-const { reserveReviewVerdict, abandonReviewVerdictOwnedBy } = vi.hoisted(() => ({
-	reserveReviewVerdict: vi.fn(),
-	abandonReviewVerdictOwnedBy: vi.fn(),
-}));
+//
+// `getApprovedHeadSlot` is half of "is this red an adjudicated approved head?"
+// (issue #1128); defaults to "not approved".
+const { reserveReviewVerdict, abandonReviewVerdictOwnedBy, getApprovedHeadSlot } = vi.hoisted(
+	() => ({
+		reserveReviewVerdict: vi.fn(),
+		abandonReviewVerdictOwnedBy: vi.fn(),
+		getApprovedHeadSlot: vi.fn(),
+	}),
+);
 vi.mock('@/db/repositories/reviewVerdictsRepository.js', () => ({
 	reserveReviewVerdict,
 	abandonReviewVerdictOwnedBy,
+	getApprovedHeadSlot,
 	REVIEW_VERDICT_CAP: 3,
 	REVIEW_SUPERSEDED_CAP: 5,
 }));
@@ -161,6 +168,16 @@ const { rearmMergeAutomationForGreenHead } = vi.hoisted(() => ({
 	rearmMergeAutomationForGreenHead: vi.fn(),
 }));
 vi.mock('@/worker/merge-automation.js', () => ({ rearmMergeAutomationForGreenHead }));
+
+// The adjudicated-red-approved-head policy (issue #1128): whether a `no-fix`
+// recovery was recorded for the head (defaults to none), and the shared re-run
+// policy itself, whose branches are asserted in its own suite.
+const { hasCiNoFixRecovery, recoverAdjudicatedApprovedHead } = vi.hoisted(() => ({
+	hasCiNoFixRecovery: vi.fn(),
+	recoverAdjudicatedApprovedHead: vi.fn(),
+}));
+vi.mock('@/dispatch/ci-no-fix-recovery.js', () => ({ hasCiNoFixRecovery }));
+vi.mock('@/dispatch/approved-head-checks-rerun.js', () => ({ recoverAdjudicatedApprovedHead }));
 
 /** Build an `AggregateCheckStatus` from `[name, status, conclusion]` triples. */
 function checkStatus(runs: Array<[string, string, string | null]>): AggregateCheckStatus {
@@ -206,6 +223,12 @@ beforeEach(() => {
 	abandonReviewVerdictOwnedBy.mockResolvedValue(true);
 	rearmMergeAutomationForGreenHead.mockReset();
 	rearmMergeAutomationForGreenHead.mockResolvedValue(undefined);
+	getApprovedHeadSlot.mockReset();
+	getApprovedHeadSlot.mockResolvedValue(undefined);
+	hasCiNoFixRecovery.mockReset();
+	hasCiNoFixRecovery.mockResolvedValue(false);
+	recoverAdjudicatedApprovedHead.mockReset();
+	recoverAdjudicatedApprovedHead.mockResolvedValue('rerun-requested');
 	hasPersonaToken.mockReset();
 	hasPersonaToken.mockResolvedValue(true);
 	getPullRequest.mockReset();
@@ -2604,6 +2627,88 @@ describe('review trigger — the CI fix holds the PR+SHA lease for its run (issu
 	});
 });
 
+describe('review trigger — a red on an adjudicated approved head (issue #1128)', () => {
+	const checks = {
+		kind: 'checks',
+		action: 'completed',
+		workItemId: '9',
+		headSha: 'cafe',
+		prBranch: 'issue-9',
+	} as const;
+
+	beforeEach(() => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'completed', 'failure']]));
+	});
+
+	function adjudicatedAndApproved(): void {
+		hasCiNoFixRecovery.mockResolvedValue(true);
+		getApprovedHeadSlot.mockResolvedValue({ checksRerunAt: null });
+	}
+
+	it('goes to the re-run policy — no Respond-to-CI, no claim, no slot', async () => {
+		adjudicatedAndApproved();
+
+		expect(await handler.handle(ctx(checks))).toBeNull();
+
+		expect(hasCiNoFixRecovery).toHaveBeenCalledWith(PROJECT, '9', 'cafe');
+		expect(getApprovedHeadSlot).toHaveBeenCalledWith({
+			projectId: PROJECT.id,
+			repository: PROJECT.repo,
+			prNumber: '9',
+			headSha: 'cafe',
+		});
+		expect(recoverAdjudicatedApprovedHead).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({ prNumber: '9', headSha: 'cafe', failedChecks: ['test'] }),
+		);
+		expect(claimReviewDispatch).not.toHaveBeenCalled();
+		expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+		expect(reserveReviewVerdict).not.toHaveBeenCalled();
+		expect(scheduleCoalescedJob).not.toHaveBeenCalled();
+	});
+
+	it('schedules one state-pending recheck while a requested re-run settles', async () => {
+		adjudicatedAndApproved();
+		recoverAdjudicatedApprovedHead.mockResolvedValue('rerun-settling');
+
+		expect(await handler.handle(ctx(checks))).toBeNull();
+
+		expect(scheduleCoalescedJob).toHaveBeenCalledTimes(1);
+		expect(scheduleCoalescedJob.mock.calls[0][0]).toMatchObject({ recheckAttempt: 1 });
+		expect(scheduleCoalescedJob.mock.calls[0][3]).toBe('recheck');
+		expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+	});
+
+	it('drops the event once the head is handed to the operator', async () => {
+		adjudicatedAndApproved();
+		recoverAdjudicatedApprovedHead.mockResolvedValue('needs-operator');
+
+		expect(await handler.handle(ctx(checks))).toBeNull();
+		expect(scheduleCoalescedJob).not.toHaveBeenCalled();
+		expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+	});
+
+	it('routes a red that was never adjudicated to Respond-to-CI, unchanged', async () => {
+		getApprovedHeadSlot.mockResolvedValue({ checksRerunAt: null });
+
+		expect(await handler.handle(ctx(checks))).toMatchObject({ phase: 'respond-to-ci' });
+		expect(recoverAdjudicatedApprovedHead).not.toHaveBeenCalled();
+	});
+
+	it('routes an adjudicated head that was not approved to Respond-to-CI, unchanged', async () => {
+		hasCiNoFixRecovery.mockResolvedValue(true);
+
+		expect(await handler.handle(ctx(checks))).toMatchObject({ phase: 'respond-to-ci' });
+		expect(recoverAdjudicatedApprovedHead).not.toHaveBeenCalled();
+	});
+
+	it('fails open to Respond-to-CI when the adjudication cannot be read', async () => {
+		hasCiNoFixRecovery.mockRejectedValue(new Error('db down'));
+
+		expect(await handler.handle(ctx(checks))).toMatchObject({ phase: 'respond-to-ci' });
+		expect(recoverAdjudicatedApprovedHead).not.toHaveBeenCalled();
+	});
+});
+
 describe('review trigger — the no-fix hand-back to Review (issue #841)', () => {
 	const checks = {
 		kind: 'checks',
@@ -2649,8 +2754,10 @@ describe('review trigger — the no-fix hand-back to Review (issue #841)', () =>
 	});
 
 	// Issue #1128: the adjudicated red is still red, so its merge would only be
-	// refused again — the re-arm belongs to a genuinely green head.
-	it('does not re-arm the merge when the adjudicated head’s slot is already submitted', async () => {
+	// refused again — the re-arm belongs to a genuinely green head. A head this PR
+	// already approved (approve, then red, then `no-fix`) goes to the approved-head
+	// re-run policy instead, and nothing is dispatched.
+	it('sends an adjudicated head whose slot is already submitted to the re-run policy', async () => {
 		reserveReviewVerdict.mockResolvedValue({
 			status: 'reused',
 			id: 'v1',
@@ -2661,6 +2768,16 @@ describe('review trigger — the no-fix hand-back to Review (issue #841)', () =>
 		expect(await handler.handle(ctx(checks, { ciNoFixRecovery: true }))).toBeNull();
 
 		expect(rearmMergeAutomationForGreenHead).not.toHaveBeenCalled();
+		expect(recoverAdjudicatedApprovedHead).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({
+				project: PROJECT,
+				scm: SCM,
+				prNumber: '9',
+				headSha: 'cafe',
+				failedChecks: ['test'],
+			}),
+		);
+		expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
 	});
 
 	it('still reserves the durable review-verdict slot, and a capped reservation still skips', async () => {

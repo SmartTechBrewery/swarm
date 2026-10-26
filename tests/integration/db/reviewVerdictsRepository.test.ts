@@ -14,6 +14,9 @@ import {
 import {
 	abandonReviewVerdict,
 	abandonReviewVerdictOwnedBy,
+	claimApprovedHeadChecksRerun,
+	claimApprovedHeadOperatorNotice,
+	getApprovedHeadSlot,
 	getPriorSubmittedReview,
 	getReviewVerdictByHead,
 	getReviewVerdictByReviewId,
@@ -742,6 +745,57 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 			it('ignores a slot that was only reserved, never submitted', async () => {
 				await reserveReviewVerdict(key('sha-1'), owner);
 				expect(await getSubmittedReviewSlot(key('sha-1'))).toBeUndefined();
+			});
+		});
+
+		// Issue #1128: the bounds on an adjudicated red approved head — one automatic
+		// re-run and one operator notice, each only on a submitted approval.
+		describe('approved-head stamps (issue #1128)', () => {
+			async function submit(headSha: string, verdict: string): Promise<void> {
+				await reserveReviewVerdict(key(headSha), owner);
+				await markReviewVerdictSubmitted(key(headSha), { verdict });
+			}
+
+			it.each([
+				['claimApprovedHeadChecksRerun', claimApprovedHeadChecksRerun],
+				['claimApprovedHeadOperatorNotice', claimApprovedHeadOperatorNotice],
+			] as const)('%s is exactly-once on a submitted approval', async (_name, claim) => {
+				await submit('sha-1', 'approve');
+
+				const results = await Promise.all([claim(key('sha-1')), claim(key('sha-1'))]);
+				expect(results.filter(Boolean)).toHaveLength(1);
+				expect(await claim(key('sha-1'))).toBe(false);
+			});
+
+			it.each([
+				['claimApprovedHeadChecksRerun', claimApprovedHeadChecksRerun],
+				['claimApprovedHeadOperatorNotice', claimApprovedHeadOperatorNotice],
+			] as const)('%s never stamps a slot that is not a submitted approval', async (_name, claim) => {
+				await submit('sha-changes', 'request-changes');
+				expect(await claim(key('sha-changes'))).toBe(false);
+
+				await reserveReviewVerdict(key('sha-pending'), owner);
+				expect(await claim(key('sha-pending'))).toBe(false);
+
+				expect(await claim(key('never-reserved'))).toBe(false);
+			});
+
+			it('keeps the two stamps independent', async () => {
+				await submit('sha-1', 'approve');
+				expect(await claimApprovedHeadOperatorNotice(key('sha-1'))).toBe(true);
+				expect(await claimApprovedHeadChecksRerun(key('sha-1'))).toBe(true);
+			});
+
+			it('getApprovedHeadSlot reads the re-run stamp of a submitted approval only', async () => {
+				await submit('sha-1', 'approve');
+				expect(await getApprovedHeadSlot(key('sha-1'))).toEqual({ checksRerunAt: null });
+
+				await claimApprovedHeadChecksRerun(key('sha-1'));
+				expect((await getApprovedHeadSlot(key('sha-1')))?.checksRerunAt).toBeInstanceOf(Date);
+
+				await submit('sha-changes', 'request-changes');
+				expect(await getApprovedHeadSlot(key('sha-changes'))).toBeUndefined();
+				expect(await getApprovedHeadSlot(key('never-reserved'))).toBeUndefined();
 			});
 		});
 	},

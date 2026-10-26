@@ -44,6 +44,7 @@
  */
 
 import type { ProjectConfig } from '../config/schema.js';
+import { findDispatchByDedupKey } from '../db/repositories/dispatchesRepository.js';
 import { requireProjectSCMProvider } from '../integrations/scm/registry.js';
 import { deliveryIdentity } from '../scm/delivery.js';
 import type { ScmEvent } from '../scm/events.js';
@@ -94,6 +95,24 @@ export function ciNoFixRecoveryDeliveryId(
 	headSha: string,
 ): string {
 	return deliveryIdentity(['respond-to-ci-no-fix', project.repo, prNumber, headSha]);
+}
+
+/**
+ * Whether SWARM's own CI agent already adjudicated this head's red as `no-fix`
+ * — answered from the recovery dispatch {@link scheduleCiNoFixRecovery} records
+ * under its deterministic dedup key, which is a durable, once-per-head trace of
+ * that verdict in whatever state the dispatch has since reached. Read by the
+ * approved-head re-run policy's two call sites (issue #1128): the `pr-review`
+ * trigger and merge automation. Throws on a database error; the callers decide
+ * which way to fail.
+ */
+export async function hasCiNoFixRecovery(
+	project: ProjectConfig,
+	prNumber: string,
+	headSha: string,
+): Promise<boolean> {
+	const dedupKey = deliveryDedupKey(ciNoFixRecoveryDeliveryId(project, prNumber, headSha));
+	return (await findDispatchByDedupKey(dedupKey)) !== undefined;
 }
 
 /**
