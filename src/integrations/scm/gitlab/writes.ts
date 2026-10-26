@@ -1,7 +1,7 @@
 /**
  * GitLab's merge-request **writes** — the note, review-verdict, merge-request
- * creation, and direct-merge half of `../github/client.ts` (issue #295, phase
- * 4/4). The reads they pair with live in `./merge-requests.ts`; both sit outside
+ * creation, direct-merge, and failed-pipeline retry half of `../github/client.ts`
+ * (issue #295, phase 4/4; the retry since issue #1133). The reads they pair with live in `./merge-requests.ts`; both sit outside
  * `./client.ts` because that module is the credential/transport primitive and
  * these are the endpoint-shaped callers of it.
  *
@@ -285,4 +285,50 @@ export async function mergeGitLabMergeRequestDirect(
 		// reports full 40-character SHAs, so there is nothing to narrow.
 		sha: mr.merge_commit_sha ?? mr.squash_commit_sha ?? undefined,
 	};
+}
+
+/** One pipeline, as `GET /projects/:id/pipelines` lists it. */
+interface GitLabPipeline {
+	id?: number;
+	/** The pipeline status vocabulary of `./pipelines.ts`. */
+	status?: string;
+	/** The branch, tag, or `refs/merge-requests/:iid/head` the pipeline ran for. */
+	ref?: string;
+	/** Set only when the pipeline's configuration names it. */
+	name?: string | null;
+}
+
+/**
+ * Retry every failed pipeline on `sha` (`POST /projects/:id/pipelines/:id/retry`,
+ * which re-runs a pipeline's failed and canceled jobs), returning a name for each
+ * pipeline GitLab accepted the retry of — empty when none failed.
+ *
+ * Only the **newest pipeline per `ref`** is considered — the listing is newest
+ * first — on the rule `getGitLabCommitStatuses` applies when it keeps the newest
+ * status per name: a failed pipeline a later one on the same ref superseded is a
+ * stale failure the aggregate no longer counts, so it is not retried. A commit
+ * status an external CI posted outside any pipeline has nothing to retry and never
+ * appears here. Throws on the first refusal; pipelines already accepted before it
+ * stay accepted.
+ */
+export async function retryFailedGitLabPipelines(repo: string, sha: string): Promise<string[]> {
+	const pipelines = await paginateGitLab<GitLabPipeline>(
+		`${projectPath(repo)}/pipelines?${new URLSearchParams({ sha })}`,
+	);
+
+	const latestByRef = new Map<string, GitLabPipeline>();
+	for (const [index, pipeline] of pipelines.entries()) {
+		const ref = pipeline.ref ?? `#${index}`;
+		if (!latestByRef.has(ref)) latestByRef.set(ref, pipeline);
+	}
+
+	const retried: string[] = [];
+	for (const pipeline of latestByRef.values()) {
+		if (pipeline.status !== 'failed' || pipeline.id === undefined) continue;
+		await gitlabRequest<unknown>('POST', `${projectPath(repo)}/pipelines/${pipeline.id}/retry`);
+		retried.push(
+			pipeline.name || `pipeline #${pipeline.id}${pipeline.ref ? ` (${pipeline.ref})` : ''}`,
+		);
+	}
+	return retried;
 }

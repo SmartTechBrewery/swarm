@@ -106,6 +106,8 @@ For the recommended **same-origin** deploy (the API server serves the built dash
 
 The **implementer** persona is no longer a project credential (issue #396), and since issue #765 it is no longer an env var either: on the worker path it is the operator's own credential stored per `(worker, scmProvider)` (see [Per-worker operator SCM credential](#per-worker-operator-scm-credential) below), and on the router it is still `SWARM_OPERATOR_GH_TOKEN` for the three call sites listed in that variable's row. Either way it is not a project credential: a legacy `swarm.config.json` still listing an `implementer` reference parses with the key stripped, so `swarm config apply` stays idempotent.
 
+**Re-running failed checks needs one more grant on the implementer credential** (issue #1133). `SCMProvider.rerunFailedChecks` writes as the implementer by default — the persona merge automation acts as — so whichever implementer credential a provider resolves (an operator token above, or the per-worker operator credential below) needs: on **GitHub**, `Actions: Read and write` on a fine-grained PAT (a classic PAT's `repo` scope already covers it); on **GitLab**, the `api` scope; on **Azure DevOps**, `Build (Read & execute)`. **Bitbucket** needs nothing extra: its provider declares the capability `unsupported`, because a Bitbucket build status cannot be re-run through the API. A token without the grant is not fatal — the re-run comes back as a `provider-error` carrying the provider's own refusal.
+
 **Dashboard frontend (Vite)** — only `VITE_`-prefixed vars reach the browser (`dashboard/.env`)
 | Variable | Default | Purpose |
 | --- | --- | --- |

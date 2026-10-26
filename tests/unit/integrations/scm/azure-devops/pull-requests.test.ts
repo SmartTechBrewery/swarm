@@ -15,6 +15,7 @@ import {
 	isAzureDevOpsBaseContainedInHead,
 	listActiveAzureDevOpsPullRequestsForBase,
 	listAzureDevOpsPullRequestsForCommit,
+	retryFailedAzureDevOpsBuilds,
 } from '@/integrations/scm/azure-devops/pull-requests.js';
 import { logger } from '@/lib/logger.js';
 import { decideAggregateCheckOutcome } from '@/triggers/handlers/aggregate-check-decision.js';
@@ -529,6 +530,87 @@ describe('azure devops pull-request reads', () => {
 			await expect(scoped(() => getAzureDevOpsCommitChecks(REPO, HEAD_SHA))).rejects.toBeInstanceOf(
 				AzureDevOpsApiError,
 			);
+		});
+	});
+
+	describe('retryFailedAzureDevOpsBuilds', () => {
+		const BUILDS = '/Fabrikam/Fiber%20Team/_apis/build/builds';
+
+		/** Route the build scan plus a retry of any build; record every request's method. */
+		const routeBuilds = (builds: unknown[], retry: unknown = { id: 0, status: 'notStarted' }) =>
+			routeFetch(fetchMock, [
+				[`${BUILDS}/`, retry],
+				[BUILDS, { count: builds.length, value: builds }],
+				[`${REPO_API}?`, { id: 'repo-guid', name: 'Web' }],
+			]);
+
+		const retries = () =>
+			fetchMock.mock.calls
+				.filter((call) => call[1]?.method === 'PATCH')
+				.map((call) => new URL(String(call[0])));
+
+		it('retries only the newest failed build per definition on the commit', async () => {
+			routeBuilds([
+				createMockAzureDevOpsBuildResponse({ id: 40, definition: { id: 5, name: 'Web CI' } }),
+				createMockAzureDevOpsBuildResponse({
+					id: 39,
+					sourceVersion: OTHER_SHA,
+					triggerInfo: { 'pr.sourceSha': HEAD_SHA },
+					definition: { id: 6, name: 'Lint' },
+					result: 'failed',
+				}),
+				// An older run of definition 5 — a stale failure the aggregate ignores.
+				createMockAzureDevOpsBuildResponse({ id: 38, result: 'failed' }),
+				// A failed build of some other commit.
+				createMockAzureDevOpsBuildResponse({
+					id: 37,
+					sourceVersion: OTHER_SHA,
+					definition: { id: 7, name: 'Other' },
+					result: 'failed',
+				}),
+			]);
+
+			await expect(scoped(() => retryFailedAzureDevOpsBuilds(REPO, HEAD_SHA))).resolves.toEqual([
+				'Lint',
+			]);
+			const [retry, ...rest] = retries();
+			expect(rest).toEqual([]);
+			expect(retry?.pathname).toBe(`${BUILDS}/39`);
+			expect(retry?.searchParams.get('retry')).toBe('true');
+			expect(retry?.searchParams.get('api-version')).toBe('7.1');
+		});
+
+		it('retries nothing when every build is green or still running', async () => {
+			routeBuilds([
+				createMockAzureDevOpsBuildResponse({ id: 40 }),
+				createMockAzureDevOpsBuildResponse({
+					id: 41,
+					status: 'inProgress',
+					result: undefined,
+					definition: { id: 6, name: 'Lint' },
+				}),
+			]);
+
+			await expect(scoped(() => retryFailedAzureDevOpsBuilds(REPO, HEAD_SHA))).resolves.toEqual([]);
+			expect(retries()).toEqual([]);
+		});
+
+		it('lets a refused retry propagate as an AzureDevOpsApiError', async () => {
+			routeFetch(fetchMock, [
+				[BUILDS, { count: 1, value: [createMockAzureDevOpsBuildResponse({ result: 'failed' })] }],
+				[`${REPO_API}?`, { id: 'repo-guid' }],
+			]);
+			// The list route also matches the PATCH path, so refuse the PATCH explicitly.
+			const listed = fetchMock.getMockImplementation();
+			fetchMock.mockImplementation(async (input, init) =>
+				init?.method === 'PATCH'
+					? jsonResponse({ message: 'Access denied', typeKey: 'AccessCheckException' }, 403)
+					: (listed as typeof fetch)(input, init),
+			);
+
+			await expect(
+				scoped(() => retryFailedAzureDevOpsBuilds(REPO, HEAD_SHA)),
+			).rejects.toBeInstanceOf(AzureDevOpsApiError);
 		});
 	});
 

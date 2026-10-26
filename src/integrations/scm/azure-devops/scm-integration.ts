@@ -35,6 +35,7 @@ import type {
 	AggregateCheckStatus,
 	CommitPullRequest,
 	PullRequestDetails,
+	RerunFailedChecksOutcome,
 	SCMProvider,
 	ScmPersona,
 	ScmPersonaIdentities,
@@ -62,6 +63,7 @@ import {
 	isAzureDevOpsBaseContainedInHead,
 	listActiveAzureDevOpsPullRequestsForBase,
 	listAzureDevOpsPullRequestsForCommit,
+	retryFailedAzureDevOpsBuilds,
 } from './pull-requests.js';
 import {
 	isSwarmGeneratedAzureDevOpsEvent,
@@ -417,6 +419,28 @@ export class AzureDevOpsSCMIntegration implements SCMProvider {
 		return this.withPersonaCredentials(project, persona, () =>
 			getAzureDevOpsCommitChecks(project.repo, ref),
 		);
+	}
+
+	/**
+	 * {@link SCMProvider.rerunFailedChecks} — retries the newest failed Azure
+	 * Pipelines build per definition on `ref`, the builds
+	 * {@link AzureDevOpsSCMIntegration.getAggregateCheckStatus} reads. External Git
+	 * commit statuses cannot be retried from Azure and do not count. Writes as the
+	 * **implementer** by default, whose PAT needs `Build (Read & execute)`.
+	 */
+	async rerunFailedChecks(
+		project: ProjectConfig,
+		ref: string,
+		persona: ScmPersona = 'implementer',
+	): Promise<RerunFailedChecksOutcome> {
+		try {
+			const checks = await this.withPersonaCredentials(project, persona, () =>
+				retryFailedAzureDevOpsBuilds(project.repo, ref),
+			);
+			return checks.length > 0 ? { status: 'requested', checks } : { status: 'nothing-to-rerun' };
+		} catch (error) {
+			return { status: 'provider-error', message: errorMessage(error) };
+		}
 	}
 
 	/**

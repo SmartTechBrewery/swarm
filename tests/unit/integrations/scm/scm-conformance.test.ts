@@ -62,6 +62,7 @@ const SCM_CONTRACT_METHODS = [
 	'pullRequestUrl',
 	'getBranchHead',
 	'getAggregateCheckStatus',
+	'rerunFailedChecks',
 	'listPullRequestsForCommit',
 	'listConflictCandidates',
 	'commentOnPullRequest',

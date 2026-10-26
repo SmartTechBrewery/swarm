@@ -31,6 +31,7 @@ vi.mock('@/integrations/scm/github/client.js', () => ({
 	isBaseContainedInHead: vi.fn(),
 	isContainedInBranch: vi.fn(),
 	mergePullRequestDirect: vi.fn(),
+	rerunFailedWorkflowRuns: vi.fn(),
 	updatePullRequestBranchDirect: vi.fn(),
 }));
 
@@ -46,6 +47,7 @@ import {
 	isBaseContainedInHead,
 	isContainedInBranch,
 	mergePullRequestDirect,
+	rerunFailedWorkflowRuns,
 	updatePullRequestBranchDirect,
 	withGitHubToken,
 } from '@/integrations/scm/github/client.js';
@@ -269,6 +271,60 @@ describe('GitHubSCMIntegration', () => {
 			vi.mocked(getPersonaToken).mockResolvedValue('tok-impl');
 			await scm.getAggregateCheckStatus(project, 'cafe', 'implementer');
 			expect(getPersonaToken).toHaveBeenCalledWith(project, 'implementer');
+		});
+	});
+
+	describe('rerunFailedChecks', () => {
+		beforeEach(() => {
+			vi.mocked(rerunFailedWorkflowRuns).mockReset();
+		});
+
+		it('writes as the implementer by default and reports the re-run workflow runs', async () => {
+			vi.mocked(getPersonaToken).mockResolvedValue('tok-impl');
+			vi.mocked(rerunFailedWorkflowRuns).mockResolvedValue(['CI']);
+
+			await expect(scm.rerunFailedChecks(project, 'cafe')).resolves.toEqual({
+				status: 'requested',
+				checks: ['CI'],
+			});
+			expect(getPersonaToken).toHaveBeenCalledWith(project, 'implementer');
+			expect(withGitHubToken).toHaveBeenCalledWith('tok-impl', expect.any(Function));
+			expect(rerunFailedWorkflowRuns).toHaveBeenCalledWith('SmartTechBrewery', 'swarm', 'cafe');
+		});
+
+		it('honours an explicit persona override', async () => {
+			vi.mocked(getPersonaToken).mockResolvedValue('tok-rev');
+			vi.mocked(rerunFailedWorkflowRuns).mockResolvedValue([]);
+			await scm.rerunFailedChecks(project, 'cafe', 'reviewer');
+			expect(getPersonaToken).toHaveBeenCalledWith(project, 'reviewer');
+		});
+
+		it('answers nothing-to-rerun when no workflow run failed', async () => {
+			vi.mocked(getPersonaToken).mockResolvedValue('tok-impl');
+			vi.mocked(rerunFailedWorkflowRuns).mockResolvedValue([]);
+			await expect(scm.rerunFailedChecks(project, 'cafe')).resolves.toEqual({
+				status: 'nothing-to-rerun',
+			});
+		});
+
+		it('turns a refused re-run (a 403 included) into provider-error instead of throwing', async () => {
+			vi.mocked(getPersonaToken).mockResolvedValue('tok-impl');
+			vi.mocked(rerunFailedWorkflowRuns).mockRejectedValue(
+				new Error('Resource not accessible by personal access token'),
+			);
+			await expect(scm.rerunFailedChecks(project, 'cafe')).resolves.toEqual({
+				status: 'provider-error',
+				message: 'Resource not accessible by personal access token',
+			});
+		});
+
+		it('turns an unresolvable token into provider-error instead of throwing', async () => {
+			vi.mocked(getPersonaToken).mockRejectedValue(new Error('no implementer token'));
+			await expect(scm.rerunFailedChecks(project, 'cafe')).resolves.toEqual({
+				status: 'provider-error',
+				message: 'no implementer token',
+			});
+			expect(rerunFailedWorkflowRuns).not.toHaveBeenCalled();
 		});
 	});
 

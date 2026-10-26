@@ -720,6 +720,28 @@ describe('BitbucketSCMIntegration', () => {
 		});
 	});
 
+	// Issue #1133. A *declared* answer rather than a stub: a Bitbucket build status is
+	// posted by whatever CI the repository uses, and the API cannot re-run it.
+	describe('rerunFailedChecks', () => {
+		const SHA = 'd3022fc0ca3d';
+
+		it('declares the capability unsupported, naming the commit', async () => {
+			const outcome = await scm.rerunFailedChecks(project, SHA);
+
+			expect(outcome.status).toBe('unsupported');
+			expect(outcome).toMatchObject({ message: expect.stringContaining(SHA) });
+		});
+
+		it('needs no credential to answer, so it never throws', async () => {
+			vi.mocked(getBitbucketCredential).mockRejectedValue(new Error('no credential'));
+
+			await expect(scm.rerunFailedChecks(project, SHA, 'implementer')).resolves.toMatchObject({
+				status: 'unsupported',
+			});
+			expect(getBitbucketCredential).not.toHaveBeenCalled();
+		});
+	});
+
 	describe('deliveryProvider', () => {
 		beforeEach(() => {
 			execFileCalls.length = 0;

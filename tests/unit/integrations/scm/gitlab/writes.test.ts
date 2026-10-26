@@ -6,6 +6,7 @@ import {
 	mergeGitLabMergeRequestDirect,
 	postGitLabMergeRequestNote,
 	postIdempotentGitLabMergeRequestNote,
+	retryFailedGitLabPipelines,
 	submitGitLabReview,
 } from '@/integrations/scm/gitlab/writes.js';
 import { deliveryMarker } from '@/scm/swarm-origin.js';
@@ -373,6 +374,64 @@ describe('gitlab merge-request writes', () => {
 
 			expect(thrown).toBeInstanceOf(GitLabApiError);
 			expect((thrown as GitLabApiError).status).toBe(405);
+		});
+	});
+
+	describe('retryFailedGitLabPipelines', () => {
+		const PIPELINES_PATH = '/api/v4/projects/jkwiecien%2Fswarm/pipelines';
+
+		it('retries only the failed newest pipeline per ref', async () => {
+			// Newest first: the MR pipeline 30 failed; the branch's newest pipeline 20 is
+			// green, so its stale failed predecessor 10 is not retried.
+			fetchMock
+				.mockResolvedValueOnce(
+					jsonResponse([
+						{ id: 30, status: 'failed', ref: 'refs/merge-requests/17/head' },
+						{ id: 20, status: 'success', ref: 'issue-17' },
+						{ id: 10, status: 'failed', ref: 'issue-17' },
+					]),
+				)
+				.mockResolvedValueOnce(jsonResponse({ id: 30, status: 'pending' }, 201));
+
+			await expect(scoped(() => retryFailedGitLabPipelines(REPO, HEAD_SHA))).resolves.toEqual([
+				'pipeline #30 (refs/merge-requests/17/head)',
+			]);
+			expect(requestSequence(fetchMock)).toEqual([
+				['GET', PIPELINES_PATH],
+				['POST', `${PIPELINES_PATH}/30/retry`],
+			]);
+			expect(new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams.get('sha')).toBe(HEAD_SHA);
+		});
+
+		it('reports a pipeline by its configured name when it has one', async () => {
+			fetchMock
+				.mockResolvedValueOnce(
+					jsonResponse([{ id: 30, status: 'failed', ref: 'main', name: 'CI' }]),
+				)
+				.mockResolvedValueOnce(jsonResponse({ id: 30, status: 'pending' }, 201));
+
+			await expect(scoped(() => retryFailedGitLabPipelines(REPO, HEAD_SHA))).resolves.toEqual([
+				'CI',
+			]);
+		});
+
+		it('retries nothing when every pipeline is green — or the commit has none', async () => {
+			fetchMock.mockResolvedValueOnce(jsonResponse([{ id: 20, status: 'success', ref: 'main' }]));
+			await expect(scoped(() => retryFailedGitLabPipelines(REPO, HEAD_SHA))).resolves.toEqual([]);
+
+			fetchMock.mockResolvedValueOnce(jsonResponse([]));
+			await expect(scoped(() => retryFailedGitLabPipelines(REPO, HEAD_SHA))).resolves.toEqual([]);
+			expect(fetchMock.mock.calls.every((call) => call[1]?.method === 'GET')).toBe(true);
+		});
+
+		it('lets a refused retry propagate as a GitLabApiError', async () => {
+			fetchMock
+				.mockResolvedValueOnce(jsonResponse([{ id: 30, status: 'failed', ref: 'main' }]))
+				.mockResolvedValueOnce(jsonResponse({ message: '403 Forbidden' }, 403));
+
+			await expect(scoped(() => retryFailedGitLabPipelines(REPO, HEAD_SHA))).rejects.toBeInstanceOf(
+				GitLabApiError,
+			);
 		});
 	});
 

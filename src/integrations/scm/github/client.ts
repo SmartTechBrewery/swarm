@@ -83,23 +83,10 @@ export async function getCheckSuiteStatus(
 	ref: string,
 ): Promise<CheckSuiteStatus> {
 	const client = getScopedClient();
-
-	const workflowRuns = await client.paginate(client.actions.listWorkflowRunsForRepo, {
-		owner,
-		repo,
-		head_sha: ref,
-		per_page: 100,
-	});
-
-	const latestRunByWorkflow = new Map<number, (typeof workflowRuns)[number]>();
-	for (const run of workflowRuns) {
-		if (!latestRunByWorkflow.has(run.workflow_id)) {
-			latestRunByWorkflow.set(run.workflow_id, run);
-		}
-	}
+	const latestRuns = await listLatestWorkflowRuns(client, owner, repo, ref);
 
 	const jobResults = await Promise.all(
-		[...latestRunByWorkflow.values()].map((run) =>
+		latestRuns.map((run) =>
 			client.paginate(client.actions.listJobsForWorkflowRun, {
 				owner,
 				repo,
@@ -118,6 +105,66 @@ export async function getCheckSuiteStatus(
 	);
 
 	return { totalCount: checkRuns.length, checkRuns };
+}
+
+/**
+ * The newest Actions workflow run per `workflow_id` on `ref` — the selection both
+ * {@link getCheckSuiteStatus} and {@link rerunFailedWorkflowRuns} read, so a re-run
+ * only ever touches a run the aggregate actually counts.
+ */
+async function listLatestWorkflowRuns(client: Octokit, owner: string, repo: string, ref: string) {
+	const workflowRuns = await client.paginate(client.actions.listWorkflowRunsForRepo, {
+		owner,
+		repo,
+		head_sha: ref,
+		per_page: 100,
+	});
+
+	const latestRunByWorkflow = new Map<number, (typeof workflowRuns)[number]>();
+	for (const run of workflowRuns) {
+		if (!latestRunByWorkflow.has(run.workflow_id)) {
+			latestRunByWorkflow.set(run.workflow_id, run);
+		}
+	}
+	return [...latestRunByWorkflow.values()];
+}
+
+/**
+ * Run conclusions a re-run of failed jobs can turn green — the failures of
+ * `FAILURE_CONCLUSIONS` in `src/triggers/handlers/aggregate-check-decision.ts`,
+ * less `action_required`, which is an approval gate rather than a failed job.
+ */
+const RERUNNABLE_RUN_CONCLUSIONS: ReadonlySet<string> = new Set(['failure', 'timed_out']);
+
+/**
+ * Re-run the failed jobs of every failed workflow run on `ref`
+ * (`POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs`),
+ * returning the names of the runs GitHub accepted a re-run of — empty when none
+ * failed. Runs are picked exactly as {@link getCheckSuiteStatus} picks them, so a
+ * stale failed run of a workflow whose latest run is green is never re-run. Throws
+ * on the first refusal (a 403 for a token without `Actions: write` included);
+ * runs already accepted before it stay accepted.
+ */
+export async function rerunFailedWorkflowRuns(
+	owner: string,
+	repo: string,
+	ref: string,
+): Promise<string[]> {
+	const client = getScopedClient();
+	const latestRuns = await listLatestWorkflowRuns(client, owner, repo, ref);
+	const failedRuns = latestRuns.filter(
+		(run) =>
+			run.status === 'completed' &&
+			run.conclusion !== null &&
+			RERUNNABLE_RUN_CONCLUSIONS.has(run.conclusion),
+	);
+
+	const rerun: string[] = [];
+	for (const run of failedRuns) {
+		await client.actions.reRunWorkflowFailedJobs({ owner, repo, run_id: run.id });
+		rerun.push(run.name ?? `workflow run ${run.id}`);
+	}
+	return rerun;
 }
 
 /**

@@ -41,6 +41,7 @@ import type {
 	AggregateCheckStatus,
 	CommitPullRequest,
 	PullRequestDetails,
+	RerunFailedChecksOutcome,
 	SCMProvider,
 	ScmPersona,
 	ScmPersonaIdentities,
@@ -78,6 +79,7 @@ import {
 	mergeGitLabMergeRequestDirect,
 	postGitLabMergeRequestNote,
 	postIdempotentGitLabMergeRequestNote,
+	retryFailedGitLabPipelines,
 	submitGitLabReview,
 } from './writes.js';
 
@@ -422,6 +424,29 @@ export class GitLabSCMIntegration implements SCMProvider {
 		return this.withPersonaCredentials(project, persona, () =>
 			getGitLabCommitStatuses(project.repo, ref),
 		);
+	}
+
+	/**
+	 * {@link SCMProvider.rerunFailedChecks} — retries the newest failed pipeline per
+	 * ref on `ref`, whose jobs are the commit statuses
+	 * {@link GitLabSCMIntegration.getAggregateCheckStatus} reads. A status an external
+	 * CI posted outside a pipeline cannot be retried, so a commit failed only by
+	 * those answers `nothing-to-rerun`. Writes as the **implementer** by default,
+	 * whose token needs the `api` scope.
+	 */
+	async rerunFailedChecks(
+		project: ProjectConfig,
+		ref: string,
+		persona: ScmPersona = 'implementer',
+	): Promise<RerunFailedChecksOutcome> {
+		try {
+			const checks = await this.withPersonaCredentials(project, persona, () =>
+				retryFailedGitLabPipelines(project.repo, ref),
+			);
+			return checks.length > 0 ? { status: 'requested', checks } : { status: 'nothing-to-rerun' };
+		} catch (error) {
+			return { status: 'provider-error', message: errorMessage(error) };
+		}
 	}
 
 	/**

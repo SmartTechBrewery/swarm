@@ -6,7 +6,9 @@
  * `getAzureDevOpsCommitChecks`, `listAzureDevOpsPullRequestsForCommit`,
  * `listActiveAzureDevOpsPullRequestsForBase`, `findActiveAzureDevOpsPullRequest`,
  * plus the merge path's commit-graph staleness read,
- * `isAzureDevOpsBaseContainedInHead`.
+ * `isAzureDevOpsBaseContainedInHead`. The one write here is
+ * `retryFailedAzureDevOpsBuilds` (issue #1133), which shares the aggregate's build
+ * scan so it can only ever retry a build that aggregate counts.
  *
  * They live in their own file rather than in `./client.ts` because that module is
  * the credential/transport primitive (token scoping, auth header, error envelope,
@@ -465,19 +467,23 @@ function builtCommit(build: AzureDevOpsBuild, sha: string): boolean {
 }
 
 /**
- * The Azure Pipelines half of the aggregate: the newest build per pipeline
- * definition that ran on `sha`.
+ * The newest build per pipeline definition that ran on `sha`, keyed by definition —
+ * the build selection both the aggregate ({@link getAzureDevOpsCommitChecks}) and
+ * the retry ({@link retryFailedAzureDevOpsBuilds}) read.
  *
  * Azure Pipelines does **not** post Git commit statuses for Azure Repos builds, so
- * this half is read from the builds API itself. That API filters by repository but
- * not by commit, so the repository's {@link BUILD_SCAN_LIMIT} most recently queued
- * builds are scanned and kept when `sourceVersion` — or, for a pull-request build,
- * which runs on Azure's merge commit, `triggerInfo['pr.sourceSha']` — names `sha`.
- * Newest first, so the first build seen per `definition.id` is the one kept: a
- * re-run's stale failure must not fail a green commit. The builds API names the
- * repository by GUID, which costs one repository read.
+ * this is read from the builds API itself. That API filters by repository but not by
+ * commit, so the repository's {@link BUILD_SCAN_LIMIT} most recently queued builds
+ * are scanned and kept when `sourceVersion` — or, for a pull-request build, which
+ * runs on Azure's merge commit, `triggerInfo['pr.sourceSha']` — names `sha`. Newest
+ * first, so the first build seen per `definition.id` is the one kept: a re-run's
+ * stale failure must not fail a green commit. The builds API names the repository by
+ * GUID, which costs one repository read.
  */
-async function buildChecks(repo: string, sha: string): Promise<Map<string, CheckRunState>> {
+async function latestBuildsForCommit(
+	repo: string,
+	sha: string,
+): Promise<Map<string, { build: AzureDevOpsBuild; index: number }>> {
 	const { organization, project } = azureRepoCoordinates(repo);
 	const repository = await azureDevOpsRequest<{ id?: string }>('GET', repositoryApiPath(repo));
 	if (!repository.id) {
@@ -491,7 +497,7 @@ async function buildChecks(repo: string, sha: string): Promise<Map<string, Check
 	});
 	const listed = await azureDevOpsRequest<AzureDevOpsList<AzureDevOpsBuild> | undefined>(
 		'GET',
-		`/${encodeURIComponent(organization)}/${encodeURIComponent(project)}/_apis/build/builds?${query}`,
+		`${buildsApiPath(organization, project)}?${query}`,
 	);
 	const builds = listed?.value ?? [];
 	if (builds.length >= BUILD_SCAN_LIMIT) {
@@ -505,16 +511,60 @@ async function buildChecks(repo: string, sha: string): Promise<Map<string, Check
 		);
 	}
 
-	const checks = new Map<string, CheckRunState>();
+	const latest = new Map<string, { build: AzureDevOpsBuild; index: number }>();
 	for (const [index, build] of builds.entries()) {
 		if (!builtCommit(build, sha)) continue;
-		const definitionId = build.definition?.id;
-		const key = `build:${definitionId ?? `#${index}`}`;
-		if (checks.has(key)) continue;
-		const name = build.definition?.name ?? `build ${build.id ?? index}`;
-		checks.set(key, buildCheckRun(name, build.status, build.result));
+		const key = `build:${build.definition?.id ?? `#${index}`}`;
+		if (!latest.has(key)) latest.set(key, { build, index });
+	}
+	return latest;
+}
+
+/** The project-level builds collection (`_apis/build/builds`). */
+function buildsApiPath(organization: string, project: string): string {
+	return `/${encodeURIComponent(organization)}/${encodeURIComponent(project)}/_apis/build/builds`;
+}
+
+/** The name a build is reported under: its pipeline definition's, else its own id. */
+function buildName(build: AzureDevOpsBuild, index: number): string {
+	return build.definition?.name ?? `build ${build.id ?? index}`;
+}
+
+/** The Azure Pipelines half of the aggregate: {@link latestBuildsForCommit}, as checks. */
+async function buildChecks(repo: string, sha: string): Promise<Map<string, CheckRunState>> {
+	const checks = new Map<string, CheckRunState>();
+	for (const [key, { build, index }] of await latestBuildsForCommit(repo, sha)) {
+		checks.set(key, buildCheckRun(buildName(build, index), build.status, build.result));
 	}
 	return checks;
+}
+
+/**
+ * Retry every failed build on `sha` (`PATCH …/_apis/build/builds/{id}?retry=true`,
+ * Build Update with `retry`, which re-runs the build's failed stages), returning the
+ * name of each build Azure accepted the retry of — empty when none failed.
+ *
+ * Builds are picked exactly as the aggregate picks them ({@link latestBuildsForCommit}),
+ * so a stale failure a newer build of the same definition superseded is not retried.
+ * External Git commit statuses — the aggregate's other half — are posted by a CI
+ * Azure cannot drive, so they are never retried. Throws on the first refusal; builds
+ * already accepted before it stay accepted.
+ */
+export async function retryFailedAzureDevOpsBuilds(repo: string, sha: string): Promise<string[]> {
+	const { organization, project } = azureRepoCoordinates(repo);
+	const retried: string[] = [];
+	for (const { build, index } of (await latestBuildsForCommit(repo, sha)).values()) {
+		if (build.status !== 'completed' || build.result !== 'failed' || build.id === undefined) {
+			continue;
+		}
+		await azureDevOpsRequest<unknown>(
+			'PATCH',
+			`${buildsApiPath(organization, project)}/${build.id}?retry=true`,
+			{},
+		);
+		retried.push(buildName(build, index));
+	}
+	return retried;
 }
 
 /**

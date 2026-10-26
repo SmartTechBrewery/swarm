@@ -144,6 +144,19 @@ export interface AggregateCheckStatus {
 }
 
 /**
+ * The result of {@link SCMProvider.rerunFailedChecks}. `requested` names the checks
+ * the provider accepted a re-run of; `nothing-to-rerun` means no check on the commit
+ * is a failed one this provider can re-run; `unsupported` is a provider that declares
+ * no re-run capability at all; `provider-error` is any transport, authentication or
+ * API failure, carried as a message rather than thrown.
+ */
+export type RerunFailedChecksOutcome =
+	| { status: 'requested'; checks: string[] }
+	| { status: 'nothing-to-rerun' }
+	| { status: 'unsupported'; message: string }
+	| { status: 'provider-error'; message: string };
+
+/**
  * A pull request a commit belongs to — just enough to tie a CI event back to the
  * pull request it ran for (see {@link SCMProvider.listPullRequestsForCommit}).
  *
@@ -377,6 +390,25 @@ export interface SCMProvider extends ScmMergeProvider {
 		ref: string,
 		persona?: ScmPersona,
 	): Promise<AggregateCheckStatus>;
+
+	/**
+	 * Ask the provider to re-run the failed checks on `ref` (a commit SHA) — the
+	 * write an approved head whose CI went red needs before it can merge (issue
+	 * #1128). Only the checks this provider's own {@link SCMProvider.getAggregateCheckStatus}
+	 * reads are re-run, so a re-run shows up in that aggregate as in progress and
+	 * then as its new conclusion; a stale failure the aggregate already ignores (a
+	 * superseded run of the same workflow/pipeline/definition) is never re-run.
+	 *
+	 * **Never throws.** Credential resolution included, every failure comes back as
+	 * `provider-error`, and a provider with no re-run capability declares
+	 * `unsupported` with its reason. Omitting `persona` writes as the
+	 * **implementer**, the persona merge automation acts as.
+	 */
+	rerunFailedChecks(
+		project: ProjectConfig,
+		ref: string,
+		persona?: ScmPersona,
+	): Promise<RerunFailedChecksOutcome>;
 
 	/**
 	 * The pull requests commit `sha` belongs to — the ingress path's commit→pull
