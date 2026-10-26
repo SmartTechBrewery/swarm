@@ -267,7 +267,9 @@ export class EnrollmentRepositoryMismatchError extends Error {
  * for a project only while its enrollment is both `active` **and** carries the
  * owner's `sharingConsent`. Suspending the enrollment or revoking consent flips
  * this to `false` — blocking new dispatch — without terminating a running agent
- * (that is #130's concern, not this predicate's). Takes only the two fields it
+ * (that is #130's concern, not this predicate's). A held but non-routable
+ * enrollment still has its running phase's control-plane deliveries served
+ * (`src/router/worker-delivery.ts`, issue #1129). Takes only the two fields it
  * reads so a caller can pass a partial enrollment.
  */
 export function isRoutable(
