@@ -36,6 +36,7 @@ import type {
 	AggregateCheckStatus,
 	CommitPullRequest,
 	PullRequestDetails,
+	RerunFailedChecksOutcome,
 	SCMProvider,
 	ScmPersona,
 	ScmPersonaIdentities,
@@ -61,6 +62,7 @@ import {
 	mergePullRequestDirect,
 	postIdempotentPullRequestComment,
 	postIssueComment,
+	rerunFailedWorkflowRuns,
 	submitPullRequestReview,
 	updatePullRequestBranchDirect,
 	withGitHubToken,
@@ -564,6 +566,31 @@ export class GitHubSCMIntegration implements SCMProvider {
 		return this.withPersonaCredentials(project, persona, () =>
 			getCheckSuiteStatus(owner, repo, ref),
 		);
+	}
+
+	/**
+	 * {@link SCMProvider.rerunFailedChecks} — re-runs the failed jobs of the latest
+	 * failed Actions workflow run per workflow on `ref`, the runs
+	 * {@link GitHubSCMIntegration.getAggregateCheckStatus} reads. Check suites other
+	 * GitHub Apps create are invisible to that aggregate, so they are not re-run
+	 * either. Writes as the **implementer** by default, whose token needs
+	 * `Actions: Read and write` (a classic PAT's `repo` covers it); a 403 for a token
+	 * without it comes back as `provider-error` like any other failure.
+	 */
+	async rerunFailedChecks(
+		project: ProjectConfig,
+		ref: string,
+		persona: ScmPersona = 'implementer',
+	): Promise<RerunFailedChecksOutcome> {
+		const [owner, repo] = project.repo.split('/');
+		try {
+			const checks = await this.withPersonaCredentials(project, persona, () =>
+				rerunFailedWorkflowRuns(owner, repo, ref),
+			);
+			return checks.length > 0 ? { status: 'requested', checks } : { status: 'nothing-to-rerun' };
+		} catch (error) {
+			return { status: 'provider-error', message: errorMessage(error) };
+		}
 	}
 
 	/**

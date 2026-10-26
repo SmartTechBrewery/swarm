@@ -11,6 +11,7 @@ const getAuthenticated = vi.fn();
 // each endpoint reference to `paginate`, so paginate switches on identity.
 const listWorkflowRunsForRepo = vi.fn();
 const listJobsForWorkflowRun = vi.fn();
+const reRunWorkflowFailedJobs = vi.fn();
 const pullsGet = vi.fn();
 const pullsMerge = vi.fn();
 const listPullRequestsAssociatedWithCommit = vi.fn();
@@ -25,7 +26,7 @@ vi.mock('@octokit/rest', () => ({
 	Octokit: class {
 		auth: unknown;
 		users = { getAuthenticated };
-		actions = { listWorkflowRunsForRepo, listJobsForWorkflowRun };
+		actions = { listWorkflowRunsForRepo, listJobsForWorkflowRun, reRunWorkflowFailedJobs };
 		pulls = { get: pullsGet, merge: pullsMerge };
 		repos = {
 			listPullRequestsAssociatedWithCommit,
@@ -57,6 +58,7 @@ import {
 	isContainedInBranch,
 	listPullRequestsForCommit,
 	mergePullRequestDirect,
+	rerunFailedWorkflowRuns,
 	withGitHubToken,
 } from '@/integrations/scm/github/client.js';
 
@@ -66,6 +68,7 @@ describe('github client', () => {
 		getAuthenticated.mockReset();
 		listWorkflowRunsForRepo.mockReset();
 		listJobsForWorkflowRun.mockReset();
+		reRunWorkflowFailedJobs.mockReset();
 		pullsGet.mockReset();
 		reposGetBranch.mockReset();
 		reposGet.mockReset();
@@ -156,6 +159,79 @@ describe('github client', () => {
 			await expect(
 				getGitHubRepositoryDefaultBranch('jkwiecien/missing', 'tok'),
 			).resolves.toBeNull();
+		});
+	});
+
+	describe('rerunFailedWorkflowRuns', () => {
+		it('re-runs the failed jobs of only the failed latest run per workflow', async () => {
+			// Workflow 100's latest run (1) failed; workflow 200's latest (3) is green;
+			// workflow 300's latest (4) timed out; workflow 400's (5) is still running.
+			paginate.mockImplementation(async (endpoint: unknown) =>
+				endpoint === listWorkflowRunsForRepo
+					? [
+							{ id: 1, workflow_id: 100, name: 'CI', status: 'completed', conclusion: 'failure' },
+							{ id: 3, workflow_id: 200, name: 'Lint', status: 'completed', conclusion: 'success' },
+							{
+								id: 4,
+								workflow_id: 300,
+								name: 'E2E',
+								status: 'completed',
+								conclusion: 'timed_out',
+							},
+							{ id: 5, workflow_id: 400, name: 'Docs', status: 'in_progress', conclusion: null },
+						]
+					: [],
+			);
+			reRunWorkflowFailedJobs.mockResolvedValue({ status: 201 });
+
+			const rerun = await withGitHubToken('tok', () =>
+				rerunFailedWorkflowRuns('jkwiecien', 'swarm', 'cafe'),
+			);
+
+			expect(rerun).toEqual(['CI', 'E2E']);
+			expect(paginate).toHaveBeenCalledWith(
+				listWorkflowRunsForRepo,
+				expect.objectContaining({ owner: 'jkwiecien', repo: 'swarm', head_sha: 'cafe' }),
+			);
+			expect(reRunWorkflowFailedJobs.mock.calls).toEqual([
+				[{ owner: 'jkwiecien', repo: 'swarm', run_id: 1 }],
+				[{ owner: 'jkwiecien', repo: 'swarm', run_id: 4 }],
+			]);
+		});
+
+		it('does not re-run a stale failed run of a workflow whose latest run is green', async () => {
+			paginate.mockImplementation(async (endpoint: unknown) =>
+				endpoint === listWorkflowRunsForRepo
+					? [
+							{ id: 2, workflow_id: 100, name: 'CI', status: 'completed', conclusion: 'success' },
+							{ id: 1, workflow_id: 100, name: 'CI', status: 'completed', conclusion: 'failure' },
+						]
+					: [],
+			);
+
+			const rerun = await withGitHubToken('tok', () =>
+				rerunFailedWorkflowRuns('jkwiecien', 'swarm', 'cafe'),
+			);
+
+			expect(rerun).toEqual([]);
+			expect(reRunWorkflowFailedJobs).not.toHaveBeenCalled();
+		});
+
+		it('propagates a refused re-run', async () => {
+			paginate.mockImplementation(async (endpoint: unknown) =>
+				endpoint === listWorkflowRunsForRepo
+					? [{ id: 1, workflow_id: 100, name: 'CI', status: 'completed', conclusion: 'failure' }]
+					: [],
+			);
+			reRunWorkflowFailedJobs.mockRejectedValue(
+				Object.assign(new Error('Resource not accessible by personal access token'), {
+					status: 403,
+				}),
+			);
+
+			await expect(
+				withGitHubToken('tok', () => rerunFailedWorkflowRuns('jkwiecien', 'swarm', 'cafe')),
+			).rejects.toThrow('Resource not accessible by personal access token');
 		});
 	});
 

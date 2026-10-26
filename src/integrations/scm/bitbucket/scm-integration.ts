@@ -41,6 +41,7 @@ import type {
 	AggregateCheckStatus,
 	CommitPullRequest,
 	PullRequestDetails,
+	RerunFailedChecksOutcome,
 	SCMProvider,
 	ScmPersona,
 	ScmPersonaIdentities,
@@ -403,6 +404,28 @@ export class BitbucketSCMIntegration implements SCMProvider {
 		return this.withPersonaCredentials(project, persona, () =>
 			getBitbucketCommitBuildStatus(workspace, slug, ref),
 		);
+	}
+
+	/**
+	 * {@link SCMProvider.rerunFailedChecks} for Bitbucket — a **declared**
+	 * `unsupported`, not a gap (issue #1133).
+	 *
+	 * A Bitbucket build status is posted by whatever CI the repository uses, and
+	 * Bitbucket Cloud's API offers no way to re-run the build behind a reported
+	 * status. Starting a fresh Bitbucket Pipelines run instead would be a different
+	 * operation — a new run, which a repository built elsewhere does not even have —
+	 * so adopting it is left to a Bitbucket-specific decision rather than smuggled in
+	 * behind a provider-neutral method name.
+	 */
+	async rerunFailedChecks(
+		project: ProjectConfig,
+		ref: string,
+		_persona?: ScmPersona,
+	): Promise<RerunFailedChecksOutcome> {
+		return {
+			status: 'unsupported',
+			message: `Bitbucket Cloud exposes no API for re-running the builds reported on commit ${ref} of ${project.repo}, so its failed checks cannot be re-run automatically`,
+		};
 	}
 
 	/**

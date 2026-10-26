@@ -70,6 +70,7 @@ vi.mock('@/integrations/scm/gitlab/writes.js', () => ({
 	mergeGitLabMergeRequestDirect: vi.fn(),
 	postGitLabMergeRequestNote: vi.fn(),
 	postIdempotentGitLabMergeRequestNote: vi.fn(),
+	retryFailedGitLabPipelines: vi.fn(),
 	submitGitLabReview: vi.fn(),
 }));
 
@@ -97,6 +98,7 @@ import {
 	mergeGitLabMergeRequestDirect,
 	postGitLabMergeRequestNote,
 	postIdempotentGitLabMergeRequestNote,
+	retryFailedGitLabPipelines,
 	submitGitLabReview,
 } from '@/integrations/scm/gitlab/writes.js';
 import type { ScmDeliveryProvider } from '@/scm/delivery.js';
@@ -727,6 +729,57 @@ describe('GitLabSCMIntegration', () => {
 			await expect(scm.updatePullRequestBranch(project, 17, APPROVED_SHA)).resolves.toMatchObject({
 				status: 'unsupported',
 			});
+		});
+	});
+
+	describe('rerunFailedChecks', () => {
+		beforeEach(() => {
+			vi.mocked(getGitLabToken).mockImplementation(async (_p, persona) => `token-${persona}`);
+			vi.mocked(retryFailedGitLabPipelines).mockReset();
+		});
+
+		it('retries as the implementer by default and reports the retried pipelines', async () => {
+			vi.mocked(retryFailedGitLabPipelines).mockResolvedValue(['pipeline #30 (main)']);
+
+			await expect(scm.rerunFailedChecks(project, APPROVED_SHA)).resolves.toEqual({
+				status: 'requested',
+				checks: ['pipeline #30 (main)'],
+			});
+			expect(vi.mocked(getGitLabToken)).toHaveBeenCalledWith(project, 'implementer');
+			expect(vi.mocked(withGitLabToken).mock.calls[0]?.[0]).toBe('token-implementer');
+			expect(retryFailedGitLabPipelines).toHaveBeenCalledWith(project.repo, APPROVED_SHA);
+		});
+
+		it('honours an explicit persona override', async () => {
+			vi.mocked(retryFailedGitLabPipelines).mockResolvedValue([]);
+			await scm.rerunFailedChecks(project, APPROVED_SHA, 'reviewer');
+			expect(vi.mocked(getGitLabToken)).toHaveBeenCalledWith(project, 'reviewer');
+		});
+
+		it('answers nothing-to-rerun when no pipeline failed', async () => {
+			vi.mocked(retryFailedGitLabPipelines).mockResolvedValue([]);
+			await expect(scm.rerunFailedChecks(project, APPROVED_SHA)).resolves.toEqual({
+				status: 'nothing-to-rerun',
+			});
+		});
+
+		it('turns a refused retry into provider-error instead of throwing', async () => {
+			vi.mocked(retryFailedGitLabPipelines).mockRejectedValue(
+				new GitLabApiError(403, 'POST', '/projects/x/pipelines/30/retry', '403 Forbidden'),
+			);
+			await expect(scm.rerunFailedChecks(project, APPROVED_SHA)).resolves.toMatchObject({
+				status: 'provider-error',
+				message: expect.stringContaining('403'),
+			});
+		});
+
+		it('turns an unresolvable token into provider-error instead of throwing', async () => {
+			vi.mocked(getGitLabToken).mockRejectedValue(new Error('No GitLab implementer token'));
+			await expect(scm.rerunFailedChecks(project, APPROVED_SHA)).resolves.toEqual({
+				status: 'provider-error',
+				message: 'No GitLab implementer token',
+			});
+			expect(retryFailedGitLabPipelines).not.toHaveBeenCalled();
 		});
 	});
 

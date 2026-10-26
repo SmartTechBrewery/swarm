@@ -27,6 +27,7 @@ vi.mock('@/integrations/scm/azure-devops/pull-requests.js', () => ({
 	isAzureDevOpsBaseContainedInHead: vi.fn(),
 	listAzureDevOpsPullRequestsForCommit: vi.fn(),
 	listActiveAzureDevOpsPullRequestsForBase: vi.fn(),
+	retryFailedAzureDevOpsBuilds: vi.fn(),
 }));
 // The writes' and delivery builders' own suites prove their requests; here they are
 // stubs, so the merge recheck, completion poll and classification are what is tested.
@@ -72,6 +73,7 @@ import {
 	isAzureDevOpsBaseContainedInHead,
 	listActiveAzureDevOpsPullRequestsForBase,
 	listAzureDevOpsPullRequestsForCommit,
+	retryFailedAzureDevOpsBuilds,
 } from '@/integrations/scm/azure-devops/pull-requests.js';
 import {
 	AzureDevOpsSCMIntegration,
@@ -603,6 +605,68 @@ describe('AzureDevOpsSCMIntegration', () => {
 
 			await expect(merge()).resolves.toMatchObject({ status: 'provider-error' });
 			expect(getAzureDevOpsPullRequestMergeState).not.toHaveBeenCalled();
+		});
+	});
+
+	describe('rerunFailedChecks', () => {
+		const SHA = 'da1560886d4f094c3e6c9ef40349f7d38b5d27d7';
+
+		beforeEach(() => {
+			vi.mocked(getAzureDevOpsToken).mockImplementation(async (_p, persona) =>
+				persona === 'implementer' ? 'pat-impl' : 'pat-rev',
+			);
+			vi.mocked(retryFailedAzureDevOpsBuilds).mockReset();
+		});
+
+		it('retries as the implementer by default and reports the retried builds', async () => {
+			vi.mocked(retryFailedAzureDevOpsBuilds).mockResolvedValue(['Lint']);
+
+			await expect(scm.rerunFailedChecks(project, SHA)).resolves.toEqual({
+				status: 'requested',
+				checks: ['Lint'],
+			});
+			expect(vi.mocked(getAzureDevOpsToken)).toHaveBeenCalledWith(project, 'implementer');
+			expect(vi.mocked(withAzureDevOpsToken).mock.calls[0]?.[0]).toBe('pat-impl');
+			expect(retryFailedAzureDevOpsBuilds).toHaveBeenCalledWith(project.repo, SHA);
+		});
+
+		it('honours an explicit persona override', async () => {
+			vi.mocked(retryFailedAzureDevOpsBuilds).mockResolvedValue([]);
+			await scm.rerunFailedChecks(project, SHA, 'reviewer');
+			expect(vi.mocked(getAzureDevOpsToken)).toHaveBeenCalledWith(project, 'reviewer');
+		});
+
+		it('answers nothing-to-rerun when no build failed', async () => {
+			vi.mocked(retryFailedAzureDevOpsBuilds).mockResolvedValue([]);
+			await expect(scm.rerunFailedChecks(project, SHA)).resolves.toEqual({
+				status: 'nothing-to-rerun',
+			});
+		});
+
+		it('turns a refused retry into provider-error instead of throwing', async () => {
+			vi.mocked(retryFailedAzureDevOpsBuilds).mockRejectedValue(
+				new AzureDevOpsApiError(
+					403,
+					'PATCH',
+					'/fabrikam/proj/_apis/build/builds/39',
+					'Access denied',
+				),
+			);
+			await expect(scm.rerunFailedChecks(project, SHA)).resolves.toMatchObject({
+				status: 'provider-error',
+				message: expect.stringContaining('Access denied'),
+			});
+		});
+
+		it('turns an unresolvable token into provider-error instead of throwing', async () => {
+			vi.mocked(getAzureDevOpsToken).mockRejectedValue(
+				new Error('No Azure DevOps implementer PAT'),
+			);
+			await expect(scm.rerunFailedChecks(project, SHA)).resolves.toEqual({
+				status: 'provider-error',
+				message: 'No Azure DevOps implementer PAT',
+			});
+			expect(retryFailedAzureDevOpsBuilds).not.toHaveBeenCalled();
 		});
 	});
 
