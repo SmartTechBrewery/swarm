@@ -17,6 +17,11 @@ const listActiveMergeDispatchesForRepository = vi.fn(
 const findDispatchByDedupKey = vi.fn(
 	async (_key: string): Promise<DispatchRow | undefined> => undefined,
 );
+// The run's active dispatch: the re-arm's "still due" guard and the hand-back's
+// first lookup (issue #1128). None by default.
+const getActiveDispatchByRunId = vi.fn(
+	async (_runId: string): Promise<DispatchRow | undefined> => undefined,
+);
 const adoptWorkerBranchUpdateIntoWaitingMerge = vi.fn(
 	async (_id: string, _wakeSeq: number, _payload: unknown): Promise<DispatchRow | null> =>
 		mockDispatchRow({ state: 'retry-scheduled' }),
@@ -30,6 +35,7 @@ vi.mock('@/db/repositories/dispatchesRepository.js', async (importOriginal) => (
 		await importOriginal<typeof import('@/db/repositories/dispatchesRepository.js')>()
 	).WAITING_DISPATCH_STATES,
 	findDispatchByDedupKey: (key: string) => findDispatchByDedupKey(key),
+	getActiveDispatchByRunId: (runId: string) => getActiveDispatchByRunId(runId),
 	adoptWorkerBranchUpdateIntoWaitingMerge: (id: string, wakeSeq: number, payload: unknown) =>
 		adoptWorkerBranchUpdateIntoWaitingMerge(id, wakeSeq, payload),
 	completeDispatch: (id: string, outcome: string) => completeDispatch(id, outcome),
@@ -42,7 +48,16 @@ vi.mock('@/db/repositories/dispatchesRepository.js', async (importOriginal) => (
 const updateReviewMergeOutcome = vi.fn(async (_runId: string, _input: unknown) => true);
 // The run-row copy of the superseded stamp (issue #1080), written beside the ledger's.
 const markReviewRunSuperseded = vi.fn(async (_runId: string) => true);
+// The approving run a green head re-arms (issue #1128). None by default.
+const findApprovedReviewRunForRearm = vi.fn(
+	async (
+		_key: unknown,
+		_outcomes: readonly string[],
+	): Promise<{ id: string; taskId: string } | undefined> => undefined,
+);
 vi.mock('@/db/repositories/runsRepository.js', () => ({
+	findApprovedReviewRunForRearm: (key: unknown, outcomes: readonly string[]) =>
+		findApprovedReviewRunForRearm(key, outcomes),
 	updateReviewMergeOutcome: (runId: string, input: unknown) =>
 		updateReviewMergeOutcome(runId, input),
 	markReviewRunSuperseded: (runId: string) => markReviewRunSuperseded(runId),
@@ -130,11 +145,14 @@ import {
 	MERGE_PROVIDER_ERROR_EXHAUSTED,
 	MERGE_QUEUE_RECHECK_MS,
 	MERGE_QUEUED,
+	MERGE_REARM_OUTCOMES,
 	MERGE_RETRY_EXHAUSTED,
 	mergeCatchUpDedupKey,
 	mergeDispatchDedupKey,
+	mergeRearmDedupKey,
 	mergeRetryDelayMs,
 	processMergeAutomationDispatch,
+	rearmMergeAutomationForGreenHead,
 	requestMergeAutomation,
 } from '@/worker/merge-automation.js';
 
@@ -246,6 +264,10 @@ beforeEach(() => {
 	markReviewRunSuperseded.mockResolvedValue(true);
 	findDispatchByDedupKey.mockReset();
 	findDispatchByDedupKey.mockResolvedValue(undefined);
+	getActiveDispatchByRunId.mockReset();
+	getActiveDispatchByRunId.mockResolvedValue(undefined);
+	findApprovedReviewRunForRearm.mockReset();
+	findApprovedReviewRunForRearm.mockResolvedValue(undefined);
 	adoptWorkerBranchUpdateIntoWaitingMerge.mockReset();
 	adoptWorkerBranchUpdateIntoWaitingMerge.mockResolvedValue(
 		mockDispatchRow({ state: 'retry-scheduled' }),
@@ -343,6 +365,83 @@ describe('requestMergeAutomation', () => {
 				approvedHeadSha: 'deadbeef',
 			}),
 		).resolves.toBeUndefined();
+	});
+});
+
+describe('mergeRearmDedupKey', () => {
+	it('keys the re-arm on the Review run and the head', () => {
+		expect(mergeRearmDedupKey('run-1', 'deadbeef')).toBe('merge-rearm:run-1:deadbeef');
+		expect(mergeRearmDedupKey('run-1', 'deadbeef')).toBe(mergeRearmDedupKey('run-1', 'deadbeef'));
+		expect(mergeRearmDedupKey('run-1', 'other')).not.toBe(mergeRearmDedupKey('run-1', 'deadbeef'));
+		expect(mergeRearmDedupKey('run-2', 'deadbeef')).not.toBe(
+			mergeRearmDedupKey('run-1', 'deadbeef'),
+		);
+		expect(mergeRearmDedupKey('run-1', 'deadbeef')).not.toBe(mergeDispatchDedupKey('run-1'));
+	});
+});
+
+describe('rearmMergeAutomationForGreenHead (issue #1128)', () => {
+	const autoMerging = { ...project, autoMerge: true };
+	const input = { project: autoMerging, prNumber: '17', headSha: 'deadbeef' };
+
+	beforeEach(() => {
+		findApprovedReviewRunForRearm.mockResolvedValue({ id: 'run-1', taskId: '17' });
+	});
+
+	it('re-arms one merge dispatch for the approved head, keyed on the run and the head', async () => {
+		await rearmMergeAutomationForGreenHead(input);
+
+		expect(findApprovedReviewRunForRearm).toHaveBeenCalledExactlyOnceWith(
+			{ projectId: project.id, repository: project.repo, prNumber: '17', headSha: 'deadbeef' },
+			MERGE_REARM_OUTCOMES,
+		);
+		expect(MERGE_REARM_OUTCOMES).toEqual(['not-eligible', MERGE_RETRY_EXHAUSTED]);
+		expect(getActiveDispatchByRunId).toHaveBeenCalledExactlyOnceWith('run-1');
+		expect(createAndPublishDispatch).toHaveBeenCalledExactlyOnceWith({
+			projectId: project.id,
+			jobPayload: job,
+			dedupKey: 'merge-rearm:run-1:deadbeef',
+			source: 'synthetic',
+			runId: 'run-1',
+			taskId: '17',
+			phase: 'merge-automation',
+		});
+	});
+
+	it('does nothing while merge automation is off for the repository', async () => {
+		await rearmMergeAutomationForGreenHead({ ...input, project: { ...project, autoMerge: false } });
+
+		expect(findApprovedReviewRunForRearm).not.toHaveBeenCalled();
+		expect(createAndPublishDispatch).not.toHaveBeenCalled();
+	});
+
+	it('does nothing when no approval of this head stopped with a re-armable outcome', async () => {
+		findApprovedReviewRunForRearm.mockResolvedValue(undefined);
+
+		await rearmMergeAutomationForGreenHead(input);
+
+		expect(createAndPublishDispatch).not.toHaveBeenCalled();
+	});
+
+	it('does nothing while the approving run still has a dispatch due', async () => {
+		getActiveDispatchByRunId.mockResolvedValue(mockDispatchRow({ state: 'retry-scheduled' }));
+
+		await rearmMergeAutomationForGreenHead(input);
+
+		expect(createAndPublishDispatch).not.toHaveBeenCalled();
+	});
+
+	it('mints no duplicate when the head was already re-armed', async () => {
+		createAndPublishDispatch.mockResolvedValue({ dispatch: mockDispatchRow(), created: false });
+
+		await expect(rearmMergeAutomationForGreenHead(input)).resolves.toBeUndefined();
+		expect(createAndPublishDispatch).toHaveBeenCalledOnce();
+	});
+
+	it('is best-effort: a creation failure is swallowed, never thrown', async () => {
+		createAndPublishDispatch.mockRejectedValue(new Error('db down'));
+
+		await expect(rearmMergeAutomationForGreenHead(input)).resolves.toBeUndefined();
 	});
 });
 
@@ -731,6 +830,9 @@ describe('processMergeAutomationDispatch: an approved head whose checks are not 
 		expect(body).toContain('`deadbeef`');
 		expect(body).toContain('Respond-to-CI');
 		expect(body).toContain('Generated by SWARM');
+		// A head re-run green is re-armed (issue #1128), not left for a hand merge.
+		expect(body).toContain('SWARM merges this head');
+		expect(body).not.toContain('merge by hand');
 		// Not the stale-base wording: nothing here is about the base.
 		expect(body).not.toContain('nothing has built against the');
 		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
@@ -784,6 +886,25 @@ describe('processMergeAutomationDispatch: an approved head whose checks are not 
 		expect(recorded.message).toMatch(/^waiting for the checks on the approved head/);
 		expect(recorded.message).toContain('test');
 		expect(outcome.result).toBe('retry-scheduled');
+	});
+
+	it('gives up on a head whose checks stay pending, saying SWARM merges it once they are green', async () => {
+		await processMergeAutomationDispatch(
+			mockDispatchRow({ attempt: MAX_MERGE_RETRIES }),
+			job,
+			project,
+			{ getAggregateCheckStatus: checksPending() },
+		);
+
+		const recorded = updateReviewMergeOutcome.mock.calls.at(-1)?.[1] as {
+			status: string;
+			message: string;
+		};
+		expect(recorded.status).toBe(MERGE_RETRY_EXHAUSTED);
+		// Re-armed once its checks complete green (issue #1128).
+		expect(recorded.message).toContain('SWARM merges it once its checks complete green');
+		expect(recorded.message).not.toContain('manual merge');
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-retry-exhausted');
 	});
 
 	it('merges a pending approved head once its checks turn green', async () => {
@@ -1664,6 +1785,24 @@ describe('adoptWorkerBranchUpdate', () => {
 
 		expect(adoptWorkerBranchUpdateIntoWaitingMerge).not.toHaveBeenCalled();
 		expect(noSleep).not.toHaveBeenCalled();
+	});
+
+	it("hands the result to a re-armed merge dispatch, the run's active one (issue #1128)", async () => {
+		getActiveDispatchByRunId.mockResolvedValue(
+			mockDispatchRow({ id: 'rearmed', state: 'retry-scheduled', wakeSeq: 2, jobPayload: waiting }),
+		);
+
+		expect(await adoptWorkerBranchUpdate(input, noSleep)).toBe(true);
+
+		expect(getActiveDispatchByRunId).toHaveBeenCalledWith('run-1');
+		expect(findDispatchByDedupKey).not.toHaveBeenCalled();
+		expect(adoptWorkerBranchUpdateIntoWaitingMerge).toHaveBeenCalledExactlyOnceWith(
+			'rearmed',
+			2,
+			expect.objectContaining({
+				workerCatchUp: { requestedFor: 'deadbeef', result: input.outcome },
+			}),
+		);
 	});
 
 	it('reads a merge dispatch caught mid-attempt again until it is waiting', async () => {

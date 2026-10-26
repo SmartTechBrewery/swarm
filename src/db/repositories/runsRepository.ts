@@ -1495,6 +1495,55 @@ export async function updateReviewMergeOutcome(
 	return rows.length > 0;
 }
 
+/** Which pull-request head {@link findApprovedReviewRunForRearm} asks about. */
+export interface ApprovedReviewRunForRearmKey {
+	projectId: string;
+	repository: string;
+	prNumber: string;
+	headSha: string;
+}
+
+/**
+ * The latest completed, still-counting Review run that approved this pull
+ * request's `headSha` and whose merge stopped with one of `outcomes` — the run a
+ * green `checks` event re-arms merge automation for (issue #1128,
+ * `rearmMergeAutomationForGreenHead`).
+ *
+ * Keyed on `reviewMergeApprovedHeadSha`, the head the run's current merge
+ * generation covers, so a run whose dispatch advanced onto another head (a base
+ * update, issue #874) is no longer re-armed for this one. `outcomes` is passed by
+ * the caller because the set of re-armable stops belongs to merge automation, not
+ * to this layer.
+ */
+export async function findApprovedReviewRunForRearm(
+	key: ApprovedReviewRunForRearmKey,
+	outcomes: readonly string[],
+): Promise<{ id: string; taskId: string } | undefined> {
+	if (outcomes.length === 0) return undefined;
+	const rows = await getDb()
+		.select()
+		.from(runs)
+		.where(
+			and(
+				eq(runs.kind, PIPELINE_RUN_KIND),
+				eq(runs.phase, 'review'),
+				eq(runs.status, 'completed'),
+				eq(runs.reviewVerdict, 'approve'),
+				eq(runs.projectId, key.projectId),
+				eq(runs.repository, key.repository),
+				eq(runs.prNumber, key.prNumber),
+				eq(runs.reviewMergeApprovedHeadSha, key.headSha),
+				isNull(runs.reviewSupersededAt),
+				inArray(runs.reviewMergeOutcome, [...outcomes]),
+			),
+		)
+		.orderBy(desc(runs.completedAt))
+		.limit(1);
+	const run = rows[0];
+	if (!run || !isPipelineRun(run)) return undefined;
+	return { id: run.id, taskId: run.taskId };
+}
+
 /**
  * Stamp a Review run's approval as superseded by a head change (issue #1079) —
  * the run-row copy of the ledger's `markReviewVerdictSuperseded`, written by the

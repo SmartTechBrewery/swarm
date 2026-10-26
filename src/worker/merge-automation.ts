@@ -63,7 +63,9 @@
  * per-repository `reviewChecks` policy the pipeline itself uses: a red head is
  * refused terminally with a PR comment and left to Respond-to-CI, a pending one
  * waits on the ordinary bounded budget (keeping its merge-queue turn), and only a
- * green one is offered to the merge capability.
+ * green one is offered to the merge capability. A head refused while red, or
+ * given up on while pending, is re-armed once when its checks later complete
+ * green (issue #1128, {@link rearmMergeAutomationForGreenHead}).
  *
  * **A refusal the head caused frees the approval's cap slot (issue #1079).**
  * When a terminal `not-eligible` is explained *only* by the pull request's head
@@ -125,12 +127,14 @@ import {
 	type DispatchWaitReason,
 	EXECUTING_DISPATCH_STATES,
 	findDispatchByDedupKey,
+	getActiveDispatchByRunId,
 	listActiveMergeDispatchesForRepository,
 	scheduleDispatchRetry,
 	WAITING_DISPATCH_STATES,
 } from '../db/repositories/dispatchesRepository.js';
 import { markReviewVerdictSuperseded } from '../db/repositories/reviewVerdictsRepository.js';
 import {
+	findApprovedReviewRunForRearm,
 	markReviewRunSuperseded,
 	updateReviewMergeOutcome,
 } from '../db/repositories/runsRepository.js';
@@ -259,13 +263,35 @@ export function mergeRetryDelayMs(attempt: number): number {
 /**
  * The dispatch dedup identity for a Review run's merge intent. Keyed on the
  * run (not the PR/head) so each approving Review run carries exactly one
- * durable merge dispatch for all time — a crash-retried creation, a webhook
+ * durable *initial* merge dispatch — a crash-retried creation, a webhook
  * redelivery, or the startup backfill can never mint a second — while a fresh
- * approval (a new Review run) still gets its own.
+ * approval (a new Review run) still gets its own. The one other merge dispatch a
+ * run can carry is a re-arm, once per approved head ({@link mergeRearmDedupKey}).
  */
 export function mergeDispatchDedupKey(reviewRunId: string): string {
 	return `merge:${reviewRunId}`;
 }
+
+/**
+ * The dedup identity of the one merge re-arm a Review run gets for an approved
+ * head whose checks later complete green (issue #1128,
+ * {@link rearmMergeAutomationForGreenHead}). Keyed on the run *and* the head, so
+ * sibling `checks` events and redeliveries for that head mint nothing more.
+ */
+export function mergeRearmDedupKey(reviewRunId: string, headSha: string): string {
+	return `merge-rearm:${reviewRunId}:${headSha}`;
+}
+
+/**
+ * The merge outcomes a now-green approved head can clear (issue #1128): the
+ * red-head refusal (`not-eligible`, issue #1124) and a budget spent waiting for
+ * the approved head's pending checks ({@link MERGE_RETRY_EXHAUSTED}). A
+ * `not-eligible` with another cause is re-armed too and refused again, harmlessly,
+ * because the merge re-verifies the approval and the head. `policy-blocked`,
+ * `unsupported` and {@link MERGE_PROVIDER_ERROR_EXHAUSTED} are left out: a green
+ * head changes none of them.
+ */
+export const MERGE_REARM_OUTCOMES = ['not-eligible', MERGE_RETRY_EXHAUSTED] as const;
 
 /** The outcome `processJob` returns for a settled merge-automation dispatch. */
 export interface MergeAutomationSettledOutcome {
@@ -297,22 +323,15 @@ export interface RequestMergeAutomationInput {
  * into a failed job.
  */
 export async function requestMergeAutomation(input: RequestMergeAutomationInput): Promise<void> {
-	const job: MergeAutomationJob = {
-		type: 'merge-automation',
-		projectId: input.project.id,
-		reviewRunId: input.reviewRunId,
-		repo: input.project.repo,
-		prNumber: input.prNumber,
-		approvedHeadSha: input.approvedHeadSha,
-		// The same SHA today, and deliberately a second field: `approvedHeadSha` is
-		// re-written by a base update (issue #874) while the ledger slot stays where
-		// the review was (issue #1079).
-		reviewedHeadSha: input.approvedHeadSha,
-	};
 	try {
 		const { dispatch, created } = await createAndPublishDispatch({
 			projectId: input.project.id,
-			jobPayload: job,
+			jobPayload: buildMergeAutomationJob(
+				input.project,
+				input.reviewRunId,
+				input.prNumber,
+				input.approvedHeadSha,
+			),
 			dedupKey: mergeDispatchDedupKey(input.reviewRunId),
 			source: 'synthetic',
 			runId: input.reviewRunId,
@@ -334,6 +353,102 @@ export async function requestMergeAutomation(input: RequestMergeAutomationInput)
 		logger.error('Failed to persist merge dispatch after Review approval', {
 			runId: input.reviewRunId,
 			prNumber: input.prNumber,
+			error: describeError(err),
+		});
+	}
+}
+
+/** The payload of a merge dispatch for the head a Review run approved. */
+function buildMergeAutomationJob(
+	project: ProjectConfig,
+	reviewRunId: string,
+	prNumber: string,
+	headSha: string,
+): MergeAutomationJob {
+	return {
+		type: 'merge-automation',
+		projectId: project.id,
+		reviewRunId,
+		repo: project.repo,
+		prNumber,
+		approvedHeadSha: headSha,
+		// The same SHA today, and deliberately a second field: `approvedHeadSha` is
+		// re-written by a base update (issue #874) while the ledger slot stays where
+		// the review was (issue #1079).
+		reviewedHeadSha: headSha,
+	};
+}
+
+export interface RearmMergeAutomationInput {
+	project: ProjectConfig;
+	prNumber: string;
+	/** The head whose checks just completed green. */
+	headSha: string;
+}
+
+/**
+ * Re-arm merge automation for an approved head whose checks have since completed
+ * green (issue #1128) — called by the `pr-review` trigger when a green aggregate
+ * meets a review-verdict slot already `submitted` for that head, instead of
+ * dropping the event as a same-head retry.
+ *
+ * The head's own merge dispatch stopped while it was red or pending ({@link
+ * MERGE_REARM_OUTCOMES}), and its `merge:<reviewRunId>` key can never be created
+ * again, so this creates one more under {@link mergeRearmDedupKey} — at most one
+ * per (approving run, head). It is the ordinary merge dispatch: it re-reads the
+ * head's checks before merging, so a head that reads red again is still refused
+ * (issue #1124), and it takes its turn on the merge queue.
+ *
+ * Does nothing unless merge automation is on for the repository (the rule
+ * `requestMergeAutomationForApproval` applies), a Review run approved this head
+ * and its merge stopped with a re-armable outcome without being superseded, and
+ * no dispatch is still active on that run — an active merge dispatch reads the
+ * green head itself. Best-effort like {@link requestMergeAutomation}: a failure
+ * is logged, never thrown, so it cannot fail the trigger evaluation.
+ */
+export async function rearmMergeAutomationForGreenHead({
+	project,
+	prNumber,
+	headSha,
+}: RearmMergeAutomationInput): Promise<void> {
+	if (project.autoMerge !== true) return;
+	const context = { projectId: project.id, prNumber, headSha };
+	try {
+		const run = await findApprovedReviewRunForRearm(
+			{ projectId: project.id, repository: project.repo, prNumber, headSha },
+			MERGE_REARM_OUTCOMES,
+		);
+		if (!run) {
+			logger.debug('Merge automation: no stopped approval to re-arm for this head', context);
+			return;
+		}
+		const active = await getActiveDispatchByRunId(run.id);
+		if (active) {
+			logger.debug('Merge automation: the approving run still has a dispatch due — not re-arming', {
+				...context,
+				runId: run.id,
+				dispatchId: active.id,
+			});
+			return;
+		}
+		const { dispatch, created } = await createAndPublishDispatch({
+			projectId: project.id,
+			jobPayload: buildMergeAutomationJob(project, run.id, prNumber, headSha),
+			dedupKey: mergeRearmDedupKey(run.id, headSha),
+			source: 'synthetic',
+			runId: run.id,
+			taskId: run.taskId,
+			phase: 'merge-automation',
+		});
+		logger.info(
+			created
+				? 'Merge automation: re-armed for an approved head whose checks turned green'
+				: 'Merge automation: already re-armed for this head — not duplicating',
+			{ ...context, runId: run.id, dispatchId: dispatch.id },
+		);
+	} catch (err) {
+		logger.error('Failed to re-arm merge automation for a green approved head', {
+			...context,
 			error: describeError(err),
 		});
 	}
@@ -410,7 +525,7 @@ function exhaustionMessage(
 	if (baseUpdatesSpent(job) > 0)
 		return `Merge automation brought this pull request's head up to date with its base and gave up after ${MAX_MERGE_RETRIES + 1} attempts waiting for that head to become mergeable; the pull request is approved but was left open for a manual merge. Last reason: ${lastMessage}`;
 	if (lastMessage.startsWith(WAITING_FOR_APPROVED_HEAD_CHECKS))
-		return `Merge automation waited ${MAX_MERGE_RETRIES + 1} attempts for the approved head's checks to finish and gave up; the pull request is approved but was left open for a manual merge once its checks are green. Last reason: ${lastMessage}`;
+		return `Merge automation waited ${MAX_MERGE_RETRIES + 1} attempts for the approved head's checks to finish and gave up; the pull request is approved and left open, and SWARM merges it once its checks complete green. Last reason: ${lastMessage}`;
 	return 'Merge automation gave up after repeated not-ready results; the pull request is approved but was left open for a manual merge.';
 }
 
@@ -1296,7 +1411,11 @@ async function tryAdoptWorkerBranchUpdate(
 	input: AdoptWorkerBranchUpdateInput,
 	context: Record<string, unknown>,
 ): Promise<'adopted' | 'dropped' | 'busy'> {
-	const dispatch = await findDispatchByDedupKey(mergeDispatchDedupKey(input.reviewRunId));
+	// The run's active dispatch first: a re-armed merge (issue #1128) is not keyed
+	// `merge:<reviewRunId>`, and a run carries at most one active dispatch.
+	const dispatch =
+		(await getActiveDispatchByRunId(input.reviewRunId)) ??
+		(await findDispatchByDedupKey(mergeDispatchDedupKey(input.reviewRunId)));
 	const payload = dispatch ? normalizeStoredJobPayload(dispatch.jobPayload) : undefined;
 	const waiting = WAITING_DISPATCH_STATES.some((state) => state === dispatch?.state);
 	const executing = EXECUTING_DISPATCH_STATES.some((state) => state === dispatch?.state);
@@ -1603,7 +1722,7 @@ async function refuseRedHead(
 				)
 			: mergeRefusalCommentBody(
 					`The review approved head \`${job.approvedHeadSha}\`, but that head fails its checks: ${failed}.`,
-					'SWARM handles the failing checks the same way as for any red pull request (Respond-to-CI, when it is enabled for this repository), and a fixed head gets its own review before it can merge. If the failure was spurious, re-run the failing checks and merge by hand once they are green — SWARM does not retry this merge for the same head.',
+					'SWARM handles the failing checks the same way as for any red pull request (Respond-to-CI, when it is enabled for this repository), and a fixed head gets its own review before it can merge. If the failure was spurious, re-run the failing checks: once they pass, SWARM merges this head — it re-arms the merge once per approved head.',
 					RED_HEAD_CONSEQUENCE,
 				),
 	);

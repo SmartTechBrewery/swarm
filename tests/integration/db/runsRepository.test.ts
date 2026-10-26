@@ -21,6 +21,7 @@ import {
 	createWorkerUpdateRun,
 	failOrphanedRunningRuns,
 	failStaleRunningRuns,
+	findApprovedReviewRunForRearm,
 	findBoardItemIdForTask,
 	getLatestCompletedPlanningScope,
 	getLatestRunForTask,
@@ -2670,6 +2671,105 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 
 		it('reports a run id that matches no row', async () => {
 			expect(await markReviewRunSuperseded('00000000-0000-0000-0000-000000000000')).toBe(false);
+		});
+	});
+
+	describe('findApprovedReviewRunForRearm (issue #1128)', () => {
+		const OUTCOMES = ['not-eligible', 'retry-exhausted'] as const;
+		const key = { projectId: PROJECT_ID, repository: REPO, prNumber: '70', headSha: 'sha-h' };
+
+		/** A completed Review run on PR 70 whose merge stopped with `outcome` at `head`. */
+		async function approvedRun(
+			taskId: string,
+			opts: {
+				verdict?: 'approve' | 'request-changes';
+				outcome?: string;
+				head?: string;
+				prNumber?: string;
+				repository?: string;
+			} = {},
+		): Promise<string> {
+			const id = await createRun({
+				projectId: PROJECT_ID,
+				taskId,
+				phase: 'review',
+				prNumber: opts.prNumber ?? '70',
+				repository: opts.repository ?? REPO,
+			});
+			await completeRun(id, {
+				status: 'completed',
+				engine: 'claude',
+				reviewVerdict: opts.verdict ?? 'approve',
+			});
+			await updateReviewMergeOutcome(id, {
+				status: opts.outcome ?? 'not-eligible',
+				message: 'stopped',
+				attempt: 0,
+				approvedHeadSha: opts.head ?? 'sha-h',
+			});
+			return id;
+		}
+
+		it('finds the approval whose merge stopped at this head with a re-armable outcome', async () => {
+			const id = await approvedRun('70');
+
+			expect(await findApprovedReviewRunForRearm(key, OUTCOMES)).toEqual({ id, taskId: '70' });
+		});
+
+		it('also finds one that exhausted its wait for the head’s checks', async () => {
+			const id = await approvedRun('70', { outcome: 'retry-exhausted' });
+
+			expect(await findApprovedReviewRunForRearm(key, OUTCOMES)).toEqual({ id, taskId: '70' });
+		});
+
+		it.each([
+			['a request-changes verdict', { verdict: 'request-changes' as const }],
+			['a merged outcome', { outcome: 'merged' }],
+			['a policy-blocked outcome', { outcome: 'policy-blocked' }],
+			['another pull request', { prNumber: '71' }],
+			['another repository', { repository: OTHER_REPO }],
+			['a merge generation advanced onto another head', { head: 'sha-updated' }],
+		])('ignores %s', async (_label, opts) => {
+			await approvedRun('70', opts);
+
+			expect(await findApprovedReviewRunForRearm(key, OUTCOMES)).toBeUndefined();
+		});
+
+		it('ignores a run with no merge outcome yet', async () => {
+			const id = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '70',
+				phase: 'review',
+				prNumber: '70',
+			});
+			await completeRun(id, { status: 'completed', engine: 'claude', reviewVerdict: 'approve' });
+
+			expect(await findApprovedReviewRunForRearm(key, OUTCOMES)).toBeUndefined();
+		});
+
+		it('ignores a superseded approval', async () => {
+			const id = await approvedRun('70');
+			await markReviewRunSuperseded(id);
+
+			expect(await findApprovedReviewRunForRearm(key, OUTCOMES)).toBeUndefined();
+		});
+
+		it('returns the latest of two matching approvals', async () => {
+			const older = await approvedRun('70');
+			const newer = await approvedRun('70');
+			await getDb()
+				.update(runs)
+				.set({ completedAt: new Date('2026-01-01T00:00:00Z') })
+				.where(eq(runs.id, older));
+			await getDb()
+				.update(runs)
+				.set({ completedAt: new Date('2026-01-02T00:00:00Z') })
+				.where(eq(runs.id, newer));
+
+			expect(await findApprovedReviewRunForRearm(key, OUTCOMES)).toEqual({
+				id: newer,
+				taskId: '70',
+			});
 		});
 	});
 
