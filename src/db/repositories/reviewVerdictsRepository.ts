@@ -504,6 +504,68 @@ export async function markReviewVerdictSuperseded(key: ReviewVerdictKey): Promis
 	return rows.length > 0;
 }
 
+/** The `WHERE` clause of this head's *submitted approval* — the only slot the approved-head stamps below touch. */
+function submittedApprovalOf(key: ReviewVerdictKey) {
+	return and(
+		eq(reviewVerdicts.projectId, key.projectId),
+		eq(reviewVerdicts.repository, key.repository),
+		eq(reviewVerdicts.prNumber, key.prNumber),
+		eq(reviewVerdicts.headSha, key.headSha),
+		eq(reviewVerdicts.state, 'submitted'),
+		eq(reviewVerdicts.verdict, 'approve'),
+	);
+}
+
+/**
+ * Claim this approved head's one automatic re-run of its failed checks (issue
+ * #1128, `src/dispatch/approved-head-checks-rerun.ts`). Conditional on a
+ * `submitted` `approve` slot with no {@link reviewVerdicts.checksRerunAt} stamp
+ * yet, so of every event that reaches an adjudicated red approved head exactly
+ * one wins and re-runs; a second caller, a head that was not approved and a key
+ * no slot exists for all answer `false`.
+ */
+export async function claimApprovedHeadChecksRerun(key: ReviewVerdictKey): Promise<boolean> {
+	const rows = await getDb()
+		.update(reviewVerdicts)
+		.set({ checksRerunAt: new Date() })
+		.where(and(submittedApprovalOf(key), isNull(reviewVerdicts.checksRerunAt)))
+		.returning({ id: reviewVerdicts.id });
+	return rows.length > 0;
+}
+
+/** This head's submitted approval, projected for the approved-head re-run policy (issue #1128). */
+export interface ApprovedHeadSlot {
+	/** When SWARM re-ran this head's failed checks, or `null` while that re-run is unspent. */
+	checksRerunAt: Date | null;
+}
+
+/** This head's `submitted` `approve` slot, or `undefined` when the head was not approved. */
+export async function getApprovedHeadSlot(
+	key: ReviewVerdictKey,
+): Promise<ApprovedHeadSlot | undefined> {
+	const rows = await getDb()
+		.select({ checksRerunAt: reviewVerdicts.checksRerunAt })
+		.from(reviewVerdicts)
+		.where(submittedApprovalOf(key))
+		.limit(1);
+	return rows[0];
+}
+
+/**
+ * Claim the once-only operator notice for this approved head (issue #1128) —
+ * the {@link claimApprovedHeadChecksRerun} twin over
+ * {@link reviewVerdicts.operatorNotifiedAt}, so every red event after the
+ * re-run failed finds the notice already written.
+ */
+export async function claimApprovedHeadOperatorNotice(key: ReviewVerdictKey): Promise<boolean> {
+	const rows = await getDb()
+		.update(reviewVerdicts)
+		.set({ operatorNotifiedAt: new Date() })
+		.where(and(submittedApprovalOf(key), isNull(reviewVerdicts.operatorNotifiedAt)))
+		.returning({ id: reviewVerdicts.id });
+	return rows.length > 0;
+}
+
 export interface ReviewVerdictRecord {
 	ordinal: number;
 	state: ReviewVerdictState;

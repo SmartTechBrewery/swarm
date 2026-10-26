@@ -87,6 +87,9 @@ const createAndPublishDispatch = vi.fn(async (_input: unknown) => ({
 const publishDispatchWakeUp = vi.fn(async (_dispatch: unknown) => {});
 const promoteMergeQueueWaits = vi.fn(async (_projectId: string, _repo: string) => false);
 vi.mock('@/dispatch/dispatcher.js', () => ({
+	// The `no-fix` recovery's dedup key a red approved head's adjudication is read
+	// under (issue #1128); `findDispatchByDedupKey` answers "none" by default.
+	deliveryDedupKey: (deliveryId: string) => `delivery:${deliveryId}`,
 	createAndPublishDispatch: (input: unknown) => createAndPublishDispatch(input),
 	publishDispatchWakeUp: (dispatch: unknown) => publishDispatchWakeUp(dispatch),
 	promoteMergeQueueWaits: (projectId: string, repo: string) =>
@@ -2476,5 +2479,151 @@ describe('processMergeAutomationDispatch: the merge queue (issue #1114)', () => 
 
 		expect(mergePullRequest).toHaveBeenCalledTimes(1);
 		expect(outcome.result).toBe('merged');
+	});
+});
+
+// Issue #1128 — a red approved head whose red SWARM's own CI agent already judged
+// not to be the pull request's fault (`no-fix`, then the hand-back's Review
+// approving it, then this merge). Respond-to-CI already declined it, so the
+// approved-head re-run policy acts instead of leaving it to Respond-to-CI.
+describe('processMergeAutomationDispatch: an adjudicated red approved head (issue #1128)', () => {
+	function commentSpy() {
+		return vi.fn(async (_p: unknown, _n: number, _body: string, _persona?: string) => 1);
+	}
+
+	function adjudicated(outcome: 'rerun-requested' | 'rerun-settling' | 'needs-operator') {
+		return {
+			hasCiNoFixRecovery: vi.fn(async () => true),
+			recoverAdjudicatedApprovedHead: vi.fn(async () => outcome),
+		};
+	}
+
+	it('re-runs the failing checks, says so, and settles without merging', async () => {
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged' });
+		const commentOnPullRequest = commentSpy();
+		const policy = adjudicated('rerun-requested');
+
+		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest,
+			getAggregateCheckStatus: checksConcluding('success', 'failure'),
+			commentOnPullRequest,
+			...policy,
+		});
+
+		expect(mergePullRequest).not.toHaveBeenCalled();
+		expect(policy.hasCiNoFixRecovery).toHaveBeenCalledWith(project, '17', 'deadbeef');
+		expect(policy.recoverAdjudicatedApprovedHead).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({
+				project,
+				prNumber: '17',
+				headSha: 'deadbeef',
+				failedChecks: ['check-1'],
+			}),
+		);
+		expect(updateReviewMergeOutcome).toHaveBeenCalledExactlyOnceWith('run-1', {
+			status: 'not-eligible',
+			message: expect.stringContaining('re-ran the failing checks'),
+			attempt: 0,
+			approvedHeadSha: 'deadbeef',
+		});
+		expect(commentOnPullRequest).toHaveBeenCalledOnce();
+		const body = commentOnPullRequest.mock.calls[0]?.[2] as string;
+		expect(body).toContain("SWARM's CI agent judged the failure unrelated");
+		expect(body).toContain('re-ran the failing checks');
+		expect(body).toContain('SWARM merges this head');
+		// Not the #1124 wording: Respond-to-CI already declined this head.
+		expect(body).not.toContain('Respond-to-CI');
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
+		expect(markReviewVerdictSuperseded).not.toHaveBeenCalled();
+		expect(outcome.result).toBe('not-eligible');
+	});
+
+	it.each([
+		'needs-operator',
+		'rerun-settling',
+	] as const)('settles %s without a second comment — the operator notice is the comment', async (result) => {
+		const commentOnPullRequest = commentSpy();
+
+		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning({ status: 'merged', message: 'merged' }),
+			getAggregateCheckStatus: checksConcluding('failure'),
+			commentOnPullRequest,
+			...adjudicated(result),
+		});
+
+		expect(commentOnPullRequest).not.toHaveBeenCalled();
+		expect(updateReviewMergeOutcome).toHaveBeenCalledExactlyOnceWith(
+			'run-1',
+			expect.objectContaining({ status: 'not-eligible' }),
+		);
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
+		expect(outcome.result).toBe('not-eligible');
+	});
+
+	it('keeps the #1124 refusal for a red that was never adjudicated', async () => {
+		const commentOnPullRequest = commentSpy();
+		const recoverAdjudicatedApprovedHead = vi.fn(async () => 'rerun-requested' as const);
+
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning({ status: 'merged', message: 'merged' }),
+			getAggregateCheckStatus: checksConcluding('failure'),
+			commentOnPullRequest,
+			hasCiNoFixRecovery: vi.fn(async () => false),
+			recoverAdjudicatedApprovedHead,
+		});
+
+		expect(recoverAdjudicatedApprovedHead).not.toHaveBeenCalled();
+		expect(commentOnPullRequest.mock.calls[0]?.[2]).toContain('Respond-to-CI');
+	});
+
+	it('keeps the #1124 refusal when the policy does not apply', async () => {
+		const commentOnPullRequest = commentSpy();
+
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning({ status: 'merged', message: 'merged' }),
+			getAggregateCheckStatus: checksConcluding('failure'),
+			commentOnPullRequest,
+			hasCiNoFixRecovery: vi.fn(async () => true),
+			recoverAdjudicatedApprovedHead: vi.fn(async () => 'not-applicable' as const),
+		});
+
+		expect(commentOnPullRequest.mock.calls[0]?.[2]).toContain('Respond-to-CI');
+	});
+
+	it('leaves a red updated head to the #874 refusal, unadjudicated', async () => {
+		const advanced: MergeAutomationJob = {
+			...job,
+			approvedHeadSha: 'merged-with-base',
+			baseUpdates: 1,
+		};
+		const commentOnPullRequest = commentSpy();
+		const policy = adjudicated('rerun-requested');
+
+		await processMergeAutomationDispatch(mockDispatchRow(), advanced, project, {
+			mergePullRequest: mergeReturning({ status: 'merged', message: 'merged' }),
+			getAggregateCheckStatus: checksConcluding('failure'),
+			commentOnPullRequest,
+			...policy,
+		});
+
+		expect(policy.hasCiNoFixRecovery).not.toHaveBeenCalled();
+		expect(policy.recoverAdjudicatedApprovedHead).not.toHaveBeenCalled();
+		expect(commentOnPullRequest.mock.calls[0]?.[2]).toContain('Each side is green on its own');
+	});
+
+	it('keeps the #1124 refusal when the adjudication cannot be read', async () => {
+		const commentOnPullRequest = commentSpy();
+
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning({ status: 'merged', message: 'merged' }),
+			getAggregateCheckStatus: checksConcluding('failure'),
+			commentOnPullRequest,
+			hasCiNoFixRecovery: vi.fn(async () => {
+				throw new Error('db down');
+			}),
+		});
+
+		expect(commentOnPullRequest.mock.calls[0]?.[2]).toContain('Respond-to-CI');
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
 	});
 });

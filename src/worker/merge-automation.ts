@@ -139,6 +139,11 @@ import {
 	updateReviewMergeOutcome,
 } from '../db/repositories/runsRepository.js';
 import { settleAbsorbedChildren } from '../dispatch/absorbed-child-settle.js';
+import {
+	type AdjudicatedApprovedHeadOutcome,
+	recoverAdjudicatedApprovedHead,
+} from '../dispatch/approved-head-checks-rerun.js';
+import { hasCiNoFixRecovery } from '../dispatch/ci-no-fix-recovery.js';
 import { classifyDispatchClaim } from '../dispatch/claim-liveness.js';
 import {
 	createAndPublishDispatch,
@@ -579,7 +584,20 @@ export interface MergeAutomationCapabilities {
 	 * {@link requestMergeCatchUp}, and is injectable for the same reason the rest is.
 	 */
 	requestMergeCatchUp?: (input: RequestMergeCatchUpInput) => Promise<void>;
+	/**
+	 * Not provider capabilities either: whether SWARM's CI agent adjudicated a red
+	 * approved head as `no-fix`, and the approved-head re-run policy that head goes
+	 * through (issue #1128). Default to the real ones; injectable for the same reason.
+	 */
+	hasCiNoFixRecovery?: typeof hasCiNoFixRecovery;
+	recoverAdjudicatedApprovedHead?: typeof recoverAdjudicatedApprovedHead;
 }
+
+/** The {@link MergeAutomationCapabilities} the project's registered provider supplies. */
+type ProviderCapability = Exclude<
+	keyof MergeAutomationCapabilities,
+	'requestMergeCatchUp' | 'hasCiNoFixRecovery' | 'recoverAdjudicatedApprovedHead'
+>;
 
 /**
  * One capability off the project's registered provider, resolved fresh at the
@@ -588,7 +606,7 @@ export interface MergeAutomationCapabilities {
  * and that has to land on the same `provider-error` path as any other provider
  * failure rather than escaping `processJob`.
  */
-function scmCapability<K extends Exclude<keyof MergeAutomationCapabilities, 'requestMergeCatchUp'>>(
+function scmCapability<K extends ProviderCapability>(
 	project: ProjectConfig,
 	key: K,
 ): NonNullable<MergeAutomationCapabilities[K]> {
@@ -1690,6 +1708,61 @@ async function settleChildrenThisMergeAbsorbed(
 }
 
 /**
+ * Put a red **approved** head through the approved-head re-run policy (issue
+ * #1128) when SWARM's own CI agent already adjudicated its red as `no-fix` — the
+ * Review that approved it was the `no-fix` hand-back's (approve-after-adjudication
+ * ordering), so nothing else will ever act on it. `not-applicable` for a head this
+ * dispatch produced by a base update (#874 — that red is the combination's, and
+ * real), for a red nobody adjudicated, and on any failure to tell — each of which
+ * keeps the #1124 refusal unchanged. Never throws.
+ */
+async function adjudicateRedApprovedHead(
+	job: MergeAutomationJob,
+	project: ProjectConfig,
+	failedChecks: string[],
+	capabilities: MergeAutomationCapabilities,
+): Promise<AdjudicatedApprovedHeadOutcome> {
+	if (baseUpdatesSpent(job) > 0) return 'not-applicable';
+	try {
+		const adjudicated = await (capabilities.hasCiNoFixRecovery ?? hasCiNoFixRecovery)(
+			project,
+			job.prNumber,
+			job.approvedHeadSha,
+		);
+		if (!adjudicated) return 'not-applicable';
+		const recover = capabilities.recoverAdjudicatedApprovedHead ?? recoverAdjudicatedApprovedHead;
+		return await recover({
+			project,
+			scm: requireProjectSCMProvider(project),
+			prNumber: job.prNumber,
+			headSha: job.approvedHeadSha,
+			failedChecks,
+		});
+	} catch (err) {
+		logger.error('Merge automation: could not apply the approved-head re-run policy', {
+			runId: job.reviewRunId,
+			prNumber: job.prNumber,
+			headSha: job.approvedHeadSha,
+			error: describeError(err),
+		});
+		return 'not-applicable';
+	}
+}
+
+/** What the run row records for a red approved head the re-run policy took (issue #1128). */
+const ADJUDICATED_RED_MESSAGES: Record<
+	Exclude<AdjudicatedApprovedHeadOutcome, 'not-applicable'>,
+	string
+> = {
+	'rerun-requested':
+		"SWARM's CI agent judged the failure unrelated to this pull request, so SWARM re-ran the failing checks; it merges this head once they pass",
+	'rerun-settling':
+		'SWARM re-ran the failing checks moments ago; it merges this head once they pass',
+	'needs-operator':
+		"SWARM's CI agent judged the failure unrelated to this pull request, and the failing checks stayed red after SWARM's one re-run (or could not be re-run); the pull request needs the operator — see the notice on the pull request",
+};
+
+/**
  * The head about to be merged is red. Refused, and said out loud on the pull
  * request — merging it would be exactly the red base this exists to prevent.
  *
@@ -1698,6 +1771,15 @@ async function settleChildrenThisMergeAbsorbed(
  * For the approved head itself (issue #1124) the review approved a commit whose
  * CI failed; the failure belongs to Respond-to-CI, which the `pr-review` trigger
  * routes this head to on its own, so nothing here races it.
+ *
+ * Unless that red was already adjudicated `no-fix` (issue #1128,
+ * {@link adjudicateRedApprovedHead}): Respond-to-CI already declined it, so the
+ * approved-head re-run policy acts instead, and the refusal says what it did.
+ * A requested re-run is commented on in its own words; a re-run still settling
+ * and a head handed to the operator are not, because the operator notice *is*
+ * the comment. Every form still settles terminally — the green re-arm (issue
+ * #1128, {@link rearmMergeAutomationForGreenHead}) is what merges the head once
+ * its re-run passes.
  */
 async function refuseRedHead(
 	dispatch: DispatchRow,
@@ -1710,6 +1792,37 @@ async function refuseRedHead(
 ): Promise<MergeAutomationSettledOutcome> {
 	const failed = redFreshChecks.join(', ');
 	const updated = baseUpdatesSpent(job) > 0;
+	const adjudication = await adjudicateRedApprovedHead(job, project, redFreshChecks, capabilities);
+	if (adjudication !== 'not-applicable') {
+		await persistMergeOutcome(
+			job,
+			'not-eligible',
+			`${message}; ${ADJUDICATED_RED_MESSAGES[adjudication]}`,
+			attempt,
+		);
+		if (adjudication === 'rerun-requested') {
+			await commentOnMergeRefusal(
+				job,
+				project,
+				capabilities,
+				mergeRefusalCommentBody(
+					`The review approved head \`${job.approvedHeadSha}\`, but that head fails its checks: ${failed}. SWARM's CI agent judged the failure unrelated to this pull request, so SWARM re-ran the failing checks.`,
+					'Nothing is needed from you yet: once the re-run passes, SWARM merges this head. If the checks fail again, SWARM leaves a separate notice saying the pull request needs you.',
+					RED_HEAD_CONSEQUENCE,
+				),
+			);
+		}
+		logger.warn('Merge automation: the approved head is red after an adjudicated no-fix', {
+			dispatchId: dispatch.id,
+			runId: job.reviewRunId,
+			prNumber: job.prNumber,
+			headSha: job.approvedHeadSha,
+			failedChecks: redFreshChecks,
+			adjudication,
+		});
+		await settleMergeDispatch(dispatch, job, project, 'merge-not-eligible');
+		return settledOutcome(job, 'not-eligible');
+	}
 	await persistMergeOutcome(job, 'not-eligible', message, attempt);
 	await commentOnMergeRefusal(
 		job,
