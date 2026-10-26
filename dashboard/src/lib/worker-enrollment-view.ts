@@ -51,6 +51,23 @@ export function routabilityBlockers(enrollment: RoutabilityInput): string[] {
 }
 
 /**
+ * Whether a non-routable enrollment is still finishing work already in flight here
+ * (issue #1129), as one line of copy — or `null` when there is nothing to say: a
+ * routable enrollment's runs are ordinary work, and an idle one has nothing left to
+ * finish. Suspending or revoking consent stops *new* dispatch only; the phase a
+ * machine already holds runs to completion, and without this the card would read
+ * as if the machine had stopped working for the project the moment it was blocked.
+ */
+export function finishingWorkNote(enrollment: {
+	isRoutable: boolean;
+	activeRuns: number;
+}): string | null {
+	if (enrollment.isRoutable || enrollment.activeRuns <= 0) return null;
+	const runs = enrollment.activeRuns === 1 ? '1 run' : `${enrollment.activeRuns} runs`;
+	return `Still finishing ${runs} already in progress here — no new work is routed to this machine for this project.`;
+}
+
+/**
  * The repositories that disagree when none of the machine's declared checkouts is
  * one this enrollment's project declares (issue #690, widened by #946 from the
  * project's default entry to its whole list, and by #1056 from the machine's one

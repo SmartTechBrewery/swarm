@@ -98,6 +98,7 @@ function makeEnrollment(overrides: Partial<WorkerDetailEnrollment> = {}): Worker
 		concurrencyAllocation: 2,
 		sharingConsent: true,
 		isRoutable: true,
+		activeRuns: 0,
 		projectRepos: ['acme/frontend'],
 		viewerCanAdminister: false,
 		...overrides,
@@ -679,6 +680,35 @@ describe('WorkerDetailView enrollment blocks', () => {
 		expect(screen.getByText('Not routable')).toBeDefined();
 		expect(screen.getByText(/awaiting a project administrator/)).toBeDefined();
 		expect(screen.getByText(/has not shared this machine/)).toBeDefined();
+	});
+
+	// Issue #1129 — suspending or revoking consent stops new dispatch only; the run a
+	// machine already holds finishes, and the card says so rather than reading idle.
+	describe('a non-routable enrollment still finishing work', () => {
+		it('says a suspended enrollment with a run in flight is finishing it', () => {
+			renderWorker({
+				enrollments: [makeEnrollment({ status: 'suspended', isRoutable: false, activeRuns: 1 })],
+			});
+
+			expect(screen.getByText('Finishing current work')).toBeDefined();
+			expect(screen.getByText(/Still finishing 1 run already in progress here/)).toBeDefined();
+		});
+
+		it('says nothing for a suspended enrollment with no run in flight', () => {
+			renderWorker({
+				enrollments: [makeEnrollment({ status: 'suspended', isRoutable: false, activeRuns: 0 })],
+			});
+
+			expect(screen.queryByText('Finishing current work')).toBeNull();
+			expect(screen.queryByText(/Still finishing/)).toBeNull();
+		});
+
+		it('says nothing for a routable enrollment running work', () => {
+			renderWorker({ enrollments: [makeEnrollment({ activeRuns: 1 })] });
+
+			expect(screen.queryByText('Finishing current work')).toBeNull();
+			expect(screen.queryByText(/Still finishing/)).toBeNull();
+		});
 	});
 
 	// Issue #690 — the reason an enrollment was refused or suspended, read off the

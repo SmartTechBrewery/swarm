@@ -663,6 +663,15 @@ export interface DashboardWorkerEnrollmentDetail {
 	sharingConsent: boolean;
 	isRoutable: boolean;
 	/**
+	 * This worker's active, unexpired dispatch claims in this project (issue #1129)
+	 * — the same count the capacity gate reads (`getWorkerDispatchClaimState`), so
+	 * it is what is actually executing here. Carried for every enrollment, but it
+	 * only means something on its own when the enrollment is not routable: a
+	 * suspended or no-longer-shared enrollment still finishes the phase already in
+	 * flight, and this is what lets the screen say so.
+	 */
+	activeRuns: number;
+	/**
 	 * **Every** repository this enrollment's project declares (issue #690, widened
 	 * by #946 from its default entry alone), in the **same normalised form** as the
 	 * surrounding view's `repositories`, so the comparison the screen makes —
@@ -880,7 +889,8 @@ export async function getDashboardWorkerDetail(
 /**
  * Assemble one detail-view enrollment by naming each safe field explicitly. The
  * project is read for its repositories alone (issue #690) — the enrollment's own
- * fields are never taken from it.
+ * fields are never taken from it — and the worker's dispatch claims in that
+ * project for the in-flight count (issue #1129).
  *
  * Reads the project **record** (`findProjectRecordByIdFromDb`) for the same reason
  * {@link assertProjectIsWorkersRepository} does (issue #946): `findProjectByIdFromDb`
@@ -892,6 +902,7 @@ async function assembleEnrollmentDetail(
 	enrollment: WorkerEnrollment,
 ): Promise<DashboardWorkerEnrollmentDetail> {
 	const project = await findProjectRecordByIdFromDb(enrollment.projectId);
+	const claims = await getWorkerDispatchClaimState(enrollment.workerId, enrollment.projectId);
 	return {
 		enrollmentId: enrollment.id,
 		projectId: enrollment.projectId,
@@ -901,6 +912,7 @@ async function assembleEnrollmentDetail(
 		concurrencyAllocation: enrollment.concurrencyAllocation,
 		sharingConsent: enrollment.sharingConsent,
 		isRoutable: isRoutable(enrollment),
+		activeRuns: claims.activeRuns,
 		projectRepos: project ? projectRepositorySlugs(project) : [],
 	};
 }
