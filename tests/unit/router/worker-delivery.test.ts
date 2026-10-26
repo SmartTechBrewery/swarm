@@ -27,6 +27,8 @@ import {
 	handleScheduleFollowUpReview,
 	handleSubmitReview,
 	handleUpdateWorkItem,
+	isExecutingClaimOf,
+	NON_ROUTABLE_ENROLLMENT_DELIVERY_REASON,
 	ORPHANED_DISPATCH_DELIVERY_REASON,
 	type WorkerDeliveryDeps,
 } from '@/router/worker-delivery.js';
@@ -129,7 +131,8 @@ function makeDeps(overrides: Partial<WorkerDeliveryDeps> = {}): WorkerDeliveryDe
 			async (id: string): Promise<ProjectRecord | undefined> =>
 				id === record.id ? record : undefined,
 		),
-		isWorkerEnrolled: vi.fn().mockResolvedValue(true),
+		findEnrollment: vi.fn().mockResolvedValue({ status: 'active', sharingConsent: true }),
+		isDispatchInFlightOn: vi.fn().mockResolvedValue(false),
 		// No dispatch is orphaned unless a test says so (issue #1073).
 		isDispatchOrphaned: vi.fn().mockReturnValue(false),
 		buildScmDelivery: vi.fn().mockResolvedValue(makeDelivery()),
@@ -259,7 +262,7 @@ describe('handleSubmitReview', () => {
 	});
 
 	it('returns 403 when the worker is not enrolled in the project', async () => {
-		const deps = makeDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+		const deps = makeDeps({ findEnrollment: vi.fn().mockResolvedValue(undefined) });
 		const result = await handleSubmitReview(deps, CREDENTIAL, reviewBody());
 		expect(result.status).toBe(403);
 		expect(deps.buildScmDelivery).not.toHaveBeenCalled();
@@ -369,7 +372,7 @@ describe('handlePostComment', () => {
 		const unknown = makeDeps({ resolveWorkerByCredential: vi.fn().mockResolvedValue(undefined) });
 		expect((await handlePostComment(unknown, 'bogus', commentBody())).status).toBe(401);
 
-		const unenrolled = makeDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+		const unenrolled = makeDeps({ findEnrollment: vi.fn().mockResolvedValue(undefined) });
 		expect((await handlePostComment(unenrolled, CREDENTIAL, commentBody())).status).toBe(403);
 		expect(unenrolled.buildScmDelivery).not.toHaveBeenCalled();
 	});
@@ -497,7 +500,7 @@ describe('handleMoveWorkItem', () => {
 	});
 
 	it('returns 403 when the worker is not enrolled in the project', async () => {
-		const deps = makeDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+		const deps = makeDeps({ findEnrollment: vi.fn().mockResolvedValue(undefined) });
 		const result = await handleMoveWorkItem(deps, CREDENTIAL, moveBody());
 		expect(result.status).toBe(403);
 		expect(deps.buildPmProvider).not.toHaveBeenCalled();
@@ -542,7 +545,7 @@ describe('handleAddPmComment', () => {
 		expect((await handleAddPmComment(unknown, 'bogus', pmCommentBody())).status).toBe(401);
 		expect(unknown.buildPmProvider).not.toHaveBeenCalled();
 
-		const unenrolled = makeDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+		const unenrolled = makeDeps({ findEnrollment: vi.fn().mockResolvedValue(undefined) });
 		expect((await handleAddPmComment(unenrolled, CREDENTIAL, pmCommentBody())).status).toBe(403);
 		expect(unenrolled.buildPmProvider).not.toHaveBeenCalled();
 	});
@@ -633,7 +636,7 @@ describe('handlePriorReview', () => {
 				await handlePriorReview(
 					makeDeps({
 						reviewLedger: unenrolledLedger,
-						isWorkerEnrolled: vi.fn().mockResolvedValue(false),
+						findEnrollment: vi.fn().mockResolvedValue(undefined),
 					}),
 					CREDENTIAL,
 					priorReviewBody(),
@@ -740,7 +743,7 @@ describe('handleMarkReviewVerdict', () => {
 				await handleMarkReviewVerdict(
 					makeDeps({
 						reviewLedger: unenrolled,
-						isWorkerEnrolled: vi.fn().mockResolvedValue(false),
+						findEnrollment: vi.fn().mockResolvedValue(undefined),
 					}),
 					CREDENTIAL,
 					markLedgerBody(),
@@ -794,7 +797,7 @@ describe('handleAbandonReviewVerdict', () => {
 				await handleAbandonReviewVerdict(
 					makeDeps({
 						reviewLedger: unenrolled,
-						isWorkerEnrolled: vi.fn().mockResolvedValue(false),
+						findEnrollment: vi.fn().mockResolvedValue(undefined),
 					}),
 					CREDENTIAL,
 					priorReviewBody({ headSha: 'deadbeef' }),
@@ -854,7 +857,7 @@ describe('handleListBlockers', () => {
 		expect((await handleListBlockers(unknownWorker, 'bogus', blockersBody())).status).toBe(401);
 		expect(unknownWorker.buildPmProvider).not.toHaveBeenCalled();
 
-		const unenrolled = makeDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+		const unenrolled = makeDeps({ findEnrollment: vi.fn().mockResolvedValue(undefined) });
 		expect((await handleListBlockers(unenrolled, CREDENTIAL, blockersBody())).status).toBe(403);
 		expect(unenrolled.buildPmProvider).not.toHaveBeenCalled();
 
@@ -933,7 +936,7 @@ describe('handleListDependents', () => {
 		expect((await handleListDependents(unknownWorker, 'bogus', dependentsBody())).status).toBe(401);
 		expect(unknownWorker.buildPmProvider).not.toHaveBeenCalled();
 
-		const unenrolled = makeDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+		const unenrolled = makeDeps({ findEnrollment: vi.fn().mockResolvedValue(undefined) });
 		expect((await handleListDependents(unenrolled, CREDENTIAL, dependentsBody())).status).toBe(403);
 		expect(unenrolled.buildPmProvider).not.toHaveBeenCalled();
 
@@ -1015,7 +1018,7 @@ describe('handleFindWorkItem', () => {
 		expect((await handleFindWorkItem(unknownWorker, 'bogus', findBody())).status).toBe(401);
 		expect(unknownWorker.buildPmProvider).not.toHaveBeenCalled();
 
-		const unenrolled = makeDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+		const unenrolled = makeDeps({ findEnrollment: vi.fn().mockResolvedValue(undefined) });
 		expect((await handleFindWorkItem(unenrolled, CREDENTIAL, findBody())).status).toBe(403);
 		expect(unenrolled.buildPmProvider).not.toHaveBeenCalled();
 
@@ -1177,7 +1180,7 @@ describe('handleFindPmComment', () => {
 		expect((await handleFindPmComment(unknownWorker, 'bogus', findCommentBody())).status).toBe(401);
 		expect(unknownWorker.buildPmProvider).not.toHaveBeenCalled();
 
-		const unenrolled = makeDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+		const unenrolled = makeDeps({ findEnrollment: vi.fn().mockResolvedValue(undefined) });
 		expect((await handleFindPmComment(unenrolled, CREDENTIAL, findCommentBody())).status).toBe(403);
 		expect(unenrolled.buildPmProvider).not.toHaveBeenCalled();
 
@@ -1277,7 +1280,7 @@ describe('handleCreateWorkItem', () => {
 		expect((await handleCreateWorkItem(unknownWorker, 'bogus', createBody())).status).toBe(401);
 		expect(unknownWorker.buildPmProvider).not.toHaveBeenCalled();
 
-		const unenrolled = makeDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+		const unenrolled = makeDeps({ findEnrollment: vi.fn().mockResolvedValue(undefined) });
 		expect((await handleCreateWorkItem(unenrolled, CREDENTIAL, createBody())).status).toBe(403);
 		expect(unenrolled.buildPmProvider).not.toHaveBeenCalled();
 
@@ -1337,7 +1340,7 @@ describe('handleUpdateWorkItem', () => {
 	});
 
 	it('enforces auth and enrollment, and rejects a malformed body', async () => {
-		const unenrolled = makeDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+		const unenrolled = makeDeps({ findEnrollment: vi.fn().mockResolvedValue(undefined) });
 		expect((await handleUpdateWorkItem(unenrolled, CREDENTIAL, updateBody())).status).toBe(403);
 		expect(unenrolled.buildPmProvider).not.toHaveBeenCalled();
 
@@ -1382,7 +1385,7 @@ describe('handleAddPmLabel', () => {
 	});
 
 	it('enforces auth and enrollment, and rejects a malformed body', async () => {
-		const unenrolled = makeDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+		const unenrolled = makeDeps({ findEnrollment: vi.fn().mockResolvedValue(undefined) });
 		expect((await handleAddPmLabel(unenrolled, CREDENTIAL, labelBody())).status).toBe(403);
 		expect(unenrolled.buildPmProvider).not.toHaveBeenCalled();
 
@@ -1423,7 +1426,7 @@ describe('handleAddBlockedBy', () => {
 	});
 
 	it('enforces auth and enrollment, and rejects a malformed body', async () => {
-		const unenrolled = makeDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+		const unenrolled = makeDeps({ findEnrollment: vi.fn().mockResolvedValue(undefined) });
 		expect((await handleAddBlockedBy(unenrolled, CREDENTIAL, blockedByBody())).status).toBe(403);
 		expect(unenrolled.buildPmProvider).not.toHaveBeenCalled();
 
@@ -1474,7 +1477,7 @@ describe('handleScheduleFollowUpReview', () => {
 		).toBe(401);
 		expect(unknownWorker.scheduleFollowUpReview).not.toHaveBeenCalled();
 
-		const unenrolled = makeDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+		const unenrolled = makeDeps({ findEnrollment: vi.fn().mockResolvedValue(undefined) });
 		expect(
 			(await handleScheduleFollowUpReview(unenrolled, CREDENTIAL, followUpBody())).status,
 		).toBe(403);
@@ -1579,10 +1582,10 @@ describe('handleReportCliQuota', () => {
 	});
 
 	it('needs no project enrollment — an allowance describes a machine', async () => {
-		const deps = makeDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+		const deps = makeDeps({ findEnrollment: vi.fn().mockResolvedValue(undefined) });
 
 		expect((await handleReportCliQuota(deps, CREDENTIAL, quotaBody())).status).toBe(200);
-		expect(deps.isWorkerEnrolled).not.toHaveBeenCalled();
+		expect(deps.findEnrollment).not.toHaveBeenCalled();
 		expect(deps.persistCliQuota).toHaveBeenCalledTimes(1);
 	});
 
@@ -1707,10 +1710,10 @@ describe('handleReportWorkerUpdate', () => {
 	});
 
 	it('needs no project enrollment — an update describes a machine', async () => {
-		const deps = makeDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+		const deps = makeDeps({ findEnrollment: vi.fn().mockResolvedValue(undefined) });
 
 		expect((await handleReportWorkerUpdate(deps, CREDENTIAL, updateBody())).status).toBe(200);
-		expect(deps.isWorkerEnrolled).not.toHaveBeenCalled();
+		expect(deps.findEnrollment).not.toHaveBeenCalled();
 	});
 
 	it('returns 400 for a malformed body, an unknown status, or a protocol mismatch', async () => {
@@ -1844,10 +1847,10 @@ describe('handleReportWorktreeSweep', () => {
 	});
 
 	it('needs no project enrollment — one report spans every project swept', async () => {
-		const deps = makeDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+		const deps = makeDeps({ findEnrollment: vi.fn().mockResolvedValue(undefined) });
 
 		expect((await handleReportWorktreeSweep(deps, CREDENTIAL, sweepBody())).status).toBe(200);
-		expect(deps.isWorkerEnrolled).not.toHaveBeenCalled();
+		expect(deps.findEnrollment).not.toHaveBeenCalled();
 	});
 
 	it('returns 400 for a malformed body, an unknown status, or a protocol mismatch', async () => {
@@ -2075,7 +2078,7 @@ describe("run-scoped routes act on the run's repository (issue #1055)", () => {
 	});
 
 	it('checks enrollment before the repository, so an unenrolled worker learns nothing about it', async () => {
-		const deps = twoRepoDeps({ isWorkerEnrolled: vi.fn().mockResolvedValue(false) });
+		const deps = twoRepoDeps({ findEnrollment: vi.fn().mockResolvedValue(undefined) });
 
 		const result = await handleSubmitReview(
 			deps,
@@ -2208,6 +2211,74 @@ describe("split-child routes act on the parent's repository (issue #1085)", () =
 	});
 });
 
+/** The dispatch a project-scoped call names (issues #1073, #1129). */
+const DISPATCH_ID = '44444444-4444-4444-8444-444444444444';
+const PR = { prNumber: '42', headSha: 'deadbeef' };
+
+/** Every project-scoped route, each with a body that would otherwise be served. */
+const ROUTES: Array<
+	[
+		string,
+		(
+			deps: WorkerDeliveryDeps,
+			credential: string | undefined,
+			body: unknown,
+		) => Promise<DeliveryResult>,
+		Record<string, unknown>,
+	]
+> = [
+	['review', handleSubmitReview, reviewBody()],
+	['pr-comment', handlePostComment, commentBody()],
+	['pm/move', handleMoveWorkItem, moveBody()],
+	['pm/comment', handleAddPmComment, pmCommentBody()],
+	['pm/blockers', handleListBlockers, { projectId: 'swarm', itemId: 'PVTI_item1' }],
+	['pm/dependents', handleListDependents, { projectId: 'swarm', itemId: 'PVTI_item1' }],
+	['pm/find-item', handleFindWorkItem, { projectId: 'swarm', urlSuffix: '/issues/17' }],
+	['pm/find-item-by-marker', handleFindWorkItemByMarker, { projectId: 'swarm', marker: 'm' }],
+	[
+		'pm/find-artifact',
+		handleFindWorkItemForArtifact,
+		{ projectId: 'swarm', repository: 'SmartTechBrewery/swarm', kind: 'issue', number: '17' },
+	],
+	[
+		'pm/find-comment',
+		handleFindPmComment,
+		{ projectId: 'swarm', itemId: 'PVTI_item1', marker: 'm' },
+	],
+	[
+		'pm/create-item',
+		handleCreateWorkItem,
+		{ projectId: 'swarm', title: 'Phase 2 of 2', description: 'child', status: 'backlog' },
+	],
+	[
+		'pm/update-item',
+		handleUpdateWorkItem,
+		{ projectId: 'swarm', itemId: 'PVTI_item1', title: 'T' },
+	],
+	['pm/label', handleAddPmLabel, { projectId: 'swarm', itemId: 'PVTI_item1', name: 'planned' }],
+	[
+		'pm/blocked-by',
+		handleAddBlockedBy,
+		{ projectId: 'swarm', itemId: 'PVTI_item2', blockerId: 'PVTI_item1' },
+	],
+	[
+		'follow-up-review',
+		handleScheduleFollowUpReview,
+		{ projectId: 'swarm', prNumber: '42', prBranch: 'issue-21', headSha: 'newsha' },
+	],
+	['review-ledger/prior', handlePriorReview, priorReviewBody()],
+	['review-ledger/mark', handleMarkReviewVerdict, markLedgerBody()],
+	['review-ledger/abandon', handleAbandonReviewVerdict, { projectId: 'swarm', ...PR }],
+];
+
+function withDispatch(body: Record<string, unknown>, dispatchId?: string) {
+	return {
+		...body,
+		...(dispatchId !== undefined && { dispatchId }),
+		protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+	};
+}
+
 /**
  * The dispatch fence (issue #1073). The transport-loss reap settles a run but cannot
  * stop its agent, so a worker that only slept comes back, finishes the phase and calls
@@ -2216,73 +2287,6 @@ describe("split-child routes act on the parent's repository (issue #1085)", () =
  */
 describe('the dispatch fence on project-scoped routes (issue #1073)', () => {
 	beforeEach(() => vi.clearAllMocks());
-
-	const DISPATCH_ID = '44444444-4444-4444-8444-444444444444';
-	const PR = { prNumber: '42', headSha: 'deadbeef' };
-
-	/** Every project-scoped route, each with a body that would otherwise be served. */
-	const ROUTES: Array<
-		[
-			string,
-			(
-				deps: WorkerDeliveryDeps,
-				credential: string | undefined,
-				body: unknown,
-			) => Promise<DeliveryResult>,
-			Record<string, unknown>,
-		]
-	> = [
-		['review', handleSubmitReview, reviewBody()],
-		['pr-comment', handlePostComment, commentBody()],
-		['pm/move', handleMoveWorkItem, moveBody()],
-		['pm/comment', handleAddPmComment, pmCommentBody()],
-		['pm/blockers', handleListBlockers, { projectId: 'swarm', itemId: 'PVTI_item1' }],
-		['pm/dependents', handleListDependents, { projectId: 'swarm', itemId: 'PVTI_item1' }],
-		['pm/find-item', handleFindWorkItem, { projectId: 'swarm', urlSuffix: '/issues/17' }],
-		['pm/find-item-by-marker', handleFindWorkItemByMarker, { projectId: 'swarm', marker: 'm' }],
-		[
-			'pm/find-artifact',
-			handleFindWorkItemForArtifact,
-			{ projectId: 'swarm', repository: 'SmartTechBrewery/swarm', kind: 'issue', number: '17' },
-		],
-		[
-			'pm/find-comment',
-			handleFindPmComment,
-			{ projectId: 'swarm', itemId: 'PVTI_item1', marker: 'm' },
-		],
-		[
-			'pm/create-item',
-			handleCreateWorkItem,
-			{ projectId: 'swarm', title: 'Phase 2 of 2', description: 'child', status: 'backlog' },
-		],
-		[
-			'pm/update-item',
-			handleUpdateWorkItem,
-			{ projectId: 'swarm', itemId: 'PVTI_item1', title: 'T' },
-		],
-		['pm/label', handleAddPmLabel, { projectId: 'swarm', itemId: 'PVTI_item1', name: 'planned' }],
-		[
-			'pm/blocked-by',
-			handleAddBlockedBy,
-			{ projectId: 'swarm', itemId: 'PVTI_item2', blockerId: 'PVTI_item1' },
-		],
-		[
-			'follow-up-review',
-			handleScheduleFollowUpReview,
-			{ projectId: 'swarm', prNumber: '42', prBranch: 'issue-21', headSha: 'newsha' },
-		],
-		['review-ledger/prior', handlePriorReview, priorReviewBody()],
-		['review-ledger/mark', handleMarkReviewVerdict, markLedgerBody()],
-		['review-ledger/abandon', handleAbandonReviewVerdict, { projectId: 'swarm', ...PR }],
-	];
-
-	function withDispatch(body: Record<string, unknown>, dispatchId?: string) {
-		return {
-			...body,
-			...(dispatchId !== undefined && { dispatchId }),
-			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
-		};
-	}
 
 	it.each(
 		ROUTES,
@@ -2348,5 +2352,177 @@ describe('the dispatch fence on project-scoped routes (issue #1073)', () => {
 
 		expect(result.status).toBe(401);
 		expect(isDispatchOrphaned).not.toHaveBeenCalled();
+	});
+});
+
+/**
+ * A suspension lets the phase in flight finish (issue #1129). Suspending an enrollment
+ * or revoking its consent stops new work reaching the worker, but the phase already
+ * running on it keeps its deliveries until it settles. A worker with no enrollment row
+ * is refused exactly as before.
+ */
+describe('a held but non-routable enrollment finishes the phase in flight (issue #1129)', () => {
+	beforeEach(() => vi.clearAllMocks());
+
+	const SUSPENDED = { status: 'suspended', sharingConsent: true } as const;
+
+	/** `pm/create-item` answers with the card it created. */
+	function servingPmProvider() {
+		return vi.fn(() =>
+			makePmProvider({ createWorkItem: vi.fn().mockResolvedValue(createMockWorkItem()) }),
+		);
+	}
+
+	it.each(
+		ROUTES,
+	)('%s serves a suspended worker its own executing claim', async (_route, handle, body) => {
+		const isDispatchInFlightOn = vi.fn().mockResolvedValue(true);
+		const deps = makeDeps({
+			findEnrollment: vi.fn().mockResolvedValue(SUSPENDED),
+			isDispatchInFlightOn,
+			buildPmProvider: servingPmProvider(),
+		});
+
+		const result = await handle(deps, CREDENTIAL, withDispatch(body, DISPATCH_ID));
+
+		expect(result.status).toBe(200);
+		// The claim is checked for the authenticated worker and the resolved project.
+		expect(isDispatchInFlightOn).toHaveBeenCalledWith(WORKER_ID, 'swarm', DISPATCH_ID);
+	});
+
+	it('serves a phase in flight after the owner revokes sharing consent', async () => {
+		const deps = makeDeps({
+			findEnrollment: vi.fn().mockResolvedValue({ status: 'active', sharingConsent: false }),
+			isDispatchInFlightOn: vi.fn().mockResolvedValue(true),
+		});
+
+		const result = await handleFindPmComment(
+			deps,
+			CREDENTIAL,
+			withDispatch({ projectId: 'swarm', itemId: 'PVTI_item1', marker: 'm' }, DISPATCH_ID),
+		);
+
+		expect(result.status).toBe(200);
+	});
+
+	it.each(
+		ROUTES,
+	)('%s refuses a suspended worker a call naming no dispatch, touching nothing', async (_route, handle, body) => {
+		const deps = makeDeps({ findEnrollment: vi.fn().mockResolvedValue(SUSPENDED) });
+
+		const result = await handle(deps, CREDENTIAL, withDispatch(body));
+
+		expect(result).toEqual({
+			status: 403,
+			json: { reason: NON_ROUTABLE_ENROLLMENT_DELIVERY_REASON },
+		});
+		expect(deps.isDispatchInFlightOn).not.toHaveBeenCalled();
+		expect(deps.buildPmProvider).not.toHaveBeenCalled();
+		expect(deps.buildScmDelivery).not.toHaveBeenCalled();
+		expect(deps.scheduleFollowUpReview).not.toHaveBeenCalled();
+		expect(deps.reviewLedger.getPriorSubmittedReview).not.toHaveBeenCalled();
+		expect(deps.reviewLedger.markReviewVerdictSubmitted).not.toHaveBeenCalled();
+		expect(deps.reviewLedger.abandonReviewVerdict).not.toHaveBeenCalled();
+	});
+
+	it('refuses a pending enrollment a dispatch that is not its executing claim, writing nothing', async () => {
+		const moveWorkItem = vi.fn().mockResolvedValue(undefined);
+		const deps = makeDeps({
+			findEnrollment: vi.fn().mockResolvedValue({ status: 'pending', sharingConsent: true }),
+			isDispatchInFlightOn: vi.fn().mockResolvedValue(false),
+			buildPmProvider: vi.fn(() => makePmProvider({ moveWorkItem })),
+		});
+
+		const result = await handleMoveWorkItem(
+			deps,
+			CREDENTIAL,
+			withDispatch(moveBody(), DISPATCH_ID),
+		);
+
+		expect(result).toEqual({
+			status: 403,
+			json: { reason: NON_ROUTABLE_ENROLLMENT_DELIVERY_REASON },
+		});
+		expect(moveWorkItem).not.toHaveBeenCalled();
+	});
+
+	it('refuses a worker with no enrollment row whatever dispatch it names', async () => {
+		const deps = makeDeps({
+			findEnrollment: vi.fn().mockResolvedValue(undefined),
+			isDispatchInFlightOn: vi.fn().mockResolvedValue(true),
+		});
+
+		const result = await handleMoveWorkItem(
+			deps,
+			CREDENTIAL,
+			withDispatch(moveBody(), DISPATCH_ID),
+		);
+
+		expect(result).toEqual({
+			status: 403,
+			json: { reason: 'worker is not enrolled in this project' },
+		});
+		expect(deps.isDispatchInFlightOn).not.toHaveBeenCalled();
+	});
+
+	it('serves a routable enrollment without reading the dispatch', async () => {
+		const deps = makeDeps();
+
+		const result = await handleMoveWorkItem(
+			deps,
+			CREDENTIAL,
+			withDispatch(moveBody(), DISPATCH_ID),
+		);
+
+		expect(result.status).toBe(200);
+		expect(deps.isDispatchInFlightOn).not.toHaveBeenCalled();
+	});
+
+	it('still fences an orphaned dispatch first, before the enrollment is read', async () => {
+		const deps = makeDeps({
+			isDispatchOrphaned: vi.fn().mockReturnValue(true),
+			findEnrollment: vi.fn().mockResolvedValue(SUSPENDED),
+			isDispatchInFlightOn: vi.fn().mockResolvedValue(true),
+		});
+
+		const result = await handleMoveWorkItem(
+			deps,
+			CREDENTIAL,
+			withDispatch(moveBody(), DISPATCH_ID),
+		);
+
+		expect(result).toEqual({ status: 409, json: { reason: ORPHANED_DISPATCH_DELIVERY_REASON } });
+		expect(deps.findEnrollment).not.toHaveBeenCalled();
+	});
+});
+
+describe('isExecutingClaimOf', () => {
+	const claim = (overrides: Record<string, unknown> = {}) =>
+		({ projectId: 'swarm', selectedWorkerId: WORKER_ID, state: 'running', ...overrides }) as const;
+
+	it.each([
+		'leased',
+		'running',
+	] as const)('is true for this worker and project while %s', (state) => {
+		expect(isExecutingClaimOf(claim({ state }), WORKER_ID, 'swarm')).toBe(true);
+	});
+
+	it.each([
+		'pending',
+		'retry-scheduled',
+		'completed',
+		'failed',
+		'cancelled',
+	] as const)('is false once the dispatch is %s', (state) => {
+		expect(isExecutingClaimOf(claim({ state }), WORKER_ID, 'swarm')).toBe(false);
+	});
+
+	it('is false for no dispatch, another worker, no worker, or another project', () => {
+		expect(isExecutingClaimOf(undefined, WORKER_ID, 'swarm')).toBe(false);
+		expect(isExecutingClaimOf(claim({ selectedWorkerId: 'other' }), WORKER_ID, 'swarm')).toBe(
+			false,
+		);
+		expect(isExecutingClaimOf(claim({ selectedWorkerId: null }), WORKER_ID, 'swarm')).toBe(false);
+		expect(isExecutingClaimOf(claim({ projectId: 'other' }), WORKER_ID, 'swarm')).toBe(false);
 	});
 });

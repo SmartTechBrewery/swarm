@@ -222,7 +222,8 @@ function deliveryDeps(
 	return {
 		resolveWorkerByCredential: vi.fn().mockResolvedValue({ id: workerId } as Worker),
 		findProjectRecordById: vi.fn().mockResolvedValue(record),
-		isWorkerEnrolled: vi.fn().mockResolvedValue(true),
+		findEnrollment: vi.fn().mockResolvedValue({ status: 'active', sharingConsent: true }),
+		isDispatchInFlightOn: vi.fn().mockResolvedValue(false),
 		// The production default: the in-process registry the reap writes.
 		isDispatchOrphaned: isDispatchOrphanedFrom,
 		buildScmDelivery: vi.fn(),

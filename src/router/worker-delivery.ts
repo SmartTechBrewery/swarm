@@ -123,6 +123,19 @@
  * dispatch waits for the automatic retry the late phase may still settle the run, so
  * its board writes are the run's own; the fence applies once the retry takes over.
  *
+ * **A suspension lets the phase in flight finish** (issue #1129). Suspending an
+ * enrollment or revoking its sharing consent stops *new* work reaching the worker —
+ * the claim and the eligibility gate refuse it — and promises the run already
+ * executing finishes normally. So a project-scoped call from a worker whose
+ * enrollment is held but not routable is still served when its `dispatchId` names
+ * that worker's own `leased`/`running` dispatch in this project, and refused with a
+ * distinct `403` otherwise. The claim is read from the dispatch row; the request's id
+ * is only a key. A worker with **no** enrollment row in the project (never enrolled,
+ * or removed) is refused as before, whatever dispatch it names. Nothing here needs to
+ * take effect immediately: a removed worker's credential no longer resolves (`401`),
+ * a deleted project is a `404`, and an operator who needs the work stopped now
+ * cancels the run.
+ *
  * Mirrors `./worker-transport.ts`: the request logic is factored out of the HTTP
  * glue into pure, injectable functions (`handleSubmitReview`,
  * `handlePostComment`, `handleMoveWorkItem`, `handleAddPmComment`,
@@ -143,15 +156,16 @@ import type { Context, Hono } from 'hono';
 import { findProjectRepository, scopeProjectToRepository } from '../config/project-repository.js';
 import type { ProjectConfig, ProjectRecord } from '../config/schema.js';
 import { upsertCliQuota } from '../db/repositories/cliQuotasRepository.js';
+import { type DispatchRow, getDispatchById } from '../db/repositories/dispatchesRepository.js';
 import { findProjectRecordByIdFromDb } from '../db/repositories/projectsRepository.js';
 import {
 	abandonReviewVerdict,
 	getPriorSubmittedReview,
 	markReviewVerdictSubmitted,
 } from '../db/repositories/reviewVerdictsRepository.js';
-import { listEnrollmentsForWorker } from '../db/repositories/workerEnrollmentsRepository.js';
+import { getEnrollment } from '../db/repositories/workerEnrollmentsRepository.js';
 import type { Worker } from '../identity/worker.js';
-import { isRoutable } from '../identity/worker-enrollment.js';
+import { isRoutable, type WorkerEnrollment } from '../identity/worker-enrollment.js';
 import {
 	recordWorkerUpdateReport,
 	recordWorktreeSweepReport,
@@ -210,6 +224,15 @@ export const ORPHANED_DISPATCH_DELIVERY_REASON =
 	"this phase's dispatch was already settled when the worker's transport was lost — its run is settled without this attempt, so its board and review writes are refused";
 
 /**
+ * Why a call from a worker whose enrollment is held but not routable is refused
+ * (issue #1129). Distinct from the no-enrollment reason on purpose: this worker *is*
+ * enrolled, and may still finish the phase already running on it, but this call is
+ * not for that phase.
+ */
+export const NON_ROUTABLE_ENROLLMENT_DELIVERY_REASON =
+	"this worker's enrollment in this project is suspended or not shared — it may only finish a phase already running on it, and this call is not for one";
+
+/**
  * Collaborators the delivery API depends on, defaulted to the real services so
  * production wiring is a bare `registerWorkerDelivery(app)`; tests inject fakes.
  * Mirrors `WorkerTransportDeps` in `./worker-transport.ts`.
@@ -222,8 +245,21 @@ export interface WorkerDeliveryDeps {
 	 * to the default entry, from one read.
 	 */
 	findProjectRecordById: (id: string) => Promise<ProjectRecord | undefined>;
-	/** Whether `workerId` may deliver to `projectId` — a routable (active + consented) enrollment. */
-	isWorkerEnrolled: (workerId: string, projectId: string) => Promise<boolean>;
+	/** The worker's enrollment in the project — any status — or `undefined` when it holds none (issue #1129). */
+	findEnrollment: (
+		workerId: string,
+		projectId: string,
+	) => Promise<Pick<WorkerEnrollment, 'status' | 'sharingConsent'> | undefined>;
+	/**
+	 * Whether `dispatchId` is `workerId`'s executing claim in `projectId` — read from
+	 * the dispatch row, never taken from the request (issue #1129). Consulted only for
+	 * an enrollment that is held but not routable, so the hot path never reads it.
+	 */
+	isDispatchInFlightOn: (
+		workerId: string,
+		projectId: string,
+		dispatchId: string,
+	) => Promise<boolean>;
 	/**
 	 * Whether `dispatchId` is one this router settled because `workerId`'s transport
 	 * was lost, is not awaiting on that worker again (issue #1073), and no longer
@@ -284,11 +320,21 @@ export interface WorkerDeliveryDeps {
 	advanceWorkerRollout: (workerId: string) => void;
 }
 
-/** A worker may deliver to a project only via a routable enrollment (active + sharing consent). */
-async function isWorkerEnrolledDefault(workerId: string, projectId: string): Promise<boolean> {
-	const enrollments = await listEnrollmentsForWorker(workerId);
-	return enrollments.some(
-		(enrollment) => enrollment.projectId === projectId && isRoutable(enrollment),
+/**
+ * Whether a dispatch row is `workerId`'s **executing claim** in `projectId` (issue
+ * #1129): the project's, selected for that worker, and `leased` or `running`. The
+ * row's state is the authority — an expired lease is moved out of those states by
+ * the lease reaper — so no lease-expiry comparison is made here.
+ */
+export function isExecutingClaimOf(
+	dispatch: Pick<DispatchRow, 'projectId' | 'selectedWorkerId' | 'state'> | undefined,
+	workerId: string,
+	projectId: string,
+): boolean {
+	return (
+		dispatch?.projectId === projectId &&
+		dispatch.selectedWorkerId === workerId &&
+		(dispatch.state === 'leased' || dispatch.state === 'running')
 	);
 }
 
@@ -296,7 +342,9 @@ function defaultDeps(): WorkerDeliveryDeps {
 	return {
 		resolveWorkerByCredential,
 		findProjectRecordById: findProjectRecordByIdFromDb,
-		isWorkerEnrolled: isWorkerEnrolledDefault,
+		findEnrollment: getEnrollment,
+		isDispatchInFlightOn: async (workerId, projectId, dispatchId) =>
+			isExecutingClaimOf(await getDispatchById(dispatchId), workerId, projectId),
 		isDispatchOrphaned: isDispatchOrphanedFrom,
 		buildScmDelivery: (project, persona) =>
 			requireProjectSCMProvider(project).deliveryProvider(project, persona),
@@ -400,6 +448,14 @@ async function resolvePersonaDelivery(
  * whatever project it names. It runs only for the worker the credential resolved to,
  * so one worker can never trip another's fence, and an unauthenticated caller
  * learns nothing about which dispatches were settled.
+ *
+ * The enrollment check then tells three cases apart (issue #1129). No enrollment row
+ * — never enrolled, or removed — is refused `403 worker is not enrolled in this
+ * project`, with no dispatch read. A routable enrollment is served. An enrollment the
+ * worker still holds but that is not routable (suspended, consent revoked, pending)
+ * is served only when the call's `dispatchId` names this worker's executing claim in
+ * this project, read server-side from the dispatch row; anything else is refused with
+ * {@link NON_ROUTABLE_ENROLLMENT_DELIVERY_REASON}.
  */
 async function authenticateProject(
 	deps: WorkerDeliveryDeps,
@@ -425,11 +481,31 @@ async function authenticateProject(
 	const record = await deps.findProjectRecordById(projectId);
 	if (!record) return { status: 404, json: { reason: 'unknown project' } };
 
-	// A valid worker credential is not enough: the worker must hold a routable
-	// enrollment in *this* project, so one worker can't deliver to a project it
-	// isn't enrolled in. Reuses the existing dispatch routability read model.
-	if (!(await deps.isWorkerEnrolled(worker.id, record.id)))
+	// A valid worker credential is not enough: the worker must hold an enrollment in
+	// *this* project, so one worker can't deliver to a project it isn't enrolled in.
+	const enrollment = await deps.findEnrollment(worker.id, record.id);
+	if (!enrollment)
 		return { status: 403, json: { reason: 'worker is not enrolled in this project' } };
+
+	// Held but not routable (suspended, consent revoked, pending): served only for
+	// this worker's own executing claim in this project, so a suspension stops new
+	// work without failing the phase already in flight (issue #1129).
+	if (
+		!isRoutable(enrollment) &&
+		!(
+			dispatchId !== undefined &&
+			(await deps.isDispatchInFlightOn(worker.id, record.id, dispatchId))
+		)
+	) {
+		logger.warn('worker-delivery: refusing a call outside the phase in flight', {
+			workerId: worker.id,
+			dispatchId,
+			projectId: record.id,
+			enrollmentStatus: enrollment.status,
+			sharingConsent: enrollment.sharingConsent,
+		});
+		return { status: 403, json: { reason: NON_ROUTABLE_ENROLLMENT_DELIVERY_REASON } };
+	}
 
 	return { worker, record };
 }
@@ -535,7 +611,8 @@ async function authenticateItemRepositoryDelivery(
  *
  * Deliberately *not* a relaxation of {@link authenticateDelivery}: the enrollment
  * check there is what stops a worker delivering into a project it isn't enrolled
- * in, and every project-scoped route keeps it.
+ * in — or, while its enrollment is suspended or not shared, into anything but the
+ * phase already running on it (issue #1129) — and every project-scoped route keeps it.
  */
 async function authenticateWorker(
 	deps: WorkerDeliveryDeps,
