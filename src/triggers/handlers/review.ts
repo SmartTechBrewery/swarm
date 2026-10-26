@@ -139,11 +139,13 @@
  * (`src/dispatch/approved-head-checks-rerun.ts`) instead of Review or
  * Respond-to-CI. That re-runs the failed checks once per approved head; a re-run
  * that passes re-arms the merge below, and one that fails again (or cannot be
- * made) leaves a once-only operator notice. The ordinary-red form is the
- * `adjudicated-red` disposition, decided before `blocked-by-base` and handled
- * before the PR+SHA claim like it, so no claim, fix attempt or slot is consumed —
- * which is what guarantees an adjudicated approved head never routes back to
- * Respond-to-CI. A head that was not approved keeps the routing above.
+ * made) leaves a once-only operator notice. The ordinary-red form is decided in
+ * `resolveAggregateCheckReview`, before `blocked-by-base` and so before the
+ * PR+SHA claim, so no claim, fix attempt or slot is consumed — which is what
+ * guarantees an adjudicated approved head never routes back to Respond-to-CI. It
+ * applies only with merge automation on (the policy's own precondition), and a
+ * policy that answers `not-applicable` falls open to the routing above. A head
+ * that was not approved keeps that routing too.
  *
  * **A green head this PR already approved re-arms its merge** (issue #1128).
  * When a green aggregate meets a review-verdict slot already `submitted` for
@@ -226,7 +228,10 @@ import {
 	failRunFromStatus,
 	getLatestRunForTask,
 } from '../../db/repositories/runsRepository.js';
-import { recoverAdjudicatedApprovedHead } from '../../dispatch/approved-head-checks-rerun.js';
+import {
+	RERUN_SETTLE_RECHECK_DELAY_MS,
+	recoverAdjudicatedApprovedHead,
+} from '../../dispatch/approved-head-checks-rerun.js';
 import { readBaseBranchHealth } from '../../dispatch/base-branch-health.js';
 import { hasCiNoFixRecovery } from '../../dispatch/ci-no-fix-recovery.js';
 import { scheduleCoalescedDispatch } from '../../dispatch/dispatcher.js';
@@ -279,14 +284,13 @@ import { decideAggregateCheckOutcome } from './aggregate-check-decision.js';
  * draft/fork PR or an incomplete/deferred suite → `none`. A `review` the #841
  * `no-fix` bypass produced is marked `adjudicatedRed`, with the checks still
  * failing on its head. A red on a head this PR already approved, whose red SWARM's
- * CI agent already adjudicated, is `adjudicated-red` (issue #1128): it goes to the
- * approved-head re-run policy, never back to Respond-to-CI.
+ * CI agent already adjudicated, is handed to the approved-head re-run policy in
+ * place (issue #1128) and resolves `none` — never back to Respond-to-CI.
  */
 type ReviewDisposition =
 	| { kind: 'review'; adjudicatedRed?: true; failedChecks?: string[] }
 	| { kind: 'respond-to-ci'; failedChecks: string[] }
 	| { kind: 'blocked-by-base'; baseBranch: string; baseHeadSha: string; sharedChecks: string[] }
-	| { kind: 'adjudicated-red'; failedChecks: string[] }
 	| { kind: 'none' };
 
 function isDispositionDisabled(
@@ -862,14 +866,17 @@ async function resolveBaseBranchAttribution(
  * Whether this red head is one SWARM approved **and** whose red SWARM's own CI
  * agent already adjudicated as `no-fix` (issue #1128) — the two durable facts
  * that make a red event the approved-head re-run policy's rather than
- * Respond-to-CI's. Fails **open** to today's routing: a read that throws answers
- * `false`, and the per-PR fix-attempt cap bounds what that costs.
+ * Respond-to-CI's. Only with merge automation on — the policy's own precondition,
+ * so a repository without it keeps today's routing without a read. Fails **open**
+ * to that routing: a read that throws answers `false`, and the per-PR fix-attempt
+ * cap bounds what that costs.
  */
 async function isAdjudicatedApprovedHead(
 	project: ProjectConfig,
 	prNumber: string,
 	headSha: string,
 ): Promise<boolean> {
+	if (project.autoMerge !== true) return false;
 	try {
 		if (!(await hasCiNoFixRecovery(project, prNumber, headSha))) return false;
 		const slot = await getApprovedHeadSlot({
@@ -890,20 +897,23 @@ async function isAdjudicatedApprovedHead(
 }
 
 /**
- * Act on an `adjudicated-red` disposition (issue #1128) through the approved-head
+ * Hand an adjudicated red on an approved head (issue #1128) to the approved-head
  * re-run policy. Taken before the PR+SHA claim, like `blocked-by-base`: nothing is
  * dispatched, so no claim, fix attempt or review slot may be consumed — the
  * re-run's own `checks` event must still be decidable. A re-run requested moments
- * ago (`rerun-settling`) waits one `state-pending` recheck on the ordinary budget,
- * so the head is decided off the re-run's verdict rather than a lagging read of
- * the state before it. Always `null`.
+ * ago (`rerun-settling`) is re-read once the settle window has passed, so the
+ * head is decided off the re-run's verdict rather than a lagging read of the
+ * state before it ({@link scheduleRerunSettleRecheck}).
+ *
+ * Returns `false` only when the policy answered `not-applicable` — it did
+ * nothing — so the ordinary-red caller can fall open to its pre-#1128 routing.
  */
 async function handleAdjudicatedRed(
 	ctx: ScmTriggerContext,
 	prNumber: string,
 	headSha: string,
 	failedChecks: string[],
-): Promise<null> {
+): Promise<boolean> {
 	const outcome = await recoverAdjudicatedApprovedHead({
 		project: ctx.project,
 		scm: ctx.scm,
@@ -919,18 +929,52 @@ async function handleAdjudicatedRed(
 		outcome,
 	});
 	if (outcome === 'rerun-settling') {
-		await scheduleCheckRecheck(
-			ctx,
-			'state-pending',
-			prNumber,
-			headSha,
-			{ reason: 'approved-head re-run settling', failedChecks },
-			{
-				waitingFor: `the re-run of the failing checks on pull request #${prNumber} at head '${headSha}' to report`,
-			},
-		);
+		await scheduleRerunSettleRecheck(ctx, prNumber, headSha, failedChecks);
 	}
-	return null;
+	return outcome !== 'not-applicable';
+}
+
+/**
+ * Re-read a `rerun-settling` head once the settle window has passed, on the
+ * aggregate-check recheck's coalesce key. Deliberately **not**
+ * {@link scheduleReviewRecheck}: the wait is a fixed provider-lag guard, not CI
+ * still running, so it neither draws nor advances the `state-pending` budget — a
+ * short `reviewChecksWaitMinutes` would otherwise run out inside the window and
+ * end the head as an abandoned Review instead of the operator notice. Bounded by
+ * construction: the re-read lands past the window, where the policy answers off
+ * the re-run's verdict and never settles again.
+ */
+async function scheduleRerunSettleRecheck(
+	ctx: ScmTriggerContext,
+	prNumber: string,
+	headSha: string,
+	failedChecks: string[],
+): Promise<void> {
+	const recheckAttempt = ctx.recheckAttempt ?? 0;
+	await scheduleCoalescedDispatch(
+		{
+			...baseReviewJobPayload(ctx),
+			...(recheckAttempt > 0 ? { recheckAttempt } : {}),
+		},
+		checkRecheckCoalesceKey(ctx.project.repo, prNumber, headSha),
+		RERUN_SETTLE_RECHECK_DELAY_MS,
+		'recheck',
+	);
+	const delaySec = Math.round(RERUN_SETTLE_RECHECK_DELAY_MS / 1000);
+	ctx.noteDecline?.({
+		kind: 'recheck-scheduled',
+		reason:
+			`Waiting for the re-run of the failing checks on pull request #${prNumber} at head ` +
+			`'${headSha}' to report. SWARM re-checks in ${describeWait(delaySec)}.` +
+			" This phase's disposition did not change.",
+		retryAfterSec: delaySec,
+	});
+	logger.debug('review: approved-head re-run settling — re-checking after the settle window', {
+		prNumber,
+		headSha,
+		failedChecks,
+		delayMs: RERUN_SETTLE_RECHECK_DELAY_MS,
+	});
 }
 
 /**
@@ -996,8 +1040,13 @@ async function resolveAggregateCheckReview(
 		// The same adjudication, met by an ordinary red event (issue #1128): a head
 		// this PR approved whose red the CI agent already declined goes to the
 		// approved-head re-run policy — a Respond-to-CI run would only decline again.
-		if (await isAdjudicatedApprovedHead(project, prNumber, headSha)) {
-			return { kind: 'adjudicated-red', failedChecks: decision.failedChecks };
+		// Nothing is dispatched, so it settles here, before the PR+SHA claim; a
+		// policy that did nothing (`not-applicable`) falls open to the routing below.
+		if (
+			(await isAdjudicatedApprovedHead(project, prNumber, headSha)) &&
+			(await handleAdjudicatedRed(ctx, prNumber, headSha, decision.failedChecks))
+		) {
+			return { kind: 'none' };
 		}
 		// Beside the bypass above, and the same shape: a second judgement about
 		// *whose* red this is, taken before any fix attempt is spent (issue #873).
@@ -1090,8 +1139,9 @@ async function resolveUpdatedPullRequestReview(
  * `pull-request`'s draft/fork check (`review`/`none`) — for an `updated` event
  * then {@link resolveUpdatedPullRequestReview}'s checks-policy decision, while an
  * `opened` event falls through (issue #1123) — and then the aggregate-CI decision
- * a `checks` event takes (`review`/`respond-to-ci`/`blocked-by-base`/`adjudicated-red`/`none`, and
- * it may defer a recheck in place). `baseBranch` is
+ * a `checks` event takes (`review`/`respond-to-ci`/`blocked-by-base`/`none`, and
+ * it may defer a recheck, or hand an adjudicated approved head to its re-run
+ * policy, in place). `baseBranch` is
  * the pull request's own base, carried from the mergeability gate for the
  * base-attribution read.
  */
@@ -1866,24 +1916,6 @@ async function handBackContinuationReviewSlot(
 }
 
 /**
- * The two dispositions `handle` settles before the PR+SHA claim, because neither
- * dispatches anything: a red the base branch explains (issue #873) and an
- * adjudicated red on an approved head (issue #1128). Always `null`.
- */
-async function handleUnclaimedDisposition(
-	ctx: ScmTriggerContext,
-	prNumber: string,
-	headSha: string,
-	disposition: Extract<ReviewDisposition, { kind: 'blocked-by-base' | 'adjudicated-red' }>,
-): Promise<null> {
-	if (disposition.kind === 'adjudicated-red') {
-		return handleAdjudicatedRed(ctx, prNumber, headSha, disposition.failedChecks);
-	}
-	await reportBaseBlockedPullRequest(ctx, prNumber, headSha, disposition);
-	return null;
-}
-
-/**
  * A head whose review-verdict slot is already `submitted` is never reviewed again
  * (issue #1128). A green one this PR approved is a merge to re-arm — it may have
  * been refused while it was red or pending. The `no-fix` hand-back's head (issue
@@ -1897,7 +1929,9 @@ async function actOnReviewedHead(
 	headSha: string,
 ): Promise<null> {
 	if (disposition.adjudicatedRed === true) {
-		return handleAdjudicatedRed(ctx, prNumber, headSha, disposition.failedChecks ?? []);
+		// `not-applicable` leaves this the same-head drop it was before #1128.
+		await handleAdjudicatedRed(ctx, prNumber, headSha, disposition.failedChecks ?? []);
+		return null;
 	}
 	await rearmMergeAutomationForGreenHead({ project: ctx.project, prNumber, headSha });
 	return null;
@@ -1937,12 +1971,9 @@ export function createReviewTrigger(): TriggerHandler {
 			// Nothing is dispatched, so nothing may consume a slot: taking the dedup
 			// claim would lock this same head out of the Review that a human re-running
 			// CI against a fixed base is meant to produce.
-			//
-			// An adjudicated red on an approved head (issue #1128) is handled here for
-			// the same reason: it dispatches nothing, and its re-run's green must find
-			// the slot free.
-			if (disposition.kind === 'blocked-by-base' || disposition.kind === 'adjudicated-red') {
-				return handleUnclaimedDisposition(ctx, prNumber, headSha, disposition);
+			if (disposition.kind === 'blocked-by-base') {
+				await reportBaseBlockedPullRequest(ctx, prNumber, headSha, disposition);
+				return null;
 			}
 
 			// Cross-process dedup: claim this PR+SHA before dispatching so a sibling

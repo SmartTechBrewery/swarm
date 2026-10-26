@@ -33,6 +33,7 @@ vi.mock('@/lib/logger.js', () => ({
 import type { ProjectConfig } from '@/config/schema.js';
 import {
 	RERUN_SETTLE_MS,
+	RERUN_SETTLE_RECHECK_DELAY_MS,
 	type RecoverAdjudicatedApprovedHeadInput,
 	recoverAdjudicatedApprovedHead,
 } from '@/dispatch/approved-head-checks-rerun.js';
@@ -156,6 +157,17 @@ describe('recoverAdjudicatedApprovedHead', () => {
 		expect(await recoverAdjudicatedApprovedHead(input())).toBe('rerun-settling');
 		expect(rerunFailedChecks).not.toHaveBeenCalled();
 		expect(claimApprovedHeadOperatorNotice).not.toHaveBeenCalled();
+	});
+
+	// The `pr-review` trigger's settle recheck waits this long, so even a read the
+	// instant the re-run was stamped is decided — never `rerun-settling` — next time.
+	it('decides the re-read a settle recheck makes, however early it was scheduled', async () => {
+		claimApprovedHeadChecksRerun.mockResolvedValue(false);
+		getApprovedHeadSlot.mockResolvedValue({
+			checksRerunAt: new Date(Date.now() - RERUN_SETTLE_RECHECK_DELAY_MS),
+		});
+		expect(RERUN_SETTLE_RECHECK_DELAY_MS).toBeGreaterThan(RERUN_SETTLE_MS);
+		expect(await recoverAdjudicatedApprovedHead(input())).toBe('needs-operator');
 	});
 
 	it('hands the head to the operator once its one re-run failed again', async () => {

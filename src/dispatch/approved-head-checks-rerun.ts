@@ -75,6 +75,19 @@ import {
 export const RERUN_SETTLE_MS = 2 * 60 * 1000;
 
 /**
+ * How long a caller waits before re-reading a head this policy answered
+ * `rerun-settling` on: the whole settle window plus a margin, so the re-read lands
+ * past {@link RERUN_SETTLE_MS} of the stamp however early in the window the
+ * settling read came, and is decided off the re-run's own verdict (green, or
+ * `needs-operator`) rather than settling again. The `pr-review` trigger waits it
+ * out on a coalesced recheck that does **not** draw the CI-wait budget
+ * (`reviewChecksWaitMinutes`): that budget is sized for checks still running, and
+ * a short one would run out inside the window and end the head as an abandoned
+ * Review instead of the operator notice.
+ */
+export const RERUN_SETTLE_RECHECK_DELAY_MS = RERUN_SETTLE_MS + 15_000;
+
+/**
  * What {@link recoverAdjudicatedApprovedHead} did:
  *  - `rerun-requested` — this call spent the head's one re-run and the provider
  *    accepted it; the re-run's own `checks` event decides what happens next;
@@ -112,7 +125,9 @@ export interface RecoverAdjudicatedApprovedHeadInput {
  * Apply the adjudicated-approved-head policy to one red read. See the module
  * header for the bounds. Never throws: a database error answers `not-applicable`
  * (logged), which leaves each caller on its pre-#1128 behaviour rather than
- * spending a re-run or a notice it could not record.
+ * spending a re-run or a notice it could not record — the `pr-review` trigger
+ * routes the red on to the base-branch attribution and Respond-to-CI, and merge
+ * automation refuses the red head as before.
  */
 export async function recoverAdjudicatedApprovedHead(
 	input: RecoverAdjudicatedApprovedHeadInput,
