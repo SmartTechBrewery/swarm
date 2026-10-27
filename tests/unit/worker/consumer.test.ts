@@ -3889,6 +3889,146 @@ describe('processJob', () => {
 				});
 			});
 
+			// Issue #1141. A pinned machine that lost its transport under this run may never
+			// come back, so that one variant of the wait is bounded and hands the run to the
+			// operator — keeping everything "Retry now" needs to continue it there.
+			describe('a pinned machine that lost its transport (issue #1141)', () => {
+				const lostTransportRun = () =>
+					getRunByIdFromDb.mockResolvedValue({
+						workerId: 'w-preserved',
+						agentSessionId: 'sess-preserved',
+						recovery: { preservedWorkerId: 'w-preserved', transportLostWorkerIds: ['w-preserved'] },
+					});
+
+				it('waits for it as the preserved-worker wait, saying when it stops waiting', async () => {
+					lostTransportRun();
+					listProjectDispatchCandidates.mockResolvedValue([candidate('w-free')]);
+
+					const outcome = await processJob(continuation(), registryReturning(planningTrigger()));
+
+					expect(outcome).toMatchObject({ status: 'phase-deferred', preservedWorkerWait: true });
+					expect(phaseCalls).toEqual([]);
+					const [, input] = scheduleDispatchRetry.mock.calls[0] as [
+						string,
+						Record<string, unknown>,
+					];
+					expect(input.waitReason).toBe('preserved-worker');
+					expect(input.lastError).toContain('lost its connection');
+					expect(input.lastError).toMatch(/until \d{4}-\d{2}-\d{2}T/);
+					// Still waiting: nothing settles the carried row yet.
+					expect(completeRun).not.toHaveBeenCalled();
+					expect(addComment).not.toHaveBeenCalled();
+				});
+
+				it('fails once the window passes, with one comment naming the machine and both actions', async () => {
+					lostTransportRun();
+					listProjectDispatchCandidates.mockResolvedValue([candidate('w-free')]);
+
+					const outcome = await processJob(
+						createMockPmWebhookJob({
+							runId: 'run-1',
+							recoveryMode: 'checkpoint',
+							workerEligibilityRecheckAttempt: 1_000_000,
+						}),
+						registryReturning(planningTrigger()),
+					);
+
+					expect(outcome.status).toBe('phase-failed');
+					expect(phaseCalls).toEqual([]);
+					expect(addComment).toHaveBeenCalledOnce();
+					const [, body] = addComment.mock.calls[0];
+					// The machine's display name, the window it waited, and both actions.
+					expect(body).toContain("worker 'worker-w-preserved'");
+					expect(body).toContain('waited 24 hours');
+					expect(body).toContain('Retry now');
+					expect(body).toContain('Reset & restart');
+					expect(failDispatch).toHaveBeenCalledOnce();
+				});
+
+				it('settles the carried row failed without dropping its session, pin or checkpoint', async () => {
+					lostTransportRun();
+					listProjectDispatchCandidates.mockResolvedValue([candidate('w-free')]);
+
+					await processJob(
+						createMockPmWebhookJob({
+							runId: 'run-1',
+							recoveryMode: 'checkpoint',
+							workerEligibilityRecheckAttempt: 1_000_000,
+						}),
+						registryReturning(planningTrigger()),
+					);
+
+					// Not `failRunFromStatus`, which nulls the session a session continuation
+					// re-enters.
+					expect(failRunFromStatus).not.toHaveBeenCalled();
+					expect(completeRun).toHaveBeenCalledOnce();
+					const [settledRunId, input] = completeRun.mock.calls[0] as [
+						string,
+						Record<string, unknown>,
+					];
+					expect(settledRunId).toBe('run-1');
+					expect(input).toMatchObject({ status: 'failed', nextRetryAt: null });
+					expect(input.error).toContain('lost its connection');
+					// Omitted keys are left untouched by `completeRun`.
+					expect(input).not.toHaveProperty('recovery');
+					expect(input).not.toHaveProperty('agentSessionId');
+					expect(input).not.toHaveProperty('checkpoint');
+				});
+
+				it('keeps the busy-machine wait unbounded when the pinned machine never lost its transport', async () => {
+					getRunByIdFromDb.mockResolvedValue({
+						recovery: { preservedWorkerId: 'w-preserved', transportLostWorkerIds: ['w-other'] },
+					});
+					listProjectDispatchCandidates.mockResolvedValue([
+						candidate('w-preserved', { activeRuns: 1 }),
+					]);
+
+					const outcome = await processJob(
+						createMockPmWebhookJob({
+							runId: 'run-1',
+							recoveryMode: 'checkpoint',
+							workerEligibilityRecheckAttempt: 1_000_000,
+						}),
+						registryReturning(planningTrigger()),
+					);
+
+					expect(outcome).toMatchObject({ status: 'phase-deferred', preservedWorkerWait: true });
+					expect(addComment).not.toHaveBeenCalled();
+				});
+
+				it('keeps the pin and session when a lost continuation spends its retry budget', async () => {
+					lostTransportRun();
+					listProjectDispatchCandidates.mockResolvedValue([candidate('w-preserved')]);
+					phaseImpl = async () => {
+						throw new AgentRunError(TRANSPORT_LOST_ORPHAN_REASON, { kind: 'transport-lost' });
+					};
+
+					const outcome = await processJob(
+						createMockPmWebhookJob({
+							runId: 'run-1',
+							recoveryMode: 'checkpoint',
+							automaticRetryAttempt: 1_000_000,
+						}),
+						registryReturning(planningTrigger()),
+						undefined,
+						executionIdentity('w-preserved'),
+					);
+
+					expect(outcome).toMatchObject({
+						status: 'phase-failed',
+						carriedContinuation: 'checkpoint',
+					});
+					const failed = completeRun.mock.calls.find(
+						([, input]) => (input as { status: string }).status === 'failed',
+					) as [string, Record<string, unknown>];
+					expect(failed[0]).toBe('run-1');
+					// A `null` recovery write would drop `preservedWorkerId`.
+					expect(failed[1]).not.toHaveProperty('recovery');
+					expect(failed[1]).not.toHaveProperty('agentSessionId');
+					expect(recordRunPreservedWorker).toHaveBeenCalledWith('run-1');
+				});
+			});
+
 			// Issue #780. The one wait with no budget must not be the one that lets a
 			// held claim lapse — nothing else would ever refresh it again.
 			it('keeps a pinned Review continuation’s dedup claim alive while it waits', async () => {

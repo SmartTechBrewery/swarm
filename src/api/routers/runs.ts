@@ -73,6 +73,7 @@ import {
 import {
 	jobContinuesPreservedCheckout,
 	preservedCheckoutMachineUnknown,
+	preservedContinuationKind,
 } from '../../dispatch/preserved-worker.js';
 import { dropCheckoutContinuation, reconstructRetryJob } from '../../dispatch/retry-payload.js';
 import { RunResetError, type RunResetRefusal, resetRun } from '../../dispatch/run-reset.js';
@@ -481,6 +482,37 @@ function alreadyRetrying(): TRPCError {
  * the gate's reason and the one action that ends it, instead of parking a dispatch on
  * `worker-authorization` until its budget runs out.
  */
+/**
+ * Whether a manual retry of a **failed** run re-enters the session it preserved on its
+ * pinned machine (issue #1141), rather than starting fresh as a failed run's retry
+ * otherwise does. A pinned continuation whose machine lost its transport and never came
+ * back settles `failed` while keeping its pin and session — that is the whole point of
+ * handing it to the operator — and its stored payload still asks to resume the session.
+ * Starting fresh there would drop that intent, so the retry would run unpinned anywhere
+ * and silently redo the work the operator was told "Retry now" continues.
+ *
+ * A checkpoint or delivery continuation needs no help here: the inherited
+ * `'checkpoint'`/`resumeDelivery` survives a fresh-session rebuild. A CLI/model
+ * override cannot re-enter another CLI's session, so it keeps the fresh start.
+ */
+function failedRunContinuesPreservedSession(
+	run: {
+		status: string;
+		agentSessionId: string | null;
+		recovery: { preservedWorkerId?: string | null } | null;
+	},
+	payload: SwarmJob,
+	applyingOverride: boolean,
+): boolean {
+	return (
+		run.status === 'failed' &&
+		!applyingOverride &&
+		Boolean(run.recovery?.preservedWorkerId) &&
+		Boolean(run.agentSessionId) &&
+		preservedContinuationKind(payload) === 'session'
+	);
+}
+
 function placeableRetryJob(
 	job: SwarmJob,
 	run: {
@@ -1563,6 +1595,11 @@ export const runsRouter = router({
 						message: `Cannot retry run "${input.runId}" — its dispatch payload no longer validates.`,
 					});
 				}
+				const continuesSession = failedRunContinuesPreservedSession(
+					run,
+					stored.data,
+					applyingOverride,
+				);
 				const job = placeableRetryJob(
 					reconstructRetryJob(
 						stored.data,
@@ -1571,8 +1608,8 @@ export const runsRouter = router({
 						input.cli,
 						input.model,
 						input.reasoning,
-						startFresh,
-						recoveryMode,
+						startFresh && !continuesSession,
+						continuesSession ? 'resume' : recoveryMode,
 						run.recovery?.agentSessionId ?? run.agentSessionId,
 					),
 					run,
@@ -1599,6 +1636,11 @@ export const runsRouter = router({
 					message: `Cannot retry run "${input.runId}" — it was created without a job payload.`,
 				});
 			}
+			const continuesSession = failedRunContinuesPreservedSession(
+				run,
+				normalizeStoredJobPayload(run.jobPayload),
+				applyingOverride,
+			);
 			const job = placeableRetryJob(
 				reconstructRetryJob(
 					run.jobPayload,
@@ -1607,8 +1649,8 @@ export const runsRouter = router({
 					input.cli,
 					input.model,
 					input.reasoning,
-					startFresh,
-					recoveryMode,
+					startFresh && !continuesSession,
+					continuesSession ? 'resume' : recoveryMode,
 					run.recovery?.agentSessionId ?? run.agentSessionId,
 				),
 				run,

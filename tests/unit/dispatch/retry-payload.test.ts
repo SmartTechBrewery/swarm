@@ -426,6 +426,21 @@ describe('deriveRetryJobPayload', () => {
 			expect(jobContinuesPreservedCheckout(next)).toBe(true);
 		});
 
+		// Issue #1141: the wait for a machine that just lost its transport is bounded,
+		// so it starts from zero rather than from a count an earlier wait spent.
+		it('starts the eligibility re-check counter again', () => {
+			const next = deriveRetryJobPayload(
+				createMockPmWebhookJob({
+					recoveryMode: 'checkpoint',
+					workerEligibilityRecheckAttempt: 500,
+				}),
+				intent,
+			);
+
+			expect(next.workerEligibilityRecheckAttempt).toBeUndefined();
+			expect(next.recoveryMode).toBe('checkpoint');
+		});
+
 		it("never carries a one-shot 'discard'", () => {
 			const next = deriveRetryJobPayload(
 				createMockScmWebhookJob({ recoveryMode: 'discard', resumeDelivery: true }),
@@ -470,6 +485,24 @@ describe('deriveCapacityPendingPayload', () => {
 });
 
 describe('reconstructRetryJob', () => {
+	// Issue #1141: a manual retry bypasses the automatic caps, including the bounded
+	// wait for a pinned machine that lost its transport — so the retry an operator
+	// makes after bringing it back waits a fresh window instead of failing at once.
+	it('resets the worker-eligibility re-check counter', () => {
+		const job = reconstructRetryJob(
+			createMockPmWebhookJob({ recoveryMode: 'checkpoint', workerEligibilityRecheckAttempt: 288 }),
+			'run-1',
+			'implementation',
+			undefined,
+			undefined,
+			undefined,
+			true,
+		);
+
+		expect(job.workerEligibilityRecheckAttempt).toBe(0);
+		expect(job.recoveryMode).toBe('checkpoint');
+	});
+
 	// Two of the three callers ("Retry now"'s reconstruct-from-run-row fallback and
 	// "Reset & restart") pass a raw `run.jobPayload` straight out of `jsonb`, so a
 	// pre-#385 row must be upgraded here — otherwise the rebuilt dispatch persists

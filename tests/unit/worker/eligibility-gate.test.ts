@@ -36,6 +36,7 @@ import {
 	evaluateDispatchEligibility,
 	isAffinityGatedPhase,
 	isAvailabilityRefusal,
+	preservedWorkerLostTransportExpiredMessage,
 	type RunnableDispatchDemand,
 } from '@/worker/eligibility-gate.js';
 
@@ -729,6 +730,34 @@ describe('evaluateDispatchEligibility', () => {
 			if (decision.status !== 'ineligible') throw new Error('unreachable');
 			expect(decision.message).toContain('m3_pro_tp');
 			expect(decision.message).toContain('Reset & restart');
+		});
+
+		// Issue #1141: a pinned machine that lost its transport under this run is waited
+		// for on a bound, and the refusal says so — not "this wait does not time out".
+		it('says a lost pinned machine lost its connection and when SWARM stops waiting', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([makeCandidate('w-free')]);
+			const waitEndsAt = new Date('2026-10-28T09:00:00.000Z');
+
+			const decision = await evaluateDispatchEligibility(
+				gateInput({
+					preservedWorker: {
+						id: 'w-preserved',
+						name: 'm3_pro_tp',
+						lostTransportWaitEndsAt: waitEndsAt,
+					},
+				}),
+			);
+
+			expect(decision).toMatchObject({
+				status: 'ineligible',
+				reason: 'preserved-worker-unavailable',
+			});
+			if (decision.status !== 'ineligible') throw new Error('unreachable');
+			expect(decision.message).toContain("worker 'm3_pro_tp'");
+			expect(decision.message).toContain('lost its connection');
+			expect(decision.message).toContain('until 2026-10-28T09:00:00.000Z');
+			expect(decision.message).toContain('Reset & restart');
+			expect(decision.message).not.toContain('does not time out');
 		});
 
 		it('waits for a pinned machine that is no longer an enrolled candidate at all', async () => {
@@ -1630,5 +1659,22 @@ describe('evaluateDispatchEligibility', () => {
 				reason: 'assignee-worker-unavailable',
 			});
 		});
+	});
+});
+
+describe('preservedWorkerLostTransportExpiredMessage', () => {
+	it('names the machine, how long SWARM waited, and both operator actions', () => {
+		const message = preservedWorkerLostTransportExpiredMessage('m3_pro_tp', 24 * 60 * 60 * 1000);
+
+		expect(message).toContain("worker 'm3_pro_tp'");
+		expect(message).toContain('waited 24 hours');
+		expect(message).toContain('"Retry now"');
+		expect(message).toContain('"Reset & restart"');
+	});
+
+	it('states a window that is not a whole number of hours in minutes', () => {
+		expect(preservedWorkerLostTransportExpiredMessage('w-1', 90 * 60 * 1000)).toContain(
+			'waited 90 minutes',
+		);
 	});
 });

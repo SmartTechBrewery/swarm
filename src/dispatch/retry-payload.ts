@@ -210,8 +210,17 @@ export function deriveRetryJobPayload(parsed: SwarmJob, intent: DeferredRetryInt
 	// re-decided: a session continuation re-enters the same session, while every other
 	// kind *assigns* one — and the lost attempt may already have opened a session under
 	// the id it was assigned, which `claude` refuses to assign twice.
+	//
+	// Its eligibility re-check counter starts again (issue #1141): the attempt that
+	// spent it is over, and the retry's wait for the machine that just lost its
+	// transport is the *bounded* one, so a count carried from an earlier wait would
+	// shorten that window or end it before it began.
 	if (intent.carriedContinuation) {
-		const { recoveryMode: carriedMode, ...rest } = carried;
+		const {
+			recoveryMode: carriedMode,
+			workerEligibilityRecheckAttempt: _priorEligibilityRechecks,
+			...rest
+		} = carried;
 		return {
 			...rest,
 			// The one-shot `'discard'` (issue #592) is never carried, on any branch.
@@ -326,9 +335,12 @@ function applyManualRecoveryIntent(
 
 /**
  * Rebuild a retry job payload from a stored one: carry the originating `runId`
- * forward (so the retry reuses that row) and reset the rate-limit and
- * automatic-retry attempt counters to 0 (a manual retry bypasses the automatic
- * caps), drop any adopted late result (issue #1076), applying any
+ * forward (so the retry reuses that row) and reset the rate-limit,
+ * automatic-retry and worker-eligibility attempt counters to 0 (a manual retry
+ * bypasses the automatic caps — including the bounded wait for a pinned machine
+ * that lost its transport, issue #1141, so "Retry now" after bringing it back waits
+ * a fresh window rather than failing at once while it is momentarily busy), drop
+ * any adopted late result (issue #1076), applying any
  * cli/model overrides. Shared by "Retry now"'s reopen-existing-dispatch path,
  * its reconstruct-from-run-row fallback, and "Reset & restart".
  *
@@ -351,6 +363,7 @@ export function reconstructRetryJob(
 	job.runId = runId;
 	job.rateLimitRetryAttempt = 0;
 	job.automaticRetryAttempt = 0;
+	job.workerEligibilityRecheckAttempt = 0;
 	// A manual retry runs the phase; it never re-settles a late result an earlier
 	// attempt was adopted with (issue #1076).
 	delete job.adoptedResult;
