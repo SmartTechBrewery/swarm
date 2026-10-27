@@ -21,7 +21,7 @@ import { promisify } from 'node:util';
 import type { ProjectConfig } from '../config/schema.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
-import { SCRATCH_PATHSPECS } from '../scm/delivery.js';
+import { HANDOFF_FILENAMES, SCRATCH_PATHSPECS } from '../scm/delivery.js';
 import { normalizeRepoSlug, resolveOriginRepoSlug } from '../scm/repo-slug.js';
 import { CommitUnavailableError } from '../worktree/commit-availability.js';
 import {
@@ -318,6 +318,12 @@ export class GitWorktreeManager {
 	 * run never released it — is taken over rather than treated as `live-leased`
 	 * (issue #427); the checkout behind it then goes through the very same reclaim
 	 * gate, so dirty/unpushed/pinned work is still retained, never force-removed.
+	 *
+	 * The one exception is a checkout an earlier attempt of **this same run** left
+	 * behind, attributed by the runtime's recorded pin or lease owner
+	 * ({@link WorktreeRuntime.isOwnedByRun}, issue #1140): it is reclaimed despite
+	 * dirty or unpushed content, and logged at `warn`, rather than failing the run's
+	 * own retry with a collision. Another run's lease or pin still blocks it.
 	 */
 	async provision(taskId: string, options: ProvisionOptions = {}): Promise<WorktreeHandle> {
 		await this.assertGitRepo();
@@ -327,6 +333,11 @@ export class GitWorktreeManager {
 		}
 
 		const path = this.worktreePath(taskId);
+		// Read before the lease gate (issue #1140): claiming or taking over the lease
+		// rewrites its owner and clears this run's own pin, erasing the evidence.
+		const ownRun =
+			options.runId !== undefined &&
+			(await this.runtime.isOwnedByRun(this.project.id, taskId, options.runId));
 		const leaseToken = randomUUID();
 		const acquired = await this.acquireProvisionLease(taskId, leaseToken, options.runId);
 		if (acquired !== 'acquired') {
@@ -359,29 +370,11 @@ export class GitWorktreeManager {
 		let reclaimedBranch: string | null = null;
 		try {
 			if (existsSync(path)) {
-				try {
-					const branchName = (
-						await this.git(['symbolic-ref', '--short', '-q', 'HEAD'], path)
-					).trim();
-					if (branchName) {
-						reclaimedBranch = branchName;
-					}
-				} catch {
-					// detached HEAD or other error, leave it null
-				}
-
-				const decision = await evaluateWorktreeReclaim(this, this.project.id, taskId, {
-					isLeased: async () => false,
-					isResumablePinned: this.runtime.isResumablePinned,
-				});
-				if (!decision.safe) {
-					throw new BlockedRecoveryError(
-						decision.reason,
-						collisionMessage(taskId, path, decision.detail),
-					);
-				}
-				logger.info('worktree collision: reclaiming safe stale checkout', { taskId, path });
-				await this.removeWorktreeCheckout(path);
+				reclaimedBranch = await this.reclaimExistingCheckout(
+					taskId,
+					path,
+					ownRun ? options.runId : undefined,
+				);
 			} else {
 				await this.runtime.clearPreservation(this.project.id, taskId);
 			}
@@ -399,6 +392,61 @@ export class GitWorktreeManager {
 			await this.runtime.release(this.project.id, taskId, leaseToken);
 			throw err;
 		}
+	}
+
+	/**
+	 * Decide the fate of an existing `task-<id>` checkout under a held provision
+	 * lease: remove it when the reclaim gate allows, or throw the gate's
+	 * {@link BlockedRecoveryError}. Returns the branch it had checked out, for the
+	 * caller to delete before re-provisioning.
+	 *
+	 * `ownRunId` is set when the checkout was left by an earlier attempt of the run
+	 * now provisioning (issue #1140). That checkout skips the content checks: this
+	 * is a fresh attempt by its payload (a continuation adopts through the recovery
+	 * gate instead), and the lease is held here, so nothing else is using it. A
+	 * different run's pin still protects it.
+	 */
+	private async reclaimExistingCheckout(
+		taskId: string,
+		path: string,
+		ownRunId: string | undefined,
+	): Promise<string | null> {
+		let branch: string | null = null;
+		try {
+			branch = (await this.git(['symbolic-ref', '--short', '-q', 'HEAD'], path)).trim() || null;
+		} catch {
+			// detached HEAD or other error, leave it null
+		}
+
+		const gateDeps = {
+			isLeased: async () => false,
+			isResumablePinned: this.runtime.isResumablePinned,
+		};
+		const decision = ownRunId
+			? await evaluateWorktreeLiveness(this.project.id, taskId, gateDeps)
+			: await evaluateWorktreeReclaim(this, this.project.id, taskId, gateDeps);
+		if (!decision.safe) {
+			throw new BlockedRecoveryError(
+				decision.reason,
+				collisionMessage(taskId, path, decision.detail),
+			);
+		}
+		if (ownRunId) {
+			logger.warn(
+				"worktree collision: reclaiming this run's own checkout from an earlier attempt — any work in it is discarded",
+				{
+					projectId: this.project.id,
+					taskId,
+					runId: ownRunId,
+					path,
+					hasCheckpoint: existsSync(resolve(path, HANDOFF_FILENAMES.checkpoint)),
+				},
+			);
+		} else {
+			logger.info('worktree collision: reclaiming safe stale checkout', { taskId, path });
+		}
+		await this.removeWorktreeCheckout(path);
+		return branch;
 	}
 
 	/**

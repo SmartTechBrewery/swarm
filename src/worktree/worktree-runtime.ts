@@ -19,6 +19,13 @@ export interface WorktreeRuntime {
 	isLeased(projectId: string, taskId: string): Promise<boolean>;
 	hasLiveOwner(projectId: string, taskId: string, runId?: string): Promise<boolean>;
 	isResumablePinned(projectId: string, taskId: string): Promise<boolean>;
+	/**
+	 * Whether the task's coordination artifacts name `runId` as their owner — the
+	 * checkout was left by an earlier attempt of this same run (issue #1140). A
+	 * recorded fact rather than a liveness answer, so an expired artifact still
+	 * identifies its owner; anything unattributable answers `false`.
+	 */
+	isOwnedByRun(projectId: string, taskId: string, runId: string): Promise<boolean>;
 	isCancellationRequested(runId: string): Promise<boolean>;
 	/** Preserve a checkout for a retry. Store-backed leases already remain held. */
 	preserve(projectId: string, taskId: string, runId?: string): Promise<void>;
@@ -65,6 +72,11 @@ export const storeBackedWorktreeRuntime: WorktreeRuntime = {
 	async isResumablePinned(projectId, taskId) {
 		const { hasResumableDeferredRun } = await import('../db/repositories/runsRepository.js');
 		return hasResumableDeferredRun(projectId, taskId);
+	},
+	async isOwnedByRun() {
+		// The Redis lease records only a token, never the run behind it, so there is
+		// no owner to attribute — fail closed to the full reclaim gate.
+		return false;
 	},
 	async isCancellationRequested(runId) {
 		const { isRunCancellationRequested } = await import('../queue/cancellation.js');
