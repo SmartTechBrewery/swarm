@@ -1668,7 +1668,59 @@ describe('runsRouter', () => {
 					workerId: 'w-1',
 					workerName: 'm3_pro_tp',
 					waiting: true,
+					waitEndsAt: null,
 				});
+			});
+
+			// Issue #1141: the bounded wait for a machine that lost its transport must not
+			// read as "does not time out" on the run detail, so its end is reported.
+			it('reports when SWARM stops waiting for a pinned machine that lost its transport', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({
+						id: 'run-1',
+						status: 'checkpointed',
+						recovery: { preservedWorkerId: 'w-1', transportLostWorkerIds: ['w-1'] },
+					}),
+				);
+				vi.mocked(getWorker).mockResolvedValue({ id: 'w-1', displayName: 'm3_pro_tp' } as never);
+				vi.mocked(getActiveDispatchByRunId).mockResolvedValue(
+					makeDispatch({
+						state: 'retry-scheduled',
+						waitReason: 'preserved-worker',
+						jobPayload: createMockPmWebhookJob({
+							runId: 'run-1',
+							recoveryMode: 'checkpoint',
+							preservedWorkerLostTransportAt: '2026-10-27T01:00:00.000Z',
+						}),
+					}),
+				);
+
+				const result = await caller.getById({ id: 'run-1' });
+
+				expect(result.preservedWorker).toMatchObject({
+					waiting: true,
+					waitEndsAt: '2026-10-28T01:00:00.000Z',
+				});
+			});
+
+			it('keeps the wait unbounded once the lost machine came back and served the run', async () => {
+				// The sticky list still names the machine, but the waiting payload carries no
+				// loss: a later attempt ran on it, so this is #567's wait again.
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({
+						id: 'run-1',
+						status: 'checkpointed',
+						recovery: { preservedWorkerId: 'w-1', transportLostWorkerIds: ['w-1'] },
+					}),
+				);
+				vi.mocked(getWorker).mockResolvedValue({ id: 'w-1', displayName: 'm3_pro_tp' } as never);
+				vi.mocked(getActiveDispatchByRunId).mockResolvedValue(
+					makeDispatch({ state: 'retry-scheduled', waitReason: 'preserved-worker' }),
+				);
+
+				const result = await caller.getById({ id: 'run-1' });
+
+				expect(result.preservedWorker).toMatchObject({ waiting: true, waitEndsAt: null });
 			});
 
 			it('does not report a pinned run as waiting when the pin is not what blocks it', async () => {
@@ -1731,6 +1783,7 @@ describe('runsRouter', () => {
 					workerId: 'w-1',
 					workerName: 'm3_pro_tp',
 					waiting: false,
+					waitEndsAt: null,
 				});
 				expect(getActiveDispatchByRunId).not.toHaveBeenCalled();
 			});

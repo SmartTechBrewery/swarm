@@ -198,22 +198,23 @@ export class WorkerIneligibleError extends Error {
 	readonly reason: DispatchIneligibilityReason;
 	/**
 	 * Set on a `preserved-worker-unavailable` refusal whose pinned machine **lost its
-	 * transport under this run** (issue #1141) — the machine's display label (or id).
-	 * Its presence is what bounds that wait: the worker gives up after a fixed window
-	 * and hands the run to the operator, where a pinned machine that is merely busy
-	 * keeps #567's unbounded wait.
+	 * transport under the attempt this dispatch re-attempts** (issue #1141): the
+	 * machine's display label (or id), and the instant the wait for it ends. Its
+	 * presence is what bounds that wait: the worker gives up once `waitEndsAt` has
+	 * passed and hands the run to the operator, where a pinned machine that is merely
+	 * busy keeps #567's unbounded wait.
 	 */
-	readonly lostTransportWorker?: string;
+	readonly lostTransport?: { worker: string; waitEndsAt: Date };
 
 	constructor(
 		reason: DispatchIneligibilityReason,
 		message: string,
-		options?: { lostTransportWorker?: string },
+		options?: { lostTransport?: { worker: string; waitEndsAt: Date } },
 	) {
 		super(message);
 		this.name = 'WorkerIneligibleError';
 		this.reason = reason;
-		this.lostTransportWorker = options?.lostTransportWorker;
+		this.lostTransport = options?.lostTransport;
 	}
 }
 
@@ -304,9 +305,10 @@ export interface DispatchGateInput {
 	 * (unenrolled since, or never enrolled in this project); the id is the fallback.
 	 *
 	 * `lostTransportWaitEndsAt` is set when that machine **lost its transport under
-	 * this run** (issue #1141): the caller bounds that wait, and this is the instant it
-	 * stops waiting, so the refusal can say the machine lost its connection and when
-	 * SWARM gives up on it. Absent, the wait is #567's unbounded one.
+	 * the attempt this dispatch re-attempts** (issue #1141): the caller bounds that
+	 * wait, and this is the instant it stops waiting, so the refusal can say the
+	 * machine lost its connection and when SWARM gives up on it. Absent, the wait is
+	 * #567's unbounded one.
 	 */
 	preservedWorker?: { id: string; name?: string; lostTransportWaitEndsAt?: Date };
 	/**
@@ -571,10 +573,12 @@ function ineligibilityMessage(
 		//
 		// A machine that lost its transport under this run (issue #1141) is the one
 		// variant with an ending: it may never come back, so the text says so and names
-		// the instant SWARM stops waiting instead of promising a wait without end.
+		// the instant SWARM stops waiting instead of promising a wait without end. It
+		// does not claim the machine is still disconnected — the same refusal covers one
+		// that has reconnected but is busy.
 		case 'preserved-worker-unavailable':
 			if (context.preservedWorkerLostTransportUntil) {
-				return `This run continues work preserved on worker '${context.preservedWorker ?? 'unknown'}', so it can only run there. That machine lost its connection to SWARM while running this phase and has not come back. Waiting for it to reconnect until ${context.preservedWorkerLostTransportUntil.toISOString()} — nothing is started over on another machine. If it is still not back by then, SWARM stops waiting and marks this run failed, keeping the preserved work. To give up the preserved work and restart this phase from scratch on any worker, use "Reset & restart".`;
+				return `This run continues work preserved on worker '${context.preservedWorker ?? 'unknown'}', so it can only run there. That machine lost its connection to SWARM while running this phase and is not available to take it yet. Waiting for it until ${context.preservedWorkerLostTransportUntil.toISOString()} — nothing is started over on another machine. If it is still not available by then, SWARM stops waiting and marks this run failed, keeping the preserved work. To give up the preserved work and restart this phase from scratch on any worker, use "Reset & restart".`;
 			}
 			return `This run continues work preserved on worker '${context.preservedWorker ?? 'unknown'}', so it can only run there. That machine is not currently available to take it. Waiting for it — this wait does not time out and nothing is started over on another machine. To give up the preserved work and restart this phase from scratch on any worker, use "Reset & restart".`;
 		// Same shape as the case above — name the condition, say what it means, name the
@@ -634,15 +638,17 @@ export function preservedWorkerLostTransportExpiredMessage(
 	worker: string,
 	waitedMs: number,
 ): string {
-	return `This run continues work preserved on worker '${worker}', so it can only run there. That machine lost its connection to SWARM while running this phase, and SWARM waited ${describeWaitDuration(waitedMs)} for it to reconnect without it coming back, so it has stopped waiting. The preserved work is kept. Either bring '${worker}' back online and use "Retry now" to continue from the preserved work there, or use "Reset & restart" to give the preserved work up and restart this phase from scratch on any worker.`;
+	return `This run continues work preserved on worker '${worker}', so it can only run there. That machine lost its connection to SWARM while running this phase, and in the ${describeWaitDuration(waitedMs)} since then it has not been available to take this run, so SWARM has stopped waiting. The preserved work is kept. Either bring '${worker}' back online and use "Retry now" to continue from the preserved work there, or use "Reset & restart" to give the preserved work up and restart this phase from scratch on any worker.`;
 }
 
-/** A wait length in the coarsest whole unit that states it — "24 hours", "90 minutes". */
+/**
+ * A wait length as an operator reads it — whole hours from two hours up ("24 hours",
+ * even when the re-check cadence made it a few minutes more), minutes below that.
+ */
 function describeWaitDuration(ms: number): string {
 	const minutes = Math.max(1, Math.round(ms / 60_000));
-	if (minutes % 60 !== 0) return `${minutes} minute${minutes === 1 ? '' : 's'}`;
-	const hours = minutes / 60;
-	return `${hours} hour${hours === 1 ? '' : 's'}`;
+	if (minutes < 120) return `${minutes} minute${minutes === 1 ? '' : 's'}`;
+	return `${Math.round(minutes / 60)} hours`;
 }
 
 /**

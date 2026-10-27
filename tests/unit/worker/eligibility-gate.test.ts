@@ -758,6 +758,10 @@ describe('evaluateDispatchEligibility', () => {
 			expect(decision.message).toContain('until 2026-10-28T09:00:00.000Z');
 			expect(decision.message).toContain('Reset & restart');
 			expect(decision.message).not.toContain('does not time out');
+			// The same refusal covers a machine that has reconnected but is busy, so the
+			// text must not claim it is still disconnected.
+			expect(decision.message).toContain('is not available to take it yet');
+			expect(decision.message).not.toContain('has not come back');
 		});
 
 		it('waits for a pinned machine that is no longer an enrolled candidate at all', async () => {
@@ -1667,14 +1671,22 @@ describe('preservedWorkerLostTransportExpiredMessage', () => {
 		const message = preservedWorkerLostTransportExpiredMessage('m3_pro_tp', 24 * 60 * 60 * 1000);
 
 		expect(message).toContain("worker 'm3_pro_tp'");
-		expect(message).toContain('waited 24 hours');
+		expect(message).toContain('in the 24 hours since then');
 		expect(message).toContain('"Retry now"');
 		expect(message).toContain('"Reset & restart"');
+		// True whether the machine is still away or reconnected but busy.
+		expect(message).not.toContain('without it coming back');
 	});
 
-	it('states a window that is not a whole number of hours in minutes', () => {
+	it('states a long wait in whole hours, even a re-check past the window', () => {
+		expect(
+			preservedWorkerLostTransportExpiredMessage('w-1', 24 * 60 * 60 * 1000 + 5 * 60 * 1000),
+		).toContain('in the 24 hours since then');
+	});
+
+	it('states a short wait in minutes', () => {
 		expect(preservedWorkerLostTransportExpiredMessage('w-1', 90 * 60 * 1000)).toContain(
-			'waited 90 minutes',
+			'in the 90 minutes since then',
 		);
 	});
 });

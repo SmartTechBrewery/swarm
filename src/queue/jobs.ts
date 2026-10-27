@@ -348,6 +348,18 @@ const jobBase = z.object({
 	 */
 	workerEligibilityRecheckAttempt: z.number().int().nonnegative().optional(),
 	/**
+	 * When the machine holding this continuation's preserved checkout lost its
+	 * transport under the attempt this dispatch re-attempts (issue #1141) — ISO
+	 * instant, set by `deriveRetryJobPayload`'s carried-continuation branch. It is what
+	 * bounds the pinned wait for that machine (`lostTransportPreservedWaitEndsAt`,
+	 * `src/dispatch/preserved-worker.ts`), and it marks *this* loss only: the
+	 * token-free re-checks that wait for the machine carry it, while every payload
+	 * derived from an attempt that ran past the gate — and every manual retry — drops
+	 * it, so a machine that came back and served the run is never again waited for on
+	 * the bound.
+	 */
+	preservedWorkerLostTransportAt: z.string().datetime().optional(),
+	/**
 	 * How many times this job has been re-checked while another dispatch held the
 	 * PR+SHA review-dispatch slot it needs (issue #1019): a continuation — an
 	 * operator's "Retry now", a "Reset & restart" — that meets a *live* claim is

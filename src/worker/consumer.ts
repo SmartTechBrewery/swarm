@@ -87,6 +87,7 @@ import {
 } from '../dispatch/dispatcher.js';
 import {
 	jobContinuesPreservedCheckout,
+	lostTransportPreservedWaitEndsAt,
 	type PreservedContinuationKind,
 	preservedCheckoutMachineUnknown,
 	preservedContinuationKind,
@@ -484,22 +485,6 @@ const MAX_DEPENDENCY_RECHECKS = maxDependencyRechecks(
  */
 const ELIGIBILITY_RECHECK_INTERVAL_MS = DEPENDENCY_RECHECK_INTERVAL_MS;
 const MAX_ELIGIBILITY_RECHECKS = MAX_DEPENDENCY_RECHECKS;
-/**
- * How long a pinned continuation waits for its preserved machine when that machine
- * **lost its transport under this run** (issue #1141), before handing the run to the
- * operator. #567's wait for a machine that is merely busy has no bound, because that
- * machine will come back; one that dropped off mid-run may not, and an unbounded wait
- * for it leaves the work invisible to everybody. A day is long enough to outlast a
- * reboot, a network outage or a laptop closed overnight. Deliberately a constant, not
- * a setting, and counted in re-checks of the shared eligibility cadence — the counter
- * starts again at each transport loss (`deriveRetryJobPayload`'s carried branch) and
- * at each "Retry now".
- */
-const LOST_TRANSPORT_PRESERVED_WAIT_MS = 24 * 60 * 60 * 1000;
-const MAX_LOST_TRANSPORT_PRESERVED_RECHECKS = Math.max(
-	1,
-	Math.ceil(LOST_TRANSPORT_PRESERVED_WAIT_MS / ELIGIBILITY_RECHECK_INTERVAL_MS),
-);
 /**
  * Floor on the retry delay, deliberately above the review-dispatch-dedup TTL
  * (5 min, `src/triggers/review-dispatch-dedup.ts`): a review retry that fires
@@ -1082,12 +1067,13 @@ async function retainContinuationDispatchClaim(
  * the phase to run anywhere. A *structural* refusal from that machine still expires
  * normally — the gate only frames "busy/offline" this way.
  *
- * **…unless that machine lost its transport under this run** (issue #1141,
- * {@link WorkerIneligibleError.lostTransportWorker}). It stays the same
- * `preserved-worker` wait, but on a {@link LOST_TRANSPORT_PRESERVED_WAIT_MS} budget:
- * a machine that dropped off mid-run may never come back, so once the window passes
- * the caller settles the run failed — keeping its pin, checkpoint and session for
- * "Retry now" — rather than waiting on it forever.
+ * **…unless that machine lost its transport under the attempt this dispatch
+ * re-attempts** (issue #1141, {@link WorkerIneligibleError.lostTransport}). It stays
+ * the same `preserved-worker` wait, but bounded by the window
+ * `lostTransportPreservedWaitEndsAt` measures from that loss: a machine that dropped
+ * off mid-run may never come back, so once the window passes the caller settles the
+ * run failed — keeping its pin, checkpoint and session for "Retry now" — rather than
+ * waiting on it forever.
  */
 async function deferWorkerIneligible(
 	err: WorkerIneligibleError,
@@ -1103,13 +1089,13 @@ async function deferWorkerIneligible(
 	const preservedWorkerWait = err.reason === 'preserved-worker-unavailable';
 	const lostTransport = isLostPreservedWorkerWait(err);
 	const unbounded = preservedWorkerWait && !lostTransport;
-	const maxRechecks = lostTransport
-		? MAX_LOST_TRANSPORT_PRESERVED_RECHECKS
-		: MAX_ELIGIBILITY_RECHECKS;
-	if (!unbounded && attempt >= maxRechecks) {
+	const exhausted = lostTransport
+		? Date.now() >= err.lostTransport.waitEndsAt.getTime()
+		: !unbounded && attempt >= MAX_ELIGIBILITY_RECHECKS;
+	if (exhausted) {
 		logger.error(
 			lostTransport
-				? `Phase failed - ${phaseLabel(trigger.phase)} — the machine holding its preserved checkout did not reconnect after ${attempt} re-checks`
+				? `Phase failed - ${phaseLabel(trigger.phase)} — the machine holding its preserved checkout was not available again within the window after it lost its transport`
 				: `Phase failed - ${phaseLabel(trigger.phase)} — no eligible worker after ${attempt} re-checks`,
 			{ projectId, phase: trigger.phase, taskId: trigger.taskId, reason: err.reason, error },
 		);
@@ -1180,30 +1166,28 @@ async function deferWorkerIneligible(
 }
 
 /** Whether this refusal is the bounded wait for a pinned machine that lost its transport (issue #1141). */
-function isLostPreservedWorkerWait(err: unknown): err is WorkerIneligibleError {
+function isLostPreservedWorkerWait(err: unknown): err is WorkerIneligibleError & {
+	lostTransport: NonNullable<WorkerIneligibleError['lostTransport']>;
+} {
 	return (
 		err instanceof WorkerIneligibleError &&
 		err.reason === 'preserved-worker-unavailable' &&
-		err.lostTransportWorker !== undefined
+		err.lostTransport !== undefined
 	);
 }
 
 /**
  * The terminal text once the bounded wait for a lost pinned machine has run out
  * (issue #1141), or `undefined` for every other refusal. Composed here rather than by
- * the gate because only the consumer knows how many re-checks the wait spent — capped
- * at the window, since a payload written before the counter was reset at the loss
- * can carry more than the window's worth.
+ * the gate because it is the consumer that decides the wait is over. The time it
+ * names is the wait actually spent — from the loss to now — not a re-check count,
+ * which can have been carried in from an earlier wait.
  */
 function lostPreservedWorkerExpiredError(err: unknown, job: SwarmJob): string | undefined {
-	if (!isLostPreservedWorkerWait(err) || err.lostTransportWorker === undefined) return undefined;
-	const rechecks = Math.min(
-		job.workerEligibilityRecheckAttempt ?? 0,
-		MAX_LOST_TRANSPORT_PRESERVED_RECHECKS,
-	);
+	if (!isLostPreservedWorkerWait(err) || !job.preservedWorkerLostTransportAt) return undefined;
 	return preservedWorkerLostTransportExpiredMessage(
-		err.lostTransportWorker,
-		rechecks * ELIGIBILITY_RECHECK_INTERVAL_MS,
+		err.lostTransport.worker,
+		Date.now() - Date.parse(job.preservedWorkerLostTransportAt),
 	);
 }
 
@@ -4626,11 +4610,12 @@ async function handlePhaseFailure(
  */
 interface PreservedWorkerPin {
 	/**
-	 * The machine that holds the checkout, when the run records one. `lostTransport`
-	 * is true when that machine lost its transport under this run (issue #1141,
-	 * `recovery.transportLostWorkerIds`), which bounds the wait for it.
+	 * The machine that holds the checkout, when the run records one.
+	 * `lostTransportWaitEndsAt` is set when that machine lost its transport under the
+	 * attempt this dispatch re-attempts (issue #1141), and is when the — then bounded
+	 * — wait for it ends; see `lostTransportPreservedWaitEndsAt`.
 	 */
-	worker?: { id: string; name?: string; lostTransport: boolean };
+	worker?: { id: string; name?: string; lostTransportWaitEndsAt?: Date };
 	/**
 	 * This dispatch continues a preserved checkout, the run records no machine for
 	 * it, and an earlier attempt nevertheless bound one — so the checkout exists on
@@ -4688,10 +4673,14 @@ async function resolvePreservedWorkerPin(job: SwarmJob): Promise<PreservedWorker
 	}
 	const workerId = run?.recovery?.preservedWorkerId;
 	if (!workerId) return { machineUnknown: preservedCheckoutMachineUnknown(run) };
-	const lostTransport = run?.recovery?.transportLostWorkerIds?.includes(workerId) === true;
+	const lostTransportWaitEndsAt = lostTransportPreservedWaitEndsAt(job, run);
 	try {
 		return {
-			worker: { id: workerId, name: (await getWorker(workerId))?.displayName, lostTransport },
+			worker: {
+				id: workerId,
+				name: (await getWorker(workerId))?.displayName,
+				lostTransportWaitEndsAt,
+			},
 			machineUnknown: false,
 		};
 	} catch (err) {
@@ -4700,17 +4689,8 @@ async function resolvePreservedWorkerPin(job: SwarmJob): Promise<PreservedWorker
 			workerId,
 			error: describeError(err),
 		});
-		return { worker: { id: workerId, lostTransport }, machineUnknown: false };
+		return { worker: { id: workerId, lostTransportWaitEndsAt }, machineUnknown: false };
 	}
-}
-
-/** When the bounded wait for a pinned machine that lost its transport ends (issue #1141). */
-function lostTransportWaitEndsAt(job: SwarmJob): Date {
-	const remaining = Math.max(
-		0,
-		MAX_LOST_TRANSPORT_PRESERVED_RECHECKS - (job.workerEligibilityRecheckAttempt ?? 0),
-	);
-	return new Date(Date.now() + remaining * ELIGIBILITY_RECHECK_INTERVAL_MS);
 }
 
 /**
@@ -4801,13 +4781,7 @@ async function gateDispatch(
 				// The machine holding this continuation's preserved checkout, when there
 				// is one (issue #567) — the hardest narrowing the gate applies — and, when
 				// it lost its transport under this run, when the wait for it ends (#1141).
-				preservedWorker: preservedPin.worker && {
-					id: preservedPin.worker.id,
-					name: preservedPin.worker.name,
-					lostTransportWaitEndsAt: preservedPin.worker.lostTransport
-						? lostTransportWaitEndsAt(job)
-						: undefined,
-				},
+				preservedWorker: preservedPin.worker,
 				// …and the case where there is a checkout to continue but no machine
 				// recorded for it (issue #954). The gate refuses that rather than routing
 				// it, but only once it knows the project is federated at all.
@@ -4840,10 +4814,11 @@ async function gateDispatch(
 	if (decision.status === 'unfederated') return undefined;
 	if (decision.status === 'ineligible') {
 		const pinned = preservedPin.worker;
+		const waitEndsAt = pinned?.lostTransportWaitEndsAt;
 		throw new WorkerIneligibleError(decision.reason, decision.message, {
-			lostTransportWorker:
-				decision.reason === 'preserved-worker-unavailable' && pinned?.lostTransport
-					? (pinned.name ?? pinned.id)
+			lostTransport:
+				decision.reason === 'preserved-worker-unavailable' && pinned && waitEndsAt
+					? { worker: pinned.name ?? pinned.id, waitEndsAt }
 					: undefined,
 		});
 	}

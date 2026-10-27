@@ -72,6 +72,7 @@ import {
 } from '../../dispatch/item-liveness.js';
 import {
 	jobContinuesPreservedCheckout,
+	lostTransportPreservedWaitEndsAt,
 	preservedCheckoutMachineUnknown,
 	preservedContinuationKind,
 } from '../../dispatch/preserved-worker.js';
@@ -750,6 +751,14 @@ export interface RunPreservedWorker {
 	 * rather than on the run's status.
 	 */
 	waiting: boolean;
+	/**
+	 * When the wait is the **bounded** one for a pinned machine that lost its
+	 * transport under this run (issue #1141), the ISO instant SWARM stops waiting and
+	 * fails the run — the same instant the worker enforces
+	 * (`lostTransportPreservedWaitEndsAt`). `null` while not waiting, and for #567's
+	 * unbounded wait, so "this wait does not time out" is said only when it is true.
+	 */
+	waitEndsAt: string | null;
 }
 
 /**
@@ -792,13 +801,19 @@ async function resolveRunLateResultAccepted(run: {
  *
  * This is what lets a run *say which machine it is waiting for*, to every viewer,
  * for as long as it waits — the wait is unbounded by design, so it must never read
- * as a wedged run. Resolved server-side like every other display label here, and a
- * failed lookup degrades to a null name (and to "not waiting", the weaker claim)
- * rather than throwing.
+ * as a wedged run. The one exception, a machine that lost its transport under this
+ * run (issue #1141), is read off the waiting dispatch's own payload so the callout
+ * can name when SWARM stops waiting. Resolved server-side like every other display
+ * label here, and a failed lookup degrades to a null name (and to "not waiting",
+ * the weaker claim) rather than throwing.
  */
 async function resolveRunPreservedWorker(run: {
 	id: string;
-	recovery: { preservedWorkerId?: string | null; abandonedWorkerId?: string | null } | null;
+	recovery: {
+		preservedWorkerId?: string | null;
+		abandonedWorkerId?: string | null;
+		transportLostWorkerIds?: string[] | null;
+	} | null;
 }): Promise<RunPreservedWorker | null> {
 	const preserved = run.recovery?.preservedWorkerId ?? null;
 	const abandoned = run.recovery?.abandonedWorkerId ?? null;
@@ -812,18 +827,23 @@ async function resolveRunPreservedWorker(run: {
 			// history and never queries the queue.
 			preserved ? getActiveDispatchByRunId(run.id) : Promise.resolve(undefined),
 		]);
+		const waiting = dispatch?.waitReason === 'preserved-worker';
+		const waitEndsAt = waiting
+			? lostTransportPreservedWaitEndsAt(dispatch.jobPayload, run)
+			: undefined;
 		return {
 			state,
 			workerId,
 			workerName: worker?.displayName ?? null,
-			waiting: dispatch?.waitReason === 'preserved-worker',
+			waiting,
+			waitEndsAt: waitEndsAt?.toISOString() ?? null,
 		};
 	} catch (error) {
 		logger.warn('runs.getById: preserved-worker lookup failed; reporting the id without a name', {
 			workerId,
 			error: describeError(error),
 		});
-		return { state, workerId, workerName: null, waiting: false };
+		return { state, workerId, workerName: null, waiting: false, waitEndsAt: null };
 	}
 }
 
