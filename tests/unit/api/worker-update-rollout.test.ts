@@ -2384,3 +2384,178 @@ describe('advanceRollout — replaying the 2026-10-08 false halt', () => {
 		]);
 	});
 });
+
+describe('a machine already on the target build (issue #1146)', () => {
+	const TARGET = 'eb9b79e4a1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6';
+	const WORKER_D = '44444444-4444-4444-8444-444444444444';
+	const onTarget = { commit: TARGET, dirty: false };
+
+	it('starts nothing, and drains nobody, when every machine already declares the target', async () => {
+		listWorkersForOwner.mockResolvedValue([
+			makeWorker(WORKER_A, { build: onTarget }),
+			makeWorker(WORKER_B, { build: { commit: 'eb9b79e', dirty: false } }),
+		]);
+
+		const result = await startRollout({ ownerUserId: OWNER_ID, scope: 'owner', target: TARGET });
+
+		expect(result).toEqual({ outcome: 'all-current' });
+		expect(createRollout).not.toHaveBeenCalled();
+		expect(setWorkerDraining).not.toHaveBeenCalled();
+		expect(fanOutWorkerUpdate).not.toHaveBeenCalled();
+	});
+
+	it('starts a rollout when one machine’s build cannot be compared, rather than reading it as current', async () => {
+		const workers = [
+			makeWorker(WORKER_A, { build: onTarget }),
+			makeWorker(WORKER_B, { build: null }),
+		];
+		listWorkersForOwner.mockResolvedValue(workers);
+		createRollout.mockResolvedValue({ rollout: makeRollout({ target: TARGET }), members: [] });
+		givenRollout(makeRollout({ target: TARGET }), [
+			makeMember(WORKER_A, 0),
+			makeMember(WORKER_B, 1),
+		]);
+		givenWorkers(...workers);
+		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry(WORKER_B, 'requested')]);
+
+		const result = await startRollout({ ownerUserId: OWNER_ID, scope: 'owner', target: TARGET });
+
+		expect(result.outcome).toBe('started');
+		expect(setWorkerDraining).toHaveBeenCalledExactlyOnceWith(WORKER_B, true);
+	});
+
+	it('leaves current machines in the pool, untouched, and moves only the outdated one', async () => {
+		const workers = [
+			makeWorker(WORKER_A, { build: onTarget }),
+			makeWorker(WORKER_B),
+			makeWorker(WORKER_C, { build: null }),
+		];
+		listWorkersForOwner.mockResolvedValue(workers);
+		createRollout.mockResolvedValue({ rollout: makeRollout({ target: TARGET }), members: [] });
+		givenRollout(makeRollout({ target: TARGET }), [
+			makeMember(WORKER_A, 0),
+			makeMember(WORKER_B, 1),
+			makeMember(WORKER_C, 2),
+		]);
+		givenWorkers(...workers);
+		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry(WORKER_B, 'requested')]);
+
+		const result = await startRollout({ ownerUserId: OWNER_ID, scope: 'owner', target: TARGET });
+
+		// The whole fleet is still a member, so the readout shows it was considered.
+		expect(createRollout).toHaveBeenCalledWith(
+			expect.objectContaining({ workerIds: [WORKER_A, WORKER_B, WORKER_C] }),
+		);
+		expect(result.outcome).toBe('started');
+		const members = result.outcome === 'started' ? result.view.members : [];
+		expect(members[0]).toMatchObject({
+			state: 'current',
+			outcome: null,
+			message: expect.stringContaining('already on the rollout’s target build'),
+			settledAt: NOW,
+		});
+		expect(setWorkerDraining).not.toHaveBeenCalledWith(WORKER_A, expect.anything());
+		expect(fanOutWorkerUpdate).toHaveBeenCalledExactlyOnceWith(
+			[expect.objectContaining({ id: WORKER_B })],
+			TARGET,
+			OWNER_ID,
+		);
+		expect(members[1].state).toBe('signalled');
+		// Unknown is handled as outdated: it waits for its own wave.
+		expect(members[2].state).toBe('queued');
+	});
+
+	it('settles a machine already on the target as current even while it is offline', async () => {
+		givenRollout(makeRollout({ target: TARGET }), [makeMember(WORKER_A, 0)]);
+		givenWorkers(makeWorker(WORKER_A, { build: onTarget }));
+		getLiveSessionForWorker.mockResolvedValue(undefined);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members[0].state).toBe('current');
+		expect(view?.rollout.status).toBe('completed');
+	});
+
+	it('drains and asks a machine on the target commit whose build is dirty', async () => {
+		givenRollout(makeRollout({ target: TARGET }), [makeMember(WORKER_A, 0)]);
+		givenWorkers(makeWorker(WORKER_A, { build: { commit: TARGET, dirty: true } }));
+		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry(WORKER_A, 'requested')]);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_A, true);
+		expect(view?.members[0].state).toBe('signalled');
+	});
+
+	// A branch cannot be resolved to a commit without a fetch, so it is never "current".
+	it('drains and asks every machine when the target is a branch', async () => {
+		givenRollout(makeRollout({ target: 'main' }), [makeMember(WORKER_A, 0)]);
+		givenWorkers(makeWorker(WORKER_A, { build: { commit: 'aaaaaaa', dirty: false } }));
+		fanOutWorkerUpdate.mockResolvedValue([fanoutEntry(WORKER_A, 'requested')]);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(setWorkerDraining).toHaveBeenCalledWith(WORKER_A, true);
+		expect(view?.members[0].state).toBe('signalled');
+	});
+
+	// `current` restarted nothing, so it is no evidence that the build starts.
+	it('does not let a current member reset the run of failed hosts', async () => {
+		const failed = (workerId: string, position: number) =>
+			makeMember(workerId, position, {
+				state: 'failed',
+				outcome: 'refused',
+				message: 'git fetch failed',
+				settledAt: NOW,
+			});
+		givenRollout(makeRollout({ target: TARGET }), [
+			failed(WORKER_A, 0),
+			makeMember(WORKER_B, 1, { state: 'current', settledAt: NOW }),
+			failed(WORKER_C, 2),
+			makeMember(WORKER_D, 3, {
+				state: 'signalled',
+				requestId: REQUEST_A,
+				drainedByRollout: true,
+				signalledAt: new Date('2026-09-13T11:05:00Z'),
+			}),
+		]);
+		givenWorkers(
+			makeWorker(WORKER_A),
+			makeWorker(WORKER_B, { build: onTarget }),
+			makeWorker(WORKER_C),
+			reported(WORKER_D, 'refused', {
+				update: {
+					requestId: null,
+					target: TARGET,
+					requestedAt: new Date('2026-09-13T11:05:00Z'),
+					requestedByUserId: REQUESTER_ID,
+					status: 'refused',
+					message: 'git fetch failed',
+					reportedAt: new Date('2026-09-13T11:59:30Z'),
+				},
+			}),
+		);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.rollout.status).toBe('halted');
+		expect(view?.rollout.haltReason).toContain('3 different hosts in a row');
+	});
+
+	it('completes once the only outdated machine is done and the rest are current', async () => {
+		givenRollout(makeRollout({ target: TARGET }), [
+			makeMember(WORKER_A, 0, { state: 'done', settledAt: NOW }),
+			makeMember(WORKER_B, 1),
+		]);
+		givenWorkers(
+			makeWorker(WORKER_A, { build: onTarget }),
+			makeWorker(WORKER_B, { build: onTarget }),
+		);
+
+		const view = await advanceRollout(ROLLOUT_ID);
+
+		expect(view?.members.map((member) => member.state)).toEqual(['done', 'current']);
+		expect(view?.rollout.status).toBe('completed');
+		expect(fanOutWorkerUpdate).not.toHaveBeenCalled();
+	});
+});

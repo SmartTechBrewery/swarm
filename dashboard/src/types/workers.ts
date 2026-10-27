@@ -443,7 +443,7 @@ export interface WorkerUpdateReport {
  * owner, and the two instants as ISO strings.
  *
  * **`state` and `outcome` are plain `string`s, for {@link WorkerUpdateReportEntry}'s
- * reason.** The server's own vocabularies are the seven member states
+ * reason.** The server's own vocabularies are the eight member states
  * `WORKER_UPDATE_ROLLOUT_MEMBER_STATES` names and the update statuses beside them,
  * but a newer control plane may report a word this bundle was built before, and a
  * machine dropped from the readout reads as a machine the rollout never named — the

@@ -1382,7 +1382,9 @@ export const workersRouter = router({
 	// The target is validated once by the same `WorkerUpdateTargetSchema`
 	// `requestUpdate` uses, so a malformed ref is one `BAD_REQUEST` before any machine
 	// is drained. An operator who owns no machines gets `{ rollout: null }` — an honest
-	// empty answer, not an error, exactly as the fan-out gives them.
+	// empty answer, not an error, exactly as the fan-out gives them. So does one whose
+	// every machine already declares the target commit (`action: 'all-current'`, issue
+	// #1146): no rollout is recorded and nothing is drained.
 	startFleetUpdate: authedProcedure
 		.input(
 			z.object({
@@ -1403,6 +1405,9 @@ export const workersRouter = router({
 			});
 			if (result.outcome === 'no-machines') {
 				return { action: 'no-machines' as const, target: input.target, rollout: null };
+			}
+			if (result.outcome === 'all-current') {
+				return { action: 'all-current' as const, target: input.target, rollout: null };
 			}
 			if (result.outcome === 'conflict') {
 				throw new TRPCError({
@@ -1475,7 +1480,8 @@ export const workersRouter = router({
 	// `CONFLICT` twice over, each naming the status procedure: for a different target
 	// while one is in progress, and for the cross-scope refusal — an installation-wide
 	// rollout overlaps every owner-scoped one, so neither may start while the other is
-	// moving.
+	// moving. When every machine already declares the target commit, nothing is started
+	// and nothing is drained (`action: 'all-current'`, issue #1146).
 	startFleetUpdateForInstallation: authedProcedure
 		.input(
 			z.object({
@@ -1495,6 +1501,9 @@ export const workersRouter = router({
 			});
 			if (result.outcome === 'no-machines') {
 				return { action: 'no-machines' as const, target: input.target, rollout: null };
+			}
+			if (result.outcome === 'all-current') {
+				return { action: 'all-current' as const, target: input.target, rollout: null };
 			}
 			if (result.outcome === 'conflict') {
 				throw new TRPCError({

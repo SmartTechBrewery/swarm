@@ -25,7 +25,8 @@ export interface RolloutMemberStateCopy {
 	/** The operator-facing word; for an unknown state, the server's own. */
 	label: string;
 	/**
-	 * `positive` only for the machine that actually came back on the new build,
+	 * `positive` only for a machine on the new build — one that came back on it, or one
+	 * that already was on it and was never touched (issue #1146) —
 	 * `caution` for one the rollout settled without moving, `negative` for a machine
 	 * that failed — whether it said so or simply stopped answering — and `neutral`
 	 * while it is still in flight, since a machine mid-wave is not yet good or bad news.
@@ -61,6 +62,14 @@ const MEMBER_STATES: Record<string, RolloutMemberStateCopy> = {
 		label: 'Done',
 		tone: 'positive',
 		description: 'It came back on the new build, and is back in the dispatch pool.',
+	},
+	// Already on the target when the rollout reached it (issue #1146), so it was never
+	// taken out of the pool at all — a different fact from `done`, which restarted.
+	current: {
+		label: 'Already current',
+		tone: 'positive',
+		description:
+			'Already on the target build, so the rollout never drained or asked it — it stayed in the dispatch pool throughout.',
 	},
 	// Settled *without being moved*, which is a different fact from `done` and must
 	// never read as one: the machine is on the build it started on.
@@ -152,6 +161,7 @@ const MEMBER_STATE_ORDER = [
 	'signalled',
 	'verifying',
 	'done',
+	'current',
 	'skipped',
 	'failed',
 ];

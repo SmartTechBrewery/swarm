@@ -447,14 +447,23 @@ and only then starts the next wave — and it does all of that **on its own** (i
 control plane for the machine that applied and never came back. So the command above
 is one operator action, not one to re-run until the fleet has moved. Re-running it is
 still legal and is a nudge as well as a read; either form prints where each machine
-stands: `queued`, `draining`, `signalled`, `verifying`, `done`, `skipped` or `failed`.
-A machine enrolled in no project settles `skipped` — advancing the rollout would never
+stands: `queued`, `draining`, `signalled`, `verifying`, `done`, `current`, `skipped` or
+`failed`. **A machine already on the target is left alone** (issue #1146): when `<ref>` is
+a commit id and a machine's declared build already is that commit (and is not dirty), it
+settles `current` with "already on the rollout's target build" on its own line — never
+drained, never asked, and in the dispatch pool throughout. It is still listed, so the
+readout shows the whole fleet was considered. When *every* machine is already on it,
+nothing is started at all and the command says so. A branch or tag cannot be compared
+without a fetch, and a machine that declared no build cannot be compared either, so
+those machines go through the normal drain-and-ask path — the daemon's own
+`already-current` report then settles them `done`. A machine enrolled in no project settles `skipped` — advancing the rollout would never
 change that answer, so it is never waited on. A machine that is **offline when its turn
 comes** is passed over the same way (issue #1071): it settles `skipped` with "offline
 when its turn came" on its own line, is never drained or asked, and the wave is filled
 from the next connected machine instead. Passed-over machines do not count toward the
-three-hosts-in-a-row halt. To pick them up, start the fleet update again once they are back —
-machines already on the target settle at once. A machine counts as **back on the new
+three-hosts-in-a-row halt. To pick them up, start the fleet update again once they are back:
+with a commit id as the target, only the machines still behind are drained and asked, and
+the rest settle `current` untouched. A machine counts as **back on the new
 build** only through a daemon that took its lease *after* the machine reported
 `applied`; a reconnect of the old daemon before that report proves nothing either way.
 
@@ -572,7 +581,10 @@ included.
 `/workers` carries a readout above the roster whenever one has run: the target, the
 status, the wave size, the halt reason when it halted, and one line per machine with
 its owner, its state (`queued`, `draining`, `signalled`, `verifying`, `done`,
-`skipped`, `failed`) and whatever that machine itself reported. It polls on the
+`current`, `skipped`, `failed`) and whatever that machine itself reported. The button
+always asks for the control plane's own commit, so a machine already on it reads
+**Already current** and was never taken out of the pool, and when every machine is
+already on it the modal says so and no rollout is started. It polls on the
 roster's own cadence and survives a page reload, so closing the tab mid-rollout loses
 nothing. A machine that settled `skipped` — enrolled in no project, or running under
 no process supervisor — reads as skipped with its reason and never as done: it is

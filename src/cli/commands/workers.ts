@@ -324,8 +324,12 @@ Usage:
              machine's report, its reconnect, and a periodic check — so one run of
              this command moves the whole fleet. Re-running it is how you read the
              rollout, and nudges it along too; each run prints where every machine
-             stands (queued, draining, signalled, verifying, done, skipped,
-             failed). A machine that reports failed, refused or declined, or that
+             stands (queued, draining, signalled, verifying, done, current,
+             skipped, failed). When <ref> is a commit id, a machine already on it
+             is listed 'current' and never drained or asked, so re-running after a
+             partial rollout moves only the machines still behind; when every
+             machine is already on it, nothing is started at all. A branch or tag
+             cannot be compared, so then every machine is asked. A machine that reports failed, refused or declined, or that
              comes back on the build it was asked to leave, HALTS the rollout:
              nothing further is drained or signalled, the reason is recorded, and
              the untouched machines stay in the pool. A machine that simply STOPS
@@ -723,6 +727,7 @@ const ROLLOUT_MEMBER_STATES = [
 	'signalled',
 	'verifying',
 	'done',
+	'current',
 	'skipped',
 	'failed',
 ];
@@ -1712,7 +1717,11 @@ async function rolloutCommand(
 		parseWith(StartFleetUpdateSchema),
 	);
 	if (!result.rollout) {
-		out.info(`you operate no machines — nothing to move to '${result.target}'`);
+		out.info(
+			result.action === 'all-current'
+				? `every machine you own is already on '${result.target}' — nothing to move, so no fleet update was started`
+				: `you operate no machines — nothing to move to '${result.target}'`,
+		);
 		return 0;
 	}
 	printRollout(result.rollout, result.action);
@@ -1922,14 +1931,17 @@ function printHaltFooter(rollout: Rollout): void {
 
 /**
  * What a completed rollout leaves. "Every machine is on the target" only when every
- * member settled `done`: since issue #1064 a rollout completes with a machine it gave up
- * on, and a `skipped` one was never moved either, so the line names the machines that
- * are not on the target rather than contradicting the table above it.
+ * member settled `done` or `current` (already there, issue #1146): since issue #1064 a
+ * rollout completes with a machine it gave up on, and a `skipped` one was never moved
+ * either, so the line names the machines that are not on the target rather than
+ * contradicting the table above it.
  */
 function printCompletedFooter(rollout: Rollout): void {
-	const notMoved = rollout.members.filter((member) => member.state !== 'done');
+	const notMoved = rollout.members.filter(
+		(member) => member.state !== 'done' && member.state !== 'current',
+	);
 	if (notMoved.length === 0) {
-		out.info(`  every machine is on '${rollout.target}' and back in the dispatch pool`);
+		out.info(`  every machine is on '${rollout.target}' and in the dispatch pool`);
 		return;
 	}
 	out.info(

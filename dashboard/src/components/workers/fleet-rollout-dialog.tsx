@@ -6,7 +6,10 @@ import type { WorkerRollout } from '@/types/workers.js';
 
 /** What `workers.startFleetUpdateForInstallation` answers with. */
 export interface StartedRollout {
-	/** `started`, `advanced`, or `no-machines` — the last of which records no rollout. */
+	/**
+	 * `started`, `advanced`, `no-machines`, or `all-current` (every machine already on the
+	 * target, issue #1146) — the last two of which record no rollout.
+	 */
 	action: string;
 	target: string;
 	rollout: WorkerRollout | null;
@@ -140,7 +143,9 @@ function FleetRolloutConfirmation({ target }: { target: string }) {
 			<p className="text-sm text-zinc-400 leading-relaxed">
 				It drains the machines itself, a bounded number at a time, and never interrupts a phase
 				already running: a machine mid-job simply finishes first. Each one is then asked to move,
-				and the rollout waits for it to come back on the new build before starting the next wave.
+				and the rollout waits for it to come back on the new build before starting the next wave. A
+				machine already on this build is listed as already current and left in the dispatch pool,
+				untouched.
 			</p>
 			<p className="text-sm text-zinc-400 leading-relaxed">
 				A machine that <em>reports</em> it cannot take the build{' '}
@@ -166,6 +171,15 @@ function FleetRolloutConfirmation({ target }: { target: string }) {
  * modal.
  */
 function StartedRolloutView({ started }: { started: StartedRollout }) {
+	if (!started.rollout && started.action === 'all-current') {
+		return (
+			<p className="text-sm text-zinc-400 leading-relaxed">
+				Every machine is already on{' '}
+				<span className="font-mono text-zinc-200">{started.target.slice(0, 7)}</span> — nothing to
+				move, so no rollout was started and no machine was drained.
+			</p>
+		);
+	}
 	if (!started.rollout) {
 		return (
 			<p className="text-sm text-zinc-400 leading-relaxed">

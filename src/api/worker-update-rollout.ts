@@ -110,7 +110,7 @@ import {
 	type WorkerUpdateRolloutMember,
 	type WorkerUpdateRolloutScope,
 } from '../identity/worker-update-rollout.js';
-import type { WorkerUpdateStatus } from '../lib/build-identity.js';
+import { buildIsOnTarget, type WorkerUpdateStatus } from '../lib/build-identity.js';
 import { fanOutWorkerUpdate } from './worker-update-fanout.js';
 
 /**
@@ -227,13 +227,18 @@ export interface RolloutView {
  * - `no-machines` — the caller operates none, so there is nothing to roll out and
  *   no rollout is recorded. An honest empty answer, not an error, exactly as
  *   `requestUpdateForMine` answers an operator with no machines.
+ * - `all-current` — every machine in scope already declares the target commit
+ *   (issue #1146), so there is nothing to move and, again, no rollout is recorded and
+ *   nothing is drained. A machine whose build cannot be compared — none declared, or a
+ *   branch or tag target — keeps this from answering.
  */
 export type StartRolloutResult =
 	| { outcome: 'started'; view: RolloutView }
 	| { outcome: 'advanced'; view: RolloutView }
 	| { outcome: 'conflict'; view: RolloutView }
 	| { outcome: 'blocked-by-other-scope'; view: RolloutView }
-	| { outcome: 'no-machines' };
+	| { outcome: 'no-machines' }
+	| { outcome: 'all-current' };
 
 /** The fields a caller supplies to start a rollout. */
 export interface StartRolloutInput {
@@ -306,6 +311,9 @@ export async function startRollout(input: StartRolloutInput): Promise<StartRollo
 			? byOwnerBlock(await listAllWorkers())
 			: await listWorkersForOwner(input.ownerUserId);
 	if (workers.length === 0) return { outcome: 'no-machines' };
+	if (workers.every((worker) => buildIsOnTarget(worker.build, input.target) === true)) {
+		return { outcome: 'all-current' };
+	}
 
 	let rolloutId: string;
 	try {
@@ -437,14 +445,18 @@ async function readRolloutView(rolloutId: string): Promise<RolloutView | undefin
  *    is returned either way ({@link abandonVerdict}).
  * 5. **Stand down** every machine the rollout has not committed to yet, if it has
  *    halted — so a halt leaves the untouched majority of the fleet in the pool.
- * 6. **Advance**, while it is still in progress: take the next `waveSize` queued
+ * 6. **Leave alone** every queued member whose machine already declares the target
+ *    commit, while it is still in progress: it settles `current` without being drained
+ *    or asked (issue #1146). A member whose build cannot be compared stays queued.
+ * 7. **Advance**, while it is still in progress: take the next `waveSize` queued
  *    members only once nothing is in flight, drain them, and signal the ones that
- *    have gone idle. A member still running a phase stays draining and is signalled
- *    on a later advance — draining never interrupts a run. A queued or drained member
+ *    have gone idle — so only a machine that is outdated, or whose build cannot be
+ *    compared, is ever drained. A member still running a phase stays draining and is
+ *    signalled on a later advance — draining never interrupts a run. A queued or drained member
  *    whose machine is offline when its turn comes is passed over `skipped` without
  *    being drained or signalled (issue #1071), and the wave fills from the next
  *    connected machine instead.
- * 7. **Complete** when every member has settled.
+ * 8. **Complete** when every member has settled.
  */
 export async function advanceRollout(rolloutId: string): Promise<RolloutView | undefined> {
 	return await advanceUnderRolloutLock(rolloutId, async (loaded, write) => {
@@ -564,6 +576,26 @@ function passOverOfflineVerdict(now: Date): MemberVerdict {
 		patch: { state: 'skipped', message: OFFLINE_MESSAGE, settledAt: now },
 		returnToPool: true,
 	};
+}
+
+/** The message recorded for a member whose machine was already on the target when the rollout reached it. */
+const ALREADY_CURRENT_MESSAGE =
+	'already on the rollout’s target build, so the rollout left it in the dispatch pool ' +
+	'without draining or asking it';
+
+/**
+ * Leave a queued member whose machine already declares the target commit exactly where
+ * it is (issue #1146): settle it **`current`** and never drain or signal it. Asking it
+ * anyway would take a machine that needs nothing out of the pool for as long as its
+ * in-flight phases run, only for it to answer `already-current`.
+ *
+ * Only ever applied to a `queued` member, so there is nothing to return to the pool and
+ * no request to withdraw. "Already on the target" is {@link buildIsOnTarget}'s `true`
+ * and nothing weaker: a machine with no declared build, or a branch or tag target, is
+ * left queued and goes through the ordinary path, where its own report settles it.
+ */
+function alreadyCurrentVerdict(now: Date): MemberVerdict {
+	return { patch: { state: 'current', message: ALREADY_CURRENT_MESSAGE, settledAt: now } };
 }
 
 /** The message recorded for a member whose machine another session asked again. */
@@ -785,10 +817,10 @@ function decideComeBack(
  * own — adds its host to the run; a member that came back on the new build (`done`)
  * resets it, because that build demonstrably starts, so the earlier failures were about
  * those machines rather than about the build; a member settled without being moved
- * (`skipped`) — and one not settled yet — says nothing about the build and leaves the
- * run alone. That includes a machine passed over for being offline when its turn came
- * ({@link passOverOfflineVerdict}, issue #1071): it was never asked, so it is no part
- * of a run.
+ * (`skipped`, or `current` — already on the target, issue #1146) — and one not settled
+ * yet — says nothing about the build and leaves the run alone. That includes a machine
+ * passed over for being offline when its turn came ({@link passOverOfflineVerdict},
+ * issue #1071): it was never asked, so it is no part of a run.
  *
  * **Distinct hosts, not members** ({@link MAX_CONSECUTIVE_FAILED_HOSTS}): several
  * daemons on one host share its network, its credentials and its install root, so the
@@ -820,7 +852,7 @@ function consecutiveFailedHosts(
  *
  * A class rather than a chain of functions because every step reads and writes the
  * same three things — the members as they stand *now*, whether the rollout has
- * halted, and the machines behind them — and threading that triple through six free
+ * halted, and the machines behind them — and threading that triple through seven free
  * functions would say less than it costs. The *rules* are the free functions above;
  * what is left here is reading the world, applying them, and writing.
  */
@@ -855,6 +887,7 @@ class AdvancePass {
 		await this.verifyApplied();
 		await this.brakeOnRepeatedFailures();
 		await this.standDownUncommitted();
+		await this.settleAlreadyCurrent();
 		await this.advanceWaves();
 		await this.completeIfSettled();
 	}
@@ -968,7 +1001,28 @@ class AdvancePass {
 	}
 
 	/**
-	 * Step 6 — take waves for as long as this pass can keep taking them.
+	 * Step 6 — settle every queued member whose machine already declares the target
+	 * commit, without draining or signalling it ({@link alreadyCurrentVerdict}).
+	 *
+	 * All of them up front rather than as each one's wave comes up, so the very first
+	 * readout already shows the whole fleet considered; and on every pass, so a machine
+	 * that reached the target some other way before its turn is left alone too. Before
+	 * connectivity on purpose: a machine already on the target needs nothing, so it is
+	 * `current` whether or not it is online. Read off the pass's own worker snapshot, so
+	 * it costs no query.
+	 */
+	private async settleAlreadyCurrent(): Promise<void> {
+		if (this.status !== 'in_progress') return;
+		for (const member of this.members) {
+			if (member.state !== 'queued') continue;
+			const worker = this.workers.get(member.workerId);
+			if (!worker || buildIsOnTarget(worker.build, this.rollout.target) !== true) continue;
+			await this.apply(member, alreadyCurrentVerdict(this.now));
+		}
+	}
+
+	/**
+	 * Step 7 — take waves for as long as this pass can keep taking them.
 	 *
 	 * **A wave that settles without ever being signalled must not cost a tick.** Some
 	 * members are decided the instant they are asked and never involve the machine at
@@ -1287,7 +1341,7 @@ class AdvancePass {
 		});
 	}
 
-	/** Step 7 — a rollout still in progress with nothing left unsettled is finished. */
+	/** Step 8 — a rollout still in progress with nothing left unsettled is finished. */
 	private async completeIfSettled(): Promise<void> {
 		if (this.status !== 'in_progress') return;
 		if (this.members.some((member) => !isSettledMemberState(member.state))) return;
@@ -1324,7 +1378,8 @@ class AdvancePass {
 	 * out of it. A machine the operator had drained for their own reasons keeps their
 	 * drain: the rollout borrowed it, it did not create it.
 	 *
-	 * Reached for every member that settles **well** — `done` or `skipped` — for every
+	 * Reached for every member that settles **well** — `done` or `skipped` (a `current`
+	 * one was never drained, so it never asks) — for every
 	 * member the rollout **gave up on** ({@link abandonVerdict}, issue #1064), and, in
 	 * an **owner-scoped** rollout, deliberately never for one whose machine *answered*
 	 * and settled `failed`: a machine that said it could not take the build, or came

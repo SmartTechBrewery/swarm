@@ -659,6 +659,22 @@ describe('WorkersRoster update actions', () => {
 		expect(screen.getByText(/survives a reload/)).toBeDefined();
 	});
 
+	// Issue #1146: a fleet already on the build is a no-op, not "nothing is registered".
+	it('says nothing was started when every machine is already on the build', async () => {
+		startFleetUpdateForInstallationMutate.mockResolvedValue({
+			action: 'all-current',
+			target: CONTROL_PLANE_COMMIT,
+			rollout: null,
+		});
+		fireEvent.click(await openFleetAction());
+
+		fireEvent.click(await screen.findByRole('button', { name: 'Start the rollout' }));
+
+		expect(await screen.findByText(/Every machine is already on/)).toBeDefined();
+		expect(screen.getByText(/no machine was drained/)).toBeDefined();
+		expect(screen.queryByText(/nothing is registered/)).toBeNull();
+	});
+
 	it('renders the FORBIDDEN a non-administrator gets verbatim', async () => {
 		// The client gate is a decision about what to *offer*; the server re-checks,
 		// and its refusal names the command that stages this over the caller's own

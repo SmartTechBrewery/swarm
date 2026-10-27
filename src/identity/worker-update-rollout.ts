@@ -95,7 +95,7 @@ export function rolloutReleasesFailedMembers(scope: WorkerUpdateRolloutScope): b
 /**
  * Where one machine stands inside a rollout. The first four are *unsettled* — the
  * rollout is waiting on that machine and will not start another wave — and the last
- * three are settled.
+ * four are settled.
  *
  * - `queued` — named by the rollout, not yet touched. It is still in the dispatch
  *   pool and stays there until its wave comes up, which is what bounds the capacity
@@ -111,6 +111,13 @@ export function rolloutReleasesFailedMembers(scope: WorkerUpdateRolloutScope): b
  * - `done` — settled good: it came back on the new build, or reported
  *   `already-current` — the install root was on the target and the daemon was already
  *   running it — and so needed no restart at all.
+ * - `current` — settled **untouched** (issue #1146): when the rollout reached it, the
+ *   build the machine declared already was the rollout's target commit, so it was never
+ *   drained or asked and stayed in the dispatch pool throughout. Its own state rather
+ *   than `done`, because nothing restarted — it is no evidence that the build *starts*,
+ *   so it neither adds to nor resets the per-host failure run — and rather than
+ *   `skipped`, which already means "not moved, try again once it is back": after a
+ *   partial rollout the operator has to tell "needs nothing" from "needs another go".
  * - `skipped` — settled without being moved, and **not** a failure: another session
  *   re-targeted the machine so there is nothing left for this rollout to verify, the
  *   rollout halted before this machine's wave came up, the machine was enrolled in
@@ -131,6 +138,7 @@ export const WORKER_UPDATE_ROLLOUT_MEMBER_STATES = [
 	'signalled',
 	'verifying',
 	'done',
+	'current',
 	'skipped',
 	'failed',
 ] as const;
@@ -145,6 +153,7 @@ export type WorkerUpdateRolloutMemberState = z.infer<typeof WorkerUpdateRolloutM
  */
 export const SETTLED_WORKER_UPDATE_ROLLOUT_MEMBER_STATES = [
 	'done',
+	'current',
 	'skipped',
 	'failed',
 ] as const satisfies readonly WorkerUpdateRolloutMemberState[];

@@ -641,6 +641,12 @@ report, off its reconnect, and off a periodic check for the machine that applied
 never came back — so start it and read it, rather than starting it and re-running it.
 Re-running the same command is still allowed, and nudges it as well as printing it.
 
+With a commit id as `<ref>`, a machine already on that commit is listed `current` and
+**never drained or asked** (issue #1146) — it stays in the pool throughout — so
+re-running after a partial rollout moves only the machines still behind, and when every
+machine is already there nothing is started at all. A branch or tag such as `main`
+cannot be compared without a fetch, so with one every machine is asked as before.
+
 A machine that reports `failed` — the build broke on it — or that comes back still on
 the build it was asked to leave, **halts** the rollout: nothing further is drained or
 signalled, the reason is printed, and the machines it had not reached stay in the pool.
@@ -874,7 +880,9 @@ swarm workers request-update main          # every machine on the installation
   returned. Because a rollout advances itself, what it leaves behind is a **readout on
   `/workers`** above the roster rather than a one-shot modal report: target, status,
   wave size, halt reason, and a line per machine with its owner, its state and its own
-  message, live and still there after a reload. A caller without the installation role
+  message, live and still there after a reload. A machine already on that build reads
+  **Already current** and is never taken out of the pool (issue #1146); when every
+  machine is, the modal says so and starts nothing. A caller without the installation role
   sees the refusal below in the control plane's own words. This command, and the
   per-machine report it prints, are unchanged.
 - **A project's own administrator can ask for the project's machines** (issue #1010),
