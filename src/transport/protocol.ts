@@ -474,6 +474,16 @@ export type TaskAssignment = z.infer<typeof TaskAssignmentSchema>;
  * on the same terms and so are **optional**, in both directions: an older control
  * plane omits them and the worker keeps its log-only behaviour rather than sending
  * a malformed result, and an older worker ignores fields it does not read.
+ *
+ * **`preserveCheckout` asks the worker to keep the stopped phase's checkout (issue
+ * #1139).** The router sets it only when it stops a transport-lost orphan whose
+ * attempt was pinned to this machine's preserved checkout
+ * (`../router/transport-loss-reaper.ts`): the retry taking over is pinned to the
+ * same checkout, so removing it in the aborted phase's cleanup would block that
+ * retry terminally. The worker preserves it exactly as a deferral does — a
+ * host-local pin for the run, lease released — and still answers with the same
+ * cancelled terminal frame. Optional on the same terms as `phase`/`taskId`: an
+ * older worker ignores it and removes the checkout as before.
  */
 export const TaskCancelSchema = z.object({
 	type: z.literal('task-cancel'),
@@ -482,6 +492,7 @@ export const TaskCancelSchema = z.object({
 	reason: z.string().optional(),
 	phase: TaskPhaseSchema.optional(),
 	taskId: z.string().min(1).optional(),
+	preserveCheckout: z.boolean().optional(),
 });
 export type TaskCancel = z.infer<typeof TaskCancelSchema>;
 

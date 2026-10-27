@@ -95,7 +95,7 @@ transport was a second front door to the same service. It is now the only one:
 issue #553 deleted that worker, and every worker acquires its session through the
 handshake (`src/router/worker-transport.ts` → `src/identity/worker-session-service.ts`).
 
-### §2 — Split delivery (implemented — issues #392, #405, #406, #407, #394, #417, #418, #536, #551, #544, #718, #724, #719, #827, #859, #1073, #1075, #1076)
+### §2 — Split delivery (implemented — issues #392, #405, #406, #407, #394, #417, #418, #536, #551, #544, #718, #724, #719, #827, #859, #1073, #1075, #1076, #1138, #1139)
 
 The rest of PROJECT.md §3 — the control plane assigning jobs and the daemon
 running them without direct Redis access (`TaskAssignment` →
@@ -623,6 +623,22 @@ server-side store) it needs:
    hold only for a run that was not continuing preserved work; for a continuation the
    pin narrows the candidates before the pass-over preference applies. A carried retry
    spends the transport-lost budget, not another Tier 2 continuation.
+
+19. **#1139 (phase 2 of 4)** — **the stop of a pinned continuation's orphan keeps its
+   checkout.** When the machine only slept, item 18's orphan is still running when its
+   pinned retry is claimed, and item 17's takeover stop aborts it. The aborted phase
+   used to remove its checkout (the host-local runtime answered "cancellation
+   requested" only on daemon shutdown), so the pinned retry then blocked terminally on
+   `missing-validation`. `task-cancel` gains an optional `preserveCheckout`, which the
+   reaper sets for an orphan whose recorded selection was `pinnedToPreservedWorker` —
+   on the takeover and on the return path alike. A DB-free worker records it beside
+   the assignment's abort controller and its host-local runtime answers
+   `isCancellationRequested` with it, so `cleanupUnlessPreserved` writes the run's pin
+   and releases the lease instead of removing the checkout. The answer to the stop is
+   the same cancelled terminal frame, and the retry already waits for it
+   (`awaitOrphanStopAnswer`), so the checkout is preserved before the retry is pushed.
+   A user termination, the stop of an unpinned orphan and an older worker that ignores
+   the field behave as before.
 
 Still out of scope: over-the-wire secret delivery, which remains unnecessary — the
 split keeps every project credential server-side instead.

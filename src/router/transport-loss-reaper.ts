@@ -57,7 +57,11 @@
  * resume, a delivery resume — is the exception (issue #1138): that work is still on
  * the machine that lost its transport, so the retry carries the lost attempt's
  * recovery intent, the settle re-records the preserved-worker pin, and the retry
- * waits for and runs on that machine instead of starting over elsewhere.
+ * waits for and runs on that machine instead of starting over elsewhere. When that
+ * attempt is still running when its retry is claimed — the machine only slept — the
+ * stop it is sent asks the worker to keep its checkout (`preserveCheckout`, issue
+ * #1139), so the aborted phase pins the checkout for the retry instead of removing
+ * it, and the pinned retry continues from it.
  *
  * The retry is mechanically the operator's Retry now — same run row, same dispatch,
  * a fresh session for a run that was not continuing preserved work — so it is exactly as safe for a pushing phase as that is: delivery
@@ -290,7 +294,15 @@ export function stopOrphanedDispatchesOnReturn(workerId: string): void {
 	}
 }
 
-/** Push one orphan its `task-cancel`, returning whether the worker's socket took it. */
+/**
+ * Push one orphan its `task-cancel`, returning whether the worker's socket took it.
+ *
+ * An orphan pushed as a pinned continuation (`selection.pinnedToPreservedWorker`)
+ * asks the worker to keep its checkout (issue #1139). Its machine is by construction
+ * the one holding the run's preserved state, and the retry taking over is pinned to
+ * that same checkout, so the aborted phase must preserve it rather than remove it.
+ * Every other stop omits the field and removes the checkout as before.
+ */
 function pushOrphanStop(orphan: OrphanedDispatch, reason: string): boolean {
 	return sendToWorker(orphan.workerId, {
 		type: 'task-cancel',
@@ -302,6 +314,7 @@ function pushOrphanStop(orphan: OrphanedDispatch, reason: string): boolean {
 		// worker.
 		phase: orphan.phase,
 		taskId: orphan.taskId,
+		...(orphan.selection?.pinnedToPreservedWorker === true ? { preserveCheckout: true } : {}),
 	});
 }
 

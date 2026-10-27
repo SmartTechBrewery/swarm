@@ -106,6 +106,33 @@ describe('host-local worktree runtime', () => {
 		expect(await first.isLeased('swarm', '535')).toBe(false);
 	});
 
+	// `cleanupUnlessPreserved` (`src/pipeline/resume.ts`) preserves the checkout on a
+	// `true` answer, so the predicate is what keeps a pinned orphan's checkout when the
+	// router stops it with `preserveCheckout` (issue #1139).
+	it('answers a cancellation request on shutdown or when the stop asked to keep the checkout', async () => {
+		const live = new Set(['dispatch-a']);
+		const shutdown = new AbortController();
+		let preserve = false;
+		const local = createHostLocalWorktreeRuntime({
+			repoRoot: repoRoot(),
+			worktreeRoot: '.swarm-workspaces',
+			ownerId: 'dispatch-a',
+			runId: 'run-a',
+			isOwnerLive: (candidate) => live.has(candidate),
+			shutdownSignal: shutdown.signal,
+			preserveOnCancel: () => preserve,
+		});
+
+		expect(await local.isCancellationRequested('run-a')).toBe(false);
+		preserve = true;
+		expect(await local.isCancellationRequested('run-a')).toBe(true);
+		preserve = false;
+		shutdown.abort();
+		expect(await local.isCancellationRequested('run-a')).toBe(true);
+		// Without the option, only a shutdown counts — exactly as before.
+		expect(await runtime('dispatch-b', live).isCancellationRequested('dispatch-b')).toBe(false);
+	});
+
 	// Every artifact below is one a crash can strand. The Redis lease this runtime
 	// replaces had a 4h TTL as its backstop; on disk that has to be explicit, or the
 	// task stays wedged until an operator deletes a file by hand (issue #535 review).

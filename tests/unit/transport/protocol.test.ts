@@ -697,6 +697,22 @@ describe('transport protocol schemas', () => {
 			);
 		});
 
+		// Additive on the same terms (issue #1139): a router stopping a pinned orphan
+		// sets it, every other cancel omits it, and an older worker ignores it.
+		it('parses a task-cancel asking the worker to keep its checkout, and one without it', () => {
+			const frame = {
+				type: 'task-cancel' as const,
+				dispatchId: DISPATCH_ID,
+				phase: 'implementation' as const,
+				taskId: '1139',
+				preserveCheckout: true,
+			};
+			expect(ControlPlaneMessageSchema.parse(frame)).toEqual(frame);
+			const { preserveCheckout: _omitted, ...plain } = frame;
+			expect(TaskCancelSchema.parse(plain).preserveCheckout).toBeUndefined();
+			expect(TaskCancelSchema.safeParse({ ...frame, preserveCheckout: 'yes' }).success).toBe(false);
+		});
+
 		it('rejects a task-cancel without the dispatch it names', () => {
 			expect(TaskCancelSchema.safeParse({ type: 'task-cancel' }).success).toBe(false);
 			expect(

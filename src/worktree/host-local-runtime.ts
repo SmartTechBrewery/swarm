@@ -131,6 +131,12 @@ export interface HostLocalWorktreeRuntimeOptions {
 	runId?: string;
 	isOwnerLive(ownerId: string): boolean;
 	shutdownSignal?: AbortSignal;
+	/**
+	 * Whether the run was stopped by a `task-cancel` asking to keep its checkout
+	 * (issue #1139). Answers `isCancellationRequested` alongside a shutdown, so the
+	 * aborted phase preserves the checkout for the pinned retry instead of removing it.
+	 */
+	preserveOnCancel?: () => boolean;
 }
 
 function stateKey(projectId: string, taskId: string): string {
@@ -371,7 +377,7 @@ export function createHostLocalWorktreeRuntime(
 			return !isExpired(pin.createdAt, PIN_TTL_MS);
 		},
 		async isCancellationRequested() {
-			return options.shutdownSignal?.aborted === true;
+			return options.shutdownSignal?.aborted === true || options.preserveOnCancel?.() === true;
 		},
 		async preserve(projectId, taskId) {
 			const path = paths(projectId, taskId);

@@ -361,6 +361,14 @@ interface CancellableAssignment {
 	 * would defer — re-running the very phase the user killed.
 	 */
 	cancelled: boolean;
+	/**
+	 * Set with `cancelled` when the `task-cancel` asked for the checkout to be kept
+	 * (issue #1139): the router stopping a pinned continuation's orphan whose retry
+	 * is pinned to this checkout. Read by the host-local runtime's
+	 * `isCancellationRequested`, so the aborted phase preserves the checkout instead
+	 * of removing it.
+	 */
+	preserveCheckout: boolean;
 }
 
 /**
@@ -378,7 +386,11 @@ const cancellableAssignments = new Map<string, CancellableAssignment>();
 
 /** Make an in-flight assignment cancellable; call {@link untrackAssignment} when it settles. */
 export function trackAssignment(dispatchId: string, controller: AbortController): void {
-	cancellableAssignments.set(dispatchId, { controller, cancelled: false });
+	cancellableAssignments.set(dispatchId, {
+		controller,
+		cancelled: false,
+		preserveCheckout: false,
+	});
 }
 
 /** Drop a settled assignment from the registry (called from the executor's `finally`). */
@@ -393,11 +405,15 @@ export function untrackAssignment(dispatchId: string): void {
  * (it already settled, or was never pushed here), which is the case
  * {@link handleTaskCancel} answers the frame for itself (issue #724) instead of
  * leaving the run to the control plane's durable marker alone.
+ *
+ * `preserveCheckout` records the frame's request to keep the checkout (issue
+ * #1139), set before the abort so the phase's cleanup already sees it.
  */
-export function cancelAssignment(dispatchId: string): boolean {
+export function cancelAssignment(dispatchId: string, preserveCheckout = false): boolean {
 	const entry = cancellableAssignments.get(dispatchId);
 	if (!entry) return false;
 	entry.cancelled = true;
+	entry.preserveCheckout = entry.preserveCheckout || preserveCheckout;
 	entry.controller.abort();
 	return true;
 }
@@ -405,6 +421,15 @@ export function cancelAssignment(dispatchId: string): boolean {
 /** Whether the assignment for `dispatchId` was cancelled by a pushed `task-cancel`. */
 export function isAssignmentCancelled(dispatchId: string): boolean {
 	return cancellableAssignments.get(dispatchId)?.cancelled === true;
+}
+
+/**
+ * Whether the assignment for `dispatchId` was cancelled by a `task-cancel` that asked
+ * for its checkout to be kept (issue #1139).
+ */
+export function isAssignmentCheckoutPreserved(dispatchId: string): boolean {
+	const entry = cancellableAssignments.get(dispatchId);
+	return entry?.cancelled === true && entry.preserveCheckout;
 }
 
 /**
@@ -418,7 +443,9 @@ export function isAssignmentCancelled(dispatchId: string): boolean {
  *
  * - **Executing here** — abort it. The run's own failure path then settles it
  *   ({@link settleAssignmentFailure}), so nothing extra is sent from here; sending
- *   a second terminal frame would race that one.
+ *   a second terminal frame would race that one. A frame with `preserveCheckout`
+ *   (issue #1139) also makes the aborted phase keep its checkout for the pinned
+ *   retry; the terminal frame is the same either way.
  * - **Not executing here** — it already finished and reported, this daemon
  *   restarted, or the dispatch was never run here at all. Answer with the terminal
  *   cancelled result so the control plane settles the run as the user termination
@@ -436,8 +463,13 @@ export function handleTaskCancel(
 	sink: AssignmentSink,
 	logger: TransportLogger = defaultLogger,
 ): void {
-	const context = { dispatchId: frame.dispatchId, runId: frame.runId, reason: frame.reason };
-	if (cancelAssignment(frame.dispatchId)) {
+	const context = {
+		dispatchId: frame.dispatchId,
+		runId: frame.runId,
+		reason: frame.reason,
+		preserveCheckout: frame.preserveCheckout,
+	};
+	if (cancelAssignment(frame.dispatchId, frame.preserveCheckout === true)) {
 		logger.info('aborting in-flight assignment after a cancellation request', context);
 		return;
 	}
@@ -1123,6 +1155,9 @@ export async function runAssignmentDbFree(
 				runId,
 				isOwnerLive: (ownerId) => inFlight.has(ownerId),
 				shutdownSignal: options.shutdownSignal,
+				// A stop that asked to keep the checkout (issue #1139) preserves it in the
+				// aborted phase's cleanup, as a shutdown does.
+				preserveOnCancel: () => isAssignmentCheckoutPreserved(dispatchId),
 			}),
 		);
 		worktreePath = worktrees.worktreePath(taskId);
