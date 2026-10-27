@@ -481,7 +481,10 @@ const getRunByIdFromDb = vi.fn(
 			| {
 					agentSessionId?: string | null;
 					continuationCount?: number;
-					recovery?: { preservedWorkerId?: string | null } | null;
+					recovery?: {
+						preservedWorkerId?: string | null;
+						transportLostWorkerIds?: string[];
+					} | null;
 					// The *last bind's* worker (issue #954) — read only to tell a run that
 					// never bound a machine from one whose recorded machine went missing.
 					workerId?: string | null;
@@ -3716,6 +3719,65 @@ describe('processJob', () => {
 				expect(phaseCalls).toEqual([]);
 			});
 
+			// Issue #1138, end to end: the retry a transport-lost continuation settles with
+			// is still pinned, so it waits for the machine holding the work rather than
+			// starting over on a free one — even though that machine is on the run's
+			// passed-over list.
+			it('keeps the retry of a transport-lost continuation pinned to the preserved machine', async () => {
+				listProjectDispatchCandidates.mockResolvedValue([candidate('w-preserved')]);
+				phaseImpl = async () => {
+					throw new AgentRunError(TRANSPORT_LOST_ORPHAN_REASON, { kind: 'transport-lost' });
+				};
+				const lost = await processJob(
+					continuation(),
+					registryReturning(planningTrigger()),
+					undefined,
+					executionIdentity('w-preserved'),
+				);
+				expect(lost).toMatchObject({
+					status: 'phase-deferred',
+					failureKind: 'transport-lost',
+					carriedContinuation: 'checkpoint',
+				});
+				const [, input] = scheduleDispatchRetry.mock.calls.at(-1) as [
+					string,
+					{ jobPayload: SwarmJob },
+				];
+				const retry = input.jobPayload;
+				expect(retry.recoveryMode).toBe('checkpoint');
+				expect(recordRunPreservedWorker).toHaveBeenCalledWith('run-1');
+
+				phaseImpl = async () => ({ agent: agentResult() });
+				phaseCalls.length = 0;
+				getRunByIdFromDb.mockResolvedValue({
+					workerId: 'w-preserved',
+					recovery: { preservedWorkerId: 'w-preserved', transportLostWorkerIds: ['w-preserved'] },
+				});
+				listProjectDispatchCandidates.mockResolvedValue([
+					candidate('w-free'),
+					candidate('w-preserved', { activeRuns: 1 }),
+				]);
+				const waiting = await processJob(retry, registryReturning(planningTrigger()));
+				expect(waiting).toMatchObject({ status: 'phase-deferred', preservedWorkerWait: true });
+				expect(phaseCalls).toEqual([]);
+
+				listProjectDispatchCandidates.mockResolvedValue([
+					candidate('w-free'),
+					candidate('w-preserved'),
+				]);
+				claimWorkerForDispatch.mockClear();
+				const ran = await processJob(
+					retry,
+					registryReturning(planningTrigger()),
+					undefined,
+					executionIdentity('w-preserved'),
+				);
+				expect(ran.status).toBe('phase-succeeded');
+				expect(claimWorkerForDispatch).toHaveBeenCalledWith(
+					expect.objectContaining({ selectedWorkerId: 'w-preserved' }),
+				);
+			});
+
 			// Issue #954. The other half of the read: a continuation whose machine nobody
 			// recorded used to route unpinned — the silent start-over the pin exists to
 			// prevent — and is now refused, bounded, wherever there is another machine it
@@ -5024,6 +5086,85 @@ describe('processJob', () => {
 			expect(recordRunTransportLostWorker).toHaveBeenCalledWith('run-1');
 			expect(failDispatch).not.toHaveBeenCalled();
 			expect(commentOnPullRequest).not.toHaveBeenCalled();
+			// Not a continuation (issue #1138): nothing is carried and nothing pinned, so
+			// the retry stays free to prefer another worker.
+			expect(outcome).toMatchObject({ carriedContinuation: undefined });
+			expect(recordRunPreservedWorker).not.toHaveBeenCalled();
+			expect(input.jobPayload.recoveryMode).toBeUndefined();
+			expect(input.jobPayload.resumeSession).toBeUndefined();
+			expect(input.jobPayload.resumeDelivery).toBeUndefined();
+		});
+
+		// Issue #1138: a continuation lost with its transport is retried as the same
+		// continuation, and the run row keeps describing it and re-records its pin.
+		it('carries a checkpoint continuation, keeps the row checkpointed and re-records the pin', async () => {
+			transportLost();
+			scheduleDispatchRetry.mockClear();
+			const before = Date.now();
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ runId: 'run-1', recoveryMode: 'checkpoint' }),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(outcome).toMatchObject({
+				status: 'phase-deferred',
+				retryDelayMs: THIRTY_MINUTES_MS,
+				failureKind: 'transport-lost',
+				carriedContinuation: 'checkpoint',
+			});
+			const [, input] = scheduleDispatchRetry.mock.calls.at(-1) as [
+				string,
+				{ waitReason: string; availableAt: Date; jobPayload: SwarmJob },
+			];
+			expect(input.waitReason).toBe('transport-lost');
+			expect(input.availableAt.getTime()).toBeGreaterThanOrEqual(before + THIRTY_MINUTES_MS);
+			expect(input.jobPayload).toMatchObject({
+				recoveryMode: 'checkpoint',
+				automaticRetryAttempt: 1,
+			});
+			const settle = completeRun.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+			expect(settle).toMatchObject({ status: 'checkpointed', agentSessionId: null });
+			// The carried retry spends no further Tier 2 continuation.
+			expect(settle.checkpoint).toBeUndefined();
+			expect(settle.continuationCount).toBeUndefined();
+			expect(recordRunPreservedWorker).toHaveBeenCalledWith('run-1');
+		});
+
+		it('carries a session continuation and leaves the row its session id', async () => {
+			const SESSION = '92340ec7-709e-4ffa-9297-3899caca4830';
+			transportLost();
+			scheduleDispatchRetry.mockClear();
+
+			await processJob(
+				createMockScmWebhookJob({ runId: 'run-1', resumeSession: true, agentSessionId: SESSION }),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			const [, input] = scheduleDispatchRetry.mock.calls.at(-1) as [
+				string,
+				{ jobPayload: SwarmJob },
+			];
+			expect(input.jobPayload).toMatchObject({ resumeSession: true, agentSessionId: SESSION });
+			const settle = completeRun.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+			expect(settle.status).toBe('deferred');
+			expect(settle.agentSessionId).toBeUndefined();
+			expect(recordRunPreservedWorker).toHaveBeenCalledWith('run-1');
+		});
+
+		it('still fails a carried continuation for the operator once its budget is spent', async () => {
+			transportLost();
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({
+					runId: 'run-1',
+					recoveryMode: 'checkpoint',
+					automaticRetryAttempt: 2,
+				}),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-failed');
 		});
 
 		it('is not blocked by rate-limit deferrals the run already spent', async () => {

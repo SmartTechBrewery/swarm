@@ -53,8 +53,14 @@
  * eligible worker for the retry. Retry now on the deferred run reopens the same
  * dispatch, so it supersedes the scheduled retry and never creates a second run.
  *
+ * A run that was **continuing preserved work** — a Tier 2 checkpoint, a session
+ * resume, a delivery resume — is the exception (issue #1138): that work is still on
+ * the machine that lost its transport, so the retry carries the lost attempt's
+ * recovery intent, the settle re-records the preserved-worker pin, and the retry
+ * waits for and runs on that machine instead of starting over elsewhere.
+ *
  * The retry is mechanically the operator's Retry now — same run row, same dispatch,
- * fresh session — so it is exactly as safe for a pushing phase as that is: delivery
+ * a fresh session for a run that was not continuing preserved work — so it is exactly as safe for a pushing phase as that is: delivery
  * refuses a remote head that drifted from the expected SHA, PR and comment delivery
  * are idempotent per run, and a Planning split is resumable by its run's markers.
  *

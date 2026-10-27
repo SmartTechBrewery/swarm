@@ -87,7 +87,9 @@ import {
 } from '../dispatch/dispatcher.js';
 import {
 	jobContinuesPreservedCheckout,
+	type PreservedContinuationKind,
 	preservedCheckoutMachineUnknown,
+	preservedContinuationKind,
 } from '../dispatch/preserved-worker.js';
 import { deriveCapacityPendingPayload, deriveRetryJobPayload } from '../dispatch/retry-payload.js';
 import type {
@@ -346,6 +348,14 @@ export type JobOutcome =
 			continuationCount?: number;
 			/** True when the retry must reuse deterministic-delivery progress, not an agent session. */
 			resumeDelivery?: boolean;
+			/**
+			 * The continuation a `transport-lost` deferral re-attempts (issue #1138) — see
+			 * {@link carriedContinuationFor}. Unlike {@link resumable}, {@link checkpoint} and
+			 * {@link resumeDelivery}, it is not derived from this attempt's result (a lost
+			 * transport reports none): the retry carries the attempt's own recovery intent,
+			 * and the settle keeps the row describing that continuation and re-records its pin.
+			 */
+			carriedContinuation?: PreservedContinuationKind;
 			/**
 			 * True when a PM-driven phase was actually entered before it deferred.
 			 * This preserves board dispatch intent without implying that
@@ -789,6 +799,21 @@ async function tryReleaseCheckpointFallbackCheckout(
 }
 
 /**
+ * The continuation a deferral carries rather than re-derives (issue #1138): the lost
+ * attempt's own, when its worker transport was lost while it was continuing preserved
+ * work. `transport-lost` alone qualifies because the reap reports no exit, session or
+ * checkpoint — nothing about the attempt can be re-derived, and the work it was
+ * continuing is still on the machine that lost its transport. Every other deferrable
+ * kind reports a result the existing tiers already judge.
+ */
+function carriedContinuationFor(
+	failure: DeferrableFailure,
+	job: SwarmJob,
+): PreservedContinuationKind | undefined {
+	return failure.kind === 'transport-lost' ? preservedContinuationKind(job) : undefined;
+}
+
+/**
  * Handle a deferrable {@link AgentRunError} (`rate-limit`, `capacity`, or `aborted`) —
  * `processJob`'s one non-terminal failure path, split out to keep that
  * function's branching within the complexity budget. Returns the
@@ -838,6 +863,7 @@ function deferAgentRunError(
 	}
 
 	const retryDelayMs = retryDelayForFailure(failure, Date.now());
+	const carriedContinuation = carriedContinuationFor(failure, job);
 	logger.warn(deferredPhaseMessage(failure, trigger.phase), {
 		projectId,
 		phase: trigger.phase,
@@ -846,8 +872,9 @@ function deferAgentRunError(
 		retryDelayMs,
 		resetHint: 'resetHint' in failure ? failure.resetHint : undefined,
 		// Tier 2: this retry re-seeds a fresh session from the checkpoint rather than
-		// re-entering the stopped run's own session.
-		continuation: checkpointContinuation?.continuationCount,
+		// re-entering the stopped run's own session. A lost transport (issue #1138)
+		// instead names the continuation its retry carries.
+		continuation: checkpointContinuation?.continuationCount ?? carriedContinuation,
 		error,
 	});
 	return {
@@ -881,6 +908,7 @@ function deferAgentRunError(
 		checkpoint: checkpointContinuation?.checkpoint,
 		continuationCount: checkpointContinuation?.continuationCount,
 		resumeDelivery: failure.kind === 'delivery' || undefined,
+		carriedContinuation,
 		pmPhaseStarted:
 			job.type === 'pm' && (trigger.phase === 'planning' || trigger.phase === 'implementation'),
 		failureKind: failure.kind,
@@ -1220,6 +1248,8 @@ async function settleDispatchRetry(
 		// with a fresh session id.
 		checkpointed: outcome.checkpoint !== undefined,
 		resumeDelivery: outcome.resumeDelivery,
+		// A lost continuation (issue #1138) carries its attempt's own recovery intent.
+		carriedContinuation: outcome.carriedContinuation !== undefined,
 		pmPhaseStarted: outcome.pmPhaseStarted,
 		continuationDispatchClaimed: outcome.continuationDispatchClaimed,
 		dependencyRecheck: outcome.dependencyRecheck,
@@ -3284,7 +3314,13 @@ async function finalizeFailedRun(
 				// "waiting to continue from a checkpoint" — the latter having no session id
 				// at all. The checkpoint travels onto the row so the API/dashboard can show
 				// the recorded remainder without reading a (possibly remote) worker's disk.
-				status: outcome.checkpoint ? 'checkpointed' : 'deferred',
+				// A checkpoint continuation lost with its transport (issue #1138) stays
+				// `checkpointed`: its retry is the same continuation, and "Retry now"
+				// derives `recoveryMode: 'checkpoint'` from this status.
+				status:
+					outcome.checkpoint || outcome.carriedContinuation === 'checkpoint'
+						? 'checkpointed'
+						: 'deferred',
 				error: outcome.reason,
 				nextRetryAt: outcome.pendingDispatch ? null : new Date(Date.now() + outcome.retryDelayMs),
 				...agentColumns(agent),
@@ -3292,8 +3328,18 @@ async function finalizeFailedRun(
 				// for claude the id it assigned/echoed, for codex/agy the id captured
 				// from their output/store. `null` when not resumable, or when the run
 				// created no session to resume (retry then starts from scratch) — which
-				// includes every checkpoint continuation.
-				agentSessionId: outcome.resumable ? (agent?.sessionId ?? null) : null,
+				// includes every checkpoint continuation. A session continuation lost
+				// with its transport (issue #1138) leaves the column untouched: the row's
+				// id is the session its retry re-enters, and clearing it would make "Retry
+				// now" start the run over. A carried retry also spends no further Tier 2
+				// continuation — `checkpoint`/`continuationCount` stay unset, so the row
+				// keeps the checkpoint being continued.
+				agentSessionId:
+					outcome.carriedContinuation === 'session'
+						? undefined
+						: outcome.resumable
+							? (agent?.sessionId ?? null)
+							: null,
 				checkpoint: outcome.checkpoint,
 				continuationCount: outcome.continuationCount,
 				fromStatus,
@@ -3305,7 +3351,18 @@ async function finalizeFailedRun(
 		// instead of being started over on whichever worker is free. Unreachable for a
 		// guarded settle: the one caller that passes `fromStatus` is the pre-run
 		// deferral, which preserves no checkout at all.
-		if (outcome.resumable || outcome.checkpoint || outcome.resumeDelivery) {
+		//
+		// A continuation lost with its transport (issue #1138) re-records the pin too:
+		// the retry carries the continuation, and a Tier 1 continuation's own re-bind
+		// already dropped the sticky pin. `runs.worker_id` is the right machine here —
+		// a continuation is only ever dispatched pinned to its preserved machine (an
+		// unknown one is refused), and an unfederated run's `NULL` is ignored.
+		if (
+			outcome.resumable ||
+			outcome.checkpoint ||
+			outcome.resumeDelivery ||
+			outcome.carriedContinuation
+		) {
 			await recordPreservedWorker(runId);
 		}
 	} else if (outcome.status === 'phase-failed') {

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
 	jobContinuesPreservedCheckout,
 	preservedCheckoutMachineUnknown,
+	preservedContinuationKind,
 } from '@/dispatch/preserved-worker.js';
 import { createMockPmWebhookJob, createMockScmWebhookJob } from '../../helpers/factories.js';
 
@@ -48,6 +49,40 @@ describe('jobContinuesPreservedCheckout', () => {
 				createMockPmWebhookJob({ recoveryMode: 'fresh', resumeSession: true }),
 			),
 		).toBe(false);
+	});
+});
+
+// Issue #1138: names which continuation a transport-lost deferral carries, so the
+// settle can keep the run row describing it.
+describe('preservedContinuationKind', () => {
+	it('names a Tier 2 checkpoint continuation', () => {
+		expect(preservedContinuationKind(createMockPmWebhookJob({ recoveryMode: 'checkpoint' }))).toBe(
+			'checkpoint',
+		);
+	});
+
+	it('names an automatic and an operator-driven session resume', () => {
+		expect(preservedContinuationKind(createMockPmWebhookJob({ resumeSession: true }))).toBe(
+			'session',
+		);
+		expect(preservedContinuationKind(createMockPmWebhookJob({ recoveryMode: 'resume' }))).toBe(
+			'session',
+		);
+	});
+
+	it('names a delivery resume', () => {
+		expect(preservedContinuationKind(createMockScmWebhookJob({ resumeDelivery: true }))).toBe(
+			'delivery',
+		);
+	});
+
+	it('is undefined for a job that is not a continuation', () => {
+		expect(preservedContinuationKind(createMockPmWebhookJob())).toBeUndefined();
+		expect(
+			preservedContinuationKind(
+				createMockPmWebhookJob({ recoveryMode: 'fresh', resumeSession: true }),
+			),
+		).toBeUndefined();
 	});
 });
 

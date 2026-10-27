@@ -75,6 +75,15 @@ export interface DeferredRetryIntent {
 	 * untouched.
 	 */
 	automaticRetry?: boolean;
+	/**
+	 * This deferral re-attempts a **continuation whose stopped attempt never reported**
+	 * (issue #1138): a lost worker transport carries no exit, session or checkpoint,
+	 * so there is nothing to re-derive recovery intent from, and the work the attempt
+	 * was continuing is still on the machine that lost its transport. The attempt's own
+	 * recovery intent (`recoveryMode`, `resumeSession`, `resumeDelivery`) is carried
+	 * instead of re-derived, so the retry stays a continuation and stays pinned.
+	 */
+	carriedContinuation?: boolean;
 }
 
 /**
@@ -133,6 +142,12 @@ function attemptCounterPatch(
  * session under cannot be assigned a second time; it exits 1 with `Session ID
  * <id> is already in use` before doing any work. So a non-resumable retry mints a
  * fresh id rather than carrying the spent one forward.
+ *
+ * Two branches carry recovery intent instead of re-deriving it: a token-free
+ * re-check (the same attempt, still waiting) and a **carried continuation** (issue
+ * #1138, {@link DeferredRetryIntent.carriedContinuation}) — a continuation whose
+ * attempt was lost without reporting anything, so its own intent is the only
+ * evidence of what the retry should adopt.
  */
 /**
  * The PM dispatch-intent patch, shared by both branches of
@@ -184,6 +199,29 @@ export function deriveRetryJobPayload(parsed: SwarmJob, intent: DeferredRetryInt
 			...dependencyBlockersPatch(intent),
 			...(intent.runId ? { runId: intent.runId } : {}),
 			...pmIntentPatch(parsed, intent, parsed.resumePmPhase),
+			...(intent.continuationDispatchClaimed ? { continuationDispatchClaimed: true } : {}),
+		};
+	}
+	// A **carried continuation** (issue #1138): the stopped attempt was continuing
+	// preserved work and reported nothing about itself, so its recovery intent is the
+	// only evidence there is. Re-deriving would drop it and turn the retry into a
+	// fresh, unpinned start; carrying it keeps the retry the same continuation. Unlike
+	// a re-check, this *is* a new attempt, so it spends a retry and the session id is
+	// re-decided: a session continuation re-enters the same session, while every other
+	// kind *assigns* one — and the lost attempt may already have opened a session under
+	// the id it was assigned, which `claude` refuses to assign twice.
+	if (intent.carriedContinuation) {
+		const { recoveryMode: carriedMode, ...rest } = carried;
+		return {
+			...rest,
+			// The one-shot `'discard'` (issue #592) is never carried, on any branch.
+			...(carriedMode && carriedMode !== 'discard' ? { recoveryMode: carriedMode } : {}),
+			...attemptCounterPatch(parsed, intent),
+			...(intent.runId ? { runId: intent.runId } : {}),
+			...pmIntentPatch(parsed, intent, parsed.resumePmPhase),
+			...(parsed.resumeSession === true || carriedMode === 'resume'
+				? {}
+				: { agentSessionId: randomUUID() }),
 			...(intent.continuationDispatchClaimed ? { continuationDispatchClaimed: true } : {}),
 		};
 	}
