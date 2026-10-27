@@ -376,6 +376,13 @@ export function createHostLocalWorktreeRuntime(
 			if (pin.ownerKey === ownerKey) return false;
 			return !isExpired(pin.createdAt, PIN_TTL_MS);
 		},
+		async isOwnedByRun(projectId, taskId, runId) {
+			// No TTL here, deliberately: expiry says whether an owner may still *block*,
+			// not who the owner was. An unparseable artifact names nobody (`undefined`).
+			const path = paths(projectId, taskId);
+			if (readJson(path.pin, LocalPinSchema)?.ownerKey === runId) return true;
+			return readJson(path.owner, LocalLeaseSchema)?.ownerKey === runId;
+		},
 		async isCancellationRequested() {
 			return options.shutdownSignal?.aborted === true || options.preserveOnCancel?.() === true;
 		},

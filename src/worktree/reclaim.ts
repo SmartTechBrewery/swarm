@@ -12,7 +12,11 @@
  *
  * Both the provision-time collision path (`GitWorktreeManager.provision`) and the
  * retention sweep (`pruneStaleWorktrees`) run through {@link evaluateWorktreeReclaim}
- * so the ordered checks — and the reasons they surface — stay identical.
+ * so the ordered checks — and the reasons they surface — stay identical. The one
+ * carve-out is a checkout an earlier attempt of the provisioning run itself left
+ * behind (issue #1140): provisioning applies only {@link evaluateWorktreeLiveness}
+ * to it, since that retry is a fresh start by its payload and its dirty/unpushed
+ * content is its own superseded work rather than anyone else's.
  *
  * The first two checks are additionally available on their own as
  * {@link evaluateWorktreeLiveness} (issue #951): the age-based abandoned sweep

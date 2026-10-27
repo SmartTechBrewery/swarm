@@ -106,6 +106,46 @@ describe('host-local worktree runtime', () => {
 		expect(await first.isLeased('swarm', '535')).toBe(false);
 	});
 
+	describe('isOwnedByRun (issue #1140)', () => {
+		it('attributes the checkout to the run whose pin it carries, and only to that run', async () => {
+			const live = new Set(['dispatch-a']);
+			const first = runtime('dispatch-a', live, 'run-a');
+			await first.claim('swarm', '1140', 'token-a');
+			await first.preserve('swarm', '1140', 'run-a');
+
+			const asker = runtime('dispatch-b', live, 'run-b');
+			expect(await asker.isOwnedByRun('swarm', '1140', 'run-a')).toBe(true);
+			expect(await asker.isOwnedByRun('swarm', '1140', 'run-b')).toBe(false);
+		});
+
+		it('attributes the checkout to the run behind a lease, even one past its expiry', async () => {
+			const live = new Set(['dispatch-a']);
+			await runtime('dispatch-a', live, 'run-a').claim('swarm', '1140', 'token-a');
+			live.delete('dispatch-a');
+			advance(5 * HOUR_MS);
+
+			const asker = runtime('dispatch-b', live, 'run-b');
+			expect(await asker.isOwnedByRun('swarm', '1140', 'run-a')).toBe(true);
+			expect(await asker.isOwnedByRun('swarm', '1140', 'run-b')).toBe(false);
+		});
+
+		it('answers false when there is nothing to attribute', async () => {
+			expect(
+				await runtime('dispatch-a', new Set(), 'run-a').isOwnedByRun('swarm', '1140', 'run-a'),
+			).toBe(false);
+		});
+
+		it('fails closed on an unreadable pin or lease', async () => {
+			mkdirSync(statePath('swarm', '1140', '.lock'), { recursive: true });
+			writeFileSync(statePath('swarm', '1140', '.lock/owner.json'), '{"ownerKey":"run-a"');
+			writeFileSync(statePath('swarm', '1140', '.pin.json'), 'not json');
+
+			expect(
+				await runtime('dispatch-a', new Set(), 'run-a').isOwnedByRun('swarm', '1140', 'run-a'),
+			).toBe(false);
+		});
+	});
+
 	// `cleanupUnlessPreserved` (`src/pipeline/resume.ts`) preserves the checkout on a
 	// `true` answer, so the predicate is what keeps a pinned orphan's checkout when the
 	// router stops it with `preserveCheckout` (issue #1139).

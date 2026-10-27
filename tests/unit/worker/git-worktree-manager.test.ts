@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createMockProjectConfig } from '../../helpers/factories.js';
 
 // The module under test wraps `execFile` in `promisify`. `execFile` is
@@ -95,10 +95,11 @@ vi.mock('node:fs', () => ({
 	},
 }));
 
+import { logger } from '@/lib/logger.js';
 import { GitWorktreeManager } from '@/worker/git-worktree-manager.js';
 import { CommitUnavailableError } from '@/worktree/commit-availability.js';
 import { BlockedRecoveryError } from '@/worktree/reclaim.js';
-import type { WorktreeRuntime } from '@/worktree/worktree-runtime.js';
+import { storeBackedWorktreeRuntime, type WorktreeRuntime } from '@/worktree/worktree-runtime.js';
 
 const REPO_ROOT = '/Users/dev/swarm/swarm';
 const WORKTREE_14 = `${REPO_ROOT}/.swarm-workspaces/task-14`;
@@ -777,6 +778,151 @@ describe('GitWorktreeManager', () => {
 			});
 		});
 
+		describe("a run's own checkout from an earlier attempt (issue #1140)", () => {
+			const RUN_ID = 'run-abc';
+			const DIRTY_STDOUT: Record<string, string> = {
+				'symbolic-ref --short': 'issue-14\n',
+				'status --porcelain': ' M file.ts\n',
+			};
+			const UNPUSHED_STDOUT: Record<string, string> = {
+				'symbolic-ref --short': 'issue-14\n',
+				'rev-parse --abbrev-ref': 'origin/issue-14\n',
+				'rev-list --count': '2\n',
+			};
+			let warn: ReturnType<typeof vi.spyOn>;
+
+			beforeEach(() => {
+				warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+			});
+
+			afterEach(() => {
+				warn.mockRestore();
+			});
+
+			/** The store-backed runtime, attributing the task's artifacts to `owner`. */
+			function managerOwnedBy(owner: string, overrides: Partial<WorktreeRuntime> = {}) {
+				const runtime: WorktreeRuntime = {
+					...storeBackedWorktreeRuntime,
+					isOwnedByRun: vi.fn(async (_projectId: string, _taskId: string, runId: string) => {
+						return runId === owner;
+					}),
+					...overrides,
+				};
+				const project = createMockProjectConfig({ id: 'project-1', repoRoot: REPO_ROOT });
+				return { manager: new GitWorktreeManager(project, runtime), runtime };
+			}
+
+			function worldFrom(stdout: Record<string, string>): (args: string[]) => GitOutcome {
+				return (args) => ({ stdout: stdout[`${args[0]} ${args[1] ?? ''}`.trim()] ?? '' });
+			}
+
+			it('reclaims its own dirty checkout and re-provisions, reading ownership before the lease', async () => {
+				// The incident: this run's own pin, a dirty tree, and the same runId.
+				existingPaths.add(WORKTREE_14);
+				existingPaths.add(`${WORKTREE_14}/swarm_checkpoint.json`);
+				gitHandler = worldFrom(DIRTY_STDOUT);
+				const { manager, runtime } = managerOwnedBy(RUN_ID);
+
+				const handle = await manager.provision('14', { runId: RUN_ID });
+
+				// Claiming the lease clears this run's own pin, so ownership is read first.
+				expect(vi.mocked(runtime.isOwnedByRun).mock.invocationCallOrder[0]).toBeLessThan(
+					tryClaimWorktreeLeaseMock.mock.invocationCallOrder[0],
+				);
+				expect(runtime.isOwnedByRun).toHaveBeenCalledWith('project-1', '14', RUN_ID);
+				expect(gitCalls).toContainEqual(['worktree', 'remove', '--force', WORKTREE_14]);
+				expect(gitCalls).toContainEqual(['branch', '-D', 'issue-14']);
+				expect(gitCalls).toContainEqual([
+					'worktree',
+					'add',
+					'-b',
+					'issue-14',
+					WORKTREE_14,
+					'origin/main',
+				]);
+				expect(handle.path).toBe(WORKTREE_14);
+				expect(releaseWorktreeLeaseMock).not.toHaveBeenCalled();
+				expect(warn).toHaveBeenCalledWith(
+					expect.stringContaining("this run's own checkout"),
+					expect.objectContaining({
+						projectId: 'project-1',
+						taskId: '14',
+						runId: RUN_ID,
+						path: WORKTREE_14,
+						hasCheckpoint: true,
+					}),
+				);
+			});
+
+			it('reclaims its own checkout with unpushed commits behind its own stale lease', async () => {
+				existingPaths.add(WORKTREE_14);
+				tryClaimWorktreeLeaseMock.mockResolvedValue(false);
+				gitHandler = worldFrom(UNPUSHED_STDOUT);
+				const { manager } = managerOwnedBy(RUN_ID);
+
+				await manager.provision('14', { runId: RUN_ID });
+
+				expect(takeOverWorktreeLeaseMock).toHaveBeenCalled();
+				expect(gitCalls).toContainEqual(['worktree', 'remove', '--force', WORKTREE_14]);
+				expect(warn).toHaveBeenCalledWith(
+					expect.any(String),
+					expect.objectContaining({ hasCheckpoint: false }),
+				);
+			});
+
+			it("still retains another run's dirty checkout", async () => {
+				existingPaths.add(WORKTREE_14);
+				gitHandler = worldFrom(DIRTY_STDOUT);
+				const { manager } = managerOwnedBy('run-other');
+
+				const err = await manager.provision('14', { runId: RUN_ID }).catch((e) => e);
+
+				expect(err).toBeInstanceOf(BlockedRecoveryError);
+				expect(err.reason).toBe('dirty');
+				expect(gitCalls.some((c) => c[0] === 'worktree' && c[1] === 'remove')).toBe(false);
+				expect(releaseWorktreeLeaseMock).toHaveBeenCalled();
+			});
+
+			it("still blocks (resumable-owner) on another run's pin, even behind its own stale lease", async () => {
+				existingPaths.add(WORKTREE_14);
+				gitHandler = worldFrom(DIRTY_STDOUT);
+				hasResumableDeferredRunMock.mockResolvedValue(true);
+				const { manager } = managerOwnedBy(RUN_ID);
+
+				const err = await manager.provision('14', { runId: RUN_ID }).catch((e) => e);
+
+				expect(err.reason).toBe('resumable-owner');
+				expect(gitCalls.some((c) => c[0] === 'worktree' && c[1] === 'remove')).toBe(false);
+				expect(releaseWorktreeLeaseMock).toHaveBeenCalled();
+			});
+
+			it('keeps the full gate without a runId', async () => {
+				existingPaths.add(WORKTREE_14);
+				gitHandler = worldFrom(DIRTY_STDOUT);
+				const { manager, runtime } = managerOwnedBy(RUN_ID);
+
+				const err = await manager.provision('14').catch((e) => e);
+
+				expect(err.reason).toBe('dirty');
+				expect(runtime.isOwnedByRun).not.toHaveBeenCalled();
+				expect(gitCalls.some((c) => c[0] === 'worktree' && c[1] === 'remove')).toBe(false);
+			});
+
+			it('still blocks (live-leased) while a live owner holds the lease', async () => {
+				existingPaths.add(WORKTREE_14);
+				tryClaimWorktreeLeaseMock.mockResolvedValue(false);
+				gitHandler = worldFrom(DIRTY_STDOUT);
+				const { manager } = managerOwnedBy(RUN_ID, { hasLiveOwner: vi.fn(async () => true) });
+
+				const err = await manager.provision('14', { runId: RUN_ID }).catch((e) => e);
+
+				expect(err.reason).toBe('live-leased');
+				expect(takeOverWorktreeLeaseMock).not.toHaveBeenCalled();
+				expect(gitCalls.some((c) => c[0] === 'worktree' && c[1] === 'remove')).toBe(false);
+				expect(releaseWorktreeLeaseMock).not.toHaveBeenCalled();
+			});
+		});
+
 		it('blocks (resumable-owner) and releases the held lease without removing', async () => {
 			existingPaths.add(WORKTREE_14);
 			hasResumableDeferredRunMock.mockResolvedValue(true);
@@ -1127,6 +1273,7 @@ describe('GitWorktreeManager', () => {
 				isLeased: vi.fn(async () => false),
 				hasLiveOwner: vi.fn(async () => false),
 				isResumablePinned: vi.fn(async () => false),
+				isOwnedByRun: vi.fn(async () => false),
 				isCancellationRequested: vi.fn(async () => false),
 				preserve: vi.fn(async () => {}),
 				clearPreservation: vi.fn(async () => {}),
