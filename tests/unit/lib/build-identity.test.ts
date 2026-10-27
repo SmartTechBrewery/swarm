@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+	buildIsOnTarget,
 	resolveBuildIdentity,
 	resolveOwnBuildIdentity,
 	swarmInstallRoot,
@@ -146,5 +147,35 @@ describe('resolveOwnBuildIdentity', () => {
 	it('anchors the install root on this module, not on the working directory', () => {
 		// The SWARM checkout itself, wherever the suite was launched from.
 		expect(existsSync(join(swarmInstallRoot(), 'package.json'))).toBe(true);
+	});
+});
+
+describe('buildIsOnTarget', () => {
+	const commit = 'eb9b79e4a1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6';
+	const clean = { commit, dirty: false };
+
+	it('cannot answer for a machine that declared no build', () => {
+		expect(buildIsOnTarget(null, commit)).toBeNull();
+	});
+
+	it('cannot answer for a branch or tag target, whatever the build', () => {
+		expect(buildIsOnTarget(clean, 'main')).toBeNull();
+		expect(buildIsOnTarget(clean, 'fix/hotfix')).toBeNull();
+		expect(buildIsOnTarget(clean, 'v1.2.0')).toBeNull();
+	});
+
+	it('reads a dirty build on the target commit as not on it', () => {
+		expect(buildIsOnTarget({ commit, dirty: true }, commit)).toBe(false);
+	});
+
+	it('matches the same commit, abbreviated on either side and in any casing', () => {
+		expect(buildIsOnTarget(clean, commit)).toBe(true);
+		expect(buildIsOnTarget(clean, 'eb9b79e')).toBe(true);
+		expect(buildIsOnTarget({ commit: 'eb9b79e', dirty: false }, commit)).toBe(true);
+		expect(buildIsOnTarget(clean, 'EB9B79E4')).toBe(true);
+	});
+
+	it('reads a different commit as not on it', () => {
+		expect(buildIsOnTarget(clean, 'b3d57b35')).toBe(false);
 	});
 });

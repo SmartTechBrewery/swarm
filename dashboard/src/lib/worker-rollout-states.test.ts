@@ -13,6 +13,7 @@ describe('describeRolloutMemberState (issue #1025)', () => {
 			'signalled',
 			'verifying',
 			'done',
+			'current',
 			'skipped',
 			'failed',
 		]) {
@@ -33,6 +34,14 @@ describe('describeRolloutMemberState (issue #1025)', () => {
 		expect(skipped.description).toMatch(/still on the build it had/);
 	});
 
+	// Issue #1146: a machine the rollout left alone because it already was on the target.
+	it('reads `current` as on the target and untouched', () => {
+		const current = describeRolloutMemberState('current');
+		expect(current.label).toBe('Already current');
+		expect(current.tone).toBe('positive');
+		expect(current.description).toMatch(/never drained or asked/);
+	});
+
 	it('reads a machine still in flight as neither good nor bad news', () => {
 		for (const state of ['queued', 'draining', 'signalled', 'verifying']) {
 			expect(describeRolloutMemberState(state).tone).toBe('neutral');
@@ -42,7 +51,7 @@ describe('describeRolloutMemberState (issue #1025)', () => {
 	});
 
 	it('keeps the server’s own word for a state this build has never heard of', () => {
-		// A newer control plane may report an eighth state; describing it is the only
+		// A newer control plane may report a ninth state; describing it is the only
 		// honest answer, and dropping the machine would read as one nobody named.
 		const unknown = describeRolloutMemberState('quarantined');
 		expect(unknown.label).toBe('quarantined');
@@ -83,6 +92,16 @@ describe('tallyRolloutMemberStates (issue #1025)', () => {
 			{ state: 'queued', count: 1 },
 			{ state: 'draining', count: 1 },
 			{ state: 'done', count: 2 },
+		]);
+	});
+
+	it('counts `current` straight after `done`', () => {
+		expect(
+			tallyRolloutMemberStates([{ state: 'skipped' }, { state: 'current' }, { state: 'done' }]),
+		).toEqual([
+			{ state: 'done', count: 1 },
+			{ state: 'current', count: 1 },
+			{ state: 'skipped', count: 1 },
 		]);
 	});
 

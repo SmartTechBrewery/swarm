@@ -1827,9 +1827,7 @@ describe('swarm workers', () => {
 			});
 
 			expect(await run(['update', '--all', 'main'])).toBe(0);
-			expect(lines().join('\n')).toContain(
-				"every machine is on 'main' and back in the dispatch pool",
-			);
+			expect(lines().join('\n')).toContain("every machine is on 'main' and in the dispatch pool");
 		});
 
 		// Since issue #1064 a rollout completes with a machine it gave up on, so the line
@@ -1863,6 +1861,32 @@ describe('swarm workers', () => {
 			fleet(null, 'no-machines');
 			expect(await run(['update', '--all', 'main'])).toBe(0);
 			expect(lines().join('\n')).toContain('you operate no machines');
+		});
+
+		it('says nothing was started when every machine is already on the target, and exits 0', async () => {
+			fleet(null, 'all-current');
+			expect(await run(['update', '--all', 'eb9b79e'])).toBe(0);
+			const joined = lines().join('\n');
+			expect(joined).toContain("every machine you own is already on 'eb9b79e'");
+			expect(joined).toContain('no fleet update was started');
+			expect(joined).not.toContain('you operate no machines');
+		});
+
+		// Issue #1146: a machine left untouched because it already was on the target is
+		// on it, so it does not stop the footer from saying so.
+		it('counts a current machine as on the target, and tallies it after done', async () => {
+			fleet({
+				status: 'completed',
+				members: [
+					{ workerId: WORKER_ID, displayName: 'ada-laptop', state: 'current' },
+					{ workerId: OTHER_WORKER_ID, displayName: 'ada-desktop', state: 'done' },
+				],
+			});
+
+			expect(await run(['update', '--all', 'main'])).toBe(0);
+			const joined = lines().join('\n');
+			expect(joined).toContain("every machine is on 'main' and in the dispatch pool");
+			expect(joined).toContain('1 done, 1 current');
 		});
 
 		it.each([

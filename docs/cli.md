@@ -774,12 +774,22 @@ unchanged.
   prints the whole member table: `queued` (not reached yet, still in the pool),
   `draining` (out of the pool, waiting to go idle — draining never interrupts a
   run), `signalled` (asked, awaiting its report), `verifying` (it applied; waiting
-  for a daemon on the new build to take a lease after its report), `done`, `skipped`
+  for a daemon on the new build to take a lease after its report), `done`, `current`
+  (already on `<ref>` when the rollout reached it, so never drained or asked — issue
+  #1146), `skipped`
   (settled without being moved — the rollout halted first, another session
   re-targeted the machine, it is enrolled in no project, it declared it runs under no
   process supervisor and so would not come back, or it was offline when its turn
   came and so was passed over without being drained or asked) and `failed`. A tally line counts them. A
   skipped machine goes back in the dispatch pool and the wave carries on past it.
+  **Only outdated machines are moved.** When `<ref>` is a commit id, a machine whose
+  declared build already is that commit (and not dirty) settles `current` and stays in
+  the dispatch pool untouched, so re-running after a partial rollout drains and asks
+  only the machines still behind. When every machine is already on it, nothing is
+  started: the command prints `every machine you own is already on '<ref>' — nothing
+  to move, so no fleet update was started` and exits 0. A branch or tag cannot be
+  compared without a fetch, nor can a machine that declared no build, so those go
+  through the normal drain-and-ask path.
   **A bad build halts the rollout.** A machine that reports `failed` — the build broke
   on it — or that comes back still on the build it was asked to leave (which is
   what a machine returning itself to its last known good build looks like — issue

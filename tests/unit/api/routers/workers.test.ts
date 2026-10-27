@@ -2667,6 +2667,17 @@ describe('workers.startFleetUpdate / fleetUpdateStatus (staged rollout, issue #9
 		});
 	});
 
+	// Issue #1146: nothing to move is a no-op, not a rollout that drains everybody.
+	it('answers a fleet already on the target commit with no rollout at all', async () => {
+		startRollout.mockResolvedValue({ outcome: 'all-current' });
+
+		await expect(owner.startFleetUpdate({ target: 'eb9b79e' })).resolves.toEqual({
+			action: 'all-current',
+			target: 'eb9b79e',
+			rollout: null,
+		});
+	});
+
 	// The same explicit ISO treatment every other timestamp on this router gets.
 	it('serialises the rollout’s and every member’s instants as ISO strings', async () => {
 		startRollout.mockResolvedValue({ outcome: 'started', view: view() });
@@ -2909,6 +2920,16 @@ describe('workers.startFleetUpdateForInstallation / …ForInstallation status (i
 		await expect(admin.startFleetUpdateForInstallation({ target: 'main' })).resolves.toEqual({
 			action: 'no-machines',
 			target: 'main',
+			rollout: null,
+		});
+	});
+
+	it('answers an installation already on the target commit with no rollout at all', async () => {
+		startRollout.mockResolvedValue({ outcome: 'all-current' });
+
+		await expect(admin.startFleetUpdateForInstallation({ target: 'eb9b79e' })).resolves.toEqual({
+			action: 'all-current',
+			target: 'eb9b79e',
 			rollout: null,
 		});
 	});

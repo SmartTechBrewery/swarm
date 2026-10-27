@@ -95,6 +95,37 @@ export const WorkerUpdateTargetSchema = z
 	);
 export type WorkerUpdateTarget = z.infer<typeof WorkerUpdateTargetSchema>;
 
+/** A target that names a commit rather than a branch or a tag. */
+const COMMIT_TARGET = /^[0-9a-f]{7,64}$/;
+
+/**
+ * Whether a machine declaring `build` is already on `target` — the relation between
+ * the two halves of the vocabulary above, which a staged fleet update asks before it
+ * drains or signals anybody (issue #1146).
+ *
+ * Three-valued on purpose, and `null` is never read as "current":
+ *
+ * - `null` when the machine declared no build, or when `target` is not commit-shaped.
+ *   A branch or tag moves, and the control plane cannot resolve one to a commit
+ *   without fetching, so it cannot say whether a machine is on it.
+ * - `false` when the build is `dirty`: a modified checkout or a stale `dist/` is not
+ *   the commit it names — the same call the roster's Outdated badge makes
+ *   (`buildMatchesControlPlane`, `../identity/worker-enrollment-service.ts`).
+ * - Otherwise whether one commit id prefixes the other, since both the declared build
+ *   and an operator-typed target may be abbreviated.
+ *
+ * Equality, not ancestry: a machine on a *later* commit than the target is not on it.
+ * The accepted edge is a branch whose name is 7+ hex characters that happen to prefix
+ * a machine's commit — it would read as that commit here, where git would resolve the
+ * branch. Nobody names branches that way.
+ */
+export function buildIsOnTarget(build: WorkerBuild | null, target: string): boolean | null {
+	const ref = target.trim().toLowerCase();
+	if (!build || !COMMIT_TARGET.test(ref)) return null;
+	if (build.dirty) return false;
+	return build.commit.startsWith(ref) || ref.startsWith(build.commit);
+}
+
 /**
  * What became of a requested update, in the one vocabulary the daemon reports in,
  * the `workers` row records, and the operator surfaces read (issue #933).
