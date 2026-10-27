@@ -609,6 +609,21 @@ server-side store) it needs:
    adopts one; and a dispatch cancelled inside the window leaves its orphan trusted until
    the record expires.
 
+18. **#1138 (phase 1 of 4)** — **a transport-lost continuation is retried as the same
+   continuation, pinned to its machine.** Item 16's retry re-derived its recovery intent
+   from the reaped attempt's result, and a reap reports none, so a run that was
+   continuing preserved work — a Tier 2 checkpoint, a session resume, a delivery resume
+   — lost its continuation and its preserved-worker pin. Its retry then started over on
+   another machine, or landed on the same one and was blocked by its own dirty checkout
+   (run 2713f9be). The deferral now carries the lost attempt's own recovery intent
+   (`DeferredRetryIntent.carriedContinuation`), the settle keeps the row describing the
+   continuation (`checkpointed`, or its session id untouched) and re-records the pin
+   from `runs.worker_id` — correct because a continuation is only ever dispatched pinned
+   to its preserved machine. Item 16's "fresh session" and "prefer another worker" now
+   hold only for a run that was not continuing preserved work; for a continuation the
+   pin narrows the candidates before the pass-over preference applies. A carried retry
+   spends the transport-lost budget, not another Tier 2 continuation.
+
 Still out of scope: over-the-wire secret delivery, which remains unnecessary — the
 split keeps every project credential server-side instead.
 

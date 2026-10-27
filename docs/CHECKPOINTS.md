@@ -375,6 +375,13 @@ is spent, the next involuntary stop is a terminal failure whose reason and
 hand-off. A continuation also consumes an ordinary rate-limit retry attempt, so the coarser
 `MAX_RATE_LIMIT_RETRIES` cap still applies underneath.
 
+**A continuation whose worker transport is lost is re-attempted as the same continuation**
+(issue #1138). The transport-loss reap reports no exit, session or checkpoint, so there is nothing
+to re-derive from; the automatic retry instead carries the lost attempt's own
+`recoveryMode: 'checkpoint'`. The run stays `checkpointed` and keeps its checkpoint, spends no
+further `continuation_count` (the transport-lost retry budget bounds it instead), and the settle
+re-records the preserved-worker pin, so the retry runs only on the machine holding the checkout.
+
 ### The operator surface — seeing one and acting on it
 
 A `checkpointed` run is not something to wait out silently: it holds a preserved checkout, has

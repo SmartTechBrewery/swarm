@@ -69,3 +69,21 @@ export function preservedCheckoutMachineUnknown(
 ): boolean {
 	return !run?.recovery?.preservedWorkerId && run?.workerId != null;
 }
+
+/** Which preserved state a continuation adopts (issue #1138) — see {@link preservedContinuationKind}. */
+export type PreservedContinuationKind = 'checkpoint' | 'session' | 'delivery';
+
+/**
+ * Which kind of continuation this dispatch is, or `undefined` when it is not one
+ * (issue #1138). {@link jobContinuesPreservedCheckout} stays the single authority on
+ * *whether* a job continues a preserved checkout; this only names *which* preserved
+ * state it adopts, so a deferral that cannot re-derive its recovery intent (a lost
+ * worker transport reports nothing about the attempt) can carry it instead and keep
+ * the run row describing the same continuation.
+ */
+export function preservedContinuationKind(job: SwarmJob): PreservedContinuationKind | undefined {
+	if (!jobContinuesPreservedCheckout(job)) return undefined;
+	if (job.recoveryMode === 'checkpoint') return 'checkpoint';
+	if (job.recoveryMode === 'resume' || job.resumeSession === true) return 'session';
+	return 'delivery';
+}

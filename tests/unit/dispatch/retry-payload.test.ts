@@ -355,6 +355,86 @@ describe('deriveRetryJobPayload', () => {
 		expect(next.recoveryMode).toBeUndefined();
 		expect(next.resumeSession).toBe(true);
 	});
+
+	// Issue #1138: a continuation lost with its worker transport reports nothing to
+	// re-derive from, so its retry carries the attempt's own recovery intent — and so
+	// stays pinned to the machine holding the work. Without the flag the retry is
+	// re-derived as before ('drops stale resume flags for a fresh (non-resumable) retry').
+	describe('a carried continuation keeps its recovery intent', () => {
+		const SESSION = '92340ec7-709e-4ffa-9297-3899caca4830';
+		const intent = {
+			phase: 'implementation' as const,
+			runId: 'run-1',
+			resumable: false,
+			automaticRetry: true,
+			carriedContinuation: true,
+		};
+
+		it('keeps a checkpoint continuation, with a fresh session id', () => {
+			const next = deriveRetryJobPayload(
+				createMockPmWebhookJob({
+					recoveryMode: 'checkpoint',
+					agentSessionId: SESSION,
+					rateLimitRetryAttempt: 1,
+				}),
+				intent,
+			);
+
+			expect(next.recoveryMode).toBe('checkpoint');
+			expect(next.resumeSession).toBeUndefined();
+			expect(next.agentSessionId).toBeDefined();
+			expect(next.agentSessionId).not.toBe(SESSION);
+			expect(next.automaticRetryAttempt).toBe(1);
+			expect(next.rateLimitRetryAttempt).toBe(1);
+			expect(next.runId).toBe('run-1');
+			expect(jobContinuesPreservedCheckout(next)).toBe(true);
+		});
+
+		it('keeps a session continuation re-entering the same session', () => {
+			const next = deriveRetryJobPayload(
+				createMockPmWebhookJob({ resumeSession: true, agentSessionId: SESSION }),
+				intent,
+			);
+
+			expect(next.resumeSession).toBe(true);
+			expect(next.agentSessionId).toBe(SESSION);
+			expect(jobContinuesPreservedCheckout(next)).toBe(true);
+		});
+
+		it("keeps an operator 'resume' and its session", () => {
+			const next = deriveRetryJobPayload(
+				createMockPmWebhookJob({
+					recoveryMode: 'resume',
+					resumeSession: true,
+					agentSessionId: SESSION,
+				}),
+				intent,
+			);
+
+			expect(next.recoveryMode).toBe('resume');
+			expect(next.agentSessionId).toBe(SESSION);
+		});
+
+		it('keeps a delivery continuation, with a fresh session id', () => {
+			const next = deriveRetryJobPayload(
+				createMockScmWebhookJob({ resumeDelivery: true, agentSessionId: SESSION }),
+				{ ...intent, phase: 'review' },
+			);
+
+			expect(next.resumeDelivery).toBe(true);
+			expect(next.agentSessionId).not.toBe(SESSION);
+			expect(jobContinuesPreservedCheckout(next)).toBe(true);
+		});
+
+		it("never carries a one-shot 'discard'", () => {
+			const next = deriveRetryJobPayload(
+				createMockScmWebhookJob({ recoveryMode: 'discard', resumeDelivery: true }),
+				{ ...intent, phase: 'review' },
+			);
+
+			expect(next.recoveryMode).toBeUndefined();
+		});
+	});
 });
 
 describe('deriveCapacityPendingPayload', () => {

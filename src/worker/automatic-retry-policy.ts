@@ -46,8 +46,10 @@ export const AUTOMATIC_RETRY_POLICIES: Partial<Record<AgentFailureKind, Automati
 	 * The worker's transport was lost and did not return within the grace (issue
 	 * #859). Thirty minutes gives a machine that only dropped off the network time to
 	 * come back, and the retry prefers a different eligible worker anyway
-	 * (`runs.recovery.transportLostWorkerIds`). Two retries: a run whose worker keeps
-	 * vanishing needs a human to look at the fleet.
+	 * (`runs.recovery.transportLostWorkerIds`) — unless the run's work is preserved on
+	 * that machine, in which case the retry carries the continuation and stays pinned
+	 * to it (issue #1138). Two retries: a run whose worker keeps vanishing needs a
+	 * human to look at the fleet.
 	 */
 	'transport-lost': {
 		delayMs: 30 * 60 * 1000,
