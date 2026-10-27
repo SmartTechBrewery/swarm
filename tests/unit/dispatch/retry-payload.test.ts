@@ -426,6 +426,22 @@ describe('deriveRetryJobPayload', () => {
 			expect(jobContinuesPreservedCheckout(next)).toBe(true);
 		});
 
+		// Issue #1141: the wait for a machine that just lost its transport is bounded,
+		// measured from *this* loss — never from an earlier one's instant.
+		it('records when the machine was lost, replacing an earlier loss', () => {
+			const before = Date.now();
+			const next = deriveRetryJobPayload(
+				createMockPmWebhookJob({
+					recoveryMode: 'checkpoint',
+					preservedWorkerLostTransportAt: '2026-01-01T00:00:00.000Z',
+				}),
+				intent,
+			);
+
+			expect(Date.parse(next.preservedWorkerLostTransportAt ?? '')).toBeGreaterThanOrEqual(before);
+			expect(next.recoveryMode).toBe('checkpoint');
+		});
+
 		it("never carries a one-shot 'discard'", () => {
 			const next = deriveRetryJobPayload(
 				createMockScmWebhookJob({ recoveryMode: 'discard', resumeDelivery: true }),
@@ -434,6 +450,40 @@ describe('deriveRetryJobPayload', () => {
 
 			expect(next.recoveryMode).toBeUndefined();
 		});
+	});
+});
+
+// Issue #1141: the loss marker bounds only the wait for the machine *this* loss took
+// away. The re-checks that wait for it keep it; an attempt that ran past the gate
+// means the machine came back, so nothing derived from it may bound a later wait.
+describe('the lost-transport marker', () => {
+	const LOST_AT = '2026-10-27T01:00:00.000Z';
+
+	it('is carried by the eligibility re-checks that wait for the machine', () => {
+		const next = deriveRetryJobPayload(
+			createMockPmWebhookJob({
+				recoveryMode: 'checkpoint',
+				preservedWorkerLostTransportAt: LOST_AT,
+				workerEligibilityRecheckAttempt: 240,
+			}),
+			{ phase: 'implementation', runId: 'run-1', resumable: false, workerEligibilityRecheck: true },
+		);
+
+		expect(next.preservedWorkerLostTransportAt).toBe(LOST_AT);
+	});
+
+	it('is dropped by a deferral of an attempt that ran, with the re-checks it spent', () => {
+		// The machine came back and ran the attempt, which then hit a usage limit.
+		const next = deriveRetryJobPayload(
+			createMockPmWebhookJob({
+				recoveryMode: 'checkpoint',
+				preservedWorkerLostTransportAt: LOST_AT,
+				workerEligibilityRecheckAttempt: 240,
+			}),
+			{ phase: 'implementation', runId: 'run-1', resumable: true },
+		);
+
+		expect(next.preservedWorkerLostTransportAt).toBeUndefined();
 	});
 });
 
@@ -470,6 +520,30 @@ describe('deriveCapacityPendingPayload', () => {
 });
 
 describe('reconstructRetryJob', () => {
+	// Issue #1141: a manual retry bypasses the automatic caps, including the bounded
+	// wait for a pinned machine that lost its transport. The stored payload may be the
+	// one an attempt ran with after that machine came back, so its loss marker is
+	// dropped rather than trusted.
+	it('resets the worker-eligibility re-check counter and drops the loss marker', () => {
+		const job = reconstructRetryJob(
+			createMockPmWebhookJob({
+				recoveryMode: 'checkpoint',
+				workerEligibilityRecheckAttempt: 288,
+				preservedWorkerLostTransportAt: '2026-10-27T01:00:00.000Z',
+			}),
+			'run-1',
+			'implementation',
+			undefined,
+			undefined,
+			undefined,
+			true,
+		);
+
+		expect(job.workerEligibilityRecheckAttempt).toBe(0);
+		expect(job.preservedWorkerLostTransportAt).toBeUndefined();
+		expect(job.recoveryMode).toBe('checkpoint');
+	});
+
 	// Two of the three callers ("Retry now"'s reconstruct-from-run-row fallback and
 	// "Reset & restart") pass a raw `run.jobPayload` straight out of `jsonb`, so a
 	// pre-#385 row must be upgraded here — otherwise the rebuilt dispatch persists

@@ -11,6 +11,7 @@ describe('preservedWorkerLabel', () => {
 				workerId: 'w-1',
 				workerName: 'm3_pro_tp',
 				waiting: true,
+				waitEndsAt: null,
 			}),
 		).toBe('m3_pro_tp');
 	});
@@ -22,17 +23,19 @@ describe('preservedWorkerLabel', () => {
 				workerId: 'w-1',
 				workerName: null,
 				waiting: false,
+				waitEndsAt: null,
 			}),
 		).toBe('w-1');
 	});
 });
 
 describe('describePreservedWorker', () => {
-	const pinned = (waiting: boolean) => ({
+	const pinned = (waiting: boolean, waitEndsAt: string | null = null) => ({
 		state: 'preserved' as const,
 		workerId: 'w-1',
 		workerName: 'm3_pro_tp',
 		waiting,
+		waitEndsAt,
 	});
 
 	it('says nothing for a run with no recorded machine', () => {
@@ -51,6 +54,22 @@ describe('describePreservedWorker', () => {
 		expect(described?.body).toContain('offline');
 	});
 
+	// Issue #1141: a machine that lost its transport under this run is waited for on a
+	// bound, so the callout must not promise the wait never ends.
+	it('names when SWARM stops waiting for a machine that lost its connection', () => {
+		const described = describePreservedWorker(
+			pinned(true, '2026-10-28T09:00:00.000Z'),
+			(iso) => `<${iso}>`,
+		);
+
+		expect(described?.title).toContain('m3_pro_tp');
+		expect(described?.body).not.toContain('does not time out');
+		expect(described?.body).toContain('lost its connection');
+		expect(described?.body).toContain('until <2026-10-28T09:00:00.000Z>');
+		expect(described?.body).toContain('Retry now');
+		expect(described?.body).toContain('Reset & restart');
+	});
+
 	it('never promises an unbounded wait for a run merely pinned, not blocked on the pin', () => {
 		// The common case right after any rate limit: the run is `deferred` with a
 		// recorded machine and a retry on a timer. Claiming that wait never expires
@@ -67,6 +86,7 @@ describe('describePreservedWorker', () => {
 			workerId: 'w-1',
 			workerName: 'm3_pro_tp',
 			waiting: false,
+			waitEndsAt: null,
 		});
 
 		expect(described?.title).toBe('Preserved work was discarded');

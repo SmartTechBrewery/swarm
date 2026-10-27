@@ -210,10 +210,15 @@ export function deriveRetryJobPayload(parsed: SwarmJob, intent: DeferredRetryInt
 	// re-decided: a session continuation re-enters the same session, while every other
 	// kind *assigns* one — and the lost attempt may already have opened a session under
 	// the id it was assigned, which `claude` refuses to assign twice.
+	//
+	// It also records *when* the machine was lost (issue #1141): the retry's wait for
+	// that machine is the bounded one, measured from this loss — a new loss starts a
+	// new window rather than inheriting an earlier one's.
 	if (intent.carriedContinuation) {
 		const { recoveryMode: carriedMode, ...rest } = carried;
 		return {
 			...rest,
+			preservedWorkerLostTransportAt: new Date().toISOString(),
 			// The one-shot `'discard'` (issue #592) is never carried, on any branch.
 			...(carriedMode && carriedMode !== 'discard' ? { recoveryMode: carriedMode } : {}),
 			...attemptCounterPatch(parsed, intent),
@@ -231,6 +236,9 @@ export function deriveRetryJobPayload(parsed: SwarmJob, intent: DeferredRetryInt
 		resumeDelivery: _resumeDelivery,
 		recoveryMode,
 		agentSessionId: priorSessionId,
+		// This attempt ran past the gate, so the machine it waited for came back
+		// (issue #1141): a later wait for it is #567's unbounded one again.
+		preservedWorkerLostTransportAt: _servedLoss,
 		...job
 	} = carried;
 	return {
@@ -326,9 +334,11 @@ function applyManualRecoveryIntent(
 
 /**
  * Rebuild a retry job payload from a stored one: carry the originating `runId`
- * forward (so the retry reuses that row) and reset the rate-limit and
- * automatic-retry attempt counters to 0 (a manual retry bypasses the automatic
- * caps), drop any adopted late result (issue #1076), applying any
+ * forward (so the retry reuses that row) and reset the rate-limit,
+ * automatic-retry and worker-eligibility attempt counters to 0 (a manual retry
+ * bypasses the automatic caps — including the bounded wait for a pinned machine
+ * that lost its transport, issue #1141, whose loss marker it drops), drop
+ * any adopted late result (issue #1076), applying any
  * cli/model overrides. Shared by "Retry now"'s reopen-existing-dispatch path,
  * its reconstruct-from-run-row fallback, and "Reset & restart".
  *
@@ -351,6 +361,12 @@ export function reconstructRetryJob(
 	job.runId = runId;
 	job.rateLimitRetryAttempt = 0;
 	job.automaticRetryAttempt = 0;
+	job.workerEligibilityRecheckAttempt = 0;
+	// The stored payload may be the one an attempt ran with after the machine it was
+	// pinned to came back, so its loss marker says nothing about now (issue #1141): a
+	// manual retry waits for its pinned machine on #567's unbounded wait — which the
+	// run-detail callout states — with "Reset & restart" as the way out.
+	delete job.preservedWorkerLostTransportAt;
 	// A manual retry runs the phase; it never re-settles a late result an earlier
 	// attempt was adopted with (issue #1076).
 	delete job.adoptedResult;

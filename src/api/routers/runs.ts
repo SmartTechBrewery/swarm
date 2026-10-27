@@ -72,7 +72,9 @@ import {
 } from '../../dispatch/item-liveness.js';
 import {
 	jobContinuesPreservedCheckout,
+	lostTransportPreservedWaitEndsAt,
 	preservedCheckoutMachineUnknown,
+	preservedContinuationKind,
 } from '../../dispatch/preserved-worker.js';
 import { dropCheckoutContinuation, reconstructRetryJob } from '../../dispatch/retry-payload.js';
 import { RunResetError, type RunResetRefusal, resetRun } from '../../dispatch/run-reset.js';
@@ -481,6 +483,37 @@ function alreadyRetrying(): TRPCError {
  * the gate's reason and the one action that ends it, instead of parking a dispatch on
  * `worker-authorization` until its budget runs out.
  */
+/**
+ * Whether a manual retry of a **failed** run re-enters the session it preserved on its
+ * pinned machine (issue #1141), rather than starting fresh as a failed run's retry
+ * otherwise does. A pinned continuation whose machine lost its transport and never came
+ * back settles `failed` while keeping its pin and session — that is the whole point of
+ * handing it to the operator — and its stored payload still asks to resume the session.
+ * Starting fresh there would drop that intent, so the retry would run unpinned anywhere
+ * and silently redo the work the operator was told "Retry now" continues.
+ *
+ * A checkpoint or delivery continuation needs no help here: the inherited
+ * `'checkpoint'`/`resumeDelivery` survives a fresh-session rebuild. A CLI/model
+ * override cannot re-enter another CLI's session, so it keeps the fresh start.
+ */
+function failedRunContinuesPreservedSession(
+	run: {
+		status: string;
+		agentSessionId: string | null;
+		recovery: { preservedWorkerId?: string | null } | null;
+	},
+	payload: SwarmJob,
+	applyingOverride: boolean,
+): boolean {
+	return (
+		run.status === 'failed' &&
+		!applyingOverride &&
+		Boolean(run.recovery?.preservedWorkerId) &&
+		Boolean(run.agentSessionId) &&
+		preservedContinuationKind(payload) === 'session'
+	);
+}
+
 function placeableRetryJob(
 	job: SwarmJob,
 	run: {
@@ -718,6 +751,14 @@ export interface RunPreservedWorker {
 	 * rather than on the run's status.
 	 */
 	waiting: boolean;
+	/**
+	 * When the wait is the **bounded** one for a pinned machine that lost its
+	 * transport under this run (issue #1141), the ISO instant SWARM stops waiting and
+	 * fails the run — the same instant the worker enforces
+	 * (`lostTransportPreservedWaitEndsAt`). `null` while not waiting, and for #567's
+	 * unbounded wait, so "this wait does not time out" is said only when it is true.
+	 */
+	waitEndsAt: string | null;
 }
 
 /**
@@ -760,13 +801,19 @@ async function resolveRunLateResultAccepted(run: {
  *
  * This is what lets a run *say which machine it is waiting for*, to every viewer,
  * for as long as it waits — the wait is unbounded by design, so it must never read
- * as a wedged run. Resolved server-side like every other display label here, and a
- * failed lookup degrades to a null name (and to "not waiting", the weaker claim)
- * rather than throwing.
+ * as a wedged run. The one exception, a machine that lost its transport under this
+ * run (issue #1141), is read off the waiting dispatch's own payload so the callout
+ * can name when SWARM stops waiting. Resolved server-side like every other display
+ * label here, and a failed lookup degrades to a null name (and to "not waiting",
+ * the weaker claim) rather than throwing.
  */
 async function resolveRunPreservedWorker(run: {
 	id: string;
-	recovery: { preservedWorkerId?: string | null; abandonedWorkerId?: string | null } | null;
+	recovery: {
+		preservedWorkerId?: string | null;
+		abandonedWorkerId?: string | null;
+		transportLostWorkerIds?: string[] | null;
+	} | null;
 }): Promise<RunPreservedWorker | null> {
 	const preserved = run.recovery?.preservedWorkerId ?? null;
 	const abandoned = run.recovery?.abandonedWorkerId ?? null;
@@ -780,18 +827,23 @@ async function resolveRunPreservedWorker(run: {
 			// history and never queries the queue.
 			preserved ? getActiveDispatchByRunId(run.id) : Promise.resolve(undefined),
 		]);
+		const waiting = dispatch?.waitReason === 'preserved-worker';
+		const waitEndsAt = waiting
+			? lostTransportPreservedWaitEndsAt(dispatch.jobPayload, run)
+			: undefined;
 		return {
 			state,
 			workerId,
 			workerName: worker?.displayName ?? null,
-			waiting: dispatch?.waitReason === 'preserved-worker',
+			waiting,
+			waitEndsAt: waitEndsAt?.toISOString() ?? null,
 		};
 	} catch (error) {
 		logger.warn('runs.getById: preserved-worker lookup failed; reporting the id without a name', {
 			workerId,
 			error: describeError(error),
 		});
-		return { state, workerId, workerName: null, waiting: false };
+		return { state, workerId, workerName: null, waiting: false, waitEndsAt: null };
 	}
 }
 
@@ -1563,6 +1615,11 @@ export const runsRouter = router({
 						message: `Cannot retry run "${input.runId}" — its dispatch payload no longer validates.`,
 					});
 				}
+				const continuesSession = failedRunContinuesPreservedSession(
+					run,
+					stored.data,
+					applyingOverride,
+				);
 				const job = placeableRetryJob(
 					reconstructRetryJob(
 						stored.data,
@@ -1571,8 +1628,8 @@ export const runsRouter = router({
 						input.cli,
 						input.model,
 						input.reasoning,
-						startFresh,
-						recoveryMode,
+						startFresh && !continuesSession,
+						continuesSession ? 'resume' : recoveryMode,
 						run.recovery?.agentSessionId ?? run.agentSessionId,
 					),
 					run,
@@ -1599,6 +1656,11 @@ export const runsRouter = router({
 					message: `Cannot retry run "${input.runId}" — it was created without a job payload.`,
 				});
 			}
+			const continuesSession = failedRunContinuesPreservedSession(
+				run,
+				normalizeStoredJobPayload(run.jobPayload),
+				applyingOverride,
+			);
 			const job = placeableRetryJob(
 				reconstructRetryJob(
 					run.jobPayload,
@@ -1607,8 +1669,8 @@ export const runsRouter = router({
 					input.cli,
 					input.model,
 					input.reasoning,
-					startFresh,
-					recoveryMode,
+					startFresh && !continuesSession,
+					continuesSession ? 'resume' : recoveryMode,
 					run.recovery?.agentSessionId ?? run.agentSessionId,
 				),
 				run,

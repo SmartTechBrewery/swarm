@@ -35,10 +35,14 @@
  *    (`preserved-worker-unavailable`) is the one wait with **no budget**: a
  *    continuation is never started over on another machine, because doing so
  *    silently discards the earlier attempt's work. Giving that work up is an
- *    operator action ("Reset & restart"), never a timer. A continuation whose
- *    machine was never recorded is refused too (`preserved-worker-unknown`, issue
- *    #954) — on the ordinary bounded budget, since no machine coming online can
- *    supply a record nobody wrote.
+ *    operator action ("Reset & restart"), never a timer. The one bound is a pinned
+ *    machine that **lost its transport under this run** (issue #1141): it may never
+ *    come back, so the worker waits a fixed window for it and then fails the run
+ *    with the pin, checkpoint and session kept, for the operator to "Retry now" or
+ *    "Reset & restart" — still never a fall-back onto another machine. A
+ *    continuation whose machine was never recorded is refused too
+ *    (`preserved-worker-unknown`, issue #954) — on the ordinary bounded budget,
+ *    since no machine coming online can supply a record nobody wrote.
  * 3. **Eligibility** — `evaluateWorkerEligibility` (#338 Phase 2) judges one
  *    worker against one target: active enrollment → sharing consent → draining
  *    (issue #919) → connection/health → free capacity → whether it holds a checkout
@@ -192,11 +196,25 @@ export type GateDecision =
  */
 export class WorkerIneligibleError extends Error {
 	readonly reason: DispatchIneligibilityReason;
+	/**
+	 * Set on a `preserved-worker-unavailable` refusal whose pinned machine **lost its
+	 * transport under the attempt this dispatch re-attempts** (issue #1141): the
+	 * machine's display label (or id), and the instant the wait for it ends. Its
+	 * presence is what bounds that wait: the worker gives up once `waitEndsAt` has
+	 * passed and hands the run to the operator, where a pinned machine that is merely
+	 * busy keeps #567's unbounded wait.
+	 */
+	readonly lostTransport?: { worker: string; waitEndsAt: Date };
 
-	constructor(reason: DispatchIneligibilityReason, message: string) {
+	constructor(
+		reason: DispatchIneligibilityReason,
+		message: string,
+		options?: { lostTransport?: { worker: string; waitEndsAt: Date } },
+	) {
 		super(message);
 		this.name = 'WorkerIneligibleError';
 		this.reason = reason;
+		this.lostTransport = options?.lostTransport;
 	}
 }
 
@@ -285,8 +303,14 @@ export interface DispatchGateInput {
 	 * `name` is the worker's display label for the refusal message, resolved by the
 	 * caller because a pinned machine may not even be an enrolled candidate here
 	 * (unenrolled since, or never enrolled in this project); the id is the fallback.
+	 *
+	 * `lostTransportWaitEndsAt` is set when that machine **lost its transport under
+	 * the attempt this dispatch re-attempts** (issue #1141): the caller bounds that
+	 * wait, and this is the instant it stops waiting, so the refusal can say the
+	 * machine lost its connection and when SWARM gives up on it. Absent, the wait is
+	 * #567's unbounded one.
 	 */
-	preservedWorker?: { id: string; name?: string };
+	preservedWorker?: { id: string; name?: string; lostTransportWaitEndsAt?: Date };
 	/**
 	 * This dispatch continues a preserved checkout and the run records **no**
 	 * machine for it (issue #954) — the case {@link preservedWorker} cannot
@@ -524,6 +548,11 @@ function ineligibilityMessage(
 		repository: string;
 		preservedWorker?: string;
 		/**
+		 * When the pinned machine lost its transport under this run (issue #1141), the
+		 * instant the bounded wait for it ends. Absent for #567's unbounded wait.
+		 */
+		preservedWorkerLostTransportUntil?: Date;
+		/**
 		 * The soonest instant any refused candidate's cool-down lapses (issue #981) —
 		 * collected during the target walk so the refusal can name when work resumes.
 		 * Absent when no candidate reported `cli-rate-limited`.
@@ -541,7 +570,16 @@ function ineligibilityMessage(
 		// for this attempt exists; the run-detail callout is what an operator reads
 		// (`runs.getById`'s `preservedWorker`), and it is built from the recorded machine
 		// rather than from this string.
+		//
+		// A machine that lost its transport under this run (issue #1141) is the one
+		// variant with an ending: it may never come back, so the text says so and names
+		// the instant SWARM stops waiting instead of promising a wait without end. It
+		// does not claim the machine is still disconnected — the same refusal covers one
+		// that has reconnected but is busy.
 		case 'preserved-worker-unavailable':
+			if (context.preservedWorkerLostTransportUntil) {
+				return `This run continues work preserved on worker '${context.preservedWorker ?? 'unknown'}', so it can only run there. That machine lost its connection to SWARM while running this phase and is not available to take it yet. Waiting for it until ${context.preservedWorkerLostTransportUntil.toISOString()} — nothing is started over on another machine. If it is still not available by then, SWARM stops waiting and marks this run failed, keeping the preserved work. To give up the preserved work and restart this phase from scratch on any worker, use "Reset & restart".`;
+			}
 			return `This run continues work preserved on worker '${context.preservedWorker ?? 'unknown'}', so it can only run there. That machine is not currently available to take it. Waiting for it — this wait does not time out and nothing is started over on another machine. To give up the preserved work and restart this phase from scratch on any worker, use "Reset & restart".`;
 		// Same shape as the case above — name the condition, say what it means, name the
 		// one action — but the opposite ending (issue #954): the machine is not named,
@@ -587,6 +625,30 @@ function ineligibilityMessage(
 		case 'repository-mismatch':
 			return `No enrolled worker for ${owner} holds a checkout of '${context.repository}' — every available machine holds checkouts of other repositories only. Give a worker a checkout of that repository (SWARM_WORKER_REPO_ROOT takes several, separated by ':') or enroll one that already holds it — this work waits until one does.`;
 	}
+}
+
+/**
+ * The terminal text for a pinned continuation whose machine lost its transport and
+ * did not come back within the bounded wait (issue #1141) — posted on the item and
+ * written onto the run once the worker stops waiting. It names the machine, how long
+ * SWARM waited, and the two operator actions; neither is automatic, because falling
+ * back to another machine is exactly the silent start-over the pin exists to prevent.
+ */
+export function preservedWorkerLostTransportExpiredMessage(
+	worker: string,
+	waitedMs: number,
+): string {
+	return `This run continues work preserved on worker '${worker}', so it can only run there. That machine lost its connection to SWARM while running this phase, and in the ${describeWaitDuration(waitedMs)} since then it has not been available to take this run, so SWARM has stopped waiting. The preserved work is kept. Either bring '${worker}' back online and use "Retry now" to continue from the preserved work there, or use "Reset & restart" to give the preserved work up and restart this phase from scratch on any worker.`;
+}
+
+/**
+ * A wait length as an operator reads it — whole hours from two hours up ("24 hours",
+ * even when the re-check cadence made it a few minutes more), minutes below that.
+ */
+function describeWaitDuration(ms: number): string {
+	const minutes = Math.max(1, Math.round(ms / 60_000));
+	if (minutes < 120) return `${minutes} minute${minutes === 1 ? '' : 's'}`;
+	return `${Math.round(minutes / 60)} hours`;
 }
 
 /**
@@ -839,6 +901,7 @@ export async function evaluateDispatchEligibility(
 		phase: input.phase,
 		repository: input.repository,
 		preservedWorker: pinned?.name ?? pinned?.id,
+		preservedWorkerLostTransportUntil: pinned?.lostTransportWaitEndsAt,
 	};
 	if (permitted.length === 0) {
 		// A pinned machine that is not a candidate at all — unenrolled since, or its

@@ -637,6 +637,7 @@ describe('PreservedWorkerCallout (issue #567)', () => {
 			workerId: 'w-1',
 			workerName: 'm3_pro_tp',
 			waiting: true,
+			waitEndsAt: null,
 			...overrides,
 		},
 	});
@@ -1470,6 +1471,7 @@ describe('ResetRunButton (issue #428)', () => {
 					workerId: 'w-1',
 					workerName: 'm3_pro_tp',
 					waiting: true,
+					waitEndsAt: null,
 				},
 			}),
 		);
@@ -1490,6 +1492,7 @@ describe('ResetRunButton (issue #428)', () => {
 					workerId: 'w-1',
 					workerName: 'm3_pro_tp',
 					waiting: false,
+					waitEndsAt: null,
 				},
 			}),
 		);

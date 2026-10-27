@@ -1668,7 +1668,59 @@ describe('runsRouter', () => {
 					workerId: 'w-1',
 					workerName: 'm3_pro_tp',
 					waiting: true,
+					waitEndsAt: null,
 				});
+			});
+
+			// Issue #1141: the bounded wait for a machine that lost its transport must not
+			// read as "does not time out" on the run detail, so its end is reported.
+			it('reports when SWARM stops waiting for a pinned machine that lost its transport', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({
+						id: 'run-1',
+						status: 'checkpointed',
+						recovery: { preservedWorkerId: 'w-1', transportLostWorkerIds: ['w-1'] },
+					}),
+				);
+				vi.mocked(getWorker).mockResolvedValue({ id: 'w-1', displayName: 'm3_pro_tp' } as never);
+				vi.mocked(getActiveDispatchByRunId).mockResolvedValue(
+					makeDispatch({
+						state: 'retry-scheduled',
+						waitReason: 'preserved-worker',
+						jobPayload: createMockPmWebhookJob({
+							runId: 'run-1',
+							recoveryMode: 'checkpoint',
+							preservedWorkerLostTransportAt: '2026-10-27T01:00:00.000Z',
+						}),
+					}),
+				);
+
+				const result = await caller.getById({ id: 'run-1' });
+
+				expect(result.preservedWorker).toMatchObject({
+					waiting: true,
+					waitEndsAt: '2026-10-28T01:00:00.000Z',
+				});
+			});
+
+			it('keeps the wait unbounded once the lost machine came back and served the run', async () => {
+				// The sticky list still names the machine, but the waiting payload carries no
+				// loss: a later attempt ran on it, so this is #567's wait again.
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({
+						id: 'run-1',
+						status: 'checkpointed',
+						recovery: { preservedWorkerId: 'w-1', transportLostWorkerIds: ['w-1'] },
+					}),
+				);
+				vi.mocked(getWorker).mockResolvedValue({ id: 'w-1', displayName: 'm3_pro_tp' } as never);
+				vi.mocked(getActiveDispatchByRunId).mockResolvedValue(
+					makeDispatch({ state: 'retry-scheduled', waitReason: 'preserved-worker' }),
+				);
+
+				const result = await caller.getById({ id: 'run-1' });
+
+				expect(result.preservedWorker).toMatchObject({ waiting: true, waitEndsAt: null });
 			});
 
 			it('does not report a pinned run as waiting when the pin is not what blocks it', async () => {
@@ -1731,6 +1783,7 @@ describe('runsRouter', () => {
 					workerId: 'w-1',
 					workerName: 'm3_pro_tp',
 					waiting: false,
+					waitEndsAt: null,
 				});
 				expect(getActiveDispatchByRunId).not.toHaveBeenCalled();
 			});
@@ -2892,6 +2945,77 @@ describe('runsRouter', () => {
 
 				const [{ jobPayload }] = vi.mocked(createAndPublishDispatch).mock.calls[0];
 				expect(jobPayload.recoveryMode).toBe('checkpoint');
+			});
+		});
+		// Issue #1141: a pinned continuation whose machine lost its transport and never
+		// came back settles `failed` keeping its pin, checkpoint and session, and tells
+		// the operator to bring the machine back and "Retry now" — which must therefore
+		// still be a pinned continuation, not the fresh start a failed run's retry is.
+		describe('a failed run whose lost pinned machine was given up on (issue #1141)', () => {
+			const PRESERVED_SESSION = 'b2c3d4e5-0000-0000-0000-000000000000';
+			const givenUpRun = (overrides: Partial<RunRow> = {}) =>
+				makeRun({
+					id: 'run-1',
+					status: 'failed',
+					phase: 'respond-to-review',
+					workerId: 'worker-a',
+					agentSessionId: PRESERVED_SESSION,
+					recovery: { preservedWorkerId: 'worker-a', transportLostWorkerIds: ['worker-a'] },
+					jobPayload: {
+						...SCM_PAYLOAD,
+						resumeSession: true,
+						agentSessionId: PRESERVED_SESSION,
+						workerEligibilityRecheckAttempt: 288,
+					},
+					...overrides,
+				});
+
+			beforeEach(() => {
+				vi.mocked(getActiveDispatchByRunId).mockResolvedValue(undefined);
+				vi.mocked(createAndPublishDispatch).mockResolvedValue({
+					dispatch: makeDispatch(),
+					created: true,
+				});
+			});
+
+			it('re-enters the preserved session, pinned, with a fresh wait window', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(givenUpRun());
+
+				await caller.retryNow({ runId: 'run-1' });
+
+				const [{ jobPayload }] = vi.mocked(createAndPublishDispatch).mock.calls[0];
+				expect(jobPayload.recoveryMode).toBe('resume');
+				expect(jobPayload.resumeSession).toBe(true);
+				expect(jobPayload.agentSessionId).toBe(PRESERVED_SESSION);
+				expect(jobPayload.workerEligibilityRecheckAttempt).toBe(0);
+				expect(jobContinuesPreservedCheckout(jobPayload)).toBe(true);
+			});
+
+			it('keeps a checkpoint continuation a checkpoint continuation', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					givenUpRun({
+						checkpoint: CHECKPOINT,
+						jobPayload: { ...SCM_PAYLOAD, recoveryMode: 'checkpoint' },
+					}),
+				);
+
+				await caller.retryNow({ runId: 'run-1' });
+
+				const [{ jobPayload }] = vi.mocked(createAndPublishDispatch).mock.calls[0];
+				expect(jobPayload.recoveryMode).toBe('checkpoint');
+				expect(jobContinuesPreservedCheckout(jobPayload)).toBe(true);
+			});
+
+			it('still starts fresh when the run no longer records the machine', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					givenUpRun({ workerId: null, recovery: null }),
+				);
+
+				await caller.retryNow({ runId: 'run-1' });
+
+				const [{ jobPayload }] = vi.mocked(createAndPublishDispatch).mock.calls[0];
+				expect(jobPayload.resumeSession).toBeUndefined();
+				expect(jobPayload.agentSessionId).not.toBe(PRESERVED_SESSION);
 			});
 		});
 	});

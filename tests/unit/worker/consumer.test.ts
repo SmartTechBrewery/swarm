@@ -3889,6 +3889,202 @@ describe('processJob', () => {
 				});
 			});
 
+			// Issue #1141. A pinned machine that lost its transport under this run may never
+			// come back, so that one variant of the wait is bounded and hands the run to the
+			// operator — keeping everything "Retry now" needs to continue it there.
+			describe('a pinned machine that lost its transport (issue #1141)', () => {
+				const HOUR = 60 * 60 * 1000;
+				const lostTransportRun = () =>
+					getRunByIdFromDb.mockResolvedValue({
+						workerId: 'w-preserved',
+						agentSessionId: 'sess-preserved',
+						recovery: { preservedWorkerId: 'w-preserved', transportLostWorkerIds: ['w-preserved'] },
+					});
+				// The carried retry of the loss, `lostAgoMs` after the machine dropped off.
+				const lostContinuation = (
+					lostAgoMs: number,
+					extra: { workerEligibilityRecheckAttempt?: number } = {},
+				) =>
+					createMockPmWebhookJob({
+						runId: 'run-1',
+						recoveryMode: 'checkpoint',
+						preservedWorkerLostTransportAt: new Date(Date.now() - lostAgoMs).toISOString(),
+						...extra,
+					});
+
+				it('waits for it as the preserved-worker wait, saying when it stops waiting', async () => {
+					lostTransportRun();
+					listProjectDispatchCandidates.mockResolvedValue([candidate('w-free')]);
+					const job = lostContinuation(HOUR);
+
+					const outcome = await processJob(job, registryReturning(planningTrigger()));
+
+					expect(outcome).toMatchObject({ status: 'phase-deferred', preservedWorkerWait: true });
+					expect(phaseCalls).toEqual([]);
+					const [, input] = scheduleDispatchRetry.mock.calls[0] as [
+						string,
+						Record<string, unknown>,
+					];
+					expect(input.waitReason).toBe('preserved-worker');
+					expect(input.lastError).toContain('lost its connection');
+					// A day from the loss, not from this re-check.
+					const endsAt = new Date(
+						Date.parse(job.preservedWorkerLostTransportAt ?? '') + 24 * HOUR,
+					).toISOString();
+					expect(input.lastError).toContain(`until ${endsAt}`);
+					// The re-check keeps the marker, so the next one ends at the same instant.
+					expect((input.jobPayload as SwarmJob).preservedWorkerLostTransportAt).toBe(
+						job.preservedWorkerLostTransportAt,
+					);
+					// Still waiting: nothing settles the carried row yet.
+					expect(completeRun).not.toHaveBeenCalled();
+					expect(addComment).not.toHaveBeenCalled();
+				});
+
+				it('is not cut short by re-checks a payload carried in from an earlier wait', async () => {
+					lostTransportRun();
+					listProjectDispatchCandidates.mockResolvedValue([candidate('w-free')]);
+
+					const outcome = await processJob(
+						lostContinuation(HOUR, { workerEligibilityRecheckAttempt: 1_000_000 }),
+						registryReturning(planningTrigger()),
+					);
+
+					expect(outcome).toMatchObject({ status: 'phase-deferred', preservedWorkerWait: true });
+					expect(addComment).not.toHaveBeenCalled();
+				});
+
+				it('fails once the window passes, with one comment naming the machine and both actions', async () => {
+					lostTransportRun();
+					listProjectDispatchCandidates.mockResolvedValue([candidate('w-free')]);
+
+					const outcome = await processJob(
+						lostContinuation(24 * HOUR + 5 * 60 * 1000),
+						registryReturning(planningTrigger()),
+					);
+
+					expect(outcome.status).toBe('phase-failed');
+					expect(phaseCalls).toEqual([]);
+					expect(addComment).toHaveBeenCalledOnce();
+					const [, body] = addComment.mock.calls[0];
+					// The machine's display name, the time it waited, and both actions.
+					expect(body).toContain("worker 'worker-w-preserved'");
+					expect(body).toContain('in the 24 hours since then');
+					expect(body).toContain('Retry now');
+					expect(body).toContain('Reset & restart');
+					expect(failDispatch).toHaveBeenCalledOnce();
+				});
+
+				it('names the wait actually spent, not the window', async () => {
+					lostTransportRun();
+					listProjectDispatchCandidates.mockResolvedValue([candidate('w-free')]);
+
+					await processJob(lostContinuation(30 * HOUR), registryReturning(planningTrigger()));
+
+					const [, body] = addComment.mock.calls[0];
+					expect(body).toContain('in the 30 hours since then');
+				});
+
+				it('settles the carried row failed without dropping its session, pin or checkpoint', async () => {
+					lostTransportRun();
+					listProjectDispatchCandidates.mockResolvedValue([candidate('w-free')]);
+
+					await processJob(lostContinuation(25 * HOUR), registryReturning(planningTrigger()));
+
+					// Not `failRunFromStatus`, which nulls the session a session continuation
+					// re-enters.
+					expect(failRunFromStatus).not.toHaveBeenCalled();
+					expect(completeRun).toHaveBeenCalledOnce();
+					const [settledRunId, input] = completeRun.mock.calls[0] as [
+						string,
+						Record<string, unknown>,
+					];
+					expect(settledRunId).toBe('run-1');
+					expect(input).toMatchObject({ status: 'failed', nextRetryAt: null });
+					expect(input.error).toContain('lost its connection');
+					// Omitted keys are left untouched by `completeRun`.
+					expect(input).not.toHaveProperty('recovery');
+					expect(input).not.toHaveProperty('agentSessionId');
+					expect(input).not.toHaveProperty('checkpoint');
+				});
+
+				it('keeps the busy-machine wait unbounded when the pinned machine never lost its transport', async () => {
+					getRunByIdFromDb.mockResolvedValue({
+						recovery: { preservedWorkerId: 'w-preserved', transportLostWorkerIds: ['w-other'] },
+					});
+					listProjectDispatchCandidates.mockResolvedValue([
+						candidate('w-preserved', { activeRuns: 1 }),
+					]);
+
+					const outcome = await processJob(
+						lostContinuation(25 * HOUR, { workerEligibilityRecheckAttempt: 1_000_000 }),
+						registryReturning(planningTrigger()),
+					);
+
+					expect(outcome).toMatchObject({ status: 'phase-deferred', preservedWorkerWait: true });
+					expect(addComment).not.toHaveBeenCalled();
+				});
+
+				// The run still lists the machine — that list is sticky — but a later attempt
+				// ran on it, so the payload of this wait carries no loss: #567's wait again.
+				it('keeps the unbounded wait once the machine came back and served the run', async () => {
+					lostTransportRun();
+					listProjectDispatchCandidates.mockResolvedValue([
+						candidate('w-preserved', { activeRuns: 1 }),
+					]);
+
+					const outcome = await processJob(
+						createMockPmWebhookJob({
+							runId: 'run-1',
+							recoveryMode: 'checkpoint',
+							workerEligibilityRecheckAttempt: 1_000_000,
+						}),
+						registryReturning(planningTrigger()),
+					);
+
+					expect(outcome).toMatchObject({ status: 'phase-deferred', preservedWorkerWait: true });
+					const [, input] = scheduleDispatchRetry.mock.calls[0] as [
+						string,
+						Record<string, unknown>,
+					];
+					expect(input.lastError).toContain('does not time out');
+					expect(input.lastError).not.toContain('lost its connection');
+					expect(addComment).not.toHaveBeenCalled();
+				});
+
+				it('keeps the pin and session when a lost continuation spends its retry budget', async () => {
+					lostTransportRun();
+					listProjectDispatchCandidates.mockResolvedValue([candidate('w-preserved')]);
+					phaseImpl = async () => {
+						throw new AgentRunError(TRANSPORT_LOST_ORPHAN_REASON, { kind: 'transport-lost' });
+					};
+
+					const outcome = await processJob(
+						createMockPmWebhookJob({
+							runId: 'run-1',
+							recoveryMode: 'checkpoint',
+							automaticRetryAttempt: 1_000_000,
+						}),
+						registryReturning(planningTrigger()),
+						undefined,
+						executionIdentity('w-preserved'),
+					);
+
+					expect(outcome).toMatchObject({
+						status: 'phase-failed',
+						carriedContinuation: 'checkpoint',
+					});
+					const failed = completeRun.mock.calls.find(
+						([, input]) => (input as { status: string }).status === 'failed',
+					) as [string, Record<string, unknown>];
+					expect(failed[0]).toBe('run-1');
+					// A `null` recovery write would drop `preservedWorkerId`.
+					expect(failed[1]).not.toHaveProperty('recovery');
+					expect(failed[1]).not.toHaveProperty('agentSessionId');
+					expect(recordRunPreservedWorker).toHaveBeenCalledWith('run-1');
+				});
+			});
+
 			// Issue #780. The one wait with no budget must not be the one that lets a
 			// held claim lapse — nothing else would ever refresh it again.
 			it('keeps a pinned Review continuation’s dedup claim alive while it waits', async () => {

@@ -395,6 +395,12 @@ export interface RunPreservedWorker {
 	 * deferral that merely also preserved its checkout.
 	 */
 	waiting: boolean;
+	/**
+	 * When the wait is the **bounded** one for a pinned machine that lost its
+	 * transport under this run (issue #1141), the ISO instant SWARM stops waiting and
+	 * fails the run. `null` while not waiting and for the unbounded wait.
+	 */
+	waitEndsAt: string | null;
 }
 
 /**

@@ -1294,7 +1294,8 @@ export function ForceReReviewButton({
  *
  * A run pinned to a machine waits for it **without a timeout**, so this callout is
  * what stops that wait reading as a wedged run: it names the machine, says the wait
- * does not expire, and names the action that ends it. It renders for every viewer
+ * does not expire, and names the action that ends it — or, for a machine that lost
+ * its transport under the run (issue #1141), when SWARM stops waiting for it. It renders for every viewer
  * off a server-resolved field, not off the local operator's mutation state.
  */
 export function PreservedWorkerCallout({ run }: { run: RunRow }) {

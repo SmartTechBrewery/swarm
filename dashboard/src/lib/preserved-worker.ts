@@ -27,7 +27,9 @@ export function preservedWorkerLabel(preserved: RunPreservedWorker): string {
  *
  * Three shapes:
  * - **waiting** — the unbounded pin wait, so it names the machine, says the wait
- *   does not expire, and names the action that ends it. Keyed on the server's
+ *   does not expire, and names the action that ends it. When the machine lost its
+ *   transport under this run (issue #1141, the server's `waitEndsAt`), the wait is
+ *   bounded instead, so it says so and names when SWARM stops waiting. Keyed on the server's
  *   `waiting` flag rather than on the run's status: a `deferred` run can also be
  *   pinned while waiting on something else entirely (an ordinary rate-limit retry
  *   preserves its checkout too), and telling that operator "this does not time
@@ -39,6 +41,7 @@ export function preservedWorkerLabel(preserved: RunPreservedWorker): string {
  */
 export function describePreservedWorker(
 	preserved: RunPreservedWorker | null | undefined,
+	formatInstant: (iso: string) => string = (iso) => new Date(iso).toLocaleString(),
 ): { title: string; body: string } | null {
 	if (!preserved) return null;
 	const machine = preservedWorkerLabel(preserved);
@@ -46,6 +49,12 @@ export function describePreservedWorker(
 		return {
 			title: 'Preserved work was discarded',
 			body: `This run was restarted from scratch instead of continuing the work preserved on ${machine}. That earlier attempt's checkpoint, session and checkout were given up deliberately and are not part of this run.`,
+		};
+	}
+	if (preserved.waiting && preserved.waitEndsAt) {
+		return {
+			title: `Waiting for ${machine}`,
+			body: `This run continues work preserved on ${machine}, so it can only run there — no other worker can pick it up, however free it is. ${machine} lost its connection to SWARM while running this phase and is not available to take it yet. SWARM waits for it until ${formatInstant(preserved.waitEndsAt)}; if it is still not available by then, the run is marked failed with the preserved work kept, for "Retry now" once ${machine} is back. Nothing is started over elsewhere. Use "Reset & restart" to give the preserved work up and restart this phase on any worker; that works even while ${machine} is offline.`,
 		};
 	}
 	if (preserved.waiting) {

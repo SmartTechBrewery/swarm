@@ -87,3 +87,46 @@ export function preservedContinuationKind(job: SwarmJob): PreservedContinuationK
 	if (job.recoveryMode === 'resume' || job.resumeSession === true) return 'session';
 	return 'delivery';
 }
+
+/**
+ * How long a pinned continuation waits for its preserved machine when that machine
+ * **lost its transport under this run** (issue #1141), before handing the run to the
+ * operator. #567's wait for a machine that is merely busy has no bound, because that
+ * machine will come back; one that dropped off mid-run may not, and an unbounded wait
+ * for it leaves the work invisible to everybody. A day is long enough to outlast a
+ * reboot, a network outage or a laptop closed overnight. Deliberately a constant, not
+ * a setting.
+ */
+export const LOST_TRANSPORT_PRESERVED_WAIT_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * When the bounded wait for a pinned machine that lost its transport ends (issue
+ * #1141), or `undefined` when this dispatch's wait for its pin is #567's unbounded one.
+ *
+ * Bounded only while **both** halves hold: the payload records the loss this dispatch
+ * re-attempts ({@link SwarmJob.preservedWorkerLostTransportAt}, which an attempt that
+ * ran past the gate never passes on), and the run lists the pinned machine among those
+ * whose transport was lost under it. The window is measured from that loss, so a wait
+ * re-checked across many deferrals still ends at the same instant. Shared by the
+ * worker's gate and the run-detail read (`runs.getById`), so the callout states the
+ * same ending the worker enforces.
+ */
+export function lostTransportPreservedWaitEndsAt(
+	job: Pick<SwarmJob, 'preservedWorkerLostTransportAt'>,
+	run:
+		| {
+				recovery: {
+					preservedWorkerId?: string | null;
+					transportLostWorkerIds?: string[] | null;
+				} | null;
+		  }
+		| undefined,
+): Date | undefined {
+	const workerId = run?.recovery?.preservedWorkerId;
+	if (!workerId || !run?.recovery?.transportLostWorkerIds?.includes(workerId)) return undefined;
+	const lostAt = job.preservedWorkerLostTransportAt
+		? Date.parse(job.preservedWorkerLostTransportAt)
+		: Number.NaN;
+	if (Number.isNaN(lostAt)) return undefined;
+	return new Date(lostAt + LOST_TRANSPORT_PRESERVED_WAIT_MS);
+}
