@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -12,6 +12,7 @@ import {
 } from '@/integrations/scm/registry.js';
 import type { Checkpoint } from '@/pipeline/checkpoint.js';
 import { DependencyBlockedError } from '@/pipeline/dependency-guard.js';
+import { cleanupUnlessPreserved } from '@/pipeline/resume.js';
 import type { ScmDeliveryProvider } from '@/scm/delivery.js';
 import { DeliveryDeferredError } from '@/scm/delivery.js';
 import { buildTaskAssignment } from '@/transport/assignment.js';
@@ -31,6 +32,7 @@ import { TRANSPORT_PROTOCOL_VERSION } from '@/transport/protocol.js';
 import type { AssignmentSink } from '@/transport/worker-client.js';
 import { ALL_TRIGGER_PHASES } from '@/triggers/types.js';
 import type { AssignedPhaseInputs, PhaseRunResult } from '@/worker/consumer.js';
+import type { GitWorktreeManager } from '@/worker/git-worktree-manager.js';
 import { CommitUnavailableError } from '@/worktree/commit-availability.js';
 import { BlockedRecoveryError } from '@/worktree/reclaim.js';
 import { createMockTaskAssignmentInput, createMockWorkItem } from '../../helpers/factories.js';
@@ -1863,6 +1865,123 @@ describe('cancelling an in-flight assignment', () => {
 		// handler would race that one.
 		expect(cancelSink.sent).toEqual([]);
 		expect(sink.sent.at(-1)).toMatchObject({ status: 'failed', cancelled: true });
+	});
+
+	// Issue #1139: the router stops a pinned continuation's orphan with
+	// `preserveCheckout`, because the retry taking over is pinned to this checkout.
+	// The aborted phase's real cleanup (`cleanupUnlessPreserved`) then preserves it —
+	// a host-local pin for the run, lease released — instead of removing it, and the
+	// terminal frame is the same cancelled one either way.
+	describe('a stop that asks to keep the checkout', () => {
+		let root: string | undefined;
+		afterEach(() => {
+			if (root) rmSync(root, { recursive: true, force: true });
+			root = undefined;
+		});
+
+		/** Cancel an in-flight assignment through `handleTaskCancel`, letting its phase settle the worktree. */
+		async function cancelInFlight(preserveCheckout: boolean | undefined) {
+			root = mkdtempSync(join(tmpdir(), 'swarm-cancel-preserve-'));
+			const sink = recordingSink();
+			// The pin is keyed on the run, so the assignment names one.
+			const frame = ciAssignment({ runId: '88888888-8888-4888-8888-888888888888' });
+			let started: () => void = () => {};
+			const running = new Promise<void>((resolve) => {
+				started = resolve;
+			});
+			let removed = false;
+			let stateRoot = '';
+			const runPhase = vi.fn(
+				(inputs: AssignedPhaseInputs) =>
+					new Promise<PhaseRunResult>((_resolve, reject) => {
+						const worktrees = inputs.worktrees as GitWorktreeManager;
+						stateRoot = join(inputs.project.repoRoot, inputs.project.worktreeRoot, '.swarm-state');
+						// Removing a checkout needs git; what matters is whether it is asked for.
+						vi.spyOn(worktrees, 'cleanup').mockImplementation(async () => {
+							removed = true;
+						});
+						(inputs.signal as AbortSignal).addEventListener('abort', () => {
+							void cleanupUnlessPreserved(
+								worktrees,
+								inputs.taskId,
+								false,
+								'test phase',
+								inputs.runId,
+							).then(() =>
+								reject(
+									new AgentRunError(
+										'aborted',
+										{ kind: 'aborted' },
+										agentResult({ exitCode: null }),
+									),
+								),
+							);
+						});
+						started();
+					}),
+			);
+			const run = runAssignmentDbFree(frame, sink, {
+				...RUN_OPTIONS,
+				checkouts: [{ repoRoot: root }],
+				deps: depsWith(runPhase),
+			});
+
+			await running;
+			handleTaskCancel(
+				{
+					type: 'task-cancel',
+					dispatchId: frame.dispatchId,
+					runId: frame.runId,
+					phase: frame.phase,
+					taskId: frame.taskId,
+					...(preserveCheckout === undefined ? {} : { preserveCheckout }),
+				},
+				recordingSink(),
+				silentLogger,
+			);
+			await run;
+
+			// Nothing pinned leaves no state directory at all.
+			const pins = existsSync(stateRoot)
+				? readdirSync(stateRoot).filter((name) => name.endsWith('.pin.json'))
+				: [];
+			const pin = pins[0]
+				? (JSON.parse(readFileSync(join(stateRoot, pins[0]), 'utf8')) as { ownerKey: string })
+				: undefined;
+			return { frame, result: sink.sent.at(-1), removed, pin };
+		}
+
+		it('preserves the checkout for the run instead of removing it', async () => {
+			const { frame, result, removed, pin } = await cancelInFlight(true);
+
+			expect(removed).toBe(false);
+			expect(pin?.ownerKey).toBe(frame.runId);
+			expect(result).toEqual({
+				type: 'task-execution-result',
+				dispatchId: frame.dispatchId,
+				runId: frame.runId,
+				phase: frame.phase,
+				taskId: frame.taskId,
+				status: 'failed',
+				cancelled: true,
+			});
+		});
+
+		it('removes the checkout for a stop that does not ask to keep it', async () => {
+			const { frame, result, removed, pin } = await cancelInFlight(undefined);
+
+			expect(removed).toBe(true);
+			expect(pin).toBeUndefined();
+			expect(result).toEqual({
+				type: 'task-execution-result',
+				dispatchId: frame.dispatchId,
+				runId: frame.runId,
+				phase: frame.phase,
+				taskId: frame.taskId,
+				status: 'failed',
+				cancelled: true,
+			});
+		});
 	});
 
 	// Issue #724: the worker is the only party that knows the phase is no longer

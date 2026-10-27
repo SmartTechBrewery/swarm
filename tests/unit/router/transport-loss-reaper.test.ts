@@ -394,6 +394,90 @@ describe('stopOrphanedDispatchesOnReturn (issue #1073)', () => {
 		deregisterConnection(WORKER_ID, reopened);
 	});
 
+	// A pinned continuation's orphan holds the checkout its retry is pinned to, so its
+	// stop asks the worker to keep it (issue #1139) — on the return path and on the
+	// takeover alike. The unpinned stops above carry no such field.
+	describe('a pinned continuation (issue #1139)', () => {
+		const PINNED = {
+			...REGISTRATION,
+			selection: {
+				workerId: WORKER_ID,
+				workerName: 'laptop',
+				ownerUserId: 'user-1',
+				target: { cli: 'claude' as const },
+				targetIndex: 0,
+				cli: 'claude' as const,
+				skippedClis: [],
+				pinnedToPreservedWorker: true,
+			},
+		};
+
+		async function reapedPinned(): Promise<void> {
+			const awaiting = awaitDispatchResult(DISPATCH_ID, PINNED);
+			transportLost(WORKER_ID);
+			await vi.advanceTimersByTimeAsync(GRACE_MS);
+			await awaiting.result;
+		}
+
+		it('asks a returning worker to keep the checkout', async () => {
+			await reapedPinned();
+			stopOrphansOfDispatch(DISPATCH_ID);
+
+			const returned = fakeWs();
+			registerConnection(WORKER_ID, returned);
+			stopOrphanedDispatchesOnReturn(WORKER_ID);
+
+			expect(JSON.parse(String(returned.send.mock.calls[0][0]))).toMatchObject({
+				type: 'task-cancel',
+				dispatchId: DISPATCH_ID,
+				preserveCheckout: true,
+			});
+			answered();
+			deregisterConnection(WORKER_ID, returned);
+		});
+
+		it('asks a connected worker to keep the checkout when its retry takes over', async () => {
+			await reapedPinned();
+			const returned = fakeWs();
+			registerConnection(WORKER_ID, returned);
+
+			stopOrphansOfDispatch(DISPATCH_ID);
+
+			expect(returned.send).toHaveBeenCalledTimes(1);
+			expect(JSON.parse(String(returned.send.mock.calls[0][0]))).toEqual({
+				type: 'task-cancel',
+				dispatchId: DISPATCH_ID,
+				runId: RUN_ID,
+				reason: expect.stringContaining('retried this dispatch after the worker was lost'),
+				phase: 'respond-to-review',
+				taskId: '118',
+				preserveCheckout: true,
+			});
+			answered();
+			deregisterConnection(WORKER_ID, returned);
+		});
+
+		it('sends no field for an orphan that was not pinned', async () => {
+			const awaiting = awaitDispatchResult(DISPATCH_ID, {
+				...PINNED,
+				selection: { ...PINNED.selection, pinnedToPreservedWorker: undefined },
+			});
+			transportLost(WORKER_ID);
+			await vi.advanceTimersByTimeAsync(GRACE_MS);
+			await awaiting.result;
+			const returned = fakeWs();
+			registerConnection(WORKER_ID, returned);
+
+			stopOrphansOfDispatch(DISPATCH_ID);
+
+			expect(JSON.parse(String(returned.send.mock.calls[0][0]))).not.toHaveProperty(
+				'preserveCheckout',
+			);
+			answered();
+			deregisterConnection(WORKER_ID, returned);
+		});
+	});
+
 	it('stops nothing for a worker that came back inside the grace', async () => {
 		const awaiting = awaitDispatchResult(DISPATCH_ID, REGISTRATION);
 		transportLost(WORKER_ID);
