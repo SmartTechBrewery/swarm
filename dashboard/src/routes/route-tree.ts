@@ -8,12 +8,14 @@ import { quotaRoute } from './quota.js';
 import { runDetailRoute } from './runs/$runId.js';
 import { runsIndexRoute } from './runs/index.js';
 import { settingsRoute } from './settings/index.js';
+import { setupRoute } from './setup.js';
 import { workerDetailRoute } from './workers/$workerId.js';
 import { workersRoute } from './workers/index.js';
 
 export const routeTree = rootRoute.addChildren([
 	indexRoute,
 	loginRoute,
+	setupRoute,
 	projectsIndexRoute,
 	projectDetailRoute,
 	runsIndexRoute,

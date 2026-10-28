@@ -44,6 +44,53 @@ export async function login(identifier: string, password: string): Promise<Login
 	return { ok: false, error: 'Login failed. Please try again.' };
 }
 
+export interface SetupResult extends LoginResult {
+	/** Set when the installation already has a user, so the form offers sign-in instead. */
+	alreadySetUp?: boolean;
+}
+
+/**
+ * POST the first-run setup form to `/auth/setup` (issue #1150): redeems the
+ * one-time link the server logged, creates the first installation admin, and
+ * sets the session cookie exactly as a login does.
+ */
+export async function completeSetup(
+	token: string,
+	identifier: string,
+	password: string,
+): Promise<SetupResult> {
+	let res: Response;
+	try {
+		res = await fetch(`${API_URL}/auth/setup`, {
+			method: 'POST',
+			credentials: 'include',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ token, identifier, password }),
+		});
+	} catch {
+		return { ok: false, error: 'Could not reach the server. Is it running?' };
+	}
+	if (res.ok) return { ok: true };
+	if (res.status === 403) {
+		return {
+			ok: false,
+			error:
+				'This setup link is invalid, expired, or already used. Restart the SWARM server to log a new one.',
+		};
+	}
+	if (res.status === 409) {
+		return {
+			ok: false,
+			error: 'This installation already has a user. Sign in instead.',
+			alreadySetUp: true,
+		};
+	}
+	if (res.status === 400) {
+		return { ok: false, error: 'Enter a valid e-mail address and a password.' };
+	}
+	return { ok: false, error: 'Setup failed. Please try again.' };
+}
+
 /** POST to `/auth/logout`; clears the session cookie server-side. Best-effort. */
 export async function logout(): Promise<void> {
 	try {

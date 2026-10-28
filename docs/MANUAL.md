@@ -76,12 +76,43 @@ every deployment. Without that worker, phases queue up with nothing to run them 
 
 **Multi-user alternative.** Set `SWARM_SINGLE_USER_MODE=false` in `.env` (or
 remove the line) to require per-user session auth instead. Then create your
-dashboard user and set its login password before signing in at `/login`:
+dashboard user and set its login password before signing in at `/login` — either
+from the first-run setup link below, or from a shell with `DATABASE_URL`:
 
 ```bash
 npm run swarm -- users add you@example.com --admin    # create your dashboard user, then
 npm run swarm -- users set-password you@example.com   # set its login password (prompts, no echo)
 ```
+
+**First-run setup, without a shell** (issue #1150). When the API process
+(`dev:api` / `start:api`) — or the all-in-one control plane (`npm run serve`, and
+so the published image) — starts against a database with **no users**, it writes
+one warning line to its log:
+
+```text
+No users exist yet. Open /setup?token=… to create the first installation admin (single use, expires 2026-10-28T11:00:00.000Z).
+```
+
+Open that path on the dashboard's address (e.g.
+`http://localhost:3101/setup?token=…`) — with `WEBHOOK_CALLBACK_BASE_URL` set, the
+logged link already starts with that public base URL — enter an e-mail address and a password,
+and SWARM creates that user as the installation admin and signs you in. The link
+then stops working. It is the only place the token is ever written — only its
+hash is held, in the memory of the process that logged it — and it:
+
+- is **single use**, and **expires after an hour**;
+- is **replaced on every restart** while no user exists: restarting before setup
+  is completed logs a fresh link and invalidates the old one;
+- is **never issued once any user exists** — however that user was created
+  (`swarm users add`, an earlier setup link, or the single-user bootstrap) — and
+  `/auth/setup` then refuses every token, so an installation that already has users
+  sees no change at all;
+- is **never issued in single-user mode**, which has its own bootstrapped admin.
+
+Two submissions racing for the link cannot create two admins: the token is
+claimed before anything is written, and the insert itself only succeeds while the
+`users` table is still empty. `swarm users` stays the shell path for this and for
+every later user.
 
 **Registering the worker, one step at a time.** `workers register-and-enroll`
 collapses two commands; either half can be run on its own, which is what you want
@@ -764,7 +795,9 @@ Run either from the repo root. It serves everything both processes serve — the
 webhook routes, `/worker/*` including the WebSocket upgrade, `/operator/*`,
 `/auth/*`, `/trpc/*`, the dashboard and a single `/health` — and runs what both
 run: the dispatch consumer, the rollout ticker, the worktree-sweep bridge, the
-orphaned-run reap and the weekly fleet abandoned-worktree sweep. A proxy in front
+orphaned-run reap and the weekly fleet abandoned-worktree sweep — and, on a
+database with no users, logs the [first-run setup](#quick-start-beyond-the-readme)
+link. A proxy in front
 needs no path rules (`reverse_proxy app:3000`), and every URL — the workers'
 `SWARM_CONTROL_PLANE_URL`, the provider webhook URLs, `WEBHOOK_CALLBACK_BASE_URL` —
 is the one public base URL.
@@ -827,6 +860,9 @@ recreates the container only when the image changed.
 - **Which commit is this?** The image has no `.git`, so the control plane reports
   no build commit of its own; the image label does:
   `docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' ghcr.io/smarttechbrewery/swarm:<tag>`.
+- **The first admin** needs no shell: on a database with no users the container
+  logs a one-time `/setup?token=…` link (see
+  [First-run setup](#quick-start-beyond-the-readme)).
 - **Admin commands** run inside the container, since this mode refuses
   single-user mode: `docker compose exec swarm node dist/cli/index.js users add
   you@example.com --admin`, then `… users set-password you@example.com`.

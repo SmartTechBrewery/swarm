@@ -26,6 +26,8 @@ import { serve } from '@hono/node-server';
 
 import { type HostMaintenanceHandle, startHostMaintenance } from '../api/maintenance.js';
 import { runMigrations } from '../db/migrate.js';
+import { announceFirstRunSetup } from '../identity/first-run-setup.js';
+import { resolveWebhookCallbackBaseUrl } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { configureLogger, logger } from '../lib/logger.js';
 import { closeQueue } from '../queue/producer.js';
@@ -74,6 +76,10 @@ const server = serve({ fetch: app.fetch, port, ...(hostname ? { hostname } : {})
 	logger.info('swarm control plane: listening', { hostname: hostname ?? null, port });
 });
 injectWebSocket(server);
+// First-run setup (issue #1150), as in `src/api/server.ts`: this process serves
+// `/auth/setup`, so it is the one that must hold the token and log the link.
+// Migrations have already run; not awaited, and it never throws.
+void announceFirstRunSetup({ baseUrl: resolveWebhookCallbackBaseUrl() });
 
 // The same two control-plane bridges the router runs (see `src/router/index.ts`
 // for why each lives beside the worker sockets). The sweep's publisher — the API

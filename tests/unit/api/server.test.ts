@@ -19,6 +19,11 @@ vi.mock('@/identity/auth.js', () => ({
 	revokeSession: vi.fn(),
 }));
 
+vi.mock('@/identity/first-run-setup.js', () => ({
+	announceFirstRunSetup: vi.fn(),
+	completeFirstRunSetup: vi.fn(),
+}));
+
 vi.mock('@/identity/membership-service.js', () => ({
 	getMembership: vi.fn(),
 	listAccessibleProjectIds: vi.fn(),
@@ -42,6 +47,7 @@ import {
 	revokeSession,
 	verifyCredentials,
 } from '@/identity/auth.js';
+import { completeFirstRunSetup } from '@/identity/first-run-setup.js';
 import { listAccessibleProjectIds } from '@/identity/membership-service.js';
 import type { SwarmUser } from '@/identity/schema.js';
 import { getUser } from '@/identity/service.js';
@@ -72,6 +78,7 @@ describe('swarm-api', () => {
 		vi.mocked(revokeSession).mockReset().mockResolvedValue(undefined);
 		vi.mocked(listAccessibleProjectIds).mockReset();
 		vi.mocked(getUser).mockReset();
+		vi.mocked(completeFirstRunSetup).mockReset();
 	});
 
 	describe('public routes', () => {
@@ -323,6 +330,86 @@ describe('swarm-api', () => {
 
 			expect(res.status).toBe(400);
 			expect(verifyCredentials).not.toHaveBeenCalled();
+		});
+	});
+
+	describe('POST /auth/setup', () => {
+		const SETUP_TOKEN = 'one-time-setup-token';
+		const post = (body: string) =>
+			createApiApp().request('http://example.com/auth/setup', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body,
+			});
+		const validBody = JSON.stringify({
+			token: SETUP_TOKEN,
+			identifier: ' ada@example.com ',
+			password: 'hunter2',
+		});
+
+		it('creates the admin, signs them in, and never echoes the token', async () => {
+			vi.mocked(completeFirstRunSetup).mockResolvedValue({
+				outcome: 'created',
+				user: { ...user, instanceAdmin: true },
+			});
+			vi.mocked(createSession).mockResolvedValue({
+				token: RAW_TOKEN,
+				expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+			});
+
+			const res = await post(validBody);
+
+			expect(res.status).toBe(200);
+			expect(completeFirstRunSetup).toHaveBeenCalledWith({
+				token: SETUP_TOKEN,
+				identifier: 'ada@example.com',
+				password: 'hunter2',
+			});
+			expect(createSession).toHaveBeenCalledWith(user.id);
+			const text = await res.text();
+			expect(JSON.parse(text).user).toMatchObject({ id: user.id, instanceAdmin: true });
+			expect(text).not.toContain(SETUP_TOKEN);
+			expect(text).not.toContain(RAW_TOKEN);
+
+			const setCookie = res.headers.get('set-cookie') ?? '';
+			expect(setCookie).toContain(`${SESSION_COOKIE_NAME}=${RAW_TOKEN}`);
+			expect(setCookie).toMatch(/HttpOnly/i);
+			expect(setCookie).toMatch(/SameSite=Strict/i);
+		});
+
+		it('returns 403 with no cookie for an invalid, expired, or used link', async () => {
+			vi.mocked(completeFirstRunSetup).mockResolvedValue({ outcome: 'invalid-link' });
+
+			const res = await post(validBody);
+
+			expect(res.status).toBe(403);
+			expect(res.headers.get('set-cookie')).toBeNull();
+			expect(createSession).not.toHaveBeenCalled();
+		});
+
+		it('returns 409 with no cookie when the installation already has a user', async () => {
+			vi.mocked(completeFirstRunSetup).mockResolvedValue({ outcome: 'already-set-up' });
+
+			const res = await post(validBody);
+
+			expect(res.status).toBe(409);
+			expect(res.headers.get('set-cookie')).toBeNull();
+			expect(createSession).not.toHaveBeenCalled();
+		});
+
+		it.each([
+			['a non-JSON body', 'not json'],
+			['a missing password', JSON.stringify({ token: SETUP_TOKEN, identifier: 'ada@example.com' })],
+			[
+				'an identifier that is not an e-mail',
+				JSON.stringify({ token: SETUP_TOKEN, identifier: 'localhost-admin', password: 'pw' }),
+			],
+			['a missing token', JSON.stringify({ identifier: 'ada@example.com', password: 'pw' })],
+		])('returns 400 for %s without spending the link', async (_label, body) => {
+			const res = await post(body);
+
+			expect(res.status).toBe(400);
+			expect(completeFirstRunSetup).not.toHaveBeenCalled();
 		});
 	});
 

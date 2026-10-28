@@ -1,6 +1,12 @@
 import { TRPCClientError } from '@trpc/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { isUnauthorizedError, login, logout, shouldRedirectToLogin } from './auth.js';
+import {
+	completeSetup,
+	isUnauthorizedError,
+	login,
+	logout,
+	shouldRedirectToLogin,
+} from './auth.js';
 
 describe('shouldRedirectToLogin', () => {
 	it('redirects an errored session on any page except /login', () => {
@@ -81,6 +87,48 @@ describe('login', () => {
 		expect(String(url)).toContain('/auth/login');
 		expect(init).toMatchObject({ method: 'POST', credentials: 'include' });
 		expect(JSON.parse(init.body)).toEqual({ identifier: 'ada@example.com', password: 'pw' });
+	});
+});
+
+describe('completeSetup', () => {
+	afterEach(() => {
+		vi.unstubAllGlobals();
+	});
+
+	it('posts the token and credentials with the session cookie included', async () => {
+		const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+		vi.stubGlobal('fetch', fetchMock);
+
+		expect(await completeSetup('tok', 'ada@example.com', 'pw')).toEqual({ ok: true });
+
+		const [url, init] = fetchMock.mock.calls[0];
+		expect(String(url)).toContain('/auth/setup');
+		expect(init).toMatchObject({ method: 'POST', credentials: 'include' });
+		expect(JSON.parse(init.body)).toEqual({
+			token: 'tok',
+			identifier: 'ada@example.com',
+			password: 'pw',
+		});
+	});
+
+	it.each([
+		[403, /invalid, expired, or already used/],
+		[409, /already has a user/],
+		[400, /valid e-mail/],
+		[500, /Setup failed/],
+	])('maps a %i response to a readable error', async (status, message) => {
+		vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status }));
+		const result = await completeSetup('tok', 'ada@example.com', 'pw');
+		expect(result.ok).toBe(false);
+		expect(result.error).toMatch(message);
+		expect(result.alreadySetUp ?? false).toBe(status === 409);
+	});
+
+	it('reports a reachability error when the request throws', async () => {
+		vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('network down')));
+		const result = await completeSetup('tok', 'ada@example.com', 'pw');
+		expect(result.ok).toBe(false);
+		expect(result.error).toMatch(/Could not reach the server/);
 	});
 });
 

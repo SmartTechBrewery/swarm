@@ -17,7 +17,8 @@ import { authedProcedure, router } from '../trpc.js';
  * **The subject is always `ctx.user.id`.** No procedure here takes a user id, so
  * no request can address another account; administering *someone else's* account
  * (creating a user, granting admin, setting a first password) stays with the
- * `swarm users` CLI, and the login `identifier`, the installation role, and
+ * `swarm users` CLI (or, for the very first admin, the first-run setup link —
+ * `POST /auth/setup`), and the login `identifier`, the installation role, and
  * project membership roles are not editable here at all.
  *
  * It returns only the public `SwarmUser` read model — never the password hash,

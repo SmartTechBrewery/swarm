@@ -14,7 +14,7 @@ cp .env.docker.example .env   # adjust POSTGRES_PASSWORD / ports if needed
 docker compose up -d --build  # postgres, redis, router (NOT the worker) — detached
 npm run db:migrate            # apply the Postgres schema (uses DATABASE_URL from .env)
 npm run db:seed               # load swarm.config.json into Postgres (projects + credentials)
-npm run swarm -- users add you@example.com --admin   # create the first user, then:
+npm run swarm -- users add you@example.com --admin   # create the first user (or skip both and use the /setup link dev:api logs), then:
 npm run swarm -- users set-password you@example.com   # set their dashboard login password (prompts, no echo)
 cd dashboard && npm install && cd .. # install dashboard (frontend) dependencies
 npm run dev:api               # start the API server on the host (default port 3101)
@@ -47,7 +47,7 @@ The dashboard can be run in two modes:
   ```
   Open `http://localhost:3101` in your browser. The API server will serve the compiled files as a fallback for any non-API/non-health routes.
 
-The dashboard uses **per-user session auth** (issue #281 task 2). It binds to `127.0.0.1` and every dashboard API request except `/health` and the `ping` liveness probe is authorized by a session cookie, not a shared secret. A user signs in at `/login` (username/email + password); the server verifies the password, mints an opaque session, and returns it as an HTTP-only, `SameSite=Strict` cookie (`Secure` off localhost). Log out to revoke it. Set a user up first with `swarm users add` + `swarm users set-password` (below). There is no `DASHBOARD_TOKEN` anymore. Once signed in, a user changes their own display name and password themselves at `/profile?tab=security` (issue #662) — the password change requires their current password, and other devices they are signed in on stay signed in.
+The dashboard uses **per-user session auth** (issue #281 task 2). It binds to `127.0.0.1` and every dashboard API request except `/health` and the `ping` liveness probe is authorized by a session cookie, not a shared secret. A user signs in at `/login` (username/email + password); the server verifies the password, mints an opaque session, and returns it as an HTTP-only, `SameSite=Strict` cookie (`Secure` off localhost). Log out to revoke it. Set a user up first with `swarm users add` + `swarm users set-password` (below) — or, with no shell, create the first admin from the one-time `/setup?token=…` link the API server (or the all-in-one control plane) logs when it starts with no users (issue #1150, [`MANUAL.md`](./MANUAL.md#quick-start-beyond-the-readme)). There is no `DASHBOARD_TOKEN` anymore. Once signed in, a user changes their own display name and password themselves at `/profile?tab=security` (issue #662) — the password change requires their current password, and other devices they are signed in on stay signed in.
 
 You can verify the dashboard API is running using `curl`:
 ```bash

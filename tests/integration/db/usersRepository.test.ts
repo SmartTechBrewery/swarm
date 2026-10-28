@@ -1,12 +1,14 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import {
+	createFirstInstanceAdmin,
 	createUser,
 	ensureLocalAdminUser,
 	findUserByIdentifier,
 	findUserCredentialById,
 	findUserCredentialByIdentifier,
 	getUserById,
+	hasAnyUser,
 	LOCAL_ADMIN_IDENTIFIER,
 	listUsers,
 	setDisplayName,
@@ -169,6 +171,54 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('usersRepository (integrat
 
 			const credential = await findUserCredentialByIdentifier(LOCAL_ADMIN_IDENTIFIER);
 			expect(credential?.passwordHash).toBe('deadbeef:cafef00d');
+		});
+	});
+
+	describe('hasAnyUser', () => {
+		it('is false on an empty table and true once a user exists', async () => {
+			expect(await hasAnyUser()).toBe(false);
+			await createUser({ identifier: 'ada@example.com', displayName: 'Ada' });
+			expect(await hasAnyUser()).toBe(true);
+		});
+	});
+
+	describe('createFirstInstanceAdmin', () => {
+		const input = (identifier: string) => ({
+			identifier,
+			displayName: identifier,
+			passwordHash: 'deadbeef:cafef00d',
+		});
+
+		it('creates an instance admin with the given password hash on an empty table', async () => {
+			const created = await createFirstInstanceAdmin(input('ada@example.com'));
+
+			expect(created).toMatchObject({ identifier: 'ada@example.com', instanceAdmin: true });
+			const credential = await findUserCredentialByIdentifier('ada@example.com');
+			expect(credential?.passwordHash).toBe('deadbeef:cafef00d');
+		});
+
+		it('creates nothing when a CLI-created user already exists', async () => {
+			await createUser({ identifier: 'cli@example.com', displayName: 'CLI' });
+
+			expect(await createFirstInstanceAdmin(input('ada@example.com'))).toBeUndefined();
+			expect(await listUsers()).toHaveLength(1);
+		});
+
+		it('creates nothing when the single-user bootstrap admin exists', async () => {
+			await ensureLocalAdminUser();
+
+			expect(await createFirstInstanceAdmin(input('ada@example.com'))).toBeUndefined();
+			expect(await listUsers()).toHaveLength(1);
+		});
+
+		it('lets exactly one of two concurrent calls create an admin', async () => {
+			const results = await Promise.all([
+				createFirstInstanceAdmin(input('ada@example.com')),
+				createFirstInstanceAdmin(input('grace@example.com')),
+			]);
+
+			expect(results.filter((r) => r !== undefined)).toHaveLength(1);
+			expect(await listUsers()).toHaveLength(1);
 		});
 	});
 });
