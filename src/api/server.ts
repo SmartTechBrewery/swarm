@@ -1,7 +1,8 @@
 /**
  * API server entry point — a self-hosted single-process Hono app
  * (ai/ARCHITECTURE.md). Exposes /health, the /auth/login + /auth/logout session
- * endpoints, mounts tRPC at /trpc, and (in a same-origin deploy) serves the
+ * endpoints, /auth/setup (which redeems the first-run setup link, issue #1150 —
+ * `src/identity/first-run-setup.ts`), mounts tRPC at /trpc, and (in a same-origin deploy) serves the
  * built dashboard SPA from `dashboard/dist`. Unlike Cascade's split cloud
  * deployment (separate API + Cloudflare Pages frontend), SWARM runs one process
  * for its local-first scope.
@@ -33,6 +34,7 @@ import {
 	revokeSession,
 	verifyCredentials,
 } from '../identity/auth.js';
+import { announceFirstRunSetup, completeFirstRunSetup } from '../identity/first-run-setup.js';
 import { getUser } from '../identity/service.js';
 import { buildCorsMiddleware } from '../lib/cors.js';
 import { isSingleUserMode } from '../lib/env.js';
@@ -46,6 +48,12 @@ export const SESSION_COOKIE_NAME = 'swarm_session';
 
 const LoginInputSchema = z.object({
 	identifier: z.string().min(1),
+	password: z.string().min(1),
+});
+
+const SetupInputSchema = z.object({
+	token: z.string().min(1),
+	identifier: z.string().trim().email(),
 	password: z.string().min(1),
 });
 
@@ -140,6 +148,50 @@ export function createApiApp(
 		return c.json({ user });
 	});
 
+	// First-run setup (issue #1150): redeem the one-time link the server logged at
+	// startup with an empty `users` table, create the first installation admin, and
+	// sign them in exactly as login does. Single-user mode needs no branch here: no
+	// link is ever issued in that mode, so every token is refused.
+	app.post('/auth/setup', async (c) => {
+		let body: unknown;
+		try {
+			body = await c.req.json();
+		} catch {
+			return c.json({ error: 'Bad Request', reason: 'Expected a JSON body' }, 400);
+		}
+		const parsed = SetupInputSchema.safeParse(body);
+		if (!parsed.success) {
+			return c.json(
+				{
+					error: 'Bad Request',
+					reason: 'A setup token, an e-mail address and a password are required',
+				},
+				400,
+			);
+		}
+
+		const result = await completeFirstRunSetup(parsed.data);
+		if (result.outcome === 'invalid-link') {
+			return c.json(
+				{ error: 'Forbidden', reason: 'This setup link is invalid, expired, or already used.' },
+				403,
+			);
+		}
+		if (result.outcome === 'already-set-up') {
+			return c.json(
+				{ error: 'Conflict', reason: 'This installation already has a user. Sign in instead.' },
+				409,
+			);
+		}
+
+		const session = await createSession(result.user.id);
+		setCookie(c, SESSION_COOKIE_NAME, session.token, {
+			...sessionCookieOptions(c),
+			expires: session.expiresAt,
+		});
+		return c.json({ user: result.user });
+	});
+
 	// Log out: revoke the session server-side and clear the cookie. Idempotent —
 	// a request with no (or an unknown) session still clears the cookie and 200s.
 	app.post('/auth/logout', async (c) => {
@@ -217,6 +269,10 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 	// `DATABASE_URL`, the operator's PATH, and the repository checkout — which of the
 	// three each chore actually needs is stated in `src/api/maintenance.ts`.
 	const maintenance = startHostMaintenance();
+	// First-run setup (issue #1150): with an empty `users` table, log the one-time
+	// link that creates the first admin. Not awaited, like maintenance, so the port
+	// binds without waiting on the database; it never throws.
+	void announceFirstRunSetup();
 	const server = serve({ fetch: app.fetch, port, hostname: '127.0.0.1' }, () => {
 		logger.debug('swarm-api: listening', { port, hostname: '127.0.0.1' });
 	});

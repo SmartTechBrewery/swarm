@@ -15,7 +15,8 @@ import { boolean, pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core';
  * `instance_admin` is the single installation-role flag — admin of every
  * project/membership/enrollment (see `InstallationRoleSchema`). It defaults to
  * `false`: the first admin is designated explicitly via the operator CLI
- * (`swarm users add --admin` / `grant-admin`), never implicitly.
+ * (`swarm users add --admin` / `grant-admin`) or the first-run setup link
+ * (issue #1150, `src/identity/first-run-setup.ts`), never implicitly.
  *
  * `password_hash` is the credential material backing cookie session auth (#281
  * task 2): a `scrypt` salt+hash (`src/identity/auth.ts`), **never** a plaintext

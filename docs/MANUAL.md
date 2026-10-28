@@ -75,12 +75,41 @@ every deployment. Without that worker, phases queue up with nothing to run them 
 
 **Multi-user alternative.** Set `SWARM_SINGLE_USER_MODE=false` in `.env` (or
 remove the line) to require per-user session auth instead. Then create your
-dashboard user and set its login password before signing in at `/login`:
+dashboard user and set its login password before signing in at `/login` — either
+from the first-run setup link below, or from a shell with `DATABASE_URL`:
 
 ```bash
 npm run swarm -- users add you@example.com --admin    # create your dashboard user, then
 npm run swarm -- users set-password you@example.com   # set its login password (prompts, no echo)
 ```
+
+**First-run setup, without a shell** (issue #1150). When the API process
+(`dev:api` / `start:api`) starts against a database with **no users**, it writes
+one warning line to its log:
+
+```text
+No users exist yet. Open /setup?token=… to create the first installation admin (single use, expires 2026-10-28T11:00:00.000Z).
+```
+
+Open that path on the dashboard's address (e.g.
+`http://localhost:3101/setup?token=…`), enter an e-mail address and a password,
+and SWARM creates that user as the installation admin and signs you in. The link
+then stops working. It is the only place the token is ever written — only its
+hash is held, in the API process's memory — and it:
+
+- is **single use**, and **expires after an hour**;
+- is **replaced on every restart** while no user exists: restarting before setup
+  is completed logs a fresh link and invalidates the old one;
+- is **never issued once any user exists** — however that user was created
+  (`swarm users add`, an earlier setup link, or the single-user bootstrap) — and
+  `/auth/setup` then refuses every token, so an installation that already has users
+  sees no change at all;
+- is **never issued in single-user mode**, which has its own bootstrapped admin.
+
+Two submissions racing for the link cannot create two admins: the token is
+claimed before anything is written, and the insert itself only succeeds while the
+`users` table is still empty. `swarm users` stays the shell path for this and for
+every later user.
 
 **Registering the worker, one step at a time.** `workers register-and-enroll`
 collapses two commands; either half can be run on its own, which is what you want

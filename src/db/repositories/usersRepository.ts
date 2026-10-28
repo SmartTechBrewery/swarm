@@ -9,9 +9,13 @@
  * not a re-validation — same as `rowToProjectConfig`. A duplicate `identifier`
  * surfaces the raw pg `23505` unique violation; the caller (the `swarm users`
  * CLI) translates it to a friendly message.
+ *
+ * Rows are created by `createUser` (the CLI), `ensureLocalAdminUser` (the
+ * single-user bootstrap), and `createFirstInstanceAdmin` (the first-run setup
+ * link, issue #1150 — `src/identity/first-run-setup.ts`).
  */
 
-import { asc, eq } from 'drizzle-orm';
+import { asc, eq, sql } from 'drizzle-orm';
 
 import type { SwarmUser } from '../../identity/schema.js';
 import { getDb } from '../client.js';
@@ -64,6 +68,48 @@ export async function createUser(input: CreateUserInput): Promise<SwarmUser> {
 		})
 		.returning();
 	return rowToSwarmUser(row);
+}
+
+/** Whether the `users` table has any row at all — the first-run setup gate (issue #1150). */
+export async function hasAnyUser(): Promise<boolean> {
+	const rows = await getDb().select({ id: users.id }).from(users).limit(1);
+	return rows.length > 0;
+}
+
+/**
+ * Create the installation's first user — an instance admin with a password —
+ * **only if the `users` table is still empty** (issue #1150). Returns
+ * `undefined` when a user already exists: a not-applicable outcome for an
+ * installation that is already set up, not an error.
+ *
+ * The emptiness check and the insert run under `SHARE ROW EXCLUSIVE` on
+ * `users`, a mode that conflicts with itself and with the `ROW EXCLUSIVE` lock
+ * every `INSERT` takes. So two concurrent calls run one after the other, and so
+ * does a race with `createUser` (the CLI) or `ensureLocalAdminUser`; the
+ * `SELECT` that runs once the lock is granted sees whatever they committed. The
+ * table is tiny and this runs at most once per installation, so the lock costs
+ * nothing.
+ */
+export async function createFirstInstanceAdmin(input: {
+	identifier: string;
+	displayName: string;
+	passwordHash: string;
+}): Promise<SwarmUser | undefined> {
+	return getDb().transaction(async (tx) => {
+		await tx.execute(sql`LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE`);
+		const existing = await tx.select({ id: users.id }).from(users).limit(1);
+		if (existing.length > 0) return undefined;
+		const [row] = await tx
+			.insert(users)
+			.values({
+				identifier: input.identifier,
+				displayName: input.displayName,
+				instanceAdmin: true,
+				passwordHash: input.passwordHash,
+			})
+			.returning();
+		return rowToSwarmUser(row);
+	});
 }
 
 /**
