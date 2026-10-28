@@ -1,0 +1,13 @@
+# SWARM behind Caddy (deploy/vps). The site address is SWARM's own public base URL —
+# the same value the app reads as WEBHOOK_CALLBACK_BASE_URL — so the domain is set
+# once, in .env. Caddy obtains and renews the certificate itself (ports 80 and 443
+# must reach this host, and the domain's DNS record must point at it).
+#
+# One upstream, no path rules: the all-in-one control plane serves the webhook
+# routes, /worker/* (including the WebSocket upgrade), /operator/*, /auth/*,
+# /trpc/* and the dashboard. reverse_proxy passes Host and X-Forwarded-Proto
+# through, which the session cookie's Secure flag and the webhook callback URL
+# rely on.
+{$WEBHOOK_CALLBACK_BASE_URL} {
+	reverse_proxy app:3000
+}
