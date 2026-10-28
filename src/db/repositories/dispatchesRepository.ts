@@ -129,6 +129,10 @@ export type DispatchWaitReason =
 	 * `provider-error` merge (issue #923) is scheduled through the same
 	 * `scheduleMergeRetry` and so records `recheck` too, although it waits on the
 	 * forge rather than on CI.
+	 *
+	 * Merge automation's retry pinned to a head is woken early when that head's
+	 * checks complete green (issue #1173, `promoteMergeChecksWaits`); the timer
+	 * stays underneath it as the fallback.
 	 */
 	| 'recheck'
 	/**
@@ -1764,6 +1768,37 @@ export async function listMergeQueueWaits(
 }
 
 /**
+ * The merge dispatches waiting on **this head's** checks (issue #1173): merge
+ * automation's `recheck` retries whose `approvedHeadSha` is the head (the approved
+ * one, or the one a base update advanced it onto), still holding a *delayed*
+ * wake-up — what a green aggregate for the head wakes. Keyed on the head rather
+ * than the pull request number because the checks are about the commit, and a
+ * `checks` event's pull request number is only the provider's first guess for
+ * that commit. No index of its own, for the reason {@link listMergeQueueWaits}
+ * needs none.
+ */
+export async function listMergeChecksWaits(
+	projectId: string,
+	repository: string,
+	headSha: string,
+	asOf: Date = new Date(),
+): Promise<DispatchRow[]> {
+	return getDb()
+		.select()
+		.from(dispatches)
+		.where(
+			and(
+				mergeQueueKey(projectId, repository),
+				eq(dispatches.state, 'retry-scheduled'),
+				eq(dispatches.waitReason, 'recheck'),
+				sql`${dispatches.jobPayload} ->> 'approvedHeadSha' = ${headSha}`,
+				gt(dispatches.availableAt, asOf),
+			),
+		)
+		.orderBy(asc(dispatches.createdAt), asc(dispatches.id));
+}
+
+/**
  * The dispatches waiting for this task's checkout to free (issue #759) — what a
  * settling phase wakes, the task-level twin of {@link selectNextCapacityDispatch}.
  *
@@ -2035,12 +2070,19 @@ export async function selectNextCapacityDispatch(
  * early" move, made by a merge-queue holder settling
  * (`promoteMergeQueueWaits`) rather than by a worker becoming available, with
  * its own candidate read ({@link listMergeQueueWaits}).
+ *
+ * `recheck` (issue #1173) is here for the re-date too, and likewise never listed
+ * by the worker listing: a merge-automation retry pinned to a head is woken when
+ * that head's checks complete green (`promoteMergeChecksWaits`), with its own
+ * candidate read ({@link listMergeChecksWaits}) that lists merge-automation rows
+ * only — so the review gate's own `recheck` waits are never promoted.
  */
 export const PROMOTABLE_AVAILABILITY_WAIT_REASONS = [
 	'worker-eligibility',
 	'worker-rate-limited',
 	'preserved-worker',
 	'merge-queue',
+	'recheck',
 ] as const satisfies readonly DispatchWaitReason[];
 
 /**

@@ -77,7 +77,12 @@ const {
 	getBranchHead: vi.fn(),
 	deliveryPostComment: vi.fn(),
 }));
-vi.mock('@/dispatch/dispatcher.js', () => ({ scheduleCoalescedDispatch: scheduleCoalescedJob }));
+// A green head wakes the merge waiting on it (issue #1173); resolves how many woke.
+const { promoteMergeChecksWaits } = vi.hoisted(() => ({ promoteMergeChecksWaits: vi.fn() }));
+vi.mock('@/dispatch/dispatcher.js', () => ({
+	scheduleCoalescedDispatch: scheduleCoalescedJob,
+	promoteMergeChecksWaits,
+}));
 
 const deliveryProvider = vi.fn(
 	async (_project: ProjectConfig, _persona: ScmPersona) =>
@@ -207,6 +212,8 @@ beforeEach(() => {
 	// dispatching. Suites that care about the aggregate set their own.
 	getAggregateCheckStatus.mockResolvedValue(checkStatus([['ci', 'completed', 'success']]));
 	scheduleCoalescedJob.mockReset();
+	promoteMergeChecksWaits.mockReset();
+	promoteMergeChecksWaits.mockResolvedValue(0);
 	// Ownership-gate default: SWARM has an Implementation run for the work item the
 	// PR's branch decodes to. Tests flip it to exercise an unrelated PR or a
 	// run-history lookup failure.
@@ -3355,5 +3362,109 @@ describe('review trigger — two repositories with different check policies (iss
 		);
 		expect(createFailedRun).toHaveBeenCalledOnce();
 		expect(createFailedRun.mock.calls[0][0].error).toContain('30 minutes');
+	});
+});
+
+describe('review trigger — a green head wakes the merge waiting on it (issue #1173)', () => {
+	const checks = {
+		kind: 'checks',
+		action: 'completed',
+		workItemId: '42',
+		headSha: 'abc123',
+		prBranch: 'issue-42',
+	} as const;
+
+	beforeEach(() => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'completed', 'success']]));
+	});
+
+	it('wakes it on a green completed-checks event that dispatches Review', async () => {
+		expect(await handler.handle(ctx(checks))).toMatchObject({ phase: 'review' });
+		expect(promoteMergeChecksWaits).toHaveBeenCalledExactlyOnceWith(
+			PROJECT.id,
+			PROJECT.repo,
+			'abc123',
+		);
+	});
+
+	it('wakes it on a green head whose slot is already submitted, beside the re-arm', async () => {
+		reserveReviewVerdict.mockResolvedValue({
+			status: 'reused',
+			id: 'v1',
+			ordinal: 1,
+			state: 'submitted',
+		});
+
+		expect(await handler.handle(ctx(checks))).toBeNull();
+		expect(promoteMergeChecksWaits).toHaveBeenCalledExactlyOnceWith(
+			PROJECT.id,
+			PROJECT.repo,
+			'abc123',
+		);
+		expect(rearmMergeAutomationForGreenHead).toHaveBeenCalledOnce();
+	});
+
+	// The head a base update produced: its merge dispatch pre-claimed the PR+SHA
+	// slot (`claimUpdatedHeadReviewSlot`), so the event is dropped at the claim.
+	it('wakes it even when the PR+SHA claim is already held', async () => {
+		claimReviewDispatch.mockResolvedValue(false);
+
+		expect(await handler.handle(ctx(checks))).toBeNull();
+		expect(promoteMergeChecksWaits).toHaveBeenCalledExactlyOnceWith(
+			PROJECT.id,
+			PROJECT.repo,
+			'abc123',
+		);
+		expect(promoteMergeChecksWaits.mock.invocationCallOrder[0]).toBeLessThan(
+			claimReviewDispatch.mock.invocationCallOrder[0] as number,
+		);
+	});
+
+	it('does not wake it on a red head', async () => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'completed', 'failure']]));
+
+		expect(await handler.handle(ctx(checks))).toMatchObject({ phase: 'respond-to-ci' });
+		expect(promoteMergeChecksWaits).not.toHaveBeenCalled();
+	});
+
+	it('does not wake it while a check is still running', async () => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'in_progress', null]]));
+
+		expect(await handler.handle(ctx(checks))).toBeNull();
+		expect(scheduleCoalescedJob).toHaveBeenCalledOnce();
+		expect(promoteMergeChecksWaits).not.toHaveBeenCalled();
+	});
+
+	// The #841 bypass reaches a `review` disposition with its checks still failing.
+	it('does not wake it on the adjudicated no-fix red', async () => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'completed', 'failure']]));
+
+		expect(await handler.handle(ctx(checks, { ciNoFixRecovery: true }))).toMatchObject({
+			phase: 'review',
+		});
+		expect(promoteMergeChecksWaits).not.toHaveBeenCalled();
+	});
+
+	it('does not wake it for a pull request SWARM does not manage', async () => {
+		hasRunForTask.mockResolvedValue(false);
+
+		expect(await handler.handle(ctx(checks))).toBeNull();
+		expect(promoteMergeChecksWaits).not.toHaveBeenCalled();
+	});
+
+	it('does not wake it for a conflicting pull request', async () => {
+		getPullRequest.mockResolvedValue({
+			number: 42,
+			headBranch: 'issue-42',
+			headSha: 'abc123',
+			baseBranch: 'main',
+			baseSha: 'base123',
+			mergeable: false,
+			authorLogin: 'operator-human',
+			state: 'open',
+		});
+
+		expect(await handler.handle(ctx(checks))).toMatchObject({ phase: 'resolve-conflicts' });
+		expect(promoteMergeChecksWaits).not.toHaveBeenCalled();
 	});
 });

@@ -157,6 +157,16 @@
  * head is still never merged. The #841 bypass above never re-arms: its head is
  * still red, and goes to the re-run policy instead.
  *
+ * **A green head wakes the merge waiting on it** (issue #1173). A merge
+ * automation retry pinned to this head — the approved head while its checks ran,
+ * or the head a base update produced — is `retry-scheduled` on its doubling
+ * backoff, so a green aggregate asks `promoteMergeChecksWaits` to make it due
+ * now. That runs as soon as the disposition reads green and **before** the
+ * PR+SHA claim below, because a head a base update produced arrives with that
+ * claim already held by its merge dispatch (`claimUpdatedHeadReviewSlot`), which
+ * would drop this event first. The woken merge still re-reads approval and checks
+ * before merging, and the backoff stays underneath as the fallback.
+ *
  * **A red the base branch already explains is attributed to the base, not to
  * the PR** (issue #873). Beside the bypass above — the same branch, a second
  * judgement about *whose* red this is — `resolveAggregateCheckReview` reads the
@@ -234,7 +244,7 @@ import {
 } from '../../dispatch/approved-head-checks-rerun.js';
 import { readBaseBranchHealth } from '../../dispatch/base-branch-health.js';
 import { hasCiNoFixRecovery } from '../../dispatch/ci-no-fix-recovery.js';
-import { scheduleCoalescedDispatch } from '../../dispatch/dispatcher.js';
+import { promoteMergeChecksWaits, scheduleCoalescedDispatch } from '../../dispatch/dispatcher.js';
 import { describeError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
 import type { SwarmJob } from '../../queue/jobs.js';
@@ -1937,6 +1947,24 @@ async function actOnReviewedHead(
 	return null;
 }
 
+/**
+ * A green head may be the one a `retry-scheduled` merge is waiting on (issue
+ * #1173): wake that merge now instead of at its next backoff slot. Called before
+ * the PR+SHA claim, because a head a base update produced arrives with that claim
+ * already held by its merge dispatch (`claimUpdatedHeadReviewSlot`), which would
+ * drop this event first; and before the phase-disabled gate, because a merge armed
+ * before Review was disabled still waits on it. An adjudicated red (#841) is not
+ * green, so it wakes nothing. Best-effort: `promoteMergeChecksWaits` never throws.
+ */
+async function wakeMergeWaitingOnHead(
+	ctx: ScmTriggerContext,
+	disposition: Exclude<ReviewDisposition, { kind: 'none' }>,
+	headSha: string,
+): Promise<void> {
+	if (disposition.kind !== 'review' || disposition.adjudicatedRed === true) return;
+	await promoteMergeChecksWaits(ctx.project.id, ctx.project.repo, headSha);
+}
+
 export function createReviewTrigger(): TriggerHandler {
 	return {
 		name: 'pr-review',
@@ -1963,6 +1991,7 @@ export function createReviewTrigger(): TriggerHandler {
 
 			const disposition = await resolveDisposition(ctx, prNumber, headSha, mergeCheck.baseBranch);
 			if (disposition.kind === 'none') return null;
+			await wakeMergeWaitingOnHead(ctx, disposition, headSha);
 			if (isDispositionDisabled(project, disposition, prNumber, headSha)) return null;
 
 			// A red the base branch already explains (issue #873) is reported and
