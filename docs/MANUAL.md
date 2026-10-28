@@ -864,15 +864,21 @@ same image locally.
 
 | Tag | Published when | Moves? |
 | --- | --- | --- |
-| `vX.Y.Z` / `vX.Y` | a `v*` git tag is pushed | no, by convention |
+| `vX.Y.Z` | a `v*` git tag is pushed | no, by convention |
+| `stable` | a `v*` git tag without a `-` (not a pre-release) is pushed | yes, once per release |
 | `sha-<7>` | a commit on `main` is published | no |
 | `main` | every merge to `main` | yes, many times a day |
 
-**Pin a version or a `sha-` tag on a server.** `main` moves continuously — the
-pipeline merges many times a day — so a restart can silently pick up a different
-build. Migrations only go forward: once a newer image has migrated the database,
-an older tag is not guaranteed to run against it, so roll back by restoring a
-pre-upgrade database backup, not by re-pinning. Upgrade deliberately.
+**Never run `main` on a server.** It moves continuously — the pipeline merges many
+times a day — so any pull can pick up a different build. Pin a version or a `sha-`
+tag, or use `stable` when the people deploying cannot edit the server's `.env`
+(say, a VPS where you are only allowed to pull and restart): it moves only when a
+maintainer cuts a release, so the upgrade is still deliberate, and it is applied
+only by an explicit pull — a restart, or `docker compose up -d` alone, keeps the
+image already on the host. Migrations only go forward: once a newer image has
+migrated the database, an older tag is not guaranteed to run against it, so roll
+back by restoring a pre-upgrade database backup, not by re-pinning. Upgrade
+deliberately.
 
 A compose service pointing at a tag updates with a plain pull and recreate:
 
@@ -905,7 +911,8 @@ in [Running on a VPS behind Caddy](#running-on-a-vps-behind-caddy) instead.
   [Adding colleagues](#quick-start-beyond-the-readme)).
 - **Unchanged:** `Dockerfile.router`, the Compose `router` service and
   `npm run reload:all` still build the router locally, as before.
-- **Maintainers:** cut a version with `git tag vX.Y.Z && git push origin vX.Y.Z`.
+- **Maintainers:** cut a version with `git tag vX.Y.Z && git push origin vX.Y.Z`;
+  that also moves `stable` (a `vX.Y.Z-rc.N` pre-release does not).
   The package has to be made **public** once by an org admin (GitHub → the org's
   Packages → `swarm` → Package settings → Change visibility → Public); until then
   an anonymous pull fails.
@@ -962,7 +969,7 @@ cp .env.example .env && chmod 600 .env
 
 | Variable | Value |
 | --- | --- |
-| `SWARM_IMAGE_TAG` | a `vX.Y.Z` or `sha-<7>` tag — never `main` on a server |
+| `SWARM_IMAGE_TAG` | a `vX.Y.Z` or `sha-<7>` tag, or `stable` if whoever upgrades cannot edit `.env` — never `main` on a server |
 | `WEBHOOK_CALLBACK_BASE_URL` | `https://<your domain>` — scheme and host only, no trailing slash; also Caddy's site address |
 | `POSTGRES_PASSWORD`, `REDIS_PASSWORD` | `openssl rand -hex 32` each — hex because they are embedded in URLs |
 | `CREDENTIAL_MASTER_KEY` | `openssl rand -hex 32` — encrypts every stored credential |
@@ -1029,6 +1036,8 @@ lapsed, `docker compose restart app` logs a fresh one.
 - **Updating.** Back up first: migrations only go forward (see
   [The published image](#the-published-image)). Then set the new
   `SWARM_IMAGE_TAG` in `.env` and run `docker compose pull && docker compose up -d`.
+  On `SWARM_IMAGE_TAG=stable` there is nothing to edit: once a release is cut,
+  `docker compose pull app && docker compose up -d app` picks it up.
   The app applies pending migrations at start, before it serves anything, so there
   is no separate migrate step. If the bundle files themselves changed at the new
   ref, fetch them again first.

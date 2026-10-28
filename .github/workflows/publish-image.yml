@@ -33,7 +33,10 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # :main on a push to main, the tag name verbatim (:v1.2.3) on a v* tag, and
-      # :sha-<short> on both. No :latest — servers should pin (docs/MANUAL.md).
+      # :sha-<short> on both. :stable follows the newest v* release (a pre-release
+      # such as v1.2.3-rc.1 leaves it alone), so a server whose .env its deployer
+      # cannot edit still upgrades only when a release is cut. No :latest —
+      # servers pin or follow :stable (docs/MANUAL.md, "The published image").
       # The generated OCI labels carry the source commit (image.revision).
       - id: meta
         uses: docker/metadata-action@v5
@@ -44,6 +47,7 @@ jobs:
             type=ref,event=branch
             type=ref,event=tag
             type=sha,prefix=sha-,format=short
+            type=raw,value=stable,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
 
       - uses: docker/build-push-action@v6
         with:
