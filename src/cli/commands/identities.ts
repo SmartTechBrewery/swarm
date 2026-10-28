@@ -1,6 +1,6 @@
 /**
  * `swarm identities` — the operator front-door onto SWARM identity linking
- * (#130 Phase 1): which provider handle (a GitHub login, a Jira account id)
+ * (#130 Phase 1): which provider handle (a GitHub login, a Jira accountId)
  * belongs to which SWARM user. Without it the link table is unreachable, since
  * automatic linking (OAuth / SCM account discovery) and a dashboard UI are both
  * out of scope — the same "make the model usable" role `swarm users` plays for
@@ -35,17 +35,25 @@ Usage:
   swarm identities unlink --provider <provider> --handle <handle>
   swarm identities list [--user <identifier>]
 
-  link     Link a provider handle (e.g. a GitHub login) to a SWARM user, looked
-           up by login handle. Re-linking the same pair is a no-op; a handle
-           already linked to a different user is rejected.
+  link     Link a provider handle (e.g. a GitHub login or a Jira accountId) to a
+           SWARM user, looked up by login handle. Re-linking the same pair is a
+           no-op; a handle already linked to a different user is rejected.
   unlink   Remove a handle's link.
   list     List links ('<identifier>\\t<provider>\\t<handle>' per line), all of
            them or just one user's.
 
-<provider> is a provider-neutral source key — 'github-projects' for the GitHub
-Projects board. Provider and handle are matched case-insensitively. Requires
-DATABASE_URL. Links are read by assignee resolution (src/identity/assignee-resolver.ts);
-nothing routes on them yet.`;
+<provider> is the project's PM type; <handle> is the id that provider reports
+for an assignee:
+  github-projects  the GitHub login
+  jira             the Atlassian accountId — not the email or display name. Find
+                   it in the profile URL (…/jira/people/<accountId>) or with
+                   GET /rest/api/3/user/search?query=<email>
+  linear           the display name
+  trello           the member username
+
+Provider and handle are matched case-insensitively. Requires DATABASE_URL. Links
+are read by assignee resolution (src/identity/assignee-resolver.ts) to route an
+assigned item to its assignee's own workers.`;
 
 const SUBCOMMANDS = ['link', 'unlink', 'list'];
 

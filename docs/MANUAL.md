@@ -1187,6 +1187,22 @@ each worker machine's checkout — see
 which carries the `swarm-repo-renamed` runbook and the ordering constraint that
 keeps worker enrollments from being suspended.
 
+**A Jira-assigned item stopped running on its assignee's worker.** Since issue
+#1166 SWARM identifies a Jira assignee by their Atlassian **accountId**, not by
+email or display name — Jira Cloud hides the email under profile visibility, and a
+display name collides between namesakes and changes on a rename. `jira` links
+created earlier with `swarm identities link --handle <email or name>` no longer
+match. This is a **deliberate breaking change with no automatic migration**: a
+link names no Jira site to resolve it against, and a display name cannot be
+resolved to one account without guessing. Until the link is redone, the item takes
+the unassigned path and may run on any eligible worker. To fix it, find the `jira`
+rows with `swarm identities list`, look up each person's accountId — from their
+profile URL `https://<site>/jira/people/<accountId>`, or with
+`GET /rest/api/3/user/search?query=<email>` using the project's Jira credentials —
+then run `swarm identities link --user <identifier> --provider jira --handle
+<accountId>` and remove the stale row with `swarm identities unlink --provider jira
+--handle <old handle>`. No restart is needed: the next dispatch reads the link.
+
 **A run that was cancelled leaves its trail in the log, not in Redis.** The
 cancellation marker and its recorded origin are deleted the moment the worker acts
 on them, so grep the log rather than Redis:
