@@ -2,11 +2,11 @@ import { z } from 'zod';
 
 /**
  * The tabs on the General Settings screen, in display order (issue #250 added
- * `appearance`, issue #769 `credentials`). `credentials` sits between the two so the
- * administrator-only tabs stay together and `appearance` — every viewer's tab, and the
- * fallback — stays last.
+ * `appearance`, issue #769 `credentials`, issue #1151 `users`). The administrator-only
+ * tabs stay together and `appearance` — every viewer's tab, and the fallback — stays
+ * last.
  */
-export const SETTINGS_TABS = ['agents', 'credentials', 'appearance'] as const;
+export const SETTINGS_TABS = ['agents', 'credentials', 'users', 'appearance'] as const;
 
 export type SettingsTab = (typeof SETTINGS_TABS)[number];
 
@@ -23,11 +23,10 @@ export interface SettingsViewer {
 }
 
 /**
- * Tabs only an instance administrator may see — both are installation-wide
- * configuration, so neither section is presented to a user without
- * instance-administration authority.
+ * Tabs only an instance administrator may see — each is installation-wide, so none
+ * is presented to a user without instance-administration authority.
  *
- * The two differ in what this list *is*, and the difference matters:
+ * They differ in what this list *is*, and the difference matters:
  *
  * - `agents` (issue #666) is a **visibility** boundary on the screen alone. The
  *   `settings.get`/`update` procedures are the enforcement point and their
@@ -37,8 +36,11 @@ export interface SettingsViewer {
  *   non-administrator (`src/api/routers/instanceCredentials.ts`). Hiding the tab is a
  *   courtesy; the router is what stops a secret being written or its
  *   configured-state read.
+ * - `users` (issue #1151) is likewise visibility on top of real enforcement: every
+ *   `users` procedure, `list` included, throws `FORBIDDEN` for a non-administrator
+ *   (`src/api/routers/users.ts`).
  */
-const INSTANCE_ADMIN_ONLY_TABS: readonly SettingsTab[] = ['agents', 'credentials'];
+const INSTANCE_ADMIN_ONLY_TABS: readonly SettingsTab[] = ['agents', 'credentials', 'users'];
 
 /** The tab a bare `/settings` link opens, for a viewer who may see it. */
 const DEFAULT_SETTINGS_TAB: SettingsTab = 'agents';
@@ -77,6 +79,16 @@ export function resolveActiveSettingsTab(
 ): SettingsTab {
 	const requested = search.tab ?? DEFAULT_SETTINGS_TAB;
 	return visibleSettingsTabs(viewer).includes(requested) ? requested : FALLBACK_SETTINGS_TAB;
+}
+
+/**
+ * Whether a tab renders from the `settings.get` blob, so the screen waits on that
+ * query (and shows its error) before rendering it. Agent Defaults reads `agents`, and
+ * Appearance merges its theme update onto the whole blob; Credentials and Users each
+ * own their query and stay usable when `settings.get` fails.
+ */
+export function settingsTabNeedsAppSettings(tab: SettingsTab): boolean {
+	return tab === 'agents' || tab === 'appearance';
 }
 
 /** Search state for switching to a tab. */

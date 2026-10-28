@@ -236,6 +236,15 @@ describe('membersRouter', () => {
 			expect(addMember).not.toHaveBeenCalled();
 		});
 
+		// The no-shell path first, the CLI as the alternative (issue #1151).
+		it('points an unknown identifier at Settings → Users, with the CLI as the alternative', async () => {
+			vi.mocked(findUserByIdentifier).mockResolvedValue(undefined);
+
+			await expect(
+				ordinary.add({ projectId: 'p1', identifier: 'nobody@example.com' }),
+			).rejects.toThrowError(/Settings → Users \(or with `swarm users add`\)/);
+		});
+
 		// Only an instanceAdmin reaches this branch — `assertProjectAccess` returns
 		// early for them without proving the project exists, so an unchecked id would
 		// surface as a foreign-key 500.

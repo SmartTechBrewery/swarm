@@ -28,7 +28,8 @@ import { Modal, ModalFooter } from '../ui/modal.js';
  * this query after each write rather than from a timer.
  *
  * **Errors are the server's own words.** Phase 1's copy already names the fix (a
- * duplicate points at changing the role, an unknown identifier at `swarm users add`),
+ * duplicate points at changing the role, an unknown identifier at Settings → Users,
+ * or `swarm users add`),
  * so nothing here paraphrases it — a failed write renders its message verbatim,
  * beside the control that caused it.
  */
@@ -244,9 +245,10 @@ export function MembersPanel({ projectId }: { projectId: string }) {
 				<div>
 					<h3 className="text-sm font-semibold text-zinc-200">Add a member</h3>
 					<p className="text-xs text-zinc-400 mt-1">
-						Name an existing SWARM user by their login identifier. Accounts themselves are still
-						created with <span className="font-mono">swarm users add</span> — this grants access to
-						the project, it does not sign anybody up.
+						Name an existing SWARM user by their login identifier. Accounts themselves are created
+						by an installation administrator under Settings → Users (or with{' '}
+						<span className="font-mono">swarm users add</span>) — this grants access to the project,
+						it does not sign anybody up.
 					</p>
 				</div>
 				<div className="grid grid-cols-1 md:grid-cols-2 gap-4">

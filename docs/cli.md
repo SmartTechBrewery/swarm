@@ -390,7 +390,13 @@ swarm users set-password <identifier>
   on a TTY, otherwise reads the password from stdin. Never logs it.
 
 Requires `DATABASE_URL`. Creating the first admin + password is how you get a
-dashboard login (there is no self-signup in the UI).
+dashboard login from a shell (the first admin can also come from the one-time
+`/setup` link). Installation admins can also create users, issue single-use
+password links (a first password or a reset) and grant or revoke installation
+admin under the dashboard's **Settings → Users**, with no shell (issue #1151,
+[`MANUAL.md`](./MANUAL.md#quick-start-beyond-the-readme)). There is still no
+self-signup: every account is created by an installation admin. Unlike the
+dashboard, `revoke-admin` here does not refuse the last installation admin.
 
 ### `swarm members`
 

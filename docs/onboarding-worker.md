@@ -60,6 +60,11 @@ npm run swarm -- users set-password ada@example.com   # prompts, no echo
 npm run swarm -- members add example-project ada@example.com --role member
 ```
 
+All three also work without a shell: an installation admin adds the person under
+the dashboard's **Settings → Users** and sends them the single-use password link it
+shows, which they open to set their own password (issue #1151); a project admin
+adds them on the project's **Members** tab.
+
 Membership is not optional: the next step asks the control plane which SCM
 provider the project runs on, and that read is refused for a non-member — with
 `You are not a member of project "example-project"`, distinct from
