@@ -85,7 +85,8 @@ npm run swarm -- users set-password you@example.com   # set its login password (
 ```
 
 **First-run setup, without a shell** (issue #1150). When the API process
-(`dev:api` / `start:api`) starts against a database with **no users**, it writes
+(`dev:api` / `start:api`) — or the all-in-one control plane (`npm run serve`, and
+so the published image) — starts against a database with **no users**, it writes
 one warning line to its log:
 
 ```text
@@ -93,10 +94,11 @@ No users exist yet. Open /setup?token=… to create the first installation admin
 ```
 
 Open that path on the dashboard's address (e.g.
-`http://localhost:3101/setup?token=…`), enter an e-mail address and a password,
+`http://localhost:3101/setup?token=…`) — with `WEBHOOK_CALLBACK_BASE_URL` set, the
+logged link already starts with that public base URL — enter an e-mail address and a password,
 and SWARM creates that user as the installation admin and signs you in. The link
 then stops working. It is the only place the token is ever written — only its
-hash is held, in the API process's memory — and it:
+hash is held, in the memory of the process that logged it — and it:
 
 - is **single use**, and **expires after an hour**;
 - is **replaced on every restart** while no user exists: restarting before setup
@@ -793,7 +795,9 @@ Run either from the repo root. It serves everything both processes serve — the
 webhook routes, `/worker/*` including the WebSocket upgrade, `/operator/*`,
 `/auth/*`, `/trpc/*`, the dashboard and a single `/health` — and runs what both
 run: the dispatch consumer, the rollout ticker, the worktree-sweep bridge, the
-orphaned-run reap and the weekly fleet abandoned-worktree sweep. A proxy in front
+orphaned-run reap and the weekly fleet abandoned-worktree sweep — and, on a
+database with no users, logs the [first-run setup](#quick-start-beyond-the-readme)
+link. A proxy in front
 needs no path rules (`reverse_proxy app:3000`), and every URL — the workers'
 `SWARM_CONTROL_PLANE_URL`, the provider webhook URLs, `WEBHOOK_CALLBACK_BASE_URL` —
 is the one public base URL.
@@ -856,6 +860,9 @@ recreates the container only when the image changed.
 - **Which commit is this?** The image has no `.git`, so the control plane reports
   no build commit of its own; the image label does:
   `docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' ghcr.io/smarttechbrewery/swarm:<tag>`.
+- **The first admin** needs no shell: on a database with no users the container
+  logs a one-time `/setup?token=…` link (see
+  [First-run setup](#quick-start-beyond-the-readme)).
 - **Admin commands** run inside the container, since this mode refuses
   single-user mode: `docker compose exec swarm node dist/cli/index.js users add
   you@example.com --admin`, then `… users set-password you@example.com`.

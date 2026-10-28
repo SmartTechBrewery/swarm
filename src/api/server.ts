@@ -37,7 +37,7 @@ import {
 import { announceFirstRunSetup, completeFirstRunSetup } from '../identity/first-run-setup.js';
 import { getUser } from '../identity/service.js';
 import { buildCorsMiddleware } from '../lib/cors.js';
-import { isSingleUserMode } from '../lib/env.js';
+import { isSingleUserMode, resolveWebhookCallbackBaseUrl } from '../lib/env.js';
 import { configureLogger, logger } from '../lib/logger.js';
 import { startHostMaintenance } from './maintenance.js';
 import { appRouter } from './router.js';
@@ -271,8 +271,9 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 	const maintenance = startHostMaintenance();
 	// First-run setup (issue #1150): with an empty `users` table, log the one-time
 	// link that creates the first admin. Not awaited, like maintenance, so the port
-	// binds without waiting on the database; it never throws.
-	void announceFirstRunSetup();
+	// binds without waiting on the database; it never throws. The public base URL
+	// (the path-routed front of both processes) makes the logged link clickable.
+	void announceFirstRunSetup({ baseUrl: resolveWebhookCallbackBaseUrl() });
 	const server = serve({ fetch: app.fetch, port, hostname: '127.0.0.1' }, () => {
 		logger.debug('swarm-api: listening', { port, hostname: '127.0.0.1' });
 	});
