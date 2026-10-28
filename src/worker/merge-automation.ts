@@ -96,7 +96,9 @@
  *    bypassed at once, which is how a dead holder's turn is reclaimed.
  *  - **A holder keeps its turn across its own retries** — a `retry-scheduled`
  *    holder waiting on its updated head's CI is still the head. That is the point,
- *    and the cost: about one merge per CI duration per base branch.
+ *    and the cost: about one merge per CI duration per base branch. A green
+ *    completed-checks event for the head it waits on wakes it at once (issue
+ *    #1173, `promoteMergeChecksWaits`); the doubling backoff stays as the fallback.
  *  - **Everyone else waits as `merge-queue`**, re-checked every
  *    {@link MERGE_QUEUE_RECHECK_MS} and woken earlier by every terminal ending of
  *    the holder ({@link settleMergeDispatch}), with no retry budget spent and a
@@ -408,7 +410,8 @@ export interface RearmMergeAutomationInput {
  * `requestMergeAutomationForApproval` applies), a Review run approved this head
  * and its merge stopped with a re-armable outcome without being superseded, and
  * no dispatch is still active on that run — an active merge dispatch reads the
- * green head itself. Best-effort like {@link requestMergeAutomation}: a failure
+ * green head itself, and the `pr-review` trigger wakes it for that head (issue
+ * #1173). Best-effort like {@link requestMergeAutomation}: a failure
  * is logged, never thrown, so it cannot fail the trigger evaluation.
  */
 export async function rearmMergeAutomationForGreenHead({
