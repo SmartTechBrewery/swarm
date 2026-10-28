@@ -812,8 +812,59 @@ is the one public base URL.
   turns it back on.
 - **SIGTERM** stops dispatch, the timers and the listener, then exits.
 
-No container image ships for this mode yet. The variables are in
+This is also what the published image runs (below). The variables are in
 [`docs/configuration.md`](./configuration.md) ("All-in-one control plane").
+
+### The published image
+
+`ghcr.io/smarttechbrewery/swarm` is built from the repo-root `Dockerfile` by
+`.github/workflows/publish-image.yml` (issue #1149). It holds the backend and the
+built dashboard, runs the all-in-one control plane on port `3000` by default, and
+applies migrations at start. The package is public, so `docker pull` needs no
+`docker login`. It needs the same environment as above — `DATABASE_URL`,
+`REDIS_URL`, `CREDENTIAL_MASTER_KEY`, `DATABASE_SSL` as your Postgres requires,
+`WEBHOOK_CALLBACK_BASE_URL` for Trello; see
+[`docs/configuration.md`](./configuration.md). `docker build -t swarm .` builds the
+same image locally.
+
+| Tag | Published when | Moves? |
+| --- | --- | --- |
+| `vX.Y.Z` / `vX.Y` | a `v*` git tag is pushed | no, by convention |
+| `sha-<7>` | a commit on `main` is published | no |
+| `main` | every merge to `main` | yes, many times a day |
+
+**Pin a version or a `sha-` tag on a server.** `main` moves continuously — the
+pipeline merges many times a day — so a restart can silently pick up a different
+build. Migrations only go forward: once a newer image has migrated the database,
+an older tag is not guaranteed to run against it, so roll back by restoring a
+pre-upgrade database backup, not by re-pinning. Upgrade deliberately.
+
+A compose service pointing at a tag updates with a plain pull and recreate:
+
+```yaml
+services:
+  swarm:
+    image: ghcr.io/smarttechbrewery/swarm:v1.2.3   # or sha-<7>
+    restart: unless-stopped
+    env_file: .env
+    ports: ["127.0.0.1:3000:3000"]
+```
+
+Edit the tag, then `docker compose pull && docker compose up -d` — Compose
+recreates the container only when the image changed.
+
+- **Which commit is this?** The image has no `.git`, so the control plane reports
+  no build commit of its own; the image label does:
+  `docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' ghcr.io/smarttechbrewery/swarm:<tag>`.
+- **Admin commands** run inside the container, since this mode refuses
+  single-user mode: `docker compose exec swarm node dist/cli/index.js users add
+  you@example.com --admin`, then `… users set-password you@example.com`.
+- **Unchanged:** `Dockerfile.router`, the Compose `router` service and
+  `npm run reload:all` still build the router locally, as before.
+- **Maintainers:** cut a version with `git tag vX.Y.Z && git push origin vX.Y.Z`.
+  The package has to be made **public** once by an org admin (GitHub → the org's
+  Packages → `swarm` → Package settings → Change visibility → Public); until then
+  an anonymous pull fails.
 
 ## Failure diagnosis
 
