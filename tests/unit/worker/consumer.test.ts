@@ -4257,6 +4257,34 @@ describe('processJob', () => {
 			expect(phaseCalls).toEqual([]);
 		});
 
+		// Issue #1165: `pipeline.requireAssignee` makes Planning affinity-gated too.
+		it.each([
+			[true, 'w-alice'],
+			[false, 'w-bob'],
+		] as const)('routes planning with requireAssignee=%s to %s', async (requireAssignee, workerId) => {
+			projectLookup = () =>
+				createMockProjectConfig({ pipeline: { requireAssignee } }) as ProjectConfig;
+			listProjectDispatchCandidates.mockResolvedValue([
+				candidate('w-bob', { ownerUserId: BOB }),
+				candidate('w-alice', { ownerUserId: ALICE }),
+			]);
+			resolveAssignedUser.mockResolvedValue({
+				user: { id: ALICE, identifier: 'octocat', displayName: 'octocat' } as SwarmUser,
+				assignee: { handle: 'octocat' },
+			});
+
+			await processJob(
+				createMockPmWebhookJob(),
+				registryReturning(planningTrigger()),
+				undefined,
+				executionIdentity(workerId),
+			);
+
+			expect(claimWorkerForDispatch).toHaveBeenCalledWith(
+				expect.objectContaining({ selectedWorkerId: workerId }),
+			);
+		});
+
 		it('refuses execution when a different authenticated worker host dequeues the job', async () => {
 			listProjectDispatchCandidates.mockResolvedValue([candidate('w-alice')]);
 			claimWorkerForDispatch.mockResolvedValue({
@@ -6163,6 +6191,161 @@ describe('processJob', () => {
 					}),
 				);
 			});
+		});
+	});
+
+	describe('assignee requirement gate (issue #1165)', () => {
+		// With `pipeline.requireAssignee`, an item without an assignee linked to a SWARM
+		// user is skipped at every phase, the same way as an unlabelled one.
+		const LINKED = {
+			user: { id: 'u-alice', identifier: 'alice', displayName: 'alice' } as SwarmUser,
+			assignee: { handle: 'alice' },
+		};
+
+		beforeEach(() => {
+			projectLookup = () =>
+				createMockProjectConfig({ pipeline: { requireAssignee: true } }) as ProjectConfig;
+		});
+
+		const BOARD_TRIGGERS: [string, (assignees: WorkItemAssignee[]) => TriggerResult][] = [
+			[
+				'Planning',
+				(assignees) => ({
+					phase: 'planning',
+					taskId: '216',
+					workItem: createMockWorkItem({ statusId: '3fe662f4', assignees }),
+				}),
+			],
+			[
+				'Implementation',
+				(assignees) => ({
+					phase: 'implementation',
+					taskId: '216',
+					workItem: createMockWorkItem({ statusId: '61e4505c', assignees }),
+				}),
+			],
+		];
+
+		it.each(BOARD_TRIGGERS)('skips an unassigned %s item', async (_n, trigger) => {
+			const info = vi.spyOn(logger, 'info').mockImplementation(() => {});
+
+			const outcome = await processJob(createMockPmWebhookJob(), registryReturning(trigger([])));
+
+			expect(outcome).toMatchObject({
+				status: 'skipped-not-eligible',
+				taskId: '216',
+				reason: expect.stringContaining('this item has no assignee'),
+			});
+			expect(phaseCalls).toEqual([]);
+			expect(acquireProjectSlot).not.toHaveBeenCalled();
+			expect(createRun).not.toHaveBeenCalled();
+			expect(completeDispatch).toHaveBeenCalledWith('dispatch-1', 'skipped-not-eligible');
+			expect(info).toHaveBeenCalledWith(
+				expect.stringContaining('no assignee linked to a SWARM user'),
+				expect.objectContaining({ taskId: '216', cause: 'unassigned' }),
+			);
+			info.mockRestore();
+		});
+
+		it.each(BOARD_TRIGGERS)('skips a %s item whose assignee is not linked', async (_n, trigger) => {
+			resolveAssignedUser.mockResolvedValue(undefined);
+
+			const outcome = await processJob(
+				createMockPmWebhookJob(),
+				registryReturning(trigger([{ handle: 'octocat' }])),
+			);
+
+			expect(outcome).toMatchObject({ status: 'skipped-not-eligible' });
+			if (outcome.status !== 'skipped-not-eligible') throw new Error('unreachable');
+			expect(outcome.reason).toContain("'octocat'");
+			expect(outcome.reason).toContain('swarm identities link');
+			expect(phaseCalls).toEqual([]);
+		});
+
+		it.each(BOARD_TRIGGERS)('runs a %s item whose assignee is linked', async (_n, trigger) => {
+			resolveAssignedUser.mockResolvedValue(LINKED);
+
+			const outcome = await processJob(
+				createMockPmWebhookJob(),
+				registryReturning(trigger([{ handle: 'alice' }])),
+			);
+
+			expect(outcome.status).toBe('phase-succeeded');
+			expect(phaseCalls).toHaveLength(1);
+		});
+
+		it('runs an unassigned item when the setting is off', async () => {
+			projectLookup = () => createMockProjectConfig() as ProjectConfig;
+			const [, trigger] = BOARD_TRIGGERS[1] ?? [];
+			if (!trigger) throw new Error('unreachable');
+
+			const outcome = await processJob(createMockPmWebhookJob(), registryReturning(trigger([])));
+
+			expect(outcome.status).toBe('phase-succeeded');
+		});
+
+		it('finalizes a retried run row with the assignee reason', async () => {
+			const [, trigger] = BOARD_TRIGGERS[1] ?? [];
+			if (!trigger) throw new Error('unreachable');
+
+			await processJob(createMockPmWebhookJob({ runId: 'run-7' }), registryReturning(trigger([])));
+
+			expect(completeRun).toHaveBeenCalledWith(
+				'run-7',
+				expect.objectContaining({
+					status: 'failed',
+					error: expect.stringContaining('requires every work item to have an assignee'),
+				}),
+			);
+		});
+
+		it('dispatches anyway when the identity link cannot be read (fails open)', async () => {
+			const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+			resolveAssignedUser.mockRejectedValueOnce(new Error('db down'));
+			const [, trigger] = BOARD_TRIGGERS[1] ?? [];
+			if (!trigger) throw new Error('unreachable');
+
+			const outcome = await processJob(
+				createMockPmWebhookJob(),
+				registryReturning(trigger([{ handle: 'alice' }])),
+			);
+
+			expect(outcome.status).toBe('phase-succeeded');
+			expect(warn).toHaveBeenCalledWith(
+				expect.stringContaining('Assignee requirement could not be checked'),
+				expect.objectContaining({ error: 'db down' }),
+			);
+			warn.mockRestore();
+		});
+
+		it("skips Review when the PR's card has no assignee, handing back its claims", async () => {
+			findWorkItemForArtifact.mockResolvedValue(createMockWorkItem({ id: 'item-17' }));
+
+			const outcome = await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(outcome).toMatchObject({ status: 'skipped-not-eligible', phase: 'review' });
+			expect(phaseCalls).toEqual([]);
+			expect(releaseReviewDispatch).toHaveBeenCalledWith(`${PROJECT.repo}:17:deadbeef`);
+			expect(abandonReviewVerdict).toHaveBeenCalled();
+		});
+
+		it('still reads the card for an SCM phase when the label gate is off', async () => {
+			projectLookup = () =>
+				createMockProjectConfig({
+					pipeline: { automationLabel: '', requireAssignee: true },
+				}) as ProjectConfig;
+			findWorkItemForArtifact.mockResolvedValue(createMockWorkItem({ id: 'item-17' }));
+
+			const outcome = await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(findWorkItemForArtifact).toHaveBeenCalled();
+			expect(outcome.status).toBe('skipped-not-eligible');
 		});
 	});
 

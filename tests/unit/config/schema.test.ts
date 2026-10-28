@@ -1458,6 +1458,15 @@ describe('PipelineConfigSchema', () => {
 			automationLabel: '',
 		});
 	});
+
+	// Issue #1165 — opt-in, so absent stays absent (read as `false` in code).
+	it('accepts requireAssignee as an optional boolean', () => {
+		expect(PipelineConfigSchema.parse({}).requireAssignee).toBeUndefined();
+		expect(PipelineConfigSchema.parse({ requireAssignee: true })).toMatchObject({
+			requireAssignee: true,
+		});
+		expect(PipelineConfigSchema.safeParse({ requireAssignee: 'yes' }).success).toBe(false);
+	});
 });
 
 describe('validateConfig', () => {

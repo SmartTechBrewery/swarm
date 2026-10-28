@@ -112,6 +112,14 @@ not a way for a project administrator to bypass the worker owner's consent.
 > daemon run every phase and killed that premise; the exemption stands on the
 > reason above, which does not depend on it.
 
+> **Amended (issue #1165): a project may opt out of the exemption.** The #469
+> exemption stays the default. A project whose developers each own their workers
+> across many repositories can set `pipeline.requireAssignee`, which gates
+> `planning` on affinity as well, and refuses any item with no assignee linked to a
+> SWARM user at every phase — so for that project the unassigned path of open
+> question 5 is closed rather than taken. Routing for every other phase is
+> unchanged.
+
 > **Amended (issue #542): every worker has the same permissions.** `planning` was
 > for a time the one phase an enrollment could be *permitted* only on a worker whose
 > owner is an instance admin. That rule is gone. `instance_admin` is a role about
