@@ -12,7 +12,8 @@
  * such as `github-projects` — so the same table serves a future Jira/Linear/SCM
  * provider without a schema change.
  *
- * Links are seeded by an operator (`swarm identities link`); automatic linking
+ * Links are seeded by an operator (`swarm identities link`, or Settings → Users
+ * in the dashboard since issue #1167); automatic linking
  * (OAuth, SCM account discovery) is a later concern, and ADR-001 open question 5
  * — an unlinked or ambiguous handle — is answered by construction: a
  * `(provider, handle)` pair maps to at most one SWARM user (the table's unique
@@ -61,3 +62,23 @@ export const LinkIdentityInputSchema = UserIdentitySchema.pick({
 });
 
 export type LinkIdentityInput = z.infer<typeof LinkIdentityInputSchema>;
+
+/**
+ * A `(provider, handle)` already linked to a *different* SWARM user — the one
+ * refusal `linkIdentity` makes. Typed so the API can map it to `CONFLICT` and
+ * name that user (issue #1167) without matching on message text; the message is
+ * the one the CLI has always printed.
+ */
+export class IdentityLinkConflictError extends Error {
+	readonly name = 'IdentityLinkConflictError';
+
+	constructor(
+		readonly provider: string,
+		readonly handle: string,
+		readonly existingUserId: string,
+	) {
+		super(
+			`Handle '${handle}' on '${provider}' is already linked to another user (${existingUserId})`,
+		);
+	}
+}

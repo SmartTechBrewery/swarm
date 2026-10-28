@@ -444,7 +444,9 @@ reports for an assignee:
 
 Provider and handle are matched case-insensitively. Re-linking the same
 pair is a no-op; a handle already linked to a different user is rejected. Requires
-`DATABASE_URL`.
+`DATABASE_URL`. Since issue #1167 an installation admin can list, link and unlink
+the same identities under the dashboard's **Settings → Users**, with no shell
+([`MANUAL.md`](./MANUAL.md#quick-start-beyond-the-readme)); this CLI is unchanged.
 
 ### `swarm workers`
 

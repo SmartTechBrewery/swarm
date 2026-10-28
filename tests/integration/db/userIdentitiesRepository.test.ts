@@ -11,6 +11,7 @@ import {
 import { createUser } from '../../../src/db/repositories/usersRepository.js';
 import { userIdentities } from '../../../src/db/schema/userIdentities.js';
 import { users } from '../../../src/db/schema/users.js';
+import { IdentityLinkConflictError } from '../../../src/identity/user-identity.js';
 import { truncateAll } from '../helpers/db.js';
 
 const PROVIDER = 'github-projects';
@@ -59,9 +60,11 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 			it('refuses to re-point a handle at a second user', async () => {
 				await linkIdentity({ userId: adaId, provider: PROVIDER, handle: 'ada' });
 
-				await expect(
-					linkIdentity({ userId: graceId, provider: PROVIDER, handle: 'ada' }),
-				).rejects.toThrow('already linked to another user');
+				const attempt = linkIdentity({ userId: graceId, provider: PROVIDER, handle: 'ada' });
+				await expect(attempt).rejects.toThrow('already linked to another user');
+				// Typed, so the API can name the owner (issue #1167).
+				await expect(attempt).rejects.toBeInstanceOf(IdentityLinkConflictError);
+				await expect(attempt).rejects.toMatchObject({ existingUserId: adaId });
 				expect(await findUserIdByIdentity(PROVIDER, 'ada')).toBe(adaId);
 			});
 
@@ -78,7 +81,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 				// Same handle in different casing is the same link, not a second user's.
 				await expect(
 					linkIdentity({ userId: graceId, provider: PROVIDER, handle: 'ADA' }),
-				).rejects.toThrow('already linked to another user');
+				).rejects.toMatchObject({ name: 'IdentityLinkConflictError', existingUserId: adaId });
 			});
 
 			it('rejects whitespace-only provider or handle values with ZodError', async () => {
