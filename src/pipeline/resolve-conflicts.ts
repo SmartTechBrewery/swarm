@@ -744,10 +744,15 @@ export async function runResolveConflictsPhase(
 		saveDeliveryProgress(handle.path, progress);
 		if (!progress.commitSha) {
 			await assertRemoteHead(handle.path, prBranch, headSha);
+			// A pending merge whose tree equals the head's is still the update: a
+			// checkout that already carries the base's content (an earlier attempt's
+			// merge commit that never reached the remote) merges the current base to an
+			// unchanged tree, and only the merge commit makes the base an ancestor.
 			progress.commitSha = await commitPreparedTree(
 				handle.path,
 				mergeCommitSubject(baseBranch, prBranch),
 				delivery.commitIdentity,
+				{ allowUnchangedMerge: true },
 			);
 			saveDeliveryProgress(handle.path, progress);
 		}
