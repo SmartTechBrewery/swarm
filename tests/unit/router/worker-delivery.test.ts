@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ProjectRecord } from '@/config/schema.js';
 import type { CliQuotaSnapshot } from '@/harness/quota.js';
 import { DEFAULT_WORKER_SUPPORTED_PHASES, type Worker } from '@/identity/worker.js';
+import { MissingWorkerScmCredentialError } from '@/identity/worker-scm-credential.js';
 import type { ReviewVerdictLedger } from '@/pipeline/review-ledger.js';
 import type { PMProvider } from '@/pm/types.js';
 import {
@@ -28,6 +29,7 @@ import {
 	handleSubmitReview,
 	handleUpdateWorkItem,
 	isExecutingClaimOf,
+	missingOperatorCredentialReason,
 	NON_ROUTABLE_ENROLLMENT_DELIVERY_REASON,
 	ORPHANED_DISPATCH_DELIVERY_REASON,
 	type WorkerDeliveryDeps,
@@ -136,6 +138,7 @@ function makeDeps(overrides: Partial<WorkerDeliveryDeps> = {}): WorkerDeliveryDe
 		// No dispatch is orphaned unless a test says so (issue #1073).
 		isDispatchOrphaned: vi.fn().mockReturnValue(false),
 		buildScmDelivery: vi.fn().mockResolvedValue(makeDelivery()),
+		buildOperatorScmDelivery: vi.fn().mockResolvedValue(makeDelivery()),
 		buildPmProvider: vi.fn(() => makePmProvider()),
 		reviewLedger: makeReviewLedger(),
 		scheduleFollowUpReview: vi.fn().mockResolvedValue(undefined),
@@ -226,6 +229,7 @@ describe('handleSubmitReview', () => {
 			expect.objectContaining({ id: 'swarm' }),
 			'reviewer',
 		);
+		expect(deps.buildOperatorScmDelivery).not.toHaveBeenCalled();
 		expect(submitReview).toHaveBeenCalledWith({
 			prNumber: 42,
 			verdict: 'approve',
@@ -338,10 +342,10 @@ describe('handlePostComment', () => {
 		});
 	});
 
-	it('posts under the persona the request names, so a review reply is authored by the implementer', async () => {
+	it("posts an implementer reply with the requesting worker's stored operator credential (issue #1152)", async () => {
 		const postComment = vi.fn().mockResolvedValue(88);
-		const buildScmDelivery = vi.fn().mockResolvedValue(makeDelivery({ postComment }));
-		const deps = makeDeps({ buildScmDelivery });
+		const buildOperatorScmDelivery = vi.fn().mockResolvedValue(makeDelivery({ postComment }));
+		const deps = makeDeps({ buildOperatorScmDelivery });
 
 		const result = await handlePostComment(
 			deps,
@@ -350,11 +354,33 @@ describe('handlePostComment', () => {
 		);
 
 		expect(result.status).toBe(200);
-		expect(buildScmDelivery).toHaveBeenCalledWith(
+		expect(buildOperatorScmDelivery).toHaveBeenCalledWith(
 			expect.objectContaining({ id: 'swarm' }),
-			'implementer',
+			expect.objectContaining({ id: WORKER_ID }),
 		);
+		expect(deps.buildScmDelivery).not.toHaveBeenCalled();
 		expect(postComment).toHaveBeenCalledTimes(1);
+	});
+
+	it('authors the reply as whichever worker the credential resolved to, not a fixed host account', async () => {
+		const otherWorkerId = '33333333-3333-4333-8333-333333333333';
+		const deps = makeDeps({
+			resolveWorkerByCredential: vi
+				.fn()
+				.mockResolvedValue(makeWorker({ id: otherWorkerId, displayName: 'grace-desktop' })),
+		});
+
+		const result = await handlePostComment(
+			deps,
+			CREDENTIAL,
+			commentBody({ persona: 'implementer' }),
+		);
+
+		expect(result.status).toBe(200);
+		expect(deps.buildOperatorScmDelivery).toHaveBeenCalledWith(
+			expect.anything(),
+			expect.objectContaining({ id: otherWorkerId, displayName: 'grace-desktop' }),
+		);
 	});
 
 	it('falls back to the reviewer persona for a client that sends none', async () => {
@@ -366,15 +392,24 @@ describe('handlePostComment', () => {
 			expect.objectContaining({ id: 'swarm' }),
 			'reviewer',
 		);
+		expect(deps.buildOperatorScmDelivery).not.toHaveBeenCalled();
 	});
 
 	it('enforces auth and enrollment before touching the PAT', async () => {
 		const unknown = makeDeps({ resolveWorkerByCredential: vi.fn().mockResolvedValue(undefined) });
-		expect((await handlePostComment(unknown, 'bogus', commentBody())).status).toBe(401);
+		expect(
+			(await handlePostComment(unknown, 'bogus', commentBody({ persona: 'implementer' }))).status,
+		).toBe(401);
+		expect(unknown.buildOperatorScmDelivery).not.toHaveBeenCalled();
 
 		const unenrolled = makeDeps({ findEnrollment: vi.fn().mockResolvedValue(undefined) });
 		expect((await handlePostComment(unenrolled, CREDENTIAL, commentBody())).status).toBe(403);
 		expect(unenrolled.buildScmDelivery).not.toHaveBeenCalled();
+		expect(
+			(await handlePostComment(unenrolled, CREDENTIAL, commentBody({ persona: 'implementer' })))
+				.status,
+		).toBe(403);
+		expect(unenrolled.buildOperatorScmDelivery).not.toHaveBeenCalled();
 	});
 
 	it('returns 400 for a malformed body', async () => {
@@ -390,15 +425,61 @@ describe('handlePostComment', () => {
 		expect(deps.buildScmDelivery).not.toHaveBeenCalled();
 	});
 
-	it('answers 503 with a reason when the persona credential cannot be resolved', async () => {
-		// Ordinary misconfiguration on this host: `implementer` resolves to its
-		// `SWARM_OPERATOR_GH_TOKEN`, which the router did not need for this route
-		// before issue #444. Letting the throw escape makes it a reason-less 500, so
-		// the worker's log — and the failed run's comment — never name the cause.
+	it('answers an actionable 503 when the requesting worker has no stored operator credential', async () => {
+		// The credential can be removed between the dispatch that checked it and the
+		// reply. Letting the throw escape makes it a reason-less 500, so the worker's
+		// log — and the failed run's comment — would never name what to set.
+		const error = new MissingWorkerScmCredentialError(
+			WORKER_ID,
+			'ada-laptop',
+			'github',
+			`No operator SCM credential stored (${RESOLVED_PAT})`,
+		);
+		const deps = makeDeps({ buildOperatorScmDelivery: vi.fn().mockRejectedValue(error) });
+
+		const result = await handlePostComment(
+			deps,
+			CREDENTIAL,
+			commentBody({ persona: 'implementer' }),
+		);
+
+		expect(result.status).toBe(503);
+		expect(result.json).toEqual({
+			reason: missingOperatorCredentialReason(error),
+			persona: 'implementer',
+		});
+		expect(result.json.reason).toContain(`/workers/${WORKER_ID}`);
+		expect(result.json.reason).toContain('github');
+		expect(result.json.reason).toContain('set-scm-credential');
+		expect(JSON.stringify(result.json)).not.toContain(RESOLVED_PAT);
+		expect(JSON.stringify(result.json)).not.toContain(CREDENTIAL);
+	});
+
+	it('answers 503 persona identity unresolved when the stored credential resolves no account', async () => {
 		const deps = makeDeps({
-			buildScmDelivery: vi
+			buildOperatorScmDelivery: vi
 				.fn()
-				.mockRejectedValue(new Error(`No operator GitHub token configured: ${RESOLVED_PAT}`)),
+				.mockRejectedValue(
+					new Error(`Could not resolve GitHub identity for the operator token ${RESOLVED_PAT}`),
+				),
+		});
+
+		const result = await handlePostComment(
+			deps,
+			CREDENTIAL,
+			commentBody({ persona: 'implementer' }),
+		);
+
+		expect(result.status).toBe(503);
+		expect(result.json).toEqual({ reason: 'persona identity unresolved', persona: 'implementer' });
+		expect(JSON.stringify(result.json)).not.toContain(RESOLVED_PAT);
+	});
+
+	it('answers 503 with a generic reason when the operator credential cannot be resolved', async () => {
+		const deps = makeDeps({
+			buildOperatorScmDelivery: vi
+				.fn()
+				.mockRejectedValue(new Error(`Failed to decrypt stored credential: ${RESOLVED_PAT}`)),
 		});
 
 		const result = await handlePostComment(
@@ -1934,6 +2015,7 @@ describe("run-scoped routes act on the run's repository (issue #1055)", () => {
 	function actedOn(deps: WorkerDeliveryDeps): boolean {
 		return [
 			deps.buildScmDelivery,
+			deps.buildOperatorScmDelivery,
 			deps.scheduleFollowUpReview,
 			deps.reviewLedger.getPriorSubmittedReview,
 			deps.reviewLedger.markReviewVerdictSubmitted,
@@ -1957,22 +2039,35 @@ describe("run-scoped routes act on the run's repository (issue #1055)", () => {
 		);
 	});
 
-	it.each([
-		'reviewer',
-		'implementer',
-	] as const)('posts a %s PR comment against the run’s repository', async (persona) => {
+	it('posts a reviewer PR comment against the run’s repository', async () => {
 		const deps = twoRepoDeps();
 
 		const result = await handlePostComment(
 			deps,
 			CREDENTIAL,
-			commentBody({ repository: MOBILE_REPO, persona }),
+			commentBody({ repository: MOBILE_REPO, persona: 'reviewer' }),
 		);
 
 		expect(result.status).toBe(200);
 		expect(deps.buildScmDelivery).toHaveBeenCalledWith(
 			expect.objectContaining({ id: 'swarm', repo: MOBILE_REPO }),
-			persona,
+			'reviewer',
+		);
+	});
+
+	it('posts an implementer PR comment against the run’s repository', async () => {
+		const deps = twoRepoDeps();
+
+		const result = await handlePostComment(
+			deps,
+			CREDENTIAL,
+			commentBody({ repository: MOBILE_REPO, persona: 'implementer' }),
+		);
+
+		expect(result.status).toBe(200);
+		expect(deps.buildOperatorScmDelivery).toHaveBeenCalledWith(
+			expect.objectContaining({ id: 'swarm', repo: MOBILE_REPO }),
+			expect.objectContaining({ id: WORKER_ID }),
 		);
 	});
 

@@ -131,10 +131,12 @@ Consequences of the rule:
   the requesting `persona` (defaulting to `reviewer`, which is what keeps an older
   client unchanged) and the router resolves that persona's credential server-side.
   `POST /worker/delivery/review` needs no such field — only Review submits a
-  verdict. The implementer resolves to the router's own `SWARM_OPERATOR_GH_TOKEN`,
-  so attribution is exact under the same-host assumption that token already carries
-  (issue #396) and is the *server* operator's on a different-machine deployment —
-  the residual gap §3/§4 below own.
+  verdict. The implementer originally resolved to the router's own
+  `SWARM_OPERATOR_GH_TOKEN`, which made the reply the *server* operator's on a
+  different-machine deployment; since issue #1152 the router resolves the
+  **requesting worker's** stored operator credential for the project's SCM
+  provider instead, so attribution is exact — the reply is authored by the account
+  that pushed the fix.
 - **PM board/issue writes also move server-side**, for the same reason the
   reviewer PAT does: they are metadata operations needing a project-scoped
   credential the worker should not hold, and the worker has no DB config under
@@ -265,10 +267,10 @@ gates stopped.
 > surfacing in phase 2/2 (issue #446). Native comment authorship is also settled
 > on every delivery path: a comment is written by the persona the phase requested
 > (issue #444), so a Respond-to-review reply reads as the implementer's rather
-> than as the reviewer answering itself — with the caveat §2 records, that the
-> implementer credential the router resolves is its own `SWARM_OPERATOR_GH_TOKEN`,
-> so on a different-machine deployment the reply is authored by the *server*
-> operator's account rather than the worker's. The mapping lives on the existing `runs` row:
+> than as the reviewer answering itself — and, since issue #1152, the implementer
+> credential the router resolves is the requesting worker's own stored operator
+> credential, so on a different-machine deployment the reply is authored by that
+> worker's operator rather than the server's. The mapping lives on the existing `runs` row:
 > `work_item_id` / `phase` / `worker_id` / **`worker_user_id`** (new) /
 > **`produced_pr_url`** (new). Both ends are captured by the control plane, as the
 > §2 constraint requires — a DB-free worker cannot write the record itself: the
