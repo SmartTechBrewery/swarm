@@ -3,7 +3,8 @@
  *
  * All the request logic lives in `webhook-receiver.ts` and
  * `worker-transport.ts` (both testable without a live server); this module is
- * just the process boundary: build the app, mount the worker-transport routes,
+ * just the process boundary: build the app (the route composition lives in
+ * `./app.ts`, shared with the all-in-one control plane in `src/serve/index.ts`),
  * bind the port, inject the WebSocket upgrade, and shut down cleanly. Verified
  * webhook events are enqueued onto BullMQ at the `enqueue.ts` seam (producer in
  * `queue/producer.ts`); the worker transport keeps the `worker_sessions`
@@ -18,20 +19,14 @@
  */
 
 import { serve } from '@hono/node-server';
-import { createNodeWebSocket } from '@hono/node-ws';
 
-import { getOperatorGitHubTokenOrNull, OPERATOR_GH_TOKEN_ENV } from '../config/operator-token.js';
 import { runMigrations } from '../db/migrate.js';
 import { describeError } from '../lib/errors.js';
 import { configureLogger, logger } from '../lib/logger.js';
 import { closeQueue } from '../queue/producer.js';
+import { createRouterApp, warnWhenOperatorTokenUnset } from './app.js';
 import type { DispatchConsumerHandle } from './dispatcher.js';
-import { registerOperatorApi } from './operator-api.js';
-import { registerOperatorSession } from './operator-session.js';
-import { createWebhookApp } from './webhook-receiver.js';
-import { registerWorkerDelivery } from './worker-delivery.js';
 import { startRolloutAdvanceTicker } from './worker-rollout-advance.js';
-import { registerWorkerTransport } from './worker-transport.js';
 import { subscribeWorktreeSweepDispatch } from './worktree-sweep-dispatch.js';
 
 // Tag every line this process emits so router and worker logs stay
@@ -40,35 +35,8 @@ configureLogger({ component: 'router' });
 
 const port = Number(process.env.PORT ?? 3000);
 
-const app = createWebhookApp();
-// The Cloudflare-tunnel-fronted router also hosts the authenticated
-// worker-transport endpoint (ADR-003 §1). `createNodeWebSocket` must bind the
-// same `app` whose `injectWebSocket` upgrades the server created by `serve`.
-const { upgradeWebSocket, injectWebSocket } = createNodeWebSocket({ app });
-registerWorkerTransport(app, upgradeWebSocket);
-// The router also hosts the server-side SCM metadata delivery API (ADR-004 §2):
-// a federated worker POSTs review/comment content here and the router performs
-// the GitHub write under the per-project reviewer PAT, which never leaves it.
-registerWorkerDelivery(app);
-// …and the operator session API (issue #798): `swarm login` authenticates a human
-// here because this is the process `SWARM_CONTROL_PLANE_URL` points at, and the
-// only one an operator off the control-plane host can reach.
-registerOperatorSession(app);
-// …and the operator API that token buys (issue #799): the `swarm workers`
-// operations at `/operator/trpc/*`, a strict subset of the dashboard's router —
-// the `workers` namespace alone, since this process is the internet-exposed one.
-registerOperatorApi(app);
-// Say so at startup rather than at the first event that needs it: without the
-// operator token this host cannot resolve the *implementer* persona for the
-// GitHub operations it originates itself — the Respond-to-review author gate, the
-// sweeps, merge automation reads. A Respond-to-review *reply* does not need it: it
-// is posted with the requesting worker's own stored operator credential (issue
-// #1152). Only a warning — every delivery route works without it.
-if (!getOperatorGitHubTokenOrNull()) {
-	logger.warn(
-		`${OPERATOR_GH_TOKEN_ENV} is unset — router-originated GitHub operations that run as the implementer persona (e.g. the Respond-to-review author gate) cannot authenticate until it is set; Respond-to-review replies do not need it (issue #1152) — see docs/configuration.md`,
-	);
-}
+const { app, injectWebSocket } = createRouterApp();
+warnWhenOperatorTokenUnset();
 const server = serve({ fetch: app.fetch, port }, () => {
 	logger.debug('swarm-router: listening', { port });
 });

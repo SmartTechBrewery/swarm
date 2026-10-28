@@ -383,3 +383,48 @@ describe('startHostMaintenance — the weekly fleet worktree sweep (issue #956)'
 		}
 	});
 });
+
+describe('startHostMaintenance — retention sweep switched off (all-in-one mode, issue #1148)', () => {
+	beforeEach(() => {
+		vi.useFakeTimers();
+	});
+
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	it('never prunes worktrees, but still reaps orphans and fans out the fleet sweep', async () => {
+		const collaborators = createCollaborators(
+			[createMockProjectConfig({ id: 'alpha' })],
+			[makeWorker('worker-a')],
+		);
+
+		const handle = startHostMaintenance({ ...collaborators, worktreeRetentionSweep: false });
+		await vi.advanceTimersByTimeAsync(0);
+
+		expect(collaborators.failOrphanedRuns).toHaveBeenCalledTimes(1);
+		expect(collaborators.fanOutSweep).toHaveBeenCalledExactlyOnceWith([makeWorker('worker-a')]);
+
+		await vi.advanceTimersByTimeAsync(SWEEP_INTERVAL_MS * 3);
+		expect(collaborators.pruneWorktrees).not.toHaveBeenCalled();
+		expect(collaborators.listProjects).not.toHaveBeenCalled();
+
+		await handle.close();
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	it('does not read SWARM_WORKTREE_SWEEP_INTERVAL_MS when the sweep is off', async () => {
+		const previous = process.env.SWARM_WORKTREE_SWEEP_INTERVAL_MS;
+		process.env.SWARM_WORKTREE_SWEEP_INTERVAL_MS = 'hourly';
+		try {
+			const handle = startHostMaintenance({
+				...createCollaborators([]),
+				worktreeRetentionSweep: false,
+			});
+			await handle.close();
+		} finally {
+			if (previous === undefined) delete process.env.SWARM_WORKTREE_SWEEP_INTERVAL_MS;
+			else process.env.SWARM_WORKTREE_SWEEP_INTERVAL_MS = previous;
+		}
+	});
+});
