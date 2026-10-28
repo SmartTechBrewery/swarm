@@ -560,6 +560,19 @@ export const PipelineBaseSchema = z.object({
 	 * layers are separate and unaffected).
 	 */
 	automationLabel: z.string().trim().optional(),
+	/**
+	 * Opt-in (issue #1165): require every work item to have an assignee linked
+	 * to a SWARM user before any phase starts for it. Unset defaults to `false`
+	 * in code (`resolveRequireAssignee`, `src/worker/assignee-requirement.ts`) for
+	 * the same reason `automationLabel` is: `pipeline` itself is optional.
+	 *
+	 * When `true`, an item with no assignee — or whose assignees are not linked
+	 * to a SWARM user — is skipped at every phase, and `planning` becomes
+	 * affinity-gated like `implementation`, so both run only on the assignee's
+	 * own workers. Provider-agnostic: it reads `WorkItem.assignees` and
+	 * `PMProvider.supportsAssignees` only.
+	 */
+	requireAssignee: z.boolean().optional(),
 });
 
 export const PipelineConfigSchema = PipelineBaseSchema.refine(

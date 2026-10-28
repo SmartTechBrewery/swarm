@@ -24,9 +24,12 @@
  *    An item with no assignees — or whose assignees are not linked to any SWARM
  *    user — takes the unassigned path (ADR-001 open question 5), so an unlinked
  *    handle never wedges a project. Affinity applies **per phase**
- *    ({@link AFFINITY_GATED_PHASES}): to `implementation` but not to `planning`,
- *    which belongs to no particular machine (issue #469; see that constant for why
- *    the exemption outlived the reason it was introduced for).
+ *    ({@link AFFINITY_GATED_PHASES}): to `implementation` but, by default, not to
+ *    `planning`, which belongs to no particular machine (issue #469; see that
+ *    constant for why the exemption outlived the reason it was introduced for). A
+ *    project that sets `pipeline.requireAssignee` (issue #1165) gates `planning`
+ *    too — and with that setting an unassigned or unlinked item never reaches this
+ *    gate at all, because `processJob` skips it first.
  * 2b. **The preserved-checkout pin** (issue #567) — when the dispatch continues
  *    work left in a machine-local checkout (a Tier 2 checkpoint, a resumable
  *    session, a delivery sidecar), the permitted set is *only* the machine that
@@ -141,7 +144,8 @@ import { type PoolDemand, selectPooledWorker } from './pool-scheduling.js';
  *
  * Only an affinity-gated phase can reach `assignee-worker-unavailable`
  * ({@link AFFINITY_GATED_PHASES}, issue #469): `planning` never narrows to one
- * user's machines, so it can never be refused for their unavailability.
+ * user's machines, so it can never be refused for their unavailability — unless
+ * the project sets `pipeline.requireAssignee` ({@link DispatchGateInput.requireAssignee}).
  */
 export type DispatchIneligibilityReason =
 	| IneligibilityReason
@@ -278,17 +282,22 @@ export interface DispatchGateInput {
 	 * declared `supportedPhases` (issue #467) so a worker whose daemon cannot run this
 	 * phase is never selected for it, against each enrollment's `allowedPhases` (issue
 	 * #509) so an owner's per-project selection is honored, and against
-	 * {@link AFFINITY_GATED_PHASES} (issue #469) to decide whether assignee affinity
-	 * applies at all.
+	 * {@link AFFINITY_GATED_PHASES} (issue #469, widened by {@link requireAssignee})
+	 * to decide whether assignee affinity applies at all.
 	 */
 	phase: TriggerPhase;
 	/**
 	 * The work item being dispatched, when the phase has one. PR-driven phases
 	 * (review / respond-*) carry no item, so they take the unassigned path — as does
 	 * `planning`, which carries one but is not affinity-gated
-	 * ({@link AFFINITY_GATED_PHASES}).
+	 * ({@link AFFINITY_GATED_PHASES}) unless {@link requireAssignee} is set.
 	 */
 	workItem?: Pick<WorkItem, 'assignees'>;
+	/**
+	 * The project's `pipeline.requireAssignee` (issue #1165). Set, it widens the
+	 * affinity-gated phases to include `planning`; absent means `false`.
+	 */
+	requireAssignee?: boolean;
 	/** The project's PM provider — only its `type`/`supportsAssignees` are read. */
 	pm?: Pick<PMProvider, 'type' | 'supportsAssignees'>;
 	/**
@@ -406,12 +415,30 @@ export interface DispatchGateOptions {
  * `implementation` keeps affinity, and the rationale still holds there: it writes
  * source in a worktree on the operator's own machine under their own token, so
  * *whose* machine runs it is the point.
+ *
+ * The #469 exemption stays the **default**. A project whose developers each own
+ * their workers across many repositories can opt `planning` into affinity with
+ * `pipeline.requireAssignee` (issue #1165,
+ * {@link ASSIGNEE_REQUIRED_AFFINITY_GATED_PHASES}) — the "routing decision of its
+ * own" anticipated above, made per project rather than globally.
  */
 const AFFINITY_GATED_PHASES: ReadonlySet<TriggerPhase> = new Set<TriggerPhase>(['implementation']);
 
-/** Whether a phase routes to its assignee's own workers (see {@link AFFINITY_GATED_PHASES}). */
-export function isAffinityGatedPhase(phase: TriggerPhase): boolean {
-	return AFFINITY_GATED_PHASES.has(phase);
+/** The affinity-gated phases when the project sets `pipeline.requireAssignee` (issue #1165). */
+const ASSIGNEE_REQUIRED_AFFINITY_GATED_PHASES: ReadonlySet<TriggerPhase> = new Set<TriggerPhase>([
+	'implementation',
+	'planning',
+]);
+
+/**
+ * Whether a phase routes to its assignee's own workers (see
+ * {@link AFFINITY_GATED_PHASES}). `requireAssignee` is the project's
+ * `pipeline.requireAssignee`, which adds `planning` to the set.
+ */
+export function isAffinityGatedPhase(phase: TriggerPhase, requireAssignee = false): boolean {
+	return (requireAssignee ? ASSIGNEE_REQUIRED_AFFINITY_GATED_PHASES : AFFINITY_GATED_PHASES).has(
+		phase,
+	);
 }
 
 /**
@@ -878,7 +905,9 @@ export async function evaluateDispatchEligibility(
 	// `assignee-worker-unavailable` framing — all of which would otherwise describe a
 	// wait for the assignee's own worker that this phase is not waiting for.
 	const assigned =
-		input.workItem && input.pm?.supportsAssignees && isAffinityGatedPhase(input.phase)
+		input.workItem &&
+		input.pm?.supportsAssignees &&
+		isAffinityGatedPhase(input.phase, input.requireAssignee)
 			? await resolveAssignedUser(input.workItem, input.pm.type)
 			: undefined;
 	// A pin outranks affinity, and replaces it rather than composing with it (issue

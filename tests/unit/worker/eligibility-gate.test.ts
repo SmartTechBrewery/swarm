@@ -181,6 +181,19 @@ describe('isAffinityGatedPhase', () => {
 			expect(isAffinityGatedPhase(phase)).toBe(false);
 		}
 	});
+
+	it('gates planning too when the project requires an assignee (issue #1165)', () => {
+		expect(isAffinityGatedPhase('planning', true)).toBe(true);
+		expect(isAffinityGatedPhase('implementation', true)).toBe(true);
+		for (const phase of [
+			'review',
+			'respond-to-review',
+			'respond-to-ci',
+			'resolve-conflicts',
+		] as const) {
+			expect(isAffinityGatedPhase(phase, true)).toBe(false);
+		}
+	});
 });
 
 // Issue #607. The classification the dispatch row records, asserted over the whole
@@ -547,6 +560,78 @@ describe('evaluateDispatchEligibility', () => {
 
 			expect(decision).toMatchObject({ status: 'selected', selection: { workerId: 'w-bob' } });
 			expect(resolveAssignedUser).not.toHaveBeenCalled();
+		});
+
+		// Issue #1165: a project that requires an assignee opts Planning into affinity.
+		describe('with pipeline.requireAssignee (issue #1165)', () => {
+			const planning = (overrides: Partial<DispatchGateInput> = {}) =>
+				gateInput({
+					phase: 'planning',
+					workItem: ASSIGNED_ITEM,
+					pm: PM,
+					requireAssignee: true,
+					...overrides,
+				});
+
+			it('routes planning only to a worker owned by the assignee', async () => {
+				listProjectDispatchCandidates.mockResolvedValue([
+					makeCandidate('w-bob', { ownerUserId: BOB }),
+					makeCandidate('w-alice', { ownerUserId: ALICE }),
+				]);
+				resolveAssignedUser.mockResolvedValue(assignedTo(ALICE));
+
+				const decision = await evaluateDispatchEligibility(planning());
+
+				expect(decision).toMatchObject({
+					status: 'selected',
+					selection: { workerId: 'w-alice', assignedUserId: ALICE },
+				});
+			});
+
+			it('stays unrestricted for planning on the same fixture when the setting is off', async () => {
+				listProjectDispatchCandidates.mockResolvedValue([
+					makeCandidate('w-bob', { ownerUserId: BOB }),
+					makeCandidate('w-alice', { ownerUserId: ALICE }),
+				]);
+				resolveAssignedUser.mockResolvedValue(assignedTo(ALICE));
+
+				const decision = await evaluateDispatchEligibility(planning({ requireAssignee: false }));
+
+				expect(decision).toMatchObject({ status: 'selected', selection: { workerId: 'w-bob' } });
+				expect(resolveAssignedUser).not.toHaveBeenCalled();
+			});
+
+			it('defers planning when the assignee owns no enrolled worker', async () => {
+				listProjectDispatchCandidates.mockResolvedValue([
+					makeCandidate('w-bob', { ownerUserId: BOB }),
+				]);
+				resolveAssignedUser.mockResolvedValue(assignedTo(ALICE));
+
+				const decision = await evaluateDispatchEligibility(planning());
+
+				expect(decision).toMatchObject({
+					status: 'ineligible',
+					reason: 'assignee-worker-unavailable',
+				});
+			});
+
+			it('defers planning as assignee-worker-unavailable when the assignee’s workers are busy', async () => {
+				listProjectDispatchCandidates.mockResolvedValue([
+					makeCandidate('w-a1', { activeRuns: 1 }),
+					makeCandidate('w-a2', { connected: false }),
+					makeCandidate('w-bob', { ownerUserId: BOB }),
+				]);
+				resolveAssignedUser.mockResolvedValue(assignedTo(ALICE));
+
+				const decision = await evaluateDispatchEligibility(planning());
+
+				expect(decision).toMatchObject({
+					status: 'ineligible',
+					reason: 'assignee-worker-unavailable',
+				});
+				if (decision.status !== 'ineligible') throw new Error('unreachable');
+				expect(decision.message).toContain('octocat');
+			});
 		});
 	});
 

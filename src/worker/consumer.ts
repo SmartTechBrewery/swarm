@@ -203,6 +203,11 @@ import {
 import { CommitUnavailableError } from '../worktree/commit-availability.js';
 import { reconcileTerminatedWorktree } from '../worktree/termination-cleanup.js';
 import { DEFAULT_AGENT_TIMEOUT_MS, resolveAgentTimeoutMs } from './agent-timeout.js';
+import {
+	type AssigneeRequirementVerdict,
+	checkAssigneeRequirement,
+	resolveRequireAssignee,
+} from './assignee-requirement.js';
 import { automaticRetryPolicyFor } from './automatic-retry-policy.js';
 import {
 	maxDependencyRechecks,
@@ -4237,7 +4242,8 @@ function buildTriggerContext(
  * Resolve-conflicts) carry a pull request instead, so their item is resolved
  * from the board here (issue #354) — through the PM contract and the PR's task
  * branch, never a provider-specific URL shape (ai/RULES.md §2). Costs one board
- * read per SCM dispatch; the gate calls it only while it is enabled.
+ * read per SCM dispatch; the gate calls it only while either work-item gate (the
+ * automation label, the required assignee) is enabled.
  *
  * **Fails open**: an unlinked PR, a branch outside the project's `branchPrefix`,
  * an unreadable board, and an unresolvable PM provider all return `undefined`,
@@ -4276,6 +4282,100 @@ async function resolveGatedWorkItem(
 		});
 		return undefined;
 	}
+}
+
+/**
+ * Settles a dispatch a work-item gate refused before anything ran (the
+ * automation label, issue #131; the required assignee, issue #1165).
+ *
+ * A deferred run being retried after the item fell out of eligibility must not
+ * sit in `deferred` forever, so it is finalized with the same honest reason, as
+ * the `no-trigger` branch does. And a skipped phase consumes nothing, so every
+ * handler-side claim this dispatch took before the gate is handed back: a later
+ * eligible attempt must not be treated as a duplicate, remain blocked by a ledger
+ * reservation, or spend a CI-fix attempt.
+ */
+async function skipIneligibleDispatch(
+	job: SwarmJob,
+	dispatch: DispatchRow,
+	project: ProjectConfig,
+	trigger: TriggerResult,
+	reason: string,
+): Promise<JobOutcome> {
+	if (job.runId) {
+		await finalizeRun(job.runId, { status: 'failed', error: reason });
+	}
+	if (trigger.phase === 'review' || trigger.phase === 'respond-to-ci') {
+		await releaseReviewDispatch(
+			buildReviewDispatchKey(project.repo, trigger.prNumber, trigger.headSha),
+		);
+	}
+	if (trigger.phase === 'review') {
+		await abandonReviewReservation(project, trigger.prNumber, trigger.headSha);
+	}
+	if (trigger.phase === 'resolve-conflicts') {
+		await releaseConflictResolution(
+			buildConflictResolutionKey(project.repo, trigger.prNumber, trigger.headSha, trigger.baseSha),
+		);
+	}
+	if (trigger.phase === 'respond-to-ci') {
+		await releaseRespondToCiAttempt(buildRespondToCiAttemptKey(project.repo, trigger.prNumber));
+	}
+	await tryCompleteDispatch(dispatch.id, 'skipped-not-eligible');
+	return {
+		status: 'skipped-not-eligible',
+		phase: trigger.phase,
+		taskId: trigger.taskId,
+		reason,
+	};
+}
+
+/**
+ * The reason `workItem` fails the project's `pipeline.requireAssignee`, or
+ * `undefined` when it passes (issue #1165). Logs the skip.
+ *
+ * **Fails open** when the requirement cannot be checked (an unresolvable
+ * provider, a failed identity-link read), matching the automation-label gate.
+ * That stays safe for the phases routed by assignment: Planning and
+ * Implementation re-resolve the assignee in the eligibility gate, where a read
+ * failure already becomes a token-free deferral.
+ */
+async function unmetAssigneeRequirement(
+	project: ProjectConfig,
+	trigger: TriggerResult,
+	workItem: WorkItem,
+): Promise<string | undefined> {
+	const logContext = {
+		projectId: project.id,
+		phase: trigger.phase,
+		taskId: trigger.taskId,
+		workItemId: workItem.id,
+	};
+	let pm: PMProvider;
+	let verdict: AssigneeRequirementVerdict;
+	try {
+		pm = requireProjectPMProvider(project);
+		verdict = await checkAssigneeRequirement(workItem, pm);
+	} catch (error) {
+		logger.warn('Assignee requirement could not be checked — dispatching anyway', {
+			...logContext,
+			error: describeError(error),
+		});
+		return undefined;
+	}
+	if (verdict.satisfied) return undefined;
+	// A provider that cannot model assignees makes the setting unsatisfiable for the
+	// whole project — a misconfiguration, so it is a warning rather than routine.
+	logger[verdict.cause === 'assignees-unsupported' ? 'warn' : 'info'](
+		'Phase skipped — work item has no assignee linked to a SWARM user',
+		{
+			...logContext,
+			cause: verdict.cause,
+			assignees: workItem.assignees.map((a) => a.handle),
+			pmProvider: pm.type,
+		},
+	);
+	return verdict.message;
 }
 
 function isLaunchOrAuthenticationFailure(error: string): boolean {
@@ -4778,6 +4878,9 @@ async function gateDispatch(
 				// its `type`, to resolve the identity link) — an unassigned item takes
 				// the unassigned path without one being constructed.
 				pm: workItem?.assignees.length ? requireProjectPMProvider(project) : undefined,
+				// Planning joins the affinity-gated phases when the project requires an
+				// assignee (issue #1165).
+				requireAssignee: resolveRequireAssignee(project.pipeline),
 				// The machine holding this continuation's preserved checkout, when there
 				// is one (issue #567) — the hardest narrowing the gate applies — and, when
 				// it lost its transport under this run, when the wait for it ends (#1141).
@@ -5425,11 +5528,13 @@ export async function processJob(
 	// ones carry their work item on the trigger, and the four SCM continuation phases
 	// resolve theirs from the pull request ({@link resolveGatedWorkItem}).
 	const automationLabel = resolveAutomationLabel(project.pipeline);
-	// Resolved only when the gate is on, so a project that opted out
-	// (`automationLabel: ""`) pays no board read on an SCM dispatch.
-	const gatedItem = automationLabel ? await resolveGatedWorkItem(project, trigger) : undefined;
+	const requireAssignee = resolveRequireAssignee(project.pipeline);
+	// Resolved only when a work-item gate is on, so a project that opted out of
+	// both (`automationLabel: ""`, no `requireAssignee`) pays no board read on an
+	// SCM dispatch.
+	const gatedItem =
+		automationLabel || requireAssignee ? await resolveGatedWorkItem(project, trigger) : undefined;
 	if (automationLabel && gatedItem && !hasAutomationLabel(gatedItem, automationLabel)) {
-		const reason = missingAutomationLabelMessage(automationLabel);
 		logger.info('Phase skipped — work item is missing the automation label', {
 			projectId: project.id,
 			phase: trigger.phase,
@@ -5437,44 +5542,21 @@ export async function processJob(
 			workItemId: gatedItem.id,
 			label: automationLabel,
 		});
-		// A deferred run being retried after the label was pulled must not sit in
-		// `deferred` forever — finalize it with the same honest reason, exactly as
-		// the `no-trigger` branch above does.
-		if (job.runId) {
-			await finalizeRun(job.runId, { status: 'failed', error: reason });
-		}
-		// Hand back every handler-side claim this dispatch took before the gate. A
-		// skipped phase consumes nothing, so a later correctly labelled attempt must
-		// not be treated as a duplicate, remain blocked by a ledger reservation, or
-		// spend a CI-fix attempt.
-		if (trigger.phase === 'review' || trigger.phase === 'respond-to-ci') {
-			await releaseReviewDispatch(
-				buildReviewDispatchKey(project.repo, trigger.prNumber, trigger.headSha),
-			);
-		}
-		if (trigger.phase === 'review') {
-			await abandonReviewReservation(project, trigger.prNumber, trigger.headSha);
-		}
-		if (trigger.phase === 'resolve-conflicts') {
-			await releaseConflictResolution(
-				buildConflictResolutionKey(
-					project.repo,
-					trigger.prNumber,
-					trigger.headSha,
-					trigger.baseSha,
-				),
-			);
-		}
-		if (trigger.phase === 'respond-to-ci') {
-			await releaseRespondToCiAttempt(buildRespondToCiAttemptKey(project.repo, trigger.prNumber));
-		}
-		await tryCompleteDispatch(dispatch.id, 'skipped-not-eligible');
-		return {
-			status: 'skipped-not-eligible',
-			phase: trigger.phase,
-			taskId: trigger.taskId,
-			reason,
-		};
+		return skipIneligibleDispatch(
+			job,
+			dispatch,
+			project,
+			trigger,
+			missingAutomationLabelMessage(automationLabel),
+		);
+	}
+	// Required assignee (issue #1165): with `pipeline.requireAssignee` on, an item
+	// with no assignee linked to a SWARM user is skipped at every phase, so it never
+	// takes ADR-001's unassigned path onto somebody else's worker. Checked after the
+	// label, which is the opt-in, so an unlabelled item reports that reason first.
+	if (requireAssignee && gatedItem) {
+		const reason = await unmetAssigneeRequirement(project, trigger, gatedItem);
+		if (reason) return skipIneligibleDispatch(job, dispatch, project, trigger, reason);
 	}
 
 	// Nothing may be dispatched into a task another phase is executing against: the
