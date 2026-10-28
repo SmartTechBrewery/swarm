@@ -30,6 +30,7 @@ import {
 	listActiveMergeDispatchesForRepository,
 	listAvailabilityWaitsForWorker,
 	listDeferredRunsWithoutActiveDispatch,
+	listMergeChecksWaits,
 	listMergeQueueWaits,
 	listPullRequestInFlightWaits,
 	listRunnableDispatchesForPool,
@@ -677,6 +678,65 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 
 			const promoted = await promoteDispatchToImmediateWake(waiting.id, waiting.wakeSeq);
 			expect(promoted?.wakeSeq).toBe(waiting.wakeSeq + 1);
+		});
+
+		// Issue #1173: what a green aggregate for a head wakes.
+		it('lists only the delayed recheck merge waits pinned to the head', async () => {
+			const later = new Date(Date.now() + 60_000);
+			const wanted = await seedMerge('1', {
+				state: 'retry-scheduled',
+				waitReason: 'recheck',
+				availableAt: later,
+			});
+			await seedMerge('2', {
+				state: 'retry-scheduled',
+				waitReason: 'recheck',
+				availableAt: later,
+				jobPayload: {
+					type: 'merge-automation',
+					projectId: PROJECT_ID,
+					reviewRunId: 'run-2',
+					repo: REPO,
+					prNumber: '2',
+					approvedHeadSha: 'another-head',
+				},
+			});
+			await seedMerge('3', {
+				state: 'retry-scheduled',
+				waitReason: 'merge-queue',
+				availableAt: later,
+			});
+			await seedMerge('4', {
+				state: 'retry-scheduled',
+				waitReason: 'recheck',
+				availableAt: new Date(Date.now() - 1_000),
+			});
+			await seedMerge('5');
+			await seedMerge('6', { state: 'leased', leaseOwner: OWNER });
+			await seedMerge(
+				'7',
+				{ state: 'retry-scheduled', waitReason: 'recheck', availableAt: later },
+				'jkwiecien/second-repo',
+			);
+
+			const waits = await listMergeChecksWaits(PROJECT_ID, REPO, 'deadbeef');
+			expect(waits.map((row) => row.id)).toEqual([wanted.id]);
+		});
+
+		it('promotes a recheck merge wait without touching its attempt or payload', async () => {
+			const waiting = await seedMerge('1', {
+				state: 'retry-scheduled',
+				waitReason: 'recheck',
+				attempt: 2,
+				availableAt: new Date(Date.now() + 60_000),
+			});
+
+			const promoted = await promoteDispatchToImmediateWake(waiting.id, waiting.wakeSeq);
+
+			expect(promoted?.wakeSeq).toBe(waiting.wakeSeq + 1);
+			expect(promoted?.availableAt.getTime()).toBeLessThanOrEqual(Date.now());
+			expect(promoted?.attempt).toBe(2);
+			expect(promoted?.jobPayload).toEqual(waiting.jobPayload);
 		});
 
 		// Issue #1117: the hand-back of a worker-side branch update.

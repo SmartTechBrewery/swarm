@@ -23,6 +23,7 @@ import {
 	findWakeableWorkerUpdateDispatch,
 	getActiveDispatchByRunId,
 	listAvailabilityWaitsForWorker,
+	listMergeChecksWaits,
 	listMergeQueueWaits,
 	listPullRequestInFlightWaits,
 	listTaskInFlightWaits,
@@ -364,6 +365,89 @@ export async function promoteMergeQueueWaits(
 			error: describeError(err),
 		});
 		return false;
+	}
+}
+
+/**
+ * Make one `retry-scheduled` dispatch due now in place of its delayed wake-up
+ * (issue #1173). Returns the re-dated row, or `null` when it moved on (claimed by
+ * its own timer, cancelled, or re-deferred) between the read and the re-date.
+ *
+ * Order: **re-date → publish → remove the delayed wake-up** — deliberately not
+ * {@link promoteAvailabilityWaitsForWorker}'s remove-first order. A publish that
+ * throws here leaves the delayed wake-up live, so the dispatch keeps its existing
+ * timer (`claimDispatch` does not check the wake sequence, so that wake-up still
+ * claims it), and the reconciler republishes the re-dated row on its next pass.
+ * The removal is best-effort: a surviving delayed wake-up can at worst re-check
+ * the dispatch once early, never run it twice at once, because the claim is
+ * conditional on a waiting state.
+ */
+async function wakeDelayedDispatchNow(dispatch: DispatchRow): Promise<DispatchRow | null> {
+	const updated = await promoteDispatchToImmediateWake(dispatch.id, dispatch.wakeSeq);
+	if (!updated) return null;
+	await publishDispatchWakeUp(updated);
+	// The old job id is the *original* row's wake sequence, not the re-dated one.
+	await removePendingJobById(wakeJobId(dispatch)).catch((err) => {
+		logger.warn('dispatch: could not remove the delayed wake-up an early wake replaced', {
+			dispatchId: dispatch.id,
+			error: describeError(err),
+		});
+		return false;
+	});
+	return updated;
+}
+
+/**
+ * After a head's checks complete green, wake the merge dispatch waiting on them
+ * (issue #1173) — the CI twin of {@link promoteMergeQueueWaits}. A merge holder
+ * waiting on its approved head's checks, or on the head a base update produced,
+ * used to learn that they passed only on its next doubling-backoff slot, while
+ * every pull request behind it in the queue waited too.
+ *
+ * Every listed waiter is woken (realistically one). Waking spends nothing extra:
+ * the woken attempt is the one its timer would have spent, and it re-reads the
+ * approval and the checks before merging, so a head that reads red again is still
+ * refused. Best-effort and fully swallowed — it runs inside trigger evaluation,
+ * which a datastore hiccup must not fail, and the dispatch's own backoff is the
+ * fallback. Returns how many were woken.
+ */
+export async function promoteMergeChecksWaits(
+	projectId: string,
+	repository: string,
+	headSha: string,
+): Promise<number> {
+	try {
+		const waiting = await listMergeChecksWaits(projectId, repository, headSha);
+		const woken: DispatchRow[] = [];
+		for (const dispatch of waiting) {
+			try {
+				const updated = await wakeDelayedDispatchNow(dispatch);
+				if (updated) woken.push(updated);
+			} catch (err) {
+				logger.warn(
+					"dispatch: could not wake a merge waiting on its head's checks — its delayed wake-up is left in place",
+					{ projectId, repository, headSha, dispatchId: dispatch.id, error: describeError(err) },
+				);
+			}
+		}
+		if (woken.length > 0) {
+			logger.info('dispatch: head checks completed green — woke the merge waiting on them', {
+				projectId,
+				repository,
+				headSha,
+				dispatchIds: woken.map((row) => row.id),
+				runIds: woken.map((row) => row.runId),
+			});
+		}
+		return woken.length;
+	} catch (err) {
+		logger.warn('dispatch: merge-checks promotion failed', {
+			projectId,
+			repository,
+			headSha,
+			error: describeError(err),
+		});
+		return 0;
 	}
 }
 
