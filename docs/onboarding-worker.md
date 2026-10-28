@@ -525,8 +525,9 @@ none and a new worker refuses to run:
 
 Only after step 3 may an operator delete `SWARM_OPERATOR_GH_TOKEN` from a worker's
 `.env` — it is inert there from that point on. (The **router**'s own
-`SWARM_OPERATOR_GH_TOKEN` stays: three control-plane call sites still read it, see
-[`docs/configuration.md`](./configuration.md).)
+`SWARM_OPERATOR_GH_TOKEN` stays: operations the router originates itself still read
+it, see [`docs/configuration.md`](./configuration.md). A Respond-to-review reply is
+not one of them — since issue #1152 it is posted with the worker's stored credential.)
 
 Make sure every CLI declared in `--cli` back in Part 1 is actually installed
 and authenticated on this machine (e.g. `claude` logged in), then:

@@ -227,6 +227,7 @@ function deliveryDeps(
 		// The production default: the in-process registry the reap writes.
 		isDispatchOrphaned: isDispatchOrphanedFrom,
 		buildScmDelivery: vi.fn(),
+		buildOperatorScmDelivery: vi.fn(),
 		buildPmProvider: vi.fn(() => board as unknown as PMProvider),
 		reviewLedger: {
 			getPriorSubmittedReview: vi.fn(),
