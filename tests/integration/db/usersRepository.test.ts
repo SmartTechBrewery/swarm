@@ -11,6 +11,7 @@ import {
 	hasAnyUser,
 	LOCAL_ADMIN_IDENTIFIER,
 	listUsers,
+	revokeInstanceAdminUnlessLast,
 	setDisplayName,
 	setInstanceAdmin,
 	setPasswordHash,
@@ -219,6 +220,60 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('usersRepository (integrat
 
 			expect(results.filter((r) => r !== undefined)).toHaveLength(1);
 			expect(await listUsers()).toHaveLength(1);
+		});
+	});
+
+	describe('revokeInstanceAdminUnlessLast', () => {
+		const admin = (identifier: string) =>
+			createUser({ identifier, displayName: identifier, instanceAdmin: true });
+
+		it('refuses the sole admin and leaves the flag set', async () => {
+			const only = await admin('ada@example.com');
+
+			expect(await revokeInstanceAdminUnlessLast(only.id)).toEqual({ outcome: 'last-admin' });
+			expect((await getUserById(only.id))?.instanceAdmin).toBe(true);
+		});
+
+		it('revokes one of two admins', async () => {
+			const ada = await admin('ada@example.com');
+			await admin('grace@example.com');
+
+			const result = await revokeInstanceAdminUnlessLast(ada.id);
+
+			expect(result).toMatchObject({
+				outcome: 'revoked',
+				user: { id: ada.id, instanceAdmin: false },
+			});
+			expect((await getUserById(ada.id))?.instanceAdmin).toBe(false);
+		});
+
+		it('leaves exactly one admin when the only two revoke each other at once', async () => {
+			const ada = await admin('ada@example.com');
+			const grace = await admin('grace@example.com');
+
+			const results = await Promise.all([
+				revokeInstanceAdminUnlessLast(ada.id),
+				revokeInstanceAdminUnlessLast(grace.id),
+			]);
+
+			expect(results.map((r) => r.outcome).sort()).toEqual(['last-admin', 'revoked']);
+			expect((await listUsers()).filter((u) => u.instanceAdmin)).toHaveLength(1);
+		});
+
+		it('treats a non-admin target as revoked without changing it', async () => {
+			await admin('ada@example.com');
+			const member = await createUser({ identifier: 'bob@example.com', displayName: 'Bob' });
+
+			expect(await revokeInstanceAdminUnlessLast(member.id)).toEqual({
+				outcome: 'revoked',
+				user: member,
+			});
+		});
+
+		it('reports an unknown id as not-found', async () => {
+			expect(await revokeInstanceAdminUnlessLast('00000000-0000-4000-8000-000000000000')).toEqual({
+				outcome: 'not-found',
+			});
 		});
 	});
 });

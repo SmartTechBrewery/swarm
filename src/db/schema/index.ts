@@ -9,6 +9,7 @@ export { reviewVerdicts } from './reviewVerdicts.js';
 export { runLogs, runOutputEvents, runs } from './runs.js';
 export { stalledDismissals } from './stalledDismissals.js';
 export { userIdentities } from './userIdentities.js';
+export { userPasswordTokens } from './userPasswordTokens.js';
 export { userSessions } from './userSessions.js';
 export { users } from './users.js';
 export { workerCliRateLimits } from './workerCliRateLimits.js';

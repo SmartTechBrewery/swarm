@@ -11,11 +11,13 @@
  * CLI) translates it to a friendly message.
  *
  * Rows are created by `createUser` (the CLI), `ensureLocalAdminUser` (the
- * single-user bootstrap), and `createFirstInstanceAdmin` (the first-run setup
- * link, issue #1150 — `src/identity/first-run-setup.ts`).
+ * single-user bootstrap), `createFirstInstanceAdmin` (the first-run setup link,
+ * issue #1150 — `src/identity/first-run-setup.ts`), and
+ * `createUserWithPasswordToken` (the admin `users` router, issue #1151 —
+ * `userPasswordTokensRepository.ts`).
  */
 
-import { asc, eq, sql } from 'drizzle-orm';
+import { and, asc, eq, ne, sql } from 'drizzle-orm';
 
 import type { SwarmUser } from '../../identity/schema.js';
 import { getDb } from '../client.js';
@@ -42,7 +44,7 @@ export interface CreateUserInput {
 }
 
 /** Re-assemble a `SwarmUser` from a persisted `users` row. */
-function rowToSwarmUser(row: UserRow): SwarmUser {
+export function rowToSwarmUser(row: UserRow): SwarmUser {
 	return {
 		id: row.id,
 		identifier: row.identifier,
@@ -179,6 +181,48 @@ export async function setInstanceAdmin(id: string, value: boolean): Promise<Swar
 		.where(eq(users.id, id))
 		.returning();
 	return row ? rowToSwarmUser(row) : undefined;
+}
+
+/** The outcomes of {@link revokeInstanceAdminUnlessLast}. */
+export type RevokeInstanceAdminResult =
+	| { outcome: 'revoked'; user: SwarmUser }
+	| { outcome: 'not-found' }
+	| { outcome: 'last-admin' };
+
+/**
+ * Revoke a user's installation-admin flag unless they are the last admin (issue
+ * #1151, the dashboard `users` router). Revoking a user who is not an admin is
+ * an idempotent `revoked` with the row unchanged.
+ *
+ * The guard runs under the same `SHARE ROW EXCLUSIVE` lock as
+ * {@link createFirstInstanceAdmin}, which conflicts with itself and with the
+ * `ROW EXCLUSIVE` lock every write takes. Without it, two admins revoking each
+ * other at once would each count the other as still an admin and both commit,
+ * leaving the installation with none.
+ */
+export async function revokeInstanceAdminUnlessLast(
+	id: string,
+): Promise<RevokeInstanceAdminResult> {
+	return getDb().transaction(async (tx) => {
+		await tx.execute(sql`LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE`);
+		const [target] = await tx.select().from(users).where(eq(users.id, id)).limit(1);
+		if (!target) return { outcome: 'not-found' };
+		if (!target.instanceAdmin) return { outcome: 'revoked', user: rowToSwarmUser(target) };
+
+		const others = await tx
+			.select({ id: users.id })
+			.from(users)
+			.where(and(eq(users.instanceAdmin, true), ne(users.id, id)))
+			.limit(1);
+		if (others.length === 0) return { outcome: 'last-admin' };
+
+		const [row] = await tx
+			.update(users)
+			.set({ instanceAdmin: false })
+			.where(eq(users.id, id))
+			.returning();
+		return { outcome: 'revoked', user: rowToSwarmUser(row) };
+	});
 }
 
 /**

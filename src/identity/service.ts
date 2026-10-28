@@ -7,8 +7,9 @@
  *
  * Reads, the installation-role predicate, and the one **self-service** write a
  * user may make about themselves: their own display name (issue #662). User
- * *creation* and the admin-flag mutations stay operator actions, exposed through
- * the `swarm users` CLI over `usersRepository.ts` — this service never widens to
+ * *creation* and the admin-flag mutations stay administrator actions, exposed
+ * through the `swarm users` CLI and the admin-only `users` router
+ * (`src/api/routers/users.ts`, issue #1151) — this service never widens to
  * administering someone else's account.
  */
 

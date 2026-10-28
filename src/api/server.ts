@@ -2,7 +2,9 @@
  * API server entry point — a self-hosted single-process Hono app
  * (ai/ARCHITECTURE.md). Exposes /health, the /auth/login + /auth/logout session
  * endpoints, /auth/setup (which redeems the first-run setup link, issue #1150 —
- * `src/identity/first-run-setup.ts`), mounts tRPC at /trpc, and (in a same-origin deploy) serves the
+ * `src/identity/first-run-setup.ts`), /auth/set-password (which redeems an
+ * admin-issued password link, issue #1151 — `src/identity/password-link.ts`),
+ * mounts tRPC at /trpc, and (in a same-origin deploy) serves the
  * built dashboard SPA from `dashboard/dist`. Unlike Cascade's split cloud
  * deployment (separate API + Cloudflare Pages frontend), SWARM runs one process
  * for its local-first scope.
@@ -35,6 +37,7 @@ import {
 	verifyCredentials,
 } from '../identity/auth.js';
 import { announceFirstRunSetup, completeFirstRunSetup } from '../identity/first-run-setup.js';
+import { redeemPasswordLink } from '../identity/password-link.js';
 import { getUser } from '../identity/service.js';
 import { buildCorsMiddleware } from '../lib/cors.js';
 import { isSingleUserMode, resolveWebhookCallbackBaseUrl } from '../lib/env.js';
@@ -54,6 +57,11 @@ const LoginInputSchema = z.object({
 const SetupInputSchema = z.object({
 	token: z.string().min(1),
 	identifier: z.string().trim().email(),
+	password: z.string().min(1),
+});
+
+const SetPasswordInputSchema = z.object({
+	token: z.string().min(1),
 	password: z.string().min(1),
 });
 
@@ -181,6 +189,40 @@ export function createApiApp(
 			return c.json(
 				{ error: 'Conflict', reason: 'This installation already has a user. Sign in instead.' },
 				409,
+			);
+		}
+
+		const session = await createSession(result.user.id);
+		setCookie(c, SESSION_COOKIE_NAME, session.token, {
+			...sessionCookieOptions(c),
+			expires: session.expiresAt,
+		});
+		return c.json({ user: result.user });
+	});
+
+	// Password link (issue #1151): redeem a link an installation admin issued from
+	// the `users` router. Redemption sets the password and revokes every session
+	// the user had; the redeemer is then signed in afresh, exactly as setup does.
+	app.post('/auth/set-password', async (c) => {
+		let body: unknown;
+		try {
+			body = await c.req.json();
+		} catch {
+			return c.json({ error: 'Bad Request', reason: 'Expected a JSON body' }, 400);
+		}
+		const parsed = SetPasswordInputSchema.safeParse(body);
+		if (!parsed.success) {
+			return c.json(
+				{ error: 'Bad Request', reason: 'A password link token and a password are required' },
+				400,
+			);
+		}
+
+		const result = await redeemPasswordLink(parsed.data);
+		if (result.outcome === 'invalid-link') {
+			return c.json(
+				{ error: 'Forbidden', reason: 'This password link is invalid, expired, or already used.' },
+				403,
 			);
 		}
 

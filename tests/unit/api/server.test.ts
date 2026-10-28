@@ -24,6 +24,10 @@ vi.mock('@/identity/first-run-setup.js', () => ({
 	completeFirstRunSetup: vi.fn(),
 }));
 
+vi.mock('@/identity/password-link.js', () => ({
+	redeemPasswordLink: vi.fn(),
+}));
+
 vi.mock('@/identity/membership-service.js', () => ({
 	getMembership: vi.fn(),
 	listAccessibleProjectIds: vi.fn(),
@@ -49,6 +53,7 @@ import {
 } from '@/identity/auth.js';
 import { completeFirstRunSetup } from '@/identity/first-run-setup.js';
 import { listAccessibleProjectIds } from '@/identity/membership-service.js';
+import { redeemPasswordLink } from '@/identity/password-link.js';
 import type { SwarmUser } from '@/identity/schema.js';
 import { getUser } from '@/identity/service.js';
 
@@ -79,6 +84,7 @@ describe('swarm-api', () => {
 		vi.mocked(listAccessibleProjectIds).mockReset();
 		vi.mocked(getUser).mockReset();
 		vi.mocked(completeFirstRunSetup).mockReset();
+		vi.mocked(redeemPasswordLink).mockReset();
 	});
 
 	describe('public routes', () => {
@@ -410,6 +416,62 @@ describe('swarm-api', () => {
 
 			expect(res.status).toBe(400);
 			expect(completeFirstRunSetup).not.toHaveBeenCalled();
+		});
+	});
+
+	describe('POST /auth/set-password', () => {
+		const LINK_TOKEN = 'single-use-password-link-token';
+		const post = (body: string) =>
+			createApiApp().request('http://example.com/auth/set-password', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body,
+			});
+		const validBody = JSON.stringify({ token: LINK_TOKEN, password: 'hunter2' });
+
+		it('sets the password, signs the user in, and never echoes either token', async () => {
+			vi.mocked(redeemPasswordLink).mockResolvedValue({ outcome: 'set', user });
+			vi.mocked(createSession).mockResolvedValue({
+				token: RAW_TOKEN,
+				expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+			});
+
+			const res = await post(validBody);
+
+			expect(res.status).toBe(200);
+			expect(redeemPasswordLink).toHaveBeenCalledWith({ token: LINK_TOKEN, password: 'hunter2' });
+			expect(createSession).toHaveBeenCalledWith(user.id);
+			const text = await res.text();
+			expect(JSON.parse(text)).toEqual({ user: JSON.parse(JSON.stringify(user)) });
+			expect(text).not.toContain(LINK_TOKEN);
+			expect(text).not.toContain(RAW_TOKEN);
+
+			const setCookie = res.headers.get('set-cookie') ?? '';
+			expect(setCookie).toContain(`${SESSION_COOKIE_NAME}=${RAW_TOKEN}`);
+			expect(setCookie).toMatch(/HttpOnly/i);
+			expect(setCookie).toMatch(/SameSite=Strict/i);
+		});
+
+		it('returns 403 with no cookie for an invalid, expired, or used link', async () => {
+			vi.mocked(redeemPasswordLink).mockResolvedValue({ outcome: 'invalid-link' });
+
+			const res = await post(validBody);
+
+			expect(res.status).toBe(403);
+			expect(res.headers.get('set-cookie')).toBeNull();
+			expect(createSession).not.toHaveBeenCalled();
+		});
+
+		it.each([
+			['a non-JSON body', 'not json'],
+			['a missing password', JSON.stringify({ token: LINK_TOKEN })],
+			['an empty password', JSON.stringify({ token: LINK_TOKEN, password: '' })],
+			['a missing token', JSON.stringify({ password: 'hunter2' })],
+		])('returns 400 for %s without spending the link', async (_label, body) => {
+			const res = await post(body);
+
+			expect(res.status).toBe(400);
+			expect(redeemPasswordLink).not.toHaveBeenCalled();
 		});
 	});
 

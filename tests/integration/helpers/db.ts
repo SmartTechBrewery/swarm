@@ -75,7 +75,7 @@ export async function runMigrations(): Promise<void> {
  * CASCADE handles the FKs (project_credentials + runs + project_members +
  * project_membership_requests from projects, run_logs from runs, worker_sessions
  * from runs + workers, worker_scm_credentials + cli_quotas from workers, user_sessions +
- * user_identities + project_members + project_membership_requests + workers from
+ * user_password_tokens + user_identities + project_members + project_membership_requests + workers from
  * users, stalled_dismissals from projects *and* users); every table is listed for
  * explicitness. `app_settings` (a standalone singleton), `instance_scm_credentials`
  * (keyed on `(provider, role)` alone, with no project or worker to cascade from) and
@@ -102,6 +102,7 @@ export async function truncateAll(): Promise<void> {
 			cli_quotas,
 			user_identities,
 			user_sessions,
+			user_password_tokens,
 			workers,
 			users
 		CASCADE

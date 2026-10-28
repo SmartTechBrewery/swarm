@@ -8,6 +8,7 @@ import { quotaRouter } from './routers/quota.js';
 import { runsRouter } from './routers/runs.js';
 import { scmRouter } from './routers/scm.js';
 import { settingsRouter } from './routers/settings.js';
+import { usersRouter } from './routers/users.js';
 import { workersRouter } from './routers/workers.js';
 import { router } from './trpc.js';
 
@@ -21,6 +22,7 @@ export const appRouter = router({
 	scm: scmRouter,
 	settings: settingsRouter,
 	quota: quotaRouter,
+	users: usersRouter,
 	workers: workersRouter,
 });
 
