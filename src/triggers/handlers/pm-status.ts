@@ -20,6 +20,11 @@
  * the phase is resolved from the item's canonical `statusKey` — never from a board
  * option id (ai/RULES.md §2).
  *
+ * A card re-read in the canonical `done` status starts no phase, but it does wake
+ * the project's dependency waits (issue #1173): a blocker finishing — moved by a
+ * human, by GitHub Projects' "item closed → Done" workflow, or closed on Jira or
+ * Linear — is how a dependent learns it may start before its re-check timer.
+ *
  * Loop prevention (a persona's own board moves must not re-fire the trigger)
  * already happened router-side (`PMRouterAdapter.isSelfAuthored`), so it isn't
  * repeated here.
@@ -27,6 +32,7 @@
 
 import type { ProjectConfig } from '../../config/schema.js';
 import { retireSupersededBoardPhases } from '../../dispatch/board-phase-retirement.js';
+import { promoteDependencyWaits } from '../../dispatch/dispatcher.js';
 import { requireProjectPMAdapter } from '../../integrations/pm/registry.js';
 import { logger } from '../../lib/logger.js';
 import { hasPlannedLabel, PLANNED_LABEL } from '../../pipeline/preplan.js';
@@ -174,6 +180,24 @@ async function applyColumnToQueue(
 }
 
 /**
+ * Wake the project's dependency waits when this card has just entered `done`
+ * (issue #1173) — a blocker finishing, observed on the board. Project-wide and
+ * keyed on no task id, because a blocker can be a card in another of the project's
+ * repositories or one with no SCM artifact at all; the dependency gate re-reads the
+ * blockers, so a dependent still blocked by something else simply re-defers. A
+ * resumed phase and an unchanged status are not a card arriving in `done`. The
+ * promotion fails open, so nothing here can fail the board event.
+ */
+async function wakeDependentsOfDoneItem(
+	ctx: PmTriggerContext,
+	workItem: WorkItem,
+	statusChanged: boolean,
+): Promise<void> {
+	if (ctx.resumePmPhase || !statusChanged || workItem.statusKey !== 'done') return;
+	await promoteDependencyWaits(ctx.project.id, 'board-done');
+}
+
+/**
  * Build the PM status-change trigger handler.
  *
  * `matches` is a cheap synchronous shape gate (is this a state change on this
@@ -233,6 +257,8 @@ export function createPmStatusTrigger(): TriggerHandler {
 			// whose card already carries `planned` — retire by the same rule rather
 			// than needing one of their own.
 			await applyColumnToQueue(ctx, workItem, taskId, statusChanged, phase);
+			// `done` starts no phase, so this runs before the phase gate below.
+			await wakeDependentsOfDoneItem(ctx, workItem, statusChanged);
 
 			if (!phase) {
 				// A valid board status that simply doesn't start a phase (backlog, todo,
