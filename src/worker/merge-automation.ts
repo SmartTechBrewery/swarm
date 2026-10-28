@@ -117,7 +117,11 @@
  * `src/dispatch/absorbed-child-settle.ts` owns the decision and every guard on
  * it; this module only tells it a merge happened, plus the one source-control
  * fact those guards need and cannot read for themselves: the task the pull
- * request was written for, decoded from its head branch.
+ * request was written for, decoded from its head branch. A merge also wakes the
+ * project's dependency waits (issue #1173, `promoteDependencyWaits`), after the
+ * absorbed siblings are closed so they count as done too. A woken dependent that
+ * reaches the gate before the forge has closed the linked issue simply
+ * re-defers, and the card's move to done wakes it again.
  */
 
 import type { ProjectConfig } from '../config/schema.js';
@@ -149,6 +153,7 @@ import { hasCiNoFixRecovery } from '../dispatch/ci-no-fix-recovery.js';
 import { classifyDispatchClaim } from '../dispatch/claim-liveness.js';
 import {
 	createAndPublishDispatch,
+	promoteDependencyWaits,
 	promoteMergeQueueWaits,
 	publishDispatchWakeUp,
 } from '../dispatch/dispatcher.js';
@@ -2032,6 +2037,7 @@ export async function processMergeAutomationDispatch(
 		});
 		await settleMergeDispatch(dispatch, job, project, 'merged');
 		await settleChildrenThisMergeAbsorbed(dispatch, job, project, capabilities);
+		await promoteDependencyWaits(project.id, 'merged');
 		return { status: 'merge-automation-settled', result: 'merged', prNumber: job.prNumber };
 	}
 

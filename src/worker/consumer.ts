@@ -471,7 +471,9 @@ const MAX_CAPACITY_RETRIES = 2;
  * token-free deferral (the gate runs before any worktree/agent) — for up to
  * {@link MAX_DEPENDENCY_RECHECKS} attempts, then settles failed with an actionable
  * "must be done first" message rather than waiting forever. Both derived from env
- * (`SWARM_DEPENDENCY_RECHECK_MS` / `SWARM_DEPENDENCY_MAX_WAIT_MS`).
+ * (`SWARM_DEPENDENCY_RECHECK_MS` / `SWARM_DEPENDENCY_MAX_WAIT_MS`). Since issue
+ * #1173 the interval is the fallback: a blocker in the project becoming done wakes
+ * the dependency waits at once (`promoteDependencyWaits`), spending no extra attempt.
  */
 const DEPENDENCY_RECHECK_INTERVAL_MS = resolveDependencyRecheckIntervalMs();
 const MAX_DEPENDENCY_RECHECKS = maxDependencyRechecks(

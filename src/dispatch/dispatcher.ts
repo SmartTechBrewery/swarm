@@ -23,6 +23,7 @@ import {
 	findWakeableWorkerUpdateDispatch,
 	getActiveDispatchByRunId,
 	listAvailabilityWaitsForWorker,
+	listDependencyWaits,
 	listMergeChecksWaits,
 	listMergeQueueWaits,
 	listPullRequestInFlightWaits,
@@ -445,6 +446,64 @@ export async function promoteMergeChecksWaits(
 			projectId,
 			repository,
 			headSha,
+			error: describeError(err),
+		});
+		return 0;
+	}
+}
+
+/** What made a blocker done, for the dependency promotion's log line (issue #1173). */
+export type DependencyWakeCause =
+	/** Merge automation merged a pull request. */
+	| 'merged'
+	/** The `pm-status-changed` trigger re-read a board card in `done`. */
+	| 'board-done';
+
+/**
+ * After a work item in this project becomes done, wake every dispatch waiting on
+ * the dependency gate (issue #1173) — the early-wake twin of the dependency
+ * re-check timer (`SWARM_DEPENDENCY_RECHECK_MS`), which used to be the only way a
+ * dependent learned its blocker had finished.
+ *
+ * Project-wide on purpose: the gate is token-free and re-reads the blockers, so a
+ * woken dependent that is still blocked simply re-defers on its normal cadence.
+ * Waking spends nothing extra — the woken attempt is the one its timer would have
+ * spent. Best-effort and fully swallowed — it runs off a settled merge and inside
+ * trigger evaluation, neither of which a datastore hiccup may fail, and the timer
+ * stays as the fallback. Returns how many were woken.
+ */
+export async function promoteDependencyWaits(
+	projectId: string,
+	cause: DependencyWakeCause,
+): Promise<number> {
+	try {
+		const waiting = await listDependencyWaits(projectId);
+		const woken: DispatchRow[] = [];
+		for (const dispatch of waiting) {
+			try {
+				const updated = await wakeDelayedDispatchNow(dispatch);
+				if (updated) woken.push(updated);
+			} catch (err) {
+				logger.warn(
+					'dispatch: could not wake a dependency-waiting dispatch — its delayed wake-up is left in place',
+					{ projectId, cause, dispatchId: dispatch.id, error: describeError(err) },
+				);
+			}
+		}
+		if (woken.length > 0) {
+			logger.info('dispatch: a blocker is done — woke the dependency-waiting dispatches', {
+				projectId,
+				cause,
+				promoted: woken.length,
+				taskIds: woken.map((row) => row.taskId),
+				phases: woken.map((row) => row.phase),
+			});
+		}
+		return woken.length;
+	} catch (err) {
+		logger.warn('dispatch: dependency-wait promotion failed', {
+			projectId,
+			cause,
 			error: describeError(err),
 		});
 		return 0;

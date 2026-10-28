@@ -30,6 +30,7 @@ import {
 	listActiveMergeDispatchesForRepository,
 	listAvailabilityWaitsForWorker,
 	listDeferredRunsWithoutActiveDispatch,
+	listDependencyWaits,
 	listMergeChecksWaits,
 	listMergeQueueWaits,
 	listPullRequestInFlightWaits,
@@ -878,6 +879,50 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 
 			const waits = await listTaskInFlightWaits(PROJECT_ID, TASK);
 			expect(waits.map((row) => row.id)).toEqual([wanted.id]);
+		});
+	});
+
+	describe('listDependencyWaits (issue #1173)', () => {
+		const later = () => new Date(Date.now() + 300_000);
+
+		async function seedWait(overrides: Partial<Parameters<typeof createDispatch>[0]> = {}) {
+			const { dispatch } = await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: job({ dependencyRecheckAttempt: 4 }),
+				source: 'webhook',
+				taskId: '901',
+				phase: 'implementation',
+				state: 'retry-scheduled',
+				waitReason: 'dependency',
+				availableAt: later(),
+				...overrides,
+			});
+			return dispatch;
+		}
+
+		it("lists only the project's dependency waits still holding a delayed wake-up", async () => {
+			const wanted = await seedWait();
+			await seedWait({ waitReason: 'recheck' });
+			await seedWait({ availableAt: new Date(Date.now() - 1_000) });
+			await seedWait({ state: 'pending' });
+			await seedProject({ id: 'proj-other', repo: 'jkwiecien/other' });
+			await seedWait({ projectId: 'proj-other', jobPayload: job({ projectId: 'proj-other' }) });
+
+			const waits = await listDependencyWaits(PROJECT_ID);
+			expect(waits.map((row) => row.id)).toEqual([wanted.id]);
+		});
+
+		// Waking spends only the one re-check it triggers.
+		it('promotes a dependency wait without touching its attempt or its re-check count', async () => {
+			const waiting = await seedWait({ attempt: 2 });
+
+			const promoted = await promoteDispatchToImmediateWake(waiting.id, waiting.wakeSeq);
+
+			expect(promoted?.wakeSeq).toBe(waiting.wakeSeq + 1);
+			expect(promoted?.availableAt.getTime()).toBeLessThanOrEqual(Date.now());
+			expect(promoted?.attempt).toBe(2);
+			expect(promoted?.jobPayload).toEqual(waiting.jobPayload);
+			expect((promoted?.jobPayload as SwarmJob).dependencyRecheckAttempt).toBe(4);
 		});
 	});
 

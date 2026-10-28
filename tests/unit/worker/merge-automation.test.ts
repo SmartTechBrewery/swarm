@@ -86,6 +86,7 @@ const createAndPublishDispatch = vi.fn(async (_input: unknown) => ({
 }));
 const publishDispatchWakeUp = vi.fn(async (_dispatch: unknown) => {});
 const promoteMergeQueueWaits = vi.fn(async (_projectId: string, _repo: string) => false);
+const promoteDependencyWaits = vi.fn(async (_projectId: string, _cause: string) => 0);
 vi.mock('@/dispatch/dispatcher.js', () => ({
 	// The `no-fix` recovery's dedup key a red approved head's adjudication is read
 	// under (issue #1128); `findDispatchByDedupKey` answers "none" by default.
@@ -94,6 +95,8 @@ vi.mock('@/dispatch/dispatcher.js', () => ({
 	publishDispatchWakeUp: (dispatch: unknown) => publishDispatchWakeUp(dispatch),
 	promoteMergeQueueWaits: (projectId: string, repo: string) =>
 		promoteMergeQueueWaits(projectId, repo),
+	promoteDependencyWaits: (projectId: string, cause: string) =>
+		promoteDependencyWaits(projectId, cause),
 }));
 
 // The review-dispatch dedup is Redis-backed; the updated head's claim (issue
@@ -251,6 +254,7 @@ beforeEach(() => {
 	listActiveMergeDispatchesForRepository.mockReset();
 	listActiveMergeDispatchesForRepository.mockResolvedValue([]);
 	promoteMergeQueueWaits.mockClear();
+	promoteDependencyWaits.mockClear();
 	updateReviewMergeOutcome.mockClear();
 	updateReviewMergeOutcome.mockResolvedValue(true);
 	createAndPublishDispatch.mockClear();
@@ -1960,6 +1964,21 @@ describe('processMergeAutomationDispatch: settling what the merge absorbed', () 
 		});
 
 		expect(settleAbsorbedChildren).not.toHaveBeenCalled();
+		expect(promoteDependencyWaits).not.toHaveBeenCalled();
+	});
+
+	// Issue #1173: the merge is a blocker becoming done, so it wakes the project's
+	// dependency waits — after the absorbed siblings are closed, so they count too.
+	it("wakes the project's dependency waits once, after settling the absorbed siblings", async () => {
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning({ status: 'merged', message: 'merged', sha: 'abc' }),
+			getPullRequest: prOnBranch(`${project.branchPrefix}12`),
+		});
+
+		expect(promoteDependencyWaits).toHaveBeenCalledExactlyOnceWith(project.id, 'merged');
+		expect(promoteDependencyWaits.mock.invocationCallOrder[0]).toBeGreaterThan(
+			settleAbsorbedChildren.mock.invocationCallOrder[0] as number,
+		);
 	});
 
 	// Fail closed on the guard's input: the settle is told it has none rather than
@@ -2311,6 +2330,7 @@ describe('processMergeAutomationDispatch: the merge queue (issue #1114)', () => 
 		});
 		expect(completeDispatch).not.toHaveBeenCalled();
 		expect(promoteMergeQueueWaits).not.toHaveBeenCalled();
+		expect(promoteDependencyWaits).not.toHaveBeenCalled();
 		expect(outcome).toEqual({
 			status: 'merge-automation-settled',
 			result: 'retry-scheduled',

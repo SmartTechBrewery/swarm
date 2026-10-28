@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { retireSupersededBoardPhases as RetireSuperseded } from '@/dispatch/board-phase-retirement.js';
+import type { promoteDependencyWaits as PromoteDependencyWaits } from '@/dispatch/dispatcher.js';
 import type { PmEvent } from '@/pm/events.js';
 import type { PMProvider, WorkItem } from '@/pm/types.js';
 
@@ -7,12 +8,16 @@ vi.mock('@/triggers/pm-status-dedup.js', () => ({ recordStatusAndDetectChange: v
 vi.mock('@/dispatch/board-phase-retirement.js', () => ({
 	retireSupersededBoardPhases: vi.fn<typeof RetireSuperseded>(),
 }));
+vi.mock('@/dispatch/dispatcher.js', () => ({
+	promoteDependencyWaits: vi.fn<typeof PromoteDependencyWaits>(),
+}));
 
 // The handler resolves the project's board adapter through the PM registry, which
 // is populated by the integrations entrypoint at module load — import it so the
 // `github-projects` manifest (and its real `isStatusChange`) is registered.
 import '@/integrations/entrypoint.js';
 import { retireSupersededBoardPhases } from '@/dispatch/board-phase-retirement.js';
+import { promoteDependencyWaits } from '@/dispatch/dispatcher.js';
 import { buildPreplanContract, embedPreplanMarker, PLANNED_LABEL } from '@/pipeline/preplan.js';
 import { createPmStatusTrigger } from '@/triggers/handlers/pm-status.js';
 import { recordStatusAndDetectChange } from '@/triggers/pm-status-dedup.js';
@@ -30,6 +35,8 @@ beforeEach(() => {
 	vi.mocked(recordStatusAndDetectChange).mockResolvedValue(true);
 	vi.mocked(retireSupersededBoardPhases).mockReset();
 	vi.mocked(retireSupersededBoardPhases).mockResolvedValue(0);
+	vi.mocked(promoteDependencyWaits).mockReset();
+	vi.mocked(promoteDependencyWaits).mockResolvedValue(0);
 });
 
 /**
@@ -566,6 +573,59 @@ describe('pm-status trigger', () => {
 			expect(retireSupersededBoardPhases).toHaveBeenCalledWith(
 				expect.objectContaining({ taskId: '10', keepPhase: 'planning' }),
 			);
+		});
+	});
+
+	// Issue #1173 — a card entering `done` is a blocker finishing, so it wakes the
+	// project's dependency waits; the gate decides whether each may now start.
+	describe('waking the dependency waits when a card enters done', () => {
+		const DONE = '98236657';
+
+		it('wakes the project once when the re-read card has just entered done', async () => {
+			const workItem = createMockWorkItem({ statusId: DONE });
+
+			expect(await trigger.handle(ctx(workItem))).toBeNull();
+			expect(promoteDependencyWaits).toHaveBeenCalledExactlyOnceWith(PROJECT.id, 'board-done');
+		});
+
+		// A blocker can be a card in another of the project's repositories, or one
+		// with no SCM artifact at all.
+		it.each([
+			['a draft card', { taskRef: undefined }],
+			['a card linked in another repository', { taskRepository: 'acme/other' }],
+		])('wakes the project for %s too', async (_name, linkage) => {
+			const workItem = createMockWorkItem({ statusId: DONE, taskRef: '10', ...linkage });
+
+			await trigger.handle(ctx(workItem));
+
+			expect(promoteDependencyWaits).toHaveBeenCalledExactlyOnceWith(PROJECT.id, 'board-done');
+		});
+
+		it('does not wake on an unchanged done status', async () => {
+			vi.mocked(recordStatusAndDetectChange).mockResolvedValue(false);
+
+			await trigger.handle(ctx(createMockWorkItem({ statusId: DONE })));
+
+			expect(promoteDependencyWaits).not.toHaveBeenCalled();
+		});
+
+		it.each([
+			['Backlog', 'f75ad846'],
+			['In review', 'df73e18b'],
+			['Planning', '61e4505c'],
+		])('does not wake on a move to %s', async (_name, statusId) => {
+			await trigger.handle(ctx(createMockWorkItem({ statusId })));
+
+			expect(promoteDependencyWaits).not.toHaveBeenCalled();
+		});
+
+		it('does not wake on a resumed PM phase', async () => {
+			await trigger.handle({
+				...ctx(createMockWorkItem({ statusId: DONE })),
+				resumePmPhase: 'implementation',
+			});
+
+			expect(promoteDependencyWaits).not.toHaveBeenCalled();
 		});
 	});
 });

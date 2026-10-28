@@ -140,6 +140,11 @@ export type DispatchWaitReason =
 	 * an unfinished prerequisite (issues #330, #889). Its `last_error` is the
 	 * gate's own "must be done first" message; the blockers the Queue names come
 	 * from the job payload's structured `dependencyBlockers` (issue #1087).
+	 *
+	 * Woken early when a blocker in the same project becomes done — merge
+	 * automation merging a pull request, or a card re-read in `done` (issue #1173,
+	 * `promoteDependencyWaits`); the re-check timer stays underneath it as the
+	 * fallback.
 	 */
 	| 'dependency'
 	/**
@@ -1826,6 +1831,32 @@ export async function listTaskInFlightWaits(
 }
 
 /**
+ * The project's dispatches waiting on the dependency gate (issue #1173) —
+ * `dependency` retries still holding a *delayed* wake-up, which is what a blocker
+ * in the project becoming done wakes. Project-wide on purpose: the gate is
+ * token-free and re-reads the blockers itself, so matching the done item against
+ * each payload's `dependencyBlockers` would buy nothing but provider-shaped
+ * comparison in shared code.
+ */
+export async function listDependencyWaits(
+	projectId: string,
+	asOf: Date = new Date(),
+): Promise<DispatchRow[]> {
+	return getDb()
+		.select()
+		.from(dispatches)
+		.where(
+			and(
+				eq(dispatches.projectId, projectId),
+				eq(dispatches.state, 'retry-scheduled'),
+				eq(dispatches.waitReason, 'dependency'),
+				gt(dispatches.availableAt, asOf),
+			),
+		)
+		.orderBy(asc(dispatches.priority), asc(dispatches.availableAt), asc(dispatches.createdAt));
+}
+
+/**
  * Every waiting dispatch (`pending`/`retry-scheduled`) — the canonical queue
  * read model (issue #284). Ordered to mirror dispatch intent: eligible-now
  * before scheduled-later, then priority (0 highest), then FIFO on availability.
@@ -2076,6 +2107,12 @@ export async function selectNextCapacityDispatch(
  * that head's checks complete green (`promoteMergeChecksWaits`), with its own
  * candidate read ({@link listMergeChecksWaits}) that lists merge-automation rows
  * only — so the review gate's own `recheck` waits are never promoted.
+ *
+ * `dependency` (issue #1173) is here for the re-date as well, and never listed by
+ * the worker listing: a blocker in the project becoming done wakes the project's
+ * dependency waits (`promoteDependencyWaits`), with its own candidate read
+ * ({@link listDependencyWaits}). The dependency gate still re-reads the blockers,
+ * so a dependent that is still blocked simply re-defers.
  */
 export const PROMOTABLE_AVAILABILITY_WAIT_REASONS = [
 	'worker-eligibility',
@@ -2083,6 +2120,7 @@ export const PROMOTABLE_AVAILABILITY_WAIT_REASONS = [
 	'preserved-worker',
 	'merge-queue',
 	'recheck',
+	'dependency',
 ] as const satisfies readonly DispatchWaitReason[];
 
 /**
