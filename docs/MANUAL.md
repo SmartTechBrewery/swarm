@@ -141,6 +141,15 @@ behind it is refused server-side for them anyway.
   never leave an installation nobody can administer; the refusal is shown as the
   server words it and the switch stays on. (`swarm users revoke-admin` has no such
   guard: whoever holds the shell can always `grant-admin` again.)
+- **Linked identities** (issue #1167) are the board accounts each user owns — the
+  same links as `swarm identities`. An item assigned to a linked account runs only
+  on that user's own workers (assignee affinity). **Link identity** on a user's row
+  asks for the board provider and that provider's handle: the GitHub login for
+  GitHub Projects, the Atlassian **accountId** for Jira (not the e-mail or display
+  name), the display name for Linear, and the member username for Trello. Re-linking
+  the same pair is a no-op; a handle already linked to someone else is refused with
+  that user named — unlink it from them first. The unlink button beside each link
+  asks for confirmation. Changes apply from the next dispatch, with no restart.
 
 Giving a new user access to a project is separate: a project admin adds them on
 that project's **Members** tab.
@@ -1201,7 +1210,8 @@ profile URL `https://<site>/jira/people/<accountId>`, or with
 `GET /rest/api/3/user/search?query=<email>` using the project's Jira credentials —
 then run `swarm identities link --user <identifier> --provider jira --handle
 <accountId>` and remove the stale row with `swarm identities unlink --provider jira
---handle <old handle>`. No restart is needed: the next dispatch reads the link.
+--handle <old handle>` — or do both under **Settings → Users** in the dashboard.
+No restart is needed: the next dispatch reads the link.
 
 **A run that was cancelled leaves its trail in the log, not in Redis.** The
 cancellation marker and its recorded origin are deleted the moment the worker acts

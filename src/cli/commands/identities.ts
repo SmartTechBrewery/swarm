@@ -1,10 +1,11 @@
 /**
  * `swarm identities` — the operator front-door onto SWARM identity linking
  * (#130 Phase 1): which provider handle (a GitHub login, a Jira accountId)
- * belongs to which SWARM user. Without it the link table is unreachable, since
- * automatic linking (OAuth / SCM account discovery) and a dashboard UI are both
- * out of scope — the same "make the model usable" role `swarm users` plays for
- * users and `swarm members` for membership.
+ * belongs to which SWARM user. Automatic linking (OAuth / SCM account discovery)
+ * is out of scope; since issue #1167 an installation admin can do the same from
+ * the dashboard's Settings → Users (the `users.identities` procedures,
+ * `src/api/routers/users.ts`), so this stays the `DATABASE_URL`-side path — the
+ * same role `swarm users` plays for users and `swarm members` for membership.
  *
  * A thin file/CLI shell over `userIdentitiesRepository.ts` (`node:util`
  * `parseArgs` + `_shared/output.ts`, like `commands/members.ts`), resolving
@@ -53,7 +54,8 @@ for an assignee:
 
 Provider and handle are matched case-insensitively. Requires DATABASE_URL. Links
 are read by assignee resolution (src/identity/assignee-resolver.ts) to route an
-assigned item to its assignee's own workers.`;
+assigned item to its assignee's own workers. An installation admin can manage the
+same links without a shell under Settings → Users in the dashboard.`;
 
 const SUBCOMMANDS = ['link', 'unlink', 'list'];
 

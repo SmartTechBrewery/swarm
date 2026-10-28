@@ -15,6 +15,7 @@
 import { and, asc, eq } from 'drizzle-orm';
 
 import {
+	IdentityLinkConflictError,
 	type LinkIdentityInput,
 	LinkIdentityInputSchema,
 	normalizeIdentityKey,
@@ -81,9 +82,7 @@ export async function linkIdentity(input: LinkIdentityInput): Promise<UserIdenti
 		throw new Error(`Failed to link '${handle}' on '${provider}': the conflicting link vanished`);
 	}
 	if (existing.userId !== input.userId) {
-		throw new Error(
-			`Handle '${handle}' on '${provider}' is already linked to another user (${existing.userId})`,
-		);
+		throw new IdentityLinkConflictError(provider, handle, existing.userId);
 	}
 	return existing;
 }

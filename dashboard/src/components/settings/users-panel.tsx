@@ -1,9 +1,15 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Check, Copy, UserPlus } from 'lucide-react';
+import { Check, Copy, UserPlus, X } from 'lucide-react';
 import type React from 'react';
 import { useState } from 'react';
 import { buttonClass } from '@/components/ui/button.js';
 import { ToggleSwitch } from '@/components/ui/toggle-switch.js';
+import {
+	groupIdentitiesByUser,
+	IDENTITY_PROVIDER_OPTIONS,
+	identityProviderLabel,
+	type LinkedIdentity,
+} from '@/lib/identity-links.js';
 import { passwordLinkUrl } from '@/lib/password-link.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
 import { Modal, ModalFooter } from '../ui/modal.js';
@@ -29,8 +35,15 @@ const ERROR_BANNER_CLASS =
  * own origin, shows it in the modal that asked for it, and drops it when that modal
  * closes — the modals are mounted only while open, so the token never outlives them.
  *
+ * **Linked identities** (issue #1167, the `users.identities` procedures) are the
+ * board accounts each user owns — the dashboard twin of `swarm identities`. An item
+ * assigned to one routes to that user's own workers (assignee affinity, ADR-001);
+ * resolution reads the links on every dispatch, so a change applies with no restart.
+ * Provider names and handle copy come from `lib/identity-links.ts`, never this file.
+ *
  * **Errors are the server's own words** — a taken identifier, the last-admin
- * refusal — rendered verbatim beside the control that caused them.
+ * refusal, a handle already linked to someone else — rendered verbatim beside the
+ * control that caused them.
  */
 
 /** One row of `users.list` — the whole of what this panel reads. */
@@ -52,9 +65,19 @@ export function UsersPanel() {
 	const listQuery = useQuery(trpc.users.list.queryOptions());
 	const [adding, setAdding] = useState(false);
 	const [linkTarget, setLinkTarget] = useState<InstallationUser | null>(null);
+	const identitiesQuery = useQuery(trpc.users.identities.list.queryOptions());
+	const [identityTarget, setIdentityTarget] = useState<InstallationUser | null>(null);
+	const [unlinkTarget, setUnlinkTarget] = useState<{
+		user: InstallationUser;
+		identity: LinkedIdentity;
+	} | null>(null);
 
 	const invalidateList = () =>
 		queryClient.invalidateQueries({ queryKey: trpc.users.list.queryOptions().queryKey });
+	const invalidateIdentities = () =>
+		queryClient.invalidateQueries({
+			queryKey: trpc.users.identities.list.queryOptions().queryKey,
+		});
 
 	// No optimistic flip: the switch shows the server's value, so a refused revoke
 	// (the last admin) leaves it where it was and the refusal says why.
@@ -77,6 +100,10 @@ export function UsersPanel() {
 	}
 
 	const users = (listQuery.data ?? []) as InstallationUser[];
+	// Undefined while loading or failed, so a cell shows a dash rather than a false "None".
+	const identitiesByUser = identitiesQuery.isSuccess
+		? groupIdentitiesByUser(identitiesQuery.data as LinkedIdentity[])
+		: undefined;
 
 	return (
 		<div className="border border-zinc-800 rounded-lg bg-panel/40 p-6 shadow-sm space-y-6">
@@ -99,10 +126,20 @@ export function UsersPanel() {
 					shown only once, because SWARM keeps only its hash. Installation admins manage users and
 					installation-wide settings; project access is granted per project, on its Members tab.
 				</p>
+				<p className="text-xs text-zinc-400 mt-2">
+					Linked identities are the board accounts each user owns. A work item assigned to one runs
+					only on that user's own workers, from the next dispatch — no restart needed.
+				</p>
 			</div>
 
 			{adminMutation.isError && (
 				<div className={ERROR_BANNER_CLASS}>{adminMutation.error.message}</div>
+			)}
+
+			{identitiesQuery.isError && (
+				<div className={ERROR_BANNER_CLASS}>
+					Failed to load linked identities: {identitiesQuery.error.message}
+				</div>
 			)}
 
 			<div className="border border-zinc-800 rounded-md overflow-hidden bg-panel/20 shadow-sm">
@@ -112,6 +149,7 @@ export function UsersPanel() {
 							<th className="px-4 py-3">Identifier</th>
 							<th className="px-4 py-3">Display name</th>
 							<th className="px-4 py-3">Installation admin</th>
+							<th className="px-4 py-3">Linked identities</th>
 							<th className="px-4 py-3 text-right">Actions</th>
 						</tr>
 					</thead>
@@ -134,14 +172,30 @@ export function UsersPanel() {
 										}
 									/>
 								</td>
-								<td className="px-4 py-3.5 text-right">
-									<button
-										type="button"
-										onClick={() => setLinkTarget(user)}
-										className={buttonClass('secondary', 'sm')}
-									>
-										Password link
-									</button>
+								<td className="px-4 py-3.5">
+									<LinkedIdentitiesCell
+										identities={identitiesByUser && (identitiesByUser.get(user.id) ?? [])}
+										user={user}
+										onUnlink={(identity) => setUnlinkTarget({ user, identity })}
+									/>
+								</td>
+								<td className="px-4 py-3.5">
+									<div className="flex justify-end gap-2">
+										<button
+											type="button"
+											onClick={() => setIdentityTarget(user)}
+											className={buttonClass('secondary', 'sm')}
+										>
+											Link identity
+										</button>
+										<button
+											type="button"
+											onClick={() => setLinkTarget(user)}
+											className={buttonClass('secondary', 'sm')}
+										>
+											Password link
+										</button>
+									</div>
 								</td>
 							</tr>
 						))}
@@ -154,7 +208,60 @@ export function UsersPanel() {
 			{linkTarget && (
 				<IssuePasswordLinkModal user={linkTarget} onClose={() => setLinkTarget(null)} />
 			)}
+
+			{identityTarget && (
+				<LinkIdentityModal
+					user={identityTarget}
+					onLinked={invalidateIdentities}
+					onClose={() => setIdentityTarget(null)}
+				/>
+			)}
+
+			{unlinkTarget && (
+				<UnlinkIdentityModal
+					user={unlinkTarget.user}
+					identity={unlinkTarget.identity}
+					onUnlinked={invalidateIdentities}
+					onClose={() => setUnlinkTarget(null)}
+				/>
+			)}
 		</div>
+	);
+}
+
+/** One user's links, each with its unlink button; a dash while they are unknown. */
+function LinkedIdentitiesCell({
+	identities,
+	user,
+	onUnlink,
+}: {
+	identities: LinkedIdentity[] | undefined;
+	user: InstallationUser;
+	onUnlink: (identity: LinkedIdentity) => void;
+}) {
+	if (!identities) return <span className="text-xs text-zinc-500">—</span>;
+	if (identities.length === 0) return <span className="text-xs text-zinc-500">None</span>;
+	return (
+		<ul className="space-y-1">
+			{identities.map((identity) => {
+				const label = identityProviderLabel(identity.provider);
+				return (
+					<li key={identity.id} className="flex items-center gap-2">
+						<span className="text-xs text-zinc-400">{label}</span>
+						<span className="font-mono text-sm text-zinc-200 break-all">{identity.handle}</span>
+						<button
+							type="button"
+							onClick={() => onUnlink(identity)}
+							aria-label={`Unlink ${identity.handle} on ${label} from ${user.identifier}`}
+							title="Unlink"
+							className="text-zinc-500 hover:text-red-400 p-1.5 rounded hover:bg-zinc-800/60 transition-colors"
+						>
+							<X className="w-3.5 h-3.5" />
+						</button>
+					</li>
+				);
+			})}
+		</ul>
 	);
 }
 
@@ -398,6 +505,190 @@ function IssuePasswordLinkModal({
 					/>
 				</div>
 			)}
+		</Modal>
+	);
+}
+
+/** Link identity: pick a board provider and enter that provider's handle for the user. */
+function LinkIdentityModal({
+	user,
+	onLinked,
+	onClose,
+}: {
+	user: InstallationUser;
+	onLinked: () => void;
+	onClose: () => void;
+}) {
+	const [providerId, setProviderId] = useState(IDENTITY_PROVIDER_OPTIONS[0].id);
+	const [handle, setHandle] = useState('');
+	const provider =
+		IDENTITY_PROVIDER_OPTIONS.find((option) => option.id === providerId) ??
+		IDENTITY_PROVIDER_OPTIONS[0];
+
+	const linkMutation = useMutation({
+		mutationFn: () =>
+			trpcClient.users.identities.link.mutate({
+				userId: user.id,
+				provider: provider.id,
+				handle: handle.trim(),
+			}),
+		onSuccess: () => {
+			onLinked();
+			onClose();
+		},
+	});
+
+	const handleSubmit = (e: React.FormEvent) => {
+		e.preventDefault();
+		linkMutation.mutate();
+	};
+
+	return (
+		<Modal open onClose={onClose} title="Link identity">
+			<form onSubmit={handleSubmit} className="space-y-4">
+				<p className="text-sm text-zinc-300">
+					Link a board account to{' '}
+					<span className="font-semibold text-zinc-200">{user.displayName}</span> (
+					<span className="font-mono">{user.identifier}</span>). Items assigned to it run on their
+					workers.
+				</p>
+				<div>
+					<label
+						htmlFor="link-identity-provider"
+						className="block text-xs font-medium text-zinc-400 mb-1"
+					>
+						Provider
+					</label>
+					<select
+						id="link-identity-provider"
+						value={provider.id}
+						onChange={(e) => {
+							setProviderId(e.target.value as typeof providerId);
+							linkMutation.reset();
+						}}
+						disabled={linkMutation.isPending}
+						className={INPUT_CLASS}
+					>
+						{IDENTITY_PROVIDER_OPTIONS.map((option) => (
+							<option key={option.id} value={option.id}>
+								{option.label}
+							</option>
+						))}
+					</select>
+				</div>
+				<div>
+					<label
+						htmlFor="link-identity-handle"
+						className="block text-xs font-medium text-zinc-400 mb-1"
+					>
+						{provider.handleLabel} <span className="text-red-500">*</span>
+					</label>
+					<input
+						id="link-identity-handle"
+						value={handle}
+						onChange={(e) => {
+							setHandle(e.target.value);
+							linkMutation.reset();
+						}}
+						disabled={linkMutation.isPending}
+						autoComplete="off"
+						placeholder={provider.placeholder}
+						className={`${INPUT_CLASS} font-mono`}
+					/>
+					<p className="text-xs text-zinc-500 mt-1">{provider.hint}</p>
+				</div>
+				{linkMutation.isError && (
+					<div className={ERROR_BANNER_CLASS}>{linkMutation.error.message}</div>
+				)}
+				<ModalFooter
+					primary={
+						<button
+							type="submit"
+							disabled={linkMutation.isPending || handle.trim().length === 0}
+							className={buttonClass('primary')}
+						>
+							{linkMutation.isPending ? 'Linking…' : 'Link'}
+						</button>
+					}
+					secondary={
+						<button
+							type="button"
+							onClick={onClose}
+							disabled={linkMutation.isPending}
+							className={buttonClass('secondary')}
+						>
+							Cancel
+						</button>
+					}
+				/>
+			</form>
+		</Modal>
+	);
+}
+
+/**
+ * Unlink: never a single stray click, and never a native `confirm()`
+ * (`ai/DESIGN_SYSTEM.md` §7) — it changes where that account's work runs.
+ */
+function UnlinkIdentityModal({
+	user,
+	identity,
+	onUnlinked,
+	onClose,
+}: {
+	user: InstallationUser;
+	identity: LinkedIdentity;
+	onUnlinked: () => void;
+	onClose: () => void;
+}) {
+	const unlinkMutation = useMutation({
+		mutationFn: () =>
+			trpcClient.users.identities.unlink.mutate({
+				provider: identity.provider,
+				handle: identity.handle,
+			}),
+		onSuccess: () => {
+			onUnlinked();
+			onClose();
+		},
+	});
+
+	return (
+		<Modal open onClose={onClose} title="Unlink identity">
+			<div className="space-y-4">
+				<p className="text-sm text-zinc-300">
+					This unlinks <span className="font-mono text-zinc-200">{identity.handle}</span> on{' '}
+					{identityProviderLabel(identity.provider)} from{' '}
+					<span className="font-semibold text-zinc-200">{user.displayName}</span> (
+					<span className="font-mono">{user.identifier}</span>). Items assigned to that account stop
+					routing to their workers from the next dispatch.
+				</p>
+				{unlinkMutation.isError && (
+					<div className={ERROR_BANNER_CLASS}>{unlinkMutation.error.message}</div>
+				)}
+				<ModalFooter
+					primary={
+						<button
+							type="button"
+							onClick={() => unlinkMutation.mutate()}
+							disabled={unlinkMutation.isPending}
+							className={buttonClass('danger')}
+						>
+							{unlinkMutation.isPending ? 'Unlinking…' : 'Unlink'}
+						</button>
+					}
+					secondary={
+						<button
+							type="button"
+							onClick={onClose}
+							disabled={unlinkMutation.isPending}
+							className={buttonClass('secondary')}
+						>
+							Cancel
+						</button>
+					}
+				/>
+			</div>
 		</Modal>
 	);
 }

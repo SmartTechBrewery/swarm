@@ -4,8 +4,20 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { listFn, createMutate, issueMutate, grantMutate, revokeMutate } = vi.hoisted(() => ({
+const {
+	listFn,
+	createMutate,
+	issueMutate,
+	grantMutate,
+	revokeMutate,
+	listIdentitiesFn,
+	linkMutate,
+	unlinkMutate,
+} = vi.hoisted(() => ({
 	listFn: vi.fn(),
+	listIdentitiesFn: vi.fn(),
+	linkMutate: vi.fn(),
+	unlinkMutate: vi.fn(),
 	createMutate: vi.fn(),
 	issueMutate: vi.fn(),
 	grantMutate: vi.fn(),
@@ -19,12 +31,24 @@ vi.mock('@/lib/trpc.js', () => ({
 			issuePasswordLink: { mutate: issueMutate },
 			grantAdmin: { mutate: grantMutate },
 			revokeAdmin: { mutate: revokeMutate },
+			identities: {
+				link: { mutate: linkMutate },
+				unlink: { mutate: unlinkMutate },
+			},
 		},
 	},
 	trpc: {
 		users: {
 			list: {
 				queryOptions: () => ({ queryKey: ['users.list'], queryFn: () => listFn() }),
+			},
+			identities: {
+				list: {
+					queryOptions: () => ({
+						queryKey: ['users.identities.list'],
+						queryFn: () => listIdentitiesFn(),
+					}),
+				},
 			},
 		},
 	},
@@ -67,6 +91,9 @@ describe('UsersPanel (issue #1151 — dashboard user management)', () => {
 		issueMutate.mockReset();
 		grantMutate.mockReset();
 		revokeMutate.mockReset();
+		listIdentitiesFn.mockReset().mockResolvedValue([]);
+		linkMutate.mockReset();
+		unlinkMutate.mockReset();
 	});
 
 	it('lists users with their identifier, display name and admin switch', async () => {
@@ -218,5 +245,103 @@ describe('UsersPanel (issue #1151 — dashboard user management)', () => {
 				.getByRole('switch', { name: 'Installation admin for ada@example.com' })
 				.getAttribute('aria-checked'),
 		).toBe('true');
+	});
+
+	describe('linked identities (issue #1167)', () => {
+		const ADA_JIRA = {
+			id: '00000000-0000-4000-8000-0000000000a1',
+			userId: ADA.id,
+			provider: 'jira',
+			handle: '557058:ada',
+			createdAt: '2026-10-01T00:00:00.000Z',
+		};
+		const ADA_GITHUB = { ...ADA_JIRA, id: 'a2', provider: 'github-projects', handle: 'ada' };
+		const ADA_LEGACY = { ...ADA_JIRA, id: 'a3', provider: 'legacy-pm', handle: 'old-ada' };
+
+		it("shows each user's links with the provider's own label", async () => {
+			listIdentitiesFn.mockResolvedValue([ADA_GITHUB, ADA_JIRA, ADA_LEGACY]);
+			renderPanel();
+
+			expect(await screen.findByText('557058:ada')).not.toBeNull();
+			expect(screen.getByText('Jira')).not.toBeNull();
+			expect(screen.getByText('GitHub Projects')).not.toBeNull();
+			// An unknown stored key is shown as itself, not dressed up as GitHub.
+			expect(screen.getByText('legacy-pm')).not.toBeNull();
+			expect(screen.getAllByText('GitHub Projects')).toHaveLength(1);
+			// Grace has none.
+			expect(screen.getByText('None')).not.toBeNull();
+		});
+
+		it('links a trimmed handle on the chosen provider, then refreshes', async () => {
+			linkMutate.mockResolvedValue({ ...ADA_JIRA, userId: GRACE.id });
+			renderPanel();
+
+			const buttons = await screen.findAllByRole('button', { name: 'Link identity' });
+			fireEvent.click(buttons[1]);
+			expect(screen.getByText('grace@example.com', { selector: 'span' })).not.toBeNull();
+
+			fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'jira' } });
+			expect(screen.getByText(/Not their e-mail or display name/)).not.toBeNull();
+			const handleInput = screen.getByLabelText(/Atlassian accountId/);
+			fireEvent.change(handleInput, { target: { value: '  557058:abc  ' } });
+			fireEvent.click(screen.getByRole('button', { name: 'Link' }));
+
+			await waitFor(() =>
+				expect(linkMutate).toHaveBeenCalledWith({
+					userId: GRACE.id,
+					provider: 'jira',
+					handle: '557058:abc',
+				}),
+			);
+			await waitFor(() => expect(listIdentitiesFn).toHaveBeenCalledTimes(2));
+			expect(screen.queryByLabelText('Provider')).toBeNull();
+		});
+
+		it('shows a handle owned by someone else verbatim, and keeps the modal open', async () => {
+			const message =
+				'Handle "ada" on github-projects is already linked to Ada Lovelace (ada@example.com). Unlink it from that user first.';
+			linkMutate.mockRejectedValue(new Error(message));
+			renderPanel();
+
+			fireEvent.click((await screen.findAllByRole('button', { name: 'Link identity' }))[1]);
+			fireEvent.change(screen.getByLabelText(/GitHub login/), { target: { value: 'ada' } });
+			fireEvent.click(screen.getByRole('button', { name: 'Link' }));
+
+			expect(await screen.findByText(message)).not.toBeNull();
+			expect(screen.getByLabelText('Provider')).not.toBeNull();
+		});
+
+		it('confirms before unlinking, then refreshes', async () => {
+			listIdentitiesFn.mockResolvedValue([ADA_JIRA]);
+			unlinkMutate.mockResolvedValue(undefined);
+			renderPanel();
+
+			const unlink = await screen.findByRole('button', {
+				name: 'Unlink 557058:ada on Jira from ada@example.com',
+			});
+
+			// Cancel unlinks nothing.
+			fireEvent.click(unlink);
+			fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+			expect(unlinkMutate).not.toHaveBeenCalled();
+
+			fireEvent.click(unlink);
+			expect(screen.getByText(/stop routing to their workers/)).not.toBeNull();
+			fireEvent.click(screen.getByRole('button', { name: 'Unlink' }));
+
+			await waitFor(() =>
+				expect(unlinkMutate).toHaveBeenCalledWith({ provider: 'jira', handle: '557058:ada' }),
+			);
+			await waitFor(() => expect(listIdentitiesFn).toHaveBeenCalledTimes(2));
+		});
+
+		it('still lists users when the links fail to load', async () => {
+			listIdentitiesFn.mockRejectedValue(new Error('boom'));
+			renderPanel();
+
+			expect(await screen.findByText('Failed to load linked identities: boom')).not.toBeNull();
+			expect(screen.getByText('ada@example.com')).not.toBeNull();
+			expect(screen.queryByText('None')).toBeNull();
+		});
 	});
 });

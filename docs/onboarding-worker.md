@@ -447,7 +447,7 @@ Notes:
   strictly the worker owner's with no instance-admin override — an administrator can
   no longer store a credential on somebody else's machine from the control-plane
   host. Whoever owns the machine signs in on it and sets it.
-- Skip `swarm identities link` unless you already know which GitHub account
+- Skip `swarm identities link` (or **Link identity** under Settings → Users) unless you already know which GitHub account
   should be the *assignee* that routes work to this specific machine — without
   it the worker still receives review / respond-to-review / respond-to-ci /
   resolve-conflicts / unassigned-implementation work normally.
