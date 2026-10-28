@@ -275,6 +275,66 @@ describe('resolve-conflicts production delivery', () => {
 		expect(options.preserve).toHaveBeenCalledTimes(1);
 		expect(options.cleanup).not.toHaveBeenCalled();
 	});
+
+	// PR #1156's later attempts: the checkout already held an earlier attempt's merge
+	// commit that never reached the remote, so merging the current base — advanced
+	// only by a commit and its revert — left a pending merge with an unchanged tree.
+	// That merge commit is still the update, so the first commit must not refuse it.
+	it('commits a first-pass merge that leaves the tree unchanged', async () => {
+		const { worktreePath, seed, headSha, baseSha } = makeConflictedCheckout();
+		const options = makeOptions(worktreePath, headSha, baseSha);
+		let advancedTo = '';
+		options.runAgent = vi.fn(async () => {
+			stageResolution(worktreePath, 'resolved by hand\n');
+			git(worktreePath, 'add', '--', 'src/db/migrations');
+			git(worktreePath, 'commit', '-q', '--no-verify', '-m', 'an earlier attempt, never pushed');
+			advanceBase(seed, 'main moved on again\n');
+			git(seed, 'revert', '--no-edit', 'HEAD');
+			git(seed, 'push', '-q', 'origin', 'main');
+			advancedTo = git(seed, 'rev-parse', 'HEAD').trim();
+			git(worktreePath, 'fetch', '-q', 'origin');
+			git(worktreePath, 'merge', '--no-verify', '--no-commit', 'origin/main');
+			return agentResult();
+		});
+
+		const { outcome } = await runResolveConflictsPhase(options);
+
+		expect(outcome.status).toBe('resolved');
+		expect(options.runAgent).toHaveBeenCalledTimes(1);
+		expect(options.pushBranch).toHaveBeenCalledTimes(1);
+		expect(options.pushBranch).toHaveBeenCalledWith(
+			worktreePath,
+			PR_BRANCH,
+			outcome.mergeCommitSha,
+		);
+		expect(() =>
+			git(worktreePath, 'merge-base', '--is-ancestor', advancedTo, outcome.mergeCommitSha),
+		).not.toThrow();
+		expect(git(worktreePath, 'rev-parse', `${outcome.mergeCommitSha}^{tree}`).trim()).toBe(
+			git(worktreePath, 'rev-parse', `${outcome.mergeCommitSha}^1^{tree}`).trim(),
+		);
+	});
+
+	// The relaxation covers a pending merge only: a first pass that leaves nothing to
+	// commit and no merge in progress is still refused.
+	it('still refuses a first pass that left no merge pending', async () => {
+		const { worktreePath, headSha, baseSha } = makeConflictedCheckout();
+		const options = makeOptions(worktreePath, headSha, baseSha);
+		options.runAgent = vi.fn(async () => {
+			stageResolution(worktreePath, 'resolved by hand\n');
+			git(worktreePath, 'add', '--', 'src/db/migrations');
+			git(worktreePath, 'commit', '-q', '--no-verify', '-m', 'committed by the agent');
+			return agentResult();
+		});
+
+		const error = await runResolveConflictsPhase(options).catch((e) => e);
+
+		expect(error).toBeInstanceOf(UnretryableDeliveryError);
+		expect(error.message).toContain('Unsafe delivery: ');
+		expect(error.message).toContain('nothing to deliver');
+		expect(options.pushBranch).not.toHaveBeenCalled();
+		expect(options.postComment).not.toHaveBeenCalled();
+	});
 });
 
 /**
