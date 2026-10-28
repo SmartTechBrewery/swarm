@@ -28,6 +28,12 @@
  * which already state that ownership; running a phase is the **worker**'s. See the
  * ownership table in `ai/ARCHITECTURE.md` ("Process responsibilities").
  *
+ * The all-in-one control plane (`src/serve/index.ts`, issue #1148) runs this same
+ * function, but with the retention sweep **off** by default: that process is meant
+ * for a server that may hold no repository checkout at all, where the sweep could
+ * only fail every hour. The reap and the fleet sweep need only the database and run
+ * there unchanged.
+ *
  * Everything here is best-effort per iteration and every timer is `unref`'d, so a
  * failing chore never stops the API server and a pending sweep never holds the
  * process open.
@@ -67,6 +73,12 @@ const DEFAULT_FLEET_SWEEP_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
 const FLEET_SWEEP_DUE_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 
 export interface HostMaintenanceOptions {
+	/**
+	 * Whether to run the checkout-dependent worktree retention sweep at all; defaults
+	 * to `true`. `false` leaves the DB-only chores running and never reads the sweep's
+	 * interval, since the chore it configures is not running.
+	 */
+	worktreeRetentionSweep?: boolean;
 	/** Worktree sweep cadence; defaults to `SWARM_WORKTREE_SWEEP_INTERVAL_MS`. */
 	worktreeSweepIntervalMs?: number;
 	/**
@@ -135,7 +147,10 @@ function resolveFleetSweepIntervalMs(): number {
  * round-trip or a filesystem walk.
  */
 export function startHostMaintenance(options: HostMaintenanceOptions = {}): HostMaintenanceHandle {
-	const sweepIntervalMs = options.worktreeSweepIntervalMs ?? resolveWorktreeSweepIntervalMs();
+	const worktreeRetentionSweep = options.worktreeRetentionSweep ?? true;
+	const sweepIntervalMs = worktreeRetentionSweep
+		? (options.worktreeSweepIntervalMs ?? resolveWorktreeSweepIntervalMs())
+		: null;
 	const fleetSweepIntervalMs = options.fleetSweepIntervalMs ?? resolveFleetSweepIntervalMs();
 	const failOrphanedRuns = options.failOrphanedRuns ?? failOrphanedRunningRuns;
 	const listProjects = options.listProjects ?? listAllProjectsFromDb;
@@ -280,20 +295,27 @@ export function startHostMaintenance(options: HostMaintenanceOptions = {}): Host
 	}
 
 	void reapOrphanedRuns();
-	void runWorktreeSweep();
+	if (sweepIntervalMs !== null) void runWorktreeSweep();
 	void runFleetWorktreeSweepIfDue();
 
-	const sweepInterval = setInterval(() => {
-		void runWorktreeSweep();
-	}, sweepIntervalMs);
-	sweepInterval.unref();
+	const sweepInterval =
+		sweepIntervalMs === null
+			? undefined
+			: setInterval(() => {
+					void runWorktreeSweep();
+				}, sweepIntervalMs);
+	sweepInterval?.unref();
 
 	const fleetSweepInterval = setInterval(() => {
 		void runFleetWorktreeSweepIfDue();
 	}, FLEET_SWEEP_DUE_CHECK_INTERVAL_MS);
 	fleetSweepInterval.unref();
 
-	logger.debug('Control-plane host maintenance started', { sweepIntervalMs, fleetSweepIntervalMs });
+	logger.debug('Control-plane host maintenance started', {
+		worktreeRetentionSweep,
+		sweepIntervalMs,
+		fleetSweepIntervalMs,
+	});
 
 	return {
 		close: () => {

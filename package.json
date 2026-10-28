@@ -24,6 +24,8 @@
 		"build": "tsc && tsc-alias",
 		"start": "node dist/index.js",
 		"start:api": "npm run build:dashboard && npm run dev:api",
+		"serve": "node --env-file-if-exists=.env --import tsx/esm src/serve/index.ts",
+		"start:serve": "node --env-file-if-exists=.env dist/serve/index.js",
 		"reload:base": "npm install && npm --prefix dashboard install && npm run build:dashboard && npm run db:migrate",
 		"reload": "npm run reload:base && echo '[reload] deps synced, dashboard rebuilt (served live by the running API), migrations applied. Restart the worker (npm run dev:worker, or swarm-worker-agent update on a launchd host) and rebuild the router (docker compose up -d --build router) if their code changed.'",
 		"reload:all": "npm run reload:base && docker compose up -d --build --wait router && echo '[reload:all] deps synced, dashboard rebuilt, migrations applied, router rebuilt and healthy. Restart the worker (npm run dev:worker, or swarm-worker-agent update on a launchd host) on EVERY host, remote ones included, if phase code changed.'",
