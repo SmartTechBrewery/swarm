@@ -304,7 +304,7 @@ run is for; a worker older than that (issue #1055) is refused on them with an
 Planning's board surface (its own
 blocker/dependent lookup for the dependency gate it has run since issue #889 —
 which rides the routes Implementation's already uses — plus creating a split's
-sibling cards, chaining their dependency edges, carrying the split item's own
+sibling cards, recording the dependency edges between them, carrying the split item's own
 dependents forward onto every phase it produced (issue #890 — the same dependent
 read, plus Respond-to-review's card lookup to resolve a dependent that carries no
 board id), re-scoping the parent, labelling what finished, and finding its own
