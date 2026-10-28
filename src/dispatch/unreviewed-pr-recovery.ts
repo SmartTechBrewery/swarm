@@ -80,8 +80,7 @@
  * aggregate-checks read only for a pull request that is genuinely unreviewed at
  * its head. In steady state the per-PR call count is zero. The list read runs
  * under the **implementer** persona — i.e. the router's own
- * `SWARM_OPERATOR_GH_TOKEN` (`src/integrations/scm/github/personas.ts`, the
- * credential the router already reads for `src/router/worker-delivery.ts`) — the
+ * `SWARM_OPERATOR_GH_TOKEN` (`src/integrations/scm/github/personas.ts`) — the
  * same credential the `resolve-conflicts` fan-out reads it with, because
  * `listConflictCandidates` is the seam being reused. A router without it degrades
  * to a logged warning per pass and no recovery; widening the seam's persona is

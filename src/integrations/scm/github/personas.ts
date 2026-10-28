@@ -28,10 +28,17 @@
  * **router**, which since issue #765 is the only side still reading that variable —
  * the worker resolves the same operator identity from the per-`(worker, provider)`
  * store instead, so on a multi-worker installation the login resolved here can
- * differ from the account that authored the PR. Moving these readers onto that store
- * is a follow-up. The `reviewer` stays a project-scoped credential. The
- * two must still resolve to two distinct accounts (operator ≠ reviewer) for loop
- * prevention to hold.
+ * differ from the account that authored the PR. That is deliberate, not a gap:
+ * {@link resolvePersonaIdentities} runs at webhook ingress (the Respond-to-review
+ * author gate), before any worker is selected, so there is no worker to key that
+ * store on; and the gate only asks whether an event's author is the **reviewer**,
+ * so the implementer login here only has to differ from it. It does fail closed
+ * when the variable is unset. The one worker-requested implementer write — the
+ * Respond-to-review reply on `POST /worker/delivery/pr-comment` — moved onto the
+ * requesting worker's stored credential in issue #1152
+ * (`src/router/worker-delivery.ts`). The `reviewer` stays a project-scoped
+ * credential. The two must still resolve to two distinct accounts (operator ≠
+ * reviewer) for loop prevention to hold.
  */
 
 import { getPersonaTokenOrNull } from '../../../config/provider.js';

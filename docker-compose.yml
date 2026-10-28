@@ -59,23 +59,22 @@ services:
       # SWARM_CONTROL_PLANE_URL=http://localhost:${ROUTER_PORT} over loopback. See
       # docs/configuration.md.
       SWARM_DISPATCH_MODE: ${SWARM_DISPATCH_MODE:-in-process}
-      # Worker-local operator GitHub token (issue #396) — OPTIONAL here, unlike on a
-      # worker (which throws at startup without it). The router's ONE use of it is
-      # POST /worker/delivery/pr-comment with `persona: 'implementer'`: a federated
-      # worker's Respond-to-review reply, which must not be authored by the reviewer
-      # it answers (issue #444). Unset, the router still starts — it logs a warning —
-      # and answers that single route 503; every other route, that route's reviewer
-      # persona included, works. It is NOT needed for loop prevention: the board gate
-      # resolves the PM provider's own credential (issue #537), comment gates key on
-      # SWARM's own marker (issue #443), and persona-identity routing (personaForActor)
-      # runs worker-side in the trigger handlers. The API server needs none either
-      # since #537 moved board discovery onto the project's PM credential, and since
-      # issue #765 no *worker* reads it at all — a worker's operator identity is
-      # stored per (worker, SCM provider) and resolved at dispatch. Note this
-      # is the *operator's own* account and the router holds one value for every
-      # worker it serves, so a multi-operator deployment authors every implementer
-      # reply under whichever account it names. Never persisted; passed through from
-      # the host env.
+      # The control plane's own operator GitHub account (issue #396) — OPTIONAL.
+      # Since issue #765 no *worker* reads it (a worker's operator identity is stored
+      # per (worker, SCM provider) and resolved at dispatch), and since issue #1152 it
+      # no longer authors Respond-to-review replies either: POST
+      # /worker/delivery/pr-comment with `persona: 'implementer'` posts with the
+      # requesting worker's own stored operator credential, so on a multi-operator
+      # deployment each reply is authored by the operator whose worker did the work.
+      # The router still reads it for operations it originates itself, with no
+      # requesting worker: the Respond-to-review author gate (persona-identity
+      # resolution, which fails closed without it), the Review trigger's fallback when
+      # a project configures no reviewer credential, the PR sweeps and merge
+      # automation reads. Unset, the router still starts and logs a warning. A
+      # deployment that still sets it keeps working — the value is simply not used
+      # for replies. The API server needs none since #537 moved board discovery onto
+      # the project's PM credential. Must resolve to a different account than the
+      # reviewer PAT. Never persisted; passed through from the host env.
       SWARM_OPERATOR_GH_TOKEN: ${SWARM_OPERATOR_GH_TOKEN:-}
       # SWARM's own public base URL (issue #496). The receiver hands each route's
       # callback URL to the PM provider's signature verifier, because some providers
