@@ -1,0 +1,120 @@
+# SWARM on a VPS behind Caddy (issue #1153) — the published image, Postgres and
+# Redis on an internal network, and Caddy as the only public service. Needs no
+# repository checkout: copy this directory's three files to the server, fill in
+# .env from .env.example, and `docker compose up -d`. Walkthrough: docs/MANUAL.md,
+# "Running on a VPS behind Caddy".
+#
+# Additive: the repo-root docker-compose.yml (the developer / Cloudflare-tunnel
+# layout) is separate and unchanged.
+name: swarm-vps # Fixed name → volumes are always "swarm-vps_<volume>"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: swarm
+      # Applied only when the volume is first initialised; changing it later does
+      # not change the database's password.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env — see .env.example}
+      POSTGRES_DB: swarm
+    # No ports: reachable only by the app, over the internal network.
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U swarm -d swarm"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Password-protected, and AOF-persisted so a restart keeps queued jobs.
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD in .env — see .env.example}", "--appendonly", "yes"]
+    environment:
+      # Lets the healthcheck's redis-cli authenticate without the password in its argv.
+      REDISCLI_AUTH: ${REDIS_PASSWORD}
+    # No ports: reachable only by the app, over the internal network.
+    volumes:
+      - redis-data:/data
+    networks: [internal]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    # The all-in-one control plane (router, API and dashboard on one port). Pin a
+    # vX.Y.Z or sha-<7> tag — never `main` on a server (docs/MANUAL.md, "The
+    # published image"). Migrations run at start, before the port is bound.
+    image: ghcr.io/smarttechbrewery/swarm:${SWARM_IMAGE_TAG:?set SWARM_IMAGE_TAG in .env — see .env.example}
+    restart: unless-stopped
+    # CREDENTIAL_MASTER_KEY, SWARM_SINGLE_USER_MODE and any optional variable from
+    # docs/configuration.md come from here. The app itself refuses to start without
+    # a valid master key or with single-user mode on — don't add
+    # SWARM_SERVE_ALLOW_INSECURE to get past that.
+    env_file: .env
+    # Values this file owns; they override anything of the same name in .env.
+    environment:
+      PORT: "3000"
+      DATABASE_URL: postgresql://swarm:${POSTGRES_PASSWORD}@postgres:5432/swarm
+      # The bundled Postgres serves no TLS; without this, client.ts defaults to
+      # rejectUnauthorized:true and the first connection would fail.
+      DATABASE_SSL: "false"
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      # The public base URL: also Caddy's site address and the prefix of the
+      # first-run setup link the app logs.
+      WEBHOOK_CALLBACK_BASE_URL: ${WEBHOOK_CALLBACK_BASE_URL:?set WEBHOOK_CALLBACK_BASE_URL in .env — see .env.example}
+      SWARM_LOG_FORMAT: json
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    # No ports: Caddy reaches it over the edge network. `internal` reaches the
+    # databases; `edge` also gives it egress to the provider APIs.
+    networks: [internal, edge]
+    healthcheck:
+      # The image has no curl/wget; Node 22's global fetch does the probe.
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      # Migrations run before the port is bound.
+      start_period: 60s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    # The ONLY service that publishes a port. 80 serves the ACME HTTP-01 challenge
+    # and the HTTP→HTTPS redirect; 443 TCP + UDP serve HTTPS and HTTP/3.
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      # Read by the Caddyfile as its site address.
+      WEBHOOK_CALLBACK_BASE_URL: ${WEBHOOK_CALLBACK_BASE_URL:?set WEBHOOK_CALLBACK_BASE_URL in .env — see .env.example}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Certificates and ACME account — kept so a recreate doesn't re-issue them
+      # (and run into Let's Encrypt's rate limits).
+      - caddy-data:/data
+      - caddy-config:/config
+    # Start order only, not service_healthy: Caddy obtains its certificate and
+    # answers 502 while the app is still migrating.
+    depends_on: [app]
+    networks: [edge]
+
+networks:
+  # No gateway: nothing on it is reachable from, or can reach, outside Docker.
+  internal:
+    internal: true
+  edge:
+
+volumes:
+  postgres-data:
+  redis-data:
+  caddy-data:
+  caddy-config:

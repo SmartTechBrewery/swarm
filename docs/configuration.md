@@ -12,7 +12,7 @@ Beyond those three, one secret is none of them: the **per-worker operator SCM cr
 
 ### General settings (environment variables)
 
-Grouped by concern. "Required" means startup throws if it's unset; everything else has a default or a safe fallback. Docker-side ports (`POSTGRES_PORT`, `REDIS_PORT`, `ROUTER_PORT`, …) are the **host-published** ports; inside the Compose network the services use their own fixed container ports.
+Grouped by concern. "Required" means startup throws if it's unset; everything else has a default or a safe fallback. Docker-side ports (`POSTGRES_PORT`, `REDIS_PORT`, `ROUTER_PORT`, …) are the **host-published** ports; inside the Compose network the services use their own fixed container ports. The VPS bundle (`deploy/vps/`) has its own compose-level variables — `SWARM_IMAGE_TAG`, `POSTGRES_PASSWORD`, `REDIS_PASSWORD`, and `WEBHOOK_CALLBACK_BASE_URL` doubling as Caddy's site address — listed in `deploy/vps/.env.example`; it assembles `DATABASE_URL` and `REDIS_URL` from them (see [`MANUAL.md`](./MANUAL.md#running-on-a-vps-behind-caddy)).
 
 **Database (Postgres)** — `src/db/client.ts`
 | Variable | Default | Purpose |

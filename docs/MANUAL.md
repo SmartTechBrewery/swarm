@@ -16,6 +16,7 @@ their own subjects; this manual is the operator's path through them.
 - [Quick start, beyond the README](#quick-start-beyond-the-readme)
 - [The worker](#the-worker)
 - [One process, one port (all-in-one control plane)](#one-process-one-port-all-in-one-control-plane)
+- [Running on a VPS behind Caddy](#running-on-a-vps-behind-caddy)
 - [Failure diagnosis](#failure-diagnosis)
 - [Common commands](#common-commands)
 - [Configuration](#configuration)
@@ -857,6 +858,9 @@ services:
 Edit the tag, then `docker compose pull && docker compose up -d` — Compose
 recreates the container only when the image changed.
 
+For a whole server — Postgres, Redis and TLS included — use the ready-made bundle
+in [Running on a VPS behind Caddy](#running-on-a-vps-behind-caddy) instead.
+
 - **Which commit is this?** The image has no `.git`, so the control plane reports
   no build commit of its own; the image label does:
   `docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' ghcr.io/smarttechbrewery/swarm:<tag>`.
@@ -872,6 +876,147 @@ recreates the container only when the image changed.
   The package has to be made **public** once by an org admin (GitHub → the org's
   Packages → `swarm` → Package settings → Change visibility → Public); until then
   an anonymous pull fails.
+
+## Running on a VPS behind Caddy
+
+`deploy/vps/` is a ready-made bundle for running a SWARM control plane on a plain
+Linux server (issue #1153): the [published image](#the-published-image), Postgres
+and Redis, and [Caddy](https://caddyserver.com) in front with automatic HTTPS. It
+needs **no SWARM checkout on the server** and no shell into the app — just its
+three files:
+
+| File | What it is |
+| --- | --- |
+| `docker-compose.yml` | the four services below, their networks, healthchecks and named volumes |
+| `Caddyfile` | one site — your domain — doing `reverse_proxy app:3000` |
+| `.env.example` | every variable the bundle needs, with how to generate each secret |
+
+It is additive: the repo-root `docker-compose.yml`, `.env.docker.example` and the
+[Cloudflare-tunnel](./cloudflare-tunnel.md) layout are unchanged.
+
+| Service | Image | Networks | Published ports |
+| --- | --- | --- | --- |
+| `caddy` | `caddy:2-alpine` | `edge` | `80`, `443` (TCP + UDP) |
+| `app` | `ghcr.io/smarttechbrewery/swarm:<SWARM_IMAGE_TAG>` | `internal`, `edge` | none |
+| `postgres` | `postgres:16-alpine` | `internal` | none |
+| `redis` | `redis:7-alpine` (password-protected) | `internal` | none |
+
+`internal` is a Docker `internal: true` network with no gateway, so Postgres and
+Redis cannot be reached from outside Docker and have no route out either. Caddy is
+the only service that publishes a port — which matters, because Docker-published
+ports bypass host firewalls such as `ufw`. The app's `DATABASE_URL` and `REDIS_URL`
+are assembled by the compose file from `POSTGRES_PASSWORD` and `REDIS_PASSWORD`.
+
+**Prerequisites:** a Linux host with Docker Engine and the Compose v2 plugin; a
+DNS `A`/`AAAA` record for your domain pointing at it; inbound `80` and `443` open
+(Caddy needs `80` for the ACME challenge), and outbound HTTPS allowed (image pulls,
+provider APIs).
+
+### Get the bundle and configure it
+
+Fetch the three files at a ref — ideally the commit of the image tag you are about
+to run (`docker inspect` shows it, see [The published image](#the-published-image)):
+
+```bash
+mkdir swarm && cd swarm
+ref=main   # or the tag / commit you deploy
+base=https://raw.githubusercontent.com/SmartTechBrewery/swarm/$ref/deploy/vps
+for f in docker-compose.yml Caddyfile .env.example; do curl -fsSLO "$base/$f"; done
+cp .env.example .env && chmod 600 .env
+```
+
+(`scp -r deploy/vps` from any checkout works just as well.) Then fill in `.env`:
+
+| Variable | Value |
+| --- | --- |
+| `SWARM_IMAGE_TAG` | a `vX.Y.Z` or `sha-<7>` tag — never `main` on a server |
+| `WEBHOOK_CALLBACK_BASE_URL` | `https://<your domain>` — scheme and host only, no trailing slash; also Caddy's site address |
+| `POSTGRES_PASSWORD`, `REDIS_PASSWORD` | `openssl rand -hex 32` each — hex because they are embedded in URLs |
+| `CREDENTIAL_MASTER_KEY` | `openssl rand -hex 32` — encrypts every stored credential |
+| `SWARM_SINGLE_USER_MODE` | leave `false`; the app refuses to start with `true` |
+
+**Back up `CREDENTIAL_MASTER_KEY` somewhere other than the server now.** Every
+credential the dashboard stores is encrypted with it; losing or changing it makes
+them all undecryptable, and no database backup brings them back. Any other
+variable from [`docs/configuration.md`](./configuration.md) can be added to the
+same `.env`, which is passed to the app whole.
+
+### First start and the first admin
+
+```bash
+docker compose up -d
+docker compose ps                              # wait until app reports (healthy)
+docker compose logs app | grep 'setup?token='  # the first-run setup link
+```
+
+On a fresh database the app logs a one-time link that already starts with
+`https://<your domain>` (see [First-run setup](#quick-start-beyond-the-readme)).
+Open it, enter an e-mail address and a password, and you are signed in as the
+installation admin. The link is single use and expires after an hour; if it has
+lapsed, `docker compose restart app` logs a fresh one.
+
+### Projects, webhooks and workers
+
+- **Create projects in the dashboard** (`https://<your domain>` → New Project),
+  then enter each project's credentials on its Source Control and Project
+  Management tabs. The roles each provider needs are in
+  [`docs/configuration.md`](./configuration.md).
+- **Point webhooks at the domain.** GitHub delivers to
+  `https://<your domain>/github/webhook`; the other providers to
+  `/bitbucket/webhook`, `/gitlab/webhook`, `/azure-devops/webhook`,
+  `/linear/webhook` and `/jira/webhook`, and Trello's is registered with
+  `docker compose exec app node dist/cli/index.js pm webhook create --project <id>`.
+  For GitHub's events and content type follow
+  [Configure the GitHub webhook](./cloudflare-tunnel.md#configure-the-github-webhook)
+  with your domain in place of the tunnel URL; every route is listed in
+  [`docs/operations.md`](./operations.md).
+- **Enroll workers against the domain.** Workers never run on the VPS — each runs
+  on an operator's machine with its own SWARM checkout and agent CLIs. The commands
+  [`onboarding-worker.md`](./onboarding-worker.md) Step 1 runs on "the admin
+  machine" run inside the container here:
+
+  ```bash
+  docker compose exec app node dist/cli/index.js users add ada@example.com --name "Ada Lovelace"
+  docker compose exec app node dist/cli/index.js users set-password ada@example.com
+  docker compose exec app node dist/cli/index.js members add example-project ada@example.com --role member
+  ```
+
+  (membership can also be granted in the dashboard). Then follow Steps 2–6 on the
+  worker's machine with `--control-plane-url https://<your domain>`.
+
+### Restarts, updates, backup and restore
+
+- **Restarts keep everything.** All state is in named volumes (`postgres-data`,
+  `redis-data`, `caddy-data`, `caddy-config`), and every service is
+  `restart: unless-stopped`, so `docker compose down` / `up -d`, `restart` and host
+  reboots lose nothing. **Never run `docker compose down -v`** — `-v` deletes the
+  volumes, the database included.
+- **Updating.** Back up first: migrations only go forward (see
+  [The published image](#the-published-image)). Then set the new
+  `SWARM_IMAGE_TAG` in `.env` and run `docker compose pull && docker compose up -d`.
+  The app applies pending migrations at start, before it serves anything, so there
+  is no separate migrate step. If the bundle files themselves changed at the new
+  ref, fetch them again first.
+- **Backup.** The Postgres volume holds everything durable — users, projects,
+  runs, and every stored credential:
+
+  ```bash
+  docker compose exec -T postgres pg_dump -U swarm -Fc swarm > swarm-$(date +%F).dump
+  ```
+
+  Those credentials are encrypted with `CREDENTIAL_MASTER_KEY`, so a dump is only
+  usable together with that key: back the key up too, **separately** from the
+  dumps. Redis needs no backup — durable dispatch state lives in Postgres and its
+  wake-ups are re-published at startup (ADR-002); at most, deliveries still waiting
+  in the queue are lost. Caddy's volume holds only certificates, which are
+  re-issued if lost.
+- **Restore** into a running stack (same `CREDENTIAL_MASTER_KEY` in `.env`):
+
+  ```bash
+  docker compose stop app
+  docker compose exec -T postgres pg_restore -U swarm -d swarm --clean --if-exists < swarm-<date>.dump
+  docker compose start app
+  ```
 
 ## Failure diagnosis
 
