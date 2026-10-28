@@ -501,8 +501,12 @@ interface MergeDeliveryRecord {
  * previous commit stays, only what the base gained is merged again, and each pass
  * goes through {@link gatePreparedMerge} and {@link commitPreparedTree} exactly as
  * the first did — then the push that follows fast-forwards the branch over the
- * commit already delivered. That also means a pass with nothing to merge is
- * refused by `validatePreparedTree` rather than silently pushed.
+ * commit already delivered. A pass whose merge leaves the tree unchanged — the
+ * base advanced only by a change the branch already holds — is still committed
+ * (`allowUnchangedMerge`, as issue #1117's catch-up does): the merge commit is
+ * what makes the advanced base an ancestor of the head, and refusing it failed a
+ * correct resolution as "no changes at all". A pass with no merge pending at all
+ * is still refused by `validatePreparedTree` rather than silently pushed.
  *
  * Exhausting the bound throws an {@link UnretryableDeliveryError} rather than a
  * plain error, because deferring is the one thing that must not happen: a
@@ -593,6 +597,7 @@ async function deliverMergeAgainstCurrentBase(
 			ctx.worktreePath,
 			mergeCommitSubject(ctx.baseBranch, ctx.prBranch),
 			commitIdentity,
+			{ allowUnchangedMerge: true },
 		);
 		record.committed(commitSha);
 	}

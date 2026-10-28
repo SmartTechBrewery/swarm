@@ -383,6 +383,80 @@ describe('resolve-conflicts when the base advances mid-run', () => {
 		RACE_CASE_TIMEOUT_MS,
 	);
 
+	// PR #1156's run: the base advanced only by what the branch already held, so the
+	// catch-up merge was clean, pending, and left the tree exactly as it was. That
+	// merge commit is still the update — refusing it as "no changes at all" failed a
+	// correct resolution.
+	it(
+		'commits a catch-up merge that leaves the tree unchanged',
+		async () => {
+			const { worktreePath, seed, headSha, baseSha } = makeConflictedCheckout();
+			const options = makeOptions(worktreePath, headSha, baseSha);
+			let advancedTo = '';
+			let passes = 0;
+			options.runAgent = vi.fn(async () => {
+				passes += 1;
+				if (passes === 1) {
+					stageResolution(worktreePath, 'resolved by hand\n');
+					advanceBase(seed, 'main moved on again\n');
+					git(seed, 'revert', '--no-edit', 'HEAD');
+					git(seed, 'push', '-q', 'origin', 'main');
+					advancedTo = git(seed, 'rev-parse', 'HEAD').trim();
+				} else {
+					git(worktreePath, 'fetch', '-q', 'origin');
+					git(worktreePath, 'merge', '--no-verify', '--no-commit', 'origin/main');
+				}
+				return agentResult();
+			});
+
+			const { outcome } = await runResolveConflictsPhase(options);
+
+			expect(outcome.status).toBe('resolved');
+			expect(options.runAgent).toHaveBeenCalledTimes(2);
+			expect(options.pushBranch).toHaveBeenCalledTimes(1);
+			expect(options.pushBranch).toHaveBeenCalledWith(
+				worktreePath,
+				PR_BRANCH,
+				outcome.mergeCommitSha,
+			);
+			expect(() =>
+				git(worktreePath, 'merge-base', '--is-ancestor', advancedTo, outcome.mergeCommitSha),
+			).not.toThrow();
+			expect(git(worktreePath, 'rev-parse', `${outcome.mergeCommitSha}^{tree}`).trim()).toBe(
+				git(worktreePath, 'rev-parse', `${outcome.mergeCommitSha}^1^{tree}`).trim(),
+			);
+		},
+		RACE_CASE_TIMEOUT_MS,
+	);
+
+	// The relaxation covers a pending merge only: a catch-up pass that merged nothing
+	// is still refused rather than pushed as if it had caught up.
+	it(
+		'still refuses a catch-up pass that left no merge pending',
+		async () => {
+			const { worktreePath, seed, headSha, baseSha } = makeConflictedCheckout();
+			const options = makeOptions(worktreePath, headSha, baseSha);
+			let passes = 0;
+			options.runAgent = vi.fn(async () => {
+				passes += 1;
+				if (passes === 1) {
+					stageResolution(worktreePath, 'resolved by hand\n');
+					advanceBase(seed, 'main moved on again\n');
+				}
+				return agentResult();
+			});
+
+			const error = await runResolveConflictsPhase(options).catch((e) => e);
+
+			expect(error).toBeInstanceOf(UnretryableDeliveryError);
+			expect(error.message).toContain('Unsafe delivery: ');
+			expect(error.message).toContain('nothing to deliver');
+			expect(options.pushBranch).not.toHaveBeenCalled();
+			expect(options.postComment).not.toHaveBeenCalled();
+		},
+		RACE_CASE_TIMEOUT_MS,
+	);
+
 	// A base merging continuously must not spin forever, and must not report success
 	// either: the run says what happened and delivers nothing.
 	it(
