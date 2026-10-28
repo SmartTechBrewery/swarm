@@ -15,6 +15,7 @@ their own subjects; this manual is the operator's path through them.
 - [Prerequisites](#prerequisites)
 - [Quick start, beyond the README](#quick-start-beyond-the-readme)
 - [The worker](#the-worker)
+- [One process, one port (all-in-one control plane)](#one-process-one-port-all-in-one-control-plane)
 - [Failure diagnosis](#failure-diagnosis)
 - [Common commands](#common-commands)
 - [Configuration](#configuration)
@@ -742,6 +743,49 @@ to be kept in step. See
 and [`docs/operations.md`](./operations.md) for health checks, ports,
 webhook setup, and troubleshooting.
 
+## One process, one port (all-in-one control plane)
+
+By default a SWARM control plane is **two processes**: the router (Compose,
+`Dockerfile.router` — webhooks, `/worker/*`, `/operator/*`, migrations, dispatch) and
+the API server (`npm run dev:api` / `swarm-api-agent` on `127.0.0.1:3101` —
+`/auth/*`, `/trpc/*`, the dashboard, host maintenance), routed by path in front.
+That layout is unchanged, and stays the default.
+
+For a server behind a reverse proxy, the same control plane can run as **one
+process on one port** (issue #1148):
+
+```bash
+npm run build:dashboard
+npm run serve                          # from source
+npm run build && npm run start:serve   # or from compiled output
+```
+
+Run either from the repo root. It serves everything both processes serve — the
+webhook routes, `/worker/*` including the WebSocket upgrade, `/operator/*`,
+`/auth/*`, `/trpc/*`, the dashboard and a single `/health` — and runs what both
+run: the dispatch consumer, the rollout ticker, the worktree-sweep bridge, the
+orphaned-run reap and the weekly fleet abandoned-worktree sweep. A proxy in front
+needs no path rules (`reverse_proxy app:3000`), and every URL — the workers'
+`SWARM_CONTROL_PLANE_URL`, the provider webhook URLs, `WEBHOOK_CALLBACK_BASE_URL` —
+is the one public base URL.
+
+- **Listen address:** `PORT` (default `3000`) and `SWARM_SERVE_HOST` (default:
+  every interface).
+- **Migrations run at startup, before the port is bound**, so no request or
+  dispatch is served against an older schema. A failed migration exits non-zero.
+- **Unsafe configurations are refused.** The process is treated as
+  network-facing whatever it binds, and will not start with
+  `SWARM_SINGLE_USER_MODE=true` or without a valid `CREDENTIAL_MASTER_KEY`; the
+  error names each problem and its fix. `SWARM_SERVE_ALLOW_INSECURE=true` starts it
+  anyway, with a warning.
+- **The worktree retention sweep is off**, because it prunes checkouts on *this*
+  host, which such a server usually has none of. `SWARM_SERVE_WORKTREE_SWEEP=true`
+  turns it back on.
+- **SIGTERM** stops dispatch, the timers and the listener, then exits.
+
+No container image ships for this mode yet. The variables are in
+[`docs/configuration.md`](./configuration.md) ("All-in-one control plane").
+
 ## Failure diagnosis
 
 For a terminal recognised response stall, SWARM labels a task as **likely scope
@@ -928,6 +972,9 @@ npm run swarm -- login --logout
 # Queue and worktrees
 npm run queue:clear
 npm run worktrees:prune
+
+# The all-in-one control plane: router + API on one port (see above)
+npm run serve
 
 # Verification
 npm run verify
