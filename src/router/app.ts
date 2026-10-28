@@ -50,15 +50,17 @@ export function createRouterApp(): RouterApp {
 }
 
 /**
- * Say so at startup rather than at the first Respond-to-review reply: without the
- * operator token this host cannot resolve the *implementer* persona, so
- * `/worker/delivery/pr-comment` answers 503 for it (issue #444). Only a warning —
- * the reviewer-persona routes, and every non-delivery route, work without it.
+ * Say so at startup rather than at the first event that needs it: without the
+ * operator token this host cannot resolve the *implementer* persona for the
+ * GitHub operations it originates itself — the Respond-to-review author gate, the
+ * sweeps, and merge-automation reads. A Respond-to-review reply does not need it:
+ * it is posted with the requesting worker's stored operator credential (issue
+ * #1152). Only a warning — every delivery route works without it.
  */
 export function warnWhenOperatorTokenUnset(): void {
 	if (!getOperatorGitHubTokenOrNull()) {
 		logger.warn(
-			`${OPERATOR_GH_TOKEN_ENV} is unset — POST /worker/delivery/pr-comment will refuse implementer-persona comments (Respond-to-review replies) until it is set`,
+			`${OPERATOR_GH_TOKEN_ENV} is unset — router-originated GitHub operations that run as the implementer persona (e.g. the Respond-to-review author gate) cannot authenticate until it is set; Respond-to-review replies do not need it (issue #1152) — see docs/configuration.md`,
 		);
 	}
 }

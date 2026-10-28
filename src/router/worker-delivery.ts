@@ -6,17 +6,19 @@
  *
  * The two metadata-only SCM
  * delivery calls — submit a review, post a PR comment — run *here*, on the
- * router, under the persona credential the server already resolves
- * (`getPersonaToken`), instead of on a federated worker holding that token. The
- * review route always writes as the **per-project reviewer PAT**; the PR-comment
- * route writes as the persona its request names — the reviewer for a Review's
- * comment, the implementer for a Respond-to-review reply — defaulting to the
- * reviewer when a client sends none (issue #444). A worker sends only the verdict
- * + comment body + PR number (+ that persona) up the transport
- * (`../scm/transport-delivery.ts`); this module performs the GitHub write and
- * returns the created review/comment id. The persona credential is resolved
- * *inside* this process and never leaves it, and only metadata crosses the wire —
- * the repository tree never does (the local-first boundary, ai/RULES.md §1).
+ * router, under a credential the server resolves, instead of on a federated
+ * worker holding that token. The review route always writes as the **per-project
+ * reviewer PAT**; the PR-comment route writes as the persona its request names —
+ * the reviewer for a Review's comment, the implementer for a Respond-to-review
+ * reply — defaulting to the reviewer when a client sends none (issue #444). The
+ * implementer is the **requesting worker's own stored operator credential** for
+ * the project's SCM provider (issue #1152) — the account that worker pushed and
+ * opened the PR as — never this host's `SWARM_OPERATOR_GH_TOKEN`. A worker sends
+ * only the verdict + comment body + PR number (+ that persona) up the transport
+ * (`../scm/transport-delivery.ts`); this module performs the SCM write and
+ * returns the created review/comment id. Every credential is resolved *inside*
+ * this process and never leaves it, and only metadata crosses the wire — the
+ * repository tree never does (the local-first boundary, ai/RULES.md §1).
  *
  * The review still lands on the PR as a genuine GitHub review, so the existing
  * `pull_request_review`-driven respond-to-review trigger (PROJECT.md §5.4) keeps
@@ -167,6 +169,10 @@ import { getEnrollment } from '../db/repositories/workerEnrollmentsRepository.js
 import type { Worker } from '../identity/worker.js';
 import { isRoutable, type WorkerEnrollment } from '../identity/worker-enrollment.js';
 import {
+	MissingWorkerScmCredentialError,
+	requireWorkerScmCredential,
+} from '../identity/worker-scm-credential.js';
+import {
 	recordWorkerUpdateReport,
 	recordWorktreeSweepReport,
 	resolveWorkerByCredential,
@@ -177,7 +183,10 @@ import {
 // module having loaded the entrypoint first (matching `./webhook-receiver.ts`).
 import '../integrations/entrypoint.js';
 import { requireProjectPMProvider } from '../integrations/pm/index.js';
-import { requireProjectSCMProvider } from '../integrations/scm/registry.js';
+import {
+	requireProjectSCMProvider,
+	requireProjectSCMProviderId,
+} from '../integrations/scm/registry.js';
 import { logger } from '../lib/logger.js';
 import {
 	type ScheduleFollowUpReview,
@@ -269,8 +278,22 @@ export interface WorkerDeliveryDeps {
 	 * crosses.
 	 */
 	isDispatchOrphaned: (workerId: string, dispatchId: string) => boolean;
-	/** Build the server-side SCM delivery provider for a project + persona (resolves the PAT here). */
+	/**
+	 * Build the server-side SCM delivery provider for a project + persona. Consulted
+	 * for the **reviewer** persona only (resolves the per-project reviewer PAT here);
+	 * an implementer write goes through {@link buildOperatorScmDelivery}.
+	 */
 	buildScmDelivery: (project: ProjectConfig, persona: ScmPersona) => Promise<ScmDeliveryProvider>;
+	/**
+	 * Build the SCM delivery provider an **implementer**-persona write runs under: the
+	 * requesting worker's own stored operator credential for the project's SCM
+	 * provider (issue #1152) — the account that worker pushed and opened the PR as —
+	 * never this host's `SWARM_OPERATOR_GH_TOKEN`.
+	 */
+	buildOperatorScmDelivery: (
+		project: ProjectConfig,
+		worker: Worker,
+	) => Promise<ScmDeliveryProvider>;
 	/** Build the server-side PM provider for a project (resolves the per-project PM credential here). */
 	buildPmProvider: (project: ProjectConfig) => PMProvider;
 	/**
@@ -348,6 +371,7 @@ function defaultDeps(): WorkerDeliveryDeps {
 		isDispatchOrphaned: isDispatchOrphanedFrom,
 		buildScmDelivery: (project, persona) =>
 			requireProjectSCMProvider(project).deliveryProvider(project, persona),
+		buildOperatorScmDelivery,
 		buildPmProvider: requireProjectPMProvider,
 		reviewLedger: { getPriorSubmittedReview, markReviewVerdictSubmitted, abandonReviewVerdict },
 		scheduleFollowUpReview: scheduleFollowUpReviewDefault,
@@ -362,7 +386,8 @@ function defaultDeps(): WorkerDeliveryDeps {
  * A delivery outcome: the HTTP status and the JSON body to return.
  *
  * `503` is the one server-fault member: a persona credential this host cannot
- * resolve ({@link resolvePersonaDelivery}). It is answered rather than thrown so
+ * resolve, or a stored operator credential the requesting worker lacks
+ * ({@link resolvePersonaDelivery}). It is answered rather than thrown so
  * the worker learns *why* its write failed — an escaped throw becomes the app-level
  * `internal error` 500, whose body carries no reason at all.
  *
@@ -389,31 +414,86 @@ interface RunDeliveryRequest extends ProjectDeliveryRequest {
 }
 
 /**
+ * The default {@link WorkerDeliveryDeps.buildOperatorScmDelivery}: the project's SCM
+ * provider's operator delivery provider, authenticated with the credential stored
+ * for `worker` on that provider (issue #1152). Resolved exactly as the dispatcher
+ * resolves the credential it hands the phase (`resolveOperatorCredential`,
+ * `./dispatcher.ts`), so the reply is authored by the same account that pushed the
+ * fix. No env fallback: one would quietly restore the single-account authorship
+ * this replaced. A worker with none throws {@link MissingWorkerScmCredentialError}.
+ *
+ * `project` is already scoped to the run's repository ({@link authenticateRunDelivery}).
+ */
+export async function buildOperatorScmDelivery(
+	project: ProjectConfig,
+	worker: Worker,
+): Promise<ScmDeliveryProvider> {
+	const scmProviderId = requireProjectSCMProviderId(project);
+	const credential = await requireWorkerScmCredential({
+		workerId: worker.id,
+		workerName: worker.displayName,
+		scmProviderId,
+	});
+	return requireProjectSCMProvider(project).operatorDeliveryProvider(project.repo, credential);
+}
+
+/**
+ * Why an implementer write is refused when the requesting worker has no stored
+ * operator credential for the project's SCM provider (issue #1152). Built only from
+ * the error's typed fields, so no secret can reach the body, and naming both places
+ * an operator can set it.
+ */
+export function missingOperatorCredentialReason(error: MissingWorkerScmCredentialError): string {
+	return (
+		`no operator source-control credential is stored for worker '${error.workerName}' on ` +
+		`${error.scmProviderId} — set it on the worker's dashboard page (/workers/${error.workerId}, ` +
+		`"Operator source-control credential") or with ` +
+		`\`swarm workers set-scm-credential ${error.workerId} ${error.scmProviderId}\``
+	);
+}
+
+/**
  * Resolve the SCM delivery provider for one persona, converting a credential this
  * host cannot resolve into an answerable `503` instead of an escaped throw.
  *
  * Both SCM routes need this because the credential is only discovered at call
  * time and its absence is ordinary misconfiguration, not a bug: the reviewer PAT
- * is a per-project secret that may be missing, and `implementer` resolves to this
- * host's `SWARM_OPERATOR_GH_TOKEN`, which the router did not need for
- * `/pr-comment` before issue #444 and which ships commented out in
- * `.env.docker.example`. Without this, the phase's only symptom is
- * `… failed with status 500` in the worker's log, with the actionable cause
- * visible solely in the router's own logs — for a Respond-to-review that has
- * already pushed its fix and now gets neither a reply nor a re-review.
+ * is a per-project secret that may be missing, and `implementer` is the requesting
+ * worker's stored operator credential (issue #1152), which an operator can remove
+ * between the dispatch that checked it and the reply. Without this, the phase's
+ * only symptom is `… failed with status 500` in the worker's log, with the
+ * actionable cause visible solely in the router's own logs — for a
+ * Respond-to-review that has already pushed its fix and now gets neither a reply
+ * nor a re-review.
  *
- * The caught error is logged server-side and never returned: it can name the
+ * A missing stored credential is recognized by type and answered with
+ * {@link missingOperatorCredentialReason}, which names what to set. Any other
+ * caught error is logged server-side and never returned: it can name the
  * credential the module is contracted not to reflect.
  */
 async function resolvePersonaDelivery(
 	deps: WorkerDeliveryDeps,
 	project: ProjectConfig,
+	worker: Worker,
 	persona: ScmPersona,
 	route: string,
 ): Promise<ScmDeliveryProvider | DeliveryResult> {
 	try {
-		return await deps.buildScmDelivery(project, persona);
+		return persona === 'implementer'
+			? await deps.buildOperatorScmDelivery(project, worker)
+			: await deps.buildScmDelivery(project, persona);
 	} catch (error) {
+		if (error instanceof MissingWorkerScmCredentialError) {
+			logger.warn('worker-delivery: requesting worker has no stored operator credential', {
+				route,
+				projectId: project.id,
+				workerId: error.workerId,
+				scmProviderId: error.scmProviderId,
+				persona,
+			});
+			return { status: 503, json: { reason: missingOperatorCredentialReason(error), persona } };
+		}
+
 		const message = error instanceof Error ? error.message : String(error);
 		const isIdentityUnresolved = message.toLowerCase().includes('identity');
 
@@ -668,6 +748,7 @@ export async function handleSubmitReview(
 	const delivery = await resolvePersonaDelivery(
 		deps,
 		authed.project,
+		authed.worker,
 		'reviewer',
 		'/worker/delivery/review',
 	);
@@ -690,11 +771,14 @@ export async function handleSubmitReview(
  * comments as the reviewer, while a Respond-to-review reply is the implementer
  * answering that review, and inferring `reviewer` here had the reviewer answering
  * itself (issue #444). The schema defaults the field to `reviewer`, so a client
- * that sends no persona behaves exactly as before. `implementer` resolves through
- * the same `getPersonaToken` seam to this host's `SWARM_OPERATOR_GH_TOKEN` — which
- * the router already holds for loop prevention — and, like the reviewer PAT, that
- * credential is resolved inside this process and never leaves it. A host that
- * cannot resolve it answers `503` with a reason rather than throwing
+ * that sends no persona behaves exactly as before. `implementer` resolves to the
+ * **requesting worker's** stored operator credential for the project's SCM provider
+ * (issue #1152, {@link buildOperatorScmDelivery}), so on a control plane several
+ * operators share, each reply is authored by the operator whose worker did the work
+ * — not by whichever account this host's `SWARM_OPERATOR_GH_TOKEN` names, which this
+ * route no longer reads. Like the reviewer PAT, that credential is resolved inside
+ * this process and never leaves it. A worker with none, or a credential that cannot
+ * be resolved, answers `503` with a reason rather than throwing
  * ({@link resolvePersonaDelivery}).
  */
 export async function handlePostComment(
@@ -718,6 +802,7 @@ export async function handlePostComment(
 	const delivery = await resolvePersonaDelivery(
 		deps,
 		authed.project,
+		authed.worker,
 		request.persona,
 		'/worker/delivery/pr-comment',
 	);
