@@ -92,6 +92,7 @@ import {
 	noteWorkerTransportLost,
 	noteWorkerTransportRestored,
 	resolveDispatchStreamTarget,
+	resolveTrustedOrphanStreamTarget,
 } from './dispatch-results.js';
 import {
 	persistControlPlaneNote,
@@ -213,6 +214,17 @@ export interface WorkerTransportDeps {
 	 */
 	resolveDispatchStreamTarget: (dispatchId: string) => DispatchStreamTarget | undefined;
 	/**
+	 * The fallback for a `stream-log` whose dispatch is not awaited here on this worker
+	 * (issue #1171): the worker and run recorded for a **trusted** orphan of that
+	 * dispatch on the socket's own worker (`./dispatch-results.ts`). A worker that came
+	 * back after the transport-loss reap may still be running a phase whose late success
+	 * would be adopted, so its output belongs on that run until the trust ends.
+	 */
+	resolveTrustedOrphanStreamTarget: (
+		dispatchId: string,
+		workerId: string,
+	) => DispatchStreamTarget | undefined;
+	/**
 	 * A worker just became reachable here — wake the dispatches that were deferred
 	 * only because none was (issue #610, `../dispatch/dispatcher.ts`). Fire-and-
 	 * forget by contract: it returns `void` so opening a socket never waits on
@@ -306,6 +318,7 @@ function defaultDeps(): WorkerTransportDeps {
 		deliverDispatchAck,
 		persistStreamLog,
 		resolveDispatchStreamTarget,
+		resolveTrustedOrphanStreamTarget,
 		onWorkerAvailable: (workerId) => {
 			void promoteAvailabilityWaitsForWorker(workerId, 'connected');
 		},
@@ -752,12 +765,23 @@ export async function handleWorkerStreamFrame(
 		// of any project — so the batch is persisted only when this router is
 		// awaiting that dispatch AND pushed it to *this* socket's worker, and it is
 		// written under the run id the router recorded, not the one the frame claims.
-		const target = deps.resolveDispatchStreamTarget(frame.dispatchId);
-		if (!target || target.workerId !== ctx.workerId) {
+		//
+		// The one exception to "awaited here" is a worker that came back after the
+		// transport-loss reap (issue #1171). While its orphan is trusted — the dispatch
+		// is still waiting for the automatic retry that would adopt its late success —
+		// its output goes to the run recorded for that orphan, keyed by the dispatch and
+		// this socket's worker. Once the trust ends (the retry or **Retry now** is
+		// claimed, or the run settles) its frames take the drop path again.
+		const awaited = deps.resolveDispatchStreamTarget(frame.dispatchId);
+		const target =
+			awaited?.workerId === ctx.workerId
+				? awaited
+				: deps.resolveTrustedOrphanStreamTarget(frame.dispatchId, ctx.workerId);
+		if (!target) {
 			logger.warn('stream-log for a dispatch this router did not push here — dropping', {
 				dispatchId: frame.dispatchId,
 				workerId: ctx.workerId,
-				awaited: !!target,
+				awaited: !!awaited,
 			});
 			return { action: 'ignore' };
 		}

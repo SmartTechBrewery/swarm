@@ -18,6 +18,7 @@ import {
 	ORPHANED_DISPATCH_RETENTION_MS,
 	resolveDispatchStreamTarget,
 	resolveDispatchTargetForRun,
+	resolveTrustedOrphanStreamTarget,
 	takeOverOrphanedDispatch,
 } from '@/router/dispatch-results.js';
 import type { TaskAssignmentAck, TaskExecutionResult, TaskProgress } from '@/transport/protocol.js';
@@ -702,6 +703,39 @@ describe('trusted orphans', () => {
 
 		expect(listOrphanedDispatchesForWorker(WORKER_A)).toEqual([]);
 		expect(isDispatchOrphanedFrom(WORKER_A, DISPATCH_A)).toBe(false);
+	});
+
+	// Issue #1171: its output reaches the run while the trust lasts.
+	it('resolves a trusted orphan stream target for its own worker only', () => {
+		orphan();
+
+		expect(resolveTrustedOrphanStreamTarget(DISPATCH_A, WORKER_A)).toEqual({
+			workerId: WORKER_A,
+			runId: 'run-a',
+		});
+		expect(resolveTrustedOrphanStreamTarget(DISPATCH_A, WORKER_B)).toBeUndefined();
+		expect(resolveTrustedOrphanStreamTarget(DISPATCH_B, WORKER_A)).toBeUndefined();
+		// The wait is gone, and the awaited-only seam does not change meaning.
+		expect(resolveDispatchStreamTarget(DISPATCH_A)).toBeUndefined();
+	});
+
+	it('stops resolving the stream target once the trust ends', () => {
+		orphan();
+		takeOverOrphanedDispatch(DISPATCH_A);
+		expect(resolveTrustedOrphanStreamTarget(DISPATCH_A, WORKER_A)).toBeUndefined();
+
+		// A retry pushed back to the same worker forgets the record outright.
+		orphan();
+		takeOverOrphanedDispatch(DISPATCH_A, WORKER_A);
+		expect(resolveTrustedOrphanStreamTarget(DISPATCH_A, WORKER_A)).toBeUndefined();
+	});
+
+	it('stops resolving the stream target once the late success is handed to the adoption', () => {
+		orphan();
+
+		deliverDispatchResult(result(DISPATCH_A), WORKER_A, vi.fn());
+
+		expect(resolveTrustedOrphanStreamTarget(DISPATCH_A, WORKER_A)).toBeUndefined();
 	});
 
 	it('hands a late success to the adoption hook and forgets the orphan', () => {

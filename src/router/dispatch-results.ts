@@ -47,9 +47,9 @@
  *
  * Since issue #1076 an orphan starts out **trusted**: while its dispatch waits for
  * that automatic retry, the late phase is left to finish — it is not stopped on
- * return, its delivery calls are served, and a late `succeeded` result is handed to
- * an injected adoption hook that settles the run with it
- * (`./transport-loss-reaper.ts`). Trust ends once the dispatch stops waiting for that
+ * return, its delivery calls are served, its streamed output reaches the run
+ * (issue #1171), and a late `succeeded` result is handed to an injected adoption hook
+ * that settles the run with it (`./transport-loss-reaper.ts`). Trust ends once the dispatch stops waiting for that
  * retry — the retry is claimed, or the run settles any other way
  * ({@link takeOverOrphanedDispatch}); from then on the orphan is stopped and fenced
  * exactly as #1073 describes.
@@ -170,8 +170,9 @@ export interface OrphanedDispatch extends DispatchRegistration {
 	 * Whether the late phase is still allowed to finish (issue #1076). Set at the reap,
 	 * whose deferral schedules an automatic retry; cleared by
 	 * {@link takeOverOrphanedDispatch} once that retry takes over or the run settles
-	 * terminally. A trusted orphan is neither stopped nor fenced, and its late success
-	 * is adopted rather than dropped.
+	 * terminally. A trusted orphan is neither stopped nor fenced, its late success
+	 * is adopted rather than dropped, and its `stream-log` frames are persisted to its
+	 * recorded run (issue #1171).
 	 */
 	trusted: boolean;
 }
@@ -809,6 +810,29 @@ export function resolveDispatchStreamTarget(dispatchId: string): DispatchStreamT
 	const entry = pending.get(dispatchId);
 	if (!entry) return undefined;
 	return { workerId: entry.workerId, runId: entry.runId };
+}
+
+/**
+ * The worker and run recorded for a **trusted** orphan of `dispatchId` on `workerId`,
+ * or `undefined` when there is none (issue #1171) — the `stream-log` authorization
+ * fallback for a worker that came back after the transport-loss reap.
+ *
+ * {@link resolveDispatchStreamTarget} answers only for a dispatch awaited here, and the
+ * reap ends that wait, so the returning worker's output was dropped for the whole
+ * window in which its late success would still be adopted. This answers from the same
+ * record and the same trust check {@link deliverDispatchResult} applies to that result:
+ * the orphan keyed by the dispatch **and** the socket's authenticated worker, still
+ * trusted. The run is the one recorded at push time, never the frame's. Once the trust
+ * ends ({@link takeOverOrphanedDispatch}) or the record goes — the late success handed
+ * to the adoption, the retention elapsed, a router restart — it answers `undefined`.
+ */
+export function resolveTrustedOrphanStreamTarget(
+	dispatchId: string,
+	workerId: string,
+): DispatchStreamTarget | undefined {
+	const orphan = orphaned.get(orphanKey(dispatchId, workerId));
+	if (!orphan?.trusted) return undefined;
+	return { workerId: orphan.workerId, runId: orphan.runId };
 }
 
 /**

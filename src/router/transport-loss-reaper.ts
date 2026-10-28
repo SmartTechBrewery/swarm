@@ -102,8 +102,9 @@
  * failure was posted, and the run can be settled by re-entering `processJob` through
  * the same dispatch. So while the dispatch is still waiting for its automatic retry
  * (`retry-scheduled` with wait reason `transport-lost`), the orphan is *trusted*: its
- * returning worker is not told to stop, its delivery calls are served, and a late
- * `succeeded` result is adopted by {@link acceptLateOrphanResult}. That makes the
+ * returning worker is not told to stop, its delivery calls are served, its streamed
+ * output is written to the run (issue #1171), and a late `succeeded` result is adopted
+ * by {@link acceptLateOrphanResult}. That makes the
  * scheduled retry due at once, carrying the result, and `processJob` settles the run
  * succeeded through its ordinary success tail — the next phase for the item and every
  * split child it advanced, merge automation, CI recovery. The phase is not run again
@@ -112,10 +113,11 @@
  * retry — or the operator's Retry now — is claimed ({@link endOrphanTrustAtClaim}), or
  * when the run settles without a claim ({@link stopOrphansOfDispatch}, through
  * {@link endOrphanTrustUnlessRetryPending}); from then on the orphan is stopped and
- * fenced exactly as above, and a late success is dropped.
+ * fenced exactly as above, its output is dropped again, and a late success is dropped.
  *
  * A router restart inside the window loses the in-memory orphan record, so the late
- * result is dropped and the scheduled retry runs at its due time.
+ * result and the returning worker's output are dropped and the scheduled retry runs at
+ * its due time.
  */
 
 import {
