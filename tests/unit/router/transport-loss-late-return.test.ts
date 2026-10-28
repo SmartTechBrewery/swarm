@@ -9,6 +9,7 @@ import {
 	deliverDispatchResult,
 	isDispatchOrphanedFrom,
 	noteWorkerTransportLost,
+	resolveTrustedOrphanStreamTarget,
 } from '@/router/dispatch-results.js';
 import { LATE_RESULT_ACCEPTED_NOTE } from '@/router/stream-log-persistence.js';
 import {
@@ -605,6 +606,34 @@ describe('a phase reaped on transport loss that finishes on its reconnected work
 		await endOrphanTrustUnlessRetryPending(DISPATCH_ID);
 
 		expect(isDispatchOrphanedFrom(WORKER_ID, DISPATCH_ID)).toBe(true);
+	});
+
+	// Issue #1171: while the retry waits, the returning worker's output is the run's.
+	it('keeps the returning worker output on the run while the retry waits, and stops at the claim', async () => {
+		await reaped();
+		const returned = fakeWs();
+		registerConnection(WORKER_ID, returned);
+		stopOrphanedDispatchesOnReturn(WORKER_ID);
+
+		expect(resolveTrustedOrphanStreamTarget(DISPATCH_ID, WORKER_ID)).toEqual({
+			workerId: WORKER_ID,
+			runId: RUN_ID,
+		});
+		expect(resolveTrustedOrphanStreamTarget(DISPATCH_ID, RETRY_WORKER_ID)).toBeUndefined();
+
+		endOrphanTrustAtClaim(DISPATCH_ID);
+
+		expect(resolveTrustedOrphanStreamTarget(DISPATCH_ID, WORKER_ID)).toBeUndefined();
+		deregisterConnection(WORKER_ID, returned);
+	});
+
+	it('drops the returning worker output once the run settles without a retry', async () => {
+		await reaped();
+		getDispatchById.mockResolvedValue(scheduledRetry({ state: 'failed', waitReason: null }));
+
+		await endOrphanTrustUnlessRetryPending(DISPATCH_ID);
+
+		expect(resolveTrustedOrphanStreamTarget(DISPATCH_ID, WORKER_ID)).toBeUndefined();
 	});
 
 	it('pushes the terminal stop at once when the lost worker is already back', async () => {

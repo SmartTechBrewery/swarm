@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import type { WSContext } from 'hono/ws';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
 	DEFAULT_WORKER_SUPPORTED_PHASES,
 	type Worker,
@@ -12,8 +12,13 @@ import { logger } from '@/lib/logger.js';
 import { resendRunCancellationsToWorker } from '@/router/dispatch-cancellation.js';
 import {
 	awaitDispatchResult,
+	deliverDispatchResult,
+	failOrphanedDispatchResultWait,
 	noteWorkerTransportLost,
 	noteWorkerTransportRestored,
+	resolveDispatchStreamTarget,
+	resolveTrustedOrphanStreamTarget,
+	takeOverOrphanedDispatch,
 } from '@/router/dispatch-results.js';
 import { isWorkerConnected, sendToWorker } from '@/router/worker-connections.js';
 import {
@@ -109,6 +114,8 @@ function makeDeps(overrides: Partial<WorkerTransportDeps> = {}): WorkerTransport
 		// By default this router is awaiting the dispatch and pushed it to WORKER_ID,
 		// so a stream-log from that socket is authorized (issue #544 review, F1).
 		resolveDispatchStreamTarget: vi.fn(() => ({ workerId: WORKER_ID, runId: RUN_ID })),
+		// No trusted orphan by default (issue #1171).
+		resolveTrustedOrphanStreamTarget: vi.fn(() => undefined),
 		onWorkerAvailable: vi.fn(),
 		onWorkerTransportLost: vi.fn(),
 		onWorkerTransportRestored: vi.fn(),
@@ -961,6 +968,22 @@ describe('handleWorkerStreamFrame', () => {
 
 		expect(action).toEqual({ action: 'ignore' });
 		expect(deps.persistStreamLog).not.toHaveBeenCalled();
+		expect(deps.resolveTrustedOrphanStreamTarget).toHaveBeenCalledWith(DISPATCH, WORKER_ID);
+	});
+
+	it('persists a trusted orphan stream-log under the run recorded for it (issue #1171)', async () => {
+		const deps = makeDeps({
+			resolveDispatchStreamTarget: vi.fn(() => undefined),
+			resolveTrustedOrphanStreamTarget: vi.fn(() => ({ workerId: WORKER_ID, runId: RUN_ID })),
+		});
+
+		await handleWorkerStreamFrame(
+			deps,
+			ctx,
+			streamLogFrame('cccccccc-cccc-4ccc-8ccc-cccccccccccc'),
+		);
+
+		expect(deps.persistStreamLog).toHaveBeenCalledWith(expect.anything(), RUN_ID);
 	});
 
 	it('drops a stream-log whose dispatch was pushed to a different worker', async () => {
@@ -987,6 +1010,88 @@ describe('handleWorkerStreamFrame', () => {
 		);
 
 		expect(deps.persistStreamLog).toHaveBeenCalledWith(expect.anything(), RUN_ID);
+	});
+
+	/**
+	 * A worker that came back after the transport-loss reap while its dispatch still
+	 * waits for the automatic retry: its orphan is trusted, so its output belongs on
+	 * the run — and only until the trust ends (issue #1171). Wired to the real registry.
+	 */
+	describe('stream-log from a worker that came back after the transport-loss reap (issue #1171)', () => {
+		const OTHER_WORKER = '99999999-9999-4999-8999-999999999999';
+
+		function orphanOn(workerId: string): void {
+			const awaiting = awaitDispatchResult(DISPATCH, {
+				workerId,
+				runId: RUN_ID,
+				phase: 'implementation',
+				taskId: '1171',
+			});
+			failOrphanedDispatchResultWait(DISPATCH, 'transport lost');
+			awaiting.dispose();
+		}
+
+		function realDeps(): WorkerTransportDeps {
+			return makeDeps({ resolveDispatchStreamTarget, resolveTrustedOrphanStreamTarget });
+		}
+
+		afterEach(() => {
+			takeOverOrphanedDispatch(DISPATCH, WORKER_ID);
+			takeOverOrphanedDispatch(DISPATCH, OTHER_WORKER);
+		});
+
+		it('persists its output under the recorded run during the trust window', async () => {
+			orphanOn(WORKER_ID);
+			const deps = realDeps();
+
+			await handleWorkerStreamFrame(
+				deps,
+				ctx,
+				streamLogFrame('cccccccc-cccc-4ccc-8ccc-cccccccccccc'),
+			);
+
+			expect(deps.persistStreamLog).toHaveBeenCalledWith(expect.anything(), RUN_ID);
+		});
+
+		it('drops its output once the retry is claimed', async () => {
+			orphanOn(WORKER_ID);
+			takeOverOrphanedDispatch(DISPATCH);
+			const deps = realDeps();
+
+			await handleWorkerStreamFrame(deps, ctx, streamLogFrame(RUN_ID));
+
+			expect(deps.persistStreamLog).not.toHaveBeenCalled();
+		});
+
+		it('drops a frame from a worker other than the orphan one', async () => {
+			orphanOn(OTHER_WORKER);
+			const deps = realDeps();
+
+			await handleWorkerStreamFrame(deps, ctx, streamLogFrame(RUN_ID));
+
+			expect(deps.persistStreamLog).not.toHaveBeenCalled();
+		});
+
+		it('drops its output once the late success is handed to the adoption', async () => {
+			orphanOn(WORKER_ID);
+			deliverDispatchResult(
+				{
+					type: 'task-execution-result',
+					dispatchId: DISPATCH,
+					phase: 'implementation',
+					taskId: '1171',
+					status: 'succeeded',
+					exitCode: 0,
+				},
+				WORKER_ID,
+				vi.fn(),
+			);
+			const deps = realDeps();
+
+			await handleWorkerStreamFrame(deps, ctx, streamLogFrame(RUN_ID));
+
+			expect(deps.persistStreamLog).not.toHaveBeenCalled();
+		});
 	});
 });
 

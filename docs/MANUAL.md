@@ -1099,9 +1099,13 @@ the run settles `completed` and the next phase starts as if the result had arriv
 time. The Queue briefly shows the dispatch as "settling with the late result of the lost
 worker", and the run detail and the run's output say the late result was accepted. While
 the retry is still waiting the returning worker is allowed to finish, so its board
-writes land; once the retry is picked up (or Retry now was pressed) — even if it then
-has to wait again, say for an eligible worker — the old attempt is told to stop and
-anything it still tries to write is refused.
+writes land and its output appears in the run's output again — the run stays
+**Deferred**, but its output shows the phase is still alive (issue #1171). Once the
+retry is picked up (or Retry now was pressed) — even if it then has to wait again, say
+for an eligible worker — the old attempt is told to stop, anything it still tries to
+write is refused, and its output is no longer shown. If the SWARM router restarts while
+the retry is waiting it forgets the returning worker: neither its output nor its late
+result is kept, and the retry runs when due.
 
 **Is this worker running the fix?** The dashboard's **Workers** screen answers it.
 Each machine's daemon declares the SWARM build it is actually running — the commit
