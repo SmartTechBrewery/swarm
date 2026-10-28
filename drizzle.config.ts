@@ -13,6 +13,7 @@ export default defineConfig({
 		'./src/db/schema/instanceScmCredentials.ts',
 		'./src/db/schema/users.ts',
 		'./src/db/schema/userSessions.ts',
+		'./src/db/schema/userPasswordTokens.ts',
 		'./src/db/schema/userIdentities.ts',
 		'./src/db/schema/projectMembers.ts',
 		'./src/db/schema/projectMembershipRequests.ts',
