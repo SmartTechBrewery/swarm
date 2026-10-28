@@ -756,9 +756,9 @@ export interface PMProvider {
 	 * must finish first). Idempotent — re-adding an existing relationship is a
 	 * no-op — and a no-op entirely when the provider has no dependency concept
 	 * ({@link supportsDependencies} is `false`). Both are provider-native work-item
-	 * ids. Planning's task-splitting uses this to chain the ordered phases so a
-	 * later phase can't start before its predecessors land (widen-the-interface,
-	 * ai/RULES.md §2).
+	 * ids. Planning's task-splitting uses this to block a phase on each earlier
+	 * phase it really depends on, so it can't start before they land (issue #1176;
+	 * widen-the-interface, ai/RULES.md §2).
 	 */
 	addBlockedBy(id: string, blockerId: string): Promise<void>;
 

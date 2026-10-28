@@ -67,7 +67,10 @@ export const MAX_SPLIT_CHILDREN = 64;
  * {@link PROPOSED_SPLIT_FILENAME}), named with one shared task name so every phase
  * of one issue is recognisable together on the board (issue #594 — SWARM enforces
  * that convention on the titles it writes, `src/pipeline/split-naming.ts`, so the
- * prompt asks for it rather than relying on it). A right-sized task is left whole. It is also
+ * prompt asks for it rather than relying on it). Each child also declares the earlier
+ * phases it really depends on (`dependsOn`, issue #1176) — SWARM records exactly those
+ * as blocked-by relationships, so independent children can run in parallel instead of
+ * being chained behind every phase before them. A right-sized task is left whole. It is also
  * told to record a scope gate — a "## Scope gate" section in `proposed_plan.md`
  * and a machine-readable {@link PROPOSED_SCOPE_FILENAME} — that SWARM's
  * deterministic post-plan guard validates.
@@ -120,7 +123,7 @@ export function buildPlanningPrompt(
 			'',
 			'FIRST, judge the size of this work item. If it is too large to implement well',
 			'in a single focused pull request, SPLIT it into smaller, independently-shippable',
-			'tasks ordered so each builds on the last:',
+			'tasks, ordered so every task comes after any task it depends on:',
 			`  - Write "${PROPOSED_PLAN_FILENAME}" as the plan for ONLY the FIRST task — the`,
 			'    smaller piece this item should become. It may be a re-scoped, renamed version',
 			'    of the original.',
@@ -135,7 +138,8 @@ export function buildPlanningPrompt(
 			'          {',
 			'            "title": "<next task>",',
 			'            "description": "<what it covers, self-contained>",',
-			'            "plan": "<concise Markdown implementation plan for this task>"',
+			'            "plan": "<concise Markdown implementation plan for this task>",',
+			'            "dependsOn": [<phase numbers of the earlier tasks it needs; [] if none>]',
 			'          }',
 			'        ]',
 			'      }',
@@ -153,17 +157,28 @@ export function buildPlanningPrompt(
 			'    TASK "<shared task name> <phase>/<total>: <this phase\'s task>", e.g.',
 			'    "Trello PM 1/3: Board reads", "Trello PM 2/3: Board writes",',
 			'    "Trello PM 3/3: The dependency opt-out" — the shared name FIRST, never a',
-			'    bare "Phase 2/3: …". A later phase must never be startable before its',
-			'    predecessors — SWARM also records this as a blocked-by relationship and',
-			'    defers a phase whose predecessors are still open, so make each',
-			'    "description" state which earlier phases it needs.',
+			'    bare "Phase 2/3: …". The numbering is the suggested order, not by itself a',
+			'    hard sequence.',
+			'    DECLARE ONLY REAL DEPENDENCIES. Analyse how the tasks actually affect each',
+			'    other and give EVERY "subTasks" entry a "dependsOn" array: the phase numbers',
+			'    of the EARLIER tasks it genuinely needs to land first — because it builds on',
+			'    code, schema, APIs, or behavior that task introduces, or because both make',
+			'    overlapping, non-trivial changes to the same code. Use [] when it could be',
+			'    implemented at the same time as the others — including when the only',
+			'    expected overlap is documentation (README.md, docs/*.md) or small config',
+			'    files, whose merge conflicts are trivial to resolve. Phase 1 is the first',
+			'    task; a task may name only phases before its own. SWARM records exactly',
+			'    these as blocked-by relationships and defers a phase until the tasks it',
+			'    names are done, while a task with [] can be picked up in parallel — so',
+			'    make each "description" state what it depends on and why, or that it is',
+			'    independent and why.',
 			'    Each "subTasks" entry is a task planned separately later. Write its "description"',
 			'    complete enough to stand on its own, and its "plan" (concise GitHub-flavored',
 			'    Markdown) covering:',
 			'      * self-contained scope and acceptance criteria;',
 			'      * anything intentionally left out of scope;',
 			'      * the relevant files, symbols, and existing patterns to follow;',
-			'      * dependencies on the preceding split tasks (what must land first);',
+			'      * which earlier split tasks it depends on and why — or why it is independent;',
 			'      * an ordered implementation outline;',
 			'      * focused verification guidance (the checks/tests to run).',
 			`  - Name AT MOST ${MAX_SPLIT_CHILDREN} "subTasks" entries — a split larger than that is a`,

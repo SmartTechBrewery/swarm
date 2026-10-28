@@ -134,11 +134,22 @@ const MainTaskSchema = z.object({
  * self-contained Markdown brief (scope + acceptance criteria, exclusions,
  * relevant files/symbols, dependencies on preceding siblings, an ordered
  * outline, and verification guidance — see {@link buildPlanningPrompt}).
+ *
+ * `dependsOn` is the planner's dependency decision for this child (issue #1176):
+ * the phase numbers (phase 1 is the main task) of the earlier phases it really
+ * needs to land first, and nothing else — `[]` for a child that can be implemented
+ * in parallel with the rest. Only *earlier* phases may be named, which
+ * {@link ProposedSplitSchema} enforces, so the recorded edges can never form a
+ * cycle and every prerequisite is created on the board ahead of what it blocks.
+ * Optional so a response that omits it degrades to the conservative answer — blocked
+ * by every earlier phase ({@link splitChildDependencies}) — rather than failing a
+ * Planning run, or starting a phase early.
  */
 const SplitSubTaskSchema = z.object({
 	title: z.string().trim().min(1),
 	description: z.string(),
 	plan: z.string().trim().min(1),
+	dependsOn: z.array(z.number().int().min(1)).optional(),
 });
 
 /**
@@ -160,18 +171,37 @@ const SplitSubTaskSchema = z.object({
  * single child card exists, so no board write can ever produce a split whose later
  * children the recovery scan would not reach (issue #911). An over-cap file is a failed
  * run like any other malformed one, not a silently truncated split.
+ *
+ * Each child's `dependsOn` is checked here for the same reason (issue #1176): a child
+ * naming its own or a later phase would be a forward edge — the half of a cycle, or a
+ * dependency on a card that does not exist yet — and rejecting it before the first
+ * board write is what keeps that from being recorded at all.
  */
-const ProposedSplitSchema = z.object({
-	sharedName: z.string().trim().min(1).optional(),
-	mainTask: MainTaskSchema.optional(),
-	subTasks: z
-		.array(SplitSubTaskSchema)
-		.max(
-			MAX_SPLIT_CHILDREN,
-			`A proposed split may name at most ${MAX_SPLIT_CHILDREN} subTasks; split the work across fewer, larger phases.`,
-		)
-		.default([]),
-});
+const ProposedSplitSchema = z
+	.object({
+		sharedName: z.string().trim().min(1).optional(),
+		mainTask: MainTaskSchema.optional(),
+		subTasks: z
+			.array(SplitSubTaskSchema)
+			.max(
+				MAX_SPLIT_CHILDREN,
+				`A proposed split may name at most ${MAX_SPLIT_CHILDREN} subTasks; split the work across fewer, larger phases.`,
+			)
+			.default([]),
+	})
+	.superRefine((split, ctx) => {
+		for (const [childIndex, sub] of split.subTasks.entries()) {
+			const phaseNumber = childIndex + 2;
+			for (const dependency of sub.dependsOn ?? []) {
+				if (dependency < phaseNumber) continue;
+				ctx.addIssue({
+					code: z.ZodIssueCode.custom,
+					path: ['subTasks', childIndex, 'dependsOn'],
+					message: `Phase ${phaseNumber} may depend only on earlier phases (1–${phaseNumber - 1}), not on phase ${dependency}.`,
+				});
+			}
+		}
+	});
 
 export type ProposedSplit = z.infer<typeof ProposedSplitSchema>;
 
@@ -538,17 +568,30 @@ function splitChildOutcome(preparation: ChildPreparation): SplitChildOutcome {
 }
 
 /**
+ * One earlier phase a split child is blocked by, with the phase number the child's
+ * note names it by (issue #1176) — no longer derivable from a position in the list,
+ * since a child is blocked only by the phases it really depends on.
+ */
+export interface SplitPhaseBlocker {
+	phaseNumber: number;
+	item: WorkItem;
+}
+
+/**
  * Comment posted on a spawned sibling so the board shows what happened: which
- * ordered phase it is, that it came from splitting the parent, whether its plan
+ * phase it is, that it came from splitting the parent, whether its plan
  * was published as a readable comment, whether automatic preparation reached
  * Planning or left it in Backlog, and — the first of the two dependency guards
  * (issue #330) — the exact earlier phases that block it. The second guard is the
  * native `blocked by` relationship {@link applySplit} records; this human-readable
  * list stands in for it on a provider that can't.
  *
- * `predecessors` are every phase that must land before this one, in order (phase 1
- * first) — for phase N that is phases 1..N-1. Empty only for the first task, which
- * is the re-scoped parent, not a spawned sibling.
+ * `blockers` are the earlier phases this one really depends on, as the planner
+ * declared them (issue #1176), in phase order. Empty for a child the planner judged
+ * independent — the note then says it can be implemented in parallel, so the phase
+ * number reads as a suggested order rather than a hard sequence — and the lifecycle
+ * advice drops its "stays blocked until the phases above are done" clause, which
+ * would otherwise point at a list that is not there.
  *
  * `preparation` is reported honestly (issue #431): the preplan comment is only
  * pointed at when it was really posted, so a failed publication never leaves the
@@ -572,12 +615,13 @@ function splitChildOutcome(preparation: ChildPreparation): SplitChildOutcome {
  */
 export function splitChildCommentBody(
 	parent: WorkItem,
-	predecessors: readonly WorkItem[],
+	blockers: readonly SplitPhaseBlocker[],
 	phaseNumber: number,
 	totalPhases: number,
 	preparation: ChildPreparation,
 	marker?: string,
 ): string {
+	const blocked = blockers.length > 0;
 	const lines = [
 		`## 🧩 Phase ${phaseNumber} of ${totalPhases} — split from a larger task`,
 		'',
@@ -585,10 +629,17 @@ export function splitChildCommentBody(
 		'because that work item was too large to implement well in a single pull request.',
 		'',
 	];
-	if (predecessors.length > 0) {
+	if (blocked) {
 		lines.push(
-			'**Blocked by** — these earlier phases must be completed first, in order:',
-			...predecessors.map((p, i) => `- Phase ${i + 1}: ${p.title} (${p.url})`),
+			'**Blocked by** — this phase depends on these earlier phases, which must be completed first:',
+			...blockers.map(({ phaseNumber: n, item }) => `- Phase ${n}: ${item.title} (${item.url})`),
+			'',
+		);
+	} else {
+		lines.push(
+			'**Not blocked** — this phase does not depend on the other phases of this split, so it',
+			'can be implemented in parallel with them; its phase number is only a suggested order.',
+			'Its description says why it is independent.',
 			'',
 		);
 	}
@@ -603,18 +654,22 @@ export function splitChildCommentBody(
 		lines.push(
 			"SWARM has already prepared this task's plan and moved it to **ToDo** — this project",
 			'advances a finished plan automatically. It carries the `planned` label, so no',
-			'Planning-agent run is spent on it. Its implementation stays blocked until the phases',
-			'above are done, so SWARM starts this phase in order rather than early. To throw the',
-			'saved plan away and have SWARM plan this task from scratch, remove the `planned` label',
+			'Planning-agent run is spent on it.',
+			blocked
+				? 'Its implementation stays blocked until the phases above are done, so SWARM does not start it early.'
+				: 'Nothing blocks it, so its implementation can start right away, alongside the other phases.',
+			'To throw the saved plan away and have SWARM plan this task from scratch, remove the `planned` label',
 			'and move the card **Backlog → Planning**.',
 		);
 	} else if (preparation.prepared) {
 		lines.push(
 			"SWARM has already prepared this task's plan and placed it in **Planning**. It carries the",
 			'`planned` label, so no Planning-agent run is spent on it, and it will **not** move to',
-			'**ToDo** on its own. Its implementation stays blocked until the phases above are done —',
-			'move it to **ToDo** when you are ready and its prerequisites have landed. To throw the',
-			'saved plan away and have SWARM plan this task from scratch, remove the `planned` label',
+			'**ToDo** on its own.',
+			blocked
+				? 'Its implementation stays blocked until the phases above are done — move it to **ToDo** when you are ready and its prerequisites have landed.'
+				: 'Nothing blocks it — move it to **ToDo** when you are ready, whether or not the other phases have landed.',
+			'To throw the saved plan away and have SWARM plan this task from scratch, remove the `planned` label',
 			'and move the card **Backlog → Planning**.',
 		);
 	} else if (preparation.planned) {
@@ -971,10 +1026,17 @@ function readPlanOrThrow(
  * are handed it. Left to the provider's default, a multi-repository project filed every
  * child in its first entry, where Implementation then checked out the wrong codebase.
  *
+ * **Each child is blocked only by what it really depends on (issue #1176).** The
+ * planner declares, per child, the earlier phases it needs to land first
+ * (`dependsOn`, {@link splitChildDependencies}); a child it judged independent gets
+ * no edge and can be implemented in parallel with the rest. Only earlier phases can
+ * be named, so the edges never form a cycle and a prerequisite's card always exists —
+ * and sits ahead on the board — before the child it blocks.
+ *
  * **Guard 3 — the outward direction (issue #890).** {@link linkBlockedBy} is only the
- * *inward* half of the split's dependency wiring: it chains the phases behind each
- * other and looks no further than the cards this split just made. An item entering
- * Planning can already be a recorded prerequisite for other board work
+ * *inward* half of the split's dependency wiring: it links the phases to the earlier
+ * ones they depend on and looks no further than the cards this split just made. An
+ * item entering Planning can already be a recorded prerequisite for other board work
  * (`ai/RULES.md` §5), and those dependents are blocked by the *original* — which the
  * split re-scopes into phase 1 while moving the rest of its substance into fresh
  * children. Left alone, closing phase 1 reads as unblocked while phases 2..N are
@@ -1039,19 +1101,24 @@ async function applySplit(
 	// worker self-enqueues each one's next phase (issue #911).
 	const advancedItemIds: string[] = [];
 	// Phase 1 is the re-scoped original (with whatever rename patch just applied);
-	// each sibling is the next phase. `predecessors` accumulates them so phase N is
-	// chained behind phases 1..N-1 — the cumulative blocked-by the issue requires.
+	// each sibling is the next phase. `phases` accumulates them, so phase N's
+	// dependencies — always earlier phases (ProposedSplitSchema) — are already cards
+	// by the time phase N is created (issue #1176).
 	const firstTask: WorkItem = mainPatch ? { ...parent, ...mainPatch } : parent;
 	const totalPhases = split.subTasks.length + 1;
-	const predecessors: WorkItem[] = [firstTask];
+	const phases: WorkItem[] = [firstTask];
 	// Read before the loop, so the clean run's reverse read cannot see the children
 	// this split is about to chain behind the parent (guard 3, issue #890).
 	const incomingDependents = await readSplitDependents(pm, parent);
 	for (const [childIndex, sub] of split.subTasks.entries()) {
+		const blockers = splitChildDependencies(sub, childIndex + 2).map((phaseNumber) => ({
+			phaseNumber,
+			item: phases[phaseNumber - 1],
+		}));
 		const { sibling, advanced } = await spawnSplitChild(pm, {
 			parent,
 			firstTask,
-			predecessors,
+			blockers,
 			sub,
 			title: naming.subTaskTitles[childIndex],
 			childIndex,
@@ -1065,26 +1132,45 @@ async function applySplit(
 		});
 		subTaskItemIds.push(sibling.id);
 		if (advanced) advancedItemIds.push(sibling.id);
-		predecessors.push(sibling);
+		phases.push(sibling);
 	}
-	// `predecessors` is now every phase in order — phase 1 plus each spawned child —
-	// which is what the dependents have to end up blocked by (guard 3, issue #890).
+	// `phases` is now every phase in order — phase 1 plus each spawned child — which
+	// is what the dependents have to end up blocked by (guard 3, issue #890): they
+	// waited on the whole of the original, whatever the phases owe each other.
 	await carryDependentsForward(pm, {
 		parent,
-		phases: predecessors,
+		phases,
 		dependents: incomingDependents,
 		splitId,
 	});
 	return { subTaskItemIds, mainTaskUpdated: mainPatch !== undefined, advancedItemIds };
 }
 
+/**
+ * The phase numbers split child `sub` — phase `phaseNumber` — is blocked by (issue
+ * #1176): exactly the earlier phases the planner declared in its `dependsOn`,
+ * deduplicated and in phase order, and none at all for a child it declared
+ * independent with `[]`. A child whose `dependsOn` is absent gets every earlier
+ * phase — the conservative reading of a decision the planner did not state, and the
+ * only one that can never let a phase start ahead of something it needed.
+ */
+function splitChildDependencies(
+	sub: ProposedSplit['subTasks'][number],
+	phaseNumber: number,
+): number[] {
+	if (sub.dependsOn === undefined) {
+		return Array.from({ length: phaseNumber - 1 }, (_, index) => index + 1);
+	}
+	return [...new Set(sub.dependsOn)].sort((a, b) => a - b);
+}
+
 /** One child's slice of {@link applySplit}'s state, for {@link spawnSplitChild}. */
 interface SpawnSplitChildOptions {
 	parent: WorkItem;
-	/** Phase 1 — the re-scoped original, named as the first blocker in the child's note. */
+	/** Phase 1 — the re-scoped original, named in the child's note as what it was split from. */
 	firstTask: WorkItem;
-	/** Phases 1..N-1, the cumulative blocked-by this child is chained behind. */
-	predecessors: readonly WorkItem[];
+	/** The earlier phases this child really depends on ({@link splitChildDependencies}). */
+	blockers: readonly SplitPhaseBlocker[];
 	sub: ProposedSplit['subTasks'][number];
 	/** This phase's board title, in the split's shared naming convention (issue #594). */
 	title: string;
@@ -1125,7 +1211,7 @@ async function spawnSplitChild(
 	const {
 		parent,
 		firstTask,
-		predecessors,
+		blockers,
 		sub,
 		title,
 		childIndex,
@@ -1188,12 +1274,19 @@ async function spawnSplitChild(
 			error: error instanceof Error ? error.message : String(error),
 		});
 	}
-	// Guard 2 (issue #330): record the native blocked-by relationship for every
-	// preceding phase, so the worker defers this phase's Implementation until they
-	// all close. Best-effort — a provider that can't model dependencies, or a
-	// transient API failure, must not fail the whole split; the note below (guard 1)
-	// still names the blockers.
-	await linkBlockedBy(pm, sibling, predecessors, splitId, childIndex);
+	// Guard 2 (issue #330): record the native blocked-by relationship for each
+	// earlier phase this one really depends on (issue #1176), so the worker defers
+	// this phase's Implementation until they all close — and nothing at all for an
+	// independent child, which may then run in parallel. Best-effort — a provider that
+	// can't model dependencies, or a transient API failure, must not fail the whole
+	// split; the note below (guard 1) still names the blockers.
+	await linkBlockedBy(
+		pm,
+		sibling,
+		blockers.map(({ item }) => item),
+		splitId,
+		childIndex,
+	);
 	// Auto-advance is the run's policy, applied to every card the run produced and
 	// not just the source task (issue #911) — but only to a child that really holds
 	// its plan: one deliberately left in Backlog by a failed preparation owes a
@@ -1206,7 +1299,7 @@ async function spawnSplitChild(
 	const preparation: ChildPreparation = { prepared, preplanPublished, planned, advanced };
 	await postSplitChildNote(pm, sibling, {
 		firstTask,
-		predecessors,
+		blockers,
 		phaseNumber: childIndex + 2,
 		totalPhases,
 		preparation,
@@ -1304,7 +1397,7 @@ async function acquireSplitChild(
 /** What {@link postSplitChildNote} needs to compose and dedupe one child's note. */
 interface SplitChildNoteOptions {
 	firstTask: WorkItem;
-	predecessors: readonly WorkItem[];
+	blockers: readonly SplitPhaseBlocker[];
 	phaseNumber: number;
 	totalPhases: number;
 	preparation: ChildPreparation;
@@ -1329,8 +1422,7 @@ async function postSplitChildNote(
 	child: WorkItem,
 	options: SplitChildNoteOptions,
 ): Promise<void> {
-	const { firstTask, predecessors, phaseNumber, totalPhases, preparation, marker, resumed } =
-		options;
+	const { firstTask, blockers, phaseNumber, totalPhases, preparation, marker, resumed } = options;
 	if (resumed && marker && (await pm.findComment(child.id, marker))) {
 		logger.debug('Planning — split note already posted for this delivery; skipping', {
 			siblingId: child.id,
@@ -1340,7 +1432,7 @@ async function postSplitChildNote(
 	}
 	await pm.addComment(
 		child.id,
-		splitChildCommentBody(firstTask, predecessors, phaseNumber, totalPhases, preparation, marker),
+		splitChildCommentBody(firstTask, blockers, phaseNumber, totalPhases, preparation, marker),
 	);
 }
 
@@ -1574,8 +1666,9 @@ async function publishPreplanComment(
 }
 
 /**
- * Record `item` as blocked by every one of its preceding phases (issue #330),
- * behind the provider-agnostic PMProvider dependency capability. No-op when the
+ * Record `item` as blocked by each of `blockers` — the earlier phases it really
+ * depends on (issues #330, #1176), which may be none — behind the
+ * provider-agnostic PMProvider dependency capability. No-op when the
  * provider can't model dependencies; per-link failures are logged and swallowed
  * so one bad link never aborts the split mid-loop (a retry would duplicate the
  * siblings) — the split comment still lists the blockers.
@@ -1613,9 +1706,9 @@ async function linkBlockedBy(
  * fails, on the same swallow-and-log contract as {@link linkBlockedBy}.
  *
  * **Called before the first child is created, and that ordering is load-bearing.**
- * Every child is recorded as blocked by phase 1, so once the child loop has run the
- * split's own children are dependents of the parent too — and carrying *those*
- * forward would hand child 2 an edge on child 3, a permanent deadlock inside the
+ * Every child that depends on phase 1 is recorded as blocked by it, so once the child
+ * loop has run the split's own children can be dependents of the parent too — and
+ * carrying *those* forward would hand child 2 an edge on child 3, a permanent deadlock inside the
  * split. Reading first makes a clean run structurally incapable of seeing them;
  * {@link carryDependentsForward}'s phase filter is what covers a *resumed* run, whose
  * children an earlier attempt already created and chained.
@@ -2537,9 +2630,9 @@ export async function runPlanningPhase(
 	//
 	// Deliberately *after* the preplanned short-circuit above: that path replays a plan
 	// the parent Planning run already wrote and published, reading no repository and
-	// spending no agent, and every split child is natively blocked by its predecessors
-	// — so gating it would defer (and eventually fail) the very dispatch that re-applies
-	// a `planned` label whose write failed (see `markSplitChildPlanned`). A human who
+	// spending no agent, and a split child is natively blocked by the earlier phases it
+	// depends on — so gating it would defer (and eventually fail) the very dispatch that
+	// re-applies a `planned` label whose write failed (see `markSplitChildPlanned`). A human who
 	// removes `planned` to force a genuine re-plan does hit the gate, which is right.
 	await assertDependenciesSatisfied(pm, workItem);
 
