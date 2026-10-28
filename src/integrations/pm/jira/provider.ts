@@ -402,20 +402,23 @@ function mapLabels(fields: JiraIssueFields): WorkItemLabel[] {
  * Map the issue's assignee onto the provider-neutral array. Jira models exactly
  * one assignee per issue, so this is `[]` or a single element.
  *
- * The handle prefers `emailAddress`, but Jira Cloud omits that field unless the
- * token's own account holds the right privacy scope, so `displayName` is the
- * fallback — and `src/identity/assignee-resolver.ts` links on whichever of the two
- * the operator recorded. `accountId` is the stable id to re-link against when a
- * display name is changed, which is what `providerId` is for.
+ * The handle is the Atlassian `accountId` (issue #1166): the identity key
+ * `src/identity/assignee-resolver.ts` links on through `user_identities`, and the
+ * same id loop prevention keys on (`resolveJiraAccountId`, `./identity.ts`). Not
+ * `emailAddress`, which Jira Cloud hides under the user's profile visibility, and
+ * not `displayName`, which is neither unique nor stable — two namesakes would
+ * collide and a rename would silently unlink a developer. Both stay display data
+ * only, with no fallback key, since falling back would bring that collision back.
+ * An assignee without an `accountId` has no stable identity to link, so it maps to
+ * no assignee (Jira Cloud always sends one). `providerId` mirrors the handle.
  */
 function mapAssignees(fields: JiraIssueFields): WorkItemAssignee[] {
 	const assignee = fields.assignee;
-	const handle = assignee?.emailAddress || assignee?.displayName;
-	if (!assignee || !handle) return [];
+	if (!assignee?.accountId) return [];
 	return [
 		{
-			handle,
-			displayName: assignee.displayName || undefined,
+			handle: assignee.accountId,
+			displayName: assignee.displayName || assignee.emailAddress || undefined,
 			providerId: assignee.accountId,
 		},
 	];
