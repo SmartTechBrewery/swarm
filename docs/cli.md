@@ -429,9 +429,20 @@ swarm identities list [--user <identifier>]
 ```
 
 Link a SWARM user to the handles they own on a provider (e.g. a GitHub login), so
-assignee resolution can map an inbound event's actor to a SWARM user. `<provider>`
-is a provider-neutral source key — `github-projects` for the GitHub Projects
-board. Provider and handle are matched case-insensitively. Re-linking the same
+assignee resolution can route an assigned item to its assignee's own workers.
+`<provider>` is the project's PM type, and `<handle>` is the id that provider
+reports for an assignee:
+
+- `github-projects` — the GitHub login.
+- `jira` — the Atlassian **accountId**, not the email or display name (issue
+  #1166). Find it in the profile URL `https://<site>/jira/people/<accountId>`, or
+  with `GET /rest/api/3/user/search?query=<email>`. Links recorded earlier on an
+  email or display name no longer match — see
+  [Failure diagnosis](./MANUAL.md#failure-diagnosis) to re-link them.
+- `linear` — the display name.
+- `trello` — the member username.
+
+Provider and handle are matched case-insensitively. Re-linking the same
 pair is a no-op; a handle already linked to a different user is rejected. Requires
 `DATABASE_URL`.
 

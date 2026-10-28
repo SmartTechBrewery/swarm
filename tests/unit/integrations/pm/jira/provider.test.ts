@@ -207,7 +207,8 @@ describe('JiraPMProvider', () => {
 				],
 				assignees: [
 					{
-						handle: 'ada@example.com',
+						// Keyed on the accountId even with the email visible (issue #1166).
+						handle: '5b10a2844c20165700ede21g',
 						displayName: 'Ada Lovelace',
 						providerId: '5b10a2844c20165700ede21g',
 					},
@@ -225,7 +226,7 @@ describe('JiraPMProvider', () => {
 			);
 		});
 
-		it('falls back to the display name when Jira Cloud hides the assignee email', async () => {
+		it('keys the assignee on its accountId when Jira Cloud hides the email', async () => {
 			mockJira({
 				'issue/SWARM-42': jiraIssue({
 					fields: { assignee: { accountId: 'acc-1', displayName: 'Ada Lovelace' } },
@@ -236,8 +237,36 @@ describe('JiraPMProvider', () => {
 			const item = await provider.getWorkItem('SWARM-42');
 
 			expect(item.assignees).toEqual([
-				{ handle: 'Ada Lovelace', displayName: 'Ada Lovelace', providerId: 'acc-1' },
+				{ handle: 'acc-1', displayName: 'Ada Lovelace', providerId: 'acc-1' },
 			]);
+		});
+
+		it('shows an email-only assignee by email but still keys it on the accountId', async () => {
+			mockJira({
+				'issue/SWARM-42': jiraIssue({
+					fields: { assignee: { accountId: 'acc-1', emailAddress: 'ada@example.com' } },
+				}),
+				'issue/SWARM-42/remotelink': [],
+			});
+
+			const item = await provider.getWorkItem('SWARM-42');
+
+			expect(item.assignees).toEqual([
+				{ handle: 'acc-1', displayName: 'ada@example.com', providerId: 'acc-1' },
+			]);
+		});
+
+		it('reports no assignee, rather than an email or name key, without an accountId', async () => {
+			mockJira({
+				'issue/SWARM-42': jiraIssue({
+					fields: { assignee: { displayName: 'Ada Lovelace', emailAddress: 'ada@example.com' } },
+				}),
+				'issue/SWARM-42/remotelink': [],
+			});
+
+			const item = await provider.getWorkItem('SWARM-42');
+
+			expect(item.assignees).toEqual([]);
 		});
 
 		it('reports no assignee and no status key for an unassigned, unmapped card', async () => {
@@ -415,6 +444,32 @@ describe('JiraPMProvider', () => {
 			expect(fetchMock).toHaveBeenCalledTimes(2);
 			expect(items.every((item) => item.taskRef === undefined)).toBe(true);
 			expect(items.every((item) => item.taskRepository === undefined)).toBe(true);
+		});
+
+		it('keeps namesakes apart and a renamed assignee on the same key', async () => {
+			mockJira({
+				'search/jql': searchPage([
+					jiraIssue({
+						fields: { assignee: { accountId: 'acc-jan-1', displayName: 'Jan Kowalski' } },
+					}),
+					jiraIssue({
+						key: 'SWARM-43',
+						fields: { assignee: { accountId: 'acc-jan-2', displayName: 'Jan Kowalski' } },
+					}),
+					jiraIssue({
+						key: 'SWARM-44',
+						fields: { assignee: { accountId: 'acc-jan-1', displayName: 'Jan Kowalski-Nowak' } },
+					}),
+				]),
+			});
+
+			const items = await provider.listWorkItems();
+
+			expect(items.map((item) => item.assignees[0]?.handle)).toEqual([
+				'acc-jan-1',
+				'acc-jan-2',
+				'acc-jan-1',
+			]);
 		});
 
 		it('narrows the read to the mapped Jira status id, unquoted so JQL reads it as an id', async () => {

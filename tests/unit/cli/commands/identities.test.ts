@@ -172,5 +172,13 @@ describe('swarm identities', () => {
 			expect(linkIdentity).not.toHaveBeenCalled();
 			expect(closeDb).not.toHaveBeenCalled();
 		});
+
+		it('names the Jira accountId as the handle to link in --help', async () => {
+			const log = vi.spyOn(console, 'log');
+
+			await run(['--help']);
+
+			expect(log).toHaveBeenCalledWith(expect.stringMatching(/jira\s+the Atlassian accountId/));
+		});
 	});
 });
