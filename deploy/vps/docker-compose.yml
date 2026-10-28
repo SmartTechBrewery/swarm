@@ -48,8 +48,9 @@ services:
 
   app:
     # The all-in-one control plane (router, API and dashboard on one port). Pin a
-    # vX.Y.Z or sha-<7> tag — never `main` on a server (docs/MANUAL.md, "The
-    # published image"). Migrations run at start, before the port is bound.
+    # vX.Y.Z or sha-<7> tag, or use `stable` — never `main` on a server
+    # (docs/MANUAL.md, "The published image"). Migrations run at start, before the
+    # port is bound.
     image: ghcr.io/smarttechbrewery/swarm:${SWARM_IMAGE_TAG:?set SWARM_IMAGE_TAG in .env — see .env.example}
     restart: unless-stopped
     # CREDENTIAL_MASTER_KEY, SWARM_SINGLE_USER_MODE and any optional variable from
