@@ -1066,6 +1066,8 @@ repo root.
 | `npm run dev:worker:seed` | Apply `swarm.config.json` (`db:seed`) then start the worker. Control-plane host only — `db:seed` needs `DATABASE_URL`. |
 | `npm run dev:dashboard` | Start the dashboard Vite dev server (`:5173`) — local development only; not what you expose publicly. |
 | `npm run dev:router` | Free `ROUTER_PORT`, then run the router (webhook receiver) on the host with `--watch` — for router development (in normal operation the router runs in Compose). |
+| `npm run serve` | Run the **all-in-one control plane** (`src/serve/index.ts`, issue #1148) from source: the router's routes and the API server's routes, the dashboard and one `/health` on one port (`PORT`, default `3000`; bind address `SWARM_SERVE_HOST`). Applies migrations before binding, refuses to start in single-user mode or without a valid `CREDENTIAL_MASTER_KEY` unless `SWARM_SERVE_ALLOW_INSECURE=true`, and leaves the checkout-dependent worktree retention sweep off unless `SWARM_SERVE_WORKTREE_SWEEP=true`. Run from the repo root, after `npm run build:dashboard`. An alternative to the two-process layout, not a replacement — see [`MANUAL.md`](./MANUAL.md#one-process-one-port-all-in-one-control-plane). |
+| `npm run start:serve` | The same from compiled output (`dist/serve/index.js`), after `npm run build`. |
 | `npm run dev` | Run `src/index.ts` (combined entry) with `--watch`. |
 
 ### Autostart on macOS
