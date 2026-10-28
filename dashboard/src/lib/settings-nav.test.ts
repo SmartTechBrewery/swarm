@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
 	resolveActiveSettingsTab,
 	settingsSearchSchema,
+	settingsTabNeedsAppSettings,
 	settingsTabSearch,
 	visibleSettingsTabs,
 } from './settings-nav.js';
@@ -29,10 +30,10 @@ describe('settingsSearchSchema', () => {
 
 describe('visibleSettingsTabs', () => {
 	it('gives an instance administrator every tab', () => {
-		expect(visibleSettingsTabs(ADMIN)).toEqual(['agents', 'credentials', 'appearance']);
+		expect(visibleSettingsTabs(ADMIN)).toEqual(['agents', 'credentials', 'users', 'appearance']);
 	});
 
-	it('hides Agent Defaults and Credentials from a non-administrator', () => {
+	it('hides Agent Defaults, Credentials and Users from a non-administrator', () => {
 		expect(visibleSettingsTabs(NON_ADMIN)).toEqual(['appearance']);
 	});
 
@@ -70,9 +71,29 @@ describe('resolveActiveSettingsTab', () => {
 		expect(resolveActiveSettingsTab({ tab: 'credentials' }, ADMIN)).toBe('credentials');
 	});
 
+	// Hidden as a courtesy; every `users` procedure refuses a non-administrator in the
+	// router regardless (issue #1151).
+	it('degrades a direct ?tab=users link for a non-administrator', () => {
+		expect(resolveActiveSettingsTab({ tab: 'users' }, NON_ADMIN)).toBe('appearance');
+		expect(resolveActiveSettingsTab({ tab: 'users' })).toBe('appearance');
+	});
+
+	it('honors ?tab=users for an administrator', () => {
+		expect(resolveActiveSettingsTab({ tab: 'users' }, ADMIN)).toBe('users');
+	});
+
 	it('treats an unresolved viewer as a non-administrator, so the section never flashes', () => {
 		expect(resolveActiveSettingsTab({ tab: 'agents' })).toBe('appearance');
 		expect(resolveActiveSettingsTab({})).toBe('appearance');
+	});
+});
+
+describe('settingsTabNeedsAppSettings', () => {
+	it('waits on settings.get only for the tabs that render from it', () => {
+		expect(settingsTabNeedsAppSettings('agents')).toBe(true);
+		expect(settingsTabNeedsAppSettings('appearance')).toBe(true);
+		expect(settingsTabNeedsAppSettings('credentials')).toBe(false);
+		expect(settingsTabNeedsAppSettings('users')).toBe(false);
 	});
 });
 

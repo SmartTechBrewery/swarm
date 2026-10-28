@@ -23,12 +23,12 @@ describe('SettingsTabBar', () => {
 		);
 
 		const labels = screen.getAllByRole('button').map((button) => button.textContent);
-		expect(labels).toEqual(['Agent Defaults', 'Credentials', 'Appearance']);
+		expect(labels).toEqual(['Agent Defaults', 'Credentials', 'Users', 'Appearance']);
 		// The rendered order and the `?tab=` vocabulary must not drift apart.
 		expect(labels).toHaveLength(SETTINGS_TABS.length);
 	});
 
-	it('offers neither admin-only tab to a non-administrator (issues #666, #769)', () => {
+	it('offers no admin-only tab to a non-administrator (issues #666, #769, #1151)', () => {
 		render(
 			<SettingsTabBar
 				tabs={visibleSettingsTabs({ instanceAdmin: false })}

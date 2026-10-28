@@ -112,8 +112,38 @@ hash is held, in the memory of the process that logged it — and it:
 
 Two submissions racing for the link cannot create two admins: the token is
 claimed before anything is written, and the insert itself only succeeds while the
-`users` table is still empty. `swarm users` stays the shell path for this and for
-every later user.
+`users` table is still empty. `swarm users` stays the shell alternative for this
+and for every later user.
+
+**Adding colleagues and resetting passwords, without a shell** (issue #1151). Once
+you are signed in as an installation admin, **Settings → Users** lists everyone who
+can sign in and manages their accounts — the same operations as `swarm users`,
+with no `DATABASE_URL` needed. Non-admins never see the tab, and every operation
+behind it is refused server-side for them anyway.
+
+- **Add user** takes the colleague's identifier (their login handle, usually an
+  e-mail address), an optional display name (it defaults to the identifier) and
+  an installation-admin switch. SWARM creates the account with no password and
+  shows a `/set-password?token=…` link built on the dashboard's own address —
+  copy it and send it to them. They open it, choose their password, and are signed
+  in. Nobody else ever chooses or sees it.
+- **The link is single use and expires after 72 hours.** It is shown exactly once:
+  SWARM stores only its hash, so a lost link cannot be shown again — issue a new
+  one. It survives a server restart for its whole lifetime.
+- **Password link** on a user's row resets a forgotten password the same way,
+  after a confirmation. Issuing a link changes nothing by itself: it replaces any
+  earlier link for that user, their current password keeps working until the
+  link is used, and using it sets the new password and **signs them out of every
+  session** they have. An invalid, expired or already-used link says so on the
+  page and asks for a new one.
+- **The Installation admin switch** on each row grants or revokes the role. The
+  dashboard refuses to revoke the **last** installation admin, so this path can
+  never leave an installation nobody can administer; the refusal is shown as the
+  server words it and the switch stays on. (`swarm users revoke-admin` has no such
+  guard: whoever holds the shell can always `grant-admin` again.)
+
+Giving a new user access to a project is separate: a project admin adds them on
+that project's **Members** tab.
 
 **Registering the worker, one step at a time.** `workers register-and-enroll`
 collapses two commands; either half can be run on its own, which is what you want
@@ -869,7 +899,10 @@ in [Running on a VPS behind Caddy](#running-on-a-vps-behind-caddy) instead.
   [First-run setup](#quick-start-beyond-the-readme)).
 - **Admin commands** run inside the container, since this mode refuses
   single-user mode: `docker compose exec swarm node dist/cli/index.js users add
-  you@example.com --admin`, then `… users set-password you@example.com`.
+  you@example.com --admin`, then `… users set-password you@example.com`. Every
+  later user needs neither: an installation admin adds them, and resets their
+  passwords, under **Settings → Users** (see
+  [Adding colleagues](#quick-start-beyond-the-readme)).
 - **Unchanged:** `Dockerfile.router`, the Compose `router` service and
   `npm run reload:all` still build the router locally, as before.
 - **Maintainers:** cut a version with `git tag vX.Y.Z && git push origin vX.Y.Z`.
@@ -981,7 +1014,9 @@ lapsed, `docker compose restart app` logs a fresh one.
   docker compose exec app node dist/cli/index.js members add example-project ada@example.com --role member
   ```
 
-  (membership can also be granted in the dashboard). Then follow Steps 2–6 on the
+  (or, with no shell, add the user under Settings → Users and send them the
+  password link it shows; membership can also be granted on the project's Members
+  tab). Then follow Steps 2–6 on the
   worker's machine with `--control-plane-url https://<your domain>`.
 
 ### Restarts, updates, backup and restore

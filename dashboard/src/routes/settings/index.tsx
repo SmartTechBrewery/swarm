@@ -1,15 +1,26 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { createRoute, useNavigate } from '@tanstack/react-router';
-import { Cpu, KeyRound, type LucideIcon, Monitor, Moon, Palette, Sun } from 'lucide-react';
+import {
+	Cpu,
+	KeyRound,
+	type LucideIcon,
+	Monitor,
+	Moon,
+	Palette,
+	Sun,
+	UsersRound,
+} from 'lucide-react';
 import type React from 'react';
 import { useEffect, useMemo, useState } from 'react';
 import { InstanceCredentialsPanel } from '@/components/settings/instance-credentials-panel.js';
+import { UsersPanel } from '@/components/settings/users-panel.js';
 import { useTheme } from '@/components/theme/theme-provider.js';
 import { buttonClass } from '@/components/ui/button.js';
 import {
 	resolveActiveSettingsTab,
 	type SettingsTab,
 	settingsSearchSchema,
+	settingsTabNeedsAppSettings,
 	settingsTabSearch,
 	visibleSettingsTabs,
 } from '@/lib/settings-nav.js';
@@ -283,13 +294,14 @@ export function AppearancePanel() {
 const SETTINGS_TAB_ITEMS: ReadonlyArray<{ tab: SettingsTab; label: string; icon: LucideIcon }> = [
 	{ tab: 'agents', label: 'Agent Defaults', icon: Cpu },
 	{ tab: 'credentials', label: 'Credentials', icon: KeyRound },
+	{ tab: 'users', label: 'Users', icon: UsersRound },
 	{ tab: 'appearance', label: 'Appearance', icon: Palette },
 ];
 
 /**
  * The horizontal tab bar, rendered from {@link SETTINGS_TAB_ITEMS} narrowed to the
  * tabs this viewer may see (`visibleSettingsTabs`) — a non-administrator is offered
- * neither Agent Defaults (issue #666) nor Credentials (issue #769).
+ * none of Agent Defaults (issue #666), Credentials (issue #769) or Users (issue #1151).
  */
 export function SettingsTabBar({
 	tabs,
@@ -327,11 +339,12 @@ function SettingsRouteComponent() {
 	const queryClient = useQueryClient();
 	const navigate = useNavigate();
 	const search = settingsRoute.useSearch();
-	// Agent defaults and the instance default credentials are installation-wide, so both
-	// sections are shown only to an instance administrator (issues #666, #769) —
-	// including on a direct `?tab=agents` / `?tab=credentials` link, which
-	// `resolveActiveSettingsTab` degrades to a tab the viewer may see. For the
-	// credentials tab that is courtesy on top of the router's own enforcement.
+	// Agent defaults, the instance default credentials and user administration are
+	// installation-wide, so those sections are shown only to an instance administrator
+	// (issues #666, #769, #1151) — including on a direct `?tab=agents` /
+	// `?tab=credentials` / `?tab=users` link, which `resolveActiveSettingsTab` degrades
+	// to a tab the viewer may see. For credentials and users that is courtesy on top of
+	// the router's own enforcement.
 	const viewer = useCurrentUser().data;
 	const tabs = visibleSettingsTabs(viewer);
 	const activeTab = resolveActiveSettingsTab(search, viewer);
@@ -395,14 +408,14 @@ function SettingsRouteComponent() {
 		});
 	};
 
-	// Credentials has its own query and remains usable if `settings.get` fails. Both other
-	// tabs depend on the full settings blob: Agent Defaults reads `agents`, while
-	// Appearance merges its theme update onto it.
-	if (activeTab !== 'credentials' && settingsQuery.isLoading) {
+	// Credentials and Users each own their query and remain usable if `settings.get`
+	// fails; only the tabs that render from the settings blob wait on it.
+	const needsSettings = settingsTabNeedsAppSettings(activeTab);
+	if (needsSettings && settingsQuery.isLoading) {
 		return <div className="text-sm text-zinc-400">Loading settings…</div>;
 	}
 
-	if (activeTab !== 'credentials' && settingsQuery.isError) {
+	if (needsSettings && settingsQuery.isError) {
 		return (
 			<div className="p-4 bg-red-950/20 border border-red-900/30 rounded flex flex-col gap-2">
 				<h3 className="text-sm font-semibold text-red-200">Error Loading Settings</h3>
@@ -437,6 +450,8 @@ function SettingsRouteComponent() {
 			)}
 
 			{activeTab === 'credentials' && <InstanceCredentialsPanel />}
+
+			{activeTab === 'users' && <UsersPanel />}
 
 			{activeTab === 'appearance' && <AppearancePanel />}
 		</div>

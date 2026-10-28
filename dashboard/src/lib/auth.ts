@@ -91,6 +91,35 @@ export async function completeSetup(
 	return { ok: false, error: 'Setup failed. Please try again.' };
 }
 
+/**
+ * POST a new password to `/auth/set-password` (issue #1151): redeems the
+ * single-use link an installation admin issued, sets the password, signs the
+ * user out everywhere else, and sets the session cookie exactly as a login does.
+ */
+export async function redeemPasswordLink(token: string, password: string): Promise<LoginResult> {
+	let res: Response;
+	try {
+		res = await fetch(`${API_URL}/auth/set-password`, {
+			method: 'POST',
+			credentials: 'include',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ token, password }),
+		});
+	} catch {
+		return { ok: false, error: 'Could not reach the server. Is it running?' };
+	}
+	if (res.ok) return { ok: true };
+	if (res.status === 403) {
+		return {
+			ok: false,
+			error:
+				'This link is invalid, expired, or already used. Ask an installation administrator for a new one.',
+		};
+	}
+	if (res.status === 400) return { ok: false, error: 'Enter a password.' };
+	return { ok: false, error: 'Setting the password failed. Please try again.' };
+}
+
 /** POST to `/auth/logout`; clears the session cookie server-side. Best-effort. */
 export async function logout(): Promise<void> {
 	try {

@@ -38,9 +38,10 @@ function RootLayout() {
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
 	// The login screen is its own full-screen route and must not itself be gated
 	// (that would loop); so is first-run setup (issue #1150), which by definition
-	// runs before anyone can sign in. Everything else runs inside the
-	// authenticated shell.
-	if (pathname === '/login' || pathname === '/setup') {
+	// runs before anyone can sign in, and redeeming a password link (issue #1151),
+	// whose holder has no password yet or has forgotten it. Everything else runs
+	// inside the authenticated shell.
+	if (pathname === '/login' || pathname === '/setup' || pathname === '/set-password') {
 		return <Outlet />;
 	}
 	return <AuthenticatedShell />;

@@ -91,8 +91,9 @@ export const membersRouter = router({
 		}),
 
 	// Add an *existing* SWARM user, named by login handle, in a chosen role.
-	// Creating the user is not this router's job — `swarm users add` stays the only
-	// path — so an unknown identifier is NOT_FOUND rather than an implicit signup.
+	// Creating the user is not this router's job — that is the instance-admin-only
+	// `users` router (Settings → Users), or `swarm users add` from a shell — so an
+	// unknown identifier is NOT_FOUND rather than an implicit signup.
 	add: authedProcedure
 		.input(
 			z.object({
@@ -119,7 +120,7 @@ export const membersRouter = router({
 			if (!user) {
 				throw new TRPCError({
 					code: 'NOT_FOUND',
-					message: `No SWARM user with identifier "${input.identifier}". Create them with \`swarm users add\` first.`,
+					message: `No SWARM user with identifier "${input.identifier}". An installation administrator can create them under Settings → Users (or with \`swarm users add\`).`,
 				});
 			}
 

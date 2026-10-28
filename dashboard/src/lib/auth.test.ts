@@ -5,6 +5,7 @@ import {
 	isUnauthorizedError,
 	login,
 	logout,
+	redeemPasswordLink,
 	shouldRedirectToLogin,
 } from './auth.js';
 
@@ -127,6 +128,42 @@ describe('completeSetup', () => {
 	it('reports a reachability error when the request throws', async () => {
 		vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('network down')));
 		const result = await completeSetup('tok', 'ada@example.com', 'pw');
+		expect(result.ok).toBe(false);
+		expect(result.error).toMatch(/Could not reach the server/);
+	});
+});
+
+describe('redeemPasswordLink', () => {
+	afterEach(() => {
+		vi.unstubAllGlobals();
+	});
+
+	it('posts the token and password with the session cookie included', async () => {
+		const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+		vi.stubGlobal('fetch', fetchMock);
+
+		expect(await redeemPasswordLink('tok', 'pw')).toEqual({ ok: true });
+
+		const [url, init] = fetchMock.mock.calls[0];
+		expect(String(url)).toContain('/auth/set-password');
+		expect(init).toMatchObject({ method: 'POST', credentials: 'include' });
+		expect(JSON.parse(init.body)).toEqual({ token: 'tok', password: 'pw' });
+	});
+
+	it.each([
+		[403, /invalid, expired, or already used\. Ask an installation administrator/],
+		[400, /Enter a password/],
+		[500, /Setting the password failed/],
+	])('maps a %i response to a readable error', async (status, message) => {
+		vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status }));
+		const result = await redeemPasswordLink('tok', 'pw');
+		expect(result.ok).toBe(false);
+		expect(result.error).toMatch(message);
+	});
+
+	it('reports a reachability error when the request throws', async () => {
+		vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('network down')));
+		const result = await redeemPasswordLink('tok', 'pw');
 		expect(result.ok).toBe(false);
 		expect(result.error).toMatch(/Could not reach the server/);
 	});
