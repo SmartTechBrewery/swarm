@@ -509,13 +509,14 @@ describe('runPlanningPhase', () => {
 		expect(secondComment).not.toContain('placed it in **Planning**');
 
 		const thirdComment = childComment(deps, 'PVTI_Third slice', false);
-		// Phase 3 of 3, cumulatively blocked by BOTH earlier phases.
+		// Phase 3 of 3, blocked by BOTH earlier phases: this fixture declares no
+		// `dependsOn`, so every earlier phase is the conservative answer (issue #1176).
 		expect(thirdComment).toMatch(/Phase 3 of 3 — split from a larger task/);
 		expect(thirdComment).toContain(`Phase 1: ${splitTitle(1, 3, 'First slice')}`);
 		expect(thirdComment).toContain(`Phase 2: ${splitTitle(2, 3, 'Second slice')}`);
 
-		// Guard 2 (issue #330): cumulative native blocked-by — phase N blocked by
-		// every predecessor. Phase 2 ← [phase 1]; phase 3 ← [phase 1, phase 2].
+		// Guard 2 (issue #330): native blocked-by. With no `dependsOn` declared, phase N
+		// falls back to every earlier phase. Phase 2 ← [phase 1]; phase 3 ← [phase 1, phase 2].
 		const blockedByPairs = deps.pm.addBlockedBy.mock.calls.map(([id, blockerId]) => [
 			id,
 			blockerId,
@@ -560,6 +561,87 @@ describe('runPlanningPhase', () => {
 		// Reported up so the worker self-enqueues each child's next phase: the move is
 		// SWARM's own, so its board webhook is dropped by loop prevention.
 		expect(result.advancedItemIds).toEqual(['PVTI_Second slice', 'PVTI_Third slice']);
+	});
+
+	describe('records only the dependencies the planner declared (issue #1176)', () => {
+		const blockedByPairs = (deps: ReturnType<typeof makeDeps>) =>
+			deps.pm.addBlockedBy.mock.calls.map(([id, blockerId]) => [id, blockerId]);
+
+		beforeEach(() => {
+			splitExists = true;
+			splitContents = JSON.stringify({
+				sharedName: SHARED_NAME,
+				mainTask: { title: 'First slice', description: 'Just the API' },
+				subTasks: [
+					{ title: 'Docs slice', description: 'Docs only', plan: '# Docs', dependsOn: [] },
+					{ title: 'UI slice', description: 'Uses the API', plan: '# UI', dependsOn: [1] },
+					{
+						title: 'Wiring slice',
+						description: 'Joins API and docs',
+						plan: '# Wiring',
+						dependsOn: [2, 1, 2],
+					},
+				],
+			});
+		});
+
+		it('blocks each child on exactly its declared earlier phases, deduplicated', async () => {
+			const deps = makeDeps();
+			await runPlanningPhase(deps);
+
+			// Phase 2 is independent (no edge at all); phase 3 needs phase 1 only; phase 4
+			// needs phases 1 and 2, each once, and never the phase 3 it did not name.
+			expect(blockedByPairs(deps)).toEqual([
+				['PVTI_UI slice', 'PVTI_item18'],
+				['PVTI_Wiring slice', 'PVTI_item18'],
+				['PVTI_Wiring slice', 'PVTI_Docs slice'],
+			]);
+		});
+
+		it('names only the real blockers in each note, by their own phase numbers', async () => {
+			const deps = makeDeps();
+			await runPlanningPhase(deps);
+
+			const wiringNote = childComment(deps, 'PVTI_Wiring slice', false);
+			expect(wiringNote).toContain('**Blocked by**');
+			expect(wiringNote).toContain(`- Phase 1: ${splitTitle(1, 4, 'First slice')}`);
+			expect(wiringNote).toContain(`- Phase 2: ${splitTitle(2, 4, 'Docs slice')}`);
+			expect(wiringNote).not.toContain('- Phase 3: ');
+			expect(wiringNote).not.toContain('in order');
+
+			const uiNote = childComment(deps, 'PVTI_UI slice', false);
+			expect(uiNote).toContain(`- Phase 1: ${splitTitle(1, 4, 'First slice')}`);
+			expect(uiNote).not.toContain('- Phase 2: ');
+		});
+
+		it('tells an independent child it is not blocked and may run in parallel', async () => {
+			const deps = makeDeps();
+			await runPlanningPhase({ ...deps, autoAdvance: true });
+
+			const docsNote = childComment(deps, 'PVTI_Docs slice', false);
+			expect(docsNote).toMatch(/Phase 2 of 4 — split from a larger task/);
+			expect(docsNote).not.toContain('**Blocked by**');
+			expect(docsNote).toContain('**Not blocked**');
+			expect(docsNote).toContain('in parallel');
+			expect(docsNote).not.toContain('stays blocked until the phases');
+			// Advanced like any prepared child, and nothing defers it.
+			expect(deps.pm.moveWorkItem).toHaveBeenCalledWith('PVTI_Docs slice', 'todo');
+		});
+
+		it('rejects a child depending on its own or a later phase before any board write', async () => {
+			splitContents = JSON.stringify({
+				subTasks: [
+					{ title: 'Second slice', description: 'D', plan: '# P', dependsOn: [3] },
+					{ title: 'Third slice', description: 'D', plan: '# P', dependsOn: [3] },
+				],
+			});
+			const deps = makeDeps();
+			await expect(runPlanningPhase(deps)).rejects.toThrow(
+				/Phase 2 may depend only on earlier phases \(1–1\), not on phase 3/,
+			);
+			expect(deps.pm.createWorkItem).not.toHaveBeenCalled();
+			expect(deps.pm.addBlockedBy).not.toHaveBeenCalled();
+		});
 	});
 
 	it('leaves every split child where it is when autoAdvance is off (issue #911)', async () => {
@@ -2857,6 +2939,16 @@ describe('buildPlanningPrompt', () => {
 		expect(prompt).not.toContain('"Phase 1/3: <title>"');
 	});
 
+	it('asks for each child’s real dependencies, not a blanket chain (issue #1176)', () => {
+		const prompt = buildPlanningPrompt(createMockWorkItem(), true);
+		expect(prompt).toContain('"dependsOn"');
+		expect(prompt).toMatch(/DECLARE ONLY REAL DEPENDENCIES/);
+		// Docs/config-only overlap is the named case for leaving a child unblocked.
+		expect(prompt).toMatch(/only\n {4}expected overlap is documentation/);
+		expect(prompt).toMatch(/may name only phases before its own/);
+		expect(prompt).not.toMatch(/must never be startable before its/);
+	});
+
 	it('states the split-size cap the split file is validated against', () => {
 		const prompt = buildPlanningPrompt(createMockWorkItem(), true);
 		// The planner is told the limit rather than discovering it as a failed run:
@@ -2919,7 +3011,7 @@ describe('splitChildCommentBody', () => {
 		).toBe(true);
 		expect(
 			isSwarmGeneratedBody(
-				splitChildCommentBody(parent, [parent], 2, 3, {
+				splitChildCommentBody(parent, [{ phaseNumber: 1, item: parent }], 2, 3, {
 					preplanPublished: false,
 					planned: false,
 					prepared: false,
@@ -2936,7 +3028,7 @@ describe('splitChildCommentBody', () => {
 	// move to ToDo on its own" is a plain falsehood.
 	it('tells an auto-advanced child it is already in ToDo and still waits its turn', () => {
 		const parent = createMockWorkItem({ title: 'Big task', url: 'https://x/issues/1' });
-		const body = splitChildCommentBody(parent, [parent], 2, 3, {
+		const body = splitChildCommentBody(parent, [{ phaseNumber: 1, item: parent }], 2, 3, {
 			preplanPublished: true,
 			planned: true,
 			prepared: true,
@@ -2950,6 +3042,41 @@ describe('splitChildCommentBody', () => {
 		expect(body).not.toMatch(/move (the item|it) to \*\*ToDo\*\* when you are ready/);
 		expect(body).not.toContain('placed it in **Planning**');
 		expect(body).not.toContain('remains in **Backlog**');
+	});
+
+	it('names each blocker by its own phase number, not its position in the list (issue #1176)', () => {
+		const parent = createMockWorkItem({ title: 'Big task', url: 'https://x/issues/1' });
+		const phase2 = createMockWorkItem({ title: 'Phase two', url: 'https://x/issues/2' });
+		const body = splitChildCommentBody(
+			parent,
+			[
+				{ phaseNumber: 1, item: parent },
+				{ phaseNumber: 3, item: phase2 },
+			],
+			4,
+			4,
+			{ preplanPublished: true, planned: true, prepared: true, advanced: false },
+		);
+		expect(body).toContain('- Phase 1: Big task (https://x/issues/1)');
+		expect(body).toContain('- Phase 3: Phase two (https://x/issues/2)');
+		expect(body).not.toContain('- Phase 2: ');
+	});
+
+	it('tells an independent child nothing blocks it, in every lifecycle branch that mentions blockers', () => {
+		const parent = createMockWorkItem({ title: 'Big task', url: 'https://x/issues/1' });
+		for (const advanced of [true, false]) {
+			const body = splitChildCommentBody(parent, [], 2, 3, {
+				preplanPublished: true,
+				planned: true,
+				prepared: true,
+				advanced,
+			});
+			expect(body).not.toContain('**Blocked by**');
+			expect(body).toContain('**Not blocked**');
+			expect(body).toContain('only a suggested order');
+			expect(body).not.toContain('stays blocked until the phases');
+			expect(body).toContain('Nothing blocks it');
+		}
 	});
 
 	it('tells a prepared child how to re-plan: remove `planned`, move Backlog → Planning', () => {
@@ -2970,7 +3097,7 @@ describe('splitChildCommentBody', () => {
 	it('says a plan-saved child stranded in Backlog will not be re-planned', () => {
 		const parent = createMockWorkItem({ title: 'Big task', url: 'https://x/issues/1' });
 		// The Planning move failed after the marker and the label landed.
-		const body = splitChildCommentBody(parent, [parent], 2, 3, {
+		const body = splitChildCommentBody(parent, [{ phaseNumber: 1, item: parent }], 2, 3, {
 			preplanPublished: true,
 			planned: true,
 			prepared: false,
@@ -2984,7 +3111,7 @@ describe('splitChildCommentBody', () => {
 
 	it('says a plan-less child stranded in Backlog gets a normal Planning run', () => {
 		const parent = createMockWorkItem({ title: 'Big task', url: 'https://x/issues/1' });
-		const body = splitChildCommentBody(parent, [parent], 2, 3, {
+		const body = splitChildCommentBody(parent, [{ phaseNumber: 1, item: parent }], 2, 3, {
 			preplanPublished: false,
 			planned: false,
 			prepared: false,

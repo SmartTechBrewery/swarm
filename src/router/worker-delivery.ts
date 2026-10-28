@@ -1193,8 +1193,8 @@ export async function handleAddPmLabel(
 }
 
 /**
- * Record one blocked-by dependency edge — how a split chains its phases so a later
- * phase cannot start before its predecessors land (issue #330). Same prelude and
+ * Record one blocked-by dependency edge — how a split records a phase's dependency on
+ * an earlier one, so it cannot start before that phase lands (issues #330, #1176). Same prelude and
  * contract as {@link handleMoveWorkItem}. No capability branch is needed: the
  * interface's own contract makes this a no-op on a provider that models no
  * dependencies (`../pm/types.ts`), exactly as `listBlockers` returns `[]` there.

@@ -83,8 +83,9 @@ one parent analysis plus one full analysis per child.
 The parent Planning run now writes a `plan` for every sibling in `proposed_split.json`
 (`SplitSubTaskSchema`, `src/pipeline/planning.ts`) — the prompt asks it to reuse the analysis it
 just did for the first task and cover, per child, self-contained scope + acceptance criteria,
-exclusions, relevant files/symbols, dependencies on preceding siblings, an ordered outline, and
-verification guidance. When it spawns each child, it embeds that plan as a **structured,
+exclusions, relevant files/symbols, dependencies on preceding siblings (or why it has none — the
+decision its `dependsOn` records as `blocked by` relationships, issue #1176), an ordered outline,
+and verification guidance. When it spawns each child, it embeds that plan as a **structured,
 validated preplanned contract** (`PreplanContractSchema`, `src/pipeline/preplan.ts`) in a hidden
 `<!-- swarm-preplan:v1 … -->` marker in the child's issue body — the only state that durably
 travels with a child while it enters Planning.
@@ -114,8 +115,8 @@ gate does read — the item's description and comments written by people — no 
 either (issue #643): a prerequisite found only in prose is surfaced on the item for a human to
 record natively, and only a recorded relationship gates the run.
 
-A dispatched preplanned child publishes its plan rather than being gated on the predecessors it is
-chained to (issue #889): that plan was written by the parent's Planning run against the same tree,
+A dispatched preplanned child publishes its plan rather than being gated on the earlier phases it
+depends on (issue #889): that plan was written by the parent's Planning run against the same tree,
 so the child reads no repository and spends no agent, and gating it would defer the one dispatch
 that repairs a `planned` label whose write failed.
 
