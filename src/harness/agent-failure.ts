@@ -151,7 +151,13 @@ export class AgentRunError extends Error {
 // Classification only trusts the terminal output window, and the softer
 // signals retain this co-occurrence gate as an additional guard against CI logs
 // or reviewed code that discusses HTTP 429 handling.
-const LIMIT_BANNER_RE = /(?:you've|you have)\s+hit\s+your\s+(?:session|usage|rate)\s+limit/i;
+// The banner names its limit either by kind ("session", "usage", "rate") or, as
+// Claude Code now words it, by the window it covers — "You've hit your 5-hour
+// limit · resets 3:40pm (Europe/Warsaw)" (issue #1196), or a weekly one. The
+// qualifier is a closed vocabulary rather than any word, so an agent's own
+// "you've hit your recursion limit" stays unmatched.
+const LIMIT_BANNER_RE =
+	/(?:you've|you have)\s+hit\s+your\s+(?:session|usage|rate|\d+[-\s]?(?:hour|day|week)|hourly|daily|weekly|monthly)\s+limit/i;
 const USAGE_LIMIT_RE = /\b(?:session|usage|rate)[\s-]?limit\b/i;
 const RATE_HTTP_RE = /\b(?:429|too many requests)\b/i;
 const RESET_RE = /resets?\s+([^\n]+)/i;
@@ -186,7 +192,10 @@ const AUTH_BANNER_RE =
 // `Claude run failed (…)` line ({@link ./claude-stream.ts}). That line is a
 // structural signal — it exists only because the CLI itself reported the run
 // as failed — so a 429/`rate_limit_error` inside it is trusted on its own,
-// without the "resets …" co-occurrence the softer free-text signals need.
+// without the "resets …" co-occurrence the softer free-text signals need. So is
+// the limit banner itself: a subscription account's usage limit arrives there
+// with no status code at all (`Claude run failed (success): You've hit your
+// 5-hour limit · …`, issue #1196).
 const CLAUDE_RATE_LIMIT_ERROR_RE = /\b429\b|\brate_limit_error\b/i;
 // agy's terminal `result` event reports its own `status`, rendered as a single
 // `Antigravity run failed (…)` line ({@link ./antigravity-stream.ts}). Like
@@ -326,6 +335,24 @@ function codexRateLimitMessage(result: AgentCliResult): string | undefined {
 }
 
 /**
+ * The message of Claude's own failed terminal `result` record when that record
+ * names an account limit — a 429/`rate_limit_error` in its subtype or text, or
+ * the limit banner itself — else `undefined`. Structural for the reason Codex's
+ * record is ({@link codexRateLimitMessage}), and returned as the message so the
+ * caller reads the reset out of the record it trusted rather than out of
+ * whichever "reset" the terminal tail happens to mention first.
+ */
+function claudeRateLimitMessage(result: AgentCliResult): string | undefined {
+	if (result.cli !== 'claude' || result.claudeFailure === undefined) return undefined;
+	const { subtype = '', message = '' } = result.claudeFailure;
+	return CLAUDE_RATE_LIMIT_ERROR_RE.test(subtype) ||
+		CLAUDE_RATE_LIMIT_ERROR_RE.test(message) ||
+		LIMIT_BANNER_RE.test(message)
+		? message
+		: undefined;
+}
+
+/**
  * Codex's own reset phrasing, trimmed of the sentence's trailing period. Read
  * only from its structural failure record, never from free text.
  */
@@ -421,12 +448,7 @@ function parseWallClockReset(hint: string, now: Date): Date | undefined {
  * guards against.
  */
 function structuralRateLimit(result: AgentCliResult): boolean {
-	if (result.cli === 'claude')
-		return (
-			result.claudeFailure !== undefined &&
-			(CLAUDE_RATE_LIMIT_ERROR_RE.test(result.claudeFailure.subtype ?? '') ||
-				CLAUDE_RATE_LIMIT_ERROR_RE.test(result.claudeFailure.message ?? ''))
-		);
+	if (result.cli === 'claude') return claudeRateLimitMessage(result) !== undefined;
 	if (result.cli === 'antigravity')
 		return (
 			result.antigravityFailure !== undefined &&
@@ -434,6 +456,28 @@ function structuralRateLimit(result: AgentCliResult): boolean {
 				ANTIGRAVITY_RATE_LIMIT_ERROR_RE.test(result.antigravityFailure.message ?? ''))
 		);
 	return codexRateLimitMessage(result) !== undefined;
+}
+
+/**
+ * The reset text of a run already classified rate-limited. Claude's own failure
+ * record names its reset first when it carries one — the terminal tail's first
+ * "reset" can be an earlier line of the agent's own work (issue #1196). The
+ * tail's shared "resets …" match then wins for every other CLI; Codex's own
+ * `try again at …` phrasing is the fallback, and resolves to an instant only when
+ * it names a zone — a missing one leaves `retryAfter` undefined and the consumer
+ * on its default backoff, never a downgraded classification.
+ */
+function rateLimitResetHint(
+	result: AgentCliResult,
+	tailResetMatch: RegExpExecArray | null,
+): string | undefined {
+	const claudeMessage = claudeRateLimitMessage(result);
+	const codexMessage = codexRateLimitMessage(result);
+	return (
+		(claudeMessage ? RESET_RE.exec(claudeMessage)?.[1]?.trim() : undefined) ||
+		tailResetMatch?.[1]?.trim() ||
+		(codexMessage ? codexResetHint(codexMessage) : undefined)
+	);
 }
 
 /**
@@ -499,7 +543,6 @@ export function classifyAgentFailure(result: AgentCliResult, now: Date = new Dat
 
 	if (isCapacity) return { kind: 'capacity' };
 
-	const codexLimitMessage = codexRateLimitMessage(result);
 	const resetMatch = RESET_RE.exec(tail);
 	const isRateLimited =
 		hasStructuralRateLimit ||
@@ -507,13 +550,7 @@ export function classifyAgentFailure(result: AgentCliResult, now: Date = new Dat
 		((USAGE_LIMIT_RE.test(tail) || RATE_HTTP_RE.test(tail)) && resetMatch !== null);
 
 	if (isRateLimited) {
-		// The shared "resets …" match still wins for every other CLI; Codex's own
-		// `try again at …` phrasing is the fallback, and resolves to an instant only
-		// when it names a zone — a missing one leaves `retryAfter` undefined and the
-		// consumer on its default backoff, never a downgraded classification.
-		const resetHint =
-			resetMatch?.[1]?.trim() ||
-			(codexLimitMessage ? codexResetHint(codexLimitMessage) : undefined);
+		const resetHint = rateLimitResetHint(result, resetMatch);
 		return {
 			kind: 'rate-limit',
 			resetHint,
