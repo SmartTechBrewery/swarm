@@ -1008,7 +1008,9 @@ lapsed, `docker compose restart app` logs a fresh one.
 
 - **Create projects in the dashboard** (`https://<your domain>` → New Project),
   then enter each project's credentials on its Source Control and Project
-  Management tabs. The roles each provider needs are in
+  Management tabs. A project needs a reviewer credential to be created: type
+  it into the dialog's reviewer field, or record one installation-wide default
+  for every new project in General Settings → Credentials. The roles each provider needs are in
   [`docs/configuration.md`](./configuration.md).
 - **Point webhooks at the domain.** GitHub delivers to
   `https://<your domain>/github/webhook`; the other providers to
