@@ -2,8 +2,9 @@
  * The `wip_slots` reads and writes (issue #1185) — the durable half of the
  * per-repository WIP limit.
  *
- * Three functions, all plain: the atomic reservation a new ticket's start takes,
- * the release that frees it, and the count promotion reads. The *policy* — which
+ * Four functions, all plain: the atomic reservation a new ticket's start takes,
+ * the release that frees it, the count promotion reads, and the full list the
+ * slot sweep (`src/dispatch/wip-slot-sweep.ts`, issue #1189) re-checks. The *policy* — which
  * phases are gated, what releases a slot, who is woken — lives in
  * `src/dispatch/wip-limit.ts`; nothing here decides anything but "is there room".
  */
@@ -133,4 +134,29 @@ export async function countWipSlots(projectId: string, repository: string): Prom
 		.from(wipSlots)
 		.where(and(eq(wipSlots.projectId, projectId), eq(wipSlots.repository, repository)));
 	return row?.count ?? 0;
+}
+
+/** One held slot, as the slot sweep re-checks it against its card. */
+export interface WipSlotRow {
+	projectId: string;
+	repository: string;
+	taskId: string;
+	workItemId: string | null;
+}
+
+/**
+ * Every held slot across every project (issue #1189), ordered so one project's
+ * repositories come out together. Unbounded on purpose: the table holds at most the
+ * sum of every repository's `wipLimit`, which is small by construction.
+ */
+export async function listWipSlots(): Promise<WipSlotRow[]> {
+	return getDb()
+		.select({
+			projectId: wipSlots.projectId,
+			repository: wipSlots.repository,
+			taskId: wipSlots.taskId,
+			workItemId: wipSlots.workItemId,
+		})
+		.from(wipSlots)
+		.orderBy(asc(wipSlots.projectId), asc(wipSlots.repository), asc(wipSlots.openedAt));
 }
