@@ -40,9 +40,9 @@ const COMMANDS: Record<string, Command> = {
 	logs,
 	queue,
 	run: runCommand,
-	// A distinct top-level key, not a subcommand of `run`: that one is a
-	// database-backed dispatch-repair command with nothing in common with starting
-	// the host's worker.
+	// A distinct top-level key, not a subcommand of `run`: that one repairs a run
+	// (database-backed) and reads runs (over the operator API), with nothing in
+	// common with starting the host's worker.
 	'run:worker': runWorker,
 	login,
 	users,
@@ -67,6 +67,7 @@ Commands:
   logs [svc] [-f]  Tail stack logs (optional service, -f/--follow to stream)
   queue clear      Remove all pending queue jobs (not active runs)
   run reset <id>   Reset a wedged run and restart its phase (last resort)
+  run list|show|logs  Read runs over the control plane (needs swarm login)
   run:worker       Start this checkout's registered worker (credential from the local cache)
   login            Sign this CLI in to the control plane (--status, --logout)
   users            Manage SWARM users and the installation admin

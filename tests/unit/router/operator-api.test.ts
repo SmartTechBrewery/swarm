@@ -4,7 +4,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 // The mount is what is under test, not the procedures behind it: `workers.listMine`
 // stands in for "a workers procedure was reached", `workers.getById` for "a query
 // that takes an input", and `projects.list` for "a namespace this router
-// deliberately does not carry". All would otherwise need a database.
+// deliberately does not carry" (the `runs` reads have their own suite). All would
+// otherwise need a database.
 const { listOwnerWorkers, getEnrollment, setSharingConsent, getDashboardWorkerDetail } = vi.hoisted(
 	() => ({
 		listOwnerWorkers: vi.fn(),
@@ -152,9 +153,10 @@ describe('registerOperatorApi — bearer authentication', () => {
 
 describe('registerOperatorApi — the exposed surface', () => {
 	// The router is the internet-exposed process, so it carries the `workers`
-	// namespace alone: projects, credentials, settings, users and runs stay on the
-	// loopback-bound API server's `appRouter`.
-	it('does not serve a non-workers namespace, even to a valid bearer', async () => {
+	// namespace plus the read-only run reads (issue #1182, covered by
+	// `./operator-api-runs.test.ts`): projects, credentials, settings, users and the
+	// run mutations stay on the loopback-bound API server's `appRouter`.
+	it('does not serve a namespace it does not carry, even to a valid bearer', async () => {
 		const response = await get(appWith(makeDeps()), '/operator/trpc/projects.list', TOKEN);
 
 		expect(response.status).toBe(404);

@@ -28,7 +28,7 @@ when present. The `--` separates npm's own args from the ones passed to the CLI 
 it is required.
 
 **Environment.** Commands that touch the database (`config`, `users`, `members`,
-`identities`, `queue`, `run`, `worktrees`, `pm`) need `DATABASE_URL` (and
+`identities`, `queue`, `run reset`, `worktrees`, `pm`) need `DATABASE_URL` (and
 some also `REDIS_URL`) in the environment; `pm webhook` additionally needs
 `WEBHOOK_CALLBACK_BASE_URL`. `run:worker` is one of the few that needs **no**
 `DATABASE_URL` — it reads a host-local file and starts the DB-free daemon. So is
@@ -37,7 +37,9 @@ network rather than reaching Postgres, which is what makes it usable off the
 control-plane host. **So is `workers`, since issue #800** — every one of its
 subcommands calls the control plane's operator API over that same
 `SWARM_CONTROL_PLANE_URL`, authenticated by a `swarm login` session, so onboarding
-a machine no longer needs a database on the machine being onboarded.
+a machine no longer needs a database on the machine being onboarded. **So are
+`run list`, `run show` and `run logs`, since issue #1182** — they read runs over
+the same operator API and session, while `run reset` stays database-backed.
 `npm run swarm -- …` and the dedicated npm
 wrappers (`db:seed`, `queue:clear`, `worktrees:prune`) load `.env` for you;
 invoking the global `swarm` binary directly requires those vars to be exported.
@@ -60,6 +62,7 @@ print the authoritative usage.
 | [`logs`](#swarm-logs) | Tail stack logs |
 | [`queue clear`](#swarm-queue) | Cancel all pending queue work |
 | [`run reset`](#swarm-run) | Reset a wedged run and restart its phase (last resort) |
+| [`run list\|show\|logs`](#swarm-run) | Read runs, one run's detail, and its logs over the control plane |
 | [`run:worker`](#swarm-runworker) | Start this checkout's registered worker (credential from the local cache) |
 | [`login`](#swarm-login) | Sign this CLI in to the control plane over the network |
 | [`users`](#swarm-users) | Manage SWARM users and the installation admin |
@@ -173,8 +176,42 @@ Requires `DATABASE_URL` and `REDIS_URL`. Wrapper: `npm run queue:clear`.
 ### `swarm run`
 
 ```bash
+swarm run list [--project <id>] [--status <status>] [--phase <phase>] \
+               [--since <window>] [--limit <n>] [--offset <n>] [--json]
+swarm run show <runId> [--json]
+swarm run logs <runId> [--json]
 swarm run reset <runId>
 ```
+
+**Reading runs** (issue #1182). `list`, `show` and `logs` call the control plane's
+operator API with your cached [`swarm login`](#swarm-login) session, so they need
+`SWARM_CONTROL_PLANE_URL` and **no** `DATABASE_URL` — which makes them the way to
+diagnose runs from a terminal, a script or an assistant session on an installation
+with no shell on the host (the VPS behind Caddy). They are the dashboard's own run
+reads (`runs.list`, `runs.getById`, `runs.getLogs`, `runs.getOutput`), with the
+dashboard's own authorization: you see what the dashboard shows you, no more — the
+runs of projects you are a member of, or every run as an instance admin, and a run
+in a project you do not belong to answers exactly like an unknown id. Nothing here
+writes; recovering a run stays `reset` or the dashboard.
+
+- **`list`** — recent runs, newest first, one tab-separated line each: started,
+  status, phase, project, run id, subject (work item, pull request or task), and
+  the first line of the run's headline. Filters: `--project <id>`, `--status`
+  (`running`, `completed`, `failed`, `deferred`, `checkpointed`), `--phase` (the
+  six pipeline phases, or `worker-update`), and `--since` — a window counted back
+  from now (`30m`, `24h`, `7d`) or an ISO 8601 timestamp. `--limit` is 1–200
+  (default 50); when more runs match, a footer names the next `--offset`.
+- **`show`** — one run's detail: project, phase, status, timing, the worker and
+  agent that ran it, its work item and pull request, the full **headline**, and
+  the **cause** and **recovery** the dashboard's failure callout shows.
+- **`logs`** — the run's agent output in order (every page of it, with a warning
+  when it was cut at the retention cap), then its captured stdout and stderr.
+
+`--json` on any of the three prints the control plane's payload instead —
+`logs --json` prints one `{ output, logs }` document — so scripts read the same
+fields the dashboard does. A bad flag or run id exits **1** before anything is
+sent; a refusal or an unreachable control plane prints the server's message and
+exits **1**; a missing session says to run `swarm login`.
 
 - **`reset`** — the last-resort recovery for a single **wedged** run: one whose
   dispatch, Redis cancellation flag, worktree lease, and recovery record disagree
@@ -230,7 +267,7 @@ retry already created the run's dispatch). Both print the refusal and exit **1**
 without a second dispatch. A failure part-way through leaves the run
 terminal-and-idle — exactly the state a second `swarm run reset` retries from.
 
-Requires `DATABASE_URL` and `REDIS_URL`. Works with the worker **and** the API
+`reset` requires `DATABASE_URL` and `REDIS_URL`. Works with the worker **and** the API
 stopped — it goes straight to Postgres and Redis, which is the point: the same
 action exists in the dashboard (a run's "Reset & restart" button), and this is how
 you reach it when the services that serve it are down.
@@ -370,6 +407,13 @@ dashboard, and `SWARM_SINGLE_USER_MODE` is ignored there too. Since issue #800
 that API is what **every [`swarm workers`](#swarm-workers) subcommand calls**, so
 `swarm login` is now the prerequisite for the whole command group and none of it
 needs a `DATABASE_URL` any more.
+
+Since issue #1182 the same API also carries a **read-only** `runs` namespace — the
+dashboard's `runs.list`, `runs.getById`, `runs.getLogs` and `runs.getOutput`,
+mounted verbatim with their authorization — which is what
+[`swarm run list|show|logs`](#swarm-run) calls. No run mutation (reset, retry,
+terminate) is served there, and neither are projects, credentials, settings or
+users.
 
 ### `swarm users`
 
