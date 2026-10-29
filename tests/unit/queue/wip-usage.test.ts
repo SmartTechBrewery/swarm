@@ -267,6 +267,35 @@ describe('toWipUsage', () => {
 		expect(holder()).toMatchObject({ state: 'waiting-on-operator', operatorReason: 'stalled' });
 	});
 
+	it('reads a holder with no run yet but a queued dispatch as waiting on the pipeline', () => {
+		const ticket = holder({
+			activeDispatches: [
+				{ projectId: 'p1', taskId: '103', phase: 'planning', waitReason: 'worker-eligibility' },
+			],
+		});
+		expect(ticket.state).toBe('waiting-on-pipeline');
+		expect(ticket.operatorReason).toBeUndefined();
+	});
+
+	it('reads a holder with no run yet but a queued pull request dispatch as waiting on the pipeline', () => {
+		const ticket = holder({
+			slots: [makeSlot({ prNumber: '120' })],
+			activeDispatches: [
+				{ projectId: 'p1', taskId: '120-respond', phase: 'respond-to-review', waitReason: null },
+			],
+		});
+		expect(ticket.state).toBe('waiting-on-pipeline');
+	});
+
+	it('still reads a holder whose only dispatch is its own wip-limit wait as stalled', () => {
+		const ticket = holder({
+			activeDispatches: [
+				{ projectId: 'p1', taskId: '103', phase: 'planning', waitReason: 'wip-limit' },
+			],
+		});
+		expect(ticket).toMatchObject({ state: 'waiting-on-operator', operatorReason: 'stalled' });
+	});
+
 	it('does not fold another repository’s activity onto a holder', () => {
 		const ticket = holder({
 			activity: [makeActivity({ repository: 'acme/other', liveRunCount: 1 })],

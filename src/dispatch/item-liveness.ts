@@ -248,7 +248,11 @@ function unitKey(
  * That is conservative in the safe direction — an active dispatch can only ever
  * *remove* a unit from the report, never invent one.
  */
-function dispatchKey(projectId: string, unit: ItemLivenessUnitKind, reference: string): string {
+export function dispatchKey(
+	projectId: string,
+	unit: ItemLivenessUnitKind,
+	reference: string,
+): string {
 	return [projectId, unit, reference].join(KEY_SEPARATOR);
 }
 

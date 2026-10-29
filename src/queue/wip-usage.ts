@@ -18,10 +18,13 @@
  *
  * 1. A live run in either unit → `running`.
  * 2. A non-terminal dispatch for either unit → `waiting-on-pipeline` (queued for a
- *    worker, a CI re-check, a retry inside its budget). The ticket's own `wip-limit`
- *    wait is excluded: that is the wait this panel explains, not movement.
+ *    worker, a CI re-check, a retry inside its budget). Matched on the holder's own
+ *    keys, not through a folded unit, so a ticket whose first dispatch is still
+ *    waiting for a worker — no run row yet — reads as queued, not stalled. The
+ *    ticket's own `wip-limit` wait is excluded: that is the wait this panel
+ *    explains, not movement.
  * 3. The unit that moved last (the pull request on a tie) decides the rest. No run
- *    at all inside the lookback reads as liveness would read silence: `settling`
+ *    and no dispatch inside the lookback reads as liveness would read silence: `settling`
  *    for {@link ITEM_STALL_AFTER_MS} after the slot opened, `stalled` after.
  * 4. Its latest run `failed` with nothing queued → `waiting-on-operator` (`failed`):
  *    nothing will retry it.
@@ -44,10 +47,12 @@ import {
 	AwaitingHumanCauseSchema,
 	awaitingHumanCause,
 	classifyItemLiveness,
+	dispatchKey,
 	foldLivenessUnits,
 	ITEM_STALL_AFTER_MS,
 	type ItemLivenessPolicy,
 	type ItemLivenessUnit,
+	livenessUnitKeysForDispatch,
 } from '../dispatch/item-liveness.js';
 
 /** What one slot holder is doing, as the operator needs to read it. */
@@ -145,10 +150,16 @@ interface HolderVerdict {
 	decidingUnit?: ItemLivenessUnit;
 }
 
-/** The holder's state from its folded units — the rule list in this module's header. */
+/**
+ * The holder's state from its folded units — the rule list in this module's header.
+ * `hasActiveDispatch` is matched on the holder's own keys rather than read off its
+ * units: a unit exists only once a run does, and a first dispatch can wait for a
+ * worker long before that.
+ */
 function classifyHolder(
 	slot: WipSlotRow,
 	units: readonly ItemLivenessUnit[],
+	hasActiveDispatch: boolean,
 	policy: ItemLivenessPolicy,
 	now: Date,
 ): HolderVerdict {
@@ -159,9 +170,7 @@ function classifyHolder(
 	}, undefined);
 
 	if (units.some((unit) => unit.liveRunCount > 0)) return { state: 'running', decidingUnit };
-	if (units.some((unit) => unit.hasActiveDispatch)) {
-		return { state: 'waiting-on-pipeline', decidingUnit };
-	}
+	if (hasActiveDispatch) return { state: 'waiting-on-pipeline', decidingUnit };
 	if (!decidingUnit) {
 		return now.getTime() - slot.openedAt.getTime() < ITEM_STALL_AFTER_MS
 			? { state: 'waiting-on-pipeline' }
@@ -212,6 +221,9 @@ function toTicket(slot: WipSlotRow, verdict: HolderVerdict): WipTicket {
 export function toWipUsage(input: WipUsageInput): WipUsageEntry[] {
 	const now = input.now ?? new Date();
 	const activeDispatches = input.activeDispatches.filter((ref) => ref.waitReason !== 'wip-limit');
+	const activeDispatchKeys = new Set(
+		activeDispatches.flatMap((ref) => livenessUnitKeysForDispatch(ref)),
+	);
 	const units = new Map<string, ItemLivenessUnit>();
 	for (const unit of foldLivenessUnits(input.activity, activeDispatches, [])) {
 		units.set(key(unit.projectId, unit.repository, unit.unit, unit.reference), unit);
@@ -246,9 +258,15 @@ export function toWipUsage(input: WipUsageInput): WipUsageEntry[] {
 				? units.get(key(slot.projectId, slot.repository, 'pull-request', slot.prNumber))
 				: undefined,
 		].filter((unit): unit is ItemLivenessUnit => unit !== undefined);
+		const hasActiveDispatch =
+			activeDispatchKeys.has(dispatchKey(slot.projectId, 'work-item', slot.taskId)) ||
+			(slot.prNumber !== null &&
+				activeDispatchKeys.has(dispatchKey(slot.projectId, 'pull-request', slot.prNumber)));
 		const policy = input.policies[slot.projectId] ?? DEFAULT_POLICY;
 		entry.inFlight += 1;
-		entry.tickets.push(toTicket(slot, classifyHolder(slot, holderUnits, policy, now)));
+		entry.tickets.push(
+			toTicket(slot, classifyHolder(slot, holderUnits, hasActiveDispatch, policy, now)),
+		);
 	}
 	for (const waiter of input.waiters) {
 		if (waiter.count > 0) entryFor(waiter.projectId, waiter.repository).waiting += waiter.count;
