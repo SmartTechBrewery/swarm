@@ -50,6 +50,25 @@ describe('jobContinuesPreservedCheckout', () => {
 			),
 		).toBe(false);
 	});
+
+	// Issue #1197: the reused task branch may exist only on the machine that cut it.
+	it('is true for a retry that reuses its provisioned Implementation branch', () => {
+		expect(
+			jobContinuesPreservedCheckout(
+				createMockPmWebhookJob({ implementationBranchProvisioned: true }),
+			),
+		).toBe(true);
+	});
+
+	it('is true for a fresh start that still reuses the provisioned branch', () => {
+		// `'fresh'` reclaims the checkout, but the phase still provisions against the
+		// existing branch, which is just as machine-local.
+		expect(
+			jobContinuesPreservedCheckout(
+				createMockPmWebhookJob({ recoveryMode: 'fresh', implementationBranchProvisioned: true }),
+			),
+		).toBe(true);
+	});
 });
 
 // Issue #1138: names which continuation a transport-lost deferral carries, so the
@@ -74,6 +93,30 @@ describe('preservedContinuationKind', () => {
 		expect(preservedContinuationKind(createMockScmWebhookJob({ resumeDelivery: true }))).toBe(
 			'delivery',
 		);
+	});
+
+	it('names a branch reuse, with or without a fresh start (issue #1197)', () => {
+		expect(
+			preservedContinuationKind(createMockPmWebhookJob({ implementationBranchProvisioned: true })),
+		).toBe('branch');
+		expect(
+			preservedContinuationKind(
+				createMockPmWebhookJob({ recoveryMode: 'fresh', implementationBranchProvisioned: true }),
+			),
+		).toBe('branch');
+	});
+
+	it('names the adopted state ahead of the branch it also reuses', () => {
+		expect(
+			preservedContinuationKind(
+				createMockPmWebhookJob({ resumeSession: true, implementationBranchProvisioned: true }),
+			),
+		).toBe('session');
+		expect(
+			preservedContinuationKind(
+				createMockPmWebhookJob({ resumeDelivery: true, implementationBranchProvisioned: true }),
+			),
+		).toBe('delivery');
 	});
 
 	it('is undefined for a job that is not a continuation', () => {

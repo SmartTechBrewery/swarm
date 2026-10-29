@@ -3146,6 +3146,55 @@ describe('runsRouter', () => {
 				expect(jobPayload.recoveryMode).toBe('checkpoint');
 			});
 		});
+		// Issue #1197, live on run 38700e2e: an Implementation run failed after provisioning
+		// its task branch locally, and "Retry now" reused the branch on another machine,
+		// which failed on `invalid reference`.
+		describe('a failed Implementation run that provisioned its branch (issue #1197)', () => {
+			const branchRun = (overrides: Partial<RunRow> = {}) =>
+				makeRun({
+					id: 'run-1',
+					status: 'failed',
+					phase: 'implementation',
+					workerId: 'worker-a',
+					recovery: { preservedWorkerId: 'worker-a' },
+					jobPayload: createMockPmWebhookJob({
+						resumePmPhase: 'implementation',
+						implementationBranchProvisioned: true,
+					}),
+					...overrides,
+				});
+
+			beforeEach(() => {
+				vi.mocked(getActiveDispatchByRunId).mockResolvedValue(undefined);
+				vi.mocked(createAndPublishDispatch).mockResolvedValue({
+					dispatch: makeDispatch(),
+					created: true,
+				});
+			});
+
+			it('keeps reusing the branch, pinned, when the run records its machine', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(branchRun());
+
+				await caller.retryNow({ runId: 'run-1' });
+
+				const [{ jobPayload }] = vi.mocked(createAndPublishDispatch).mock.calls[0];
+				expect(jobPayload.implementationBranchProvisioned).toBe(true);
+				expect(jobContinuesPreservedCheckout(jobPayload)).toBe(true);
+			});
+
+			it('restarts the phase when the run records no machine for the branch', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					branchRun({ recovery: null, workerId: 'worker-b' }),
+				);
+
+				await caller.retryNow({ runId: 'run-1' });
+
+				const [{ jobPayload }] = vi.mocked(createAndPublishDispatch).mock.calls[0];
+				expect(jobPayload.implementationBranchProvisioned).toBeUndefined();
+				expect(jobPayload.resumePmPhase).toBe('implementation');
+				expect(jobContinuesPreservedCheckout(jobPayload)).toBe(false);
+			});
+		});
 		// Issue #1141: a pinned continuation whose machine lost its transport and never
 		// came back settles `failed` keeping its pin, checkpoint and session, and tells
 		// the operator to bring the machine back and "Retry now" — which must therefore
