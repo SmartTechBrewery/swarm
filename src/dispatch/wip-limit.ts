@@ -35,6 +35,7 @@ import {
 import {
 	countWipSlots,
 	type ReserveWipSlotResult,
+	recordWipSlotPullRequest,
 	releaseWipSlot,
 	reserveWipSlot,
 	type WipSlotHolder,
@@ -82,6 +83,36 @@ export async function admitTicket(
 			url: trigger.workItem.url,
 		},
 	});
+}
+
+/**
+ * Record the pull request a ticket in flight opened onto its slot (issue #1192), so
+ * the dashboard's WIP panel can follow the holder from its card onto that pull
+ * request (`src/queue/wip-usage.ts`). Called by `processJob` once a pull
+ * request-driven phase resolves; the ticket is the task id SWARM's own branch naming
+ * maps the head branch back to — never a URL — and a branch that is not a SWARM task
+ * branch, or a ticket holding no slot, records nothing. Best-effort and fully
+ * swallowed: it only feeds a read model, and must never fail the phase.
+ */
+export async function recordTicketPullRequest(
+	project: ProjectConfig,
+	pullRequest: { prNumber: string; prBranch: string },
+): Promise<void> {
+	const taskId = issueNumberFromBranch(pullRequest.prBranch, project.branchPrefix, {
+		strict: true,
+	});
+	if (!taskId) return;
+	try {
+		await recordWipSlotPullRequest(project.id, project.repo, taskId, pullRequest.prNumber);
+	} catch (err) {
+		logger.debug('wip-limit: could not record the ticket’s pull request (continuing)', {
+			projectId: project.id,
+			repository: project.repo,
+			taskId,
+			prNumber: pullRequest.prNumber,
+			error: describeError(err),
+		});
+	}
 }
 
 /**

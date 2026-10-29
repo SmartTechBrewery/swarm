@@ -394,6 +394,9 @@ const releaseWipSlot = vi.fn(
 	async (_projectId: string, _repository: string, _taskId: string) => false,
 );
 const countWipSlots = vi.fn(async (_projectId: string, _repository: string) => 0);
+const recordWipSlotPullRequest = vi.fn(
+	async (_projectId: string, _repository: string, _taskId: string, _prNumber: string) => false,
+);
 const listWipLimitWaits = vi.fn(
 	async (_projectId: string, _repository: string): Promise<MockDispatchRow[]> => [],
 );
@@ -402,6 +405,12 @@ vi.mock('@/db/repositories/wipSlotsRepository.js', () => ({
 	releaseWipSlot: (projectId: string, repository: string, taskId: string) =>
 		releaseWipSlot(projectId, repository, taskId),
 	countWipSlots: (projectId: string, repository: string) => countWipSlots(projectId, repository),
+	recordWipSlotPullRequest: (
+		projectId: string,
+		repository: string,
+		taskId: string,
+		prNumber: string,
+	) => recordWipSlotPullRequest(projectId, repository, taskId, prNumber),
 }));
 
 const refreshConflictResolutionClaim = vi.fn(
@@ -1035,6 +1044,8 @@ describe('processJob', () => {
 		releaseWipSlot.mockResolvedValue(false);
 		countWipSlots.mockReset();
 		countWipSlots.mockResolvedValue(0);
+		recordWipSlotPullRequest.mockReset();
+		recordWipSlotPullRequest.mockResolvedValue(false);
 		listWipLimitWaits.mockReset();
 		listWipLimitWaits.mockResolvedValue([]);
 		bindDispatchToRun.mockClear();
@@ -6583,6 +6594,35 @@ describe('processJob', () => {
 			await processJob(createMockPmWebhookJob(), registryReturning(boardTrigger('planning')));
 
 			expect(releaseWipSlot).not.toHaveBeenCalled();
+		});
+
+		it("records a pull request-driven phase's pull request on its ticket's slot (issue #1192)", async () => {
+			await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
+
+			// The ticket is the task id the head branch `issue-17` maps back to.
+			expect(recordWipSlotPullRequest).toHaveBeenCalledWith(PROJECT.id, PROJECT.repo, '17', '17');
+		});
+
+		it('records nothing for a board-driven phase or a branch that is no task branch', async () => {
+			await processJob(createMockPmWebhookJob(), registryReturning(boardTrigger('planning')));
+			await processJob(
+				createMockScmWebhookJob(),
+				registryReturning({ ...REVIEW_TRIGGER, prBranch: 'feature/not-a-task' }),
+			);
+
+			expect(recordWipSlotPullRequest).not.toHaveBeenCalled();
+		});
+
+		it('runs the phase anyway when the pull request cannot be recorded', async () => {
+			recordWipSlotPullRequest.mockRejectedValueOnce(new Error('db down'));
+
+			const outcome = await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(outcome).toMatchObject({ phase: 'review' });
+			expect(phaseCalls.map((call) => call.phase)).toContain('review');
 		});
 	});
 

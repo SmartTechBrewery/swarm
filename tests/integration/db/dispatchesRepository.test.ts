@@ -11,6 +11,7 @@ import {
 	claimDispatch,
 	claimWorkerForDispatch,
 	completeDispatch,
+	countWipLimitWaitsByRepository,
 	createDispatch,
 	type DispatchRow,
 	type DispatchState,
@@ -952,6 +953,30 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 					{ projectId: PROJECT_ID, repository: 'jkwiecien/other-repo' },
 				]),
 			);
+		});
+
+		it('counts the waiters per repository, within the scope it is given (issue #1192)', async () => {
+			await defer(await wipWait('1'));
+			await defer(await wipWait('2'));
+			await defer(await wipWait('3'), 'jkwiecien/other-repo');
+			// A board dispatch waiting on anything else is not a WIP waiter.
+			const capacity = await wipWait('4');
+			await claimDispatch(capacity, OWNER, 60_000);
+			await deferDispatchToPending(capacity, {
+				jobPayload: job(),
+				waitReason: 'project-capacity',
+			});
+
+			const counts = await countWipLimitWaitsByRepository([PROJECT_ID]);
+			expect(counts).toHaveLength(2);
+			expect(counts).toEqual(
+				expect.arrayContaining([
+					{ projectId: PROJECT_ID, repository: REPO, count: 2 },
+					{ projectId: PROJECT_ID, repository: 'jkwiecien/other-repo', count: 1 },
+				]),
+			);
+			expect(await countWipLimitWaitsByRepository([])).toEqual([]);
+			expect(await countWipLimitWaitsByRepository(['someone-else'])).toEqual([]);
 		});
 	});
 

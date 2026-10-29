@@ -1,9 +1,14 @@
 import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 
-import { scopeProjectToRepository } from '../../config/project-repository.js';
+import {
+	findProjectRepository,
+	resolveWipLimit,
+	scopeProjectToRepository,
+} from '../../config/project-repository.js';
 import type { ProjectConfig, ProjectRecord } from '../../config/schema.js';
 import {
+	countWipLimitWaitsByRepository,
 	type DispatchRow,
 	getActiveDispatchByRunId,
 	getDispatchById,
@@ -51,6 +56,7 @@ import {
 	recordStalledDismissal,
 } from '../../db/repositories/stalledDismissalsRepository.js';
 import { getUserById } from '../../db/repositories/usersRepository.js';
+import { listWipSlots } from '../../db/repositories/wipSlotsRepository.js';
 import { classifyDispatchClaim } from '../../dispatch/claim-liveness.js';
 import {
 	cancelDispatchAndWake,
@@ -111,6 +117,7 @@ import {
 	type QueuedRun,
 	toQueuedRuns,
 } from '../../queue/queued-runs.js';
+import { toWipUsage, type WipUsageEntry } from '../../queue/wip-usage.js';
 import { repoSlugsMatch } from '../../scm/repo-slug.js';
 import type { SCMProvider } from '../../scm/types.js';
 import { reviewRecheckCoalesceKeys } from '../../triggers/review-recheck-keys.js';
@@ -1240,6 +1247,38 @@ function toLivenessDismissals(
 }
 
 /**
+ * A per-project, memoized lookup of the project's own pull-request URL grammar
+ * (`SCMProvider.pullRequestUrl`), or `null` — logged once per project — when the
+ * project resolves no runtime-ready provider. Shared by `runs.stalled` and `runs.wip`,
+ * which both link pull requests without assembling a URL of their own.
+ */
+function pullRequestUrlResolver(
+	projects: Map<string, ProjectConfig>,
+	view: string,
+): (projectId: string) => SCMProvider['pullRequestUrl'] | null {
+	const urlForProject = new Map<string, SCMProvider['pullRequestUrl'] | null>();
+	return (projectId) => {
+		const cached = urlForProject.get(projectId);
+		if (cached !== undefined) return cached;
+		const project = projects.get(projectId);
+		let resolved: SCMProvider['pullRequestUrl'] | null = null;
+		if (project) {
+			try {
+				const provider = requireProjectSCMProvider(project);
+				resolved = provider.pullRequestUrl.bind(provider);
+			} catch (error) {
+				logger.warn(
+					`${view}: no source-control provider resolved; listing that project’s pull requests unlinked`,
+					{ projectId, error: describeError(error) },
+				);
+			}
+		}
+		urlForProject.set(projectId, resolved);
+		return resolved;
+	};
+}
+
+/**
  * Fill each `pull-request` stalled row's `prUrl` with the **provider's own** web
  * URL for that pull request, so the dashboard links a stalled PR out without
  * assembling a URL of its own — which is how a GitLab or Bitbucket project's rows
@@ -1262,33 +1301,103 @@ function withPullRequestUrls(
 	items: StalledItem[],
 	projects: Map<string, ProjectConfig>,
 ): StalledItem[] {
-	const urlForProject = new Map<string, SCMProvider['pullRequestUrl'] | null>();
-	const resolve = (projectId: string): SCMProvider['pullRequestUrl'] | null => {
-		const cached = urlForProject.get(projectId);
-		if (cached !== undefined) return cached;
-		const project = projects.get(projectId);
-		let resolved: SCMProvider['pullRequestUrl'] | null = null;
-		if (project) {
-			try {
-				const provider = requireProjectSCMProvider(project);
-				resolved = provider.pullRequestUrl.bind(provider);
-			} catch (error) {
-				logger.warn(
-					'runs.stalled: no source-control provider resolved; listing that project’s pull requests unlinked',
-					{ projectId, error: describeError(error) },
-				);
-			}
-		}
-		urlForProject.set(projectId, resolved);
-		return resolved;
-	};
-
+	const resolve = pullRequestUrlResolver(projects, 'runs.stalled');
 	return items.map((item) => {
 		if (item.unit !== 'pull-request' || !item.prNumber) return item;
 		const pullRequestUrl = resolve(item.projectId);
 		if (!pullRequestUrl) return item;
 		return { ...item, prUrl: pullRequestUrl(item.repository, item.prNumber) };
 	});
+}
+
+/**
+ * A repository's resolved WIP limit from the project records the caller loaded. A
+ * repository the project no longer owns — slots outliving a removed entry — reads at
+ * the project default rather than failing the view.
+ */
+function wipLimitFrom(records: Map<string, ProjectRecord>) {
+	return (projectId: string, repository: string): number => {
+		const record = records.get(projectId);
+		const entry = record ? findProjectRepository(record, repository) : undefined;
+		return resolveWipLimit(entry ?? {});
+	};
+}
+
+/**
+ * Assemble the `runs.wip` read model (issue #1192) for `projectIds` (every project
+ * when absent) from its four bounded reads, and link each holder's pull request in
+ * its project's own provider grammar. Postgres only, like `runs.stalled`.
+ */
+async function loadWipUsage(
+	records: ProjectRecord[],
+	projectIds?: string[],
+): Promise<WipUsageEntry[]> {
+	const since = new Date(Date.now() - ITEM_ACTIVITY_LOOKBACK_MS);
+	const [slots, waiters] = await Promise.all([
+		listWipSlots(projectIds),
+		countWipLimitWaitsByRepository(projectIds),
+	]);
+	if (slots.length === 0 && waiters.length === 0) return [];
+	const [activity, activeDispatches] = slots.length
+		? await Promise.all([
+				listTaskActivitySince({ since, projectIds }),
+				listActiveDispatchTaskRefs(projectIds),
+			])
+		: [[], []];
+	const recordsById = new Map(records.map((record) => [record.id, record]));
+	const entries = toWipUsage({
+		slots,
+		waiters,
+		limitFor: wipLimitFrom(recordsById),
+		activity,
+		activeDispatches,
+		policies: Object.fromEntries(
+			records.map((record) => [record.id, itemLivenessPolicyFor(record)]),
+		),
+	});
+	const resolve = pullRequestUrlResolver(
+		new Map(records.map((record) => [record.id, scopeProjectToRepository(record)])),
+		'runs.wip',
+	);
+	return entries.map((entry) => ({
+		...entry,
+		tickets: entry.tickets.map((ticket) => {
+			const pullRequestUrl = ticket.prNumber ? resolve(entry.projectId) : null;
+			return pullRequestUrl && ticket.prNumber
+				? { ...ticket, prUrl: pullRequestUrl(entry.repository, ticket.prNumber) }
+				: ticket;
+		}),
+	}));
+}
+
+/**
+ * Name each `wip-limit` row's repository's `in flight / limit` (issue #1192), so the
+ * Queue says how full the repository it waits on is. One slot read, made only when
+ * the page holds such a row; best-effort — a failed read leaves the rows as they were.
+ */
+async function withQueuedWipUsage(
+	items: QueuedRun[],
+	loadRecords: () => Promise<ProjectRecord[]>,
+): Promise<QueuedRun[]> {
+	const waiting = items.filter((item) => item.waitReason === 'wip-limit' && item.repo);
+	if (waiting.length === 0) return items;
+	try {
+		const projectIds = [...new Set(waiting.map((item) => item.projectId))];
+		const [slots, records] = await Promise.all([listWipSlots(projectIds), loadRecords()]);
+		const limitFor = wipLimitFrom(new Map(records.map((record) => [record.id, record])));
+		return items.map((item) => {
+			if (item.waitReason !== 'wip-limit' || !item.repo) return item;
+			const inFlight = slots.filter(
+				(slot) => slot.projectId === item.projectId && slot.repository === item.repo,
+			).length;
+			return { ...item, wipUsage: { inFlight, limit: limitFor(item.projectId, item.repo) } };
+		});
+	} catch (error) {
+		logger.debug('runs.queued: WIP usage lookup failed; listing wip-limit rows without it', {
+			error: describeError(error),
+		});
+		return items;
+	}
 }
 
 /**
@@ -1452,9 +1561,16 @@ export const runsRouter = router({
 				const project = await getProjectByIdFromDb(input.projectId);
 				const policy = project?.pipeline?.prioritizeContinuations !== false;
 				const policies = { [input.projectId]: policy };
+				const projectId = input.projectId;
 				return partitionQueuedRuns(
-					await enrichQueuedWorkItems(
-						toQueuedRuns(await listWaitingDispatches(input.projectId), policies),
+					await withQueuedWipUsage(
+						await enrichQueuedWorkItems(
+							toQueuedRuns(await listWaitingDispatches(projectId), policies),
+						),
+						async () => {
+							const record = await findProjectRecordByIdFromDb(projectId);
+							return record ? [record] : [];
+						},
 					),
 				);
 			}
@@ -1464,7 +1580,12 @@ export const runsRouter = router({
 			const policies = Object.fromEntries(
 				projects.map((p) => [p.id, p.pipeline?.prioritizeContinuations !== false]),
 			);
-			return partitionQueuedRuns(await enrichQueuedWorkItems(toQueuedRuns(dispatches, policies)));
+			return partitionQueuedRuns(
+				await withQueuedWipUsage(
+					await enrichQueuedWorkItems(toQueuedRuns(dispatches, policies)),
+					listAllProjectRecordsFromDb,
+				),
+			);
 		}),
 
 	// The item-centric read model (issue #840) — the third one beside Queue
@@ -1520,6 +1641,25 @@ export const runsRouter = router({
 				toStalledItems(activity, activeDispatches, policies, toLivenessDismissals(dismissals)),
 				new Map(records.map((record) => [record.id, scopeProjectToRepository(record)])),
 			);
+		}),
+
+	// Each repository's WIP limit in use (issue #1192): `in flight / limit`, how many
+	// new tickets wait for a slot, and every slot holder with what it is doing — and
+	// whether it waits on the operator, derived from the item-liveness classifier
+	// rather than persisted (`src/queue/wip-usage.ts`). Postgres only, like `stalled`.
+	//
+	// Authorization is `stalled`'s verbatim: a chosen `projectId` needs read access,
+	// and the unscoped, installation-wide view remains an instance administrator's.
+	wip: authedProcedure
+		.input(z.object({ projectId: z.string().min(1).optional() }).optional())
+		.query(async ({ ctx, input }): Promise<WipUsageEntry[]> => {
+			if (input?.projectId) {
+				await assertProjectAccess(ctx.user, input.projectId, 'contributor');
+				const record = await findProjectRecordByIdFromDb(input.projectId);
+				return loadWipUsage(record ? [record] : [], [input.projectId]);
+			}
+			assertInstanceAdmin(ctx.user, 'WIP usage');
+			return loadWipUsage(await listAllProjectRecordsFromDb());
 		}),
 
 	// Fire a run's retry immediately ("Retry now", issues #136, #284).

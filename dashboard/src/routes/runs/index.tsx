@@ -6,11 +6,13 @@ import { QueuedRunsSection } from '@/components/runs/queued-runs-section.js';
 import { RunFilters } from '@/components/runs/run-filters.js';
 import { RunsTable } from '@/components/runs/runs-table.js';
 import { StalledItemsSection } from '@/components/runs/stalled-items-section.js';
+import { WipUsageSection } from '@/components/runs/wip-usage-section.js';
 import { canViewInstanceWide } from '@/lib/instance-admin.js';
 import {
 	queuedListRefetchInterval,
 	runsListRefetchInterval,
 	stalledListRefetchInterval,
+	wipUsageRefetchInterval,
 } from '@/lib/runs-refresh.js';
 import { trpc } from '@/lib/trpc.js';
 import { useCurrentUser } from '@/lib/use-current-user.js';
@@ -40,7 +42,8 @@ type RunsSearch = z.infer<typeof runsSearchSchema>;
  * instance-admin-only, so the section is rendered — and its query issued — only
  * for an administrator. Scoping the queue the same way is a separate change. The
  * Stalled section above it (issue #847) shares that gate exactly, because
- * `runs.stalled` copied `runs.queued`'s authorization verbatim.
+ * `runs.stalled` copied `runs.queued`'s authorization verbatim — and so does the WIP
+ * section between them (issue #1192), whose `runs.wip` copied `runs.stalled`'s.
  */
 export function RunsRouteComponent() {
 	const search = runsIndexRoute.useSearch() as RunsSearch;
@@ -109,6 +112,15 @@ export function RunsRouteComponent() {
 		refetchInterval: stalledListRefetchInterval(),
 	});
 
+	// Each repository's WIP limit in use (issue #1192), between the Stalled and Queued
+	// sections. Gated exactly as those two are: without a `projectId` `runs.wip` is
+	// instance-admin-only, like `runs.stalled` whose authorization it copied.
+	const wipQuery = useQuery({
+		...trpc.runs.wip.queryOptions({ projectId: search.projectId || undefined }),
+		enabled: canReadQueue || !!search.projectId,
+		refetchInterval: wipUsageRefetchInterval(),
+	});
+
 	const hasActiveFilters = !!(search.projectId || search.status || search.phase);
 
 	return (
@@ -132,6 +144,9 @@ export function RunsRouteComponent() {
 			 * has no data, so this needs no visibility condition of its own.
 			 */}
 			<StalledItemsSection items={stalledQuery.data ?? []} />
+
+			{/* Likewise renders nothing when no repository holds a slot or a waiter. */}
+			<WipUsageSection entries={wipQuery.data ?? []} />
 
 			{(canReadQueue || search.projectId) && (
 				<QueuedRunsSection

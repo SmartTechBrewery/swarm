@@ -171,6 +171,14 @@ export const QueuedRunSchema = z.object({
 	 * Absent when the deferral recorded none (a row written before the field existed).
 	 */
 	blockers: z.array(z.object({ reference: z.string(), url: z.string().optional() })).optional(),
+	/**
+	 * A `wip-limit` wait only — its repository's `in flight / limit` (issue #1192),
+	 * filled by the API from `wip_slots` so the Queue can name how full the repository
+	 * is. Absent when the API could not read it; never derived from the dispatch row.
+	 */
+	wipUsage: z
+		.object({ inFlight: z.number().int().nonnegative(), limit: z.number().int().positive() })
+		.optional(),
 	/** The `runs` row this dispatch retries, when one exists (deferred runs). */
 	runId: z.string().optional(),
 	/** Deferred-retry attempt counter. */
