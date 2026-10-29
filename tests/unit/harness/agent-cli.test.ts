@@ -1006,6 +1006,32 @@ describe('runAgentCli', () => {
 			expect(failure.retryAfter?.toISOString()).toBe('2026-01-01T12:40:00.000Z');
 		});
 
+		it("classifies Claude's 5-hour-limit banner as a rate limit, with its reset time", async () => {
+			// The shape observed on run 38700e2e… (issue #1196): the banner as an
+			// assistant line, then a failed `result` whose subtype is `success` and
+			// which names no status code.
+			const banner = "You've hit your 5-hour limit · resets 3:40pm (Europe/Warsaw)";
+			const lines: string[] = [];
+			const promise = runAgentCli(
+				createMockRunAgentCliOptions({ onStdout: (line) => lines.push(line) }),
+			);
+			const child = lastChild();
+			child.stdout.emit('data', claudeStream(claudeText(banner)));
+			child.stdout.emit(
+				'data',
+				claudeStream({ type: 'result', subtype: 'success', is_error: true, result: banner }),
+			);
+			child.emit('close', 1, null);
+			const result = await promise;
+
+			expect(lines.at(-1)).toBe(`Claude run failed (success): ${banner}`);
+			const failure = classifyAgentFailure(result, new Date('2026-01-01T09:00:00Z'));
+			expect(failure.kind).toBe('rate-limit');
+			expect(failure.resetHint).toBe('3:40pm (Europe/Warsaw)');
+			// 3:40pm Warsaw (UTC+1 in January) == 14:40Z.
+			expect(failure.retryAfter?.toISOString()).toBe('2026-01-01T14:40:00.000Z');
+		});
+
 		it('defers a rate-limited run to the reset instant Claude reported', async () => {
 			// The shape confirmed against a live `claude --output-format stream-json`
 			// run: an exact epoch, where the human banner only offers a wall clock.

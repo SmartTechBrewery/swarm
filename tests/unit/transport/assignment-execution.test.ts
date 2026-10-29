@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AgentCliResult, runAgentCli } from '@/harness/agent-cli.js';
-import { AgentRunError } from '@/harness/agent-failure.js';
+import { AgentRunError, agentRunError } from '@/harness/agent-failure.js';
 import type { SCMProviderManifest } from '@/integrations/scm/manifest.js';
 import {
 	_resetSCMProviderRegistryForTesting,
@@ -1316,6 +1316,41 @@ describe('runAssignmentDbFree', () => {
 
 		expect(frame.retryAfter).toBeUndefined();
 		expect(frame.resetHint).toBeUndefined();
+	});
+
+	// Issue #1196: the observed Claude stop, classified from the run's own output
+	// rather than a hand-built failure, settles deferred until the reset it named —
+	// it used to settle terminally `failed` on its bare exit code.
+	it("defers Claude's 5-hour-limit stop until the reset it named", () => {
+		vi.useFakeTimers({ now: new Date('2026-07-07T10:00:00Z') });
+		try {
+			const banner = "You've hit your 5-hour limit · resets 3:40pm (Europe/Warsaw)";
+			const frame = deferrableOrFailedResult(
+				agentRunError(
+					agentResult({
+						exitCode: 1,
+						stdout: `${banner}\nClaude run failed (success): ${banner}\n`,
+						claudeFailure: { subtype: 'success', message: banner },
+					}),
+					'Implementation agent (claude) exited with code 1',
+					" for task '1190'",
+				),
+				buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'implementation' })),
+			);
+
+			expect(frame).toMatchObject({
+				status: 'deferred',
+				failureKind: 'rate-limit',
+				resumable: true,
+				// 3:40pm Warsaw (UTC+2 in July) == 13:40Z.
+				retryAfter: '2026-07-07T13:40:00.000Z',
+				resetHint: '3:40pm (Europe/Warsaw)',
+			});
+			// 3h40m away: the retry lands at (or after) the reset, not on a default backoff.
+			expect(frame.retryDelayMs as number).toBeGreaterThanOrEqual((3 * 60 + 40) * 60 * 1000);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	// Issue #1018. A federated worker is the only side that can see its own clone, and
