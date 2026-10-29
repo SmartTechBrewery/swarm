@@ -67,6 +67,7 @@ import {
 	isRetryPendingStatus,
 	listRunPassedOverWorkerIds,
 	type RunStatus,
+	recordRunBranchHolder,
 	recordRunCommitUnavailableWorker,
 	recordRunPreservedWorker,
 	recordRunTransportLostWorker,
@@ -3092,6 +3093,23 @@ function resetSessionColumn(job: SwarmJob): string | null | undefined {
 	return job.resumeSession ? undefined : (job.agentSessionId ?? null);
 }
 
+/**
+ * The recovery record a retry's re-bind writes: `recovered` for an attempt that
+ * carries a recovery mode, or that reuses a provisioned Implementation branch (issue
+ * #1197), and `null` otherwise. The non-null write is what keeps the sticky
+ * `preservedWorkerId` across the bind (`recoveryWriteSql`); a branch retry needs it
+ * even with no mode, because a pre-run wait binds the row with no worker, and a pin
+ * dropped there would let the next wake-up route the retry to a machine that does not
+ * have the branch.
+ */
+function rebindRecovery(
+	job: SwarmJob,
+): { state: 'recovered'; agentSessionId: string | null } | null {
+	return job.recoveryMode || job.implementationBranchProvisioned === true
+		? { state: 'recovered', agentSessionId: job.agentSessionId ?? null }
+		: null;
+}
+
 async function tryReuseLatestRun(
 	project: ProjectConfig,
 	resolution: PhaseResolution,
@@ -3142,9 +3160,7 @@ async function tryReuseLatestRun(
 		job,
 		implementationUnplanned,
 	);
-	const recoveryVal = job.recoveryMode
-		? { state: 'recovered' as const, agentSessionId: job.agentSessionId ?? null }
-		: null;
+	const recoveryVal = rebindRecovery(job);
 	const claimed = await resetRunToRunning(
 		prior.id,
 		{ ...job, runId: prior.id },
@@ -3181,9 +3197,7 @@ async function tryResetCarriedRun(
 			job,
 			implementationUnplanned,
 		);
-		const recoveryVal = job.recoveryMode
-			? { state: 'recovered' as const, agentSessionId: job.agentSessionId ?? null }
-			: null;
+		const recoveryVal = rebindRecovery(job);
 		return (await resetRunToRunning(
 			runId,
 			job,
@@ -3574,6 +3588,11 @@ async function finalizeFailedRun(
 		// A cancellation that kept the checkout for its session leaves the same
 		// machine-local state a deferral does, so it pins the same way (issue #567).
 		if (recoveryVal?.state === 'preserved') await recordPreservedWorker(runId);
+		// An Implementation attempt that provisioned its task branch leaves that branch
+		// on its own machine whatever became of the checkout, and "Retry now" reuses it
+		// (issue #1197). So the holder is re-recorded after the `null` write above;
+		// the repository write is a no-op unless the stored payload records the branch.
+		if (outcome.phase === 'implementation') await recordBranchHolder(runId);
 	}
 }
 
@@ -3589,6 +3608,22 @@ async function recordPreservedWorker(runId: string | undefined): Promise<void> {
 		await recordRunPreservedWorker(runId);
 	} catch (err) {
 		logger.error('Failed to record the worker holding the preserved checkout (continuing)', {
+			runId,
+			error: describeError(err),
+		});
+	}
+}
+
+/**
+ * Record the machine holding this run's provisioned Implementation branch (issue
+ * #1197). Best-effort, exactly like {@link recordPreservedWorker}.
+ */
+async function recordBranchHolder(runId: string | undefined): Promise<void> {
+	if (!runId) return;
+	try {
+		await recordRunBranchHolder(runId);
+	} catch (err) {
+		logger.error('Failed to record the worker holding the provisioned task branch (continuing)', {
 			runId,
 			error: describeError(err),
 		});

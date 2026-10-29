@@ -1001,6 +1001,42 @@ export async function recordRunPreservedWorker(runId: string): Promise<void> {
 }
 
 /**
+ * Record the machine that holds this run's **provisioned Implementation branch**
+ * (issue #1197), so a "Retry now" that reuses the branch is pinned to it.
+ *
+ * Called after a failed settle, whose `recovery: null` write drops any pin. The
+ * branch premise is read off the *stored* payload because that is the only place the
+ * provisioning checkpoint lives: the dispatcher's `persistBranchProvisioned` writes the
+ * run row, not the in-memory job, and the row's payload is what "Retry now" rebuilds
+ * from. If that fire-and-forget write has not landed when the failure settles, nothing
+ * is recorded and the retry restarts the phase (`dropCheckoutContinuation`), which is
+ * safe.
+ *
+ * Unlike #954's rule that `worker_id` is never a substitute pin, `worker_id` is the
+ * right machine here. An attempt that *carried* the branch premise ran pinned to the
+ * machine holding the branch: it is a continuation, and its re-bind keeps the pin. An
+ * attempt that did not carry it has the premise on the row only because it provisioned
+ * the branch itself.
+ *
+ * A run with no recorded worker (an unfederated one) matches nothing and records
+ * nothing, exactly as {@link recordRunPreservedWorker}. Best-effort on the same terms.
+ */
+export async function recordRunBranchHolder(runId: string): Promise<void> {
+	await getDb()
+		.update(runs)
+		.set({
+			recovery: sql`coalesce(${runs.recovery}, '{}'::jsonb) || jsonb_build_object('preservedWorkerId', ${runs.workerId})`,
+		})
+		.where(
+			and(
+				eq(runs.id, runId),
+				isNotNull(runs.workerId),
+				sql`${runs.jobPayload} ->> 'implementationBranchProvisioned' = 'true'`,
+			),
+		);
+}
+
+/**
  * Record that **this attempt's machine** could not obtain the commit the phase's
  * checkout has to be detached at (issue #1018), taken from the attempt's own
  * `worker_id` exactly as {@link recordRunPreservedWorker} is.

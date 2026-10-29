@@ -40,6 +40,7 @@ import {
 	MAX_RUN_OUTPUT_BYTES,
 	markReviewRunSuperseded,
 	markRunUserTerminated,
+	recordRunBranchHolder,
 	recordRunCleanupBlocked,
 	recordRunCommitUnavailableWorker,
 	recordRunPreservedWorker,
@@ -60,7 +61,7 @@ import type { SwarmUser } from '../../../src/identity/schema.js';
 import type { Worker } from '../../../src/identity/worker.js';
 import { registerWorker } from '../../../src/identity/worker-service.js';
 import type { SwarmJob } from '../../../src/queue/jobs.js';
-import { createMockScmWebhookJob } from '../../helpers/factories.js';
+import { createMockPmWebhookJob, createMockScmWebhookJob } from '../../helpers/factories.js';
 import { truncateAll } from '../helpers/db.js';
 import { seedProject } from '../helpers/seed.js';
 
@@ -1038,6 +1039,83 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			);
 
 			expect((await getRunByIdFromDb(id))?.recovery).toEqual({ abandonedWorkerId: worker.id });
+		});
+
+		// Issue #1197: a failed Implementation settle writes `recovery: null`, which drops
+		// any pin, yet the task branch it provisioned is still only on its own machine.
+		describe('the provisioned-branch holder (issue #1197)', () => {
+			const BRANCH_PAYLOAD = createMockPmWebhookJob({
+				resumePmPhase: 'implementation',
+				implementationBranchProvisioned: true,
+			});
+
+			async function failedRun(taskId: string, workerId: string | undefined, jobPayload: SwarmJob) {
+				const id = await createRun({
+					projectId: PROJECT_ID,
+					taskId,
+					phase: 'implementation',
+					workerId,
+					jobPayload,
+				});
+				await completeRun(id, { status: 'failed', error: 'agent crashed', recovery: null });
+				return id;
+			}
+
+			it('records the failed attempt’s worker when the stored payload provisioned the branch', async () => {
+				const { worker } = await seedWorker('branch-a');
+				const id = await failedRun('1197a', worker.id, BRANCH_PAYLOAD);
+
+				await recordRunBranchHolder(id);
+
+				expect((await getRunByIdFromDb(id))?.recovery).toEqual({ preservedWorkerId: worker.id });
+			});
+
+			it('records nothing when the stored payload provisioned no branch', async () => {
+				const { worker } = await seedWorker('branch-b');
+				const id = await failedRun(
+					'1197b',
+					worker.id,
+					createMockPmWebhookJob({ resumePmPhase: 'implementation' }),
+				);
+
+				await recordRunBranchHolder(id);
+
+				expect((await getRunByIdFromDb(id))?.recovery).toBeNull();
+			});
+
+			it('records nothing for a run with no worker', async () => {
+				const id = await failedRun('1197c', undefined, BRANCH_PAYLOAD);
+
+				await recordRunBranchHolder(id);
+
+				expect((await getRunByIdFromDb(id))?.recovery).toBeNull();
+			});
+
+			it('keeps the holder through the retry’s recovered re-bind', async () => {
+				const { worker, owner } = await seedWorker('branch-d');
+				const id = await failedRun('1197d', worker.id, BRANCH_PAYLOAD);
+				await recordRunBranchHolder(id);
+
+				await resetRunToRunning(
+					id,
+					undefined,
+					'failed',
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					{ state: 'recovered', agentSessionId: null },
+					undefined,
+					undefined,
+					owner.id,
+				);
+
+				expect((await getRunByIdFromDb(id))?.recovery).toEqual({
+					state: 'recovered',
+					preservedWorkerId: worker.id,
+				});
+			});
 		});
 	});
 

@@ -510,6 +510,7 @@ const resetRunToRunning = vi.fn(async (_id: string, _job?: unknown, _fromStatus?
 const resetRunBindings: Array<{
 	model?: string;
 	engine?: string;
+	recovery?: unknown;
 	workerId?: string;
 	fencingToken?: number;
 	workerUserId?: string;
@@ -547,6 +548,8 @@ const getRunByIdFromDb = vi.fn(
 );
 /** Issue #567 — the settle-time record of which machine holds the preserved checkout. */
 const recordRunPreservedWorker = vi.fn(async (_runId: string) => {});
+/** Issue #1197 — the failed settle's record of which machine holds the provisioned branch. */
+const recordRunBranchHolder = vi.fn(async (_runId: string) => {});
 // Issue #1018 — the run's record of which machines could not obtain its commit: the
 // write the failure makes, and the read the next dispatch's gate does.
 const recordRunCommitUnavailableWorker = vi.fn(async (_runId: string) => {});
@@ -572,6 +575,7 @@ vi.mock('@/db/repositories/runsRepository.js', () => ({
 		resetRunBindings.push({
 			model: args[3] as string | undefined,
 			engine: args[6] as string | undefined,
+			recovery: args[8],
 			workerId: args[9] as string | undefined,
 			fencingToken: args[10] as number | undefined,
 			workerUserId: args[11] as string | undefined,
@@ -580,6 +584,7 @@ vi.mock('@/db/repositories/runsRepository.js', () => ({
 	},
 	getRunByIdFromDb: (id: string) => getRunByIdFromDb(id),
 	recordRunPreservedWorker: (runId: string) => recordRunPreservedWorker(runId),
+	recordRunBranchHolder: (runId: string) => recordRunBranchHolder(runId),
 	recordRunCommitUnavailableWorker: (runId: string) => recordRunCommitUnavailableWorker(runId),
 	recordRunTransportLostWorker: (runId: string) => recordRunTransportLostWorker(runId),
 	listRunPassedOverWorkerIds: (runId: string) => listRunPassedOverWorkerIds(runId),
@@ -1078,6 +1083,7 @@ describe('processJob', () => {
 		getRunByIdFromDb.mockClear();
 		getRunByIdFromDb.mockResolvedValue(undefined);
 		recordRunPreservedWorker.mockClear();
+		recordRunBranchHolder.mockClear();
 		getWorker.mockClear();
 		reconcileTerminatedWorktree.mockClear();
 		reconcileTerminatedWorktree.mockResolvedValue({ outcome: 'absent' });
@@ -3831,6 +3837,137 @@ describe('processJob', () => {
 				expect(claimWorkerForDispatch).toHaveBeenCalledWith(
 					expect.objectContaining({ selectedWorkerId: 'w-preserved' }),
 				);
+			});
+
+			// Issue #1197: a "Retry now" that reuses the task branch an earlier attempt
+			// provisioned is a continuation too — the branch may exist only on the machine
+			// that cut it, and any other worker fails on `invalid reference`.
+			describe('a retry that reuses its provisioned task branch (issue #1197)', () => {
+				const implementationTrigger = (): TriggerResult => ({
+					phase: 'implementation',
+					taskId: '10',
+					workItem: assignedItem(),
+				});
+				const branchRetry = () =>
+					createMockPmWebhookJob({
+						runId: 'run-1',
+						resumePmPhase: 'implementation',
+						implementationBranchProvisioned: true,
+					});
+
+				beforeEach(() => {
+					getRunByIdFromDb.mockResolvedValue({
+						workerId: 'w-a',
+						recovery: { preservedWorkerId: 'w-a' },
+					});
+				});
+
+				it('is not selected for another worker after a failed attempt on worker A', async () => {
+					listProjectDispatchCandidates.mockResolvedValue([
+						candidate('w-b'),
+						candidate('w-a', { activeRuns: 1 }),
+					]);
+
+					const outcome = await processJob(
+						branchRetry(),
+						registryReturning(implementationTrigger()),
+					);
+
+					expect(outcome).toMatchObject({ status: 'phase-deferred', preservedWorkerWait: true });
+					expect(phaseCalls).toEqual([]);
+					expect(claimWorkerForDispatch).not.toHaveBeenCalledWith(
+						expect.objectContaining({ selectedWorkerId: 'w-b' }),
+					);
+					const [, input] = scheduleDispatchRetry.mock.calls[0] as [
+						string,
+						Record<string, unknown>,
+					];
+					expect(input).toMatchObject({ waitReason: 'preserved-worker' });
+				});
+
+				it('runs on the machine holding the branch when it is free', async () => {
+					listProjectDispatchCandidates.mockResolvedValue([candidate('w-b'), candidate('w-a')]);
+
+					const outcome = await processJob(
+						branchRetry(),
+						registryReturning(implementationTrigger()),
+						undefined,
+						executionIdentity('w-a'),
+					);
+
+					expect(outcome.status).toBe('phase-succeeded');
+					expect(claimWorkerForDispatch).toHaveBeenCalledWith(
+						expect.objectContaining({ selectedWorkerId: 'w-a' }),
+					);
+					// The re-bind keeps the sticky pin, so a later wait still knows the machine.
+					expect(resetRunBindings[0].recovery).toMatchObject({ state: 'recovered' });
+				});
+
+				it('refuses it rather than routing it when the run records no machine', async () => {
+					getRunByIdFromDb.mockResolvedValue({ workerId: 'w-b', recovery: {} });
+					listProjectDispatchCandidates.mockResolvedValue([candidate('w-b')]);
+
+					const outcome = await processJob(
+						branchRetry(),
+						registryReturning(implementationTrigger()),
+						undefined,
+						executionIdentity('w-b'),
+					);
+
+					expect(outcome).toMatchObject({
+						status: 'phase-deferred',
+						workerEligibilityRecheck: true,
+						preservedWorkerWait: false,
+					});
+					expect(phaseCalls).toEqual([]);
+				});
+
+				it('re-binds an ordinary retry without a recovery record', async () => {
+					listProjectDispatchCandidates.mockResolvedValue([candidate('w-a')]);
+
+					await processJob(
+						createMockPmWebhookJob({ runId: 'run-1', resumePmPhase: 'implementation' }),
+						registryReturning(implementationTrigger()),
+						undefined,
+						executionIdentity('w-a'),
+					);
+
+					expect(resetRunBindings[0].recovery).toBeNull();
+				});
+
+				it('records the branch holder when an Implementation attempt fails', async () => {
+					listProjectDispatchCandidates.mockResolvedValue([candidate('w-a')]);
+					phaseImpl = async () => {
+						throw new Error('agent crashed');
+					};
+
+					const outcome = await processJob(
+						branchRetry(),
+						registryReturning(implementationTrigger()),
+						undefined,
+						executionIdentity('w-a'),
+					);
+
+					expect(outcome.status).toBe('phase-failed');
+					expect(recordRunBranchHolder).toHaveBeenCalledWith('run-1');
+				});
+
+				it('records no branch holder when a Planning attempt fails', async () => {
+					listProjectDispatchCandidates.mockResolvedValue([candidate('w-a')]);
+					phaseImpl = async () => {
+						throw new Error('agent crashed');
+					};
+
+					const outcome = await processJob(
+						createMockPmWebhookJob({ runId: 'run-1' }),
+						registryReturning(planningTrigger()),
+						undefined,
+						executionIdentity('w-a'),
+					);
+
+					expect(outcome.status).toBe('phase-failed');
+					expect(recordRunBranchHolder).not.toHaveBeenCalled();
+				});
 			});
 
 			// Issue #954. The other half of the read: a continuation whose machine nobody

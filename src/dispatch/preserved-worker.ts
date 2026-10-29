@@ -21,8 +21,9 @@ import type { SwarmJob } from '../queue/jobs.js';
  * Whether this dispatch means to continue work left in a preserved checkout, and
  * must therefore run on the machine holding it.
  *
- * The four payload shapes that adopt a checkout, all of which the recovery gate
- * (`src/pipeline/resume.ts`) resolves against the on-disk `task-<id>` directory:
+ * The five payload shapes that depend on machine-local state. The first four adopt a
+ * checkout, and the recovery gate (`src/pipeline/resume.ts`) resolves them against the
+ * on-disk `task-<id>` directory:
  *
  * - `recoveryMode: 'resume'` — an operator-driven resume of the captured session.
  * - `recoveryMode: 'checkpoint'` — the Tier 2 continuation (issue #503).
@@ -33,12 +34,22 @@ import type { SwarmJob } from '../queue/jobs.js';
  *   failure in place.
  * - `resumeDelivery` — reuses the worktree's delivery progress sidecar, which needs
  *   no agent session at all.
+ * - `implementationBranchProvisioned` — Implementation reuses the task branch an
+ *   earlier attempt provisioned (`createBranch: false`) instead of cutting it (issue
+ *   #1197). Until the attempt pushes, that branch exists only in the repository of
+ *   the machine that created it, so any other worker fails on `invalid reference`.
  *
  * `recoveryMode: 'fresh'` is the explicit opposite — "start over, reclaiming the
- * checkout" — and is never pinned, so it stays the escape hatch it is. It is checked
- * first so it wins over a stale `resumeSession` a payload might still carry.
+ * checkout" — and is never pinned on its own, so it stays the escape hatch it is. It
+ * is checked after the branch premise, because `'fresh'` reclaims only the checkout:
+ * the phase still provisions against the existing branch, which is just as
+ * machine-local. It is checked before the other three, so it wins over a stale
+ * `resumeSession` a payload might still carry. "Reset & restart" strips the branch
+ * premise along with the rest of the recovery intent (issue #741), so it is still the
+ * way to start over anywhere.
  */
 export function jobContinuesPreservedCheckout(job: SwarmJob): boolean {
+	if (job.implementationBranchProvisioned === true) return true;
 	if (job.recoveryMode === 'fresh') return false;
 	return (
 		job.recoveryMode === 'resume' ||
@@ -71,7 +82,7 @@ export function preservedCheckoutMachineUnknown(
 }
 
 /** Which preserved state a continuation adopts (issue #1138) — see {@link preservedContinuationKind}. */
-export type PreservedContinuationKind = 'checkpoint' | 'session' | 'delivery';
+export type PreservedContinuationKind = 'checkpoint' | 'session' | 'delivery' | 'branch';
 
 /**
  * Which kind of continuation this dispatch is, or `undefined` when it is not one
@@ -83,9 +94,12 @@ export type PreservedContinuationKind = 'checkpoint' | 'session' | 'delivery';
  */
 export function preservedContinuationKind(job: SwarmJob): PreservedContinuationKind | undefined {
 	if (!jobContinuesPreservedCheckout(job)) return undefined;
+	// `'fresh'` adopts nothing but the provisioned branch (issue #1197).
+	if (job.recoveryMode === 'fresh') return 'branch';
 	if (job.recoveryMode === 'checkpoint') return 'checkpoint';
 	if (job.recoveryMode === 'resume' || job.resumeSession === true) return 'session';
-	return 'delivery';
+	if (job.resumeDelivery === true) return 'delivery';
+	return 'branch';
 }
 
 /**

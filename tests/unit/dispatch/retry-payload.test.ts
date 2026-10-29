@@ -783,12 +783,30 @@ describe('dropCheckoutContinuation', () => {
 		expect(jobContinuesPreservedCheckout(next)).toBe(false);
 	});
 
+	// Issue #1197: with no recorded machine for the branch, the retry cuts it afresh.
+	it('removes the provisioned-branch premise', () => {
+		const next = dropCheckoutContinuation(
+			createMockPmWebhookJob({
+				recoveryMode: 'fresh',
+				agentSessionId: 'a1b2c3d4-0000-4000-8000-000000000000',
+				resumePmPhase: 'implementation',
+				implementationBranchProvisioned: true,
+			}),
+		);
+		expect(next.implementationBranchProvisioned).toBeUndefined();
+		expect(next).toMatchObject({
+			recoveryMode: 'fresh',
+			agentSessionId: 'a1b2c3d4-0000-4000-8000-000000000000',
+			resumePmPhase: 'implementation',
+		});
+		expect(jobContinuesPreservedCheckout(next)).toBe(false);
+	});
+
 	it('keeps everything that is not checkout-continuation intent', () => {
 		const job = createMockPmWebhookJob({
 			recoveryMode: 'fresh',
 			agentSessionId: 'a1b2c3d4-0000-4000-8000-000000000000',
 			resumePmPhase: 'implementation',
-			implementationBranchProvisioned: true,
 			cliOverride: 'codex',
 			rateLimitRetryAttempt: 0,
 		});
