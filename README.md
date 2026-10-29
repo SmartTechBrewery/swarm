@@ -205,6 +205,34 @@ A local install is single-user by default: no account to create, no password, no
 `/login`. The prerequisites, the multi-user alternative, and the full worker
 runbook are in [`docs/MANUAL.md`](docs/MANUAL.md).
 
+## Releasing
+
+A maintainer cuts a version and deploys it with one command, from a clean `main`:
+
+```bash
+npm run release
+```
+
+[`bin/swarm-release`](bin/swarm-release):
+
+1. Pulls `main` and shows the current version and the latest tag.
+2. Asks for the new version as `X.Y.Z`. It refuses a malformed version, one lower
+   than the current one, and a tag that already exists.
+3. Warns when `deploy/vps` changed since the previous tag, because the server's
+   compose file, Caddyfile or `.env` may then need the admin.
+4. Bumps `package.json`, commits `chore(release): vX.Y.Z` on `main`, tags it
+   `vX.Y.Z` and pushes both. The pre-push hook runs the tests.
+5. Waits for GitHub Actions to build `ghcr.io/smarttechbrewery/swarm:vX.Y.Z` and
+   move `:stable` to it.
+6. Publishes the GitHub release, with notes generated from the merged PRs.
+7. Deploys to the VPS with `sudo dockerctl deploy app`. Migrations run when the
+   app starts.
+8. Checks that `/health` answers and that the dashboard reports the new version.
+
+It needs a signed-in `gh` and SSH access to the server. `SWARM_DEPLOY_SSH`
+(default `jkwiecien@51.255.194.195`) and `SWARM_DEPLOY_URL` (default
+`https://swarm-sm.pl`) override the target.
+
 ## Documentation
 
 Everything else — prerequisites, how the worker works and what it deliberately
