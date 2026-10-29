@@ -43,6 +43,7 @@ import {
 	listWipLimitWaits,
 	markDispatchRunning,
 	promoteDispatchToImmediateWake,
+	rankDispatch,
 	recordDispatchResolution,
 	reopenDispatchForManualRetry,
 	scheduleDispatchRetry,
@@ -69,8 +70,15 @@ import { workers } from '../../../src/db/schema/workers.js';
 import type { AgentCli } from '../../../src/harness/agent-cli.js';
 import { describeError } from '../../../src/lib/errors.js';
 import type { SwarmJob } from '../../../src/queue/jobs.js';
-import type { TriggerPhase } from '../../../src/triggers/types.js';
 import {
+	IN_FLIGHT_JOB_PRIORITY,
+	PM_BOARD_JOB_PRIORITY,
+	priorityFor,
+} from '../../../src/queue/producer.js';
+import type { TriggerPhase } from '../../../src/triggers/types.js';
+import { assignWorkerPool } from '../../../src/worker/pool-scheduling.js';
+import {
+	createMockPmWebhookJob,
 	createMockProjectRepositoryPair,
 	createMockScmWebhookJob,
 } from '../../helpers/factories.js';
@@ -1986,6 +1994,138 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 
 			expect(claim.claimed).toBe(true);
 			expect(await listRunnableDispatchesForPool(PROJECT_ID)).toEqual([]);
+		});
+	});
+
+	// Issue #1191: when dispatches compete for the same worker capacity, work for a
+	// ticket already in flight is chosen ahead of a new ticket's start, and
+	// Resolve-conflicts ahead of everything but a worker self-update.
+	describe('in-flight work ranks ahead of new starts (issue #1191)', () => {
+		it('re-ranks a leased dispatch', async () => {
+			const { dispatch } = await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: { ...createMockPmWebhookJob(), projectId: PROJECT_ID },
+				source: 'webhook',
+				priority: PM_BOARD_JOB_PRIORITY,
+				state: 'leased',
+				leaseOwner: OWNER,
+				leaseExpiresAt: new Date(Date.now() + 60_000),
+				phase: 'implementation',
+			});
+
+			expect(await rankDispatch(dispatch.id, IN_FLIGHT_JOB_PRIORITY)).toBe(true);
+			expect((await getDispatchById(dispatch.id))?.priority).toBe(IN_FLIGHT_JOB_PRIORITY);
+		});
+
+		it.each([
+			'pending',
+			'running',
+			'completed',
+		] as const)('leaves a %s dispatch untouched', async (state) => {
+			const id = await seedDispatchInState('task-rank', state, undefined, 'implementation');
+			const before = await getDispatchById(id);
+
+			expect(await rankDispatch(id, -1)).toBe(false);
+			expect((await getDispatchById(id))?.priority).toBe(before?.priority);
+		});
+
+		/**
+		 * The four contenders, oldest first — so FIFO alone would pick the new Planning
+		 * and Resolve-conflicts last — each at the rank production gives it:
+		 * Resolve-conflicts and Review from `priorityFor`, the in-flight Implementation
+		 * created at the board rank and re-ranked at admission, the new Planning left at
+		 * the board rank. Each is deferred the way the worker gate defers it when no
+		 * machine has room. Returns the ids in the order they must be picked: the two
+		 * pieces of in-flight work share a rank, so the older of them goes first.
+		 */
+		async function seedContenders(waitUntil: Date): Promise<string[]> {
+			const scm = createMockScmWebhookJob();
+			const contenders: Array<{ jobPayload: SwarmJob; phase: TriggerPhase; inFlight?: true }> = [
+				{ jobPayload: { ...createMockPmWebhookJob(), projectId: PROJECT_ID }, phase: 'planning' },
+				{
+					jobPayload: { ...createMockPmWebhookJob(), projectId: PROJECT_ID },
+					phase: 'implementation',
+					inFlight: true,
+				},
+				{ jobPayload: job(), phase: 'review' },
+				{
+					jobPayload: job({
+						event: {
+							...scm.event,
+							kind: 'pull-request',
+							action: 'closed',
+							conflictPrNumber: '42',
+						},
+					}),
+					phase: 'resolve-conflicts',
+				},
+			];
+			const ids: string[] = [];
+			for (const [index, contender] of contenders.entries()) {
+				const { dispatch } = await createDispatch({
+					projectId: PROJECT_ID,
+					jobPayload: contender.jobPayload,
+					source: 'webhook',
+					priority: priorityFor(contender.jobPayload) ?? 0,
+					state: 'leased',
+					leaseOwner: OWNER,
+					leaseExpiresAt: new Date(Date.now() + 60_000),
+					phase: contender.phase,
+					availableAt: new Date(Date.now() - (4 - index) * 60_000),
+				});
+				if (contender.inFlight) await rankDispatch(dispatch.id, IN_FLIGHT_JOB_PRIORITY);
+				await scheduleDispatchRetry(dispatch.id, {
+					jobPayload: contender.jobPayload,
+					availableAt: waitUntil,
+					waitReason: 'worker-eligibility',
+					attempt: 0,
+				});
+				ids.push(dispatch.id);
+			}
+			const [planning, implementation, review, resolveConflicts] = ids;
+			return [resolveConflicts, implementation, review, planning];
+		}
+
+		it('places Resolve-conflicts, then in-flight work, then the new Planning on one free slot', async () => {
+			const expected = await seedContenders(new Date(Date.now() - 1_000));
+			const [resolveConflicts] = expected;
+
+			const runnable = await listRunnableDispatchesForPool(PROJECT_ID);
+			expect(runnable.map((row) => row.id)).toEqual(expected);
+			expect(runnable.map((row) => row.priority)).toEqual([-5, 0, 0, 10]);
+
+			const assignment = assignWorkerPool({
+				demands: runnable.map((row) => ({
+					dispatchId: row.id,
+					eligibleWorkerIds: [WORKER_ID],
+				})),
+				freeSlots: new Map([[WORKER_ID, 1]]),
+			});
+			expect([...assignment]).toEqual([[resolveConflicts, WORKER_ID]]);
+		});
+
+		it('offers the same order to a worker becoming available', async () => {
+			const owner = await createUser({ identifier: 'rank@example.com', displayName: 'Owner' });
+			const worker = await createWorker({
+				ownerUserId: owner.id,
+				displayName: 'worker-rank',
+				capabilities: ['claude'],
+				credentialHash: 'hash-rank',
+			});
+			await createEnrollment({
+				workerId: worker.id,
+				projectId: PROJECT_ID,
+				status: 'active',
+				allowedClis: ['claude'],
+				allowedPhases: ['planning', 'implementation', 'review', 'resolve-conflicts'],
+				concurrencyAllocation: 1,
+				sharingConsent: true,
+			});
+			const expected = await seedContenders(new Date(Date.now() + 60_000));
+
+			expect((await listAvailabilityWaitsForWorker(worker.id)).map((row) => row.id)).toEqual(
+				expected,
+			);
 		});
 	});
 

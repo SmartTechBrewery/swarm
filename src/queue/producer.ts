@@ -19,6 +19,20 @@ import { normalizeStoredJobPayload, QUEUE_NAME, type SwarmJob } from './jobs.js'
 
 let queue: Queue<SwarmJob> | null = null;
 
+/*
+ * The dispatch ranks, lowest first — the order every claim-ordering read of the
+ * durable dispatch table sorts by (`dispatches.priority ASC`), so when dispatches
+ * compete for the same worker capacity, work for a ticket already in flight is
+ * chosen ahead of starting a new one (issue #1191):
+ *
+ * 1. a worker self-update — {@link WORKER_UPDATE_JOB_PRIORITY};
+ * 2. Resolve-conflicts — {@link RESOLVE_CONFLICTS_JOB_PRIORITY};
+ * 3. every other piece of in-flight work — {@link IN_FLIGHT_JOB_PRIORITY}: the SCM
+ *    continuations, plus a board-driven phase of a ticket that already holds a WIP
+ *    slot, re-ranked to this at admission (`processJob`, `../worker/consumer.ts`);
+ * 4. a new ticket's start — {@link PM_BOARD_JOB_PRIORITY}.
+ */
+
 /**
  * PM-driven events (`pm` card status changes, plus SCM `work-item`
  * invalidations that dispatch fallback Planning) are demoted below BullMQ's
@@ -30,8 +44,35 @@ let queue: Queue<SwarmJob> | null = null;
  * on a worker enrolled to run one of the project's jobs at a time
  * (`concurrencyAllocation`), and even at 2 it still competes for the same limited
  * slots.
+ *
+ * It means **a board job not yet known to belong to an in-flight ticket** (issue
+ * #1191): a job is ranked once, at creation, before anything has asked whether its
+ * ticket holds a WIP slot. The repository WIP admission is what tells the two apart,
+ * and re-ranks a board dispatch whose ticket is already in flight to
+ * {@link IN_FLIGHT_JOB_PRIORITY}, so only a new ticket's start keeps this rank.
  */
 export const PM_BOARD_JOB_PRIORITY = 10;
+
+/**
+ * Work for a ticket already in flight (issue #1191) — the default rank, which an SCM
+ * continuation (Review, Respond-to-review, Respond-to-CI) gets by {@link priorityFor}
+ * leaving it unset, and the one a board-driven dispatch is re-ranked to once its WIP
+ * admission finds the ticket already holding a slot.
+ */
+export const IN_FLIGHT_JOB_PRIORITY = 0;
+
+/**
+ * Resolve-conflicts outranks every other pipeline dispatch (issue #1191), Review and
+ * the respond phases included: a conflicted pull request blocks everything else its
+ * ticket still needs — no Review verdict, CI result, or merge on it means anything
+ * until its branch merges cleanly again — and the longer it waits the further its
+ * base moves on. Ranked below a worker self-update only, which is shorter still and
+ * what every other job on its machine is waiting behind.
+ *
+ * Negative like {@link WORKER_UPDATE_JOB_PRIORITY}, so it is **carried to BullMQ as
+ * `lifo`** too — see {@link bullMqOrderingOptions}.
+ */
+export const RESOLVE_CONFLICTS_JOB_PRIORITY = -5;
 
 /**
  * A worker self-update is promoted *above* the default (issue #972): it is the
@@ -64,10 +105,25 @@ export const WORKER_UPDATE_JOB_PRIORITY = -10;
 export function priorityFor(job: SwarmJob): number | undefined {
 	const normalized = normalizeStoredJobPayload(job);
 	if (normalized.type === 'worker-update') return WORKER_UPDATE_JOB_PRIORITY;
+	if (isResolveConflictsJob(normalized)) return RESOLVE_CONFLICTS_JOB_PRIORITY;
 	return normalized.type === 'pm' ||
 		(normalized.type === 'scm' && normalized.event.kind === 'work-item')
 		? PM_BOARD_JOB_PRIORITY
 		: undefined;
+}
+
+/**
+ * Whether a job dispatches the `resolve-conflicts` phase — the two payloads the
+ * trigger turns into a run (`../triggers/handlers/resolve-conflicts.ts`): a per-PR
+ * conflict check, the coalesced re-check carrying `event.conflictPrNumber`, and merge
+ * automation's catch-up, carrying `mergeCatchUp`. The merged pull request that fans
+ * those checks out carries neither; it only schedules, so it keeps the default rank.
+ */
+function isResolveConflictsJob(job: SwarmJob): boolean {
+	return (
+		job.type === 'scm' &&
+		(job.event.conflictPrNumber !== undefined || job.mergeCatchUp !== undefined)
+	);
 }
 
 /**
@@ -103,7 +159,11 @@ export function priorityFor(job: SwarmJob): number | undefined {
  *
  * The durable dispatch table, where ordering actually decides which unit a worker
  * claims, honours the negative directly (`priority ASC`); BullMQ only carries the
- * wake-up.
+ * wake-up. **Only that column orders claims — the BullMQ order is advisory**, and
+ * deliberately coarser: every negative rank maps to the same `lifo`, so a worker
+ * self-update and a Resolve-conflicts (issue #1191) are not ordered against each
+ * other here, and a board dispatch re-ranked at admission keeps its board-rank
+ * wake-up options, since those are derived from the payload, not the row.
  */
 function bullMqOrderingOptions(job: SwarmJob): { priority?: number; lifo?: boolean } {
 	const priority = priorityFor(job);

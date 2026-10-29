@@ -176,6 +176,8 @@ vi.mock('@/pipeline/resolve-conflicts.js', () => ({
 
 vi.mock('@/queue/producer.js', () => ({
 	priorityFor: (job: { type: string }) => (job.type === 'pm' ? 10 : undefined),
+	PM_BOARD_JOB_PRIORITY: 10,
+	IN_FLIGHT_JOB_PRIORITY: 0,
 }));
 
 // The durable dispatch layer (issue #284) is mocked at its two boundaries: the
@@ -305,6 +307,8 @@ const getDispatchById = vi.fn(
 	async (_id: string): Promise<MockDispatchRow | undefined> => mockDispatchRow({}),
 );
 const deferDispatchToPending = vi.fn(async (_id: string, _input: unknown) => mockDispatchRow({}));
+/** The admission-time re-rank of an in-flight ticket's board dispatch (issue #1191). */
+const rankDispatch = vi.fn(async (_id: string, _priority: number) => true);
 /**
  * The claim-side bind onto a reused run row (issue #1102). Defaults to "bound", so
  * every pre-existing reuse case keeps taking the row over.
@@ -360,6 +364,7 @@ vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
 		excludeDispatchId?: string,
 	) => findActivePlanningDispatchForTask(projectId, taskId, excludeDispatchId),
 	deferDispatchToPending: (id: string, input: unknown) => deferDispatchToPending(id, input),
+	rankDispatch: (id: string, priority: number) => rankDispatch(id, priority),
 	bindDispatchToRun: (id: string, runId: string) => bindDispatchToRun(id, runId),
 	scheduleDispatchRetry: (id: string, input: { jobPayload: Record<string, unknown> }) =>
 		scheduleDispatchRetry(id, input),
@@ -1034,6 +1039,8 @@ describe('processJob', () => {
 		getDispatchById.mockReset();
 		getDispatchById.mockImplementation(async (_id: string) => mockDispatchRow({}));
 		deferDispatchToPending.mockClear();
+		rankDispatch.mockReset();
+		rankDispatch.mockResolvedValue(true);
 		reserveWipSlot.mockReset();
 		reserveWipSlot.mockResolvedValue({ admitted: true, alreadyInFlight: false });
 		releaseWipSlot.mockReset();
@@ -6385,6 +6392,81 @@ describe('processJob', () => {
 
 			expect(outcome.status).toBe('phase-succeeded');
 			expect(deferDispatchToPending).not.toHaveBeenCalled();
+		});
+
+		describe('ranks in-flight work ahead of new starts (issue #1191)', () => {
+			/** Claims the job as a dispatch row still at the rank it was created with. */
+			function claimAtRank(priority: number): void {
+				claimDispatchForJob.mockImplementationOnce(async (job: Record<string, unknown>) => ({
+					claimed: true,
+					dispatch: { ...mockDispatchRow(job), priority },
+				}));
+			}
+
+			it('re-ranks the board dispatch of a ticket already in flight to in-flight work', async () => {
+				claimAtRank(10);
+				reserveWipSlot.mockResolvedValueOnce({ admitted: true, alreadyInFlight: true });
+
+				const outcome = await processJob(
+					createMockPmWebhookJob(),
+					registryReturning(boardTrigger('implementation')),
+				);
+
+				expect(outcome.status).toBe('phase-succeeded');
+				expect(rankDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 0);
+			});
+
+			it('leaves a new ticket’s start at the board rank', async () => {
+				claimAtRank(10);
+
+				await processJob(createMockPmWebhookJob(), registryReturning(boardTrigger('planning')));
+
+				expect(rankDispatch).not.toHaveBeenCalled();
+			});
+
+			it('leaves a refused start at the board rank', async () => {
+				claimAtRank(10);
+				reserveWipSlot.mockResolvedValueOnce({ admitted: false, holders: HOLDERS });
+
+				await processJob(createMockPmWebhookJob(), registryReturning(boardTrigger('planning')));
+
+				expect(rankDispatch).not.toHaveBeenCalled();
+			});
+
+			it('keeps a rank something else already gave the dispatch', async () => {
+				claimAtRank(0);
+				reserveWipSlot.mockResolvedValueOnce({ admitted: true, alreadyInFlight: true });
+
+				await processJob(
+					createMockPmWebhookJob(),
+					registryReturning(boardTrigger('implementation')),
+				);
+
+				expect(rankDispatch).not.toHaveBeenCalled();
+			});
+
+			it('runs the phase when the re-rank write fails', async () => {
+				claimAtRank(10);
+				reserveWipSlot.mockResolvedValueOnce({ admitted: true, alreadyInFlight: true });
+				rankDispatch.mockRejectedValueOnce(new Error('db down'));
+
+				const outcome = await processJob(
+					createMockPmWebhookJob(),
+					registryReturning(boardTrigger('implementation')),
+				);
+
+				expect(outcome.status).toBe('phase-succeeded');
+			});
+
+			it.each([
+				REVIEW_TRIGGER,
+				RESPOND_TO_REVIEW_TRIGGER,
+				RESOLVE_CONFLICTS_TRIGGER,
+			])('never re-ranks $phase, a pull request-driven phase', async (trigger) => {
+				await processJob(createMockScmWebhookJob(), registryReturning(trigger));
+
+				expect(rankDispatch).not.toHaveBeenCalled();
+			});
 		});
 
 		it('defers Implementation of a ticket that never ran Planning when the repository is full', async () => {

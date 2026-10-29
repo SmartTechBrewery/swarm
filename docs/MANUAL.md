@@ -808,6 +808,12 @@ worker leaves its dispatch durably pending; a wait for a *machine* ends as soon
 as one turns up (a worker connecting, or finishing a run and freeing its slot),
 while a wait for a *human* (consent, an enrollment, a permitted phase, a drained
 machine) keeps the timed cadence, since nothing a machine does can clear it.
+When several dispatches wait for the same worker capacity, **work for tickets already
+in flight goes first**, and **Resolve-conflicts first of all** (issue #1191): a worker
+self-update, then Resolve-conflicts, then every other phase of a ticket already in
+flight — Review, Respond-to-review, Respond-to-CI, and the Planning or Implementation
+of a ticket already holding a WIP slot — and only then a new ticket's start. Equally
+ranked work goes oldest first, and nothing already running is interrupted.
 
 Each repository also has a **WIP limit** (`repositories[].wipLimit`, default 1 —
 [`docs/configuration.md`](./configuration.md#repositories), editable per repository on

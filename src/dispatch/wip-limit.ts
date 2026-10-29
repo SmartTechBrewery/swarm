@@ -23,6 +23,12 @@
  *   slots, oldest first. Called on every release, and for every repository holding
  *   waiters by the reconciler ({@link promoteAllWipWaits}), which covers a lost
  *   wake-up and an operator raising a limit.
+ *
+ * Admission also **ranks** (issue #1191): a board-driven dispatch whose ticket
+ * already holds a slot is in-flight work, not a new start, so
+ * {@link rankAdmittedTicketDispatch} moves it up from the board rank to the one SCM
+ * continuations hold — which is what lets the capacity every dispatch competes for
+ * finish tickets before it starts new ones.
  */
 
 import { findProjectRepository, resolveWipLimit } from '../config/project-repository.js';
@@ -30,6 +36,7 @@ import type { ProjectConfig } from '../config/schema.js';
 import {
 	listRepositoriesWithWipWaits,
 	listWipLimitWaits,
+	rankDispatch,
 } from '../db/repositories/dispatchesRepository.js';
 import {
 	findProjectByIdFromDb,
@@ -47,6 +54,7 @@ import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { issueNumberFromBranch } from '../pipeline/task-branch.js';
 import { repositoryForJob, type SwarmJob } from '../queue/jobs.js';
+import { IN_FLIGHT_JOB_PRIORITY, PM_BOARD_JOB_PRIORITY } from '../queue/producer.js';
 import type { TriggerResult } from '../triggers/types.js';
 import { publishDispatchWakeUp } from './dispatcher.js';
 
@@ -92,6 +100,34 @@ export async function admitTicket(
 			url: trigger.workItem.url,
 		},
 	});
+}
+
+/**
+ * Rank an admitted board-driven dispatch by what admission found (issue #1191). A
+ * ticket that already held a slot is in-flight work, so its dispatch moves from
+ * {@link PM_BOARD_JOB_PRIORITY} — the rank every board job is created with, before
+ * anything knows whether its ticket holds a slot — to {@link IN_FLIGHT_JOB_PRIORITY},
+ * and every later wait, defer and promotion of it then orders it with the ticket's
+ * other in-flight work rather than behind new starts. A new ticket's start keeps the
+ * board rank.
+ *
+ * Only a dispatch still at the board rank is touched: one an operator or another
+ * path already ranked otherwise keeps that rank. Best-effort and fully swallowed —
+ * the rank only orders contention, and must never fail the phase.
+ */
+export async function rankAdmittedTicketDispatch(
+	dispatch: { id: string; priority: number },
+	admission: { alreadyInFlight: boolean },
+): Promise<void> {
+	if (!admission.alreadyInFlight || dispatch.priority !== PM_BOARD_JOB_PRIORITY) return;
+	try {
+		await rankDispatch(dispatch.id, IN_FLIGHT_JOB_PRIORITY);
+	} catch (err) {
+		logger.debug('wip-limit: could not re-rank an in-flight ticket’s dispatch (continuing)', {
+			dispatchId: dispatch.id,
+			error: describeError(err),
+		});
+	}
 }
 
 /**
