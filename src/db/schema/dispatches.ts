@@ -116,12 +116,16 @@ export const dispatches = pgTable(
 		continuation: boolean('continuation').notNull().default(false),
 		/**
 		 * Effective queue priority: the column every claim-ordering read sorts by
-		 * `ASC`. 0 is the default, a positive value is a demotion (board-driven work,
-		 * `PM_BOARD_JOB_PRIORITY`), and a **negative** value outranks everything
-		 * already waiting (a worker self-update, `WORKER_UPDATE_JOB_PRIORITY`, issue
-		 * #972) — a plain `integer` with no lower bound, so ranking ahead needed no
-		 * migration. BullMQ's own priority is a different scale and is deliberately
-		 * not handed a negative (see `bullMqPriorityOption`, `src/queue/producer.ts`).
+		 * `ASC`. 0 is in-flight work (`IN_FLIGHT_JOB_PRIORITY` — the SCM
+		 * continuations, and a board-driven dispatch of a ticket already holding a WIP
+		 * slot, re-ranked at admission, issue #1191), a positive value is a demotion
+		 * (a new ticket's start, `PM_BOARD_JOB_PRIORITY`), and a **negative** value
+		 * outranks everything already waiting: Resolve-conflicts
+		 * (`RESOLVE_CONFLICTS_JOB_PRIORITY`, issue #1191), and ahead of it a worker
+		 * self-update (`WORKER_UPDATE_JOB_PRIORITY`, issue #972) — a plain `integer`
+		 * with no lower bound, so ranking ahead needed no migration. BullMQ's own
+		 * priority is a different scale and is deliberately not handed a negative (see
+		 * `bullMqOrderingOptions`, `src/queue/producer.ts`).
 		 */
 		priority: integer('priority').notNull().default(0),
 		/** Deferred-retry attempt counter (mirrors the payload's rateLimitRetryAttempt). */

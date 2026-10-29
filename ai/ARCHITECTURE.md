@@ -760,7 +760,22 @@ capacity wait, that wait's slot-release promotion and the continuation-priority 
 that ordered it — a worker's `concurrencyAllocation` is the only job-level bound, and a
 claim over it defers as an availability wait, woken the moment that machine frees a slot
 (issue #610), like any other busy machine. Migration 0085 turned the waiters left at upgrade into
-ordinary pending work. **An event-woken `pending` wait sequences the phases of one task** (issues #759 and
+ordinary pending work. **Dispatch ordering** (issue #1191): every read that decides which
+of several contending dispatches gets worker capacity — the pool matching's demand read
+(`listRunnableDispatchesForPool`), the availability promotion
+(`listAvailabilityWaitsForWorker`), the Queue (`listWaitingDispatches`) and the WIP
+waits (`listWipLimitWaits`) — sorts by the row's `priority` first, so that one column is
+the whole policy. `priorityFor` (`src/queue/producer.ts`) decides it once at creation,
+lower first: a worker self-update `-10`; Resolve-conflicts `-5` — a per-PR conflict check
+(`event.conflictPrNumber`) or merge automation's catch-up (`mergeCatchUp`), the two
+payloads the trigger turns into a run — because a conflicted pull request blocks
+everything else its ticket needs; other in-flight work `0` — the SCM continuations, and a
+board-driven phase of a ticket that already holds a WIP slot, re-ranked from `10` at its
+WIP admission (`rankDispatch`, conditional on the row being `leased`); and a new ticket's
+start `10`. Ties fall to `available_at`, then age. BullMQ carries the same order only
+advisorily: every negative rank is added `lifo`, and a re-ranked board dispatch keeps
+its payload-derived board options there, so only the column orders claims. Nothing
+running is preempted. **An event-woken `pending` wait sequences the phases of one task** (issues #759 and
 #761): a dispatch whose task has an *earlier* phase that has not settled waits as
 `task-in-flight` and is woken by that phase settling
 (`promoteTaskInFlightWaits`, from `processJob`'s `finally` — every settle path,
@@ -1329,6 +1344,14 @@ id Planning and Implementation share ("Task identity" above). Policy lives in
   Backlog → ToDo — the ordinary path — and a split child advanced straight to ToDo
   (issue #911) never run Planning, and without it the limit would bound only tickets
   that happen to.
+- **Ranking (issue #1191).** Admission is also what tells an in-flight ticket's board
+  work apart from a new start, which `priorityFor` cannot: every board job is created at
+  `PM_BOARD_JOB_PRIORITY` (10) before anything has asked. An admission that answers
+  `alreadyInFlight` re-ranks the dispatch to `IN_FLIGHT_JOB_PRIORITY` (0) through
+  `rankAdmittedTicketDispatch` → `rankDispatch` — conditional on the row still being
+  `leased`, only from the board rank, best-effort — and since no defer rewrites the
+  column, every later wait, defer and promotion of it competes as in-flight work. A new
+  start keeps 10. See "Dispatch ordering" under the durable dispatch state machine.
 - **Why not inside `claimWorkerForDispatch`.** Every refusal there comes back through
   `bindSelectedWorker` as a `WorkerIneligibleError`, which becomes a *timed*
   `worker-eligibility` wait; a WIP wait has to be event-woken and visible under its own
@@ -1390,8 +1413,8 @@ id Planning and Implementation share ("Task identity" above). Policy lives in
   wake-up and an operator **raising** a limit; lowering one preempts nothing.
 
 Tickets already in flight when this shipped hold no slot. Since issue #1190 retired the
-project-wide job cap it is the only project-side bound; ranking in-flight work ahead of
-new starts is a later phase of issue #1185.
+project-wide job cap it is the only project-side bound, and since issue #1191 an admitted
+ticket's work ranks ahead of new starts for worker capacity (the Ranking bullet above).
 
 **The WIP panel (issue #1192).** `runs.wip` (`src/api/routers/runs.ts`, authorized exactly
 like `runs.stalled`) returns one entry per `(project, repository)` holding a slot or a

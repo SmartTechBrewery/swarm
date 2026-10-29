@@ -98,6 +98,7 @@ import { derivePreRunPendingPayload, deriveRetryJobPayload } from '../dispatch/r
 import {
 	admitTicket,
 	type BoardTriggerResult,
+	rankAdmittedTicketDispatch,
 	recordTicketPullRequest,
 	releaseTicketSlot,
 	wipLimitWaitReason,
@@ -5636,7 +5637,9 @@ export async function processJob(
 	// After the two work-item gates, so a skipped item costs no slot; before
 	// `claimTaskForPhase`, whose task claim only the `finally` below releases, so a
 	// deferral here leaks nothing. A late result adopted for this very phase already
-	// ran — it asks nothing, as it asks the worker gate nothing.
+	// ran — it asks nothing, as it asks the worker gate nothing. A ticket admitted as
+	// already in flight is re-ranked from the board rank to in-flight work (issue
+	// #1191), so any later wait of this dispatch competes ahead of new starts.
 	if (
 		isBoardTrigger(trigger) &&
 		!(job.adoptedResult && adoptedResultMatchesTrigger(job.adoptedResult, trigger))
@@ -5645,6 +5648,7 @@ export async function processJob(
 		if (!admission.admitted) {
 			return handleWipLimitDeferral(dispatch, job, trigger, project, admission.holders);
 		}
+		await rankAdmittedTicketDispatch(dispatch, admission);
 	}
 
 	// Nothing may be dispatched into a task another phase is executing against: the

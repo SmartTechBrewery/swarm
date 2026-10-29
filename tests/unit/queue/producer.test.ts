@@ -222,6 +222,73 @@ describe('enqueueJob', () => {
 		expect(opts).not.toHaveProperty('priority');
 	});
 
+	// Issue #1191: in-flight work outranks new starts, and Resolve-conflicts outranks
+	// all other pipeline work — below a worker self-update only.
+	describe('ranks per job kind (issue #1191)', () => {
+		function conflictCheckJob(): SwarmJob {
+			const base = createMockScmWebhookJob();
+			return {
+				...base,
+				event: { ...base.event, kind: 'pull-request', action: 'closed', conflictPrNumber: '42' },
+			};
+		}
+
+		function mergeCatchUpJob(): SwarmJob {
+			return {
+				...createMockScmWebhookJob(),
+				mergeCatchUp: { reviewRunId: 'review-run-1', headSha: 'abc123' },
+			};
+		}
+
+		it('ranks a per-PR conflict check and a merge catch-up as Resolve-conflicts', async () => {
+			const { priorityFor, RESOLVE_CONFLICTS_JOB_PRIORITY } = await import('@/queue/producer.js');
+
+			expect(priorityFor(conflictCheckJob())).toBe(RESOLVE_CONFLICTS_JOB_PRIORITY);
+			expect(priorityFor(mergeCatchUpJob())).toBe(RESOLVE_CONFLICTS_JOB_PRIORITY);
+		});
+
+		it('orders worker-update < Resolve-conflicts < in-flight work < new starts', async () => {
+			const {
+				IN_FLIGHT_JOB_PRIORITY,
+				PM_BOARD_JOB_PRIORITY,
+				priorityFor,
+				RESOLVE_CONFLICTS_JOB_PRIORITY,
+				WORKER_UPDATE_JOB_PRIORITY,
+			} = await import('@/queue/producer.js');
+
+			expect([
+				priorityFor(workerUpdateJob()),
+				priorityFor(conflictCheckJob()),
+				priorityFor(createMockScmWebhookJob()) ?? IN_FLIGHT_JOB_PRIORITY,
+				priorityFor(createMockPmWebhookJob()),
+			]).toEqual([-10, -5, 0, 10]);
+			expect(WORKER_UPDATE_JOB_PRIORITY).toBeLessThan(RESOLVE_CONFLICTS_JOB_PRIORITY);
+			expect(RESOLVE_CONFLICTS_JOB_PRIORITY).toBeLessThan(IN_FLIGHT_JOB_PRIORITY);
+			expect(IN_FLIGHT_JOB_PRIORITY).toBeLessThan(PM_BOARD_JOB_PRIORITY);
+		});
+
+		it('leaves the merged pull request that only fans the checks out at the default', async () => {
+			const { priorityFor } = await import('@/queue/producer.js');
+			const base = createMockScmWebhookJob();
+
+			expect(
+				priorityFor({
+					...base,
+					event: { ...base.event, kind: 'pull-request', action: 'closed', merged: true },
+				}),
+			).toBeUndefined();
+		});
+
+		it('carries a Resolve-conflicts job to BullMQ as lifo, like every negative rank', async () => {
+			const { enqueueDispatchWakeUp } = await import('@/queue/producer.js');
+
+			await enqueueDispatchWakeUp(conflictCheckJob(), 'dispatch_conflicts_w0', 0);
+
+			const [, , opts] = add.mock.calls[0];
+			expect(opts).toEqual({ jobId: 'dispatch_conflicts_w0', lifo: true });
+		});
+	});
+
 	it('omits the job id when the event carries no deliveryId', async () => {
 		const { enqueueJob } = await import('@/queue/producer.js');
 		const { deliveryId: _dropped, ...job } = createMockScmWebhookJob();

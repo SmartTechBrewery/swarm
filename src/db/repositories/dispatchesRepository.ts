@@ -573,6 +573,23 @@ export async function bindDispatchToRun(id: string, runId: string): Promise<bool
 }
 
 /**
+ * Re-rank a claimed dispatch (issue #1191): write its queue `priority`, the column
+ * every claim-ordering read sorts by. Conditional on the row still being this
+ * process's `leased` claim, so it never touches a row another actor holds or has
+ * already settled — a pending or terminal row is left exactly as it is. Every later
+ * wait, defer and promotion of the dispatch then orders it at the new rank, since
+ * none of them rewrites the column. Returns whether the row was updated.
+ */
+export async function rankDispatch(id: string, priority: number): Promise<boolean> {
+	const rows = await getDb()
+		.update(dispatches)
+		.set({ priority, updatedAt: new Date() })
+		.where(and(eq(dispatches.id, id), eq(dispatches.state, 'leased')))
+		.returning({ id: dispatches.id });
+	return rows.length > 0;
+}
+
+/**
  * Record what the trigger resolved on a claimed dispatch (before a run row
  * exists): the task and phase the Queue UI names a waiting dispatch by, plus the
  * pull request the PR-scoped hold is keyed on (issue #850).
