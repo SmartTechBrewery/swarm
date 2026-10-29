@@ -89,7 +89,10 @@ for _ in $(seq 1 24); do
 	if curl -fsS "$DEPLOY_URL/health" >/dev/null 2>&1; then
 		live=""
 		for js in $(curl -fsS "$DEPLOY_URL/" | grep -oE '/assets/[^"]+\.js'); do
-			curl -fsS "$DEPLOY_URL$js" | grep -q "\"$version\"" && live=yes && break
+			# Read the bundle whole: piped into `grep -q`, curl dies writing to the
+			# closed pipe on the first match, and pipefail turns that into a miss.
+			bundle=$(curl -fsS "$DEPLOY_URL$js") || continue
+			[[ "$bundle" == *"\"$version\""* ]] && live=yes && break
 		done
 		if [ -n "$live" ]; then
 			echo "$tag is live at $DEPLOY_URL"
