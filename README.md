@@ -262,34 +262,6 @@ zwykłym sposobem na wczytanie zmian w pliście: przeniesionego `node`, nowo
 zainstalowanego CLI agenta albo nowych dodatkowych checkoutów po
 `add-checkout`.
 
-## Wydawanie wersji
-
-Nową wersję wydaje się jedną komendą, z czystego `main`:
-
-```bash
-npm run release
-```
-
-Skrypt [`bin/swarm-release`](bin/swarm-release):
-
-1. Pobiera aktualny `main` i pokazuje obecną wersję oraz ostatni tag.
-2. Prosi o nową wersję w formacie `X.Y.Z`. Odrzuca zły format, wersję niższą od
-   obecnej i istniejący już tag.
-3. Ostrzega, jeśli od poprzedniego tagu zmieniło się `deploy/vps`. Wtedy pliki na
-   serwerze (compose, Caddyfile, `.env`) mogą wymagać admina.
-4. Podbija wersję w `package.json`, commituje `chore(release): vX.Y.Z` na `main`,
-   tworzy tag `vX.Y.Z` i wypycha oba. Hook pre-push uruchamia przy tym testy.
-5. Czeka, aż GitHub Actions zbuduje obraz `ghcr.io/smarttechbrewery/swarm:vX.Y.Z`
-   i przesunie na niego tag `:stable`.
-6. Publikuje GitHub Release z notatkami wygenerowanymi z PR-ów.
-7. Robi deploy na VPS (`sudo dockerctl deploy app`). Migracje uruchamiają się
-   same przy starcie.
-8. Sprawdza, że `/health` odpowiada i że dashboard pokazuje nową wersję.
-
-Wymaga zalogowanego `gh` i dostępu SSH do serwera. Adres serwera można nadpisać
-zmiennymi `SWARM_DEPLOY_SSH` (domyślnie `jkwiecien@51.255.194.195`) i
-`SWARM_DEPLOY_URL` (domyślnie `https://swarm-sm.pl`).
-
 ## Dokumentacja
 
 Wszystko inne jest w [`docs/MANUAL.md`](docs/MANUAL.md): wymagania wstępne, jak
