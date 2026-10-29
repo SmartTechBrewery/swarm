@@ -552,6 +552,28 @@ describe('runsRouter', () => {
 			expect(result.data[0].workerId).toBe('worker-gone');
 		});
 
+		// Issue #1182 — the list's time window, which `swarm run list --since` sends.
+		it('passes a since window to the repository as a startedSince instant', async () => {
+			vi.mocked(listRunsFromDb).mockResolvedValue({ data: [], total: 0 });
+			const since = '2026-07-09T00:00:00.000Z';
+
+			await caller.list({ status: 'failed', since });
+
+			expect(listRunsFromDb).toHaveBeenCalledWith({
+				status: 'failed',
+				limit: 50,
+				offset: 0,
+				startedSince: new Date(since),
+			});
+		});
+
+		it('refuses a since that is not an ISO 8601 timestamp, without querying', async () => {
+			await expect(caller.list({ since: 'yesterday' })).rejects.toThrowError(
+				expect.objectContaining({ code: 'BAD_REQUEST' }),
+			);
+			expect(listRunsFromDb).not.toHaveBeenCalled();
+		});
+
 		// Issue #971 — same fallback in the list, for the same reason: a maintenance row
 		// whose machine has been retired still names it, while an ordinary pipeline row
 		// with a gone worker keeps showing no machine rather than an invented one.
@@ -4109,6 +4131,22 @@ describe('runsRouter', () => {
 					phase: 'review',
 					limit: 10,
 					offset: 20,
+					projectIds: ['p1'],
+				});
+			});
+
+			// Issue #1182 — a time window narrows within the membership scope, never past it.
+			it('carries a since window alongside the membership scope', async () => {
+				vi.mocked(listAccessibleProjectIds).mockResolvedValue(['p1']);
+				vi.mocked(listRunsFromDb).mockResolvedValue({ data: [], total: 0 });
+				const since = '2026-07-09T00:00:00+02:00';
+
+				await ordinary.list({ since });
+
+				expect(listRunsFromDb).toHaveBeenCalledWith({
+					limit: 50,
+					offset: 0,
+					startedSince: new Date(since),
 					projectIds: ['p1'],
 				});
 			});
