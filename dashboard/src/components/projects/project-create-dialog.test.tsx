@@ -87,6 +87,44 @@ describe('ProjectCreateDialog', () => {
 		);
 	});
 
+	it('submits a reviewer token typed at creation, trimmed', async () => {
+		createProject.mockResolvedValue({});
+		renderDialog(<ProjectCreateDialog open onOpenChange={vi.fn()} />);
+
+		fillRequiredFields();
+		fireEvent.change(screen.getByLabelText('Reviewer PAT'), {
+			target: { value: '  ghp_project_reviewer  ' },
+		});
+		fireEvent.click(screen.getByRole('button', { name: 'Create Project' }));
+
+		await waitFor(() =>
+			expect(createProject).toHaveBeenCalledWith(
+				expect.objectContaining({ reviewerToken: 'ghp_project_reviewer' }),
+			),
+		);
+	});
+
+	// Left out rather than sent blank, so the server falls back to the installation default.
+	it('omits an empty reviewer token', async () => {
+		createProject.mockResolvedValue({});
+		renderDialog(<ProjectCreateDialog open onOpenChange={vi.fn()} />);
+
+		fillRequiredFields();
+		fireEvent.change(screen.getByLabelText('Reviewer PAT'), { target: { value: '   ' } });
+		fireEvent.click(screen.getByRole('button', { name: 'Create Project' }));
+
+		await waitFor(() => expect(createProject).toHaveBeenCalled());
+		expect(createProject.mock.calls[0]?.[0]).not.toHaveProperty('reviewerToken');
+	});
+
+	it("labels the reviewer token with the selected provider's own name for it", () => {
+		renderDialog(<ProjectCreateDialog open onOpenChange={vi.fn()} />);
+
+		fireEvent.change(screen.getByRole('combobox'), { target: { value: 'gitlab' } });
+
+		expect(screen.getByLabelText('Reviewer Access Token')).toHaveProperty('type', 'password');
+	});
+
 	it('pre-fills the base branch so the operator sees what the project will use', () => {
 		renderDialog(<ProjectCreateDialog open onOpenChange={vi.fn()} />);
 

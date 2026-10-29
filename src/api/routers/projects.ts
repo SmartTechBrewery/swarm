@@ -125,7 +125,14 @@ interface ResolvedInstanceScmDefault {
 
 /**
  * Resolve every instance-level default the new project's **own** SCM provider requires,
- * refusing creation when the installation has recorded none (issue #778).
+ * refusing creation when neither the request nor the installation supplies one (issue
+ * #778).
+ *
+ * A `reviewerToken` the creator typed into the New Project dialog satisfies the
+ * `reviewer` role on its own — the stored default is then not even read — so a project
+ * whose reviewer is not the installation's usual account can be created without an
+ * instance administrator recording a default nobody else wants. The default stays the
+ * fallback for a creator who leaves the field empty.
  *
  * The reviewer identity is an installation-wide *requirement*, not the best-effort
  * convenience issue #769 shipped: a project whose provider declares an
@@ -163,19 +170,32 @@ interface ResolvedInstanceScmDefault {
  */
 async function requireInstanceScmDefaults(
 	scm: ScmType,
+	reviewerToken: string | undefined,
 ): Promise<readonly ResolvedInstanceScmDefault[]> {
 	const resolved: ResolvedInstanceScmDefault[] = [];
-	for (const eligible of listInstanceDefaultScmRoles()) {
-		if (eligible.providerId !== scm) continue;
-		const secret = await resolveInstanceScmCredential(scm, eligible.role);
+	const eligibleRoles = listInstanceDefaultScmRoles().filter((r) => r.providerId === scm);
+	// Every shipped provider declares `reviewer` eligible, so this only refuses a token for
+	// a provider that would otherwise silently drop it.
+	if (reviewerToken !== undefined && !eligibleRoles.some((r) => r.role === 'reviewer')) {
+		throw new TRPCError({
+			code: 'BAD_REQUEST',
+			message: `A reviewer token cannot be set at creation for a ${scm} project; set it on the Source Control tab.`,
+		});
+	}
+	for (const eligible of eligibleRoles) {
+		const secret =
+			eligible.role === 'reviewer' && reviewerToken !== undefined
+				? reviewerToken
+				: await resolveInstanceScmCredential(scm, eligible.role);
 		if (secret === null) {
 			throw new TRPCError({
 				code: 'PRECONDITION_FAILED',
 				message:
 					`This installation has recorded no ${eligible.providerLabel} '${eligible.role}' ` +
-					`credential, so a ${eligible.providerLabel} project could not run Review. An ` +
-					'instance administrator must set it in General Settings → Credentials ' +
-					`(${eligible.envVarKey}) before this project can be created.`,
+					`credential, so a ${eligible.providerLabel} project could not run Review. Enter ` +
+					"the project's reviewer token in the New Project dialog, or have an instance " +
+					'administrator set a default in General Settings → Credentials ' +
+					`(${eligible.envVarKey}).`,
 			});
 		}
 		resolved.push({ role: eligible.role, envVarKey: eligible.envVarKey, secret });
@@ -223,7 +243,11 @@ async function seedInstanceScmCredentials(
 const ProjectWriteInputSchema = ProjectRecordBaseSchema.omit({ credentials: true });
 // `pm` is omitted from the create input, not accepted from the client: a new
 // project always starts on `DEFAULT_PM_CONFIG`'s placeholder mapping.
-const ProjectCreateInputSchema = ProjectWriteInputSchema.omit({ pm: true });
+// `reviewerToken` is a secret, not config: `create` strips it before the record is
+// assembled and only ever writes it, encrypted, to the project's credential row.
+const ProjectCreateInputSchema = ProjectWriteInputSchema.omit({ pm: true }).extend({
+	reviewerToken: z.string().trim().min(1).optional(),
+});
 
 function mergePipelineConfig(
 	existing: PipelineConfig | undefined,
@@ -468,7 +492,8 @@ export const projectsRouter = router({
 	// the row is still written so the creator keeps access if their installation
 	// role is later removed. Creation and membership insertion are performed
 	// atomically in one transaction so a partial failure never leaves an unowned project.
-	create: authedProcedure.input(ProjectCreateInputSchema).mutation(async ({ ctx, input }) => {
+	create: authedProcedure.input(ProjectCreateInputSchema).mutation(async ({ ctx, input: raw }) => {
+		const { reviewerToken, ...input } = raw;
 		const pmReferences = defaultPmCredentialReferences(DEFAULT_PM_CONFIG);
 		// This is a creation-time default, not a config-schema fallback: the dashboard
 		// always submits its explicit picker value, while non-dashboard callers remain
@@ -483,7 +508,7 @@ export const projectsRouter = router({
 		// even assembled, so a refused creation does no work at all. A request that would
 		// both be refused and conflict on id therefore reports the refusal, the more
 		// actionable of the two; the operator meets the conflict on the retry.
-		const instanceDefaults = await requireInstanceScmDefaults(scm);
+		const instanceDefaults = await requireInstanceScmDefaults(scm, reviewerToken);
 		const scmReferences = defaultScmCredentialReferences(scm);
 		const config = {
 			...input,

@@ -3,7 +3,12 @@ import { Info, RefreshCw } from 'lucide-react';
 import type React from 'react';
 import { useEffect, useRef, useState } from 'react';
 import { buttonClass } from '@/components/ui/button.js';
-import { DEFAULT_SCM_PROVIDER_ID, SCM_PROVIDERS, type ScmProviderId } from '@/lib/credentials.js';
+import {
+	DEFAULT_SCM_PROVIDER_ID,
+	getScmProviderCopy,
+	SCM_PROVIDERS,
+	type ScmProviderId,
+} from '@/lib/credentials.js';
 import { parseRepoUrl } from '@/lib/parse-repo-url.js';
 import { DEFAULT_BASE_BRANCH, repoInputShape } from '@/lib/project-repository.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
@@ -43,6 +48,7 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 	const [repoRoot, setRepoRoot] = useState('');
 	const [scm, setScm] = useState<ScmProviderId>(DEFAULT_SCM_PROVIDER_ID);
 	const [repoUrl, setRepoUrl] = useState('');
+	const [reviewerToken, setReviewerToken] = useState('');
 	const [urlError, setUrlError] = useState('');
 	const [baseBranchNote, setBaseBranchNote] = useState('');
 	const [baseBranchDetectionFailed, setBaseBranchDetectionFailed] = useState(false);
@@ -99,6 +105,7 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 			repositories: Array<{ repo: string; baseBranch: string }>;
 			repoRoot: string;
 			scm: ScmProviderId;
+			reviewerToken?: string;
 		}) => trpcClient.projects.create.mutate(newProject),
 		onSuccess: () => {
 			queryClient.invalidateQueries({
@@ -113,6 +120,7 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 			setRepoRoot('');
 			setScm(DEFAULT_SCM_PROVIDER_ID);
 			setRepoUrl('');
+			setReviewerToken('');
 			setUrlError('');
 			setShowPathHelp(false);
 			onOpenChange(false);
@@ -129,12 +137,23 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 		// `main` was silently configured against a branch nobody chose. `branchPrefix` keeps
 		// taking that default — a task branch prefix is SWARM's own naming convention rather
 		// than a property of the repository, so nothing about it can be silently wrong.
-		mutation.mutate({ id, name, repositories: [{ repo, baseBranch }], repoRoot, scm });
+		// An empty reviewer token is left out rather than sent blank: the server then falls
+		// back to the installation default from General Settings → Credentials.
+		const token = reviewerToken.trim();
+		mutation.mutate({
+			id,
+			name,
+			repositories: [{ repo, baseBranch }],
+			repoRoot,
+			scm,
+			...(token ? { reviewerToken: token } : {}),
+		});
 	};
 
 	const handleClose = () => {
 		mutation.reset();
 		setRepoUrl('');
+		setReviewerToken('');
 		setUrlError('');
 		invalidateBaseBranchDetection();
 		setShowPathHelp(false);
@@ -431,6 +450,28 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 							placeholder="/Users/you/code/my-repo"
 							className="block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 font-mono"
 						/>
+					</div>
+					<div className="md:col-span-2">
+						<label
+							htmlFor="project-reviewer-token"
+							className="block text-xs font-medium text-zinc-400 mb-1"
+						>
+							{getScmProviderCopy(scm).roleLabels.reviewer}
+						</label>
+						<input
+							type="password"
+							id="project-reviewer-token"
+							value={reviewerToken}
+							onChange={(e) => setReviewerToken(e.target.value)}
+							autoComplete="new-password"
+							aria-describedby="project-reviewer-token-hint"
+							className="block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 font-mono"
+						/>
+						<p id="project-reviewer-token-hint" className="mt-1 text-xs text-zinc-500">
+							The credential this project's reviewer persona reviews with. Leave empty to use the
+							installation default from General Settings → Credentials. Editable later on the
+							project's Source Control tab.
+						</p>
 					</div>
 				</div>
 
