@@ -408,4 +408,127 @@ describe('ProjectCreateDialog', () => {
 			expect(defaultBranchQuery).not.toHaveBeenCalled();
 		});
 	});
+
+	// Issue #1181: autofill used to leave Source Control Provider on its GitHub default, so
+	// an Azure DevOps URL filled a three-segment Repo that creation then refused under it.
+	describe('provider autofill', () => {
+		/** Paste `url` into Repository URL and press autofill. */
+		function autofill(url: string) {
+			fireEvent.change(screen.getByLabelText('Repository URL'), { target: { value: url } });
+			fireEvent.click(screen.getByRole('button', { name: 'Autofill from repository URL' }));
+		}
+
+		const providerSelect = () => screen.getByRole('combobox') as HTMLSelectElement;
+
+		it('selects the provider an Azure DevOps URL belongs to and creates the project on it', async () => {
+			createProject.mockResolvedValue({});
+			defaultBranchQuery.mockResolvedValue({ branch: 'develop' });
+			renderDialog(<ProjectCreateDialog open onOpenChange={vi.fn()} />);
+			expect(providerSelect().value).toBe('github');
+
+			autofill('https://dev.azure.com/core3pl/KV-TMS/_git/VikingKurier');
+
+			expect(providerSelect().value).toBe('azure-devops');
+			expect(
+				(screen.getByPlaceholderText('organization/project/repository') as HTMLInputElement).value,
+			).toBe('core3pl/KV-TMS/VikingKurier');
+			// Detection runs under the provider autofill selected, never the one it replaced.
+			await waitFor(() =>
+				expect(defaultBranchQuery).toHaveBeenCalledWith({
+					scm: 'azure-devops',
+					repo: 'core3pl/KV-TMS/VikingKurier',
+				}),
+			);
+			expect(defaultBranchQuery).not.toHaveBeenCalledWith(
+				expect.objectContaining({ scm: 'github' }),
+			);
+			await waitFor(() =>
+				expect((screen.getByLabelText(/^Base Branch/) as HTMLInputElement).value).toBe('develop'),
+			);
+
+			fireEvent.change(screen.getByLabelText(/^Repo Local Path/), {
+				target: { value: '/work/viking-kurier' },
+			});
+			fireEvent.click(screen.getByRole('button', { name: 'Create Project' }));
+
+			await waitFor(() =>
+				expect(createProject).toHaveBeenCalledWith(
+					expect.objectContaining({
+						repositories: [{ repo: 'core3pl/KV-TMS/VikingKurier', baseBranch: 'develop' }],
+						scm: 'azure-devops',
+					}),
+				),
+			);
+		});
+
+		it.each([
+			['git@bitbucket.org:workspace/repo.git', 'bitbucket'],
+			['https://gitlab.com/namespace/project', 'gitlab'],
+		])('selects the provider %s belongs to', async (url, provider) => {
+			renderDialog(<ProjectCreateDialog open onOpenChange={vi.fn()} />);
+
+			autofill(url);
+
+			expect(providerSelect().value).toBe(provider);
+			await waitFor(() =>
+				expect(defaultBranchQuery).toHaveBeenCalledWith(expect.objectContaining({ scm: provider })),
+			);
+		});
+
+		it('selects GitHub again for a github.com URL after another provider was chosen', async () => {
+			renderDialog(<ProjectCreateDialog open onOpenChange={vi.fn()} />);
+			fireEvent.change(providerSelect(), { target: { value: 'gitlab' } });
+
+			autofill('git@github.com:owner/repo.git');
+
+			expect(providerSelect().value).toBe('github');
+			await waitFor(() =>
+				expect(defaultBranchQuery).toHaveBeenCalledWith({ scm: 'github', repo: 'owner/repo' }),
+			);
+		});
+
+		it('keeps the selected provider for a host that does not tell which one it is', async () => {
+			renderDialog(<ProjectCreateDialog open onOpenChange={vi.fn()} />);
+			fireEvent.change(providerSelect(), { target: { value: 'gitlab' } });
+			defaultBranchQuery.mockClear();
+
+			autofill('https://gitlab.example.com/group/project.git');
+
+			expect(providerSelect().value).toBe('gitlab');
+			expect((screen.getByPlaceholderText('namespace/project') as HTMLInputElement).value).toBe(
+				'group/project',
+			);
+			await waitFor(() =>
+				expect(defaultBranchQuery).toHaveBeenCalledWith({ scm: 'gitlab', repo: 'group/project' }),
+			);
+		});
+
+		it('lets the operator change the provider by hand after autofill', async () => {
+			createProject.mockResolvedValue({});
+			renderDialog(<ProjectCreateDialog open onOpenChange={vi.fn()} />);
+
+			autofill('https://github.com/owner/repo');
+			expect(providerSelect().value).toBe('github');
+
+			fireEvent.change(providerSelect(), { target: { value: 'bitbucket' } });
+			expect(providerSelect().value).toBe('bitbucket');
+			await waitFor(() =>
+				expect(defaultBranchQuery).toHaveBeenCalledWith({ scm: 'bitbucket', repo: 'owner/repo' }),
+			);
+
+			fireEvent.change(screen.getByLabelText(/^Repo Local Path/), {
+				target: { value: '/work/repo' },
+			});
+			fireEvent.click(screen.getByRole('button', { name: 'Create Project' }));
+
+			await waitFor(() =>
+				expect(createProject).toHaveBeenCalledWith(
+					expect.objectContaining({
+						repositories: [{ repo: 'owner/repo', baseBranch: 'main' }],
+						scm: 'bitbucket',
+					}),
+				),
+			);
+		});
+	});
 });

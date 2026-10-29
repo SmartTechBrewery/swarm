@@ -9,6 +9,7 @@ describe('parseRepoUrl', () => {
 			repo: 'owner/repo',
 			id: 'repo',
 			name: 'repo',
+			provider: 'github',
 		});
 	});
 
@@ -19,6 +20,7 @@ describe('parseRepoUrl', () => {
 			repo: 'owner/repo',
 			id: 'repo',
 			name: 'repo',
+			provider: 'github',
 		});
 	});
 
@@ -29,6 +31,7 @@ describe('parseRepoUrl', () => {
 			repo: 'owner/repo',
 			id: 'repo',
 			name: 'repo',
+			provider: 'github',
 		});
 	});
 
@@ -39,6 +42,7 @@ describe('parseRepoUrl', () => {
 			repo: 'owner/repo',
 			id: 'repo',
 			name: 'repo',
+			provider: 'github',
 		});
 	});
 
@@ -49,6 +53,7 @@ describe('parseRepoUrl', () => {
 			repo: 'owner/repo',
 			id: 'repo',
 			name: 'repo',
+			provider: 'github',
 		});
 	});
 
@@ -59,6 +64,7 @@ describe('parseRepoUrl', () => {
 			repo: 'owner/repo',
 			id: 'repo',
 			name: 'repo',
+			provider: 'github',
 		});
 	});
 
@@ -69,6 +75,7 @@ describe('parseRepoUrl', () => {
 			repo: 'Some-Org/My_Awesome.Repo.123',
 			id: 'my-awesome-repo-123',
 			name: 'My_Awesome.Repo.123',
+			provider: 'github',
 		});
 	});
 
@@ -79,6 +86,7 @@ describe('parseRepoUrl', () => {
 			repo: 'some-group/project',
 			id: 'project',
 			name: 'project',
+			provider: null,
 		});
 	});
 
@@ -89,6 +97,7 @@ describe('parseRepoUrl', () => {
 			repo: 'owner/repo-name',
 			id: 'repo-name',
 			name: 'repo-name',
+			provider: 'gitlab',
 		});
 	});
 
@@ -99,6 +108,7 @@ describe('parseRepoUrl', () => {
 			repo: '123org/repo-name',
 			id: 'repo-name',
 			name: 'repo-name',
+			provider: 'github',
 		});
 	});
 
@@ -117,6 +127,7 @@ describe('parseRepoUrl', () => {
 			repo: 'Fabrikam/Fiber/Web',
 			id: 'web',
 			name: 'Web',
+			provider: 'azure-devops',
 		};
 
 		it.each([
@@ -134,6 +145,7 @@ describe('parseRepoUrl', () => {
 				repo: 'Fabrikam/Fiber Project/Web',
 				id: 'web',
 				name: 'Web',
+				provider: 'azure-devops',
 			});
 		});
 
@@ -155,6 +167,47 @@ describe('parseRepoUrl', () => {
 
 		it('falls back to the generic reading for an Azure path it does not recognize', () => {
 			expect(parseRepoUrl('https://dev.azure.com/Fabrikam/Fiber')?.repo).toBe('Fabrikam/Fiber');
+		});
+	});
+
+	// Issue #1181: autofill selects the provider a URL belongs to, so the parser reports it
+	// alongside the repository — read off the host, HTTPS and SSH forms alike.
+	describe('provider recognition', () => {
+		it.each([
+			['https://github.com/owner/repo', 'github'],
+			['git@github.com:owner/repo.git', 'github'],
+			['ssh://git@ssh.github.com:443/owner/repo.git', 'github'],
+			['https://bitbucket.org/workspace/repo', 'bitbucket'],
+			['https://user@bitbucket.org/workspace/repo.git', 'bitbucket'],
+			['git@bitbucket.org:workspace/repo.git', 'bitbucket'],
+			['ssh://git@altssh.bitbucket.org:443/workspace/repo.git', 'bitbucket'],
+			['https://gitlab.com/namespace/project', 'gitlab'],
+			['git@gitlab.com:namespace/project.git', 'gitlab'],
+			['ssh://git@altssh.gitlab.com:443/namespace/project.git', 'gitlab'],
+			['https://dev.azure.com/Fabrikam/Fiber/_git/Web', 'azure-devops'],
+			['git@ssh.dev.azure.com:v3/Fabrikam/Fiber/Web', 'azure-devops'],
+			['https://fabrikam.visualstudio.com/Fiber/_git/Web', 'azure-devops'],
+			['Fabrikam@vs-ssh.visualstudio.com:v3/Fabrikam/Fiber/Web', 'azure-devops'],
+			['HTTPS://GitHub.com/owner/repo', 'github'],
+		])('recognizes %s as %s', (url, provider) => {
+			expect(parseRepoUrl(url)?.provider).toBe(provider);
+		});
+
+		// The host alone decides: an Azure path the parser cannot read is still Azure's, so
+		// selecting it lets the Repo field say the repository is incomplete.
+		it('recognizes the provider even when the path falls back to the generic reading', () => {
+			expect(parseRepoUrl('https://dev.azure.com/Fabrikam/Fiber')?.provider).toBe('azure-devops');
+		});
+
+		it.each([
+			'https://gitlab.example.com/group/project.git',
+			'git@git.internal:team/repo.git',
+			'https://github.example.com/owner/repo',
+			'https://notgithub.com/owner/repo',
+		])('reports no provider for %s, whose host does not tell', (url) => {
+			const result = parseRepoUrl(url);
+			expect(result).not.toBeNull();
+			expect(result?.provider).toBeNull();
 		});
 	});
 });
