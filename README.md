@@ -1,178 +1,184 @@
-<img width="1726" height="845" alt="SWARM dashboard" src="https://github.com/user-attachments/assets/9792915e-517a-423f-b059-e9eff99792b0" />
+<img width="1726" height="845" alt="Dashboard SWARM" src="https://github.com/user-attachments/assets/9792915e-517a-423f-b059-e9eff99792b0" />
 
 # SWARM
 
-**A local-first, federated multi-agent framework that turns a project board into shipped code.**
+**Lokalny, sfederowany framework wieloagentowy, który zamienia tablicę projektu w dostarczony kod.**
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A522-339933.svg)](https://nodejs.org)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict%20%2B%20ESM-3178c6.svg)](https://www.typescriptlang.org/)
 
-Move a card to **Ready** and SWARM takes it from there. A coding agent plans the
-task, implements it in an isolated Git worktree on a machine *you* own, opens a
-pull request, reviews that pull request as a **separate identity**, answers its
-own review, fixes red CI, resolves merge conflicts, and moves the card to
-**Done** — commenting on the board at every step so a human can follow along or
-step in.
+Przesuń kartę do **Ready**, a resztą zajmie się SWARM. Agent kodujący planuje
+zadanie, implementuje je w odizolowanym worktree Gita na maszynie, która należy
+do *ciebie*, otwiera pull request, recenzuje go jako **osobna tożsamość**,
+odpowiada na własne review, naprawia czerwone CI, rozwiązuje konflikty i
+przesuwa kartę do **Done**. Na każdym kroku komentuje na tablicy, więc człowiek
+może śledzić postęp albo w każdej chwili wkroczyć.
 
-Your source code never leaves your machine. The control plane only ever sees
-issue metadata, comments, and logs.
+Twój kod źródłowy nigdy nie opuszcza twojej maszyny. Control plane widzi
+wyłącznie metadane zadań, komentarze i logi.
 
 ---
 
-## What it does, in one picture
+## Jak to działa w jednym obrazku
 
 ```text
    ┌──────────────────────────────────────────────────────────────────────┐
-   │  Board: GitHub Projects · Linear · Jira · Trello                     │
-   │  Code:  GitHub · Bitbucket Cloud · GitLab · Azure DevOps             │
+   │  Tablica: GitHub Projects · Linear · Jira · Trello                   │
+   │  Kod:     GitHub · Bitbucket Cloud · GitLab · Azure DevOps           │
    └───────────────┬──────────────────────────────────────────────────────┘
-                   │  signed webhook (HTTPS, usually a Cloudflare Tunnel)
+                   │  podpisany webhook (HTTPS, zwykle Cloudflare Tunnel)
                    ▼
    ┌──────────────────────────────────────────────────────────────────────┐
    │  Router (control plane)                                              │
-   │  verify → normalize to a provider-neutral event → durable dispatch   │
-   │  in Postgres → Redis wake-up → eligibility gate → pick a worker      │
+   │  weryfikacja → zdarzenie niezależne od providera → trwały dispatch   │
+   │  w Postgresie → wybudzenie przez Redis → bramka → wybór workera      │
    └───────────────┬──────────────────────────────────────────────────────┘
-                   │  TaskAssignment over an authenticated WebSocket
-                   │  (never a project secret)
+                   │  TaskAssignment przez uwierzytelniony WebSocket
+                   │  (nigdy sekret projektu)
                    ▼
    ┌──────────────────────────────────────────────────────────────────────┐
-   │  Worker — your machine, your PATH, your CLI logins                   │
-   │  isolated worktree → claude / agy / codex → structured hand-off      │
+   │  Worker — twoja maszyna, twój PATH, twoje loginy CLI                 │
+   │  odizolowany worktree → claude / agy / codex → ustrukturyzowany      │
+   │  hand-off                                                            │
    └───────────────┬──────────────────────────────────────────────────────┘
-                   │  result streams back
+                   │  wynik wraca strumieniem
                    ▼
-      SWARM performs the delivery: commit · push · PR · review · board move
+      SWARM dostarcza: commit · push · PR · review · ruch na tablicy
 ```
 
-## Why it isn't just an agent in a for-loop
+## Dlaczego to nie jest po prostu agent w pętli
 
-**It's a pipeline, not a prompt.** Six distinct phases, each with its own
-trigger, worktree mode, prompt, hand-off schema, and delivery rules — so
-"implement this" and "review this" are genuinely different jobs with different
-credentials, not the same agent asked nicely.
+**To pipeline, a nie prompt.** Sześć odrębnych faz, każda z własnym
+wyzwalaczem, trybem worktree, promptem, schematem hand-offu i regułami
+dostarczania. „Zaimplementuj to” i „zrecenzuj to” to naprawdę różne zadania z
+różnymi poświadczeniami, a nie ten sam agent grzecznie poproszony o coś innego.
 
-**The agent writes code; SWARM does the delivery.** Every phase ends with a
-structured hand-off validated against a Zod schema. Commits, pushes, pull
-requests, review submissions, and board moves are then performed *by SWARM* from
-that hand-off — never by the agent shelling out on its own. A hand-off that fails
-validation gets exactly one repair pass, and then the run fails loudly instead of
-half-delivering.
+**Agent pisze kod, a SWARM go dostarcza.** Każda faza kończy się
+ustrukturyzowanym hand-offem walidowanym schematem Zod. Commity, pushe, pull
+requesty, review i ruchy na tablicy wykonuje potem *SWARM* na podstawie tego
+hand-offu, nigdy agent na własną rękę. Hand-off, który nie przejdzie walidacji,
+dostaje dokładnie jedną próbę naprawy. Potem run kończy się wyraźnym błędem,
+zamiast dostarczyć coś w połowie.
 
-**Two identities, so the review means something.** Implementation runs under an
-implementer persona; Review submits under a separate, project-scoped reviewer
-credential, scoped per call via `AsyncLocalStorage`. Each provider establishes
-its own identity for loop prevention, so SWARM never reacts to its own events.
+**Dwie tożsamości, żeby review coś znaczyło.** Implementacja działa jako
+persona implementera. Review jest wysyłane przez osobne poświadczenie
+reviewera, przypisane do projektu i wybierane dla każdego wywołania przez
+`AsyncLocalStorage`. Każdy provider ustala własną tożsamość na potrzeby
+zapobiegania pętlom, więc SWARM nigdy nie reaguje na własne zdarzenia.
 
-**Your code stays put.** Cloning, worktrees, agent CLI runs, and pushes all
-happen on a machine you own, under `.swarm-workspaces/task-<id>/`. The worker
-daemon holds no `DATABASE_URL`, no `REDIS_URL`, and no project secret — anything
-needing one (a reviewer verdict, a board move, the verdict ledger) goes back up
-to the control plane's delivery API.
+**Twój kod zostaje na miejscu.** Klonowanie, worktree, uruchomienia CLI agentów
+i pushe odbywają się na twojej maszynie, w `.swarm-workspaces/task-<id>/`.
+Daemon workera nie ma `DATABASE_URL`, `REDIS_URL` ani żadnego sekretu projektu.
+Wszystko, co go wymaga (werdykt reviewera, ruch na tablicy, rejestr werdyktów),
+wraca do API dostarczania w control plane.
 
-**Provider-neutral on every axis.** Three source-control providers, four project
-boards, three agent CLIs — and *none* of them are named in pipeline, trigger, or
-worker code. A new provider is an interface implementation, not a fork: fifteen
-outbound methods plus five inbound ones, declared as data on a manifest, and a
-conformance suite that refuses to let a provider register while any method is
-still a stub.
+**Niezależny od providera na każdej osi.** Trzech providerów kontroli wersji,
+cztery tablice projektów, trzy CLI agentów, a *żaden* z nich nie jest nazwany w
+kodzie pipeline'u, wyzwalaczy ani workera. Nowy provider to implementacja
+interfejsu, a nie fork: piętnaście metod wychodzących i pięć przychodzących,
+zadeklarowanych jako dane w manifeście, oraz zestaw testów zgodności, który nie
+pozwoli zarejestrować providera, dopóki choć jedna metoda jest atrapą.
 
-**Durable by design.** Postgres holds the dispatch state machine; Redis only
-carries wake-ups, never the source of truth. Webhook deliveries dedupe on the
-provider's own delivery id and dispatches on deterministic per-(repo, PR, head)
-keys — so a redelivered webhook, a queue retry, or a worker restart mid-delivery
-still produces exactly one run and one comment.
+**Trwałość z założenia.** Postgres przechowuje maszynę stanów dispatchu. Redis
+przenosi tylko wybudzenia i nigdy nie jest źródłem prawdy. Webhooki są
+deduplikowane po identyfikatorze dostawy nadanym przez providera, a dispatche po
+deterministycznych kluczach (repo, PR, head). Ponownie dostarczony webhook,
+retry kolejki czy restart workera w trakcie dostarczania dają więc dokładnie
+jeden run i jeden komentarz.
 
-**Bounded, so nothing runs away.** A durable ledger caps every pull request at
-three submitted verdicts (an authorized operator can grant exactly one more).
-CI-fix attempts are capped per PR. "The provider answered, but not finally" and
-"the read never answered" spend *separate* recheck budgets, so a DNS outage
-can't quietly drain the allowance a slow CI run needs — and every give-up leaves
-a `failed` run row an operator can see and retry.
+**Ograniczenia, żeby nic nie wymknęło się spod kontroli.** Trwały rejestr
+ogranicza każdy pull request do trzech wysłanych werdyktów (uprawniony operator
+może przyznać dokładnie jeden więcej). Próby naprawy CI mają limit na PR.
+„Provider odpowiedział, ale jeszcze nie ostatecznie” i „odczyt w ogóle nie
+odpowiedział” zużywają *osobne* budżety ponownych sprawdzeń, więc awaria DNS
+nie wyczerpie po cichu puli, której potrzebuje wolne CI. Każda rezygnacja
+zostawia wiersz runu ze statusem `failed`, który operator widzi i może ponowić.
 
-**A real dispatch gate.** Before any worktree or agent exists, SWARM confirms an
-*eligible* worker may take the phase: active enrollment, the owner's sharing
-consent, a live connection, free capacity, the phase, the configured CLI, and
-that the host's checkout is actually the right repository. Assigned work runs on
-its assignee's own machine and nobody else's. One rule for every deployment — a
-single-user install enrolls its one local worker exactly like anyone else.
+**Prawdziwa bramka dispatchu.** Zanim powstanie jakikolwiek worktree czy agent,
+SWARM sprawdza, czy fazę może przyjąć *uprawniony* worker: aktywna rejestracja w
+projekcie, zgoda właściciela na udostępnianie, żywe połączenie, wolna pojemność,
+obsługiwana faza, skonfigurowane CLI oraz to, że checkout na hoście jest
+właściwym repozytorium. Przypisana praca działa na maszynie osoby przypisanej i
+na żadnej innej. Jedna reguła dla każdego wdrożenia: instalacja jednoosobowa
+rejestruje swojego jedynego lokalnego workera dokładnie tak samo jak każdy inny.
 
-**Operated from a dashboard**, not a log file: run history and per-run detail
-with failure diagnosis, a **Stalled** section naming the work items that have
-stopped moving, project and board mapping, per-provider credential entry, worker
-registration and approval, and each of your own workers' live CLI quota.
+**Obsługa z dashboardu**, a nie z pliku logów: historia runów i szczegóły
+każdego runu z diagnozą błędu, sekcja **Stalled** wskazująca zadania, które
+przestały się ruszać, mapowanie projektów i tablic, wprowadzanie poświadczeń
+per provider, rejestracja i zatwierdzanie workerów oraz bieżący limit CLI
+każdego z twoich workerów.
 
-## The six phases
+## Sześć faz
 
-| Phase | Starts when | The agent does | SWARM then does |
+| Faza | Startuje, gdy | Agent | SWARM potem |
 | --- | --- | --- | --- |
-| **Planning** | A card moves to *Planning* without already carrying `planned` | Reads the task in a read-only worktree and writes `proposed_plan.md` — and, when `verifyPlan` is on (off by default), a second independent agent fact-checks that plan against the repo first, correcting wrong paths, symbols and claims in place and noting on the plan that it was fact-checked | Posts the plan on the item; advances the card only if `autoAdvance` is on (off by default) |
-| **Implementation** | A card moves to *Ready* | Implements and verifies on a task branch, writes a structured hand-off | Validates, commits, pushes, opens/reuses the PR, links it on the card, moves it to *In review* |
-| **Review** | A SWARM-managed PR's checks pass (an opened PR waits for them; with no CI under `if-present` it is reviewed on opening), or a periodic check finds it ready and unreviewed | Reviews at the PR's head SHA and returns structured findings | Renders the review body itself, submits it under the reviewer identity, spends a ledger slot |
-| **Respond-to-review** | The reviewer requests changes | Addresses each point, writes a structured response | Commits/pushes the fix, posts the response, enqueues exactly one follow-up Review for the new head |
-| **Respond-to-CI** | A check fails on a task branch, and the failure isn't attributed to the PR's base branch already being red on the same check ([docs/pipeline.md](docs/pipeline.md#base-branch-health)) | Fixes the failure, or reports that it can't | Commits/pushes and explains on the PR, under a per-PR attempt cap, which records a durable give-up when it is spent. Reporting that it can't fix the build hands the PR back to Review rather than ending the line |
-| **Resolve conflicts** | A PR is confirmed conflicting with its base | Merges the current base and resolves | Commits and pushes; rechecks are coalesced, bounded, and deduplicated |
+| **Planning** | Karta trafia do *Planning* i nie ma jeszcze etykiety `planned` | Czyta zadanie w worktree tylko do odczytu i pisze `proposed_plan.md`. Gdy włączone jest `verifyPlan` (domyślnie wyłączone), drugi, niezależny agent najpierw sprawdza plan z repozytorium, poprawia na miejscu błędne ścieżki, symbole i twierdzenia i odnotowuje w planie, że został sprawdzony | Publikuje plan w zadaniu. Przesuwa kartę dalej tylko przy włączonym `autoAdvance` (domyślnie wyłączone) |
+| **Implementation** | Karta trafia do *Ready* | Implementuje i weryfikuje na gałęzi zadania, pisze ustrukturyzowany hand-off | Waliduje, commituje, pushuje, otwiera albo ponownie używa PR, linkuje go na karcie i przesuwa ją do *In review* |
+| **Review** | Przechodzą checki PR zarządzanego przez SWARM (otwarty PR na nie czeka, a bez CI przy `if-present` jest recenzowany od razu po otwarciu) albo okresowe sprawdzenie znajdzie PR gotowy i bez review | Recenzuje na SHA heada PR i zwraca ustrukturyzowane uwagi | Sam składa treść review, wysyła ją jako reviewer i zużywa miejsce w rejestrze werdyktów |
+| **Respond-to-review** | Reviewer prosi o zmiany | Odnosi się do każdego punktu, pisze ustrukturyzowaną odpowiedź | Commituje i pushuje poprawkę, publikuje odpowiedź, kolejkuje dokładnie jedno kolejne Review dla nowego heada |
+| **Respond-to-CI** | Na gałęzi zadania pada check, a błąd nie wynika z tego, że ten sam check jest już czerwony na gałęzi bazowej PR ([docs/pipeline.md](docs/pipeline.md#base-branch-health)) | Naprawia błąd albo zgłasza, że nie potrafi | Commituje, pushuje i wyjaśnia na PR, z limitem prób na PR; po jego wyczerpaniu zapisuje trwałą rezygnację. Zgłoszenie, że builda nie da się naprawić, oddaje PR z powrotem do Review zamiast kończyć sprawę |
+| **Resolve conflicts** | Potwierdzono konflikt PR z gałęzią bazową | Merguje aktualną bazę i rozwiązuje konflikty | Commituje i pushuje. Ponowne sprawdzenia są scalane, ograniczone i deduplikowane |
 
-All six run on any worker, over the same transport — which machine a worker
-happens to be is not a factor. One deliberate exception: a phase *continuing*
-work already on disk — a preserved checkout, which is machine-local and has no
-server-side copy — is offered only to the worker that holds it, rather than
-being silently started over somewhere else.
+Wszystkie sześć faz działa na dowolnym workerze i przez ten sam transport. To,
+którą maszyną jest dany worker, nie ma znaczenia. Jest jeden celowy wyjątek:
+faza, która *kontynuuje* pracę już leżącą na dysku (zachowany checkout jest
+lokalny dla maszyny i nie ma kopii na serwerze), trafia tylko do workera, który
+go trzyma, zamiast po cichu zaczynać od nowa gdzie indziej.
 
-## What it plugs into
+## Z czym współpracuje
 
-| Axis | Supported today |
+| Oś | Obsługiwane dziś |
 | --- | --- |
-| **Source control** | GitHub · Bitbucket Cloud · gitlab.com · Azure DevOps Services |
-| **Project boards** | GitHub Projects v2 · Linear · Jira Cloud · Trello |
-| **Agent CLIs** | `claude` (Claude Code) · `agy` (Antigravity) · `codex` |
-| **Runtime** | Node 22+ · Postgres · Redis · Docker Compose |
+| **Kontrola wersji** | GitHub · Bitbucket Cloud · gitlab.com · Azure DevOps Services |
+| **Tablice projektów** | GitHub Projects v2 · Linear · Jira Cloud · Trello |
+| **CLI agentów** | `claude` (Claude Code) · `agy` (Antigravity) · `codex` |
+| **Środowisko** | Node 22+ · Postgres · Redis · Docker Compose |
 
-Each project names its own source-control provider and its own board, so one
-installation can run a GitHub/Jira project next to a GitLab/Linear one.
+Każdy projekt wskazuje własnego providera kontroli wersji i własną tablicę, więc
+jedna instalacja może obsługiwać projekt GitHub/Jira obok projektu
+GitLab/Linear.
 
-## Built with
+## Na czym zbudowany
 
 TypeScript (strict, ESM) · Hono · tRPC · Drizzle + Postgres · BullMQ + Redis ·
-Zod as the source of truth for every schema · React + TanStack Router + Vite
-for the dashboard · Vitest · Biome · Lefthook.
+Zod jako źródło prawdy dla każdego schematu · React + TanStack Router + Vite w
+dashboardzie · Vitest · Biome · Lefthook.
 
-Roughly 74k lines of application code and 34k of dashboard, against 88k lines of
-tests — about 5,000 test cases across 258 files, all of which run in
-`npm run verify` (lint + typecheck + tests) locally and on every pull request.
+Około 74 tys. linii kodu aplikacji i 34 tys. dashboardu wobec 88 tys. linii
+testów: mniej więcej 5000 przypadków testowych w 258 plikach. Wszystkie
+uruchamia `npm run verify` (lint + typecheck + testy), lokalnie i przy każdym
+pull requeście.
 
-## Design decisions worth reading
+## Decyzje projektowe warte przeczytania
 
-The interesting parts are written down as ADRs rather than left in the code:
+Najciekawsze rzeczy są spisane jako ADR, a nie zostawione w kodzie:
 
-- [ADR-002](./docs/decisions/ADR-002-durable-dispatch-state-machine.md) — one durable dispatch state machine for orchestration *(accepted)*
-- [ADR-003](./docs/decisions/ADR-003-worker-transport-and-split-delivery.md) / [ADR-004](./docs/decisions/ADR-004-worker-transport-and-split-delivery.md) — worker↔control-plane transport and split delivery: why the worker gets a WebSocket and an assignment instead of a database URL *(accepted)*
-- [ADR-006](./docs/decisions/ADR-006-unconditional-worker-updates.md) — a worker updates when the installation asks it to: why the per-host self-update opt-in was removed *(accepted)*
-- [ADR-001](./docs/decisions/ADR-001-federated-workers-and-project-access.md) — federated workers and project access *(proposed)*
-- [ADR-005](./docs/decisions/ADR-005-dashboard-chat-with-worker-agent-clis.md) — dashboard chat with a worker's agent CLIs *(under discussion)*
+- [ADR-002](./docs/decisions/ADR-002-durable-dispatch-state-machine.md): jedna trwała maszyna stanów dispatchu do orkiestracji *(przyjęty)*
+- [ADR-003](./docs/decisions/ADR-003-worker-transport-and-split-delivery.md) / [ADR-004](./docs/decisions/ADR-004-worker-transport-and-split-delivery.md): transport worker↔control plane i dzielone dostarczanie, czyli dlaczego worker dostaje WebSocket i przydział zadania zamiast adresu bazy danych *(przyjęty)*
+- [ADR-006](./docs/decisions/ADR-006-unconditional-worker-updates.md): worker aktualizuje się, gdy instalacja go o to poprosi, czyli dlaczego usunięto opcjonalną samoaktualizację per host *(przyjęty)*
 
-[`ai/ARCHITECTURE.md`](./ai/ARCHITECTURE.md) is the architecture as actually
-built; [`docs/pipeline.md`](./docs/pipeline.md) covers phase lifecycle, the
-security model, and the provider boundaries.
+[`ai/ARCHITECTURE.md`](./ai/ARCHITECTURE.md) opisuje architekturę taką, jaka
+faktycznie jest zbudowana, a [`docs/pipeline.md`](./docs/pipeline.md) cykl życia
+faz, model bezpieczeństwa i granice providerów.
 
 ---
 
-## Quick start
+## Szybki start
 
-From the repository root:
+Z katalogu głównego repozytorium:
 
 ```bash
 npm install
-cp .env.docker.example .env       # set passwords
+cp .env.docker.example .env       # ustaw hasła
 cd dashboard && npm install && cd ..
-docker compose up -d --build      # Postgres, Redis, and router
+docker compose up -d --build      # Postgres, Redis i router
 npm run db:migrate
-npm run db:seed                   # loads swarm.config.json into Postgres
+npm run db:seed                   # wczytuje swarm.config.json do Postgresa
 ```
 
-Register this machine as a worker. Every deployment does — a phase runs on an
-enrolled worker or it waits:
+Zarejestruj tę maszynę jako workera. Robi to każde wdrożenie: faza albo działa
+na zarejestrowanym workerze, albo czeka.
 
 ```bash
 npm run swarm -- login --identifier localhost-admin
@@ -180,53 +186,106 @@ npm run swarm -- workers register-and-enroll localhost-admin <project-id> \
   --name "this machine" --cli claude --control-plane-url http://localhost:3100
 ```
 
-`--control-plane-url` is the router base URL this machine's worker talks to —
-loopback here, the tunnel URL on a remote machine. The command writes it into
-`.env` when that file does not already name one, so nothing has to be edited by
-hand; pass it only on a machine that has not been pointed at an installation yet.
+`--control-plane-url` to bazowy adres routera, z którym rozmawia worker tej
+maszyny: tu loopback, a na zdalnej maszynie adres tunelu. Komenda zapisuje go w
+`.env`, jeśli ten plik jeszcze go nie zawiera, więc nic nie trzeba edytować
+ręcznie. Podawaj go tylko na maszynie, która nie została jeszcze skierowana na
+żadną instalację.
 
-Then start the processes and open <http://localhost:5173>:
-
-```bash
-npm run dev:api                   # API on 127.0.0.1:3101
-npm run dev:dashboard             # dashboard on localhost:5173
-npm run dev:worker                # the worker
-```
-
-The worker holds that terminal for as long as the machine is meant to accept
-work. **On macOS** it can run from a launchd agent instead, started at login —
-from the checkout it was registered for:
+Potem uruchom procesy i otwórz <http://localhost:5173>:
 
 ```bash
-swarm-worker-agent install        # then: status · logs · update · uninstall
+npm run dev:api                   # API na 127.0.0.1:3101
+npm run dev:dashboard             # dashboard na localhost:5173
+npm run dev:worker                # worker
 ```
 
-A local install is single-user by default: no account to create, no password, no
-`/login`. The prerequisites, the multi-user alternative, and the full worker
-runbook are in [`docs/MANUAL.md`](docs/MANUAL.md).
+Worker zajmuje ten terminal tak długo, jak maszyna ma przyjmować pracę. **Na
+macOS** może zamiast tego działać jako agent launchd uruchamiany przy
+logowaniu. Uruchom to z checkoutu, dla którego worker został zarejestrowany:
 
-## Documentation
+```bash
+swarm-worker-agent install        # potem: status · logs · update · uninstall
+```
 
-Everything else — prerequisites, how the worker works and what it deliberately
-does not hold, the command reference, the configuration layers, and the map of
-every other document — is in [`docs/MANUAL.md`](docs/MANUAL.md).
+Lokalna instalacja jest domyślnie jednoosobowa: bez zakładania konta, bez hasła
+i bez `/login`. Wymagania wstępne, wariant wieloosobowy i pełny poradnik workera
+są w [`docs/MANUAL.md`](docs/MANUAL.md).
 
-## Project status
+### Co robi `install`
 
-Early but working — and dogfooded: all six phases run end to end against this
-repository, so issues on the live board are planned, implemented, reviewed, and
-merged by SWARM itself. Over 300 of the commits here were authored by its own
-implementer persona and approved by its own reviewer persona.
+`swarm-worker-agent install [<checkout>]` zamienia checkout, dla którego worker
+jest już zarejestrowany, w LaunchAgent uruchamiany przy logowaniu i
+restartowany, gdy padnie. Kolejno:
 
-[`docs/status.md`](./docs/status.md) is the honest, area-by-area snapshot —
-including what is unit-verified but not yet driven against a live provider.
+1. **Ustala checkout.** `<checkout>` (domyślnie bieżący katalog) jest
+   rozwiązywany do ścieżki rzeczywistej. Z niej wynika wszystko inne: sha256,
+   które jest kluczem cache'u poświadczeń i blokady checkoutu, oraz etykieta
+   agenta `pl.smarttechbrewery.swarm.worker.<basename>.<hash8>`.
+2. **Sprawdza warunki wstępne** i odmawia z komunikatem, gdy któryś nie jest
+   spełniony:
+   - katalog jest checkoutem gita (istnieje `.git`);
+   - jest dla niego zarejestrowany worker, czyli istnieje
+     `~/.swarm/worker-credentials/<hash>/credential.json`. Bez tego agent
+     padałby przy każdym starcie, a launchd restartowałby go w nieskończoność,
+     więc najpierw zarejestruj workera (`swarm workers setup` albo
+     `register-and-enroll`);
+   - `node` i `swarm` są w `PATH`. Ich bezwzględne ścieżki trafiają do plisty,
+     więc agent dalej uruchamia binarki aktualne w chwili instalacji.
+3. **Odmawia, jeśli checkout trzyma już inny worker.** Czyta blokadę checkoutu
+   daemona (`~/.swarm/checkout-locks/<hash>/owner.json`) i odmawia, gdy zapisany
+   pid należy do działającego daemona workera, podając jego nazwę. Nie odmawia
+   w dwóch przypadkach:
+   - blokada jest nieaktualna: procesu o tym pid już nie ma albo jej
+     `refreshedAt` jest starsze niż 15 minut;
+   - blokadę trzyma działający agent tego samego checkoutu, który i tak zostanie
+     zastąpiony w kroku 5.
+4. **Zapisuje plistę** do `~/Library/LaunchAgents/<label>.plist` i waliduje ją
+   przez `plutil -lint`. Agent:
+   - uruchamia `node <swarm> run:worker` z checkoutem jako `WorkingDirectory`.
+     W ten sposób daemon znajduje swoje zapisane poświadczenie. Do plisty nie
+     trafia żaden sekret;
+   - dostaje `PATH` złożony z katalogów, w których znaleziono `node`, `npm`,
+     `git`, `gh`, `claude`, `codex` i `agy`, oraz ze standardowych katalogów
+     systemowych. Bez tego daemon widziałby minimalny `PATH` launchd, w którym
+     nie ma CLI agentów;
+   - ma ustawione `RunAtLoad` i `KeepAlive`, z 30-sekundowym
+     `ThrottleInterval` między restartami;
+   - loguje do `~/Library/Logs/<label>.log` i `<label>.error.log`.
+5. **(Re)startuje agenta.** Usuwa istniejące zadanie o tej etykiecie
+   (`launchctl bootout`) i ładuje nową plistę do domeny GUI użytkownika
+   (`launchctl bootstrap gui/<uid>`), więc worker startuje od razu. Wypisuje
+   etykietę, checkout i ścieżkę do logu.
 
-## Contributing
+Ponowne uruchomienie `install` przy działającym agencie jest bezpieczne i jest
+zwykłym sposobem na wczytanie zmian w pliście: przeniesionego `node`, nowo
+zainstalowanego CLI agenta albo nowych dodatkowych checkoutów po
+`add-checkout`.
 
-Read [`ai/RULES.md`](./ai/RULES.md) before making changes. Run
-`npm run verify` before submitting a change. GitHub Actions runs the same
-verification command for every pull request.
+## Dokumentacja
 
-## License
+Wszystko inne jest w [`docs/MANUAL.md`](docs/MANUAL.md): wymagania wstępne, jak
+działa worker i czego celowo nie przechowuje, opis komend, warstwy konfiguracji
+oraz mapa wszystkich pozostałych dokumentów.
 
-SWARM is licensed under the [Apache License 2.0](./LICENSE).
+## Stan projektu
+
+Wczesny, ale działający, i używany do budowy samego siebie: wszystkie sześć faz
+działa od początku do końca na tym repozytorium, więc zadania z tablicy są
+planowane, implementowane, recenzowane i mergowane przez sam SWARM. Ponad 300
+commitów w tym repozytorium napisała jego własna persona implementera, a
+zatwierdziła jego własna persona reviewera.
+
+[`docs/status.md`](./docs/status.md) to rzetelny przegląd stanu obszar po
+obszarze, łącznie z tym, co jest zweryfikowane testami jednostkowymi, ale nie
+było jeszcze uruchamiane na żywym providerze.
+
+## Współtworzenie
+
+Przed wprowadzeniem zmian przeczytaj [`ai/RULES.md`](./ai/RULES.md). Przed
+zgłoszeniem zmiany uruchom `npm run verify`. GitHub Actions uruchamia tę samą
+weryfikację dla każdego pull requesta.
+
+## Licencja
+
+SWARM jest udostępniany na [licencji Apache 2.0](./LICENSE).
