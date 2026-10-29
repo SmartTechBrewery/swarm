@@ -57,6 +57,8 @@ export const WORKER_SAFE_KEYS = [
  * like `pipeline`: the merge decision is made by the control plane's consumer, never
  * on a worker. `reviewChecks` / `reviewChecksWaitMinutes` (issue #1109) are Review
  * dispatch policy, decided control-plane side like the `pipeline` block they left.
+ * `wipLimit` (issue #1185) is admission policy: whether a ticket may start is decided
+ * by the control plane's consumer before any worker is chosen.
  */
 export const SERVER_ONLY_KEYS = [
 	'credentials',
@@ -66,6 +68,7 @@ export const SERVER_ONLY_KEYS = [
 	'autoMerge',
 	'reviewChecks',
 	'reviewChecksWaitMinutes',
+	'wipLimit',
 	'pipeline',
 	'visibility',
 	'maxConcurrentJobs',

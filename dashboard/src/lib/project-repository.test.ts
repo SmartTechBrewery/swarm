@@ -61,6 +61,7 @@ describe('toRepositoryForms', () => {
 				autoMerge: false,
 				reviewChecks: 'required',
 				reviewChecksWaitMinutes: '',
+				wipLimit: '',
 			},
 			{
 				id: '2',
@@ -70,6 +71,7 @@ describe('toRepositoryForms', () => {
 				autoMerge: false,
 				reviewChecks: 'required',
 				reviewChecksWaitMinutes: '',
+				wipLimit: '',
 			},
 		]);
 	});
@@ -87,6 +89,7 @@ describe('toRepositoryForms', () => {
 				autoMerge: false,
 				reviewChecks: 'required',
 				reviewChecksWaitMinutes: '',
+				wipLimit: '',
 			},
 		]);
 	});
@@ -102,6 +105,7 @@ describe('toRepositoryForms', () => {
 			autoMerge: false,
 			reviewChecks: 'required',
 			reviewChecksWaitMinutes: '',
+			wipLimit: '',
 		};
 		expect(toRepositoryForms(undefined)).toEqual([blank]);
 		expect(toRepositoryForms([])).toEqual([blank]);
@@ -120,6 +124,7 @@ describe('toRepositoryEntries', () => {
 					autoMerge: false,
 					reviewChecks: 'required',
 					reviewChecksWaitMinutes: '',
+					wipLimit: '',
 				},
 				{
 					id: '2',
@@ -129,6 +134,7 @@ describe('toRepositoryEntries', () => {
 					autoMerge: false,
 					reviewChecks: 'required',
 					reviewChecksWaitMinutes: '',
+					wipLimit: '',
 				},
 			]),
 		).toEqual([
@@ -181,6 +187,16 @@ describe('toRepositoryEntries', () => {
 		expect(blank && 'reviewChecksWaitMinutes' in blank).toBe(false);
 	});
 
+	// Issue #1185: the WIP limit round-trips per row, so saving the list cannot erase a
+	// limit set in `swarm.config.json`; a blank one is omitted so the default (1) applies.
+	it('carries each row’s WIP limit through, omitting a blank one', () => {
+		const rows = toRepositoryForms([{ repo: 'acme/first', wipLimit: 3 }, { repo: 'acme/second' }]);
+		expect(rows.map((row) => row.wipLimit)).toEqual(['3', '']);
+		const entries = toRepositoryEntries(patchRepository(rows, 0, { wipLimit: ' 2 ' }));
+		expect(entries[0]).toMatchObject({ repo: 'acme/first', wipLimit: 2 });
+		expect(entries[1] && 'wipLimit' in entries[1]).toBe(false);
+	});
+
 	// A save states no provider per repository (issue #727), so a stored one is dropped
 	// here exactly as the server drops it — the two surfaces agree on the shape.
 	it('sends no `scm`, even for a row projected from a stored one', () => {
@@ -199,6 +215,7 @@ describe('toRepositoryEntries', () => {
 				autoMerge: false,
 				reviewChecks: 'required',
 				reviewChecksWaitMinutes: '',
+				wipLimit: '',
 			},
 		]);
 		expect(entry && 'id' in entry).toBe(false);
@@ -248,6 +265,7 @@ describe('repository list mutations', () => {
 			autoMerge: false,
 			reviewChecks: 'required',
 			reviewChecksWaitMinutes: '',
+			wipLimit: '',
 		},
 		{
 			id: '2',
@@ -257,6 +275,7 @@ describe('repository list mutations', () => {
 			autoMerge: false,
 			reviewChecks: 'required',
 			reviewChecksWaitMinutes: '',
+			wipLimit: '',
 		},
 	];
 
@@ -271,6 +290,7 @@ describe('repository list mutations', () => {
 				autoMerge: false,
 				reviewChecks: 'required',
 				reviewChecksWaitMinutes: '',
+				wipLimit: '',
 			},
 		]);
 	});
@@ -320,6 +340,7 @@ describe('duplicateRepositories', () => {
 			autoMerge: false,
 			reviewChecks: 'required',
 			reviewChecksWaitMinutes: '',
+			wipLimit: '',
 		};
 	}
 
@@ -380,6 +401,21 @@ describe('areRepositoriesDirty', () => {
 				stored,
 			),
 		).toBe(true);
+	});
+
+	it('reports a WIP limit change that changes nothing else (issue #1185)', () => {
+		expect(
+			areRepositoriesDirty(
+				patchRepository(toRepositoryForms(stored), 0, { wipLimit: '2' }),
+				stored,
+			),
+		).toBe(true);
+		expect(
+			areRepositoriesDirty(
+				patchRepository(toRepositoryForms(stored), 0, { wipLimit: ' ' }),
+				stored,
+			),
+		).toBe(false);
 	});
 
 	// Position is part of the value: the first entry is the project's default.

@@ -14,6 +14,7 @@ function row(overrides: Partial<RepositoryForm> = {}): RepositoryForm {
 		autoMerge: false,
 		reviewChecks: 'required',
 		reviewChecksWaitMinutes: '',
+		wipLimit: '',
 		...overrides,
 	};
 }
@@ -212,6 +213,24 @@ describe('RepositoryList', () => {
 		expect(onChange).toHaveBeenCalledWith(1, { reviewChecks: 'if-present' });
 		fireEvent.change(firstWait, { target: { value: '45' } });
 		expect(onChange).toHaveBeenCalledWith(0, { reviewChecksWaitMinutes: '45' });
+	});
+
+	// Issue #1185: the WIP limit is per repository, a positive whole number, blank = 1.
+	it('gives each row its own WIP limit input', () => {
+		const { onChange } = renderList({
+			repositories: [row({ id: '1' }), row({ id: '2', repo: 'acme/second', wipLimit: '3' })],
+		});
+
+		const first = screen.getByLabelText('WIP limit, entry 1') as HTMLInputElement;
+		const second = screen.getByLabelText('WIP limit, entry 2') as HTMLInputElement;
+		expect(first.value).toBe('');
+		expect(first.placeholder).toBe('1');
+		expect(first.min).toBe('1');
+		expect(first.step).toBe('1');
+		expect(second.value).toBe('3');
+
+		fireEvent.change(first, { target: { value: '2' } });
+		expect(onChange).toHaveBeenCalledWith(0, { wipLimit: '2' });
 	});
 
 	it('disables every control while a save is in flight', () => {

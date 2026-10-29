@@ -24,6 +24,7 @@
  * that dequeues for it stays a thin shell.
  */
 
+import { resolveWipLimit } from '../config/project-repository.js';
 import type { AgentDefaults, ProjectConfig } from '../config/schema.js';
 import { getAppSettings } from '../db/repositories/appSettingsRepository.js';
 import {
@@ -73,6 +74,7 @@ import {
 	storeRunLogs,
 	updateRunJobPayload,
 } from '../db/repositories/runsRepository.js';
+import { countWipSlots, type WipSlotHolder } from '../db/repositories/wipSlotsRepository.js';
 import { scheduleCiNoFixRecovery } from '../dispatch/ci-no-fix-recovery.js';
 import {
 	claimDispatchForJob,
@@ -93,6 +95,12 @@ import {
 	preservedContinuationKind,
 } from '../dispatch/preserved-worker.js';
 import { deriveCapacityPendingPayload, deriveRetryJobPayload } from '../dispatch/retry-payload.js';
+import {
+	admitTicket,
+	type BoardTriggerResult,
+	releaseTicketSlot,
+	wipLimitWaitReason,
+} from '../dispatch/wip-limit.js';
 import type {
 	AgentCli,
 	AgentCliResult,
@@ -1399,7 +1407,7 @@ async function deferBeforeRun(
 	job: SwarmJob,
 	trigger: TriggerResult,
 	project: ProjectConfig,
-	wait: { waitReason: DispatchWaitReason; reason: string },
+	wait: { waitReason: DispatchWaitReason; reason: string; repository?: string },
 ): Promise<{
 	outcome: Extract<JobOutcome, { status: 'phase-deferred' }>;
 	pending: DispatchRow | null;
@@ -1450,6 +1458,7 @@ async function deferBeforeRun(
 		waitReason: wait.waitReason,
 		continuation: deferred.pendingContinuation === true,
 		runId: deferred.runId,
+		repository: wait.repository,
 	});
 
 	// This pre-try/catch path must settle the visible run now. Neither pre-run wait
@@ -1486,6 +1495,61 @@ async function handleConcurrencyDeferral(
 		waitReason: 'project-capacity',
 		reason: `Project '${project.id}' is at its concurrent-job limit`,
 	});
+	return outcome;
+}
+
+/** Whether this is one of the two board-driven phases — the only ones the WIP limit gates. */
+function isBoardTrigger(trigger: TriggerResult): trigger is BoardTriggerResult {
+	return trigger.phase === 'planning' || trigger.phase === 'implementation';
+}
+
+/**
+ * Handle a new ticket's start refused by its repository's WIP limit (issue #1185) —
+ * the twin of {@link handleConcurrencyDeferral}: an event-woken `wip-limit` pending
+ * wait with a visible run row naming the tickets in flight, and the repository
+ * recorded on the dispatch so a released slot can find it (`promoteWipWaits`).
+ *
+ * The re-check closes the window the refusal leaves open, as
+ * {@link handleTaskInFlightDeferral}'s does: a holder can be released — and promote —
+ * between the refusal and this row becoming `pending`, which that promotion cannot
+ * see. So the free-slot question is asked again once the wait is durable, and a free
+ * slot publishes our own wake-up. The reconciler's sweep stays underneath either way.
+ */
+async function handleWipLimitDeferral(
+	dispatch: DispatchRow,
+	job: SwarmJob,
+	trigger: TriggerResult,
+	project: ProjectConfig,
+	holders: readonly WipSlotHolder[],
+): Promise<JobOutcome> {
+	const limit = resolveWipLimit(project);
+	logger.info(`Phase deferred - ${phaseLabel(trigger.phase)} — repository at its WIP limit`, {
+		projectId: project.id,
+		repository: project.repo,
+		phase: trigger.phase,
+		taskId: trigger.taskId,
+		limit,
+		inFlight: holders.map((holder) => holder.taskId),
+	});
+	const { outcome, pending } = await deferBeforeRun(dispatch, job, trigger, project, {
+		waitReason: 'wip-limit',
+		reason: wipLimitWaitReason(project.repo, limit, holders),
+		repository: project.repo,
+	});
+	if (pending) {
+		try {
+			if ((await countWipSlots(project.id, project.repo)) < limit) {
+				await publishDispatchWakeUp(pending);
+			}
+		} catch (err) {
+			logger.warn('Could not re-check a wip-limit wait after deferring it', {
+				projectId: project.id,
+				dispatchId: dispatch.id,
+				taskId: trigger.taskId,
+				error: describeError(err),
+			});
+		}
+	}
 	return outcome;
 }
 
@@ -5523,9 +5587,9 @@ export async function processJob(
 	// dispatch — a fresh webhook, a delayed retry, a self-enqueued next phase, a
 	// capacity promotion, a reconciler republish, a manual "Retry now" — so removing
 	// the label stops all later dispatches (it never terminates a run already in
-	// flight). It runs before the in-flight guard and `acquireProjectSlot`, so a skip
-	// costs no slot, no worktree, and no tokens. This is also where #339's
-	// worker-eligibility check belongs: a dispatch is eligible only when the worker is
+	// flight). It runs before the repository's WIP limit, the in-flight guard and
+	// `acquireProjectSlot`, so a skip costs no slot, no worktree, and no tokens. This
+	// is also where #339's worker-eligibility check belongs: a dispatch is eligible only when the worker is
 	// authorized *and* the item is opted in. Every phase is gated: the board-driven
 	// ones carry their work item on the trigger, and the four SCM continuation phases
 	// resolve theirs from the pull request ({@link resolveGatedWorkItem}).
@@ -5559,6 +5623,25 @@ export async function processJob(
 	if (requireAssignee && gatedItem) {
 		const reason = await unmetAssigneeRequirement(project, trigger, gatedItem);
 		if (reason) return skipIneligibleDispatch(job, dispatch, project, trigger, reason);
+	}
+
+	// Repository WIP limit (issue #1185): a **new ticket's start** — Planning, or
+	// Implementation of a ticket that never ran Planning — takes one of its
+	// repository's `wipLimit` slots, or waits as `wip-limit` until one frees. A ticket
+	// already holding a slot is admitted at once, and no pull request-driven phase
+	// asks at all, so an in-flight ticket can always get the job that finishes it.
+	// After the two work-item gates, so a skipped item costs no slot; before
+	// `claimTaskForPhase`, whose task claim only the `finally` below releases, so a
+	// deferral here leaks nothing. A late result adopted for this very phase already
+	// ran — it asks nothing, as it asks the worker gate nothing.
+	if (
+		isBoardTrigger(trigger) &&
+		!(job.adoptedResult && adoptedResultMatchesTrigger(job.adoptedResult, trigger))
+	) {
+		const admission = await admitTicket(project, trigger, dispatch.id);
+		if (!admission.admitted) {
+			return handleWipLimitDeferral(dispatch, job, trigger, project, admission.holders);
+		}
 	}
 
 	// Nothing may be dispatched into a task another phase is executing against: the
@@ -5919,6 +6002,13 @@ export async function processJob(
 		try {
 			if (outcome.status === 'phase-deferred') {
 				await settleDispatchRetry(dispatch, job, outcome);
+				// A start blocked on an unfinished prerequisite has not really started
+				// (issue #1185): holding its slot would keep that prerequisite — which
+				// may be the next ticket waiting for one — from ever starting. The
+				// re-check re-admits it like any new start.
+				if (outcome.dependencyRecheck && isBoardTrigger(trigger)) {
+					await releaseTicketSlot(project.id, project.repo, trigger.taskId, 'dependency-wait');
+				}
 			} else if (outcome.status === 'phase-failed') {
 				if (outcome.cancelled) {
 					await cancelClaimedDispatch(dispatch.id, RUN_CANCELLED_MESSAGE);

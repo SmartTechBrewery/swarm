@@ -20,7 +20,12 @@
  * `schema.ts`, which stays Zod-only.
  */
 
-import type { ProjectConfig, ProjectRecord, ProjectRepository } from './schema.js';
+import {
+	PROJECT_DEFAULTS,
+	type ProjectConfig,
+	type ProjectRecord,
+	type ProjectRepository,
+} from './schema.js';
 
 /**
  * The project's default repository — its **first** entry.
@@ -81,8 +86,8 @@ export function requireProjectRepository(record: ProjectRecord, repo: string): P
  * explicit `undefined` — the same care `rowToProjectConfig` takes for a `NULL`
  * `scm_type` (`src/db/repositories/projectsRepository.ts`), since "states no provider"
  * is a distinct case the registry lookup reports on. The entry's `autoMerge` (issue
- * #1066) and its `reviewChecks` / `reviewChecksWaitMinutes` (issue #1109) are kept
- * absent the same way when the entry states none.
+ * #1066), its `reviewChecks` / `reviewChecksWaitMinutes` (issue #1109) and its
+ * `wipLimit` (issue #1185) are kept absent the same way when the entry states none.
  */
 export function scopeProjectToRepository(record: ProjectRecord, repo?: string): ProjectConfig {
 	const { repositories: _repositories, scm, ...shared } = record;
@@ -98,6 +103,16 @@ export function scopeProjectToRepository(record: ProjectRecord, repo?: string): 
 		...(entry.reviewChecksWaitMinutes !== undefined
 			? { reviewChecksWaitMinutes: entry.reviewChecksWaitMinutes }
 			: {}),
+		...(entry.wipLimit !== undefined ? { wipLimit: entry.wipLimit } : {}),
 		...(scm ? { scm } : {}),
 	};
+}
+
+/**
+ * The repository's WIP limit (issue #1185) — its own `wipLimit`, or
+ * `PROJECT_DEFAULTS.wipLimit` when it states none. Takes the entry or the scoped
+ * config alike, since both carry the key at the top level.
+ */
+export function resolveWipLimit(entry: { wipLimit?: number }): number {
+	return entry.wipLimit ?? PROJECT_DEFAULTS.wipLimit;
 }

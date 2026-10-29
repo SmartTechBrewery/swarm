@@ -481,6 +481,26 @@ describe('ProjectRecordSchema', () => {
 		});
 	});
 
+	// Issue #1185: the WIP limit is per repository, optional, and a positive integer.
+	describe('WIP limit (issue #1185)', () => {
+		it('is optional, and kept absent when unstated', () => {
+			const record = ProjectRecordSchema.parse({
+				...shared,
+				repositories: [{ repo: 'acme/one' }, { repo: 'acme/two', wipLimit: 3 }],
+			});
+			expect(record.repositories.map((entry) => entry.wipLimit)).toEqual([undefined, 3]);
+		});
+
+		it.each([0, -1, 1.5])('rejects a WIP limit of %d', (wipLimit) => {
+			expect(
+				ProjectRecordSchema.safeParse({
+					...shared,
+					repositories: [{ repo: 'acme/one', wipLimit }],
+				}).success,
+			).toBe(false);
+		});
+	});
+
 	// The record carries the same cross-field credential checks the scoped config does —
 	// neither reads a repository, so both refine through the same two functions.
 	it('applies the same credential cross-field checks the scoped config does', () => {

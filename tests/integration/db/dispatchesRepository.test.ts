@@ -34,10 +34,12 @@ import {
 	listMergeChecksWaits,
 	listMergeQueueWaits,
 	listPullRequestInFlightWaits,
+	listRepositoriesWithWipWaits,
 	listRunnableDispatchesForPool,
 	listTaskInFlightWaits,
 	listWaitingDispatches,
 	listWakeablePendingDispatches,
+	listWipLimitWaits,
 	markDispatchRunning,
 	promoteDispatchToImmediateWake,
 	recordDispatchResolution,
@@ -879,6 +881,77 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 
 			const waits = await listTaskInFlightWaits(PROJECT_ID, TASK);
 			expect(waits.map((row) => row.id)).toEqual([wanted.id]);
+		});
+	});
+
+	describe('wip-limit waits (issue #1185)', () => {
+		async function wipWait(
+			taskId: string,
+			overrides: Partial<Parameters<typeof createDispatch>[0]> = {},
+		): Promise<string> {
+			const { dispatch } = await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: job(),
+				source: 'webhook',
+				taskId,
+				phase: 'planning',
+				...overrides,
+			});
+			return dispatch.id;
+		}
+
+		async function defer(id: string, repository = REPO): Promise<DispatchRow | null> {
+			await claimDispatch(id, OWNER, 60_000);
+			return deferDispatchToPending(id, {
+				jobPayload: job(),
+				waitReason: 'wip-limit',
+				repository,
+			});
+		}
+
+		it('records the repository on the deferred row and keeps it out of the timed republish', async () => {
+			const id = await wipWait('1');
+
+			const pending = await defer(id);
+
+			expect(pending).toMatchObject({
+				state: 'pending',
+				waitReason: 'wip-limit',
+				repository: REPO,
+			});
+			expect(await listWakeablePendingDispatches()).toHaveLength(0);
+		});
+
+		it('lists one repository’s waiters by priority, then creation — a re-deferred older row stays first', async () => {
+			const older = await wipWait('1');
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			const newer = await wipWait('2');
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			const urgent = await wipWait('3', { priority: -1 });
+			// The older one loses a race and re-defers last, re-dating its availability.
+			await defer(newer);
+			await defer(urgent);
+			await defer(older);
+			const elsewhere = await wipWait('4');
+			await defer(elsewhere, 'jkwiecien/other-repo');
+
+			const waits = await listWipLimitWaits(PROJECT_ID, REPO);
+			expect(waits.map((row) => row.id)).toEqual([urgent, older, newer]);
+		});
+
+		it('names every (project, repository) holding a waiter, once each', async () => {
+			await defer(await wipWait('1'));
+			await defer(await wipWait('2'));
+			await defer(await wipWait('3'), 'jkwiecien/other-repo');
+
+			const repositories = await listRepositoriesWithWipWaits();
+			expect(repositories).toHaveLength(2);
+			expect(repositories).toEqual(
+				expect.arrayContaining([
+					{ projectId: PROJECT_ID, repository: REPO },
+					{ projectId: PROJECT_ID, repository: 'jkwiecien/other-repo' },
+				]),
+			);
 		});
 	});
 

@@ -61,6 +61,8 @@ export interface RepositoryEntry {
 	reviewChecks?: ReviewChecksPolicy;
 	/** Review's check wait for this repository, in minutes (issue #1109). Unset means 10. */
 	reviewChecksWaitMinutes?: number;
+	/** Tickets that may be in flight at once in this repository (issue #1185). Unset means 1. */
+	wipLimit?: number;
 }
 
 /**
@@ -87,6 +89,11 @@ export interface RepositoryForm {
 	 * server's default (10 minutes) applies and the entry is saved without the key.
 	 */
 	reviewChecksWaitMinutes: string;
+	/**
+	 * The repository's WIP limit (issue #1185), as typed. `''` states none, so the
+	 * server's default (1 ticket) applies and the entry is saved without the key.
+	 */
+	wipLimit: string;
 	/**
 	 * Carried opaquely, never rendered (issue #686). It rides on the row rather than
 	 * being looked up at save time because a save sends the whole list positionally,
@@ -126,6 +133,7 @@ const NEW_REPOSITORY = {
 	autoMerge: false,
 	reviewChecks: DEFAULT_REVIEW_CHECKS_POLICY,
 	reviewChecksWaitMinutes: '',
+	wipLimit: '',
 } as const;
 
 /** A row id no row in `rows` already uses, so keys stay unique across adds and removes. */
@@ -149,6 +157,7 @@ export function toRepositoryForms(repositories: RepositoryEntry[] | undefined): 
 		autoMerge: entry.autoMerge === true,
 		reviewChecks: entry.reviewChecks ?? DEFAULT_REVIEW_CHECKS_POLICY,
 		reviewChecksWaitMinutes: entry.reviewChecksWaitMinutes?.toString() ?? '',
+		wipLimit: entry.wipLimit?.toString() ?? '',
 		...(entry.pmRoutingToken ? { pmRoutingToken: entry.pmRoutingToken } : {}),
 	}));
 	return rows.length > 0 ? rows : [{ id: '1', ...NEW_REPOSITORY }];
@@ -165,12 +174,15 @@ export function toRepositoryForms(repositories: RepositoryEntry[] | undefined): 
  * here exactly as the server drops it on parse, so the two surfaces agree that a
  * repository states no provider of its own.
  *
- * The check policy is always written, explicit like `autoMerge`; a blank check wait is
- * omitted, so the entry keeps running on the server's default rather than a copy of it.
+ * The check policy is always written, explicit like `autoMerge`; a blank check wait or
+ * WIP limit is omitted, so the entry keeps running on the server's default rather than a
+ * copy of it. The WIP limit has to be carried at all for the reason `pmRoutingToken`
+ * does: a list saved without it would erase a limit set in `swarm.config.json`.
  */
 export function toRepositoryEntries(rows: RepositoryForm[]): RepositoryEntry[] {
 	return rows.map((row) => {
 		const wait = row.reviewChecksWaitMinutes.trim();
+		const wipLimit = row.wipLimit.trim();
 		return {
 			repo: row.repo,
 			baseBranch: row.baseBranch,
@@ -178,6 +190,7 @@ export function toRepositoryEntries(rows: RepositoryForm[]): RepositoryEntry[] {
 			autoMerge: row.autoMerge,
 			reviewChecks: row.reviewChecks,
 			...(wait ? { reviewChecksWaitMinutes: Number(wait) } : {}),
+			...(wipLimit ? { wipLimit: Number(wipLimit) } : {}),
 			...(row.pmRoutingToken ? { pmRoutingToken: row.pmRoutingToken } : {}),
 		};
 	});
@@ -266,7 +279,8 @@ export function areRepositoriesDirty(
 			row.branchPrefix !== other?.branchPrefix ||
 			row.autoMerge !== other?.autoMerge ||
 			row.reviewChecks !== other?.reviewChecks ||
-			row.reviewChecksWaitMinutes.trim() !== other?.reviewChecksWaitMinutes
+			row.reviewChecksWaitMinutes.trim() !== other?.reviewChecksWaitMinutes ||
+			row.wipLimit.trim() !== other?.wipLimit
 		);
 	});
 }

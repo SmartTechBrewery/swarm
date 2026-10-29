@@ -78,6 +78,7 @@ import {
 } from '../../dispatch/preserved-worker.js';
 import { dropCheckoutContinuation, reconstructRetryJob } from '../../dispatch/retry-payload.js';
 import { RunResetError, type RunResetRefusal, resetRun } from '../../dispatch/run-reset.js';
+import { releasePutBackTicketSlot } from '../../dispatch/wip-limit.js';
 import { AgentCliSchema } from '../../harness/agent-cli.js';
 import { ReasoningLevelSchema } from '../../harness/models.js';
 import { getWorker, getWorkers } from '../../identity/worker-service.js';
@@ -98,6 +99,7 @@ import {
 import {
 	normalizeStoredJobPayload,
 	type RecoveryMode,
+	repositoryForJob,
 	type SwarmJob,
 	SwarmJobSchema,
 } from '../../queue/jobs.js';
@@ -109,6 +111,7 @@ import {
 	type QueuedRun,
 	toQueuedRuns,
 } from '../../queue/queued-runs.js';
+import { repoSlugsMatch } from '../../scm/repo-slug.js';
 import type { SCMProvider } from '../../scm/types.js';
 import { reviewRecheckCoalesceKeys } from '../../triggers/review-recheck-keys.js';
 import type { TriggerPhase } from '../../triggers/types.js';
@@ -2081,6 +2084,9 @@ export const runsRouter = router({
 			}
 
 			let workItemNodeId: string | undefined;
+			// The card's own task reference, when this run's repository owns it — the
+			// WIP-slot key of a board dispatch that never resolved a task id (issue #1185).
+			let cardTaskRef: string | undefined;
 			const pmManifest = getPMProvider(project.pm.type);
 			if (!pmManifest) {
 				throw new TRPCError({
@@ -2110,6 +2116,10 @@ export const runsRouter = router({
 						code: 'PRECONDITION_FAILED',
 						message: `Work item status does not start a Planning or Implementation phase.`,
 					});
+				}
+				const repository = repositoryForJob(jobData) ?? project.repo;
+				if (workItem.taskRepository && repoSlugsMatch(workItem.taskRepository, repository)) {
+					cardTaskRef = workItem.taskRef;
 				}
 			} else if (jobData.type === 'scm') {
 				const prNumber = jobData.event.workItemId;
@@ -2171,6 +2181,14 @@ export const runsRouter = router({
 					message: `Dispatch cancelled, but moving the board card to backlog failed: ${error instanceof Error ? error.message : String(error)}`,
 				});
 			}
+
+			// The ticket left the pipeline, so it no longer counts against its
+			// repository's WIP limit (issue #1185). Explicit, because the card move above
+			// is SWARM's own and its board event never reaches `pm-status`.
+			await releasePutBackTicketSlot(project.id, jobData, {
+				dispatchTaskId: dispatch.taskId,
+				cardTaskRef,
+			});
 
 			return { success: true };
 		}),

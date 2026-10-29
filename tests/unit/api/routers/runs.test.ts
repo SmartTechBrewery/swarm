@@ -110,6 +110,12 @@ vi.mock('@/integrations/pm/registry.js', () => ({
 	getPMProvider: vi.fn(),
 }));
 
+// Put back's WIP-slot release (issue #1185) has its own coverage in
+// `tests/unit/dispatch/wip-limit-promotion.test.ts`; here only *whether* and *with what*.
+vi.mock('@/dispatch/wip-limit.js', () => ({
+	releasePutBackTicketSlot: vi.fn(),
+}));
+
 // The SCM registry the `stalled` procedure resolves a project's own pull-request
 // URL grammar through (`SCMProvider.pullRequestUrl`). Mocked at the registry
 // boundary rather than importing the integrations entrypoint, so these tests stay
@@ -225,6 +231,7 @@ import { ForceReReviewError, forceReReview } from '@/dispatch/force-re-review.js
 import { ITEM_ACTIVITY_LOOKBACK_MS, ITEM_STALL_AFTER_MS } from '@/dispatch/item-liveness.js';
 import { jobContinuesPreservedCheckout } from '@/dispatch/preserved-worker.js';
 import { RunResetError, resetRun } from '@/dispatch/run-reset.js';
+import { releasePutBackTicketSlot } from '@/dispatch/wip-limit.js';
 import type { ProjectMembership, ProjectRole } from '@/identity/membership.js';
 import { getMembership, listAccessibleProjectIds } from '@/identity/membership-service.js';
 import type { SwarmUser } from '@/identity/schema.js';
@@ -3631,6 +3638,68 @@ describe('runsRouter', () => {
 			expect(cancelDispatchAndWake).toHaveBeenCalledWith('dispatch-1', expect.any(String));
 			expect(getWorkItem).toHaveBeenCalledWith(jobData.event.itemId);
 			expect(moveWorkItem).toHaveBeenCalledWith(jobData.event.itemId, 'backlog');
+		});
+
+		// Issue #1185: the card move is SWARM's own, so its board event never reaches
+		// `pm-status` — Put back frees the ticket's WIP slot itself, after the move.
+		it('releases the ticket’s WIP slot once the card is back in backlog', async () => {
+			vi.mocked(releasePutBackTicketSlot).mockClear();
+			vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+			const jobData = createMockPmWebhookJob({ projectId: 'p1' });
+			const dispatch = makeDispatch({ state: 'pending', jobPayload: jobData, runId: null });
+			vi.mocked(getDispatchById).mockResolvedValue(dispatch);
+			vi.mocked(cancelDispatchAndWake).mockResolvedValue(dispatch);
+			const moveWorkItem = vi.fn().mockResolvedValue(undefined);
+			vi.mocked(getPMProvider).mockReturnValue({
+				createProvider: () => ({
+					getWorkItem: vi.fn().mockResolvedValue({
+						id: jobData.event.itemId,
+						statusId: '61e4505c',
+						statusKey: 'planning',
+						title: 'Card',
+						url: 'https://github.com/SmartTechBrewery/swarm/issues/7',
+						taskRef: '7',
+						taskRepository: 'SmartTechBrewery/swarm',
+					}),
+					moveWorkItem,
+				}),
+			} as never);
+
+			await caller.putBack({ jobId: 'dispatch-1', projectId: 'p1' });
+
+			expect(releasePutBackTicketSlot).toHaveBeenCalledExactlyOnceWith('p1', jobData, {
+				dispatchTaskId: dispatch.taskId,
+				cardTaskRef: '7',
+			});
+			expect(moveWorkItem.mock.invocationCallOrder[0]).toBeLessThan(
+				vi.mocked(releasePutBackTicketSlot).mock.invocationCallOrder[0] ?? 0,
+			);
+		});
+
+		it('releases no WIP slot when moving the card fails', async () => {
+			vi.mocked(releasePutBackTicketSlot).mockClear();
+			vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+			const jobData = createMockPmWebhookJob({ projectId: 'p1' });
+			const dispatch = makeDispatch({ state: 'pending', jobPayload: jobData, runId: null });
+			vi.mocked(getDispatchById).mockResolvedValue(dispatch);
+			vi.mocked(cancelDispatchAndWake).mockResolvedValue(dispatch);
+			vi.mocked(getPMProvider).mockReturnValue({
+				createProvider: () => ({
+					getWorkItem: vi.fn().mockResolvedValue({
+						id: jobData.event.itemId,
+						statusId: '61e4505c',
+						statusKey: 'planning',
+						title: 'Card',
+						url: 'https://github.com/SmartTechBrewery/swarm/issues/7',
+					}),
+					moveWorkItem: vi.fn().mockRejectedValue(new Error('board down')),
+				}),
+			} as never);
+
+			await expect(caller.putBack({ jobId: 'dispatch-1', projectId: 'p1' })).rejects.toThrow(
+				/moving the board card to backlog failed/,
+			);
+			expect(releasePutBackTicketSlot).not.toHaveBeenCalled();
 		});
 
 		it('cancels an scm dispatch and moves the card found by its url', async () => {

@@ -33,6 +33,7 @@
 import type { ProjectConfig } from '../../config/schema.js';
 import { retireSupersededBoardPhases } from '../../dispatch/board-phase-retirement.js';
 import { promoteDependencyWaits } from '../../dispatch/dispatcher.js';
+import { releaseTicketSlot } from '../../dispatch/wip-limit.js';
 import { requireProjectPMAdapter } from '../../integrations/pm/registry.js';
 import { logger } from '../../lib/logger.js';
 import { hasPlannedLabel, PLANNED_LABEL } from '../../pipeline/preplan.js';
@@ -198,6 +199,29 @@ async function wakeDependentsOfDoneItem(
 }
 
 /**
+ * Free the ticket's repository WIP slot when its card has just entered `done` or
+ * `backlog` (issue #1185): finished, or taken off the pipeline by a human. Same guards
+ * as {@link wakeDependentsOfDoneItem} — a resumed phase and an unchanged status are
+ * not a card arriving there — plus a task id, which is the slot's key, resolved
+ * against this run's own repository. Idempotent and fail-open, like the promotion.
+ */
+async function releaseSlotOfFinishedItem(
+	ctx: PmTriggerContext,
+	workItem: WorkItem,
+	taskId: string | undefined,
+	statusChanged: boolean,
+): Promise<void> {
+	if (ctx.resumePmPhase || !statusChanged || !taskId) return;
+	if (workItem.statusKey !== 'done' && workItem.statusKey !== 'backlog') return;
+	await releaseTicketSlot(
+		ctx.project.id,
+		ctx.project.repo,
+		taskId,
+		workItem.statusKey === 'done' ? 'board-done' : 'board-backlog',
+	);
+}
+
+/**
  * Build the PM status-change trigger handler.
  *
  * `matches` is a cheap synchronous shape gate (is this a state change on this
@@ -259,6 +283,7 @@ export function createPmStatusTrigger(): TriggerHandler {
 			await applyColumnToQueue(ctx, workItem, taskId, statusChanged, phase);
 			// `done` starts no phase, so this runs before the phase gate below.
 			await wakeDependentsOfDoneItem(ctx, workItem, statusChanged);
+			await releaseSlotOfFinishedItem(ctx, workItem, taskId, statusChanged);
 
 			if (!phase) {
 				// A valid board status that simply doesn't start a phase (backlog, todo,

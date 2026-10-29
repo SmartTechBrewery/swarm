@@ -14,6 +14,7 @@ const REPOSITORIES: RepositoryForm[] = [
 		autoMerge: false,
 		reviewChecks: 'required',
 		reviewChecksWaitMinutes: '',
+		wipLimit: '',
 	},
 	{
 		id: '2',
@@ -23,6 +24,7 @@ const REPOSITORIES: RepositoryForm[] = [
 		autoMerge: false,
 		reviewChecks: 'required',
 		reviewChecksWaitMinutes: '',
+		wipLimit: '',
 	},
 ];
 

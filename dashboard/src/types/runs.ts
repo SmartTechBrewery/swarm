@@ -169,6 +169,7 @@ export const queuedWaitReasonSchema = z.enum([
 	'task-in-flight',
 	'pr-in-flight',
 	'merge-queue',
+	'wip-limit',
 	'manual-retry',
 	'recovered',
 ]);

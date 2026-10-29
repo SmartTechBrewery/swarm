@@ -77,7 +77,9 @@ export const dispatches = pgTable(
 		 * Implementation behind a Planning dispatch it must not overtake, queued or
 		 * executing — issue #761), `pr-in-flight` (a branch-writing phase behind
 		 * another one executing against the same pull request's head branch — issue
-		 * #850), `manual-retry`, `recovered`. Null while leased/running and for
+		 * #850), `wip-limit` (a new ticket's start waiting for a free slot in its
+		 * repository's WIP limit — issue #1185), `manual-retry`, `recovered`. Null
+		 * while leased/running and for
 		 * terminal states.
 		 */
 		waitReason: text('wait_reason'),

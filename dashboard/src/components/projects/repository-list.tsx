@@ -52,8 +52,8 @@ interface RepositoryRowProps {
 /**
  * One repository in the project's list: its rank, the reorder/remove actions, and the
  * settings that are genuinely per-repository — merge automation among them since issue
- * #1066, and Review's check policy and check wait since issue #1109, each moved off the
- * Pipeline tab's project-wide control. Each field's accessible name carries the rank,
+ * #1066, Review's check policy and check wait since issue #1109, each moved off the
+ * Pipeline tab's project-wide control, and the WIP limit since issue #1185. Each field's accessible name carries the rank,
  * since a project can hold several identical-looking rows.
  *
  * The source-control provider is **not** among them (issue #727): it is the project's,
@@ -236,6 +236,28 @@ function RepositoryRow({
 						blank for 10 minutes.
 					</p>
 				</div>
+				<div>
+					<label htmlFor={`${idBase}-wip-limit`} className={LABEL_CLASS}>
+						WIP Limit
+					</label>
+					<input
+						type="number"
+						id={`${idBase}-wip-limit`}
+						aria-label={`WIP limit, entry ${rank}`}
+						value={entry.wipLimit}
+						onChange={(e) => onChange(index, { wipLimit: e.target.value })}
+						disabled={isPending}
+						min={1}
+						step={1}
+						placeholder="1"
+						className={FIELD_CLASS}
+					/>
+					<p className="text-xs text-zinc-400 mt-1">
+						How many tickets may be in flight at once in this repository, from Planning until their
+						pull request is merged or closed. A new ticket waits in the queue for a free slot. Leave
+						blank for 1.
+					</p>
+				</div>
 			</div>
 		</li>
 	);
@@ -291,12 +313,12 @@ export function RepositoryList({
 					Repositories
 				</h2>
 				<p className="text-xs text-zinc-400">
-					Every repository this project operates on, with the branch, merge and Review check
-					settings SWARM uses for each. Each piece of work runs against the repository it belongs to
-					— a board card against the repository that claims it — and none of them is a fallback for
-					the others: with several repositories, a card none of them claims is refused rather than
-					run against the first. All of them live on the provider selected above, using the
-					credentials configured with it.
+					Every repository this project operates on, with the branch, merge, Review check and WIP
+					limit settings SWARM uses for each. Each piece of work runs against the repository it
+					belongs to — a board card against the repository that claims it — and none of them is a
+					fallback for the others: with several repositories, a card none of them claims is refused
+					rather than run against the first. All of them live on the provider selected above, using
+					the credentials configured with it.
 				</p>
 			</div>
 

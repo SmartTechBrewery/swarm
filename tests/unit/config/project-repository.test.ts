@@ -4,6 +4,7 @@ import {
 	defaultProjectRepository,
 	findProjectRepository,
 	requireProjectRepository,
+	resolveWipLimit,
 	scopeProjectToRepository,
 } from '@/config/project-repository.js';
 import type { ProjectRecord } from '@/config/schema.js';
@@ -137,8 +138,33 @@ describe('project repository scoping (issue #684)', () => {
 			expect(Object.hasOwn(second, 'reviewChecksWaitMinutes')).toBe(false);
 		});
 
+		// Issue #1185: and so is the WIP limit.
+		it("carries the named entry's own WIP limit, absent when unstated", () => {
+			const withLimit: ProjectRecord = {
+				...twoRepositoryRecord(),
+				repositories: [
+					{ repo: 'acme/first', baseBranch: 'main', branchPrefix: 'issue-', wipLimit: 2 },
+					{ repo: 'acme/second', baseBranch: 'develop', branchPrefix: 'task-' },
+				],
+			};
+			expect(scopeProjectToRepository(withLimit, 'acme/first').wipLimit).toBe(2);
+			expect(Object.hasOwn(scopeProjectToRepository(withLimit, 'acme/second'), 'wipLimit')).toBe(
+				false,
+			);
+		});
+
 		it('throws rather than falling back when the repository is not the project’s', () => {
 			expect(() => scopeProjectToRepository(twoRepositoryRecord(), 'acme/third')).toThrow();
 		});
+	});
+});
+
+describe('resolveWipLimit (issue #1185)', () => {
+	it('reads the entry’s own limit', () => {
+		expect(resolveWipLimit({ wipLimit: 4 })).toBe(4);
+	});
+
+	it('defaults an entry stating none to 1', () => {
+		expect(resolveWipLimit({})).toBe(1);
 	});
 });

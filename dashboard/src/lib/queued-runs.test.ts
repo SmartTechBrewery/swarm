@@ -136,6 +136,13 @@ describe('queuedWaitReasonLabel', () => {
 		);
 	});
 
+	// Issue #1185: the wait is on the *repository's* WIP limit, not a project slot.
+	it('names the repository for a new ticket waiting on a WIP slot', () => {
+		expect(queuedWaitReasonLabel('wip-limit')).toBe(
+			'waiting for a free WIP slot in its repository',
+		);
+	});
+
 	// Issue #759: the wait is on the *task*, so the copy must not read as another
 	// worker/slot wait — nothing but the phase ahead of it settling ends it. Issue
 	// #761 made that phase possibly *queued* rather than running, so the copy says

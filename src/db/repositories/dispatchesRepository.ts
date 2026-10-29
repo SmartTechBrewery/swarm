@@ -266,6 +266,17 @@ export type DispatchWaitReason =
 	 * long it has held the queue.
 	 */
 	| 'merge-queue'
+	/**
+	 * A **new ticket's start refused by its repository's WIP limit** (issue #1185):
+	 * the repository already has `wipLimit` tickets in flight (`wip_slots`), so this
+	 * Planning — or Implementation of a ticket that never ran Planning — waits for one
+	 * of them to finish. An event-woken pre-run wait like `project-capacity`: it holds
+	 * no checkout, spends no attempt budget, and is woken by a slot being released
+	 * (`promoteWipWaits`, `../../dispatch/wip-limit.ts`) or by the reconciler, never
+	 * by the timed republish. The one board-driven wait that records `repository` on
+	 * the row, since promotion is keyed on it. Its run row's reason names the holders.
+	 */
+	| 'wip-limit'
 	| 'manual-retry'
 	| 'recovered';
 
@@ -1077,6 +1088,11 @@ export interface DeferDispatchToPendingInput {
 	waitReason: DispatchWaitReason;
 	continuation?: boolean;
 	runId?: string;
+	/**
+	 * The repository the wait is keyed on, written when given — a `wip-limit` wait
+	 * (issue #1185), whose board-driven dispatch would otherwise have none recorded.
+	 */
+	repository?: string;
 }
 
 /**
@@ -1103,6 +1119,7 @@ export async function deferDispatchToPending(
 			workerFencingToken: null,
 			...(input.continuation !== undefined ? { continuation: input.continuation } : {}),
 			...(input.runId !== undefined ? { runId: input.runId } : {}),
+			...(input.repository !== undefined ? { repository: input.repository } : {}),
 			updatedAt: now,
 		})
 		.where(and(eq(dispatches.id, id), inArray(dispatches.state, ['leased', 'running'])))
@@ -1505,8 +1522,9 @@ export async function findActivePlanningDispatchForTask(
  *   existing dedup and `skipped-duplicate` machinery already owns.
  *
  * `repository` is deliberately absent from the key: `recordDispatchResolution`
- * writes that column only from a pull request, so it is null for every
- * board-driven dispatch by construction. The key is `(project_id, task_id,
+ * writes that column only from a pull request, so it is null for a board-driven
+ * dispatch — bar a `wip-limit` wait, the one that records it (issue #1185), which
+ * a repository-free key matches all the same. The key is `(project_id, task_id,
  * phase, state)` — precisely the one the two task guards above already use.
  *
  * One indexed scan on `(project_id, state)`, the same read cost those guards
@@ -1854,6 +1872,43 @@ export async function listDependencyWaits(
 			),
 		)
 		.orderBy(asc(dispatches.priority), asc(dispatches.availableAt), asc(dispatches.createdAt));
+}
+
+/**
+ * The dispatches waiting on one repository's WIP limit (issue #1185), in the order a
+ * freed slot admits them: queue priority, then **creation** order. Not
+ * `availableAt`, which `deferDispatchToPending` re-dates on every re-defer — a
+ * waiter that lost a race for a slot would otherwise fall behind newer tickets.
+ */
+export async function listWipLimitWaits(
+	projectId: string,
+	repository: string,
+): Promise<DispatchRow[]> {
+	return getDb()
+		.select()
+		.from(dispatches)
+		.where(
+			and(
+				eq(dispatches.projectId, projectId),
+				eq(dispatches.repository, repository),
+				eq(dispatches.state, 'pending'),
+				eq(dispatches.waitReason, 'wip-limit'),
+			),
+		)
+		.orderBy(asc(dispatches.priority), asc(dispatches.createdAt), asc(dispatches.id));
+}
+
+/** Every `(project, repository)` holding a `wip-limit` wait — the reconciler's sweep. */
+export async function listRepositoriesWithWipWaits(): Promise<
+	{ projectId: string; repository: string }[]
+> {
+	const rows = await getDb()
+		.selectDistinct({ projectId: dispatches.projectId, repository: dispatches.repository })
+		.from(dispatches)
+		.where(and(eq(dispatches.state, 'pending'), eq(dispatches.waitReason, 'wip-limit')));
+	return rows.flatMap((row) =>
+		row.repository ? [{ projectId: row.projectId, repository: row.repository }] : [],
+	);
 }
 
 /**
@@ -2429,8 +2484,10 @@ export async function cancelAllWaitingDispatches(
 
 /**
  * Waiting dispatches that need a wake-up (re-)published: every
- * `retry-scheduled` row plus `pending` rows not waiting on project capacity
- * (those are woken by slot releases, not timers). Publishing is idempotent
+ * `retry-scheduled` row plus `pending` rows not waiting on project capacity or a
+ * repository's WIP limit (issue #1185) — those are woken by slot releases, not
+ * timers, and re-evaluating every WIP waiter each pass would cost a board re-read
+ * apiece. Publishing is idempotent
  * (deterministic wake ids), so returning rows whose wake-up still exists is
  * fine — the re-add is a queue no-op.
  */
@@ -2439,7 +2496,7 @@ export async function listWakeablePendingDispatches(): Promise<DispatchRow[]> {
 		.select()
 		.from(dispatches)
 		.where(
-			sql`(${dispatches.state} = 'retry-scheduled') OR (${dispatches.state} = 'pending' AND (${dispatches.waitReason} IS NULL OR ${dispatches.waitReason} <> 'project-capacity'))`,
+			sql`(${dispatches.state} = 'retry-scheduled') OR (${dispatches.state} = 'pending' AND (${dispatches.waitReason} IS NULL OR ${dispatches.waitReason} NOT IN ('project-capacity', 'wip-limit')))`,
 		);
 }
 
