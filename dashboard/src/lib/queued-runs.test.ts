@@ -234,6 +234,16 @@ describe('queuedWaitLabel', () => {
 		);
 	});
 
+	// Issue #1192: a WIP wait says how full its repository is, when the server read it.
+	it("names a wip-limit wait's repository in flight / limit", () => {
+		expect(
+			queuedWaitLabel(boardRun({ waitReason: 'wip-limit', wipUsage: { inFlight: 2, limit: 2 } })),
+		).toBe('waiting for a free WIP slot in its repository (2 / 2 in flight)');
+		expect(queuedWaitLabel(boardRun({ waitReason: 'wip-limit' }))).toBe(
+			'waiting for a free WIP slot in its repository',
+		);
+	});
+
 	it('is the plain reason label for every other wait, and absent for none', () => {
 		expect(queuedWaitLabel(githubRun({ waitReason: 'recheck' }))).toBe(
 			'waiting for checks to settle',

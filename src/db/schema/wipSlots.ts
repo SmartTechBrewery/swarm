@@ -27,6 +27,13 @@ import { projects } from './projects.js';
  * trigger may carry none; they let later readers name a holder without a board read.
  * `opened_dispatch_id` → `dispatches.id` `on delete set null`, mirroring
  * `review_verdicts.dispatch_id`: the slot must outlive the dispatch that opened it.
+ *
+ * `pr_number` is the ticket's pull request, written once a pull request-driven phase
+ * for the ticket's branch resolves (`recordTicketPullRequest`,
+ * `src/dispatch/wip-limit.ts`, issue #1192). Nullable — a ticket still in Planning or
+ * Implementation has none — and read only by the dashboard's WIP read model
+ * (`src/queue/wip-usage.ts`), which folds the pull request's own liveness onto the
+ * holder. Admission and release never consult it.
  */
 export const wipSlots = pgTable(
 	'wip_slots',
@@ -46,6 +53,7 @@ export const wipSlots = pgTable(
 			onDelete: 'set null',
 		}),
 		openedAt: timestamp('opened_at').defaultNow().notNull(),
+		prNumber: text('pr_number'),
 	},
 	(table) => [
 		uniqueIndex('uq_wip_slots_ticket').on(table.projectId, table.repository, table.taskId),

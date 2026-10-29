@@ -2,14 +2,15 @@
  * The `wip_slots` reads and writes (issue #1185) — the durable half of the
  * per-repository WIP limit.
  *
- * Four functions, all plain: the atomic reservation a new ticket's start takes,
- * the release that frees it, the count promotion reads, and the full list the
- * slot sweep (`src/dispatch/wip-slot-sweep.ts`, issue #1189) re-checks. The *policy* — which
+ * All plain: the atomic reservation a new ticket's start takes, the release that
+ * frees it, the count promotion reads, the full list the slot sweep
+ * (`src/dispatch/wip-slot-sweep.ts`, issue #1189) re-checks, and — for the dashboard's
+ * WIP panel (issue #1192) — the holder's pull request. The *policy* — which
  * phases are gated, what releases a slot, who is woken — lives in
  * `src/dispatch/wip-limit.ts`; nothing here decides anything but "is there room".
  */
 
-import { and, asc, eq, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNull, or, type SQL, sql } from 'drizzle-orm';
 
 import { getDb } from '../client.js';
 import { projects } from '../schema/projects.js';
@@ -136,27 +137,79 @@ export async function countWipSlots(projectId: string, repository: string): Prom
 	return row?.count ?? 0;
 }
 
-/** One held slot, as the slot sweep re-checks it against its card. */
+/**
+ * Record the pull request a ticket in flight opened (issue #1192), so the dashboard's
+ * WIP read model can follow the holder onto it. A conditional UPDATE: a no-op for a
+ * ticket holding no slot, and for a slot already naming this pull request. Returns
+ * whether a row changed.
+ */
+export async function recordWipSlotPullRequest(
+	projectId: string,
+	repository: string,
+	taskId: string,
+	prNumber: string,
+): Promise<boolean> {
+	const rows = await getDb()
+		.update(wipSlots)
+		.set({ prNumber })
+		.where(
+			and(
+				eq(wipSlots.projectId, projectId),
+				eq(wipSlots.repository, repository),
+				eq(wipSlots.taskId, taskId),
+				or(isNull(wipSlots.prNumber), sql`${wipSlots.prNumber} <> ${prNumber}`),
+			),
+		)
+		.returning({ id: wipSlots.id });
+	return rows.length > 0;
+}
+
+/**
+ * One held slot, as the slot sweep re-checks it against its card (issue #1189) and the
+ * dashboard's WIP read model (`src/queue/wip-usage.ts`) reads it.
+ */
 export interface WipSlotRow {
 	projectId: string;
 	repository: string;
 	taskId: string;
 	workItemId: string | null;
+	workItemTitle: string | null;
+	workItemUrl: string | null;
+	openedPhase: string;
+	openedAt: Date;
+	prNumber: string | null;
 }
 
 /**
- * Every held slot across every project (issue #1189), ordered so one project's
- * repositories come out together. Unbounded on purpose: the table holds at most the
- * sum of every repository's `wipLimit`, which is small by construction.
+ * Every held slot, oldest first per repository, so one project's repositories come out
+ * together — the slot sweep (issue #1189) and the dashboard's WIP panel (issue #1192).
+ * Unbounded on purpose: the table holds at most the sum of every repository's
+ * `wipLimit`, which is small by construction. `projectIds` is the authorization scope,
+ * the `listTaskActivitySince` convention: omitted (the sweep) reads every project; an
+ * empty scope is answered without a query, so it can never widen to every project.
  */
-export async function listWipSlots(): Promise<WipSlotRow[]> {
+export async function listWipSlots(projectIds?: readonly string[]): Promise<WipSlotRow[]> {
+	if (projectIds && projectIds.length === 0) return [];
+	const conditions: SQL[] = [];
+	if (projectIds) conditions.push(inArray(wipSlots.projectId, [...projectIds]));
 	return getDb()
 		.select({
 			projectId: wipSlots.projectId,
 			repository: wipSlots.repository,
 			taskId: wipSlots.taskId,
 			workItemId: wipSlots.workItemId,
+			workItemTitle: wipSlots.workItemTitle,
+			workItemUrl: wipSlots.workItemUrl,
+			openedPhase: wipSlots.openedPhase,
+			openedAt: wipSlots.openedAt,
+			prNumber: wipSlots.prNumber,
 		})
 		.from(wipSlots)
-		.orderBy(asc(wipSlots.projectId), asc(wipSlots.repository), asc(wipSlots.openedAt));
+		.where(conditions.length > 0 ? and(...conditions) : undefined)
+		.orderBy(
+			asc(wipSlots.projectId),
+			asc(wipSlots.repository),
+			asc(wipSlots.openedAt),
+			asc(wipSlots.taskId),
+		);
 }

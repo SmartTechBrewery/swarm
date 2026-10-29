@@ -1898,6 +1898,37 @@ export async function listWipLimitWaits(
 		.orderBy(asc(dispatches.priority), asc(dispatches.createdAt), asc(dispatches.id));
 }
 
+/**
+ * How many dispatches wait on each repository's WIP limit (issue #1192) — the
+ * dashboard's WIP panel's "n waiting". Scoped like `listActiveDispatchTaskRefs`: an
+ * empty `projectIds` is answered without a query.
+ */
+export async function countWipLimitWaitsByRepository(
+	projectIds?: readonly string[],
+): Promise<{ projectId: string; repository: string; count: number }[]> {
+	if (projectIds && projectIds.length === 0) return [];
+	const conditions: SQL[] = [
+		eq(dispatches.state, 'pending'),
+		eq(dispatches.waitReason, 'wip-limit'),
+		isNotNull(dispatches.repository),
+	];
+	if (projectIds) conditions.push(inArray(dispatches.projectId, [...projectIds]));
+	const rows = await getDb()
+		.select({
+			projectId: dispatches.projectId,
+			repository: dispatches.repository,
+			count: sql<number>`count(*)::int`,
+		})
+		.from(dispatches)
+		.where(and(...conditions))
+		.groupBy(dispatches.projectId, dispatches.repository);
+	return rows.flatMap((row) =>
+		row.repository
+			? [{ projectId: row.projectId, repository: row.repository, count: row.count }]
+			: [],
+	);
+}
+
 /** Every `(project, repository)` holding a `wip-limit` wait — the reconciler's sweep. */
 export async function listRepositoriesWithWipWaits(): Promise<
 	{ projectId: string; repository: string }[]
@@ -1940,6 +1971,12 @@ export interface ActiveDispatchTaskRef {
 	taskId: string;
 	/** Null until a claim resolves the trigger (`src/db/schema/dispatches.ts`). */
 	phase: string | null;
+	/**
+	 * Why the dispatch is waiting, when it is. Read by the dashboard's WIP read model
+	 * (`src/queue/wip-usage.ts`, issue #1192), which must not count a ticket's own
+	 * `wip-limit` wait as movement. Optional so a caller building refs by hand needs no edit.
+	 */
+	waitReason?: string | null;
 }
 
 /**
@@ -1979,13 +2016,23 @@ export async function listActiveDispatchTaskRefs(
 			projectId: dispatches.projectId,
 			taskId: dispatches.taskId,
 			phase: dispatches.phase,
+			waitReason: dispatches.waitReason,
 		})
 		.from(dispatches)
 		.where(and(...conditions));
 	// `task_id IS NOT NULL` above is the real filter; this narrows the nullable
 	// column type without a non-null assertion.
 	return rows.flatMap((row) =>
-		row.taskId === null ? [] : [{ projectId: row.projectId, taskId: row.taskId, phase: row.phase }],
+		row.taskId === null
+			? []
+			: [
+					{
+						projectId: row.projectId,
+						taskId: row.taskId,
+						phase: row.phase,
+						waitReason: row.waitReason,
+					},
+				],
 	);
 }
 

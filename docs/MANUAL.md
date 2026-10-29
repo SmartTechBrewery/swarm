@@ -830,6 +830,21 @@ hand, close the pull request or move the card to Backlog or Done. Tickets alread
 flight when the limit shipped hold no slot. Until Maximum Concurrent Jobs is retired
 both caps apply, so an admitted ticket can still wait for a project slot.
 
+The **WIP** section of the Runs screen, between Stalled and the Queue, shows how full
+each repository is (issue #1192). A repository row reads `x / y in flight` and, when
+new tickets are held back, `n waiting`; under it is every ticket holding a slot — its
+card, its pull request once it has one, how long it has been in flight, and what it is
+doing. A ticket the pipeline cannot move on its own carries a **Waiting on you** badge
+with the reason: its plan is waiting for your greenlight (move the card to Ready), its
+pull request is approved and waiting for you to merge, it reached the review cap, it
+stalled, or its latest run failed and nothing will retry it. That verdict comes from
+the same liveness rules as the Stalled section, so a dismissed stall still shows here
+while its ticket holds a slot. A Queue row waiting for a WIP slot also names its
+repository's `x / y`. To free a slot, finish or abandon the ticket: merge or close its
+pull request, move its card to Done or Backlog, or Put it back from the Queue. The
+section is hidden when no repository has a ticket in flight or waiting, and, like the
+Queue, needs a chosen project unless you are an instance administrator.
+
 The control-plane host's own worker runs this identical program over loopback, so
 a remote worker and a local one are the same code path rather than two that have
 to be kept in step. See

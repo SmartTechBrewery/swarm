@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import {
 	countWipSlots,
 	listWipSlots,
+	recordWipSlotPullRequest,
 	releaseWipSlot,
 	reserveWipSlot,
 } from '../../../src/db/repositories/wipSlotsRepository.js';
@@ -90,8 +91,18 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('wipSlotsRepository', () =
 
 		expect(await listWipSlots()).toEqual(
 			expect.arrayContaining([
-				{ projectId: PROJECT_ID, repository: REPO, taskId: '1', workItemId: 'ITEM_1' },
-				{ projectId: PROJECT_ID, repository: OTHER_REPO, taskId: '2', workItemId: 'ITEM_2' },
+				expect.objectContaining({
+					projectId: PROJECT_ID,
+					repository: REPO,
+					taskId: '1',
+					workItemId: 'ITEM_1',
+				}),
+				expect.objectContaining({
+					projectId: PROJECT_ID,
+					repository: OTHER_REPO,
+					taskId: '2',
+					workItemId: 'ITEM_2',
+				}),
 			]),
 		);
 		expect(await listWipSlots()).toHaveLength(2);
@@ -108,5 +119,36 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('wipSlotsRepository', () =
 
 		expect(results.filter((result) => result.admitted)).toHaveLength(limit);
 		expect(await countWipSlots(PROJECT_ID, REPO)).toBe(limit);
+	});
+
+	// Issue #1192 — the slot learns its pull request, and the dashboard reads the slots.
+	it('records a holder’s pull request once, and nothing for a ticket holding no slot', async () => {
+		await reserveWipSlot(reservation('1'));
+
+		expect(await recordWipSlotPullRequest(PROJECT_ID, REPO, '1', '120')).toBe(true);
+		expect(await recordWipSlotPullRequest(PROJECT_ID, REPO, '1', '120')).toBe(false);
+		expect(await recordWipSlotPullRequest(PROJECT_ID, REPO, '404', '121')).toBe(false);
+		expect(await recordWipSlotPullRequest(PROJECT_ID, OTHER_REPO, '1', '121')).toBe(false);
+
+		const [slot] = await listWipSlots([PROJECT_ID]);
+		expect(slot).toMatchObject({
+			projectId: PROJECT_ID,
+			repository: REPO,
+			taskId: '1',
+			workItemId: 'ITEM_1',
+			workItemTitle: 'Ticket 1',
+			workItemUrl: 'https://x/1',
+			openedPhase: 'planning',
+			prNumber: '120',
+		});
+	});
+
+	it('lists the slots oldest first, within the scope it is given', async () => {
+		await reserveWipSlot(reservation('2', 2));
+		await reserveWipSlot(reservation('1', 2));
+
+		expect((await listWipSlots()).map((slot) => slot.taskId)).toEqual(['2', '1']);
+		expect(await listWipSlots([])).toEqual([]);
+		expect(await listWipSlots(['someone-else'])).toEqual([]);
 	});
 });

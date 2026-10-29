@@ -138,10 +138,17 @@ export type QueuedWaitLabelPart = string | QueuedBlocker;
  * recorded no reason. A `dependency` wait whose blockers the server could read
  * names them — "waiting for #11 and #12 to be done" — with each blocker kept
  * whole so the Queue can link it: a bare `#11` may belong to another repository
- * than the row's. Every other row is its {@link queuedWaitReasonLabel}.
+ * than the row's. A `wip-limit` wait the server supplied `wipUsage` for names its
+ * repository's `in flight / limit`. Every other row is its {@link queuedWaitReasonLabel}.
  */
 export function queuedWaitLabelParts(item: QueuedRun): QueuedWaitLabelPart[] | undefined {
 	if (!item.waitReason) return undefined;
+	// A `wip-limit` wait names how full its repository is, when the server read it
+	// (issue #1192): "… in its repository (2 / 2 in flight)".
+	if (item.waitReason === 'wip-limit' && item.wipUsage) {
+		const { inFlight, limit } = item.wipUsage;
+		return [`${queuedWaitReasonLabel(item.waitReason)} (${inFlight} / ${limit} in flight)`];
+	}
 	const blockers = item.waitReason === 'dependency' ? (item.blockers ?? []) : [];
 	if (blockers.length === 0) return [queuedWaitReasonLabel(item.waitReason)];
 	const parts: QueuedWaitLabelPart[] = ['waiting for '];

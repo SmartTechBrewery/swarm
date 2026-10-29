@@ -39,6 +39,11 @@ vi.mock('@/db/repositories/stalledDismissalsRepository.js', () => ({
 	recordStalledDismissal: vi.fn(),
 }));
 
+// The `wip_slots` read `wip` and the Queue's `wip-limit` rows fold in (issue #1192).
+vi.mock('@/db/repositories/wipSlotsRepository.js', () => ({
+	listWipSlots: vi.fn(),
+}));
+
 // The GitWorktreeManager constructor is harmless (stores config), but its methods
 // touch git/Redis — the settlement decision is mocked at its own boundary.
 vi.mock('@/worktree/termination-cleanup.js', () => ({
@@ -69,6 +74,7 @@ vi.mock('@/db/repositories/usersRepository.js', () => ({
 vi.mock('@/db/repositories/dispatchesRepository.js', async (importOriginal) => ({
 	...(await importOriginal<typeof import('@/db/repositories/dispatchesRepository.js')>()),
 	getActiveDispatchByRunId: vi.fn(),
+	countWipLimitWaitsByRepository: vi.fn(),
 	getDispatchById: vi.fn(),
 	hasActiveDispatchForCoalesceKeys: vi.fn(),
 	listActiveDispatchTaskRefs: vi.fn(),
@@ -182,6 +188,7 @@ vi.mock('@/queue/cancellation.js', () => ({
 
 import { runsRouter } from '@/api/routers/runs.js';
 import {
+	countWipLimitWaitsByRepository,
 	type DispatchRow,
 	getActiveDispatchByRunId,
 	getDispatchById,
@@ -219,6 +226,7 @@ import {
 	recordStalledDismissal,
 } from '@/db/repositories/stalledDismissalsRepository.js';
 import { getUserById } from '@/db/repositories/usersRepository.js';
+import { listWipSlots, type WipSlotRow } from '@/db/repositories/wipSlotsRepository.js';
 import type { runs } from '@/db/schema/runs.js';
 import { classifyDispatchClaim } from '@/dispatch/claim-liveness.js';
 import {
@@ -442,6 +450,10 @@ describe('runsRouter', () => {
 		vi.mocked(listTaskActivitySince).mockResolvedValue([]);
 		vi.mocked(listActiveDispatchTaskRefs).mockReset();
 		vi.mocked(listActiveDispatchTaskRefs).mockResolvedValue([]);
+		vi.mocked(listWipSlots).mockReset();
+		vi.mocked(listWipSlots).mockResolvedValue([]);
+		vi.mocked(countWipLimitWaitsByRepository).mockReset();
+		vi.mocked(countWipLimitWaitsByRepository).mockResolvedValue([]);
 		vi.mocked(listStalledDismissals).mockReset();
 		vi.mocked(listStalledDismissals).mockResolvedValue([]);
 		vi.mocked(recordStalledDismissal).mockReset();
@@ -926,7 +938,199 @@ describe('runsRouter', () => {
 		});
 	});
 
+	// issue #1192 — each repository's WIP limit in use. The pure read model
+	// (`@/queue/wip-usage.js`) is not mocked, so these exercise the wiring — which
+	// reads, which scope, which limit — through the real classification.
+	describe('wip', () => {
+		const OPENED_AT = new Date('2026-10-29T08:00:00.000Z');
+
+		function slotRow(overrides: Partial<WipSlotRow> = {}): WipSlotRow {
+			return {
+				projectId: 'p1',
+				repository: 'acme/widgets',
+				taskId: '103',
+				workItemId: 'item-103',
+				workItemTitle: 'Add widgets',
+				workItemUrl: 'https://github.com/acme/widgets/issues/103',
+				openedPhase: 'planning',
+				openedAt: OPENED_AT,
+				prNumber: null,
+				...overrides,
+			};
+		}
+
+		beforeEach(() => {
+			vi.setSystemTime(new Date(OPENED_AT.getTime() + 2 * ITEM_STALL_AFTER_MS));
+			vi.mocked(requireProjectSCMProvider).mockReset();
+			vi.mocked(requireProjectSCMProvider).mockImplementation(() => {
+				throw new Error('no runtime-ready SCM provider');
+			});
+		});
+
+		afterEach(() => {
+			vi.useRealTimers();
+		});
+
+		it('is empty, reading no activity, when no repository holds a slot or a waiter', async () => {
+			await expect(caller.wip({})).resolves.toEqual([]);
+			expect(listWipSlots).toHaveBeenCalledExactlyOnceWith(undefined);
+			expect(countWipLimitWaitsByRepository).toHaveBeenCalledExactlyOnceWith(undefined);
+			expect(listTaskActivitySince).not.toHaveBeenCalled();
+		});
+
+		it('reports in flight against the repository’s own limit, the waiters, and each holder', async () => {
+			vi.mocked(listAllProjectRecordsFromDb).mockResolvedValue([
+				createMockProjectRecord({
+					id: 'p1',
+					repositories: [{ repo: 'acme/widgets', wipLimit: 3 }],
+				}),
+			]);
+			vi.mocked(listWipSlots).mockResolvedValue([slotRow()]);
+			vi.mocked(countWipLimitWaitsByRepository).mockResolvedValue([
+				{ projectId: 'p1', repository: 'acme/widgets', count: 2 },
+			]);
+			vi.mocked(listTaskActivitySince).mockResolvedValue([
+				{
+					projectId: 'p1',
+					repository: 'acme/widgets',
+					taskId: '103',
+					runId: 'run-plan',
+					phase: 'planning',
+					status: 'completed',
+					prNumber: null,
+					prTitle: null,
+					workItemId: null,
+					workItemTitle: null,
+					workItemUrl: null,
+					producedPrUrl: null,
+					reviewVerdict: null,
+					reviewAutomationOutcome: null,
+					reviewMergeOutcome: null,
+					lastActivityAt: OPENED_AT,
+					liveRunCount: 0,
+					mergedRunCount: 0,
+				},
+			]);
+
+			await expect(caller.wip({})).resolves.toEqual([
+				{
+					projectId: 'p1',
+					repository: 'acme/widgets',
+					limit: 3,
+					inFlight: 1,
+					waiting: 2,
+					tickets: [
+						{
+							taskId: '103',
+							workItemId: 'item-103',
+							workItemTitle: 'Add widgets',
+							workItemUrl: 'https://github.com/acme/widgets/issues/103',
+							openedPhase: 'planning',
+							openedAt: OPENED_AT.toISOString(),
+							state: 'waiting-on-operator',
+							operatorReason: 'plan-awaiting-greenlight',
+							phase: 'planning',
+							lastActivityAt: OPENED_AT.toISOString(),
+						},
+					],
+				},
+			]);
+			expect(listTaskActivitySince).toHaveBeenCalledWith({
+				since: new Date(Date.now() - ITEM_ACTIVITY_LOOKBACK_MS),
+				projectIds: undefined,
+			});
+		});
+
+		it('links a holder’s pull request through its project’s own provider', async () => {
+			vi.mocked(listAllProjectRecordsFromDb).mockResolvedValue([
+				createMockProjectRecord({ id: 'p1' }),
+			]);
+			vi.mocked(listWipSlots).mockResolvedValue([slotRow({ prNumber: '120' })]);
+			vi.mocked(requireProjectSCMProvider).mockReturnValue({
+				pullRequestUrl: (repo: string, pr: number | string) =>
+					`https://gitlab.com/${repo}/-/merge_requests/${pr}`,
+			} as unknown as ReturnType<typeof requireProjectSCMProvider>);
+
+			const [entry] = await caller.wip({});
+
+			expect(entry?.tickets[0]?.prUrl).toBe('https://gitlab.com/acme/widgets/-/merge_requests/120');
+		});
+
+		it('scopes every read to a chosen project', async () => {
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(
+				createMockProjectRecord({ id: 'p1' }),
+			);
+			vi.mocked(listWipSlots).mockResolvedValue([slotRow()]);
+
+			const entries = await caller.wip({ projectId: 'p1' });
+
+			expect(entries).toHaveLength(1);
+			// No limit configured — the project default.
+			expect(entries[0]?.limit).toBe(1);
+			expect(listWipSlots).toHaveBeenCalledWith(['p1']);
+			expect(countWipLimitWaitsByRepository).toHaveBeenCalledWith(['p1']);
+			expect(listActiveDispatchTaskRefs).toHaveBeenCalledWith(['p1']);
+			expect(listTaskActivitySince).toHaveBeenCalledWith(
+				expect.objectContaining({ projectIds: ['p1'] }),
+			);
+			expect(listAllProjectRecordsFromDb).not.toHaveBeenCalled();
+		});
+	});
+
 	describe('queued', () => {
+		it('names a wip-limit row’s repository in flight / limit (issue #1192)', async () => {
+			const waiter = {
+				jobId: 'dispatch-wip',
+				projectId: 'p1',
+				type: 'pm' as const,
+				repo: 'acme/widgets',
+				state: 'blocked' as const,
+				phaseHint: 'planning' as const,
+				waitReason: 'wip-limit' as const,
+				priority: 10,
+				continuation: false,
+				prioritizeContinuations: true,
+				enqueuedAt: '2026-07-17T10:00:00.000Z',
+				availableAt: '2026-07-17T10:00:00.000Z',
+			};
+			const other = { ...waiter, jobId: 'dispatch-other', waitReason: 'project-capacity' as const };
+			vi.mocked(toQueuedRuns).mockReturnValue([waiter, other]);
+			vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(
+				createMockProjectRecord({
+					id: 'p1',
+					repositories: [{ repo: 'acme/widgets', wipLimit: 2 }],
+				}),
+			);
+			vi.mocked(listWipSlots).mockResolvedValue([
+				{
+					projectId: 'p1',
+					repository: 'acme/widgets',
+					taskId: '7',
+					workItemId: null,
+					workItemTitle: null,
+					workItemUrl: null,
+					openedPhase: 'planning',
+					openedAt: new Date(),
+					prNumber: null,
+				},
+			]);
+
+			const result = await caller.queued({ projectId: 'p1' });
+
+			expect(result.items).toEqual([{ ...waiter, wipUsage: { inFlight: 1, limit: 2 } }, other]);
+			expect(listWipSlots).toHaveBeenCalledWith(['p1']);
+		});
+
+		it('reads no slots for a page with no wip-limit row', async () => {
+			vi.mocked(toQueuedRuns).mockReturnValue([]);
+			vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+
+			await caller.queued({ projectId: 'p1' });
+
+			expect(listWipSlots).not.toHaveBeenCalled();
+		});
+
 		it('reads canonical waiting dispatches and enriches board jobs with backing metadata', async () => {
 			const queuedItem = {
 				jobId: 'dispatch-board',
@@ -4251,6 +4455,31 @@ describe('runsRouter', () => {
 
 				await expect(ordinary.stalled({ projectId: 'p1' })).resolves.toEqual([]);
 				expect(listActiveDispatchTaskRefs).toHaveBeenCalledWith(['p1']);
+			});
+		});
+
+		describe('wip', () => {
+			it('denies the installation-wide view to a non-admin, without reading a slot', async () => {
+				await expect(ordinary.wip({})).rejects.toThrowError(
+					expect.objectContaining({ code: 'FORBIDDEN' }),
+				);
+				expect(listWipSlots).not.toHaveBeenCalled();
+			});
+
+			it('denies a project the caller is not a member of, hiding its existence', async () => {
+				vi.mocked(getMembership).mockResolvedValue(undefined);
+
+				await expect(ordinary.wip({ projectId: 'p9' })).rejects.toThrowError(
+					expect.objectContaining({ code: 'NOT_FOUND' }),
+				);
+				expect(listWipSlots).not.toHaveBeenCalled();
+			});
+
+			it('still lets a contributor read the WIP usage of their own project', async () => {
+				vi.mocked(getMembership).mockResolvedValue(membershipFor('contributor'));
+
+				await expect(ordinary.wip({ projectId: 'p1' })).resolves.toEqual([]);
+				expect(listWipSlots).toHaveBeenCalledWith(['p1']);
 			});
 		});
 

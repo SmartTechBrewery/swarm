@@ -225,6 +225,13 @@ export const queuedRunSchema = z.object({
 	 * linkable `http:`/`https:` URL. Absent when the server recorded none.
 	 */
 	blockers: z.array(z.object({ reference: z.string(), url: z.string().optional() })).optional(),
+	/**
+	 * A `wip-limit` wait only — its repository's `in flight / limit` (mirrors the
+	 * server field, issue #1192). Absent when the server could not read it.
+	 */
+	wipUsage: z
+		.object({ inFlight: z.number().int().nonnegative(), limit: z.number().int().positive() })
+		.optional(),
 	/** The run row this dispatch retries, when one exists (deferred runs). */
 	runId: z.string().optional(),
 	/** Deferred-retry attempt counter. */
@@ -276,6 +283,57 @@ export const queuedRunSchema = z.object({
 	reviewGate: queuedReviewGateSchema.optional(),
 });
 export type QueuedRun = z.infer<typeof queuedRunSchema>;
+
+/** Mirrors `WipTicketStateSchema` (`src/queue/wip-usage.ts`, issue #1192). */
+export const wipTicketStateSchema = z.enum([
+	'running',
+	'waiting-on-pipeline',
+	'waiting-on-operator',
+]);
+export type WipTicketState = z.infer<typeof wipTicketStateSchema>;
+
+/** Mirrors `WipOperatorReasonSchema` (`src/queue/wip-usage.ts`, issue #1192). */
+export const wipOperatorReasonSchema = z.enum([
+	'review-cap-reached',
+	'plan-awaiting-greenlight',
+	'approved-awaiting-merge',
+	'stalled',
+	'failed',
+]);
+export type WipOperatorReason = z.infer<typeof wipOperatorReasonSchema>;
+
+/**
+ * Mirrors the server `runs.wip` contract (`WipUsageEntrySchema`,
+ * `src/queue/wip-usage.ts`, issue #1192) — one repository's WIP limit in use and the
+ * tickets holding its slots. Keep it exactly in step with the server schema. Whether
+ * a holder waits on the operator is the server's verdict; nothing here re-derives it.
+ */
+export const wipUsageEntrySchema = z.object({
+	projectId: z.string(),
+	repository: z.string(),
+	limit: z.number().int().positive(),
+	inFlight: z.number().int().nonnegative(),
+	waiting: z.number().int().nonnegative(),
+	tickets: z.array(
+		z.object({
+			taskId: z.string(),
+			workItemId: z.string().optional(),
+			workItemTitle: z.string().optional(),
+			workItemUrl: z.string().optional(),
+			openedPhase: z.string(),
+			/** ISO 8601 — when the ticket took its slot. */
+			openedAt: z.string(),
+			state: wipTicketStateSchema,
+			operatorReason: wipOperatorReasonSchema.optional(),
+			phase: z.string().optional(),
+			prNumber: z.string().optional(),
+			prUrl: z.string().optional(),
+			lastActivityAt: z.string().optional(),
+		}),
+	),
+});
+export type WipUsageEntry = z.infer<typeof wipUsageEntrySchema>;
+export type WipTicket = WipUsageEntry['tickets'][number];
 
 /**
  * The liveness unit one stalled item names (mirrors `ItemLivenessUnitKindSchema`,

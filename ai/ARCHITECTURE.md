@@ -1387,8 +1387,37 @@ id Planning and Implementation share ("Task identity" above). Policy lives in
   wake-up and an operator **raising** a limit; lowering one preempts nothing.
 
 Tickets already in flight when this shipped hold no slot. Ranking in-flight work ahead
-of new starts, the WIP dashboard panel, and retiring `maxConcurrentJobs` (both caps apply
-until then) are later phases of issue #1185.
+of new starts and retiring `maxConcurrentJobs` (both caps apply until then) are later
+phases of issue #1185.
+
+**The WIP panel (issue #1192).** `runs.wip` (`src/api/routers/runs.ts`, authorized exactly
+like `runs.stalled`) returns one entry per `(project, repository)` holding a slot or a
+`wip-limit` waiter: `limit` (`resolveWipLimit`), `inFlight`, `waiting`
+(`countWipLimitWaitsByRepository`), and each holder with its state. The fold is the pure
+`src/queue/wip-usage.ts`, in the shape of the queued-runs and item-liveness read models, and
+the dashboard renders it as the WIP section of `/runs`
+(`dashboard/src/components/runs/wip-usage-section.tsx`); a Queue row's `wip-limit` label
+gains the same `x / y` through `QueuedRun.wipUsage`, filled by `runs.queued` from one
+`listWipSlots` read made only when the page holds such a row.
+
+- **A holder's state is derived from liveness, never persisted.** `running` (a live run),
+  `waiting-on-pipeline`, or `waiting-on-operator` is the item-liveness classifier's verdict
+  on the slot's `work-item` unit (its task id) and, once known, its `pull-request` unit —
+  so it cannot disagree with the Stalled view, and nothing has to be un-set when the ticket
+  moves. `awaiting-human` names its cause through `awaitingHumanCause`
+  (`src/dispatch/item-liveness.ts`), which *is* the classifier's rules 5–7 rather than a
+  copy of them: review cap reached, plan awaiting greenlight, approved and awaiting merge.
+  Two deliberate differences from the Stalled view: a latest run `failed` with nothing
+  queued waits on the operator at once rather than after the grace window, since nothing
+  will retry it; and operator dismissals are not folded in, since a dismissed unit still
+  holding a slot still blocks its repository. The ticket's own `wip-limit` wait is not
+  counted as an active dispatch (`ActiveDispatchTaskRef.waitReason`).
+- **How a slot learns its pull request.** `wip_slots.pr_number` is written by
+  `recordTicketPullRequest` (`src/dispatch/wip-limit.ts`) from `processJob`, right after
+  `recordDispatchResolution`, for every pull request-driven trigger: the ticket is the task
+  id the head branch maps back to (`issueNumberFromBranch`, strict) — never a URL — and the
+  conditional update is a no-op for a ticket holding no slot. Best-effort; admission and
+  release never read it.
 
 ### Failure handling & rate-limit retries (issue #91)
 

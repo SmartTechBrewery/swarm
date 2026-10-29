@@ -56,3 +56,12 @@ export function queuedListRefetchInterval(items?: { length: number } | null): nu
 export function stalledListRefetchInterval(): number {
 	return RUNS_IDLE_REFETCH_MS;
 }
+
+/**
+ * Poll cadence for the WIP section (issue #1192): the idle baseline, always. A slot
+ * changes hands only when a ticket finishes or starts, which the runs list already
+ * watches at its own cadence. Returns a positive number in all cases.
+ */
+export function wipUsageRefetchInterval(): number {
+	return RUNS_IDLE_REFETCH_MS;
+}

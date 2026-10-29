@@ -59,6 +59,11 @@ function slot(taskId: string, overrides: Partial<WipSlotRow> = {}): WipSlotRow {
 		repository: REPO,
 		taskId,
 		workItemId: `ITEM_${taskId}`,
+		workItemTitle: `Ticket ${taskId}`,
+		workItemUrl: null,
+		openedPhase: 'planning',
+		openedAt: new Date('2026-01-01T00:00:00Z'),
+		prNumber: null,
 		...overrides,
 	};
 }

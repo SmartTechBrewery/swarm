@@ -5,13 +5,21 @@ import { render, screen } from '@testing-library/react';
 import type { ReactElement } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { runsListQueryOptions, runsQueuedQueryOptions, runsStalledQueryOptions, stalledQueryFn } =
-	vi.hoisted(() => ({
-		runsListQueryOptions: vi.fn(),
-		runsQueuedQueryOptions: vi.fn(),
-		runsStalledQueryOptions: vi.fn(),
-		stalledQueryFn: vi.fn(),
-	}));
+const {
+	runsListQueryOptions,
+	runsQueuedQueryOptions,
+	runsStalledQueryOptions,
+	stalledQueryFn,
+	runsWipQueryOptions,
+	wipQueryFn,
+} = vi.hoisted(() => ({
+	runsListQueryOptions: vi.fn(),
+	runsQueuedQueryOptions: vi.fn(),
+	runsStalledQueryOptions: vi.fn(),
+	stalledQueryFn: vi.fn(),
+	runsWipQueryOptions: vi.fn(),
+	wipQueryFn: vi.fn(),
+}));
 
 vi.mock('@/lib/trpc.js', () => ({
 	trpc: {
@@ -19,6 +27,7 @@ vi.mock('@/lib/trpc.js', () => ({
 			list: { queryOptions: runsListQueryOptions },
 			queued: { queryOptions: runsQueuedQueryOptions },
 			stalled: { queryOptions: runsStalledQueryOptions },
+			wip: { queryOptions: runsWipQueryOptions },
 		},
 	},
 	trpcClient: {},
@@ -34,6 +43,9 @@ vi.mock('@/components/runs/queued-runs-section.js', () => ({
 }));
 vi.mock('@/components/runs/stalled-items-section.js', () => ({
 	StalledItemsSection: () => <div>stalled section</div>,
+}));
+vi.mock('@/components/runs/wip-usage-section.js', () => ({
+	WipUsageSection: () => <div>wip section</div>,
 }));
 vi.mock('@/components/runs/runs-table.js', () => ({ RunsTable: () => <div>runs table</div> }));
 vi.mock('@/components/runs/empty-runs-state.js', () => ({
@@ -69,6 +81,10 @@ beforeEach(() => {
 	stalledQueryFn.mockReset();
 	stalledQueryFn.mockResolvedValue([]);
 	runsStalledQueryOptions.mockReturnValue({ queryKey: ['runs.stalled'], queryFn: stalledQueryFn });
+	runsWipQueryOptions.mockReset();
+	wipQueryFn.mockReset();
+	wipQueryFn.mockResolvedValue([]);
+	runsWipQueryOptions.mockReturnValue({ queryKey: ['runs.wip'], queryFn: wipQueryFn });
 	vi.mocked(useCurrentUser).mockReset();
 	// The route's search params come from the router the screen is mounted in;
 	// these tests render the screen directly, so the read is stubbed.
@@ -159,5 +175,36 @@ describe('the Stalled section (issue #847)', () => {
 
 		expect(runsStalledQueryOptions).toHaveBeenCalledWith({ projectId: 'p1' });
 		expect(stalledQueryFn).toHaveBeenCalled();
+	});
+});
+
+// `runs.wip` copied `runs.stalled`'s authorization verbatim (issue #1192), so it is
+// gated the same way: the section is always mounted, the unscoped read admin-only.
+describe('the WIP section (issue #1192)', () => {
+	it('does not issue the unscoped WIP read for a non-admin with no project chosen', () => {
+		vi.mocked(useCurrentUser).mockReturnValue(signedInAs(false));
+
+		renderScreen(<RunsRouteComponent />);
+
+		expect(screen.getByText('wip section')).toBeDefined();
+		expect(wipQueryFn).not.toHaveBeenCalled();
+	});
+
+	it('issues the unscoped WIP read for an instance admin', () => {
+		vi.mocked(useCurrentUser).mockReturnValue(signedInAs(true));
+
+		renderScreen(<RunsRouteComponent />);
+
+		expect(wipQueryFn).toHaveBeenCalled();
+	});
+
+	it('issues the project-scoped WIP read once a non-admin filters to a project', () => {
+		vi.mocked(useCurrentUser).mockReturnValue(signedInAs(false));
+		vi.mocked(runsIndexRoute.useSearch).mockReturnValue({ projectId: 'p1' } as never);
+
+		renderScreen(<RunsRouteComponent />);
+
+		expect(runsWipQueryOptions).toHaveBeenCalledWith({ projectId: 'p1' });
+		expect(wipQueryFn).toHaveBeenCalled();
 	});
 });

@@ -248,7 +248,11 @@ function unitKey(
  * That is conservative in the safe direction — an active dispatch can only ever
  * *remove* a unit from the report, never invent one.
  */
-function dispatchKey(projectId: string, unit: ItemLivenessUnitKind, reference: string): string {
+export function dispatchKey(
+	projectId: string,
+	unit: ItemLivenessUnitKind,
+	reference: string,
+): string {
 	return [projectId, unit, reference].join(KEY_SEPARATOR);
 }
 
@@ -302,6 +306,48 @@ export function livenessUnitKeysForDispatch(ref: ActiveDispatchTaskRef): string[
 }
 
 /**
+ * Which recorded hand-off to a person an `awaiting-human` unit rests on — rules 5–7
+ * of {@link classifyItemLiveness}, in that order. Named so a reader can tell the
+ * operator *what* they are waited on for (the dashboard's WIP panel, issue #1192).
+ */
+export const AwaitingHumanCauseSchema = z.enum([
+	'review-cap-reached',
+	'plan-awaiting-greenlight',
+	'approved-awaiting-merge',
+]);
+export type AwaitingHumanCause = z.infer<typeof AwaitingHumanCauseSchema>;
+
+/**
+ * Rules 5–7 of {@link classifyItemLiveness} — the one place they are written, so the
+ * classifier and anything naming its `awaiting-human` cause cannot disagree. Reads
+ * only the unit's latest run and the project policy; the earlier rules are the
+ * caller's.
+ */
+export function awaitingHumanCause(
+	unit: Pick<ItemLivenessUnit, 'latest' | 'repository'>,
+	policy: ItemLivenessPolicy,
+): AwaitingHumanCause | null {
+	const latest = unit.latest;
+	const completed = latest.status === 'completed';
+	if (latest.reviewAutomationOutcome === 'manual-intervention-required') {
+		return 'review-cap-reached';
+	}
+	if (completed && latest.phase === 'planning' && !policy.planningAutoAdvance) {
+		return 'plan-awaiting-greenlight';
+	}
+	if (
+		completed &&
+		latest.phase === 'review' &&
+		latest.reviewVerdict === 'approve' &&
+		(latest.reviewMergeOutcome !== null ||
+			!policy.autoMergeRepositories.some((repo) => repoSlugsMatch(repo, unit.repository)))
+	) {
+		return 'approved-awaiting-merge';
+	}
+	return null;
+}
+
+/**
  * Classify one folded unit. The first rule that matches wins, and every rule but
  * the last names a hand-off *recorded on a row* — never a failure mode. Read the
  * list that way: it is not an enumeration of the ways work can break, and it must
@@ -328,6 +374,8 @@ export function livenessUnitKeysForDispatch(ref: ActiveDispatchTaskRef): string[
  *    is terminal for the pull request: a later `respond-to-ci`, or a failed
  *    re-review sharing the Review's own `task_id`, used to become `latest` and
  *    report a merged PR as stalled for the rest of the lookback (issue #879).
+ * Rules 5–7 live in {@link awaitingHumanCause}, which names which one matched.
+ *
  * 5. `review_automation_outcome = 'manual-intervention-required'` → the review-cap
  *    stop (issues #235/#328): SWARM's own design stops here and asks for a person.
  * 6. A `completed` Planning run on a project that does not auto-advance → the plan
@@ -355,19 +403,7 @@ export function classifyItemLiveness(
 	const completed = latest.status === 'completed';
 	if (completed && latest.phase === 'implementation' && latest.producedPrUrl) return 'handed-off';
 	if (unit.mergedRunCount > 0) return 'merged';
-	if (latest.reviewAutomationOutcome === 'manual-intervention-required') return 'awaiting-human';
-	if (completed && latest.phase === 'planning' && !policy.planningAutoAdvance) {
-		return 'awaiting-human';
-	}
-	if (
-		completed &&
-		latest.phase === 'review' &&
-		latest.reviewVerdict === 'approve' &&
-		(latest.reviewMergeOutcome !== null ||
-			!policy.autoMergeRepositories.some((repo) => repoSlugsMatch(repo, unit.repository)))
-	) {
-		return 'awaiting-human';
-	}
+	if (awaitingHumanCause(unit, policy)) return 'awaiting-human';
 
 	if (now.getTime() - unit.lastActivityAt.getTime() < ITEM_STALL_AFTER_MS) return 'settling';
 	return 'stalled';

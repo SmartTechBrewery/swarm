@@ -98,6 +98,7 @@ import { deriveCapacityPendingPayload, deriveRetryJobPayload } from '../dispatch
 import {
 	admitTicket,
 	type BoardTriggerResult,
+	recordTicketPullRequest,
 	releaseTicketSlot,
 	wipLimitWaitReason,
 } from '../dispatch/wip-limit.js';
@@ -5588,6 +5589,11 @@ export async function processJob(
 			error: describeError(err),
 		});
 	}
+	// A pull request-driven phase names the pull request its ticket opened: recorded on
+	// the ticket's WIP slot so the dashboard's WIP panel can follow the holder onto it
+	// (issue #1192). Best-effort, and a no-op for a ticket holding no slot.
+	const prTrigger = pullRequestTrigger(trigger);
+	if (prTrigger) await recordTicketPullRequest(project, prTrigger);
 
 	// Explicit automation opt-in (issues #131 and #354): the work item behind a
 	// dispatch must carry the project's configured automation label before SWARM
