@@ -154,6 +154,24 @@ behind it is refused server-side for them anyway.
 Giving a new user access to a project is separate: a project admin adds them on
 that project's **Members** tab.
 
+**Registering this checkout's worker, the short way.** Run from the checkout the
+worker is to serve:
+
+```bash
+npm run swarm -- workers setup
+```
+
+It is `register-and-enroll` with its inputs defaulted: the owner is the signed-in
+operator (`swarm login`), the CLIs are the ones on this machine's `PATH`, and the
+name is `<owner>_<host>_<repo>`. It asks only for the project id (offering the
+checkout's repository name) and the operator source-control credential (no echo,
+verified before it is stored). On macOS it then installs the launchd autostart
+through `swarm-worker-agent install`; elsewhere it tells you to run `swarm
+run:worker`, and `--no-autostart` skips starting it at all. It refuses a checkout
+that already has a worker cached, since registering again would strand the first
+worker's enrollments. `--project`, `--cli`, `--name` and `--control-plane-url`
+override the defaults — see [`docs/cli.md`](./cli.md#swarm-workers).
+
 **Registering the worker, one step at a time.** `workers register-and-enroll`
 collapses two commands; either half can be run on its own, which is what you want
 when the two approvals are separate human decisions:
@@ -210,8 +228,8 @@ fresh clone is bootstrapped by the same command that registers the machine. (`sw
 init` is for the *stack*, not for a worker: it copies `.env.docker.example`,
 `DATABASE_URL` and all, onto a machine that must hold neither that nor `REDIS_URL`.)
 
-**On the machine that registered it, there is a shorter way to start it.** Both
-registration commands also write the freshly issued credential to a per-checkout
+**On the machine that registered it, there is a shorter way to start it.** The
+registration commands (`register`, `register-and-enroll`, `setup`) also write the freshly issued credential to a per-checkout
 cache in the operator's home directory (`~/.swarm/worker-credentials/<hash>/`,
 owner-only, outside every checkout — no `.gitignore` entry needed anywhere), so
 from inside that checkout:
