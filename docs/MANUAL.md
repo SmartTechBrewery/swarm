@@ -920,8 +920,18 @@ in [Running on a VPS behind Caddy](#running-on-a-vps-behind-caddy) instead.
   [Adding colleagues](#quick-start-beyond-the-readme)).
 - **Unchanged:** `Dockerfile.router`, the Compose `router` service and
   `npm run reload:all` still build the router locally, as before.
-- **Maintainers:** cut a version with `git tag vX.Y.Z && git push origin vX.Y.Z`;
-  that also moves `stable` (a `vX.Y.Z-rc.N` pre-release does not).
+- **Maintainers:** cut a version with `npm run release` (`bin/swarm-release`), from
+  a clean `main`. It shows the current version and asks for the new one (`X.Y.Z`).
+  Then it bumps `package.json`, commits `chore(release): vX.Y.Z` to `main` and
+  tags it, and pushes both. It waits for the image build, which also moves
+  `stable`, and publishes the GitHub release. Finally it runs
+  `sudo dockerctl deploy app` on the server and checks that the new version is
+  live. It warns first when `deploy/vps` changed since the previous tag, because
+  the server's files may then need the admin. The server is
+  `$SWARM_DEPLOY_SSH` / `$SWARM_DEPLOY_URL`, defaulting to the SmartTechBrewery
+  VPS. A tag pushed by hand (`git tag vX.Y.Z && git push origin vX.Y.Z`) builds
+  and moves `stable` the same way, but deploys nothing. A `vX.Y.Z-rc.N`
+  pre-release does not move `stable`.
   The package has to be made **public** once by an org admin (GitHub → the org's
   Packages → `swarm` → Package settings → Change visibility → Public); until then
   an anonymous pull fails.

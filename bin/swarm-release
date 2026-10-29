@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# `swarm-release` — cut a SWARM release from the current `origin/main` and deploy it
+# to the VPS (docs/MANUAL.md, "The published image").
+#
+# Shows the current version, asks for the new one (X.Y.Z), bumps package.json,
+# commits `chore(release): vX.Y.Z` on main, tags it, pushes both, waits for the
+# publish workflow to build the image and move `:stable`, publishes the GitHub
+# release, then runs `dockerctl deploy app` on the server and checks that the
+# new version is live.
+#
+# Run by a maintainer, by hand: it commits to main directly, which an agent
+# session never does (ai/RULES.md §6).
+#
+# The server is reached as $SWARM_DEPLOY_SSH and checked at $SWARM_DEPLOY_URL.
+set -euo pipefail
+
+DEPLOY_SSH="${SWARM_DEPLOY_SSH:-jkwiecien@51.255.194.195}"
+DEPLOY_URL="${SWARM_DEPLOY_URL:-https://swarm-sm.pl}"
+REPO="SmartTechBrewery/swarm"
+WORKFLOW="publish-image.yml"
+
+die() {
+	echo "swarm-release: $*" >&2
+	exit 1
+}
+step() { printf '\n==> %s\n' "$*"; }
+
+cd "$(dirname "$0")/.."
+
+command -v gh >/dev/null || die "gh is not on PATH"
+gh auth status >/dev/null 2>&1 || die "gh is not signed in"
+
+step "Updating main"
+[ -z "$(command git status --porcelain)" ] || die "the working tree is not clean"
+[ "$(command git rev-parse --abbrev-ref HEAD)" = main ] || die "check out main first"
+command git pull --ff-only --tags origin main
+
+current=$(node -p "require('./package.json').version")
+previous_tag=$(command git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)
+echo "Current version: $current (latest tag: ${previous_tag:-none})"
+
+read -r -p "New version (X.Y.Z): " version
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "'$version' is not X.Y.Z"
+[ "$version" != "$current" ] || die "$version is already the current version"
+[ "$(printf '%s\n%s\n' "$current" "$version" | sort -V | tail -1)" = "$version" ] ||
+	die "$version is lower than $current"
+tag="v$version"
+command git rev-parse -q --verify "refs/tags/$tag" >/dev/null && die "tag $tag already exists"
+
+if [ -n "$previous_tag" ] && ! command git diff --quiet "$previous_tag" HEAD -- deploy/vps; then
+	echo
+	echo "WARNING: deploy/vps changed since $previous_tag. The server's compose file,"
+	echo "Caddyfile or .env may need the admin before or after this deploy:"
+	command git diff --stat "$previous_tag" HEAD -- deploy/vps
+	read -r -p "Continue anyway? [y/N] " answer
+	[[ "$answer" =~ ^[yY]$ ]] || die "aborted"
+fi
+
+step "Bumping to $version"
+npm version "$version" --no-git-tag-version >/dev/null
+command git commit -q -am "chore(release): $tag"
+command git tag "$tag"
+
+step "Pushing main and $tag"
+command git push --atomic origin main "$tag"
+sha=$(command git rev-parse HEAD)
+
+step "Waiting for the image build"
+run_id=""
+for _ in $(seq 1 30); do
+	run_id=$(gh run list --repo "$REPO" --workflow "$WORKFLOW" --commit "$sha" --event push \
+		--json databaseId,headBranch -q ".[] | select(.headBranch == \"$tag\") | .databaseId" | head -1)
+	[ -n "$run_id" ] && break
+	sleep 5
+done
+[ -n "$run_id" ] || die "no $WORKFLOW run started for $tag"
+gh run watch "$run_id" --repo "$REPO" --exit-status >/dev/null ||
+	die "the image build failed: https://github.com/$REPO/actions/runs/$run_id"
+echo "Image published as :$tag and :stable"
+
+step "Publishing the GitHub release"
+gh release create "$tag" --repo "$REPO" --verify-tag --title "$tag" --generate-notes
+
+step "Deploying to $DEPLOY_SSH"
+ssh "$DEPLOY_SSH" sudo dockerctl deploy app
+
+step "Checking $DEPLOY_URL"
+for _ in $(seq 1 24); do
+	if curl -fsS "$DEPLOY_URL/health" >/dev/null 2>&1; then
+		live=""
+		for js in $(curl -fsS "$DEPLOY_URL/" | grep -oE '/assets/[^"]+\.js'); do
+			curl -fsS "$DEPLOY_URL$js" | grep -q "\"$version\"" && live=yes && break
+		done
+		if [ -n "$live" ]; then
+			echo "$tag is live at $DEPLOY_URL"
+			exit 0
+		fi
+	fi
+	sleep 5
+done
+die "$DEPLOY_URL did not report $version within 2 minutes; check: ssh $DEPLOY_SSH sudo dockerctl logs app"

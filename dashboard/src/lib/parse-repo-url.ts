@@ -1,8 +1,16 @@
+import type { ScmProviderId } from './credentials.js';
+
 export interface ParsedRepoUrl {
 	owner: string;
 	repo: string;
 	id: string; // slugified repo name
 	name: string; // repo name as-is
+	/**
+	 * The source-control provider the URL's host belongs to, or `null` when the host
+	 * does not tell — a self-hosted instance, or any host not listed in
+	 * {@link scmProviderForHost} (issue #1181).
+	 */
+	provider: ScmProviderId | null;
 }
 
 /**
@@ -16,6 +24,10 @@ export interface ParsedRepoUrl {
  * An Azure DevOps URL reads as the three-segment `organization/project/repository` its
  * project's `repo` states (issue #1089 phase 6/6) — see {@link azureDevOpsRepoPath}, with
  * `owner` the `organization/project` pair.
+ *
+ * `provider` is read off the host alone, independently of whether the path is a shape
+ * that provider serves: an Azure DevOps URL whose path is not recognised still belongs
+ * to Azure DevOps, and selecting it lets the Repo field say what is missing.
  */
 export function parseRepoUrl(url: string): ParsedRepoUrl | null {
 	if (!url) return null;
@@ -35,8 +47,10 @@ export function parseRepoUrl(url: string): ParsedRepoUrl | null {
 	// 5. Split into segments and filter empty ones
 	const segments = str.split('/').filter(Boolean);
 
+	const provider = segments[0] ? scmProviderForHost(segments[0]) : null;
+
 	const azure = azureDevOpsRepoPath(segments);
-	if (azure) return toParsed(azure.owner, azure.name);
+	if (azure) return toParsed(azure.owner, azure.name, provider);
 
 	// We expect at least a host, an owner, and a repo name (at least 3 segments)
 	if (segments.length < 3) {
@@ -56,10 +70,14 @@ export function parseRepoUrl(url: string): ParsedRepoUrl | null {
 		return null;
 	}
 
-	return toParsed(owner, repoSegment);
+	return toParsed(owner, repoSegment, provider);
 }
 
-function toParsed(owner: string, name: string): ParsedRepoUrl | null {
+function toParsed(
+	owner: string,
+	name: string,
+	provider: ScmProviderId | null,
+): ParsedRepoUrl | null {
 	// ID: slugified repo name (lowercase, non-[a-z0-9-] runs collapsed to -, trimmed)
 	const id = name
 		.toLowerCase()
@@ -75,6 +93,7 @@ function toParsed(owner: string, name: string): ParsedRepoUrl | null {
 		repo: `${owner}/${name}`,
 		id,
 		name,
+		provider,
 	};
 }
 
@@ -84,6 +103,35 @@ const AZURE_DEVOPS_SSH_HOSTS: ReadonlySet<string> = new Set([
 	'vs-ssh.visualstudio.com',
 ]);
 const AZURE_DEVOPS_LEGACY_HOST_SUFFIX = '.visualstudio.com';
+
+/**
+ * The hosts each provider serves its repositories from — HTTPS and SSH alike, including
+ * the port-443 SSH hosts GitHub, Bitbucket and GitLab document for networks that block
+ * port 22. Azure DevOps' `vs-ssh.visualstudio.com` is covered by the legacy-host suffix.
+ */
+const SCM_PROVIDER_HOSTS: ReadonlyMap<string, ScmProviderId> = new Map<string, ScmProviderId>([
+	['github.com', 'github'],
+	['ssh.github.com', 'github'],
+	['bitbucket.org', 'bitbucket'],
+	['altssh.bitbucket.org', 'bitbucket'],
+	['gitlab.com', 'gitlab'],
+	['altssh.gitlab.com', 'gitlab'],
+	[AZURE_DEVOPS_HOST, 'azure-devops'],
+	['ssh.dev.azure.com', 'azure-devops'],
+]);
+
+/**
+ * The provider a URL's host (with any `:port`) belongs to, or `null` for a host none of
+ * them serves from — which is every self-hosted instance, since only the providers'
+ * public hosts can be told apart by name. Legacy `{org}.visualstudio.com` hosts are
+ * Azure DevOps' whatever the organization.
+ */
+function scmProviderForHost(rawHost: string): ScmProviderId | null {
+	const host = rawHost.toLowerCase().replace(/:\d+$/, '');
+	const known = SCM_PROVIDER_HOSTS.get(host);
+	if (known) return known;
+	return host.endsWith(AZURE_DEVOPS_LEGACY_HOST_SUFFIX) ? 'azure-devops' : null;
+}
 
 /**
  * The `organization/project` owner and repository name an Azure DevOps URL names, or
