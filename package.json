@@ -12,6 +12,7 @@
 	},
 	"scripts": {
 		"swarm": "node --env-file-if-exists=.env --import tsx/esm src/cli/index.ts",
+		"release": "bin/swarm-release",
 		"dev": "node --env-file=.env --import tsx/esm --watch src/index.ts",
 		"dev:router": "node --env-file=.env bin/kill-port.js ROUTER_PORT && node --env-file=.env --import tsx/esm --watch src/router/index.ts",
 		"dev:api": "npm run db:migrate && node --env-file=.env bin/kill-port.js API_PORT && node --import ./bin/load-env.js --import tsx/esm --watch --watch-path=./src src/api/server.ts",
