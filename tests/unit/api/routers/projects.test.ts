@@ -595,6 +595,64 @@ describe('projectsRouter', () => {
 				]);
 			});
 
+			// A reviewer token typed into the New Project dialog stands in for the stored
+			// default, so a project can be created on an installation that records none.
+			it('seeds a reviewer token supplied at creation without reading the stored default', async () => {
+				vi.mocked(resolveInstanceScmCredential).mockResolvedValue(null);
+
+				const created = await caller.create({
+					...validProjectInput,
+					reviewerToken: '  ghp_project_reviewer  ',
+				});
+
+				expect(resolveInstanceScmCredential).not.toHaveBeenCalled();
+				expect(vi.mocked(writeProjectCredential).mock.calls).toEqual([
+					['new-proj', 'GITHUB_TOKEN_REVIEWER', 'ghp_project_reviewer', null],
+				]);
+				// A secret, not config: it reaches neither the stored record nor the response.
+				expect(created).not.toHaveProperty('reviewerToken');
+				expect(vi.mocked(createProjectWithMemberInDb).mock.calls[0]?.[0]).not.toHaveProperty(
+					'reviewerToken',
+				);
+			});
+
+			it('prefers a supplied reviewer token over the stored default', async () => {
+				vi.mocked(resolveInstanceScmCredential).mockResolvedValue('ghp_instance_default');
+
+				await caller.create({ ...validProjectInput, reviewerToken: 'ghp_project_reviewer' });
+
+				expect(vi.mocked(writeProjectCredential).mock.calls).toEqual([
+					['new-proj', 'GITHUB_TOKEN_REVIEWER', 'ghp_project_reviewer', null],
+				]);
+			});
+
+			it('rejects a blank reviewer token rather than treating it as absent', async () => {
+				await expect(
+					caller.create({ ...validProjectInput, reviewerToken: '   ' }),
+				).rejects.toThrowError(expect.objectContaining({ code: 'BAD_REQUEST' }));
+				expect(createProjectWithMemberInDb).not.toHaveBeenCalled();
+			});
+
+			it('refuses a reviewer token for a provider whose reviewer cannot be set at creation', async () => {
+				_resetSCMProviderRegistryForTesting();
+				registerSCMProvider({
+					id: 'bitbucket',
+					label: 'Stub Bitbucket',
+					category: 'scm',
+					webhookRoute: '/stub-bitbucket/webhook',
+					credentialRoles: [
+						{ role: 'reviewer', envVarKey: 'BB_STUB_TOKEN_REVIEWER' },
+						{ role: 'webhookSecret', envVarKey: 'BB_STUB_WEBHOOK_SECRET' },
+					],
+				} as unknown as SCMProviderManifest);
+
+				await expect(
+					caller.create({ ...validProjectInput, scm: 'bitbucket', reviewerToken: 'bb_token' }),
+				).rejects.toThrowError(expect.objectContaining({ code: 'BAD_REQUEST' }));
+				expect(createProjectWithMemberInDb).not.toHaveBeenCalled();
+				expect(writeProjectCredential).not.toHaveBeenCalled();
+			});
+
 			// Issue #778: the value the guard resolved is threaded through to the write rather
 			// than read a second time, which closes the window where the default is cleared
 			// between check and seed.
