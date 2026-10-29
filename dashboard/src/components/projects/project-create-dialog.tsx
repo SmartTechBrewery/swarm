@@ -191,11 +191,16 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 		}
 		const parsed = parseRepoUrl(repoUrl);
 		if (parsed) {
+			// The URL's host names its provider (issue #1181), and the Repo format and the
+			// detection below both depend on it; a host that does not tell — a self-hosted
+			// instance — keeps whatever the operator has selected.
+			const provider = parsed.provider ?? scm;
 			setId(parsed.id);
 			setName(parsed.name);
 			setRepo(parsed.repo);
+			setScm(provider);
 			setUrlError('');
-			void detectBaseBranch(parsed.repo, scm);
+			void detectBaseBranch(parsed.repo, provider);
 		} else {
 			setUrlError('Invalid repository URL format.');
 		}
