@@ -137,16 +137,15 @@ export type QueuedBoardOutcome = z.infer<typeof queuedBoardOutcomeSchema>;
 /**
  * The queue-facing state of a waiting dispatch (mirrors
  * `PendingJobStateSchema`, issue #284): `waiting`/`prioritized` for
- * eligible-now work, `blocked` for a dispatch an event has to wake — a free
- * project slot, or the task's own checkout freeing (issue #759) — `delayed` for a
- * scheduled retry/recheck.
+ * eligible-now work, `blocked` for a dispatch an event has to wake — the task's
+ * own checkout freeing (issue #759), or a slot freeing in its repository's WIP
+ * limit (issue #1185) — `delayed` for a scheduled retry/recheck.
  */
 export const queuedRunStateSchema = z.enum(['waiting', 'prioritized', 'delayed', 'blocked']);
 export type QueuedRunState = z.infer<typeof queuedRunStateSchema>;
 
 /** Why a waiting dispatch isn't running (mirrors `QueuedWaitReasonSchema`). */
 export const queuedWaitReasonSchema = z.enum([
-	'project-capacity',
 	'rate-limit',
 	'agent-capacity',
 	'timeout',
@@ -257,20 +256,11 @@ export const queuedRunSchema = z.object({
 	 * failed the parse would take the whole queued-runs response down.
 	 */
 	priority: z.number().int(),
-	/**
-	 * Whether this dispatch is a prioritized SCM continuation (Review /
-	 * Respond-to-review / Respond-to-CI / Resolve-conflicts resumed after a
-	 * capacity wait) — the primary key the scheduler orders the capacity-blocked
-	 * bucket by (mirrors the server `QueuedRunSchema.continuation`, issue #374).
-	 */
-	continuation: z.boolean(),
-	/** Whether the project has SCM continuation prioritization active. */
-	prioritizeContinuations: z.boolean(),
 	/** ISO 8601 — when the job was enqueued. */
 	enqueuedAt: z.string(),
 	/**
-	 * ISO 8601 — when the dispatch became eligible; the capacity wake selector's
-	 * secondary ordering key, distinct from `enqueuedAt` (mirrors the server
+	 * ISO 8601 — when the dispatch became eligible; the `blocked` bucket's ordering
+	 * key, distinct from `enqueuedAt` (mirrors the server
 	 * `QueuedRunSchema.availableAt`, issue #374).
 	 */
 	availableAt: z.string(),

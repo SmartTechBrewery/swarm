@@ -8,7 +8,7 @@
 
 SWARM modelled one logical unit of work ("start or resume a pipeline phase") across four
 partly independent stores: BullMQ job state, `runs` rows, a Redis pending-continuation
-registry used only for project-capacity waits, and the GitHub Projects card status. No
+registry used only for project capacity waits, and the GitHub Projects card status. No
 store was canonical, state changes spanned them without an atomic protocol, and a process
 stop, queue removal, race, or partial write produced ambiguous orphans that neither the
 worker nor the dashboard could explain or repair (issues #269, #279: deferred runs whose
@@ -75,10 +75,14 @@ retry, a cancel and a slot release) resolve to exactly one winner.
   timeout plus margin). Startup and periodic reconciliation fail dispatches whose lease
   expired, alongside the existing
   `runs`-row sweeps.
-- **Project concurrency** is scheduling on a pending dispatch (`wait_reason =
-  'project-capacity'`), not a separate Redis registry. A freed slot selects the next
-  eligible dispatch under the existing continuation-priority policy and publishes its
-  wake-up; the worker re-checks the slot on claim and re-defers if it lost the race.
+- **Project concurrency** is scheduling on a pending dispatch (a capacity wait reason),
+  not a separate Redis registry. A freed slot selects the next eligible dispatch under
+  the existing continuation-priority policy and publishes its wake-up; the worker
+  re-checks the slot on claim and re-defers if it lost the race. *Superseded by issue
+  #1190*, which retired the project-wide job cap, this wait and its continuation
+  priority: a worker enrollment's `concurrencyAllocation` is the only job-level bound,
+  and the per-repository WIP limit (issue #1185) — itself an event-woken pending wait
+  of this shape — the only project-side one.
 - **Phase sequencing within one task** is the second such pending wait (`wait_reason =
   'task-in-flight'`, issues #759 and #761). Two phases must never hold the same
   `task-<id>` checkout, and the board-driven pair deliberately share a task id (issue

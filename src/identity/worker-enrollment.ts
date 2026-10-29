@@ -113,20 +113,19 @@ export const DEFAULT_ENROLLMENT_ALLOWED_PHASES: readonly TriggerPhase[] = ALL_TR
  *
  * There is deliberately **no "unbounded" value**: "no per-worker cap" used to be
  * expressible as `NULL`, which was a second way of saying a number — on a default
- * install it already resolved to an effective 1, because the limit it deferred
- * to (the project's `maxConcurrentJobs`) defaults to 1. Every enrollment now states its share outright; a worker
- * meant to take several of a project's slots says so with a larger allocation.
+ * install it already resolved to an effective 1, because the project-wide job cap
+ * it deferred to (retired by issue #1190) defaulted to 1. Every enrollment now
+ * states its share outright; a worker meant to take several of a project's jobs
+ * says so with a larger allocation. Since that cap went, this is the only bound on
+ * how many of a project's jobs run at once — per worker, summed across them.
  */
 export const ConcurrencyAllocationSchema = z.number().int().positive();
 
 /**
  * The allocation a new enrollment gets when the operator names none — the safe
- * value, and the one SWARM's other concurrency default already carries:
- * `PROJECT_DEFAULTS.maxConcurrentJobs` (`src/config/schema.ts`) is `1` too.
- * Kept separate from it rather than derived from it: they bound different things
- * (a project, one worker's share of a project) and happen to agree on the value,
- * so re-defaulting one must not silently move the other. The `worker_project_enrollments.concurrency_allocation` column default
- * mirrors this constant.
+ * value: one job of the project at a time on this worker. The
+ * `worker_project_enrollments.concurrency_allocation` column default mirrors this
+ * constant.
  */
 export const DEFAULT_CONCURRENCY_ALLOCATION = 1;
 

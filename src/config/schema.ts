@@ -93,8 +93,6 @@ export { CUSTOM_PROMPT_MAX_LENGTH, normalizeCustomPrompt };
 export const PROJECT_DEFAULTS = {
 	baseBranch: 'main',
 	branchPrefix: 'issue-',
-	/** One job per project at a time until an operator raises it. */
-	maxConcurrentJobs: 1,
 	/**
 	 * One ticket in flight per repository until an operator raises it (issue #1185) —
 	 * `repositories[].wipLimit`, resolved by `resolveWipLimit`.
@@ -526,18 +524,6 @@ export const PipelineBaseSchema = z.object({
 		.optional(),
 	respondToCi: z.object({ enabled: z.boolean().optional() }).optional(),
 	/**
-	 * When a continuation of already-active pipeline work is blocked *solely* by
-	 * this project's concurrency limit, prioritize it over fresh
-	 * Planning/Implementation work once a slot frees, instead of sending it
-	 * through the generic rate-limit retry delay (issue #214). Unset (or the
-	 * whole `pipeline` block omitted) defaults to `true`; set `false` to preserve
-	 * the prior best-effort/FIFO scheduling for maximum new-work throughput.
-	 *
-	 * Applies to Review, Respond-to-review, Respond-to-CI, and
-	 * Resolve-conflicts; Planning and Implementation remain new board work.
-	 */
-	prioritizeContinuations: z.boolean().optional(),
-	/**
 	 * How many times one run may be continued from its Tier 2 checkpoint
 	 * (`docs/CHECKPOINTS.md`) before the fallback gives up and the run fails
 	 * terminally with a "continuation budget exhausted" reason. Unset (or the whole
@@ -889,9 +875,6 @@ export const ProjectRecordBaseSchema = z.object({
 	 * same value is meaningful beneath each execution host's own `repoRoot`.
 	 */
 	worktreeRoot: z.string().min(1).default(PROJECT_DEFAULTS.worktreeRoot),
-
-	/** Maximum number of jobs this project may run concurrently. */
-	maxConcurrentJobs: z.number().int().positive().default(PROJECT_DEFAULTS.maxConcurrentJobs),
 
 	/** Discovery / open-join policy (`ProjectVisibilitySchema`); `private` by default. */
 	visibility: ProjectVisibilitySchema.default('private'),

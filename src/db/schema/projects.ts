@@ -1,4 +1,4 @@
-import { integer, jsonb, pgTable, text, timestamp } from 'drizzle-orm/pg-core';
+import { jsonb, pgTable, text, timestamp } from 'drizzle-orm/pg-core';
 
 import type {
 	AgentsConfig,
@@ -54,9 +54,6 @@ export const projects = pgTable('projects', {
 	repositories: jsonb('repositories').$type<ProjectRepository[]>().notNull(),
 	repoRoot: text('repo_root').notNull(),
 	worktreeRoot: text('worktree_root').notNull().default(PROJECT_DEFAULTS.worktreeRoot),
-	maxConcurrentJobs: integer('max_concurrent_jobs')
-		.notNull()
-		.default(PROJECT_DEFAULTS.maxConcurrentJobs),
 	/**
 	 * Discovery / open-join policy — one of `ProjectVisibilitySchema`
 	 * (`src/config/schema.ts`, the source of truth for the values), stored as

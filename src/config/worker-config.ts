@@ -46,8 +46,7 @@ export const WORKER_SAFE_KEYS = [
  * Fields that never leave the control plane: the host-specific `repoRoot`, the
  * secret-bearing `credentials` block (persona token references + webhook secret — the hard exclusion the
  * acceptance criteria require), plus control-plane-only policy and
- * provider-specific IDs (pipeline board-move policy, visibility, the scheduler
- * concurrency knob, and `pm` — which since issue #495 is the provider
+ * provider-specific IDs (pipeline board-move policy, visibility, and `pm` — which since issue #495 is the provider
  * discriminator *and* its board/field IDs in one union, so excluding the block
  * excludes the mapping with it) that a remote worker cannot act on and does not
  * need. `pmRoutingToken` (issue #686) belongs with `pm` for the same reason twice
@@ -71,7 +70,6 @@ export const SERVER_ONLY_KEYS = [
 	'wipLimit',
 	'pipeline',
 	'visibility',
-	'maxConcurrentJobs',
 ] as const;
 
 const workerSafeMask = Object.fromEntries(WORKER_SAFE_KEYS.map((k) => [k, true as const])) as {

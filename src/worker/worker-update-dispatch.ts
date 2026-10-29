@@ -5,12 +5,12 @@
  *
  * Modelled on `./merge-automation.ts`, the existing precedent for a dispatch
  * that carries no webhook event, resolves no trigger, provisions no worktree,
- * takes no project slot, and settles itself against the claimed dispatch record.
+ * takes no WIP slot, and settles itself against the claimed dispatch record.
  * All this one does is ask the control plane — the side holding worker sockets —
  * to push the frame, and record what came of that.
  *
  * **Nothing is preempted.** It resolves no trigger, claims no task, takes no
- * project slot and touches no run but its own, so a phase already executing is
+ * WIP slot and touches no run but its own, so a phase already executing is
  * never cancelled, deferred or failed to make room for an update. That holds
  * because nothing was added, not because something checks.
  *

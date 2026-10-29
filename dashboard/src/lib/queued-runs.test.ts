@@ -26,8 +26,6 @@ function githubRun(overrides: Partial<QueuedRun> = {}): QueuedRun {
 		repo: 'acme/widgets',
 		prNumber: '42',
 		priority: 0,
-		continuation: false,
-		prioritizeContinuations: true,
 		enqueuedAt: '2026-07-17T10:00:00.000Z',
 		availableAt: '2026-07-17T10:00:00.000Z',
 		...overrides,
@@ -46,8 +44,6 @@ function boardRun(overrides: Partial<QueuedRun> = {}): QueuedRun {
 		workItemTitle: 'Fix the widget',
 		workItemUrl: 'https://github.com/acme/widgets/issues/42',
 		priority: 5,
-		continuation: false,
-		prioritizeContinuations: true,
 		enqueuedAt: '2026-07-17T09:00:00.000Z',
 		availableAt: '2026-07-17T12:00:00.000Z',
 		runsAt: '2026-07-17T12:00:00.000Z',
@@ -84,8 +80,6 @@ describe('a worker-update row', () => {
 			phaseHint: 'worker-update',
 			// Outranks everything already waiting — the schema must accept it.
 			priority: -10,
-			continuation: false,
-			prioritizeContinuations: true,
 			enqueuedAt: '2026-07-17T10:00:00.000Z',
 			availableAt: '2026-07-17T10:00:00.000Z',
 		};
@@ -509,7 +503,7 @@ describe('groupQueuedRuns', () => {
 		expect(rows.every((r) => r.boardDuplicateCount === 0)).toBe(true);
 	});
 
-	// A dispatch that already owns a run (a capacity-blocked continuation or a
+	// A dispatch that already owns a run (an event-blocked continuation or a
 	// deferred/resuming run) is a distinct unit of work, not a display duplicate.
 	it('never folds a board dispatch that owns a runId', () => {
 		const fresh = boardRun({ jobId: 'job-fresh', workItemNodeId: 'PVTI_card_y' });

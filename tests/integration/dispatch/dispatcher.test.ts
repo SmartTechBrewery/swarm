@@ -19,7 +19,7 @@ import {
 	claimDispatchForJob,
 	createAndPublishDispatch,
 	promoteAvailabilityWaitsForWorker,
-	promoteNextCapacityDispatch,
+	promoteTaskInFlightWaits,
 	publishDispatchWakeUp,
 	scheduleCoalescedDispatch,
 	wakeJobId,
@@ -177,27 +177,8 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 			});
 		});
 
-		it('slot release wakes the next capacity-blocked dispatch with a fresh deterministic id', async () => {
-			const { dispatch } = await createDispatch({
-				projectId: PROJECT_ID,
-				jobPayload: job(),
-				source: 'webhook',
-				state: 'pending',
-				waitReason: 'project-capacity',
-			});
-
-			await promoteNextCapacityDispatch(PROJECT_ID, true);
-
-			const ids = await pendingJobIds();
-			expect(ids).toEqual([wakeJobId(dispatch)]);
-
-			// Promotion is idempotent under racing slot releases (same job id).
-			await promoteNextCapacityDispatch(PROJECT_ID, true);
-			expect(await pendingJobIds()).toHaveLength(1);
-		});
-
-		// Issue #610. The availability wake-up's real difference from the capacity one:
-		// it promotes a `retry-scheduled` row that already holds a *delayed* wake-up, so
+		// Issue #610. The availability wake-up's real difference from the task-in-flight
+		// one: it promotes a `retry-scheduled` row that already holds a *delayed* wake-up, so
 		// the stale one has to go rather than be overwritten.
 		it('an available worker replaces the delayed wake-up with an immediate one', async () => {
 			const owner = await createUser({ identifier: 'wake@example.com', displayName: 'Owner' });
@@ -294,24 +275,25 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 				dedupKey: 'delivery:d-a',
 				source: 'webhook',
 			});
-			const capacity = await createDispatch({
+			const sequenced = await createDispatch({
 				projectId: PROJECT_ID,
 				jobPayload: job({ deliveryId: 'd-b' }),
 				dedupKey: 'delivery:d-b',
 				source: 'webhook',
 				state: 'pending',
-				waitReason: 'project-capacity',
+				taskId: '17',
+				waitReason: 'task-in-flight',
 			});
 
 			const result = await cancelAllWaitingWork('cleared in test');
 
 			expect(result.cancelledDispatches).toBe(2);
 			expect(await pendingJobIds()).toHaveLength(0);
-			// Nothing can resurrect the capacity dispatch: a late slot release
+			// Nothing can resurrect the sequenced dispatch: a late settle of the task
 			// finds nothing to promote, and a claim refuses.
-			await promoteNextCapacityDispatch(PROJECT_ID, true);
+			await promoteTaskInFlightWaits(PROJECT_ID, '17');
 			expect(await pendingJobIds()).toHaveLength(0);
-			expect(await claimDispatch(capacity.dispatch.id, 'w:1', 60_000)).toBeNull();
+			expect(await claimDispatch(sequenced.dispatch.id, 'w:1', 60_000)).toBeNull();
 		});
 	},
 );

@@ -83,7 +83,6 @@ import {
 	DISPATCH_LEASE_OWNER,
 	parseDispatchPayload,
 	promoteAvailabilityWaitsForWorker,
-	promoteNextCapacityDispatch,
 	promotePullRequestInFlightWaits,
 	promoteTaskInFlightWaits,
 	publishDispatchWakeUp,
@@ -95,7 +94,7 @@ import {
 	preservedCheckoutMachineUnknown,
 	preservedContinuationKind,
 } from '../dispatch/preserved-worker.js';
-import { deriveCapacityPendingPayload, deriveRetryJobPayload } from '../dispatch/retry-payload.js';
+import { derivePreRunPendingPayload, deriveRetryJobPayload } from '../dispatch/retry-payload.js';
 import {
 	admitTicket,
 	type BoardTriggerResult,
@@ -250,11 +249,6 @@ import {
 } from './merge-automation.js';
 import { loadRunnableDispatchDemands } from './pool-demand.js';
 import {
-	acquireProjectSlot,
-	releaseProjectSlot,
-	type SlotAcquisition,
-} from './project-concurrency.js';
-import {
 	beginRunCancellationTracking,
 	linkRunAbortController,
 	RunTerminatedError,
@@ -401,16 +395,9 @@ export type JobOutcome =
 			 */
 			continuationDispatchClaimed?: boolean;
 			/**
-			 * Set when this deferral should be retained in the pending-continuation
-			 * registry (issue #214), so a freed project slot promotes its delayed retry
-			 * ahead of new board work. `reenqueueDeferred` registers it after enqueuing
-			 * the fallback retry.
-			 */
-			pendingContinuation?: boolean;
-			/**
-			 * A project-slot deferral. Unlike a provider failure, its dispatch is
-			 * returned to `pending` (wait reason `project-capacity`) and awakened
-			 * only by a released slot, not a timer.
+			 * A pre-run deferral (`task-in-flight`, `pr-in-flight`, `wip-limit`). Unlike
+			 * a provider failure, its dispatch is returned to `pending` and awakened
+			 * only by an event — what it waits on freeing — not a timer.
 			 */
 			pendingDispatch?: boolean;
 			/**
@@ -1155,7 +1142,7 @@ async function deferWorkerIneligible(
 		// The gate refuses before `tryCreateRun`, so a fresh dispatch has no row yet
 		// (`runId` is undefined). A retry carries its originating row, which must
 		// survive so the next re-check keeps re-using it rather than orphaning it —
-		// the same reason the concurrency deferral carries `job.runId`.
+		// the same reason a pre-run deferral carries `job.runId`.
 		runId: runId ?? job.runId,
 	};
 	// The handler claimed this phase's dispatch dedup slot before the gate ran, and
@@ -1165,10 +1152,6 @@ async function deferWorkerIneligible(
 	// `completed` with no run row and no error. The fast availability wake (issue
 	// #610) makes that certain rather than merely likely, since it fires seconds
 	// into the claim's TTL instead of just after it.
-	//
-	// `pendingContinuation` is deliberately *not* set: it orders project-slot
-	// promotion via `deferDispatchToPending`'s `continuation` column, and an
-	// eligibility wait is a timed re-check, not a slot wait.
 	if (
 		await retainContinuationDispatchClaim(
 			project,
@@ -1359,9 +1342,10 @@ async function settleDispatchRetry(
 /**
  * The `phase-deferred` outcome shared by `processJob`'s **pre-run** waits: a
  * claimed dispatch handed back to `pending`, eligible immediately, woken by an
- * event rather than a timer — a freed project slot (issue #284) or the task's own
- * checkout freeing (issue #759) — and spending no attempt, since waiting for one of
- * those is not a failure.
+ * event rather than a timer — the task's own checkout freeing (issue #759), the
+ * pull request's head branch freeing (issue #850) or a WIP slot freeing (issue
+ * #1185) — and spending no attempt, since waiting for one of those is not a
+ * failure.
  */
 function buildPendingDeferral(
 	job: SwarmJob,
@@ -1385,18 +1369,17 @@ function buildPendingDeferral(
 }
 
 /**
- * Hand a claimed dispatch back to `pending` under one of the two **pre-run**
- * waits — `processJob`'s deferral path, split out so that function stays within
- * the complexity budget (the file already splits helpers this way), and shared by
- * both callers so a task-in-flight wait behaves exactly like a capacity wait
- * (issue #759) rather than re-deriving half of it.
+ * Hand a claimed dispatch back to `pending` under one of the **pre-run** waits —
+ * `processJob`'s deferral path, split out so that function stays within the
+ * complexity budget (the file already splits helpers this way), and shared by
+ * every caller so each wait behaves exactly like the others rather than
+ * re-deriving half of it.
  *
  * The dispatch is returned to `pending` with the caller's `waitReason` and its
  * exact dispatch intent persisted — PM jobs carry `resumePmPhase` so a stale board
  * status cannot deduplicate the resumed phase — and is woken by an event, not a
  * timer (issue #284). Its run row becomes visible immediately. SCM continuations
- * retain their dispatch dedup claim and optionally receive priority over board
- * work; retaining that claim matters for *both* waits, since a `review` /
+ * retain their dispatch dedup claim; retaining that claim matters for *every* wait, since a `review` /
  * `respond-to-ci` / `resolve-conflicts` dispatch that let its claim lapse would be
  * refused by it on waking (issue #214) — dropped for a second reason.
  *
@@ -1433,7 +1416,7 @@ async function deferBeforeRun(
 	);
 	if (runId) deferred.runId = runId;
 
-	// Retain a blocked SCM phase as a prioritized continuation once it can run.
+	// Retain a blocked SCM phase's dispatch claim so it can run once woken.
 	if (
 		await retainContinuationDispatchClaim(
 			project,
@@ -1443,12 +1426,11 @@ async function deferBeforeRun(
 		)
 	) {
 		deferred.continuationDispatchClaimed = true;
-		deferred.pendingContinuation = project.pipeline?.prioritizeContinuations !== false;
 	}
 
 	// Persist the durable wait *before* settling the visible run: the dispatch row
 	// is the retry intent, so a crash after this line loses nothing.
-	const pendingPayload = deriveCapacityPendingPayload(job, {
+	const pendingPayload = derivePreRunPendingPayload(job, {
 		phase: trigger.phase,
 		runId: deferred.runId,
 		resumable: false,
@@ -1458,12 +1440,11 @@ async function deferBeforeRun(
 	const pending = await deferDispatchToPending(dispatch.id, {
 		jobPayload: pendingPayload,
 		waitReason: wait.waitReason,
-		continuation: deferred.pendingContinuation === true,
 		runId: deferred.runId,
 		repository: wait.repository,
 	});
 
-	// This pre-try/catch path must settle the visible run now. Neither pre-run wait
+	// This pre-try/catch path must settle the visible run now. No pre-run wait
 	// has a scheduled timestamp: an event, not polling, wakes it.
 	//
 	// Guarded on `running` — the status `tryCreateRun` left the row in a few lines
@@ -1478,28 +1459,6 @@ async function deferBeforeRun(
 	return { outcome: deferred, pending };
 }
 
-/**
- * Handle a job blocked by the project's concurrency limit — woken by a freed slot
- * (issue #284).
- */
-async function handleConcurrencyDeferral(
-	dispatch: DispatchRow,
-	job: SwarmJob,
-	trigger: TriggerResult,
-	project: ProjectConfig,
-): Promise<JobOutcome> {
-	logger.warn(`Phase deferred - ${phaseLabel(trigger.phase)} — project at concurrency limit`, {
-		projectId: project.id,
-		phase: trigger.phase,
-		taskId: trigger.taskId,
-	});
-	const { outcome } = await deferBeforeRun(dispatch, job, trigger, project, {
-		waitReason: 'project-capacity',
-		reason: `Project '${project.id}' is at its concurrent-job limit`,
-	});
-	return outcome;
-}
-
 /** Whether this is one of the two board-driven phases — the only ones the WIP limit gates. */
 function isBoardTrigger(trigger: TriggerResult): trigger is BoardTriggerResult {
 	return trigger.phase === 'planning' || trigger.phase === 'implementation';
@@ -1507,7 +1466,7 @@ function isBoardTrigger(trigger: TriggerResult): trigger is BoardTriggerResult {
 
 /**
  * Handle a new ticket's start refused by its repository's WIP limit (issue #1185) —
- * the twin of {@link handleConcurrencyDeferral}: an event-woken `wip-limit` pending
+ * the twin of {@link handleTaskInFlightDeferral}: an event-woken `wip-limit` pending
  * wait with a visible run row naming the tickets in flight, and the repository
  * recorded on the dispatch so a released slot can find it (`promoteWipWaits`).
  *
@@ -3436,8 +3395,8 @@ async function finalizeFailedRun(
 	// Present only for the in-worker phase-failure path: lets a user-terminated
 	// run reconcile its checkout (`src/worktree/termination-cleanup.ts`) now that
 	// its agent has exited, so the persisted recovery record matches what was left
-	// on disk. Omitted for the pre-run concurrency deferral (a `phase-deferred`
-	// outcome that never provisioned a worktree).
+	// on disk. Omitted for a pre-run deferral (a `phase-deferred` outcome that
+	// never provisioned a worktree).
 	reconcile?: { project: ProjectConfig; taskId: string; worktrees?: GitWorktreeManager },
 	// The settle's atomic guard ({@link CompleteRunInput.fromStatus}), supplied by
 	// the one caller whose write races another party's — see `deferBeforeRun`.
@@ -5101,11 +5060,6 @@ async function bindSelectedWorker(
 				unavailableReason,
 				`Worker '${selection.workerName}' lost its live session or available capacity before execution could be claimed. Waiting and re-checking eligibility.`,
 			);
-		case 'project-capacity':
-			throw new WorkerIneligibleError(
-				'worker-unavailable',
-				`Project '${dispatch.projectId}' reached its configured concurrent-job limit before worker execution could be claimed. Waiting for an active dispatch to settle.`,
-			);
 		case 'missing-enrollment':
 		case 'missing-consent':
 		// A drain (issue #919) belongs with the three structural refusals rather than
@@ -5583,7 +5537,7 @@ export async function processJob(
 
 	// The agent-less dispatch kind (issue #292): a merge-automation dispatch
 	// carries no webhook event, resolves no trigger, provisions no worktree, and
-	// takes no project slot — it settles itself (complete / fail / bounded
+	// takes no WIP slot — it settles itself (complete / fail / bounded
 	// retry-scheduled) against the claimed dispatch record.
 	if (job.type === 'merge-automation') {
 		return processMergeAutomationDispatch(dispatch, job, project);
@@ -5634,10 +5588,10 @@ export async function processJob(
 	// dispatch must carry the project's configured automation label before SWARM
 	// starts an agent phase for it. Checked here, at the composition root, on *every*
 	// dispatch — a fresh webhook, a delayed retry, a self-enqueued next phase, a
-	// capacity promotion, a reconciler republish, a manual "Retry now" — so removing
+	// slot-release promotion, a reconciler republish, a manual "Retry now" — so removing
 	// the label stops all later dispatches (it never terminates a run already in
-	// flight). It runs before the repository's WIP limit, the in-flight guard and
-	// `acquireProjectSlot`, so a skip costs no slot, no worktree, and no tokens. This
+	// flight). It runs before the repository's WIP limit and the in-flight guard,
+	// so a skip costs no slot, no worktree, and no tokens. This
 	// is also where #339's worker-eligibility check belongs: a dispatch is eligible only when the worker is
 	// authorized *and* the item is opted in. Every phase is gated: the board-driven
 	// ones carry their work item on the trigger, and the four SCM continuation phases
@@ -5752,7 +5706,6 @@ export async function processJob(
 		}
 		return { status: 'skipped-in-flight', phase: trigger.phase, taskId: trigger.taskId };
 	}
-	let slot: SlotAcquisition = { acquired: true, tracked: false };
 
 	let runId: string | undefined;
 	// The worker whose execution claim this dispatch holds, once the fenced bind
@@ -5857,9 +5810,6 @@ export async function processJob(
 			// unexpired dispatch claim), so from here on this dispatch settling frees a
 			// slot on that machine — which is what the `finally` promotes on (#610).
 			claimedWorkerId = selection.workerId;
-		} else {
-			slot = await acquireProjectSlot(project.id, project.maxConcurrentJobs);
-			if (!slot.acquired) return handleConcurrencyDeferral(dispatch, job, trigger, project);
 		}
 
 		// Record a run-history row for this agent-CLI invocation. Everything here is
@@ -6037,7 +5987,7 @@ export async function processJob(
 		const outcome = await handlePhaseFailure(err, job, trigger, project, runId, dispatch.id);
 		preserveCancellationMarker = outcome.status === 'phase-deferred';
 		// Reconcile the terminated run's checkout before the `finally` clears
-		// cancellation tracking and releases the project slot.
+		// cancellation tracking.
 		await finalizeFailedRun(runId, outcome, err, { project, taskId: trigger.taskId });
 		// …and the row a continuation *carries*, which the settle above cannot reach
 		// because the gate refuses before this dispatch has a run of its own (#954).
@@ -6102,21 +6052,6 @@ export async function processJob(
 					phase: trigger.phase,
 				});
 			}
-		}
-		// Release the slot once the run settles (success, failure, or deferral) so
-		// a later legitimate dispatch for the same task — a genuine retry, or a
-		// re-run after this one finished — isn't blocked. A deferred job is
-		// re-enqueued and re-enters `processJob` fresh, past this release.
-		if (slot.acquired && slot.tracked) {
-			await releaseProjectSlot(project.id);
-			// A slot just freed — wake the next capacity-blocked dispatch for this
-			// project (issues #214/#219, #284) so SCM work blocked only by concurrency
-			// runs ahead of new board work. No-op when nothing is pending or the
-			// policy is off; never reserves a slot.
-			await promoteNextCapacityDispatch(
-				project.id,
-				project.pipeline?.prioritizeContinuations !== false,
-			);
 		}
 		// The same move for the *worker* whose claim this dispatch held (issue #610):
 		// it has just settled — success, failure, cancellation, or deferral alike — so

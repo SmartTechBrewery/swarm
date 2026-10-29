@@ -49,7 +49,6 @@ function rowToProjectRecord(row: ProjectRow): ProjectRecord {
 		repositories: row.repositories,
 		repoRoot: row.repoRoot,
 		worktreeRoot: row.worktreeRoot,
-		maxConcurrentJobs: row.maxConcurrentJobs,
 		visibility: row.visibility as ProjectVisibility,
 		// A `NULL` scm_type is a project that states no SCM provider, which is a
 		// different thing from one that states `github` — spread it in only when the
@@ -96,7 +95,6 @@ function projectRecordToRow(record: ProjectRecord) {
 		repositories: record.repositories,
 		repoRoot: record.repoRoot,
 		worktreeRoot: record.worktreeRoot,
-		maxConcurrentJobs: record.maxConcurrentJobs,
 		visibility: record.visibility,
 		// `null`, not `'github'`, when the project states no provider — see the
 		// `scm_type` column comment (`src/db/schema/projects.ts`).

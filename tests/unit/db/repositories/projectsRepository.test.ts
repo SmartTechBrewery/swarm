@@ -92,7 +92,6 @@ const row = {
 	repositories: [{ repo: 'SmartTechBrewery/swarm', baseBranch: 'main', branchPrefix: 'issue-' }],
 	repoRoot: '/Users/dev/swarm',
 	worktreeRoot: '.swarm-workspaces',
-	maxConcurrentJobs: 4,
 	pmType: 'github-projects',
 	// `pm` persists split: the discriminator in `pm_type`, the provider's own config
 	// in the generic `pm_config` blob (issue #495).
@@ -118,7 +117,6 @@ describe('projectsRepository', () => {
 			expect(project).toMatchObject({
 				id: 'proj-1',
 				repo: 'SmartTechBrewery/swarm',
-				maxConcurrentJobs: 4,
 				pm: { type: 'github-projects' },
 				credentials: { implementer: 'IMPL', reviewer: 'REV', webhookSecret: 'HOOK' },
 			});
@@ -515,12 +513,6 @@ describe('projectsRepository', () => {
 			const { values } = stubInsert([{ id: 'proj-1' }]);
 			await upsertProjectToDb(createMockProjectRecord({ id: 'proj-1' }));
 			expect(values).toHaveBeenCalledTimes(1);
-		});
-
-		it('writes the configured maximum concurrent jobs', async () => {
-			const { values } = stubInsert();
-			await upsertProjectToDb(createMockProjectRecord({ id: 'proj-1', maxConcurrentJobs: 3 }));
-			expect(values.mock.calls[0][0]).toMatchObject({ maxConcurrentJobs: 3 });
 		});
 
 		it('writes the agents block as-is when the config sets one', async () => {

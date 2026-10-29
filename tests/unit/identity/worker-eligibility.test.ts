@@ -201,8 +201,8 @@ describe('evaluateWorkerEligibility', () => {
 	it('gates on the default allocation of 1 — there is no uncapped enrollment (issue #480)', () => {
 		// The capacity test lost its null case with #480: every enrollment states its
 		// share of the project, so one active run already fills a default allocation:
-		// the enrollment's own allocation is what gates, with the project's
-		// maxConcurrentJobs on top.
+		// the enrollment's own allocation is what gates — and since issue #1190 retired
+		// the project-wide job cap, nothing else does.
 		const enrollment = makeEnrollment({
 			concurrencyAllocation: DEFAULT_CONCURRENCY_ALLOCATION,
 		});

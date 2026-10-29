@@ -455,7 +455,7 @@ export function deliverDispatchResult(
  * the durable dispatch row is then the whole story.
  *
  * Without this the awaiting job stays parked until `timeoutMs +
- * RESULT_WAIT_MARGIN_MS` (`./dispatcher.ts`) holding the project slot and a BullMQ
+ * RESULT_WAIT_MARGIN_MS` (`./dispatcher.ts`) holding a BullMQ
  * concurrency slot — the settle would reach the rows and none of the capacity — and
  * it would then settle the same run *again*, as a deferral, over the terminal state
  * the reap wrote.

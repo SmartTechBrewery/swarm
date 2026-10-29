@@ -459,15 +459,17 @@ export function reconstructResetJob(
 }
 
 /**
- * The payload an event-woken **pre-run** wait defers with — a project-capacity
- * block, or a task whose earlier phase has not settled (`task-in-flight`: still
- * executing, issue #759, or a Planning dispatch an Implementation must not overtake,
- * issue #761): the attempt counter is *not* consumed (waiting on a slot or on a
- * sibling phase isn't a failure), but PM dispatch intent and the held dedup claim are
+ * The payload an event-woken **pre-run** wait defers with — a task whose earlier
+ * phase has not settled (`task-in-flight`: still executing, issue #759, or a
+ * Planning dispatch an Implementation must not overtake, issue #761), a writing
+ * phase behind another on the same pull request (`pr-in-flight`, issue #850), or a
+ * ticket refused by its repository's WIP limit (`wip-limit`, issue #1185): the
+ * attempt counter is *not* consumed (waiting on a slot or on a sibling phase isn't
+ * a failure), but PM dispatch intent and the held dedup claim are
  * recorded so the eventual wake-up re-enters its original phase unambiguously even
  * after status-dedup TTLs expire.
  */
-export function deriveCapacityPendingPayload(
+export function derivePreRunPendingPayload(
 	parsed: SwarmJob,
 	intent: DeferredRetryIntent,
 ): SwarmJob {

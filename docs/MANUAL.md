@@ -797,9 +797,11 @@ nobody is doing the asking, and the weekly ask leaves every machine's stored ans
 standing — so "never swept" is never an artefact of the schedule. It reads every
 owner's machines, so it is an installation administrator's.
 
-The **router** dequeues and dispatches; a project's **Maximum Concurrent Jobs**
-setting and each enrolled worker's **concurrency allocation** are what bound how
-many of its runs happen at once. Dispatch always runs on the control
+The **router** dequeues and dispatches; each enrolled worker's **concurrency
+allocation** is what bounds how many of a project's runs happen at once on that
+machine — the project-wide **Maximum Concurrent Jobs** setting was retired by issue
+#1190, so a project's runs are bounded only by the allocations of the workers
+enrolled in it, and new tickets by each repository's WIP limit below. Dispatch always runs on the control
 plane (ADR-003 §2): there is no second arrangement — the in-process executor was
 deleted so that one path carries every run. A project with no enrolled, connected
 worker leaves its dispatch durably pending; a wait for a *machine* ends as soon
@@ -827,8 +829,9 @@ reached Done or Backlog without SWARM seeing the move, or its repository was rem
 from the project — so removing the label frees the slot within one sweep. A card the
 sweep cannot read keeps its slot until a later pass can. A failed run keeps its slot — the ticket is waiting on you — so to free one by
 hand, close the pull request or move the card to Backlog or Done. Tickets already in
-flight when the limit shipped hold no slot. Until Maximum Concurrent Jobs is retired
-both caps apply, so an admitted ticket can still wait for a project slot.
+flight when the limit shipped hold no slot. It is the only project-side bound: an
+admitted ticket never waits for a project slot, only for a worker with a free
+allocation.
 
 The **WIP** section of the Runs screen, between Stalled and the Queue, shows how full
 each repository is (issue #1192). A repository row reads `x / y in flight` and, when

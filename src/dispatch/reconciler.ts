@@ -30,7 +30,6 @@ import {
 	failExpiredDispatchLeases,
 	failSupersededWorkerDispatchClaims,
 	listDeferredRunsWithoutActiveDispatch,
-	listProjectsWithCapacityPending,
 	listWakeablePendingDispatches,
 } from '../db/repositories/dispatchesRepository.js';
 import { findProjectByIdFromDb } from '../db/repositories/projectsRepository.js';
@@ -46,7 +45,7 @@ import { type MergeAutomationJob, type SwarmJob, SwarmJobSchema } from '../queue
 import { priorityFor } from '../queue/producer.js';
 import type { TriggerPhase } from '../triggers/types.js';
 import { mergeDispatchDedupKey } from '../worker/merge-automation.js';
-import { promoteNextCapacityDispatch, publishDispatchWakeUp } from './dispatcher.js';
+import { publishDispatchWakeUp } from './dispatcher.js';
 import { promoteAllWipWaits } from './wip-limit.js';
 
 /** The Redis namespace the retired pending-continuation registry lived under. */
@@ -139,23 +138,12 @@ async function republishWakeUps(): Promise<number> {
 	return published;
 }
 
-/** Wake capacity-blocked work in every project that holds some. */
-async function promoteCapacityPending(
-	prioritizeContinuationsFor: (projectId: string) => boolean,
-): Promise<void> {
-	const projectIds = await listProjectsWithCapacityPending();
-	for (const projectId of projectIds) {
-		await promoteNextCapacityDispatch(projectId, prioritizeContinuationsFor(projectId));
-	}
-}
-
 /** Parse a legacy pending-continuation entry; `undefined` for malformed values. */
 function parseLegacyContinuation(raw: string):
 	| {
 			taskId: string;
 			phase: string;
 			job: SwarmJob;
-			continuation: boolean;
 	  }
 	| undefined {
 	try {
@@ -166,7 +154,6 @@ function parseLegacyContinuation(raw: string):
 				taskId: value.taskId,
 				phase: value.phase,
 				job: job.data,
-				continuation: value.continuation === true,
 			};
 		}
 	} catch {
@@ -177,7 +164,8 @@ function parseLegacyContinuation(raw: string):
 
 /**
  * One-time import of the retired Redis pending-continuation registry into
- * capacity-pending dispatches. Each imported field is deleted from Redis only
+ * ordinary pending dispatches — the project capacity wait they once sat in is
+ * gone (issue #1190), so the same startup pass re-publishes their wake-ups. Each imported field is deleted from Redis only
  * after its dispatch exists (or is provably a duplicate); the whole step is
  * skipped silently when Redis has no legacy keys.
  */
@@ -210,8 +198,6 @@ async function backfillLegacyPendingContinuations(): Promise<number> {
 						priority: priorityFor(entry.job) ?? 0,
 						source: 'recovered',
 						state: 'pending',
-						waitReason: 'project-capacity',
-						continuation: entry.continuation,
 						runId: entry.job.runId,
 						taskId: entry.taskId,
 						attempt: entry.job.rateLimitRetryAttempt ?? 0,
@@ -439,17 +425,14 @@ export async function reconcileDispatchesAtStartup(): Promise<void> {
 
 /**
  * Periodic reconciliation while serving jobs: reclaim expired leases,
- * re-publish any wake-up a crash window lost, and nudge capacity-blocked work
- * whose slot-release wake-up went missing — and tickets waiting on a repository's
- * WIP limit (issue #1185), which also picks up an operator raising that limit.
+ * re-publish any wake-up a crash window lost, and nudge tickets waiting on a
+ * repository's WIP limit (issue #1185) whose slot-release wake-up went missing,
+ * which also picks up an operator raising that limit.
  */
-export async function reconcileDispatchesPeriodically(
-	prioritizeContinuationsFor: (projectId: string) => boolean,
-): Promise<void> {
+export async function reconcileDispatchesPeriodically(): Promise<void> {
 	try {
 		const reclaimed = await reclaimDeadLeases(new Date());
 		const republished = await republishWakeUps();
-		await promoteCapacityPending(prioritizeContinuationsFor);
 		await promoteAllWipWaits();
 		if (reclaimed > 0) {
 			logger.warn('dispatch-reconciler: reclaimed expired dispatch leases', {

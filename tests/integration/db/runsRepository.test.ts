@@ -2033,7 +2033,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 					runId: capacityRunId,
 				} as SwarmJob,
 				source: 'synthetic',
-				waitReason: 'project-capacity',
+				waitReason: 'task-in-flight',
 				runId: capacityRunId,
 				state: 'pending',
 			});

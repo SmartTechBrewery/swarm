@@ -1088,12 +1088,10 @@ describe('runsRouter', () => {
 				phaseHint: 'planning' as const,
 				waitReason: 'wip-limit' as const,
 				priority: 10,
-				continuation: false,
-				prioritizeContinuations: true,
 				enqueuedAt: '2026-07-17T10:00:00.000Z',
 				availableAt: '2026-07-17T10:00:00.000Z',
 			};
-			const other = { ...waiter, jobId: 'dispatch-other', waitReason: 'project-capacity' as const };
+			const other = { ...waiter, jobId: 'dispatch-other', waitReason: 'task-in-flight' as const };
 			vi.mocked(toQueuedRuns).mockReturnValue([waiter, other]);
 			vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
 			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(
@@ -1141,8 +1139,6 @@ describe('runsRouter', () => {
 				workItemNodeId: 'PVTI_item',
 				contentType: 'Issue',
 				priority: 10,
-				continuation: false,
-				prioritizeContinuations: true,
 				enqueuedAt: '2026-07-17T10:00:00.000Z',
 				availableAt: '2026-07-17T10:00:00.000Z',
 			};
@@ -1196,8 +1192,6 @@ describe('runsRouter', () => {
 				phaseHint: 'board' as const,
 				workItemNodeId: 'PVTI_missing',
 				priority: 10,
-				continuation: false,
-				prioritizeContinuations: true,
 				enqueuedAt: '2026-07-17T10:00:00.000Z',
 				availableAt: '2026-07-17T10:00:00.000Z',
 			};
@@ -1220,8 +1214,6 @@ describe('runsRouter', () => {
 				repo: 'acme/widgets',
 				prNumber: '42',
 				priority: 0,
-				continuation: false,
-				prioritizeContinuations: true,
 				enqueuedAt: '2026-07-17T10:00:00.000Z',
 				availableAt: '2026-07-17T10:00:00.000Z',
 				reviewGate: {
@@ -1263,8 +1255,6 @@ describe('runsRouter', () => {
 					repo: 'acme/widgets',
 					prNumber: '42',
 					priority: 0,
-					continuation: false,
-					prioritizeContinuations: true,
 					enqueuedAt: '2026-07-17T10:00:00.000Z',
 					availableAt: '2026-07-17T10:00:00.000Z',
 					...overrides,
@@ -1386,36 +1376,14 @@ describe('runsRouter', () => {
 			});
 		});
 
-		it('propagates the project-specific prioritizeContinuations policy when scoped', async () => {
+		it('maps the waiting dispatches with no per-project policy', async () => {
 			vi.mocked(toQueuedRuns).mockReturnValue([]);
-			vi.mocked(getProjectByIdFromDb).mockResolvedValue(
-				createMockProjectConfig({
-					id: 'p1',
-					pipeline: { prioritizeContinuations: false },
-				}),
-			);
 
 			await caller.queued({ projectId: 'p1' });
-
-			expect(toQueuedRuns).toHaveBeenCalledWith(expect.any(Array), { p1: false });
-		});
-
-		it('propagates all project-specific prioritizeContinuations policies when unscoped (cross-project)', async () => {
-			vi.mocked(toQueuedRuns).mockReturnValue([]);
-			vi.mocked(listAllProjectsFromDb).mockResolvedValue([
-				createMockProjectConfig({
-					id: 'p1',
-					pipeline: { prioritizeContinuations: false },
-				}),
-				createMockProjectConfig({
-					id: 'p2',
-					pipeline: { prioritizeContinuations: true },
-				}),
-			]);
-
 			await caller.queued({});
 
-			expect(toQueuedRuns).toHaveBeenCalledWith(expect.any(Array), { p1: false, p2: true });
+			expect(toQueuedRuns).toHaveBeenCalledTimes(2);
+			for (const call of vi.mocked(toQueuedRuns).mock.calls) expect(call).toHaveLength(1);
 		});
 
 		// Issue #570: every board status change SWARM itself makes (Implementation
@@ -1438,8 +1406,6 @@ describe('runsRouter', () => {
 					workItemNodeId: 'PVTI_item',
 					contentType: 'Issue',
 					priority: 10,
-					continuation: false,
-					prioritizeContinuations: true,
 					enqueuedAt: '2026-08-07T10:22:22.000Z',
 					availableAt: '2026-08-07T10:22:22.000Z',
 					...overrides,

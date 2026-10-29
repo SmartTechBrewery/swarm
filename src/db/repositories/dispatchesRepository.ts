@@ -16,7 +16,6 @@ import {
 	type AnyColumn,
 	and,
 	asc,
-	desc,
 	eq,
 	gt,
 	inArray,
@@ -38,7 +37,6 @@ import type { SwarmJob } from '../../queue/jobs.js';
 import type { TriggerPhase } from '../../triggers/types.js';
 import { getDb } from '../client.js';
 import { dispatches } from '../schema/dispatches.js';
-import { projects } from '../schema/projects.js';
 import { runs } from '../schema/runs.js';
 import { workerProjectEnrollments } from '../schema/workerProjectEnrollments.js';
 import { workerSessions } from '../schema/workerSessions.js';
@@ -88,7 +86,6 @@ export const WAITING_DISPATCH_STATES = ['pending', 'retry-scheduled'] as const;
 
 /** Why a non-terminal dispatch is waiting rather than running. */
 export type DispatchWaitReason =
-	| 'project-capacity'
 	| 'rate-limit'
 	| 'agent-capacity'
 	| 'timeout'
@@ -214,7 +211,7 @@ export type DispatchWaitReason =
 	 * branch (issue #498, ai/RULES.md §2) — so "Planning finished, the card moved to
 	 * ToDo" arrives while Planning may still be in flight. Such a dispatch holds no
 	 * checkout, consumes no attempt budget, and is woken when the holding phase
-	 * settles rather than by a timer, exactly like `project-capacity`.
+	 * settles rather than by a timer.
 	 *
 	 * Two holds settle under this one reason. #759's is a phase *executing* against
 	 * the shared checkout ({@link findExecutingDispatchForTask}), which any phase
@@ -270,7 +267,7 @@ export type DispatchWaitReason =
 	 * A **new ticket's start refused by its repository's WIP limit** (issue #1185):
 	 * the repository already has `wipLimit` tickets in flight (`wip_slots`), so this
 	 * Planning — or Implementation of a ticket that never ran Planning — waits for one
-	 * of them to finish. An event-woken pre-run wait like `project-capacity`: it holds
+	 * of them to finish. An event-woken pre-run wait like `task-in-flight`: it holds
 	 * no checkout, spends no attempt budget, and is woken by a slot being released
 	 * (`promoteWipWaits`, `../../dispatch/wip-limit.ts`) or by the reconciler, never
 	 * by the timed republish. The one board-driven wait that records `repository` on
@@ -362,7 +359,6 @@ export interface CreateDispatchInput {
 	source: 'webhook' | 'synthetic' | 'recheck' | 'manual' | 'recovered' | 'adopted';
 	waitReason?: DispatchWaitReason;
 	availableAt?: Date;
-	continuation?: boolean;
 	runId?: string;
 	taskId?: string;
 	phase?: DispatchPhase;
@@ -413,7 +409,6 @@ export async function createDispatch(
 			source: input.source,
 			waitReason: input.waitReason,
 			availableAt: input.availableAt ?? new Date(),
-			continuation: input.continuation ?? false,
 			runId: input.runId,
 			taskId: input.taskId,
 			phase: input.phase,
@@ -601,7 +596,6 @@ export async function recordDispatchResolution(
 export type WorkerDispatchClaimRefusal =
 	| 'not-claimable'
 	| 'wrong-worker-host'
-	| 'project-capacity'
 	| 'worker-unavailable'
 	| 'missing-enrollment'
 	| 'missing-consent'
@@ -704,7 +698,8 @@ function workerAllocationExceeded(
 
 /**
  * Bind a leased dispatch to the selected worker's authenticated live session and
- * atomically reserve one project allocation slot. The worker-session row is the
+ * atomically reserve one of the worker's `concurrencyAllocation` slots in the
+ * project — the only job-level bound there is (issue #1190). The worker-session row is the
  * serialization lock: every claim for the same worker queues behind it, so the
  * active-claim count and insert/update form one capacity decision.
  */
@@ -725,12 +720,6 @@ export async function claimWorkerForDispatch(
 			.limit(1);
 		const dispatchRefusal = dispatchClaimRefusal(dispatch, input);
 		if (dispatchRefusal) return { claimed: false, reason: dispatchRefusal };
-		const [project] = await tx
-			.select({ maxConcurrentJobs: projects.maxConcurrentJobs })
-			.from(projects)
-			.where(eq(projects.id, input.projectId))
-			.for('update')
-			.limit(1);
 
 		const [session] = await tx
 			.select()
@@ -744,7 +733,9 @@ export async function claimWorkerForDispatch(
 		// FOR UPDATE rather than a plain read (issue #919): a drain write and this
 		// claim must serialize on the worker row, so the drain re-check below can
 		// never observe a half-state. Lock order stays acyclic — this transaction
-		// takes dispatches → projects → worker_sessions → workers → enrollments, and
+		// takes dispatches → worker_sessions → workers → enrollments (no `projects`
+		// lock since the project-wide job cap went, issue #1190 — the per-repository
+		// WIP limit takes its own in `reserveWipSlot`), and
 		// the only other `workers`-locking writers (`updateWorkerCapabilities`,
 		// `setWorkerDeclaredCapabilities`) take `workers` first and never lock an
 		// enrollment.
@@ -768,25 +759,6 @@ export async function claimWorkerForDispatch(
 		const eligibilityRefusal = eligibilityClaimRefusal(worker, enrollment, input.cli);
 		if (eligibilityRefusal) return { claimed: false, reason: eligibilityRefusal };
 
-		const activeClaimPredicate = and(
-			ne(dispatches.id, input.dispatchId),
-			inArray(dispatches.state, ['leased', 'running']),
-			gt(dispatches.leaseExpiresAt, now),
-		);
-		const [projectCapacity] = await tx
-			.select({ activeRuns: sql<number>`count(*)::int` })
-			.from(dispatches)
-			.where(
-				and(
-					eq(dispatches.projectId, input.projectId),
-					sql`${dispatches.selectedWorkerId} IS NOT NULL`,
-					activeClaimPredicate,
-				),
-			);
-		if ((projectCapacity?.activeRuns ?? 0) >= (project?.maxConcurrentJobs ?? 0)) {
-			return { claimed: false, reason: 'project-capacity' };
-		}
-
 		const [workerCapacity] = await tx
 			.select({ activeRuns: sql<number>`count(*)::int` })
 			.from(dispatches)
@@ -794,7 +766,9 @@ export async function claimWorkerForDispatch(
 				and(
 					eq(dispatches.projectId, input.projectId),
 					eq(dispatches.selectedWorkerId, input.selectedWorkerId),
-					activeClaimPredicate,
+					ne(dispatches.id, input.dispatchId),
+					inArray(dispatches.state, ['leased', 'running']),
+					gt(dispatches.leaseExpiresAt, now),
 				),
 			);
 		if (workerAllocationExceeded(enrollment, workerCapacity?.activeRuns ?? 0)) {
@@ -1086,7 +1060,6 @@ export async function scheduleDispatchRetry(
 export interface DeferDispatchToPendingInput {
 	jobPayload: SwarmJob;
 	waitReason: DispatchWaitReason;
-	continuation?: boolean;
 	runId?: string;
 	/**
 	 * The repository the wait is keyed on, written when given — a `wip-limit` wait
@@ -1096,8 +1069,9 @@ export interface DeferDispatchToPendingInput {
 }
 
 /**
- * Return a claimed dispatch to `pending` — the project-capacity wait: eligible
- * immediately, woken by a freed slot (or the reconciler), not by a timer.
+ * Return a claimed dispatch to `pending` — an event-woken pre-run wait such as
+ * `wip-limit` or `task-in-flight`: eligible immediately, woken by whatever it
+ * waits on freeing (or the reconciler), not by a timer.
  */
 export async function deferDispatchToPending(
 	id: string,
@@ -1117,7 +1091,6 @@ export async function deferDispatchToPending(
 			selectedWorkerId: null,
 			workerSessionId: null,
 			workerFencingToken: null,
-			...(input.continuation !== undefined ? { continuation: input.continuation } : {}),
 			...(input.runId !== undefined ? { runId: input.runId } : {}),
 			...(input.repository !== undefined ? { repository: input.repository } : {}),
 			updatedAt: now,
@@ -1455,7 +1428,7 @@ export async function findExecutingDispatchForTask(
  * Four things this read is, deliberately:
  *
  * - **All of {@link ACTIVE_DISPATCH_STATES}**, not just the executing pair. A
- *   Planning waiting for a worker, a project slot, a rate-limit reset, or its own
+ *   Planning waiting for a worker, a WIP slot, a rate-limit reset, or its own
  *   `task-in-flight` turn has not settled, so its plan has not landed yet.
  * - **Keyed on `task_id`/`phase`**, columns the record already normalises when a
  *   claim resolves the trigger. Reaching into `jobPayload` for a board item id
@@ -1656,7 +1629,7 @@ export async function findExecutingWritingDispatchForPullRequest(
  *
  * Deliberately broader than {@link findExecutingWritingDispatchForPullRequest}
  * beside it, in both legs. All of {@link ACTIVE_DISPATCH_STATES}, not just the
- * executing pair: a capacity-blocked attempt, a dependency-gated one and a
+ * executing pair: a slot-blocked attempt, a dependency-gated one and a
  * bounded retry inside its budget are all legitimate waiting, exactly as rule 1
  * of `classifyItemLiveness` (`src/dispatch/item-liveness.ts`) reads them. And
  * every phase, not just the branch-writing ones: a Review already in flight is
@@ -1823,7 +1796,7 @@ export async function listMergeChecksWaits(
 
 /**
  * The dispatches waiting for this task's checkout to free (issue #759) — what a
- * settling phase wakes, the task-level twin of {@link selectNextCapacityDispatch}.
+ * settling phase wakes.
  *
  * Returns every waiter rather than only the first: realistically a task has at
  * most one (the next phase in its sequence), and a second would otherwise sit
@@ -1984,7 +1957,7 @@ export interface ActiveDispatchTaskRef {
  * due for this item" set, which is what steps an item back from `stalled`.
  *
  * All of {@link ACTIVE_DISPATCH_STATES} rather than only the waiting pair: a
- * capacity-blocked dispatch, a dependency-gated one, and a bounded retry inside
+ * slot-blocked dispatch, a dependency-gated one, and a bounded retry inside
  * its budget are all legitimate waiting, and so is one currently executing.
  *
  * Rows with a **null `task_id` are excluded**, deliberately: such a dispatch is
@@ -2142,33 +2115,6 @@ export async function listRunnableDispatchesForPool(
 		)
 		.orderBy(asc(dispatches.priority), asc(dispatches.availableAt), asc(dispatches.createdAt))
 		.limit(POOL_DEMAND_LIMIT);
-}
-
-/**
- * The next capacity-blocked dispatch a freed project slot should wake. With
- * continuation priority on, the oldest SCM continuation wins; otherwise strict
- * FIFO on when the dispatch became pending.
- */
-export async function selectNextCapacityDispatch(
-	projectId: string,
-	prioritizeContinuations: boolean,
-): Promise<DispatchRow | undefined> {
-	const base = and(
-		eq(dispatches.projectId, projectId),
-		eq(dispatches.state, 'pending'),
-		eq(dispatches.waitReason, 'project-capacity'),
-	);
-	const rows = await getDb()
-		.select()
-		.from(dispatches)
-		.where(base)
-		.orderBy(
-			...(prioritizeContinuations
-				? [desc(dispatches.continuation), asc(dispatches.availableAt)]
-				: [asc(dispatches.availableAt)]),
-		)
-		.limit(1);
-	return rows[0];
 }
 
 /**
@@ -2531,9 +2477,8 @@ export async function cancelAllWaitingDispatches(
 
 /**
  * Waiting dispatches that need a wake-up (re-)published: every
- * `retry-scheduled` row plus `pending` rows not waiting on project capacity or a
- * repository's WIP limit (issue #1185) — those are woken by slot releases, not
- * timers, and re-evaluating every WIP waiter each pass would cost a board re-read
+ * `retry-scheduled` row plus `pending` rows not waiting on a repository's WIP
+ * limit (issue #1185) — those are woken by slot releases, not timers, and re-evaluating every WIP waiter each pass would cost a board re-read
  * apiece. Publishing is idempotent
  * (deterministic wake ids), so returning rows whose wake-up still exists is
  * fine — the re-add is a queue no-op.
@@ -2543,17 +2488,8 @@ export async function listWakeablePendingDispatches(): Promise<DispatchRow[]> {
 		.select()
 		.from(dispatches)
 		.where(
-			sql`(${dispatches.state} = 'retry-scheduled') OR (${dispatches.state} = 'pending' AND (${dispatches.waitReason} IS NULL OR ${dispatches.waitReason} NOT IN ('project-capacity', 'wip-limit')))`,
+			sql`(${dispatches.state} = 'retry-scheduled') OR (${dispatches.state} = 'pending' AND (${dispatches.waitReason} IS NULL OR ${dispatches.waitReason} <> 'wip-limit'))`,
 		);
-}
-
-/** Project ids that currently hold capacity-blocked pending dispatches. */
-export async function listProjectsWithCapacityPending(): Promise<string[]> {
-	const rows = await getDb()
-		.selectDistinct({ projectId: dispatches.projectId })
-		.from(dispatches)
-		.where(and(eq(dispatches.state, 'pending'), eq(dispatches.waitReason, 'project-capacity')));
-	return rows.map((r) => r.projectId);
 }
 
 /**

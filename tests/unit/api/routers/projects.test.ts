@@ -261,12 +261,11 @@ describe('projectsRouter', () => {
 
 	describe('getById', () => {
 		it('returns the project when findProjectRecordByIdFromDb resolves one', async () => {
-			const project = createMockProjectRecord({ id: 'p1', maxConcurrentJobs: 4 });
+			const project = createMockProjectRecord({ id: 'p1' });
 			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(project);
 
 			const result = await caller.getById({ id: 'p1' });
 			expect(result).toEqual(project);
-			expect(result.maxConcurrentJobs).toBe(4);
 			expect(findProjectRecordByIdFromDb).toHaveBeenCalledWith('p1');
 		});
 
@@ -327,7 +326,6 @@ describe('projectsRouter', () => {
 
 			const expectedConfig = {
 				...validProjectInput,
-				maxConcurrentJobs: 1,
 				visibility: 'private',
 				scm: 'github',
 				pm: DEFAULT_PM_CONFIG,
@@ -361,7 +359,6 @@ describe('projectsRouter', () => {
 					{ repo: 'jkwiecien/minimal-proj', baseBranch: 'main', branchPrefix: 'issue-' },
 				],
 				worktreeRoot: '.swarm-workspaces',
-				maxConcurrentJobs: 1,
 				visibility: 'private',
 				scm: 'github',
 				pm: DEFAULT_PM_CONFIG,
@@ -413,7 +410,6 @@ describe('projectsRouter', () => {
 
 			const expectedConfig = {
 				...validProjectInput,
-				maxConcurrentJobs: 1,
 				visibility: 'private',
 				scm: 'github',
 				pm: DEFAULT_PM_CONFIG,
@@ -510,7 +506,6 @@ describe('projectsRouter', () => {
 
 			const expectedConfig = {
 				...validProjectInput,
-				maxConcurrentJobs: 1,
 				visibility: 'private',
 				scm: 'github',
 				pm: DEFAULT_PM_CONFIG,
@@ -860,19 +855,6 @@ describe('projectsRouter', () => {
 			expect(writeProjectCredential).not.toHaveBeenCalled();
 		});
 
-		it('saves the maximum concurrent jobs setting', async () => {
-			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
-			vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
-
-			const result = await caller.update({ id: 'p1', maxConcurrentJobs: 4 });
-
-			expect(result.maxConcurrentJobs).toBe(4);
-			expect(upsertProjectToDb).toHaveBeenCalledWith({
-				...existing,
-				maxConcurrentJobs: 4,
-			});
-		});
-
 		// Issue #1066: merge automation is per repository, saved with the list it lives on.
 		it('saves the opt-in merge automation setting per repository', async () => {
 			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
@@ -968,14 +950,6 @@ describe('projectsRouter', () => {
 			expect(result.pipeline?.planning?.autoAdvance).toBe(true);
 			expect(result.pipeline?.respondToReview?.enabled).toBe(false);
 			expect(result.pipeline?.respondToReview?.skipOnMinors).toBe(true);
-		});
-
-		it.each([0, -1, 1.5, 'many'])('rejects invalid maximum concurrent jobs: %s', async (value) => {
-			await expect(
-				caller.update({ id: 'p1', maxConcurrentJobs: value as number }),
-			).rejects.toThrow();
-			expect(findProjectRecordByIdFromDb).not.toHaveBeenCalled();
-			expect(upsertProjectToDb).not.toHaveBeenCalled();
 		});
 
 		it('absent keys are not updated/merged to undefined', async () => {

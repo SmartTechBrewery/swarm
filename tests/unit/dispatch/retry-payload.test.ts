@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { jobContinuesPreservedCheckout } from '@/dispatch/preserved-worker.js';
 import {
-	deriveCapacityPendingPayload,
+	derivePreRunPendingPayload,
 	deriveRetryJobPayload,
 	dropCheckoutContinuation,
 	reconstructResetJob,
@@ -487,9 +487,9 @@ describe('the lost-transport marker', () => {
 	});
 });
 
-describe('deriveCapacityPendingPayload', () => {
+describe('derivePreRunPendingPayload', () => {
 	it('does not consume a retry attempt while waiting for a slot', () => {
-		const pending = deriveCapacityPendingPayload(
+		const pending = derivePreRunPendingPayload(
 			createMockScmWebhookJob({ rateLimitRetryAttempt: 3 }),
 			{ phase: 'review', runId: 'run-1', resumable: false },
 		);
@@ -499,7 +499,7 @@ describe('deriveCapacityPendingPayload', () => {
 	});
 
 	it('records exact PM dispatch intent so a stale board status cannot dedupe the wake-up', () => {
-		const pending = deriveCapacityPendingPayload(createMockPmWebhookJob(), {
+		const pending = derivePreRunPendingPayload(createMockPmWebhookJob(), {
 			phase: 'implementation',
 			runId: 'run-1',
 			resumable: false,
@@ -509,7 +509,7 @@ describe('deriveCapacityPendingPayload', () => {
 	});
 
 	it('keeps the held dedup claim for a blocked SCM continuation', () => {
-		const pending = deriveCapacityPendingPayload(createMockScmWebhookJob(), {
+		const pending = derivePreRunPendingPayload(createMockScmWebhookJob(), {
 			phase: 'review',
 			resumable: false,
 			continuationDispatchClaimed: true,

@@ -235,8 +235,8 @@ export function evaluateWorkerEligibility(input: WorkerEligibilityInput): Eligib
 		return { eligible: false, reason: 'worker-draining' };
 	}
 	// Every enrollment states this worker's share of the project (issue #480), so
-	// the capacity test is unconditional: the project's `maxConcurrentJobs` bounds
-	// it further, it never stands in for a missing allocation.
+	// the capacity test is unconditional — and, with the project-wide job cap retired
+	// (issue #1190), it is the only job-level bound there is.
 	const atCapacity = availability.activeRuns >= enrollment.concurrencyAllocation;
 	if (!availability.connected || atCapacity) {
 		return { eligible: false, reason: 'worker-unavailable' };

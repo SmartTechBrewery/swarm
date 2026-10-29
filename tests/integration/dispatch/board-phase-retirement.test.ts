@@ -325,7 +325,6 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 			const pending = await deferDispatchToPending(claimed.id, {
 				jobPayload: job({ deliveryId: 'd-impl' }),
 				waitReason: 'task-in-flight',
-				continuation: false,
 				runId,
 			});
 			expect(pending).toMatchObject({ state: 'pending', runId });
@@ -379,7 +378,6 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 			await deferDispatchToPending(claimed.id, {
 				jobPayload: job({ deliveryId: 'd-impl' }),
 				waitReason: 'task-in-flight',
-				continuation: false,
 				runId,
 			});
 
