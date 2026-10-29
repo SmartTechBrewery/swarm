@@ -4359,7 +4359,8 @@ async function resolveGatedWorkItem(
  * the `no-trigger` branch does. And a skipped phase consumes nothing, so every
  * handler-side claim this dispatch took before the gate is handed back: a later
  * eligible attempt must not be treated as a duplicate, remain blocked by a ledger
- * reservation, or spend a CI-fix attempt.
+ * reservation, or spend a CI-fix attempt. A board-driven ticket's WIP slot is
+ * freed too, since the item has left automation.
  */
 async function skipIneligibleDispatch(
 	job: SwarmJob,
@@ -4386,6 +4387,13 @@ async function skipIneligibleDispatch(
 	}
 	if (trigger.phase === 'respond-to-ci') {
 		await releaseRespondToCiAttempt(buildRespondToCiAttemptKey(project.repo, trigger.prNumber));
+	}
+	// A board-driven ticket that fell out of eligibility has left automation, so the
+	// WIP slot it took on an earlier admission is freed now rather than at the next
+	// slot sweep (issue #1189). Best-effort — `releaseTicketSlot` swallows its own
+	// failures — so it never changes the skip.
+	if (isBoardTrigger(trigger)) {
+		await releaseTicketSlot(project.id, project.repo, trigger.taskId, 'automation-skip');
 	}
 	await tryCompleteDispatch(dispatch.id, 'skipped-not-eligible');
 	return {
