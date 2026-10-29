@@ -1845,6 +1845,25 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			expect(combined.total).toBe(1);
 		});
 
+		// Issue #1182 — `swarm run list --since`'s time window.
+		it('keeps only runs started at or after startedSince, and counts the window', async () => {
+			await seedRun({ startedAt: new Date('2026-01-01') });
+			await seedRun({ startedAt: new Date('2026-02-01') });
+			await seedRun({ startedAt: new Date('2026-03-01') });
+
+			const windowed = await listRunsFromDb({
+				startedSince: new Date('2026-02-01'),
+				limit: 50,
+				offset: 0,
+			});
+
+			expect(windowed.total).toBe(2);
+			expect(windowed.data.map((r) => r.startedAt.getTime())).toEqual([
+				new Date('2026-03-01').getTime(),
+				new Date('2026-02-01').getTime(),
+			]);
+		});
+
 		it('orders by startedAt descending', async () => {
 			await seedRun({ startedAt: new Date('2026-01-01') });
 			await seedRun({ startedAt: new Date('2026-03-01') });

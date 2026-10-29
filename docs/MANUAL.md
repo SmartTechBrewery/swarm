@@ -1287,6 +1287,12 @@ npm run swarm -- login
 npm run swarm -- login --status
 npm run swarm -- login --logout
 
+# Read runs over the same session — no DATABASE_URL, no browser
+npm run swarm -- run list --status failed --since 24h
+npm run swarm -- run show <run-id>      # headline + failure cause
+npm run swarm -- run logs <run-id>      # agent output + captured stdout/stderr
+npm run swarm -- run list --project <id> --json   # machine-readable
+
 # Queue and worktrees
 npm run queue:clear
 npm run worktrees:prune
@@ -1305,6 +1311,13 @@ dispatches but does not terminate an active agent; stop the worker first when
 clearing work before a restart. The full list of `swarm` commands and `npm run`
 scripts, with descriptions, is in [`docs/cli.md`](./cli.md); detailed
 operator guidance is in [`docs/operations.md`](./operations.md).
+
+`swarm run list|show|logs` read runs over the control plane with the cached
+`swarm login` session — the dashboard's own run list, run detail, logs and agent
+output, with the dashboard's authorization — so they need no `DATABASE_URL` and no
+browser. They are the run-diagnosis path on a host with no shell (see
+[Running on a VPS behind Caddy](#running-on-a-vps-behind-caddy)); `--json` makes
+any of them scriptable. Details: [`docs/cli.md`](./cli.md#swarm-run).
 
 ## Configuration
 

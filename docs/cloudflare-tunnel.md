@@ -289,8 +289,8 @@ SWARM_CONTROL_PLANE_URL=https://swarm.example.com swarm login --identifier <emai
 ```
 
 This calls `POST https://swarm.example.com/operator/session` for the login itself
-and `https://swarm.example.com/operator/trpc/*` for every `swarm workers` call
-that follows — both under the `/operator/*` prefix, alongside `/worker/*` and
+and `https://swarm.example.com/operator/trpc/*` for every `swarm workers` and
+`swarm run list|show|logs` call that follows — both under the `/operator/*` prefix, alongside `/worker/*` and
 `/github/webhook`.
 
 A **single catch-all Public Hostname** (`service: http://router:3000`, Path B/C as

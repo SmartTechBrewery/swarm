@@ -377,6 +377,9 @@ const ListRunsInputSchema = z.object({
 	phase: RunPhaseEnum.optional(),
 	limit: z.number().int().positive().max(200).default(50),
 	offset: z.number().int().nonnegative().default(0),
+	// The list's time window (issue #1182): ISO 8601, runs started at or after it.
+	// A string, not a coerced Date — no transformer is configured, so the wire is JSON.
+	since: z.string().datetime({ offset: true }).optional(),
 });
 
 function wakeJobId(dispatch: { id: string; wakeSeq: number }): string {
@@ -1285,7 +1288,13 @@ function withPullRequestUrls(
 	});
 }
 
-export const runsRouter = router({
+/**
+ * The run reads the dashboard's run list and run detail screens make — and the
+ * only part of {@link runsRouter} the operator API carries (issue #1182, see
+ * `../operator-router.ts`). Held as one record so both routers mount the very same
+ * procedure objects. Nothing here writes.
+ */
+const runReadProcedures = {
 	// Paginated, filtered list; returns { data, total } from the repo, each row
 	// widened with the additive, server-resolved `workerName` naming the machine
 	// that executed it (issue #523 — see `withWorkerNames`). The name is resolved
@@ -1300,107 +1309,20 @@ export const runsRouter = router({
 	// the projects they are a member of. A user who belongs to no project gets an
 	// empty page rather than a denial — an empty scope would otherwise widen the
 	// query back to every project, so it short-circuits without querying at all.
+	// The optional `since` window (issue #1182) narrows the set within that scope;
+	// it never widens it.
 	list: authedProcedure.input(ListRunsInputSchema).query(async ({ ctx, input }) => {
-		if (input.projectId) {
-			await assertProjectAccess(ctx.user, input.projectId, 'contributor');
-			return await listRunsWithWorkerNames(input);
+		const { since, ...rest } = input;
+		const filter = since ? { ...rest, startedSince: new Date(since) } : rest;
+		if (filter.projectId) {
+			await assertProjectAccess(ctx.user, filter.projectId, 'contributor');
+			return await listRunsWithWorkerNames(filter);
 		}
 		const scope = await accessibleProjectScope(ctx.user);
-		if (scope === null) return await listRunsWithWorkerNames(input);
+		if (scope === null) return await listRunsWithWorkerNames(filter);
 		if (scope.length === 0) return { data: [], total: 0 };
-		return await listRunsWithWorkerNames({ ...input, projectIds: scope });
+		return await listRunsWithWorkerNames({ ...filter, projectIds: scope });
 	}),
-
-	// Every canonical waiting dispatch (pending / capacity-blocked /
-	// retry-scheduled) — the durable queue read model (issues #234, #284), never
-	// a BullMQ snapshot, so nothing pending can be invisible here. No pagination:
-	// the pending set is small and bounded by worker throughput. A chosen
-	// `projectId` needs read access, exactly like `list`; the unscoped,
-	// installation-wide queue remains an instance administrator's view (issue
-	// #647) and was deliberately left there when issue #821 opened the unscoped
-	// `list` to every member — the queue is an operator's dispatch view, and
-	// giving it the same membership scoping is its own change.
-	//
-	// Returns the two-part {@link QueuedRunsPage}: the queue itself, and the board
-	// dispatches the enrichment's own board read proved cannot start a phase
-	// (issue #570), reported separately instead of listed as pending work.
-	queued: authedProcedure
-		.input(z.object({ projectId: z.string().min(1).optional() }).optional())
-		.query(async ({ ctx, input }): Promise<QueuedRunsPage> => {
-			if (input?.projectId) {
-				await assertProjectAccess(ctx.user, input.projectId, 'contributor');
-				const project = await getProjectByIdFromDb(input.projectId);
-				const policy = project?.pipeline?.prioritizeContinuations !== false;
-				const policies = { [input.projectId]: policy };
-				return partitionQueuedRuns(
-					await enrichQueuedWorkItems(
-						toQueuedRuns(await listWaitingDispatches(input.projectId), policies),
-					),
-				);
-			}
-			assertInstanceAdmin(ctx.user, 'queue');
-			const dispatches = await listWaitingDispatches(input?.projectId);
-			const projects = await listAllProjectsFromDb();
-			const policies = Object.fromEntries(
-				projects.map((p) => [p.id, p.pipeline?.prioritizeContinuations !== false]),
-			);
-			return partitionQueuedRuns(await enrichQueuedWorkItems(toQueuedRuns(dispatches, policies)));
-		}),
-
-	// The item-centric read model (issue #840) — the third one beside Queue
-	// (dispatch-centric) and Runs (run-centric). It folds `runs` and `dispatches`
-	// onto the unit an operator recognises (a pull request, a board card) and
-	// reports the units with no forward path. The whole decision lives in the pure
-	// `src/dispatch/item-liveness.ts`; this procedure only supplies the three bounded
-	// reads and the per-project policy map, and touches nothing but Postgres — no
-	// provider call, no cache, no enrichment, unlike `queued`.
-	//
-	// "Stalled" is a computed view, never a persisted status: nothing here writes,
-	// and a unit stays listed until it moves, is dismissed by an operator
-	// ({@link runsRouter.dismissStalled}, issue #880), or ages out of the lookback
-	// window.
-	//
-	// Authorization is `queued`'s shape verbatim, so no new access decision is made
-	// here: a chosen `projectId` needs read access, and the unscoped,
-	// installation-wide view remains an instance administrator's.
-	stalled: authedProcedure
-		.input(z.object({ projectId: z.string().min(1).optional() }).optional())
-		.query(async ({ ctx, input }): Promise<StalledItem[]> => {
-			const since = new Date(Date.now() - ITEM_ACTIVITY_LOOKBACK_MS);
-			if (input?.projectId) {
-				await assertProjectAccess(ctx.user, input.projectId, 'contributor');
-				const record = await findProjectRecordByIdFromDb(input.projectId);
-				const projectIds = [input.projectId];
-				const [activity, activeDispatches, dismissals] = await Promise.all([
-					listTaskActivitySince({ since, projectIds }),
-					listActiveDispatchTaskRefs(projectIds),
-					listStalledDismissals({ since, projectIds }),
-				]);
-				return withPullRequestUrls(
-					toStalledItems(
-						activity,
-						activeDispatches,
-						{ [input.projectId]: itemLivenessPolicyFor(record) },
-						toLivenessDismissals(dismissals),
-					),
-					new Map(record ? [[record.id, scopeProjectToRepository(record)]] : []),
-				);
-			}
-			assertInstanceAdmin(ctx.user, 'stalled work');
-			const [activity, activeDispatches, records, dismissals] = await Promise.all([
-				listTaskActivitySince({ since }),
-				listActiveDispatchTaskRefs(),
-				listAllProjectRecordsFromDb(),
-				listStalledDismissals({ since }),
-			]);
-			const policies = Object.fromEntries(
-				records.map((record) => [record.id, itemLivenessPolicyFor(record)]),
-			);
-			return withPullRequestUrls(
-				toStalledItems(activity, activeDispatches, policies, toLivenessDismissals(dismissals)),
-				new Map(records.map((record) => [record.id, scopeProjectToRepository(record)])),
-			);
-		}),
 
 	// Single run by id; NOT_FOUND when unknown or when the caller is not a member
 	// of the run's project (existence hidden with identical run-not-found message).
@@ -1493,6 +1415,108 @@ export const runsRouter = router({
 				`Run with ID "${input.runId}" not found`,
 			);
 			return await getRunOutputEvents(input.runId, input.after);
+		}),
+};
+
+/**
+ * The read-only slice of {@link runsRouter} the operator API mounts (issue #1182):
+ * the same procedure objects, so authorization cannot diverge between the two
+ * surfaces. Nothing here writes.
+ */
+export const runsReadRouter = router(runReadProcedures);
+
+export const runsRouter = router({
+	...runReadProcedures,
+
+	// Every canonical waiting dispatch (pending / capacity-blocked /
+	// retry-scheduled) — the durable queue read model (issues #234, #284), never
+	// a BullMQ snapshot, so nothing pending can be invisible here. No pagination:
+	// the pending set is small and bounded by worker throughput. A chosen
+	// `projectId` needs read access, exactly like `list`; the unscoped,
+	// installation-wide queue remains an instance administrator's view (issue
+	// #647) and was deliberately left there when issue #821 opened the unscoped
+	// `list` to every member — the queue is an operator's dispatch view, and
+	// giving it the same membership scoping is its own change.
+	//
+	// Returns the two-part {@link QueuedRunsPage}: the queue itself, and the board
+	// dispatches the enrichment's own board read proved cannot start a phase
+	// (issue #570), reported separately instead of listed as pending work.
+	queued: authedProcedure
+		.input(z.object({ projectId: z.string().min(1).optional() }).optional())
+		.query(async ({ ctx, input }): Promise<QueuedRunsPage> => {
+			if (input?.projectId) {
+				await assertProjectAccess(ctx.user, input.projectId, 'contributor');
+				const project = await getProjectByIdFromDb(input.projectId);
+				const policy = project?.pipeline?.prioritizeContinuations !== false;
+				const policies = { [input.projectId]: policy };
+				return partitionQueuedRuns(
+					await enrichQueuedWorkItems(
+						toQueuedRuns(await listWaitingDispatches(input.projectId), policies),
+					),
+				);
+			}
+			assertInstanceAdmin(ctx.user, 'queue');
+			const dispatches = await listWaitingDispatches(input?.projectId);
+			const projects = await listAllProjectsFromDb();
+			const policies = Object.fromEntries(
+				projects.map((p) => [p.id, p.pipeline?.prioritizeContinuations !== false]),
+			);
+			return partitionQueuedRuns(await enrichQueuedWorkItems(toQueuedRuns(dispatches, policies)));
+		}),
+
+	// The item-centric read model (issue #840) — the third one beside Queue
+	// (dispatch-centric) and Runs (run-centric). It folds `runs` and `dispatches`
+	// onto the unit an operator recognises (a pull request, a board card) and
+	// reports the units with no forward path. The whole decision lives in the pure
+	// `src/dispatch/item-liveness.ts`; this procedure only supplies the three bounded
+	// reads and the per-project policy map, and touches nothing but Postgres — no
+	// provider call, no cache, no enrichment, unlike `queued`.
+	//
+	// "Stalled" is a computed view, never a persisted status: nothing here writes,
+	// and a unit stays listed until it moves, is dismissed by an operator
+	// ({@link runsRouter.dismissStalled}, issue #880), or ages out of the lookback
+	// window.
+	//
+	// Authorization is `queued`'s shape verbatim, so no new access decision is made
+	// here: a chosen `projectId` needs read access, and the unscoped,
+	// installation-wide view remains an instance administrator's.
+	stalled: authedProcedure
+		.input(z.object({ projectId: z.string().min(1).optional() }).optional())
+		.query(async ({ ctx, input }): Promise<StalledItem[]> => {
+			const since = new Date(Date.now() - ITEM_ACTIVITY_LOOKBACK_MS);
+			if (input?.projectId) {
+				await assertProjectAccess(ctx.user, input.projectId, 'contributor');
+				const record = await findProjectRecordByIdFromDb(input.projectId);
+				const projectIds = [input.projectId];
+				const [activity, activeDispatches, dismissals] = await Promise.all([
+					listTaskActivitySince({ since, projectIds }),
+					listActiveDispatchTaskRefs(projectIds),
+					listStalledDismissals({ since, projectIds }),
+				]);
+				return withPullRequestUrls(
+					toStalledItems(
+						activity,
+						activeDispatches,
+						{ [input.projectId]: itemLivenessPolicyFor(record) },
+						toLivenessDismissals(dismissals),
+					),
+					new Map(record ? [[record.id, scopeProjectToRepository(record)]] : []),
+				);
+			}
+			assertInstanceAdmin(ctx.user, 'stalled work');
+			const [activity, activeDispatches, records, dismissals] = await Promise.all([
+				listTaskActivitySince({ since }),
+				listActiveDispatchTaskRefs(),
+				listAllProjectRecordsFromDb(),
+				listStalledDismissals({ since }),
+			]);
+			const policies = Object.fromEntries(
+				records.map((record) => [record.id, itemLivenessPolicyFor(record)]),
+			);
+			return withPullRequestUrls(
+				toStalledItems(activity, activeDispatches, policies, toLivenessDismissals(dismissals)),
+				new Map(records.map((record) => [record.id, scopeProjectToRepository(record)])),
+			);
 		}),
 
 	// Fire a run's retry immediately ("Retry now", issues #136, #284).

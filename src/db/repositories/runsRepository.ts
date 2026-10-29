@@ -1774,6 +1774,8 @@ export interface ListRunsFilter {
 	 * isolate maintenance runs, whose `phase` is the maintenance kind's own name.
 	 */
 	phase?: TriggerPhase | typeof WORKER_UPDATE_RUN_PHASE;
+	/** Only runs started at or after this instant — the list's time window (issue #1182). */
+	startedSince?: Date;
 	limit: number;
 	offset: number;
 }
@@ -1782,7 +1784,9 @@ export interface ListRunsFilter {
  * Paginated, filtered list of runs ordered by `startedAt` desc. `total` is the
  * count of the *filtered* set (not the page), so a UI can render page counts;
  * it runs as a separate query against the same conditions. Sort order is fixed
- * (`startedAt desc`) — sortable columns and date-range filters are out of scope.
+ * (`startedAt desc`). A lower bound on `startedAt` (`startedSince`, issue #1182)
+ * narrows the set `total` counts too; sortable columns and an upper bound remain
+ * out of scope.
  *
  * Queue and Runs are complementary read models (issues #279/#316): Queue is
  * the canonical list for waiting dispatches, so Runs hides only a retry-pending
@@ -1816,6 +1820,7 @@ export async function listRunsFromDb(
 	}
 	if (filter.status) conditions.push(eq(runs.status, filter.status));
 	if (filter.phase) conditions.push(eq(runs.phase, filter.phase));
+	if (filter.startedSince) conditions.push(gte(runs.startedAt, filter.startedSince));
 
 	const where = and(...conditions);
 

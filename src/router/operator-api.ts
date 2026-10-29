@@ -11,11 +11,13 @@
  * that logs you in nowhere.
  *
  * **What it exposes is deliberately narrow.** `operatorRouter`
- * (`../api/operator-router.ts`) is a strict subset — the `workers` namespace and
- * nothing else — never `appRouter`. Because this process is internet-reachable,
+ * (`../api/operator-router.ts`) is a strict subset — the `workers` namespace plus
+ * the four read-only `runs` reads (`list`, `getById`, `getLogs`, `getOutput`;
+ * issue #1182) — never `appRouter`. Because this process is internet-reachable,
  * mounting the dashboard's whole router here would publish projects, credentials,
- * settings, users and runs, none of which the CLI needs and all of which stay on
- * loopback today.
+ * settings, users and the run mutations, none of which the CLI needs and all of
+ * which stay on the loopback-bound API server. The reasoning for each namespace
+ * lives in `../api/operator-router.ts`.
  *
  * **`SWARM_SINGLE_USER_MODE` is deliberately not honoured**, exactly as in
  * `./operator-session.ts`. The API server can resolve the bootstrapped
