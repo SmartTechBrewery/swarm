@@ -97,7 +97,13 @@
  * provider (`workers.projectScmProvider`) instead of guessing one — the condition
  * #767 recorded as missing at registration time.
  *
+ * `setup` (run in the worker's checkout) is the shortest path of all: it is
+ * `register-and-enroll` with the owner, CLIs and name defaulted, asks only for the
+ * project id and the operator credential, and ends by installing the worker under
+ * the host's process supervisor instead of printing a start line.
+ *
  * Subcommands:
+ *   swarm workers setup [--project <id>] [--name <displayName>] [--cli <c1,c2,...>] [--control-plane-url <url>] [--no-autostart]
  *   swarm workers register <owner-identifier> --name <displayName> --cli <c1,c2,...> [--extra-checkout <path>]...
  *   swarm workers register-and-enroll <owner-identifier> <project-id> --name <displayName> --cli <c1,c2,...> [--control-plane-url <url>] [--repo-root <path>] [--extra-checkout <path>]...
  *   swarm workers add-checkout <path>
@@ -121,7 +127,9 @@
  */
 
 import { existsSync } from 'node:fs';
+import { hostname } from 'node:os';
 import { delimiter, resolve } from 'node:path';
+import { createInterface } from 'node:readline/promises';
 import { parseArgs } from 'node:util';
 import { z } from 'zod';
 import { type AgentCli, AgentCliSchema } from '../../harness/agent-cli.js';
@@ -129,6 +137,7 @@ import { describeError } from '../../lib/errors.js';
 import { operatorCredentialCopyFor } from '../../scm/operator-credential-copy.js';
 import { repoSlugsMatch, resolveDeclarableOriginRepoSlug } from '../../scm/repo-slug.js';
 import { SCM_TYPES } from '../../scm/types.js';
+import { discoverAvailableClis } from '../../transport/cli-discovery.js';
 import { canonicalCheckoutPath } from '../../worktree/checkout-key.js';
 import { ensureControlPlaneUrl } from '../_shared/control-plane-env.js';
 import {
@@ -140,6 +149,7 @@ import {
 } from '../_shared/operator-client.js';
 import * as out from '../_shared/output.js';
 import { promptHidden, readStdin } from '../_shared/secret-input.js';
+import { installWorkerAutostart, type WorkerAutostartResult } from '../_shared/worker-autostart.js';
 import {
 	readWorkerCredentialCache,
 	updateWorkerCredentialCacheCheckouts,
@@ -161,6 +171,7 @@ const SCM_PROVIDER_IDS = SCM_TYPES;
 const USAGE = `swarm workers — register and manage local workers (identity + declared CLIs)
 
 Usage:
+  swarm workers setup [--project <id>] [--name <displayName>] [--cli <c1,c2,...>] [--control-plane-url <url>] [--no-autostart]
   swarm workers register <owner-identifier> --name <displayName> --cli <c1,c2,...> [--extra-checkout <path>]...
   swarm workers register-and-enroll <owner-identifier> <project-id> --name <displayName> --cli <c1,c2,...> [--control-plane-url <url>] [--repo-root <path>] [--extra-checkout <path>]...
   swarm workers add-checkout <path>
@@ -182,6 +193,19 @@ Usage:
   swarm workers approve <worker-id> <project-id>
   swarm workers consent <worker-id> <project-id> <on|off>
 
+  setup      The shortest path for a NEW worker, run in the checkout it is to
+             serve: asks for the project id (offering the checkout's repository
+             name) and the operator source-control credential (no echo), then
+             registers, credentials and enrolls the worker exactly as
+             register-and-enroll does and starts it under the host's process
+             supervisor — a launchd LaunchAgent via swarm-worker-agent on macOS.
+             Other platforms have no autostart yet and are told to run
+             swarm run:worker. The owner is the signed-in operator (swarm login),
+             the CLIs are the ones found on this machine's PATH, and the name is
+             <owner>_<host>_<repo>; --project, --cli and --name override them,
+             and --no-autostart stops short of starting it. Refused in a checkout
+             that already has a worker registered — it never issues a second one.
+             The worker credential is cached for this checkout and not printed.
   register   Register a worker for an owner (by login handle) with a display
              name and declared CLIs (--cli, comma-separated, one or more of
              ${AGENT_CLIS.join(' | ')}). Prints a worker credential ONCE — store
@@ -429,6 +453,7 @@ offers it to a project, and it is routable
 only while active AND sharing consent is on.`;
 
 const SUBCOMMANDS = [
+	'setup',
 	'register',
 	'register-and-enroll',
 	'add-checkout',
@@ -2346,14 +2371,8 @@ async function planRegisterAndEnroll(
 	// same lookup the dispatcher uses so the credential is stored under the id a
 	// dispatch will ask for — never `project.scm ?? 'github'`. Its refusals already
 	// name the project and what it asked for.
-	const { providerId } = await operator.client.query(
-		'workers.projectScmProvider',
-		{ projectId },
-		parseWith(ProjectScmProviderSchema),
-	);
-
-	const operatorCredential = await readOperatorCredential(providerId, name);
-	if (!operatorCredential) return { ok: false, code: 1 };
+	const secret = await resolveOperatorCredentialForProject(operator, projectId, name);
+	if (!secret) return { ok: false, code: 1 };
 
 	return {
 		ok: true,
@@ -2363,12 +2382,31 @@ async function planRegisterAndEnroll(
 			projectId,
 			displayName: name,
 			capabilities,
-			providerId,
-			operatorCredential,
+			...secret,
 			repoRoot,
 			extraRepoRoots,
 		},
 	};
+}
+
+/**
+ * Resolve the SCM provider `projectId` runs on and read this machine's operator
+ * credential for it — the half of planning `register-and-enroll` and `setup` share.
+ * `undefined` (message already printed) for an empty secret; a refusal from the
+ * control plane propagates as the `OperatorApiError` it already is.
+ */
+async function resolveOperatorCredentialForProject(
+	operator: Operator,
+	projectId: string,
+	displayName: string,
+): Promise<{ providerId: string; operatorCredential: string } | undefined> {
+	const { providerId } = await operator.client.query(
+		'workers.projectScmProvider',
+		{ projectId },
+		parseWith(ProjectScmProviderSchema),
+	);
+	const operatorCredential = await readOperatorCredential(providerId, displayName);
+	return operatorCredential ? { providerId, operatorCredential } : undefined;
 }
 
 /**
@@ -2442,7 +2480,31 @@ async function readOperatorCredential(
 async function registerAndEnrollCommand(argv: string[]): Promise<number> {
 	const planned = await planRegisterAndEnroll(argv);
 	if (!planned.ok) return planned.code;
-	const { client } = planned.operator;
+	const registered = await executeRegisterAndEnroll(planned.operator, planned.plan);
+	if (!registered.ok) return registered.code;
+
+	// The credential's one and only appearance, on the last line — the "copy the
+	// last line" affordance docs/onboarding-worker.md relies on.
+	out.info(
+		'start the worker on that machine — this command does not (its .env must already carry SWARM_CONTROL_PLANE_URL). Run:',
+	);
+	out.info(
+		`SWARM_WORKER_CREDENTIAL=${registered.credential} SWARM_WORKER_REPO_ROOT=${workerRepoRootValue(planned.plan.repoRoot, planned.plan.extraRepoRoots)} npm run dev:worker`,
+	);
+	return 0;
+}
+
+/**
+ * Carry out a validated plan: register, store the operator credential, enroll
+ * active + consenting. Shared by `register-and-enroll` and `setup`, which differ
+ * only in what they do once it succeeds. On failure the outstanding steps and the
+ * one-time worker credential have already been printed.
+ */
+async function executeRegisterAndEnroll(
+	operator: Operator,
+	plan: RegisterAndEnrollPlan,
+): Promise<{ ok: true; workerId: string; credential: string } | { ok: false; code: number }> {
+	const { client } = operator;
 	const {
 		identifier,
 		projectId,
@@ -2452,7 +2514,7 @@ async function registerAndEnrollCommand(argv: string[]): Promise<number> {
 		operatorCredential,
 		repoRoot,
 		extraRepoRoots,
-	} = planned.plan;
+	} = plan;
 
 	const { worker, credential } = await client.mutate(
 		'workers.register',
@@ -2468,7 +2530,7 @@ async function registerAndEnrollCommand(argv: string[]): Promise<number> {
 	// only in memory, so a later failure must still hand it over — losing it means
 	// `workers remove` + `workers register` again. Each recovery path names only the
 	// step that did not complete, and prints the credential exactly once, last.
-	const reportUnfinished = (remaining: string[]): number => {
+	const reportUnfinished = (remaining: string[]): { ok: false; code: number } => {
 		out.info(
 			remaining.length > 0
 				? 'the worker is registered; finish it by hand with:'
@@ -2477,7 +2539,7 @@ async function registerAndEnrollCommand(argv: string[]): Promise<number> {
 		for (const command of remaining) out.info(`  ${command}`);
 		out.info('worker credential (store it now — it will not be shown again):');
 		out.info(credential);
-		return 1;
+		return { ok: false, code: 1 };
 	};
 	const enrollByHand = `swarm workers enroll ${worker.id} ${projectId} --cli ${capabilities.join(',')} --active --consent`;
 
@@ -2524,16 +2586,196 @@ async function registerAndEnrollCommand(argv: string[]): Promise<number> {
 				: [enrollByHand],
 		);
 	}
+	return { ok: true, workerId: worker.id, credential };
+}
 
-	// The credential's one and only appearance, on the last line — the "copy the
-	// last line" affordance docs/onboarding-worker.md relies on.
+/**
+ * `setup` — onboard the checkout this runs in as a worker with as few questions as
+ * possible, and leave it running under the host's process supervisor.
+ *
+ * It is `register-and-enroll` with its inputs defaulted rather than demanded: the
+ * owner is the signed-in operator (`swarm login`), the CLIs are the ones the daemon
+ * would itself discover on this machine's PATH (`discoverAvailableClis`), and the
+ * name is derived from the owner, the host and the repository. What it asks is only
+ * what nothing here can know — the project id (offered the checkout's repository
+ * name as a default) and the operator source-control credential, which
+ * `readOperatorCredential` reads without echo exactly as `register-and-enroll` does.
+ * Each default is a flag away from being overridden.
+ *
+ * It refuses a checkout that already has a worker cached: registering again would
+ * issue a new worker and strand the old one's enrollments and operator credentials,
+ * which is never what re-running a setup command should do.
+ *
+ * Then, unlike `register-and-enroll`, it starts the worker — by installing the
+ * supervisor entry (`../_shared/worker-autostart.ts`), never by forking the daemon
+ * itself, so the process stays one the operator stops with the supervisor's own
+ * tools. Where no installer exists yet it says so and names the foreground command.
+ * The worker credential is not printed on success: it is in this checkout's cache,
+ * which is all `swarm run:worker` and the LaunchAgent read.
+ */
+async function setupCommand(argv: string[]): Promise<number> {
+	const { values, positionals } = parseArgs({
+		args: argv,
+		options: {
+			project: { type: 'string' },
+			name: { type: 'string' },
+			cli: { type: 'string' },
+			'control-plane-url': { type: 'string' },
+			'no-autostart': { type: 'boolean' },
+			help: { type: 'boolean', short: 'h' },
+		},
+		allowPositionals: true,
+	});
+	if (values.help) {
+		out.info(USAGE);
+		return 0;
+	}
+	if (positionals.length > 0) {
+		out.error("workers setup takes no positional arguments — run it in the worker's checkout");
+		out.info(USAGE);
+		return 1;
+	}
+
+	const repoRoot = canonicalCheckoutPath(invokingCheckout());
+	if (alreadyRegisteredHere(repoRoot)) return 1;
+
+	const capabilities = await setupCapabilities(values.cli);
+	if (!capabilities) return 1;
+
+	if (!(await ensureControlPlaneUrl(values['control-plane-url']))) return 1;
+	const operator = requireOperator();
+	if (!operator) return 1;
+	const identifier = operator.session.identifier;
+
+	const originSlug = await resolveDeclarableOriginRepoSlug(repoRoot);
+	const repoName = (originSlug ?? repoRoot).split('/').pop() ?? '';
+	const projectId = values.project?.trim() || (await promptProjectId(repoName));
+	if (!projectId) {
+		out.error(
+			'workers setup: a project id is required — pass --project <id> (stdin is not a terminal, or nothing was entered)',
+		);
+		return 1;
+	}
+
+	const displayName = values.name?.trim() || defaultWorkerName(identifier, hostname(), repoName);
 	out.info(
-		'start the worker on that machine — this command does not (its .env must already carry SWARM_CONTROL_PLANE_URL). Run:',
+		`setting up worker '${displayName}' for '${identifier}' in project '${projectId}' (CLIs: ${capabilities.join(', ')}, checkout: ${repoRoot})`,
 	);
-	out.info(
-		`SWARM_WORKER_CREDENTIAL=${credential} SWARM_WORKER_REPO_ROOT=${workerRepoRootValue(repoRoot, extraRepoRoots)} npm run dev:worker`,
+
+	const secret = await resolveOperatorCredentialForProject(operator, projectId, displayName);
+	if (!secret) return 1;
+
+	const registered = await executeRegisterAndEnroll(operator, {
+		identifier,
+		projectId,
+		displayName,
+		capabilities,
+		...secret,
+		repoRoot,
+		extraRepoRoots: [],
+	});
+	if (!registered.ok) return registered.code;
+
+	if (values['no-autostart']) {
+		out.info('autostart skipped (--no-autostart) — start the worker here with: swarm run:worker');
+		return 0;
+	}
+	return reportAutostart(displayName, await installWorkerAutostart(repoRoot));
+}
+
+/**
+ * Whether this checkout already has a worker cached — printing the refusal when it
+ * does. `setup` never registers over one: a second registration would issue a new
+ * worker and strand the first one's enrollments and operator credentials.
+ */
+function alreadyRegisteredHere(repoRoot: string): boolean {
+	const cached = readWorkerCredentialCache(repoRoot);
+	if (cached !== null) {
+		out.error(
+			cached === undefined
+				? `workers setup: this checkout already has a worker credential cache entry that could not be read: ${workerCredentialCachePath(repoRoot)}`
+				: `workers setup: a worker (${cached.workerId}) is already registered for this checkout (${repoRoot})`,
+		);
+		out.info('  start it with: swarm-worker-agent install (or swarm run:worker)');
+		out.info(
+			`  to replace it, remove it (swarm workers remove <worker-id>) and delete ${workerCredentialCachePath(repoRoot)}`,
+		);
+		return true;
+	}
+	return false;
+}
+
+/**
+ * The CLIs `setup` declares: `--cli` when given, otherwise the ones the daemon
+ * would itself discover on this machine's PATH. `undefined` (message printed) for
+ * an invalid list or a machine with none at all.
+ */
+async function setupCapabilities(cli: string | undefined): Promise<AgentCli[] | undefined> {
+	if (cli) return parseClis(cli);
+	const discovered = await discoverAvailableClis();
+	if (discovered.length > 0) return discovered;
+	out.error(
+		`workers setup: none of the agent CLIs (${AGENT_CLIS.join(', ')}) is on this machine's PATH — install and sign in to one, or name them with --cli`,
 	);
-	return 0;
+	return undefined;
+}
+
+/** Say how the worker `setup` registered is (or is not) being started, as an exit code. */
+function reportAutostart(displayName: string, autostart: WorkerAutostartResult): number {
+	switch (autostart.kind) {
+		case 'installed':
+			out.info(
+				`worker '${displayName}' is installed under launchd and starting — check it with: swarm-worker-agent status`,
+			);
+			return 0;
+		case 'unsupported':
+			out.info(
+				`autostart is not available on ${autostart.platform} yet — start the worker here with: swarm run:worker`,
+			);
+			return 0;
+		default:
+			out.error(
+				`workers setup: the worker is registered and enrolled, but autostart failed: ${autostart.reason}`,
+			);
+			out.info('  retry it with: swarm-worker-agent install (or start it with swarm run:worker)');
+			return 1;
+	}
+}
+
+/**
+ * Ask for the project id on a TTY, offering `suggestion` — the checkout's
+ * repository name, which is what a project is usually called — as the answer to
+ * Enter. Off a TTY there is nobody to ask, so the caller is told to pass --project.
+ */
+async function promptProjectId(suggestion: string): Promise<string | undefined> {
+	if (!process.stdin.isTTY) return undefined;
+	const rl = createInterface({ input: process.stdin, output: process.stdout });
+	try {
+		const hint = suggestion ? ` [${suggestion}]` : '';
+		const answer = (await rl.question(`Project id${hint}: `)).trim();
+		return answer || suggestion || undefined;
+	} finally {
+		rl.close();
+	}
+}
+
+/**
+ * `<owner>_<host>_<repo>`: the owner's handle up to any `@`, the host's first DNS
+ * label, and the repository name, each lowercased with runs of anything but
+ * letters and digits collapsed to `_` — a name that says whose machine serves which
+ * repository, which is the convention docs/onboarding-worker.md recommends.
+ */
+export function defaultWorkerName(identifier: string, host: string, repoName: string): string {
+	const part = (value: string) =>
+		value
+			.toLowerCase()
+			.replace(/[^a-z0-9]+/g, '_')
+			.replace(/^_+|_+$/g, '');
+	return [identifier.split('@')[0] ?? '', host.split('.')[0] ?? '', repoName]
+		.map(part)
+		.filter((value) => value.length > 0)
+		.join('_')
+		.slice(0, 80);
 }
 
 /**
@@ -2803,6 +3045,8 @@ export async function run(argv: string[]): Promise<number> {
 
 	try {
 		switch (subcommand) {
+			case 'setup':
+				return await setupCommand(rest);
 			case 'register':
 				return await registerWorkerCommand(rest);
 			case 'register-and-enroll':

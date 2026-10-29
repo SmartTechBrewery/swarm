@@ -69,8 +69,21 @@ vi.mock('@/scm/repo-slug.js', async (importOriginal) => ({
 	resolveDeclarableOriginRepoSlug,
 }));
 vi.mock('@/cli/_shared/control-plane-env.js', () => ({ ensureControlPlaneUrl }));
+// `setup` discovers CLIs on PATH, asks for the project id on a TTY, and installs a
+// supervisor entry — all three seams mocked so the suite spawns nothing and reads
+// no real terminal.
+const { discoverAvailableClis, installWorkerAutostart, question } = vi.hoisted(() => ({
+	discoverAvailableClis: vi.fn(),
+	installWorkerAutostart: vi.fn(),
+	question: vi.fn(),
+}));
+vi.mock('@/transport/cli-discovery.js', () => ({ discoverAvailableClis }));
+vi.mock('@/cli/_shared/worker-autostart.js', () => ({ installWorkerAutostart }));
+vi.mock('node:readline/promises', () => ({
+	createInterface: () => ({ question, close: () => {} }),
+}));
 
-import { run } from '@/cli/commands/workers.js';
+import { defaultWorkerName, run } from '@/cli/commands/workers.js';
 
 const WORKER_ID = '11111111-1111-4111-8111-111111111111';
 const PROJECT_ID = 'proj-a';
@@ -296,6 +309,9 @@ describe('swarm workers', () => {
 			sharingConsent: true,
 		}));
 		answers.set('workers.projectScmProvider', () => ({ providerId: 'github' }));
+		discoverAvailableClis.mockReset().mockResolvedValue(['claude', 'codex']);
+		installWorkerAutostart.mockReset().mockResolvedValue({ kind: 'installed' });
+		question.mockReset().mockResolvedValue('');
 	});
 
 	afterEach(() => {
@@ -479,6 +495,106 @@ describe('swarm workers', () => {
 	// Issue #786 — the composite: register + operator credential + enroll, ending in
 	// the exact command that starts the daemon. It composes the three commands above,
 	// so what is asserted here is the *ordering* and the credential handling.
+	describe('setup', () => {
+		const REPO_ROOT = realpathSync(process.cwd());
+
+		it("registers the signed-in operator's worker with discovered CLIs and installs autostart", async () => {
+			slugs.set(REPO_ROOT, 'acme/myrepo');
+			expect(await run(['setup', '--project', PROJECT_ID])).toBe(0);
+			expect(pathsCalled()).toEqual([
+				'workers.projectScmProvider',
+				'workers.register',
+				'workers.scmCredentials.set',
+				'workers.enroll',
+				'workers.approveEnrollment',
+				'workers.setConsent',
+			]);
+			const registered = inputFor('workers.register') ?? {};
+			expect(registered.ownerIdentifier).toBe(IDENTIFIER);
+			expect(registered.capabilities).toEqual(['claude', 'codex']);
+			expect(String(registered.displayName)).toMatch(/^ada_.+_myrepo$/);
+			expect(installWorkerAutostart).toHaveBeenCalledExactlyOnceWith(REPO_ROOT);
+			// The credential is cached for the LaunchAgent, never printed on success.
+			expect(lines().some((line) => line.includes('raw-credential-token'))).toBe(false);
+		});
+
+		it('offers the repository name as the project id on a TTY', async () => {
+			slugs.set(REPO_ROOT, 'acme/proj-a');
+			await onATTY(async () => {
+				expect(await run(['setup', '--name', 'ada-laptop'])).toBe(0);
+			});
+			expect(question).toHaveBeenCalledWith('Project id [proj-a]: ');
+			expect(inputFor('workers.projectScmProvider')).toEqual({ projectId: 'proj-a' });
+			expect(promptHidden).toHaveBeenCalledOnce();
+		});
+
+		it('refuses without a project id when there is nobody to ask', async () => {
+			expect(await run(['setup'])).toBe(1);
+			expect(pathsCalled()).toEqual([]);
+		});
+
+		it('refuses a checkout that already has a worker, before asking anything', async () => {
+			readWorkerCredentialCache.mockReturnValue({
+				workerId: WORKER_ID,
+				credential: 'raw-credential-token',
+				repoRoot: REPO_ROOT,
+				registeredAt: new Date().toISOString(),
+			});
+			expect(await run(['setup', '--project', PROJECT_ID])).toBe(1);
+			expect(pathsCalled()).toEqual([]);
+			expect(ensureControlPlaneUrl).not.toHaveBeenCalled();
+		});
+
+		it('refuses a machine with no agent CLI on PATH', async () => {
+			discoverAvailableClis.mockResolvedValue([]);
+			expect(await run(['setup', '--project', PROJECT_ID])).toBe(1);
+			expect(pathsCalled()).toEqual([]);
+		});
+
+		it('takes --cli over discovery', async () => {
+			expect(await run(['setup', '--project', PROJECT_ID, '--cli', 'codex'])).toBe(0);
+			expect(discoverAvailableClis).not.toHaveBeenCalled();
+			expect(inputFor('workers.register')?.capabilities).toEqual(['codex']);
+		});
+
+		it('skips autostart with --no-autostart', async () => {
+			expect(await run(['setup', '--project', PROJECT_ID, '--no-autostart'])).toBe(0);
+			expect(installWorkerAutostart).not.toHaveBeenCalled();
+		});
+
+		it('names the foreground command where no autostart exists', async () => {
+			installWorkerAutostart.mockResolvedValue({ kind: 'unsupported', platform: 'win32' });
+			expect(await run(['setup', '--project', PROJECT_ID])).toBe(0);
+			expect(lines().some((line) => line.includes('not available on win32'))).toBe(true);
+		});
+
+		it('fails, with the worker left registered, when autostart fails', async () => {
+			installWorkerAutostart.mockResolvedValue({ kind: 'failed', reason: 'exit 1' });
+			expect(await run(['setup', '--project', PROJECT_ID])).toBe(1);
+			expect(pathsCalled()).toContain('workers.setConsent');
+		});
+
+		it('does not install autostart when enrollment did not finish', async () => {
+			refuse('workers.scmCredentials.set', 'the credential did not authenticate');
+			expect(await run(['setup', '--project', PROJECT_ID])).toBe(1);
+			expect(installWorkerAutostart).not.toHaveBeenCalled();
+			// The one-time credential is still handed over on the failure path.
+			expect(lines().some((line) => line.includes('raw-credential-token'))).toBe(true);
+		});
+	});
+
+	describe('defaultWorkerName', () => {
+		it('joins owner, host and repository into one lowercase name', () => {
+			expect(defaultWorkerName('Jacek.Kwiecien@gmail.com', 'Jaceks-Mac-mini.local', 'swarm')).toBe(
+				'jacek_kwiecien_jaceks_mac_mini_swarm',
+			);
+		});
+
+		it('drops a part that sanitises to nothing', () => {
+			expect(defaultWorkerName('ada', '---', 'repo')).toBe('ada_repo');
+		});
+	});
+
 	describe('register-and-enroll', () => {
 		/** The checkout this test process is standing in — the command's own default. */
 		const REPO_ROOT = process.cwd();

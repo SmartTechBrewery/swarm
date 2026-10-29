@@ -15,6 +15,10 @@ macOS only — launchd is. On Linux the equivalent is a `systemd --user` unit ru
 the same command with `WorkingDirectory=` set to the checkout; the script says so
 rather than half-working.
 
+A worker that does not exist yet does not need this command run by hand:
+[`swarm workers setup`](./cli.md#swarm-workers) registers and enrolls it from its
+checkout and ends by running `swarm-worker-agent install` there.
+
 ## Usage
 
 ```bash

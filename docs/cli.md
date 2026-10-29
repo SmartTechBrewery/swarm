@@ -451,6 +451,7 @@ the same identities under the dashboard's **Settings → Users**, with no shell
 ### `swarm workers`
 
 ```bash
+swarm workers setup [--project <id>] [--name <displayName>] [--cli <c1,c2,...>] [--control-plane-url <url>] [--no-autostart]
 swarm workers register <owner-identifier> --name <displayName> --cli <c1,c2,...> [--extra-checkout <path>]...
 swarm workers register-and-enroll <owner-identifier> <project-id> --name <displayName> --cli <c1,c2,...> [--control-plane-url <url>] [--repo-root <path>] [--extra-checkout <path>]...
 swarm workers add-checkout <path>
@@ -582,6 +583,26 @@ unchanged.
   primary checkout's own `origin` must name a repository too: alone it may have
   none, but beside another the daemon could not tell it apart and refuses to start.
   It is recorded in the primary checkout's cache entry, which is how `run:worker` finds it.
+- **`setup`** — the **shortest path for a new worker**, run in the checkout it is to
+  serve. It is `register-and-enroll` with its inputs defaulted rather than demanded,
+  and it asks only for what nothing on the machine can know: the **project id**
+  (offering the checkout's repository name, so Enter usually answers it) and the
+  **operator source-control credential** (no echo, verified before it is stored, as
+  below). The owner is the signed-in operator (`swarm login`), the CLIs are the ones
+  the daemon would itself discover on this machine's `PATH`, and the name is
+  `<owner>_<host>_<repo>`, lowercased; `--project`, `--cli` and `--name` override
+  each. It then **starts the worker under the host's process supervisor** instead of
+  printing a start line: on macOS it runs `swarm-worker-agent install` for the
+  checkout ([`launchd-worker-autostart.md`](./launchd-worker-autostart.md)), whose
+  own refusals apply unchanged. Other platforms have no autostart yet — Windows
+  included — and are told to run `swarm run:worker`; `--no-autostart` stops short
+  of starting it anywhere. It **refuses a checkout that already has a worker
+  cached**, before asking anything, since registering again would issue a second
+  worker and strand the first one's enrollments and operator credentials. The worker
+  credential is cached for the checkout and, on success, not printed; if a step
+  after registration fails it is printed once with the outstanding commands, exactly
+  as `register-and-enroll` does, and no autostart is installed. A worker serving
+  further repositories gains them afterwards with `add-checkout`.
 - **`register-and-enroll`** — the **recommended one-command path for a new machine**
   (issue #786): `register` + `set-scm-credential` + `enroll` in one invocation,
   ending with the exact command that starts the daemon. It composes those three and

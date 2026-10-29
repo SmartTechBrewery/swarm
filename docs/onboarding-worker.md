@@ -98,6 +98,24 @@ own call.
 Sessions last `SWARM_SESSION_TTL_HOURS` (7 days by default); re-running this
 command is the renewal.
 
+### Shortcut — steps 4 and 6 in one command
+
+On a machine that is signed in (step 3), the project's checkout can do the rest by
+itself:
+
+```bash
+cd ~/code/example-project
+npm run swarm -- workers setup     # or `swarm workers setup` with the global binary
+```
+
+It asks for the project id (offering the checkout's repository name) and the
+operator source-control credential, takes the CLIs from the machine's `PATH` and
+names the worker `<owner>_<host>_<repo>` (`--cli` / `--name` / `--project`
+override), registers and enrolls it exactly as step 4 does, and on macOS installs
+it as a LaunchAgent so it is already running when the command returns. Elsewhere it
+stops at the start command of step 6. Step 5 still applies to a project you do not
+administer. See [`docs/cli.md`](./cli.md#swarm-workers) for the details.
+
 ### Step 4 — register and enroll the worker
 
 Run this **from the project's checkout**, or name it with `--repo-root`:
