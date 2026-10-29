@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { MERGE_CATCH_UP_ACTION } from '@/queue/jobs.js';
+import type { ScmEvent } from '@/scm/events.js';
 import { registerBuiltInTriggers } from '@/triggers/builtins.js';
 import { createTriggerRegistry } from '@/triggers/registry.js';
 import { createFakeScmProvider, createMockScmTriggerContext } from '../../helpers/factories.js';
@@ -11,6 +12,7 @@ describe('registerBuiltInTriggers', () => {
 
 		const names = registry.getHandlers().map((h) => h.name);
 		expect(names).toEqual([
+			'wip-release',
 			'pr-review',
 			'resolve-conflicts',
 			'pr-review-submitted',
@@ -62,5 +64,29 @@ describe('registerBuiltInTriggers', () => {
 				.filter((handler) => handler.matches(ctx))
 				.map((handler) => handler.name),
 		).toEqual(['resolve-conflicts']);
+	});
+
+	// Issue #1185: `wip-release` overlaps `resolve-conflicts` on a merged close on
+	// purpose — it frees the ticket's WIP slot and yields, so the merge still fans out.
+	it('matches a merged close with wip-release first, then resolve-conflicts', () => {
+		const registry = createTriggerRegistry();
+		registerBuiltInTriggers(registry);
+		const event: ScmEvent = {
+			kind: 'pull-request',
+			action: 'closed',
+			merged: true,
+			repoFullName: 'acme/widgets',
+			workItemId: '42',
+			prBranch: 'issue-42',
+			isCommentEvent: false,
+		};
+		const ctx = createMockScmTriggerContext({ scm: createFakeScmProvider({}), event });
+
+		expect(
+			registry
+				.getHandlers()
+				.filter((handler) => handler.matches(ctx))
+				.map((handler) => handler.name),
+		).toEqual(['wip-release', 'resolve-conflicts']);
 	});
 });

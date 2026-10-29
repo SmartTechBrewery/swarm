@@ -25,20 +25,27 @@
  * into Planning.
  *
  * Registration order matters — the registry dispatches first-match-wins
- * (`registry.ts`) — but these handlers key off disjoint event types
+ * (`registry.ts`) — but the phase-starting handlers key off disjoint event types
  * (`projects_v2_item` vs `pull_request` vs `check_suite` vs `pull_request_review`),
- * so no two ever both match the same event. The order
- * below follows Cascade's (review-lifecycle handlers ahead of the PM one) for
- * familiarity, not correctness.
+ * so no two of them ever both match the same event. Their order below follows
+ * Cascade's (review-lifecycle handlers ahead of the PM one) for familiarity, not
+ * correctness.
+ *
+ * The one deliberate overlap is `wip-release` (issue #1185), registered **first**: it
+ * matches every pull request close — the merged one `resolve-conflicts` also matches
+ * included — frees the ticket's repository WIP slot as a side effect, and always
+ * yields `null`, so the event carries on to whichever handler starts a phase from it.
  */
 
 import { createPmStatusTrigger } from './handlers/pm-status.js';
 import { createResolveConflictsTrigger } from './handlers/resolve-conflicts.js';
 import { createRespondToReviewTrigger } from './handlers/respond-to-review.js';
 import { createReviewTrigger } from './handlers/review.js';
+import { createWipReleaseTrigger } from './handlers/wip-release.js';
 import type { TriggerRegistry } from './registry.js';
 
 export function registerBuiltInTriggers(registry: TriggerRegistry): void {
+	registry.register(createWipReleaseTrigger());
 	registry.register(createReviewTrigger());
 	registry.register(createResolveConflictsTrigger());
 	registry.register(createRespondToReviewTrigger());

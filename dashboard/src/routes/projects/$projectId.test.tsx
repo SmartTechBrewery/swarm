@@ -1348,6 +1348,7 @@ describe('toRepositoriesUpdate', () => {
 			autoMerge: true,
 			reviewChecks: 'if-present',
 			reviewChecksWaitMinutes: '',
+			wipLimit: '',
 		},
 	];
 

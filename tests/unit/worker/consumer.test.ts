@@ -366,6 +366,42 @@ vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
 	bindDispatchToRun: (id: string, runId: string) => bindDispatchToRun(id, runId),
 	scheduleDispatchRetry: (id: string, input: { jobPayload: Record<string, unknown> }) =>
 		scheduleDispatchRetry(id, input),
+	listWipLimitWaits: (projectId: string, repository: string) =>
+		listWipLimitWaits(projectId, repository),
+}));
+
+/**
+ * The repository WIP limit's slot table (issue #1185). Defaults to "admitted as a new
+ * ticket", so every pre-existing board-driven case runs exactly as before.
+ */
+const reserveWipSlot = vi.fn(
+	async (_input: {
+		projectId: string;
+		repository: string;
+		taskId: string;
+		limit: number;
+		phase: string;
+		dispatchId: string;
+	}): Promise<
+		| { admitted: true; alreadyInFlight: boolean }
+		| {
+				admitted: false;
+				holders: Array<{ taskId: string; workItemTitle: string | null; openedAt: Date }>;
+		  }
+	> => ({ admitted: true, alreadyInFlight: false }),
+);
+const releaseWipSlot = vi.fn(
+	async (_projectId: string, _repository: string, _taskId: string) => false,
+);
+const countWipSlots = vi.fn(async (_projectId: string, _repository: string) => 0);
+const listWipLimitWaits = vi.fn(
+	async (_projectId: string, _repository: string): Promise<MockDispatchRow[]> => [],
+);
+vi.mock('@/db/repositories/wipSlotsRepository.js', () => ({
+	reserveWipSlot: (input: Parameters<typeof reserveWipSlot>[0]) => reserveWipSlot(input),
+	releaseWipSlot: (projectId: string, repository: string, taskId: string) =>
+		releaseWipSlot(projectId, repository, taskId),
+	countWipSlots: (projectId: string, repository: string) => countWipSlots(projectId, repository),
 }));
 
 const refreshConflictResolutionClaim = vi.fn(
@@ -993,6 +1029,14 @@ describe('processJob', () => {
 		getDispatchById.mockReset();
 		getDispatchById.mockImplementation(async (_id: string) => mockDispatchRow({}));
 		deferDispatchToPending.mockClear();
+		reserveWipSlot.mockReset();
+		reserveWipSlot.mockResolvedValue({ admitted: true, alreadyInFlight: false });
+		releaseWipSlot.mockReset();
+		releaseWipSlot.mockResolvedValue(false);
+		countWipSlots.mockReset();
+		countWipSlots.mockResolvedValue(0);
+		listWipLimitWaits.mockReset();
+		listWipLimitWaits.mockResolvedValue([]);
 		bindDispatchToRun.mockClear();
 		bindDispatchToRun.mockResolvedValue(true);
 		scheduleDispatchRetry.mockClear();
@@ -5531,6 +5575,8 @@ describe('processJob', () => {
 			expect(listProjectDispatchCandidates).not.toHaveBeenCalled();
 			expect(claimWorkerForDispatch).not.toHaveBeenCalled();
 			expect(acquireProjectSlot).not.toHaveBeenCalled();
+			// …and no repository WIP admission either (issue #1185).
+			expect(reserveWipSlot).not.toHaveBeenCalled();
 			// The executor sees the carried result and the machine that produced it.
 			const context = phaseCalls.at(-1)?.context;
 			expect(context?.resolution.selection).toEqual(SELECTION);
@@ -6346,6 +6392,197 @@ describe('processJob', () => {
 
 			expect(findWorkItemForArtifact).toHaveBeenCalled();
 			expect(outcome.status).toBe('skipped-not-eligible');
+		});
+	});
+
+	describe('repository WIP limit (issue #1185)', () => {
+		const HOLDERS = [{ taskId: '1180', workItemTitle: 'Earlier ticket', openedAt: new Date() }];
+
+		function boardTrigger(
+			phase: 'planning' | 'implementation',
+			taskId = '216',
+		): Extract<TriggerResult, { phase: 'planning' | 'implementation' }> {
+			return {
+				phase,
+				taskId,
+				workItem: createMockWorkItem({
+					statusId: phase === 'planning' ? '3fe662f4' : '61e4505c',
+				}),
+			};
+		}
+
+		it('defers a refused Planning as a visible wip-limit wait, before any task claim or gate', async () => {
+			reserveWipSlot.mockResolvedValueOnce({ admitted: false, holders: HOLDERS });
+			countWipSlots.mockResolvedValueOnce(1);
+
+			const outcome = await processJob(
+				createMockPmWebhookJob({ runId: undefined }),
+				registryReturning(boardTrigger('planning')),
+			);
+
+			expect(outcome).toMatchObject({ status: 'phase-deferred', pendingDispatch: true });
+			if (outcome.status !== 'phase-deferred') throw new Error('expected phase-deferred');
+			expect(outcome.reason).toContain(`Repository '${PROJECT.repo}' is at its WIP limit (1/1`);
+			expect(outcome.reason).toContain('#1180');
+			expect(reserveWipSlot).toHaveBeenCalledWith(
+				expect.objectContaining({
+					projectId: PROJECT.id,
+					repository: PROJECT.repo,
+					taskId: '216',
+					limit: 1,
+					phase: 'planning',
+					dispatchId: 'dispatch-1',
+				}),
+			);
+			expect(deferDispatchToPending).toHaveBeenCalledWith(
+				'dispatch-1',
+				expect.objectContaining({
+					waitReason: 'wip-limit',
+					repository: PROJECT.repo,
+					runId: 'run-1',
+					jobPayload: expect.objectContaining({ resumePmPhase: 'planning' }),
+				}),
+			);
+			expect(completeRun).toHaveBeenCalledWith(
+				'run-1',
+				expect.objectContaining({ status: 'deferred', fromStatus: 'running' }),
+			);
+			// Refused before the task claim, the worker gate, and the project slot.
+			expect(findExecutingDispatchForTask).not.toHaveBeenCalled();
+			expect(listProjectDispatchCandidates).not.toHaveBeenCalled();
+			expect(acquireProjectSlot).not.toHaveBeenCalled();
+			expect(phaseCalls).toEqual([]);
+			expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+			// Still full after the defer, so it does not wake itself.
+			expect(publishDispatchWakeUp).not.toHaveBeenCalled();
+		});
+
+		it('wakes its own wait when a slot freed between the refusal and the defer', async () => {
+			reserveWipSlot.mockResolvedValueOnce({ admitted: false, holders: HOLDERS });
+			countWipSlots.mockResolvedValueOnce(0);
+
+			await processJob(createMockPmWebhookJob(), registryReturning(boardTrigger('planning')));
+
+			expect(publishDispatchWakeUp).toHaveBeenCalledOnce();
+		});
+
+		it('admits a Planning under the limit and runs it', async () => {
+			const outcome = await processJob(
+				createMockPmWebhookJob(),
+				registryReturning(boardTrigger('planning')),
+			);
+
+			expect(outcome.status).toBe('phase-succeeded');
+			expect(reserveWipSlot).toHaveBeenCalledOnce();
+			expect(phaseCalls).toHaveLength(1);
+		});
+
+		it('runs Implementation of a ticket already in flight regardless of the count', async () => {
+			reserveWipSlot.mockResolvedValueOnce({ admitted: true, alreadyInFlight: true });
+
+			const outcome = await processJob(
+				createMockPmWebhookJob(),
+				registryReturning(boardTrigger('implementation')),
+			);
+
+			expect(outcome.status).toBe('phase-succeeded');
+			expect(deferDispatchToPending).not.toHaveBeenCalled();
+		});
+
+		it('defers Implementation of a ticket that never ran Planning when the repository is full', async () => {
+			reserveWipSlot.mockResolvedValueOnce({ admitted: false, holders: HOLDERS });
+			countWipSlots.mockResolvedValueOnce(1);
+
+			const outcome = await processJob(
+				createMockPmWebhookJob(),
+				registryReturning(boardTrigger('implementation')),
+			);
+
+			expect(outcome.status).toBe('phase-deferred');
+			expect(deferDispatchToPending).toHaveBeenCalledWith(
+				'dispatch-1',
+				expect.objectContaining({ waitReason: 'wip-limit' }),
+			);
+			expect(phaseCalls).toEqual([]);
+		});
+
+		it('reads the repository’s own limit', async () => {
+			projectLookup = () => createMockProjectConfig({ scm: 'github', wipLimit: 3 });
+
+			await processJob(createMockPmWebhookJob(), registryReturning(boardTrigger('planning')));
+
+			expect(reserveWipSlot).toHaveBeenCalledWith(expect.objectContaining({ limit: 3 }));
+		});
+
+		it.each([
+			REVIEW_TRIGGER,
+			RESPOND_TO_REVIEW_TRIGGER,
+			RESPOND_TO_CI_TRIGGER,
+			RESOLVE_CONFLICTS_TRIGGER,
+		])('never gates $phase, a pull request-driven phase', async (trigger) => {
+			reserveWipSlot.mockResolvedValue({ admitted: false, holders: HOLDERS });
+
+			const outcome = await processJob(createMockScmWebhookJob(), registryReturning(trigger));
+
+			expect(reserveWipSlot).not.toHaveBeenCalled();
+			expect(outcome.status).not.toBe('phase-deferred');
+		});
+
+		it('takes no slot for an item the automation-label gate skips', async () => {
+			const outcome = await processJob(
+				createMockPmWebhookJob(),
+				registryReturning({
+					phase: 'planning',
+					taskId: '216',
+					workItem: createMockWorkItem({ statusId: '3fe662f4', labels: [] }),
+				}),
+			);
+
+			expect(outcome.status).toBe('skipped-not-eligible');
+			expect(reserveWipSlot).not.toHaveBeenCalled();
+		});
+
+		it('admits a woken resumePmPhase Planning once a slot is free (the automatic start)', async () => {
+			const outcome = await processJob(
+				{ ...createMockPmWebhookJob(), resumePmPhase: 'planning' },
+				registryReturning(boardTrigger('planning')),
+			);
+
+			expect(reserveWipSlot).toHaveBeenCalledOnce();
+			expect(outcome.status).toBe('phase-succeeded');
+		});
+
+		it('frees the slot of a start that deferred on an unfinished prerequisite', async () => {
+			const trigger = boardTrigger('planning');
+			releaseWipSlot.mockResolvedValueOnce(true);
+			phaseImpl = async () => {
+				throw new DependencyBlockedError(trigger.workItem, [
+					{
+						reference: '#319',
+						url: 'https://github.com/o/r/issues/319',
+						title: 'Session auth',
+						open: true,
+						source: 'dependency',
+					},
+				]);
+			};
+
+			const outcome = await processJob(createMockPmWebhookJob(), registryReturning(trigger));
+
+			expect(outcome).toMatchObject({ status: 'phase-deferred', dependencyRecheck: true });
+			expect(releaseWipSlot).toHaveBeenCalledWith(PROJECT.id, PROJECT.repo, '216');
+			// …and wakes the repository's waiters, which may include the prerequisite.
+			expect(listWipLimitWaits).toHaveBeenCalledWith(PROJECT.id, PROJECT.repo);
+		});
+
+		it('keeps the slot of a start that failed — the ticket waits on the operator', async () => {
+			phaseImpl = async () => {
+				throw new Error('agent crashed');
+			};
+
+			await processJob(createMockPmWebhookJob(), registryReturning(boardTrigger('planning')));
+
+			expect(releaseWipSlot).not.toHaveBeenCalled();
 		});
 	});
 

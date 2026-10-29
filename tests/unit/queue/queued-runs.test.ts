@@ -383,6 +383,11 @@ describe('toQueuedRuns', () => {
 	// Issue #759: the second event-woken pending wait. It is eligible now but nothing
 	// picks it up until the task's current phase settles, so it must read as `blocked`
 	// rather than `waiting`.
+	it('maps a wip-limit wait to the blocked state with its wait reason (issue #1185)', () => {
+		const [item] = toQueuedRuns([makeDispatch({ waitReason: 'wip-limit' })]);
+		expect(item).toMatchObject({ state: 'blocked', waitReason: 'wip-limit' });
+	});
+
 	it('maps a task-in-flight wait to the blocked state with its wait reason', () => {
 		const [item] = toQueuedRuns([makeDispatch({ waitReason: 'task-in-flight' })]);
 		expect(item).toMatchObject({ state: 'blocked', waitReason: 'task-in-flight' });

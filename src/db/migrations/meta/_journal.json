@@ -582,6 +582,13 @@
       "when": 1793177309604,
       "tag": "0082_user_password_tokens",
       "breakpoints": true
+    },
+    {
+      "idx": 83,
+      "version": "7",
+      "when": 1793281955856,
+      "tag": "0083_wip_slots",
+      "breakpoints": true
     }
   ]
 }

@@ -47,6 +47,7 @@ import { priorityFor } from '../queue/producer.js';
 import type { TriggerPhase } from '../triggers/types.js';
 import { mergeDispatchDedupKey } from '../worker/merge-automation.js';
 import { promoteNextCapacityDispatch, publishDispatchWakeUp } from './dispatcher.js';
+import { promoteAllWipWaits } from './wip-limit.js';
 
 /** The Redis namespace the retired pending-continuation registry lived under. */
 const LEGACY_CONTINUATION_NS = 'swarm:pending-continuations:';
@@ -409,13 +410,24 @@ export async function reconcileDispatchesAtStartup(): Promise<void> {
 		const orphans = await backfillOrphanedDeferredRuns();
 		const merges = await backfillLegacyMergeFollowUps();
 		const republished = await republishWakeUps();
-		if (reclaimed > 0 || legacy > 0 || orphans > 0 || merges > 0 || republished > 0) {
+		// A `wip-limit` wait is not timed-republished (issue #1185), so a wake-up lost
+		// across the restart is repaired here instead.
+		const wipPromoted = await promoteAllWipWaits();
+		if (
+			reclaimed > 0 ||
+			legacy > 0 ||
+			orphans > 0 ||
+			merges > 0 ||
+			republished > 0 ||
+			wipPromoted > 0
+		) {
 			logger.info('dispatch-reconciler: startup reconciliation complete', {
 				deadLeases: reclaimed,
 				legacyContinuationsImported: legacy,
 				orphanedDeferredRunsImported: orphans,
 				legacyMergeFollowUpsImported: merges,
 				wakeUpsRepublished: republished,
+				wipLimitWaitsPromoted: wipPromoted,
 			});
 		}
 	} catch (err) {
@@ -428,7 +440,8 @@ export async function reconcileDispatchesAtStartup(): Promise<void> {
 /**
  * Periodic reconciliation while serving jobs: reclaim expired leases,
  * re-publish any wake-up a crash window lost, and nudge capacity-blocked work
- * whose slot-release wake-up went missing.
+ * whose slot-release wake-up went missing — and tickets waiting on a repository's
+ * WIP limit (issue #1185), which also picks up an operator raising that limit.
  */
 export async function reconcileDispatchesPeriodically(
 	prioritizeContinuationsFor: (projectId: string) => boolean,
@@ -437,6 +450,7 @@ export async function reconcileDispatchesPeriodically(
 		const reclaimed = await reclaimDeadLeases(new Date());
 		const republished = await republishWakeUps();
 		await promoteCapacityPending(prioritizeContinuationsFor);
+		await promoteAllWipWaits();
 		if (reclaimed > 0) {
 			logger.warn('dispatch-reconciler: reclaimed expired dispatch leases', {
 				count: reclaimed,

@@ -69,6 +69,15 @@ describe('toWorkerConfig', () => {
 		expect('reviewChecksWaitMinutes' in worker).toBe(false);
 	});
 
+	// Issue #1185: admission is decided control-plane side.
+	it('drops the per-repository WIP limit', () => {
+		const worker = toWorkerConfig(createMockProjectConfig({ wipLimit: 3 })) as Record<
+			string,
+			unknown
+		>;
+		expect('wipLimit' in worker).toBe(false);
+	});
+
 	it('strips the board mapping along with the pm block it now lives under', () => {
 		const project = createMockProjectConfig();
 		const pm = requireGitHubProjectsConfig(project);

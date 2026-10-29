@@ -115,6 +115,10 @@ const QUEUED_WAIT_REASON_LABELS: Record<QueuedWaitReason, string> = {
 	// only waits for the merge ahead of it to settle (issue #1114). Which pull request
 	// that is, and for how long it has held the queue, is on the Review run's detail.
 	'merge-queue': "waiting for its turn in the repository's merge queue",
+	// Names the *repository's* WIP limit: a new ticket waits for one already in flight
+	// there to be merged, closed or put back (issue #1185). Which tickets hold the
+	// slots is in the run's own reason.
+	'wip-limit': 'waiting for a free WIP slot in its repository',
 	'manual-retry': 'manual retry',
 	recovered: 'recovered after a restart',
 };

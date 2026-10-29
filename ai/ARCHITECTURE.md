@@ -1302,6 +1302,72 @@ The dashboard deliberately exposes three complementary read models (issues #313,
   own is invisible here, because closing that needs the provider's open-pull-request list —
   a different read with a different cost profile.
 
+**Repository WIP limit (issue #1185).** An event-woken `pending` wait like `project-capacity` bounds how
+many **tickets** are in flight per repository (`repositories[].wipLimit`, default 1,
+resolved by `resolveWipLimit`, `src/config/project-repository.ts`; a server-only key).
+"In flight" is SWARM's own durable state, never a count of board columns: a ticket is in
+flight while it holds a row in `wip_slots` (`src/db/schema/wipSlots.ts`), keyed
+`(project_id, repository, task_id)` — the scoped `project.repo` and the SCM-derived task
+id Planning and Implementation share ("Task identity" above). Policy lives in
+`src/dispatch/wip-limit.ts`, persistence in `src/db/repositories/wipSlotsRepository.ts`.
+
+- **The gate.** `processJob` asks only for the two board-driven phases (`admitTicket`),
+  after the automation-label and assignee gates (a skipped item costs no slot) and before
+  `claimTaskForPhase` (whose task claim only the `finally` releases, so a deferral there
+  leaks nothing); a late result adopted for that very phase asks nothing. `reserveWipSlot`
+  is one transaction that takes the `projects` row `FOR UPDATE` — the row
+  `claimWorkerForDispatch` serializes on — then admits a ticket already holding a slot
+  (`alreadyInFlight`), refuses at `count >= limit` naming the holders, or inserts. Two
+  concurrent admissions cannot both take the last slot, and no `dispatches` row is
+  locked, so the lock order stays acyclic with that claim. A ticket already in flight is
+  therefore never gated (Implementation, a re-Planning), and the PR-driven phases and
+  merge automation never ask, so an in-flight ticket can always get the job that
+  finishes it. Gating Implementation of a *slot-less* ticket is deliberate: a card moved
+  Backlog → ToDo — the ordinary path — and a split child advanced straight to ToDo
+  (issue #911) never run Planning, and without it the limit would bound only tickets
+  that happen to.
+- **Why not inside `claimWorkerForDispatch`.** Every refusal there comes back through
+  `bindSelectedWorker` as a `WorkerIneligibleError`, which becomes a *timed*
+  `worker-eligibility` wait; a WIP wait has to be event-woken and visible under its own
+  reason. Taking the slot before a worker is bound is correct anyway: the ticket is
+  admitted and first in line, and if it then waits for a machine nothing else could have
+  used the slot better.
+- **The wait.** A refusal is `handleWipLimitDeferral` → `deferBeforeRun` with
+  `waitReason: 'wip-limit'`: a visible `deferred` run whose reason names the holders, the
+  dispatch back in `pending` with `resumePmPhase` stamped, and — the one board-driven wait
+  that does — `repository` written on the row so promotion can find it. It is excluded
+  from `listWakeablePendingDispatches` like `project-capacity` (re-evaluating every waiter
+  each reconciler pass would cost a board re-read apiece), re-checks for a slot freed
+  inside its own defer window, and reads as `blocked` in the Queue. Card moves while it
+  waits are board-phase retirement's, unchanged (issue #909).
+- **Release** (`releaseTicketSlot` — delete the row, then `promoteWipWaits`; idempotent and
+  fail-open). The ticket's **pull request closing**, merged or not: the `wip-release`
+  trigger (`src/triggers/handlers/wip-release.ts`), registered first, matches the
+  normalized `pull-request` / `closed` event every SCM adapter emits — SWARM's own merges
+  included, since ingress loop prevention drops only comments — derives the task id
+  from the branch with `issueNumberFromBranch(…, { strict: true })`, and always yields
+  `null` so `resolve-conflicts` still receives a merged close; it ignores the conflict
+  fan-out's re-checks and merge catch-ups. The **card reaching `done` or `backlog`**: a
+  `pm-status` side effect beside `wakeDependentsOfDoneItem`, with its guards. A dashboard
+  **Put back** (`runs.putBack`), explicitly and only after its card move succeeded,
+  because that move is made with the project's own board credential and its board event
+  is dropped at ingress as self-authored. And a **start deferred on an unfinished
+  prerequisite** (`dependencyRecheck`), which has not really started — holding its slot
+  would keep that prerequisite, possibly the next ticket waiting, from ever starting; the
+  re-check re-admits it like any start. **Not** a release: a failed run (the ticket waits
+  on an operator), "Reset & restart", a Queue-cancelled dispatch.
+- **Promotion.** `promoteWipWaits` wakes the first `limit − count` waiters ordered
+  `priority, created_at` — not `available_at`, which every re-defer re-dates — through
+  `publishDispatchWakeUp`, whose deterministic wake ids make two concurrent releases
+  publish one job; each woken dispatch re-admits itself and a loser simply re-defers. The
+  reconciler's startup and periodic passes run `promoteAllWipWaits`, covering a lost
+  wake-up and an operator **raising** a limit; lowering one preempts nothing.
+
+Tickets already in flight when this shipped hold no slot. The label-removal sweep that
+frees the slots of tickets taken off automation without an event, ranking in-flight work
+ahead of new starts, the WIP dashboard panel, and retiring `maxConcurrentJobs` (both caps
+apply until then) are later phases of issue #1185.
+
 ### Failure handling & rate-limit retries (issue #91)
 
 A phase whose agent exits non-zero throws, and `processJob` turns that into a `phase-failed` `JobOutcome` rather than rethrowing — an agent run isn't idempotent, so a BullMQ retry storm is worse than surfacing the failure (the phase already logged the agent's stdout/stderr, and the `attempts: 3` default only ever fires for the infra throws that happen *before* the agent runs). The exceptions are transient failures: a **usage/session-limit** hit where the agent never did any work, an **aborted** run where the worker itself shuts down mid-phase, or a deterministic-delivery failure after the agent has already produced a valid checkpoint. Delivery deferrals preserve the worktree and expose the wrapped push/hook/API cause in the run rather than misreporting it as a worker shutdown.

@@ -12,6 +12,7 @@ export { userIdentities } from './userIdentities.js';
 export { userPasswordTokens } from './userPasswordTokens.js';
 export { userSessions } from './userSessions.js';
 export { users } from './users.js';
+export { wipSlots } from './wipSlots.js';
 export { workerCliRateLimits } from './workerCliRateLimits.js';
 export { workerProjectEnrollments } from './workerProjectEnrollments.js';
 export { workerScmCredentials } from './workerScmCredentials.js';

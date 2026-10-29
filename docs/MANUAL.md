@@ -807,6 +807,24 @@ as one turns up (a worker connecting, or finishing a run and freeing its slot),
 while a wait for a *human* (consent, an enrollment, a permitted phase, a drained
 machine) keeps the timed cadence, since nothing a machine does can clear it.
 
+Each repository also has a **WIP limit** (`repositories[].wipLimit`, default 1 —
+[`docs/configuration.md`](./configuration.md#repositories), editable per repository on
+the Source Control tab), which bounds how many **tickets** are in flight there rather
+than how many runs happen at once (issue #1185). Only a ticket's **start** is held
+back: its Planning, or its Implementation when it never ran Planning. Every later
+phase of a ticket already in flight, and every pull-request-driven phase — Review,
+Respond-to-review, Respond-to-CI, Resolve-conflicts, merge automation — runs
+regardless, so a ticket can always get the job that finishes it. A held start shows
+in the Queue as *waiting for a free WIP slot in its repository*, with a deferred run
+whose reason names the tickets holding the slots, and starts by itself once one
+frees. A ticket stops counting when its **pull request is merged or closed**, its
+**card reaches Done or Backlog**, or it is **Put back** from the Queue; a start that
+turns out to be blocked on an unfinished prerequisite gives its slot back while it
+waits. A failed run keeps its slot — the ticket is waiting on you — so to free one by
+hand, close the pull request or move the card to Backlog or Done. Tickets already in
+flight when the limit shipped hold no slot. Until Maximum Concurrent Jobs is retired
+both caps apply, so an admitted ticket can still wait for a project slot.
+
 The control-plane host's own worker runs this identical program over loopback, so
 a remote worker and a local one are the same code path rather than two that have
 to be kept in step. See

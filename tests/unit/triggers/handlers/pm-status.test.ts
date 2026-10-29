@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { retireSupersededBoardPhases as RetireSuperseded } from '@/dispatch/board-phase-retirement.js';
 import type { promoteDependencyWaits as PromoteDependencyWaits } from '@/dispatch/dispatcher.js';
+import type { releaseTicketSlot as ReleaseTicketSlot } from '@/dispatch/wip-limit.js';
 import type { PmEvent } from '@/pm/events.js';
 import type { PMProvider, WorkItem } from '@/pm/types.js';
 
@@ -11,6 +12,9 @@ vi.mock('@/dispatch/board-phase-retirement.js', () => ({
 vi.mock('@/dispatch/dispatcher.js', () => ({
 	promoteDependencyWaits: vi.fn<typeof PromoteDependencyWaits>(),
 }));
+vi.mock('@/dispatch/wip-limit.js', () => ({
+	releaseTicketSlot: vi.fn<typeof ReleaseTicketSlot>(),
+}));
 
 // The handler resolves the project's board adapter through the PM registry, which
 // is populated by the integrations entrypoint at module load — import it so the
@@ -18,6 +22,7 @@ vi.mock('@/dispatch/dispatcher.js', () => ({
 import '@/integrations/entrypoint.js';
 import { retireSupersededBoardPhases } from '@/dispatch/board-phase-retirement.js';
 import { promoteDependencyWaits } from '@/dispatch/dispatcher.js';
+import { releaseTicketSlot } from '@/dispatch/wip-limit.js';
 import { buildPreplanContract, embedPreplanMarker, PLANNED_LABEL } from '@/pipeline/preplan.js';
 import { createPmStatusTrigger } from '@/triggers/handlers/pm-status.js';
 import { recordStatusAndDetectChange } from '@/triggers/pm-status-dedup.js';
@@ -37,6 +42,8 @@ beforeEach(() => {
 	vi.mocked(retireSupersededBoardPhases).mockResolvedValue(0);
 	vi.mocked(promoteDependencyWaits).mockReset();
 	vi.mocked(promoteDependencyWaits).mockResolvedValue(0);
+	vi.mocked(releaseTicketSlot).mockReset();
+	vi.mocked(releaseTicketSlot).mockResolvedValue(true);
 });
 
 /**
@@ -626,6 +633,60 @@ describe('pm-status trigger', () => {
 			});
 
 			expect(promoteDependencyWaits).not.toHaveBeenCalled();
+		});
+	});
+	// Issue #1185 — a card reaching Done (finished) or Backlog (taken off the pipeline
+	// by a human) frees its ticket's slot in the repository's WIP limit.
+	describe('releasing the ticket’s WIP slot', () => {
+		it.each([
+			['done', '98236657', 'board-done'],
+			['backlog', 'f75ad846', 'board-backlog'],
+		])('releases on a move to %s', async (_name, statusId, cause) => {
+			expect(await trigger.handle(ctx(createMockWorkItem({ statusId })))).toBeNull();
+
+			expect(releaseTicketSlot).toHaveBeenCalledExactlyOnceWith(
+				PROJECT.id,
+				PROJECT.repo,
+				'10',
+				cause,
+			);
+		});
+
+		it.each([
+			['ToDo', '3121a97d'],
+			['In review', 'df73e18b'],
+		])('does not release on a move to %s', async (_name, statusId) => {
+			await trigger.handle(ctx(createMockWorkItem({ statusId })));
+
+			expect(releaseTicketSlot).not.toHaveBeenCalled();
+		});
+
+		it('does not release on an unchanged status', async () => {
+			vi.mocked(recordStatusAndDetectChange).mockResolvedValue(false);
+
+			await trigger.handle(ctx(createMockWorkItem({ statusId: '98236657' })));
+
+			expect(releaseTicketSlot).not.toHaveBeenCalled();
+		});
+
+		it('does not release on a resumed PM phase', async () => {
+			await trigger.handle({
+				...ctx(createMockWorkItem({ statusId: '98236657' })),
+				resumePmPhase: 'implementation',
+			});
+
+			expect(releaseTicketSlot).not.toHaveBeenCalled();
+		});
+
+		it.each([
+			['a draft card', { taskRef: undefined }],
+			['a card linked in another repository', { taskRepository: 'acme/other' }],
+		])('does not release for %s, which names no ticket here', async (_name, linkage) => {
+			await trigger.handle(
+				ctx(createMockWorkItem({ statusId: '98236657', taskRef: '10', ...linkage })),
+			);
+
+			expect(releaseTicketSlot).not.toHaveBeenCalled();
 		});
 	});
 });

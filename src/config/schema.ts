@@ -95,6 +95,11 @@ export const PROJECT_DEFAULTS = {
 	branchPrefix: 'issue-',
 	/** One job per project at a time until an operator raises it. */
 	maxConcurrentJobs: 1,
+	/**
+	 * One ticket in flight per repository until an operator raises it (issue #1185) —
+	 * `repositories[].wipLimit`, resolved by `resolveWipLimit`.
+	 */
+	wipLimit: 1,
 	/** Relative to `repoRoot`; matches the worktree lifecycle in ai/ARCHITECTURE.md. */
 	worktreeRoot: '.swarm-workspaces',
 	maxWorktrees: 10,
@@ -772,6 +777,25 @@ export const ProjectRepositorySchema = z.object({
 	 * same way as {@link reviewChecks}.
 	 */
 	reviewChecksWaitMinutes: z.number().int().min(1).max(120).optional(),
+
+	/**
+	 * How many tickets may be **in flight** in this repository at once (issue #1185).
+	 * Per repository because how many tickets can safely run against one codebase at
+	 * the same time is small, and a property of that codebase rather than of the
+	 * project.
+	 *
+	 * It gates only a **new ticket's start** — Planning, or Implementation of a ticket
+	 * that never ran Planning. Every later phase of an admitted ticket, and every pull
+	 * request-driven phase, runs regardless, so a ticket in flight can always get the
+	 * job that finishes it. A ticket counts from that start until its pull request is
+	 * merged or closed, or its card reaches Done or Backlog (`src/dispatch/wip-limit.ts`).
+	 *
+	 * Unset defaults to `PROJECT_DEFAULTS.wipLimit` (1) through `resolveWipLimit`
+	 * (`./project-repository.ts`) rather than a `.default()`, the `autoMerge` /
+	 * `reviewChecksWaitMinutes` shape: a persisted row is re-joined without parsing, so
+	 * an entry written before this key existed must still read as the default.
+	 */
+	wipLimit: z.number().int().positive().optional(),
 });
 
 /**

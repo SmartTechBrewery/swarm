@@ -93,6 +93,7 @@ export async function truncateAll(): Promise<void> {
 			runs,
 			review_verdicts,
 			stalled_dismissals,
+			wip_slots,
 			project_membership_requests,
 			project_members,
 			project_credentials,

@@ -73,9 +73,9 @@ export type QueuedBoardOutcome = z.infer<typeof QueuedBoardOutcomeSchema>;
  * The queue-facing view of a dispatch's state: `waiting`/`prioritized` for an
  * eligible-now pending dispatch (by queue priority), `blocked` for one an *event*
  * has to wake rather than a timer — a freed project slot, the task's own checkout
- * freeing (issue #759), a pull request's head branch freeing (issue #850), or the
- * repository's merge queue moving on (issue #1114) — and `delayed` for a scheduled
- * retry.
+ * freeing (issue #759), a pull request's head branch freeing (issue #850), the
+ * repository's merge queue moving on (issue #1114), or a slot freeing in the
+ * repository's WIP limit (issue #1185) — and `delayed` for a scheduled retry.
  */
 export const PendingJobStateSchema = z.enum(['waiting', 'prioritized', 'delayed', 'blocked']);
 export type PendingJobState = z.infer<typeof PendingJobStateSchema>;
@@ -105,6 +105,7 @@ export const QueuedWaitReasonSchema = z.enum([
 	'task-in-flight',
 	'pr-in-flight',
 	'merge-queue',
+	'wip-limit',
 	'manual-retry',
 	'recovered',
 ]);
@@ -289,14 +290,16 @@ export function deriveQueuedState(dispatch: DispatchRow): PendingJobState {
 	// settling, so it reads as `blocked` like the event-woken pending waits below.
 	if (dispatch.waitReason === 'merge-queue') return 'blocked';
 	if (dispatch.state === 'retry-scheduled') return 'delayed';
-	// The three event-woken pending waits read as `blocked` rather than `waiting`: all
+	// The four event-woken pending waits read as `blocked` rather than `waiting`: all
 	// are eligible *now* and none will be picked up until something frees — a project
-	// slot, the task's own earlier phase settling (issues #759 and #761), or a writing
-	// phase of the same pull request settling (issue #850).
+	// slot, the task's own earlier phase settling (issues #759 and #761), a writing
+	// phase of the same pull request settling (issue #850), or a ticket in the
+	// repository leaving flight (issue #1185).
 	if (
 		dispatch.waitReason === 'project-capacity' ||
 		dispatch.waitReason === 'task-in-flight' ||
-		dispatch.waitReason === 'pr-in-flight'
+		dispatch.waitReason === 'pr-in-flight' ||
+		dispatch.waitReason === 'wip-limit'
 	)
 		return 'blocked';
 	if (dispatch.availableAt.getTime() > Date.now()) return 'delayed';
