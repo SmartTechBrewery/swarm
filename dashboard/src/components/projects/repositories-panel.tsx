@@ -13,7 +13,7 @@ import { RepositoryList } from './repository-list.js';
  * `owner/repo` slug (three segments on Azure DevOps), `baseBranch` is what pull requests target and worktrees are cut
  * from, `branchPrefix` names task branches. So the tab now reads top-to-bottom as
  * provider → credentials → repositories, the shape issue #630 gave Project Management.
- * Settings keeps `name`, `repoRoot`, `worktreeRoot` and `maxConcurrentJobs`.
+ * Settings keeps `name`, `repoRoot` and `worktreeRoot`.
  *
  * `repoRoot`/`worktreeRoot` deliberately stayed there: they are **host** layout — one
  * local checkout path per project on whichever machine runs the work — rather than
@@ -22,7 +22,7 @@ import { RepositoryList } from './repository-list.js';
  *
  * **Saving is this card's own**, not shared with Settings: `projects.update` is a
  * partial patch, so this sends `repositories` alone and the Settings form sends
- * `name`/`repoRoot`/`worktreeRoot`/`maxConcurrentJobs` alone. That is what the other
+ * `name`/`repoRoot`/`worktreeRoot` alone. That is what the other
  * tabs already do (Agents sends `agents`, Pipeline `pipeline`, Project Management `pm`),
  * and it is what keeps each tab's Save from carrying the other's unsaved edits — the
  * lost-update shape issue #369 removed. Both writes still go through the route's single

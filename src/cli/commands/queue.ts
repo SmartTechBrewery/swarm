@@ -7,7 +7,7 @@ const USAGE = `swarm queue — inspect and clear pending queue work
 
 Usage: swarm queue clear
 
-  clear  Cancel every waiting dispatch (pending, capacity-blocked, and
+  clear  Cancel every waiting dispatch (pending, event-blocked, and
          retry-scheduled — the canonical durable queue, issue #284) and drain
          their queued wake-ups plus any legacy jobs from Redis. Cancelled
          dispatches can never be resurrected by a retry, slot release, or

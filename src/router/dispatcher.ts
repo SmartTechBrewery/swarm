@@ -41,7 +41,6 @@
  */
 
 import { Worker } from 'bullmq';
-import { listAllProjectsFromDb } from '../db/repositories/projectsRepository.js';
 import { failStaleRunningRuns, updateRunJobPayload } from '../db/repositories/runsRepository.js';
 import { recordWorkerCliRateLimit } from '../db/repositories/workerCliRateLimitsRepository.js';
 import {
@@ -158,11 +157,11 @@ const STALE_RUN_MARGIN_MS = 10 * 60 * 1000;
 
 /**
  * How many dispatch wake-ups the consumer pulls off the queue at once. Not a
- * business cap, and deliberately not configurable (issue #811): the caps an
- * operator sets — a project's `maxConcurrentJobs` and an enrollment's
- * `concurrencyAllocation` — are enforced transactionally by
- * `claimWorkerForDispatch`, which returns an over-limit dispatch to a durable,
- * event-woken `project-capacity` wait. A dispatch job holds only an awaited
+ * business cap, and deliberately not configurable (issue #811): the bounds an
+ * operator sets — an enrollment's `concurrencyAllocation`, enforced
+ * transactionally by `claimWorkerForDispatch`, and a repository's `wipLimit`,
+ * which holds a new ticket in a durable, event-woken `wip-limit` wait — never
+ * depend on it. A dispatch job holds only an awaited
  * result promise here (the phase itself runs on the worker), so this exists
  * solely to bound the router's own fan-out, and it sits far above any aggregate
  * an installation configures so it can never be the tighter limit — which is
@@ -1045,11 +1044,7 @@ export async function startControlPlaneDispatch(options: {
 	// behind by a worker that died mid-phase.
 	async function reconcile(): Promise<void> {
 		try {
-			const projects = await listAllProjectsFromDb();
-			const prioritize = new Map(
-				projects.map((p) => [p.id, p.pipeline?.prioritizeContinuations !== false]),
-			);
-			await reconcileDispatchesPeriodically((projectId) => prioritize.get(projectId) ?? true);
+			await reconcileDispatchesPeriodically();
 			await failStaleRunningRuns(
 				DEFAULT_PHASE_TIMEOUT_MS,
 				STALE_RUN_MARGIN_MS,

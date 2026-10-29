@@ -632,14 +632,14 @@ async function reapClaimsOfSupersededSession(
  * now instead of at `timeoutMs + RESULT_WAIT_MARGIN_MS`.
  *
  * Both halves are load-bearing. The rows are what `claimWorkerForDispatch` counts
- * this worker's and the project's capacity from; the parked job is what holds the
- * project slot (`../worker/project-concurrency.ts`) and a BullMQ concurrency slot —
- * so failing the rows alone would free the claim and none of the capacity, and the
- * job would later settle the same run a *second* time when its own timer fired.
+ * this worker's capacity from; the parked job is what holds a BullMQ concurrency
+ * slot — so failing the rows alone would free the claim and none of the capacity,
+ * and the job would later settle the same run a *second* time when its own timer
+ * fired.
  *
- * Nothing is promoted from here on purpose: the unwind's own `finally` releases the
- * slot and then runs both existing promotions (`../worker/consumer.ts`), and a wake
- * issued while the slot is still held only makes the woken dispatch re-defer.
+ * Nothing is promoted from here on purpose: the unwind's own `finally` runs the
+ * existing promotions (`../worker/consumer.ts`), and a wake issued while the job is
+ * still parked only makes the woken dispatch re-defer.
  */
 async function reapSupersededWorkerClaims(
 	workerId: string,

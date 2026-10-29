@@ -54,14 +54,6 @@ describe('ProjectConfigSchema', () => {
 		expect(project.worktreeRoot).toBe(PROJECT_DEFAULTS.worktreeRoot);
 		expect(project.baseBranch).toBe(PROJECT_DEFAULTS.baseBranch);
 		expect(project.branchPrefix).toBe(PROJECT_DEFAULTS.branchPrefix);
-		expect(project.maxConcurrentJobs).toBe(PROJECT_DEFAULTS.maxConcurrentJobs);
-	});
-
-	it('accepts only positive integer maximum concurrent jobs', () => {
-		expect(createMockProjectConfig({ maxConcurrentJobs: 4 }).maxConcurrentJobs).toBe(4);
-		for (const maxConcurrentJobs of [0, -1, 1.5]) {
-			expect(() => createMockProjectConfig({ maxConcurrentJobs })).toThrow();
-		}
 	});
 
 	it('rejects a repo that is not owner/repo', () => {
@@ -1422,24 +1414,6 @@ describe('PipelineConfigSchema', () => {
 		expect(PipelineConfigSchema.safeParse({ review: { enabled: false } }).success).toBe(false);
 	});
 
-	it('leaves prioritizeContinuations unset by default (read as on)', () => {
-		// Absent → undefined; read sites treat `!== false` as the default-on switch.
-		expect(PipelineConfigSchema.parse({}).prioritizeContinuations).toBeUndefined();
-	});
-
-	it('accepts an explicit prioritizeContinuations boolean', () => {
-		expect(PipelineConfigSchema.parse({ prioritizeContinuations: false })).toMatchObject({
-			prioritizeContinuations: false,
-		});
-		expect(PipelineConfigSchema.parse({ prioritizeContinuations: true })).toMatchObject({
-			prioritizeContinuations: true,
-		});
-	});
-
-	it('rejects a non-boolean prioritizeContinuations', () => {
-		expect(PipelineConfigSchema.safeParse({ prioritizeContinuations: 'yes' }).success).toBe(false);
-	});
-
 	// The Tier 2 continuation budget (issue #503). Left unset here so
 	// `resolveMaxContinuations` supplies the coded default — a Zod default would never
 	// be seen, since the whole `pipeline` block is optional.
@@ -1501,6 +1475,22 @@ describe('validateConfig', () => {
 
 	it('rejects a non-object config', () => {
 		expect(() => validateConfig(null)).toThrow();
+	});
+
+	// Issue #1190 retired the project-wide job cap and the continuation priority that
+	// ordered its waiters. A `swarm.config.json` written before then still states them, and
+	// must keep loading: both objects are non-strict, so the keys are stripped, not refused.
+	it('strips the retired job-cap and continuation-priority keys from an old config', () => {
+		const legacy = {
+			...createMockProjectRecord(),
+			maxConcurrentJobs: 3,
+			pipeline: { prioritizeContinuations: false, respondToCi: { enabled: true } },
+		};
+
+		const [project] = validateConfig({ projects: [legacy] }).projects;
+
+		expect(project).not.toHaveProperty('maxConcurrentJobs');
+		expect(project.pipeline).toEqual({ respondToCi: { enabled: true } });
 	});
 
 	it('is the SwarmConfigSchema parser', () => {

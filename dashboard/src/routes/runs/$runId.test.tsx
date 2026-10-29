@@ -1033,8 +1033,8 @@ describe('RunDetailHeader for a maintenance run (issue #974)', () => {
 		expect(screen.getByRole('heading', { name: /update in progress/i })).toBeDefined();
 		expect(screen.getByText(/studio-mac was asked to move to/i)).toBeDefined();
 		expect(screen.getByText(/asking again with a different build supersedes/i)).toBeDefined();
-		// The pipeline copy claims an agent and a project slot a maintenance run has neither of.
-		expect(screen.queryByText(/frees its project slot/i)).toBeNull();
+		// The pipeline copy claims an agent and a worker slot a maintenance run has neither of.
+		expect(screen.queryByText(/frees its slot on the worker/i)).toBeNull();
 		expect(screen.queryByRole('button', { name: /terminate/i })).toBeNull();
 	});
 

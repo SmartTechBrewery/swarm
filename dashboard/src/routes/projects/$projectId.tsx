@@ -312,20 +312,17 @@ function cleanAgentConfig(config: AgentConfig): AgentConfig | undefined {
  * The repository list rendered here between issues #700 and #729 and now lives on the
  * Source Control tab, under the provider those repositories are hosted on
  * ({@link RepositoriesPanel}). What is left is coherent on its own — a display `name`,
- * plus the two local paths and the concurrency cap that describe the *host* running the
- * work rather than any repository. It keeps its own `projects.update` write, sending
- * exactly these four fields; the repository list sends its own.
+ * plus the two local paths that describe the *host* running the work rather than any
+ * repository. It keeps its own `projects.update` write, sending exactly these three
+ * fields; the repository list sends its own.
  */
 interface GeneralSettingsFormProps {
 	name: string;
 	repoRoot: string;
 	worktreeRoot: string;
-	maxConcurrentJobs: string;
-	maxConcurrentJobsError?: string;
 	setName: (val: string) => void;
 	setRepoRoot: (val: string) => void;
 	setWorktreeRoot: (val: string) => void;
-	setMaxConcurrentJobs: (val: string) => void;
 	handleInputChange: (
 		setter: (val: string) => void,
 	) => (e: React.ChangeEvent<HTMLInputElement>) => void;
@@ -342,12 +339,9 @@ export function GeneralSettingsForm({
 	name,
 	repoRoot,
 	worktreeRoot,
-	maxConcurrentJobs,
-	maxConcurrentJobsError,
 	setName,
 	setRepoRoot,
 	setWorktreeRoot,
-	setMaxConcurrentJobs,
 	handleInputChange,
 	handleSubmit,
 	handleReset,
@@ -426,33 +420,6 @@ export function GeneralSettingsForm({
 							<p className="text-xs text-zinc-500 mt-1">
 								Directory under the repository root where task-specific git worktrees live.
 							</p>
-						</div>
-
-						<div>
-							<label
-								htmlFor="maxConcurrentJobs"
-								className="block text-xs font-medium text-zinc-400 mb-1"
-							>
-								Maximum Concurrent Jobs <span className="text-red-500">*</span>
-							</label>
-							<input
-								type="number"
-								id="maxConcurrentJobs"
-								value={maxConcurrentJobs}
-								onChange={handleInputChange(setMaxConcurrentJobs)}
-								disabled={isPending}
-								className="block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 transition-shadow disabled:opacity-50 disabled:cursor-not-allowed"
-							/>
-							{maxConcurrentJobsError ? (
-								<p className="text-xs text-red-400 mt-1">{maxConcurrentJobsError}</p>
-							) : (
-								<p className="text-xs text-zinc-500 mt-1">
-									Maximum jobs this project may run at once, across all enrolled workers. Each
-									enrolled worker also has its own share of this project (its concurrency
-									allocation), so the effective number running is the smaller of the two. Must be a
-									positive whole number.
-								</p>
-							)}
 						</div>
 					</div>
 				</div>
@@ -1820,8 +1787,7 @@ export function diffProjectForSync(
 		general:
 			next.name !== prev.name ||
 			next.repoRoot !== prev.repoRoot ||
-			next.worktreeRoot !== prev.worktreeRoot ||
-			next.maxConcurrentJobs !== prev.maxConcurrentJobs,
+			next.worktreeRoot !== prev.worktreeRoot,
 		repositories: JSON.stringify(next.repositories) !== JSON.stringify(prev.repositories),
 		agents: JSON.stringify(next.agents) !== JSON.stringify(prev.agents),
 		pipeline: JSON.stringify(next.pipeline) !== JSON.stringify(prev.pipeline),
@@ -1860,8 +1826,8 @@ export function isConfigWriteInFlight(flags: {
  */
 export function toGeneralSettingsUpdate(
 	projectId: string,
-	fields: { name: string; repoRoot: string; worktreeRoot: string; maxConcurrentJobs: number },
-): { id: string; name: string; repoRoot: string; worktreeRoot: string; maxConcurrentJobs: number } {
+	fields: { name: string; repoRoot: string; worktreeRoot: string },
+): { id: string; name: string; repoRoot: string; worktreeRoot: string } {
 	return { id: projectId, ...fields };
 }
 
@@ -1995,8 +1961,6 @@ function ProjectDetailRouteComponent() {
 	const [repositories, setRepositories] = useState<RepositoryForm[]>(() => toRepositoryForms([]));
 	const [repoRoot, setRepoRoot] = useState('');
 	const [worktreeRoot, setWorktreeRoot] = useState('');
-	const [maxConcurrentJobs, setMaxConcurrentJobs] = useState('');
-	const [maxConcurrentJobsError, setMaxConcurrentJobsError] = useState<string>();
 
 	const [agents, setAgents] = useState<AgentsConfig>({});
 	const [pipelineEnabled, setPipelineEnabled] = useState<PipelineEnabledForm>(() =>
@@ -2037,7 +2001,6 @@ function ProjectDetailRouteComponent() {
 	const handleInputChange =
 		(setter: (val: string) => void) => (e: React.ChangeEvent<HTMLInputElement>) => {
 			setter(e.target.value);
-			setMaxConcurrentJobsError(undefined);
 			updateMutation.reset();
 		};
 
@@ -2056,8 +2019,6 @@ function ProjectDetailRouteComponent() {
 			setName(project.name);
 			setRepoRoot(project.repoRoot);
 			setWorktreeRoot(project.worktreeRoot ?? '');
-			setMaxConcurrentJobs(String(project.maxConcurrentJobs));
-			setMaxConcurrentJobsError(undefined);
 		}
 
 		if (changed.repositories) {
@@ -2089,7 +2050,6 @@ function ProjectDetailRouteComponent() {
 			repositories?: RepositoryEntry[];
 			repoRoot?: string;
 			worktreeRoot?: string;
-			maxConcurrentJobs?: number;
 			agents?: AgentsConfig;
 			pipeline?: PipelineConfig;
 			pm?: ProjectPm;
@@ -2152,10 +2112,9 @@ function ProjectDetailRouteComponent() {
 		return (
 			name !== project.name ||
 			repoRoot !== project.repoRoot ||
-			worktreeRoot !== (project.worktreeRoot ?? '') ||
-			maxConcurrentJobs !== String(project.maxConcurrentJobs)
+			worktreeRoot !== (project.worktreeRoot ?? '')
 		);
-	}, [project, name, repoRoot, worktreeRoot, maxConcurrentJobs]);
+	}, [project, name, repoRoot, worktreeRoot]);
 
 	const isRepositoriesDirty = useMemo(
 		() => (project ? areRepositoriesDirty(repositories, project.repositories) : false),
@@ -2396,8 +2355,6 @@ function ProjectDetailRouteComponent() {
 			setName(project.name);
 			setRepoRoot(project.repoRoot);
 			setWorktreeRoot(project.worktreeRoot ?? '');
-			setMaxConcurrentJobs(String(project.maxConcurrentJobs));
-			setMaxConcurrentJobsError(undefined);
 			updateMutation.reset();
 		}
 	};
@@ -2405,22 +2362,9 @@ function ProjectDetailRouteComponent() {
 	const handleSubmit = (e: React.FormEvent) => {
 		e.preventDefault();
 		if (configWriteInFlight) return;
-		const parsedMaxConcurrentJobs = Number(maxConcurrentJobs);
-		if (!Number.isInteger(parsedMaxConcurrentJobs) || parsedMaxConcurrentJobs < 1) {
-			setMaxConcurrentJobsError('Maximum concurrent jobs must be a positive whole number.');
-			return;
-		}
-		setMaxConcurrentJobsError(undefined);
-		// Only this tab's four fields: the repository list saves itself from the Source
+		// Only this tab's three fields: the repository list saves itself from the Source
 		// Control tab (issue #729), so sending it here would carry its unsaved edits.
-		updateMutation.mutate(
-			toGeneralSettingsUpdate(projectId, {
-				name,
-				repoRoot,
-				worktreeRoot,
-				maxConcurrentJobs: parsedMaxConcurrentJobs,
-			}),
-		);
+		updateMutation.mutate(toGeneralSettingsUpdate(projectId, { name, repoRoot, worktreeRoot }));
 	};
 
 	const handleRepositoriesReset = () => {
@@ -2526,12 +2470,9 @@ function ProjectDetailRouteComponent() {
 							name={name}
 							repoRoot={repoRoot}
 							worktreeRoot={worktreeRoot}
-							maxConcurrentJobs={maxConcurrentJobs}
-							maxConcurrentJobsError={maxConcurrentJobsError}
 							setName={setName}
 							setRepoRoot={setRepoRoot}
 							setWorktreeRoot={setWorktreeRoot}
-							setMaxConcurrentJobs={setMaxConcurrentJobs}
 							handleInputChange={handleInputChange}
 							handleSubmit={handleSubmit}
 							handleReset={handleReset}

@@ -46,7 +46,6 @@ import {
 	recordDispatchResolution,
 	reopenDispatchForManualRetry,
 	scheduleDispatchRetry,
-	selectNextCapacityDispatch,
 	supersedeDispatchesByCoalesceKey,
 	supersedeWorkerUpdateDispatches,
 	takeOverStaleDispatchForManualRetry,
@@ -66,7 +65,6 @@ import {
 	setWorkerDraining,
 } from '../../../src/db/repositories/workersRepository.js';
 import { dispatches } from '../../../src/db/schema/dispatches.js';
-import { projects } from '../../../src/db/schema/projects.js';
 import { workers } from '../../../src/db/schema/workers.js';
 import type { AgentCli } from '../../../src/harness/agent-cli.js';
 import { describeError } from '../../../src/lib/errors.js';
@@ -867,7 +865,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 
 		it('excludes other wait reasons, other tasks, other projects, and non-pending rows', async () => {
 			const wanted = await seedWait();
-			await seedWait({ waitReason: 'project-capacity' });
+			await seedWait({ waitReason: 'pr-in-flight' });
 			await seedWait({ taskId: '755' });
 			await seedWait({ state: 'leased' });
 			await seedProject({ id: 'proj-other', repo: 'jkwiecien/other' });
@@ -960,11 +958,11 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 			await defer(await wipWait('2'));
 			await defer(await wipWait('3'), 'jkwiecien/other-repo');
 			// A board dispatch waiting on anything else is not a WIP waiter.
-			const capacity = await wipWait('4');
-			await claimDispatch(capacity, OWNER, 60_000);
-			await deferDispatchToPending(capacity, {
+			const sequenced = await wipWait('4');
+			await claimDispatch(sequenced, OWNER, 60_000);
+			await deferDispatchToPending(sequenced, {
 				jobPayload: job(),
-				waitReason: 'project-capacity',
+				waitReason: 'task-in-flight',
 			});
 
 			const counts = await countWipLimitWaitsByRepository([PROJECT_ID]);
@@ -1141,10 +1139,6 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 		});
 
 		it('atomically prevents simultaneous dispatches from exceeding allocation', async () => {
-			await getDb()
-				.update(projects)
-				.set({ maxConcurrentJobs: 2 })
-				.where(eq(projects.id, PROJECT_ID));
 			const { worker, session } = await seedFederatedWorker(1);
 			const [first, second] = await Promise.all([
 				leasedDispatch('host-a:1'),
@@ -1171,16 +1165,11 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 			expect((await getWorkerDispatchClaimState(worker.id, PROJECT_ID)).activeRuns).toBe(1);
 		});
 
-		it('a widened allocation lets one worker fill both project slots', async () => {
-			// With allocation=1 the previous test capped a single worker at one run
-			// even when the project allowed two. Raising the enrollment's share to 2
-			// is how an operator lets the same worker fill both project slots — issue
-			// #480 removed the `null`/"uncapped" allocation that used to do this
-			// implicitly.
-			await getDb()
-				.update(projects)
-				.set({ maxConcurrentJobs: 2 })
-				.where(eq(projects.id, PROJECT_ID));
+		it('a widened allocation lets one worker run two of the project’s jobs', async () => {
+			// With allocation=1 the previous test capped a single worker at one run.
+			// Raising the enrollment's share to 2 is how an operator lets the same worker
+			// run two — issue #480 removed the `null`/"uncapped" allocation that used to do
+			// this implicitly.
 			const { worker, session } = await seedFederatedWorker(2, 'wide');
 			const [first, second] = await Promise.all([
 				leasedDispatch('host-a:1'),
@@ -1204,7 +1193,10 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 			expect((await getWorkerDispatchClaimState(worker.id, PROJECT_ID)).activeRuns).toBe(2);
 		});
 
-		it('serializes two worker identities against the project concurrency limit', async () => {
+		// Issue #1190 retired the project-wide job cap: each worker is bounded by its own
+		// allocation alone, so two workers at allocation 1 run two of the project's jobs
+		// at once rather than contending for a shared project slot.
+		it('bounds each worker by its own allocation only', async () => {
 			const firstHost = await seedFederatedWorker(1, 'host-a');
 			const secondHost = await seedFederatedWorker(1, 'host-b');
 			const [first, second] = await Promise.all([
@@ -1228,14 +1220,13 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 				});
 
 			const results = await Promise.all([claim(first, firstHost), claim(second, secondHost)]);
-			expect(results.filter((result) => result.claimed)).toHaveLength(1);
-			expect(results.filter((result) => !result.claimed)).toEqual([
-				{ claimed: false, reason: 'project-capacity' },
-			]);
-			const totalActive =
-				(await getWorkerDispatchClaimState(firstHost.worker.id, PROJECT_ID)).activeRuns +
-				(await getWorkerDispatchClaimState(secondHost.worker.id, PROJECT_ID)).activeRuns;
-			expect(totalActive).toBe(1);
+			expect(results.filter((result) => result.claimed)).toHaveLength(2);
+			expect((await getWorkerDispatchClaimState(firstHost.worker.id, PROJECT_ID)).activeRuns).toBe(
+				1,
+			);
+			expect((await getWorkerDispatchClaimState(secondHost.worker.id, PROJECT_ID)).activeRuns).toBe(
+				1,
+			);
 		});
 
 		it('clears a claim on deferral so another dispatch can reserve the slot', async () => {
@@ -1590,8 +1581,8 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 		});
 	});
 
-	describe('capacity waits and promotion', () => {
-		it('returns a claimed dispatch to pending with the capacity wait reason', async () => {
+	describe('pre-run waits', () => {
+		it('returns a claimed dispatch to pending with the wait reason', async () => {
 			const { dispatch } = await createDispatch({
 				projectId: PROJECT_ID,
 				jobPayload: job(),
@@ -1601,39 +1592,37 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 
 			const pending = await deferDispatchToPending(dispatch.id, {
 				jobPayload: job({ continuationDispatchClaimed: true }),
-				waitReason: 'project-capacity',
-				continuation: true,
+				waitReason: 'wip-limit',
+				repository: REPO,
 			});
 
 			expect(pending).toMatchObject({
 				state: 'pending',
-				waitReason: 'project-capacity',
-				continuation: true,
+				waitReason: 'wip-limit',
+				continuation: false,
 				wakeSeq: 1,
 			});
-			// Capacity waits are woken by slot releases, not timers — the wake-up
-			// republisher must not touch them.
+			// A WIP wait is woken by a slot release, not a timer — the wake-up
+			// republisher must not touch it.
 			expect(await listWakeablePendingDispatches()).toHaveLength(0);
 		});
 
-		it('selects the oldest continuation first when the policy is on, FIFO otherwise', async () => {
-			async function capacityPending(continuation: boolean, availableAt: Date): Promise<string> {
-				const { dispatch } = await createDispatch({
-					projectId: PROJECT_ID,
-					jobPayload: job(),
-					source: 'webhook',
-					state: 'pending',
-					waitReason: 'project-capacity',
-					continuation,
-					availableAt,
-				});
-				return dispatch.id;
-			}
-			const boardOld = await capacityPending(false, new Date(Date.now() - 60_000));
-			const continuationNew = await capacityPending(true, new Date(Date.now() - 30_000));
+		// Issue #1190 retired the project capacity wait; every other pending wait is
+		// republished by the reconciler, so nothing can be stranded behind a reason no
+		// promotion looks for.
+		it('leaves every other pending wait to the timed republish', async () => {
+			const { dispatch } = await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: job(),
+				source: 'webhook',
+			});
+			await claimDispatch(dispatch.id, OWNER, 60_000);
+			await deferDispatchToPending(dispatch.id, {
+				jobPayload: job(),
+				waitReason: 'task-in-flight',
+			});
 
-			expect((await selectNextCapacityDispatch(PROJECT_ID, true))?.id).toBe(continuationNew);
-			expect((await selectNextCapacityDispatch(PROJECT_ID, false))?.id).toBe(boardOld);
+			expect((await listWakeablePendingDispatches()).map((row) => row.id)).toEqual([dispatch.id]);
 		});
 	});
 
@@ -1876,7 +1865,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 				dedupKey: 'delivery:d-cap',
 				source: 'webhook',
 				state: 'pending',
-				waitReason: 'project-capacity',
+				waitReason: 'task-in-flight',
 			});
 			const scheduled = await createDispatch({
 				projectId: PROJECT_ID,

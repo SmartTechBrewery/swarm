@@ -58,7 +58,7 @@ export const dispatches = pgTable(
 		prNumber: text('pr_number'),
 		state: text('state').notNull().default('pending'),
 		/**
-		 * Why a non-terminal dispatch is waiting: `project-capacity`, `rate-limit`,
+		 * Why a non-terminal dispatch is waiting: `rate-limit`,
 		 * `agent-capacity`, `timeout`, `worker-shutdown`, `delivery`,
 		 * `worktree-exists`, `stalled`, `commit-unavailable` (the machine this attempt
 		 * ran on could not obtain the commit its checkout must be detached at — issue
@@ -106,7 +106,13 @@ export const dispatches = pgTable(
 		 * non-terminal dispatches carrying the same key.
 		 */
 		coalesceKey: text('coalesce_key'),
-		/** SCM continuations jump ahead of new board work when the project opts in. */
+		/**
+		 * Retired with the project capacity wait it ordered (issue #1190): it once let
+		 * an SCM continuation jump ahead of new board work for a freed project slot
+		 * (a `pipeline` opt-in retired with it). Nothing writes or reads it any more;
+		 * the column is kept, always `false` on a new row, so dropping it stays a
+		 * separate, deliberate migration.
+		 */
 		continuation: boolean('continuation').notNull().default(false),
 		/**
 		 * Effective queue priority: the column every claim-ordering read sorts by

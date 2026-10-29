@@ -34,7 +34,8 @@ The following paths create, transition, or wake a durable dispatch:
   for Planning split children;
 - follow-up Review after a Respond-to-review fix;
 - coalesced Review/check-suite and conflict-resolution rechecks;
-- project-capacity waits and continuation priority;
+- project capacity waits and continuation priority (both retired by issue #1190,
+  together with the project-wide job cap they served);
 - agent/provider/delivery deferrals and their delayed retries;
 - dashboard Retry now, Terminate, Put back, and `swarm queue clear`;
 - startup and periodic reconciliation, including import of legacy deferred

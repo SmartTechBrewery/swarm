@@ -52,7 +52,6 @@ export function queuedPhaseLabel(hint: QueuedPhaseHint): string {
  * value so a newly-added server reason still renders.
  */
 const QUEUED_WAIT_REASON_LABELS: Record<QueuedWaitReason, string> = {
-	'project-capacity': 'waiting for a free project slot',
 	'rate-limit': 'retrying after a rate limit',
 	'agent-capacity': 'retrying after provider capacity',
 	timeout: 'retrying after a timeout',

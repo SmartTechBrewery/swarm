@@ -141,8 +141,9 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 			await reconcileDispatchesAtStartup();
 
 			expect(await redis.exists(`swarm:pending-continuations:${PROJECT_ID}`)).toBe(0);
-			// The entry became a durable capacity-pending dispatch, visible to the
-			// canonical queue and woken by slot releases.
+			// The entry became an ordinary durable pending dispatch, visible to the
+			// canonical queue — the capacity wait it once sat in is retired (issue #1190),
+			// so the same startup pass republishes its wake-up.
 			const { listWaitingDispatches } = await import(
 				'../../../src/db/repositories/dispatchesRepository.js'
 			);
@@ -150,8 +151,8 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 			expect(waiting).toHaveLength(1);
 			expect(waiting[0]).toMatchObject({
 				state: 'pending',
-				waitReason: 'project-capacity',
-				continuation: true,
+				waitReason: null,
+				continuation: false,
 				taskId: '17',
 			});
 		});
