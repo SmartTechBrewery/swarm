@@ -539,7 +539,11 @@ function placeableRetryJob(
 	if (startFresh) {
 		logger.info(
 			'retryNow: dropping an inherited checkout continuation whose machine is not recorded; restarting the phase',
-			{ runId: run.id, recoveryMode: job.recoveryMode },
+			{
+				runId: run.id,
+				recoveryMode: job.recoveryMode,
+				implementationBranchProvisioned: job.implementationBranchProvisioned,
+			},
 		);
 		return dropCheckoutContinuation(job);
 	}

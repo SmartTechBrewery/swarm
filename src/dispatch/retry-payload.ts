@@ -383,8 +383,10 @@ export function reconstructRetryJob(
 /**
  * The manual retry's payload with every **checkout-continuation** intent removed
  * (issue #1101): `recoveryMode` when it is `'resume'`/`'checkpoint'`, `resumeSession`,
- * and `resumeDelivery` — exactly the fields `jobContinuesPreservedCheckout` reads, so
- * the result is never pinned to a machine. Everything else (the fresh `agentSessionId`
+ * `resumeDelivery`, and `implementationBranchProvisioned` (issue #1197) — exactly the
+ * fields `jobContinuesPreservedCheckout` reads, so the result is never pinned to a
+ * machine, and Implementation cuts its branch afresh rather than expecting one that
+ * may exist only on an unrecorded machine. Everything else (the fresh `agentSessionId`
  * {@link reconstructRetryJob} minted, `resumePmPhase`, overrides, zeroed budgets) is
  * kept: the attempt is the ordinary from-scratch retry a fresh-start "Retry now"
  * already is. `'fresh'` is left in place — it is the escape hatch, not a continuation.
@@ -396,6 +398,7 @@ export function dropCheckoutContinuation(job: SwarmJob): SwarmJob {
 	}
 	delete next.resumeSession;
 	delete next.resumeDelivery;
+	delete next.implementationBranchProvisioned;
 	return next;
 }
 
