@@ -1118,3 +1118,89 @@ describe('an agy run that exhausted its account quota (issue #1013)', () => {
 		).toBe(false);
 	});
 });
+
+describe("Claude's duration-named usage-limit banner (issue #1196)", () => {
+	// The observed run's last two lines, verbatim (run 38700e2e…, task #1190): the
+	// banner as free text, then the rendered terminal `result` record — whose
+	// subtype is `success`, and which carries no 429 or `rate_limit_error` at all.
+	const BANNER = "You've hit your 5-hour limit · resets 3:40pm (Europe/Warsaw)";
+	const FAILED_LINE = `Claude run failed (success): ${BANNER}`;
+	const claudeFailure = { subtype: 'success', message: BANNER };
+	// 3:40pm Warsaw (UTC+2 in July) == 13:40Z, later today than NOW (10:00Z).
+	const RESET_AT = '2026-07-07T13:40:00.000Z';
+
+	it('classifies the observed output as a rate-limit with its reset', () => {
+		const failure = classifyAgentFailure(
+			result({ stdout: `${BANNER}\n${FAILED_LINE}\n`, claudeFailure }),
+			NOW,
+		);
+		expect(failure).toEqual({
+			kind: 'rate-limit',
+			resetHint: '3:40pm (Europe/Warsaw)',
+			retryAfter: new Date(RESET_AT),
+		});
+	});
+
+	it('recognises the banner as free text alone', () => {
+		const failure = classifyAgentFailure(result({ stdout: `${BANNER}\n` }), NOW);
+		expect(failure.kind).toBe('rate-limit');
+		expect(failure.resetHint).toBe('3:40pm (Europe/Warsaw)');
+		expect(failure.retryAfter?.toISOString()).toBe(RESET_AT);
+	});
+
+	it("recognises the banner in Claude's own failure record alone, even on an exit-0 run", () => {
+		// The structural record is trusted without a co-occurring free-text line, and
+		// — like a streamed 429 (issue #1013) — stops the phase gate whatever the exit.
+		const structural = result({ stdout: FAILED_LINE, claudeFailure });
+		expect(classifyAgentFailure(structural, NOW).kind).toBe('rate-limit');
+		expect(agentRunFailed({ ...structural, exitCode: 0 })).toBe(true);
+	});
+
+	it("reads the reset from Claude's failure record over an earlier reset in the tail", () => {
+		const failure = classifyAgentFailure(
+			result({
+				stdout: ['Tool started: Bash', 'I will reset the fixture first.', BANNER, FAILED_LINE].join(
+					'\n',
+				),
+				claudeFailure,
+			}),
+			NOW,
+		);
+		expect(failure.resetHint).toBe('3:40pm (Europe/Warsaw)');
+		expect(failure.retryAfter?.toISOString()).toBe(RESET_AT);
+	});
+
+	it.each([
+		"You've hit your weekly limit · resets 9am (Europe/Warsaw)",
+		'You have hit your 5 hour limit · resets 3:40pm (Europe/Warsaw)',
+		"You've hit your daily limit",
+		"You've hit your 7-day limit",
+	])('recognises the duration-named banner %s', (banner) => {
+		expect(classifyAgentFailure(result({ stdout: banner }), NOW).kind).toBe('rate-limit');
+	});
+
+	it('does not misread output that merely discusses a limit', () => {
+		for (const text of [
+			'Reviewed the classifier: a 5-hour limit banner now defers the run.',
+			'CI log: the GitHub API hourly limit was exceeded; it resets 3:40pm (Europe/Warsaw).',
+			'The weekly limit resets on Monday.',
+			"Error: you've hit your recursion limit",
+		]) {
+			expect(classifyAgentFailure(result({ stdout: text }), NOW).kind).toBe('error');
+		}
+		// A healthy exit-0 run whose transcript quotes the banner carries no failure
+		// record, so it is not stopped at the phase gate either.
+		expect(agentRunFailed(result({ exitCode: 0, stdout: BANNER }))).toBe(false);
+	});
+
+	it('names the limit in the headline instead of a bare exit code', () => {
+		expect(
+			agentRunError(
+				result({ stdout: `${BANNER}\n${FAILED_LINE}\n`, claudeFailure }),
+				'Implementation agent (claude) exited with code 1',
+				" for task '1190'",
+				NOW,
+			).message,
+		).toBe("Implementation agent (claude) exited with code 1 (rate limited) for task '1190'");
+	});
+});
