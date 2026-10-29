@@ -23,7 +23,6 @@ import {
 	findProjectRecordByIdFromDb,
 	getProjectByIdFromDb,
 	listAllProjectRecordsFromDb,
-	listAllProjectsFromDb,
 } from '../../db/repositories/projectsRepository.js';
 import {
 	hasOutstandingCapOverride,
@@ -1540,7 +1539,7 @@ export const runsReadRouter = router(runReadProcedures);
 export const runsRouter = router({
 	...runReadProcedures,
 
-	// Every canonical waiting dispatch (pending / capacity-blocked /
+	// Every canonical waiting dispatch (pending / event-blocked /
 	// retry-scheduled) — the durable queue read model (issues #234, #284), never
 	// a BullMQ snapshot, so nothing pending can be invisible here. No pagination:
 	// the pending set is small and bounded by worker throughput. A chosen
@@ -1558,15 +1557,10 @@ export const runsRouter = router({
 		.query(async ({ ctx, input }): Promise<QueuedRunsPage> => {
 			if (input?.projectId) {
 				await assertProjectAccess(ctx.user, input.projectId, 'contributor');
-				const project = await getProjectByIdFromDb(input.projectId);
-				const policy = project?.pipeline?.prioritizeContinuations !== false;
-				const policies = { [input.projectId]: policy };
 				const projectId = input.projectId;
 				return partitionQueuedRuns(
 					await withQueuedWipUsage(
-						await enrichQueuedWorkItems(
-							toQueuedRuns(await listWaitingDispatches(projectId), policies),
-						),
+						await enrichQueuedWorkItems(toQueuedRuns(await listWaitingDispatches(projectId))),
 						async () => {
 							const record = await findProjectRecordByIdFromDb(projectId);
 							return record ? [record] : [];
@@ -1576,13 +1570,9 @@ export const runsRouter = router({
 			}
 			assertInstanceAdmin(ctx.user, 'queue');
 			const dispatches = await listWaitingDispatches(input?.projectId);
-			const projects = await listAllProjectsFromDb();
-			const policies = Object.fromEntries(
-				projects.map((p) => [p.id, p.pipeline?.prioritizeContinuations !== false]),
-			);
 			return partitionQueuedRuns(
 				await withQueuedWipUsage(
-					await enrichQueuedWorkItems(toQueuedRuns(dispatches, policies)),
+					await enrichQueuedWorkItems(toQueuedRuns(dispatches)),
 					listAllProjectRecordsFromDb,
 				),
 			);
@@ -1670,7 +1660,7 @@ export const runsRouter = router({
 	// failed enqueue can no longer strand a false `running` run (the exact
 	// orphan issue #284 calls out). Two shapes:
 	//
-	//  1. The run has an active dispatch (`retry-scheduled`, or capacity-blocked
+	//  1. The run has an active dispatch (`retry-scheduled`, or event-blocked
 	//     `pending`) — the common case. Its stored payload gets the operator's
 	//     overrides folded in and the dispatch is atomically re-opened for an
 	//     immediate attempt (`reopenDispatchForManualRetry`); losing that

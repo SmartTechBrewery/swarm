@@ -1991,7 +1991,7 @@ function maintenanceCommandParts(run: RunRow): { workerId: string; target: strin
 /**
  * What a `running` maintenance run says in place of the pipeline "Running" callout
  * (issue #974). The pipeline copy is wrong here in every clause — there is no agent
- * to stop and no project slot to free (a maintenance run creates no dispatch) — and
+ * to stop and no worker slot to free (a maintenance run creates no dispatch) — and
  * its Terminate control offers an action `runs.terminate` refuses outright
  * (`requirePipelineRun`). Same violet "in progress" panel, no buttons: the only way
  * to change an outstanding request is to make another one.
@@ -2070,7 +2070,7 @@ function PipelineRunningCallout({ run }: { run: RunRow }) {
 			<div>
 				<h3 className="text-xs font-semibold text-violet-200">Running</h3>
 				<p className="text-xs text-violet-200/70 mt-1">
-					This run is in progress. Terminating it stops the agent and frees its project slot.
+					This run is in progress. Terminating it stops the agent and frees its slot on the worker.
 				</p>
 				{canTerminateRun(run.status) && <TerminateRunButton run={run} />}
 			</div>

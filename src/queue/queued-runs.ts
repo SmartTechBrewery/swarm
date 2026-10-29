@@ -72,8 +72,7 @@ export type QueuedBoardOutcome = z.infer<typeof QueuedBoardOutcomeSchema>;
 /**
  * The queue-facing view of a dispatch's state: `waiting`/`prioritized` for an
  * eligible-now pending dispatch (by queue priority), `blocked` for one an *event*
- * has to wake rather than a timer — a freed project slot, the task's own checkout
- * freeing (issue #759), a pull request's head branch freeing (issue #850), the
+ * has to wake rather than a timer — the task's own checkout freeing (issue #759), a pull request's head branch freeing (issue #850), the
  * repository's merge queue moving on (issue #1114), or a slot freeing in the
  * repository's WIP limit (issue #1185) — and `delayed` for a scheduled retry.
  */
@@ -82,7 +81,6 @@ export type PendingJobState = z.infer<typeof PendingJobStateSchema>;
 
 /** Why a waiting dispatch isn't running — mirrors `DispatchWaitReason`. */
 export const QueuedWaitReasonSchema = z.enum([
-	'project-capacity',
 	'rate-limit',
 	'agent-capacity',
 	'timeout',
@@ -214,24 +212,13 @@ export const QueuedRunSchema = z.object({
 	 * would take the whole `runs.queued` response down with it.
 	 */
 	priority: z.number().int(),
-	/**
-	 * Whether this dispatch is a prioritized SCM continuation (Review /
-	 * Respond-to-review / Respond-to-CI / Resolve-conflicts resumed after a
-	 * capacity wait) — the primary key `selectNextCapacityDispatch` orders the
-	 * `blocked` bucket by. Read-model only; mirrors `DispatchRow.continuation`.
-	 */
-	continuation: z.boolean(),
-	/**
-	 * Whether the project has SCM continuation prioritization active.
-	 */
-	prioritizeContinuations: z.boolean(),
 	/** ISO 8601 — when the dispatch was created. */
 	enqueuedAt: z.string(),
 	/**
 	 * ISO 8601 — when the dispatch became eligible (`DispatchRow.availableAt`).
-	 * The capacity wake selector's secondary ordering key, distinct from
-	 * `enqueuedAt`: a dispatch deferred to `pending` on a freed slot has its
-	 * availability reset to that moment while its creation time stays fixed.
+	 * The `blocked` bucket's ordering key, distinct from `enqueuedAt`: a dispatch
+	 * deferred back to `pending` has its availability reset to that moment while
+	 * its creation time stays fixed.
 	 */
 	availableAt: z.string(),
 	/** ISO 8601 — `delayed` dispatches only, scheduled run time. */
@@ -298,13 +285,12 @@ export function deriveQueuedState(dispatch: DispatchRow): PendingJobState {
 	// settling, so it reads as `blocked` like the event-woken pending waits below.
 	if (dispatch.waitReason === 'merge-queue') return 'blocked';
 	if (dispatch.state === 'retry-scheduled') return 'delayed';
-	// The four event-woken pending waits read as `blocked` rather than `waiting`: all
-	// are eligible *now* and none will be picked up until something frees — a project
-	// slot, the task's own earlier phase settling (issues #759 and #761), a writing
-	// phase of the same pull request settling (issue #850), or a ticket in the
-	// repository leaving flight (issue #1185).
+	// The three event-woken pending waits read as `blocked` rather than `waiting`: all
+	// are eligible *now* and none will be picked up until something frees — the
+	// task's own earlier phase settling (issues #759 and #761), a writing phase of
+	// the same pull request settling (issue #850), or a ticket in the repository
+	// leaving flight (issue #1185).
 	if (
-		dispatch.waitReason === 'project-capacity' ||
 		dispatch.waitReason === 'task-in-flight' ||
 		dispatch.waitReason === 'pr-in-flight' ||
 		dispatch.waitReason === 'wip-limit'
@@ -357,7 +343,7 @@ function dependencyBlockersFor(dispatch: DispatchRow, data: SwarmJob): Pick<Queu
 	};
 }
 
-function toQueuedRun(dispatch: DispatchRow, prioritizeContinuations: boolean): QueuedRun {
+function toQueuedRun(dispatch: DispatchRow): QueuedRun {
 	// A row written before issue #385/#297 still carries the legacy envelope, and the
 	// `jsonb` column is typed rather than validated — normalize before reading.
 	const data = normalizeStoredJobPayload(dispatch.jobPayload);
@@ -383,8 +369,6 @@ function toQueuedRun(dispatch: DispatchRow, prioritizeContinuations: boolean): Q
 		runId: dispatch.runId ?? undefined,
 		attempt: dispatch.attempt,
 		priority: dispatch.priority,
-		continuation: dispatch.continuation,
-		prioritizeContinuations,
 		enqueuedAt: dispatch.createdAt.toISOString(),
 		availableAt: dispatch.availableAt.toISOString(),
 		...(state === 'delayed' ? { runsAt: dispatch.availableAt.toISOString() } : {}),
@@ -405,25 +389,19 @@ function toQueuedRun(dispatch: DispatchRow, prioritizeContinuations: boolean): Q
 
 /**
  * Order to mirror dispatch intent: runnable (`waiting`/`prioritized`) first,
- * capacity-`blocked` next (eligible, waiting on a slot), `delayed` last.
+ * event-`blocked` next (eligible, waiting on something to free), `delayed` last.
  *
  * Runnable/delayed rows order by priority ascending (0 highest), then FIFO
  * within the same priority — enqueue time for runnable jobs, scheduled run time
  * for delayed ones.
  *
- * The `blocked` bucket deliberately does NOT use generic priority. When a
- * project slot frees, the scheduler picks the next blocked dispatch via
- * `selectNextCapacityDispatch` (`continuation desc, availableAt asc`), so a
- * prioritized SCM continuation wins the freed slot ahead of new work regardless
- * of queue priority. This mirrors that ordering exactly so the displayed order
- * matches the real wake order (issue #374). A `task-in-flight` row shares the
- * bucket (it is event-woken too) and is ordered on `availableAt` within it, which
- * is `listTaskInFlightWaits`' own order — its wake-up doesn't compete for a slot
- * with the capacity rows, it waits on one specific task. A `pr-in-flight` row
- * (issue #850) shares it on exactly the same terms, ordered on `availableAt`, which
- * is `listPullRequestInFlightWaits`' own order. A `merge-queue` row (issue #1114)
- * shares it too, ordered on its re-check time, which follows arrival order closely
- * enough for display — its true wake order is `listMergeQueueWaits`' `created_at`.
+ * The `blocked` bucket deliberately does NOT use generic priority: each of its
+ * rows waits on one specific thing rather than competing for a shared slot, so it
+ * orders on `availableAt`. That is `listTaskInFlightWaits`' own order for a
+ * `task-in-flight` row, and `listPullRequestInFlightWaits`' for a `pr-in-flight`
+ * row (issue #850). A `merge-queue` row (issue #1114) is ordered on its re-check
+ * time, which follows arrival order closely enough for display — its true wake
+ * order is `listMergeQueueWaits`' `created_at`.
  */
 export function sortQueuedRuns(items: QueuedRun[]): QueuedRun[] {
 	const stateRank = (state: PendingJobState): number =>
@@ -434,15 +412,9 @@ export function sortQueuedRuns(items: QueuedRun[]): QueuedRun[] {
 	return [...items].sort((a, b) => {
 		const byState = stateRank(a.state) - stateRank(b.state);
 		if (byState !== 0) return byState;
-		// Both rows are in the same bucket here. Within `blocked`, mirror
-		// selectNextCapacityDispatch's wake order (continuation-first, then
-		// availableAt) instead of priority/FIFO.
-		if (a.state === 'blocked') {
-			const aCont = a.prioritizeContinuations && a.continuation;
-			const bCont = b.prioritizeContinuations && b.continuation;
-			if (aCont !== bCont) return aCont ? -1 : 1;
-			return Date.parse(a.availableAt) - Date.parse(b.availableAt);
-		}
+		// Both rows are in the same bucket here. Within `blocked`, order on
+		// availableAt instead of priority/FIFO.
+		if (a.state === 'blocked') return Date.parse(a.availableAt) - Date.parse(b.availableAt);
 		if (a.priority !== b.priority) return a.priority - b.priority;
 		return timeRank(a) - timeRank(b);
 	});
@@ -453,15 +425,11 @@ export function sortQueuedRuns(items: QueuedRun[]): QueuedRun[] {
  * order them to mirror dispatch. Rows whose stored payload no longer parses are
  * skipped (they can't run either — the worker fails them at claim time).
  */
-export function toQueuedRuns(
-	dispatches: DispatchRow[],
-	projectPolicies: Record<string, boolean> = {},
-): QueuedRun[] {
+export function toQueuedRuns(dispatches: DispatchRow[]): QueuedRun[] {
 	const mapped: QueuedRun[] = [];
 	for (const dispatch of dispatches) {
 		try {
-			const policy = projectPolicies[dispatch.projectId] ?? true;
-			mapped.push(toQueuedRun(dispatch, policy));
+			mapped.push(toQueuedRun(dispatch));
 		} catch {
 			// Malformed payload — the claim path surfaces it; don't break the list.
 		}

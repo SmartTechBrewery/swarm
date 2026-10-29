@@ -1011,7 +1011,8 @@ unchanged.
   subset of the worker's capabilities) and `--concurrency`, this worker's share of
   the project. Omit `--concurrency` for `1` (the default): one of the project's
   jobs at a time on this machine. A larger value lets the project run several jobs
-  here at once, still bounded by the project's Maximum Concurrent Jobs. There is
+  here at once — since issue #1190 retired the project-wide job cap, this is the
+  only bound on how many of the project's jobs run at once on the machine. There is
   no value meaning "no per-worker limit" — every enrollment states its share.
   **Enrolling your own machine in a project you administer creates it active and
   consenting** (issue #784), since both approvals are already yours; otherwise it

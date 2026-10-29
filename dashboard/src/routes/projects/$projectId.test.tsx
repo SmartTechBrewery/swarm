@@ -92,7 +92,6 @@ function makeProject(overrides: Partial<ProjectRecord> = {}): ProjectRecord {
 		repositories: [{ repo: 'owner/repo', baseBranch: 'main', branchPrefix: 'issue-' }],
 		repoRoot: '/repo',
 		worktreeRoot: '.worktrees',
-		maxConcurrentJobs: 1,
 		visibility: 'private',
 		pm: { type: 'github-projects' } as ProjectRecord['pm'],
 		credentials: {} as ProjectRecord['credentials'],
@@ -1215,9 +1214,9 @@ describe('diffProjectForSync', () => {
 		expect(diffProjectForSync(prev, next)).toMatchObject({ agents: true, pipeline: false });
 	});
 
-	it('flags general when a scalar field like maxConcurrentJobs changed', () => {
-		const prev = makeProject({ maxConcurrentJobs: 1 });
-		const next = makeProject({ maxConcurrentJobs: 4 });
+	it('flags general when a scalar field like worktreeRoot changed', () => {
+		const prev = makeProject({ worktreeRoot: '.worktrees' });
+		const next = makeProject({ worktreeRoot: '.elsewhere' });
 		expect(diffProjectForSync(prev, next)).toMatchObject({ general: true, pipeline: false });
 	});
 
@@ -1245,8 +1244,8 @@ describe('diffProjectForSync', () => {
 		});
 	});
 
-	// The reverse half: a Settings save changes `name`/`repoRoot`/`worktreeRoot`/
-	// `maxConcurrentJobs` only, so an unsaved repository edit survives its refetch.
+	// The reverse half: a Settings save changes `name`/`repoRoot`/`worktreeRoot` only,
+	// so an unsaved repository edit survives its refetch.
 	it('leaves the repositories slice alone when only a Settings field changed', () => {
 		const prev = makeProject({ repoRoot: '/repo' });
 		const next = makeProject({ repoRoot: '/elsewhere' });
@@ -1273,9 +1272,9 @@ describe('diffProjectForSync', () => {
 	// The draft only ever shields `boardMapping` — the other tabs' slices keep re-syncing,
 	// so an open switch can't stall an unrelated change out of the form.
 	it('leaves the other slices alone while a draft is open', () => {
-		const prev = makeProject({ maxConcurrentJobs: 1, agents: { planning: {} } });
+		const prev = makeProject({ name: 'Proj', agents: { planning: {} } });
 		const next = makeProject({
-			maxConcurrentJobs: 4,
+			name: 'Renamed',
 			agents: { planning: { timeoutMs: 1000 } },
 		});
 
@@ -1324,7 +1323,6 @@ describe('toGeneralSettingsUpdate', () => {
 			name: 'Proj',
 			repoRoot: '/repo',
 			worktreeRoot: '.worktrees',
-			maxConcurrentJobs: 2,
 		});
 
 		expect(update).toEqual({
@@ -1332,7 +1330,6 @@ describe('toGeneralSettingsUpdate', () => {
 			name: 'Proj',
 			repoRoot: '/repo',
 			worktreeRoot: '.worktrees',
-			maxConcurrentJobs: 2,
 		});
 		expect(update).not.toHaveProperty('repositories');
 	});
@@ -1430,11 +1427,9 @@ describe('GeneralSettingsForm', () => {
 				name="Proj"
 				repoRoot="/repo"
 				worktreeRoot=".worktrees"
-				maxConcurrentJobs="1"
 				setName={() => {}}
 				setRepoRoot={() => {}}
 				setWorktreeRoot={() => {}}
-				setMaxConcurrentJobs={() => {}}
 				handleInputChange={() => () => {}}
 				handleSubmit={handleSubmit}
 				handleReset={handleReset}
@@ -1460,7 +1455,9 @@ describe('GeneralSettingsForm', () => {
 		expect(screen.getByLabelText(/^Name/)).toBeTruthy();
 		expect(screen.getByLabelText(/^Local Repository Root/)).toBeTruthy();
 		expect(screen.getByLabelText(/^Worktree Directory/)).toBeTruthy();
-		expect(screen.getByLabelText(/^Maximum Concurrent Jobs/)).toBeTruthy();
+		// The project-wide job cap is retired (issue #1190): a repository's WIP limit and
+		// each worker's concurrency allocation bound the work now, neither on this tab.
+		expect(screen.queryByLabelText(/^Maximum Concurrent Jobs/)).toBeNull();
 
 		// Neither the list editor nor the pre-#684 single-field trio it replaced.
 		expect(screen.queryByLabelText('Repository, entry 1')).toBeNull();

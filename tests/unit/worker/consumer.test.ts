@@ -235,7 +235,6 @@ const createAndPublishDispatch = vi.fn(async (_input: unknown) => ({
 	dispatch: mockDispatchRow({}),
 	created: true,
 }));
-const promoteNextCapacityDispatch = vi.fn(async (_projectId: string, _prioritize?: boolean) => {});
 const promoteAvailabilityWaitsForWorker = vi.fn(async (_workerId: string, _cause: string) => 0);
 const promoteTaskInFlightWaits = vi.fn(async (_projectId: string, _taskId: string) => 0);
 const promotePullRequestInFlightWaits = vi.fn(
@@ -253,8 +252,6 @@ vi.mock('@/dispatch/dispatcher.js', () => ({
 	}),
 	promoteAvailabilityWaitsForWorker: (workerId: string, cause: string) =>
 		promoteAvailabilityWaitsForWorker(workerId, cause),
-	promoteNextCapacityDispatch: (projectId: string, prioritize?: boolean) =>
-		promoteNextCapacityDispatch(projectId, prioritize),
 	promoteTaskInFlightWaits: (projectId: string, taskId: string) =>
 		promoteTaskInFlightWaits(projectId, taskId),
 	promotePullRequestInFlightWaits: (projectId: string, repository: string, prNumber: string) =>
@@ -686,15 +683,15 @@ vi.mock('@/identity/assignee-resolver.js', () => ({
 		resolveAssignedUser(workItem, provider),
 }));
 
-type SlotAcquisition = { acquired: false } | { acquired: true; tracked: boolean };
-const acquireProjectSlot = vi.fn<(projectId: string, limit: number) => Promise<SlotAcquisition>>(
-	async () => ({ acquired: true, tracked: true }),
-);
-const releaseProjectSlot = vi.fn(async (_projectId: string) => {});
-vi.mock('@/worker/project-concurrency.js', () => ({
-	acquireProjectSlot: (projectId: string, limit: number) => acquireProjectSlot(projectId, limit),
-	releaseProjectSlot: (projectId: string) => releaseProjectSlot(projectId),
-}));
+/**
+ * Makes the next dispatch take a **pre-run** wait (issue #284): the task-in-flight
+ * guard (issue #759) finds a holder whose phase is unrecorded, which defers any phase.
+ * The generic stand-in for a pre-run deferral since issue #1190 retired the project
+ * slot these cases were once anchored on.
+ */
+function holdTaskOnce(): void {
+	findExecutingDispatchForTask.mockResolvedValueOnce({ id: 'other', phase: null });
+}
 
 // User-initiated termination (issue #166): the durable cancellation flag is read
 // to tell a user termination apart from a worker-shutdown abort, and the per-run
@@ -1019,7 +1016,6 @@ describe('processJob', () => {
 		}));
 		createAndPublishDispatch.mockClear();
 		createAndPublishDispatch.mockResolvedValue({ dispatch: mockDispatchRow({}), created: true });
-		promoteNextCapacityDispatch.mockClear();
 		promoteAvailabilityWaitsForWorker.mockClear();
 		promoteTaskInFlightWaits.mockClear();
 		promotePullRequestInFlightWaits.mockClear();
@@ -1094,9 +1090,6 @@ describe('processJob', () => {
 		listProjectDispatchCandidates.mockResolvedValue([]);
 		resolveAssignedUser.mockClear();
 		resolveAssignedUser.mockResolvedValue(undefined);
-		acquireProjectSlot.mockClear();
-		acquireProjectSlot.mockResolvedValue({ acquired: true, tracked: true });
-		releaseProjectSlot.mockClear();
 		isRunCancellationRequested.mockClear();
 		isRunCancellationRequested.mockResolvedValue(false);
 		clearRunCancellation.mockClear();
@@ -1120,17 +1113,10 @@ describe('processJob', () => {
 		vi.unstubAllEnvs();
 	});
 
-	it('runs under the project limit and releases the slot on success', async () => {
-		const outcome = await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
-
-		expect(outcome.status).toBe('phase-succeeded');
-		expect(acquireProjectSlot).toHaveBeenCalledWith(PROJECT.id, PROJECT.maxConcurrentJobs);
-		expect(releaseProjectSlot).toHaveBeenCalledOnce();
-		expect(releaseProjectSlot).toHaveBeenCalledWith(PROJECT.id);
-	});
-
-	it('defers at the project limit without running or releasing an unacquired slot', async () => {
-		acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
+	// A pre-run wait (issue #284): the dispatch is handed back to `pending` before any
+	// worktree or agent, woken by an event rather than a timer.
+	it('defers a pre-run wait without running, and runs once woken', async () => {
+		holdTaskOnce();
 
 		const outcome = await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
@@ -1143,14 +1129,13 @@ describe('processJob', () => {
 			pendingDispatch: true,
 		});
 		expect(phaseCalls).toEqual([]);
-		expect(releaseProjectSlot).not.toHaveBeenCalled();
 
 		await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 		expect(phaseCalls).toHaveLength(1);
 	});
 
-	it('leaves a fresh Implementation retry free to create its task branch after a capacity deferral', async () => {
-		acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
+	it('leaves a fresh Implementation retry free to create its task branch after a pre-run deferral', async () => {
+		holdTaskOnce();
 		const workItem = createMockWorkItem({ statusId: '61e4505c' });
 		const trigger: TriggerResult = { phase: 'implementation', taskId: '216', workItem };
 
@@ -1165,8 +1150,8 @@ describe('processJob', () => {
 		expect(phaseCalls).toEqual([]);
 	});
 
-	it('does not consume the external-failure retry budget while waiting for a slot', async () => {
-		acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
+	it('does not consume the external-failure retry budget during a pre-run wait', async () => {
+		holdTaskOnce();
 
 		const outcome = await processJob(
 			createMockScmWebhookJob({ rateLimitRetryAttempt: 6 }),
@@ -1180,9 +1165,9 @@ describe('processJob', () => {
 		expect(phaseCalls).toEqual([]);
 	});
 
-	describe('pending-continuation scheduling (#214)', () => {
-		it('retains a concurrency-blocked Review as an observable pending continuation', async () => {
-			acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
+	describe('pre-run continuation claims (#214)', () => {
+		it('retains a pre-run-blocked Review as an observable continuation', async () => {
+			holdTaskOnce();
 
 			const outcome = await processJob(
 				createMockScmWebhookJob(),
@@ -1194,29 +1179,26 @@ describe('processJob', () => {
 				phase: 'review',
 				taskId: '17',
 				continuationDispatchClaimed: true,
-				pendingContinuation: true,
 				runId: 'run-1',
 			});
 			// Observable: a `deferred` run row is created now instead of the Review being
-			// invisible until the fallback delay fires.
+			// invisible until it is woken.
 			expect(createRun).toHaveBeenCalledTimes(1);
-			// The PR+SHA claim is refreshed (held open) past the fallback retry window so
-			// no sibling event steals it while the continuation waits.
+			// The PR+SHA claim is refreshed (held open) past the wait so no sibling event
+			// steals it while the continuation waits.
 			expect(refreshReviewDispatchClaim).toHaveBeenCalledWith(
 				`${PROJECT.repo}:17:deadbeef`,
 				expect.any(Number),
 			);
 			expect(phaseCalls).toEqual([]);
-			// Never acquired a slot → never released, and nothing reserved.
-			expect(releaseProjectSlot).not.toHaveBeenCalled();
 		});
 
 		it.each([
 			['Respond-to-review', RESPOND_TO_REVIEW_TRIGGER],
 			['Respond-to-CI', RESPOND_TO_CI_TRIGGER],
 			['Resolve-conflicts', RESOLVE_CONFLICTS_TRIGGER],
-		] as const)('retains a concurrency-blocked %s phase as an observable pending continuation', async (_label, trigger) => {
-			acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
+		] as const)('retains a pre-run-blocked %s phase as an observable continuation', async (_label, trigger) => {
+			holdTaskOnce();
 
 			const outcome = await processJob(createMockScmWebhookJob(), registryReturning(trigger));
 
@@ -1225,7 +1207,6 @@ describe('processJob', () => {
 				phase: trigger.phase,
 				taskId: trigger.taskId,
 				continuationDispatchClaimed: true,
-				pendingContinuation: true,
 				runId: 'run-1',
 			});
 			expect(createRun).toHaveBeenCalledOnce();
@@ -1233,7 +1214,7 @@ describe('processJob', () => {
 		});
 
 		it('refreshes the Respond-to-CI PR+SHA claim without refreshing Respond-to-review', async () => {
-			acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
+			holdTaskOnce();
 			await processJob(createMockScmWebhookJob(), registryReturning(RESPOND_TO_CI_TRIGGER));
 
 			expect(refreshReviewDispatchClaim).toHaveBeenCalledWith(
@@ -1242,15 +1223,15 @@ describe('processJob', () => {
 			);
 
 			refreshReviewDispatchClaim.mockClear();
-			acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
+			holdTaskOnce();
 			await processJob(createMockScmWebhookJob(), registryReturning(RESPOND_TO_REVIEW_TRIGGER));
 
-			// The dispatch claim stays held even without priority so immediate
-			// slot-release dispatch cannot be deduplicated as a fresh webhook.
+			// The dispatch claim stays held so the woken dispatch cannot be deduplicated
+			// as a fresh webhook.
 		});
 
 		it('refreshes the Resolve-conflicts head/base claim while pending', async () => {
-			acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
+			holdTaskOnce();
 
 			await processJob(createMockScmWebhookJob(), registryReturning(RESOLVE_CONFLICTS_TRIGGER));
 
@@ -1263,24 +1244,8 @@ describe('processJob', () => {
 			);
 		});
 
-		it('retains a continuation when a project with multiple slots is fully occupied', async () => {
-			projectLookup = () => createMockProjectConfig({ maxConcurrentJobs: 2 });
-			acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
-
-			const outcome = await processJob(
-				createMockScmWebhookJob(),
-				registryReturning(RESPOND_TO_CI_TRIGGER),
-			);
-
-			expect(acquireProjectSlot).toHaveBeenCalledWith(PROJECT.id, 2);
-			expect(outcome).toMatchObject({
-				status: 'phase-deferred',
-				pendingContinuation: true,
-			});
-		});
-
 		it('retains a blocked Implementation with a visible run and exact resume phase', async () => {
-			acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
+			holdTaskOnce();
 			const workItem = createMockWorkItem({ statusId: '61e4505c' });
 			const trigger: TriggerResult = { phase: 'implementation', taskId: '216', workItem };
 
@@ -1288,25 +1253,13 @@ describe('processJob', () => {
 
 			if (outcome.status !== 'phase-deferred') throw new Error('expected phase-deferred');
 			expect(outcome.continuationDispatchClaimed).toBeUndefined();
-			expect(outcome.pendingContinuation).toBeUndefined();
 			expect(outcome.pendingDispatch).toBe(true);
 			expect(refreshReviewDispatchClaim).not.toHaveBeenCalled();
 			expect(createRun).toHaveBeenCalledOnce();
 		});
 
-		it('wakes the next capacity-blocked dispatch when a slot frees on success', async () => {
-			const outcome = await processJob(
-				createMockScmWebhookJob(),
-				registryReturning(REVIEW_TRIGGER),
-			);
-
-			expect(outcome.status).toBe('phase-succeeded');
-			expect(releaseProjectSlot).toHaveBeenCalledOnce();
-			expect(promoteNextCapacityDispatch).toHaveBeenCalledWith(PROJECT.id, true);
-		});
-
-		it('records the capacity wait durably on the dispatch when blocked by the limit', async () => {
-			acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
+		it('records the pre-run wait durably on the dispatch', async () => {
+			holdTaskOnce();
 
 			const outcome = await processJob(
 				createMockScmWebhookJob({ runId: undefined }),
@@ -1317,8 +1270,7 @@ describe('processJob', () => {
 			expect(deferDispatchToPending).toHaveBeenCalledWith(
 				'dispatch-1',
 				expect.objectContaining({
-					waitReason: 'project-capacity',
-					continuation: true,
+					waitReason: 'task-in-flight',
 					runId: 'run-1',
 					jobPayload: expect.objectContaining({
 						runId: 'run-1',
@@ -1326,7 +1278,7 @@ describe('processJob', () => {
 					}),
 				}),
 			);
-			// A slot deferral is durable pending work, not a timer retry.
+			// A pre-run deferral is durable pending work, not a timer retry.
 			expect(scheduleDispatchRetry).not.toHaveBeenCalled();
 		});
 
@@ -1335,7 +1287,7 @@ describe('processJob', () => {
 		// guard is what makes this write lose to that, instead of putting a
 		// `deferred` run back under a cancelled dispatch for the backfill to find.
 		it('guards the pre-run deferral’s run settle on the row still being `running`', async () => {
-			acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
+			holdTaskOnce();
 
 			await processJob(
 				createMockScmWebhookJob({ runId: undefined }),
@@ -1346,39 +1298,6 @@ describe('processJob', () => {
 				'run-1',
 				expect.objectContaining({ status: 'deferred', fromStatus: 'running' }),
 			);
-		});
-
-		it.each([
-			REVIEW_TRIGGER,
-			RESPOND_TO_REVIEW_TRIGGER,
-			RESPOND_TO_CI_TRIGGER,
-			RESOLVE_CONFLICTS_TRIGGER,
-		])('keeps FIFO scheduling for $phase when continuation prioritization is false', async (trigger) => {
-			projectLookup = () =>
-				createMockProjectConfig({ pipeline: { prioritizeContinuations: false } });
-			acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
-
-			const outcome = await processJob(createMockScmWebhookJob(), registryReturning(trigger));
-
-			expect(outcome).toMatchObject({
-				status: 'phase-deferred',
-				phase: trigger.phase,
-				retryDelayMs: 0,
-			});
-			if (outcome.status !== 'phase-deferred') throw new Error('unreachable');
-			expect(outcome.continuationDispatchClaimed).toBe(true);
-			expect(outcome.pendingContinuation).toBe(false);
-			expect(createRun).toHaveBeenCalledOnce();
-		});
-
-		it('still promotes pending work on slot release when prioritizeContinuations is false', async () => {
-			projectLookup = () =>
-				createMockProjectConfig({ pipeline: { prioritizeContinuations: false } });
-
-			await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
-
-			expect(releaseProjectSlot).toHaveBeenCalledOnce();
-			expect(promoteNextCapacityDispatch).toHaveBeenCalledWith(PROJECT.id, false);
 		});
 
 		it('finalizes the run row and releases the claim if a pending continuation re-resolves to no-trigger', async () => {
@@ -1916,27 +1835,6 @@ describe('processJob', () => {
 		});
 	});
 
-	it('releases a tracked slot after failure and abort, but not a fail-open slot', async () => {
-		phaseImpl = async () => {
-			throw new Error('failed');
-		};
-		await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
-		expect(releaseProjectSlot).toHaveBeenCalledTimes(1);
-
-		releaseProjectSlot.mockClear();
-		phaseImpl = async () => {
-			throw new AgentRunError('aborted', { kind: 'aborted' });
-		};
-		await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
-		expect(releaseProjectSlot).toHaveBeenCalledTimes(1);
-
-		releaseProjectSlot.mockClear();
-		acquireProjectSlot.mockResolvedValueOnce({ acquired: true, tracked: false });
-		phaseImpl = async () => ({ agent: agentResult() });
-		await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
-		expect(releaseProjectSlot).not.toHaveBeenCalled();
-	});
-
 	it('throws for a job referencing an unknown project', async () => {
 		projectLookup = () => undefined;
 
@@ -2034,7 +1932,6 @@ describe('processJob', () => {
 				expect.stringContaining("does not own repository 'SmartTechBrewery/gone'"),
 			);
 			expect(phaseCalls).toEqual([]);
-			expect(acquireProjectSlot).not.toHaveBeenCalled();
 		});
 
 		// Same refusal for a routed board card whose repository has since been removed
@@ -2299,7 +2196,6 @@ describe('processJob', () => {
 			// It never resolves a trigger, runs an agent phase, or consumes a slot.
 			expect(seen).toHaveLength(0);
 			expect(phaseCalls).toHaveLength(0);
-			expect(acquireProjectSlot).not.toHaveBeenCalled();
 		});
 
 		it('drops the wake-up without executing when the dispatch claim is refused', async () => {
@@ -2340,7 +2236,6 @@ describe('processJob', () => {
 			});
 			expect(seen).toHaveLength(0);
 			expect(phaseCalls).toHaveLength(0);
-			expect(acquireProjectSlot).not.toHaveBeenCalled();
 			expect(projectLookupCalls).toHaveLength(0);
 		});
 
@@ -2353,7 +2248,6 @@ describe('processJob', () => {
 
 			expect(outcome).toMatchObject({ result: 'not-connected' });
 			expect(phaseCalls).toHaveLength(0);
-			expect(acquireProjectSlot).not.toHaveBeenCalled();
 		});
 
 		it('drops the wake-up without pushing when the dispatch claim is refused', async () => {
@@ -2912,9 +2806,9 @@ describe('processJob', () => {
 			expect(resolvedTarget()).toMatchObject({ engine: 'codex', model: 'gpt-5.6-terra' });
 		});
 
-		it('records the preferred target on a capacity-deferred run row', async () => {
+		it('records the preferred target on a pre-run-deferred run row', async () => {
 			projectLookup = twoTargetProject;
-			acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
+			holdTaskOnce();
 
 			const outcome = await processJob(
 				createMockPmWebhookJob(),
@@ -4576,7 +4470,6 @@ describe('processJob', () => {
 				expect(outcome.status).toBe('phase-succeeded');
 				expect(listProjectDispatchCandidates).toHaveBeenCalledWith(PROJECT.id);
 				expect(claimWorkerForDispatch).not.toHaveBeenCalled();
-				expect(acquireProjectSlot).toHaveBeenCalledWith(PROJECT.id, PROJECT.maxConcurrentJobs);
 			});
 
 			it('tells a worker-less transport install which commands to run', async () => {
@@ -5564,7 +5457,6 @@ describe('processJob', () => {
 			});
 			listProjectDispatchCandidates.mockClear();
 			claimWorkerForDispatch.mockClear();
-			acquireProjectSlot.mockClear();
 			scheduleDispatchRetry.mockClear();
 			completeDispatch.mockClear();
 			resetRunBindings.length = 0;
@@ -5585,7 +5477,6 @@ describe('processJob', () => {
 			// No gate, no bind, no slot: the phase already ran on the lost machine.
 			expect(listProjectDispatchCandidates).not.toHaveBeenCalled();
 			expect(claimWorkerForDispatch).not.toHaveBeenCalled();
-			expect(acquireProjectSlot).not.toHaveBeenCalled();
 			// …and no repository WIP admission either (issue #1185).
 			expect(reserveWipSlot).not.toHaveBeenCalled();
 			// The executor sees the carried result and the machine that produced it.
@@ -5968,7 +5859,6 @@ describe('processJob', () => {
 				taskId: '216',
 			});
 			expect(phaseCalls).toEqual([]);
-			expect(acquireProjectSlot).not.toHaveBeenCalled();
 			expect(createRun).not.toHaveBeenCalled();
 			expect(completeDispatch).toHaveBeenCalledWith('dispatch-1', 'skipped-not-eligible');
 			// Still resolved on the dispatch first, so the Queue UI can name what was skipped.
@@ -6103,7 +5993,6 @@ describe('processJob', () => {
 					taskId: trigger.taskId,
 				});
 				expect(phaseCalls).toEqual([]);
-				expect(acquireProjectSlot).not.toHaveBeenCalled();
 				expect(createRun).not.toHaveBeenCalled();
 				expect(completeDispatch).toHaveBeenCalledWith('dispatch-1', 'skipped-not-eligible');
 			});
@@ -6294,7 +6183,6 @@ describe('processJob', () => {
 				reason: expect.stringContaining('this item has no assignee'),
 			});
 			expect(phaseCalls).toEqual([]);
-			expect(acquireProjectSlot).not.toHaveBeenCalled();
 			expect(createRun).not.toHaveBeenCalled();
 			expect(completeDispatch).toHaveBeenCalledWith('dispatch-1', 'skipped-not-eligible');
 			expect(info).toHaveBeenCalledWith(
@@ -6458,10 +6346,9 @@ describe('processJob', () => {
 				'run-1',
 				expect.objectContaining({ status: 'deferred', fromStatus: 'running' }),
 			);
-			// Refused before the task claim, the worker gate, and the project slot.
+			// Refused before the task claim and the worker gate.
 			expect(findExecutingDispatchForTask).not.toHaveBeenCalled();
 			expect(listProjectDispatchCandidates).not.toHaveBeenCalled();
-			expect(acquireProjectSlot).not.toHaveBeenCalled();
 			expect(phaseCalls).toEqual([]);
 			expect(scheduleDispatchRetry).not.toHaveBeenCalled();
 			// Still full after the defer, so it does not wake itself.
@@ -6823,7 +6710,9 @@ describe('processJob', () => {
 			expect(promoteTaskInFlightWaits).toHaveBeenCalledWith(PROJECT.id, '17');
 
 			promoteTaskInFlightWaits.mockClear();
-			acquireProjectSlot.mockResolvedValue({ acquired: false });
+			phaseImpl = async () => {
+				throw new AgentRunError('rate limited', { kind: 'rate-limit' });
+			};
 			const deferred = await processJob(
 				createMockScmWebhookJob(),
 				registryReturning(REVIEW_TRIGGER),
@@ -7497,8 +7386,9 @@ describe('processJob', () => {
 				);
 
 				promotePullRequestInFlightWaits.mockClear();
-				phaseImpl = async () => ({ agent: agentResult() });
-				acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
+				phaseImpl = async () => {
+					throw new AgentRunError('rate limited', { kind: 'rate-limit' });
+				};
 				const deferred = await processJob(
 					createMockScmWebhookJob(),
 					registryReturning(RESOLVE_CONFLICTS_TRIGGER),
@@ -8031,7 +7921,7 @@ describe('processJob', () => {
 		it('never parks a pre-run wait on a row another active dispatch owns (issue #1102)', async () => {
 			getLatestRunForTask.mockResolvedValueOnce({ id: 'run-held', status: 'deferred' } as never);
 			bindDispatchToRun.mockResolvedValueOnce(false);
-			acquireProjectSlot.mockResolvedValueOnce({ acquired: false });
+			holdTaskOnce();
 
 			const outcome = await processJob(
 				createMockScmWebhookJob({ runId: undefined }),

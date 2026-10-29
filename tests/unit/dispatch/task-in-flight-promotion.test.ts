@@ -18,7 +18,6 @@ vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
 	getActiveDispatchByRunId: vi.fn(),
 	listAvailabilityWaitsForWorker: vi.fn(),
 	promoteDispatchToImmediateWake: vi.fn(),
-	selectNextCapacityDispatch: vi.fn(),
 	supersedeDispatchesByCoalesceKey: vi.fn(),
 }));
 

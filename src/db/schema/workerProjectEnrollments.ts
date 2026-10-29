@@ -50,8 +50,8 @@ import { workers } from './workers.js';
  * of the project, and a new one claims a single slot unless the operator says
  * otherwise. "No per-worker cap" is deliberately not expressible — as `NULL` it
  * was a second way of saying a number, and on a default install already resolved
- * to an effective 1 (the limit it deferred to, `max_concurrent_jobs`, defaults
- * to 1). A larger integer widens this one
+ * to an effective 1 (the project-wide job cap it deferred to, retired by issue
+ * #1190, defaulted to 1). A larger integer widens this one
  * project's share of the worker. `order_index` is this worker's rank **within
  * its project's configured order** (issue #750): `NOT NULL`, defaulting to
  * `DEFAULT_ENROLLMENT_ORDER_INDEX` (`0`), read ascending with `(created_at, id)`

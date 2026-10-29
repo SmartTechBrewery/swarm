@@ -32,7 +32,6 @@ vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
 	listMergeQueueWaits: vi.fn(),
 	listPullRequestInFlightWaits: vi.fn(),
 	listTaskInFlightWaits: vi.fn(),
-	selectNextCapacityDispatch: vi.fn(),
 	supersedeDispatchesByCoalesceKey: vi.fn(),
 }));
 

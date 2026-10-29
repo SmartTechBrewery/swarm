@@ -1589,7 +1589,7 @@ export const workersRouter = router({
 				// Omit for every phase (issue #509) — a new enrollment constrains nothing
 				// its machine's daemon and the project don't already constrain.
 				allowedPhases: AllowedPhasesInput.optional(),
-				// Omit for the default share of one project slot (issue #480); there is
+				// Omit for the default share of one job at a time (issue #480); there is
 				// deliberately no value meaning "no per-worker cap".
 				concurrencyAllocation: ConcurrencyInput.optional(),
 			}),

@@ -29,7 +29,6 @@ import {
 	listPullRequestInFlightWaits,
 	listTaskInFlightWaits,
 	promoteDispatchToImmediateWake,
-	selectNextCapacityDispatch,
 	supersedeDispatchesByCoalesceKey,
 } from '../db/repositories/dispatchesRepository.js';
 import { adoptOutstandingWorkerUpdateRequest } from '../db/repositories/workersRepository.js';
@@ -208,40 +207,8 @@ export async function scheduleCoalescedDispatch(
 }
 
 /**
- * After a project slot frees, wake the next capacity-blocked dispatch (SCM
- * continuations first when the project opts in — issue #214's policy). No slot
- * is reserved: the woken dispatch re-checks capacity at claim time and re-defers
- * if it lost the race. Best-effort and fully swallowed — a queue hiccup must
- * never turn a settled run into a failed job; the reconciler's periodic
- * promotion is the safety net.
- */
-export async function promoteNextCapacityDispatch(
-	projectId: string,
-	prioritizeContinuations = true,
-): Promise<void> {
-	try {
-		const next = await selectNextCapacityDispatch(projectId, prioritizeContinuations);
-		if (!next) return;
-		await publishDispatchWakeUp(next);
-		logger.debug('dispatch: slot freed — woke capacity-blocked dispatch', {
-			projectId,
-			dispatchId: next.id,
-			taskId: next.taskId,
-			phase: next.phase,
-			continuation: next.continuation,
-		});
-	} catch (err) {
-		logger.warn('dispatch: capacity promotion failed', {
-			projectId,
-			error: describeError(err),
-		});
-	}
-}
-
-/**
  * After a phase settles, wake whatever was waiting for *that task's* checkout to
- * free (issue #759) — the task-level sibling of {@link promoteNextCapacityDispatch},
- * and the wake-up that turns the in-flight collision guard from a silent drop into
+ * free (issue #759) — the wake-up that turns the in-flight collision guard from a silent drop into
  * a sequenced hand-off.
  *
  * No re-dating is needed (unlike {@link promoteAvailabilityWaitsForWorker}): these
@@ -250,10 +217,9 @@ export async function promoteNextCapacityDispatch(
  * is a queue no-op. A woken dispatch re-runs the guard on claim and re-defers if it
  * lost the race.
  *
- * Best-effort and fully swallowed, exactly like the capacity promotion: it runs off
- * a settled run, which a queue hiccup must never fail — the reconciler's periodic
- * republish (`pending` rows are wakeable unless they wait on project capacity) is
- * the safety net.
+ * Best-effort and fully swallowed: it runs off a settled run, which a queue hiccup
+ * must never fail — the reconciler's periodic republish (`pending` rows are
+ * wakeable unless they wait on a repository's WIP limit) is the safety net.
  */
 export async function promoteTaskInFlightWaits(projectId: string, taskId: string): Promise<number> {
 	try {
@@ -525,11 +491,11 @@ export type WorkerAvailabilityCause =
  * A refusal from the eligibility gate is deferred on the dependency gate's
  * 5-minute cadence, so before this a dispatch sat still next to an idle worker
  * for up to a full interval. This is the availability wait's equivalent of the
- * slot-release scheduling {@link promoteNextCapacityDispatch} does for the
- * concurrency wait — with one real difference: a capacity wait is a `pending`
- * row whose wake-up is simply (re)published, while these are `retry-scheduled`
- * rows that already hold a live *delayed* wake-up, so the stale one has to be
- * dealt with rather than merely overwritten.
+ * slot-release scheduling {@link promoteTaskInFlightWaits} does for a task's
+ * checkout — with one real difference: that wait is a `pending` row whose wake-up
+ * is simply (re)published, while these are `retry-scheduled` rows that already
+ * hold a live *delayed* wake-up, so the stale one has to be dealt with rather than
+ * merely overwritten.
  *
  * Hence the per-row order: **remove the delayed wake-up, then re-date the row,
  * then publish the replacement**, so the dispatch never holds two live wake-ups
@@ -540,7 +506,7 @@ export type WorkerAvailabilityCause =
  * leaves behind, the reconciler's idempotent republish and the timed re-check
  * are both still underneath it.
  *
- * Best-effort and fully swallowed, exactly like the capacity promotion: this
+ * Best-effort and fully swallowed, exactly like the task-in-flight promotion: this
  * runs off a settled run and off a socket open, and neither may be failed by a
  * queue hiccup. Returns how many dispatches were promoted.
  */

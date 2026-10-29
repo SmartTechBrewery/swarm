@@ -75,7 +75,6 @@ describe('db schema', () => {
 
 		it('applies the PROJECT_DEFAULTS as column defaults', () => {
 			expect(columns.get('worktree_root')?.default).toBe('.swarm-workspaces');
-			expect(columns.get('max_concurrent_jobs')?.default).toBe(1);
 		});
 	});
 

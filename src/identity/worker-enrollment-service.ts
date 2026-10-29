@@ -1061,8 +1061,8 @@ export interface EnrollWorkerInput {
  *
  * A multi-repository project holding several workers this way remains a *single*
  * project in every other respect: one SCM provider (issue #727), one credential
- * set, one `pipeline`/`agents` config and one `maxConcurrentJobs` across its
- * repositories. Those are existing deliberate properties, not gaps this opens.
+ * set and one `pipeline`/`agents` config across its repositories (each
+ * repository keeps its own WIP limit, issue #1185). Those are existing deliberate properties, not gaps this opens.
  */
 export async function enrollWorker(input: EnrollWorkerInput): Promise<WorkerEnrollment> {
 	const allowedClis = EnrollmentAllowedClisSchema.parse(input.allowedClis);

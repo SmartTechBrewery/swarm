@@ -421,8 +421,7 @@ Usage:
              the worker's capabilities) and --concurrency, this worker's share of
              the project. Omit --concurrency for 1 (the default): one of the
              project's jobs at a time on this machine. A larger value lets the
-             project run several jobs here at once, still bounded by the
-             project's Maximum Concurrent Jobs. Enrolling your own machine in a
+             project run several jobs here at once. Enrolling your own machine in a
              project you administer creates it active and consenting; otherwise it
              starts pending with sharing consent off, and --active/--consent then
              approve it and grant consent (operator seeding). --active is a

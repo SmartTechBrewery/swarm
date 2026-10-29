@@ -587,7 +587,7 @@ export const MergeAutomationJobSchema = jobBase.extend({
  * The shortest job in the system and the one everything else waits behind, so it
  * ranks *ahead* of everything already queued ({@link priorityFor},
  * `./producer.ts`). It carries no webhook event, resolves no trigger, provisions
- * no worktree and takes no project slot — modelled on `merge-automation`, the
+ * no worktree and takes no worker slot — modelled on `merge-automation`, the
  * existing agent-less dispatch kind.
  */
 export const WorkerUpdateJobSchema = jobBase.extend({

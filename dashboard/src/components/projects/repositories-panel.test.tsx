@@ -67,7 +67,7 @@ describe('RepositoriesPanel', () => {
 	});
 
 	// Its own Save, sending `repositories` alone: the Settings tab keeps a separate one for
-	// `name`/`repoRoot`/`worktreeRoot`/`maxConcurrentJobs`.
+	// `name`/`repoRoot`/`worktreeRoot`.
 	it('saves and resets on its own controls', () => {
 		const { handleSubmit, handleReset } = renderPanel();
 

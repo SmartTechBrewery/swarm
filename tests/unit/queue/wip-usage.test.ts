@@ -159,7 +159,7 @@ describe('toWipUsage', () => {
 			projectId: 'p1',
 			taskId: '103',
 			phase: 'implementation',
-			waitReason: 'project-capacity',
+			waitReason: 'task-in-flight',
 		};
 		expect(holder({ activity: [makeActivity()], activeDispatches: [queued] }).state).toBe(
 			'waiting-on-pipeline',

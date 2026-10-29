@@ -31,8 +31,8 @@
  * marker. Nothing secret goes on those lines, and `CancellationOrigin.actor` is
  * logged only when one was genuinely recorded — never guessed (issue #308).
  *
- * Own lazy ioredis client per process, mirroring `project-concurrency.ts` — the
- * dashboard publishes, the worker subscribes, both against the one shared Redis.
+ * Own lazy ioredis client per process — the dashboard publishes, the worker
+ * subscribes, both against the one shared Redis.
  */
 
 import { Redis } from 'ioredis';
