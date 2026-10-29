@@ -58,6 +58,7 @@ import {
 	recoverUnreviewedPullRequests,
 	UNREVIEWED_PR_SWEEP_INTERVAL_MS,
 } from '../dispatch/unreviewed-pr-recovery.js';
+import { sweepWipSlots, WIP_SLOT_SWEEP_INTERVAL_MS } from '../dispatch/wip-slot-sweep.js';
 import type { AgentCliResult, ReportedAgentResult } from '../harness/agent-cli.js';
 import {
 	type AgentFailure,
@@ -1089,6 +1090,16 @@ export async function startControlPlaneDispatch(options: {
 	);
 	baseHealthInterval.unref();
 
+	// Free the WIP slot of a ticket that left automation with no event SWARM observes —
+	// its label removed, its card closed by SWARM's own credential, a lost board
+	// webhook, its repository removed (issue #1189). Its own interval, and a first
+	// pass right away rather than after a full interval: unlike the two sweeps above,
+	// a stale slot actively blocks a waiting ticket, and a pass is one board read per
+	// held slot — at most the sum of the configured WIP limits.
+	void sweepWipSlots();
+	const wipSlotInterval = setInterval(() => void sweepWipSlots(), WIP_SLOT_SWEEP_INTERVAL_MS);
+	wipSlotInterval.unref();
+
 	// Deliver user terminations to the worker running the run (issue #549). A
 	// dispatched run is otherwise unstoppable until its wall-clock timeout, and a
 	// DB-free worker has no Redis to read the durable marker with either.
@@ -1104,6 +1115,7 @@ export async function startControlPlaneDispatch(options: {
 			clearInterval(reconcileInterval);
 			clearInterval(reviewRecoveryInterval);
 			clearInterval(baseHealthInterval);
+			clearInterval(wipSlotInterval);
 			// Drain the consumer first: an in-flight dispatch still reads the durable
 			// cancellation marker on this client, so closing it underneath would only
 			// make that read fail safe into "not cancelled".

@@ -85,6 +85,29 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('wipSlotsRepository', () =
 		expect(await reserveWipSlot(reservation('2'))).toMatchObject({ admitted: true });
 	});
 
+	it('lists every held slot with the card it started from (issue #1189)', async () => {
+		await reserveWipSlot(reservation('1'));
+		await reserveWipSlot(reservation('2', 1, OTHER_REPO));
+
+		expect(await listWipSlots()).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					projectId: PROJECT_ID,
+					repository: REPO,
+					taskId: '1',
+					workItemId: 'ITEM_1',
+				}),
+				expect.objectContaining({
+					projectId: PROJECT_ID,
+					repository: OTHER_REPO,
+					taskId: '2',
+					workItemId: 'ITEM_2',
+				}),
+			]),
+		);
+		expect(await listWipSlots()).toHaveLength(2);
+	});
+
 	it('reports releasing a ticket that holds no slot', async () => {
 		expect(await releaseWipSlot(PROJECT_ID, REPO, '404')).toBe(false);
 	});

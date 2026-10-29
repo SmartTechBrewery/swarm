@@ -3,8 +3,9 @@
  * per-repository WIP limit.
  *
  * All plain: the atomic reservation a new ticket's start takes, the release that
- * frees it, the count promotion reads, and — for the dashboard's WIP panel (issue
- * #1192) — the holder's pull request and the slot listing. The *policy* — which
+ * frees it, the count promotion reads, the full list the slot sweep
+ * (`src/dispatch/wip-slot-sweep.ts`, issue #1189) re-checks, and — for the dashboard's
+ * WIP panel (issue #1192) — the holder's pull request. The *policy* — which
  * phases are gated, what releases a slot, who is woken — lives in
  * `src/dispatch/wip-limit.ts`; nothing here decides anything but "is there room".
  */
@@ -163,7 +164,10 @@ export async function recordWipSlotPullRequest(
 	return rows.length > 0;
 }
 
-/** One slot, as the dashboard's WIP read model (`src/queue/wip-usage.ts`) reads it. */
+/**
+ * One held slot, as the slot sweep re-checks it against its card (issue #1189) and the
+ * dashboard's WIP read model (`src/queue/wip-usage.ts`) reads it.
+ */
 export interface WipSlotRow {
 	projectId: string;
 	repository: string;
@@ -177,8 +181,11 @@ export interface WipSlotRow {
 }
 
 /**
- * Every slot, oldest first per repository — the dashboard's WIP panel (issue #1192).
- * `projectIds` is the authorization scope, the `listTaskActivitySince` convention: an
+ * Every held slot, oldest first per repository, so one project's repositories come out
+ * together — the slot sweep (issue #1189) and the dashboard's WIP panel (issue #1192).
+ * Unbounded on purpose: the table holds at most the sum of every repository's
+ * `wipLimit`, which is small by construction. `projectIds` is the authorization scope,
+ * the `listTaskActivitySince` convention: omitted (the sweep) reads every project; an
  * empty scope is answered without a query, so it can never widen to every project.
  */
 export async function listWipSlots(projectIds?: readonly string[]): Promise<WipSlotRow[]> {

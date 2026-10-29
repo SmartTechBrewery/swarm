@@ -820,7 +820,12 @@ whose reason names the tickets holding the slots, and starts by itself once one
 frees. A ticket stops counting when its **pull request is merged or closed**, its
 **card reaches Done or Backlog**, or it is **Put back** from the Queue; a start that
 turns out to be blocked on an unfinished prerequisite gives its slot back while it
-waits. A failed run keeps its slot — the ticket is waiting on you — so to free one by
+waits. A ticket taken off automation frees its slot too: one the automation-label or
+assignee check skips frees it at once, and a periodic sweep (every 5 minutes) re-reads
+each slot holder's card and frees the slot when the card has lost the automation label,
+reached Done or Backlog without SWARM seeing the move, or its repository was removed
+from the project — so removing the label frees the slot within one sweep. A card the
+sweep cannot read keeps its slot until a later pass can. A failed run keeps its slot — the ticket is waiting on you — so to free one by
 hand, close the pull request or move the card to Backlog or Done. Tickets already in
 flight when the limit shipped hold no slot. Until Maximum Concurrent Jobs is retired
 both caps apply, so an admitted ticket can still wait for a project slot.

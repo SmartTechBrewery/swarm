@@ -1356,6 +1356,29 @@ id Planning and Implementation share ("Task identity" above). Policy lives in
   would keep that prerequisite, possibly the next ticket waiting, from ever starting; the
   re-check re-admits it like any start. **Not** a release: a failed run (the ticket waits
   on an operator), "Reset & restart", a Queue-cancelled dispatch.
+- **Leaving automation without an event (issue #1189).** A ticket can also leave by a
+  road no event travels: its automation label removed (no provider's label change is a
+  trigger), its card moved to Done/Backlog by SWARM's **own** board credential (split
+  children a parent merge absorbed — dropped at ingress as self-authored), a lost board
+  webhook, or its repository removed from the project. Two releases cover them. When
+  `processJob`'s automation-label or assignee gate skips a board-driven dispatch,
+  `skipIneligibleDispatch` releases that ticket's slot at once (`automation-skip`;
+  best-effort, never changing the skip; a pull request-driven skip touches no slot). And
+  the **slot sweep** (`sweepWipSlots`, `src/dispatch/wip-slot-sweep.ts`), scheduled from
+  `src/router/dispatcher.ts` with a first pass at start and then every
+  `WIP_SLOT_SWEEP_INTERVAL_MS` (5 minutes, coded), re-reads each holder's card with the
+  one-card `PMProvider.getWorkItem` — the slot's `work_item_id`, else
+  `findBoardItemIdForTask` from the ticket's runs, else the slot is kept and logged — and
+  the pure `wipSlotReleaseCause` releases on `statusKey` `done`/`backlog`
+  (`board-done`/`board-backlog`), on a missing automation label only while the project
+  gates on one (`label-removed`), and on a repository the record no longer owns
+  (`repository-removed`, decided from the record with no read). Reads **fail closed**:
+  `getWorkItem` has no typed not-found, so a read that throws keeps the slot and is
+  logged with project, repository, task and card — a release is only ever made on a
+  positive answer. Cost is **bounded**: each project is loaded once, each repository's
+  provider resolved once, and a pass makes at most one `getWorkItem` per held slot — so
+  at most the sum of the configured WIP limits — and never `listWorkItems` (ai/RULES.md
+  §2, issue #735); each pass logs its slot, read, release and unreadable counts.
 - **Promotion.** `promoteWipWaits` wakes the first `limit − count` waiters ordered
   `priority, created_at` — not `available_at`, which every re-defer re-dates — through
   `publishDispatchWakeUp`, whose deterministic wake ids make two concurrent releases
@@ -1363,10 +1386,9 @@ id Planning and Implementation share ("Task identity" above). Policy lives in
   reconciler's startup and periodic passes run `promoteAllWipWaits`, covering a lost
   wake-up and an operator **raising** a limit; lowering one preempts nothing.
 
-Tickets already in flight when this shipped hold no slot. The label-removal sweep that
-frees the slots of tickets taken off automation without an event, ranking in-flight work
-ahead of new starts, and retiring `maxConcurrentJobs` (both caps apply until then) are
-later phases of issue #1185.
+Tickets already in flight when this shipped hold no slot. Ranking in-flight work ahead
+of new starts and retiring `maxConcurrentJobs` (both caps apply until then) are later
+phases of issue #1185.
 
 **The WIP panel (issue #1192).** `runs.wip` (`src/api/routers/runs.ts`, authorized exactly
 like `runs.stalled`) returns one entry per `(project, repository)` holding a slot or a

@@ -6553,6 +6553,48 @@ describe('processJob', () => {
 			expect(reserveWipSlot).not.toHaveBeenCalled();
 		});
 
+		it.each([
+			'planning',
+			'implementation',
+		] as const)('frees the slot of a %s the automation-label gate skips (issue #1189)', async (phase) => {
+			const trigger = boardTrigger(phase);
+			trigger.workItem.labels = [];
+
+			const outcome = await processJob(createMockPmWebhookJob(), registryReturning(trigger));
+
+			expect(outcome.status).toBe('skipped-not-eligible');
+			expect(releaseWipSlot).toHaveBeenCalledWith(PROJECT.id, PROJECT.repo, '216');
+		});
+
+		it('keeps the skip when freeing the slot fails (issue #1189)', async () => {
+			releaseWipSlot.mockRejectedValueOnce(new Error('db down'));
+			const trigger = boardTrigger('implementation');
+			trigger.workItem.labels = [];
+
+			const outcome = await processJob(createMockPmWebhookJob(), registryReturning(trigger));
+
+			expect(outcome.status).toBe('skipped-not-eligible');
+			expect(completeDispatch).toHaveBeenCalledWith('dispatch-1', 'skipped-not-eligible');
+		});
+
+		it('touches no slot when the gate skips a pull request-driven phase (issue #1189)', async () => {
+			findWorkItemForArtifact.mockResolvedValue(
+				createMockWorkItem({
+					id: 'item-17',
+					url: 'https://github.com/SmartTechBrewery/swarm/issues/17',
+					labels: [],
+				}),
+			);
+
+			const outcome = await processJob(
+				createMockScmWebhookJob(),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('skipped-not-eligible');
+			expect(releaseWipSlot).not.toHaveBeenCalled();
+		});
+
 		it('admits a woken resumePmPhase Planning once a slot is free (the automatic start)', async () => {
 			const outcome = await processJob(
 				{ ...createMockPmWebhookJob(), resumePmPhase: 'planning' },

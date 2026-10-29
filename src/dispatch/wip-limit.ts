@@ -15,7 +15,10 @@
  * - **Release** ({@link releaseTicketSlot}) — the ticket finished or left the
  *   pipeline: its pull request closed or merged (the `wip-release` trigger), its card
  *   reached Done or Backlog (`pm-status`), a dashboard Put back, or its start turned
- *   out to be blocked on a prerequisite. Idempotent and best-effort.
+ *   out to be blocked on a prerequisite. A ticket that leaves automation with no
+ *   event SWARM observes is caught by the periodic slot sweep
+ *   (`./wip-slot-sweep.ts`, issue #1189), and one the automation gate skips is
+ *   released by `processJob` at once. Idempotent and best-effort.
  * - **Promote** ({@link promoteWipWaits}) — wake as many waiters as there are free
  *   slots, oldest first. Called on every release, and for every repository holding
  *   waiters by the reconciler ({@link promoteAllWipWaits}), which covers a lost
@@ -55,7 +58,13 @@ export type WipReleaseCause =
 	| 'board-backlog'
 	| 'put-back'
 	/** The ticket's start deferred on an unfinished prerequisite — it has not really started. */
-	| 'dependency-wait';
+	| 'dependency-wait'
+	/** The slot sweep found the card no longer carries the automation label (issue #1189). */
+	| 'label-removed'
+	/** The slot sweep found the repository is no longer one of the project's (issue #1189). */
+	| 'repository-removed'
+	/** The automation-label or assignee gate skipped the ticket's board-driven dispatch. */
+	| 'automation-skip';
 
 /** The two board-driven phases — the only ones that ever ask for a slot. */
 export type BoardTriggerResult = Extract<TriggerResult, { phase: 'planning' | 'implementation' }>;
