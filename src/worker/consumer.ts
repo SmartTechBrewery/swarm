@@ -337,6 +337,13 @@ export type JobOutcome =
 			 * preserved work on the machine that holds it rather than starting over.
 			 */
 			carriedContinuation?: PreservedContinuationKind;
+			/**
+			 * True when this failure left this phase's checkpoint in a preserved checkout
+			 * that Tier 2 judged continuable, but whose continuation or retry budget is
+			 * spent. The settle records the machine holding it (issue #1219), so "Retry
+			 * now" continues from that checkpoint there instead of starting over.
+			 */
+			preservesCheckpoint?: boolean;
 	  }
 	| {
 			status: 'phase-deferred';
@@ -729,6 +736,9 @@ function deferredPhaseMessage(failure: DeferrableFailure, phase: TriggerPhase): 
  * that its budget for doing so is spent. When the budget cannot be read, it instead
  * releases the checkout before the ordinary retry. Resolved by {@link resolveCheckpointFallback};
  * `undefined` there means "not a Tier 2 case" and the deferral proceeds exactly as it did before.
+ * `continue` carries the run's continuation count *after* this settle — unchanged for a
+ * usage-limit stop, which is never charged (issue #1219) — and `exhausted` is only ever a
+ * stop attributable to the run itself (a timeout or a stall).
  */
 type CheckpointFallback =
 	| { kind: 'continue'; checkpoint: Checkpoint; continuationCount: number }
@@ -742,7 +752,8 @@ type CheckpointFallback =
  * a resumable session can still serve — so this only ever *adds* a path for stops
  * that would otherwise restart the phase from scratch. Everything after that gate is
  * evidence gathering: a parseable checkpoint that names this phase, and the run's
- * remaining continuation budget.
+ * remaining continuation budget — which a provider-side stop (a usage limit) never
+ * spends and is never ended by (issue #1219).
  *
  * The checkpoint has two sources and one meaning. A federated worker parsed the file
  * on its own host and reported it in the deferral frame (`AgentRunError.checkpoint`,
@@ -793,6 +804,14 @@ async function resolveCheckpointFallback(
 			error: describeError(readErr),
 		});
 		return { kind: 'release' };
+	}
+	// A usage limit is the provider's stop, not the run's (issue #1219): the work is
+	// progressing and the account resets at a known time, so it neither spends a
+	// continuation nor is ended by a spent budget — the continuation is re-attempted
+	// at the reset, on the same count. The budget bounds a run that keeps stopping
+	// *on its own* (a timeout, a stall); `MAX_RATE_LIMIT_RETRIES` still bounds this.
+	if (err.failure.kind === 'rate-limit') {
+		return { kind: 'continue', checkpoint, continuationCount: spent };
 	}
 	const max = resolveMaxContinuations(project);
 	if (spent >= max) return { kind: 'exhausted', spent, max };
@@ -851,7 +870,9 @@ function deferAgentRunError(
 	// The Tier 2 bound sits with the other caps rather than in the settle: a run that
 	// has already spent every continuation the project allows must fall through to a
 	// terminal failure, which the caller reports as an exhausted continuation budget.
-	// Checked first because it is the more specific of the two exhausted budgets.
+	// Checked first because it is the more specific of the two exhausted budgets. A
+	// usage-limit stop never reaches it (issue #1219): it is not charged to this budget,
+	// so the rate-limit retry cap below is the only one that can end it.
 	if (checkpointFallback?.kind === 'exhausted') {
 		logger.error(`Phase failed - ${phaseLabel(trigger.phase)} — continuation budget exhausted`, {
 			projectId,
@@ -3526,6 +3547,7 @@ async function finalizeFailedRun(
 		// cancellation, `undefined` when this failure isn't a cancellation at all
 		// (leaves the column untouched — see `CompleteRunInput.cancellation`).
 		let cancellationOrigin: CancellationOrigin | null | undefined;
+		let isCancelled = false;
 
 		if (err instanceof BlockedRecoveryError) {
 			recoveryVal = {
@@ -3533,7 +3555,7 @@ async function finalizeFailedRun(
 				blockedReason: err.reason,
 			};
 		} else {
-			const isCancelled = runId ? await isRunCancellationRequested(runId) : false;
+			isCancelled = runId ? await isRunCancellationRequested(runId) : false;
 			if (isCancelled && runId) {
 				cancellationOrigin = await getRunCancellationOrigin(runId);
 				const run = await getRunByIdFromDb(runId);
@@ -3583,6 +3605,13 @@ async function finalizeFailedRun(
 		// A cancellation that kept the checkout for its session leaves the same
 		// machine-local state a deferral does, so it pins the same way (issue #567).
 		if (recoveryVal?.state === 'preserved') await recordPreservedWorker(runId);
+		// A terminal failure Tier 2 judged continuable left this phase's checkpoint in a
+		// preserved checkout (issue #1219), so it is pinned the same way, after the
+		// `null` write above that would otherwise erase it. `runs.worker_id` is the right
+		// machine: a continuation is only ever dispatched pinned to its preserved
+		// machine, and a first attempt preserved its own checkout. A cancellation is
+		// left to the reconcile above, which decides that checkout's fate.
+		if (outcome.preservesCheckpoint && !isCancelled) await recordPreservedWorker(runId);
 		// An Implementation attempt that provisioned its task branch leaves that branch
 		// on its own machine whatever became of the checkout, and "Retry now" reuses it
 		// (issue #1197). So the holder is re-recorded after the `null` write above;
@@ -4804,6 +4833,15 @@ async function handlePhaseFailure(
 			isDeferrable && err instanceof AgentRunError
 				? carriedContinuationFor(err.failure, job)
 				: undefined,
+		// Tier 2 judged this stop continuable — an exhausted continuation budget, or a
+		// `continue` verdict whose retry budget is spent — so the checkout and this
+		// phase's checkpoint are still on the attempt's machine (issue #1219). `release`
+		// is excluded because that checkout was just released, and `undefined` because
+		// no checkpoint of this phase was found (or the stop was not deferrable at all).
+		preservesCheckpoint:
+			checkpointFallback?.kind === 'exhausted' ||
+			checkpointFallback?.kind === 'continue' ||
+			undefined,
 	};
 }
 

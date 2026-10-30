@@ -303,8 +303,9 @@ export const runs = pgTable(
 		/**
 		 * How many times this run has already been continued from a checkpoint. The
 		 * bound on the Tier 2 fallback: once it reaches the project's
-		 * `pipeline.maxContinuations`, the next involuntary stop fails terminally
-		 * ("continuation budget exhausted") instead of handing off again. Deliberately
+		 * `pipeline.maxContinuations`, the next timeout or stall fails terminally
+		 * ("continuation budget exhausted") instead of handing off again; a usage-limit
+		 * stop is never charged (issue #1219). Deliberately
 		 * **not** cleared by a retry ({@link resetRunToRunning}) — that would unbound
 		 * the loop — only by "Reset & restart" ({@link clearRunRecovery}).
 		 */
