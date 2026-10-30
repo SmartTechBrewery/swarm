@@ -9301,6 +9301,116 @@ describe('processJob', () => {
 				expect.objectContaining({ status: 'checkpointed', continuationCount: 1 }),
 			);
 		});
+
+		// Issue #1219: a stop Tier 2 judged continuable that still ends the run leaves
+		// this phase's checkpoint in a preserved checkout on the attempt's machine. The
+		// failed settle writes `recovery: null`, so the pin is re-recorded after it —
+		// otherwise "Retry now" would drop the inherited checkpoint continuation.
+		it('keeps the machine pin when a checkpoint continuation times out at the budget', async () => {
+			getRunByIdFromDb.mockResolvedValue({ continuationCount: 2 });
+			phaseImpl = stoppedRun({ checkpoint: CHECKPOINT, kind: 'timeout' });
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ runId: 'run-1', recoveryMode: 'checkpoint' }),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome).toMatchObject({
+				status: 'phase-failed',
+				preservesCheckpoint: true,
+				failureDiagnosis: { kind: 'continuation-budget-exhausted' },
+			});
+			expect(completeRun).toHaveBeenCalledExactlyOnceWith(
+				'run-1',
+				expect.objectContaining({ status: 'failed', recovery: null }),
+			);
+			expect(recordRunPreservedWorker).toHaveBeenCalledExactlyOnceWith('run-1');
+			// After the `null` write, which would otherwise erase it.
+			expect(recordRunPreservedWorker.mock.invocationCallOrder[0]).toBeGreaterThan(
+				completeRun.mock.invocationCallOrder[0],
+			);
+		});
+
+		it('keeps the machine pin when a continuable stop spends the retry budget', async () => {
+			getRunByIdFromDb.mockResolvedValue({ continuationCount: 1 });
+			phaseImpl = stoppedRun({ checkpoint: CHECKPOINT, kind: 'timeout' });
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({
+					runId: 'run-1',
+					recoveryMode: 'checkpoint',
+					rateLimitRetryAttempt: 6,
+				}),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome).toMatchObject({ status: 'phase-failed', preservesCheckpoint: true });
+			expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+			expect(completeRun).toHaveBeenCalledExactlyOnceWith(
+				'run-1',
+				expect.objectContaining({ status: 'failed', recovery: null }),
+			);
+			expect(recordRunPreservedWorker).toHaveBeenCalledExactlyOnceWith('run-1');
+		});
+
+		it('records no pin for a non-deferrable failure of a checkpoint continuation', async () => {
+			getRunByIdFromDb.mockResolvedValue({ continuationCount: 1 });
+			phaseImpl = async () => {
+				throw new AgentRunError(
+					'respond-to-ci agent (claude) exited with code 1',
+					{ kind: 'error' },
+					agentResult({ exitCode: 1 }),
+					CHECKPOINT,
+				);
+			};
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ runId: 'run-1', recoveryMode: 'checkpoint' }),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-failed');
+			expect(outcome).not.toHaveProperty('preservesCheckpoint', true);
+			expect(recordRunPreservedWorker).not.toHaveBeenCalled();
+		});
+
+		it('records no pin for another phase’s checkpoint at retry exhaustion', async () => {
+			getRunByIdFromDb.mockResolvedValue({ continuationCount: 1 });
+			phaseImpl = stoppedRun({ checkpoint: { ...CHECKPOINT, phase: 'implementation' } });
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ runId: 'run-1', rateLimitRetryAttempt: 6 }),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-failed');
+			expect(outcome).not.toHaveProperty('preservesCheckpoint', true);
+			expect(recordRunPreservedWorker).not.toHaveBeenCalled();
+		});
+
+		// A cancellation that lands between the failure's classification and its settle:
+		// the reconcile decides that checkout's fate, so the settle adds no pin of its own.
+		it('records no pin when the continuable failure settles as a cancellation', async () => {
+			getRunByIdFromDb.mockResolvedValue({ continuationCount: 2 });
+			isRunCancellationRequested
+				.mockResolvedValueOnce(false)
+				.mockResolvedValueOnce(false)
+				.mockResolvedValue(true);
+			phaseImpl = stoppedRun({ checkpoint: CHECKPOINT, kind: 'timeout' });
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ runId: 'run-1', recoveryMode: 'checkpoint' }),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome).toMatchObject({ status: 'phase-failed', preservesCheckpoint: true });
+			expect(completeRun).toHaveBeenCalledExactlyOnceWith(
+				'run-1',
+				// `null` is a marker-only cancellation — the settle saw the marker.
+				expect.objectContaining({ status: 'failed', cancellation: null }),
+			);
+			expect(recordRunPreservedWorker).not.toHaveBeenCalled();
+		});
 	});
 });
 
