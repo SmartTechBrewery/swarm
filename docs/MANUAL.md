@@ -861,7 +861,10 @@ The **Tickets in progress** section of the Runs screen, between Stalled and the
 Queue, shows how full each repository is (issue #1192; called "WIP" until #1204). Its
 heading counts the tickets holding a slot, `Tickets in progress (n)`, and adds
 `(n waiting on you)` when any need you. A repository row reads `x / y in flight`
-and, when new tickets are held back, `n waiting`; under it is every ticket holding a
+and, when new tickets are held back, `n waiting`, plus `Tickets in queue: n` — cards
+carrying the automation label (`swarm` by default) on the board outside Backlog and
+Done that hold no slot yet. That count comes from a whole-board read cached for five
+minutes per project, and is left out when the board cannot be read. Under the row is every ticket holding a
 slot — its card, its pull request once it has one, how long it has been in flight, and
 what it is doing. A ticket the pipeline cannot move on its own carries a **Waiting on you** badge
 with the reason: its plan is waiting for your greenlight (move the card to Ready), its

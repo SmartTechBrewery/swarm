@@ -7,6 +7,7 @@ import { trpc } from '@/lib/trpc.js';
 import {
 	WIP_SECTION_EXPLANATION,
 	WIP_SECTION_TITLE,
+	wipBoardQueueLabel,
 	wipInFlightLabel,
 	wipOperatorReasonLabel,
 	wipPipelineReasonLabel,
@@ -160,6 +161,7 @@ export function WipUsageSection({ entries, showProject = true }: WipUsageSection
 								<div className="flex items-center gap-2 text-xs">
 									<span className="font-semibold text-zinc-100">{wipInFlightLabel(entry)}</span>
 									{entry.waiting > 0 && <Badge>{entry.waiting} waiting</Badge>}
+									{entry.boardQueued !== undefined && <Badge>{wipBoardQueueLabel(entry)}</Badge>}
 								</div>
 							</div>
 							{entry.tickets.length > 0 ? (

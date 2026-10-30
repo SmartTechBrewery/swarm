@@ -2,6 +2,7 @@ import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 
 import {
+	defaultProjectRepository,
 	findProjectRepository,
 	resolveWipLimit,
 	scopeProjectToRepository,
@@ -54,7 +55,7 @@ import {
 	recordStalledDismissal,
 } from '../../db/repositories/stalledDismissalsRepository.js';
 import { getUserById } from '../../db/repositories/usersRepository.js';
-import { listWipSlots } from '../../db/repositories/wipSlotsRepository.js';
+import { listWipSlots, type WipSlotRow } from '../../db/repositories/wipSlotsRepository.js';
 import { classifyDispatchClaim } from '../../dispatch/claim-liveness.js';
 import {
 	cancelDispatchAndWake,
@@ -87,12 +88,14 @@ import { releasePutBackTicketSlot } from '../../dispatch/wip-limit.js';
 import { AgentCliSchema } from '../../harness/agent-cli.js';
 import { ReasoningLevelSchema } from '../../harness/models.js';
 import { getWorker, getWorkers } from '../../identity/worker-service.js';
-import { getPMProvider } from '../../integrations/pm/registry.js';
+import { getPMProvider, requireProjectPMProvider } from '../../integrations/pm/registry.js';
 import { requireProjectSCMProvider } from '../../integrations/scm/registry.js';
 import { describeError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
 import { type Checkpoint, resolveMaxContinuations } from '../../pipeline/checkpoint.js';
+import { resolveAutomationLabel } from '../../pm/automation-label.js';
 import { resolvePipelinePhaseForStatusKey } from '../../pm/pipeline.js';
+import { cachedBoardItems, countBoardQueue } from '../../queue/board-queue.js';
 import {
 	type CancellationOrigin,
 	clearRunCancellation,
@@ -1311,6 +1314,55 @@ function wipLimitFrom(records: Map<string, ProjectRecord>) {
 }
 
 /**
+ * Each entry's `boardQueued` count (`src/queue/board-queue.ts`), from one cached
+ * board read per project. A project whose board cannot be read keeps its entries
+ * without the count rather than failing the view.
+ */
+async function withBoardQueue(
+	entries: WipUsageEntry[],
+	records: Map<string, ProjectRecord>,
+	slots: readonly WipSlotRow[],
+): Promise<WipUsageEntry[]> {
+	const projectIds = [...new Set(entries.map((entry) => entry.projectId))];
+	const boards = new Map(
+		await Promise.all(
+			projectIds.map(async (projectId) => {
+				const record = records.get(projectId);
+				if (!record) return [projectId, undefined] as const;
+				try {
+					const items = await cachedBoardItems(projectId, () =>
+						requireProjectPMProvider(scopeProjectToRepository(record)).listWorkItems(),
+					);
+					return [projectId, items] as const;
+				} catch (error) {
+					logger.warn('runs.wip: board read failed; listing that project without its queue', {
+						projectId,
+						error: describeError(error),
+					});
+					return [projectId, undefined] as const;
+				}
+			}),
+		),
+	);
+	return entries.map((entry) => {
+		const record = records.get(entry.projectId);
+		const items = boards.get(entry.projectId);
+		if (!record || !items) return entry;
+		const boardQueued = countBoardQueue(items, {
+			repository: entry.repository,
+			isDefaultRepository: defaultProjectRepository(record).repo === entry.repository,
+			label: resolveAutomationLabel(record.pipeline),
+			heldWorkItemIds: new Set(
+				slots
+					.filter((slot) => slot.projectId === entry.projectId && slot.workItemId)
+					.map((slot) => slot.workItemId as string),
+			),
+		});
+		return { ...entry, boardQueued };
+	});
+}
+
+/**
  * Assemble the `runs.wip` read model (issue #1192) for `projectIds` (every project
  * when absent) from its four bounded reads, and link each holder's pull request in
  * its project's own provider grammar. Postgres only, like `runs.stalled`.
@@ -1346,7 +1398,7 @@ async function loadWipUsage(
 		new Map(records.map((record) => [record.id, scopeProjectToRepository(record)])),
 		'runs.wip',
 	);
-	return entries.map((entry) => ({
+	const linked = entries.map((entry) => ({
 		...entry,
 		tickets: entry.tickets.map((ticket) => {
 			const pullRequestUrl = ticket.prNumber ? resolve(entry.projectId) : null;
@@ -1355,6 +1407,7 @@ async function loadWipUsage(
 				: ticket;
 		}),
 	}));
+	return withBoardQueue(linked, recordsById, slots);
 }
 
 /**
