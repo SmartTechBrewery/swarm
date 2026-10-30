@@ -84,6 +84,36 @@ export async function isSwarmManagedPullRequest(
 }
 
 /**
+ * Why the gate turned a pull request away, in the operator's words (issue #1248)
+ * — the reason a retried Review or Resolve-conflicts run records. A head branch
+ * the repository's naming no longer recognises names the lever outright: it is
+ * what a branch stops matching when that naming changes, and nothing else on the
+ * run would point there.
+ */
+export function describeUnmanagedPullRequest(
+	prNumber: string | number,
+	headBranch: string | undefined,
+	decision: Extract<SwarmManagedPrResult, { managed: false }>,
+): string {
+	if (decision.reason === 'no-run') {
+		return (
+			`The head branch \`${headBranch}\` of pull request #${prNumber} names task ` +
+			`${decision.taskId}, but SWARM has no Implementation run for that task in this project, ` +
+			'so it does not treat the pull request as its own.'
+		);
+	}
+	if (!headBranch) {
+		return `Pull request #${prNumber} reports no head branch, so SWARM cannot tell whether it is one of its own.`;
+	}
+	return (
+		`The head branch \`${headBranch}\` of pull request #${prNumber} is not a SWARM task branch ` +
+		"under this repository's branch naming (its `branchPattern`, or the legacy " +
+		'`<branchPrefix><taskId>` shape), so SWARM does not treat the pull request as its own. ' +
+		"Check the repository's branch naming under Source Control → Repositories."
+	);
+}
+
+/**
  * {@link isSwarmManagedPullRequest}'s answer with its one failure mode
  * classified rather than thrown.
  */
