@@ -281,7 +281,10 @@ export type JobOutcome =
 			 * The wake-up's dispatch record refused the claim (cancelled, completed,
 			 * superseded, held elsewhere, or a duplicate attempt for a run that
 			 * already has one) — the delivery is dropped without touching anything
-			 * (issue #284): terminal dispatch states cannot be resurrected.
+			 * (issue #284): terminal dispatch states cannot be resurrected. Also a
+			 * second concurrent delivery of an attempt this process is already
+			 * executing (`reason: 'redelivered'`, issue #1208), which the claim's
+			 * same-owner re-claim lets through.
 			 */
 			status: 'dispatch-refused';
 			reason: string;
@@ -2001,6 +2004,21 @@ async function handlePullRequestInFlight(
  */
 const inFlightPhaseByTask = new Map<string, InFlightPhase>();
 
+/**
+ * The dispatch attempts this process is executing: dispatch id → the `wakeSeq` the
+ * claim returned (issue #1208).
+ *
+ * `claimDispatch` lets the lease's own owner re-claim a `leased` row, and the router is
+ * one owner running wake jobs concurrently, so two wake jobs for one dispatch can both
+ * claim it. Every hand-back from `leased`/`running` to a wakeable state bumps
+ * `wake_seq` and the claim never does, so the same `(id, wakeSeq)` is **one attempt
+ * delivered twice** — the second copy is dropped — while a higher `wakeSeq` is that
+ * dispatch's next attempt, which {@link claimTaskForPhase} makes wait for the earlier
+ * one to release the checkout. In-process is enough: another owner's lease is refused
+ * by the claim itself, and the router is the queue's only consumer.
+ */
+const executingDispatchAttempts = new Map<string, number>();
+
 /** The in-process holder of one task's checkout: which phase, and on which dispatch. */
 interface InFlightPhase {
 	phase: TriggerPhase;
@@ -2018,8 +2036,10 @@ interface TaskHold {
 	 * True when the hold comes from an in-process entry whose own dispatch has already
 	 * settled (issue #858): the phase is no longer claimable there, so a same-phase
 	 * collision is a *replacement* waiting for the parked job to release the checkout,
-	 * not a repeated delivery to drop. Never true for a durable hold, which reads
-	 * `leased`/`running` rows only — a cancelled dispatch already stops holding those.
+	 * not a repeated delivery to drop. Also true when the in-process holder is an
+	 * earlier attempt of the claiming dispatch itself (issue #1208). Never true for a
+	 * durable hold, which reads `leased`/`running` rows only — a cancelled dispatch
+	 * already stops holding those.
 	 */
 	releasing: boolean;
 }
@@ -2240,7 +2260,10 @@ async function findPullRequestHold(
  * a parked job, so a same-phase hit whose holding dispatch has already settled reports
  * `releasing` and the caller makes the collision **wait** instead of dropping it. The
  * hold itself is not weakened: it still refuses the claim, so two attempts can never
- * run against one checkout.
+ * run against one checkout. A holder on the claiming dispatch's own id is always an
+ * earlier attempt of it (issue #1208 — `processJob` drops a second delivery of the
+ * same attempt), so it reports `releasing` without the liveness read, which would
+ * only see this attempt's own claim.
  *
  * The verdict is discriminated rather than a bare hold because the two kinds settle
  * differently, and because both refusals return *before* the map entry is taken —
@@ -2266,13 +2289,25 @@ async function claimTaskForPhase(
 		? undefined
 		: await findPullRequestHold(project.id, pullRequestRefForTrigger(project, trigger), dispatchId);
 	// Only the *same*-phase collision is dropped rather than deferred, so only it is
-	// worth one row read (issue #858); every other caller pays nothing.
+	// worth one row read (issue #858); every other caller pays nothing. A holder on this
+	// very dispatch is skipped too: the row it would read is this attempt's own claim.
 	const peekedReleasing =
-		peeked !== undefined && peeked.phase === trigger.phase
+		peeked !== undefined && peeked.phase === trigger.phase && peeked.dispatchId !== dispatchId
 			? !(await isInFlightHolderLive(peeked))
 			: false;
 	// Synchronous from here to the `set` below.
 	const holding = inFlightPhaseByTask.get(trigger.taskId);
+	if (holding !== undefined && holding.dispatchId === dispatchId) {
+		// An earlier attempt of this same dispatch (issue #1208) — `processJob` already
+		// dropped a second delivery of *this* attempt, so a same-id holder is one that
+		// settled and is still releasing the checkout in its `finally`, or a parked job a
+		// stale takeover replaced. Whatever its phase, this attempt waits for it.
+		return {
+			claimed: false,
+			kind: 'task',
+			hold: { phase: holding.phase, executing: false, releasing: true },
+		};
+	}
 	if (holding !== undefined) {
 		// The verdict above belongs to the entry we peeked. A different entry now means
 		// the holder changed under us, which is a live claim by definition — and an entry
@@ -5485,6 +5520,39 @@ export async function processJob(
 		return { status: 'dispatch-refused', reason: claim.reason };
 	}
 	const dispatch = claim.dispatch;
+	// One attempt delivered twice (issue #1208): the claim's same-owner re-claim hands a
+	// second concurrent wake job the dispatch this process is already executing. Checked
+	// and set with nothing awaited in between, and dropped before trigger resolution, so
+	// the copy creates no run, takes no Review PR+SHA claim and settles nothing — the
+	// surviving attempt keeps the row to complete or retry.
+	if (executingDispatchAttempts.get(dispatch.id) === dispatch.wakeSeq) {
+		logger.info('Dropping a second delivery of a dispatch attempt already executing here', {
+			projectId: job.projectId,
+			dispatchId: dispatch.id,
+			wakeSeq: dispatch.wakeSeq,
+		});
+		return { status: 'dispatch-refused', reason: 'redelivered' };
+	}
+	executingDispatchAttempts.set(dispatch.id, dispatch.wakeSeq);
+	try {
+		return await processClaimedDispatch(dispatch, job, registry, signal, executionIdentity, deps);
+	} finally {
+		// A later attempt of the same dispatch may have replaced the entry; leave that one.
+		if (executingDispatchAttempts.get(dispatch.id) === dispatch.wakeSeq) {
+			executingDispatchAttempts.delete(dispatch.id);
+		}
+	}
+}
+
+/** {@link processJob}'s body once the dispatch is claimed and the attempt is this process's own. */
+async function processClaimedDispatch(
+	dispatch: DispatchRow,
+	job: SwarmJob,
+	registry: TriggerRegistry,
+	signal: AbortSignal | undefined,
+	executionIdentity: WorkerExecutionIdentity | undefined,
+	deps: ProcessJobDeps,
+): Promise<JobOutcome> {
 	deps.onDispatchClaimed?.(dispatch.id);
 	try {
 		// The dispatch row's stored payload is authoritative — a manual retry's
@@ -5667,6 +5735,9 @@ export async function processJob(
 	//   parked job to release the checkout instead of being dropped as a duplicate —
 	//   which is what used to settle the run `failed` on the restart Reset had just
 	//   reported.
+	// - **The same dispatch, an earlier attempt still releasing** (issue #1208) — its
+	//   next wake-up published before the earlier job's `finally` cleared the entry.
+	//   It waits as `task-in-flight` too, whatever the phase.
 	// - **A different phase, executing** — the pipeline advancing through one shared
 	//   checkout. `taskId` is deliberately shared by the sequential board-driven pair
 	//   (issue #498), so "Planning finished, the operator moved the card to ToDo"
