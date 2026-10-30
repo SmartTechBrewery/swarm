@@ -17,8 +17,11 @@ import {
 } from '../db/repositories/projectsRepository.js';
 import { requireProjectPMCredentialRole } from '../integrations/pm/registry.js';
 import { getSCMProvider } from '../integrations/scm/registry.js';
+import {
+	requireScopedOperatorCredential,
+	scopedOperatorCredential,
+} from '../scm/operator-credential.js';
 import type { ScmCredentialRole, ScmPersona, ScmType } from '../scm/types.js';
-import { getOperatorGitHubTokenOrNull, OPERATOR_GH_TOKEN_ENV } from './operator-token.js';
 import { pmCredentialReferenceFor } from './pm-credentials.js';
 import type { ProjectConfig } from './schema.js';
 import { scmCredentialReferenceFor, sharedScmCredentialProviderFor } from './scm-credentials.js';
@@ -159,26 +162,25 @@ export async function requireScmCredential(
  * Resolve a persona's GitHub token for a project, or `null` if it resolves to no
  * token.
  *
- * **This pair is GitHub's**, not a provider-neutral seam: the `implementer` branch
- * returns the *GitHub* operator token, and the `reviewer` branch resolves GitHub's own
- * per-provider reference since issue #628. Bitbucket and GitLab have their own twins
- * in their provider folders (`src/integrations/scm/{bitbucket,gitlab}/credentials.ts`)
- * for exactly that reason.
+ * **This pair is GitHub's**, not a provider-neutral seam: the `reviewer` branch
+ * resolves GitHub's own per-provider reference since issue #628. Bitbucket, GitLab and
+ * Azure DevOps have their own twins in their provider folders
+ * (`src/integrations/scm/<provider>/credentials.ts`) for exactly that reason.
  *
- * The two personas resolve from *different* sources (issue #396): the
- * `implementer` is the worker operator's own token, a worker-local env var
- * (`SWARM_OPERATOR_GH_TOKEN`, `./operator-token.ts`) that is never persisted and
- * never in the project config; the `reviewer` stays a project-scoped credential
- * *reference* resolved from the secret store. The implementer/reviewer split is the
- * whole point (ai/CODING_STANDARDS.md "Loop prevention"): the two personas must
- * resolve to two distinct identities so neither reacts to its own output — here the
- * author (operator) ≠ reviewer.
+ * The two personas resolve from *different* sources: the `reviewer` is a
+ * project-scoped credential *reference* resolved from the secret store, and the
+ * `implementer` is never the control plane's own (issue #1249) — it is the stored
+ * credential of the operator a write is being made for, bound by
+ * `withOperatorCredential` (`src/scm/operator-credential.ts`), and `null` outside
+ * that scope. The implementer/reviewer split is the whole point
+ * (ai/CODING_STANDARDS.md "Loop prevention"): the PR's author (an operator) is never
+ * the account that reviews it.
  */
 export async function getPersonaTokenOrNull(
 	project: ProjectConfig,
 	persona: ScmPersona,
 ): Promise<string | null> {
-	if (persona === 'implementer') return getOperatorGitHubTokenOrNull();
+	if (persona === 'implementer') return scopedOperatorCredential();
 	return resolveScmCredentialOrNull(project, 'github', persona);
 }
 
@@ -298,8 +300,8 @@ export class MissingPmCredentialError extends Error {
  * that cannot run without it, worded like {@link getPersonaToken} so the message
  * names both the role and the ways it can be supplied.
  *
- * It never falls back to an SCM credential — in particular not to the worker-local
- * operator token (`SWARM_OPERATOR_GH_TOKEN`), which is a source-control identity
+ * It never falls back to an SCM credential — in particular not to an operator's own
+ * source-control credential, which is an SCM identity rather than a board one
  * (issue #537). A project whose board credential is unconfigured fails here,
  * loudly, rather than silently borrowing whichever token the host happens to hold.
  */
@@ -326,20 +328,14 @@ export async function requirePmCredential(project: ProjectConfig, role: string):
  * token — an operation that needs a persona token but has none configured is a
  * deployment error, not a soft "not found" (ai/CODING_STANDARDS.md "Error
  * handling"). The message points at the persona's actual source: the operator
- * env var for the implementer, and — via {@link requireScmCredential} — GitHub's own
- * per-provider credential reference for the reviewer.
+ * credential in scope for the implementer (`requireScopedOperatorCredential`), and —
+ * via {@link requireScmCredential} — GitHub's own per-provider credential reference
+ * for the reviewer.
  */
 export async function getPersonaToken(
 	project: ProjectConfig,
 	persona: ScmPersona,
 ): Promise<string> {
-	if (persona === 'implementer') {
-		const token = await getOperatorGitHubTokenOrNull();
-		if (token) return token;
-		throw new Error(
-			`No GitHub implementer token configured: set ${OPERATOR_GH_TOKEN_ENV} on this host ` +
-				"(the worker operator's own token; never stored in project_credentials)",
-		);
-	}
+	if (persona === 'implementer') return requireScopedOperatorCredential('GitHub');
 	return requireScmCredential(project, 'github', persona);
 }

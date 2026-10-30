@@ -53,16 +53,10 @@ import {
 	updatePullRequestBranchDirect,
 	withGitHubToken,
 } from '@/integrations/scm/github/client.js';
-import {
-	_resetPersonaIdentityCache,
-	getPersonaForLogin,
-	isSwarmBot,
-} from '@/integrations/scm/github/personas.js';
+import { _resetPersonaIdentityCache, isReviewerLogin } from '@/integrations/scm/github/personas.js';
 import { GitHubSCMIntegration } from '@/integrations/scm/github/scm-integration.js';
-import type { ScmPersonaIdentities } from '@/scm/types.js';
 
 const project = createMockProjectConfig();
-const IDENTITIES: ScmPersonaIdentities = { implementer: 'swarm-impl', reviewer: 'swarm-rev' };
 
 describe('GitHubSCMIntegration', () => {
 	const scm = new GitHubSCMIntegration();
@@ -134,57 +128,32 @@ describe('GitHubSCMIntegration', () => {
 		});
 	});
 
-	describe('persona/actor resolution (SCMProvider contract wrappers)', () => {
+	describe('reviewer identity + actor check (SCMProvider contract wrappers)', () => {
 		beforeEach(() => {
 			_resetPersonaIdentityCache();
 		});
 
-		it('resolves both persona identities from their own tokens', async () => {
+		it('resolves the reviewer identity from the reviewer token alone', async () => {
 			vi.mocked(getPersonaTokenOrNull).mockImplementation(async (_p, persona) => `tok-${persona}`);
 			vi.mocked(getGitHubUserForToken).mockImplementation(async (token) =>
-				token === 'tok-implementer' ? 'swarm-impl' : 'swarm-rev',
+				token === 'tok-reviewer' ? 'swarm-rev' : 'someone-else',
 			);
-			await expect(scm.resolvePersonaIdentities(project)).resolves.toEqual(IDENTITIES);
+			await expect(scm.resolveReviewerIdentity(project)).resolves.toBe('swarm-rev');
+			expect(getPersonaTokenOrNull).not.toHaveBeenCalledWith(project, 'implementer');
 		});
 
-		it('propagates the throw when an identity cannot be resolved', async () => {
+		it('propagates the throw when the reviewer identity cannot be resolved', async () => {
 			vi.mocked(getPersonaTokenOrNull).mockResolvedValue('tok');
 			vi.mocked(getGitHubUserForToken).mockResolvedValue(null);
-			await expect(scm.resolvePersonaIdentities(project)).rejects.toThrow(/implementer/);
+			await expect(scm.resolveReviewerIdentity(project)).rejects.toThrow(/reviewer/);
 		});
 
-		it('personaForActor answers the same as the module-level mapping, bot suffix included', () => {
-			for (const login of [
-				'swarm-impl',
-				'swarm-impl[bot]',
-				'swarm-rev',
-				'swarm-rev[bot]',
-				'human',
-			]) {
-				expect(scm.personaForActor(login, IDENTITIES)).toBe(getPersonaForLogin(login, IDENTITIES));
+		it('isReviewerActor answers the same as the module-level check, bot suffix included', () => {
+			for (const login of ['swarm-rev', 'swarm-rev[bot]', 'operator-alice', 'human']) {
+				expect(scm.isReviewerActor(login, 'swarm-rev')).toBe(isReviewerLogin(login, 'swarm-rev'));
 			}
-			expect(scm.personaForActor('swarm-rev[bot]', IDENTITIES)).toBe('reviewer');
-			expect(scm.personaForActor('human', IDENTITIES)).toBeNull();
-		});
-
-		it('isSwarmActor answers the same as the module-level bot check', () => {
-			for (const login of ['swarm-impl', 'swarm-rev[bot]', 'human']) {
-				expect(scm.isSwarmActor(login, IDENTITIES)).toBe(isSwarmBot(login, IDENTITIES));
-			}
-			expect(scm.isSwarmActor('swarm-impl[bot]', IDENTITIES)).toBe(true);
-			expect(scm.isSwarmActor('human', IDENTITIES)).toBe(false);
-		});
-
-		it('returns true when actor matches implementer/operator identity, showing why it cannot serve as an event drop gate (#397/#443)', () => {
-			// Under the federated model (ADR-004 §3), the implementer identity is the worker
-			// operator's own account. isSwarmActor returns true for it, which means an event drop
-			// gate based on login would silently drop human-authored events. Drop gates use
-			// SWARM-origin markers (#443) and work-item origin (#397) instead.
-			const federatedIdentities: ScmPersonaIdentities = {
-				implementer: 'jkwiecien',
-				reviewer: 'swarm-rev[bot]',
-			};
-			expect(scm.isSwarmActor('jkwiecien', federatedIdentities)).toBe(true);
+			expect(scm.isReviewerActor('swarm-rev[bot]', 'swarm-rev')).toBe(true);
+			expect(scm.isReviewerActor('operator-alice', 'swarm-rev')).toBe(false);
 		});
 	});
 
@@ -230,22 +199,20 @@ describe('GitHubSCMIntegration', () => {
 			vi.mocked(getBranchHead).mockResolvedValue('base-head-sha');
 		});
 
-		// The implementer rather than `getAggregateCheckStatus`'s reviewer: a
-		// repository-level read, whose caller today is a router sweep holding only
-		// the operator's own credential.
-		it('reads under the implementer persona by default, with owner/repo split from project.repo', async () => {
-			vi.mocked(getPersonaToken).mockResolvedValue('tok-impl');
+		// The reviewer, like every read the control plane makes (issue #1249).
+		it('reads under the reviewer persona by default, with owner/repo split from project.repo', async () => {
+			vi.mocked(getPersonaToken).mockResolvedValue('tok-rev');
 			await expect(scm.getBranchHead(project, 'main')).resolves.toBe('base-head-sha');
 
-			expect(getPersonaToken).toHaveBeenCalledWith(project, 'implementer');
-			expect(withGitHubToken).toHaveBeenCalledWith('tok-impl', expect.any(Function));
+			expect(getPersonaToken).toHaveBeenCalledWith(project, 'reviewer');
+			expect(withGitHubToken).toHaveBeenCalledWith('tok-rev', expect.any(Function));
 			expect(getBranchHead).toHaveBeenCalledWith('SmartTechBrewery', 'swarm', 'main');
 		});
 
 		it('honours an explicit persona override', async () => {
-			vi.mocked(getPersonaToken).mockResolvedValue('tok-rev');
-			await scm.getBranchHead(project, 'main', 'reviewer');
-			expect(getPersonaToken).toHaveBeenCalledWith(project, 'reviewer');
+			vi.mocked(getPersonaToken).mockResolvedValue('tok-impl');
+			await scm.getBranchHead(project, 'main', 'implementer');
+			expect(getPersonaToken).toHaveBeenCalledWith(project, 'implementer');
 		});
 	});
 

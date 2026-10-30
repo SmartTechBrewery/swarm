@@ -31,6 +31,7 @@ import {
 // credential" errors below name — the criterion that a project asked for GitLab is
 // told about GitLab, never handed GitHub's secret (issue #628).
 import '@/integrations/entrypoint.js';
+import { withOperatorCredential } from '@/scm/operator-credential.js';
 
 // A pre-#628 config: the legacy shared pair, which the schema's adoption normalizer
 // files under the provider the project runs on (here an unstated `scm`, so GitHub).
@@ -91,15 +92,18 @@ describe('config provider', () => {
 	});
 
 	describe('getPersonaTokenOrNull', () => {
-		it('resolves the implementer persona from the worker-local operator env var', async () => {
-			process.env.SWARM_OPERATOR_GH_TOKEN = 'operator-token';
-			const token = await getPersonaTokenOrNull(project, 'implementer');
+		it('resolves the implementer persona from the operator credential in scope', async () => {
+			const token = await withOperatorCredential('operator-token', () =>
+				getPersonaTokenOrNull(project, 'implementer'),
+			);
 			expect(token).toBe('operator-token');
 			// The implementer never touches project_credentials (issue #396).
 			expect(resolveProjectCredential).not.toHaveBeenCalled();
 		});
 
-		it('returns null for the implementer when the operator env var is unset', async () => {
+		// The retired installation-wide token is never read (issue #1249).
+		it('returns null for the implementer outside a scope, even with the retired env var set', async () => {
+			process.env.SWARM_OPERATOR_GH_TOKEN = 'retired-token';
 			expect(await getPersonaTokenOrNull(project, 'implementer')).toBeNull();
 			expect(resolveProjectCredential).not.toHaveBeenCalled();
 		});
@@ -117,15 +121,17 @@ describe('config provider', () => {
 	});
 
 	describe('getPersonaToken', () => {
-		it('returns the implementer operator token when configured', async () => {
-			process.env.SWARM_OPERATOR_GH_TOKEN = 'operator-token';
-			expect(await getPersonaToken(project, 'implementer')).toBe('operator-token');
+		it('returns the operator credential in scope for the implementer', async () => {
+			await expect(
+				withOperatorCredential('operator-token', () => getPersonaToken(project, 'implementer')),
+			).resolves.toBe('operator-token');
 		});
 
-		it('throws an actionable SWARM_OPERATOR_GH_TOKEN error when the implementer token is unset', async () => {
-			await expect(getPersonaToken(project, 'implementer')).rejects.toThrow(
-				/SWARM_OPERATOR_GH_TOKEN/,
-			);
+		it('throws outside an operator scope, without pointing at an env var', async () => {
+			process.env.SWARM_OPERATOR_GH_TOKEN = 'retired-token';
+			const failure = getPersonaToken(project, 'implementer');
+			await expect(failure).rejects.toThrow('No GitHub implementer credential is in scope');
+			await expect(failure).rejects.not.toThrow(/SWARM_OPERATOR_GH_TOKEN/);
 		});
 
 		it('throws when the reviewer token is not configured', async () => {

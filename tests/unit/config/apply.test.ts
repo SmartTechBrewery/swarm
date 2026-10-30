@@ -49,8 +49,8 @@ describe('applyConfig', () => {
 
 		expect(upsertProjectToDb).toHaveBeenCalledWith(project);
 		expect(result.projects).toEqual(['proj-1']);
-		// The implementer persona is worker-local (SWARM_OPERATOR_GH_TOKEN), never a
-		// project credential (issue #396), and the webhook secret is never seeded from a
+		// The implementer persona is each operator's own stored credential, never a
+		// project credential (issues #396, #1249), and the webhook secret is never seeded from a
 		// shared host environment (issue #900) — so only `reviewer` is stored.
 		expect(result.credentialsWritten).toBe(1);
 		expect(result.credentialsSkipped).toEqual([]);

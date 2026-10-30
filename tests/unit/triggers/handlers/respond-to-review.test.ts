@@ -2,11 +2,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ProjectConfig } from '@/config/schema.js';
 import { REVIEW_VERDICT_CAP } from '@/db/repositories/reviewVerdictsRepository.js';
 import { retireSupersededReviewResponses } from '@/dispatch/review-response-supersession.js';
-import { getPersonaForLogin } from '@/integrations/scm/github/personas.js';
+import { isReviewerLogin } from '@/integrations/scm/github/personas.js';
 import { parseGitHubWebhook } from '@/integrations/scm/github/webhook.js';
 import { gitLabRequestChangesMarker } from '@/integrations/scm/gitlab/review-marker.js';
 import { parseGitLabWebhook } from '@/integrations/scm/gitlab/webhook.js';
-import type { ScmPersonaIdentities } from '@/scm/types.js';
 import { createRespondToReviewTrigger } from '@/triggers/handlers/respond-to-review.js';
 import type { TriggerContext, TriggerDecline } from '@/triggers/types.js';
 import {
@@ -24,16 +23,17 @@ vi.mock('@/dispatch/review-response-supersession.js', () => ({
 }));
 
 const PROJECT = createMockProjectConfig();
-const IDENTITIES: ScmPersonaIdentities = { implementer: 'swarm-impl', reviewer: 'swarm-rev' };
+const REVIEWER = 'swarm-rev';
 const HEAD_SHA = 'deadbeef1234deadbeef1234deadbeef1234dead';
 
-// The handler resolves persona identities through the injected `SCMProvider`, so
-// only identity *resolution* is stubbed (it would otherwise hit the provider's
-// API); the real `personaForActor` mapping runs against these identities, which
-// is what keeps the `[bot]`-suffix case honest.
+// The handler resolves the reviewer identity through the injected `SCMProvider`, so
+// only identity *resolution* is stubbed (it would otherwise hit the provider's API);
+// GitHub's real `isReviewerActor` comparison runs against it, which is what keeps the
+// `[bot]`-suffix case honest. Nothing else is stubbed: the gate needs no implementer
+// credential at all (issue #1249).
 const SCM = createFakeScmProvider({
-	resolvePersonaIdentities: async () => IDENTITIES,
-	personaForActor: getPersonaForLogin,
+	resolveReviewerIdentity: async () => REVIEWER,
+	isReviewerActor: isReviewerLogin,
 });
 
 // The ledger lookups default to the first (non-capping) verdict slot so the
@@ -249,8 +249,22 @@ describe('respond-to-review trigger', () => {
 			expect(await handler.handle(ctx({ actorLogin: 'a-human' }))).toBeNull();
 		});
 
-		it('skips a review authored by the implementer persona', async () => {
-			expect(await handler.handle(ctx({ actorLogin: 'swarm-impl' }))).toBeNull();
+		it('skips a review authored by an operator account (the implementer side)', async () => {
+			expect(await handler.handle(ctx({ actorLogin: 'operator-alice' }))).toBeNull();
+		});
+
+		it('fails closed when the reviewer identity cannot be resolved', async () => {
+			const scm = createFakeScmProvider({
+				resolveReviewerIdentity: async () => {
+					throw new Error('reviewer credential missing');
+				},
+				isReviewerActor: isReviewerLogin,
+			});
+			await expect(
+				handler.handle(
+					createMockScmTriggerContext({ project: PROJECT, scm, event: reviewEvent() }),
+				),
+			).rejects.toThrow('reviewer credential missing');
 		});
 
 		it('recognizes a [bot]-suffixed reviewer login', async () => {
@@ -435,10 +449,10 @@ describe('respond-to-review trigger', () => {
 
 		it('skips the reviewer-persona gate, since the forced event replays SWARM\u2019s own ledger record', async () => {
 			const scm = createFakeScmProvider({
-				resolvePersonaIdentities: async () => {
-					throw new Error('identities should not be resolved for a forced continuation');
+				resolveReviewerIdentity: async () => {
+					throw new Error('the reviewer should not be resolved for a forced continuation');
 				},
-				personaForActor: getPersonaForLogin,
+				isReviewerActor: isReviewerLogin,
 			});
 			const forced = {
 				...createMockScmTriggerContext({

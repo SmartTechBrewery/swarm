@@ -14,13 +14,9 @@ import { getGitHubUserForToken } from '@/integrations/scm/github/client.js';
 import {
 	_resetPersonaIdentityCache,
 	getPersonaForAgentType,
-	getPersonaForLogin,
-	isSwarmBot,
-	type PersonaIdentities,
-	resolvePersonaIdentities,
+	isReviewerLogin,
+	resolveReviewerIdentity,
 } from '@/integrations/scm/github/personas.js';
-
-const IDENTITIES: PersonaIdentities = { implementer: 'swarm-impl', reviewer: 'swarm-rev' };
 
 describe('personas', () => {
 	beforeEach(() => {
@@ -42,74 +38,45 @@ describe('personas', () => {
 		});
 	});
 
-	describe('isSwarmBot', () => {
-		it('recognizes both persona logins', () => {
-			expect(isSwarmBot('swarm-impl', IDENTITIES)).toBe(true);
-			expect(isSwarmBot('swarm-rev', IDENTITIES)).toBe(true);
+	describe('isReviewerLogin', () => {
+		it('recognizes the reviewer login and its [bot]-suffixed App form', () => {
+			expect(isReviewerLogin('swarm-rev', 'swarm-rev')).toBe(true);
+			expect(isReviewerLogin('swarm-rev[bot]', 'swarm-rev')).toBe(true);
 		});
 
-		it('recognizes the [bot]-suffixed App forms', () => {
-			expect(isSwarmBot('swarm-impl[bot]', IDENTITIES)).toBe(true);
-			expect(isSwarmBot('swarm-rev[bot]', IDENTITIES)).toBe(true);
-		});
-
-		it('does not flag a human login', () => {
-			expect(isSwarmBot('some-human', IDENTITIES)).toBe(false);
+		it('does not match any other login', () => {
+			expect(isReviewerLogin('operator-alice', 'swarm-rev')).toBe(false);
+			expect(isReviewerLogin('Swarm-Rev', 'swarm-rev')).toBe(false);
 		});
 	});
 
-	describe('getPersonaForLogin', () => {
-		it('resolves each persona, including the [bot] form', () => {
-			expect(getPersonaForLogin('swarm-impl', IDENTITIES)).toBe('implementer');
-			expect(getPersonaForLogin('swarm-rev[bot]', IDENTITIES)).toBe('reviewer');
-		});
-
-		it('returns null for a non-persona login', () => {
-			expect(getPersonaForLogin('some-human', IDENTITIES)).toBeNull();
-		});
-	});
-
-	describe('resolvePersonaIdentities', () => {
+	describe('resolveReviewerIdentity', () => {
 		const project = createMockProjectConfig();
 
-		it('resolves both persona logins from their tokens', async () => {
-			vi.mocked(getPersonaTokenOrNull).mockImplementation(async (_p, persona) =>
-				persona === 'implementer' ? 'tok-impl' : 'tok-rev',
-			);
-			vi.mocked(getGitHubUserForToken).mockImplementation(async (tok) =>
-				tok === 'tok-impl' ? 'swarm-impl' : 'swarm-rev',
-			);
+		it('resolves the reviewer login from the reviewer token alone', async () => {
+			vi.mocked(getPersonaTokenOrNull).mockResolvedValue('tok-rev');
+			vi.mocked(getGitHubUserForToken).mockResolvedValue('swarm-rev');
 
-			const identities = await resolvePersonaIdentities(project);
-			expect(identities).toEqual(IDENTITIES);
+			await expect(resolveReviewerIdentity(project)).resolves.toBe('swarm-rev');
+			expect(getPersonaTokenOrNull).toHaveBeenCalledWith(project, 'reviewer');
+			expect(getPersonaTokenOrNull).not.toHaveBeenCalledWith(project, 'implementer');
 		});
 
 		it('caches per-project — a second call does not re-resolve', async () => {
 			vi.mocked(getPersonaTokenOrNull).mockResolvedValue('tok');
-			vi.mocked(getGitHubUserForToken).mockResolvedValue('swarm-impl');
+			vi.mocked(getGitHubUserForToken).mockResolvedValue('swarm-rev');
 
-			await resolvePersonaIdentities(project);
+			await resolveReviewerIdentity(project);
 			const callsAfterFirst = vi.mocked(getGitHubUserForToken).mock.calls.length;
-			await resolvePersonaIdentities(project);
+			await resolveReviewerIdentity(project);
 			expect(vi.mocked(getGitHubUserForToken).mock.calls.length).toBe(callsAfterFirst);
 		});
 
-		it('throws when the implementer identity cannot be resolved', async () => {
+		it('throws when the reviewer identity cannot be resolved', async () => {
 			vi.mocked(getPersonaTokenOrNull).mockResolvedValue(null);
 			vi.mocked(getGitHubUserForToken).mockResolvedValue(null);
 
-			await expect(resolvePersonaIdentities(project)).rejects.toThrow(/implementer/);
-		});
-
-		it('throws when only the reviewer identity is missing', async () => {
-			vi.mocked(getPersonaTokenOrNull).mockImplementation(async (_p, persona) =>
-				persona === 'implementer' ? 'tok-impl' : null,
-			);
-			vi.mocked(getGitHubUserForToken).mockImplementation(async (tok) =>
-				tok === 'tok-impl' ? 'swarm-impl' : null,
-			);
-
-			await expect(resolvePersonaIdentities(project)).rejects.toThrow(/reviewer/);
+			await expect(resolveReviewerIdentity(project)).rejects.toThrow(/reviewer/);
 		});
 	});
 });

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createMockProjectConfig } from '../../../../helpers/factories.js';
 
@@ -14,121 +14,84 @@ import { getBitbucketUserForCredential } from '@/integrations/scm/bitbucket/clie
 import { getBitbucketCredentialOrNull } from '@/integrations/scm/bitbucket/credentials.js';
 import {
 	_resetBitbucketPersonaIdentityCache,
-	getBitbucketPersonaForLogin,
-	isSwarmBitbucketActor,
-	resolveBitbucketPersonaIdentities,
+	isBitbucketReviewer,
+	resolveBitbucketReviewerIdentity,
 } from '@/integrations/scm/bitbucket/personas.js';
-import type { ScmPersonaIdentities } from '@/scm/types.js';
 
-const IDENTITIES: ScmPersonaIdentities = { implementer: 'swarm-impl', reviewer: 'swarm-rev' };
 const project = createMockProjectConfig();
 
-/** Both personas resolve to a credential, and each credential to its own login. */
+/** The reviewer resolves to a credential, and that to its own login. */
 function stubHappyPath(): void {
-	vi.mocked(getBitbucketCredentialOrNull).mockImplementation(async (_p, persona) =>
-		persona === 'implementer' ? 'cred-impl' : 'cred-rev',
-	);
-	vi.mocked(getBitbucketUserForCredential).mockImplementation(async (credential) =>
-		credential === 'cred-impl' ? 'swarm-impl' : 'swarm-rev',
-	);
+	vi.mocked(getBitbucketCredentialOrNull).mockResolvedValue('cred-rev');
+	vi.mocked(getBitbucketUserForCredential).mockResolvedValue('swarm-rev');
 }
 
-describe('bitbucket personas', () => {
+describe('bitbucket reviewer identity', () => {
 	beforeEach(() => {
 		_resetBitbucketPersonaIdentityCache();
 		vi.mocked(getBitbucketCredentialOrNull).mockReset();
 		vi.mocked(getBitbucketUserForCredential).mockReset();
 	});
 
-	describe('isSwarmBitbucketActor', () => {
-		it('recognizes both persona logins', () => {
-			expect(isSwarmBitbucketActor('swarm-impl', IDENTITIES)).toBe(true);
-			expect(isSwarmBitbucketActor('swarm-rev', IDENTITIES)).toBe(true);
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	describe('isBitbucketReviewer', () => {
+		it('recognizes the reviewer login, case-insensitively', () => {
+			expect(isBitbucketReviewer('swarm-rev', 'swarm-rev')).toBe(true);
+			expect(isBitbucketReviewer('SWARM-REV', 'swarm-rev')).toBe(true);
 		});
 
-		it('matches case-insensitively — a Bitbucket nickname has no canonical case', () => {
-			expect(isSwarmBitbucketActor('Swarm-Impl', IDENTITIES)).toBe(true);
-		});
-
-		it('does not flag a human login', () => {
-			expect(isSwarmBitbucketActor('some-human', IDENTITIES)).toBe(false);
+		it('does not match an operator account or a human', () => {
+			expect(isBitbucketReviewer('operator-alice', 'swarm-rev')).toBe(false);
+			expect(isBitbucketReviewer('some-human', 'swarm-rev')).toBe(false);
 		});
 	});
 
-	describe('getBitbucketPersonaForLogin', () => {
-		it('maps each persona, case-insensitively', () => {
-			expect(getBitbucketPersonaForLogin('swarm-impl', IDENTITIES)).toBe('implementer');
-			expect(getBitbucketPersonaForLogin('SWARM-REV', IDENTITIES)).toBe('reviewer');
-		});
-
-		it('returns null for a login that is neither persona', () => {
-			expect(getBitbucketPersonaForLogin('some-human', IDENTITIES)).toBeNull();
-		});
-	});
-
-	describe('resolveBitbucketPersonaIdentities', () => {
-		it('resolves both persona logins from their own credentials', async () => {
+	describe('resolveBitbucketReviewerIdentity', () => {
+		it('resolves the reviewer from its own credential alone — no implementer credential', async () => {
 			stubHappyPath();
 
-			await expect(resolveBitbucketPersonaIdentities(project)).resolves.toEqual(IDENTITIES);
+			await expect(resolveBitbucketReviewerIdentity(project)).resolves.toBe('swarm-rev');
+			expect(getBitbucketCredentialOrNull).toHaveBeenCalledWith(project, 'reviewer');
+			expect(getBitbucketCredentialOrNull).not.toHaveBeenCalledWith(project, 'implementer');
 		});
 
 		it('caches per project — a second call does not re-resolve', async () => {
 			stubHappyPath();
 
-			await resolveBitbucketPersonaIdentities(project);
-			const callsAfterFirst = vi.mocked(getBitbucketUserForCredential).mock.calls.length;
-			await resolveBitbucketPersonaIdentities(project);
+			await resolveBitbucketReviewerIdentity(project);
+			await resolveBitbucketReviewerIdentity(project);
 
-			expect(vi.mocked(getBitbucketUserForCredential).mock.calls.length).toBe(callsAfterFirst);
+			expect(vi.mocked(getBitbucketUserForCredential)).toHaveBeenCalledTimes(1);
 		});
 
-		it('re-resolves after the test-only cache reset', async () => {
+		it('re-resolves once the 60s TTL has expired', async () => {
 			stubHappyPath();
+			vi.useFakeTimers();
 
-			await resolveBitbucketPersonaIdentities(project);
-			_resetBitbucketPersonaIdentityCache();
-			await resolveBitbucketPersonaIdentities(project);
+			await resolveBitbucketReviewerIdentity(project);
+			vi.advanceTimersByTime(60_001);
+			await resolveBitbucketReviewerIdentity(project);
 
-			expect(vi.mocked(getBitbucketUserForCredential)).toHaveBeenCalledTimes(4);
+			expect(vi.mocked(getBitbucketUserForCredential)).toHaveBeenCalledTimes(2);
 		});
 
-		it('fails closed when the implementer identity cannot be resolved', async () => {
+		it('fails closed when the reviewer identity cannot be resolved', async () => {
 			vi.mocked(getBitbucketCredentialOrNull).mockResolvedValue(null);
 			vi.mocked(getBitbucketUserForCredential).mockResolvedValue(null);
 
-			await expect(resolveBitbucketPersonaIdentities(project)).rejects.toThrow(/implementer/);
-		});
-
-		it('fails closed when only the reviewer identity is missing', async () => {
-			vi.mocked(getBitbucketCredentialOrNull).mockImplementation(async (_p, persona) =>
-				persona === 'implementer' ? 'cred-impl' : null,
-			);
-			vi.mocked(getBitbucketUserForCredential).mockImplementation(async (credential) =>
-				credential === 'cred-impl' ? 'swarm-impl' : null,
-			);
-
-			await expect(resolveBitbucketPersonaIdentities(project)).rejects.toThrow(/reviewer/);
-		});
-
-		it('fails closed when an account exposes no nickname', async () => {
-			vi.mocked(getBitbucketCredentialOrNull).mockImplementation(async (_p, persona) =>
-				persona === 'implementer' ? 'cred-impl' : 'cred-rev',
-			);
-			vi.mocked(getBitbucketUserForCredential).mockImplementation(async (credential) =>
-				credential === 'cred-impl' ? 'swarm-impl' : null,
-			);
-
-			await expect(resolveBitbucketPersonaIdentities(project)).rejects.toThrow(/reviewer/);
+			await expect(resolveBitbucketReviewerIdentity(project)).rejects.toThrow(/reviewer/);
 		});
 
 		it('does not cache a failure — the next call retries', async () => {
 			vi.mocked(getBitbucketCredentialOrNull).mockResolvedValue(null);
 			vi.mocked(getBitbucketUserForCredential).mockResolvedValue(null);
-			await expect(resolveBitbucketPersonaIdentities(project)).rejects.toThrow();
+			await expect(resolveBitbucketReviewerIdentity(project)).rejects.toThrow();
 
 			stubHappyPath();
-			await expect(resolveBitbucketPersonaIdentities(project)).resolves.toEqual(IDENTITIES);
+			await expect(resolveBitbucketReviewerIdentity(project)).resolves.toBe('swarm-rev');
 		});
 	});
 });

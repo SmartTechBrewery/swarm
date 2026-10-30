@@ -45,7 +45,6 @@ import type {
 	RerunFailedChecksOutcome,
 	SCMProvider,
 	ScmPersona,
-	ScmPersonaIdentities,
 	ScmWebhookRequest,
 	WebhookHeaderReader,
 } from '../../../scm/types.js';
@@ -64,11 +63,7 @@ import {
 	listOpenGitLabMergeRequestsForBase,
 } from './merge-requests.js';
 import { createGitLabOperatorDeliveryProvider } from './operator-delivery.js';
-import {
-	getGitLabPersonaForLogin,
-	isSwarmGitLabActor,
-	resolveGitLabPersonaIdentities,
-} from './personas.js';
+import { isGitLabReviewer, resolveGitLabReviewerIdentity } from './personas.js';
 import {
 	isSwarmGeneratedGitLabEvent,
 	parseGitLabWebhook,
@@ -306,19 +301,17 @@ export class GitLabSCMIntegration implements SCMProvider {
 		return withGitLabToken(token, fn);
 	}
 
-	/** {@link SCMProvider.resolvePersonaIdentities} — per-project TTL cache in `./personas.ts`. */
-	async resolvePersonaIdentities(project: ProjectConfig): Promise<ScmPersonaIdentities> {
-		return resolveGitLabPersonaIdentities(project);
+	/**
+	 * {@link SCMProvider.resolveReviewerIdentity} — the reviewer credential's account,
+	 * with a per-project TTL cache in `./personas.ts`.
+	 */
+	async resolveReviewerIdentity(project: ProjectConfig): Promise<string> {
+		return resolveGitLabReviewerIdentity(project);
 	}
 
-	/** {@link SCMProvider.personaForActor} — GitLab's case-insensitive username match. */
-	personaForActor(login: string, identities: ScmPersonaIdentities): ScmPersona | null {
-		return getGitLabPersonaForLogin(login, identities);
-	}
-
-	/** {@link SCMProvider.isSwarmActor} — matches either configured persona identity. */
-	isSwarmActor(login: string, identities: ScmPersonaIdentities): boolean {
-		return isSwarmGitLabActor(login, identities);
+	/** {@link SCMProvider.isReviewerActor} — GitLab's case-insensitive username match. */
+	isReviewerActor(login: string, reviewerIdentity: string): boolean {
+		return isGitLabReviewer(login, reviewerIdentity);
 	}
 
 	// ==========================================================================
@@ -372,14 +365,14 @@ export class GitLabSCMIntegration implements SCMProvider {
 	}
 
 	/**
-	 * {@link SCMProvider.getPullRequestTitle}. Defaults to the **implementer** — the
-	 * merge request's author, whose credential is always configured for a project that
-	 * opens them — matching the other two adapters' default for the same read.
+	 * {@link SCMProvider.getPullRequestTitle} — the title for a run-history row. Reads
+	 * under the **reviewer** persona by default, the credential the control plane holds
+	 * for every read it makes (issue #1249); reading a title triggers no pipeline phase.
 	 */
 	async getPullRequestTitle(
 		project: ProjectConfig,
 		prNumber: number,
-		persona: ScmPersona = 'implementer',
+		persona: ScmPersona = 'reviewer',
 	): Promise<string | null> {
 		return this.withPersonaCredentials(project, persona, () =>
 			getGitLabMergeRequestTitle(project.repo, prNumber),
@@ -397,15 +390,14 @@ export class GitLabSCMIntegration implements SCMProvider {
 
 	/**
 	 * {@link SCMProvider.getBranchHead} — the branch's current head commit, from
-	 * GitLab's repository-branches read. Defaults to the **implementer** persona
-	 * for the reason GitHub's adapter states: it is a repository-level read, and
-	 * its caller today is a router sweep holding only the operator's own
-	 * credential.
+	 * GitLab's repository-branches read. Reads under the **reviewer** persona by default,
+	 * the credential every router read uses (issue #1249) — its caller is the
+	 * base-branch health sweep.
 	 */
 	async getBranchHead(
 		project: ProjectConfig,
 		branch: string,
-		persona: ScmPersona = 'implementer',
+		persona: ScmPersona = 'reviewer',
 	): Promise<string | null> {
 		return this.withPersonaCredentials(project, persona, () =>
 			getGitLabBranchHead(project.repo, branch),
@@ -477,15 +469,15 @@ export class GitLabSCMIntegration implements SCMProvider {
 	}
 
 	/**
-	 * {@link SCMProvider.listConflictCandidates} — open same-project merge requests
-	 * targeting `baseBranch`, read as the **implementer** (the persona that would push
-	 * the resolution), same as GitHub's and Bitbucket's.
+	 * {@link SCMProvider.listConflictCandidates} — open same-repository pull requests
+	 * targeting `baseBranch`, read as the **reviewer**, the credential every router
+	 * read uses (issue #1249).
 	 */
 	async listConflictCandidates(
 		project: ProjectConfig,
 		baseBranch: string,
 	): Promise<PullRequestDetails[]> {
-		return this.withPersonaCredentials(project, 'implementer', () =>
+		return this.withPersonaCredentials(project, 'reviewer', () =>
 			listOpenGitLabMergeRequestsForBase(project.repo, baseBranch),
 		);
 	}
@@ -495,20 +487,19 @@ export class GitLabSCMIntegration implements SCMProvider {
 	// ==========================================================================
 
 	/**
-	 * {@link SCMProvider.commentOnPullRequest} — a note on the merge request as
-	 * `persona`, returning the new note's id. The PR-driven phases normally comment
-	 * from *inside* the agent run; this is the out-of-band path for the worker's
-	 * stalled-job safety net, where the run was reclaimed before it could comment
-	 * itself. Defaults to the **implementer** (the merge request's author, whose token
-	 * is always configured for a project that opens them) for the same reason GitHub's
-	 * and Bitbucket's do: a comment triggers no pipeline phase, so the persona choice
-	 * is immaterial to loop prevention.
+	 * {@link SCMProvider.commentOnPullRequest} — a top-level comment as `persona`,
+	 * returning the new comment's id. The PR-driven phases normally comment through
+	 * their own delivery; this is the out-of-band path for the control plane's notices
+	 * (give-ups, refusals, phase failures). Defaults to the **reviewer**: the router
+	 * speaks as SWARM's own reviewer identity, the one SCM credential it holds
+	 * (issue #1249). Every such body carries the SWARM-origin footer, so ingress drops
+	 * its comment event whichever account posted it.
 	 */
 	async commentOnPullRequest(
 		project: ProjectConfig,
 		prNumber: number,
 		body: string,
-		persona: ScmPersona = 'implementer',
+		persona: ScmPersona = 'reviewer',
 	): Promise<number> {
 		return this.withPersonaCredentials(project, persona, () =>
 			postGitLabMergeRequestNote(project.repo, prNumber, body),

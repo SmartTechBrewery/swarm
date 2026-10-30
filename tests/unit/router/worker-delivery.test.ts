@@ -2,7 +2,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ProjectRecord } from '@/config/schema.js';
 import type { CliQuotaSnapshot } from '@/harness/quota.js';
 import { DEFAULT_WORKER_SUPPORTED_PHASES, type Worker } from '@/identity/worker.js';
-import { MissingWorkerScmCredentialError } from '@/identity/worker-scm-credential.js';
+import {
+	MissingWorkerScmCredentialError,
+	missingOperatorCredentialReason,
+} from '@/identity/worker-scm-credential.js';
 import type { ReviewVerdictLedger } from '@/pipeline/review-ledger.js';
 import type { PMProvider } from '@/pm/types.js';
 import {
@@ -29,7 +32,6 @@ import {
 	handleSubmitReview,
 	handleUpdateWorkItem,
 	isExecutingClaimOf,
-	missingOperatorCredentialReason,
 	NON_ROUTABLE_ENROLLMENT_DELIVERY_REASON,
 	ORPHANED_DISPATCH_DELIVERY_REASON,
 	type WorkerDeliveryDeps,

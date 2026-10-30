@@ -20,11 +20,12 @@
 
 import { serve } from '@hono/node-server';
 
+import { noticeRetiredOperatorTokens } from '../config/retired-operator-tokens.js';
 import { runMigrations } from '../db/migrate.js';
 import { describeError } from '../lib/errors.js';
 import { configureLogger, logger } from '../lib/logger.js';
 import { closeQueue } from '../queue/producer.js';
-import { createRouterApp, warnWhenOperatorTokenUnset } from './app.js';
+import { createRouterApp } from './app.js';
 import type { DispatchConsumerHandle } from './dispatcher.js';
 import { startRolloutAdvanceTicker } from './worker-rollout-advance.js';
 import { subscribeWorktreeSweepDispatch } from './worktree-sweep-dispatch.js';
@@ -36,7 +37,7 @@ configureLogger({ component: 'router' });
 const port = Number(process.env.PORT ?? 3000);
 
 const { app, injectWebSocket } = createRouterApp();
-warnWhenOperatorTokenUnset();
+noticeRetiredOperatorTokens();
 const server = serve({ fetch: app.fetch, port }, () => {
 	logger.debug('swarm-router: listening', { port });
 });

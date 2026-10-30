@@ -74,22 +74,16 @@ export type ScmType = (typeof SCM_TYPES)[number];
 export type ScmPersona = 'implementer' | 'reviewer';
 
 /**
- * The provider login each persona's credential authenticates as. Loop
- * prevention compares an inbound event's actor against these, so both must
- * resolve for it to hold.
- */
-export type ScmPersonaIdentities = Record<ScmPersona, string>;
-
-/**
  * The project-scoped credentials every SCM provider needs, as a **closed** pair
  * (issue #628) — a project supplies one reference per role, per provider, under
  * `credentials.scm[<providerId>]` (`src/config/schema.ts`).
  *
  * Closed, unlike the PM side's open `credentialRoles` vocabulary, because these two
  * are named by the *contract* rather than by a provider: `reviewer` is
- * {@link ScmPersona}'s project-scoped half (the implementer is the worker
- * operator's own env-var credential and is deliberately not a project credential —
- * issue #396), and `webhookSecret` is what
+ * {@link ScmPersona}'s project-scoped half (the implementer is deliberately not a
+ * project credential — it is the stored credential of the operator a write is made
+ * for, issues #765 and #1249, `src/scm/operator-credential.ts`), and `webhookSecret`
+ * is what
  * {@link SCMProvider.verifyWebhookSignature} authenticates a delivery with. A PM
  * provider's roles genuinely differ per provider (Jira an email + token, Trello a
  * key + token + secret); an SCM provider's do not. What *is* per provider is the
@@ -236,28 +230,26 @@ export interface SCMProvider extends ScmMergeProvider {
 	): Promise<T>;
 
 	/**
-	 * Resolve both persona logins for a project. Throws when either can't be
-	 * resolved: without both, loop prevention can't tell SWARM's own events from
-	 * a human's, so proceeding would be unsafe.
+	 * The login the project's **reviewer** credential authenticates as — the one
+	 * SWARM identity the control plane can establish on its own (issue #1249). The
+	 * implementer has no single identity to resolve: every pull request is authored
+	 * by the operator whose worker produced it. Throws when the reviewer credential is
+	 * missing or resolves to no account, so a caller deciding by it fails closed.
 	 */
-	resolvePersonaIdentities(project: ProjectConfig): Promise<ScmPersonaIdentities>;
-
-	/** Which persona an actor login belongs to, or `null` when it isn't one of SWARM's. */
-	personaForActor(login: string, identities: ScmPersonaIdentities): ScmPersona | null;
+	resolveReviewerIdentity(project: ProjectConfig): Promise<string>;
 
 	/**
-	 * Whether an actor login matches one of SWARM's configured persona identities.
+	 * Whether an actor login is the reviewer identity
+	 * {@link SCMProvider.resolveReviewerIdentity} answered, compared the way this
+	 * provider spells an account (case, a GitHub App's `[bot]` suffix, …). What the
+	 * Respond-to-review author gate asks of a submitted review.
 	 *
-	 * Note: this is NOT SWARM's loop-prevention drop gate for events. Under the
-	 * federated model (ADR-004 §3), an implementer identity is the worker operator's
-	 * own account, so actor login alone cannot distinguish SWARM's output from human
-	 * actions. Event drop gates use SWARM-origin markers (`src/scm/swarm-origin.ts`,
-	 * issue #443) for comments and work-item origin (`src/triggers/swarm-managed-pr.ts`)
-	 * for PR ownership on both `pr-review` (issue #397) and `resolve-conflicts`
-	 * (issue #836) — which is why no production call site is left, though the
-	 * contract still requires the method of every provider.
+	 * Not a loop-prevention drop gate: SWARM's own comments are recognised by their
+	 * SWARM-origin marker (`src/scm/swarm-origin.ts`, issue #443) and SWARM's own
+	 * pull requests by work-item origin (`src/triggers/swarm-managed-pr.ts`), because
+	 * an implementer's login is an ordinary operator's account (ADR-004 §3).
 	 */
-	isSwarmActor(login: string, identities: ScmPersonaIdentities): boolean;
+	isReviewerActor(login: string, reviewerIdentity: string): boolean;
 
 	/**
 	 * Verify an inbound webhook's signature against the project's shared secret.
@@ -402,7 +394,9 @@ export interface SCMProvider extends ScmMergeProvider {
 	 * **Never throws.** Credential resolution included, every failure comes back as
 	 * `provider-error`, and a provider with no re-run capability declares
 	 * `unsupported` with its reason. Omitting `persona` writes as the
-	 * **implementer**, the persona merge automation acts as.
+	 * **implementer** — on the control plane, the stored credential of the operator
+	 * whose worker produced the pull request, which the caller binds
+	 * (`runAsPullRequestOperator`, `src/identity/pull-request-operator.ts`).
 	 */
 	rerunFailedChecks(
 		project: ProjectConfig,
@@ -436,10 +430,20 @@ export interface SCMProvider extends ScmMergeProvider {
 		persona?: ScmPersona,
 	): Promise<CommitPullRequest[]>;
 
-	/** Open pull requests targeting `baseBranch` — the conflict-detection seam after a base advances. */
+	/**
+	 * Open pull requests targeting `baseBranch` — the conflict-detection seam after a
+	 * base advances, and the unreviewed-PR recovery sweep's list. Read as the
+	 * **reviewer**, like every read the control plane makes (issue #1249).
+	 */
 	listConflictCandidates(project: ProjectConfig, baseBranch: string): Promise<PullRequestDetails[]>;
 
-	/** Post a top-level comment on a pull request, returning the new comment's id. */
+	/**
+	 * Post a top-level comment on a pull request, returning the new comment's id.
+	 * Omitting `persona` posts as the **reviewer**: every notice the control plane
+	 * posts on its own — a give-up, a base-blocked or merge-refusal notice, a phase
+	 * failure — speaks as SWARM's reviewer identity, the one SCM credential a project
+	 * always gives it (issue #1249).
+	 */
 	commentOnPullRequest(
 		project: ProjectConfig,
 		prNumber: number,

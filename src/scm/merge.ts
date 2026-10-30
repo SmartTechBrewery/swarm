@@ -1,7 +1,9 @@
 /**
  * Provider-neutral merge capability (issue #253; direct-merge-only per issue
  * #292). The adapter performs the provider's *direct* PR/MR merge operation
- * under the project's implementer credential — never the provider's own merge
+ * under the implementer credential in scope — on the control plane, the stored
+ * credential of the operator whose worker produced the pull request, which the
+ * merge dispatch binds (issue #1249) — never the provider's own merge
  * automation (GitHub's native auto-merge is unavailable on many private
  * repositories and has no portable equivalent in Bitbucket/GitLab, so SWARM
  * neither requests nor relies on it). Orchestration — when to ask, how to

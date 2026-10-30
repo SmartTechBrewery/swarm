@@ -132,7 +132,7 @@ Consequences of the rule:
   client unchanged) and the router resolves that persona's credential server-side.
   `POST /worker/delivery/review` needs no such field — only Review submits a
   verdict. The implementer originally resolved to the router's own
-  `SWARM_OPERATOR_GH_TOKEN`, which made the reply the *server* operator's on a
+  `SWARM_OPERATOR_GH_TOKEN` (retired by issue #1249), which made the reply the *server* operator's on a
   different-machine deployment; since issue #1152 the router resolves the
   **requesting worker's** stored operator credential for the project's SCM
   provider instead, so attribution is exact — the reply is authored by the account
@@ -202,6 +202,17 @@ filesystem, and both are load-bearing rather than defensive polish:
   `project.repo`. Best-effort by design — a clone with no `origin` cannot be
   identified and is accepted; only a remote naming a *different* repository fails.
 
+**Amendment (2026-10-30, issue #1249).** The control plane keeps no implementer
+credential of its own either. `SWARM_OPERATOR_GH_TOKEN` and its Azure DevOps, GitLab
+and Bitbucket siblings are retired — no process reads them — and the router's own
+operations take the identities this section already established: every read runs as
+the project's reviewer credential, the notices the router posts speak as that
+reviewer, and the writes it makes on a pull request author's behalf (merge, branch
+update, check re-run) run as the operator whose worker produced the pull request,
+with that worker's stored credential, found through §4's attribution record. The
+Respond-to-review author gate needs only the reviewer's identity. See
+`ai/ARCHITECTURE.md` "Which account the control plane acts as".
+
 ### 3. Re-base the review trigger on work-item linkage, not persona authorship
 
 > **Status: implemented, in three phases.** Phase 1 (issue #397) — the **`pr-review`
@@ -258,7 +269,8 @@ that carries neither marker is the one way to reopen the loop.
 The reviewer identity remains distinct from the author (per-project reviewer PAT
 ≠ user account) and the aggregate check query and Review phase still run under it,
 so the independent-reviewer invariant (PROJECT.md §5.3) still holds. Routing
-*between* personas still resolves identities (`getPersonaForLogin`); only the drop
+*between* personas still resolves identities (`getPersonaForLogin`; since issue #1249
+the reviewer's alone, `resolveReviewerIdentity` + `isReviewerActor`); only the drop
 gates stopped.
 
 ### 4. Record worker→PR attribution in the data model

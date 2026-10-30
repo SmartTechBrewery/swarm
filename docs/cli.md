@@ -818,8 +818,10 @@ unchanged.
   **Operator source-control credential** card uses, from one shared catalogue
   (`src/scm/operator-credential-copy.ts`, issue #807). A worker with none stored for
   the provider a dispatch needs fails that dispatch immediately, naming the worker
-  and the provider. It replaces the
-  worker-local `SWARM_OPERATOR_GH_TOKEN`, which no worker reads any more. Owner-only
+  and the provider. The control plane also
+  merges, updates the branch of, and re-runs checks on a pull request this worker
+  produced with it (issue #1249). It replaces the retired `SWARM_OPERATOR_GH_TOKEN`,
+  which nothing reads any more. Owner-only
   (narrowing 1).
 - **`remove`** — deregister a worker by worker id. Owner-only, and refused while the
   machine is executing a run (narrowing 2) — the same rule its dashboard equivalent

@@ -342,6 +342,12 @@ export type DispatchOutcome =
 	| 'merge-unsupported'
 	| 'merge-retry-exhausted'
 	/**
+	 * Merge automation found no operator to merge as (issue #1249): no registered
+	 * worker is recorded as having produced the pull request, or that worker holds no
+	 * credential for the project's SCM provider. The reason is on the Review run.
+	 */
+	| 'merge-no-operator'
+	/**
 	 * The `worker-update` frame reached the machine (issue #972). The dispatch's
 	 * whole job is the delivery, so this is where it ends: what the daemon makes
 	 * of the request is answered on its own report route and lands on the

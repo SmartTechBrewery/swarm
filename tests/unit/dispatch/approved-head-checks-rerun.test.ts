@@ -26,6 +26,22 @@ vi.mock('@/triggers/review-dispatch-dedup.js', () => ({
 	releaseReviewDispatch: (key: string) => releaseReviewDispatch(key),
 }));
 
+// The re-run is a write made for the pull request's author (issue #1249): it runs as
+// the operator whose worker produced it. Resolving that reads the run and worker
+// tables, so it is mocked; by default an operator resolves and the write runs.
+const runAsPullRequestOperator = vi.fn(
+	async (
+		_project: unknown,
+		_prNumber: string,
+		fn: (operator: { workerId: string; workerName: string }) => Promise<unknown>,
+	) => fn({ workerId: 'worker-1', workerName: 'alice-laptop' }),
+);
+vi.mock('@/identity/pull-request-operator.js', async (importOriginal) => ({
+	...(await importOriginal<typeof import('@/identity/pull-request-operator.js')>()),
+	runAsPullRequestOperator: (project: unknown, prNumber: string, fn: never) =>
+		runAsPullRequestOperator(project, prNumber, fn),
+}));
+
 vi.mock('@/lib/logger.js', () => ({
 	logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
@@ -37,6 +53,7 @@ import {
 	type RecoverAdjudicatedApprovedHeadInput,
 	recoverAdjudicatedApprovedHead,
 } from '@/dispatch/approved-head-checks-rerun.js';
+import { PullRequestOperatorUnavailableError } from '@/identity/pull-request-operator.js';
 import { deliveryIdentity, type ScmDeliveryProvider } from '@/scm/delivery.js';
 import type { RerunFailedChecksOutcome } from '@/scm/types.js';
 import { createMockProjectConfig } from '../../helpers/factories.js';
@@ -90,6 +107,7 @@ beforeEach(() => {
 	rerunFailedChecks.mockClear();
 	postComment.mockClear();
 	deliveryProvider.mockClear();
+	runAsPullRequestOperator.mockClear();
 });
 
 describe('recoverAdjudicatedApprovedHead', () => {
@@ -109,9 +127,10 @@ describe('recoverAdjudicatedApprovedHead', () => {
 		expect(createFailedRun).not.toHaveBeenCalled();
 	});
 
-	it('spends the one re-run as the implementer and releases the PR+SHA claim', async () => {
+	it('spends the one re-run as the pull request’s operator and releases the PR+SHA claim', async () => {
 		expect(await recoverAdjudicatedApprovedHead(input())).toBe('rerun-requested');
 		expect(claimApprovedHeadChecksRerun).toHaveBeenCalledWith(KEY);
+		expect(runAsPullRequestOperator.mock.calls[0]?.slice(0, 2)).toEqual([PROJECT, '42']);
 		expect(rerunFailedChecks).toHaveBeenCalledWith(PROJECT, 'abc123', 'implementer');
 		// So the re-run's own `checks completed` is decided, not dropped as a duplicate.
 		expect(releaseReviewDispatch).toHaveBeenCalledWith(`${PROJECT.repo}:42:abc123`);
@@ -188,7 +207,8 @@ describe('recoverAdjudicatedApprovedHead', () => {
 		expect(run.error).toContain("SWARM's CI agent judged the failure unrelated");
 		expect(run.error).toContain('failed again');
 		expect(run.jobPayload).toEqual({ type: 'scm' });
-		expect(deliveryProvider).toHaveBeenCalledWith(PROJECT, 'implementer');
+		// The notice speaks as the reviewer, like every comment the router posts (issue #1249).
+		expect(deliveryProvider).toHaveBeenCalledWith(PROJECT, 'reviewer');
 		const comment = postComment.mock.calls[0][0] as { body: string };
 		expect(comment.body).toContain('`lint`, `test`');
 	});
@@ -202,6 +222,29 @@ describe('recoverAdjudicatedApprovedHead', () => {
 		expect(claimApprovedHeadOperatorNotice).toHaveBeenCalledTimes(2);
 		expect(createFailedRun).toHaveBeenCalledTimes(1);
 		expect(postComment).toHaveBeenCalledTimes(1);
+	});
+
+	it('hands the head to the operator, re-running nothing, when there is no operator to act as', async () => {
+		const reason =
+			"no operator source-control credential is stored for worker 'alice-laptop' on github";
+		runAsPullRequestOperator.mockRejectedValueOnce(new PullRequestOperatorUnavailableError(reason));
+
+		expect(await recoverAdjudicatedApprovedHead(input())).toBe('needs-operator');
+		expect(rerunFailedChecks).not.toHaveBeenCalled();
+		expect(releaseReviewDispatch).not.toHaveBeenCalled();
+		const run = createFailedRun.mock.calls[0]?.[0] as { error: string };
+		expect(run.error).toContain(`SWARM could not re-run the failing checks: ${reason}.`);
+		expect(run.error).not.toMatch(/SWARM_OPERATOR_/);
+		expect(postComment).toHaveBeenCalledOnce();
+	});
+
+	it('names the operator whose credential the provider refused', async () => {
+		rerunFailedChecks.mockResolvedValueOnce({ status: 'provider-error', message: 'HTTP 401' });
+
+		expect(await recoverAdjudicatedApprovedHead(input())).toBe('needs-operator');
+		expect((createFailedRun.mock.calls[0]?.[0] as { error: string }).error).toContain(
+			"HTTP 401 (acting as the operator credential stored for worker 'alice-laptop')",
+		);
 	});
 
 	it('never throws: a ledger error leaves the head to its caller', async () => {

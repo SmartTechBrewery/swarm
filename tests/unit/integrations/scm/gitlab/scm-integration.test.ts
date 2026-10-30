@@ -43,9 +43,8 @@ vi.mock('@/integrations/scm/gitlab/credentials.js', () => ({
 	getGitLabTokenOrNull: vi.fn<(project: unknown, persona: string) => Promise<string | null>>(),
 }));
 vi.mock('@/integrations/scm/gitlab/personas.js', () => ({
-	resolveGitLabPersonaIdentities: vi.fn(),
-	isSwarmGitLabActor: vi.fn(),
-	getGitLabPersonaForLogin: vi.fn(),
+	resolveGitLabReviewerIdentity: vi.fn(),
+	isGitLabReviewer: vi.fn(),
 }));
 vi.mock('@/integrations/scm/gitlab/operator-delivery.js', () => ({
 	createGitLabOperatorDeliveryProvider: vi.fn(),
@@ -89,9 +88,8 @@ import {
 } from '@/integrations/scm/gitlab/merge-requests.js';
 import { createGitLabOperatorDeliveryProvider } from '@/integrations/scm/gitlab/operator-delivery.js';
 import {
-	getGitLabPersonaForLogin,
-	isSwarmGitLabActor,
-	resolveGitLabPersonaIdentities,
+	isGitLabReviewer,
+	resolveGitLabReviewerIdentity,
 } from '@/integrations/scm/gitlab/personas.js';
 import { GitLabSCMIntegration } from '@/integrations/scm/gitlab/scm-integration.js';
 import {
@@ -104,10 +102,9 @@ import {
 } from '@/integrations/scm/gitlab/writes.js';
 import type { ScmDeliveryProvider } from '@/scm/delivery.js';
 import { SWARM_GENERATED_FOOTER } from '@/scm/swarm-origin.js';
-import type { ScmPersonaIdentities } from '@/scm/types.js';
 
 const project = createMockProjectConfig();
-const IDENTITIES: ScmPersonaIdentities = { implementer: 'swarm-impl', reviewer: 'swarm-rev' };
+const REVIEWER = 'swarm-rev';
 /** GitLab reports full 40-character SHAs, so a reviewed head is compared exactly. */
 const APPROVED_SHA = 'da1560886d4f094c3e6c9ef40349f7d38b5d27d7';
 const OTHER_SHA = 'aaaa560886d4f094c3e6c9ef40349f7d38b5d27d7';
@@ -184,26 +181,19 @@ describe('GitLabSCMIntegration', () => {
 		});
 	});
 
-	describe('persona identity + actor resolution', () => {
+	describe('reviewer identity + actor check', () => {
 		it('delegates identity resolution to the cached resolver', async () => {
-			vi.mocked(resolveGitLabPersonaIdentities).mockResolvedValue(IDENTITIES);
+			vi.mocked(resolveGitLabReviewerIdentity).mockResolvedValue(REVIEWER);
 
-			await expect(scm.resolvePersonaIdentities(project)).resolves.toEqual(IDENTITIES);
-			expect(vi.mocked(resolveGitLabPersonaIdentities)).toHaveBeenCalledWith(project);
+			await expect(scm.resolveReviewerIdentity(project)).resolves.toBe(REVIEWER);
+			expect(vi.mocked(resolveGitLabReviewerIdentity)).toHaveBeenCalledWith(project);
 		});
 
-		it('delegates actor → persona mapping', () => {
-			vi.mocked(getGitLabPersonaForLogin).mockReturnValue('reviewer');
+		it('delegates the reviewer-actor check', () => {
+			vi.mocked(isGitLabReviewer).mockReturnValue(true);
 
-			expect(scm.personaForActor('swarm-rev', IDENTITIES)).toBe('reviewer');
-			expect(vi.mocked(getGitLabPersonaForLogin)).toHaveBeenCalledWith('swarm-rev', IDENTITIES);
-		});
-
-		it('delegates the SWARM-actor check', () => {
-			vi.mocked(isSwarmGitLabActor).mockReturnValue(true);
-
-			expect(scm.isSwarmActor('swarm-impl', IDENTITIES)).toBe(true);
-			expect(vi.mocked(isSwarmGitLabActor)).toHaveBeenCalledWith('swarm-impl', IDENTITIES);
+			expect(scm.isReviewerActor(REVIEWER, REVIEWER)).toBe(true);
+			expect(vi.mocked(isGitLabReviewer)).toHaveBeenCalledWith(REVIEWER, REVIEWER);
 		});
 	});
 
@@ -313,21 +303,18 @@ describe('GitLabSCMIntegration', () => {
 			expect(tokenOnTheWire()).toBe('token-implementer');
 		});
 
-		it('reads a title as the implementer — the merge request’s own author', async () => {
+		it('reads a title as the reviewer, like every control-plane read', async () => {
 			fetchMock.mockResolvedValue(jsonResponse(createMockGitLabMergeRequestResponse()));
 
 			await expect(scm.getPullRequestTitle(project, 17)).resolves.toBe('Add a thing');
-			expect(tokenOnTheWire()).toBe('token-implementer');
+			expect(tokenOnTheWire()).toBe('token-reviewer');
 		});
 
-		// The implementer rather than the reviewer the aggregate read below uses: a
-		// repository-level read, whose caller today is a router sweep holding only the
-		// operator's own credential.
-		it("reads the base branch's head commit as the implementer", async () => {
+		it("reads the base branch's head commit as the reviewer", async () => {
 			fetchMock.mockResolvedValue(jsonResponse({ name: 'main', commit: { id: 'a'.repeat(40) } }));
 
 			await expect(scm.getBranchHead(project, 'main')).resolves.toBe('a'.repeat(40));
-			expect(tokenOnTheWire()).toBe('token-implementer');
+			expect(tokenOnTheWire()).toBe('token-reviewer');
 			expect(requestedPath()).toBe(
 				'/api/v4/projects/SmartTechBrewery%2Fswarm/repository/branches/main',
 			);
@@ -372,11 +359,11 @@ describe('GitLabSCMIntegration', () => {
 			);
 		});
 
-		it('lists conflict candidates as the implementer, the persona that pushes the fix', async () => {
+		it('lists conflict candidates as the reviewer, like every control-plane read', async () => {
 			fetchMock.mockResolvedValue(jsonResponse([]));
 
 			await expect(scm.listConflictCandidates(project, 'main')).resolves.toEqual([]);
-			expect(tokenOnTheWire()).toBe('token-implementer');
+			expect(tokenOnTheWire()).toBe('token-reviewer');
 			expect(requestedPath()).toBe('/api/v4/projects/SmartTechBrewery%2Fswarm/merge_requests');
 		});
 
@@ -425,20 +412,20 @@ describe('GitLabSCMIntegration', () => {
 			vi.mocked(postGitLabMergeRequestNote).mockResolvedValue(991);
 		});
 
-		it('comments as the implementer by default — the merge request’s own author', async () => {
+		it("comments as the reviewer by default — the control plane's own voice", async () => {
 			await expect(scm.commentOnPullRequest(project, 17, 'reclaimed mid-run')).resolves.toBe(991);
 			expect(vi.mocked(postGitLabMergeRequestNote)).toHaveBeenCalledWith(
 				'SmartTechBrewery/swarm',
 				17,
 				'reclaimed mid-run',
 			);
-			expect(vi.mocked(getGitLabToken)).toHaveBeenCalledWith(project, 'implementer');
+			expect(vi.mocked(getGitLabToken)).toHaveBeenCalledWith(project, 'reviewer');
 		});
 
 		it('honours an explicitly requested persona', async () => {
-			await scm.commentOnPullRequest(project, 17, 'note', 'reviewer');
+			await scm.commentOnPullRequest(project, 17, 'note', 'implementer');
 
-			expect(vi.mocked(getGitLabToken)).toHaveBeenCalledWith(project, 'reviewer');
+			expect(vi.mocked(getGitLabToken)).toHaveBeenCalledWith(project, 'implementer');
 		});
 	});
 

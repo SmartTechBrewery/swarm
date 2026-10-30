@@ -177,7 +177,7 @@ async function checkCatchUp(
 		noteSkip(ctx, 'The merge catch-up event names no pull request, so there is nothing to update.');
 		return null;
 	}
-	const pr = await ctx.scm.getPullRequest(ctx.project, Number(prNumber), 'implementer');
+	const pr = await ctx.scm.getPullRequest(ctx.project, Number(prNumber), 'reviewer');
 	if (pr.state !== 'open') {
 		logger.info(
 			'resolve-conflicts: catch-up requested for a pull request that is closed — skipping',

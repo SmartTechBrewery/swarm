@@ -7,10 +7,9 @@ import {
 	readGitHubWebhookRequest,
 	verifyGitHubSignature,
 } from '@/integrations/scm/github/webhook.js';
-import type { ScmPersonaIdentities } from '@/scm/types.js';
 import { createMockProjectConfig } from '../../../../helpers/factories.js';
 
-const IDENTITIES: ScmPersonaIdentities = { implementer: 'swarm-impl', reviewer: 'swarm-rev' };
+const IDENTITIES = { implementer: 'swarm-impl', reviewer: 'swarm-rev' };
 const project = createMockProjectConfig({ id: 'proj-1', repo: 'SmartTechBrewery/swarm' });
 
 function repo() {

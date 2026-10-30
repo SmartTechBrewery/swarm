@@ -5,12 +5,11 @@
  * dispatches a conflict check (`handlers/resolve-conflicts.ts`, issue #836).
  *
  * **Why not the PR's author.** SWARM used to answer this by matching the PR
- * author against its own persona logins (`isSwarmBot`). Under the federated
- * model (ADR-004 §3, issue #397) the implementer credential is the *worker
- * operator's own* GitHub token, so a SWARM PR is authored by a plain user
- * account — and `resolvePersonaIdentities` only ever resolves the identities of
- * the process it runs in, so the control plane cannot even name the operator
- * that opened a PR on another machine. An author gate therefore skips every
+ * author against its own persona logins (the retired `isSwarmBot`). Under the
+ * federated model (ADR-004 §3, issue #397) the implementer credential is the
+ * *worker operator's own* GitHub token, so a SWARM PR is authored by a plain user
+ * account — one per operator, none of which the control plane holds an identity
+ * for (issue #1249 left it the reviewer's alone). An author gate therefore skips every
  * federated PR (auto-review silently stops firing) while *accepting* the same
  * operator's hand-written PRs. Author identity stopped carrying the signal.
  *

@@ -567,8 +567,10 @@ Notes:
   (`github` | `bitbucket` | `gitlab` | `azure-devops`), and a rotation takes effect on the next phase
   with no worker restart. Without it, every Planning/Implementation/Review dispatch
   to this worker fails immediately with a message naming the worker and the provider.
-  It replaces the worker-local `SWARM_OPERATOR_GH_TOKEN`, which no worker reads any
-  more; see the rollout order in Part 2.
+  It is also the account the control plane merges, updates the branch of, and re-runs
+  checks on a pull request this worker produced as (issue #1249). It replaces the
+  retired `SWARM_OPERATOR_GH_TOKEN`, which nothing reads any more; see the rollout
+  order in Part 2.
 - **Step 5 has a dashboard equivalent too** (issue #766): the worker's owner can set
   and rotate the same value at `/workers/<worker-id>` → **Operator source-control
   credential**, with no CLI or DB access — one field per provider that machine's
@@ -663,11 +665,12 @@ none and a new worker refuses to run:
 2. deploy the router;
 3. deploy the workers.
 
-Only after step 3 may an operator delete `SWARM_OPERATOR_GH_TOKEN` from a worker's
-`.env` — it is inert there from that point on. (The **router**'s own
-`SWARM_OPERATOR_GH_TOKEN` stays: operations the router originates itself still read
-it, see [`docs/configuration.md`](./configuration.md). A Respond-to-review reply is
-not one of them — since issue #1152 it is posted with the worker's stored credential.)
+After step 3, delete `SWARM_OPERATOR_GH_TOKEN` from every `.env` — the worker's and
+the control plane's alike. Since issue #1249 nothing reads it, or its Azure DevOps,
+GitLab and Bitbucket siblings: the control plane reads as each project's reviewer
+credential and merges as the operator whose worker produced the pull request, with
+the credential step 5 stored (see [`docs/configuration.md`](./configuration.md)). A
+control plane that still finds one set says once at startup that it is ignored.
 
 Make sure every CLI declared in `--cli` back in Part 1 is actually installed
 and authenticated on this machine (e.g. `claude` logged in), then:

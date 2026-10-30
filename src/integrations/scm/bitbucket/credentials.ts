@@ -1,81 +1,60 @@
 /**
  * Persona credential resolution for Bitbucket — the Bitbucket counterpart of
- * `getPersonaToken`/`getPersonaTokenOrNull` (`src/config/provider.ts`) plus the
- * worker-local operator token (`src/config/operator-token.ts`).
+ * `getPersonaToken`/`getPersonaTokenOrNull` (`src/config/provider.ts`).
  *
- * The two personas resolve from *different* sources, exactly as GitHub's do
- * (issue #396): the **implementer** is the worker operator's own credential, read
- * here from a `SWARM_OPERATOR_BITBUCKET_TOKEN` env var on the **control plane** and
- * never in `ProjectConfig` (so never in the transport's non-secret project slice);
- * the **reviewer** stays a project-scoped credential *reference* resolved from the
- * secret store. A *worker* resolves the same operator identity from the
- * per-`(worker, provider)` store instead, and it does travel on the assignment frame
- * (issue #765) — the worker's own credential, not the project's.
- * Two distinct accounts are what breaks the automation feedback loop
- * (ai/CODING_STANDARDS.md "Loop prevention").
+ * The two personas resolve from *different* sources, exactly as GitHub's do: the
+ * **reviewer** is a project-scoped credential *reference* resolved from the secret
+ * store, and the **implementer** is never the control plane's own (issue #1249) — it
+ * is the stored credential of the operator a write is being made for, bound by
+ * `withOperatorCredential` (`src/scm/operator-credential.ts`), and absent outside that
+ * scope. Either an access token or a `username:app_password` pair — the client picks
+ * the auth scheme from the form (`./client.ts`). Two distinct accounts are what
+ * breaks the automation feedback loop (ai/CODING_STANDARDS.md "Loop prevention").
  *
  * **Why this lives in the provider folder** rather than widening
- * `getPersonaToken` (`src/config/provider.ts`): that function's `implementer` branch
- * returns the *GitHub* operator token, and its `reviewer` branch resolves GitHub's own
- * per-provider reference. Widening it would either hand a Bitbucket call a GitHub
- * credential or force a GitHub-path change this file has no reason to make.
+ * `getPersonaToken` (`src/config/provider.ts`): that function's `reviewer` branch
+ * resolves GitHub's own per-provider reference, so widening it would either hand a
+ * Bitbucket call a GitHub credential or force a GitHub-path change this file has no
+ * reason to make.
  *
  * The reviewer reference itself is **Bitbucket's own** since issue #628: it resolves
  * through the provider-parameterised `requireScmCredential` /
  * `resolveScmCredentialOrNull` seam, reading `credentials.scm.bitbucket.reviewer` and
  * nothing else — so a project holding both Bitbucket's and GitHub's tokens keeps them
  * apart, and a project with only GitHub's fails here with Bitbucket's own error rather
- * than silently authenticating as GitHub's reviewer. (Before #628 the two references
- * were one shared provider-neutral pair, which is why this file's own doc used to say
- * no config-schema change was needed.) `project.repo` (`owner/repo`) doubles as
- * Bitbucket's `workspace/repo_slug`.
+ * than silently authenticating as GitHub's reviewer. `project.repo` (`owner/repo`)
+ * doubles as Bitbucket's `workspace/repo_slug`.
  */
 
 import { requireScmCredential, resolveScmCredentialOrNull } from '../../../config/provider.js';
 import type { ProjectConfig } from '../../../config/schema.js';
-import { optionalEnv } from '../../../lib/env.js';
+import {
+	requireScopedOperatorCredential,
+	scopedOperatorCredential,
+} from '../../../scm/operator-credential.js';
 import type { ScmPersona } from '../../../scm/types.js';
-
-/** Env var name holding the worker-local operator Bitbucket credential. */
-export const OPERATOR_BITBUCKET_TOKEN_ENV = 'SWARM_OPERATOR_BITBUCKET_TOKEN';
-
-/**
- * The operator's Bitbucket credential, or `null` when the env var is unset or
- * empty. Either an access token or a `username:app_password` pair — the client
- * picks the auth scheme from the form (`./client.ts`).
- */
-export function getOperatorBitbucketCredentialOrNull(): string | null {
-	return optionalEnv(OPERATOR_BITBUCKET_TOKEN_ENV, '').trim() || null;
-}
 
 /** Resolve `persona`'s Bitbucket credential for `project`, or `null` when none resolves. */
 export async function getBitbucketCredentialOrNull(
 	project: ProjectConfig,
 	persona: ScmPersona,
 ): Promise<string | null> {
-	if (persona === 'implementer') return getOperatorBitbucketCredentialOrNull();
+	if (persona === 'implementer') return scopedOperatorCredential();
 	return resolveScmCredentialOrNull(project, 'bitbucket', persona);
 }
 
 /**
- * Resolve `persona`'s Bitbucket credential for `project`. Throws when none
- * resolves — an operation that needs a persona credential but has none configured
- * is a deployment error, not a soft "not found" (ai/CODING_STANDARDS.md "Error
- * handling"). The message names the persona's actual source: the operator env var for
- * the implementer, and — through the shared `requireScmCredential` — Bitbucket's own
- * reference plus its conventional config-apply key for the reviewer.
+ * Resolve `persona`'s Bitbucket credential for `project`. Throws when none resolves — an
+ * operation that needs a persona credential but has none is a deployment error, not a
+ * soft "not found" (ai/CODING_STANDARDS.md "Error handling"). The message names the
+ * persona's actual source: the operator credential in scope for the implementer, and —
+ * through the shared `requireScmCredential` — Bitbucket's own reference plus its
+ * conventional config-apply key for the reviewer.
  */
 export async function getBitbucketCredential(
 	project: ProjectConfig,
 	persona: ScmPersona,
 ): Promise<string> {
-	if (persona === 'implementer') {
-		const credential = getOperatorBitbucketCredentialOrNull();
-		if (credential) return credential;
-		throw new Error(
-			`No Bitbucket implementer credential configured: set ${OPERATOR_BITBUCKET_TOKEN_ENV} on this host ` +
-				"(the worker operator's own credential; never stored in project_credentials)",
-		);
-	}
+	if (persona === 'implementer') return requireScopedOperatorCredential('Bitbucket');
 	return requireScmCredential(project, 'bitbucket', persona);
 }

@@ -127,12 +127,28 @@ vi.mock('@octokit/rest', () => ({
 		graphql = octokitGraphql;
 	},
 }));
+// Whose credential the merge and the branch update run as (issue #1249): the operator
+// whose worker produced the pull request. The resolution reads the run and worker
+// tables, so it is mocked here; by default an operator resolves and the write runs.
+const runAsPullRequestOperator = vi.fn(
+	async (
+		_project: unknown,
+		_prNumber: string,
+		fn: (operator: { workerId: string; workerName: string }) => Promise<unknown>,
+	) => fn({ workerId: 'worker-1', workerName: 'alice-laptop' }),
+);
+vi.mock('@/identity/pull-request-operator.js', async (importOriginal) => ({
+	...(await importOriginal<typeof import('@/identity/pull-request-operator.js')>()),
+	runAsPullRequestOperator: (project: unknown, prNumber: string, fn: never) =>
+		runAsPullRequestOperator(project, prNumber, fn),
+}));
 vi.mock('@/config/provider.js', async (importOriginal) => ({
 	...(await importOriginal<typeof import('@/config/provider.js')>()),
 	getPersonaToken: vi.fn(async () => 'tok-impl'),
 }));
 
 import type { DispatchRow } from '@/db/repositories/dispatchesRepository.js';
+import { PullRequestOperatorUnavailableError } from '@/identity/pull-request-operator.js';
 import { GitHubSCMIntegration } from '@/integrations/scm/github/scm-integration.js';
 import type { SCMProviderManifest } from '@/integrations/scm/manifest.js';
 import {
@@ -150,6 +166,7 @@ import {
 	adoptWorkerBranchUpdate,
 	MAX_BASE_UPDATES,
 	MAX_MERGE_RETRIES,
+	MERGE_NO_OPERATOR,
 	MERGE_PROVIDER_ERROR_EXHAUSTED,
 	MERGE_QUEUE_RECHECK_MS,
 	MERGE_QUEUED,
@@ -281,6 +298,7 @@ beforeEach(() => {
 	adoptWorkerBranchUpdateIntoWaitingMerge.mockResolvedValue(
 		mockDispatchRow({ state: 'retry-scheduled' }),
 	);
+	runAsPullRequestOperator.mockClear();
 });
 
 /** The stale-base answer the merge capability gives for a head behind its base. */
@@ -592,9 +610,11 @@ describe('processMergeAutomationDispatch', () => {
 		expect(delay).toBeLessThanOrEqual(mergeRetryDelayMs(3) + 1000);
 		// The reason is on the Review run from the first failed attempt, so the
 		// dashboard names it while the retries are still running.
+		// …naming the operator whose credential the provider refused (issue #1249).
 		expect(updateReviewMergeOutcome).toHaveBeenLastCalledWith('run-1', {
 			status: 'provider-error',
-			message: '502 Bad Gateway',
+			message:
+				"502 Bad Gateway (acting as the operator credential stored for worker 'alice-laptop')",
 			attempt: 2,
 			approvedHeadSha: 'deadbeef',
 		});
@@ -782,7 +802,7 @@ describe('processMergeAutomationDispatch', () => {
 		expect(getAggregateCheckStatus).toHaveBeenCalledExactlyOnceWith(
 			project,
 			'deadbeef',
-			'implementer',
+			'reviewer',
 		);
 		expect(getAggregateCheckStatus.mock.invocationCallOrder[0]).toBeLessThan(
 			mergePullRequest.mock.invocationCallOrder[0] as number,
@@ -1383,7 +1403,8 @@ describe('processMergeAutomationDispatch: a stale approved head', () => {
 		// terminal branch used to emit.
 		expect(updateReviewMergeOutcome).toHaveBeenLastCalledWith('run-1', {
 			status: 'provider-error',
-			message: 'failed to bring the head up to date with the base: 502 Bad Gateway',
+			message:
+				"failed to bring the head up to date with the base: 502 Bad Gateway (acting as the operator credential stored for worker 'alice-laptop')",
 			attempt: 0,
 			approvedHeadSha: 'deadbeef',
 		});
@@ -1948,7 +1969,7 @@ describe('processMergeAutomationDispatch: settling what the merge absorbed', () 
 		// The pull request's own task is the number its head branch encodes — never
 		// the Review run's `taskId`, which is the pull request's own number.
 		expect(await lastResolveOwnTaskId()()).toBe('12');
-		expect(getPullRequest).toHaveBeenCalledExactlyOnceWith(project, 17, 'implementer');
+		expect(getPullRequest).toHaveBeenCalledExactlyOnceWith(project, 17, 'reviewer');
 		// The merge is the fact the settle is licensed by, so it can never run first.
 		expect(settleAbsorbedChildren.mock.invocationCallOrder[0]).toBeGreaterThan(
 			completeDispatch.mock.invocationCallOrder[0] as number,
@@ -2055,7 +2076,7 @@ describe('processMergeAutomationDispatch: superseded approvals', () => {
 			getPullRequest,
 		});
 
-		expect(getPullRequest).toHaveBeenCalledExactlyOnceWith(project, 17, 'implementer');
+		expect(getPullRequest).toHaveBeenCalledExactlyOnceWith(project, 17, 'reviewer');
 		expect(markReviewVerdictSuperseded).toHaveBeenCalledExactlyOnceWith({
 			projectId: project.id,
 			repository: project.repo,
@@ -2656,5 +2677,81 @@ describe('processMergeAutomationDispatch: an adjudicated red approved head (issu
 
 		expect(commentOnPullRequest.mock.calls[0]?.[2]).toContain('Respond-to-CI');
 		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
+	});
+});
+
+describe('processMergeAutomationDispatch: whose account merges (issue #1249)', () => {
+	const NO_OPERATOR =
+		"no operator source-control credential is stored for worker 'alice-laptop' on github";
+
+	it('merges and reads as two different accounts: the operator writes, the reviewer reads', async () => {
+		const getAggregateCheckStatus = checksConcluding('success');
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged' });
+
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest,
+			getAggregateCheckStatus,
+		});
+
+		expect(runAsPullRequestOperator).toHaveBeenCalledOnce();
+		expect(runAsPullRequestOperator.mock.calls[0]?.slice(0, 2)).toEqual([project, '17']);
+		expect(getAggregateCheckStatus).toHaveBeenCalledWith(project, 'deadbeef', 'reviewer');
+		// The check read happens outside the operator scope, the merge inside it.
+		expect(getAggregateCheckStatus.mock.invocationCallOrder[0]).toBeLessThan(
+			runAsPullRequestOperator.mock.invocationCallOrder[0] ?? 0,
+		);
+		expect(mergePullRequest).toHaveBeenCalledOnce();
+	});
+
+	it('settles terminally, with the reason on the run and a reviewer comment, when there is no operator', async () => {
+		runAsPullRequestOperator.mockRejectedValueOnce(
+			new PullRequestOperatorUnavailableError(NO_OPERATOR),
+		);
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged' });
+		const commentOnPullRequest = vi.fn(
+			async (_p: unknown, _n: number, _body: string, _persona?: string) => 1,
+		);
+
+		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest,
+			commentOnPullRequest,
+		});
+
+		expect(mergePullRequest).not.toHaveBeenCalled();
+		expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+		expect(updateReviewMergeOutcome).toHaveBeenCalledExactlyOnceWith('run-1', {
+			status: MERGE_NO_OPERATOR,
+			message: `Merge automation did not merge this approved pull request: ${NO_OPERATOR}.`,
+			attempt: 0,
+			approvedHeadSha: 'deadbeef',
+			advancedFrom: undefined,
+		});
+		expect(commentOnPullRequest).toHaveBeenCalledOnce();
+		const [, prNumber, body, persona] = commentOnPullRequest.mock.calls[0] ?? [];
+		expect(prNumber).toBe(17);
+		expect(body).toContain(NO_OPERATOR);
+		expect(body).not.toMatch(/SWARM_OPERATOR_/);
+		expect(persona).toBe('reviewer');
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-no-operator');
+		expect(outcome.result).toBe(MERGE_NO_OPERATOR);
+	});
+
+	it('settles the same way when the operator is gone by the time the branch update runs', async () => {
+		runAsPullRequestOperator
+			.mockImplementationOnce(async (_p, _n, fn) =>
+				fn({ workerId: 'worker-1', workerName: 'alice-laptop' }),
+			)
+			.mockRejectedValueOnce(new PullRequestOperatorUnavailableError(NO_OPERATOR));
+		const updatePullRequestBranch = updateReturning({ status: 'updated', headSha: 'cafe' });
+
+		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning(STALE_BASE),
+			updatePullRequestBranch,
+			commentOnPullRequest: vi.fn(async () => 1),
+		});
+
+		expect(updatePullRequestBranch).not.toHaveBeenCalled();
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-no-operator');
+		expect(outcome.result).toBe(MERGE_NO_OPERATOR);
 	});
 });
