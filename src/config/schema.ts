@@ -534,7 +534,8 @@ export const PipelineBaseSchema = z.object({
 	 * from a degraded hand-off: a phase that keeps stopping involuntarily would
 	 * otherwise hand itself off forever, each time paying for a new session that
 	 * re-reads the same remainder. Counted per run row (`runs.continuation_count`)
-	 * and cleared only by "Reset & restart", not by an ordinary retry.
+	 * and cleared only by "Reset & restart", not by an ordinary retry. Only a
+	 * timeout or stall spends it; a usage-limit stop is never charged (issue #1219).
 	 */
 	maxContinuations: z.number().int().positive().optional(),
 	/**

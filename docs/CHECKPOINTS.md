@@ -352,7 +352,7 @@ continue from a checkpoint":
 | `status` | `checkpointed` — retry-pending, **not** terminal |
 | `agent_session_id` | `null` — there is deliberately no session to resume |
 | `checkpoint` | the parsed hand-off, so the API/dashboard can show the remaining work without reading a (possibly remote) worker's filesystem |
-| `continuation_count` | incremented; kept through an ordinary retry, cleared only by "Reset & restart" |
+| `continuation_count` | incremented for a timeout or stall; unchanged for a usage-limit stop (issue #1219); kept through an ordinary retry, cleared only by "Reset & restart" |
 | `next_retry_at` | the scheduled continuation, exactly as for a deferral |
 
 The continuation itself goes out through the **existing durable dispatch** — the same machinery
@@ -370,10 +370,19 @@ delete the very working tree the checkpoint describes, turning the continuation 
 
 **The fallback is bounded.** `pipeline.maxContinuations` (default 2, `docs/configuration.md`) is
 the number of times one run may be continued this way; the count lives on the run row. Once it
-is spent, the next involuntary stop is a terminal failure whose reason and
+is spent, the next timeout or stall is a terminal failure whose reason and
 `FailureDiagnosis` both say the continuation budget was exhausted, rather than a further
 hand-off. A continuation also consumes an ordinary rate-limit retry attempt, so the coarser
 `MAX_RATE_LIMIT_RETRIES` cap still applies underneath.
+
+**The budget ends only stops attributable to the run** (issue #1219). A usage limit
+(`rate-limit`) is the provider's stop, not the run's: the work was progressing and the account
+resets at a known time. So a usage-limit stop of a Tier 2 continuation is deferred to the
+reported reset (or the usual 30-minute rate-limit backoff) whatever `pipeline.maxContinuations`
+says, and spends nothing: the run stays `checkpointed` with its checkpoint and an unchanged
+`continuation_count`, the settle records the preserved-worker pin, and the retry is a
+`recoveryMode: 'checkpoint'` continuation on that machine. Only `MAX_RATE_LIMIT_RETRIES` bounds
+it. `capacity` stops are unaffected — they never become a Tier 2 continuation in the first place.
 
 **A continuation whose worker transport is lost is re-attempted as the same continuation**
 (issue #1138). The transport-loss reap reports no exit, session or checkpoint, so there is nothing

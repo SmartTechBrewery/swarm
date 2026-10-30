@@ -729,6 +729,9 @@ function deferredPhaseMessage(failure: DeferrableFailure, phase: TriggerPhase): 
  * that its budget for doing so is spent. When the budget cannot be read, it instead
  * releases the checkout before the ordinary retry. Resolved by {@link resolveCheckpointFallback};
  * `undefined` there means "not a Tier 2 case" and the deferral proceeds exactly as it did before.
+ * `continue` carries the run's continuation count *after* this settle — unchanged for a
+ * usage-limit stop, which is never charged (issue #1219) — and `exhausted` is only ever a
+ * stop attributable to the run itself (a timeout or a stall).
  */
 type CheckpointFallback =
 	| { kind: 'continue'; checkpoint: Checkpoint; continuationCount: number }
@@ -742,7 +745,8 @@ type CheckpointFallback =
  * a resumable session can still serve — so this only ever *adds* a path for stops
  * that would otherwise restart the phase from scratch. Everything after that gate is
  * evidence gathering: a parseable checkpoint that names this phase, and the run's
- * remaining continuation budget.
+ * remaining continuation budget — which a provider-side stop (a usage limit) never
+ * spends and is never ended by (issue #1219).
  *
  * The checkpoint has two sources and one meaning. A federated worker parsed the file
  * on its own host and reported it in the deferral frame (`AgentRunError.checkpoint`,
@@ -793,6 +797,14 @@ async function resolveCheckpointFallback(
 			error: describeError(readErr),
 		});
 		return { kind: 'release' };
+	}
+	// A usage limit is the provider's stop, not the run's (issue #1219): the work is
+	// progressing and the account resets at a known time, so it neither spends a
+	// continuation nor is ended by a spent budget — the continuation is re-attempted
+	// at the reset, on the same count. The budget bounds a run that keeps stopping
+	// *on its own* (a timeout, a stall); `MAX_RATE_LIMIT_RETRIES` still bounds this.
+	if (err.failure.kind === 'rate-limit') {
+		return { kind: 'continue', checkpoint, continuationCount: spent };
 	}
 	const max = resolveMaxContinuations(project);
 	if (spent >= max) return { kind: 'exhausted', spent, max };
@@ -851,7 +863,9 @@ function deferAgentRunError(
 	// The Tier 2 bound sits with the other caps rather than in the settle: a run that
 	// has already spent every continuation the project allows must fall through to a
 	// terminal failure, which the caller reports as an exhausted continuation budget.
-	// Checked first because it is the more specific of the two exhausted budgets.
+	// Checked first because it is the more specific of the two exhausted budgets. A
+	// usage-limit stop never reaches it (issue #1219): it is not charged to this budget,
+	// so the rate-limit retry cap below is the only one that can end it.
 	if (checkpointFallback?.kind === 'exhausted') {
 		logger.error(`Phase failed - ${phaseLabel(trigger.phase)} — continuation budget exhausted`, {
 			projectId,
