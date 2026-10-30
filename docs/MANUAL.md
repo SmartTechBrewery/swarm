@@ -1289,8 +1289,11 @@ Retry now once the provider is reachable.
 **A renamed repository produces no failure at all.** Cards stop dispatching and
 nothing is marked failed: the router logs `pm-status: work item has no backing SCM
 artifact reference` and completes the job as a no-op, because the card's repository
-no longer matches the project's. Fix the project's repository first, then re-point
-each worker machine's checkout — see
+no longer matches the project's. The card itself also carries a one-off SWARM notice
+("SWARM could not start …") naming the phase, both repositories and the fix — the
+same notice a card with no linked task at all gets, except a GitHub Projects draft
+card, which has no backing issue to comment on and stays log-only. Fix the project's
+repository first, then re-point each worker machine's checkout — see
 [`docs/launchd-worker-autostart.md`](./launchd-worker-autostart.md#a-repository-was-renamed),
 which carries the `swarm-repo-renamed` runbook and the ordering constraint that
 keeps worker enrollments from being suspended.

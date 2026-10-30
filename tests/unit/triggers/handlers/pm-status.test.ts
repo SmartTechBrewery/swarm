@@ -24,7 +24,11 @@ import { retireSupersededBoardPhases } from '@/dispatch/board-phase-retirement.j
 import { promoteDependencyWaits } from '@/dispatch/dispatcher.js';
 import { releaseTicketSlot } from '@/dispatch/wip-limit.js';
 import { buildPreplanContract, embedPreplanMarker, PLANNED_LABEL } from '@/pipeline/preplan.js';
-import { createPmStatusTrigger } from '@/triggers/handlers/pm-status.js';
+import {
+	createPmStatusTrigger,
+	unresolvableCardCommentBody,
+	unresolvableCardMarker,
+} from '@/triggers/handlers/pm-status.js';
 import { recordStatusAndDetectChange } from '@/triggers/pm-status-dedup.js';
 import type { PmTriggerContext, TriggerContext } from '@/triggers/types.js';
 import {
@@ -687,6 +691,153 @@ describe('pm-status trigger', () => {
 			);
 
 			expect(releaseTicketSlot).not.toHaveBeenCalled();
+		});
+	});
+
+	// Issue #1231 — a card that enters a phase-starting column but names no task for
+	// this run's repository is told so on the card, once, instead of silently doing
+	// nothing. The notice is a comment, which is neither a status change nor
+	// unattributed (it carries the SWARM footer and marker), so it cannot re-fire this
+	// handler.
+	describe('surfacing a card that names no task', () => {
+		const PLANNING = '61e4505c';
+		const TODO = '3121a97d';
+
+		function commentingCtx(
+			workItem: WorkItem,
+			comments: Partial<Pick<PMProvider, 'addComment' | 'findComment'>> = {},
+		) {
+			const addComment = vi.fn<PMProvider['addComment']>(comments.addComment ?? (async () => 'c1'));
+			const findComment = vi.fn<PMProvider['findComment']>(
+				comments.findComment ?? (async () => undefined),
+			);
+			const base = ctx(workItem);
+			return {
+				addComment,
+				findComment,
+				context: { ...base, pm: { ...base.pm, addComment, findComment } },
+			};
+		}
+
+		it.each([
+			['Planning', PLANNING, 'planning'],
+			['ToDo', TODO, 'implementation'],
+		] as const)('posts one notice naming the phase on a move into %s with no task', async (_name, statusId, phase) => {
+			const workItem = createMockWorkItem({
+				statusId,
+				taskRef: undefined,
+				taskRepository: undefined,
+			});
+			const { addComment, findComment, context } = commentingCtx(workItem);
+
+			expect(await trigger.handle(context)).toBeNull();
+
+			const marker = unresolvableCardMarker({ phase, repository: PROJECT.repo });
+			expect(findComment).toHaveBeenCalledWith(workItem.id, marker);
+			expect(addComment).toHaveBeenCalledTimes(1);
+			const [itemId, body] = addComment.mock.calls[0];
+			expect(itemId).toBe(workItem.id);
+			expect(body).toContain(marker);
+			expect(body).toContain(phase === 'planning' ? '**Planning**' : '**Implementation**');
+			expect(body).toContain('no linked source-control artifact');
+		});
+
+		it('names both repositories for a card linked into another repository', async () => {
+			const workItem = createMockWorkItem({
+				statusId: PLANNING,
+				url: 'https://github.com/acme/other/issues/12',
+			});
+			const { addComment, context } = commentingCtx(workItem);
+
+			expect(await trigger.handle(context)).toBeNull();
+
+			expect(addComment).toHaveBeenCalledTimes(1);
+			const body = addComment.mock.calls[0][1];
+			expect(body).toContain('`acme/other`');
+			expect(body).toContain(`\`${PROJECT.repo}\``);
+			expect(body).toContain(
+				unresolvableCardMarker({
+					phase: 'planning',
+					repository: PROJECT.repo,
+					artifactRepository: 'acme/other',
+				}),
+			);
+		});
+
+		it('does not repost when the card already carries the notice', async () => {
+			const workItem = createMockWorkItem({ statusId: PLANNING, taskRef: undefined });
+			const { addComment, context } = commentingCtx(workItem, {
+				findComment: async () => 'existing',
+			});
+
+			expect(await trigger.handle(context)).toBeNull();
+			expect(addComment).not.toHaveBeenCalled();
+		});
+
+		it.each([
+			['addComment', { addComment: async () => Promise.reject(new Error('draft item')) }],
+			['findComment', { findComment: async () => Promise.reject(new Error('board down')) }],
+		] as const)('still resolves null when %s rejects', async (_name, comments) => {
+			const workItem = createMockWorkItem({ statusId: PLANNING, taskRef: undefined });
+			const { context } = commentingCtx(workItem, comments);
+
+			await expect(trigger.handle(context)).resolves.toBeNull();
+		});
+
+		it.each<[string, Partial<WorkItem>, boolean]>([
+			['a status that starts no phase', { statusId: '98236657' }, true],
+			['an unchanged status', { statusId: PLANNING }, false],
+			[
+				'a card carrying `planned`',
+				{ statusId: PLANNING, labels: [{ id: 'l1', name: PLANNED_LABEL }] },
+				true,
+			],
+		])('posts nothing for %s', async (_name, overrides, changed) => {
+			vi.mocked(recordStatusAndDetectChange).mockResolvedValue(changed);
+			const workItem = createMockWorkItem({ ...overrides, taskRef: undefined });
+			const { addComment, findComment, context } = commentingCtx(workItem);
+
+			expect(await trigger.handle(context)).toBeNull();
+			expect(findComment).not.toHaveBeenCalled();
+			expect(addComment).not.toHaveBeenCalled();
+		});
+
+		it('posts nothing for a card without the automation label', async () => {
+			const workItem = createMockWorkItem({ statusId: PLANNING, taskRef: undefined, labels: [] });
+			const { addComment, findComment, context } = commentingCtx(workItem);
+
+			expect(await trigger.handle(context)).toBeNull();
+			expect(findComment).not.toHaveBeenCalled();
+			expect(addComment).not.toHaveBeenCalled();
+		});
+
+		it('posts the notice on an unlabeled card when the automation gate is off', async () => {
+			const workItem = createMockWorkItem({ statusId: PLANNING, taskRef: undefined, labels: [] });
+			const { addComment, context } = commentingCtx(workItem);
+			const project = { ...PROJECT, pipeline: { ...PROJECT.pipeline, automationLabel: '' } };
+
+			expect(await trigger.handle({ ...context, project })).toBeNull();
+			expect(addComment).toHaveBeenCalledTimes(1);
+		});
+
+		it('posts nothing for a card that dispatches', async () => {
+			const workItem = createMockWorkItem({ statusId: PLANNING });
+			const { addComment, findComment, context } = commentingCtx(workItem);
+
+			expect(await trigger.handle(context)).toEqual({ phase: 'planning', taskId: '10', workItem });
+			expect(findComment).not.toHaveBeenCalled();
+			expect(addComment).not.toHaveBeenCalled();
+		});
+
+		it('ends the body in the SWARM footer and marker', () => {
+			const notice = { phase: 'implementation', repository: 'acme/app' } as const;
+			const body = unresolvableCardCommentBody(notice);
+
+			expect(body).toContain('SWARM could not start Implementation');
+			expect(body.split('\n').slice(-2)).toEqual([
+				'_Generated by SWARM._',
+				unresolvableCardMarker(notice),
+			]);
 		});
 	});
 });
