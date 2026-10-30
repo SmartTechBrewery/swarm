@@ -223,6 +223,11 @@ export interface CreateFailedRunInput {
 	prNumber?: string;
 	/** The payload a "Retry now" on this row rebuilds its dispatch from. */
 	jobPayload?: SwarmJob;
+	/**
+	 * The operator-facing headline of the abandonment, when it has one (issue
+	 * #1203) — its `kind` is the recorded fact the WIP read model classifies on.
+	 */
+	failureDiagnosis?: FailureDiagnosis;
 }
 
 /**
@@ -257,6 +262,7 @@ export async function createFailedRun(input: CreateFailedRunInput): Promise<stri
 			jobPayload: input.jobPayload,
 			status: 'failed',
 			error: input.error,
+			failureDiagnosis: input.failureDiagnosis,
 			completedAt: new Date(),
 		})
 		.returning({ id: runs.id });
@@ -1894,6 +1900,12 @@ export interface TaskActivityRow {
 	reviewVerdict: string | null;
 	reviewAutomationOutcome: string | null;
 	reviewMergeOutcome: string | null;
+	/**
+	 * The latest run's own `failure_diagnosis.kind` (issue #1203) — a fact about
+	 * that run, not the group, which is what the WIP classifier reads beside its
+	 * `status`; so it is read off the selected row, unlike `mergedRunCount`.
+	 */
+	failureDiagnosisKind: string | null;
 	/** `max(coalesce(completed_at, started_at))` across the group. */
 	lastActivityAt: Date;
 	/** How many runs in the group are still `running`. */
@@ -1996,6 +2008,7 @@ export async function listTaskActivitySince(input: {
 			reviewVerdict: runs.reviewVerdict,
 			reviewAutomationOutcome: runs.reviewAutomationOutcome,
 			reviewMergeOutcome: runs.reviewMergeOutcome,
+			failureDiagnosisKind: sql<string | null>`${runs.failureDiagnosis}->>'kind'`,
 			lastActivityAt: activity.lastActivityAt,
 			liveRunCount: activity.liveRunCount,
 			mergedRunCount: activity.mergedRunCount,

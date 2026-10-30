@@ -6,7 +6,12 @@
  */
 
 import type { WorkItemCellRun } from '@/components/runs/work-item-cell.js';
-import type { WipOperatorReason, WipTicket, WipUsageEntry } from '@/types/runs.js';
+import type {
+	WipOperatorReason,
+	WipPipelineReason,
+	WipTicket,
+	WipUsageEntry,
+} from '@/types/runs.js';
 import { stalledPhaseLabel } from './stalled-items.js';
 
 /** Not a byte a project id or repository slug can contain. */
@@ -33,6 +38,15 @@ const OPERATOR_REASON_LABELS: Record<WipOperatorReason, string> = {
 
 export function wipOperatorReasonLabel(reason: WipOperatorReason): string {
 	return OPERATOR_REASON_LABELS[reason] ?? reason;
+}
+
+/** Why the pipeline is still on it, when there is something more specific to say. */
+const PIPELINE_REASON_LABELS: Record<WipPipelineReason, string> = {
+	'waiting-for-checks': 'Waiting for CI — Review starts when the checks finish',
+};
+
+export function wipPipelineReasonLabel(reason: WipPipelineReason): string {
+	return PIPELINE_REASON_LABELS[reason] ?? reason;
 }
 
 /** What a holder is doing, as one line: the phase it is in and whether it moves. */

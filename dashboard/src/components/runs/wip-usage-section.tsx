@@ -8,6 +8,7 @@ import {
 	WIP_SECTION_EXPLANATION,
 	wipInFlightLabel,
 	wipOperatorReasonLabel,
+	wipPipelineReasonLabel,
 	wipTicketActivityLabel,
 	wipTicketRun,
 	wipUsageKey,
@@ -52,6 +53,9 @@ function WipTicketRow({ ticket, repository }: { ticket: WipTicket; repository: s
 				</div>
 				{waitingOnOperator && ticket.operatorReason && (
 					<span className="text-amber-200/80">{wipOperatorReasonLabel(ticket.operatorReason)}</span>
+				)}
+				{ticket.state === 'waiting-on-pipeline' && ticket.pipelineReason && (
+					<span className="text-zinc-400">{wipPipelineReasonLabel(ticket.pipelineReason)}</span>
 				)}
 				<div className="flex flex-wrap items-center gap-2 md:justify-end">
 					<PullRequestReference ticket={ticket} />

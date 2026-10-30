@@ -27,7 +27,12 @@
  *    and no dispatch inside the lookback reads as liveness would read silence: `settling`
  *    for {@link ITEM_STALL_AFTER_MS} after the slot opened, `stalled` after.
  * 4. Its latest run `failed` with nothing queued → `waiting-on-operator` (`failed`):
- *    nothing will retry it.
+ *    nothing will retry it. **Except** a Review abandoned while the head's checks
+ *    were still running, recorded as `failure_diagnosis.kind =
+ *    'review-waiting-for-checks'` (issue #1203): the completed-checks event resumes
+ *    it by itself, so it falls through to the rules below — `waiting-on-pipeline`
+ *    (`waiting-for-checks`) inside the liveness grace window, `stalled` after it.
+ *    That rests on the recorded kind, never on parsing the run's `error`.
  * 5. Liveness `awaiting-human` → `waiting-on-operator`, naming which recorded
  *    hand-off (`awaitingHumanCause`: review cap reached, plan awaiting greenlight,
  *    approved and awaiting merge).
@@ -54,6 +59,7 @@ import {
 	type ItemLivenessUnit,
 	livenessUnitKeysForDispatch,
 } from '../dispatch/item-liveness.js';
+import type { FailureDiagnosisKind } from '../worker/failure-diagnosis.js';
 
 /** What one slot holder is doing, as the operator needs to read it. */
 export const WipTicketStateSchema = z.enum([
@@ -71,6 +77,10 @@ export const WipOperatorReasonSchema = z.enum([
 ]);
 export type WipOperatorReason = z.infer<typeof WipOperatorReasonSchema>;
 
+/** Why a `waiting-on-pipeline` holder waits, when there is something more specific to say. */
+export const WipPipelineReasonSchema = z.enum(['waiting-for-checks']);
+export type WipPipelineReason = z.infer<typeof WipPipelineReasonSchema>;
+
 /** One ticket holding a slot. */
 export const WipTicketSchema = z.object({
 	taskId: z.string(),
@@ -84,6 +94,8 @@ export const WipTicketSchema = z.object({
 	state: WipTicketStateSchema,
 	/** `waiting-on-operator` only. */
 	operatorReason: WipOperatorReasonSchema.optional(),
+	/** `waiting-on-pipeline` only. */
+	pipelineReason: WipPipelineReasonSchema.optional(),
 	/** The phase of the latest run in the deciding unit, when there is one. */
 	phase: z.string().optional(),
 	/** The ticket's pull request, once a pull request-driven phase recorded one. */
@@ -135,6 +147,9 @@ export interface WipUsageInput {
 /** Not a byte a project id, repository slug, or task id can contain. */
 const KEY_SEPARATOR = '\u0000';
 
+/** The diagnosis an abandoned Review records when the head's checks were still running. */
+const WAITING_FOR_CHECKS_KIND: FailureDiagnosisKind = 'review-waiting-for-checks';
+
 const DEFAULT_POLICY: ItemLivenessPolicy = {
 	planningAutoAdvance: false,
 	autoMergeRepositories: [],
@@ -147,6 +162,7 @@ function key(...parts: string[]): string {
 interface HolderVerdict {
 	state: WipTicketState;
 	operatorReason?: WipOperatorReason;
+	pipelineReason?: WipPipelineReason;
 	decidingUnit?: ItemLivenessUnit;
 }
 
@@ -176,7 +192,10 @@ function classifyHolder(
 			? { state: 'waiting-on-pipeline' }
 			: { state: 'waiting-on-operator', operatorReason: 'stalled' };
 	}
-	if (decidingUnit.latest.status === 'failed') {
+	const waitingForChecks =
+		decidingUnit.latest.status === 'failed' &&
+		decidingUnit.latest.failureDiagnosisKind === WAITING_FOR_CHECKS_KIND;
+	if (decidingUnit.latest.status === 'failed' && !waitingForChecks) {
 		return { state: 'waiting-on-operator', operatorReason: 'failed', decidingUnit };
 	}
 	const liveness = classifyItemLiveness(decidingUnit, policy, now);
@@ -191,7 +210,13 @@ function classifyHolder(
 	if (liveness === 'stalled') {
 		return { state: 'waiting-on-operator', operatorReason: 'stalled', decidingUnit };
 	}
-	return { state: 'waiting-on-pipeline', decidingUnit };
+	return {
+		state: 'waiting-on-pipeline',
+		...(waitingForChecks && liveness === 'settling'
+			? { pipelineReason: 'waiting-for-checks' as const }
+			: {}),
+		decidingUnit,
+	};
 }
 
 function toTicket(slot: WipSlotRow, verdict: HolderVerdict): WipTicket {
@@ -205,6 +230,7 @@ function toTicket(slot: WipSlotRow, verdict: HolderVerdict): WipTicket {
 		openedAt: slot.openedAt.toISOString(),
 		state: verdict.state,
 		...(verdict.operatorReason ? { operatorReason: verdict.operatorReason } : {}),
+		...(verdict.pipelineReason ? { pipelineReason: verdict.pipelineReason } : {}),
 		...(latest ? { phase: latest.phase } : {}),
 		...(slot.prNumber ? { prNumber: slot.prNumber } : {}),
 		...(verdict.decidingUnit
