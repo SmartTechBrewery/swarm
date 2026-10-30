@@ -7,8 +7,10 @@
  * (`commands/users.ts`) and `swarm members` (`commands/members.ts`).
  *
  * **It holds no `DATABASE_URL`** (issue #800). Every subcommand reaches the
- * control plane's operator API over `SWARM_CONTROL_PLANE_URL`
- * (`../_shared/operator-client.ts` → the router's `/operator/trpc/*` mount),
+ * control plane's operator API over `SWARM_CONTROL_PLANE_URL` — from the
+ * environment, else this checkout's `.env`, the precedence every command shares
+ * (`../_shared/control-plane-env.ts`) — through `../_shared/operator-client.ts` →
+ * the router's `/operator/trpc/*` mount,
  * authenticated by the session `swarm login` caches — so the whole command group
  * runs from a machine that has never had Postgres credentials, which is precisely
  * the machine being onboarded. It imports nothing from `../../db/*` and nothing
@@ -227,10 +229,12 @@ Usage:
              at the control plane, registers the worker, stores its operator
              source-control credential, and enrolls it in <project-id> — then
              prints the exact command that starts it. SWARM_CONTROL_PLANE_URL is
-             taken from .env when it is already there (left untouched, so a
-             second worker on this machine changes nothing), otherwise from
-             --control-plane-url, the environment, or a prompt on a TTY, and
-             written to .env for the daemon to read. Nothing else is scaffolded:
+             taken from --control-plane-url, else the environment, else .env,
+             else a prompt on a TTY — the order every swarm command uses — and
+             written to .env for the daemon to read when .env carries none. An
+             existing assignment is left untouched (so a second worker on this
+             machine changes nothing); a URL that differs from it is refused,
+             because the daemon reads .env. Nothing else is scaffolded:
              a worker holds no DATABASE_URL, which is why \`swarm init\` is the
              wrong command for this machine. The
              provider is resolved from the target project, so the credential
@@ -444,7 +448,8 @@ Usage:
              Revoking it blocks future dispatch without stopping a running agent.
              The machine's owner alone may do it, so sign in as them.
 
-Requires SWARM_CONTROL_PLANE_URL and a \`swarm login\` session — and no
+Requires SWARM_CONTROL_PLANE_URL (from the environment, or this checkout's .env)
+and a \`swarm login\` session — and no
 DATABASE_URL: every subcommand except add-checkout and remove-checkout calls the
 control plane's operator API, so this runs from the machine being onboarded. A
 worker is a local execution environment owned by a SWARM user; an enrollment
@@ -781,9 +786,9 @@ interface Operator {
 }
 
 /**
- * Resolve `SWARM_CONTROL_PLANE_URL` + the cached `swarm login` session into a
- * client, printing the one actionable line and returning `undefined` when either
- * is missing. Called *after* a subcommand has parsed its arguments, so `--help`
+ * Resolve the control-plane URL (environment, else this checkout's `.env`) + the
+ * cached `swarm login` session into a client, printing the one actionable line
+ * and returning `undefined` when either is missing. Called *after* a subcommand has parsed its arguments, so `--help`
  * and a usage error still answer on a machine that has never logged in.
  */
 function requireOperator(): Operator | undefined {
@@ -2354,11 +2359,12 @@ async function planRegisterAndEnroll(
 	const extraRepoRoots = await validateExtraCheckouts(repoRoot, values['extra-checkout'] ?? []);
 	if (!extraRepoRoots) return { ok: false, code: 1 };
 
-	// Before `requireOperator`, which reads SWARM_CONTROL_PLANE_URL: on a machine
+	// Before `requireOperator`, which resolves SWARM_CONTROL_PLANE_URL: on a machine
 	// being onboarded for its first worker nothing has ever written it, and the
 	// daemon this command ends by printing a start line for reads it from the same
-	// `.env`. Idempotent by construction (`../_shared/control-plane-env.ts`), so a
-	// second worker on an onboarded machine passes straight through. It is the one
+	// `.env` — which is why a URL differing from `.env`'s is refused here rather
+	// than used. Idempotent by construction (`../_shared/control-plane-env.ts`), so
+	// a second worker on an onboarded machine passes straight through. It is the one
 	// write that precedes the plan-then-act ordering below, and deliberately: it
 	// touches nothing on the control plane, and every step after it needs the URL.
 	if (!(await ensureControlPlaneUrl(values['control-plane-url']))) return { ok: false, code: 1 };
