@@ -28,7 +28,7 @@
  * A card that enters a phase-starting column but names no task for this run's
  * repository is skipped, and since issue #1231 the skip is surfaced on the card
  * itself as a one-off SWARM notice rather than only in the router log
- * ({@link surfaceUnresolvableCard}).
+ * ({@link surfaceUnresolvableCard}) — for a card opted into automation only.
  *
  * Loop prevention (a persona's own board moves must not re-fire the trigger)
  * already happened router-side (`PMRouterAdapter.isSelfAuthored`), so it isn't
@@ -44,6 +44,7 @@ import { releaseTicketSlot } from '../../dispatch/wip-limit.js';
 import { requireProjectPMAdapter } from '../../integrations/pm/registry.js';
 import { logger } from '../../lib/logger.js';
 import { hasPlannedLabel, PLANNED_LABEL } from '../../pipeline/preplan.js';
+import { hasAutomationLabel, resolveAutomationLabel } from '../../pm/automation-label.js';
 import {
 	isPhaseReportedStatusKey,
 	type PipelinePhase,
@@ -200,6 +201,17 @@ export function unresolvableCardCommentBody(notice: UnresolvableCardNotice): str
  * Only for a genuine move: a resumed phase replays its original event and records
  * no status change, so it posts nothing.
  *
+ * Only for a card opted into automation: the notice runs inside the trigger, ahead
+ * of the consumer's automation-label gate, so it applies the same gate itself
+ * (`resolveAutomationLabel` / `hasAutomationLabel`, ai/RULES.md §5). A card without
+ * the label is one SWARM must not touch — on a shared board it may well belong to
+ * another repository's manual work — and an empty `automationLabel` switches the
+ * gate off here exactly as it does there. `pipeline.requireAssignee` deliberately
+ * does **not** suppress the notice: it is an eligibility rule on a card that has
+ * already opted in, not an opt-out, and the operator who labelled it still needs
+ * to learn that it names no task — fixing that link is what lets the assignee gate
+ * report its own reason on the next move.
+ *
  * Best-effort: any provider failure is logged and swallowed, so the skip stays a
  * skip. A GitHub Projects draft card has no backing issue to comment on, so its
  * `addComment` throws and that case stays log-only.
@@ -211,6 +223,8 @@ async function surfaceUnresolvableCard(
 	statusChanged: boolean,
 ): Promise<void> {
 	if (!statusChanged) return;
+	const automationLabel = resolveAutomationLabel(ctx.project.pipeline);
+	if (automationLabel && !hasAutomationLabel(workItem, automationLabel)) return;
 	const artifactRepository = workItem.taskRepository;
 	const notice: UnresolvableCardNotice = {
 		phase,

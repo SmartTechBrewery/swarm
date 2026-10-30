@@ -802,6 +802,24 @@ describe('pm-status trigger', () => {
 			expect(addComment).not.toHaveBeenCalled();
 		});
 
+		it('posts nothing for a card without the automation label', async () => {
+			const workItem = createMockWorkItem({ statusId: PLANNING, taskRef: undefined, labels: [] });
+			const { addComment, findComment, context } = commentingCtx(workItem);
+
+			expect(await trigger.handle(context)).toBeNull();
+			expect(findComment).not.toHaveBeenCalled();
+			expect(addComment).not.toHaveBeenCalled();
+		});
+
+		it('posts the notice on an unlabeled card when the automation gate is off', async () => {
+			const workItem = createMockWorkItem({ statusId: PLANNING, taskRef: undefined, labels: [] });
+			const { addComment, context } = commentingCtx(workItem);
+			const project = { ...PROJECT, pipeline: { ...PROJECT.pipeline, automationLabel: '' } };
+
+			expect(await trigger.handle({ ...context, project })).toBeNull();
+			expect(addComment).toHaveBeenCalledTimes(1);
+		});
+
 		it('posts nothing for a card that dispatches', async () => {
 			const workItem = createMockWorkItem({ statusId: PLANNING });
 			const { addComment, findComment, context } = commentingCtx(workItem);
