@@ -4,6 +4,10 @@ import type { releaseTicketSlot as ReleaseTicketSlot } from '@/dispatch/wip-limi
 vi.mock('@/dispatch/wip-limit.js', () => ({
 	releaseTicketSlot: vi.fn<typeof ReleaseTicketSlot>(),
 }));
+const { findTaskIdForStoredTaskBranch } = vi.hoisted(() => ({
+	findTaskIdForStoredTaskBranch: vi.fn(),
+}));
+vi.mock('@/db/repositories/runsRepository.js', () => ({ findTaskIdForStoredTaskBranch }));
 
 import { releaseTicketSlot } from '@/dispatch/wip-limit.js';
 import type { ScmEvent } from '@/scm/events.js';
@@ -38,6 +42,8 @@ function closed(overrides: Partial<ScmEvent> = {}) {
 beforeEach(() => {
 	vi.mocked(releaseTicketSlot).mockReset();
 	vi.mocked(releaseTicketSlot).mockResolvedValue(true);
+	findTaskIdForStoredTaskBranch.mockReset();
+	findTaskIdForStoredTaskBranch.mockResolvedValue(undefined);
 });
 
 // Issue #1185: a ticket's pull request closing frees its repository WIP slot.
@@ -73,6 +79,27 @@ describe('wip-release trigger', () => {
 			PROJECT.id,
 			PROJECT.repo,
 			'VT-1538',
+			'pull-request-merged',
+		);
+	});
+
+	// Issue #1247: the branch Implementation recorded still names the ticket after the
+	// repository's prefix is cleared.
+	it('releases the ticket of a recorded branch after the prefix is cleared', async () => {
+		const cleared = createMockProjectConfig({ branchPrefix: '' });
+		findTaskIdForStoredTaskBranch.mockResolvedValue('42');
+
+		await trigger.handle({ ...closed(), project: cleared });
+
+		expect(findTaskIdForStoredTaskBranch).toHaveBeenCalledWith(
+			cleared.id,
+			cleared.repo,
+			'issue-42',
+		);
+		expect(releaseTicketSlot).toHaveBeenCalledExactlyOnceWith(
+			cleared.id,
+			cleared.repo,
+			'42',
 			'pull-request-merged',
 		);
 	});

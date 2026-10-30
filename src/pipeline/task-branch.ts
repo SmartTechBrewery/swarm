@@ -14,9 +14,12 @@
  *
  * A branch is recognised under the repository's pattern **and** under its legacy
  * prefix shape ({@link taskIdFromTaskBranch}), so a pull request opened before a
- * pattern was first set stays SWARM's own without any migration. Only those two are
- * tried: a branch rendered by an *earlier* pattern is not recognised once the pattern
- * changes again, which the dashboard's pattern editor warns about.
+ * pattern was first set stays SWARM's own without any migration. Control-plane readers
+ * look the branch up among the branches Implementation recorded first
+ * (`findTaskIdForPrBranch`, `findTaskIdForStoredTaskBranch` — issue #1247), so a pull
+ * request survives its repository's pattern or prefix changing; this decode decides
+ * only for one whose run stored no branch (before issue #1241), and the DB-free
+ * worker-side fallbacks that have no recorded branch to read.
  */
 
 import {
@@ -122,7 +125,8 @@ export function taskIdFromBranch(
  * (issue #1241), or under its legacy `<branchPrefix><taskId>` shape, which stays
  * recognised after a pattern is set so every branch already open under the prefix
  * keeps being SWARM's own. A branch named by an earlier *pattern* is not: only the
- * current one is tried. `strict` applies to the legacy shape exactly as in
+ * current one is tried, which is why control-plane readers consult the recorded branch
+ * first (`findTaskIdForPrBranch`, issue #1247). `strict` applies to the legacy shape exactly as in
  * {@link taskIdFromBranch}; the pattern always matches the whole branch.
  */
 export function taskIdFromTaskBranch(

@@ -595,6 +595,8 @@ vi.mock('@/db/repositories/runsRepository.js', () => ({
 		findStoredTaskBranch(projectId, repository, taskId),
 	findStoredCommitSubject: (projectId: string, repository: string, taskId: string) =>
 		findStoredCommitSubject(projectId, repository, taskId),
+	// No recorded task branch (issue #1247): the automation-label gate decodes the PR branch.
+	findTaskIdForStoredTaskBranch: async () => undefined,
 	hasCompletedRunForTask: (projectId: string, taskId: string, phase: string) =>
 		hasCompletedRunForTask(projectId, taskId, phase),
 	isRetryPendingStatus: (status: string) => status === 'deferred' || status === 'checkpointed',
