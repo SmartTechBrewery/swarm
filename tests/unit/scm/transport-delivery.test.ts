@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CreatePullRequestInput, ScmDeliveryProvider } from '@/scm/delivery.js';
 import { createTransportScmDeliveryProvider, type FetchLike } from '@/scm/transport-delivery.js';
 import { TRANSPORT_PROTOCOL_VERSION } from '@/transport/protocol.js';
+import { createMockPullRequestContext } from '../../helpers/factories.js';
 
 const CONTROL_PLANE = 'https://swarm.example';
 const CREDENTIAL = 'raw-worker-credential-secret';
@@ -17,6 +18,7 @@ function makeLocalDelegate(overrides: Partial<ScmDeliveryProvider> = {}): ScmDel
 		createPullRequest: vi.fn().mockResolvedValue({ number: 6, url: 'u' }),
 		pushBranch: vi.fn().mockResolvedValue(undefined),
 		submitReview: vi.fn(),
+		readPullRequestContext: vi.fn(async () => createMockPullRequestContext()),
 		postComment: vi.fn(),
 		...overrides,
 	};
@@ -28,6 +30,26 @@ function jsonResponse(status: number, body: unknown): Awaited<ReturnType<FetchLi
 
 describe('createTransportScmDeliveryProvider', () => {
 	beforeEach(() => vi.clearAllMocks());
+
+	it('reads the pull request context on the local delegate, never over the transport (issue #1239)', async () => {
+		const fetchImpl = vi.fn<FetchLike>();
+		const localDelegate = makeLocalDelegate();
+		const provider = createTransportScmDeliveryProvider({
+			controlPlaneUrl: CONTROL_PLANE,
+			workerCredential: CREDENTIAL,
+			projectId: PROJECT_ID,
+			repository: REPOSITORY,
+			persona: 'reviewer',
+			localDelegate,
+			fetchImpl,
+		});
+
+		await expect(provider.readPullRequestContext(42)).resolves.toEqual(
+			createMockPullRequestContext(),
+		);
+		expect(localDelegate.readPullRequestContext).toHaveBeenCalledWith(42);
+		expect(fetchImpl).not.toHaveBeenCalled();
+	});
 
 	it('POSTs submitReview to the review endpoint with the bearer header and schema-valid body', async () => {
 		const fetchImpl = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(200, { reviewId: 77 }));

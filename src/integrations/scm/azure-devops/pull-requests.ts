@@ -6,7 +6,8 @@
  * `getAzureDevOpsCommitChecks`, `listAzureDevOpsPullRequestsForCommit`,
  * `listActiveAzureDevOpsPullRequestsForBase`, `findActiveAzureDevOpsPullRequest`,
  * plus the merge path's commit-graph staleness read,
- * `isAzureDevOpsBaseContainedInHead`. The one write here is
+ * `isAzureDevOpsBaseContainedInHead`, and the agent's read of a pull request and
+ * its discussion, `readAzureDevOpsPullRequestContext` (issue #1239). The one write here is
  * `retryFailedAzureDevOpsBuilds` (issue #1133), which shares the aggregate's build
  * scan so it can only ever retry a build that aggregate counts.
  *
@@ -34,6 +35,10 @@
  */
 
 import { logger } from '../../../lib/logger.js';
+import type {
+	PullRequestContext,
+	PullRequestDiscussionEntry,
+} from '../../../scm/pull-request-context.js';
 import type {
 	AggregateCheckStatus,
 	CheckRunState,
@@ -70,6 +75,7 @@ const AZURE_REPOS_GIT = 'TfsGit';
 interface AzureDevOpsPullRequest {
 	pullRequestId?: number;
 	title?: string;
+	description?: string;
 	/** `active` | `completed` | `abandoned` (`notSet` on a malformed record). */
 	status?: string;
 	isDraft?: boolean;
@@ -95,6 +101,28 @@ interface AzureDevOpsPullRequest {
 /** A `{ count, value }` list response. */
 interface AzureDevOpsList<T> {
 	value?: T[];
+}
+
+/** One pull-request thread, typed to the fields the context read depends on. */
+interface AzureDevOpsDiscussionThread {
+	isDeleted?: boolean;
+	/** Present on a thread anchored to a file; `filePath` carries a leading `/`. */
+	threadContext?: {
+		filePath?: string;
+		rightFileStart?: { line?: number } | null;
+		leftFileStart?: { line?: number } | null;
+	} | null;
+	comments?: AzureDevOpsDiscussionComment[] | null;
+}
+
+/** One comment of an {@link AzureDevOpsDiscussionThread}. */
+interface AzureDevOpsDiscussionComment {
+	content?: string;
+	/** `text` | `system` | `codeChange` — `system` is Azure's own activity bookkeeping. */
+	commentType?: string;
+	isDeleted?: boolean;
+	publishedDate?: string;
+	author?: { displayName?: string; uniqueName?: string } | null;
 }
 
 /** One ref, as `GET …/refs` lists it. */
@@ -260,6 +288,68 @@ export async function getAzureDevOpsPullRequest(
 	pullRequestId: number,
 ): Promise<PullRequestDetails> {
 	return toPullRequestDetails(await getPullRequestObject(repo, pullRequestId));
+}
+
+/** A thread's comments as discussion entries, skipping Azure's own and deleted ones. */
+function discussionEntries(thread: AzureDevOpsDiscussionThread): PullRequestDiscussionEntry[] {
+	if (thread.isDeleted) return [];
+	const filePath = thread.threadContext?.filePath;
+	const anchor = filePath
+		? {
+				kind: 'review-comment' as const,
+				path: filePath.replace(/^\/+/, ''),
+				line:
+					thread.threadContext?.rightFileStart?.line ?? thread.threadContext?.leftFileStart?.line,
+			}
+		: { kind: 'comment' as const };
+	return (thread.comments ?? [])
+		.filter(
+			(comment) =>
+				!comment.isDeleted && comment.commentType !== 'system' && Boolean(comment.content?.trim()),
+		)
+		.map((comment) => ({
+			...anchor,
+			author: comment.author?.displayName ?? comment.author?.uniqueName ?? null,
+			createdAt: comment.publishedDate ?? null,
+			body: comment.content ?? '',
+		}));
+}
+
+/**
+ * A pull request and its discussion, for the agent that reviews or answers it
+ * (issue #1239). The discussion is every human-authored comment of every thread —
+ * SWARM's own review verdicts included, since a review here is a marker-carrying
+ * thread (`./writes.ts`) — with Azure's `system` activity entries and deleted
+ * comments and threads left out. The threads endpoint answers every thread in one
+ * response; it is not paged. Azure links no issue to a pull request the way GitHub
+ * does, so the context carries no issue-read hint.
+ */
+export async function readAzureDevOpsPullRequestContext(
+	repo: string,
+	pullRequestId: number,
+): Promise<PullRequestContext> {
+	const [pr, threads] = await Promise.all([
+		getPullRequestObject(repo, pullRequestId),
+		azureDevOpsRequest<AzureDevOpsList<AzureDevOpsDiscussionThread> | undefined>(
+			'GET',
+			`${pullRequestPath(repo, pullRequestId)}/threads`,
+		),
+	]);
+	const number = pr.pullRequestId;
+	if (number === undefined || !pr.sourceRefName || !pr.targetRefName) {
+		throw new Error(
+			`Azure DevOps pull-request response is missing required fields (pullRequestId=${number}, source=${pr.sourceRefName}, target=${pr.targetRefName})`,
+		);
+	}
+	return {
+		number,
+		title: pr.title ?? '',
+		description: pr.description ?? '',
+		baseBranch: branchName(pr.targetRefName),
+		headBranch: branchName(pr.sourceRefName),
+		url: pullRequestWebUrl(repo, number),
+		discussion: (threads?.value ?? []).flatMap(discussionEntries),
+	};
 }
 
 /**

@@ -1438,6 +1438,7 @@ describe('GitWorktreeManager', () => {
 				':(exclude)respond_to_ci_handoff.json',
 				':(exclude)resolve_conflicts_handoff.json',
 				':(exclude)swarm_checkpoint.json',
+				':(exclude)swarm_pull_request.md',
 				':(exclude).swarm_delivery.json',
 			]);
 		});

@@ -15,6 +15,10 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { Octokit } from '@octokit/rest';
 
 import { logger } from '../../../lib/logger.js';
+import type {
+	PullRequestContext,
+	PullRequestDiscussionEntry,
+} from '../../../scm/pull-request-context.js';
 import { deliveryMarker } from '../../../scm/swarm-origin.js';
 import type {
 	AggregateCheckStatus,
@@ -707,4 +711,92 @@ export async function postIdempotentPullRequestComment(
 		body: `${input.body}\n\n${marker}`,
 	});
 	return data.id;
+}
+
+/** A submitted review's GitHub state, in the neutral `ScmReviewState` spelling where one maps. */
+function neutralReviewState(state: string): string {
+	return state === 'CHANGES_REQUESTED' ? 'changes-requested' : state.toLowerCase();
+}
+
+/**
+ * A pull request's context for the agent that reviews or answers it (issue
+ * #1239): the PR itself, its top-level comments, its submitted reviews, and its
+ * file-anchored review comments. A `PENDING` review is someone's unsubmitted
+ * draft, and a `COMMENTED` review with no body is only the container its inline
+ * comments were submitted in — those arrive as review comments — so both are
+ * left out.
+ *
+ * The issue-read hint keeps the agent's `gh issue view` reads of a linked issue
+ * and its plan, the one read GitHub still serves through the CLI: the issue is a
+ * GitHub issue in the same repository, and the agent's `GH_TOKEN` can read it.
+ */
+export async function readGitHubPullRequestContext(
+	owner: string,
+	repo: string,
+	prNumber: number,
+): Promise<PullRequestContext> {
+	const client = getScopedClient();
+	const [{ data: pull }, comments, reviews, reviewComments] = await Promise.all([
+		client.pulls.get({ owner, repo, pull_number: prNumber }),
+		client.paginate(client.issues.listComments, {
+			owner,
+			repo,
+			issue_number: prNumber,
+			per_page: 100,
+		}),
+		client.paginate(client.pulls.listReviews, {
+			owner,
+			repo,
+			pull_number: prNumber,
+			per_page: 100,
+		}),
+		client.paginate(client.pulls.listReviewComments, {
+			owner,
+			repo,
+			pull_number: prNumber,
+			per_page: 100,
+		}),
+	]);
+	const discussion: PullRequestDiscussionEntry[] = [
+		...comments.map(
+			(comment): PullRequestDiscussionEntry => ({
+				kind: 'comment',
+				author: comment.user?.login ?? null,
+				createdAt: comment.created_at ?? null,
+				body: comment.body ?? '',
+			}),
+		),
+		...reviews
+			.filter((review) => review.state !== 'PENDING')
+			.filter((review) => review.state !== 'COMMENTED' || (review.body ?? '').trim() !== '')
+			.map(
+				(review): PullRequestDiscussionEntry => ({
+					kind: 'review',
+					author: review.user?.login ?? null,
+					createdAt: review.submitted_at ?? null,
+					body: review.body ?? '',
+					reviewState: neutralReviewState(review.state),
+				}),
+			),
+		...reviewComments.map(
+			(comment): PullRequestDiscussionEntry => ({
+				kind: 'review-comment',
+				author: comment.user?.login ?? null,
+				createdAt: comment.created_at ?? null,
+				body: comment.body ?? '',
+				path: comment.path,
+				line: comment.line ?? comment.original_line ?? undefined,
+			}),
+		),
+	];
+	return {
+		number: pull.number,
+		title: pull.title,
+		description: pull.body ?? '',
+		baseBranch: pull.base.ref,
+		headBranch: pull.head.ref,
+		url: pull.html_url,
+		discussion,
+		issueReadHint: `Issues this pull request references are GitHub issues in \`${owner}/${repo}\`: read one, including any plan posted on it, with \`gh issue view <number> --repo ${owner}/${repo} --comments\`.`,
+	};
 }

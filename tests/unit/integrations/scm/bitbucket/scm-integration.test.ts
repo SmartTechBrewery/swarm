@@ -1,5 +1,6 @@
 import { createHmac } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { ScmReadUnsupportedError } from '@/scm/pull-request-context.js';
 
 import { createMockProjectConfig, createMockScmEvent } from '../../../../helpers/factories.js';
 
@@ -750,6 +751,14 @@ describe('BitbucketSCMIntegration', () => {
 			);
 			vi.mocked(getBitbucketUserForCredential).mockResolvedValue('swarm-impl');
 			vi.mocked(getScopedBitbucketUserEmail).mockResolvedValue('impl@example.com');
+		});
+
+		it('declares the pull-request context read not yet supported (issue #1239)', async () => {
+			const delivery = await scm.deliveryProvider(project, 'reviewer');
+			await expect(delivery.readPullRequestContext(1)).rejects.toThrow(ScmReadUnsupportedError);
+			await expect(delivery.readPullRequestContext(1)).rejects.toThrow(
+				'not yet supported on Bitbucket Cloud',
+			);
 		});
 
 		it('signs commits with the account nickname and its confirmed email', async () => {

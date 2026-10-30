@@ -35,7 +35,11 @@ import {
 	UnretryableDeliveryError,
 } from '@/scm/delivery.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
-import { createMockProjectConfig, createMockWorkItem } from '../../helpers/factories.js';
+import {
+	createMockProjectConfig,
+	createMockPullRequestContext,
+	createMockWorkItem,
+} from '../../helpers/factories.js';
 
 const PR_BRANCH = 'issue-21';
 
@@ -200,6 +204,7 @@ function makeDeps() {
 			createPullRequest: vi.fn(async () => ({ number: 99, url: 'https://x/pull/99' })),
 			pushBranch: vi.fn(async (_cwd: string, _branch: string, _expectedSha: string) => {}),
 			submitReview: vi.fn(async () => 0),
+			readPullRequestContext: vi.fn(async () => createMockPullRequestContext()),
 			postComment: vi.fn(
 				async (_input: { prNumber: number; body: string; deliveryId: string }) => 7,
 			),

@@ -46,6 +46,7 @@ import {
 	ScmWebhookJobSchema,
 } from '@/queue/jobs.js';
 import { type ScmEvent, ScmEventSchema } from '@/scm/events.js';
+import type { PullRequestContext } from '@/scm/pull-request-context.js';
 import type { SCMProvider } from '@/scm/types.js';
 import type { BuildTaskAssignmentInput } from '@/transport/assignment.js';
 import type { TriggerContext } from '@/triggers/types.js';
@@ -923,6 +924,39 @@ export function createMockGitLabCommitStatusResponse(
 		created_at: '2026-08-04T10:00:00.000Z',
 		started_at: '2026-08-04T10:01:00.000Z',
 		finished_at: '2026-08-04T10:05:00.000Z',
+		...overrides,
+	};
+}
+
+/**
+ * A pull request's provider-neutral context (`src/scm/pull-request-context.ts`,
+ * issue #1239) — what a delivery provider's `readPullRequestContext` answers.
+ */
+export function createMockPullRequestContext(
+	overrides: Partial<PullRequestContext> = {},
+): PullRequestContext {
+	return {
+		number: 99,
+		title: 'Add the widget',
+		description: 'Closes #17',
+		baseBranch: 'main',
+		headBranch: 'issue-17',
+		url: 'https://github.com/SmartTechBrewery/swarm/pull/99',
+		discussion: [
+			{
+				kind: 'comment',
+				author: 'human-dev',
+				createdAt: '2026-08-04T10:00:00.000Z',
+				body: 'Looks close.',
+			},
+			{
+				kind: 'review',
+				author: 'swarm-reviewer',
+				createdAt: '2026-08-04T11:00:00.000Z',
+				body: 'F1: missing test',
+				reviewState: 'changes-requested',
+			},
+		],
 		...overrides,
 	};
 }

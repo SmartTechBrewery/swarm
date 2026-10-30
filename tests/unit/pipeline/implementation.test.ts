@@ -62,7 +62,11 @@ import type { WorkItemBlocker, WorkItemDependent } from '@/pm/types.js';
 import { HANDOFF_FILENAMES, type ScmDeliveryProvider } from '@/scm/delivery.js';
 import { isSwarmGeneratedBody } from '@/scm/swarm-origin.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
-import { createMockProjectConfig, createMockWorkItem } from '../../helpers/factories.js';
+import {
+	createMockProjectConfig,
+	createMockPullRequestContext,
+	createMockWorkItem,
+} from '../../helpers/factories.js';
 
 const WORKTREE_PATH = '/Users/dev/swarm/swarm/.swarm-workspaces/task-19';
 const PR_URL = 'https://github.com/SmartTechBrewery/swarm/pull/99';
@@ -114,6 +118,7 @@ function makeDelivery() {
 		createPullRequest: vi.fn(async () => ({ number: 99, url: PR_URL })),
 		pushBranch: vi.fn(async (_cwd: string, _branch: string, _expectedSha: string) => {}),
 		submitReview: vi.fn(async () => 0),
+		readPullRequestContext: vi.fn(async () => createMockPullRequestContext()),
 		postComment: vi.fn(async () => 0),
 	} satisfies ScmDeliveryProvider;
 }
