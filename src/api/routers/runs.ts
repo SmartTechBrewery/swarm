@@ -92,6 +92,7 @@ import { requireProjectSCMProvider } from '../../integrations/scm/registry.js';
 import { describeError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
 import { type Checkpoint, resolveMaxContinuations } from '../../pipeline/checkpoint.js';
+import { taskIdForRepository } from '../../pipeline/task-identity.js';
 import { resolvePipelinePhaseForStatusKey } from '../../pm/pipeline.js';
 import {
 	type CancellationOrigin,
@@ -117,7 +118,6 @@ import {
 	toQueuedRuns,
 } from '../../queue/queued-runs.js';
 import { toWipUsage, type WipUsageEntry } from '../../queue/wip-usage.js';
-import { repoSlugsMatch } from '../../scm/repo-slug.js';
 import type { SCMProvider } from '../../scm/types.js';
 import type { TriggerPhase } from '../../triggers/types.js';
 import { GitWorktreeManager } from '../../worker/git-worktree-manager.js';
@@ -2226,8 +2226,9 @@ export const runsRouter = router({
 			}
 
 			let workItemNodeId: string | undefined;
-			// The card's own task reference, when this run's repository owns it — the
-			// WIP-slot key of a board dispatch that never resolved a task id (issue #1185).
+			// The task id the card names in this run's repository (`taskIdForRepository`,
+			// the rule `pm-status` keys on) — the WIP-slot key of a board dispatch that
+			// never resolved a task id (issue #1185).
 			let cardTaskRef: string | undefined;
 			const pmManifest = getPMProvider(project.pm.type);
 			if (!pmManifest) {
@@ -2260,9 +2261,7 @@ export const runsRouter = router({
 					});
 				}
 				const repository = repositoryForJob(jobData) ?? project.repo;
-				if (workItem.taskRepository && repoSlugsMatch(workItem.taskRepository, repository)) {
-					cardTaskRef = workItem.taskRef;
-				}
+				cardTaskRef = taskIdForRepository(workItem, repository);
 			} else if (jobData.type === 'scm') {
 				const prNumber = jobData.event.workItemId;
 				const repoFullName = jobData.event.repoFullName;

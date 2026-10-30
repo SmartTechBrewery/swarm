@@ -37,13 +37,13 @@ import { releaseTicketSlot } from '../../dispatch/wip-limit.js';
 import { requireProjectPMAdapter } from '../../integrations/pm/registry.js';
 import { logger } from '../../lib/logger.js';
 import { hasPlannedLabel, PLANNED_LABEL } from '../../pipeline/preplan.js';
+import { taskIdForRepository } from '../../pipeline/task-identity.js';
 import {
 	isPhaseReportedStatusKey,
 	type PipelinePhase,
 	resolvePipelinePhaseForStatusKey,
 } from '../../pm/pipeline.js';
 import type { WorkItem } from '../../pm/types.js';
-import { repoSlugsMatch } from '../../scm/repo-slug.js';
 import { recordStatusAndDetectChange } from '../pm-status-dedup.js';
 import type { PmTriggerContext, TriggerContext, TriggerHandler, TriggerResult } from '../types.js';
 
@@ -100,18 +100,20 @@ function resolvePhaseForItem(workItem: WorkItem): PipelinePhase | undefined {
  * The worktree task id this card names, or `undefined` when it names none *for
  * this run's repository*.
  *
- * The provider resolved the card's SCM artifact from its own linkage — both
- * halves of it: the number (`WorkItem.taskRef`) and the repository that numbers
- * it (`WorkItem.taskRepository`). Shared code never regexes a GitHub-shaped URL
- * for either (ai/RULES.md §2, ai/ARCHITECTURE.md "Task identity").
+ * The rule itself is `taskIdForRepository` (`src/pipeline/task-identity.ts`),
+ * shared with the dashboard's Put back: the card's SCM artifact — both halves of
+ * it, the number (`WorkItem.taskRef`) and the repository that numbers it
+ * (`WorkItem.taskRepository`) — names the task when the provider resolved one;
+ * otherwise the card's own board key (`WorkItem.ownTaskRef`, issue #1230) does.
+ * Shared code never regexes a GitHub-shaped URL for either (ai/RULES.md §2,
+ * ai/ARCHITECTURE.md "Task identity").
  *
- * Deciding whether that repository is the one *this run* is for is this handler's
- * job, not the provider's: a provider is built from a config scoped to one
- * repository and so carries no list of the project's repositories (issue #710),
- * while `project` is already scoped to the repository the job routed to (issue
- * #686 phase 2). Compared through `repoSlugsMatch` rather than `===`, so a config
- * entry's casing or a `.git` suffix cannot refuse a card that ingress routed on
- * the same terms (issue #688).
+ * Deciding whether an artifact's repository is the one *this run* is for is this
+ * handler's job, not the provider's: a provider is built from a config scoped to
+ * one repository and so carries no list of the project's repositories (issue
+ * #710), while `project` is already scoped to the repository the job routed to
+ * (issue #686 phase 2). A link into another repository is a skip, never a fallback
+ * to the card's own key.
  *
  * Logs nothing: it is resolved before the phase gate (issue #909, so the
  * retirement below can key on it even for a column that starts no phase), and the
@@ -119,10 +121,7 @@ function resolvePhaseForItem(workItem: WorkItem): PipelinePhase | undefined {
  * Backlog or Done move of a draft card would start warning.
  */
 function resolveTaskIdForItem(workItem: WorkItem, project: ProjectConfig): string | undefined {
-	const artifactRepository = workItem.taskRepository;
-	return artifactRepository && repoSlugsMatch(artifactRepository, project.repo)
-		? workItem.taskRef
-		: undefined;
+	return taskIdForRepository(workItem, project.repo);
 }
 
 /**
@@ -309,9 +308,10 @@ export function createPmStatusTrigger(): TriggerHandler {
 			}
 
 			if (!taskId) {
-				// No backing SCM artifact *for this repository* to key the worktree on — a
-				// draft item, a board with no SCM linkage at all, or a card whose linkage
-				// points somewhere this run is not for. Can't run a phase without it; drop
+				// No task id *for this repository* to key the worktree on — a draft item, a
+				// card on a board that neither links an SCM artifact nor names its own task,
+				// or a card whose linkage points somewhere this run is not for (which never
+				// falls back to the card's own key). Can't run a phase without it; drop
 				// rather than throw (a draft card isn't a failed job), and name both
 				// repositories so a mis-linked card is diagnosable rather than
 				// indistinguishable from a draft.
@@ -321,6 +321,7 @@ export function createPmStatusTrigger(): TriggerHandler {
 					phase,
 					taskRef: workItem.taskRef,
 					artifactRepository: workItem.taskRepository,
+					ownTaskRef: workItem.ownTaskRef,
 					repository: ctx.project.repo,
 				});
 				return null;

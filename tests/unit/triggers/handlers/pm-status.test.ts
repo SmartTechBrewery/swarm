@@ -380,6 +380,32 @@ describe('pm-status trigger', () => {
 			expect(await trigger.handle(ctx(workItem))).toBeNull();
 		});
 
+		// Issue #1230 — a card with no SCM artifact may name its own task (a Jira issue
+		// key), on any SCM. The link keeps precedence, so this only ever fills a gap.
+		it.each([
+			['planning', '61e4505c'],
+			['implementation', '3121a97d'],
+		])('dispatches %s keyed on the card’s own key when it has no link', async (phase, statusId) => {
+			const workItem = createMockWorkItem({
+				statusId,
+				url: 'https://acme.atlassian.net/browse/VT-1538',
+				ownTaskRef: 'VT-1538',
+			});
+			const result = await trigger.handle(ctx(workItem));
+			expect(result).toEqual({ phase, taskId: 'VT-1538', workItem });
+		});
+
+		it('skips a card linked in another repository rather than falling back to its own key', async () => {
+			const workItem = createMockWorkItem({
+				statusId: '61e4505c',
+				url: 'https://acme.atlassian.net/browse/VT-1538',
+				taskRef: '12',
+				taskRepository: 'acme/other',
+				ownTaskRef: 'VT-1538',
+			});
+			expect(await trigger.handle(ctx(workItem))).toBeNull();
+		});
+
 		it('re-reads the exact item from the event through the injected provider', async () => {
 			const seen: string[] = [];
 			const workItem = createMockWorkItem({ statusId: '61e4505c' });
@@ -518,6 +544,19 @@ describe('pm-status trigger', () => {
 			);
 		});
 
+		it('keys the retirement on the card’s own key for a card with no link (issue #1230)', async () => {
+			const workItem = createMockWorkItem({
+				statusId: 'f75ad846', // Backlog
+				url: 'https://acme.atlassian.net/browse/VT-1538',
+				ownTaskRef: 'VT-1538',
+			});
+
+			expect(await trigger.handle(ctx(workItem))).toBeNull();
+			expect(retireSupersededBoardPhases).toHaveBeenCalledWith(
+				expect.objectContaining({ taskId: 'VT-1538', keepPhase: undefined }),
+			);
+		});
+
 		// A phase's own status report retires nothing (`PM_PHASE_REPORTED_STATUS_KEYS`):
 		// Implementation moves its card here to report the pickup, and retiring on it
 		// would kill that very phase's own deferred retry.
@@ -648,6 +687,25 @@ describe('pm-status trigger', () => {
 				PROJECT.id,
 				PROJECT.repo,
 				'10',
+				cause,
+			);
+		});
+
+		it.each([
+			['done', '98236657', 'board-done'],
+			['backlog', 'f75ad846', 'board-backlog'],
+		])('releases a card-named task’s slot on a move to %s (issue #1230)', async (_name, statusId, cause) => {
+			const workItem = createMockWorkItem({
+				statusId,
+				url: 'https://acme.atlassian.net/browse/VT-1538',
+				ownTaskRef: 'VT-1538',
+			});
+
+			expect(await trigger.handle(ctx(workItem))).toBeNull();
+			expect(releaseTicketSlot).toHaveBeenCalledExactlyOnceWith(
+				PROJECT.id,
+				PROJECT.repo,
+				'VT-1538',
 				cause,
 			);
 		});

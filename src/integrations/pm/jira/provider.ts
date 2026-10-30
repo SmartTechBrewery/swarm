@@ -19,9 +19,11 @@
  * with and what a board webhook carries; a **state** is one of that project's
  * workflow statuses, mapped by status **id** (`./config-schema.ts`).
  *
- * Three Jira-specific costs are deliberate and visible rather than hidden:
- * `taskRef` needs the issue's *remote links*, a second round trip per card, so it
- * is resolved only on the reads that answer with a single card; Jira indexes
+ * Three Jira-specific costs are deliberate and visible rather than hidden: the
+ * card's task identity (`taskRef`/`taskRepository` from a GitHub issue link, else
+ * `ownTaskRef`, the card's own key — issue #1230) needs the issue's *remote links*,
+ * a second round trip per card, so it is resolved only on the reads that answer
+ * with a single card; Jira indexes
  * nothing on a remote link's URL, so {@link JiraPMProvider.findWorkItemForArtifact}
  * is a capped scan rather than a lookup; and a status change is a **workflow
  * transition**, not a field write, so {@link JiraPMProvider.moveWorkItem} resolves
@@ -370,10 +372,9 @@ function normalizeArtifactUrl(url: string): string {
  *
  * The Jira analogue of Linear's GitHub-issue *attachment* rule (ai/ARCHITECTURE.md
  * "Task identity"). A *pull-request* remote link deliberately does not qualify — a
- * PR is an artifact of the task, not its id — and the Jira issue key is never used
- * as a task id, since a task id names a worktree and a branch. A card with no
- * GitHub issue link leaves both unset, which is the honest answer: the phase
- * dispatcher logs and skips.
+ * PR is an artifact of the task, not its id. A card with no GitHub issue link
+ * yields nothing here, and {@link taskIdentityFromRemoteLinks} names its task by
+ * its own key instead.
  */
 function taskRefFromRemoteLinks(
 	links: JiraRemoteLink[],
@@ -386,6 +387,26 @@ function taskRefFromRemoteLinks(
 		}
 	}
 	return undefined;
+}
+
+/**
+ * The task-identity fields of a card whose remote links were read: the first GitHub
+ * issue link's `taskRef`/`taskRepository` when it has one, else the card's own
+ * issue key as `ownTaskRef` (issue #1230). The link keeps precedence — a linked
+ * card keeps the numeric task id it has always had, and one linked into another
+ * repository is left for the caller to refuse rather than falling back to the key
+ * (`taskIdForRepository`, `src/pipeline/task-identity.ts`). Only a read that
+ * fetched the links may use this: without them, "no link" and "links unknown" look
+ * the same, and the key would hand a linked card the wrong id.
+ */
+function taskIdentityFromRemoteLinks(
+	key: string,
+	links: JiraRemoteLink[],
+): Pick<WorkItem, 'taskRef' | 'taskRepository' | 'ownTaskRef'> {
+	const artifact = taskRefFromRemoteLinks(links);
+	return artifact
+		? { taskRef: artifact.number, taskRepository: artifact.repository, ownTaskRef: undefined }
+		: { taskRef: undefined, taskRepository: undefined, ownTaskRef: key };
 }
 
 /**
@@ -430,9 +451,9 @@ function mapAssignees(fields: JiraIssueFields): WorkItemAssignee[] {
  * into the canonical `statusKey` shared code resolves a pipeline phase from, so no
  * caller inverts `statusOptions` itself (ai/RULES.md §2).
  *
- * `taskRef` is **not** set here: it lives on the issue's remote links, a separate
- * request, so the callers that need it merge it in explicitly
- * ({@link JiraPMProvider.resolveTaskRef}).
+ * No task identity (`taskRef`/`taskRepository`/`ownTaskRef`) is set here: which
+ * of them applies depends on the issue's remote links, a separate request, so the
+ * callers that need it merge it in explicitly ({@link JiraPMProvider.resolveTaskRef}).
  */
 function toWorkItem(issue: KeyedJiraIssue, config: JiraIntegrationConfig): WorkItem {
 	const fields = issue.fields ?? {};
@@ -673,7 +694,9 @@ export class JiraPMProvider implements PMProvider {
 			// `id`; the reads that answer with a single card do resolve them. This is also
 			// why a board-wide read here resolves nothing per card where the other three
 			// providers resolve per card (issue #710): the linkage is a separate request,
-			// not a field already read.
+			// not a field already read. `ownTaskRef` stays unset for the same reason
+			// (issue #1230): without the links, whether a card is linked is unknown, and
+			// the key would hand a GitHub-linked card the wrong task id.
 			return issues.map((issue) => toWorkItem(issue, this.config));
 		});
 	}
@@ -777,13 +800,13 @@ export class JiraPMProvider implements PMProvider {
 					}),
 				);
 				if (confirmed) {
-					// The links this card was confirmed by are the same ones `taskRef` is
-					// read from, so it costs no extra request here.
-					const artifact = taskRefFromRemoteLinks(confirmed.links);
+					// The links this card was confirmed by are the same ones its task
+					// identity is read from, so it costs no extra request here. A card
+					// confirmed only through a pull-request link has no issue link, so it
+					// names its task by its own key.
 					return {
 						...toWorkItem(confirmed.issue, this.config),
-						taskRef: artifact?.number,
-						taskRepository: artifact?.repository,
+						...taskIdentityFromRemoteLinks(confirmed.issue.key, confirmed.links),
 					};
 				}
 			}
@@ -1210,15 +1233,16 @@ export class JiraPMProvider implements PMProvider {
 	}
 
 	/**
-	 * Fill in the card's `taskRef` and the repository it numbers an artifact in from
-	 * its remote links — the one extra round trip per card this provider pays for the
-	 * card↔artifact link, kept in a single helper so every call site paying it is
-	 * visible. Runs inside a credential scope (its callers do).
+	 * Fill in the card's task identity from its remote links — `taskRef` and the
+	 * repository it numbers an artifact in, or the card's own key as `ownTaskRef` when
+	 * it has no GitHub issue link ({@link taskIdentityFromRemoteLinks}). The one extra
+	 * round trip per card this provider pays for the card↔artifact link, kept in a
+	 * single helper so every call site paying it is visible. Runs inside a credential
+	 * scope (its callers do).
 	 */
 	private async resolveTaskRef(item: WorkItem): Promise<WorkItem> {
 		const links = await this.fetchRemoteLinks(item.id);
-		const artifact = taskRefFromRemoteLinks(links);
-		return { ...item, taskRef: artifact?.number, taskRepository: artifact?.repository };
+		return { ...item, ...taskIdentityFromRemoteLinks(item.id, links) };
 	}
 
 	/** One issue's remote links. Runs inside a credential scope (its callers do). */

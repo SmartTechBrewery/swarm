@@ -173,8 +173,10 @@ export interface WorkItem {
 	 * read, so the reference rides along with the item instead of costing a second
 	 * lookup — and the method surface stays as it is. It exists so no *shared*
 	 * module has to recover the number by regexing a GitHub-shaped `url`
-	 * (ai/RULES.md §2); see ai/ARCHITECTURE.md "Task identity" for why `taskId`
-	 * stays SCM-derived rather than becoming the PM provider's own key.
+	 * (ai/RULES.md §2). When the card has an SCM artifact, that artifact names the
+	 * task — it takes precedence over {@link ownTaskRef}, the card's own key, so a
+	 * linked card keeps the task id it has always had (ai/ARCHITECTURE.md "Task
+	 * identity").
 	 */
 	taskRef?: string;
 	/**
@@ -204,6 +206,26 @@ export interface WorkItem {
 	 *   `src/scm/repo-slug.ts`, so casing and a `.git` suffix are noise).
 	 */
 	taskRepository?: string;
+	/**
+	 * The task id the card names for *itself* — a board key such as a Jira issue key
+	 * (`VT-1538`) — for a card with no SCM artifact to name its task (issue #1230).
+	 *
+	 * - A provider sets it only on a read that also resolved the card's SCM linkage
+	 *   and found **no** artifact, so its presence never means "linkage unknown": a
+	 *   read that skips the linkage (a whole-board read) leaves it unset, since the
+	 *   key would hand a linked card the wrong id.
+	 * - It carries no repository: it is valid in whichever of the project's
+	 *   repositories the card was routed to.
+	 * - {@link taskRef} / {@link taskRepository} always take precedence: a card with
+	 *   either set is decided by them alone, so a link into another repository stays
+	 *   a skip rather than falling back to the key.
+	 * - It must satisfy `isTaskId` (`src/pipeline/task-branch.ts`), the grammar every
+	 *   branch → task reader parses; one that does not is ignored.
+	 *
+	 * Read it through `taskIdForRepository` (`src/pipeline/task-identity.ts`), never
+	 * directly, so every caller applies the same precedence.
+	 */
+	ownTaskRef?: string;
 	/** Human-readable Status option name (e.g. `In progress`) when available. */
 	status?: string;
 	/**

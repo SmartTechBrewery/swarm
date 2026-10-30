@@ -287,16 +287,29 @@ describe('JiraPMProvider', () => {
 		it.each([
 			{ label: 'only a pull-request remote link', links: [GITHUB_PR_LINK] },
 			{ label: 'no remote links at all', links: [] },
-		])('leaves taskRef unset for a card with $label', async ({ links }) => {
+		])('leaves taskRef unset and names its own key for a card with $label', async ({ links }) => {
 			mockJira({ 'issue/SWARM-42': jiraIssue(), 'issue/SWARM-42/remotelink': links });
 
-			// A PR is an artifact *of* the task, not its id, and the Jira key is never a
-			// task id — so an unlinked card honestly has none (ai/ARCHITECTURE.md "Task
-			// identity"). The phase dispatcher logs and skips.
+			// A PR is an artifact *of* the task, not its id, so an unlinked card has no
+			// SCM artifact — and names its task by its own issue key instead (issue #1230,
+			// ai/ARCHITECTURE.md "Task identity").
 			await expect(provider.getWorkItem('SWARM-42')).resolves.toMatchObject({
 				taskRef: undefined,
 				taskRepository: undefined,
+				ownTaskRef: 'SWARM-42',
 			});
+		});
+
+		it('offers no own key for a card with a GitHub issue link — the link keeps precedence', async () => {
+			mockJira({
+				'issue/SWARM-42': jiraIssue(),
+				'issue/SWARM-42/remotelink': [GITHUB_PR_LINK, GITHUB_ISSUE_LINK],
+			});
+
+			const item = await provider.getWorkItem('SWARM-42');
+
+			expect(item.taskRef).toBe('577');
+			expect(item.ownTaskRef).toBeUndefined();
 		});
 
 		// Issue #710 moved the repository half of this rule out of the provider: a link
@@ -312,9 +325,12 @@ describe('JiraPMProvider', () => {
 				],
 			});
 
+			// Still the link, never the key: the caller refuses the other repository and
+			// skips rather than falling back to `SWARM-42` (issue #1230).
 			await expect(provider.getWorkItem('SWARM-42')).resolves.toMatchObject({
 				taskRef: '12',
 				taskRepository: 'acme/other',
+				ownTaskRef: undefined,
 			});
 		});
 
@@ -444,6 +460,9 @@ describe('JiraPMProvider', () => {
 			expect(fetchMock).toHaveBeenCalledTimes(2);
 			expect(items.every((item) => item.taskRef === undefined)).toBe(true);
 			expect(items.every((item) => item.taskRepository === undefined)).toBe(true);
+			// Nor the card's own key: without the links, a linked card would be handed
+			// the wrong task id (issue #1230).
+			expect(items.every((item) => item.ownTaskRef === undefined)).toBe(true);
 		});
 
 		it('keeps namesakes apart and a renamed assignee on the same key', async () => {
@@ -572,7 +591,7 @@ describe('JiraPMProvider', () => {
 
 			await expect(
 				provider.findWorkItemForArtifact({ repository: REPO, kind: 'pullRequest', number: '601' }),
-			).resolves.toMatchObject({ id: 'SWARM-42', taskRef: undefined });
+			).resolves.toMatchObject({ id: 'SWARM-42', taskRef: undefined, ownTaskRef: 'SWARM-42' });
 		});
 
 		it('misses softly when the board only links the same number in another repository', async () => {

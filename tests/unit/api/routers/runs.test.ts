@@ -3948,6 +3948,37 @@ describe('runsRouter', () => {
 			);
 		});
 
+		// Issue #1230: a card with no SCM artifact names its task by its own key, by the
+		// same rule `pm-status` dispatched it under (`taskIdForRepository`).
+		it('releases the slot keyed on the card’s own key for a card with no link', async () => {
+			vi.mocked(releasePutBackTicketSlot).mockClear();
+			vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+			const jobData = createMockPmWebhookJob({ projectId: 'p1' });
+			const dispatch = makeDispatch({ state: 'pending', jobPayload: jobData, runId: null });
+			vi.mocked(getDispatchById).mockResolvedValue(dispatch);
+			vi.mocked(cancelDispatchAndWake).mockResolvedValue(dispatch);
+			vi.mocked(getPMProvider).mockReturnValue({
+				createProvider: () => ({
+					getWorkItem: vi.fn().mockResolvedValue({
+						id: jobData.event.itemId,
+						statusId: '10001',
+						statusKey: 'planning',
+						title: 'Card',
+						url: 'https://acme.atlassian.net/browse/VT-1538',
+						ownTaskRef: 'VT-1538',
+					}),
+					moveWorkItem: vi.fn().mockResolvedValue(undefined),
+				}),
+			} as never);
+
+			await caller.putBack({ jobId: 'dispatch-1', projectId: 'p1' });
+
+			expect(releasePutBackTicketSlot).toHaveBeenCalledExactlyOnceWith('p1', jobData, {
+				dispatchTaskId: dispatch.taskId,
+				cardTaskRef: 'VT-1538',
+			});
+		});
+
 		it('releases no WIP slot when moving the card fails', async () => {
 			vi.mocked(releasePutBackTicketSlot).mockClear();
 			vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
