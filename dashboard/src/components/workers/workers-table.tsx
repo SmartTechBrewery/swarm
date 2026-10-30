@@ -190,6 +190,32 @@ function enrollmentKey(workerId: string, projectId: string): string {
 }
 
 /**
+ * The repositories the machine holds a checkout of (issue #1228), one line each under
+ * its name, in the order the daemon declared them, so the primary checkout comes
+ * first. This is what tells two workers on one machine apart without opening either.
+ * Styled like the machine line under a run's phase on `/runs` (`run-worker-name`),
+ * because the name above it is styled like that phase. A machine that declared none
+ * (it never connected, its daemon predates the field, or its checkout has no readable
+ * `origin`) gets no line at all, never a placeholder.
+ */
+function MachineRepositories({ repositories }: { repositories: string[] }) {
+	if (repositories.length === 0) return null;
+	return (
+		<div data-testid="worker-repositories">
+			{repositories.map((repository) => (
+				<span
+					key={repository}
+					className="mt-0.5 block truncate font-mono text-xs font-normal text-zinc-500"
+					title={repository}
+				>
+					{repository}
+				</span>
+			))}
+		</div>
+	);
+}
+
+/**
  * Two independent facts, stacked (issue #926). The first is heartbeat liveness:
  * online is a live status dot, offline stays neutral with its last-seen time beside
  * it. The second is whether an operator has taken the machine **out of the dispatch
@@ -1108,7 +1134,8 @@ export function WorkersTable({
 								onSelectWorker ? 'cursor-pointer' : ''
 							}`}
 						>
-							<td className="px-3 py-3 align-top text-sm font-medium text-zinc-100 break-words">
+							{/* The name in the weight `/runs` gives a run's phase (issue #1228). */}
+							<td className="px-3 py-3 align-top text-sm font-semibold text-zinc-100 break-words">
 								{/* The build marks sit beside the name rather than in a column of their
 								    own (issues #925, #978): COLUMN_WIDTHS is a hand-tuned budget, and
 								    these are rare per-row exceptions, not facts every row carries. */}
@@ -1131,6 +1158,7 @@ export function WorkersTable({
 									<WorkerUpdatingBadge update={worker.update} />
 									<WorkerBuildBadge buildIsCurrent={worker.buildIsCurrent} />
 								</div>
+								<MachineRepositories repositories={worker.repositories} />
 							</td>
 							<td className="px-3 py-3 align-top text-sm text-zinc-300 break-words">
 								{worker.owner ? (

@@ -375,6 +375,72 @@ describe('WorkersTable row content', () => {
 	});
 });
 
+// Issue #1228 — which repository a worker serves, readable off the roster rather than
+// by opening each machine.
+describe('WorkersTable checkout repositories (issue #1228)', () => {
+	/** The repository lines in the one row's Machine cell, in render order. */
+	function repositoryLines(): string[] {
+		const lines = screen.queryByTestId('worker-repositories');
+		return [...(lines?.children ?? [])].map((line) => line.textContent ?? '');
+	}
+
+	it('shows the repository under the machine name, in the Machine cell', () => {
+		renderTable(<WorkersTable workers={[makeWorker()]} onSelectWorker={vi.fn()} />);
+
+		expect(repositoryLines()).toEqual(['acme/frontend']);
+		const lines = screen.getByTestId('worker-repositories');
+		const name = screen.getByRole('button', { name: 'Open ada-laptop details' });
+		expect(lines.closest('td')).toBe(name.closest('td'));
+		// Under the name, not beside it: a sibling after the name-and-badges line.
+		expect(lines.previousElementSibling?.contains(name)).toBe(true);
+	});
+
+	it('lists every repository a machine serves, primary first, as declared', () => {
+		renderTable(
+			<WorkersTable
+				workers={[makeWorker({ repositories: ['acme/frontend', 'acme/backend', 'acme/infra'] })]}
+			/>,
+		);
+
+		expect(repositoryLines()).toEqual(['acme/frontend', 'acme/backend', 'acme/infra']);
+	});
+
+	it('shows no repository line for a machine that declared none, and the row still reads', () => {
+		renderTable(
+			<WorkersTable
+				workers={[makeWorker({ repositories: [], buildIsCurrent: false })]}
+				onSelectWorker={vi.fn()}
+			/>,
+		);
+
+		expect(screen.queryByTestId('worker-repositories')).toBeNull();
+		const name = screen.getByRole('button', { name: 'Open ada-laptop details' });
+		expect(name.closest('td')?.textContent).toBe('ada-laptopOutdated');
+		expect(screen.getAllByRole('row')[1].querySelectorAll('td')).toHaveLength(7);
+	});
+
+	it('keeps the name opening the detail view, with the build marks still beside it', () => {
+		const onSelectWorker = vi.fn();
+		renderTable(
+			<WorkersTable
+				workers={[
+					makeWorker({ repositories: ['acme/frontend', 'acme/backend'], buildIsCurrent: false }),
+				]}
+				onSelectWorker={onSelectWorker}
+			/>,
+		);
+
+		const name = screen.getByRole('button', { name: 'Open ada-laptop details' });
+		expect(name.textContent).toBe('ada-laptop');
+		expect(screen.getByTitle(/differs from the control plane/).parentElement).toBe(
+			name.parentElement,
+		);
+		fireEvent.click(name);
+		expect(onSelectWorker).toHaveBeenCalledTimes(1);
+		expect(onSelectWorker).toHaveBeenCalledWith('worker-1');
+	});
+});
+
 describe('WorkersTable active job (issue #473)', () => {
 	it('describes a board-driven job by its work-item title and reference, never by the run id', async () => {
 		projectsListQueryFn.mockResolvedValue([
@@ -1366,7 +1432,8 @@ describe('WorkersTable reorder controls (issue #750 phase 2)', () => {
 		const names = screen
 			.getAllByRole('row')
 			.slice(1)
-			.map((row) => row.querySelector('td')?.textContent);
+			// The name line alone — the checkout repositories sit under it (issue #1228).
+			.map((row) => row.querySelector('td > div')?.textContent);
 		expect(names).toEqual(['ada-laptop', 'grace-box', 'linus-rack']);
 	});
 
