@@ -142,6 +142,7 @@ import { SCM_TYPES } from '../../scm/types.js';
 import { discoverAvailableClis } from '../../transport/cli-discovery.js';
 import { canonicalCheckoutPath } from '../../worktree/checkout-key.js';
 import { ensureControlPlaneUrl } from '../_shared/control-plane-env.js';
+import { swarmCommand, workerAgentCommand } from '../_shared/installation-command.js';
 import {
 	createOperatorClient,
 	OperatorApiError,
@@ -2082,12 +2083,13 @@ function remainingEnrollmentSteps(
 	projectId: string,
 	enrollment: { status: string; sharingConsent: boolean },
 ): string[] {
+	const swarm = swarmCommand();
 	const steps: string[] = [];
 	if (enrollment.status !== 'active') {
-		steps.push(`swarm workers approve ${workerId} ${projectId}`);
+		steps.push(`${swarm} workers approve ${workerId} ${projectId}`);
 	}
 	if (!enrollment.sharingConsent) {
-		steps.push(`swarm workers consent ${workerId} ${projectId} on`);
+		steps.push(`${swarm} workers consent ${workerId} ${projectId} on`);
 	}
 	return steps;
 }
@@ -2554,7 +2556,8 @@ async function executeRegisterAndEnroll(
 		out.info(credential);
 		return { ok: false, code: 1 };
 	};
-	const enrollByHand = `swarm workers enroll ${worker.id} ${projectId} --cli ${capabilities.join(',')} --active --consent`;
+	const swarm = swarmCommand();
+	const enrollByHand = `${swarm} workers enroll ${worker.id} ${projectId} --cli ${capabilities.join(',')} --active --consent`;
 
 	// The same helper `enroll` uses, so the capability, repository-mismatch and
 	// duplicate refusals are surfaced unchanged. Active + consenting with no flag:
@@ -2594,7 +2597,7 @@ async function executeRegisterAndEnroll(
 				: [enrollByHand]),
 		);
 	}
-	if (!stored) remaining.push(`swarm workers set-scm-credential ${worker.id} ${providerId}`);
+	if (!stored) remaining.push(`${swarm} workers set-scm-credential ${worker.id} ${providerId}`);
 	if (enrolled.code !== 0 || !stored) return reportUnfinished(remaining);
 	return { ok: true, workerId: worker.id, credential };
 }
@@ -2715,7 +2718,9 @@ async function setupCommand(argv: string[]): Promise<number> {
 	if (!registered.ok) return registered.code;
 
 	if (values['no-autostart']) {
-		out.info('autostart skipped (--no-autostart) — start the worker here with: swarm run:worker');
+		out.info(
+			`autostart skipped (--no-autostart) — start the worker here with: ${swarmCommand()} run:worker`,
+		);
 		return 0;
 	}
 	return reportAutostart(displayName, await installWorkerAutostart(repoRoot));
@@ -2734,9 +2739,10 @@ function alreadyRegisteredHere(repoRoot: string): boolean {
 				? `workers setup: this checkout already has a worker credential cache entry that could not be read: ${workerCredentialCachePath(repoRoot)}`
 				: `workers setup: a worker (${cached.workerId}) is already registered for this checkout (${repoRoot})`,
 		);
-		out.info('  start it with: swarm-worker-agent install (or swarm run:worker)');
+		const swarm = swarmCommand();
+		out.info(`  start it with: ${workerAgentCommand()} install (or ${swarm} run:worker)`);
 		out.info(
-			`  to replace it, remove it (swarm workers remove <worker-id>) and delete ${workerCredentialCachePath(repoRoot)}`,
+			`  to replace it, remove it (${swarm} workers remove <worker-id>) and delete ${workerCredentialCachePath(repoRoot)}`,
 		);
 		return true;
 	}
@@ -2760,22 +2766,24 @@ async function setupCapabilities(cli: string | undefined): Promise<AgentCli[] | 
 
 /** Say how the worker `setup` registered is (or is not) being started, as an exit code. */
 function reportAutostart(displayName: string, autostart: WorkerAutostartResult): number {
+	const swarm = swarmCommand();
+	const workerAgent = workerAgentCommand();
 	switch (autostart.kind) {
 		case 'installed':
 			out.info(
-				`worker '${displayName}' is installed under launchd and starting — check it with: swarm-worker-agent status`,
+				`worker '${displayName}' is installed under launchd and starting — check it with: ${workerAgent} status`,
 			);
 			return 0;
 		case 'unsupported':
 			out.info(
-				`autostart is not available on ${autostart.platform} yet — start the worker here with: swarm run:worker`,
+				`autostart is not available on ${autostart.platform} yet — start the worker here with: ${swarm} run:worker`,
 			);
 			return 0;
 		default:
 			out.error(
 				`workers setup: the worker is registered and enrolled, but autostart failed: ${autostart.reason}`,
 			);
-			out.info('  retry it with: swarm-worker-agent install (or start it with swarm run:worker)');
+			out.info(`  retry it with: ${workerAgent} install (or start it with ${swarm} run:worker)`);
 			return 1;
 	}
 }

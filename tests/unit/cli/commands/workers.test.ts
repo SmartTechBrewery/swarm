@@ -82,6 +82,15 @@ vi.mock('@/cli/_shared/worker-autostart.js', () => ({ installWorkerAutostart }))
 vi.mock('node:readline/promises', () => ({
 	createInterface: () => ({ question, close: () => {} }),
 }));
+// How a printed follow-up names this installation's CLI depends on the machine's
+// PATH (issue #1221). Pinned to the bare names here, so the suite reads the same
+// whatever the developer's PATH holds — tests/unit/cli/installation-command.test.ts
+// covers the resolution itself.
+const { swarmCommand, workerAgentCommand } = vi.hoisted(() => ({
+	swarmCommand: vi.fn(),
+	workerAgentCommand: vi.fn(),
+}));
+vi.mock('@/cli/_shared/installation-command.js', () => ({ swarmCommand, workerAgentCommand }));
 
 import { defaultWorkerName, run } from '@/cli/commands/workers.js';
 
@@ -182,6 +191,8 @@ describe('swarm workers', () => {
 		});
 
 		ensureControlPlaneUrl.mockReset().mockResolvedValue('https://swarm.example.com');
+		swarmCommand.mockReset().mockReturnValue('swarm');
+		workerAgentCommand.mockReset().mockReturnValue('swarm-worker-agent');
 
 		// Non-TTY is the shape a test process actually has, so the command reads stdin.
 		promptHidden.mockReset().mockResolvedValue('typed-secret');
@@ -572,6 +583,29 @@ describe('swarm workers', () => {
 			installWorkerAutostart.mockResolvedValue({ kind: 'failed', reason: 'exit 1' });
 			expect(await run(['setup', '--project', PROJECT_ID])).toBe(1);
 			expect(pathsCalled()).toContain('workers.setConsent');
+			expect(
+				lines().some((line) =>
+					line.endsWith(
+						'  retry it with: swarm-worker-agent install (or start it with swarm run:worker)',
+					),
+				),
+			).toBe(true);
+		});
+
+		// Issue #1221: on a machine whose PATH `swarm` is another installation's, the
+		// retry line names this installation's own installer and CLI.
+		it("names this installation's own commands when autostart fails on a second installation", async () => {
+			swarmCommand.mockReturnValue('node /opt/swarm-two/bin/swarm.js');
+			workerAgentCommand.mockReturnValue('/opt/swarm-two/bin/swarm-worker-agent');
+			installWorkerAutostart.mockResolvedValue({ kind: 'failed', reason: 'exit 1' });
+			expect(await run(['setup', '--project', PROJECT_ID])).toBe(1);
+			expect(
+				lines().some((line) =>
+					line.endsWith(
+						'  retry it with: /opt/swarm-two/bin/swarm-worker-agent install (or start it with node /opt/swarm-two/bin/swarm.js run:worker)',
+					),
+				),
+			).toBe(true);
 		});
 
 		// Issue #1220: an Azure DevOps PAT is verified within a repository the worker is
@@ -976,6 +1010,45 @@ describe('swarm workers', () => {
 			expect(enroll).toBeGreaterThanOrEqual(0);
 			expect(store).toBeGreaterThan(enroll);
 			expect(printed.filter((line) => line.includes('raw-credential-token'))).toHaveLength(1);
+		});
+
+		// Issue #1221: on a machine whose PATH `swarm` is another installation's, every
+		// recovery step names this installation's CLI by its absolute form.
+		it("names this installation's own CLI in every recovery step on a second installation", async () => {
+			swarmCommand.mockReturnValue('node /opt/swarm-two/bin/swarm.js');
+			refuse('workers.enroll', 'Worker capability mismatch');
+			refuse('workers.scmCredentials.set', 'the credential did not authenticate');
+			expect(await run(ARGV)).toBe(1);
+			const steps = lines().filter((line) => line.includes(' workers '));
+			expect(steps).toHaveLength(2);
+			expect(steps[0]).toMatch(
+				/ {2}node \/opt\/swarm-two\/bin\/swarm\.js workers enroll \S+ proj-a --cli claude --active --consent$/,
+			);
+			expect(steps[1]).toMatch(
+				/ {2}node \/opt\/swarm-two\/bin\/swarm\.js workers set-scm-credential \S+ github$/,
+			);
+		});
+
+		it('names this installation in the approve and consent steps on a second installation', async () => {
+			swarmCommand.mockReturnValue('node /opt/swarm-two/bin/swarm.js');
+			refuse('workers.approveEnrollment', 'You do not have permission.');
+			refuse('workers.setConsent', 'You do not have permission.');
+			expect(await run(ARGV)).toBe(1);
+			const printed = lines();
+			expect(
+				printed.some((line) =>
+					line.endsWith(
+						`  node /opt/swarm-two/bin/swarm.js workers approve ${WORKER_ID} ${PROJECT_ID}`,
+					),
+				),
+			).toBe(true);
+			expect(
+				printed.some((line) =>
+					line.endsWith(
+						`  node /opt/swarm-two/bin/swarm.js workers consent ${WORKER_ID} ${PROJECT_ID} on`,
+					),
+				),
+			).toBe(true);
 		});
 
 		it('names approve before set-scm-credential when both are outstanding', async () => {
