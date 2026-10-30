@@ -114,7 +114,6 @@ vi.mock('@/dispatch/dispatcher.js', () => ({
 
 vi.mock('@/integrations/pm/registry.js', () => ({
 	getPMProvider: vi.fn(),
-	requireProjectPMProvider: vi.fn(),
 }));
 
 // Put back's WIP-slot release (issue #1185) has its own coverage in
@@ -246,10 +245,9 @@ import { getMembership, listAccessibleProjectIds } from '@/identity/membership-s
 import type { SwarmUser } from '@/identity/schema.js';
 import { DEFAULT_WORKER_SUPPORTED_PHASES } from '@/identity/worker.js';
 import { getWorker, getWorkers } from '@/identity/worker-service.js';
-import { getPMProvider, requireProjectPMProvider } from '@/integrations/pm/registry.js';
+import { getPMProvider } from '@/integrations/pm/registry.js';
 import { requireProjectSCMProvider } from '@/integrations/scm/registry.js';
 import { type Checkpoint, DEFAULT_MAX_CONTINUATIONS } from '@/pipeline/checkpoint.js';
-import { clearBoardQueueCache } from '@/queue/board-queue.js';
 import {
 	clearRunCancellation,
 	getRunCancellationOrigin,
@@ -965,8 +963,6 @@ describe('runsRouter', () => {
 
 		beforeEach(() => {
 			vi.setSystemTime(new Date(OPENED_AT.getTime() + 2 * ITEM_STALL_AFTER_MS));
-			clearBoardQueueCache();
-			vi.mocked(requireProjectPMProvider).mockReset();
 			vi.mocked(requireProjectSCMProvider).mockReset();
 			vi.mocked(requireProjectSCMProvider).mockImplementation(() => {
 				throw new Error('no runtime-ready SCM provider');
@@ -1061,30 +1057,6 @@ describe('runsRouter', () => {
 			const [entry] = await caller.wip({});
 
 			expect(entry?.tickets[0]?.prUrl).toBe('https://gitlab.com/acme/widgets/-/merge_requests/120');
-		});
-
-		it('counts the board’s queued cards, excluding slot holders, from one cached read', async () => {
-			vi.mocked(listAllProjectRecordsFromDb).mockResolvedValue([
-				createMockProjectRecord({ id: 'p1' }),
-			]);
-			vi.mocked(listWipSlots).mockResolvedValue([slotRow()]);
-			const ISSUES = 'https://github.com/acme/widgets/issues';
-			const listWorkItems = vi
-				.fn()
-				.mockResolvedValue([
-					createMockWorkItem({ id: 'item-103', statusKey: 'todo', url: `${ISSUES}/103` }),
-					createMockWorkItem({ id: 'item-104', statusKey: 'todo', url: `${ISSUES}/104` }),
-					createMockWorkItem({ id: 'item-105', statusKey: 'backlog', url: `${ISSUES}/105` }),
-				]);
-			vi.mocked(requireProjectPMProvider).mockReturnValue({
-				listWorkItems,
-			} as unknown as ReturnType<typeof requireProjectPMProvider>);
-
-			const [entry] = await caller.wip({});
-			await caller.wip({});
-
-			expect(entry?.boardQueued).toBe(1);
-			expect(listWorkItems).toHaveBeenCalledTimes(1);
 		});
 
 		it('scopes every read to a chosen project', async () => {

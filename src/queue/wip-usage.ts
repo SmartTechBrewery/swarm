@@ -120,11 +120,6 @@ export const WipUsageEntrySchema = z.object({
 	inFlight: z.number().int().nonnegative(),
 	/** How many new tickets wait as `wip-limit` for a slot. */
 	waiting: z.number().int().nonnegative(),
-	/**
-	 * Automation-labelled cards on the board outside Backlog and Done that hold no
-	 * slot (`./board-queue.ts`). Absent when the board could not be read.
-	 */
-	boardQueued: z.number().int().nonnegative().optional(),
 	/** The slot holders, oldest slot first. */
 	tickets: z.array(WipTicketSchema),
 });

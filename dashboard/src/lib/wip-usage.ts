@@ -28,14 +28,6 @@ export function wipInFlightLabel(entry: WipUsageEntry): string {
 	return `${entry.inFlight} / ${entry.limit} in flight`;
 }
 
-/**
- * `Tickets in queue: 4` — automation-labelled cards on the board outside Backlog and
- * Done that hold no slot, or `undefined` when the server could not read the board.
- */
-export function wipBoardQueueLabel(entry: WipUsageEntry): string | undefined {
-	return entry.boardQueued === undefined ? undefined : `Tickets in queue: ${entry.boardQueued}`;
-}
-
 /** What the operator is waited on for, in their own terms. */
 const OPERATOR_REASON_LABELS: Record<WipOperatorReason, string> = {
 	'plan-awaiting-greenlight': 'plan is waiting for your greenlight',
