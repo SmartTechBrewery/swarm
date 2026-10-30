@@ -1,8 +1,9 @@
 /**
- * Pure display helpers for the WIP section (issue #1192). They only derive keys,
- * labels, and the run-description shape from an already-fetched
- * {@link WipUsageEntry}; the server owns the counting and the classification —
- * including whether a holder waits on the operator — so nothing here re-decides it.
+ * Pure display helpers for the Tickets in progress section (issue #1192; named "WIP"
+ * until #1204). They only derive keys, labels, and the run-description shape from an
+ * already-fetched {@link WipUsageEntry}; the server owns the counting and the
+ * classification — including whether a holder waits on the operator — so nothing
+ * here re-decides it.
  */
 
 import type { WorkItemCellRun } from '@/components/runs/work-item-cell.js';
@@ -80,6 +81,9 @@ export function wipTicketRun(ticket: WipTicket, repository: string): WorkItemCel
 		prTitle: null,
 	};
 }
+
+/** The section's heading — the operator's word for what it lists, not "WIP" (issue #1204). */
+export const WIP_SECTION_TITLE = 'Tickets in progress';
 
 /** Why the section lists what it lists — shown once, under the header. */
 export const WIP_SECTION_EXPLANATION =

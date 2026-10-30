@@ -58,6 +58,27 @@ describe('WipUsageSection', () => {
 		expect(container.innerHTML).toBe('');
 	});
 
+	// Issue #1204: headed like Queued — a plain title with a muted count of the tickets
+	// holding a slot — and no panel around the per-repository cards.
+	it('is headed "Tickets in progress" with the count of slot holders, outside any panel', () => {
+		renderSection(
+			<WipUsageSection
+				entries={[
+					makeEntry({ inFlight: 2, tickets: [makeTicket(), makeTicket({ taskId: '104' })] }),
+					makeEntry({ repository: 'acme/other' }),
+				]}
+			/>,
+		);
+
+		const heading = screen.getByRole('heading', { level: 2 });
+		expect(heading.textContent).toBe('Tickets in progress (3)');
+		expect(heading.querySelector('svg')).not.toBeNull();
+		expect(screen.getByTestId('wip-usage-section').className).not.toMatch(/\bborder\b/);
+		for (const repository of screen.getAllByTestId('wip-repository')) {
+			expect(repository.className).toMatch(/\bborder\b/);
+		}
+	});
+
 	it('names each repository with its in flight / limit and its waiting count', () => {
 		renderSection(
 			<WipUsageSection
@@ -168,7 +189,7 @@ describe('WipUsageSection', () => {
 	it('folds away', () => {
 		renderSection(<WipUsageSection entries={[makeEntry()]} />);
 
-		fireEvent.click(screen.getByRole('button', { name: /WIP/ }));
+		fireEvent.click(screen.getByRole('button', { name: /Tickets in progress/ }));
 
 		expect(screen.queryByTestId('wip-repository')).toBeNull();
 	});

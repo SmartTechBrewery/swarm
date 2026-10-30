@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ChevronDown, ChevronRight, ExternalLink, RotateCcw } from 'lucide-react';
+import { ChevronDown, ChevronRight, ExternalLink, ListOrdered, RotateCcw } from 'lucide-react';
 import { useState } from 'react';
 import { buttonClass } from '@/components/ui/button.js';
 import { formatRelativeTime, formatTimeUntil } from '@/lib/format.js';
@@ -332,7 +332,9 @@ export function QueuedRunsSection({
 
 	return (
 		<section data-testid="queued-runs-section" className="space-y-2">
-			<h2 className="text-sm font-semibold tracking-tight text-zinc-300">
+			{/* Ordered as dispatched (priority + FIFO), hence the icon (issue #1204). */}
+			<h2 className="flex items-center gap-1.5 text-sm font-semibold tracking-tight text-zinc-300">
+				<ListOrdered className="h-4 w-4 shrink-0 text-zinc-400" aria-hidden="true" />
 				Queued <span className="text-zinc-500">({rows.length})</span>
 			</h2>
 			{successMessage && (

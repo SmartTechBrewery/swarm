@@ -180,7 +180,7 @@ describe('the Stalled section (issue #847)', () => {
 
 // `runs.wip` copied `runs.stalled`'s authorization verbatim (issue #1192), so it is
 // gated the same way: the section is always mounted, the unscoped read admin-only.
-describe('the WIP section (issue #1192)', () => {
+describe('the Tickets in progress section (issue #1192)', () => {
 	it('does not issue the unscoped WIP read for a non-admin with no project chosen', () => {
 		vi.mocked(useCurrentUser).mockReturnValue(signedInAs(false));
 
