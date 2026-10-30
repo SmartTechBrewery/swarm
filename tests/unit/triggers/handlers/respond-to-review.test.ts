@@ -8,7 +8,7 @@ import { gitLabRequestChangesMarker } from '@/integrations/scm/gitlab/review-mar
 import { parseGitLabWebhook } from '@/integrations/scm/gitlab/webhook.js';
 import type { ScmPersonaIdentities } from '@/scm/types.js';
 import { createRespondToReviewTrigger } from '@/triggers/handlers/respond-to-review.js';
-import type { TriggerContext } from '@/triggers/types.js';
+import type { TriggerContext, TriggerDecline } from '@/triggers/types.js';
 import {
 	createFakeScmProvider,
 	createMockProjectConfig,
@@ -528,5 +528,57 @@ describe('respond-to-review trigger', () => {
 				['acme', 'acme/backend', '17', HEAD_SHA],
 			]);
 		});
+	});
+});
+
+// Issue #1248: a retried Respond-to-review the handler turned away was recorded as
+// a changed disposition; each skip now names its cause for the settle to report.
+describe('respond-to-review names why it skipped (issue #1248)', () => {
+	async function skipReason(
+		context: TriggerContext,
+		trigger: ReturnType<typeof createRespondToReviewTrigger> = handler,
+	): Promise<string> {
+		const noteDecline = vi.fn();
+		expect(await trigger.handle({ ...context, runId: 'run-7', noteDecline })).toBeNull();
+		expect(noteDecline).toHaveBeenCalledOnce();
+		const decline = noteDecline.mock.calls[0][0] as TriggerDecline;
+		expect(decline.kind).toBe('skipped');
+		return decline.reason;
+	}
+
+	it('names a review the reviewer persona did not submit', async () => {
+		const reason = await skipReason(ctx({ actorLogin: 'a-human' }));
+
+		expect(reason).toContain('pull request #17');
+		expect(reason).toContain('`a-human`');
+		expect(reason).toContain('`swarm-rev`');
+	});
+
+	it('names a minor verdict the project does not answer', async () => {
+		const reason = await skipReason(ctx({ reviewState: 'approved' }));
+
+		expect(reason).toContain('`approved`');
+		expect(reason).toContain('`pipeline.respondToReview.skipOnMinors`');
+	});
+
+	it('names the review cap', async () => {
+		expect(await skipReason(ctx(), cappedHandler())).toContain('review cap');
+	});
+
+	it('names a disabled phase', async () => {
+		const project = createMockProjectConfig({ pipeline: { respondToReview: { enabled: false } } });
+
+		expect(
+			await skipReason(createMockScmTriggerContext({ project, scm: SCM, event: reviewEvent() })),
+		).toContain('`pipeline.respondToReview.enabled`');
+	});
+
+	it('notes nothing on a dispatch', async () => {
+		const noteDecline = vi.fn();
+
+		expect(await handler.handle({ ...ctx(), runId: 'run-7', noteDecline })).toMatchObject({
+			phase: 'respond-to-review',
+		});
+		expect(noteDecline).not.toHaveBeenCalled();
 	});
 });

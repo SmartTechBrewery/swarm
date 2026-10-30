@@ -60,8 +60,17 @@ export interface TriggerDecline {
 	 * (the latest `deferred` row for the task, `tryReuseLatestRun` in
 	 * `src/worker/consumer.ts`), so the settle marks the run a continuation carries
 	 * `deferred` with this reason rather than terminally `failed`.
+	 *
+	 * `skipped` — the handler looked and decided the phase should not run, for a
+	 * reason it can name: the pull request is closed, its head branch is not one of
+	 * the repository's task branches, another review of it is still pending, the
+	 * phase is disabled (issue #1248). Settled exactly like a decline that names
+	 * nothing — the carried run is failed and this dispatch's own claims are handed
+	 * back — with this sentence in place of the generic wording. Noting one costs a
+	 * fresh delivery nothing: the settle reads it only for a run a continuation
+	 * carries, and logs nothing for a delivery that carries none.
 	 */
-	kind: 'dispatch-claim-held' | 'recheck-scheduled';
+	kind: 'dispatch-claim-held' | 'recheck-scheduled' | 'skipped';
 	/** Operator-facing sentence, recorded verbatim as the settled run's error. */
 	reason: string;
 	/**

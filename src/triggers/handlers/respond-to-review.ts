@@ -51,7 +51,6 @@
  * fresh delivery and supersedes too.
  */
 
-import type { ProjectConfig } from '../../config/schema.js';
 import {
 	getReviewVerdictByHead as getReviewVerdictByHeadDefault,
 	getReviewVerdictByReviewId as getReviewVerdictByReviewIdDefault,
@@ -60,6 +59,7 @@ import {
 import { retireSupersededReviewResponses } from '../../dispatch/review-response-supersession.js';
 import { logger } from '../../lib/logger.js';
 import type { ScmEvent } from '../../scm/events.js';
+import { noteSkip } from '../decline.js';
 import type { ScmTriggerContext, TriggerContext, TriggerHandler, TriggerResult } from '../types.js';
 
 /**
@@ -70,15 +70,24 @@ import type { ScmTriggerContext, TriggerContext, TriggerHandler, TriggerResult }
  * the durable ledger under `reviewId`.
  */
 function resolveWebhookCoordinates(
-	event: ScmEvent,
+	ctx: ScmTriggerContext,
 ): { prNumber: string; prBranch: string; reviewId: string } | null {
-	const { workItemId: prNumber, prBranch, reviewId } = event;
+	const { workItemId: prNumber, prBranch, reviewId } = ctx.event;
 	if (!prNumber || !prBranch || !reviewId) {
 		logger.warn('respond-to-review: event missing PR/branch/review coordinates — skipping', {
 			prNumber,
 			hasBranch: !!prBranch,
 			hasReviewId: !!reviewId,
 		});
+		const missing = [
+			prNumber ? null : 'pull request number',
+			prBranch ? null : 'head branch',
+			reviewId ? null : 'review id',
+		].filter((name) => name !== null);
+		noteSkip(
+			ctx,
+			`The review event names no ${missing.join(' or ')}, so there is nothing to respond to.`,
+		);
 		return null;
 	}
 	return { prNumber, prBranch, reviewId };
@@ -123,6 +132,16 @@ function stopsAtReviewCap(
 	return true;
 }
 
+/** The skip reason for a review whose reviewed head neither the event nor the ledger names. */
+function noReviewedHeadReason(prNumber: string): string {
+	return `Neither the review event nor SWARM's review-verdict ledger names the head commit reviewed on pull request #${prNumber}, so there is nothing to respond against.`;
+}
+
+/** `pull request #42`, or `this pull request` for an event that names none — for the skip reasons. */
+function reviewSubject(event: ScmEvent): string {
+	return event.workItemId ? `pull request #${event.workItemId}` : 'this pull request';
+}
+
 /**
  * The reviewer-persona gate: whether this submitted review is the *reviewer*
  * persona's own batched review, rather than a human's or the implementer's.
@@ -132,6 +151,10 @@ async function isReviewerPersonaReview(ctx: ScmTriggerContext): Promise<boolean>
 	const { event, project } = ctx;
 	if (!event.actorLogin) {
 		logger.debug('respond-to-review: review has no author — skipping');
+		noteSkip(
+			ctx,
+			`The review on ${reviewSubject(event)} names no author, so SWARM cannot confirm its own reviewer submitted it.`,
+		);
 		return false;
 	}
 	const identities = await ctx.scm.resolvePersonaIdentities(project);
@@ -140,6 +163,11 @@ async function isReviewerPersonaReview(ctx: ScmTriggerContext): Promise<boolean>
 			reviewAuthor: event.actorLogin,
 			expectedReviewer: identities.reviewer,
 		});
+		noteSkip(
+			ctx,
+			`The review on ${reviewSubject(event)} was submitted by \`${event.actorLogin}\`, not by ` +
+				`SWARM's reviewer${identities.reviewer ? ` (\`${identities.reviewer}\`)` : ''}, so SWARM does not respond to it.`,
+		);
 		return false;
 	}
 	return true;
@@ -176,12 +204,13 @@ export function createRespondToReviewTrigger(
 	 * its reviewed SHA), but a cap-reaching ordinal no longer stops the dispatch.
 	 */
 	async function resolveChangesRequestedVerdict(
-		project: ProjectConfig,
+		ctx: ScmTriggerContext,
 		prNumber: string,
 		reviewId: string,
 		headSha: string | undefined,
 		forced: boolean,
 	): Promise<Awaited<ReturnType<typeof getReviewVerdictByReviewId>> | null> {
+		const { project } = ctx;
 		try {
 			const record =
 				(await getReviewVerdictByReviewId(project.id, project.repo, reviewId)) ??
@@ -193,31 +222,54 @@ export function createRespondToReviewTrigger(
 					'respond-to-review: no review-verdict ledger record for this changes-requested review — failing closed',
 					{ prNumber, headSha, reviewId },
 				);
+				noteSkip(
+					ctx,
+					`SWARM's review-verdict ledger has no record of the changes-requested review on pull ` +
+						`request #${prNumber}, so it does not respond — an unrecorded verdict could reopen an unbounded review cycle.`,
+				);
 				return null;
 			}
-			if (stopsAtReviewCap(record, forced, { prNumber, headSha, reviewId })) return null;
+			if (stopsAtReviewCap(record, forced, { prNumber, headSha, reviewId })) {
+				noteSkip(
+					ctx,
+					`The changes-requested review on pull request #${prNumber} was the last verdict the ` +
+						'review cap allows, so the automatic cycle stops here — it needs a human, or an ' +
+						"operator's Force re-review to continue past the cap.",
+				);
+				return null;
+			}
 			return record;
 		} catch (err) {
+			const error = err instanceof Error ? err.message : String(err);
 			logger.error('respond-to-review: failed to read review-verdict cap state — failing closed', {
 				prNumber,
 				headSha,
 				reviewId,
-				error: err instanceof Error ? err.message : String(err),
+				error,
 			});
+			noteSkip(
+				ctx,
+				`SWARM could not read its review-verdict ledger for pull request #${prNumber} (${error}), ` +
+					'so it does not respond until the review cap can be checked.',
+			);
 			return null;
 		}
 	}
 
 	async function resolveDispatchHeadSha(
-		project: ProjectConfig,
-		event: ScmEvent,
+		ctx: ScmTriggerContext,
 		coords: { prNumber: string; reviewId: string },
 		forced: boolean,
 	): Promise<string | null> {
-		if (event.reviewState !== 'changes-requested') return event.headSha ?? null;
+		const { event } = ctx;
+		if (event.reviewState !== 'changes-requested') {
+			if (event.headSha) return event.headSha;
+			noteSkip(ctx, noReviewedHeadReason(coords.prNumber));
+			return null;
+		}
 
 		const record = await resolveChangesRequestedVerdict(
-			project,
+			ctx,
 			coords.prNumber,
 			coords.reviewId,
 			event.headSha,
@@ -235,6 +287,7 @@ export function createRespondToReviewTrigger(
 				reviewId: coords.reviewId,
 			},
 		);
+		noteSkip(ctx, noReviewedHeadReason(coords.prNumber));
 		return null;
 	}
 
@@ -258,6 +311,10 @@ export function createRespondToReviewTrigger(
 			const { event, project } = ctx;
 			if (project.pipeline?.respondToReview?.enabled === false) {
 				logger.debug('respond-to-review: phase disabled — skipping');
+				noteSkip(
+					ctx,
+					'The Respond-to-review phase is disabled for this project (`pipeline.respondToReview.enabled`).',
+				);
 				return null;
 			}
 			if (
@@ -267,6 +324,12 @@ export function createRespondToReviewTrigger(
 				logger.debug('respond-to-review: minor review skipped by project setting', {
 					reviewState: event.reviewState,
 				});
+				noteSkip(
+					ctx,
+					`The review on ${reviewSubject(event)} did not request changes ` +
+						`(\`${event.reviewState ?? 'no verdict'}\`), and this project responds only to a ` +
+						'changes-requested review (`pipeline.respondToReview.skipOnMinors`).',
+				);
 				return null;
 			}
 
@@ -276,10 +339,10 @@ export function createRespondToReviewTrigger(
 			const forced = ctx.forcedReReview === true;
 			if (!forced && !(await isReviewerPersonaReview(ctx))) return null;
 
-			const coords = resolveWebhookCoordinates(event);
+			const coords = resolveWebhookCoordinates(ctx);
 			if (!coords) return null;
 			const { prNumber, prBranch, reviewId } = coords;
-			const headSha = await resolveDispatchHeadSha(project, event, coords, forced);
+			const headSha = await resolveDispatchHeadSha(ctx, coords, forced);
 			if (!headSha) return null;
 
 			logger.debug('respond-to-review: dispatching Respond-to-review phase', {

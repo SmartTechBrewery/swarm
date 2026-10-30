@@ -5440,17 +5440,24 @@ async function settleUnmatchedNoTriggerDelivery(
 		return undefined;
 	}
 	if (job.runId) {
-		await finalizeRun(job.runId, {
-			status: 'failed',
-			// A handler that named its own reason is reported verbatim (issue #1019).
-			// The generic wording below is a *guess* at the cause — it names the board
-			// and the phase's disposition — and a dispatch dropped because SWARM's own
-			// PR+SHA lock is held sends the operator to investigate the wrong system
-			// entirely.
-			error:
-				decline?.reason ??
-				'The pending continuation re-evaluated to no-trigger (e.g. disposition changed or was disabled)',
+		// A handler that named its own reason is reported verbatim (issues #1019,
+		// #1248). The generic wording below is a *guess* at the cause — it names the
+		// board and the phase's disposition — and a dispatch dropped because SWARM's
+		// own PR+SHA lock is held, or because the pull request's head branch is no
+		// longer recognised, sends the operator to investigate the wrong system.
+		const error =
+			decline?.reason ??
+			'The pending continuation re-evaluated to no-trigger (e.g. disposition changed or was disabled)';
+		// Only a continuation reaches here — Retry now, a reset, a deferred retry — so
+		// this is never noise from a fresh delivery that matched nothing.
+		logger.info('No-trigger continuation — settling its run failed', {
+			projectId: project.id,
+			dispatchId: dispatch.id,
+			runId: job.runId,
+			declined: decline?.kind ?? null,
+			reason: error,
 		});
+		await finalizeRun(job.runId, { status: 'failed', error });
 	}
 	// Issue #856: outside the `runId` gate deliberately — the leak this closes is a
 	// dispatch deferred for worker capacity, which never got a run row.
@@ -5533,6 +5540,14 @@ async function settleUnmatchedNoTriggerDelivery(
  * changed disposition and terminally `failed`, until that recheck dispatched and
  * flipped the same row back to `running`. A `recheck-scheduled` decline now leaves
  * the run `deferred`, naming what it waits for.
+ *
+ * **Issue #1248.** The remaining guesses: a retried Review whose pull request's
+ * head branch the repository's naming no longer recognised was reported as a
+ * changed disposition too, and so was every other ordinary skip. The skip paths a
+ * retry can reach in the SCM handlers now note a `skipped` decline naming the
+ * cause, which settles exactly as an unnamed one does — the run failed, this
+ * dispatch's claims handed back — but reports that cause verbatim, so the
+ * generic wording is left for a decline no handler explained.
  */
 async function settleNoTriggerDelivery(
 	job: SwarmJob,
