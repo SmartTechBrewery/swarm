@@ -25,9 +25,16 @@
  * human, by GitHub Projects' "item closed → Done" workflow, or closed on Jira or
  * Linear — is how a dependent learns it may start before its re-check timer.
  *
+ * A card that enters a phase-starting column but names no task for this run's
+ * repository is skipped, and since issue #1231 the skip is surfaced on the card
+ * itself as a one-off SWARM notice rather than only in the router log
+ * ({@link surfaceUnresolvableCard}).
+ *
  * Loop prevention (a persona's own board moves must not re-fire the trigger)
  * already happened router-side (`PMRouterAdapter.isSelfAuthored`), so it isn't
- * repeated here.
+ * repeated here. That covers the notice too: a comment is not a status change
+ * (`PMRouterAdapter.isStatusChange`), and it carries the SWARM footer and marker,
+ * so it can never re-enter this handler.
  */
 
 import type { ProjectConfig } from '../../config/schema.js';
@@ -44,6 +51,7 @@ import {
 } from '../../pm/pipeline.js';
 import type { WorkItem } from '../../pm/types.js';
 import { repoSlugsMatch } from '../../scm/repo-slug.js';
+import { SWARM_GENERATED_FOOTER, swarmMarker } from '../../scm/swarm-origin.js';
 import { recordStatusAndDetectChange } from '../pm-status-dedup.js';
 import type { PmTriggerContext, TriggerContext, TriggerHandler, TriggerResult } from '../types.js';
 
@@ -123,6 +131,104 @@ function resolveTaskIdForItem(workItem: WorkItem, project: ProjectConfig): strin
 	return artifactRepository && repoSlugsMatch(artifactRepository, project.repo)
 		? workItem.taskRef
 		: undefined;
+}
+
+/** The inputs one unresolvable-card notice is written from, and keyed on. */
+export interface UnresolvableCardNotice {
+	phase: PipelinePhase;
+	/** The run's own scoped project repository. */
+	repository: string;
+	/**
+	 * The repository the card's linked artifact is in, when that is *not*
+	 * `repository`; absent when the card names no artifact at all.
+	 */
+	artifactRepository?: string;
+}
+
+const PHASE_NAMES: Readonly<Record<PipelinePhase, string>> = {
+	planning: 'Planning',
+	implementation: 'Implementation',
+};
+
+/**
+ * The idempotency marker of an unresolvable-card notice (issue #1231): one notice
+ * per phase, run repository, reason and foreign artifact repository, so dragging
+ * the card back and forth does not repost it while a different problem — another
+ * phase, or a card re-linked into yet another repository — still gets its own.
+ */
+export function unresolvableCardMarker(notice: UnresolvableCardNotice): string {
+	const reason = notice.artifactRepository
+		? `other-repository:${notice.artifactRepository}`
+		: 'no-task';
+	return swarmMarker('unresolvable-card', `${notice.phase}:${notice.repository}:${reason}`);
+}
+
+/**
+ * The notice posted on a card that entered a phase-starting column but names no
+ * task this run can key a worktree on (issue #1231). It says which phase could
+ * not start, why, and what to do — worded provider-neutrally, since the card may
+ * be on any board and its artifact on any source-control provider.
+ */
+export function unresolvableCardCommentBody(notice: UnresolvableCardNotice): string {
+	const { repository, artifactRepository } = notice;
+	const phase = PHASE_NAMES[notice.phase];
+	const reason = artifactRepository
+		? `its linked source-control artifact is in \`${artifactRepository}\`, not this project repository \`${repository}\`.`
+		: 'it names no task SWARM can run: it has no linked source-control artifact, and the board provider offers none of its own.';
+	const fix = artifactRepository
+		? `Link the card to an issue in \`${repository}\` instead — or, if the work belongs in \`${artifactRepository}\`, make that the project's repository (for example after a rename) — then move the card out of this column and back in.`
+		: `Link the card to an issue in \`${repository}\`, then move the card out of this column and back in.`;
+	return [
+		`### SWARM could not start ${phase}`,
+		'',
+		`This card entered a column that starts the **${phase}** phase, but ${reason}`,
+		'',
+		`**Nothing was started.** ${fix}`,
+		'',
+		'---',
+		SWARM_GENERATED_FOOTER,
+		unresolvableCardMarker(notice),
+	].join('\n');
+}
+
+/**
+ * Post {@link unresolvableCardCommentBody} on the card (issue #1231), so an
+ * operator who moved it sees why nothing happened instead of a card that silently
+ * does nothing. Idempotent on {@link unresolvableCardMarker}, following
+ * `surfaceProseAdvisory` (`src/pipeline/dependency-guard.ts`).
+ *
+ * Only for a genuine move: a resumed phase replays its original event and records
+ * no status change, so it posts nothing.
+ *
+ * Best-effort: any provider failure is logged and swallowed, so the skip stays a
+ * skip. A GitHub Projects draft card has no backing issue to comment on, so its
+ * `addComment` throws and that case stays log-only.
+ */
+async function surfaceUnresolvableCard(
+	ctx: PmTriggerContext,
+	workItem: WorkItem,
+	phase: PipelinePhase,
+	statusChanged: boolean,
+): Promise<void> {
+	if (!statusChanged) return;
+	const artifactRepository = workItem.taskRepository;
+	const notice: UnresolvableCardNotice = {
+		phase,
+		repository: ctx.project.repo,
+		...(artifactRepository && !repoSlugsMatch(artifactRepository, ctx.project.repo)
+			? { artifactRepository }
+			: {}),
+	};
+	try {
+		if (await ctx.pm.findComment(workItem.id, unresolvableCardMarker(notice))) return;
+		await ctx.pm.addComment(workItem.id, unresolvableCardCommentBody(notice));
+	} catch (err) {
+		logger.warn('pm-status: could not post the unresolvable-card notice', {
+			itemId: workItem.id,
+			phase,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	}
 }
 
 /**
@@ -314,7 +420,8 @@ export function createPmStatusTrigger(): TriggerHandler {
 				// points somewhere this run is not for. Can't run a phase without it; drop
 				// rather than throw (a draft card isn't a failed job), and name both
 				// repositories so a mis-linked card is diagnosable rather than
-				// indistinguishable from a draft.
+				// indistinguishable from a draft. The same diagnosis goes on the card
+				// itself (issue #1231).
 				logger.warn('pm-status: work item has no backing SCM artifact reference — skipping', {
 					itemId: event.itemId,
 					url: workItem.url,
@@ -323,6 +430,7 @@ export function createPmStatusTrigger(): TriggerHandler {
 					artifactRepository: workItem.taskRepository,
 					repository: ctx.project.repo,
 				});
+				await surfaceUnresolvableCard(ctx, workItem, phase, statusChanged);
 				return null;
 			}
 

@@ -201,8 +201,9 @@ the two halves have to be fixed in a fixed order.
 What goes stale: the project's own `repo` on the control plane, and — on every
 worker machine — the checkout's `origin` URL plus the declaration the running
 daemon read from it at startup. Nothing here heals on its own. The board card is
-simply skipped, with `pm-status: work item has no backing SCM artifact reference`
-in the router log, because the card's repository no longer matches the project's
+skipped, with `pm-status: work item has no backing SCM artifact reference`
+in the router log and a one-off "SWARM could not start …" notice on the card naming
+both repositories, because the card's repository no longer matches the project's
 (`repoSlugsMatch`, `src/triggers/handlers/pm-status.ts`); once the project *is*
 fixed, dispatch moves on to waiting with `worker-authorization` instead, because
 every machine still declares the old name.
