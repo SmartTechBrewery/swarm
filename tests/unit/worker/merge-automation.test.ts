@@ -1981,6 +1981,15 @@ describe('processMergeAutomationDispatch: settling what the merge absorbed', () 
 		);
 	});
 
+	it('hands the settle a board-key own task from its task branch (issue #1226)', async () => {
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning({ status: 'merged', message: 'merged', sha: 'abc' }),
+			getPullRequest: prOnBranch(`${project.branchPrefix}VT-1538`),
+		});
+
+		expect(await lastResolveOwnTaskId()()).toBe('VT-1538');
+	});
+
 	// Fail closed on the guard's input: the settle is told it has none rather than
 	// being handed an identity nothing verified.
 	it.each([

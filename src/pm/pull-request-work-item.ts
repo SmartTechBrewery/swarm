@@ -27,10 +27,11 @@ export interface PullRequestWorkItemQuery {
 	/** Repository the pull request belongs to, in the project's configured owner/name form. */
 	repository: string;
 	/**
-	 * The work-item number the PR's head branch decodes to under the project's
-	 * `branchPrefix`, when it is a SWARM task branch — the usual case, since SWARM
-	 * names every task branch after the item it implements. Absent for a branch
-	 * outside that convention.
+	 * The SCM issue number the PR's head branch's task id names, when it is one: a
+	 * SWARM task branch (`<branchPrefix><taskId>`) whose task id is the SCM
+	 * artifact-number form — the usual case, since SWARM names every task branch
+	 * after the item it implements. Absent for a branch outside that convention and
+	 * for a board-key task id (`VT-1538`), which names no SCM issue.
 	 */
 	issueNumber?: string;
 	/** The pull request's own number — for a board that tracks the PR itself as a card. */
@@ -42,9 +43,10 @@ export interface PullRequestWorkItemQuery {
  * on the board (or the board couldn't be read — see the module header).
  *
  * The backing **work item** wins over the PR: SWARM's own PRs are opened from a
- * `<branchPrefix><itemNumber>` branch and the card tracks that item, so the issue
- * artifact is tried first and the PR artifact only when it misses. Each attempt is one
- * board read, so the second is paid only by a PR whose item is not on the board.
+ * task branch whose task id is usually an SCM issue number, and the card tracks
+ * that item, so the issue artifact is tried first and the PR artifact only when it
+ * misses. Each attempt is one board read, so the second is paid only by a PR whose
+ * item is not on the board.
  *
  * `logContext` is merged into the log lines (the caller's `projectId`/`phase`/
  * `taskId`) so a fail-open decision is traceable to the dispatch it belongs to.
