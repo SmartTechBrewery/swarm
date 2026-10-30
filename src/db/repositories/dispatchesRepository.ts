@@ -2519,8 +2519,17 @@ export async function listWakeablePendingDispatches(): Promise<DispatchRow[]> {
  * (issue #971): a maintenance run is not a phase the reconciler could re-dispatch,
  * and narrowing here is what keeps one out of `backfillOrphanedDeferredRuns`
  * (`../../dispatch/reconciler.ts`) rather than each of its reads having to notice.
+ *
+ * `settledBefore` is the periodic pass's settle grace (issue #1210): a run any of
+ * whose dispatches — active or settled — was updated after it is left out, so a
+ * Reset's cancel-then-recreate window (and any other just-settled hand-off) is
+ * never read as an orphan. Without it the read is the startup pass's, which runs
+ * before anything else can be mid-hand-off. A run with no dispatch row at all is
+ * never excluded by it.
  */
-export async function listDeferredRunsWithoutActiveDispatch(): Promise<PipelineRunRow[]> {
+export async function listDeferredRunsWithoutActiveDispatch(
+	options: { settledBefore?: Date } = {},
+): Promise<PipelineRunRow[]> {
 	const active = getDb()
 		.select({ runId: dispatches.runId })
 		.from(dispatches)
@@ -2530,6 +2539,13 @@ export async function listDeferredRunsWithoutActiveDispatch(): Promise<PipelineR
 				sql`${dispatches.runId} IS NOT NULL`,
 			),
 		);
+	const { settledBefore } = options;
+	const recentlyTouched = settledBefore
+		? getDb()
+				.select({ runId: dispatches.runId })
+				.from(dispatches)
+				.where(and(sql`${dispatches.runId} IS NOT NULL`, gt(dispatches.updatedAt, settledBefore)))
+		: undefined;
 	const rows = await getDb()
 		.select()
 		.from(runs)
@@ -2538,6 +2554,7 @@ export async function listDeferredRunsWithoutActiveDispatch(): Promise<PipelineR
 				eq(runs.kind, PIPELINE_RUN_KIND),
 				inArray(runs.status, [...RETRY_PENDING_RUN_STATUSES]),
 				notInArray(runs.id, active),
+				recentlyTouched ? notInArray(runs.id, recentlyTouched) : undefined,
 			),
 		);
 	return rows.filter(isPipelineRun);

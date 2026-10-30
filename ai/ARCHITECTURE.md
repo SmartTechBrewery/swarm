@@ -823,8 +823,16 @@ project capacity). A worker
 startup + periodic reconciler (`src/dispatch/reconciler.ts`) reclaims expired
 leases (failing the dispatch and its still-`running` run together), re-publishes
 lost wake-ups, and — once, at startup — imports legacy shapes (Redis
-pending-continuation entries, deferred runs with no active dispatch, and
-pre-#292 `not-ready` merge-follow-up intent) as durable dispatches.
+pending-continuation entries and pre-#292 `not-ready` merge-follow-up intent) as
+durable dispatches. Deferred (or checkpointed) runs with no active dispatch are
+re-queued as `retry-scheduled` dispatches at startup **and on every periodic pass**
+(issue #1210), so a run orphaned by any cause no longer waits for a router restart
+or an operator's Retry now. The periodic pass skips a run any of whose dispatches
+changed within the 2-minute settle grace (`ORPHAN_SETTLE_GRACE_MS`), which keeps it
+out of a Reset's cancel-then-recreate window, and neither pass ever imports a run an
+active #1049 recheck backs — that recheck carries no `run_id` by design, so it is
+found with the same predicate the run detail uses (`awaitsReviewRecheck`,
+`src/dispatch/review-recheck-wait.ts`).
 **That sweep is no longer the only thing that ends an abandoned claim** (issue
 #1017). A dispatch in `leased`/`running` is active, so the operator's "Retry now"
 found one and refused — "This run is already retrying" — for a claim whose worker

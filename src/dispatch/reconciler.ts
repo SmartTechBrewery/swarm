@@ -6,9 +6,13 @@
  *    (deterministic wake ids make the re-add a queue no-op when it did land);
  *  - claim → run: a leased/running dispatch whose lease expired belongs to a
  *    dead process — fail it (and its still-`running` run row) visibly;
- *  - legacy shapes: Redis pending-continuation entries and `deferred` runs with
- *    no active dispatch (the exact #269/#279 orphans) are imported as durable
- *    dispatches once, at startup.
+ *  - orphaned retries: `deferred`/`checkpointed` runs with no active dispatch
+ *    (the #269/#279 orphan shapes, and any later cause) are imported as durable
+ *    dispatches at startup and on every periodic pass — the periodic pass only
+ *    once the run's dispatches have settled for {@link ORPHAN_SETTLE_GRACE_MS},
+ *    and never for a run an active #1049 recheck backs (issue #1210);
+ *  - legacy shapes: Redis pending-continuation entries and the retired
+ *    merge-follow-up queue are imported as durable dispatches once, at startup.
  *
  * Runs inside the worker: once at startup (after migrations, before serving
  * jobs) and periodically while serving. Every step is best-effort and logged —
@@ -46,6 +50,7 @@ import { priorityFor } from '../queue/producer.js';
 import type { TriggerPhase } from '../triggers/types.js';
 import { mergeDispatchDedupKey } from '../worker/merge-automation.js';
 import { publishDispatchWakeUp } from './dispatcher.js';
+import { awaitsReviewRecheck } from './review-recheck-wait.js';
 import { promoteAllWipWaits } from './wip-limit.js';
 
 /** The Redis namespace the retired pending-continuation registry lived under. */
@@ -64,6 +69,16 @@ const DEAD_LEASE_REASON =
  */
 const SUPERSEDED_WORKER_SESSION_REASON =
 	"The worker's session was superseded by a newer one while this phase was executing — settled from that signal, not from the lease window";
+
+/**
+ * How long every dispatch of a deferred run must have been left alone before the
+ * periodic pass reads the run as orphaned (issue #1210). A Reset (`./run-reset.ts`)
+ * cancels the run's active dispatch, tears down its checkout, and only then
+ * creates the replacement; importing the run inside that gap would make the Reset
+ * refuse with `already-resetting` and restart the run on its un-sanitised payload.
+ * The cancelled dispatch's fresh `updated_at` is what this grace keys on.
+ */
+export const ORPHAN_SETTLE_GRACE_MS = 2 * 60 * 1000;
 
 async function settleFailedDispatchRuns(failed: DispatchRow[]): Promise<void> {
 	for (const dispatch of failed) {
@@ -230,17 +245,31 @@ async function backfillLegacyPendingContinuations(): Promise<number> {
 /**
  * Import `deferred` runs with no active dispatch as `retry-scheduled`
  * dispatches — the durable repair for a retry whose delayed job vanished (the
- * exact #269/#279 orphan shapes). The run row's persisted `jobPayload` is the
- * retry intent; its recorded `nextRetryAt` (or now) is the schedule. A run
- * without a payload cannot be reconstructed and is surfaced for operator
- * action instead of being silently discarded.
+ * #269/#279 orphan shapes, or any later cause). The run row's persisted
+ * `jobPayload` is the retry intent; its recorded `nextRetryAt` (or now) is the
+ * schedule. A run without a payload cannot be reconstructed and is surfaced for
+ * operator action instead of being silently discarded.
+ *
+ * A run waiting on its own coalesced recheck (issue #1049) is backed even though
+ * no dispatch names it, so it is never imported — doing so would dispatch a
+ * duplicate beside the recheck that re-adopts it. A recheck read that throws
+ * leaves the run for the next pass rather than guessing.
+ *
+ * `settledBefore` is the periodic pass's settle grace (issue #1210, see
+ * {@link ORPHAN_SETTLE_GRACE_MS}); the startup pass omits it, since nothing else
+ * is running yet. On the periodic pass the un-rebuildable skips log at `debug`,
+ * so one stuck run does not warn every interval — startup still warns once.
+ * Returns the ids of the runs it imported.
  */
-async function backfillOrphanedDeferredRuns(): Promise<number> {
-	const orphans = await listDeferredRunsWithoutActiveDispatch();
-	let imported = 0;
+async function backfillOrphanedDeferredRuns(
+	options: { settledBefore?: Date } = {},
+): Promise<string[]> {
+	const orphans = await listDeferredRunsWithoutActiveDispatch(options);
+	const logSkip = options.settledBefore ? logger.debug : logger.warn;
+	const imported: string[] = [];
 	for (const run of orphans) {
 		if (!run.jobPayload) {
-			logger.warn(
+			logSkip(
 				'dispatch-reconciler: deferred run has no stored job payload — leave for operator action (Retry now cannot rebuild it either)',
 				{ runId: run.id, projectId: run.projectId, taskId: run.taskId, phase: run.phase },
 			);
@@ -248,10 +277,22 @@ async function backfillOrphanedDeferredRuns(): Promise<number> {
 		}
 		const parsed = SwarmJobSchema.safeParse(run.jobPayload);
 		if (!parsed.success) {
-			logger.warn('dispatch-reconciler: deferred run payload failed validation — skipping', {
+			logSkip('dispatch-reconciler: deferred run payload failed validation — skipping', {
 				runId: run.id,
 				error: parsed.error.message,
 			});
+			continue;
+		}
+		try {
+			if (await awaitsReviewRecheck(run)) continue;
+		} catch (err) {
+			logger.warn(
+				'dispatch-reconciler: review-recheck lookup failed — leaving the run for a later pass',
+				{
+					runId: run.id,
+					error: describeError(err),
+				},
+			);
 			continue;
 		}
 		const job: SwarmJob = { ...parsed.data, runId: run.id };
@@ -270,7 +311,7 @@ async function backfillOrphanedDeferredRuns(): Promise<number> {
 				attempt: job.rateLimitRetryAttempt ?? 0,
 			});
 			await publishDispatchWakeUp(dispatch);
-			imported += 1;
+			imported.push(run.id);
 		} catch (err) {
 			logger.warn('dispatch-reconciler: deferred-run import refused', {
 				runId: run.id,
@@ -393,7 +434,7 @@ export async function reconcileDispatchesAtStartup(): Promise<void> {
 	try {
 		const reclaimed = await reclaimDeadLeases(new Date());
 		const legacy = await backfillLegacyPendingContinuations();
-		const orphans = await backfillOrphanedDeferredRuns();
+		const orphans = (await backfillOrphanedDeferredRuns()).length;
 		const merges = await backfillLegacyMergeFollowUps();
 		const republished = await republishWakeUps();
 		// A `wip-limit` wait is not timed-republished (issue #1185), so a wake-up lost
@@ -424,14 +465,29 @@ export async function reconcileDispatchesAtStartup(): Promise<void> {
 }
 
 /**
- * Periodic reconciliation while serving jobs: reclaim expired leases,
- * re-publish any wake-up a crash window lost, and nudge tickets waiting on a
- * repository's WIP limit (issue #1185) whose slot-release wake-up went missing,
- * which also picks up an operator raising that limit.
+ * Periodic reconciliation while serving jobs: reclaim expired leases, re-queue
+ * deferred runs left without a dispatch (issue #1210), re-publish any wake-up a
+ * crash window lost, and nudge tickets waiting on a repository's WIP limit
+ * (issue #1185) whose slot-release wake-up went missing, which also picks up an
+ * operator raising that limit.
+ *
+ * The orphan backfill runs after the lease reclaim but with the settle grace, so
+ * a run whose lease was reclaimed in this pass (a fresh `updated_at`) is picked
+ * up a pass later rather than raced here. An import while the router runs means
+ * something dropped a retry, so it warns with the run ids.
  */
 export async function reconcileDispatchesPeriodically(): Promise<void> {
 	try {
 		const reclaimed = await reclaimDeadLeases(new Date());
+		const orphanRunIds = await backfillOrphanedDeferredRuns({
+			settledBefore: new Date(Date.now() - ORPHAN_SETTLE_GRACE_MS),
+		});
+		if (orphanRunIds.length > 0) {
+			logger.warn('dispatch-reconciler: re-queued deferred runs left without a dispatch', {
+				count: orphanRunIds.length,
+				runIds: orphanRunIds,
+			});
+		}
 		const republished = await republishWakeUps();
 		await promoteAllWipWaits();
 		if (reclaimed > 0) {
