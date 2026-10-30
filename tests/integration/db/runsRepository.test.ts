@@ -61,6 +61,10 @@ import type { SwarmUser } from '../../../src/identity/schema.js';
 import type { Worker } from '../../../src/identity/worker.js';
 import { registerWorker } from '../../../src/identity/worker-service.js';
 import type { SwarmJob } from '../../../src/queue/jobs.js';
+import {
+	abandonedReviewDiagnosis,
+	type FailureDiagnosis,
+} from '../../../src/worker/failure-diagnosis.js';
 import { createMockPmWebhookJob, createMockScmWebhookJob } from '../../helpers/factories.js';
 import { truncateAll } from '../helpers/db.js';
 import { seedProject } from '../helpers/seed.js';
@@ -2556,6 +2560,23 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			const { data } = await listRunsFromDb({ projectId: PROJECT_ID, limit: 10, offset: 0 });
 			expect(data.map((row) => row.taskId)).toContain('44');
 		});
+
+		it('persists the abandonment’s diagnosis when it carries one (issue #1203)', async () => {
+			const failureDiagnosis = abandonedReviewDiagnosis({
+				kind: 'review-waiting-for-checks',
+				waitMinutes: 2,
+			});
+			const id = await createFailedRun({
+				projectId: PROJECT_ID,
+				repository: REPO,
+				taskId: '45',
+				phase: 'review',
+				error: "Review didn't start yet.",
+				failureDiagnosis,
+			});
+
+			expect((await getRunByIdFromDb(id))?.failureDiagnosis).toEqual(failureDiagnosis);
+		});
 	});
 
 	describe('hasResumableDeferredRun', () => {
@@ -2996,6 +3017,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			prNumber?: string;
 			producedPrUrl?: string;
 			reviewMergeOutcome?: string;
+			failureDiagnosis?: FailureDiagnosis;
 		}): Promise<string> {
 			const rows = await getDb()
 				.insert(runs)
@@ -3010,10 +3032,40 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 					prNumber: input.prNumber,
 					producedPrUrl: input.producedPrUrl,
 					reviewMergeOutcome: input.reviewMergeOutcome,
+					failureDiagnosis: input.failureDiagnosis,
 				})
 				.returning({ id: runs.id });
 			return rows[0].id;
 		}
+
+		// The WIP section reads this off the latest run to tell a Review waiting for CI
+		// from one that waits on the operator (issue #1203).
+		it('carries the latest run’s own failure-diagnosis kind', async () => {
+			await seedActivityRun({
+				taskId: '92',
+				phase: 'review',
+				status: 'failed',
+				failureDiagnosis: abandonedReviewDiagnosis({
+					kind: 'review-waiting-for-checks',
+					waitMinutes: 2,
+				}),
+				startedAt: new Date('2026-02-01T00:00:00Z'),
+				completedAt: new Date('2026-02-01T00:10:00Z'),
+			});
+			await seedActivityRun({
+				taskId: '93',
+				phase: 'review',
+				status: 'failed',
+				startedAt: new Date('2026-02-01T00:00:00Z'),
+				completedAt: new Date('2026-02-01T00:10:00Z'),
+			});
+
+			const rows = await listTaskActivitySince({ since: SINCE });
+			const byTask = Object.fromEntries(rows.map((row) => [row.taskId, row]));
+
+			expect(byTask['92']?.failureDiagnosisKind).toBe('review-waiting-for-checks');
+			expect(byTask['93']?.failureDiagnosisKind).toBeNull();
+		});
 
 		it('returns the group’s latest run by completion time, with its aggregates', async () => {
 			await seedActivityRun({

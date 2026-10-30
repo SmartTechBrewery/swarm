@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import type { AgentCliResult } from '@/harness/agent-cli.js';
 import type { ProposedScope } from '@/pipeline/planning.js';
-import { diagnoseFailure, MIN_SCOPE_STALL_DURATION_MS } from '@/worker/failure-diagnosis.js';
+import {
+	abandonedReviewDiagnosis,
+	diagnoseFailure,
+	MIN_SCOPE_STALL_DURATION_MS,
+} from '@/worker/failure-diagnosis.js';
 
 const MULTI_CONCERN_SCOPE: ProposedScope = {
 	whyOneTask: 'The concerns must be coordinated in one delivery.',
@@ -111,5 +115,42 @@ describe('diagnoseFailure (issue #269)', () => {
 		});
 
 		expect(diagnosis).toMatchObject({ kind: knownCondition, title });
+	});
+});
+
+describe('abandonedReviewDiagnosis (issue #1203)', () => {
+	it('reads a still-running head as a wait that ends by itself, naming the wait', () => {
+		const diagnosis = abandonedReviewDiagnosis({
+			kind: 'review-waiting-for-checks',
+			waitMinutes: 2,
+		});
+
+		expect(diagnosis.kind).toBe('review-waiting-for-checks');
+		expect(diagnosis.title).toBe("Review didn't start yet — CI was still running after 2 minutes");
+		expect(diagnosis.message).toContain('starts automatically when the checks finish');
+		expect(diagnosis.recovery).toContain('Check Wait');
+		expect(diagnosis.recovery).toContain('2 minutes');
+	});
+
+	it('says one minute in the singular', () => {
+		const { title } = abandonedReviewDiagnosis({
+			kind: 'review-waiting-for-checks',
+			waitMinutes: 1,
+		});
+		expect(title).toMatch(/after 1 minute$/);
+	});
+
+	it('tells the operator to retry once an unreachable provider answers', () => {
+		const diagnosis = abandonedReviewDiagnosis({
+			kind: 'review-provider-unreachable',
+			providerLabel: 'GitHub',
+		});
+
+		expect(diagnosis.kind).toBe('review-provider-unreachable');
+		expect(diagnosis.title).toBe(
+			"GitHub didn't respond while SWARM was checking this pull request",
+		);
+		expect(diagnosis.message).toContain('will not start by itself');
+		expect(diagnosis.recovery).toBe('Use Retry now once GitHub is reachable.');
 	});
 });

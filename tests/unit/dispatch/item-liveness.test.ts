@@ -35,6 +35,7 @@ function makeActivity(overrides: Partial<TaskActivityRow> = {}): TaskActivityRow
 		reviewVerdict: null,
 		reviewAutomationOutcome: null,
 		reviewMergeOutcome: null,
+		failureDiagnosisKind: null,
 		lastActivityAt: LONG_AGO,
 		liveRunCount: 0,
 		mergedRunCount: 0,

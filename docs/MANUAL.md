@@ -864,8 +864,11 @@ card, its pull request once it has one, how long it has been in flight, and what
 doing. A ticket the pipeline cannot move on its own carries a **Waiting on you** badge
 with the reason: its plan is waiting for your greenlight (move the card to Ready), its
 pull request is approved and waiting for you to merge, it reached the review cap, it
-stalled, or its latest run failed and nothing will retry it. That verdict comes from
-the same liveness rules as the Stalled section, so a dismissed stall still shows here
+stalled, or its latest run failed and nothing will retry it. A Review abandoned while
+the head's CI was still running is not one of these (issue #1203): the completed-checks
+event starts Review by itself, so the ticket shows as waiting on the pipeline —
+"Waiting for CI — Review starts when the checks finish" — and reads as stalled only if
+nothing moves for two hours. That verdict comes from the same liveness rules as the Stalled section, so a dismissed stall still shows here
 while its ticket holds a slot. A Queue row waiting for a WIP slot also names its
 repository's `x / y`. To free a slot, finish or abandon the ticket: merge or close its
 pull request, move its card to Done or Backlog, or Put it back from the Queue. The
@@ -1265,8 +1268,11 @@ pull requests sets `reviewChecks: 'if-present'` and is reviewed as soon as the p
 request opens. A Review that was queued, waiting for a worker for example, reads
 the checks again when it is picked up, so it never starts on a head that went red
 in the meantime. If this repository's CI routinely outlasts the wait, an abandoned
-Review run naming `reviewChecksWaitMinutes` appears. The completed-checks event
-still reviews the head, and raising the setting removes the noise.
+Review run appears that says Review didn't start yet because CI was still running,
+naming the repository's Check Wait and its value. The completed-checks event
+still reviews the head, and raising the setting removes the noise. A Review abandoned
+because the provider never answered says so too, and does not start by itself: use
+Retry now once the provider is reachable.
 
 **A renamed repository produces no failure at all.** Cards stop dispatching and
 nothing is marked failed: the router logs `pm-status: work item has no backing SCM

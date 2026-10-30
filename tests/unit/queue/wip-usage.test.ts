@@ -43,6 +43,7 @@ function makeActivity(overrides: Partial<TaskActivityRow> = {}): TaskActivityRow
 		reviewVerdict: null,
 		reviewAutomationOutcome: null,
 		reviewMergeOutcome: null,
+		failureDiagnosisKind: null,
 		lastActivityAt: LONG_AGO,
 		liveRunCount: 0,
 		mergedRunCount: 0,
@@ -248,6 +249,58 @@ describe('toWipUsage', () => {
 			activeDispatches: [{ projectId: 'p1', taskId: '103', phase: 'planning', waitReason: null }],
 		});
 		expect(ticket.state).toBe('waiting-on-pipeline');
+	});
+
+	describe('a Review abandoned while its checks were still running (issue #1203)', () => {
+		/** The holder's pull request, its latest Review the abandoned record. */
+		const abandonedReview = (
+			failureDiagnosisKind: string,
+			lastActivityAt: Date,
+		): Partial<WipUsageInput> => ({
+			slots: [makeSlot({ prNumber: '120' })],
+			activity: [
+				makeActivity({ phase: 'implementation', producedPrUrl: 'https://x/pull/120' }),
+				makeActivity({
+					taskId: '120',
+					prNumber: '120',
+					phase: 'review',
+					status: 'failed',
+					failureDiagnosisKind,
+					lastActivityAt,
+				}),
+			],
+		});
+
+		it('reads as waiting on the pipeline for CI, not as a failure', () => {
+			const ticket = holder(abandonedReview('review-waiting-for-checks', RECENTLY));
+			expect(ticket).toMatchObject({
+				state: 'waiting-on-pipeline',
+				pipelineReason: 'waiting-for-checks',
+				phase: 'review',
+			});
+			expect(ticket.operatorReason).toBeUndefined();
+		});
+
+		it('reads as stalled once nothing has moved for the grace window', () => {
+			const ticket = holder(abandonedReview('review-waiting-for-checks', LONG_AGO));
+			expect(ticket).toMatchObject({ state: 'waiting-on-operator', operatorReason: 'stalled' });
+			expect(ticket.pipelineReason).toBeUndefined();
+		});
+
+		it('still reads a provider that never answered as a failure for the operator', () => {
+			const ticket = holder(abandonedReview('review-provider-unreachable', RECENTLY));
+			expect(ticket).toMatchObject({ state: 'waiting-on-operator', operatorReason: 'failed' });
+			expect(ticket.pipelineReason).toBeUndefined();
+		});
+
+		it('lets a queued dispatch decide, with no CI reason', () => {
+			const ticket = holder({
+				...abandonedReview('review-waiting-for-checks', RECENTLY),
+				activeDispatches: [{ projectId: 'p1', taskId: '120', phase: 'review', waitReason: null }],
+			});
+			expect(ticket.state).toBe('waiting-on-pipeline');
+			expect(ticket.pipelineReason).toBeUndefined();
+		});
 	});
 
 	it('classifies a holder without a pull request number from its card alone', () => {

@@ -13,6 +13,8 @@ export const FailureDiagnosisKindSchema = z.enum([
 	'user-terminated',
 	'continuation-budget-exhausted',
 	'commit-unavailable',
+	'review-waiting-for-checks',
+	'review-provider-unreachable',
 ]);
 
 export type FailureDiagnosisKind = z.infer<typeof FailureDiagnosisKindSchema>;
@@ -33,7 +35,10 @@ export type FailureDiagnosis = z.infer<typeof FailureDiagnosisSchema>;
 
 export type KnownFailureCondition = Exclude<
 	FailureDiagnosisKind,
-	'likely-scope-exceeded' | 'provider-stalled-early'
+	| 'likely-scope-exceeded'
+	| 'provider-stalled-early'
+	| 'review-waiting-for-checks'
+	| 'review-provider-unreachable'
 >;
 
 export interface DiagnoseFailureInput {
@@ -108,6 +113,44 @@ function knownDiagnosis(condition: KnownFailureCondition): FailureDiagnosis {
 				'Inspect the checkpoint recorded on this run, then either raise `pipeline.maxContinuations`, narrow the task, or reset and restart the phase.',
 			);
 	}
+}
+
+/**
+ * The two Review give-ups an operator should read in plain terms (issue #1203),
+ * each carrying the one value its copy names.
+ */
+export type AbandonedReviewDiagnosisInput =
+	| { kind: 'review-waiting-for-checks'; waitMinutes: number }
+	| { kind: 'review-provider-unreachable'; providerLabel: string };
+
+function describeMinutes(minutes: number): string {
+	return minutes === 1 ? '1 minute' : `${minutes} minutes`;
+}
+
+/**
+ * The headline of an abandoned Review run (issue #1203). The `kind` is the
+ * recorded fact about the abandonment — which recheck budget ran out, and for
+ * `review-waiting-for-checks` that the head's checks were still running — and the
+ * WIP read model (`src/queue/wip-usage.ts`) reads that kind, never the run's
+ * `error`, to tell a Review that resumes by itself when CI finishes from one that
+ * waits on the operator.
+ */
+export function abandonedReviewDiagnosis(input: AbandonedReviewDiagnosisInput): FailureDiagnosis {
+	if (input.kind === 'review-waiting-for-checks') {
+		const minutes = describeMinutes(input.waitMinutes);
+		return diagnosis(
+			input.kind,
+			`Review didn't start yet — CI was still running after ${minutes}`,
+			'Review starts automatically when the checks finish.',
+			`None needed now. If CI in this repository usually takes longer than ${minutes}, raise its Check Wait under Source Control → Repositories.`,
+		);
+	}
+	return diagnosis(
+		input.kind,
+		`${input.providerLabel} didn't respond while SWARM was checking this pull request`,
+		'SWARM stopped waiting, so this Review will not start by itself.',
+		`Use Retry now once ${input.providerLabel} is reachable.`,
+	);
 }
 
 function progressOutputBytes(agent: ReportedAgentResult): number {

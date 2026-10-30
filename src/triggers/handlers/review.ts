@@ -96,7 +96,11 @@
  * attempts spent and last read (`recordAbandonedReview`). It is written there
  * rather than posted to the provider because the give-up is usually caused by
  * that provider being unreachable; the pull-request comment stays a best-effort
- * extra, and the row is retryable from the dashboard.
+ * extra, and the row is retryable from the dashboard. A give-up on checks still
+ * running, or on the provider never answering, also records a `failure_diagnosis`
+ * (issue #1203) that leads the record in plain terms — and the WIP read model reads
+ * its kind to tell a Review that resumes by itself when CI finishes from one that
+ * waits on the operator.
  *
  * **So does a spent CI-fix budget** (issue #838). The Respond-to-CI fix-attempt
  * cap above used to wind down to a bare warn, leaving a capped pull request
@@ -245,6 +249,7 @@ import {
 import { readBaseBranchHealth } from '../../dispatch/base-branch-health.js';
 import { hasCiNoFixRecovery } from '../../dispatch/ci-no-fix-recovery.js';
 import { promoteMergeChecksWaits, scheduleCoalescedDispatch } from '../../dispatch/dispatcher.js';
+import { getSCMProvider } from '../../integrations/scm/registry.js';
 import { describeError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
 import type { SwarmJob } from '../../queue/jobs.js';
@@ -254,6 +259,7 @@ import { repoSlugsMatch } from '../../scm/repo-slug.js';
 import { SWARM_GENERATED_FOOTER } from '../../scm/swarm-origin.js';
 import type { AggregateCheckStatus, PullRequestDetails, SCMProvider } from '../../scm/types.js';
 import { resolveAgentTimeoutMs } from '../../worker/agent-timeout.js';
+import { abandonedReviewDiagnosis, type FailureDiagnosis } from '../../worker/failure-diagnosis.js';
 import { rearmMergeAutomationForGreenHead } from '../../worker/merge-automation.js';
 import { buildConflictResolutionKey, claimConflictResolution } from '../resolve-conflicts-dedup.js';
 import {
@@ -387,11 +393,54 @@ interface RecheckWait {
 	 */
 	lever?: string;
 	/**
-	 * Named only in the give-up record: the lever for a wait that ends by itself but
-	 * outlasted this project's budget (issue #1083) — never in the in-flight reason,
-	 * which needs no advice while the checks are still running.
+	 * The give-up record's plain-terms headline (issue #1203), for a give-up whose
+	 * cause the operator should read without SWARM's internals: checks that were
+	 * still running when the repository's CI wait ran out (issue #1083), or a
+	 * provider that never answered. Never in the in-flight reason, which needs no
+	 * advice while the wait is still going; its `kind` is persisted on the run so
+	 * the WIP section can tell a self-resuming CI wait from a give-up.
 	 */
-	exhaustedLever?: string;
+	abandonedDiagnosis?: FailureDiagnosis;
+}
+
+/** Operator-facing labels for the `details` keys the defer sites record. */
+const ABANDONED_REVIEW_DETAIL_LABELS: Record<string, string> = {
+	incompleteChecks: 'Still running',
+	error: 'Last error',
+	reason: 'Reason',
+};
+
+/**
+ * The give-up record's secondary details (issue #1203): one plain line per fact,
+ * a list one nested line per entry — never JSON, and never comma-joined, since a
+ * check's own name can contain commas ("Lint, typecheck, and test").
+ */
+function abandonedReviewDetailLines(
+	prNumber: string,
+	headSha: string,
+	attemptsSpent: number,
+	cap: number,
+	details: Record<string, unknown>,
+): string[] {
+	const lines = [
+		`- Pull request: #${prNumber}`,
+		`- Head commit: ${headSha}`,
+		`- Re-checks spent: ${attemptsSpent} of ${cap}`,
+	];
+	for (const [key, value] of Object.entries(details)) {
+		const label = ABANDONED_REVIEW_DETAIL_LABELS[key] ?? key;
+		if (Array.isArray(value)) {
+			lines.push(`- ${label}:`, ...value.map((entry) => `  - ${String(entry)}`));
+		} else {
+			lines.push(`- ${label}: ${String(value)}`);
+		}
+	}
+	return lines;
+}
+
+/** The provider's display name for the give-up copy, readable even when unregistered. */
+function scmProviderLabel(ctx: ScmTriggerContext): string {
+	return getSCMProvider(ctx.providerId)?.label ?? 'The source-control provider';
 }
 
 /**
@@ -430,10 +479,14 @@ function baseReviewJobPayload(ctx: ScmTriggerContext): SwarmJob {
  * trace anywhere. The pull-request comment ({@link scmCommentReviewGaveUp}) stays
  * a best-effort extra on top of this.
  *
- * The row carries the repository, PR, phase and head SHA already, names which
- * budget ran out, how many attempts it spent and what the last read reported —
- * and, because it stores this event's payload, `runs.retryNow` re-runs the
- * review decision from the dashboard on a fresh budget.
+ * The row carries the repository, PR, phase and head SHA already, names why it
+ * gave up, how many attempts it spent and what the last read reported — and,
+ * because it stores this event's payload, `runs.retryNow` re-runs the review
+ * decision from the dashboard on a fresh budget. Where the wait carries an
+ * {@link RecheckWait.abandonedDiagnosis} (issue #1203), the error leads with its
+ * short headline, the diagnosis is persisted beside it, and the facts follow as a
+ * plain details list; which budget ran out is then recorded by the diagnosis kind
+ * rather than spelled out in the text.
  *
  * **A chain a retry started ends on the retried run, not on a second row** (issue
  * #1049). Retrying an abandoned review — or a Respond-to-CI run this handler
@@ -452,18 +505,21 @@ async function recordAbandonedReview(
 	attemptsSpent: number,
 	cap: number,
 	details: Record<string, unknown>,
-	lever?: string,
+	wait: RecheckWait,
 ): Promise<void> {
-	const lastRead = Object.entries(details)
-		.map(([key, value]) => `${key}: ${typeof value === 'string' ? value : JSON.stringify(value)}`)
-		.join('; ');
-	const error =
-		`Review abandoned: ${ABANDONED_REVIEW_REASONS[budget]}. ` +
-		`PR #${prNumber} at ${headSha}; the ${budget} recheck budget is spent (${attemptsSpent}/${cap} attempts).` +
-		(lastRead ? ` Last read — ${lastRead}.` : '') +
-		(lever ? ` ${lever}` : '');
+	const diagnosis = wait.abandonedDiagnosis;
+	const headline = diagnosis
+		? `${diagnosis.title}. ${diagnosis.message}\n${diagnosis.recovery}`
+		: `Review abandoned: ${ABANDONED_REVIEW_REASONS[budget]}.` +
+			(wait.lever ? ` ${wait.lever}` : '');
+	const error = [
+		headline,
+		'',
+		'Details:',
+		...abandonedReviewDetailLines(prNumber, headSha, attemptsSpent, cap, details),
+	].join('\n');
 	try {
-		if (await settleRunAwaitingRecheck(ctx, prNumber, headSha, error)) return;
+		if (await settleRunAwaitingRecheck(ctx, prNumber, headSha, error, diagnosis)) return;
 		await createFailedRun({
 			projectId: ctx.project.id,
 			repository: ctx.project.repo,
@@ -474,6 +530,7 @@ async function recordAbandonedReview(
 			prNumber,
 			jobPayload: baseReviewJobPayload(ctx),
 			error,
+			failureDiagnosis: diagnosis,
 		});
 	} catch (err) {
 		logger.error('review: failed to record the abandoned review run', {
@@ -519,6 +576,7 @@ async function settleRunAwaitingRecheck(
 	prNumber: string,
 	headSha: string,
 	error: string,
+	failureDiagnosis?: FailureDiagnosis,
 ): Promise<boolean> {
 	let settledAny = false;
 	for (const [taskId, phase] of recheckWaiterTasks(prNumber)) {
@@ -528,7 +586,7 @@ async function settleRunAwaitingRecheck(
 		const payload = run.jobPayload;
 		if (payload?.type !== 'scm' || payload.event.headSha !== headSha) continue;
 		if (await getActiveDispatchByRunId(run.id)) continue;
-		if (!(await failRunFromStatus(run.id, error, 'deferred'))) continue;
+		if (!(await failRunFromStatus(run.id, error, 'deferred', failureDiagnosis))) continue;
 		settledAny = true;
 		logger.info('review: recheck chain gave up — settled the run it was waiting on', {
 			runId: run.id,
@@ -646,16 +704,7 @@ async function scheduleReviewRecheck(
 		// Both terminal give-up paths — the mergeability one and the aggregate-check
 		// one — funnel through this branch, so the durable trace is written once,
 		// here, rather than repeated at (and forgettable from) each caller.
-		await recordAbandonedReview(
-			ctx,
-			budget,
-			prNumber,
-			headSha,
-			attemptsSpent,
-			cap,
-			details,
-			[wait.lever, wait.exhaustedLever].filter(Boolean).join(' ') || undefined,
-		);
+		await recordAbandonedReview(ctx, budget, prNumber, headSha, attemptsSpent, cap, details, wait);
 		return false;
 	}
 
@@ -783,11 +832,10 @@ function aggregateCheckWait(
 	if (incompleteChecks.length > 0) {
 		return {
 			waitingFor: `${subject} to finish (still running: ${incompleteChecks.join(', ')})`,
-			exhaustedLever:
-				`Checks were still running when this repository's CI wait ran out ` +
-				`(${resolveChecksWaitMinutes(project)} minutes, \`reviewChecksWaitMinutes\` on this ` +
-				"repository's Source Control entry) — raise it if this repository's CI routinely " +
-				'takes longer.',
+			abandonedDiagnosis: abandonedReviewDiagnosis({
+				kind: 'review-waiting-for-checks',
+				waitMinutes: resolveChecksWaitMinutes(project),
+			}),
 		};
 	}
 	return {
@@ -1028,6 +1076,10 @@ async function resolveAggregateCheckReview(
 			{ reason: 'aggregate query failed', error },
 			{
 				waitingFor: `the source-control provider to report the checks on pull request #${prNumber} at head '${headSha}' (the last read failed: ${error})`,
+				abandonedDiagnosis: abandonedReviewDiagnosis({
+					kind: 'review-provider-unreachable',
+					providerLabel: scmProviderLabel(ctx),
+				}),
 			},
 		);
 	}
@@ -1718,6 +1770,10 @@ async function checkMergeabilityAndConflicts(
 			{ reason: 'fetch PR failed', error },
 			{
 				waitingFor: `the source-control provider to return pull request #${prNumber} (the last read failed: ${error})`,
+				abandonedDiagnosis: abandonedReviewDiagnosis({
+					kind: 'review-provider-unreachable',
+					providerLabel: scmProviderLabel(ctx),
+				}),
 			},
 		);
 	}

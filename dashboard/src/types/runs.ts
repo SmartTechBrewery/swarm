@@ -63,6 +63,8 @@ export const failureDiagnosisSchema = z.object({
 		'user-terminated',
 		'continuation-budget-exhausted',
 		'commit-unavailable',
+		'review-waiting-for-checks',
+		'review-provider-unreachable',
 	]),
 	title: z.string(),
 	message: z.string(),
@@ -292,6 +294,10 @@ export const wipOperatorReasonSchema = z.enum([
 ]);
 export type WipOperatorReason = z.infer<typeof wipOperatorReasonSchema>;
 
+/** Mirrors `WipPipelineReasonSchema` (`src/queue/wip-usage.ts`, issue #1203). */
+export const wipPipelineReasonSchema = z.enum(['waiting-for-checks']);
+export type WipPipelineReason = z.infer<typeof wipPipelineReasonSchema>;
+
 /**
  * Mirrors the server `runs.wip` contract (`WipUsageEntrySchema`,
  * `src/queue/wip-usage.ts`, issue #1192) — one repository's WIP limit in use and the
@@ -315,6 +321,7 @@ export const wipUsageEntrySchema = z.object({
 			openedAt: z.string(),
 			state: wipTicketStateSchema,
 			operatorReason: wipOperatorReasonSchema.optional(),
+			pipelineReason: wipPipelineReasonSchema.optional(),
 			phase: z.string().optional(),
 			prNumber: z.string().optional(),
 			prUrl: z.string().optional(),

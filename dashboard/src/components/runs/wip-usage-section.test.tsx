@@ -130,6 +130,32 @@ describe('WipUsageSection', () => {
 		expect(screen.getByText('Waiting on the pipeline after Planning')).toBeDefined();
 	});
 
+	it('names a Review waiting for CI as the pipeline’s wait, not the operator’s (issue #1203)', () => {
+		renderSection(
+			<WipUsageSection
+				entries={[
+					makeEntry({
+						tickets: [
+							makeTicket({
+								state: 'waiting-on-pipeline',
+								pipelineReason: 'waiting-for-checks',
+								phase: 'review',
+								prNumber: '120',
+							}),
+						],
+					}),
+				]}
+			/>,
+		);
+
+		const ticket = screen.getByTestId('wip-ticket');
+		expect(within(ticket).getByText('Waiting on the pipeline after Review')).toBeDefined();
+		expect(
+			within(ticket).getByText('Waiting for CI — Review starts when the checks finish'),
+		).toBeDefined();
+		expect(screen.queryByText('Waiting on you')).toBeNull();
+	});
+
 	it('explains a repository with waiters but no holders', () => {
 		renderSection(
 			<WipUsageSection entries={[makeEntry({ inFlight: 0, waiting: 1, tickets: [] })]} />,

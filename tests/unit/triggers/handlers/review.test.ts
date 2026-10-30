@@ -1893,6 +1893,7 @@ describe('review trigger — durable trace when a review is abandoned (issue #74
 		prNumber?: string;
 		error: string;
 		jobPayload?: Record<string, unknown>;
+		failureDiagnosis?: { kind: string; title: string; message: string; recovery: string };
 	} {
 		expect(createFailedRun).toHaveBeenCalledTimes(1);
 		return createFailedRun.mock.calls[0][0];
@@ -1911,12 +1912,16 @@ describe('review trigger — durable trace when a review is abandoned (issue #74
 			phase: 'review',
 			prNumber: '42',
 		});
-		// Which budget ran out, how many attempts it spent, the head SHA, and the
-		// last underlying error — the four things an operator asks after.
-		expect(record.error).toContain('read-failed');
-		expect(record.error).toContain('15/15 attempts');
-		expect(record.error).toContain('abc123');
-		expect(record.error).toContain('getaddrinfo ENOTFOUND api.github.com');
+		// Which budget ran out (recorded as the diagnosis kind, issue #1203), how many
+		// attempts it spent, the head SHA, and the last underlying error — the four
+		// things an operator asks after.
+		expect(record.failureDiagnosis?.kind).toBe('review-provider-unreachable');
+		expect(record.error).toContain("didn't respond while SWARM was checking this pull request");
+		expect(record.error).toContain('Retry now');
+		expect(record.error).toContain('Re-checks spent: 15 of 15');
+		expect(record.error).toContain('Head commit: abc123');
+		expect(record.error).toContain('Last error: getaddrinfo ENOTFOUND api.github.com');
+		expect(record.error).not.toContain('read-failed');
 	});
 
 	it('records one failed Review run when the aggregate-check path gives up', async () => {
@@ -1930,23 +1935,70 @@ describe('review trigger — durable trace when a review is abandoned (issue #74
 
 		const record = recorded();
 		expect(record).toMatchObject({ taskId: '9', phase: 'review', prNumber: '9' });
-		expect(record.error).toContain('read-failed');
+		expect(record.failureDiagnosis?.kind).toBe('review-provider-unreachable');
+		expect(record.error).toContain('Use Retry now once');
 		expect(record.error).toContain('cafe');
 		expect(record.error).toContain('502 Bad Gateway');
 		expect(commentOnPullRequest).not.toHaveBeenCalled();
 	});
 
 	it('names the CI-lag budget when that is the one that ran out', async () => {
-		getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'in_progress', null]]));
+		getAggregateCheckStatus.mockResolvedValue(
+			checkStatus([
+				['test', 'in_progress', null],
+				['Lint, typecheck, and test', 'queued', null],
+			]),
+		);
 
 		expect(
 			await handler.handle(ctx({ ...checks, headSha: 'cafe' }, { recheckAttempt: 20 })),
 		).toBeNull();
 
 		const record = recorded();
-		expect(record.error).toContain('state-pending');
-		expect(record.error).toContain('20/20 attempts');
-		expect(record.error).toContain('test');
+		// The recorded fact the WIP section classifies on (issue #1203).
+		expect(record.failureDiagnosis?.kind).toBe('review-waiting-for-checks');
+		// A short plain headline first, the details secondary.
+		expect(record.error).toMatch(
+			/^Review didn't start yet — CI was still running after 10 minutes\./,
+		);
+		expect(record.error).toContain('starts automatically when the checks finish');
+		expect(record.error).toContain('Re-checks spent: 20 of 20');
+		// One line per check, never JSON and never comma-joined.
+		expect(record.error).toContain('Still running:\n  - test\n  - Lint, typecheck, and test');
+		expect(record.error).not.toContain('state-pending');
+		expect(record.error).not.toContain('["');
+		expect(record.error).not.toContain('reviewChecksWaitMinutes');
+	});
+
+	it('keeps the plain headline, and no diagnosis, when mergeability is never computed', async () => {
+		getPullRequest.mockResolvedValue({
+			number: 42,
+			headBranch: 'issue-42',
+			headSha: 'abc123',
+			baseBranch: 'main',
+			baseSha: 'base-sha-123',
+			mergeable: null,
+			authorLogin: 'operator-human',
+			state: 'open',
+		});
+
+		await handler.handle(ctx(updated, { recheckAttempt: 20 }));
+
+		const record = recorded();
+		expect(record.failureDiagnosis).toBeUndefined();
+		expect(record.error).toMatch(/^Review abandoned: the source-control provider never reported/);
+		expect(record.error).toContain('Re-checks spent: 20 of 20');
+	});
+
+	it('records no diagnosis when SWARM’s own ownership lookup is what failed', async () => {
+		hasRunForTask.mockRejectedValue(new Error('connection reset'));
+
+		await handler.handle(ctx(updated, { readFailureRecheckAttempt: 15 }));
+
+		const record = recorded();
+		expect(record.failureDiagnosis).toBeUndefined();
+		expect(record.error).toMatch(/^Review abandoned: the source-control provider never answered\./);
+		expect(record.error).toContain('Reason: ownership gate resolution failed');
 	});
 
 	it('stores a payload a dashboard retry re-decides from, with both budgets reset', async () => {
@@ -2058,10 +2110,10 @@ describe('review trigger — per-project CI wait (issue #1083)', () => {
 
 		expect(scheduleCoalescedJob).not.toHaveBeenCalled();
 		expect(createFailedRun).toHaveBeenCalledOnce();
-		const { error } = createFailedRun.mock.calls[0][0];
-		expect(error).toContain('state-pending');
-		expect(error).toContain('40/40 attempts');
-		expect(error).toContain('`reviewChecksWaitMinutes`');
+		const { error, failureDiagnosis } = createFailedRun.mock.calls[0][0];
+		expect(failureDiagnosis?.kind).toBe('review-waiting-for-checks');
+		expect(error).toContain('Re-checks spent: 40 of 40');
+		expect(error).toContain('Check Wait');
 		expect(error).toContain('20 minutes');
 	});
 
@@ -2071,8 +2123,8 @@ describe('review trigger — per-project CI wait (issue #1083)', () => {
 		await handler.handle(ctx({ ...checks, headSha: 'cafe' }, { recheckAttempt: 20 }));
 
 		const { error } = createFailedRun.mock.calls[0][0];
-		expect(error).toContain('20/20 attempts');
-		expect(error).toContain('`reviewChecksWaitMinutes`');
+		expect(error).toContain('Re-checks spent: 20 of 20');
+		expect(error).toContain('Check Wait');
 		expect(error).toContain('10 minutes');
 	});
 
@@ -2110,8 +2162,8 @@ describe('review trigger — per-project CI wait (issue #1083)', () => {
 		);
 		expect(createFailedRun).toHaveBeenCalledOnce();
 		const { error } = createFailedRun.mock.calls[0][0];
-		expect(error).toContain('15/15 attempts');
-		expect(error).not.toContain('checksWaitMinutes');
+		expect(error).toContain('Re-checks spent: 15 of 15');
+		expect(error).not.toContain('Check Wait');
 	});
 });
 
@@ -2250,8 +2302,26 @@ describe('review trigger — a retry that meets a defer names its wait (issue #1
 				'run-abandoned',
 				expect.stringContaining('Review abandoned'),
 				'deferred',
+				undefined,
 			);
 			expect(failRunFromStatus.mock.calls[0][1]).toContain('`if-present`');
+			expect(createFailedRun).not.toHaveBeenCalled();
+		});
+
+		// Issue #1203: the retried run the chain settles carries the same recorded
+		// fact as a fresh record, so the WIP section reads it as waiting for CI.
+		it('settles a still-running head’s waiting run with its CI-wait diagnosis', async () => {
+			getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'in_progress', null]]));
+			waitingOnly('review');
+
+			await exhaustedChain();
+
+			expect(failRunFromStatus).toHaveBeenCalledExactlyOnceWith(
+				'run-abandoned',
+				expect.stringContaining("Review didn't start yet"),
+				'deferred',
+				expect.objectContaining({ kind: 'review-waiting-for-checks' }),
+			);
 			expect(createFailedRun).not.toHaveBeenCalled();
 		});
 
@@ -2274,6 +2344,7 @@ describe('review trigger — a retry that meets a defer names its wait (issue #1
 				'run-abandoned',
 				expect.stringContaining('Review abandoned'),
 				'deferred',
+				undefined,
 			);
 			expect(createFailedRun).not.toHaveBeenCalled();
 		});
