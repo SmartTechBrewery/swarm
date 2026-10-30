@@ -59,6 +59,9 @@ or `swarm workers setup` through `node <clone>/bin/swarm.js`. A bare
 `swarm-worker-agent` on `PATH` is the linked clone's. Re-running `install` from the
 same clone keeps the agent on it.
 
+Serving a second installation from one machine is laid out end to end in
+[`onboarding-worker.md`](./onboarding-worker.md#serving-a-second-installation-from-the-same-machine).
+
 | What | Where |
 | --- | --- |
 | Agent | `~/Library/LaunchAgents/pl.smarttechbrewery.swarm.worker.<basename>.<hash8>.plist` |

@@ -327,6 +327,12 @@ An extra checkout has no cache entry of its own, so this command run *in* one
 gets the "no worker registered" refusal — start the worker from its primary
 checkout.
 
+`SWARM_CONTROL_PLANE_URL` comes from the SWARM installation's own `.env` unless the
+environment exports one, which wins (issue #1214's precedence). So a second SWARM
+clone on the same machine reaches its own installation through its own `.env`
+with nothing exported — but not from a shell that exports the first
+installation's URL (issue #1215).
+
 This is an **additional** start path, not a replacement. It is for the case where
 the machine that registered the worker is the machine running it; for a remote
 machine, a process supervisor, or anything else, keep using `npm run dev:worker`
