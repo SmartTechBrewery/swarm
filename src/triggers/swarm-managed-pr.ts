@@ -16,11 +16,12 @@
  *
  * **What does.** Both triggers resolve through {@link resolveSwarmManagedPr}
  * below, so neither the decision nor what counts as "could not decide" can drift
- * between them. SWARM opens every PR from a branch it named itself
- * (`<branchPrefix><taskId>`, `GitWorktreeManager.provision`) and leaves
- * a best-effort `runs` row for every phase it dispatched. So a PR is SWARM-managed iff its
- * head branch decodes to a task id under the project's `branchPrefix` — an SCM
- * artifact number (`42`) or a board key (`VT-1538`), `taskIdFromBranch` — **and**
+ * between them. SWARM opens every PR from a branch it named itself (the
+ * repository's branch name pattern, issue #1241 — `issue-42`, `VT-1538/some-slug`) and
+ * leaves a best-effort `runs` row for every phase it dispatched. So a PR is
+ * SWARM-managed iff its head branch decodes to a task id under the repository's
+ * pattern or its legacy `<branchPrefix><taskId>` shape — an SCM artifact number (`42`)
+ * or a board key (`VT-1538`), `taskIdFromTaskBranch` — **and**
  * SWARM has an `implementation` run row for that task in that project. Both halves are provider-agnostic (ai/RULES.md §2): no GitHub URL or
  * payload shape is parsed, and `runs` is SWARM's own table.
  *
@@ -41,7 +42,7 @@
 import type { ProjectConfig } from '../config/schema.js';
 import { hasRunForTask as hasRunForTaskDefault } from '../db/repositories/runsRepository.js';
 import { logger } from '../lib/logger.js';
-import { taskIdFromBranch } from '../pipeline/task-branch.js';
+import { taskIdFromTaskBranch } from '../pipeline/task-branch.js';
 
 export interface SwarmManagedPrDeps {
 	/** Injectable run-history read — defaults to the real repository call. */
@@ -57,7 +58,7 @@ export type SwarmManagedPrResult =
  * Whether `headBranch` belongs to a PR SWARM manages (see the module header).
  * Returns a discriminated result distinguishing non-task branches from
  * task branches lacking an Implementation run row.
- * A branch outside the project's `branchPrefix` — or a missing one — is a
+ * A branch in neither the repository's pattern nor its legacy prefix shape — or a missing one — is a
  * definitive `'not-a-task-branch'` and costs no query. A failing run-history lookup throws:
  * the caller owns the defer-vs-skip decision, since dropping a legitimate
  * review over a transient DB blip is worse than a bounded recheck.
@@ -68,7 +69,7 @@ export async function isSwarmManagedPullRequest(
 	deps: SwarmManagedPrDeps = {},
 ): Promise<SwarmManagedPrResult> {
 	const taskId = headBranch
-		? taskIdFromBranch(headBranch, project.branchPrefix, { strict: true })
+		? taskIdFromTaskBranch(headBranch, project, { strict: true })
 		: undefined;
 	if (!taskId) return { managed: false, reason: 'not-a-task-branch' };
 

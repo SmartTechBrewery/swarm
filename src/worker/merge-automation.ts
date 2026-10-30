@@ -160,7 +160,7 @@ import {
 import { requireProjectSCMProvider } from '../integrations/scm/registry.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
-import { taskIdFromBranch } from '../pipeline/task-branch.js';
+import { taskIdFromTaskBranch } from '../pipeline/task-branch.js';
 import {
 	MERGE_CATCH_UP_ACTION,
 	type MergeAutomationJob,
@@ -1647,8 +1647,9 @@ async function attemptMerge(
  * Read here rather than passed down from the Review run row, because a Review
  * run's `taskId` is the *pull request's* number rather than the issue's
  * (`src/triggers/handlers/review.ts`), so the two are never comparable. SWARM
- * names every task branch `<branchPrefix><taskId>` (`GitWorktreeManager.provision`),
- * whichever form the task id takes (`taskIdFromBranch`), which is the same provider-agnostic derivation the PR-ownership gate
+ * names every task branch by the repository's pattern (issue #1241), and reads either
+ * form of task id back out of it, or out of the legacy `<branchPrefix><taskId>` shape
+ * (`taskIdFromTaskBranch`), which is the same provider-agnostic derivation the PR-ownership gate
  * (`isSwarmManagedPullRequest`) and the PR-driven phases'
  * board-card lookup (`resolveBoardItemIdForPrBranch`) already answer from.
  *
@@ -1665,7 +1666,7 @@ async function resolveOwnTaskId(
 		// Implementer: the persona this dispatch merges as, so one attempt does not
 		// speak as two different accounts.
 		const details = await read(project, Number(job.prNumber), 'implementer');
-		return taskIdFromBranch(details.headBranch, project.branchPrefix, { strict: true });
+		return taskIdFromTaskBranch(details.headBranch, project, { strict: true });
 	} catch (err) {
 		logger.warn('Merge automation: could not resolve the pull request’s own task', {
 			projectId: project.id,

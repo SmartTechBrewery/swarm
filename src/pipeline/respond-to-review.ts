@@ -123,7 +123,7 @@ import {
 } from '@/scm/delivery.js';
 import { GitWorktreeManager } from '@/worker/git-worktree-manager.js';
 import { graftEnvironment } from '@/worktree/graft.js';
-import { isArtifactNumberTaskId, taskIdFromBranch } from './task-branch.js';
+import { isArtifactNumberTaskId, taskIdFromTaskBranch } from './task-branch.js';
 
 /** The file the respond agent is instructed to write its outcome to, at the worktree root. */
 export const RESPOND_OUTCOME_FILENAME = HANDOFF_FILENAMES.respondToReview;
@@ -470,7 +470,7 @@ export async function runRespondToReviewPhase(
 	// move) and reflect "In progress" before the (possibly long) agent run, so a
 	// human watching the board sees the response start — never blocks or fails the
 	// response. See the module header. Skipped when no provider is injected.
-	const branchTaskId = taskIdFromBranch(prBranch, project.branchPrefix);
+	const branchTaskId = taskIdFromTaskBranch(prBranch, project);
 	const boardItemId = pm
 		? await resolveBoardItemId(pm, branchTaskId, taskId, options.boardItemId)
 		: undefined;

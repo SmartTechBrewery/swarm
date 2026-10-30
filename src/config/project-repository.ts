@@ -5,7 +5,7 @@
  * shared across its repositories stated once, plus a `repositories` list carrying
  * what is genuinely per-repository. `ProjectConfig` is that record **scoped to one
  * entry** — the shape every runtime call site already takes, with `repo`,
- * `baseBranch`, `branchPrefix`, `autoMerge`, `reviewChecks` and
+ * `baseBranch`, `branchPrefix`, `branchPattern`, `autoMerge`, `reviewChecks` and
  * `reviewChecksWaitMinutes` flattened back to the top level beside the project's own
  * `scm`.
  *
@@ -86,8 +86,9 @@ export function requireProjectRepository(record: ProjectRecord, repo: string): P
  * explicit `undefined` — the same care `rowToProjectConfig` takes for a `NULL`
  * `scm_type` (`src/db/repositories/projectsRepository.ts`), since "states no provider"
  * is a distinct case the registry lookup reports on. The entry's `autoMerge` (issue
- * #1066), its `reviewChecks` / `reviewChecksWaitMinutes` (issue #1109) and its
- * `wipLimit` (issue #1185) are kept absent the same way when the entry states none.
+ * #1066), its `reviewChecks` / `reviewChecksWaitMinutes` (issue #1109), its
+ * `wipLimit` (issue #1185) and its `branchPattern` (issue #1241) are kept absent the
+ * same way when the entry states none.
  */
 export function scopeProjectToRepository(record: ProjectRecord, repo?: string): ProjectConfig {
 	const { repositories: _repositories, scm, ...shared } = record;
@@ -98,6 +99,7 @@ export function scopeProjectToRepository(record: ProjectRecord, repo?: string): 
 		repo: entry.repo,
 		baseBranch: entry.baseBranch,
 		branchPrefix: entry.branchPrefix,
+		...(entry.branchPattern !== undefined ? { branchPattern: entry.branchPattern } : {}),
 		...(entry.autoMerge !== undefined ? { autoMerge: entry.autoMerge } : {}),
 		...(entry.reviewChecks !== undefined ? { reviewChecks: entry.reviewChecks } : {}),
 		...(entry.reviewChecksWaitMinutes !== undefined

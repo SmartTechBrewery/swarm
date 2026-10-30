@@ -505,6 +505,13 @@ const getLatestRunForTask = vi.fn(
 		_phase: string,
 	): Promise<unknown> => undefined,
 );
+/**
+ * Issue #1241 — the task branch an earlier Implementation run decided, seeded onto a
+ * later attempt's job before its run row is written.
+ */
+const findStoredTaskBranch = vi.fn<
+	(projectId: string, repository: string, taskId: string) => Promise<string | undefined>
+>(async () => undefined);
 const getLatestCompletedPlanningScope = vi.fn<
 	(projectId: string, repository: string, taskId: string) => Promise<ProposedScope | undefined>
 >(async (_projectId: string, _repository: string, _taskId: string) => undefined);
@@ -580,6 +587,8 @@ vi.mock('@/db/repositories/runsRepository.js', () => ({
 		getLatestRunForTask(projectId, repository, taskId, phase),
 	getLatestCompletedPlanningScope: (projectId: string, repository: string, taskId: string) =>
 		getLatestCompletedPlanningScope(projectId, repository, taskId),
+	findStoredTaskBranch: (projectId: string, repository: string, taskId: string) =>
+		findStoredTaskBranch(projectId, repository, taskId),
 	hasCompletedRunForTask: (projectId: string, taskId: string, phase: string) =>
 		hasCompletedRunForTask(projectId, taskId, phase),
 	isRetryPendingStatus: (status: string) => status === 'deferred' || status === 'checkpointed',
@@ -1021,6 +1030,7 @@ describe('processJob', () => {
 		workerUpdatePushResult = 'pushed';
 		projectLookup = () => PROJECT;
 		phaseImpl = async () => ({ agent: agentResult() });
+		findStoredTaskBranch.mockReset().mockResolvedValue(undefined);
 		addComment.mockClear();
 		addComment.mockResolvedValue('comment-1');
 		findWorkItemForArtifact.mockClear();
@@ -2050,6 +2060,46 @@ describe('processJob', () => {
 		);
 
 		expect(phaseCalls[0].context.job.implementationBranchProvisioned).toBe(true);
+	});
+
+	// Issue #1241: a task's branch is decided once, so a later Implementation attempt
+	// carries the one an earlier run stored — onto the run row and into the phase.
+	it('seeds an implementation dispatch with the task branch an earlier run stored', async () => {
+		findStoredTaskBranch.mockResolvedValue('VT-1538/pierwsza-strona-testowa');
+		const workItem = createMockWorkItem({ statusId: '47fc9ee4' });
+		const trigger: TriggerResult = { phase: 'implementation', taskId: 'VT-1538', workItem };
+
+		await processJob(createMockPmWebhookJob(), registryReturning(trigger));
+
+		expect(findStoredTaskBranch).toHaveBeenCalledWith(PROJECT.id, PROJECT.repo, 'VT-1538');
+		expect(resolvedTarget().jobPayload).toMatchObject({
+			taskBranch: 'VT-1538/pierwsza-strona-testowa',
+		});
+		expect(phaseCalls[0].context.job.taskBranch).toBe('VT-1538/pierwsza-strona-testowa');
+	});
+
+	it('keeps a task branch the job already carries without reading the stored one', async () => {
+		const workItem = createMockWorkItem({ statusId: '47fc9ee4' });
+		const trigger: TriggerResult = { phase: 'implementation', taskId: 'VT-1538', workItem };
+
+		await processJob(
+			createMockPmWebhookJob({ taskBranch: 'VT-1538/already-on-the-job' }),
+			registryReturning(trigger),
+		);
+
+		expect(findStoredTaskBranch).not.toHaveBeenCalled();
+		expect(phaseCalls[0].context.job.taskBranch).toBe('VT-1538/already-on-the-job');
+	});
+
+	it('decides the task branch afresh when the stored-branch read fails', async () => {
+		findStoredTaskBranch.mockRejectedValue(new Error('connection reset'));
+		const workItem = createMockWorkItem({ statusId: '47fc9ee4' });
+		const trigger: TriggerResult = { phase: 'implementation', taskId: 'VT-1538', workItem };
+
+		await processJob(createMockPmWebhookJob(), registryReturning(trigger));
+
+		expect(phaseCalls).toHaveLength(1);
+		expect(phaseCalls[0].context.job.taskBranch).toBeUndefined();
 	});
 
 	it('does not treat PM resume dispatch intent as proof that a branch exists', async () => {

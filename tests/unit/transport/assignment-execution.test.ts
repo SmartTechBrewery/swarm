@@ -1551,6 +1551,34 @@ describe('runAssignmentDbFree', () => {
 		).toBe(true);
 	});
 
+	// Issue #1241: the decided task branch rides the same frame, and a stored one
+	// reaches the phase — the worker has no run row to read or write it.
+	it('reports a decided task branch and hands the phase a stored one', async () => {
+		const sink = recordingSink();
+		let stored: string | undefined;
+		const runPhase = vi.fn(async (inputs: AssignedPhaseInputs) => {
+			stored = inputs.taskBranch;
+			await inputs.onBranchNamed?.('VT-1538/pierwsza-strona-testowa');
+			return { agent: agentResult() };
+		});
+		await runAssignmentDbFree(
+			buildTaskAssignment(
+				createMockTaskAssignmentInput({ phase: 'implementation', taskBranch: 'VT-1538/stored' }),
+			),
+			sink,
+			{ ...RUN_OPTIONS, deps: depsWith(runPhase) },
+		);
+
+		expect(stored).toBe('VT-1538/stored');
+		expect(sink.sent).toContainEqual(
+			expect.objectContaining({
+				type: 'task-progress',
+				state: 'branch-provisioned',
+				branch: 'VT-1538/pierwsza-strona-testowa',
+			}),
+		);
+	});
+
 	it('routes a timed-out run through the failure path even when it exited 0', async () => {
 		const sink = recordingSink();
 		const runPhase = vi.fn(async () => ({

@@ -37,6 +37,7 @@ const DELIVERED_SHA = 'c0ffee1234567890c0ffee1234567890c0ffee12';
 vi.mock('@/scm/delivery.js', async (importOriginal) => ({
 	...(await importOriginal<typeof import('@/scm/delivery.js')>()),
 	commitPreparedTree: vi.fn(async () => DELIVERED_SHA),
+	renameCheckedOutBranch: vi.fn(async () => {}),
 }));
 
 // A checkpoint continuation's gate verdict. The gate itself (validation, lease
@@ -59,7 +60,11 @@ import {
 	runImplementationPhase,
 } from '@/pipeline/implementation.js';
 import type { WorkItemBlocker, WorkItemDependent } from '@/pm/types.js';
-import { HANDOFF_FILENAMES, type ScmDeliveryProvider } from '@/scm/delivery.js';
+import {
+	HANDOFF_FILENAMES,
+	renameCheckedOutBranch,
+	type ScmDeliveryProvider,
+} from '@/scm/delivery.js';
 import { isSwarmGeneratedBody } from '@/scm/swarm-origin.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
 import {
@@ -247,7 +252,10 @@ describe('runImplementationPhase', () => {
 		expect(deps.pm.moveWorkItem).toHaveBeenNthCalledWith(1, 'PVTI_item19', 'inProgress');
 
 		// Task-branch checkout: provisioned with defaults (createBranch), NOT detached.
-		expect(deps.worktrees.provision).toHaveBeenCalledWith('19', { runId: undefined });
+		expect(deps.worktrees.provision).toHaveBeenCalledWith('19', {
+			branch: 'issue-19',
+			runId: undefined,
+		});
 
 		// Claude Code is run with the worktree as CWD, the implementation prompt,
 		// and the implementer token in GH_TOKEN so gh (incl. `gh pr create`) acts
@@ -346,7 +354,10 @@ describe('runImplementationPhase', () => {
 		const deps = makeDeps();
 		await runImplementationPhase({ ...deps, runId: 'run-19' });
 
-		expect(deps.worktrees.provision).toHaveBeenCalledWith('19', { runId: 'run-19' });
+		expect(deps.worktrees.provision).toHaveBeenCalledWith('19', {
+			branch: 'issue-19',
+			runId: 'run-19',
+		});
 	});
 
 	it('reuses a preserved task worktree for a fresh-session implementation retry', async () => {
@@ -371,7 +382,10 @@ describe('runImplementationPhase', () => {
 		const deps = makeDeps();
 		await runImplementationPhase({ ...deps, resumeExistingBranch: false });
 
-		expect(deps.worktrees.provision).toHaveBeenCalledWith('19', { runId: undefined });
+		expect(deps.worktrees.provision).toHaveBeenCalledWith('19', {
+			branch: 'issue-19',
+			runId: undefined,
+		});
 	});
 
 	it('records branch provisioning only after worktree acquisition succeeds', async () => {
@@ -576,7 +590,10 @@ describe('runImplementationPhase', () => {
 		await runImplementationPhase({ ...deps, sessionId: 'sess-19' });
 
 		expect(deps.worktrees.reuse).not.toHaveBeenCalled();
-		expect(deps.worktrees.provision).toHaveBeenCalledWith('19', { runId: undefined });
+		expect(deps.worktrees.provision).toHaveBeenCalledWith('19', {
+			branch: 'issue-19',
+			runId: undefined,
+		});
 		const runArgs = deps.runAgent.mock.calls[0][0];
 		expect(runArgs.sessionId).toBe('sess-19');
 		expect(runArgs.resumeSessionId).toBeUndefined();
@@ -599,7 +616,10 @@ describe('runImplementationPhase', () => {
 		await runImplementationPhase({ ...deps, sessionId: 'sess-19', resumeSessionId: 'sess-19' });
 
 		expect(deps.worktrees.reuse).toHaveBeenCalledWith('19', 'issue-19', false);
-		expect(deps.worktrees.provision).toHaveBeenCalledWith('19', { runId: undefined });
+		expect(deps.worktrees.provision).toHaveBeenCalledWith('19', {
+			branch: 'issue-19',
+			runId: undefined,
+		});
 		// Nothing to resume: the fresh checkout gets the first-run sessionId instead.
 		const runArgs = deps.runAgent.mock.calls[0][0];
 		expect(runArgs.resumeSessionId).toBeUndefined();
@@ -776,6 +796,137 @@ describe('runImplementationPhase', () => {
 		);
 		await expect(runImplementationPhase(deps)).rejects.toThrow(/rate limited/);
 		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('19');
+	});
+});
+
+// Issue #1241: a repository's branch name pattern decides the task branch once, and a
+// decided name is reused rather than rendered again.
+describe('runImplementationPhase — branch name pattern', () => {
+	beforeEach(() => {
+		handoffFileExists = true;
+		blockedReasonFileExists = false;
+		blockedReasonFileContents = '';
+		checkpointFileExists = false;
+		checkpointFileContents = '';
+		progressFileContents = undefined;
+		vi.mocked(renameCheckedOutBranch).mockClear();
+	});
+
+	function handoffWith(fields: Record<string, unknown>): string {
+		return JSON.stringify({ ...JSON.parse(HANDOFF), ...fields });
+	}
+
+	function patternDeps(branchPattern: string, taskId: string) {
+		const deps = makeDeps();
+		const handle: WorktreeHandle = {
+			taskId,
+			path: WORKTREE_PATH,
+			branch: `issue-${taskId}`,
+			detached: false,
+		};
+		vi.mocked(deps.worktrees.provision).mockResolvedValue(handle);
+		return {
+			...deps,
+			taskId,
+			project: createMockProjectConfig({ branchPattern }),
+			workItem: createMockWorkItem({ id: 'PVTI_vt', title: 'Pierwsza strona testowa' }),
+			onBranchNamed: vi.fn(async (_branch: string) => {}),
+		};
+	}
+
+	it('names the branch from the implementer’s friendly name at delivery', async () => {
+		handoffFileContents = handoffWith({ friendlyName: 'Pierwsza strona testowa' });
+		const deps = patternDeps('{issue_key}/{friendly_name}', 'VT-1538');
+
+		const result = await runImplementationPhase(deps);
+
+		// Checked out on the provisional legacy shape until the implementer has chosen.
+		expect(deps.worktrees.provision).toHaveBeenCalledWith('VT-1538', {
+			branch: 'issue-VT-1538',
+			runId: undefined,
+		});
+		expect(deps.runAgent.mock.calls[0]?.[0].args?.[0]).toContain('friendlyName (');
+		const branch = 'VT-1538/pierwsza-strona-testowa';
+		expect(renameCheckedOutBranch).toHaveBeenCalledWith(WORKTREE_PATH, branch);
+		expect(deps.delivery.pushBranch).toHaveBeenCalledWith(WORKTREE_PATH, branch, DELIVERED_SHA);
+		expect(deps.delivery.createPullRequest).toHaveBeenCalledWith(
+			expect.objectContaining({ branch }),
+		);
+		expect(deps.onBranchNamed).toHaveBeenCalledExactlyOnceWith(branch);
+		expect(result.branch).toBe(branch);
+	});
+
+	it('falls back to the commit subject’s type and the card title', async () => {
+		handoffFileContents = handoffWith({ commitSubject: 'fix(filters): refresh main filters' });
+		const deps = patternDeps('{work_type}/{issue_key}-{friendly_name}', 'VT-1234');
+		deps.workItem = createMockWorkItem({ id: 'PVTI_vt', title: 'Main filters refresh' });
+
+		const result = await runImplementationPhase(deps);
+
+		expect(result.branch).toBe('fix/VT-1234-main-filters-refresh');
+	});
+
+	it('reuses a stored branch verbatim and never renders or reports another', async () => {
+		handoffFileContents = handoffWith({ friendlyName: 'something else entirely' });
+		const deps = patternDeps('{issue_key}/{friendly_name}', 'VT-1538');
+		const stored = 'VT-1538/pierwsza-strona-testowa';
+		vi.mocked(deps.worktrees.provision).mockResolvedValue({
+			taskId: 'VT-1538',
+			path: WORKTREE_PATH,
+			branch: stored,
+			detached: false,
+		});
+
+		const result = await runImplementationPhase({ ...deps, taskBranch: stored });
+
+		expect(deps.worktrees.provision).toHaveBeenCalledWith('VT-1538', {
+			branch: stored,
+			runId: undefined,
+		});
+		// The already-delivered probe asks about the stored name.
+		expect(deps.delivery.findPullRequest).toHaveBeenCalledWith(stored);
+		expect(deps.runAgent.mock.calls[0]?.[0].args?.[0]).not.toContain('friendlyName (');
+		expect(deps.delivery.pushBranch).toHaveBeenCalledWith(WORKTREE_PATH, stored, DELIVERED_SHA);
+		expect(deps.onBranchNamed).not.toHaveBeenCalled();
+		expect(result.branch).toBe(stored);
+	});
+
+	it('keeps the name a resumed delivery already recorded', async () => {
+		handoffFileContents = handoffWith({ friendlyName: 'a different name' });
+		const deps = patternDeps('{issue_key}/{friendly_name}', 'VT-1538');
+		await runImplementationPhase(deps);
+		const recorded = JSON.parse(progressFileContents ?? '{}');
+		expect(recorded.branch).toBe('VT-1538/a-different-name');
+
+		// A later attempt resuming that checkout's delivery, with a hand-off that would now
+		// render differently, still pushes the recorded name.
+		handoffFileContents = handoffWith({ friendlyName: 'renamed later' });
+		progressFileContents = JSON.stringify({ ...recorded, pushed: false });
+		const resumed = patternDeps('{issue_key}/{friendly_name}', 'VT-1538');
+		const result = await runImplementationPhase({ ...resumed, resumeDelivery: true });
+
+		expect(result.branch).toBe('VT-1538/a-different-name');
+	});
+
+	it('decides and reports a pattern with no implementer part at provisioning', async () => {
+		handoffFileContents = HANDOFF;
+		const deps = patternDeps('feature/{issue_key}-impl', '19');
+		vi.mocked(deps.worktrees.provision).mockResolvedValue({
+			taskId: '19',
+			path: WORKTREE_PATH,
+			branch: 'feature/19-impl',
+			detached: false,
+		});
+
+		const result = await runImplementationPhase(deps);
+
+		expect(deps.worktrees.provision).toHaveBeenCalledWith('19', {
+			branch: 'feature/19-impl',
+			runId: undefined,
+		});
+		expect(deps.onBranchNamed).toHaveBeenCalledExactlyOnceWith('feature/19-impl');
+		expect(deps.runAgent.mock.calls[0]?.[0].args?.[0]).not.toContain('friendlyName (');
+		expect(result.branch).toBe('feature/19-impl');
 	});
 });
 

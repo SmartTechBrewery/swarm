@@ -1,6 +1,15 @@
 import { ChevronDown, ChevronUp, Plus, Trash2 } from 'lucide-react';
-import { type RepositoryForm, repoInputShape } from '@/lib/project-repository.js';
+import { useState } from 'react';
+import { buttonClass } from '@/components/ui/button.js';
+import {
+	branchPatternPatch,
+	effectiveBranchPattern,
+	type RepositoryForm,
+	repoInputShape,
+} from '@/lib/project-repository.js';
 import type { ReviewChecksPolicy } from '../../../../src/config/schema.js';
+import { branchPatternFromPrefix } from '../../../../src/pipeline/branch-pattern.js';
+import { BranchPatternDialog } from './branch-pattern-dialog.js';
 
 /** Input/select recipe shared with the rest of the tab (ai/DESIGN_SYSTEM.md §4). */
 const FIELD_CLASS =
@@ -78,6 +87,8 @@ function RepositoryRow({
 	const idBase = `repository-${index}`;
 	const isOnly = total === 1;
 	const policy = REVIEW_CHECKS_POLICY_OPTIONS.find(({ value }) => value === entry.reviewChecks);
+	const branchPattern = effectiveBranchPattern(entry);
+	const [editingPattern, setEditingPattern] = useState(false);
 
 	return (
 		<li className="p-4 border border-zinc-800 rounded-md bg-panel/20 space-y-3">
@@ -155,21 +166,43 @@ function RepositoryRow({
 					/>
 				</div>
 				<div>
-					<label htmlFor={`${idBase}-branch-prefix`} className={LABEL_CLASS}>
-						Branch Prefix
+					<label htmlFor={`${idBase}-branch-pattern`} className={LABEL_CLASS}>
+						Branch Name Pattern
 					</label>
-					<input
-						type="text"
-						id={`${idBase}-branch-prefix`}
-						aria-label={`Branch prefix, entry ${rank}`}
-						value={entry.branchPrefix}
-						onChange={(e) => onChange(index, { branchPrefix: e.target.value })}
-						disabled={isPending}
-						placeholder="issue-"
-						className={`${FIELD_CLASS} font-mono`}
-					/>
+					{/* Read-only on purpose (issue #1241): the pattern is composed and validated in
+					    the editor, never typed here unchecked. */}
+					<div className="flex gap-2">
+						<input
+							type="text"
+							id={`${idBase}-branch-pattern`}
+							aria-label={`Branch name pattern, entry ${rank}`}
+							value={branchPattern}
+							readOnly
+							className={`${FIELD_CLASS} font-mono`}
+						/>
+						<button
+							type="button"
+							onClick={() => setEditingPattern(true)}
+							disabled={isPending}
+							aria-label={`Edit branch name pattern, entry ${rank}`}
+							className={buttonClass('secondary')}
+						>
+							Edit
+						</button>
+					</div>
 				</div>
 			</div>
+			<BranchPatternDialog
+				open={editingPattern}
+				pattern={branchPattern}
+				legacyPattern={branchPatternFromPrefix(entry.branchPrefix)}
+				rank={rank}
+				onApply={(pattern) => {
+					onChange(index, branchPatternPatch(entry, pattern));
+					setEditingPattern(false);
+				}}
+				onCancel={() => setEditingPattern(false)}
+			/>
 
 			<label className="flex items-start gap-3 p-4 border border-zinc-800 rounded-md bg-panel/20 cursor-pointer hover:bg-zinc-800/20 transition-colors">
 				<input

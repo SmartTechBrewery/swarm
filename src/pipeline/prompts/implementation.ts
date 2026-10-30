@@ -7,6 +7,11 @@
 
 import { GH_IDENTITY_GUARD } from '@/pipeline/agent-auth.js';
 import { pipelinePhaseGuard } from '@/pipeline/agent-scope.js';
+import {
+	FRIENDLY_NAME_MAX_LENGTH,
+	FRIENDLY_NAME_MAX_WORDS,
+	WORK_TYPES,
+} from '@/pipeline/branch-pattern.js';
 import { CHECKPOINT_FILENAME, type Checkpoint } from '@/pipeline/checkpoint.js';
 import {
 	checkpointContinuationSection,
@@ -25,6 +30,29 @@ const IMPLEMENTATION_HANDOFF_FILENAME = HANDOFF_FILENAMES.implementation;
  * (`src/pipeline/implementation.ts`); lives here because the prompt names it.
  */
 export const BLOCKED_REASON_FILENAME = 'blocked_reason.md';
+
+/**
+ * The hand-off fields a branch name pattern asks the implementer to choose (issue
+ * #1241) — only the ones `pattern` contains, and none when it is unset. Empty for
+ * every repository on the legacy prefix, leaving its prompt unchanged.
+ */
+function branchNamingFields(pattern: string | undefined): string {
+	if (!pattern) return '';
+	const fields = [
+		...(pattern.includes('{work_type}')
+			? [
+					`workType (exactly one of ${WORK_TYPES.join(', ')} — the Conventional Commits type that describes the change, the same one your commitSubject starts with)`,
+				]
+			: []),
+		...(pattern.includes('{friendly_name}')
+			? [
+					`friendlyName (a short name for the change: 2–${FRIENDLY_NAME_MAX_WORDS} lowercase ASCII words joined by hyphens, Polish and other diacritics transliterated, at most ${FRIENDLY_NAME_MAX_LENGTH} characters, e.g. "main-filters-refresh")`,
+				]
+			: []),
+	];
+	if (fields.length === 0) return '';
+	return ` SWARM names the branch "${pattern}" from it, so also include ${fields.join(' and ')}.`;
+}
 
 /**
  * Build the prompt handed to the implementation agent. It's told to implement the
@@ -59,10 +87,17 @@ export function buildImplementationPrompt(
 		 * work item. Unset on every ordinary run, leaving the prompt unchanged.
 		 */
 		checkpoint?: Checkpoint;
+		/**
+		 * The repository's branch name pattern, set only while this task's branch is
+		 * still undecided (issue #1241). When it has a `{work_type}` or
+		 * `{friendly_name}`, the hand-off also asks for them; unset leaves the prompt
+		 * unchanged.
+		 */
+		branchPattern?: string;
 	},
 	customPrompt?: string,
 ): string {
-	const { repo, branch, baseBranch, worktreePath, checkpoint } = context;
+	const { repo, branch, baseBranch, worktreePath, checkpoint, branchPattern } = context;
 	// When the worktree path is named, the agent must not trust its own working
 	// directory: point every edit, command, and hand-off file at that absolute
 	// path, so SWARM's delivery validation finds the hand-off where it looks.
@@ -95,7 +130,7 @@ export function buildImplementationPrompt(
 		'4. Run the project lint, type-check, and the relevant tests; fix whatever they surface before continuing.',
 		'5. Do not commit, push, open a pull request, or run any GitHub mutation. SWARM delivers the prepared tree after you exit.',
 		`Specifically, do not run \`git push -u origin ${branch}\` or \`gh pr create --base ${baseBranch} --head ${branch}\`; SWARM constructs the PR with \`Closes #${context.taskId}\`. GH_TOKEN is read-only context authentication; do not run gh auth switch.`,
-		`6. Write "${IMPLEMENTATION_HANDOFF_FILENAME}" as JSON with: summary (PR-ready text), verification (an array of {command,outcome:"passed"}), commitSubject (a conventional-commit subject), limitations (an array), and readyForDelivery:true. Do not track this file.`,
+		`6. Write "${IMPLEMENTATION_HANDOFF_FILENAME}" as JSON with: summary (PR-ready text), verification (an array of {command,outcome:"passed"}), commitSubject (a conventional-commit subject), limitations (an array), and readyForDelivery:true.${branchNamingFields(branchPattern)} Do not track this file.`,
 		'Do NOT `git add`/commit the hand-off file.',
 		`If a genuine external prerequisite blocks implementation (for example, a required PR has not merged), do not open a placeholder PR. Instead, write a concise, human-readable explanation and the actionable next step to "${BLOCKED_REASON_FILENAME}" at the worktree root, then stop. Do NOT commit that file.`,
 		'',

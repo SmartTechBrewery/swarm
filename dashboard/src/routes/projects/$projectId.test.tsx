@@ -1342,6 +1342,7 @@ describe('toRepositoriesUpdate', () => {
 			repo: 'acme/first',
 			baseBranch: 'main',
 			branchPrefix: 'issue-',
+			branchPattern: '',
 			autoMerge: true,
 			reviewChecks: 'if-present',
 			reviewChecksWaitMinutes: '',

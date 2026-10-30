@@ -28,7 +28,7 @@ export interface PullRequestWorkItemQuery {
 	repository: string;
 	/**
 	 * The SCM issue number the PR's head branch's task id names, when it is one: a
-	 * SWARM task branch (`<branchPrefix><taskId>`) whose task id is the SCM
+	 * SWARM task branch (`taskIdFromTaskBranch`) whose task id is the SCM
 	 * artifact-number form — the usual case, since SWARM names every task branch
 	 * after the item it implements. Absent for a branch outside that convention and
 	 * for a board-key task id (`VT-1538`), which names no SCM issue.

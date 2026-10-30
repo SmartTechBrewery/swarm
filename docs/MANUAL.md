@@ -1341,7 +1341,9 @@ No restart is needed: the next dispatch reads the link.
 or only a pull request — names its task by its issue key, so moving it to the
 status mapped to `planning` / `todo` starts Planning / Implementation on any
 source-control provider, Azure DevOps included: the worktree is `task-VT-1538` and
-the branch `<branchPrefix>VT-1538` (pick a `branchPrefix` that suits a key — see
+the branch is the repository's branch name pattern filled for `VT-1538` — e.g.
+`VT-1538/pierwsza-strona-testowa` under `{issue_key}/{friendly_name}`, or
+`issue-VT-1538` on a repository still on the legacy `issue-` prefix (see
 [`docs/configuration.md`](./configuration.md#repositories)). A card **with** a
 GitHub issue link keeps that issue's number exactly as before, and a card linked
 into a repository the run is not for is still skipped with

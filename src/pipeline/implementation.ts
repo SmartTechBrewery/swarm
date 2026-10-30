@@ -32,7 +32,8 @@
  * provider)` store and handed to this phase as `agentToken`/`delivery` rather than
  * read from an env var — so the PR is authored by the operator's account. Review's ownership gate no longer reads that author
  * at all (issue #397): it recognises the PR from its **branch**
- * (`<branchPrefix><issueNumber>`, the branch this phase's worktree provisions)
+ * (the repository's branch name pattern filled for the task, issue #1241 — the branch
+ * this phase decides, provisions and pushes)
  * plus this phase's own `runs` row — see `src/triggers/swarm-managed-pr.ts`.
  * Which is why the branch name matters: an off-convention branch is a PR Review
  * will not recognise, silently stranding the item in "In review" forever with
@@ -72,6 +73,15 @@ import { agentRunError, agentRunFailed } from '@/harness/agent-failure.js';
 import type { ReasoningLevel } from '@/harness/models.js';
 import { requireProjectSCMProvider } from '@/integrations/scm/registry.js';
 import { logger } from '@/lib/logger.js';
+import {
+	branchPatternNeedsImplementer,
+	FALLBACK_WORK_TYPE,
+	isWorkType,
+	renderBranchName,
+	toFriendlyName,
+	type WorkType,
+	workTypeFromCommitSubject,
+} from '@/pipeline/branch-pattern.js';
 import type { Checkpoint } from '@/pipeline/checkpoint.js';
 import { assertDependenciesSatisfied } from '@/pipeline/dependency-guard.js';
 import {
@@ -85,6 +95,7 @@ import {
 	shouldPreserveFailedCheckout,
 	warnStartingOverOnPreservedWork,
 } from '@/pipeline/resume.js';
+import { provisionalTaskBranch, resolveBranchPattern } from '@/pipeline/task-branch.js';
 import type { PmStatusKey } from '@/pm/pipeline.js';
 import type { PMProvider, WorkItem } from '@/pm/types.js';
 import type { RecoveryMode } from '@/queue/jobs.js';
@@ -98,6 +109,7 @@ import {
 	loadDeliveryProgress,
 	pushDeliveredBranch,
 	readHandoff,
+	renameCheckedOutBranch,
 	resumedDeliveryAgent,
 	type ScmDeliveryProvider,
 	saveDeliveryProgress,
@@ -133,6 +145,18 @@ const START_STATUS: PmStatusKey = 'inProgress';
 const NEXT_STATUS: PmStatusKey = 'inReview';
 
 /**
+ * The `{friendly_name}` of last resort (issue #1241), for a task whose hand-off names
+ * none and whose title transliterates to nothing ASCII.
+ */
+const FALLBACK_FRIENDLY_NAME = 'change';
+
+/** The implementer's `{work_type}`, when it named one from the closed list. */
+function implementerWorkType(value: string | undefined): WorkType | undefined {
+	const normalized = value?.trim().toLowerCase();
+	return normalized && isWorkType(normalized) ? normalized : undefined;
+}
+
+/**
  * Cap on captured agent output, so a chatty/runaway Claude Code run can't grow the
  * worker's memory without bound. The delivery reads the agent's hand-off file, not
  * its stdout, so truncating the captured stream costs nothing here.
@@ -149,7 +173,7 @@ export interface RunImplementationPhaseOptions {
 	workItem: WorkItem;
 	/**
 	 * Task identifier for the worktree path (`task-<taskId>`) and branch name
-	 * (`<branchPrefix><taskId>`) — the linked issue number. Also the `#<n>` the PR
+	 * (named by the repository's branch name pattern) — the linked issue number. Also the `#<n>` the PR
 	 * body closes, which is what links the PR to the item. Passed explicitly rather
 	 * than derived from `workItem`: the item's `id` is an opaque node ID, and the
 	 * worker that dequeues the job is the layer that knows the issue number.
@@ -185,6 +209,20 @@ export interface RunImplementationPhaseOptions {
 	resumeExistingBranch?: boolean;
 	/** Called once the task branch worktree has been acquired successfully. */
 	onBranchProvisioned?: () => Promise<void>;
+	/**
+	 * The task branch an earlier attempt or run already decided for this task (issue
+	 * #1241), read back off the run record. Reused verbatim — checked out, probed for an
+	 * open PR, pushed to — and never re-rendered, so a retry cannot rename a branch a
+	 * PR may already be open from.
+	 */
+	taskBranch?: string;
+	/**
+	 * Called with the task branch's name once this attempt has decided it — at
+	 * provisioning when the repository's pattern needs no implementer-chosen part, at
+	 * delivery otherwise — so the caller can store it with the run (issue #1241). Not
+	 * called when {@link taskBranch} was handed in: that name is already stored.
+	 */
+	onBranchNamed?: (branch: string) => Promise<void>;
 	/** Kill the agent run after this many ms. Omit for no timeout. */
 	timeoutMs?: number;
 	/** External cancellation — aborting kills the agent run. */
@@ -320,7 +358,7 @@ function readBlockedReason(worktreePath: string): string | undefined {
  * branch survives cleanup so the PR is unaffected.
  *
  * Note that `GitWorktreeManager.cleanup` removes the worktree but not the local
- * `<branchPrefix><taskId>` branch it created — deliberately, so a *successful*
+ * task branch it created — deliberately, so a *successful*
  * run leaves the branch for Review/Respond-to-review/Respond-to-CI to check
  * out again. A re-run after a mid-flight failure would otherwise hit
  * `git worktree add -b` "branch already exists" on the leftover branch;
@@ -395,7 +433,7 @@ async function acquireImplementationWorktree(
 	warnStartingOverOnPreservedWork(worktrees, taskId, 'implementation', runId);
 	const handle = resumeExistingBranch
 		? await worktrees.provision(taskId, { createBranch: false, branch, runId })
-		: await worktrees.provision(taskId, { runId });
+		: await worktrees.provision(taskId, { branch, runId });
 	return { handle, resumed: false, deliveryResumed: false };
 }
 
@@ -418,6 +456,8 @@ export async function runImplementationPhase(
 		resumeDelivery = false,
 		resumeExistingBranch = false,
 		onBranchProvisioned,
+		taskBranch: storedTaskBranch,
+		onBranchNamed,
 		timeoutMs,
 		signal,
 		runAgent = runAgentCli,
@@ -465,12 +505,23 @@ export async function runImplementationPhase(
 	// move on the deferred run's retry.
 	if (!signal?.aborted) await pm.moveWorkItem(workItem.id, START_STATUS);
 
+	// The task branch's name (issue #1241): the one an earlier attempt decided when
+	// there is one, never re-rendered. Otherwise a pattern with no implementer-chosen
+	// part is decided here, from the task id alone; one with a `{work_type}` or
+	// `{friendly_name}` is checked out on its provisional legacy-shaped name and
+	// decided at delivery, once the implementer's hand-off has chosen them.
+	const branchPattern = resolveBranchPattern(project);
+	const provisionalBranch = provisionalTaskBranch(project, taskId);
+	const decidedBranch =
+		storedTaskBranch ??
+		(branchPatternNeedsImplementer(branchPattern) ? undefined : provisionalBranch);
+
 	// Task-branch checkout (createBranch defaults to true): the agent commits and
 	// pushes here, so — unlike Planning — this is not a detached, throwaway HEAD.
 	const { handle, resumed, deliveryResumed, checkpoint } = await acquireImplementationWorktree(
 		worktrees,
 		taskId,
-		`${project.branchPrefix}${taskId}`,
+		decidedBranch ?? provisionalBranch,
 		resumeSessionId,
 		resumeExistingBranch,
 		resumeDelivery,
@@ -478,6 +529,7 @@ export async function runImplementationPhase(
 		runId,
 	);
 	await onBranchProvisioned?.();
+	if (decidedBranch && !storedTaskBranch) await onBranchNamed?.(decidedBranch);
 	let preserveForResume = false;
 	try {
 		graft(project.repoRoot, handle.path);
@@ -488,7 +540,16 @@ export async function runImplementationPhase(
 		const delivery =
 			options.delivery ??
 			(await requireProjectSCMProvider(project).deliveryProvider(project, 'implementer'));
-		const deliveryId = deliveryIdentity(['implementation', project.repo, taskId, handle.branch]);
+		// Keyed on the provisional name rather than the checkout's, which a decided
+		// pattern name replaces between attempts — the progress sidecar and the PR-link
+		// comment marker must stay this task's across that rename. For a pattern with no
+		// implementer-chosen part the two are the same name, as they always were.
+		const deliveryId = deliveryIdentity([
+			'implementation',
+			project.repo,
+			taskId,
+			provisionalBranch,
+		]);
 
 		// Already delivered by an earlier attempt (issue #558). An interruption after
 		// the push — a control-plane restart, a worker shutdown, a lost socket — puts
@@ -553,6 +614,8 @@ export async function runImplementationPhase(
 								// this fresh session has no CLI context to resume, so the prompt
 								// carries the stopped run's recorded remainder instead.
 								checkpoint,
+								// Asked for only while the branch is undecided (issue #1241).
+								branchPattern: decidedBranch ? undefined : branchPattern,
 							},
 							customPrompt,
 						),
@@ -599,7 +662,27 @@ export async function runImplementationPhase(
 			ImplementationHandoffSchema,
 		);
 		const progress = loadDeliveryProgress(handle.path, deliveryId);
+		// Decided once (issue #1241): a resumed delivery keeps the name its first attempt
+		// recorded, a stored name is reused, and only a first decision renders one.
+		const branch =
+			progress.branch ??
+			decidedBranch ??
+			renderBranchName(branchPattern, {
+				issueKey: taskId,
+				workType:
+					implementerWorkType(handoff.workType) ??
+					workTypeFromCommitSubject(handoff.commitSubject) ??
+					FALLBACK_WORK_TYPE,
+				friendlyName:
+					toFriendlyName(handoff.friendlyName ?? '') ||
+					toFriendlyName(workItem.title) ||
+					FALLBACK_FRIENDLY_NAME,
+			});
+		progress.branch = branch;
 		saveDeliveryProgress(handle.path, progress);
+		if (!handle.detached) await renameCheckedOutBranch(handle.path, branch);
+		// A name decided before the agent ran was already stored, or reported at provisioning.
+		if (branch !== decidedBranch) await onBranchNamed?.(branch);
 		if (!progress.commitSha) {
 			progress.commitSha = await commitPreparedTree(
 				handle.path,
@@ -609,16 +692,16 @@ export async function runImplementationPhase(
 			saveDeliveryProgress(handle.path, progress);
 		}
 		if (!progress.pushed) {
-			await pushDeliveredBranch(delivery, handle.path, handle.branch, progress.commitSha);
+			await pushDeliveredBranch(delivery, handle.path, branch, progress.commitSha);
 			progress.pushed = true;
 			saveDeliveryProgress(handle.path, progress);
 		}
 		if (!progress.pullRequestUrl) {
 			const pull =
-				(await delivery.findPullRequest(handle.branch)) ??
+				(await delivery.findPullRequest(branch)) ??
 				(await delivery.createPullRequest({
 					baseBranch: project.baseBranch,
-					branch: handle.branch,
+					branch,
 					title: workItem.title,
 					body: `Closes #${taskId}\n\n${handoff.summary}`,
 				}));
@@ -642,7 +725,7 @@ export async function runImplementationPhase(
 		logger.info('Phase finished - Implementation', {
 			taskId,
 			workItemId: workItem.id,
-			branch: handle.branch,
+			branch,
 			prUrl,
 			commentId,
 			movedTo: reviewEnabled ? NEXT_STATUS : undefined,
@@ -650,7 +733,7 @@ export async function runImplementationPhase(
 
 		return {
 			prUrl,
-			branch: handle.branch,
+			branch,
 			commentId,
 			movedTo: reviewEnabled ? NEXT_STATUS : undefined,
 			agent,

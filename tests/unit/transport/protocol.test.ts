@@ -314,6 +314,20 @@ describe('transport protocol schemas', () => {
 			}
 		});
 
+		// Issue #1241: the decided task branch is an optional key, not a new state, so an
+		// older control plane still parses the frame.
+		it('carries an optional decided task branch on a branch-provisioned frame', () => {
+			const frame = {
+				type: 'task-progress' as const,
+				dispatchId: DISPATCH_ID,
+				phase: 'implementation' as const,
+				taskId: 'VT-1538',
+				state: 'branch-provisioned' as const,
+				branch: 'VT-1538/pierwsza-strona-testowa',
+			};
+			expect(TaskProgressSchema.parse(frame)).toEqual(frame);
+		});
+
 		it('round-trips a succeeded task-execution-result', () => {
 			const frame = {
 				type: 'task-execution-result' as const,

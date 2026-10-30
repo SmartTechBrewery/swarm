@@ -991,6 +991,20 @@ function buildDbFreePhaseInputs({
 				state: 'branch-provisioned',
 			});
 		},
+		// The task branch's decided name (issue #1241), stored by the control plane on
+		// the run so a later attempt reuses it — the worker has no run row to write.
+		taskBranch: assignment.taskBranch,
+		onBranchNamed: async (branch: string) => {
+			sink.send({
+				type: 'task-progress',
+				dispatchId: assignment.dispatchId,
+				runId: assignment.runId,
+				phase: assignment.phase,
+				taskId: assignment.taskId,
+				state: 'branch-provisioned',
+				branch,
+			});
+		},
 		prNumber: assignment.prNumber,
 		prBranch: assignment.prBranch,
 		headSha: assignment.headSha,
