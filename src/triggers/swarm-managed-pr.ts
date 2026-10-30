@@ -17,13 +17,17 @@
  * **What does.** Both triggers resolve through {@link resolveSwarmManagedPr}
  * below, so neither the decision nor what counts as "could not decide" can drift
  * between them. SWARM opens every PR from a branch it named itself (the
- * repository's branch name pattern, issue #1241 — `issue-42`, `VT-1538/some-slug`) and
+ * repository's branch name pattern, issue #1241 — `issue-42`, `VT-1538/some-slug`),
+ * records that name on its Implementation run (`runs.job_payload.taskBranch`), and
  * leaves a best-effort `runs` row for every phase it dispatched. So a PR is
- * SWARM-managed iff its head branch decodes to a task id under the repository's
- * pattern or its legacy `<branchPrefix><taskId>` shape — an SCM artifact number (`42`)
- * or a board key (`VT-1538`), `taskIdFromTaskBranch` — **and**
- * SWARM has an `implementation` run row for that task in that project. Both halves are provider-agnostic (ai/RULES.md §2): no GitHub URL or
- * payload shape is parsed, and `runs` is SWARM's own table.
+ * SWARM-managed iff an Implementation run of this project **recorded its head branch
+ * in this repository** (issue #1247) — which holds however the repository's naming
+ * changes afterwards — or, for a PR whose run recorded no branch (before issue #1241),
+ * iff its head branch decodes to a task id under the repository's *current* pattern or
+ * its legacy `<branchPrefix><taskId>` shape — an SCM artifact number (`42`) or a board
+ * key (`VT-1538`), `taskIdFromTaskBranch` — **and** SWARM has an `implementation` run
+ * row for that task in that project. Every half is provider-agnostic (ai/RULES.md §2):
+ * no GitHub URL or payload shape is parsed, and `runs` is SWARM's own table.
  *
  * The run row is the stronger half: it exists only because the composition root
  * (`src/worker/consumer.ts`) already verified board membership *and* the `pipeline.automationLabel`
@@ -40,13 +44,18 @@
  */
 
 import type { ProjectConfig } from '../config/schema.js';
-import { hasRunForTask as hasRunForTaskDefault } from '../db/repositories/runsRepository.js';
+import {
+	findTaskIdForStoredTaskBranch as findTaskIdForStoredTaskBranchDefault,
+	hasRunForTask as hasRunForTaskDefault,
+} from '../db/repositories/runsRepository.js';
 import { logger } from '../lib/logger.js';
 import { taskIdFromTaskBranch } from '../pipeline/task-branch.js';
 
 export interface SwarmManagedPrDeps {
 	/** Injectable run-history read — defaults to the real repository call. */
 	hasRunForTask?: typeof hasRunForTaskDefault;
+	/** Injectable recorded-branch read (issue #1247) — defaults to the real repository call. */
+	findTaskIdForStoredTaskBranch?: typeof findTaskIdForStoredTaskBranchDefault;
 }
 
 export type SwarmManagedPrResult =
@@ -58,19 +67,27 @@ export type SwarmManagedPrResult =
  * Whether `headBranch` belongs to a PR SWARM manages (see the module header).
  * Returns a discriminated result distinguishing non-task branches from
  * task branches lacking an Implementation run row.
- * A branch in neither the repository's pattern nor its legacy prefix shape — or a missing one — is a
- * definitive `'not-a-task-branch'` and costs no query. A failing run-history lookup throws:
- * the caller owns the defer-vs-skip decision, since dropping a legitimate
- * review over a transient DB blip is worse than a bounded recheck.
+ * A missing branch is a definitive `'not-a-task-branch'` and costs no query. Any other
+ * branch costs one project-scoped read of the recorded branches — bounded per PR
+ * evaluation — and a hit is SWARM's own outright: the row it came from *is* the
+ * Implementation run the fallback would look for. A miss falls back to the decode, where
+ * a branch in neither the repository's pattern nor its legacy prefix shape is a
+ * definitive `'not-a-task-branch'`. A failing lookup throws: the caller owns the
+ * defer-vs-skip decision, since dropping a legitimate review over a transient DB blip
+ * is worse than a bounded recheck.
  */
 export async function isSwarmManagedPullRequest(
 	project: ProjectConfig,
 	headBranch: string | undefined,
 	deps: SwarmManagedPrDeps = {},
 ): Promise<SwarmManagedPrResult> {
-	const taskId = headBranch
-		? taskIdFromTaskBranch(headBranch, project, { strict: true })
-		: undefined;
+	if (!headBranch) return { managed: false, reason: 'not-a-task-branch' };
+
+	const findRecorded = deps.findTaskIdForStoredTaskBranch ?? findTaskIdForStoredTaskBranchDefault;
+	const recorded = await findRecorded(project.id, project.repo, headBranch);
+	if (recorded) return { managed: true, taskId: recorded };
+
+	const taskId = taskIdFromTaskBranch(headBranch, project, { strict: true });
 	if (!taskId) return { managed: false, reason: 'not-a-task-branch' };
 
 	// Scoped to `implementation`: it is the only phase that opens a PR, and an
@@ -90,7 +107,7 @@ export async function isSwarmManagedPullRequest(
 export type SwarmManagedPrDecision = SwarmManagedPrResult | 'error';
 
 /**
- * {@link isSwarmManagedPullRequest}, tri-state: `'error'` when the run-history
+ * {@link isSwarmManagedPullRequest}, tri-state: `'error'` when a run-history
  * lookup did not answer. Both PR-ownership triggers resolve ownership through
  * this one function, so a later change cannot fix the decision — or what counts
  * as "could not decide" — on one trigger and leave the other behind (issue

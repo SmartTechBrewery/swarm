@@ -25,6 +25,7 @@ import {
 	findBoardItemIdForTask,
 	findStoredCommitSubject,
 	findStoredTaskBranch,
+	findTaskIdForStoredTaskBranch,
 	getLatestCompletedPlanningScope,
 	getLatestRunForTask,
 	getPendingReviewMergeFollowUps,
@@ -1624,6 +1625,49 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 
 			expect(await findStoredTaskBranch(PROJECT_ID, REPO, 'VT-2')).toBeUndefined();
 			expect(await findStoredTaskBranch(PROJECT_ID, REPO, 'never-ran')).toBeUndefined();
+		});
+	});
+
+	// Issue #1247: the reverse read — a pull request's head branch back to its task.
+	describe('findTaskIdForStoredTaskBranch', () => {
+		it('returns the task of the Implementation run that stored the branch', async () => {
+			await createRun({
+				projectId: PROJECT_ID,
+				taskId: 'VT-1538',
+				phase: 'implementation',
+				jobPayload: createMockPmWebhookJob({ taskBranch: 'issue-VT-1538' }),
+			});
+
+			expect(await findTaskIdForStoredTaskBranch(PROJECT_ID, REPO, 'issue-VT-1538')).toBe(
+				'VT-1538',
+			);
+		});
+
+		it('ignores the branch stored in another repository or by another phase', async () => {
+			await createRun({
+				projectId: PROJECT_ID,
+				repository: OTHER_REPO,
+				taskId: 'VT-7',
+				phase: 'implementation',
+				jobPayload: createMockPmWebhookJob({ taskBranch: 'issue-VT-7' }),
+			});
+			await createRun({
+				projectId: PROJECT_ID,
+				taskId: 'VT-7',
+				phase: 'review',
+				jobPayload: createMockPmWebhookJob({ taskBranch: 'issue-VT-7' }),
+			});
+
+			expect(await findTaskIdForStoredTaskBranch(PROJECT_ID, REPO, 'issue-VT-7')).toBeUndefined();
+			expect(await findTaskIdForStoredTaskBranch(PROJECT_ID, OTHER_REPO, 'issue-VT-7')).toBe(
+				'VT-7',
+			);
+		});
+
+		it('returns undefined for a branch no run stored', async () => {
+			await createRun({ projectId: PROJECT_ID, taskId: '42', phase: 'implementation' });
+
+			expect(await findTaskIdForStoredTaskBranch(PROJECT_ID, REPO, 'issue-42')).toBeUndefined();
 		});
 	});
 

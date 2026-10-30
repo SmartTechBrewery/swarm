@@ -124,17 +124,23 @@ vi.mock('@/lib/logger.js', () => ({
 // (issue #1049) — the latest run for the task, its active dispatch, and the
 // conditional settle. Defaults to "no such run", so every give-up below still
 // writes its own record unless a case says otherwise.
-const { hasRunForTask, createFailedRun, getLatestRunForTask, failRunFromStatus } = vi.hoisted(
-	() => ({
-		hasRunForTask: vi.fn(),
-		createFailedRun: vi.fn(),
-		getLatestRunForTask: vi.fn(),
-		failRunFromStatus: vi.fn(),
-	}),
-);
+const {
+	hasRunForTask,
+	findTaskIdForStoredTaskBranch,
+	createFailedRun,
+	getLatestRunForTask,
+	failRunFromStatus,
+} = vi.hoisted(() => ({
+	hasRunForTask: vi.fn(),
+	findTaskIdForStoredTaskBranch: vi.fn(),
+	createFailedRun: vi.fn(),
+	getLatestRunForTask: vi.fn(),
+	failRunFromStatus: vi.fn(),
+}));
 vi.mock('@/db/repositories/runsRepository.js', async (importActual) => ({
 	...(await importActual<typeof import('@/db/repositories/runsRepository.js')>()),
 	hasRunForTask,
+	findTaskIdForStoredTaskBranch,
 	createFailedRun,
 	getLatestRunForTask,
 	failRunFromStatus,
@@ -219,6 +225,9 @@ beforeEach(() => {
 	// run-history lookup failure.
 	hasRunForTask.mockReset();
 	hasRunForTask.mockResolvedValue(true);
+	// No recorded task branch (issue #1247), so the gate decodes the branch as before.
+	findTaskIdForStoredTaskBranch.mockReset();
+	findTaskIdForStoredTaskBranch.mockResolvedValue(undefined);
 	createFailedRun.mockReset();
 	createFailedRun.mockResolvedValue('run-abandoned');
 	getLatestRunForTask.mockReset();
@@ -344,6 +353,35 @@ describe('review trigger', () => {
 				'abc123',
 			);
 			expect(scheduleCoalescedJob).not.toHaveBeenCalled();
+		});
+
+		// Issue #1247: the incident — a board-key PR keeps its Review after the repository's
+		// `branchPrefix` is cleared, because Implementation recorded the branch.
+		it('dispatches Review for a recorded branch after the prefix is cleared', async () => {
+			const project = createMockProjectConfig({ branchPrefix: '' });
+			getPullRequest.mockResolvedValue({
+				number: 42,
+				headBranch: 'issue-VT-1538',
+				headSha: 'abc123',
+				baseBranch: 'main',
+				baseSha: 'base-sha-123',
+				mergeable: true,
+				authorLogin: 'operator-human',
+				state: 'open',
+			});
+			findTaskIdForStoredTaskBranch.mockResolvedValue('VT-1538');
+
+			const result = await handler.handle({
+				...ctx({ ...base, headSha: 'abc123', isDraft: false, isCrossRepo: false }),
+				project,
+			});
+
+			expect(result).toMatchObject({ phase: 'review', prNumber: '42', prBranch: 'issue-VT-1538' });
+			expect(findTaskIdForStoredTaskBranch).toHaveBeenCalledWith(
+				project.id,
+				project.repo,
+				'issue-VT-1538',
+			);
 		});
 
 		it('dispatches when no pipeline config is present', async () => {

@@ -11,12 +11,14 @@ const {
 	scheduleCoalescedJob,
 	claimConflictResolution,
 	hasRunForTask,
+	findTaskIdForStoredTaskBranch,
 } = vi.hoisted(() => ({
 	listConflictCandidates: vi.fn(),
 	commentOnPullRequest: vi.fn(),
 	scheduleCoalescedJob: vi.fn(),
 	claimConflictResolution: vi.fn(),
 	hasRunForTask: vi.fn(),
+	findTaskIdForStoredTaskBranch: vi.fn(),
 }));
 
 // The work-item origin gate (issue #836) reads run history; mock just that read,
@@ -26,6 +28,7 @@ const {
 vi.mock('@/db/repositories/runsRepository.js', async (importActual) => ({
 	...(await importActual<typeof import('@/db/repositories/runsRepository.js')>()),
 	hasRunForTask,
+	findTaskIdForStoredTaskBranch,
 }));
 
 vi.mock('@/dispatch/dispatcher.js', () => ({ scheduleCoalescedDispatch: scheduleCoalescedJob }));
@@ -87,6 +90,8 @@ describe('resolve-conflicts trigger', () => {
 		claimConflictResolution.mockResolvedValue(true);
 		scheduleCoalescedJob.mockResolvedValue(undefined);
 		hasRunForTask.mockResolvedValue(true);
+		// No recorded task branch (issue #1247), so the gate decodes the branch as before.
+		findTaskIdForStoredTaskBranch.mockResolvedValue(undefined);
 	});
 
 	it('matches only a merged pull-request `closed` event', () => {

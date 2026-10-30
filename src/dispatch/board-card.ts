@@ -5,10 +5,11 @@
  * card the work started from, but nothing in a pull request names that card. The
  * durable link SWARM already keeps is `runs.work_item_id`, written by every
  * board-driven run next to its `(project_id, task_id)` — so the card is a read
- * model away, keyed by the task the branch encodes. That is deliberately *not* a
+ * model away, keyed by the task the branch belongs to. That is deliberately *not* a
  * PM-provider question: it is answered from SWARM's own tables, with SWARM's own
- * branch naming (the repository's pattern or legacy `<branchPrefix><taskId>`, whether the task id is an SCM artifact
- * number or a board key), so it holds for any board paired with any repository
+ * branch naming (the branch Implementation recorded, or else the repository's pattern or
+ * legacy `<branchPrefix><taskId>` — `./pr-branch-task.ts`, issue #1247 — whether the task
+ * id is an SCM artifact number or a board key), so it holds for any board paired with any repository
  * (ai/RULES.md §2, ai/ARCHITECTURE.md "Task identity").
  *
  * It lives here, not in the phase, because the DB is here: a federated worker
@@ -26,7 +27,7 @@ import type { ProjectConfig } from '../config/schema.js';
 import { findBoardItemIdForTask } from '../db/repositories/runsRepository.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
-import { taskIdFromTaskBranch } from '../pipeline/task-branch.js';
+import { findTaskIdForPrBranch } from './pr-branch-task.js';
 
 /**
  * The board card a PR branch's task was dispatched from, or `undefined` when
@@ -39,7 +40,7 @@ export async function resolveBoardItemIdForPrBranch(
 	prBranch: string | undefined,
 ): Promise<string | undefined> {
 	if (!prBranch) return undefined;
-	const taskId = taskIdFromTaskBranch(prBranch, project);
+	const taskId = await findTaskIdForPrBranch(project, prBranch);
 	if (!taskId) return undefined;
 	try {
 		return await findBoardItemIdForTask(project.id, taskId);

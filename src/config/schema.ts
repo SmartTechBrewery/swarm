@@ -735,7 +735,10 @@ export const ProjectRepositorySchema = z.object({
 	 * (`issue-42`). Superseded by {@link branchPattern} (issue #1241) but kept, never
 	 * migrated: an entry with no pattern still names its branches this way (the pattern
 	 * `<prefix>{issue_key}`), and every entry keeps *recognising* this shape after a
-	 * pattern is set, so the pull requests already open under it stay SWARM's own.
+	 * pattern is set, so the pull requests already open under it stay SWARM's own. That
+	 * recognition decides only for a pull request whose Implementation stored no branch
+	 * (before issue #1241): one that did is SWARM's own by its recorded branch, whatever
+	 * the prefix or pattern says now (issue #1247, `findTaskIdForPrBranch`).
 	 */
 	branchPrefix: z.string().default(PROJECT_DEFAULTS.branchPrefix),
 

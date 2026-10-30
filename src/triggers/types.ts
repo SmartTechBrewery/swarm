@@ -261,7 +261,7 @@ export type TriggerResult =
 			 * The PR head branch. The Review phase itself checks out the head SHA
 			 * detached and never uses it; it is carried because the automation-label
 			 * gate resolves the PR back to its board work item through this branch
-			 * (`taskIdFromTaskBranch`, issues #354 and #1241), and the handler already holds
+			 * (`findTaskIdForPrBranch`, issues #354, #1241 and #1247), and the handler already holds
 			 * the PR details a second SCM round-trip would have re-fetched.
 			 */
 			prBranch: string;

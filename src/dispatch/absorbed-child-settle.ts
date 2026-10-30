@@ -32,8 +32,8 @@
  * while a card's `taskRef` is the issue number behind it — two disjoint slices of
  * one forge-wide sequence, so comparing them can only ever be false. The pull
  * request's backing task is instead resolved by the caller from the head branch
- * SWARM itself named (`taskIdFromTaskBranch`, the same derivation
- * `isSwarmManagedPullRequest` and `resolveBoardItemIdForPrBranch` use) and handed
+ * SWARM itself named and recorded (`findTaskIdForPrBranch`, issue #1247 — the same
+ * derivation `isSwarmManagedPullRequest` and `resolveBoardItemIdForPrBranch` use) and handed
  * in as {@link SettleAbsorbedChildrenInput.resolveOwnTaskId}.
  *
  * **It fails open, per item**, on {@link retireSupersededBoardPhases}' posture and

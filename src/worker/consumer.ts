@@ -89,6 +89,7 @@ import {
 	promoteTaskInFlightWaits,
 	publishDispatchWakeUp,
 } from '../dispatch/dispatcher.js';
+import { findTaskIdForPrBranch } from '../dispatch/pr-branch-task.js';
 import {
 	jobContinuesPreservedCheckout,
 	lostTransportPreservedWaitEndsAt,
@@ -153,7 +154,7 @@ import {
 	runReviewPhase,
 } from '../pipeline/review.js';
 import type { ReviewVerdictLedger } from '../pipeline/review-ledger.js';
-import { isArtifactNumberTaskId, taskIdFromTaskBranch } from '../pipeline/task-branch.js';
+import { isArtifactNumberTaskId } from '../pipeline/task-branch.js';
 import {
 	hasAutomationLabel,
 	missingAutomationLabelMessage,
@@ -4450,11 +4451,11 @@ async function resolveGatedWorkItem(
 		taskId: trigger.taskId,
 		prNumber: trigger.prNumber,
 	};
-	// SWARM opens every PR from a branch its pattern names, so the branch names the
-	// task (the same decode `src/pipeline/respond-to-review.ts` performs for its board
-	// report). Only an SCM artifact-number task id names an *issue* artifact; a
+	// SWARM opens every PR from a branch it named and recorded, so the branch names the
+	// task — through that record first, then the decode `src/pipeline/respond-to-review.ts`
+	// performs for its board report (issue #1247), so a renamed pattern still finds it. Only an SCM artifact-number task id names an *issue* artifact; a
 	// board-key task (`VT-1538`) has none, so its lookup tries the PR artifact alone.
-	const branchTaskId = taskIdFromTaskBranch(trigger.prBranch, project);
+	const branchTaskId = await findTaskIdForPrBranch(project, trigger.prBranch);
 	try {
 		return await findWorkItemForPullRequest(
 			requireProjectPMProvider(project),

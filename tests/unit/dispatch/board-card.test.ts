@@ -1,7 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { findBoardItemIdForTask } = vi.hoisted(() => ({ findBoardItemIdForTask: vi.fn() }));
-vi.mock('@/db/repositories/runsRepository.js', () => ({ findBoardItemIdForTask }));
+const { findBoardItemIdForTask, findTaskIdForStoredTaskBranch } = vi.hoisted(() => ({
+	findBoardItemIdForTask: vi.fn(),
+	findTaskIdForStoredTaskBranch: vi.fn(),
+}));
+vi.mock('@/db/repositories/runsRepository.js', () => ({
+	findBoardItemIdForTask,
+	findTaskIdForStoredTaskBranch,
+}));
 
 import { resolveBoardItemIdForPrBranch } from '@/dispatch/board-card.js';
 import { createMockProjectConfig } from '../../helpers/factories.js';
@@ -15,6 +21,19 @@ describe('resolveBoardItemIdForPrBranch', () => {
 
 	beforeEach(() => {
 		findBoardItemIdForTask.mockReset();
+		findTaskIdForStoredTaskBranch.mockReset();
+		findTaskIdForStoredTaskBranch.mockResolvedValue(undefined);
+	});
+
+	// Issue #1247: the branch Implementation recorded names the task whatever the
+	// repository's naming says now.
+	it('looks the card up by the task that recorded the branch, after the prefix is cleared', async () => {
+		findTaskIdForStoredTaskBranch.mockResolvedValue('VT-1538');
+		findBoardItemIdForTask.mockResolvedValue('ITEM_VT');
+		const cleared = createMockProjectConfig({ id: 'proj-1', branchPrefix: '' });
+
+		await expect(resolveBoardItemIdForPrBranch(cleared, 'issue-VT-1538')).resolves.toBe('ITEM_VT');
+		expect(findBoardItemIdForTask).toHaveBeenCalledWith('proj-1', 'VT-1538');
 	});
 
 	it('looks the card up by the task id the PR branch encodes', async () => {
