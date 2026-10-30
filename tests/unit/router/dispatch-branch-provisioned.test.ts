@@ -162,6 +162,50 @@ describe('control-plane executePhase — branch-provisioned frame (issue #1241)'
 		expect(job.commitSubject).toBe('VT-1538 Add the starting page');
 	});
 
+	// Review of #1245 F1: at delivery the branch and the commit subject arrive as two
+	// frames back to back. Each write replaces the whole payload, so a first write that
+	// lands last must not drop the commit subject the second one recorded.
+	it('writes back-to-back frames in order, the last carrying both values', async () => {
+		const job: SwarmJob = { ...createMockPmWebhookJob(), dispatchId: DISPATCH_ID };
+		let releaseFirst: () => void = () => {};
+		vi.mocked(updateRunJobPayload).mockImplementationOnce(
+			() =>
+				new Promise<void>((resolve) => {
+					releaseFirst = resolve;
+				}),
+		);
+		const running = executePhase(context(job));
+		await vi.waitFor(() => expect(ws.send).toHaveBeenCalled());
+
+		deliverDispatchProgress(provisioned('VT-1538/pierwsza-strona-testowa'), WORKER_ID);
+		deliverDispatchProgress(provisioned(undefined, 'VT-1538 Add the starting page'), WORKER_ID);
+		await vi.waitFor(() => expect(updateRunJobPayload).toHaveBeenCalledTimes(1));
+		// The second write waits for the first rather than racing it.
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(updateRunJobPayload).toHaveBeenCalledTimes(1);
+
+		releaseFirst();
+		await vi.waitFor(() => expect(updateRunJobPayload).toHaveBeenCalledTimes(2));
+		expect(vi.mocked(updateRunJobPayload).mock.lastCall?.[1]).toMatchObject({
+			taskBranch: 'VT-1538/pierwsza-strona-testowa',
+			commitSubject: 'VT-1538 Add the starting page',
+		});
+
+		deliverDispatchResult(
+			{
+				type: 'task-execution-result',
+				dispatchId: DISPATCH_ID,
+				status: 'succeeded',
+				phase: 'implementation',
+				taskId: 'VT-1538',
+				exitCode: 0,
+				durationMs: 1_000,
+			},
+			WORKER_ID,
+		);
+		await running;
+	});
+
 	it('carries the job’s stored commit subject to the worker', async () => {
 		const job: SwarmJob = {
 			...createMockPmWebhookJob(),

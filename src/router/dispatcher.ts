@@ -673,16 +673,26 @@ export function awaitResultWithGuards(
  * (`settleDispatchRetry`, `../worker/consumer.ts`) and would otherwise write back
  * without it. A frame naming the decided commit subject (issue #1242) records it as the
  * run's `commitSubject` the same way.
+ *
+ * Each write replaces the whole payload, so the writes of one dispatch run one after
+ * another: `previous` is that dispatch's last write, and this one snapshots the job
+ * only once it has settled. Run concurrently on two pool connections, an earlier
+ * frame's snapshot could commit last and drop what a later frame recorded — the commit
+ * subject reported right after the branch at delivery (review of #1245 F1). The job
+ * itself is still updated at once, for a deferral of this attempt.
  */
 async function persistBranchProvisioned(
 	runId: string | undefined,
 	job: SwarmJob,
 	taskId: string,
 	progress: Pick<TaskProgress, 'branch' | 'commitSubject'>,
+	previous: Promise<void>,
 ): Promise<void> {
 	if (progress.branch) job.taskBranch = progress.branch;
 	if (progress.commitSubject) job.commitSubject = progress.commitSubject;
 	if (!runId) return;
+	// Never rejects: every write catches its own failure.
+	await previous;
 	try {
 		await updateRunJobPayload(runId, { ...job, implementationBranchProvisioned: true });
 	} catch (err) {
@@ -870,6 +880,8 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 	// trusted loses its trust now.
 	stopOrphansOfDispatch(dispatch.id, selection.workerId);
 
+	// This dispatch's last run-payload write, which the next one waits on.
+	let branchCheckpoint: Promise<void> = Promise.resolve();
 	// Register the result wait *before* pushing so a fast worker's ack/progress/
 	// result can't race ahead of the registration.
 	const awaiting = awaitDispatchResult(
@@ -890,7 +902,13 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 		{
 			onProgress: (progress: TaskProgress) => {
 				if (progress.state === 'branch-provisioned') {
-					void persistBranchProvisioned(runId, job, trigger.taskId, progress);
+					branchCheckpoint = persistBranchProvisioned(
+						runId,
+						job,
+						trigger.taskId,
+						progress,
+						branchCheckpoint,
+					);
 				}
 			},
 		},
