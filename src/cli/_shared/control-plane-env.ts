@@ -29,6 +29,7 @@
  * here is not yet a URL that answers.
  */
 
+import { readFileSync } from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
@@ -77,7 +78,11 @@ async function readEnvState(path: string): Promise<EnvState> {
 		if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
 		return { kind: 'absent', contents: '' };
 	}
+	return parseEnvState(contents);
+}
 
+/** Classify `.env` text — the one parser both the async and the sync reader share. */
+function parseEnvState(contents: string): EnvState {
 	for (const line of contents.split('\n')) {
 		const match = ASSIGNMENT.exec(line);
 		if (!match) continue;
@@ -85,6 +90,35 @@ async function readEnvState(path: string): Promise<EnvState> {
 		return value ? { kind: 'set', value } : { kind: 'empty' };
 	}
 	return { kind: 'absent', contents };
+}
+
+/**
+ * The control-plane URL this installation's own `.env` declares, or `undefined`
+ * when it declares none.
+ *
+ * The `.env` beside the `bin/swarm.js` being run is the file
+ * {@link ensureControlPlaneUrl} wrote, so it names the installation this SWARM
+ * clone serves. Reading it ahead of the ambient environment is what lets a second
+ * clone on the same machine reach its own installation even when the shell exports
+ * the first one's URL (issue #1215) — and keeps `swarm login` and every later
+ * operator call resolving the same installation.
+ *
+ * Every outcome but a non-empty assignment — no file, no assignment, an empty one,
+ * any read error — answers `undefined`, so a caller falls back to the environment
+ * exactly as it did before it consulted the file; reporting an empty or unreadable
+ * `.env` stays {@link ensureControlPlaneUrl}'s job. Sync because
+ * `requireOperatorSession` is. It reads this one key and never the rest of the
+ * file, so database variables stay ambient-only.
+ */
+export function installationControlPlaneUrl(): string | undefined {
+	let contents: string;
+	try {
+		contents = readFileSync(resolve(REPO_ROOT, ENV_FILE), 'utf8');
+	} catch {
+		return undefined;
+	}
+	const state = parseEnvState(contents);
+	return state.kind === 'set' ? state.value : undefined;
 }
 
 /**

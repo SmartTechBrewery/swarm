@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
 const { readOperatorSessionCache, operatorSessionCachePath } = vi.hoisted(() => ({
@@ -9,6 +9,16 @@ const { readOperatorSessionCache, operatorSessionCachePath } = vi.hoisted(() => 
 vi.mock('@/cli/_shared/operator-session-cache.js', () => ({
 	readOperatorSessionCache,
 	operatorSessionCachePath,
+}));
+
+// The real read would consult this checkout's own `.env`, which on a developer's
+// machine names a live installation.
+const { installationControlPlaneUrl } = vi.hoisted(() => ({
+	installationControlPlaneUrl: vi.fn<() => string | undefined>(),
+}));
+vi.mock('@/cli/_shared/control-plane-env.js', () => ({
+	CONTROL_PLANE_ENV: 'SWARM_CONTROL_PLANE_URL',
+	installationControlPlaneUrl,
 }));
 
 import {
@@ -200,6 +210,10 @@ describe('createOperatorClient', () => {
 describe('requireOperatorSession', () => {
 	const ORIGINAL = process.env.SWARM_CONTROL_PLANE_URL;
 
+	beforeEach(() => {
+		installationControlPlaneUrl.mockReturnValue(undefined);
+	});
+
 	afterEach(() => {
 		if (ORIGINAL === undefined) delete process.env.SWARM_CONTROL_PLANE_URL;
 		else process.env.SWARM_CONTROL_PLANE_URL = ORIGINAL;
@@ -244,6 +258,48 @@ describe('requireOperatorSession', () => {
 		process.env.SWARM_CONTROL_PLANE_URL = CONTROL_PLANE;
 		readOperatorSessionCache.mockReturnValue(null);
 		expect(requireOperatorSession()).toEqual({ error: 'not signed in — run `swarm login`' });
+	});
+
+	// Issue #1215: the installation's own `.env` decides, the same precedence
+	// `swarm login` has, so a second SWARM clone reaches its own installation.
+	describe("with this installation's .env naming a control plane", () => {
+		const OTHER = 'https://other.example.com';
+		const session = (controlPlaneUrl: string) => ({
+			controlPlaneUrl,
+			token: TOKEN,
+			userId: 'user-1',
+			identifier: 'ada@example.com',
+			expiresAt: '2026-09-04T00:00:00.000Z',
+			createdAt: '2026-08-28T00:00:00.000Z',
+		});
+
+		it('prefers it over a different ambient URL', () => {
+			installationControlPlaneUrl.mockReturnValue(OTHER);
+			process.env.SWARM_CONTROL_PLANE_URL = CONTROL_PLANE;
+			readOperatorSessionCache.mockReturnValue(session(OTHER));
+			expect(requireOperatorSession()).toEqual({
+				session: { controlPlaneUrl: OTHER, token: TOKEN, identifier: 'ada@example.com' },
+			});
+			expect(readOperatorSessionCache).toHaveBeenCalledWith(OTHER);
+		});
+
+		it('needs nothing exported', () => {
+			installationControlPlaneUrl.mockReturnValue(OTHER);
+			delete process.env.SWARM_CONTROL_PLANE_URL;
+			readOperatorSessionCache.mockReturnValue(session(OTHER));
+			expect(requireOperatorSession()).toEqual({
+				session: { controlPlaneUrl: OTHER, token: TOKEN, identifier: 'ada@example.com' },
+			});
+		});
+
+		it('validates it like an ambient one', () => {
+			installationControlPlaneUrl.mockReturnValue('ftp://swarm.example.com');
+			process.env.SWARM_CONTROL_PLANE_URL = CONTROL_PLANE;
+			expect(requireOperatorSession()).toEqual({
+				error: expect.stringContaining('must be an http(s) URL'),
+			});
+			expect(readOperatorSessionCache).not.toHaveBeenCalled();
+		});
 	});
 
 	// An unreadable entry is a different problem from an absent one, and says so.

@@ -240,6 +240,115 @@ the flag would only be refused if it named a different one. The operator
 credential is asked for again — it is stored per `(worker, provider)`, so the
 second worker has its own, even when the value is the same.
 
+### Serving a second installation from the same machine
+
+A machine that already runs workers for one installation can run workers for a
+second one too (issue #1215). It needs **one SWARM clone per installation**. A
+clone's `.env` names the control plane it serves, and that installation's updates
+move the clone itself to its build
+([ADR-006](./decisions/ADR-006-unconditional-worker-updates.md)). Pointing the
+existing clone at a second URL is refused (`--control-plane-url` that disagrees
+with its `.env`). Even if it were accepted, the two fleets would keep moving one
+checkout to each other's builds.
+
+| Placeholder | Stands for |
+| --- | --- |
+| `https://swarm-two.example.com` | the second installation's control-plane base URL |
+| `~/code/swarm-two` | this machine's SWARM clone for that installation |
+| `~/code/two-project` | this machine's checkout of that installation's project repository |
+
+**1. Prepare the clone.**
+
+```bash
+git clone <the second installation's swarm repo> ~/code/swarm-two
+cd ~/code/swarm-two
+npm ci
+npm --prefix dashboard ci
+npm run build                  # bin/swarm.js runs the compiled dist/
+```
+
+Install **both** dependency trees. The clone's pre-push hook runs `npm test`, and
+that includes the dashboard's tests. A clone without `dashboard/node_modules`
+therefore works until something pushes from it or from one of its worktrees, which
+happens when it is also a worker checkout of SWARM itself, and then fails as a
+broken hook. Leave the clone on the branch it checked out, and do **not** `npm link`
+it: `swarm` and `swarm-worker-agent` on `PATH` stay the first installation's.
+
+**2. Sign in to the second installation, through that clone.**
+
+```bash
+node ~/code/swarm-two/bin/swarm.js login --identifier ada@example.com \
+  --control-plane-url https://swarm-two.example.com
+```
+
+This writes `SWARM_CONTROL_PLANE_URL` into `~/code/swarm-two/.env` and nowhere
+else. That file is gitignored, so the clone stays clean, and the first clone's
+`.env` is never touched. Sessions are cached per control-plane URL, so the first
+installation's session stays as it is.
+
+**3. Pick a project checkout no other worker holds.** Credentials and the checkout
+lock are keyed on the checkout's realpath, and `workers setup` refuses a checkout
+that already has a worker registered. Clone the second installation's project
+repository separately (`~/code/two-project`), even when it is the same repository
+the first installation's worker serves.
+
+**4. Register, enroll and autostart the worker.**
+
+```bash
+cd ~/code/two-project
+node ~/code/swarm-two/bin/swarm.js workers setup
+```
+
+It reaches the second installation through `~/code/swarm-two/.env`. On macOS it
+installs the LaunchAgent with that clone's **own** `bin/swarm-worker-agent`, so
+the agent runs `~/code/swarm-two/bin/swarm.js run:worker` (issue #1213). If the
+enrollment needs approval, a project administrator of the second installation
+gives it (step 5 above), with this clone's CLI.
+
+**5. Run every later command for that installation through the same clone:**
+`node ~/code/swarm-two/bin/swarm.js <command>`. An alias in your own shell is a
+convenience, nothing more. Every command run through a clone's `bin/swarm.js`
+takes `SWARM_CONTROL_PLANE_URL` from that clone's `.env` before the environment.
+That covers `login`, every `workers` subcommand, `run list|show|logs` and
+`run:worker`. Nothing has to be exported, and a URL exported for the first
+installation does not redirect it. Bare `swarm` stays the first installation's.
+Manage the agent with that clone's installer too:
+`~/code/swarm-two/bin/swarm-worker-agent status|logs|update ~/code/two-project`.
+
+**6. Check that both are running side by side.**
+
+- The agent's log (`~/code/swarm-two/bin/swarm-worker-agent logs ~/code/two-project`)
+  shows `worker transport client starting` with
+  `controlPlaneUrl` = `https://swarm-two.example.com`.
+- `plutil -extract ProgramArguments.1 raw <the agent's plist>` names
+  `~/code/swarm-two/bin/swarm.js`
+  ([where the plist lives](./launchd-worker-autostart.md)).
+- `node ~/code/swarm-two/bin/swarm.js workers list ada@example.com` lists the new
+  worker, and `swarm workers list ada@example.com` still lists only the first
+  installation's.
+
+**7. Updates stay independent.** A daemon's install root is the clone its code is
+loaded from. The second installation's *Update worker* button, `workers update`
+and its staged rollouts therefore move only `~/code/swarm-two`. The first
+installation never reaches that clone, because none of its workers are on the
+first installation's control plane. Update state and the install lock are kept per
+install root. `swarm-worker-agent update` from `PATH` restarts only the first
+installation's agents.
+
+**8. Keep the clone updatable.** A fleet update refuses an install root it cannot
+move safely:
+
+- **Keep it on its branch.** A detached HEAD with no recorded tracked branch is
+  refused; `git checkout main` (or whichever branch it tracks) fixes it.
+- **Keep `git status --porcelain` empty.** Untracked files count, so no scratch
+  files and no hand edits. `.env`, `node_modules`, `dist/` and
+  `.swarm-workspaces/` are already ignored.
+- Never edit the other installation's `.env`.
+
+**What the two installations still share** is the machine's agent-CLI logins and
+quotas: both installations' workers draw on the same `claude` / `codex` / `agy`
+accounts. Before a host restart, drain the workers on both installations.
+
 ---
 
 ## Part 1 — register the user + worker

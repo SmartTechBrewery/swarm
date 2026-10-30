@@ -43,6 +43,12 @@ the same operator API and session, while `run reset` stays database-backed.
 `npm run swarm -- …` and the dedicated npm
 wrappers (`db:seed`, `queue:clear`, `worktrees:prune`) load `.env` for you;
 invoking the global `swarm` binary directly requires those vars to be exported.
+The one exception is `SWARM_CONTROL_PLANE_URL`: `login`, `workers`, `run
+list|show|logs` and `run:worker` read it from the installation's own `.env` (the
+one beside the `bin/swarm.js` being run) before the environment, so each SWARM
+clone on a machine reaches its own installation (issue #1215, see
+[onboarding](./onboarding-worker.md#serving-a-second-installation-from-the-same-machine)).
+Database variables still have to be exported.
 
 Run `swarm --help`, or `swarm <command> --help` on the multi-subcommand commands
 (`config`, `queue`, `run`, `users`, `members`, `identities`, `workers`, `pm`), to
@@ -303,6 +309,12 @@ An extra checkout has no cache entry of its own, so this command run *in* one
 gets the "no worker registered" refusal — start the worker from its primary
 checkout.
 
+`SWARM_CONTROL_PLANE_URL` comes from the SWARM installation's own `.env` and is
+handed to the daemon explicitly, so it wins over a URL exported in the shell, which
+may belong to another installation's clone on the same machine (issue #1215). An
+installation whose `.env` names none leaves the environment to supply it, as
+before.
+
 This is an **additional** start path, not a replacement. It is for the case where
 the machine that registered the worker is the machine running it; for a remote
 machine, a process supervisor, or anything else, keep using `npm run dev:worker`
@@ -519,7 +531,8 @@ swarm workers consent <worker-id> <project-id> <on|off>
 ```
 
 **Requires `SWARM_CONTROL_PLANE_URL` and a [`swarm login`](#swarm-login) session —
-and no `DATABASE_URL`** (issue #800). Every subcommand but `add-checkout` and
+and no `DATABASE_URL`** (issue #800). The URL is read from the installation's own `.env`
+first, then the environment (issue #1215). Every subcommand but `add-checkout` and
 `remove-checkout`, which are host-local (below), calls the control plane's
 operator API (`/operator/trpc/*`) over the network, exactly as the worker daemon
 calls the transport, so the whole group runs from the machine being onboarded

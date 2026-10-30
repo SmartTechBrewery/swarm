@@ -52,10 +52,14 @@
  *
  * - **The injected environment wins over the SWARM checkout's own `.env`.**
  *   `dev:worker` runs `node --env-file-if-exists=.env …`, and Node's `--env-file`
- *   does *not* override a variable already present in the environment. So that
- *   `.env` still supplies `SWARM_CONTROL_PLANE_URL`, while our two values take
- *   precedence over any stale copies of them there. That ordering is the
- *   load-bearing assumption of this command.
+ *   does *not* override a variable already present in the environment. So our two
+ *   values take precedence over any stale copies of them there. That ordering is
+ *   the load-bearing assumption of this command. `SWARM_CONTROL_PLANE_URL` is
+ *   injected too, read *from* that same `.env`: left to `--env-file`, it would
+ *   lose to a URL the shell exports for another installation, and a second SWARM
+ *   clone on the machine would start a worker against the first one's control
+ *   plane (issue #1215). A `.env` naming none injects nothing, leaving the
+ *   environment to supply it as before.
  * - **The daemon runs in `REPO_ROOT`** — the SWARM checkout this CLI's own code
  *   lives in — so its `.env` and its `tsx` loader resolve there even though the
  *   operator is standing in a different repository. The replacement therefore
@@ -85,6 +89,7 @@
 import { delimiter, join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { canonicalCheckoutPath } from '../../worktree/checkout-key.js';
+import { CONTROL_PLANE_ENV, installationControlPlaneUrl } from '../_shared/control-plane-env.js';
 import { runCommand } from '../_shared/exec.js';
 import * as out from '../_shared/output.js';
 import { REPO_ROOT } from '../_shared/paths.js';
@@ -111,7 +116,8 @@ primary checkout: every extra checkout recorded with \`swarm workers register
 SWARM_WORKER_REPO_ROOT after the current directory.
 
 It needs no DATABASE_URL — the daemon is DB-free and so is this launcher. The
-SWARM installation's own .env still supplies SWARM_CONTROL_PLANE_URL.
+SWARM installation's own .env still supplies SWARM_CONTROL_PLANE_URL, and wins
+over one exported in the shell.
 
 For a remote machine, a process supervisor, or any other setup where the machine
 that registered the worker is not the one running it, keep using \`npm run
@@ -188,9 +194,11 @@ export async function run(argv: string[]): Promise<number> {
 	const repoRoots = [repoRoot, ...(cached.extraRepoRoots ?? [])];
 	// The worker id and every checkout, never the credential.
 	out.step(`starting worker '${cached.workerId}' for ${repoRoots.join(', ')}…`);
-	const env = {
+	const controlPlaneUrl = installationControlPlaneUrl();
+	const env: Record<string, string> = {
 		SWARM_WORKER_REPO_ROOT: repoRoots.join(delimiter),
 		SWARM_WORKER_CREDENTIAL: cached.credential,
+		...(controlPlaneUrl ? { [CONTROL_PLANE_ENV]: controlPlaneUrl } : {}),
 	};
 
 	// Become the daemon rather than parenting it, so a supervisor's job *is* the

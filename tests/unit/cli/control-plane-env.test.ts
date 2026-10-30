@@ -4,9 +4,19 @@ vi.mock('node:fs/promises', () => ({
 	readFile: vi.fn(),
 	writeFile: vi.fn(async () => undefined),
 }));
+vi.mock('node:fs', async (importOriginal) => ({
+	...(await importOriginal<typeof import('node:fs')>()),
+	readFileSync: vi.fn(),
+}));
 
+import { readFileSync } from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
-import { ensureControlPlaneUrl } from '@/cli/_shared/control-plane-env.js';
+import { resolve } from 'node:path';
+import {
+	ensureControlPlaneUrl,
+	installationControlPlaneUrl,
+} from '@/cli/_shared/control-plane-env.js';
+import { REPO_ROOT } from '@/cli/_shared/paths.js';
 
 const URL_A = 'https://swarm.example.com';
 const URL_B = 'https://other.example.com';
@@ -130,5 +140,43 @@ describe('ensureControlPlaneUrl', () => {
 		vi.mocked(readFile).mockRejectedValue(Object.assign(new Error('EACCES'), { code: 'EACCES' }));
 		await expect(ensureControlPlaneUrl(URL_A)).rejects.toThrow('EACCES');
 		expect(writeFile).not.toHaveBeenCalled();
+	});
+});
+
+// Issue #1215: the sync read every operator-API command and `run:worker` take the
+// installation's URL from. It never reports — anything short of a value is
+// `undefined`, leaving the caller on the ambient environment.
+describe('installationControlPlaneUrl', () => {
+	afterEach(() => {
+		vi.mocked(readFileSync).mockReset();
+	});
+
+	it("reads this installation's own .env", () => {
+		vi.mocked(readFileSync).mockReturnValue(`SWARM_CONTROL_PLANE_URL=${URL_A}\n`);
+		expect(installationControlPlaneUrl()).toBe(URL_A);
+		expect(readFileSync).toHaveBeenCalledWith(resolve(REPO_ROOT, '.env'), 'utf8');
+	});
+
+	it('sees through quotes and an export prefix', () => {
+		vi.mocked(readFileSync).mockReturnValue(
+			`LOG_LEVEL=debug\nexport SWARM_CONTROL_PLANE_URL="${URL_A}"\n`,
+		);
+		expect(installationControlPlaneUrl()).toBe(URL_A);
+	});
+
+	it.each([
+		['no assignment', 'LOG_LEVEL=debug\n'],
+		['a commented-out assignment', `# SWARM_CONTROL_PLANE_URL=${URL_A}\n`],
+		['an empty assignment', 'SWARM_CONTROL_PLANE_URL=\n'],
+	])('answers undefined for %s', (_label, contents) => {
+		vi.mocked(readFileSync).mockReturnValue(contents);
+		expect(installationControlPlaneUrl()).toBeUndefined();
+	});
+
+	it.each(['ENOENT', 'EACCES'])('answers undefined when the read fails with %s', (code) => {
+		vi.mocked(readFileSync).mockImplementation(() => {
+			throw Object.assign(new Error(code), { code });
+		});
+		expect(installationControlPlaneUrl()).toBeUndefined();
 	});
 });

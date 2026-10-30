@@ -265,6 +265,15 @@ handshake. Re-registering instead would issue a new worker and lose its enrollme
 and operator credentials. See
 [`docs/onboarding-worker.md`](./onboarding-worker.md#serving-a-second-repository).
 
+**One machine can serve two installations** (issue #1215) — with one SWARM clone
+per installation, because a clone's `.env` names the control plane it serves and
+that installation's updates move the clone itself (ADR-006). Every command run
+through a clone's `bin/swarm.js`, `run:worker` included, takes
+`SWARM_CONTROL_PLANE_URL` from that clone's `.env` before the environment, so
+the second clone's commands and its LaunchAgent reach the second installation with
+nothing exported and the first clone's `.env` untouched. See
+[`docs/onboarding-worker.md`](./onboarding-worker.md#serving-a-second-installation-from-the-same-machine).
+
 The operator's own source-control credential is **not** among them: it is stored
 server-side per `(worker, SCM provider)` — `swarm workers set-scm-credential
 <worker-id> <github|bitbucket|gitlab|azure-devops>`, or from that worker's own page in

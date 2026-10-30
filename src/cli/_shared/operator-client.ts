@@ -34,13 +34,12 @@
  */
 
 import { z } from 'zod';
+import { CONTROL_PLANE_ENV, installationControlPlaneUrl } from './control-plane-env.js';
 import {
 	type OperatorSessionCache,
 	operatorSessionCachePath,
 	readOperatorSessionCache,
 } from './operator-session-cache.js';
-
-const CONTROL_PLANE_ENV = 'SWARM_CONTROL_PLANE_URL';
 
 /**
  * The path the operator API is mounted under, stated here rather than imported
@@ -243,12 +242,18 @@ export interface OperatorSession {
  * re-validated here — it is opaque to this process, and the first call spends it,
  * which is what turns an expired one into {@link failureMessage}'s "run
  * `swarm login`".
+ *
+ * The URL comes from this installation's own `.env` first, then the environment —
+ * the precedence `ensureControlPlaneUrl` already gives `swarm login`. Without it an
+ * ambient URL differing from `.env` would sign `login` in to one installation and
+ * send every later call to the other, and a second SWARM clone on the machine
+ * could not reach its own installation without an export (issue #1215).
  */
 export function requireOperatorSession(): { session: OperatorSession } | { error: string } {
-	const raw = process.env[CONTROL_PLANE_ENV]?.trim();
+	const raw = (installationControlPlaneUrl() ?? process.env[CONTROL_PLANE_ENV])?.trim();
 	if (!raw) {
 		return {
-			error: `${CONTROL_PLANE_ENV} is unset — point it at this installation's router (e.g. https://swarm.example.com)`,
+			error: `${CONTROL_PLANE_ENV} is unset and this installation's .env names none — point it at this installation's router (e.g. https://swarm.example.com)`,
 		};
 	}
 	let base: URL;
