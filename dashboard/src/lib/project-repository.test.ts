@@ -10,6 +10,7 @@ import {
 	effectiveBranchPattern,
 	effectiveCommitSubjectMaxLength,
 	effectiveCommitSubjectPattern,
+	legacyBranchPattern,
 	moveRepository,
 	patchRepository,
 	projectRepo,
@@ -99,7 +100,6 @@ describe('toRepositoryForms', () => {
 				id: '1',
 				repo: 'acme/first',
 				baseBranch: '',
-				branchPrefix: '',
 				branchPattern: '',
 				commitSubjectPattern: '',
 				commitSubjectMaxLength: '',
@@ -538,6 +538,39 @@ describe('branch name pattern', () => {
 		expect(branchPatternPatch({ branchPrefix: 'issue-' }, '{issue_key}/{friendly_name}')).toEqual({
 			branchPattern: '{issue_key}/{friendly_name}',
 		});
+	});
+
+	// Issue #1250: the prefix is carried exactly as stored. An absent one used to be
+	// written back as an explicit '', which renamed new branches `issue-VT-1` → `VT-1`.
+	it('round-trips an absent, default and empty prefix exactly', () => {
+		const stored: RepositoryEntry[] = [
+			{ repo: 'acme/absent' },
+			{ repo: 'acme/default', branchPrefix: 'issue-' },
+			{ repo: 'acme/empty', branchPrefix: '' },
+		];
+		const rows = toRepositoryForms(stored);
+		const entries = toRepositoryEntries(rows);
+		expect(entries[0]).not.toHaveProperty('branchPrefix');
+		expect(entries[1]).toHaveProperty('branchPrefix', 'issue-');
+		expect(entries[2]).toHaveProperty('branchPrefix', '');
+		expect(areRepositoriesDirty(rows, stored)).toBe(false);
+	});
+
+	// The server resolves an absent prefix as `issue-` (`legacyPrefix`), so the editor does too.
+	it('reads an absent prefix as issue-, and an explicit empty one as none', () => {
+		expect(legacyBranchPattern({})).toBe('issue-{issue_key}');
+		expect(legacyBranchPattern({ branchPrefix: '' })).toBe('{issue_key}');
+		expect(effectiveBranchPattern({ branchPattern: '' })).toBe('issue-{issue_key}');
+		expect(effectiveBranchPattern({ branchPattern: '', branchPrefix: '' })).toBe('{issue_key}');
+	});
+
+	it('keeps an entry with no prefix on none when its effective pattern is applied unchanged', () => {
+		const stored: RepositoryEntry[] = [{ repo: 'acme/first' }];
+		expect(branchPatternPatch({}, 'issue-{issue_key}')).toEqual({ branchPattern: '' });
+		const applied = applyBranchPattern(toRepositoryForms(stored), 'issue-{issue_key}');
+		expect(areRepositoriesDirty(applied, stored)).toBe(false);
+		expect(toRepositoryEntries(applied)[0]).not.toHaveProperty('branchPattern');
+		expect(toRepositoryEntries(applied)[0]).not.toHaveProperty('branchPrefix');
 	});
 });
 
