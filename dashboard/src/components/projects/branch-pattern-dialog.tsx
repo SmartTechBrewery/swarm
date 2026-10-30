@@ -13,23 +13,17 @@ import { Modal, ModalFooter } from '../ui/modal.js';
 const FIELD_CLASS =
 	'block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-800 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 transition-shadow';
 
-/** What one repository names its branches by now, for the editor's warnings. */
-export interface RepositoryBranchNaming {
-	/** The pattern the repository names its branches by now — its own, or its prefix's. */
-	pattern: string;
-	/**
-	 * The pattern the repository's legacy prefix stands for (`<prefix>{issue_key}`) — the
-	 * one shape `taskIdFromTaskBranch` keeps recognising whatever the pattern is.
-	 */
-	legacyPattern: string;
-}
-
 interface BranchPatternDialogProps {
 	open: boolean;
 	/** The pattern the editor starts from — the project's, or the first repository's. */
 	pattern: string;
-	/** Every repository of the project, since the pattern applies to all of them (issue #1246). */
-	repositories: RepositoryBranchNaming[];
+	/**
+	 * The pattern each repository's legacy prefix stands for (`<prefix>{issue_key}`), one
+	 * per repository since the pattern applies to all of them (issue #1246) — the shape
+	 * `taskIdFromTaskBranch` keeps recognising for a pull request whose run stored no
+	 * branch, whatever the pattern is.
+	 */
+	legacyPatterns: string[];
 	/** Whether the repositories name their branches differently now. */
 	differs: boolean;
 	onApply: (pattern: string) => void;
@@ -50,14 +44,15 @@ function unique(values: string[]): string[] {
  * repository's row, and the tab's own Save persists it like every other repository
  * setting.
  *
- * Only the legacy `<prefix>{issue_key}` shape stays recognised after a change, so
- * replacing any repository's other pattern warns that pull requests open under it stop
- * being SWARM's own.
+ * A change strands no pull request SWARM already opened (issue #1247): each keeps its
+ * branch, which is stored with the task, and stays SWARM's own. So the editor no longer
+ * warns about one; it only names the legacy shape that a pull request from before
+ * branches were stored (issue #1241) is still recognised by.
  */
 export function BranchPatternDialog({
 	open,
 	pattern,
-	repositories,
+	legacyPatterns,
 	differs,
 	onApply,
 	onCancel,
@@ -71,23 +66,8 @@ export function BranchPatternDialog({
 		if (open) setDraft(pattern);
 	}, [open, pattern]);
 
-	const validation = validateBranchPattern(draft);
-	const { errors } = validation;
-	const legacyPatterns = unique(repositories.map((repository) => repository.legacyPattern));
-	const legacyShape = `${legacyPatterns.join(', ')} ${legacyPatterns.length === 1 ? 'shape stays' : 'shapes stay'}`;
-	// A repository's own pattern, replaced, is no longer recognised; its legacy shape still is.
-	const stranded = unique(
-		repositories
-			.filter((repository) => ![draft, repository.legacyPattern].includes(repository.pattern))
-			.map((repository) => repository.pattern),
-	);
-	const warnings =
-		stranded.length > 0
-			? [
-					...validation.warnings,
-					`Pull requests already open on branches named by ${stranded.join(', ')} will no longer be recognised as SWARM's own — no Review, WIP release or merge automation. Only the legacy ${legacyShape} recognised after a change.`,
-				]
-			: validation.warnings;
+	const { errors, warnings } = validateBranchPattern(draft);
+	const legacyShapes = unique(legacyPatterns);
 	const preview = errors.length === 0 ? renderBranchName(draft, SAMPLE_BRANCH_NAME_PARTS) : null;
 
 	/** Insert `{name}` at the caret (or replacing the selection), keeping focus in the field. */
@@ -111,10 +91,11 @@ export function BranchPatternDialog({
 					How SWARM names the task branches of every repository in this project. Combine literal
 					text — letters, digits and the separators <span className="font-mono">/</span>,{' '}
 					<span className="font-mono">-</span> and <span className="font-mono">_</span> — with these
-					elements. The name is decided once per task and kept for every later phase. After a
-					change, branches already open stay recognised only in the legacy{' '}
-					<span className="font-mono">{legacyPatterns.join(', ')}</span>{' '}
-					{legacyPatterns.length === 1 ? 'shape' : 'shapes'}.
+					elements. The name is decided once per task and kept for every later phase. Pull requests
+					SWARM already opened keep their branch, which is stored with the task, so they stay
+					SWARM's own after a change; one opened before branches were stored is recognised by the
+					legacy <span className="font-mono">{legacyShapes.join(', ')}</span>{' '}
+					{legacyShapes.length === 1 ? 'shape' : 'shapes'}.
 				</p>
 				{differs && (
 					<p className="p-3 bg-zinc-900/50 border border-zinc-800 text-xs text-zinc-300 rounded">

@@ -8,6 +8,7 @@ import {
 	applyCommitSubjectPattern,
 	type RepositoryForm,
 	toRepositoryEntries,
+	toRepositoryForms,
 } from '@/lib/project-repository.js';
 import { NamingPatterns } from './naming-patterns.js';
 
@@ -216,8 +217,9 @@ describe('NamingPatterns', () => {
 			expect(onApplyBranchPattern).toHaveBeenCalledWith('{issue_key}');
 		});
 
-		// Only the legacy prefix shape stays recognised after a change (review of #1243).
-		it('warns that replacing a repository’s own pattern strands branches open under it', () => {
+		// Issue #1250: a pull request SWARM opened keeps its stored branch (issue #1247), so a
+		// change strands none and the editor says so instead of warning.
+		it('does not warn that replacing a repository’s own pattern strands open branches', () => {
 			renderPatterns({
 				repositories: [
 					row({ branchPattern: '{issue_key}/{friendly_name}' }),
@@ -225,23 +227,49 @@ describe('NamingPatterns', () => {
 				],
 			});
 			fireEvent.click(screen.getByRole('button', { name: 'Edit branch name pattern' }));
-			expect(screen.queryByText(/will no longer be recognised/)).toBeNull();
-
 			fireEvent.change(patternInput(), {
 				target: { value: '{work_type}/{issue_key}-{friendly_name}' },
 			});
-			expect(
-				screen.getByText(/branches named by \{issue_key\}\/\{friendly_name\} will no longer be/),
-			).toBeTruthy();
+
+			expect(screen.queryByText(/no longer be recognised/)).toBeNull();
+			expect(screen.getByText(/stored with the task, so they stay SWARM's own/)).toBeTruthy();
 			expect(apply().disabled).toBe(false);
 		});
 
-		it('does not warn when replacing the legacy prefix’s pattern, which stays recognised', () => {
-			renderPatterns({ repositories: TWO });
+		// Issue #1250: an entry stored with no prefix runs on `issue-`, as the server resolves it.
+		it('reads an entry stored without a prefix as issue-{issue_key} and saves none back', () => {
+			const initial = toRepositoryForms([{ repo: 'acme/first' }]);
+			function Harness() {
+				const [rows, setRows] = useState(initial);
+				return (
+					<>
+						<NamingPatterns
+							repositories={rows}
+							isPending={false}
+							onApplyBranchPattern={(pattern) => setRows(applyBranchPattern(rows, pattern))}
+							onApplyCommitSubjectPattern={vi.fn()}
+						/>
+						<output data-testid="saved">{JSON.stringify(toRepositoryEntries(rows))}</output>
+					</>
+				);
+			}
+			render(<Harness />);
+			const saved = () =>
+				JSON.parse(screen.getByTestId('saved').textContent ?? '[]') as Array<
+					Record<string, unknown>
+				>;
+
+			expect(branchField().value).toBe('issue-{issue_key}');
 			fireEvent.click(screen.getByRole('button', { name: 'Edit branch name pattern' }));
+			expect(patternInput().value).toBe('issue-{issue_key}');
+			expect(screen.getByText(/recognised by the legacy/).textContent).toContain(
+				'issue-{issue_key}',
+			);
 
 			fireEvent.change(patternInput(), { target: { value: '{issue_key}/{friendly_name}' } });
-			expect(screen.queryByText(/will no longer be recognised/)).toBeNull();
+			fireEvent.click(apply());
+			expect(saved()[0]).toMatchObject({ branchPattern: '{issue_key}/{friendly_name}' });
+			expect(saved()[0]).not.toHaveProperty('branchPrefix');
 		});
 	});
 

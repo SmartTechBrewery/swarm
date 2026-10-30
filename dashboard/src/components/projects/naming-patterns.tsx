@@ -4,11 +4,11 @@ import {
 	effectiveBranchPattern,
 	effectiveCommitSubjectMaxLength,
 	effectiveCommitSubjectPattern,
+	legacyBranchPattern,
 	type RepositoryForm,
 	sharedBranchPattern,
 	sharedCommitSubjectNaming,
 } from '@/lib/project-repository.js';
-import { branchPatternFromPrefix } from '../../../../src/pipeline/branch-pattern.js';
 import { BranchPatternDialog } from './branch-pattern-dialog.js';
 import { CommitSubjectPatternDialog } from './commit-subject-pattern-dialog.js';
 
@@ -186,10 +186,7 @@ export function NamingPatterns({
 			<BranchPatternDialog
 				open={editingBranch}
 				pattern={branchPattern ?? effectiveBranchPattern(first)}
-				repositories={repositories.map((row) => ({
-					pattern: effectiveBranchPattern(row),
-					legacyPattern: branchPatternFromPrefix(row.branchPrefix),
-				}))}
+				legacyPatterns={repositories.map(legacyBranchPattern)}
 				differs={branchPattern === undefined}
 				onApply={(pattern) => {
 					onApplyBranchPattern(pattern);
