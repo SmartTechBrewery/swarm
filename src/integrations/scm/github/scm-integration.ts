@@ -39,7 +39,6 @@ import type {
 	RerunFailedChecksOutcome,
 	SCMProvider,
 	ScmPersona,
-	ScmPersonaIdentities,
 	ScmWebhookRequest,
 	WebhookHeaderReader,
 } from '../../../scm/types.js';
@@ -69,7 +68,7 @@ import {
 	withGitHubToken,
 } from './client.js';
 import { createOperatorDeliveryProvider } from './operator-delivery.js';
-import { getPersonaForLogin, isSwarmBot, resolvePersonaIdentities } from './personas.js';
+import { isReviewerLogin, resolveReviewerIdentity } from './personas.js';
 import {
 	isSwarmGeneratedGitHubEvent,
 	parseGitHubWebhook,
@@ -411,28 +410,19 @@ export class GitHubSCMIntegration implements SCMProvider {
 	}
 
 	/**
-	 * {@link SCMProvider.resolvePersonaIdentities} — the contract's view of the
-	 * module-level `resolvePersonaIdentities`, including its per-project TTL cache.
-	 * The module function stays exported for direct utility usage (the PM adapter
-	 * `src/router/adapters/github-projects.ts` is the last direct importer).
+	 * {@link SCMProvider.resolveReviewerIdentity} — the reviewer credential's account,
+	 * with a per-project TTL cache in `./personas.ts`.
 	 */
-	async resolvePersonaIdentities(project: ProjectConfig): Promise<ScmPersonaIdentities> {
-		return resolvePersonaIdentities(project);
-	}
-
-	/** {@link SCMProvider.personaForActor} — GitHub's `getPersonaForLogin`. */
-	personaForActor(login: string, identities: ScmPersonaIdentities): ScmPersona | null {
-		return getPersonaForLogin(login, identities);
+	async resolveReviewerIdentity(project: ProjectConfig): Promise<string> {
+		return resolveReviewerIdentity(project);
 	}
 
 	/**
-	 * {@link SCMProvider.isSwarmActor} — GitHub's `isSwarmBot`, which matches
-	 * configured persona identities and `[bot]`-suffixed App forms for the PM
-	 * board's status-change gate and conflict filter (NOT the event drop gate,
-	 * which uses markers per #443 and work-item origin per #397).
+	 * {@link SCMProvider.isReviewerActor} — an exact login match, plus the
+	 * `[bot]`-suffixed form a GitHub App identity surfaces with.
 	 */
-	isSwarmActor(login: string, identities: ScmPersonaIdentities): boolean {
-		return isSwarmBot(login, identities);
+	isReviewerActor(login: string, reviewerIdentity: string): boolean {
+		return isReviewerLogin(login, reviewerIdentity);
 	}
 
 	/**
@@ -481,28 +471,28 @@ export class GitHubSCMIntegration implements SCMProvider {
 	}
 
 	/**
-	 * Convenience wrapper for the common case: run `fn` as the implementer, the
-	 * persona behind most SCM writes (opening PRs, pushing, commenting).
+	 * Convenience wrapper: run `fn` as the implementer — on the control plane, the
+	 * operator credential a caller bound for a write made on a pull request author's
+	 * behalf (`src/scm/operator-credential.ts`, issue #1249).
 	 */
 	async withCredentials<T>(project: ProjectConfig, fn: () => Promise<T>): Promise<T> {
 		return this.withPersonaCredentials(project, 'implementer', fn);
 	}
 
 	/**
-	 * Post a top-level comment on a pull request as `persona`, returning the new
-	 * comment's id. The PR-driven phases (review / respond-to-*) normally comment
-	 * from *inside* the agent run via `gh`; this is the out-of-band path for the
-	 * worker's stalled-job safety net, where the run was reclaimed before it could
-	 * comment itself and the PM provider has no PR → comment mapping. Defaults to
-	 * the implementer (the PR's author, whose token is always configured for a
-	 * project that opens PRs); a comment triggers no pipeline phase, so the persona
-	 * choice is immaterial to loop prevention.
+	 * {@link SCMProvider.commentOnPullRequest} — a top-level comment as `persona`,
+	 * returning the new comment's id. The PR-driven phases normally comment through
+	 * their own delivery; this is the out-of-band path for the control plane's notices
+	 * (give-ups, refusals, phase failures). Defaults to the **reviewer**: the router
+	 * speaks as SWARM's own reviewer identity, the one SCM credential it holds
+	 * (issue #1249). Every such body carries the SWARM-origin footer, so ingress drops
+	 * its comment event whichever account posted it.
 	 */
 	async commentOnPullRequest(
 		project: ProjectConfig,
 		prNumber: number,
 		body: string,
-		persona: ScmPersona = 'implementer',
+		persona: ScmPersona = 'reviewer',
 	): Promise<number> {
 		const [owner, repo] = project.repo.split('/');
 		return this.withPersonaCredentials(project, persona, () =>
@@ -511,15 +501,14 @@ export class GitHubSCMIntegration implements SCMProvider {
 	}
 
 	/**
-	 * Resolve a PR's title for a run-history row (the worker's `tryCreateRun`).
-	 * Reads under the implementer persona (the PR's author, whose token is always
-	 * configured for a project that opens PRs); reading a title triggers no
-	 * pipeline phase, so the persona choice is immaterial to loop prevention.
+	 * {@link SCMProvider.getPullRequestTitle} — the title for a run-history row. Reads
+	 * under the **reviewer** persona by default, the credential the control plane holds
+	 * for every read it makes (issue #1249); reading a title triggers no pipeline phase.
 	 */
 	async getPullRequestTitle(
 		project: ProjectConfig,
 		prNumber: number,
-		persona: ScmPersona = 'implementer',
+		persona: ScmPersona = 'reviewer',
 	): Promise<string | null> {
 		const [owner, repo] = project.repo.split('/');
 		return this.withPersonaCredentials(project, persona, () =>
@@ -538,16 +527,14 @@ export class GitHubSCMIntegration implements SCMProvider {
 
 	/**
 	 * {@link SCMProvider.getBranchHead} — the branch's current head commit, read
-	 * with `repos.getBranch`. Defaults to the **implementer** persona rather than
-	 * the reviewer its two neighbours below default to: this is a repository-level
-	 * read like {@link GitHubSCMIntegration.listConflictCandidates}, and its caller
-	 * today is a router sweep holding only the operator's own credential
-	 * (`SWARM_OPERATOR_GH_TOKEN`).
+	 * with `repos.getBranch`. Reads under the **reviewer** persona by default,
+	 * the credential every router read uses (issue #1249) — its caller is the
+	 * base-branch health sweep.
 	 */
 	async getBranchHead(
 		project: ProjectConfig,
 		branch: string,
-		persona: ScmPersona = 'implementer',
+		persona: ScmPersona = 'reviewer',
 	): Promise<string | null> {
 		const [owner, repo] = project.repo.split('/');
 		return this.withPersonaCredentials(project, persona, () => getBranchHead(owner, repo, branch));
@@ -673,13 +660,17 @@ export class GitHubSCMIntegration implements SCMProvider {
 		}
 	}
 
-	/** Provider seam for conflict detection after a base branch advances. */
+	/**
+	 * {@link SCMProvider.listConflictCandidates} — open same-repository pull requests
+	 * targeting `baseBranch`, read as the **reviewer**, the credential every router
+	 * read uses (issue #1249).
+	 */
 	async listConflictCandidates(
 		project: ProjectConfig,
 		baseBranch: string,
 	): Promise<PullRequestDetails[]> {
 		const [owner, repo] = project.repo.split('/');
-		return this.withPersonaCredentials(project, 'implementer', () =>
+		return this.withPersonaCredentials(project, 'reviewer', () =>
 			listOpenPullRequestsForBase(owner, repo, baseBranch),
 		);
 	}

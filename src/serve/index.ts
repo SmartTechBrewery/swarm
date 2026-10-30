@@ -25,13 +25,13 @@
 import { serve } from '@hono/node-server';
 
 import { type HostMaintenanceHandle, startHostMaintenance } from '../api/maintenance.js';
+import { noticeRetiredOperatorTokens } from '../config/retired-operator-tokens.js';
 import { runMigrations } from '../db/migrate.js';
 import { announceFirstRunSetup } from '../identity/first-run-setup.js';
 import { resolveWebhookCallbackBaseUrl } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { configureLogger, logger } from '../lib/logger.js';
 import { closeQueue } from '../queue/producer.js';
-import { warnWhenOperatorTokenUnset } from '../router/app.js';
 import type { DispatchConsumerHandle } from '../router/dispatcher.js';
 import { startRolloutAdvanceTicker } from '../router/worker-rollout-advance.js';
 import { subscribeWorktreeSweepDispatch } from '../router/worktree-sweep-dispatch.js';
@@ -70,7 +70,7 @@ try {
 }
 
 const { app, injectWebSocket } = createAllInOneApp();
-warnWhenOperatorTokenUnset();
+noticeRetiredOperatorTokens();
 const { hostname, port } = listen;
 const server = serve({ fetch: app.fetch, port, ...(hostname ? { hostname } : {}) }, () => {
 	logger.info('swarm control plane: listening', { hostname: hostname ?? null, port });

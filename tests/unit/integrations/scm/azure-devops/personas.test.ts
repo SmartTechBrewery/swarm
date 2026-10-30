@@ -19,31 +19,23 @@ import { getAzureDevOpsUserForToken } from '@/integrations/scm/azure-devops/clie
 import { getAzureDevOpsTokenOrNull } from '@/integrations/scm/azure-devops/credentials.js';
 import {
 	_resetAzureDevOpsPersonaIdentityCache,
-	getAzureDevOpsPersonaForLogin,
-	isSwarmAzureDevOpsActor,
-	resolveAzureDevOpsPersonaIdentities,
+	isAzureDevOpsReviewer,
+	resolveAzureDevOpsReviewerIdentity,
 } from '@/integrations/scm/azure-devops/personas.js';
-import type { ScmPersonaIdentities } from '@/scm/types.js';
 
-const IMPL_ID = '6f1c2a3b-0000-4000-8000-00000000000a';
 const REV_ID = '7e2d3b4c-0000-4000-8000-00000000000b';
-const IDENTITIES: ScmPersonaIdentities = { implementer: IMPL_ID, reviewer: REV_ID };
 const project = createMockProjectConfig({
 	scm: 'azure-devops',
 	repo: 'fabrikam/Fiber Project/web',
 });
 
-/** Both personas resolve to a token, and each token to its own identity id. */
+/** The reviewer resolves to a token, and that to its own identity id. */
 function stubHappyPath(): void {
-	vi.mocked(getAzureDevOpsTokenOrNull).mockImplementation(async (_p, persona) =>
-		persona === 'implementer' ? 'pat-impl' : 'pat-rev',
-	);
-	vi.mocked(getAzureDevOpsUserForToken).mockImplementation(async (pat) =>
-		pat === 'pat-impl' ? IMPL_ID : REV_ID,
-	);
+	vi.mocked(getAzureDevOpsTokenOrNull).mockResolvedValue('pat-rev');
+	vi.mocked(getAzureDevOpsUserForToken).mockResolvedValue(REV_ID);
 }
 
-describe('azure devops personas', () => {
+describe('azure-devops reviewer identity', () => {
 	beforeEach(() => {
 		_resetAzureDevOpsPersonaIdentityCache();
 		vi.mocked(getAzureDevOpsTokenOrNull).mockReset();
@@ -54,88 +46,62 @@ describe('azure devops personas', () => {
 		vi.useRealTimers();
 	});
 
-	describe('isSwarmAzureDevOpsActor', () => {
-		it('recognizes both persona identity ids', () => {
-			expect(isSwarmAzureDevOpsActor(IMPL_ID, IDENTITIES)).toBe(true);
-			expect(isSwarmAzureDevOpsActor(REV_ID, IDENTITIES)).toBe(true);
+	describe('isAzureDevOpsReviewer', () => {
+		it('recognizes the reviewer identity id, case-insensitively', () => {
+			expect(isAzureDevOpsReviewer(REV_ID, REV_ID)).toBe(true);
+			expect(isAzureDevOpsReviewer(REV_ID.toUpperCase(), REV_ID)).toBe(true);
 		});
 
-		it('matches GUIDs case-insensitively — loop prevention must fail closed', () => {
-			expect(isSwarmAzureDevOpsActor(IMPL_ID.toUpperCase(), IDENTITIES)).toBe(true);
-		});
-
-		it('does not flag a human identity', () => {
-			expect(isSwarmAzureDevOpsActor('00000000-0000-4000-8000-000000000000', IDENTITIES)).toBe(
-				false,
-			);
+		it('does not match an operator account or a human', () => {
+			expect(isAzureDevOpsReviewer('6f1c2a3b-0000-4000-8000-00000000000a', REV_ID)).toBe(false);
+			expect(isAzureDevOpsReviewer('some-human', REV_ID)).toBe(false);
 		});
 	});
 
-	describe('getAzureDevOpsPersonaForLogin', () => {
-		it('maps each persona, case-insensitively', () => {
-			expect(getAzureDevOpsPersonaForLogin(IMPL_ID, IDENTITIES)).toBe('implementer');
-			expect(getAzureDevOpsPersonaForLogin(REV_ID.toUpperCase(), IDENTITIES)).toBe('reviewer');
-		});
-
-		it('returns null for an identity that is neither persona', () => {
-			expect(getAzureDevOpsPersonaForLogin('someone-else', IDENTITIES)).toBeNull();
-		});
-	});
-
-	describe('resolveAzureDevOpsPersonaIdentities', () => {
-		it('resolves both identities from their own tokens, in the project’s organization', async () => {
+	describe('resolveAzureDevOpsReviewerIdentity', () => {
+		it('resolves the reviewer from its own token alone — no implementer credential', async () => {
 			stubHappyPath();
 
-			await expect(resolveAzureDevOpsPersonaIdentities(project)).resolves.toEqual(IDENTITIES);
-			expect(vi.mocked(getAzureDevOpsUserForToken)).toHaveBeenCalledWith('pat-impl', 'fabrikam');
+			await expect(resolveAzureDevOpsReviewerIdentity(project)).resolves.toBe(REV_ID);
+			expect(getAzureDevOpsTokenOrNull).toHaveBeenCalledWith(project, 'reviewer');
+			expect(getAzureDevOpsTokenOrNull).not.toHaveBeenCalledWith(project, 'implementer');
 			expect(vi.mocked(getAzureDevOpsUserForToken)).toHaveBeenCalledWith('pat-rev', 'fabrikam');
 		});
 
 		it('caches per project — a second call does not re-resolve', async () => {
 			stubHappyPath();
 
-			await resolveAzureDevOpsPersonaIdentities(project);
-			await resolveAzureDevOpsPersonaIdentities(project);
+			await resolveAzureDevOpsReviewerIdentity(project);
+			await resolveAzureDevOpsReviewerIdentity(project);
 
-			expect(vi.mocked(getAzureDevOpsUserForToken)).toHaveBeenCalledTimes(2);
+			expect(vi.mocked(getAzureDevOpsUserForToken)).toHaveBeenCalledTimes(1);
 		});
 
 		it('re-resolves once the 60s TTL has expired', async () => {
 			stubHappyPath();
 			vi.useFakeTimers();
 
-			await resolveAzureDevOpsPersonaIdentities(project);
+			await resolveAzureDevOpsReviewerIdentity(project);
 			vi.advanceTimersByTime(60_001);
-			await resolveAzureDevOpsPersonaIdentities(project);
+			await resolveAzureDevOpsReviewerIdentity(project);
 
-			expect(vi.mocked(getAzureDevOpsUserForToken)).toHaveBeenCalledTimes(4);
+			expect(vi.mocked(getAzureDevOpsUserForToken)).toHaveBeenCalledTimes(2);
 		});
 
-		it('fails closed when the implementer identity cannot be resolved', async () => {
+		it('fails closed when the reviewer identity cannot be resolved', async () => {
 			vi.mocked(getAzureDevOpsTokenOrNull).mockResolvedValue(null);
 			vi.mocked(getAzureDevOpsUserForToken).mockResolvedValue(null);
 
-			await expect(resolveAzureDevOpsPersonaIdentities(project)).rejects.toThrow(/implementer/);
-		});
-
-		it('fails closed when only the reviewer identity is missing', async () => {
-			vi.mocked(getAzureDevOpsTokenOrNull).mockImplementation(async (_p, persona) =>
-				persona === 'implementer' ? 'pat-impl' : null,
-			);
-			vi.mocked(getAzureDevOpsUserForToken).mockImplementation(async (pat) =>
-				pat === 'pat-impl' ? IMPL_ID : null,
-			);
-
-			await expect(resolveAzureDevOpsPersonaIdentities(project)).rejects.toThrow(/reviewer/);
+			await expect(resolveAzureDevOpsReviewerIdentity(project)).rejects.toThrow(/reviewer/);
 		});
 
 		it('does not cache a failure — the next call retries', async () => {
 			vi.mocked(getAzureDevOpsTokenOrNull).mockResolvedValue(null);
 			vi.mocked(getAzureDevOpsUserForToken).mockResolvedValue(null);
-			await expect(resolveAzureDevOpsPersonaIdentities(project)).rejects.toThrow();
+			await expect(resolveAzureDevOpsReviewerIdentity(project)).rejects.toThrow();
 
 			stubHappyPath();
-			await expect(resolveAzureDevOpsPersonaIdentities(project)).resolves.toEqual(IDENTITIES);
+			await expect(resolveAzureDevOpsReviewerIdentity(project)).resolves.toBe(REV_ID);
 		});
 	});
 });

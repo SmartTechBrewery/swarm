@@ -23,6 +23,7 @@ import {
 	failStaleRunningRuns,
 	findApprovedReviewRunForRearm,
 	findBoardItemIdForTask,
+	findPullRequestProducerWorkerId,
 	findStoredCommitSubject,
 	findStoredTaskBranch,
 	getLatestCompletedPlanningScope,
@@ -1574,6 +1575,67 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 
 	// Issue #1241: the task branch Implementation decided is stored on its run's payload
 	// and read back for every later attempt of the same task.
+	// Issue #1249: whose stored credential a merge, branch update or check re-run uses.
+	describe('findPullRequestProducerWorkerId', () => {
+		async function producingRun(
+			workerId: string | undefined,
+			prUrl: string,
+			startedAt: string,
+			overrides: { repository?: string; phase?: 'implementation' | 'respond-to-review' } = {},
+		): Promise<string> {
+			const id = await createRunRow({
+				projectId: PROJECT_ID,
+				repository: overrides.repository ?? REPO,
+				taskId: '42',
+				phase: overrides.phase ?? 'implementation',
+				...(workerId ? { workerId } : {}),
+			});
+			await completeRun(id, { status: 'completed', producedPrUrl: prUrl });
+			await getDb()
+				.update(runs)
+				.set({ startedAt: new Date(startedAt) })
+				.where(eq(runs.id, id));
+			return id;
+		}
+
+		it('returns the worker of the newest Implementation run that produced the pull request', async () => {
+			const { worker: first } = await seedWorker('pr-producer-first');
+			const { worker: retried } = await seedWorker('pr-producer-retried');
+			await producingRun(first.id, 'https://github.com/jkwiecien/runs-repo/pull/7', '2026-01-01');
+			await producingRun(retried.id, 'https://github.com/jkwiecien/runs-repo/pull/7', '2026-02-01');
+
+			expect(await findPullRequestProducerWorkerId(PROJECT_ID, REPO, '7')).toBe(retried.id);
+		});
+
+		it('matches the trailing number of any provider’s URL, and only that number', async () => {
+			const { worker } = await seedWorker('pr-producer-azure');
+			await producingRun(
+				worker.id,
+				'https://dev.azure.com/fabrikam/Kuchnia%20Vikinga/_git/web/pullrequest/3472',
+				'2026-01-01',
+			);
+
+			expect(await findPullRequestProducerWorkerId(PROJECT_ID, REPO, '3472')).toBe(worker.id);
+			expect(await findPullRequestProducerWorkerId(PROJECT_ID, REPO, '472')).toBeUndefined();
+			expect(await findPullRequestProducerWorkerId(PROJECT_ID, REPO, '%')).toBeUndefined();
+		});
+
+		it('ignores another repository, another phase, and a run whose worker was removed', async () => {
+			const { worker: other } = await seedWorker('pr-producer-other');
+			const { worker: removed } = await seedWorker('pr-producer-removed');
+			await producingRun(other.id, 'https://github.com/x/y/pull/9', '2026-01-01', {
+				repository: OTHER_REPO,
+			});
+			await producingRun(other.id, 'https://github.com/x/y/pull/9', '2026-01-02', {
+				phase: 'respond-to-review',
+			});
+			await producingRun(removed.id, 'https://github.com/x/y/pull/9', '2026-01-03');
+			expect(await removeWorker(removed.id)).toBe(true);
+
+			expect(await findPullRequestProducerWorkerId(PROJECT_ID, REPO, '9')).toBeUndefined();
+		});
+	});
+
 	describe('findStoredTaskBranch', () => {
 		it('returns the newest Implementation branch stored for this repository task', async () => {
 			const older = await createRun({

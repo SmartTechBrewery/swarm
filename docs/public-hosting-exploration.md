@@ -19,6 +19,13 @@
 > longer true, so re-read it with that in mind rather than as a current statement of
 > the code. The rest of the analysis is untouched.
 
+> **Superseded in part by issue #1249 (2026-10-30).** §3's credential table and §6
+> name `SWARM_OPERATOR_GH_TOKEN` and its siblings as the implementer. They are
+> retired: no process reads them. The implementer is always an operator's stored
+> per-worker credential, and the control plane reads as each project's reviewer and
+> merges as the operator whose worker produced the pull request (ai/ARCHITECTURE.md,
+> "Which account the control plane acts as").
+
 > **Superseded in part by issues #799/#800 (2026-08-28).** §2's item 5 says a worker
 > can only be registered from a shell on the control-plane host. `workers.register`
 > now exists on the tRPC router and is served to an operator CLI over the network at

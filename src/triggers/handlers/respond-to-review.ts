@@ -16,8 +16,10 @@
  *    dismissals carry a non-`submitted` action.
  *  - **Authored by the reviewer persona.** Self-review is impossible, so a human's
  *    review or the implementer's own event must not start a response.
- *    `SCMProvider.personaForActor` confirms the review's author is the *reviewer*
- *    persona before dispatching.
+ *    `SCMProvider.isReviewerActor` confirms the review's author is the *reviewer*
+ *    persona's identity (`SCMProvider.resolveReviewerIdentity`) before dispatching
+ *    — the reviewer's own identity is all the gate needs, so it needs no
+ *    implementer credential (issue #1249).
  *
  * **The review-verdict safety cap (issue #235).** A `changes_requested` event
  * that is the last permitted verdict the review-verdict ledger allowed
@@ -126,7 +128,8 @@ function stopsAtReviewCap(
 /**
  * The reviewer-persona gate: whether this submitted review is the *reviewer*
  * persona's own batched review, rather than a human's or the implementer's.
- * Self-review is impossible, so anything else must not start a response.
+ * Self-review is impossible, so anything else must not start a response. Decided
+ * by the reviewer's identity alone, the one the control plane holds (issue #1249).
  */
 async function isReviewerPersonaReview(ctx: ScmTriggerContext): Promise<boolean> {
 	const { event, project } = ctx;
@@ -134,11 +137,11 @@ async function isReviewerPersonaReview(ctx: ScmTriggerContext): Promise<boolean>
 		logger.debug('respond-to-review: review has no author — skipping');
 		return false;
 	}
-	const identities = await ctx.scm.resolvePersonaIdentities(project);
-	if (ctx.scm.personaForActor(event.actorLogin, identities) !== 'reviewer') {
+	const reviewer = await ctx.scm.resolveReviewerIdentity(project);
+	if (!ctx.scm.isReviewerActor(event.actorLogin, reviewer)) {
 		logger.debug('respond-to-review: review not authored by reviewer persona — skipping', {
 			reviewAuthor: event.actorLogin,
-			expectedReviewer: identities.reviewer,
+			expectedReviewer: reviewer,
 		});
 		return false;
 	}

@@ -16,7 +16,10 @@
  *    — no merge ever happens here, so merge automation still never merges a red
  *    or pending head;
  *  - if they fail again, or the provider cannot re-run them, SWARM hands the head
- *    to the operator once: one durable `failed` Respond-to-CI run (the
+ *    to the operator once — so does a head with no operator to re-run them as,
+ *    since the re-run is a write made for the pull request's author with the stored
+ *    credential of the operator whose worker produced it (issue #1249). The
+ *    hand-off is one durable `failed` Respond-to-CI run (the
  *    `recordAbandonedCiFix` precedent, issue #838) and one idempotent comment on
  *    the pull request through the delivery seam (the base-blocked notice's
  *    precedent, issue #873).
@@ -52,6 +55,11 @@ import {
 	type ReviewVerdictKey,
 } from '../db/repositories/reviewVerdictsRepository.js';
 import { createFailedRun } from '../db/repositories/runsRepository.js';
+import {
+	attributedToOperator,
+	PullRequestOperatorUnavailableError,
+	runAsPullRequestOperator,
+} from '../identity/pull-request-operator.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import type { SwarmJob } from '../queue/jobs.js';
@@ -186,8 +194,23 @@ async function requestRerun(
 	const { project, scm, prNumber, headSha } = input;
 	let outcome: RerunFailedChecksOutcome;
 	try {
-		outcome = await scm.rerunFailedChecks(project, headSha, 'implementer');
+		// A write made for the pull request's author, so it runs as the operator whose
+		// worker produced it (issue #1249).
+		outcome = await runAsPullRequestOperator(project, prNumber, async (operator) => {
+			const answer = await scm.rerunFailedChecks(project, headSha, 'implementer');
+			return answer.status === 'provider-error'
+				? { ...answer, message: attributedToOperator(answer.message, operator) }
+				: answer;
+		});
 	} catch (err) {
+		if (err instanceof PullRequestOperatorUnavailableError) {
+			await handToOperator(
+				input,
+				key,
+				`SWARM could not re-run the failing checks: ${err.message}.`,
+			);
+			return 'needs-operator';
+		}
 		// The contract never throws; this keeps a provider that does from escaping.
 		outcome = { status: 'provider-error', message: describeError(err) };
 	}
@@ -276,7 +299,7 @@ async function handToOperator(
 	}
 
 	try {
-		const delivery = await scm.deliveryProvider(project, 'implementer');
+		const delivery = await scm.deliveryProvider(project, 'reviewer');
 		await delivery.postComment({
 			prNumber: Number(prNumber),
 			body: operatorNoticeBody(headSha, failedChecks, rerun),

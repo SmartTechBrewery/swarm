@@ -42,9 +42,8 @@ vi.mock('@/integrations/scm/azure-devops/operator-delivery.js', () => ({
 // The completion poll waits between reads; the tests count reads, not seconds.
 vi.mock('node:timers/promises', () => ({ setTimeout: vi.fn(async () => undefined) }));
 vi.mock('@/integrations/scm/azure-devops/personas.js', () => ({
-	resolveAzureDevOpsPersonaIdentities: vi.fn(),
-	isSwarmAzureDevOpsActor: vi.fn(),
-	getAzureDevOpsPersonaForLogin: vi.fn(),
+	resolveAzureDevOpsReviewerIdentity: vi.fn(),
+	isAzureDevOpsReviewer: vi.fn(),
 }));
 
 import {
@@ -60,9 +59,8 @@ import {
 	createAzureDevOpsOperatorDeliveryProvider,
 } from '@/integrations/scm/azure-devops/operator-delivery.js';
 import {
-	getAzureDevOpsPersonaForLogin,
-	isSwarmAzureDevOpsActor,
-	resolveAzureDevOpsPersonaIdentities,
+	isAzureDevOpsReviewer,
+	resolveAzureDevOpsReviewerIdentity,
 } from '@/integrations/scm/azure-devops/personas.js';
 import {
 	getAzureDevOpsBranchHead,
@@ -84,10 +82,9 @@ import {
 	postAzureDevOpsPullRequestThread,
 } from '@/integrations/scm/azure-devops/writes.js';
 import { SWARM_GENERATED_FOOTER } from '@/scm/swarm-origin.js';
-import type { ScmPersonaIdentities } from '@/scm/types.js';
 
 const project = createMockProjectConfig({ scm: 'azure-devops', repo: 'fabrikam/proj/web' });
-const IDENTITIES: ScmPersonaIdentities = { implementer: 'guid-impl', reviewer: 'guid-rev' };
+const REVIEWER = 'guid-rev';
 
 describe('AzureDevOpsSCMIntegration', () => {
 	const scm = new AzureDevOpsSCMIntegration();
@@ -163,26 +160,19 @@ describe('AzureDevOpsSCMIntegration', () => {
 		});
 	});
 
-	describe('persona identity + actor resolution', () => {
+	describe('reviewer identity + actor check', () => {
 		it('delegates identity resolution to the cached resolver', async () => {
-			vi.mocked(resolveAzureDevOpsPersonaIdentities).mockResolvedValue(IDENTITIES);
+			vi.mocked(resolveAzureDevOpsReviewerIdentity).mockResolvedValue(REVIEWER);
 
-			await expect(scm.resolvePersonaIdentities(project)).resolves.toEqual(IDENTITIES);
-			expect(vi.mocked(resolveAzureDevOpsPersonaIdentities)).toHaveBeenCalledWith(project);
+			await expect(scm.resolveReviewerIdentity(project)).resolves.toBe(REVIEWER);
+			expect(vi.mocked(resolveAzureDevOpsReviewerIdentity)).toHaveBeenCalledWith(project);
 		});
 
-		it('delegates actor → persona mapping', () => {
-			vi.mocked(getAzureDevOpsPersonaForLogin).mockReturnValue('reviewer');
+		it('delegates the reviewer-actor check', () => {
+			vi.mocked(isAzureDevOpsReviewer).mockReturnValue(true);
 
-			expect(scm.personaForActor('guid-rev', IDENTITIES)).toBe('reviewer');
-			expect(vi.mocked(getAzureDevOpsPersonaForLogin)).toHaveBeenCalledWith('guid-rev', IDENTITIES);
-		});
-
-		it('delegates the SWARM-actor check', () => {
-			vi.mocked(isSwarmAzureDevOpsActor).mockReturnValue(true);
-
-			expect(scm.isSwarmActor('guid-impl', IDENTITIES)).toBe(true);
-			expect(vi.mocked(isSwarmAzureDevOpsActor)).toHaveBeenCalledWith('guid-impl', IDENTITIES);
+			expect(scm.isReviewerActor(REVIEWER, REVIEWER)).toBe(true);
+			expect(vi.mocked(isAzureDevOpsReviewer)).toHaveBeenCalledWith(REVIEWER, REVIEWER);
 		});
 	});
 
@@ -262,14 +252,14 @@ describe('AzureDevOpsSCMIntegration', () => {
 			],
 			[
 				'getPullRequestTitle',
-				'implementer',
+				'reviewer',
 				() => scm.getPullRequestTitle(project, 17),
 				getAzureDevOpsPullRequestTitle,
 				[project.repo, 17],
 			],
 			[
 				'getBranchHead',
-				'implementer',
+				'reviewer',
 				() => scm.getBranchHead(project, 'main'),
 				getAzureDevOpsBranchHead,
 				[project.repo, 'main'],
@@ -290,7 +280,7 @@ describe('AzureDevOpsSCMIntegration', () => {
 			],
 			[
 				'listConflictCandidates',
-				'implementer',
+				'reviewer',
 				() => scm.listConflictCandidates(project, 'main'),
 				listActiveAzureDevOpsPullRequestsForBase,
 				[project.repo, 'main'],
@@ -327,7 +317,7 @@ describe('AzureDevOpsSCMIntegration', () => {
 	});
 
 	describe('commentOnPullRequest', () => {
-		it('posts a thread as the implementer by default and returns its id', async () => {
+		it('posts a thread as the reviewer by default and returns its id', async () => {
 			vi.mocked(getAzureDevOpsToken).mockImplementation(async (_p, persona) => `pat-${persona}`);
 			vi.mocked(postAzureDevOpsPullRequestThread).mockResolvedValue(55);
 
@@ -337,7 +327,7 @@ describe('AzureDevOpsSCMIntegration', () => {
 				17,
 				'hello',
 			);
-			expect(vi.mocked(withAzureDevOpsToken).mock.calls[0]?.[0]).toBe('pat-implementer');
+			expect(vi.mocked(withAzureDevOpsToken).mock.calls[0]?.[0]).toBe('pat-reviewer');
 		});
 	});
 
@@ -383,7 +373,7 @@ describe('AzureDevOpsSCMIntegration', () => {
 			state: 'open',
 			draft: false,
 			headSha: APPROVED,
-			reviewers: [{ id: IDENTITIES.reviewer, vote: 10, isRequired: false }],
+			reviewers: [{ id: REVIEWER, vote: 10, isRequired: false }],
 			mergeStatus: 'succeeded',
 			mergeCommitSha: null,
 			baseBranch: 'main',
@@ -393,7 +383,7 @@ describe('AzureDevOpsSCMIntegration', () => {
 
 		beforeEach(() => {
 			vi.mocked(getAzureDevOpsToken).mockImplementation(async (_p, persona) => `pat-${persona}`);
-			vi.mocked(resolveAzureDevOpsPersonaIdentities).mockResolvedValue(IDENTITIES);
+			vi.mocked(resolveAzureDevOpsReviewerIdentity).mockResolvedValue(REVIEWER);
 			vi.mocked(getAzureDevOpsPullRequestMergeState).mockReset();
 			vi.mocked(completeAzureDevOpsPullRequest).mockReset();
 			vi.mocked(completeAzureDevOpsPullRequest).mockResolvedValue(undefined);
@@ -420,7 +410,7 @@ describe('AzureDevOpsSCMIntegration', () => {
 			['it was abandoned', { state: 'closed' as const }, /abandoned/],
 			[
 				'the reviewer persona’s vote no longer approves',
-				{ reviewers: [{ id: IDENTITIES.reviewer, vote: -5, isRequired: false }] },
+				{ reviewers: [{ id: REVIEWER, vote: -5, isRequired: false }] },
 				/vote no longer approves/,
 			],
 			['the reviewer persona never voted', { reviewers: [] }, /vote no longer approves/],
@@ -428,7 +418,7 @@ describe('AzureDevOpsSCMIntegration', () => {
 				'another reviewer rejected it',
 				{
 					reviewers: [
-						{ id: IDENTITIES.reviewer, vote: 10, isRequired: false },
+						{ id: REVIEWER, vote: 10, isRequired: false },
 						{ id: 'guid-human', vote: -10, isRequired: false },
 					],
 				},
@@ -450,7 +440,7 @@ describe('AzureDevOpsSCMIntegration', () => {
 			vi.mocked(getAzureDevOpsPullRequestMergeState)
 				.mockResolvedValueOnce(
 					state({
-						reviewers: [{ id: IDENTITIES.reviewer.toUpperCase(), vote: 5, isRequired: false }],
+						reviewers: [{ id: REVIEWER.toUpperCase(), vote: 5, isRequired: false }],
 					}),
 				)
 				.mockResolvedValueOnce(
@@ -598,8 +588,8 @@ describe('AzureDevOpsSCMIntegration', () => {
 			await expect(merge()).resolves.toEqual({ status: 'provider-error', message: 'boom' });
 		});
 
-		it('is a provider-error, never a throw, when persona identities do not resolve', async () => {
-			vi.mocked(resolveAzureDevOpsPersonaIdentities).mockRejectedValue(
+		it('is a provider-error, never a throw, when the reviewer identity does not resolve', async () => {
+			vi.mocked(resolveAzureDevOpsReviewerIdentity).mockRejectedValue(
 				new Error('Failed to resolve Azure DevOps identity for reviewer token'),
 			);
 

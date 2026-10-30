@@ -13,7 +13,7 @@
  * reply — defaulting to the reviewer when a client sends none (issue #444). The
  * implementer is the **requesting worker's own stored operator credential** for
  * the project's SCM provider (issue #1152) — the account that worker pushed and
- * opened the PR as — never this host's `SWARM_OPERATOR_GH_TOKEN`. A worker sends
+ * opened the PR as — never an account of the control plane's own. A worker sends
  * only the verdict + comment body + PR number (+ that persona) up the transport
  * (`../scm/transport-delivery.ts`); this module performs the SCM write and
  * returns the created review/comment id. Every credential is resolved *inside*
@@ -170,6 +170,7 @@ import type { Worker } from '../identity/worker.js';
 import { isRoutable, type WorkerEnrollment } from '../identity/worker-enrollment.js';
 import {
 	MissingWorkerScmCredentialError,
+	missingOperatorCredentialReason,
 	requireWorkerScmCredential,
 } from '../identity/worker-scm-credential.js';
 import {
@@ -288,7 +289,7 @@ export interface WorkerDeliveryDeps {
 	 * Build the SCM delivery provider an **implementer**-persona write runs under: the
 	 * requesting worker's own stored operator credential for the project's SCM
 	 * provider (issue #1152) — the account that worker pushed and opened the PR as —
-	 * never this host's `SWARM_OPERATOR_GH_TOKEN`.
+	 * never an account of the control plane's own.
 	 */
 	buildOperatorScmDelivery: (
 		project: ProjectConfig,
@@ -435,21 +436,6 @@ export async function buildOperatorScmDelivery(
 		scmProviderId,
 	});
 	return requireProjectSCMProvider(project).operatorDeliveryProvider(project.repo, credential);
-}
-
-/**
- * Why an implementer write is refused when the requesting worker has no stored
- * operator credential for the project's SCM provider (issue #1152). Built only from
- * the error's typed fields, so no secret can reach the body, and naming both places
- * an operator can set it.
- */
-export function missingOperatorCredentialReason(error: MissingWorkerScmCredentialError): string {
-	return (
-		`no operator source-control credential is stored for worker '${error.workerName}' on ` +
-		`${error.scmProviderId} — set it on the worker's dashboard page (/workers/${error.workerId}, ` +
-		`"Operator source-control credential") or with ` +
-		`\`swarm workers set-scm-credential ${error.workerId} ${error.scmProviderId}\``
-	);
 }
 
 /**
@@ -775,8 +761,8 @@ export async function handleSubmitReview(
  * **requesting worker's** stored operator credential for the project's SCM provider
  * (issue #1152, {@link buildOperatorScmDelivery}), so on a control plane several
  * operators share, each reply is authored by the operator whose worker did the work
- * — not by whichever account this host's `SWARM_OPERATOR_GH_TOKEN` names, which this
- * route no longer reads. Like the reviewer PAT, that credential is resolved inside
+ * — not by one account the control plane holds for everyone (it holds none since
+ * issue #1249). Like the reviewer PAT, that credential is resolved inside
  * this process and never leaves it. A worker with none, or a credential that cannot
  * be resolved, answers `503` with a reason rather than throwing
  * ({@link resolvePersonaDelivery}).

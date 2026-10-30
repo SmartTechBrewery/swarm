@@ -17,7 +17,7 @@
  * credential — the `apiToken` role this provider declares on its manifest,
  * resolved through `credentials.pm` (issue #537). It is deliberately *not* the SCM
  * implementer persona it used to borrow: the worker-local `SWARM_OPERATOR_GH_TOKEN`
- * is an SCM credential, and depending on it made board access a property of
+ * (retired since issue #1249) was an SCM credential, and depending on it made board access a property of
  * whichever host happened to run the code. Because that credential is the account
  * every SWARM board write is attributed to, it is also the identity the router's
  * loop-prevention gate recognizes as its own (`resolveGitHubProjectsIdentity`), so

@@ -141,7 +141,8 @@ server-side store) it needs:
 5. **#394** — the DB-free executor (`src/transport/assignment-execution.ts`
    `runAssignmentDbFree`): reconstruct the project from the assignment's non-secret
    slice, run source-carrying delivery under the operator's own token
-   (`SWARM_OPERATOR_GH_TOKEN`), stream output over the transport only, and cancel
+   (then `SWARM_OPERATOR_GH_TOKEN`; stored per worker and carried on the assignment
+   since issue #765, and the variable retired altogether by issue #1249), stream output over the transport only, and cancel
    off the shutdown signal — no `DATABASE_URL`/`REDIS_URL`. A supported-phase gate
    admitted only the two fully-worker-side phases (`respond-to-ci`,
    `resolve-conflicts`).
@@ -281,8 +282,9 @@ server-side store) it needs:
 
    **The deliberate behavioural delta is the agent's `GH_TOKEN`.** The deleted
    executor resolved a per-project *implementer persona* token from Postgres because
-   it happened to be able to; the surviving one uses the operator's own
-   `SWARM_OPERATOR_GH_TOKEN`. That is ADR-004 §2's already-taken decision — the
+   it happened to be able to; the surviving one uses the operator's own credential
+   (then `SWARM_OPERATOR_GH_TOKEN`; per worker since issue #765, the variable retired
+   by issue #1249). That is ADR-004 §2's already-taken decision — the
    implementer identity *is* the worker operator's own GitHub account — and issue
    #396 had already removed `implementer` from `ScmCredentialReferencesSchema`, so
    there is no per-project implementer token left to resolve on any host. The

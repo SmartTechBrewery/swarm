@@ -12,10 +12,10 @@
  * on `SWARM_OPERATOR_GH_TOKEN` — which made a worker's implementer identity a
  * hidden requirement of the API host, gave a project admin no way to configure
  * board access, and broke discovery whenever that operator token happened to lack
- * `read:org`. The operator token is now strictly an SCM implementer credential
- * (`src/config/operator-token.ts`); the board resolves `credentials.pm['github-projects'].apiToken`
- * through the provider-agnostic role mechanism (`resolvePmCredential`,
- * `src/config/provider.ts`, issue #497) and nothing here ever falls back to it.
+ * `read:org`. That variable has since been retired altogether (issue #1249); the board
+ * resolves `credentials.pm['github-projects'].apiToken` through the provider-agnostic
+ * role mechanism (`resolvePmCredential`, `src/config/provider.ts`, issue #497) and
+ * nothing here ever falls back to an SCM credential.
  *
  * Reusing the SCM module's Octokit client (`withGitHubToken` / `getScopedClient` /
  * `getGitHubUserForToken`) is *client* reuse, not identity reuse: the board and
@@ -122,7 +122,7 @@ export async function resolveGitHubProjectsIdentity(project: ProjectConfig): Pro
 /**
  * Whether a webhook actor login *is* the board identity. The `[bot]`-suffixed form
  * covers a GitHub App credential, which surfaces with that suffix on events —
- * the same allowance `isSwarmBot` makes on the SCM side.
+ * the same allowance `isReviewerLogin` makes on the SCM side.
  */
 export function matchesGitHubProjectsIdentity(actorLogin: string, identity: string): boolean {
 	return actorLogin === identity || actorLogin === `${identity}[bot]`;

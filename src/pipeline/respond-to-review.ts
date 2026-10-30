@@ -9,8 +9,8 @@
  * to every reviewer verdict. "Wait for the final submitted review, not
  * individual line comments" is still Cascade's rule and still applies here.
  * Matching the event (`pull_request_review` `submitted`, authored by the
- * *reviewer* persona — the `getPersonaForLogin` routing in
- * `src/integrations/scm/github/webhook.ts`) is the trigger handler's job (SWARM-53),
+ * *reviewer* persona — `SCMProvider.isReviewerActor`) is the trigger handler's job
+ * (`src/triggers/handlers/respond-to-review.ts`),
  * not this phase's: it receives a review to respond to, already vetted.
  *
  * The checkout is the PR branch itself (`provision`'s `createBranch: false`

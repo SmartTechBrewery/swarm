@@ -40,9 +40,8 @@ vi.mock('@/integrations/scm/bitbucket/credentials.js', () => ({
 		vi.fn<(project: unknown, persona: string) => Promise<string | null>>(),
 }));
 vi.mock('@/integrations/scm/bitbucket/personas.js', () => ({
-	resolveBitbucketPersonaIdentities: vi.fn(),
-	isSwarmBitbucketActor: vi.fn(),
-	getBitbucketPersonaForLogin: vi.fn(),
+	resolveBitbucketReviewerIdentity: vi.fn(),
+	isBitbucketReviewer: vi.fn(),
 }));
 // The reads are stubbed; `bitbucketPullRequestUrl` is kept real, because it is a
 // pure URL grammar and a stubbed copy could drift from the one the module's own
@@ -79,9 +78,8 @@ import {
 	getBitbucketCredentialOrNull,
 } from '@/integrations/scm/bitbucket/credentials.js';
 import {
-	getBitbucketPersonaForLogin,
-	isSwarmBitbucketActor,
-	resolveBitbucketPersonaIdentities,
+	isBitbucketReviewer,
+	resolveBitbucketReviewerIdentity,
 } from '@/integrations/scm/bitbucket/personas.js';
 import {
 	findOpenBitbucketPullRequest,
@@ -103,10 +101,10 @@ import {
 	submitBitbucketReview,
 } from '@/integrations/scm/bitbucket/writes.js';
 import { SWARM_GENERATED_FOOTER } from '@/scm/swarm-origin.js';
-import type { PullRequestDetails, ScmPersonaIdentities } from '@/scm/types.js';
+import type { PullRequestDetails } from '@/scm/types.js';
 
 const project = createMockProjectConfig();
-const IDENTITIES: ScmPersonaIdentities = { implementer: 'swarm-impl', reviewer: 'swarm-rev' };
+const REVIEWER = 'swarm-rev';
 
 describe('BitbucketSCMIntegration', () => {
 	const scm = new BitbucketSCMIntegration();
@@ -180,26 +178,19 @@ describe('BitbucketSCMIntegration', () => {
 		});
 	});
 
-	describe('persona identity + actor resolution', () => {
+	describe('reviewer identity + actor check', () => {
 		it('delegates identity resolution to the cached resolver', async () => {
-			vi.mocked(resolveBitbucketPersonaIdentities).mockResolvedValue(IDENTITIES);
+			vi.mocked(resolveBitbucketReviewerIdentity).mockResolvedValue(REVIEWER);
 
-			await expect(scm.resolvePersonaIdentities(project)).resolves.toEqual(IDENTITIES);
-			expect(vi.mocked(resolveBitbucketPersonaIdentities)).toHaveBeenCalledWith(project);
+			await expect(scm.resolveReviewerIdentity(project)).resolves.toBe(REVIEWER);
+			expect(vi.mocked(resolveBitbucketReviewerIdentity)).toHaveBeenCalledWith(project);
 		});
 
-		it('delegates actor → persona mapping', () => {
-			vi.mocked(getBitbucketPersonaForLogin).mockReturnValue('reviewer');
+		it('delegates the reviewer-actor check', () => {
+			vi.mocked(isBitbucketReviewer).mockReturnValue(true);
 
-			expect(scm.personaForActor('swarm-rev', IDENTITIES)).toBe('reviewer');
-			expect(vi.mocked(getBitbucketPersonaForLogin)).toHaveBeenCalledWith('swarm-rev', IDENTITIES);
-		});
-
-		it('delegates the SWARM-actor check', () => {
-			vi.mocked(isSwarmBitbucketActor).mockReturnValue(true);
-
-			expect(scm.isSwarmActor('swarm-impl', IDENTITIES)).toBe(true);
-			expect(vi.mocked(isSwarmBitbucketActor)).toHaveBeenCalledWith('swarm-impl', IDENTITIES);
+			expect(scm.isReviewerActor(REVIEWER, REVIEWER)).toBe(true);
+			expect(vi.mocked(isBitbucketReviewer)).toHaveBeenCalledWith(REVIEWER, REVIEWER);
 		});
 	});
 
@@ -303,7 +294,7 @@ describe('BitbucketSCMIntegration', () => {
 			expect(vi.mocked(getBitbucketCredential)).toHaveBeenCalledWith(project, 'implementer');
 		});
 
-		it('reads a title as the implementer — the PR’s own author', async () => {
+		it('reads a title as the reviewer, like every control-plane read', async () => {
 			vi.mocked(getBitbucketPullRequestTitle).mockResolvedValue('Add a thing');
 
 			await expect(scm.getPullRequestTitle(project, 17)).resolves.toBe('Add a thing');
@@ -312,13 +303,10 @@ describe('BitbucketSCMIntegration', () => {
 				'swarm',
 				17,
 			);
-			expect(vi.mocked(getBitbucketCredential)).toHaveBeenCalledWith(project, 'implementer');
+			expect(vi.mocked(getBitbucketCredential)).toHaveBeenCalledWith(project, 'reviewer');
 		});
 
-		// The implementer rather than the reviewer the aggregate read below uses: a
-		// repository-level read, whose caller today is a router sweep holding only the
-		// operator's own credential.
-		it("reads the base branch's head commit as the implementer", async () => {
+		it("reads the base branch's head commit as the reviewer", async () => {
 			vi.mocked(getBitbucketBranchHead).mockResolvedValue('d3022fc0ca3d');
 
 			await expect(scm.getBranchHead(project, 'main')).resolves.toBe('d3022fc0ca3d');
@@ -327,7 +315,7 @@ describe('BitbucketSCMIntegration', () => {
 				'swarm',
 				'main',
 			);
-			expect(vi.mocked(getBitbucketCredential)).toHaveBeenCalledWith(project, 'implementer');
+			expect(vi.mocked(getBitbucketCredential)).toHaveBeenCalledWith(project, 'reviewer');
 		});
 
 		it('aggregates build statuses as the reviewer', async () => {
@@ -369,7 +357,7 @@ describe('BitbucketSCMIntegration', () => {
 			expect(vi.mocked(getBitbucketCredential)).toHaveBeenCalledWith(project, 'reviewer');
 		});
 
-		it('lists conflict candidates as the implementer, the persona that pushes the fix', async () => {
+		it('lists conflict candidates as the reviewer, like every control-plane read', async () => {
 			vi.mocked(listOpenBitbucketPullRequestsForBase).mockResolvedValue([PR_DETAILS]);
 
 			await expect(scm.listConflictCandidates(project, 'main')).resolves.toEqual([PR_DETAILS]);
@@ -378,7 +366,7 @@ describe('BitbucketSCMIntegration', () => {
 				'swarm',
 				'main',
 			);
-			expect(vi.mocked(getBitbucketCredential)).toHaveBeenCalledWith(project, 'implementer');
+			expect(vi.mocked(getBitbucketCredential)).toHaveBeenCalledWith(project, 'reviewer');
 		});
 	});
 
@@ -412,7 +400,7 @@ describe('BitbucketSCMIntegration', () => {
 			vi.mocked(postBitbucketPullRequestComment).mockResolvedValue(991);
 		});
 
-		it('comments as the implementer by default — the pull request’s own author', async () => {
+		it("comments as the reviewer by default — the control plane's own voice", async () => {
 			await expect(scm.commentOnPullRequest(project, 17, 'reclaimed mid-run')).resolves.toBe(991);
 			expect(vi.mocked(postBitbucketPullRequestComment)).toHaveBeenCalledWith(
 				'SmartTechBrewery',
@@ -420,13 +408,13 @@ describe('BitbucketSCMIntegration', () => {
 				17,
 				'reclaimed mid-run',
 			);
-			expect(vi.mocked(getBitbucketCredential)).toHaveBeenCalledWith(project, 'implementer');
+			expect(vi.mocked(getBitbucketCredential)).toHaveBeenCalledWith(project, 'reviewer');
 		});
 
 		it('honours an explicitly requested persona', async () => {
-			await scm.commentOnPullRequest(project, 17, 'note', 'reviewer');
+			await scm.commentOnPullRequest(project, 17, 'note', 'implementer');
 
-			expect(vi.mocked(getBitbucketCredential)).toHaveBeenCalledWith(project, 'reviewer');
+			expect(vi.mocked(getBitbucketCredential)).toHaveBeenCalledWith(project, 'implementer');
 		});
 	});
 

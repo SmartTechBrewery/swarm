@@ -1356,6 +1356,45 @@ export async function findBoardItemIdForTask(
 }
 
 /**
+ * The worker whose Implementation run produced pull request `prNumber` of
+ * `repository` (issue #1249) — the operator a write made on that pull request
+ * author's behalf (merge, branch update, check re-run) runs as.
+ *
+ * Read off the attribution record (`runs.worker_id` + `produced_pr_url`, ADR-004 §4).
+ * The URL is matched on its trailing `/<number>`, which every provider's pull-request
+ * URL ends in, rather than rebuilt from a URL grammar: a provider may report its own
+ * web URL in a casing or encoding that grammar does not reproduce. The newest such run
+ * naming a worker wins — a retried Implementation that recovered the open pull request
+ * on another machine pushed to it as that machine's operator.
+ *
+ * `undefined` when no run recorded producing it with a worker still registered —
+ * a pull request a person opened, or one whose producing worker was removed
+ * (`worker_id` is `ON DELETE SET NULL`).
+ */
+export async function findPullRequestProducerWorkerId(
+	projectId: string,
+	repository: string,
+	prNumber: string,
+): Promise<string | undefined> {
+	if (!/^\d+$/.test(prNumber)) return undefined;
+	const rows = await getDb()
+		.select({ workerId: runs.workerId })
+		.from(runs)
+		.where(
+			and(
+				eq(runs.projectId, projectId),
+				eq(runs.repository, repository),
+				eq(runs.phase, 'implementation'),
+				isNotNull(runs.workerId),
+				sql`${runs.producedPrUrl} LIKE ${`%/${prNumber}`}`,
+			),
+		)
+		.orderBy(desc(runs.startedAt))
+		.limit(1);
+	return rows[0]?.workerId ?? undefined;
+}
+
+/**
  * The task branch Implementation last decided for this project task (issue #1241) —
  * the `taskBranch` its newest run carrying one stored on its job payload.
  *

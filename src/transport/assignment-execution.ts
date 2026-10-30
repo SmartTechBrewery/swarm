@@ -707,9 +707,7 @@ export const SUPPORTED_DB_FREE_PHASES: ReadonlySet<TaskPhase> = new Set<TaskPhas
  * PR comment: that comment is the *implementer's* reply to the review, so it must
  * be authored by the implementer identity (the operator, as in Implementation) —
  * routing it through a composite built for the reviewer persona would have the
- * reviewer answering its own review, and the author-persona routing that decides
- * what a comment event means (`SCMProvider.personaForActor`, `../scm/types.ts`)
- * would read the wrong persona off it. The composite states `persona: 'reviewer'`
+ * reviewer answering its own review. The composite states `persona: 'reviewer'`
  * explicitly, so the frame carries the identity this Review write runs under
  * rather than leaving the server to infer one (issue #444). It names the run's
  * repository too — `project` is already scoped to it by the dispatcher (issue

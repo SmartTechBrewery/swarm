@@ -21,13 +21,12 @@
  * all.
  *
  * A merge dispatch runs entirely outside the agent pipeline: it only invokes
- * the provider-neutral `ScmMergeProvider` (`src/scm/merge.ts`) under the
- * project's implementer credential — never provisioning a worktree, starting
- * an agent, or resubmitting the review. Every attempt re-reads the PR's
- * current state and re-verifies the approved head, so a retry can never merge
- * newly pushed or no-longer-approved changes. Outcomes persist onto the
- * originating Review run's `review_merge_*` columns (same dashboard surface
- * as before).
+ * the provider-neutral `ScmMergeProvider` (`src/scm/merge.ts`) — never
+ * provisioning a worktree, starting an agent, or resubmitting the review. Every
+ * attempt re-reads the PR's current state and re-verifies the approved head, so a
+ * retry can never merge newly pushed or no-longer-approved changes. Outcomes
+ * persist onto the originating Review run's `review_merge_*` columns (same
+ * dashboard surface as before).
  *
  * **Re-verifying a stale head (issue #874).** An approval proves the diff was
  * read; it does not prove the *tree the merge would produce* was ever built. So
@@ -111,6 +110,17 @@
  *    a dependent's pull request — let alone its approval — never exists before its
  *    blocker merged.
  *
+ * **Whose account merges (issue #1249).** The control plane holds no implementer
+ * credential of its own. The merge and the branch update are writes made for the
+ * pull request's author, so they run as the operator whose worker produced it, with
+ * that operator's stored credential ({@link runAsPullRequestOperator}); every read
+ * runs as the project's reviewer, and so does the refusal comment. When there is no
+ * such operator — nobody SWARM knows opened the pull request, or that worker holds no
+ * credential for the provider — the dispatch does not merge: it settles terminally
+ * as {@link MERGE_NO_OPERATOR} with the reason on the Review run and the pull
+ * request. A credential the provider rejects is a `provider-error` like any other,
+ * retried on the same budget, and names the worker whose credential it was.
+ *
  * **A `merged` outcome also settles what the merge absorbed (issue #959).** When
  * this pull request's Review runs declared they traced a split sibling's whole
  * scope through its diff, that sibling is closed as part of the same merge —
@@ -157,6 +167,12 @@ import {
 	promoteMergeQueueWaits,
 	publishDispatchWakeUp,
 } from '../dispatch/dispatcher.js';
+import {
+	attributedToOperator,
+	type PullRequestOperator,
+	PullRequestOperatorUnavailableError,
+	runAsPullRequestOperator,
+} from '../identity/pull-request-operator.js';
 import { requireProjectSCMProvider } from '../integrations/scm/registry.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
@@ -209,12 +225,22 @@ export const MERGE_PROVIDER_ERROR_EXHAUSTED = 'provider-error-exhausted' as cons
  */
 export const MERGE_QUEUED = 'queued' as const;
 
+/**
+ * Terminal outcome recorded when there is no operator to merge as (issue #1249): no
+ * registered worker is recorded as having produced the pull request, or that worker
+ * holds no credential for the project's SCM provider. Not a provider answer — the
+ * provider was never asked — and not retried, since no delay stores a credential;
+ * the message says what to set.
+ */
+export const MERGE_NO_OPERATOR = 'no-operator-credential' as const;
+
 /** Every value the `runs.review_merge_outcome` column can hold. */
 export type ReviewMergeOutcomeStatus =
 	| MergePullRequestOutcome['status']
 	| typeof MERGE_RETRY_EXHAUSTED
 	| typeof MERGE_PROVIDER_ERROR_EXHAUSTED
-	| typeof MERGE_QUEUED;
+	| typeof MERGE_QUEUED
+	| typeof MERGE_NO_OPERATOR;
 
 /**
  * Bounded backoff, coded constants — merge retry policy is intentionally not
@@ -657,10 +683,9 @@ async function readFreshCheckVerdict(
 ): Promise<FreshCheckVerdict> {
 	const read =
 		capabilities.getAggregateCheckStatus ?? scmCapability(project, 'getAggregateCheckStatus');
-	// Implementer: the persona this dispatch merges as, so one attempt does not
-	// speak as two different accounts (the same reason `readBaseBranchHealth`
-	// passes it explicitly — the contract's reads disagree on their defaults).
-	const checks = await read(project, job.approvedHeadSha, 'implementer');
+	// Reviewer: every read the control plane makes runs as the project's reviewer
+	// credential (issue #1249) — stated explicitly, as `readBaseBranchHealth` does.
+	const checks = await read(project, job.approvedHeadSha, 'reviewer');
 	const decision = decideAggregateCheckOutcome(
 		checks,
 		job.prNumber,
@@ -697,7 +722,7 @@ async function commentOnMergeRefusal(
 			project,
 			Number(job.prNumber),
 			`${body}\n\n---\n${SWARM_GENERATED_FOOTER}`,
-			'implementer',
+			'reviewer',
 		);
 	} catch (err) {
 		logger.error('Merge automation: failed to post the terminal refusal comment', {
@@ -1004,8 +1029,26 @@ async function reactToStaleBase(
 	try {
 		const updateBranch =
 			capabilities.updatePullRequestBranch ?? scmCapability(project, 'updatePullRequestBranch');
-		update = await updateBranch(project, Number(job.prNumber), job.approvedHeadSha);
+		update = await runAsPullRequestOperator(project, job.prNumber, async (operator) =>
+			namingOperator(
+				await updateBranch(project, Number(job.prNumber), job.approvedHeadSha),
+				operator,
+			),
+		);
 	} catch (err) {
+		if (err instanceof PullRequestOperatorUnavailableError) {
+			return {
+				kind: 'settled',
+				outcome: await refuseWithoutOperator(
+					dispatch,
+					job,
+					project,
+					err.message,
+					attempt,
+					capabilities,
+				),
+			};
+		}
 		update = { status: 'provider-error', message: describeError(err) };
 	}
 
@@ -1518,9 +1561,7 @@ async function markApprovalSupersededByHeadChange(
 	const reviewedHeadSha = job.reviewedHeadSha ?? job.approvedHeadSha;
 	try {
 		const read = capabilities.getPullRequest ?? scmCapability(project, 'getPullRequest');
-		// Implementer: the persona this dispatch merges as, so one attempt does not
-		// speak as two different accounts.
-		const details = await read(project, Number(job.prNumber), 'implementer');
+		const details = await read(project, Number(job.prNumber), 'reviewer');
 		if (details.headSha === reviewedHeadSha) {
 			logger.debug('Merge automation: the head is unchanged — the refusal had another cause', {
 				runId: job.reviewRunId,
@@ -1569,10 +1610,27 @@ async function markApprovalSupersededByHeadChange(
 }
 
 /** What one merge attempt came back with, before any of it is settled. */
-interface MergeAttempt {
-	outcome: MergePullRequestOutcome;
-	/** Set only when the attempt refused because the head it was about to merge is red. */
-	redFreshChecks: string[] | null;
+type MergeAttempt =
+	| {
+			kind: 'answered';
+			outcome: MergePullRequestOutcome;
+			/** Set only when the attempt refused because the head it was about to merge is red. */
+			redFreshChecks: string[] | null;
+	  }
+	/** There was no operator to merge as (issue #1249); `reason` says why. */
+	| { kind: 'no-operator'; reason: string };
+
+/**
+ * A provider answer naming the operator it was made as when the provider refused or
+ * failed it — a revoked or under-scoped credential then reads as *that worker's*
+ * credential to replace, not as an anonymous forge error (issue #1249).
+ */
+function namingOperator<O extends MergePullRequestOutcome | UpdatePullRequestBranchOutcome>(
+	outcome: O,
+	operator: PullRequestOperator,
+): O {
+	if (outcome.status !== 'provider-error' && outcome.status !== 'policy-blocked') return outcome;
+	return { ...outcome, message: attributedToOperator(outcome.message, operator) };
 }
 
 /**
@@ -1606,6 +1664,7 @@ async function attemptMerge(
 			// The head's own CI has not finished. Ordinary backoff — for an updated
 			// head the budget was reset when it advanced, so this is the wait it exists for.
 			return {
+				kind: 'answered',
 				outcome: {
 					status: 'not-ready',
 					message: updated
@@ -1618,6 +1677,7 @@ async function attemptMerge(
 		if (freshChecks.kind === 'red') {
 			const failed = freshChecks.failedChecks.join(', ');
 			return {
+				kind: 'answered',
 				outcome: {
 					status: 'not-eligible',
 					message: updated
@@ -1627,12 +1687,17 @@ async function attemptMerge(
 				redFreshChecks: freshChecks.failedChecks,
 			};
 		}
-		return {
-			outcome: await merge(project, Number(job.prNumber), job.approvedHeadSha),
-			redFreshChecks: null,
-		};
+		// The merge itself is the pull request author's write (issue #1249).
+		const outcome = await runAsPullRequestOperator(project, job.prNumber, async (operator) =>
+			namingOperator(await merge(project, Number(job.prNumber), job.approvedHeadSha), operator),
+		);
+		return { kind: 'answered', outcome, redFreshChecks: null };
 	} catch (err) {
+		if (err instanceof PullRequestOperatorUnavailableError) {
+			return { kind: 'no-operator', reason: err.message };
+		}
 		return {
+			kind: 'answered',
 			outcome: { status: 'provider-error', message: describeError(err) },
 			redFreshChecks: null,
 		};
@@ -1663,9 +1728,7 @@ async function resolveOwnTaskId(
 ): Promise<string | undefined> {
 	try {
 		const read = capabilities.getPullRequest ?? scmCapability(project, 'getPullRequest');
-		// Implementer: the persona this dispatch merges as, so one attempt does not
-		// speak as two different accounts.
-		const details = await read(project, Number(job.prNumber), 'implementer');
+		const details = await read(project, Number(job.prNumber), 'reviewer');
 		return taskIdFromTaskBranch(details.headBranch, project, { strict: true });
 	} catch (err) {
 		logger.warn('Merge automation: could not resolve the pull request’s own task', {
@@ -1870,6 +1933,41 @@ async function refuseRedHead(
 }
 
 /**
+ * Settle a merge that has no operator to act as (issue #1249): record the reason on
+ * the Review run, say so on the pull request, and complete the dispatch — terminally,
+ * since no retry stores a credential. Nothing was merged or pushed.
+ */
+async function refuseWithoutOperator(
+	dispatch: DispatchRow,
+	job: MergeAutomationJob,
+	project: ProjectConfig,
+	reason: string,
+	attempt: number,
+	capabilities: MergeAutomationCapabilities,
+): Promise<MergeAutomationSettledOutcome> {
+	const message = `Merge automation did not merge this approved pull request: ${reason}.`;
+	await persistMergeOutcome(job, MERGE_NO_OPERATOR, message, attempt);
+	await commentOnMergeRefusal(
+		job,
+		project,
+		capabilities,
+		mergeRefusalCommentBody(
+			`It is approved, but ${reason}.`,
+			'Merge it manually; later approvals merge automatically once the operator credential is in place.',
+			'SWARM merges a pull request as the operator whose worker produced it, never as an account of its own. No branch changes were made.',
+		),
+	);
+	logger.warn('Merge automation: no operator to merge as, leaving the PR open', {
+		dispatchId: dispatch.id,
+		runId: job.reviewRunId,
+		prNumber: job.prNumber,
+		reason,
+	});
+	await settleMergeDispatch(dispatch, job, project, 'merge-no-operator');
+	return settledOutcome(job, MERGE_NO_OPERATOR);
+}
+
+/**
  * A retryable outcome: schedule the next attempt on the bounded, doubling
  * backoff, or — on the attempt that spends the budget — settle with the
  * exhaustion outcome that names why.
@@ -1990,6 +2088,9 @@ export async function processMergeAutomationDispatch(
 		);
 	}
 	const attempted = await attemptMerge(job, project, capabilities);
+	if (attempted.kind === 'no-operator') {
+		return refuseWithoutOperator(dispatch, job, project, attempted.reason, attempt, capabilities);
+	}
 	const redFreshChecks = attempted.redFreshChecks;
 	let outcome: MergePullRequestOutcome = attempted.outcome;
 

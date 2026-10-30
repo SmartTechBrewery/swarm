@@ -1049,8 +1049,8 @@ async function scheduleRerunSettleRecheck(
  * throw — a transient 5xx/rate-limit/network blip, or a project with no
  * resolvable reviewer token. That throw must not escape `handle`: it would land
  * outside `processJob`'s `runPhase`-only try/catch, failing the job and burning
- * its BullMQ retries re-running this same query (an implementer-token-only
- * project would fail+retry on *every* `checks` event). We degrade to a
+ * its BullMQ retries re-running this same query (a project with no reviewer
+ * credential would fail+retry on *every* `checks` event). We degrade to a
  * bounded recheck instead — Cascade skips on error; we defer so a transient blip
  * can't silently drop a legitimate review, and the cap winds a persistent
  * failure down to one warn+drop rather than a retry storm. That degrade spends
@@ -1650,9 +1650,9 @@ async function reportBaseBlockedPullRequest(
 	});
 
 	try {
-		// Implementer, the persona `readBaseBranchHealth` just read the base with, so
-		// one attribution does not speak as two different accounts.
-		const delivery = await ctx.scm.deliveryProvider(project, 'implementer');
+		// Reviewer, the persona `readBaseBranchHealth` just read the base with and the
+		// one every notice the control plane posts speaks as (issue #1249).
+		const delivery = await ctx.scm.deliveryProvider(project, 'reviewer');
 		await delivery.postComment({
 			prNumber: Number(prNumber),
 			body: baseBlockedCommentBody(baseBranch, baseHeadSha, sharedChecks),
@@ -1757,10 +1757,9 @@ async function checkMergeabilityAndConflicts(
 	}
 
 	const { scm } = ctx;
-	const persona = (await scm.hasPersonaToken(project, 'reviewer')) ? 'reviewer' : 'implementer';
 	let prDetails: Awaited<ReturnType<typeof scm.getPullRequest>>;
 	try {
-		prDetails = await scm.getPullRequest(project, Number(prNumber), persona);
+		prDetails = await scm.getPullRequest(project, Number(prNumber), 'reviewer');
 	} catch (err) {
 		const error = err instanceof Error ? err.message : String(err);
 		return scheduleMergeabilityRecheck(

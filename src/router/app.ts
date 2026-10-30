@@ -12,8 +12,6 @@
 import { createNodeWebSocket, type NodeWebSocket } from '@hono/node-ws';
 import type { Hono } from 'hono';
 
-import { getOperatorGitHubTokenOrNull, OPERATOR_GH_TOKEN_ENV } from '../config/operator-token.js';
-import { logger } from '../lib/logger.js';
 import { registerOperatorApi } from './operator-api.js';
 import { registerOperatorSession } from './operator-session.js';
 import { createWebhookApp } from './webhook-receiver.js';
@@ -47,20 +45,4 @@ export function createRouterApp(): RouterApp {
 	// the `workers` namespace alone, since this process is the internet-exposed one.
 	registerOperatorApi(app);
 	return { app, injectWebSocket };
-}
-
-/**
- * Say so at startup rather than at the first event that needs it: without the
- * operator token this host cannot resolve the *implementer* persona for the
- * GitHub operations it originates itself — the Respond-to-review author gate, the
- * sweeps, and merge-automation reads. A Respond-to-review reply does not need it:
- * it is posted with the requesting worker's stored operator credential (issue
- * #1152). Only a warning — every delivery route works without it.
- */
-export function warnWhenOperatorTokenUnset(): void {
-	if (!getOperatorGitHubTokenOrNull()) {
-		logger.warn(
-			`${OPERATOR_GH_TOKEN_ENV} is unset — router-originated GitHub operations that run as the implementer persona (e.g. the Respond-to-review author gate) cannot authenticate until it is set; Respond-to-review replies do not need it (issue #1152) — see docs/configuration.md`,
-		);
-	}
 }

@@ -12,7 +12,7 @@ vi.mock('@/identity/first-run-setup.js', () => ({
 	announceFirstRunSetup: vi.fn(async () => undefined),
 }));
 vi.mock('@/queue/producer.js', () => ({ closeQueue: vi.fn() }));
-vi.mock('@/router/app.js', () => ({ warnWhenOperatorTokenUnset: vi.fn() }));
+vi.mock('@/config/retired-operator-tokens.js', () => ({ noticeRetiredOperatorTokens: vi.fn() }));
 vi.mock('@/router/dispatcher.js', () => ({
 	startControlPlaneDispatch: vi.fn(async () => ({ close: vi.fn() })),
 }));

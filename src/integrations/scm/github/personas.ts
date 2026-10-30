@@ -6,45 +6,22 @@
  * exists to break the automation feedback loop: a persona must never react to its
  * own output — the implementer never reviews its own PR, and the reviewer's
  * `changes_requested` routes back to the implementer, not to itself
- * (ai/CODING_STANDARDS.md "Loop prevention"). That invariant is enforced by
- * mapping every inbound event's actor to a persona (`getPersonaForLogin`).
+ * (ai/CODING_STANDARDS.md "Loop prevention").
  *
- * `isSwarmBot` — "did a SWARM persona produce this?" — is the narrower, and now
- * largely retired, half. SWARM's *drop* gates stopped asking it: under the
- * federated model an implementer identity is the worker operator's own account, so
- * a login no longer distinguishes SWARM's output from that human's (ADR-004 §3).
- * Both PR-ownership triggers key on work-item origin instead (`pr-review` since
- * issue #397, `resolve-conflicts` since issue #836) and comment loop prevention on
- * the comment's own marker (issue #443, `src/scm/swarm-origin.ts`), and the
- * board's status-change gate stopped asking these personas at all once board
- * writes moved onto the PM provider's own credential (issue #537 —
- * `GitHubProjectsRouterAdapter` now resolves that credential's identity instead).
- * Nothing in production calls `isSwarmBot` any more; it stays because the SCM
- * contract still requires `isSwarmActor` of every provider.
- *
- * The two personas resolve their tokens from different sources (issue #396): the
- * `implementer` identity is resolved from the worker operator's own token
- * (`SWARM_OPERATOR_GH_TOKEN`, via `getPersonaTokenOrNull`). This runs on the
- * **router**, which since issue #765 is the only side still reading that variable —
- * the worker resolves the same operator identity from the per-`(worker, provider)`
- * store instead, so on a multi-worker installation the login resolved here can
- * differ from the account that authored the PR. That is deliberate, not a gap:
- * {@link resolvePersonaIdentities} runs at webhook ingress (the Respond-to-review
- * author gate), before any worker is selected, so there is no worker to key that
- * store on; and the gate only asks whether an event's author is the **reviewer**,
- * so the implementer login here only has to differ from it. It does fail closed
- * when the variable is unset. The one worker-requested implementer write — the
- * Respond-to-review reply on `POST /worker/delivery/pr-comment` — moved onto the
- * requesting worker's stored credential in issue #1152
- * (`src/router/worker-delivery.ts`). The `reviewer` stays a project-scoped
- * credential. The two must still resolve to two distinct accounts (operator ≠
- * reviewer) for loop prevention to hold.
+ * Only the **reviewer** has an identity the control plane can resolve (issue
+ * #1249): it is the project's own credential. The implementer is whichever
+ * operator's worker produced a pull request — an ordinary account, one per
+ * operator — so there is no single implementer login to resolve, and nothing asks
+ * for one. The Respond-to-review author gate only asks whether a review came from
+ * the reviewer ({@link resolveReviewerIdentity} + {@link isReviewerLogin}); SWARM's
+ * own comments are recognised by their marker (issue #443, `src/scm/swarm-origin.ts`)
+ * and its own pull requests by work-item origin (`src/triggers/swarm-managed-pr.ts`).
  */
 
 import { getPersonaTokenOrNull } from '../../../config/provider.js';
 import type { ProjectConfig } from '../../../config/schema.js';
 import { logger } from '../../../lib/logger.js';
-import type { ScmPersona, ScmPersonaIdentities } from '../../../scm/types.js';
+import type { ScmPersona } from '../../../scm/types.js';
 import { getGitHubUserForToken } from './client.js';
 
 // ============================================================================
@@ -53,13 +30,11 @@ import { getGitHubUserForToken } from './client.js';
 
 /**
  * The persona role model is provider-neutral (`ScmPersona`, `src/scm/types.ts`);
- * these are the GitHub module's local names for it. Kept as aliases rather than
+ * this is the GitHub module's local name for it. Kept as an alias rather than
  * renamed at every call site: ~10 files still spell `GitHubPersona`, and issues
  * #385/#386 retire the alias as they migrate those call sites onto the registry.
  */
 export type GitHubPersona = ScmPersona;
-
-export type PersonaIdentities = ScmPersonaIdentities;
 
 // ============================================================================
 // Agent → Persona mapping
@@ -83,103 +58,55 @@ export function getPersonaForAgentType(agentType: string): GitHubPersona {
 }
 
 // ============================================================================
-// Identity resolution
+// Reviewer identity
 // ============================================================================
 
 const PERSONA_CACHE_TTL_MS = 60_000; // 60s — matches Cascade's persona identity cache
 
 interface CacheEntry {
-	value: PersonaIdentities;
+	value: string;
 	expiresAt: number;
 }
 
-// Per-project TTL cache of persona identities. Resolving an identity costs a
-// token lookup plus a GitHub API round-trip; a burst of webhooks for one repo
-// would otherwise repeat that work per event. Errors are re-thrown (not cached)
-// so a transient credential failure doesn't get pinned for the TTL window.
-const personaIdentityCache = new Map<string, CacheEntry>();
+// Per-project TTL cache of the reviewer identity. Resolving it costs a token lookup
+// plus a GitHub API round-trip; a burst of webhooks for one repo would otherwise
+// repeat that work per event. Errors are re-thrown (not cached) so a transient
+// credential failure doesn't get pinned for the TTL window.
+const reviewerIdentityCache = new Map<string, CacheEntry>();
 
 /**
- * Resolve both persona GitHub logins for a project, cached per-project with a
- * 60s TTL. Throws if either persona's token is missing or its identity can't be
- * resolved — without both identities, loop prevention can't tell SWARM's own
- * events apart from a human's, so proceeding would be unsafe.
+ * Resolve the GitHub login of a project's reviewer token, cached per project with a
+ * 60s TTL. Throws if the token is missing or its identity can't be resolved — the
+ * author gate then fails closed rather than answering a review it cannot attribute.
  */
-export async function resolvePersonaIdentities(project: ProjectConfig): Promise<PersonaIdentities> {
-	const cached = personaIdentityCache.get(project.id);
+export async function resolveReviewerIdentity(project: ProjectConfig): Promise<string> {
+	const cached = reviewerIdentityCache.get(project.id);
 	if (cached && Date.now() < cached.expiresAt) return cached.value;
 
-	const [implementerToken, reviewerToken] = await Promise.all([
-		getPersonaTokenOrNull(project, 'implementer'),
-		getPersonaTokenOrNull(project, 'reviewer'),
-	]);
-
-	const [implementerLogin, reviewerLogin] = await Promise.all([
-		getGitHubUserForToken(implementerToken),
-		getGitHubUserForToken(reviewerToken),
-	]);
-
-	if (!implementerLogin) {
-		throw new Error(
-			`Failed to resolve GitHub identity for implementer token in project '${project.id}'`,
-		);
-	}
-	if (!reviewerLogin) {
+	const reviewer = await getGitHubUserForToken(await getPersonaTokenOrNull(project, 'reviewer'));
+	if (!reviewer) {
 		throw new Error(
 			`Failed to resolve GitHub identity for reviewer token in project '${project.id}'`,
 		);
 	}
 
-	const identities: PersonaIdentities = {
-		implementer: implementerLogin,
-		reviewer: reviewerLogin,
-	};
-
-	logger.debug('Resolved persona identities', {
-		projectId: project.id,
-		implementer: implementerLogin,
-		reviewer: reviewerLogin,
-	});
-
-	personaIdentityCache.set(project.id, {
-		value: identities,
+	logger.debug('Resolved reviewer identity', { projectId: project.id, reviewer });
+	reviewerIdentityCache.set(project.id, {
+		value: reviewer,
 		expiresAt: Date.now() + PERSONA_CACHE_TTL_MS,
 	});
-	return identities;
+	return reviewer;
 }
 
 /** @internal Visible for testing only — clears the per-project identity cache. */
 export function _resetPersonaIdentityCache(): void {
-	personaIdentityCache.clear();
+	reviewerIdentityCache.clear();
 }
-
-// ============================================================================
-// Bot detection (loop prevention)
-// ============================================================================
 
 /**
- * Whether a GitHub login belongs to either SWARM persona. The `[bot]`-suffixed
- * forms cover GitHub App identities, which surface with that suffix on events.
+ * Whether a GitHub login is the reviewer identity. The `[bot]`-suffixed form covers
+ * a GitHub App identity, which surfaces with that suffix on events.
  */
-export function isSwarmBot(login: string, identities: PersonaIdentities): boolean {
-	return (
-		login === identities.implementer ||
-		login === identities.reviewer ||
-		login === `${identities.implementer}[bot]` ||
-		login === `${identities.reviewer}[bot]`
-	);
-}
-
-/** Which persona a login belongs to, or `null` if it isn't a SWARM persona. */
-export function getPersonaForLogin(
-	login: string,
-	identities: PersonaIdentities,
-): GitHubPersona | null {
-	if (login === identities.implementer || login === `${identities.implementer}[bot]`) {
-		return 'implementer';
-	}
-	if (login === identities.reviewer || login === `${identities.reviewer}[bot]`) {
-		return 'reviewer';
-	}
-	return null;
+export function isReviewerLogin(login: string, reviewer: string): boolean {
+	return login === reviewer || login === `${reviewer}[bot]`;
 }

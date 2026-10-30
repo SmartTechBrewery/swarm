@@ -3,7 +3,7 @@
  * prevention (`SCMProvider.isSwarmGeneratedEvent`, issue #443).
  *
  * **Why not the comment's author.** SWARM used to answer this by matching the
- * comment's author against its own persona logins (`isSwarmBot`). Under the
+ * comment's author against its own persona logins (the retired `isSwarmBot`). Under the
  * federated model (ADR-004 §2, issue #396) the implementer credential is the
  * *worker operator's own* GitHub token, so the author of a SWARM comment is a
  * plain user account: the gate started dropping that operator's hand-written

@@ -25,7 +25,7 @@ type DiscoveringProvider = PMProvider & { discover: NonNullable<PMProvider['disc
  * Discovery runs on the **project's own PM credential** (the roles its provider
  * declares under `credentials.pm`, resolved from the encrypted secret store —
  * issue #537), not on a worker-local SCM identity: the browser never supplies a
- * token, and the API host needs no `SWARM_OPERATOR_GH_TOKEN` to map a board. A
+ * token, and the API host needs no source-control credential to map a board. A
  * resolved board catalogue is still a privileged read of the provider account, so
  * every procedure requires `projectAdmin` (the same boundary as editing config);
  * a non-member gets NOT_FOUND, so a private project's existence never leaks.

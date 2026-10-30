@@ -10,6 +10,7 @@ import {
 	writeProjectCredential,
 } from '../../../src/db/repositories/credentialsRepository.js';
 import { projectCredentials } from '../../../src/db/schema/projectCredentials.js';
+import { withOperatorCredential } from '../../../src/scm/operator-credential.js';
 import { truncateAll } from '../helpers/db.js';
 import { seedProject } from '../helpers/seed.js';
 
@@ -122,11 +123,16 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('credentialsRepository (in
 			expect(await getWebhookSecretOrNull(project, 'github')).toBe('hmac-secret');
 		});
 
-		it('resolves the implementer token from the operator env var, not project credentials', async () => {
-			vi.stubEnv('SWARM_OPERATOR_GH_TOKEN', 'operator-token');
+		it('resolves the implementer only from the operator credential in scope (issue #1249)', async () => {
+			vi.stubEnv('SWARM_OPERATOR_GH_TOKEN', 'retired-token');
 			const project = await seedProject({ id: 'swarm-op', repo: 'SmartTechBrewery/swarm-op' });
 
-			expect(await getPersonaTokenOrNull(project, 'implementer')).toBe('operator-token');
+			expect(await getPersonaTokenOrNull(project, 'implementer')).toBeNull();
+			expect(
+				await withOperatorCredential('operator-token', () =>
+					getPersonaTokenOrNull(project, 'implementer'),
+				),
+			).toBe('operator-token');
 		});
 
 		it('resolves the reviewer token to null when the referenced credential is not stored', async () => {

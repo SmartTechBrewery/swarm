@@ -53,8 +53,8 @@ export const azureDevOpsScmManifest: SCMProviderManifest = {
 	// the password itself travels under.
 	runtimeReady: true,
 	// Azure DevOps' own reference names for the contract's two credentials (issue
-	// #628's per-provider shape), spelled like the sibling operator variable
-	// `SWARM_OPERATOR_AZURE_DEVOPS_TOKEN`. `webhookSecret` is the password a service
+	// #628's per-provider shape), in the `<PROVIDER>_TOKEN_REVIEWER` form GitHub's uses.
+	// `webhookSecret` is the password a service
 	// hook sends as HTTP basic auth (`./webhook.ts`), not an HMAC key. `instanceDefault`
 	// on `reviewer` follows issue #778's installation-wide rule, offered now that this
 	// manifest is runtime-ready (`listInstanceDefaultScmRoles`).

@@ -28,7 +28,7 @@ import { authedProcedure, router } from '../trpc.js';
  * **One procedure per provider, not one generalised over the registry**
  * (ai/RULES.md §2 names this as a deliberate exception): the caller has a pasted
  * secret and a provider *name* but no project yet, so there is nothing to resolve a
- * `SCMProvider` from — `hasIntegration`/`resolvePersonaIdentities` both take a
+ * `SCMProvider` from — `hasIntegration`/`resolveReviewerIdentity` both take a
  * `ProjectConfig`. Bitbucket joined GitHub with issue #618, GitLab with issue #619,
  * and Azure DevOps with issue #1089 phase 6/6, each when it became runtime-selectable.
  *

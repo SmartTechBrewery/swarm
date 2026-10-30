@@ -1878,6 +1878,7 @@ const MERGE_TERMINAL_LABELS: Record<string, string> = {
 	unsupported: 'Merge automation unsupported',
 	'retry-exhausted': 'Automatic merge retry budget exhausted',
 	'provider-error-exhausted': 'The source-control provider kept failing the merge',
+	'no-operator-credential': 'No operator credential to merge as',
 };
 
 /** Heading for each *waiting* merge-automation outcome — the ones a later attempt overwrites. */

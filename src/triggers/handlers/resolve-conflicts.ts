@@ -151,7 +151,7 @@ async function checkCatchUp(
 ): Promise<TriggerResult | null> {
 	const prNumber = ctx.event.workItemId;
 	if (!prNumber) return null;
-	const pr = await ctx.scm.getPullRequest(ctx.project, Number(prNumber), 'implementer');
+	const pr = await ctx.scm.getPullRequest(ctx.project, Number(prNumber), 'reviewer');
 	if (pr.state !== 'open') {
 		logger.info(
 			'resolve-conflicts: catch-up requested for a pull request that is closed — skipping',

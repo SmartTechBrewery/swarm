@@ -306,7 +306,7 @@ describe('resolve-conflicts trigger: merge automation catch-up', () => {
 	it('dispatches a catch-up pass pinned to the approved head and claims its state', async () => {
 		const result = await createResolveConflictsTrigger().handle(catchUpEvent);
 
-		expect(getPullRequest).toHaveBeenCalledWith(project, 42, 'implementer');
+		expect(getPullRequest).toHaveBeenCalledWith(project, 42, 'reviewer');
 		expect(claimConflictResolution).toHaveBeenCalledWith(
 			'acme/widgets:42:approved1:base456',
 			catchUpEvent.dispatchId,

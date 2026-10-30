@@ -78,13 +78,11 @@
  *
  * **Provider cost.** One pull-request list read per repository per pass, plus one
  * aggregate-checks read only for a pull request that is genuinely unreviewed at
- * its head. In steady state the per-PR call count is zero. The list read runs
- * under the **implementer** persona — i.e. the router's own
- * `SWARM_OPERATOR_GH_TOKEN` (`src/integrations/scm/github/personas.ts`) — the
- * same credential the `resolve-conflicts` fan-out reads it with, because
- * `listConflictCandidates` is the seam being reused. A router without it degrades
- * to a logged warning per pass and no recovery; widening the seam's persona is
- * out of scope here.
+ * its head. In steady state the per-PR call count is zero. Both reads run as the
+ * project's **reviewer** credential — `listConflictCandidates` reads as it, the
+ * same seam the `resolve-conflicts` fan-out uses — so the sweep needs no operator
+ * token of the control plane's own (issue #1249). A project whose reviewer
+ * credential is missing degrades to a logged warning per pass for that repository.
  *
  * **Known limitation, stated rather than fixed:** `PullRequestDetails` carries no
  * draft flag, so a SWARM-managed pull request converted back to draft is not

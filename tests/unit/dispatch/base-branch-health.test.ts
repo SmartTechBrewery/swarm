@@ -126,8 +126,8 @@ describe('readBaseBranchHealth', () => {
 			status: 'green',
 			headSha: 'base-head-sha',
 		});
-		expect(getBranchHead).toHaveBeenCalledWith(PROJECT, PROJECT.baseBranch, 'implementer');
-		expect(getAggregateCheckStatus).toHaveBeenCalledWith(PROJECT, 'base-head-sha', 'implementer');
+		expect(getBranchHead).toHaveBeenCalledWith(PROJECT, PROJECT.baseBranch, 'reviewer');
+		expect(getAggregateCheckStatus).toHaveBeenCalledWith(PROJECT, 'base-head-sha', 'reviewer');
 	});
 
 	// The branch is a parameter, not `project.baseBranch`: issue #873 asks about
@@ -136,8 +136,8 @@ describe('readBaseBranchHealth', () => {
 	it('reads the branch it is given rather than the project base', async () => {
 		await readBaseBranchHealth(PROJECT, SCM, 'release/1.0');
 
-		expect(getBranchHead).toHaveBeenCalledWith(PROJECT, 'release/1.0', 'implementer');
-		expect(getBranchHead).not.toHaveBeenCalledWith(PROJECT, PROJECT.baseBranch, 'implementer');
+		expect(getBranchHead).toHaveBeenCalledWith(PROJECT, 'release/1.0', 'reviewer');
+		expect(getBranchHead).not.toHaveBeenCalledWith(PROJECT, PROJECT.baseBranch, 'reviewer');
 	});
 
 	it('reports red with exactly the failing check names', async () => {
@@ -244,12 +244,8 @@ describe('sweepBaseBranchHealth', () => {
 		it('comments once on the pull request whose merge produced the head', async () => {
 			await sweepBaseBranchHealth();
 
-			expect(listPullRequestsForCommit).toHaveBeenCalledWith(
-				PROJECT,
-				'base-head-sha',
-				'implementer',
-			);
-			expect(deliveryProvider).toHaveBeenCalledWith(PROJECT, 'implementer');
+			expect(listPullRequestsForCommit).toHaveBeenCalledWith(PROJECT, 'base-head-sha', 'reviewer');
+			expect(deliveryProvider).toHaveBeenCalledWith(PROJECT, 'reviewer');
 			expect(postComment).toHaveBeenCalledTimes(1);
 			expect(postComment.mock.calls[0][0]).toMatchObject({
 				prNumber: 77,

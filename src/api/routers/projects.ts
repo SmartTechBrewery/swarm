@@ -77,9 +77,9 @@ export const DEFAULT_PM_CONFIG: ProjectPm = githubProjectsBlankPm;
  * {@link defaultPmCredentialReferences}, read off the manifest rather than hardcoded,
  * so a project created for another provider seeds *its* keys with no edit here.
  *
- * The implementer persona is intentionally absent — it resolves from the worker-local
- * `SWARM_OPERATOR_GH_TOKEN` (and its Bitbucket/GitLab siblings), not from
- * `project_credentials` (issue #396). An unregistered provider seeds nothing.
+ * The implementer persona is intentionally absent — it is the stored credential of the
+ * operator whose worker produced a pull request (issues #765, #1249), not a
+ * `project_credentials` entry. An unregistered provider seeds nothing.
  */
 function defaultScmCredentialReferences(scm: ScmType): ScmCredentialReferencesByProvider {
 	const roles = getSCMProvider(scm)?.credentialRoles ?? [];

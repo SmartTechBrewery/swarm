@@ -14,26 +14,19 @@ import { getGitLabUserForToken } from '@/integrations/scm/gitlab/client.js';
 import { getGitLabTokenOrNull } from '@/integrations/scm/gitlab/credentials.js';
 import {
 	_resetGitLabPersonaIdentityCache,
-	getGitLabPersonaForLogin,
-	isSwarmGitLabActor,
-	resolveGitLabPersonaIdentities,
+	isGitLabReviewer,
+	resolveGitLabReviewerIdentity,
 } from '@/integrations/scm/gitlab/personas.js';
-import type { ScmPersonaIdentities } from '@/scm/types.js';
 
-const IDENTITIES: ScmPersonaIdentities = { implementer: 'swarm-impl', reviewer: 'swarm-rev' };
 const project = createMockProjectConfig();
 
-/** Both personas resolve to a token, and each token to its own username. */
+/** The reviewer resolves to a token, and that to its own username. */
 function stubHappyPath(): void {
-	vi.mocked(getGitLabTokenOrNull).mockImplementation(async (_p, persona) =>
-		persona === 'implementer' ? 'token-impl' : 'token-rev',
-	);
-	vi.mocked(getGitLabUserForToken).mockImplementation(async (token) =>
-		token === 'token-impl' ? 'swarm-impl' : 'swarm-rev',
-	);
+	vi.mocked(getGitLabTokenOrNull).mockResolvedValue('token-rev');
+	vi.mocked(getGitLabUserForToken).mockResolvedValue('swarm-rev');
 }
 
-describe('gitlab personas', () => {
+describe('gitlab reviewer identity', () => {
 	beforeEach(() => {
 		_resetGitLabPersonaIdentityCache();
 		vi.mocked(getGitLabTokenOrNull).mockReset();
@@ -44,95 +37,61 @@ describe('gitlab personas', () => {
 		vi.useRealTimers();
 	});
 
-	describe('isSwarmGitLabActor', () => {
-		it('recognizes both persona usernames', () => {
-			expect(isSwarmGitLabActor('swarm-impl', IDENTITIES)).toBe(true);
-			expect(isSwarmGitLabActor('swarm-rev', IDENTITIES)).toBe(true);
+	describe('isGitLabReviewer', () => {
+		it('recognizes the reviewer username, case-insensitively', () => {
+			expect(isGitLabReviewer('swarm-rev', 'swarm-rev')).toBe(true);
+			expect(isGitLabReviewer('SWARM-REV', 'swarm-rev')).toBe(true);
 		});
 
-		it('matches case-insensitively — loop prevention must fail closed', () => {
-			expect(isSwarmGitLabActor('Swarm-Impl', IDENTITIES)).toBe(true);
-		});
-
-		it('does not flag a human username', () => {
-			expect(isSwarmGitLabActor('some-human', IDENTITIES)).toBe(false);
+		it('does not match an operator account or a human', () => {
+			expect(isGitLabReviewer('operator-alice', 'swarm-rev')).toBe(false);
+			expect(isGitLabReviewer('some-human', 'swarm-rev')).toBe(false);
 		});
 	});
 
-	describe('getGitLabPersonaForLogin', () => {
-		it('maps each persona, case-insensitively', () => {
-			expect(getGitLabPersonaForLogin('swarm-impl', IDENTITIES)).toBe('implementer');
-			expect(getGitLabPersonaForLogin('SWARM-REV', IDENTITIES)).toBe('reviewer');
-		});
-
-		it('returns null for a username that is neither persona', () => {
-			expect(getGitLabPersonaForLogin('some-human', IDENTITIES)).toBeNull();
-		});
-	});
-
-	describe('resolveGitLabPersonaIdentities', () => {
-		it('resolves both persona usernames from their own tokens', async () => {
+	describe('resolveGitLabReviewerIdentity', () => {
+		it('resolves the reviewer from its own token alone — no implementer credential', async () => {
 			stubHappyPath();
 
-			await expect(resolveGitLabPersonaIdentities(project)).resolves.toEqual(IDENTITIES);
+			await expect(resolveGitLabReviewerIdentity(project)).resolves.toBe('swarm-rev');
+			expect(getGitLabTokenOrNull).toHaveBeenCalledWith(project, 'reviewer');
+			expect(getGitLabTokenOrNull).not.toHaveBeenCalledWith(project, 'implementer');
 		});
 
 		it('caches per project — a second call does not re-resolve', async () => {
 			stubHappyPath();
 
-			await resolveGitLabPersonaIdentities(project);
-			const callsAfterFirst = vi.mocked(getGitLabUserForToken).mock.calls.length;
-			await resolveGitLabPersonaIdentities(project);
+			await resolveGitLabReviewerIdentity(project);
+			await resolveGitLabReviewerIdentity(project);
 
-			expect(vi.mocked(getGitLabUserForToken).mock.calls.length).toBe(callsAfterFirst);
+			expect(vi.mocked(getGitLabUserForToken)).toHaveBeenCalledTimes(1);
 		});
 
 		it('re-resolves once the 60s TTL has expired', async () => {
 			stubHappyPath();
 			vi.useFakeTimers();
 
-			await resolveGitLabPersonaIdentities(project);
+			await resolveGitLabReviewerIdentity(project);
 			vi.advanceTimersByTime(60_001);
-			await resolveGitLabPersonaIdentities(project);
+			await resolveGitLabReviewerIdentity(project);
 
-			expect(vi.mocked(getGitLabUserForToken)).toHaveBeenCalledTimes(4);
+			expect(vi.mocked(getGitLabUserForToken)).toHaveBeenCalledTimes(2);
 		});
 
-		it('re-resolves after the test-only cache reset', async () => {
-			stubHappyPath();
-
-			await resolveGitLabPersonaIdentities(project);
-			_resetGitLabPersonaIdentityCache();
-			await resolveGitLabPersonaIdentities(project);
-
-			expect(vi.mocked(getGitLabUserForToken)).toHaveBeenCalledTimes(4);
-		});
-
-		it('fails closed when the implementer identity cannot be resolved', async () => {
+		it('fails closed when the reviewer identity cannot be resolved', async () => {
 			vi.mocked(getGitLabTokenOrNull).mockResolvedValue(null);
 			vi.mocked(getGitLabUserForToken).mockResolvedValue(null);
 
-			await expect(resolveGitLabPersonaIdentities(project)).rejects.toThrow(/implementer/);
-		});
-
-		it('fails closed when only the reviewer identity is missing', async () => {
-			vi.mocked(getGitLabTokenOrNull).mockImplementation(async (_p, persona) =>
-				persona === 'implementer' ? 'token-impl' : null,
-			);
-			vi.mocked(getGitLabUserForToken).mockImplementation(async (token) =>
-				token === 'token-impl' ? 'swarm-impl' : null,
-			);
-
-			await expect(resolveGitLabPersonaIdentities(project)).rejects.toThrow(/reviewer/);
+			await expect(resolveGitLabReviewerIdentity(project)).rejects.toThrow(/reviewer/);
 		});
 
 		it('does not cache a failure — the next call retries', async () => {
 			vi.mocked(getGitLabTokenOrNull).mockResolvedValue(null);
 			vi.mocked(getGitLabUserForToken).mockResolvedValue(null);
-			await expect(resolveGitLabPersonaIdentities(project)).rejects.toThrow();
+			await expect(resolveGitLabReviewerIdentity(project)).rejects.toThrow();
 
 			stubHappyPath();
-			await expect(resolveGitLabPersonaIdentities(project)).resolves.toEqual(IDENTITIES);
+			await expect(resolveGitLabReviewerIdentity(project)).resolves.toBe('swarm-rev');
 		});
 	});
 });

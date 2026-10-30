@@ -72,17 +72,15 @@ import { decideAggregateCheckOutcome } from '../triggers/handlers/aggregate-chec
 export const BASE_BRANCH_HEALTH_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 
 /**
- * The persona every read in this sweep authenticates as.
+ * The persona every read in this sweep authenticates as — and the red-base notice
+ * is posted as.
  *
- * Stated once and passed explicitly, because the three contract methods used here
- * disagree on their own defaults — `listPullRequestsForCommit` and
- * `getAggregateCheckStatus` default to the **reviewer**, `listConflictCandidates`
- * hard-codes the **implementer** — so leaving it implicit would have one pass
- * authenticate as two different accounts. Implementer is the credential the
- * router actually holds (`SWARM_OPERATOR_GH_TOKEN`) and the one the unreviewed-PR
- * sweep beside this reads with.
+ * Stated once and passed explicitly, so one pass never authenticates as two
+ * different accounts whatever a contract method's own default is. The reviewer,
+ * because it is the credential the control plane holds for every read it makes and
+ * the identity every notice it posts speaks as (issue #1249).
  */
-const SWEEP_PERSONA = 'implementer' as const;
+const SWEEP_PERSONA = 'reviewer' as const;
 
 /** What the base branch's own CI says right now. */
 export type BaseBranchHealth =

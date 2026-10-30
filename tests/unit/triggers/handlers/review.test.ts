@@ -61,7 +61,6 @@ vi.mock('@/triggers/respond-to-ci-attempts.js', () => ({
 const {
 	getAggregateCheckStatus,
 	scheduleCoalescedJob,
-	hasPersonaToken,
 	getPullRequest,
 	commentOnPullRequest,
 	getBranchHead,
@@ -69,7 +68,6 @@ const {
 } = vi.hoisted(() => ({
 	getAggregateCheckStatus: vi.fn(),
 	scheduleCoalescedJob: vi.fn(),
-	hasPersonaToken: vi.fn(),
 	getPullRequest: vi.fn(),
 	commentOnPullRequest: vi.fn(),
 	// The base-branch health read the red path takes before attributing a failure
@@ -91,7 +89,6 @@ const deliveryProvider = vi.fn(
 
 const SCM = createFakeScmProvider({
 	getAggregateCheckStatus,
-	hasPersonaToken,
 	getPullRequest,
 	commentOnPullRequest,
 	getBranchHead,
@@ -239,8 +236,6 @@ beforeEach(() => {
 	hasCiNoFixRecovery.mockResolvedValue(false);
 	recoverAdjudicatedApprovedHead.mockReset();
 	recoverAdjudicatedApprovedHead.mockResolvedValue('rerun-requested');
-	hasPersonaToken.mockReset();
-	hasPersonaToken.mockResolvedValue(true);
 	getPullRequest.mockReset();
 	// `issue-42` matches `createMockProjectConfig()`'s `branchPrefix`, so the
 	// ownership gate resolves this PR to work item 42. `authorLogin` is a plain
@@ -3192,7 +3187,7 @@ describe('review trigger — a red the base branch explains (issue #873)', () =>
 		it('comments once, naming the base branch, its head and the shared checks', async () => {
 			await handler.handle(ctx(checks));
 
-			expect(deliveryProvider).toHaveBeenCalledWith(PROJECT, 'implementer');
+			expect(deliveryProvider).toHaveBeenCalledWith(PROJECT, 'reviewer');
 			expect(deliveryPostComment).toHaveBeenCalledTimes(1);
 			const posted = deliveryPostComment.mock.calls[0][0];
 			expect(posted.prNumber).toBe(9);
@@ -3291,8 +3286,8 @@ describe('review trigger — a red the base branch explains (issue #873)', () =>
 			});
 
 			expect(await handler.handle(ctx(checks))).toMatchObject({ phase: 'respond-to-ci' });
-			expect(getBranchHead).toHaveBeenCalledWith(PROJECT, 'release/1.0', 'implementer');
-			expect(getBranchHead).not.toHaveBeenCalledWith(PROJECT, 'main', 'implementer');
+			expect(getBranchHead).toHaveBeenCalledWith(PROJECT, 'release/1.0', 'reviewer');
+			expect(getBranchHead).not.toHaveBeenCalledWith(PROJECT, 'main', 'reviewer');
 			expect(deliveryPostComment).not.toHaveBeenCalled();
 		});
 

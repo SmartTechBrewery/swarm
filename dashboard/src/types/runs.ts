@@ -582,7 +582,9 @@ export interface RunRow {
 	 * Provider-neutral merge-automation outcome for a completed Review run's
 	 * `approve` verdict (issue #278): one of `merged`/`not-ready`/
 	 * `not-eligible`/`policy-blocked`/`unsupported`/`provider-error`/
-	 * `retry-exhausted`/`provider-error-exhausted`/`queued`. `provider-error` is
+	 * `retry-exhausted`/`provider-error-exhausted`/`queued`/`no-operator-credential`.
+	 * `no-operator-credential` (issue #1249) is terminal: nobody SWARM knows produced
+	 * the pull request, or that worker stores no credential to merge as. `provider-error` is
 	 * transient since issue #923 — an attempt failed and a retry is scheduled — while
 	 * `provider-error-exhausted` is the terminal "the forge kept failing". `queued`
 	 * (issue #1114) is waiting too: another pull request in the repository holds the

@@ -84,6 +84,22 @@ export async function requireWorkerScmCredential({
 }
 
 /**
+ * Why a write made as a worker's operator is refused when that worker has no stored
+ * credential for the project's SCM provider (issues #1152, #1249) — the operator-facing
+ * reason a delivery route answers and a merge, branch update or check re-run records.
+ * Built only from the error's typed fields, so no secret can reach it, and naming both
+ * places an operator can set it.
+ */
+export function missingOperatorCredentialReason(error: MissingWorkerScmCredentialError): string {
+	return (
+		`no operator source-control credential is stored for worker '${error.workerName}' on ` +
+		`${error.scmProviderId} — set it on the worker's dashboard page (/workers/${error.workerId}, ` +
+		`"Operator source-control credential") or with ` +
+		`\`swarm workers set-scm-credential ${error.workerId} ${error.scmProviderId}\``
+	);
+}
+
+/**
  * Which SCM providers this worker actually needs an operator credential for — the
  * providers of the projects it is enrolled in, de-duplicated and in enrollment
  * order. The read behind phase 2/3's dashboard form (issue #766), so the slots it

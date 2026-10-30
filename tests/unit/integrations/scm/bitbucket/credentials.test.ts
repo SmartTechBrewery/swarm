@@ -14,8 +14,8 @@ import '@/integrations/entrypoint.js';
 import {
 	getBitbucketCredential,
 	getBitbucketCredentialOrNull,
-	OPERATOR_BITBUCKET_TOKEN_ENV,
 } from '@/integrations/scm/bitbucket/credentials.js';
+import { withOperatorCredential } from '@/scm/operator-credential.js';
 
 // A project that runs on this provider and stores *its* reviewer reference — never a
 // shared pair, since issue #628 gave each provider its own (`credentials.scm`).
@@ -31,29 +31,32 @@ const project = createMockProjectConfig({
 describe('bitbucket persona credentials', () => {
 	beforeEach(() => {
 		vi.mocked(resolveProjectCredential).mockReset();
-		vi.stubEnv(OPERATOR_BITBUCKET_TOKEN_ENV, '');
 	});
 
 	afterEach(() => {
 		vi.unstubAllEnvs();
 	});
 
-	describe('implementer — the worker-local operator credential', () => {
-		it('resolves from the operator env var, never the credential store', async () => {
-			vi.stubEnv(OPERATOR_BITBUCKET_TOKEN_ENV, ' operator-cred ');
+	describe('implementer — the operator credential in scope (issue #1249)', () => {
+		it('resolves the bound operator credential, never the store or the environment', async () => {
+			vi.stubEnv('SWARM_OPERATOR_BITBUCKET_TOKEN', 'retired-env-value');
 
-			await expect(getBitbucketCredential(project, 'implementer')).resolves.toBe('operator-cred');
+			await expect(
+				withOperatorCredential('operator-cred', () =>
+					getBitbucketCredential(project, 'implementer'),
+				),
+			).resolves.toBe('operator-cred');
 			expect(resolveProjectCredential).not.toHaveBeenCalled();
 		});
 
-		it('returns null from the …OrNull variant when the env var is unset', async () => {
+		it('returns null from the …OrNull variant outside an operator scope', async () => {
 			await expect(getBitbucketCredentialOrNull(project, 'implementer')).resolves.toBeNull();
 		});
 
-		it('throws naming the env var when it is unset', async () => {
-			await expect(getBitbucketCredential(project, 'implementer')).rejects.toThrow(
-				new RegExp(`set ${OPERATOR_BITBUCKET_TOKEN_ENV} on this host`),
-			);
+		it('throws outside an operator scope without suggesting an env var', async () => {
+			const failure = getBitbucketCredential(project, 'implementer');
+			await expect(failure).rejects.toThrow('No Bitbucket implementer credential is in scope');
+			await expect(failure).rejects.not.toThrow(/SWARM_OPERATOR_/);
 		});
 	});
 
