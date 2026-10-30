@@ -789,7 +789,16 @@ dispatch that re-claimed a lapsed key and re-pointed the slot keeps both (issue
 #1105) — **unless the in-process holder's own dispatch
 has already settled** (issue #858), in which case the collision is not a repeated
 delivery but a replacement dispatch racing a job the router has not given up on yet,
-and it waits as `task-in-flight` too. So the two halves of that collision stay
+and it waits as `task-in-flight` too. The in-process claims also record which
+dispatch *attempt* holds them (issue #1208), because `claimDispatch` lets the lease's
+own owner re-claim a `leased` row and the router runs wake jobs concurrently: a
+second delivery of the attempt already executing — the same dispatch id and
+`wakeSeq`, which every hand-back bumps and the claim never does — is dropped at the
+dispatch claim (`dispatch-refused`, `redelivered`) without touching the row or its
+run, so the surviving attempt can still schedule its retry; and a holder on the same
+dispatch id is an earlier attempt still releasing the checkout, which the next
+attempt waits behind as `task-in-flight`. `skipped-duplicate` is therefore only ever
+the verdict for a *different* dispatch of the same phase. So the two halves of that collision stay
 distinguishable on the row; and the collision is read from the dispatch table as
 well as from the worker's in-process map, so the verdict does not depend on which
 worker the dispatch was routed to. Two durable reads answer it, under one wait

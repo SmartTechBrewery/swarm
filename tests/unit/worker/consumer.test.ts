@@ -233,6 +233,17 @@ const claimDispatchForJob = vi.fn(
 			| { claimed: true; dispatch: MockDispatchRow }
 			| { claimed: false; reason: string },
 );
+/**
+ * The harness hands every job `dispatch-1` at `wakeSeq` 0, so two concurrent jobs are
+ * one attempt delivered twice (issue #1208); this makes the next claim a different row
+ * — another dispatch, or the same one's next attempt — instead.
+ */
+const claimNextDispatchAs = (id: string, overrides: Partial<MockDispatchRow> = {}) => {
+	claimDispatchForJob.mockImplementationOnce(async (job: Record<string, unknown>) => ({
+		claimed: true,
+		dispatch: { ...mockDispatchRow(job), id, ...overrides },
+	}));
+};
 const createAndPublishDispatch = vi.fn(async (_input: unknown) => ({
 	dispatch: mockDispatchRow({}),
 	created: true,
@@ -6805,6 +6816,7 @@ describe('processJob', () => {
 			// runPhase, so it has registered taskId 17 as in-flight.
 			await new Promise((r) => setTimeout(r, 0));
 
+			claimNextDispatchAs('dispatch-2');
 			const second = await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 			expect(second).toEqual({ status: 'skipped-in-flight', phase: 'review', taskId: '17' });
@@ -6859,6 +6871,7 @@ describe('processJob', () => {
 
 			// A different taskId must run, not be skipped by task 17's in-flight slot.
 			const other: TriggerResult = { ...REVIEW_TRIGGER, taskId: '18', prNumber: '18' };
+			claimNextDispatchAs('dispatch-2');
 			const second = await processJob(createMockScmWebhookJob(), registryReturning(other));
 
 			expect(second.status).toBe('phase-succeeded');
@@ -6886,6 +6899,7 @@ describe('processJob', () => {
 			);
 			await new Promise((r) => setTimeout(r, 0));
 
+			claimNextDispatchAs('dispatch-2');
 			const implementation = await processJob(
 				createMockPmWebhookJob(),
 				registryReturning({ phase: 'implementation', taskId: '17', workItem }),
@@ -6899,7 +6913,7 @@ describe('processJob', () => {
 			// It waited rather than running into Planning's checkout.
 			expect(phaseCalls).toHaveLength(1);
 			expect(deferDispatchToPending).toHaveBeenCalledWith(
-				'dispatch-1',
+				'dispatch-2',
 				expect.objectContaining({ waitReason: 'task-in-flight' }),
 			);
 			// `skipped-duplicate` stays reserved for a repeated delivery of one phase.
@@ -6954,13 +6968,14 @@ describe('processJob', () => {
 			await new Promise((r) => setTimeout(r, 0));
 
 			// A dispatch that already waited once carries the run row of that wait.
+			claimNextDispatchAs('dispatch-2');
 			const second = await processJob(
 				createMockScmWebhookJob({ runId: 'run-9' }),
 				registryReturning(REVIEW_TRIGGER),
 			);
 
 			expect(second.status).toBe('skipped-in-flight');
-			expect(completeDispatch).toHaveBeenCalledWith('dispatch-1', 'skipped-duplicate');
+			expect(completeDispatch).toHaveBeenCalledWith('dispatch-2', 'skipped-duplicate');
 			expect(completeRun).toHaveBeenCalledWith(
 				'run-9',
 				expect.objectContaining({
@@ -6982,13 +6997,6 @@ describe('processJob', () => {
 		// `skipped-duplicate` and the run settled `failed` on the restart Reset had just
 		// reported. The holder's own dispatch row is what tells the two apart.
 		describe('a replacement dispatch racing a parked job (issue #858)', () => {
-			/** The harness hands every job `dispatch-1`; the *asker* is a different row. */
-			const claimNextDispatchAs = (id: string) => {
-				claimDispatchForJob.mockImplementationOnce(async (job: Record<string, unknown>) => ({
-					claimed: true,
-					dispatch: { ...mockDispatchRow(job), id },
-				}));
-			};
 			/** Park a phase so its task stays claimed in this process's map. */
 			const parkFirstJob = (trigger: TriggerResult) => {
 				let release: (() => void) | undefined;
@@ -7219,12 +7227,6 @@ describe('processJob', () => {
 		// neither ran a Review.
 		describe('a Review dropped as a same-phase duplicate (issue #1105)', () => {
 			const DISPATCH_KEY = `${PROJECT.repo}:17:deadbeef`;
-			const claimNextDispatchAs = (id: string) => {
-				claimDispatchForJob.mockImplementationOnce(async (job: Record<string, unknown>) => ({
-					claimed: true,
-					dispatch: { ...mockDispatchRow(job), id },
-				}));
-			};
 
 			it('hands back the claim and the slot it created, after settling', async () => {
 				findExecutingDispatchForTask.mockResolvedValue({ id: 'other', phase: 'review' });
@@ -7362,6 +7364,211 @@ describe('processJob', () => {
 					expect.anything(),
 					'webhook-dispatch',
 				);
+			});
+		});
+
+		// Issue #1208. `claimDispatch` lets the lease's own owner re-claim a `leased` row,
+		// and the router is one owner running wake jobs concurrently, so two wake jobs for
+		// one dispatch can both claim it. The copy reaching the task claim second read the
+		// entry its own dispatch held as a duplicate phase, completed the dispatch
+		// `skipped-duplicate` and settled the run `failed` — so when the surviving attempt
+		// then deferred, its retry could not be scheduled and the run was left `deferred`
+		// with no dispatch behind it. `wakeSeq` tells one attempt delivered twice from the
+		// dispatch's next attempt: every hand-back bumps it, the claim never does.
+		describe('a second delivery of the same dispatch (issue #1208)', () => {
+			const BLOCKER = {
+				reference: '#319',
+				url: 'https://github.com/o/r/issues/319',
+				title: 'Session auth',
+				open: true,
+				source: 'dependency' as const,
+			} as const;
+			const workItem = createMockWorkItem({ statusId: '61e4505c' });
+			const IMPLEMENTATION: TriggerResult = { phase: 'implementation', taskId: '17', workItem };
+
+			/** Park the phase on a gate, then settle it with `settle`'s outcome. */
+			const gatePhase = (settle: () => Promise<StubPhaseResult>) => {
+				let release: (() => void) | undefined;
+				const gate = new Promise<void>((resolve) => {
+					release = resolve;
+				});
+				phaseImpl = async () => {
+					await gate;
+					return settle();
+				};
+				return () => release?.();
+			};
+
+			afterEach(() => {
+				completeDispatch.mockReset();
+				failDispatch.mockReset();
+				scheduleDispatchRetry.mockReset();
+			});
+
+			it('leaves the surviving attempt to defer with its retry scheduled, the run deferred', async () => {
+				// `dispatch-1` as the real conditional updates treat it: once terminal, a
+				// retry schedule is refused.
+				let terminal = false;
+				completeDispatch.mockImplementation(async (id: string) => {
+					if (id === 'dispatch-1') terminal = true;
+					return true;
+				});
+				failDispatch.mockImplementation(async (id: string) => {
+					if (id === 'dispatch-1') terminal = true;
+					return true;
+				});
+				scheduleDispatchRetry.mockImplementation(
+					async (_id: string, input: { jobPayload: Record<string, unknown> }) =>
+						terminal
+							? (null as unknown as ReturnType<typeof mockDispatchRow>)
+							: { ...mockDispatchRow(input.jobPayload), state: 'retry-scheduled' },
+				);
+				const release = gatePhase(async () => {
+					throw new DependencyBlockedError(workItem, [BLOCKER]);
+				});
+
+				const first = processJob(createMockPmWebhookJob(), registryReturning(IMPLEMENTATION));
+				await new Promise((r) => setTimeout(r, 0));
+
+				const second = await processJob(
+					createMockPmWebhookJob(),
+					registryReturning(IMPLEMENTATION),
+				);
+
+				expect(second).toEqual({ status: 'dispatch-refused', reason: 'redelivered' });
+				expect(completeDispatch).not.toHaveBeenCalled();
+				expect(completeRun).not.toHaveBeenCalledWith(
+					expect.anything(),
+					expect.objectContaining({ status: 'failed' }),
+				);
+				expect(phaseCalls).toHaveLength(1);
+
+				release();
+				const outcome = await first;
+
+				expect(outcome).toMatchObject({ status: 'phase-deferred', dependencyRecheck: true });
+				expect(scheduleDispatchRetry).toHaveBeenCalledExactlyOnceWith(
+					'dispatch-1',
+					expect.objectContaining({ waitReason: 'dependency' }),
+				);
+				// The dispatch backing the run is active again, not completed under it.
+				expect(await scheduleDispatchRetry.mock.results[0]?.value).toMatchObject({
+					state: 'retry-scheduled',
+				});
+				expect(terminal).toBe(false);
+				expect(completeRun).toHaveBeenCalledWith(
+					'run-1',
+					expect.objectContaining({ status: 'deferred' }),
+				);
+			});
+
+			it('drops the redelivery before trigger resolution, touching nothing', async () => {
+				const release = gatePhase(async () => ({ agent: agentResult() }));
+				const seen: TriggerContext[] = [];
+				const onDispatchClaimed = vi.fn();
+				const registry = registryReturning(IMPLEMENTATION, seen);
+
+				const first = processJob(createMockPmWebhookJob(), registry, undefined, undefined, {
+					onDispatchClaimed,
+				});
+				await new Promise((r) => setTimeout(r, 0));
+				const second = await processJob(createMockPmWebhookJob(), registry, undefined, undefined, {
+					onDispatchClaimed,
+				});
+
+				expect(second).toEqual({ status: 'dispatch-refused', reason: 'redelivered' });
+				expect(seen).toHaveLength(1);
+				expect(recordDispatchResolution).toHaveBeenCalledOnce();
+				expect(onDispatchClaimed).toHaveBeenCalledOnce();
+				expect(createRun).toHaveBeenCalledOnce();
+
+				release();
+				await first;
+			});
+
+			it('does not settle a live Review dispatch no-trigger on its redelivery', async () => {
+				// The PR+SHA claim as the SET-NX it is: a second evaluation would decline.
+				const claims = new Set<string>();
+				const registry = createTriggerRegistry();
+				registry.register({
+					name: 'pr-review',
+					description: 'claims the PR+SHA slot',
+					matches: () => true,
+					handle: async () => {
+						const key = `${PROJECT.repo}:17:deadbeef`;
+						if (claims.has(key)) return null;
+						claims.add(key);
+						return REVIEW_TRIGGER;
+					},
+				});
+				const release = gatePhase(async () => ({ agent: agentResult() }));
+
+				const first = processJob(createMockScmWebhookJob(), registry);
+				await new Promise((r) => setTimeout(r, 0));
+				const second = await processJob(createMockScmWebhookJob(), registry);
+
+				expect(second).toEqual({ status: 'dispatch-refused', reason: 'redelivered' });
+				expect(completeDispatch).not.toHaveBeenCalled();
+
+				release();
+				expect((await first).status).toBe('phase-succeeded');
+				expect(completeDispatch).not.toHaveBeenCalledWith(expect.anything(), 'no-trigger');
+				expect(completeDispatch).not.toHaveBeenCalledWith(expect.anything(), 'skipped-duplicate');
+			});
+
+			it("makes the dispatch's next attempt wait for the earlier one to release the checkout", async () => {
+				const release = gatePhase(async () => ({ agent: agentResult() }));
+				const earlier = processJob(createMockPmWebhookJob(), registryReturning(IMPLEMENTATION));
+				await new Promise((r) => setTimeout(r, 0));
+				getDispatchById.mockClear();
+
+				claimNextDispatchAs('dispatch-1', { wakeSeq: 1 });
+				const next = await processJob(createMockPmWebhookJob(), registryReturning(IMPLEMENTATION));
+
+				expect(next).toMatchObject({
+					status: 'phase-deferred',
+					phase: 'implementation',
+					taskId: '17',
+				});
+				expect(deferDispatchToPending).toHaveBeenCalledWith(
+					'dispatch-1',
+					expect.objectContaining({ waitReason: 'task-in-flight' }),
+				);
+				expect(completeRun).toHaveBeenCalledWith(
+					'run-1',
+					expect.objectContaining({
+						status: 'deferred',
+						error: expect.stringContaining('releasing'),
+					}),
+				);
+				expect(completeDispatch).not.toHaveBeenCalledWith(expect.anything(), 'skipped-duplicate');
+				expect(completeRun).not.toHaveBeenCalledWith(
+					expect.anything(),
+					expect.objectContaining({ status: 'failed' }),
+				);
+				// The holder is this dispatch, so its row says nothing about liveness.
+				expect(getDispatchById).not.toHaveBeenCalledWith('dispatch-1');
+				expect(phaseCalls).toHaveLength(1);
+
+				promoteTaskInFlightWaits.mockClear();
+				release();
+				await earlier;
+				expect(promoteTaskInFlightWaits).toHaveBeenCalledWith(PROJECT.id, '17');
+			});
+
+			it('releases the attempt guard once both attempts settle', async () => {
+				const release = gatePhase(async () => ({ agent: agentResult() }));
+				const earlier = processJob(createMockPmWebhookJob(), registryReturning(IMPLEMENTATION));
+				await new Promise((r) => setTimeout(r, 0));
+				claimNextDispatchAs('dispatch-1', { wakeSeq: 1 });
+				await processJob(createMockPmWebhookJob(), registryReturning(IMPLEMENTATION));
+				release();
+				await earlier;
+
+				phaseImpl = async () => ({ agent: agentResult() });
+				const later = await processJob(createMockPmWebhookJob(), registryReturning(IMPLEMENTATION));
+
+				expect(later.status).toBe('phase-succeeded');
 			});
 		});
 
@@ -7704,6 +7911,7 @@ describe('processJob', () => {
 				const review = processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 				await new Promise((r) => setTimeout(r, 0));
 
+				claimNextDispatchAs('dispatch-2');
 				const conflicts = await processJob(
 					createMockScmWebhookJob(),
 					registryReturning(RESOLVE_CONFLICTS_TRIGGER),
@@ -8667,6 +8875,7 @@ describe('processJob', () => {
 			const first = processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 			await new Promise((r) => setTimeout(r, 0));
 
+			claimNextDispatchAs('dispatch-2');
 			await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 			// Only the first (in-flight) run created a row; the skipped duplicate did not.
