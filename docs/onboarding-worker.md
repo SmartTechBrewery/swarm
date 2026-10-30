@@ -247,8 +247,8 @@ second one too (issue #1215). It needs **one SWARM clone per installation**. A
 clone's `.env` names the control plane it serves, and that installation's updates
 move the clone itself to its build
 ([ADR-006](./decisions/ADR-006-unconditional-worker-updates.md)). Pointing the
-existing clone at a second URL is refused (`--control-plane-url` that disagrees
-with its `.env`). Even if it were accepted, the two fleets would keep moving one
+existing clone at a second URL is refused: `workers setup` rejects a
+`--control-plane-url` that disagrees with its `.env`. Even if it were accepted, the two fleets would keep moving one
 checkout to each other's builds.
 
 | Placeholder | Stands for |
@@ -308,10 +308,13 @@ gives it (step 5 above), with this clone's CLI.
 **5. Run every later command for that installation through the same clone:**
 `node ~/code/swarm-two/bin/swarm.js <command>`. An alias in your own shell is a
 convenience, nothing more. Every command run through a clone's `bin/swarm.js`
-takes `SWARM_CONTROL_PLANE_URL` from that clone's `.env` before the environment.
-That covers `login`, every `workers` subcommand, `run list|show|logs` and
-`run:worker`. Nothing has to be exported, and a URL exported for the first
-installation does not redirect it. Bare `swarm` stays the first installation's.
+(`login`, every `workers` subcommand, `run list|show|logs` and `run:worker`)
+falls back to that clone's `.env` for `SWARM_CONTROL_PLANE_URL`, so nothing has to
+be exported. An exported `SWARM_CONTROL_PLANE_URL` still wins over `.env`, which is
+the precedence every command shares ([`cli.md`](./cli.md), issue #1214). So do not
+export the first installation's URL in your shell profile. If it is exported,
+`workers setup` refuses and `login` warns, naming both URLs. The LaunchAgent reads
+only the clone's `.env`. Bare `swarm` stays the first installation's.
 Manage the agent with that clone's installer too:
 `~/code/swarm-two/bin/swarm-worker-agent status|logs|update ~/code/two-project`.
 
@@ -1118,10 +1121,10 @@ where every machine stands, live and across a page reload.
 
 | Symptom | Cause |
 | --- | --- |
-| A `swarm workers` command says "not signed in — run `swarm login`" or "your control-plane session has expired" | Since issue #800 the whole command group authenticates over the network instead of holding `DATABASE_URL`. Run `swarm login` on that machine (`swarm login --status` says who the cached session is); the session lasts `SWARM_SESSION_TTL_HOURS`. |
+| A `swarm workers` command says "not signed in to `<url>` — run `swarm login`" or "your control-plane session at `<url>` has expired" | If `<url>` is not the installation you meant, the URL came from somewhere you did not expect — the environment beats `.env` (see [`docs/cli.md`](./cli.md#invoking-the-cli)). Otherwise: since issue #800 the whole command group authenticates over the network instead of holding `DATABASE_URL`. Run `swarm login` on that machine (`swarm login --status` says who the cached session is); the session lasts `SWARM_SESSION_TTL_HOURS`. |
 | `swarm login` says `the control plane refused the login (HTTP 404)` | `SWARM_CONTROL_PLANE_URL` is reachable but its tunnel has no rule for `/operator/*` yet — an admin-side prerequisite this doc doesn't cover; see [`docs/cloudflare-tunnel.md`](./cloudflare-tunnel.md#the-operator-cli-operator). |
-| A `swarm workers` command says `SWARM_CONTROL_PLANE_URL is unset` | Same cause: the command group needs the router base URL, not a database. `workers register-and-enroll --control-plane-url <url>` writes it into this checkout's `.env` for you; any other subcommand wants it there (the same value the daemon uses) before you re-run. |
-| `register-and-enroll` says `.env already points at <url>, not the requested <other>` | This machine is already onboarded against a different installation, and the command never rewrites a line it did not write. If the machine really is moving, edit `.env` by hand; otherwise drop the flag — an existing assignment is what a second worker on this machine should keep. |
+| A `swarm workers` command says `SWARM_CONTROL_PLANE_URL is unset` | Same cause: the command group needs the router base URL, not a database, and found it neither in the environment nor in this checkout's `.env`. `swarm login --control-plane-url <url>` or `workers register-and-enroll --control-plane-url <url>` writes it into `.env` for you; otherwise put it there (the same value the daemon uses) or export it before you re-run. |
+| `register-and-enroll` or `setup` says `.env already points at <url>, not <other> from …` | This machine is already onboarded against a different installation, and the command never rewrites a line it did not write. If the machine really is moving, edit `.env` by hand; otherwise drop the flag or unset the exported `SWARM_CONTROL_PLANE_URL` (the message says which it came from) — an existing assignment is what a second worker on this machine should keep. |
 | `register-and-enroll` says `.env assigns SWARM_CONTROL_PLANE_URL no value` | The key is there with an empty value, which is neither a URL to keep nor an absence to fill. Put the URL in, or delete the line and re-run with `--control-plane-url`. |
 | `workers set-scm-credential`, `workers remove`, `workers consent` or `workers update-enrollment` says `Worker with ID "…" not found` / `Enrollment with ID "…" not found` for one that exists | All four are strictly the machine owner's since issue #800 — an installation admin gets the same `NOT_FOUND` a stranger does. Sign in as the worker's owner on that machine. |
 | `register-and-enroll` says `You are not a member of project "…"` | The project id is **right** and the enrollment has nothing to do with it — the calling operator simply has no membership row for that project (issue #899; before it, this arrived as an indistinguishable `Project with ID "…" not found` and read as a typo). An instance administrator runs `swarm members add <project-id> <your login handle>` on the control-plane host — that command needs `DATABASE_URL` — then re-run. |

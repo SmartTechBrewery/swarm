@@ -10,16 +10,14 @@ vi.mock('@/cli/_shared/operator-session-cache.js', () => ({
 	readOperatorSessionCache,
 	operatorSessionCachePath,
 }));
+// The URL resolver also reads this checkout's `.env` (issue #1214). Stubbed so a
+// developer's own `.env` never decides a test: each one states what it holds.
+vi.mock('node:fs', async (importOriginal) => ({
+	...(await importOriginal<typeof import('node:fs')>()),
+	readFileSync: vi.fn(),
+}));
 
-// The real read would consult this checkout's own `.env`, which on a developer's
-// machine names a live installation.
-const { installationControlPlaneUrl } = vi.hoisted(() => ({
-	installationControlPlaneUrl: vi.fn<() => string | undefined>(),
-}));
-vi.mock('@/cli/_shared/control-plane-env.js', () => ({
-	CONTROL_PLANE_ENV: 'SWARM_CONTROL_PLANE_URL',
-	installationControlPlaneUrl,
-}));
+import { readFileSync } from 'node:fs';
 
 import {
 	createOperatorClient,
@@ -145,7 +143,7 @@ describe('createOperatorClient', () => {
 	it('turns UNAUTHORIZED into the `swarm login` hint', async () => {
 		const { client: api } = client(trpcError(401, 'UNAUTHORIZED', 'UNAUTHORIZED'));
 		await expect(api.query('workers.list', undefined, passthrough)).rejects.toThrow(
-			'your control-plane session has expired — run `swarm login`',
+			'your control-plane session at https://swarm.example.com has expired — run `swarm login`',
 		);
 	});
 
@@ -209,27 +207,32 @@ describe('createOperatorClient', () => {
 
 describe('requireOperatorSession', () => {
 	const ORIGINAL = process.env.SWARM_CONTROL_PLANE_URL;
+	const OTHER = 'https://other.example.com';
+	const SESSION = {
+		controlPlaneUrl: CONTROL_PLANE,
+		token: TOKEN,
+		userId: 'user-1',
+		identifier: 'ada@example.com',
+		expiresAt: '2026-09-04T00:00:00.000Z',
+		createdAt: '2026-08-28T00:00:00.000Z',
+	};
 
 	beforeEach(() => {
-		installationControlPlaneUrl.mockReturnValue(undefined);
+		vi.mocked(readFileSync).mockImplementation(() => {
+			throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+		});
 	});
 
 	afterEach(() => {
 		if (ORIGINAL === undefined) delete process.env.SWARM_CONTROL_PLANE_URL;
 		else process.env.SWARM_CONTROL_PLANE_URL = ORIGINAL;
 		readOperatorSessionCache.mockReset();
+		vi.mocked(readFileSync).mockReset();
 	});
 
 	it('resolves the control plane and the cached token', () => {
 		process.env.SWARM_CONTROL_PLANE_URL = CONTROL_PLANE;
-		readOperatorSessionCache.mockReturnValue({
-			controlPlaneUrl: CONTROL_PLANE,
-			token: TOKEN,
-			userId: 'user-1',
-			identifier: 'ada@example.com',
-			expiresAt: '2026-09-04T00:00:00.000Z',
-			createdAt: '2026-08-28T00:00:00.000Z',
-		});
+		readOperatorSessionCache.mockReturnValue(SESSION);
 		expect(requireOperatorSession()).toEqual({
 			session: { controlPlaneUrl: CONTROL_PLANE, token: TOKEN, identifier: 'ada@example.com' },
 		});
@@ -240,7 +243,28 @@ describe('requireOperatorSession', () => {
 		expect(requireOperatorSession()).toEqual({
 			error: expect.stringContaining('SWARM_CONTROL_PLANE_URL is unset'),
 		});
+		expect(requireOperatorSession()).toEqual({ error: expect.stringContaining('.env') });
 		expect(readOperatorSessionCache).not.toHaveBeenCalled();
+	});
+
+	// `swarm workers list` right after a `swarm login` that left the URL in `.env`,
+	// with nothing exported — the acceptance criterion of issue #1214.
+	it("falls back to the checkout's .env when nothing is exported", () => {
+		delete process.env.SWARM_CONTROL_PLANE_URL;
+		vi.mocked(readFileSync).mockReturnValue(`SWARM_CONTROL_PLANE_URL=${CONTROL_PLANE}\n`);
+		readOperatorSessionCache.mockReturnValue(SESSION);
+		expect(requireOperatorSession()).toEqual({
+			session: { controlPlaneUrl: CONTROL_PLANE, token: TOKEN, identifier: 'ada@example.com' },
+		});
+		expect(readOperatorSessionCache).toHaveBeenCalledWith(CONTROL_PLANE);
+	});
+
+	it('prefers an exported URL over .env, as every other command does', () => {
+		process.env.SWARM_CONTROL_PLANE_URL = OTHER;
+		vi.mocked(readFileSync).mockReturnValue(`SWARM_CONTROL_PLANE_URL=${CONTROL_PLANE}\n`);
+		readOperatorSessionCache.mockReturnValue(SESSION);
+		requireOperatorSession();
+		expect(readOperatorSessionCache).toHaveBeenCalledWith(OTHER);
 	});
 
 	it('rejects a control-plane URL that is not http(s)', () => {
@@ -257,48 +281,8 @@ describe('requireOperatorSession', () => {
 	it('points an operator with no cached session at `swarm login`', () => {
 		process.env.SWARM_CONTROL_PLANE_URL = CONTROL_PLANE;
 		readOperatorSessionCache.mockReturnValue(null);
-		expect(requireOperatorSession()).toEqual({ error: 'not signed in — run `swarm login`' });
-	});
-
-	// Issue #1215: the installation's own `.env` decides, the same precedence
-	// `swarm login` has, so a second SWARM clone reaches its own installation.
-	describe("with this installation's .env naming a control plane", () => {
-		const OTHER = 'https://other.example.com';
-		const session = (controlPlaneUrl: string) => ({
-			controlPlaneUrl,
-			token: TOKEN,
-			userId: 'user-1',
-			identifier: 'ada@example.com',
-			expiresAt: '2026-09-04T00:00:00.000Z',
-			createdAt: '2026-08-28T00:00:00.000Z',
-		});
-
-		it('prefers it over a different ambient URL', () => {
-			installationControlPlaneUrl.mockReturnValue(OTHER);
-			process.env.SWARM_CONTROL_PLANE_URL = CONTROL_PLANE;
-			readOperatorSessionCache.mockReturnValue(session(OTHER));
-			expect(requireOperatorSession()).toEqual({
-				session: { controlPlaneUrl: OTHER, token: TOKEN, identifier: 'ada@example.com' },
-			});
-			expect(readOperatorSessionCache).toHaveBeenCalledWith(OTHER);
-		});
-
-		it('needs nothing exported', () => {
-			installationControlPlaneUrl.mockReturnValue(OTHER);
-			delete process.env.SWARM_CONTROL_PLANE_URL;
-			readOperatorSessionCache.mockReturnValue(session(OTHER));
-			expect(requireOperatorSession()).toEqual({
-				session: { controlPlaneUrl: OTHER, token: TOKEN, identifier: 'ada@example.com' },
-			});
-		});
-
-		it('validates it like an ambient one', () => {
-			installationControlPlaneUrl.mockReturnValue('ftp://swarm.example.com');
-			process.env.SWARM_CONTROL_PLANE_URL = CONTROL_PLANE;
-			expect(requireOperatorSession()).toEqual({
-				error: expect.stringContaining('must be an http(s) URL'),
-			});
-			expect(readOperatorSessionCache).not.toHaveBeenCalled();
+		expect(requireOperatorSession()).toEqual({
+			error: 'not signed in to https://swarm.example.com — run `swarm login`',
 		});
 	});
 

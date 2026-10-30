@@ -250,7 +250,9 @@ describe('the operator CLI client against this mount', () => {
 				undefined,
 				(value) => value,
 			),
-		).rejects.toThrow('your control-plane session has expired — run `swarm login`');
+		).rejects.toThrow(
+			'your control-plane session at http://control-plane.test has expired — run `swarm login`',
+		);
 	});
 
 	// A namespace this router deliberately does not carry reads to the CLI as

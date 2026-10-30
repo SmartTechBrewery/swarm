@@ -6,8 +6,9 @@
  * possible on the control-plane host. This one is the opposite by design: it holds
  * **no** `DATABASE_URL` and imports nothing from `../../db/*`, talking to the
  * router's `/operator/session` routes (`../../router/operator-session.ts`) over
- * `SWARM_CONTROL_PLANE_URL` exactly as the worker daemon does. That is what makes
- * it usable from a machine that is not the control plane.
+ * `SWARM_CONTROL_PLANE_URL` exactly as the worker daemon does — resolved by the
+ * precedence every command shares (`../_shared/control-plane-env.ts`). That is
+ * what makes it usable from a machine that is not the control plane.
  *
  * The password is read without echo on a TTY, or from stdin so a script can pipe
  * it (`../_shared/secret-input.ts`) — never from argv, where it would reach the
@@ -30,7 +31,7 @@
 import { createInterface } from 'node:readline/promises';
 import { parseArgs } from 'node:util';
 import { z } from 'zod';
-import { ensureControlPlaneUrl } from '../_shared/control-plane-env.js';
+import { CONTROL_PLANE_ENV, ensureControlPlaneUrl } from '../_shared/control-plane-env.js';
 import {
 	clearOperatorSessionCache,
 	type OperatorSessionCache,
@@ -40,8 +41,6 @@ import {
 } from '../_shared/operator-session-cache.js';
 import * as out from '../_shared/output.js';
 import { promptHidden, readStdin } from '../_shared/secret-input.js';
-
-const CONTROL_PLANE_ENV = 'SWARM_CONTROL_PLANE_URL';
 
 /** Long enough for a scrypt verification on a loaded host, short enough to fail rather than hang. */
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -56,10 +55,11 @@ Usage:
   --identifier <id>  The login handle to authenticate as. Prompted for on a TTY;
                      required when stdin is a pipe (which carries the password).
   --control-plane-url <url>
-                     The installation to sign in to, written to this checkout's
-                     .env when it carries no ${CONTROL_PLANE_ENV}. An
-                     existing assignment is kept and never rewritten, so this is
-                     only needed once per machine.
+                     The installation to sign in to. Overrides
+                     ${CONTROL_PLANE_ENV} in the environment, which
+                     overrides this checkout's .env. Written to .env only when
+                     it carries no assignment; a different one already there is
+                     kept, and login warns that it is using another installation.
   --status           Report who the cached session resolves to, by asking the
                      control plane. Exits non-zero when there is no live session.
   --logout           Revoke the session on the control plane and delete the local
@@ -69,8 +69,9 @@ The password is typed without echo on a TTY, or read from stdin otherwise. It is
 never accepted as an argument, never printed, and never logged; neither is the
 session token, which is cached under ~/.swarm/operator-sessions/ at 700/600.
 
-Needs ${CONTROL_PLANE_ENV} — the same router base URL the worker uses — and no
-DATABASE_URL. A single-user installation is not exempt: SWARM_SINGLE_USER_MODE is
+Needs ${CONTROL_PLANE_ENV} — the same router base URL the worker uses, taken
+from --control-plane-url, else the environment, else this checkout's .env, as
+every swarm command does — and no DATABASE_URL. A single-user installation is not exempt: SWARM_SINGLE_USER_MODE is
 deliberately not honoured by the control plane's login routes, so run
 \`swarm users set-password localhost-admin\` once and sign in like anyone else.`;
 
@@ -163,7 +164,7 @@ function unreachable(url: string): void {
 function requireCachedSession(base: string): OperatorSessionCache | undefined {
 	const cached = readOperatorSessionCache(base);
 	if (cached === null) {
-		out.error('not signed in — run `swarm login`');
+		out.error(`not signed in to ${base} — run \`swarm login\``);
 		return undefined;
 	}
 	if (cached === undefined) {
@@ -210,7 +211,9 @@ async function login(endpoint: { url: string; base: string }, flagIdentifier?: s
 	if (response.status === 401) {
 		// The control plane does not distinguish an unknown identifier from a wrong
 		// password, and neither does this line.
-		out.error('login failed — check the identifier and password');
+		out.error(
+			`login to ${endpoint.base} failed — check the identifier and password, and that this is the installation you meant`,
+		);
 		return 1;
 	}
 	if (response.status !== 200) {
@@ -274,7 +277,9 @@ async function status(endpoint: { url: string; base: string }) {
 		return 1;
 	}
 	if (response.status === 401) {
-		out.error('the cached session was rejected (expired or revoked) — run `swarm login`');
+		out.error(
+			`the cached session for ${endpoint.base} was rejected (expired or revoked) — run \`swarm login\``,
+		);
 		return 1;
 	}
 	if (response.status !== 200) {
@@ -317,7 +322,7 @@ async function revokeMintedSession(url: string, token: string): Promise<void> {
 async function logout(endpoint: { url: string; base: string }) {
 	const cached = readOperatorSessionCache(endpoint.base);
 	if (cached === null) {
-		out.info('not signed in — nothing to revoke');
+		out.info(`not signed in to ${endpoint.base} — nothing to revoke`);
 		return 0;
 	}
 
@@ -373,10 +378,13 @@ export async function run(argv: string[]): Promise<number> {
 
 	// This is the *first* command run on a machine being onboarded, so it is also
 	// the first to need the URL — before `workers register-and-enroll`, which does
-	// the same bootstrap, has run at all. Same helper, same idempotence: an
-	// existing assignment is kept and reported, so signing in again on an onboarded
-	// machine writes nothing (`../_shared/control-plane-env.ts`).
-	if (!(await ensureControlPlaneUrl(values['control-plane-url']))) return 1;
+	// the same bootstrap, has run at all. Same helper, same precedence (flag, then
+	// environment, then `.env`), same idempotence: an existing assignment is never
+	// rewritten, so signing in again on an onboarded machine writes nothing. A
+	// different one only warns — a login leaves nothing behind that reads `.env`,
+	// unlike a registered worker (`../_shared/control-plane-env.ts`).
+	if (!(await ensureControlPlaneUrl(values['control-plane-url'], { onEnvFileConflict: 'warn' })))
+		return 1;
 
 	const endpoint = resolveSessionEndpoint();
 	if ('error' in endpoint) {

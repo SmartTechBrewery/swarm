@@ -1,6 +1,18 @@
 /**
- * Leaving a worker checkout's `.env` pointed at an installation — the one piece of
- * onboarding that used to be an `echo` in a runbook.
+ * Which installation a `swarm` command talks to, and leaving a worker checkout's
+ * `.env` pointed at one — the piece of onboarding that used to be an `echo` in a
+ * runbook.
+ *
+ * **One precedence, for every command** (issue #1214): `--control-plane-url` on the
+ * commands that take it, then `SWARM_CONTROL_PLANE_URL` in the environment, then
+ * the same assignment in this checkout's `.env` — read with Node's own parser, so
+ * it means exactly what the worker daemon's `--env-file-if-exists` makes of it. The
+ * daemon has no flag and Node lets the environment win over `.env`, so it already
+ * follows the same rule. {@link resolveControlPlaneUrl} is that rule for the
+ * operator-API commands; {@link ensureControlPlaneUrl} applies it too, and then
+ * also bootstraps `.env`. Before this, `login` let `.env` win over the environment
+ * and `workers list` / `run *` never read `.env` at all, so the two could ask
+ * different installations from the same shell.
  *
  * A worker holds two values and is *given* one of them: `SWARM_WORKER_CREDENTIAL`
  * arrives from `workers register` / `register-and-enroll` and is cached per
@@ -12,8 +24,9 @@
  * it cannot be made safe: a runbook cannot know whether the file exists, already
  * carries the key, or points at a different installation.
  *
- * `register-and-enroll` calls this before anything else, because every step it
- * takes needs the URL. Two rules keep it safe to run on a machine that is already
+ * `login`, `workers setup` and `register-and-enroll` call
+ * {@link ensureControlPlaneUrl} before anything else, because every step they take
+ * needs the URL. Two rules keep it safe to run on a machine that is already
  * onboarded — which is the normal case for a second worker:
  *
  * - **Never clobber.** An existing assignment is reported and left exactly as it
@@ -30,22 +43,19 @@
  */
 
 import { readFileSync } from 'node:fs';
-import { readFile, writeFile } from 'node:fs/promises';
+import { writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
+import { parseEnv } from 'node:util';
 import * as out from './output.js';
 import { REPO_ROOT } from './paths.js';
 
 const ENV_FILE = '.env';
 export const CONTROL_PLANE_ENV = 'SWARM_CONTROL_PLANE_URL';
+const DEFAULT_FLAG = '--control-plane-url';
 
-/**
- * An uncommented assignment of {@link CONTROL_PLANE_ENV}, capturing its value.
- * `export` is tolerated because a `.env` carrying one is still a file this must
- * not append a second assignment to, whatever Node's own `--env-file` parser
- * makes of the prefix.
- */
-const ASSIGNMENT = /^[ \t]*(?:export[ \t]+)?SWARM_CONTROL_PLANE_URL[ \t]*=(.*)$/;
+/** Where a resolved URL came from — for the messages that must say which installation was asked. */
+export type ControlPlaneUrlSource = 'flag' | 'environment' | 'env-file';
 
 /** What the checkout's `.env` says about {@link CONTROL_PLANE_ENV}. */
 type EnvState =
@@ -53,72 +63,55 @@ type EnvState =
 	| { kind: 'set'; value: string }
 	| { kind: 'empty' };
 
-/** Strip one pair of matching quotes, the only `.env` quoting this needs to see through. */
-function unquote(raw: string): string {
-	const value = raw.trim();
-	const quoted =
-		value.length >= 2 &&
-		(value.startsWith('"') || value.startsWith("'")) &&
-		value.at(-1) === value[0];
-	return quoted ? value.slice(1, -1).trim() : value;
+function envFilePath(): string {
+	return resolve(REPO_ROOT, ENV_FILE);
 }
 
 /**
  * Read the checkout's `.env` and classify it. A missing file reads as `absent`
  * with empty contents — the same state as a file that simply has no assignment,
  * since both are resolved by appending one.
+ *
+ * Synchronous because the operator-API commands resolve their session
+ * synchronously. Parsed with `util.parseEnv`, the parser behind the daemon's own
+ * `--env-file-if-exists`, so quotes, an `export` prefix, comments and a repeated
+ * assignment (the last one wins) read here exactly as they do there.
  */
-async function readEnvState(path: string): Promise<EnvState> {
+function readEnvState(path: string): EnvState {
 	let contents = '';
 	try {
-		contents = await readFile(path, 'utf8');
+		contents = readFileSync(path, 'utf8');
 	} catch (err) {
 		// Anything but "no such file" is a real failure (a directory in the way, no
 		// permission) and must not be mistaken for an un-bootstrapped checkout.
 		if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
 		return { kind: 'absent', contents: '' };
 	}
-	return parseEnvState(contents);
+
+	const value = parseEnv(contents)[CONTROL_PLANE_ENV];
+	if (value === undefined) return { kind: 'absent', contents };
+	const trimmed = value.trim();
+	return trimmed ? { kind: 'set', value: trimmed } : { kind: 'empty' };
 }
 
-/** Classify `.env` text — the one parser both the async and the sync reader share. */
-function parseEnvState(contents: string): EnvState {
-	for (const line of contents.split('\n')) {
-		const match = ASSIGNMENT.exec(line);
-		if (!match) continue;
-		const value = unquote(match[1] ?? '');
-		return value ? { kind: 'set', value } : { kind: 'empty' };
-	}
-	return { kind: 'absent', contents };
+/** The precedence itself, written once: the first non-empty of flag, environment, `.env`. */
+function pickControlPlaneUrl(
+	requested: string | undefined,
+	state: EnvState,
+): { value: string; source: ControlPlaneUrlSource } | undefined {
+	const flag = requested?.trim();
+	if (flag) return { value: flag, source: 'flag' };
+	const ambient = process.env[CONTROL_PLANE_ENV]?.trim();
+	if (ambient) return { value: ambient, source: 'environment' };
+	if (state.kind === 'set') return { value: state.value, source: 'env-file' };
+	return undefined;
 }
 
-/**
- * The control-plane URL this installation's own `.env` declares, or `undefined`
- * when it declares none.
- *
- * The `.env` beside the `bin/swarm.js` being run is the file
- * {@link ensureControlPlaneUrl} wrote, so it names the installation this SWARM
- * clone serves. Reading it ahead of the ambient environment is what lets a second
- * clone on the same machine reach its own installation even when the shell exports
- * the first one's URL (issue #1215) — and keeps `swarm login` and every later
- * operator call resolving the same installation.
- *
- * Every outcome but a non-empty assignment — no file, no assignment, an empty one,
- * any read error — answers `undefined`, so a caller falls back to the environment
- * exactly as it did before it consulted the file; reporting an empty or unreadable
- * `.env` stays {@link ensureControlPlaneUrl}'s job. Sync because
- * `requireOperatorSession` is. It reads this one key and never the rest of the
- * file, so database variables stay ambient-only.
- */
-export function installationControlPlaneUrl(): string | undefined {
-	let contents: string;
-	try {
-		contents = readFileSync(resolve(REPO_ROOT, ENV_FILE), 'utf8');
-	} catch {
-		return undefined;
-	}
-	const state = parseEnvState(contents);
-	return state.kind === 'set' ? state.value : undefined;
+/** Name a source the way an operator would look for it. */
+function describeSource(source: ControlPlaneUrlSource, flagName = DEFAULT_FLAG): string {
+	if (source === 'flag') return flagName;
+	if (source === 'environment') return 'the environment';
+	return envFilePath();
 }
 
 /**
@@ -126,21 +119,45 @@ export function installationControlPlaneUrl(): string | undefined {
  * (`../../transport/worker-client.ts`'s `deriveTransportUrls`,
  * `../commands/login.ts`'s `resolveSessionEndpoint`), so a value written here is
  * one those two can derive their endpoints from. The base URL only — no endpoint
- * is built and nothing is requested.
+ * is built and nothing is requested. `origin`, when known, names where the value
+ * came from, since a bad value in a forgotten `.env` is otherwise hard to find.
  */
-function validateUrl(raw: string): { url: string } | { error: string } {
+function validateUrl(raw: string, origin?: string): { url: string } | { error: string } {
 	const value = raw.trim();
-	if (!value) return { error: `${CONTROL_PLANE_ENV} cannot be empty` };
+	const subject = origin ? `${CONTROL_PLANE_ENV} from ${origin}` : CONTROL_PLANE_ENV;
+	if (!value) return { error: `${subject} cannot be empty` };
 
 	let parsed: URL;
 	try {
 		parsed = new URL(value);
 	} catch {
-		return { error: `${CONTROL_PLANE_ENV} is not a valid URL: '${value}'` };
+		return { error: `${subject} is not a valid URL: '${value}'` };
 	}
 	if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')
-		return { error: `${CONTROL_PLANE_ENV} must be an http(s) URL, got '${value}'` };
+		return { error: `${subject} must be an http(s) URL, got '${value}'` };
 	return { url: value };
+}
+
+/**
+ * The control-plane URL a command should use, by the one precedence every command
+ * shares — flag, then environment, then this checkout's `.env` — and where it came
+ * from; or the single line explaining why there is none. Reads, never writes:
+ * this is what the operator-API commands use, so `swarm workers list` right after
+ * `swarm login` finds the URL `login` left in `.env` without anything exported.
+ */
+export function resolveControlPlaneUrl(
+	requested?: string,
+): { url: string; source: ControlPlaneUrlSource } | { error: string } {
+	const path = envFilePath();
+	const picked = pickControlPlaneUrl(requested, readEnvState(path));
+	if (!picked) {
+		return {
+			error: `${CONTROL_PLANE_ENV} is unset — export it, or set it in ${path} (e.g. https://swarm.example.com)`,
+		};
+	}
+	const validated = validateUrl(picked.value, describeSource(picked.source));
+	if ('error' in validated) return validated;
+	return { url: validated.url, source: picked.source };
 }
 
 /** Ask for the URL on a TTY, with echo — it is configuration, not a secret. */
@@ -153,24 +170,82 @@ async function promptUrl(): Promise<string> {
 	}
 }
 
+/** How {@link ensureControlPlaneUrl} treats a resolved URL that differs from `.env`'s. */
+export interface EnsureControlPlaneUrlOptions {
+	/**
+	 * `'refuse'` (the default) for a command that registers a worker: the daemon a
+	 * launchd plist starts reads only `.env`, so a worker registered on one
+	 * installation while `.env` names another would never connect. `'warn'` for
+	 * `swarm login`, which leaves nothing behind that depends on `.env`.
+	 */
+	onEnvFileConflict?: 'refuse' | 'warn';
+	/** The flag to name when there is nothing to resolve and nobody to prompt. */
+	flagName?: string;
+}
+
 /**
- * Leave this checkout's `.env` carrying a control-plane URL and answer which one,
- * also exporting it into this process so a caller that already started without it
- * can go on to use it. Prints its own failures and answers `undefined` for them,
- * since each is a state a human has to settle.
+ * Report a resolved URL that differs from `.env`'s: refused (answers `false`) or
+ * warned about (answers `true`, go on with the resolved one), per `mode`.
+ */
+function settleEnvFileConflict(
+	conflict: {
+		envValue: string;
+		url: string;
+		source: ControlPlaneUrlSource;
+		flagName: string;
+		path: string;
+	},
+	mode: 'refuse' | 'warn',
+): boolean {
+	const { envValue, url, source, flagName, path } = conflict;
+	const origin = describeSource(source, flagName);
+	if (mode === 'refuse') {
+		const remedy = source === 'flag' ? `drop ${flagName}` : `unset ${CONTROL_PLANE_ENV}`;
+		out.error(
+			`${ENV_FILE} already points at ${envValue}, not ${url} from ${origin} — a worker registered on ${url} would still connect to ${envValue}. Edit it by hand if this machine is moving installation, or ${remedy} (${path})`,
+		);
+		return false;
+	}
+	out.warn(
+		`using ${url} from ${origin}, although this checkout's ${ENV_FILE} points at ${envValue} — anything run here without that override (the worker included) talks to ${envValue} (${path})`,
+	);
+	return true;
+}
+
+/**
+ * Append the assignment — append-only, and never onto a final line missing its
+ * newline, which would otherwise absorb it.
+ */
+async function appendAssignment(path: string, contents: string, url: string): Promise<void> {
+	const separator = contents && !contents.endsWith('\n') ? '\n' : '';
+	await writeFile(path, `${contents}${separator}${CONTROL_PLANE_ENV}=${url}\n`);
+	out.info(
+		contents
+			? `added ${CONTROL_PLANE_ENV}=${url} to ${ENV_FILE}`
+			: `created ${ENV_FILE} with ${CONTROL_PLANE_ENV}=${url}`,
+	);
+}
+
+/**
+ * Resolve the control-plane URL by the shared precedence ({@link
+ * resolveControlPlaneUrl}), leave this checkout's `.env` carrying one, and answer
+ * which URL to use — also exporting it into this process, so a caller that started
+ * without it (or with a different value in the environment than the flag) goes on
+ * to use the resolved one. Prints its own failures and answers `undefined` for
+ * them, since each is a state a human has to settle.
  *
- * `requested` wins, then the ambient environment — where an operator who exported
- * the URL for an earlier `swarm login` already has it — then the operator, on a
- * TTY. A machine being onboarded non-interactively with neither is told which flag
- * to pass rather than prompted into a hang.
+ * With nothing to resolve the operator is prompted on a TTY; a machine being
+ * onboarded non-interactively is told which flag to pass rather than prompted into
+ * a hang. `.env` is written only when it carries no assignment; a different one
+ * already there is refused or warned about per `onEnvFileConflict`.
  */
 export async function ensureControlPlaneUrl(
 	requested: string | undefined,
-	flagName = '--control-plane-url',
+	options: EnsureControlPlaneUrlOptions = {},
 ): Promise<string | undefined> {
-	const path = resolve(REPO_ROOT, ENV_FILE);
-	const state = await readEnvState(path);
-	const wanted = requested?.trim();
+	const { onEnvFileConflict = 'refuse', flagName = DEFAULT_FLAG } = options;
+	const path = envFilePath();
+	const state = readEnvState(path);
 
 	if (state.kind === 'empty') {
 		out.error(
@@ -179,41 +254,32 @@ export async function ensureControlPlaneUrl(
 		return undefined;
 	}
 
-	if (state.kind === 'set') {
-		if (wanted && wanted !== state.value) {
-			out.error(
-				`${ENV_FILE} already points at ${state.value}, not the requested ${wanted} — edit it by hand if this machine is moving installation (${path})`,
-			);
-			return undefined;
-		}
-		process.env[CONTROL_PLANE_ENV] = state.value;
-		return state.value;
-	}
-
-	const supplied = wanted || process.env[CONTROL_PLANE_ENV]?.trim();
-	const answered = supplied || (process.stdin.isTTY ? await promptUrl() : undefined);
+	const picked = pickControlPlaneUrl(requested, state);
+	const answered = picked?.value || (process.stdin.isTTY ? await promptUrl() : undefined);
 	if (!answered) {
 		out.error(
-			`${ENV_FILE} carries no ${CONTROL_PLANE_ENV} — pass ${flagName} <url> (stdin is not a terminal, so there is nobody to prompt)`,
+			`${CONTROL_PLANE_ENV} is unset in the environment and in ${path} — pass ${flagName} <url> (stdin is not a terminal, so there is nobody to prompt)`,
 		);
 		return undefined;
 	}
 
-	const validated = validateUrl(answered);
+	const origin = picked ? describeSource(picked.source, flagName) : undefined;
+	const validated = validateUrl(answered, origin);
 	if ('error' in validated) {
 		out.error(validated.error);
 		return undefined;
 	}
+	const url = validated.url;
 
-	// Append-only, and never onto a final line missing its newline — that line
-	// would otherwise absorb the assignment.
-	const separator = state.contents && !state.contents.endsWith('\n') ? '\n' : '';
-	await writeFile(path, `${state.contents}${separator}${CONTROL_PLANE_ENV}=${validated.url}\n`);
-	out.info(
-		state.contents
-			? `added ${CONTROL_PLANE_ENV}=${validated.url} to ${ENV_FILE}`
-			: `created ${ENV_FILE} with ${CONTROL_PLANE_ENV}=${validated.url}`,
-	);
-	process.env[CONTROL_PLANE_ENV] = validated.url;
-	return validated.url;
+	// `picked` is always defined when `.env` is `set` (it is itself a candidate);
+	// checking it only narrows the type.
+	if (picked && state.kind === 'set' && state.value !== url) {
+		const conflict = { envValue: state.value, url, source: picked.source, flagName, path };
+		if (!settleEnvFileConflict(conflict, onEnvFileConflict)) return undefined;
+	}
+
+	if (state.kind === 'absent') await appendAssignment(path, state.contents, url);
+
+	process.env[CONTROL_PLANE_ENV] = url;
+	return url;
 }

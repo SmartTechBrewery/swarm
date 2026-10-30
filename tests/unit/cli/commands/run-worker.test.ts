@@ -8,17 +8,7 @@ const { readWorkerCredentialCache, workerCredentialCachePath } = vi.hoisted(() =
 	workerCredentialCachePath: vi.fn(),
 }));
 
-const { installationControlPlaneUrl } = vi.hoisted(() => ({
-	installationControlPlaneUrl: vi.fn<() => string | undefined>(),
-}));
-
 vi.mock('@/cli/_shared/exec.js', () => ({ runCommand }));
-// The real read would consult this checkout's own `.env`, which on a developer's
-// machine names a live installation.
-vi.mock('@/cli/_shared/control-plane-env.js', () => ({
-	CONTROL_PLANE_ENV: 'SWARM_CONTROL_PLANE_URL',
-	installationControlPlaneUrl,
-}));
 vi.mock('@/cli/_shared/worker-credential-cache.js', () => ({
 	readWorkerCredentialCache,
 	workerCredentialCachePath,
@@ -58,7 +48,6 @@ describe('swarm run:worker', () => {
 		error = vi.spyOn(console, 'error').mockImplementation(() => {});
 		warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 		runCommand.mockReset().mockResolvedValue(0);
-		installationControlPlaneUrl.mockReset().mockReturnValue(undefined);
 		readWorkerCredentialCache.mockReset().mockReturnValue({
 			workerId: WORKER_ID,
 			credential: 'raw-credential-token',
@@ -242,61 +231,6 @@ describe('swarm run:worker', () => {
 		expect(step).toContain(CWD);
 		expect(step).toContain('/checkouts/mobile');
 		expect(step).toContain('/checkouts/web');
-	});
-
-	// Issue #1215: `--env-file` loses to an exported variable, so the installation's
-	// own URL is handed over explicitly — a second SWARM clone's worker must not
-	// start against the control plane the shell exports for the first.
-	describe("with this installation's .env naming a control plane", () => {
-		const OWN = 'https://swarm-two.example.com';
-		const ORIGINAL_URL = process.env.SWARM_CONTROL_PLANE_URL;
-
-		beforeEach(() => {
-			installationControlPlaneUrl.mockReturnValue(OWN);
-			process.env.SWARM_CONTROL_PLANE_URL = 'https://swarm.example.com';
-		});
-
-		afterEach(() => {
-			if (ORIGINAL_URL === undefined) delete process.env.SWARM_CONTROL_PLANE_URL;
-			else process.env.SWARM_CONTROL_PLANE_URL = ORIGINAL_URL;
-		});
-
-		it('injects it over an ambient one into the replacement', async () => {
-			expect(await run([])).toBe(0);
-			expect(execve).toHaveBeenCalledWith(
-				process.execPath,
-				expect.any(Array),
-				expect.objectContaining({ SWARM_CONTROL_PLANE_URL: OWN }),
-			);
-		});
-
-		it('injects it into the spawned fallback too', async () => {
-			expect(await runWithoutExecve()).toBe(0);
-			expect(runCommand).toHaveBeenCalledWith('npm', ['run', 'dev:worker'], {
-				cwd: REPO_ROOT,
-				env: {
-					SWARM_WORKER_REPO_ROOT: CWD,
-					SWARM_WORKER_CREDENTIAL: 'raw-credential-token',
-					SWARM_CONTROL_PLANE_URL: OWN,
-				},
-			});
-		});
-	});
-
-	it('leaves an ambient URL untouched when .env names none', async () => {
-		const original = process.env.SWARM_CONTROL_PLANE_URL;
-		process.env.SWARM_CONTROL_PLANE_URL = 'https://swarm.example.com';
-		try {
-			expect(await run([])).toBe(0);
-			expect(execve).toHaveBeenCalledWith(
-				process.execPath,
-				expect.any(Array),
-				expect.objectContaining({ SWARM_CONTROL_PLANE_URL: 'https://swarm.example.com' }),
-			);
-		} finally {
-			if (original === undefined) delete process.env.SWARM_CONTROL_PLANE_URL;
-			else process.env.SWARM_CONTROL_PLANE_URL = original;
-		}
 	});
 
 	it('prints usage for --help without starting anything', async () => {
