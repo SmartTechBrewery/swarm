@@ -26,8 +26,9 @@ export interface BoardMappingForm {
 	/**
 	 * Opaque provider scope carried through to save time — for GitHub Projects the
 	 * `{ statusFieldId }` state discovery returns, for Jira the `{ baseUrl }` held in
-	 * the persisted mapping or incoming-provider draft; empty for a provider whose state ids are the
-	 * whole mapping, such as Linear. Cleared on a provider switch so one provider's
+	 * the persisted mapping or incoming-provider draft plus the optional
+	 * `{ repositoryField }` the operator types (issue #1237); empty for a provider whose
+	 * state ids are the whole mapping, such as Linear. Cleared on a provider switch so one provider's
 	 * scope can't be saved as another's, and its *container-scoped* half (GitHub's
 	 * field id) is cleared on a container switch too — a site URL is not a property
 	 * of the selected container, so it survives that (see
@@ -104,6 +105,11 @@ export interface PmMappingProvider {
 	 * provider's own declared role, rendered by the Credentials section above.
 	 */
 	intro: string;
+	/**
+	 * Copy for the input naming where a card's repository is read from (issue #1237),
+	 * for a provider whose mapping carries one; absent hides the input.
+	 */
+	repositoryField?: { label: string; description: string };
 }
 
 export const PM_MAPPING_PROVIDERS: readonly PmMappingProvider[] = [
@@ -136,6 +142,11 @@ export const PM_MAPPING_PROVIDERS: readonly PmMappingProvider[] = [
 		stateNounPlural: 'statuses',
 		intro:
 			"Enter this project's Jira site URL, pick its Jira project, then map each SWARM pipeline status to one of its workflow statuses. Projects and statuses are discovered server-side with this project's own board credential, configured under Credentials above.",
+		repositoryField: {
+			label: 'Repository field',
+			description:
+				"Where a card names its repository, when this project has more than one. Leave blank to route by Jira component, matched against each repository's routing token. Enter a custom text field's id, such as customfield_10515, to route by that field instead: a card's value must be one of this project's repositories exactly as listed under Source Control, and no routing token is needed.",
+		},
 	},
 	{
 		id: 'trello',
@@ -224,6 +235,45 @@ function baseUrlOf(form: BoardMappingForm): string {
 }
 
 /**
+ * The `repositoryField` value meaning Jira components — the routing axis a blank
+ * input stands for, so it is never persisted (`JIRA_COMPONENTS_REPOSITORY_FIELD`,
+ * `src/integrations/pm/jira/config-schema.ts`).
+ */
+const COMPONENTS_REPOSITORY_FIELD = 'components';
+
+/**
+ * A custom field id, the only other value `jiraConfigSchema.repositoryField`
+ * accepts. Mirrored rather than imported so this browser module pulls in no
+ * provider schema; `board-mapping.test.ts` parses what the form builds through the
+ * real schema to keep the two from drifting.
+ */
+const CUSTOM_FIELD_ID = /^customfield_\d+$/;
+
+/** Whether the selected provider's mapping carries a repository field (issue #1237). */
+function usesRepositoryField(form: BoardMappingForm): boolean {
+	return getPmMappingProvider(form.providerId).repositoryField !== undefined;
+}
+
+/** A repository field normalized for saving: blank stands for components, the default. */
+function normalizeRepositoryField(value: string | undefined): string {
+	const trimmed = (value ?? '').trim();
+	return trimmed === COMPONENTS_REPOSITORY_FIELD ? '' : trimmed;
+}
+
+/** The carried repository field, normalized; blank when the provider has none or none is set. */
+function repositoryFieldOf(form: BoardMappingForm): string {
+	return usesRepositoryField(form)
+		? normalizeRepositoryField(form.providerContext.repositoryField)
+		: '';
+}
+
+/** Whether the repository field is set to something other than components or a custom field id. */
+export function isRepositoryFieldInvalid(form: BoardMappingForm): boolean {
+	const value = repositoryFieldOf(form);
+	return value !== '' && !CUSTOM_FIELD_ID.test(value);
+}
+
+/**
  * Whether the selected provider needs a base URL and the form carries none — the
  * one save gate the operator can't clear from this screen, so the panel explains
  * where to set it rather than leaving Save inexplicably disabled.
@@ -280,7 +330,9 @@ export function withProviderContext(
  * selected container: Jira's `baseUrl` is the site every one of the discovered
  * projects came from, and nothing re-seeds it (this screen doesn't edit it and Jira's
  * state discovery deliberately returns no context), so clearing it on a container
- * switch would leave a Jira mapping permanently unsaveable.
+ * switch would leave a Jira mapping permanently unsaveable. Jira's repository field
+ * survives too: the operator typed it, it stays on screen to edit, and clearing it
+ * would quietly put the project back on component routing.
  */
 export function withSelectedContainer(
 	form: BoardMappingForm,
@@ -288,11 +340,17 @@ export function withSelectedContainer(
 ): BoardMappingForm {
 	if (form.containerId === containerId) return form;
 	const baseUrl = baseUrlOf(form);
+	const repositoryField = usesRepositoryField(form)
+		? (form.providerContext.repositoryField ?? '')
+		: '';
 	return {
 		...form,
 		containerId,
 		statusOptions: blankStatusOptions(),
-		providerContext: baseUrl ? { baseUrl } : {},
+		providerContext: {
+			...(baseUrl ? { baseUrl } : {}),
+			...(repositoryField ? { repositoryField } : {}),
+		},
 	};
 }
 
@@ -311,9 +369,10 @@ export function withSelectedContainer(
  * Provider-specific fields are read only after narrowing: the neutral
  * `containerId` is GitHub's board node id, Linear's team UUID, Jira's project key,
  * or Trello's board id depending on the member, and `providerContext` carries
- * whichever second value that member has — GitHub's Status field id (issue #531)
- * or Jira's site base URL (issue #581), never both, and neither for Linear or
- * Trello, whose state ids are the whole mapping.
+ * whichever second value that member has — GitHub's Status field id (issue #531),
+ * or Jira's site base URL (issue #581) and repository field (issue #1237) — never
+ * both providers' at once, and neither for Linear or Trello, whose state ids are
+ * the whole mapping.
  */
 export function toBoardMappingForm(pm: ProjectPm | undefined): BoardMappingForm {
 	const githubProjects = pm?.type === 'github-projects' ? pm : undefined;
@@ -332,9 +391,10 @@ export function toBoardMappingForm(pm: ProjectPm | undefined): BoardMappingForm 
 		statusOptions,
 		providerContext: githubProjects?.statusFieldId
 			? { statusFieldId: githubProjects.statusFieldId }
-			: jira?.baseUrl
-				? { baseUrl: jira.baseUrl }
-				: {},
+			: {
+					...(jira?.baseUrl ? { baseUrl: jira.baseUrl } : {}),
+					...(jira?.repositoryField ? { repositoryField: jira.repositoryField } : {}),
+				},
 	};
 }
 
@@ -379,11 +439,14 @@ export function buildPmUpdate(form: BoardMappingForm, existing: ProjectPm | unde
 	if (selectedProviderId(form) === 'jira') {
 		// The site URL comes from Jira's persisted mapping or incoming-provider draft;
 		// the final write is the only place that draft becomes project configuration.
+		// A blank repository field is omitted, which is components — the default.
+		const repositoryField = repositoryFieldOf(form);
 		const jira: JiraPm = {
 			type: 'jira',
 			baseUrl: baseUrlOf(form),
 			projectKey: containerId,
 			statusOptions,
+			...(repositoryField ? { repositoryField } : {}),
 		};
 		return jira;
 	}
@@ -404,7 +467,8 @@ export function buildPmUpdate(form: BoardMappingForm, existing: ProjectPm | unde
  * Whether the form differs from the stored config, compared semantically after
  * normalization (selected provider, selected container, and each mapped status).
  * Each provider's own `providerContext` entry is compared only for that provider —
- * the Status field id for GitHub Projects, the site base URL for Jira — so a
+ * the Status field id for GitHub Projects, the site base URL and repository field
+ * for Jira — so a
  * provider that carries neither doesn't read as permanently clean or permanently
  * dirty against a stored mapping that does.
  */
@@ -420,6 +484,11 @@ export function isBoardMappingDirty(form: BoardMappingForm, pm: ProjectPm | unde
 		return true;
 	if (requiresBaseUrl(form) && baseUrlOf(form) !== (stored.providerContext.baseUrl ?? ''))
 		return true;
+	if (
+		usesRepositoryField(form) &&
+		repositoryFieldOf(form) !== normalizeRepositoryField(stored.providerContext.repositoryField)
+	)
+		return true;
 	return STATUS_KEYS.some(
 		(key) => (form.statusOptions[key]?.trim() ?? '') !== stored.statusOptions[key],
 	);
@@ -432,13 +501,15 @@ export function isBoardMappingDirty(form: BoardMappingForm, pm: ProjectPm | unde
  * `jiraConfigSchema`, `trelloConfigSchema`) rather than requiring every status be
  * mapped — plus each
  * provider's own required context: a known Status-field context for GitHub Projects,
- * a valid site base URL for Jira. The route additionally gates Save on the form
- * being dirty and no other config write being in flight.
+ * a valid site base URL for Jira, and a repository field that is blank or a custom
+ * field id. The route additionally gates Save on the form being dirty and no other
+ * config write being in flight.
  */
 export function canSaveBoardMapping(form: BoardMappingForm): boolean {
 	if (!form.containerId.trim()) return false;
 	if (usesStatusFieldContext(form) && !(form.providerContext.statusFieldId ?? '').trim())
 		return false;
 	if (isBaseUrlMissing(form) || isBaseUrlInvalid(form)) return false;
+	if (isRepositoryFieldInvalid(form)) return false;
 	return STATUS_KEYS.some((key) => !!form.statusOptions[key]?.trim());
 }

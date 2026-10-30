@@ -393,13 +393,30 @@ export interface WorkItemDependent {
  * `routingToken` is an **id, never a name** — a Jira component id, a Linear label
  * id, a Trello label id — matched exactly. An entry that declares none claims
  * nothing. GitHub Projects ignores the field entirely: a card there wraps one
- * backing Issue/PR, whose own repository is authoritative.
+ * backing Issue/PR, whose own repository is authoritative, and so does a Jira board
+ * routing on a text field that names the repository itself (issue #1237), which
+ * matches `repo` instead.
  */
 export interface RepositoryRoutingCandidate {
 	/** The repository this candidate names, as `owner/repo` (a `ProjectRepository.repo`). */
 	repo: string;
 	/** The provider-native id a card carries to claim it for this repository, when it declares one. */
 	routingToken?: string;
+}
+
+/**
+ * What a card itself wrote about its repository, when the provider routes on one
+ * value a person typed rather than on opaque ids (issue #1237) — a Jira text field
+ * holding `organization/project/repository`. Carried on an `unrouted` answer so the
+ * refusal can be shown on the card, naming what was read; an id-based axis
+ * (components, labels) reports none, since a list of ids explains nothing to the
+ * person who set them.
+ */
+export interface RepositoryClaim {
+	/** The board's own name for where the value was read — a Jira field's display name. */
+	source: string;
+	/** The value read, trimmed; empty when the card leaves it blank. */
+	value: string;
 }
 
 /**
@@ -411,11 +428,13 @@ export interface RepositoryRoutingCandidate {
  * to the wrong repository would push a branch and open a pull request where nobody
  * asked for one, so a provider reports the ambiguity and lets the caller refuse.
  * `unrouted` is the same refusal for a card that claims nothing — never a guess at
- * the default entry, which is the caller's policy to apply, not the provider's.
+ * the default entry, which is the caller's policy to apply, not the provider's. It
+ * carries the card's own {@link RepositoryClaim} when the provider read one, so the
+ * caller can tell the card why (issue #1237).
  */
 export type ItemRepositoryRoute =
 	| { status: 'routed'; repo: string }
-	| { status: 'unrouted' }
+	| { status: 'unrouted'; claim?: RepositoryClaim }
 	/** Every claimed repository, sorted, so a message naming them is stable. */
 	| { status: 'ambiguous'; repos: string[] };
 
@@ -689,7 +708,9 @@ export interface PMProvider {
 	 * Which of the project's repositories the board card `id` belongs to, chosen
 	 * from `candidates` (issue #686 phase 1). Each provider answers from its own
 	 * narrowest read: GitHub Projects compares the backing Issue/PR's repository,
-	 * Jira its component ids, Linear and Trello their label ids.
+	 * Jira its component ids — or, when its board mapping names a repository text
+	 * field, that field's value against each candidate's `repo` (issue #1237) —
+	 * Linear and Trello their label ids.
 	 *
 	 * Widening the interface rather than reading a board field at the call site is
 	 * what keeps the decision provider-agnostic (ai/RULES.md §2) — *which* ids a card

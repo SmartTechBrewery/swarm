@@ -9,7 +9,9 @@
  * config and no provider id, only the claim ids a card carries and the candidates
  * those may match. That is what keeps it out of ai/RULES.md §2's way — *which* ids a
  * card carries stays each provider's own read (a Jira component, a Linear label, a
- * Trello label), and this module never learns which one asked.
+ * Trello label), and this module never learns which one asked. {@link
+ * routeByRepositoryValue} is its twin for a card that names its repository in plain
+ * text instead (issue #1237), equally blind to which provider read the value.
  *
  * {@link repositoryRoutingCandidates} and {@link resolveCardRepository} are the
  * caller's half, equally provider-blind: they name no provider either, taking the
@@ -23,7 +25,12 @@
  */
 
 import type { ProjectRecord } from '../config/schema.js';
-import type { ItemRepositoryRoute, PMProvider, RepositoryRoutingCandidate } from './types.js';
+import type {
+	ItemRepositoryRoute,
+	PMProvider,
+	RepositoryClaim,
+	RepositoryRoutingCandidate,
+} from './types.js';
 
 /**
  * Which candidate repository a card's `claimTokenIds` route it to.
@@ -52,6 +59,34 @@ export function routeByClaimTokens(
 	if (first === undefined) return { status: 'unrouted' };
 	if (rest.length === 0) return { status: 'routed', repo: first };
 	return { status: 'ambiguous', repos: [first, ...rest].sort() };
+}
+
+/**
+ * Which candidate repository a card's own repository value routes it to (issue
+ * #1237) — the path for a board whose card *names* its repository, as a Jira text
+ * field holding `organization/project/repository` does, rather than carrying an id
+ * a repository entry declares.
+ *
+ * The value is matched against each candidate's `repo` itself, so no entry needs a
+ * `routingToken` and a repository added to the project routes the moment it is in
+ * the list. Matching is **exact** on the whole slug once surrounding whitespace is
+ * trimmed: the value is the repository's own path in the form `repo` states it, so
+ * a bare repository name, another casing, or a URL names nothing — the refusal
+ * that follows says what was read, which is cheaper to fix than a fuzzy match that
+ * picks the wrong repository.
+ *
+ * Never `ambiguous`: one value can equal at most one repository. A blank value or
+ * one naming no candidate is `unrouted`, carrying the trimmed claim so the caller
+ * can show the card what it said.
+ */
+export function routeByRepositoryValue(
+	claim: RepositoryClaim,
+	candidates: readonly RepositoryRoutingCandidate[],
+): ItemRepositoryRoute {
+	const value = claim.value.trim();
+	const match = value ? candidates.find((candidate) => candidate.repo === value) : undefined;
+	if (match) return { status: 'routed', repo: match.repo };
+	return { status: 'unrouted', claim: { source: claim.source, value } };
 }
 
 /**
