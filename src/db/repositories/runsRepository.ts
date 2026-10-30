@@ -1373,9 +1373,40 @@ export async function findStoredTaskBranch(
 	repository: string,
 	taskId: string,
 ): Promise<string | undefined> {
-	const taskBranch = sql<string>`${runs.jobPayload} ->> 'taskBranch'`;
+	return findStoredImplementationValue(projectId, repository, taskId, 'taskBranch');
+}
+
+/**
+ * The commit subject Implementation last decided for this project task (issue #1242) —
+ * the `commitSubject` its newest run carrying one stored on its job payload. Decided
+ * once and kept exactly like {@link findStoredTaskBranch}'s branch: a later attempt
+ * commits with it again, and the control plane hands it to the task's Respond-to-review
+ * and Respond-to-CI dispatches so their fix commits carry it too.
+ *
+ * `undefined` when no run stored one — the task never reached delivery, or every run
+ * predates issue #1242.
+ */
+export async function findStoredCommitSubject(
+	projectId: string,
+	repository: string,
+	taskId: string,
+): Promise<string | undefined> {
+	return findStoredImplementationValue(projectId, repository, taskId, 'commitSubject');
+}
+
+/** The newest value an Implementation run of this task stored under `key` on its job payload. */
+async function findStoredImplementationValue(
+	projectId: string,
+	repository: string,
+	taskId: string,
+	key: 'taskBranch' | 'commitSubject',
+): Promise<string | undefined> {
+	// A literal, not a bound parameter: `jsonb ->> $1` leaves Postgres to guess between
+	// the text and integer operators, and `key` is a closed union anyway.
+	const field = sql.raw(`'${key}'`);
+	const value = sql<string>`${runs.jobPayload} ->> ${field}`;
 	const rows = await getDb()
-		.select({ taskBranch })
+		.select({ value })
 		.from(runs)
 		.where(
 			and(
@@ -1383,12 +1414,12 @@ export async function findStoredTaskBranch(
 				eq(runs.repository, repository),
 				eq(runs.taskId, taskId),
 				eq(runs.phase, 'implementation'),
-				sql`${runs.jobPayload} ->> 'taskBranch' IS NOT NULL`,
+				sql`${runs.jobPayload} ->> ${field} IS NOT NULL`,
 			),
 		)
 		.orderBy(desc(runs.startedAt))
 		.limit(1);
-	return rows[0]?.taskBranch ?? undefined;
+	return rows[0]?.value ?? undefined;
 }
 
 /**

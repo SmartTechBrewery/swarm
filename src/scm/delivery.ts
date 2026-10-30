@@ -51,23 +51,38 @@ export const VerificationSchema = z.object({
 	outcome: z.literal('passed'),
 });
 
-const CommitSchema = z.object({
-	commitSubject: z.string().min(1).max(200),
-	verification: z.array(VerificationSchema).min(1),
-});
-
-export const ImplementationHandoffSchema = CommitSchema.extend({
-	summary: z.string().min(1),
-	limitations: z.array(z.string()).default([]),
-	readyForDelivery: z.literal(true),
-	/**
-	 * The implementer's `{work_type}` and `{friendly_name}` for a branch name pattern
-	 * that has them (issue #1241). Free strings on purpose, normalised by the phase
-	 * with fallbacks: a malformed branch-name hint must never cost a whole delivery.
-	 */
-	workType: z.string().optional(),
-	friendlyName: z.string().optional(),
-});
+export const ImplementationHandoffSchema = z
+	.object({
+		/**
+		 * The implementer's one-line summary of the change (issue #1242) — the
+		 * `{subject}` SWARM renders the repository's commit subject pattern with. The
+		 * agent no longer writes the subject's format itself.
+		 */
+		subject: z.string().min(1).max(200).optional(),
+		/**
+		 * The whole Conventional Commits subject a pre-#1242 hand-off carried. Still
+		 * accepted, so a delivery resumed from a worktree an older prompt prepared
+		 * completes: its type and summary are read back out of it.
+		 */
+		commitSubject: z.string().min(1).max(200).optional(),
+		verification: z.array(VerificationSchema).min(1),
+		summary: z.string().min(1),
+		limitations: z.array(z.string()).default([]),
+		readyForDelivery: z.literal(true),
+		/**
+		 * The implementer's `{work_type}` (issues #1241, #1242 — the branch name's and
+		 * the commit subject's) and `{friendly_name}` for a branch name pattern that has
+		 * one. Free strings on purpose, normalised by the phase with fallbacks: a
+		 * malformed naming hint must never cost a whole delivery.
+		 */
+		workType: z.string().optional(),
+		friendlyName: z.string().optional(),
+	})
+	.refine((handoff) => handoff.subject !== undefined || handoff.commitSubject !== undefined, {
+		message: 'subject is required',
+		path: ['subject'],
+	});
+export type ImplementationHandoff = z.infer<typeof ImplementationHandoffSchema>;
 
 /**
  * A command the reviewer ran, and whether it passed. Unlike
@@ -527,6 +542,11 @@ export const DeliveryProgressSchema = z.object({
 	 * rather than rendering another.
 	 */
 	branch: z.string().optional(),
+	/**
+	 * The commit subject this delivery commits with and titles its pull request by,
+	 * once decided (issue #1242) — recorded beside {@link branch} for the same reason.
+	 */
+	commitSubject: z.string().optional(),
 	commitSha: z.string().optional(),
 	pushed: z.boolean().default(false),
 	pullRequestNumber: z.number().int().positive().optional(),

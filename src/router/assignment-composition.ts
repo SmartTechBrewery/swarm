@@ -91,6 +91,7 @@ export function composeSystemPrompt(
 					branch: resolveTargetBranch(project, trigger, taskBranch),
 					baseBranch: project.baseBranch,
 					...(taskBranch ? {} : { branchPattern: resolveBranchPattern(project) }),
+					commitSubjectNaming: project,
 				},
 				customPrompt,
 			);

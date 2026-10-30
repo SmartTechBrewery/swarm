@@ -12,6 +12,8 @@ function row(overrides: Partial<RepositoryForm> = {}): RepositoryForm {
 		baseBranch: 'main',
 		branchPrefix: 'issue-',
 		branchPattern: '',
+		commitSubjectPattern: '',
+		commitSubjectMaxLength: '',
 		autoMerge: false,
 		reviewChecks: 'required',
 		reviewChecksWaitMinutes: '',
@@ -341,6 +343,70 @@ describe('RepositoryList', () => {
 
 			fireEvent.change(patternInput(), { target: { value: '{issue_key}/{friendly_name}' } });
 			expect(screen.queryByText(/will no longer be recognised/)).toBeNull();
+		});
+	});
+
+	// Issue #1242: the commit subject pattern is composed in its own editor, the same way.
+	describe('commit subject pattern editor', () => {
+		const patternInput = () => screen.getByLabelText('Pattern') as HTMLInputElement;
+		const lengthInput = () => screen.getByLabelText('Length Limit') as HTMLInputElement;
+		const apply = () => screen.getByRole('button', { name: 'Apply' }) as HTMLButtonElement;
+		const preview = () => screen.getByTestId('commit-subject-pattern-preview').textContent;
+
+		it('shows the default, describes every element and previews a sample task live', () => {
+			renderList({ repositories: TWO });
+			expect(
+				(screen.getByLabelText('Commit subject pattern, entry 1') as HTMLInputElement).value,
+			).toBe('{work_type}: {subject}');
+			fireEvent.click(screen.getByLabelText('Edit commit subject pattern, entry 1'));
+
+			for (const name of ['issue_key', 'work_type', 'subject']) {
+				expect(screen.getByLabelText(`Insert {${name}}`)).toBeTruthy();
+			}
+			expect(preview()).toBe('feat: add the starting page of the SWARM test bed');
+
+			fireEvent.change(patternInput(), { target: { value: '{issue_key} {Subject}' } });
+			expect(preview()).toBe('VT-1538 Add the starting page of the SWARM test bed');
+		});
+
+		it('warns when the preview runs over the length limit, without refusing it', () => {
+			renderList({ repositories: TWO });
+			fireEvent.click(screen.getByLabelText('Edit commit subject pattern, entry 1'));
+
+			fireEvent.change(patternInput(), { target: { value: '{issue_key} {Subject}' } });
+			expect(screen.queryByText(/over the .*-character limit/)).toBeNull();
+			fireEvent.change(lengthInput(), { target: { value: '40' } });
+			expect(screen.getByText(/over the 40-character limit/)).toBeTruthy();
+			expect(apply().disabled).toBe(false);
+		});
+
+		it('refuses a pattern without {subject}', () => {
+			renderList({ repositories: TWO });
+			fireEvent.click(screen.getByLabelText('Edit commit subject pattern, entry 1'));
+
+			fireEvent.change(patternInput(), { target: { value: '{issue_key}' } });
+			expect(apply().disabled).toBe(true);
+			expect(screen.getByText(/must contain \{subject\}/)).toBeTruthy();
+		});
+
+		it('applies a pattern and limit to its own row, and the unchanged default as none', () => {
+			const { onChange } = renderList({ repositories: TWO });
+
+			fireEvent.click(screen.getByLabelText('Edit commit subject pattern, entry 2'));
+			fireEvent.change(patternInput(), { target: { value: '{issue_key} {Subject}' } });
+			fireEvent.change(lengthInput(), { target: { value: '60' } });
+			fireEvent.click(apply());
+			expect(onChange).toHaveBeenCalledWith(1, {
+				commitSubjectPattern: '{issue_key} {Subject}',
+				commitSubjectMaxLength: '60',
+			});
+
+			fireEvent.click(screen.getByLabelText('Edit commit subject pattern, entry 1'));
+			fireEvent.click(apply());
+			expect(onChange).toHaveBeenLastCalledWith(0, {
+				commitSubjectPattern: '',
+				commitSubjectMaxLength: '',
+			});
 		});
 	});
 });

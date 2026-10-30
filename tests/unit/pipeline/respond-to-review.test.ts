@@ -446,6 +446,41 @@ describe('runRespondToReviewPhase', () => {
 		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('respond-21');
 	});
 
+	// Issue #1242: every commit SWARM makes for a task carries the one subject
+	// Implementation decided for it.
+	describe('the fix commit’s subject (issue #1242)', () => {
+		const headSubject = (path: string) => fixtureGit(path, 'log', '-1', '--format=%s').trim();
+
+		it('commits with the subject Implementation stored for the task', async () => {
+			const deps = makeDeps();
+
+			await runRespondToReviewPhase({ ...deps, commitSubject: 'VT-1538 Add the starting page' });
+
+			expect(headSubject(deps.path)).toBe('VT-1538 Add the starting page');
+		});
+
+		it('needs no subject of the agent’s own when one is stored', async () => {
+			const deps = makeDeps();
+			writeHandoff(deps.path, responseHandoff({ commitSubject: undefined }));
+
+			const result = await runRespondToReviewPhase({ ...deps, commitSubject: '21 Add the page' });
+
+			expect(result.outcome).toBe('fixed');
+			expect(headSubject(deps.path)).toBe('21 Add the page');
+		});
+
+		it('renders the agent’s subject through the repository’s pattern when none is stored', async () => {
+			const deps = makeDeps();
+
+			await runRespondToReviewPhase({
+				...deps,
+				project: createMockProjectConfig({ commitSubjectPattern: '{issue_key} {Subject}' }),
+			});
+
+			expect(headSubject(deps.path)).toBe('21 Address review feedback');
+		});
+	});
+
 	it.each([
 		'fixed',
 		'pushed-back',

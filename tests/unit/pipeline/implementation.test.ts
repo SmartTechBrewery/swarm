@@ -61,6 +61,7 @@ import {
 } from '@/pipeline/implementation.js';
 import type { WorkItemBlocker, WorkItemDependent } from '@/pm/types.js';
 import {
+	commitPreparedTree,
 	HANDOFF_FILENAMES,
 	renameCheckedOutBranch,
 	type ScmDeliveryProvider,
@@ -930,6 +931,105 @@ describe('runImplementationPhase — branch name pattern', () => {
 	});
 });
 
+describe('runImplementationPhase — commit subject pattern (issue #1242)', () => {
+	beforeEach(() => {
+		handoffFileExists = true;
+		blockedReasonFileExists = false;
+		checkpointFileExists = false;
+		progressFileContents = undefined;
+		vi.mocked(commitPreparedTree).mockClear();
+	});
+
+	const NEW_HANDOFF = JSON.stringify({
+		summary: 'Adds the starting page.',
+		subject: 'add the starting page of the SWARM test bed',
+		workType: 'feat',
+		verification: [{ command: 'npm test', outcome: 'passed' }],
+		limitations: [],
+		readyForDelivery: true,
+	});
+
+	function subjectDeps(commitSubjectPattern?: string) {
+		const deps = makeDeps();
+		return {
+			...deps,
+			taskId: 'VT-1538',
+			project: createMockProjectConfig(
+				commitSubjectPattern === undefined ? {} : { commitSubjectPattern },
+			),
+			workItem: createMockWorkItem({ id: 'PVTI_vt', title: 'Pierwsza strona testowa' }),
+			onCommitSubjectNamed: vi.fn(async (_subject: string) => {}),
+		};
+	}
+
+	function committedSubject(): unknown {
+		return vi.mocked(commitPreparedTree).mock.calls[0]?.[1];
+	}
+
+	it('commits with today’s conventional subject, and keeps the card title, when no pattern is set', async () => {
+		handoffFileContents = NEW_HANDOFF;
+		const deps = subjectDeps();
+
+		await runImplementationPhase(deps);
+
+		expect(committedSubject()).toBe('feat: add the starting page of the SWARM test bed');
+		expect(deps.delivery.createPullRequest).toHaveBeenCalledWith(
+			expect.objectContaining({ title: 'Pierwsza strona testowa' }),
+		);
+		expect(deps.onCommitSubjectNamed).toHaveBeenCalledExactlyOnceWith(
+			'feat: add the starting page of the SWARM test bed',
+		);
+	});
+
+	it('renders the repository’s pattern for the commit and titles the pull request with it', async () => {
+		handoffFileContents = NEW_HANDOFF;
+		const deps = subjectDeps('{issue_key} {Subject}');
+
+		await runImplementationPhase(deps);
+
+		const subject = 'VT-1538 Add the starting page of the SWARM test bed';
+		expect(committedSubject()).toBe(subject);
+		expect(deps.delivery.createPullRequest).toHaveBeenCalledWith(
+			expect.objectContaining({ title: subject }),
+		);
+		expect(deps.onCommitSubjectNamed).toHaveBeenCalledExactlyOnceWith(subject);
+		expect(JSON.parse(progressFileContents ?? '{}').commitSubject).toBe(subject);
+	});
+
+	it('reads the summary and type out of a pre-#1242 hand-off’s whole commitSubject', async () => {
+		handoffFileContents = HANDOFF;
+		const deps = subjectDeps('{issue_key} {Subject}');
+
+		await runImplementationPhase(deps);
+
+		expect(committedSubject()).toBe('VT-1538 Add the implementation phase');
+	});
+
+	it('reuses a stored subject verbatim and never reports another', async () => {
+		handoffFileContents = NEW_HANDOFF;
+		const deps = subjectDeps('{issue_key} {Subject}');
+
+		await runImplementationPhase({ ...deps, commitSubject: 'VT-1538 Add the first page' });
+
+		expect(committedSubject()).toBe('VT-1538 Add the first page');
+		expect(deps.delivery.createPullRequest).toHaveBeenCalledWith(
+			expect.objectContaining({ title: 'VT-1538 Add the first page' }),
+		);
+		expect(deps.onCommitSubjectNamed).not.toHaveBeenCalled();
+	});
+
+	it('names the branch and the commit by one work type', async () => {
+		handoffFileContents = JSON.stringify({ ...JSON.parse(NEW_HANDOFF), workType: 'fix' });
+		const deps = subjectDeps();
+		deps.project = createMockProjectConfig({ branchPattern: '{work_type}/{issue_key}' });
+
+		const result = await runImplementationPhase(deps);
+
+		expect(result.branch).toBe('fix/VT-1538');
+		expect(committedSubject()).toBe('fix: add the starting page of the SWARM test bed');
+	});
+});
+
 describe('buildImplementationPrompt', () => {
 	const context = {
 		repo: 'SmartTechBrewery/swarm',
@@ -951,6 +1051,25 @@ describe('buildImplementationPrompt', () => {
 		expect(prompt).toContain('main');
 		expect(prompt).toContain('T');
 		expect(prompt).toContain('D');
+	});
+
+	// Issue #1242: SWARM renders the commit subject; the agent supplies its parts only.
+	it('asks for a summary and a work type rather than a formatted commit subject', () => {
+		const prompt = buildImplementationPrompt(createMockWorkItem(), context);
+		expect(prompt).toContain('subject (a one-line summary of the change in the imperative mood');
+		expect(prompt).toContain('workType (exactly one of feat, fix,');
+		expect(prompt).not.toContain('commitSubject');
+		expect(prompt).not.toContain('conventional-commit subject');
+	});
+
+	it('sizes the summary to what the repository’s pattern leaves of its limit', () => {
+		const prompt = buildImplementationPrompt(createMockWorkItem(), {
+			...context,
+			taskId: 'VT-1538',
+			commitSubjectNaming: { commitSubjectPattern: '{issue_key} {Subject}' },
+		});
+		// 72 minus "VT-1538 " (8 characters).
+		expect(prompt).toContain('at most 64 characters');
 	});
 
 	it('tells the agent to read the linked issue and its posted plan first', () => {

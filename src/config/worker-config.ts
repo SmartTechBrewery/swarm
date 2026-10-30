@@ -39,6 +39,8 @@ export const WORKER_SAFE_KEYS = [
 	'baseBranch',
 	'branchPrefix',
 	'branchPattern',
+	'commitSubjectPattern',
+	'commitSubjectMaxLength',
 	'agents',
 	'worktreeRetention',
 ] as const;

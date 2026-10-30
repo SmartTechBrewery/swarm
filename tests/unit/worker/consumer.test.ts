@@ -512,6 +512,10 @@ const getLatestRunForTask = vi.fn(
 const findStoredTaskBranch = vi.fn<
 	(projectId: string, repository: string, taskId: string) => Promise<string | undefined>
 >(async () => undefined);
+/** Issue #1242 — the commit subject an earlier Implementation run decided, seeded the same way. */
+const findStoredCommitSubject = vi.fn<
+	(projectId: string, repository: string, taskId: string) => Promise<string | undefined>
+>(async () => undefined);
 const getLatestCompletedPlanningScope = vi.fn<
 	(projectId: string, repository: string, taskId: string) => Promise<ProposedScope | undefined>
 >(async (_projectId: string, _repository: string, _taskId: string) => undefined);
@@ -589,6 +593,8 @@ vi.mock('@/db/repositories/runsRepository.js', () => ({
 		getLatestCompletedPlanningScope(projectId, repository, taskId),
 	findStoredTaskBranch: (projectId: string, repository: string, taskId: string) =>
 		findStoredTaskBranch(projectId, repository, taskId),
+	findStoredCommitSubject: (projectId: string, repository: string, taskId: string) =>
+		findStoredCommitSubject(projectId, repository, taskId),
 	hasCompletedRunForTask: (projectId: string, taskId: string, phase: string) =>
 		hasCompletedRunForTask(projectId, taskId, phase),
 	isRetryPendingStatus: (status: string) => status === 'deferred' || status === 'checkpointed',
@@ -1031,6 +1037,7 @@ describe('processJob', () => {
 		projectLookup = () => PROJECT;
 		phaseImpl = async () => ({ agent: agentResult() });
 		findStoredTaskBranch.mockReset().mockResolvedValue(undefined);
+		findStoredCommitSubject.mockReset().mockResolvedValue(undefined);
 		addComment.mockClear();
 		addComment.mockResolvedValue('comment-1');
 		findWorkItemForArtifact.mockClear();
@@ -2100,6 +2107,32 @@ describe('processJob', () => {
 
 		expect(phaseCalls).toHaveLength(1);
 		expect(phaseCalls[0].context.job.taskBranch).toBeUndefined();
+	});
+
+	// Issue #1242: the commit subject is decided once too, and rides on the job the same way.
+	it('seeds an implementation dispatch with the commit subject an earlier run stored', async () => {
+		findStoredCommitSubject.mockResolvedValue('VT-1538 Add the starting page');
+		const workItem = createMockWorkItem({ statusId: '47fc9ee4' });
+		const trigger: TriggerResult = { phase: 'implementation', taskId: 'VT-1538', workItem };
+
+		await processJob(createMockPmWebhookJob(), registryReturning(trigger));
+
+		expect(findStoredCommitSubject).toHaveBeenCalledWith(PROJECT.id, PROJECT.repo, 'VT-1538');
+		expect(resolvedTarget().jobPayload).toMatchObject({
+			commitSubject: 'VT-1538 Add the starting page',
+		});
+		expect(phaseCalls[0].context.job.commitSubject).toBe('VT-1538 Add the starting page');
+	});
+
+	it('decides the commit subject afresh when the stored-subject read fails', async () => {
+		findStoredCommitSubject.mockRejectedValue(new Error('connection reset'));
+		const workItem = createMockWorkItem({ statusId: '47fc9ee4' });
+		const trigger: TriggerResult = { phase: 'implementation', taskId: 'VT-1538', workItem };
+
+		await processJob(createMockPmWebhookJob(), registryReturning(trigger));
+
+		expect(phaseCalls).toHaveLength(1);
+		expect(phaseCalls[0].context.job.commitSubject).toBeUndefined();
 	});
 
 	it('does not treat PM resume dispatch intent as proof that a branch exists', async () => {

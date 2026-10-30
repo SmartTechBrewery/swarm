@@ -3,13 +3,17 @@ import { useState } from 'react';
 import { buttonClass } from '@/components/ui/button.js';
 import {
 	branchPatternPatch,
+	commitSubjectPatternPatch,
 	effectiveBranchPattern,
+	effectiveCommitSubjectMaxLength,
+	effectiveCommitSubjectPattern,
 	type RepositoryForm,
 	repoInputShape,
 } from '@/lib/project-repository.js';
 import type { ReviewChecksPolicy } from '../../../../src/config/schema.js';
 import { branchPatternFromPrefix } from '../../../../src/pipeline/branch-pattern.js';
 import { BranchPatternDialog } from './branch-pattern-dialog.js';
+import { CommitSubjectPatternDialog } from './commit-subject-pattern-dialog.js';
 
 /** Input/select recipe shared with the rest of the tab (ai/DESIGN_SYSTEM.md §4). */
 const FIELD_CLASS =
@@ -62,7 +66,8 @@ interface RepositoryRowProps {
  * One repository in the project's list: its rank, the reorder/remove actions, and the
  * settings that are genuinely per-repository — merge automation among them since issue
  * #1066, Review's check policy and check wait since issue #1109, each moved off the
- * Pipeline tab's project-wide control, and the WIP limit since issue #1185. Each field's accessible name carries the rank,
+ * Pipeline tab's project-wide control, the WIP limit since issue #1185, and the branch
+ * name and commit subject patterns since issues #1241 and #1242. Each field's accessible name carries the rank,
  * since a project can hold several identical-looking rows.
  *
  * The source-control provider is **not** among them (issue #727): it is the project's,
@@ -89,6 +94,8 @@ function RepositoryRow({
 	const policy = REVIEW_CHECKS_POLICY_OPTIONS.find(({ value }) => value === entry.reviewChecks);
 	const branchPattern = effectiveBranchPattern(entry);
 	const [editingPattern, setEditingPattern] = useState(false);
+	const commitSubjectPattern = effectiveCommitSubjectPattern(entry);
+	const [editingCommitSubject, setEditingCommitSubject] = useState(false);
 
 	return (
 		<li className="p-4 border border-zinc-800 rounded-md bg-panel/20 space-y-3">
@@ -191,6 +198,35 @@ function RepositoryRow({
 						</button>
 					</div>
 				</div>
+				<div className="sm:col-span-2">
+					<label htmlFor={`${idBase}-commit-subject-pattern`} className={LABEL_CLASS}>
+						Commit Subject Pattern
+					</label>
+					{/* Read-only like the branch pattern (issue #1242): composed and validated in
+					    the editor, never typed here unchecked. */}
+					<div className="flex gap-2">
+						<input
+							type="text"
+							id={`${idBase}-commit-subject-pattern`}
+							aria-label={`Commit subject pattern, entry ${rank}`}
+							value={commitSubjectPattern}
+							readOnly
+							className={`${FIELD_CLASS} font-mono`}
+						/>
+						<button
+							type="button"
+							onClick={() => setEditingCommitSubject(true)}
+							disabled={isPending}
+							aria-label={`Edit commit subject pattern, entry ${rank}`}
+							className={buttonClass('secondary')}
+						>
+							Edit
+						</button>
+					</div>
+					<p className="text-xs text-zinc-400 mt-1">
+						How SWARM words this repository's commits and, once set, its pull request titles.
+					</p>
+				</div>
 			</div>
 			<BranchPatternDialog
 				open={editingPattern}
@@ -202,6 +238,17 @@ function RepositoryRow({
 					setEditingPattern(false);
 				}}
 				onCancel={() => setEditingPattern(false)}
+			/>
+			<CommitSubjectPatternDialog
+				open={editingCommitSubject}
+				pattern={commitSubjectPattern}
+				maxLength={effectiveCommitSubjectMaxLength(entry)}
+				rank={rank}
+				onApply={(pattern, maxLength) => {
+					onChange(index, commitSubjectPatternPatch(entry, pattern, maxLength));
+					setEditingCommitSubject(false);
+				}}
+				onCancel={() => setEditingCommitSubject(false)}
 			/>
 
 			<label className="flex items-start gap-3 p-4 border border-zinc-800 rounded-md bg-panel/20 cursor-pointer hover:bg-zinc-800/20 transition-colors">
@@ -346,9 +393,9 @@ export function RepositoryList({
 					Repositories
 				</h2>
 				<p className="text-xs text-zinc-400">
-					Every repository this project operates on, with the branch, merge, Review check and WIP
-					limit settings SWARM uses for each. Each piece of work runs against the repository it
-					belongs to — a board card against the repository that claims it — and none of them is a
+					Every repository this project operates on, with the branch, commit, merge, Review check
+					and WIP limit settings SWARM uses for each. Each piece of work runs against the repository
+					it belongs to — a board card against the repository that claims it — and none of them is a
 					fallback for the others: with several repositories, a card none of them claims is refused
 					rather than run against the first. All of them live on the provider selected above, using
 					the credentials configured with it.

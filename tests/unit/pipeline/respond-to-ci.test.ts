@@ -439,6 +439,30 @@ describe('runRespondToCiPhase', () => {
 		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('respond-ci-64');
 	});
 
+	// Issue #1242: the CI fix carries the task's one subject, like every other commit.
+	describe('the fix commit’s subject (issue #1242)', () => {
+		const headSubject = (path: string) => fixtureGit(path, 'log', '-1', '--format=%s').trim();
+
+		it('commits with the subject Implementation stored for the task, needing none of its own', async () => {
+			const deps = makeDeps();
+			writeHandoff(deps.path, ciHandoff({ commitSubject: undefined }));
+
+			await runRespondToCiPhase({ ...deps, commitSubject: 'VT-1538 Add the starting page' });
+
+			expect(headSubject(deps.path)).toBe('VT-1538 Add the starting page');
+		});
+
+		it('renders the agent’s subject through the repository’s pattern when none is stored', async () => {
+			const deps = makeDeps(
+				createMockProjectConfig({ commitSubjectPattern: '{issue_key} {Subject}' }),
+			);
+
+			await runRespondToCiPhase(deps);
+
+			expect(headSubject(deps.path)).toBe('64 Satisfy the type-check');
+		});
+	});
+
 	/**
 	 * A branch that moved under the fix (issue #850). Phase 1/2's PR-scoped hold is
 	 * what prevents the concurrency; these cover what the hold cannot — a fail-open

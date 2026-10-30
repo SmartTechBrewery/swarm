@@ -425,6 +425,15 @@ export const TaskAssignmentSchema = z.object({
 	 */
 	taskBranch: z.string().min(1).optional(),
 	/**
+	 * implementation, respond-to-review and respond-to-ci: the commit subject
+	 * Implementation decided for this task (issue #1242), resolved control-plane side
+	 * from the run record the worker cannot read. Implementation reuses it rather than
+	 * rendering the repository's pattern again; a respond phase commits its fix with it.
+	 * Additive in both directions like {@link taskBranch}, so the protocol version is
+	 * not bumped: without it each phase falls back to deciding a subject itself.
+	 */
+	commitSubject: z.string().min(1).optional(),
+	/**
 	 * The **worker operator's own** SCM credential for the provider this project runs
 	 * on, resolved control-plane side per `(worker, project.scm)` from the durable
 	 * store (issue #765) — the identity the phase's commits, push, pull request and
@@ -668,7 +677,9 @@ export type WorkItemBlockerFrame = z.infer<typeof WorkItemBlockerFrameSchema>;
  * repository's pattern has a part the implementer chooses — which the control
  * plane stores as the run's `taskBranch`. A new optional key rather than a new
  * `state`, on purpose: an older control plane strips the key and still parses the
- * frame, while an unknown state would fail it and close the worker's socket.
+ * frame, while an unknown state would fail it and close the worker's socket. The
+ * same goes for `commitSubject` (issue #1242), which names the commit subject the
+ * phase decided at delivery, stored as the run's `commitSubject`.
  */
 export const TaskProgressSchema = z.object({
 	type: z.literal('task-progress'),
@@ -678,6 +689,7 @@ export const TaskProgressSchema = z.object({
 	taskId: z.string().min(1),
 	state: z.enum(['running', 'branch-provisioned']),
 	branch: z.string().min(1).optional(),
+	commitSubject: z.string().min(1).optional(),
 });
 export type TaskProgress = z.infer<typeof TaskProgressSchema>;
 

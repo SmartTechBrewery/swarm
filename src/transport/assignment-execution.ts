@@ -1005,6 +1005,21 @@ function buildDbFreePhaseInputs({
 				branch,
 			});
 		},
+		// The task's commit subject (issue #1242): the one Implementation decided, which
+		// Implementation reuses and a respond phase commits its fix with — and, once this
+		// attempt decides one, reported for the control plane to store with the run.
+		commitSubject: assignment.commitSubject,
+		onCommitSubjectNamed: async (commitSubject: string) => {
+			sink.send({
+				type: 'task-progress',
+				dispatchId: assignment.dispatchId,
+				runId: assignment.runId,
+				phase: assignment.phase,
+				taskId: assignment.taskId,
+				state: 'branch-provisioned',
+				commitSubject,
+			});
+		},
 		prNumber: assignment.prNumber,
 		prBranch: assignment.prBranch,
 		headSha: assignment.headSha,

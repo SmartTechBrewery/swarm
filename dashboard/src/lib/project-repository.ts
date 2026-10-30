@@ -30,6 +30,10 @@ import {
 	branchPatternFromPrefix,
 	DEFAULT_BRANCH_PREFIX,
 } from '../../../src/pipeline/branch-pattern.js';
+import {
+	DEFAULT_COMMIT_SUBJECT_MAX_LENGTH,
+	DEFAULT_COMMIT_SUBJECT_PATTERN,
+} from '../../../src/pipeline/commit-subject-pattern.js';
 import { SCM_REPO_COORDINATES } from '../../../src/scm/repo-coordinates.js';
 import type { ScmType } from '../../../src/scm/types.js';
 
@@ -60,6 +64,13 @@ export interface RepositoryEntry {
 	branchPrefix?: string;
 	/** How this repository names its task branches (issue #1241). Unset means `<branchPrefix>{issue_key}`. */
 	branchPattern?: string;
+	/**
+	 * How this repository words its commit subjects and pull request titles (issue
+	 * #1242). Unset means `{work_type}: {subject}` with pull requests titled by their card.
+	 */
+	commitSubjectPattern?: string;
+	/** The rendered subject length the pattern editor warns above (issue #1242). Unset means 72. */
+	commitSubjectMaxLength?: number;
 	/**
 	 * The board card's routing token (issue #686). Authored in `swarm.config.json`
 	 * and **not editable here** — this screen only carries it through, so saving the
@@ -97,6 +108,16 @@ export interface RepositoryForm {
 	 * entry keeps running on `<branchPrefix>{issue_key}` and is saved without the key.
 	 */
 	branchPattern: string;
+	/**
+	 * The repository's own commit subject pattern (issue #1242). `''` states none, so the
+	 * entry keeps today's conventional subjects and card-titled pull requests.
+	 */
+	commitSubjectPattern: string;
+	/**
+	 * The editor's length limit (issue #1242), as typed. `''` states none, so the default
+	 * (72 characters) applies and the entry is saved without the key.
+	 */
+	commitSubjectMaxLength: string;
 	/** Merge automation for this repository (issue #1066) — an unset entry reads as off. */
 	autoMerge: boolean;
 	/** Review's check policy (issue #1109) — an unset entry reads as `required`. */
@@ -148,6 +169,8 @@ const NEW_REPOSITORY = {
 	baseBranch: DEFAULT_BASE_BRANCH,
 	branchPrefix: DEFAULT_BRANCH_PREFIX,
 	branchPattern: '',
+	commitSubjectPattern: '',
+	commitSubjectMaxLength: '',
 	autoMerge: false,
 	reviewChecks: DEFAULT_REVIEW_CHECKS_POLICY,
 	reviewChecksWaitMinutes: '',
@@ -173,6 +196,8 @@ export function toRepositoryForms(repositories: RepositoryEntry[] | undefined): 
 		baseBranch: entry.baseBranch ?? '',
 		branchPrefix: entry.branchPrefix ?? '',
 		branchPattern: entry.branchPattern ?? '',
+		commitSubjectPattern: entry.commitSubjectPattern ?? '',
+		commitSubjectMaxLength: entry.commitSubjectMaxLength?.toString() ?? '',
 		autoMerge: entry.autoMerge === true,
 		reviewChecks: entry.reviewChecks ?? DEFAULT_REVIEW_CHECKS_POLICY,
 		reviewChecksWaitMinutes: entry.reviewChecksWaitMinutes?.toString() ?? '',
@@ -202,11 +227,14 @@ export function toRepositoryEntries(rows: RepositoryForm[]): RepositoryEntry[] {
 	return rows.map((row) => {
 		const wait = row.reviewChecksWaitMinutes.trim();
 		const wipLimit = row.wipLimit.trim();
+		const maxLength = row.commitSubjectMaxLength.trim();
 		return {
 			repo: row.repo,
 			baseBranch: row.baseBranch,
 			branchPrefix: row.branchPrefix,
 			...(row.branchPattern ? { branchPattern: row.branchPattern } : {}),
+			...(row.commitSubjectPattern ? { commitSubjectPattern: row.commitSubjectPattern } : {}),
+			...(maxLength ? { commitSubjectMaxLength: Number(maxLength) } : {}),
 			autoMerge: row.autoMerge,
 			reviewChecks: row.reviewChecks,
 			...(wait ? { reviewChecksWaitMinutes: Number(wait) } : {}),
@@ -237,6 +265,46 @@ export function branchPatternPatch(
 	pattern: string,
 ): Pick<RepositoryForm, 'branchPattern'> {
 	return { branchPattern: pattern === branchPatternFromPrefix(row.branchPrefix) ? '' : pattern };
+}
+
+/**
+ * The pattern a row words its commit subjects by (issue #1242) — its own, or the
+ * default `{work_type}: {subject}`, the same resolution the server applies
+ * (`resolveCommitSubjectPattern`, `src/pipeline/commit-subject-pattern.ts`).
+ */
+export function effectiveCommitSubjectPattern(
+	row: Pick<RepositoryForm, 'commitSubjectPattern'>,
+): string {
+	return row.commitSubjectPattern || DEFAULT_COMMIT_SUBJECT_PATTERN;
+}
+
+/** The length limit a row's pattern editor warns above (issue #1242) — its own, or 72. */
+export function effectiveCommitSubjectMaxLength(
+	row: Pick<RepositoryForm, 'commitSubjectMaxLength'>,
+): number {
+	const stated = Number.parseInt(row.commitSubjectMaxLength.trim(), 10);
+	return Number.isFinite(stated) ? stated : DEFAULT_COMMIT_SUBJECT_MAX_LENGTH;
+}
+
+/**
+ * The row patch an edited commit subject pattern and length limit apply (issue #1242).
+ * A row stating none keeps stating none when the default is applied unchanged, so an
+ * entry opened and applied as-is is not made dirty — and its pull requests keep their
+ * card's title, which only a pattern of the repository's own replaces. A row stating
+ * its own keeps whatever is applied, the default included.
+ */
+export function commitSubjectPatternPatch(
+	row: Pick<RepositoryForm, 'commitSubjectPattern' | 'commitSubjectMaxLength'>,
+	pattern: string,
+	maxLength: number,
+): Pick<RepositoryForm, 'commitSubjectPattern' | 'commitSubjectMaxLength'> {
+	const keepsNoPattern = !row.commitSubjectPattern && pattern === DEFAULT_COMMIT_SUBJECT_PATTERN;
+	const keepsNoLimit =
+		!row.commitSubjectMaxLength.trim() && maxLength === DEFAULT_COMMIT_SUBJECT_MAX_LENGTH;
+	return {
+		commitSubjectPattern: keepsNoPattern ? '' : pattern,
+		commitSubjectMaxLength: keepsNoLimit ? '' : String(maxLength),
+	};
 }
 
 /** Append a blank row at the end — the lowest-priority position, never the default. */
@@ -321,6 +389,8 @@ export function areRepositoriesDirty(
 			row.baseBranch !== other?.baseBranch ||
 			row.branchPrefix !== other?.branchPrefix ||
 			row.branchPattern !== other?.branchPattern ||
+			row.commitSubjectPattern !== other?.commitSubjectPattern ||
+			row.commitSubjectMaxLength.trim() !== other?.commitSubjectMaxLength ||
 			row.autoMerge !== other?.autoMerge ||
 			row.reviewChecks !== other?.reviewChecks ||
 			row.reviewChecksWaitMinutes.trim() !== other?.reviewChecksWaitMinutes ||

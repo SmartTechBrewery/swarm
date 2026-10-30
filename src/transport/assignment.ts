@@ -101,6 +101,12 @@ export interface BuildTaskAssignmentInput {
 	 */
 	taskBranch?: string;
 	/**
+	 * implementation / respond-to-review / respond-to-ci: the commit subject
+	 * Implementation decided for the task (issue #1242), read off the run record by the
+	 * caller — the worker has no database.
+	 */
+	commitSubject?: string;
+	/**
 	 * The selected worker's own operator SCM credential for this project's provider,
 	 * resolved by the caller from the per-`(worker, provider)` store
 	 * (`requireWorkerScmCredential`, `../identity/worker-scm-credential.ts`).
@@ -165,6 +171,7 @@ export function buildTaskAssignment(input: BuildTaskAssignmentInput): TaskAssign
 		boardItemId: input.boardItemId,
 		repository: input.repository,
 		taskBranch: input.taskBranch,
+		commitSubject: input.commitSubject,
 		operatorCredential: input.operatorCredential,
 	};
 	// Validate before returning so a bad assembly fails at the seam, not on the wire.
