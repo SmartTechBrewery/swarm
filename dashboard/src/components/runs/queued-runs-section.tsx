@@ -210,138 +210,59 @@ function NoTriggerGroup({ items }: { items: QueuedRun[] }) {
 	);
 }
 
-interface QueuedRunsSectionProps {
-	items: QueuedRun[];
-	/**
-	 * The board dispatches `runs.queued` reported as proven no-trigger (issue
-	 * #570) — server-partitioned, never mixed into `items`. Rendered as one
-	 * collapsed line by {@link NoTriggerGroup}; omitted by callers that don't read
-	 * that half of the response.
-	 */
-	noTriggerItems?: QueuedRun[];
-	/**
-	 * Whether to render the Project column. `true` for the global `/runs` view;
-	 * `false` for the project-scoped Runs tab, where every row is the same project
-	 * — matching {@link RunsTable}'s `showProject`.
-	 */
-	showProject?: boolean;
-	/**
-	 * The project scope for the in-progress-run lookup (issue #421), matching the
-	 * scope of `items`. Left undefined by the global `/runs` view, where the lookup
-	 * runs unscoped — a work-item URL is globally unique, so an unscoped match can
-	 * only be the same card.
-	 */
-	projectId?: string;
+/**
+ * The section's heading and its fold toggle (issue #1207) — the same affordance as
+ * {@link WipUsageSection}'s, so the two neighbouring sections fold alike. The
+ * count stays on the heading, so a folded queue still says how much is waiting.
+ */
+function QueuedHeading({
+	count,
+	expanded,
+	onToggle,
+}: {
+	count: number;
+	expanded: boolean;
+	onToggle: () => void;
+}) {
+	return (
+		<h2>
+			<button
+				type="button"
+				aria-expanded={expanded}
+				onClick={onToggle}
+				className="flex w-full items-center gap-1.5 text-left text-sm font-semibold tracking-tight text-zinc-300 hover:text-zinc-200"
+			>
+				{expanded ? (
+					<ChevronDown className="h-3.5 w-3.5 shrink-0" />
+				) : (
+					<ChevronRight className="h-3.5 w-3.5 shrink-0" />
+				)}
+				{/* Ordered as dispatched (priority + FIFO), hence the icon (issue #1204). */}
+				<ListOrdered className="h-4 w-4 shrink-0 text-zinc-400" aria-hidden="true" />
+				Queued <span className="text-zinc-500">({count})</span>
+			</button>
+		</h2>
+	);
 }
 
 /**
- * A compact, distinct **Queued** section shown above the Runs table (issue #238):
- * work already enqueued in BullMQ but not yet picked up by the worker, so users
- * see pending work even when nothing is currently running.
- *
- * - Hidden entirely when there is nothing queued — returns `null` so there's no
- *   empty box and no layout shift for the table below.
- * - Rows render in the exact order the server returns them (dispatch priority +
- *   FIFO); this component never re-sorts — it only folds pending review-gate
- *   jobs sharing the same project/repo/PR/head SHA into one logical row via
- *   {@link groupQueuedRuns} (issue #275), so a duplicate raw lifecycle event
- *   (e.g. a Respond-to-review follow-up alongside a pull-request update) doesn't read as two queued Review agents.
- * - A row linked to an existing deferred attempt exposes its run detail page;
- *   fresh queued work has no run yet and therefore no detail action.
+ * The queued rows themselves, in both presentations — what the heading folds away
+ * (issue #1207). Rows keep the order they are given in.
  */
-export function QueuedRunsSection({
-	items,
-	noTriggerItems = [],
-	showProject = true,
-	projectId,
-}: QueuedRunsSectionProps) {
-	// Resolve project display names the same way RunsTable does. Hook order is
-	// stable across renders, so the early return below stays after all hooks.
-	const projectsQuery = useQuery(trpc.projects.list.queryOptions());
-	const projectsMap = new Map(projectsQuery.data?.map((p) => [p.id, p]) ?? []);
+function QueuedRowList({
+	rows,
+	showProject,
+	projectsMap,
+	onPutBack,
+}: {
+	rows: QueuedDisplayRow[];
+	showProject: boolean;
+	projectsMap: ReadonlyMap<string, { name: string }>;
+	onPutBack: (item: QueuedRun) => void;
+}) {
 	const columnWidths = runTableColumnWidths(showProject);
-
-	// Dedicated running-run lookup (issue #421): a claimed board dispatch has left
-	// the waiting set and become a run in the Runs table, but its leftover sibling
-	// dispatches linger here as `pending`. Scoped only by project — deliberately
-	// independent of the Runs table's own status/phase filters and pagination — so
-	// the dedup holds even when that table is filtered away from `running`.
-	const runningRunsQuery = useQuery({
-		...trpc.runs.list.queryOptions({ projectId, status: 'running', limit: 200, offset: 0 }),
-		refetchInterval: (query) => runsListRefetchInterval(query.state.data),
-	});
-	const activeBoardRunUrls = new Set<string>();
-	for (const run of (runningRunsQuery.data?.data ?? []) as RunRow[]) {
-		if ((run.phase === 'planning' || run.phase === 'implementation') && run.workItemUrl) {
-			activeBoardRunUrls.add(run.workItemUrl);
-		}
-	}
-
-	const rows = hideBoardRowsWithActiveRun(groupQueuedRuns(items), activeBoardRunUrls);
-
-	const [confirmOpen, setConfirmOpen] = useState(false);
-	const [selectedItem, setSelectedItem] = useState<QueuedRun | null>(null);
-	const [successMessage, setSuccessMessage] = useState<string | null>(null);
-	const [errorMessage, setErrorMessage] = useState<string | null>(null);
-
-	const queryClient = useQueryClient();
-	const putBackMutation = useMutation({
-		mutationFn: (item: QueuedRun) =>
-			trpcClient.runs.putBack.mutate({ jobId: item.jobId, projectId: item.projectId }),
-		onSuccess: () => {
-			setConfirmOpen(false);
-			setSelectedItem(null);
-			setSuccessMessage('Successfully returned the work item to Backlog.');
-			setErrorMessage(null);
-			queryClient.invalidateQueries({ queryKey: trpc.runs.queued.queryKey() });
-			setTimeout(() => setSuccessMessage(null), 5000);
-		},
-		onError: (err) => {
-			setErrorMessage(err.message || 'An error occurred while putting back the item.');
-		},
-	});
-
-	// Collapse the section when nothing remains to show — either no queued items at
-	// all, or every queued item was a fresh board row hidden as a duplicate of an
-	// in-progress run (issue #421). Computed from `rows` (post-hide) so the header
-	// count and the section presence stay consistent. Proven no-trigger dispatches
-	// keep the section alive on their own (issue #570) — they are not queued work, so
-	// they get no heading, count or table, but an accumulation of them must not become
-	// invisible either.
-	if (rows.length === 0) {
-		if (noTriggerItems.length === 0) return null;
-		return (
-			<section data-testid="queued-runs-section" className="space-y-2">
-				<NoTriggerGroup items={noTriggerItems} />
-			</section>
-		);
-	}
-
-	const handleOpenConfirm = (item: QueuedRun) => {
-		setSelectedItem(item);
-		setErrorMessage(null);
-		setConfirmOpen(true);
-	};
-
-	const handleCloseConfirm = () => {
-		if (putBackMutation.isPending) return;
-		setConfirmOpen(false);
-		setSelectedItem(null);
-		setErrorMessage(null);
-	};
-
 	return (
-		<section data-testid="queued-runs-section" className="space-y-2">
-			{/* Ordered as dispatched (priority + FIFO), hence the icon (issue #1204). */}
-			<h2 className="flex items-center gap-1.5 text-sm font-semibold tracking-tight text-zinc-300">
-				<ListOrdered className="h-4 w-4 shrink-0 text-zinc-400" aria-hidden="true" />
-				Queued <span className="text-zinc-500">({rows.length})</span>
-			</h2>
-			{successMessage && (
-				<div className="p-3 bg-emerald-950/40 border border-emerald-800 rounded text-xs text-emerald-200">
-					{successMessage}
-				</div>
-			)}
+		<>
 			{/*
 			 * Mobile (< md): one card per grouped queued row — no horizontal scroll
 			 * (issue #381). Task + Queued badge are the primary line, phase (with
@@ -399,7 +320,7 @@ export function QueuedRunsSection({
 									{showPutBack && (
 										<button
 											type="button"
-											onClick={() => handleOpenConfirm(item)}
+											onClick={() => onPutBack(item)}
 											className={`${buttonClass('secondary', 'sm')} min-h-[40px]`}
 										>
 											<RotateCcw className="w-3.5 h-3.5" />
@@ -489,7 +410,7 @@ export function QueuedRunsSection({
 											{showPutBack && (
 												<button
 													type="button"
-													onClick={() => handleOpenConfirm(item)}
+													onClick={() => onPutBack(item)}
 													className={buttonClass('secondary', 'xs')}
 												>
 													<RotateCcw className="w-3 h-3" />
@@ -504,10 +425,159 @@ export function QueuedRunsSection({
 					</tbody>
 				</table>
 			</div>
+		</>
+	);
+}
+
+interface QueuedRunsSectionProps {
+	items: QueuedRun[];
+	/**
+	 * The board dispatches `runs.queued` reported as proven no-trigger (issue
+	 * #570) — server-partitioned, never mixed into `items`. Rendered as one
+	 * collapsed line by {@link NoTriggerGroup}; omitted by callers that don't read
+	 * that half of the response.
+	 */
+	noTriggerItems?: QueuedRun[];
+	/**
+	 * Whether to render the Project column. `true` for the global `/runs` view;
+	 * `false` for the project-scoped Runs tab, where every row is the same project
+	 * — matching {@link RunsTable}'s `showProject`.
+	 */
+	showProject?: boolean;
+	/**
+	 * The project scope for the in-progress-run lookup (issue #421), matching the
+	 * scope of `items`. Left undefined by the global `/runs` view, where the lookup
+	 * runs unscoped — a work-item URL is globally unique, so an unscoped match can
+	 * only be the same card.
+	 */
+	projectId?: string;
+}
+
+/**
+ * A compact, distinct **Queued** section shown above the Runs table (issue #238):
+ * work already enqueued in BullMQ but not yet picked up by the worker, so users
+ * see pending work even when nothing is currently running.
+ *
+ * - Hidden entirely when there is nothing queued — returns `null` so there's no
+ *   empty box and no layout shift for the table below.
+ * - Folds from its heading like {@link WipUsageSection} (issue #1207), starting
+ *   expanded; the heading and its count stay visible while the rows are folded.
+ * - Rows render in the exact order the server returns them (dispatch priority +
+ *   FIFO); this component never re-sorts — it only folds pending review-gate
+ *   jobs sharing the same project/repo/PR/head SHA into one logical row via
+ *   {@link groupQueuedRuns} (issue #275), so a duplicate raw lifecycle event
+ *   (e.g. a Respond-to-review follow-up alongside a pull-request update) doesn't read as two queued Review agents.
+ * - A row linked to an existing deferred attempt exposes its run detail page;
+ *   fresh queued work has no run yet and therefore no detail action.
+ */
+export function QueuedRunsSection({
+	items,
+	noTriggerItems = [],
+	showProject = true,
+	projectId,
+}: QueuedRunsSectionProps) {
+	// Resolve project display names the same way RunsTable does. Hook order is
+	// stable across renders, so the early return below stays after all hooks.
+	const projectsQuery = useQuery(trpc.projects.list.queryOptions());
+	const projectsMap = new Map(projectsQuery.data?.map((p) => [p.id, p]) ?? []);
+
+	// Dedicated running-run lookup (issue #421): a claimed board dispatch has left
+	// the waiting set and become a run in the Runs table, but its leftover sibling
+	// dispatches linger here as `pending`. Scoped only by project — deliberately
+	// independent of the Runs table's own status/phase filters and pagination — so
+	// the dedup holds even when that table is filtered away from `running`.
+	const runningRunsQuery = useQuery({
+		...trpc.runs.list.queryOptions({ projectId, status: 'running', limit: 200, offset: 0 }),
+		refetchInterval: (query) => runsListRefetchInterval(query.state.data),
+	});
+	const activeBoardRunUrls = new Set<string>();
+	for (const run of (runningRunsQuery.data?.data ?? []) as RunRow[]) {
+		if ((run.phase === 'planning' || run.phase === 'implementation') && run.workItemUrl) {
+			activeBoardRunUrls.add(run.workItemUrl);
+		}
+	}
+
+	const rows = hideBoardRowsWithActiveRun(groupQueuedRuns(items), activeBoardRunUrls);
+
+	// Folds the queued rows away from the heading, like Tickets in progress (issue #1207).
+	const [expanded, setExpanded] = useState(true);
+	const [confirmOpen, setConfirmOpen] = useState(false);
+	const [selectedItem, setSelectedItem] = useState<QueuedRun | null>(null);
+	const [successMessage, setSuccessMessage] = useState<string | null>(null);
+	const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+	const queryClient = useQueryClient();
+	const putBackMutation = useMutation({
+		mutationFn: (item: QueuedRun) =>
+			trpcClient.runs.putBack.mutate({ jobId: item.jobId, projectId: item.projectId }),
+		onSuccess: () => {
+			setConfirmOpen(false);
+			setSelectedItem(null);
+			setSuccessMessage('Successfully returned the work item to Backlog.');
+			setErrorMessage(null);
+			queryClient.invalidateQueries({ queryKey: trpc.runs.queued.queryKey() });
+			setTimeout(() => setSuccessMessage(null), 5000);
+		},
+		onError: (err) => {
+			setErrorMessage(err.message || 'An error occurred while putting back the item.');
+		},
+	});
+
+	// Collapse the section when nothing remains to show — either no queued items at
+	// all, or every queued item was a fresh board row hidden as a duplicate of an
+	// in-progress run (issue #421). Computed from `rows` (post-hide) so the header
+	// count and the section presence stay consistent. Proven no-trigger dispatches
+	// keep the section alive on their own (issue #570) — they are not queued work, so
+	// they get no heading, count or table, but an accumulation of them must not become
+	// invisible either.
+	if (rows.length === 0) {
+		if (noTriggerItems.length === 0) return null;
+		return (
+			<section data-testid="queued-runs-section" className="space-y-2">
+				<NoTriggerGroup items={noTriggerItems} />
+			</section>
+		);
+	}
+
+	const handleOpenConfirm = (item: QueuedRun) => {
+		setSelectedItem(item);
+		setErrorMessage(null);
+		setConfirmOpen(true);
+	};
+
+	const handleCloseConfirm = () => {
+		if (putBackMutation.isPending) return;
+		setConfirmOpen(false);
+		setSelectedItem(null);
+		setErrorMessage(null);
+	};
+
+	return (
+		<section data-testid="queued-runs-section" className="space-y-2">
+			<QueuedHeading
+				count={rows.length}
+				expanded={expanded}
+				onToggle={() => setExpanded((current) => !current)}
+			/>
+			{successMessage && (
+				<div className="p-3 bg-emerald-950/40 border border-emerald-800 rounded text-xs text-emerald-200">
+					{successMessage}
+				</div>
+			)}
+			{expanded && (
+				<QueuedRowList
+					rows={rows}
+					showProject={showProject}
+					projectsMap={projectsMap}
+					onPutBack={handleOpenConfirm}
+				/>
+			)}
 
 			{/*
 			 * Board dispatches the server proved cannot start a phase (issue #570) —
-			 * below the queue, collapsed, and never counted as queued work.
+			 * below the queue, collapsed, and never counted as queued work. Left out of
+			 * the Queued toggle on purpose (issue #1207): they are not queued work, and
+			 * an accumulation of them must stay observable while the queue is folded.
 			 */}
 			<NoTriggerGroup items={noTriggerItems} />
 
