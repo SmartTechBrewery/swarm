@@ -766,7 +766,12 @@ unchanged.
   registration fails, the command prints what is left to run by hand — **in the
   order it must be run**: the enrollment steps (`workers enroll`, or `approve` /
   `consent` when the enrollment was created) before `set-scm-credential` — *and* the
-  worker credential once, since that value is otherwise unrecoverable.
+  worker credential once, since that value is otherwise unrecoverable. Those
+  commands, and `setup`'s start / check / retry lines, name **this installation's**
+  CLI (issue #1221): bare `swarm` / `swarm-worker-agent` when that name on `PATH`
+  resolves to the clone the command runs from, otherwise its absolute
+  `node <clone>/bin/swarm.js` / `<clone>/bin/swarm-worker-agent` form — so a machine
+  serving a second installation is never handed the other installation's command.
 - **`add-checkout <path>`** — give an **existing** worker another repository
   checkout on this machine (issue #1059), without re-registering it — which would
   issue a new worker and lose its enrollments and stored operator credentials. Run
