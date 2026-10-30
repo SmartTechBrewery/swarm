@@ -714,6 +714,20 @@ describe('swarm workers', () => {
 			const cacheLine = lines().find((line) => line.includes('run:worker')) ?? '';
 			expect(cacheLine).toContain('/home/ada/.swarm/worker-credentials/deadbeef/credential.json');
 			expect(cacheLine).not.toContain('raw-credential-token');
+			expect(cacheLine).toContain(
+				`also cached for ${REPO_ROOT} — start this worker there with: swarm run:worker (`,
+			);
+		});
+
+		// Issue #1221: the cache line is a start command too, so on a machine whose PATH
+		// `swarm` is another installation's it names this installation's own CLI.
+		it("names this installation's own CLI in the cache line on a second installation", async () => {
+			swarmCommand.mockReturnValue('node /opt/swarm-two/bin/swarm.js');
+			expect(await run(ARGV)).toBe(0);
+			const cacheLine = lines().find((line) => line.includes('also cached for')) ?? '';
+			expect(cacheLine).toMatch(
+				/ — start this worker there with: node \/opt\/swarm-two\/bin\/swarm\.js run:worker \(\/home\/ada\/\.swarm\/worker-credentials\/deadbeef\/credential\.json\)$/,
+			);
 		});
 
 		it('does not invite a local start when the worker checkout is not on this machine', async () => {

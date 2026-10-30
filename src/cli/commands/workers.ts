@@ -898,7 +898,7 @@ function cacheCredentialForCheckout(
 			extraRepoRoots.length > 0 ? ` (with ${extraRepoRoots.join(', ')} as extra checkouts)` : '';
 		if (existsSync(repoRoot)) {
 			out.info(
-				`also cached for ${repoRoot}${extras} — start this worker there with: swarm run:worker (${cachePath})`,
+				`also cached for ${repoRoot}${extras} — start this worker there with: ${swarmCommand()} run:worker (${cachePath})`,
 			);
 		} else {
 			out.info(`also cached for checkout ${repoRoot}${extras}: ${cachePath}`);
