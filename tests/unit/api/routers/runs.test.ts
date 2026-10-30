@@ -3176,6 +3176,34 @@ describe('runsRouter', () => {
 				const [{ jobPayload }] = vi.mocked(createAndPublishDispatch).mock.calls[0];
 				expect(jobPayload.recoveryMode).toBe('checkpoint');
 			});
+
+			// Issue #1219: a checkpoint continuation that timed out at its continuation
+			// budget keeps its pin through the failed settle, so "Retry now" continues from
+			// the checkpoint on that machine rather than restarting the phase.
+			it('continues a continuation-budget-exhausted run on the machine holding it (issue #1219)', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					unrecordedFailedRun({
+						recovery: { preservedWorkerId: 'worker-a' },
+						failureDiagnosis: {
+							kind: 'continuation-budget-exhausted',
+							title: 'Known condition: continuation budget exhausted',
+							message: 'The run was stopped involuntarily again.',
+							recovery: 'Retry now continues it once more.',
+						},
+					}),
+				);
+				vi.mocked(getActiveDispatchByRunId).mockResolvedValue(undefined);
+				vi.mocked(createAndPublishDispatch).mockResolvedValue({
+					dispatch: makeDispatch(),
+					created: true,
+				});
+
+				await caller.retryNow({ runId: 'run-1' });
+
+				const [{ jobPayload }] = vi.mocked(createAndPublishDispatch).mock.calls[0];
+				expect(jobPayload.recoveryMode).toBe('checkpoint');
+				expect(jobContinuesPreservedCheckout(jobPayload)).toBe(true);
+			});
 		});
 		// Issue #1197, live on run 38700e2e: an Implementation run failed after provisioning
 		// its task branch locally, and "Retry now" reused the branch on another machine,

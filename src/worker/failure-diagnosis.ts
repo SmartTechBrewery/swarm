@@ -110,7 +110,7 @@ function knownDiagnosis(condition: KnownFailureCondition): FailureDiagnosis {
 				condition,
 				'Known condition: continuation budget exhausted',
 				'The run was stopped involuntarily again after using every checkpoint continuation the project allows, so it was not handed off a further time.',
-				'Inspect the checkpoint recorded on this run, then either raise `pipeline.maxContinuations`, narrow the task, or reset and restart the phase.',
+				'Inspect the checkpoint recorded on this run. "Retry now" continues it once more from that checkpoint on the machine holding it; otherwise raise `pipeline.maxContinuations`, narrow the task, or use "Reset & restart" to start the phase over.',
 			);
 	}
 }

@@ -384,6 +384,15 @@ says, and spends nothing: the run stays `checkpointed` with its checkpoint and a
 `recoveryMode: 'checkpoint'` continuation on that machine. Only `MAX_RATE_LIMIT_RETRIES` bounds
 it. `capacity` stops are unaffected — they never become a Tier 2 continuation in the first place.
 
+**A terminal failure keeps the pin** (issue #1219). When a stop Tier 2 judged continuable still
+ends the run — a timeout or stall with the continuation budget spent, or any Tier 2 stop whose
+rate-limit or automatic retry budget ran out — the checkout and this phase's checkpoint are still
+on the attempt's machine. The `failed` settle therefore re-records the preserved-worker pin after
+its `recovery: null` write, so "Retry now" on a run whose failed attempt was itself a checkpoint
+continuation keeps `recoveryMode: 'checkpoint'` and continues from that checkpoint on that machine.
+"Reset & restart" is the way to start the phase over instead. A hard error, a checkpoint written
+by another phase, a released checkout, and a cancellation record no pin, exactly as before.
+
 **A continuation whose worker transport is lost is re-attempted as the same continuation**
 (issue #1138). The transport-loss reap reports no exit, session or checkpoint, so there is nothing
 to re-derive from; the automatic retry instead carries the lost attempt's own

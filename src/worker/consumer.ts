@@ -337,6 +337,13 @@ export type JobOutcome =
 			 * preserved work on the machine that holds it rather than starting over.
 			 */
 			carriedContinuation?: PreservedContinuationKind;
+			/**
+			 * True when this failure left this phase's checkpoint in a preserved checkout
+			 * that Tier 2 judged continuable, but whose continuation or retry budget is
+			 * spent. The settle records the machine holding it (issue #1219), so "Retry
+			 * now" continues from that checkpoint there instead of starting over.
+			 */
+			preservesCheckpoint?: boolean;
 	  }
 	| {
 			status: 'phase-deferred';
@@ -3540,6 +3547,7 @@ async function finalizeFailedRun(
 		// cancellation, `undefined` when this failure isn't a cancellation at all
 		// (leaves the column untouched — see `CompleteRunInput.cancellation`).
 		let cancellationOrigin: CancellationOrigin | null | undefined;
+		let isCancelled = false;
 
 		if (err instanceof BlockedRecoveryError) {
 			recoveryVal = {
@@ -3547,7 +3555,7 @@ async function finalizeFailedRun(
 				blockedReason: err.reason,
 			};
 		} else {
-			const isCancelled = runId ? await isRunCancellationRequested(runId) : false;
+			isCancelled = runId ? await isRunCancellationRequested(runId) : false;
 			if (isCancelled && runId) {
 				cancellationOrigin = await getRunCancellationOrigin(runId);
 				const run = await getRunByIdFromDb(runId);
@@ -3597,6 +3605,13 @@ async function finalizeFailedRun(
 		// A cancellation that kept the checkout for its session leaves the same
 		// machine-local state a deferral does, so it pins the same way (issue #567).
 		if (recoveryVal?.state === 'preserved') await recordPreservedWorker(runId);
+		// A terminal failure Tier 2 judged continuable left this phase's checkpoint in a
+		// preserved checkout (issue #1219), so it is pinned the same way, after the
+		// `null` write above that would otherwise erase it. `runs.worker_id` is the right
+		// machine: a continuation is only ever dispatched pinned to its preserved
+		// machine, and a first attempt preserved its own checkout. A cancellation is
+		// left to the reconcile above, which decides that checkout's fate.
+		if (outcome.preservesCheckpoint && !isCancelled) await recordPreservedWorker(runId);
 		// An Implementation attempt that provisioned its task branch leaves that branch
 		// on its own machine whatever became of the checkout, and "Retry now" reuses it
 		// (issue #1197). So the holder is re-recorded after the `null` write above;
@@ -4818,6 +4833,15 @@ async function handlePhaseFailure(
 			isDeferrable && err instanceof AgentRunError
 				? carriedContinuationFor(err.failure, job)
 				: undefined,
+		// Tier 2 judged this stop continuable — an exhausted continuation budget, or a
+		// `continue` verdict whose retry budget is spent — so the checkout and this
+		// phase's checkpoint are still on the attempt's machine (issue #1219). `release`
+		// is excluded because that checkout was just released, and `undefined` because
+		// no checkpoint of this phase was found (or the stop was not deferrable at all).
+		preservesCheckpoint:
+			checkpointFallback?.kind === 'exhausted' ||
+			checkpointFallback?.kind === 'continue' ||
+			undefined,
 	};
 }
 
