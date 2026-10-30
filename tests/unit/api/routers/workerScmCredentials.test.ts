@@ -209,6 +209,25 @@ describe('workerScmCredentialsRouter (issue #766)', () => {
 			expect(writeWorkerScmCredential).not.toHaveBeenCalled();
 		});
 
+		// Issue #1220: a worker with no Azure DevOps enrollment has no organization to
+		// verify the PAT in, so the value was never checked — that is a precondition,
+		// not an invalid or unreachable credential.
+		it('refuses an unscoped credential as not checked, and stores nothing', async () => {
+			vi.mocked(findWorkerScmRepository).mockResolvedValue(undefined);
+			vi.mocked(verifyScmCredentialSecret).mockResolvedValue({ valid: false, reason: 'unscoped' });
+
+			const refusal = caller.set({
+				workerId: WORKER_ID,
+				providerId: 'azure-devops',
+				value: 'ado-pat',
+			});
+			await expect(refusal).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+			await expect(refusal).rejects.toThrow(/not checked, so nothing was stored/);
+			await expect(refusal).rejects.toThrow(/no enrollment in a Azure DevOps project yet/);
+			await expect(refusal).rejects.not.toThrow(/did not resolve|unreachable/);
+			expect(writeWorkerScmCredential).not.toHaveBeenCalled();
+		});
+
 		it('refuses a provider nothing runtime-ready is registered for, before verifying', async () => {
 			await expect(
 				caller.set({ workerId: WORKER_ID, providerId: 'nonesuch', value: 'secret' }),

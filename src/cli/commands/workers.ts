@@ -88,7 +88,7 @@
  *
  * `register-and-enroll` (issue #786) is the recommended path for a *new* machine
  * and the third write surface onto that per-`(worker, provider)` store: it
- * composes `register` + `set-scm-credential` + `enroll` and ends with the exact
+ * composes `register` + `enroll` + `set-scm-credential` and ends with the exact
  * command that starts the daemon. It also bootstraps the checkout it runs in,
  * leaving `.env` pointed at the control plane (`_shared/control-plane-env.ts`)
  * before it needs the URL itself — the last onboarding step that was still prose
@@ -198,7 +198,7 @@ Usage:
   setup      The shortest path for a NEW worker, run in the checkout it is to
              serve: asks for the project id (offering the checkout's repository
              name) and the operator source-control credential (no echo), then
-             registers, credentials and enrolls the worker exactly as
+             registers, enrolls and credentials the worker exactly as
              register-and-enroll does and starts it under the host's process
              supervisor — a launchd LaunchAgent via swarm-worker-agent on macOS.
              Other platforms have no autostart yet and are told to run
@@ -226,9 +226,9 @@ Usage:
              machine, served by the same daemon; see add-checkout.
   register-and-enroll
              The one-command path for a NEW machine: points this checkout's .env
-             at the control plane, registers the worker, stores its operator
-             source-control credential, and enrolls it in <project-id> — then
-             prints the exact command that starts it. SWARM_CONTROL_PLANE_URL is
+             at the control plane, registers the worker, enrolls it in
+             <project-id>, and stores its operator source-control credential —
+             then prints the exact command that starts it. SWARM_CONTROL_PLANE_URL is
              taken from --control-plane-url, else the environment, else .env,
              else a prompt on a TTY — the order every swarm command uses — and
              written to .env for the daemon to read when .env carries none. An
@@ -2464,11 +2464,14 @@ async function readOperatorCredential(
 
 /**
  * `register-and-enroll` — the one command that takes an operator from "no worker"
- * to "registered, credentialed, enrolled, and here is what starts it" (issue #786).
+ * to "registered, enrolled, credentialed, and here is what starts it" (issue #786).
  *
- * It adds no business logic: `workers.register`, `workers.scmCredentials.set` and
- * `performEnroll` are the same calls `register` / `set-scm-credential` / `enroll`
- * make, with the same refusals. What it does add is **ordering** — everything that
+ * It adds no business logic: `workers.register`, `performEnroll` and
+ * `workers.scmCredentials.set` are the same calls `register` / `enroll` /
+ * `set-scm-credential` make, with the same refusals, in that order — the credential
+ * last, because an organization-scoped one (Azure DevOps) is verified within a
+ * repository the worker is enrolled on (issue #1220). What it does add is
+ * **ordering** — everything that
  * can fail without writing anything (the CLI list, the session, the project and
  * its SCM provider, an empty or aborted secret) is checked *before*
  * `workers.register` by `planRegisterAndEnroll`, so a mistyped argument never
@@ -2500,10 +2503,15 @@ async function registerAndEnrollCommand(argv: string[]): Promise<number> {
 }
 
 /**
- * Carry out a validated plan: register, store the operator credential, enroll
- * active + consenting. Shared by `register-and-enroll` and `setup`, which differ
- * only in what they do once it succeeds. On failure the outstanding steps and the
- * one-time worker credential have already been printed.
+ * Carry out a validated plan: register, enroll active + consenting, then store the
+ * operator credential. Shared by `register-and-enroll` and `setup`, which differ
+ * only in what they do once it succeeds. On failure the outstanding steps — in the
+ * order they must be run — and the one-time worker credential have already been
+ * printed.
+ *
+ * The credential comes last (issue #1220): an organization-scoped credential (an
+ * Azure DevOps PAT) is verified within a repository the worker is enrolled on, so
+ * it can only be checked once the enrollment exists.
  */
 async function executeRegisterAndEnroll(
 	operator: Operator,
@@ -2548,29 +2556,16 @@ async function executeRegisterAndEnroll(
 	};
 	const enrollByHand = `swarm workers enroll ${worker.id} ${projectId} --cli ${capabilities.join(',')} --active --consent`;
 
-	try {
-		const { login } = await client.mutate(
-			'workers.scmCredentials.set',
-			{ workerId: worker.id, providerId, value: operatorCredential },
-			parseWith(StoredScmCredentialSchema),
-		);
-		out.info(
-			`stored operator scm credential for worker '${worker.displayName}' (${worker.id}) on provider '${providerId}' — it authenticates as '${login}'`,
-		);
-	} catch (err) {
-		if (!(err instanceof OperatorApiError)) throw err;
-		out.error(err.message);
-		return reportUnfinished([
-			`swarm workers set-scm-credential ${worker.id} ${providerId}`,
-			enrollByHand,
-		]);
-	}
-
 	// The same helper `enroll` uses, so the capability, repository-mismatch and
 	// duplicate refusals are surfaced unchanged. Active + consenting with no flag:
 	// an enrollment is routable only while both hold, and a pending, non-consenting
 	// one is not "ready to start" — the four-command path stays for anyone who wants
 	// the two human approvals kept separate.
+	//
+	// It runs *before* the credential is stored (issue #1220): an organization-scoped
+	// credential (Azure DevOps) is verified within a repository the worker is
+	// enrolled on, so it can only be checked once an enrollment — even a pending one
+	// — exists.
 	const enrolled = await performEnroll(
 		client,
 		{ id: worker.id, displayName: worker.displayName },
@@ -2580,18 +2575,56 @@ async function executeRegisterAndEnroll(
 		true,
 		true,
 	);
+
+	// Attempted whatever the enroll outcome, so a provider that needs no enrollment to
+	// verify against (GitHub, Bitbucket, GitLab) ends up credentialed on every path.
+	const stored = await storeOperatorCredential(client, worker, providerId, operatorCredential);
+
+	// The outstanding steps, in the order they must be run: the enrollment first,
+	// because the credential may only be verifiable once it exists. Which enrollment
+	// step is printed turns on whether the row exists: a refused `--active` (a
+	// `projectAdmin` call the machine's owner may well not have) already created it,
+	// so re-running `workers enroll` could only answer `CONFLICT`. Name the approvals
+	// that are actually outstanding instead.
+	const remaining: string[] = [];
 	if (enrolled.code !== 0) {
-		// Which recovery is printed turns on whether the enrollment row exists: a
-		// refused `--active` (a `projectAdmin` call the machine's owner may well not
-		// have) already created it, so re-running `workers enroll` could only answer
-		// `CONFLICT`. Name the approvals that are actually outstanding instead.
-		return reportUnfinished(
-			enrolled.enrollment
+		remaining.push(
+			...(enrolled.enrollment
 				? remainingEnrollmentSteps(worker.id, projectId, enrolled.enrollment)
-				: [enrollByHand],
+				: [enrollByHand]),
 		);
 	}
+	if (!stored) remaining.push(`swarm workers set-scm-credential ${worker.id} ${providerId}`);
+	if (enrolled.code !== 0 || !stored) return reportUnfinished(remaining);
 	return { ok: true, workerId: worker.id, credential };
+}
+
+/**
+ * `workers.scmCredentials.set` for {@link executeRegisterAndEnroll}: prints the
+ * account the credential authenticates as, or the control plane's own refusal, and
+ * reports whether it was stored. Anything but an operator-API refusal is rethrown.
+ */
+async function storeOperatorCredential(
+	client: OperatorClient,
+	worker: { id: string; displayName: string },
+	providerId: string,
+	value: string,
+): Promise<boolean> {
+	try {
+		const { login } = await client.mutate(
+			'workers.scmCredentials.set',
+			{ workerId: worker.id, providerId, value },
+			parseWith(StoredScmCredentialSchema),
+		);
+		out.info(
+			`stored operator scm credential for worker '${worker.displayName}' (${worker.id}) on provider '${providerId}' — it authenticates as '${login}'`,
+		);
+		return true;
+	} catch (err) {
+		if (!(err instanceof OperatorApiError)) throw err;
+		out.error(err.message);
+		return false;
+	}
 }
 
 /**

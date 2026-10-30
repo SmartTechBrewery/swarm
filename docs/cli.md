@@ -684,9 +684,14 @@ unchanged.
   as `register-and-enroll` does, and no autostart is installed. A worker serving
   further repositories gains them afterwards with `add-checkout`.
 - **`register-and-enroll`** — the **recommended one-command path for a new machine**
-  (issue #786): `register` + `set-scm-credential` + `enroll` in one invocation,
+  (issue #786): `register` + `enroll` + `set-scm-credential` in one invocation,
   ending with the exact command that starts the daemon. It composes those three and
-  relaxes none of their checks. **It also bootstraps the checkout it runs in**,
+  relaxes none of their checks. The credential is stored **last** (issue #1220): an
+  Azure DevOps PAT is organization-scoped and is verified within a repository the
+  worker is enrolled on, so it can only be checked once the enrollment — even a
+  pending one — exists. The store is attempted whatever the enrollment's outcome,
+  so a GitHub, Bitbucket or GitLab credential, which needs no enrollment to verify,
+  ends up stored on every path. **It also bootstraps the checkout it runs in**,
   which is what makes "one command for a new machine" true of a *fresh clone*: the
   SWARM checkout's `.env` must carry `SWARM_CONTROL_PLANE_URL` — the only value the
   daemon reads from it, since the worker holds no `DATABASE_URL`/`REDIS_URL` — and
@@ -758,8 +763,10 @@ unchanged.
   a duplicate display name, an unverifiable credential, a capability mismatch, and a
   repository mismatch (naming both repositories) fail exactly as `register` /
   `set-scm-credential` / `enroll` do. If a step after
-  registration fails, the command prints what is left to run by hand *and* the worker
-  credential once, since that value is otherwise unrecoverable.
+  registration fails, the command prints what is left to run by hand — **in the
+  order it must be run**: the enrollment steps (`workers enroll`, or `approve` /
+  `consent` when the enrollment was created) before `set-scm-credential` — *and* the
+  worker credential once, since that value is otherwise unrecoverable.
 - **`add-checkout <path>`** — give an **existing** worker another repository
   checkout on this machine (issue #1059), without re-registering it — which would
   issue a new worker and lose its enrollments and stored operator credentials. Run
