@@ -5,7 +5,6 @@ import {
 	CircleDashed,
 	CircleX,
 	FolderGit2,
-	Gauge,
 	LogOut,
 	Play,
 	Plus,
@@ -174,20 +173,9 @@ export function Sidebar() {
 						General
 					</Link>
 
-					<div className="px-3 pt-4 pb-1 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">
-						Other
-					</div>
-					<Link
-						to="/quota"
-						className={
-							currentPath.startsWith('/quota')
-								? 'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium bg-zinc-800/40 text-zinc-100'
-								: 'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium text-zinc-300 hover:bg-zinc-800/40'
-						}
-					>
-						<Gauge className="h-4 w-4" />
-						CLI Quota
-					</Link>
+					{/* CLI Quota is deliberately not linked here (issue #1229): the page is
+					    still served at `/quota`, it just no longer has a nav entry — and its
+					    "Other" heading went with it, since it was the group's only item. */}
 				</nav>
 			</div>
 			{/* The account area: one compact row that never scrolls away, so the

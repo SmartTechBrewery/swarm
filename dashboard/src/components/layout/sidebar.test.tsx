@@ -67,6 +67,42 @@ beforeEach(() => {
 	);
 });
 
+describe('Sidebar navigation', () => {
+	function signInAs(instanceAdmin: boolean) {
+		const data = { id: 'u1', identifier: 'ada@example.com', displayName: 'Ada', instanceAdmin };
+		// biome-ignore lint/suspicious/noExplicitAny: the sidebar reads only `data`.
+		vi.mocked(useCurrentUser).mockReturnValue({ data } as any);
+	}
+
+	it.each([
+		{ role: 'an instance administrator', instanceAdmin: true },
+		{ role: 'a member', instanceAdmin: false },
+	])('offers no CLI Quota entry and no "Other" heading to $role (issue #1229)', ({
+		instanceAdmin,
+	}) => {
+		signInAs(instanceAdmin);
+
+		const container = renderSidebar();
+
+		expect(screen.queryByRole('link', { name: 'CLI Quota' })).toBeNull();
+		expect(container.querySelector('a[href="/quota"]')).toBeNull();
+		expect(screen.queryByText('Other')).toBeNull();
+	});
+
+	it('keeps the remaining entries in their order (issue #1229)', async () => {
+		projectsQueryFn.mockResolvedValue([{ id: 'p1', name: 'Alpha' }]);
+		signInAs(true);
+
+		const container = renderSidebar();
+		await screen.findByRole('link', { name: 'Alpha' });
+
+		const entries = [...(container.querySelector('nav')?.querySelectorAll('a') ?? [])].map(
+			(link) => link.textContent,
+		);
+		expect(entries).toEqual(['Runs', 'Workers', 'Alpha', 'General']);
+	});
+});
+
 describe('Sidebar user block', () => {
 	it('opens the profile from the name of the signed-in user (issue #659)', () => {
 		renderSidebar();
