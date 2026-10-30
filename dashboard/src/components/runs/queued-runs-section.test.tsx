@@ -149,7 +149,7 @@ describe('QueuedRunsSection', () => {
 
 			expect(toggle().getAttribute('aria-expanded')).toBe('true');
 			fireEvent.click(within(cards()[0]).getByRole('button', { name: /Put back/i }));
-			expect(screen.getByText('Put Back Work Item')).not.toBeNull();
+			expect(screen.getByText('Put back work item')).not.toBeNull();
 		});
 
 		// Deliberate: no-trigger dispatches are not queued work and must stay observable
@@ -278,7 +278,7 @@ describe('QueuedRunsSection', () => {
 
 		fireEvent.click(putBackBtn);
 
-		expect(screen.getByText('Put Back Work Item')).not.toBeNull();
+		expect(screen.getByText('Put back work item')).not.toBeNull();
 		expect(
 			screen.getByText(/Are you sure you want to put this queued work item back\?/),
 		).not.toBeNull();

@@ -67,7 +67,7 @@ export const jiraManifest: PMProviderManifest = {
 	credentialRoles: [
 		{
 			role: JIRA_EMAIL_ROLE,
-			label: 'Account Email',
+			label: 'Account email',
 			// Plain prose, not markdown: the dashboard renders a description as text
 			// (`pm-credentials-panel.tsx`), so backticks would show up literally.
 			description:
@@ -76,14 +76,14 @@ export const jiraManifest: PMProviderManifest = {
 		},
 		{
 			role: JIRA_API_TOKEN_ROLE,
-			label: 'API Token',
+			label: 'API token',
 			description:
 				'Atlassian API token for that account, created from Atlassian account settings, which SWARM uses to read and write the board. It pairs with the account email: neither half authenticates a request on its own.',
 			envVarKey: 'JIRA_API_TOKEN',
 		},
 		{
 			role: PM_WEBHOOK_SECRET_ROLE,
-			label: 'Webhook Secret',
+			label: 'Webhook secret',
 			description:
 				'Secret you enter on the Jira webhook screen, which signs board deliveries. It is the board webhook secret only — not the repository one.',
 			envVarKey: 'JIRA_WEBHOOK_SECRET',

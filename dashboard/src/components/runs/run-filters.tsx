@@ -6,7 +6,7 @@ import { trpc } from '@/lib/trpc.js';
 import { type RunPhaseFilter, runPhaseFilterSchema } from '@/types/runs.js';
 
 /**
- * The Phase filter's labels. Title Case with an upper-case "CI", which `formatPhase`
+ * The Phase filter's labels. Sentence case with an upper-case "CI", which `formatPhase`
  * (`@/lib/format.ts`, a hyphen→space replace) does not produce, so they are stated
  * rather than derived. Keyed by `RunPhaseFilter`, so a phase added to the filter
  * vocabulary fails to type-check until it is labelled here.
@@ -15,12 +15,12 @@ const PHASE_FILTER_LABELS: Record<RunPhaseFilter, string> = {
 	planning: 'Planning',
 	implementation: 'Implementation',
 	review: 'Review',
-	'respond-to-review': 'Respond to Review',
+	'respond-to-review': 'Respond to review',
 	'respond-to-ci': 'Respond to CI',
-	'resolve-conflicts': 'Resolve Conflicts',
+	'resolve-conflicts': 'Resolve conflicts',
 	// Not a pipeline phase at all (issue #971) — machine maintenance, which
 	// `sortPipelinePhases` therefore ranks after every known phase.
-	'worker-update': 'Worker Update',
+	'worker-update': 'Worker update',
 };
 
 /**
@@ -81,7 +81,7 @@ export function RunFilters({
 						onChange={(e) => onProjectIdChange(e.target.value || undefined)}
 						className="block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500"
 					>
-						<option value="">All Projects</option>
+						<option value="">All projects</option>
 						{projectsQuery.data?.map((p) => (
 							<option key={p.id} value={p.id}>
 								{p.name} ({p.id})
@@ -101,7 +101,7 @@ export function RunFilters({
 					onChange={(e) => onStatusChange(e.target.value || undefined)}
 					className="block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500"
 				>
-					<option value="">All Statuses</option>
+					<option value="">All statuses</option>
 					<option value="running">Running</option>
 					<option value="completed">Completed</option>
 					<option value="failed">Failed</option>
@@ -120,7 +120,7 @@ export function RunFilters({
 					onChange={(e) => onPhaseChange(e.target.value || undefined)}
 					className="block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500"
 				>
-					<option value="">All Phases</option>
+					<option value="">All phases</option>
 					{PHASE_FILTER_OPTIONS.map((phaseOption) => (
 						<option key={phaseOption} value={phaseOption}>
 							{PHASE_FILTER_LABELS[phaseOption]}
@@ -136,7 +136,7 @@ export function RunFilters({
 					className={`${buttonClass('secondary', 'sm')} h-[38px]`}
 				>
 					<X className="h-3.5 w-3.5" />
-					Clear Filters
+					Clear filters
 				</button>
 			)}
 		</div>

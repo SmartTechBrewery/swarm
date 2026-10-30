@@ -37,7 +37,7 @@ function StubProjectDetail() {
 			<div>
 				<div>phase-detail:{search.phase}</div>
 				<button type="button" onClick={() => go(agentConfigSearch())}>
-					Back to Agent Configuration
+					Back to agent configuration
 				</button>
 			</div>
 		);
@@ -56,7 +56,7 @@ function StubProjectDetail() {
 		<div>
 			<div>tab:{activeTab}</div>
 			<button type="button" onClick={() => go(tabSearch('agents'))}>
-				Agent Configuration
+				Agent configuration
 			</button>
 			<button type="button" onClick={() => go(tabSearch('workers'))}>
 				Workers
@@ -88,7 +88,7 @@ describe('Agent Configuration browser-history navigation', () => {
 		const router = renderAt('/projects/p1');
 		expect(await screen.findByText('tab:runs')).toBeDefined();
 
-		fireEvent.click(screen.getByText('Agent Configuration'));
+		fireEvent.click(screen.getByText('Agent configuration'));
 		expect(await screen.findByText('agent-config-summary')).toBeDefined();
 
 		fireEvent.click(screen.getByText('Open Review'));
@@ -111,17 +111,17 @@ describe('Agent Configuration browser-history navigation', () => {
 
 	it('opens a phase detail as a distinct history entry', async () => {
 		const router = renderAt('/projects/p1');
-		fireEvent.click(await screen.findByText('Agent Configuration'));
+		fireEvent.click(await screen.findByText('Agent configuration'));
 		fireEvent.click(await screen.findByText('Open Review'));
 		await screen.findByText('phase-detail:review');
 		expect(router.state.location.search).toEqual({ tab: 'agents', phase: 'review' });
 	});
 
-	it('the in-app Back to Agent Configuration control returns to the summary', async () => {
+	it('the in-app Back to agent configuration control returns to the summary', async () => {
 		renderAt('/projects/p1?tab=agents&phase=review');
 		expect(await screen.findByText('phase-detail:review')).toBeDefined();
 
-		fireEvent.click(screen.getByText('Back to Agent Configuration'));
+		fireEvent.click(screen.getByText('Back to agent configuration'));
 		expect(await screen.findByText('agent-config-summary')).toBeDefined();
 	});
 

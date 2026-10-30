@@ -106,11 +106,14 @@ export interface RepositoryForm {
 	/**
 	 * The repository's own branch name pattern (issue #1241). `''` states none, so the
 	 * entry keeps running on `<branchPrefix>{issue_key}` and is saved without the key.
+	 * Still stored per row, but edited for every row at once since issue #1246
+	 * ({@link applyBranchPattern}).
 	 */
 	branchPattern: string;
 	/**
 	 * The repository's own commit subject pattern (issue #1242). `''` states none, so the
-	 * entry keeps today's conventional subjects and card-titled pull requests.
+	 * entry keeps today's conventional subjects and card-titled pull requests. Edited for
+	 * every row at once since issue #1246 ({@link applyCommitSubjectPattern}).
 	 */
 	commitSubjectPattern: string;
 	/**
@@ -287,29 +290,108 @@ export function effectiveCommitSubjectMaxLength(
 }
 
 /**
- * The row patch an edited commit subject pattern and length limit apply (issue #1242).
- * A row stating none keeps stating none when the default is applied unchanged, so an
- * entry opened and applied as-is is not made dirty — and its pull requests keep their
- * card's title, which only a pattern of the repository's own replaces. A row stating
- * its own keeps whatever is applied, the default included.
+ * The branch name pattern every row names its task branches by (issue #1246), or
+ * `undefined` when the rows differ. The patterns are set once per project but still
+ * stored per repository, so a project written before that can hold several; the screen
+ * says so rather than showing one of them as the project's.
+ *
+ * Compared by {@link effectiveBranchPattern}: a row on its legacy prefix and a row
+ * stating the same pattern outright name their branches identically.
  */
-export function commitSubjectPatternPatch(
-	row: Pick<RepositoryForm, 'commitSubjectPattern' | 'commitSubjectMaxLength'>,
-	pattern: string,
-	maxLength: number,
-): Pick<RepositoryForm, 'commitSubjectPattern' | 'commitSubjectMaxLength'> {
-	const keepsNoPattern = !row.commitSubjectPattern && pattern === DEFAULT_COMMIT_SUBJECT_PATTERN;
-	const keepsNoLimit =
-		!row.commitSubjectMaxLength.trim() && maxLength === DEFAULT_COMMIT_SUBJECT_MAX_LENGTH;
-	return {
-		commitSubjectPattern: keepsNoPattern ? '' : pattern,
-		commitSubjectMaxLength: keepsNoLimit ? '' : String(maxLength),
-	};
+export function sharedBranchPattern(
+	rows: Array<Pick<RepositoryForm, 'branchPattern' | 'branchPrefix'>>,
+): string | undefined {
+	const patterns = new Set(rows.map(effectiveBranchPattern));
+	return patterns.size === 1 ? [...patterns][0] : undefined;
 }
 
-/** Append a blank row at the end — the lowest-priority position, never the default. */
+/**
+ * Apply one branch name pattern to every row (issue #1246). Each row stores it through
+ * {@link branchPatternPatch}, so a row whose prefix already renders it keeps following
+ * the prefix — the same name either way.
+ */
+export function applyBranchPattern(rows: RepositoryForm[], pattern: string): RepositoryForm[] {
+	return rows.map((row) => ({ ...row, ...branchPatternPatch(row, pattern) }));
+}
+
+type CommitSubjectNamingForm = Pick<
+	RepositoryForm,
+	'commitSubjectPattern' | 'commitSubjectMaxLength'
+>;
+
+/**
+ * The commit subject pattern and length limit every row shares (issue #1246), as the
+ * first row states them, or `undefined` when the rows differ.
+ *
+ * The pattern is compared as stated, not as {@link effectiveCommitSubjectPattern}: a
+ * repository stating none titles its pull requests by their card, one stating the
+ * default by the rendered subject, so the two do not behave alike. The limit only
+ * defaults, so it is compared by its effective value.
+ */
+export function sharedCommitSubjectNaming(
+	rows: CommitSubjectNamingForm[],
+): CommitSubjectNamingForm | undefined {
+	const [first] = rows;
+	if (!first) return undefined;
+	const limit = effectiveCommitSubjectMaxLength(first);
+	const shared = rows.every(
+		(row) =>
+			row.commitSubjectPattern === first.commitSubjectPattern &&
+			effectiveCommitSubjectMaxLength(row) === limit,
+	);
+	return shared
+		? {
+				commitSubjectPattern: first.commitSubjectPattern,
+				commitSubjectMaxLength: first.commitSubjectMaxLength,
+			}
+		: undefined;
+}
+
+/**
+ * Apply one commit subject pattern and length limit to every row (issue #1246), so
+ * every repository ends up stating the same values. When no row states a pattern and
+ * the default is applied unchanged, none is kept, so the editor opened and applied
+ * as-is makes nothing dirty — and pull requests keep their card's title, which only a
+ * stated pattern replaces. Otherwise every row states what was applied, the default
+ * included. The limit follows the same rule.
+ */
+export function applyCommitSubjectPattern(
+	rows: RepositoryForm[],
+	pattern: string,
+	maxLength: number,
+): RepositoryForm[] {
+	const keepsNoPattern =
+		rows.every((row) => !row.commitSubjectPattern) && pattern === DEFAULT_COMMIT_SUBJECT_PATTERN;
+	const keepsNoLimit =
+		rows.every((row) => !row.commitSubjectMaxLength.trim()) &&
+		maxLength === DEFAULT_COMMIT_SUBJECT_MAX_LENGTH;
+	return rows.map((row) => ({
+		...row,
+		commitSubjectPattern: keepsNoPattern ? '' : pattern,
+		commitSubjectMaxLength: keepsNoLimit ? '' : String(maxLength),
+	}));
+}
+
+/**
+ * Append a blank row at the end — the lowest-priority position, never the default.
+ *
+ * It starts on the project's patterns (issue #1246) when the rows share them, so a
+ * repository added later names its branches and commits like the rest. While they
+ * differ there is no project pattern to take, so it starts on the defaults and the
+ * screen lists it among the differing rows.
+ */
 export function addRepository(rows: RepositoryForm[]): RepositoryForm[] {
-	return [...rows, { id: nextRowId(rows), ...NEW_REPOSITORY }];
+	const added: RepositoryForm = { id: nextRowId(rows), ...NEW_REPOSITORY };
+	const branchPattern = sharedBranchPattern(rows);
+	const commitSubject = sharedCommitSubjectNaming(rows);
+	return [
+		...rows,
+		{
+			...added,
+			...(branchPattern !== undefined ? branchPatternPatch(added, branchPattern) : {}),
+			...commitSubject,
+		},
+	];
 }
 
 /**

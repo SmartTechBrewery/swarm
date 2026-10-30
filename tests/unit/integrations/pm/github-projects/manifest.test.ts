@@ -76,7 +76,7 @@ describe('github-projects manifest registration', () => {
 		);
 		expect(apiToken).toMatchObject({
 			role: 'apiToken',
-			label: 'GitHub Projects API Token',
+			label: 'GitHub Projects API token',
 			envVarKey: 'PM_GITHUB_PROJECTS_TOKEN',
 		});
 		// Required: neither optional nor satisfied by a shared SCM reference.

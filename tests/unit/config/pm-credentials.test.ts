@@ -103,7 +103,7 @@ describe('credentials.pm validation against the declared roles', () => {
 		registerRoles([
 			{
 				role: 'webhookSecret',
-				label: 'Webhook Secret',
+				label: 'Webhook secret',
 				envVarKey: 'SCM_WEBHOOK_SECRET',
 				inheritsSharedCredential: 'webhookSecret',
 			},
@@ -116,13 +116,13 @@ describe('credentials.pm validation against the declared roles', () => {
 	// back to the worker operator's SCM token.
 	it("requires GitHub Projects' own apiToken role", () => {
 		const errors = parseErrors(configWithPmReferences({}));
-		expect(errors).toContain("requires the 'apiToken' credential (GitHub Projects API Token)");
+		expect(errors).toContain("requires the 'apiToken' credential (GitHub Projects API token)");
 		expect(errors).toContain('credentials.pm.github-projects.apiToken');
 		expect(errors).toContain('PM_GITHUB_PROJECTS_TOKEN');
 	});
 
 	it('rejects a reference for a role the provider does not declare, naming the declared roles', () => {
-		registerRoles([{ role: 'apiToken', label: 'API Token', envVarKey: 'JIRA_API_TOKEN' }]);
+		registerRoles([{ role: 'apiToken', label: 'API token', envVarKey: 'JIRA_API_TOKEN' }]);
 		const errors = parseErrors(configWithPmReferences({ apiToken: 'X', apiKey: 'Y' }));
 		expect(errors).toContain("declares no credential role 'apiKey'");
 		expect(errors).toContain('its roles are: apiToken');
@@ -131,27 +131,27 @@ describe('credentials.pm validation against the declared roles', () => {
 	it('rejects a configured block that omits a non-optional role, naming it and its env var', () => {
 		registerRoles([
 			{ role: 'email', label: 'Email', envVarKey: 'JIRA_EMAIL' },
-			{ role: 'apiToken', label: 'API Token', envVarKey: 'JIRA_API_TOKEN' },
+			{ role: 'apiToken', label: 'API token', envVarKey: 'JIRA_API_TOKEN' },
 		]);
 		const errors = parseErrors(configWithPmReferences({ email: 'JIRA_EMAIL' }));
-		expect(errors).toContain("requires the 'apiToken' credential (API Token)");
+		expect(errors).toContain("requires the 'apiToken' credential (API token)");
 		expect(errors).toContain('credentials.pm.github-projects.apiToken');
 		expect(errors).toContain('JIRA_API_TOKEN');
 	});
 
 	it('rejects an absent block when the provider has a non-optional role', () => {
-		registerRoles([{ role: 'apiToken', label: 'API Token', envVarKey: 'JIRA_API_TOKEN' }]);
+		registerRoles([{ role: 'apiToken', label: 'API token', envVarKey: 'JIRA_API_TOKEN' }]);
 		const errors = parseErrors(configWithPmReferences(undefined));
-		expect(errors).toContain("requires the 'apiToken' credential (API Token)");
+		expect(errors).toContain("requires the 'apiToken' credential (API token)");
 		expect(errors).toContain('credentials.pm.github-projects.apiToken');
 	});
 
 	it('does not require an optional role', () => {
 		registerRoles([
-			{ role: 'apiKey', label: 'API Key', envVarKey: 'LINEAR_API_KEY' },
+			{ role: 'apiKey', label: 'API key', envVarKey: 'LINEAR_API_KEY' },
 			{
 				role: 'webhookSecret',
-				label: 'Webhook Secret',
+				label: 'Webhook secret',
 				envVarKey: 'LINEAR_WEBHOOK_SECRET',
 				optional: true,
 			},
@@ -211,7 +211,7 @@ describe('credentials.pm validation against the declared roles', () => {
 			const errors = parseErrors(
 				linearConfigWithPmReferences({ webhookSecret: 'LINEAR_WEBHOOK_SECRET' }),
 			);
-			expect(errors).toContain("requires the 'apiKey' credential (API Key)");
+			expect(errors).toContain("requires the 'apiKey' credential (API key)");
 			expect(errors).toContain('credentials.pm.linear.apiKey');
 			expect(errors).toContain('LINEAR_API_KEY');
 		});
@@ -220,7 +220,7 @@ describe('credentials.pm validation against the declared roles', () => {
 		// secret, so an optional role would validate here and 401 every delivery.
 		it('requires the webhookSecret role too, since it inherits nothing', () => {
 			const errors = parseErrors(linearConfigWithPmReferences({ apiKey: 'LINEAR_API_KEY' }));
-			expect(errors).toContain("requires the 'webhookSecret' credential (Webhook Secret)");
+			expect(errors).toContain("requires the 'webhookSecret' credential (Webhook secret)");
 			expect(errors).toContain('credentials.pm.linear.webhookSecret');
 			expect(errors).toContain('LINEAR_WEBHOOK_SECRET');
 		});
@@ -615,7 +615,7 @@ describe('requirePmCredential', () => {
 			// provider and `src/api/routers/pm.ts` composes its own copy from these fields.
 			providerId: 'github-projects',
 			role: 'apiToken',
-			label: 'GitHub Projects API Token',
+			label: 'GitHub Projects API token',
 			envVarKey: 'PM_GITHUB_PROJECTS_TOKEN',
 		});
 		// It names what is missing, never a credential value.
