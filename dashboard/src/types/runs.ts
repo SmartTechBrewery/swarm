@@ -310,6 +310,7 @@ export const wipUsageEntrySchema = z.object({
 	limit: z.number().int().positive(),
 	inFlight: z.number().int().nonnegative(),
 	waiting: z.number().int().nonnegative(),
+	boardQueued: z.number().int().nonnegative().optional(),
 	tickets: z.array(
 		z.object({
 			taskId: z.string(),
