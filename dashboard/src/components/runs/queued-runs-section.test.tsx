@@ -115,6 +115,61 @@ describe('QueuedRunsSection', () => {
 		expect(heading.querySelector('svg')).not.toBeNull();
 	});
 
+	// Issue #1207: the heading folds the queue away, exactly like Tickets in progress.
+	describe('folds from its heading (issue #1207)', () => {
+		const toggle = () => screen.getByRole('button', { name: /^Queued/ });
+
+		it('starts expanded, with the chevron pointing down', () => {
+			const { container } = renderSection(<QueuedRunsSection items={[githubItem, boardItem]} />);
+
+			expect(toggle().getAttribute('aria-expanded')).toBe('true');
+			expect(toggle().querySelector('.lucide-chevron-down')).not.toBeNull();
+			expect(cards()).toHaveLength(2);
+			expect(container.querySelector('table')).not.toBeNull();
+		});
+
+		it('hides the cards and the table when collapsed, keeping the heading and its count', () => {
+			const { container } = renderSection(<QueuedRunsSection items={[githubItem, boardItem]} />);
+
+			fireEvent.click(toggle());
+
+			expect(toggle().getAttribute('aria-expanded')).toBe('false');
+			expect(toggle().querySelector('.lucide-chevron-right')).not.toBeNull();
+			expect(screen.getByRole('heading', { level: 2 }).textContent).toBe('Queued (2)');
+			expect(screen.queryByTestId('queued-run-card')).toBeNull();
+			expect(container.querySelector('table')).toBeNull();
+			expect(screen.queryByRole('button', { name: /Put back/i })).toBeNull();
+		});
+
+		it('brings the rows back, Put back included, when expanded again', () => {
+			renderSection(<QueuedRunsSection items={[boardItem]} />);
+
+			fireEvent.click(toggle());
+			fireEvent.click(toggle());
+
+			expect(toggle().getAttribute('aria-expanded')).toBe('true');
+			fireEvent.click(within(cards()[0]).getByRole('button', { name: /Put back/i }));
+			expect(screen.getByText('Put Back Work Item')).not.toBeNull();
+		});
+
+		// Deliberate: no-trigger dispatches are not queued work and must stay observable
+		// (issue #570), so folding the queue leaves their own collapsed line reachable.
+		it('leaves the no-trigger group reachable while the queue is collapsed', () => {
+			renderSection(
+				<QueuedRunsSection
+					items={[githubItem]}
+					noTriggerItems={[{ ...boardItem, jobId: 'job-no-trigger', boardOutcome: 'no-trigger' }]}
+				/>,
+			);
+
+			fireEvent.click(toggle());
+			expect(screen.queryByTestId('queued-run-card')).toBeNull();
+
+			fireEvent.click(screen.getByRole('button', { name: /starts no phase/ }));
+			expect(screen.getAllByTestId('queued-no-trigger-row')).toHaveLength(1);
+		});
+	});
+
 	it('renders a card per item with the right phase label and Task reference', () => {
 		renderSection(<QueuedRunsSection items={[githubItem, boardItem]} />);
 		const [reviewCard, boardCard] = cards();
