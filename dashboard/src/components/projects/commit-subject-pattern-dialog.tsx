@@ -19,12 +19,12 @@ const MAX_MAX_LENGTH = 200;
 
 interface CommitSubjectPatternDialogProps {
 	open: boolean;
-	/** The pattern the repository words its commit subjects by now — its own, or the default. */
+	/** The pattern the editor starts from — the project's, or the first repository's. */
 	pattern: string;
-	/** The rendered length the repository aims to stay within now. */
+	/** The length limit the editor starts from, chosen the same way. */
 	maxLength: number;
-	/** The repository's rank in the list, so the dialog says which entry it edits. */
-	rank: number;
+	/** Whether the repositories word their commit subjects differently now (issue #1246). */
+	differs: boolean;
 	onApply: (pattern: string, maxLength: number) => void;
 	onCancel: () => void;
 }
@@ -32,19 +32,20 @@ interface CommitSubjectPatternDialogProps {
 /**
  * The commit subject pattern editor (issue #1242), the branch name pattern editor's
  * twin: describes every element, composes the pattern, previews it for the same sample
- * task, warns when the preview runs over the repository's length limit, and refuses to
- * apply a pattern the server would refuse. The rules are `validateCommitSubjectPattern`
+ * task, warns when the preview runs over the length limit, and refuses to apply a
+ * pattern the server would refuse. The rules are `validateCommitSubjectPattern`
  * (`src/pipeline/commit-subject-pattern.ts`) — the very function the config schema
  * runs — so the two cannot disagree.
  *
- * Applying only edits the row: the pattern is persisted by the tab's own Save, like
- * every other repository setting.
+ * It edits the project's one pattern and limit (issue #1246): applying sets both on
+ * every repository's row, and the tab's own Save persists them like every other
+ * repository setting.
  */
 export function CommitSubjectPatternDialog({
 	open,
 	pattern,
 	maxLength,
-	rank,
+	differs,
 	onApply,
 	onCancel,
 }: CommitSubjectPatternDialogProps) {
@@ -54,7 +55,7 @@ export function CommitSubjectPatternDialog({
 	const inputId = useId();
 	const lengthId = useId();
 
-	// Every opening starts from the repository's current values, not a cancelled draft.
+	// Every opening starts from the current values, not a cancelled draft.
 	useEffect(() => {
 		if (open) {
 			setDraft(pattern);
@@ -89,18 +90,24 @@ export function CommitSubjectPatternDialog({
 	};
 
 	return (
-		<Modal open={open} onClose={onCancel} title={`Commit subject pattern — repository ${rank}`}>
+		<Modal open={open} onClose={onCancel} title="Commit subject pattern">
 			<div className="space-y-4">
 				<p className="text-xs text-zinc-400">
-					How SWARM words every commit it makes for a task in this repository — the implementation
-					and every review or CI fix — and, once the repository has a pattern of its own, the title
-					of the task's pull request. Combine literal text with these elements; write an element
-					with a capital first letter, e.g. <span className="font-mono">{'{Subject}'}</span>, to
-					capitalise it. The subject is decided once per task, with the same work type as its branch
-					name. Without a pattern of its own the repository uses{' '}
-					<span className="font-mono">{'{work_type}: {subject}'}</span> and titles pull requests by
-					their card.
+					How SWARM words every commit it makes for a task in any repository of this project — the
+					implementation and every review or CI fix — and, once the project has a pattern of its
+					own, the title of the task's pull request. Combine literal text with these elements; write
+					an element with a capital first letter, e.g.{' '}
+					<span className="font-mono">{'{Subject}'}</span>, to capitalise it. The subject is decided
+					once per task, with the same work type as its branch name. Without a pattern of its own
+					the project uses <span className="font-mono">{'{work_type}: {subject}'}</span> and titles
+					pull requests by their card.
 				</p>
+				{differs && (
+					<p className="p-3 bg-zinc-900/50 border border-zinc-800 text-xs text-zinc-300 rounded">
+						The repositories word their commit subjects differently now. This starts from the first
+						repository's pattern and limit; applying sets both for every repository.
+					</p>
+				)}
 
 				<ul className="space-y-2">
 					{COMMIT_SUBJECT_PATTERN_ELEMENTS.map((name) => (
@@ -139,7 +146,7 @@ export function CommitSubjectPatternDialog({
 					</div>
 					<div>
 						<label htmlFor={lengthId} className="block text-xs font-medium text-zinc-400 mb-1">
-							Length Limit
+							Length limit
 						</label>
 						<input
 							id={lengthId}

@@ -94,6 +94,8 @@ import {
 } from '@/lib/project-nav.js';
 import {
 	addRepository,
+	applyBranchPattern,
+	applyCommitSubjectPattern,
 	areRepositoriesDirty,
 	duplicateRepositories,
 	moveRepository,
@@ -154,7 +156,7 @@ const PHASE_LABELS: Record<
 		description: 'Reviews the pull request',
 	},
 	respondToReview: {
-		label: 'Respond to Review',
+		label: 'Respond to review',
 		code: 'respondToReview',
 		description: 'Addresses reviewer suggestions',
 	},
@@ -164,7 +166,7 @@ const PHASE_LABELS: Record<
 		description: 'Fixes failing CI checks',
 	},
 	resolveConflicts: {
-		label: 'Resolve Conflicts',
+		label: 'Resolve conflicts',
 		code: 'resolveConflicts',
 		description: 'Resolves merge conflicts',
 	},
@@ -356,7 +358,7 @@ export function GeneralSettingsForm({
 			<form onSubmit={handleSubmit} className="space-y-6">
 				<div>
 					<h2 className="text-sm font-semibold text-zinc-200 border-b border-zinc-800 pb-2 mb-4">
-						General Configuration
+						General configuration
 					</h2>
 					<div className="grid grid-cols-1 md:grid-cols-2 gap-4">
 						{/* Name */}
@@ -371,7 +373,7 @@ export function GeneralSettingsForm({
 								onChange={handleInputChange(setName)}
 								disabled={isPending}
 								required
-								placeholder="Project Name"
+								placeholder="Project name"
 								className="block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 transition-shadow disabled:opacity-50 disabled:cursor-not-allowed"
 							/>
 							<p className="text-xs text-zinc-500 mt-1">
@@ -382,7 +384,7 @@ export function GeneralSettingsForm({
 						{/* Repo Root */}
 						<div>
 							<label htmlFor="repoRoot" className="block text-xs font-medium text-zinc-400 mb-1">
-								Local Repository Root <span className="text-red-500">*</span>
+								Local repository root <span className="text-red-500">*</span>
 							</label>
 							<input
 								type="text"
@@ -405,7 +407,7 @@ export function GeneralSettingsForm({
 								htmlFor="worktreeRoot"
 								className="block text-xs font-medium text-zinc-400 mb-1"
 							>
-								Worktree Directory <span className="text-red-500">*</span>
+								Worktree directory <span className="text-red-500">*</span>
 							</label>
 							<input
 								type="text"
@@ -440,7 +442,7 @@ export function GeneralSettingsForm({
 				{/* Action Buttons */}
 				<div className="flex items-center gap-2 border-t border-zinc-800 pt-4">
 					<button type="submit" disabled={isPending || !isDirty} className={buttonClass('primary')}>
-						{isPending ? 'Saving…' : 'Save Changes'}
+						{isPending ? 'Saving…' : 'Save changes'}
 					</button>
 					<button
 						type="button"
@@ -1079,7 +1081,7 @@ export function PhaseSettingsDetail({
 				className="inline-flex items-center gap-1 text-xs font-medium text-zinc-400 hover:text-zinc-200 transition-colors"
 			>
 				<ChevronLeft className="h-4 w-4" aria-hidden="true" />
-				Back to Agent Configuration
+				Back to agent configuration
 			</button>
 
 			<div className={`${CARD_CLASS} space-y-5`}>
@@ -1291,7 +1293,7 @@ function AgentConfigurationActions({
 				disabled={isPending || !isDirty || hasValidationError}
 				className={buttonClass('primary')}
 			>
-				{isPending ? 'Saving…' : 'Save Changes'}
+				{isPending ? 'Saving…' : 'Save changes'}
 			</button>
 			<button
 				type="button"
@@ -1441,7 +1443,7 @@ export function AgentConfigurationForm({
 					<div className="border border-zinc-800 rounded-lg bg-panel/40 p-6 shadow-sm">
 						<div>
 							<h2 className="text-sm font-semibold text-zinc-200 border-b border-zinc-800 pb-2 mb-4">
-								Phases Configuration
+								Phases configuration
 							</h2>
 							<p className="text-xs text-zinc-400 mb-4">
 								Select a phase to configure its model targets in priority order and an optional
@@ -1549,7 +1551,7 @@ export function PipelineSettingsForm({
 			<form onSubmit={handleSubmit} className="space-y-6">
 				<div>
 					<h2 className="text-sm font-semibold text-zinc-200 border-b border-zinc-800 pb-2 mb-4">
-						Pipeline Automation
+						Pipeline automation
 					</h2>
 					<label className="flex items-start gap-3 p-4 border border-zinc-800 rounded-md bg-panel/20 cursor-pointer hover:bg-zinc-800/20 transition-colors">
 						<input
@@ -1564,7 +1566,7 @@ export function PipelineSettingsForm({
 								Skip respond to review on minors
 							</span>
 							<span className="block text-xs text-zinc-400 mt-1">
-								Only start Respond to Review for a reviewer request-changes verdict. Approvals and
+								Only start Respond to review for a reviewer request-changes verdict. Approvals and
 								comment-only reviews do not consume a separate agent run.
 							</span>
 						</span>
@@ -1578,7 +1580,7 @@ export function PipelineSettingsForm({
 					{/* Per repository since issue #1109: whether a repository has CI is its own
 					    property, so the policy and its wait moved to each Source Control entry. */}
 					<p className="text-xs text-zinc-400">
-						Review's CI check policy and check wait are set per repository, on Source Control →
+						Review's CI check policy and check wait are set per repository, on Source control →
 						Repositories.
 					</p>
 				</div>
@@ -1596,7 +1598,7 @@ export function PipelineSettingsForm({
 
 				<div className="flex items-center gap-2 border-t border-zinc-800 pt-4">
 					<button type="submit" disabled={isPending || !isDirty} className={buttonClass('primary')}>
-						{isPending ? 'Saving…' : 'Save Changes'}
+						{isPending ? 'Saving…' : 'Save changes'}
 					</button>
 					<button
 						type="button"
@@ -1857,10 +1859,10 @@ const PROJECT_TAB_ITEMS: ReadonlyArray<{ tab: ProjectTab; label: string; icon: L
 	{ tab: 'runs', label: 'Runs', icon: Play },
 	{ tab: 'workers', label: 'Workers', icon: Server },
 	{ tab: 'general', label: 'Settings', icon: Settings },
-	{ tab: 'agents', label: 'Agent Configuration', icon: Cpu },
+	{ tab: 'agents', label: 'Agent configuration', icon: Cpu },
 	{ tab: 'pipeline', label: 'Pipeline', icon: GitMerge },
-	{ tab: 'projectManagement', label: 'Project Management', icon: SquareKanban },
-	{ tab: 'credentials', label: 'Source Control', icon: GitBranch },
+	{ tab: 'projectManagement', label: 'Project management', icon: SquareKanban },
+	{ tab: 'credentials', label: 'Source control', icon: GitBranch },
 	{ tab: 'members', label: 'Members', icon: Users },
 ];
 
@@ -2181,6 +2183,13 @@ function ProjectDetailRouteComponent() {
 
 	const handleAddRepository = () => updateRepositories(addRepository);
 
+	// The project's patterns (issue #1246): one edit, written to every row.
+	const handleApplyBranchPattern = (pattern: string) =>
+		updateRepositories((rows) => applyBranchPattern(rows, pattern));
+
+	const handleApplyCommitSubjectPattern = (pattern: string, maxLength: number) =>
+		updateRepositories((rows) => applyCommitSubjectPattern(rows, pattern, maxLength));
+
 	const handleRemoveRepository = (index: number) =>
 		updateRepositories((rows) => removeRepository(rows, index));
 
@@ -2413,13 +2422,13 @@ function ProjectDetailRouteComponent() {
 	if (projectQuery.isError) {
 		return (
 			<div className="p-4 bg-red-950/20 border border-red-900/30 rounded flex flex-col gap-2">
-				<h3 className="text-sm font-semibold text-red-200">Error Loading Project</h3>
+				<h3 className="text-sm font-semibold text-red-200">Error loading project</h3>
 				<p className="text-xs text-red-400/80 font-mono">{projectQuery.error.message}</p>
 				<Link
 					to="/projects"
 					className="text-xs font-semibold text-zinc-300 hover:text-white transition-colors underline mt-2 inline-block"
 				>
-					Back to Projects
+					Back to projects
 				</Link>
 			</div>
 		);
@@ -2438,7 +2447,7 @@ function ProjectDetailRouteComponent() {
 			{/* Page Title */}
 			<div>
 				<h1 className="text-2xl font-semibold tracking-tight text-zinc-100">
-					{project?.name || 'Project Settings'}
+					{project?.name || 'Project settings'}
 				</h1>
 				<p className="text-xs text-zinc-500 mt-1 font-mono">{projectId}</p>
 			</div>
@@ -2635,6 +2644,8 @@ function ProjectDetailRouteComponent() {
 							onAdd={handleAddRepository}
 							onRemove={handleRemoveRepository}
 							onMove={handleMoveRepository}
+							onApplyBranchPattern={handleApplyBranchPattern}
+							onApplyCommitSubjectPattern={handleApplyCommitSubjectPattern}
 							handleSubmit={handleRepositoriesSubmit}
 							handleReset={handleRepositoriesReset}
 							isDirty={isRepositoriesDirty}

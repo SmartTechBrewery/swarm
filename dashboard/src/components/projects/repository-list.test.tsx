@@ -60,10 +60,15 @@ describe('RepositoryList', () => {
 			'acme/first',
 		);
 		expect((screen.getByLabelText('Base branch, entry 2') as HTMLInputElement).value).toBe('trunk');
-		// Issue #1241: a legacy prefix reads as the pattern it stands for.
-		const pattern = screen.getByLabelText('Branch name pattern, entry 2') as HTMLInputElement;
-		expect(pattern.value).toBe('work-{issue_key}');
-		expect(pattern.readOnly).toBe(true);
+	});
+
+	// Issue #1246: the patterns are the project's, set once above the list, so no row
+	// carries a pattern field or editor of its own.
+	it('gives no row a branch name or commit subject pattern of its own', () => {
+		renderList({ repositories: TWO });
+
+		expect(screen.queryByLabelText(/branch name pattern/i)).toBeNull();
+		expect(screen.queryByLabelText(/commit subject pattern/i)).toBeNull();
 	});
 
 	// Issue #727: a project has one SCM provider, stated together with the credentials it
@@ -252,161 +257,5 @@ describe('RepositoryList', () => {
 		expect(
 			(screen.getByLabelText('Check wait in minutes, entry 1') as HTMLInputElement).disabled,
 		).toBe(true);
-	});
-
-	// Issue #1241: the pattern is composed in an editor, never typed into the row.
-	describe('branch name pattern editor', () => {
-		const patternInput = () => screen.getByLabelText('Pattern') as HTMLInputElement;
-		const apply = () => screen.getByRole('button', { name: 'Apply' }) as HTMLButtonElement;
-
-		it('describes every element and previews the pattern for a sample task', () => {
-			renderList({ repositories: TWO });
-			fireEvent.click(screen.getByLabelText('Edit branch name pattern, entry 1'));
-
-			for (const name of ['issue_key', 'work_type', 'friendly_name']) {
-				expect(screen.getByLabelText(`Insert {${name}}`)).toBeTruthy();
-			}
-			expect(patternInput().value).toBe('issue-{issue_key}');
-			expect(screen.getByTestId('branch-pattern-preview').textContent).toBe('issue-VT-1538');
-
-			fireEvent.change(patternInput(), { target: { value: '{issue_key}/{friendly_name}' } });
-			expect(screen.getByTestId('branch-pattern-preview').textContent).toBe(
-				'VT-1538/pierwsza-strona-testowa',
-			);
-		});
-
-		it('refuses a pattern without {issue_key} or with it twice', () => {
-			renderList({ repositories: TWO });
-			fireEvent.click(screen.getByLabelText('Edit branch name pattern, entry 1'));
-
-			fireEvent.change(patternInput(), { target: { value: 'feature/{friendly_name}' } });
-			expect(apply().disabled).toBe(true);
-			expect(screen.getByText(/must contain \{issue_key\}/)).toBeTruthy();
-
-			fireEvent.change(patternInput(), { target: { value: '{issue_key}-{issue_key}' } });
-			expect(apply().disabled).toBe(true);
-			expect(screen.getByText('{issue_key} must appear exactly once.')).toBeTruthy();
-		});
-
-		it('warns on a flat key but still applies it', () => {
-			const { onChange } = renderList({ repositories: TWO });
-			fireEvent.click(screen.getByLabelText('Edit branch name pattern, entry 1'));
-
-			fireEvent.change(patternInput(), { target: { value: '{issue_key}' } });
-			expect(screen.getByText(/bare issue key/)).toBeTruthy();
-			expect(apply().disabled).toBe(false);
-			fireEvent.click(apply());
-			expect(onChange).toHaveBeenCalledWith(0, { branchPattern: '{issue_key}' });
-		});
-
-		it('applies a pattern to its own row, and the prefix’s own pattern as none', () => {
-			const { onChange } = renderList({ repositories: TWO });
-
-			fireEvent.click(screen.getByLabelText('Edit branch name pattern, entry 2'));
-			fireEvent.change(patternInput(), {
-				target: { value: '{work_type}/{issue_key}-{friendly_name}' },
-			});
-			fireEvent.click(apply());
-			expect(onChange).toHaveBeenCalledWith(1, {
-				branchPattern: '{work_type}/{issue_key}-{friendly_name}',
-			});
-
-			fireEvent.click(screen.getByLabelText('Edit branch name pattern, entry 1'));
-			fireEvent.click(apply());
-			expect(onChange).toHaveBeenLastCalledWith(0, { branchPattern: '' });
-		});
-
-		// Only the legacy prefix shape stays recognised after a change (review of #1243).
-		it('warns that replacing a repository’s own pattern strands branches open under it', () => {
-			const { onChange } = renderList({
-				repositories: [row({ branchPattern: '{issue_key}/{friendly_name}' })],
-			});
-			fireEvent.click(screen.getByLabelText('Edit branch name pattern, entry 1'));
-			expect(screen.queryByText(/will no longer be recognised/)).toBeNull();
-
-			fireEvent.change(patternInput(), {
-				target: { value: '{work_type}/{issue_key}-{friendly_name}' },
-			});
-			expect(
-				screen.getByText(/branches named by \{issue_key\}\/\{friendly_name\} will no longer be/),
-			).toBeTruthy();
-			expect(apply().disabled).toBe(false);
-			fireEvent.click(apply());
-			expect(onChange).toHaveBeenCalledWith(0, {
-				branchPattern: '{work_type}/{issue_key}-{friendly_name}',
-			});
-		});
-
-		it('does not warn when replacing the legacy prefix’s pattern, which stays recognised', () => {
-			renderList({ repositories: TWO });
-			fireEvent.click(screen.getByLabelText('Edit branch name pattern, entry 1'));
-
-			fireEvent.change(patternInput(), { target: { value: '{issue_key}/{friendly_name}' } });
-			expect(screen.queryByText(/will no longer be recognised/)).toBeNull();
-		});
-	});
-
-	// Issue #1242: the commit subject pattern is composed in its own editor, the same way.
-	describe('commit subject pattern editor', () => {
-		const patternInput = () => screen.getByLabelText('Pattern') as HTMLInputElement;
-		const lengthInput = () => screen.getByLabelText('Length Limit') as HTMLInputElement;
-		const apply = () => screen.getByRole('button', { name: 'Apply' }) as HTMLButtonElement;
-		const preview = () => screen.getByTestId('commit-subject-pattern-preview').textContent;
-
-		it('shows the default, describes every element and previews a sample task live', () => {
-			renderList({ repositories: TWO });
-			expect(
-				(screen.getByLabelText('Commit subject pattern, entry 1') as HTMLInputElement).value,
-			).toBe('{work_type}: {subject}');
-			fireEvent.click(screen.getByLabelText('Edit commit subject pattern, entry 1'));
-
-			for (const name of ['issue_key', 'work_type', 'subject']) {
-				expect(screen.getByLabelText(`Insert {${name}}`)).toBeTruthy();
-			}
-			expect(preview()).toBe('feat: add the starting page of the SWARM test bed');
-
-			fireEvent.change(patternInput(), { target: { value: '{issue_key} {Subject}' } });
-			expect(preview()).toBe('VT-1538 Add the starting page of the SWARM test bed');
-		});
-
-		it('warns when the preview runs over the length limit, without refusing it', () => {
-			renderList({ repositories: TWO });
-			fireEvent.click(screen.getByLabelText('Edit commit subject pattern, entry 1'));
-
-			fireEvent.change(patternInput(), { target: { value: '{issue_key} {Subject}' } });
-			expect(screen.queryByText(/over the .*-character limit/)).toBeNull();
-			fireEvent.change(lengthInput(), { target: { value: '40' } });
-			expect(screen.getByText(/over the 40-character limit/)).toBeTruthy();
-			expect(apply().disabled).toBe(false);
-		});
-
-		it('refuses a pattern without {subject}', () => {
-			renderList({ repositories: TWO });
-			fireEvent.click(screen.getByLabelText('Edit commit subject pattern, entry 1'));
-
-			fireEvent.change(patternInput(), { target: { value: '{issue_key}' } });
-			expect(apply().disabled).toBe(true);
-			expect(screen.getByText(/must contain \{subject\}/)).toBeTruthy();
-		});
-
-		it('applies a pattern and limit to its own row, and the unchanged default as none', () => {
-			const { onChange } = renderList({ repositories: TWO });
-
-			fireEvent.click(screen.getByLabelText('Edit commit subject pattern, entry 2'));
-			fireEvent.change(patternInput(), { target: { value: '{issue_key} {Subject}' } });
-			fireEvent.change(lengthInput(), { target: { value: '60' } });
-			fireEvent.click(apply());
-			expect(onChange).toHaveBeenCalledWith(1, {
-				commitSubjectPattern: '{issue_key} {Subject}',
-				commitSubjectMaxLength: '60',
-			});
-
-			fireEvent.click(screen.getByLabelText('Edit commit subject pattern, entry 1'));
-			fireEvent.click(apply());
-			expect(onChange).toHaveBeenLastCalledWith(0, {
-				commitSubjectPattern: '',
-				commitSubjectMaxLength: '',
-			});
-		});
 	});
 });

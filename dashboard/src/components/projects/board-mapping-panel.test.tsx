@@ -215,7 +215,7 @@ describe('BoardMappingPanel (issue #201)', () => {
 		await waitFor(() => expect(readySelect.disabled).toBe(false));
 
 		fireEvent.change(readySelect, { target: { value: 'opt_ready' } });
-		fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+		fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
 
 		expect(onSubmit).toHaveBeenCalledWith(
 			expect.objectContaining({
@@ -373,7 +373,7 @@ describe('BoardMappingPanel (issue #201)', () => {
 			const onSubmit = vi.fn();
 			renderHarness({ initial: LINEAR_CONFIG, onSubmit });
 
-			const save = () => screen.getByRole('button', { name: 'Save Changes' }) as HTMLButtonElement;
+			const save = () => screen.getByRole('button', { name: 'Save changes' }) as HTMLButtonElement;
 			// Unchanged from the stored mapping — saveable, but nothing to save yet.
 			expect(save().disabled).toBe(true);
 
@@ -465,7 +465,7 @@ describe('BoardMappingPanel (issue #201)', () => {
 			await waitFor(() => expect(doneSelect.disabled).toBe(false));
 			fireEvent.change(doneSelect, { target: { value: '10002' } });
 
-			const save = screen.getByRole('button', { name: 'Save Changes' }) as HTMLButtonElement;
+			const save = screen.getByRole('button', { name: 'Save changes' }) as HTMLButtonElement;
 			await waitFor(() => expect(save.disabled).toBe(false));
 			fireEvent.click(save);
 
@@ -490,7 +490,7 @@ describe('BoardMappingPanel (issue #201)', () => {
 			await waitFor(() => expect(readySelect.disabled).toBe(false));
 			fireEvent.change(readySelect, { target: { value: '10001' } });
 
-			const save = screen.getByRole('button', { name: 'Save Changes' }) as HTMLButtonElement;
+			const save = screen.getByRole('button', { name: 'Save changes' }) as HTMLButtonElement;
 			await waitFor(() => expect(save.disabled).toBe(false));
 			fireEvent.click(save);
 
@@ -507,7 +507,7 @@ describe('BoardMappingPanel (issue #201)', () => {
 				initial: { ...JIRA_CONFIG, baseUrl: '' } as ProjectPm,
 			});
 
-			const save = screen.getByRole('button', { name: 'Save Changes' }) as HTMLButtonElement;
+			const save = screen.getByRole('button', { name: 'Save changes' }) as HTMLButtonElement;
 			await screen.findByLabelText('Jira site URL');
 			expect(discoverContainersFn).not.toHaveBeenCalledWith(
 				expect.objectContaining({ providerId: 'jira' }),
@@ -548,7 +548,7 @@ describe('BoardMappingPanel (issue #201)', () => {
 			await waitFor(() => expect(doneSelect.disabled).toBe(false));
 			fireEvent.change(doneSelect, { target: { value: '10002' } });
 
-			const save = screen.getByRole('button', { name: 'Save Changes' }) as HTMLButtonElement;
+			const save = screen.getByRole('button', { name: 'Save changes' }) as HTMLButtonElement;
 			await waitFor(() => expect(save.disabled).toBe(false));
 			fireEvent.click(save);
 			expect(onSubmit).toHaveBeenCalledWith({
@@ -583,7 +583,7 @@ describe('BoardMappingPanel (issue #201)', () => {
 			expect(input.value).toBe('');
 			fireEvent.change(input, { target: { value: 'customfield_10515' } });
 
-			const save = screen.getByRole('button', { name: 'Save Changes' }) as HTMLButtonElement;
+			const save = screen.getByRole('button', { name: 'Save changes' }) as HTMLButtonElement;
 			await waitFor(() => expect(save.disabled).toBe(false));
 			fireEvent.click(save);
 
@@ -612,7 +612,7 @@ describe('BoardMappingPanel (issue #201)', () => {
 			expect(input.value).toBe('customfield_10515');
 			fireEvent.change(input, { target: { value: '' } });
 
-			const save = screen.getByRole('button', { name: 'Save Changes' }) as HTMLButtonElement;
+			const save = screen.getByRole('button', { name: 'Save changes' }) as HTMLButtonElement;
 			await waitFor(() => expect(save.disabled).toBe(false));
 			fireEvent.click(save);
 
@@ -627,7 +627,7 @@ describe('BoardMappingPanel (issue #201)', () => {
 			});
 
 			expect(screen.getByText(/Enter a custom field id such as customfield_10515/)).not.toBeNull();
-			const save = screen.getByRole('button', { name: 'Save Changes' }) as HTMLButtonElement;
+			const save = screen.getByRole('button', { name: 'Save changes' }) as HTMLButtonElement;
 			expect(save.disabled).toBe(true);
 		});
 
@@ -693,7 +693,7 @@ describe('BoardMappingPanel (issue #201)', () => {
 			const onSubmit = vi.fn();
 			renderHarness({ initial: TRELLO_CONFIG, onSubmit });
 
-			const save = () => screen.getByRole('button', { name: 'Save Changes' }) as HTMLButtonElement;
+			const save = () => screen.getByRole('button', { name: 'Save changes' }) as HTMLButtonElement;
 			// Unchanged from the stored mapping — saveable, but nothing to save yet.
 			expect(save().disabled).toBe(true);
 
@@ -725,7 +725,7 @@ describe('BoardMappingPanel (issue #201)', () => {
 
 		renderHarness();
 
-		const save = () => screen.getByRole('button', { name: 'Save Changes' }) as HTMLButtonElement;
+		const save = () => screen.getByRole('button', { name: 'Save changes' }) as HTMLButtonElement;
 		expect(save().disabled).toBe(true);
 
 		await screen.findByRole('option', { name: 'My Board' });

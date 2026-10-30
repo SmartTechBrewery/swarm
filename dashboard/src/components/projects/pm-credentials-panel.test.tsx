@@ -57,7 +57,7 @@ const API_TOKEN_ROLE = {
 // asserted against the real response shape rather than against an empty one.
 const WEBHOOK_ROLE = {
 	role: 'webhookSecret',
-	label: 'Webhook Secret',
+	label: 'Webhook secret',
 	description: 'HMAC secret GitHub signs board deliveries with.',
 	envVarKey: 'SCM_WEBHOOK_SECRET',
 	referenceKey: 'GITHUB_WEBHOOK_SECRET',
@@ -164,11 +164,11 @@ describe('PmCredentialsPanel (issue #537 — Project Management credentials)', (
 		renderPanel(<PmCredentialsPanel projectId="proj-a" providerId="github-projects" />);
 
 		await waitFor(() => expect(screen.getByText('GitHub Projects API Token')).not.toBeNull());
-		expect(screen.queryByText('Webhook Secret')).toBeNull();
+		expect(screen.queryByText('Webhook secret')).toBeNull();
 		expect(screen.queryByText('GITHUB_WEBHOOK_SECRET')).toBeNull();
-		expect(screen.queryByText(/configured on the Source Control tab/)).toBeNull();
-		expect(screen.queryByLabelText('Webhook Secret value')).toBeNull();
-		expect(screen.queryByLabelText('Remove Webhook Secret')).toBeNull();
+		expect(screen.queryByText(/configured on the Source control tab/i)).toBeNull();
+		expect(screen.queryByLabelText('Webhook secret value')).toBeNull();
+		expect(screen.queryByLabelText('Remove Webhook secret')).toBeNull();
 	});
 
 	it('clears a configured role through the confirmation modal', async () => {

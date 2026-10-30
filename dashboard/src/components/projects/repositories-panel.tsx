@@ -1,6 +1,7 @@
 import type React from 'react';
 import { buttonClass } from '@/components/ui/button.js';
 import type { RepositoryForm } from '@/lib/project-repository.js';
+import { NamingPatterns } from './naming-patterns.js';
 import { RepositoryList } from './repository-list.js';
 
 /**
@@ -15,6 +16,10 @@ import { RepositoryList } from './repository-list.js';
  * commits (issue #1242). So the tab now reads top-to-bottom as
  * provider → credentials → repositories, the shape issue #630 gave Project Management.
  * Settings keeps `name`, `repoRoot` and `worktreeRoot`.
+ *
+ * The two patterns open the card, above the list (issue #1246): set once for the whole
+ * project, but still stored on every repository, so they are saved by this card's Save
+ * with the rows they are written to.
  *
  * `repoRoot`/`worktreeRoot` deliberately stayed there: they are **host** layout — one
  * local checkout path per project on whichever machine runs the work — rather than
@@ -39,6 +44,10 @@ export interface RepositoriesPanelProps {
 	onAdd: () => void;
 	onRemove: (index: number) => void;
 	onMove: (index: number, direction: 'up' | 'down') => void;
+	/** Set the project's branch name pattern on every repository (issue #1246). */
+	onApplyBranchPattern: (pattern: string) => void;
+	/** Set the project's commit subject pattern and length limit on every repository. */
+	onApplyCommitSubjectPattern: (pattern: string, maxLength: number) => void;
 	handleSubmit: (e: React.FormEvent) => void;
 	handleReset: () => void;
 	isDirty: boolean;
@@ -56,6 +65,8 @@ export function RepositoriesPanel({
 	onAdd,
 	onRemove,
 	onMove,
+	onApplyBranchPattern,
+	onApplyCommitSubjectPattern,
 	handleSubmit,
 	handleReset,
 	isDirty,
@@ -67,6 +78,13 @@ export function RepositoriesPanel({
 	return (
 		<div className="border border-zinc-800 rounded-lg bg-panel/40 p-6 shadow-sm">
 			<form onSubmit={handleSubmit} className="space-y-6">
+				<NamingPatterns
+					repositories={repositories}
+					isPending={isPending}
+					onApplyBranchPattern={onApplyBranchPattern}
+					onApplyCommitSubjectPattern={onApplyCommitSubjectPattern}
+				/>
+
 				<RepositoryList
 					repositories={repositories}
 					duplicates={duplicates}
@@ -101,7 +119,7 @@ export function RepositoriesPanel({
 						disabled={isPending || !isDirty || duplicates.length > 0}
 						className={buttonClass('primary')}
 					>
-						{isPending ? 'Saving…' : 'Save Changes'}
+						{isPending ? 'Saving…' : 'Save changes'}
 					</button>
 					<button
 						type="button"

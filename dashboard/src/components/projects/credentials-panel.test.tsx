@@ -219,7 +219,7 @@ describe('CredentialsPanel (issue #200 — Source Control tab)', () => {
 	it('shows an unset provider as unsaved and persists a GitHub selection', async () => {
 		renderPanel(<CredentialsPanel projectId="proj-a" />);
 
-		await waitFor(() => expect(screen.getByText('Source Control')).not.toBeNull());
+		await waitFor(() => expect(screen.getByText('Source control')).not.toBeNull());
 
 		const select = screen.getByLabelText('Provider') as HTMLSelectElement;
 		expect(select.value).toBe('');
@@ -311,7 +311,7 @@ describe('CredentialsPanel (issue #200 — Source Control tab)', () => {
 
 		await waitFor(() => expect(screen.getByText(/\/gitlab\/webhook/)).not.toBeNull());
 
-		fireEvent.change(screen.getByLabelText('Reviewer Access Token value'), {
+		fireEvent.change(screen.getByLabelText('Reviewer access token value'), {
 			target: { value: 'glpat-secret' },
 		});
 		fireEvent.click(screen.getAllByRole('button', { name: /Verify/ })[0]);
@@ -385,14 +385,14 @@ describe('CredentialsPanel (issue #200 — Source Control tab)', () => {
 
 		// GitLab's own label, its own reference names, and its own (unconfigured) state —
 		// the outgoing provider's configured fields are gone rather than relabelled.
-		await waitFor(() => expect(screen.getByText('Reviewer Access Token')).not.toBeNull());
+		await waitFor(() => expect(screen.getByText('Reviewer access token')).not.toBeNull());
 		expect(listedProviderIds.current).toEqual(['github', 'gitlab']);
 		expect(screen.getByText('GITLAB_TOKEN_REVIEWER')).not.toBeNull();
-		expect(screen.getByText('Secret Token')).not.toBeNull();
+		expect(screen.getByText('Secret token')).not.toBeNull();
 		expect(screen.queryByText('Reviewer PAT')).toBeNull();
 		expect(screen.queryByText('SCM_TOKEN_REVIEWER')).toBeNull();
 		// Unconfigured, so the input is revealed rather than a masked preview.
-		expect(screen.getByLabelText('Reviewer Access Token value')).not.toBeNull();
+		expect(screen.getByLabelText('Reviewer access token value')).not.toBeNull();
 	});
 
 	// Both providers spell the roles the same way, so the fields have to be remounted per
@@ -407,9 +407,9 @@ describe('CredentialsPanel (issue #200 — Source Control tab)', () => {
 
 		fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'gitlab' } });
 		await waitFor(() =>
-			expect(screen.getByLabelText('Reviewer Access Token value')).not.toBeNull(),
+			expect(screen.getByLabelText('Reviewer access token value')).not.toBeNull(),
 		);
-		fireEvent.change(screen.getByLabelText('Reviewer Access Token value'), {
+		fireEvent.change(screen.getByLabelText('Reviewer access token value'), {
 			target: { value: 'glpat-secret' },
 		});
 		fireEvent.click(screen.getAllByRole('button', { name: /Verify/ })[0]);
@@ -428,10 +428,10 @@ describe('CredentialsPanel (issue #200 — Source Control tab)', () => {
 		projectScm.current = 'gitlab';
 		renderPanel(<CredentialsPanel projectId="proj-a" />);
 		await waitFor(() =>
-			expect(screen.getByLabelText('Reviewer Access Token value')).not.toBeNull(),
+			expect(screen.getByLabelText('Reviewer access token value')).not.toBeNull(),
 		);
 
-		fireEvent.change(screen.getByLabelText('Reviewer Access Token value'), {
+		fireEvent.change(screen.getByLabelText('Reviewer access token value'), {
 			target: { value: 'glpat-secret ' },
 		});
 		fireEvent.click(screen.getAllByRole('button', { name: 'Save' })[0]);

@@ -443,7 +443,7 @@ export function BoardMappingPanel({
 						disabled={isPending || !isDirty || !canSave}
 						className={buttonClass('primary')}
 					>
-						{isPending ? 'Saving…' : 'Save Changes'}
+						{isPending ? 'Saving…' : 'Save changes'}
 					</button>
 					<button
 						type="button"

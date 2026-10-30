@@ -73,7 +73,7 @@ describe('linear manifest registration', () => {
 		const apiKey = linearManifest.credentialRoles.find((role) => role.role === 'apiKey');
 		expect(apiKey).toMatchObject({
 			role: 'apiKey',
-			label: 'API Key',
+			label: 'API key',
 			envVarKey: 'LINEAR_API_KEY',
 		});
 		expect(apiKey?.optional).toBeUndefined();
@@ -87,7 +87,7 @@ describe('linear manifest registration', () => {
 		);
 		expect(webhookSecret).toMatchObject({
 			role: 'webhookSecret',
-			label: 'Webhook Secret',
+			label: 'Webhook secret',
 			envVarKey: 'LINEAR_WEBHOOK_SECRET',
 		});
 		expect(webhookSecret?.optional).toBeUndefined();

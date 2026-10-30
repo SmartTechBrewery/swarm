@@ -56,7 +56,7 @@ export const trelloManifest: PMProviderManifest = {
 	credentialRoles: [
 		{
 			role: TRELLO_API_KEY_ROLE,
-			label: 'API Key',
+			label: 'API key',
 			// Plain prose, not markdown: the dashboard renders a description as text
 			// (`pm-credentials-panel.tsx`), so backticks would show up literally.
 			description:
@@ -72,7 +72,7 @@ export const trelloManifest: PMProviderManifest = {
 		},
 		{
 			role: PM_WEBHOOK_SECRET_ROLE,
-			label: 'Webhook Secret',
+			label: 'Webhook secret',
 			description:
 				'Trello API secret shown beside the API key, which signs every webhook delivery for this integration. It is not a per-webhook secret you choose, and it is the board secret only — not the repository one.',
 			// The role name is the *receiver's* vocabulary and the credential behind it

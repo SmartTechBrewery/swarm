@@ -43,7 +43,7 @@ describe('the Phase filter isolates worker-update runs (issues #971, #974)', () 
 
 		const phaseSelect = screen.getByLabelText('Phase') as HTMLSelectElement;
 		const option = Array.from(phaseSelect.options).find((o) => o.value === 'worker-update');
-		expect(option?.textContent).toBe('Worker Update');
+		expect(option?.textContent).toBe('Worker update');
 
 		// `Updating` would read as a status; the Status filter is the axis that carries one.
 		for (const o of Array.from(phaseSelect.options)) {
