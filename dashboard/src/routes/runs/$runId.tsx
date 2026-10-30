@@ -2128,7 +2128,9 @@ type StrandedDeferredCalloutProps = Omit<DeferredCalloutProps, 'nextRetryAt'>;
  * {@link DeferredCallout}'s "automatic retry scheduled" against a time in the
  * past, and a run with no `nextRetryAt` at all rendered nothing whatsoever: no
  * heading, and none of the three controls that could move it. Both now say the
- * same true thing, and carry the same buttons.
+ * same true thing, and carry the same buttons. The router's periodic reconcile
+ * re-queues such a run on its own within a few minutes (issue #1210), which the
+ * copy says rather than leaving Retry now as the only way out.
  */
 function StrandedDeferredCallout({ run, onResetSuccess }: StrandedDeferredCalloutProps) {
 	return (
@@ -2142,8 +2144,8 @@ function StrandedDeferredCallout({ run, onResetSuccess }: StrandedDeferredCallou
 					</p>
 				)}
 				<p className="text-xs text-amber-200/70 mt-2">
-					The attempt this run was waiting on ended without scheduling another, so nothing will pick
-					it up on its own. Retry now starts it immediately.
+					The attempt this run was waiting on ended without scheduling another. SWARM re-queues a
+					run left like this automatically within a few minutes; Retry now starts it immediately.
 				</p>
 				{run.nextRetryAt && (
 					<p className="text-xs text-amber-200/70 mt-2 font-mono">

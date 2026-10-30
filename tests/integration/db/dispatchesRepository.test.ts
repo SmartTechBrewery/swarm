@@ -2159,6 +2159,52 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 			expect(orphans.map((r) => r.id)).toEqual([orphanId]);
 			expect(await getActiveDispatchByRunId(coveredId)).toBeDefined();
 		});
+
+		// Issue #1210: the periodic pass's settle grace.
+		it('with settledBefore, leaves out a run whose dispatch settled after the cut-off', async () => {
+			async function deferredRunWithSettledDispatch(taskId: string): Promise<{
+				runId: string;
+				dispatchId: string;
+			}> {
+				const runId = await createRun({
+					projectId: PROJECT_ID,
+					repository: REPO,
+					taskId,
+					phase: 'implementation',
+				});
+				await completeRun(runId, { status: 'deferred', error: 'rate limited' });
+				const { dispatch } = await createDispatch({
+					projectId: PROJECT_ID,
+					jobPayload: job({ runId }),
+					source: 'webhook',
+					runId,
+				});
+				await claimDispatch(dispatch.id, 'worker:1', 60_000);
+				await completeDispatch(dispatch.id, 'skipped-duplicate');
+				return { runId, dispatchId: dispatch.id };
+			}
+			const fresh = await deferredRunWithSettledDispatch('fresh');
+			const settled = await deferredRunWithSettledDispatch('settled');
+			await getDb()
+				.update(dispatches)
+				.set({ updatedAt: new Date(Date.now() - 10 * 60_000) })
+				.where(eq(dispatches.id, settled.dispatchId));
+			const bareId = await createRun({
+				projectId: PROJECT_ID,
+				repository: REPO,
+				taskId: 'bare',
+				phase: 'implementation',
+			});
+			await completeRun(bareId, { status: 'deferred', error: 'rate limited' });
+
+			const graced = await listDeferredRunsWithoutActiveDispatch({
+				settledBefore: new Date(Date.now() - 2 * 60_000),
+			});
+			expect(graced.map((r) => r.id).sort()).toEqual([settled.runId, bareId].sort());
+
+			const ungraced = await listDeferredRunsWithoutActiveDispatch();
+			expect(ungraced.map((r) => r.id).sort()).toEqual([fresh.runId, settled.runId, bareId].sort());
+		});
 	});
 
 	// Issue #610. Which deferred dispatches a worker becoming available may start —

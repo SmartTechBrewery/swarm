@@ -2519,8 +2519,18 @@ export async function listWakeablePendingDispatches(): Promise<DispatchRow[]> {
  * (issue #971): a maintenance run is not a phase the reconciler could re-dispatch,
  * and narrowing here is what keeps one out of `backfillOrphanedDeferredRuns`
  * (`../../dispatch/reconciler.ts`) rather than each of its reads having to notice.
+ *
+ * `settledBefore` is the periodic pass's settle grace (issue #1210): a run any of
+ * whose dispatches — active or settled — was updated after it, or whose Reset
+ * began after it (`runs.reset_started_at`), is left out, so a Reset's
+ * cancel-then-recreate window — including a Reset of a run with no active
+ * dispatch, which touches no dispatch row — and any other just-settled hand-off
+ * is never read as an orphan. Without it the read is the startup pass's, which
+ * runs before anything else can be mid-hand-off.
  */
-export async function listDeferredRunsWithoutActiveDispatch(): Promise<PipelineRunRow[]> {
+export async function listDeferredRunsWithoutActiveDispatch(
+	options: { settledBefore?: Date } = {},
+): Promise<PipelineRunRow[]> {
 	const active = getDb()
 		.select({ runId: dispatches.runId })
 		.from(dispatches)
@@ -2530,6 +2540,13 @@ export async function listDeferredRunsWithoutActiveDispatch(): Promise<PipelineR
 				sql`${dispatches.runId} IS NOT NULL`,
 			),
 		);
+	const { settledBefore } = options;
+	const recentlyTouched = settledBefore
+		? getDb()
+				.select({ runId: dispatches.runId })
+				.from(dispatches)
+				.where(and(sql`${dispatches.runId} IS NOT NULL`, gt(dispatches.updatedAt, settledBefore)))
+		: undefined;
 	const rows = await getDb()
 		.select()
 		.from(runs)
@@ -2538,9 +2555,54 @@ export async function listDeferredRunsWithoutActiveDispatch(): Promise<PipelineR
 				eq(runs.kind, PIPELINE_RUN_KIND),
 				inArray(runs.status, [...RETRY_PENDING_RUN_STATUSES]),
 				notInArray(runs.id, active),
+				recentlyTouched ? notInArray(runs.id, recentlyTouched) : undefined,
+				settledBefore ? notResetSince(settledBefore) : undefined,
 			),
 		);
 	return rows.filter(isPipelineRun);
+}
+
+/** A run whose Reset has not begun since `since` (issue #1210). */
+function notResetSince(since: Date): SQL | undefined {
+	return or(isNull(runs.resetStartedAt), lte(runs.resetStartedAt, since));
+}
+
+/**
+ * Import one orphan {@link listDeferredRunsWithoutActiveDispatch} returned, under a
+ * lock on its run row (issue #1210). The row is re-read `FOR UPDATE` and must still
+ * be retry-pending — and, with `settledBefore`, still not reset since then — and
+ * `build` derives the dispatch from *that* read, so the import never runs on a
+ * payload read before a concurrent Reset sanitised it. The lock is what makes the
+ * check hold: a Reset stamps `reset_started_at` before it cancels anything, so its
+ * stamp either commits first and this skips, or waits behind this transaction and
+ * then finds — and cancels — the dispatch it created. `null` when the run changed
+ * under the pass or `build` declined it.
+ */
+export async function createDispatchForOrphanedRun(
+	runId: string,
+	options: { settledBefore?: Date },
+	build: (run: PipelineRunRow) => CreateDispatchInput | null,
+): Promise<DispatchRow | null> {
+	const { settledBefore } = options;
+	return getDb().transaction(async (tx) => {
+		const [run] = await tx
+			.select()
+			.from(runs)
+			.where(
+				and(
+					eq(runs.id, runId),
+					inArray(runs.status, [...RETRY_PENDING_RUN_STATUSES]),
+					settledBefore ? notResetSince(settledBefore) : undefined,
+				),
+			)
+			.for('update')
+			.limit(1);
+		if (!run || !isPipelineRun(run)) return null;
+		const input = build(run);
+		if (!input) return null;
+		const { dispatch } = await createDispatch(input, tx);
+		return dispatch;
+	});
 }
 
 /** Whether any dispatch rows exist at all — used to gate one-time backfills. */

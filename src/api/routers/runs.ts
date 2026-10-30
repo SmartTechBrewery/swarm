@@ -12,7 +12,6 @@ import {
 	type DispatchRow,
 	getActiveDispatchByRunId,
 	getDispatchById,
-	hasActiveDispatchForCoalesceKeys,
 	listActiveDispatchTaskRefs,
 	listWaitingDispatches,
 	reopenDispatchForManualRetry,
@@ -82,6 +81,7 @@ import {
 	preservedContinuationKind,
 } from '../../dispatch/preserved-worker.js';
 import { dropCheckoutContinuation, reconstructRetryJob } from '../../dispatch/retry-payload.js';
+import { awaitsReviewRecheck } from '../../dispatch/review-recheck-wait.js';
 import { RunResetError, type RunResetRefusal, resetRun } from '../../dispatch/run-reset.js';
 import { releasePutBackTicketSlot } from '../../dispatch/wip-limit.js';
 import { AgentCliSchema } from '../../harness/agent-cli.js';
@@ -119,7 +119,6 @@ import {
 import { toWipUsage, type WipUsageEntry } from '../../queue/wip-usage.js';
 import { repoSlugsMatch } from '../../scm/repo-slug.js';
 import type { SCMProvider } from '../../scm/types.js';
-import { reviewRecheckCoalesceKeys } from '../../triggers/review-recheck-keys.js';
 import type { TriggerPhase } from '../../triggers/types.js';
 import { GitWorktreeManager } from '../../worker/git-worktree-manager.js';
 import { reconcileTerminatedWorktree } from '../../worktree/termination-cleanup.js';
@@ -1062,21 +1061,6 @@ async function resolveRetryScheduled(run: RunRow): Promise<boolean | null> {
 		});
 		return null;
 	}
-}
-
-/**
- * Whether a `pr-review` recheck for this run's own pull request head is still
- * active — the unlinked dispatch a retried Review or Respond-to-CI run waits on
- * (issue #1049, {@link resolveRetryScheduled}). Only those two phases are ever
- * left waiting on one, and only with an SCM event naming the head.
- */
-async function awaitsReviewRecheck(run: RunRow): Promise<boolean> {
-	if (run.phase !== 'review' && run.phase !== 'respond-to-ci') return false;
-	const payload = run.jobPayload;
-	if (!run.repository || !run.prNumber || payload?.type !== 'scm') return false;
-	return hasActiveDispatchForCoalesceKeys(
-		reviewRecheckCoalesceKeys(run.repository, run.prNumber, payload.event),
-	);
 }
 
 /**

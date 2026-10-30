@@ -1,10 +1,13 @@
 import { Queue } from 'bullmq';
+import { eq } from 'drizzle-orm';
 import { Redis } from 'ioredis';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 
+import { getDb } from '../../../src/db/client.js';
 import {
 	claimDispatch,
 	claimWorkerForDispatch,
+	completeDispatch,
 	createDispatch,
 	getActiveDispatchByRunId,
 	getDispatchById,
@@ -16,19 +19,29 @@ import {
 	completeRun,
 	createRun,
 	getRunByIdFromDb,
+	markRunResetStarted,
 	updateReviewMergeOutcome,
 } from '../../../src/db/repositories/runsRepository.js';
 import { createUser } from '../../../src/db/repositories/usersRepository.js';
 import { createEnrollment } from '../../../src/db/repositories/workerEnrollmentsRepository.js';
 import { acquireLease } from '../../../src/db/repositories/workerSessionsRepository.js';
 import { createWorker } from '../../../src/db/repositories/workersRepository.js';
+import { dispatches } from '../../../src/db/schema/dispatches.js';
+import { runs } from '../../../src/db/schema/runs.js';
 import {
+	ORPHAN_SETTLE_GRACE_MS,
 	reconcileDispatchesAtStartup,
+	reconcileDispatchesPeriodically,
 	reconcileSupersededWorkerClaims,
 } from '../../../src/dispatch/reconciler.js';
 import { QUEUE_NAME, type SwarmJob } from '../../../src/queue/jobs.js';
 import { closeQueue } from '../../../src/queue/producer.js';
-import { createMockProjectRecord, createMockScmWebhookJob } from '../../helpers/factories.js';
+import { checkRecheckCoalesceKey } from '../../../src/triggers/review-recheck-keys.js';
+import {
+	createMockProjectRecord,
+	createMockScmEvent,
+	createMockScmWebhookJob,
+} from '../../helpers/factories.js';
 import { truncateAll } from '../helpers/db.js';
 import { seedProject } from '../helpers/seed.js';
 
@@ -251,6 +264,156 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 
 			expect(second?.id).toBe(first?.id);
 			expect(await pendingJobIds()).toHaveLength(1);
+		});
+
+		/**
+		 * The periodic orphan backfill (issue #1210): a deferred run left without a
+		 * dispatch while the router runs is re-queued once its dispatches have settled
+		 * for the grace, and never when its own #1049 recheck backs it.
+		 */
+		describe('periodic orphaned deferred-run backfill', () => {
+			/** A deferred run whose only dispatch completed `skipped-duplicate` just now. */
+			async function strandedRun(nextRetryAt: Date | undefined = undefined): Promise<{
+				runId: string;
+				dispatchId: string;
+			}> {
+				const runId = await createRun({
+					projectId: PROJECT_ID,
+					repository: REPO,
+					taskId: '1210',
+					phase: 'implementation',
+					jobPayload: job(),
+				});
+				await completeRun(runId, { status: 'deferred', error: 'rate limited', nextRetryAt });
+				const { dispatch } = await createDispatch({
+					projectId: PROJECT_ID,
+					jobPayload: job({ runId }),
+					source: 'webhook',
+					runId,
+				});
+				await claimDispatch(dispatch.id, 'worker:1', 60_000);
+				await completeDispatch(dispatch.id, 'skipped-duplicate');
+				return { runId, dispatchId: dispatch.id };
+			}
+
+			async function backdate(dispatchId: string): Promise<void> {
+				await getDb()
+					.update(dispatches)
+					.set({ updatedAt: new Date(Date.now() - ORPHAN_SETTLE_GRACE_MS - 60_000) })
+					.where(eq(dispatches.id, dispatchId));
+			}
+
+			it('re-queues a run whose dispatch settled before the grace, with its wake-up', async () => {
+				const nextRetryAt = new Date(Date.now() + 60_000);
+				const { runId, dispatchId } = await strandedRun(nextRetryAt);
+				await backdate(dispatchId);
+
+				await reconcileDispatchesPeriodically();
+
+				const dispatch = await getActiveDispatchByRunId(runId);
+				expect(dispatch).toMatchObject({
+					state: 'retry-scheduled',
+					waitReason: 'recovered',
+					source: 'recovered',
+					runId,
+				});
+				expect(dispatch?.availableAt.getTime()).toBe(nextRetryAt.getTime());
+				expect(await pendingJobIds()).toContain(`dispatch_${dispatch?.id}_w0`);
+			});
+
+			it('leaves a run whose dispatch settled within the grace for a later pass', async () => {
+				const { runId, dispatchId } = await strandedRun();
+
+				await reconcileDispatchesPeriodically();
+				expect(await getActiveDispatchByRunId(runId)).toBeUndefined();
+
+				await backdate(dispatchId);
+				await reconcileDispatchesPeriodically();
+				expect(await getActiveDispatchByRunId(runId)).toMatchObject({
+					state: 'retry-scheduled',
+				});
+			});
+
+			it('re-queues a deferred run that never had a dispatch at all', async () => {
+				const runId = await createRun({
+					projectId: PROJECT_ID,
+					repository: REPO,
+					taskId: '1210',
+					phase: 'implementation',
+					jobPayload: job(),
+				});
+				await completeRun(runId, { status: 'deferred', error: 'rate limited' });
+
+				await reconcileDispatchesPeriodically();
+
+				expect(await getActiveDispatchByRunId(runId)).toMatchObject({
+					state: 'retry-scheduled',
+					source: 'recovered',
+				});
+			});
+
+			it('never re-queues a Review run waiting on its own coalesced recheck (issue #1049)', async () => {
+				const headSha = 'a'.repeat(40);
+				const runId = await createRun({
+					projectId: PROJECT_ID,
+					repository: REPO,
+					taskId: '1049',
+					phase: 'review',
+					prNumber: '1049',
+					jobPayload: job({
+						event: createMockScmEvent({ kind: 'checks', headSha }),
+					} as Partial<SwarmJob>),
+				});
+				await completeRun(runId, { status: 'deferred', error: 'waiting for CI' });
+				await createDispatch({
+					projectId: PROJECT_ID,
+					jobPayload: job(),
+					source: 'webhook',
+					state: 'pending',
+					coalesceKey: checkRecheckCoalesceKey(REPO, '1049', headSha),
+				});
+
+				await reconcileDispatchesPeriodically();
+				await reconcileDispatchesAtStartup();
+
+				expect(await getActiveDispatchByRunId(runId)).toBeUndefined();
+			});
+
+			// A Reset of a run with no active dispatch touches no dispatch row, so the
+			// grace reads the run's own `reset_started_at` instead.
+			it('does not re-queue a stranded run while a Reset of it is in progress', async () => {
+				const { runId, dispatchId } = await strandedRun();
+				await backdate(dispatchId);
+				await markRunResetStarted(runId);
+
+				await reconcileDispatchesPeriodically();
+				expect(await getActiveDispatchByRunId(runId)).toBeUndefined();
+
+				// A Reset that began longer ago than the grace no longer shields the run.
+				await getDb()
+					.update(runs)
+					.set({ resetStartedAt: new Date(Date.now() - ORPHAN_SETTLE_GRACE_MS - 60_000) })
+					.where(eq(runs.id, runId));
+				await reconcileDispatchesPeriodically();
+				expect(await getActiveDispatchByRunId(runId)).toMatchObject({
+					state: 'retry-scheduled',
+				});
+			});
+
+			it('is idempotent — two periodic passes leave exactly one active dispatch', async () => {
+				const { runId, dispatchId } = await strandedRun();
+				await backdate(dispatchId);
+
+				await reconcileDispatchesPeriodically();
+				const first = await getActiveDispatchByRunId(runId);
+				await reconcileDispatchesPeriodically();
+				const second = await getActiveDispatchByRunId(runId);
+
+				expect(first).toBeDefined();
+				expect(second?.id).toBe(first?.id);
+				const rows = await getDb().select().from(dispatches).where(eq(dispatches.runId, runId));
+				expect(rows.filter((row) => row.state === 'retry-scheduled')).toHaveLength(1);
+			});
 		});
 
 		/**

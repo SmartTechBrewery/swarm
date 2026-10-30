@@ -794,6 +794,15 @@ export async function resetRunToRunning(
 	return rows.length > 0;
 }
 
+/**
+ * Stamp that a Reset & restart of the run is beginning its destructive steps
+ * (issue #1210) — the mark the reconciler's periodic orphan backfill keys its
+ * settle grace on, so it never imports the run inside the Reset's window.
+ */
+export async function markRunResetStarted(runId: string): Promise<void> {
+	await getDb().update(runs).set({ resetStartedAt: new Date() }).where(eq(runs.id, runId));
+}
+
 /** Persist a newer retry checkpoint without changing the run's lifecycle state. */
 export async function updateRunJobPayload(runId: string, jobPayload: SwarmJob): Promise<void> {
 	await getDb().update(runs).set({ jobPayload }).where(eq(runs.id, runId));

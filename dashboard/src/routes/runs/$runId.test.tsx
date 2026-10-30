@@ -1625,7 +1625,7 @@ describe('a deferred run with no scheduled retry (issue #1017)', () => {
 			screen.getByRole('heading', { name: /deferred — no retry is scheduled/i }),
 		).toBeDefined();
 		expect(screen.queryByRole('heading', { name: /automatic retry scheduled/i })).toBeNull();
-		expect(screen.getByText(/nothing will pick it up on its own/i)).toBeDefined();
+		expect(screen.getByText(/re-queues a run left like this automatically/i)).toBeDefined();
 	});
 
 	it('offers Retry now, Terminate, and Reset & restart', () => {

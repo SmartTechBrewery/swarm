@@ -414,6 +414,14 @@ export const runs = pgTable(
 		 * origin from a prior cancelled attempt.
 		 */
 		cancellation: jsonb('cancellation').$type<CancellationOrigin>(),
+		/**
+		 * When a Reset & restart of this run last began its destructive steps (issue
+		 * #1210, `src/dispatch/run-reset.ts`). A Reset of a run with no active dispatch
+		 * writes nothing else before it creates the replacement, so this is the mark
+		 * the reconciler's periodic orphan backfill keys its settle grace on to stay
+		 * out of that window. Never cleared: it only ever matters while it is fresh.
+		 */
+		resetStartedAt: timestamp('reset_started_at'),
 	},
 	(table) => [
 		index('idx_runs_project_id').on(table.projectId),

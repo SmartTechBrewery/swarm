@@ -9,6 +9,7 @@ vi.mock('@/db/repositories/runsRepository.js', async (importOriginal) => ({
 	clearRunRecovery: vi.fn(),
 	failRunFromStatus: vi.fn(),
 	hasLiveRunForTask: vi.fn(),
+	markRunResetStarted: vi.fn(),
 	updateRunJobPayload: vi.fn(),
 }));
 
@@ -66,6 +67,7 @@ import {
 	failRunFromStatus,
 	getRunByIdFromDb,
 	hasLiveRunForTask,
+	markRunResetStarted,
 	updateRunJobPayload,
 } from '@/db/repositories/runsRepository.js';
 import type { runs } from '@/db/schema/runs.js';
@@ -146,6 +148,7 @@ function makeRun(overrides: Partial<RunRow> = {}): RunRow {
 		agentSessionId: 'stale-session',
 		recovery: { state: 'blocked', blockedReason: 'live-leased' },
 		cancellation: null,
+		resetStartedAt: null,
 		checkpoint: null,
 		continuationCount: 0,
 		outputBytes: 0,
@@ -214,6 +217,7 @@ describe('resetRun', () => {
 		vi.mocked(clearRunRecovery).mockReset().mockResolvedValue(undefined);
 		vi.mocked(failRunFromStatus).mockReset().mockResolvedValue(true);
 		vi.mocked(hasLiveRunForTask).mockReset().mockResolvedValue(false);
+		vi.mocked(markRunResetStarted).mockReset().mockResolvedValue(undefined);
 		vi.mocked(updateRunJobPayload).mockReset().mockResolvedValue(undefined);
 		vi.mocked(removePendingJobById).mockClear();
 		vi.mocked(reconcileTerminatedWorktree).mockReset().mockResolvedValue({ outcome: 'removed' });
@@ -311,6 +315,20 @@ describe('resetRun', () => {
 	// `implementationBranchProvisioned: true` survived every reset and each restart
 	// re-provisioned with `createBranch: false` against a branch that no longer existed
 	// (`fatal: invalid reference: issue-719`), while a fresh dispatch of the same task ran fine.
+	// Issue #1210: a run with no active dispatch has no dispatch row for the periodic
+	// orphan backfill's settle grace to read, so the stamp must land before any
+	// teardown — it is the only mark that keeps the backfill out of the Reset.
+	it('stamps the run as resetting before cancelling or tearing anything down', async () => {
+		await resetRun('run-1');
+
+		expect(markRunResetStarted).toHaveBeenCalledWith('run-1');
+		const stampedAt = vi.mocked(markRunResetStarted).mock.invocationCallOrder[0];
+		expect(stampedAt).toBeLessThan(vi.mocked(getActiveDispatchByRunId).mock.invocationCallOrder[0]);
+		expect(stampedAt).toBeLessThan(
+			vi.mocked(reconcileTerminatedWorktree).mock.invocationCallOrder[0],
+		);
+	});
+
 	describe('the replacement dispatch carries no resumption state', () => {
 		const STORED_SESSION = '92340ec7-709e-4ffa-9297-3899caca4830';
 

@@ -106,6 +106,7 @@ import {
 	getRunByIdFromDb,
 	hasLiveRunForTask,
 	isPipelineRun,
+	markRunResetStarted,
 	type PipelineRunRow,
 	updateRunJobPayload,
 } from '../db/repositories/runsRepository.js';
@@ -474,6 +475,12 @@ async function performReset(run: ResetTargetRun, progress: ResetRunSteps): Promi
 		});
 	}
 
+	// Stamped before anything is cancelled (issue #1210): for a run with no active
+	// dispatch this is the only write the reconciler's periodic orphan backfill can
+	// see before the replacement exists, and its import takes the run row's lock to
+	// read it — so a backfill either loses to this and skips, or finishes first and
+	// its dispatch is the one cancelled below.
+	await markRunResetStarted(run.id);
 	progress.dispatch = await cancelActiveDispatch(run.id);
 
 	// A stale user-termination flag would make the worker terminate the fresh
