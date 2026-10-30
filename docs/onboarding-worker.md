@@ -303,7 +303,10 @@ It reaches the second installation through `~/code/swarm-two/.env`. On macOS it
 installs the LaunchAgent with that clone's **own** `bin/swarm-worker-agent`, so
 the agent runs `~/code/swarm-two/bin/swarm.js run:worker` (issue #1213). If the
 enrollment needs approval, a project administrator of the second installation
-gives it (step 5 above), with this clone's CLI.
+gives it (step 5 above), with this clone's CLI. The commands `setup` prints when a
+step fails, or to start, check or retry the worker, already name this clone's own
+`node ~/code/swarm-two/bin/swarm.js` / `~/code/swarm-two/bin/swarm-worker-agent`
+form (issue #1221), so they can be copied as printed.
 
 **5. Run every later command for that installation through the same clone:**
 `node ~/code/swarm-two/bin/swarm.js <command>`. An alias in your own shell is a

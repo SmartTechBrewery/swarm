@@ -302,7 +302,7 @@ describe('WorkersRoster reorder controls (issue #750 phase 2)', () => {
 				screen
 					.getAllByRole('row')
 					.slice(1)
-					.map((row) => row.querySelector('td')?.textContent),
+					.map((row) => row.querySelector('td > div')?.textContent),
 			).toEqual(['grace-box', 'ada-laptop']);
 		});
 		expect(reorderMutate).toHaveBeenCalledWith({
@@ -324,7 +324,7 @@ describe('WorkersRoster reorder controls (issue #750 phase 2)', () => {
 			screen
 				.getAllByRole('row')
 				.slice(1)
-				.map((row) => row.querySelector('td')?.textContent),
+				.map((row) => row.querySelector('td > div')?.textContent),
 		).toEqual(['ada-laptop', 'grace-box']);
 	});
 });
@@ -339,11 +339,12 @@ describe('WorkersRoster search (issue #897)', () => {
 	});
 
 	const searchBox = () => screen.getByRole('searchbox', { name: 'Search workers' });
+	// The name line alone — the checkout repositories sit under it (issue #1228).
 	const machineNames = () =>
 		screen
 			.getAllByRole('row')
 			.slice(1)
-			.map((row) => row.querySelector('td')?.textContent);
+			.map((row) => row.querySelector('td > div')?.textContent);
 
 	it('offers the search box on the global screen and the project tab alike', async () => {
 		workersListQueryFn.mockResolvedValue([ADA, GRACE]);
