@@ -59,6 +59,7 @@ import {
 	completeRun,
 	createRun,
 	failRunFromStatus,
+	findStoredTaskBranch,
 	getLatestCompletedPlanningScope,
 	getLatestRunForTask,
 	getRunByIdFromDb,
@@ -151,7 +152,7 @@ import {
 	runReviewPhase,
 } from '../pipeline/review.js';
 import type { ReviewVerdictLedger } from '../pipeline/review-ledger.js';
-import { isArtifactNumberTaskId, taskIdFromBranch } from '../pipeline/task-branch.js';
+import { isArtifactNumberTaskId, taskIdFromTaskBranch } from '../pipeline/task-branch.js';
 import {
 	hasAutomationLabel,
 	missingAutomationLabelMessage,
@@ -2696,6 +2697,13 @@ export interface AssignedPhaseInputs {
 	pm?: PMProvider;
 	/** implementation: called once the task branch has been acquired, for resume idempotency. */
 	onBranchProvisioned?: () => Promise<void>;
+	/**
+	 * implementation: the task branch an earlier run already decided (issue #1241),
+	 * resolved control-plane side from the run record — reused, never re-rendered.
+	 */
+	taskBranch?: string;
+	/** implementation: called with the task branch's name once the phase decides it (issue #1241). */
+	onBranchNamed?: (branch: string) => Promise<void>;
 	/** PR-driven phases (review / respond-to-* / resolve-conflicts). */
 	prNumber?: string;
 	prBranch?: string;
@@ -2845,6 +2853,8 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 				customPrompt,
 				resumeExistingBranch,
 				onBranchProvisioned: inputs.onBranchProvisioned,
+				taskBranch: inputs.taskBranch,
+				onBranchNamed: inputs.onBranchNamed,
 				// Identifies this attempt to the provision-time collision gate, so a
 				// lease left behind by a crashed run is recognised as an orphan instead
 				// of wedging this one as `live-leased` (issue #427). Every phase below
@@ -3337,6 +3347,27 @@ async function reuseRunRow(
 			projectId: project.id,
 			phase: trigger.phase,
 			taskId: trigger.taskId,
+			error: describeError(err),
+		});
+		return undefined;
+	}
+}
+
+/**
+ * The task branch stored for this task by an earlier Implementation run (issue
+ * #1241), best-effort: a failed read decides the branch afresh, as a task with no
+ * stored branch does, rather than failing the dispatch.
+ */
+async function tryFindStoredTaskBranch(
+	project: ProjectConfig,
+	taskId: string,
+): Promise<string | undefined> {
+	try {
+		return await findStoredTaskBranch(project.id, project.repo, taskId);
+	} catch (err) {
+		logger.warn('Could not read the stored task branch (deciding it afresh)', {
+			projectId: project.id,
+			taskId,
 			error: describeError(err),
 		});
 		return undefined;
@@ -4371,7 +4402,7 @@ function buildTriggerContext(
  * read per SCM dispatch; the gate calls it only while either work-item gate (the
  * automation label, the required assignee) is enabled.
  *
- * **Fails open**: an unlinked PR, a branch outside the project's `branchPrefix`,
+ * **Fails open**: an unlinked PR, a branch that is not a task branch of the repository,
  * an unreadable board, and an unresolvable PM provider all return `undefined`,
  * which the gate treats as eligible. A board blip must never wedge review/CI work.
  */
@@ -4386,11 +4417,11 @@ async function resolveGatedWorkItem(
 		taskId: trigger.taskId,
 		prNumber: trigger.prNumber,
 	};
-	// SWARM opens every PR from `<branchPrefix><taskId>`, so the branch names the
+	// SWARM opens every PR from a branch its pattern names, so the branch names the
 	// task (the same decode `src/pipeline/respond-to-review.ts` performs for its board
 	// report). Only an SCM artifact-number task id names an *issue* artifact; a
 	// board-key task (`VT-1538`) has none, so its lookup tries the PR artifact alone.
-	const branchTaskId = taskIdFromBranch(trigger.prBranch, project.branchPrefix);
+	const branchTaskId = taskIdFromTaskBranch(trigger.prBranch, project);
 	try {
 		return await findWorkItemForPullRequest(
 			requireProjectPMProvider(project),
@@ -5926,6 +5957,15 @@ async function processClaimedDispatch(
 			// unexpired dispatch claim), so from here on this dispatch settling frees a
 			// slot on that machine — which is what the `finally` promotes on (#610).
 			claimedWorkerId = selection.workerId;
+		}
+
+		// The task branch an earlier run already decided (issue #1241) rides on this
+		// attempt, so the run row below records it and the phase reuses it rather than
+		// rendering the pattern again. Seeded before the row is written: a reused row's
+		// payload is replaced by this job's.
+		if (trigger.phase === 'implementation' && !job.taskBranch) {
+			const taskBranch = await tryFindStoredTaskBranch(project, trigger.taskId);
+			if (taskBranch) job.taskBranch = taskBranch;
 		}
 
 		// Record a run-history row for this agent-CLI invocation. Everything here is

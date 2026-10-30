@@ -7,7 +7,7 @@
  * board-driven run next to its `(project_id, task_id)` — so the card is a read
  * model away, keyed by the task the branch encodes. That is deliberately *not* a
  * PM-provider question: it is answered from SWARM's own tables, with SWARM's own
- * branch naming (`<branchPrefix><taskId>`, whether the task id is an SCM artifact
+ * branch naming (the repository's pattern or legacy `<branchPrefix><taskId>`, whether the task id is an SCM artifact
  * number or a board key), so it holds for any board paired with any repository
  * (ai/RULES.md §2, ai/ARCHITECTURE.md "Task identity").
  *
@@ -26,7 +26,7 @@ import type { ProjectConfig } from '../config/schema.js';
 import { findBoardItemIdForTask } from '../db/repositories/runsRepository.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
-import { taskIdFromBranch } from '../pipeline/task-branch.js';
+import { taskIdFromTaskBranch } from '../pipeline/task-branch.js';
 
 /**
  * The board card a PR branch's task was dispatched from, or `undefined` when
@@ -39,7 +39,7 @@ export async function resolveBoardItemIdForPrBranch(
 	prBranch: string | undefined,
 ): Promise<string | undefined> {
 	if (!prBranch) return undefined;
-	const taskId = taskIdFromBranch(prBranch, project.branchPrefix);
+	const taskId = taskIdFromTaskBranch(prBranch, project);
 	if (!taskId) return undefined;
 	try {
 		return await findBoardItemIdForTask(project.id, taskId);

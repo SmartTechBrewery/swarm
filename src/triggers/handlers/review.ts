@@ -205,7 +205,8 @@
  * **Work-item origin gate.** SWARM reviews only PRs it manages itself: a
  * human- or third-party-authored PR completing its checks (or being opened) must
  * not burn a review. Ownership is decided from the PR's *work-item origin*, not
- * its author — its head branch must be exact `<branchPrefix><taskId>`
+ * its author — its head branch must be a task branch of the repository (its branch
+ * name pattern, or the legacy exact `<branchPrefix><taskId>`, issue #1241)
  * and SWARM must hold an `implementation` run row for that item
  * (`isSwarmManagedPullRequest`, `../swarm-managed-pr.ts`). Author identity no
  * longer carries the signal: under the federated model (ADR-004 §3, issue #397)

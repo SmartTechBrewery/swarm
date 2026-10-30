@@ -3,7 +3,9 @@ import { describe, expect, it } from 'vitest';
 import {
 	addRepository,
 	areRepositoriesDirty,
+	branchPatternPatch,
 	duplicateRepositories,
+	effectiveBranchPattern,
 	moveRepository,
 	patchRepository,
 	projectRepo,
@@ -58,6 +60,7 @@ describe('toRepositoryForms', () => {
 				repo: 'acme/first',
 				baseBranch: 'main',
 				branchPrefix: 'issue-',
+				branchPattern: '',
 				autoMerge: false,
 				reviewChecks: 'required',
 				reviewChecksWaitMinutes: '',
@@ -68,6 +71,7 @@ describe('toRepositoryForms', () => {
 				repo: 'acme/second',
 				baseBranch: 'trunk',
 				branchPrefix: 'work-',
+				branchPattern: '',
 				autoMerge: false,
 				reviewChecks: 'required',
 				reviewChecksWaitMinutes: '',
@@ -86,6 +90,7 @@ describe('toRepositoryForms', () => {
 				repo: 'acme/first',
 				baseBranch: '',
 				branchPrefix: '',
+				branchPattern: '',
 				autoMerge: false,
 				reviewChecks: 'required',
 				reviewChecksWaitMinutes: '',
@@ -102,6 +107,7 @@ describe('toRepositoryForms', () => {
 			repo: '',
 			baseBranch: 'main',
 			branchPrefix: 'issue-',
+			branchPattern: '',
 			autoMerge: false,
 			reviewChecks: 'required',
 			reviewChecksWaitMinutes: '',
@@ -121,6 +127,7 @@ describe('toRepositoryEntries', () => {
 					repo: 'acme/first',
 					baseBranch: 'main',
 					branchPrefix: 'issue-',
+					branchPattern: '',
 					autoMerge: false,
 					reviewChecks: 'required',
 					reviewChecksWaitMinutes: '',
@@ -131,6 +138,7 @@ describe('toRepositoryEntries', () => {
 					repo: 'acme/second',
 					baseBranch: 'trunk',
 					branchPrefix: 'work-',
+					branchPattern: '',
 					autoMerge: false,
 					reviewChecks: 'required',
 					reviewChecksWaitMinutes: '',
@@ -212,6 +220,7 @@ describe('toRepositoryEntries', () => {
 				repo: 'acme/first',
 				baseBranch: 'main',
 				branchPrefix: 'issue-',
+				branchPattern: '',
 				autoMerge: false,
 				reviewChecks: 'required',
 				reviewChecksWaitMinutes: '',
@@ -262,6 +271,7 @@ describe('repository list mutations', () => {
 			repo: 'acme/first',
 			baseBranch: 'main',
 			branchPrefix: 'issue-',
+			branchPattern: '',
 			autoMerge: false,
 			reviewChecks: 'required',
 			reviewChecksWaitMinutes: '',
@@ -272,6 +282,7 @@ describe('repository list mutations', () => {
 			repo: 'acme/second',
 			baseBranch: 'trunk',
 			branchPrefix: 'work-',
+			branchPattern: '',
 			autoMerge: false,
 			reviewChecks: 'required',
 			reviewChecksWaitMinutes: '',
@@ -287,6 +298,7 @@ describe('repository list mutations', () => {
 				repo: '',
 				baseBranch: 'main',
 				branchPrefix: 'issue-',
+				branchPattern: '',
 				autoMerge: false,
 				reviewChecks: 'required',
 				reviewChecksWaitMinutes: '',
@@ -337,6 +349,7 @@ describe('duplicateRepositories', () => {
 			repo,
 			baseBranch: 'main',
 			branchPrefix: 'issue-',
+			branchPattern: '',
 			autoMerge: false,
 			reviewChecks: 'required',
 			reviewChecksWaitMinutes: '',
@@ -430,5 +443,45 @@ describe('areRepositoriesDirty', () => {
 	it('reports the blank row against an absent list', () => {
 		expect(areRepositoriesDirty(toRepositoryForms(undefined), undefined)).toBe(false);
 		expect(areRepositoriesDirty(toRepositoryForms(stored), undefined)).toBe(true);
+	});
+});
+
+// Issue #1241: the pattern replaces the prefix as the edited setting; the prefix rides
+// through untouched, since it is still recognised for branches already open.
+describe('branch name pattern', () => {
+	it('reads an entry with no pattern as its prefix before {issue_key}', () => {
+		const [row] = toRepositoryForms([{ repo: 'acme/first', branchPrefix: 'work-' }]);
+		expect(row?.branchPattern).toBe('');
+		expect(effectiveBranchPattern(row as RepositoryForm)).toBe('work-{issue_key}');
+	});
+
+	it('round-trips a pattern and keeps the prefix beside it', () => {
+		const stored: RepositoryEntry[] = [
+			{ repo: 'acme/first', branchPrefix: 'issue-', branchPattern: '{issue_key}/{friendly_name}' },
+		];
+		const rows = toRepositoryForms(stored);
+		expect(effectiveBranchPattern(rows[0] as RepositoryForm)).toBe('{issue_key}/{friendly_name}');
+		expect(toRepositoryEntries(rows)[0]).toMatchObject({
+			branchPrefix: 'issue-',
+			branchPattern: '{issue_key}/{friendly_name}',
+		});
+		expect(areRepositoriesDirty(rows, stored)).toBe(false);
+		expect(
+			areRepositoriesDirty(patchRepository(rows, 0, { branchPattern: '{issue_key}' }), stored),
+		).toBe(true);
+	});
+
+	it('saves no pattern for an entry still on its prefix', () => {
+		const rows = toRepositoryForms([{ repo: 'acme/first', branchPrefix: 'issue-' }]);
+		expect(toRepositoryEntries(rows)[0]).not.toHaveProperty('branchPattern');
+	});
+
+	it('stores the prefix’s own pattern as none, and anything else as itself', () => {
+		expect(branchPatternPatch({ branchPrefix: 'issue-' }, 'issue-{issue_key}')).toEqual({
+			branchPattern: '',
+		});
+		expect(branchPatternPatch({ branchPrefix: 'issue-' }, '{issue_key}/{friendly_name}')).toEqual({
+			branchPattern: '{issue_key}/{friendly_name}',
+		});
 	});
 });

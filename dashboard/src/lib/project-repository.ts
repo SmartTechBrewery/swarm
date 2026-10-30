@@ -26,6 +26,10 @@
  */
 
 import type { ReviewChecksPolicy } from '../../../src/config/schema.js';
+import {
+	branchPatternFromPrefix,
+	DEFAULT_BRANCH_PREFIX,
+} from '../../../src/pipeline/branch-pattern.js';
 import { SCM_REPO_COORDINATES } from '../../../src/scm/repo-coordinates.js';
 import type { ScmType } from '../../../src/scm/types.js';
 
@@ -48,7 +52,14 @@ interface ProjectWithRepositories {
 export interface RepositoryEntry {
 	repo: string;
 	baseBranch?: string;
+	/**
+	 * The legacy task-branch prefix. No longer edited here (issue #1241) — it is
+	 * carried through unchanged, because it is still the pattern of an entry stating
+	 * none and its `<prefix><id>` shape stays recognised for branches already open.
+	 */
 	branchPrefix?: string;
+	/** How this repository names its task branches (issue #1241). Unset means `<branchPrefix>{issue_key}`. */
+	branchPattern?: string;
 	/**
 	 * The board card's routing token (issue #686). Authored in `swarm.config.json`
 	 * and **not editable here** — this screen only carries it through, so saving the
@@ -79,7 +90,13 @@ export interface RepositoryForm {
 	id: string;
 	repo: string;
 	baseBranch: string;
+	/** Carried through, never edited here (issue #1241) — see {@link RepositoryEntry.branchPrefix}. */
 	branchPrefix: string;
+	/**
+	 * The repository's own branch name pattern (issue #1241). `''` states none, so the
+	 * entry keeps running on `<branchPrefix>{issue_key}` and is saved without the key.
+	 */
+	branchPattern: string;
 	/** Merge automation for this repository (issue #1066) — an unset entry reads as off. */
 	autoMerge: boolean;
 	/** Review's check policy (issue #1109) — an unset entry reads as `required`. */
@@ -129,7 +146,8 @@ export const DEFAULT_REVIEW_CHECKS_POLICY: ReviewChecksPolicy = 'required';
 const NEW_REPOSITORY = {
 	repo: '',
 	baseBranch: DEFAULT_BASE_BRANCH,
-	branchPrefix: 'issue-',
+	branchPrefix: DEFAULT_BRANCH_PREFIX,
+	branchPattern: '',
 	autoMerge: false,
 	reviewChecks: DEFAULT_REVIEW_CHECKS_POLICY,
 	reviewChecksWaitMinutes: '',
@@ -154,6 +172,7 @@ export function toRepositoryForms(repositories: RepositoryEntry[] | undefined): 
 		repo: entry.repo,
 		baseBranch: entry.baseBranch ?? '',
 		branchPrefix: entry.branchPrefix ?? '',
+		branchPattern: entry.branchPattern ?? '',
 		autoMerge: entry.autoMerge === true,
 		reviewChecks: entry.reviewChecks ?? DEFAULT_REVIEW_CHECKS_POLICY,
 		reviewChecksWaitMinutes: entry.reviewChecksWaitMinutes?.toString() ?? '',
@@ -187,6 +206,7 @@ export function toRepositoryEntries(rows: RepositoryForm[]): RepositoryEntry[] {
 			repo: row.repo,
 			baseBranch: row.baseBranch,
 			branchPrefix: row.branchPrefix,
+			...(row.branchPattern ? { branchPattern: row.branchPattern } : {}),
 			autoMerge: row.autoMerge,
 			reviewChecks: row.reviewChecks,
 			...(wait ? { reviewChecksWaitMinutes: Number(wait) } : {}),
@@ -194,6 +214,29 @@ export function toRepositoryEntries(rows: RepositoryForm[]): RepositoryEntry[] {
 			...(row.pmRoutingToken ? { pmRoutingToken: row.pmRoutingToken } : {}),
 		};
 	});
+}
+
+/**
+ * The pattern a row names its task branches by (issue #1241) — its own, or its legacy
+ * prefix as `<prefix>{issue_key}`, the same resolution the server applies
+ * (`resolveBranchPattern`, `src/pipeline/task-branch.ts`).
+ */
+export function effectiveBranchPattern(
+	row: Pick<RepositoryForm, 'branchPattern' | 'branchPrefix'>,
+): string {
+	return row.branchPattern || branchPatternFromPrefix(row.branchPrefix);
+}
+
+/**
+ * The row patch an edited pattern applies. A pattern equal to what the legacy prefix
+ * already renders is stored as none, so an entry opened and applied unchanged is not
+ * made dirty — and keeps following its prefix.
+ */
+export function branchPatternPatch(
+	row: Pick<RepositoryForm, 'branchPrefix'>,
+	pattern: string,
+): Pick<RepositoryForm, 'branchPattern'> {
+	return { branchPattern: pattern === branchPatternFromPrefix(row.branchPrefix) ? '' : pattern };
 }
 
 /** Append a blank row at the end — the lowest-priority position, never the default. */
@@ -277,6 +320,7 @@ export function areRepositoriesDirty(
 			row.repo !== other?.repo ||
 			row.baseBranch !== other?.baseBranch ||
 			row.branchPrefix !== other?.branchPrefix ||
+			row.branchPattern !== other?.branchPattern ||
 			row.autoMerge !== other?.autoMerge ||
 			row.reviewChecks !== other?.reviewChecks ||
 			row.reviewChecksWaitMinutes.trim() !== other?.reviewChecksWaitMinutes ||

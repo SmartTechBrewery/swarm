@@ -11,14 +11,14 @@
  * events — so this covers both without naming a provider (ai/RULES.md §2).
  *
  * The ticket is recovered from SWARM's own branch naming,
- * `taskIdFromBranch(prBranch, branchPrefix, { strict: true })`, the derivation
+ * `taskIdFromTaskBranch(prBranch, project, { strict: true })`, the derivation
  * merge automation already uses: a branch SWARM did not name maps to no ticket and
  * frees nothing. The release is idempotent, so a pull request whose ticket held no
  * slot is a no-op.
  */
 
 import { releaseTicketSlot } from '../../dispatch/wip-limit.js';
-import { taskIdFromBranch } from '../../pipeline/task-branch.js';
+import { taskIdFromTaskBranch } from '../../pipeline/task-branch.js';
 import type { TriggerContext, TriggerHandler, TriggerResult } from '../types.js';
 
 export function createWipReleaseTrigger(): TriggerHandler {
@@ -39,9 +39,7 @@ export function createWipReleaseTrigger(): TriggerHandler {
 		},
 		async handle(ctx: TriggerContext): Promise<TriggerResult | null> {
 			if (ctx.source !== 'scm' || !ctx.event.prBranch) return null;
-			const taskId = taskIdFromBranch(ctx.event.prBranch, ctx.project.branchPrefix, {
-				strict: true,
-			});
+			const taskId = taskIdFromTaskBranch(ctx.event.prBranch, ctx.project, { strict: true });
 			if (!taskId) return null;
 			await releaseTicketSlot(
 				ctx.project.id,

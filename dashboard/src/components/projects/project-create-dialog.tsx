@@ -134,9 +134,10 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 		// single-entry rather than growing a second form. Its base branch is submitted
 		// explicitly (issue #883): the create schema would otherwise fill in
 		// `PROJECT_DEFAULTS.baseBranch` unseen, so a repository whose default branch is not
-		// `main` was silently configured against a branch nobody chose. `branchPrefix` keeps
-		// taking that default — a task branch prefix is SWARM's own naming convention rather
-		// than a property of the repository, so nothing about it can be silently wrong.
+		// `main` was silently configured against a branch nobody chose. Branch naming keeps
+		// taking its default (`issue-{issue_key}`, through the default `branchPrefix`) — SWARM
+		// renders a working name either way, and the pattern editor on the Source Control tab
+		// is where a repository's own convention is set (issue #1241).
 		// An empty reviewer token is left out rather than sent blank: the server then falls
 		// back to the installation default from General Settings → Credentials.
 		const token = reviewerToken.trim();

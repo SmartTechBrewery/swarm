@@ -664,12 +664,21 @@ export function awaitResultWithGuards(
 	});
 }
 
-/** Persist the Implementation branch checkpoint on the run row so a re-push can resume it (best-effort). */
+/**
+ * Persist the Implementation branch checkpoint on the run row so a re-push can resume
+ * it (best-effort). A frame naming the decided task branch (issue #1241) also records
+ * it as the run's `taskBranch` — on the row, and on the in-flight `job` itself, which
+ * is the object a deferral of this attempt derives its retry payload from
+ * (`settleDispatchRetry`, `../worker/consumer.ts`) and would otherwise write back
+ * without it.
+ */
 async function persistBranchProvisioned(
 	runId: string | undefined,
 	job: SwarmJob,
 	taskId: string,
+	branch: string | undefined,
 ): Promise<void> {
+	if (branch) job.taskBranch = branch;
 	if (!runId) return;
 	try {
 		await updateRunJobPayload(runId, { ...job, implementationBranchProvisioned: true });
@@ -771,6 +780,7 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 	// credential for that provider fails now, naming both — rather than a few seconds
 	// into the run with the provider's own generic identity error.
 	const operatorCredential = await resolveOperatorCredential(project, selection);
+	const taskBranch = trigger.phase === 'implementation' ? job.taskBranch : undefined;
 
 	const assignment = buildTaskAssignment({
 		dispatchId: dispatch.id,
@@ -778,8 +788,8 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 		project,
 		phase: trigger.phase,
 		taskId: trigger.taskId,
-		targetBranch: resolveTargetBranch(project, trigger),
-		systemPrompt: composeSystemPrompt(project, trigger, customPrompt),
+		targetBranch: resolveTargetBranch(project, trigger, taskBranch),
+		systemPrompt: composeSystemPrompt(project, trigger, customPrompt, taskBranch),
 		customPrompt,
 		target: selection.target,
 		timeoutMs,
@@ -804,6 +814,9 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 		// disagree about which repository the phase ran against. Not read back off the
 		// run row — creation is best-effort, so `runId` can be undefined here.
 		repository: project.repo,
+		// The task branch a previous run decided (issue #1241), seeded onto the job by
+		// `processJob` from the run record — the worker has no database to read it from.
+		taskBranch,
 		operatorCredential,
 	});
 
@@ -848,7 +861,7 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 		{
 			onProgress: (progress: TaskProgress) => {
 				if (progress.state === 'branch-provisioned') {
-					void persistBranchProvisioned(runId, job, trigger.taskId);
+					void persistBranchProvisioned(runId, job, trigger.taskId, progress.branch);
 				}
 			},
 		},

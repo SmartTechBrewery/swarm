@@ -23,6 +23,7 @@ import {
 	failStaleRunningRuns,
 	findApprovedReviewRunForRearm,
 	findBoardItemIdForTask,
+	findStoredTaskBranch,
 	getLatestCompletedPlanningScope,
 	getLatestRunForTask,
 	getPendingReviewMergeFollowUps,
@@ -1567,6 +1568,61 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 
 			expect(await findBoardItemIdForTask(PROJECT_ID, '78')).toBeUndefined();
 			expect(await findBoardItemIdForTask(PROJECT_ID, 'never-ran')).toBeUndefined();
+		});
+	});
+
+	// Issue #1241: the task branch Implementation decided is stored on its run's payload
+	// and read back for every later attempt of the same task.
+	describe('findStoredTaskBranch', () => {
+		it('returns the newest Implementation branch stored for this repository task', async () => {
+			const older = await createRun({
+				projectId: PROJECT_ID,
+				taskId: 'VT-1',
+				phase: 'implementation',
+				jobPayload: createMockPmWebhookJob({ taskBranch: 'VT-1/first-name' }),
+			});
+			const newest = await createRun({
+				projectId: PROJECT_ID,
+				taskId: 'VT-1',
+				phase: 'implementation',
+				jobPayload: createMockPmWebhookJob({ taskBranch: 'VT-1/second-name' }),
+			});
+			// A newer row with no stored branch, and the same task in another repository,
+			// never shadow it.
+			const unnamed = await createRun({
+				projectId: PROJECT_ID,
+				taskId: 'VT-1',
+				phase: 'implementation',
+				jobPayload: createMockPmWebhookJob(),
+			});
+			await createRun({
+				projectId: PROJECT_ID,
+				repository: OTHER_REPO,
+				taskId: 'VT-1',
+				phase: 'implementation',
+				jobPayload: createMockPmWebhookJob({ taskBranch: 'VT-1/other-repository' }),
+			});
+			await getDb()
+				.update(runs)
+				.set({ startedAt: new Date('2026-01-01') })
+				.where(eq(runs.id, older));
+			await getDb()
+				.update(runs)
+				.set({ startedAt: new Date('2026-02-01') })
+				.where(eq(runs.id, newest));
+			await getDb()
+				.update(runs)
+				.set({ startedAt: new Date('2026-03-01') })
+				.where(eq(runs.id, unnamed));
+
+			expect(await findStoredTaskBranch(PROJECT_ID, REPO, 'VT-1')).toBe('VT-1/second-name');
+		});
+
+		it('returns undefined when no run of the task stored one', async () => {
+			await createRun({ projectId: PROJECT_ID, taskId: 'VT-2', phase: 'implementation' });
+
+			expect(await findStoredTaskBranch(PROJECT_ID, REPO, 'VT-2')).toBeUndefined();
+			expect(await findStoredTaskBranch(PROJECT_ID, REPO, 'never-ran')).toBeUndefined();
 		});
 	});
 

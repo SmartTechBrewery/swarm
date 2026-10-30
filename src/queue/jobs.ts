@@ -384,6 +384,17 @@ const jobBase = z.object({
 	 * the separate {@link resumeSession} flag, which spans every phase and CLI.
 	 */
 	resumePmPhase: z.enum(['planning', 'implementation']).optional(),
+	/**
+	 * The task branch Implementation decided for this task (issue #1241), stored with
+	 * the run so every later attempt — a retry, a reset, a fresh dispatch of the same
+	 * card — reuses the name rather than rendering the repository's pattern again,
+	 * which could pick a different `{friendly_name}` than the one a PR is already open
+	 * from. Written from the worker's `branch-provisioned` progress
+	 * (`src/router/dispatcher.ts`) and seeded onto a new attempt from the task's
+	 * previous runs (`findStoredTaskBranch`). Deliberately *not* recovery intent: it is
+	 * a fact about the task, so a reset keeps it.
+	 */
+	taskBranch: z.string().min(1).optional(),
 	// How this attempt treats a prior one's preserved work — declared once in
 	// {@link RecoveryIntentSchema} and spread here, so the payload and the
 	// transport frame cannot drift apart member by member (issue #591).

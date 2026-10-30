@@ -416,6 +416,15 @@ export const TaskAssignmentSchema = z.object({
 	 */
 	catchUpOnly: z.boolean().optional(),
 	/**
+	 * implementation only: the task branch an earlier run already decided for this
+	 * task (issue #1241), resolved control-plane side from the run record the worker
+	 * cannot read — reused verbatim, never re-rendered from the branch name pattern.
+	 * Additive in both directions, so `TRANSPORT_PROTOCOL_VERSION` is deliberately not
+	 * bumped: an older router omits it and the phase decides the name as a first
+	 * attempt does; an older worker ignores it and names the branch as it always did.
+	 */
+	taskBranch: z.string().min(1).optional(),
+	/**
 	 * The **worker operator's own** SCM credential for the provider this project runs
 	 * on, resolved control-plane side per `(worker, project.scm)` from the durable
 	 * store (issue #765) — the identity the phase's commits, push, pull request and
@@ -653,6 +662,13 @@ export type WorkItemBlockerFrame = z.infer<typeof WorkItemBlockerFrameSchema>;
  * is emitted once the phase actually starts; `branch-provisioned` reports the
  * Implementation task-branch checkpoint so a re-pushed assignment can resume on
  * the existing branch (the transport mirror of `implementationBranchProvisioned`).
+ *
+ * A `branch-provisioned` frame carrying `branch` names the task branch the phase
+ * decided (issue #1241) — at provisioning, or again at delivery when the
+ * repository's pattern has a part the implementer chooses — which the control
+ * plane stores as the run's `taskBranch`. A new optional key rather than a new
+ * `state`, on purpose: an older control plane strips the key and still parses the
+ * frame, while an unknown state would fail it and close the worker's socket.
  */
 export const TaskProgressSchema = z.object({
 	type: z.literal('task-progress'),
@@ -661,6 +677,7 @@ export const TaskProgressSchema = z.object({
 	phase: TaskPhaseSchema,
 	taskId: z.string().min(1),
 	state: z.enum(['running', 'branch-provisioned']),
+	branch: z.string().min(1).optional(),
 });
 export type TaskProgress = z.infer<typeof TaskProgressSchema>;
 

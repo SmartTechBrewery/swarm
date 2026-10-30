@@ -11,7 +11,7 @@ import { RepositoryList } from './repository-list.js';
  * source control took two tabs — one to say *which* provider, another to say what it
  * operates on. Nothing in a row is project identity or host layout: `repo` is an
  * `owner/repo` slug (three segments on Azure DevOps), `baseBranch` is what pull requests target and worktrees are cut
- * from, `branchPrefix` names task branches. So the tab now reads top-to-bottom as
+ * from, `branchPattern` names task branches (issue #1241). So the tab now reads top-to-bottom as
  * provider → credentials → repositories, the shape issue #630 gave Project Management.
  * Settings keeps `name`, `repoRoot` and `worktreeRoot`.
  *

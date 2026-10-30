@@ -32,6 +32,9 @@ import { trelloConfigSchema } from '../integrations/pm/trello/config-schema.js';
 // Registry lookup only, like the PM one above — `../integrations/scm/registry.js`
 // imports nothing at runtime.
 import { listSCMProviders } from '../integrations/scm/registry.js';
+// The branch name pattern rules (issue #1241) — `../pipeline/branch-pattern.js` imports
+// nothing at all, which is also what lets the dashboard's editor share them.
+import { validateBranchPattern } from '../pipeline/branch-pattern.js';
 // The value list behind `PMType` — `../pm/types.js` imports nothing at runtime either.
 import { PM_TYPES, type PMType } from '../pm/types.js';
 // The Zod mirror of `ScmType`; `../scm/events.js` imports only zod plus a type-only
@@ -725,8 +728,32 @@ export const ProjectRepositorySchema = z.object({
 	/** Branch task worktrees are cut from and PRs target. */
 	baseBranch: z.string().min(1).default(PROJECT_DEFAULTS.baseBranch),
 
-	/** Prefix for task branch names — SWARM's convention is `issue-<n>-<slug>`. */
+	/**
+	 * The **legacy** task-branch naming: branches named `<branchPrefix><taskId>`
+	 * (`issue-42`). Superseded by {@link branchPattern} (issue #1241) but kept, never
+	 * migrated: an entry with no pattern still names its branches this way (the pattern
+	 * `<prefix>{issue_key}`), and every entry keeps *recognising* this shape after a
+	 * pattern is set, so the pull requests already open under it stay SWARM's own.
+	 */
 	branchPrefix: z.string().default(PROJECT_DEFAULTS.branchPrefix),
+
+	/**
+	 * How this repository names its task branches (issue #1241) — literal text plus the
+	 * elements `{issue_key}` (exactly once), `{work_type}` and `{friendly_name}`, e.g.
+	 * `{issue_key}/{friendly_name}` → `VT-1538/pierwsza-strona-testowa`. Validated by
+	 * `validateBranchPattern` (`src/pipeline/branch-pattern.ts`), the same check the
+	 * dashboard's editor applies. Unset means `<branchPrefix>{issue_key}`, so an entry
+	 * written before this key existed keeps its exact branch names
+	 * (`resolveBranchPattern`, `src/pipeline/task-branch.ts`).
+	 */
+	branchPattern: z
+		.string()
+		.superRefine((pattern, ctx) => {
+			for (const message of validateBranchPattern(pattern).errors) {
+				ctx.addIssue({ code: z.ZodIssueCode.custom, message });
+			}
+		})
+		.optional(),
 
 	/**
 	 * Merge automation for **this** repository: once a SWARM Review approves a pull

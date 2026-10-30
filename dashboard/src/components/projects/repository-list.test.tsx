@@ -11,6 +11,7 @@ function row(overrides: Partial<RepositoryForm> = {}): RepositoryForm {
 		repo: 'acme/first',
 		baseBranch: 'main',
 		branchPrefix: 'issue-',
+		branchPattern: '',
 		autoMerge: false,
 		reviewChecks: 'required',
 		reviewChecksWaitMinutes: '',
@@ -57,9 +58,10 @@ describe('RepositoryList', () => {
 			'acme/first',
 		);
 		expect((screen.getByLabelText('Base branch, entry 2') as HTMLInputElement).value).toBe('trunk');
-		expect((screen.getByLabelText('Branch prefix, entry 2') as HTMLInputElement).value).toBe(
-			'work-',
-		);
+		// Issue #1241: a legacy prefix reads as the pattern it stands for.
+		const pattern = screen.getByLabelText('Branch name pattern, entry 2') as HTMLInputElement;
+		expect(pattern.value).toBe('work-{issue_key}');
+		expect(pattern.readOnly).toBe(true);
 	});
 
 	// Issue #727: a project has one SCM provider, stated together with the credentials it
@@ -248,5 +250,68 @@ describe('RepositoryList', () => {
 		expect(
 			(screen.getByLabelText('Check wait in minutes, entry 1') as HTMLInputElement).disabled,
 		).toBe(true);
+	});
+
+	// Issue #1241: the pattern is composed in an editor, never typed into the row.
+	describe('branch name pattern editor', () => {
+		const patternInput = () => screen.getByLabelText('Pattern') as HTMLInputElement;
+		const apply = () => screen.getByRole('button', { name: 'Apply' }) as HTMLButtonElement;
+
+		it('describes every element and previews the pattern for a sample task', () => {
+			renderList({ repositories: TWO });
+			fireEvent.click(screen.getByLabelText('Edit branch name pattern, entry 1'));
+
+			for (const name of ['issue_key', 'work_type', 'friendly_name']) {
+				expect(screen.getByLabelText(`Insert {${name}}`)).toBeTruthy();
+			}
+			expect(patternInput().value).toBe('issue-{issue_key}');
+			expect(screen.getByTestId('branch-pattern-preview').textContent).toBe('issue-VT-1538');
+
+			fireEvent.change(patternInput(), { target: { value: '{issue_key}/{friendly_name}' } });
+			expect(screen.getByTestId('branch-pattern-preview').textContent).toBe(
+				'VT-1538/pierwsza-strona-testowa',
+			);
+		});
+
+		it('refuses a pattern without {issue_key} or with it twice', () => {
+			renderList({ repositories: TWO });
+			fireEvent.click(screen.getByLabelText('Edit branch name pattern, entry 1'));
+
+			fireEvent.change(patternInput(), { target: { value: 'feature/{friendly_name}' } });
+			expect(apply().disabled).toBe(true);
+			expect(screen.getByText(/must contain \{issue_key\}/)).toBeTruthy();
+
+			fireEvent.change(patternInput(), { target: { value: '{issue_key}-{issue_key}' } });
+			expect(apply().disabled).toBe(true);
+			expect(screen.getByText('{issue_key} must appear exactly once.')).toBeTruthy();
+		});
+
+		it('warns on a flat key but still applies it', () => {
+			const { onChange } = renderList({ repositories: TWO });
+			fireEvent.click(screen.getByLabelText('Edit branch name pattern, entry 1'));
+
+			fireEvent.change(patternInput(), { target: { value: '{issue_key}' } });
+			expect(screen.getByText(/bare issue key/)).toBeTruthy();
+			expect(apply().disabled).toBe(false);
+			fireEvent.click(apply());
+			expect(onChange).toHaveBeenCalledWith(0, { branchPattern: '{issue_key}' });
+		});
+
+		it('applies a pattern to its own row, and the prefix’s own pattern as none', () => {
+			const { onChange } = renderList({ repositories: TWO });
+
+			fireEvent.click(screen.getByLabelText('Edit branch name pattern, entry 2'));
+			fireEvent.change(patternInput(), {
+				target: { value: '{work_type}/{issue_key}-{friendly_name}' },
+			});
+			fireEvent.click(apply());
+			expect(onChange).toHaveBeenCalledWith(1, {
+				branchPattern: '{work_type}/{issue_key}-{friendly_name}',
+			});
+
+			fireEvent.click(screen.getByLabelText('Edit branch name pattern, entry 1'));
+			fireEvent.click(apply());
+			expect(onChange).toHaveBeenLastCalledWith(0, { branchPattern: '' });
+		});
 	});
 });
