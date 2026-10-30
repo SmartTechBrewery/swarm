@@ -3577,3 +3577,138 @@ describe('review trigger — a green head wakes the merge waiting on it (issue #
 		expect(promoteMergeChecksWaits).not.toHaveBeenCalled();
 	});
 });
+
+// Issue #1248: a retried Review (or Respond-to-CI) that the handler turned away
+// was recorded as "re-evaluated to no-trigger (e.g. disposition changed …)" while
+// the handler knew exactly why — a head branch the repository's naming no longer
+// recognised took reading the source to find. Each skip now names its cause.
+describe('names why a dispatch was skipped (issue #1248)', () => {
+	const checks = {
+		kind: 'checks',
+		action: 'completed',
+		workItemId: '42',
+		headSha: 'abc123',
+		prBranch: 'issue-42',
+	} as const;
+
+	async function skipReason(
+		overrides: Partial<Parameters<typeof createMockScmEvent>[0]> = {},
+		project?: ProjectConfig,
+	): Promise<string> {
+		const noteDecline = vi.fn();
+		expect(
+			await handler.handle(
+				ctx(
+					{ ...checks, ...overrides },
+					{ runId: 'run-7', noteDecline, ...(project ? { project } : {}) },
+				),
+			),
+		).toBeNull();
+		expect(noteDecline).toHaveBeenCalledOnce();
+		const decline = noteDecline.mock.calls[0][0] as TriggerDecline;
+		expect(decline.kind).toBe('skipped');
+		return decline.reason;
+	}
+
+	it('names a head branch that is not one of the repository task branches', async () => {
+		getPullRequest.mockResolvedValue({
+			number: 42,
+			headBranch: 'issue-VT-1538',
+			headSha: 'abc123',
+			baseBranch: 'main',
+			baseSha: 'base-sha-123',
+			mergeable: true,
+			authorLogin: 'operator-human',
+			state: 'open',
+		});
+		// The incident's shape: a legacy `branchPrefix` emptied under a branch it named.
+		const reason = await skipReason({}, createMockProjectConfig({ branchPrefix: '' }));
+
+		expect(reason).toContain('`issue-VT-1538`');
+		expect(reason).toContain('pull request #42');
+		expect(reason).toContain('not a SWARM task branch');
+		expect(reason).toContain('branch naming');
+	});
+
+	it('names the task a branch decodes to when SWARM never implemented it', async () => {
+		hasRunForTask.mockResolvedValue(false);
+
+		const reason = await skipReason();
+
+		expect(reason).toContain('names task 42');
+		expect(reason).toContain('no Implementation run');
+	});
+
+	it('says the pull request is closed', async () => {
+		getPullRequest.mockResolvedValue({
+			number: 42,
+			headBranch: 'issue-42',
+			headSha: 'abc123',
+			baseBranch: 'main',
+			baseSha: 'base-sha-123',
+			mergeable: null,
+			authorLogin: 'operator-human',
+			state: 'closed',
+		});
+
+		expect(await skipReason()).toContain('Pull request #42 is closed');
+	});
+
+	it('says another review of the pull request is still pending', async () => {
+		reserveReviewVerdict.mockResolvedValue({ status: 'blocked', ordinal: 1 });
+
+		expect(await skipReason()).toContain('Another review of pull request #42 is still pending');
+	});
+
+	it('says the Review phase is disabled', async () => {
+		const project = createMockProjectConfig({
+			pipeline: { review: { enabled: false }, respondToReview: { enabled: false } },
+		});
+
+		expect(await skipReason({}, project)).toContain('`pipeline.review.enabled`');
+	});
+
+	it('says the pull request is a draft', async () => {
+		expect(await skipReason({ kind: 'pull-request', action: 'opened', isDraft: true })).toContain(
+			'Pull request #42 is a draft',
+		);
+	});
+
+	it("says a Respond-to-CI retry met the pull request's spent fix budget", async () => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['ci', 'completed', 'failure']]));
+		claimRespondToCiAttempt.mockResolvedValue({ allowed: false, attempt: 5 });
+
+		expect(await skipReason()).toContain('every permitted Respond-to-CI attempt');
+	});
+
+	it('notes nothing on a dispatch', async () => {
+		const noteDecline = vi.fn();
+
+		expect(await handler.handle(ctx(checks, { runId: 'run-7', noteDecline }))).toMatchObject({
+			phase: 'review',
+		});
+		expect(noteDecline).not.toHaveBeenCalled();
+	});
+
+	// The note is the run's reason, not a log line: the skip a fresh delivery takes
+	// stays at the level it always had (the "no new noise" half of the issue).
+	it('adds no info or warn log to an ordinary skip', async () => {
+		getPullRequest.mockResolvedValue({
+			number: 42,
+			headBranch: 'contributor-patch',
+			headSha: 'abc123',
+			baseBranch: 'main',
+			baseSha: 'base-sha-123',
+			mergeable: true,
+			authorLogin: 'a-human',
+			state: 'open',
+		});
+		loggerInfo.mockClear();
+		loggerWarn.mockClear();
+
+		expect(await handler.handle(ctx(checks, { noteDecline: vi.fn() }))).toBeNull();
+
+		expect(loggerInfo).not.toHaveBeenCalled();
+		expect(loggerWarn).not.toHaveBeenCalled();
+	});
+});

@@ -40,6 +40,7 @@ vi.mock('@/triggers/resolve-conflicts-dedup.js', () => ({
 
 import { MERGE_CATCH_UP_ACTION } from '@/queue/jobs.js';
 import { createResolveConflictsTrigger } from '@/triggers/handlers/resolve-conflicts.js';
+import type { TriggerDecline } from '@/triggers/types.js';
 
 const project = createMockProjectConfig({ repo: 'acme/widgets' });
 
@@ -342,5 +343,59 @@ describe('resolve-conflicts trigger: merge automation catch-up', () => {
 		claimConflictResolution.mockResolvedValue(false);
 
 		expect(await createResolveConflictsTrigger().handle(catchUpEvent)).toBeNull();
+	});
+});
+
+// Issue #1248: a retried Resolve-conflicts run the handler turned away was recorded
+// as a changed disposition; each skip now names its cause for the settle to report.
+describe('resolve-conflicts names why it skipped (issue #1248)', () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		listConflictCandidates.mockResolvedValue([candidate]);
+		claimConflictResolution.mockResolvedValue(true);
+		scheduleCoalescedJob.mockResolvedValue(undefined);
+		hasRunForTask.mockResolvedValue(true);
+	});
+
+	async function skipReason(): Promise<string> {
+		const noteDecline = vi.fn();
+		const result = await createResolveConflictsTrigger().handle({
+			...mergedEvent,
+			event: { ...mergedEvent.event, conflictPrNumber: '42' },
+			runId: 'run-7',
+			noteDecline,
+		});
+		expect(result).toBeNull();
+		expect(noteDecline).toHaveBeenCalledOnce();
+		const decline = noteDecline.mock.calls[0][0] as TriggerDecline;
+		expect(decline.kind).toBe('skipped');
+		return decline.reason;
+	}
+
+	it('says the pull request no longer conflicts', async () => {
+		listConflictCandidates.mockResolvedValue([{ ...candidate, mergeable: true }]);
+
+		expect(await skipReason()).toContain('Pull request #42 does not conflict');
+	});
+
+	it('says the pull request is no longer open against the base', async () => {
+		listConflictCandidates.mockResolvedValue([]);
+
+		expect(await skipReason()).toContain('Pull request #42 is no longer open against `main`');
+	});
+
+	it('names a head branch that is not one of the repository task branches', async () => {
+		listConflictCandidates.mockResolvedValue([{ ...candidate, headBranch: 'contributor-patch' }]);
+
+		const reason = await skipReason();
+
+		expect(reason).toContain('`contributor-patch`');
+		expect(reason).toContain('not a SWARM task branch');
+	});
+
+	it('says the provider has not reported mergeability yet', async () => {
+		listConflictCandidates.mockResolvedValue([{ ...candidate, mergeable: null }]);
+
+		expect(await skipReason()).toContain('not yet reported whether pull request #42 is mergeable');
 	});
 });
