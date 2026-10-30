@@ -39,6 +39,7 @@ import { TRANSPORT_PROTOCOL_VERSION } from '@/transport/protocol.js';
 import {
 	createMockProjectConfig,
 	createMockProjectRecord,
+	createMockPullRequestContext,
 	createMockWorkItem,
 	toProjectRecord,
 } from '../../helpers/factories.js';
@@ -84,6 +85,7 @@ function makeDelivery(overrides: Partial<ScmDeliveryProvider> = {}): ScmDelivery
 		createPullRequest: vi.fn(),
 		pushBranch: vi.fn(),
 		submitReview: vi.fn().mockResolvedValue(77),
+		readPullRequestContext: vi.fn(async () => createMockPullRequestContext()),
 		postComment: vi.fn().mockResolvedValue(88),
 		...overrides,
 	};

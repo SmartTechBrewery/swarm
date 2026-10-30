@@ -11,6 +11,7 @@ import type { FetchLike } from '@/transport/delivery-client.js';
 import type { AssignmentSink } from '@/transport/worker-client.js';
 import {
 	createMockProjectConfig,
+	createMockPullRequestContext,
 	createMockTaskAssignmentInput,
 	createMockWorkItem,
 } from '../../helpers/factories.js';
@@ -45,6 +46,7 @@ function delivery(): ScmDeliveryProvider {
 		createPullRequest: vi.fn(async () => ({ number: 1, url: 'https://example.test/pr/1' })),
 		pushBranch: vi.fn(async () => {}),
 		submitReview: vi.fn(async () => 1),
+		readPullRequestContext: vi.fn(async () => createMockPullRequestContext()),
 		postComment: vi.fn(async () => 1),
 	};
 }

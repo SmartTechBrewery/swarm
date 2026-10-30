@@ -29,6 +29,7 @@ import {
 	findOpenPullRequest,
 	getGitHubUserForToken,
 	postIdempotentPullRequestComment,
+	readGitHubPullRequestContext,
 	withGitHubToken,
 } from './client.js';
 
@@ -78,5 +79,7 @@ export async function createOperatorDeliveryProvider(
 			);
 		},
 		postComment: (input) => scoped(() => postIdempotentPullRequestComment(owner, repoName, input)),
+		readPullRequestContext: (prNumber) =>
+			scoped(() => readGitHubPullRequestContext(owner, repoName, prNumber)),
 	};
 }

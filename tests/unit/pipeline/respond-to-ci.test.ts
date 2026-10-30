@@ -36,6 +36,7 @@ import { readDeliveryId } from '../../helpers/delivery-sidecar.js';
 import {
 	createMockProjectConfig,
 	createMockProjectRepositoryPair,
+	createMockPullRequestContext,
 } from '../../helpers/factories.js';
 
 const PR_BRANCH = 'issue-64';
@@ -197,6 +198,7 @@ function makeDeps(project = createMockProjectConfig()) {
 			createPullRequest: vi.fn(async () => ({ number: 99, url: 'https://x/pull/99' })),
 			pushBranch: vi.fn(async (_cwd: string, _branch: string, _expectedSha: string) => {}),
 			submitReview: vi.fn(async () => 0),
+			readPullRequestContext: vi.fn(async () => createMockPullRequestContext()),
 			postComment: vi.fn(
 				async (_input: { prNumber: number; body: string; deliveryId: string }) => 7,
 			),

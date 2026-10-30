@@ -10,6 +10,7 @@ import { readDeliveryId } from '../../helpers/delivery-sidecar.js';
 import {
 	createMockProjectConfig,
 	createMockProjectRepositoryPair,
+	createMockPullRequestContext,
 } from '../../helpers/factories.js';
 
 const roots: string[] = [];
@@ -103,6 +104,7 @@ function deliveryDeps(
 				createPullRequest: vi.fn(),
 				pushBranch: vi.fn(),
 				submitReview,
+				readPullRequestContext: vi.fn(async () => createMockPullRequestContext()),
 				postComment: vi.fn(),
 			} as unknown as ScmDeliveryProvider,
 			markReviewVerdictSubmitted: vi.fn(async () => ({ id: 'verdict-1', ordinal: 1 })),
@@ -404,6 +406,8 @@ describe('review body rendering', () => {
 		const result = await runReviewPhase({ ...options, resumeDelivery: true });
 
 		expect(submitReview.mock.calls[0][0].body).toBe('Looks good');
+		// A resumed delivery runs no agent, so it has no pull request to read (issue #1239).
+		expect(options.delivery?.readPullRequestContext).not.toHaveBeenCalled();
 		// A legacy hand-off has no `absorbed` to report, exactly as it has no
 		// findings — the resume finishes the submission, it does not re-judge (issue #953).
 		expect(result.absorbed).toBeUndefined();
@@ -500,6 +504,7 @@ describe('review production delivery', () => {
 			createPullRequest: vi.fn(),
 			pushBranch: vi.fn(),
 			submitReview,
+			readPullRequestContext: vi.fn(async () => createMockPullRequestContext()),
 			postComment: vi.fn(),
 		} as unknown as ScmDeliveryProvider;
 		const markReviewVerdictSubmitted = vi.fn(async () => ({ id: 'verdict-1', ordinal: 1 }));

@@ -61,7 +61,8 @@ const BUILDERS: Array<{ name: string; build: (customPrompt?: string) => string }
 	},
 	{
 		name: 'review',
-		build: (p) => buildReviewPrompt({ repo: 'o/r', prNumber: '7', headSha: 'abc123' }, p),
+		build: (p) =>
+			buildReviewPrompt({ repo: 'o/r', prNumber: '7', headSha: 'abc123', baseBranch: 'main' }, p),
 	},
 	{
 		name: 'respond-to-review',

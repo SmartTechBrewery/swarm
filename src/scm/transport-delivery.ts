@@ -25,6 +25,10 @@
  * board write has no local half at all — so its delegate was only ever the
  * DB-holding worker's in-process provider, and it retired with that worker.
  *
+ * `readPullRequestContext` is source-side work too: the agent's reading of the
+ * pull request runs on the worker under the operator credential and never
+ * crosses the transport.
+ *
  * A non-2xx or unparseable response **throws**, so the phase's existing
  * `DeliveryDeferredError` retry path (`../pipeline/review.ts`,
  * `../pipeline/respond-to-review.ts`) preserves the worktree and retries. The
@@ -110,5 +114,6 @@ export function createTransportScmDeliveryProvider(
 				},
 				(value) => PostCommentDeliveryResponseSchema.parse(value).commentId,
 			),
+		readPullRequestContext: (prNumber) => localDelegate.readPullRequestContext(prNumber),
 	};
 }

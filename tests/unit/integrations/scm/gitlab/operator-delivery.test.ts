@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { ScmReadUnsupportedError } from '@/scm/pull-request-context.js';
 
 const execFileCalls: Array<{ args: string[]; env: NodeJS.ProcessEnv }> = [];
 vi.mock('node:child_process', () => ({
@@ -56,6 +57,12 @@ describe('createGitLabOperatorDeliveryProvider', () => {
 		withGitLabToken.mockClear();
 		getScopedGitLabUser.mockClear();
 		getScopedGitLabUser.mockResolvedValue({ username: 'operator-login', email: 'op@example.com' });
+	});
+
+	it('declares the pull-request context read not yet supported (issue #1239)', async () => {
+		const delivery = await createGitLabOperatorDeliveryProvider(REPO, CREDENTIAL);
+		await expect(delivery.readPullRequestContext(1)).rejects.toThrow(ScmReadUnsupportedError);
+		await expect(delivery.readPullRequestContext(1)).rejects.toThrow('not yet supported on GitLab');
 	});
 
 	it('sets the commit identity from the operator token', async () => {

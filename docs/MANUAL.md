@@ -1286,6 +1286,17 @@ still reviews the head, and raising the setting removes the noise. A Review aban
 because the provider never answered says so too, and does not start by itself: use
 Retry now once the provider is reachable.
 
+**"Review could not read pull request #… from SCM provider '…'" is the real cause**
+(issue #1239). Review reads the pull request — its description, branches and every
+comment and review so far — through SWARM before the agent starts, and hands it to
+the agent as `swarm_pull_request.md` in the checkout; the agent reads the diff
+locally. When that read fails, the run fails with this message and the provider's
+own error after the colon, and no agent ever ran — so the cause is the provider's
+answer (a credential that cannot read the pull request, an unreachable API), not
+the agent. On Bitbucket Cloud and gitlab.com the read is not yet supported, so
+Review fails there with this message, ending `not yet supported on …`, until their
+readers land.
+
 **A renamed repository produces no failure at all.** Cards stop dispatching and
 nothing is marked failed: the router logs `pm-status: work item has no backing SCM
 artifact reference` and completes the job as a no-op, because the card's repository

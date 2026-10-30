@@ -12,6 +12,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { ScmDeliveryProvider } from '../../../scm/delivery.js';
+import { unsupportedPullRequestContextRead } from '../../../scm/pull-request-context.js';
 import { getScopedGitLabUser, withGitLabToken } from './client.js';
 import { findOpenGitLabMergeRequest } from './merge-requests.js';
 import { createGitLabMergeRequest, postIdempotentGitLabMergeRequestNote } from './writes.js';
@@ -77,5 +78,7 @@ export async function createGitLabOperatorDeliveryProvider(
 					deliveryId: input.deliveryId,
 				}),
 			),
+		// A declared gap with its own follow-up, not a stub (issue #1239).
+		readPullRequestContext: unsupportedPullRequestContextRead('GitLab'),
 	};
 }

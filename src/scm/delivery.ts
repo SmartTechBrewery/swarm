@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import { z } from 'zod';
 import type { AgentCli, AgentCliResult } from '../harness/agent-cli.js';
 import { logger } from '../lib/logger.js';
+import { PULL_REQUEST_CONTEXT_FILENAME, type PullRequestContext } from './pull-request-context.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -583,6 +584,15 @@ export interface ScmDeliveryProvider {
 		deliveryId: string;
 	}): Promise<number>;
 	postComment(input: { prNumber: number; body: string; deliveryId: string }): Promise<number>;
+	/**
+	 * Read a pull request's title, description, branches, URL and discussion
+	 * (issue #1239) — the one read this seam carries, so a phase can hand the agent
+	 * the pull request without the agent reaching for a provider-specific CLI. A
+	 * read, not a mutation: it runs under the provider's own credential and changes
+	 * nothing. Rejects with `ScmReadUnsupportedError` on a provider that has no
+	 * reader yet.
+	 */
+	readPullRequestContext(prNumber: number): Promise<PullRequestContext>;
 }
 
 export const HANDOFF_FILENAMES = {
@@ -604,7 +614,13 @@ export const HANDOFF_FILENAMES = {
 } as const;
 
 const PROGRESS_FILENAME = '.swarm_delivery.json';
-export const SCRATCH_PATHSPECS = [...Object.values(HANDOFF_FILENAMES), PROGRESS_FILENAME] as const;
+// The pull-request context is SWARM's input to an agent rather than a hand-off,
+// so it is scratch without being one of HANDOFF_FILENAMES.
+export const SCRATCH_PATHSPECS = [
+	...Object.values(HANDOFF_FILENAMES),
+	PULL_REQUEST_CONTEXT_FILENAME,
+	PROGRESS_FILENAME,
+] as const;
 
 export class DeliveryDeferredError extends Error {
 	constructor(message: string, options?: ErrorOptions) {

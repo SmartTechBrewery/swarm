@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -14,8 +14,13 @@ import {
 	ReviewHandoffSchema,
 	type ScmDeliveryProvider,
 } from '@/scm/delivery.js';
+import {
+	PULL_REQUEST_CONTEXT_FILENAME,
+	renderPullRequestContext,
+	ScmReadUnsupportedError,
+} from '@/scm/pull-request-context.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
-import { createMockProjectConfig } from '../../helpers/factories.js';
+import { createMockProjectConfig, createMockPullRequestContext } from '../../helpers/factories.js';
 
 const HEAD_SHA = 'abc1234def5678abc1234def5678abc1234def56';
 
@@ -132,6 +137,7 @@ function makeDeps() {
 					deliveryId: string;
 				}) => 77,
 			),
+			readPullRequestContext: vi.fn(async () => createMockPullRequestContext()),
 			postComment: vi.fn(async () => 1),
 		} satisfies ScmDeliveryProvider,
 		// Ledger writers default to a first-verdict reservation so existing tests
@@ -166,7 +172,7 @@ describe('runReviewPhase', () => {
 		expect(runArgs.cli).toBe('claude');
 		expect(runArgs.cwd).toBe(deps.path);
 		// The prompt names the repository the run recorded, not the project's own.
-		expect(runArgs.args?.[0]).toContain(`gh pr diff 99 --repo ${RUN_REPOSITORY}`);
+		expect(runArgs.args?.[0]).toContain(RUN_REPOSITORY);
 		expect(runArgs.env).toEqual({ GH_TOKEN: 'reviewer-token' });
 
 		// Env is grafted into the worktree before the agent runs.
@@ -184,6 +190,68 @@ describe('runReviewPhase', () => {
 
 		expect(result.verdict).toBe('request-changes');
 		expect(result.agent.exitCode).toBe(0);
+	});
+
+	describe('reading the pull request through SWARM (issue #1239)', () => {
+		it('reads the pull request before the agent runs and stages it in the worktree', async () => {
+			const deps = makeDeps();
+			await runReviewPhase(deps);
+
+			expect(deps.delivery.readPullRequestContext).toHaveBeenCalledWith(99);
+			expect(deps.delivery.readPullRequestContext.mock.invocationCallOrder[0]).toBeLessThan(
+				deps.runAgent.mock.invocationCallOrder[0],
+			);
+			const staged = join(deps.path, PULL_REQUEST_CONTEXT_FILENAME);
+			expect(existsSync(staged)).toBe(true);
+			expect(readFileSync(staged, 'utf8')).toBe(
+				renderPullRequestContext(createMockPullRequestContext()),
+			);
+
+			const prompt = deps.runAgent.mock.calls[0][0].args?.[0] ?? '';
+			expect(prompt).toContain(PULL_REQUEST_CONTEXT_FILENAME);
+			expect(prompt).toContain('git diff origin/main...HEAD');
+			expect(prompt).not.toMatch(/gh (pr view|pr diff|issue view|api)\b/);
+		});
+
+		it('diffs against the base branch the pull request reports', async () => {
+			const deps = makeDeps();
+			deps.delivery.readPullRequestContext.mockResolvedValueOnce(
+				createMockPullRequestContext({ baseBranch: 'release/2.0' }),
+			);
+			await runReviewPhase(deps);
+			expect(deps.runAgent.mock.calls[0][0].args?.[0]).toContain(
+				'git diff origin/release/2.0...HEAD',
+			);
+		});
+
+		it('fails the run with the read failure as its reason, before the agent starts', async () => {
+			const deps = makeDeps();
+			deps.delivery.readPullRequestContext.mockRejectedValueOnce(new Error('boom'));
+
+			await expect(
+				runReviewPhase({ ...deps, project: { ...deps.project, scm: 'azure-devops' } }),
+			).rejects.toThrow(
+				`Review could not read pull request #99 in ${RUN_REPOSITORY} from SCM provider 'azure-devops': boom`,
+			);
+			expect(deps.runAgent).not.toHaveBeenCalled();
+			expect(deps.delivery.submitReview).not.toHaveBeenCalled();
+			expect(deps.abandonReviewVerdict).toHaveBeenCalledTimes(1);
+			expect(deps.worktrees.cleanup).toHaveBeenCalledWith('review-20');
+		});
+
+		it('names a provider that does not yet support the read', async () => {
+			const deps = makeDeps();
+			deps.delivery.readPullRequestContext.mockRejectedValueOnce(
+				new ScmReadUnsupportedError(
+					"reading a pull request's context is not yet supported on Bitbucket Cloud",
+				),
+			);
+
+			await expect(
+				runReviewPhase({ ...deps, project: { ...deps.project, scm: 'bitbucket' } }),
+			).rejects.toThrow(/from SCM provider 'bitbucket': .*not yet supported on Bitbucket Cloud/);
+			expect(deps.runAgent).not.toHaveBeenCalled();
+		});
 	});
 
 	it('forwards timeoutMs, signal, and maxOutputBytes to the agent runner', async () => {
@@ -519,12 +587,21 @@ describe('runReviewPhase', () => {
 });
 
 describe('buildReviewPrompt', () => {
-	const context = { repo: 'SmartTechBrewery/swarm', prNumber: '99', headSha: HEAD_SHA };
+	const context = {
+		repo: 'SmartTechBrewery/swarm',
+		prNumber: '99',
+		headSha: HEAD_SHA,
+		baseBranch: 'main',
+	};
 
 	it('instructs reading the PR, the full diff, and recording the verdict in the hand-off', () => {
 		const prompt = buildReviewPrompt(context);
-		expect(prompt).toContain('gh pr view 99 --repo SmartTechBrewery/swarm --comments');
-		expect(prompt).toContain('gh pr diff 99 --repo SmartTechBrewery/swarm');
+		// Read through SWARM's staged file and a local diff, never a provider CLI (issue #1239).
+		expect(prompt).toContain(PULL_REQUEST_CONTEXT_FILENAME);
+		expect(prompt).toContain('git diff origin/main...HEAD');
+		expect(prompt).toContain('Review ALL changed files');
+		expect(prompt).not.toMatch(/gh (pr view|pr diff|issue view|api)\b/);
+		expect(prompt).not.toContain('on GitHub');
 		expect(prompt).toContain('gh pr review 99 --repo SmartTechBrewery/swarm');
 		expect(prompt).toContain('--approve');
 		expect(prompt).toContain('--request-changes');
@@ -646,7 +723,9 @@ describe('buildReviewPrompt', () => {
 			const prompt = buildReviewPrompt(context, undefined, true);
 			expect(prompt).toContain('REVIEW ONLY');
 			expect(prompt).toContain(HEAD_SHA);
-			expect(prompt).toContain(`gh pr view 99 --repo SmartTechBrewery/swarm --comments`);
+			expect(prompt).toContain(PULL_REQUEST_CONTEXT_FILENAME);
+			expect(prompt).toContain('git diff origin/main...HEAD');
+			expect(prompt).not.toMatch(/gh (pr view|pr diff|issue view|api)\b/);
 			expect(prompt).toContain(`gh pr review 99 --repo SmartTechBrewery/swarm`);
 			expect(prompt).toContain(REVIEW_VERDICT_FILENAME);
 			expect(prompt).toContain('Do not merge the PR');
