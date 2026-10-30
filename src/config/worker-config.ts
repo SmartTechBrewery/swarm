@@ -38,6 +38,7 @@ export const WORKER_SAFE_KEYS = [
 	'worktreeRoot',
 	'baseBranch',
 	'branchPrefix',
+	'branchPattern',
 	'agents',
 	'worktreeRetention',
 ] as const;

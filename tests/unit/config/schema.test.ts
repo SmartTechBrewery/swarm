@@ -493,6 +493,51 @@ describe('ProjectRecordSchema', () => {
 		});
 	});
 
+	// Issue #1241: a repository names its branches by a validated pattern; unset keeps
+	// the legacy prefix, which no migration touches.
+	describe('branch name pattern (issue #1241)', () => {
+		it('is optional, kept absent when unstated, and leaves the prefix in place', () => {
+			const record = ProjectRecordSchema.parse({
+				...shared,
+				repositories: [
+					{ repo: 'acme/one' },
+					{ repo: 'acme/two', branchPattern: '{issue_key}/{friendly_name}' },
+				],
+			});
+			expect(record.repositories.map((entry) => entry.branchPattern)).toEqual([
+				undefined,
+				'{issue_key}/{friendly_name}',
+			]);
+			expect(record.repositories.map((entry) => entry.branchPrefix)).toEqual([
+				PROJECT_DEFAULTS.branchPrefix,
+				PROJECT_DEFAULTS.branchPrefix,
+			]);
+		});
+
+		it.each([
+			'feature/{friendly_name}',
+			'{issue_key}/{issue_key}',
+			'{issue_key}/{slug}',
+			'/{issue_key}',
+		])('rejects the pattern %s', (branchPattern) => {
+			const result = ProjectRecordSchema.safeParse({
+				...shared,
+				repositories: [{ repo: 'acme/one', branchPattern }],
+			});
+			expect(result.success).toBe(false);
+			expect(result.error?.issues[0]?.path).toEqual(['repositories', 0, 'branchPattern']);
+		});
+
+		it('accepts a flat-key pattern, which the editor only warns about', () => {
+			expect(
+				ProjectRecordSchema.safeParse({
+					...shared,
+					repositories: [{ repo: 'acme/one', branchPattern: '{issue_key}' }],
+				}).success,
+			).toBe(true);
+		});
+	});
+
 	// The record carries the same cross-field credential checks the scoped config does —
 	// neither reads a repository, so both refine through the same two functions.
 	it('applies the same credential cross-field checks the scoped config does', () => {

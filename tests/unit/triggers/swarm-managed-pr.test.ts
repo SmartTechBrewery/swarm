@@ -35,6 +35,21 @@ describe('isSwarmManagedPullRequest (issue #397)', () => {
 		expect(hasRunForTask).toHaveBeenCalledWith(project.id, '108', 'implementation');
 	});
 
+	// Issue #1241: a branch named by the repository's pattern is SWARM's own, and a
+	// branch opened under the legacy prefix before the pattern was set still is.
+	it('recognises a pattern-named branch, and the legacy prefix shape beside it', async () => {
+		const project = createMockProjectConfig({ branchPattern: '{issue_key}/{friendly_name}' });
+		await expect(
+			isSwarmManagedPullRequest(project, 'VT-1538/pierwsza-strona-testowa', { hasRunForTask }),
+		).resolves.toEqual({ managed: true, taskId: 'VT-1538' });
+		await expect(
+			isSwarmManagedPullRequest(project, 'issue-VT-1538', { hasRunForTask }),
+		).resolves.toEqual({ managed: true, taskId: 'VT-1538' });
+		await expect(
+			isSwarmManagedPullRequest(project, 'VT-1538/Some-Human-Branch', { hasRunForTask }),
+		).resolves.toEqual({ managed: false, reason: 'not-a-task-branch' });
+	});
+
 	it('rejects a SWARM-style branch with no Implementation run as no-run', async () => {
 		hasRunForTask.mockResolvedValue(false);
 		await expect(

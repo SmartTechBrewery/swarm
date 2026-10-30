@@ -224,8 +224,8 @@ async function scmCommentUnknownMergeability(
  * no-trigger job. Silently disappearing here is the failure this trigger was
  * fixed for (issue #836) and must not come back as a DB blip.
  *
- * Cost: one `runs` lookup per open candidate whose head branch decodes under the
- * project's `branchPrefix` — a branch outside it is answered with no query at all
+ * Cost: one `runs` lookup per open candidate whose head branch decodes as one of the
+ * repository's task branches — any other branch is answered with no query at all
  * (`isSwarmManagedPullRequest`). Bounded by the open-PR count on the base branch,
  * and paid once per merge into it.
  */

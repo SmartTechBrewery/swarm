@@ -59,6 +59,13 @@ export const ImplementationHandoffSchema = CommitSchema.extend({
 	summary: z.string().min(1),
 	limitations: z.array(z.string()).default([]),
 	readyForDelivery: z.literal(true),
+	/**
+	 * The implementer's `{work_type}` and `{friendly_name}` for a branch name pattern
+	 * that has them (issue #1241). Free strings on purpose, normalised by the phase
+	 * with fallbacks: a malformed branch-name hint must never cost a whole delivery.
+	 */
+	workType: z.string().optional(),
+	friendlyName: z.string().optional(),
 });
 
 /**
@@ -513,6 +520,12 @@ export type ConflictHandoff = z.infer<typeof ConflictHandoffSchema>;
 
 export const DeliveryProgressSchema = z.object({
 	deliveryId: z.string(),
+	/**
+	 * The branch this delivery pushes to, once decided (issue #1241). Recorded before
+	 * the commit so a resumed delivery pushes to the name its first attempt chose
+	 * rather than rendering another.
+	 */
+	branch: z.string().optional(),
 	commitSha: z.string().optional(),
 	pushed: z.boolean().default(false),
 	pullRequestNumber: z.number().int().positive().optional(),
@@ -1198,6 +1211,28 @@ export async function mergeBaseIntoCheckout(
 		if (!unresolved) throw error;
 		await git(cwd, ['merge', '--abort']);
 		return { status: 'conflict', baseSha, paths: unresolved.split('\n') };
+	}
+}
+
+/**
+ * Rename the branch a worktree has checked out to `branch` (issue #1241) — the step
+ * that turns Implementation's provisional checkout into its decided task branch. A
+ * checkout already on `branch` is left alone. Best-effort: every push is
+ * `<sha>:refs/heads/<branch>`, so the delivery does not depend on the local ref's
+ * name; renaming only keeps a provisional `VT-1538` from blocking a later local
+ * checkout of `VT-1538/…`.
+ */
+export async function renameCheckedOutBranch(cwd: string, branch: string): Promise<void> {
+	try {
+		const current = await git(cwd, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
+		if (current === branch) return;
+		await git(cwd, ['branch', '-m', branch]);
+	} catch (error) {
+		logger.warn('Could not rename the checked-out branch — pushing by commit regardless', {
+			cwd,
+			branch,
+			error: error instanceof Error ? error.message : String(error),
+		});
 	}
 }
 

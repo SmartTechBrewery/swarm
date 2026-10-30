@@ -25,7 +25,7 @@ const WORK_ITEM: WorkItem = {
 };
 
 describe('resolveTargetBranch', () => {
-	it('pins the board phases and review to the task branch <branchPrefix><taskId>', () => {
+	it('pins the board phases to the task branch <branchPrefix><taskId>, and review to the PR head', () => {
 		const planning: TriggerResult = { phase: 'planning', taskId: '407', workItem: WORK_ITEM };
 		const implementation: TriggerResult = {
 			phase: 'implementation',
@@ -36,12 +36,31 @@ describe('resolveTargetBranch', () => {
 			phase: 'review',
 			taskId: '407',
 			prNumber: '88',
-			prBranch: 'swarm/407',
+			prBranch: 'swarm/407-renamed',
 			headSha: 'abc',
 		};
 		expect(resolveTargetBranch(PROJECT, planning)).toBe('swarm/407');
 		expect(resolveTargetBranch(PROJECT, implementation)).toBe('swarm/407');
-		expect(resolveTargetBranch(PROJECT, review)).toBe('swarm/407');
+		expect(resolveTargetBranch(PROJECT, review)).toBe('swarm/407-renamed');
+	});
+
+	// Issue #1241: a decided name is carried as-is; an undecided pattern name starts on
+	// its provisional legacy shape.
+	it('carries a stored task branch, or the provisional name a pattern starts on', () => {
+		const implementation: TriggerResult = {
+			phase: 'implementation',
+			taskId: 'VT-1538',
+			workItem: WORK_ITEM,
+		};
+		const patterned = { ...PROJECT, branchPattern: '{issue_key}/{friendly_name}' };
+		expect(resolveTargetBranch(patterned, implementation)).toBe('swarm/VT-1538');
+		expect(resolveTargetBranch(patterned, implementation, 'VT-1538/pierwsza-strona-testowa')).toBe(
+			'VT-1538/pierwsza-strona-testowa',
+		);
+		expect(composeSystemPrompt(patterned, implementation)).toContain('friendlyName (');
+		expect(composeSystemPrompt(patterned, implementation, undefined, 'VT-1538/x')).not.toContain(
+			'friendlyName (',
+		);
 	});
 
 	it('carries the PR head branch for the SCM continuation phases', () => {

@@ -21,6 +21,7 @@ import { promisify } from 'node:util';
 import type { ProjectConfig } from '../config/schema.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
+import { provisionalTaskBranch } from '../pipeline/task-branch.js';
 import { HANDOFF_FILENAMES, SCRATCH_PATHSPECS } from '../scm/delivery.js';
 import { normalizeRepoSlug, resolveOriginRepoSlug } from '../scm/repo-slug.js';
 import { CommitUnavailableError } from '../worktree/commit-availability.js';
@@ -109,10 +110,11 @@ export interface WorktreeHandle {
 /** Options for {@link GitWorktreeManager.provision}. */
 export interface ProvisionOptions {
 	/**
-	 * Branch to check out in the worktree. Defaults to `<branchPrefix><taskId>`
-	 * (SWARM's `issue-<n>` convention, from the project config) when creating a
-	 * branch; **required** when `createBranch` is false (there's no sensible
-	 * default for an existing checkout target).
+	 * Branch to check out in the worktree. Defaults to the task's provisional
+	 * branch (`provisionalTaskBranch` — the repository's branch name pattern, or
+	 * `issue-<n>` on the legacy prefix) when creating a branch; **required** when
+	 * `createBranch` is false (there's no sensible default for an existing checkout
+	 * target).
 	 */
 	branch?: string;
 	/**
@@ -541,7 +543,7 @@ export class GitWorktreeManager {
 		// Detached HEAD has no branch; the handle reports the base ref it points at.
 		const branch = explicitlyDetached
 			? baseBranch
-			: (options.branch ?? `${this.project.branchPrefix}${taskId}`);
+			: (options.branch ?? provisionalTaskBranch(this.project, taskId));
 
 		// Whether a local branch of this name survives into the checkout below. On the
 		// create path the reap already asked git, so its answer is reused rather than

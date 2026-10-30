@@ -26,22 +26,27 @@ import { buildResolveConflictsPrompt } from '../pipeline/prompts/resolve-conflic
 import { buildRespondToCiPrompt } from '../pipeline/prompts/respond-to-ci.js';
 import { buildRespondToReviewPrompt } from '../pipeline/prompts/respond-to-review.js';
 import { buildReviewPrompt } from '../pipeline/prompts/review.js';
-import { taskBranch } from '../pipeline/task-branch.js';
+import { provisionalTaskBranch, resolveBranchPattern } from '../pipeline/task-branch.js';
 import type { TriggerResult } from '../triggers/types.js';
 
 /**
  * Resolve the target branch the assignment carries, from config + trigger alone
- * (no checkout). The board phases and Review pin to the task branch
- * (`<branchPrefix><taskId>` — the branch Implementation opens the PR from and
- * Review's detached checkout sits on); the SCM continuation phases carry the PR
- * head branch the trigger already resolved.
+ * (no checkout). The board phases pin to the task branch — the one a previous run
+ * already decided (`taskBranch`, issue #1241) when there is one, otherwise the name
+ * Implementation checks the task out on before it decides one
+ * (`provisionalTaskBranch`); Review and the SCM continuation phases carry the PR head
+ * branch the trigger already resolved.
  */
-export function resolveTargetBranch(project: ProjectConfig, trigger: TriggerResult): string {
+export function resolveTargetBranch(
+	project: ProjectConfig,
+	trigger: TriggerResult,
+	taskBranch?: string,
+): string {
 	switch (trigger.phase) {
 		case 'planning':
 		case 'implementation':
+			return taskBranch ?? provisionalTaskBranch(project, trigger.taskId);
 		case 'review':
-			return taskBranch(project.branchPrefix, trigger.taskId);
 		case 'respond-to-review':
 		case 'respond-to-ci':
 		case 'resolve-conflicts':
@@ -67,6 +72,7 @@ export function composeSystemPrompt(
 	project: ProjectConfig,
 	trigger: TriggerResult,
 	customPrompt?: string,
+	taskBranch?: string,
 ): string {
 	switch (trigger.phase) {
 		case 'planning':
@@ -82,8 +88,9 @@ export function composeSystemPrompt(
 				{
 					repo: project.repo,
 					taskId: trigger.taskId,
-					branch: taskBranch(project.branchPrefix, trigger.taskId),
+					branch: resolveTargetBranch(project, trigger, taskBranch),
 					baseBranch: project.baseBranch,
+					...(taskBranch ? {} : { branchPattern: resolveBranchPattern(project) }),
 				},
 				customPrompt,
 			);

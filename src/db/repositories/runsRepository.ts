@@ -1356,6 +1356,42 @@ export async function findBoardItemIdForTask(
 }
 
 /**
+ * The task branch Implementation last decided for this project task (issue #1241) —
+ * the `taskBranch` its newest run carrying one stored on its job payload.
+ *
+ * The branch name is decided once per task and kept: a later attempt or a fresh
+ * dispatch of the same card reuses it instead of rendering the repository's pattern
+ * again, which could choose a different `{friendly_name}` than the one a pull request
+ * is already open from. Repository-scoped like the run itself, since a same-numbered
+ * task in another repository of the project is different work (issue #1108).
+ *
+ * `undefined` when no run stored one — the task never reached a decided branch, or
+ * every run predates issue #1241 — and the phase then decides as a first attempt does.
+ */
+export async function findStoredTaskBranch(
+	projectId: string,
+	repository: string,
+	taskId: string,
+): Promise<string | undefined> {
+	const taskBranch = sql<string>`${runs.jobPayload} ->> 'taskBranch'`;
+	const rows = await getDb()
+		.select({ taskBranch })
+		.from(runs)
+		.where(
+			and(
+				eq(runs.projectId, projectId),
+				eq(runs.repository, repository),
+				eq(runs.taskId, taskId),
+				eq(runs.phase, 'implementation'),
+				sql`${runs.jobPayload} ->> 'taskBranch' IS NOT NULL`,
+			),
+		)
+		.orderBy(desc(runs.startedAt))
+		.limit(1);
+	return rows[0]?.taskBranch ?? undefined;
+}
+
+/**
  * Resolve the newest successful Planning scope for this exact
  * project/repository/task. Failed, deferred, unrelated, and pre-scope historical
  * runs are intentionally ignored: absence is evidence we do not have, never
