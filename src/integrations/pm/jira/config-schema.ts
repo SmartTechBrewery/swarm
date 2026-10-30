@@ -29,6 +29,16 @@ import { z } from 'zod';
 
 import type { ProjectConfig, ProjectPm } from '../../../config/schema.js';
 
+/** The `repositoryField` value naming Jira components — the routing axis when none is set. */
+export const JIRA_COMPONENTS_REPOSITORY_FIELD = 'components';
+
+/**
+ * What `repositoryField` accepts: components, or a custom field id. Mirrored by the
+ * dashboard's board-mapping form (`dashboard/src/lib/board-mapping.ts`), whose tests
+ * parse what it builds through this schema.
+ */
+const JIRA_REPOSITORY_FIELD_PATTERN = /^(?:components|customfield_\d+)$/;
+
 export const jiraConfigSchema = z
 	.object({
 		/**
@@ -65,6 +75,25 @@ export const jiraConfigSchema = z
 			.refine((record) => Object.keys(record).length > 0, {
 				message: 'statusOptions must map at least one pipeline status to a Jira status ID',
 			}),
+
+		/**
+		 * Where a card says which of the project's repositories it belongs to (issue
+		 * #1237) — consulted only when the project owns more than one. Absent or
+		 * `components` routes on the issue's component ids against each repository's
+		 * `pmRoutingToken`, as every Jira project did before. A custom field **id**
+		 * (`customfield_10515`) routes on that text field's value instead, matched
+		 * exactly against each repository's own `repo`, so no repository declares a
+		 * token — the way in for a team-managed project, which may have no components
+		 * at all. An id rather than the field's name, as `statusOptions` holds ids: a
+		 * name is rename-prone and need not be unique.
+		 */
+		repositoryField: z
+			.string()
+			.regex(
+				JIRA_REPOSITORY_FIELD_PATTERN,
+				`Must be '${JIRA_COMPONENTS_REPOSITORY_FIELD}' or a Jira custom field id such as 'customfield_10515'`,
+			)
+			.optional(),
 	})
 	.strict()
 	.describe('Jira board integration config');

@@ -85,7 +85,8 @@ import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import type { PmEvent } from '../pm/events.js';
 import { resolveCardRepository } from '../pm/repository-routing.js';
-import type { ItemRepositoryRoute, PMType } from '../pm/types.js';
+import type { ItemRepositoryRoute, PMProvider, PMType } from '../pm/types.js';
+import { surfaceUnroutedCard } from '../pm/unrouted-card-notice.js';
 import type { ScmEvent } from '../scm/events.js';
 import type { CommitPullRequest, ScmType, ScmWebhookRequest } from '../scm/types.js';
 import { enqueuePmEvent, enqueueScmEvent } from './enqueue.js';
@@ -506,7 +507,10 @@ async function handlePmEvent(
  *
  * Both refusals ack `202` so the provider stops redelivering a card whose routing
  * only an operator can fix, and say so explicitly in the response and a `logger.warn`
- * naming the project, the card, and the repositories it could have gone to.
+ * naming the project, the card, and the repositories it could have gone to. An
+ * `unrouted` answer carrying the card's own claim — a repository field a person
+ * fills in, read as text (issue #1237) — is also put on the card itself
+ * (`surfaceUnroutedCard`, `../pm/unrouted-card-notice.ts`), best-effort.
  *
  * The provider is built from the manifest's own factory (no registry branch, no
  * `pm.type` here), and the default-scoped `ProjectConfig` it is handed is the right
@@ -535,13 +539,17 @@ async function routeBoardCard(
 		return c.json({ ok: true, ignored: true, reason: 'project no longer exists' }, 202);
 	}
 
+	// Built at most once, and only if needed: the routing read and the notice below
+	// share it, while a one-repository project builds none.
+	let provider: PMProvider | undefined;
+	const boardProvider = (): PMProvider => {
+		provider ??= manifest.createProvider(project);
+		return provider;
+	};
+
 	let route: ItemRepositoryRoute;
 	try {
-		route = await resolveCardRepository(
-			record,
-			() => manifest.createProvider(project),
-			event.itemId,
-		);
+		route = await resolveCardRepository(record, boardProvider, event.itemId);
 	} catch (error) {
 		logger.error('Could not resolve which repository a board card belongs to', {
 			...logContext,
@@ -552,17 +560,32 @@ async function routeBoardCard(
 
 	if (route.status === 'routed') return { repo: route.repo };
 
+	const repositories = record.repositories.map((entry) => entry.repo);
+	const claim = route.status === 'unrouted' ? route.claim : undefined;
 	logger.warn('Board card is not routed to exactly one repository — not dispatching', {
 		...logContext,
 		status: route.status,
-		repositories: record.repositories.map((entry) => entry.repo),
+		repositories,
 		...(route.status === 'ambiguous' ? { claimedRepositories: route.repos } : {}),
+		...(claim ? { claim } : {}),
 	});
-	const reason =
-		route.status === 'ambiguous'
-			? `board card claimed by more than one repository: ${route.repos.join(', ')}`
-			: "board card claims none of the project's repositories";
-	return c.json({ ok: true, ignored: true, reason }, 202);
+	// A card that named its repository in a field a person fills in is told why it
+	// was refused (issue #1237); an id-routed refusal carries no claim and stays log-only.
+	if (claim) {
+		await surfaceUnroutedCard(boardProvider(), project, event.itemId, claim, repositories);
+	}
+	return c.json({ ok: true, ignored: true, reason: unroutedReason(route) }, 202);
+}
+
+/** The acknowledged reason a board card was not routed, as the delivery's response states it. */
+function unroutedReason(route: Exclude<ItemRepositoryRoute, { status: 'routed' }>): string {
+	if (route.status === 'ambiguous') {
+		return `board card claimed by more than one repository: ${route.repos.join(', ')}`;
+	}
+	if (!route.claim) return "board card claims none of the project's repositories";
+	return route.claim.value
+		? `board card's ${route.claim.source} '${route.claim.value}' names none of the project's repositories`
+		: `board card's ${route.claim.source} is empty`;
 }
 
 /** Group PM manifests by the route they declare, so one path mounts one handler. */

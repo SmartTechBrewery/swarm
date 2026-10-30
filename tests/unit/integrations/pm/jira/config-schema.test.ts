@@ -41,6 +41,29 @@ describe('jiraConfigSchema', () => {
 		).toBe('https://swarm.jira-dev.com');
 	});
 
+	// Issue #1237: where a card's repository is read from — components by default.
+	it.each([
+		'components',
+		'customfield_10515',
+	])('accepts %s as the repository field', (repositoryField) => {
+		expect(createMockJiraConfig({ repositoryField }).repositoryField).toBe(repositoryField);
+	});
+
+	it('leaves the repository field unset by default, so existing mappings route by components', () => {
+		expect(createMockJiraConfig().repositoryField).toBeUndefined();
+	});
+
+	it.each([
+		'',
+		'Repozytorium',
+		'customfield_',
+		'customfield_10515 ',
+		'labels',
+	])('rejects %j as the repository field — a custom field id, never a name', (repositoryField) => {
+		// The factory parses through `jiraConfigSchema`.
+		expect(() => createMockJiraConfig({ repositoryField })).toThrow(/customfield_10515/);
+	});
+
 	it('rejects GitHub Projects-only keys instead of silently retaining a mixed mapping', () => {
 		expect(() =>
 			jiraConfigSchema.parse({

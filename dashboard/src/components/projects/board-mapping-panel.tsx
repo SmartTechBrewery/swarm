@@ -8,6 +8,7 @@ import {
 	getPmMappingProvider,
 	isBaseUrlInvalid,
 	isBaseUrlMissing,
+	isRepositoryFieldInvalid,
 	STATUS_KEY_LABELS,
 	STATUS_KEYS,
 	selectedPmProviderId,
@@ -67,6 +68,12 @@ const SELECT_CLASS =
 
 const LABEL_CLASS = 'block text-xs font-medium text-zinc-400 mb-1';
 
+const INPUT_CLASS =
+	'block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 disabled:opacity-50 disabled:bg-zinc-950 disabled:border-zinc-800 disabled:text-zinc-500';
+
+/** `providerContext` key of the repository-field input (issue #1237). */
+const REPOSITORY_FIELD_KEY = 'repositoryField';
+
 const NEUTRAL_UNAVAILABLE = 'Configured value (unavailable)';
 
 interface StateOption {
@@ -92,6 +99,63 @@ function stateOptionsFor(
 		options.push({ value: s.id, label: s.name });
 	}
 	return options;
+}
+
+/**
+ * The discovery draft to send: the provider's declared draft fields only. The draft
+ * schema is strict, and the rest of `providerContext` (Jira's repository field) is
+ * mapping rather than discovery input — sending it would fail the draft and re-run
+ * discovery on every keystroke.
+ */
+function discoveryDraftOf(
+	fields: ReadonlyArray<{ key: string }>,
+	providerContext: Record<string, string>,
+): Record<string, string> {
+	return Object.fromEntries(fields.map((field) => [field.key, providerContext[field.key] ?? '']));
+}
+
+/**
+ * Where a card names its repository (issue #1237) — free text, since a provider's
+ * fields are not discovered; `canSaveBoardMapping` checks its shape. Renders nothing
+ * for a provider whose catalogue entry declares no such field.
+ */
+function RepositoryFieldInput({
+	copy,
+	value,
+	invalid,
+	disabled,
+	onChange,
+}: {
+	copy: { label: string; description: string } | undefined;
+	value: string | undefined;
+	invalid: boolean;
+	disabled: boolean;
+	onChange: (value: string) => void;
+}) {
+	if (!copy) return null;
+	return (
+		<div>
+			<label htmlFor="pm-repository-field" className={LABEL_CLASS}>
+				{copy.label}
+			</label>
+			<input
+				id="pm-repository-field"
+				type="text"
+				placeholder="components"
+				value={value ?? ''}
+				onChange={(event) => onChange(event.target.value)}
+				disabled={disabled}
+				aria-invalid={invalid}
+				className={INPUT_CLASS}
+			/>
+			<p className="text-xs text-zinc-400 mt-1">{copy.description}</p>
+			{invalid && (
+				<p className="text-xs text-red-400 mt-1">
+					Enter a custom field id such as customfield_10515, or leave it blank for components.
+				</p>
+			)}
+		</div>
+	);
 }
 
 export function BoardMappingPanel({
@@ -133,7 +197,9 @@ export function BoardMappingPanel({
 	const discoveryInput = {
 		projectId,
 		providerId,
-		...(discoveryDraftFields.length ? { discoveryDraft: form.providerContext } : {}),
+		...(discoveryDraftFields.length
+			? { discoveryDraft: discoveryDraftOf(discoveryDraftFields, form.providerContext) }
+			: {}),
 	};
 
 	// The credential roles this provider declares, so the board picker states the step
@@ -212,6 +278,7 @@ export function BoardMappingPanel({
 	}
 	const canSave = canSaveBoardMapping(form);
 	const baseUrlMissing = isBaseUrlMissing(form);
+	const repositoryFieldInvalid = isRepositoryFieldInvalid(form);
 
 	return (
 		<div className="border border-zinc-800 rounded-lg bg-panel/40 p-6 shadow-sm">
@@ -235,7 +302,7 @@ export function BoardMappingPanel({
 							value={form.providerContext[field.key] ?? ''}
 							onChange={(event) => onProviderContextChange(field.key, event.target.value)}
 							disabled={isPending}
-							className="block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 disabled:opacity-50 disabled:bg-zinc-950 disabled:border-zinc-800 disabled:text-zinc-500"
+							className={INPUT_CLASS}
 						/>
 						{field.description && <p className="text-xs text-zinc-400 mt-1">{field.description}</p>}
 					</div>
@@ -349,6 +416,14 @@ export function BoardMappingPanel({
 						})}
 					</div>
 				</div>
+
+				<RepositoryFieldInput
+					copy={provider.repositoryField}
+					value={form.providerContext[REPOSITORY_FIELD_KEY]}
+					invalid={repositoryFieldInvalid}
+					disabled={isPending}
+					onChange={(value) => onProviderContextChange(REPOSITORY_FIELD_KEY, value)}
+				/>
 
 				{isSuccess && (
 					<div className="p-3 bg-emerald-950/20 border border-emerald-900/30 text-sm text-emerald-400 rounded">

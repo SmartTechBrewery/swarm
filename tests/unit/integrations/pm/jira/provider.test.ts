@@ -438,6 +438,109 @@ describe('JiraPMProvider', () => {
 			expect(reads).toHaveLength(1);
 			expect(reads[0]?.url.searchParams.get('fields')).toBe('components');
 		});
+
+		// Issue #1237: a board mapping naming a custom text field routes on its value —
+		// the repository's own path — instead of components, so no token is needed.
+		describe('by a repository text field', () => {
+			const FIELD = 'customfield_10515';
+			const REPOSITORIES = [
+				{ repo: 'core3pl/KV-TMS/ai-sdlc' },
+				{ repo: 'core3pl/KV-TMS/VikingKurier' },
+			];
+			const textFieldProvider = new JiraPMProvider(
+				createMockJiraProjectConfig({
+					pm: { type: 'jira', ...CONFIG, repositoryField: FIELD },
+				}),
+			);
+
+			/** The issue read answering with the field's value and its display name. */
+			function mockRepositoryField(value: unknown, names: Record<string, string> = {}): void {
+				mockJira({
+					'issue/SWARM-42': {
+						key: 'SWARM-42',
+						fields: { [FIELD]: value },
+						names: { [FIELD]: 'Repozytorium', ...names },
+					},
+				});
+			}
+
+			it("routes to the repository whose repo equals the field's value", async () => {
+				mockRepositoryField('core3pl/KV-TMS/VikingKurier');
+
+				await expect(
+					textFieldProvider.resolveItemRepository('SWARM-42', REPOSITORIES),
+				).resolves.toEqual({ status: 'routed', repo: 'core3pl/KV-TMS/VikingKurier' });
+			});
+
+			it('asks for that field alone, with its display name, in one request', async () => {
+				mockRepositoryField('core3pl/KV-TMS/ai-sdlc');
+
+				await textFieldProvider.resolveItemRepository('SWARM-42', REPOSITORIES);
+
+				const reads = requestsTo('issue/SWARM-42', 'GET');
+				expect(reads).toHaveLength(1);
+				expect(reads[0]?.url.searchParams.get('fields')).toBe(FIELD);
+				expect(reads[0]?.url.searchParams.get('expand')).toBe('names');
+			});
+
+			it('reports a value naming no repository as unrouted, under the field name', async () => {
+				mockRepositoryField('core3pl/KV-TMS/elsewhere');
+
+				await expect(
+					textFieldProvider.resolveItemRepository('SWARM-42', REPOSITORIES),
+				).resolves.toEqual({
+					status: 'unrouted',
+					claim: { source: 'Repozytorium', value: 'core3pl/KV-TMS/elsewhere' },
+				});
+			});
+
+			it.each([
+				['unset', null],
+				['not text', { value: 'core3pl/KV-TMS/ai-sdlc' }],
+			])('reads a field that is %s as an empty value', async (_label, value) => {
+				mockRepositoryField(value);
+
+				await expect(
+					textFieldProvider.resolveItemRepository('SWARM-42', REPOSITORIES),
+				).resolves.toEqual({ status: 'unrouted', claim: { source: 'Repozytorium', value: '' } });
+			});
+
+			it('falls back to the field id when Jira returns no display name for it', async () => {
+				mockJira({ 'issue/SWARM-42': { key: 'SWARM-42', fields: {} } });
+
+				await expect(
+					textFieldProvider.resolveItemRepository('SWARM-42', REPOSITORIES),
+				).resolves.toEqual({ status: 'unrouted', claim: { source: FIELD, value: '' } });
+			});
+
+			it('never consults components or routing tokens', async () => {
+				mockJira({
+					'issue/SWARM-42': {
+						key: 'SWARM-42',
+						fields: { components: [{ id: 'component-second' }] },
+						names: { [FIELD]: 'Repozytorium' },
+					},
+				});
+
+				await expect(
+					textFieldProvider.resolveItemRepository('SWARM-42', CANDIDATES),
+				).resolves.toEqual({ status: 'unrouted', claim: { source: 'Repozytorium', value: '' } });
+			});
+		});
+
+		it("routes by components when the mapping names 'components' explicitly", async () => {
+			mockComponents('component-second');
+			const explicit = new JiraPMProvider(
+				createMockJiraProjectConfig({
+					pm: { type: 'jira', ...CONFIG, repositoryField: 'components' },
+				}),
+			);
+
+			await expect(explicit.resolveItemRepository('SWARM-42', CANDIDATES)).resolves.toEqual({
+				status: 'routed',
+				repo: 'acme/second',
+			});
+		});
 	});
 
 	describe('listWorkItems', () => {

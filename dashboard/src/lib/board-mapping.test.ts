@@ -14,6 +14,7 @@ import {
 	isBaseUrlInvalid,
 	isBaseUrlMissing,
 	isBoardMappingDirty,
+	isRepositoryFieldInvalid,
 	STATUS_KEYS,
 	selectedPmProviderId,
 	switchedPmProviderId,
@@ -699,5 +700,78 @@ describe('switchedPmProviderId (issue #642)', () => {
 		expect(switchedPmProviderId(draft, fullPm)).toBe('linear');
 		expect(canSaveBoardMapping(draft)).toBe(true);
 		expect(buildPmUpdate(draft, fullPm)).toEqual(linearPm);
+	});
+});
+
+// Issue #1237: where a Jira card names its repository — components by default, or a
+// custom text field by id — editable here rather than only in `swarm.config.json`.
+describe('Jira repository field', () => {
+	const textFieldPm = { ...jiraPm, repositoryField: 'customfield_10515' } as ProjectPm;
+
+	it('round-trips a stored custom field into a member the config schema accepts', () => {
+		const form = toBoardMappingForm(textFieldPm);
+		expect(form.providerContext.repositoryField).toBe('customfield_10515');
+
+		const payload = buildPmUpdate(form, textFieldPm);
+		expect(payload).toEqual(textFieldPm);
+		expect(jiraConfigSchema.safeParse(withoutDiscriminator(payload)).success).toBe(true);
+		expect(isBoardMappingDirty(form, textFieldPm)).toBe(false);
+	});
+
+	it.each([
+		['blank', '  '],
+		['components', ' components '],
+	])('saves a %s field as no field at all — components, the default', (_label, value) => {
+		const form = toBoardMappingForm(textFieldPm);
+		form.providerContext = { ...form.providerContext, repositoryField: value };
+
+		const payload = buildPmUpdate(form, textFieldPm);
+		expect(payload).toEqual(jiraPm);
+		expect(isBoardMappingDirty(form, textFieldPm)).toBe(true);
+		expect(isBoardMappingDirty(form, jiraPm)).toBe(false);
+	});
+
+	it('marks the form dirty when a field is set, and trims it on save', () => {
+		const form = toBoardMappingForm(jiraPm);
+		form.providerContext = { ...form.providerContext, repositoryField: ' customfield_10515 ' };
+
+		expect(isBoardMappingDirty(form, jiraPm)).toBe(true);
+		expect(buildPmUpdate(form, jiraPm)).toEqual(textFieldPm);
+	});
+
+	it.each([
+		'Repozytorium',
+		'customfield_',
+		'labels',
+	])('refuses %j — a custom field id, never a name', (value) => {
+		const form = toBoardMappingForm(jiraPm);
+		form.providerContext = { ...form.providerContext, repositoryField: value };
+
+		expect(isRepositoryFieldInvalid(form)).toBe(true);
+		expect(canSaveBoardMapping(form)).toBe(false);
+		// The same value the persisted schema would reject.
+		expect(
+			jiraConfigSchema.safeParse({ ...withoutDiscriminator(jiraPm), repositoryField: value })
+				.success,
+		).toBe(false);
+	});
+
+	it('keeps the field when another Jira project is selected', () => {
+		const switched = withSelectedContainer(toBoardMappingForm(textFieldPm), 'OTHER');
+		expect(switched.providerContext).toEqual({
+			baseUrl: 'https://acme.atlassian.net',
+			repositoryField: 'customfield_10515',
+		});
+	});
+
+	it('is Jira’s alone: another provider neither carries nor saves one', () => {
+		const switched = withSelectedProvider(toBoardMappingForm(textFieldPm), 'linear');
+		expect(switched.providerContext).toEqual({});
+
+		const linear = toBoardMappingForm(linearPm);
+		linear.providerContext = { repositoryField: 'customfield_10515' };
+		expect(isRepositoryFieldInvalid(linear)).toBe(false);
+		expect(buildPmUpdate(linear, linearPm)).not.toHaveProperty('repositoryField');
+		expect(isBoardMappingDirty(linear, linearPm)).toBe(false);
 	});
 });

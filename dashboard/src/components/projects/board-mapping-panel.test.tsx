@@ -560,6 +560,87 @@ describe('BoardMappingPanel (issue #201)', () => {
 		});
 	});
 
+	// Issue #1237: where a Jira card names its repository is set here, not only in
+	// `swarm.config.json` — blank keeps component routing, a custom field id switches it.
+	describe("with a Jira project's repository field", () => {
+		const JIRA_CONFIG: ProjectPm = {
+			type: 'jira',
+			baseUrl: 'https://acme.atlassian.net',
+			projectKey: 'SWARM',
+			statusOptions: { todo: '10001' },
+		};
+
+		beforeEach(() => {
+			discoverContainersFn.mockResolvedValue({ containers: [{ id: 'SWARM', name: 'Swarm' }] });
+			discoverStatesFn.mockResolvedValue({ states: [{ id: '10001', name: 'To Do' }] });
+		});
+
+		it('saves a custom field id as the repository field, keeping discovery on the site URL alone', async () => {
+			const onSubmit = vi.fn();
+			renderHarness({ initial: JIRA_CONFIG, onSubmit });
+
+			const input = (await screen.findByLabelText('Repository field')) as HTMLInputElement;
+			expect(input.value).toBe('');
+			fireEvent.change(input, { target: { value: 'customfield_10515' } });
+
+			const save = screen.getByRole('button', { name: 'Save Changes' }) as HTMLButtonElement;
+			await waitFor(() => expect(save.disabled).toBe(false));
+			fireEvent.click(save);
+
+			expect(onSubmit).toHaveBeenCalledWith({
+				...JIRA_CONFIG,
+				repositoryField: 'customfield_10515',
+			});
+			// The draft schema is strict: the repository field must not ride along with it.
+			for (const [args] of discoverContainersFn.mock.calls) {
+				expect(args).toEqual({
+					projectId: 'p1',
+					providerId: 'jira',
+					discoveryDraft: { baseUrl: 'https://acme.atlassian.net' },
+				});
+			}
+		});
+
+		it('shows the stored field and saves a cleared one as components, the default', async () => {
+			const onSubmit = vi.fn();
+			renderHarness({
+				initial: { ...JIRA_CONFIG, repositoryField: 'customfield_10515' },
+				onSubmit,
+			});
+
+			const input = (await screen.findByLabelText('Repository field')) as HTMLInputElement;
+			expect(input.value).toBe('customfield_10515');
+			fireEvent.change(input, { target: { value: '' } });
+
+			const save = screen.getByRole('button', { name: 'Save Changes' }) as HTMLButtonElement;
+			await waitFor(() => expect(save.disabled).toBe(false));
+			fireEvent.click(save);
+
+			expect(onSubmit).toHaveBeenCalledWith(JIRA_CONFIG);
+		});
+
+		it('refuses to save a field name instead of a field id', async () => {
+			renderHarness({ initial: JIRA_CONFIG });
+
+			fireEvent.change(await screen.findByLabelText('Repository field'), {
+				target: { value: 'Repozytorium' },
+			});
+
+			expect(screen.getByText(/Enter a custom field id such as customfield_10515/)).not.toBeNull();
+			const save = screen.getByRole('button', { name: 'Save Changes' }) as HTMLButtonElement;
+			expect(save.disabled).toBe(true);
+		});
+
+		it('is not offered for a provider whose mapping has no repository field', async () => {
+			renderHarness({
+				initial: { type: 'linear', teamId: 'team-uuid', statusOptions: { todo: 'state-todo' } },
+			});
+
+			await waitFor(() => expect(listProvidersFn).toHaveBeenCalled());
+			expect(screen.queryByLabelText('Repository field')).toBeNull();
+		});
+	});
+
 	// Issue #588: the fourth provider through the same panel. Trello's nouns come from
 	// the catalogue too — a card's status is the *list* it sits in — and, like Linear,
 	// it carries no provider context, so Save needs nothing beyond a board and a list.

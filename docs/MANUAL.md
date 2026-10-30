@@ -1298,6 +1298,16 @@ repository first, then re-point each worker machine's checkout — see
 which carries the `swarm-repo-renamed` runbook and the ordering constraint that
 keeps worker enrollments from being suspended.
 
+**On a project with several repositories, a card that names none of them is not
+dispatched.** The router acknowledges the delivery with the reason and logs `Board
+card is not routed to exactly one repository`; no run appears. A Jira board routing
+by a repository text field (`pm.repositoryField`, issue #1237) also puts a one-off
+SWARM notice on the card ("SWARM could not start …") quoting the field's value and
+listing the repositories it may name — set the field to one of them exactly and move
+the card out of its column and back in. Component- and label-routed boards stay
+log-only: check the card carries exactly one repository's `pmRoutingToken`. See
+[`docs/configuration.md`](./configuration.md#project-config-swarmconfigjson).
+
 **A Jira-assigned item stopped running on its assignee's worker.** Since issue
 #1166 SWARM identifies a Jira assignee by their Atlassian **accountId**, not by
 email or display name — Jira Cloud hides the email under profile visibility, and a

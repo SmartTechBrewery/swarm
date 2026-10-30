@@ -4,6 +4,7 @@ import {
 	repositoryRoutingCandidates,
 	resolveCardRepository,
 	routeByClaimTokens,
+	routeByRepositoryValue,
 } from '@/pm/repository-routing.js';
 import type { ItemRepositoryRoute, PMProvider, RepositoryRoutingCandidate } from '@/pm/types.js';
 import { createMockProjectRecord } from '../../helpers/factories.js';
@@ -60,6 +61,54 @@ describe('routeByClaimTokens', () => {
 
 	it('answers unrouted for an empty candidate list', () => {
 		expect(routeByClaimTokens(['token-second'], [])).toEqual({ status: 'unrouted' });
+	});
+});
+
+// Issue #1237: a card that names its repository in a text field routes on the
+// repository's own path, so no candidate needs a token.
+describe('routeByRepositoryValue', () => {
+	const REPOSITORIES: RepositoryRoutingCandidate[] = [
+		{ repo: 'core3pl/KV-TMS/ai-sdlc' },
+		{ repo: 'core3pl/KV-TMS/VikingKurier' },
+	];
+	const claim = (value: string) => ({ source: 'Repozytorium', value });
+
+	it('routes to the repository whose repo equals the value, with no routing token declared', () => {
+		expect(routeByRepositoryValue(claim('core3pl/KV-TMS/VikingKurier'), REPOSITORIES)).toEqual({
+			status: 'routed',
+			repo: 'core3pl/KV-TMS/VikingKurier',
+		});
+	});
+
+	it('ignores surrounding whitespace a person typed around the value', () => {
+		expect(routeByRepositoryValue(claim('  core3pl/KV-TMS/ai-sdlc\n'), REPOSITORIES)).toEqual({
+			status: 'routed',
+			repo: 'core3pl/KV-TMS/ai-sdlc',
+		});
+	});
+
+	it('reports an empty value as unrouted, carrying the claim', () => {
+		expect(routeByRepositoryValue(claim('   '), REPOSITORIES)).toEqual({
+			status: 'unrouted',
+			claim: { source: 'Repozytorium', value: '' },
+		});
+	});
+
+	it.each([
+		['a bare repository name', 'ai-sdlc'],
+		['another casing', 'core3pl/kv-tms/ai-sdlc'],
+		['a repository the project does not own', 'core3pl/KV-TMS/other'],
+	])('matches exactly — %s names nothing', (_label, value) => {
+		expect(routeByRepositoryValue(claim(value), REPOSITORIES)).toEqual({
+			status: 'unrouted',
+			claim: { source: 'Repozytorium', value },
+		});
+	});
+
+	it('ignores routing tokens: a value equal to a token is not a repository', () => {
+		expect(
+			routeByRepositoryValue(claim('10001'), [{ repo: 'acme/one', routingToken: '10001' }]),
+		).toEqual({ status: 'unrouted', claim: { source: 'Repozytorium', value: '10001' } });
 	});
 });
 

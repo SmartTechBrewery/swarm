@@ -29,6 +29,7 @@ import { logger } from '@/lib/logger.js';
 import type { PmEvent } from '@/pm/events.js';
 import type { PMRouterAdapter } from '@/pm/router-adapter.js';
 import type { ItemRepositoryRoute, PMProvider, PMType } from '@/pm/types.js';
+import { unroutedCardCommentBody } from '@/pm/unrouted-card-notice.js';
 import { createWebhookApp, type WebhookReceiverDeps } from '@/router/webhook-receiver.js';
 import type { ScmEvent } from '@/scm/events.js';
 import type { SCMProvider } from '@/scm/types.js';
@@ -41,6 +42,7 @@ import {
 	createMockProjectConfig,
 	createMockProjectRecord,
 	createMockTrelloProjectConfig,
+	createMockWorkItem,
 	toProjectRecord,
 } from '../../helpers/factories.js';
 
@@ -715,6 +717,123 @@ describe('createWebhookApp', () => {
 					expect.any(String),
 					expect.objectContaining({ claimedRepositories: [project.repo, SECOND_REPO] }),
 				);
+				warnSpy.mockRestore();
+			});
+
+			// Issue #1237: a card that named its repository in a text field is told on the
+			// card itself why it was refused, naming what was read.
+			describe('a card whose own repository field names none of them', () => {
+				const claim = { source: 'Repozytorium', value: 'SmartTechBrewery/elsewhere' };
+
+				/** A provider refusing with `claim`, whose card sits in a phase-starting column. */
+				function claimManifest(routeClaim = claim) {
+					const provider = {
+						resolveItemRepository: vi.fn().mockResolvedValue({
+							status: 'unrouted',
+							claim: routeClaim,
+						}),
+						getWorkItem: vi
+							.fn()
+							.mockResolvedValue(createMockWorkItem({ id: pmEvent.itemId, statusKey: 'planning' })),
+						findComment: vi.fn().mockResolvedValue(undefined),
+						addComment: vi.fn().mockResolvedValue('comment-1'),
+					};
+					const createProvider = vi.fn<PMProviderManifest['createProvider']>(
+						() => provider as unknown as PMProvider,
+					);
+					return { manifest: { ...fakePmManifest(), createProvider }, provider };
+				}
+
+				it('refuses the card and posts a notice naming the value and the repositories', async () => {
+					const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+					const { manifest, provider } = claimManifest();
+					const { app, enqueuePm } = makePmApp(
+						{ findProjectRecord: vi.fn().mockResolvedValue(twoRepositories) },
+						manifest,
+					);
+
+					const res = await postPm(app);
+
+					expect(res.status).toBe(202);
+					expect(await res.json()).toEqual({
+						ok: true,
+						ignored: true,
+						reason:
+							"board card's Repozytorium 'SmartTechBrewery/elsewhere' names none of the project's repositories",
+					});
+					expect(enqueuePm).not.toHaveBeenCalled();
+					expect(provider.addComment).toHaveBeenCalledWith(
+						pmEvent.itemId,
+						unroutedCardCommentBody({
+							phase: 'planning',
+							claim,
+							repositories: [project.repo, SECOND_REPO],
+						}),
+					);
+					// One provider serves both the routing read and the notice.
+					expect(manifest.createProvider).toHaveBeenCalledTimes(1);
+					expect(warnSpy).toHaveBeenCalledWith(
+						expect.stringContaining('not routed to exactly one repository'),
+						expect.objectContaining({ claim }),
+					);
+					warnSpy.mockRestore();
+				});
+
+				it('says an empty field is empty', async () => {
+					const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+					const { manifest } = claimManifest({ source: 'Repozytorium', value: '' });
+					const { app } = makePmApp(
+						{ findProjectRecord: vi.fn().mockResolvedValue(twoRepositories) },
+						manifest,
+					);
+
+					const res = await postPm(app);
+
+					expect((await res.json()).reason).toBe("board card's Repozytorium is empty");
+					warnSpy.mockRestore();
+				});
+
+				// Best-effort: the refusal is acknowledged whether or not the notice lands.
+				it('still acknowledges the refusal when the notice cannot be posted', async () => {
+					const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+					const { manifest, provider } = claimManifest();
+					provider.addComment.mockRejectedValue(new Error('board unreachable'));
+					const { app, enqueuePm } = makePmApp(
+						{ findProjectRecord: vi.fn().mockResolvedValue(twoRepositories) },
+						manifest,
+					);
+
+					const res = await postPm(app);
+
+					expect(res.status).toBe(202);
+					expect((await res.json()).ignored).toBe(true);
+					expect(enqueuePm).not.toHaveBeenCalled();
+					warnSpy.mockRestore();
+				});
+			});
+
+			// A component- or label-routed refusal carries no claim: nothing is posted, as before.
+			it('posts no notice for a refusal that carries no claim', async () => {
+				const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+				const addComment = vi.fn();
+				const getWorkItem = vi.fn();
+				const createProvider = vi.fn<PMProviderManifest['createProvider']>(
+					() =>
+						({
+							resolveItemRepository: async () => ({ status: 'unrouted' }),
+							getWorkItem,
+							addComment,
+						}) as unknown as PMProvider,
+				);
+				const { app } = makePmApp(
+					{ findProjectRecord: vi.fn().mockResolvedValue(twoRepositories) },
+					{ ...fakePmManifest(), createProvider },
+				);
+
+				await postPm(app);
+
+				expect(getWorkItem).not.toHaveBeenCalled();
+				expect(addComment).not.toHaveBeenCalled();
 				warnSpy.mockRestore();
 			});
 

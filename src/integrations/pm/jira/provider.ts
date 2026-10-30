@@ -37,7 +37,7 @@ import {
 	dependencyProse,
 	findDependencyReferences,
 } from '../../../pm/dependencies.js';
-import { routeByClaimTokens } from '../../../pm/repository-routing.js';
+import { routeByClaimTokens, routeByRepositoryValue } from '../../../pm/repository-routing.js';
 import type {
 	ContainerDiscoveryResult,
 	CreateWorkItemInput,
@@ -50,6 +50,7 @@ import type {
 	PMDiscoveryResult,
 	PMProvider,
 	PMType,
+	RepositoryClaim,
 	RepositoryRoutingCandidate,
 	StateDiscoveryResult,
 	UpdateWorkItemPatch,
@@ -62,7 +63,11 @@ import type {
 } from '../../../pm/types.js';
 import { adfToPlainText, textToAdf } from './adf.js';
 import { collectJiraPage, JiraApiError, type JiraPage, jiraRequest, MAX_PAGES } from './client.js';
-import { type JiraIntegrationConfig, requireJiraConfig } from './config-schema.js';
+import {
+	JIRA_COMPONENTS_REPOSITORY_FIELD,
+	type JiraIntegrationConfig,
+	requireJiraConfig,
+} from './config-schema.js';
 import { withJiraProjectCredentials } from './credentials.js';
 import { requireStatusIdForStatusKey, resolveStatusKeyByStatusId } from './status-mapping.js';
 
@@ -255,6 +260,17 @@ interface JiraIssue {
 	/** Jira's numeric issue id. Unused: the key is the id every seam speaks. */
 	id?: string;
 	fields?: JiraIssueFields | null;
+}
+
+/**
+ * One issue read for a single field named at runtime, with `expand=names` — the
+ * repository-field routing read (issue #1237). Its own shape rather than an index
+ * signature on {@link JiraIssueFields}, which every other read types precisely.
+ */
+interface JiraFieldRead {
+	fields?: Record<string, unknown> | null;
+	/** Each returned field's id → the display name the board shows it under. */
+	names?: Record<string, string | null | undefined> | null;
 }
 
 /** An issue whose key is known — what every read narrows to before mapping. */
@@ -659,21 +675,32 @@ export class JiraPMProvider implements PMProvider {
 	}
 
 	/**
-	 * Jira's routing axis is **components** (issue #686 phase 1): the `projectKey`
-	 * is already the board container, so it cannot also say which repository a card
-	 * belongs to, while a component is a per-project subdivision an issue carries
-	 * zero or more of. Matched on the component **id**, never its name, which is
-	 * what a repository entry's `pmRoutingToken` holds.
+	 * Jira's default routing axis is **components** (issue #686 phase 1): the
+	 * `projectKey` is already the board container, so it cannot also say which
+	 * repository a card belongs to, while a component is a per-project subdivision
+	 * an issue carries zero or more of. Matched on the component **id**, never its
+	 * name, which is what a repository entry's `pmRoutingToken` holds.
 	 *
-	 * Its own narrow read rather than widening {@link ISSUE_FIELDS}: routing is one
-	 * call, and adding `components` there would make every other board read pay for
-	 * a field none of them look at.
+	 * A board mapping naming a custom field in `repositoryField` routes on that text
+	 * field instead (issue #1237): its value is the repository's own path, matched
+	 * against each candidate's `repo`, so no token is needed on either side — and a
+	 * team-managed project with no components at all can route. Its refusal carries
+	 * what the field said, under the field's display name, for the card notice.
+	 *
+	 * Either way its own narrow read rather than widening {@link ISSUE_FIELDS}:
+	 * routing is one call, and adding the field there would make every other board
+	 * read pay for a field none of them look at.
 	 */
 	async resolveItemRepository(
 		id: string,
 		candidates: readonly RepositoryRoutingCandidate[],
 	): Promise<ItemRepositoryRoute> {
-		return this.run(async () => routeByClaimTokens(await this.fetchComponentIds(id), candidates));
+		const field = this.config.repositoryField ?? JIRA_COMPONENTS_REPOSITORY_FIELD;
+		return this.run(async () =>
+			field === JIRA_COMPONENTS_REPOSITORY_FIELD
+				? routeByClaimTokens(await this.fetchComponentIds(id), candidates)
+				: routeByRepositoryValue(await this.fetchRepositoryClaim(id, field), candidates),
+		);
 	}
 
 	async listWorkItems(filter?: ListWorkItemsFilter): Promise<WorkItem[]> {
@@ -1276,6 +1303,25 @@ export class JiraPMProvider implements PMProvider {
 		return (issue?.fields?.components ?? []).flatMap((component) =>
 			component?.id ? [component.id] : [],
 		);
+	}
+
+	/**
+	 * What the issue's repository text field says (issue #1237), read as narrowly as
+	 * {@link fetchComponentIds}: that one field, plus `expand=names` so a refusal can
+	 * name the field as the board shows it (`Repozytorium`) rather than by id — at no
+	 * extra request. A field the issue leaves unset, or one that is not a text field,
+	 * reads as an empty value, which routes to nothing. Runs inside a credential
+	 * scope (its caller does).
+	 */
+	private async fetchRepositoryClaim(id: string, field: string): Promise<RepositoryClaim> {
+		const issue = await jiraRequest<JiraFieldRead | undefined>(`issue/${encodeURIComponent(id)}`, {
+			query: { fields: field, expand: 'names' },
+		});
+		const value = issue?.fields?.[field];
+		return {
+			source: issue?.names?.[field] || field,
+			value: typeof value === 'string' ? value : '',
+		};
 	}
 
 	/**
