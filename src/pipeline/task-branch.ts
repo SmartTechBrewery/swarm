@@ -13,8 +13,10 @@
  * overlap: a number starts with a digit, a key with a letter.
  *
  * A branch is recognised under the repository's pattern **and** under its legacy
- * prefix shape ({@link taskIdFromTaskBranch}), so a pull request opened before the
- * pattern changed stays SWARM's own without any migration.
+ * prefix shape ({@link taskIdFromTaskBranch}), so a pull request opened before a
+ * pattern was first set stays SWARM's own without any migration. Only those two are
+ * tried: a branch rendered by an *earlier* pattern is not recognised once the pattern
+ * changes again, which the dashboard's pattern editor warns about.
  */
 
 import {
@@ -118,8 +120,9 @@ export function taskIdFromBranch(
 /**
  * The task id a branch of this repository carries — under its branch name pattern
  * (issue #1241), or under its legacy `<branchPrefix><taskId>` shape, which stays
- * recognised after a pattern change so every branch already open keeps being
- * SWARM's own. `strict` applies to the legacy shape exactly as in
+ * recognised after a pattern is set so every branch already open under the prefix
+ * keeps being SWARM's own. A branch named by an earlier *pattern* is not: only the
+ * current one is tried. `strict` applies to the legacy shape exactly as in
  * {@link taskIdFromBranch}; the pattern always matches the whole branch.
  */
 export function taskIdFromTaskBranch(

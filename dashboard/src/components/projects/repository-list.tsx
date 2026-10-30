@@ -8,6 +8,7 @@ import {
 	repoInputShape,
 } from '@/lib/project-repository.js';
 import type { ReviewChecksPolicy } from '../../../../src/config/schema.js';
+import { branchPatternFromPrefix } from '../../../../src/pipeline/branch-pattern.js';
 import { BranchPatternDialog } from './branch-pattern-dialog.js';
 
 /** Input/select recipe shared with the rest of the tab (ai/DESIGN_SYSTEM.md §4). */
@@ -194,6 +195,7 @@ function RepositoryRow({
 			<BranchPatternDialog
 				open={editingPattern}
 				pattern={branchPattern}
+				legacyPattern={branchPatternFromPrefix(entry.branchPrefix)}
 				rank={rank}
 				onApply={(pattern) => {
 					onChange(index, branchPatternPatch(entry, pattern));

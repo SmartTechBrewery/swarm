@@ -17,6 +17,11 @@ interface BranchPatternDialogProps {
 	open: boolean;
 	/** The pattern the repository names its branches by now — its own, or its prefix's. */
 	pattern: string;
+	/**
+	 * The pattern the repository's legacy prefix stands for (`<prefix>{issue_key}`) — the
+	 * one shape `taskIdFromTaskBranch` keeps recognising whatever the pattern is.
+	 */
+	legacyPattern: string;
 	/** The repository's rank in the list, so the dialog says which entry it edits. */
 	rank: number;
 	onApply: (pattern: string) => void;
@@ -31,10 +36,15 @@ interface BranchPatternDialogProps {
  *
  * Applying only edits the row: the pattern is persisted by the tab's own Save, like
  * every other repository setting.
+ *
+ * Only the legacy `<prefix>{issue_key}` shape stays recognised after a change, so
+ * replacing any other pattern warns that pull requests open under it stop being
+ * SWARM's own.
  */
 export function BranchPatternDialog({
 	open,
 	pattern,
+	legacyPattern,
 	rank,
 	onApply,
 	onCancel,
@@ -48,7 +58,15 @@ export function BranchPatternDialog({
 		if (open) setDraft(pattern);
 	}, [open, pattern]);
 
-	const { errors, warnings } = validateBranchPattern(draft);
+	const validation = validateBranchPattern(draft);
+	const { errors } = validation;
+	const strandsOpenBranches = draft !== pattern && pattern !== legacyPattern;
+	const warnings = strandsOpenBranches
+		? [
+				...validation.warnings,
+				`Pull requests already open on branches named by ${pattern} will no longer be recognised as SWARM's own — no Review, WIP release or merge automation. Only the legacy ${legacyPattern} shape stays recognised after a change.`,
+			]
+		: validation.warnings;
 	const preview = errors.length === 0 ? renderBranchName(draft, SAMPLE_BRANCH_NAME_PARTS) : null;
 
 	/** Insert `{name}` at the caret (or replacing the selection), keeping focus in the field. */
@@ -72,8 +90,9 @@ export function BranchPatternDialog({
 					How SWARM names this repository's task branches. Combine literal text — letters, digits
 					and the separators <span className="font-mono">/</span>,{' '}
 					<span className="font-mono">-</span> and <span className="font-mono">_</span> — with these
-					elements. The name is decided once per task and kept for every later phase; branches
-					already open under an earlier name are still recognised.
+					elements. The name is decided once per task and kept for every later phase. After a
+					change, branches already open stay recognised only in the legacy{' '}
+					<span className="font-mono">{legacyPattern}</span> shape.
 				</p>
 
 				<ul className="space-y-2">

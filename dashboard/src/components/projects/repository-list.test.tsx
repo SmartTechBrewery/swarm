@@ -313,5 +313,34 @@ describe('RepositoryList', () => {
 			fireEvent.click(apply());
 			expect(onChange).toHaveBeenLastCalledWith(0, { branchPattern: '' });
 		});
+
+		// Only the legacy prefix shape stays recognised after a change (review of #1243).
+		it('warns that replacing a repository’s own pattern strands branches open under it', () => {
+			const { onChange } = renderList({
+				repositories: [row({ branchPattern: '{issue_key}/{friendly_name}' })],
+			});
+			fireEvent.click(screen.getByLabelText('Edit branch name pattern, entry 1'));
+			expect(screen.queryByText(/will no longer be recognised/)).toBeNull();
+
+			fireEvent.change(patternInput(), {
+				target: { value: '{work_type}/{issue_key}-{friendly_name}' },
+			});
+			expect(
+				screen.getByText(/branches named by \{issue_key\}\/\{friendly_name\} will no longer be/),
+			).toBeTruthy();
+			expect(apply().disabled).toBe(false);
+			fireEvent.click(apply());
+			expect(onChange).toHaveBeenCalledWith(0, {
+				branchPattern: '{work_type}/{issue_key}-{friendly_name}',
+			});
+		});
+
+		it('does not warn when replacing the legacy prefix’s pattern, which stays recognised', () => {
+			renderList({ repositories: TWO });
+			fireEvent.click(screen.getByLabelText('Edit branch name pattern, entry 1'));
+
+			fireEvent.change(patternInput(), { target: { value: '{issue_key}/{friendly_name}' } });
+			expect(screen.queryByText(/will no longer be recognised/)).toBeNull();
+		});
 	});
 });
