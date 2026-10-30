@@ -581,7 +581,7 @@ export function QueuedRunsSection({
 			 */}
 			<NoTriggerGroup items={noTriggerItems} />
 
-			<Modal open={confirmOpen} onClose={handleCloseConfirm} title="Put Back Work Item">
+			<Modal open={confirmOpen} onClose={handleCloseConfirm} title="Put back work item">
 				<div className="space-y-4">
 					{errorMessage && (
 						<div className="p-3 bg-red-950/40 border border-red-800 rounded text-xs text-red-200">
@@ -595,7 +595,7 @@ export function QueuedRunsSection({
 					{selectedItem && (
 						<div className="p-3 bg-zinc-900/60 border border-zinc-800 rounded text-xs space-y-1">
 							<div className="font-semibold text-zinc-200">
-								{queuedWorkItemTitle(selectedItem) || 'Work Item'}
+								{queuedWorkItemTitle(selectedItem) || 'Work item'}
 							</div>
 							<div className="font-mono text-zinc-500">{queuedWorkItemLabel(selectedItem)}</div>
 						</div>

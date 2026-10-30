@@ -2,9 +2,10 @@ import { describe, expect, it } from 'vitest';
 
 import {
 	addRepository,
+	applyBranchPattern,
+	applyCommitSubjectPattern,
 	areRepositoriesDirty,
 	branchPatternPatch,
-	commitSubjectPatternPatch,
 	duplicateRepositories,
 	effectiveBranchPattern,
 	effectiveCommitSubjectMaxLength,
@@ -15,6 +16,8 @@ import {
 	type RepositoryEntry,
 	type RepositoryForm,
 	removeRepository,
+	sharedBranchPattern,
+	sharedCommitSubjectNaming,
 	toRepositoryEntries,
 	toRepositoryForms,
 } from './project-repository.js';
@@ -311,6 +314,7 @@ describe('repository list mutations', () => {
 		},
 	];
 
+	// The two fixture rows differ in prefix, so there is no project branch pattern to take.
 	it('appends a blank row on the project defaults, with an unused id', () => {
 		expect(addRepository(rows)).toEqual([
 			...rows,
@@ -328,6 +332,32 @@ describe('repository list mutations', () => {
 				wipLimit: '',
 			},
 		]);
+	});
+
+	// Issue #1246: a repository added later takes the project's patterns.
+	it('starts an added row on the patterns every row shares', () => {
+		const named = applyCommitSubjectPattern(
+			applyBranchPattern(rows, '{issue_key}/{friendly_name}'),
+			'{issue_key} {Subject}',
+			60,
+		);
+		expect(addRepository(named)[2]).toMatchObject({
+			branchPrefix: 'issue-',
+			branchPattern: '{issue_key}/{friendly_name}',
+			commitSubjectPattern: '{issue_key} {Subject}',
+			commitSubjectMaxLength: '60',
+		});
+	});
+
+	// A pattern the new row's own prefix already renders is stored as none, like any row's.
+	it('starts an added row on a shared legacy pattern through its own prefix', () => {
+		const onPrefix = rows.map((row) => ({ ...row, branchPrefix: 'issue-' }));
+		expect(addRepository(onPrefix)[2]).toMatchObject({ branchPrefix: 'issue-', branchPattern: '' });
+		const onOtherPrefix = rows.map((row) => ({ ...row, branchPrefix: 'work-' }));
+		expect(addRepository(onOtherPrefix)[2]).toMatchObject({
+			branchPrefix: 'issue-',
+			branchPattern: 'work-{issue_key}',
+		});
 	});
 
 	// Ids must stay unique after a removal, or two rows would share a React key.
@@ -539,21 +569,82 @@ describe('commit subject pattern (issue #1242)', () => {
 			areRepositoriesDirty(patchRepository(rows, 0, { commitSubjectMaxLength: '72' }), stored),
 		).toBe(true);
 	});
+});
 
-	it('keeps an entry with none on none when the defaults are applied unchanged', () => {
-		const none = { commitSubjectPattern: '', commitSubjectMaxLength: '' };
-		expect(commitSubjectPatternPatch(none, '{work_type}: {subject}', 72)).toEqual(none);
-		expect(commitSubjectPatternPatch(none, '{issue_key} {Subject}', 72)).toEqual({
-			commitSubjectPattern: '{issue_key} {Subject}',
+// Issue #1246: the patterns are set once per project, but still stored on every row.
+describe('project-wide patterns', () => {
+	const rows = toRepositoryForms([
+		{ repo: 'acme/first', branchPrefix: 'issue-' },
+		{ repo: 'acme/second', branchPrefix: 'issue-' },
+	]);
+
+	it('reads the patterns the rows share', () => {
+		expect(sharedBranchPattern(rows)).toBe('issue-{issue_key}');
+		expect(sharedCommitSubjectNaming(rows)).toEqual({
+			commitSubjectPattern: '',
 			commitSubjectMaxLength: '',
 		});
-		// A pattern of the repository's own stays its own, even set to the default.
+	});
+
+	it('compares branch patterns by the name they render', () => {
+		const stated = patchRepository(rows, 1, { branchPattern: 'issue-{issue_key}' });
+		expect(sharedBranchPattern(stated)).toBe('issue-{issue_key}');
 		expect(
-			commitSubjectPatternPatch(
-				{ commitSubjectPattern: '{issue_key} {Subject}', commitSubjectMaxLength: '60' },
-				'{work_type}: {subject}',
-				72,
+			sharedBranchPattern(patchRepository(rows, 1, { branchPrefix: 'work-' })),
+		).toBeUndefined();
+		expect(
+			sharedBranchPattern(
+				patchRepository(rows, 1, { branchPattern: '{issue_key}/{friendly_name}' }),
 			),
-		).toEqual({ commitSubjectPattern: '{work_type}: {subject}', commitSubjectMaxLength: '72' });
+		).toBeUndefined();
+	});
+
+	// Stating none titles pull requests by their card; stating the default does not.
+	it('tells a stated default commit subject pattern apart from none, but not a stated default limit', () => {
+		expect(
+			sharedCommitSubjectNaming(
+				patchRepository(rows, 1, { commitSubjectPattern: '{work_type}: {subject}' }),
+			),
+		).toBeUndefined();
+		expect(
+			sharedCommitSubjectNaming(patchRepository(rows, 1, { commitSubjectMaxLength: '72' })),
+		).toBeDefined();
+		expect(
+			sharedCommitSubjectNaming(patchRepository(rows, 1, { commitSubjectMaxLength: '60' })),
+		).toBeUndefined();
+	});
+
+	it('applies a branch pattern to every row, storing a prefix’s own pattern as none', () => {
+		const mixed = patchRepository(rows, 1, { branchPrefix: 'work-' });
+		const applied = applyBranchPattern(mixed, 'issue-{issue_key}');
+		expect(applied.map((row) => row.branchPattern)).toEqual(['', 'issue-{issue_key}']);
+		expect(sharedBranchPattern(applied)).toBe('issue-{issue_key}');
+		expect(
+			applyBranchPattern(mixed, '{issue_key}/{friendly_name}').map((row) => row.branchPattern),
+		).toEqual(['{issue_key}/{friendly_name}', '{issue_key}/{friendly_name}']);
+	});
+
+	it('keeps rows stating none on none when the defaults are applied unchanged', () => {
+		const applied = applyCommitSubjectPattern(rows, '{work_type}: {subject}', 72);
+		expect(applied).toEqual(rows);
+		expect(areRepositoriesDirty(applied, toRepositoryEntries(rows))).toBe(false);
+	});
+
+	// Once any row states its own, every row states what is applied — the default included —
+	// so the repositories end up identical rather than split between none and the default.
+	it('writes the same pattern and limit to every row once any row states its own', () => {
+		const mixed = patchRepository(rows, 1, {
+			commitSubjectPattern: '{issue_key} {Subject}',
+			commitSubjectMaxLength: '60',
+		});
+		const applied = applyCommitSubjectPattern(mixed, '{work_type}: {subject}', 72);
+		expect(toRepositoryEntries(applied).map((entry) => entry.commitSubjectPattern)).toEqual([
+			'{work_type}: {subject}',
+			'{work_type}: {subject}',
+		]);
+		expect(toRepositoryEntries(applied).map((entry) => entry.commitSubjectMaxLength)).toEqual([
+			72, 72,
+		]);
+		expect(sharedCommitSubjectNaming(applied)).toBeDefined();
 	});
 });

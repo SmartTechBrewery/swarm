@@ -8,7 +8,7 @@ interface EmptyRunsStateProps {
 
 /**
  * Shared empty state for run-history views — the global `/runs` route and the
- * project-scoped Runs tab. When filters are active it offers a "Clear Filters"
+ * project-scoped Runs tab. When filters are active it offers a "Clear filters"
  * action; otherwise it hints how runs get created.
  */
 export function EmptyRunsState({ hasFilters, onClear }: EmptyRunsStateProps) {
@@ -22,7 +22,7 @@ export function EmptyRunsState({ hasFilters, onClear }: EmptyRunsStateProps) {
 					onClick={onClear}
 					className={`${buttonClass('secondary', 'sm')} mt-2`}
 				>
-					Clear Filters
+					Clear filters
 				</button>
 			) : (
 				<p className="text-xs text-zinc-500">

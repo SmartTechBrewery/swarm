@@ -22,7 +22,7 @@ function ProjectsRouteComponent() {
 					className={buttonClass('primary')}
 				>
 					<Plus className="h-4 w-4" />
-					New Project
+					New project
 				</button>
 			</div>
 
@@ -45,7 +45,7 @@ function ProjectsRouteComponent() {
 						onClick={() => setCreateOpen(true)}
 						className={`${buttonClass('secondary', 'sm')} mt-2`}
 					>
-						New Project
+						New project
 					</button>
 				</div>
 			)}

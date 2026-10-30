@@ -580,7 +580,7 @@ export function CredentialsPanel({
 		<div className="border border-zinc-800 rounded-lg bg-panel/40 p-6 shadow-sm space-y-6">
 			<div>
 				<h2 className="text-sm font-semibold text-zinc-200 border-b border-zinc-800 pb-2 mb-4">
-					Source Control
+					Source control
 				</h2>
 
 				<ScmProviderSelect

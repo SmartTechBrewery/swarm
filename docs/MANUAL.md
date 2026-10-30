@@ -1096,7 +1096,7 @@ lapsed, `docker compose restart app` logs a fresh one.
 
 ### Projects, webhooks and workers
 
-- **Create projects in the dashboard** (`https://<your domain>` → New Project),
+- **Create projects in the dashboard** (`https://<your domain>` → New project),
   then enter each project's credentials on its Source Control and Project
   Management tabs. A project needs a reviewer credential to be created: type
   it into the dialog's reviewer field, or record one installation-wide default
@@ -1346,7 +1346,8 @@ the branch is the repository's branch name pattern filled for `VT-1538` — e.g.
 `issue-VT-1538` on a repository still on the legacy `issue-` prefix (see
 [`docs/configuration.md`](./configuration.md#repositories)). For Jira's
 Development panel to link the commits and the pull request too, set the
-repository's commit subject pattern to `{issue_key} {Subject}` (issue #1242):
+project's commit subject pattern to `{issue_key} {Subject}` (issue #1242; set once
+for every repository on the dashboard's Source control tab, issue #1246):
 every commit SWARM makes for the card, review and CI fixes included, and the
 pull request's title then start with `VT-1538 `. A card **with** a
 GitHub issue link keeps that issue's number exactly as before, and a card linked

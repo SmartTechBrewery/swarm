@@ -96,7 +96,7 @@ describe('jira manifest registration', () => {
 		const email = jiraManifest.credentialRoles.find((role) => role.role === 'email');
 		expect(email).toMatchObject({
 			role: 'email',
-			label: 'Account Email',
+			label: 'Account email',
 			envVarKey: 'JIRA_EMAIL',
 		});
 		expect(email?.optional).toBeUndefined();
@@ -106,7 +106,7 @@ describe('jira manifest registration', () => {
 		const apiToken = jiraManifest.credentialRoles.find((role) => role.role === 'apiToken');
 		expect(apiToken).toMatchObject({
 			role: 'apiToken',
-			label: 'API Token',
+			label: 'API token',
 			envVarKey: 'JIRA_API_TOKEN',
 		});
 		expect(apiToken?.optional).toBeUndefined();
@@ -120,7 +120,7 @@ describe('jira manifest registration', () => {
 		);
 		expect(webhookSecret).toMatchObject({
 			role: 'webhookSecret',
-			label: 'Webhook Secret',
+			label: 'Webhook secret',
 			envVarKey: 'JIRA_WEBHOOK_SECRET',
 		});
 		expect(webhookSecret?.optional).toBeUndefined();

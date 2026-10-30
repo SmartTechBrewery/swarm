@@ -37,6 +37,7 @@ const REPOSITORIES: RepositoryForm[] = [
 function renderPanel(overrides: Partial<Parameters<typeof RepositoriesPanel>[0]> = {}) {
 	const handleSubmit = vi.fn((e: React.FormEvent) => e.preventDefault());
 	const handleReset = vi.fn();
+	const onApplyBranchPattern = vi.fn<(pattern: string) => void>();
 	render(
 		<RepositoriesPanel
 			repositories={REPOSITORIES}
@@ -45,6 +46,8 @@ function renderPanel(overrides: Partial<Parameters<typeof RepositoriesPanel>[0]>
 			onAdd={vi.fn()}
 			onRemove={vi.fn()}
 			onMove={vi.fn()}
+			onApplyBranchPattern={onApplyBranchPattern}
+			onApplyCommitSubjectPattern={vi.fn()}
 			handleSubmit={handleSubmit}
 			handleReset={handleReset}
 			isDirty={true}
@@ -54,7 +57,7 @@ function renderPanel(overrides: Partial<Parameters<typeof RepositoriesPanel>[0]>
 			{...overrides}
 		/>,
 	);
-	return { handleSubmit, handleReset };
+	return { handleSubmit, handleReset, onApplyBranchPattern };
 }
 
 describe('RepositoriesPanel', () => {
@@ -72,12 +75,28 @@ describe('RepositoriesPanel', () => {
 		expect(screen.queryByText('Default')).toBeNull();
 	});
 
+	// Issue #1246: the patterns are the project's — one of each, above the list, saved by
+	// this card's Save with the rows they are written to.
+	it('sets the branch and commit naming once, above the repository rows', () => {
+		const { onApplyBranchPattern } = renderPanel();
+
+		const naming = screen.getByRole('heading', { name: 'Branch and commit naming' });
+		const list = screen.getByRole('heading', { name: 'Repositories' });
+		expect(naming.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+		expect(screen.getAllByLabelText('Branch name pattern')).toHaveLength(1);
+		expect(screen.getAllByLabelText('Commit subject pattern')).toHaveLength(1);
+
+		fireEvent.click(screen.getByRole('button', { name: 'Edit branch name pattern' }));
+		fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+		expect(onApplyBranchPattern).toHaveBeenCalledWith('issue-{issue_key}');
+	});
+
 	// Its own Save, sending `repositories` alone: the Settings tab keeps a separate one for
 	// `name`/`repoRoot`/`worktreeRoot`.
 	it('saves and resets on its own controls', () => {
 		const { handleSubmit, handleReset } = renderPanel();
 
-		fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+		fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
 		expect(handleSubmit).toHaveBeenCalled();
 
 		fireEvent.click(screen.getByRole('button', { name: 'Reset' }));
@@ -87,7 +106,7 @@ describe('RepositoriesPanel', () => {
 	it('offers neither Save nor Reset while the list is unchanged', () => {
 		renderPanel({ isDirty: false });
 
-		expect(screen.getByRole('button', { name: 'Save Changes' })).toHaveProperty('disabled', true);
+		expect(screen.getByRole('button', { name: 'Save changes' })).toHaveProperty('disabled', true);
 		expect(screen.getByRole('button', { name: 'Reset' })).toHaveProperty('disabled', true);
 	});
 
@@ -96,7 +115,7 @@ describe('RepositoriesPanel', () => {
 	it('blocks Save on a duplicate repository, and Enter-to-submit with it', () => {
 		const { handleSubmit } = renderPanel({ duplicates: ['acme/first'] });
 
-		const save = screen.getByRole('button', { name: 'Save Changes' });
+		const save = screen.getByRole('button', { name: 'Save changes' });
 		expect(save).toHaveProperty('disabled', true);
 		fireEvent.click(save);
 		expect(handleSubmit).not.toHaveBeenCalled();

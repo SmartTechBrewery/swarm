@@ -49,7 +49,7 @@ export interface ScmCredentialsView {
 /** GitHub's own name for each role — see {@link ScmProviderCopy.roleLabels}. */
 const GITHUB_ROLE_LABELS: Record<CredentialRole, string> = {
 	reviewer: 'Reviewer PAT',
-	webhookSecret: 'Webhook Secret',
+	webhookSecret: 'Webhook secret',
 };
 
 const GITHUB_ROLE_DESCRIPTIONS: Record<CredentialRole, string> = {
@@ -139,8 +139,8 @@ export interface ScmProviderCopy {
 
 /** Bitbucket Cloud's name for each role — an app password, not a PAT. */
 const BITBUCKET_ROLE_LABELS: Record<CredentialRole, string> = {
-	reviewer: 'Reviewer App Password',
-	webhookSecret: 'Webhook Secret',
+	reviewer: 'Reviewer app password',
+	webhookSecret: 'Webhook secret',
 };
 
 /**
@@ -162,8 +162,8 @@ const BITBUCKET_ROLE_DESCRIPTIONS: Record<CredentialRole, string> = {
  * rather than an HMAC key it signs the body with.
  */
 const GITLAB_ROLE_LABELS: Record<CredentialRole, string> = {
-	reviewer: 'Reviewer Access Token',
-	webhookSecret: 'Secret Token',
+	reviewer: 'Reviewer access token',
+	webhookSecret: 'Secret token',
 };
 
 /**
