@@ -390,11 +390,13 @@ Sign in as **the worker's owner** — `<email>` — not as an installation admin
 somebody else's behalf: storing a machine's operator source-control credential is
 strictly the owner's (see [`docs/cli.md`](./cli.md#swarm-workers)).
 
-The middle command registers the worker, prompts **once** (no echo; pipe the secret
-on stdin to script it) for the operator source-control credential of whichever
-provider the target project runs on — verifying it against that provider before
-storing it — enrolls the machine in that project `active` with sharing consent on,
-and prints, as its **last** line, the exact command to start the daemon:
+The middle command prompts **once** (no echo; pipe the secret on stdin to script
+it) for the operator source-control credential of whichever provider the target
+project runs on, registers the worker, enrolls the machine in that project `active`
+with sharing consent on, then stores the credential — verifying it against that
+provider first, which for an organization-scoped Azure DevOps PAT needs the
+enrollment to exist (issue #1220) — and prints, as its **last** line, the exact
+command to start the daemon:
 
 ```
 swarm: SWARM_WORKER_CREDENTIAL=<credential> SWARM_WORKER_REPO_ROOT=<checkout> npm run dev:worker

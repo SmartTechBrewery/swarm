@@ -31,14 +31,16 @@ describe('pre-project SCM reads — Azure DevOps', () => {
 		});
 
 		// An organization-scoped PAT names no account on its own, so with no repository —
-		// or one that is not Azure-shaped — it reads as unverifiable, never as verified.
-		it('reports invalid without a request when no Azure-shaped repository is given', async () => {
+		// or one that is not Azure-shaped — it is reported as unscoped (issue #1220): never
+		// as verified, and never as invalid, since it was never checked.
+		it('reports unscoped without a request when no Azure-shaped repository is given', async () => {
 			await expect(verifyScmCredentialSecret('azure-devops', 'ado-pat')).resolves.toEqual({
 				valid: false,
+				reason: 'unscoped',
 			});
 			await expect(
 				verifyScmCredentialSecret('azure-devops', 'ado-pat', 'owner/repo'),
-			).resolves.toEqual({ valid: false });
+			).resolves.toEqual({ valid: false, reason: 'unscoped' });
 			expect(getAzureDevOpsUserForToken).not.toHaveBeenCalled();
 		});
 	});

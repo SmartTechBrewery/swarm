@@ -492,7 +492,7 @@ describe('swarm workers', () => {
 		});
 	});
 
-	// Issue #786 — the composite: register + operator credential + enroll, ending in
+	// Issue #786 — the composite: register + enroll + operator credential, ending in
 	// the exact command that starts the daemon. It composes the three commands above,
 	// so what is asserted here is the *ordering* and the credential handling.
 	describe('setup', () => {
@@ -504,10 +504,10 @@ describe('swarm workers', () => {
 			expect(pathsCalled()).toEqual([
 				'workers.projectScmProvider',
 				'workers.register',
-				'workers.scmCredentials.set',
 				'workers.enroll',
 				'workers.approveEnrollment',
 				'workers.setConsent',
+				'workers.scmCredentials.set',
 			]);
 			const registered = inputFor('workers.register') ?? {};
 			expect(registered.ownerIdentifier).toBe(IDENTIFIER);
@@ -574,6 +574,19 @@ describe('swarm workers', () => {
 			expect(pathsCalled()).toContain('workers.setConsent');
 		});
 
+		// Issue #1220: an Azure DevOps PAT is verified within a repository the worker is
+		// enrolled on, so the enrollment has to exist first — then one run is enough.
+		it('stores an Azure DevOps credential, enrolls and installs autostart in one run', async () => {
+			answers.set('workers.projectScmProvider', () => ({ providerId: 'azure-devops' }));
+			expect(await run(['setup', '--project', PROJECT_ID])).toBe(0);
+			const paths = pathsCalled();
+			expect(paths.indexOf('workers.enroll')).toBeLessThan(
+				paths.indexOf('workers.scmCredentials.set'),
+			);
+			expect(inputFor('workers.scmCredentials.set')).toMatchObject({ providerId: 'azure-devops' });
+			expect(installWorkerAutostart).toHaveBeenCalledExactlyOnceWith(REPO_ROOT);
+		});
+
 		it('does not install autostart when enrollment did not finish', async () => {
 			refuse('workers.scmCredentials.set', 'the credential did not authenticate');
 			expect(await run(['setup', '--project', PROJECT_ID])).toBe(1);
@@ -613,10 +626,10 @@ describe('swarm workers', () => {
 			expect(pathsCalled()).toEqual([
 				'workers.projectScmProvider',
 				'workers.register',
-				'workers.scmCredentials.set',
 				'workers.enroll',
 				'workers.approveEnrollment',
 				'workers.setConsent',
+				'workers.scmCredentials.set',
 			]);
 			expect(inputFor('workers.scmCredentials.set')).toEqual({
 				workerId: WORKER_ID,
@@ -717,6 +730,22 @@ describe('swarm workers', () => {
 			answers.set('workers.projectScmProvider', () => ({ providerId: 'bitbucket' }));
 			expect(await run(ARGV)).toBe(0);
 			expect(inputFor('workers.scmCredentials.set')).toMatchObject({ providerId: 'bitbucket' });
+		});
+
+		// Issue #1220: the Azure DevOps credential is stored only after the enrollment it
+		// is verified within exists.
+		it('enrolls before storing an Azure DevOps credential and finishes in one run', async () => {
+			answers.set('workers.projectScmProvider', () => ({ providerId: 'azure-devops' }));
+			expect(await run(ARGV)).toBe(0);
+			const paths = pathsCalled();
+			expect(paths.indexOf('workers.enroll')).toBeLessThan(
+				paths.indexOf('workers.scmCredentials.set'),
+			);
+			expect(inputFor('workers.scmCredentials.set')).toEqual({
+				workerId: WORKER_ID,
+				providerId: 'azure-devops',
+				value: 'piped-secret',
+			});
 		});
 
 		// …and so it names that provider's own credential type in the prompt (#807),
@@ -864,9 +893,13 @@ describe('swarm workers', () => {
 			expect(await run(ARGV)).toBe(1);
 			expect(error).toHaveBeenCalledWith(expect.stringContaining('acme/frontend'));
 			expect(error).toHaveBeenCalledWith(expect.stringContaining('acme/backend'));
+			// The credential is still stored — GitHub needs no enrollment to verify it —
+			// so the enrollment is the only step left.
+			expect(pathsCalled()).toContain('workers.scmCredentials.set');
 			const printed = lines();
 			expect(printed.filter((line) => line.includes('raw-credential-token'))).toHaveLength(1);
 			expect(printed.some((line) => line.includes('workers enroll'))).toBe(true);
+			expect(printed.some((line) => line.includes('set-scm-credential'))).toBe(false);
 		});
 
 		// The other half of that: `workers.enroll` *succeeded* and only the projectAdmin
@@ -887,10 +920,11 @@ describe('swarm workers', () => {
 			const error = vi.spyOn(console, 'error');
 			expect(await run(ARGV)).toBe(1);
 			expect(error).toHaveBeenCalledWith(expect.stringContaining('do not have permission'));
-			expect(pathsCalled().slice(-3)).toEqual([
+			expect(pathsCalled().slice(-4)).toEqual([
 				'workers.enroll',
 				'workers.approveEnrollment',
 				'workers.setConsent',
+				'workers.scmCredentials.set',
 			]);
 			const printed = lines();
 			const created = printed.find((line) => line.includes('the enrollment was created')) ?? '';
@@ -905,6 +939,7 @@ describe('swarm workers', () => {
 				),
 			).toBe(false);
 			expect(printed.some((line) => line.includes('swarm workers enroll'))).toBe(false);
+			expect(printed.some((line) => line.includes('set-scm-credential'))).toBe(false);
 			expect(printed.filter((line) => line.includes('raw-credential-token'))).toHaveLength(1);
 		});
 
@@ -914,11 +949,53 @@ describe('swarm workers', () => {
 				'That credential did not resolve to a GitHub account, so nothing was stored.',
 			);
 			expect(await run(ARGV)).toBe(1);
-			expect(pathsCalled()).not.toContain('workers.enroll');
+			// The enrollment was made before the store, so only the credential is left.
+			expect(pathsCalled()).toContain('workers.enroll');
 			const printed = lines();
 			expect(printed.filter((line) => line.includes('raw-credential-token'))).toHaveLength(1);
 			expect(printed.some((line) => line.includes('set-scm-credential'))).toBe(true);
-			expect(printed.some((line) => line.includes('workers enroll'))).toBe(true);
+			expect(printed.some((line) => line.includes('workers enroll'))).toBe(false);
+		});
+
+		// Issue #1220: every printed step must succeed in the order shown, and an Azure
+		// DevOps credential can only be verified once an enrollment exists — so the
+		// enrollment step always comes before set-scm-credential.
+		it('prints workers enroll before set-scm-credential when both are outstanding', async () => {
+			answers.set('workers.projectScmProvider', () => ({ providerId: 'azure-devops' }));
+			refuse('workers.enroll', 'Worker capability mismatch');
+			refuse(
+				'workers.scmCredentials.set',
+				'That credential was not checked, so nothing was stored: … no enrollment in a Azure DevOps project yet.',
+			);
+			expect(await run(ARGV)).toBe(1);
+			const printed = lines();
+			const enroll = printed.findIndex((line) => line.includes('swarm workers enroll'));
+			const store = printed.findIndex((line) =>
+				line.includes(`swarm workers set-scm-credential ${WORKER_ID} azure-devops`),
+			);
+			expect(enroll).toBeGreaterThanOrEqual(0);
+			expect(store).toBeGreaterThan(enroll);
+			expect(printed.filter((line) => line.includes('raw-credential-token'))).toHaveLength(1);
+		});
+
+		it('names approve before set-scm-credential when both are outstanding', async () => {
+			refuse(
+				'workers.approveEnrollment',
+				'You do not have permission to perform this action on project "proj-a".',
+			);
+			refuse(
+				'workers.scmCredentials.set',
+				'That credential was not checked, so nothing was stored.',
+			);
+			expect(await run(ARGV)).toBe(1);
+			const printed = lines();
+			const approve = printed.findIndex((line) =>
+				line.endsWith(`swarm workers approve ${WORKER_ID} ${PROJECT_ID}`),
+			);
+			const store = printed.findIndex((line) => line.includes('swarm workers set-scm-credential'));
+			expect(approve).toBeGreaterThanOrEqual(0);
+			expect(store).toBeGreaterThan(approve);
+			expect(printed.some((line) => line.includes('swarm workers enroll'))).toBe(false);
 		});
 
 		it('prints --repo-root instead of the invoking checkout when given', async () => {
