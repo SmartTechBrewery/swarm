@@ -7,9 +7,9 @@
  * board-driven run next to its `(project_id, task_id)` — so the card is a read
  * model away, keyed by the task the branch encodes. That is deliberately *not* a
  * PM-provider question: it is answered from SWARM's own tables, with SWARM's own
- * branch naming (`<branchPrefix><taskId>`), so it holds for a Jira/Linear/Trello
- * board paired with a GitHub repo exactly as it does today (ai/RULES.md §2,
- * ai/ARCHITECTURE.md "Task identity").
+ * branch naming (`<branchPrefix><taskId>`, whether the task id is an SCM artifact
+ * number or a board key), so it holds for any board paired with any repository
+ * (ai/RULES.md §2, ai/ARCHITECTURE.md "Task identity").
  *
  * It lives here, not in the phase, because the DB is here: a federated worker
  * must be able to run the phase with no database at all (ADR-003 §2 / ADR-004
@@ -26,7 +26,7 @@ import type { ProjectConfig } from '../config/schema.js';
 import { findBoardItemIdForTask } from '../db/repositories/runsRepository.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
-import { issueNumberFromBranch } from '../pipeline/task-branch.js';
+import { taskIdFromBranch } from '../pipeline/task-branch.js';
 
 /**
  * The board card a PR branch's task was dispatched from, or `undefined` when
@@ -39,7 +39,7 @@ export async function resolveBoardItemIdForPrBranch(
 	prBranch: string | undefined,
 ): Promise<string | undefined> {
 	if (!prBranch) return undefined;
-	const taskId = issueNumberFromBranch(prBranch, project.branchPrefix);
+	const taskId = taskIdFromBranch(prBranch, project.branchPrefix);
 	if (!taskId) return undefined;
 	try {
 		return await findBoardItemIdForTask(project.id, taskId);

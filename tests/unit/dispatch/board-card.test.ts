@@ -24,8 +24,16 @@ describe('resolveBoardItemIdForPrBranch', () => {
 		expect(findBoardItemIdForTask).toHaveBeenCalledWith('proj-1', '21');
 	});
 
+	it('looks the card up by a board-key task id the PR branch encodes (issue #1226)', async () => {
+		findBoardItemIdForTask.mockResolvedValue('ITEM_VT');
+
+		await expect(resolveBoardItemIdForPrBranch(project, 'issue-VT-1538')).resolves.toBe('ITEM_VT');
+		expect(findBoardItemIdForTask).toHaveBeenCalledWith('proj-1', 'VT-1538');
+	});
+
 	it('returns undefined for a branch that encodes no task', async () => {
 		await expect(resolveBoardItemIdForPrBranch(project, 'hotfix/typo')).resolves.toBeUndefined();
+		await expect(resolveBoardItemIdForPrBranch(project, 'issue-hotfix-2')).resolves.toBeUndefined();
 		expect(findBoardItemIdForTask).not.toHaveBeenCalled();
 	});
 

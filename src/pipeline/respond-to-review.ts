@@ -123,7 +123,7 @@ import {
 } from '@/scm/delivery.js';
 import { GitWorktreeManager } from '@/worker/git-worktree-manager.js';
 import { graftEnvironment } from '@/worktree/graft.js';
-import { issueNumberFromBranch } from './task-branch.js';
+import { isArtifactNumberTaskId, taskIdFromBranch } from './task-branch.js';
 
 /** The file the respond agent is instructed to write its outcome to, at the worktree root. */
 export const RESPOND_OUTCOME_FILENAME = HANDOFF_FILENAMES.respondToReview;
@@ -297,8 +297,6 @@ export interface RespondToReviewPhaseResult {
 	pushedHeadSha?: string;
 }
 
-export { issueNumberFromBranch } from './task-branch.js';
-
 /**
  * The pushed commit SHA a follow-up Review should be scheduled for (issue
  * #241), or `undefined` when this response doesn't qualify: any outcome but
@@ -328,19 +326,22 @@ export function resolvePushedHeadSha(
  * that assumption lives: a PR opened before this change (or one whose run rows
  * were pruned) has no recorded card, so the card is guessed from a
  * `/issues/<n>` URL suffix. It resolves nothing for a board whose items carry
- * some other URL shape, which is exactly the pre-#498 behaviour it preserves.
+ * some other URL shape, which is exactly the pre-#498 behaviour it preserves. Only
+ * a branch whose task id is an SCM artifact number gets it: a board-key task
+ * (`VT-1538`) names no issue, and is found through the injected link alone.
  *
  * Swallows and logs provider errors either way — the caller treats any failure as
  * "no board report", never a phase failure.
  */
 async function resolveBoardItemId(
 	pm: PMProvider,
-	issueNumber: string | undefined,
+	branchTaskId: string | undefined,
 	taskId: string,
 	injectedItemId: string | undefined,
 ): Promise<string | undefined> {
 	if (injectedItemId) return injectedItemId;
-	if (!issueNumber) return undefined;
+	if (!branchTaskId || !isArtifactNumberTaskId(branchTaskId)) return undefined;
+	const issueNumber = branchTaskId;
 	try {
 		// A `/issues/100` suffix can't false-match `/issues/1001` — the char before
 		// `100` must be `/` — so no need to anchor on the repo too.
@@ -469,9 +470,9 @@ export async function runRespondToReviewPhase(
 	// move) and reflect "In progress" before the (possibly long) agent run, so a
 	// human watching the board sees the response start — never blocks or fails the
 	// response. See the module header. Skipped when no provider is injected.
-	const issueNumber = issueNumberFromBranch(prBranch, project.branchPrefix);
+	const branchTaskId = taskIdFromBranch(prBranch, project.branchPrefix);
 	const boardItemId = pm
-		? await resolveBoardItemId(pm, issueNumber, taskId, options.boardItemId)
+		? await resolveBoardItemId(pm, branchTaskId, taskId, options.boardItemId)
 		: undefined;
 	// `!signal?.aborted` for the same reason as the Implementation pickup (issue
 	// #912): a run already cancelled must not report itself into the phase's column,

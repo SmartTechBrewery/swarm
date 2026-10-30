@@ -17,11 +17,11 @@
  * **What does.** Both triggers resolve through {@link resolveSwarmManagedPr}
  * below, so neither the decision nor what counts as "could not decide" can drift
  * between them. SWARM opens every PR from a branch it named itself
- * (`<branchPrefix><workItemNumber>`, `GitWorktreeManager.provision`) and leaves
+ * (`<branchPrefix><taskId>`, `GitWorktreeManager.provision`) and leaves
  * a best-effort `runs` row for every phase it dispatched. So a PR is SWARM-managed iff its
- * head branch decodes to a work-item number under the project's `branchPrefix`
- * **and** SWARM has an `implementation` run row for that work item in that
- * project. Both halves are provider-agnostic (ai/RULES.md §2): no GitHub URL or
+ * head branch decodes to a task id under the project's `branchPrefix` — an SCM
+ * artifact number (`42`) or a board key (`VT-1538`), `taskIdFromBranch` — **and**
+ * SWARM has an `implementation` run row for that task in that project. Both halves are provider-agnostic (ai/RULES.md §2): no GitHub URL or
  * payload shape is parsed, and `runs` is SWARM's own table.
  *
  * The run row is the stronger half: it exists only because the composition root
@@ -41,7 +41,7 @@
 import type { ProjectConfig } from '../config/schema.js';
 import { hasRunForTask as hasRunForTaskDefault } from '../db/repositories/runsRepository.js';
 import { logger } from '../lib/logger.js';
-import { issueNumberFromBranch } from '../pipeline/task-branch.js';
+import { taskIdFromBranch } from '../pipeline/task-branch.js';
 
 export interface SwarmManagedPrDeps {
 	/** Injectable run-history read — defaults to the real repository call. */
@@ -68,13 +68,13 @@ export async function isSwarmManagedPullRequest(
 	deps: SwarmManagedPrDeps = {},
 ): Promise<SwarmManagedPrResult> {
 	const taskId = headBranch
-		? issueNumberFromBranch(headBranch, project.branchPrefix, { strict: true })
+		? taskIdFromBranch(headBranch, project.branchPrefix, { strict: true })
 		: undefined;
 	if (!taskId) return { managed: false, reason: 'not-a-task-branch' };
 
 	// Scoped to `implementation`: it is the only phase that opens a PR, and an
 	// unscoped lookup could match a `review` run whose taskId (a PR number)
-	// numerically collides with this branch's work-item number.
+	// numerically collides with this branch's task id.
 	const hasRunForTask = deps.hasRunForTask ?? hasRunForTaskDefault;
 	const hasRun = await hasRunForTask(project.id, taskId, 'implementation');
 	if (!hasRun) return { managed: false, reason: 'no-run', taskId };

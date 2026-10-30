@@ -151,7 +151,7 @@ import {
 	runReviewPhase,
 } from '../pipeline/review.js';
 import type { ReviewVerdictLedger } from '../pipeline/review-ledger.js';
-import { issueNumberFromBranch } from '../pipeline/task-branch.js';
+import { isArtifactNumberTaskId, taskIdFromBranch } from '../pipeline/task-branch.js';
 import {
 	hasAutomationLabel,
 	missingAutomationLabelMessage,
@@ -4386,15 +4386,18 @@ async function resolveGatedWorkItem(
 		taskId: trigger.taskId,
 		prNumber: trigger.prNumber,
 	};
+	// SWARM opens every PR from `<branchPrefix><taskId>`, so the branch names the
+	// task (the same decode `src/pipeline/respond-to-review.ts` performs for its board
+	// report). Only an SCM artifact-number task id names an *issue* artifact; a
+	// board-key task (`VT-1538`) has none, so its lookup tries the PR artifact alone.
+	const branchTaskId = taskIdFromBranch(trigger.prBranch, project.branchPrefix);
 	try {
 		return await findWorkItemForPullRequest(
 			requireProjectPMProvider(project),
 			{
 				repository: project.repo,
-				// SWARM opens every PR from `<branchPrefix><itemNumber>`, so the branch
-				// names the backing item (the same decode `src/pipeline/respond-to-review.ts`
-				// performs for its board report).
-				issueNumber: issueNumberFromBranch(trigger.prBranch, project.branchPrefix),
+				issueNumber:
+					branchTaskId && isArtifactNumberTaskId(branchTaskId) ? branchTaskId : undefined,
 				prNumber: trigger.prNumber,
 			},
 			logContext,

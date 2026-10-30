@@ -66,8 +66,20 @@ describe('wip-release trigger', () => {
 		);
 	});
 
+	it('releases the ticket of a board-key task branch (issue #1226)', async () => {
+		await trigger.handle(closed({ prBranch: 'issue-VT-1538' }));
+
+		expect(releaseTicketSlot).toHaveBeenCalledExactlyOnceWith(
+			PROJECT.id,
+			PROJECT.repo,
+			'VT-1538',
+			'pull-request-merged',
+		);
+	});
+
 	it.each([
 		['a branch SWARM did not name', 'feature/x'],
+		['a lowercase human branch under the prefix', 'issue-hotfix-2'],
 		['a suffixed branch under the strict rule', 'issue-12-foo'],
 	])('frees nothing for %s', async (_name, prBranch) => {
 		expect(await trigger.handle(closed({ prBranch }))).toBeNull();

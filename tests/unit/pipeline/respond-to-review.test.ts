@@ -23,7 +23,6 @@ import type { Checkpoint } from '@/pipeline/checkpoint.js';
 import type { FollowUpReviewInput } from '@/pipeline/follow-up-review.js';
 import {
 	buildRespondToReviewPrompt,
-	issueNumberFromBranch,
 	RESPOND_OUTCOME_FILENAME,
 	resolvePushedHeadSha,
 	runRespondToReviewPhase,
@@ -757,6 +756,24 @@ describe('runRespondToReviewPhase', () => {
 			expect(result.movedTo).toBe('inReview');
 		});
 
+		it('gives a board-key task branch no legacy URL-suffix fallback (issue #1226)', async () => {
+			// A board key names no SCM issue, so there is no `/issues/<n>` to guess: the
+			// card is found through the injected `runs.work_item_id` link alone.
+			const deps = makeDeps();
+			const pm = makePm();
+
+			const result = await runRespondToReviewPhase({
+				...deps,
+				prBranch: 'issue-VT-1538',
+				pm,
+				boardItemId: undefined,
+			});
+
+			expect(pm.findWorkItemByUrlSuffix).not.toHaveBeenCalled();
+			expect(pm.moveWorkItem).not.toHaveBeenCalled();
+			expect(result.outcome).toBe('fixed');
+		});
+
 		it('leaves the card at In progress (no In review move) when the agent fails', async () => {
 			const deps = makeDeps();
 			const pm = makePm();
@@ -817,28 +834,6 @@ describe('buildRespondToReviewPrompt', () => {
 		const prompt = buildRespondToReviewPrompt(context);
 		expect(prompt).toContain('GH_TOKEN');
 		expect(prompt).toContain('gh auth switch');
-	});
-});
-
-describe('issueNumberFromBranch', () => {
-	it('extracts the issue number from the bare convention branch', () => {
-		expect(issueNumberFromBranch('issue-100', 'issue-')).toBe('100');
-	});
-
-	it('extracts the issue number when a slug follows', () => {
-		expect(issueNumberFromBranch('issue-100-runs-list-screen', 'issue-')).toBe('100');
-	});
-
-	it('honours a custom branch prefix', () => {
-		expect(issueNumberFromBranch('task/42-fix', 'task/')).toBe('42');
-	});
-
-	it('returns undefined for a branch that does not start with the prefix', () => {
-		expect(issueNumberFromBranch('feature/login', 'issue-')).toBeUndefined();
-	});
-
-	it('returns undefined when the prefix is not followed by digits', () => {
-		expect(issueNumberFromBranch('issue-fix-login', 'issue-')).toBeUndefined();
 	});
 });
 
