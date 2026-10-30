@@ -52,11 +52,11 @@ import {
 } from '../db/repositories/wipSlotsRepository.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
-import { taskIdFromTaskBranch } from '../pipeline/task-branch.js';
 import { repositoryForJob, type SwarmJob } from '../queue/jobs.js';
 import { IN_FLIGHT_JOB_PRIORITY, PM_BOARD_JOB_PRIORITY } from '../queue/producer.js';
 import type { TriggerResult } from '../triggers/types.js';
 import { publishDispatchWakeUp } from './dispatcher.js';
+import { findTaskIdForPrBranch } from './pr-branch-task.js';
 
 /** What freed a ticket's slot, for the release's log line. */
 export type WipReleaseCause =
@@ -135,15 +135,16 @@ export async function rankAdmittedTicketDispatch(
  * the dashboard's WIP panel can follow the holder from its card onto that pull
  * request (`src/queue/wip-usage.ts`). Called by `processJob` once a pull
  * request-driven phase resolves; the ticket is the task id SWARM's own branch naming
- * maps the head branch back to — never a URL — and a branch that is not a SWARM task
- * branch, or a ticket holding no slot, records nothing. Best-effort and fully
+ * maps the head branch back to (`findTaskIdForPrBranch`, issue #1247) — never a URL —
+ * and a branch that is not a SWARM task branch, or a ticket holding no slot, records
+ * nothing. Best-effort and fully
  * swallowed: it only feeds a read model, and must never fail the phase.
  */
 export async function recordTicketPullRequest(
 	project: ProjectConfig,
 	pullRequest: { prNumber: string; prBranch: string },
 ): Promise<void> {
-	const taskId = taskIdFromTaskBranch(pullRequest.prBranch, project, { strict: true });
+	const taskId = await findTaskIdForPrBranch(project, pullRequest.prBranch, { strict: true });
 	if (!taskId) return;
 	try {
 		await recordWipSlotPullRequest(project.id, project.repo, taskId, pullRequest.prNumber);
@@ -227,9 +228,7 @@ export async function releasePutBackTicketSlot(
 		if (!project) return false;
 		const taskId =
 			job.type === 'scm'
-				? job.event.prBranch
-					? taskIdFromTaskBranch(job.event.prBranch, project, { strict: true })
-					: undefined
+				? await findTaskIdForPrBranch(project, job.event.prBranch, { strict: true })
 				: (ticket.dispatchTaskId ?? ticket.cardTaskRef);
 		if (!taskId) return false;
 		return await releaseTicketSlot(projectId, project.repo, taskId, 'put-back');

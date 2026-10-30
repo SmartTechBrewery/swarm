@@ -6,7 +6,8 @@
  * Respond-to-CI fixes — carries that same subject, so an integration keyed on it (a
  * Jira–Azure DevOps link reading the leading `VT-1538`) sees every one of them. Those
  * phases start from a pull request, which names no subject; the subject is stored on
- * the task's Implementation runs, keyed by the task the branch encodes — the same read
+ * the task's Implementation runs, keyed by the task the branch belongs to (the branch
+ * Implementation recorded, else its decode — `./pr-branch-task.ts`, issue #1247) — the same read
  * model `./board-card.ts` resolves the board card from.
  *
  * It lives here, not in the phase, because the DB is here: a federated worker runs the
@@ -22,7 +23,7 @@ import type { ProjectConfig } from '../config/schema.js';
 import { findStoredCommitSubject } from '../db/repositories/runsRepository.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
-import { taskIdFromTaskBranch } from '../pipeline/task-branch.js';
+import { findTaskIdForPrBranch } from './pr-branch-task.js';
 
 /**
  * The commit subject Implementation stored for a PR branch's task, or `undefined` when
@@ -34,7 +35,7 @@ export async function resolveCommitSubjectForPrBranch(
 	prBranch: string | undefined,
 ): Promise<string | undefined> {
 	if (!prBranch) return undefined;
-	const taskId = taskIdFromTaskBranch(prBranch, project);
+	const taskId = await findTaskIdForPrBranch(project, prBranch);
 	if (!taskId) return undefined;
 	try {
 		return await findStoredCommitSubject(project.id, project.repo, taskId);

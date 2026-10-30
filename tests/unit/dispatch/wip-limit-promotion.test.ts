@@ -48,6 +48,11 @@ vi.mock('@/db/repositories/wipSlotsRepository.js', () => ({
 	reserveWipSlot: vi.fn(),
 }));
 
+// No recorded task branch (issue #1247), so a pull request's ticket is decoded from its branch.
+vi.mock('@/db/repositories/runsRepository.js', () => ({
+	findTaskIdForStoredTaskBranch: async () => undefined,
+}));
+
 const publishDispatchWakeUp = vi.fn<(dispatch: DispatchRow) => Promise<void>>();
 vi.mock('@/dispatch/dispatcher.js', () => ({
 	publishDispatchWakeUp: (dispatch: DispatchRow) => publishDispatchWakeUp(dispatch),

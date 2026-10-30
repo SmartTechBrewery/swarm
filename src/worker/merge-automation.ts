@@ -167,6 +167,7 @@ import {
 	promoteMergeQueueWaits,
 	publishDispatchWakeUp,
 } from '../dispatch/dispatcher.js';
+import { findTaskIdForPrBranch } from '../dispatch/pr-branch-task.js';
 import {
 	attributedToOperator,
 	type PullRequestOperator,
@@ -176,7 +177,6 @@ import {
 import { requireProjectSCMProvider } from '../integrations/scm/registry.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
-import { taskIdFromTaskBranch } from '../pipeline/task-branch.js';
 import {
 	MERGE_CATCH_UP_ACTION,
 	type MergeAutomationJob,
@@ -1705,16 +1705,18 @@ async function attemptMerge(
 }
 
 /**
- * The task the merged pull request was written for, decoded from its head branch
+ * The task the merged pull request was written for, resolved from its head branch
  * — the one input the settle's own-task guard cannot recover for itself (issue
  * #959).
  *
  * Read here rather than passed down from the Review run row, because a Review
  * run's `taskId` is the *pull request's* number rather than the issue's
  * (`src/triggers/handlers/review.ts`), so the two are never comparable. SWARM
- * names every task branch by the repository's pattern (issue #1241), and reads either
- * form of task id back out of it, or out of the legacy `<branchPrefix><taskId>` shape
- * (`taskIdFromTaskBranch`), which is the same provider-agnostic derivation the PR-ownership gate
+ * names every task branch by the repository's pattern (issue #1241) and records it on the
+ * task's Implementation run, so the branch resolves to its task through that record first
+ * and only then by decoding the repository's current pattern or legacy
+ * `<branchPrefix><taskId>` shape (`findTaskIdForPrBranch`, issue #1247) — the same
+ * provider-agnostic derivation the PR-ownership gate
  * (`isSwarmManagedPullRequest`) and the PR-driven phases'
  * board-card lookup (`resolveBoardItemIdForPrBranch`) already answer from.
  *
@@ -1729,7 +1731,7 @@ async function resolveOwnTaskId(
 	try {
 		const read = capabilities.getPullRequest ?? scmCapability(project, 'getPullRequest');
 		const details = await read(project, Number(job.prNumber), 'reviewer');
-		return taskIdFromTaskBranch(details.headBranch, project, { strict: true });
+		return await findTaskIdForPrBranch(project, details.headBranch, { strict: true });
 	} catch (err) {
 		logger.warn('Merge automation: could not resolve the pull request’s own task', {
 			projectId: project.id,

@@ -262,6 +262,7 @@ import type { AggregateCheckStatus, PullRequestDetails, SCMProvider } from '../.
 import { resolveAgentTimeoutMs } from '../../worker/agent-timeout.js';
 import { abandonedReviewDiagnosis, type FailureDiagnosis } from '../../worker/failure-diagnosis.js';
 import { rearmMergeAutomationForGreenHead } from '../../worker/merge-automation.js';
+import { noteSkip } from '../decline.js';
 import { buildConflictResolutionKey, claimConflictResolution } from '../resolve-conflicts-dedup.js';
 import {
 	buildRespondToCiAttemptKey,
@@ -281,7 +282,11 @@ import {
 	reviewDispatchClaimTtlSec,
 } from '../review-dispatch-dedup.js';
 import { checkRecheckCoalesceKey, mergeabilityRecheckCoalesceKey } from '../review-recheck-keys.js';
-import { resolveSwarmManagedPr, type SwarmManagedPrResult } from '../swarm-managed-pr.js';
+import {
+	describeUnmanagedPullRequest,
+	resolveSwarmManagedPr,
+	type SwarmManagedPrResult,
+} from '../swarm-managed-pr.js';
 import type {
 	ScmTriggerContext,
 	TriggerContext,
@@ -311,13 +316,15 @@ type ReviewDisposition =
 	| { kind: 'none' };
 
 function isDispositionDisabled(
-	project: ProjectConfig,
+	ctx: ScmTriggerContext,
 	disposition: Exclude<ReviewDisposition, { kind: 'none' }>,
 	prNumber?: string,
 	headSha?: string,
 ): boolean {
+	const { project } = ctx;
 	if (disposition.kind === 'review' && project.pipeline?.review?.enabled === false) {
 		logger.debug('review: phase disabled — skipping', { prNumber, headSha });
+		noteSkip(ctx, 'The Review phase is disabled for this project (`pipeline.review.enabled`).');
 		return true;
 	}
 	// `blocked-by-base` is the other outcome of the *same* red-check path (issue
@@ -329,6 +336,11 @@ function isDispositionDisabled(
 		project.pipeline?.respondToCi?.enabled === false
 	) {
 		logger.debug('respond-to-ci: phase disabled — skipping', { prNumber, headSha });
+		noteSkip(
+			ctx,
+			`Checks are failing on pull request #${prNumber} at head '${headSha}', but the ` +
+				'Respond-to-CI phase is disabled for this project (`pipeline.respondToCi.enabled`).',
+		);
 		return true;
 	}
 	return false;
@@ -955,6 +967,13 @@ async function isAdjudicatedApprovedHead(
 	}
 }
 
+/** What the approved-head re-run policy did, for the reason a retried run records (issue #1248). */
+const ADJUDICATED_RED_OUTCOMES: Record<'rerun-requested' | 'needs-operator', string> = {
+	'rerun-requested': 'it re-ran them, and that re-run decides what happens next',
+	'needs-operator':
+		'its one re-run already failed again or could not be made, so the pull request needs an operator',
+};
+
 /**
  * Hand an adjudicated red on an approved head (issue #1128) to the approved-head
  * re-run policy. Taken before the PR+SHA claim, like `blocked-by-base`: nothing is
@@ -989,6 +1008,13 @@ async function handleAdjudicatedRed(
 	});
 	if (outcome === 'rerun-settling') {
 		await scheduleRerunSettleRecheck(ctx, prNumber, headSha, failedChecks);
+	} else if (outcome !== 'not-applicable') {
+		noteSkip(
+			ctx,
+			`Pull request #${prNumber} at head '${headSha}' is already approved, and SWARM's CI agent ` +
+				'already judged its failing checks not to be its own fault, so they went to the ' +
+				`approved-head re-run policy instead of another phase (${ADJUDICATED_RED_OUTCOMES[outcome]}).`,
+		);
 	}
 	return outcome !== 'not-applicable';
 }
@@ -1160,12 +1186,19 @@ async function resolveUpdatedPullRequestReview(
 ): Promise<ReviewDisposition> {
 	const { project } = ctx;
 	const checksPolicy = project.reviewChecks ?? 'required';
+	// One reason for every way this push is left to its head's checks (issue #1248):
+	// a retried Resolve-conflicts run lands here once its pull request stops
+	// conflicting, and "no conflicts" is the fact that run needs.
+	const waitingForChecks =
+		`Pull request #${prNumber} at head '${headSha}' has no conflicts, and a push starts no ` +
+		"Review by itself under this repository's `reviewChecks` policy — the head's completed checks do.";
 	if (checksPolicy === 'required') {
 		logger.debug('review: PR is mergeable on updated event; waiting for checks — skipping', {
 			prNumber,
 			headSha,
 			checksPolicy,
 		});
+		noteSkip(ctx, waitingForChecks);
 		return { kind: 'none' };
 	}
 
@@ -1173,9 +1206,15 @@ async function resolveUpdatedPullRequestReview(
 	try {
 		checkStatus = await ctx.scm.getAggregateCheckStatus(project, headSha);
 	} catch (err) {
+		const error = err instanceof Error ? err.message : String(err);
 		logger.warn(
 			'review: aggregate check read failed on updated event — leaving it to the checks event and the unreviewed-PR sweep',
-			{ prNumber, headSha, error: err instanceof Error ? err.message : String(err) },
+			{ prNumber, headSha, error },
+		);
+		noteSkip(
+			ctx,
+			`Pull request #${prNumber} at head '${headSha}' has no conflicts, but its checks could not ` +
+				`be read (${error}), so this push is left to the head's completed checks.`,
 		);
 		return { kind: 'none' };
 	}
@@ -1194,6 +1233,7 @@ async function resolveUpdatedPullRequestReview(
 		checksPolicy,
 		checks: decision.action,
 	});
+	noteSkip(ctx, waitingForChecks);
 	return { kind: 'none' };
 }
 
@@ -1301,6 +1341,10 @@ async function dispatchRespondToCi(
 			prNumber,
 			headSha,
 		});
+		noteSkip(
+			ctx,
+			`The checks event for pull request #${prNumber} names no head branch, so a CI fix has no branch to push to.`,
+		);
 		return null;
 	}
 
@@ -1319,6 +1363,12 @@ async function dispatchRespondToCi(
 				await recordAbandonedCiFix(ctx, prNumber, headSha, failedChecks, claim.attempt);
 				await scmCommentCiFixGaveUp(ctx.scm, project, Number(prNumber));
 			}
+			noteSkip(
+				ctx,
+				`Pull request #${prNumber} has used every permitted Respond-to-CI attempt ` +
+					`(${MAX_FIX_ATTEMPTS}), so SWARM dispatched no further CI fix — it needs a human. The ` +
+					'count clears once the pull request has gone an hour without another attempt.',
+			);
 			return null;
 		}
 		attempt = claim.attempt;
@@ -1374,11 +1424,11 @@ async function dispatchRespondToCi(
  * verdict, whether or not some later drop path remembers to hand it back.
  */
 async function reserveDurableReviewSlot(
-	project: ProjectConfig,
+	ctx: ScmTriggerContext,
 	prNumber: string,
 	headSha: string,
-	dispatchId: string,
 ): Promise<'reserved' | 'reused' | 'submitted' | null> {
+	const { project, dispatchId } = ctx;
 	try {
 		const reservation = await reserveReviewVerdict(
 			{
@@ -1407,6 +1457,11 @@ async function reserveDurableReviewSlot(
 				headSha,
 				pendingOrdinal: reservation.ordinal,
 			});
+			noteSkip(
+				ctx,
+				`Another review of pull request #${prNumber} is still pending, so head '${headSha}' ` +
+					'is not reviewed until that one settles.',
+			);
 			return null;
 		}
 		if (reservation.status === 'reused' && reservation.state === 'submitted') {
@@ -1415,6 +1470,10 @@ async function reserveDurableReviewSlot(
 				headSha,
 				ordinal: reservation.ordinal,
 			});
+			noteSkip(
+				ctx,
+				`Pull request #${prNumber} at head '${headSha}' already has a submitted review, so it is not reviewed again.`,
+			);
 			return 'submitted';
 		}
 		if (reservation.status === 'capped') {
@@ -1434,6 +1493,14 @@ async function reserveDurableReviewSlot(
 					supersededCap: REVIEW_SUPERSEDED_CAP,
 				},
 			);
+			noteSkip(
+				ctx,
+				reservation.reason === 'superseded-bound'
+					? `${REVIEW_SUPERSEDED_CAP} reviews of pull request #${prNumber} have already been ` +
+							'superseded by a new head, so SWARM stops reviewing it automatically (safety cap) — it needs a human.'
+					: `Pull request #${prNumber} has already used every permitted review verdict ` +
+							`(${REVIEW_VERDICT_CAP}), so SWARM stops reviewing it automatically (safety cap) — it needs a human.`,
+			);
 			return null;
 		}
 		logger.debug('review: reserved durable review-verdict slot', {
@@ -1445,11 +1512,17 @@ async function reserveDurableReviewSlot(
 		});
 		return reservation.status;
 	} catch (err) {
+		const error = err instanceof Error ? err.message : String(err);
 		logger.error('review: failed to reserve review-verdict slot — failing closed', {
 			prNumber,
 			headSha,
-			error: err instanceof Error ? err.message : String(err),
+			error,
 		});
+		noteSkip(
+			ctx,
+			`SWARM could not reserve a review of pull request #${prNumber} at head '${headSha}' in its ` +
+				`review-verdict ledger (${error}), so it did not start one.`,
+		);
 		return null;
 	}
 }
@@ -1472,7 +1545,7 @@ function validateReviewEvent(ctx: TriggerContext): {
 	if (ctx.source !== 'scm') return null;
 	const { event, project } = ctx;
 
-	if (event.kind === 'pull-request' && isDispositionDisabled(project, { kind: 'review' })) {
+	if (event.kind === 'pull-request' && isDispositionDisabled(ctx, { kind: 'review' })) {
 		return null;
 	}
 
@@ -1483,6 +1556,10 @@ function validateReviewEvent(ctx: TriggerContext): {
 		logger.debug('review: event carries no PR number — skipping', {
 			eventKind: event.kind,
 		});
+		noteSkip(
+			ctx,
+			'The event this run re-evaluates names no pull request, so there is nothing to act on.',
+		);
 		return null;
 	}
 
@@ -1493,6 +1570,10 @@ function validateReviewEvent(ctx: TriggerContext): {
 			prNumber,
 			eventKind: event.kind,
 		});
+		noteSkip(
+			ctx,
+			`The event for pull request #${prNumber} names no head commit, so there is nothing to pin the phase to.`,
+		);
 		return null;
 	}
 
@@ -1648,6 +1729,12 @@ async function reportBaseBlockedPullRequest(
 		baseHeadSha,
 		sharedChecks,
 	});
+	noteSkip(
+		ctx,
+		`The checks failing on pull request #${prNumber} at head '${headSha}' are failing on its base ` +
+			`branch \`${baseBranch}\` too (${sharedChecks.map((name) => `\`${name}\``).join(', ')}), so SWARM attributes them to the ` +
+			'base and dispatched no CI fix. A fresh run of those checks once the base is green clears it.',
+	);
 
 	try {
 		// Reviewer, the persona `readBaseBranchHealth` just read the base with and the
@@ -1753,6 +1840,12 @@ async function checkMergeabilityAndConflicts(
 			isDraft: event.isDraft,
 			isCrossRepo: event.isCrossRepo,
 		});
+		noteSkip(
+			ctx,
+			event.isDraft
+				? `Pull request #${prNumber} is a draft, and SWARM does not act on a draft.`
+				: `Pull request #${prNumber} comes from a fork, whose head commit SWARM cannot fetch.`,
+		);
 		return null;
 	}
 
@@ -1780,6 +1873,7 @@ async function checkMergeabilityAndConflicts(
 
 	if (!prDetails) {
 		logger.debug('review: PR details not found — skipping', { prNumber });
+		noteSkip(ctx, `Pull request #${prNumber} was not found on the source-control provider.`);
 		return null;
 	}
 
@@ -1799,6 +1893,7 @@ async function checkMergeabilityAndConflicts(
 			headSha,
 			eventKind: event.kind,
 		});
+		noteSkip(ctx, `Pull request #${prNumber} is closed, so there is nothing left to act on.`);
 		return null;
 	}
 
@@ -1822,6 +1917,7 @@ async function checkMergeabilityAndConflicts(
 	}
 	if (!isSwarm.managed) {
 		logOwnershipSkip(project.id, prNumber, prDetails.headBranch, prDetails.authorLogin, isSwarm);
+		noteSkip(ctx, describeUnmanagedPullRequest(prNumber, prDetails.headBranch, isSwarm));
 		return null;
 	}
 
@@ -2048,7 +2144,7 @@ export function createReviewTrigger(): TriggerHandler {
 			const disposition = await resolveDisposition(ctx, prNumber, headSha, mergeCheck.baseBranch);
 			if (disposition.kind === 'none') return null;
 			await wakeMergeWaitingOnHead(ctx, disposition, headSha);
-			if (isDispositionDisabled(project, disposition, prNumber, headSha)) return null;
+			if (isDispositionDisabled(ctx, disposition, prNumber, headSha)) return null;
 
 			// A red the base branch already explains (issue #873) is reported and
 			// dropped here — deliberately *before* the PR+SHA dedup claim below, and so
@@ -2107,7 +2203,7 @@ export function createReviewTrigger(): TriggerHandler {
 				return dispatchRespondToCi(ctx, prNumber, headSha, disposition.failedChecks);
 			}
 
-			const slot = await reserveDurableReviewSlot(ctx.project, prNumber, headSha, ctx.dispatchId);
+			const slot = await reserveDurableReviewSlot(ctx, prNumber, headSha);
 			if (slot === 'submitted') {
 				return actOnReviewedHead(ctx, disposition, prNumber, headSha);
 			}

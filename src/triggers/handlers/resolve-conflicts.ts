@@ -22,8 +22,13 @@ import type { MergeCatchUpRequest } from '../../queue/jobs.js';
 import type { ScmEvent } from '../../scm/events.js';
 import { SWARM_GENERATED_FOOTER } from '../../scm/swarm-origin.js';
 import type { PullRequestDetails } from '../../scm/types.js';
+import { noteSkip } from '../decline.js';
 import { buildConflictResolutionKey, claimConflictResolution } from '../resolve-conflicts-dedup.js';
-import { resolveSwarmManagedPr, type SwarmManagedPrResult } from '../swarm-managed-pr.js';
+import {
+	describeUnmanagedPullRequest,
+	resolveSwarmManagedPr,
+	type SwarmManagedPrResult,
+} from '../swarm-managed-pr.js';
 import type { ScmTriggerContext, TriggerHandler, TriggerResult } from '../types.js';
 
 const TRIGGER_NAME = 'resolve-conflicts';
@@ -66,7 +71,13 @@ export function createResolveConflictsTrigger(): TriggerHandler {
 		async handle(ctx): Promise<TriggerResult | null> {
 			if (ctx.source !== 'scm') return null;
 			if (ctx.mergeCatchUp) return checkCatchUp(ctx, ctx.mergeCatchUp);
-			if (!ctx.event.baseBranch) return null;
+			if (!ctx.event.baseBranch) {
+				noteSkip(
+					ctx,
+					'The merged pull request event names no base branch, so there is nothing to check for conflicts.',
+				);
+				return null;
+			}
 			const candidates = await ctx.scm.listConflictCandidates(ctx.project, ctx.event.baseBranch);
 
 			if (!ctx.event.conflictPrNumber) {
@@ -75,7 +86,12 @@ export function createResolveConflictsTrigger(): TriggerHandler {
 			}
 
 			const candidate = candidates.find((pr) => String(pr.number) === ctx.event.conflictPrNumber);
-			return candidate ? checkCandidate(ctx, candidate) : null;
+			if (candidate) return checkCandidate(ctx, candidate);
+			noteSkip(
+				ctx,
+				`Pull request #${ctx.event.conflictPrNumber} is no longer open against \`${ctx.event.baseBranch}\`, so there is no conflict to resolve.`,
+			);
+			return null;
 		},
 	};
 }
@@ -97,6 +113,7 @@ async function checkCandidate(
 	}
 	if (!owned.managed) {
 		logOwnershipSkip(candidate, owned);
+		noteSkip(ctx, describeUnmanagedPullRequest(candidate.number, candidate.headBranch, owned));
 		return null;
 	}
 
@@ -104,7 +121,13 @@ async function checkCandidate(
 		await deferUnknownMergeability(ctx, candidate.number);
 		return null;
 	}
-	if (candidate.mergeable) return null;
+	if (candidate.mergeable) {
+		noteSkip(
+			ctx,
+			`Pull request #${candidate.number} does not conflict with its base branch \`${candidate.baseBranch}\`, so there is nothing to resolve.`,
+		);
+		return null;
+	}
 
 	const stateKey = buildConflictResolutionKey(
 		ctx.project.repo,
@@ -150,7 +173,10 @@ async function checkCatchUp(
 	request: MergeCatchUpRequest,
 ): Promise<TriggerResult | null> {
 	const prNumber = ctx.event.workItemId;
-	if (!prNumber) return null;
+	if (!prNumber) {
+		noteSkip(ctx, 'The merge catch-up event names no pull request, so there is nothing to update.');
+		return null;
+	}
 	const pr = await ctx.scm.getPullRequest(ctx.project, Number(prNumber), 'reviewer');
 	if (pr.state !== 'open') {
 		logger.info(
@@ -160,6 +186,7 @@ async function checkCatchUp(
 				reviewRunId: request.reviewRunId,
 			},
 		);
+		noteSkip(ctx, `Pull request #${prNumber} is closed, so its branch is not brought up to date.`);
 		return null;
 	}
 	const stateKey = buildConflictResolutionKey(
@@ -188,13 +215,24 @@ async function checkCatchUp(
 }
 
 async function deferUnknownMergeability(ctx: ScmTriggerContext, prNumber: number): Promise<void> {
-	if ((ctx.recheckAttempt ?? 0) < MAX_RECHECKS) {
+	const attempt = ctx.recheckAttempt ?? 0;
+	if (attempt < MAX_RECHECKS) {
 		await scheduleCandidate(ctx, String(prNumber), RECHECK_DELAY_MS, 'mergeability');
+		noteSkip(
+			ctx,
+			`The source-control provider has not yet reported whether pull request #${prNumber} is ` +
+				`mergeable. SWARM re-checks in ${RECHECK_DELAY_MS / 1000}s (attempt ${attempt + 1} of ${MAX_RECHECKS}).`,
+		);
 		return;
 	}
 	logger.warn('resolve-conflicts: mergeability remained unknown; manual intervention required', {
 		prNumber,
 	});
+	noteSkip(
+		ctx,
+		`The source-control provider never reported whether pull request #${prNumber} is mergeable ` +
+			`after ${MAX_RECHECKS} re-checks, so SWARM stopped checking it for conflicts — inspect it by hand.`,
+	);
 	await scmCommentUnknownMergeability(ctx, prNumber);
 }
 
@@ -256,14 +294,25 @@ async function fanOutCandidates(
  * declining to answer, which this is not).
  */
 async function deferUnresolvedOwnership(ctx: ScmTriggerContext, prNumber: number): Promise<void> {
-	if ((ctx.recheckAttempt ?? 0) < MAX_RECHECKS) {
+	const attempt = ctx.recheckAttempt ?? 0;
+	if (attempt < MAX_RECHECKS) {
 		await scheduleCandidate(ctx, String(prNumber), RECHECK_DELAY_MS, 'read-failed');
+		noteSkip(
+			ctx,
+			`SWARM's run history could not confirm pull request #${prNumber} is one SWARM implemented ` +
+				`(the lookup failed). SWARM re-checks in ${RECHECK_DELAY_MS / 1000}s (attempt ${attempt + 1} of ${MAX_RECHECKS}).`,
+		);
 		return;
 	}
 	logger.warn('resolve-conflicts: PR ownership stayed unresolved; giving up', {
 		prNumber,
 		attempts: ctx.recheckAttempt,
 	});
+	noteSkip(
+		ctx,
+		`SWARM's run history never confirmed pull request #${prNumber} is one SWARM implemented ` +
+			`after ${MAX_RECHECKS} re-checks, so SWARM stopped checking it for conflicts.`,
+	);
 }
 
 /** `authorLogin` is carried for diagnostics only — it is never a gate. */

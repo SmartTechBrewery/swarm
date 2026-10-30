@@ -595,6 +595,8 @@ vi.mock('@/db/repositories/runsRepository.js', () => ({
 		findStoredTaskBranch(projectId, repository, taskId),
 	findStoredCommitSubject: (projectId: string, repository: string, taskId: string) =>
 		findStoredCommitSubject(projectId, repository, taskId),
+	// No recorded task branch (issue #1247): the automation-label gate decodes the PR branch.
+	findTaskIdForStoredTaskBranch: async () => undefined,
 	hasCompletedRunForTask: (projectId: string, taskId: string, phase: string) =>
 		hasCompletedRunForTask(projectId, taskId, phase),
 	isRetryPendingStatus: (status: string) => status === 'deferred' || status === 'checkpointed',
@@ -971,6 +973,27 @@ function registryDeferringToRecheck() {
 		matches: () => true,
 		handle: async (ctx) => {
 			ctx.noteDecline?.({ kind: 'recheck-scheduled', reason: RECHECK_REASON, retryAfterSec: 30 });
+			return null;
+		},
+	});
+	return registry;
+}
+
+const SKIP_REASON =
+	"The head branch `issue-VT-1538` of pull request #17 is not a SWARM task branch under this repository's branch naming.";
+
+/**
+ * A registry whose single handler skips *and says why* — the shape every SCM
+ * handler's ordinary skip path produces since issue #1248.
+ */
+function registryDecliningWithSkip() {
+	const registry = createTriggerRegistry();
+	registry.register({
+		name: 'test-trigger',
+		description: 'skips for a reason it names',
+		matches: () => true,
+		handle: async (ctx) => {
+			ctx.noteDecline?.({ kind: 'skipped', reason: SKIP_REASON });
 			return null;
 		},
 	});
@@ -1796,6 +1819,52 @@ describe('processJob', () => {
 					status: 'failed',
 					error: expect.stringContaining('disposition changed or was disabled'),
 				});
+			});
+		});
+
+		// Issue #1248: a retried run the handler skipped for an ordinary reason — the
+		// pull request closed, its head branch no longer recognised — was reported as a
+		// changed disposition. The run now carries the handler's own sentence.
+		describe('a skip the handler named is reported as the run outcome (issue #1248)', () => {
+			const retried = () =>
+				createMockScmWebhookJob({
+					runId: 'run-123',
+					event: createMockScmEvent({ headSha: 'deadbeef' }),
+				});
+
+			it("fails the carried run with the handler's reason instead of the generic wording", async () => {
+				claimDispatchWithPhase('review');
+
+				const outcome = await processJob(retried(), registryDecliningWithSkip());
+
+				expect(outcome).toEqual({ status: 'no-trigger' });
+				expect(completeRun).toHaveBeenCalledExactlyOnceWith('run-123', {
+					status: 'failed',
+					error: SKIP_REASON,
+				});
+				expect(completeDispatch).toHaveBeenCalledWith('dispatch-1', 'no-trigger');
+				expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+			});
+
+			// Unlike a claim collision, a skip is this dispatch's own decision, so what
+			// it claimed is handed back exactly as for an unnamed decline.
+			it('still hands back what this dispatch claimed', async () => {
+				claimDispatchWithPhase('review');
+
+				await processJob(retried(), registryDecliningWithSkip());
+
+				expect(releaseReviewDispatch).toHaveBeenCalledWith(`${PROJECT.repo}:17:deadbeef`);
+				expect(abandonReviewVerdict).toHaveBeenCalledOnce();
+			});
+
+			it('touches no run for a fresh delivery that skips', async () => {
+				await processJob(
+					createMockScmWebhookJob({ event: createMockScmEvent({ headSha: 'deadbeef' }) }),
+					registryDecliningWithSkip(),
+				);
+
+				expect(completeRun).not.toHaveBeenCalled();
+				expect(completeDispatch).toHaveBeenCalledWith('dispatch-1', 'no-trigger');
 			});
 		});
 

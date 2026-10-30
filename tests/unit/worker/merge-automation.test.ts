@@ -61,6 +61,8 @@ vi.mock('@/db/repositories/runsRepository.js', () => ({
 	updateReviewMergeOutcome: (runId: string, input: unknown) =>
 		updateReviewMergeOutcome(runId, input),
 	markReviewRunSuperseded: (runId: string) => markReviewRunSuperseded(runId),
+	// No recorded task branch (issue #1247): the own-task settle decodes the head branch.
+	findTaskIdForStoredTaskBranch: async () => undefined,
 }));
 
 // The review-verdict ledger's superseded stamp (issue #1079). Mocked for the same

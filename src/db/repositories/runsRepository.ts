@@ -1416,6 +1416,40 @@ export async function findStoredTaskBranch(
 }
 
 /**
+ * The task whose Implementation stored `branch` as its task branch (issue #1247) — the
+ * reverse of {@link findStoredTaskBranch}, so a pull request keeps resolving to the task
+ * SWARM opened it for whatever happens to the repository's branch naming afterwards.
+ * Repository-scoped like the forward read (issue #1108). Newest run first.
+ *
+ * `undefined` when no Implementation run of this repository stored that name — a branch
+ * SWARM never decided, or one whose every run predates issue #1241.
+ */
+export async function findTaskIdForStoredTaskBranch(
+	projectId: string,
+	repository: string,
+	branch: string,
+): Promise<string | undefined> {
+	// The key is a literal for the same reason as in `findStoredImplementationValue`;
+	// the branch itself stays a bound parameter.
+	const field = sql.raw(`'taskBranch'`);
+	const rows = await getDb()
+		.select({ taskId: runs.taskId })
+		.from(runs)
+		.where(
+			and(
+				eq(runs.projectId, projectId),
+				eq(runs.repository, repository),
+				eq(runs.phase, 'implementation'),
+				isNotNull(runs.taskId),
+				sql`${runs.jobPayload} ->> ${field} = ${branch}`,
+			),
+		)
+		.orderBy(desc(runs.startedAt))
+		.limit(1);
+	return rows[0]?.taskId ?? undefined;
+}
+
+/**
  * The commit subject Implementation last decided for this project task (issue #1242) —
  * the `commitSubject` its newest run carrying one stored on its job payload. Decided
  * once and kept exactly like {@link findStoredTaskBranch}'s branch: a later attempt

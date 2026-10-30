@@ -1,7 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { findStoredCommitSubject } = vi.hoisted(() => ({ findStoredCommitSubject: vi.fn() }));
-vi.mock('@/db/repositories/runsRepository.js', () => ({ findStoredCommitSubject }));
+const { findStoredCommitSubject, findTaskIdForStoredTaskBranch } = vi.hoisted(() => ({
+	findStoredCommitSubject: vi.fn(),
+	findTaskIdForStoredTaskBranch: vi.fn(),
+}));
+vi.mock('@/db/repositories/runsRepository.js', () => ({
+	findStoredCommitSubject,
+	findTaskIdForStoredTaskBranch,
+}));
 
 import { resolveCommitSubjectForPrBranch } from '@/dispatch/commit-subject.js';
 import { createMockProjectConfig } from '../../helpers/factories.js';
@@ -19,6 +25,28 @@ describe('resolveCommitSubjectForPrBranch', () => {
 
 	beforeEach(() => {
 		findStoredCommitSubject.mockReset();
+		findTaskIdForStoredTaskBranch.mockReset();
+		findTaskIdForStoredTaskBranch.mockResolvedValue(undefined);
+	});
+
+	// Issue #1247: a branch the pattern no longer decodes still names its task by record.
+	it('looks the subject up by the task that recorded the branch, after the pattern changed', async () => {
+		findTaskIdForStoredTaskBranch.mockResolvedValue('VT-1538');
+		findStoredCommitSubject.mockResolvedValue('VT-1538 Add the starting page');
+		const changed = createMockProjectConfig({
+			...project,
+			branchPrefix: '',
+			branchPattern: '{work_type}/{issue_key}/{friendly_name}',
+		});
+
+		await expect(resolveCommitSubjectForPrBranch(changed, 'issue-VT-1538')).resolves.toBe(
+			'VT-1538 Add the starting page',
+		);
+		expect(findStoredCommitSubject).toHaveBeenCalledWith(
+			'proj-1',
+			'org/kuchnia-vikinga',
+			'VT-1538',
+		);
 	});
 
 	it('looks the subject up by the task the PR branch encodes, in this repository', async () => {
