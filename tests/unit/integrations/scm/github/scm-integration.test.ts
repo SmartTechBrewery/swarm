@@ -31,6 +31,7 @@ vi.mock('@/integrations/scm/github/client.js', () => ({
 	isBaseContainedInHead: vi.fn(),
 	isContainedInBranch: vi.fn(),
 	mergePullRequestDirect: vi.fn(),
+	readGitHubPullRequestContext: vi.fn(),
 	rerunFailedWorkflowRuns: vi.fn(),
 	updatePullRequestBranchDirect: vi.fn(),
 }));
@@ -47,6 +48,7 @@ import {
 	isBaseContainedInHead,
 	isContainedInBranch,
 	mergePullRequestDirect,
+	readGitHubPullRequestContext,
 	rerunFailedWorkflowRuns,
 	updatePullRequestBranchDirect,
 	withGitHubToken,
@@ -1092,6 +1094,20 @@ describe('GitHubSCMIntegration', () => {
 				name: 'swarm-implementer',
 				email: 'swarm-implementer@users.noreply.github.com',
 			});
+		});
+
+		it('reads the pull request context under the persona token (issue #1239)', async () => {
+			vi.mocked(getPersonaToken).mockResolvedValue('tok-reviewer');
+			vi.mocked(getGitHubUserForToken).mockResolvedValue('swarm-reviewer');
+			vi.mocked(readGitHubPullRequestContext).mockResolvedValue({
+				number: 7,
+			} as Awaited<ReturnType<typeof readGitHubPullRequestContext>>);
+			const delivery = await scm.deliveryProvider(project, 'reviewer');
+
+			await expect(delivery.readPullRequestContext(7)).resolves.toEqual({ number: 7 });
+
+			expect(readGitHubPullRequestContext).toHaveBeenCalledWith('SmartTechBrewery', 'swarm', 7);
+			expect(vi.mocked(withGitHubToken).mock.calls.at(-1)?.[0]).toBe('tok-reviewer');
 		});
 
 		it('bypasses interactive git hooks when pushing a worker-owned delivery', async () => {

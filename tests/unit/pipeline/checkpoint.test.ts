@@ -977,9 +977,9 @@ describe.each(IMPLEMENTER_BUILDERS)('$name prompt asks for a checkpoint', ({ nam
 describe('phases that deliberately do not write a checkpoint', () => {
 	it('planning and review never mention it', () => {
 		expect(buildPlanningPrompt(createMockWorkItem(), false)).not.toContain(CHECKPOINT_FILENAME);
-		expect(buildReviewPrompt({ repo: 'o/r', prNumber: '7', headSha: 'abc123' })).not.toContain(
-			CHECKPOINT_FILENAME,
-		);
+		expect(
+			buildReviewPrompt({ repo: 'o/r', prNumber: '7', headSha: 'abc123', baseBranch: 'main' }),
+		).not.toContain(CHECKPOINT_FILENAME);
 	});
 });
 

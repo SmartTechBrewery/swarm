@@ -7,6 +7,14 @@
  * and have it submit a formal GitHub PR review — mirroring Cascade's
  * review-agent trigger on `check_suite` success.
  *
+ * The agent reads the pull request through SWARM, not through a provider CLI
+ * (issue #1239): before it starts, the phase reads the PR and its discussion
+ * through the delivery seam's provider-neutral `readPullRequestContext` and
+ * writes it to `swarm_pull_request.md` at the worktree root, and the prompt has
+ * it read the diff locally with `git diff origin/<base>...HEAD`. A pull request
+ * the provider cannot (or does not yet) let SWARM read fails the run before the
+ * agent starts, naming that cause.
+ *
  * The review must be a *formal* review (`gh pr review`), not a plain comment:
  * the Respond-to-review phase (SWARM-21) is driven by the
  * `pull_request_review` webhook that only a submitted review emits, and its
@@ -100,6 +108,7 @@ import {
 	type ScmDeliveryProvider,
 	saveDeliveryProgress,
 } from '@/scm/delivery.js';
+import { type PullRequestContext, writePullRequestContext } from '@/scm/pull-request-context.js';
 import { GitWorktreeManager } from '@/worker/git-worktree-manager.js';
 import { graftEnvironment } from '@/worktree/graft.js';
 
@@ -328,6 +337,39 @@ interface ReviewAgentRunParams {
 	signal?: AbortSignal;
 	runAgent: (opts: Parameters<typeof runAgentCli>[0]) => Promise<AgentCliResult>;
 	getPriorSubmittedReview: ReviewVerdictLedger['getPriorSubmittedReview'];
+	/** Reads the pull request the agent is handed ({@link stagePullRequestContext}). */
+	delivery: ScmDeliveryProvider;
+}
+
+/**
+ * Read the pull request through the delivery seam and write it where the prompt
+ * tells the agent to look (issue #1239). A read that fails — including a
+ * provider that does not yet support it — becomes the run's failure reason,
+ * naming the pull request, the repository and the provider, instead of the
+ * agent failing later for want of something to read.
+ *
+ * The write sits outside the `try` on purpose: a local filesystem error is not
+ * "could not read from the provider".
+ */
+async function stagePullRequestContext(params: {
+	delivery: ScmDeliveryProvider;
+	project: ProjectConfig;
+	repository: string;
+	prNumber: string;
+	worktreePath: string;
+}): Promise<PullRequestContext> {
+	let context: PullRequestContext;
+	try {
+		context = await params.delivery.readPullRequestContext(Number(params.prNumber));
+	} catch (error) {
+		const cause = error instanceof Error ? error.message : String(error);
+		throw new Error(
+			`Review could not read pull request #${params.prNumber} in ${params.repository} from SCM provider '${params.project.scm ?? 'unset'}': ${cause}`,
+			{ cause: error },
+		);
+	}
+	writePullRequestContext(params.worktreePath, context);
+	return context;
 }
 
 /**
@@ -364,6 +406,7 @@ async function produceReviewAgentResult(
 		signal,
 		runAgent,
 		getPriorSubmittedReview,
+		delivery,
 	} = params;
 
 	// Read-only, and the current head is excluded, so this can't mistake the run's
@@ -394,15 +437,31 @@ async function produceReviewAgentResult(
 		});
 	}
 
+	// Only a run that starts an agent reads the pull request: a resumed delivery
+	// (above) has nothing left to hand one.
+	const context = await stagePullRequestContext({
+		delivery,
+		project,
+		repository,
+		prNumber,
+		worktreePath,
+	});
 	const agent = await runAgent({
 		cli,
 		model,
 		reasoning,
 		...sessionRunArgs({ sessionId, resumeSessionId }, resumed),
 		cwd: worktreePath,
-		args: [buildReviewPrompt({ repo: repository, prNumber, headSha }, customPrompt, isReReview)],
+		args: [
+			buildReviewPrompt(
+				{ repo: repository, prNumber, headSha, baseBranch: context.baseBranch },
+				customPrompt,
+				isReReview,
+			),
+		],
 		// `gh` reads GH_TOKEN ahead of any ambient `gh auth` login, so every gh
-		// call the agent makes acts as the reviewer persona.
+		// call the agent makes (a linked GitHub issue's read) acts as the reviewer
+		// persona.
 		maxOutputBytes: MAX_AGENT_OUTPUT_BYTES,
 		logContext: { taskId, phase: 'review', prNumber, headSha },
 		timeoutMs,
@@ -694,13 +753,13 @@ async function readReviewSubmission(
 
 /**
  * Run the Review phase for one PR. Resolves the reviewer persona's token,
- * provisions a detached worktree at the PR's head SHA, runs the review agent
- * to read the diff and submit a formal PR review as the reviewer, and
- * validates the verdict it handed back.
+ * provisions a detached worktree at the PR's head SHA, stages the pull request
+ * read through the delivery seam, runs the review agent to read the diff and
+ * verify its findings, and submits the verdict it handed back as the reviewer.
  *
  * Throws if the reviewer token is missing (resolved *before* provisioning —
  * without it the agent could only act as the PR's own author, which GitHub
- * rejects), if the agent exits non-zero, or if it produced no recognizable
+ * rejects), if the pull request cannot be read, if the agent exits non-zero, or if it produced no recognizable
  * verdict — a review run that didn't verifiably submit a review is a failed
  * job, not a soft miss (ai/CODING_STANDARDS.md "Error handling"). The worktree
  * is always removed once provisioned, success or failure; the submitted review
@@ -764,6 +823,11 @@ export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<Re
 	let preserveForResume = false;
 	try {
 		graft(project.repoRoot, handle.path);
+		// Resolved before the agent runs: the agent is handed the pull request read
+		// through it, and the verdict is submitted through it afterwards.
+		const delivery =
+			options.delivery ??
+			(await requireProjectSCMProvider(project).deliveryProvider(project, 'reviewer'));
 
 		const { agent, isReReview, passOrdinal } = await produceReviewAgentResult({
 			shouldResumeDelivery: deliveryResumed,
@@ -785,6 +849,7 @@ export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<Re
 			signal,
 			runAgent,
 			getPriorSubmittedReview,
+			delivery,
 		});
 
 		if (agentRunFailed(agent)) {
@@ -826,9 +891,6 @@ export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<Re
 				runAgent,
 			}),
 		});
-		const delivery =
-			options.delivery ??
-			(await requireProjectSCMProvider(project).deliveryProvider(project, 'reviewer'));
 		// Deliberately still `project.repo`, not the run's `repository`: this is a
 		// resume-idempotency key a preserved worktree's sidecar was written under, so
 		// re-deriving it from a different input would orphan the progress of a run in

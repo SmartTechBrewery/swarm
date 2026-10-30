@@ -20,7 +20,10 @@ import {
 	getScopedAzureDevOpsUser,
 	withAzureDevOpsToken,
 } from './client.js';
-import { findActiveAzureDevOpsPullRequest } from './pull-requests.js';
+import {
+	findActiveAzureDevOpsPullRequest,
+	readAzureDevOpsPullRequestContext,
+} from './pull-requests.js';
 import {
 	createAzureDevOpsPullRequest,
 	postIdempotentAzureDevOpsPullRequestThread,
@@ -135,6 +138,9 @@ export async function createAzureDevOpsDeliveryProvider(
 					deliveryId: input.deliveryId,
 				}),
 			),
+		// A read, so — like `postComment` — not gated on `reviews`.
+		readPullRequestContext: (prNumber) =>
+			scoped(() => readAzureDevOpsPullRequestContext(repo, prNumber)),
 	};
 }
 

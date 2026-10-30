@@ -96,7 +96,14 @@ export function composeSystemPrompt(
 			);
 		case 'review':
 			return buildReviewPrompt(
-				{ repo: project.repo, prNumber: trigger.prNumber, headSha: trigger.headSha },
+				{
+					repo: project.repo,
+					prNumber: trigger.prNumber,
+					headSha: trigger.headSha,
+					// The phase recomposes this with the base branch the pull request
+					// itself reports; the project's base is the trigger-time stand-in.
+					baseBranch: project.baseBranch,
+				},
 				customPrompt,
 			);
 		case 'respond-to-review':

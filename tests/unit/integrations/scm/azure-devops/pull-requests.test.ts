@@ -15,6 +15,7 @@ import {
 	isAzureDevOpsBaseContainedInHead,
 	listActiveAzureDevOpsPullRequestsForBase,
 	listAzureDevOpsPullRequestsForCommit,
+	readAzureDevOpsPullRequestContext,
 	retryFailedAzureDevOpsBuilds,
 } from '@/integrations/scm/azure-devops/pull-requests.js';
 import { logger } from '@/lib/logger.js';
@@ -139,6 +140,103 @@ describe('azure devops pull-request reads', () => {
 			await expect(scoped(() => getAzureDevOpsPullRequest(REPO, 17))).rejects.toBeInstanceOf(
 				AzureDevOpsApiError,
 			);
+		});
+	});
+
+	describe('readAzureDevOpsPullRequestContext (issue #1239)', () => {
+		const threads = [
+			{
+				id: 1,
+				comments: [
+					{
+						content: 'Please add a test.',
+						commentType: 'text',
+						publishedDate: '2026-10-21T08:00:00.000Z',
+						author: { displayName: 'Human Dev', uniqueName: 'human@fabrikam.com' },
+					},
+					{ content: 'removed', commentType: 'text', isDeleted: true },
+					{ content: '', commentType: 'text' },
+				],
+			},
+			{
+				id: 2,
+				comments: [{ content: 'Human Dev voted 10', commentType: 'system' }],
+			},
+			{ id: 3, isDeleted: true, comments: [{ content: 'gone', commentType: 'text' }] },
+			{
+				id: 4,
+				threadContext: { filePath: '/src/a.ts', rightFileStart: { line: 12 } },
+				comments: [
+					{
+						content: 'Off by one here.',
+						commentType: 'text',
+						publishedDate: '2026-10-21T09:00:00.000Z',
+						author: { uniqueName: 'reviewer@fabrikam.com' },
+					},
+				],
+			},
+		];
+
+		it('reads the pull request and its human discussion, in the neutral shape', async () => {
+			routeFetch(fetchMock, [
+				['/pullrequests/17/threads', { value: threads }],
+				[
+					'/pullrequests/17',
+					createMockAzureDevOpsPullRequestResponse({ description: 'Closes VT-1538' }),
+				],
+			]);
+
+			await expect(scoped(() => readAzureDevOpsPullRequestContext(REPO, 17))).resolves.toEqual({
+				number: 17,
+				title: 'Add a thing',
+				description: 'Closes VT-1538',
+				baseBranch: 'main',
+				headBranch: 'swarm/issue-17',
+				url: 'https://dev.azure.com/Fabrikam/Fiber%20Team/_git/Web/pullrequest/17',
+				discussion: [
+					{
+						kind: 'comment',
+						author: 'Human Dev',
+						createdAt: '2026-10-21T08:00:00.000Z',
+						body: 'Please add a test.',
+					},
+					{
+						kind: 'review-comment',
+						path: 'src/a.ts',
+						line: 12,
+						author: 'reviewer@fabrikam.com',
+						createdAt: '2026-10-21T09:00:00.000Z',
+						body: 'Off by one here.',
+					},
+				],
+			});
+			expect(requestedUrls(fetchMock).map((url) => url.pathname)).toEqual(
+				expect.arrayContaining([
+					`${REPO_API}/pullrequests/17`,
+					`${REPO_API}/pullrequests/17/threads`,
+				]),
+			);
+		});
+
+		it('throws when the target branch is missing rather than diffing against a stand-in', async () => {
+			routeFetch(fetchMock, [
+				['/pullrequests/17/threads', { value: [] }],
+				[
+					'/pullrequests/17',
+					createMockAzureDevOpsPullRequestResponse({ targetRefName: undefined }),
+				],
+			]);
+			await expect(scoped(() => readAzureDevOpsPullRequestContext(REPO, 17))).rejects.toThrow(
+				/missing required fields/,
+			);
+		});
+
+		it('propagates an API error', async () => {
+			// Both reads fan out at once, so each gets its own response body.
+			fetchMock.mockImplementation(async () => jsonResponse({ message: 'gone' }, 404));
+			await expect(
+				scoped(() => readAzureDevOpsPullRequestContext(REPO, 17)),
+			).rejects.toBeInstanceOf(AzureDevOpsApiError);
 		});
 	});
 

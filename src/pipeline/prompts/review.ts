@@ -33,6 +33,7 @@ import { GH_IDENTITY_GUARD } from '@/pipeline/agent-auth.js';
 import { pipelinePhaseGuard } from '@/pipeline/agent-scope.js';
 import { projectInstructionsSection } from '@/pipeline/prompts/custom-prompt.js';
 import { HANDOFF_FILENAMES } from '@/scm/delivery.js';
+import { PULL_REQUEST_CONTEXT_FILENAME } from '@/scm/pull-request-context.js';
 
 /** The hand-off file the reviewer writes with its verdict (the phase's delivery contract). */
 const REVIEW_VERDICT_FILENAME = HANDOFF_FILENAMES.review;
@@ -41,7 +42,19 @@ interface ReviewPromptContext {
 	repo: string;
 	prNumber: string;
 	headSha: string;
+	/** The pull request's base branch, as the provider reported it — what the local diff is taken against. */
+	baseBranch: string;
 }
+
+/**
+ * Where the agent reads the pull request (issue #1239): the file SWARM rendered
+ * from the source-control provider before the run, never a provider CLI — which
+ * only one provider answers.
+ */
+const PR_CONTEXT_SOURCE = `"${PULL_REQUEST_CONTEXT_FILENAME}" at the root of this worktree, which SWARM wrote from the source-control provider just before this run (title, description, base/head branch, URL, and every comment and review so far)`;
+
+/** How a linked issue is read: only the way that file says, since not every provider offers one. */
+const LINKED_ISSUE_READ = `If the description references an issue and "${PULL_REQUEST_CONTEXT_FILENAME}" says how to read one, read it too`;
 
 /**
  * The severity rubric, stated once and shared by both passes. Severity is the
@@ -68,7 +81,7 @@ function handoffContract(isReReview: boolean): readonly string[] {
 		'Every field below states its JSON type. Write exactly that type: a string slot is ONE string even when you have several things to say, and an array slot is an array even when you have one entry.',
 		'  - `verdict`: a string, `approve` or `request-changes`. Those are the only two. It follows mechanically from your severities — any `blocker`/`major` means `request-changes`, otherwise `approve` — and the hand-off is rejected if it disagrees, so the verdict is not a separate judgement call. There is no comment-only or no-opinion verdict: if you could not verify the change at all (a command you needed is blocked, the diff is unreadable), stop and fail rather than submitting a verdict you cannot support.',
 		'  - `summary`: a single string, at most three sentences. What the change does, and what you confirmed about its shape. No praise, and do not restate your findings here.',
-		'  - `verification`: an array of `{command, outcome}` objects, one per command you actually ran; `command` is one command line as a string and `outcome` is `passed` or `failed`. At least one entry is required — the commands you read the PR with count. Report a failing command, and report one that was blocked or unavailable the same way with outcome `failed`: both are evidence, not something to hide. Do not list commands you did not run.',
+		'  - `verification`: an array of `{command, outcome}` objects, one per command you actually ran; `command` is one command line as a string and `outcome` is `passed` or `failed`. At least one entry is required — the `git diff` you read the change with counts. Report a failing command, and report one that was blocked or unavailable the same way with outcome `failed`: both are evidence, not something to hide. Do not list commands you did not run.',
 		"  - `docsChecked`: an array of `{path, status, note?}` objects, one per document THIS repository requires to stay current — its README, plus whatever its own contributor/agent guide (`CLAUDE.md`, `AGENTS.md`, `CONTRIBUTING.md`, or equivalent) says must not go stale. Read that guide to find out; do not assume another project's layout. `path` and the optional `note` are strings; `status` is `accurate`, `updated`, `not-applicable`, or `stale`. Judge every one you identify — `not-applicable` is a real answer when the PR changes nothing that document describes. A `stale` document is itself a defect: also report it in `findings`.",
 		'  - `preExisting`: an array of strings, one per condition you noticed that predates this PR (pre-existing lint warnings, unrelated failures), so they are not charged to it. Empty array if none.',
 		'  - `findings`: an array of finding objects — see below. Empty array when there is nothing to report.',
@@ -93,18 +106,18 @@ function handoffContract(isReReview: boolean): readonly string[] {
  * The numbered instruction block for a PR's **first** review — a full pass over
  * the whole diff, reporting every notable issue with a proposed fix plan.
  */
-function initialReviewInstructions({ repo, prNumber }: ReviewPromptContext): string[] {
+function initialReviewInstructions({ repo, prNumber, baseBranch }: ReviewPromptContext): string[] {
 	return [
 		'Do all of the following, in order:',
-		`1. Read the PR and its discussion: \`gh pr view ${prNumber} --repo ${repo} --comments\`. If the PR body references an issue, read that too (\`gh issue view <n> --repo ${repo} --comments\`) — the issue and any plan posted on it are the ground truth for what was agreed.`,
-		`2. Read the full diff: \`gh pr diff ${prNumber} --repo ${repo}\`. Review ALL changed files, not just the first few.`,
+		`1. Read the PR and its discussion in ${PR_CONTEXT_SOURCE}. ${LINKED_ISSUE_READ} — the issue and any plan posted on it are the ground truth for what was agreed.`,
+		`2. Read the full diff locally: \`git diff origin/${baseBranch}...HEAD\`. Review ALL changed files, not just the first few.`,
 		'3. Verify before claiming: for each candidate finding, trace the exact failing scenario in the surrounding code of this checkout. Only report issues you can demonstrate — do not invent problems, pad the review with praise, or restate personal preferences as defects.',
 		'Use the checked-out code and existing tests for that verification. Do not create disposable repositories or alter Git configuration to reproduce a concern, and never run destructive cleanup commands such as `rm -rf`.',
 		'If an optional command is unavailable or blocked, continue the review with the evidence already available and still write the required hand-off file.',
 		'4. Judge every documentation file this repo requires to stay current, and report a stale one as a finding in its own right.',
 		'5. Assign each finding a severity from the rubric below, then record everything in the hand-off.',
-		`6. If — and only if — the PR body or the issue it closes names a SIBLING task split off from the same work, check whether this diff delivers that task too: read it (\`gh issue view <n> --repo ${repo}\`), check each of its acceptance criteria against this diff, and record it in \`absorbed\` only when every one of them is met here. Otherwise leave \`absorbed\` empty, which is the answer for almost every review.`,
-		'7. Do not submit a review or perform any GitHub mutation. SWARM submits the decision after you exit.',
+		`6. If — and only if — the PR body or the issue it closes names a SIBLING task split off from the same work, check whether this diff delivers that task too: read it the way "${PULL_REQUEST_CONTEXT_FILENAME}" says linked issues are read (when it offers no way, leave \`absorbed\` empty), check each of its acceptance criteria against this diff, and record it in \`absorbed\` only when every one of them is met here. Otherwise leave \`absorbed\` empty, which is the answer for almost every review.`,
+		'7. Do not submit a review or perform any mutation on the pull request. SWARM submits the decision after you exit.',
 		`In particular, do not run \`gh pr review ${prNumber} --repo ${repo}\`, \`--approve\`, \`--request-changes\`, or \`--comment\`. GH_TOKEN is read-only context authentication; do not run gh auth switch.`,
 		'',
 		...SEVERITY_RUBRIC,
@@ -122,7 +135,7 @@ function initialReviewInstructions({ repo, prNumber }: ReviewPromptContext): str
  * burns one of the PR's few permitted verdicts on unrelated work and restarts
  * the change cycle instead of confirming (or correcting) the fix.
  */
-function reReviewInstructions({ repo, prNumber }: ReviewPromptContext): string[] {
+function reReviewInstructions({ repo, prNumber, baseBranch }: ReviewPromptContext): string[] {
 	return [
 		'This PR was already reviewed and the most recent review REQUESTED CHANGES; the',
 		'implementer has since pushed new commits in response. This is a RE-REVIEW, and',
@@ -130,13 +143,13 @@ function reReviewInstructions({ repo, prNumber }: ReviewPromptContext): string[]
 		'implemented correctly. Do NOT broaden the review.',
 		'',
 		'Do all of the following, in order:',
-		`1. Read the PR and its earlier review: \`gh pr view ${prNumber} --repo ${repo} --comments\`. Find the most recent SWARM review that requested changes and list the specific changes it required, with the finding id (\`F1\`, \`F2\`, …) each one carried. If the PR references an issue, read it too (\`gh issue view <n> --repo ${repo} --comments\`) for the agreed ground truth.`,
-		`2. Read the diff: \`gh pr diff ${prNumber} --repo ${repo}\`. For each change the previous review required, trace it in this checkout and decide whether it is now correctly and completely implemented. Use the checked-out code and existing tests as evidence.`,
+		`1. Read the PR and its earlier review in ${PR_CONTEXT_SOURCE}. Find the most recent SWARM review that requested changes — depending on the provider it appears as a review or as a comment — and list the specific changes it required, with the finding id (\`F1\`, \`F2\`, …) each one carried. ${LINKED_ISSUE_READ}, for the agreed ground truth.`,
+		`2. Read the diff locally: \`git diff origin/${baseBranch}...HEAD\`. For each change the previous review required, trace it in this checkout and decide whether it is now correctly and completely implemented. Use the checked-out code and existing tests as evidence.`,
 		'3. STAY IN SCOPE. Do NOT raise new findings for pre-existing issues an earlier review did not flag, even if you notice them now — a re-review must not restart the cycle over problems that were missed earlier. The ONLY issues you may report as new findings are: (a) a previously requested change that is still missing or was implemented incorrectly, or (b) a defect the new commits themselves introduced — a regression in the fix, including a doc the new changes made stale. Everything else is out of scope; leave it for a human.',
 		'4. Verify before claiming: demonstrate each conclusion against the checked-out code and its tests. Do not invent problems or restate personal preferences as defects. Do not create disposable repositories or alter Git configuration to reproduce a concern, and never run destructive cleanup commands such as `rm -rf`. If an optional command is unavailable or blocked, continue with the evidence already available and still write the required hand-off file.',
 		'5. Record what became of every previously requested change in `carried` — including the ones that are now correct, since a resolved item is the result a human most needs to see. Anything you did not mark `resolved` also becomes a finding under its original id, so it carries a severity and a fix plan; that is what keeps the verdict honest about work still outstanding.',
 		'6. Leave `absorbed` empty unless the NEW commits deliver the whole scope of a sibling task split off from the same work. A declaration an earlier pass already made is recorded; you do not need to repeat it.',
-		'7. Do not submit a review or perform any GitHub mutation. SWARM submits the decision after you exit.',
+		'7. Do not submit a review or perform any mutation on the pull request. SWARM submits the decision after you exit.',
 		`In particular, do not run \`gh pr review ${prNumber} --repo ${repo}\`, \`--approve\`, \`--request-changes\`, or \`--comment\`. GH_TOKEN is read-only context authentication; do not run gh auth switch.`,
 		'',
 		...SEVERITY_RUBRIC,
@@ -148,7 +161,8 @@ function reReviewInstructions({ repo, prNumber }: ReviewPromptContext): string[]
 /**
  * Build the prompt handed to the review agent. It's told this is review-only
  * (findings, never fixes — mirroring Cascade's review agent, which is
- * hard-blocked from editing), to read the PR / linked issue / full diff, to
+ * hard-blocked from editing), to read the PR from the file SWARM staged (issue
+ * #1239), any linked issue the way that file says, and the full diff locally, to
  * verify findings against the checkout before reporting them, and to record its
  * verdict and findings as hand-off *fields* that SWARM renders into the posted
  * review (issue #470).
@@ -179,7 +193,7 @@ export function buildReviewPrompt(
 		'yourself.',
 		'',
 		`This worktree is checked out (detached) at ${headSha}, the head commit of PR`,
-		`#${prNumber} in ${repo} on GitHub.`,
+		`#${prNumber} in ${repo}.`,
 		'',
 		...(isReReview ? reReviewInstructions(context) : initialReviewInstructions(context)),
 		'',

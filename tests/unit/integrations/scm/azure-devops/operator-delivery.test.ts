@@ -20,6 +20,7 @@ const {
 	createAzureDevOpsPullRequest,
 	postIdempotentAzureDevOpsPullRequestThread,
 	submitAzureDevOpsReview,
+	readAzureDevOpsPullRequestContext,
 } = vi.hoisted(() => ({
 	withAzureDevOpsToken: vi.fn(<T>(_token: string, fn: () => Promise<T>) => fn()),
 	getScopedAzureDevOpsUser:
@@ -34,6 +35,7 @@ const {
 	createAzureDevOpsPullRequest: vi.fn(async () => ({ number: 8, url: 'https://x/pr/8' })),
 	postIdempotentAzureDevOpsPullRequestThread: vi.fn(async () => 4242),
 	submitAzureDevOpsReview: vi.fn(async () => 99),
+	readAzureDevOpsPullRequestContext: vi.fn(async () => ({ number: 7 })),
 }));
 
 vi.mock('@/integrations/scm/azure-devops/client.js', async (importOriginal) => ({
@@ -43,6 +45,7 @@ vi.mock('@/integrations/scm/azure-devops/client.js', async (importOriginal) => (
 }));
 vi.mock('@/integrations/scm/azure-devops/pull-requests.js', () => ({
 	findActiveAzureDevOpsPullRequest,
+	readAzureDevOpsPullRequestContext,
 }));
 vi.mock('@/integrations/scm/azure-devops/writes.js', () => ({
 	createAzureDevOpsPullRequest,
@@ -162,5 +165,24 @@ describe('azure devops delivery providers', () => {
 			reviewerId: 'guid-operator',
 		});
 		expect(withAzureDevOpsToken.mock.calls.at(-1)?.[0]).toBe('reviewer-pat');
+	});
+
+	// A read, so neither provider gates it on `reviews` (issue #1239).
+	it.each([
+		[
+			'the operator provider',
+			() => createAzureDevOpsOperatorDeliveryProvider(REPO, CREDENTIAL),
+			CREDENTIAL,
+		],
+		[
+			'a per-persona provider',
+			() => createAzureDevOpsDeliveryProvider(REPO, 'reviewer-pat', { reviews: true }),
+			'reviewer-pat',
+		],
+	])('reads the pull request context under %s’s PAT', async (_label, build, pat) => {
+		const delivery = await build();
+		await expect(delivery.readPullRequestContext(7)).resolves.toEqual({ number: 7 });
+		expect(readAzureDevOpsPullRequestContext).toHaveBeenLastCalledWith(REPO, 7);
+		expect(withAzureDevOpsToken.mock.calls.at(-1)?.[0]).toBe(pat);
 	});
 });

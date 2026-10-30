@@ -19,6 +19,9 @@ const reposGetBranch = vi.fn();
 const reposGet = vi.fn();
 const reposGetCommit = vi.fn();
 const compareCommitsWithBasehead = vi.fn();
+const listReviews = vi.fn();
+const listReviewComments = vi.fn();
+const listIssueComments = vi.fn();
 const paginate = vi.fn();
 const graphql = vi.fn();
 
@@ -27,7 +30,8 @@ vi.mock('@octokit/rest', () => ({
 		auth: unknown;
 		users = { getAuthenticated };
 		actions = { listWorkflowRunsForRepo, listJobsForWorkflowRun, reRunWorkflowFailedJobs };
-		pulls = { get: pullsGet, merge: pullsMerge };
+		pulls = { get: pullsGet, merge: pullsMerge, listReviews, listReviewComments };
+		issues = { listComments: listIssueComments };
 		repos = {
 			listPullRequestsAssociatedWithCommit,
 			get: reposGet,
@@ -58,6 +62,7 @@ import {
 	isContainedInBranch,
 	listPullRequestsForCommit,
 	mergePullRequestDirect,
+	readGitHubPullRequestContext,
 	rerunFailedWorkflowRuns,
 	withGitHubToken,
 } from '@/integrations/scm/github/client.js';
@@ -654,6 +659,130 @@ describe('github client', () => {
 					mergePullRequestDirect('jkwiecien', 'swarm', 42, 'reviewed-head'),
 				),
 			).rejects.toThrow(/not mergeable/);
+		});
+	});
+
+	describe('readGitHubPullRequestContext (issue #1239)', () => {
+		function stubDiscussion(data: {
+			comments?: unknown[];
+			reviews?: unknown[];
+			reviewComments?: unknown[];
+		}): void {
+			paginate.mockImplementation(async (endpoint: unknown) => {
+				if (endpoint === listIssueComments) return data.comments ?? [];
+				if (endpoint === listReviews) return data.reviews ?? [];
+				if (endpoint === listReviewComments) return data.reviewComments ?? [];
+				throw new Error('unexpected endpoint');
+			});
+		}
+
+		beforeEach(() => {
+			pullsGet.mockResolvedValue({
+				data: {
+					number: 42,
+					title: 'Add the widget',
+					body: null,
+					base: { ref: 'main' },
+					head: { ref: 'issue-17' },
+					html_url: 'https://github.com/jkwiecien/swarm/pull/42',
+				},
+			});
+		});
+
+		it('maps the pull request, with a null body read as an empty description', async () => {
+			stubDiscussion({});
+			const context = await withGitHubToken('tok', () =>
+				readGitHubPullRequestContext('jkwiecien', 'swarm', 42),
+			);
+			expect(context).toMatchObject({
+				number: 42,
+				title: 'Add the widget',
+				description: '',
+				baseBranch: 'main',
+				headBranch: 'issue-17',
+				url: 'https://github.com/jkwiecien/swarm/pull/42',
+				discussion: [],
+			});
+			expect(pullsGet).toHaveBeenCalledWith({ owner: 'jkwiecien', repo: 'swarm', pull_number: 42 });
+			expect(paginate).toHaveBeenCalledWith(listIssueComments, {
+				owner: 'jkwiecien',
+				repo: 'swarm',
+				issue_number: 42,
+				per_page: 100,
+			});
+		});
+
+		it('reads comments, submitted reviews and review comments, skipping drafts and empty containers', async () => {
+			stubDiscussion({
+				comments: [{ user: { login: 'human' }, created_at: '2026-01-01T00:00:00Z', body: 'Hi' }],
+				reviews: [
+					{
+						user: { login: 'bot' },
+						submitted_at: '2026-01-02T00:00:00Z',
+						body: 'F1: fix it',
+						state: 'CHANGES_REQUESTED',
+					},
+					{ user: { login: 'bot' }, body: 'draft', state: 'PENDING' },
+					{
+						user: { login: 'human' },
+						submitted_at: '2026-01-03T00:00:00Z',
+						body: '',
+						state: 'COMMENTED',
+					},
+					{
+						user: { login: 'human' },
+						submitted_at: '2026-01-04T00:00:00Z',
+						body: '',
+						state: 'APPROVED',
+					},
+				],
+				reviewComments: [
+					{
+						user: { login: 'human' },
+						created_at: '2026-01-03T00:00:00Z',
+						body: 'nit',
+						path: 'src/a.ts',
+						line: null,
+						original_line: 7,
+					},
+				],
+			});
+			const { discussion } = await withGitHubToken('tok', () =>
+				readGitHubPullRequestContext('jkwiecien', 'swarm', 42),
+			);
+			expect(discussion).toEqual([
+				{ kind: 'comment', author: 'human', createdAt: '2026-01-01T00:00:00Z', body: 'Hi' },
+				{
+					kind: 'review',
+					author: 'bot',
+					createdAt: '2026-01-02T00:00:00Z',
+					body: 'F1: fix it',
+					reviewState: 'changes-requested',
+				},
+				{
+					kind: 'review',
+					author: 'human',
+					createdAt: '2026-01-04T00:00:00Z',
+					body: '',
+					reviewState: 'approved',
+				},
+				{
+					kind: 'review-comment',
+					author: 'human',
+					createdAt: '2026-01-03T00:00:00Z',
+					body: 'nit',
+					path: 'src/a.ts',
+					line: 7,
+				},
+			]);
+		});
+
+		it('keeps the linked-issue read as a gh issue view hint for this repository', async () => {
+			stubDiscussion({});
+			const { issueReadHint } = await withGitHubToken('tok', () =>
+				readGitHubPullRequestContext('jkwiecien', 'swarm', 42),
+			);
+			expect(issueReadHint).toContain('gh issue view <number> --repo jkwiecien/swarm --comments');
 		});
 	});
 });

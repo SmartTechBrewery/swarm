@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { ScmReadUnsupportedError } from '@/scm/pull-request-context.js';
 
 import {
 	createMockGitLabCommitStatusResponse,
@@ -791,6 +792,14 @@ describe('GitLabSCMIntegration', () => {
 				username: 'swarm-impl',
 				email: 'impl@example.com',
 			});
+		});
+
+		it('declares the pull-request context read not yet supported (issue #1239)', async () => {
+			const delivery = await scm.deliveryProvider(project, 'reviewer');
+			await expect(delivery.readPullRequestContext(1)).rejects.toThrow(ScmReadUnsupportedError);
+			await expect(delivery.readPullRequestContext(1)).rejects.toThrow(
+				'not yet supported on GitLab',
+			);
 		});
 
 		it('signs commits with the account username and its exposed email', async () => {

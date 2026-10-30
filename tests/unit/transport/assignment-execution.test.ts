@@ -35,7 +35,11 @@ import type { AssignedPhaseInputs, PhaseRunResult } from '@/worker/consumer.js';
 import type { GitWorktreeManager } from '@/worker/git-worktree-manager.js';
 import { CommitUnavailableError } from '@/worktree/commit-availability.js';
 import { BlockedRecoveryError } from '@/worktree/reclaim.js';
-import { createMockTaskAssignmentInput, createMockWorkItem } from '../../helpers/factories.js';
+import {
+	createMockPullRequestContext,
+	createMockTaskAssignmentInput,
+	createMockWorkItem,
+} from '../../helpers/factories.js';
 
 /** The operator credential the assignment factory puts on every built frame. */
 const OPERATOR_CREDENTIAL = 'operator-credential';
@@ -91,6 +95,7 @@ function stubDelivery(): ScmDeliveryProvider {
 		createPullRequest: vi.fn(async () => ({ number: 1, url: 'u' })),
 		pushBranch: vi.fn(async () => {}),
 		submitReview: vi.fn(async () => 1),
+		readPullRequestContext: vi.fn(async () => createMockPullRequestContext()),
 		postComment: vi.fn(async () => 1),
 	};
 }
