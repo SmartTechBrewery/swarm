@@ -5,10 +5,12 @@
  * It adds no supervision model of its own. On macOS it hands the checkout to
  * `bin/swarm-worker-agent install`, the same LaunchAgent installer an operator runs
  * by hand (`docs/launchd-worker-autostart.md`), so the refusals that script makes —
- * a worker already running for the checkout, a missing `swarm` binary — are made
- * once, there, in its own words. Every other platform has no installer yet and is
- * answered as such, so the caller can name the foreground command instead of
- * pretending the worker was started.
+ * a worker already running for the checkout, a missing `node` — are made once,
+ * there, in its own words. Because the installer is this checkout's own, the agent
+ * it writes runs this checkout's CLI — and therefore this checkout's `.env` and
+ * control plane — whatever `swarm` is on `PATH`. Every other platform has no
+ * installer yet and is answered as such, so the caller can name the foreground
+ * command instead of pretending the worker was started.
  */
 
 import { join } from 'node:path';

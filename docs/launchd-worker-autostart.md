@@ -50,6 +50,15 @@ declares its new set of repositories.
 The command ships in this package's `bin`, so a machine that has SWARM installed
 (or `npm link`ed) already has it on `PATH` next to `swarm`.
 
+The agent runs the `swarm` CLI **of the installation the installer belongs to**
+(`<installation>/bin/swarm.js`), never whichever `swarm` comes first on `PATH`
+(issue #1213) — and that installation's `.env` is where its
+`SWARM_CONTROL_PLANE_URL` comes from. On a Mac with two SWARM clones, run the
+intended clone's own installer: `<clone>/bin/swarm-worker-agent install <checkout>`,
+or `swarm workers setup` through `node <clone>/bin/swarm.js`. A bare
+`swarm-worker-agent` on `PATH` is the linked clone's. Re-running `install` from the
+same clone keeps the agent on it.
+
 | What | Where |
 | --- | --- |
 | Agent | `~/Library/LaunchAgents/pl.smarttechbrewery.swarm.worker.<basename>.<hash8>.plist` |
@@ -80,7 +89,9 @@ swarm-worker-agent update ~/work/api  # only that checkout's agent
   the agents afterwards. `<checkout>` narrows *which agents restart*, never which
   installation is pulled: there is one build behind all of them.
 - **Which agents count is read off each plist, not assumed.** Every worker agent whose
-  launcher resolves into this installation is restarted; a second SWARM clone's agents
+  launcher resolves into this installation is restarted — a plist names
+  `<installation>/bin/swarm.js` directly, and one written before issue #1213 names the
+  `PATH` symlink, which is followed; a second SWARM clone's agents
   on the same Mac are left alone, because nothing pulled *their* build. A `<checkout>`
   whose agent belongs to another installation is refused rather than restarted onto a
   build this run never touched.
@@ -117,8 +128,8 @@ swarm-worker-agent update ~/work/api  # only that checkout's agent
   node under nvm/asdf/fnm all work without editing anything. Anything *else* a phase
   needs from a login shell — a proxy, `JAVA_HOME`, an extra API key — is still not
   inherited, and has to be added to the plist's `EnvironmentVariables`.
-- **`SWARM_CONTROL_PLANE_URL` is deliberately absent.** The SWARM installation's
-  `.env` stays its single source, exactly as for an interactive `run:worker`
+- **`SWARM_CONTROL_PLANE_URL` is deliberately absent.** The `.env` of the SWARM
+  installation whose installer wrote the plist stays its single source, exactly as for an interactive `run:worker`
   (`node --env-file-if-exists=.env` supplies it to the daemon).
 - **`KeepAlive` with `ThrottleInterval 30`** restarts a daemon that dies, without
   turning a genuine failure into a hot loop.
@@ -165,9 +176,14 @@ swarm-worker-agent update ~/work/api  # only that checkout's agent
   checkout's remote under a live daemon changes nothing the control plane sees, and
   neither does a reconnect — it re-sends the value it still holds in memory. See
   "A repository was renamed" below.
-- **`swarm` runs the built CLI.** The `swarm` binary resolves to `dist/`, so a stale
-  build affects the agent exactly as it affects an interactive call: run
-  `npm run build` after changing CLI source.
+- **The agent runs the built CLI.** Its `<installation>/bin/swarm.js` loads that
+  installation's `dist/`, so a stale build affects the agent exactly as it affects an
+  interactive call: run `npm run build` after changing CLI source.
+- **A plist written before issue #1213 may run another clone.** It still names
+  whatever `swarm` was on `PATH` at install time, which on a Mac with two SWARM
+  clones may be the one whose `.env` points at a different control plane. Check it
+  with `plutil -extract ProgramArguments.1 raw <plist>`, and re-run the intended
+  clone's `install` to repoint it.
 - **Enrollment is not connection.** A connected daemon still needs an `active`
   enrollment with sharing consent before anything is dispatched to it, and an
   approved enrollment still needs the daemon running. The dashboard's
