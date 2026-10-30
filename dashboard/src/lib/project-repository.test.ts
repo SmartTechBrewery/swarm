@@ -4,8 +4,11 @@ import {
 	addRepository,
 	areRepositoriesDirty,
 	branchPatternPatch,
+	commitSubjectPatternPatch,
 	duplicateRepositories,
 	effectiveBranchPattern,
+	effectiveCommitSubjectMaxLength,
+	effectiveCommitSubjectPattern,
 	moveRepository,
 	patchRepository,
 	projectRepo,
@@ -61,6 +64,8 @@ describe('toRepositoryForms', () => {
 				baseBranch: 'main',
 				branchPrefix: 'issue-',
 				branchPattern: '',
+				commitSubjectPattern: '',
+				commitSubjectMaxLength: '',
 				autoMerge: false,
 				reviewChecks: 'required',
 				reviewChecksWaitMinutes: '',
@@ -72,6 +77,8 @@ describe('toRepositoryForms', () => {
 				baseBranch: 'trunk',
 				branchPrefix: 'work-',
 				branchPattern: '',
+				commitSubjectPattern: '',
+				commitSubjectMaxLength: '',
 				autoMerge: false,
 				reviewChecks: 'required',
 				reviewChecksWaitMinutes: '',
@@ -91,6 +98,8 @@ describe('toRepositoryForms', () => {
 				baseBranch: '',
 				branchPrefix: '',
 				branchPattern: '',
+				commitSubjectPattern: '',
+				commitSubjectMaxLength: '',
 				autoMerge: false,
 				reviewChecks: 'required',
 				reviewChecksWaitMinutes: '',
@@ -108,6 +117,8 @@ describe('toRepositoryForms', () => {
 			baseBranch: 'main',
 			branchPrefix: 'issue-',
 			branchPattern: '',
+			commitSubjectPattern: '',
+			commitSubjectMaxLength: '',
 			autoMerge: false,
 			reviewChecks: 'required',
 			reviewChecksWaitMinutes: '',
@@ -128,6 +139,8 @@ describe('toRepositoryEntries', () => {
 					baseBranch: 'main',
 					branchPrefix: 'issue-',
 					branchPattern: '',
+					commitSubjectPattern: '',
+					commitSubjectMaxLength: '',
 					autoMerge: false,
 					reviewChecks: 'required',
 					reviewChecksWaitMinutes: '',
@@ -139,6 +152,8 @@ describe('toRepositoryEntries', () => {
 					baseBranch: 'trunk',
 					branchPrefix: 'work-',
 					branchPattern: '',
+					commitSubjectPattern: '',
+					commitSubjectMaxLength: '',
 					autoMerge: false,
 					reviewChecks: 'required',
 					reviewChecksWaitMinutes: '',
@@ -221,6 +236,8 @@ describe('toRepositoryEntries', () => {
 				baseBranch: 'main',
 				branchPrefix: 'issue-',
 				branchPattern: '',
+				commitSubjectPattern: '',
+				commitSubjectMaxLength: '',
 				autoMerge: false,
 				reviewChecks: 'required',
 				reviewChecksWaitMinutes: '',
@@ -272,6 +289,8 @@ describe('repository list mutations', () => {
 			baseBranch: 'main',
 			branchPrefix: 'issue-',
 			branchPattern: '',
+			commitSubjectPattern: '',
+			commitSubjectMaxLength: '',
 			autoMerge: false,
 			reviewChecks: 'required',
 			reviewChecksWaitMinutes: '',
@@ -283,6 +302,8 @@ describe('repository list mutations', () => {
 			baseBranch: 'trunk',
 			branchPrefix: 'work-',
 			branchPattern: '',
+			commitSubjectPattern: '',
+			commitSubjectMaxLength: '',
 			autoMerge: false,
 			reviewChecks: 'required',
 			reviewChecksWaitMinutes: '',
@@ -299,6 +320,8 @@ describe('repository list mutations', () => {
 				baseBranch: 'main',
 				branchPrefix: 'issue-',
 				branchPattern: '',
+				commitSubjectPattern: '',
+				commitSubjectMaxLength: '',
 				autoMerge: false,
 				reviewChecks: 'required',
 				reviewChecksWaitMinutes: '',
@@ -350,6 +373,8 @@ describe('duplicateRepositories', () => {
 			baseBranch: 'main',
 			branchPrefix: 'issue-',
 			branchPattern: '',
+			commitSubjectPattern: '',
+			commitSubjectMaxLength: '',
 			autoMerge: false,
 			reviewChecks: 'required',
 			reviewChecksWaitMinutes: '',
@@ -483,5 +508,52 @@ describe('branch name pattern', () => {
 		expect(branchPatternPatch({ branchPrefix: 'issue-' }, '{issue_key}/{friendly_name}')).toEqual({
 			branchPattern: '{issue_key}/{friendly_name}',
 		});
+	});
+});
+
+describe('commit subject pattern (issue #1242)', () => {
+	it('reads an entry with none as the default pattern and limit, and saves neither', () => {
+		const rows = toRepositoryForms([{ repo: 'acme/first' }]);
+		const row = rows[0] as RepositoryForm;
+		expect(effectiveCommitSubjectPattern(row)).toBe('{work_type}: {subject}');
+		expect(effectiveCommitSubjectMaxLength(row)).toBe(72);
+		expect(toRepositoryEntries(rows)[0]).not.toHaveProperty('commitSubjectPattern');
+		expect(toRepositoryEntries(rows)[0]).not.toHaveProperty('commitSubjectMaxLength');
+	});
+
+	it('round-trips a pattern and its limit, and sees a change as dirty', () => {
+		const stored: RepositoryEntry[] = [
+			{
+				repo: 'acme/first',
+				commitSubjectPattern: '{issue_key} {Subject}',
+				commitSubjectMaxLength: 60,
+			},
+		];
+		const rows = toRepositoryForms(stored);
+		expect(toRepositoryEntries(rows)[0]).toMatchObject({
+			commitSubjectPattern: '{issue_key} {Subject}',
+			commitSubjectMaxLength: 60,
+		});
+		expect(areRepositoriesDirty(rows, stored)).toBe(false);
+		expect(
+			areRepositoriesDirty(patchRepository(rows, 0, { commitSubjectMaxLength: '72' }), stored),
+		).toBe(true);
+	});
+
+	it('keeps an entry with none on none when the defaults are applied unchanged', () => {
+		const none = { commitSubjectPattern: '', commitSubjectMaxLength: '' };
+		expect(commitSubjectPatternPatch(none, '{work_type}: {subject}', 72)).toEqual(none);
+		expect(commitSubjectPatternPatch(none, '{issue_key} {Subject}', 72)).toEqual({
+			commitSubjectPattern: '{issue_key} {Subject}',
+			commitSubjectMaxLength: '',
+		});
+		// A pattern of the repository's own stays its own, even set to the default.
+		expect(
+			commitSubjectPatternPatch(
+				{ commitSubjectPattern: '{issue_key} {Subject}', commitSubjectMaxLength: '60' },
+				'{work_type}: {subject}',
+				72,
+			),
+		).toEqual({ commitSubjectPattern: '{work_type}: {subject}', commitSubjectMaxLength: '72' });
 	});
 });

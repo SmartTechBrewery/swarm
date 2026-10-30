@@ -5,7 +5,8 @@
  * shared across its repositories stated once, plus a `repositories` list carrying
  * what is genuinely per-repository. `ProjectConfig` is that record **scoped to one
  * entry** — the shape every runtime call site already takes, with `repo`,
- * `baseBranch`, `branchPrefix`, `branchPattern`, `autoMerge`, `reviewChecks` and
+ * `baseBranch`, `branchPrefix`, `branchPattern`, `commitSubjectPattern`,
+ * `commitSubjectMaxLength`, `autoMerge`, `reviewChecks` and
  * `reviewChecksWaitMinutes` flattened back to the top level beside the project's own
  * `scm`.
  *
@@ -87,7 +88,8 @@ export function requireProjectRepository(record: ProjectRecord, repo: string): P
  * `scm_type` (`src/db/repositories/projectsRepository.ts`), since "states no provider"
  * is a distinct case the registry lookup reports on. The entry's `autoMerge` (issue
  * #1066), its `reviewChecks` / `reviewChecksWaitMinutes` (issue #1109), its
- * `wipLimit` (issue #1185) and its `branchPattern` (issue #1241) are kept absent the
+ * `wipLimit` (issue #1185), its `branchPattern` (issue #1241) and its
+ * `commitSubjectPattern` / `commitSubjectMaxLength` (issue #1242) are kept absent the
  * same way when the entry states none.
  */
 export function scopeProjectToRepository(record: ProjectRecord, repo?: string): ProjectConfig {
@@ -100,6 +102,12 @@ export function scopeProjectToRepository(record: ProjectRecord, repo?: string): 
 		baseBranch: entry.baseBranch,
 		branchPrefix: entry.branchPrefix,
 		...(entry.branchPattern !== undefined ? { branchPattern: entry.branchPattern } : {}),
+		...(entry.commitSubjectPattern !== undefined
+			? { commitSubjectPattern: entry.commitSubjectPattern }
+			: {}),
+		...(entry.commitSubjectMaxLength !== undefined
+			? { commitSubjectMaxLength: entry.commitSubjectMaxLength }
+			: {}),
 		...(entry.autoMerge !== undefined ? { autoMerge: entry.autoMerge } : {}),
 		...(entry.reviewChecks !== undefined ? { reviewChecks: entry.reviewChecks } : {}),
 		...(entry.reviewChecksWaitMinutes !== undefined

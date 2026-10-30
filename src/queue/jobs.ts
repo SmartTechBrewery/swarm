@@ -395,6 +395,15 @@ const jobBase = z.object({
 	 * a fact about the task, so a reset keeps it.
 	 */
 	taskBranch: z.string().min(1).optional(),
+	/**
+	 * The commit subject Implementation decided for this task (issue #1242), stored with
+	 * the run beside {@link taskBranch} and for the same reason: every later attempt
+	 * reuses it, and the Respond-to-review / Respond-to-CI fix commits are handed it
+	 * (`resolveCommitSubjectForPrBranch`), so every commit of the task reads the same.
+	 * Written from the worker's `branch-provisioned` progress and seeded onto a new
+	 * Implementation attempt from the task's previous runs (`findStoredCommitSubject`).
+	 */
+	commitSubject: z.string().min(1).optional(),
 	// How this attempt treats a prior one's preserved work — declared once in
 	// {@link RecoveryIntentSchema} and spread here, so the payload and the
 	// transport frame cannot drift apart member by member (issue #591).

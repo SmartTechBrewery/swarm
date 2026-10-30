@@ -328,6 +328,19 @@ describe('transport protocol schemas', () => {
 			expect(TaskProgressSchema.parse(frame)).toEqual(frame);
 		});
 
+		// Issue #1242: the decided commit subject rides the same frame the same way.
+		it('carries an optional decided commit subject on a branch-provisioned frame', () => {
+			const frame = {
+				type: 'task-progress' as const,
+				dispatchId: DISPATCH_ID,
+				phase: 'implementation' as const,
+				taskId: 'VT-1538',
+				state: 'branch-provisioned' as const,
+				commitSubject: 'VT-1538 Add the starting page of the SWARM test bed',
+			};
+			expect(TaskProgressSchema.parse(frame)).toEqual(frame);
+		});
+
 		it('round-trips a succeeded task-execution-result', () => {
 			const frame = {
 				type: 'task-execution-result' as const,

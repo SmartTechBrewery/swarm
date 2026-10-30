@@ -48,6 +48,7 @@ import {
 	sweepBaseBranchHealth,
 } from '../dispatch/base-branch-health.js';
 import { resolveBoardItemIdForPrBranch } from '../dispatch/board-card.js';
+import { resolveCommitSubjectForPrBranch } from '../dispatch/commit-subject.js';
 import { cancelDispatchAndWake } from '../dispatch/dispatcher.js';
 import {
 	reconcileDispatchesAtStartup,
@@ -670,15 +671,17 @@ export function awaitResultWithGuards(
  * it as the run's `taskBranch` — on the row, and on the in-flight `job` itself, which
  * is the object a deferral of this attempt derives its retry payload from
  * (`settleDispatchRetry`, `../worker/consumer.ts`) and would otherwise write back
- * without it.
+ * without it. A frame naming the decided commit subject (issue #1242) records it as the
+ * run's `commitSubject` the same way.
  */
 async function persistBranchProvisioned(
 	runId: string | undefined,
 	job: SwarmJob,
 	taskId: string,
-	branch: string | undefined,
+	progress: Pick<TaskProgress, 'branch' | 'commitSubject'>,
 ): Promise<void> {
-	if (branch) job.taskBranch = branch;
+	if (progress.branch) job.taskBranch = progress.branch;
+	if (progress.commitSubject) job.commitSubject = progress.commitSubject;
 	if (!runId) return;
 	try {
 		await updateRunJobPayload(runId, { ...job, implementationBranchProvisioned: true });
@@ -688,6 +691,28 @@ async function persistBranchProvisioned(
 			taskId,
 			error: describeError(err),
 		});
+	}
+}
+
+/**
+ * The commit subject an assignment carries (issue #1242). Implementation reuses the one
+ * `processJob` seeded onto its job from the task's earlier runs; Respond-to-review and
+ * Respond-to-CI commit their fixes with the one Implementation stored for the task the
+ * pull request's branch encodes. No other phase commits with it.
+ */
+async function resolveAssignmentCommitSubject(
+	project: DispatchPhaseContext['project'],
+	trigger: TriggerResult,
+	job: SwarmJob,
+): Promise<string | undefined> {
+	switch (trigger.phase) {
+		case 'implementation':
+			return job.commitSubject;
+		case 'respond-to-review':
+		case 'respond-to-ci':
+			return resolveCommitSubjectForPrBranch(project, trigger.prBranch);
+		default:
+			return undefined;
 	}
 }
 
@@ -781,6 +806,7 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 	// into the run with the provider's own generic identity error.
 	const operatorCredential = await resolveOperatorCredential(project, selection);
 	const taskBranch = trigger.phase === 'implementation' ? job.taskBranch : undefined;
+	const commitSubject = await resolveAssignmentCommitSubject(project, trigger, job);
 
 	const assignment = buildTaskAssignment({
 		dispatchId: dispatch.id,
@@ -817,6 +843,9 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 		// The task branch a previous run decided (issue #1241), seeded onto the job by
 		// `processJob` from the run record — the worker has no database to read it from.
 		taskBranch,
+		// The task's commit subject (issue #1242) — Implementation's own from the job,
+		// or the one it stored, for the fix commits of the PR-driven phases.
+		commitSubject,
 		operatorCredential,
 	});
 
@@ -861,7 +890,7 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 		{
 			onProgress: (progress: TaskProgress) => {
 				if (progress.state === 'branch-provisioned') {
-					void persistBranchProvisioned(runId, job, trigger.taskId, progress.branch);
+					void persistBranchProvisioned(runId, job, trigger.taskId, progress);
 				}
 			},
 		},

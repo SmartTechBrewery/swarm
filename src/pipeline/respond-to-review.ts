@@ -90,6 +90,7 @@ import { agentRunError, agentRunFailed } from '@/harness/agent-failure.js';
 import type { ReasoningLevel } from '@/harness/models.js';
 import { requireProjectSCMProvider } from '@/integrations/scm/registry.js';
 import { logger } from '@/lib/logger.js';
+import { fixCommitSubject } from '@/pipeline/commit-subject-pattern.js';
 import {
 	type ScheduleFollowUpReview,
 	scheduleFollowUpReviewDefault,
@@ -251,6 +252,14 @@ export interface RunRespondToReviewPhaseOptions {
 	recoveryMode?: RecoveryMode;
 	/** Resume deterministic delivery from a preserved worktree without rerunning the agent. */
 	resumeDelivery?: boolean;
+	/**
+	 * The commit subject Implementation decided for this pull request's task (issue
+	 * #1242), resolved control-plane side from the task's run record — where the DB is,
+	 * so a federated worker needs none. A `fixed` response commits with it, so every
+	 * commit of the task reads the same; omitted for a pull request opened before
+	 * subjects were stored, when the agent's own subject is used ({@link fixCommitSubject}).
+	 */
+	commitSubject?: string;
 	/** Kill the agent run after this many ms. Omit for no timeout. */
 	timeoutMs?: number;
 	/** External cancellation — aborting kills the agent run. */
@@ -441,6 +450,7 @@ export async function runRespondToReviewPhase(
 		runId,
 		recoveryMode,
 		resumeDelivery = false,
+		commitSubject: storedCommitSubject,
 		timeoutMs,
 		signal,
 		runAgent = runAgentCli,
@@ -567,10 +577,15 @@ export async function runRespondToReviewPhase(
 		}
 
 		const handoff = readHandoff(handle.path, RESPOND_OUTCOME_FILENAME, ReviewResponseHandoffSchema);
-		if (
-			handoff.outcome === 'fixed' &&
-			(!handoff.commitSubject || (handoff.verification?.length ?? 0) === 0)
-		) {
+		// One subject for every commit of the task (issue #1242): the stored one when
+		// there is one, otherwise the agent's own, through the repository's pattern.
+		const fixSubject = fixCommitSubject({
+			stored: storedCommitSubject,
+			agentSubject: handoff.commitSubject,
+			naming: project,
+			issueKey: taskIdFromTaskBranch(prBranch, project),
+		});
+		if (handoff.outcome === 'fixed' && (!fixSubject || (handoff.verification?.length ?? 0) === 0)) {
 			throw new Error(
 				'Invalid respond-to-review hand-off: fixed requires commitSubject and verification',
 			);
@@ -588,7 +603,7 @@ export async function runRespondToReviewPhase(
 			await assertRemoteFastForwardable(handle.path, prBranch);
 			progress.commitSha = await commitPreparedTree(
 				handle.path,
-				handoff.commitSubject as string,
+				fixSubject as string,
 				delivery.commitIdentity,
 			);
 			saveDeliveryProgress(handle.path, progress);

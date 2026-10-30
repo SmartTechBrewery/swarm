@@ -538,6 +538,51 @@ describe('ProjectRecordSchema', () => {
 		});
 	});
 
+	// Issue #1242: a repository words its commit subjects by a validated pattern; unset
+	// keeps today's conventional subject.
+	describe('commit subject pattern (issue #1242)', () => {
+		it('is optional and kept absent when unstated', () => {
+			const record = ProjectRecordSchema.parse({
+				...shared,
+				repositories: [
+					{ repo: 'acme/one' },
+					{
+						repo: 'acme/two',
+						commitSubjectPattern: '{issue_key} {Subject}',
+						commitSubjectMaxLength: 72,
+					},
+				],
+			});
+			expect(record.repositories.map((entry) => entry.commitSubjectPattern)).toEqual([
+				undefined,
+				'{issue_key} {Subject}',
+			]);
+			expect(record.repositories[0]).not.toHaveProperty('commitSubjectMaxLength');
+		});
+
+		it.each([
+			'{issue_key}',
+			'{issue_key} {summary}',
+			'{issue_key}\n{subject}',
+		])('rejects the pattern %j', (commitSubjectPattern) => {
+			const result = ProjectRecordSchema.safeParse({
+				...shared,
+				repositories: [{ repo: 'acme/one', commitSubjectPattern }],
+			});
+			expect(result.success).toBe(false);
+			expect(result.error?.issues[0]?.path).toEqual(['repositories', 0, 'commitSubjectPattern']);
+		});
+
+		it.each([0, 19, 201, 72.5])('rejects the length limit %s', (commitSubjectMaxLength) => {
+			expect(
+				ProjectRecordSchema.safeParse({
+					...shared,
+					repositories: [{ repo: 'acme/one', commitSubjectMaxLength }],
+				}).success,
+			).toBe(false);
+		});
+	});
+
 	// The record carries the same cross-field credential checks the scoped config does —
 	// neither reads a repository, so both refine through the same two functions.
 	it('applies the same credential cross-field checks the scoped config does', () => {

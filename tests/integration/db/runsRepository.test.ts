@@ -23,6 +23,7 @@ import {
 	failStaleRunningRuns,
 	findApprovedReviewRunForRearm,
 	findBoardItemIdForTask,
+	findStoredCommitSubject,
 	findStoredTaskBranch,
 	getLatestCompletedPlanningScope,
 	getLatestRunForTask,
@@ -1623,6 +1624,42 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 
 			expect(await findStoredTaskBranch(PROJECT_ID, REPO, 'VT-2')).toBeUndefined();
 			expect(await findStoredTaskBranch(PROJECT_ID, REPO, 'never-ran')).toBeUndefined();
+		});
+	});
+
+	// Issue #1242: the commit subject is stored and read back exactly like the branch.
+	describe('findStoredCommitSubject', () => {
+		it('returns the newest Implementation subject stored for this repository task', async () => {
+			const older = await createRun({
+				projectId: PROJECT_ID,
+				taskId: 'VT-3',
+				phase: 'implementation',
+				jobPayload: createMockPmWebhookJob({ commitSubject: 'VT-3 First subject' }),
+			});
+			const newest = await createRun({
+				projectId: PROJECT_ID,
+				taskId: 'VT-3',
+				phase: 'implementation',
+				jobPayload: createMockPmWebhookJob({ commitSubject: 'VT-3 Second subject' }),
+			});
+			await createRun({
+				projectId: PROJECT_ID,
+				repository: OTHER_REPO,
+				taskId: 'VT-3',
+				phase: 'implementation',
+				jobPayload: createMockPmWebhookJob({ commitSubject: 'VT-3 Other repository' }),
+			});
+			await getDb()
+				.update(runs)
+				.set({ startedAt: new Date('2026-01-01') })
+				.where(eq(runs.id, older));
+			await getDb()
+				.update(runs)
+				.set({ startedAt: new Date('2026-02-01') })
+				.where(eq(runs.id, newest));
+
+			expect(await findStoredCommitSubject(PROJECT_ID, REPO, 'VT-3')).toBe('VT-3 Second subject');
+			expect(await findStoredCommitSubject(PROJECT_ID, REPO, 'never-ran')).toBeUndefined();
 		});
 	});
 

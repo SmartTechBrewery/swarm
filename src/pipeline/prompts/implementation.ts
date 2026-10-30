@@ -14,6 +14,12 @@ import {
 } from '@/pipeline/branch-pattern.js';
 import { CHECKPOINT_FILENAME, type Checkpoint } from '@/pipeline/checkpoint.js';
 import {
+	type CommitSubjectNaming,
+	resolveCommitSubjectMaxLength,
+	resolveCommitSubjectPattern,
+	subjectLengthBudget,
+} from '@/pipeline/commit-subject-pattern.js';
+import {
 	checkpointContinuationSection,
 	checkpointInstructions,
 } from '@/pipeline/prompts/checkpoint.js';
@@ -32,26 +38,29 @@ const IMPLEMENTATION_HANDOFF_FILENAME = HANDOFF_FILENAMES.implementation;
 export const BLOCKED_REASON_FILENAME = 'blocked_reason.md';
 
 /**
- * The hand-off fields a branch name pattern asks the implementer to choose (issue
- * #1241) — only the ones `pattern` contains, and none when it is unset. Empty for
- * every repository on the legacy prefix, leaving its prompt unchanged.
+ * The hand-off field a branch name pattern additionally asks the implementer to choose
+ * (issue #1241) — `friendlyName`, only when `pattern` contains it, and nothing when it
+ * is unset. `workType` is asked for on every run since issue #1242, because the commit
+ * subject needs it too.
  */
 function branchNamingFields(pattern: string | undefined): string {
-	if (!pattern) return '';
-	const fields = [
-		...(pattern.includes('{work_type}')
-			? [
-					`workType (exactly one of ${WORK_TYPES.join(', ')} — the Conventional Commits type that describes the change, the same one your commitSubject starts with)`,
-				]
-			: []),
-		...(pattern.includes('{friendly_name}')
-			? [
-					`friendlyName (a short name for the change: 2–${FRIENDLY_NAME_MAX_WORDS} lowercase ASCII words joined by hyphens, Polish and other diacritics transliterated, at most ${FRIENDLY_NAME_MAX_LENGTH} characters, e.g. "main-filters-refresh")`,
-				]
-			: []),
-	];
-	if (fields.length === 0) return '';
-	return ` SWARM names the branch "${pattern}" from it, so also include ${fields.join(' and ')}.`;
+	if (!pattern?.includes('{friendly_name}')) return '';
+	return ` SWARM names the branch "${pattern}" from it, so also include friendlyName (a short name for the change: 2–${FRIENDLY_NAME_MAX_WORDS} lowercase ASCII words joined by hyphens, Polish and other diacritics transliterated, at most ${FRIENDLY_NAME_MAX_LENGTH} characters, e.g. "main-filters-refresh").`;
+}
+
+/**
+ * The hand-off's naming fields (issue #1242): the implementer supplies a summary and a
+ * work type, never the commit subject's format — SWARM renders the repository's commit
+ * subject pattern from them. The summary's length budget is what is left of the
+ * repository's limit once the pattern's own text and the task's key are counted.
+ */
+function commitNamingFields(taskId: string, naming: CommitSubjectNaming): string {
+	const budget = subjectLengthBudget(
+		resolveCommitSubjectPattern(naming),
+		taskId,
+		resolveCommitSubjectMaxLength(naming),
+	);
+	return `subject (a one-line summary of the change in the imperative mood, at most ${budget} characters, e.g. "add the starting page of the test bed" — no type prefix, issue key or trailing period; SWARM composes the commit subject from it), workType (exactly one of ${WORK_TYPES.join(', ')} — the Conventional Commits type that describes the change)`;
 }
 
 /**
@@ -89,11 +98,15 @@ export function buildImplementationPrompt(
 		checkpoint?: Checkpoint;
 		/**
 		 * The repository's branch name pattern, set only while this task's branch is
-		 * still undecided (issue #1241). When it has a `{work_type}` or
-		 * `{friendly_name}`, the hand-off also asks for them; unset leaves the prompt
-		 * unchanged.
+		 * still undecided (issue #1241). When it has a `{friendly_name}`, the hand-off
+		 * also asks for one; unset leaves the prompt unchanged.
 		 */
 		branchPattern?: string;
+		/**
+		 * The repository's commit subject pattern and length limit (issue #1242), which
+		 * size the summary the hand-off asks for. Unset means the defaults.
+		 */
+		commitSubjectNaming?: CommitSubjectNaming;
 	},
 	customPrompt?: string,
 ): string {
@@ -130,7 +143,7 @@ export function buildImplementationPrompt(
 		'4. Run the project lint, type-check, and the relevant tests; fix whatever they surface before continuing.',
 		'5. Do not commit, push, open a pull request, or run any GitHub mutation. SWARM delivers the prepared tree after you exit.',
 		`Specifically, do not run \`git push -u origin ${branch}\` or \`gh pr create --base ${baseBranch} --head ${branch}\`; SWARM constructs the PR with \`Closes #${context.taskId}\`. GH_TOKEN is read-only context authentication; do not run gh auth switch.`,
-		`6. Write "${IMPLEMENTATION_HANDOFF_FILENAME}" as JSON with: summary (PR-ready text), verification (an array of {command,outcome:"passed"}), commitSubject (a conventional-commit subject), limitations (an array), and readyForDelivery:true.${branchNamingFields(branchPattern)} Do not track this file.`,
+		`6. Write "${IMPLEMENTATION_HANDOFF_FILENAME}" as JSON with: summary (PR-ready text), verification (an array of {command,outcome:"passed"}), ${commitNamingFields(context.taskId, context.commitSubjectNaming ?? {})}, limitations (an array), and readyForDelivery:true.${branchNamingFields(branchPattern)} Do not track this file.`,
 		'Do NOT `git add`/commit the hand-off file.',
 		`If a genuine external prerequisite blocks implementation (for example, a required PR has not merged), do not open a placeholder PR. Instead, write a concise, human-readable explanation and the actionable next step to "${BLOCKED_REASON_FILENAME}" at the worktree root, then stop. Do NOT commit that file.`,
 		'',

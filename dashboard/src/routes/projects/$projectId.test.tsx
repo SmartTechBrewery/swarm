@@ -1343,6 +1343,8 @@ describe('toRepositoriesUpdate', () => {
 			baseBranch: 'main',
 			branchPrefix: 'issue-',
 			branchPattern: '',
+			commitSubjectPattern: '',
+			commitSubjectMaxLength: '',
 			autoMerge: true,
 			reviewChecks: 'if-present',
 			reviewChecksWaitMinutes: '',

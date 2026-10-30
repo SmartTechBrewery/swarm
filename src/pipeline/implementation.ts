@@ -83,6 +83,12 @@ import {
 	workTypeFromCommitSubject,
 } from '@/pipeline/branch-pattern.js';
 import type { Checkpoint } from '@/pipeline/checkpoint.js';
+import {
+	normalizeSubject,
+	renderCommitSubject,
+	resolveCommitSubjectMaxLength,
+	resolveCommitSubjectPattern,
+} from '@/pipeline/commit-subject-pattern.js';
 import { assertDependenciesSatisfied } from '@/pipeline/dependency-guard.js';
 import {
 	BLOCKED_REASON_FILENAME,
@@ -102,9 +108,11 @@ import type { RecoveryMode } from '@/queue/jobs.js';
 import {
 	commitPreparedTree,
 	DeliveryDeferredError,
+	type DeliveryProgress,
 	deliveryIdentity,
 	HANDOFF_FILENAMES,
 	hasDeliveryProgress,
+	type ImplementationHandoff,
 	ImplementationHandoffSchema,
 	loadDeliveryProgress,
 	pushDeliveredBranch,
@@ -150,10 +158,82 @@ const NEXT_STATUS: PmStatusKey = 'inReview';
  */
 const FALLBACK_FRIENDLY_NAME = 'change';
 
-/** The implementer's `{work_type}`, when it named one from the closed list. */
-function implementerWorkType(value: string | undefined): WorkType | undefined {
-	const normalized = value?.trim().toLowerCase();
-	return normalized && isWorkType(normalized) ? normalized : undefined;
+/**
+ * The task's `{work_type}` (issues #1241, #1242): the one the implementer named from the
+ * closed list, else the type its legacy `commitSubject` starts with, else the fallback.
+ */
+function implementerWorkType(handoff: ImplementationHandoff): WorkType {
+	const named = handoff.workType?.trim().toLowerCase();
+	if (named && isWorkType(named)) return named;
+	return workTypeFromCommitSubject(handoff.commitSubject ?? '') ?? FALLBACK_WORK_TYPE;
+}
+
+/** The task's `{friendly_name}` (issue #1241): the implementer's, else the card title's, else the fallback. */
+function implementerFriendlyName(handoff: ImplementationHandoff, title: string): string {
+	return (
+		toFriendlyName(handoff.friendlyName ?? '') || toFriendlyName(title) || FALLBACK_FRIENDLY_NAME
+	);
+}
+
+/**
+ * The implementer's `{subject}` (issue #1242): its `subject`, or — from a hand-off an
+ * older prompt prepared — the summary inside its whole `commitSubject`. `''` when
+ * neither leaves any text, so the caller falls back to the card title.
+ */
+function implementerSubject(handoff: ImplementationHandoff, taskId: string): string {
+	return normalizeSubject(handoff.subject ?? handoff.commitSubject ?? '', taskId);
+}
+
+/** What {@link decideDeliveryNaming} decides from. */
+interface DeliveryNamingInput {
+	project: ProjectConfig;
+	taskId: string;
+	workItem: WorkItem;
+	handoff: ImplementationHandoff;
+	progress: DeliveryProgress;
+	branchPattern: string;
+	decidedBranch?: string;
+	storedCommitSubject?: string;
+}
+
+/**
+ * The task branch and commit subject this delivery uses (issues #1241, #1242), each
+ * decided once: a resumed delivery keeps what its first attempt recorded, a stored
+ * value is reused, and only a first decision renders one. Both are rendered from one
+ * work type, so the branch name and the commits never describe the task differently,
+ * and the subject from the repository's pattern and the implementer's summary — never
+ * the agent's own wording of the format.
+ */
+function decideDeliveryNaming(input: DeliveryNamingInput): {
+	branch: string;
+	commitSubject: string;
+} {
+	const { project, taskId, workItem, handoff, progress } = input;
+	const workType = implementerWorkType(handoff);
+	const branch =
+		progress.branch ??
+		input.decidedBranch ??
+		renderBranchName(input.branchPattern, {
+			issueKey: taskId,
+			workType,
+			friendlyName: implementerFriendlyName(handoff, workItem.title),
+		});
+	const commitSubject =
+		progress.commitSubject ??
+		input.storedCommitSubject ??
+		renderCommitSubject(resolveCommitSubjectPattern(project), {
+			issueKey: taskId,
+			workType,
+			subject: implementerSubject(handoff, taskId) || workItem.title,
+		});
+	const maxLength = resolveCommitSubjectMaxLength(project);
+	if (commitSubject.length > maxLength)
+		logger.warn('Commit subject is longer than the repository asks for — committing it anyway', {
+			taskId,
+			commitSubject,
+			maxLength,
+		});
+	return { branch, commitSubject };
 }
 
 /**
@@ -223,6 +303,20 @@ export interface RunImplementationPhaseOptions {
 	 * called when {@link taskBranch} was handed in: that name is already stored.
 	 */
 	onBranchNamed?: (branch: string) => Promise<void>;
+	/**
+	 * The commit subject an earlier attempt or run already decided for this task (issue
+	 * #1242), read back off the run record. Reused verbatim — committed with, and the
+	 * pull request titled by — never re-rendered, so the task's commits and its branch
+	 * name keep the `{work_type}` and summary they were first given.
+	 */
+	commitSubject?: string;
+	/**
+	 * Called with the commit subject once this attempt has decided it, at delivery, so
+	 * the caller can store it with the run (issue #1242) for every later attempt and for
+	 * the Respond-to-review / Respond-to-CI fix commits. Not called when
+	 * {@link commitSubject} was handed in: that subject is already stored.
+	 */
+	onCommitSubjectNamed?: (commitSubject: string) => Promise<void>;
 	/** Kill the agent run after this many ms. Omit for no timeout. */
 	timeoutMs?: number;
 	/** External cancellation — aborting kills the agent run. */
@@ -458,6 +552,8 @@ export async function runImplementationPhase(
 		onBranchProvisioned,
 		taskBranch: storedTaskBranch,
 		onBranchNamed,
+		commitSubject: storedCommitSubject,
+		onCommitSubjectNamed,
 		timeoutMs,
 		signal,
 		runAgent = runAgentCli,
@@ -616,6 +712,7 @@ export async function runImplementationPhase(
 								checkpoint,
 								// Asked for only while the branch is undecided (issue #1241).
 								branchPattern: decidedBranch ? undefined : branchPattern,
+								commitSubjectNaming: project,
 							},
 							customPrompt,
 						),
@@ -662,31 +759,27 @@ export async function runImplementationPhase(
 			ImplementationHandoffSchema,
 		);
 		const progress = loadDeliveryProgress(handle.path, deliveryId);
-		// Decided once (issue #1241): a resumed delivery keeps the name its first attempt
-		// recorded, a stored name is reused, and only a first decision renders one.
-		const branch =
-			progress.branch ??
-			decidedBranch ??
-			renderBranchName(branchPattern, {
-				issueKey: taskId,
-				workType:
-					implementerWorkType(handoff.workType) ??
-					workTypeFromCommitSubject(handoff.commitSubject) ??
-					FALLBACK_WORK_TYPE,
-				friendlyName:
-					toFriendlyName(handoff.friendlyName ?? '') ||
-					toFriendlyName(workItem.title) ||
-					FALLBACK_FRIENDLY_NAME,
-			});
+		const { branch, commitSubject } = decideDeliveryNaming({
+			project,
+			taskId,
+			workItem,
+			handoff,
+			progress,
+			branchPattern,
+			decidedBranch,
+			storedCommitSubject,
+		});
 		progress.branch = branch;
+		progress.commitSubject = commitSubject;
 		saveDeliveryProgress(handle.path, progress);
 		if (!handle.detached) await renameCheckedOutBranch(handle.path, branch);
 		// A name decided before the agent ran was already stored, or reported at provisioning.
 		if (branch !== decidedBranch) await onBranchNamed?.(branch);
+		if (commitSubject !== storedCommitSubject) await onCommitSubjectNamed?.(commitSubject);
 		if (!progress.commitSha) {
 			progress.commitSha = await commitPreparedTree(
 				handle.path,
-				handoff.commitSubject,
+				commitSubject,
 				delivery.commitIdentity,
 			);
 			saveDeliveryProgress(handle.path, progress);
@@ -702,7 +795,11 @@ export async function runImplementationPhase(
 				(await delivery.createPullRequest({
 					baseBranch: project.baseBranch,
 					branch,
-					title: workItem.title,
+					// Titled by the commit subject once the repository states a pattern (issue
+					// #1242) — Azure DevOps pre-fills a squash merge's message from the title,
+					// so it has to carry the issue key as much as the commits do. A repository
+					// stating none keeps the card's own title, exactly as before.
+					title: project.commitSubjectPattern !== undefined ? commitSubject : workItem.title,
 					body: `Closes #${taskId}\n\n${handoff.summary}`,
 				}));
 			progress.pullRequestNumber = pull.number;

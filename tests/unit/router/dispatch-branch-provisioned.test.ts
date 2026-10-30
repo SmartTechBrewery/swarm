@@ -70,7 +70,7 @@ function context(job: SwarmJob): DispatchPhaseContext {
 	};
 }
 
-function provisioned(branch?: string): TaskProgress {
+function provisioned(branch?: string, commitSubject?: string): TaskProgress {
 	return {
 		type: 'task-progress',
 		dispatchId: DISPATCH_ID,
@@ -78,6 +78,7 @@ function provisioned(branch?: string): TaskProgress {
 		taskId: 'VT-1538',
 		state: 'branch-provisioned',
 		...(branch ? { branch } : {}),
+		...(commitSubject ? { commitSubject } : {}),
 	};
 }
 
@@ -146,6 +147,34 @@ describe('control-plane executePhase — branch-provisioned frame (issue #1241)'
 		);
 		// The object a deferral of this attempt re-derives its retry payload from.
 		expect(job.taskBranch).toBe('VT-1538/pierwsza-strona-testowa');
+	});
+
+	// Issue #1242: the decided commit subject is stored with the run the same way.
+	it('records the decided commit subject on the run payload and on the in-flight job', async () => {
+		const job: SwarmJob = { ...createMockPmWebhookJob(), dispatchId: DISPATCH_ID };
+
+		await runWithProgress(job, provisioned(undefined, 'VT-1538 Add the starting page'));
+
+		expect(updateRunJobPayload).toHaveBeenCalledWith(
+			RUN_ID,
+			expect.objectContaining({ commitSubject: 'VT-1538 Add the starting page' }),
+		);
+		expect(job.commitSubject).toBe('VT-1538 Add the starting page');
+	});
+
+	it('carries the job’s stored commit subject to the worker', async () => {
+		const job: SwarmJob = {
+			...createMockPmWebhookJob(),
+			dispatchId: DISPATCH_ID,
+			commitSubject: 'VT-1538 Add the first page',
+		};
+
+		await runWithProgress(job, provisioned());
+
+		expect(JSON.parse(String(ws.send.mock.calls[0][0]))).toMatchObject({
+			type: 'task-assignment',
+			commitSubject: 'VT-1538 Add the first page',
+		});
 	});
 
 	it('leaves a stored taskBranch intact when the frame names none', async () => {

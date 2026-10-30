@@ -35,6 +35,8 @@ import { listSCMProviders } from '../integrations/scm/registry.js';
 // The branch name pattern rules (issue #1241) — `../pipeline/branch-pattern.js` imports
 // nothing at all, which is also what lets the dashboard's editor share them.
 import { validateBranchPattern } from '../pipeline/branch-pattern.js';
+// The commit subject pattern rules (issue #1242), dependency-free for the same reason.
+import { validateCommitSubjectPattern } from '../pipeline/commit-subject-pattern.js';
 // The value list behind `PMType` — `../pm/types.js` imports nothing at runtime either.
 import { PM_TYPES, type PMType } from '../pm/types.js';
 // The Zod mirror of `ScmType`; `../scm/events.js` imports only zod plus a type-only
@@ -754,6 +756,32 @@ export const ProjectRepositorySchema = z.object({
 			}
 		})
 		.optional(),
+
+	/**
+	 * How this repository words the commits SWARM makes for a task — and, when set, the
+	 * title of the pull request opened from them (issue #1242). Literal text plus the
+	 * elements `{issue_key}`, `{work_type}` and `{subject}` (required), each capitalised
+	 * by writing its first letter in upper case: `{issue_key} {Subject}` →
+	 * `VT-1538 Add the starting page of the SWARM test bed`. Validated by
+	 * `validateCommitSubjectPattern` (`src/pipeline/commit-subject-pattern.ts`), the
+	 * same check the dashboard's editor applies. Unset means `{work_type}: {subject}`
+	 * with the pull request titled by its board card, exactly as before.
+	 */
+	commitSubjectPattern: z
+		.string()
+		.superRefine((pattern, ctx) => {
+			for (const message of validateCommitSubjectPattern(pattern).errors) {
+				ctx.addIssue({ code: z.ZodIssueCode.custom, message });
+			}
+		})
+		.optional(),
+
+	/**
+	 * The rendered commit subject length above which the dashboard's pattern editor
+	 * warns (issue #1242), and the budget the implementer is asked to fit its summary
+	 * into. Advisory only — a longer subject is still committed. Unset means 72.
+	 */
+	commitSubjectMaxLength: z.number().int().min(20).max(200).optional(),
 
 	/**
 	 * Merge automation for **this** repository: once a SWARM Review approves a pull

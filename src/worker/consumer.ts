@@ -59,6 +59,7 @@ import {
 	completeRun,
 	createRun,
 	failRunFromStatus,
+	findStoredCommitSubject,
 	findStoredTaskBranch,
 	getLatestCompletedPlanningScope,
 	getLatestRunForTask,
@@ -2704,6 +2705,14 @@ export interface AssignedPhaseInputs {
 	taskBranch?: string;
 	/** implementation: called with the task branch's name once the phase decides it (issue #1241). */
 	onBranchNamed?: (branch: string) => Promise<void>;
+	/**
+	 * implementation / respond-to-review / respond-to-ci: the commit subject
+	 * Implementation decided for the task (issue #1242), resolved control-plane side
+	 * from the run record — reused by Implementation, committed with by a fix.
+	 */
+	commitSubject?: string;
+	/** implementation: called with the commit subject once the phase decides it (issue #1242). */
+	onCommitSubjectNamed?: (commitSubject: string) => Promise<void>;
 	/** PR-driven phases (review / respond-to-* / resolve-conflicts). */
 	prNumber?: string;
 	prBranch?: string;
@@ -2855,6 +2864,8 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 				onBranchProvisioned: inputs.onBranchProvisioned,
 				taskBranch: inputs.taskBranch,
 				onBranchNamed: inputs.onBranchNamed,
+				commitSubject: inputs.commitSubject,
+				onCommitSubjectNamed: inputs.onCommitSubjectNamed,
 				// Identifies this attempt to the provision-time collision gate, so a
 				// lease left behind by a crashed run is recognised as an orphan instead
 				// of wedging this one as `live-leased` (issue #427). Every phase below
@@ -2917,6 +2928,7 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 				taskId,
 				pm: resolvePm(),
 				boardItemId: inputs.boardItemId,
+				commitSubject: inputs.commitSubject,
 				delivery,
 				getToken,
 				// Undefined on the in-process/same-host paths, where the phase keeps its
@@ -2948,6 +2960,7 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 				prBranch: inputs.prBranch,
 				headSha: inputs.headSha,
 				taskId,
+				commitSubject: inputs.commitSubject,
 				delivery,
 				getToken,
 				cli,
@@ -3362,10 +3375,30 @@ async function tryFindStoredTaskBranch(
 	project: ProjectConfig,
 	taskId: string,
 ): Promise<string | undefined> {
+	return tryFindStored('task branch', findStoredTaskBranch, project, taskId);
+}
+
+/**
+ * The commit subject stored for this task by an earlier Implementation run (issue
+ * #1242), best-effort in the same way as {@link tryFindStoredTaskBranch}.
+ */
+async function tryFindStoredCommitSubject(
+	project: ProjectConfig,
+	taskId: string,
+): Promise<string | undefined> {
+	return tryFindStored('commit subject', findStoredCommitSubject, project, taskId);
+}
+
+async function tryFindStored(
+	what: string,
+	find: (projectId: string, repository: string, taskId: string) => Promise<string | undefined>,
+	project: ProjectConfig,
+	taskId: string,
+): Promise<string | undefined> {
 	try {
-		return await findStoredTaskBranch(project.id, project.repo, taskId);
+		return await find(project.id, project.repo, taskId);
 	} catch (err) {
-		logger.warn('Could not read the stored task branch (deciding it afresh)', {
+		logger.warn(`Could not read the stored ${what} (deciding it afresh)`, {
 			projectId: project.id,
 			taskId,
 			error: describeError(err),
@@ -5966,6 +5999,12 @@ async function processClaimedDispatch(
 		if (trigger.phase === 'implementation' && !job.taskBranch) {
 			const taskBranch = await tryFindStoredTaskBranch(project, trigger.taskId);
 			if (taskBranch) job.taskBranch = taskBranch;
+		}
+		// Its commit subject likewise (issue #1242), so a later attempt commits with the
+		// subject the task's branch name and earlier commits already carry.
+		if (trigger.phase === 'implementation' && !job.commitSubject) {
+			const commitSubject = await tryFindStoredCommitSubject(project, trigger.taskId);
+			if (commitSubject) job.commitSubject = commitSubject;
 		}
 
 		// Record a run-history row for this agent-CLI invocation. Everything here is

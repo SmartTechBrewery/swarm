@@ -1574,6 +1574,37 @@ describe('runAssignmentDbFree', () => {
 		);
 	});
 
+	// Issue #1242: the task's commit subject reaches the phase, and a decided one is
+	// reported for the control plane to store.
+	it('reports a decided commit subject and hands the phase a stored one', async () => {
+		const sink = recordingSink();
+		let stored: string | undefined;
+		const runPhase = vi.fn(async (inputs: AssignedPhaseInputs) => {
+			stored = inputs.commitSubject;
+			await inputs.onCommitSubjectNamed?.('VT-1538 Add the starting page');
+			return { agent: agentResult() };
+		});
+		await runAssignmentDbFree(
+			buildTaskAssignment(
+				createMockTaskAssignmentInput({
+					phase: 'implementation',
+					commitSubject: 'VT-1538 Add the first page',
+				}),
+			),
+			sink,
+			{ ...RUN_OPTIONS, deps: depsWith(runPhase) },
+		);
+
+		expect(stored).toBe('VT-1538 Add the first page');
+		expect(sink.sent).toContainEqual(
+			expect.objectContaining({
+				type: 'task-progress',
+				state: 'branch-provisioned',
+				commitSubject: 'VT-1538 Add the starting page',
+			}),
+		);
+	});
+
 	it('routes a timed-out run through the failure path even when it exited 0', async () => {
 		const sink = recordingSink();
 		const runPhase = vi.fn(async () => ({
