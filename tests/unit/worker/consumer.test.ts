@@ -6275,6 +6275,23 @@ describe('processJob', () => {
 				});
 			});
 
+			it('looks up only the PR card for a board-key task branch (issue #1226)', async () => {
+				// A board key names no SCM issue, so there is no issue artifact to try.
+				findWorkItemForArtifact.mockResolvedValue(undefined);
+
+				const outcome = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning({ ...REVIEW_TRIGGER, prBranch: 'issue-VT-1538' }),
+				);
+
+				expect(outcome.status).toBe('phase-succeeded');
+				expect(findWorkItemForArtifact).toHaveBeenCalledExactlyOnceWith({
+					repository: PROJECT.repo,
+					kind: 'pullRequest',
+					number: '17',
+				});
+			});
+
 			it('finalizes a retried run row instead of leaving it deferred', async () => {
 				findWorkItemForArtifact.mockResolvedValue(card([]));
 

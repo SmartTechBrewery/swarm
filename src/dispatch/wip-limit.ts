@@ -52,7 +52,7 @@ import {
 } from '../db/repositories/wipSlotsRepository.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
-import { issueNumberFromBranch } from '../pipeline/task-branch.js';
+import { taskIdFromBranch } from '../pipeline/task-branch.js';
 import { repositoryForJob, type SwarmJob } from '../queue/jobs.js';
 import { IN_FLIGHT_JOB_PRIORITY, PM_BOARD_JOB_PRIORITY } from '../queue/producer.js';
 import type { TriggerResult } from '../triggers/types.js';
@@ -143,7 +143,7 @@ export async function recordTicketPullRequest(
 	project: ProjectConfig,
 	pullRequest: { prNumber: string; prBranch: string },
 ): Promise<void> {
-	const taskId = issueNumberFromBranch(pullRequest.prBranch, project.branchPrefix, {
+	const taskId = taskIdFromBranch(pullRequest.prBranch, project.branchPrefix, {
 		strict: true,
 	});
 	if (!taskId) return;
@@ -230,7 +230,7 @@ export async function releasePutBackTicketSlot(
 		const taskId =
 			job.type === 'scm'
 				? job.event.prBranch
-					? issueNumberFromBranch(job.event.prBranch, project.branchPrefix, { strict: true })
+					? taskIdFromBranch(job.event.prBranch, project.branchPrefix, { strict: true })
 					: undefined
 				: (ticket.dispatchTaskId ?? ticket.cardTaskRef);
 		if (!taskId) return false;

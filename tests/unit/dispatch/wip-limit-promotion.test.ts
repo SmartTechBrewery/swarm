@@ -31,10 +31,20 @@ vi.mock('@/db/repositories/projectsRepository.js', () => ({
 const countWipSlots = vi.fn<(projectId: string, repository: string) => Promise<number>>();
 const releaseWipSlot =
 	vi.fn<(projectId: string, repository: string, taskId: string) => Promise<boolean>>();
+const recordWipSlotPullRequest =
+	vi.fn<
+		(projectId: string, repository: string, taskId: string, prNumber: string) => Promise<void>
+	>();
 vi.mock('@/db/repositories/wipSlotsRepository.js', () => ({
 	countWipSlots: (projectId: string, repository: string) => countWipSlots(projectId, repository),
 	releaseWipSlot: (projectId: string, repository: string, taskId: string) =>
 		releaseWipSlot(projectId, repository, taskId),
+	recordWipSlotPullRequest: (
+		projectId: string,
+		repository: string,
+		taskId: string,
+		prNumber: string,
+	) => recordWipSlotPullRequest(projectId, repository, taskId, prNumber),
 	reserveWipSlot: vi.fn(),
 }));
 
@@ -46,6 +56,7 @@ vi.mock('@/dispatch/dispatcher.js', () => ({
 import {
 	promoteAllWipWaits,
 	promoteWipWaits,
+	recordTicketPullRequest,
 	releasePutBackTicketSlot,
 	releaseTicketSlot,
 	wipLimitWaitReason,
@@ -213,12 +224,46 @@ describe('repository WIP limit promotion (issue #1185)', () => {
 			expect(releaseWipSlot).toHaveBeenCalledWith('swarm', REPO, '77');
 		});
 
+		it('releases a board-key task branch’s ticket by its key (issue #1226)', async () => {
+			const job = createMockScmWebhookJob();
+			if (job.type !== 'scm') throw new Error('expected an scm job');
+			job.event = { ...job.event, prBranch: 'issue-VT-1538' };
+
+			await releasePutBackTicketSlot('swarm', job, { dispatchTaskId: '99-respond' });
+
+			expect(releaseWipSlot).toHaveBeenCalledWith('swarm', REPO, 'VT-1538');
+		});
+
 		it('releases nothing when no ticket can be resolved', async () => {
 			await releasePutBackTicketSlot('swarm', createMockPmWebhookJob() as SwarmJob, {
 				dispatchTaskId: null,
 			});
 
 			expect(releaseWipSlot).not.toHaveBeenCalled();
+		});
+	});
+
+	describe('recordTicketPullRequest', () => {
+		const project = createMockProjectConfig();
+
+		it.each([
+			['an SCM-number task branch', 'issue-42', '42'],
+			['a board-key task branch (issue #1226)', 'issue-VT-1538', 'VT-1538'],
+		])('records the pull request against %s', async (_name, prBranch, taskId) => {
+			await recordTicketPullRequest(project, { prNumber: '7', prBranch });
+
+			expect(recordWipSlotPullRequest).toHaveBeenCalledExactlyOnceWith(
+				project.id,
+				project.repo,
+				taskId,
+				'7',
+			);
+		});
+
+		it('records nothing for a human branch under the prefix', async () => {
+			await recordTicketPullRequest(project, { prNumber: '7', prBranch: 'issue-hotfix-2' });
+
+			expect(recordWipSlotPullRequest).not.toHaveBeenCalled();
 		});
 	});
 

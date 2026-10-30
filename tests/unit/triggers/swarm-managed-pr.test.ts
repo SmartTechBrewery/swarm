@@ -57,6 +57,20 @@ describe('isSwarmManagedPullRequest (issue #397)', () => {
 		expect(hasRunForTask).not.toHaveBeenCalled();
 	});
 
+	it('treats a board-key task branch with an Implementation run as managed (issue #1226)', async () => {
+		await expect(
+			isSwarmManagedPullRequest(PROJECT, 'issue-VT-1538', { hasRunForTask }),
+		).resolves.toEqual({ managed: true, taskId: 'VT-1538' });
+		expect(hasRunForTask).toHaveBeenCalledWith(PROJECT.id, 'VT-1538', 'implementation');
+	});
+
+	it('still rejects a lowercase human branch under the prefix without a query', async () => {
+		await expect(
+			isSwarmManagedPullRequest(PROJECT, 'issue-hotfix-2', { hasRunForTask }),
+		).resolves.toEqual({ managed: false, reason: 'not-a-task-branch' });
+		expect(hasRunForTask).not.toHaveBeenCalled();
+	});
+
 	it('rejects a prefixed branch that encodes no work-item number', async () => {
 		await expect(
 			isSwarmManagedPullRequest(PROJECT, 'issue-fix-login', { hasRunForTask }),
