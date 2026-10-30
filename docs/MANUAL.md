@@ -857,11 +857,13 @@ flight when the limit shipped hold no slot. It is the only project-side bound: a
 admitted ticket never waits for a project slot, only for a worker with a free
 allocation.
 
-The **WIP** section of the Runs screen, between Stalled and the Queue, shows how full
-each repository is (issue #1192). A repository row reads `x / y in flight` and, when
-new tickets are held back, `n waiting`; under it is every ticket holding a slot — its
-card, its pull request once it has one, how long it has been in flight, and what it is
-doing. A ticket the pipeline cannot move on its own carries a **Waiting on you** badge
+The **Tickets in progress** section of the Runs screen, between Stalled and the
+Queue, shows how full each repository is (issue #1192; called "WIP" until #1204). Its
+heading counts the tickets holding a slot, `Tickets in progress (n)`, and adds
+`(n waiting on you)` when any need you. A repository row reads `x / y in flight`
+and, when new tickets are held back, `n waiting`; under it is every ticket holding a
+slot — its card, its pull request once it has one, how long it has been in flight, and
+what it is doing. A ticket the pipeline cannot move on its own carries a **Waiting on you** badge
 with the reason: its plan is waiting for your greenlight (move the card to Ready), its
 pull request is approved and waiting for you to merge, it reached the review cap, it
 stalled, or its latest run failed and nothing will retry it. A Review abandoned while

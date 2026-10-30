@@ -6,6 +6,7 @@ import { formatRelativeTime } from '@/lib/format.js';
 import { trpc } from '@/lib/trpc.js';
 import {
 	WIP_SECTION_EXPLANATION,
+	WIP_SECTION_TITLE,
 	wipInFlightLabel,
 	wipOperatorReasonLabel,
 	wipPipelineReasonLabel,
@@ -79,14 +80,18 @@ interface WipUsageSectionProps {
 }
 
 /**
- * The **WIP** section on the Runs screen (issue #1192): each repository's WIP limit
- * in use (issue #1185) — `x / y in flight`, how many new tickets wait for a slot,
- * and every ticket holding one with what it is doing. A holder the pipeline cannot
- * move on its own carries a **Waiting on you** badge and the reason, so a full limit
- * reads as "these need you" rather than as a hung SWARM.
+ * The **Tickets in progress** section on the Runs screen (issue #1192, renamed from
+ * "WIP" by #1204): each repository's WIP limit in use (issue #1185) — `x / y in
+ * flight`, how many new tickets wait for a slot, and every ticket holding one with
+ * what it is doing. A holder the pipeline cannot move on its own carries a **Waiting
+ * on you** badge and the reason, so a full limit reads as "these need you" rather
+ * than as a hung SWARM.
  *
  * - **Hidden entirely when no repository holds a slot or a waiter** — like the
  *   Stalled section, no permanent empty box.
+ * - **Laid out like {@link QueuedRunsSection}**: a plain heading with a muted count
+ *   sits on the page, and only the per-repository listings are cards — no panel
+ *   around them, so no card nests in a card.
  * - **A view, not a control.** The limit is edited in the repository editor and a
  *   slot frees when its ticket is merged, closed or put back; nothing here acts.
  * - Neutral-toned: a full limit is the limit working. Only the per-holder badge is
@@ -102,6 +107,8 @@ export function WipUsageSection({ entries, showProject = true }: WipUsageSection
 
 	if (entries.length === 0) return null;
 
+	// Every ticket holding a slot across the listed repositories — the rows below.
+	const ticketCount = entries.reduce((count, entry) => count + entry.tickets.length, 0);
 	const waitingOnYou = entries.reduce(
 		(count, entry) =>
 			count + entry.tickets.filter((ticket) => ticket.state === 'waiting-on-operator').length,
@@ -109,16 +116,13 @@ export function WipUsageSection({ entries, showProject = true }: WipUsageSection
 	);
 
 	return (
-		<section
-			data-testid="wip-usage-section"
-			className="space-y-2 rounded-md border border-zinc-800 bg-panel/20 p-3"
-		>
+		<section data-testid="wip-usage-section" className="space-y-2">
 			<h2>
 				<button
 					type="button"
 					aria-expanded={expanded}
 					onClick={() => setExpanded((current) => !current)}
-					className="flex w-full items-center gap-1.5 text-left text-sm font-semibold tracking-tight text-zinc-200 hover:text-zinc-100"
+					className="flex w-full items-center gap-1.5 text-left text-sm font-semibold tracking-tight text-zinc-300 hover:text-zinc-200"
 				>
 					{expanded ? (
 						<ChevronDown className="h-3.5 w-3.5 shrink-0" />
@@ -126,7 +130,7 @@ export function WipUsageSection({ entries, showProject = true }: WipUsageSection
 						<ChevronRight className="h-3.5 w-3.5 shrink-0" />
 					)}
 					<Gauge className="h-4 w-4 shrink-0 text-zinc-400" aria-hidden="true" />
-					WIP
+					{WIP_SECTION_TITLE} <span className="text-zinc-500">({ticketCount})</span>
 					{waitingOnYou > 0 && (
 						<span className="font-normal text-amber-200/80">({waitingOnYou} waiting on you)</span>
 					)}

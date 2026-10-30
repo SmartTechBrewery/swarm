@@ -1421,9 +1421,9 @@ like `runs.stalled`) returns one entry per `(project, repository)` holding a slo
 `wip-limit` waiter: `limit` (`resolveWipLimit`), `inFlight`, `waiting`
 (`countWipLimitWaitsByRepository`), and each holder with its state. The fold is the pure
 `src/queue/wip-usage.ts`, in the shape of the queued-runs and item-liveness read models, and
-the dashboard renders it as the WIP section of `/runs`
-(`dashboard/src/components/runs/wip-usage-section.tsx`); a Queue row's `wip-limit` label
-gains the same `x / y` through `QueuedRun.wipUsage`, filled by `runs.queued` from one
+the dashboard renders it as the **Tickets in progress** section of `/runs` (titled "WIP"
+until issue #1204; `dashboard/src/components/runs/wip-usage-section.tsx`); a Queue row's
+`wip-limit` label gains the same `x / y` through `QueuedRun.wipUsage`, filled by `runs.queued` from one
 `listWipSlots` read made only when the page holds such a row.
 
 - **A holder's state is derived from liveness, never persisted.** `running` (a live run),

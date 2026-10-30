@@ -106,6 +106,15 @@ describe('QueuedRunsSection', () => {
 		expect(screen.queryByTestId('queued-runs-section')).toBeNull();
 	});
 
+	// Issue #1204: the heading carries an icon, like every other Runs section heading.
+	it('heads the section with an icon, the title and the muted count', () => {
+		renderSection(<QueuedRunsSection items={[githubItem, boardItem]} />);
+
+		const heading = screen.getByRole('heading', { level: 2 });
+		expect(heading.textContent).toBe('Queued (2)');
+		expect(heading.querySelector('svg')).not.toBeNull();
+	});
+
 	it('renders a card per item with the right phase label and Task reference', () => {
 		renderSection(<QueuedRunsSection items={[githubItem, boardItem]} />);
 		const [reviewCard, boardCard] = cards();
