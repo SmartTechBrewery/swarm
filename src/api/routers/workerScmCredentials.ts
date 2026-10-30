@@ -143,8 +143,10 @@ export const workerScmCredentialsRouter = router({
 	 * provider (`findWorkerScmRepository`), for a provider whose identity is scoped
 	 * below the account: an Azure DevOps PAT resolves only within an organization
 	 * (issue #1089 phase 6/6), so a worker not yet enrolled in an Azure DevOps project
-	 * cannot have its Azure DevOps credential verified, and so cannot store one. The
-	 * other providers ignore it.
+	 * cannot have its Azure DevOps credential verified, and so cannot store one. That
+	 * case is refused as `PRECONDITION_FAILED` — "not checked" — rather than as an
+	 * invalid credential (issue #1220): the value was never sent anywhere. The other
+	 * providers ignore the repository.
 	 *
 	 * Returns the login the secret resolved to, so the form can confirm the account
 	 * this machine will commit, push and comment as. It is not persisted.
@@ -163,6 +165,18 @@ export const workerScmCredentialsRouter = router({
 
 			const repo = await findWorkerScmRepository(input.workerId, provider.id);
 			const verification = await verifyScmCredentialSecret(provider.id, input.value, repo);
+			if (!verification.valid && 'reason' in verification && verification.reason === 'unscoped') {
+				// Provider-neutral on purpose: which providers need a scope is
+				// `scm-verification.ts`'s knowledge, and the dashboard shows this message too.
+				throw new TRPCError({
+					code: 'PRECONDITION_FAILED',
+					message:
+						`That credential was not checked, so nothing was stored: a ${provider.label} ` +
+						'credential is verified against a repository this worker is enrolled on, and ' +
+						`the worker has no enrollment in a ${provider.label} project yet. Enroll it in ` +
+						'that project first, then store the credential again.',
+				});
+			}
 			if (!verification.valid) {
 				throw new TRPCError({
 					code: 'BAD_REQUEST',

@@ -19,7 +19,8 @@
  * PAT is scoped to one organization by default, so a bare secret identifies no
  * account. The caller passes a repository the secret is meant to reach and the
  * organization is read off it; the other providers ignore it. Without one, an Azure
- * DevOps secret reads as "cannot be verified" — never as verified.
+ * DevOps secret is reported as `unscoped` (issue #1220) — never as verified, and
+ * never as invalid either, since it was never sent anywhere to be checked.
  *
  * Each lookup already swallows a failed call to `null`, so an unreachable provider
  * is reported as an invalid credential rather than as an inconclusive check. That is
@@ -39,8 +40,16 @@ import type { ScmType } from '../scm/types.js';
  * login is the same namespace each provider's persona identities and loop prevention
  * compare in, so a verified value is one an operator can check against the account
  * they intended.
+ *
+ * `reason: 'unscoped'` is the third outcome (issue #1220): the secret was never
+ * checked, because the provider verifies it within a scope (Azure DevOps: an
+ * organization) the caller named no repository for. A caller must not report that
+ * as an invalid credential.
  */
-export type ScmCredentialVerification = { valid: true; login: string } | { valid: false };
+export type ScmCredentialVerification =
+	| { valid: true; login: string }
+	| { valid: false }
+	| { valid: false; reason: 'unscoped' };
 
 /**
  * Resolve `secret` to an account on `providerId`, or report it as invalid. `repo` is a
@@ -52,32 +61,29 @@ export async function verifyScmCredentialSecret(
 	secret: string,
 	repo?: string,
 ): Promise<ScmCredentialVerification> {
-	const login = await resolveLogin(providerId, secret, repo);
-	return login ? { valid: true, login } : { valid: false };
-}
-
-async function resolveLogin(
-	providerId: ScmType,
-	secret: string,
-	repo: string | undefined,
-): Promise<string | null> {
 	switch (providerId) {
 		case 'github':
-			return await getGitHubUserForToken(secret);
+			return fromLogin(await getGitHubUserForToken(secret));
 		case 'bitbucket':
-			return await getBitbucketUserForCredential(secret);
+			return fromLogin(await getBitbucketUserForCredential(secret));
 		case 'gitlab':
-			return await getGitLabUserForToken(secret);
+			return fromLogin(await getGitLabUserForToken(secret));
 		case 'azure-devops': {
 			// No repository, or one not in Azure's three-segment shape, names no
-			// organization to resolve the PAT in.
-			if (!repo || repoCoordinatesIssue('azure-devops', repo) !== null) return null;
-			return await getAzureDevOpsUserForToken(secret, repo.split('/')[0] as string);
+			// organization to resolve the PAT in — so it is not sent anywhere.
+			if (!repo || repoCoordinatesIssue('azure-devops', repo) !== null) {
+				return { valid: false, reason: 'unscoped' };
+			}
+			return fromLogin(await getAzureDevOpsUserForToken(secret, repo.split('/')[0] as string));
 		}
 		default:
 			// A provider id from the closed `ScmType` list that no branch above serves —
 			// unreachable today, and a fifth provider registering without adding its
 			// lookup here must read as "cannot be verified" rather than as verified.
-			return null;
+			return { valid: false };
 	}
+}
+
+function fromLogin(login: string | null): ScmCredentialVerification {
+	return login ? { valid: true, login } : { valid: false };
 }
