@@ -1315,6 +1315,19 @@ then run `swarm identities link --user <identifier> --provider jira --handle
 --handle <old handle>` — or do both under **Settings → Users** in the dashboard.
 No restart is needed: the next dispatch reads the link.
 
+**A Jira card with no GitHub link runs under its own key.** Since issue #1230 a
+`swarm`-labelled Jira card whose remote links name no GitHub *issue* — none at all,
+or only a pull request — names its task by its issue key, so moving it to the
+status mapped to `planning` / `todo` starts Planning / Implementation on any
+source-control provider, Azure DevOps included: the worktree is `task-VT-1538` and
+the branch `<branchPrefix>VT-1538` (pick a `branchPrefix` that suits a key — see
+[`docs/configuration.md`](./configuration.md#repositories)). A card **with** a
+GitHub issue link keeps that issue's number exactly as before, and a card linked
+into a repository the run is not for is still skipped with
+`pm-status: work item has no backing SCM artifact reference` rather than falling
+back to the key — so to run such a card under its key, remove the stray link.
+Linear and Trello cards still need a GitHub issue link.
+
 **A run that was cancelled leaves its trail in the log, not in Redis.** The
 cancellation marker and its recorded origin are deleted the moment the worker acts
 on them, so grep the log rather than Redis:
