@@ -29,7 +29,9 @@ import { Queue } from 'bullmq';
 import { Redis } from 'ioredis';
 import type { ProjectConfig } from '../config/schema.js';
 import {
+	type CreateDispatchInput,
 	createDispatch,
+	createDispatchForOrphanedRun,
 	type DispatchRow,
 	failExpiredDispatchLeases,
 	failSupersededWorkerDispatchClaims,
@@ -40,6 +42,7 @@ import { findProjectByIdFromDb } from '../db/repositories/projectsRepository.js'
 import {
 	failRunFromStatus,
 	getPendingReviewMergeFollowUps,
+	type PipelineRunRow,
 } from '../db/repositories/runsRepository.js';
 import { requireEnv } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
@@ -71,12 +74,16 @@ const SUPERSEDED_WORKER_SESSION_REASON =
 	"The worker's session was superseded by a newer one while this phase was executing — settled from that signal, not from the lease window";
 
 /**
- * How long every dispatch of a deferred run must have been left alone before the
- * periodic pass reads the run as orphaned (issue #1210). A Reset (`./run-reset.ts`)
- * cancels the run's active dispatch, tears down its checkout, and only then
- * creates the replacement; importing the run inside that gap would make the Reset
- * refuse with `already-resetting` and restart the run on its un-sanitised payload.
- * The cancelled dispatch's fresh `updated_at` is what this grace keys on.
+ * How long a deferred run's dispatches — and its last Reset — must have been left
+ * alone before the periodic pass reads the run as orphaned (issue #1210). A Reset
+ * (`./run-reset.ts`) cancels the run's active dispatch, tears down its checkout,
+ * and only then creates the replacement; importing the run inside that gap would
+ * make the Reset refuse with `already-resetting` and restart the run on its
+ * un-sanitised payload. The grace keys on two marks: every dispatch row's
+ * `updated_at`, and `runs.reset_started_at`, which a Reset stamps before it
+ * cancels anything — the only mark a Reset of a run with no active dispatch
+ * leaves. The import itself re-checks the latter under a lock on the run row
+ * (`createDispatchForOrphanedRun`), so a Reset beginning mid-pass is not raced.
  */
 export const ORPHAN_SETTLE_GRACE_MS = 2 * 60 * 1000;
 
@@ -243,6 +250,30 @@ async function backfillLegacyPendingContinuations(): Promise<number> {
 }
 
 /**
+ * The `retry-scheduled` dispatch an orphaned retry-pending run is imported as:
+ * its stored `jobPayload` is the retry intent, its `nextRetryAt` (or now) the
+ * schedule. `null` for a payload that is absent or no longer parses.
+ */
+function orphanDispatchInput(run: PipelineRunRow): CreateDispatchInput | null {
+	const parsed = SwarmJobSchema.safeParse(run.jobPayload);
+	if (!parsed.success) return null;
+	const job: SwarmJob = { ...parsed.data, runId: run.id };
+	return {
+		projectId: run.projectId,
+		jobPayload: job,
+		priority: priorityFor(job) ?? 0,
+		source: 'recovered',
+		state: 'retry-scheduled',
+		waitReason: 'recovered',
+		availableAt: run.nextRetryAt ?? new Date(),
+		runId: run.id,
+		taskId: run.taskId,
+		phase: run.phase as TriggerPhase,
+		attempt: job.rateLimitRetryAttempt ?? 0,
+	};
+}
+
+/**
  * Import `deferred` runs with no active dispatch as `retry-scheduled`
  * dispatches — the durable repair for a retry whose delayed job vanished (the
  * #269/#279 orphan shapes, or any later cause). The run row's persisted
@@ -295,21 +326,17 @@ async function backfillOrphanedDeferredRuns(
 			);
 			continue;
 		}
-		const job: SwarmJob = { ...parsed.data, runId: run.id };
 		try {
-			const { dispatch } = await createDispatch({
-				projectId: run.projectId,
-				jobPayload: job,
-				priority: priorityFor(job) ?? 0,
-				source: 'recovered',
-				state: 'retry-scheduled',
-				waitReason: 'recovered',
-				availableAt: run.nextRetryAt ?? new Date(),
-				runId: run.id,
-				taskId: run.taskId,
-				phase: run.phase as TriggerPhase,
-				attempt: job.rateLimitRetryAttempt ?? 0,
-			});
+			// Rebuilt from the run row as re-read under its lock, not from `run`: a
+			// Reset that began since the list read has sanitised the payload (or is
+			// about to), and is then left alone rather than raced.
+			const dispatch = await createDispatchForOrphanedRun(run.id, options, orphanDispatchInput);
+			if (!dispatch) {
+				logger.debug('dispatch-reconciler: deferred run changed under the pass — skipping', {
+					runId: run.id,
+				});
+				continue;
+			}
 			await publishDispatchWakeUp(dispatch);
 			imported.push(run.id);
 		} catch (err) {

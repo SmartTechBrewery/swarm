@@ -19,6 +19,7 @@ import {
 	completeRun,
 	createRun,
 	getRunByIdFromDb,
+	markRunResetStarted,
 	updateReviewMergeOutcome,
 } from '../../../src/db/repositories/runsRepository.js';
 import { createUser } from '../../../src/db/repositories/usersRepository.js';
@@ -26,6 +27,7 @@ import { createEnrollment } from '../../../src/db/repositories/workerEnrollments
 import { acquireLease } from '../../../src/db/repositories/workerSessionsRepository.js';
 import { createWorker } from '../../../src/db/repositories/workersRepository.js';
 import { dispatches } from '../../../src/db/schema/dispatches.js';
+import { runs } from '../../../src/db/schema/runs.js';
 import {
 	ORPHAN_SETTLE_GRACE_MS,
 	reconcileDispatchesAtStartup,
@@ -375,6 +377,27 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 				await reconcileDispatchesAtStartup();
 
 				expect(await getActiveDispatchByRunId(runId)).toBeUndefined();
+			});
+
+			// A Reset of a run with no active dispatch touches no dispatch row, so the
+			// grace reads the run's own `reset_started_at` instead.
+			it('does not re-queue a stranded run while a Reset of it is in progress', async () => {
+				const { runId, dispatchId } = await strandedRun();
+				await backdate(dispatchId);
+				await markRunResetStarted(runId);
+
+				await reconcileDispatchesPeriodically();
+				expect(await getActiveDispatchByRunId(runId)).toBeUndefined();
+
+				// A Reset that began longer ago than the grace no longer shields the run.
+				await getDb()
+					.update(runs)
+					.set({ resetStartedAt: new Date(Date.now() - ORPHAN_SETTLE_GRACE_MS - 60_000) })
+					.where(eq(runs.id, runId));
+				await reconcileDispatchesPeriodically();
+				expect(await getActiveDispatchByRunId(runId)).toMatchObject({
+					state: 'retry-scheduled',
+				});
 			});
 
 			it('is idempotent — two periodic passes leave exactly one active dispatch', async () => {

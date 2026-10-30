@@ -828,8 +828,14 @@ durable dispatches. Deferred (or checkpointed) runs with no active dispatch are
 re-queued as `retry-scheduled` dispatches at startup **and on every periodic pass**
 (issue #1210), so a run orphaned by any cause no longer waits for a router restart
 or an operator's Retry now. The periodic pass skips a run any of whose dispatches
-changed within the 2-minute settle grace (`ORPHAN_SETTLE_GRACE_MS`), which keeps it
-out of a Reset's cancel-then-recreate window, and neither pass ever imports a run an
+changed — or whose Reset began (`runs.reset_started_at`, stamped by Reset before it
+cancels anything, since a Reset of a run with no active dispatch touches no dispatch
+row) — within the 2-minute settle grace (`ORPHAN_SETTLE_GRACE_MS`), and re-reads the
+run row `FOR UPDATE` before creating the dispatch (`createDispatchForOrphanedRun`),
+building it from that read. A Reset's stamp therefore either commits first and the
+import skips, or waits behind the import and then cancels the dispatch it created —
+so the pass stays out of a Reset's cancel-then-recreate window and never imports a
+payload read before Reset sanitised it. Neither pass ever imports a run an
 active #1049 recheck backs — that recheck carries no `run_id` by design, so it is
 found with the same predicate the run detail uses (`awaitsReviewRecheck`,
 `src/dispatch/review-recheck-wait.ts`).

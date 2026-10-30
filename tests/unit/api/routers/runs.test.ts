@@ -319,6 +319,7 @@ function makeRun(overrides: Partial<RunRow> = {}): RunRow {
 		agentSessionId: null,
 		recovery: null,
 		cancellation: null,
+		resetStartedAt: null,
 		checkpoint: null,
 		continuationCount: 0,
 		outputBytes: 0,
