@@ -611,7 +611,8 @@ export interface CompleteRunInput {
 	checkpoint?: Checkpoint;
 	/**
 	 * The run's checkpoint-continuation count *after* this settle — written only by a
-	 * `checkpointed` settle, which is the one thing that spends the budget.
+	 * `checkpointed` settle, which is the one thing that spends the budget. A usage-limit
+	 * stop's `checkpointed` settle writes it unchanged (issue #1219).
 	 */
 	continuationCount?: number;
 	/**
