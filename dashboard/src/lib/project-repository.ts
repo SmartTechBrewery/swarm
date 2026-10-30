@@ -58,8 +58,9 @@ export interface RepositoryEntry {
 	baseBranch?: string;
 	/**
 	 * The legacy task-branch prefix. No longer edited here (issue #1241) — it is
-	 * carried through unchanged, because it is still the pattern of an entry stating
-	 * none and its `<prefix><id>` shape stays recognised for branches already open.
+	 * carried through exactly as stored, absent included (issue #1250), because it is
+	 * still the pattern of an entry stating none and its `<prefix><id>` shape stays
+	 * recognised for pull requests whose run stored no branch. Absent means `issue-`.
 	 */
 	branchPrefix?: string;
 	/** How this repository names its task branches (issue #1241). Unset means `<branchPrefix>{issue_key}`. */
@@ -101,8 +102,13 @@ export interface RepositoryForm {
 	id: string;
 	repo: string;
 	baseBranch: string;
-	/** Carried through, never edited here (issue #1241) — see {@link RepositoryEntry.branchPrefix}. */
-	branchPrefix: string;
+	/**
+	 * Carried opaquely, never edited here (issues #1241, #1250) — see
+	 * {@link RepositoryEntry.branchPrefix}. Absent while the entry states none, so a save
+	 * writes none back rather than turning the server's `issue-` default into an explicit
+	 * `''`; read it through {@link legacyBranchPattern}, never directly.
+	 */
+	branchPrefix?: string;
 	/**
 	 * The repository's own branch name pattern (issue #1241). `''` states none, so the
 	 * entry keeps running on `<branchPrefix>{issue_key}` and is saved without the key.
@@ -197,7 +203,6 @@ export function toRepositoryForms(repositories: RepositoryEntry[] | undefined): 
 		id: String(index + 1),
 		repo: entry.repo,
 		baseBranch: entry.baseBranch ?? '',
-		branchPrefix: entry.branchPrefix ?? '',
 		branchPattern: entry.branchPattern ?? '',
 		commitSubjectPattern: entry.commitSubjectPattern ?? '',
 		commitSubjectMaxLength: entry.commitSubjectMaxLength?.toString() ?? '',
@@ -205,6 +210,7 @@ export function toRepositoryForms(repositories: RepositoryEntry[] | undefined): 
 		reviewChecks: entry.reviewChecks ?? DEFAULT_REVIEW_CHECKS_POLICY,
 		reviewChecksWaitMinutes: entry.reviewChecksWaitMinutes?.toString() ?? '',
 		wipLimit: entry.wipLimit?.toString() ?? '',
+		...(entry.branchPrefix !== undefined ? { branchPrefix: entry.branchPrefix } : {}),
 		...(entry.pmRoutingToken ? { pmRoutingToken: entry.pmRoutingToken } : {}),
 	}));
 	return rows.length > 0 ? rows : [{ id: '1', ...NEW_REPOSITORY }];
@@ -214,8 +220,10 @@ export function toRepositoryForms(repositories: RepositoryEntry[] | undefined): 
  * The `repositories` list to send on save. The whole list goes every time, because
  * `projects.update` replaces it wholesale — so a field this screen does not edit still
  * has to be written back, or saving the tab would delete it. `pmRoutingToken` (issue
- * #686) is the one such field: it is authored in `swarm.config.json`, has no input
- * here, and is carried straight through from the row it was read onto.
+ * #686) and `branchPrefix` (issue #1250) are such fields: authored in
+ * `swarm.config.json`, with no input here, and carried straight through from the row
+ * they were read onto. The prefix is written exactly as stored — an explicit `''`
+ * included, an absent one left absent — since an absent prefix means `issue-`.
  *
  * A pre-#727 per-repository `scm` is deliberately *not* one of those: it is dropped
  * here exactly as the server drops it on parse, so the two surfaces agree that a
@@ -234,7 +242,7 @@ export function toRepositoryEntries(rows: RepositoryForm[]): RepositoryEntry[] {
 		return {
 			repo: row.repo,
 			baseBranch: row.baseBranch,
-			branchPrefix: row.branchPrefix,
+			...(row.branchPrefix !== undefined ? { branchPrefix: row.branchPrefix } : {}),
 			...(row.branchPattern ? { branchPattern: row.branchPattern } : {}),
 			...(row.commitSubjectPattern ? { commitSubjectPattern: row.commitSubjectPattern } : {}),
 			...(maxLength ? { commitSubjectMaxLength: Number(maxLength) } : {}),
@@ -248,14 +256,24 @@ export function toRepositoryEntries(rows: RepositoryForm[]): RepositoryEntry[] {
 }
 
 /**
- * The pattern a row names its task branches by (issue #1241) — its own, or its legacy
- * prefix as `<prefix>{issue_key}`, the same resolution the server applies
+ * The pattern a row's legacy prefix stands for, `<prefix>{issue_key}` (issue #1250). An
+ * entry stating no prefix runs on `issue-`, exactly as the server resolves it
+ * (`legacyPrefix`, `src/pipeline/task-branch.ts`) — so it reads `issue-{issue_key}`,
+ * while an explicit `''` reads `{issue_key}`.
+ */
+export function legacyBranchPattern(row: Pick<RepositoryForm, 'branchPrefix'>): string {
+	return branchPatternFromPrefix(row.branchPrefix ?? DEFAULT_BRANCH_PREFIX);
+}
+
+/**
+ * The pattern a row names its task branches by (issue #1241) — its own, or its
+ * {@link legacyBranchPattern}, the same resolution the server applies
  * (`resolveBranchPattern`, `src/pipeline/task-branch.ts`).
  */
 export function effectiveBranchPattern(
 	row: Pick<RepositoryForm, 'branchPattern' | 'branchPrefix'>,
 ): string {
-	return row.branchPattern || branchPatternFromPrefix(row.branchPrefix);
+	return row.branchPattern || legacyBranchPattern(row);
 }
 
 /**
@@ -267,7 +285,7 @@ export function branchPatternPatch(
 	row: Pick<RepositoryForm, 'branchPrefix'>,
 	pattern: string,
 ): Pick<RepositoryForm, 'branchPattern'> {
-	return { branchPattern: pattern === branchPatternFromPrefix(row.branchPrefix) ? '' : pattern };
+	return { branchPattern: pattern === legacyBranchPattern(row) ? '' : pattern };
 }
 
 /**
