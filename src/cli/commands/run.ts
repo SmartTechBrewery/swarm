@@ -19,7 +19,8 @@
  * (`../_shared/operator-client.ts`) with the cached `swarm login` session (issue
  * #1182): the dashboard's own `runs.list` / `runs.getById` / `runs.getLogs` /
  * `runs.getOutput`, so a caller reads exactly what the dashboard shows them. They
- * need `SWARM_CONTROL_PLANE_URL` and **no `DATABASE_URL`**, which is the point on
+ * need `SWARM_CONTROL_PLANE_URL` (the environment, else this checkout's `.env` —
+ * `../_shared/control-plane-env.ts`) and **no `DATABASE_URL`**, which is the point on
  * a host with no shell (the VPS behind Caddy, issue #1153). They import nothing
  * new from `../../db/*`; response shapes are declared here, never imported from
  * the router, for the reason `operator-client.ts` gives.
@@ -79,7 +80,8 @@ Usage:
            "Terminate" from the dashboard first.
 
 list, show and logs read over the control plane with your \`swarm login\` session
-and need SWARM_CONTROL_PLANE_URL — no database and no browser. They show exactly
+and need SWARM_CONTROL_PLANE_URL (from the environment, or this checkout's .env)
+— no database and no browser. They show exactly
 what the dashboard shows you, no more. --json prints the control plane's payload
 unchanged, for scripts. Example: swarm run list --status failed --since 24h
 

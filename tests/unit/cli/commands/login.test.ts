@@ -21,7 +21,10 @@ const {
 // covered by tests/unit/cli/control-plane-env.test.ts.
 const { ensureControlPlaneUrl } = vi.hoisted(() => ({ ensureControlPlaneUrl: vi.fn() }));
 
-vi.mock('@/cli/_shared/control-plane-env.js', () => ({ ensureControlPlaneUrl }));
+vi.mock('@/cli/_shared/control-plane-env.js', () => ({
+	CONTROL_PLANE_ENV: 'SWARM_CONTROL_PLANE_URL',
+	ensureControlPlaneUrl,
+}));
 vi.mock('@/cli/_shared/secret-input.js', () => ({ promptHidden, readStdin }));
 vi.mock('@/cli/_shared/operator-session-cache.js', () => ({
 	readOperatorSessionCache,
@@ -160,7 +163,9 @@ describe('swarm login', () => {
 		stubFetch({ status: 401, body: { error: 'Unauthorized', reason: 'Invalid credentials' } });
 
 		expect(await run(['--identifier', 'ada@example.com'])).toBe(1);
-		expect(printed()).toContain('login failed — check the identifier and password');
+		expect(printed()).toContain(
+			`login to ${CONTROL_PLANE} failed — check the identifier and password`,
+		);
 		expect(writeOperatorSessionCache).not.toHaveBeenCalled();
 	});
 
@@ -233,7 +238,9 @@ describe('swarm login', () => {
 		stubFetch({ status: 200, body: { token: TOKEN, expiresAt: EXPIRES_AT, user: USER } });
 
 		await run(['--identifier', USER.identifier, '--control-plane-url', CONTROL_PLANE]);
-		expect(ensureControlPlaneUrl).toHaveBeenCalledWith(CONTROL_PLANE);
+		expect(ensureControlPlaneUrl).toHaveBeenCalledWith(CONTROL_PLANE, {
+			onEnvFileConflict: 'warn',
+		});
 	});
 
 	it('signs in to nothing when the checkout cannot be pointed at a control plane', async () => {
@@ -305,7 +312,7 @@ describe('swarm login --status', () => {
 		const fetchMock = stubFetch();
 
 		expect(await run(['--status'])).toBe(1);
-		expect(printed()).toContain('not signed in — run `swarm login`');
+		expect(printed()).toContain(`not signed in to ${CONTROL_PLANE} — run \`swarm login\``);
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
@@ -338,7 +345,9 @@ describe('swarm login --status', () => {
 		stubFetch({ status: 401, body: { error: 'Unauthorized' } });
 
 		expect(await run(['--status'])).toBe(1);
-		expect(printed()).toContain('the cached session was rejected (expired or revoked)');
+		expect(printed()).toContain(
+			`the cached session for ${CONTROL_PLANE} was rejected (expired or revoked)`,
+		);
 	});
 
 	it('identifies an unexpected successful cached-session response as version skew', async () => {
@@ -400,7 +409,7 @@ describe('swarm login --logout', () => {
 		expect(await run(['--logout'])).toBe(0);
 		expect(fetchMock).not.toHaveBeenCalled();
 		expect(clearOperatorSessionCache).not.toHaveBeenCalled();
-		expect(printed()).toContain('not signed in — nothing to revoke');
+		expect(printed()).toContain(`not signed in to ${CONTROL_PLANE} — nothing to revoke`);
 	});
 
 	it('deletes an unreadable entry it cannot revoke, and says so', async () => {

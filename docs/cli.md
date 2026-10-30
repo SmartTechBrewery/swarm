@@ -42,7 +42,31 @@ a machine no longer needs a database on the machine being onboarded. **So are
 the same operator API and session, while `run reset` stays database-backed.
 `npm run swarm -- …` and the dedicated npm
 wrappers (`db:seed`, `queue:clear`, `worktrees:prune`) load `.env` for you;
-invoking the global `swarm` binary directly requires those vars to be exported.
+invoking the global `swarm` binary directly requires those vars to be exported —
+except `SWARM_CONTROL_PLANE_URL`, which every command resolves itself.
+
+**Which installation a command talks to** (issue #1214). Every command that needs
+`SWARM_CONTROL_PLANE_URL` — `login`, every `workers` subcommand, `run list/show/logs`
+— resolves it by the same rule, and the first non-empty value wins:
+
+1. `--control-plane-url <url>`, on the commands that take it (`login`,
+   `workers setup`, `workers register-and-enroll`);
+2. `SWARM_CONTROL_PLANE_URL` in the environment;
+3. `SWARM_CONTROL_PLANE_URL` in this SWARM checkout's `.env`, read with Node's own
+   `.env` parser (the last assignment wins, as it does for the daemon).
+
+The worker daemon follows the same rule: it takes no flag, and Node's
+`--env-file-if-exists` lets the environment win over `.env`. So `swarm workers list`
+right after a `swarm login` that left the URL in `.env` reaches the same
+installation with nothing exported, and an exported URL is never silently
+overridden by `.env`. Writing `.env` is separate from reading it: the URL is
+appended only when the file carries no assignment. When the resolved URL differs
+from one already there, `swarm login` **warns**, naming both, and signs in to the
+resolved one; `workers setup` and `register-and-enroll` **refuse**, because the
+worker they register is started by a daemon that reads only `.env` (under launchd,
+nothing else) and would connect to the other installation. Errors that depend on
+the installation — not signed in, an expired or rejected session, a failed login,
+an unreachable control plane — name the URL they used.
 
 Run `swarm --help`, or `swarm <command> --help` on the multi-subcommand commands
 (`config`, `queue`, `run`, `users`, `members`, `identities`, `workers`, `pm`), to
@@ -350,12 +374,17 @@ plane.
 - **`swarm login`** — prompts for an identifier (echoed; it is not a secret) and a
   password (never echoed), authenticates against the control plane, verifies the
   session it was issued, and caches the opaque token locally. `--control-plane-url
-  <url>` names the installation and writes `SWARM_CONTROL_PLANE_URL` into this
-  checkout's `.env` when it carries none — the same idempotent bootstrap
-  [`workers register-and-enroll`](#swarm-workers) performs, and needed here because
-  this is the *first* command a machine being onboarded runs, before that one has
-  written anything. An existing assignment is kept and reported rather than
-  rewritten, so the flag is a once-per-machine affair. When stdin is a
+  <url>` names the installation — overriding the environment and `.env`
+  (see "Which installation a command talks to" under
+  [Invoking the CLI](#invoking-the-cli)) — and writes
+  `SWARM_CONTROL_PLANE_URL` into this checkout's `.env` when it carries none — the
+  same idempotent bootstrap [`workers register-and-enroll`](#swarm-workers)
+  performs, and needed here because this is the *first* command a machine being
+  onboarded runs, before that one has written anything. An existing assignment is
+  never rewritten, so the flag is a once-per-machine affair; when the flag or the
+  environment names a different installation than `.env`, login warns, naming both,
+  and signs in to the one it was asked for. A rejected password names the
+  installation it was checked against. When stdin is a
   **pipe** the password is read from it, so `--identifier <id>` is then required —
   stdin is already spoken for.
 - **`--status`** — reports who the cached token resolves to by *asking* the control
@@ -518,14 +547,15 @@ swarm workers approve <worker-id> <project-id>
 swarm workers consent <worker-id> <project-id> <on|off>
 ```
 
-**Requires `SWARM_CONTROL_PLANE_URL` and a [`swarm login`](#swarm-login) session —
+**Requires `SWARM_CONTROL_PLANE_URL` (exported, or in this checkout's `.env`) and a
+[`swarm login`](#swarm-login) session —
 and no `DATABASE_URL`** (issue #800). Every subcommand but `add-checkout` and
 `remove-checkout`, which are host-local (below), calls the control plane's
 operator API (`/operator/trpc/*`) over the network, exactly as the worker daemon
 calls the transport, so the whole group runs from the machine being onboarded
 rather than only from the control-plane host. An absent or expired session is one
-actionable line and exit 1 ("not signed in — run `swarm login`"); so is an unset
-`SWARM_CONTROL_PLANE_URL`.
+actionable line and exit 1 ("not signed in to `<url>` — run `swarm login`"); so is a
+`SWARM_CONTROL_PLANE_URL` set neither in the environment nor in `.env`.
 
 A refusal is reported in the **control plane's own words**. The procedures already
 name what disagrees — the capability the machine never probed, the two
@@ -657,8 +687,8 @@ unchanged.
   until now nothing wrote it, leaving an `echo` in a runbook as the last hand step
   of onboarding. `swarm init` cannot serve that machine: it copies
   `.env.docker.example` wholesale, `DATABASE_URL` included. So this command resolves
-  the URL from `--control-plane-url`, else the environment, else a prompt on a TTY,
-  and appends the assignment — **before** anything else, because every step after it
+  the URL from `--control-plane-url`, else the environment, else `.env`, else a
+  prompt on a TTY, and appends the assignment when `.env` has none — **before** anything else, because every step after it
   needs that URL (`requireOperator` included) and because the start line it prints
   at the end names a daemon that reads the same file. Two rules make it safe on a
   machine that is already onboarded, which is the normal case for a second worker:
@@ -666,8 +696,9 @@ unchanged.
   not an edit), and the file is only ever **appended** to — never parsed and
   rewritten, so nothing it does not understand can be lost. The two states it cannot
   settle by appending are refused for a human rather than guessed at: a
-  `--control-plane-url` that disagrees with the stored one (it names both, and says
-  to edit `.env` by hand if the machine is genuinely moving installation) and a key
+  `--control-plane-url` or exported `SWARM_CONTROL_PLANE_URL` that disagrees with the
+  stored one (it names both, and says to edit `.env` by hand if the machine is
+  genuinely moving installation, or to drop the flag / unset the variable) and a key
   present with an empty value. It writes a file and contacts nothing — a URL that
   parses is not yet a URL that answers, which is what the session below finds out.
   The **SCM provider is resolved from the target

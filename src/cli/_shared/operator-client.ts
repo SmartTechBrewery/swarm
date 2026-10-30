@@ -34,13 +34,12 @@
  */
 
 import { z } from 'zod';
+import { CONTROL_PLANE_ENV, resolveControlPlaneUrl } from './control-plane-env.js';
 import {
 	type OperatorSessionCache,
 	operatorSessionCachePath,
 	readOperatorSessionCache,
 } from './operator-session-cache.js';
-
-const CONTROL_PLANE_ENV = 'SWARM_CONTROL_PLANE_URL';
 
 /**
  * The path the operator API is mounted under, stated here rather than imported
@@ -126,18 +125,24 @@ export class OperatorApiError extends Error {
  *
  * - `UNAUTHORIZED` is the one refusal with a fixed remedy, and the token is opaque
  *   here, so this client cannot tell an expired session from a revoked one — the
- *   answer is the same command either way.
+ *   answer is the same command either way. It names the control plane, since a
+ *   session that "expired" on the wrong installation was never valid there.
  * - A tRPC "no procedure found" is a *deployment* mismatch, not a request error:
  *   the CLI called something this control plane does not serve.
  * - A 404 with no tRPC envelope at all means `/operator/trpc` is not mounted —
  *   the same skew, one release earlier.
  */
-function failureMessage(procedurePath: string, status: number, body: unknown): string {
+function failureMessage(
+	controlPlaneUrl: string,
+	procedurePath: string,
+	status: number,
+	body: unknown,
+): string {
 	const failure = TrpcErrorSchema.safeParse(body);
 	if (failure.success) {
 		const { message, data } = failure.data.error;
 		if (data?.code === 'UNAUTHORIZED') {
-			return 'your control-plane session has expired — run `swarm login`';
+			return `your control-plane session at ${controlPlaneUrl} has expired — run \`swarm login\``;
 		}
 		if (/^No procedure found on path/i.test(message)) {
 			return `${message} — this control plane is running an older build than your CLI; update it, or run a CLI matching it`;
@@ -198,7 +203,9 @@ async function call<T>(
 	// message there, and that message is the whole point of surfacing the failure.
 	const body = await response.json().catch(() => undefined);
 	if (!response.ok) {
-		throw new OperatorApiError(failureMessage(procedurePath, response.status, body));
+		throw new OperatorApiError(
+			failureMessage(options.controlPlaneUrl, procedurePath, response.status, body),
+		);
 	}
 
 	const envelope = TrpcSuccessSchema.safeParse(body);
@@ -238,33 +245,22 @@ export interface OperatorSession {
 }
 
 /**
- * `SWARM_CONTROL_PLANE_URL` plus the cached `swarm login` session, or the single
- * actionable line explaining which of the two is missing. The token is not
- * re-validated here — it is opaque to this process, and the first call spends it,
- * which is what turns an expired one into {@link failureMessage}'s "run
- * `swarm login`".
+ * The control-plane URL — resolved by the precedence every `swarm` command shares
+ * (`./control-plane-env.ts`: the environment, then this checkout's `.env`) — plus
+ * the cached `swarm login` session, or the single actionable line explaining which
+ * of the two is missing. The token is not re-validated here — it is opaque to this
+ * process, and the first call spends it, which is what turns an expired one into
+ * {@link failureMessage}'s "run `swarm login`".
  */
 export function requireOperatorSession(): { session: OperatorSession } | { error: string } {
-	const raw = process.env[CONTROL_PLANE_ENV]?.trim();
-	if (!raw) {
-		return {
-			error: `${CONTROL_PLANE_ENV} is unset — point it at this installation's router (e.g. https://swarm.example.com)`,
-		};
-	}
-	let base: URL;
-	try {
-		base = new URL(raw);
-	} catch {
-		return { error: `${CONTROL_PLANE_ENV} is not a valid URL: '${raw}'` };
-	}
-	if (base.protocol !== 'http:' && base.protocol !== 'https:') {
-		return { error: `${CONTROL_PLANE_ENV} must be an http(s) URL, got '${raw}'` };
-	}
+	const resolved = resolveControlPlaneUrl();
+	if ('error' in resolved) return { error: resolved.error };
+	const raw = resolved.url;
 
 	// `null` (nothing cached) and `undefined` (unreadable) are different problems,
 	// reported as such — the same split `commands/login.ts` makes.
 	const cached: OperatorSessionCache | null | undefined = readOperatorSessionCache(raw);
-	if (cached === null) return { error: 'not signed in — run `swarm login`' };
+	if (cached === null) return { error: `not signed in to ${raw} — run \`swarm login\`` };
 	if (cached === undefined) {
 		return {
 			error: `the cached session at ${operatorSessionCachePath(raw)} could not be read — run \`swarm login\` to replace it`,
