@@ -76,7 +76,8 @@ resolve_symlink() {
 # The SWARM installation this script was shipped from, resolved through whatever PATH
 # symlink invoked it. `update` pulls *that* checkout rather than the current directory:
 # the operator running it is typically standing in a worker checkout, which is a
-# project repository and holds none of SWARM's own code.
+# project repository and holds none of SWARM's own code. `install` writes *that*
+# installation's `bin/swarm.js` into the plist, for the same reason.
 install_root() {
 	local self
 	self=$(resolve_symlink "${BASH_SOURCE[0]}")
@@ -84,10 +85,11 @@ install_root() {
 }
 
 # Every worker agent on this machine that runs *this* installation, as `<label> TAB
-# <checkout>` lines. The plist names the launcher by its PATH location, so resolving
-# that symlink is what tells a peer agent apart from one belonging to a second SWARM
-# clone on the same Mac -- and a second clone must not be restarted onto a build
-# nobody updated.
+# <checkout>` lines. A plist written since issue #1213 names `<installation>/bin/swarm.js`
+# directly; an older one names the launcher by its PATH symlink. Resolving the launcher
+# through any symlinks answers both, and is what tells a peer agent apart from one
+# belonging to a second SWARM clone on the same Mac -- and a second clone must not be
+# restarted onto a build nobody updated.
 agents_of_install_root() {
 	local plist launcher checkout
 	for plist in "$HOME"/Library/LaunchAgents/pl.smarttechbrewery.swarm.worker.*.plist; do
@@ -200,7 +202,15 @@ cmd_install() {
 
 	local node swarm
 	node=$(command -v node) || die 'node not found on PATH'
-	swarm=$(command -v swarm) || die 'swarm not found on PATH'
+	# This installation's own CLI, never `command -v swarm` (issue #1213). The daemon
+	# `run:worker` starts reads SWARM_CONTROL_PLANE_URL from the `.env` of the
+	# installation whose CLI it is, and a `swarm` found on PATH may be a *different*
+	# clone -- one that connects the worker to an installation it was never registered
+	# with. Resolving from the installer's own location ties the agent to the
+	# installation that installed it, so `swarm workers setup` through a clone and a
+	# re-run of that clone's `install` both land on it.
+	swarm="$ROOT/bin/swarm.js"
+	[ -f "$swarm" ] || die "no swarm CLI at $swarm -- is $ROOT a SWARM installation?"
 
 	refuse_if_worker_running
 
@@ -357,10 +367,10 @@ case "${1:-}" in
 					;;
 			esac
 		done
+		ROOT=$(install_root)
 		if [ "$action" = 'update' ]; then
 			# The one action that is not about a single checkout: an omitted argument means
 			# every agent running this installation, not the current directory's.
-			ROOT=$(install_root)
 			ONE_CHECKOUT=$checkout
 			[ -z "$checkout" ] || resolve "$checkout"
 			cmd_update

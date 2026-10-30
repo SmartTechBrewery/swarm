@@ -39,6 +39,12 @@ interface AgentFixture {
 	checkout: string;
 	/** Which installation's `bin/swarm.js` this agent's launcher symlink lands on. */
 	installation: 'this' | 'other';
+	/**
+	 * How the plist names that launcher: by the `<prefix>/bin/swarm` PATH symlink, as
+	 * an install before issue #1213 wrote it, or as `<installation>/bin/swarm.js`
+	 * directly, as `install` writes it now.
+	 */
+	launcher?: 'link' | 'direct';
 }
 
 interface UpdateOptions {
@@ -90,13 +96,14 @@ describe('swarm-worker-agent update', () => {
 	 * fixtures stay plain text and the suite runs off a Mac.
 	 */
 	function plant(agent: AgentFixture): void {
-		const prefix = join(home, 'prefix', agent.installation === 'this' ? 'this' : 'other');
+		const name = agent.installation === 'this' ? 'this' : 'other';
+		const launcher =
+			agent.launcher === 'direct'
+				? join(home, 'checkouts', name, 'bin', 'swarm.js')
+				: join(home, 'prefix', name, 'bin', 'swarm');
 		writeFileSync(
 			join(home, 'Library', 'LaunchAgents', `${agent.label}.plist`),
-			[
-				`ProgramArguments.1=${join(prefix, 'bin', 'swarm')}`,
-				`WorkingDirectory=${agent.checkout}`,
-			].join('\n'),
+			[`ProgramArguments.1=${launcher}`, `WorkingDirectory=${agent.checkout}`].join('\n'),
 			'utf8',
 		);
 	}
@@ -199,6 +206,31 @@ describe('swarm-worker-agent update', () => {
 		expect(result.kickstarted.join('\n')).not.toContain('spare');
 		expect(result.stdout).toContain('abc1234 -> def5678');
 		expect(result.stdout).toContain('2 agent(s) restarted on def5678');
+	});
+
+	it('restarts an agent whose plist names this installation’s bin/swarm.js directly', () => {
+		// The shape `install` writes since issue #1213 — still picked up, and a second
+		// clone's agent in the same shape still left alone.
+		const result = runUpdate({
+			agents: [
+				{
+					label: 'pl.smarttechbrewery.swarm.worker.api.aaaaaaaa',
+					checkout: '/checkouts/api',
+					installation: 'this',
+					launcher: 'direct',
+				},
+				{
+					label: 'pl.smarttechbrewery.swarm.worker.spare.cccccccc',
+					checkout: '/checkouts/spare',
+					installation: 'other',
+					launcher: 'direct',
+				},
+			],
+		});
+
+		expect(result.status).toBe(0);
+		expect(result.kickstarted).toHaveLength(1);
+		expect(result.kickstarted[0]).toContain('worker.api.aaaaaaaa');
 	});
 
 	it('restarts nothing when the build fails, leaving every daemon on the old build', () => {
