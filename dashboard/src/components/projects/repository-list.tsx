@@ -1,19 +1,6 @@
 import { ChevronDown, ChevronUp, Plus, Trash2 } from 'lucide-react';
-import { useState } from 'react';
-import { buttonClass } from '@/components/ui/button.js';
-import {
-	branchPatternPatch,
-	commitSubjectPatternPatch,
-	effectiveBranchPattern,
-	effectiveCommitSubjectMaxLength,
-	effectiveCommitSubjectPattern,
-	type RepositoryForm,
-	repoInputShape,
-} from '@/lib/project-repository.js';
+import { type RepositoryForm, repoInputShape } from '@/lib/project-repository.js';
 import type { ReviewChecksPolicy } from '../../../../src/config/schema.js';
-import { branchPatternFromPrefix } from '../../../../src/pipeline/branch-pattern.js';
-import { BranchPatternDialog } from './branch-pattern-dialog.js';
-import { CommitSubjectPatternDialog } from './commit-subject-pattern-dialog.js';
 
 /** Input/select recipe shared with the rest of the tab (ai/DESIGN_SYSTEM.md §4). */
 const FIELD_CLASS =
@@ -66,9 +53,13 @@ interface RepositoryRowProps {
  * One repository in the project's list: its rank, the reorder/remove actions, and the
  * settings that are genuinely per-repository — merge automation among them since issue
  * #1066, Review's check policy and check wait since issue #1109, each moved off the
- * Pipeline tab's project-wide control, the WIP limit since issue #1185, and the branch
- * name and commit subject patterns since issues #1241 and #1242. Each field's accessible name carries the rank,
- * since a project can hold several identical-looking rows.
+ * Pipeline tab's project-wide control, and the WIP limit since issue #1185. Each field's
+ * accessible name carries the rank, since a project can hold several identical-looking rows.
+ *
+ * The branch name and commit subject patterns (issues #1241, #1242) are stored per
+ * repository but are **not** edited here since issue #1246: a project's repositories do
+ * not name branches or commits differently, so `NamingPatterns` sets them once, above
+ * this list, for every row.
  *
  * The source-control provider is **not** among them (issue #727): it is the project's,
  * stated once for the whole project, and every repository the project owns lives on it.
@@ -92,10 +83,6 @@ function RepositoryRow({
 	const idBase = `repository-${index}`;
 	const isOnly = total === 1;
 	const policy = REVIEW_CHECKS_POLICY_OPTIONS.find(({ value }) => value === entry.reviewChecks);
-	const branchPattern = effectiveBranchPattern(entry);
-	const [editingPattern, setEditingPattern] = useState(false);
-	const commitSubjectPattern = effectiveCommitSubjectPattern(entry);
-	const [editingCommitSubject, setEditingCommitSubject] = useState(false);
 
 	return (
 		<li className="p-4 border border-zinc-800 rounded-md bg-panel/20 space-y-3">
@@ -158,7 +145,7 @@ function RepositoryRow({
 				</div>
 				<div>
 					<label htmlFor={`${idBase}-base-branch`} className={LABEL_CLASS}>
-						Base Branch <span className="text-red-500">*</span>
+						Base branch <span className="text-red-500">*</span>
 					</label>
 					<input
 						type="text"
@@ -172,84 +159,7 @@ function RepositoryRow({
 						className={FIELD_CLASS}
 					/>
 				</div>
-				<div>
-					<label htmlFor={`${idBase}-branch-pattern`} className={LABEL_CLASS}>
-						Branch Name Pattern
-					</label>
-					{/* Read-only on purpose (issue #1241): the pattern is composed and validated in
-					    the editor, never typed here unchecked. */}
-					<div className="flex gap-2">
-						<input
-							type="text"
-							id={`${idBase}-branch-pattern`}
-							aria-label={`Branch name pattern, entry ${rank}`}
-							value={branchPattern}
-							readOnly
-							className={`${FIELD_CLASS} font-mono`}
-						/>
-						<button
-							type="button"
-							onClick={() => setEditingPattern(true)}
-							disabled={isPending}
-							aria-label={`Edit branch name pattern, entry ${rank}`}
-							className={buttonClass('secondary')}
-						>
-							Edit
-						</button>
-					</div>
-				</div>
-				<div className="sm:col-span-2">
-					<label htmlFor={`${idBase}-commit-subject-pattern`} className={LABEL_CLASS}>
-						Commit Subject Pattern
-					</label>
-					{/* Read-only like the branch pattern (issue #1242): composed and validated in
-					    the editor, never typed here unchecked. */}
-					<div className="flex gap-2">
-						<input
-							type="text"
-							id={`${idBase}-commit-subject-pattern`}
-							aria-label={`Commit subject pattern, entry ${rank}`}
-							value={commitSubjectPattern}
-							readOnly
-							className={`${FIELD_CLASS} font-mono`}
-						/>
-						<button
-							type="button"
-							onClick={() => setEditingCommitSubject(true)}
-							disabled={isPending}
-							aria-label={`Edit commit subject pattern, entry ${rank}`}
-							className={buttonClass('secondary')}
-						>
-							Edit
-						</button>
-					</div>
-					<p className="text-xs text-zinc-400 mt-1">
-						How SWARM words this repository's commits and, once set, its pull request titles.
-					</p>
-				</div>
 			</div>
-			<BranchPatternDialog
-				open={editingPattern}
-				pattern={branchPattern}
-				legacyPattern={branchPatternFromPrefix(entry.branchPrefix)}
-				rank={rank}
-				onApply={(pattern) => {
-					onChange(index, branchPatternPatch(entry, pattern));
-					setEditingPattern(false);
-				}}
-				onCancel={() => setEditingPattern(false)}
-			/>
-			<CommitSubjectPatternDialog
-				open={editingCommitSubject}
-				pattern={commitSubjectPattern}
-				maxLength={effectiveCommitSubjectMaxLength(entry)}
-				rank={rank}
-				onApply={(pattern, maxLength) => {
-					onChange(index, commitSubjectPatternPatch(entry, pattern, maxLength));
-					setEditingCommitSubject(false);
-				}}
-				onCancel={() => setEditingCommitSubject(false)}
-			/>
 
 			<label className="flex items-start gap-3 p-4 border border-zinc-800 rounded-md bg-panel/20 cursor-pointer hover:bg-zinc-800/20 transition-colors">
 				<input
@@ -274,7 +184,7 @@ function RepositoryRow({
 			<div className="grid gap-4 sm:grid-cols-2">
 				<div>
 					<label htmlFor={`${idBase}-review-checks`} className={LABEL_CLASS}>
-						Review Check Policy
+						Review check policy
 					</label>
 					<select
 						id={`${idBase}-review-checks`}
@@ -296,7 +206,7 @@ function RepositoryRow({
 				</div>
 				<div>
 					<label htmlFor={`${idBase}-checks-wait`} className={LABEL_CLASS}>
-						Check Wait (minutes)
+						Check wait (minutes)
 					</label>
 					<input
 						type="number"
@@ -318,7 +228,7 @@ function RepositoryRow({
 				</div>
 				<div>
 					<label htmlFor={`${idBase}-wip-limit`} className={LABEL_CLASS}>
-						WIP Limit
+						WIP limit
 					</label>
 					<input
 						type="number"
@@ -374,7 +284,8 @@ export interface RepositoryListProps {
  *
  * What is *not* here is anything shared by the whole project: the board mapping and the
  * PM credentials on Project Management, the provider and its credentials in the cards
- * above. Only the settings that are genuinely per-repository are here.
+ * above, and the branch and commit naming patterns directly above this list (issue
+ * #1246). Only the settings that are genuinely per-repository are here.
  */
 export function RepositoryList({
 	repositories,
@@ -393,9 +304,9 @@ export function RepositoryList({
 					Repositories
 				</h2>
 				<p className="text-xs text-zinc-400">
-					Every repository this project operates on, with the branch, commit, merge, Review check
-					and WIP limit settings SWARM uses for each. Each piece of work runs against the repository
-					it belongs to — a board card against the repository that claims it — and none of them is a
+					Every repository this project operates on, with the base branch, merge, Review check and
+					WIP limit settings SWARM uses for each. Each piece of work runs against the repository it
+					belongs to — a board card against the repository that claims it — and none of them is a
 					fallback for the others: with several repositories, a card none of them claims is refused
 					rather than run against the first. All of them live on the provider selected above, using
 					the credentials configured with it.

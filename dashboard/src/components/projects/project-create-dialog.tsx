@@ -227,7 +227,7 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 	};
 
 	return (
-		<Modal open={open} onClose={handleClose} title="New Project">
+		<Modal open={open} onClose={handleClose} title="New project">
 			<form onSubmit={handleSubmit} className="space-y-4">
 				<div className="grid grid-cols-1 md:grid-cols-2 gap-4">
 					<div className="md:col-span-2">
@@ -319,7 +319,7 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 							htmlFor="project-base-branch"
 							className="block text-xs font-medium text-zinc-400 mb-1"
 						>
-							Base Branch <span className="text-red-500">*</span>
+							Base branch <span className="text-red-500">*</span>
 						</label>
 						<input
 							type="text"
@@ -335,7 +335,7 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 						/>
 						<p className="mt-1 text-xs text-zinc-500">
 							Task branches are cut from this branch and pull requests target it. Editable later on
-							the project's Source Control tab.
+							the project's Source control tab.
 						</p>
 						{baseBranchNote && (
 							<p
@@ -347,7 +347,7 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 					</div>
 					<div>
 						<label htmlFor="project-scm" className="block text-xs font-medium text-zinc-400 mb-1">
-							Source Control Provider <span className="text-red-500">*</span>
+							Source control provider <span className="text-red-500">*</span>
 						</label>
 						<select
 							id="project-scm"
@@ -371,7 +371,7 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 					<div>
 						<div className="relative flex items-center gap-1.5 mb-1">
 							<label htmlFor="project-reporoot" className="block text-xs font-medium text-zinc-400">
-								Repo Local Path <span className="text-red-500">*</span>
+								Repo local path <span className="text-red-500">*</span>
 							</label>
 							<button
 								type="button"
@@ -475,8 +475,8 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 						/>
 						<p id="project-reviewer-token-hint" className="mt-1 text-xs text-zinc-500">
 							The credential this project's reviewer persona reviews with. Leave empty to use the
-							installation default from General Settings → Credentials. Editable later on the
-							project's Source Control tab.
+							installation default from Settings → Credentials. Editable later on the project's
+							Source control tab.
 						</p>
 					</div>
 				</div>
@@ -490,7 +490,7 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 				<ModalFooter
 					primary={
 						<button type="submit" disabled={mutation.isPending} className={buttonClass('primary')}>
-							{mutation.isPending ? 'Creating…' : 'Create Project'}
+							{mutation.isPending ? 'Creating…' : 'Create project'}
 						</button>
 					}
 					secondary={

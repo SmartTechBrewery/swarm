@@ -13,8 +13,8 @@ import { Modal, ModalFooter } from '../ui/modal.js';
 const FIELD_CLASS =
 	'block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-800 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 transition-shadow';
 
-interface BranchPatternDialogProps {
-	open: boolean;
+/** What one repository names its branches by now, for the editor's warnings. */
+export interface RepositoryBranchNaming {
 	/** The pattern the repository names its branches by now — its own, or its prefix's. */
 	pattern: string;
 	/**
@@ -22,10 +22,22 @@ interface BranchPatternDialogProps {
 	 * one shape `taskIdFromTaskBranch` keeps recognising whatever the pattern is.
 	 */
 	legacyPattern: string;
-	/** The repository's rank in the list, so the dialog says which entry it edits. */
-	rank: number;
+}
+
+interface BranchPatternDialogProps {
+	open: boolean;
+	/** The pattern the editor starts from — the project's, or the first repository's. */
+	pattern: string;
+	/** Every repository of the project, since the pattern applies to all of them (issue #1246). */
+	repositories: RepositoryBranchNaming[];
+	/** Whether the repositories name their branches differently now. */
+	differs: boolean;
 	onApply: (pattern: string) => void;
 	onCancel: () => void;
+}
+
+function unique(values: string[]): string[] {
+	return [...new Set(values)];
 }
 
 /**
@@ -34,18 +46,19 @@ interface BranchPatternDialogProps {
  * refuse. The rules are `validateBranchPattern` (`src/pipeline/branch-pattern.ts`) —
  * the very function the config schema runs — so the two cannot disagree.
  *
- * Applying only edits the row: the pattern is persisted by the tab's own Save, like
- * every other repository setting.
+ * It edits the project's one pattern (issue #1246): applying sets it on every
+ * repository's row, and the tab's own Save persists it like every other repository
+ * setting.
  *
  * Only the legacy `<prefix>{issue_key}` shape stays recognised after a change, so
- * replacing any other pattern warns that pull requests open under it stop being
- * SWARM's own.
+ * replacing any repository's other pattern warns that pull requests open under it stop
+ * being SWARM's own.
  */
 export function BranchPatternDialog({
 	open,
 	pattern,
-	legacyPattern,
-	rank,
+	repositories,
+	differs,
 	onApply,
 	onCancel,
 }: BranchPatternDialogProps) {
@@ -53,20 +66,28 @@ export function BranchPatternDialog({
 	const inputRef = useRef<HTMLInputElement>(null);
 	const inputId = useId();
 
-	// Every opening starts from the repository's current pattern, not a cancelled draft.
+	// Every opening starts from the current pattern, not a cancelled draft.
 	useEffect(() => {
 		if (open) setDraft(pattern);
 	}, [open, pattern]);
 
 	const validation = validateBranchPattern(draft);
 	const { errors } = validation;
-	const strandsOpenBranches = draft !== pattern && pattern !== legacyPattern;
-	const warnings = strandsOpenBranches
-		? [
-				...validation.warnings,
-				`Pull requests already open on branches named by ${pattern} will no longer be recognised as SWARM's own — no Review, WIP release or merge automation. Only the legacy ${legacyPattern} shape stays recognised after a change.`,
-			]
-		: validation.warnings;
+	const legacyPatterns = unique(repositories.map((repository) => repository.legacyPattern));
+	const legacyShape = `${legacyPatterns.join(', ')} ${legacyPatterns.length === 1 ? 'shape stays' : 'shapes stay'}`;
+	// A repository's own pattern, replaced, is no longer recognised; its legacy shape still is.
+	const stranded = unique(
+		repositories
+			.filter((repository) => ![draft, repository.legacyPattern].includes(repository.pattern))
+			.map((repository) => repository.pattern),
+	);
+	const warnings =
+		stranded.length > 0
+			? [
+					...validation.warnings,
+					`Pull requests already open on branches named by ${stranded.join(', ')} will no longer be recognised as SWARM's own — no Review, WIP release or merge automation. Only the legacy ${legacyShape} recognised after a change.`,
+				]
+			: validation.warnings;
 	const preview = errors.length === 0 ? renderBranchName(draft, SAMPLE_BRANCH_NAME_PARTS) : null;
 
 	/** Insert `{name}` at the caret (or replacing the selection), keeping focus in the field. */
@@ -84,16 +105,23 @@ export function BranchPatternDialog({
 	};
 
 	return (
-		<Modal open={open} onClose={onCancel} title={`Branch name pattern — repository ${rank}`}>
+		<Modal open={open} onClose={onCancel} title="Branch name pattern">
 			<div className="space-y-4">
 				<p className="text-xs text-zinc-400">
-					How SWARM names this repository's task branches. Combine literal text — letters, digits
-					and the separators <span className="font-mono">/</span>,{' '}
+					How SWARM names the task branches of every repository in this project. Combine literal
+					text — letters, digits and the separators <span className="font-mono">/</span>,{' '}
 					<span className="font-mono">-</span> and <span className="font-mono">_</span> — with these
 					elements. The name is decided once per task and kept for every later phase. After a
 					change, branches already open stay recognised only in the legacy{' '}
-					<span className="font-mono">{legacyPattern}</span> shape.
+					<span className="font-mono">{legacyPatterns.join(', ')}</span>{' '}
+					{legacyPatterns.length === 1 ? 'shape' : 'shapes'}.
 				</p>
+				{differs && (
+					<p className="p-3 bg-zinc-900/50 border border-zinc-800 text-xs text-zinc-300 rounded">
+						The repositories name their branches differently now. This starts from the first
+						repository's pattern; applying sets the pattern for every repository.
+					</p>
+				)}
 
 				<ul className="space-y-2">
 					{BRANCH_PATTERN_ELEMENTS.map((name) => (

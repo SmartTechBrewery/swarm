@@ -51,7 +51,7 @@ export const githubProjectsManifest: PMProviderManifest = {
 	credentialRoles: [
 		{
 			role: GITHUB_PROJECTS_API_TOKEN_ROLE,
-			label: 'GitHub Projects API Token',
+			label: 'GitHub Projects API token',
 			// Plain prose, not markdown: the dashboard renders a description as text
 			// (`pm-credentials-panel.tsx`), so backticks would show up literally.
 			description:
@@ -60,7 +60,7 @@ export const githubProjectsManifest: PMProviderManifest = {
 		},
 		{
 			role: PM_WEBHOOK_SECRET_ROLE,
-			label: 'Webhook Secret',
+			label: 'Webhook secret',
 			description:
 				"HMAC secret GitHub signs board deliveries with. It is the repository's webhook secret — one webhook carries both — so it is configured on the Source Control tab, not here.",
 			envVarKey: 'GITHUB_WEBHOOK_SECRET',

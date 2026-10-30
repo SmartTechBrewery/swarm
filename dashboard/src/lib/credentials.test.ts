@@ -77,7 +77,7 @@ describe('getScmProviderCopy', () => {
 	});
 
 	it('labels the roles in GitHub’s own vocabulary', () => {
-		expect(copy.roleLabels).toEqual({ reviewer: 'Reviewer PAT', webhookSecret: 'Webhook Secret' });
+		expect(copy.roleLabels).toEqual({ reviewer: 'Reviewer PAT', webhookSecret: 'Webhook secret' });
 	});
 
 	it('projects the verify-failure copy', () => {
@@ -109,8 +109,8 @@ describe('getScmProviderCopy — Bitbucket', () => {
 	// #632): the role is neutral, the credential is not.
 	it('labels the reviewer role an app password, not a PAT', () => {
 		expect(copy.roleLabels).toEqual({
-			reviewer: 'Reviewer App Password',
-			webhookSecret: 'Webhook Secret',
+			reviewer: 'Reviewer app password',
+			webhookSecret: 'Webhook secret',
 		});
 	});
 
@@ -158,8 +158,8 @@ describe('getScmProviderCopy — GitLab', () => {
 	// it echoes back in a header.
 	it('labels the roles an access token and a secret token', () => {
 		expect(copy.roleLabels).toEqual({
-			reviewer: 'Reviewer Access Token',
-			webhookSecret: 'Secret Token',
+			reviewer: 'Reviewer access token',
+			webhookSecret: 'Secret token',
 		});
 	});
 });

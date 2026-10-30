@@ -486,7 +486,7 @@ describe('credentialsRouter', () => {
 			expect(result.roles).toContainEqual(
 				expect.objectContaining({
 					role: 'apiToken',
-					label: 'GitHub Projects API Token',
+					label: 'GitHub Projects API token',
 					envVarKey: 'PM_GITHUB_PROJECTS_TOKEN',
 					referenceKey: 'PM_GITHUB_PROJECTS_TOKEN',
 					optional: false,
@@ -608,7 +608,7 @@ describe('credentialsRouter', () => {
 				'p1',
 				'PM_GITHUB_PROJECTS_TOKEN',
 				'ghp_board_token',
-				'GitHub Projects API Token',
+				'GitHub Projects API token',
 			);
 			expect(upsertProjectToDb).toHaveBeenCalledWith(
 				expect.objectContaining({
@@ -642,7 +642,7 @@ describe('credentialsRouter', () => {
 				'p1',
 				'PM_GITHUB_PROJECTS_TOKEN',
 				'ghp_rotated',
-				'GitHub Projects API Token',
+				'GitHub Projects API token',
 			);
 			// The reference itself was unchanged, so the row is not rewritten — and Jira's
 			// block is therefore untouched by construction.
@@ -693,7 +693,7 @@ describe('credentialsRouter', () => {
 				'p1',
 				'CUSTOM_BOARD_TOKEN',
 				'ghp_new',
-				'GitHub Projects API Token',
+				'GitHub Projects API token',
 			);
 			expect(upsertProjectToDb).not.toHaveBeenCalled();
 		});
@@ -761,7 +761,7 @@ describe('credentialsRouter', () => {
 					'p1',
 					'JIRA_API_TOKEN',
 					'jira_pat',
-					'API Token',
+					'API token',
 				);
 				expect(writeProjectCredential).toHaveBeenCalledOnce();
 				expect(upsertProjectToDb).toHaveBeenCalledWith(
@@ -814,7 +814,7 @@ describe('credentialsRouter', () => {
 					'p1',
 					'JIRA_WEBHOOK_SECRET',
 					'whsec_jira',
-					'Webhook Secret',
+					'Webhook secret',
 				);
 			});
 		});

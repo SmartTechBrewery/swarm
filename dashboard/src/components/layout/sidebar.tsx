@@ -119,7 +119,7 @@ export function Sidebar() {
 							type="button"
 							onClick={() => setCreateOpen(true)}
 							className="flex h-5 w-5 items-center justify-center rounded text-zinc-500 hover:bg-zinc-800/40 hover:text-zinc-100 transition-colors"
-							title="New Project"
+							title="New project"
 						>
 							<Plus className="h-3.5 w-3.5" />
 						</button>

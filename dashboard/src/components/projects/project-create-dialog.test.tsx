@@ -52,7 +52,7 @@ function fillRequiredFields() {
 	fireEvent.change(screen.getByPlaceholderText('owner/repo'), {
 		target: { value: 'team/new-project' },
 	});
-	fireEvent.change(screen.getByLabelText(/^Repo Local Path/), {
+	fireEvent.change(screen.getByLabelText(/^Repo local path/), {
 		target: { value: '/work/new-project' },
 	});
 }
@@ -74,7 +74,7 @@ describe('ProjectCreateDialog', () => {
 		fireEvent.change(screen.getByRole('combobox'), {
 			target: { value: 'bitbucket' },
 		});
-		fireEvent.click(screen.getByRole('button', { name: 'Create Project' }));
+		fireEvent.click(screen.getByRole('button', { name: 'Create project' }));
 
 		await waitFor(() =>
 			expect(createProject).toHaveBeenCalledWith({
@@ -95,7 +95,7 @@ describe('ProjectCreateDialog', () => {
 		fireEvent.change(screen.getByLabelText('Reviewer PAT'), {
 			target: { value: '  ghp_project_reviewer  ' },
 		});
-		fireEvent.click(screen.getByRole('button', { name: 'Create Project' }));
+		fireEvent.click(screen.getByRole('button', { name: 'Create project' }));
 
 		await waitFor(() =>
 			expect(createProject).toHaveBeenCalledWith(
@@ -111,7 +111,7 @@ describe('ProjectCreateDialog', () => {
 
 		fillRequiredFields();
 		fireEvent.change(screen.getByLabelText('Reviewer PAT'), { target: { value: '   ' } });
-		fireEvent.click(screen.getByRole('button', { name: 'Create Project' }));
+		fireEvent.click(screen.getByRole('button', { name: 'Create project' }));
 
 		await waitFor(() => expect(createProject).toHaveBeenCalled());
 		expect(createProject.mock.calls[0]?.[0]).not.toHaveProperty('reviewerToken');
@@ -122,13 +122,13 @@ describe('ProjectCreateDialog', () => {
 
 		fireEvent.change(screen.getByRole('combobox'), { target: { value: 'gitlab' } });
 
-		expect(screen.getByLabelText('Reviewer Access Token')).toHaveProperty('type', 'password');
+		expect(screen.getByLabelText('Reviewer access token')).toHaveProperty('type', 'password');
 	});
 
 	it('pre-fills the base branch so the operator sees what the project will use', () => {
 		renderDialog(<ProjectCreateDialog open onOpenChange={vi.fn()} />);
 
-		const input = screen.getByLabelText(/^Base Branch/) as HTMLInputElement;
+		const input = screen.getByLabelText(/^Base branch/) as HTMLInputElement;
 		expect(input.value).toBe('main');
 	});
 
@@ -137,8 +137,8 @@ describe('ProjectCreateDialog', () => {
 		renderDialog(<ProjectCreateDialog open onOpenChange={vi.fn()} />);
 
 		fillRequiredFields();
-		fireEvent.change(screen.getByLabelText(/^Base Branch/), { target: { value: 'develop' } });
-		fireEvent.click(screen.getByRole('button', { name: 'Create Project' }));
+		fireEvent.change(screen.getByLabelText(/^Base branch/), { target: { value: 'develop' } });
+		fireEvent.click(screen.getByRole('button', { name: 'Create project' }));
 
 		await waitFor(() =>
 			expect(createProject).toHaveBeenCalledWith(
@@ -162,7 +162,7 @@ describe('ProjectCreateDialog', () => {
 			fireEvent.blur(screen.getByPlaceholderText('owner/repo'));
 
 			await waitFor(() =>
-				expect((screen.getByLabelText(/^Base Branch/) as HTMLInputElement).value).toBe('develop'),
+				expect((screen.getByLabelText(/^Base branch/) as HTMLInputElement).value).toBe('develop'),
 			);
 			expect(defaultBranchQuery).toHaveBeenCalledWith({
 				scm: 'github',
@@ -170,7 +170,7 @@ describe('ProjectCreateDialog', () => {
 			});
 			expect(screen.getByText(/Detected team\/new-project's default branch/)).toBeTruthy();
 
-			fireEvent.click(screen.getByRole('button', { name: 'Create Project' }));
+			fireEvent.click(screen.getByRole('button', { name: 'Create project' }));
 
 			await waitFor(() =>
 				expect(createProject).toHaveBeenCalledWith(
@@ -194,9 +194,9 @@ describe('ProjectCreateDialog', () => {
 			await waitFor(() =>
 				expect(screen.getByText(/Couldn't read team\/new-project's default branch/)).toBeTruthy(),
 			);
-			expect((screen.getByLabelText(/^Base Branch/) as HTMLInputElement).value).toBe('main');
+			expect((screen.getByLabelText(/^Base branch/) as HTMLInputElement).value).toBe('main');
 
-			fireEvent.click(screen.getByRole('button', { name: 'Create Project' }));
+			fireEvent.click(screen.getByRole('button', { name: 'Create project' }));
 
 			await waitFor(() =>
 				expect(createProject).toHaveBeenCalledWith(
@@ -218,7 +218,7 @@ describe('ProjectCreateDialog', () => {
 			await waitFor(() =>
 				expect(screen.getByText(/Couldn't read team\/new-project's default branch/)).toBeTruthy(),
 			);
-			expect((screen.getByLabelText(/^Base Branch/) as HTMLInputElement).value).toBe('main');
+			expect((screen.getByLabelText(/^Base branch/) as HTMLInputElement).value).toBe('main');
 		});
 
 		it('does not overwrite a branch the operator has already typed', async () => {
@@ -226,11 +226,11 @@ describe('ProjectCreateDialog', () => {
 			renderDialog(<ProjectCreateDialog open onOpenChange={vi.fn()} />);
 
 			fillRequiredFields();
-			fireEvent.change(screen.getByLabelText(/^Base Branch/), { target: { value: 'release' } });
+			fireEvent.change(screen.getByLabelText(/^Base branch/), { target: { value: 'release' } });
 			fireEvent.blur(screen.getByPlaceholderText('owner/repo'));
 
 			await waitFor(() => expect(defaultBranchQuery).not.toHaveBeenCalled());
-			expect((screen.getByLabelText(/^Base Branch/) as HTMLInputElement).value).toBe('release');
+			expect((screen.getByLabelText(/^Base branch/) as HTMLInputElement).value).toBe('release');
 		});
 
 		// A repo slug means different things to different providers, so a provider change
@@ -281,16 +281,16 @@ describe('ProjectCreateDialog', () => {
 
 			gitlab.resolve({ branch: 'develop' });
 			await waitFor(() =>
-				expect((screen.getByLabelText(/^Base Branch/) as HTMLInputElement).value).toBe('develop'),
+				expect((screen.getByLabelText(/^Base branch/) as HTMLInputElement).value).toBe('develop'),
 			);
 
 			github.resolve({ branch: 'main' });
 			await flush();
 
-			expect((screen.getByLabelText(/^Base Branch/) as HTMLInputElement).value).toBe('develop');
+			expect((screen.getByLabelText(/^Base branch/) as HTMLInputElement).value).toBe('develop');
 			expect(screen.getByText(/Detected team\/new-project's default branch/)).toBeTruthy();
 
-			fireEvent.click(screen.getByRole('button', { name: 'Create Project' }));
+			fireEvent.click(screen.getByRole('button', { name: 'Create project' }));
 
 			await waitFor(() =>
 				expect(createProject).toHaveBeenCalledWith(
@@ -325,7 +325,7 @@ describe('ProjectCreateDialog', () => {
 
 			current.resolve({ branch: 'develop' });
 			await waitFor(() =>
-				expect((screen.getByLabelText(/^Base Branch/) as HTMLInputElement).value).toBe('develop'),
+				expect((screen.getByLabelText(/^Base branch/) as HTMLInputElement).value).toBe('develop'),
 			);
 
 			// The stale detection answering nothing would otherwise replace the current
@@ -333,7 +333,7 @@ describe('ProjectCreateDialog', () => {
 			stale.resolve({ branch: null });
 			await flush();
 
-			expect((screen.getByLabelText(/^Base Branch/) as HTMLInputElement).value).toBe('develop');
+			expect((screen.getByLabelText(/^Base branch/) as HTMLInputElement).value).toBe('develop');
 			expect(screen.queryByText(/Couldn't read team\/old's default branch/)).toBeNull();
 			expect(screen.getByText(/Detected team\/new's default branch/)).toBeTruthy();
 		});
@@ -378,13 +378,13 @@ describe('ProjectCreateDialog', () => {
 				}),
 			);
 			await waitFor(() =>
-				expect((screen.getByLabelText(/^Base Branch/) as HTMLInputElement).value).toBe('develop'),
+				expect((screen.getByLabelText(/^Base branch/) as HTMLInputElement).value).toBe('develop'),
 			);
 
-			fireEvent.change(screen.getByLabelText(/^Repo Local Path/), {
+			fireEvent.change(screen.getByLabelText(/^Repo local path/), {
 				target: { value: '/work/web' },
 			});
-			fireEvent.click(screen.getByRole('button', { name: 'Create Project' }));
+			fireEvent.click(screen.getByRole('button', { name: 'Create project' }));
 
 			await waitFor(() =>
 				expect(createProject).toHaveBeenCalledWith(
@@ -443,13 +443,13 @@ describe('ProjectCreateDialog', () => {
 				expect.objectContaining({ scm: 'github' }),
 			);
 			await waitFor(() =>
-				expect((screen.getByLabelText(/^Base Branch/) as HTMLInputElement).value).toBe('develop'),
+				expect((screen.getByLabelText(/^Base branch/) as HTMLInputElement).value).toBe('develop'),
 			);
 
-			fireEvent.change(screen.getByLabelText(/^Repo Local Path/), {
+			fireEvent.change(screen.getByLabelText(/^Repo local path/), {
 				target: { value: '/work/viking-kurier' },
 			});
-			fireEvent.click(screen.getByRole('button', { name: 'Create Project' }));
+			fireEvent.click(screen.getByRole('button', { name: 'Create project' }));
 
 			await waitFor(() =>
 				expect(createProject).toHaveBeenCalledWith(
@@ -516,10 +516,10 @@ describe('ProjectCreateDialog', () => {
 				expect(defaultBranchQuery).toHaveBeenCalledWith({ scm: 'bitbucket', repo: 'owner/repo' }),
 			);
 
-			fireEvent.change(screen.getByLabelText(/^Repo Local Path/), {
+			fireEvent.change(screen.getByLabelText(/^Repo local path/), {
 				target: { value: '/work/repo' },
 			});
-			fireEvent.click(screen.getByRole('button', { name: 'Create Project' }));
+			fireEvent.click(screen.getByRole('button', { name: 'Create project' }));
 
 			await waitFor(() =>
 				expect(createProject).toHaveBeenCalledWith(

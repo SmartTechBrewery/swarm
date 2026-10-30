@@ -50,7 +50,7 @@ export const linearManifest: PMProviderManifest = {
 	credentialRoles: [
 		{
 			role: LINEAR_API_KEY_ROLE,
-			label: 'API Key',
+			label: 'API key',
 			// Plain prose, not markdown: the dashboard renders a description as text
 			// (`pm-credentials-panel.tsx`), so backticks would show up literally.
 			description:
@@ -59,7 +59,7 @@ export const linearManifest: PMProviderManifest = {
 		},
 		{
 			role: PM_WEBHOOK_SECRET_ROLE,
-			label: 'Webhook Secret',
+			label: 'Webhook secret',
 			description:
 				'Signing secret Linear shows when you create the webhook. It signs board deliveries, and it is the board webhook secret only — not the repository one.',
 			envVarKey: 'LINEAR_WEBHOOK_SECRET',

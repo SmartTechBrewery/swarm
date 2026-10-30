@@ -161,7 +161,7 @@ describe('PhaseEnabledCell', () => {
 		render(
 			<PhaseEnabledCell
 				phase="respondToReview"
-				label="Respond to Review"
+				label="Respond to review"
 				enabled={true}
 				enabledDisabled={true}
 				isPending={false}
@@ -885,12 +885,12 @@ describe('PipelineSettingsForm — per-repository settings', () => {
 	});
 
 	// Issue #1109 moved Review's check policy and wait there too; the tab says where.
-	it('no longer offers a project-wide Review check policy, and points to Source Control', () => {
+	it('no longer offers a project-wide Review check policy, and points to Source control', () => {
 		renderForm();
 
 		expect(screen.queryByRole('radio')).toBeNull();
 		expect(screen.queryByText(/Require CI checks/)).toBeNull();
-		expect(screen.getByText(/set per repository, on Source Control/)).toBeDefined();
+		expect(screen.getByText(/set per repository, on Source control/)).toBeDefined();
 	});
 });
 
@@ -1391,10 +1391,10 @@ describe('ProjectTabBar', () => {
 			'Runs',
 			'Workers',
 			'Settings',
-			'Agent Configuration',
+			'Agent configuration',
 			'Pipeline',
-			'Project Management',
-			'Source Control',
+			'Project management',
+			'Source control',
 			// Issue #806: the roster tab goes last, behind the configuration tabs.
 			'Members',
 		]);
@@ -1456,8 +1456,8 @@ describe('GeneralSettingsForm', () => {
 		// `getElementById(...).toBeDefined()` — which is `true` even for `null` and so
 		// would stay green if the move ever took a Settings field along with it.
 		expect(screen.getByLabelText(/^Name/)).toBeTruthy();
-		expect(screen.getByLabelText(/^Local Repository Root/)).toBeTruthy();
-		expect(screen.getByLabelText(/^Worktree Directory/)).toBeTruthy();
+		expect(screen.getByLabelText(/^Local repository root/)).toBeTruthy();
+		expect(screen.getByLabelText(/^Worktree directory/)).toBeTruthy();
 		// The project-wide job cap is retired (issue #1190): a repository's WIP limit and
 		// each worker's concurrency allocation bound the work now, neither on this tab.
 		expect(screen.queryByLabelText(/^Maximum Concurrent Jobs/)).toBeNull();
@@ -1473,14 +1473,14 @@ describe('GeneralSettingsForm', () => {
 
 	it('offers Save and Reset once the form is dirty, and neither while it is not', () => {
 		const { handleReset } = renderForm();
-		expect(screen.getByRole('button', { name: 'Save Changes' })).toHaveProperty('disabled', false);
+		expect(screen.getByRole('button', { name: 'Save changes' })).toHaveProperty('disabled', false);
 
 		fireEvent.click(screen.getByRole('button', { name: 'Reset' }));
 		expect(handleReset).toHaveBeenCalled();
 
 		cleanup();
 		renderForm({ isDirty: false });
-		expect(screen.getByRole('button', { name: 'Save Changes' })).toHaveProperty('disabled', true);
+		expect(screen.getByRole('button', { name: 'Save changes' })).toHaveProperty('disabled', true);
 		expect(screen.getByRole('button', { name: 'Reset' })).toHaveProperty('disabled', true);
 	});
 
@@ -1564,28 +1564,28 @@ describe('AgentConfigurationForm — Save/Reset scoping', () => {
 	it('offers no Save Changes / Reset on the phases list, even with unsaved edits', () => {
 		renderForm({ selectedPhase: undefined, isDirty: true, dirtyPhases: ['planning'] });
 
-		expect(screen.queryByRole('button', { name: 'Save Changes' })).toBeNull();
+		expect(screen.queryByRole('button', { name: 'Save changes' })).toBeNull();
 		expect(screen.queryByRole('button', { name: 'Reset' })).toBeNull();
 		// The list itself is unchanged — every phase still has its row.
-		expect(screen.getByRole('heading', { level: 2, name: 'Phases Configuration' })).toBeDefined();
+		expect(screen.getByRole('heading', { level: 2, name: 'Phases configuration' })).toBeDefined();
 	});
 
 	it("offers Save Changes / Reset on a phase's detail screen, under the same isDirty gate", () => {
 		const { handleReset } = renderForm({ selectedPhase: 'planning', isDirty: true });
-		expect(screen.getByRole('button', { name: 'Save Changes' })).toHaveProperty('disabled', false);
+		expect(screen.getByRole('button', { name: 'Save changes' })).toHaveProperty('disabled', false);
 		fireEvent.click(screen.getByRole('button', { name: 'Reset' }));
 		expect(handleReset).toHaveBeenCalled();
 
 		cleanup();
 		renderForm({ selectedPhase: 'planning', isDirty: false });
-		expect(screen.getByRole('button', { name: 'Save Changes' })).toHaveProperty('disabled', true);
+		expect(screen.getByRole('button', { name: 'Save changes' })).toHaveProperty('disabled', true);
 		expect(screen.getByRole('button', { name: 'Reset' })).toHaveProperty('disabled', true);
 	});
 
 	it('still blocks Save on a validation error, and only Save', () => {
 		renderForm({ selectedPhase: 'planning', isDirty: true, hasValidationError: true });
 
-		expect(screen.getByRole('button', { name: 'Save Changes' })).toHaveProperty('disabled', true);
+		expect(screen.getByRole('button', { name: 'Save changes' })).toHaveProperty('disabled', true);
 		expect(screen.getByRole('button', { name: 'Reset' })).toHaveProperty('disabled', false);
 	});
 
