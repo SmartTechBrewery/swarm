@@ -126,6 +126,8 @@ function makeCappedReviewRun(overrides: Partial<RunRow> = {}): RunRow {
 		agentSessionId: null,
 		checkpoint: null,
 		continuationCount: 0,
+		continuationProgressCount: 0,
+		continuationNoProgressStreak: 0,
 		recovery: null,
 		cancellation: null,
 		resetStartedAt: null,

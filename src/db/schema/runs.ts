@@ -302,14 +302,27 @@ export const runs = pgTable(
 		checkpoint: jsonb('checkpoint').$type<Checkpoint>(),
 		/**
 		 * How many times this run has already been continued from a checkpoint. The
-		 * bound on the Tier 2 fallback: once it reaches the project's
+		 * ceiling on the Tier 2 fallback: once it reaches the project's
 		 * `pipeline.maxContinuations`, the next timeout or stall fails terminally
-		 * ("continuation budget exhausted") instead of handing off again; a usage-limit
+		 * ("continuation ceiling reached") instead of handing off again; a usage-limit
 		 * stop is never charged (issue #1219). Deliberately
 		 * **not** cleared by a retry ({@link resetRunToRunning}) — that would unbound
 		 * the loop — only by "Reset & restart" ({@link clearRunRecovery}).
 		 */
 		continuationCount: integer('continuation_count').notNull().default(0),
+		/**
+		 * How many of {@link continuationCount}'s continuations were granted on a stop
+		 * whose checkpoint advanced over the previous one (issue #1256,
+		 * `checkpointAdvanced`). Written, and cleared, exactly as `continuationCount` is.
+		 */
+		continuationProgressCount: integer('continuation_progress_count').notNull().default(0),
+		/**
+		 * How many consecutive charged stops left a checkpoint without progress (issue
+		 * #1256). A progressing stop resets it to `0`; once it reaches the project's
+		 * `pipeline.maxContinuationsWithoutProgress` the run fails terminally
+		 * ("continuation stalled"). Written, and cleared, exactly as `continuationCount` is.
+		 */
+		continuationNoProgressStreak: integer('continuation_no_progress_streak').notNull().default(0),
 		outputBytes: integer('output_bytes').notNull().default(0),
 		outputTruncated: boolean('output_truncated').notNull().default(false),
 		recovery: jsonb('recovery').$type<{

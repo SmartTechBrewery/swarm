@@ -76,6 +76,13 @@ export interface DeferredRetryIntent {
 	 */
 	automaticRetry?: boolean;
 	/**
+	 * This deferral is a charged Tier 2 checkpoint continuation (issue #1256): it
+	 * spends the run's own continuation budget (`runs.continuation_count`, bounded by
+	 * `pipeline.maxContinuations` and `pipeline.maxContinuationsWithoutProgress`)
+	 * instead of the rate-limit counter, which it leaves untouched.
+	 */
+	continuationBudgetCharged?: boolean;
+	/**
 	 * This deferral re-attempts a **continuation whose stopped attempt never reported**
 	 * (issue #1138): a lost worker transport carries no exit, session or checkpoint,
 	 * so there is nothing to re-derive recovery intent from, and the work the attempt
@@ -90,8 +97,10 @@ export interface DeferredRetryIntent {
  * Which attempt counter this deferral spends. The two token-free re-checks
  * (dependency, worker eligibility) each have their own budget so a long wait on
  * one can't exhaust the other or the small rate-limit budget, and so does an
- * automatic retry of a failure that used to be terminal (issue #1075); every other
- * deferral is a failure retry and consumes the rate-limit one as before.
+ * automatic retry of a failure that used to be terminal (issue #1075). A charged
+ * checkpoint continuation (issue #1256) spends none: the run's own continuation
+ * limits bound it. Every other deferral is a failure retry and consumes the
+ * rate-limit one as before.
  */
 function attemptCounterPatch(
 	job: SwarmJob,
@@ -111,6 +120,8 @@ function attemptCounterPatch(
 	if (intent.automaticRetry) {
 		return { automaticRetryAttempt: (job.automaticRetryAttempt ?? 0) + 1 };
 	}
+	// Spread by every caller, so an empty patch leaves every counter as it was.
+	if (intent.continuationBudgetCharged) return {};
 	return { rateLimitRetryAttempt: (job.rateLimitRetryAttempt ?? 0) + 1 };
 }
 

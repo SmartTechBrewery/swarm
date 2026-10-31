@@ -2850,6 +2850,9 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 				agentSessionId: null,
 				checkpoint: CHECKPOINT,
 				continuationCount,
+				// Issue #1256: one progress-bearing continuation, then a stall per extra one.
+				continuationProgressCount: 1,
+				continuationNoProgressStreak: continuationCount - 1,
 			});
 			return id;
 		}
@@ -2862,6 +2865,8 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			expect(row?.agentSessionId).toBeNull();
 			expect(row?.checkpoint).toEqual(CHECKPOINT);
 			expect(row?.continuationCount).toBe(1);
+			expect(row?.continuationProgressCount).toBe(1);
+			expect(row?.continuationNoProgressStreak).toBe(0);
 		});
 
 		// The retention pin cannot key on `agent_session_id` here: a checkpointed row has
@@ -2900,6 +2905,8 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			const row = await getRunByIdFromDb(id);
 			expect(row?.status).toBe('running');
 			expect(row?.continuationCount).toBe(2);
+			expect(row?.continuationProgressCount).toBe(1);
+			expect(row?.continuationNoProgressStreak).toBe(1);
 			expect(row?.checkpoint).toEqual(CHECKPOINT);
 		});
 
@@ -2911,6 +2918,8 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			await clearRunRecovery(id);
 			const row = await getRunByIdFromDb(id);
 			expect(row?.continuationCount).toBe(0);
+			expect(row?.continuationProgressCount).toBe(0);
+			expect(row?.continuationNoProgressStreak).toBe(0);
 			expect(row?.checkpoint).toBeNull();
 		});
 

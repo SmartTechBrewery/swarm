@@ -123,6 +123,23 @@ describe('deriveRetryJobPayload', () => {
 		expect(next.runId).toBe('run-1');
 	});
 
+	it('spends no attempt counter for a charged checkpoint continuation (issue #1256)', () => {
+		const next = deriveRetryJobPayload(
+			createMockScmWebhookJob({ automaticRetryAttempt: 1, rateLimitRetryAttempt: 6 }),
+			{
+				phase: 'respond-to-ci',
+				runId: 'run-1',
+				resumable: false,
+				checkpointed: true,
+				continuationBudgetCharged: true,
+			},
+		);
+
+		expect(next.rateLimitRetryAttempt).toBe(6);
+		expect(next.automaticRetryAttempt).toBe(1);
+		expect(next.recoveryMode).toBe('checkpoint');
+	});
+
 	// Issue #567. Both token-free gates refuse *before* anything is provisioned, so
 	// their "retry" is the same attempt still waiting. Re-deriving recovery intent
 	// there would turn the wait into the start-over it exists to prevent.

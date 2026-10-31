@@ -21,8 +21,9 @@
  *   worker reporting its own disk (`src/transport/assignment-execution.ts`), where a
  *   bad file just means "not a Tier 2 case" and must never fail the settle.
  *
- * It also owns the continuation *budget* ({@link resolveMaxContinuations}), the bound
- * that keeps a phase which keeps stopping from handing itself off forever. The prompt
+ * It also owns the continuation *budget* ({@link judgeCheckpointContinuation}) — a
+ * consecutive no-progress limit plus a hard ceiling ({@link resolveMaxContinuations}) —
+ * the bound that keeps a phase which keeps stopping from handing itself off forever. The prompt
  * half — what makes the four implementer phases write the file, and what re-seeds a
  * continuation with its contents — is `src/pipeline/prompts/checkpoint.ts`.
  *
@@ -132,16 +133,135 @@ export function tryReadCheckpoint(cwd: string): Checkpoint | undefined {
 }
 
 /**
- * How many checkpoint continuations one run gets by default. Two is deliberately
- * small: each continuation pays for a fresh session seeded from a degraded
- * hand-off, so a phase that keeps stopping involuntarily is better surfaced to a
- * human than handed off indefinitely.
+ * The hard ceiling on one run's checkpoint continuations, by default. It bounds a
+ * run whose checkpoint keeps advancing — which the no-progress limit below never
+ * ends — so a phase too large for its budget is still surfaced to a human
+ * eventually rather than handed off indefinitely. Six matches
+ * `MAX_RATE_LIMIT_RETRIES` and leaves room for a large task that progresses on
+ * every stop (issue #1256).
  */
-export const DEFAULT_MAX_CONTINUATIONS = 2;
+export const DEFAULT_MAX_CONTINUATIONS = 6;
 
-/** The project's checkpoint-continuation budget — `pipeline.maxContinuations`, or the coded default. */
+/** The project's ceiling on total checkpoint continuations — `pipeline.maxContinuations`, or the coded default. */
 export function resolveMaxContinuations(project: ProjectConfig): number {
 	return project.pipeline?.maxContinuations ?? DEFAULT_MAX_CONTINUATIONS;
+}
+
+/**
+ * How many consecutive charged stops without checkpoint progress end a run, by
+ * default. Two keeps today's bound on a stuck run: its first hand-off continues,
+ * one stop without progress continues once more, and the second fails it.
+ */
+export const DEFAULT_MAX_CONTINUATIONS_WITHOUT_PROGRESS = 2;
+
+/** The project's no-progress limit — `pipeline.maxContinuationsWithoutProgress`, or the coded default. */
+export function resolveMaxContinuationsWithoutProgress(project: ProjectConfig): number {
+	return (
+		project.pipeline?.maxContinuationsWithoutProgress ?? DEFAULT_MAX_CONTINUATIONS_WITHOUT_PROGRESS
+	);
+}
+
+/** Every path a checkpoint's `workingTree` names, as `git status` would report it. */
+function workingTreePaths(checkpoint: Checkpoint): Set<string> {
+	const { modified, added, deleted } = checkpoint.workingTree;
+	return new Set([...modified, ...added, ...deleted].map(normalizePath));
+}
+
+/**
+ * Whether `next` records progress over `previous`, the checkpoint the run was last
+ * continued from (`runs.checkpoint`). Progress is any of:
+ *
+ * - **no previous checkpoint** — nothing has been continued yet, so this stop judges
+ *   no continuation; it produced the run's first hand-off;
+ * - a `completed` entry `previous` lacks (compared trimmed);
+ * - fewer `remaining` entries;
+ * - a `workingTree` path `previous` did not name — the least wording-dependent
+ *   signal, since the continuation gate verifies each entry against `git status`.
+ *
+ * An unchanged or merely reworded checkpoint is not progress. The signal is the
+ * agent's own record, so an agent can fool it — by rewording `completed` on every
+ * stop, say — and that is exactly why `pipeline.maxContinuations` still caps the
+ * total: this check decides what a stop is *charged*, the ceiling bounds the run.
+ */
+export function checkpointAdvanced(
+	previous: Checkpoint | null | undefined,
+	next: Checkpoint,
+): boolean {
+	if (!previous) return true;
+	const completedBefore = new Set(previous.completed.map((entry) => entry.trim()));
+	if (next.completed.some((entry) => !completedBefore.has(entry.trim()))) return true;
+	if (next.remaining.length < previous.remaining.length) return true;
+	const pathsBefore = workingTreePaths(previous);
+	for (const path of workingTreePaths(next)) if (!pathsBefore.has(path)) return true;
+	return false;
+}
+
+/** The run's Tier 2 counters as the row holds them before this stop is judged. */
+export interface CheckpointContinuationState {
+	/** The checkpoint the run was last continued from (`runs.checkpoint`). */
+	previous: Checkpoint | null | undefined;
+	/** Total continuations granted so far (`runs.continuation_count`). */
+	continuationCount: number;
+	/** Continuations granted on a stop whose checkpoint advanced (`runs.continuation_progress_count`). */
+	progressCount: number;
+	/** Consecutive charged stops without progress (`runs.continuation_no_progress_streak`). */
+	noProgressStreak: number;
+}
+
+/** The two bounds a charged stop is judged against. */
+export interface CheckpointContinuationLimits {
+	/** The ceiling on total continuations — `pipeline.maxContinuations`. */
+	maxContinuations: number;
+	/** The consecutive no-progress limit — `pipeline.maxContinuationsWithoutProgress`. */
+	maxWithoutProgress: number;
+}
+
+/**
+ * What a charged stop earns: another continuation, carrying the counters the settle
+ * writes, or the limit that ends the run. `no-progress` is checked first, because a
+ * stuck run is the more specific — and more actionable — diagnosis of the two.
+ */
+export type CheckpointContinuationVerdict =
+	| {
+			kind: 'continue';
+			progressed: boolean;
+			continuationCount: number;
+			progressCount: number;
+			noProgressStreak: number;
+	  }
+	| { kind: 'no-progress'; streak: number; max: number; spent: number }
+	| { kind: 'ceiling'; spent: number; max: number };
+
+/**
+ * Judge a stop the run itself caused (a timeout, a stall) that left checkpoint
+ * `next` behind (issue #1256). The budget counts **stalls, not stops**: a stop that
+ * shows progress ({@link checkpointAdvanced}) resets the no-progress streak, so a
+ * progressing run is ended only by the ceiling; a run that stops without progress
+ * `maxWithoutProgress` times in a row fails however much ceiling is left.
+ */
+export function judgeCheckpointContinuation(
+	state: CheckpointContinuationState,
+	next: Checkpoint,
+	limits: CheckpointContinuationLimits,
+): CheckpointContinuationVerdict {
+	const progressed = checkpointAdvanced(state.previous, next);
+	const streak = progressed ? 0 : state.noProgressStreak + 1;
+	if (streak >= limits.maxWithoutProgress)
+		return {
+			kind: 'no-progress',
+			streak,
+			max: limits.maxWithoutProgress,
+			spent: state.continuationCount,
+		};
+	if (state.continuationCount >= limits.maxContinuations)
+		return { kind: 'ceiling', spent: state.continuationCount, max: limits.maxContinuations };
+	return {
+		kind: 'continue',
+		progressed,
+		continuationCount: state.continuationCount + 1,
+		progressCount: state.progressCount + (progressed ? 1 : 0),
+		noProgressStreak: streak,
+	};
 }
 
 /**

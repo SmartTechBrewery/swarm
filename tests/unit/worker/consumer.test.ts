@@ -550,7 +550,11 @@ const getRunByIdFromDb = vi.fn(
 		undefined as
 			| {
 					agentSessionId?: string | null;
+					// The Tier 2 baseline and counters (issue #1256).
+					checkpoint?: Checkpoint | null;
 					continuationCount?: number;
+					continuationProgressCount?: number;
+					continuationNoProgressStreak?: number;
 					recovery?: {
 						preservedWorkerId?: string | null;
 						transportLostWorkerIds?: string[];
@@ -9233,6 +9237,9 @@ describe('processJob', () => {
 					agentSessionId: null,
 					checkpoint: CHECKPOINT,
 					continuationCount: 1,
+					// The first hand-off has no previous checkpoint to compare, so it is progress.
+					continuationProgressCount: 1,
+					continuationNoProgressStreak: 0,
 				}),
 			);
 			// …and the continuation goes out through the existing durable dispatch, asking
@@ -9367,17 +9374,58 @@ describe('processJob', () => {
 			cleanup.mockRestore();
 		});
 
-		// A stop attributable to the run itself spends the budget, and the next one past
-		// it ends the run.
+		// Issue #1256: the budget counts stalls, not stops. A stop whose checkpoint
+		// advanced over the one the run was seeded from (`runs.checkpoint`) continues past
+		// the old flat budget of two, counting its progress.
+		const ADVANCED: Checkpoint = {
+			...CHECKPOINT,
+			completed: [...CHECKPOINT.completed, 'Re-ran lint'],
+			remaining: ['Write the hand-off file'],
+		};
+
+		it('continues a progressing timeout past two continuations, counting its progress', async () => {
+			getRunByIdFromDb.mockResolvedValue({
+				checkpoint: CHECKPOINT,
+				continuationCount: 2,
+				continuationProgressCount: 2,
+				continuationNoProgressStreak: 0,
+			});
+			phaseImpl = stoppedRun({ checkpoint: ADVANCED, kind: 'timeout' });
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ runId: 'run-1', recoveryMode: 'checkpoint' }),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-deferred');
+			expect(completeRun).toHaveBeenCalledExactlyOnceWith(
+				'run-1',
+				expect.objectContaining({
+					status: 'checkpointed',
+					checkpoint: ADVANCED,
+					continuationCount: 3,
+					continuationProgressCount: 3,
+					continuationNoProgressStreak: 0,
+				}),
+			);
+		});
+
+		// A stop attributable to the run itself that leaves the checkpoint unchanged
+		// extends the no-progress streak, and the streak reaching its limit ends the run.
 		it.each([
 			'timeout',
 			'stalled',
-		] as const)('fails a %s terminally once the continuation budget is exhausted', async (kind) => {
-			getRunByIdFromDb.mockResolvedValue({ continuationCount: 2 });
+		] as const)('fails a %s terminally once its continuations stop making progress', async (kind) => {
+			getRunByIdFromDb.mockResolvedValue({
+				checkpoint: CHECKPOINT,
+				continuationCount: 2,
+				continuationProgressCount: 1,
+				continuationNoProgressStreak: 1,
+			});
 			phaseImpl = stoppedRun({ checkpoint: CHECKPOINT, kind });
 
 			const outcome = await processJob(
-				createMockScmWebhookJob({ runId: 'run-1' }),
+				createMockScmWebhookJob({ runId: 'run-1', recoveryMode: 'checkpoint' }),
 				registryReturning(RESPOND_TO_CI_TRIGGER),
 			);
 
@@ -9385,8 +9433,11 @@ describe('processJob', () => {
 			// The reason is on the run's own `error`, not only in the diagnosis, so it
 			// survives wherever the raw message is shown.
 			expect(outcome).toMatchObject({
-				error: expect.stringContaining('checkpoint continuation budget exhausted (2 of 2 used)'),
-				failureDiagnosis: { kind: 'continuation-budget-exhausted' },
+				error: expect.stringContaining(
+					'checkpoint continuation stalled: 2 consecutive continuation(s) made no progress (limit 2, pipeline.maxContinuationsWithoutProgress)',
+				),
+				failureDiagnosis: { kind: 'continuation-no-progress' },
+				preservesCheckpoint: true,
 			});
 			expect(completeRun).toHaveBeenCalledExactlyOnceWith(
 				'run-1',
@@ -9396,13 +9447,118 @@ describe('processJob', () => {
 			expect(scheduleDispatchRetry).not.toHaveBeenCalled();
 		});
 
-		it('reads the budget from pipeline.maxContinuations', async () => {
-			projectLookup = () => createMockProjectConfig({ pipeline: { maxContinuations: 3 } });
-			getRunByIdFromDb.mockResolvedValue({ continuationCount: 2 });
+		it('continues a first stop without progress, extending the streak', async () => {
+			getRunByIdFromDb.mockResolvedValue({
+				checkpoint: CHECKPOINT,
+				continuationCount: 1,
+				continuationProgressCount: 1,
+				continuationNoProgressStreak: 0,
+			});
 			phaseImpl = stoppedRun({ checkpoint: CHECKPOINT, kind: 'timeout' });
 
 			const outcome = await processJob(
-				createMockScmWebhookJob({ runId: 'run-1' }),
+				createMockScmWebhookJob({ runId: 'run-1', recoveryMode: 'checkpoint' }),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-deferred');
+			expect(completeRun).toHaveBeenCalledExactlyOnceWith(
+				'run-1',
+				expect.objectContaining({
+					status: 'checkpointed',
+					continuationCount: 2,
+					continuationProgressCount: 1,
+					continuationNoProgressStreak: 1,
+				}),
+			);
+		});
+
+		it('fails a progressing run terminally at the continuation ceiling', async () => {
+			getRunByIdFromDb.mockResolvedValue({
+				checkpoint: CHECKPOINT,
+				continuationCount: 6,
+				continuationProgressCount: 6,
+				continuationNoProgressStreak: 0,
+			});
+			phaseImpl = stoppedRun({ checkpoint: ADVANCED, kind: 'timeout' });
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ runId: 'run-1', recoveryMode: 'checkpoint' }),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome).toMatchObject({
+				status: 'phase-failed',
+				error: expect.stringContaining(
+					'checkpoint continuation ceiling reached (6 of 6 continuations used, pipeline.maxContinuations)',
+				),
+				failureDiagnosis: { kind: 'continuation-budget-exhausted' },
+				preservesCheckpoint: true,
+			});
+			expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+		});
+
+		it('reads the ceiling from pipeline.maxContinuations', async () => {
+			projectLookup = () => createMockProjectConfig({ pipeline: { maxContinuations: 3 } });
+			getRunByIdFromDb.mockResolvedValue({
+				checkpoint: CHECKPOINT,
+				continuationCount: 3,
+				continuationProgressCount: 3,
+				continuationNoProgressStreak: 0,
+			});
+			phaseImpl = stoppedRun({ checkpoint: ADVANCED, kind: 'timeout' });
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ runId: 'run-1', recoveryMode: 'checkpoint' }),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome).toMatchObject({
+				status: 'phase-failed',
+				error: expect.stringContaining('checkpoint continuation ceiling reached (3 of 3'),
+			});
+		});
+
+		it('reads the no-progress limit from pipeline.maxContinuationsWithoutProgress', async () => {
+			projectLookup = () =>
+				createMockProjectConfig({ pipeline: { maxContinuationsWithoutProgress: 1 } });
+			getRunByIdFromDb.mockResolvedValue({
+				checkpoint: CHECKPOINT,
+				continuationCount: 1,
+				continuationProgressCount: 1,
+				continuationNoProgressStreak: 0,
+			});
+			phaseImpl = stoppedRun({ checkpoint: CHECKPOINT, kind: 'timeout' });
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ runId: 'run-1', recoveryMode: 'checkpoint' }),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome).toMatchObject({
+				status: 'phase-failed',
+				error: expect.stringContaining('1 consecutive continuation(s) made no progress (limit 1'),
+				failureDiagnosis: { kind: 'continuation-no-progress' },
+			});
+		});
+
+		// The ceiling is the real bound: a charged continuation is exempt from the
+		// rate-limit retry cap and spends none of that counter.
+		it('continues a charged continuation whose rate-limit retry counter is spent', async () => {
+			getRunByIdFromDb.mockResolvedValue({
+				checkpoint: CHECKPOINT,
+				continuationCount: 2,
+				continuationProgressCount: 2,
+				continuationNoProgressStreak: 0,
+			});
+			phaseImpl = stoppedRun({ checkpoint: ADVANCED, kind: 'timeout' });
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({
+					runId: 'run-1',
+					recoveryMode: 'checkpoint',
+					rateLimitRetryAttempt: 6,
+				}),
 				registryReturning(RESPOND_TO_CI_TRIGGER),
 			);
 
@@ -9411,6 +9567,10 @@ describe('processJob', () => {
 				'run-1',
 				expect.objectContaining({ status: 'checkpointed', continuationCount: 3 }),
 			);
+			expect(retriedPayload()).toMatchObject({
+				recoveryMode: 'checkpoint',
+				rateLimitRetryAttempt: 6,
+			});
 		});
 
 		// Issue #1219: a usage limit is the provider's stop, not the run's. A
@@ -9451,7 +9611,12 @@ describe('processJob', () => {
 			);
 			expect(recordRunPreservedWorker).toHaveBeenCalledWith('run-1');
 			expect(scheduleDispatchRetry).toHaveBeenCalledOnce();
-			expect(retriedPayload()).toMatchObject({ recoveryMode: 'checkpoint' });
+			// A usage-limit continuation is not charged, so it still spends the rate-limit
+			// counter that bounds it (issue #1256).
+			expect(retriedPayload()).toMatchObject({
+				recoveryMode: 'checkpoint',
+				rateLimitRetryAttempt: 1,
+			});
 			expect(retriedPayload().agentSessionId).toBeDefined();
 		});
 
@@ -9475,8 +9640,12 @@ describe('processJob', () => {
 		// this phase's checkpoint in a preserved checkout on the attempt's machine. The
 		// failed settle writes `recovery: null`, so the pin is re-recorded after it —
 		// otherwise "Retry now" would drop the inherited checkpoint continuation.
-		it('keeps the machine pin when a checkpoint continuation times out at the budget', async () => {
-			getRunByIdFromDb.mockResolvedValue({ continuationCount: 2 });
+		it('keeps the machine pin when a checkpoint continuation times out without progress', async () => {
+			getRunByIdFromDb.mockResolvedValue({
+				checkpoint: CHECKPOINT,
+				continuationCount: 2,
+				continuationNoProgressStreak: 1,
+			});
 			phaseImpl = stoppedRun({ checkpoint: CHECKPOINT, kind: 'timeout' });
 
 			const outcome = await processJob(
@@ -9487,7 +9656,7 @@ describe('processJob', () => {
 			expect(outcome).toMatchObject({
 				status: 'phase-failed',
 				preservesCheckpoint: true,
-				failureDiagnosis: { kind: 'continuation-budget-exhausted' },
+				failureDiagnosis: { kind: 'continuation-no-progress' },
 			});
 			expect(completeRun).toHaveBeenCalledExactlyOnceWith(
 				'run-1',
@@ -9500,9 +9669,11 @@ describe('processJob', () => {
 			);
 		});
 
+		// A usage-limit continuation still spends the rate-limit counter (a charged one
+		// is exempt — issue #1256), so it is the one a spent retry budget still ends.
 		it('keeps the machine pin when a continuable stop spends the retry budget', async () => {
 			getRunByIdFromDb.mockResolvedValue({ continuationCount: 1 });
-			phaseImpl = stoppedRun({ checkpoint: CHECKPOINT, kind: 'timeout' });
+			phaseImpl = stoppedRun({ checkpoint: CHECKPOINT });
 
 			const outcome = await processJob(
 				createMockScmWebhookJob({
@@ -9560,7 +9731,11 @@ describe('processJob', () => {
 		// A cancellation that lands between the failure's classification and its settle:
 		// the reconcile decides that checkout's fate, so the settle adds no pin of its own.
 		it('records no pin when the continuable failure settles as a cancellation', async () => {
-			getRunByIdFromDb.mockResolvedValue({ continuationCount: 2 });
+			getRunByIdFromDb.mockResolvedValue({
+				checkpoint: CHECKPOINT,
+				continuationCount: 2,
+				continuationNoProgressStreak: 1,
+			});
 			isRunCancellationRequested
 				.mockResolvedValueOnce(false)
 				.mockResolvedValueOnce(false)
