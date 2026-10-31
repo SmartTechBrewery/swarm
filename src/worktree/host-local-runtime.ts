@@ -38,7 +38,7 @@
  * (`./reclaim.ts`) still refuses a checkout that is dirty or carries unpushed
  * commits, so the worst an expiry can do is stop a *marker* from blocking. Nor does
  * bounding liveness cut a real phase short — a configured per-phase timeout caps at
- * 45 minutes (`AgentConfigSchema`, `../config/schema.ts`), far inside the lease TTL,
+ * 90 minutes (`AgentConfigSchema`, `../config/schema.ts`), far inside the 4-hour lease TTL,
  * and the Redis lease this mirrors was never heartbeated either: it lapsed under a
  * live phase too.
  */

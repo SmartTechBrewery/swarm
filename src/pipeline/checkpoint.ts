@@ -42,6 +42,7 @@ import { logger } from '@/lib/logger.js';
 import { gitEnvironmentForCwd, HANDOFF_FILENAMES, readHandoff } from '@/scm/delivery.js';
 import { type TriggerPhase, TriggerPhaseSchema } from '@/triggers/types.js';
 import type { BlockedRecoveryReason } from '@/worktree/reclaim.js';
+import { DEFAULT_MAX_CONTINUATIONS } from './continuation-budget.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -131,13 +132,8 @@ export function tryReadCheckpoint(cwd: string): Checkpoint | undefined {
 	}
 }
 
-/**
- * How many checkpoint continuations one run gets by default. Two is deliberately
- * small: each continuation pays for a fresh session seeded from a degraded
- * hand-off, so a phase that keeps stopping involuntarily is better surfaced to a
- * human than handed off indefinitely.
- */
-export const DEFAULT_MAX_CONTINUATIONS = 2;
+/** Re-exported so every existing importer is unchanged; the value lives in `./continuation-budget.ts`. */
+export { DEFAULT_MAX_CONTINUATIONS };
 
 /** The project's checkpoint-continuation budget — `pipeline.maxContinuations`, or the coded default. */
 export function resolveMaxContinuations(project: ProjectConfig): number {

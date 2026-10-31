@@ -2668,7 +2668,7 @@ describe('review trigger — the CI fix holds the PR+SHA lease for its run (issu
 
 	/**
 	 * The lease is derived from the timeout the fix will actually run under, not
-	 * from the coded default: `agents.respondToCi.timeoutMs` is valid to 45 minutes
+	 * from the coded default: `agents.respondToCi.timeoutMs` is valid to 90 minutes
 	 * and `SWARM_AGENT_TIMEOUT_MS` moves the default under it, and a lease fixed at
 	 * the default's 35 minutes lapsed in the tail of either.
 	 */
@@ -2681,19 +2681,20 @@ describe('review trigger — the CI fix holds the PR+SHA lease for its run (issu
 				event: createMockScmEvent(checks),
 			});
 
-		it('covers a Respond-to-CI timeout configured to the schema’s 45-minute maximum', async () => {
+		it('covers a Respond-to-CI timeout configured to the schema’s 90-minute maximum', async () => {
 			const project = createMockProjectConfig({
-				agents: { respondToCi: { timeoutMs: 45 * 60 * 1000 } },
+				agents: { respondToCi: { timeoutMs: 90 * 60 * 1000 } },
 			});
 
 			expect(await handler.handle(projectCtx(project))).toMatchObject({
 				phase: 'respond-to-ci',
 			});
-			expect(refreshReviewDispatchClaim).toHaveBeenCalledWith(KEY, 50 * 60);
+			expect(refreshReviewDispatchClaim).toHaveBeenCalledWith(KEY, 95 * 60);
 
-			// Minute 36 — where the old fixed lease had already lapsed — and a delayed
-			// sibling completed-check event for the same head is still locked out.
-			elapse(36 * 60);
+			// Minute 89 — deep in the tail of a 90-minute run, long after the old fixed
+			// lease had lapsed — and a delayed sibling completed-check event for the same
+			// head is still locked out.
+			elapse(89 * 60);
 			expect(await handler.handle(projectCtx(project))).toBeNull();
 			// The decisive assertion: no second fix attempt was spent on this red.
 			expect(claimRespondToCiAttempt).toHaveBeenCalledTimes(1);
