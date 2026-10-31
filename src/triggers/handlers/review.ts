@@ -1287,7 +1287,7 @@ const CI_FIX_CLAIM_MARGIN_SEC = 5 * 60;
  *
  * Derived rather than fixed, because the wall clock is configurable and the lease
  * has to cover whatever it is set to. `agents.respondToCi.timeoutMs` is valid up
- * to 45 minutes (`AgentConfigSchema`, `src/config/schema.ts`) and
+ * to 90 minutes (`AgentConfigSchema`, `src/config/schema.ts`, issue #1259) and
  * `SWARM_AGENT_TIMEOUT_MS` moves the default under it, so a constant sized for
  * the 30-minute default lapsed ~10 minutes into the tail of a legitimately
  * configured run — long enough for a delayed sibling completed-check event to

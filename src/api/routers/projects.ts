@@ -249,12 +249,34 @@ const ProjectCreateInputSchema = ProjectWriteInputSchema.omit({ pm: true }).exte
 	reviewerToken: z.string().trim().min(1).optional(),
 });
 
+/**
+ * The `pipeline` patch `update` accepts: the stored shape, except that
+ * `maxContinuations: null` *clears* the budget back to its coded default (issue
+ * #1259). The wire is plain JSON, so an `undefined` key never arrives — without an
+ * explicit `null` the Pipeline tab could set the budget but never unset it.
+ */
+const PipelinePatchSchema = PipelineBaseSchema.extend({
+	maxContinuations: z.number().int().positive().nullable().optional(),
+});
+type PipelinePatch = z.infer<typeof PipelinePatchSchema>;
+
 function mergePipelineConfig(
 	existing: PipelineConfig | undefined,
-	patch: Partial<PipelineConfig> | undefined,
+	patch: PipelinePatch | undefined,
 ): PipelineConfig {
-	if (!existing) return (patch || {}) as PipelineConfig;
-	if (!patch) return existing;
+	if (!patch) return existing ?? {};
+	const { maxContinuations, ...rest } = patch;
+	const merged = mergePipelineSections(existing, rest);
+	if (maxContinuations === null) delete merged.maxContinuations;
+	else if (maxContinuations !== undefined) merged.maxContinuations = maxContinuations;
+	return merged;
+}
+
+function mergePipelineSections(
+	existing: PipelineConfig | undefined,
+	patch: PipelineConfig,
+): PipelineConfig {
+	if (!existing) return { ...patch };
 	return {
 		...existing,
 		...patch,
@@ -556,7 +578,7 @@ export const projectsRouter = router({
 		.input(
 			ProjectWriteInputSchema.partial().extend({
 				id: z.string().min(1),
-				pipeline: PipelineBaseSchema.optional(),
+				pipeline: PipelinePatchSchema.optional(),
 			}),
 		)
 		.mutation(async ({ ctx, input }) => {
@@ -570,7 +592,7 @@ export const projectsRouter = router({
 					message: `Project with ID "${input.id}" not found`,
 				});
 			}
-			const { id, ...updates } = input;
+			const { id, pipeline: pipelinePatch, ...updates } = input;
 			// Before the merge, so a refused switch leaves nothing written at all.
 			if (updates.pm) assertPmProviderSwitchable(existing, updates.pm);
 			const config = {
@@ -583,9 +605,9 @@ export const projectsRouter = router({
 			if (updates.repositories || updates.scm) {
 				assertRepositoryCoordinates(config.scm, config.repositories);
 			}
-			if (updates.pipeline) {
+			if (pipelinePatch) {
 				config.pipeline = PipelineConfigSchema.parse(
-					mergePipelineConfig(existing.pipeline, updates.pipeline),
+					mergePipelineConfig(existing.pipeline, pipelinePatch),
 				);
 			}
 			try {

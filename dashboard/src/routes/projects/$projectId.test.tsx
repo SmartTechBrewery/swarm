@@ -80,6 +80,7 @@ import {
 	ToggleSaveIndicator,
 	toGeneralSettingsUpdate,
 	toggleSaveKey,
+	toPipelineSettingsUpdate,
 	toRepositoriesUpdate,
 	useToggleAutoSave,
 } from './$projectId.js';
@@ -867,6 +868,10 @@ describe('PipelineSettingsForm — per-repository settings', () => {
 			<PipelineSettingsForm
 				skipRespondToReviewOnMinors={true}
 				setSkipRespondToReviewOnMinors={noop}
+				maxContinuationsInput=""
+				setMaxContinuationsInput={noop}
+				storedMaxContinuations={undefined}
+				agents={{}}
 				handleSubmit={(e) => e.preventDefault()}
 				handleReset={noop}
 				isDirty={false}
@@ -891,6 +896,133 @@ describe('PipelineSettingsForm — per-repository settings', () => {
 		expect(screen.queryByRole('radio')).toBeNull();
 		expect(screen.queryByText(/Require CI checks/)).toBeNull();
 		expect(screen.getByText(/set per repository, on Source control/)).toBeDefined();
+	});
+});
+
+describe('PipelineSettingsForm — checkpoint continuation budget (issue #1259)', () => {
+	type FormProps = React.ComponentProps<typeof PipelineSettingsForm>;
+
+	function renderForm(overrides: Partial<FormProps> = {}) {
+		render(
+			<PipelineSettingsForm
+				skipRespondToReviewOnMinors={true}
+				setSkipRespondToReviewOnMinors={() => {}}
+				maxContinuationsInput=""
+				setMaxContinuationsInput={() => {}}
+				storedMaxContinuations={undefined}
+				agents={{}}
+				handleSubmit={(e) => e.preventDefault()}
+				handleReset={() => {}}
+				isDirty={false}
+				isPending={false}
+				isSuccess={false}
+				isError={false}
+				{...overrides}
+			/>,
+		);
+	}
+
+	/** The "Max run time" cell of one phase's row. */
+	function maxRunTimeOf(phaseLabel: string): string | null {
+		const row = screen.getByText(phaseLabel).closest('tr');
+		return row?.querySelectorAll('td')[2]?.textContent ?? null;
+	}
+
+	it('shows the default when the project sets no budget', () => {
+		renderForm();
+
+		expect(screen.getByLabelText('Max checkpoint continuations')).toHaveProperty('value', '');
+		expect(screen.getByPlaceholderText('2 (default)')).toBeDefined();
+		expect(screen.getByText(/Using the default of 2/)).toBeDefined();
+	});
+
+	it("derives each phase's maximum run time from its effective timeout and the budget", () => {
+		renderForm({
+			maxContinuationsInput: '3',
+			agents: { implementation: { timeoutMs: 90 * 60 * 1000 } },
+		});
+
+		// 90 min × (1 + 3), and the 30-minute default × (1 + 3) for an unset phase.
+		expect(maxRunTimeOf('Implementation')).toBe('6 h');
+		expect(maxRunTimeOf('Respond to review')).toBe('2 h');
+		// Planning and Review keep no checkpoint, so they are not listed.
+		expect(screen.queryByText('Planning')).toBeNull();
+	});
+
+	it('falls back to the default budget in the run-time column when the field is blank', () => {
+		renderForm({ storedMaxContinuations: 5 });
+
+		expect(maxRunTimeOf('Implementation')).toBe('1 h 30 min');
+	});
+
+	it('reports an invalid entry and blocks Save', () => {
+		renderForm({ maxContinuationsInput: '0', isDirty: true });
+
+		expect(screen.getByText(/Enter a whole number of 1 or more/)).toBeDefined();
+		expect(screen.getByRole('button', { name: 'Save changes' })).toHaveProperty('disabled', true);
+	});
+
+	it('hands each edit to its setter', () => {
+		const setMaxContinuationsInput = vi.fn();
+		renderForm({ setMaxContinuationsInput });
+
+		fireEvent.change(screen.getByLabelText('Max checkpoint continuations'), {
+			target: { value: '4' },
+		});
+
+		expect(setMaxContinuationsInput).toHaveBeenCalledWith('4');
+	});
+});
+
+describe('toPipelineSettingsUpdate (issue #1259)', () => {
+	const form = { skipRespondToReviewOnMinors: true, maxContinuationsInput: '' };
+
+	it('writes only maxContinuations when only the budget changed', () => {
+		expect(
+			toPipelineSettingsUpdate(
+				'p1',
+				{ review: { enabled: true } },
+				{ ...form, maxContinuationsInput: '4' },
+			),
+		).toEqual({ id: 'p1', pipeline: { maxContinuations: 4 } });
+	});
+
+	it('clears a stored budget with an explicit null when the field is emptied', () => {
+		expect(
+			toPipelineSettingsUpdate('p1', { maxContinuations: 4, automationLabel: 'bot' }, form),
+		).toEqual({ id: 'p1', pipeline: { maxContinuations: null } });
+	});
+
+	it('sends nothing when the form matches the stored config', () => {
+		expect(
+			toPipelineSettingsUpdate(
+				'p1',
+				{ maxContinuations: 4 },
+				{ ...form, maxContinuationsInput: ' 4 ' },
+			),
+		).toBeNull();
+		expect(toPipelineSettingsUpdate('p1', undefined, form)).toBeNull();
+	});
+
+	it('sends nothing for an invalid budget', () => {
+		expect(
+			toPipelineSettingsUpdate('p1', undefined, {
+				skipRespondToReviewOnMinors: false,
+				maxContinuationsInput: '1.5',
+			}),
+		).toBeNull();
+	});
+
+	it('keeps the skip-on-minors toggle in the same patch when both changed', () => {
+		expect(
+			toPipelineSettingsUpdate('p1', undefined, {
+				skipRespondToReviewOnMinors: false,
+				maxContinuationsInput: '1',
+			}),
+		).toEqual({
+			id: 'p1',
+			pipeline: { respondToReview: { skipOnMinors: false }, maxContinuations: 1 },
+		});
 	});
 });
 
@@ -1500,6 +1632,10 @@ describe('PipelineSettingsForm serialization', () => {
 			<PipelineSettingsForm
 				skipRespondToReviewOnMinors={true}
 				setSkipRespondToReviewOnMinors={() => {}}
+				maxContinuationsInput=""
+				setMaxContinuationsInput={() => {}}
+				storedMaxContinuations={undefined}
+				agents={{}}
 				handleSubmit={(e) => e.preventDefault()}
 				handleReset={() => {}}
 				isDirty={true}
