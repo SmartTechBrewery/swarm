@@ -23,6 +23,8 @@ const findBoardItemIdForTask = vi.fn(
 vi.mock('@/db/repositories/runsRepository.js', () => ({
 	findBoardItemIdForTask: (projectId: string, taskId: string) =>
 		findBoardItemIdForTask(projectId, taskId),
+	// No recorded Implementation branch: the PR branch's task comes from its decode.
+	findTaskIdForStoredTaskBranch: async () => undefined,
 }));
 
 const WEBHOOK = 'https://hooks.example.test/swarm';
@@ -33,13 +35,21 @@ const IMPLEMENTATION: TriggerResult = {
 	taskId: '1963',
 	workItem: createMockWorkItem({ id: 'ITEM_1963' }),
 };
+// A pull-request phase's own task id is the PR number, never the card's task.
 const REVIEW: TriggerResult = {
 	phase: 'review',
-	taskId: '1963',
-	prNumber: '2001',
+	taskId: '1980',
+	prNumber: '1980',
 	prBranch: 'issue-1963',
 	headSha: 'deadbeef',
-} as TriggerResult;
+};
+const RESPOND_TO_CI: TriggerResult = {
+	phase: 'respond-to-ci',
+	taskId: '1980-ci',
+	prNumber: '1980',
+	prBranch: 'issue-1963',
+	headSha: 'deadbeef',
+};
 
 const dependent = (reference: string, open = true): WorkItemDependent => ({
 	reference,
@@ -100,18 +110,43 @@ describe('notifyBlockingFailure', () => {
 		expect(body.text).toContain('checkpoint continuation budget exhausted');
 	});
 
-	it("finds a pull-request phase's work item through the task's recorded card", async () => {
-		findBoardItemIdForTask.mockResolvedValue('ITEM_1963');
+	it.each([
+		['Review', REVIEW],
+		['Respond-to-CI', RESPOND_TO_CI],
+	])("finds a %s run's work item through its branch's task, not the PR number", async (_phase, trigger) => {
+		findBoardItemIdForTask.mockImplementation(async (_projectId, taskId) =>
+			taskId === '1963' ? 'ITEM_1963' : undefined,
+		);
 		listDependents.mockResolvedValue([dependent('#1964')]);
 		const fetchImpl = okFetch();
 
 		await notifyBlockingFailure(
-			{ project: project({ webhookUrl: WEBHOOK }), trigger: REVIEW, runId: 'run-2', error: ERROR },
+			{ project: project({ webhookUrl: WEBHOOK }), trigger, runId: 'run-2', error: ERROR },
 			fetchImpl,
 		);
 
+		expect(findBoardItemIdForTask).toHaveBeenCalledExactlyOnceWith(expect.any(String), '1963');
 		expect(listDependents).toHaveBeenCalledWith('ITEM_1963');
 		expect(fetchImpl).toHaveBeenCalledOnce();
+	});
+
+	it('sends nothing for a pull-request phase whose branch names no task', async () => {
+		listDependents.mockResolvedValue([dependent('#1964')]);
+		const fetchImpl = okFetch();
+
+		await notifyBlockingFailure(
+			{
+				project: project({ webhookUrl: WEBHOOK }),
+				trigger: { ...REVIEW, prBranch: 'hand-named-fix' },
+				runId: 'run-2',
+				error: ERROR,
+			},
+			fetchImpl,
+		);
+
+		expect(findBoardItemIdForTask).not.toHaveBeenCalled();
+		expect(listDependents).not.toHaveBeenCalled();
+		expect(fetchImpl).not.toHaveBeenCalled();
 	});
 
 	it.each([

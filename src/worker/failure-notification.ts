@@ -18,7 +18,7 @@
  */
 
 import type { ProjectConfig } from '../config/schema.js';
-import { findBoardItemIdForTask } from '../db/repositories/runsRepository.js';
+import { resolveBoardItemIdForPrBranch } from '../dispatch/board-card.js';
 import { requireProjectPMProvider } from '../integrations/pm/registry.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
@@ -78,9 +78,12 @@ export function blockingFailureNotification(
 
 /**
  * The open items natively blocked by the failed run's own work item. A board phase
- * carries its item; a pull-request phase recovers it from the durable task ↔ card link
- * the board phases recorded (`findBoardItemIdForTask`), and a task the board never
- * drove has nothing waiting on it that SWARM can name.
+ * carries its item; a pull-request phase recovers it from its head branch — the task
+ * the branch belongs to, then the card that task's board runs recorded
+ * (`resolveBoardItemIdForPrBranch`). Never by the trigger's own `taskId`: a
+ * pull-request phase's is the PR number (`1980`, `1980-ci`, …), not the card's task.
+ * A branch that names no task, or a task the board never drove, has nothing waiting on
+ * it that SWARM can name.
  */
 async function openDependents(
 	project: ProjectConfig,
@@ -91,7 +94,7 @@ async function openDependents(
 	const workItemId =
 		'workItem' in trigger
 			? trigger.workItem.id
-			: await findBoardItemIdForTask(project.id, trigger.taskId);
+			: await resolveBoardItemIdForPrBranch(project, trigger.prBranch);
 	if (!workItemId) return [];
 	return (await pm.listDependents(workItemId)).filter((dependent) => dependent.open);
 }

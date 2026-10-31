@@ -372,8 +372,12 @@ delete the very working tree the checkpoint describes, turning the continuation 
 the number of times one run may be continued this way; the count lives on the run row. Once it
 is spent, the next timeout or stall is a terminal failure whose reason and
 `FailureDiagnosis` both say the continuation budget was exhausted, rather than a further
-hand-off. A continuation also consumes an ordinary rate-limit retry attempt, so the coarser
-`MAX_RATE_LIMIT_RETRIES` cap still applies underneath.
+hand-off. That failure is not yet handed to the operator, though: unless the project turned it
+off, it first gets the one automatic preserved-work retry (`pipeline.preservedWorkRetry`, issue
+#1257) after `pipeline.preservedWorkRetry.delayMinutes` — a `recoveryMode: 'checkpoint'`
+continuation pinned to the machine holding the checkout, which spends no further continuation.
+Only a failure after that retry is terminal. A continuation also consumes an ordinary
+rate-limit retry attempt, so the coarser `MAX_RATE_LIMIT_RETRIES` cap still applies underneath.
 
 **The budget ends only stops attributable to the run** (issue #1219). A usage limit
 (`rate-limit`) is the provider's stop, not the run's: the work was progressing and the account
