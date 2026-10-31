@@ -544,6 +544,36 @@ export const PipelineBaseSchema = z.object({
 	 */
 	maxContinuations: z.number().int().positive().optional(),
 	/**
+	 * The one automatic retry a run gets when it fails terminally while holding
+	 * preserved work — a checkpoint, a resumable delivery or session, or a provisioned
+	 * Implementation branch (issue #1257, `PRESERVED_WORK_RETRY_POLICY` in
+	 * `src/worker/automatic-retry-policy.ts`). On by default; `enabled: false` hands
+	 * such a run straight to the operator, as before. `delayMinutes` is the cool-down
+	 * before the retry (default 45).
+	 */
+	preservedWorkRetry: z
+		.object({
+			enabled: z.boolean().optional(),
+			delayMinutes: z.number().int().positive().optional(),
+		})
+		.optional(),
+	/**
+	 * Where SWARM tells the operator that a run failed terminally while other work
+	 * items wait on its own (issue #1257, `src/worker/failure-notification.ts`): a
+	 * JSON `POST` to `webhookUrl`, naming the run, the failure and the waiting items.
+	 * Sent only when `webhookUrl` is set and `enabled` is not `false`.
+	 */
+	failureNotifications: z
+		.object({
+			enabled: z.boolean().optional(),
+			webhookUrl: z
+				.string()
+				.url()
+				.refine((url) => /^https?:\/\//i.test(url), 'must be an http(s) URL')
+				.optional(),
+		})
+		.optional(),
+	/**
 	 * Label a work item must carry before SWARM starts a board-driven agent
 	 * phase (Planning, Implementation) for it — the explicit, human-controlled
 	 * automation opt-in (issue #131). Provider-neutral: it is a work-item label

@@ -66,6 +66,8 @@ export const dispatches = pgTable(
 		 * return, so the run is retried automatically after its failure type's delay —
 		 * issue #1075), `late-result` (that retry's lost attempt reported a late
 		 * success, which the dispatch now settles the run with — issue #1076),
+		 * `preserved-work-retry` (the run failed terminally holding preserved work and
+		 * gets one automatic retry after a cool-down — issue #1257),
 		 * `recheck` (a wait on CI), `dependency` (an unfinished prerequisite — issue
 		 * #1087), `review-claim` (another dispatch holds the head's review slot),
 		 * `mergeability` (the provider has not computed it yet), `read-failed` (a

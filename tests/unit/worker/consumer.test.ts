@@ -567,6 +567,9 @@ const getRunByIdFromDb = vi.fn(
 					// `taskId`: a maintenance run carries neither.
 					kind?: string;
 					repository?: string | null;
+					// Issue #1257 — read for the Implementation branch an attempt provisioned,
+					// which the dispatcher records on the row's payload only.
+					jobPayload?: Partial<SwarmJob>;
 			  }
 			| undefined,
 );
@@ -623,6 +626,13 @@ vi.mock('@/db/repositories/runsRepository.js', () => ({
 	// the repository about what counts as pipeline work.
 	isPipelineRun: (run: { kind?: string; repository?: string | null; taskId?: string | null }) =>
 		run.kind === 'pipeline' && run.repository !== null && run.taskId !== null,
+}));
+
+// Issue #1257 — the operator notice a blocking terminal failure sends, mocked at the
+// module boundary; what it sends is covered by `failure-notification.test.ts`.
+const notifyBlockingFailure = vi.fn(async (_failure: unknown) => {});
+vi.mock('@/worker/failure-notification.js', () => ({
+	notifyBlockingFailure: (failure: unknown) => notifyBlockingFailure(failure),
 }));
 
 // The preserved-checkout pin resolves the machine's display name for its refusal
@@ -1138,6 +1148,7 @@ describe('processJob', () => {
 		getRunByIdFromDb.mockResolvedValue(undefined);
 		recordRunPreservedWorker.mockClear();
 		recordRunBranchHolder.mockClear();
+		notifyBlockingFailure.mockClear();
 		getWorker.mockClear();
 		reconcileTerminatedWorktree.mockClear();
 		reconcileTerminatedWorktree.mockResolvedValue({ outcome: 'absent' });
@@ -5885,7 +5896,8 @@ describe('processJob', () => {
 			failWith(new DeliveryDeferredError('Review delivery deferred for retry'));
 
 			const outcome = await processJob(
-				createMockScmWebhookJob({ rateLimitRetryAttempt: 6 }),
+				// Past its one automatic retry too (issue #1257), so the run is terminal.
+				createMockScmWebhookJob({ rateLimitRetryAttempt: 6, preservedWorkRetryAttempt: 1 }),
 				registryReturning(REVIEW_TRIGGER),
 			);
 
@@ -9377,7 +9389,8 @@ describe('processJob', () => {
 			phaseImpl = stoppedRun({ checkpoint: CHECKPOINT, kind });
 
 			const outcome = await processJob(
-				createMockScmWebhookJob({ runId: 'run-1' }),
+				// The run already had its one automatic retry (issue #1257).
+				createMockScmWebhookJob({ runId: 'run-1', preservedWorkRetryAttempt: 1 }),
 				registryReturning(RESPOND_TO_CI_TRIGGER),
 			);
 
@@ -9480,7 +9493,11 @@ describe('processJob', () => {
 			phaseImpl = stoppedRun({ checkpoint: CHECKPOINT, kind: 'timeout' });
 
 			const outcome = await processJob(
-				createMockScmWebhookJob({ runId: 'run-1', recoveryMode: 'checkpoint' }),
+				createMockScmWebhookJob({
+					runId: 'run-1',
+					recoveryMode: 'checkpoint',
+					preservedWorkRetryAttempt: 1,
+				}),
 				registryReturning(RESPOND_TO_CI_TRIGGER),
 			);
 
@@ -9509,6 +9526,7 @@ describe('processJob', () => {
 					runId: 'run-1',
 					recoveryMode: 'checkpoint',
 					rateLimitRetryAttempt: 6,
+					preservedWorkRetryAttempt: 1,
 				}),
 				registryReturning(RESPOND_TO_CI_TRIGGER),
 			);
@@ -9568,7 +9586,11 @@ describe('processJob', () => {
 			phaseImpl = stoppedRun({ checkpoint: CHECKPOINT, kind: 'timeout' });
 
 			const outcome = await processJob(
-				createMockScmWebhookJob({ runId: 'run-1', recoveryMode: 'checkpoint' }),
+				createMockScmWebhookJob({
+					runId: 'run-1',
+					recoveryMode: 'checkpoint',
+					preservedWorkRetryAttempt: 1,
+				}),
 				registryReturning(RESPOND_TO_CI_TRIGGER),
 			);
 
@@ -9579,6 +9601,256 @@ describe('processJob', () => {
 				expect.objectContaining({ status: 'failed', cancellation: null }),
 			);
 			expect(recordRunPreservedWorker).not.toHaveBeenCalled();
+		});
+	});
+
+	// Issue #1257: a run that fails terminally while holding preserved work gets one
+	// automatic retry after a cool-down, continuing that work where it is, before it is
+	// handed to the operator — who is then told when other work waits on it.
+	describe('the automatic retry of a run that failed holding preserved work', () => {
+		const FORTY_FIVE_MINUTES_MS = 45 * 60 * 1000;
+		const CHECKPOINT: Checkpoint = {
+			phase: 'respond-to-ci',
+			completed: ['Fixed the failing config test'],
+			remaining: ['verify', 'handoff'],
+			decisions: [],
+			workingTree: { modified: ['src/config/schema.ts'], added: [], deleted: [] },
+		};
+		const IMPLEMENTATION_TRIGGER: TriggerResult = {
+			phase: 'implementation',
+			taskId: '10',
+			workItem: createMockWorkItem(),
+		};
+
+		beforeEach(() => {
+			getRunByIdFromDb.mockResolvedValue(undefined);
+		});
+
+		/** A checkpoint continuation that timed out with every continuation spent. */
+		const timedOutAtContinuationBudget = (
+			failure: { kind: 'timeout' | 'auth' } = { kind: 'timeout' },
+		) => {
+			getRunByIdFromDb.mockResolvedValue({ continuationCount: 2 });
+			phaseImpl = async () => {
+				throw new AgentRunError(
+					`respond-to-ci agent (claude) exited with code 1 (${failure.kind})`,
+					failure,
+					agentResult({ exitCode: 1 }),
+					CHECKPOINT,
+				);
+			};
+		};
+		const scheduled = () =>
+			scheduleDispatchRetry.mock.calls.at(-1) as [
+				string,
+				{ waitReason: string; attempt: number; availableAt: Date; jobPayload: SwarmJob },
+			];
+
+		it('retries a run at its continuation budget once, after the cool-down, from its checkpoint', async () => {
+			timedOutAtContinuationBudget();
+			const before = Date.now();
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ runId: 'run-1', recoveryMode: 'checkpoint' }),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome).toMatchObject({
+				status: 'phase-deferred',
+				retryDelayMs: FORTY_FIVE_MINUTES_MS,
+				attempt: 0,
+				preservedWorkRetry: 'checkpoint',
+				// The Queue shows why the run is waiting.
+				reason: expect.stringContaining('checkpoint continuation budget exhausted (2 of 2 used)'),
+			});
+			const [, input] = scheduled();
+			expect(input.waitReason).toBe('preserved-work-retry');
+			expect(input.attempt).toBe(1);
+			expect(input.availableAt.getTime()).toBeGreaterThanOrEqual(before + FORTY_FIVE_MINUTES_MS);
+			expect(input.jobPayload).toMatchObject({
+				recoveryMode: 'checkpoint',
+				preservedWorkRetryAttempt: 1,
+			});
+			// Its own counter: neither the rate-limit nor the transport-loss budget is spent.
+			expect(input.jobPayload.rateLimitRetryAttempt).toBeUndefined();
+			expect(input.jobPayload.automaticRetryAttempt).toBeUndefined();
+			// The row waits as the same continuation, spends no further one, and is pinned
+			// to the machine holding the checkout.
+			const settle = completeRun.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+			expect(settle).toMatchObject({ status: 'checkpointed', checkpoint: CHECKPOINT });
+			expect(settle.continuationCount).toBeUndefined();
+			expect(recordRunPreservedWorker).toHaveBeenCalledWith('run-1');
+			// Nothing is reported as failed while the retry waits.
+			expect(failDispatch).not.toHaveBeenCalled();
+			expect(commentOnPullRequest).not.toHaveBeenCalled();
+			expect(notifyBlockingFailure).not.toHaveBeenCalled();
+		});
+
+		it('fails for the operator once the retry is spent, says so, and notifies', async () => {
+			timedOutAtContinuationBudget();
+			failDispatch.mockClear();
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({
+					runId: 'run-1',
+					recoveryMode: 'checkpoint',
+					preservedWorkRetryAttempt: 1,
+				}),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			const note = 'already retried automatically once, still failing';
+			expect(outcome).toMatchObject({
+				status: 'phase-failed',
+				error: expect.stringContaining(note),
+				preservesCheckpoint: true,
+			});
+			expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+			expect(failDispatch).toHaveBeenCalledWith('dispatch-1', expect.stringContaining(note));
+			expect(commentOnPullRequest).toHaveBeenCalledWith(
+				expect.anything(),
+				expect.anything(),
+				expect.stringContaining(note),
+			);
+			expect(notifyBlockingFailure).toHaveBeenCalledExactlyOnceWith(
+				expect.objectContaining({
+					runId: 'run-1',
+					trigger: RESPOND_TO_CI_TRIGGER,
+					error: expect.stringContaining(note),
+				}),
+			);
+		});
+
+		it("waits the project's own cool-down", async () => {
+			projectLookup = () =>
+				createMockProjectConfig({
+					scm: 'github',
+					pipeline: { preservedWorkRetry: { delayMinutes: 60 } },
+				});
+			timedOutAtContinuationBudget();
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ runId: 'run-1', recoveryMode: 'checkpoint' }),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome).toMatchObject({ status: 'phase-deferred', retryDelayMs: 60 * 60 * 1000 });
+		});
+
+		it('hands the run straight to the operator when the project turned the retry off', async () => {
+			projectLookup = () =>
+				createMockProjectConfig({
+					scm: 'github',
+					pipeline: { preservedWorkRetry: { enabled: false } },
+				});
+			timedOutAtContinuationBudget();
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ runId: 'run-1', recoveryMode: 'checkpoint' }),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-failed');
+			expect(outcome).not.toMatchObject({
+				error: expect.stringContaining('retried automatically'),
+			});
+			expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+		});
+
+		it('does not retry a failure that preserved nothing', async () => {
+			// A usage limit past its budget, with no session captured and no checkpoint.
+			phaseImpl = async () => {
+				throw new AgentRunError(
+					'rate limited',
+					{ kind: 'rate-limit' },
+					agentResult({ exitCode: 1 }),
+				);
+			};
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ runId: 'run-1', rateLimitRetryAttempt: 6 }),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-failed');
+			expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+		});
+
+		it('does not retry a failure the operator must act on, even with a checkpoint', async () => {
+			timedOutAtContinuationBudget({ kind: 'auth' });
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ runId: 'run-1', recoveryMode: 'checkpoint' }),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-failed');
+			expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+		});
+
+		it('continues a spent delivery from its preserved progress', async () => {
+			phaseImpl = async () => {
+				throw new DeliveryDeferredError('Review delivery deferred for retry');
+			};
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ runId: 'run-1', rateLimitRetryAttempt: 6 }),
+				registryReturning(REVIEW_TRIGGER),
+			);
+
+			expect(outcome).toMatchObject({ status: 'phase-deferred', preservedWorkRetry: 'delivery' });
+			const [, input] = scheduled();
+			expect(input.waitReason).toBe('preserved-work-retry');
+			expect(input.jobPayload).toMatchObject({
+				resumeDelivery: true,
+				preservedWorkRetryAttempt: 1,
+			});
+			expect(recordRunPreservedWorker).toHaveBeenCalledWith('run-1');
+		});
+
+		// A worker reports a control-plane server error inside a terminal frame, as an
+		// unclassified failure (`../router/dispatcher.ts`).
+		it('retries an Implementation the control plane failed with a server error, on its branch', async () => {
+			getRunByIdFromDb.mockResolvedValue({ jobPayload: { implementationBranchProvisioned: true } });
+			phaseImpl = async () => {
+				throw new AgentRunError(
+					'Control-plane delivery /worker/delivery/pm/move failed with status 500',
+					{ kind: 'error' },
+				);
+			};
+
+			const outcome = await processJob(
+				createMockPmWebhookJob({ runId: 'run-1' }),
+				registryReturning(IMPLEMENTATION_TRIGGER),
+			);
+
+			expect(outcome).toMatchObject({ status: 'phase-deferred', preservedWorkRetry: 'branch' });
+			const [, input] = scheduled();
+			expect(input.waitReason).toBe('preserved-work-retry');
+			// The in-flight job never carried the premise; the retry does, and is pinned.
+			expect(input.jobPayload).toMatchObject({
+				implementationBranchProvisioned: true,
+				preservedWorkRetryAttempt: 1,
+			});
+			expect(recordRunBranchHolder).toHaveBeenCalledWith('run-1');
+		});
+
+		it('leaves a control-plane refusal for the operator', async () => {
+			getRunByIdFromDb.mockResolvedValue({ jobPayload: { implementationBranchProvisioned: true } });
+			phaseImpl = async () => {
+				throw new AgentRunError(
+					'Control-plane delivery /worker/delivery/pm/move failed with status 403: not enrolled',
+					{ kind: 'error' },
+				);
+			};
+
+			const outcome = await processJob(
+				createMockPmWebhookJob({ runId: 'run-1' }),
+				registryReturning(IMPLEMENTATION_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-failed');
+			expect(scheduleDispatchRetry).not.toHaveBeenCalled();
 		});
 	});
 });

@@ -123,6 +123,31 @@ describe('deriveRetryJobPayload', () => {
 		expect(next.runId).toBe('run-1');
 	});
 
+	it('spends only its own budget for a preserved-work retry (issue #1257)', () => {
+		const next = deriveRetryJobPayload(
+			createMockScmWebhookJob({ automaticRetryAttempt: 1, rateLimitRetryAttempt: 6 }),
+			{ phase: 'review', runId: 'run-1', resumable: false, preservedWorkRetry: true },
+		);
+
+		expect(next.preservedWorkRetryAttempt).toBe(1);
+		expect(next.automaticRetryAttempt).toBe(1);
+		expect(next.rateLimitRetryAttempt).toBe(6);
+	});
+
+	// The dispatcher records an attempt's own branch provisioning on the run row only,
+	// so the retry of that attempt has to be told to carry it (issue #1257).
+	it('carries a provisioned branch the in-flight job did not know about', () => {
+		const next = deriveRetryJobPayload(createMockPmWebhookJob(), {
+			phase: 'implementation',
+			runId: 'run-1',
+			resumable: false,
+			preservedWorkRetry: true,
+			branchProvisioned: true,
+		});
+
+		expect(next.implementationBranchProvisioned).toBe(true);
+	});
+
 	// Issue #567. Both token-free gates refuse *before* anything is provisioned, so
 	// their "retry" is the same attempt still waiting. Re-deriving recovery intent
 	// there would turn the wait into the start-over it exists to prevent.
@@ -584,6 +609,18 @@ describe('reconstructRetryJob', () => {
 		expect(job.rateLimitRetryAttempt).toBe(0);
 	});
 
+	// Issue #1257: Retry now during the cool-down replaces the pending automatic retry
+	// (it reopens the same dispatch), and the attempt it starts gets a fresh one.
+	it('zeroes the preserved-work retry budget, so a manual retry gets a fresh one', () => {
+		const job = reconstructRetryJob(
+			createMockScmWebhookJob({ preservedWorkRetryAttempt: 1 }),
+			'run-1',
+			'review',
+		);
+
+		expect(job.preservedWorkRetryAttempt).toBe(0);
+	});
+
 	it('leaves a current envelope untouched while carrying the run row forward', () => {
 		const job = reconstructRetryJob(createMockScmWebhookJob(), 'run-2', 'review');
 
@@ -716,7 +753,11 @@ describe('reconstructResetJob', () => {
 
 	it('carries the run row and zeroes the rate-limit and automatic-retry budgets', () => {
 		const job = reconstructResetJob(
-			createMockScmWebhookJob({ rateLimitRetryAttempt: 4, automaticRetryAttempt: 2 }),
+			createMockScmWebhookJob({
+				rateLimitRetryAttempt: 4,
+				automaticRetryAttempt: 2,
+				preservedWorkRetryAttempt: 1,
+			}),
 			'run-4',
 			'review',
 		);
@@ -724,6 +765,7 @@ describe('reconstructResetJob', () => {
 		expect(job.runId).toBe('run-4');
 		expect(job.rateLimitRetryAttempt).toBe(0);
 		expect(job.automaticRetryAttempt).toBe(0);
+		expect(job.preservedWorkRetryAttempt).toBe(0);
 	});
 
 	// Dispatch intent, not resumption: the card has already moved to In progress, so

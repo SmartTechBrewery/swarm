@@ -18,8 +18,14 @@
  * Adding a type takes four edits: a new `AgentFailureKind`, an entry here, a
  * `DispatchWaitReason` member (and its mirrors in `../queue/queued-runs.ts` and the
  * dashboard), and that wait reason's Queue label.
+ *
+ * Beside the per-kind registry sits one policy keyed by what a terminal failure
+ * leaves behind rather than by its kind: {@link PRESERVED_WORK_RETRY_POLICY}
+ * (issue #1257), the last chance a run holding preserved work gets before it goes to
+ * the operator.
  */
 
+import type { ProjectConfig } from '../config/schema.js';
 import type { DispatchWaitReason } from '../db/repositories/dispatchesRepository.js';
 import type { AgentFailureKind } from '../harness/agent-failure.js';
 
@@ -65,4 +71,43 @@ export function automaticRetryPolicyFor(
 ): AutomaticRetryPolicy | undefined {
 	if (kind === undefined || kind === 'delivery') return undefined;
 	return AUTOMATIC_RETRY_POLICIES[kind];
+}
+
+/**
+ * The one automatic retry of a run that failed **terminally while holding preserved
+ * work** (issue #1257) — a Tier 2 checkpoint, a resumable delivery, a resumable
+ * session or a provisioned Implementation branch.
+ *
+ * Not keyed by a failure kind, because what qualifies a run is the work it leaves
+ * behind rather than how it stopped: a transient stop whose own budget ran out (most
+ * often a spent checkpoint continuation budget) or a control plane that answered a
+ * delivery with a server error. Such a run used to wait for an operator, which at
+ * night left every ticket blocked on it standing still until morning. One retry after
+ * a cool-down continues the preserved work on the machine holding it, exactly as Retry
+ * now would; a second terminal failure goes to the operator, saying it was already
+ * retried. Its own counter (`SwarmJob.preservedWorkRetryAttempt`), so a lost transport
+ * earlier in the run cannot spend it.
+ *
+ * `delayMs` is the default: a project may change it, or turn the retry off, under
+ * `pipeline.preservedWorkRetry` ({@link preservedWorkRetryPolicyFor}).
+ */
+export const PRESERVED_WORK_RETRY_POLICY: AutomaticRetryPolicy = {
+	delayMs: 45 * 60 * 1000,
+	maxAttempts: 1,
+	waitReason: 'preserved-work-retry',
+	label: 'failed holding preserved work',
+};
+
+/**
+ * The preserved-work retry policy for `project`, with its own delay applied, or
+ * `undefined` when the project turned the retry off.
+ */
+export function preservedWorkRetryPolicyFor(
+	project: Pick<ProjectConfig, 'pipeline'>,
+): AutomaticRetryPolicy | undefined {
+	const config = project.pipeline?.preservedWorkRetry;
+	if (config?.enabled === false) return undefined;
+	return config?.delayMinutes === undefined
+		? PRESERVED_WORK_RETRY_POLICY
+		: { ...PRESERVED_WORK_RETRY_POLICY, delayMs: config.delayMinutes * 60 * 1000 };
 }

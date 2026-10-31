@@ -69,6 +69,9 @@ const QUEUED_WAIT_REASON_LABELS: Record<QueuedWaitReason, string> = {
 	// The lost worker came back and reported a late success before that retry was
 	// due (issue #1076): the run is being settled with it, not run again.
 	'late-result': 'settling with the late result of the lost worker',
+	// The one automatic retry of a run that failed holding preserved work (issue
+	// #1257): it waits out a cool-down, then continues that work where it is.
+	'preserved-work-retry': 'retrying once automatically after a failure',
 	// A wait on CI (issue #1087): merge automation retrying a pull request that is
 	// not ready, and the review gate re-checking a head whose checks are running.
 	// Each other token-free re-check below names its own wait, because this one sent

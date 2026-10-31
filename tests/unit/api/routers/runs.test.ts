@@ -2634,6 +2634,42 @@ describe('runsRouter', () => {
 			expect(createAndPublishDispatch).not.toHaveBeenCalled();
 		});
 
+		// Issue #1257: the same for the one automatic retry of a run that failed holding
+		// preserved work — Retry now during the cool-down replaces it rather than running
+		// beside it, still continues the checkpoint, and starts a fresh budget.
+		it('supersedes a pending preserved-work retry by reopening its dispatch', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(
+				makeRun({
+					id: 'run-1',
+					status: 'checkpointed',
+					workerId: 'worker-1',
+					recovery: { preservedWorkerId: 'worker-1' },
+				}),
+			);
+			vi.mocked(getActiveDispatchByRunId).mockResolvedValue(
+				makeDispatch({
+					waitReason: 'preserved-work-retry',
+					jobPayload: { ...SCM_PAYLOAD, recoveryMode: 'checkpoint', preservedWorkRetryAttempt: 1 },
+				}),
+			);
+			vi.mocked(reopenDispatchForManualRetry).mockResolvedValue(makeDispatch());
+
+			await expect(caller.retryNow({ runId: 'run-1' })).resolves.toEqual({
+				runId: 'run-1',
+				status: 'retrying',
+			});
+
+			expect(reopenDispatchForManualRetry).toHaveBeenCalledWith(
+				'dispatch-1',
+				expect.objectContaining({
+					runId: 'run-1',
+					recoveryMode: 'checkpoint',
+					preservedWorkRetryAttempt: 0,
+				}),
+			);
+			expect(createAndPublishDispatch).not.toHaveBeenCalled();
+		});
+
 		it('folds cli/model/reasoning overrides into the dispatch payload', async () => {
 			vi.mocked(getRunByIdFromDb).mockResolvedValue(
 				makeRun({

@@ -221,7 +221,11 @@ import {
 	checkAssigneeRequirement,
 	resolveRequireAssignee,
 } from './assignee-requirement.js';
-import { automaticRetryPolicyFor } from './automatic-retry-policy.js';
+import {
+	automaticRetryPolicyFor,
+	PRESERVED_WORK_RETRY_POLICY,
+	preservedWorkRetryPolicyFor,
+} from './automatic-retry-policy.js';
 import {
 	maxDependencyRechecks,
 	resolveDependencyMaxWaitMs,
@@ -243,6 +247,7 @@ import {
 	type FailureDiagnosis,
 	type KnownFailureCondition,
 } from './failure-diagnosis.js';
+import { notifyBlockingFailure } from './failure-notification.js';
 import { GitWorktreeManager } from './git-worktree-manager.js';
 import { resolveMaxJobAgeMs } from './job-freshness.js';
 import {
@@ -461,6 +466,14 @@ export type JobOutcome =
 			 * untouched, and `attempt` is read from that counter.
 			 */
 			automaticRetry?: boolean;
+			/**
+			 * The one automatic retry of a run that failed terminally while holding
+			 * preserved work (issue #1257, {@link deferPreservedWorkRetry}), naming that
+			 * work. The retry consumes the separate
+			 * {@link SwarmJob.preservedWorkRetryAttempt} budget and waits on its own
+			 * `preserved-work-retry` reason.
+			 */
+			preservedWorkRetry?: PreservedContinuationKind;
 	  };
 
 /**
@@ -745,7 +758,7 @@ function deferredPhaseMessage(failure: DeferrableFailure, phase: TriggerPhase): 
  */
 type CheckpointFallback =
 	| { kind: 'continue'; checkpoint: Checkpoint; continuationCount: number }
-	| { kind: 'exhausted'; spent: number; max: number }
+	| { kind: 'exhausted'; checkpoint: Checkpoint; spent: number; max: number }
 	| { kind: 'release' };
 
 /**
@@ -817,7 +830,7 @@ async function resolveCheckpointFallback(
 		return { kind: 'continue', checkpoint, continuationCount: spent };
 	}
 	const max = resolveMaxContinuations(project);
-	if (spent >= max) return { kind: 'exhausted', spent, max };
+	if (spent >= max) return { kind: 'exhausted', checkpoint, spent, max };
 	return { kind: 'continue', checkpoint, continuationCount: spent + 1 };
 }
 
@@ -956,6 +969,173 @@ function deferAgentRunError(
 		failureKind: failure.kind,
 		automaticRetry: automatic || undefined,
 	};
+}
+
+/**
+ * A control plane that answered a worker's delivery call with a server error (issue
+ * #1257) — the message `postDelivery` (`../transport/delivery-client.ts`) throws, which
+ * reaches the settle inside a federated worker's terminal frame. A 5xx is the control
+ * plane's own passing trouble, not the run's; a 4xx is a refusal an operator acts on.
+ */
+const CONTROL_PLANE_DELIVERY_SERVER_ERROR = /Control-plane delivery \S+ failed with status 5\d\d\b/;
+
+/**
+ * Whether a terminal failure is one a later, unattended attempt would likely get past
+ * (issue #1257): a transient stop SWARM already defers, whose own budget has run out,
+ * or a control-plane server error during delivery.
+ *
+ * Two deferrable kinds are left out on purpose. A lost transport is bounded by its own
+ * registry entry, which already hands the operator a machine that keeps vanishing; and
+ * a commit no eligible machine could obtain will not appear by waiting. Everything else
+ * — an `auth` failure, a refused recovery, a gate refusal, an ordinary error — is a
+ * failure the operator has to act on, and stays theirs.
+ */
+function isTransientTerminalFailure(err: unknown, isDeferrable: boolean, error: string): boolean {
+	if (isDeferrable) {
+		if (err instanceof CommitUnavailableError) return false;
+		if (!(err instanceof AgentRunError)) return true;
+		return err.failure.kind !== 'transport-lost' && err.failure.kind !== 'commit-unavailable';
+	}
+	// A federated worker's terminal failure arrives as `kind: 'error'`
+	// (`../router/dispatcher.ts`); every typed refusal is excluded by construction.
+	const unclassified =
+		err instanceof AgentRunError
+			? err.failure.kind === 'error'
+			: !(
+					err instanceof BlockedRecoveryError ||
+					err instanceof WorkerIneligibleError ||
+					err instanceof DependencyBlockedError
+				);
+	return unclassified && CONTROL_PLANE_DELIVERY_SERVER_ERROR.test(error);
+}
+
+/**
+ * Whether the stored run payload records an Implementation branch this run provisioned
+ * (issue #1197). The dispatcher writes that premise onto the row only
+ * (`persistBranchProvisioned`, `../router/dispatcher.ts`), so the in-flight job of the
+ * attempt that provisioned it does not carry it. An unreadable row reads as no branch.
+ */
+async function storedBranchProvisioned(runId: string | undefined): Promise<boolean> {
+	if (!runId) return false;
+	try {
+		return (await getRunByIdFromDb(runId))?.jobPayload?.implementationBranchProvisioned === true;
+	} catch (readErr) {
+		logger.warn('Failed to read the run payload for a provisioned branch', {
+			runId,
+			error: describeError(readErr),
+		});
+		return false;
+	}
+}
+
+/**
+ * The work a terminal failure leaves for a continuation to pick up (issue #1257), or
+ * `undefined` when it leaves none: a checkpoint Tier 2 judged continuable, a delivery
+ * whose progress the worktree keeps, a session the stop can resume, or a provisioned
+ * Implementation branch. A checkout released before an ordinary retry keeps nothing.
+ */
+async function preservedWorkOf(
+	err: unknown,
+	job: SwarmJob,
+	trigger: TriggerResult,
+	checkpointFallback: CheckpointFallback | undefined,
+	runId: string | undefined,
+): Promise<PreservedContinuationKind | undefined> {
+	if (checkpointFallback?.kind === 'release') return undefined;
+	if (checkpointFallback) return 'checkpoint';
+	if (err instanceof DeliveryDeferredError) return 'delivery';
+	if (
+		err instanceof AgentRunError &&
+		(err.failure.kind === 'rate-limit' ||
+			err.failure.kind === 'timeout' ||
+			err.failure.kind === 'stalled') &&
+		err.agent?.sessionId
+	) {
+		return 'session';
+	}
+	if (trigger.phase !== 'implementation') return undefined;
+	if (job.implementationBranchProvisioned === true || (await storedBranchProvisioned(runId))) {
+		return 'branch';
+	}
+	return undefined;
+}
+
+/**
+ * The one automatic retry of a run about to fail terminally while holding preserved
+ * work (issue #1257, `PRESERVED_WORK_RETRY_POLICY`), or `undefined` when the run does
+ * not get one: the project turned it off, the run already had it, the failure is one
+ * the operator must act on ({@link isTransientTerminalFailure}), or nothing is
+ * preserved ({@link preservedWorkOf}).
+ *
+ * The retry continues the preserved work exactly as the deferral that found it would
+ * have — from the checkpoint, the delivery progress or the session — so the settle pins
+ * it to the machine holding that work, as Retry now would. It spends no further Tier 2
+ * continuation and no rate-limit attempt: it is one attempt beyond those budgets, and a
+ * second terminal failure goes to the operator. `reason` is the terminal text the run
+ * would otherwise have failed with, so the Queue shows why it is waiting.
+ */
+async function deferPreservedWorkRetry(
+	err: unknown,
+	job: SwarmJob,
+	trigger: TriggerResult,
+	project: ProjectConfig,
+	reason: string,
+	runId: string | undefined,
+	failure: { isDeferrable: boolean; checkpointFallback?: CheckpointFallback },
+): Promise<Extract<JobOutcome, { status: 'phase-deferred' }> | undefined> {
+	const policy = preservedWorkRetryPolicyFor(project);
+	const attempt = job.preservedWorkRetryAttempt ?? 0;
+	if (!policy || attempt >= policy.maxAttempts) return undefined;
+	if (!isTransientTerminalFailure(err, failure.isDeferrable, reason)) return undefined;
+	const { checkpointFallback } = failure;
+	const preserved = await preservedWorkOf(err, job, trigger, checkpointFallback, runId);
+	if (!preserved) return undefined;
+
+	const retryDelayMs = Math.min(MAX_RETRY_DELAY_MS, policy.delayMs);
+	logger.warn(
+		`Phase stopped - ${phaseLabel(trigger.phase)} — ${policy.label}, retrying automatically in ${Math.round(retryDelayMs / 60_000)}m`,
+		{
+			projectId: project.id,
+			phase: trigger.phase,
+			taskId: trigger.taskId,
+			attempt,
+			retryDelayMs,
+			preservedWork: preserved,
+			error: reason,
+		},
+	);
+	return {
+		status: 'phase-deferred',
+		phase: trigger.phase,
+		taskId: trigger.taskId,
+		retryDelayMs,
+		reason,
+		attempt,
+		runId,
+		resumable: preserved === 'session',
+		checkpoint:
+			checkpointFallback?.kind === 'continue' || checkpointFallback?.kind === 'exhausted'
+				? checkpointFallback.checkpoint
+				: undefined,
+		// A spent budget stays as it is: this retry is outside it.
+		continuationCount:
+			checkpointFallback?.kind === 'continue' ? checkpointFallback.continuationCount : undefined,
+		resumeDelivery: preserved === 'delivery' || undefined,
+		pmPhaseStarted:
+			job.type === 'pm' && (trigger.phase === 'planning' || trigger.phase === 'implementation'),
+		preservedWorkRetry: preserved,
+	};
+}
+
+/**
+ * The note a terminal failure carries once the run has already had its automatic
+ * preserved-work retry (issue #1257), so the operator is not left wondering whether
+ * SWARM tried again on its own.
+ */
+function automaticRetryNote(job: SwarmJob): string {
+	const retried = job.preservedWorkRetryAttempt ?? 0;
+	if (retried === 0) return '';
+	return ` — already retried automatically ${retried === 1 ? 'once' : `${retried} times`}, still failing`;
 }
 
 /**
@@ -1271,6 +1451,7 @@ async function persistRetryPayloadOnRun(runId: string | undefined, job: SwarmJob
 function deferralWaitReason(
 	outcome: Extract<JobOutcome, { status: 'phase-deferred' }>,
 ): DispatchWaitReason {
+	if (outcome.preservedWorkRetry) return PRESERVED_WORK_RETRY_POLICY.waitReason;
 	if (outcome.dependencyRecheck) return 'dependency';
 	// Checked first: a preserved-checkout wait is an eligibility re-check too, but it
 	// is the one with no budget, and the dispatch row is where an operator sees the
@@ -1304,6 +1485,7 @@ function deferralAttempt(
 	if (outcome.dependencyRecheck) return next.dependencyRecheckAttempt ?? 0;
 	if (outcome.workerEligibilityRecheck) return next.workerEligibilityRecheckAttempt ?? 0;
 	if (outcome.automaticRetry) return next.automaticRetryAttempt ?? 0;
+	if (outcome.preservedWorkRetry) return next.preservedWorkRetryAttempt ?? 0;
 	return next.rateLimitRetryAttempt ?? 0;
 }
 
@@ -1337,6 +1519,8 @@ async function settleDispatchRetry(
 		dependencyBlockers: outcome.dependencyBlockers,
 		workerEligibilityRecheck: outcome.workerEligibilityRecheck,
 		automaticRetry: outcome.automaticRetry,
+		preservedWorkRetry: outcome.preservedWorkRetry !== undefined,
+		branchProvisioned: outcome.preservedWorkRetry === 'branch',
 	});
 	await persistRetryPayloadOnRun(outcome.runId, next);
 	const updated = await scheduleDispatchRetry(dispatch.id, {
@@ -3585,6 +3769,10 @@ async function finalizeFailedRun(
 		) {
 			await recordPreservedWorker(runId);
 		}
+		// The automatic retry of a run whose only preserved work is its provisioned
+		// Implementation branch (issue #1257) continues on that branch, so it is pinned to
+		// the machine holding it, exactly as a failed settle pins it for "Retry now".
+		if (outcome.preservedWorkRetry === 'branch') await recordBranchHolder(runId);
 	} else if (outcome.status === 'phase-failed' && outcome.carriedContinuation) {
 		// A lost continuation whose retry budget ran out (issue #1141) gives nothing up:
 		// the preserved work is still on the machine that lost its transport. So the
@@ -4851,9 +5039,22 @@ async function handlePhaseFailure(
 	// A pinned wait for a machine that lost its transport ends here once its window has
 	// passed (issue #1141), and its gate text — which still says "waiting" — is replaced
 	// by the hand-off to the operator.
-	const terminalError = budgetExhausted
+	const stoppedError = budgetExhausted
 		? `${error} — checkpoint continuation budget exhausted (${budgetExhausted.spent} of ${budgetExhausted.max} used)`
 		: (lostPreservedWorkerExpiredError(err, job) ?? error);
+	// A run holding preserved work gets one automatic retry after a cool-down before it
+	// is handed to the operator (issue #1257); once it has had it, its error says so.
+	const preservedWorkRetry = await deferPreservedWorkRetry(
+		err,
+		job,
+		trigger,
+		project,
+		stoppedError,
+		runId,
+		{ isDeferrable, checkpointFallback },
+	);
+	if (preservedWorkRetry) return preservedWorkRetry;
+	const terminalError = `${stoppedError}${automaticRetryNote(job)}`;
 	logger.error(`Phase failed - ${phaseLabel(trigger.phase)}`, {
 		projectId: project.id,
 		phase: trigger.phase,
@@ -4879,6 +5080,9 @@ async function handlePhaseFailure(
 	// above returns early), so a run that's about to be retried never posts a
 	// premature "failed".
 	await reportPhaseFailureToBoardOrPr(trigger, project, terminalError, failureDiagnosis);
+	// …and tell the operator directly when other work items wait on this one (issue
+	// #1257), so a failure at night does not stall its dependents until morning.
+	await notifyBlockingFailure({ project, trigger, runId, error: terminalError });
 	// The review handler's claim is handed back by the caller's
 	// {@link releaseFailedReviewClaim} once this outcome is settled — but only for a
 	// run that provably delivered nothing (issue #1019). It is deliberately not done

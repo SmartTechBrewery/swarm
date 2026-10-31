@@ -76,6 +76,20 @@ export interface DeferredRetryIntent {
 	 */
 	automaticRetry?: boolean;
 	/**
+	 * This is the one automatic retry of a run that failed terminally while holding
+	 * preserved work (issue #1257, `PRESERVED_WORK_RETRY_POLICY`): it consumes the
+	 * separate {@link SwarmJob.preservedWorkRetryAttempt} budget.
+	 */
+	preservedWorkRetry?: boolean;
+	/**
+	 * The retry continues an Implementation branch this attempt provisioned (issue
+	 * #1257). The premise lives only on the stored run payload until then (the
+	 * dispatcher's `persistBranchProvisioned`), so the in-flight job this payload is
+	 * derived from does not carry it, and the retry would otherwise cut the branch
+	 * again.
+	 */
+	branchProvisioned?: boolean;
+	/**
 	 * This deferral re-attempts a **continuation whose stopped attempt never reported**
 	 * (issue #1138): a lost worker transport carries no exit, session or checkpoint,
 	 * so there is nothing to re-derive recovery intent from, and the work the attempt
@@ -90,7 +104,8 @@ export interface DeferredRetryIntent {
  * Which attempt counter this deferral spends. The two token-free re-checks
  * (dependency, worker eligibility) each have their own budget so a long wait on
  * one can't exhaust the other or the small rate-limit budget, and so does an
- * automatic retry of a failure that used to be terminal (issue #1075); every other
+ * automatic retry of a failure that used to be terminal (issue #1075) and the one
+ * retry of a run that failed holding preserved work (issue #1257); every other
  * deferral is a failure retry and consumes the rate-limit one as before.
  */
 function attemptCounterPatch(
@@ -101,6 +116,7 @@ function attemptCounterPatch(
 	workerEligibilityRecheckAttempt?: number;
 	rateLimitRetryAttempt?: number;
 	automaticRetryAttempt?: number;
+	preservedWorkRetryAttempt?: number;
 } {
 	if (intent.dependencyRecheck) {
 		return { dependencyRecheckAttempt: (job.dependencyRecheckAttempt ?? 0) + 1 };
@@ -110,6 +126,9 @@ function attemptCounterPatch(
 	}
 	if (intent.automaticRetry) {
 		return { automaticRetryAttempt: (job.automaticRetryAttempt ?? 0) + 1 };
+	}
+	if (intent.preservedWorkRetry) {
+		return { preservedWorkRetryAttempt: (job.preservedWorkRetryAttempt ?? 0) + 1 };
 	}
 	return { rateLimitRetryAttempt: (job.rateLimitRetryAttempt ?? 0) + 1 };
 }
@@ -281,6 +300,7 @@ export function deriveRetryJobPayload(parsed: SwarmJob, intent: DeferredRetryInt
 		// Delivery retries reuse a valid progress-marked worktree, independent of
 		// whether the completed agent run exposed a session id.
 		...(intent.resumeDelivery ? { resumeDelivery: true } : {}),
+		...(intent.branchProvisioned ? { implementationBranchProvisioned: true } : {}),
 		// A prioritized continuation already holds its dispatch dedup claim; the
 		// retry's handler must reuse it rather than re-claim (issue #214).
 		...(intent.continuationDispatchClaimed ? { continuationDispatchClaimed: true } : {}),
@@ -361,6 +381,7 @@ export function reconstructRetryJob(
 	job.runId = runId;
 	job.rateLimitRetryAttempt = 0;
 	job.automaticRetryAttempt = 0;
+	job.preservedWorkRetryAttempt = 0;
 	job.workerEligibilityRecheckAttempt = 0;
 	// The stored payload may be the one an attempt ran with after the machine it was
 	// pinned to came back, so its loss marker says nothing about now (issue #1141): a
@@ -444,6 +465,7 @@ export function reconstructResetJob(
 	job.runId = runId;
 	job.rateLimitRetryAttempt = 0;
 	job.automaticRetryAttempt = 0;
+	job.preservedWorkRetryAttempt = 0;
 	delete job.adoptedResult;
 	if (job.type === 'pm' && (phase === 'planning' || phase === 'implementation')) {
 		job.resumePmPhase = phase;

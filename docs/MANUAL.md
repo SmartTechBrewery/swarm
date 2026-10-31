@@ -1185,6 +1185,28 @@ run a fresh automatic budget. Only once both automatic retries are spent does th
 settle `failed` with the board comment, as it always did. If one machine keeps
 appearing in these, the fleet — not the task — is what needs looking at.
 
+**A run that fails holding preserved work gets one more try on its own** (issue
+#1257). When a run stops for good while its work is still preserved — a checkpoint
+whose continuation budget is spent, a delivery or session past its retry cap, an
+Implementation branch it already provisioned — and the cause is a transient one (a
+timeout, stall, usage limit or delivery failure that ran out of retries, or a control
+plane that answered a worker with a server error), it is not failed for you yet: it
+waits in the Queue as "retrying once automatically after a failure" for 45 minutes
+(`pipeline.preservedWorkRetry.delayMinutes`), then continues that work on the machine
+holding it, exactly as **Retry now** would. If that attempt also fails, the run
+settles `failed` with an error ending `— already retried automatically once, still
+failing`. Failures you have to fix yourself (a logged-out CLI, a refused recovery, a
+dispatch-gate refusal, any other error) and runs with nothing preserved go to you
+straight away, as before. **Retry now** or **Reset** during the cool-down replaces the
+pending retry rather than running beside it. `pipeline.preservedWorkRetry.enabled:
+false` turns this off for a project.
+
+**You can be told when a failure blocks other work** (issue #1257). Set
+`pipeline.failureNotifications.webhookUrl` and SWARM `POST`s a JSON notice whenever a
+run fails terminally while other open work items depend on its own — naming the run,
+the reason and the waiting items, with a one-line `text` a Slack-style incoming webhook
+shows as is. See [`docs/configuration.md`](configuration.md) for the body's fields.
+
 If the dropped worker comes back **before** that retry is due and its phase finishes
 successfully (issue #1076), SWARM keeps its result rather than running the phase again:
 the run settles `completed` and the next phase starts as if the result had arrived on

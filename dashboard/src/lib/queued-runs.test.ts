@@ -122,6 +122,17 @@ describe('queuedWaitReasonLabel', () => {
 		);
 	});
 
+	// Issue #1257: the one automatic retry of a run that failed holding preserved work —
+	// a timed wait, distinct from the pinned machine being busy (`preserved-worker`).
+	it('names the one automatic retry of a run that failed holding preserved work', () => {
+		expect(queuedWaitReasonLabel('preserved-work-retry')).toBe(
+			'retrying once automatically after a failure',
+		);
+		expect(queuedWaitReasonLabel('preserved-work-retry')).not.toBe(
+			queuedWaitReasonLabel('preserved-worker'),
+		);
+	});
+
 	// Issue #1076: the lost worker's late success is settling the run — not a wait for
 	// anything, so the copy says the result is being used rather than retried.
 	it('names the adopted late result', () => {

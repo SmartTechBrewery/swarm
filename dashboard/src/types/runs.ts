@@ -158,6 +158,7 @@ export const queuedWaitReasonSchema = z.enum([
 	'commit-unavailable',
 	'transport-lost',
 	'late-result',
+	'preserved-work-retry',
 	'recheck',
 	'dependency',
 	'review-claim',
