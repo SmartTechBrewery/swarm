@@ -952,6 +952,89 @@ describe('projectsRouter', () => {
 			expect(result.pipeline?.respondToReview?.skipOnMinors).toBe(true);
 		});
 
+		describe('checkpoint-continuation budget (issue #1259)', () => {
+			const withPipeline = () =>
+				createMockProjectRecord({
+					id: 'p1',
+					pipeline: {
+						planning: { autoAdvance: true },
+						respondToReview: { skipOnMinors: false },
+						automationLabel: 'bot',
+						maxContinuations: 4,
+					},
+				});
+
+			it('sets maxContinuations and leaves the rest of pipeline untouched', async () => {
+				vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(withPipeline());
+				vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
+
+				const result = await caller.update({ id: 'p1', pipeline: { maxContinuations: 6 } });
+
+				expect(result.pipeline).toEqual({
+					planning: { autoAdvance: true },
+					respondToReview: { skipOnMinors: false },
+					automationLabel: 'bot',
+					maxContinuations: 6,
+				});
+			});
+
+			it('clears maxContinuations back to the default on an explicit null', async () => {
+				vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(withPipeline());
+				vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
+
+				const result = await caller.update({ id: 'p1', pipeline: { maxContinuations: null } });
+
+				expect(result.pipeline).toEqual({
+					planning: { autoAdvance: true },
+					respondToReview: { skipOnMinors: false },
+					automationLabel: 'bot',
+				});
+				expect(upsertProjectToDb).toHaveBeenCalledWith(
+					expect.objectContaining({
+						pipeline: expect.not.objectContaining({ maxContinuations: null }),
+					}),
+				);
+			});
+
+			it('keeps a stored budget when the patch does not name it', async () => {
+				vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(withPipeline());
+				vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
+
+				const result = await caller.update({
+					id: 'p1',
+					pipeline: { respondToReview: { skipOnMinors: true } },
+				});
+
+				expect(result.pipeline?.maxContinuations).toBe(4);
+			});
+
+			it('rejects a budget below one', async () => {
+				vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(withPipeline());
+
+				await expect(
+					caller.update({ id: 'p1', pipeline: { maxContinuations: 0 } }),
+				).rejects.toThrow();
+				expect(upsertProjectToDb).not.toHaveBeenCalled();
+			});
+		});
+
+		it('accepts a per-phase timeout up to 90 minutes and rejects one above it (issue #1259)', async () => {
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
+			vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
+
+			const result = await caller.update({
+				id: 'p1',
+				agents: { implementation: { timeoutMs: 90 * 60 * 1000 } },
+			});
+			expect(result.agents?.implementation?.timeoutMs).toBe(90 * 60 * 1000);
+
+			vi.mocked(upsertProjectToDb).mockClear();
+			await expect(
+				caller.update({ id: 'p1', agents: { implementation: { timeoutMs: 90 * 60 * 1000 + 1 } } }),
+			).rejects.toThrow();
+			expect(upsertProjectToDb).not.toHaveBeenCalled();
+		});
+
 		it('absent keys are not updated/merged to undefined', async () => {
 			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
 			vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);

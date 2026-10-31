@@ -308,12 +308,12 @@ export const AgentConfigSchema = z
 		reasoning: ReasoningLevelSchema.optional(),
 		/** Model targets in priority order, at most one per CLI (see above). */
 		targets: z.array(AgentTargetSchema).optional(),
-		/** A bounded per-phase timeout: 5–45 minutes, stored in milliseconds. */
+		/** A bounded per-phase timeout: 5–90 minutes, stored in milliseconds. */
 		timeoutMs: z
 			.number()
 			.int()
 			.min(5 * 60 * 1000)
-			.max(45 * 60 * 1000)
+			.max(90 * 60 * 1000)
 			.optional(),
 		/**
 		 * Optional project-owned instructions appended to this phase's SWARM
@@ -533,7 +533,7 @@ export const PipelineBaseSchema = z.object({
 	 * (`docs/CHECKPOINTS.md`) before the fallback gives up and the run fails
 	 * terminally with a "continuation budget exhausted" reason. Unset (or the whole
 	 * `pipeline` block omitted) defaults to
-	 * `DEFAULT_MAX_CONTINUATIONS` (`src/pipeline/checkpoint.ts`).
+	 * `DEFAULT_MAX_CONTINUATIONS` (`src/pipeline/continuation-budget.ts`).
 	 *
 	 * The bound matters because a checkpoint continuation re-seeds a *fresh* session
 	 * from a degraded hand-off: a phase that keeps stopping involuntarily would

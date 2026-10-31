@@ -368,7 +368,8 @@ session id *or* the `checkpointed` status says a run intends to come back — pr
 delete the very working tree the checkpoint describes, turning the continuation into a
 `checkpoint-divergent` block.
 
-**The fallback is bounded.** `pipeline.maxContinuations` (default 2, `docs/configuration.md`) is
+**The fallback is bounded.** `pipeline.maxContinuations` (default 2, `docs/configuration.md`;
+editable on the project's Pipeline tab since issue #1259) is
 the number of times one run may be continued this way; the count lives on the run row. Once it
 is spent, the next timeout or stall is a terminal failure whose reason and
 `FailureDiagnosis` both say the continuation budget was exhausted, rather than a further
