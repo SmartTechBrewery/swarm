@@ -393,8 +393,12 @@ then apply (`judgeCheckpointContinuation`), both in `docs/configuration.md`:
   `… — checkpoint continuation ceiling reached (N of N continuations used, pipeline.maxContinuations)`
   and the `continuation-budget-exhausted` diagnosis.
 
-The no-progress limit is checked first, as the more specific diagnosis. The counts live on the
-run row (the settle table above). A charged continuation no longer consumes a rate-limit retry
+The no-progress limit is checked first, as the more specific diagnosis. Either failure is not
+yet handed to the operator, though: unless the project turned it off, it first gets the one
+automatic preserved-work retry (`pipeline.preservedWorkRetry`, issue #1257) after
+`pipeline.preservedWorkRetry.delayMinutes` — a `recoveryMode: 'checkpoint'` continuation pinned
+to the machine holding the checkout, which spends no further continuation. Only a failure after
+that retry is terminal. The counts live on the run row (the settle table above). A charged continuation no longer consumes a rate-limit retry
 attempt, so the ceiling is the real bound — a configured `pipeline.maxContinuations` above
 `MAX_RATE_LIMIT_RETRIES` (6) is honoured. Tier 1 resumes and usage-limit continuations still
 spend and are bounded by that counter.

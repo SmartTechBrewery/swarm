@@ -117,6 +117,14 @@ export type DispatchWaitReason =
 	 */
 	| 'late-result'
 	/**
+	 * The run failed terminally while holding preserved work, and gets one automatic
+	 * retry after the project's cool-down (issue #1257, `PRESERVED_WORK_RETRY_POLICY`
+	 * in `../../worker/automatic-retry-policy.ts`). A timed wait, pinned like any
+	 * continuation to the machine holding that work; a manual Retry now or Reset
+	 * replaces it.
+	 */
+	| 'preserved-work-retry'
+	/**
 	 * A token-free wait on **CI**: merge automation retrying a pull request that is
 	 * not ready to merge yet, and the review gate re-checking a head whose checks
 	 * are still running or not registered yet. Narrowed to that meaning by issue

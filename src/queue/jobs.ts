@@ -311,6 +311,16 @@ const jobBase = z.object({
 	 */
 	automaticRetryAttempt: z.number().int().nonnegative().optional(),
 	/**
+	 * How many automatic retries this job has already had after failing terminally
+	 * while holding preserved work (issue #1257, `PRESERVED_WORK_RETRY_POLICY` in
+	 * `src/worker/automatic-retry-policy.ts`). Its own counter rather than
+	 * {@link automaticRetryAttempt}, so a lost transport earlier in the run cannot
+	 * spend this one retry, and a non-zero value is what tells the terminal message
+	 * the run was already retried automatically. Absent on a fresh webhook; zeroed by a
+	 * manual Retry now or Reset.
+	 */
+	preservedWorkRetryAttempt: z.number().int().nonnegative().optional(),
+	/**
 	 * How many times this job has been re-checked while waiting on an unfinished
 	 * dependency (issue #330): an Implementation whose work item is `blocked by` an
 	 * open prerequisite is deferred as a token-free `dependency` dispatch — no worktree,
