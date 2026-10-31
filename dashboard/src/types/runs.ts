@@ -676,6 +676,27 @@ export interface RunRow {
 	 */
 	maxContinuations?: number | null;
 	/**
+	 * How many of this run's checkpoint continuations showed progress (issue
+	 * #1256) — mirrors the `continuation_progress_count` column. Optional here
+	 * because pre-#1256 payloads carry no such field.
+	 */
+	continuationProgressCount?: number;
+	/**
+	 * How many continuations in a row have ended without progress — the streak the
+	 * `maxContinuationsWithoutProgress` stall limit reads against (issue #1256).
+	 * Mirrors the `continuation_no_progress_streak` column; optional because
+	 * pre-#1256 payloads carry no such field.
+	 */
+	continuationNoProgressStreak?: number;
+	/**
+	 * The project's no-progress stall limit this run's `continuationNoProgressStreak`
+	 * reads against — `pipeline.maxContinuationsWithoutProgress`, resolved
+	 * server-side by `runs.getById` (issue #1256) so the default never has to be
+	 * re-declared here. Null exactly when `maxContinuations` is, in which case the
+	 * panel shows the bare streak rather than a fabricated limit.
+	 */
+	maxContinuationsWithoutProgress?: number | null;
+	/**
 	 * Preservation/recovery state for failed or resumed runs.
 	 */
 	recovery?: {

@@ -446,10 +446,14 @@ recorded work left, and spends a bounded budget. So the dashboard renders it as 
   completed, the decisions carried over, and the working tree the checkpoint recorded — read off
   the persisted `checkpoint` column, so it renders for a federated worker's run too. The panel is
   gated on the checkpoint's *presence*, not on the status, because the column survives an
-  ordinary retry as the record of what the current attempt was seeded from. Its spent
-  `continuation_count` reads against the project's ceiling, which `runs.getById` resolves
-  server-side (`maxContinuations`) so `pipeline.maxContinuations`'s default is never re-declared
-  in the web bundle.
+  ordinary retry as the record of what the current attempt was seeded from. Its header reads the
+  spent `continuation_count` against the project's ceiling (`Continuation 3 of 6`), how many of
+  those continuations showed progress (`continuation_progress_count`, `3 with progress`), and the
+  current `continuation_no_progress_streak` against the stall limit (`0 of 2 without progress in
+  a row`), so an operator sees how close the run is to each bound. `runs.getById` resolves both
+  limits server-side (`maxContinuations`, `maxContinuationsWithoutProgress`, issue #1256) so
+  neither `pipeline.*` default is re-declared in the web bundle; when the project cannot be read
+  both are `null` and the panel shows the bare counts rather than a made-up limit.
 - **Continue now / Terminate / Reset & restart.** The same three actions a deferred run offers,
   relabelled for what they actually do here. "Continue now" fires the *existing* `runs.retryNow`
   mutation, which sends a `checkpointed` row through `recoveryMode: 'checkpoint'` unconditionally

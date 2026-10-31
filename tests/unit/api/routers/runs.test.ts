@@ -247,7 +247,11 @@ import { DEFAULT_WORKER_SUPPORTED_PHASES } from '@/identity/worker.js';
 import { getWorker, getWorkers } from '@/identity/worker-service.js';
 import { getPMProvider } from '@/integrations/pm/registry.js';
 import { requireProjectSCMProvider } from '@/integrations/scm/registry.js';
-import { type Checkpoint, DEFAULT_MAX_CONTINUATIONS } from '@/pipeline/checkpoint.js';
+import {
+	type Checkpoint,
+	DEFAULT_MAX_CONTINUATIONS,
+	DEFAULT_MAX_CONTINUATIONS_WITHOUT_PROGRESS,
+} from '@/pipeline/checkpoint.js';
 import {
 	clearRunCancellation,
 	getRunCancellationOrigin,
@@ -1556,6 +1560,7 @@ describe('runsRouter', () => {
 				attribution: null,
 				preservedWorker: null,
 				maxContinuations: null,
+				maxContinuationsWithoutProgress: null,
 				pendingRequest: null,
 				retryScheduled: null,
 				lateResultAccepted: null,
@@ -1733,28 +1738,38 @@ describe('runsRouter', () => {
 			});
 		});
 
-		// The Tier 2 continuation ceiling the dashboard shows the spent count against
-		// (issue #504). Resolved server-side so `pipeline.maxContinuations`'s default
-		// isn't re-declared in the web bundle.
+		// The Tier 2 continuation ceiling (issue #504) and no-progress stall limit
+		// (issue #1256) the dashboard shows the spent count and streak against.
+		// Resolved server-side so neither `pipeline.*` default is re-declared in the
+		// web bundle.
 		describe('maxContinuations', () => {
-			it("resolves the project's configured ceiling for a checkpointed run", async () => {
+			it("resolves the project's configured limits for a checkpointed run", async () => {
 				vi.mocked(getRunByIdFromDb).mockResolvedValue(
 					makeRun({
 						id: 'run-1',
 						status: 'checkpointed',
 						checkpoint: CHECKPOINT,
-						continuationCount: 1,
+						continuationCount: 3,
+						continuationProgressCount: 2,
+						continuationNoProgressStreak: 1,
 					}),
 				);
 				vi.mocked(getProjectByIdFromDb).mockResolvedValue(
-					createMockProjectConfig({ id: 'p1', pipeline: { maxContinuations: 5 } }),
+					createMockProjectConfig({
+						id: 'p1',
+						pipeline: { maxContinuations: 5, maxContinuationsWithoutProgress: 3 },
+					}),
 				);
 
 				const result = await caller.getById({ id: 'run-1' });
 
 				expect(result.maxContinuations).toBe(5);
+				expect(result.maxContinuationsWithoutProgress).toBe(3);
 				expect(result.checkpoint).toEqual(CHECKPOINT);
-				expect(result.continuationCount).toBe(1);
+				expect(result.continuationCount).toBe(3);
+				expect(result.continuationProgressCount).toBe(2);
+				expect(result.continuationNoProgressStreak).toBe(1);
+				expect(getProjectByIdFromDb).toHaveBeenCalledTimes(1);
 			});
 
 			it('falls back to the coded default when the project configures none', async () => {
@@ -1765,6 +1780,7 @@ describe('runsRouter', () => {
 
 				await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
 					maxContinuations: DEFAULT_MAX_CONTINUATIONS,
+					maxContinuationsWithoutProgress: DEFAULT_MAX_CONTINUATIONS_WITHOUT_PROGRESS,
 				});
 			});
 
@@ -1773,8 +1789,21 @@ describe('runsRouter', () => {
 
 				await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
 					maxContinuations: null,
+					maxContinuationsWithoutProgress: null,
 				});
 				expect(getProjectByIdFromDb).not.toHaveBeenCalled();
+			});
+
+			it('reports null limits when the project no longer resolves', async () => {
+				vi.mocked(getRunByIdFromDb).mockResolvedValue(
+					makeRun({ id: 'run-1', status: 'checkpointed', checkpoint: CHECKPOINT }),
+				);
+				vi.mocked(getProjectByIdFromDb).mockResolvedValue(undefined);
+
+				await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
+					maxContinuations: null,
+					maxContinuationsWithoutProgress: null,
+				});
 			});
 
 			it('degrades to the count alone instead of failing the page when the project read throws', async () => {
@@ -1785,6 +1814,7 @@ describe('runsRouter', () => {
 
 				await expect(caller.getById({ id: 'run-1' })).resolves.toMatchObject({
 					maxContinuations: null,
+					maxContinuationsWithoutProgress: null,
 				});
 			});
 		});
@@ -2060,6 +2090,7 @@ describe('runsRouter', () => {
 					attribution: null,
 					preservedWorker: null,
 					maxContinuations: null,
+					maxContinuationsWithoutProgress: null,
 					pendingRequest: null,
 					retryScheduled: null,
 					lateResultAccepted: null,
@@ -4663,6 +4694,7 @@ describe('runsRouter', () => {
 					attribution: null,
 					preservedWorker: null,
 					maxContinuations: null,
+					maxContinuationsWithoutProgress: null,
 					pendingRequest: null,
 					retryScheduled: null,
 					lateResultAccepted: null,

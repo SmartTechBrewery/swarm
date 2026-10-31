@@ -1473,6 +1473,23 @@ function describeContinuationBudget(count: number, max: number | null | undefine
 	return typeof max === 'number' ? `Continuation ${count} of ${max}` : `Continuation ${count}`;
 }
 
+/** How many of the spent continuations showed progress (issue #1256). */
+function describeContinuationProgress(progressCount: number): string {
+	return `${progressCount} with progress`;
+}
+
+/**
+ * The current no-progress streak against the project's
+ * `pipeline.maxContinuationsWithoutProgress` stall limit (issue #1256) — resolved
+ * server-side like `maxContinuations`, and reported bare under the same rule when
+ * the server couldn't resolve it.
+ */
+function describeNoProgressStreak(streak: number, max: number | null | undefined): string {
+	return typeof max === 'number'
+		? `${streak} of ${max} without progress in a row`
+		: `${streak} without progress in a row`;
+}
+
 /** One labelled group of checkpoint lines; renders nothing when the group is empty. */
 function CheckpointList({
 	label,
@@ -1531,7 +1548,8 @@ function CheckpointList({
  * because the column survives an ordinary retry as the record of what the current
  * attempt was seeded from: an operator watching a running continuation, or
  * diagnosing one that then failed, needs exactly this. The spent continuation
- * count rides here so the state and its budget are read in one place.
+ * count, how many of those showed progress, and the no-progress streak (issue
+ * #1256) ride here so the state and its budget are read in one place.
  *
  * Remaining work leads, and is numbered — its order is the order a continuation
  * works in.
@@ -1551,9 +1569,16 @@ export function CheckpointPanel({ run }: { run: RunRow }) {
 					Checkpoint hand-off
 				</h3>
 				{count > 0 && (
-					<span className="text-xs font-medium text-zinc-400">
-						{describeContinuationBudget(count, run.maxContinuations)}
-					</span>
+					<div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs font-medium text-zinc-400">
+						<span>{describeContinuationBudget(count, run.maxContinuations)}</span>
+						<span>{describeContinuationProgress(run.continuationProgressCount ?? 0)}</span>
+						<span>
+							{describeNoProgressStreak(
+								run.continuationNoProgressStreak ?? 0,
+								run.maxContinuationsWithoutProgress,
+							)}
+						</span>
+					</div>
 				)}
 			</div>
 
