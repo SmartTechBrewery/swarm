@@ -106,6 +106,8 @@ describe('diagnoseFailure (issue #269)', () => {
 		['launch-or-authentication', 'Known provider condition: launch or authentication'],
 		['worker-shutdown', 'Known condition: worker shutdown'],
 		['user-terminated', 'Known condition: user termination'],
+		['continuation-budget-exhausted', 'Known condition: continuation ceiling reached'],
+		['continuation-no-progress', 'Known condition: checkpoint continuations made no progress'],
 	] as const)('%s takes precedence over scope-looking evidence', (knownCondition, title) => {
 		const diagnosis = diagnoseFailure({
 			knownCondition,
@@ -115,6 +117,17 @@ describe('diagnoseFailure (issue #269)', () => {
 		});
 
 		expect(diagnosis).toMatchObject({ kind: knownCondition, title });
+	});
+
+	// Issue #1256: each Tier 2 limit names the setting that bounds it.
+	it.each([
+		['continuation-budget-exhausted', 'pipeline.maxContinuations`'],
+		['continuation-no-progress', 'pipeline.maxContinuationsWithoutProgress'],
+	] as const)('%s names the limit that ended the run', (knownCondition, setting) => {
+		const diagnosis = diagnoseFailure({ knownCondition });
+
+		expect(diagnosis?.message).toContain(setting);
+		expect(diagnosis?.recovery).toContain(setting);
 	});
 });
 

@@ -1626,8 +1626,9 @@ export function PipelineSettingsForm({
 								? `Using the default of ${DEFAULT_MAX_CONTINUATIONS}. `
 								: ''}
 							How many times a phase stopped by its timeout or a stall is resumed from its
-							checkpoint before the run fails. A usage-limit stop is never charged. Leave it blank
-							for the default.
+							checkpoint before the run fails — the ceiling, progress or not; a run that stops
+							without progress fails sooner. A usage-limit stop is never charged. Leave it blank for
+							the default.
 						</p>
 					)}
 					<table className="mt-4 w-full max-w-md text-xs">

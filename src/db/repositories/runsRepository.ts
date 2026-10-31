@@ -616,6 +616,13 @@ export interface CompleteRunInput {
 	 */
 	continuationCount?: number;
 	/**
+	 * The run's progress-bearing continuation count and no-progress streak *after* this
+	 * settle (issue #1256) — written only by a `checkpointed` settle, alongside
+	 * {@link continuationCount}, and unchanged by a usage-limit stop's.
+	 */
+	continuationProgressCount?: number;
+	continuationNoProgressStreak?: number;
+	/**
 	 * Atomic guard: apply this settle **only** while the row still holds this
 	 * status, exactly as {@link resetRunToRunning}'s `fromStatus` guards a retry.
 	 * Omitted (the usual case) the settle is unconditional.
@@ -672,6 +679,8 @@ export async function completeRun(runId: string, input: CompleteRunInput): Promi
 			failureDiagnosis: input.failureDiagnosis,
 			checkpoint: input.checkpoint,
 			continuationCount: input.continuationCount,
+			continuationProgressCount: input.continuationProgressCount,
+			continuationNoProgressStreak: input.continuationNoProgressStreak,
 			completedAt: new Date(),
 		})
 		.where(
@@ -769,8 +778,10 @@ export async function resetRunToRunning(
 			// `continuationCount` and `checkpoint` are deliberately *not* cleared either
 			// (issue #503): the count is the bound on the Tier 2 fallback, so resetting
 			// it on the very retry the fallback scheduled would make the loop unbounded,
-			// and the checkpoint is what this attempt is being seeded from. "Reset &
-			// restart" ({@link clearRunRecovery}) is what discards both.
+			// and the checkpoint is what this attempt is being seeded from — and the
+			// baseline its next stop's progress is judged against (issue #1256), which is
+			// why `continuationProgressCount` and `continuationNoProgressStreak` stay too.
+			// "Reset & restart" ({@link clearRunRecovery}) is what discards them all.
 			// A retried attempt hasn't (yet) been cancelled — clear a prior attempt's
 			// recorded origin so a genuine failure this time never shows a stale
 			// "cancelled via dashboard" origin left over from before the retry.
@@ -1163,8 +1174,9 @@ export async function listRunPassedOverWorkerIds(runId: string): Promise<string[
  * The Tier 2 record goes too (issue #503): the reset discards the checkout, so the
  * `checkpoint` describes a working tree that no longer exists, and the whole point
  * of the action is to start over — which means the spent `continuationCount` is
- * forgiven. This is the *only* path that resets that count; an ordinary retry keeps
- * it, or the fallback would never be bounded.
+ * forgiven, with its progress count and no-progress streak (issue #1256). This is the
+ * *only* path that resets those counts; an ordinary retry keeps them, or the fallback
+ * would never be bounded.
  *
  * One thing is not cleared but *converted* (issue #567): a recorded
  * `preservedWorkerId` becomes an `abandonedWorkerId`. Clearing the pin is what frees
@@ -1195,6 +1207,8 @@ export async function clearRunRecovery(runId: string): Promise<void> {
 			agentSessionId: null,
 			checkpoint: null,
 			continuationCount: 0,
+			continuationProgressCount: 0,
+			continuationNoProgressStreak: 0,
 		})
 		.where(eq(runs.id, runId));
 }

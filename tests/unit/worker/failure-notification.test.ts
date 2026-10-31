@@ -29,7 +29,7 @@ vi.mock('@/db/repositories/runsRepository.js', () => ({
 
 const WEBHOOK = 'https://hooks.example.test/swarm';
 const ERROR =
-	'Implementation agent timed out — checkpoint continuation budget exhausted (2 of 2 used)';
+	'Implementation agent timed out — checkpoint continuation ceiling reached (6 of 6 continuations used, pipeline.maxContinuations)';
 const IMPLEMENTATION: TriggerResult = {
 	phase: 'implementation',
 	taskId: '1963',
@@ -107,7 +107,7 @@ describe('notifyBlockingFailure', () => {
 		});
 		expect(body.text).toContain('run-1');
 		expect(body.text).toContain('#1964 Part #1964');
-		expect(body.text).toContain('checkpoint continuation budget exhausted');
+		expect(body.text).toContain('checkpoint continuation ceiling reached');
 	});
 
 	it.each([
