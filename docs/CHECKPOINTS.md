@@ -353,6 +353,8 @@ continue from a checkpoint":
 | `agent_session_id` | `null` — there is deliberately no session to resume |
 | `checkpoint` | the parsed hand-off, so the API/dashboard can show the remaining work without reading a (possibly remote) worker's filesystem |
 | `continuation_count` | incremented for a timeout or stall; unchanged for a usage-limit stop (issue #1219); kept through an ordinary retry, cleared only by "Reset & restart" |
+| `continuation_progress_count` | incremented with `continuation_count` when the stop's checkpoint advanced over the previous one (issue #1256); unchanged for a usage-limit stop; kept and cleared exactly as `continuation_count` |
+| `continuation_no_progress_streak` | `0` after a stop whose checkpoint advanced, incremented after one that did not (issue #1256); for a usage-limit stop, reset to `0` when its checkpoint advanced and otherwise unchanged; kept and cleared exactly as `continuation_count` |
 | `next_retry_at` | the scheduled continuation, exactly as for a deferral |
 
 The continuation itself goes out through the **existing durable dispatch** — the same machinery
@@ -368,13 +370,34 @@ session id *or* the `checkpointed` status says a run intends to come back — pr
 delete the very working tree the checkpoint describes, turning the continuation into a
 `checkpoint-divergent` block.
 
-**The fallback is bounded.** `pipeline.maxContinuations` (default 2, `docs/configuration.md`;
-editable on the project's Pipeline tab since issue #1259) is
-the number of times one run may be continued this way; the count lives on the run row. Once it
-is spent, the next timeout or stall is a terminal failure whose reason and
-`FailureDiagnosis` both say the continuation budget was exhausted, rather than a further
-hand-off. A continuation also consumes an ordinary rate-limit retry attempt, so the coarser
-`MAX_RATE_LIMIT_RETRIES` cap still applies underneath.
+**The fallback is bounded — by stalls, not stops** (issue #1256). When a timeout or stall
+leaves a checkpoint, the new checkpoint is compared with the previous one already on
+`runs.checkpoint` — the one this attempt was seeded from, so the comparison happens on the
+control plane for in-process and federated workers alike (`checkpointAdvanced`,
+`src/pipeline/checkpoint.ts`). The stop counts as **progress** when there is no previous
+checkpoint (it is the run's first hand-off), or when the new one records a `completed` entry the
+previous lacked (compared trimmed), fewer `remaining` entries, or a `workingTree` path the
+previous did not name. An unchanged or merely reworded checkpoint is not progress. Two limits
+then apply (`judgeCheckpointContinuation`), both in `docs/configuration.md`:
+
+- **`pipeline.maxContinuationsWithoutProgress`** (default 2) — consecutive stops without
+  progress. A progressing stop resets the streak, so it is never charged against this limit.
+  Reaching it fails the run with
+  `… — checkpoint continuation stalled: N consecutive continuation(s) made no progress (limit N, pipeline.maxContinuationsWithoutProgress)`
+  and the `continuation-no-progress` diagnosis. With the default, a stuck run continues its first
+  hand-off and one stop without progress, and the second fails it — the two wasted continuations
+  the old flat budget allowed.
+- **`pipeline.maxContinuations`** (default 6; editable on the project's Pipeline tab since issue
+  #1259) — the hard ceiling on total continuations, progress or not. It is what bounds a run whose progress signal is fooled (the signal is the agent's own
+  record), and reaching it fails the run with
+  `… — checkpoint continuation ceiling reached (N of N continuations used, pipeline.maxContinuations)`
+  and the `continuation-budget-exhausted` diagnosis.
+
+The no-progress limit is checked first, as the more specific diagnosis. The counts live on the
+run row (the settle table above). A charged continuation no longer consumes a rate-limit retry
+attempt, so the ceiling is the real bound — a configured `pipeline.maxContinuations` above
+`MAX_RATE_LIMIT_RETRIES` (6) is honoured. Tier 1 resumes and usage-limit continuations still
+spend and are bounded by that counter.
 
 **The budget ends only stops attributable to the run** (issue #1219). A usage limit
 (`rate-limit`) is the provider's stop, not the run's: the work was progressing and the account
@@ -383,10 +406,13 @@ reported reset (or the usual 30-minute rate-limit backoff) whatever `pipeline.ma
 says, and spends nothing: the run stays `checkpointed` with its checkpoint and an unchanged
 `continuation_count`, the settle records the preserved-worker pin, and the retry is a
 `recoveryMode: 'checkpoint'` continuation on that machine. Only `MAX_RATE_LIMIT_RETRIES` bounds
-it. `capacity` stops are unaffected — they never become a Tier 2 continuation in the first place.
+it. Its checkpoint does become the baseline the next charged stop is judged against, so a
+usage-limit stop whose checkpoint advanced resets the no-progress streak (issue #1256) — otherwise
+the progress it recorded would be absorbed into that baseline and the next stop judged a stall.
+One without progress leaves the streak as it was. `capacity` stops are unaffected — they never become a Tier 2 continuation in the first place.
 
 **A terminal failure keeps the pin** (issue #1219). When a stop Tier 2 judged continuable still
-ends the run — a timeout or stall with the continuation budget spent, or any Tier 2 stop whose
+ends the run — a timeout or stall that stalled or reached the ceiling, or any Tier 2 stop whose
 rate-limit or automatic retry budget ran out — the checkout and this phase's checkpoint are still
 on the attempt's machine. The `failed` settle therefore re-records the preserved-worker pin after
 its `recovery: null` write, so "Retry now" on a run whose failed attempt was itself a checkpoint
@@ -471,7 +497,9 @@ and nowhere else, so the settle additionally records which machine it is on
 that machine is unavailable the dispatch waits for it without a timeout rather than continuing
 somewhere the checkpoint does not exist — which used to provision a fresh checkout and re-run the
 phase from scratch, silently. "Reset & restart" is the deliberate way out: it discards the
-checkpoint and the continuation budget as it always did, and now also releases the pin, recording
+checkpoint and the continuation budget as it always did — all three counters, `continuation_count`,
+`continuation_progress_count` and `continuation_no_progress_streak` (issue #1256) — and now also
+releases the pin, recording
 on the run that the preserved work was abandoned.
 
 A continuation the recovery gate **refuses to adopt** — its checkpoint no longer describes a state

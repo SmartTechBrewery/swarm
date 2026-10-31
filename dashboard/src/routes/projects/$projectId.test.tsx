@@ -932,8 +932,8 @@ describe('PipelineSettingsForm — checkpoint continuation budget (issue #1259)'
 		renderForm();
 
 		expect(screen.getByLabelText('Max checkpoint continuations')).toHaveProperty('value', '');
-		expect(screen.getByPlaceholderText('2 (default)')).toBeDefined();
-		expect(screen.getByText(/Using the default of 2/)).toBeDefined();
+		expect(screen.getByPlaceholderText('6 (default)')).toBeDefined();
+		expect(screen.getByText(/Using the default of 6/)).toBeDefined();
 	});
 
 	it("derives each phase's maximum run time from its effective timeout and the budget", () => {
@@ -952,7 +952,7 @@ describe('PipelineSettingsForm — checkpoint continuation budget (issue #1259)'
 	it('falls back to the default budget in the run-time column when the field is blank', () => {
 		renderForm({ storedMaxContinuations: 5 });
 
-		expect(maxRunTimeOf('Implementation')).toBe('1 h 30 min');
+		expect(maxRunTimeOf('Implementation')).toBe('3 h 30 min');
 	});
 
 	it('reports an invalid entry and blocks Save', () => {

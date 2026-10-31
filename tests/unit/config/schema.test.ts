@@ -1526,6 +1526,24 @@ describe('PipelineConfigSchema', () => {
 		expect(PipelineConfigSchema.safeParse({ maxContinuations: 1.5 }).success).toBe(false);
 	});
 
+	// The consecutive no-progress limit (issue #1256), validated exactly as the ceiling.
+	it('leaves maxContinuationsWithoutProgress unset by default (read as the coded default)', () => {
+		expect(PipelineConfigSchema.parse({}).maxContinuationsWithoutProgress).toBeUndefined();
+	});
+
+	it('accepts a positive integer maxContinuationsWithoutProgress', () => {
+		expect(PipelineConfigSchema.parse({ maxContinuationsWithoutProgress: 3 })).toMatchObject({
+			maxContinuationsWithoutProgress: 3,
+		});
+	});
+
+	it('rejects a non-positive or fractional maxContinuationsWithoutProgress', () => {
+		for (const value of [0, -1, 1.5])
+			expect(
+				PipelineConfigSchema.safeParse({ maxContinuationsWithoutProgress: value }).success,
+			).toBe(false);
+	});
+
 	it('leaves automationLabel unset by default (read as the coded default)', () => {
 		// Absent → undefined; `resolveAutomationLabel` supplies `swarm`, since the
 		// whole `pipeline` block is optional and a Zod default would never be seen.

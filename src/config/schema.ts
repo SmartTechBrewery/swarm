@@ -529,20 +529,32 @@ export const PipelineBaseSchema = z.object({
 		.optional(),
 	respondToCi: z.object({ enabled: z.boolean().optional() }).optional(),
 	/**
-	 * How many times one run may be continued from its Tier 2 checkpoint
-	 * (`docs/CHECKPOINTS.md`) before the fallback gives up and the run fails
-	 * terminally with a "continuation budget exhausted" reason. Unset (or the whole
-	 * `pipeline` block omitted) defaults to
-	 * `DEFAULT_MAX_CONTINUATIONS` (`src/pipeline/continuation-budget.ts`).
+	 * The hard ceiling on how many times one run may be continued from its Tier 2
+	 * checkpoint (`docs/CHECKPOINTS.md`), progress or not. Reaching it fails the run
+	 * terminally with a "checkpoint continuation ceiling reached" reason. Unset (or
+	 * the whole `pipeline` block omitted) defaults to `DEFAULT_MAX_CONTINUATIONS`
+	 * (`src/pipeline/continuation-budget.ts`).
 	 *
-	 * The bound matters because a checkpoint continuation re-seeds a *fresh* session
-	 * from a degraded hand-off: a phase that keeps stopping involuntarily would
-	 * otherwise hand itself off forever, each time paying for a new session that
-	 * re-reads the same remainder. Counted per run row (`runs.continuation_count`)
-	 * and cleared only by "Reset & restart", not by an ordinary retry. Only a
-	 * timeout or stall spends it; a usage-limit stop is never charged (issue #1219).
+	 * A run that stops without progress is ended sooner, by
+	 * {@link maxContinuationsWithoutProgress}; this ceiling bounds the run that keeps
+	 * progressing, since a checkpoint continuation re-seeds a *fresh* session from a
+	 * degraded hand-off and an agent's own record of progress can be fooled. Counted
+	 * per run row (`runs.continuation_count`) and cleared only by "Reset & restart",
+	 * not by an ordinary retry. Only a timeout or stall spends it; a usage-limit stop
+	 * is never charged (issue #1219).
 	 */
 	maxContinuations: z.number().int().positive().optional(),
+	/**
+	 * How many consecutive checkpoint continuations may make no progress before the
+	 * run fails terminally with a "checkpoint continuation stalled" reason (issue
+	 * #1256). A stop counts as progress when its checkpoint records a new
+	 * `completed` entry, fewer `remaining` entries, or a new `workingTree` path, and
+	 * a progressing stop resets the streak (`runs.continuation_no_progress_streak`).
+	 * Unset defaults to `DEFAULT_MAX_CONTINUATIONS_WITHOUT_PROGRESS`
+	 * (`src/pipeline/checkpoint.ts`). Named for progress rather than "stalls" because
+	 * `stalled` is already a failure kind.
+	 */
+	maxContinuationsWithoutProgress: z.number().int().positive().optional(),
 	/**
 	 * Label a work item must carry before SWARM starts a board-driven agent
 	 * phase (Planning, Implementation) for it — the explicit, human-controlled

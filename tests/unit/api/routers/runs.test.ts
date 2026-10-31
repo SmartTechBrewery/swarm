@@ -322,6 +322,8 @@ function makeRun(overrides: Partial<RunRow> = {}): RunRow {
 		resetStartedAt: null,
 		checkpoint: null,
 		continuationCount: 0,
+		continuationProgressCount: 0,
+		continuationNoProgressStreak: 0,
 		outputBytes: 0,
 		outputTruncated: false,
 		...overrides,

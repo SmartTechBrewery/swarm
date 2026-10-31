@@ -12,6 +12,7 @@ export const FailureDiagnosisKindSchema = z.enum([
 	'worker-shutdown',
 	'user-terminated',
 	'continuation-budget-exhausted',
+	'continuation-no-progress',
 	'commit-unavailable',
 	'review-waiting-for-checks',
 	'review-provider-unreachable',
@@ -108,9 +109,16 @@ function knownDiagnosis(condition: KnownFailureCondition): FailureDiagnosis {
 		case 'continuation-budget-exhausted':
 			return diagnosis(
 				condition,
-				'Known condition: continuation budget exhausted',
-				'The run was stopped involuntarily again after using every checkpoint continuation the project allows, so it was not handed off a further time.',
+				'Known condition: continuation ceiling reached',
+				'The run kept progressing, but it was stopped involuntarily again after using every checkpoint continuation `pipeline.maxContinuations` allows, so it was not handed off a further time.',
 				'Inspect the checkpoint recorded on this run. "Retry now" continues it once more from that checkpoint on the machine holding it; otherwise raise `pipeline.maxContinuations`, narrow the task, or use "Reset & restart" to start the phase over.',
+			);
+		case 'continuation-no-progress':
+			return diagnosis(
+				condition,
+				'Known condition: checkpoint continuations made no progress',
+				'The checkpoint did not advance across as many consecutive continuations as `pipeline.maxContinuationsWithoutProgress` allows — no new completed step, no fewer remaining steps, no new working-tree path — so the run was not handed off a further time.',
+				'Inspect the checkpoint recorded on this run. "Retry now" continues it once more from that checkpoint on the machine holding it; otherwise raise `pipeline.maxContinuationsWithoutProgress`, narrow the task, or use "Reset & restart" to start the phase over.',
 			);
 	}
 }

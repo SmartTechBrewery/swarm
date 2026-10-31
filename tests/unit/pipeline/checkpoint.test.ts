@@ -15,10 +15,14 @@ import {
 	CHECKPOINT_FILENAME,
 	type Checkpoint,
 	CheckpointSchema,
+	checkpointAdvanced,
 	DEFAULT_MAX_CONTINUATIONS,
+	DEFAULT_MAX_CONTINUATIONS_WITHOUT_PROGRESS,
 	hasCheckpoint,
+	judgeCheckpointContinuation,
 	readCheckpoint,
 	resolveMaxContinuations,
+	resolveMaxContinuationsWithoutProgress,
 	tryReadCheckpoint,
 	validateCheckpointForContinuation,
 } from '@/pipeline/checkpoint.js';
@@ -231,11 +235,157 @@ describe('tryReadCheckpoint / resolveMaxContinuations (issue #503)', () => {
 		).toBeUndefined();
 	});
 
-	it('reads the continuation budget from the project, defaulting when unset', () => {
+	it('reads the continuation ceiling from the project, defaulting to 6 when unset', () => {
+		expect(DEFAULT_MAX_CONTINUATIONS).toBe(6);
 		expect(resolveMaxContinuations(createMockProjectConfig())).toBe(DEFAULT_MAX_CONTINUATIONS);
 		expect(
 			resolveMaxContinuations(createMockProjectConfig({ pipeline: { maxContinuations: 5 } })),
 		).toBe(5);
+	});
+
+	it('reads the no-progress limit from the project, defaulting to 2 when unset (issue #1256)', () => {
+		expect(DEFAULT_MAX_CONTINUATIONS_WITHOUT_PROGRESS).toBe(2);
+		expect(resolveMaxContinuationsWithoutProgress(createMockProjectConfig())).toBe(2);
+		expect(
+			resolveMaxContinuationsWithoutProgress(
+				createMockProjectConfig({ pipeline: { maxContinuationsWithoutProgress: 4 } }),
+			),
+		).toBe(4);
+	});
+});
+
+describe('checkpointAdvanced (issue #1256)', () => {
+	const previous = CheckpointSchema.parse({
+		...VALID,
+		completed: ['Added the schema'],
+		remaining: ['Wire the consumer', 'Update the docs'],
+	});
+
+	it('counts the first hand-off — no previous checkpoint — as progress', () => {
+		expect(checkpointAdvanced(undefined, previous)).toBe(true);
+		expect(checkpointAdvanced(null, previous)).toBe(true);
+	});
+
+	it('does not count an identical checkpoint', () => {
+		expect(checkpointAdvanced(previous, structuredClone(previous))).toBe(false);
+	});
+
+	it('counts a new completed entry', () => {
+		expect(
+			checkpointAdvanced(previous, {
+				...previous,
+				completed: [...previous.completed, 'Wired the consumer'],
+			}),
+		).toBe(true);
+	});
+
+	it('does not count whitespace-only differences in completed', () => {
+		expect(checkpointAdvanced(previous, { ...previous, completed: ['  Added the schema '] })).toBe(
+			false,
+		);
+	});
+
+	it('does not count a reworded remaining list of the same length', () => {
+		expect(
+			checkpointAdvanced(previous, {
+				...previous,
+				remaining: ['Wire up the consumer', 'Refresh the docs'],
+			}),
+		).toBe(false);
+	});
+
+	it('counts fewer remaining entries', () => {
+		expect(checkpointAdvanced(previous, { ...previous, remaining: ['Update the docs'] })).toBe(
+			true,
+		);
+	});
+
+	it('counts a new working-tree path, but not the same path spelled ./', () => {
+		expect(
+			checkpointAdvanced(previous, {
+				...previous,
+				workingTree: { ...previous.workingTree, added: ['src/worker/new.ts'] },
+			}),
+		).toBe(true);
+		expect(
+			checkpointAdvanced(previous, {
+				...previous,
+				workingTree: { modified: ['./src/pipeline/checkpoint.ts'], added: [], deleted: [] },
+			}),
+		).toBe(false);
+	});
+});
+
+describe('judgeCheckpointContinuation (issue #1256)', () => {
+	const limits = { maxContinuations: 6, maxWithoutProgress: 2 };
+	const base = CheckpointSchema.parse({ ...VALID, completed: ['Step 0'] });
+	const advanced = (n: number) => ({ ...base, completed: [`Step ${n}`] });
+
+	it('continues a progressing run past the old default of two, counting progress', () => {
+		const verdict = judgeCheckpointContinuation(
+			{ previous: advanced(2), continuationCount: 2, progressCount: 2, noProgressStreak: 0 },
+			advanced(3),
+			limits,
+		);
+		expect(verdict).toEqual({
+			kind: 'continue',
+			progressed: true,
+			continuationCount: 3,
+			progressCount: 3,
+			noProgressStreak: 0,
+		});
+	});
+
+	it('resets the no-progress streak on a progressing stop', () => {
+		expect(
+			judgeCheckpointContinuation(
+				{ previous: advanced(1), continuationCount: 2, progressCount: 1, noProgressStreak: 1 },
+				advanced(2),
+				limits,
+			),
+		).toMatchObject({ kind: 'continue', progressCount: 2, noProgressStreak: 0 });
+	});
+
+	it('continues a first stop without progress, then fails the next one', () => {
+		const first = judgeCheckpointContinuation(
+			{ previous: base, continuationCount: 1, progressCount: 1, noProgressStreak: 0 },
+			base,
+			limits,
+		);
+		expect(first).toEqual({
+			kind: 'continue',
+			progressed: false,
+			continuationCount: 2,
+			progressCount: 1,
+			noProgressStreak: 1,
+		});
+		expect(
+			judgeCheckpointContinuation(
+				{ previous: base, continuationCount: 2, progressCount: 1, noProgressStreak: 1 },
+				base,
+				limits,
+			),
+		).toEqual({ kind: 'no-progress', streak: 2, max: 2, spent: 2 });
+	});
+
+	it('ends a progressing run at the ceiling', () => {
+		expect(
+			judgeCheckpointContinuation(
+				{ previous: advanced(5), continuationCount: 6, progressCount: 6, noProgressStreak: 0 },
+				advanced(6),
+				limits,
+			),
+		).toEqual({ kind: 'ceiling', spent: 6, max: 6 });
+	});
+
+	it('names the no-progress limit rather than the ceiling when both are reached', () => {
+		expect(
+			judgeCheckpointContinuation(
+				{ previous: base, continuationCount: 6, progressCount: 5, noProgressStreak: 1 },
+				base,
+				limits,
+			),
+		).toMatchObject({ kind: 'no-progress' });
 	});
 });
 
