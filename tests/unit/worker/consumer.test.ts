@@ -9636,6 +9636,88 @@ describe('processJob', () => {
 			);
 		});
 
+		// A usage-limit stop's checkpoint becomes the next charged stop's baseline, so
+		// the progress it recorded is credited here or never (issue #1256).
+		it('resets the no-progress streak when a usage-limit stop records progress', async () => {
+			getRunByIdFromDb.mockResolvedValue({
+				checkpoint: CHECKPOINT,
+				continuationCount: 2,
+				continuationProgressCount: 1,
+				continuationNoProgressStreak: 1,
+			});
+			phaseImpl = stoppedRun({ checkpoint: ADVANCED });
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ runId: 'run-1', recoveryMode: 'checkpoint' }),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-deferred');
+			expect(completeRun).toHaveBeenCalledExactlyOnceWith(
+				'run-1',
+				expect.objectContaining({
+					status: 'checkpointed',
+					checkpoint: ADVANCED,
+					continuationCount: 2,
+					continuationProgressCount: 1,
+					continuationNoProgressStreak: 0,
+				}),
+			);
+		});
+
+		it('leaves the no-progress streak unchanged for a usage-limit stop without progress', async () => {
+			getRunByIdFromDb.mockResolvedValue({
+				checkpoint: CHECKPOINT,
+				continuationCount: 2,
+				continuationProgressCount: 1,
+				continuationNoProgressStreak: 1,
+			});
+			phaseImpl = stoppedRun({ checkpoint: CHECKPOINT });
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ runId: 'run-1', recoveryMode: 'checkpoint' }),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-deferred');
+			expect(completeRun).toHaveBeenCalledExactlyOnceWith(
+				'run-1',
+				expect.objectContaining({
+					status: 'checkpointed',
+					continuationCount: 2,
+					continuationNoProgressStreak: 1,
+				}),
+			);
+		});
+
+		// The row as the progressing usage-limit stop above left it: its checkpoint is
+		// the baseline and the streak was reset, so one unchanged timeout is a first stall.
+		it('does not fail as stalled a timeout following a progressing usage-limit stop', async () => {
+			getRunByIdFromDb.mockResolvedValue({
+				checkpoint: ADVANCED,
+				continuationCount: 2,
+				continuationProgressCount: 1,
+				continuationNoProgressStreak: 0,
+			});
+			phaseImpl = stoppedRun({ checkpoint: ADVANCED, kind: 'timeout' });
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ runId: 'run-1', recoveryMode: 'checkpoint' }),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-deferred');
+			expect(outcome).not.toHaveProperty('failureDiagnosis');
+			expect(completeRun).toHaveBeenCalledExactlyOnceWith(
+				'run-1',
+				expect.objectContaining({
+					status: 'checkpointed',
+					continuationCount: 3,
+					continuationNoProgressStreak: 1,
+				}),
+			);
+		});
+
 		// Issue #1219: a stop Tier 2 judged continuable that still ends the run leaves
 		// this phase's checkpoint in a preserved checkout on the attempt's machine. The
 		// failed settle writes `recovery: null`, so the pin is re-recorded after it —

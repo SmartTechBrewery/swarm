@@ -131,6 +131,7 @@ import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import {
 	type Checkpoint,
+	checkpointAdvanced,
 	judgeCheckpointContinuation,
 	resolveMaxContinuations,
 	resolveMaxContinuationsWithoutProgress,
@@ -751,8 +752,9 @@ function deferredPhaseMessage(failure: DeferrableFailure, phase: TriggerPhase): 
  * which of its limits ended it. When the budget cannot be read, it instead
  * releases the checkout before the ordinary retry. Resolved by {@link resolveCheckpointFallback};
  * `undefined` there means "not a Tier 2 case" and the deferral proceeds exactly as it did before.
- * `continue` carries the run's counters *after* this settle — unchanged, and `charged: false`,
- * for a usage-limit stop, which is never charged (issue #1219) — and `exhausted` is only ever a
+ * `continue` carries the run's counters *after* this settle — `charged: false` for a usage-limit
+ * stop, which is never charged (issue #1219) and changes no count, though progress it recorded
+ * still resets the no-progress streak (issue #1256) — and `exhausted` is only ever a
  * stop attributable to the run itself (a timeout or a stall): `no-progress` when its checkpoint
  * stopped advancing for `pipeline.maxContinuationsWithoutProgress` stops in a row, `ceiling`
  * when a progressing run used every continuation `pipeline.maxContinuations` allows (issue #1256).
@@ -846,13 +848,16 @@ async function resolveCheckpointFallback(
 	// continuation nor is ended by a spent budget — the continuation is re-attempted
 	// at the reset, on the same count. The budget bounds a run that keeps stopping
 	// *on its own* (a timeout, a stall); `MAX_RATE_LIMIT_RETRIES` still bounds this.
+	// Its checkpoint still becomes the next charged stop's baseline (`runs.checkpoint`),
+	// so progress it recorded resets the streak here — otherwise that baseline would
+	// absorb the progress and the next charged stop would be judged a stall (issue #1256).
 	if (err.failure.kind === 'rate-limit') {
 		return {
 			kind: 'continue',
 			checkpoint,
 			continuationCount: state.continuationCount,
 			progressCount: state.progressCount,
-			noProgressStreak: state.noProgressStreak,
+			noProgressStreak: checkpointAdvanced(state.previous, checkpoint) ? 0 : state.noProgressStreak,
 			charged: false,
 		};
 	}
@@ -944,12 +949,12 @@ function deferAgentRunError(
 	runId: string | undefined,
 	checkpointFallback?: CheckpointFallback,
 ): Extract<JobOutcome, { status: 'phase-deferred' }> | undefined {
-	// The Tier 2 bound sits with the other caps rather than in the settle: a run that
-	// has already spent every continuation the project allows must fall through to a
-	// terminal failure, which the caller reports as an exhausted continuation budget.
-	// Checked first because it is the more specific of the two exhausted budgets. A
-	// usage-limit stop never reaches it (issue #1219): it is not charged to this budget,
-	// so the rate-limit retry cap below is the only one that can end it.
+	// The Tier 2 bound sits with the other caps rather than in the settle: a run whose
+	// Tier 2 verdict ended it — stalled without progress, or at the continuation ceiling
+	// (issue #1256) — must fall through to a terminal failure, and the caller names which
+	// limit ended the run. Checked first because it is the more specific of the exhausted
+	// budgets. A usage-limit stop never reaches it (issue #1219): it is not charged to
+	// either limit, so the rate-limit retry cap below is the only one that can end it.
 	if (checkpointFallback?.kind === 'exhausted') {
 		logger.error(
 			`Phase failed - ${phaseLabel(trigger.phase)} — ${

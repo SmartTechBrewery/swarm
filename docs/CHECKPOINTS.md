@@ -354,7 +354,7 @@ continue from a checkpoint":
 | `checkpoint` | the parsed hand-off, so the API/dashboard can show the remaining work without reading a (possibly remote) worker's filesystem |
 | `continuation_count` | incremented for a timeout or stall; unchanged for a usage-limit stop (issue #1219); kept through an ordinary retry, cleared only by "Reset & restart" |
 | `continuation_progress_count` | incremented with `continuation_count` when the stop's checkpoint advanced over the previous one (issue #1256); unchanged for a usage-limit stop; kept and cleared exactly as `continuation_count` |
-| `continuation_no_progress_streak` | `0` after a stop whose checkpoint advanced, incremented after one that did not (issue #1256); unchanged for a usage-limit stop; kept and cleared exactly as `continuation_count` |
+| `continuation_no_progress_streak` | `0` after a stop whose checkpoint advanced, incremented after one that did not (issue #1256); for a usage-limit stop, reset to `0` when its checkpoint advanced and otherwise unchanged; kept and cleared exactly as `continuation_count` |
 | `next_retry_at` | the scheduled continuation, exactly as for a deferral |
 
 The continuation itself goes out through the **existing durable dispatch** — the same machinery
@@ -406,7 +406,10 @@ reported reset (or the usual 30-minute rate-limit backoff) whatever `pipeline.ma
 says, and spends nothing: the run stays `checkpointed` with its checkpoint and an unchanged
 `continuation_count`, the settle records the preserved-worker pin, and the retry is a
 `recoveryMode: 'checkpoint'` continuation on that machine. Only `MAX_RATE_LIMIT_RETRIES` bounds
-it. `capacity` stops are unaffected — they never become a Tier 2 continuation in the first place.
+it. Its checkpoint does become the baseline the next charged stop is judged against, so a
+usage-limit stop whose checkpoint advanced resets the no-progress streak (issue #1256) — otherwise
+the progress it recorded would be absorbed into that baseline and the next stop judged a stall.
+One without progress leaves the streak as it was. `capacity` stops are unaffected — they never become a Tier 2 continuation in the first place.
 
 **A terminal failure keeps the pin** (issue #1219). When a stop Tier 2 judged continuable still
 ends the run — a timeout or stall that stalled or reached the ceiling, or any Tier 2 stop whose
