@@ -91,7 +91,11 @@ import { getPMProvider } from '../../integrations/pm/registry.js';
 import { requireProjectSCMProvider } from '../../integrations/scm/registry.js';
 import { describeError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
-import { type Checkpoint, resolveMaxContinuations } from '../../pipeline/checkpoint.js';
+import {
+	type Checkpoint,
+	resolveMaxContinuations,
+	resolveMaxContinuationsWithoutProgress,
+} from '../../pipeline/checkpoint.js';
 import { taskIdForRepository } from '../../pipeline/task-identity.js';
 import { resolvePipelinePhaseForStatusKey } from '../../pm/pipeline.js';
 import {
@@ -912,32 +916,43 @@ async function listRunsWithWorkerNames(filter: ListRunsFilter) {
 }
 
 /**
- * The checkpoint-continuation budget that bounds this run's Tier 2 fallback
- * (issue #504) — the project's `pipeline.maxContinuations`, or the coded default
- * ({@link resolveMaxContinuations}). Resolved server-side, so the dashboard can
- * show the spent `continuationCount` against its ceiling without re-declaring
- * that default in the web bundle where it would go stale.
+ * The checkpoint-continuation budget that bounds this run's Tier 2 fallback —
+ * the project's `pipeline.maxContinuations` ceiling (issue #504) and its
+ * `pipeline.maxContinuationsWithoutProgress` stall limit (issue #1256), or the
+ * coded defaults ({@link resolveMaxContinuations},
+ * {@link resolveMaxContinuationsWithoutProgress}). Resolved server-side, so the
+ * dashboard can show the spent `continuationCount` and the
+ * `continuationNoProgressStreak` against their limits without re-declaring either
+ * default in the web bundle where it would go stale.
  *
  * Only a row that actually carries a checkpoint has a budget worth reporting, so
  * every other run skips the project read entirely — the same shape
- * {@link resolveRunAttribution} uses for a run with no recorded worker. Returns
- * `null` when the project no longer resolves or the read throws, so the panel
- * shows the spent count alone rather than a fabricated ceiling.
+ * {@link resolveRunAttribution} uses for a run with no recorded worker. Both limits
+ * are `null` when the project no longer resolves or the read throws, so the panel
+ * shows the bare counts rather than fabricated limits.
  */
 async function resolveContinuationBudget(run: {
 	projectId: string;
 	checkpoint: Checkpoint | null;
-}): Promise<number | null> {
-	if (!run.checkpoint) return null;
+}): Promise<{
+	maxContinuations: number | null;
+	maxContinuationsWithoutProgress: number | null;
+}> {
+	const unknown = { maxContinuations: null, maxContinuationsWithoutProgress: null };
+	if (!run.checkpoint) return unknown;
 	try {
 		const project = await getProjectByIdFromDb(run.projectId);
-		return project ? resolveMaxContinuations(project) : null;
+		if (!project) return unknown;
+		return {
+			maxContinuations: resolveMaxContinuations(project),
+			maxContinuationsWithoutProgress: resolveMaxContinuationsWithoutProgress(project),
+		};
 	} catch (error) {
 		logger.warn('runs.getById: continuation-budget lookup failed; reporting the count alone', {
 			projectId: run.projectId,
 			error: describeError(error),
 		});
-		return null;
+		return unknown;
 	}
 }
 
@@ -1429,7 +1444,9 @@ const runReadProcedures = {
 	// `continuationCount` (issue #503) the detail page's checkpoint panel renders —
 	// plus five additive, server-resolved fields: an `attribution` object resolving
 	// the recorded worker/user to display labels (issue #446), the
-	// `maxContinuations` ceiling that count reads against (issue #504), the
+	// `maxContinuations` ceiling that count reads against (issue #504) together
+	// with the `maxContinuationsWithoutProgress` stall limit the row's
+	// `continuationNoProgressStreak` reads against (issue #1256), the
 	// `pendingRequest` naming an accepted Terminate/Reset request that hasn't taken
 	// effect yet (issue #561 — the Redis cancellation marker for a `running` run, the
 	// run's waiting `manual-retry` dispatch otherwise), the `preservedWorker`
@@ -1463,7 +1480,7 @@ const runReadProcedures = {
 			return {
 				...run,
 				attribution: await resolveRunAttribution(run),
-				maxContinuations: await resolveContinuationBudget(run),
+				...(await resolveContinuationBudget(run)),
 				pendingRequest: await resolvePendingRunRequest(run),
 				preservedWorker: await resolveRunPreservedWorker(run),
 				retryScheduled: await resolveRetryScheduled(run),

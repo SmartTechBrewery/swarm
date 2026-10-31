@@ -781,6 +781,9 @@ function makeCheckpointedRun(overrides: Partial<RunRow> = {}): RunRow {
 		checkpoint: CHECKPOINT,
 		continuationCount: 1,
 		maxContinuations: 2,
+		continuationProgressCount: 1,
+		continuationNoProgressStreak: 0,
+		maxContinuationsWithoutProgress: 2,
 		...overrides,
 	});
 }
@@ -815,9 +818,36 @@ describe('CheckpointPanel (issue #504)', () => {
 		expect(screen.getByText('Continuation 1 of 2')).toBeDefined();
 	});
 
-	it('reports the count alone when the server could not resolve a ceiling', () => {
-		render(<CheckpointPanel run={makeCheckpointedRun({ maxContinuations: null })} />);
+	it('reads the progress count and the no-progress streak against its stall limit (issue #1256)', () => {
+		render(
+			<CheckpointPanel
+				run={makeCheckpointedRun({
+					continuationCount: 3,
+					maxContinuations: 6,
+					continuationProgressCount: 3,
+					continuationNoProgressStreak: 0,
+					maxContinuationsWithoutProgress: 2,
+				})}
+			/>,
+		);
+		expect(screen.getByText('Continuation 3 of 6')).toBeDefined();
+		expect(screen.getByText('3 with progress')).toBeDefined();
+		expect(screen.getByText('0 of 2 without progress in a row')).toBeDefined();
+	});
+
+	it('reports bare counts when the server could not resolve the limits', () => {
+		render(
+			<CheckpointPanel
+				run={makeCheckpointedRun({
+					continuationNoProgressStreak: 1,
+					maxContinuations: null,
+					maxContinuationsWithoutProgress: null,
+				})}
+			/>,
+		);
 		expect(screen.getByText('Continuation 1')).toBeDefined();
+		expect(screen.getByText('1 with progress')).toBeDefined();
+		expect(screen.getByText('1 without progress in a row')).toBeDefined();
 	});
 
 	it('omits empty checkpoint groups rather than rendering an empty label', () => {
