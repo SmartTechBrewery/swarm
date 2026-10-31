@@ -387,8 +387,8 @@ then apply (`judgeCheckpointContinuation`), both in `docs/configuration.md`:
   and the `continuation-no-progress` diagnosis. With the default, a stuck run continues its first
   hand-off and one stop without progress, and the second fails it — the two wasted continuations
   the old flat budget allowed.
-- **`pipeline.maxContinuations`** (default 6) — the hard ceiling on total continuations, progress
-  or not. It is what bounds a run whose progress signal is fooled (the signal is the agent's own
+- **`pipeline.maxContinuations`** (default 6; editable on the project's Pipeline tab since issue
+  #1259) — the hard ceiling on total continuations, progress or not. It is what bounds a run whose progress signal is fooled (the signal is the agent's own
   record), and reaching it fails the run with
   `… — checkpoint continuation ceiling reached (N of N continuations used, pipeline.maxContinuations)`
   and the `continuation-budget-exhausted` diagnosis.

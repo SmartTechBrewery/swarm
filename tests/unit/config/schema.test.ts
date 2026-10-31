@@ -1211,11 +1211,12 @@ describe('ProjectRecordSchema', () => {
 		).toEqual({ review: { enabled: true } });
 	});
 
-	it('limits per-phase timeouts to five through forty-five minutes', () => {
+	it('limits per-phase timeouts to five through ninety minutes (issue #1259)', () => {
 		expect(() => AgentConfigSchema.parse({ timeoutMs: 5 * 60 * 1000 })).not.toThrow();
-		expect(() => AgentConfigSchema.parse({ timeoutMs: 45 * 60 * 1000 })).not.toThrow();
+		expect(() => AgentConfigSchema.parse({ timeoutMs: 60 * 60 * 1000 })).not.toThrow();
+		expect(() => AgentConfigSchema.parse({ timeoutMs: 90 * 60 * 1000 })).not.toThrow();
 		expect(() => AgentConfigSchema.parse({ timeoutMs: 5 * 60 * 1000 - 1 })).toThrow();
-		expect(() => AgentConfigSchema.parse({ timeoutMs: 45 * 60 * 1000 + 1 })).toThrow();
+		expect(() => AgentConfigSchema.parse({ timeoutMs: 90 * 60 * 1000 + 1 })).toThrow();
 	});
 
 	describe('custom prompt (issue #135)', () => {

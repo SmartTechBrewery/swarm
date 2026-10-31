@@ -308,12 +308,12 @@ export const AgentConfigSchema = z
 		reasoning: ReasoningLevelSchema.optional(),
 		/** Model targets in priority order, at most one per CLI (see above). */
 		targets: z.array(AgentTargetSchema).optional(),
-		/** A bounded per-phase timeout: 5–45 minutes, stored in milliseconds. */
+		/** A bounded per-phase timeout: 5–90 minutes, stored in milliseconds. */
 		timeoutMs: z
 			.number()
 			.int()
 			.min(5 * 60 * 1000)
-			.max(45 * 60 * 1000)
+			.max(90 * 60 * 1000)
 			.optional(),
 		/**
 		 * Optional project-owned instructions appended to this phase's SWARM
@@ -533,7 +533,7 @@ export const PipelineBaseSchema = z.object({
 	 * checkpoint (`docs/CHECKPOINTS.md`), progress or not. Reaching it fails the run
 	 * terminally with a "checkpoint continuation ceiling reached" reason. Unset (or
 	 * the whole `pipeline` block omitted) defaults to `DEFAULT_MAX_CONTINUATIONS`
-	 * (`src/pipeline/checkpoint.ts`).
+	 * (`src/pipeline/continuation-budget.ts`).
 	 *
 	 * A run that stops without progress is ended sooner, by
 	 * {@link maxContinuationsWithoutProgress}; this ceiling bounds the run that keeps

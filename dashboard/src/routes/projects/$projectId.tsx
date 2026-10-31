@@ -61,6 +61,15 @@ import {
 	withSelectedProvider,
 } from '@/lib/board-mapping.js';
 import {
+	CHECKPOINT_PHASES,
+	DEFAULT_MAX_CONTINUATIONS,
+	effectiveMaxContinuations,
+	formatMinutes,
+	maxPhaseRunMinutes,
+	parseMaxContinuationsInput,
+	toMaxContinuationsInput,
+} from '@/lib/continuation-budget.js';
+import {
 	anyCustomPromptError,
 	CUSTOM_PROMPT_MAX_LENGTH,
 	customPromptError,
@@ -1178,7 +1187,7 @@ export function PhaseSettingsDetail({
 							id={`${phase}-timeout`}
 							type="number"
 							min="5"
-							max="45"
+							max="90"
 							value={timeoutMinutes}
 							onChange={(e) => handleTimeoutChange(phase, e.target.value)}
 							disabled={isPending}
@@ -1526,6 +1535,13 @@ export function AgentConfigurationForm({
 interface PipelineSettingsFormProps {
 	skipRespondToReviewOnMinors: boolean;
 	setSkipRespondToReviewOnMinors: (value: boolean) => void;
+	/** The "Max checkpoint continuations" field's text — blank means the default. */
+	maxContinuationsInput: string;
+	setMaxContinuationsInput: (value: string) => void;
+	/** The stored `pipeline.maxContinuations`, which an invalid entry leaves standing. */
+	storedMaxContinuations: number | undefined;
+	/** The per-phase configs the run-time column reads each phase's effective timeout from. */
+	agents: AgentsConfig;
 	handleSubmit: (e: React.FormEvent) => void;
 	handleReset: () => void;
 	isDirty: boolean;
@@ -1538,6 +1554,10 @@ interface PipelineSettingsFormProps {
 export function PipelineSettingsForm({
 	skipRespondToReviewOnMinors,
 	setSkipRespondToReviewOnMinors,
+	maxContinuationsInput,
+	setMaxContinuationsInput,
+	storedMaxContinuations,
+	agents,
 	handleSubmit,
 	handleReset,
 	isDirty,
@@ -1546,6 +1566,11 @@ export function PipelineSettingsForm({
 	isError,
 	errorMessage,
 }: PipelineSettingsFormProps) {
+	const parsedMaxContinuations = parseMaxContinuationsInput(maxContinuationsInput);
+	const maxContinuationsError = parsedMaxContinuations.ok
+		? undefined
+		: parsedMaxContinuations.error;
+	const continuations = effectiveMaxContinuations(maxContinuationsInput, storedMaxContinuations);
 	return (
 		<div className="border border-zinc-800 rounded-lg bg-panel/40 p-6 shadow-sm">
 			<form onSubmit={handleSubmit} className="space-y-6">
@@ -1575,6 +1600,83 @@ export function PipelineSettingsForm({
 
 				<div>
 					<h2 className="text-sm font-semibold text-zinc-200 border-b border-zinc-800 pb-2 mb-4">
+						Checkpoint continuations
+					</h2>
+					<label htmlFor="max-continuations" className={LABEL_CLASS}>
+						Max checkpoint continuations
+					</label>
+					<input
+						id="max-continuations"
+						type="number"
+						min="1"
+						step="1"
+						inputMode="numeric"
+						value={maxContinuationsInput}
+						onChange={(event) => setMaxContinuationsInput(event.target.value)}
+						disabled={isPending}
+						placeholder={`${DEFAULT_MAX_CONTINUATIONS} (default)`}
+						aria-invalid={maxContinuationsError ? true : undefined}
+						className={`${FIELD_CLASS} font-mono max-w-[12rem]`}
+					/>
+					{maxContinuationsError ? (
+						<p className="text-xs text-red-400 mt-1">{maxContinuationsError}</p>
+					) : (
+						<p className="text-xs text-zinc-500 mt-1">
+							{maxContinuationsInput.trim() === ''
+								? `Using the default of ${DEFAULT_MAX_CONTINUATIONS}. `
+								: ''}
+							How many times a phase stopped by its timeout or a stall is resumed from its
+							checkpoint before the run fails — the ceiling, progress or not; a run that stops
+							without progress fails sooner. A usage-limit stop is never charged. Leave it blank for
+							the default.
+						</p>
+					)}
+					<table className="mt-4 w-full max-w-md text-xs">
+						<caption className="text-left text-zinc-400 mb-1.5">
+							Resulting maximum run time per phase (timeout × (1 + continuations))
+						</caption>
+						<thead>
+							<tr className="text-zinc-500">
+								<th scope="col" className="text-left font-medium py-1">
+									Phase
+								</th>
+								<th scope="col" className="text-right font-medium py-1">
+									Timeout
+								</th>
+								<th scope="col" className="text-right font-medium py-1">
+									Max run time
+								</th>
+							</tr>
+						</thead>
+						<tbody>
+							{CHECKPOINT_PHASES.map((phase) => {
+								const config = agents[phase] ?? {};
+								const timeoutMinutes = timeoutMinutesOf(config);
+								return (
+									<tr key={phase} className="border-t border-zinc-800 text-zinc-300">
+										<td className="py-1">{PHASE_LABELS[phase].label}</td>
+										<td className="py-1 text-right font-mono">
+											{formatMinutes(timeoutMinutes)}
+											{config.timeoutMs == null && (
+												<span className="text-zinc-500"> (default)</span>
+											)}
+										</td>
+										<td className="py-1 text-right font-mono">
+											{formatMinutes(maxPhaseRunMinutes(timeoutMinutes, continuations))}
+										</td>
+									</tr>
+								);
+							})}
+						</tbody>
+					</table>
+					<p className="text-xs text-zinc-500 mt-2">
+						Timeouts are set per phase on Agent configuration. Planning and Review keep no
+						checkpoint, so the budget does not extend them.
+					</p>
+				</div>
+
+				<div>
+					<h2 className="text-sm font-semibold text-zinc-200 border-b border-zinc-800 pb-2 mb-4">
 						Review
 					</h2>
 					{/* Per repository since issue #1109: whether a repository has CI is its own
@@ -1597,7 +1699,11 @@ export function PipelineSettingsForm({
 				)}
 
 				<div className="flex items-center gap-2 border-t border-zinc-800 pt-4">
-					<button type="submit" disabled={isPending || !isDirty} className={buttonClass('primary')}>
+					<button
+						type="submit"
+						disabled={isPending || !isDirty || maxContinuationsError !== undefined}
+						className={buttonClass('primary')}
+					>
 						{isPending ? 'Saving…' : 'Save changes'}
 					</button>
 					<button
@@ -1834,6 +1940,39 @@ export function toGeneralSettingsUpdate(
 }
 
 /**
+ * What a Pipeline tab save may send: the stored `pipeline` shape, except that
+ * `maxContinuations: null` clears the budget back to its default — the wire is plain
+ * JSON, so an unset key could never say so (issue #1259).
+ */
+export type PipelinePatch = Omit<PipelineConfig, 'maxContinuations'> & {
+	maxContinuations?: number | null;
+};
+
+/**
+ * The Pipeline tab's save payload: only the settings the form changed, so a save
+ * never writes a default the project left unset (`projects.update` merges the patch
+ * into the stored `pipeline`, leaving every other key as it was). `null` when nothing
+ * changed or the continuation budget does not parse — the same answer the tab's
+ * dirty check and its Save button read.
+ */
+export function toPipelineSettingsUpdate(
+	projectId: string,
+	stored: PipelineConfig | undefined,
+	form: { skipRespondToReviewOnMinors: boolean; maxContinuationsInput: string },
+): { id: string; pipeline: PipelinePatch } | null {
+	const pipeline: PipelinePatch = {};
+	if (form.skipRespondToReviewOnMinors !== (stored?.respondToReview?.skipOnMinors ?? true)) {
+		pipeline.respondToReview = { skipOnMinors: form.skipRespondToReviewOnMinors };
+	}
+	const budget = parseMaxContinuationsInput(form.maxContinuationsInput);
+	if (!budget.ok) return null;
+	if (budget.value !== (stored?.maxContinuations ?? null)) {
+		pipeline.maxContinuations = budget.value;
+	}
+	return Object.keys(pipeline).length > 0 ? { id: projectId, pipeline } : null;
+}
+
+/**
  * The Source Control tab's repository-list save payload: `repositories` alone, replaced
  * wholesale every time (`projects.update` is a partial patch). `null` when `duplicates`
  * is non-empty — the one list rule with no server-side twin — so the caller's early
@@ -1973,6 +2112,7 @@ function ProjectDetailRouteComponent() {
 	);
 	const [verifyPlan, setVerifyPlan] = useState(() => toVerifyPlanForm(undefined));
 	const [skipRespondToReviewOnMinors, setSkipRespondToReviewOnMinors] = useState(true);
+	const [maxContinuationsInput, setMaxContinuationsInput] = useState('');
 	const [boardMapping, setBoardMapping] = useState<BoardMappingForm>(() =>
 		toBoardMappingForm(undefined),
 	);
@@ -2036,6 +2176,7 @@ function ProjectDetailRouteComponent() {
 			setPipelineAutoAdvance(toPipelineAutoAdvanceForm(project.pipeline));
 			setVerifyPlan(toVerifyPlanForm(project.pipeline));
 			setSkipRespondToReviewOnMinors(project.pipeline?.respondToReview?.skipOnMinors ?? true);
+			setMaxContinuationsInput(toMaxContinuationsInput(project.pipeline));
 		}
 
 		if (changed.boardMapping) {
@@ -2053,7 +2194,7 @@ function ProjectDetailRouteComponent() {
 			repoRoot?: string;
 			worktreeRoot?: string;
 			agents?: AgentsConfig;
-			pipeline?: PipelineConfig;
+			pipeline?: PipelinePatch;
 			pm?: ProjectPm;
 		}) => trpcClient.projects.update.mutate(variables),
 		onSuccess: () => {
@@ -2161,10 +2302,12 @@ function ProjectDetailRouteComponent() {
 		[agents],
 	);
 
+	// Raw text, not the parsed budget: an invalid entry is still an edit Reset must undo.
 	const isPipelineDirty = useMemo(
 		() =>
-			skipRespondToReviewOnMinors !== (project?.pipeline?.respondToReview?.skipOnMinors ?? true),
-		[project, skipRespondToReviewOnMinors],
+			skipRespondToReviewOnMinors !== (project?.pipeline?.respondToReview?.skipOnMinors ?? true) ||
+			maxContinuationsInput.trim() !== toMaxContinuationsInput(project?.pipeline),
+		[project, skipRespondToReviewOnMinors, maxContinuationsInput],
 	);
 
 	const isBoardMappingFormDirty = useMemo(
@@ -2273,16 +2416,16 @@ function ProjectDetailRouteComponent() {
 	const handlePipelineSubmit = (e: React.FormEvent) => {
 		e.preventDefault();
 		if (configWriteInFlight) return;
-		updateMutation.mutate({
-			id: projectId,
-			pipeline: {
-				respondToReview: { skipOnMinors: skipRespondToReviewOnMinors },
-			},
+		const update = toPipelineSettingsUpdate(projectId, project?.pipeline, {
+			skipRespondToReviewOnMinors,
+			maxContinuationsInput,
 		});
+		if (update) updateMutation.mutate(update);
 	};
 
 	const handlePipelineReset = () => {
 		setSkipRespondToReviewOnMinors(project?.pipeline?.respondToReview?.skipOnMinors ?? true);
+		setMaxContinuationsInput(toMaxContinuationsInput(project?.pipeline));
 		updateMutation.reset();
 	};
 
@@ -2549,6 +2692,13 @@ function ProjectDetailRouteComponent() {
 							setSkipRespondToReviewOnMinors(value);
 							updateMutation.reset();
 						}}
+						maxContinuationsInput={maxContinuationsInput}
+						setMaxContinuationsInput={(value) => {
+							setMaxContinuationsInput(value);
+							updateMutation.reset();
+						}}
+						storedMaxContinuations={project?.pipeline?.maxContinuations}
+						agents={agents}
 						handleSubmit={handlePipelineSubmit}
 						handleReset={handlePipelineReset}
 						isDirty={isPipelineDirty}

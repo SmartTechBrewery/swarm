@@ -43,6 +43,7 @@ import { logger } from '@/lib/logger.js';
 import { gitEnvironmentForCwd, HANDOFF_FILENAMES, readHandoff } from '@/scm/delivery.js';
 import { type TriggerPhase, TriggerPhaseSchema } from '@/triggers/types.js';
 import type { BlockedRecoveryReason } from '@/worktree/reclaim.js';
+import { DEFAULT_MAX_CONTINUATIONS } from './continuation-budget.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -132,15 +133,8 @@ export function tryReadCheckpoint(cwd: string): Checkpoint | undefined {
 	}
 }
 
-/**
- * The hard ceiling on one run's checkpoint continuations, by default. It bounds a
- * run whose checkpoint keeps advancing — which the no-progress limit below never
- * ends — so a phase too large for its budget is still surfaced to a human
- * eventually rather than handed off indefinitely. Six matches
- * `MAX_RATE_LIMIT_RETRIES` and leaves room for a large task that progresses on
- * every stop (issue #1256).
- */
-export const DEFAULT_MAX_CONTINUATIONS = 6;
+/** Re-exported so every existing importer is unchanged; the value lives in `./continuation-budget.ts`. */
+export { DEFAULT_MAX_CONTINUATIONS };
 
 /** The project's ceiling on total checkpoint continuations — `pipeline.maxContinuations`, or the coded default. */
 export function resolveMaxContinuations(project: ProjectConfig): number {
