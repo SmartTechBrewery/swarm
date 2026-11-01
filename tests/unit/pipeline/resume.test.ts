@@ -36,6 +36,7 @@ import { AgentRunError } from '@/harness/agent-failure.js';
 import { CHECKPOINT_FILENAME } from '@/pipeline/checkpoint.js';
 import {
 	acquireResumableWorktree,
+	canResumeSessionOnRetry,
 	checkpointFallbackApplies,
 	executeRecoveryGate,
 	repairSessionId,
@@ -792,5 +793,32 @@ describe('repairSessionId (issue #865)', () => {
 	it('falls back to the id this phase resumed with, on every CLI', () => {
 		for (const cli of ['claude', 'codex', 'antigravity'] as const)
 			expect(repairSessionId(cli, mockAgentResult(undefined), session, true)).toBe('prior-19');
+	});
+});
+
+describe('canResumeSessionOnRetry (issue #1266)', () => {
+	const agent = (cli: AgentCliResult['cli'], sessionId?: string): AgentCliResult => ({
+		...mockAgentResult(sessionId),
+		cli,
+	});
+
+	it('refuses a self-minting CLI that reported no session — there is nothing to resume', () => {
+		// Codex rate-limited at start-up never created a thread; resuming SWARM's own
+		// id is refused with "no rollout found for thread id".
+		expect(canResumeSessionOnRetry(agent('codex'))).toBe(false);
+		expect(canResumeSessionOnRetry(agent('antigravity'))).toBe(false);
+	});
+
+	it('resumes a session the CLI reported, on every CLI', () => {
+		for (const cli of ['claude', 'codex', 'antigravity'] as const)
+			expect(canResumeSessionOnRetry(agent(cli, 'thread-1'))).toBe(true);
+	});
+
+	it('resumes claude on its assigned id, which it accepts', () => {
+		expect(canResumeSessionOnRetry(agent('claude'))).toBe(true);
+	});
+
+	it('keeps the previous answer when there is no agent result to judge by', () => {
+		expect(canResumeSessionOnRetry(undefined)).toBe(true);
 	});
 });

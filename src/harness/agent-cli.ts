@@ -597,7 +597,9 @@ function buildSessionArgs(
  * #860).
  *
  * The asymmetry itself is expressed above; this is the read side, for a caller
- * deciding whether an *assigned* id is a usable resume handle at all.
+ * deciding whether an *assigned* id is a usable resume handle at all. A refused
+ * Codex resume that slips through anyway falls back to a fresh session inside
+ * {@link runAgentCli} (issue #1266).
  * `buildSessionArgs` keeps its own branching, so a fourth CLI still has to state
  * its resume shape there rather than inherit one from here.
  */
@@ -633,7 +635,52 @@ async function resolveAntigravityArgs(
 	};
 }
 
+/**
+ * What `codex exec resume <id>` prints, on stderr, when it has no rollout for the
+ * thread it was asked to resume — an id Codex never minted (issue #865's assigned
+ * id, issue #1266's run id) or a rollout since pruned. Observed verbatim:
+ * `Error: thread/resume: thread/resume failed: no rollout found for thread id <id>
+ * (code -32600)`, exit 1 in well under a second without reaching the model.
+ */
+const CODEX_NO_ROLLOUT = /no rollout found for thread id/i;
+
+/**
+ * Whether a run was a Codex resume that Codex refused for want of a rollout —
+ * the one failure {@link runAgentCli} answers by starting a fresh session rather
+ * than reporting it. Only a genuine exit of its own counts: a timed-out or
+ * aborted run stopped for SWARM's reasons, not Codex's.
+ */
+function isRefusedCodexResume(options: RunAgentCliOptions, result: AgentCliResult): boolean {
+	return (
+		result.cli === 'codex' &&
+		options.resumeSessionId !== undefined &&
+		!result.timedOut &&
+		!result.aborted &&
+		options.signal?.aborted !== true &&
+		result.exitCode !== 0 &&
+		CODEX_NO_ROLLOUT.test(result.stderr)
+	);
+}
+
+/**
+ * Run an agent CLI to completion. A Codex resume refused with "no rollout found"
+ * (see {@link CODEX_NO_ROLLOUT}) is retried once, in the same call, as a fresh
+ * session: the checkout and the phase prompt are both still there, so a fresh turn
+ * is strictly better than a terminal failure that drops the dispatch (issue #1266).
+ * The fresh run reports Codex's own newly minted thread, which is what a later
+ * resume then uses.
+ */
 export async function runAgentCli(options: RunAgentCliOptions): Promise<AgentCliResult> {
+	const result = await runAgentCliOnce(options);
+	if (!isRefusedCodexResume(options, result)) return result;
+	logger.warn('codex refused to resume a thread it has no rollout for; starting a fresh session', {
+		...options.logContext,
+		resumeSessionId: options.resumeSessionId,
+	});
+	return runAgentCliOnce({ ...options, resumeSessionId: undefined });
+}
+
+async function runAgentCliOnce(options: RunAgentCliOptions): Promise<AgentCliResult> {
 	const cli = AgentCliSchema.parse(options.cli);
 	const command = options.command ?? DEFAULT_COMMAND[cli];
 	// Resolve the logical (model, reasoning) into the concrete `--model` value and

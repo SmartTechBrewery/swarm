@@ -367,6 +367,49 @@ describe('deriveRetryJobPayload', () => {
 		expect(next.resumeSession).toBe(true);
 	});
 
+	// Issue #1266: a self-minting CLI never learns the assigned id the job carries, so a
+	// resumable retry must resume the id the CLI itself reported.
+	const RUN_ID = 'fad75e02-8743-496a-b9d0-01a8ce5e2a89';
+
+	it('resumes the session id the CLI reported rather than the assigned one', () => {
+		const next = deriveRetryJobPayload(
+			createMockScmWebhookJob({ agentSessionId: RUN_ID, runId: RUN_ID }),
+			{
+				phase: 'resolve-conflicts',
+				runId: RUN_ID,
+				resumable: true,
+				resumeSessionId: '019f57a7-cf1b-72d3-b887-63758a10f3a8',
+			},
+		);
+
+		expect(next.resumeSession).toBe(true);
+		expect(next.agentSessionId).toBe('019f57a7-cf1b-72d3-b887-63758a10f3a8');
+	});
+
+	it('falls back to the prior id when the deferral reports none', () => {
+		const next = deriveRetryJobPayload(
+			createMockScmWebhookJob({
+				agentSessionId: '0b6f1c2e-3d4a-4b5c-8d6e-7f8091a2b3c4',
+				runId: RUN_ID,
+			}),
+			{ phase: 'review', runId: RUN_ID, resumable: true },
+		);
+
+		expect(next.resumeSession).toBe(true);
+		expect(next.agentSessionId).toBe('0b6f1c2e-3d4a-4b5c-8d6e-7f8091a2b3c4');
+	});
+
+	it('mints a fresh id and resumes nothing on a non-resumable retry', () => {
+		const next = deriveRetryJobPayload(
+			createMockScmWebhookJob({ agentSessionId: RUN_ID, runId: RUN_ID }),
+			{ phase: 'resolve-conflicts', runId: RUN_ID, resumable: false },
+		);
+
+		expect(next.resumeSession).toBeUndefined();
+		expect(next.agentSessionId).toBeDefined();
+		expect(next.agentSessionId).not.toBe(RUN_ID);
+	});
+
 	it('leaves an operator-selected recovery mode alone', () => {
 		const next = deriveRetryJobPayload(
 			createMockScmWebhookJob({ recoveryMode: 'resume', runId: 'run-1' }),

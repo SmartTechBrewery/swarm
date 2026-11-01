@@ -149,7 +149,11 @@ import {
 } from '../pipeline/resolve-conflicts.js';
 import { type RespondCiOutcome, runRespondToCiPhase } from '../pipeline/respond-to-ci.js';
 import { runRespondToReviewPhase } from '../pipeline/respond-to-review.js';
-import { BlockedRecoveryError, checkpointFallbackApplies } from '../pipeline/resume.js';
+import {
+	BlockedRecoveryError,
+	canResumeSessionOnRetry,
+	checkpointFallbackApplies,
+} from '../pipeline/resume.js';
 import {
 	REVIEW_VERDICTS,
 	type ReviewAutomationOutcome,
@@ -373,6 +377,12 @@ export type JobOutcome =
 			 * whether the captured `agentSessionId` is kept on the deferred row.
 			 */
 			resumable: boolean;
+			/**
+			 * The session id the stopped run's CLI itself reported, which a
+			 * {@link resumable} retry resumes in preference to the job's assigned id
+			 * (issue #1266) — a self-minting CLI never learns SWARM's.
+			 */
+			resumeSessionId?: string;
 			/**
 			 * Set when this deferral is a **Tier 2 checkpoint continuation** (issue #503,
 			 * `docs/CHECKPOINTS.md`): native session resume could not serve the stop, but
@@ -968,6 +978,7 @@ function deferAgentRunError(
 	projectId: string,
 	error: string,
 	runId: string | undefined,
+	agent: Pick<AgentCliResult, 'cli' | 'sessionId'> | undefined,
 	checkpointFallback?: CheckpointFallback,
 ): Extract<JobOutcome, { status: 'phase-deferred' }> | undefined {
 	// The Tier 2 bound sits with the other caps rather than in the settle: a run whose
@@ -1021,6 +1032,10 @@ function deferAgentRunError(
 
 	const retryDelayMs = retryDelayForFailure(failure, Date.now());
 	const carriedContinuation = carriedContinuationFor(failure, job);
+	const resumable =
+		checkpointFallback === undefined &&
+		(failure.kind === 'rate-limit' || failure.kind === 'timeout' || failure.kind === 'stalled') &&
+		canResumeSessionOnRetry(agent);
 	logger.warn(deferredPhaseMessage(failure, trigger.phase), {
 		projectId,
 		phase: trigger.phase,
@@ -1046,8 +1061,7 @@ function deferAgentRunError(
 		// lives in the agent's CLI session (and, for implementer phases, whose
 		// partial edits live in the worktree) — resume it instead of redoing it.
 		// Every phase and CLI now captures a resumable session id (agent-cli.ts), so
-		// this is no longer gated to claude or the PM phases; a run whose session
-		// wasn't captured simply persists no id and retries from scratch.
+		// this is no longer gated to claude or the PM phases.
 		//
 		// A `capacity` deferral (Codex "at capacity", Claude 529/overloaded — issue
 		// #229) deliberately stays fresh: the provider rejected the request before
@@ -1059,9 +1073,13 @@ function deferAgentRunError(
 		// A Tier 2 continuation is never `resumable` (issue #503): there is no session
 		// worth carrying — that is precisely why it fell back to the checkpoint — so the
 		// settle drops the captured id and the retry mints a fresh one.
-		resumable:
-			checkpointFallback === undefined &&
-			(failure.kind === 'rate-limit' || failure.kind === 'timeout' || failure.kind === 'stalled'),
+		//
+		// Nor is a self-minting CLI's run that never reported a session (issue #1266):
+		// Codex rate-limited at start-up has created no thread, and resuming SWARM's own
+		// assigned id instead is refused with "no rollout found" — so it persists no id
+		// and retries from scratch. A resumable retry resumes the id the CLI reported.
+		resumable,
+		resumeSessionId: resumable ? agent?.sessionId : undefined,
 		checkpoint: checkpointContinuation?.checkpoint,
 		continuationCount: checkpointContinuation?.continuationCount,
 		continuationProgressCount: checkpointContinuation?.progressCount,
@@ -1218,6 +1236,8 @@ async function deferPreservedWorkRetry(
 		attempt,
 		runId,
 		resumable: preserved === 'session',
+		resumeSessionId:
+			preserved === 'session' && err instanceof AgentRunError ? err.agent?.sessionId : undefined,
 		checkpoint:
 			checkpointFallback?.kind === 'continue' || checkpointFallback?.kind === 'exhausted'
 				? checkpointFallback.checkpoint
@@ -1611,6 +1631,7 @@ async function settleDispatchRetry(
 		phase: outcome.phase,
 		runId: outcome.runId,
 		resumable: outcome.resumable,
+		resumeSessionId: outcome.resumeSessionId,
 		// Tier 2 (issue #503): the retry adopts the preserved checkout on the strength of
 		// the checkpoint rather than a session, so it runs `recoveryMode: 'checkpoint'`
 		// with a fresh session id.
@@ -5137,6 +5158,7 @@ async function handlePhaseFailure(
 			project.id,
 			error,
 			runId,
+			err instanceof AgentRunError ? err.agent : undefined,
 			checkpointFallback,
 		);
 		if (deferred) return deferred;
