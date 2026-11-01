@@ -15,19 +15,29 @@ import {
 // The handler gates dispatch on a Redis-backed dedup claim; mock it so these
 // tests stay pure-in-memory. `claimReviewDispatch` defaults to granting the
 // claim (the common path); individual tests flip it to exercise a skip.
-const { claimReviewDispatch, refreshReviewDispatchClaim, reviewDispatchClaimTtlSec } = vi.hoisted(
-	() => ({
-		claimReviewDispatch: vi.fn(),
-		refreshReviewDispatchClaim: vi.fn(),
-		// Read only to describe a *declined* claim to the operator (issue #1019);
-		// defaults to "no lease could be read", the shape a down Redis produces.
-		reviewDispatchClaimTtlSec: vi.fn(),
-	}),
-);
+const {
+	claimReviewDispatch,
+	refreshReviewDispatchClaim,
+	reviewDispatchClaimTtlSec,
+	markReviewDispatchClaimedWithoutChecks,
+	reviewClaimedWithoutChecksTtlSec,
+} = vi.hoisted(() => ({
+	claimReviewDispatch: vi.fn(),
+	refreshReviewDispatchClaim: vi.fn(),
+	// Read only to describe a *declined* claim to the operator (issue #1019);
+	// defaults to "no lease could be read", the shape a down Redis produces.
+	reviewDispatchClaimTtlSec: vi.fn(),
+	// The check-less Review's claim mark and its read (issue #1270); the read
+	// defaults to "not held by such a Review", the ordinary collision.
+	markReviewDispatchClaimedWithoutChecks: vi.fn(),
+	reviewClaimedWithoutChecksTtlSec: vi.fn(),
+}));
 vi.mock('@/triggers/review-dispatch-dedup.js', () => ({
 	claimReviewDispatch,
 	refreshReviewDispatchClaim,
 	reviewDispatchClaimTtlSec,
+	markReviewDispatchClaimedWithoutChecks,
+	reviewClaimedWithoutChecksTtlSec,
 	reviewDispatchClaimOwner: (dispatchId: string) => `pr-review:${dispatchId}`,
 	buildReviewDispatchKey: (repo: string, prNumber: string, headSha: string) =>
 		`${repo}:${prNumber}:${headSha}`,
@@ -205,6 +215,10 @@ beforeEach(() => {
 	reviewDispatchClaimTtlSec.mockResolvedValue(undefined);
 	refreshReviewDispatchClaim.mockReset();
 	refreshReviewDispatchClaim.mockResolvedValue(undefined);
+	markReviewDispatchClaimedWithoutChecks.mockReset();
+	markReviewDispatchClaimedWithoutChecks.mockResolvedValue(undefined);
+	reviewClaimedWithoutChecksTtlSec.mockReset();
+	reviewClaimedWithoutChecksTtlSec.mockResolvedValue(undefined);
 	claimRespondToCiAttempt.mockReset();
 	claimRespondToCiAttempt.mockResolvedValue({ allowed: true, attempt: 1 });
 	claimConflictResolution.mockReset();
@@ -3706,5 +3720,157 @@ describe('names why a dispatch was skipped (issue #1248)', () => {
 
 		expect(loggerInfo).not.toHaveBeenCalled();
 		expect(loggerWarn).not.toHaveBeenCalled();
+	});
+});
+
+/**
+ * A red check suite on a head Review took before its checks registered (issue
+ * #1270). Live on `rover#346` and `under-control-mobile#292`, both `if-present`:
+ * the `opened` event read a head GitHub had not registered its workflow on yet,
+ * Review was dispatched and took the PR+SHA claim, and the red suite ~2 minutes
+ * later was dropped as a duplicate — Respond-to-CI never ran and the approved red
+ * head was refused its merge. The claim is now marked as taken without checks, and
+ * a red event that meets it re-checks once it lapses.
+ */
+describe('review trigger — red after a Review taken without checks (issue #1270)', () => {
+	const IF_PRESENT = createMockProjectConfig({ reviewChecks: 'if-present' });
+	const KEY = `${IF_PRESENT.repo}:42:abc123`;
+	const opened = {
+		kind: 'pull-request',
+		action: 'opened',
+		workItemId: '42',
+		headSha: 'abc123',
+		isDraft: false,
+		isCrossRepo: false,
+	} as const;
+	const red = {
+		kind: 'checks',
+		action: 'completed',
+		workItemId: '42',
+		headSha: 'abc123',
+		prBranch: 'issue-42',
+	} as const;
+
+	beforeEach(() => {
+		getPullRequest.mockResolvedValue({
+			number: 42,
+			headBranch: 'issue-42',
+			headSha: 'abc123',
+			baseBranch: 'main',
+			baseSha: 'base123',
+			mergeable: true,
+			authorLogin: 'operator-human',
+			state: 'open',
+		});
+	});
+
+	it('reaches Respond-to-CI: opened with no registered checks → Review → red suite', async () => {
+		// 1. `opened` before GitHub registered the workflow: reviewed at once, and
+		//    the claim is marked as taken without checks.
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([]));
+		expect(await handler.handle(ctx(opened, { project: IF_PRESENT }))).toMatchObject({
+			phase: 'review',
+			headSha: 'abc123',
+		});
+		expect(markReviewDispatchClaimedWithoutChecks).toHaveBeenCalledExactlyOnceWith(KEY);
+
+		// 2. The suite completes red while that Review holds the slot: not dropped,
+		//    but re-checked once the claim lapses.
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['Verify', 'completed', 'failure']]));
+		claimReviewDispatch.mockResolvedValue(false);
+		reviewClaimedWithoutChecksTtlSec.mockResolvedValue(180);
+		const noteDecline = vi.fn();
+		expect(await handler.handle(ctx(red, { project: IF_PRESENT, noteDecline }))).toBeNull();
+
+		expect(reviewClaimedWithoutChecksTtlSec).toHaveBeenCalledWith(KEY);
+		expect(scheduleCoalescedJob).toHaveBeenCalledTimes(1);
+		const [job, coalesceKey, delayMs, waitReason] = scheduleCoalescedJob.mock.calls[0];
+		expect(job).toMatchObject({
+			type: 'scm',
+			event: expect.objectContaining({ headSha: 'abc123' }),
+		});
+		// Off the CI-wait budget: it waits on a lease, not on CI.
+		expect(job).not.toHaveProperty('recheckAttempt');
+		expect(coalesceKey).toBe(`check-suite:${IF_PRESENT.repo}:42:abc123`);
+		expect(delayMs).toBe(185_000);
+		expect(waitReason).toBe('recheck');
+		expect(noteDecline).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({ kind: 'recheck-scheduled', retryAfterSec: 185 }),
+		);
+		// Nothing spent on the way: no fix attempt, no lease extension.
+		expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+		expect(refreshReviewDispatchClaim).not.toHaveBeenCalled();
+
+		// 3. The re-check, once the claim lapsed, wins the slot and starts the fix.
+		claimReviewDispatch.mockResolvedValue(true);
+		expect(await handler.handle(ctx(red, { project: IF_PRESENT }))).toEqual({
+			phase: 'respond-to-ci',
+			taskId: '42-ci',
+			prNumber: '42',
+			prBranch: 'issue-42',
+			headSha: 'abc123',
+		});
+	});
+
+	// Every other holder keeps the ordinary drop — above all a CI fix already
+	// running on this head, whose lease rewrote the mark away: two fixes for one
+	// head is what the shared slot exists to prevent.
+	it('still drops a red event whose slot another holder has', async () => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['Verify', 'completed', 'failure']]));
+		claimReviewDispatch.mockResolvedValue(false);
+		const noteDecline = vi.fn();
+
+		expect(await handler.handle(ctx(red, { project: IF_PRESENT, noteDecline }))).toBeNull();
+
+		expect(scheduleCoalescedJob).not.toHaveBeenCalled();
+		expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+		expect(noteDecline).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({ kind: 'dispatch-claim-held' }),
+		);
+	});
+
+	// A green collision is a genuine duplicate Review: it never consults the mark.
+	it('does not re-check a green event that meets a check-less Review', async () => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['Verify', 'completed', 'success']]));
+		claimReviewDispatch.mockResolvedValue(false);
+		reviewClaimedWithoutChecksTtlSec.mockResolvedValue(180);
+
+		expect(await handler.handle(ctx(red, { project: IF_PRESENT }))).toBeNull();
+
+		expect(reviewClaimedWithoutChecksTtlSec).not.toHaveBeenCalled();
+		expect(scheduleCoalescedJob).not.toHaveBeenCalled();
+	});
+
+	it('marks a check-less Review dispatched off a push too (issue #1107)', async () => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([]));
+
+		expect(
+			await handler.handle(ctx({ ...opened, action: 'updated' }, { project: IF_PRESENT })),
+		).toMatchObject({ phase: 'review' });
+		expect(markReviewDispatchClaimedWithoutChecks).toHaveBeenCalledExactlyOnceWith(KEY);
+	});
+
+	it('does not mark a Review dispatched off checks that passed', async () => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['Verify', 'completed', 'success']]));
+
+		expect(await handler.handle(ctx(red, { project: IF_PRESENT }))).toMatchObject({
+			phase: 'review',
+		});
+		expect(markReviewDispatchClaimedWithoutChecks).not.toHaveBeenCalled();
+	});
+
+	// A check-less Review the verdict ledger already records for this head is not
+	// dispatched again, so there is no new holder to mark.
+	it('does not mark a head whose review is already submitted', async () => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([]));
+		reserveReviewVerdict.mockResolvedValue({
+			status: 'reused',
+			id: 'v1',
+			ordinal: 1,
+			state: 'submitted',
+		});
+
+		expect(await handler.handle(ctx(opened, { project: IF_PRESENT }))).toBeNull();
+		expect(markReviewDispatchClaimedWithoutChecks).not.toHaveBeenCalled();
 	});
 });
