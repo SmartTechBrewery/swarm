@@ -543,6 +543,22 @@ export function repairSessionId(
 	return acceptsAssignedSessionId(cli) ? session.sessionId : undefined;
 }
 
+/**
+ * Whether a deferred run's retry can resume a session at all: the CLI reported
+ * one, or it is a CLI that accepts SWARM's assigned id (claude). A self-minting
+ * CLI (codex, agy) that died before announcing its id has nothing to resume —
+ * the retry would hand it SWARM's own id, and `codex exec resume <assigned id>`
+ * is refused with "no rollout found" (issue #1266, the deferral twin of
+ * {@link repairSessionId}'s #865). No agent result at all is not evidence either
+ * way, so it keeps the previous answer.
+ */
+export function canResumeSessionOnRetry(
+	agent: Pick<AgentCliResult, 'cli' | 'sessionId'> | undefined,
+): boolean {
+	if (agent === undefined) return true;
+	return agent.sessionId !== undefined || acceptsAssignedSessionId(agent.cli);
+}
+
 export async function cleanupUnlessPreserved(
 	worktrees: GitWorktreeManager,
 	taskId: string,

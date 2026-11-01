@@ -36,6 +36,13 @@ export interface DeferredRetryIntent {
 	/** Resume the preserved agent session on retry (rate-limit/timeout/stalled). */
 	resumable: boolean;
 	/**
+	 * The session id the stopped run's CLI itself reported, which a {@link resumable}
+	 * retry resumes in preference to the job's assigned id (issue #1266): a
+	 * self-minting CLI (codex, agy) never learns SWARM's id, so resuming that one
+	 * addresses a session that does not exist.
+	 */
+	resumeSessionId?: string;
+	/**
 	 * Continue from the Tier 2 checkpoint in the preserved worktree instead of a
 	 * session (issue #503, `docs/CHECKPOINTS.md`). Mutually exclusive with
 	 * {@link resumable} by construction — the fallback is only chosen when no session
@@ -207,6 +214,22 @@ function dependencyBlockersPatch(
 		: {};
 }
 
+/**
+ * The session half of a re-derived retry: resume the id the stopped run's CLI
+ * reported, falling back to the job's prior id — the assigned one, which only a
+ * CLI that accepts it can resume, and which the deferral only marks resumable for
+ * such a CLI (`canResumeSessionOnRetry`, issue #1266). A non-resumable retry mints
+ * a fresh id to assign.
+ */
+function sessionPatch(
+	intent: DeferredRetryIntent,
+	priorSessionId: string | undefined,
+): Pick<SwarmJob, 'resumeSession' | 'agentSessionId'> {
+	if (!intent.resumable) return { agentSessionId: randomUUID() };
+	const resumeId = intent.resumeSessionId ?? priorSessionId;
+	return { resumeSession: true, ...(resumeId ? { agentSessionId: resumeId } : {}) };
+}
+
 export function deriveRetryJobPayload(parsed: SwarmJob, intent: DeferredRetryIntent): SwarmJob {
 	// The blockers a dependency wait names (issue #1087) describe the deferral that
 	// recorded them, so they are dropped here and re-recorded only when this deferral
@@ -298,9 +321,7 @@ export function deriveRetryJobPayload(parsed: SwarmJob, intent: DeferredRetryInt
 		// assign-upfront flag, the harness falls back to it when a run dies before
 		// emitting a parseable `session_id`, which is what lets Tier 1 resume a run
 		// that produced no output. codex/agy ignore it and capture their own.
-		...(intent.resumable
-			? { resumeSession: true, ...(priorSessionId ? { agentSessionId: priorSessionId } : {}) }
-			: { agentSessionId: randomUUID() }),
+		...sessionPatch(intent, priorSessionId),
 		// Tier 2 (issue #503): the preserved checkout is adopted on the strength of its
 		// checkpoint, so the attempt runs through the recovery gate's `'checkpoint'`
 		// branch — with a *fresh* session id, since a continuation carries no session to

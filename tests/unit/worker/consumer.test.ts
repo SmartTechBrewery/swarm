@@ -21,7 +21,7 @@ import { buildPreplanContract, embedPreplanMarker } from '@/pipeline/preplan.js'
 import { BlockedRecoveryError } from '@/pipeline/resume.js';
 import type { PMProvider, WorkItem, WorkItemAssignee } from '@/pm/types.js';
 import type { CancellationOrigin } from '@/queue/cancellation.js';
-import type { SwarmJob } from '@/queue/jobs.js';
+import { phaseRecoveryFromAssignment, type SwarmJob } from '@/queue/jobs.js';
 import { TRANSPORT_LOST_ORPHAN_REASON } from '@/router/transport-loss-reaper.js';
 import { DeliveryDeferredError, HANDOFF_FILENAMES, validatePreparedTree } from '@/scm/delivery.js';
 import { GitWorktreeManager } from '@/worker/git-worktree-manager.js';
@@ -9178,6 +9178,64 @@ describe('processJob', () => {
 				'run-1',
 				expect.objectContaining({ status: 'failed', engine: 'codex' }),
 			);
+		});
+	});
+
+	/**
+	 * Issue #1266: Codex mints its own thread id and never learns SWARM's, so a run
+	 * rate-limited before Codex reported a thread has nothing to resume. Its retry must
+	 * start a fresh session — resuming the assigned id (the run id) is refused with
+	 * "no rollout found", which used to settle the dispatch terminally.
+	 */
+	describe('a Codex run rate-limited at start-up (issue #1266)', () => {
+		const ASSIGNED_ID = 'fad75e02-8743-496a-b9d0-01a8ce5e2a89';
+
+		beforeEach(() => {
+			getRunByIdFromDb.mockResolvedValue(undefined);
+		});
+
+		const rateLimitedCodex = (sessionId?: string) => async () => {
+			throw new AgentRunError(
+				'Resolve-conflicts agent (codex) exited with code 1 (rate limited)',
+				{ kind: 'rate-limit' },
+				agentResult({ cli: 'codex', exitCode: 1, sessionId }),
+			);
+		};
+
+		const retriedPayload = () => scheduleDispatchRetry.mock.calls[0][1].jobPayload as SwarmJob;
+
+		it('defers, then retries as a fresh session rather than resuming the assigned id', async () => {
+			phaseImpl = rateLimitedCodex();
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ agentSessionId: ASSIGNED_ID }),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-deferred');
+			expect(outcome).toMatchObject({ resumable: false });
+			expect(completeRun).toHaveBeenCalledExactlyOnceWith(
+				'run-1',
+				expect.objectContaining({ status: 'deferred', agentSessionId: null }),
+			);
+			expect(retriedPayload().resumeSession).toBeUndefined();
+			expect(retriedPayload().agentSessionId).toBeDefined();
+			expect(retriedPayload().agentSessionId).not.toBe(ASSIGNED_ID);
+			expect(phaseRecoveryFromAssignment(retriedPayload()).resumeSessionId).toBeUndefined();
+		});
+
+		it('resumes the thread Codex reported, not the assigned id', async () => {
+			const THREAD_ID = '019f57a7-cf1b-72d3-b887-63758a10f3a8';
+			phaseImpl = rateLimitedCodex(THREAD_ID);
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ agentSessionId: ASSIGNED_ID }),
+				registryReturning(RESPOND_TO_CI_TRIGGER),
+			);
+
+			expect(outcome).toMatchObject({ status: 'phase-deferred', resumable: true });
+			expect(retriedPayload()).toMatchObject({ resumeSession: true, agentSessionId: THREAD_ID });
+			expect(phaseRecoveryFromAssignment(retriedPayload()).resumeSessionId).toBe(THREAD_ID);
 		});
 	});
 
