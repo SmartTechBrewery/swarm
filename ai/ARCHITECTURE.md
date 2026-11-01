@@ -948,7 +948,8 @@ base-branch sweep use — so "merges only once the fresh CI is green" is SWARM's
 own guarantee rather than a property of the repository's branch protection;
 pending defers on the ordinary backoff, and **red settles terminally** as
 `merge-not-eligible`, which is the two-green-pull-requests case this whole issue
-exists for. (4) A conflicting update settles `merge-not-eligible`, an
+exists for. (4) A conflicting update settles `merge-not-eligible` and hands the
+pull request to Resolve-conflicts (issue #1264, below), an
 `unsupported` provider hands the update to a SWARM worker (below), and a
 `provider-error` rides the same shared bounded retry as the merge call's own
 (issue #923) rather than settling; the conflicting update, a head that moved
@@ -1084,8 +1085,9 @@ under its own claim through the *same* branches the provider's update takes
 (`applyBranchUpdate`): `updated` advances `approvedHeadSha` (`baseUpdates + 1`,
 `reviewedHeadSha` untouched), pre-claims the new head's review slot and resets the
 budget, so the fresh-CI wait, `MAX_BASE_UPDATES` and the merge follow unchanged;
-`conflict` and `head-moved` settle `merge-not-eligible` with the same comments and
-the same supersession stamp; `up-to-date` lets the attempt merge as usual. GitHub
+`conflict` and `head-moved` settle `merge-not-eligible` with the same comments,
+the same supersession stamp and, for `conflict`, the same Resolve-conflicts
+hand-off; `up-to-date` lets the attempt merge as usual. GitHub
 never takes this path — its update is supported — so the fallback runs only on
 `unsupported`. **Known limits:** a catch-up run that fails outright hands nothing
 back, and an older worker ignores `catchUpOnly` and runs an ordinary resolution;
@@ -1171,13 +1173,37 @@ cause was only that the head moved: it asks one provider-neutral
 `src/dispatch/force-re-review.ts` already makes, rather than widening
 `MergePullRequestOutcome` with structured refusal reasons across three adapters
 — and stamps the slot when the current head is not the reviewed one. It is
-written on the two head-moved paths only (the terminal `not-eligible`, and the
-`head-moved` answer to a branch update), never on the red-merged-tree refusal,
-which is a genuine failure of the combination and must keep its slot. The job
+written on the two head-moved paths (the terminal `not-eligible`, and the
+`head-moved` answer to a branch update) and on a conflicting update (issue
+#1264, below) — never on the red-merged-tree refusal, which is a genuine failure
+of the combination and must keep its slot. The job
 carries a new optional `reviewedHeadSha` so the ledger key survives the base
 update above rewriting `approvedHeadSha`, and the whole write is best-effort: a
 read or write failure degrades to the old behaviour, never to a merge SWARM
 should not have made.
+
+**A conflicting approved head is handed to Resolve-conflicts (issue #1264).** A
+sibling that merges into the base while a pull request's Review is running fans
+its per-PR conflict checks out at once — before that Review approves — so the
+pull request could reach merge automation conflicting with nothing left to
+notice: the update answered `conflict`, the dispatch settled
+`merge-not-eligible`, and the approved pull request sat there until an operator
+scheduled its conflict check by hand (`SmartTechBrewery/under-control-mobile`
+#265 and #244). The conflicting-update settle (`settleConflictingUpdate`, both the
+provider's update and a SWARM worker's) now schedules that check itself:
+`scheduleCoalescedDispatch` of `buildConflictCheckJob` — the fan-out's own
+synthetic `closed`/`merged` event carrying `conflictPrNumber` — under the
+fan-out's own coalesce key `resolve-conflicts:<repo>:<pr>:<base>`
+(`conflictCheckCoalesceKey`), so a check the fan-out already has pending is
+replaced rather than doubled, and the per-PR path still decides ownership,
+mergeability and the head/base claim. The base is read off the pull request (one
+`getPullRequest`, which also skips a closed one), falling back to the project's
+configured base when the read fails. The same settle stamps the approval
+superseded **without** the head-moved read: the approval was sound and the base
+moving is what invalidated it, so the resolved head's Review must not spend a
+`REVIEW_VERDICT_CAP` slot per lost race — which is how #244 used all three and
+then needed Force re-review. `REVIEW_SUPERSEDED_CAP` still bounds the loop. Both
+writes are best-effort extras on the settle, like its comment.
 
 A superseded slot stays `submitted` — the prior-review signal, the Force
 re-review slot read and the override grant all still need it — but frees both its
