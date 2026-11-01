@@ -379,7 +379,11 @@ giving a machine work is that one of its agent CLIs reported its usage allowance
 spent on a real run (issue #981). That is recorded per `(machine, CLI)` with the
 instant the allowance is expected back, and it is **not** a drain: nobody set it,
 nothing clears it by hand, it lapses by itself at that instant, and the machine goes
-on taking work on its *other* CLIs throughout. Read it in the two places it is
+on taking work on its *other* CLIs throughout. That instant is the reset the CLI
+reported — Codex's `try again at 7:15 PM` or `try again at Nov 4th, 2026 7:35 AM` is
+read in the machine's own timezone, since that is the clock Codex prints — even when it
+is days away (up to eight), or 30 minutes on when the CLI named no reset it could be
+read from. Read it in the two places it is
 surfaced (issue #988): `swarm workers list` marks such a machine `rate-limited:
 <cli>` beside the `draining` suffix — naming the CLIs, because the machine as a whole
 is not idle — and the machine's dashboard page has a **Usage limits** section, above

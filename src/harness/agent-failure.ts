@@ -71,16 +71,17 @@ export interface AgentFailure {
 	/**
 	 * The CLI's verbatim reset text, in whichever phrasing it used — `resets …`
 	 * for most (e.g. `1:40pm (Europe/Warsaw)`), `try again at …` for Codex (e.g.
-	 * `8:44 PM`) — kept for logs/PR comments even when {@link retryAfter} can't be
-	 * resolved, which for a zone-less hint like Codex's is always.
+	 * `8:44 PM`, or `Nov 4th, 2026 7:35 AM`) — kept for logs/PR comments even when
+	 * {@link retryAfter} can't be resolved.
 	 */
 	resetHint?: string;
 	/**
 	 * Best-effort absolute instant the limit resets: the reset the CLI reported
 	 * itself ({@link AgentCliResult.rateLimitResetAt}) when it has one, else
-	 * parsed from {@link resetHint}. Undefined when neither is available — the
-	 * hint carries no timezone, or can't be parsed — and the caller falls back to
-	 * a default backoff.
+	 * parsed from {@link resetHint} — Codex's zone-less hint in the worker host's
+	 * own zone, which is the clock Codex printed it in. Undefined when neither is
+	 * available — the hint carries no timezone it can be read in, or can't be
+	 * parsed — and the caller falls back to a default backoff.
 	 */
 	retryAfter?: Date;
 	/**
@@ -163,10 +164,35 @@ const RATE_HTTP_RE = /\b(?:429|too many requests)\b/i;
 const RESET_RE = /resets?\s+([^\n]+)/i;
 // Codex names its reset in its own phrasing — `try again at 8:44 PM`, not
 // "resets …" — so RESET_RE never sees it. Read only out of Codex's structural
-// failure record (below), never out of free text, and captured even though the
-// observed wording carries no timezone for parseRetryAfter to resolve: the hint
-// still reaches logs and PR comments, and resolves the day Codex names a zone.
+// failure record (below), never out of free text. The wording names no timezone:
+// it is the wall clock of the machine Codex runs on, so parseCodexReset resolves it
+// in this host's own zone (issue #1265).
 const CODEX_RESET_RE = /try\s+again\s+at\s+([^\n]+)/i;
+// The two shapes that hint takes, both observed live on 2026-10-31 (issue #1265):
+// a bare clock time for a short limit (`7:15 PM`), and a date in front of it for a
+// longer one (`Nov 4th, 2026 7:35 AM`). Both are anchored at the start of the hint,
+// so a stray number elsewhere in it is never read as an hour.
+const CODEX_TIME_RESET_RE = /^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i;
+const CODEX_DATED_RESET_RE =
+	/^([a-z]{3})[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4}),?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i;
+const MONTH_PREFIXES = [
+	'jan',
+	'feb',
+	'mar',
+	'apr',
+	'may',
+	'jun',
+	'jul',
+	'aug',
+	'sep',
+	'oct',
+	'nov',
+	'dec',
+];
+// The furthest out a dated Codex reset is believed: a weekly allowance plus a day
+// of slack. Anything later is far likelier a misread than a real reset, and a
+// wrong guess is worse than the default backoff.
+const MAX_CODEX_RESET_HORIZON_MS = 8 * 24 * 60 * 60 * 1000;
 // Codex reports selected-model saturation separately from account quota.
 const CODEX_CAPACITY_RE = /selected model is at capacity/i;
 // Claude / Claude Code surface Anthropic's transient 529 overload — a documented
@@ -363,8 +389,8 @@ function codexResetHint(message: string): string | undefined {
 /**
  * Resolve a relative "resets …" hint like `in 16h39m20s` to the instant that
  * duration lands on, or undefined when the hint is not one. Needs no timezone,
- * which is what makes it the phrasing that actually reaches `retryAfter` — a
- * zone-less wall-clock hint never can (issue #1013).
+ * which is what makes it the phrasing that reliably reaches `retryAfter` — a
+ * zone-less `resets …` wall clock never can (issue #1013).
  */
 function parseRelativeReset(hint: string, now: Date): Date | undefined {
 	const match = RELATIVE_RESET_RE.exec(hint.trim());
@@ -400,36 +426,95 @@ function parseWallClockReset(hint: string, now: Date): Date | undefined {
 		if (!match) return undefined;
 		const [, rawHour, rawMinute, meridiem, timeZone] = match;
 		if (!timeZone) return undefined;
-
-		let hour = Number(rawHour);
-		const minute = rawMinute ? Number(rawMinute) : 0;
-		if (meridiem) {
-			const pm = meridiem.toLowerCase() === 'pm';
-			if (hour === 12) hour = pm ? 12 : 0;
-			else if (pm) hour += 12;
-		}
-		if (hour > 23 || minute > 59) return undefined;
-
-		// Today's date *in the target zone* — the reset time is a wall clock there.
-		const dateParts = new Intl.DateTimeFormat('en-US', {
-			timeZone,
-			year: 'numeric',
-			month: '2-digit',
-			day: '2-digit',
-		}).formatToParts(now);
-		const get = (type: string): number => Number(dateParts.find((p) => p.type === type)?.value);
-		let target = zonedWallTimeToUtc(get('year'), get('month'), get('day'), hour, minute, timeZone);
-		// A reset that already passed today means the next occurrence is tomorrow.
-		// Adding a fixed 24h (rather than re-deriving tomorrow's wall time) can skew
-		// the instant by an hour across a DST boundary — harmless here: the reset is
-		// only a hint, and the consumer buffers + clamps the delay to [6min, 6h].
-		if (target.getTime() <= now.getTime()) {
-			target = new Date(target.getTime() + 24 * 60 * 60 * 1000);
-		}
-		return target;
+		const time = clockTime(rawHour, rawMinute, meridiem);
+		return time ? nextWallClockOccurrence(time.hour, time.minute, now, timeZone) : undefined;
 	} catch {
 		return undefined;
 	}
+}
+
+/**
+ * Resolve Codex's `try again at …` hint (issue #1265) — `7:15 PM`, or the dated
+ * `Nov 4th, 2026 7:35 AM` it prints for a longer limit — in `timeZone`. Codex names
+ * no zone because it prints the wall clock of the machine it runs on, and this code
+ * runs on the worker that spawned it, so the caller passes this host's own zone
+ * ({@link hostTimeZone}). Only Codex's hint gets that reading: another CLI's
+ * zone-less `resets …` stays unresolved ({@link parseWallClockReset}), because
+ * nothing establishes that it, too, is in the host's zone.
+ *
+ * A bare time is its next occurrence, exactly as a zoned `resets …` hint is. A
+ * dated one is that date: one that does not exist (`Feb 30th`), or lies more than
+ * {@link MAX_CODEX_RESET_HORIZON_MS} away, is no reset at all, while one already
+ * past is returned as is and the retry policy floors it. Never throws (an invalid
+ * timezone makes Intl throw).
+ */
+function parseCodexReset(hint: string, now: Date, timeZone: string): Date | undefined {
+	try {
+		const dated = CODEX_DATED_RESET_RE.exec(hint);
+		if (dated) {
+			const [, rawMonth, rawDay, rawYear, rawHour, rawMinute, meridiem] = dated;
+			const month1 = MONTH_PREFIXES.indexOf(rawMonth.toLowerCase()) + 1;
+			const day = Number(rawDay);
+			const year = Number(rawYear);
+			const time = clockTime(rawHour, rawMinute, meridiem);
+			// Date.UTC rolls an impossible day over into the next month; catching that
+			// is what rejects `Feb 30th`.
+			const calendar = new Date(Date.UTC(year, month1 - 1, day));
+			if (month1 === 0 || !time || calendar.getUTCMonth() !== month1 - 1) return undefined;
+			const target = zonedWallTimeToUtc(year, month1, day, time.hour, time.minute, timeZone);
+			if (Number.isNaN(target.getTime())) return undefined;
+			return target.getTime() - now.getTime() > MAX_CODEX_RESET_HORIZON_MS ? undefined : target;
+		}
+
+		const timeOnly = CODEX_TIME_RESET_RE.exec(hint);
+		if (!timeOnly) return undefined;
+		const time = clockTime(timeOnly[1], timeOnly[2], timeOnly[3]);
+		return time ? nextWallClockOccurrence(time.hour, time.minute, now, timeZone) : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** This process's own IANA zone — the clock a CLI it spawned prints a local time in. */
+function hostTimeZone(): string {
+	return Intl.DateTimeFormat().resolvedOptions().timeZone;
+}
+
+/** A matched `h[:mm] [am|pm]` as a 24-hour clock time, or undefined when out of range. */
+function clockTime(
+	rawHour: string,
+	rawMinute: string | undefined,
+	meridiem: string | undefined,
+): { hour: number; minute: number } | undefined {
+	let hour = Number(rawHour);
+	const minute = rawMinute ? Number(rawMinute) : 0;
+	if (meridiem) {
+		const pm = meridiem.toLowerCase() === 'pm';
+		if (hour === 12) hour = pm ? 12 : 0;
+		else if (pm) hour += 12;
+	}
+	return hour > 23 || minute > 59 ? undefined : { hour, minute };
+}
+
+/** The next instant, after `now`, whose wall-clock reading in `timeZone` is `hour:minute`. */
+function nextWallClockOccurrence(hour: number, minute: number, now: Date, timeZone: string): Date {
+	// Today's date *in the target zone* — the reset time is a wall clock there.
+	const dateParts = new Intl.DateTimeFormat('en-US', {
+		timeZone,
+		year: 'numeric',
+		month: '2-digit',
+		day: '2-digit',
+	}).formatToParts(now);
+	const get = (type: string): number => Number(dateParts.find((p) => p.type === type)?.value);
+	let target = zonedWallTimeToUtc(get('year'), get('month'), get('day'), hour, minute, timeZone);
+	// A reset that already passed today means the next occurrence is tomorrow.
+	// Adding a fixed 24h (rather than re-deriving tomorrow's wall time) can skew
+	// the instant by an hour across a DST boundary — harmless here: the reset is
+	// only a hint, and the consumer buffers + clamps the delay to [6min, 6h].
+	if (target.getTime() <= now.getTime()) {
+		target = new Date(target.getTime() + 24 * 60 * 60 * 1000);
+	}
+	return target;
 }
 
 /**
@@ -463,25 +548,38 @@ function structuralRateLimit(result: AgentCliResult): boolean {
  * record names its reset first when it carries one — the terminal tail's first
  * "reset" can be an earlier line of the agent's own work (issue #1196). The
  * tail's shared "resets …" match then wins for every other CLI; Codex's own
- * `try again at …` phrasing is the fallback, and resolves to an instant only when
- * it names a zone — a missing one leaves `retryAfter` undefined and the consumer
- * on its default backoff, never a downgraded classification.
+ * `try again at …` phrasing is the fallback. `codex` says which one was chosen,
+ * because only Codex's is read in the host's zone ({@link parseCodexReset}); a
+ * hint either reader leaves unresolved keeps `retryAfter` undefined and the
+ * consumer on its default backoff, never a downgraded classification.
  */
 function rateLimitResetHint(
 	result: AgentCliResult,
 	tailResetMatch: RegExpExecArray | null,
-): string | undefined {
+): { text: string; codex: boolean } | undefined {
 	const claudeMessage = claudeRateLimitMessage(result);
-	const codexMessage = codexRateLimitMessage(result);
-	return (
+	const shared =
 		(claudeMessage ? RESET_RE.exec(claudeMessage)?.[1]?.trim() : undefined) ||
-		tailResetMatch?.[1]?.trim() ||
-		(codexMessage ? codexResetHint(codexMessage) : undefined)
-	);
+		tailResetMatch?.[1]?.trim();
+	if (shared) return { text: shared, codex: false };
+	const codexMessage = codexRateLimitMessage(result);
+	const codexHint = codexMessage ? codexResetHint(codexMessage) : undefined;
+	return codexHint ? { text: codexHint, codex: true } : undefined;
+}
+
+/** The instant a {@link rateLimitResetHint} names, read by whichever parser owns its phrasing. */
+function resolveResetHint(
+	hint: { text: string; codex: boolean } | undefined,
+	now: Date,
+	timeZone: string,
+): Date | undefined {
+	if (hint === undefined) return undefined;
+	return hint.codex ? parseCodexReset(hint.text, now, timeZone) : parseRetryAfter(hint.text, now);
 }
 
 /**
- * Classify a failed agent run. `now` is injectable so the reset-time parse is
+ * Classify a failed agent run. `now` and `timeZone` — the host zone Codex's
+ * zone-less reset is read in — are injectable so the reset-time parse is
  * deterministic under test.
  *
  * A timed-out run is a `timeout` — the harness killing it is the authoritative
@@ -520,7 +618,11 @@ function rateLimitResetHint(
  * can restore. Otherwise a stalled run is classified as `stalled`, and
  * everything else is a plain `error`.
  */
-export function classifyAgentFailure(result: AgentCliResult, now: Date = new Date()): AgentFailure {
+export function classifyAgentFailure(
+	result: AgentCliResult,
+	now: Date = new Date(),
+	timeZone: string = hostTimeZone(),
+): AgentFailure {
 	const output = `${result.stdout}\n${result.stderr}`;
 	const trimmed = output.trim();
 	const tail = terminalTail(output);
@@ -550,14 +652,13 @@ export function classifyAgentFailure(result: AgentCliResult, now: Date = new Dat
 		((USAGE_LIMIT_RE.test(tail) || RATE_HTTP_RE.test(tail)) && resetMatch !== null);
 
 	if (isRateLimited) {
-		const resetHint = rateLimitResetHint(result, resetMatch);
+		const hint = rateLimitResetHint(result, resetMatch);
 		return {
 			kind: 'rate-limit',
-			resetHint,
+			resetHint: hint?.text,
 			// The CLI's own reported reset instant wins over the parsed hint: it is
 			// exact, where a hint without a timezone can't be resolved at all.
-			retryAfter:
-				result.rateLimitResetAt ?? (resetHint ? parseRetryAfter(resetHint, now) : undefined),
+			retryAfter: result.rateLimitResetAt ?? resolveResetHint(hint, now, timeZone),
 		};
 	}
 

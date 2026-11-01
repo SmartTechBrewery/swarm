@@ -512,10 +512,116 @@ describe('classifyAgentFailure', () => {
 				codexFailure: { message: CODEX_USAGE_LIMIT_MESSAGE },
 			}),
 			NOW,
+			'Europe/Warsaw',
 		);
-		// Codex names its reset without a timezone, so the hint is kept but cannot
-		// resolve to an instant — the consumer falls back to its default backoff.
-		expect(failure).toEqual({ kind: 'rate-limit', resetHint: '8:44 PM', retryAfter: undefined });
+		// Codex names its reset in the worker host's own wall clock (issue #1265):
+		// 20:44 CEST is 18:44 UTC.
+		expect(failure).toEqual({
+			kind: 'rate-limit',
+			resetHint: '8:44 PM',
+			retryAfter: new Date('2026-07-07T18:44:00Z'),
+		});
+	});
+
+	// Issue #1265: Codex prints its reset with no zone, in the local time of the
+	// machine it runs on — a bare time for a short limit, a date in front of it for a
+	// weekly one. Both resolve in the worker host's zone.
+	describe('Codex reset times', () => {
+		function codexLimit(resetText: string, now: Date, timeZone = 'Europe/Warsaw') {
+			const message = `You’ve hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at ${resetText}.`;
+			return classifyAgentFailure(
+				result({ cli: 'codex', stdout: 'working', codexFailure: { message } }),
+				now,
+				timeZone,
+			);
+		}
+
+		it('resolves the observed time-only hint to the next such time in the host zone', () => {
+			// Run fad75e02 at 17:20 UTC on 2026-10-31 — already CET (UTC+1) after the
+			// Oct 25 DST change — so 7:15 PM is 18:15 UTC the same day.
+			const failure = codexLimit('7:15 PM', new Date('2026-10-31T17:20:00Z'));
+			expect(failure.resetHint).toBe('7:15 PM');
+			expect(failure.retryAfter).toEqual(new Date('2026-10-31T18:15:00Z'));
+		});
+
+		it('rolls a time already past today in the host zone over to tomorrow', () => {
+			// 12:00 CEST at NOW, so 9:30 AM has passed — it is tomorrow's 07:30 UTC.
+			expect(codexLimit('9:30 AM', NOW).retryAfter).toEqual(new Date('2026-07-08T07:30:00Z'));
+		});
+
+		it('resolves the observed dated hint to that date and time in the host zone', () => {
+			// Run 08a6f578 at 18:51 UTC on 2026-10-31: a weekly limit ~3.5 days away.
+			const failure = codexLimit('Nov 4th, 2026 7:35 AM', new Date('2026-10-31T18:51:00Z'));
+			expect(failure.resetHint).toBe('Nov 4th, 2026 7:35 AM');
+			expect(failure.retryAfter).toEqual(new Date('2026-11-04T06:35:00Z'));
+		});
+
+		it('reads the dated hint in whichever zone the host is in', () => {
+			const failure = codexLimit(
+				'Nov 4th, 2026 7:35 AM',
+				new Date('2026-10-31T18:51:00Z'),
+				'America/New_York',
+			);
+			// EST (UTC−5) after New York's Nov 1 DST change.
+			expect(failure.retryAfter).toEqual(new Date('2026-11-04T12:35:00Z'));
+		});
+
+		it.each([
+			['Nov 1st, 2026 7:35 AM', '2026-11-01T06:35:00Z'],
+			['Nov 2nd, 2026 7:35 AM', '2026-11-02T06:35:00Z'],
+			['Nov 3rd, 2026 7:35 AM', '2026-11-03T06:35:00Z'],
+			['Nov 4th, 2026 7:35 AM', '2026-11-04T06:35:00Z'],
+			['Nov 4, 2026 7:35 AM', '2026-11-04T06:35:00Z'],
+			['November 4th, 2026 7:35 PM', '2026-11-04T18:35:00Z'],
+			['Nov 4th, 2026 12:05 AM', '2026-11-03T23:05:00Z'],
+		])('resolves the dated hint %s', (resetText, expected) => {
+			expect(codexLimit(resetText, new Date('2026-10-31T18:51:00Z')).retryAfter).toEqual(
+				new Date(expected),
+			);
+		});
+
+		it.each([
+			['a date that does not exist', 'Feb 30th, 2026 7:35 AM', '2026-02-25T10:00:00Z'],
+			['a month that does not exist', 'Foo 4th, 2026 7:35 AM', '2026-10-31T18:51:00Z'],
+			['a date beyond a weekly horizon', 'Dec 4th, 2026 7:35 AM', '2026-10-31T18:51:00Z'],
+			['an out-of-range time', '25:15', '2026-10-31T18:51:00Z'],
+			['wording with no time in it', 'a later time', '2026-10-31T18:51:00Z'],
+		])('leaves %s unresolved, on the default backoff', (_label, resetText, now) => {
+			const failure = codexLimit(resetText, new Date(now));
+			expect(failure.kind).toBe('rate-limit');
+			expect(failure.resetHint).toBe(resetText);
+			expect(failure.retryAfter).toBeUndefined();
+		});
+
+		it('leaves the hint unresolved when the host zone is not a valid zone', () => {
+			const failure = codexLimit('7:15 PM', new Date('2026-10-31T17:20:00Z'), 'Not/AZone');
+			expect(failure.retryAfter).toBeUndefined();
+		});
+
+		it('still prefers the reset the CLI reported structurally', () => {
+			const rateLimitResetAt = new Date('2026-11-01T00:00:00Z');
+			const failure = classifyAgentFailure(
+				result({
+					cli: 'codex',
+					codexFailure: { message: CODEX_USAGE_LIMIT_MESSAGE },
+					rateLimitResetAt,
+				}),
+				NOW,
+				'Europe/Warsaw',
+			);
+			expect(failure.retryAfter).toEqual(rateLimitResetAt);
+		});
+
+		it('does not read another CLI zone-less reset in the host zone', () => {
+			// The host-zone reading is Codex's alone: nothing establishes that Claude's
+			// zone-less "resets …" is the host's wall clock.
+			const failure = classifyAgentFailure(
+				result({ stdout: "You've hit your session limit · resets 1:40pm\n" }),
+				NOW,
+				'Europe/Warsaw',
+			);
+			expect(failure).toEqual({ kind: 'rate-limit', resetHint: '1:40pm', retryAfter: undefined });
+		});
 	});
 
 	it('classifies a Codex usage limit hit before the first agent message identically', () => {

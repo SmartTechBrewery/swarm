@@ -88,8 +88,8 @@ describe('recordReportedRateLimit (issue #981)', () => {
 		});
 	});
 
-	// The record lapses at exactly the instant the deferred retry is scheduled for,
-	// because both come from the same policy call on the same failure.
+	// With no reset to follow, the record lapses at exactly the instant the deferred
+	// retry is scheduled for, because both come from the same policy call.
 	it('degrades to the shared default backoff when the frame reports no reset', async () => {
 		await recordReportedRateLimit(frame({ failureKind: 'rate-limit' }), SELECTION);
 
@@ -98,11 +98,10 @@ describe('recordReportedRateLimit (issue #981)', () => {
 		expect(input?.expiresAt.getTime()).toBe(NOW.getTime() + 30 * 60 * 1000);
 	});
 
-	// Criterion 5: no sequence of events can hold a machine back indefinitely. The
-	// ceiling is structural because the expiry goes through the shared policy rather
-	// than being stored raw — it is the longest wait a deferred wake-up survives the
-	// job-freshness gate for (`SWARM_MAX_JOB_AGE_MS`, 24 h, less a dequeue margin).
-	it('caps a reset far in the future at the shared ceiling', async () => {
+	// Criterion 5: no sequence of events can hold a machine back indefinitely. A
+	// mis-parsed reset is bounded by the cooldown's own ceiling — a little over a
+	// week, so a weekly allowance is honoured — not by the run's retry clamp.
+	it('caps a reset far in the future at the cooldown ceiling', async () => {
 		const retryAfter = new Date(NOW.getTime() + 30 * 24 * 60 * 60 * 1000);
 		await recordReportedRateLimit(
 			frame({ failureKind: 'rate-limit', retryAfter: retryAfter.toISOString() }),
@@ -110,10 +109,29 @@ describe('recordReportedRateLimit (issue #981)', () => {
 		);
 
 		const [input] = recordWorkerCliRateLimit.mock.calls[0] ?? [];
-		expect(input?.expiresAt.getTime()).toBe(expiryFor(retryAfter));
-		expect((input?.expiresAt.getTime() ?? 0) - NOW.getTime()).toBe(
-			24 * 60 * 60 * 1000 - 15 * 60 * 1000,
+		expect((input?.expiresAt.getTime() ?? 0) - NOW.getTime()).toBe(8 * 24 * 60 * 60 * 1000);
+	});
+
+	// Issue #1265: the run's retry is clamped to the longest wait a deferred wake-up
+	// survives (~24 h), but the cooldown is not — a weekly Codex limit days away would
+	// otherwise put the machine back in the routing pool every day.
+	it.each([
+		['a weekly Codex reset three and a half days out', 3.5 * 24 * 60 * 60 * 1000],
+		['a reset twelve hours out', 12 * 60 * 60 * 1000],
+	])('holds the cooldown until %s, past the run retry clamp', async (_label, away) => {
+		const retryAfter = new Date(NOW.getTime() + away);
+		await recordReportedRateLimit(
+			frame({
+				failureKind: 'rate-limit',
+				retryAfter: retryAfter.toISOString(),
+				resetHint: 'Nov 4th, 2026 7:35 AM',
+			}),
+			{ ...SELECTION, cli: 'codex', target: { cli: 'codex' } },
 		);
+
+		const [input] = recordWorkerCliRateLimit.mock.calls[0] ?? [];
+		expect(input?.expiresAt.getTime()).toBe(retryAfter.getTime() + RETRY_BUFFER_MS);
+		expect(input?.expiresAt.getTime() ?? 0).toBeGreaterThanOrEqual(expiryFor(retryAfter));
 	});
 
 	// The observed agy exhaustion (issue #1013). A six-hour ceiling used to expire this
