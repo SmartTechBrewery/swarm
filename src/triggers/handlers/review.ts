@@ -227,6 +227,18 @@
  * dispatch; a duplicate claim short-circuits to a skip. The claim happens here,
  * at the single dispatch-decision point, so the duplicate is dropped before any
  * worktree is provisioned.
+ *
+ * **A Review taken without checks does not swallow the red that follows it**
+ * (issue #1270). Review and Respond-to-CI share that slot, which is sound for a
+ * Review dispatched off completed checks — a head's checks are either green or
+ * red — but not for one dispatched on a head that reported none under
+ * `if-present`: GitHub registers a workflow's checks a moment after the PR event
+ * (`rover#346`: PR opened, Verify run created and Review dispatched within one
+ * second), so that head can still go red while the Review holds the slot. Such a
+ * claim is marked as taken without checks, and a red event that meets it
+ * re-checks the head once the claim lapses instead of being dropped as a
+ * duplicate; the re-check must still win the claim, so one head never gets two CI
+ * fixes. A repository with genuinely no CI is unaffected: no red ever arrives.
  */
 
 import type { ProjectConfig } from '../../config/schema.js';
@@ -277,7 +289,9 @@ import {
 import {
 	buildReviewDispatchKey,
 	claimReviewDispatch,
+	markReviewDispatchClaimedWithoutChecks,
 	refreshReviewDispatchClaim,
+	reviewClaimedWithoutChecksTtlSec,
 	reviewDispatchClaimOwner,
 	reviewDispatchClaimTtlSec,
 } from '../review-dispatch-dedup.js';
@@ -305,12 +319,14 @@ import { decideAggregateCheckOutcome } from './aggregate-check-decision.js';
  * common); a
  * draft/fork PR or an incomplete/deferred suite → `none`. A `review` the #841
  * `no-fix` bypass produced is marked `adjudicatedRed`, with the checks still
- * failing on its head. A red on a head this PR already approved, whose red SWARM's
- * CI agent already adjudicated, is handed to the approved-head re-run policy in
- * place (issue #1128) and resolves `none` — never back to Respond-to-CI.
+ * failing on its head; one taken on a head reporting no checks under `if-present`
+ * is marked `withoutChecks` (issue #1270). A red on a head this PR already
+ * approved, whose red SWARM's CI agent already adjudicated, is handed to the
+ * approved-head re-run policy in place (issue #1128) and resolves `none` — never
+ * back to Respond-to-CI.
  */
 type ReviewDisposition =
-	| { kind: 'review'; adjudicatedRed?: true; failedChecks?: string[] }
+	| { kind: 'review'; adjudicatedRed?: true; failedChecks?: string[]; withoutChecks?: true }
 	| { kind: 'respond-to-ci'; failedChecks: string[] }
 	| { kind: 'blocked-by-base'; baseBranch: string; baseHeadSha: string; sharedChecks: string[] }
 	| { kind: 'none' };
@@ -1113,7 +1129,11 @@ async function resolveAggregateCheckReview(
 
 	const checksPolicy = project.reviewChecks ?? 'required';
 	const decision = decideAggregateCheckOutcome(checkStatus, prNumber, checksPolicy);
-	if (decision.action === 'review') return { kind: 'review' };
+	if (decision.action === 'review') {
+		return decision.basis === 'no-checks'
+			? { kind: 'review', withoutChecks: true }
+			: { kind: 'review' };
+	}
 
 	if (decision.action === 'respond-to-ci') {
 		// The `no-fix` hand-back (issue #841) — see the module header. The red is
@@ -1225,7 +1245,7 @@ async function resolveUpdatedPullRequestReview(
 			'review: head reports no checks under if-present — reviewing on the updated event',
 			{ prNumber, headSha },
 		);
-		return { kind: 'review' };
+		return { kind: 'review', withoutChecks: true };
 	}
 	logger.debug('review: PR is mergeable on updated event; waiting for checks — skipping', {
 		prNumber,
@@ -2117,6 +2137,107 @@ async function wakeMergeWaitingOnHead(
 	await promoteMergeChecksWaits(ctx.project.id, ctx.project.repo, headSha);
 }
 
+/**
+ * Margin past a check-less Review's claim lapsing before the red head is re-read
+ * (issue #1270), so the re-read finds the slot already free rather than racing
+ * its expiry.
+ */
+const CLAIM_LAPSE_RECHECK_MARGIN_SEC = 5;
+
+/**
+ * A red head whose PR+SHA slot is held by a Review dispatched while the head
+ * reported **no** checks (issue #1270): re-read it once that claim lapses, rather
+ * than dropping the CI fix as a duplicate. Returns `false` for any other holder,
+ * which keeps the ordinary drop.
+ *
+ * That Review never looked at CI — under `if-present` an `opened` (or pushed) head
+ * whose workflow GitHub had not registered yet reads as check-less — so the red
+ * that arrives while it holds the slot is not a duplicate of anything. Dropping it
+ * stranded the head (`rover#346`, `under-control-mobile#292`): Review approved, the
+ * merge refused the red head, and no later event ever reached Respond-to-CI.
+ *
+ * The re-read is an ordinary re-entry of this handler on the aggregate-check
+ * recheck's coalesce key, so every sibling red event collapses into one, and it
+ * still has to win {@link claimReviewDispatch} itself: whichever event takes the
+ * freed slot is the one CI fix, and the fix's own lease then locks the rest out.
+ * Like {@link scheduleRerunSettleRecheck} it waits on a lease rather than on CI, so
+ * it neither draws nor advances the `state-pending` budget. Bounded by
+ * construction: only a check-less Review's dispatch marks a claim, a head that now
+ * has checks can never dispatch one again, and a CI fix taking the slot over
+ * clears the mark.
+ */
+async function recheckRedHeldByCheckLessReview(
+	ctx: ScmTriggerContext,
+	dispatchKey: string,
+	prNumber: string,
+	headSha: string,
+): Promise<boolean> {
+	const ttlSec = await reviewClaimedWithoutChecksTtlSec(dispatchKey);
+	if (ttlSec === undefined) return false;
+	const delaySec = ttlSec + CLAIM_LAPSE_RECHECK_MARGIN_SEC;
+	const recheckAttempt = ctx.recheckAttempt ?? 0;
+	await scheduleCoalescedDispatch(
+		{
+			...baseReviewJobPayload(ctx),
+			...(recheckAttempt > 0 ? { recheckAttempt } : {}),
+		},
+		checkRecheckCoalesceKey(ctx.project.repo, prNumber, headSha),
+		delaySec * 1000,
+		'recheck',
+	);
+	ctx.noteDecline?.({
+		kind: 'recheck-scheduled',
+		reason:
+			`Checks are failing on pull request #${prNumber} at head '${headSha}', but a Review that ` +
+			'started before they were registered holds its review slot. SWARM re-checks in ' +
+			`${describeWait(delaySec)}, once that slot frees, to start the CI fix.` +
+			" This phase's disposition did not change.",
+		retryAfterSec: delaySec,
+	});
+	logger.info(
+		'review: red head held by a Review dispatched without checks — re-checking once its claim lapses',
+		{ prNumber, headSha, reviewDispatchKey: dispatchKey, delaySec },
+	);
+	return true;
+}
+
+/**
+ * Mark the PR+SHA claim of a Review dispatched on a head that reported no checks
+ * (issue #1270), so a red that follows it can tell it from a genuine duplicate
+ * ({@link recheckRedHeldByCheckLessReview}). A no-op for any other Review.
+ */
+async function markClaimIfTakenWithoutChecks(
+	disposition: Extract<ReviewDisposition, { kind: 'review' }>,
+	dispatchKey: string,
+): Promise<void> {
+	if (disposition.withoutChecks === true) {
+		await markReviewDispatchClaimedWithoutChecks(dispatchKey);
+	}
+}
+
+/**
+ * The PR+SHA claim is held by someone else: a red head held by a Review taken
+ * without checks re-checks once that claim lapses (issue #1270); every other
+ * collision is the duplicate drop, recorded so the operator need not diagnose it
+ * off the board (issue #1019). Always `null`.
+ */
+async function declineHeldDispatchClaim(
+	ctx: ScmTriggerContext,
+	disposition: Exclude<ReviewDisposition, { kind: 'none' }>,
+	dispatchKey: string,
+	prNumber: string,
+	headSha: string,
+): Promise<null> {
+	if (
+		disposition.kind === 'respond-to-ci' &&
+		(await recheckRedHeldByCheckLessReview(ctx, dispatchKey, prNumber, headSha))
+	) {
+		return null;
+	}
+	await noteDispatchClaimHeld(ctx, dispatchKey, prNumber, headSha);
+	return null;
+}
+
 export function createReviewTrigger(): TriggerHandler {
 	return {
 		name: 'pr-review',
@@ -2161,11 +2282,16 @@ export function createReviewTrigger(): TriggerHandler {
 			// event for the same commit (PR opened → check suite passed, or one
 			// event per CI suite) doesn't launch a second phase. Fails closed, so a
 			// claim we can't obtain (duplicate, or Redis down) drops to a skip. The
-			// review and respond-to-ci paths share this slot deliberately: they are
-			// mutually exclusive for a given SHA (a commit's checks either all pass or
-			// one failed), and each is only dispatched once every check has completed,
-			// so there is never a legitimate second dispatch for the same PR+SHA to
-			// contend for it.
+			// review and respond-to-ci paths share this slot deliberately: a commit's
+			// checks either all pass or one failed, so a Review dispatched off
+			// completed checks and a CI fix never contend for one head. The one
+			// exception is a Review dispatched on a head that reported **no** checks
+			// under `if-present` (issues #1107, #1270): GitHub can register the head's
+			// checks moments after that read, and they can then go red while the
+			// Review holds this slot. That claim is marked as taken without checks, and
+			// a red event that collides with it re-checks once it lapses instead of
+			// being dropped ({@link recheckRedHeldByCheckLessReview}) — and still has to win
+			// the claim then, so one head never gets two CI fixes.
 			const dispatchKey = buildReviewDispatchKey(ctx.project.repo, prNumber, headSha);
 			// Two kinds of job arrive here already *holding* this PR+SHA claim, and
 			// both must reuse it rather than re-claim: re-claiming within the TTL would
@@ -2191,10 +2317,7 @@ export function createReviewTrigger(): TriggerHandler {
 					owner: reviewDispatchClaimOwner(ctx.dispatchId),
 				});
 				if (!claimed) {
-					// A decline the operator would otherwise have to diagnose off the
-					// board (issue #1019) — record what actually stopped it.
-					await noteDispatchClaimHeld(ctx, dispatchKey, prNumber, headSha);
-					return null;
+					return declineHeldDispatchClaim(ctx, disposition, dispatchKey, prNumber, headSha);
 				}
 			}
 
@@ -2209,6 +2332,7 @@ export function createReviewTrigger(): TriggerHandler {
 			}
 			if (!slot) return null;
 
+			await markClaimIfTakenWithoutChecks(disposition, dispatchKey);
 			logger.debug('review: dispatching Review phase', { prNumber, headSha });
 			return {
 				phase: 'review',

@@ -196,7 +196,9 @@ export async function reviewDispatchClaimTtlSec(key: string): Promise<number | u
  *
  * `SET key value EX ttl` (no `NX`): extends the existing claim, or re-establishes
  * it if it lapsed a moment ago, so the pending continuation is never dropped as a
- * duplicate. Best-effort — errors are logged, never thrown (same posture as
+ * duplicate. Rewriting the value also clears a no-checks mark
+ * ({@link markReviewDispatchClaimedWithoutChecks}): whoever refreshes now holds
+ * the slot, not the Review that took it without checks. Best-effort — errors are logged, never thrown (same posture as
  * {@link releaseReviewDispatch}); the claim's own TTL and the fallback delayed
  * retry are the safety nets.
  */
@@ -261,8 +263,18 @@ export async function releaseReviewDispatch(key: string): Promise<void> {
 	}
 }
 
-// Compare-and-delete: DEL only while the key still carries the caller's token.
-const RELEASE_IF_HELD_BY = `if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) end return 0`;
+/**
+ * Suffix a claim's value carries while it is held by a Review dispatched on a
+ * head that reported **no checks** (issue #1270). Kept on the claim's own value,
+ * not in a key beside it, so the mark lives exactly as long as that Review's
+ * hold: when a CI fix takes the slot over ({@link refreshReviewDispatchClaim}
+ * rewrites the value) or the claim lapses, the mark goes with it.
+ */
+const NO_CHECKS_MARK = ':no-checks';
+
+// Compare-and-delete: DEL only while the key still carries the caller's token —
+// bare, or marked as a Review dispatched without checks (ARGV[2]).
+const RELEASE_IF_HELD_BY = `local v = redis.call('get', KEYS[1]) if v == ARGV[1] or v == ARGV[1] .. ARGV[2] then return redis.call('del', KEYS[1]) end return 0`;
 
 /**
  * Release a claim only while `owner` still holds it (issue #1105) — the
@@ -271,18 +283,82 @@ const RELEASE_IF_HELD_BY = `if redis.call('get', KEYS[1]) == ARGV[1] then return
  * so by then a later dispatch may have re-claimed the key; an unconditional DEL
  * would erase *its* claim and let a further event start a duplicate review. Any
  * other value — a later dispatch's token, a refreshed continuation's — is left
- * alone, as is an expired key.
+ * alone, as is an expired key. The owner's token still matches once
+ * {@link markReviewDispatchClaimedWithoutChecks} has marked it (issue #1270).
  *
  * Best-effort, like the unconditional release: errors are logged, never thrown.
  */
 export async function releaseReviewDispatchHeldBy(key: string, owner: string): Promise<void> {
 	const namespacedKey = `${KEY_NS}${key}`;
 	try {
-		await getRedis().eval(RELEASE_IF_HELD_BY, 1, namespacedKey, owner);
+		await getRedis().eval(RELEASE_IF_HELD_BY, 1, namespacedKey, owner, NO_CHECKS_MARK);
 	} catch (err) {
 		logger.warn('review-dispatch dedup: owner-fenced release failed (TTL will reap)', {
 			reviewDispatchKey: key,
 			error: String(err),
 		});
+	}
+}
+
+// Append the mark to the live value, keeping its TTL; a no-op on a missing or
+// already-marked key.
+const MARK_WITHOUT_CHECKS = `local v = redis.call('get', KEYS[1]) if v and string.sub(v, -string.len(ARGV[1])) ~= ARGV[1] then redis.call('set', KEYS[1], v .. ARGV[1], 'XX', 'KEEPTTL') return 1 end return 0`;
+
+// The remaining TTL while the key carries the mark; -2 otherwise.
+const TTL_IF_MARKED_WITHOUT_CHECKS = `local v = redis.call('get', KEYS[1]) if v and string.sub(v, -string.len(ARGV[1])) == ARGV[1] then return redis.call('ttl', KEYS[1]) end return -2`;
+
+/**
+ * Mark the live claim on `key` as held by a Review dispatched on a head that
+ * reported **no checks** — the `reviewChecks: 'if-present'` path (issues #274,
+ * #1107) — keeping its owner token and its TTL (issue #1270).
+ *
+ * Such a Review is the one claim holder the shared slot's invariant does not
+ * cover: GitHub can register a head's checks a moment *after* the PR event that
+ * read none, and when those checks then go red, the Respond-to-CI the red event
+ * routes to finds this claim and would be dropped as a duplicate of a phase that
+ * never looked at CI. The mark is what lets the red event recognise that holder
+ * ({@link reviewClaimedWithoutChecksTtlSec}) and wait for its claim to lapse
+ * rather than drop.
+ *
+ * Best-effort, like every write here: a failure costs only that wait.
+ */
+export async function markReviewDispatchClaimedWithoutChecks(key: string): Promise<void> {
+	const namespacedKey = `${KEY_NS}${key}`;
+	try {
+		await getRedis().eval(MARK_WITHOUT_CHECKS, 1, namespacedKey, NO_CHECKS_MARK);
+	} catch (err) {
+		logger.warn('review-dispatch dedup: could not mark a claim as taken without checks', {
+			reviewDispatchKey: key,
+			error: String(err),
+		});
+	}
+}
+
+/**
+ * How many seconds the claim on `key` has left **while it is held by a Review
+ * dispatched without checks** ({@link markReviewDispatchClaimedWithoutChecks}),
+ * or `undefined` for any other holder, no holder, or a failed read (issue #1270).
+ *
+ * Read only after a failed {@link claimReviewDispatch}, never in place of it: the
+ * answer tells a red event to re-check once that lease lapses, and the re-check
+ * still has to win the claim itself, so `SET NX` remains the only thing that
+ * decides who dispatches.
+ */
+export async function reviewClaimedWithoutChecksTtlSec(key: string): Promise<number | undefined> {
+	try {
+		const ttl = await getRedis().eval(
+			TTL_IF_MARKED_WITHOUT_CHECKS,
+			1,
+			`${KEY_NS}${key}`,
+			NO_CHECKS_MARK,
+		);
+		// `0` is a lease about to lapse — still this holder's; -1/-2 are not leases.
+		return typeof ttl === 'number' && ttl >= 0 ? ttl : undefined;
+	} catch (err) {
+		logger.debug('review-dispatch dedup: could not read whether a claim was taken without checks', {
+			reviewDispatchKey: key,
+			error: String(err),
+		});
+		return undefined;
 	}
 }

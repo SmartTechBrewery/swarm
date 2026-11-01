@@ -190,10 +190,12 @@ describe('releaseReviewDispatchHeldBy', () => {
 		await releaseReviewDispatchHeldBy('acme/widgets:42:abc', 'pr-review:dispatch-7');
 
 		expect(evalScript).toHaveBeenCalledWith(
-			expect.stringContaining("redis.call('get', KEYS[1]) == ARGV[1]"),
+			expect.stringContaining('v == ARGV[1] or v == ARGV[1] .. ARGV[2]'),
 			1,
 			`${NS}acme/widgets:42:abc`,
 			'pr-review:dispatch-7',
+			// The owner's token still matches once marked as taken without checks (#1270).
+			':no-checks',
 		);
 		expect(del).not.toHaveBeenCalled();
 	});
@@ -229,5 +231,84 @@ describe('refreshReviewDispatchClaim', () => {
 		const { refreshReviewDispatchClaim } = await import('@/triggers/review-dispatch-dedup.js');
 
 		await expect(refreshReviewDispatchClaim('acme/widgets:42:abc', 2100)).resolves.toBeUndefined();
+	});
+});
+
+/**
+ * Issue #1270 — a Review dispatched on a head reporting no checks marks its claim,
+ * so a red event that meets it can tell it from a genuine duplicate.
+ */
+describe('markReviewDispatchClaimedWithoutChecks', () => {
+	it('appends the mark to the live value, keeping its TTL', async () => {
+		const { markReviewDispatchClaimedWithoutChecks } = await import(
+			'@/triggers/review-dispatch-dedup.js'
+		);
+
+		await markReviewDispatchClaimedWithoutChecks('acme/widgets:42:abc');
+
+		expect(evalScript).toHaveBeenCalledWith(
+			expect.stringContaining("'XX', 'KEEPTTL'"),
+			1,
+			`${NS}acme/widgets:42:abc`,
+			':no-checks',
+		);
+		expect(set).not.toHaveBeenCalled();
+	});
+
+	it('swallows Redis errors', async () => {
+		evalScript.mockRejectedValue(new Error('ECONNREFUSED'));
+		const { markReviewDispatchClaimedWithoutChecks } = await import(
+			'@/triggers/review-dispatch-dedup.js'
+		);
+
+		await expect(
+			markReviewDispatchClaimedWithoutChecks('acme/widgets:42:abc'),
+		).resolves.toBeUndefined();
+	});
+});
+
+describe('reviewClaimedWithoutChecksTtlSec', () => {
+	it('reports the lease of a claim carrying the mark', async () => {
+		evalScript.mockResolvedValue(180);
+		const { reviewClaimedWithoutChecksTtlSec } = await import(
+			'@/triggers/review-dispatch-dedup.js'
+		);
+
+		await expect(reviewClaimedWithoutChecksTtlSec('acme/widgets:42:abc')).resolves.toBe(180);
+		expect(evalScript).toHaveBeenCalledWith(
+			expect.any(String),
+			1,
+			`${NS}acme/widgets:42:abc`,
+			':no-checks',
+		);
+	});
+
+	// A lease about to lapse is still that holder's.
+	it('reports a zero lease as held', async () => {
+		evalScript.mockResolvedValue(0);
+		const { reviewClaimedWithoutChecksTtlSec } = await import(
+			'@/triggers/review-dispatch-dedup.js'
+		);
+
+		await expect(reviewClaimedWithoutChecksTtlSec('acme/widgets:42:abc')).resolves.toBe(0);
+	});
+
+	// -2: unmarked or missing; -1: no expiry — neither is a lapse to wait for.
+	it.each([-2, -1])('reports nothing for %s', async (answer) => {
+		evalScript.mockResolvedValue(answer);
+		const { reviewClaimedWithoutChecksTtlSec } = await import(
+			'@/triggers/review-dispatch-dedup.js'
+		);
+
+		await expect(reviewClaimedWithoutChecksTtlSec('acme/widgets:42:abc')).resolves.toBeUndefined();
+	});
+
+	it('reports nothing when the read throws', async () => {
+		evalScript.mockRejectedValue(new Error('ECONNREFUSED'));
+		const { reviewClaimedWithoutChecksTtlSec } = await import(
+			'@/triggers/review-dispatch-dedup.js'
+		);
+
+		await expect(reviewClaimedWithoutChecksTtlSec('acme/widgets:42:abc')).resolves.toBeUndefined();
 	});
 });
