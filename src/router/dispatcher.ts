@@ -157,6 +157,14 @@ const DEFAULT_PHASE_TIMEOUT_MS = resolveAgentTimeoutMs();
 const STALE_RUN_MARGIN_MS = 10 * 60 * 1000;
 
 /**
+ * The longest a reported reset may hold a `(worker, CLI)` out of routing — the
+ * bound on a mis-parsed reset for the cooldown alone, where the run's own retry is
+ * bounded by `MAX_RETRY_DELAY_MS` (issue #1265). A little over a week, so a weekly
+ * allowance is honoured in full.
+ */
+const MAX_CLI_COOLDOWN_MS = 8 * 24 * 60 * 60 * 1000;
+
+/**
  * How many dispatch wake-ups the consumer pulls off the queue at once. Not a
  * business cap, and deliberately not configurable (issue #811): the bounds an
  * operator sets — an enrollment's `concurrencyAllocation`, enforced
@@ -340,12 +348,18 @@ function reportedRetryHint(
  * record if it wanted to, and the pure result adapter below must not, since it is
  * unit-tested as a pure adapter.
  *
- * The expiry is `retryDelayForFailure`'s own answer for this failure rather than a
- * number of its own, which is what makes the three properties that matter
- * structural: the record lapses at exactly the instant the deferred retry is
- * scheduled for, a missing or unparseable reset degrades to the shared default
- * backoff rather than to "forever", and `MAX_RETRY_DELAY_MS` bounds a mis-parsed
- * one so no sequence of observations can hold a machine back indefinitely.
+ * The record lapses at the reported reset plus `RETRY_BUFFER_MS`, and never before
+ * the deferred retry `retryDelayForFailure` schedules for the same failure. Those
+ * two agree whenever the reset is near; they part only when it is further out than
+ * the run's own clamp, which is bounded by the longest wait a deferred wake-up
+ * survives (~24 h) — and the cooldown must not be cut to that (issue #1265): a
+ * weekly Codex limit days away would otherwise put the machine back in the routing
+ * pool every day, to provision a worktree and bounce off the same limit. So the
+ * retry fires first, the eligibility gate still excludes this `(worker, CLI)`, and
+ * the retry routes elsewhere or waits. A missing or unparseable reset still degrades
+ * to the shared default backoff rather than to "forever", and
+ * {@link MAX_CLI_COOLDOWN_MS} bounds a mis-parsed one so no sequence of observations
+ * can hold a machine back indefinitely.
  *
  * Best-effort and fully swallowed, like `tryCompleteDispatch`: bookkeeping must
  * never fail a settle. A lost record costs one avoidable bounce, not a dropped job.
@@ -363,7 +377,10 @@ export async function recordReportedRateLimit(
 
 	const now = Date.now();
 	const failure: AgentFailure = { kind: 'rate-limit', ...reportedRetryHint(result, 'rate-limit') };
-	const expiresAt = new Date(now + retryDelayForFailure(failure, now));
+	const reported = failure.retryAfter
+		? Math.min(failure.retryAfter.getTime() - now + RETRY_BUFFER_MS, MAX_CLI_COOLDOWN_MS)
+		: 0;
+	const expiresAt = new Date(now + Math.max(retryDelayForFailure(failure, now), reported));
 	try {
 		await recordWorkerCliRateLimit({
 			workerId: selection.workerId,
