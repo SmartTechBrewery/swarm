@@ -42,7 +42,10 @@
  *  - it is allowed {@link MAX_BASE_UPDATES} times, after which the pull request
  *    is handed to a human rather than looping against a faster-moving base;
  *  - a conflicting update and a red fresh CI each settle terminally *and comment
- *    on the pull request* — refused rather than merged on stale evidence;
+ *    on the pull request* — refused rather than merged on stale evidence. A
+ *    conflicting update also hands the pull request to Resolve-conflicts (issue
+ *    #1264): a sibling that merged while it was in review has already had its
+ *    fan-out, so nothing else would;
  *  - a provider that cannot update a branch at all (Bitbucket Cloud, gitlab.com,
  *    Azure DevOps Services) has the update done on a SWARM worker instead (issue
  *    #1117): a catch-up pass of the Resolve-conflicts phase merges the base into
@@ -75,7 +78,9 @@
  * is reviewed again at its current head instead of stalling green, mergeable and
  * permanently unreviewed. Decided by one provider-neutral `getPullRequest` read
  * rather than a structured refusal reason, and written on the two head-moved
- * paths only — never on a red-head refusal, which is a real failure.
+ * paths — and, with no read, on a conflicting update (issue #1264), whose
+ * approval the base invalidated rather than the diff — but never on a red-head
+ * refusal, which is a real failure.
  *
  * **One merge per repository at a time (issue #1114).** Freshness checked per
  * pull request is not enough on its own: two approved pull requests can each read
@@ -166,6 +171,7 @@ import {
 	promoteDependencyWaits,
 	promoteMergeQueueWaits,
 	publishDispatchWakeUp,
+	scheduleCoalescedDispatch,
 } from '../dispatch/dispatcher.js';
 import { findTaskIdForPrBranch } from '../dispatch/pr-branch-task.js';
 import {
@@ -193,6 +199,10 @@ import type {
 import { SWARM_GENERATED_FOOTER } from '../scm/swarm-origin.js';
 import type { SCMProvider } from '../scm/types.js';
 import { decideAggregateCheckOutcome } from '../triggers/handlers/aggregate-check-decision.js';
+import {
+	buildConflictCheckJob,
+	conflictCheckCoalesceKey,
+} from '../triggers/handlers/resolve-conflicts.js';
 import {
 	buildReviewDispatchKey,
 	claimReviewDispatch,
@@ -619,6 +629,12 @@ export interface MergeAutomationCapabilities {
 	 */
 	requestMergeCatchUp?: (input: RequestMergeCatchUpInput) => Promise<void>;
 	/**
+	 * Not a provider capability: how an approved head that conflicts with its base
+	 * is handed to Resolve-conflicts (issue #1264). Defaults to
+	 * {@link requestConflictResolution}, injectable for the same reason.
+	 */
+	requestConflictResolution?: (input: RequestConflictResolutionInput) => Promise<void>;
+	/**
 	 * Not provider capabilities either: whether SWARM's CI agent adjudicated a red
 	 * approved head as `no-fix`, and the approved-head re-run policy that head goes
 	 * through (issue #1128). Default to the real ones; injectable for the same reason.
@@ -630,7 +646,10 @@ export interface MergeAutomationCapabilities {
 /** The {@link MergeAutomationCapabilities} the project's registered provider supplies. */
 type ProviderCapability = Exclude<
 	keyof MergeAutomationCapabilities,
-	'requestMergeCatchUp' | 'hasCiNoFixRecovery' | 'recoverAdjudicatedApprovedHead'
+	| 'requestMergeCatchUp'
+	| 'requestConflictResolution'
+	| 'hasCiNoFixRecovery'
+	| 'recoverAdjudicatedApprovedHead'
 >;
 
 /**
@@ -1216,10 +1235,18 @@ async function settleHeadMovedDuringUpdate(
 }
 
 /**
- * The base does not merge into the head cleanly. Deliberately *not* stamped
- * superseded (issue #1079): a conflicting update means the base does not merge
- * into the head, not that the head moved, so the approval keeps its slot.
- * Resolving it is the Resolve-conflicts phase's job, not merge automation's.
+ * The base does not merge into the head cleanly — in practice a sibling merged
+ * into the base while this pull request was being reviewed (issue #1264). The
+ * post-merge fan-out may already have come and gone by then, so nothing else is
+ * going to notice: the pull request is handed to Resolve-conflicts here
+ * ({@link handConflictToResolveConflicts}), whose push is then reviewed again.
+ *
+ * The approval is stamped superseded too ({@link stampApprovalSuperseded}), with
+ * no "did the head move" read: the approval was sound and the base moving is what
+ * invalidated it, so the resolved head's review must not spend one of
+ * `REVIEW_VERDICT_CAP`'s three slots per lost race — which is how a pull request
+ * that lost it three times stalled for good. The loop stays bounded by
+ * `REVIEW_SUPERSEDED_CAP`, which the Review trigger enforces on its own.
  */
 async function settleConflictingUpdate(
 	dispatch: DispatchRow,
@@ -1236,7 +1263,7 @@ async function settleConflictingUpdate(
 		capabilities,
 		mergeRefusalCommentBody(
 			`Its head is behind the base and the base does not merge into it cleanly: ${message}`,
-			'Resolve the conflict on the branch; SWARM will pick the pull request up again from its next review.',
+			'SWARM is handing the pull request to Resolve-conflicts and will review the resolved head.',
 		),
 	);
 	logger.warn('Merge automation: cannot update a conflicting head', {
@@ -1245,8 +1272,104 @@ async function settleConflictingUpdate(
 		prNumber: job.prNumber,
 		message,
 	});
+	await handConflictToResolveConflicts(dispatch, job, project, capabilities);
+	await stampApprovalSuperseded(job, project, {
+		runId: job.reviewRunId,
+		prNumber: job.prNumber,
+		reviewedHeadSha: job.reviewedHeadSha ?? job.approvedHeadSha,
+		cause: 'base-conflict',
+	});
 	await settleMergeDispatch(dispatch, job, project, 'merge-not-eligible');
 	return settledOutcome(job, 'not-eligible');
+}
+
+/**
+ * Ask for the per-PR conflict check of a pull request whose approved head
+ * conflicts with its base (issue #1264). Best-effort throughout — the settle it
+ * runs inside must never fail on it.
+ *
+ * The base is read off the pull request rather than assumed, and a closed one is
+ * not handed over at all. A read that fails falls back to the project's
+ * configured base, which every SWARM-managed pull request targets (the merge
+ * queue relies on the same fact), so a provider blip still schedules the check.
+ * Ownership, mergeability and the head/base claim are all re-decided by the
+ * per-PR path the request arrives on, so it can never start a second resolution.
+ */
+async function handConflictToResolveConflicts(
+	dispatch: DispatchRow,
+	job: MergeAutomationJob,
+	project: ProjectConfig,
+	capabilities: MergeAutomationCapabilities,
+): Promise<void> {
+	const context = { dispatchId: dispatch.id, runId: job.reviewRunId, prNumber: job.prNumber };
+	let baseBranch = project.baseBranch;
+	try {
+		const read = capabilities.getPullRequest ?? scmCapability(project, 'getPullRequest');
+		const details = await read(project, Number(job.prNumber), 'reviewer');
+		if (details.state === 'closed') {
+			logger.debug(
+				'Merge automation: the conflicting pull request is closed — nothing to resolve',
+				context,
+			);
+			return;
+		}
+		baseBranch = details.baseBranch;
+	} catch (err) {
+		logger.warn(
+			"Merge automation: could not read the conflicting pull request — using the project's base",
+			{ ...context, baseBranch, error: describeError(err) },
+		);
+	}
+	try {
+		await (capabilities.requestConflictResolution ?? requestConflictResolution)({
+			project,
+			job,
+			baseBranch,
+		});
+	} catch (err) {
+		logger.error(
+			'Merge automation: failed to hand the conflicting pull request to Resolve-conflicts',
+			{ ...context, baseBranch, error: describeError(err) },
+		);
+	}
+}
+
+export interface RequestConflictResolutionInput {
+	project: ProjectConfig;
+	/** The merge dispatch's payload — the pull request whose approved head conflicts. */
+	job: MergeAutomationJob;
+	/** The base the pull request targets, which its conflict check is keyed on. */
+	baseBranch: string;
+}
+
+/**
+ * Schedule the per-PR conflict check a merged sibling's fan-out would have
+ * (issue #1264), under the same coalesce key, so a check the fan-out already has
+ * pending is replaced rather than duplicated. Throws on failure.
+ */
+export async function requestConflictResolution({
+	project,
+	job,
+	baseBranch,
+}: RequestConflictResolutionInput): Promise<void> {
+	await scheduleCoalescedDispatch(
+		buildConflictCheckJob({
+			providerId: requireProjectSCMProvider(project).type,
+			projectId: project.id,
+			repo: job.repo,
+			prNumber: job.prNumber,
+			baseBranch,
+		}),
+		conflictCheckCoalesceKey(job.repo, job.prNumber, baseBranch),
+		0,
+		null,
+	);
+	logger.info('Merge automation: handed the conflicting pull request to Resolve-conflicts', {
+		runId: job.reviewRunId,
+		prNumber: job.prNumber,
+		repo: job.repo,
+		baseBranch,
+	});
 }
 
 /**
@@ -1570,40 +1693,64 @@ async function markApprovalSupersededByHeadChange(
 			});
 			return;
 		}
+		await stampApprovalSuperseded(job, project, {
+			runId: job.reviewRunId,
+			prNumber: job.prNumber,
+			reviewedHeadSha,
+			currentHeadSha: details.headSha,
+			cause: 'head-change',
+		});
+	} catch (err) {
+		logger.warn('Merge automation: could not record the superseded approval', {
+			runId: job.reviewRunId,
+			prNumber: job.prNumber,
+			reviewedHeadSha,
+			error: describeError(err),
+		});
+	}
+}
+
+/**
+ * Stamp this approval's review-verdict slot and its Review run superseded — the
+ * write {@link markApprovalSupersededByHeadChange} makes once it has decided the
+ * head moved, and {@link settleConflictingUpdate} makes outright (issue #1264).
+ * Keyed on the reviewed head, never the possibly-advanced approved one. Never
+ * throws: a failure is logged and the slot keeps counting.
+ */
+async function stampApprovalSuperseded(
+	job: MergeAutomationJob,
+	project: ProjectConfig,
+	context: { reviewedHeadSha: string; cause: 'head-change' | 'base-conflict' } & Record<
+		string,
+		unknown
+	>,
+): Promise<void> {
+	try {
 		const stamped = await markReviewVerdictSuperseded({
 			projectId: project.id,
 			repository: job.repo,
 			prNumber: job.prNumber,
-			headSha: reviewedHeadSha,
+			headSha: context.reviewedHeadSha,
 		});
 		// The run-row copy (issue #1080), so the runs list can tell this pass from one
 		// that spent a cap slot without a ledger read per row. Written whether or not
 		// the ledger stamp landed just now: a retry after a crash between the two
 		// writes finds the ledger already stamped, and must still reach the run row.
 		const runStamped = await markReviewRunSuperseded(job.reviewRunId);
-		const context = {
-			runId: job.reviewRunId,
-			prNumber: job.prNumber,
-			reviewedHeadSha,
-			currentHeadSha: details.headSha,
-			runStamped,
-		};
 		if (stamped) {
 			logger.info(
-				'Merge automation: the approval was superseded by a head change — it no longer spends a review-cap slot',
-				context,
+				'Merge automation: the approval was superseded — it no longer spends a review-cap slot',
+				{ ...context, runStamped },
 			);
 		} else {
 			logger.warn(
 				'Merge automation: no submitted review slot to mark superseded (already stamped, or never recorded)',
-				context,
+				{ ...context, runStamped },
 			);
 		}
 	} catch (err) {
 		logger.warn('Merge automation: could not record the superseded approval', {
-			runId: job.reviewRunId,
-			prNumber: job.prNumber,
-			reviewedHeadSha,
+			...context,
 			error: describeError(err),
 		});
 	}

@@ -89,6 +89,10 @@ const createAndPublishDispatch = vi.fn(async (_input: unknown) => ({
 const publishDispatchWakeUp = vi.fn(async (_dispatch: unknown) => {});
 const promoteMergeQueueWaits = vi.fn(async (_projectId: string, _repo: string) => false);
 const promoteDependencyWaits = vi.fn(async (_projectId: string, _cause: string) => 0);
+// The per-PR conflict check a conflicting approved head is handed to (issue #1264).
+const scheduleCoalescedDispatch = vi.fn(
+	async (_job: unknown, _key: string, _delayMs: number, _waitReason: unknown) => {},
+);
 vi.mock('@/dispatch/dispatcher.js', () => ({
 	// The `no-fix` recovery's dedup key a red approved head's adjudication is read
 	// under (issue #1128); `findDispatchByDedupKey` answers "none" by default.
@@ -99,6 +103,8 @@ vi.mock('@/dispatch/dispatcher.js', () => ({
 		promoteMergeQueueWaits(projectId, repo),
 	promoteDependencyWaits: (projectId: string, cause: string) =>
 		promoteDependencyWaits(projectId, cause),
+	scheduleCoalescedDispatch: (job: unknown, key: string, delayMs: number, waitReason: unknown) =>
+		scheduleCoalescedDispatch(job, key, delayMs, waitReason),
 }));
 
 // The review-dispatch dedup is Redis-backed; the updated head's claim (issue
@@ -163,6 +169,10 @@ import type {
 } from '@/scm/merge.js';
 import type { AggregateCheckStatus, PullRequestDetails } from '@/scm/types.js';
 import {
+	buildConflictCheckJob,
+	conflictCheckCoalesceKey,
+} from '@/triggers/handlers/resolve-conflicts.js';
+import {
 	adoptWorkerBranchUpdate,
 	MAX_BASE_UPDATES,
 	MAX_MERGE_RETRIES,
@@ -178,6 +188,7 @@ import {
 	mergeRetryDelayMs,
 	processMergeAutomationDispatch,
 	rearmMergeAutomationForGreenHead,
+	requestConflictResolution,
 	requestMergeAutomation,
 } from '@/worker/merge-automation.js';
 
@@ -279,6 +290,8 @@ beforeEach(() => {
 	createAndPublishDispatch.mockClear();
 	createAndPublishDispatch.mockResolvedValue({ dispatch: mockDispatchRow(), created: true });
 	publishDispatchWakeUp.mockClear();
+	scheduleCoalescedDispatch.mockReset();
+	scheduleCoalescedDispatch.mockResolvedValue(undefined);
 	claimReviewDispatch.mockClear();
 	claimReviewDispatch.mockResolvedValue(true);
 	refreshReviewDispatchClaim.mockClear();
@@ -1683,7 +1696,9 @@ describe('processMergeAutomationDispatch: a provider that cannot update a branch
 			'the base does not merge into it cleanly: conflicts in a.ts',
 		);
 		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
-		expect(markReviewVerdictSuperseded).not.toHaveBeenCalled();
+		// Handed to Resolve-conflicts, and the approval's slot freed (issue #1264).
+		expect(scheduleCoalescedDispatch).toHaveBeenCalledOnce();
+		expect(markReviewVerdictSuperseded).toHaveBeenCalledOnce();
 		expect(promoteMergeQueueWaits).toHaveBeenCalledExactlyOnceWith(project.id, job.repo);
 		expect(outcome.result).toBe('not-eligible');
 	});
@@ -2060,6 +2075,204 @@ describe('processMergeAutomationDispatch: settling what the merge absorbed', () 
  * a structured refusal reason — these cases pin which refusals ask it, what key
  * they write, and that every failure degrades to the old behaviour.
  */
+// Issue #1264: Review starts → a sibling merges into the base → Review approves
+// the old head → the merge finds it behind and conflicting. The sibling's
+// post-merge fan-out has already run, so this settle is what hands the pull
+// request to Resolve-conflicts and frees the approval's cap slot.
+describe('processMergeAutomationDispatch: a sibling merge makes the approved head conflict (issue #1264)', () => {
+	const CONFLICT: UpdatePullRequestBranchOutcome = {
+		status: 'conflict',
+		message: 'merge conflict between base and head',
+	};
+
+	function openPr(overrides: Partial<PullRequestDetails> = {}) {
+		return vi.fn(
+			async () =>
+				({
+					number: 17,
+					state: 'open',
+					headBranch: 'issue-12',
+					headSha: 'deadbeef',
+					baseBranch: 'main',
+					...overrides,
+				}) as PullRequestDetails,
+		);
+	}
+
+	function conflicting(overrides: Partial<Parameters<typeof processMergeAutomationDispatch>[3]>) {
+		return {
+			mergePullRequest: mergeReturning(STALE_BASE),
+			updatePullRequestBranch: updateReturning(CONFLICT),
+			commentOnPullRequest: vi.fn(async (_p: unknown, _n: number, _b: string) => 1),
+			getPullRequest: openPr(),
+			...overrides,
+		};
+	}
+
+	it('hands the pull request to Resolve-conflicts and frees the approval’s slot', async () => {
+		const requestConflictResolution = vi.fn(async (_input: unknown) => {});
+		const commentOnPullRequest = vi.fn(async (_p: unknown, _n: number, _b: string) => 1);
+
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow(),
+			job,
+			project,
+			conflicting({ requestConflictResolution, commentOnPullRequest }),
+		);
+
+		expect(requestConflictResolution).toHaveBeenCalledExactlyOnceWith({
+			project,
+			job: onTurn(job),
+			baseBranch: 'main',
+		});
+		expect(markReviewVerdictSuperseded).toHaveBeenCalledExactlyOnceWith({
+			projectId: project.id,
+			repository: project.repo,
+			prNumber: '17',
+			headSha: 'deadbeef',
+		});
+		expect(markReviewRunSuperseded).toHaveBeenCalledExactlyOnceWith('run-1');
+		const body = commentOnPullRequest.mock.calls[0]?.[2] ?? '';
+		expect(body).toContain('the base does not merge into it cleanly: ');
+		expect(body).toContain('Resolve-conflicts');
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
+		expect(promoteMergeQueueWaits).toHaveBeenCalledExactlyOnceWith(project.id, job.repo);
+		expect(outcome.result).toBe('not-eligible');
+	});
+
+	// The ledger slot stays where the review was, never on an advanced head (#874).
+	it('stamps the reviewed head when an earlier update advanced the approved one', async () => {
+		const advanced: MergeAutomationJob = {
+			...job,
+			approvedHeadSha: 'merged-with-base',
+			baseUpdates: 1,
+		};
+
+		await processMergeAutomationDispatch(
+			mockDispatchRow(),
+			advanced,
+			project,
+			conflicting({
+				requestConflictResolution: vi.fn(async () => {}),
+				getPullRequest: openPr({ headSha: 'merged-with-base' }),
+			}),
+		);
+
+		expect(markReviewVerdictSuperseded).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({ headSha: 'deadbeef' }),
+		);
+	});
+
+	it('does the same when a SWARM worker reports the conflict (issue #1117)', async () => {
+		const requestConflictResolution = vi.fn(async (_input: unknown) => {});
+
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow(),
+			{ ...job, workerCatchUp: { requestedFor: 'deadbeef', result: CONFLICT } },
+			project,
+			conflicting({ requestConflictResolution }),
+		);
+
+		expect(requestConflictResolution).toHaveBeenCalledOnce();
+		expect(requestConflictResolution.mock.calls[0]?.[0]).toMatchObject({ baseBranch: 'main' });
+		expect(markReviewVerdictSuperseded).toHaveBeenCalledOnce();
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
+		expect(outcome.result).toBe('not-eligible');
+	});
+
+	it("still asks, against the project's base, when the pull request cannot be read", async () => {
+		const requestConflictResolution = vi.fn(async (_input: unknown) => {});
+
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow(),
+			job,
+			project,
+			conflicting({
+				requestConflictResolution,
+				getPullRequest: vi.fn(async () => {
+					throw new Error('provider unavailable');
+				}),
+			}),
+		);
+
+		expect(requestConflictResolution).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({ baseBranch: project.baseBranch }),
+		);
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
+		expect(outcome.result).toBe('not-eligible');
+	});
+
+	it('asks nothing for a pull request that is already closed', async () => {
+		const requestConflictResolution = vi.fn(async (_input: unknown) => {});
+
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow(),
+			job,
+			project,
+			conflicting({ requestConflictResolution, getPullRequest: openPr({ state: 'closed' }) }),
+		);
+
+		expect(requestConflictResolution).not.toHaveBeenCalled();
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
+		expect(outcome.result).toBe('not-eligible');
+	});
+
+	it('settles even when the hand-off and the stamp both fail', async () => {
+		markReviewVerdictSuperseded.mockRejectedValueOnce(new Error('db down'));
+
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow(),
+			job,
+			project,
+			conflicting({
+				requestConflictResolution: vi.fn(async () => {
+					throw new Error('queue down');
+				}),
+			}),
+		);
+
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
+		expect(promoteMergeQueueWaits).toHaveBeenCalledExactlyOnceWith(project.id, job.repo);
+		expect(outcome.result).toBe('not-eligible');
+	});
+
+	it('schedules the per-PR conflict check under the fan-out’s own key by default', async () => {
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, conflicting({}));
+
+		const expectedJob = buildConflictCheckJob({
+			providerId: 'github',
+			projectId: project.id,
+			repo: project.repo,
+			prNumber: '17',
+			baseBranch: 'main',
+		});
+		expect(scheduleCoalescedDispatch).toHaveBeenCalledExactlyOnceWith(
+			expectedJob,
+			conflictCheckCoalesceKey(project.repo, '17', 'main'),
+			0,
+			null,
+		);
+		expect(conflictCheckCoalesceKey(project.repo, '17', 'main')).toBe(
+			`resolve-conflicts:${project.repo}:17:main`,
+		);
+		expect(expectedJob.event).toMatchObject({
+			kind: 'pull-request',
+			action: 'closed',
+			merged: true,
+			conflictPrNumber: '17',
+			baseBranch: 'main',
+		});
+	});
+
+	it('requestConflictResolution throws when the check cannot be scheduled', async () => {
+		scheduleCoalescedDispatch.mockRejectedValueOnce(new Error('db down'));
+
+		await expect(requestConflictResolution({ project, job, baseBranch: 'main' })).rejects.toThrow(
+			'db down',
+		);
+	});
+});
+
 describe('processMergeAutomationDispatch: superseded approvals', () => {
 	/** A pull-request read reporting `headSha` as the branch's current head. */
 	function prAtHead(headSha: string) {
@@ -2147,18 +2360,24 @@ describe('processMergeAutomationDispatch: superseded approvals', () => {
 		expect(outcome.result).toBe('not-eligible');
 	});
 
-	// A conflicting update means the base does not merge into the head, not that
-	// the head moved.
-	it('never stamps the slot for a conflicting update', async () => {
+	// A conflicting update is the base invalidating a sound approval (issue #1264):
+	// the head did not move, but the resolved head's review must not spend a slot.
+	it('stamps the slot for a conflicting update even though the head is unchanged', async () => {
 		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
 			mergePullRequest: mergeReturning(STALE_BASE),
 			updatePullRequestBranch: updateReturning({ status: 'conflict', message: 'conflict' }),
-			getPullRequest: prAtHead('pushed-head'),
+			getPullRequest: prAtHead('deadbeef'),
 			commentOnPullRequest: vi.fn(async (_p: unknown, _n: number, _b: string) => 1),
+			requestConflictResolution: vi.fn(async () => {}),
 		});
 
-		expect(markReviewVerdictSuperseded).not.toHaveBeenCalled();
-		expect(markReviewRunSuperseded).not.toHaveBeenCalled();
+		expect(markReviewVerdictSuperseded).toHaveBeenCalledExactlyOnceWith({
+			projectId: project.id,
+			repository: project.repo,
+			prNumber: '17',
+			headSha: 'deadbeef',
+		});
+		expect(markReviewRunSuperseded).toHaveBeenCalledExactlyOnceWith('run-1');
 	});
 
 	it.each([

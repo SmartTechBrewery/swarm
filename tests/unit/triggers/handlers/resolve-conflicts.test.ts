@@ -39,7 +39,11 @@ vi.mock('@/triggers/resolve-conflicts-dedup.js', () => ({
 }));
 
 import { MERGE_CATCH_UP_ACTION } from '@/queue/jobs.js';
-import { createResolveConflictsTrigger } from '@/triggers/handlers/resolve-conflicts.js';
+import {
+	buildConflictCheckJob,
+	conflictCheckCoalesceKey,
+	createResolveConflictsTrigger,
+} from '@/triggers/handlers/resolve-conflicts.js';
 import type { TriggerDecline } from '@/triggers/types.js';
 
 const project = createMockProjectConfig({ repo: 'acme/widgets' });
@@ -281,6 +285,62 @@ describe('resolve-conflicts trigger', () => {
 
 // Issue #1117: merge automation's worker-side branch update rides this phase as a
 // catch-up pass, dispatched from a synthetic job rather than from a merge event.
+// Merge automation asks for this check when an approved head turns out to
+// conflict after its sibling's fan-out has already run (issue #1264).
+describe('resolve-conflicts trigger: the conflict check merge automation asks for', () => {
+	const job = buildConflictCheckJob({
+		providerId: 'github',
+		projectId: project.id,
+		repo: project.repo,
+		prNumber: '42',
+		baseBranch: 'main',
+	});
+	const checkEvent = createMockScmTriggerContext({ project, scm, event: job.event });
+
+	beforeEach(() => {
+		vi.clearAllMocks();
+		listConflictCandidates.mockResolvedValue([candidate]);
+		claimConflictResolution.mockResolvedValue(true);
+		scheduleCoalescedJob.mockResolvedValue(undefined);
+		hasRunForTask.mockResolvedValue(true);
+		findTaskIdForStoredTaskBranch.mockResolvedValue(undefined);
+	});
+
+	it('takes the per-PR path and dispatches a confirmed conflict', async () => {
+		const trigger = createResolveConflictsTrigger();
+		expect(trigger.matches(checkEvent)).toBe(true);
+
+		const result = await trigger.handle(checkEvent);
+
+		expect(listConflictCandidates).toHaveBeenCalledWith(project, 'main');
+		expect(claimConflictResolution).toHaveBeenCalledWith(
+			'acme/widgets:42:head123:base456',
+			checkEvent.dispatchId,
+		);
+		expect(result).toMatchObject({
+			phase: 'resolve-conflicts',
+			prNumber: '42',
+			taskId: '42-conflicts',
+			headSha: 'head123',
+			baseBranch: 'main',
+		});
+	});
+
+	it('rechecks unknown mergeability under the same key the fan-out uses', async () => {
+		listConflictCandidates.mockResolvedValue([{ ...candidate, mergeable: null }]);
+
+		await createResolveConflictsTrigger().handle(checkEvent);
+
+		expect(scheduleCoalescedJob).toHaveBeenCalledOnce();
+		expect(scheduleCoalescedJob.mock.calls[0][1]).toBe(
+			conflictCheckCoalesceKey(project.repo, '42', 'main'),
+		);
+		expect(conflictCheckCoalesceKey(project.repo, '42', 'main')).toBe(
+			'resolve-conflicts:acme/widgets:42:main',
+		);
+	});
+});
+
 describe('resolve-conflicts trigger: merge automation catch-up', () => {
 	const catchUpEvent = createMockScmTriggerContext({
 		project,
