@@ -510,7 +510,7 @@ function nextWallClockOccurrence(hour: number, minute: number, now: Date, timeZo
 	// A reset that already passed today means the next occurrence is tomorrow.
 	// Adding a fixed 24h (rather than re-deriving tomorrow's wall time) can skew
 	// the instant by an hour across a DST boundary — harmless here: the reset is
-	// only a hint, and the consumer buffers + clamps the delay to [6min, 6h].
+	// only a hint, and the consumer buffers + clamps the delay.
 	if (target.getTime() <= now.getTime()) {
 		target = new Date(target.getTime() + 24 * 60 * 60 * 1000);
 	}
@@ -544,11 +544,12 @@ function structuralRateLimit(result: AgentCliResult): boolean {
 }
 
 /**
- * The reset text of a run already classified rate-limited. Claude's own failure
- * record names its reset first when it carries one — the terminal tail's first
- * "reset" can be an earlier line of the agent's own work (issue #1196). The
- * tail's shared "resets …" match then wins for every other CLI; Codex's own
- * `try again at …` phrasing is the fallback. `codex` says which one was chosen,
+ * The reset text of a run already classified rate-limited. The CLI's own failure
+ * record names its reset first when it carries one — Claude's "resets …", Codex's
+ * `try again at …` — because the terminal tail's first "reset" can be an earlier
+ * line of the agent's own work (issue #1196, and the same for Codex, whose
+ * `stdout` keeps its `agent_message` text). The tail's shared "resets …" match
+ * is read only when no record names one. `codex` says which one was chosen,
  * because only Codex's is read in the host's zone ({@link parseCodexReset}); a
  * hint either reader leaves unresolved keeps `retryAfter` undefined and the
  * consumer on its default backoff, never a downgraded classification.
@@ -558,13 +559,13 @@ function rateLimitResetHint(
 	tailResetMatch: RegExpExecArray | null,
 ): { text: string; codex: boolean } | undefined {
 	const claudeMessage = claudeRateLimitMessage(result);
-	const shared =
-		(claudeMessage ? RESET_RE.exec(claudeMessage)?.[1]?.trim() : undefined) ||
-		tailResetMatch?.[1]?.trim();
-	if (shared) return { text: shared, codex: false };
+	const claudeHint = claudeMessage ? RESET_RE.exec(claudeMessage)?.[1]?.trim() : undefined;
+	if (claudeHint) return { text: claudeHint, codex: false };
 	const codexMessage = codexRateLimitMessage(result);
 	const codexHint = codexMessage ? codexResetHint(codexMessage) : undefined;
-	return codexHint ? { text: codexHint, codex: true } : undefined;
+	if (codexHint) return { text: codexHint, codex: true };
+	const tailHint = tailResetMatch?.[1]?.trim();
+	return tailHint ? { text: tailHint, codex: false } : undefined;
 }
 
 /** The instant a {@link rateLimitResetHint} names, read by whichever parser owns its phrasing. */

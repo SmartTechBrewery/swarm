@@ -598,6 +598,34 @@ describe('classifyAgentFailure', () => {
 			expect(failure.retryAfter).toBeUndefined();
 		});
 
+		it.each([
+			[
+				'a dated hint over an agent line that mentions a reset',
+				'I will reset the branch to origin/main before rebasing.',
+				'Nov 4th, 2026 7:35 AM',
+				'2026-10-31T18:51:00Z',
+				'2026-11-04T06:35:00Z',
+			],
+			[
+				'a time-only hint over a resolvable-looking tail reset',
+				'The limiter resets the counter in 5m',
+				'7:15 PM',
+				'2026-10-31T17:20:00Z',
+				'2026-10-31T18:15:00Z',
+			],
+		])('prefers its own failure record: %s', (_label, stdout, resetText, now, expected) => {
+			// Codex's stdout keeps the agent's own messages, so the tail's first
+			// "reset" can be the agent's work rather than the CLI's verdict.
+			const message = `You’ve hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at ${resetText}.`;
+			const failure = classifyAgentFailure(
+				result({ cli: 'codex', stdout, codexFailure: { message } }),
+				new Date(now),
+				'Europe/Warsaw',
+			);
+			expect(failure.resetHint).toBe(resetText);
+			expect(failure.retryAfter).toEqual(new Date(expected));
+		});
+
 		it('still prefers the reset the CLI reported structurally', () => {
 			const rateLimitResetAt = new Date('2026-11-01T00:00:00Z');
 			const failure = classifyAgentFailure(
