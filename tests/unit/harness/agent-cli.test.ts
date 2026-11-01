@@ -263,6 +263,68 @@ describe('runAgentCli', () => {
 		]);
 	});
 
+	describe('a codex resume refused for want of a rollout (issue #1266)', () => {
+		const NO_ROLLOUT =
+			'Error: thread/resume: thread/resume failed: no rollout found for thread id fad75e02-8743-496a-b9d0-01a8ce5e2a89 (code -32600)\n';
+
+		it('starts a fresh session in the same call and reports its result', async () => {
+			const promise = runAgentCli(
+				createMockRunAgentCliOptions({
+					cli: 'codex',
+					resumeSessionId: 'fad75e02-8743-496a-b9d0-01a8ce5e2a89',
+					args: ['continue'],
+				}),
+			);
+			const refused = await spawnedChild(0);
+			refused.stderr.emit('data', NO_ROLLOUT);
+			refused.emit('close', 1, null);
+			const fresh = await spawnedChild(1);
+			fresh.stdout.emit(
+				'data',
+				`${JSON.stringify({ type: 'thread.started', thread_id: 'thread-new' })}\n`,
+			);
+			fresh.emit('close', 0, null);
+			const result = await promise;
+
+			expect(spawnMock).toHaveBeenCalledTimes(2);
+			const freshArgs = spawnMock.mock.calls[1][1] as string[];
+			expect(freshArgs[0]).toBe('exec');
+			expect(freshArgs).not.toContain('resume');
+			expect(freshArgs).not.toContain('fad75e02-8743-496a-b9d0-01a8ce5e2a89');
+			expect(result.exitCode).toBe(0);
+			expect(result.sessionId).toBe('thread-new');
+		});
+
+		it('does not retry a fresh run that prints the same line', async () => {
+			const promise = runAgentCli(createMockRunAgentCliOptions({ cli: 'codex', args: ['go'] }));
+			lastChild().stderr.emit('data', NO_ROLLOUT);
+			lastChild().emit('close', 1, null);
+			const result = await promise;
+			expect(spawnMock).toHaveBeenCalledTimes(1);
+			expect(result.exitCode).toBe(1);
+		});
+
+		it('does not retry a codex resume that failed for another reason', async () => {
+			const promise = runAgentCli(
+				createMockRunAgentCliOptions({ cli: 'codex', resumeSessionId: 'thread-1', args: ['go'] }),
+			);
+			lastChild().stderr.emit('data', 'boom\n');
+			lastChild().emit('close', 1, null);
+			await promise;
+			expect(spawnMock).toHaveBeenCalledTimes(1);
+		});
+
+		it('does not retry a claude resume', async () => {
+			const promise = runAgentCli(
+				createMockRunAgentCliOptions({ cli: 'claude', resumeSessionId: 'session-1', args: ['go'] }),
+			);
+			lastChild().stderr.emit('data', NO_ROLLOUT);
+			lastChild().emit('close', 1, null);
+			await promise;
+			expect(spawnMock).toHaveBeenCalledTimes(1);
+		});
+	});
+
 	describe('containment (issue #614)', () => {
 		// The per-CLI arguments themselves are covered in containment.test.ts; these
 		// assert the harness *wiring* — that a resolved plan lands in the position
