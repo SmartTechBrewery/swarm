@@ -18,7 +18,7 @@
 import type { DispatchWaitReason } from '../../db/repositories/dispatchesRepository.js';
 import { scheduleCoalescedDispatch } from '../../dispatch/dispatcher.js';
 import { logger } from '../../lib/logger.js';
-import type { MergeCatchUpRequest } from '../../queue/jobs.js';
+import type { MergeCatchUpRequest, ScmWebhookJob } from '../../queue/jobs.js';
 import type { ScmEvent } from '../../scm/events.js';
 import { SWARM_GENERATED_FOOTER } from '../../scm/swarm-origin.js';
 import type { PullRequestDetails } from '../../scm/types.js';
@@ -35,6 +35,52 @@ const TRIGGER_NAME = 'resolve-conflicts';
 const RECHECK_DELAY_MS = 30_000;
 const MAX_RECHECKS = 20;
 
+/**
+ * The coalesce identity of one pull request's conflict check against one base —
+ * shared by the fan-out, its rechecks, and merge automation's hand-off (issue
+ * #1264), so a request from any of them supersedes a pending one rather than
+ * queueing beside it.
+ */
+export function conflictCheckCoalesceKey(
+	repo: string,
+	prNumber: string,
+	baseBranch: string,
+): string {
+	return `resolve-conflicts:${repo}:${prNumber}:${baseBranch}`;
+}
+
+export interface ConflictCheckJobInput {
+	providerId: ScmWebhookJob['providerId'];
+	projectId: string;
+	repo: string;
+	prNumber: string;
+	baseBranch: string;
+}
+
+/**
+ * The per-PR conflict check for a pull request no merge event is in hand for —
+ * the shape the fan-out schedules, as merge automation asks for it when an
+ * approved head turns out to conflict with its base (issue #1264). It carries no
+ * `workItemId`/`prBranch`/`headSha`: there is no merged sibling for them to
+ * describe, and the per-PR path reads the candidate itself.
+ */
+export function buildConflictCheckJob(input: ConflictCheckJobInput): ScmWebhookJob {
+	return {
+		type: 'scm',
+		providerId: input.providerId,
+		projectId: input.projectId,
+		event: {
+			kind: 'pull-request',
+			action: 'closed',
+			merged: true,
+			repoFullName: input.repo,
+			isCommentEvent: false,
+			baseBranch: input.baseBranch,
+			conflictPrNumber: input.prNumber,
+		},
+	};
+}
+
 async function scheduleCandidate(
 	ctx: ScmTriggerContext,
 	prNumber: string,
@@ -50,7 +96,7 @@ async function scheduleCandidate(
 			event,
 			recheckAttempt: (ctx.recheckAttempt ?? 0) + 1,
 		},
-		`resolve-conflicts:${ctx.project.repo}:${prNumber}:${ctx.event.baseBranch}`,
+		conflictCheckCoalesceKey(ctx.project.repo, prNumber, ctx.event.baseBranch ?? ''),
 		delay,
 		waitReason,
 	);
