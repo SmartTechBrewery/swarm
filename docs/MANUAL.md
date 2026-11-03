@@ -1053,7 +1053,9 @@ are assembled by the compose file from `POSTGRES_PASSWORD` and `REDIS_PASSWORD`.
 **Prerequisites:** a Linux host with Docker Engine and the Compose v2 plugin; a
 DNS `A`/`AAAA` record for your domain pointing at it; inbound `80` and `443` open
 (Caddy needs `80` for the ACME challenge), and outbound HTTPS allowed (image pulls,
-provider APIs).
+provider APIs). A host without inbound `80`/`443` runs the bundle
+[behind a Cloudflare Tunnel](#behind-a-cloudflare-tunnel-instead-of-caddy) instead,
+and needs no DNS record of its own.
 
 ### Get the bundle and configure it
 
@@ -1130,6 +1132,48 @@ lapsed, `docker compose restart app` logs a fresh one.
   password link it shows; membership can also be granted on the project's Members
   tab). Then follow Steps 2–6 on the
   worker's machine with `--control-plane-url https://<your domain>`.
+
+### Behind a Cloudflare Tunnel instead of Caddy
+
+Caddy needs inbound `80` and `443` on a public address. A host that has neither —
+a shared-IPv4 LXC VPS such as [Mikrus](https://mikr.us), which forwards only a few
+high ports to each server, or a machine behind NAT — can run the same bundle with
+`cloudflared` in Caddy's place. The tunnel dials out to Cloudflare, Cloudflare
+terminates HTTPS for your domain, and every request (the `/worker/stream`
+WebSocket upgrade included) reaches `app:3000` over the `edge` network. No service
+publishes a port at all.
+
+It is an opt-in override, `deploy/vps/docker-compose.tunnel.yml`: a plain
+`docker compose up -d` never reads it, so a Caddy install is unaffected.
+
+1. **Create the tunnel** in the Cloudflare Zero Trust dashboard (Networks →
+   Tunnels → Create a tunnel → Cloudflared) for a domain on Cloudflare DNS, and
+   copy its token. Give it **one** public hostname — your domain, no path — with
+   service `http://app:3000`. The all-in-one app needs no path rules, so an
+   existing tunnel that splits paths between a router and an API server is
+   collapsed to that single entry.
+2. **Fetch the override** beside the other three files (or `scp` it from a
+   checkout):
+
+   ```bash
+   curl -fsSLO "$base/docker-compose.tunnel.yml"
+   ```
+
+3. **Add two lines to `.env`** (both are in `.env.example`, commented out):
+
+   ```bash
+   COMPOSE_FILE=docker-compose.yml:docker-compose.tunnel.yml
+   CLOUDFLARE_TUNNEL_TOKEN=<the tunnel's token>
+   ```
+
+   `WEBHOOK_CALLBACK_BASE_URL` is still `https://<your domain>` — the tunnel's
+   hostname — and no DNS record needs to point at the server: the tunnel's own
+   `CNAME` does that.
+
+Everything else in this section reads the same: `docker compose up -d`,
+`docker compose ps` and `docker compose logs app` pick up the override from
+`COMPOSE_FILE`. `cloudflared` starts only once the app is healthy, and Caddy is
+kept out of the default set by a profile, so it neither starts nor binds a port.
 
 ### Restarts, updates, backup and restore
 
