@@ -1,0 +1,32 @@
+# Cloudflare Tunnel in place of Caddy — an override for docker-compose.yml, for a
+# host that cannot take inbound 80/443 on a public IPv4 (a shared-IPv4 LXC VPS
+# such as Mikrus, or anything behind NAT). cloudflared dials out to Cloudflare,
+# which terminates HTTPS for the domain and forwards every request — the
+# /worker/stream WebSocket upgrade included — to app:3000. Nothing publishes a
+# port. Walkthrough: docs/MANUAL.md, "Behind a Cloudflare Tunnel instead of Caddy".
+#
+# Opt-in only: a plain `docker compose up -d` never reads this file, so a Caddy
+# install is unchanged. Turn it on by adding to .env:
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.tunnel.yml
+#   CLOUDFLARE_TUNNEL_TOKEN=<the tunnel's token>
+
+services:
+  caddy:
+    # Kept out of the default set: Caddy would try to bind 80/443 and obtain a
+    # certificate this host cannot be reached for.
+    profiles: ["caddy"]
+
+  cloudflared:
+    # Pinned like every other image here; bump deliberately.
+    image: cloudflare/cloudflared:2026.7.2
+    restart: unless-stopped
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      # Read from the environment rather than argv, so it stays out of `ps`.
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN in .env — see .env.example}
+    # Started only once the app is healthy (migrations done, port bound), so the
+    # tunnel never serves Cloudflare 502s for a starting app.
+    depends_on:
+      app: { condition: service_healthy }
+    # The same network Caddy uses: reaches app:3000, and has egress to Cloudflare.
+    networks: [edge]
