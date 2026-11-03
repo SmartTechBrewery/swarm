@@ -78,6 +78,9 @@ logs/
 # actually run: the machines, their launchd agents, where the live data is. Local by
 # definition, so it is never committed; a fresh clone simply has none.
 ai/LOCAL_CONFIG.md
+# The same for the server hosting this installation's control plane (ai/RULES.md §7):
+# how to reach it, where the stack and backups live, how to operate it.
+ai/VPS.md
 
 # Operator crib sheet for standing up a new project — local notes, not a
 # maintained reference (the sources of truth are docs/configuration.md,
