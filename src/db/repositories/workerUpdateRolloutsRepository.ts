@@ -291,6 +291,33 @@ export async function findLatestInstallationRollout(): Promise<WorkerUpdateRollo
 }
 
 /**
+ * The most recent installation-wide rollout to exactly `target`, **whatever its
+ * status**, or `undefined` when the fleet has never been offered that build (issue
+ * #1284).
+ *
+ * Any status on purpose: this is the record that the build was already offered to
+ * the fleet, which is what stops the automatic follow-the-installation rollout
+ * (`../../api/worker-follow-installation.ts`) from starting a second one — whether
+ * the first is still moving, completed, or halted on a bad build. Matched on the
+ * exact target rather than on the latest rollout, so an administrator's later
+ * manual rollout to another build does not read as "not yet offered" and get undone.
+ */
+export async function findInstallationRolloutForTarget(
+	target: string,
+): Promise<WorkerUpdateRollout | undefined> {
+	const rows = await getDb()
+		.select()
+		.from(workerUpdateRollouts)
+		.where(
+			and(eq(workerUpdateRollouts.scope, 'installation'), eq(workerUpdateRollouts.target, target)),
+		)
+		.orderBy(desc(workerUpdateRollouts.createdAt), desc(workerUpdateRollouts.id))
+		.limit(1);
+	const row = rows[0];
+	return row ? rowToRollout(row) : undefined;
+}
+
+/**
  * The rollouts an advance can still do something with (issue #1023): every
  * `in_progress` one, plus a `halted` one that still holds a member the rollout
  * committed to and has not settled.

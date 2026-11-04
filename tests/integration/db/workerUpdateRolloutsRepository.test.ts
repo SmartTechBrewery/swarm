@@ -10,6 +10,7 @@ import {
 	findAnyInProgressOwnerRollout,
 	findInProgressInstallationRollout,
 	findInProgressRolloutForOwner,
+	findInstallationRolloutForTarget,
 	findLatestInstallationRollout,
 	findLatestRolloutForOwner,
 	findRolloutHoldElsewhere,
@@ -394,6 +395,39 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 				);
 
 				expect(ids(await listAdvanceableRollouts())).toEqual([owned, installation]);
+			});
+		});
+
+		/**
+		 * The follow-the-installation guard's read (issue #1284): has the fleet already
+		 * been offered this exact build? Any status counts, which is what keeps a halted
+		 * rollout from being retried automatically.
+		 */
+		describe('findInstallationRolloutForTarget', () => {
+			for (const status of ['in_progress', 'halted', 'completed'] as const) {
+				it(`finds a ${status} installation rollout to the target`, async () => {
+					const id = await givenRollout(
+						adaId,
+						graceWorkerId,
+						status,
+						[status === 'in_progress' ? 'draining' : 'failed'],
+						'installation',
+					);
+
+					expect((await findInstallationRolloutForTarget('main'))?.id).toBe(id);
+				});
+			}
+
+			it('ignores an installation rollout to another target', async () => {
+				await givenRollout(adaId, graceWorkerId, 'halted', ['failed'], 'installation');
+
+				expect(await findInstallationRolloutForTarget('v9.9.9')).toBeUndefined();
+			});
+
+			it('ignores an owner-scoped rollout to the same target', async () => {
+				await givenRollout(adaId, adaWorkerId, 'halted', ['failed']);
+
+				expect(await findInstallationRolloutForTarget('main')).toBeUndefined();
 			});
 		});
 	},

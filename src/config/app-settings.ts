@@ -20,7 +20,10 @@
  * `agents`, it defaults *within the schema* (`.default('dark')`) rather than
  * downstream, since there's no coded fallback layer for it to fall through to.
  * Issue #956 added `maintenance`, which is the first key here that is **not** a
- * setting at all but machine-written state (see its own comment).
+ * setting at all but machine-written state (see its own comment). Issue #1284
+ * added `workers.followInstallationVersion`, whether the control plane rolls its
+ * fleet onto its own version after an upgrade — defaulted within the schema like
+ * `appearance`, since its only reader has no fallback layer either.
  * The top-level object shape is deliberate so future global settings (host
  * URL, worker concurrency, …) drop in as sibling keys without a migration (the
  * blob is extensible).
@@ -87,10 +90,36 @@ export const AppMaintenanceSettingsSchema = z
 export type AppMaintenanceSettings = z.infer<typeof AppMaintenanceSettingsSchema>;
 
 /**
+ * Global worker-fleet settings (issue #1284).
+ *
+ * `followInstallationVersion` keeps the fleet on the installation's own version:
+ * once a control plane has been up on a build its workers are not on, it starts one
+ * staged installation-wide rollout to that build (`src/api/worker-follow-installation.ts`)
+ * — the same waves, drain and halt an administrator's `swarm workers update --all`
+ * gets — and never a second one for the same build.
+ *
+ * **Defaults to `true`.** ADR-006 named a fleet that drifts behind its installation
+ * by default as the failure to avoid, and an off-by-default switch would leave every
+ * installation carrying exactly that drift until somebody remembered to flip it. On
+ * is safe to default to because the move is the bounded rollout an administrator
+ * would start by hand: one machine at a time, drained only once idle so no run is
+ * interrupted, halted on a bad build, and a runtime worker rolls itself back. An
+ * installation that prefers to update by hand turns it off.
+ */
+export const AppWorkersSettingsSchema = z
+	.object({
+		followInstallationVersion: z.boolean().default(true),
+	})
+	.describe("Global worker-fleet settings — whether workers follow the installation's own version");
+
+export type AppWorkersSettings = z.infer<typeof AppWorkersSettingsSchema>;
+
+/**
  * The whole global-settings blob. `agents` is optional so an empty `{}` is a
  * valid (all-defaults) settings object; `appearance` always materializes (with
  * its own defaulted `theme`) so every parse — including of `{}` — yields an
  * effective theme rather than requiring every caller to fall back manually.
+ * `workers` materializes the same way, for the same reason.
  * `maintenance` is optional and never defaulted: an absent marker is the honest
  * "this has not happened yet", and materializing an empty object would say the
  * same thing in more bytes.
@@ -102,6 +131,7 @@ export const AppSettingsSchema = z
 		agents: AppAgentsSettingsSchema.optional(),
 		appearance: AppAppearanceSettingsSchema.default({ theme: 'dark' }),
 		maintenance: AppMaintenanceSettingsSchema.optional(),
+		workers: AppWorkersSettingsSchema.default({ followInstallationVersion: true }),
 	})
 	.describe('SWARM global (app-wide) settings, persisted as one jsonb blob');
 
@@ -110,7 +140,8 @@ export type AppSettings = z.infer<typeof AppSettingsSchema>;
 
 /**
  * The baseline returned when no `app_settings` row exists — the schema's
- * defaults applied to an empty object (`{ appearance: { theme: 'dark' } }`).
+ * defaults applied to an empty object
+ * (`{ appearance: { theme: 'dark' }, workers: { followInstallationVersion: true } }`).
  * With no global overrides, the coded per-CLI defaults still apply downstream
  * via `DEFAULT_MODEL_PER_CLI`, so `agents` staying absent here is correct.
  */

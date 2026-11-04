@@ -1009,7 +1009,10 @@ control plane first, workers after.** An older control plane does not serve the
 report route, so a newer daemon's outcome reaches a 404 and is lost (the daemon
 itself survives and keeps working); an older daemon does not recognise the pushed
 frame and ignores it, so the request sits pending until that machine is upgraded by
-hand. Deploy the router and API server, then the workers.
+hand. Deploy the router and API server, then the workers — which, with
+`workers.followInstallationVersion` on (the default, issue #1284), the control plane
+does itself about two minutes after it starts on the new version
+([`configuration.md`](./configuration.md#global-settings-app_settings)).
 
 **What "it worked" looks like.** `swarm workers list` marks the machine
 `update <ref> pending` while the request is outstanding and `update <ref> <outcome>`
