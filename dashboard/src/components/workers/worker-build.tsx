@@ -7,10 +7,11 @@ import { Badge } from '@/components/ui/badge.js';
  * than copied into two components that then drift.
  *
  * The build itself is the daemon's own declaration: the commit its SWARM install
- * root is on, plus a flag for a checkout that is dirty or whose `dist/` build
- * predates that commit. It answers the question `daemonVersion` cannot — that
- * resolves to `package.json`'s never-bumped `0.1.0`, identical on every machine in
- * the fleet whatever code it is running.
+ * root is on (or, for the image and a packaged install with no checkout of its own,
+ * the commit stamped at build time), plus a flag for a checkout that is dirty or
+ * whose `dist/` build predates that commit. It answers the question the version
+ * cannot: a release version moves only when one is cut, so between two releases
+ * every machine reports the same string whatever code it is running.
  *
  * Since issue #978 the module holds the *second* mark those screens put beside a
  * machine's name — `Updating`, for a request still outstanding. It lives here
@@ -19,11 +20,17 @@ import { Badge } from '@/components/ui/badge.js';
  * coincidence of two components.
  */
 
-/** A build as one scannable token: the abbreviated commit, marked when the checkout it named was dirty. */
+/**
+ * A build as one scannable token: the abbreviated commit, marked when the checkout
+ * it named was dirty, led by the release version — the one passed in (a worker's,
+ * stored on its own axis) or else the one the build itself carries (the control
+ * plane's, issue #1285).
+ */
 export function formatWorkerBuild(
-	build: { commit: string; dirty: boolean },
-	version?: string | null,
+	build: { commit: string; dirty: boolean; version?: string },
+	explicitVersion?: string | null,
 ): string {
+	const version = explicitVersion ?? build.version;
 	const commit = `${build.commit.slice(0, 7)}${build.dirty ? '+dirty' : ''}`;
 	// The version leads because it is what an operator says out loud, and the commit
 	// stays because it is what "Outdated" was actually decided on — dropping it would
@@ -56,7 +63,7 @@ export function WorkerBuildBadge({
 	 * Only the detail view does — it is one value for the whole installation, so the
 	 * roster payload does not repeat it per row.
 	 */
-	controlPlaneBuild?: { commit: string; dirty: boolean } | null;
+	controlPlaneBuild?: { commit: string; dirty: boolean; version?: string } | null;
 }) {
 	if (buildIsCurrent !== false) return null;
 	const against = controlPlaneBuild ? ` (${formatWorkerBuild(controlPlaneBuild)})` : '';

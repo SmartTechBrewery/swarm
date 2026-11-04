@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+	BUILD_INFO_FILENAME,
 	buildIsOnTarget,
 	resolveBuildIdentity,
 	resolveOwnBuildIdentity,
@@ -39,7 +40,7 @@ function makeCheckout(committedAt = '2026-01-01T00:00:00Z'): string {
 	roots.push(root);
 	execFileSync('git', ['init', '-q', '-b', 'main', root], { env: gitEnv });
 	writeFileSync(join(root, '.gitignore'), 'dist/\nlogs/\n');
-	writeFileSync(join(root, 'package.json'), '{}\n');
+	writeFileSync(join(root, 'package.json'), '{"version":"1.5.4"}\n');
 	git(root, ['add', '.']);
 	git(root, ['-c', 'user.email=t@e.com', '-c', 'user.name=T', 'commit', '-q', '-m', 'seed'], {
 		...gitEnv,
@@ -70,15 +71,20 @@ describe('resolveBuildIdentity', () => {
 		expect(build).toEqual({
 			commit: git(root, ['rev-parse', 'HEAD']).trim(),
 			dirty: false,
+			version: '1.5.4',
 		});
 		expect(build?.commit).toMatch(/^[0-9a-f]{40}$/);
 	});
 
 	it('reports the same commit with dirty set when the tree has an uncommitted change', async () => {
 		const root = makeCheckout();
-		writeFileSync(join(root, 'package.json'), '{"changed":true}\n');
+		writeFileSync(join(root, 'package.json'), '{"version":"1.5.4","changed":true}\n');
 		const build = await resolveBuildIdentity(root, sourceModule(root));
-		expect(build).toEqual({ commit: git(root, ['rev-parse', 'HEAD']).trim(), dirty: true });
+		expect(build).toEqual({
+			commit: git(root, ['rev-parse', 'HEAD']).trim(),
+			dirty: true,
+			version: '1.5.4',
+		});
 	});
 
 	// The case that would otherwise make every real host report dirty: `dist/`,
@@ -132,6 +138,76 @@ describe('resolveBuildIdentity', () => {
 		git(root, ['-c', 'user.email=t@e.com', '-c', 'user.name=T', 'commit', '-q', '-am', 'ignore']);
 		const build = await resolveBuildIdentity(root, path);
 		expect(build?.dirty).toBe(false);
+	});
+});
+
+// Issue #1285: an install root with no checkout of its own — the published image,
+// a packaged worker — declares the version and commit stamped at build time.
+describe('resolveBuildIdentity from a build-info stamp', () => {
+	const STAMPED = 'ABCDEF0123456789abcdef0123456789abcdef01';
+
+	function makeStampedRoot(stamp: unknown, pkg: unknown = { version: '1.5.4' }): string {
+		const root = mkdtempSync(join(tmpdir(), 'swarm-build-identity-stamp-'));
+		roots.push(root);
+		writeFileSync(join(root, 'package.json'), JSON.stringify(pkg));
+		writeFileSync(join(root, BUILD_INFO_FILENAME), JSON.stringify(stamp));
+		return root;
+	}
+
+	it('reports the stamped version and commit, clean, where there is no .git', async () => {
+		const root = makeStampedRoot({ version: '1.5.4', commit: STAMPED });
+		await expect(resolveBuildIdentity(root, sourceModule(root))).resolves.toEqual({
+			commit: STAMPED.toLowerCase(),
+			dirty: false,
+			version: '1.5.4',
+		});
+	});
+
+	it("falls back to package.json's version when the stamp names none", async () => {
+		const root = makeStampedRoot({ commit: STAMPED }, { version: '2.0.0' });
+		const build = await resolveBuildIdentity(root, sourceModule(root));
+		expect(build?.version).toBe('2.0.0');
+	});
+
+	it('declares nothing for a stamp whose commit is not a hex id', async () => {
+		const root = makeStampedRoot({ version: '1.5.4', commit: 'not-a-commit' });
+		await expect(resolveBuildIdentity(root, sourceModule(root))).resolves.toBeUndefined();
+	});
+
+	it('declares nothing for an unreadable stamp', async () => {
+		const root = makeStampedRoot({});
+		writeFileSync(join(root, BUILD_INFO_FILENAME), '{ not json');
+		await expect(resolveBuildIdentity(root, sourceModule(root))).resolves.toBeUndefined();
+	});
+
+	// A packaged install lives in some project's `node_modules`, inside that project's
+	// checkout: its HEAD is the project's commit, not SWARM's.
+	it("prefers the stamp over an enclosing repository's HEAD", async () => {
+		const project = makeCheckout();
+		const root = join(project, 'node_modules', 'swarm');
+		mkdirSync(root, { recursive: true });
+		writeFileSync(join(project, '.gitignore'), 'dist/\nlogs/\nnode_modules/\n');
+		writeFileSync(join(root, 'package.json'), '{"version":"1.5.4"}');
+		writeFileSync(join(root, BUILD_INFO_FILENAME), JSON.stringify({ commit: STAMPED }));
+		const build = await resolveBuildIdentity(root, sourceModule(root));
+		expect(build).toEqual({ commit: STAMPED.toLowerCase(), dirty: false, version: '1.5.4' });
+	});
+
+	it("declares nothing — never the enclosing repository's HEAD — without a stamp", async () => {
+		const project = makeCheckout();
+		const root = join(project, 'node_modules', 'swarm');
+		mkdirSync(root, { recursive: true });
+		await expect(resolveBuildIdentity(root, sourceModule(root))).resolves.toBeUndefined();
+	});
+
+	// A clone keeps git's answer — and its dirty flag — even if a stamp is lying around.
+	it('lets a checkout of its own win over a stale stamp', async () => {
+		const root = makeCheckout();
+		writeFileSync(join(root, '.gitignore'), `dist/\nlogs/\n${BUILD_INFO_FILENAME}\n`);
+		writeFileSync(join(root, BUILD_INFO_FILENAME), JSON.stringify({ commit: STAMPED }));
+		const build = await resolveBuildIdentity(root, sourceModule(root));
+		expect(build?.commit).toBe(git(root, ['rev-parse', 'HEAD']).trim());
+		expect(build?.dirty).toBe(true);
 	});
 });
 

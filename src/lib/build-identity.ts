@@ -1,13 +1,31 @@
 /**
- * The **build identity of the SWARM install this module is part of** — the commit
- * its checkout is on, plus a flag saying the running code is not exactly that
- * commit (issue #918).
+ * The **build identity of the SWARM install this module is part of** — its release
+ * version and the source commit it was built from, plus a flag saying the running
+ * code is not exactly that commit (issues #918, #1285).
  *
- * It exists because `package.json`'s `version` cannot answer "is this worker
- * running the fix?". That version is `0.1.0` and never moves, so `daemonVersion`
- * (`../transport/connect-entry.ts`) — the only build fact the handshake carried —
- * is the same string on every daemon in the fleet, whatever code it is running. A
- * commit id moves with the code, which is the whole point.
+ * The commit is the comparand: it moves with the code, so "is this worker running
+ * the fix?" is answered by it. The version is the *label* an operator says out loud.
+ * It does move now — `bin/swarm-release` bumps `package.json` and tags `v*` on
+ * every release — but between two releases every build carries the same string
+ * whatever code it runs, so it is never what staleness is judged on.
+ *
+ * **Two sources, one answer** ({@link resolveBuildIdentity}):
+ *
+ * 1. **A checkout of its own** — the install root is the top level of a git work
+ *    tree. HEAD is the commit, `package.json` the version, and `dirty` covers an
+ *    uncommitted change or a `dist/` build older than HEAD. This is every clone and
+ *    every worktree, and it wins whenever it applies, because only git can say the
+ *    code differs from the commit it names.
+ * 2. **A stamped build** — `build-info.json` ({@link BUILD_INFO_FILENAME}) at the
+ *    install root, written at build time by `bin/write-build-info.js` from the
+ *    commit CI built (`Dockerfile`'s `SWARM_BUILD_COMMIT`). This is the published
+ *    image, which has no `.git`, and a packaged install, whose root may sit inside
+ *    some *other* repository's `node_modules` — the reason (1) asks for the work
+ *    tree's top level rather than merely "is there a HEAD": an install nested in a
+ *    project's checkout would otherwise report the project's commit. A stamped
+ *    build is never `dirty`; it was built from a committed source.
+ *
+ * Neither present → nothing is declared, exactly as before.
  *
  * **The install root is not the worker's repo root.** On a control-plane host
  * several daemons serve several different project repositories and all load SWARM
@@ -21,17 +39,12 @@
  * `node_modules`.
  *
  * **Never throws**, on the same contract as `resolveOriginRepoSlug`
- * (`../scm/repo-slug.ts`): an install root that is not a git checkout (the Compose
- * router image has no `.git` at all) declares nothing and keeps starting.
- *
- * Deliberately *not* guarded: an install root nested inside another git repository
- * would report the outer repository's HEAD. That is operator error of the same
- * class `repo-slug.ts` already declines to defend against, and checking it would
- * buy a third subprocess for a case nobody has.
+ * (`../scm/repo-slug.ts`): an install root with neither a checkout nor a stamp
+ * declares nothing and keeps starting.
  */
 
 import { execFile } from 'node:child_process';
-import { stat } from 'node:fs/promises';
+import { readFile, realpath, stat } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
@@ -47,6 +60,13 @@ import { z } from 'zod';
  * commit it names: uncommitted changes in the checkout, and a `dist/` build older
  * than HEAD (`bin/swarm.js` runs the compiled output, so those two can diverge).
  * The pair travels together so a consumer cannot read a commit without its flag.
+ *
+ * `version` is the release the build carries (issue #1285) — a label beside the
+ * commit, never a comparand. **Optional on purpose**: a daemon on a build that
+ * predates it sends `{ commit, dirty }` alone and must still parse, and an older
+ * control plane strips a key it does not know. A worker's version is persisted on
+ * its own axis (`workers.version`, from `daemonVersion`), so the stored build
+ * carries none; the control plane's own build carries it for display.
  */
 export const WorkerBuildSchema = z.object({
 	commit: z
@@ -55,6 +75,7 @@ export const WorkerBuildSchema = z.object({
 		.toLowerCase()
 		.pipe(z.string().regex(/^[0-9a-f]{7,64}$/, 'must be a hex commit id')),
 	dirty: z.boolean(),
+	version: z.string().trim().min(1).max(100).optional(),
 });
 export type WorkerBuild = z.infer<typeof WorkerBuildSchema>;
 
@@ -196,9 +217,26 @@ async function git(cwd: string, args: string[]): Promise<string | null> {
 }
 
 /**
+ * The stamp a build without a checkout of its own declares itself by (issue
+ * #1285), at the install root beside `package.json`. Written at build time by
+ * `bin/write-build-info.js`; gitignored, so a clone never commits one.
+ */
+export const BUILD_INFO_FILENAME = 'build-info.json';
+
+/**
+ * The stamp's shape. Unknown keys are ignored so a later writer can add a field
+ * without a reader on an older build refusing the whole file.
+ */
+const BuildInfoSchema = z.object({
+	commit: z.string(),
+	version: z.string().optional(),
+});
+
+/**
  * Resolve a build identity for `root`, given the path of the module actually
  * executing — the testable form of {@link resolveOwnBuildIdentity}, which supplies
- * this module's own coordinates.
+ * this module's own coordinates. A checkout of its own wins over a stamp; see the
+ * module header for why.
  *
  * `modulePath` decides whether the *unbuilt* half of `dirty` is checked at all: it
  * is meaningful only when the running code is compiled output under `root/dist`,
@@ -209,21 +247,83 @@ export async function resolveBuildIdentity(
 	root: string,
 	modulePath: string,
 ): Promise<WorkerBuild | undefined> {
-	const commit = await git(root, ['rev-parse', 'HEAD']);
-	if (!commit) return undefined;
+	const fromCheckout = await resolveCheckoutBuild(root, modulePath);
+	if (fromCheckout !== null) return fromCheckout;
+	return await readBuildInfo(root);
+}
+
+/**
+ * The identity of an install root that is the top level of its own git work tree,
+ * `null` when it is not one (so the stamp is consulted), or `undefined` when it is
+ * one whose answer cannot be parsed.
+ */
+async function resolveCheckoutBuild(
+	root: string,
+	modulePath: string,
+): Promise<WorkerBuild | undefined | null> {
+	// One subprocess for both answers: the work tree's top level, then HEAD.
+	const revParse = await git(root, ['rev-parse', '--show-toplevel', 'HEAD']);
+	if (!revParse) return null;
+	const [toplevel, commit] = revParse.split('\n').map((line) => line.trim());
+	if (!toplevel || !commit || !(await isSamePath(toplevel, root))) return null;
 
 	const status = await git(root, ['status', '--porcelain']);
 	// A failed `status` (but a readable HEAD) leaves the honest answer unknown, so
 	// say dirty rather than claim clean: the flag exists to stop a build being
 	// trusted, and a false "clean" is the one wrong answer that matters.
 	const dirty = status === null || status !== '' || (await isStaleBuild(root, modulePath, commit));
+	const version = await readPackageVersion(root);
 
-	const parsed = WorkerBuildSchema.safeParse({ commit, dirty });
+	const parsed = WorkerBuildSchema.safeParse({ commit, dirty, ...(version ? { version } : {}) });
 	// Same reason `resolveDeclarableOriginRepoSlug` filters: the daemon parses its
 	// own handshake body at startup, so a value the wire schema would reject must
 	// never reach it — an odd `rev-parse` output leaves it undeclared instead of
 	// killing the daemon.
 	return parsed.success ? parsed.data : undefined;
+}
+
+/**
+ * The stamped identity at `root`, or `undefined` when there is no stamp or it does
+ * not parse. A stamp naming no version falls back to `package.json`'s.
+ */
+async function readBuildInfo(root: string): Promise<WorkerBuild | undefined> {
+	const stamp = BuildInfoSchema.safeParse(await readJson(join(root, BUILD_INFO_FILENAME)));
+	if (!stamp.success) return undefined;
+	const version = stamp.data.version?.trim() || (await readPackageVersion(root));
+	const parsed = WorkerBuildSchema.safeParse({
+		commit: stamp.data.commit,
+		dirty: false,
+		...(version ? { version } : {}),
+	});
+	return parsed.success ? parsed.data : undefined;
+}
+
+/** `package.json`'s `version` at `root`, or `undefined` when it has none to give. */
+async function readPackageVersion(root: string): Promise<string | undefined> {
+	const pkg = await readJson(join(root, 'package.json'));
+	const version = (pkg as { version?: unknown } | undefined)?.version;
+	return typeof version === 'string' && version.trim() ? version.trim() : undefined;
+}
+
+async function readJson(path: string): Promise<unknown> {
+	try {
+		return JSON.parse(await readFile(path, 'utf8'));
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Whether two paths name one directory. Compared through `realpath` because git
+ * reports a resolved top level while `root` may arrive through a symlink (macOS's
+ * `/var` → `/private/var` tmpdir is the everyday case).
+ */
+async function isSamePath(a: string, b: string): Promise<boolean> {
+	try {
+		return (await realpath(a)) === (await realpath(b));
+	} catch {
+		return false;
+	}
 }
 
 /**
@@ -253,7 +353,7 @@ let ownBuildIdentity: Promise<WorkerBuild | undefined> | undefined;
  *
  * Memoized in a module-level promise: the identity of a running process is fixed
  * for its life, so re-resolving it could only invite two answers to differ — and it
- * costs two `git` subprocesses, which a caller on a per-request path must not pay
+ * costs `git` subprocesses, which a caller on a per-request path must not pay
  * repeatedly.
  */
 export function resolveOwnBuildIdentity(): Promise<WorkerBuild | undefined> {

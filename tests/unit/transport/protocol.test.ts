@@ -145,6 +145,26 @@ describe('transport protocol schemas', () => {
 			});
 		});
 
+		// Issue #1285: a current daemon also names the release beside the commit. The
+		// commit-only shape above is an older daemon's and must keep parsing as-is.
+		it('accepts a build carrying its release version beside the commit', () => {
+			expect(
+				HandshakeRequestSchema.parse({
+					...valid,
+					build: { commit: 'abc1234', dirty: false, version: ' 1.5.4 ' },
+				}).build,
+			).toEqual({ commit: 'abc1234', dirty: false, version: '1.5.4' });
+		});
+
+		it('rejects a build whose version is empty', () => {
+			expect(
+				HandshakeRequestSchema.safeParse({
+					...valid,
+					build: { commit: 'abc1234', dirty: false, version: '' },
+				}).success,
+			).toBe(false);
+		});
+
 		it('rejects a non-hex, too-short, or absent commit', () => {
 			for (const commit of ['zzzzzzz', 'abc123', '']) {
 				expect(

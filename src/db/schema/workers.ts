@@ -152,8 +152,8 @@ export const workers = pgTable(
 		 * The commit the **SWARM install root** of the daemon currently operating this
 		 * row is on (issue #918), declared at handshake. It answers what
 		 * `HandshakeRequestSchema.daemonVersion` cannot: that resolves to
-		 * `package.json`'s `version`, which never moves, so it is the same string on
-		 * every daemon whatever code it runs.
+		 * `package.json`'s `version`, which moves only when a release is cut, so
+		 * between releases it is the same string on every daemon whatever code it runs.
 		 *
 		 * Nullable with no default: NULL means "this daemon declared no build" — what
 		 * every row written before this column says, what a daemon too old to send the

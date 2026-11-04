@@ -56,5 +56,9 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Stamped into build-info.json so the running control plane knows the
+          # commit it was built from — the image has no .git (issue #1285).
+          build-args: |
+            SWARM_BUILD_COMMIT=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

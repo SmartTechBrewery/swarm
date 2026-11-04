@@ -32,8 +32,14 @@ COPY --from=builder /app/src/db/migrations ./src/db/migrations
 # createApiApp serves the SPA from ./dashboard/dist (cwd-relative).
 COPY --from=builder /app/dashboard/dist ./dashboard/dist
 
-# No .git in the image, so src/lib/build-identity.ts declares no commit; the source
-# commit is the org.opencontainers.image.revision label CI stamps on the image.
+# No .git in the image, so the build identity (src/lib/build-identity.ts) comes from
+# build-info.json: package.json's version plus the source commit CI passes in as
+# SWARM_BUILD_COMMIT (the same commit as the org.opencontainers.image.revision
+# label). Declared this late so a new commit invalidates only this layer. Without
+# the arg nothing is stamped and the control plane declares no build.
+ARG SWARM_BUILD_COMMIT=""
+COPY bin/write-build-info.js ./bin/write-build-info.js
+RUN node bin/write-build-info.js /app
 USER node
 ENV PORT=3000
 EXPOSE 3000

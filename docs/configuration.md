@@ -114,6 +114,11 @@ The **implementer** persona is no longer a project credential (issue #396), and 
 
 **Re-running failed checks needs one more grant on the implementer credential** (issue #1133). `SCMProvider.rerunFailedChecks` writes as the implementer by default — the persona merge automation acts as — so the [per-worker operator credential](#per-worker-operator-scm-credential) of the worker that produced the pull request needs: on **GitHub**, `Actions: Read and write` on a fine-grained PAT (a classic PAT's `repo` scope already covers it); on **GitLab**, the `api` scope; on **Azure DevOps**, `Build (Read & execute)`. **Bitbucket** needs nothing extra: its provider declares the capability `unsupported`, because a Bitbucket build status cannot be re-run through the API. A token without the grant is not fatal — the re-run comes back as a `provider-error` carrying the provider's own refusal.
 
+**Image build** — build-time only (`Dockerfile`, `bin/write-build-info.js`), never read by a running process
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `SWARM_BUILD_COMMIT` | _(unset)_ | Docker build arg: the source commit stamped into the image's `build-info.json` beside `package.json`'s version, which is the build identity an install with no `.git` reports (issue #1285; `ai/ARCHITECTURE.md` "Build identity"). CI passes `github.sha`. Unset → nothing is stamped and the control plane declares no build; a non-hex value fails the build. |
+
 **Dashboard frontend (Vite)** — only `VITE_`-prefixed vars reach the browser (`dashboard/.env`)
 | Variable | Default | Purpose |
 | --- | --- | --- |
