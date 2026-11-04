@@ -1279,12 +1279,12 @@ in [Running on a VPS behind Caddy](#running-on-a-vps-behind-caddy) instead.
   Then it bumps `package.json`, commits `chore(release): vX.Y.Z` to `main` and
   tags it, and pushes both. It waits for the image build, which also moves
   `stable` and publishes the GitHub release, and checks that the release carries
-  the signed worker runtime (below). Finally it runs
-  `sudo dockerctl deploy app` on the server and checks that the new version is
-  live. It warns first when `deploy/vps` changed since the previous tag, because
-  the server's files may then need the admin. The server is
-  `$SWARM_DEPLOY_SSH` / `$SWARM_DEPLOY_URL`, defaulting to the SmartTechBrewery
-  VPS. A tag pushed by hand (`git tag vX.Y.Z && git push origin vX.Y.Z`) builds
+  the signed worker runtime (below). Finally, when
+  `SWARM_DEPLOY_SSH`, `SWARM_DEPLOY_URL` and `SWARM_DEPLOY_COMMAND` are set (in
+  the environment or the checkout's gitignored `.env`), it runs the command on the
+  server over SSH and checks that the new version is live. Without them it stops
+  after the release. It warns first when `deploy/vps` changed since the previous
+  tag, because the server's files may then need updating. A tag pushed by hand (`git tag vX.Y.Z && git push origin vX.Y.Z`) builds
   and moves `stable` the same way, but deploys nothing. A `vX.Y.Z-rc.N`
   pre-release does not move `stable`.
   The package has to be made **public** once by an org admin (GitHub → the org's

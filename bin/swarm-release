@@ -5,18 +5,27 @@
 # Shows the current version, asks for the new one (X.Y.Z), bumps package.json,
 # commits `chore(release): vX.Y.Z` on main, tags it, pushes both, waits for the
 # publish workflow to build the image, move `:stable` and publish the GitHub
-# release, checks that the release carries the signed worker runtime (its
-# tarball, `.sha256` and `.minisig`), then runs `dockerctl deploy app` on the
-# server and checks that the new version is live.
+# release, and checks that the release carries the signed worker runtime (its
+# tarball, `.sha256` and `.minisig`). When a deploy target is configured, it then
+# runs $SWARM_DEPLOY_COMMAND on the server over SSH and checks that the new
+# version is live.
 #
 # Run by a maintainer, by hand: it commits to main directly, which an agent
 # session never does (ai/RULES.md §6).
 #
-# The server is reached as $SWARM_DEPLOY_SSH and checked at $SWARM_DEPLOY_URL.
+# The deploy target is installation-specific, so it is never committed: set
+# SWARM_DEPLOY_SSH (user@host), SWARM_DEPLOY_URL (the installation's base URL)
+# and SWARM_DEPLOY_COMMAND (what pulls and restarts the app there) in the
+# environment or in this checkout's gitignored .env. Without them the release is
+# cut and the deploy is skipped.
 set -euo pipefail
 
-DEPLOY_SSH="${SWARM_DEPLOY_SSH:-jkwiecien@51.255.194.195}"
-DEPLOY_URL="${SWARM_DEPLOY_URL:-https://swarm-sm.pl}"
+# A value from the environment wins; otherwise the line in .env, if any.
+from_env_file() {
+	[ -f .env ] || return 0
+	sed -n "s/^$1=//p" .env | tail -1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"
+}
+
 REPO="SmartTechBrewery/swarm"
 WORKFLOW="publish-image.yml"
 
@@ -27,6 +36,10 @@ die() {
 step() { printf '\n==> %s\n' "$*"; }
 
 cd "$(dirname "$0")/.."
+
+DEPLOY_SSH="${SWARM_DEPLOY_SSH:-$(from_env_file SWARM_DEPLOY_SSH)}"
+DEPLOY_URL="${SWARM_DEPLOY_URL:-$(from_env_file SWARM_DEPLOY_URL)}"
+DEPLOY_COMMAND="${SWARM_DEPLOY_COMMAND:-$(from_env_file SWARM_DEPLOY_COMMAND)}"
 
 command -v gh >/dev/null || die "gh is not on PATH"
 gh auth status >/dev/null 2>&1 || die "gh is not signed in"
@@ -90,8 +103,15 @@ for asset in "$runtime" "$runtime.sha256" "$runtime.minisig"; do
 done
 echo "Release $tag carries the signed worker runtime"
 
+if [ -z "$DEPLOY_SSH" ] || [ -z "$DEPLOY_URL" ] || [ -z "$DEPLOY_COMMAND" ]; then
+	echo
+	echo "Released $tag. No deploy: set SWARM_DEPLOY_SSH, SWARM_DEPLOY_URL and SWARM_DEPLOY_COMMAND to deploy."
+	exit 0
+fi
+
 step "Deploying to $DEPLOY_SSH"
-ssh "$DEPLOY_SSH" sudo dockerctl deploy app
+# shellcheck disable=SC2029 # the command is meant to expand here and run there
+ssh "$DEPLOY_SSH" "$DEPLOY_COMMAND"
 
 step "Checking $DEPLOY_URL"
 for _ in $(seq 1 24); do
@@ -110,4 +130,4 @@ for _ in $(seq 1 24); do
 	fi
 	sleep 5
 done
-die "$DEPLOY_URL did not report $version within 2 minutes; check: ssh $DEPLOY_SSH sudo dockerctl logs app"
+die "$DEPLOY_URL did not report $version within 2 minutes; check the app's logs on $DEPLOY_SSH"

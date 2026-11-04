@@ -158,118 +158,73 @@ security model, and the provider boundaries.
 
 ---
 
-## Get a worker running
-
-A worker is a machine that runs the phases, in its own checkout of the project.
-Joining an installation that is already up takes one command, and needs **no
-GitHub account and no SWARM clone** — everything comes from the installation:
-
-1. **Have the prerequisites:** Node.js 22 or newer, git, an agent CLI (`claude`,
-   `codex` or `agy`) you are logged in to, and a checkout of the project the
-   worker is to serve. You also need a login on the installation, and membership
-   of the project.
-2. **In that checkout, run the installation's installer:**
-
-   ```bash
-   curl -fsSL https://<installation>/install.sh | sh
-   ```
-
-3. **Answer its questions:** your login email and password, the project, the
-   agent CLIs to offer, and your source-control token for the project's provider
-   when it needs one. It then installs the `swarm-worker` launcher, writes the
-   worker's profile, fetches and verifies the installation's runtime, and installs
-   the LaunchAgent that keeps the worker running (on macOS; elsewhere it prints
-   the `swarm-worker run <id>` to start it with).
-4. **Check it:** `swarm-worker status` shows the worker connected. If you do not
-   administer the project, a project administrator approves the enrollment
-   before work arrives.
-5. **Leave updates alone:** when the installation upgrades, it moves its workers
-   onto its new version itself. Nothing is needed from you.
-
-Flags for an unattended install, moving a worker that runs from a SWARM clone
-onto the launcher (`… | sh -s -- migrate`), and serving a second installation
-from the same machine are in
-[`docs/onboarding-worker.md`](docs/onboarding-worker.md). Operational detail is in
-[`docs/MANUAL.md`](docs/MANUAL.md#the-worker).
-
 ## Quick start
 
-To run an installation from source, from the repository root:
+### From a server installation
+
+On the server (Docker, a domain pointing at it, ports 80/443 open):
 
 ```bash
-npm install
-cp .env.docker.example .env       # set passwords
-cd dashboard && npm install && cd ..
-docker compose up -d --build      # Postgres, Redis, and router
-npm run db:migrate
-npm run db:seed                   # loads swarm.config.json into Postgres
+mkdir swarm && cd swarm
+base=https://raw.githubusercontent.com/SmartTechBrewery/swarm/main/deploy/vps
+for f in docker-compose.yml Caddyfile .env.example; do curl -fsSLO "$base/$f"; done
+cp .env.example .env && chmod 600 .env   # fill in: domain, image tag, secrets
+docker compose up -d
+docker compose logs app | grep 'setup?token='   # open it: create the admin
 ```
 
-Register this machine as a worker. Every deployment does — a phase runs on an
-enrolled worker or it waits. Working from the clone, register it with the clone's
-own CLI (other machines use the installer above):
+In the dashboard: create a project, add its credentials.
+
+On each worker machine, in the project's checkout:
 
 ```bash
+curl -fsSL https://<your-domain>/install.sh | sh
+swarm-worker status
+```
+
+Details: [`docs/MANUAL.md`](docs/MANUAL.md#running-on-a-vps-behind-caddy),
+[`docs/onboarding-worker.md`](docs/onboarding-worker.md).
+
+### From source
+
+```bash
+git clone https://github.com/SmartTechBrewery/swarm.git && cd swarm
+npm install && npm --prefix dashboard install
+cp .env.docker.example .env               # set passwords
+docker compose up -d --build              # Postgres, Redis, router
+npm run db:migrate && npm run db:seed     # seed loads swarm.config.json
 npm run swarm -- login --identifier localhost-admin
 npm run swarm -- workers register-and-enroll localhost-admin <project-id> \
   --name "this machine" --cli claude --control-plane-url http://localhost:3100
 ```
 
-`--control-plane-url` is the router base URL this machine's worker talks to —
-loopback here, the tunnel URL on a remote machine. The command writes it into
-`.env` when that file does not already name one, so nothing has to be edited by
-hand; pass it only on a machine that has not been pointed at an installation yet.
-
-Then start the processes and open <http://localhost:5173>:
+Then, each in its own terminal:
 
 ```bash
-npm run dev:api                   # API on 127.0.0.1:3101
-npm run dev:dashboard             # dashboard on localhost:5173
-npm run dev:worker                # the worker
+npm run dev:api          # API on 127.0.0.1:3101
+npm run dev:dashboard    # http://localhost:5173
+npm run dev:worker       # the worker
 ```
 
-The worker holds that terminal for as long as the machine is meant to accept
-work. **On macOS** it can run from a launchd agent instead, started at login —
-from the checkout it was registered for:
-
-```bash
-swarm-worker-agent install        # then: status · logs · update · uninstall
-```
-
-A local install is single-user by default: no account to create, no password, no
-`/login`. The prerequisites, the multi-user alternative, and the full worker
-runbook are in [`docs/MANUAL.md`](docs/MANUAL.md).
+Single-user by default, no login. Details: [`docs/MANUAL.md`](docs/MANUAL.md).
 
 ## Releasing
 
-A maintainer cuts a version and deploys it with one command, from a clean `main`:
-
 ```bash
-npm run release
+npm run release          # asks for X.Y.Z, tags, builds, publishes, deploys
 ```
 
-[`bin/swarm-release`](bin/swarm-release):
+Deploy target, in the environment or the checkout's `.env` (none set: release
+only):
 
-1. Pulls `main` and shows the current version and the latest tag.
-2. Asks for the new version as `X.Y.Z`. It refuses a malformed version, one lower
-   than the current one, and a tag that already exists.
-3. Warns when `deploy/vps` changed since the previous tag, because the server's
-   compose file, Caddyfile or `.env` may then need the admin.
-4. Bumps `package.json`, commits `chore(release): vX.Y.Z` on `main`, tags it
-   `vX.Y.Z` and pushes both. The pre-push hook runs the tests.
-5. Waits for GitHub Actions to build `ghcr.io/smarttechbrewery/swarm:vX.Y.Z`,
-   move `:stable` to it and publish the GitHub release, with notes generated from
-   the merged PRs.
-6. Checks that the release carries the signed worker runtime: its tarball,
-   `.sha256` and `.minisig` (see "Verifying the worker runtime" in
-   [`docs/MANUAL.md`](docs/MANUAL.md#verifying-the-worker-runtime)).
-7. Deploys to the VPS with `sudo dockerctl deploy app`. Migrations run when the
-   app starts.
-8. Checks that `/health` answers and that the dashboard reports the new version.
+```bash
+SWARM_DEPLOY_SSH=user@host
+SWARM_DEPLOY_URL=https://<your-domain>
+SWARM_DEPLOY_COMMAND="cd ~/swarm && docker compose pull app && docker compose up -d app"
+```
 
-It needs a signed-in `gh` and SSH access to the server. `SWARM_DEPLOY_SSH`
-(default `jkwiecien@51.255.194.195`) and `SWARM_DEPLOY_URL` (default
-`https://swarm-sm.pl`) override the target.
+Details: [`bin/swarm-release`](bin/swarm-release),
+[`docs/MANUAL.md`](docs/MANUAL.md#the-published-image).
 
 ## Documentation
 
