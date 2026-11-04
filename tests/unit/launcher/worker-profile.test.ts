@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
 	isValidWorkerId,
 	listWorkerProfiles,
+	MAX_FAILED_STARTS,
 	readWorkerProfile,
 	readWorkerState,
 	updateWorkerProfileRepoRoots,
@@ -25,6 +26,7 @@ import {
 	writeWorkerProfile,
 	writeWorkerState,
 } from '@/launcher/worker-profile.js';
+import { MAX_FAILED_STARTS as CLONE_MAX_FAILED_STARTS } from '@/worker/self-update.js';
 
 const WORKER_ID = '3f1c2a7e-0d4b-4c55-9a7e-1b2c3d4e5f60';
 const NOW = Date.parse('2026-11-04T12:00:00.000Z');
@@ -168,5 +170,48 @@ describe('worker profiles', () => {
 		expect(statSync(join(workerProfileDir(WORKER_ID, home), 'state.json')).mode & 0o777).toBe(
 			0o600,
 		);
+	});
+
+	it('derives a patch from the state as read, when given a function', () => {
+		write();
+		writeWorkerState(
+			WORKER_ID,
+			{ lastRuntimeVersion: '1.2.3', startedAt: '2026-11-04T12:00:00.000Z' },
+			home,
+		);
+		updateWorkerState(
+			WORKER_ID,
+			(state) => ({ lastKnownGoodVersion: state.lastKnownGoodVersion ?? state.lastRuntimeVersion }),
+			home,
+		);
+		writeWorkerState(
+			WORKER_ID,
+			{
+				...readWorkerState(WORKER_ID, home),
+				lastRuntimeVersion: '2.0.0',
+				startedAt: '2026-11-04T12:00:00.000Z',
+			},
+			home,
+		);
+		updateWorkerState(
+			WORKER_ID,
+			(state) => ({ lastKnownGoodVersion: state.lastKnownGoodVersion ?? state.lastRuntimeVersion }),
+			home,
+		);
+		expect(readWorkerState(WORKER_ID, home)?.lastKnownGoodVersion).toBe('1.2.3');
+	});
+
+	it('reads a state written before the pending-verification record as nothing pending', () => {
+		write();
+		writeWorkerState(
+			WORKER_ID,
+			{ lastRuntimeVersion: '1.2.3', startedAt: '2026-11-04T12:00:00.000Z' },
+			home,
+		);
+		expect(readWorkerState(WORKER_ID, home)?.pendingVerification ?? null).toBeNull();
+	});
+
+	it("counts failed starts against the same budget as a clone's build verification", () => {
+		expect(MAX_FAILED_STARTS).toBe(CLONE_MAX_FAILED_STARTS);
 	});
 });

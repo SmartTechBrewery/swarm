@@ -31,6 +31,7 @@ import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { run as runLauncher } from '@/launcher/main.js';
+import { RUNTIME_LAUNCHER_PROTOCOL } from '@/launcher/runtime-store.js';
 import { writeWorkerProfile } from '@/launcher/worker-profile.js';
 import { swarmInstallRoot } from '@/lib/build-identity.js';
 import { applyUpdateTarget } from '@/worker/self-update.js';
@@ -162,6 +163,8 @@ describe('bin/build-worker-runtime.js', () => {
 		expect(JSON.parse(readFileSync(join(runtimeRoot, 'build-info.json'), 'utf8'))).toEqual({
 			version: VERSION,
 			commit: COMMIT,
+			// What lets a worker be moved to this runtime at all (issue #1303).
+			launcherProtocol: RUNTIME_LAUNCHER_PROTOCOL,
 		});
 	});
 

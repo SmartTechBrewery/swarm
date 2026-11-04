@@ -11,6 +11,11 @@
 // tree beside it for a quick local run. The stamp is written by
 // `bin/write-build-info.js` from SWARM_BUILD_COMMIT, with its rules: no commit, no
 // stamp (the runtime then declares no identity); a commit that is not hex fails.
+// This script adds `launcherProtocol` to it (issue #1303) — `RUNTIME_LAUNCHER_PROTOCOL`
+// in `src/launcher/runtime-store.ts`, which a test keeps this copy equal to: it tells
+// a daemon moving its worker to this runtime that the runtime's own daemon promotes
+// a version awaiting verification, so the launcher will not abandon it after a few
+// healthy starts. A runtime without it is never a move's target.
 //
 // **The layout is load-bearing.** Every module in a bundle shares the bundle's
 // `import.meta.url`, and two of them anchor on it: `swarmInstallRoot()`
@@ -25,7 +30,7 @@
 // and GNU flavours disagree on the flags that pin order, owners and times: a
 // fixed entry order, mtime 0, uid/gid 0, and a gzip header with no time or name.
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
@@ -80,6 +85,17 @@ const stamp = spawnSync(process.execPath, [join(repoRoot, 'bin/write-build-info.
 	stdio: 'inherit',
 });
 if (stamp.status !== 0) process.exit(stamp.status ?? 1);
+
+/** `RUNTIME_LAUNCHER_PROTOCOL` (`src/launcher/runtime-store.ts`). */
+const LAUNCHER_PROTOCOL = 1;
+const buildInfoPath = join(stage, 'build-info.json');
+if (existsSync(buildInfoPath)) {
+	const info = JSON.parse(readFileSync(buildInfoPath, 'utf8'));
+	writeFileSync(
+		buildInfoPath,
+		`${JSON.stringify({ ...info, launcherProtocol: LAUNCHER_PROTOCOL }, null, 2)}\n`,
+	);
+}
 
 // Directories before their contents, then a fixed order — never `readdir`'s.
 const entries = ['', 'dist/', 'dist/transport/', 'package.json', 'build-info.json', BUNDLE];

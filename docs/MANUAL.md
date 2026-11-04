@@ -315,7 +315,16 @@ machine, each on its own runtime. A runtime that fails its size, checksum or
 signature check is never started: the launcher exits 1 naming the check. When the
 control plane cannot be reached (or serves no runtime) and no selection is
 installed, the version this worker last started on is used if it is still installed; otherwise the launcher exits 1 with the
-reason. The signing key it trusts is `deploy/worker-runtime/minisign.pub` under the
+reason. A version the worker was **moved to** is on trial until a daemon running it
+connects (issue #1303): `state.json` holds a pending-verification record, `run`
+counts each start of that version *before* handing its process over, and the
+daemon's first session clears the record and makes the version the worker's
+`lastKnownGoodVersion`. After three starts in a row without a session — or at once,
+when the control plane rejects the daemon's handshake outright — `run` logs an error,
+selects the version the worker was moved from and starts that instead. If that
+version is no longer installed it exits 1 and keeps the record, so the worker stays
+down and says why rather than crash-looping on the version that never connected.
+The signing key it trusts is `deploy/worker-runtime/minisign.pub` under the
 launcher's own install; without that file it installs nothing new and still starts
 versions already installed. For now the launcher runs from a SWARM build
 (`npm run build`, then `bin/swarm-launcher.js`); a clone-free launcher comes in a
@@ -518,7 +527,14 @@ download per host however many of its workers ask), records it as the worker's
 selected version, reports `applied` and exits for the launcher to start it on that
 version. A branch, another commit, or a version with no signed release is `refused`;
 a failed download or signature check is `failed` and leaves the worker where it
-was. No other worker on the host is waited for or disturbed.
+was. So is a release whose runtime predates launcher-driven verification (its
+`build-info.json` declares no `launcherProtocol`): its daemon could never prove
+itself, so the launcher would abandon it after a few healthy starts. No other worker
+on the host is waited for or disturbed. An `applied` move that then never connects
+is undone by the launcher, which goes back to the version the worker was moved from
+(`swarm-launcher`, below) — the same recovery a clone gets from its last known good
+build, and it reads the same way: the worker comes back reporting its previous
+build, which also halts a staged rollout.
 
 **Each request is a run, in the runs list** (issue #971). Asking a machine to move
 creates one run per machine asked, scoped to that machine's project, which starts,

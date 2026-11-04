@@ -376,6 +376,110 @@ describe('swarm-launcher', () => {
 		expect(execs).toEqual([]);
 	});
 
+	describe('a version awaiting verification (issue #1303)', () => {
+		const pendingAt = '2026-11-04T11:00:00.000Z';
+
+		/** worker-one installed on 1.0.0, moved to 2.0.0, which has not connected yet. */
+		const movedTo2 = async (failedStarts = 0, previousVersion = '1.0.0') => {
+			profile('worker-one', V1.url);
+			await run(['run', 'worker-one'], deps([V1]));
+			profile('worker-two', V2.url);
+			await run(['run', 'worker-two'], deps([V2]));
+			updateWorkerState(
+				'worker-one',
+				{
+					selectedVersion: '2.0.0',
+					lastKnownGoodVersion: '1.0.0',
+					pendingVerification: {
+						version: '2.0.0',
+						previousVersion,
+						failedStarts,
+						startedAt: pendingAt,
+					},
+				},
+				home,
+			);
+			execs = [];
+			output = [];
+		};
+		const entrypointOf = (version: string) => join(runtimesDir(home), version, RUNTIME_ENTRYPOINT);
+		const pending = () => readWorkerState('worker-one', home)?.pendingVerification;
+
+		it('counts the first and second starts and starts the new version', async () => {
+			await movedTo2();
+			expect(await run(['run', 'worker-one'], deps([V1]))).toBe(0);
+			expect(execs[0].args[1]).toBe(entrypointOf('2.0.0'));
+			expect(pending()).toMatchObject({ version: '2.0.0', failedStarts: 1 });
+			expect(output.join('\n')).toContain('newly selected');
+
+			execs = [];
+			output = [];
+			expect(await run(['run', 'worker-one'], deps([V1]))).toBe(0);
+			expect(execs[0].args[1]).toBe(entrypointOf('2.0.0'));
+			expect(pending()).toMatchObject({ version: '2.0.0', failedStarts: 2 });
+			expect(output.join('\n')).toContain('has still not connected once');
+			// The rest of the state survives the launcher's own write.
+			expect(readWorkerState('worker-one', home)).toMatchObject({
+				lastRuntimeVersion: '2.0.0',
+				selectedVersion: '2.0.0',
+				lastKnownGoodVersion: '1.0.0',
+			});
+		});
+
+		it('writes the count before it hands its process to the daemon', async () => {
+			await movedTo2();
+			const seen: Array<number | undefined> = [];
+			await run(
+				['run', 'worker-one'],
+				deps([V1], {
+					execve: () => {
+						seen.push(pending()?.failedStarts);
+					},
+				}),
+			);
+			expect(seen).toEqual([1]);
+		});
+
+		it('starts the version it was moved from on the third start, and clears the record', async () => {
+			await movedTo2(2);
+			expect(await run(['run', 'worker-one'], deps([V1]))).toBe(0);
+			expect(execs[0].args[1]).toBe(entrypointOf('1.0.0'));
+			expect(readWorkerState('worker-one', home)).toMatchObject({
+				lastRuntimeVersion: '1.0.0',
+				selectedVersion: '1.0.0',
+				lastKnownGoodVersion: '1.0.0',
+				pendingVerification: null,
+			});
+			expect(output.join('\n')).toContain('giving up on v2.0.0');
+
+			// And it stays there: the next start is an ordinary one.
+			execs = [];
+			expect(await run(['run', 'worker-one'], deps([V1]))).toBe(0);
+			expect(execs[0].args[1]).toBe(entrypointOf('1.0.0'));
+		});
+
+		it('starts nothing, exits 1 and keeps the record when the previous version is not installed', async () => {
+			await movedTo2(2, '0.5.0');
+			expect(await run(['run', 'worker-one'], deps([V1]))).toBe(1);
+			expect(execs).toEqual([]);
+			expect(readWorkerState('worker-one', home)).toMatchObject({
+				selectedVersion: '2.0.0',
+				pendingVerification: { version: '2.0.0', previousVersion: '0.5.0', failedStarts: 3 },
+			});
+			expect(output.join('\n')).toContain(
+				'v0.5.0, the version this worker was moved from, is not installed',
+			);
+		});
+
+		it('does not count a record naming another version than the selected one', async () => {
+			await movedTo2();
+			updateWorkerState('worker-one', { selectedVersion: '1.0.0' }, home);
+			expect(await run(['run', 'worker-one'], deps([V1]))).toBe(0);
+			expect(execs[0].args[1]).toBe(entrypointOf('1.0.0'));
+			expect(pending()).toMatchObject({ failedStarts: 0 });
+		});
+	});
+
 	it('lists the installed runtimes', async () => {
 		expect(await run(['runtimes'], deps([]))).toBe(0);
 		expect(output.join('\n')).toContain('no runtimes installed');
