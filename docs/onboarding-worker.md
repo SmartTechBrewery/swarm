@@ -369,7 +369,9 @@ workers"), so the two installations' updates never meet in one clone.
 swarm login --identifier ada@example.com --control-plane-url https://swarm-two.example.com
 cd ~/code/two-project
 swarm workers setup --profile --control-plane-url https://swarm-two.example.com
-swarm-launcher run <worker-id>     # exactly as setup prints it
+# on macOS setup ends by installing its LaunchAgent; elsewhere, or with
+# --no-autostart, start it as setup prints:
+swarm-launcher run <worker-id>
 ```
 
 - `--profile` (on `setup` and `register-and-enroll`) takes the URL from
@@ -394,8 +396,13 @@ swarm-launcher run <worker-id>     # exactly as setup prints it
   `request-update`) keep the usual precedence, so point them at the second
   installation explicitly:
   `SWARM_CONTROL_PLANE_URL=https://swarm-two.example.com swarm workers list ada@example.com`.
-- There is no autostart for a profile worker yet: `setup --profile` stops where
-  `--no-autostart` does and prints the start command.
+- On macOS `setup --profile` ends by running `swarm-worker-agent install --profile
+  <worker-id>` (issue #1297): a LaunchAgent running `swarm-launcher run <worker-id>`
+  at login, labelled with the installation's host so `launchctl list` tells the two
+  installations' workers apart. Manage it with `swarm-worker-agent status|logs|uninstall
+  --profile <worker-id>`. `swarm-worker-agent update` never restarts it — its daemon
+  runs the runtime the second installation serves, not this clone's build
+  ([`launchd-worker-autostart.md`](./launchd-worker-autostart.md#profile-based-workers)).
 
 ---
 

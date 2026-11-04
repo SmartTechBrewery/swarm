@@ -5,6 +5,9 @@
 # It is a wrapper around `swarm run:worker`, not a second launcher: the agent runs
 # that command with the checkout as its working directory, which is what lets the
 # credential stay in the per-checkout cache instead of being written into a plist.
+# A profile-based worker (`--profile <worker-id>`, issue #1297) is the same idea one
+# step removed: the agent runs `swarm-launcher run <worker-id>`, which reads the
+# credential from the worker's own profile, so it is never written into a plist either.
 set -euo pipefail
 
 usage() {
@@ -12,10 +15,10 @@ usage() {
 swarm-worker-agent -- launchd autostart for a SWARM worker checkout (macOS)
 
 Usage:
-  swarm-worker-agent install   [<checkout>]   write the agent and start it
-  swarm-worker-agent uninstall [<checkout>]   stop it and remove the agent
-  swarm-worker-agent status    [<checkout>]   show whether it is loaded/running
-  swarm-worker-agent logs      [<checkout>]   tail this checkout's worker log
+  swarm-worker-agent install   [<checkout> | --profile <worker-id>]   write the agent and start it
+  swarm-worker-agent uninstall [<checkout> | --profile <worker-id>]   stop it and remove the agent
+  swarm-worker-agent status    [<checkout> | --profile <worker-id>]   show whether it is loaded/running
+  swarm-worker-agent logs      [<checkout> | --profile <worker-id>]   tail this worker's log
   swarm-worker-agent update    [<checkout>]   update this SWARM install, restart its agents
 
 <checkout> is the repository checkout the worker was registered for, and defaults
@@ -29,6 +32,12 @@ agent in an extra checkout.
 *SWARM installation's* build, not its checkout's, so one pull updates every daemon on
 the machine at once. With no argument it pulls this installation, rebuilds it, and
 restarts every worker agent running it; pass a <checkout> to restart only that one.
+
+--profile <worker-id> is a PROFILE-BASED worker (`swarm workers setup --profile`):
+the agent runs `swarm-launcher run <worker-id>` from ~/.swarm/workers/<worker-id>,
+and its label names the host of the installation the profile serves, so workers of
+two installations on one Mac never share one. `update` never restarts such an agent:
+it runs the runtime its control plane names, not this installation's build.
 EOF
 }
 
@@ -51,6 +60,84 @@ resolve() {
 	PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 	LOG="$HOME/Library/Logs/$LABEL.log"
 	TARGET="gui/$(id -u)/$LABEL"
+}
+
+# A profile-based worker (issue #1297): `~/.swarm/workers/<worker-id>/profile.json`,
+# written by `swarm workers setup --profile` (src/launcher/worker-profile.ts). Only
+# `controlPlaneUrl` and `repoRoots` are read out of it -- never the credential, which
+# stays where `swarm-launcher run` reads it from and is printed by nothing here.
+#
+# The label carries the installation's host as well as the worker id, so `launchctl
+# list` says which installation each agent serves; the hash of the two together is
+# what keeps two installations on one host (two ports) apart. The id is checked
+# against the profile module's own path-safe grammar before any path is built from
+# it. With `required` unset (uninstall/status/logs) a profile that is gone or
+# unreadable still resolves -- through the installed plist whose WorkingDirectory is
+# the profile's directory -- so an agent is never left with no way to remove it.
+resolve_profile() {
+	WORKER_ID=$1
+	local required=${2:-}
+	[[ "$WORKER_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$ ]] ||
+		die "not a valid worker id: $WORKER_ID (letters, digits, '-' and '_' only)"
+	PROFILE_DIR="$HOME/.swarm/workers/$WORKER_ID"
+	PROFILE="$PROFILE_DIR/profile.json"
+	REPO_ROOTS=()
+
+	local fields=() line
+	if [ -f "$PROFILE" ] && command -v node >/dev/null 2>&1; then
+		while IFS= read -r line; do fields+=("$line"); done < <(read_profile "$PROFILE" "$WORKER_ID" 2>/dev/null || true)
+	fi
+	if [ "${#fields[@]}" -lt 3 ]; then
+		if [ -n "$required" ]; then
+			[ -f "$PROFILE" ] || die "no worker profile for $WORKER_ID at $PROFILE
+  register one first: swarm workers setup --profile"
+			die "the worker profile at $PROFILE could not be read (or names another worker)"
+		fi
+		LABEL=$(installed_profile_label) || die "no agent installed for worker $WORKER_ID"
+	else
+		local url=${fields[0]} host=${fields[1]} hash
+		REPO_ROOTS=("${fields[@]:2}")
+		hash=$(printf '%s\n%s' "$url" "$WORKER_ID" | shasum -a 256 | cut -d' ' -f1)
+		LABEL="pl.smarttechbrewery.swarm.worker.$(label_slug "$host").$(label_slug "$WORKER_ID").${hash:0:8}"
+	fi
+	CHECKOUT=$PROFILE_DIR
+	PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+	LOG="$HOME/Library/Logs/$LABEL.log"
+	TARGET="gui/$(id -u)/$LABEL"
+}
+
+# `controlPlaneUrl`, its host, then each of `repoRoots`, one per line -- or a non-zero
+# exit for a profile that is not one: unparseable, naming another worker, or missing
+# either field. The credential is never so much as copied out of the parsed record.
+read_profile() {
+	node -e '
+const p = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+const roots = p.repoRoots;
+if (p.workerId !== process.argv[2] || typeof p.controlPlaneUrl !== "string") process.exit(1);
+if (!Array.isArray(roots) || roots.length === 0 || !roots.every((r) => typeof r === "string" && r && !r.includes("\n"))) process.exit(1);
+const host = new URL(p.controlPlaneUrl).host;
+if (!host) process.exit(1);
+process.stdout.write([p.controlPlaneUrl, host, ...roots].join("\n") + "\n");
+' "$1" "$2"
+}
+
+# A launchd label segment: anything but letters, digits, `_` and `-` becomes `-`, so
+# a host's dots and port colon never read as extra label components.
+label_slug() {
+	printf '%s' "$1" | tr -c 'A-Za-z0-9_-' '-'
+}
+
+# The label of the installed agent serving this profile, found by its plist's
+# WorkingDirectory -- for a profile that is gone or unreadable.
+installed_profile_label() {
+	local plist
+	for plist in "$HOME"/Library/LaunchAgents/pl.smarttechbrewery.swarm.worker.*.plist; do
+		[ -f "$plist" ] || continue
+		[ "$(plutil -extract WorkingDirectory raw "$plist" 2>/dev/null)" = "$PROFILE_DIR" ] || continue
+		basename "$plist" .plist
+		return 0
+	done
+	return 1
 }
 
 # Follow a symlink chain to the file it ends at, without `readlink -f` (BSD gained it
@@ -90,14 +177,30 @@ install_root() {
 # through any symlinks answers both, and is what tells a peer agent apart from one
 # belonging to a second SWARM clone on the same Mac -- and a second clone must not be
 # restarted onto a build nobody updated.
+#
+# Clone agents only -- those whose ProgramArguments run `run:worker`. A profile agent
+# (`swarm-launcher run <worker-id>`, issue #1297) also names a launcher under this
+# installation, but the daemon it starts is the runtime its control plane names, not
+# this checkout's build, so restarting it onto a pull would change nothing; updating
+# those is the launcher's own business (#1282).
 agents_of_install_root() {
 	local plist launcher checkout
 	for plist in "$HOME"/Library/LaunchAgents/pl.smarttechbrewery.swarm.worker.*.plist; do
 		[ -f "$plist" ] || continue
+		runs_clone_worker "$plist" || continue
 		launcher=$(plutil -extract ProgramArguments.1 raw "$plist" 2>/dev/null) || continue
 		case "$(resolve_symlink "$launcher")" in "$ROOT"/*) ;; *) continue ;; esac
 		checkout=$(plutil -extract WorkingDirectory raw "$plist" 2>/dev/null) || continue
 		printf '%s\t%s\n' "$(basename "$plist" .plist)" "$checkout"
+	done
+}
+
+# Whether a plist's ProgramArguments include `run:worker`, i.e. it is a clone agent.
+runs_clone_worker() {
+	local i arg
+	for ((i = 0; ; i++)); do
+		arg=$(plutil -extract "ProgramArguments.$i" raw "$1" 2>/dev/null) || return 1
+		[ "$arg" != 'run:worker' ] || return 0
 	done
 }
 
@@ -147,8 +250,8 @@ agent_running() {
 # zero-padded -- so comparing the first 19 characters as plain strings orders them
 # correctly without parsing a date in shell.
 lock_lapsed() {
-	local refreshed cutoff
-	refreshed=$(sed -n 's/.*"refreshedAt":[[:space:]]*"\([^"]*\)".*/\1/p' "$LOCK" 2>/dev/null | head -1 || true)
+	local lock=${1:-$LOCK} refreshed cutoff
+	refreshed=$(sed -n 's/.*"refreshedAt":[[:space:]]*"\([^"]*\)".*/\1/p' "$lock" 2>/dev/null | head -1 || true)
 	[ -n "$refreshed" ] || return 0
 	cutoff=$(date -u -v-15M +%Y-%m-%dT%H:%M:%S 2>/dev/null ||
 		date -u -d '15 minutes ago' +%Y-%m-%dT%H:%M:%S)
@@ -171,25 +274,42 @@ lock_lapsed() {
 # refuses nothing, exactly as the next daemon reclaims it rather than refusing to
 # start -- at once when its pid is gone, and once the record lapses when that pid has
 # been recycled to another worker.
+#
+# It takes the checkout and its lock (defaulting to the clone checkout's own), because
+# a profile worker holds one lock per checkout it serves and is guarded on each. The
+# liveness pattern is `transport/connect-entry` rather than its `src/` spelling so a
+# launcher-started runtime's `dist/transport/connect-entry.mjs` is a worker too.
 refuse_if_worker_running() {
-	[ -f "$LOCK" ] || return 0
+	local checkout=${1:-$CHECKOUT} lock=${2:-$LOCK}
+	[ -f "$lock" ] || return 0
 	local holder who
-	holder=$(sed -n 's/.*"pid":[[:space:]]*\([0-9]\{1,\}\).*/\1/p' "$LOCK" 2>/dev/null | head -1 || true)
+	holder=$(sed -n 's/.*"pid":[[:space:]]*\([0-9]\{1,\}\).*/\1/p' "$lock" 2>/dev/null | head -1 || true)
 	[ -n "$holder" ] || return 0
-	ps -ww -p "$holder" -o command= 2>/dev/null | grep -q 'src/transport/connect-entry' || return 0
-	lock_lapsed && return 0
+	ps -ww -p "$holder" -o command= 2>/dev/null | grep -q 'transport/connect-entry' || return 0
+	lock_lapsed "$lock" && return 0
 	agent_running && return 0
 	# Named the way the daemon's own refusal names a holder (`describeHolder`,
 	# src/worktree/checkout-lock.ts): by worker id when the lock has one, since that
 	# is what an operator can act on; by pid alone before its first handshake.
 	# `"workerId":null` leaves this empty (the pattern requires the opening quote), so
 	# a daemon that has not handshaked yet keeps the wording the cwd guard used.
-	who=$(sed -n 's/.*"workerId":"\([^"]*\)".*/\1/p' "$LOCK" 2>/dev/null | head -1 || true)
+	who=$(sed -n 's/.*"workerId":"\([^"]*\)".*/\1/p' "$lock" 2>/dev/null | head -1 || true)
 	who="${who:+worker $who}"
-	die "${who:-a worker} (pid $holder) is already running for $CHECKOUT -- stop it first, then re-run install"
+	die "${who:-a worker} (pid $holder) is already running for $checkout -- stop it first, then re-run install"
+}
+
+# The lock a daemon holds on one checkout, keyed exactly as `resolve()` keys it.
+checkout_lock() {
+	local hash
+	hash=$(printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1)
+	printf '%s' "$HOME/.swarm/checkout-locks/$hash/owner.json"
 }
 
 cmd_install() {
+	if [ -n "$WORKER_ID" ]; then
+		install_profile
+		return
+	fi
 	# A worker checkout is a git checkout of the *project* repository (the daemon
 	# declares its `origin` at handshake); it is not necessarily a Node project, so
 	# .git is the invariant to check, not package.json.
@@ -214,6 +334,41 @@ cmd_install() {
 
 	refuse_if_worker_running
 
+	write_plist "$node" "$swarm" run:worker
+	bootstrap_agent
+	printf 'swarm-worker-agent: installed %s\n  checkout: %s\n  log:      %s\n' \
+		"$LABEL" "$CHECKOUT" "$LOG"
+}
+
+# `install --profile <worker-id>` (issue #1297): the same agent, running this
+# installation's `swarm-launcher run <worker-id>` from the profile's own directory --
+# which is where the launcher runs the daemon too. The launcher reads the credential
+# from the profile, so the plist carries none, exactly as a clone agent's does not.
+install_profile() {
+	local node launcher root
+	node=$(command -v node) || die 'node not found on PATH'
+	# This installation's own launcher, for the reason `install` names its own CLI.
+	launcher="$ROOT/bin/swarm-launcher.js"
+	[ -f "$launcher" ] || die "no swarm-launcher at $launcher -- is $ROOT a SWARM installation?"
+
+	# A daemon holds a lock per checkout it serves, so any one of the profile's
+	# checkouts already being served refuses the install.
+	for root in "${REPO_ROOTS[@]}"; do
+		refuse_if_worker_running "$root" "$(checkout_lock "$root")"
+	done
+
+	write_plist "$node" "$launcher" run "$WORKER_ID"
+	bootstrap_agent
+	printf 'swarm-worker-agent: installed %s\n  worker:  %s\n  profile: %s\n  log:     %s\n' \
+		"$LABEL" "$WORKER_ID" "$PROFILE_DIR" "$LOG"
+}
+
+# The agent's plist: `$LABEL`, running the given program arguments in `$CHECKOUT`
+# (a clone worker's checkout, or a profile worker's directory) and logging to `$LOG`.
+write_plist() {
+	local arg args=''
+	for arg in "$@"; do args="$args		<string>$arg</string>
+"; done
 	mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
 	cat >"$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -225,10 +380,7 @@ cmd_install() {
 
 	<key>ProgramArguments</key>
 	<array>
-		<string>$node</string>
-		<string>$swarm</string>
-		<string>run:worker</string>
-	</array>
+$args	</array>
 
 	<key>WorkingDirectory</key>
 	<string>$CHECKOUT</string>
@@ -258,25 +410,34 @@ cmd_install() {
 </plist>
 EOF
 	plutil -lint "$PLIST" >/dev/null || die "generated plist is invalid: $PLIST"
+}
 
+bootstrap_agent() {
 	launchctl bootout "$TARGET" 2>/dev/null || true
 	launchctl bootstrap "gui/$(id -u)" "$PLIST"
-	printf 'swarm-worker-agent: installed %s\n  checkout: %s\n  log:      %s\n' \
-		"$LABEL" "$CHECKOUT" "$LOG"
 }
 
 cmd_uninstall() {
-	[ -f "$PLIST" ] || die "no agent installed for $CHECKOUT"
+	[ -f "$PLIST" ] || die "no agent installed for $(subject)"
 	launchctl bootout "$TARGET" 2>/dev/null || true
 	rm -f "$PLIST"
 	printf 'swarm-worker-agent: removed %s (logs kept at %s)\n' "$LABEL" "$LOG"
 }
 
 cmd_status() {
-	[ -f "$PLIST" ] || die "no agent installed for $CHECKOUT"
-	printf 'label:    %s\ncheckout: %s\n' "$LABEL" "$CHECKOUT"
+	[ -f "$PLIST" ] || die "no agent installed for $(subject)"
+	if [ -n "$WORKER_ID" ]; then
+		printf 'label:    %s\nworker:   %s\nprofile:  %s\n' "$LABEL" "$WORKER_ID" "$PROFILE_DIR"
+	else
+		printf 'label:    %s\ncheckout: %s\n' "$LABEL" "$CHECKOUT"
+	fi
 	launchctl print "$TARGET" 2>/dev/null | grep -E '^[[:space:]]+(state|pid|last exit code) ' ||
 		echo 'state = not loaded'
+}
+
+# What an agent is installed for, in a refusal: the checkout, or the profile worker.
+subject() {
+	if [ -n "$WORKER_ID" ]; then printf 'worker %s' "$WORKER_ID"; else printf '%s' "$CHECKOUT"; fi
 }
 
 cmd_logs() {
@@ -351,6 +512,10 @@ cmd_update() {
 	[ "$failed" -eq 0 ] || exit 1
 }
 
+# Clone mode unless the dispatcher below resolves a `--profile`.
+WORKER_ID=''
+REPO_ROOTS=()
+
 [ "$(uname -s)" = 'Darwin' ] || die 'launchd is macOS-only; on Linux use a systemd --user unit running `swarm run:worker`'
 
 case "${1:-}" in
@@ -358,22 +523,36 @@ case "${1:-}" in
 		action=$1
 		shift
 		checkout=''
-		for arg in "$@"; do
-			case "$arg" in
-				-*) die "unknown option: $arg" ;;
+		WORKER_ID=''
+		profile=''
+		while [ "$#" -gt 0 ]; do
+			case "$1" in
+				--profile)
+					[ "$#" -ge 2 ] || die '--profile needs a <worker-id>'
+					profile=$2
+					shift
+					;;
+				--profile=*) profile=${1#--profile=} ;;
+				-*) die "unknown option: $1" ;;
 				*)
 					[ -z "$checkout" ] || die "only one <checkout> may be given"
-					checkout=$arg
+					checkout=$1
 					;;
 			esac
+			shift
 		done
 		ROOT=$(install_root)
 		if [ "$action" = 'update' ]; then
+			[ -z "$profile" ] || die 'update restarts clone agents only -- a profile-based worker runs the runtime its control plane names, not this installation'"'"'s build'
 			# The one action that is not about a single checkout: an omitted argument means
 			# every agent running this installation, not the current directory's.
 			ONE_CHECKOUT=$checkout
 			[ -z "$checkout" ] || resolve "$checkout"
 			cmd_update
+		elif [ -n "$profile" ]; then
+			[ -z "$checkout" ] || die '--profile and a <checkout> cannot both be given'
+			resolve_profile "$profile" "$([ "$action" = 'install' ] && echo required)"
+			"cmd_$action"
 		else
 			resolve "${checkout:-$PWD}"
 			"cmd_$action"

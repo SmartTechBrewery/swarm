@@ -811,9 +811,11 @@ unchanged.
   an existing profile already serves for the **same** installation. A profile for
   another installation may name the same checkout, but the checkout lock lets only
   one of the two workers run there at a time. A plain `setup` refuses a checkout a
-  profile serves for the same installation too. Autostart for a profile worker
-  arrives with a later phase: until then `setup --profile` stops where
-  `--no-autostart` does.
+  profile serves for the same installation too. `setup --profile`'s autostart
+  (issue #1297) is `swarm-worker-agent install --profile <worker-id>`, whose agent
+  runs `swarm-launcher run <worker-id>`; its check / retry lines name the agent by
+  `--profile <worker-id>`, and `--no-autostart` (or another platform) ends with the
+  `swarm-launcher run` line instead. `register-and-enroll --profile` starts nothing.
 - **`add-checkout <path>`** — give an **existing** worker another repository
   checkout on this machine (issue #1059), without re-registering it — which would
   issue a new worker and lose its enrollments and stored operator credentials. Run
@@ -1271,6 +1273,7 @@ half-working.)
 | `swarm-api-agent reload [--all]` | Run [`npm run reload`](#services) (`--all`: `reload:all`) in the foreground, then restart and wait for `/health`. A failed migration or build stops the chain before the restart. Workers are still yours to restart (`swarm-worker-agent update`). |
 | `swarm-api-agent logs` | Tail this installation's stdout + stderr logs. |
 | `swarm-worker-agent install` | Write and start the worker's LaunchAgent for a registered worker checkout — a wrapper around [`swarm run:worker`](#swarm-runworker). Refuses while a worker is already running for that checkout. One agent per **primary** checkout serves every checkout the worker holds (issue #1059); never install one in an extra checkout. |
+| `swarm-worker-agent install --profile <worker-id>` | The same for a **profile-based** worker (issue #1297): the agent runs this installation's `swarm-launcher run <worker-id>` from `~/.swarm/workers/<worker-id>`, and its label names the host of the installation the profile serves. Refuses a missing or unreadable profile, and a daemon already running for any of its checkouts. `uninstall` / `status` / `logs` take `--profile <worker-id>` too; `update` never restarts a profile agent. |
 | `swarm-worker-agent uninstall` | Stop that agent and remove it (logs are kept). |
 | `swarm-worker-agent status` | Show whether that checkout's agent is loaded and running. |
 | `swarm-worker-agent logs` | Tail that checkout's worker logs. |

@@ -1,6 +1,9 @@
 /**
  * Install a checkout's worker under the host's process supervisor, so it starts at
  * login instead of occupying a terminal tab — what `swarm workers setup` ends with.
+ * A profile-based worker (`setup --profile`, issue #1297) is installed the same way,
+ * by `swarm-worker-agent install --profile <worker-id>`, whose agent runs this
+ * installation's `swarm-launcher run <worker-id>`.
  *
  * It adds no supervision model of its own. On macOS it hands the checkout to
  * `bin/swarm-worker-agent install`, the same LaunchAgent installer an operator runs
@@ -30,9 +33,28 @@ export async function installWorkerAutostart(
 	repoRoot: string,
 	platform: NodeJS.Platform = process.platform,
 ): Promise<WorkerAutostartResult> {
+	return await runInstaller(['install', repoRoot], platform);
+}
+
+/**
+ * The profile variant: hand the worker id to the same installer, which reads the
+ * profile itself (and refuses one it cannot read, or whose checkouts a running
+ * daemon already holds).
+ */
+export async function installProfileWorkerAutostart(
+	workerId: string,
+	platform: NodeJS.Platform = process.platform,
+): Promise<WorkerAutostartResult> {
+	return await runInstaller(['install', '--profile', workerId], platform);
+}
+
+async function runInstaller(
+	args: string[],
+	platform: NodeJS.Platform,
+): Promise<WorkerAutostartResult> {
 	if (platform !== 'darwin') return { kind: 'unsupported', platform };
 	try {
-		const code = await runCommand(LAUNCHD_INSTALLER, ['install', repoRoot]);
+		const code = await runCommand(LAUNCHD_INSTALLER, args);
 		return code === 0
 			? { kind: 'installed' }
 			: { kind: 'failed', reason: `swarm-worker-agent install exited with code ${code}` };

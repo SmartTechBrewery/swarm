@@ -313,8 +313,10 @@ started on is used if it is still installed; otherwise the launcher exits 1 with
 reason. The signing key it trusts is `deploy/worker-runtime/minisign.pub` under the
 launcher's own install; without that file it installs nothing new and still starts
 versions already installed. For now the launcher runs from a SWARM build
-(`npm run build`, then `bin/swarm-launcher.js`); launchd and a clone-free launcher
-come in later phases. `swarm run:worker` and `npm run dev:worker` are unchanged.
+(`npm run build`, then `bin/swarm-launcher.js`); a clone-free launcher comes in a
+later phase. Under launchd, `swarm-worker-agent install --profile <workerId>` runs
+it at login (issue #1297, [`launchd-worker-autostart.md`](./launchd-worker-autostart.md),
+"Profile-based workers"). `swarm run:worker` and `npm run dev:worker` are unchanged.
 
 The operator CLI writes profiles (issue #1296): `swarm workers setup --profile` and
 `swarm workers register-and-enroll … --profile` register, enroll and credential the
@@ -322,8 +324,9 @@ worker exactly as without the flag, but put its credential, checkouts and
 control-plane URL (from `--control-plane-url`, else the environment, else `.env`) in
 the profile instead of the per-checkout credential cache. They write no `.env` and
 do not refuse one that names another installation, print no worker credential, and
-end with the `swarm-launcher run <workerId>` that starts the worker (no autostart
-yet). They refuse a checkout that already has a cached worker, or that a profile
+end with the `swarm-launcher run <workerId>` that starts the worker — except that
+`setup --profile` autostarts it, through `swarm-worker-agent install --profile
+<workerId>` (issue #1297), unless `--no-autostart` is given. They refuse a checkout that already has a cached worker, or that a profile
 already serves for the same installation. From then on every `swarm workers`
 command that takes a `<worker-id>` (`drain`, `undrain`, `update <worker-id>`,
 `set-cli`, `set-scm-credential`, `remove`, `sweep-worktrees`, `enroll`,
