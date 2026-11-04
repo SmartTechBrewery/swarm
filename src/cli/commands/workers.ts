@@ -3171,7 +3171,8 @@ export function reportAutostart(
 	autostart: WorkerAutostartResult,
 	profileWorkerId?: string,
 ): number {
-	const workerAgent = workerAgentCommand();
+	const workerAgent =
+		(autostart.kind !== 'unsupported' && autostart.serviceCommand) || workerAgentCommand();
 	const agentArgs = profileWorkerId ? ` --profile ${profileWorkerId}` : '';
 	const foreground = profileWorkerId
 		? `${launcherCommand()} run ${profileWorkerId}`
@@ -3179,7 +3180,7 @@ export function reportAutostart(
 	switch (autostart.kind) {
 		case 'installed':
 			out.info(
-				`worker '${displayName}' is installed under launchd and starting — check it with: ${workerAgent} status${agentArgs}`,
+				`worker '${displayName}' is installed under ${autostart.supervisor ?? 'launchd'} and starting — check it with: ${workerAgent} status${agentArgs}`,
 			);
 			return 0;
 		case 'unsupported':

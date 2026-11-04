@@ -256,6 +256,24 @@ describe('swarm-worker setup', () => {
 		expect(printed()).toMatch(/could not fetch the installation's runtime yet/);
 	});
 
+	// Issue #1323.
+	it('reports a Task Scheduler install in its own words and still waits for the connection', async () => {
+		const installAutostart = vi.fn(async () => ({
+			kind: 'installed' as const,
+			supervisor: 'Task Scheduler',
+			serviceCommand: 'swarm-worker agent',
+		}));
+		const { deps: setupDeps, api } = deps({ installAutostart });
+
+		expect(await runSetup(fullFlags(), setupDeps)).toBe(0);
+
+		expect(printed()).toContain(
+			`installed under Task Scheduler and starting — check it with: swarm-worker agent status --profile ${WORKER_ID}`,
+		);
+		expect(api.paths().at(-1)).toBe('workers.listMine');
+		expect(printed()).toContain(`is connected to ${CONTROL_PLANE}`);
+	});
+
 	it('never prints, logs or writes the password, the SCM token or the worker credential', async () => {
 		const { deps: setupDeps } = deps();
 		rmSync(passwordFile);
