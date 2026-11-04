@@ -123,6 +123,14 @@ import {
 	pullRequestDescriptionDisplay,
 	pullRequestDescriptionError,
 } from '@/lib/pull-request-description.js';
+import {
+	isDefaultReviewReport,
+	isReviewReportDirty,
+	normalizeReviewReport,
+	REVIEW_REPORT_MAX_LENGTH,
+	reviewReportDisplay,
+	reviewReportError,
+} from '@/lib/review-report.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
 import type {
 	AgentConfig,
@@ -282,6 +290,7 @@ function normalizeAgentsForDisplay(agents: AgentsConfig): AgentsConfig {
 			timeoutMs: config.timeoutMs,
 			prompt: config.prompt,
 			pullRequestDescription: config.pullRequestDescription,
+			reviewReport: config.reviewReport,
 		};
 	}
 	return next;
@@ -292,7 +301,8 @@ function isPhaseConfigDirty(local: AgentConfig = {}, db: AgentConfig = {}): bool
 		areTargetsDirty(toTargetList(local), db) ||
 		(local.timeoutMs ?? '') !== (db.timeoutMs ?? '') ||
 		isCustomPromptDirty(local.prompt, db.prompt) ||
-		isPullRequestDescriptionDirty(local.pullRequestDescription, db.pullRequestDescription)
+		isPullRequestDescriptionDirty(local.pullRequestDescription, db.pullRequestDescription) ||
+		isReviewReportDirty(local.reviewReport, db.reviewReport)
 	);
 }
 
@@ -317,8 +327,16 @@ function cleanAgentConfig(config: AgentConfig): AgentConfig | undefined {
 	const normalizedPrompt = normalizeCustomPrompt(prompt);
 	// The untouched default structure is not an override either (issue #1277).
 	const pullRequestDescription = normalizePullRequestDescription(config.pullRequestDescription);
+	// Nor is the untouched default review report layout (issue #1288).
+	const reviewReport = normalizeReviewReport(config.reviewReport);
 	const cleanedTargets = cleanTargets(toTargetList(config));
-	if (cleanedTargets.length === 0 && !timeoutMs && !normalizedPrompt && !pullRequestDescription)
+	if (
+		cleanedTargets.length === 0 &&
+		!timeoutMs &&
+		!normalizedPrompt &&
+		!pullRequestDescription &&
+		!reviewReport
+	)
 		return undefined;
 	// Only `targets` is sent: the schema re-derives the top-level `cli`/`model`/
 	// `reasoning` mirror from the highest-priority target, so writing it here could
@@ -328,6 +346,7 @@ function cleanAgentConfig(config: AgentConfig): AgentConfig | undefined {
 		timeoutMs,
 		prompt: normalizedPrompt,
 		pullRequestDescription,
+		reviewReport,
 	};
 }
 
@@ -755,53 +774,63 @@ interface PhaseSettingsDetailProps extends TargetHandlers {
 	 * the default. Read only on the Implementation screen, the one that renders the field.
 	 */
 	handlePullRequestDescriptionChange?: (value: string | undefined) => void;
+	/**
+	 * Sets the Review phase's report layout; `undefined` restores the default. Read
+	 * only on the Review screen, the one that renders the field (issue #1288).
+	 */
+	handleReviewReportChange?: (value: string | undefined) => void;
 	onBack: () => void;
 }
 
 /**
- * The Implementation phase's **Pull request description** card (issue #1277): the
- * structure every pull request description SWARM opens follows, showing SWARM's
- * default until the operator edits it, with a way back to that default. Kept out of
- * {@link PhaseSettingsDetail} so that component's cognitive complexity stays bounded.
+ * A phase's editable text card with a **Restore default** button: the field shows
+ * SWARM's default until the operator edits it, and Restore default puts it back,
+ * disabled while the field already holds it. Shared by the Implementation phase's
+ * **Pull request description** (issue #1277) and the Review phase's **Review
+ * report** (issue #1288), so both look and behave the same.
  */
-function PullRequestDescriptionField({
-	value,
+function DefaultableTextField({
+	id,
+	label,
+	description,
+	display,
+	error,
+	length,
+	maxLength,
+	isDefault,
 	isPending,
 	onChange,
 }: {
-	value: string | undefined;
+	id: string;
+	label: string;
+	description: React.ReactNode;
+	display: string;
+	error: string | undefined;
+	length: number;
+	maxLength: number;
+	isDefault: boolean;
 	isPending: boolean;
 	onChange: (value: string | undefined) => void;
 }) {
-	const error = pullRequestDescriptionError(value);
-	const length = (normalizePullRequestDescription(value) ?? '').length;
 	return (
 		<div className={`${CARD_CLASS} space-y-2`}>
 			<div className="flex items-center justify-between gap-3">
-				<label
-					htmlFor="implementation-pull-request-description"
-					className="block text-sm font-semibold text-zinc-200"
-				>
-					Pull request description
+				<label htmlFor={id} className="block text-sm font-semibold text-zinc-200">
+					{label}
 				</label>
 				<button
 					type="button"
 					onClick={() => onChange(undefined)}
-					disabled={isPending || isDefaultPullRequestDescription(value)}
+					disabled={isPending || isDefault}
 					className="text-xs font-medium text-zinc-400 hover:text-zinc-200 disabled:opacity-50 disabled:hover:text-zinc-400 transition-colors"
 				>
 					Restore default
 				</button>
 			</div>
-			<p className="text-xs text-zinc-400">
-				The structure the agent fills in for the description of every pull request this phase opens.
-				It starts as SWARM's default; edit it freely. SWARM always adds the last line itself —{' '}
-				<code className="font-mono">Closes: #&lt;n&gt;</code> for a GitHub issue in the same
-				repository, otherwise <code className="font-mono">Work item: [key](url)</code>.
-			</p>
+			<p className="text-xs text-zinc-400">{description}</p>
 			<textarea
-				id="implementation-pull-request-description"
-				value={pullRequestDescriptionDisplay(value)}
+				id={id}
+				value={display}
 				onChange={(e) => onChange(e.target.value)}
 				disabled={isPending}
 				rows={16}
@@ -812,11 +841,84 @@ function PullRequestDescriptionField({
 				<p className="text-xs text-red-400">{error}</p>
 			) : (
 				<p className="text-xs text-zinc-500">
-					{length.toLocaleString()} / {PULL_REQUEST_DESCRIPTION_MAX_LENGTH.toLocaleString()}{' '}
-					characters
+					{length.toLocaleString()} / {maxLength.toLocaleString()} characters
 				</p>
 			)}
 		</div>
+	);
+}
+
+/**
+ * The Implementation phase's **Pull request description** card (issue #1277): the
+ * structure every pull request description SWARM opens follows.
+ */
+function PullRequestDescriptionField({
+	value,
+	isPending,
+	onChange,
+}: {
+	value: string | undefined;
+	isPending: boolean;
+	onChange: (value: string | undefined) => void;
+}) {
+	return (
+		<DefaultableTextField
+			id="implementation-pull-request-description"
+			label="Pull request description"
+			description={
+				<>
+					The structure the agent fills in for the description of every pull request this phase
+					opens. It starts as SWARM's default; edit it freely. SWARM always adds the last line
+					itself — <code className="font-mono">Closes: #&lt;n&gt;</code> for a GitHub issue in the
+					same repository, otherwise <code className="font-mono">Work item: [key](url)</code>.
+				</>
+			}
+			display={pullRequestDescriptionDisplay(value)}
+			error={pullRequestDescriptionError(value)}
+			length={(normalizePullRequestDescription(value) ?? '').length}
+			maxLength={PULL_REQUEST_DESCRIPTION_MAX_LENGTH}
+			isDefault={isDefaultPullRequestDescription(value)}
+			isPending={isPending}
+			onChange={onChange}
+		/>
+	);
+}
+
+/**
+ * The Review phase's **Review report** card (issue #1288): the layout of the report
+ * every review posts on a pull request, in the project's language.
+ */
+function ReviewReportField({
+	value,
+	isPending,
+	onChange,
+}: {
+	value: string | undefined;
+	isPending: boolean;
+	onChange: (value: string | undefined) => void;
+}) {
+	return (
+		<DefaultableTextField
+			id="review-report"
+			label="Review report"
+			description={
+				<>
+					The layout of the report every review posts on a pull request. It starts as SWARM's
+					default; edit it freely. Write it in the language the report should use — the agent then
+					writes its findings, and SWARM its own wording, in that language. SWARM fills each{' '}
+					<code className="font-mono">{'{slot}'}</code> from the review; a slot left out that has
+					content is added at the end, so nothing blocking is ever hidden. The hidden marker,
+					footer, finding ids and the verdict cast stay SWARM's.
+				</>
+			}
+			display={reviewReportDisplay(value)}
+			error={reviewReportError(value)}
+			length={(normalizeReviewReport(value) ?? '').length}
+			maxLength={REVIEW_REPORT_MAX_LENGTH}
+			isDefault={isDefaultReviewReport(value)}
+			isPending={isPending}
+			onChange={onChange}
+		/>
 	);
 }
 
@@ -1150,6 +1252,7 @@ export function PhaseSettingsDetail({
 	handleTimeoutChange,
 	handlePromptChange,
 	handlePullRequestDescriptionChange,
+	handleReviewReportChange,
 	onBack,
 }: PhaseSettingsDetailProps) {
 	const phaseLabel = PHASE_LABELS[phase];
@@ -1287,6 +1390,14 @@ export function PhaseSettingsDetail({
 				/>
 			)}
 
+			{phase === 'review' && (
+				<ReviewReportField
+					value={config.reviewReport}
+					isPending={isPending}
+					onChange={(value) => handleReviewReportChange?.(value)}
+				/>
+			)}
+
 			<div className={`${CARD_CLASS} space-y-2`}>
 				<label htmlFor={`${phase}-prompt`} className="block text-sm font-semibold text-zinc-200">
 					Custom prompt (optional)
@@ -1421,6 +1532,7 @@ interface AgentConfigurationFormProps extends TargetHandlers {
 	handleTimeoutChange: (phase: keyof AgentsConfig, value: string) => void;
 	handlePromptChange: (phase: keyof AgentsConfig, value: string) => void;
 	handlePullRequestDescriptionChange: (value: string | undefined) => void;
+	handleReviewReportChange: (value: string | undefined) => void;
 	handleSubmit: (e: React.FormEvent) => void;
 	handleReset: () => void;
 	isDirty: boolean;
@@ -1481,6 +1593,7 @@ export function AgentConfigurationForm({
 	handleTimeoutChange,
 	handlePromptChange,
 	handlePullRequestDescriptionChange,
+	handleReviewReportChange,
 	handleSubmit,
 	handleReset,
 	isDirty,
@@ -1537,6 +1650,7 @@ export function AgentConfigurationForm({
 					handleTimeoutChange={handleTimeoutChange}
 					handlePromptChange={handlePromptChange}
 					handlePullRequestDescriptionChange={handlePullRequestDescriptionChange}
+					handleReviewReportChange={handleReviewReportChange}
 					onBack={onBack}
 				/>
 			) : (
@@ -2392,6 +2506,7 @@ function ProjectDetailRouteComponent() {
 		() =>
 			anyCustomPromptError(PHASES.map((phase) => agents[phase]?.prompt)) ||
 			pullRequestDescriptionError(agents.implementation?.pullRequestDescription) !== undefined ||
+			reviewReportError(agents.review?.reviewReport) !== undefined ||
 			PHASES.some((phase) => hasDuplicateCli(agents[phase]?.targets ?? [])),
 		[agents],
 	);
@@ -2486,6 +2601,16 @@ function ProjectDetailRouteComponent() {
 		setAgents((prev) => ({
 			...prev,
 			implementation: { ...prev.implementation, pullRequestDescription: value },
+		}));
+		updateMutation.reset();
+	};
+
+	const handleReviewReportChange = (value: string | undefined) => {
+		// Raw while editing, normalized on save — so the untouched default stores
+		// nothing (issue #1288). `undefined` is Restore default.
+		setAgents((prev) => ({
+			...prev,
+			review: { ...prev.review, reviewReport: value },
 		}));
 		updateMutation.reset();
 	};
@@ -2776,6 +2901,7 @@ function ProjectDetailRouteComponent() {
 						handleTimeoutChange={handleTimeoutChange}
 						handlePromptChange={handlePromptChange}
 						handlePullRequestDescriptionChange={handlePullRequestDescriptionChange}
+						handleReviewReportChange={handleReviewReportChange}
 						handleSubmit={handleAgentsSubmit}
 						handleReset={handleAgentsReset}
 						isDirty={isAgentsDirty}

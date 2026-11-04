@@ -64,6 +64,7 @@
  */
 
 import { getPersonaToken } from '@/config/provider.js';
+import { normalizeReviewReport } from '@/config/review-report.js';
 import type { ProjectConfig } from '@/config/schema.js';
 import {
 	abandonReviewVerdict as abandonReviewVerdictDefault,
@@ -457,6 +458,7 @@ async function produceReviewAgentResult(
 				{ repo: repository, prNumber, headSha, baseBranch: context.baseBranch },
 				customPrompt,
 				isReReview,
+				reviewReportLayout(project),
 			),
 		],
 		// `gh` reads GH_TOKEN ahead of any ambient `gh auth` login, so every gh
@@ -474,6 +476,8 @@ async function produceReviewAgentResult(
 interface RepairReviewHandoffParams {
 	validationError: string;
 	isReReview: boolean;
+	/** The project's review report layout, so the repair keeps the report's language (issue #1288). */
+	reviewReport?: string;
 	cli: AgentCli;
 	model?: string;
 	reasoning?: ReasoningLevel;
@@ -527,7 +531,13 @@ async function repairReviewHandoff(
 			reasoning: params.reasoning,
 			resumeSessionId: params.resumeSessionId,
 			cwd: params.worktreePath,
-			args: [buildReviewHandoffRepairPrompt(params.validationError, params.isReReview)],
+			args: [
+				buildReviewHandoffRepairPrompt(
+					params.validationError,
+					params.isReReview,
+					params.reviewReport,
+				),
+			],
 			maxOutputBytes: MAX_AGENT_OUTPUT_BYTES,
 			logContext: { taskId, phase: 'review-handoff-repair', prNumber, headSha },
 			// Its own budget: the harness has no notion of a phase's remaining time,
@@ -575,6 +585,15 @@ function minorsAreAnswered(project: ProjectConfig): boolean {
 }
 
 /**
+ * The project's own review report layout (issue #1288), or `undefined` for SWARM's
+ * default. Normalized again here, not only by the config schema, so a value equal to
+ * the default can never switch a review onto the translated-wording path.
+ */
+function reviewReportLayout(project: ProjectConfig): string | undefined {
+	return normalizeReviewReport(project.agents?.review?.reviewReport);
+}
+
+/**
  * Bind {@link repairReviewHandoff} to this run, so the submission reader can call
  * it with nothing but the validator's message. Split out to keep the closure —
  * and its long argument list — out of {@link runReviewPhase}'s complexity budget.
@@ -591,6 +610,8 @@ interface ReviewSubmissionContext {
 	ordinal: number;
 	isReReview: boolean;
 	minorsAnswered: boolean;
+	/** The project's review report layout, or `undefined` for SWARM's default (issue #1288). */
+	layout?: string;
 	/** Accept a pre-#470 hand-off — set only when resuming a delivery (see below). */
 	allowLegacy: boolean;
 	/**
@@ -642,6 +663,7 @@ function renderSubmission(
 			cap: Math.max(REVIEW_VERDICT_CAP, context.ordinal),
 			isReReview: context.isReReview,
 			minorsAnswered: context.minorsAnswered,
+			layout: context.layout,
 		}),
 	};
 }
@@ -873,10 +895,12 @@ export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<Re
 			ordinal: passOrdinal,
 			isReReview,
 			minorsAnswered: minorsAreAnswered(project),
+			layout: reviewReportLayout(project),
 			allowLegacy: deliveryResumed,
 			repairResumesSession: repairResumeId !== undefined,
 			repair: reviewRepairStep({
 				isReReview,
+				reviewReport: reviewReportLayout(project),
 				cli,
 				model,
 				reasoning,

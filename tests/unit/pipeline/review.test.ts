@@ -584,6 +584,57 @@ describe('runReviewPhase', () => {
 			expect(prompt).not.toContain('This is a RE-REVIEW');
 		});
 	});
+
+	describe('review report layout (issue #1288)', () => {
+		const POLISH_LAYOUT = '> {pass} · `{verdict}` · commit `{head}`\n\n## Zakres\n\n{summary}';
+
+		it('posts the default report and an unchanged prompt when the project sets no layout', async () => {
+			const deps = makeDeps();
+			writeHandoff(deps.path, handoff({ reportLabels: { review: 'Przegląd' } }));
+			await runReviewPhase(deps);
+
+			const { body } = deps.delivery.submitReview.mock.calls[0][0];
+			expect(body.startsWith('> **Review** · pass 1 of 3 · `request-changes`')).toBe(true);
+			expect(body).toContain('## Scope');
+			expect(deps.runAgent.mock.calls[0][0].args?.[0]).not.toContain('REVIEW REPORT');
+		});
+
+		it("renders the project's layout in the agent's translated wording, keeping the verdict and ids", async () => {
+			const deps = makeDeps();
+			deps.project = createMockProjectConfig({
+				agents: { review: { reviewReport: POLISH_LAYOUT } },
+			});
+			writeHandoff(
+				deps.path,
+				handoff({
+					summary: 'Dodaje fazę przeglądu.',
+					reportLabels: {
+						review: 'Przegląd',
+						passOf: 'przebieg {ordinal} z {cap}',
+						verdictRequestChanges: 'prośba o zmiany',
+						severityBlocker: 'blokujące',
+					},
+				}),
+			);
+			await runReviewPhase(deps);
+
+			const prompt = deps.runAgent.mock.calls[0][0].args?.[0] ?? '';
+			expect(prompt).toContain('--- REVIEW REPORT ---');
+			expect(prompt).toContain(POLISH_LAYOUT);
+
+			const submitted = deps.delivery.submitReview.mock.calls[0][0];
+			// The verdict submitted is SWARM's own value; only its display is translated.
+			expect(submitted.verdict).toBe('request-changes');
+			expect(submitted.body).toContain(
+				`> **Przegląd** · przebieg 1 z 3 · \`prośba o zmiany\` · commit \`${HEAD_SHA}\``,
+			);
+			expect(submitted.body).toContain('## Zakres\n\nDodaje fazę przeglądu.');
+			// Every slot the layout leaves out is appended rather than dropped, so the
+			// blocking finding — and its id — is still there.
+			expect(submitted.body).toContain('## F1 · blokujące · correctness — Unhandled rejection');
+			expect(submitted.body).not.toContain('## Scope');
+		});
+	});
 });
 
 describe('buildReviewPrompt', () => {
@@ -609,6 +660,18 @@ describe('buildReviewPrompt', () => {
 		expect(prompt).toContain(REVIEW_VERDICT_FILENAME);
 		expect(prompt).toContain('Judge every documentation file this repo requires to stay current');
 		expect(prompt).toContain('`docsChecked`');
+	});
+
+	// Issue #1288: a project's own layout tells the agent the report's language;
+	// SWARM still fills the layout, and the Custom prompt keeps its place after it.
+	it('carries a project review report layout before the project instructions', () => {
+		const layout = '## Zakres\n\n{summary}\n\n{blocking_findings}';
+		const prompt = buildReviewPrompt(context, 'Be terse.', false, layout);
+		expect(prompt).toContain('--- REVIEW REPORT ---');
+		expect(prompt).toContain(`Layout:\n${layout}`);
+		expect(prompt).toContain('Write every free-text field of the hand-off in that language');
+		expect(prompt).toContain('"severityBlocker": "blocker"');
+		expect(prompt.indexOf('--- END REVIEW REPORT ---')).toBeLessThan(prompt.indexOf('Be terse.'));
 	});
 
 	// The prompt specifies content, not layout (issue #470): SWARM renders the body
@@ -785,10 +848,21 @@ describe('buildReviewPrompt', () => {
 			...Object.keys(ReviewFindingSchema.shape),
 		].filter((slot) => !DESCRIBED_ELSEWHERE.has(slot));
 
+		// `reportLabels` is asked for only beside a project's own review report layout
+		// (issue #1288), so the audit reads the prompt that carries one — the superset.
+		const CUSTOM_LAYOUT = '## Zakres\n\n{summary}';
+
 		it.each(SLOTS)('states the JSON type of `%s`', (slot) => {
-			expect(statesType(contractRegion(buildReviewPrompt(context, undefined, true)), slot)).toBe(
-				true,
-			);
+			expect(
+				statesType(
+					contractRegion(buildReviewPrompt(context, undefined, true, CUSTOM_LAYOUT)),
+					slot,
+				),
+			).toBe(true);
+		});
+
+		it('asks for no `reportLabels` on SWARM’s default layout', () => {
+			expect(buildReviewPrompt(context, undefined, true)).not.toContain('reportLabels');
 		});
 
 		it('states `severity`’s type in the rubric that actually describes it', () => {
@@ -802,7 +876,7 @@ describe('buildReviewPrompt', () => {
 		// finding's own `id`/`title` bullets: in the re-review prompt above, the
 		// `carried` bullet types those two names as well.
 		it('covers every slot but `carried` on an initial review', () => {
-			const region = contractRegion(buildReviewPrompt(context));
+			const region = contractRegion(buildReviewPrompt(context, undefined, false, CUSTOM_LAYOUT));
 			for (const slot of SLOTS)
 				expect({ slot, typed: statesType(region, slot) }).toEqual({
 					slot,
@@ -849,6 +923,14 @@ describe('buildReviewHandoffRepairPrompt', () => {
 			`Read "${REVIEW_VERDICT_FILENAME}" first — it holds the findings, severities and verdict this pass must preserve`,
 		);
 		expect(prompt).not.toContain('as before');
+	});
+
+	// A repair that loses the report's language would post a half-English report.
+	it('carries a project review report layout, and asks for no labels without one', () => {
+		const prompt = buildReviewHandoffRepairPrompt('x', false, '## Zakres\n\n{summary}');
+		expect(prompt).toContain('--- REVIEW REPORT ---');
+		expect(prompt).toContain('`reportLabels`: an object whose values are strings');
+		expect(buildReviewHandoffRepairPrompt('x')).not.toContain('reportLabels');
 	});
 
 	it('asks a re-review to repair its `carried` list too', () => {
