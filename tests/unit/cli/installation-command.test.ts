@@ -63,6 +63,20 @@ describe('installation command', () => {
 		expect(launcherCommand({ PATH: pathDir }, other)).toBe('swarm-launcher');
 	});
 
+	// Issue #1311: the launcher package ships `swarm-worker` and no `swarm-launcher`,
+	// and its `run <worker-id>` is the same command.
+	it('names swarm-worker for a launcher package, which has no swarm-launcher', () => {
+		const pkg = join(root, 'swarm-worker-launcher');
+		mkdirSync(join(pkg, 'bin'), { recursive: true });
+		writeFileSync(join(pkg, 'bin', 'swarm-worker.js'), '#!/bin/sh\n');
+		chmodSync(join(pkg, 'bin', 'swarm-worker.js'), 0o755);
+		expect(launcherCommand({ PATH: pathDir }, pkg)).toBe(
+			`node ${join(pkg, 'bin', 'swarm-worker.js')}`,
+		);
+		link('swarm-worker', join(pkg, 'bin', 'swarm-worker.js'));
+		expect(launcherCommand({ PATH: pathDir }, pkg)).toBe('swarm-worker');
+	});
+
 	it('follows a symlink chain the way npm link leaves one', () => {
 		const global = join(root, 'global', 'node_modules');
 		mkdirSync(global, { recursive: true });

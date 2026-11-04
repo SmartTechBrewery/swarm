@@ -16,7 +16,7 @@
  * printing it.
  */
 
-import { accessSync, constants, realpathSync } from 'node:fs';
+import { accessSync, constants, existsSync, realpathSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import { REPO_ROOT } from './paths.js';
 
@@ -33,12 +33,22 @@ export function swarmCommand(
  * `swarm-launcher`, or `node <install-root>/bin/swarm-launcher.js` when `PATH`'s is
  * another installation's — the command a profile-based worker is started with
  * (issue #1296), named exactly as {@link swarmCommand} names `swarm`.
+ *
+ * The launcher package (issue #1283) ships no `swarm-launcher.js`: its command is
+ * `swarm-worker`, whose `run <worker-id>` is the same launcher. So an install root
+ * without the one but with the other is named by `swarm-worker` instead (issue
+ * #1311), and a hint printed by `swarm-worker setup` names a command that exists.
  */
 export function launcherCommand(
 	env: NodeJS.ProcessEnv = process.env,
 	installRoot = REPO_ROOT,
 ): string {
 	const own = join(installRoot, 'bin', 'swarm-launcher.js');
+	const packaged = join(installRoot, 'bin', 'swarm-worker.js');
+	if (!existsSync(own) && existsSync(packaged))
+		return resolvesToOwn('swarm-worker', packaged, env)
+			? 'swarm-worker'
+			: `node ${shellQuote(packaged)}`;
 	return resolvesToOwn('swarm-launcher', own, env) ? 'swarm-launcher' : `node ${shellQuote(own)}`;
 }
 

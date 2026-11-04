@@ -81,6 +81,12 @@ export interface OperatorClientOptions {
 	token: string;
 	/** Override `fetch` in tests; defaults to the global. */
 	fetchImpl?: FetchLike;
+	/**
+	 * The command an expired session is renewed with, for the refusal that names it —
+	 * `swarm login` unless the caller is another program (`swarm-worker login`,
+	 * issue #1311, which runs with no `swarm` CLI on the machine).
+	 */
+	loginCommand?: string;
 }
 
 /** The two call shapes the operator API offers, sharing everything but the HTTP verb. */
@@ -147,12 +153,13 @@ function failureMessage(
 	procedurePath: string,
 	status: number,
 	body: unknown,
+	loginCommand = 'swarm login',
 ): string {
 	const failure = TrpcErrorSchema.safeParse(body);
 	if (failure.success) {
 		const { message, data } = failure.data.error;
 		if (data?.code === 'UNAUTHORIZED') {
-			return `your control-plane session at ${controlPlaneUrl} has expired — run \`swarm login\``;
+			return `your control-plane session at ${controlPlaneUrl} has expired — run \`${loginCommand}\``;
 		}
 		if (/^No procedure found on path/i.test(message)) {
 			return `${message} — this control plane is running an older build than your CLI; update it, or run a CLI matching it`;
@@ -214,7 +221,13 @@ async function call<T>(
 	const body = await response.json().catch(() => undefined);
 	if (!response.ok) {
 		throw new OperatorApiError(
-			failureMessage(options.controlPlaneUrl, procedurePath, response.status, body),
+			failureMessage(
+				options.controlPlaneUrl,
+				procedurePath,
+				response.status,
+				body,
+				options.loginCommand,
+			),
 		);
 	}
 

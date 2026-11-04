@@ -61,6 +61,7 @@ import { resolveOwnBuildIdentity, WorkerUpdateTargetSchema } from '../../lib/bui
 import { logger } from '../../lib/logger.js';
 import { publishWorktreeSweepRequest } from '../../queue/worker-sweeps.js';
 import { TriggerPhaseSchema } from '../../triggers/types.js';
+import { listAccessibleProjectSummaries } from '../accessible-projects.js';
 import {
 	accessibleProjectScope,
 	assertInstanceAdmin,
@@ -747,6 +748,15 @@ export const workersRouter = router({
 			rateLimits: serializeWorkerRateLimits(worker.rateLimits),
 		}));
 	}),
+
+	// The projects the caller may enroll a worker into — the picker `swarm-worker
+	// setup` offers (issue #1311), which runs against the operator API alone, where
+	// `projects.*` is deliberately not mounted (`../operator-router.ts`). It is
+	// `projects.listMine`'s own read (`listAccessibleProjectSummaries`): the caller's
+	// membership set, or every project for an `instanceAdmin`, as id + name + role and
+	// nothing else — no repository, board or credential reference. Whether the
+	// enrollment then needs a project administrator's approval stays `enroll`'s call.
+	enrollableProjects: authedProcedure.query(({ ctx }) => listAccessibleProjectSummaries(ctx.user)),
 
 	// Rename one of the caller's own workers — the machine's own label, not a
 	// project-scoped fact, so it is gated by strict ownership

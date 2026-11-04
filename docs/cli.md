@@ -1244,6 +1244,92 @@ credential roles.
 
 ---
 
+## Worker launcher — `swarm-worker`
+
+The command a **clone-free** worker host runs (issues #1283, #1311): the launcher
+package's `bin/swarm-worker.js` (`npm run build:worker-launcher`), or the same file in
+a clone after `npm run build`. It needs only Node >= 22, and it reads and writes no
+`.env` — each command is handed its installation's URL by a flag, an answer, or a
+worker profile.
+
+```bash
+swarm-worker setup [--control-plane-url <url>] [--email <email>] [--password-file <path|->]
+                   [--project <id>] [--cli <c1,c2>] [--name <name>]
+                   [--scm-token-file <path|->] [--no-autostart] [--yes]
+swarm-worker login [--control-plane-url <url>] [--email <email>] [--password-file <path|->]
+swarm-worker status [<workerId>]
+swarm-worker run <workerId>
+swarm-worker runtimes
+swarm-worker --version
+```
+
+### `swarm-worker setup`
+
+Run in the project checkout the worker is to serve. It ends with a
+**profile-based** worker (`~/.swarm/workers/<id>/profile.json`) that is registered,
+enrolled, credentialed, on a verified runtime, under launchd, and connected:
+
+1. **Session.** A live cached session for the URL (`~/.swarm/operator-sessions/`,
+   as `swarm login` caches it) is reused with no password asked — unless `--email`
+   names someone else. Otherwise it signs in with your email and password and caches
+   only the session token (`700`/`600`).
+2. **Project.** Picked from the projects you can access (`workers.enrollableProjects`
+   — id, name and your role, exactly what `projects.listMine` lists to you): the only
+   one is picked for you; several are a numbered list, offering the one named like
+   the checkout's repository (which `--yes` accepts). `--project` must be one of them.
+3. **CLIs and name.** The agent CLIs on `PATH` (confirmable; `--cli` overrides) and
+   `<you>_<host>_<repo>` (`--name` overrides).
+4. **SCM token.** Your source-control credential for the project's provider
+   (`workers.projectScmProvider`), typed without echo or read from
+   `--scm-token-file`.
+5. **Register, enroll, store** — [`swarm workers setup --profile`](#swarm-workers)'s
+   own code, with its refusals and recovery hints. It refuses a checkout that
+   already has a cached worker, or that a profile already serves for the same
+   installation.
+6. **Runtime.** The installation's runtime is downloaded and verified now
+   (`ensureRuntime`). A verification refusal exits 1 before launchd is touched,
+   naming the `swarm-worker-agent install --profile <id>` to retry with; an
+   installation that serves no runtime yet, or cannot be reached for it, is a
+   warning — the launcher fetches it at start.
+7. **Start.** `swarm-worker-agent install --profile <id>`, then up to 60 s of
+   `workers.listMine` until the worker is `connected` (exit 1 if it never is, naming
+   `swarm-worker status <id>`). Off macOS, or with `--no-autostart`, it prints
+   `swarm-worker run <id>` instead.
+
+Every question has a flag. With no terminal a missing answer fails **naming its
+flag** (CLIs and name default instead); `--yes` accepts every default. Secrets are
+never arguments: `--password-file` and `--scm-token-file` take a path or `-` for
+stdin, and only one of them may be `-`. The password is never echoed, printed,
+logged or stored; the SCM token is sent once, to `workers.scmCredentials.set`; the
+worker credential stays in the profile. An enrollment into a project you do not
+administer is created **pending**: setup still installs and starts the worker, and
+names the `swarm workers approve <id> <project>` a project administrator runs (or
+the project's Workers tab).
+
+### `swarm-worker login`
+
+Signs in afresh and caches the session token, exactly as `swarm login` does but with
+no `.env`. The URL defaults to the installation this host's profiles serve when they
+serve exactly one; the email to the identifier last signed in there.
+
+### `swarm-worker status`
+
+For each profile (or just `<workerId>`): its LaunchAgent, as
+`swarm-worker-agent status --profile <id>` reports it (off macOS, the foreground
+command); its runtime, from `state.json` (selected version and whether it is
+installed, the version last started, a version on trial); and — when a session for
+its installation is live — the control plane's view from `workers.listMine`:
+connected or not, last seen, drained, and each enrollment's state. Without a live
+session it shows the local view and says to run `swarm-worker login`. Exits 0 only
+when every worker reported is connected.
+
+### `swarm-worker run` / `runtimes`
+
+The launcher's own commands (`swarm-launcher run|runtimes`) — see
+[Profile-based workers](./MANUAL.md#the-worker) in the manual.
+
+---
+
 ## Process & dev scripts (`npm run`)
 
 The host processes and tooling that live outside the `swarm` CLI. Run from the

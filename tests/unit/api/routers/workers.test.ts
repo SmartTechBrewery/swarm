@@ -106,9 +106,11 @@ const { getInstallationRollout, getRolloutForOwner, startRollout } = vi.hoisted(
 // suite stubs it rather than driving a real checkout.
 const { resolveOwnBuildIdentity } = vi.hoisted(() => ({ resolveOwnBuildIdentity: vi.fn() }));
 const { removeWorker } = vi.hoisted(() => ({ removeWorker: vi.fn() }));
-const { getMembership, listAccessibleProjectIds } = vi.hoisted(() => ({
+const { getMembership, listAccessibleProjectIds, listProjectsForUser } = vi.hoisted(() => ({
 	getMembership: vi.fn(),
 	listAccessibleProjectIds: vi.fn(),
+	// Issue #1311 — `enrollableProjects` reads the role the caller holds on each.
+	listProjectsForUser: vi.fn(),
 }));
 // Issue #799 — `register` resolves its owner and `projectScmProvider` its project
 // and that project's SCM provider.
@@ -120,7 +122,10 @@ const { findUserByIdentifier, getUserById, listUsers } = vi.hoisted(() => ({
 	// Issue #922 — `requestUpdateForInstallation` labels every machine with its owner.
 	listUsers: vi.fn(),
 }));
-const { findProjectByIdFromDb } = vi.hoisted(() => ({ findProjectByIdFromDb: vi.fn() }));
+const { findProjectByIdFromDb, listAllProjectRecordsFromDb } = vi.hoisted(() => ({
+	findProjectByIdFromDb: vi.fn(),
+	listAllProjectRecordsFromDb: vi.fn(),
+}));
 const { requireProjectSCMProviderId } = vi.hoisted(() => ({
 	requireProjectSCMProviderId: vi.fn(),
 }));
@@ -168,7 +173,11 @@ vi.mock('@/api/worker-update-rollout.js', () => ({
 	startRollout,
 }));
 vi.mock('@/db/repositories/workersRepository.js', () => ({ removeWorker }));
-vi.mock('@/identity/membership-service.js', () => ({ getMembership, listAccessibleProjectIds }));
+vi.mock('@/identity/membership-service.js', () => ({
+	getMembership,
+	listAccessibleProjectIds,
+	listProjectsForUser,
+}));
 vi.mock('@/db/repositories/usersRepository.js', () => ({
 	findUserByIdentifier,
 	getUserById,
@@ -183,6 +192,7 @@ vi.mock('@/db/repositories/projectsRepository.js', async () => ({
 		'@/db/repositories/projectsRepository.js',
 	)),
 	findProjectByIdFromDb,
+	listAllProjectRecordsFromDb,
 }));
 vi.mock('@/integrations/scm/registry.js', async () => ({
 	...(await vi.importActual<typeof import('@/integrations/scm/registry.js')>(
@@ -311,6 +321,8 @@ beforeEach(() => {
 		removeWorker,
 		getMembership,
 		listAccessibleProjectIds,
+		listProjectsForUser,
+		listAllProjectRecordsFromDb,
 		findUserByIdentifier,
 		getUserById,
 		listUsers,
@@ -930,6 +942,47 @@ describe('workers.listMine (owner self-service)', () => {
 				resetHint: 'resets at 6pm',
 			},
 		]);
+	});
+});
+
+// Issue #1311: the project picker `swarm-worker setup` offers over the operator API,
+// where `projects.*` is not mounted. It must list exactly what `projects.listMine`
+// lists to the same caller, and nothing but id + name + role.
+describe('workers.enrollableProjects', () => {
+	const PROJECTS = [
+		{ id: 'p1', name: 'Alpha', repo: 'acme/alpha', repoRoot: '/srv/alpha' },
+		{ id: 'p2', name: 'Beta', repo: 'acme/beta', repoRoot: '/srv/beta' },
+	];
+
+	beforeEach(() => {
+		listAllProjectRecordsFromDb.mockResolvedValue(PROJECTS);
+		listProjectsForUser.mockResolvedValue([]);
+	});
+
+	it('lists a member’s own projects with the role they hold, and only those', async () => {
+		listAccessibleProjectIds.mockResolvedValue(['p2']);
+		listProjectsForUser.mockResolvedValue([membershipFor('member', 'p2')]);
+
+		await expect(owner.enrollableProjects()).resolves.toEqual([
+			{ id: 'p2', name: 'Beta', role: 'member' },
+		]);
+		expect(listAccessibleProjectIds).toHaveBeenCalledWith(OWNER_ID);
+	});
+
+	it('lists nothing for a caller who is a member of no project', async () => {
+		listAccessibleProjectIds.mockResolvedValue([]);
+
+		await expect(owner.enrollableProjects()).resolves.toEqual([]);
+	});
+
+	it('lists every project for an instanceAdmin, with no invented role', async () => {
+		const admin = workersRouter.createCaller({ user: ADMIN_USER });
+
+		await expect(admin.enrollableProjects()).resolves.toEqual([
+			{ id: 'p1', name: 'Alpha', role: null },
+			{ id: 'p2', name: 'Beta', role: null },
+		]);
+		expect(listAccessibleProjectIds).not.toHaveBeenCalled();
 	});
 });
 

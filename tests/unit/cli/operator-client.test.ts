@@ -159,6 +159,20 @@ describe('createOperatorClient', () => {
 		);
 	});
 
+	// Issue #1311: the launcher package has no `swarm`, so it names its own login.
+	it('names the caller’s own login command when it has one', async () => {
+		const { fetchImpl } = stubFetch(trpcError(401, 'UNAUTHORIZED', 'UNAUTHORIZED'));
+		const api = createOperatorClient({
+			controlPlaneUrl: CONTROL_PLANE,
+			token: TOKEN,
+			fetchImpl,
+			loginCommand: 'swarm-worker login',
+		});
+		await expect(api.query('workers.listMine', undefined, passthrough)).rejects.toThrow(
+			'your control-plane session at https://swarm.example.com has expired — run `swarm-worker login`',
+		);
+	});
+
 	it('names version skew when the control plane serves no such procedure', async () => {
 		const { client: api } = client(
 			trpcError(404, 'No procedure found on path "workers.register"', 'NOT_FOUND'),

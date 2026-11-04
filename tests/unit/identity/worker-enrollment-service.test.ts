@@ -397,6 +397,27 @@ describe('listOwnerWorkers', () => {
 
 		expect(view.supervision).toBe('unsupervised');
 	});
+
+	// Issue #1311: `swarm-worker setup` waits on this for the worker it installed, and
+	// `swarm-worker status` reports it, with no dashboard session.
+	it('carries the connection and last heartbeat, as the dashboard row derives them', async () => {
+		const heartbeat = new Date('2026-11-04T10:00:00Z');
+		listWorkersForOwner.mockResolvedValue([makeWorker()]);
+		listEnrollmentsForWorker.mockResolvedValue([]);
+		getLiveSessionForWorker.mockResolvedValue({ currentRunId: null, lastHeartbeatAt: heartbeat });
+
+		const [online] = await listOwnerWorkers(OWNER_ID);
+		expect(online).toMatchObject({ connection: 'online', lastSeenAt: heartbeat });
+
+		getLiveSessionForWorker.mockResolvedValue(undefined);
+		getRetainedSessionForWorker.mockResolvedValue({ lastHeartbeatAt: heartbeat });
+		const [offline] = await listOwnerWorkers(OWNER_ID);
+		expect(offline).toMatchObject({ connection: 'offline', lastSeenAt: heartbeat });
+
+		getRetainedSessionForWorker.mockResolvedValue(undefined);
+		const [never] = await listOwnerWorkers(OWNER_ID);
+		expect(never).toMatchObject({ connection: 'offline', lastSeenAt: null });
+	});
 });
 
 describe('listDashboardWorkers (issue #133)', () => {

@@ -95,16 +95,29 @@ describe('swarm-worker', () => {
 		const launcher = vi.fn();
 		const io = capture();
 
-		expect(await run(['setup'], { launcher, stdout: io.stdout, stderr: io.stderr })).toBe(1);
-		expect(io.err).toEqual(['swarm-worker: unknown command: setup']);
+		expect(await run(['migrate'], { launcher, stdout: io.stdout, stderr: io.stderr })).toBe(1);
+		expect(io.err).toEqual(['swarm-worker: unknown command: migrate']);
 		expect(io.out).toEqual([USAGE]);
 		expect(launcher).not.toHaveBeenCalled();
 	});
 
 	it('names only the subcommands that exist', () => {
-		expect(USAGE).toContain('swarm-worker run <workerId>');
-		expect(USAGE).toContain('swarm-worker runtimes');
-		for (const later of ['setup', 'login', 'status', 'migrate'])
-			expect(USAGE).not.toMatch(new RegExp(`swarm-worker ${later}\\b`));
+		for (const command of ['setup', 'login', 'status', 'run <workerId>', 'runtimes'])
+			expect(USAGE).toContain(`swarm-worker ${command}`);
+		expect(USAGE).not.toMatch(/swarm-worker migrate\b/);
+	});
+
+	// Issue #1311.
+	it.each([
+		['setup', ['setup', '--control-plane-url', 'https://swarm.example.com']],
+		['login', ['login', '--email', 'ada@example.com']],
+		['status', ['status', 'w-1']],
+	] as const)('hands %s its own arguments, and nothing to the launcher', async (command, argv) => {
+		const launcher = vi.fn();
+		const handler = vi.fn().mockResolvedValue(3);
+
+		expect(await run([...argv], { launcher, [command]: handler })).toBe(3);
+		expect(handler).toHaveBeenCalledWith(argv.slice(1));
+		expect(launcher).not.toHaveBeenCalled();
 	});
 });

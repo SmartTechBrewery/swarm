@@ -22,6 +22,16 @@
  *
  * Projects, credentials, settings and users stay off the exposed process
  * entirely rather than relying on their own authorization as the only barrier.
+ * One project read is the exception, and it is deliberately narrow (issue #1311):
+ * `workers.enrollableProjects`, the picker `swarm-worker setup` offers on a machine
+ * with no SWARM clone and no dashboard session. It answers id + name + the
+ * caller's role for exactly the projects `projects.listMine` lists to the same
+ * user — their membership set, or every project for an `instanceAdmin` — and
+ * nothing a project's configuration holds: no repository, board mapping or
+ * credential reference. It rides in the `workers` namespace rather than mounting
+ * `projects`, because what it serves is the enrollment step and nothing else; the
+ * project ids it names were already learnable one at a time through
+ * `workers.projectScmProvider`, which setup calls next.
  * So do every run mutation (`retryNow`, `terminate`, `reset`, `forceReReview`,
  * `dismissStalled`, `putBack`) and the installation-wide dispatch views
  * (`queued`, `stalled`). No credential-bearing procedure is mounted, so nothing
