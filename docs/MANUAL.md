@@ -315,26 +315,9 @@ machine, each on its own runtime. A runtime that fails its size, checksum or
 signature check is never started: the launcher exits 1 naming the check. When the
 control plane cannot be reached (or serves no runtime) and no selection is
 installed, the version this worker last started on is used if it is still installed; otherwise the launcher exits 1 with the
-reason. A version the worker was **moved to** is on trial until a daemon running it
-connects (issue #1303): `state.json` holds a pending-verification record, `run`
-counts each start of that version *before* handing its process over, and the
-daemon's first session clears the record and makes the version the worker's
-`lastKnownGoodVersion`. After three starts in a row without a session — or at once,
-when the control plane rejects the daemon's handshake outright — `run` logs an error,
-selects the version the worker was moved from and starts that instead. If that
-version is no longer installed it exits 1 and keeps the record, so the worker stays
-down and says why rather than crash-looping on the version that never connected.
-**Versions no worker uses are removed** (issue #1304). Every `run`, once it has
-recorded its start, and every daemon, right after its first session promotes a
-version, removes each installed version that no worker's `state.json` under
-`~/.swarm/workers/` names — as its selected, last-run or last known good version, or
-as either side of a pending verification — and `run` logs each removal. A version
-installed within the last hour is kept, so is one being installed right now, and
-nothing at all is removed while any worker's state cannot be read. The removal runs
-under a store-wide lock (`~/.swarm/runtimes/.locks/.store.lock`) that recording a
-selection also takes, so a version cannot be selected while it is being removed. It
-is best effort: a failure is logged and never stops a start. There is no prune
-command and no retention setting; `swarm-launcher runtimes` lists what is left.
+reason. A version the worker was **moved to** is on trial until it connects, and
+versions no worker uses are removed as workers start — both under **Updating a
+runtime-based worker** below.
 The signing key it trusts is `deploy/worker-runtime/minisign.pub` under the
 launcher's own install; without that file it installs nothing new and still starts
 versions already installed. For now the launcher runs from a SWARM build
@@ -529,23 +512,67 @@ swarm workers list                       # read what it reported
 swarm workers undrain <worker-id>        # back in the pool
 ```
 
-A **runtime-based** worker (a profile-based one `swarm-launcher run` starts, below)
-has no install root, so it is asked for a **signed release version** instead —
-`swarm workers update <worker-id> v1.6.0` (or `1.6.0`, or the installation's own
-commit) — and the same drain, supervision and reporting apply (issue #1302). Its
-daemon downloads and verifies that release into `~/.swarm/runtimes/<version>/` (one
-download per host however many of its workers ask), records it as the worker's
-selected version, reports `applied` and exits for the launcher to start it on that
+**Updating a runtime-based worker** (issues #1302–#1304,
+[`ADR-007`](./decisions/ADR-007-runtime-worker-updates.md)). A profile-based worker
+(the one `swarm-launcher run` starts, above) has no install root, so it is asked for
+a **signed release version** instead — and the same drain, enrollment, supervision
+and reporting apply:
+
+```bash
+swarm workers drain <worker-id>
+swarm workers update <worker-id> v1.6.0  # or 1.6.0, or the installation's own commit
+swarm workers list
+swarm workers undrain <worker-id>
+```
+
+Its daemon asks its control plane where that release is (the installation's own
+artifact, or the publisher's GitHub Release — see
+[Serving the runtime from the installation](#serving-the-runtime-from-the-installation)),
+downloads and verifies it into `~/.swarm/runtimes/<version>/` (one download per host
+however many of its workers ask), records it as the worker's selected version in
+`state.json`, reports `applied` and exits for the launcher to start it on that
 version. A branch, another commit, or a version with no signed release is `refused`;
 a failed download or signature check is `failed` and leaves the worker where it
 was. So is a release whose runtime predates launcher-driven verification (its
 `build-info.json` declares no `launcherProtocol`): its daemon could never prove
 itself, so the launcher would abandon it after a few healthy starts. No other worker
-on the host is waited for or disturbed. An `applied` move that then never connects
-is undone by the launcher, which goes back to the version the worker was moved from
-(`swarm-launcher`, below) — the same recovery a clone gets from its last known good
-build, and it reads the same way: the worker comes back reporting its previous
-build, which also halts a staged rollout.
+on the host is waited for or disturbed. There is no ancestor check and no dirty-root
+refusal: the publisher's signature, verified against the launcher's own trusted key,
+replaces the first, and an installed runtime is never modified, so the second has
+nothing to protect — an administrator can move a worker to any signed release, older
+ones included, and to nothing unsigned. ADR-007 records that trust model; a clone
+keeps ADR-006's.
+
+*Rollback* (issue #1303). A version the worker was moved to is on trial until a
+daemon running it connects: `state.json` holds a pending-verification record, `run`
+counts each start of that version *before* handing its process over, and the
+daemon's first session clears the record and makes the version the worker's
+`lastKnownGoodVersion`. After three starts in a row without a session
+(`MAX_FAILED_STARTS`) — or at once, when the control plane rejects the daemon's
+handshake outright — `run` logs an error, selects the version the worker was moved
+from and starts that instead. If that version is no longer installed it exits 1 and
+keeps the record, so the worker stays down and says why rather than crash-looping on
+the version that never connected. It reads like a clone's return to its last known
+good build: the worker comes back reporting its previous build, which also halts a
+staged rollout. The daemon logs the promotion or the rejection to
+`<profileDir>/logs/worker.log`; the launcher's counted starts and the return
+(`giving up on v<version>, which never connected …`) are in its own output, which
+under launchd is `swarm-worker-agent logs --profile <worker-id>`.
+
+*Cleanup* (issue #1304). Every `run`, once it has recorded its start, and every
+daemon, right after its first session promotes a version, removes each installed
+version that no worker's `state.json` under `~/.swarm/workers/` names — as its
+selected, last-run or last known good version, or as either side of a pending
+verification — and `run` logs each removal. So the version a worker runs and the one
+it would go back to are always kept. A version installed within the last hour is
+kept, so is one being installed right now, and nothing at all is removed while any
+worker's state cannot be read. The removal runs under a store-wide lock
+(`~/.swarm/runtimes/.locks/.store.lock`) that recording a selection also takes, so a
+version cannot be selected while it is being removed. It is best effort: a failure
+is logged and never stops a start. There is no prune command and no retention
+setting; `swarm-launcher runtimes` lists what is left. See
+[`docs/onboarding-worker.md`](./onboarding-worker.md#updating-a-runtime-based-worker)
+for what each step looks like on the host.
 
 **Each request is a run, in the runs list** (issue #971). Asking a machine to move
 creates one run per machine asked, scoped to that machine's project, which starts,
@@ -1898,7 +1925,11 @@ The complete option catalogue, defaults, and source-of-truth schemas are in
   and why the API is a host process rather than a Compose service
 - [`docs/github-projects-v2-api.md`](./github-projects-v2-api.md) —
   Projects v2 API and webhook details
-- [`docs/decisions/`](./decisions/) — architecture decision records
+- [`docs/decisions/`](./decisions/) — architecture decision records, among them
+  [`ADR-006`](./decisions/ADR-006-unconditional-worker-updates.md) (what bounds a
+  clone-based worker's update) and
+  [`ADR-007`](./decisions/ADR-007-runtime-worker-updates.md) (the signed-release
+  trust model that replaces parts of it for runtime-based workers)
 - [`docs/public-hosting-exploration.md`](./public-hosting-exploration.md) —
   what a public, multi-tenant deployment would take (hosting, missing pieces,
   credential model, OAuth across the three SCM providers). **Deferred** — SWARM
