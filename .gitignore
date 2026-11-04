@@ -52,7 +52,7 @@ build-info.json
 
 # The packaged worker runtime and its staged tree (bin/build-worker-runtime.js,
 # issue #1279) — a build output, never committed.
-worker-runtime/
+/worker-runtime/
 
 # TypeScript
 *.tsbuildinfo
