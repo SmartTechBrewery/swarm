@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
+import { render, screen } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 
-import { formatWorkerBuild } from '@/components/workers/worker-build.js';
+import { formatWorkerBuild, WorkerBuildBadge } from '@/components/workers/worker-build.js';
 
 const COMMIT = { commit: 'abc1234def5678', dirty: false };
 
@@ -38,5 +39,33 @@ describe('formatWorkerBuild', () => {
 	// printed, because a control plane may be newer than this build.
 	it('prints an unexpected version string verbatim', () => {
 		expect(formatWorkerBuild(COMMIT, '2.0.0-rc.1+build.7')).toBe('2.0.0-rc.1+build.7 (abc1234)');
+	});
+});
+
+describe('WorkerBuildBadge', () => {
+	// A runtime-based worker declares the commit stamped into it, with a version and
+	// never dirty (issue #1302); on another commit than the control plane's it is
+	// Outdated exactly as a clone is, and the advice holds for both kinds.
+	it('marks a stamped build on another commit Outdated, advising swarm workers update', () => {
+		render(
+			<WorkerBuildBadge
+				buildIsCurrent={false}
+				controlPlaneBuild={{ commit: 'abc1234def5678', dirty: false, version: '1.6.0' }}
+			/>,
+		);
+		const badge = screen.getByText('Outdated');
+		expect(badge.getAttribute('title')).toContain('1.6.0 (abc1234)');
+		expect(badge.getAttribute('title')).toContain('swarm workers update');
+		expect(badge.getAttribute('title')).not.toContain('checkout');
+	});
+
+	it('renders nothing for a current build or one with no answer', () => {
+		const { container } = render(
+			<>
+				<WorkerBuildBadge buildIsCurrent={true} />
+				<WorkerBuildBadge buildIsCurrent={null} />
+			</>,
+		);
+		expect(container.textContent).toBe('');
 	});
 });

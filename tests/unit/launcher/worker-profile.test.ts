@@ -18,6 +18,7 @@ import {
 	readWorkerProfile,
 	readWorkerState,
 	updateWorkerProfileRepoRoots,
+	updateWorkerState,
 	workerProfileDir,
 	workerProfilePath,
 	workerProfilesDir,
@@ -150,5 +151,22 @@ describe('worker profiles', () => {
 
 		writeFileSync(path, '[]');
 		expect(readWorkerState(WORKER_ID, home)).toBeUndefined();
+	});
+
+	it('merges a patch into the state, keeping the fields it does not name', () => {
+		write();
+		expect(updateWorkerState(WORKER_ID, { selectedVersion: '2.0.0' }, home)).toBeNull();
+		expect(readWorkerState(WORKER_ID, home)).toBeNull();
+
+		const state = { lastRuntimeVersion: '1.2.3', startedAt: '2026-11-04T12:00:00.000Z' };
+		writeWorkerState(WORKER_ID, state, home);
+		expect(updateWorkerState(WORKER_ID, { selectedVersion: '2.0.0' }, home)).toEqual({
+			...state,
+			selectedVersion: '2.0.0',
+		});
+		expect(readWorkerState(WORKER_ID, home)).toEqual({ ...state, selectedVersion: '2.0.0' });
+		expect(statSync(join(workerProfileDir(WORKER_ID, home), 'state.json')).mode & 0o777).toBe(
+			0o600,
+		);
 	});
 });

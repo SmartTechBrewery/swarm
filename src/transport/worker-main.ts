@@ -111,6 +111,7 @@ import {
 	WORKER_QUOTA_REPORT_INTERVAL_MS,
 	type WorkerQuotaReportingHandle,
 } from './quota-reporting.js';
+import { runtimeUpdateApply } from './runtime-update.js';
 import {
 	declaredRepositories,
 	resolveWorkerCheckouts,
@@ -443,6 +444,10 @@ async function main(): Promise<void> {
 			// connected. Comparing that against the install root is how an update that
 			// found the files already moved decides whether it has anything to restart for.
 			build,
+			// A launcher-run daemon (`SWARM_WORKER_ID` set) has no install root to move: it
+			// installs the requested signed release and selects it for the launcher's next
+			// start instead (issue #1302). `undefined` keeps the git path for a clone.
+			apply: runtimeUpdateApply(process.env, { controlPlaneUrl, credential, build }),
 		}),
 		// The second frame about this *machine* rather than a dispatch (issue #955):
 		// remove the `task-<id>` checkouts under this host's own repo root that nothing

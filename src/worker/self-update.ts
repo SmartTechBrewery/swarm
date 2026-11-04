@@ -185,7 +185,13 @@ export type UpdateFailureStage = 'checkout' | 'install' | 'build';
  */
 export type UpdateOutcome =
 	| { status: 'already-current'; commit: string }
-	| { status: 'applied'; commit: string; previousCommit: string }
+	| {
+			status: 'applied';
+			commit: string;
+			previousCommit: string;
+			/** The operator-facing words, when the mechanism was not this install root's (issue #1302). */
+			message?: string;
+	  }
 	/** Nothing was changed, and `reason` says why in operator-facing prose. */
 	| { status: 'refused'; reason: string }
 	| {

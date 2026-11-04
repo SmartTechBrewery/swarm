@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
 	existsSync,
@@ -11,7 +11,7 @@ import {
 	utimesSync,
 	writeFileSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -137,6 +137,7 @@ describe('ensureRuntime', () => {
 			homeDir: home,
 			fetch: fetch.fetch,
 			now: overrides.now,
+			lockPollMs: 5,
 		});
 
 	it('installs a verified runtime read-only under ~/.swarm/runtimes/<version>/', async () => {
@@ -320,7 +321,7 @@ describe('ensureRuntime', () => {
 		});
 	});
 
-	it('lets two concurrent installs of one version agree on one directory', async () => {
+	it('downloads once when two installs of one version run concurrently, and both succeed', async () => {
 		const fetch = fakeFetch({ [ARTIFACT_URL]: { body: tarball } });
 		const manifest = manifestFor(tarball);
 		const results = await Promise.all([ensure(manifest, fetch), ensure(manifest, fetch)]);
@@ -332,8 +333,43 @@ describe('ensureRuntime', () => {
 			false,
 			true,
 		]);
-		expect(readdirSync(runtimesDir(home)).sort()).toEqual(['.staging', VERSION]);
+		expect(fetch.calls.filter((call) => call.url === ARTIFACT_URL)).toHaveLength(1);
+		expect(readdirSync(runtimesDir(home)).sort()).toEqual(['.locks', '.staging', VERSION]);
+		expect(readdirSync(join(runtimesDir(home), '.locks'))).toEqual([]);
 		expect(stagingEntries()).toEqual([]);
+		expect(listInstalledRuntimes(home).map((runtime) => runtime.version)).toEqual([VERSION]);
+	});
+
+	it('reclaims an install lock left by a process that is gone, or one older than an hour', async () => {
+		const locks = join(runtimesDir(home), '.locks');
+		const lock = join(locks, `${VERSION}.lock`);
+		mkdirSync(locks, { recursive: true });
+		const deadPid = spawnSync(process.execPath, ['-e', '']).pid;
+		writeFileSync(
+			lock,
+			JSON.stringify({ pid: deadPid, hostname: hostname(), createdAt: new Date().toISOString() }),
+		);
+		const fetch = fakeFetch({ [ARTIFACT_URL]: { body: tarball } });
+		expect(await ensure(manifestFor(tarball), fetch)).toMatchObject({ installed: true });
+		expect(existsSync(lock)).toBe(false);
+
+		// A live holder (this very process) whose lock has outlived any install.
+		const other = '2.0.0';
+		const otherTarball = buildRuntimeTarball(other, COMMIT);
+		const otherUrl = `${CONTROL_PLANE}/worker/runtime/artifacts/swarm-worker-runtime-${other}.tar.gz`;
+		writeFileSync(
+			join(locks, `${other}.lock`),
+			JSON.stringify({
+				pid: process.pid,
+				hostname: hostname(),
+				createdAt: new Date(Date.now() - STALE_STAGING_MS - 60_000).toISOString(),
+			}),
+		);
+		const otherFetch = fakeFetch({ [otherUrl]: { body: otherTarball } });
+		expect(await ensure(manifestFor(otherTarball, { version: other }), otherFetch)).toMatchObject({
+			version: other,
+			installed: true,
+		});
 	});
 
 	it('sweeps staging directories older than an hour and keeps fresh ones', async () => {

@@ -295,21 +295,26 @@ swarm-launcher run <workerId>    # become that worker's daemon
 swarm-launcher runtimes          # list the runtime versions installed on this host
 ```
 
-`run` asks the worker's control plane which runtime it serves
+`run` starts the worker's **selected** version (`selectedVersion` in `state.json`
+beside the profile, issue #1302) while it is installed — `swarm workers update`
+moves a runtime-based worker by installing a release and selecting it. With no
+installed selection it asks the worker's control plane which runtime it serves
 (`/worker/runtime/manifest`), installs and verifies that exact version under
-`~/.swarm/runtimes/<version>/` when it is missing, records it in `state.json` beside
-the profile, and replaces itself with `node <runtime>/dist/transport/connect-entry.mjs`
+`~/.swarm/runtimes/<version>/` when it is missing, and records it in `state.json` as
+the selection and the version last started. It then replaces itself with `node <runtime>/dist/transport/connect-entry.mjs`
 (spawning it as a child where `process.execve` is unavailable, like `swarm
 run:worker`). The daemon gets exactly its usual variables, taken from the profile and
 overriding any already in the environment — `SWARM_CONTROL_PLANE_URL`,
 `SWARM_WORKER_CREDENTIAL`, `SWARM_WORKER_REPO_ROOT` and `SWARM_LOG_FILE`
-(`<profileDir>/logs/worker.log`) — and runs in the profile directory; no `.env` is
+(`<profileDir>/logs/worker.log`) — plus `SWARM_WORKER_ID` and, when the launcher
+has a trusted key, `SWARM_RUNTIME_TRUSTED_KEY` (that key file's path, never its
+contents), which is what lets the daemon install a release it is moved to — and runs in the profile directory; no `.env` is
 read. The credential is never printed and never passed as an argument. So two
 profiles pointing at two installations on two versions run as two daemons on one
 machine, each on its own runtime. A runtime that fails its size, checksum or
 signature check is never started: the launcher exits 1 naming the check. When the
-control plane cannot be reached (or serves no runtime), the version this worker last
-started on is used if it is still installed; otherwise the launcher exits 1 with the
+control plane cannot be reached (or serves no runtime) and no selection is
+installed, the version this worker last started on is used if it is still installed; otherwise the launcher exits 1 with the
 reason. The signing key it trusts is `deploy/worker-runtime/minisign.pub` under the
 launcher's own install; without that file it installs nothing new and still starts
 versions already installed. For now the launcher runs from a SWARM build
@@ -503,6 +508,17 @@ swarm workers update <worker-id> main    # a branch, a tag, or a commit id
 swarm workers list                       # read what it reported
 swarm workers undrain <worker-id>        # back in the pool
 ```
+
+A **runtime-based** worker (a profile-based one `swarm-launcher run` starts, below)
+has no install root, so it is asked for a **signed release version** instead —
+`swarm workers update <worker-id> v1.6.0` (or `1.6.0`, or the installation's own
+commit) — and the same drain, supervision and reporting apply (issue #1302). Its
+daemon downloads and verifies that release into `~/.swarm/runtimes/<version>/` (one
+download per host however many of its workers ask), records it as the worker's
+selected version, reports `applied` and exits for the launcher to start it on that
+version. A branch, another commit, or a version with no signed release is `refused`;
+a failed download or signature check is `failed` and leaves the worker where it
+was. No other worker on the host is waited for or disturbed.
 
 **Each request is a run, in the runs list** (issue #971). Asking a machine to move
 creates one run per machine asked, scoped to that machine's project, which starts,

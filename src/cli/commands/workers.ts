@@ -395,6 +395,14 @@ Usage:
              unknown is never refused. Requesting again replaces a
              request that has not been answered yet. The machine's owner alone may
              do it, so sign in as them. Remember to undrain it afterwards.
+             A RUNTIME-BASED worker (one 'swarm-launcher run' starts) has no
+             install root: it takes a signed RELEASE VERSION as <ref> (v1.6.0 or
+             1.6.0, or the installation's own commit), downloads and verifies that
+             runtime beside the others — once per host, however many of its
+             workers ask — selects it, and restarts onto it. A branch or another
+             commit is refused; a failed download or signature check is 'failed'
+             and leaves it on the version it has. No other worker on the host is
+             waited for or disturbed.
              With --all and no worker id, every machine you own is moved to <ref>
              as a STAGED ROLLOUT instead: SWARM drains at most --wave machines (one
              by default), waits for each to go idle, asks it, waits for it to come
