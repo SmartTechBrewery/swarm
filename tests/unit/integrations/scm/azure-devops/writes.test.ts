@@ -297,6 +297,45 @@ describe('azure devops pull-request writes', () => {
 			expect(description).toHaveLength(MAX_PULL_REQUEST_DESCRIPTION_CHARS);
 			expect(description).toMatch(/truncated/);
 		});
+
+		it('keeps SWARM’s final work-item line when it truncates the prose before it', async () => {
+			fetchMock.mockResolvedValue(jsonResponse(createMockAzureDevOpsPullRequestResponse()));
+			const trailer = 'Work item: [VT-1557](https://core3.atlassian.net/browse/VT-1557)';
+
+			await scoped(() =>
+				createAzureDevOpsPullRequest(REPO, {
+					baseBranch: 'main',
+					branch: 'b',
+					title: 't',
+					body: `## Summary\n\n${'x'.repeat(MAX_PULL_REQUEST_DESCRIPTION_CHARS + 500)}\n\n${trailer}`,
+				}),
+			);
+
+			const { description } = requestBody(fetchMock) as { description: string };
+			expect(description).toHaveLength(MAX_PULL_REQUEST_DESCRIPTION_CHARS);
+			expect(description).toMatch(/^## Summary\n\nx/);
+			expect(description).toMatch(/truncated/);
+			expect(description.endsWith(`\n\n${trailer}`)).toBe(true);
+		});
+
+		it('cuts a long or multi-line final paragraph like any other prose', async () => {
+			fetchMock.mockResolvedValue(jsonResponse(createMockAzureDevOpsPullRequestResponse()));
+
+			await scoped(() =>
+				createAzureDevOpsPullRequest(REPO, {
+					baseBranch: 'main',
+					branch: 'b',
+					title: 't',
+					body: `intro\n\n${'x'.repeat(MAX_PULL_REQUEST_DESCRIPTION_CHARS)}\nend`,
+				}),
+			);
+
+			const { description } = requestBody(fetchMock) as { description: string };
+			expect(description).toHaveLength(MAX_PULL_REQUEST_DESCRIPTION_CHARS);
+			expect(description).toMatch(
+				/truncated to fit Azure DevOps’ pull-request description limit\._$/,
+			);
+		});
 	});
 
 	describe('completeAzureDevOpsPullRequest', () => {

@@ -48,7 +48,11 @@ export function isPullRequestDescriptionDirty(
 	);
 }
 
-/** Whether the field already shows SWARM's default, so Restore default has nothing to do. */
+/**
+ * Whether the field already shows SWARM's default, so Restore default has nothing to
+ * do. A cleared field normalizes to "unset" too, but the box is then empty rather
+ * than showing the default, so it is not one: Restore default must stay available.
+ */
 export function isDefaultPullRequestDescription(value: string | undefined): boolean {
-	return normalizePullRequestDescription(value) === undefined;
+	return normalizePullRequestDescription(value) === undefined && value?.trim() !== '';
 }

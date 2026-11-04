@@ -47,4 +47,9 @@ describe('isDefaultPullRequestDescription', () => {
 		expect(isDefaultPullRequestDescription(`${DEFAULT_PULL_REQUEST_DESCRIPTION}\n`)).toBe(true);
 		expect(isDefaultPullRequestDescription('## Zmiany')).toBe(false);
 	});
+
+	it('is false for a cleared field, which shows an empty box rather than the default', () => {
+		expect(isDefaultPullRequestDescription('')).toBe(false);
+		expect(isDefaultPullRequestDescription('  \n')).toBe(false);
+	});
 });

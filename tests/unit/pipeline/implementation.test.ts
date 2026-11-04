@@ -1080,6 +1080,31 @@ describe('runImplementationPhase — pull request description (issue #1277)', ()
 		expect(body).not.toContain('Closes');
 	});
 
+	it('hands an over-long summary to Azure DevOps with the work-item line still last', async () => {
+		const deps = makeDeps();
+		deps.project = createMockProjectConfig({
+			scm: 'azure-devops',
+			repo: 'core3pl/KV-TMS/ai-sdlc',
+		});
+		deps.workItem = createMockWorkItem({
+			id: 'PVTI_vt',
+			url: 'https://core3.atlassian.net/browse/VT-1557',
+			taskRef: undefined,
+			taskRepository: undefined,
+			ownTaskRef: 'VT-1557',
+		});
+		const summary = `## Summary\n\n${'x'.repeat(4500)}`;
+		handoffFileContents = JSON.stringify({ ...JSON.parse(HANDOFF), summary });
+
+		await runImplementationPhase({ ...deps, taskId: 'VT-1557' });
+
+		// The Azure adapter truncates the prose before this line (writes.test.ts), so
+		// the composed body must keep it as its own final paragraph.
+		expect(createdBody(deps)).toBe(
+			`${summary}\n\nWork item: [VT-1557](https://core3.atlassian.net/browse/VT-1557)`,
+		);
+	});
+
 	it('hands the agent the project’s own structure in place of the default', async () => {
 		const deps = makeDeps();
 		deps.project = createMockProjectConfig({

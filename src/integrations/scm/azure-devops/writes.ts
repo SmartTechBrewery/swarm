@@ -221,15 +221,36 @@ export async function submitAzureDevOpsReview(
 }
 
 /**
+ * The longest final line {@link pullRequestDescription} keeps past a truncation —
+ * room for SWARM's work-item line with a long title and URL, small enough that the
+ * prose it displaces stays the bulk of the description.
+ */
+const MAX_PRESERVED_TRAILER_CHARS = 500;
+
+/**
  * The description a pull request is opened with: the body verbatim, or — past
  * Azure's {@link MAX_PULL_REQUEST_DESCRIPTION_CHARS} — cut short with a visible
  * note, so an over-long summary costs the tail of the prose rather than the
  * delivery.
+ *
+ * A body whose last paragraph is a single short line keeps that line after the
+ * note (issue #1277): it is the work-item line SWARM appends to every pull request
+ * it opens (`composePullRequestBody`), and on a Jira, Linear or Trello card it is
+ * the pull request's only link back to the card — so the prose before it is what
+ * gets cut, never the trailer.
  */
 function pullRequestDescription(body: string): string {
 	if (body.length <= MAX_PULL_REQUEST_DESCRIPTION_CHARS) return body;
 	const note = '\n\n_…truncated to fit Azure DevOps’ pull-request description limit._';
-	return `${body.slice(0, MAX_PULL_REQUEST_DESCRIPTION_CHARS - note.length)}${note}`;
+	const split = body.lastIndexOf('\n\n');
+	const trailer = split === -1 ? '' : body.slice(split + 2);
+	const keepTrailer =
+		trailer.trim().length > 0 &&
+		!trailer.includes('\n') &&
+		trailer.length <= MAX_PRESERVED_TRAILER_CHARS;
+	const suffix = keepTrailer ? `${note}\n\n${trailer}` : note;
+	const prose = keepTrailer ? body.slice(0, split) : body;
+	return `${prose.slice(0, MAX_PULL_REQUEST_DESCRIPTION_CHARS - suffix.length)}${suffix}`;
 }
 
 /** Open a pull request, returning the delivery seam's `{ number, url }`. */
