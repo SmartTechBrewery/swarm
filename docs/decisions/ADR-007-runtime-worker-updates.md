@@ -133,6 +133,13 @@ owner's control, and a veto, if ever wanted, belongs at the role level.
   daemon that never clears the pending-verification record, so the launcher would
   abandon it after a few healthy starts; a move to one is refused before anything is
   recorded. That makes the oldest reachable release the first one that stamps it.
+- **Installing the launcher trusts the installation over TLS** (issue #1312).
+  `curl -fsSL https://<installation>/install.sh | sh` downloads the launcher package
+  from that installation and checks it against the SHA-256 the same installation
+  serves, so the check catches a damaged download, not a malicious server: the
+  launcher is not signed, exactly as `curl | sh` always trusts whoever answers. The
+  trust this ADR decides is unchanged downstream of it — every runtime the launcher
+  installs is still verified against the minisign key shipped in the package.
 - **No trusted key means no new version.** A launcher without
   `deploy/worker-runtime/minisign.pub` installs nothing new — the store fails closed —
   and still starts versions already installed. A move to a version not yet on the

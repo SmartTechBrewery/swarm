@@ -12,10 +12,12 @@
 import { createNodeWebSocket, type NodeWebSocket } from '@hono/node-ws';
 import type { Hono } from 'hono';
 
+import { registerInstallScript } from './install-script.js';
 import { registerOperatorApi } from './operator-api.js';
 import { registerOperatorSession } from './operator-session.js';
 import { createWebhookApp } from './webhook-receiver.js';
 import { registerWorkerDelivery } from './worker-delivery.js';
+import { registerWorkerLauncher } from './worker-launcher.js';
 import { registerWorkerRuntime } from './worker-runtime.js';
 import { registerWorkerTransport } from './worker-transport.js';
 
@@ -40,6 +42,10 @@ export function createRouterApp(): RouterApp {
 	// …and the worker runtime for this installation's own build (issue #1280), so a
 	// worker host updates from the control plane it is registered with, not GitHub.
 	registerWorkerRuntime(app);
+	// …and the clone-free launcher package plus `/install.sh` (issue #1312), so a new
+	// host installs `swarm-worker` from this installation with one `curl | sh`.
+	registerWorkerLauncher(app);
+	registerInstallScript(app);
 	// …and the operator session API (issue #798): `swarm login` authenticates a human
 	// here because this is the process `SWARM_CONTROL_PLANE_URL` points at, and the
 	// only one an operator off the control-plane host can reach.

@@ -346,7 +346,8 @@ package's own `bin/swarm-worker-agent install --profile <workerId>` writes an ag
 that runs the package's `bin/swarm-worker.js`, so it never refers back to a clone.
 Its tarball is byte-deterministic for one tree and commit, and every published image
 carries it, with its `.sha256`, under `/app/worker-runtime/` (see "The published
-image"); having the installation serve it to new hosts is a later phase. `swarm run:worker` and `npm run dev:worker` are unchanged.
+image"), and the installation serves it to new hosts through `/install.sh` (issue
+#1312, [Serving the launcher and `install.sh`](#serving-the-launcher-and-installsh)). `swarm run:worker` and `npm run dev:worker` are unchanged.
 
 The operator CLI writes profiles (issue #1296): `swarm workers setup --profile` and
 `swarm workers register-and-enroll … --profile` register, enroll and credential the
@@ -373,6 +374,8 @@ with no profile on the machine is handled exactly as before.
 #1311). Run in the project checkout the worker is to serve:
 
 ```bash
+curl -fsSL https://swarm.example.com/install.sh | sh   # installs swarm-worker, then runs setup
+# …which is, once swarm-worker is installed:
 swarm-worker setup --control-plane-url https://swarm.example.com
 swarm-worker status            # each profile: LaunchAgent, runtime, connected or not
 swarm-worker login             # renew the session (URL defaults to the profiles' one)
@@ -1388,6 +1391,57 @@ control plane's own origin), verifies it, and installs it read-only and atomical
 under `~/.swarm/runtimes/<version>/`, side by side with every other version, and
 `swarm-launcher run` starts a profile-based worker from there.
 
+#### Serving the launcher and `install.sh`
+
+The installation also serves the **launcher package** for its own build — the
+`swarm-worker-launcher-<version>.tar.gz` and `.sha256` its image carries beside the
+runtime — and an installer for it, so a new host is set up with one command and no
+GitHub access (issue #1312):
+
+```bash
+cd ~/code/my-project          # the checkout the worker is to serve
+curl -fsSL https://swarm.example.com/install.sh | sh
+curl -fsSL https://swarm.example.com/install.sh | sh -s -- --email me@example.com --yes   # flags go to setup
+curl -fsSL https://swarm.example.com/install.sh | sh -s -- login                        # another subcommand
+```
+
+| Route | Auth | Answers |
+| --- | --- | --- |
+| `GET /install.sh` | none | A POSIX `sh` script (`text/x-shellscript`) with the installation's base URL baked in. |
+| `GET /worker/launcher/manifest` | none | `{"available":true,"version","file","size","sha256"}` for the installation's own package, or `{"available":false,"reason"}`. |
+| `GET /worker/launcher/artifacts/<file>` | none | The package itself; only the exact file the manifest names. |
+
+The script refuses, naming the prerequisite, when Node.js >= 22, git, curl or tar is
+missing; downloads the manifest and the package from the same installation into a
+temporary directory under `~/.swarm/` and checks the SHA-256 (`sha256sum` or
+`shasum -a 256`), installing nothing on a mismatch; unpacks it to
+`~/.swarm/launcher.new` and swaps it into `~/.swarm/launcher`, keeping the previous
+launcher until the swap succeeds; links `~/.swarm/bin/swarm-worker` (and
+`~/.local/bin/swarm-worker` when `~/.local/bin` is on `PATH`) to
+`~/.swarm/launcher/bin/swarm-worker.js`, printing a `PATH` hint when neither is on
+`PATH`; and then runs `swarm-worker setup --control-plane-url <installation>` with the
+terminal as its stdin (under `curl | sh` stdin is the script). A first argument after
+`sh -s --` that is not a flag names another subcommand to run instead of `setup`;
+every other argument is passed through, so with all of setup's flags given it runs
+unattended. The subcommand must accept `--control-plane-url` (`setup` and `login`
+do). Re-running it upgrades the launcher in place, and a LaunchAgent `setup`
+installed keeps working, since its plist names the stable
+`~/.swarm/launcher/bin/swarm-worker.js`.
+
+The base URL in the script is `WEBHOOK_CALLBACK_BASE_URL` when set, otherwise the
+request's `Host` with `X-Forwarded-Proto`. Set it on an installation behind a proxy
+that rewrites `Host`. Every route here is public, because the installer holds no
+credential yet and the package holds nothing secret (the launcher and the public
+key). The launcher is availability-checked like the runtime — the installation's own
+version, present, matching its `.sha256`, read once on the first request — but **it
+is not signed**: installing it trusts the installation over TLS, exactly as any
+`curl | sh` does, while every runtime it installs is still minisign-verified against
+the key the package carries
+([ADR-007](./decisions/ADR-007-runtime-worker-updates.md)). The launcher routes send
+`Cache-Control: private, no-store` and `/install.sh` sends `no-store`. Behind Caddy
+nothing needs configuring; a path-scoped Cloudflare Tunnel needs `^/install\.sh$`
+routed to the router ([`cloudflare-tunnel.md`](./cloudflare-tunnel.md)).
+
 #### Rotating the runtime signing key
 
 The private key exists only as the `SWARM_RUNTIME_SIGNING_KEY` Actions secret,
@@ -1916,6 +1970,7 @@ npm run swarm -- login --logout
 npm run swarm -- workers setup --profile --control-plane-url <url>
 swarm-launcher run <worker-id>
 # …or, from the launcher package with no clone at all, in the project checkout:
+curl -fsSL <url>/install.sh | sh          # install swarm-worker from the installation, then setup
 swarm-worker setup --control-plane-url <url>
 swarm-worker status
 
