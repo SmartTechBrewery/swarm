@@ -4,6 +4,7 @@ import { act, cleanup, fireEvent, render, renderHook, screen } from '@testing-li
 import type React from 'react';
 import { describe, expect, it, type Mock, vi } from 'vitest';
 import type { RepositoryForm } from '@/lib/project-repository.js';
+import { DEFAULT_PULL_REQUEST_DESCRIPTION } from '@/lib/pull-request-description.js';
 import type { AgentConfig, ProjectRecord } from '../../../../src/config/schema.js';
 
 const mockMutate = vi.fn();
@@ -630,6 +631,70 @@ describe('PhaseSettingsDetail', () => {
 
 		expect(screen.getByText('Enabled')).toBeDefined();
 		expect(screen.getByText('Locked off while Review is disabled.')).toBeDefined();
+	});
+
+	// Issue #1277: the Implementation phase's PR description structure.
+	function renderImplementation(config: AgentConfig, onChange = vi.fn()) {
+		render(
+			<PhaseSettingsDetail
+				phase="implementation"
+				config={config}
+				isPending={false}
+				enabled={undefined}
+				{...targetHandlers()}
+				handleTimeoutChange={() => {}}
+				handlePromptChange={() => {}}
+				handlePullRequestDescriptionChange={onChange}
+				onBack={() => {}}
+			/>,
+		);
+		return onChange;
+	}
+
+	it('shows the default pull request description above Custom prompt on Implementation', () => {
+		renderImplementation(mockConfig);
+
+		const field = screen.getByLabelText('Pull request description') as HTMLTextAreaElement;
+		expect(field.value).toBe(DEFAULT_PULL_REQUEST_DESCRIPTION);
+		const prompt = screen.getByLabelText('Custom prompt (optional)');
+		// DOCUMENT_POSITION_FOLLOWING: the Custom prompt comes after the new field.
+		expect(field.compareDocumentPosition(prompt) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+		expect(
+			(screen.getByRole('button', { name: 'Restore default' }) as HTMLButtonElement).disabled,
+		).toBe(true);
+	});
+
+	it('edits the structure and restores the default', () => {
+		const onChange = renderImplementation({ ...mockConfig, pullRequestDescription: '## Zmiany' });
+
+		const field = screen.getByLabelText('Pull request description') as HTMLTextAreaElement;
+		expect(field.value).toBe('## Zmiany');
+		fireEvent.change(field, { target: { value: '## Zmiany\n## Testy' } });
+		expect(onChange).toHaveBeenLastCalledWith('## Zmiany\n## Testy');
+
+		const restore = screen.getByRole('button', { name: 'Restore default' }) as HTMLButtonElement;
+		expect(restore.disabled).toBe(false);
+		fireEvent.click(restore);
+		expect(onChange).toHaveBeenLastCalledWith(undefined);
+	});
+
+	it('shows no pull request description field on any other phase', () => {
+		for (const phase of ['planning', 'implementationUnplanned', 'review'] as const) {
+			render(
+				<PhaseSettingsDetail
+					phase={phase}
+					config={mockConfig}
+					isPending={false}
+					enabled={undefined}
+					{...targetHandlers()}
+					handleTimeoutChange={() => {}}
+					handlePromptChange={() => {}}
+					onBack={() => {}}
+				/>,
+			);
+			expect(screen.queryByLabelText('Pull request description')).toBeNull();
+			cleanup();
+		}
 	});
 });
 
@@ -1677,6 +1742,7 @@ describe('AgentConfigurationForm — Save/Reset scoping', () => {
 				handleMoveTarget={() => {}}
 				handleTimeoutChange={() => {}}
 				handlePromptChange={() => {}}
+				handlePullRequestDescriptionChange={() => {}}
 				handleSubmit={handleSubmit}
 				handleReset={handleReset}
 				isDirty={true}

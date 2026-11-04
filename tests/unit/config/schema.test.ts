@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
+	DEFAULT_PULL_REQUEST_DESCRIPTION,
+	PULL_REQUEST_DESCRIPTION_MAX_LENGTH,
+} from '@/config/pull-request-description.js';
+import {
 	type AgentConfig,
 	AgentConfigSchema,
 	AgentsConfigSchema,
@@ -1248,6 +1252,34 @@ describe('ProjectRecordSchema', () => {
 			// Over the bound only counting whitespace — trims to the max, so it passes.
 			const padded = `${'a'.repeat(CUSTOM_PROMPT_MAX_LENGTH)}${'  '.repeat(50)}`;
 			expect(() => AgentConfigSchema.parse({ prompt: padded })).not.toThrow();
+		});
+	});
+
+	describe('pull request description (issue #1277)', () => {
+		it('keeps a project’s own structure, trimmed', () => {
+			expect(
+				AgentConfigSchema.parse({ pullRequestDescription: '  ## Zmiany\n<lista>  ' })
+					.pullRequestDescription,
+			).toBe('## Zmiany\n<lista>');
+		});
+
+		it('stores nothing for a blank value or the untouched default', () => {
+			expect(AgentConfigSchema.parse({}).pullRequestDescription).toBeUndefined();
+			expect(
+				AgentConfigSchema.parse({ pullRequestDescription: '  ' }).pullRequestDescription,
+			).toBeUndefined();
+			expect(
+				AgentConfigSchema.parse({ pullRequestDescription: DEFAULT_PULL_REQUEST_DESCRIPTION })
+					.pullRequestDescription,
+			).toBeUndefined();
+		});
+
+		it('rejects a structure over the bound', () => {
+			expect(() =>
+				AgentConfigSchema.parse({
+					pullRequestDescription: 'a'.repeat(PULL_REQUEST_DESCRIPTION_MAX_LENGTH + 1),
+				}),
+			).toThrow(/at most/);
 		});
 	});
 
