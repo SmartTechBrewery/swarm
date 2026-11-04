@@ -32,7 +32,17 @@
  * checksum, a signature, a trusted comment naming the version), and trust stays
  * with the worker, which installs only bytes its own key verifies. A located
  * release is memoized per version, since a published release is immutable; a
- * failure is not, so a release published after the first ask is found on the next.
+ * failure is remembered for {@link RELEASE_FAILURE_TTL_MS} only, so a release
+ * published after the first ask is found once that expires.
+ *
+ * **Only an authenticated caller reaches GitHub.** The lookup is anonymous, so it
+ * spends the control plane's per-IP unauthenticated GitHub API budget (60 an hour).
+ * A `?version=` that is not already remembered therefore needs the same bearer as
+ * the artifact route (a worker credential or an operator session token) and is
+ * answered `401` without one; a remembered answer, the installation's own version
+ * and the no-version manifest stay open. Otherwise anyone who can reach the
+ * control plane could walk unknown versions and leave every worker unable to look
+ * up a real release until GitHub's window resets.
  *
  * Both routes send `Cache-Control: private, no-store`. Cloudflare caches `.gz` by
  * extension by default, and a cached copy of the authenticated download would be
@@ -83,6 +93,8 @@ export interface WorkerRuntimeDeps {
 	resolveSession: (rawToken: string) => Promise<SwarmUser | undefined>;
 	/** Reaches the publisher's GitHub Releases for another version's manifest. */
 	fetch?: typeof globalThis.fetch;
+	/** The clock a remembered failed lookup expires by. */
+	now?: () => number;
 }
 
 function defaultDeps(): WorkerRuntimeDeps {
@@ -369,6 +381,18 @@ export type RuntimeArtifactResult =
 	| { status: 401 | 404; json: Record<string, unknown> }
 	| { status: 200; path: string; size: number; name: string };
 
+/** Whether `bearer` is a worker credential or an operator session token. */
+async function isAuthenticated(
+	deps: WorkerRuntimeDeps,
+	bearer: string | undefined,
+): Promise<boolean> {
+	return (
+		bearer !== undefined &&
+		((await deps.resolveWorkerByCredential(bearer)) !== undefined ||
+			(await deps.resolveSession(bearer)) !== undefined)
+	);
+}
+
 /**
  * Authenticate, then serve `name` when it is exactly this installation's runtime.
  *
@@ -383,11 +407,8 @@ export async function handleRuntimeArtifact(
 	bearer: string | undefined,
 	name: string,
 ): Promise<RuntimeArtifactResult> {
-	const authenticated =
-		bearer !== undefined &&
-		((await deps.resolveWorkerByCredential(bearer)) !== undefined ||
-			(await deps.resolveSession(bearer)) !== undefined);
-	if (!authenticated) return { status: 401, json: { authenticated: false } };
+	if (!(await isAuthenticated(deps, bearer)))
+		return { status: 401, json: { authenticated: false } };
 
 	const runtime = await getRuntime();
 	if (!runtime.available) return { status: 404, json: { reason: runtime.reason } };
@@ -406,6 +427,12 @@ const NO_STORE = { 'Cache-Control': 'private, no-store' } as const;
 
 /** How many located releases one process remembers, so walking versions cannot grow it. */
 export const RELEASE_MEMO_LIMIT = 32;
+
+/**
+ * How long a failed release lookup is remembered, so asking again for a missing
+ * version costs one GitHub call per window rather than one per request.
+ */
+export const RELEASE_FAILURE_TTL_MS = 5 * 60 * 1000;
 
 /**
  * Mount the manifest and artifact routes on the router's `app`. Pass `overrides` to
@@ -428,38 +455,69 @@ export function registerWorkerRuntime(app: Hono, overrides: Partial<WorkerRuntim
 		return runtime;
 	};
 
-	const releases = new Map<string, Promise<ReleaseRuntime>>();
-	const getRelease = (version: string): Promise<ReleaseRuntime> => {
+	const now = deps.now ?? Date.now;
+	/** A lookup in flight or settled; `expiresAt` is set once it has failed. */
+	const releases = new Map<string, { pending: Promise<ReleaseRuntime>; expiresAt?: number }>();
+	/** A remembered answer for `version`, which costs no GitHub call. */
+	const knownRelease = (version: string): Promise<ReleaseRuntime> | undefined => {
 		const known = releases.get(version);
-		if (known) return known;
-		const pending = resolveReleaseRuntime(version, deps).then((resolved) => {
-			// A failure is not remembered: the release may be published after this ask.
-			if (!resolved.available && releases.get(version) === pending) releases.delete(version);
-			return resolved;
-		});
+		if (!known) return undefined;
+		if (known.expiresAt !== undefined && known.expiresAt <= now()) {
+			releases.delete(version);
+			return undefined;
+		}
+		return known.pending;
+	};
+	const lookUpRelease = (version: string): Promise<ReleaseRuntime> => {
+		const entry: { pending: Promise<ReleaseRuntime>; expiresAt?: number } = {
+			pending: resolveReleaseRuntime(version, deps).then((resolved) => {
+				// A failure is remembered briefly: the release may be published after this ask.
+				if (!resolved.available) entry.expiresAt = now() + RELEASE_FAILURE_TTL_MS;
+				return resolved;
+			}),
+		};
 		if (releases.size >= RELEASE_MEMO_LIMIT) {
 			const oldest = releases.keys().next().value;
 			if (oldest !== undefined) releases.delete(oldest);
 		}
-		releases.set(version, pending);
-		return pending;
+		releases.set(version, entry);
+		return entry.pending;
 	};
 
-	/** The runtime a manifest request names: the installation's own, or another release. */
+	/**
+	 * The runtime a manifest request names: the installation's own, or another
+	 * release. `undefined` when answering would reach GitHub for a caller who has
+	 * not authenticated.
+	 */
 	const runtimeFor = async (
 		requested: string | undefined,
-	): Promise<OwnRuntime | ReleaseRuntime> => {
+		bearer: string | undefined,
+	): Promise<OwnRuntime | ReleaseRuntime | undefined> => {
 		if (requested === undefined) return getRuntime();
 		// An operator often types the tag, so one leading `v` is accepted.
 		const version = requested.startsWith('v') ? requested.slice(1) : requested;
 		if (!isRuntimeVersion(version))
 			return unavailable(`${JSON.stringify(requested)} is not a valid runtime version`);
 		if ((await deps.resolveOwnBuild())?.version === version) return getRuntime();
-		return getRelease(version);
+		const known = knownRelease(version);
+		if (known) return known;
+		if (!(await isAuthenticated(deps, bearer))) return undefined;
+		return knownRelease(version) ?? lookUpRelease(version);
 	};
 
 	app.get(WORKER_RUNTIME_MANIFEST_PATH, async (c) => {
-		const result = handleRuntimeManifest(await runtimeFor(c.req.query('version')));
+		const runtime = await runtimeFor(c.req.query('version'), resolveOperatorBearer(c));
+		if (runtime === undefined)
+			return c.json(
+				{
+					authenticated: false,
+					reason:
+						'looking up another release on GitHub needs a worker credential or an operator token from `swarm login`',
+				},
+				401,
+				NO_STORE,
+			);
+		const result = handleRuntimeManifest(runtime);
 		return c.json(result.json, result.status, NO_STORE);
 	});
 

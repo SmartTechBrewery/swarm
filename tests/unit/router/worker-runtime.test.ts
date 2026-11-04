@@ -10,6 +10,7 @@ import type { Worker } from '@/identity/worker.js';
 import { ensureRuntime } from '@/launcher/runtime-store.js';
 import type { WorkerBuild } from '@/lib/build-identity.js';
 import {
+	RELEASE_FAILURE_TTL_MS,
 	RELEASE_MEMO_LIMIT,
 	registerWorkerRuntime,
 	resolveReleaseRuntime,
@@ -90,8 +91,10 @@ function buildApp(deps: WorkerRuntimeDeps = makeDeps()): Hono {
 	return app;
 }
 
-async function manifest(app: Hono, query = '') {
-	const res = await app.request(`/worker/runtime/manifest${query}`);
+async function manifest(app: Hono, query = '', bearer?: string) {
+	const res = await app.request(`/worker/runtime/manifest${query}`, {
+		headers: bearer ? { Authorization: `Bearer ${bearer}` } : {},
+	});
 	expect(res.status).toBe(200);
 	expect(res.headers.get('Cache-Control')).toBe('private, no-store');
 	return WorkerRuntimeManifestSchema.parse(await res.json());
@@ -425,6 +428,7 @@ describe('GET /worker/runtime/manifest?version= (issue #1282)', () => {
 		const body = await manifest(
 			buildApp(makeDeps({ fetch: github.fetch })),
 			`?version=v${OTHER_VERSION}`,
+			WORKER_CREDENTIAL,
 		);
 
 		expect(body).toEqual({
@@ -496,6 +500,7 @@ describe('GET /worker/runtime/manifest?version= (issue #1282)', () => {
 		const body = await manifest(
 			buildApp(makeDeps({ fetch: fakeFetch(routes()).fetch })),
 			`?version=${OTHER_VERSION}`,
+			WORKER_CREDENTIAL,
 		);
 
 		expect(body.available).toBe(false);
@@ -505,25 +510,66 @@ describe('GET /worker/runtime/manifest?version= (issue #1282)', () => {
 
 	it('still serves only its own artifact', async () => {
 		const app = buildApp(makeDeps({ fetch: fakeFetch(releaseRoutes()).fetch }));
-		await manifest(app, `?version=${OTHER_VERSION}`);
+		await manifest(app, `?version=${OTHER_VERSION}`, WORKER_CREDENTIAL);
 
 		const res = await download(app, OTHER_NAME, WORKER_CREDENTIAL);
 
 		expect(res.status).toBe(404);
 	});
 
-	it('remembers a located release, but retries one that was not found', async () => {
+	it('remembers a located release, and one that was not found only for a while', async () => {
+		let clock = 1_000_000;
 		const routes: Record<string, Served> = {};
 		const github = fakeFetch(routes);
-		const app = buildApp(makeDeps({ fetch: github.fetch }));
+		const app = buildApp(makeDeps({ fetch: github.fetch, now: () => clock }));
+		const ask = (query: string, bearer?: string) => manifest(app, query, bearer);
 
-		expect((await manifest(app, `?version=${OTHER_VERSION}`)).available).toBe(false);
+		expect((await ask(`?version=${OTHER_VERSION}`, WORKER_CREDENTIAL)).available).toBe(false);
 		Object.assign(routes, releaseRoutes());
-		expect((await manifest(app, `?version=${OTHER_VERSION}`)).available).toBe(true);
+		// Within the window the failure is answered again, to anyone, without GitHub.
+		clock += RELEASE_FAILURE_TTL_MS - 1;
+		expect((await ask(`?version=${OTHER_VERSION}`, WORKER_CREDENTIAL)).available).toBe(false);
+		expect((await ask(`?version=${OTHER_VERSION}`)).available).toBe(false);
+		expect(github.calls.map((call) => call.url)).toEqual([RELEASE_API]);
+
+		clock += 1;
+		expect((await ask(`?version=${OTHER_VERSION}`, WORKER_CREDENTIAL)).available).toBe(true);
 		const lookups = github.calls.length;
-		expect((await manifest(app, `?version=v${OTHER_VERSION}`)).available).toBe(true);
+		clock += 10 * RELEASE_FAILURE_TTL_MS;
+		// A located release is remembered for good, and answered open.
+		expect((await ask(`?version=v${OTHER_VERSION}`)).available).toBe(true);
 
 		expect(github.calls.length).toBe(lookups);
+	});
+
+	it('answers an unauthenticated lookup it has not made with 401, without GitHub', async () => {
+		const github = fakeFetch(releaseRoutes());
+		const app = buildApp(makeDeps({ fetch: github.fetch }));
+
+		for (const headers of [{}, { Authorization: 'Bearer not-a-credential' }] as Array<
+			Record<string, string>
+		>) {
+			const res = await app.request(`/worker/runtime/manifest?version=${OTHER_VERSION}`, {
+				headers,
+			});
+			expect(res.status).toBe(401);
+			expect(res.headers.get('Cache-Control')).toBe('private, no-store');
+			expect(await res.json()).toMatchObject({ authenticated: false });
+		}
+		expect(github.calls).toEqual([]);
+		// The no-version and own-version manifests stay open.
+		expect((await manifest(app)).available).toBe(true);
+		expect((await manifest(app, `?version=${VERSION}`)).available).toBe(true);
+	});
+
+	it('looks up a release for an operator session token too', async () => {
+		const body = await manifest(
+			buildApp(makeDeps({ fetch: fakeFetch(releaseRoutes()).fetch })),
+			`?version=${OTHER_VERSION}`,
+			OPERATOR_TOKEN,
+		);
+
+		expect(body.available).toBe(true);
 	});
 
 	it(`remembers at most ${RELEASE_MEMO_LIMIT} releases, forgetting the oldest`, async () => {
@@ -550,9 +596,9 @@ describe('GET /worker/runtime/manifest?version= (issue #1282)', () => {
 		const app = buildApp(makeDeps({ fetch: github }));
 
 		for (let i = 0; i <= RELEASE_MEMO_LIMIT; i++)
-			expect((await manifest(app, `?version=9.0.${i}`)).available).toBe(true);
-		await manifest(app, `?version=9.0.${RELEASE_MEMO_LIMIT}`);
-		await manifest(app, '?version=9.0.0');
+			expect((await manifest(app, `?version=9.0.${i}`, WORKER_CREDENTIAL)).available).toBe(true);
+		await manifest(app, `?version=9.0.${RELEASE_MEMO_LIMIT}`, WORKER_CREDENTIAL);
+		await manifest(app, '?version=9.0.0', WORKER_CREDENTIAL);
 
 		expect(looked).toEqual([
 			...Array.from({ length: RELEASE_MEMO_LIMIT + 1 }, (_, i) => `9.0.${i}`),

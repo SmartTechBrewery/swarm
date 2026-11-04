@@ -9,7 +9,10 @@
  *
  *   - `GET /worker/runtime/manifest` — **unauthenticated**. A first install has no
  *     credential yet and still needs the version, checksum and signature. Nothing
- *     here is secret: a version, a commit, a SHA-256 and a public signature.
+ *     here is secret: a version, a commit, a SHA-256 and a public signature. The
+ *     one exception is a `?version=` the control plane has not located yet: that
+ *     lookup spends its anonymous GitHub API budget, so it needs the artifact
+ *     route's bearer and is answered `401` without one.
  *   - `GET /worker/runtime/artifacts/<name>` — **Bearer**: a worker credential or
  *     an operator session token (`swarm login`). The tarball is the installation's
  *     code, so a private fork's must not be downloadable by anyone who finds the URL.

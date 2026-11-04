@@ -105,13 +105,16 @@ function commitsMatch(a: string, b: string): boolean {
 
 /**
  * Fetch and parse an installation's runtime manifest: for the installation's own
- * version, or, with `version`, for that signed release (issue #1282). An
- * `available: false` manifest is returned as it is, with its reason; every failure
- * to get a manifest at all is an `{ error }` saying which one.
+ * version, or, with `version`, for that signed release (issue #1282). A release the
+ * control plane has not located yet is looked up only for a caller that sends
+ * `bearer` (a worker credential or an operator token); the request carrying it
+ * refuses redirects, as the artifact download does. An `available: false` manifest
+ * is returned as it is, with its reason; every failure to get a manifest at all is
+ * an `{ error }` saying which one.
  */
 export async function fetchRuntimeManifest(
 	controlPlaneUrl: string,
-	options: { fetch?: Fetch; version?: string } = {},
+	options: { fetch?: Fetch; version?: string; bearer?: string } = {},
 ): Promise<WorkerRuntimeManifest | StoreError> {
 	const fetchImpl = options.fetch ?? globalThis.fetch;
 	let url: URL;
@@ -123,13 +126,23 @@ export async function fetchRuntimeManifest(
 	if (options.version !== undefined) url.searchParams.set('version', options.version);
 	let response: Response;
 	try {
-		response = await fetchImpl(url, { headers: { accept: 'application/json' } });
+		response = await fetchImpl(url, {
+			headers: {
+				accept: 'application/json',
+				...(options.bearer ? { authorization: `Bearer ${options.bearer}` } : {}),
+			},
+			...(options.bearer ? { redirect: 'error' as const } : {}),
+		});
 	} catch (err) {
 		return { error: `could not reach the control plane at ${url.origin}: ${errorMessage(err)}` };
 	}
 	if (response.status === 404)
 		return {
 			error: `the control plane at ${url.origin} predates the worker runtime route (${WORKER_RUNTIME_MANIFEST_PATH} answered 404)`,
+		};
+	if (response.status === 401)
+		return {
+			error: `the control plane at ${url.origin} looks up a release it has not located yet only for an authenticated caller (${WORKER_RUNTIME_MANIFEST_PATH} answered 401)`,
 		};
 	if (!response.ok)
 		return { error: `${WORKER_RUNTIME_MANIFEST_PATH} answered HTTP ${response.status}` };
