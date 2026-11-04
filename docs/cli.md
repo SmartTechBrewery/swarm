@@ -1258,6 +1258,7 @@ swarm-worker setup [--control-plane-url <url>] [--email <email>] [--password-fil
                    [--scm-token-file <path|->] [--no-autostart] [--yes]
 swarm-worker login [--control-plane-url <url>] [--email <email>] [--password-file <path|->]
 swarm-worker status [<workerId>]
+swarm-worker migrate [<checkout>] [--control-plane-url <url>] [--yes]
 swarm-worker run <workerId>
 swarm-worker runtimes
 swarm-worker --version
@@ -1330,6 +1331,54 @@ its installation is live — the control plane's view from `workers.listMine`:
 connected or not, last seen, drained, and each enrollment's state. Without a live
 session it shows the local view and says to run `swarm-worker login`. Exits 0 only
 when every worker reported is connected.
+
+### `swarm-worker migrate`
+
+Moves a **clone-based** worker — one a SWARM clone's LaunchAgent runs as `swarm
+run:worker` in its checkout — onto this launcher, keeping the worker (issue #1313).
+`curl -fsSL https://<installation>/install.sh | sh -s -- migrate` installs the
+launcher and runs it with `--control-plane-url <installation>`. `<checkout>`
+defaults to the current directory: the checkout the worker was registered in.
+
+It reads the worker id, credential and extra checkouts from that checkout's
+credential cache (`~/.swarm/worker-credentials/<sha256>/credential.json`), finds the
+clone from the LaunchAgent whose `WorkingDirectory` is the checkout and whose
+`ProgramArguments` run `<clone>/bin/swarm.js run:worker`, and reads the
+installation from that agent's `SWARM_CONTROL_PLANE_URL`, else the clone's `.env`.
+Before changing anything it refuses: no cache entry; a profile that already serves
+the checkout (or one of its extras) for that installation, or already exists for the
+worker; a `--control-plane-url` that differs from the clone's after normalising —
+naming both, since the credential belongs to one; an installation that serves no
+runtime; and a credential the control plane does not accept (a `HEAD` of its runtime
+artifact with the credential as bearer, answered 401). Then it confirms, warning
+that a run in progress is interrupted and retried as on any daemon restart and
+pointing at the worker's dashboard page to drain it first (`--yes` skips the
+question; with no terminal, `--yes` is required), and in order:
+
+1. writes `~/.swarm/workers/<id>/profile.json` — the same id, credential and URL,
+   `repoRoots` = the checkout then its extras;
+2. installs and verifies the runtime (`ensureRuntime`) — a refusal removes the
+   profile and leaves the clone worker as it was;
+3. stops and removes the clone's agent with the clone's own
+   `<clone>/bin/swarm-worker-agent uninstall <checkout>`, and waits up to 60 s for
+   its daemon to release the checkout locks;
+4. installs the profile agent with the package's `swarm-worker-agent install
+   --profile <id>` — a failure reinstalls the clone's agent, removes the profile,
+   and says so;
+5. deletes the credential cache entry, so `swarm run:worker` in the checkout cannot
+   start a second copy.
+
+No register or enroll call is made, so the worker id, its enrollments and the stored
+operator SCM credentials are unchanged, and the credential is never printed. It
+ends saying the worker now runs from the launcher and no longer needs the clone,
+listing any other clone agents still running that clone (or saying it can be
+deleted), and pointing at `swarm-worker status <id>`. With no clone LaunchAgent for
+the checkout (a worker started by hand, or off macOS) `--control-plane-url` is
+required; it writes the profile, installs the runtime and deletes the cache entry,
+then prints `swarm-worker run <id>` to start the worker once the old daemon is
+stopped. A profile worker `swarm workers setup --profile` created from a clone needs
+no migration: re-run `swarm-worker-agent install --profile <id>` from the package to
+point its agent at the launcher.
 
 ### `swarm-worker run` / `runtimes`
 

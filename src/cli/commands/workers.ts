@@ -1018,10 +1018,14 @@ function saveWorkerProfile(
  * worker is a different worker. A profile that cannot be read is passed over — it
  * cannot be said to serve anything.
  */
-function profileServingCheckout(repoRoot: string, controlPlaneUrl: string): string | undefined {
+export function profileServingCheckout(
+	repoRoot: string,
+	controlPlaneUrl: string,
+	homeDir?: string,
+): string | undefined {
 	const checkout = canonicalCheckoutPath(repoRoot);
 	const installation = normalizeControlPlaneUrl(controlPlaneUrl);
-	return listWorkerProfiles().find(
+	return listWorkerProfiles(homeDir).find(
 		({ profile }) =>
 			profile?.controlPlaneUrl === installation && profile.repoRoots.includes(checkout),
 	)?.workerId;
