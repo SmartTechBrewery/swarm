@@ -190,6 +190,8 @@ describe('JiraPMProvider', () => {
 				// The human key, not the numeric issue id: it is what a webhook carries
 				// and what every other seam speaks.
 				id: 'SWARM-42',
+				// The same key, as the display key the PR work-item line shows (#1287).
+				key: 'SWARM-42',
 				title: 'Wire triggers',
 				description: DESCRIPTION_TEXT,
 				url: 'https://example.atlassian.net/browse/SWARM-42',
@@ -310,6 +312,8 @@ describe('JiraPMProvider', () => {
 
 			expect(item.taskRef).toBe('577');
 			expect(item.ownTaskRef).toBeUndefined();
+			// The display key is set whatever the linkage (issue #1287).
+			expect(item.key).toBe('SWARM-42');
 		});
 
 		// Issue #710 moved the repository half of this rule out of the provider: a link
@@ -566,6 +570,8 @@ describe('JiraPMProvider', () => {
 			// Nor the card's own key: without the links, a linked card would be handed
 			// the wrong task id (issue #1230).
 			expect(items.every((item) => item.ownTaskRef === undefined)).toBe(true);
+			// The display key needs no links, so even a whole-board read sets it (#1287).
+			expect(items.map((item) => item.key)).toEqual(['SWARM-42', 'SWARM-43']);
 		});
 
 		it('keeps namesakes apart and a renamed assignee on the same key', async () => {

@@ -467,7 +467,8 @@ function mapAssignees(fields: JiraIssueFields): WorkItemAssignee[] {
  * into the canonical `statusKey` shared code resolves a pipeline phase from, so no
  * caller inverts `statusOptions` itself (ai/RULES.md §2).
  *
- * No task identity (`taskRef`/`taskRepository`/`ownTaskRef`) is set here: which
+ * The issue key is set as the display-only `key` on every read (issue #1287). No
+ * task identity (`taskRef`/`taskRepository`/`ownTaskRef`) is set here: which
  * of them applies depends on the issue's remote links, a separate request, so the
  * callers that need it merge it in explicitly ({@link JiraPMProvider.resolveTaskRef}).
  */
@@ -476,6 +477,7 @@ function toWorkItem(issue: KeyedJiraIssue, config: JiraIntegrationConfig): WorkI
 	const statusId = fields.status?.id;
 	return {
 		id: issue.key,
+		key: issue.key,
 		title: fields.summary ?? '',
 		description: adfToPlainText(fields.description),
 		url: `${siteUrl(config)}/browse/${issue.key}`,

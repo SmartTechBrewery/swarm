@@ -1068,7 +1068,7 @@ describe('runImplementationPhase — pull request description (issue #1277)', ()
 			url: 'https://core3.atlassian.net/browse/VT-1557',
 			taskRef: undefined,
 			taskRepository: undefined,
-			ownTaskRef: 'VT-1557',
+			key: 'VT-1557',
 		});
 
 		await runImplementationPhase({ ...deps, taskId: 'VT-1557' });
@@ -1091,7 +1091,7 @@ describe('runImplementationPhase — pull request description (issue #1277)', ()
 			url: 'https://core3.atlassian.net/browse/VT-1557',
 			taskRef: undefined,
 			taskRepository: undefined,
-			ownTaskRef: 'VT-1557',
+			key: 'VT-1557',
 		});
 		const summary = `## Summary\n\n${'x'.repeat(4500)}`;
 		handoffFileContents = JSON.stringify({ ...JSON.parse(HANDOFF), summary });

@@ -317,6 +317,13 @@ export const AssignedWorkItemSchema = z.object({
 	 * does (issue #683).
 	 */
 	taskRepository: z.string().optional(),
+	/**
+	 * The card's display key (`WorkItem.key`, issue #1287) — a Jira issue key, a
+	 * Linear identifier — which names the card in the pull request's work-item line.
+	 * Additive and optional like `taskRepository`, so the protocol version is not
+	 * bumped: a router predating it omits it and the worker falls back to the title.
+	 */
+	key: z.string().optional(),
 	status: z.string().optional(),
 	statusId: z.string().optional(),
 	/** The canonical pipeline status key (`WorkItem.statusKey`) the provider resolved. */
