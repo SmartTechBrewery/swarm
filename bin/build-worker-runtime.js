@@ -26,15 +26,14 @@
 // Move it up or down a level and the version and the identity silently vanish.
 //
 // **The tarball is byte-deterministic** for one source tree and commit — phase 2
-// signs and checksums it — so it is packed here rather than by `tar`, whose BSD
-// and GNU flavours disagree on the flags that pin order, owners and times: a
-// fixed entry order, mtime 0, uid/gid 0, and a gzip header with no time or name.
+// signs and checksums it — so it is packed by `./lib/deterministic-tarball.js`
+// (shared with `bin/build-worker-launcher.js`) rather than by `tar`.
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { gzipSync } from 'node:zlib';
 import { build } from 'esbuild';
+import { packDeterministicTarball } from './lib/deterministic-tarball.js';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const outDir = resolve(process.argv[2] ?? join(repoRoot, 'worker-runtime'));
@@ -97,58 +96,18 @@ if (existsSync(buildInfoPath)) {
 	);
 }
 
-// Directories before their contents, then a fixed order — never `readdir`'s.
-const entries = ['', 'dist/', 'dist/transport/', 'package.json', 'build-info.json', BUNDLE];
-const blocks = [];
-for (const entry of entries) {
-	const isDir = entry === '' || entry.endsWith('/');
-	if (isDir) {
-		blocks.push(tarHeader(`${name}/${entry}`, 0, true));
-		continue;
-	}
-	let data;
-	try {
-		data = readFileSync(join(stage, entry));
-	} catch (err) {
-		// The one optional file: no SWARM_BUILD_COMMIT, no stamp.
-		if (entry === 'build-info.json' && err.code === 'ENOENT') continue;
-		throw err;
-	}
-	blocks.push(tarHeader(`${name}/${entry}`, data.length, false), data, padding(data.length));
-}
-blocks.push(Buffer.alloc(1024));
-
-const gz = gzipSync(Buffer.concat(blocks), { level: 9 });
-// The header's OS byte is whatever platform zlib was built for; pin it to Unix
-// so a macOS and a Linux build of the same tree agree.
-gz[9] = 3;
+// Directories before their contents, then a fixed order — never `readdir`'s. The
+// stamp is the one optional file: no SWARM_BUILD_COMMIT, no stamp.
 const artifact = join(outDir, `${name}.tar.gz`);
-writeFileSync(artifact, gz);
+writeFileSync(
+	artifact,
+	packDeterministicTarball(stage, name, [
+		'',
+		'dist/',
+		'dist/transport/',
+		'package.json',
+		{ path: 'build-info.json', optional: true },
+		BUNDLE,
+	]),
+);
 console.log(`[build-worker-runtime] ${artifact}`);
-
-/** A POSIX ustar header for one entry, with every variable field pinned. */
-function tarHeader(path, size, isDir) {
-	if (Buffer.byteLength(path) > 100) throw new Error(`tar entry name too long: ${path}`);
-	const header = Buffer.alloc(512);
-	const field = (offset, length, value) => header.write(value, offset, length, 'ascii');
-	const octal = (offset, length, value) =>
-		field(offset, length, `${value.toString(8).padStart(length - 1, '0')}\0`);
-	field(0, 100, path);
-	octal(100, 8, isDir ? 0o755 : 0o644);
-	octal(108, 8, 0); // uid
-	octal(116, 8, 0); // gid
-	octal(124, 12, size);
-	octal(136, 12, 0); // mtime
-	field(148, 8, ' '.repeat(8)); // checksum placeholder, summed as spaces
-	field(156, 1, isDir ? '5' : '0');
-	field(257, 6, 'ustar\0');
-	field(263, 2, '00');
-	let sum = 0;
-	for (const byte of header) sum += byte;
-	field(148, 8, `${sum.toString(8).padStart(6, '0')}\0 `);
-	return header;
-}
-
-function padding(size) {
-	return Buffer.alloc((512 - (size % 512)) % 512);
-}

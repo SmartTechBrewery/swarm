@@ -92,7 +92,7 @@ running it.
 | --- | --- |
 | Agent | `~/Library/LaunchAgents/pl.smarttechbrewery.swarm.worker.<host>.<worker-id>.<hash8>.plist` |
 | Logs | `~/Library/Logs/<that label>.log` (+ `.error.log`) — launchd's capture of the launcher's own output; the daemon's log is `~/.swarm/workers/<worker-id>/logs/worker.log` |
-| `ProgramArguments` | `<node> <installation>/bin/swarm-launcher.js run <worker-id>` |
+| `ProgramArguments` | `<node> <installation>/bin/swarm-worker.js run <worker-id>` (an agent installed before issue #1283 names `bin/swarm-launcher.js`, which still works) |
 | `WorkingDirectory` | `~/.swarm/workers/<worker-id>` |
 
 - **The label names the installation.** `<host>` is the host (and any port) of the
@@ -122,9 +122,12 @@ running it.
   not this installation's build, so restarting it onto a pull would change nothing.
   `update --profile` is refused. Updating profile workers is #1282's.
 - **It runs this installation's launcher**, for the same reason a clone agent runs
-  this installation's `swarm` — and it needs that installation built
-  (`npm run build`), since `bin/swarm-launcher.js` loads `dist/`. A clone-mode agent
-  and its plist are unchanged.
+  this installation's `swarm`. `<installation>` is whatever the script ships in: a
+  SWARM clone, which needs to be built (`npm run build`), since `bin/swarm-worker.js`
+  loads `dist/`; or the clone-free **launcher package** (issue #1283,
+  [`MANUAL.md`](./MANUAL.md), "Profile-based workers"), whose own
+  `bin/swarm-worker-agent install --profile` writes a plist pointing into the
+  package. A clone-mode agent and its plist are unchanged.
 
 ## After a `git pull` — the update flow
 

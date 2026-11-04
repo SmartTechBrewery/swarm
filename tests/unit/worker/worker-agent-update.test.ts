@@ -46,7 +46,7 @@ interface AgentFixture {
 	 */
 	launcher?: 'link' | 'direct';
 	/**
-	 * A profile-based agent (issue #1297): `swarm-launcher.js run <worker-id>` from this
+	 * A profile-based agent (issue #1297): `swarm-worker.js run <worker-id>` from this
 	 * installation, rather than `swarm run:worker`.
 	 */
 	profile?: boolean;
@@ -103,7 +103,7 @@ describe('swarm-worker-agent update', () => {
 	function plant(agent: AgentFixture): void {
 		const name = agent.installation === 'this' ? 'this' : 'other';
 		const launcher = agent.profile
-			? join(home, 'checkouts', name, 'bin', 'swarm-launcher.js')
+			? join(home, 'checkouts', name, 'bin', 'swarm-worker.js')
 			: agent.launcher === 'direct'
 				? join(home, 'checkouts', name, 'bin', 'swarm.js')
 				: join(home, 'prefix', name, 'bin', 'swarm');
