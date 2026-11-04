@@ -320,11 +320,32 @@ versions no worker uses are removed as workers start — both under **Updating a
 runtime-based worker** below.
 The signing key it trusts is `deploy/worker-runtime/minisign.pub` under the
 launcher's own install; without that file it installs nothing new and still starts
-versions already installed. For now the launcher runs from a SWARM build
-(`npm run build`, then `bin/swarm-launcher.js`); a clone-free launcher comes in a
-later phase. Under launchd, `swarm-worker-agent install --profile <workerId>` runs
-it at login (issue #1297, [`launchd-worker-autostart.md`](./launchd-worker-autostart.md),
-"Profile-based workers"). `swarm run:worker` and `npm run dev:worker` are unchanged.
+versions already installed. Under launchd, `swarm-worker-agent install --profile <workerId>` runs
+it at login as `<root>/bin/swarm-worker.js run <workerId>` (issue #1297, [`launchd-worker-autostart.md`](./launchd-worker-autostart.md),
+"Profile-based workers").
+
+The launcher runs either from a SWARM build (`npm run build`, then
+`bin/swarm-worker.js` or the older `bin/swarm-launcher.js`) or, with **no clone and
+no `node_modules`**, from the **launcher package** (issue #1283):
+
+```bash
+SWARM_BUILD_COMMIT=$(git rev-parse HEAD) npm run build:worker-launcher
+# → worker-runtime/swarm-worker-launcher-<version>.tar.gz
+tar -xzf swarm-worker-launcher-<version>.tar.gz
+swarm-worker-launcher-<version>/bin/swarm-worker.js run <workerId>   # or: runtimes, --version
+```
+
+It unpacks to `swarm-worker-launcher-<version>/` holding a minimal `package.json`,
+the `build-info.json` stamp (when `SWARM_BUILD_COMMIT` is set), `bin/swarm-worker.js`,
+`bin/swarm-worker-agent`, the launcher bundled into `dist/launcher/swarm-worker.js`,
+and the trusted key at `deploy/worker-runtime/minisign.pub` when the checkout it was
+built from has one (the build warns when it does not). It needs only Node >= 22.
+`swarm-worker run` and `runtimes` are exactly the launcher's commands above. The
+package's own `bin/swarm-worker-agent install --profile <workerId>` writes an agent
+that runs the package's `bin/swarm-worker.js`, so it never refers back to a clone.
+Its tarball is byte-deterministic for one tree and commit, and every published image
+carries it, with its `.sha256`, under `/app/worker-runtime/` (see "The published
+image"); having the installation serve it to new hosts is a later phase. `swarm run:worker` and `npm run dev:worker` are unchanged.
 
 The operator CLI writes profiles (issue #1296): `swarm workers setup --profile` and
 `swarm workers register-and-enroll … --profile` register, enroll and credential the
@@ -1213,7 +1234,11 @@ in [Running on a VPS behind Caddy](#running-on-a-vps-behind-caddy) instead.
   a tag pushed by hand gets one too, and `npm run release` only checks that it
   carries all three files. A `v*` tag **fails** when the signing secret or the
   committed public key is missing; a push to `main` then ships the runtime
-  unsigned, with a warning. A plain `docker build .` ships an empty
+  unsigned, with a warning. Beside them the same step builds the
+  [launcher package](#the-worker) (issue #1283),
+  `swarm-worker-launcher-<version>.tar.gz`, and its `.sha256`; those two go into
+  the image only — never to the Release, and unsigned (the launcher package carries
+  the trusted key itself). A plain `docker build .` ships an empty
   `/app/worker-runtime`.
 
 #### Verifying the worker runtime
@@ -1232,7 +1257,8 @@ sha256sum -c "$f.sha256"              # macOS: shasum -a 256 -c "$f.sha256"
 minisign -Vm "$f" -p minisign.pub     # prints the trusted comment: swarm-worker-runtime X.Y.Z <commit>
 ```
 
-The image holds the same three files for its own version:
+The image holds the same three files for its own version (plus the launcher
+package and its `.sha256`):
 `docker create --name rt ghcr.io/smarttechbrewery/swarm:vX.Y.Z && docker cp rt:/app/worker-runtime . && docker rm rt`.
 The signature covers the tarball alone; its trusted comment names the version and
 the commit it was built from. The worker launcher's runtime store
