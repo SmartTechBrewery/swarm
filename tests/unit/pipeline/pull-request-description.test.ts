@@ -28,19 +28,68 @@ describe('pullRequestWorkItemLine (issue #1277)', () => {
 		);
 	});
 
-	it('links a Jira card by its own key on Azure DevOps', () => {
+	it('links a Jira card by its key, not its title, on Azure DevOps (issue #1287)', () => {
 		const workItem = createMockWorkItem({
-			title: 'Add robots.txt',
-			url: 'https://core3.atlassian.net/browse/VT-1557',
+			title: 'INFRA Strona błędu 404 poligonu SWARM',
+			url: 'https://core3.atlassian.net/browse/VT-1558',
 			taskRef: undefined,
 			taskRepository: undefined,
-			ownTaskRef: 'VT-1557',
+			key: 'VT-1558',
 		});
 		const line = pullRequestWorkItemLine(workItem, {
 			scm: 'azure-devops',
 			repo: 'core3pl/KV-TMS/ai-sdlc',
 		});
-		expect(line).toBe('Work item: [VT-1557](https://core3.atlassian.net/browse/VT-1557)');
+		expect(line).toBe('Work item: [VT-1558](https://core3.atlassian.net/browse/VT-1558)');
+	});
+
+	it('links a Jira card linked to an issue in another repository by its key', () => {
+		const workItem = createMockWorkItem({
+			title: 'Fix the board',
+			url: 'https://core3.atlassian.net/browse/VT-1558',
+			taskRef: '7',
+			taskRepository: 'other/repo',
+			ownTaskRef: undefined,
+			key: 'VT-1558',
+		});
+		expect(pullRequestWorkItemLine(workItem, GITHUB)).toBe(
+			'Work item: [VT-1558](https://core3.atlassian.net/browse/VT-1558)',
+		);
+	});
+
+	it('links a Linear issue by its identifier', () => {
+		const workItem = createMockWorkItem({
+			title: 'Fix the board',
+			url: 'https://linear.app/acme/issue/ENG-42/fix-the-board',
+			taskRef: undefined,
+			taskRepository: undefined,
+			key: 'ENG-42',
+		});
+		expect(pullRequestWorkItemLine(workItem, GITHUB)).toBe(
+			'Work item: [ENG-42](https://linear.app/acme/issue/ENG-42/fix-the-board)',
+		);
+	});
+
+	it('links a card on a provider with no keys (Trello) by its title', () => {
+		const workItem = createMockWorkItem({
+			title: 'Fix the board',
+			url: 'https://trello.com/c/abc123',
+			taskRef: undefined,
+			taskRepository: undefined,
+			key: undefined,
+		});
+		expect(pullRequestWorkItemLine(workItem, GITHUB)).toBe(
+			'Work item: [Fix the board](https://trello.com/c/abc123)',
+		);
+	});
+
+	it('still closes a same-repository GitHub issue when the card also has a key', () => {
+		const workItem = createMockWorkItem({
+			taskRef: '42',
+			taskRepository: GITHUB.repo,
+			key: 'ENG-42',
+		});
+		expect(pullRequestWorkItemLine(workItem, GITHUB)).toBe('Closes: #42');
 	});
 
 	it('links rather than closes a same-repository issue on a provider with no closing keyword', () => {

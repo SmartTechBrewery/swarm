@@ -2351,10 +2351,12 @@ describe('fromAssignedWorkItem', () => {
 			statusId: '3fe662f4',
 			taskRef: '42',
 			taskRepository: 'acme/backend',
+			key: 'VT-1558',
 			labels: [{ id: 'LA_1', name: 'swarm', color: 'ededed' }],
 			assignees: [{ handle: 'octocat', displayName: 'The Octocat' }],
 		});
 		expect(workItem).toMatchObject({
+			key: 'VT-1558',
 			id: 'PVTI_1',
 			title: 'Do it',
 			// A bare artifact number names nothing, so the repository numbering it comes
@@ -2379,5 +2381,6 @@ describe('fromAssignedWorkItem', () => {
 		});
 		expect(workItem.taskRef).toBeUndefined();
 		expect(workItem.taskRepository).toBeUndefined();
+		expect(workItem.key).toBeUndefined();
 	});
 });

@@ -127,6 +127,7 @@ function toAssignedWorkItem(workItem: WorkItem): AssignedWorkItem {
 		url: workItem.url,
 		taskRef: workItem.taskRef,
 		taskRepository: workItem.taskRepository,
+		key: workItem.key,
 		status: workItem.status,
 		statusId: workItem.statusId,
 		statusKey: workItem.statusKey,

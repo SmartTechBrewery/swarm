@@ -35,6 +35,7 @@ const API_KEY = 'lin_api_test_key';
 
 const ISSUE_NODE = {
 	id: '0d5c3e5e-2d8e-4a3f-9f9a-0f5b1c0f0e21',
+	identifier: 'ENG-42',
 	title: 'Wire triggers',
 	description: 'Do the thing.',
 	url: 'https://linear.app/acme/issue/ENG-42/wire-triggers',
@@ -167,6 +168,9 @@ describe('LinearPMProvider', () => {
 
 			await expect(provider.getWorkItem(ISSUE_NODE.id)).resolves.toEqual({
 				id: ISSUE_NODE.id,
+				// The identifier is the display key only (issue #1287) — never the task id,
+				// which on Linear comes from a linked SCM issue alone.
+				key: 'ENG-42',
 				title: 'Wire triggers',
 				description: 'Do the thing.',
 				url: ISSUE_NODE.url,
@@ -189,7 +193,7 @@ describe('LinearPMProvider', () => {
 				expect.stringContaining('labels(first: 100)'),
 				expect.anything(),
 			);
-			expect(linearGraphQL.mock.calls[0]?.[0]).not.toContain('identifier');
+			expect(linearGraphQL.mock.calls[0]?.[0]).toContain('identifier');
 		});
 
 		// Issue #710 moved the repository half of this rule: the pair is read off the
