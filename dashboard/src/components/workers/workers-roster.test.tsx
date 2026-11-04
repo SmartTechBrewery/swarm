@@ -235,6 +235,9 @@ describe('WorkersRoster states', () => {
 
 		expect(await screen.findByText('No workers to show.')).toBeDefined();
 		expect(screen.getByText(/enrolled in this project/)).toBeDefined();
+		// Issue #1314: the installation's own install.sh, not an operator-CLI command.
+		expect(screen.getByText(`curl -fsSL ${window.location.origin}/install.sh | sh`)).toBeDefined();
+		expect(screen.queryByText(/swarm workers register/)).toBeNull();
 	});
 
 	it('keeps the cross-project wording for the unscoped empty state', async () => {

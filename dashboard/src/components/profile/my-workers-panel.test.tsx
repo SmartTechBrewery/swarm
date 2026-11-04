@@ -346,7 +346,9 @@ describe('MyWorkersPanel query states', () => {
 		renderPanel(<MyWorkersPanel />);
 
 		expect(await screen.findByText("You don't operate any workers yet.")).toBeDefined();
-		expect(screen.getByText('swarm workers register')).toBeDefined();
+		// Issue #1314: the installation's own install.sh, not an operator-CLI command.
+		expect(screen.getByText(`curl -fsSL ${window.location.origin}/install.sh | sh`)).toBeDefined();
+		expect(screen.queryByText(/swarm workers register/)).toBeNull();
 		expect(screen.queryAllByRole('link')).toHaveLength(0);
 	});
 

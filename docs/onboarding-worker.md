@@ -4,23 +4,34 @@ A step-by-step runbook for making a machine — **this one or somebody else's** 
 a worker. Every worker connects over the transport (ADR-003 §2 — see
 [`docs/configuration.md`](./configuration.md) and
 [`docs/cloudflare-tunnel.md`](./cloudflare-tunnel.md#remote-worker-transport-worker));
-there is one worker program (issue #553), with two ways to launch it (Part 2). The
-admin-side prerequisites — the Cloudflare Tunnel `/worker/*` route in particular —
-are out of scope here; this doc assumes the router is healthy with its dispatch consumer
-running, which it always is.
+there is one worker program (issue #553). The admin-side prerequisites — the
+Cloudflare Tunnel `/worker/*` route in particular — are out of scope here; this doc
+assumes the router is healthy with its dispatch consumer running, which it always
+is.
+
+**There are two ways to set a worker host up.** The default is the installation's
+own installer, `curl -fsSL https://<installation>/install.sh | sh` (issues #1311–
+#1314): it needs no SWARM clone and no GitHub account, installs the `swarm-worker`
+launcher from the installation, and leaves a **profile-based** worker that runs the
+signed runtime its installation serves and is updated by it. The end-to-end example
+below uses it. **SWARM developers** can still run a worker from a SWARM clone —
+[SWARM developers: running a worker from a clone](#swarm-developers-running-a-worker-from-a-clone)
+keeps that path, and Parts 1 and 2 are its full reference. A clone-based worker
+moves onto the launcher, as the same worker, with
+[`migrate`](#migrating-a-clone-based-worker).
 
 **Every deployment does this, including a single-user install** (issue #552).
 `SWARM_SINGLE_USER_MODE` is the API's authentication policy; it does not bypass
 the dispatch gate, so the control-plane host's own worker is registered and
-enrolled by these same commands. A host with no registered worker has nothing to
-run phases on and its dispatches wait durably — which is what `swarm start` /
-`swarm status` warn about.
+enrolled too. A host with no registered worker has nothing to run phases on and its
+dispatches wait durably — which is what `swarm start` / `swarm status` warn about.
 
-**Where each part runs.** The user and membership steps (Part 1, steps 1–2) still
-need `DATABASE_URL` and so still run on the **admin machine**. Everything else —
-every `swarm workers` subcommand — needs only `SWARM_CONTROL_PLANE_URL` and a
-`swarm login` session since issue #800, so it runs on the **worker's own machine**,
-which is also where Part 2 runs.
+**Where each part runs.** Creating the user and the membership (step 1) needs an
+installation admin — the dashboard, or a shell with `DATABASE_URL` on the **admin
+machine**. Everything else runs on the **worker's own machine** and reaches the
+control plane over the network: the installer signs in with the owner's email and
+password, and the clone path's `swarm workers` subcommands need only
+`SWARM_CONTROL_PLANE_URL` and a `swarm login` session (issue #800).
 
 ---
 
@@ -37,7 +48,6 @@ substitute your own.
 | `https://swarm.example.com` | this installation's control-plane base URL |
 | `ada_example_project` | the worker's display name, unique installation-wide |
 | `claude,codex` | the agent CLIs installed **and authenticated** on that machine |
-| `~/code/swarm` | that machine's checkout of SWARM itself |
 | `~/code/example-project` | that machine's checkout of the project's repository |
 
 A worker is registered from one repository checkout — its **primary** checkout,
@@ -49,10 +59,11 @@ workers each registered from its own checkout. Naming workers after the person a
 the project (`ada_example_project`, `ada_example_mobile`) is a convention, not a
 rule — the pairing SWARM enforces is each checkout's `origin`, never the name.
 
-### Step 1 — on the admin machine (the one with `DATABASE_URL`)
+### Step 1 — an installation admin creates the user and the membership
 
 Create the person, give them a dashboard password, and put them in the project.
-Skip any part already done; `users add` refuses a handle that exists.
+Skip any part already done; `users add` refuses a handle that exists. From a shell
+with `DATABASE_URL` (the admin machine):
 
 ```bash
 npm run swarm -- users add ada@example.com --name "Ada Lovelace"
@@ -65,12 +76,234 @@ the dashboard's **Settings → Users** and sends them the single-use password li
 shows, which they open to set their own password (issue #1151); a project admin
 adds them on the project's **Members** tab.
 
-Membership is not optional: the next step asks the control plane which SCM
-provider the project runs on, and that read is refused for a non-member — with
-`You are not a member of project "example-project"`, distinct from
-`Project with ID "example-project" not found`, so the two are told apart.
+Membership is not optional: the installer offers only the projects its user can
+access, so a project the teammate is not a member of is not on its list, and a
+`--project` naming one is refused.
 
-### Step 2 — on the teammate's machine, in the SWARM checkout
+### Step 2 — on the teammate's machine, run the installer in the project checkout
+
+The machine needs Node.js 22 or newer, git, `curl`, `tar`, and the agent CLIs it
+will offer, installed and logged in. Then, as the teammate themselves:
+
+```bash
+cd ~/code/example-project
+curl -fsSL https://swarm.example.com/install.sh | sh
+```
+
+The script is served by the installation with its own URL baked in. It downloads
+the installation's launcher package and checks it against the installation's
+SHA-256, installs it at `~/.swarm/launcher` with `swarm-worker` linked into
+`~/.swarm/bin` (and `~/.local/bin` when that is on `PATH`), and hands over to
+`swarm-worker setup --control-plane-url https://swarm.example.com`, which asks, in
+order:
+
+1. **the login email and password** — typed without echo, never printed, logged or
+   stored; only the session token is cached, under `~/.swarm/operator-sessions/`. A
+   live session for the installation is reused with no password asked;
+2. **the project** — picked for you when you can access only one, otherwise a
+   numbered list offering the one named like the checkout's repository;
+3. **the agent CLIs** — the ones on `PATH`, to confirm — and **the worker's name**,
+   `<you>_<host>_<repo>` by default;
+4. **the source-control token** for the project's provider, typed without echo —
+   the account this machine's commits, pushes, pull requests and implementer
+   comments are authored as. For GitHub that is a personal access token needing
+   `repo`, plus `workflow` if agents may touch `.github/workflows/**`. It is
+   verified against the provider before it is stored, and never printed back.
+
+It then registers and enrolls the worker (with sharing consent), writes its profile
+to `~/.swarm/workers/<worker-id>/profile.json`, downloads and verifies the
+installation's runtime, installs the LaunchAgent that keeps it running, and waits up
+to a minute for the control plane to see it connected. Off macOS, or with
+`--no-autostart`, it ends by printing the `swarm-worker run <worker-id>` to start it
+with instead. Nothing is read from or written to a `.env`. Every step it cannot
+finish by itself names the worker's page on the dashboard,
+`https://swarm.example.com/workers/<worker-id>`. See
+[`swarm-worker setup`](./cli.md#swarm-worker-setup).
+
+### Step 3 — approve the enrollment (a project administrator)
+
+Skipped when the teammate administers the project themselves — the enrollment then
+arrives active. Otherwise it is created pending: the worker is installed, started
+and connected anyway, and takes work the moment a project administrator approves
+it — with **Approve enrollment** on the worker's page in the dashboard, or with
+`swarm workers approve <worker-id> example-project` from a SWARM clone. Sharing
+consent was already given at step 2, so the approval is genuinely the only thing
+left.
+
+### Checking on it
+
+```bash
+swarm-worker status            # each worker: LaunchAgent, runtime, connected or not
+swarm-worker login             # renew the session when it has lapsed
+```
+
+`swarm-worker status` exits 0 only when every worker it reports is connected.
+Without a live session it shows the local view and says to run `swarm-worker
+login`. Sessions last `SWARM_SESSION_TTL_HOURS` (7 days by default); the worker
+itself does not need one — only these commands do. Under launchd,
+`swarm-worker-agent status|logs --profile <worker-id>` (the package's own, at
+`~/.swarm/launcher/bin/swarm-worker-agent`) reports on the agent
+([`launchd-worker-autostart.md`](./launchd-worker-autostart.md#profile-based-workers)).
+
+**Updates need nothing from you.** The worker runs the signed runtime its
+installation serves, from `~/.swarm/runtimes/<version>/`. When the installation
+upgrades, it moves its workers onto its new version by itself
+(`workers.followInstallationVersion`, on by default), and each one downloads and
+verifies that version before it runs it
+([Updating a runtime-based worker](#updating-a-runtime-based-worker)). Re-running
+the installer upgrades the launcher itself in place; `curl -fsSL
+https://swarm.example.com/install.sh | sh -s -- login` does that without running
+setup again.
+
+### Installing without questions
+
+Every question has a flag, and the script passes everything after `sh -s --`
+through to `swarm-worker setup`:
+
+```bash
+curl -fsSL https://swarm.example.com/install.sh | sh -s -- \
+  --email ada@example.com --password-file ~/.swarm-password \
+  --project example-project --cli claude,codex --name ada_example_project \
+  --scm-token-file ~/.scm-token --yes
+```
+
+| Flag | Answers |
+| --- | --- |
+| `--email <email>` | the login email (alias `--identifier`) |
+| `--password-file <path\|->` | the password, read from a file or from stdin (`-`) |
+| `--project <id>` | the project to enroll in — one of the projects you can access |
+| `--cli <c1,c2>` | the agent CLIs to declare; those on `PATH` otherwise |
+| `--name <name>` | the worker's name; `<you>_<host>_<repo>` otherwise |
+| `--scm-token-file <path\|->` | the source-control token, read from a file or from stdin (`-`) |
+| `--no-autostart` | register only; start it with `swarm-worker run <worker-id>` |
+| `--yes`, `-y` | accept the defaults instead of asking |
+
+Secrets are never arguments. Under `curl | sh` the script itself arrives on stdin,
+so give the two files as paths; `-` (stdin, for only one of them) is for
+`swarm-worker setup` run directly. With no terminal, a missing answer that has no
+default fails naming its flag. (`--control-plane-url` is the script's own; it is
+always passed.)
+
+### Adding a second worker later
+
+Run the installer again in the other project's checkout — it reuses the live
+session, so it asks only for the project, the CLIs, the name and the token:
+
+```bash
+cd ~/code/example-mobile
+curl -fsSL https://swarm.example.com/install.sh | sh    # or: swarm-worker setup --control-plane-url https://swarm.example.com
+```
+
+The source-control token is asked for again: it is stored per `(worker, provider)`,
+so the second worker has its own, even when the value is the same. A checkout that
+already has a worker for this installation is refused, since registering again
+would strand the first worker's enrollments. To have **one** worker serve a second
+repository instead, see [Serving a second repository](#serving-a-second-repository).
+
+### Serving a second installation from the same machine
+
+A machine that already runs a worker for one installation can run workers for a
+second one too (issue #1215). With the launcher this needs **no second clone and no
+second launcher**: each worker's profile names the installation it serves.
+
+| Placeholder | Stands for |
+| --- | --- |
+| `https://swarm-two.example.com` | the second installation's control-plane base URL |
+| `~/code/two-project` | this machine's checkout of that installation's project repository |
+
+1. **Pick a project checkout no other worker holds.** Credentials and the checkout
+   lock are keyed on the checkout's realpath, and only one worker can run in a
+   checkout at a time. Clone the second installation's project repository
+   separately (`~/code/two-project`), even when it is the same repository the first
+   installation's worker serves.
+2. **Run the second installation's own installer there**, signed in as your user
+   on *that* installation:
+
+   ```bash
+   cd ~/code/two-project
+   curl -fsSL https://swarm-two.example.com/install.sh | sh
+   ```
+
+   Sessions are cached per installation, so the first installation's session is
+   left as it is. If the enrollment needs approval, a project administrator of the
+   second installation gives it (step 3).
+
+What you end up with:
+
+- **Each worker's profile names its installation.**
+  `~/.swarm/workers/<worker-id>/profile.json` holds that worker's control-plane URL,
+  credential and checkouts, and every `swarm-worker` command reads the installation
+  from the profile — `swarm-worker status` lists both workers, each against its own
+  installation.
+- **Two LaunchAgents, labelled by host.** Each agent's label carries the host of the
+  installation its profile serves
+  (`pl.smarttechbrewery.swarm.worker.swarm-two-example-com.<worker-id>.<hash8>`), so
+  `launchctl list | grep swarm.worker` tells the two apart
+  ([`launchd-worker-autostart.md`](./launchd-worker-autostart.md#profile-based-workers)).
+- **Runtime updates stay independent.** Each worker runs the runtime *its*
+  installation serves and is moved only by it. The runtimes are shared read-only
+  under `~/.swarm/runtimes/`, and one is removed only once no worker on the host
+  names it, so neither installation's update disturbs the other's worker.
+- **One launcher.** `~/.swarm/launcher` is whichever installation's `install.sh`
+  ran last; it starts each worker on its own installation's runtime either way.
+- **What the two installations still share** is the machine's agent-CLI logins and
+  quotas: both installations' workers draw on the same `claude` / `codex` / `agy`
+  accounts. Before a host restart, drain the workers on both installations.
+
+A SWARM developer serving a second installation from a clone has the older,
+one-clone-per-installation route as well:
+[One SWARM clone per installation](#one-swarm-clone-per-installation).
+
+### Migrating a clone-based worker
+
+A worker set up the older way — a SWARM clone's LaunchAgent running `swarm
+run:worker` in its checkout, with its credential in the per-checkout cache — moves
+onto the launcher **as the same worker** (issue #1313). In its checkout:
+
+```bash
+cd ~/code/example-project
+curl -fsSL https://swarm.example.com/install.sh | sh -s -- migrate
+# or, once swarm-worker is installed: swarm-worker migrate [<checkout>]
+```
+
+**What is carried over:** the worker id and credential, its extra checkouts (the
+primary first) and the installation it serves, read from the checkout's credential
+cache and from the clone's LaunchAgent (else the clone's `.env`), into
+`~/.swarm/workers/<worker-id>/profile.json`. Nothing is registered or enrolled, so
+the worker's enrollments and the source-control tokens stored for it are the ones it
+had. It then installs and verifies the installation's runtime, replaces the clone's
+LaunchAgent with a profile agent running the launcher, and deletes the cache entry,
+so `swarm run:worker` in the checkout cannot start a second copy.
+
+It refuses, with nothing changed, a checkout with no cached worker, one a profile
+already serves, an installation other than the clone's, and a credential the
+control plane does not accept; if the new agent cannot be installed it puts the
+clone's agent back. The restart interrupts a run in progress (retried, as on any
+daemon restart), so drain the worker first if that matters — it asks before it
+starts, and `--yes` skips the question. A worker started by hand rather than by a
+LaunchAgent is given its profile and runtime, and `migrate` prints the `swarm-worker
+run <worker-id>` to start it with once the old daemon is stopped.
+
+**The clone is no longer needed** by that worker: `migrate` ends by saying so, and
+lists any other clone agents still running from it — once none are, the clone can be
+deleted. See [`swarm-worker migrate`](./cli.md#swarm-worker-migrate).
+
+---
+
+## SWARM developers: running a worker from a clone
+
+A worker can also run straight from a SWARM clone — the `swarm` CLI registers it and
+`swarm run:worker` (or the clone's `swarm-worker-agent`) starts it on the clone's
+own build, which its installation's updates then move (ADR-006). It is the path for
+working on SWARM itself, and for a machine that needs the `swarm` operator CLI
+anyway. Step 1 above is unchanged; steps 2–6 below replace the installer, with one
+more placeholder:
+
+| Placeholder | Stands for |
+| --- | --- |
+| `~/code/swarm` | that machine's checkout of SWARM itself |
+
+### Clone step 2 — on the teammate's machine, in the SWARM checkout
 
 ```bash
 git clone <this installation's swarm repo> ~/code/swarm
@@ -81,7 +314,7 @@ npm install
 Nothing has to be put in `.env` by hand — the next command writes the one line a
 worker needs.
 
-### Step 3 — sign in, as the worker's owner
+### Clone step 3 — sign in, as the worker's owner
 
 ```bash
 npm run swarm -- login --identifier ada@example.com \
@@ -98,9 +331,9 @@ own call.
 Sessions last `SWARM_SESSION_TTL_HOURS` (7 days by default); re-running this
 command is the renewal.
 
-### Shortcut — steps 4 and 6 in one command
+### Shortcut — clone steps 4 and 6 in one command
 
-On a machine that is signed in (step 3), the project's checkout can do the rest by
+On a machine that is signed in (clone step 3), the project's checkout can do the rest by
 itself:
 
 ```bash
@@ -116,7 +349,7 @@ it as a LaunchAgent so it is already running when the command returns. Elsewhere
 stops at the start command of step 6. Step 5 still applies to a project you do not
 administer. See [`docs/cli.md`](./cli.md#swarm-workers) for the details.
 
-### Step 4 — register and enroll the worker
+### Clone step 4 — register and enroll the worker
 
 Run this **from the project's checkout**, or name it with `--repo-root`:
 
@@ -143,7 +376,7 @@ swarm: SWARM_WORKER_CREDENTIAL=<credential> SWARM_WORKER_REPO_ROOT=<checkout> np
 Copy it before the terminal scrolls — though on this machine you will not need to,
 since step 6 reads it from the local cache this command just wrote.
 
-### Step 5 — approve the enrollment (a project administrator)
+### Clone step 5 — approve the enrollment (a project administrator)
 
 Skipped when the owner administers the project themselves — the enrollment then
 already arrives active, and step 4 says so. Otherwise, from any machine with a
@@ -159,7 +392,7 @@ prints it again. Sharing consent was already recorded in step 4 — it is the
 machine owner's decision and is kept even while approval is pending — so approval
 is genuinely the only thing left.
 
-### Step 6 — start the daemon
+### Clone step 6 — start the daemon
 
 ```bash
 cd ~/code/example-project
@@ -174,6 +407,13 @@ run in `~/code/swarm`. On macOS,
 instead of from a terminal tab.
 
 ### Serving a second repository
+
+This needs the `swarm` operator CLI from a clone — `swarm-worker` has no
+command for it yet — but it works for a profile-based worker too: run in that
+worker's primary checkout, `add-checkout` / `remove-checkout` edit its profile
+rather than a credential cache, and the worker is restarted with the launcher's
+own `~/.swarm/launcher/bin/swarm-worker-agent install --profile <worker-id>`
+instead.
 
 One worker can hold a checkout of each repository it serves (issue #1059) — one
 daemon, one machine, one checkout per repository. That is usually what you want
@@ -224,7 +464,7 @@ next restart too. Two things to keep in mind:
   stops it first — and once the combined worker is up and has picked up that
   repository's work, retire the old one (`swarm workers remove <worker-id>`).
 
-### Adding a second worker later
+### Adding a second clone-based worker later
 
 Steps 2, 3 and 5 are already done for that machine and that person. Only step 4
 repeats, against the other project and its own checkout, with a new name:
@@ -240,12 +480,12 @@ the flag would only be refused if it named a different one. The operator
 credential is asked for again — it is stored per `(worker, provider)`, so the
 second worker has its own, even when the value is the same.
 
-### Serving a second installation from the same machine
+### One SWARM clone per installation
 
-A machine that already runs workers for one installation can run workers for a
-second one too (issue #1215). It needs **one SWARM clone per installation**. A
-clone's `.env` names the control plane it serves, and that installation's updates
-move the clone itself to its build
+A SWARM developer whose workers run from a clone can serve a second installation
+from the same machine with **a second SWARM clone** (issue #1215) — the installer's
+route above needs neither. A clone's `.env` names the control plane it serves, and
+that installation's updates move the clone itself to its build
 ([ADR-006](./decisions/ADR-006-unconditional-worker-updates.md)). Pointing the
 existing clone at a second URL is refused: `workers setup` rejects a
 `--control-plane-url` that disagrees with its `.env`. Even if it were accepted, the two fleets would keep moving one
@@ -303,7 +543,7 @@ It reaches the second installation through `~/code/swarm-two/.env`. On macOS it
 installs the LaunchAgent with that clone's **own** `bin/swarm-worker-agent`, so
 the agent runs `~/code/swarm-two/bin/swarm.js run:worker` (issue #1213). If the
 enrollment needs approval, a project administrator of the second installation
-gives it (step 5 above), with this clone's CLI. The commands `setup` prints when a
+gives it (clone step 5 above), with this clone's CLI. The commands `setup` prints when a
 step fails, or to start, check or retry the worker, already name this clone's own
 `node ~/code/swarm-two/bin/swarm.js` / `~/code/swarm-two/bin/swarm-worker-agent`
 form (issue #1221), so they can be copied as printed.
@@ -407,6 +647,11 @@ swarm-launcher run <worker-id>
 ---
 
 ## Part 1 — register the user + worker
+
+Parts 1 and 2 are the full reference for the clone path
+([SWARM developers: running a worker from a clone](#swarm-developers-running-a-worker-from-a-clone)),
+with the `swarm` operator CLI. A worker host set up with `install.sh` needs neither
+([The whole thing, end to end](#the-whole-thing-end-to-end)).
 
 For a **single-user install**, skip the user and membership steps and pass
 `localhost-admin` as `<email>` (in either path below): that is the bootstrapped
@@ -688,11 +933,9 @@ git clone <repo-url> && cd swarm
 npm ci
 ```
 
-(A machine that should not hold a SWARM clone at all can run the packaged worker
-runtime instead — one tarball needing only Node ≥ 22, with this same `.env`
-contract; see "The packaged runtime" under
-[The worker](./MANUAL.md#the-worker) in the manual. Part 1 still needs a clone
-somewhere, for the `swarm` CLI.)
+(A machine that should not hold a SWARM clone at all uses the installation's
+`install.sh` instead — see [The whole thing, end to end](#the-whole-thing-end-to-end)
+— which needs neither Part 1 nor Part 2.)
 
 Since issue #800 this same checkout is where Part 1 is run from — `swarm login` and
 `swarm workers register-and-enroll` need only `SWARM_CONTROL_PLANE_URL`, and

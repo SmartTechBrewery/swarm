@@ -194,7 +194,9 @@ itself.
 `workers register` prints a credential **once** — put it in `.env` as
 `SWARM_WORKER_CREDENTIAL` before starting the worker, or skip that by running
 `swarm run:worker` from the checkout you registered in. `swarm start` and `swarm
-status` warn when this host has no usable credential. The full runbook, including
+status` warn when this host has no usable credential. Any other machine needs no
+clone at all: in its project checkout, `curl -fsSL https://<installation>/install.sh
+| sh` sets it up as a profile-based worker (below). The full runbook, including
 someone else's machine, is [`docs/onboarding-worker.md`](./onboarding-worker.md);
 on macOS, [`docs/launchd-worker-autostart.md`](./launchd-worker-autostart.md) runs
 it from a launchd agent instead of a terminal tab.
@@ -442,9 +444,14 @@ handshake. Re-registering instead would issue a new worker and lose its enrollme
 and operator credentials. See
 [`docs/onboarding-worker.md`](./onboarding-worker.md#serving-a-second-repository).
 
-**One machine can serve two installations** (issue #1215) — with one SWARM clone
-per installation, because a clone's `.env` names the control plane it serves and
-that installation's updates move the clone itself (ADR-006). Every command run
+**One machine can serve two installations** (issue #1215). With the launcher it
+needs nothing extra: run the second installation's own `install.sh` in a project
+checkout no other worker holds, and that worker's profile names its installation,
+its LaunchAgent is labelled with that installation's host, and each worker's runtime
+is updated by its own installation alone; the agent-CLI logins and quotas stay
+shared. A clone-based worker instead needs one SWARM clone per installation, because
+a clone's `.env` names the control plane it serves and that installation's updates
+move the clone itself (ADR-006). Every command run
 through a clone's `bin/swarm.js`, `run:worker` included, falls back to
 `SWARM_CONTROL_PLANE_URL` in that clone's `.env` when the environment exports none
 (issue #1214's precedence). So the second clone's commands and its LaunchAgent
@@ -1590,9 +1597,9 @@ lapsed, `docker compose restart app` logs a fresh one.
   with your domain in place of the tunnel URL; every route is listed in
   [`docs/operations.md`](./operations.md).
 - **Enroll workers against the domain.** Workers never run on the VPS — each runs
-  on an operator's machine with its own SWARM checkout and agent CLIs. The commands
-  [`onboarding-worker.md`](./onboarding-worker.md) Step 1 runs on "the admin
-  machine" run inside the container here:
+  on an operator's machine, in its checkout of the project, with its own agent CLIs.
+  The commands [`onboarding-worker.md`](./onboarding-worker.md) Step 1 runs on "the
+  admin machine" run inside the container here:
 
   ```bash
   docker compose exec app node dist/cli/index.js users add ada@example.com --name "Ada Lovelace"
@@ -1602,8 +1609,8 @@ lapsed, `docker compose restart app` logs a fresh one.
 
   (or, with no shell, add the user under Settings → Users and send them the
   password link it shows; membership can also be granted on the project's Members
-  tab). Then follow Steps 2–6 on the
-  worker's machine with `--control-plane-url https://<your domain>`.
+  tab). Then, on the worker's machine and in its project checkout, run
+  `curl -fsSL https://<your domain>/install.sh | sh` (onboarding Steps 2–3).
 
 ### Behind a Cloudflare Tunnel instead of Caddy
 
@@ -2071,7 +2078,8 @@ The complete option catalogue, defaults, and source-of-truth schemas are in
 - [`docs/cloudflare-tunnel.md`](./cloudflare-tunnel.md) — exposing the
   local router to GitHub
 - [`docs/onboarding-worker.md`](./onboarding-worker.md) — adding a new
-  user + worker, local or remote
+  user + worker with the installation's `install.sh`, local or remote; migrating a
+  clone-based worker; and the clone path for SWARM developers
 - [`docs/launchd-worker-autostart.md`](./launchd-worker-autostart.md) — running a
   worker from a launchd agent on macOS instead of a terminal tab, and the
   `swarm-repo-renamed` runbook for a renamed project repository

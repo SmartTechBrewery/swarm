@@ -158,9 +158,43 @@ security model, and the provider boundaries.
 
 ---
 
+## Get a worker running
+
+A worker is a machine that runs the phases, in its own checkout of the project.
+Joining an installation that is already up takes one command, and needs **no
+GitHub account and no SWARM clone** — everything comes from the installation:
+
+1. **Have the prerequisites:** Node.js 22 or newer, git, an agent CLI (`claude`,
+   `codex` or `agy`) you are logged in to, and a checkout of the project the
+   worker is to serve. You also need a login on the installation, and membership
+   of the project.
+2. **In that checkout, run the installation's installer:**
+
+   ```bash
+   curl -fsSL https://<installation>/install.sh | sh
+   ```
+
+3. **Answer its questions:** your login email and password, the project, the
+   agent CLIs to offer, and your source-control token for the project's provider
+   when it needs one. It then installs the `swarm-worker` launcher, writes the
+   worker's profile, fetches and verifies the installation's runtime, and installs
+   the LaunchAgent that keeps the worker running (on macOS; elsewhere it prints
+   the `swarm-worker run <id>` to start it with).
+4. **Check it:** `swarm-worker status` shows the worker connected. If you do not
+   administer the project, a project administrator approves the enrollment
+   before work arrives.
+5. **Leave updates alone:** when the installation upgrades, it moves its workers
+   onto its new version itself. Nothing is needed from you.
+
+Flags for an unattended install, moving a worker that runs from a SWARM clone
+onto the launcher (`… | sh -s -- migrate`), and serving a second installation
+from the same machine are in
+[`docs/onboarding-worker.md`](docs/onboarding-worker.md). Operational detail is in
+[`docs/MANUAL.md`](docs/MANUAL.md#the-worker).
+
 ## Quick start
 
-From the repository root:
+To run an installation from source, from the repository root:
 
 ```bash
 npm install
@@ -172,7 +206,8 @@ npm run db:seed                   # loads swarm.config.json into Postgres
 ```
 
 Register this machine as a worker. Every deployment does — a phase runs on an
-enrolled worker or it waits:
+enrolled worker or it waits. Working from the clone, register it with the clone's
+own CLI (other machines use the installer above):
 
 ```bash
 npm run swarm -- login --identifier localhost-admin
