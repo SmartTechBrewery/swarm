@@ -14,13 +14,23 @@
  */
 
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import {
+	cpSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	writeFileSync,
+} from 'node:fs';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { swarmInstallRoot } from '@/lib/build-identity.js';
+import { applyUpdateTarget } from '@/worker/self-update.js';
 
 const REPO_ROOT = swarmInstallRoot();
 const SCRIPT = join(REPO_ROOT, 'bin/build-worker-runtime.js');
@@ -41,11 +51,19 @@ function tempDir(label: string): string {
 	return dir;
 }
 
-function buildInto(outDir: string): string {
+function buildInto(
+	outDir: string,
+	env: Record<string, string> = { SWARM_BUILD_COMMIT: COMMIT },
+): string {
 	const result = spawnSync(process.execPath, [SCRIPT, outDir], {
 		cwd: REPO_ROOT,
 		encoding: 'utf8',
-		env: { ...baseEnv, SWARM_BUILD_COMMIT: COMMIT },
+		env: {
+			...Object.fromEntries(
+				Object.entries(baseEnv).filter(([key]) => key !== 'SWARM_BUILD_COMMIT'),
+			),
+			...env,
+		},
 		timeout: 120_000,
 	});
 	expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
@@ -131,6 +149,44 @@ describe('bin/build-worker-runtime.js', () => {
 		expect(bundle).not.toContain(REPO_ROOT);
 		expect(bundle).not.toContain(realpathSync(REPO_ROOT));
 	});
+
+	it('packs no stamp when no commit is given, and still succeeds', () => {
+		const unstamped = buildInto(tempDir('unstamped'), {});
+		const unpacked = tempDir('unstamped-unpacked');
+		execFileSync('tar', ['-xzf', unstamped, '-C', unpacked]);
+		expect(listFiles(join(unpacked, NAME))).toEqual([
+			'dist/transport/connect-entry.mjs',
+			'package.json',
+		]);
+	}, 120_000);
+
+	it('refuses a control-plane update when unpacked inside another git work tree', async () => {
+		// The build script's own default: staged under a gitignored directory of a clone,
+		// where `rev-parse HEAD` and a clean `status` both answer for that clone.
+		const clone = join(tempDir('enclosing'), 'swarm');
+		mkdirSync(clone);
+		const git = (args: string[]) =>
+			execFileSync('git', args, { cwd: clone, env: baseEnv, stdio: 'pipe' }).toString().trim();
+		git(['init', '-q', '-b', 'main']);
+		writeFileSync(join(clone, '.gitignore'), 'worker-runtime/\n');
+		git(['add', '.gitignore']);
+		git(['-c', 'user.email=t@e.com', '-c', 'user.name=T', 'commit', '-q', '-m', 'seed']);
+		const before = git(['rev-parse', 'HEAD']);
+		const nested = join(clone, 'worker-runtime', NAME);
+		cpSync(runtimeRoot, nested, { recursive: true });
+
+		const outcome = await applyUpdateTarget({
+			target: 'main',
+			installRoot: nested,
+			homeDir: tempDir('home'),
+		});
+
+		expect(outcome.status).toBe('refused');
+		if (outcome.status !== 'refused') return;
+		expect(outcome.reason).toContain('not the top level');
+		expect(git(['rev-parse', 'HEAD'])).toBe(before);
+		expect(git(['symbolic-ref', '--quiet', 'HEAD'])).toBe('refs/heads/main');
+	}, 60_000);
 
 	it('builds byte-identical artifacts from one tree and commit', () => {
 		const again = buildInto(tempDir('again'));
