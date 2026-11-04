@@ -14,6 +14,7 @@
  */
 
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
 	cpSync,
 	mkdirSync,
@@ -29,8 +30,11 @@ import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { run as runLauncher } from '@/launcher/main.js';
+import { writeWorkerProfile } from '@/launcher/worker-profile.js';
 import { swarmInstallRoot } from '@/lib/build-identity.js';
 import { applyUpdateTarget } from '@/worker/self-update.js';
+import { makeMinisignKey, signMinisign } from '../../helpers/runtime-fixtures.js';
 
 const REPO_ROOT = swarmInstallRoot();
 const SCRIPT = join(REPO_ROOT, 'bin/build-worker-runtime.js');
@@ -121,8 +125,25 @@ beforeAll(() => {
 }, 120_000);
 
 afterAll(() => {
-	for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+	for (const dir of dirs.splice(0)) {
+		// An installed runtime is read-only (`src/launcher/runtime-store.ts`).
+		execFileSync('chmod', ['-R', 'u+w', dir]);
+		rmSync(dir, { recursive: true, force: true });
+	}
 });
+
+/** A git checkout whose origin names `acme/widgets`, for the daemon to declare. */
+function gitCheckout(): string {
+	const checkout = join(tempDir('checkout'), 'repo');
+	mkdirSync(checkout);
+	const git = (args: string[]) =>
+		execFileSync('git', args, { cwd: checkout, env: baseEnv, stdio: 'pipe' });
+	const identity = ['-c', 'user.email=t@e.com', '-c', 'user.name=T'];
+	git(['init', '-q', '-b', 'main']);
+	git([...identity, 'commit', '-q', '--allow-empty', '-m', 'seed']);
+	git(['remote', 'add', 'origin', 'https://github.com/acme/widgets.git']);
+	return checkout;
+}
 
 describe('bin/build-worker-runtime.js', () => {
 	it('packs exactly the manifest, the stamp and the bundle, at the depth the anchors need', () => {
@@ -201,14 +222,7 @@ describe('bin/build-worker-runtime.js', () => {
 	}, 60_000);
 
 	it('reports the stamped build identity at handshake', async () => {
-		const checkout = join(tempDir('checkout'), 'repo');
-		mkdirSync(checkout);
-		const git = (args: string[]) =>
-			execFileSync('git', args, { cwd: checkout, env: baseEnv, stdio: 'pipe' });
-		const identity = ['-c', 'user.email=t@e.com', '-c', 'user.name=T'];
-		git(['init', '-q', '-b', 'main']);
-		git([...identity, 'commit', '-q', '--allow-empty', '-m', 'seed']);
-		git(['remote', 'add', 'origin', 'https://github.com/acme/widgets.git']);
+		const checkout = gitCheckout();
 
 		const handshakes: unknown[] = [];
 		const server = createServer((req, res) => {
@@ -238,6 +252,88 @@ describe('bin/build-worker-runtime.js', () => {
 				repository: 'acme/widgets',
 				build: { commit: COMMIT, dirty: false, version: VERSION },
 			});
+		} finally {
+			await new Promise((closed) => server.close(closed));
+		}
+	}, 60_000);
+	it('is installed, verified and started by swarm-launcher from a profile', async () => {
+		const checkout = gitCheckout();
+		const home = tempDir('launcher-home');
+		const key = makeMinisignKey();
+		const tarball = readFileSync(artifact);
+		const name = `${NAME}.tar.gz`;
+		const manifest = {
+			available: true,
+			version: VERSION,
+			commit: COMMIT,
+			artifact: {
+				name,
+				url: `/worker/runtime/artifacts/${name}`,
+				size: tarball.length,
+				sha256: createHash('sha256').update(tarball).digest('hex'),
+			},
+			signature: {
+				format: 'minisign',
+				minisig: signMinisign(key, tarball, `swarm-worker-runtime ${VERSION} ${COMMIT}`),
+			},
+		};
+
+		const handshakes: unknown[] = [];
+		const downloads: Array<string | undefined> = [];
+		const server = createServer((req, res) => {
+			let body = '';
+			req.on('data', (chunk) => {
+				body += chunk;
+			});
+			req.on('end', () => {
+				if (req.url === '/worker/runtime/manifest') {
+					res.writeHead(200, { 'content-type': 'application/json' });
+					res.end(JSON.stringify(manifest));
+					return;
+				}
+				if (req.url === manifest.artifact.url) {
+					downloads.push(req.headers.authorization);
+					res.writeHead(200, { 'content-type': 'application/gzip' });
+					res.end(tarball);
+					return;
+				}
+				if (req.url === '/worker/session') handshakes.push(JSON.parse(body));
+				res.writeHead(401, { 'content-type': 'application/json' });
+				res.end('{"reason":"test control plane"}');
+			});
+		});
+		await new Promise<void>((ready) => server.listen(0, '127.0.0.1', ready));
+		try {
+			const { port } = server.address() as AddressInfo;
+			writeWorkerProfile({
+				workerId: 'launcher-worker',
+				controlPlaneUrl: `http://127.0.0.1:${port}`,
+				credential: 'test-credential',
+				repoRoots: [checkout],
+				homeDir: home,
+			});
+			const output: string[] = [];
+			// No `execve` here, so the launcher takes its spawn fallback and the daemon
+			// runs as a child this test can wait on.
+			const status = await runLauncher(['run', 'launcher-worker'], {
+				homeDir: home,
+				trustedPublicKey: key.publicKey,
+				execve: null,
+				env: { PATH: process.env.PATH ?? '', HOME: home, SWARM_WORKER_TRANSPORT_CLIS: 'claude' },
+				stdout: (line) => output.push(line),
+				stderr: (line) => output.push(line),
+			});
+			expect(status, output.join('\n')).toBe(1);
+			expect(downloads).toEqual(['Bearer test-credential']);
+			expect(handshakes).toHaveLength(1);
+			expect(handshakes[0]).toMatchObject({
+				daemonVersion: VERSION,
+				repository: 'acme/widgets',
+				build: { commit: COMMIT, dirty: false, version: VERSION },
+			});
+			expect(
+				readFileSync(join(home, '.swarm/workers/launcher-worker/logs/worker.log'), 'utf8'),
+			).not.toBe('');
 		} finally {
 			await new Promise((closed) => server.close(closed));
 		}
