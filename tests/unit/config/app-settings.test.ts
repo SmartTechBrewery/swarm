@@ -65,6 +65,22 @@ describe('AppSettingsSchema', () => {
 
 	it('APP_SETTINGS_DEFAULTS is a valid settings object defaulting to a dark theme', () => {
 		expect(AppSettingsSchema.safeParse(APP_SETTINGS_DEFAULTS).success).toBe(true);
-		expect(APP_SETTINGS_DEFAULTS).toEqual({ appearance: { theme: 'dark' } });
+		expect(APP_SETTINGS_DEFAULTS).toEqual({
+			appearance: { theme: 'dark' },
+			workers: { followInstallationVersion: true },
+		});
+	});
+
+	// Issue #1284: on by default, so a fleet does not drift behind its installation
+	// unless somebody chose that.
+	it('defaults workers.followInstallationVersion to true when absent', () => {
+		expect(validateAppSettings({}).workers.followInstallationVersion).toBe(true);
+		expect(validateAppSettings({ workers: {} }).workers.followInstallationVersion).toBe(true);
+	});
+
+	it('round-trips an explicit workers.followInstallationVersion of false', () => {
+		const parsed = validateAppSettings({ workers: { followInstallationVersion: false } });
+		expect(parsed.workers.followInstallationVersion).toBe(false);
+		expect(validateAppSettings(parsed)).toEqual(parsed);
 	});
 });

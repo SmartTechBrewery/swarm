@@ -291,6 +291,29 @@ export async function findLatestInstallationRollout(): Promise<WorkerUpdateRollo
 }
 
 /**
+ * Every installation-wide rollout, **whatever its status**, newest first — or an
+ * empty list when the fleet has never been offered one (issue #1284).
+ *
+ * Any status on purpose: this is the record of which builds were already offered to
+ * the fleet, which is what stops the automatic follow-the-installation rollout
+ * (`../../api/worker-follow-installation.ts`) from starting a second one — whether
+ * the first is still moving, completed, or halted on a bad build. It returns them all
+ * rather than matching a target here because a rollout stores its target *as typed*
+ * — a version (`v1.6.0`, `1.6.0`), a tag or an abbreviated commit — so whether one
+ * names a given build is the caller's decision, not a string equality. Unbounded,
+ * and fine to be: there is one row per installation-wide rollout an administrator
+ * or an upgrade started, not per machine.
+ */
+export async function listInstallationRollouts(): Promise<WorkerUpdateRollout[]> {
+	const rows = await getDb()
+		.select()
+		.from(workerUpdateRollouts)
+		.where(eq(workerUpdateRollouts.scope, 'installation'))
+		.orderBy(desc(workerUpdateRollouts.createdAt), desc(workerUpdateRollouts.id));
+	return rows.map(rowToRollout);
+}
+
+/**
  * The rollouts an advance can still do something with (issue #1023): every
  * `in_progress` one, plus a `halted` one that still holds a member the rollout
  * committed to and has not settled.

@@ -30,10 +30,16 @@ describe('settingsSearchSchema', () => {
 
 describe('visibleSettingsTabs', () => {
 	it('gives an instance administrator every tab', () => {
-		expect(visibleSettingsTabs(ADMIN)).toEqual(['agents', 'credentials', 'users', 'appearance']);
+		expect(visibleSettingsTabs(ADMIN)).toEqual([
+			'agents',
+			'credentials',
+			'users',
+			'fleet',
+			'appearance',
+		]);
 	});
 
-	it('hides Agent Defaults, Credentials and Users from a non-administrator', () => {
+	it('hides Agent Defaults, Credentials, Users and Fleet from a non-administrator', () => {
 		expect(visibleSettingsTabs(NON_ADMIN)).toEqual(['appearance']);
 	});
 
@@ -82,6 +88,17 @@ describe('resolveActiveSettingsTab', () => {
 		expect(resolveActiveSettingsTab({ tab: 'users' }, ADMIN)).toBe('users');
 	});
 
+	// Hidden as a courtesy; `settings.update` refuses a non-administrator's change to the
+	// key it edits regardless (issue #1284).
+	it('degrades a direct ?tab=fleet link for a non-administrator', () => {
+		expect(resolveActiveSettingsTab({ tab: 'fleet' }, NON_ADMIN)).toBe('appearance');
+		expect(resolveActiveSettingsTab({ tab: 'fleet' })).toBe('appearance');
+	});
+
+	it('honors ?tab=fleet for an administrator', () => {
+		expect(resolveActiveSettingsTab({ tab: 'fleet' }, ADMIN)).toBe('fleet');
+	});
+
 	it('treats an unresolved viewer as a non-administrator, so the section never flashes', () => {
 		expect(resolveActiveSettingsTab({ tab: 'agents' })).toBe('appearance');
 		expect(resolveActiveSettingsTab({})).toBe('appearance');
@@ -91,6 +108,7 @@ describe('resolveActiveSettingsTab', () => {
 describe('settingsTabNeedsAppSettings', () => {
 	it('waits on settings.get only for the tabs that render from it', () => {
 		expect(settingsTabNeedsAppSettings('agents')).toBe(true);
+		expect(settingsTabNeedsAppSettings('fleet')).toBe(true);
 		expect(settingsTabNeedsAppSettings('appearance')).toBe(true);
 		expect(settingsTabNeedsAppSettings('credentials')).toBe(false);
 		expect(settingsTabNeedsAppSettings('users')).toBe(false);

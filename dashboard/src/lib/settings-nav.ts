@@ -2,11 +2,11 @@ import { z } from 'zod';
 
 /**
  * The tabs on the General Settings screen, in display order (issue #250 added
- * `appearance`, issue #769 `credentials`, issue #1151 `users`). The administrator-only
+ * `appearance`, issue #769 `credentials`, issue #1151 `users`, issue #1284 `fleet`). The administrator-only
  * tabs stay together and `appearance` — every viewer's tab, and the fallback — stays
  * last.
  */
-export const SETTINGS_TABS = ['agents', 'credentials', 'users', 'appearance'] as const;
+export const SETTINGS_TABS = ['agents', 'credentials', 'users', 'fleet', 'appearance'] as const;
 
 export type SettingsTab = (typeof SETTINGS_TABS)[number];
 
@@ -39,8 +39,16 @@ export interface SettingsViewer {
  * - `users` (issue #1151) is likewise visibility on top of real enforcement: every
  *   `users` procedure, `list` included, throws `FORBIDDEN` for a non-administrator
  *   (`src/api/routers/users.ts`).
+ * - `fleet` (issue #1284) is visibility on top of enforcement of the one key it edits:
+ *   `settings.update` refuses a non-administrator's change to
+ *   `workers.followInstallationVersion` with `FORBIDDEN` (`src/api/routers/settings.ts`).
  */
-const INSTANCE_ADMIN_ONLY_TABS: readonly SettingsTab[] = ['agents', 'credentials', 'users'];
+const INSTANCE_ADMIN_ONLY_TABS: readonly SettingsTab[] = [
+	'agents',
+	'credentials',
+	'users',
+	'fleet',
+];
 
 /** The tab a bare `/settings` link opens, for a viewer who may see it. */
 const DEFAULT_SETTINGS_TAB: SettingsTab = 'agents';
@@ -83,12 +91,12 @@ export function resolveActiveSettingsTab(
 
 /**
  * Whether a tab renders from the `settings.get` blob, so the screen waits on that
- * query (and shows its error) before rendering it. Agent Defaults reads `agents`, and
- * Appearance merges its theme update onto the whole blob; Credentials and Users each
- * own their query and stay usable when `settings.get` fails.
+ * query (and shows its error) before rendering it. Agent Defaults reads `agents`, Fleet
+ * reads `workers`, and both it and Appearance merge their update onto the whole blob;
+ * Credentials and Users each own their query and stay usable when `settings.get` fails.
  */
 export function settingsTabNeedsAppSettings(tab: SettingsTab): boolean {
-	return tab === 'agents' || tab === 'appearance';
+	return tab === 'agents' || tab === 'fleet' || tab === 'appearance';
 }
 
 /** Search state for switching to a tab. */

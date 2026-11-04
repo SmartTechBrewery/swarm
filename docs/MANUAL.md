@@ -880,6 +880,22 @@ still on the build it had. Once the rollout is `completed` the readout folds to 
 `Last fleet update report` heading you can open again — and fold back; a halted one
 stays open, since it is the one that is waiting on you.
 
+**After an upgrade the control plane starts that rollout itself** (issue #1284). With
+the global setting `workers.followInstallationVersion` on — the default, on the
+Settings screen's **Fleet** tab — a control plane that has been up for two minutes on a
+version its workers are not on starts exactly the staged installation-wide rollout
+**Update all workers** would, to its own commit, recorded under the first instance
+administrator. It does so at most once per version — counting a rollout you started
+yourself as that version (`v1.6.0` or `1.6.0`) or its full or abbreviated commit; a
+branch or another tag names no build it can check. A restart on the same version
+starts nothing, a rollout in progress is not duplicated, and a **halted one is not
+retried** — the readout above is where it, and every machine that could not take the
+build, is reported. The two minutes are for the fleet to reconnect after the restart;
+a rollout already moving blocks it until that one finishes. `swarm workers update
+--all`, the button and the commands below keep working as before; turn the setting
+off if you would rather move the fleet by hand, or to hold it on another build than
+the installation's. See [`configuration.md`](./configuration.md#global-settings-app_settings).
+
 A project's own administrator has the narrower, **unstaged** form in the same place on
 the project detail page's **Workers** tab (issue #1010): **Update project workers**
 asks the machines enrolled in that project, in the project's configured order, through

@@ -54,6 +54,13 @@
  * first left behind, so a wave cannot be drained or signalled twice. That lock was
  * written for this phase — phase 2 had one caller.
  *
+ * The tick carries one more job since issue #1284, and it is a *start* rather than an
+ * advance: once the process has been up long enough for its fleet to reconnect, it
+ * asks whether to roll the fleet onto the control plane's own version
+ * (`followInstallationVersionIfDue`, `../api/worker-follow-installation.ts`). It rides
+ * this timer because it is the control plane's rollout timer, and every rule about it
+ * lives in that module, exactly as every rule about advancing lives in the policy.
+ *
  * It lives in `src/router/` rather than beside the policy it drives, for the reason
  * `./worker-update-dispatch.ts` already gives: this is the process that holds worker
  * sockets and serves the delivery routes, so it is where the events are — and it
@@ -61,6 +68,7 @@
  * (`./dispatcher.ts`), so it is where a control-plane timer belongs too.
  */
 
+import { followInstallationVersionIfDue } from '../api/worker-follow-installation.js';
 import { advanceRollout } from '../api/worker-update-rollout.js';
 import {
 	findAdvanceableInstallationRollout,
@@ -226,17 +234,22 @@ export async function advanceRolloutsInProgress(): Promise<void> {
  *
  * One sweep at a time: a sweep that outruns the interval would only queue a second
  * set of callers behind the same row locks, so a tick arriving while one is still
- * running is skipped rather than stacked. The timer is `unref`'d like the
+ * running is skipped rather than stacked. Each sweep advances first and then decides
+ * whether to follow the installation version (issue #1284), under the same guard, so
+ * the decision reads the rollouts this tick has just moved. The timer is `unref`'d like the
  * dispatcher's own intervals, so it never by itself keeps the process alive.
  */
 export function startRolloutAdvanceTicker(): { close: () => void } {
+	const startedAt = Date.now();
 	let sweeping = false;
 	const timer = setInterval(() => {
 		if (sweeping) return;
 		sweeping = true;
-		void advanceRolloutsInProgress().finally(() => {
-			sweeping = false;
-		});
+		void advanceRolloutsInProgress()
+			.then(() => followInstallationVersionIfDue(startedAt))
+			.finally(() => {
+				sweeping = false;
+			});
 	}, ROLLOUT_ADVANCE_TICK_MS);
 	timer.unref();
 	return { close: () => clearInterval(timer) };

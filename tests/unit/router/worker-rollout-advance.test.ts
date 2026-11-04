@@ -28,6 +28,14 @@ const { advanceRollout } = vi.hoisted(() => ({
 }));
 vi.mock('@/api/worker-update-rollout.js', () => ({ advanceRollout }));
 
+// The follow-the-installation decision (issue #1284) is its own module's to test;
+// here it is only a step the tick takes after advancing.
+const { followInstallationVersionIfDue } = vi.hoisted(() => ({
+	followInstallationVersionIfDue:
+		vi.fn<(processStartedAt: number, now?: number) => Promise<void>>(),
+}));
+vi.mock('@/api/worker-follow-installation.js', () => ({ followInstallationVersionIfDue }));
+
 const {
 	findAdvanceableInstallationRollout,
 	listAdvanceableRollouts,
@@ -104,6 +112,7 @@ beforeEach(() => {
 	// No installation-wide rollout unless a case says there is one (issue #1024).
 	findAdvanceableInstallationRollout.mockResolvedValue(undefined);
 	advanceRollout.mockImplementation(async (id) => makeView(makeRollout({ id })));
+	followInstallationVersionIfDue.mockResolvedValue(undefined);
 });
 
 describe('advanceRolloutForWorker', () => {
@@ -314,6 +323,29 @@ describe('startRolloutAdvanceTicker', () => {
 		ticker.close();
 	});
 
+	// Issue #1284: after advancing, each tick asks whether to follow the installation
+	// version, measured from when the ticker started rather than from the tick.
+	it('decides whether to follow the installation version after advancing', async () => {
+		vi.useFakeTimers();
+		const startedAt = Date.now();
+		const order: string[] = [];
+		listAdvanceableRollouts.mockResolvedValue([makeRollout()]);
+		advanceRollout.mockImplementation(async (id) => {
+			order.push('advance');
+			return makeView(makeRollout({ id }));
+		});
+		followInstallationVersionIfDue.mockImplementation(async () => {
+			order.push('follow');
+		});
+		const ticker = startRolloutAdvanceTicker();
+
+		await vi.advanceTimersByTimeAsync(ROLLOUT_ADVANCE_TICK_MS);
+
+		expect(order).toEqual(['advance', 'follow']);
+		expect(followInstallationVersionIfDue).toHaveBeenCalledWith(startedAt);
+		ticker.close();
+	});
+
 	it('ticks no more once it is closed', async () => {
 		vi.useFakeTimers();
 		listAdvanceableRollouts.mockResolvedValue([makeRollout()]);
@@ -341,6 +373,7 @@ describe('startRolloutAdvanceTicker', () => {
 
 		await vi.advanceTimersByTimeAsync(ROLLOUT_ADVANCE_TICK_MS * 3);
 		expect(advanceRollout).toHaveBeenCalledTimes(1);
+		expect(followInstallationVersionIfDue).not.toHaveBeenCalled();
 
 		release();
 		await vi.advanceTimersByTimeAsync(ROLLOUT_ADVANCE_TICK_MS);
