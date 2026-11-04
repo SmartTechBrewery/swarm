@@ -1137,7 +1137,7 @@ reason, unless all of these hold: the installation declares a version and a comm
 (its `build-info.json` stamp or its checkout); the tarball for *that* version is
 present; its `.sha256` matches its bytes; a `.minisig` is present; and that
 signature's trusted comment names the same version and commit. So an image built
-before #1290, a plain `docker build`, a `main` build signed without the key, or a
+before #1290, a plain `docker build`, a `main` build made without the signing key (unsigned), or a
 dev checkout's locally built `worker-runtime/` all say so plainly, and a tarball for
 any other version is never served. The answer is read once, on the first request,
 and logged (`Serving the worker runtime …`, or `Not serving a worker runtime` with

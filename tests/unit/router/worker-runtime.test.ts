@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { createReadStream, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Hono } from 'hono';
@@ -12,6 +12,11 @@ import {
 	parseMinisignTrustedComment,
 	WorkerRuntimeManifestSchema,
 } from '@/transport/runtime-manifest.js';
+
+vi.mock('node:fs', async (importOriginal) => {
+	const actual = await importOriginal<typeof import('node:fs')>();
+	return { ...actual, createReadStream: vi.fn(actual.createReadStream) };
+});
 
 const VERSION = '1.5.5';
 const COMMIT = 'a45f6d97c0ffee00112233445566778899aabbcc';
@@ -79,8 +84,9 @@ async function manifest(app: Hono) {
 	return WorkerRuntimeManifestSchema.parse(await res.json());
 }
 
-function download(app: Hono, name: string, bearer?: string) {
+function download(app: Hono, name: string, bearer?: string, method = 'GET') {
 	return app.request(`/worker/runtime/artifacts/${name}`, {
+		method,
 		headers: bearer ? { Authorization: `Bearer ${bearer}` } : {},
 	});
 }
@@ -216,6 +222,31 @@ describe('GET /worker/runtime/artifacts/:name (issue #1280)', () => {
 		expect(res.headers.get('Content-Disposition')).toBe(`attachment; filename="${NAME}"`);
 		expect(res.headers.get('Cache-Control')).toBe('private, no-store');
 		expect(Buffer.from(await res.arrayBuffer()).equals(tarball)).toBe(true);
+	});
+
+	it('answers an authenticated HEAD with the download headers and no body, without opening the file', async () => {
+		const app = buildApp();
+		// Resolving the runtime hashes the tarball once; only the download is counted.
+		await manifest(app);
+		vi.mocked(createReadStream).mockClear();
+
+		const res = await download(app, NAME, WORKER_CREDENTIAL, 'HEAD');
+
+		expect(res.status).toBe(200);
+		expect(res.headers.get('Content-Type')).toBe('application/gzip');
+		expect(res.headers.get('Content-Length')).toBe(String(tarball.length));
+		expect(res.headers.get('Cache-Control')).toBe('private, no-store');
+		expect(res.body).toBeNull();
+		expect(createReadStream).not.toHaveBeenCalled();
+	});
+
+	it('refuses an unauthenticated HEAD with 401', async () => {
+		vi.mocked(createReadStream).mockClear();
+
+		const res = await download(buildApp(), NAME, undefined, 'HEAD');
+
+		expect(res.status).toBe(401);
+		expect(createReadStream).not.toHaveBeenCalled();
 	});
 
 	it('refuses a request with no bearer', async () => {

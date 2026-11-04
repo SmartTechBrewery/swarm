@@ -262,12 +262,18 @@ export function registerWorkerRuntime(app: Hono, overrides: Partial<WorkerRuntim
 			c.req.param('name'),
 		);
 		if (result.status !== 200) return c.json(result.json, result.status, NO_STORE);
-		const body = Readable.toWeb(createReadStream(result.path)) as ReadableStream;
-		return c.body(body, 200, {
+		const headers = {
 			...NO_STORE,
 			'Content-Type': 'application/gzip',
 			'Content-Length': String(result.size),
 			'Content-Disposition': `attachment; filename="${result.name}"`,
-		});
+		};
+		// Hono answers HEAD by running this GET handler and discarding the body
+		// without cancelling it, so a stream opened here would hold its fd forever.
+		if (c.req.method === 'HEAD') return c.body(null, 200, headers);
+		const file = createReadStream(result.path);
+		// A client that disconnects mid-download must not leave the fd open either.
+		c.req.raw.signal.addEventListener('abort', () => file.destroy(), { once: true });
+		return c.body(Readable.toWeb(file) as ReadableStream, 200, headers);
 	});
 }
