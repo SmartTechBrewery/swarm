@@ -6,6 +6,9 @@ import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AppSettings } from '../../../../src/config/app-settings.js';
 
+/** The `workers` key every stored settings blob carries (issue #1284). */
+const WORKERS = { followInstallationVersion: true };
+
 const { mockGetSettings, mockUpdateSettings } = vi.hoisted(() => ({
 	mockGetSettings: vi.fn(),
 	mockUpdateSettings: vi.fn(),
@@ -107,7 +110,10 @@ describe('ThemeProvider', () => {
 	});
 
 	it('applies an explicit saved light preference', async () => {
-		mockGetSettings.mockResolvedValue({ appearance: { theme: 'light' } } satisfies AppSettings);
+		mockGetSettings.mockResolvedValue({
+			appearance: { theme: 'light' },
+			workers: WORKERS,
+		} satisfies AppSettings);
 		const { result } = renderTheme();
 
 		await waitFor(() => expect(result.current.preference).toBe('light'));
@@ -117,7 +123,10 @@ describe('ThemeProvider', () => {
 
 	it('resolves system to the live OS preference and updates documentElement', async () => {
 		const { fire } = stubMatchMedia(true);
-		mockGetSettings.mockResolvedValue({ appearance: { theme: 'system' } } satisfies AppSettings);
+		mockGetSettings.mockResolvedValue({
+			appearance: { theme: 'system' },
+			workers: WORKERS,
+		} satisfies AppSettings);
 		const { result } = renderTheme();
 
 		// Wait for the saved 'system' preference to actually load — the initial
@@ -133,7 +142,10 @@ describe('ThemeProvider', () => {
 
 	it('does not subscribe to system-preference changes for an explicit dark/light choice', async () => {
 		const { mql } = stubMatchMedia(true);
-		mockGetSettings.mockResolvedValue({ appearance: { theme: 'dark' } } satisfies AppSettings);
+		mockGetSettings.mockResolvedValue({
+			appearance: { theme: 'dark' },
+			workers: WORKERS,
+		} satisfies AppSettings);
 		const { result } = renderTheme();
 
 		await waitFor(() => expect(result.current.preference).toBe('dark'));
@@ -142,8 +154,11 @@ describe('ThemeProvider', () => {
 
 	it('unsubscribes the media-query listener when switching away from system', async () => {
 		const { mql } = stubMatchMedia(true);
-		mockGetSettings.mockResolvedValue({ appearance: { theme: 'system' } } satisfies AppSettings);
-		mockUpdateSettings.mockResolvedValue({ appearance: { theme: 'dark' } });
+		mockGetSettings.mockResolvedValue({
+			appearance: { theme: 'system' },
+			workers: WORKERS,
+		} satisfies AppSettings);
+		mockUpdateSettings.mockResolvedValue({ appearance: { theme: 'dark' }, workers: WORKERS });
 		const { result } = renderTheme();
 
 		await waitFor(() => expect(mql.addEventListener).toHaveBeenCalledTimes(1));
@@ -154,7 +169,10 @@ describe('ThemeProvider', () => {
 
 	it('reads the current OS preference when switching from an explicit theme to system', async () => {
 		const { mql } = stubMatchMedia(true);
-		mockGetSettings.mockResolvedValue({ appearance: { theme: 'light' } } satisfies AppSettings);
+		mockGetSettings.mockResolvedValue({
+			appearance: { theme: 'light' },
+			workers: WORKERS,
+		} satisfies AppSettings);
 		let resolveUpdate: (value: AppSettings) => void = () => {};
 		mockUpdateSettings.mockReturnValue(
 			new Promise((resolve) => {
@@ -173,7 +191,7 @@ describe('ThemeProvider', () => {
 		expect(document.documentElement.getAttribute('data-theme')).toBe('light');
 
 		await act(async () => {
-			resolveUpdate({ appearance: { theme: 'system' } });
+			resolveUpdate({ appearance: { theme: 'system' }, workers: WORKERS });
 			await Promise.resolve();
 		});
 	});
@@ -182,6 +200,7 @@ describe('ThemeProvider', () => {
 		const stored: AppSettings = {
 			agents: { defaults: { claude: 'opus' } },
 			appearance: { theme: 'dark' },
+			workers: WORKERS,
 		};
 		mockGetSettings.mockResolvedValue(stored);
 		let resolveUpdate: (value: AppSettings) => void = () => {};
@@ -202,6 +221,7 @@ describe('ThemeProvider', () => {
 		expect(mockUpdateSettings).toHaveBeenCalledWith({
 			agents: { defaults: { claude: 'opus' } },
 			appearance: { theme: 'light' },
+			workers: WORKERS,
 		});
 
 		await act(async () => {
@@ -212,7 +232,7 @@ describe('ThemeProvider', () => {
 	});
 
 	it('rolls back to the last persisted preference and surfaces an error on save failure', async () => {
-		const stored = { appearance: { theme: 'dark' } } satisfies AppSettings;
+		const stored = { appearance: { theme: 'dark' }, workers: WORKERS } satisfies AppSettings;
 		mockGetSettings.mockResolvedValue(stored);
 		mockUpdateSettings.mockRejectedValue(new Error('save failed'));
 		const { result, queryClient } = renderTheme();

@@ -23,6 +23,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('appSettingsRepository (in
 			const settings = {
 				agents: { defaults: { claude: 'opus' } },
 				appearance: { theme: 'light' as const },
+				workers: { followInstallationVersion: false },
 			};
 			const returned = await updateAppSettings(settings);
 
@@ -34,34 +35,42 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('appSettingsRepository (in
 			await updateAppSettings({
 				agents: { defaults: { claude: 'opus' } },
 				appearance: { theme: 'dark' },
+				workers: { followInstallationVersion: true },
 			});
 			await updateAppSettings({
 				agents: { defaults: { claude: 'sonnet' } },
 				appearance: { theme: 'system' },
+				workers: { followInstallationVersion: true },
 			});
 
 			expect(await getAppSettings()).toEqual({
 				agents: { defaults: { claude: 'sonnet' } },
 				appearance: { theme: 'system' },
+				workers: { followInstallationVersion: true },
 			});
 		});
 
 		it('round-trips each theme value', async () => {
 			for (const theme of ['dark', 'light', 'system'] as const) {
-				await updateAppSettings({ appearance: { theme } });
-				expect(await getAppSettings()).toEqual({ appearance: { theme } });
+				const settings = { appearance: { theme }, workers: { followInstallationVersion: true } };
+				await updateAppSettings(settings);
+				expect(await getAppSettings()).toEqual(settings);
 			}
 		});
 	});
 
 	describe('legacy rows', () => {
-		it('normalizes a pre-appearance row to a dark default on read', async () => {
+		it('normalizes a pre-appearance, pre-workers row to the defaults on read', async () => {
 			const db = (await import('../../../src/db/client.js')).getDb();
 			const { appSettings } = await import('../../../src/db/schema/appSettings.js');
 			// biome-ignore lint/suspicious/noExplicitAny: intentionally bypassing the AppSettings type to write a pre-#250 shape
 			await db.insert(appSettings).values({ id: 'global', settings: { agents: {} } as any });
 
-			expect(await getAppSettings()).toEqual({ agents: {}, appearance: { theme: 'dark' } });
+			expect(await getAppSettings()).toEqual({
+				agents: {},
+				appearance: { theme: 'dark' },
+				workers: { followInstallationVersion: true },
+			});
 		});
 	});
 });

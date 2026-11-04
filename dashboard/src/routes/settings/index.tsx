@@ -7,11 +7,13 @@ import {
 	Monitor,
 	Moon,
 	Palette,
+	RefreshCw,
 	Sun,
 	UsersRound,
 } from 'lucide-react';
 import type React from 'react';
 import { useEffect, useMemo, useState } from 'react';
+import { FleetUpdatesPanel } from '@/components/settings/fleet-updates-panel.js';
 import { InstanceCredentialsPanel } from '@/components/settings/instance-credentials-panel.js';
 import { UsersPanel } from '@/components/settings/users-panel.js';
 import { useTheme } from '@/components/theme/theme-provider.js';
@@ -45,7 +47,10 @@ const CLIS = ['claude', 'antigravity', 'codex'] as const;
  * which would pull that backend module's real (non-type) dependency chain —
  * down to `node:child_process` — into the browser bundle.
  */
-const FALLBACK_SETTINGS: AppSettings = { appearance: { theme: 'dark' } };
+const FALLBACK_SETTINGS: AppSettings = {
+	appearance: { theme: 'dark' },
+	workers: { followInstallationVersion: true },
+};
 
 const CLI_LABELS: Record<AgentCli, string> = {
 	claude: 'Claude',
@@ -295,13 +300,15 @@ const SETTINGS_TAB_ITEMS: ReadonlyArray<{ tab: SettingsTab; label: string; icon:
 	{ tab: 'agents', label: 'Agent Defaults', icon: Cpu },
 	{ tab: 'credentials', label: 'Credentials', icon: KeyRound },
 	{ tab: 'users', label: 'Users', icon: UsersRound },
+	{ tab: 'fleet', label: 'Fleet', icon: RefreshCw },
 	{ tab: 'appearance', label: 'Appearance', icon: Palette },
 ];
 
 /**
  * The horizontal tab bar, rendered from {@link SETTINGS_TAB_ITEMS} narrowed to the
  * tabs this viewer may see (`visibleSettingsTabs`) — a non-administrator is offered
- * none of Agent Defaults (issue #666), Credentials (issue #769) or Users (issue #1151).
+ * none of Agent Defaults (issue #666), Credentials (issue #769), Users (issue #1151)
+ * or Fleet (issue #1284).
  */
 export function SettingsTabBar({
 	tabs,
@@ -339,12 +346,12 @@ function SettingsRouteComponent() {
 	const queryClient = useQueryClient();
 	const navigate = useNavigate();
 	const search = settingsRoute.useSearch();
-	// Agent defaults, the instance default credentials and user administration are
-	// installation-wide, so those sections are shown only to an instance administrator
-	// (issues #666, #769, #1151) — including on a direct `?tab=agents` /
-	// `?tab=credentials` / `?tab=users` link, which `resolveActiveSettingsTab` degrades
-	// to a tab the viewer may see. For credentials and users that is courtesy on top of
-	// the router's own enforcement.
+	// Agent defaults, the instance default credentials, user administration and fleet
+	// updates are installation-wide, so those sections are shown only to an instance
+	// administrator (issues #666, #769, #1151, #1284) — including on a direct
+	// `?tab=agents` / `?tab=credentials` / `?tab=users` / `?tab=fleet` link, which
+	// `resolveActiveSettingsTab` degrades to a tab the viewer may see. For credentials,
+	// users and fleet that is courtesy on top of the router's own enforcement.
 	const viewer = useCurrentUser().data;
 	const tabs = visibleSettingsTabs(viewer);
 	const activeTab = resolveActiveSettingsTab(search, viewer);
@@ -452,6 +459,8 @@ function SettingsRouteComponent() {
 			{activeTab === 'credentials' && <InstanceCredentialsPanel />}
 
 			{activeTab === 'users' && <UsersPanel />}
+
+			{activeTab === 'fleet' && <FleetUpdatesPanel settings={settings ?? FALLBACK_SETTINGS} />}
 
 			{activeTab === 'appearance' && <AppearancePanel />}
 		</div>

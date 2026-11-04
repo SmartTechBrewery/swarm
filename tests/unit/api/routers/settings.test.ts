@@ -1,3 +1,4 @@
+import { TRPCError } from '@trpc/server';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/db/repositories/appSettingsRepository.js', () => ({
@@ -38,6 +39,7 @@ describe('settingsRouter', () => {
 			const settings: AppSettings = {
 				agents: { defaults: { claude: 'opus' } },
 				appearance: { theme: 'dark' },
+				workers: { followInstallationVersion: true },
 			};
 			vi.mocked(getAppSettings).mockResolvedValue(settings);
 
@@ -47,7 +49,10 @@ describe('settingsRouter', () => {
 		});
 
 		it('returns the defaults when nothing is stored', async () => {
-			const defaults: AppSettings = { appearance: { theme: 'dark' } };
+			const defaults: AppSettings = {
+				appearance: { theme: 'dark' },
+				workers: { followInstallationVersion: true },
+			};
 			vi.mocked(getAppSettings).mockResolvedValue(defaults);
 
 			const result = await caller.get();
@@ -60,6 +65,7 @@ describe('settingsRouter', () => {
 			const settings: AppSettings = {
 				agents: { defaults: { claude: 'sonnet' } },
 				appearance: { theme: 'light' },
+				workers: { followInstallationVersion: true },
 			};
 			vi.mocked(updateAppSettings).mockResolvedValue(settings);
 
@@ -74,6 +80,57 @@ describe('settingsRouter', () => {
 				caller.update({ agents: { defaults: { claude: 'gpt-5.6-terra' } } } as AppSettings),
 			).rejects.toThrow();
 			expect(updateAppSettings).not.toHaveBeenCalled();
+		});
+
+		it('materializes workers.followInstallationVersion as true when the input omits it', async () => {
+			vi.mocked(updateAppSettings).mockImplementation(async (settings) => settings);
+
+			await caller.update({ appearance: { theme: 'dark' } } as AppSettings);
+
+			expect(updateAppSettings).toHaveBeenCalledWith({
+				appearance: { theme: 'dark' },
+				workers: { followInstallationVersion: true },
+			});
+		});
+	});
+
+	// Issue #1284: the key decides whether installation-wide rollouts start, which is
+	// administrator-only everywhere else, so only an administrator may change it.
+	describe('update — workers.followInstallationVersion', () => {
+		const NON_ADMIN = { ...AUTHED_USER, instanceAdmin: false };
+		const nonAdminCaller = settingsRouter.createCaller({ user: NON_ADMIN });
+		const STORED: AppSettings = {
+			appearance: { theme: 'dark' },
+			workers: { followInstallationVersion: true },
+		};
+
+		beforeEach(() => {
+			vi.mocked(getAppSettings).mockResolvedValue(STORED);
+			vi.mocked(updateAppSettings).mockImplementation(async (settings) => settings);
+		});
+
+		it('refuses a non-administrator who changes it', async () => {
+			const error = await nonAdminCaller
+				.update({ ...STORED, workers: { followInstallationVersion: false } })
+				.catch((err: unknown) => err);
+
+			expect(error).toBeInstanceOf(TRPCError);
+			expect((error as TRPCError).code).toBe('FORBIDDEN');
+			expect(updateAppSettings).not.toHaveBeenCalled();
+		});
+
+		it('lets a non-administrator save another setting while carrying it unchanged', async () => {
+			const next: AppSettings = { ...STORED, appearance: { theme: 'light' } };
+
+			await expect(nonAdminCaller.update(next)).resolves.toEqual(next);
+			expect(updateAppSettings).toHaveBeenCalledWith(next);
+		});
+
+		it('lets an administrator change it', async () => {
+			const next: AppSettings = { ...STORED, workers: { followInstallationVersion: false } };
+
+			await expect(caller.update(next)).resolves.toEqual(next);
+			expect(updateAppSettings).toHaveBeenCalledWith(next);
 		});
 	});
 });
