@@ -5,6 +5,7 @@
  * its existing callers.
  */
 
+import { DEFAULT_PULL_REQUEST_DESCRIPTION } from '@/config/pull-request-description.js';
 import { GH_IDENTITY_GUARD } from '@/pipeline/agent-auth.js';
 import { pipelinePhaseGuard } from '@/pipeline/agent-scope.js';
 import {
@@ -64,6 +65,30 @@ function commitNamingFields(taskId: string, naming: CommitSubjectNaming): string
 }
 
 /**
+ * The delimited block telling the implementer how to write the pull request
+ * description (issue #1277): the project's structure (or SWARM's default) and the
+ * rules that come with it. It sits before the project instructions, so a Custom
+ * prompt keeps reading as general guidance for the phase.
+ */
+function pullRequestDescriptionSection(structure: string): readonly string[] {
+	return [
+		'',
+		'--- PULL REQUEST DESCRIPTION ---',
+		'Write the hand-off `summary` as the pull request description, by filling in the',
+		'structure below as Markdown. Replace every <…> placeholder and keep every heading.',
+		'- Every section is mandatory. When one has nothing to say, write "None" (or the',
+		"  structure's own equivalent) — never drop it.",
+		'- Nothing may be described as checked or verified unless it appears in your',
+		'  `verification` array; say what you did not check and why.',
+		'- Write in the language of the structure.',
+		'- Do not add a "Closes"/"Fixes" line or a link to the work item — SWARM appends it.',
+		'',
+		structure,
+		'--- END PULL REQUEST DESCRIPTION ---',
+	];
+}
+
+/**
  * Build the prompt handed to the implementation agent. It's told to implement the
  * work item (following the plan the Planning phase posted on the linked Issue),
  * verify with lint/typecheck/tests, and record the prepared change for SWARM to
@@ -107,6 +132,12 @@ export function buildImplementationPrompt(
 		 * size the summary the hand-off asks for. Unset means the defaults.
 		 */
 		commitSubjectNaming?: CommitSubjectNaming;
+		/**
+		 * The structure the pull request description follows (issue #1277) — the
+		 * project's `agents.implementation.pullRequestDescription`, resolved. Unset
+		 * means SWARM's default.
+		 */
+		pullRequestDescription?: string;
 	},
 	customPrompt?: string,
 ): string {
@@ -142,8 +173,8 @@ export function buildImplementationPrompt(
 		"3. Definition of enough: meet the work item's agreed acceptance criteria with the smallest durable change. Do not add speculative features, broad refactors, or exhaustive test coverage merely because adjacent code is untested. Add or update focused tests for changed stable behavior, regressions, public/critical paths, and bug fixes; leave volatile or explicitly out-of-scope coverage alone unless the issue/plan requires it.",
 		'4. Run the project lint, type-check, and the relevant tests; fix whatever they surface before continuing.',
 		'5. Do not commit, push, open a pull request, or run any GitHub mutation. SWARM delivers the prepared tree after you exit.',
-		`Specifically, do not run \`git push -u origin ${branch}\` or \`gh pr create --base ${baseBranch} --head ${branch}\`; SWARM constructs the PR with \`Closes #${context.taskId}\`. GH_TOKEN is read-only context authentication; do not run gh auth switch.`,
-		`6. Write "${IMPLEMENTATION_HANDOFF_FILENAME}" as JSON with: summary (PR-ready text), verification (an array of {command,outcome:"passed"}), ${commitNamingFields(context.taskId, context.commitSubjectNaming ?? {})}, limitations (an array), and readyForDelivery:true.${branchNamingFields(branchPattern)} Do not track this file.`,
+		`Specifically, do not run \`git push -u origin ${branch}\` or \`gh pr create --base ${baseBranch} --head ${branch}\`; SWARM opens the PR and adds the line naming the work item itself. GH_TOKEN is read-only context authentication; do not run gh auth switch.`,
+		`6. Write "${IMPLEMENTATION_HANDOFF_FILENAME}" as JSON with: summary (the pull request description: the PULL REQUEST DESCRIPTION structure below, filled in, as Markdown), verification (an array of {command,outcome:"passed"}), ${commitNamingFields(context.taskId, context.commitSubjectNaming ?? {})}, limitations (an array), and readyForDelivery:true.${branchNamingFields(branchPattern)} Do not track this file.`,
 		'Do NOT `git add`/commit the hand-off file.',
 		`If a genuine external prerequisite blocks implementation (for example, a required PR has not merged), do not open a placeholder PR. Instead, write a concise, human-readable explanation and the actionable next step to "${BLOCKED_REASON_FILENAME}" at the worktree root, then stop. Do NOT commit that file.`,
 		'',
@@ -155,6 +186,9 @@ export function buildImplementationPrompt(
 		'',
 		...(checkpoint ? [...checkpointContinuationSection(checkpoint), ''] : []),
 		'Do not merge the PR. Keep the change scoped to the work item.',
+		...pullRequestDescriptionSection(
+			context.pullRequestDescription ?? DEFAULT_PULL_REQUEST_DESCRIPTION,
+		),
 		...projectInstructionsSection(customPrompt),
 		'',
 		'--- WORK ITEM ---',

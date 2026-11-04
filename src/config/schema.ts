@@ -56,6 +56,10 @@ import {
 	PmProviderCredentialReferencesSchema,
 } from './pm-credentials.js';
 import {
+	normalizePullRequestDescription,
+	PULL_REQUEST_DESCRIPTION_MAX_LENGTH,
+} from './pull-request-description.js';
+import {
 	adoptLegacyScmCredentials,
 	ScmCredentialReferencesByProviderSchema,
 	ScmProviderCredentialReferencesSchema,
@@ -323,6 +327,15 @@ export const AgentConfigSchema = z
 		 * project without one produces exactly today's prompt.
 		 */
 		prompt: z.string().optional(),
+		/**
+		 * The structure of the pull request description the agent writes (issue
+		 * #1277). Read **only** on `agents.implementation` — the phase that opens the
+		 * pull request. Unset means SWARM's English default
+		 * (`DEFAULT_PULL_REQUEST_DESCRIPTION`); a value equal to the default
+		 * normalizes to unset, so saving it untouched stores nothing. SWARM always
+		 * appends the work-item line itself, outside this structure.
+		 */
+		pullRequestDescription: z.string().optional(),
 	})
 	.transform((agent, ctx) => {
 		// Whitespace-only is not a meaningful override — normalize it away so it's
@@ -330,6 +343,7 @@ export const AgentConfigSchema = z
 		// spreading a `prompt` key onto the result) so the inferred output keeps
 		// `prompt` optional, matching every other field.
 		agent.prompt = normalizeCustomPrompt(agent.prompt);
+		agent.pullRequestDescription = normalizePullRequestDescription(agent.pullRequestDescription);
 		if (agent.targets === undefined) {
 			// A config written before `targets` existed (or one the pre-list dashboard
 			// saved): fold its single selection into the list so every reader sees one
@@ -382,6 +396,15 @@ export const AgentConfigSchema = z
 		message: `prompt must be at most ${CUSTOM_PROMPT_MAX_LENGTH} characters (issue #135)`,
 		path: ['prompt'],
 	})
+	.refine(
+		(agent) =>
+			!agent.pullRequestDescription ||
+			agent.pullRequestDescription.length <= PULL_REQUEST_DESCRIPTION_MAX_LENGTH,
+		{
+			message: `pullRequestDescription must be at most ${PULL_REQUEST_DESCRIPTION_MAX_LENGTH} characters (issue #1277)`,
+			path: ['pullRequestDescription'],
+		},
+	)
 	.refine(
 		// A phase names each CLI at most once — two targets on the same CLI would be
 		// an ambiguous priority rather than a fallback. `undefined` participates in

@@ -115,6 +115,14 @@ import {
 	toRepositoryEntries,
 	toRepositoryForms,
 } from '@/lib/project-repository.js';
+import {
+	isDefaultPullRequestDescription,
+	isPullRequestDescriptionDirty,
+	normalizePullRequestDescription,
+	PULL_REQUEST_DESCRIPTION_MAX_LENGTH,
+	pullRequestDescriptionDisplay,
+	pullRequestDescriptionError,
+} from '@/lib/pull-request-description.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
 import type {
 	AgentConfig,
@@ -273,6 +281,7 @@ function normalizeAgentsForDisplay(agents: AgentsConfig): AgentsConfig {
 			targets: toTargetList(config),
 			timeoutMs: config.timeoutMs,
 			prompt: config.prompt,
+			pullRequestDescription: config.pullRequestDescription,
 		};
 	}
 	return next;
@@ -282,7 +291,8 @@ function isPhaseConfigDirty(local: AgentConfig = {}, db: AgentConfig = {}): bool
 	return (
 		areTargetsDirty(toTargetList(local), db) ||
 		(local.timeoutMs ?? '') !== (db.timeoutMs ?? '') ||
-		isCustomPromptDirty(local.prompt, db.prompt)
+		isCustomPromptDirty(local.prompt, db.prompt) ||
+		isPullRequestDescriptionDirty(local.pullRequestDescription, db.pullRequestDescription)
 	);
 }
 
@@ -305,8 +315,11 @@ function cleanAgentConfig(config: AgentConfig): AgentConfig | undefined {
 	// Whitespace-only prompt is not a meaningful override (issue #135) — drop it so
 	// it's neither persisted nor counted as a set value here.
 	const normalizedPrompt = normalizeCustomPrompt(prompt);
+	// The untouched default structure is not an override either (issue #1277).
+	const pullRequestDescription = normalizePullRequestDescription(config.pullRequestDescription);
 	const cleanedTargets = cleanTargets(toTargetList(config));
-	if (cleanedTargets.length === 0 && !timeoutMs && !normalizedPrompt) return undefined;
+	if (cleanedTargets.length === 0 && !timeoutMs && !normalizedPrompt && !pullRequestDescription)
+		return undefined;
 	// Only `targets` is sent: the schema re-derives the top-level `cli`/`model`/
 	// `reasoning` mirror from the highest-priority target, so writing it here could
 	// only introduce a stale second copy (issue #345).
@@ -314,6 +327,7 @@ function cleanAgentConfig(config: AgentConfig): AgentConfig | undefined {
 		targets: cleanedTargets.length > 0 ? cleanedTargets : undefined,
 		timeoutMs,
 		prompt: normalizedPrompt,
+		pullRequestDescription,
 	};
 }
 
@@ -736,7 +750,74 @@ interface PhaseSettingsDetailProps extends TargetHandlers {
 	handleVerifyPlanChange?: (enabled: boolean) => void;
 	handleTimeoutChange: (phase: keyof AgentsConfig, value: string) => void;
 	handlePromptChange: (phase: keyof AgentsConfig, value: string) => void;
+	/**
+	 * Sets the Implementation phase's PR description structure; `undefined` restores
+	 * the default. Read only on the Implementation screen, the one that renders the field.
+	 */
+	handlePullRequestDescriptionChange?: (value: string | undefined) => void;
 	onBack: () => void;
+}
+
+/**
+ * The Implementation phase's **Pull request description** card (issue #1277): the
+ * structure every pull request description SWARM opens follows, showing SWARM's
+ * default until the operator edits it, with a way back to that default. Kept out of
+ * {@link PhaseSettingsDetail} so that component's cognitive complexity stays bounded.
+ */
+function PullRequestDescriptionField({
+	value,
+	isPending,
+	onChange,
+}: {
+	value: string | undefined;
+	isPending: boolean;
+	onChange: (value: string | undefined) => void;
+}) {
+	const error = pullRequestDescriptionError(value);
+	const length = (normalizePullRequestDescription(value) ?? '').length;
+	return (
+		<div className={`${CARD_CLASS} space-y-2`}>
+			<div className="flex items-center justify-between gap-3">
+				<label
+					htmlFor="implementation-pull-request-description"
+					className="block text-sm font-semibold text-zinc-200"
+				>
+					Pull request description
+				</label>
+				<button
+					type="button"
+					onClick={() => onChange(undefined)}
+					disabled={isPending || isDefaultPullRequestDescription(value)}
+					className="text-xs font-medium text-zinc-400 hover:text-zinc-200 disabled:opacity-50 disabled:hover:text-zinc-400 transition-colors"
+				>
+					Restore default
+				</button>
+			</div>
+			<p className="text-xs text-zinc-400">
+				The structure the agent fills in for the description of every pull request this phase opens.
+				It starts as SWARM's default; edit it freely. SWARM always adds the last line itself —{' '}
+				<code className="font-mono">Closes: #&lt;n&gt;</code> for a GitHub issue in the same
+				repository, otherwise <code className="font-mono">Work item: [key](url)</code>.
+			</p>
+			<textarea
+				id="implementation-pull-request-description"
+				value={pullRequestDescriptionDisplay(value)}
+				onChange={(e) => onChange(e.target.value)}
+				disabled={isPending}
+				rows={16}
+				aria-invalid={error ? true : undefined}
+				className={`${FIELD_CLASS} font-mono resize-y`}
+			/>
+			{error ? (
+				<p className="text-xs text-red-400">{error}</p>
+			) : (
+				<p className="text-xs text-zinc-500">
+					{length.toLocaleString()} / {PULL_REQUEST_DESCRIPTION_MAX_LENGTH.toLocaleString()}{' '}
+					characters
+				</p>
+			)}
+		</div>
+	);
 }
 
 /**
@@ -1068,6 +1149,7 @@ export function PhaseSettingsDetail({
 	handleMoveTarget,
 	handleTimeoutChange,
 	handlePromptChange,
+	handlePullRequestDescriptionChange,
 	onBack,
 }: PhaseSettingsDetailProps) {
 	const phaseLabel = PHASE_LABELS[phase];
@@ -1196,6 +1278,14 @@ export function PhaseSettingsDetail({
 					</div>
 				</div>
 			</div>
+
+			{phase === 'implementation' && (
+				<PullRequestDescriptionField
+					value={config.pullRequestDescription}
+					isPending={isPending}
+					onChange={(value) => handlePullRequestDescriptionChange?.(value)}
+				/>
+			)}
 
 			<div className={`${CARD_CLASS} space-y-2`}>
 				<label htmlFor={`${phase}-prompt`} className="block text-sm font-semibold text-zinc-200">
@@ -1330,6 +1420,7 @@ interface AgentConfigurationFormProps extends TargetHandlers {
 	handleVerifyPlanChange: (enabled: boolean) => void;
 	handleTimeoutChange: (phase: keyof AgentsConfig, value: string) => void;
 	handlePromptChange: (phase: keyof AgentsConfig, value: string) => void;
+	handlePullRequestDescriptionChange: (value: string | undefined) => void;
 	handleSubmit: (e: React.FormEvent) => void;
 	handleReset: () => void;
 	isDirty: boolean;
@@ -1389,6 +1480,7 @@ export function AgentConfigurationForm({
 	handleMoveTarget,
 	handleTimeoutChange,
 	handlePromptChange,
+	handlePullRequestDescriptionChange,
 	handleSubmit,
 	handleReset,
 	isDirty,
@@ -1444,6 +1536,7 @@ export function AgentConfigurationForm({
 					handleMoveTarget={handleMoveTarget}
 					handleTimeoutChange={handleTimeoutChange}
 					handlePromptChange={handlePromptChange}
+					handlePullRequestDescriptionChange={handlePullRequestDescriptionChange}
 					onBack={onBack}
 				/>
 			) : (
@@ -2298,6 +2391,7 @@ function ProjectDetailRouteComponent() {
 	const hasAgentValidationError = useMemo(
 		() =>
 			anyCustomPromptError(PHASES.map((phase) => agents[phase]?.prompt)) ||
+			pullRequestDescriptionError(agents.implementation?.pullRequestDescription) !== undefined ||
 			PHASES.some((phase) => hasDuplicateCli(agents[phase]?.targets ?? [])),
 		[agents],
 	);
@@ -2382,6 +2476,16 @@ function ProjectDetailRouteComponent() {
 		setAgents((prev) => ({
 			...prev,
 			[phase]: { ...prev[phase], prompt: value },
+		}));
+		updateMutation.reset();
+	};
+
+	const handlePullRequestDescriptionChange = (value: string | undefined) => {
+		// Raw while editing, normalized on save — so the untouched default stores
+		// nothing (issue #1277). `undefined` is Restore default.
+		setAgents((prev) => ({
+			...prev,
+			implementation: { ...prev.implementation, pullRequestDescription: value },
 		}));
 		updateMutation.reset();
 	};
@@ -2671,6 +2775,7 @@ function ProjectDetailRouteComponent() {
 						handleMoveTarget={handleMoveTarget}
 						handleTimeoutChange={handleTimeoutChange}
 						handlePromptChange={handlePromptChange}
+						handlePullRequestDescriptionChange={handlePullRequestDescriptionChange}
 						handleSubmit={handleAgentsSubmit}
 						handleReset={handleAgentsReset}
 						isDirty={isAgentsDirty}

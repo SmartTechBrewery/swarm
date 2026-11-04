@@ -49,6 +49,7 @@ vi.mock('@/pipeline/resume.js', async (importOriginal) => ({
 	executeRecoveryGate: executeRecoveryGateMock,
 }));
 
+import { DEFAULT_PULL_REQUEST_DESCRIPTION } from '@/config/pull-request-description.js';
 import type { AgentCliResult, RunAgentCliOptions } from '@/harness/agent-cli.js';
 import { AgentRunError } from '@/harness/agent-failure.js';
 import { logger } from '@/lib/logger.js';
@@ -1030,6 +1031,69 @@ describe('runImplementationPhase — commit subject pattern (issue #1242)', () =
 	});
 });
 
+describe('runImplementationPhase — pull request description (issue #1277)', () => {
+	beforeEach(() => {
+		handoffFileExists = true;
+		handoffFileContents = HANDOFF;
+		blockedReasonFileExists = false;
+		checkpointFileExists = false;
+		progressFileContents = undefined;
+	});
+
+	function createdBody(deps: ReturnType<typeof makeDeps>): unknown {
+		const calls = deps.delivery.createPullRequest.mock.calls as unknown as Array<
+			[{ body: string }]
+		>;
+		return calls[0]?.[0].body;
+	}
+
+	it('ends a GitHub issue’s pull request with the line that closes it', async () => {
+		const deps = makeDeps();
+		deps.project = createMockProjectConfig({ scm: 'github' });
+
+		await runImplementationPhase(deps);
+
+		expect(createdBody(deps)).toBe('Adds the implementation phase.\n\nCloses: #10');
+	});
+
+	it('links a Jira card on Azure DevOps rather than writing GitHub’s closing syntax', async () => {
+		const deps = makeDeps();
+		deps.project = createMockProjectConfig({
+			scm: 'azure-devops',
+			repo: 'core3pl/KV-TMS/ai-sdlc',
+		});
+		deps.workItem = createMockWorkItem({
+			id: 'PVTI_vt',
+			title: 'Add robots.txt',
+			url: 'https://core3.atlassian.net/browse/VT-1557',
+			taskRef: undefined,
+			taskRepository: undefined,
+			ownTaskRef: 'VT-1557',
+		});
+
+		await runImplementationPhase({ ...deps, taskId: 'VT-1557' });
+
+		const body = createdBody(deps);
+		expect(body).toBe(
+			'Adds the implementation phase.\n\nWork item: [VT-1557](https://core3.atlassian.net/browse/VT-1557)',
+		);
+		expect(body).not.toContain('Closes');
+	});
+
+	it('hands the agent the project’s own structure in place of the default', async () => {
+		const deps = makeDeps();
+		deps.project = createMockProjectConfig({
+			agents: { implementation: { pullRequestDescription: '## Zmiany\n<co i dlaczego>' } },
+		});
+
+		await runImplementationPhase(deps);
+
+		const prompt = deps.runAgent.mock.calls[0]?.[0].args?.[0];
+		expect(prompt).toContain('## Zmiany\n<co i dlaczego>');
+		expect(prompt).not.toContain('## Why this way');
+	});
+});
+
 describe('buildImplementationPrompt', () => {
 	const context = {
 		repo: 'SmartTechBrewery/swarm',
@@ -1045,12 +1109,42 @@ describe('buildImplementationPrompt', () => {
 		);
 		expect(prompt).toContain(HANDOFF_FILENAMES.implementation);
 		expect(prompt).toContain(BLOCKED_REASON_FILENAME);
-		expect(prompt).toContain('Closes #19');
+		// SWARM appends the work-item line itself (issue #1277).
+		expect(prompt).not.toContain('Closes #19');
 		expect(prompt).toContain('git push -u origin issue-19');
 		expect(prompt).toContain('gh pr create');
 		expect(prompt).toContain('main');
 		expect(prompt).toContain('T');
 		expect(prompt).toContain('D');
+	});
+
+	// Issue #1277: `summary` is the pull request description, in the project's structure.
+	it('asks for the summary as the default description structure, with every section', () => {
+		const prompt = buildImplementationPrompt(createMockWorkItem(), context);
+		expect(prompt).toContain('--- PULL REQUEST DESCRIPTION ---');
+		expect(prompt).toContain(DEFAULT_PULL_REQUEST_DESCRIPTION);
+		for (const heading of ['## Changes', '## Why this way', '## Verification', '## Out of scope']) {
+			expect(prompt).toContain(heading);
+		}
+		expect(prompt).toContain('Every section is mandatory');
+		expect(prompt).toContain('`verification` array');
+		expect(prompt).not.toContain('PR-ready text');
+	});
+
+	it('uses a project’s own structure and keeps the custom prompt as project instructions after it', () => {
+		const structure = '## Podsumowanie\n<jedno zdanie>\n\n## Weryfikacja\n<polecenia>';
+		const prompt = buildImplementationPrompt(
+			createMockWorkItem(),
+			{ ...context, pullRequestDescription: structure },
+			'Prefer small commits.',
+		);
+		expect(prompt).toContain(structure);
+		expect(prompt).not.toContain('## Why this way');
+		const template = prompt.indexOf('--- PULL REQUEST DESCRIPTION ---');
+		const instructions = prompt.indexOf('--- PROJECT INSTRUCTIONS ---');
+		expect(template).toBeGreaterThan(-1);
+		expect(instructions).toBeGreaterThan(template);
+		expect(prompt.slice(instructions)).toContain('Prefer small commits.');
 	});
 
 	// Issue #1242: SWARM renders the commit subject; the agent supplies its parts only.
