@@ -4,6 +4,7 @@ import { Server } from 'lucide-react';
 import { Badge } from '@/components/ui/badge.js';
 import { trpc } from '@/lib/trpc.js';
 import { routabilityBlockers } from '@/lib/worker-enrollment-view.js';
+import { workerInstallCommand } from '@/lib/worker-install-command.js';
 import { WORKERS_REFETCH_MS } from '@/lib/workers-refresh.js';
 import type { OwnerEnrollment, OwnerWorker } from '@/types/workers.js';
 
@@ -216,9 +217,12 @@ export function MyWorkersPanel() {
 				<Server className="w-12 h-12 stroke-1 text-zinc-700 mx-auto" />
 				<p className="text-sm text-zinc-400">You don't operate any workers yet.</p>
 				<p className="text-xs text-zinc-500">
-					A machine appears here once you register it with{' '}
-					<span className="font-mono">swarm workers register</span>. Open it from this tab to enroll
-					it in a project and make it available.
+					To make a machine a worker, run{' '}
+					<span className="font-mono break-all">
+						{workerInstallCommand(window.location.origin)}
+					</span>{' '}
+					in its checkout of the project. It appears here once registered; open it from this tab to
+					manage its enrollments and availability.
 				</p>
 			</div>
 		);

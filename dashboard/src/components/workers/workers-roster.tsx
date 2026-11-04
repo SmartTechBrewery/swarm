@@ -9,6 +9,7 @@ import { WorkersTable } from '@/components/workers/workers-table.js';
 import { canViewInstanceWide } from '@/lib/instance-admin.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
 import { useCurrentUser } from '@/lib/use-current-user.js';
+import { workerInstallCommand } from '@/lib/worker-install-command.js';
 import { filterWorkersBySearch } from '@/lib/worker-search.js';
 import { WORKERS_REFETCH_MS } from '@/lib/workers-refresh.js';
 import type { WorkerRow } from '@/types/workers.js';
@@ -164,8 +165,9 @@ export function WorkersRoster({ projectId, canAdminister = false }: WorkersRoste
 			<Server className="w-12 h-12 stroke-1 text-zinc-700 mx-auto" />
 			<p className="text-sm text-zinc-400">No workers to show.</p>
 			<p className="text-xs text-zinc-500">
-				A machine appears here once it is registered with{' '}
-				<span className="font-mono">swarm workers register</span> and enrolled in{' '}
+				A machine appears here once{' '}
+				<span className="font-mono break-all">{workerInstallCommand(window.location.origin)}</span>{' '}
+				has been run in its checkout of the project and it is enrolled in{' '}
 				{projectId ? 'this project' : 'a project you can access'}.
 			</p>
 		</div>

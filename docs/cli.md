@@ -1250,7 +1250,11 @@ The command a **clone-free** worker host runs (issues #1283, #1311): the launche
 package's `bin/swarm-worker.js` (`npm run build:worker-launcher`), or the same file in
 a clone after `npm run build`. It needs only Node >= 22, and it reads and writes no
 `.env` — each command is handed its installation's URL by a flag, an answer, or a
-worker profile.
+worker profile. A worker host gets it from its installation, with no clone:
+`curl -fsSL https://<installation>/install.sh | sh`, run in the project checkout,
+installs it and runs `setup` (`… | sh -s -- <subcommand> [flags]` runs another
+command, or passes flags to `setup`); see
+[`docs/onboarding-worker.md`](./onboarding-worker.md#the-whole-thing-end-to-end).
 
 ```bash
 swarm-worker setup [--control-plane-url <url>] [--email <email>] [--password-file <path|->]

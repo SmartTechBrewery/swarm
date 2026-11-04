@@ -15,11 +15,15 @@ macOS only — launchd is. On Linux the equivalent is a `systemd --user` unit ru
 the same command with `WorkingDirectory=` set to the checkout; the script says so
 rather than half-working.
 
-A worker that does not exist yet does not need this command run by hand:
+A worker that does not exist yet does not need this command run by hand. The
+installation's installer, `curl -fsSL https://<installation>/install.sh | sh` run
+in the project checkout ([`swarm-worker setup`](./cli.md#swarm-worker-setup)), ends
+by running the launcher package's own `swarm-worker-agent install --profile
+<worker-id>` (see [Profile-based workers](#profile-based-workers)), and so does
+`swarm-worker migrate` for a worker moving off a clone. From a SWARM clone,
 [`swarm workers setup`](./cli.md#swarm-workers) registers and enrolls it from its
 checkout and ends by running `swarm-worker-agent install` there (`setup --profile`:
-`swarm-worker-agent install --profile <worker-id>`, see
-[Profile-based workers](#profile-based-workers)).
+`swarm-worker-agent install --profile <worker-id>`).
 
 ## Usage
 
@@ -67,7 +71,10 @@ or `swarm workers setup` through `node <clone>/bin/swarm.js`. A bare
 same clone keeps the agent on it.
 
 Serving a second installation from one machine is laid out end to end in
-[`onboarding-worker.md`](./onboarding-worker.md#serving-a-second-installation-from-the-same-machine).
+[`onboarding-worker.md`](./onboarding-worker.md#serving-a-second-installation-from-the-same-machine):
+with the launcher, each installation's `install.sh` installs its own profile agent,
+labelled by that installation's host (below); the one-clone-per-installation route is
+[`onboarding-worker.md`](./onboarding-worker.md#one-swarm-clone-per-installation).
 
 | What | Where |
 | --- | --- |
@@ -81,7 +88,8 @@ sharing a basename (`~/work/api` and `~/oss/api`) still get distinct labels.
 
 ## Profile-based workers
 
-A **profile-based** worker (`swarm workers setup --profile`, issue #1296) is started
+A **profile-based** worker (`install.sh` / `swarm-worker setup`, issue #1311, or
+`swarm workers setup --profile` from a clone, issue #1296) is started
 by `swarm-launcher run <worker-id>` from its profile, `~/.swarm/workers/<worker-id>/
 profile.json`, rather than by `swarm run:worker` in a checkout
 ([`MANUAL.md`](./MANUAL.md), "Profile-based workers"). `--profile <worker-id>`
@@ -120,7 +128,8 @@ running it.
 - **`update` never restarts a profile agent.** It restarts only agents running
   `run:worker`: a profile agent's daemon runs the runtime its control plane names,
   not this installation's build, so restarting it onto a pull would change nothing.
-  `update --profile` is refused. Updating profile workers is #1282's.
+  `update --profile` is refused. A profile worker is updated by its installation
+  instead ([`onboarding-worker.md`](./onboarding-worker.md#updating-a-runtime-based-worker)).
 - **It runs this installation's launcher**, for the same reason a clone agent runs
   this installation's `swarm`. `<installation>` is whatever the script ships in: a
   SWARM clone, which needs to be built (`npm run build`), since `bin/swarm-worker.js`
