@@ -18,9 +18,13 @@
  * so a concurrent reader never sees half a record. Nothing here prints it.
  *
  * **The launcher's own bookkeeping lives beside it in `state.json`**
- * (`{ lastRuntimeVersion, startedAt }`), so starting a worker never rewrites the
- * file holding the credential. It is what lets a worker start on the version it
- * last ran when its control plane is briefly unreachable.
+ * (`{ lastRuntimeVersion, startedAt, selectedVersion? }`), so starting a worker never
+ * rewrites the file holding the credential. `lastRuntimeVersion` is what lets a
+ * worker start on the version it last ran when its control plane is briefly
+ * unreachable; `selectedVersion` (issue #1302) is the version the worker is *meant*
+ * to run — recorded by the launcher from the manifest the first time, and by the
+ * daemon itself when `swarm workers update` moves it to another release. It is
+ * optional so a `state.json` written before it existed still parses.
  *
  * Bundle-safe like the rest of `src/launcher/`: nothing from the daemon graph.
  */
@@ -53,6 +57,8 @@ export type WorkerProfile = z.infer<typeof WorkerProfileSchema>;
 export const WorkerStateSchema = z.object({
 	lastRuntimeVersion: z.string().min(1),
 	startedAt: z.string().datetime(),
+	/** The version the launcher starts this worker on while it is installed (issue #1302). */
+	selectedVersion: z.string().min(1).optional(),
 });
 export type WorkerState = z.infer<typeof WorkerStateSchema>;
 
@@ -181,6 +187,24 @@ export function readWorkerState(
 
 export function writeWorkerState(workerId: string, state: WorkerState, homeDir?: string): string {
 	return writeRecord(workerStatePath(workerId, homeDir), WorkerStateSchema.parse(state));
+}
+
+/**
+ * Merge `patch` into a worker's state and write it back, leaving every other field
+ * as it was. Answers like {@link readWorkerState} when there is no readable state to
+ * update, and writes nothing in that case: the launcher writes the state before it
+ * starts the daemon, so a daemon finding none was not started by a launcher.
+ */
+export function updateWorkerState(
+	workerId: string,
+	patch: Partial<WorkerState>,
+	homeDir?: string,
+): WorkerState | null | undefined {
+	const state = readWorkerState(workerId, homeDir);
+	if (!state) return state;
+	const record = WorkerStateSchema.parse({ ...state, ...patch });
+	writeRecord(workerStatePath(workerId, homeDir), record);
+	return record;
 }
 
 /** Write one record owner-only, atomically, and return the path written. */

@@ -8,6 +8,7 @@ import { DAEMON_ENV_KEYS, type LauncherDeps, run } from '@/launcher/main.js';
 import { RUNTIME_ENTRYPOINT, runtimesDir } from '@/launcher/runtime-store.js';
 import {
 	readWorkerState,
+	updateWorkerState,
 	workerProfileDir,
 	writeWorkerProfile,
 	writeWorkerState,
@@ -21,6 +22,7 @@ import {
 
 const KEY = makeMinisignKey();
 const CREDENTIAL = 'super-secret-worker-credential';
+const KEY_PATH = '/opt/swarm-launcher/deploy/worker-runtime/minisign.pub';
 const AMBIENT = {
 	PATH: '/usr/bin',
 	HOME: '/home/operator',
@@ -29,6 +31,8 @@ const AMBIENT = {
 	SWARM_WORKER_CREDENTIAL: 'stale-credential',
 	SWARM_WORKER_REPO_ROOT: '/stale/checkout',
 	SWARM_LOG_FILE: '/stale/worker.log',
+	SWARM_WORKER_ID: 'stale-worker',
+	SWARM_RUNTIME_TRUSTED_KEY: '/stale/minisign.pub',
 };
 
 interface ControlPlane {
@@ -120,12 +124,24 @@ describe('swarm-launcher', () => {
 			homeDir: home,
 		});
 
+	/** A state written before selections existed. */
+	const clearSelection = (workerId: string) => {
+		const state = readWorkerState(workerId, home);
+		if (!state) throw new Error('no state');
+		writeWorkerState(
+			workerId,
+			{ lastRuntimeVersion: state.lastRuntimeVersion, startedAt: state.startedAt },
+			home,
+		);
+	};
+
 	const deps = (planes: ControlPlane[], overrides: Partial<LauncherDeps> = {}): LauncherDeps => ({
 		homeDir: home,
 		fetch: fakeFetch(planes),
 		env: AMBIENT,
 		execPath: '/usr/local/bin/node',
 		trustedPublicKey: KEY.publicKey,
+		trustedKeyPath: KEY_PATH,
 		chdir: (dir) => {
 			cwd = dir;
 		},
@@ -152,7 +168,7 @@ describe('swarm-launcher', () => {
 		commit: 'b'.repeat(40),
 	};
 
-	it('installs the named runtime and execs it with exactly the four daemon vars from the profile', async () => {
+	it('installs the named runtime and execs it with exactly the daemon vars from the profile', async () => {
 		profile('worker-one', V1.url);
 		expect(await run(['run', 'worker-one'], deps([V1]))).toBe(0);
 
@@ -169,15 +185,68 @@ describe('swarm-launcher', () => {
 			SWARM_WORKER_CREDENTIAL: CREDENTIAL,
 			SWARM_WORKER_REPO_ROOT: [checkout, extra].join(delimiter),
 			SWARM_LOG_FILE: join(profileDir, 'logs', 'worker.log'),
+			SWARM_WORKER_ID: 'worker-one',
+			SWARM_RUNTIME_TRUSTED_KEY: KEY_PATH,
 		});
+		// The path of the launcher's key, never its contents.
+		expect(Object.values(exec.env).join('\n')).not.toContain(KEY.publicKey.split('\n')[1]);
 		// The launcher adds nothing beyond the daemon's own contract.
 		const added = Object.keys(exec.env).filter((key) => !(key in AMBIENT));
 		expect(added.every((key) => (DAEMON_ENV_KEYS as readonly string[]).includes(key))).toBe(true);
 		expect(statSync(join(profileDir, 'logs')).isDirectory()).toBe(true);
+		// With no selection yet, the manifest's version becomes it.
 		expect(readWorkerState('worker-one', home)).toEqual({
 			lastRuntimeVersion: '1.0.0',
 			startedAt: '2026-11-04T12:00:00.000Z',
+			selectedVersion: '1.0.0',
 		});
+	});
+
+	it('hands the daemon no trusted key path when the launcher has no key', async () => {
+		profile('worker-one', V1.url);
+		await run(['run', 'worker-one'], deps([V1], { trustedKeyPath: null }));
+		expect(execs[0].env.SWARM_WORKER_ID).toBe('worker-one');
+		expect('SWARM_RUNTIME_TRUSTED_KEY' in execs[0].env).toBe(false);
+	});
+
+	it('starts the selected version even when the manifest names another', async () => {
+		profile('worker-one', V1.url);
+		// Installs 1.0.0 and selects it.
+		await run(['run', 'worker-one'], deps([V1]));
+		execs = [];
+		// The installation now serves 2.0.0, which does not move a worker off its selection.
+		const moved = { ...V2, url: V1.url };
+		expect(await run(['run', 'worker-one'], deps([moved]))).toBe(0);
+		expect(execs[0].args[1]).toBe(join(runtimesDir(home), '1.0.0', RUNTIME_ENTRYPOINT));
+		expect(existsSync(join(runtimesDir(home), '2.0.0'))).toBe(false);
+
+		// A selection the daemon recorded (`swarm workers update`) is what starts next.
+		profile('worker-two', V2.url);
+		await run(['run', 'worker-two'], deps([V2]));
+		updateWorkerState('worker-one', { selectedVersion: '2.0.0' }, home);
+		execs = [];
+		expect(await run(['run', 'worker-one'], deps([{ ...V1, manifest: 'unreachable' }]))).toBe(0);
+		expect(execs[0].args[1]).toBe(join(runtimesDir(home), '2.0.0', RUNTIME_ENTRYPOINT));
+		expect(readWorkerState('worker-one', home)).toMatchObject({
+			lastRuntimeVersion: '2.0.0',
+			selectedVersion: '2.0.0',
+		});
+	});
+
+	it('asks the control plane when the selected version is not installed, and selects its answer', async () => {
+		profile('worker-one', V1.url);
+		writeWorkerState(
+			'worker-one',
+			{
+				lastRuntimeVersion: '0.9.0',
+				startedAt: '2026-11-01T00:00:00.000Z',
+				selectedVersion: '0.9.0',
+			},
+			home,
+		);
+		expect(await run(['run', 'worker-one'], deps([V1]))).toBe(0);
+		expect(execs[0].args[1]).toBe(join(runtimesDir(home), '1.0.0', RUNTIME_ENTRYPOINT));
+		expect(readWorkerState('worker-one', home)?.selectedVersion).toBe('1.0.0');
 	});
 
 	it('never puts the credential in argv or in its output', async () => {
@@ -216,6 +285,7 @@ describe('swarm-launcher', () => {
 	it('does not fall back to the last version when the named one fails verification', async () => {
 		profile('worker-one', V1.url);
 		await run(['run', 'worker-one'], deps([V1]));
+		clearSelection('worker-one');
 		execs = [];
 		expect(await run(['run', 'worker-one'], deps([{ ...V2, url: V1.url, tamper: true }]))).toBe(1);
 		expect(execs).toEqual([]);
@@ -235,6 +305,7 @@ describe('swarm-launcher', () => {
 	it('falls back to the last installed version when the control plane is unreachable', async () => {
 		profile('worker-one', V1.url);
 		await run(['run', 'worker-one'], deps([V1]));
+		clearSelection('worker-one');
 		execs = [];
 		output = [];
 
@@ -249,6 +320,8 @@ describe('swarm-launcher', () => {
 			),
 		).toBe(0);
 		expect(execs).toHaveLength(2);
+		// Nothing the control plane named, so nothing newly selected.
+		expect(readWorkerState('worker-one', home)?.selectedVersion).toBeUndefined();
 	});
 
 	it('fails when the control plane is unreachable and no last version is installed', async () => {

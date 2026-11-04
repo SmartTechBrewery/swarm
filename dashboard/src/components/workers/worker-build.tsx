@@ -52,6 +52,12 @@ export function formatWorkerBuild(
  * equality is what was actually checked. The control plane cannot cheaply prove the
  * worker's commit is an ancestor of its own — it may never have fetched it — so
  * naming a distance would be inventing one.
+ *
+ * The advice is the one move that works for both kinds of worker (issue #1302): a
+ * clone-based one checks out and rebuilds its install root, a runtime-based
+ * (launcher-run) one installs a signed release and selects it, and both are asked
+ * with `swarm workers update`. A runtime declares the commit stamped into it, so it
+ * is compared, and marked, exactly as a clone is.
  */
 export function WorkerBuildBadge({
 	buildIsCurrent,
@@ -70,7 +76,7 @@ export function WorkerBuildBadge({
 	return (
 		<Badge
 			tone="caution"
-			title={`This machine's SWARM build differs from the control plane's${against}. It is running code from a different checkout state — restart the daemon after updating its checkout.`}
+			title={`This machine's SWARM build differs from the control plane's${against}. Move it to the control plane's build with \`swarm workers update\`.`}
 		>
 			Outdated
 		</Badge>

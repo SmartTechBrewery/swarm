@@ -1699,6 +1699,19 @@ describe('buildMatchesControlPlane (issue #925)', () => {
 		);
 	});
 
+	// Issue #1302: a runtime-based worker declares its runtime's stamp — a version and
+	// never dirty. On another commit than the control plane's it is outdated, whatever
+	// its version says; on the same commit it is current.
+	it('marks a stamped runtime on another commit outdated, and on the same commit current', () => {
+		const controlPlane = { commit: COMMIT, dirty: false, version: '1.6.0' };
+		expect(
+			buildMatchesControlPlane({ commit: OTHER, dirty: false, version: '1.5.0' }, controlPlane),
+		).toBe(false);
+		expect(
+			buildMatchesControlPlane({ commit: COMMIT, dirty: false, version: '1.6.0' }, controlPlane),
+		).toBe(true);
+	});
+
 	it('matches an abbreviated stamped commit against the full id it prefixes', () => {
 		expect(
 			buildMatchesControlPlane(

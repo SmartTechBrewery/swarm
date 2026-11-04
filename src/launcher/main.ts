@@ -3,20 +3,31 @@
  * installation names (issue #1281, phase 2).
  *
  * `swarm-launcher run <workerId>` reads `~/.swarm/workers/<workerId>/profile.json`
- * (`./worker-profile.ts`), asks that worker's control plane which runtime it serves
- * (`fetchRuntimeManifest`), makes sure that exact version is installed and verified
- * under `~/.swarm/runtimes/<version>/` (`ensureRuntime`), and then *becomes* that
- * runtime's daemon. Two profiles pointing at two installations on two versions are
+ * (`./worker-profile.ts`), decides which runtime version to start, makes sure that
+ * exact version is installed and verified under `~/.swarm/runtimes/<version>/`
+ * (`ensureRuntime`), and then *becomes* that runtime's daemon. The version is the
+ * worker's **selected** one (`state.json`'s `selectedVersion`, issue #1302) while it
+ * is installed — the daemon records a new selection when `swarm workers update`
+ * moves it to another release, then exits for its supervisor to start it here again.
+ * Only a worker with no installed selection asks its control plane which runtime it
+ * serves (`fetchRuntimeManifest`), and that version is then recorded as its
+ * selection. Two profiles pointing at two installations on two versions are
  * two independent daemons, each on its own runtime directory, with no SWARM clone
  * and no `.env` anywhere.
  *
  * Load-bearing rules:
  *
- *   - **The contract with the runtime is only the daemon's existing env vars**:
+ *   - **The contract with the runtime is only the daemon's env vars**:
  *     `SWARM_CONTROL_PLANE_URL`, `SWARM_WORKER_CREDENTIAL`, `SWARM_WORKER_REPO_ROOT`
  *     (`path.delimiter`-separated, primary first) and `SWARM_LOG_FILE`
- *     (`<profileDir>/logs/worker.log`). The four always come from the profile and
- *     overwrite any ambient value; the rest of the environment is carried over,
+ *     (`<profileDir>/logs/worker.log`), plus, since issue #1302, `SWARM_WORKER_ID`
+ *     (what tells a daemon it is launcher-run, and whose `state.json` to record a new
+ *     selection in) and `SWARM_RUNTIME_TRUSTED_KEY` — the absolute path of the
+ *     *launcher's* `minisign.pub`, set only when that file exists, so the daemon
+ *     verifies a release it installs against the launcher's trust anchor and never
+ *     against a copy shipped inside a runtime. These always come from the launcher
+ *     and overwrite any ambient value (an ambient `SWARM_RUNTIME_TRUSTED_KEY` is
+ *     removed when the launcher has no key); the rest of the environment is carried over,
  *     because `PATH`/`HOME` are what the agent CLIs need and `XPC_SERVICE_NAME` is
  *     half of the supervision read (`../lib/worker-supervision.ts`). The daemon runs
  *     in the profile directory, and nothing passes `--env-file`.
@@ -26,7 +37,8 @@
  *     The fallback below is for a control plane that gave no answer, not for one
  *     whose answer failed verification.
  *   - **A briefly unreachable control plane does not stop a worker from starting.**
- *     When the manifest cannot be fetched or says `available: false`, the version
+ *     With no installed selection, when the manifest cannot be fetched or says
+ *     `available: false`, the version
  *     recorded in `state.json` the last time this worker started is used if it is
  *     still installed (it was verified when it was installed, and an installed
  *     version is never modified). With none, the launcher exits 1 with the reason.
@@ -80,6 +92,8 @@ export const DAEMON_ENV_KEYS = [
 	'SWARM_WORKER_CREDENTIAL',
 	'SWARM_WORKER_REPO_ROOT',
 	'SWARM_LOG_FILE',
+	'SWARM_WORKER_ID',
+	'SWARM_RUNTIME_TRUSTED_KEY',
 ] as const;
 
 const PREFIX = 'swarm-launcher';
@@ -92,7 +106,8 @@ Usage:
 
 \`run\` asks the worker's control plane which runtime version it serves, installs
 and verifies that version under ~/.swarm/runtimes/<version>/ when it is missing,
-and replaces this process with its daemon. The daemon gets the profile's
+and replaces this process with its daemon. A worker moved to another release with
+\`swarm workers update\` starts on that selected version instead. The daemon gets the profile's
 control-plane URL, credential and checkouts through its usual environment
 variables, runs in the profile directory, and logs to <profileDir>/logs/worker.log.
 When the control plane cannot be reached, the version this worker last started on
@@ -117,6 +132,8 @@ export interface LauncherDeps {
 	) => Promise<number>;
 	/** `null` for none; omitted to read {@link TRUSTED_KEY_PATH}. */
 	trustedPublicKey?: string | null;
+	/** The key file handed to the daemon; `null` for none, omitted for {@link trustedKeyFile}. */
+	trustedKeyPath?: string | null;
 	execPath?: string;
 	now?: () => number;
 	stdout?: (line: string) => void;
@@ -132,6 +149,12 @@ export function readTrustedPublicKey(installRoot = LAUNCHER_INSTALL_ROOT): strin
 	} catch {
 		return undefined;
 	}
+}
+
+/** The absolute path of the launcher's trusted key, or `undefined` when there is none. */
+export function trustedKeyFile(installRoot = LAUNCHER_INSTALL_ROOT): string | undefined {
+	const path = join(installRoot, TRUSTED_KEY_PATH);
+	return existsSync(path) ? path : undefined;
 }
 
 function defaultExecve(): Execve | null {
@@ -163,6 +186,8 @@ function defaultSpawnDaemon(
 interface Resolved {
 	version: string;
 	entrypoint: string;
+	/** The version to record as the worker's selection, when this start chose one. */
+	select?: string;
 }
 
 interface Io {
@@ -172,19 +197,30 @@ interface Io {
 }
 
 /**
- * The runtime this worker starts on: the version its control plane names, ensured
- * and verified, or — only when the control plane named none — the version it last
- * started on, while that is still installed.
+ * The runtime this worker starts on: its selected version while that is installed;
+ * otherwise the version its control plane names, ensured and verified, and recorded
+ * as the selection; or — only when the control plane named none — the version it
+ * last started on, while that is still installed.
  */
 async function resolveRuntime(
 	profile: WorkerProfile,
 	deps: LauncherDeps,
 	io: Io,
 ): Promise<Resolved | { error: string }> {
+	const state = readWorkerState(profile.workerId, deps.homeDir);
+	// Verified when it was installed, and an installed version is never modified.
+	const selected = state?.selectedVersion
+		? installedRuntime(state.selectedVersion, deps.homeDir)
+		: undefined;
+	if (selected) return { version: selected.version, entrypoint: selected.entrypoint };
+	if (state?.selectedVersion)
+		io.warn(
+			`v${state.selectedVersion}, the version this worker is selected to run, is not installed; asking its control plane`,
+		);
+
 	const manifest = await fetchRuntimeManifest(profile.controlPlaneUrl, { fetch: deps.fetch });
 	if ('error' in manifest || !manifest.available) {
 		const reason = 'error' in manifest ? manifest.error : manifest.reason;
-		const state = readWorkerState(profile.workerId, deps.homeDir);
 		const last = state ? installedRuntime(state.lastRuntimeVersion, deps.homeDir) : undefined;
 		if (!last)
 			return {
@@ -211,7 +247,7 @@ async function resolveRuntime(
 	});
 	if ('error' in ensured) return { error: `v${manifest.version} is not started: ${ensured.error}` };
 	if (ensured.installed) io.info(`installed and verified v${ensured.version} at ${ensured.dir}`);
-	return { version: ensured.version, entrypoint: ensured.entrypoint };
+	return { version: ensured.version, entrypoint: ensured.entrypoint, select: ensured.version };
 }
 
 async function runWorker(workerId: string, deps: LauncherDeps, io: Io): Promise<number> {
@@ -238,9 +274,15 @@ async function runWorker(workerId: string, deps: LauncherDeps, io: Io): Promise<
 	}
 
 	const now = deps.now ?? Date.now;
+	const selectedVersion =
+		runtime.select ?? readWorkerState(workerId, deps.homeDir)?.selectedVersion;
 	writeWorkerState(
 		workerId,
-		{ lastRuntimeVersion: runtime.version, startedAt: new Date(now()).toISOString() },
+		{
+			lastRuntimeVersion: runtime.version,
+			startedAt: new Date(now()).toISOString(),
+			...(selectedVersion ? { selectedVersion } : {}),
+		},
 		deps.homeDir,
 	);
 
@@ -253,7 +295,13 @@ async function runWorker(workerId: string, deps: LauncherDeps, io: Io): Promise<
 		SWARM_WORKER_CREDENTIAL: profile.credential,
 		SWARM_WORKER_REPO_ROOT: profile.repoRoots.join(delimiter),
 		SWARM_LOG_FILE: join(logsDir, 'worker.log'),
+		SWARM_WORKER_ID: workerId,
 	};
+	// The path, never the key itself, and only the launcher's own: an ambient value
+	// would let the environment pick the key a daemon trusts.
+	const trustedKeyPath = deps.trustedKeyPath === undefined ? trustedKeyFile() : deps.trustedKeyPath;
+	if (trustedKeyPath) env.SWARM_RUNTIME_TRUSTED_KEY = trustedKeyPath;
+	else delete env.SWARM_RUNTIME_TRUSTED_KEY;
 	// The worker id, version and checkouts, never the credential.
 	io.info(
 		`starting worker '${workerId}' on v${runtime.version} for ${profile.repoRoots.join(', ')}…`,

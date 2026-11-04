@@ -66,6 +66,14 @@
  * `../lib/build-identity.ts`; a daemon on a pre-#975 build still reports it, so it
  * stays on the wire.)
  *
+ * **A launcher-run daemon moves differently and is reported the same** (issue #1302).
+ * A runtime-based worker has no install root to check out, so `./worker-main.ts`
+ * injects `applyRuntimeUpdate` (`./runtime-update.ts`) as `apply` when the launcher
+ * set `SWARM_WORKER_ID`: it installs the requested signed release beside the others
+ * and records it as the worker's selected version, and the exit on `applied` is what
+ * has the launcher start it again on that version. The wait, the statuses and the
+ * report below are shared unchanged; only the mechanism differs.
+ *
  * The exit deliberately goes through the daemon's own graceful path rather than a
  * bare `process.exit`: the session is released so the control plane frees the lease
  * promptly, quota reporting stops, and the checkout lock is dropped so the restarted
@@ -472,8 +480,9 @@ function describeOutcome(
 			return {
 				status: 'applied',
 				message:
+					outcome.message ??
 					`Applied: the SWARM install root moved from ${outcome.previousCommit} to ` +
-					`${outcome.commit} and was rebuilt there. The daemon is restarting into it.`,
+						`${outcome.commit} and was rebuilt there. The daemon is restarting into it.`,
 			};
 		case 'already-current': {
 			// The files are on the target; whether *this* process is running them is a

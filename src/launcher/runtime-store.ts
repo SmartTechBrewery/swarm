@@ -25,6 +25,14 @@
  *   - **The bearer goes only to the control-plane origin.** `artifact.url` may be
  *     absolute (a runtime served elsewhere), and the credential must not follow it
  *     there; a request that carries it also refuses to follow a redirect.
+ *   - **One download per version per host** (issue #1302): download, verify and
+ *     install run under `.locks/<version>.lock`, created exclusively (`'wx'`). A
+ *     second caller for the same version waits for the holder, then finds the
+ *     version installed and returns it. The lock is an economy, not the
+ *     correctness guarantee — that stays the single atomic `rename` above — so a
+ *     holder that died (its pid is gone) or a lock older than
+ *     {@link STALE_STAGING_MS} is simply reclaimed, and the rare race two
+ *     reclaimers can lose costs one duplicate download, never a corrupt install.
  *   - **Nothing from the daemon graph is imported**: the launcher bundles this
  *     module, and the manifest contract it reads is `node:`-free for that reason.
  */
@@ -32,16 +40,20 @@
 import { createHash } from 'node:crypto';
 import {
 	chmodSync,
+	closeSync,
 	existsSync,
 	lstatSync,
 	mkdirSync,
 	mkdtempSync,
+	openSync,
 	readdirSync,
 	renameSync,
 	rmSync,
 	statSync,
+	unlinkSync,
+	writeSync,
 } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, hostname } from 'node:os';
 import { join, resolve } from 'node:path';
 import { z } from 'zod';
 import {
@@ -53,7 +65,7 @@ import {
 	type WorkerRuntimeManifest,
 	WorkerRuntimeManifestSchema,
 } from '../transport/runtime-manifest.js';
-import { readJson } from '../worktree/local-lock.js';
+import { isExpired, pathOlderThan, pidIsLive, readJson } from '../worktree/local-lock.js';
 import { verifyMinisign } from './minisign.js';
 import { extractRuntimeTarball } from './runtime-tar.js';
 
@@ -63,8 +75,21 @@ export const RUNTIME_ENTRYPOINT = 'dist/transport/connect-entry.mjs';
 /** In-flight installs. Never read, never started; swept once stale. */
 const STAGING_DIR = '.staging';
 
+/** Per-version install locks. Never versions either. */
+const LOCKS_DIR = '.locks';
+
 /** A staging entry older than this was left by a killed install. A constant, not a setting. */
 export const STALE_STAGING_MS = 60 * 60 * 1000;
+
+/** How often a caller waiting on another install of the same version looks again. */
+export const INSTALL_LOCK_POLL_MS = 500;
+
+const InstallLockSchema = z.object({
+	pid: z.number().int(),
+	hostname: z.string(),
+	createdAt: z.string(),
+});
+type InstallLock = z.infer<typeof InstallLockSchema>;
 
 const BuildInfoSchema = z.object({ commit: z.string().min(1).optional() }).passthrough();
 
@@ -181,7 +206,7 @@ export function listInstalledRuntimes(homeDir?: string): InstalledRuntime[] {
 		return [];
 	}
 	return names
-		.filter((name) => name !== STAGING_DIR)
+		.filter((name) => name !== STAGING_DIR && name !== LOCKS_DIR)
 		.sort()
 		.flatMap((name) => installedRuntime(name, homeDir) ?? []);
 }
@@ -229,6 +254,75 @@ function sweepStaleStaging(stagingRoot: string, now: number): void {
 		} catch {
 			// Vanished underneath us: another install swept or published it.
 		}
+	}
+}
+
+/** Whether a lock on disk was left by a process that can no longer release it. */
+function lockIsStale(path: string, now: number): boolean {
+	const holder = readJson(path, InstallLockSchema);
+	if (holder === null) return false;
+	// Unreadable: possibly a holder between creating the file and writing it, so it is
+	// judged by the file's own age rather than reclaimed on sight.
+	if (holder === undefined) return pathOlderThan(path, STALE_STAGING_MS, now);
+	if (isExpired(holder.createdAt, STALE_STAGING_MS, now)) return true;
+	// A pid means something only on the host that recorded it.
+	return holder.hostname === hostname() && !pidIsLive(holder.pid);
+}
+
+/** `true` when this call created the lock, `false` when another caller holds it. Throws on anything else. */
+function tryCreateLock(path: string, record: InstallLock): boolean {
+	let fd: number;
+	try {
+		fd = openSync(path, 'wx', 0o600);
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code === 'EEXIST') return false;
+		throw err;
+	}
+	try {
+		writeSync(fd, `${JSON.stringify(record)}\n`);
+	} finally {
+		closeSync(fd);
+	}
+	return true;
+}
+
+/**
+ * Take `<runtimes>/.locks/<version>.lock`, waiting while a live holder has it and
+ * reclaiming it from a dead or expired one. Resolves to the release function.
+ */
+async function acquireInstallLock(
+	version: string,
+	homeDir: string | undefined,
+	now: () => number,
+	pollMs: number,
+): Promise<() => void> {
+	const dir = join(runtimesDir(homeDir), LOCKS_DIR);
+	mkdirSync(dir, { recursive: true, mode: 0o700 });
+	const path = join(dir, `${version}.lock`);
+	while (true) {
+		const record: InstallLock = {
+			pid: process.pid,
+			hostname: hostname(),
+			createdAt: new Date(now()).toISOString(),
+		};
+		if (tryCreateLock(path, record)) {
+			return () => {
+				// Only our own record is removed: a lock reclaimed from us after an hour now
+				// belongs to somebody else.
+				const current = readJson(path, InstallLockSchema);
+				if (current && current.pid === record.pid && current.createdAt === record.createdAt)
+					rmSync(path, { force: true });
+			};
+		}
+		if (lockIsStale(path, now())) {
+			try {
+				unlinkSync(path);
+			} catch {
+				// Another waiter reclaimed it first.
+			}
+			continue;
+		}
+		await new Promise((resolvePromise) => setTimeout(resolvePromise, pollMs));
 	}
 }
 
@@ -365,13 +459,16 @@ export interface EnsureRuntimeInput {
 	homeDir?: string;
 	fetch?: Fetch;
 	now?: () => number;
+	/** How often to look again while another caller installs this version. */
+	lockPollMs?: number;
 }
 
 /**
  * Make `manifest`'s runtime available on this host: return it when it is already
- * installed, otherwise download, verify and install it atomically. Never throws;
- * every refusal is an `{ error }` naming the check that failed, with nothing left
- * under `<version>/`.
+ * installed, otherwise download, verify and install it atomically, under the
+ * version's install lock so a second caller reuses the first one's result rather
+ * than downloading it again. Never throws; every refusal is an `{ error }` naming
+ * the check that failed, with nothing left under `<version>/`.
  */
 export async function ensureRuntime(
 	input: EnsureRuntimeInput,
@@ -396,17 +493,41 @@ export async function ensureRuntime(
 			error: `no trusted runtime signing key is configured, so v${version} cannot be verified and is not installed`,
 		};
 
-	const data = await download(
-		manifest,
-		input.controlPlaneUrl,
-		input.bearer,
-		input.fetch ?? globalThis.fetch,
-	);
-	if (!Buffer.isBuffer(data)) return data;
-	const refused = verifyArtifact(manifest, data, trustedPublicKey);
-	if (refused) return refused;
+	const now = input.now ?? Date.now;
+	let release: () => void;
+	try {
+		release = await acquireInstallLock(
+			version,
+			homeDir,
+			now,
+			input.lockPollMs ?? INSTALL_LOCK_POLL_MS,
+		);
+	} catch (err) {
+		return { error: `could not take the install lock for v${version}: ${errorMessage(err)}` };
+	}
+	try {
+		// The holder this call waited for may have installed it.
+		const installed = existingInstall(manifest, homeDir);
+		if (installed) return installed;
 
-	return installVerified(manifest, data, homeDir, (input.now ?? Date.now)());
+		const data = await download(
+			manifest,
+			input.controlPlaneUrl,
+			input.bearer,
+			input.fetch ?? globalThis.fetch,
+		);
+		if (!Buffer.isBuffer(data)) return data;
+		const refused = verifyArtifact(manifest, data, trustedPublicKey);
+		if (refused) return refused;
+
+		return installVerified(manifest, data, homeDir, now());
+	} finally {
+		try {
+			release();
+		} catch {
+			// A lock left behind is reclaimed once its holder is gone.
+		}
+	}
 }
 
 /**

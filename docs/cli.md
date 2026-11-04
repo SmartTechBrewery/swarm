@@ -927,7 +927,20 @@ unchanged.
   the worker to drain, so drain every daemon on such a machine before updating it. A
   daemon comes over on its own request: this command moves one machine, while
   `update --all`, `request-update` and the staged rollout ask every machine (see
-  [`docs/onboarding-worker.md`](./onboarding-worker.md)). The outcome lands back on the row and is
+  [`docs/onboarding-worker.md`](./onboarding-worker.md)).
+  **A runtime-based worker takes a release version instead** (issue #1302). A worker
+  `swarm-launcher run` starts has no install root to check out: it runs a signed
+  runtime from `~/.swarm/runtimes/<version>/`, so `<ref>` names a **signed release** —
+  `v1.6.0` or `1.6.0`, or the installation's own commit, which names the
+  installation's own release. Its daemon downloads that runtime, verifies its size,
+  checksum and signature against the launcher's trusted key, installs it beside the
+  others, records it as the worker's **selected** version, reports `applied` and
+  exits, and the launcher starts it again on that version. Two workers on one host
+  asked for the same version share one download. A branch, any other commit, or a
+  version with no signed release is `refused`; a failed download or verification is
+  `failed` and leaves the worker on the version it has. The same drain and
+  supervision preconditions apply, but no other worker on the host is waited for or
+  refused — runtimes are immutable and each worker selects its own. The outcome lands back on the row and is
   shown by `list` as `update <ref> pending` while it is outstanding and
   `update <ref> <outcome>` once answered — `applied`, `adopted`, `already-current`,
   `declined`, `refused`, or `failed`. `applied` and `adopted` both restart the daemon;
