@@ -329,7 +329,9 @@ command that takes a `<worker-id>` (`drain`, `undrain`, `update <worker-id>`,
 `set-cli`, `set-scm-credential`, `remove`, `sweep-worktrees`, `enroll`,
 `update-enrollment`, `approve`, `consent`) talks to the installation that worker's
 profile names, using the session `swarm login --control-plane-url <that URL>`
-cached, and refuses an exported `SWARM_CONTROL_PLANE_URL` that names another one.
+cached, and refuses an exported `SWARM_CONTROL_PLANE_URL` that names another one
+(the checkout's own `.env`, which `npm run swarm --` loads into the environment, is
+never held against it).
 `add-checkout` / `remove-checkout` in its primary checkout edit the profile, and
 `swarm run:worker` there exits 1 naming `swarm-launcher run <workerId>`. A worker
 with no profile on the machine is handled exactly as before.

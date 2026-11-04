@@ -74,10 +74,13 @@ subcommand that acts on one `<worker-id>` — `drain`, `undrain`, `update
 `enroll`, `update-enrollment`, `approve`, `consent` — first looks for that worker's
 profile on this machine (`~/.swarm/workers/<worker-id>/profile.json`, written by
 [`workers setup --profile`](#swarm-workers)). When there is one, its control-plane
-URL is used and `.env` is not consulted; the session is the one cached for that URL,
-and a missing one says to run `swarm login --control-plane-url <that URL>`. An
-exported `SWARM_CONTROL_PLANE_URL` that names a different installation is refused,
-naming both URLs, rather than either winning silently. With no profile for the
+URL is used and `.env` is not held against it; the session is the one cached for
+that URL, and a missing one says to run `swarm login --control-plane-url <that URL>`.
+An exported `SWARM_CONTROL_PLANE_URL` that names a different installation is refused,
+naming both URLs, rather than either winning silently. The copy of `.env` that `npm
+run swarm --` loads into the environment (`node --env-file-if-exists=.env`) is not an
+export: an environment value equal to this checkout's `.env` assignment is ignored
+here, so a profile worker of another installation can be managed from any clone. With no profile for the
 worker, the rule above applies unchanged; commands that act on no one worker
 (`list`, `sweeps`, `update --all`, `request-update`) always use it.
 

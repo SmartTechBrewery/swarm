@@ -39,7 +39,11 @@ import {
 	readWorkerProfile,
 	workerProfilePath,
 } from '../../launcher/worker-profile.js';
-import { CONTROL_PLANE_ENV, resolveControlPlaneUrl } from './control-plane-env.js';
+import {
+	CONTROL_PLANE_ENV,
+	envFileControlPlaneUrl,
+	resolveControlPlaneUrl,
+} from './control-plane-env.js';
 import {
 	normalizeControlPlaneUrl,
 	type OperatorSessionCache,
@@ -277,8 +281,11 @@ export interface RequireOperatorSessionOptions {
  * clone the operator happens to be standing in. An explicit flag or exported
  * `SWARM_CONTROL_PLANE_URL` naming a *different* installation is refused with both
  * URLs named, rather than either one quietly winning — `.env` is not an explicit
- * choice and is simply not consulted. With no profile for the worker, nothing
- * here changes.
+ * choice and is not held against the profile. That includes the copy of it
+ * `npm run swarm --` puts in the environment (`node --env-file-if-exists=.env`):
+ * an environment value equal to this checkout's `.env` assignment is read as that
+ * copy, not as an export, since the two cannot otherwise be told apart. With no
+ * profile for the worker, nothing here changes.
  */
 export function requireOperatorSession(
 	options: RequireOperatorSessionOptions = {},
@@ -347,8 +354,8 @@ function profileControlPlaneUrl(
 	const overrides = [
 		{ value: options.controlPlaneUrl, origin: '--control-plane-url', remedy: 'drop it' },
 		{
-			value: process.env[CONTROL_PLANE_ENV],
-			origin: CONTROL_PLANE_ENV,
+			value: exportedControlPlaneUrl(),
+			origin: `the exported ${CONTROL_PLANE_ENV}`,
 			remedy: `unset ${CONTROL_PLANE_ENV}`,
 		},
 	];
@@ -361,4 +368,24 @@ function profileControlPlaneUrl(
 		}
 	}
 	return { url, login: `swarm login --control-plane-url ${url}` };
+}
+
+/**
+ * `SWARM_CONTROL_PLANE_URL` from the environment, unless it is only the copy of
+ * this checkout's `.env` that `npm run swarm --` loads there — `undefined` then,
+ * so the checkout's default never refuses a profile worker of another
+ * installation. A genuinely exported value differing from `.env` still counts
+ * (Node never lets `.env` overwrite an exported variable, so that value is the
+ * operator's own).
+ */
+function exportedControlPlaneUrl(): string | undefined {
+	const ambient = process.env[CONTROL_PLANE_ENV]?.trim();
+	if (!ambient) return undefined;
+	const envFile = envFileControlPlaneUrl();
+	if (
+		envFile !== undefined &&
+		normalizeControlPlaneUrl(envFile) === normalizeControlPlaneUrl(ambient)
+	)
+		return undefined;
+	return ambient;
 }

@@ -355,6 +355,30 @@ describe('requireOperatorSession', () => {
 			expect(readOperatorSessionCache).not.toHaveBeenCalled();
 		});
 
+		// `npm run swarm --` runs under `node --env-file-if-exists=.env`, so the
+		// checkout's own `.env` arrives in `process.env` looking exported.
+		it("uses the profile's URL when the environment only carries this checkout's .env value", () => {
+			process.env.SWARM_CONTROL_PLANE_URL = OTHER;
+			vi.mocked(readFileSync).mockReturnValue(`SWARM_CONTROL_PLANE_URL=${OTHER}/\n`);
+			expect(requireOperatorSession({ workerId: WORKER_ID })).toEqual({
+				session: { controlPlaneUrl: CONTROL_PLANE, token: TOKEN, identifier: 'ada@example.com' },
+			});
+			expect(readOperatorSessionCache).toHaveBeenCalledExactlyOnceWith(CONTROL_PLANE);
+		});
+
+		it('still refuses an exported URL that differs from both the profile and .env', () => {
+			const EXPORTED = 'https://third.example.com';
+			process.env.SWARM_CONTROL_PLANE_URL = EXPORTED;
+			vi.mocked(readFileSync).mockReturnValue(`SWARM_CONTROL_PLANE_URL=${OTHER}\n`);
+			const resolved = requireOperatorSession({ workerId: WORKER_ID });
+			expect(resolved).toEqual({ error: expect.stringContaining(CONTROL_PLANE) });
+			expect(resolved).toEqual({ error: expect.stringContaining(EXPORTED) });
+			expect(resolved).toEqual({
+				error: expect.stringContaining('unset SWARM_CONTROL_PLANE_URL'),
+			});
+			expect(readOperatorSessionCache).not.toHaveBeenCalled();
+		});
+
 		it('refuses a --control-plane-url naming another installation, naming both', () => {
 			delete process.env.SWARM_CONTROL_PLANE_URL;
 			const resolved = requireOperatorSession({ workerId: WORKER_ID, controlPlaneUrl: OTHER });

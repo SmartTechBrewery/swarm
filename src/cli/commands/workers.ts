@@ -3214,8 +3214,9 @@ function saveProfileCheckouts(worker: WorkerHere, extraRepoRoots: string[]): str
  * repository checkout on this machine (issue #1059), without re-registering it.
  *
  * Host-local by design: the checkout's path never leaves the machine, so this edits
- * only the primary checkout's cache entry and needs neither a session nor the
- * control plane. The daemon learns of it when it next starts.
+ * only the primary checkout's cache entry — or, for the profile-based worker whose
+ * primary checkout this is, its profile (issue #1296) — and needs neither a session
+ * nor the control plane. The daemon learns of it when it next starts.
  */
 async function addCheckoutCommand(argv: string[]): Promise<number> {
 	const { values, positionals } = parseArgs({
