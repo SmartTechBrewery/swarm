@@ -34,8 +34,18 @@
  */
 
 import { z } from 'zod';
-import { CONTROL_PLANE_ENV, resolveControlPlaneUrl } from './control-plane-env.js';
 import {
+	isValidWorkerId,
+	readWorkerProfile,
+	workerProfilePath,
+} from '../../launcher/worker-profile.js';
+import {
+	CONTROL_PLANE_ENV,
+	envFileControlPlaneUrl,
+	resolveControlPlaneUrl,
+} from './control-plane-env.js';
+import {
+	normalizeControlPlaneUrl,
 	type OperatorSessionCache,
 	operatorSessionCachePath,
 	readOperatorSessionCache,
@@ -244,29 +254,138 @@ export interface OperatorSession {
 	identifier: string;
 }
 
+/** What {@link requireOperatorSession} is told about the command asking. */
+export interface RequireOperatorSessionOptions {
+	/**
+	 * The worker the command acts on (issue #1296). When this machine holds a
+	 * profile for it (`../../launcher/worker-profile.ts`), the profile names the
+	 * installation — not this checkout's `.env`.
+	 */
+	workerId?: string;
+	/** The command's own `--control-plane-url`, for the commands that take one. */
+	controlPlaneUrl?: string;
+}
+
 /**
  * The control-plane URL — resolved by the precedence every `swarm` command shares
- * (`./control-plane-env.ts`: the environment, then this checkout's `.env`) — plus
- * the cached `swarm login` session, or the single actionable line explaining which
- * of the two is missing. The token is not re-validated here — it is opaque to this
- * process, and the first call spends it, which is what turns an expired one into
+ * (`./control-plane-env.ts`: a `--control-plane-url` the caller passes, the
+ * environment, then this checkout's `.env`) — plus the cached `swarm login`
+ * session, or the single actionable line explaining which of the two is missing.
+ * The token is not re-validated here — it is opaque to this process, and the
+ * first call spends it, which is what turns an expired one into
  * {@link failureMessage}'s "run `swarm login`".
+ *
+ * **A profile worker answers for itself** (issue #1296). Given a `workerId` this
+ * machine holds a profile for, the profile's URL is used ahead of everything
+ * above: a profile worker serves the installation it was registered on, whichever
+ * clone the operator happens to be standing in. An explicit flag or exported
+ * `SWARM_CONTROL_PLANE_URL` naming a *different* installation is refused with both
+ * URLs named, rather than either one quietly winning — `.env` is not an explicit
+ * choice and is not held against the profile. That includes the copy of it
+ * `npm run swarm --` puts in the environment (`node --env-file-if-exists=.env`):
+ * an environment value equal to this checkout's `.env` assignment is read as that
+ * copy, not as an export, since the two cannot otherwise be told apart. With no
+ * profile for the worker, nothing here changes.
  */
-export function requireOperatorSession(): { session: OperatorSession } | { error: string } {
-	const resolved = resolveControlPlaneUrl();
-	if ('error' in resolved) return { error: resolved.error };
-	const raw = resolved.url;
+export function requireOperatorSession(
+	options: RequireOperatorSessionOptions = {},
+): { session: OperatorSession } | { error: string } {
+	const resolved = resolveSessionUrl(options);
+	if ('error' in resolved) return resolved;
+	const { url: raw, login } = resolved;
 
 	// `null` (nothing cached) and `undefined` (unreadable) are different problems,
 	// reported as such — the same split `commands/login.ts` makes.
 	const cached: OperatorSessionCache | null | undefined = readOperatorSessionCache(raw);
-	if (cached === null) return { error: `not signed in to ${raw} — run \`swarm login\`` };
+	if (cached === null) return { error: `not signed in to ${raw} — run \`${login}\`` };
 	if (cached === undefined) {
 		return {
-			error: `the cached session at ${operatorSessionCachePath(raw)} could not be read — run \`swarm login\` to replace it`,
+			error: `the cached session at ${operatorSessionCachePath(raw)} could not be read — run \`${login}\` to replace it`,
 		};
 	}
 	return {
 		session: { controlPlaneUrl: raw, token: cached.token, identifier: cached.identifier },
 	};
+}
+
+/**
+ * The URL a session is read for, and the `swarm login` that would create one
+ * there. The bare `swarm login` is named only when the shared precedence chose
+ * the URL without a flag, since that is the URL a bare login resolves too.
+ */
+function resolveSessionUrl(
+	options: RequireOperatorSessionOptions,
+): { url: string; login: string } | { error: string } {
+	const profiled = profileControlPlaneUrl(options);
+	if (profiled !== null) return profiled;
+
+	const resolved = resolveControlPlaneUrl(options.controlPlaneUrl);
+	if ('error' in resolved) return { error: resolved.error };
+	return {
+		url: resolved.url,
+		login:
+			resolved.source === 'flag'
+				? `swarm login --control-plane-url ${resolved.url}`
+				: 'swarm login',
+	};
+}
+
+/**
+ * The installation a worker's local profile names, `null` when this machine holds
+ * no profile for it, or the refusal: an unreadable profile, or an explicit
+ * override that names another installation.
+ */
+function profileControlPlaneUrl(
+	options: RequireOperatorSessionOptions,
+): { url: string; login: string } | { error: string } | null {
+	const { workerId } = options;
+	// A worker id no profile could be stored under has no profile.
+	if (workerId === undefined || !isValidWorkerId(workerId)) return null;
+	const profile = readWorkerProfile(workerId);
+	if (profile === null) return null;
+	const path = workerProfilePath(workerId);
+	if (profile === undefined) {
+		return {
+			error: `worker ${workerId}'s profile at ${path} could not be read, so which installation it serves is unknown — repair or remove it`,
+		};
+	}
+
+	const url = profile.controlPlaneUrl;
+	const overrides = [
+		{ value: options.controlPlaneUrl, origin: '--control-plane-url', remedy: 'drop it' },
+		{
+			value: exportedControlPlaneUrl(),
+			origin: `the exported ${CONTROL_PLANE_ENV}`,
+			remedy: `unset ${CONTROL_PLANE_ENV}`,
+		},
+	];
+	for (const { value, origin, remedy } of overrides) {
+		const requested = value?.trim();
+		if (requested && normalizeControlPlaneUrl(requested) !== url) {
+			return {
+				error: `worker ${workerId} serves ${url} (its profile, ${path}), but ${origin} names ${requested} — ${remedy} to act on this worker`,
+			};
+		}
+	}
+	return { url, login: `swarm login --control-plane-url ${url}` };
+}
+
+/**
+ * `SWARM_CONTROL_PLANE_URL` from the environment, unless it is only the copy of
+ * this checkout's `.env` that `npm run swarm --` loads there — `undefined` then,
+ * so the checkout's default never refuses a profile worker of another
+ * installation. A genuinely exported value differing from `.env` still counts
+ * (Node never lets `.env` overwrite an exported variable, so that value is the
+ * operator's own).
+ */
+function exportedControlPlaneUrl(): string | undefined {
+	const ambient = process.env[CONTROL_PLANE_ENV]?.trim();
+	if (!ambient) return undefined;
+	const envFile = envFileControlPlaneUrl();
+	if (
+		envFile !== undefined &&
+		normalizeControlPlaneUrl(envFile) === normalizeControlPlaneUrl(ambient)
+	)
+		return undefined;
+	return ambient;
 }

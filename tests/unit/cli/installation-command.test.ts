@@ -2,7 +2,11 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync }
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { swarmCommand, workerAgentCommand } from '@/cli/_shared/installation-command.js';
+import {
+	launcherCommand,
+	swarmCommand,
+	workerAgentCommand,
+} from '@/cli/_shared/installation-command.js';
 
 /**
  * Two fake installations, each with a `bin/`, and a synthetic PATH directory
@@ -17,7 +21,7 @@ describe('installation command', () => {
 
 	function installation(dir: string): string {
 		mkdirSync(join(dir, 'bin'), { recursive: true });
-		for (const file of ['swarm.js', 'swarm-worker-agent']) {
+		for (const file of ['swarm.js', 'swarm-worker-agent', 'swarm-launcher.js']) {
 			writeFileSync(join(dir, 'bin', file), '#!/bin/sh\n');
 			chmodSync(join(dir, 'bin', file), 0o755);
 		}
@@ -45,6 +49,18 @@ describe('installation command', () => {
 		link('swarm-worker-agent', join(mine, 'bin', 'swarm-worker-agent'));
 		expect(swarmCommand({ PATH: pathDir }, mine)).toBe('swarm');
 		expect(workerAgentCommand({ PATH: pathDir }, mine)).toBe('swarm-worker-agent');
+	});
+
+	// Issue #1296: a profile worker's start command is named the same way.
+	it('names swarm-launcher bare only when PATH resolves to this installation', () => {
+		expect(launcherCommand({ PATH: pathDir }, mine)).toBe(
+			`node ${join(mine, 'bin', 'swarm-launcher.js')}`,
+		);
+		link('swarm-launcher', join(other, 'bin', 'swarm-launcher.js'));
+		expect(launcherCommand({ PATH: pathDir }, mine)).toBe(
+			`node ${join(mine, 'bin', 'swarm-launcher.js')}`,
+		);
+		expect(launcherCommand({ PATH: pathDir }, other)).toBe('swarm-launcher');
 	});
 
 	it('follows a symlink chain the way npm link leaves one', () => {

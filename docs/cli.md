@@ -68,6 +68,22 @@ nothing else) and would connect to the other installation. Errors that depend on
 the installation — not signed in, an expired or rejected session, a failed login,
 an unreachable control plane — name the URL they used.
 
+**A profile-based worker names its own installation** (issue #1296). A `workers`
+subcommand that acts on one `<worker-id>` — `drain`, `undrain`, `update
+<worker-id>`, `set-cli`, `set-scm-credential`, `remove`, `sweep-worktrees`,
+`enroll`, `update-enrollment`, `approve`, `consent` — first looks for that worker's
+profile on this machine (`~/.swarm/workers/<worker-id>/profile.json`, written by
+[`workers setup --profile`](#swarm-workers)). When there is one, its control-plane
+URL is used and `.env` is not held against it; the session is the one cached for
+that URL, and a missing one says to run `swarm login --control-plane-url <that URL>`.
+An exported `SWARM_CONTROL_PLANE_URL` that names a different installation is refused,
+naming both URLs, rather than either winning silently. The copy of `.env` that `npm
+run swarm --` loads into the environment (`node --env-file-if-exists=.env`) is not an
+export: an environment value equal to this checkout's `.env` assignment is ignored
+here, so a profile worker of another installation can be managed from any clone. With no profile for the
+worker, the rule above applies unchanged; commands that act on no one worker
+(`list`, `sweeps`, `update --all`, `request-update`) always use it.
+
 Run `swarm --help`, or `swarm <command> --help` on the multi-subcommand commands
 (`config`, `queue`, `run`, `users`, `members`, `identities`, `workers`, `pm`), to
 print the authoritative usage.
@@ -333,6 +349,11 @@ clone on the same machine reaches its own installation through its own `.env`
 with nothing exported — but not from a shell that exports the first
 installation's URL (issue #1215).
 
+A checkout served only by a **profile-based worker** (issue #1296,
+[`workers setup --profile`](#swarm-workers)) has no cache entry, and is refused
+with exit 1 naming the command that starts that worker instead:
+`swarm-launcher run <worker-id>`.
+
 This is an **additional** start path, not a replacement. It is for the case where
 the machine that registered the worker is the machine running it; for a remote
 machine, a process supervisor, or anything else, keep using `npm run dev:worker`
@@ -530,9 +551,9 @@ the same identities under the dashboard's **Settings → Users**, with no shell
 ### `swarm workers`
 
 ```bash
-swarm workers setup [--project <id>] [--name <displayName>] [--cli <c1,c2,...>] [--control-plane-url <url>] [--no-autostart]
+swarm workers setup [--project <id>] [--name <displayName>] [--cli <c1,c2,...>] [--control-plane-url <url>] [--no-autostart] [--profile]
 swarm workers register <owner-identifier> --name <displayName> --cli <c1,c2,...> [--extra-checkout <path>]...
-swarm workers register-and-enroll <owner-identifier> <project-id> --name <displayName> --cli <c1,c2,...> [--control-plane-url <url>] [--repo-root <path>] [--extra-checkout <path>]...
+swarm workers register-and-enroll <owner-identifier> <project-id> --name <displayName> --cli <c1,c2,...> [--control-plane-url <url>] [--repo-root <path>] [--extra-checkout <path>]... [--profile]
 swarm workers add-checkout <path>
 swarm workers remove-checkout <path>
 swarm workers list [<owner-identifier>]
@@ -772,6 +793,27 @@ unchanged.
   resolves to the clone the command runs from, otherwise its absolute
   `node <clone>/bin/swarm.js` / `<clone>/bin/swarm-worker-agent` form — so a machine
   serving a second installation is never handed the other installation's command.
+- **`--profile`** (on `setup` and `register-and-enroll`, issue #1296) — make a
+  **profile-based** worker, which runs without a SWARM clone. It is registered,
+  enrolled and credentialed exactly as without the flag, but the worker credential,
+  its checkouts (primary first, `--extra-checkout` after it) and the control-plane
+  URL it was registered on are written to `~/.swarm/workers/<worker-id>/profile.json`
+  (directory `700`, file `600`) instead of the per-checkout credential cache, and it
+  is started with `swarm-launcher run <worker-id>`, which the command ends by
+  printing ([`MANUAL.md`](./MANUAL.md), "Profile-based workers"). The URL comes
+  from `--control-plane-url`, else the environment, else `.env`; `.env` is **not**
+  bootstrapped, and one naming a different installation is not refused, because the
+  launcher's daemon reads no `.env`. The worker credential is never printed — not
+  on success and not with the outstanding commands of an unfinished run — except
+  when the profile itself cannot be written, when it is printed once because it is
+  the only copy (and the command exits 1). It refuses, before anything is
+  registered, a checkout that already has a worker in the credential cache, or that
+  an existing profile already serves for the **same** installation. A profile for
+  another installation may name the same checkout, but the checkout lock lets only
+  one of the two workers run there at a time. A plain `setup` refuses a checkout a
+  profile serves for the same installation too. Autostart for a profile worker
+  arrives with a later phase: until then `setup --profile` stops where
+  `--no-autostart` does.
 - **`add-checkout <path>`** — give an **existing** worker another repository
   checkout on this machine (issue #1059), without re-registering it — which would
   issue a new worker and lose its enrollments and stored operator credentials. Run
@@ -784,7 +826,11 @@ unchanged.
   Restart the worker afterwards (`swarm run:worker`, or `swarm-worker-agent install`
   / `update`); it declares the new repository at its next handshake, and the
   dashboard's worker detail then lists it. Enroll the worker in that repository's
-  project as usual if it is not enrolled already.
+  project as usual if it is not enrolled already. In the primary checkout of a
+  **profile-based** worker (issue #1296) it edits that worker's profile's
+  `repoRoots` instead, and the restart is `swarm-launcher run <worker-id>`; when two
+  profiles (for two installations) share the primary checkout, it refuses as
+  ambiguous. `remove-checkout` follows the same rules.
 - **`remove-checkout <path>`** — drop one of those extra checkouts, from the
   worker's primary checkout. The path need not still exist. The primary checkout
   itself cannot be removed — that is `remove`. Host-local, and takes effect at the

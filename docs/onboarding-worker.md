@@ -355,6 +355,48 @@ move safely:
 quotas: both installations' workers draw on the same `claude` / `codex` / `agy`
 accounts. Before a host restart, drain the workers on both installations.
 
+#### Or: a profile-based worker, with no second clone
+
+Since issue #1296 the second installation's worker can be a **profile-based**
+worker instead, which needs no second clone at all. The first clone's CLI registers
+it, but the worker's control-plane URL, credential and checkouts go into
+`~/.swarm/workers/<worker-id>/profile.json` (`700`/`600`) rather than into a clone's
+`.env` and credential cache. `swarm-launcher run <worker-id>` then starts it on the
+runtime that installation serves ([`MANUAL.md`](./MANUAL.md), "Profile-based
+workers"), so the two installations' updates never meet in one clone.
+
+```bash
+swarm login --identifier ada@example.com --control-plane-url https://swarm-two.example.com
+cd ~/code/two-project
+swarm workers setup --profile --control-plane-url https://swarm-two.example.com
+swarm-launcher run <worker-id>     # exactly as setup prints it
+```
+
+- `--profile` (on `setup` and `register-and-enroll`) takes the URL from
+  `--control-plane-url`, else the environment, else the clone's `.env`, stores it in
+  the profile, and writes no `.env`. A `.env` naming the first installation is not
+  a conflict, because the launcher reads none. The worker credential is not
+  printed.
+- It refuses a checkout that already has a clone worker cached, or that a profile
+  already serves for the same installation. Another installation's profile may
+  name the same checkout, but the checkout lock lets only one worker run there at a
+  time, so keep giving each installation its own checkout (step 3).
+- Every `swarm workers` command that takes a `<worker-id>` — `drain`, `undrain`,
+  `update <worker-id>`, `set-cli`, `set-scm-credential`, `remove`,
+  `sweep-worktrees`, `enroll`, `update-enrollment`, `approve`, `consent` — acts on
+  the installation that worker's profile names, with the session
+  `swarm login --control-plane-url <that URL>` cached. An exported
+  `SWARM_CONTROL_PLANE_URL` naming another installation is refused, naming both.
+- `add-checkout` / `remove-checkout`, run in the worker's primary checkout, edit
+  its profile. `swarm run:worker` there refuses and names `swarm-launcher run
+  <worker-id>`.
+- Commands that act on no one worker (`list`, `sweeps`, `update --all`,
+  `request-update`) keep the usual precedence, so point them at the second
+  installation explicitly:
+  `SWARM_CONTROL_PLANE_URL=https://swarm-two.example.com swarm workers list ada@example.com`.
+- There is no autostart for a profile worker yet: `setup --profile` stops where
+  `--no-autostart` does and prints the start command.
+
 ---
 
 ## Part 1 — register the user + worker

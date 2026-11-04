@@ -94,6 +94,25 @@ function readEnvState(path: string): EnvState {
 	return trimmed ? { kind: 'set', value: trimmed } : { kind: 'empty' };
 }
 
+/**
+ * The value this checkout's `.env` assigns {@link CONTROL_PLANE_ENV}, or
+ * `undefined` when it assigns none (or an empty one). Exists because the source
+ * wrapper `npm run swarm --` runs the CLI under `node --env-file-if-exists=.env`,
+ * which loads this very assignment into `process.env` — so a caller that must
+ * tell an *exported* override from the checkout's own default can compare against
+ * it (issue #1296). An unreadable `.env` answers `undefined`: Node could not have
+ * loaded it either, so nothing in the environment came from it.
+ */
+export function envFileControlPlaneUrl(): string | undefined {
+	let state: EnvState;
+	try {
+		state = readEnvState(envFilePath());
+	} catch {
+		return undefined;
+	}
+	return state.kind === 'set' ? state.value : undefined;
+}
+
 /** The precedence itself, written once: the first non-empty of flag, environment, `.env`. */
 function pickControlPlaneUrl(
 	requested: string | undefined,

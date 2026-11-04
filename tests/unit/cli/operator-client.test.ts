@@ -6,9 +6,21 @@ const { readOperatorSessionCache, operatorSessionCachePath } = vi.hoisted(() => 
 	operatorSessionCachePath: vi.fn(() => '/home/ada/.swarm/operator-sessions/abc123/session.json'),
 }));
 
-vi.mock('@/cli/_shared/operator-session-cache.js', () => ({
+vi.mock('@/cli/_shared/operator-session-cache.js', async (importOriginal) => ({
+	normalizeControlPlaneUrl: (
+		await importOriginal<typeof import('@/cli/_shared/operator-session-cache.js')>()
+	).normalizeControlPlaneUrl,
 	readOperatorSessionCache,
 	operatorSessionCachePath,
+}));
+// A worker's local profile names its installation (issue #1296). Stubbed so each test
+// states whether this machine holds one; the module itself is covered by
+// tests/unit/launcher/worker-profile.test.ts.
+const { readWorkerProfile } = vi.hoisted(() => ({ readWorkerProfile: vi.fn() }));
+vi.mock('@/launcher/worker-profile.js', async (importOriginal) => ({
+	...(await importOriginal<typeof import('@/launcher/worker-profile.js')>()),
+	readWorkerProfile,
+	workerProfilePath: (workerId: string) => `/home/ada/.swarm/workers/${workerId}/profile.json`,
 }));
 // The URL resolver also reads this checkout's `.env` (issue #1214). Stubbed so a
 // developer's own `.env` never decides a test: each one states what it holds.
@@ -292,6 +304,122 @@ describe('requireOperatorSession', () => {
 		readOperatorSessionCache.mockReturnValue(undefined);
 		expect(requireOperatorSession()).toEqual({
 			error: expect.stringContaining('could not be read'),
+		});
+	});
+	// Issue #1296: a worker this machine holds a profile for is managed on the
+	// installation its profile names, whichever clone the command runs in.
+	describe('for a worker with a local profile', () => {
+		const WORKER_ID = '11111111-1111-4111-8111-111111111111';
+		const PROFILE = {
+			workerId: WORKER_ID,
+			controlPlaneUrl: CONTROL_PLANE,
+			credential: 'raw-credential-token',
+			repoRoots: ['/home/ada/code/app'],
+			createdAt: '2026-11-04T00:00:00.000Z',
+		};
+
+		beforeEach(() => {
+			readWorkerProfile.mockReturnValue(PROFILE);
+			readOperatorSessionCache.mockReturnValue(SESSION);
+		});
+
+		afterEach(() => {
+			readWorkerProfile.mockReset();
+		});
+
+		it("uses the profile's URL over this checkout's .env", () => {
+			delete process.env.SWARM_CONTROL_PLANE_URL;
+			vi.mocked(readFileSync).mockReturnValue(`SWARM_CONTROL_PLANE_URL=${OTHER}\n`);
+			expect(requireOperatorSession({ workerId: WORKER_ID })).toEqual({
+				session: { controlPlaneUrl: CONTROL_PLANE, token: TOKEN, identifier: 'ada@example.com' },
+			});
+			expect(readWorkerProfile).toHaveBeenCalledWith(WORKER_ID);
+			expect(readOperatorSessionCache).toHaveBeenCalledExactlyOnceWith(CONTROL_PLANE);
+		});
+
+		it('accepts an override naming the same installation, however it is spelled', () => {
+			process.env.SWARM_CONTROL_PLANE_URL = 'https://SWARM.example.com/';
+			expect(
+				requireOperatorSession({ workerId: WORKER_ID, controlPlaneUrl: `${CONTROL_PLANE}/` }),
+			).toHaveProperty('session.controlPlaneUrl', CONTROL_PLANE);
+		});
+
+		it('refuses an exported URL naming another installation, naming both', () => {
+			process.env.SWARM_CONTROL_PLANE_URL = OTHER;
+			const resolved = requireOperatorSession({ workerId: WORKER_ID });
+			expect(resolved).toEqual({ error: expect.stringContaining(CONTROL_PLANE) });
+			expect(resolved).toEqual({ error: expect.stringContaining(OTHER) });
+			expect(resolved).toEqual({
+				error: expect.stringContaining('unset SWARM_CONTROL_PLANE_URL'),
+			});
+			expect(readOperatorSessionCache).not.toHaveBeenCalled();
+		});
+
+		// `npm run swarm --` runs under `node --env-file-if-exists=.env`, so the
+		// checkout's own `.env` arrives in `process.env` looking exported.
+		it("uses the profile's URL when the environment only carries this checkout's .env value", () => {
+			process.env.SWARM_CONTROL_PLANE_URL = OTHER;
+			vi.mocked(readFileSync).mockReturnValue(`SWARM_CONTROL_PLANE_URL=${OTHER}/\n`);
+			expect(requireOperatorSession({ workerId: WORKER_ID })).toEqual({
+				session: { controlPlaneUrl: CONTROL_PLANE, token: TOKEN, identifier: 'ada@example.com' },
+			});
+			expect(readOperatorSessionCache).toHaveBeenCalledExactlyOnceWith(CONTROL_PLANE);
+		});
+
+		it('still refuses an exported URL that differs from both the profile and .env', () => {
+			const EXPORTED = 'https://third.example.com';
+			process.env.SWARM_CONTROL_PLANE_URL = EXPORTED;
+			vi.mocked(readFileSync).mockReturnValue(`SWARM_CONTROL_PLANE_URL=${OTHER}\n`);
+			const resolved = requireOperatorSession({ workerId: WORKER_ID });
+			expect(resolved).toEqual({ error: expect.stringContaining(CONTROL_PLANE) });
+			expect(resolved).toEqual({ error: expect.stringContaining(EXPORTED) });
+			expect(resolved).toEqual({
+				error: expect.stringContaining('unset SWARM_CONTROL_PLANE_URL'),
+			});
+			expect(readOperatorSessionCache).not.toHaveBeenCalled();
+		});
+
+		it('refuses a --control-plane-url naming another installation, naming both', () => {
+			delete process.env.SWARM_CONTROL_PLANE_URL;
+			const resolved = requireOperatorSession({ workerId: WORKER_ID, controlPlaneUrl: OTHER });
+			expect(resolved).toEqual({
+				error: expect.stringMatching(
+					/serves https:\/\/swarm\.example\.com .*--control-plane-url names https:\/\/other\.example\.com/,
+				),
+			});
+		});
+
+		it('names the login that reaches the profile installation when no session is cached', () => {
+			delete process.env.SWARM_CONTROL_PLANE_URL;
+			readOperatorSessionCache.mockReturnValue(null);
+			expect(requireOperatorSession({ workerId: WORKER_ID })).toEqual({
+				error: `not signed in to ${CONTROL_PLANE} — run \`swarm login --control-plane-url ${CONTROL_PLANE}\``,
+			});
+		});
+
+		it('refuses an unreadable profile rather than guessing an installation', () => {
+			readWorkerProfile.mockReturnValue(undefined);
+			expect(requireOperatorSession({ workerId: WORKER_ID })).toEqual({
+				error: expect.stringContaining('could not be read'),
+			});
+			expect(readOperatorSessionCache).not.toHaveBeenCalled();
+		});
+
+		// The regression guard for the developer path: no profile, nothing changes.
+		it('falls back to the shared precedence when the worker has no profile here', () => {
+			readWorkerProfile.mockReturnValue(null);
+			delete process.env.SWARM_CONTROL_PLANE_URL;
+			vi.mocked(readFileSync).mockReturnValue(`SWARM_CONTROL_PLANE_URL=${OTHER}\n`);
+			requireOperatorSession({ workerId: WORKER_ID });
+			expect(readOperatorSessionCache).toHaveBeenCalledExactlyOnceWith(OTHER);
+		});
+	});
+
+	it('names the flag in the login hint when --control-plane-url chose the URL', () => {
+		delete process.env.SWARM_CONTROL_PLANE_URL;
+		readOperatorSessionCache.mockReturnValue(null);
+		expect(requireOperatorSession({ controlPlaneUrl: OTHER })).toEqual({
+			error: `not signed in to ${OTHER} — run \`swarm login --control-plane-url ${OTHER}\``,
 		});
 	});
 });

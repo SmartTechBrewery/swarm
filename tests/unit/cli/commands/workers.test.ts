@@ -1,4 +1,13 @@
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -86,13 +95,38 @@ vi.mock('node:readline/promises', () => ({
 // PATH (issue #1221). Pinned to the bare names here, so the suite reads the same
 // whatever the developer's PATH holds — tests/unit/cli/installation-command.test.ts
 // covers the resolution itself.
-const { swarmCommand, workerAgentCommand } = vi.hoisted(() => ({
+const { swarmCommand, workerAgentCommand, launcherCommand } = vi.hoisted(() => ({
 	swarmCommand: vi.fn(),
 	workerAgentCommand: vi.fn(),
+	launcherCommand: vi.fn(),
 }));
-vi.mock('@/cli/_shared/installation-command.js', () => ({ swarmCommand, workerAgentCommand }));
+vi.mock('@/cli/_shared/installation-command.js', () => ({
+	swarmCommand,
+	workerAgentCommand,
+	launcherCommand,
+}));
+
+/**
+ * Worker profiles (issue #1296) live under `~/.swarm/workers/`, read and written for
+ * real here, so `homedir()` answers a throwaway directory per test — and throws
+ * outside one, so no test can reach the developer's own. Setting `HOME` would not
+ * do: a worker thread's `process.env` is its own copy, which `homedir()` never reads.
+ */
+const { fakeHome } = vi.hoisted(() => ({ fakeHome: { dir: '' } }));
+vi.mock('node:os', async (importOriginal) => ({
+	...(await importOriginal<typeof import('node:os')>()),
+	homedir: () => {
+		if (!fakeHome.dir) throw new Error('no test home directory is set');
+		return fakeHome.dir;
+	},
+}));
 
 import { defaultWorkerName, run } from '@/cli/commands/workers.js';
+import {
+	readWorkerProfile,
+	workerProfilePath,
+	writeWorkerProfile,
+} from '@/launcher/worker-profile.js';
 
 const WORKER_ID = '11111111-1111-4111-8111-111111111111';
 const PROJECT_ID = 'proj-a';
@@ -171,9 +205,13 @@ interface EnrollmentRow {
 
 describe('swarm workers', () => {
 	let enrollmentRow: EnrollmentRow;
+	/** This test's home directory (see `fakeHome`). */
+	let home: string;
 
 	beforeEach(() => {
 		delete process.env.INIT_CWD;
+		home = realpathSync(mkdtempSync(join(tmpdir(), 'swarm-workers-home-')));
+		fakeHome.dir = home;
 		vi.spyOn(console, 'log').mockImplementation(() => {});
 		vi.spyOn(console, 'error').mockImplementation(() => {});
 		calls.length = 0;
@@ -193,6 +231,7 @@ describe('swarm workers', () => {
 		ensureControlPlaneUrl.mockReset().mockResolvedValue('https://swarm.example.com');
 		swarmCommand.mockReset().mockReturnValue('swarm');
 		workerAgentCommand.mockReset().mockReturnValue('swarm-worker-agent');
+		launcherCommand.mockReset().mockReturnValue('swarm-launcher');
 
 		// Non-TTY is the shape a test process actually has, so the command reads stdin.
 		promptHidden.mockReset().mockResolvedValue('typed-secret');
@@ -328,6 +367,8 @@ describe('swarm workers', () => {
 	afterEach(() => {
 		if (ORIGINAL_INIT_CWD === undefined) delete process.env.INIT_CWD;
 		else process.env.INIT_CWD = ORIGINAL_INIT_CWD;
+		fakeHome.dir = '';
+		rmSync(home, { recursive: true, force: true });
 	});
 
 	// Issue #800's headline: the command group needs a control plane and a session,
@@ -2799,6 +2840,211 @@ describe('swarm workers', () => {
 			}));
 			expect(await run(['consent', WORKER_ID, PROJECT_ID, 'on'])).toBe(1);
 			expect(pathsCalled()).not.toContain('workers.setConsent');
+		});
+	});
+
+	describe('profile-based workers (issue #1296)', () => {
+		const REPO_ROOT = realpathSync(process.cwd());
+		const CONTROL_PLANE = 'https://swarm.example.com';
+		const OTHER_PLANE = 'https://swarm-two.example.com';
+		const SETUP = ['setup', '--project', PROJECT_ID, '--profile'];
+		const REGISTER_AND_ENROLL = [
+			'register-and-enroll',
+			IDENTIFIER,
+			PROJECT_ID,
+			'--name',
+			'ada-laptop',
+			'--cli',
+			'claude',
+			'--profile',
+		];
+
+		function errors(): string[] {
+			return vi.mocked(console.error).mock.calls.map(([line]) => String(line));
+		}
+
+		function printed(): string[] {
+			return [...lines(), ...errors()];
+		}
+
+		/** A profile already on this machine. */
+		function profiled(workerId: string, controlPlaneUrl: string, repoRoots: string[]): void {
+			writeWorkerProfile({
+				workerId,
+				controlPlaneUrl,
+				credential: 'existing-credential',
+				repoRoots,
+			});
+		}
+
+		beforeEach(() => {
+			slugs.set(REPO_ROOT, 'acme/myrepo');
+		});
+
+		// Every command acting on one worker hands its id to the session lookup, which
+		// is what lets a local profile name the installation.
+		it.each([
+			[['drain', WORKER_ID]],
+			[['undrain', WORKER_ID]],
+			[['update', WORKER_ID, 'main']],
+			[['set-cli', WORKER_ID, '--auto']],
+			[['set-scm-credential', WORKER_ID, 'github']],
+			[['remove', WORKER_ID]],
+			[['sweep-worktrees', WORKER_ID]],
+			[['enroll', WORKER_ID, PROJECT_ID, '--cli', 'claude']],
+			[['update-enrollment', WORKER_ID, PROJECT_ID, '--concurrency', '2']],
+			[['approve', WORKER_ID, PROJECT_ID]],
+			[['consent', WORKER_ID, PROJECT_ID, 'on']],
+		])('%j resolves its session for that worker', async (argv) => {
+			answers.set('workers.requestWorktreeSweep', (input) => ({
+				workerId: input.workerId,
+				displayName: 'ada-laptop',
+				previousSweep: null,
+			}));
+			await run(argv);
+			expect(requireOperatorSession).toHaveBeenCalledExactlyOnceWith({ workerId: WORKER_ID });
+		});
+
+		// The regression guard: what acts on no one worker keeps the clone/env precedence.
+		it('leaves commands that act on no one worker on the shared precedence', async () => {
+			await run(['list']);
+			expect(requireOperatorSession).toHaveBeenCalledExactlyOnceWith(undefined);
+		});
+
+		it('setup --profile writes the profile, no cache entry, and leaves .env alone', async () => {
+			expect(await run(SETUP)).toBe(0);
+
+			expect(ensureControlPlaneUrl).not.toHaveBeenCalled();
+			expect(requireOperatorSession).toHaveBeenCalledWith({ controlPlaneUrl: undefined });
+			expect(writeWorkerCredentialCache).not.toHaveBeenCalled();
+			expect(installWorkerAutostart).not.toHaveBeenCalled();
+			expect(readWorkerProfile(WORKER_ID)).toMatchObject({
+				workerId: WORKER_ID,
+				controlPlaneUrl: CONTROL_PLANE,
+				credential: 'raw-credential-token',
+				repoRoots: [REPO_ROOT],
+			});
+			expect(statSync(workerProfilePath(WORKER_ID)).mode & 0o777).toBe(0o600);
+			expect(statSync(join(home, '.swarm', 'workers', WORKER_ID)).mode & 0o777).toBe(0o700);
+			expect(lines().at(-1)).toContain(`start the worker with: swarm-launcher run ${WORKER_ID}`);
+			expect(printed().some((line) => line.includes('raw-credential-token'))).toBe(false);
+		});
+
+		it('setup --profile hands --control-plane-url to the shared precedence', async () => {
+			expect(await run([...SETUP, '--control-plane-url', CONTROL_PLANE])).toBe(0);
+			expect(requireOperatorSession).toHaveBeenCalledWith({ controlPlaneUrl: CONTROL_PLANE });
+		});
+
+		it('setup --profile refuses a checkout with a clone worker cached, before asking anything', async () => {
+			readWorkerCredentialCache.mockReturnValue({
+				workerId: OTHER_WORKER_ID,
+				credential: 'raw-credential-token',
+				repoRoot: REPO_ROOT,
+				registeredAt: new Date().toISOString(),
+			});
+			expect(await run(SETUP)).toBe(1);
+			expect(pathsCalled()).toEqual([]);
+			expect(existsSync(join(home, '.swarm', 'workers'))).toBe(false);
+		});
+
+		it('refuses a checkout a profile already serves for the same installation', async () => {
+			profiled(OTHER_WORKER_ID, `${CONTROL_PLANE}/`, [REPO_ROOT]);
+			expect(await run(SETUP)).toBe(1);
+			expect(pathsCalled()).toEqual([]);
+			expect(errors()).toEqual([expect.stringContaining(`worker ${OTHER_WORKER_ID}'s profile`)]);
+			expect(lines()).toContainEqual(
+				expect.stringContaining(`start it with: swarm-launcher run ${OTHER_WORKER_ID}`),
+			);
+			expect(readWorkerProfile(WORKER_ID)).toBeNull();
+		});
+
+		it('allows the same checkout for a different installation', async () => {
+			profiled(OTHER_WORKER_ID, OTHER_PLANE, [REPO_ROOT]);
+			expect(await run(SETUP)).toBe(0);
+			expect(readWorkerProfile(WORKER_ID)?.controlPlaneUrl).toBe(CONTROL_PLANE);
+			expect(readWorkerProfile(OTHER_WORKER_ID)?.controlPlaneUrl).toBe(OTHER_PLANE);
+		});
+
+		it('a clone setup refuses a checkout a profile serves for the same installation', async () => {
+			profiled(OTHER_WORKER_ID, CONTROL_PLANE, [REPO_ROOT]);
+			expect(await run(['setup', '--project', PROJECT_ID])).toBe(1);
+			expect(pathsCalled()).toEqual([]);
+			expect(writeWorkerCredentialCache).not.toHaveBeenCalled();
+		});
+
+		it('register-and-enroll --profile writes the profile and prints no credential', async () => {
+			expect(await run(REGISTER_AND_ENROLL)).toBe(0);
+			expect(ensureControlPlaneUrl).not.toHaveBeenCalled();
+			expect(writeWorkerCredentialCache).not.toHaveBeenCalled();
+			expect(readWorkerProfile(WORKER_ID)).toMatchObject({
+				controlPlaneUrl: CONTROL_PLANE,
+				repoRoots: [REPO_ROOT],
+			});
+			expect(lines().at(-1)).toContain(`start the worker with: swarm-launcher run ${WORKER_ID}`);
+			expect(printed().some((line) => line.includes('raw-credential-token'))).toBe(false);
+		});
+
+		it('register-and-enroll --profile keeps the credential out of an unfinished report', async () => {
+			refuse('workers.scmCredentials.set', 'the credential resolved to no account');
+			expect(await run(REGISTER_AND_ENROLL)).toBe(1);
+			expect(readWorkerProfile(WORKER_ID)?.credential).toBe('raw-credential-token');
+			expect(lines()).toContainEqual(
+				expect.stringContaining(`swarm workers set-scm-credential ${WORKER_ID} github`),
+			);
+			expect(printed().some((line) => line.includes('raw-credential-token'))).toBe(false);
+		});
+
+		// The one case the credential is printed: the profile was going to be its only copy.
+		it('prints the credential once when the profile cannot be written', async () => {
+			mkdirSync(join(home, '.swarm'));
+			writeFileSync(join(home, '.swarm', 'workers'), 'not a directory');
+			expect(await run(REGISTER_AND_ENROLL)).toBe(1);
+			expect(lines().filter((line) => line.includes('raw-credential-token'))).toHaveLength(1);
+			expect(errors().at(-1)).toContain('its profile could not be written');
+		});
+
+		it("add-checkout in a profile worker's primary checkout updates its profile", async () => {
+			const scratch = realpathSync(mkdtempSync(join(tmpdir(), 'swarm-profile-checkout-')));
+			try {
+				slugs.set(scratch, 'acme/mobile');
+				profiled(WORKER_ID, CONTROL_PLANE, [REPO_ROOT]);
+
+				expect(await run(['add-checkout', scratch])).toBe(0);
+				expect(readWorkerProfile(WORKER_ID)?.repoRoots).toEqual([REPO_ROOT, scratch]);
+				expect(readWorkerProfile(WORKER_ID)?.credential).toBe('existing-credential');
+				expect(updateWorkerCredentialCacheCheckouts).not.toHaveBeenCalled();
+				expect(requireOperatorSession).not.toHaveBeenCalled();
+				expect(lines().some((line) => line.includes(`swarm-launcher run ${WORKER_ID}`))).toBe(true);
+
+				expect(await run(['remove-checkout', scratch])).toBe(0);
+				expect(readWorkerProfile(WORKER_ID)?.repoRoots).toEqual([REPO_ROOT]);
+			} finally {
+				rmSync(scratch, { recursive: true, force: true });
+			}
+		});
+
+		it('add-checkout refuses when two profiles share this primary checkout', async () => {
+			profiled(WORKER_ID, CONTROL_PLANE, [REPO_ROOT]);
+			profiled(OTHER_WORKER_ID, OTHER_PLANE, [REPO_ROOT]);
+			expect(await run(['add-checkout', '/elsewhere'])).toBe(1);
+			expect(errors()).toEqual([expect.stringContaining('ambiguous')]);
+		});
+
+		it('leaves a clone worker on its cache entry even when a profile shares the checkout', async () => {
+			profiled(OTHER_WORKER_ID, OTHER_PLANE, [REPO_ROOT]);
+			readWorkerCredentialCache.mockReturnValue({
+				workerId: WORKER_ID,
+				credential: 'raw-credential-token',
+				repoRoot: REPO_ROOT,
+				registeredAt: new Date().toISOString(),
+				extraRepoRoots: ['/gone'],
+			});
+			expect(await run(['remove-checkout', '/gone'])).toBe(0);
+			expect(updateWorkerCredentialCacheCheckouts).toHaveBeenCalledExactlyOnceWith(REPO_ROOT, []);
+			expect(readWorkerProfile(OTHER_WORKER_ID)?.repoRoots).toEqual([REPO_ROOT]);
+			expect(
+				readFileSync(workerProfilePath(OTHER_WORKER_ID), 'utf8').includes('existing-credential'),
+			).toBe(true);
 		});
 	});
 
