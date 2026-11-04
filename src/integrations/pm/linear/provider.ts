@@ -77,6 +77,7 @@ import { requireStateIdForStatusKey, resolveStatusKeyByStateId } from './status-
  */
 const ISSUE_FIELDS = /* GraphQL */ `
 	id
+	identifier
 	title
 	description
 	url
@@ -330,6 +331,8 @@ const CREATE_RELATION_MUTATION = /* GraphQL */ `
 /** The shape {@link ISSUE_FIELDS} selects. Every field is optional defensively. */
 interface IssueNode {
 	id?: string;
+	/** Linear's human-readable reference (`ENG-42`) — the work item's display key. */
+	identifier?: string;
 	title?: string;
 	description?: string | null;
 	url?: string;
@@ -599,6 +602,7 @@ function toWorkItem(issue: IssueNode & { id: string }, config: LinearIntegration
 	const artifact = taskRefFromAttachments(issue);
 	return {
 		id: issue.id,
+		key: issue.identifier || undefined,
 		title: issue.title ?? '',
 		description: issue.description ?? '',
 		url: issue.url ?? '',

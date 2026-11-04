@@ -155,6 +155,18 @@ describe('buildTaskAssignment', () => {
 			expect(TaskAssignmentSchema.safeParse(assignment).success).toBe(true);
 		});
 
+		// The work-item line of the pull request names the card by its key (issue
+		// #1287), and the worker composes that body, so the key has to cross the wire.
+		it('carries the work item display key', () => {
+			const input = createMockTaskAssignmentInput({ phase: 'implementation' });
+			const assignment = buildTaskAssignment({
+				...input,
+				workItem: input.workItem ? { ...input.workItem, key: 'VT-1558' } : undefined,
+			});
+			expect(assignment.workItem?.key).toBe('VT-1558');
+			expect(TaskAssignmentSchema.safeParse(assignment).success).toBe(true);
+		});
+
 		it('carries baseBranch/baseSha only for resolve-conflicts', () => {
 			const assignment = buildTaskAssignment(
 				createMockTaskAssignmentInput({

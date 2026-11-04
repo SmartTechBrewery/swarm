@@ -6,8 +6,9 @@
  * dashboard bundle must not reach it through `./schema.ts`.
  *
  * The structure is the *editable* part of the description only. The line naming the
- * work item (`Closes: #<n>` or `Work item: [<key>](<url>)`) is always appended by
- * SWARM itself (`src/pipeline/pull-request-description.ts`), outside it.
+ * work item (`Closes: #<n>` or `Work item: [<key>](<url>)` — the card's key whenever
+ * its PM provider has one, its title only on a provider with no keys) is always
+ * appended by SWARM itself (`src/pipeline/pull-request-description.ts`), outside it.
  */
 
 /**

@@ -435,6 +435,15 @@ export const ReviewHandoffSchema = z
 		 * requested changes and would never restate it.
 		 */
 		absorbed: z.preprocess(asList, z.array(ReviewAbsorbedSchema)).default([]),
+		/**
+		 * SWARM's own report wording translated into the language of the project's
+		 * review report layout (issue #1288), keyed like
+		 * `ENGLISH_REVIEW_REPORT_VOCABULARY` (`src/pipeline/review-report-vocabulary.ts`).
+		 * Asked for only when the project has its own layout, and read only then.
+		 * Wording, never semantics: a malformed object is dropped rather than failing
+		 * the review, and the renderer keeps English for any entry it cannot use.
+		 */
+		reportLabels: z.record(z.string(), z.unknown()).optional().catch(undefined),
 	})
 	.superRefine((handoff, ctx) => {
 		checkFindingTiers(handoff.findings, ctx);

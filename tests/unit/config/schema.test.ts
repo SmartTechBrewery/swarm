@@ -3,6 +3,7 @@ import {
 	DEFAULT_PULL_REQUEST_DESCRIPTION,
 	PULL_REQUEST_DESCRIPTION_MAX_LENGTH,
 } from '@/config/pull-request-description.js';
+import { DEFAULT_REVIEW_REPORT, REVIEW_REPORT_MAX_LENGTH } from '@/config/review-report.js';
 import {
 	type AgentConfig,
 	AgentConfigSchema,
@@ -1279,6 +1280,28 @@ describe('ProjectRecordSchema', () => {
 				AgentConfigSchema.parse({
 					pullRequestDescription: 'a'.repeat(PULL_REQUEST_DESCRIPTION_MAX_LENGTH + 1),
 				}),
+			).toThrow(/at most/);
+		});
+	});
+
+	describe('review report layout (issue #1288)', () => {
+		it('keeps a project’s own layout, trimmed', () => {
+			expect(
+				AgentConfigSchema.parse({ reviewReport: '  ## Zakres\n\n{summary}  ' }).reviewReport,
+			).toBe('## Zakres\n\n{summary}');
+		});
+
+		it('stores nothing for a blank value or the untouched default', () => {
+			expect(AgentConfigSchema.parse({}).reviewReport).toBeUndefined();
+			expect(AgentConfigSchema.parse({ reviewReport: '  ' }).reviewReport).toBeUndefined();
+			expect(
+				AgentConfigSchema.parse({ reviewReport: DEFAULT_REVIEW_REPORT }).reviewReport,
+			).toBeUndefined();
+		});
+
+		it('rejects a layout over the bound', () => {
+			expect(() =>
+				AgentConfigSchema.parse({ reviewReport: 'a'.repeat(REVIEW_REPORT_MAX_LENGTH + 1) }),
 			).toThrow(/at most/);
 		});
 	});
