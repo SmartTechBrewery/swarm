@@ -5,6 +5,7 @@ import type React from 'react';
 import { describe, expect, it, type Mock, vi } from 'vitest';
 import type { RepositoryForm } from '@/lib/project-repository.js';
 import { DEFAULT_PULL_REQUEST_DESCRIPTION } from '@/lib/pull-request-description.js';
+import { DEFAULT_REVIEW_REPORT } from '@/lib/review-report.js';
 import type { AgentConfig, ProjectRecord } from '../../../../src/config/schema.js';
 
 const mockMutate = vi.fn();
@@ -693,6 +694,69 @@ describe('PhaseSettingsDetail', () => {
 				/>,
 			);
 			expect(screen.queryByLabelText('Pull request description')).toBeNull();
+			cleanup();
+		}
+	});
+
+	// Issue #1288: the Review phase's report layout, the twin of the field above.
+	function renderReview(config: AgentConfig, onChange = vi.fn()) {
+		render(
+			<PhaseSettingsDetail
+				phase="review"
+				config={config}
+				isPending={false}
+				enabled={undefined}
+				{...targetHandlers()}
+				handleTimeoutChange={() => {}}
+				handlePromptChange={() => {}}
+				handleReviewReportChange={onChange}
+				onBack={() => {}}
+			/>,
+		);
+		return onChange;
+	}
+
+	it('shows the default review report above Custom prompt on Review', () => {
+		renderReview(mockConfig);
+
+		const field = screen.getByLabelText('Review report') as HTMLTextAreaElement;
+		expect(field.value).toBe(DEFAULT_REVIEW_REPORT);
+		const prompt = screen.getByLabelText('Custom prompt (optional)');
+		expect(field.compareDocumentPosition(prompt) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+		expect(
+			(screen.getByRole('button', { name: 'Restore default' }) as HTMLButtonElement).disabled,
+		).toBe(true);
+	});
+
+	it('edits the review report and restores the default', () => {
+		const onChange = renderReview({ ...mockConfig, reviewReport: '## Zakres\n\n{summary}' });
+
+		const field = screen.getByLabelText('Review report') as HTMLTextAreaElement;
+		expect(field.value).toBe('## Zakres\n\n{summary}');
+		fireEvent.change(field, { target: { value: '## Zakres' } });
+		expect(onChange).toHaveBeenLastCalledWith('## Zakres');
+
+		const restore = screen.getByRole('button', { name: 'Restore default' }) as HTMLButtonElement;
+		expect(restore.disabled).toBe(false);
+		fireEvent.click(restore);
+		expect(onChange).toHaveBeenLastCalledWith(undefined);
+	});
+
+	it('shows no review report field on any other phase', () => {
+		for (const phase of ['planning', 'implementation', 'implementationUnplanned'] as const) {
+			render(
+				<PhaseSettingsDetail
+					phase={phase}
+					config={mockConfig}
+					isPending={false}
+					enabled={undefined}
+					{...targetHandlers()}
+					handleTimeoutChange={() => {}}
+					handlePromptChange={() => {}}
+					onBack={() => {}}
+				/>,
+			);
+			expect(screen.queryByLabelText('Review report')).toBeNull();
 			cleanup();
 		}
 	});
@@ -1743,6 +1807,7 @@ describe('AgentConfigurationForm — Save/Reset scoping', () => {
 				handleTimeoutChange={() => {}}
 				handlePromptChange={() => {}}
 				handlePullRequestDescriptionChange={() => {}}
+				handleReviewReportChange={() => {}}
 				handleSubmit={handleSubmit}
 				handleReset={handleReset}
 				isDirty={true}

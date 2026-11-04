@@ -59,6 +59,7 @@ import {
 	normalizePullRequestDescription,
 	PULL_REQUEST_DESCRIPTION_MAX_LENGTH,
 } from './pull-request-description.js';
+import { normalizeReviewReport, REVIEW_REPORT_MAX_LENGTH } from './review-report.js';
 import {
 	adoptLegacyScmCredentials,
 	ScmCredentialReferencesByProviderSchema,
@@ -336,6 +337,14 @@ export const AgentConfigSchema = z
 		 * appends the work-item line itself, outside this structure.
 		 */
 		pullRequestDescription: z.string().optional(),
+		/**
+		 * The layout of the review report the agent's hand-off is rendered into
+		 * (issue #1288): headings and fixed wording in the project's language, plus
+		 * `{slot}` placeholders SWARM fills. Read **only** on `agents.review`. Unset
+		 * means SWARM's English default (`DEFAULT_REVIEW_REPORT`); a value equal to
+		 * the default normalizes to unset, so saving it untouched stores nothing.
+		 */
+		reviewReport: z.string().optional(),
 	})
 	.transform((agent, ctx) => {
 		// Whitespace-only is not a meaningful override — normalize it away so it's
@@ -344,6 +353,7 @@ export const AgentConfigSchema = z
 		// `prompt` optional, matching every other field.
 		agent.prompt = normalizeCustomPrompt(agent.prompt);
 		agent.pullRequestDescription = normalizePullRequestDescription(agent.pullRequestDescription);
+		agent.reviewReport = normalizeReviewReport(agent.reviewReport);
 		if (agent.targets === undefined) {
 			// A config written before `targets` existed (or one the pre-list dashboard
 			// saved): fold its single selection into the list so every reader sees one
@@ -405,6 +415,10 @@ export const AgentConfigSchema = z
 			path: ['pullRequestDescription'],
 		},
 	)
+	.refine((agent) => !agent.reviewReport || agent.reviewReport.length <= REVIEW_REPORT_MAX_LENGTH, {
+		message: `reviewReport must be at most ${REVIEW_REPORT_MAX_LENGTH} characters (issue #1288)`,
+		path: ['reviewReport'],
+	})
 	.refine(
 		// A phase names each CLI at most once — two targets on the same CLI would be
 		// an ambiguous priority rather than a fallback. `undefined` participates in

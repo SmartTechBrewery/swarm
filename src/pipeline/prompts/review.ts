@@ -32,6 +32,7 @@
 import { GH_IDENTITY_GUARD } from '@/pipeline/agent-auth.js';
 import { pipelinePhaseGuard } from '@/pipeline/agent-scope.js';
 import { projectInstructionsSection } from '@/pipeline/prompts/custom-prompt.js';
+import { ENGLISH_REVIEW_REPORT_VOCABULARY } from '@/pipeline/review-report-vocabulary.js';
 import { HANDOFF_FILENAMES } from '@/scm/delivery.js';
 import { PULL_REQUEST_CONTEXT_FILENAME } from '@/scm/pull-request-context.js';
 
@@ -74,8 +75,45 @@ const SEVERITY_RUBRIC: readonly string[] = [
 	'When a finding could plausibly have been major and you call it `minor`/`nit`, say why in `downgradeRationale` — a single string — so a real defect cannot be quietly parked among the nits.',
 ];
 
+/**
+ * The delimited block a project with its own review report layout gets (issue
+ * #1288): the layout, so the agent knows the report's language, the instruction to
+ * write every free-text field in it, and SWARM's own wording to translate into
+ * `reportLabels`. The agent still formats nothing — SWARM fills the layout. A project
+ * on SWARM's default layout gets no block at all, so its prompt is unchanged.
+ */
+function reviewReportSection(layout: string | undefined): readonly string[] {
+	if (layout === undefined) return [];
+	return [
+		'',
+		'--- REVIEW REPORT ---',
+		"This project has its own layout for the review report, shown below. SWARM fills it from your hand-off; do not reproduce it or format anything yourself. The report's language is the language this layout is written in.",
+		"- Write every free-text field of the hand-off in that language: `summary`, every finding's `title`, `evidence`, `failureScenario`, `impact`, `fixPlan`, `tests`, `suggestion` and `downgradeRationale`, every `carried` entry's `title` and `detail`, every `docsChecked` `note`, every `preExisting` entry and every `absorbed` `evidence`.",
+		'- Keep finding ids (`F1`, `F2`, …), the values of `verdict`, `severity`, `category` and `status`, commands, paths, URLs and code exactly as they are — SWARM relies on them.',
+		'- Unless the layout is in English, also write `reportLabels`: the object below with every value translated into that language. Keep each key, and keep every `{placeholder}` exactly as written; Markdown emphasis is added by SWARM. A value you leave out, or whose placeholders differ, stays English.',
+		'',
+		'Layout:',
+		layout,
+		'',
+		'Words to translate into `reportLabels`:',
+		JSON.stringify(ENGLISH_REVIEW_REPORT_VOCABULARY, null, 2),
+		'--- END REVIEW REPORT ---',
+	];
+}
+
+/**
+ * The `reportLabels` bullet of the field contract — present only beside a
+ * {@link reviewReportSection}, which is what it points at.
+ */
+function reportLabelsField(customReport: boolean): readonly string[] {
+	if (!customReport) return [];
+	return [
+		"  - `reportLabels`: an object whose values are strings — SWARM's own report wording translated into the language of the REVIEW REPORT layout, keyed exactly as listed there. Omit it when that layout is in English. When rewriting a hand-off, keep the one it already has.",
+	];
+}
+
 /** What each hand-off field must contain. Shared by both passes; the renderer owns the shape. */
-function handoffContract(isReReview: boolean): readonly string[] {
+function handoffContract(isReReview: boolean, customReport = false): readonly string[] {
 	return [
 		`Write "${REVIEW_VERDICT_FILENAME}" as JSON with these fields. SWARM renders the review from them — do not write a review body, headings, or a prose summary of your findings anywhere; anything you format yourself is discarded.`,
 		'Every field below states its JSON type. Write exactly that type: a string slot is ONE string even when you have several things to say, and an array slot is an array even when you have one entry.',
@@ -91,6 +129,7 @@ function handoffContract(isReReview: boolean): readonly string[] {
 					"  - `carried`: an array of `{id, title, status, detail}` objects, one per finding the previous review raised; `id`, `title` and `detail` are strings and `status` is `resolved`, `partial`, `outstanding`, or `regressed`. Reuse the previous review's finding ids (`F1`, `F2`, …) exactly — they are how SWARM tracks an item across passes. `detail` is your evidence for that status, traced in this checkout. Every entry that is NOT `resolved` must also appear in `findings` under that same id, so it carries a severity and a fix plan; the hand-off is rejected if one does not.",
 				]
 			: []),
+		...reportLabelsField(customReport),
 		'Each finding is `{id, title, severity, category, evidence, …}`:',
 		`  - \`id\`: a string, \`F1\`, \`F2\`, … numbered in the order you report them.${isReReview ? " Re-reporting an item from `carried` KEEPS that item's original id — that is what lets SWARM follow one problem across passes. Mint a new id only for a problem no earlier pass raised, continuing past the highest id the previous review used; never reuse an id for a different problem." : ''}`,
 		'  - `title`: a single string — one short line naming the defect, not a sentence about it.',
@@ -106,7 +145,10 @@ function handoffContract(isReReview: boolean): readonly string[] {
  * The numbered instruction block for a PR's **first** review — a full pass over
  * the whole diff, reporting every notable issue with a proposed fix plan.
  */
-function initialReviewInstructions({ repo, prNumber, baseBranch }: ReviewPromptContext): string[] {
+function initialReviewInstructions(
+	{ repo, prNumber, baseBranch }: ReviewPromptContext,
+	customReport: boolean,
+): string[] {
 	return [
 		'Do all of the following, in order:',
 		`1. Read the PR and its discussion in ${PR_CONTEXT_SOURCE}. ${LINKED_ISSUE_READ} — the issue and any plan posted on it are the ground truth for what was agreed.`,
@@ -122,7 +164,7 @@ function initialReviewInstructions({ repo, prNumber, baseBranch }: ReviewPromptC
 		'',
 		...SEVERITY_RUBRIC,
 		'',
-		...handoffContract(false),
+		...handoffContract(false, customReport),
 	];
 }
 
@@ -135,7 +177,10 @@ function initialReviewInstructions({ repo, prNumber, baseBranch }: ReviewPromptC
  * burns one of the PR's few permitted verdicts on unrelated work and restarts
  * the change cycle instead of confirming (or correcting) the fix.
  */
-function reReviewInstructions({ repo, prNumber, baseBranch }: ReviewPromptContext): string[] {
+function reReviewInstructions(
+	{ repo, prNumber, baseBranch }: ReviewPromptContext,
+	customReport: boolean,
+): string[] {
 	return [
 		'This PR was already reviewed and the most recent review REQUESTED CHANGES; the',
 		'implementer has since pushed new commits in response. This is a RE-REVIEW, and',
@@ -154,7 +199,7 @@ function reReviewInstructions({ repo, prNumber, baseBranch }: ReviewPromptContex
 		'',
 		...SEVERITY_RUBRIC,
 		'',
-		...handoffContract(true),
+		...handoffContract(true, customReport),
 	];
 }
 
@@ -175,11 +220,17 @@ function reReviewInstructions({ repo, prNumber, baseBranch }: ReviewPromptContex
  * `customPrompt` is the project's optional per-phase instructions (issue #135),
  * appended after the SWARM instructions as a clearly delimited, supplement-only
  * section (empty when unset).
+ *
+ * `reviewReport` is the project's own review report layout (issue #1288), already
+ * normalized — `undefined` on SWARM's default, which leaves the prompt as it was.
+ * It sits before the project instructions, so a Custom prompt keeps reading as
+ * general guidance for the phase.
  */
 export function buildReviewPrompt(
 	context: ReviewPromptContext,
 	customPrompt?: string,
 	isReReview = false,
+	reviewReport?: string,
 ): string {
 	const { repo, prNumber, headSha } = context;
 	return [
@@ -195,9 +246,12 @@ export function buildReviewPrompt(
 		`This worktree is checked out (detached) at ${headSha}, the head commit of PR`,
 		`#${prNumber} in ${repo}.`,
 		'',
-		...(isReReview ? reReviewInstructions(context) : initialReviewInstructions(context)),
+		...(isReReview
+			? reReviewInstructions(context, reviewReport !== undefined)
+			: initialReviewInstructions(context, reviewReport !== undefined)),
 		'',
 		'Do not merge the PR.',
+		...reviewReportSection(reviewReport),
 		...projectInstructionsSection(customPrompt),
 	].join('\n');
 }
@@ -234,6 +288,7 @@ export function buildReviewPrompt(
 export function buildReviewHandoffRepairPrompt(
 	validationError: string,
 	isReReview = false,
+	reviewReport?: string,
 ): string {
 	return [
 		...pipelinePhaseGuard(),
@@ -252,6 +307,7 @@ export function buildReviewHandoffRepairPrompt(
 		'',
 		...SEVERITY_RUBRIC,
 		'',
-		...handoffContract(isReReview),
+		...handoffContract(isReReview, reviewReport !== undefined),
+		...reviewReportSection(reviewReport),
 	].join('\n');
 }
