@@ -1,5 +1,11 @@
 # ADR-006: A worker updates when the installation asks it to
 
+> **Partly superseded by [ADR-007](./ADR-007-runtime-worker-updates.md) for
+> runtime-based workers.** For a worker `swarm-launcher run` starts, guards 1 and 2
+> below are replaced by the publisher's signature and guard 3 has nothing left to
+> protect; guard 4 is unchanged. Clone-based workers are still governed by this
+> record in full.
+
 - **Status**: accepted
 - **Issue**: [#975](https://github.com/SmartTechBrewery/swarm/issues/975)
 - **Date**: 2026-09-15

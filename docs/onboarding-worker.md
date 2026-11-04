@@ -1047,6 +1047,94 @@ to read the machine's own log, where the return is a single `returned to the las
 known good SWARM build` line preceded by why it gave up. Re-requesting the same ref
 will simply repeat the cycle; fix the build first.
 
+### Updating a runtime-based worker
+
+A **profile-based** worker (`swarm workers setup --profile`, started by
+`swarm-launcher run <worker-id>`) has no install root to move: it runs an immutable,
+signed runtime from `~/.swarm/runtimes/<version>/`. So it is asked for a **signed
+release version** rather than a branch or a commit (issues #1302–#1304):
+
+```bash
+swarm workers drain <worker-id>            # required first, exactly as above
+swarm workers update <worker-id> v1.6.0    # vX.Y.Z or X.Y.Z — a signed release
+swarm workers list                         # read what it reported
+swarm workers undrain <worker-id>          # put it back in the pool
+```
+
+The drain, the enrollment and the process-supervisor preconditions, the run in the
+runs list and the outcomes `swarm workers list` shows are all the ones described
+above. The installation's own commit is also accepted, as a name for the
+installation's own release. What differs is what the daemon does once it is idle:
+
+- **It installs the release, and nothing else.** It asks its control plane where
+  that version is — the installation's own artifact, or the publisher's GitHub
+  Release — downloads it, and installs it under `~/.swarm/runtimes/<version>/` only
+  after the size, the SHA-256, the minisign signature against the launcher's trusted
+  key and the signature's trusted comment (naming that version and commit) all
+  check out. It then records the version as the worker's selection in
+  `~/.swarm/workers/<worker-id>/state.json`, reports `applied`, and exits for the
+  launcher to start it on that version.
+- **One download per host.** However many of this host's workers are moved to the
+  same version, it is downloaded and verified once and shared read-only.
+- **No other worker is waited for or disturbed.** Each worker selects its own
+  version, and the one it leaves stays installed, so there is no peer to drain and
+  nothing like a shared install root's `adopted`.
+- **What is refused or fails, and leaves the worker where it was.** A branch, any
+  other commit, or a version with no signed release is `refused`, as is a release
+  whose runtime predates launcher-driven verification (its `build-info.json`
+  declares no `launcherProtocol`). A failed download or a check that does not pass
+  is `failed`. A version other than the installation's own is looked up on GitHub,
+  so it needs a public release and is subject to GitHub's anonymous API limit.
+
+There is no ancestor check and no dirty-root refusal here: the signature takes the
+place of the first, and an installed runtime is never modified, so the second has
+nothing to protect.
+[`ADR-007`](./decisions/ADR-007-runtime-worker-updates.md) records that trust model
+and which parts of ADR-006 it replaces; clone-based workers keep ADR-006 as it is.
+
+**What a rollback looks like.** A version a worker was moved to is on trial until a
+daemon running it connects once. `swarm-launcher run` counts every start of it
+*before* handing its process over, and after `MAX_FAILED_STARTS` (three) starts in
+a row without a session — or at once, when the control plane rejects the daemon's
+handshake outright — it starts the version the worker was moved from instead. Two
+logs tell that story:
+
+- The **daemon's** log, `<profileDir>/logs/worker.log`
+  (`~/.swarm/workers/<worker-id>/logs/worker.log`), carries `runtime version
+  verified — promoting it to last known good` when the new version connects, or
+  `the control plane rejected this runtime version outright — the launcher starts
+  the previous one next` when it never can. A runtime that dies before it gets that
+  far writes neither line.
+- The **launcher's** own output — under launchd, `swarm-worker-agent logs --profile
+  <worker-id>` ([`launchd-worker-autostart.md`](./launchd-worker-autostart.md#profile-based-workers))
+  — carries each counted start and the return:
+
+  ```text
+  swarm-launcher: starting on v1.6.0, newly selected — it proves itself by connecting
+  swarm-launcher: starting again on v1.6.0, which has still not connected once (2 of 3 starts)
+  swarm-launcher: giving up on v1.6.0, which never connected (3 of 3 starts); starting v1.5.0, the version this worker was moved from
+  ```
+
+From the control plane it reads as it does for a clone: `swarm workers list` still
+says `update v1.6.0 applied`, while the build the worker declares is the old one
+again. Re-requesting the same version repeats the cycle. If the version it was moved
+from is no longer installed, the launcher logs `giving up on v1.6.0 … but v1.5.0, the
+version this worker was moved from, is not installed — this worker is down until it
+is`, exits 1 and keeps trying that return on every start rather than going back to
+the version that never connected.
+
+**Where versions live, and when they are removed.** Every runtime is a read-only
+directory under `~/.swarm/runtimes/<version>/`, shared by every profile-based worker
+on the host; `swarm-launcher runtimes` lists them. A version is removed once no
+worker's `state.json` under `~/.swarm/workers/` names it — as its selected, last-run
+or last known good version, or as either side of a pending verification — so the
+version a worker runs and the one it would go back to are always kept. Removal
+happens on every `swarm-launcher run` (after it records its start) and right after a
+moved worker's first session proves the new version, so the version it left goes
+as soon as no other worker names it. A version installed within the last hour, or being installed, is
+kept, and nothing is removed while any worker's state cannot be read. There is no
+prune command and no retention setting.
+
 ### Who may ask, and for whose machines (issue #922)
 
 **An installation administrator may ask a machine they do not own — and that is all
