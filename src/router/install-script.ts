@@ -366,7 +366,11 @@ function Install-SwarmWorker {
 		$rest = @($rest | Select-Object -Skip 1)
 	}
 
-	$swarmDir = Join-Path $HOME '.swarm'
+	# Windows PowerShell 5.1's $HOME is HOMEDRIVE+HOMEPATH, which a redirected home
+	# moves off USERPROFILE: the home Node's os.homedir() reads, and the one the .cmd
+	# and the PATH entry below name.
+	$userHome = if ($onWindows -and $env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
+	$swarmDir = Join-Path $userHome '.swarm'
 	$launcherDir = Join-Path $swarmDir 'launcher'
 	$entry = Join-Path (Join-Path $launcherDir 'bin') 'swarm-worker.js'
 	$binDir = Join-Path $swarmDir 'bin'

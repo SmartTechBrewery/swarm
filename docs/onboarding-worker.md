@@ -199,9 +199,11 @@ irm https://swarm.example.com/install.ps1 | iex
 ```
 
 It checks the package against the installation's SHA-256 exactly as `install.sh`
-does, installs it at `~\.swarm\launcher`, writes `~\.swarm\bin\swarm-worker.cmd`, adds
-`~\.swarm\bin` to your **user** `PATH` (no admin), and runs the same `swarm-worker
-setup`. That PowerShell window can run `swarm-worker` at once; a terminal that was
+does, installs it at `%USERPROFILE%\.swarm\launcher`, writes
+`%USERPROFILE%\.swarm\bin\swarm-worker.cmd`, adds `%USERPROFILE%\.swarm\bin` to your
+**user** `PATH` (no admin), and runs the same `swarm-worker setup`. That is
+`%USERPROFILE%` rather than PowerShell's `$HOME`, which a redirected home folder
+moves to another drive: it is the home the launcher keeps its worker profiles under. That PowerShell window can run `swarm-worker` at once; a terminal that was
 already open before the install cannot until it is reopened, while any terminal
 opened afterwards can. A failure is reported as a `swarm install: …` error, and the
 window stays open.

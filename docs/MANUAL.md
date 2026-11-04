@@ -1482,9 +1482,12 @@ git or tar is missing (`tar.exe` ships with Windows 10 1803 and later and is
 preferred over any other `tar` on `PATH`); downloads with `Invoke-WebRequest` (TLS
 1.2 forced on Windows PowerShell 5.1) and checks the package with `Get-FileHash
 -Algorithm SHA256`, installing nothing on a mismatch; swaps it into
-`~\.swarm\launcher` the same way; writes `~\.swarm\bin\swarm-worker.cmd` (`@node
-"%USERPROFILE%\.swarm\launcher\bin\swarm-worker.js" %*`) and adds `~\.swarm\bin` to
-the **user** `PATH` when it is missing — terminals opened afterwards run
+`%USERPROFILE%\.swarm\launcher` the same way — `%USERPROFILE%`, the home Node's
+`os.homedir()` and so the launcher's profiles use, not Windows PowerShell 5.1's
+`$HOME`, which a redirected home folder moves to another drive; writes
+`%USERPROFILE%\.swarm\bin\swarm-worker.cmd` (`@node
+"%USERPROFILE%\.swarm\launcher\bin\swarm-worker.js" %*`) and adds
+`%USERPROFILE%\.swarm\bin` to the **user** `PATH` when it is missing — terminals opened afterwards run
 `swarm-worker` by name, and the current session's `$env:Path` is updated too; then
 runs `swarm-worker setup --control-plane-url <installation>`. A refusal is a thrown
 `swarm install: …` error rather than an `exit`, which under `irm | iex` would close

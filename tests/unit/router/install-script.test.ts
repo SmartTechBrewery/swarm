@@ -140,6 +140,32 @@ describe('renderInstallPowerShell', () => {
 		expect(/^[\t\n\x20-\x7e]*$/.test(script)).toBe(true);
 	});
 
+	it('roots the install at USERPROFILE on Windows, the home the .cmd, the PATH entry and Node name', () => {
+		expect(script).toContain(
+			'$userHome = if ($onWindows -and $env:USERPROFILE) { $env:USERPROFILE } else { $HOME }',
+		);
+		expect(script).toContain("$swarmDir = Join-Path $userHome '.swarm'");
+		expect(script).not.toMatch(/Join-Path \$HOME\b/);
+		expect(script).toContain('"%USERPROFILE%\\.swarm\\launcher\\bin\\swarm-worker.js"');
+		expect(script).toContain("'%USERPROFILE%\\.swarm\\bin'");
+	});
+
+	it.skipIf(!PWSH)('resolves that root to USERPROFILE on Windows and to $HOME elsewhere', () => {
+		const line = script.split('\n').find((l) => l.trim().startsWith('$userHome = '));
+		expect(line).toBeDefined();
+		const resolveHome = (onWindows: boolean, userProfile: string): string => {
+			const result = runPwsh(
+				`$onWindows = $${onWindows}; $env:USERPROFILE = ${powershellQuote(userProfile)}\n${line}\n[Console]::Out.Write($userHome)`,
+			);
+			expect(result.status, result.stderr).toBe(0);
+			return result.stdout;
+		};
+		const home = runPwsh('[Console]::Out.Write($HOME)').stdout;
+		expect(resolveHome(true, 'C:\\Users\\ada')).toBe('C:\\Users\\ada');
+		expect(resolveHome(true, '')).toBe(home);
+		expect(resolveHome(false, 'C:\\Users\\ada')).toBe(home);
+	});
+
 	it('quotes PowerShell strings with every quote PowerShell reads doubled', () => {
 		expect(powershellQuote("a'b")).toBe("'a''b'");
 		expect(powershellQuote('a’b‘c')).toBe("'a’’b‘‘c'");
@@ -455,7 +481,7 @@ describe('the installers end to end', () => {
 		function installPs(
 			home: string,
 			args: string[],
-			opts: { path?: string; url?: string; iex?: boolean } = {},
+			opts: { path?: string; url?: string; iex?: boolean; userProfile?: string } = {},
 		): Promise<{ status: number | null; stdout: string; stderr: string }> {
 			const scriptUrl = powershellQuote(`${opts.url ?? installation.url}/install.ps1`);
 			const command = opts.iex
@@ -469,6 +495,7 @@ describe('the installers end to end', () => {
 						cwd: home,
 						env: {
 							HOME: home,
+							...(opts.userProfile === undefined ? {} : { USERPROFILE: opts.userProfile }),
 							PATH: opts.path ?? `${NODE_DIR}:${SYSTEM_PATH}`,
 							POWERSHELL_TELEMETRY_OPTOUT: '1',
 							POWERSHELL_UPDATECHECK: 'Off',
@@ -519,6 +546,15 @@ describe('the installers end to end', () => {
 				'@node "%USERPROFILE%\\.swarm\\launcher\\bin\\swarm-worker.js" %*',
 			);
 			expect(readdirSync(join(home, '.swarm')).sort()).toEqual(['bin', 'launcher']);
+		}, 60_000);
+
+		it('keeps the install under $HOME off Windows, whatever USERPROFILE says', async () => {
+			const home = tempDir('home');
+			const profile = tempDir('profile');
+			const result = await installPs(home, ['version'], { userProfile: profile });
+			expect(result.status, result.stderr).toBe(0);
+			expect(existsSync(join(home, '.swarm/launcher/bin/swarm-worker.js'))).toBe(true);
+			expect(readdirSync(profile)).toEqual([]);
 		}, 60_000);
 
 		it('runs setup with the installation URL under irm | iex', async () => {
