@@ -1686,6 +1686,27 @@ describe('buildMatchesControlPlane (issue #925)', () => {
 		expect(buildMatchesControlPlane({ commit: COMMIT, dirty: false }, null)).toBeNull();
 		expect(buildMatchesControlPlane({ commit: COMMIT, dirty: false }, undefined)).toBeNull();
 	});
+
+	// Issue #1285: the image's build comes from a stamp and carries a version; an
+	// older daemon still sends only `{ commit, dirty }`. The commit decides, never
+	// the version label.
+	it('compares a stamped, versioned control plane against a commit-only daemon by commit', () => {
+		const image = { commit: COMMIT, dirty: false, version: '1.5.4' };
+		expect(buildMatchesControlPlane({ commit: COMMIT, dirty: false }, image)).toBe(true);
+		expect(buildMatchesControlPlane({ commit: OTHER, dirty: false }, image)).toBe(false);
+		expect(buildMatchesControlPlane({ commit: OTHER, dirty: false, version: '1.5.4' }, image)).toBe(
+			false,
+		);
+	});
+
+	it('matches an abbreviated stamped commit against the full id it prefixes', () => {
+		expect(
+			buildMatchesControlPlane(
+				{ commit: COMMIT, dirty: false },
+				{ commit: COMMIT.slice(0, 7), dirty: false },
+			),
+		).toBe(true);
+	});
 });
 
 describe('getDashboardWorkerDetail (issue #477)', () => {

@@ -155,11 +155,13 @@ export type TaskPhase = z.infer<typeof TaskPhaseSchema>;
  * clears the stored set. Additive in both directions, so no protocol-version bump.
  *
  * `build` is the SWARM build this daemon is actually running (issue #918): the
- * commit its **install root** is on, plus a flag for a dirty or unbuilt checkout.
- * It is what `daemonVersion` above cannot be — that resolves to `package.json`'s
- * `version`, which never moves, so every daemon in the fleet reports the same
- * string whatever code it runs, and "is this worker running the fix?" has no
- * answer from the control plane at all. The install root is anchored on the
+ * commit its **install root** is on (or the commit stamped into a build with no
+ * checkout of its own, issue #1285), plus a flag for a dirty or unbuilt checkout,
+ * and — optionally, so an older daemon's `{ commit, dirty }` still parses — the
+ * release version beside it. It is what `daemonVersion` above cannot be: a release
+ * version moves only when one is cut, so between two releases every daemon reports
+ * the same string whatever code it runs, and "is this worker running the fix?" is
+ * answered by the commit alone. The install root is anchored on the
  * daemon's own module path, never its repo root: one npm-linked SWARM checkout
  * serves daemons whose `cwd` is a different project repository each
  * (`WorkerBuildSchema`, `../lib/build-identity.js` — the shared definition rather

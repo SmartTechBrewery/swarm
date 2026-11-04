@@ -395,7 +395,10 @@ async function main(): Promise<void> {
 		build,
 		supervision,
 		hostname: host,
-		daemonVersion: resolveDaemonVersion(),
+		// The build's own version first (issue #1285): it is read from the install root
+		// or its stamp, where `npm_package_version` is the *project's* when the daemon
+		// was launched from a project's npm script.
+		daemonVersion: build?.version ?? resolveDaemonVersion(),
 		onAssignment: (assignment, sink) => {
 			void runAssignmentDbFree(assignment, sink, {
 				// The same set the handshake declares, so the executor runs each assignment in

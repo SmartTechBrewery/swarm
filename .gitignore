@@ -46,6 +46,10 @@ lerna-debug.log*
 # IDs, credential references), not committed. See src/cli/commands/init.ts.
 swarm.config.json
 
+# Build identity stamp (bin/write-build-info.js, issue #1285) — written into an
+# install root with no checkout of its own; a clone reads git instead.
+build-info.json
+
 # TypeScript
 *.tsbuildinfo
 dist/
