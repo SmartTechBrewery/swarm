@@ -249,6 +249,35 @@ The global `swarm run:worker` form uses its current directory; `npm run swarm --
 run:worker` uses npm's caller directory (`INIT_CWD`), so both forms select the
 checkout you invoked them from.
 
+**The packaged runtime: a worker without a SWARM clone** (issue #1279). The same
+daemon can be built into one self-contained artifact that needs nothing on the
+machine but Node ≥ 22 — no SWARM checkout, no `node_modules`, no `tsx`:
+
+```bash
+SWARM_BUILD_COMMIT=$(git rev-parse HEAD) npm run build:worker-runtime
+# → worker-runtime/swarm-worker-runtime-<version>.tar.gz
+```
+
+It unpacks to `swarm-worker-runtime-<version>/` holding a minimal `package.json`, the
+`build-info.json` stamp (written only when `SWARM_BUILD_COMMIT` is set — without it
+the runtime declares no build), and `dist/transport/connect-entry.mjs`, the daemon
+bundled by esbuild. Run it with the variables above exported, or from a directory
+holding that `.env`:
+
+```bash
+tar -xzf swarm-worker-runtime-<version>.tar.gz
+node --env-file-if-exists=.env swarm-worker-runtime-<version>/dist/transport/connect-entry.mjs
+```
+
+The env contract is unchanged, since it is the same entrypoint, and
+`SWARM_WORKER_REPO_ROOT` still names the project checkouts the agents work in;
+`logs/worker.log` is relative to the current directory as before. The tarball is
+byte-identical for one tree and commit. Two limits for now: a packaged runtime has no
+git checkout of its own, so an update request from the control plane is **refused**
+there rather than applied (replace the artifact instead), and `swarm run:worker` and
+`swarm-worker-agent` still start a clone — running from a clone is unchanged. Signed
+release assets and a copy in the published image are the follow-up.
+
 **One worker can serve several repositories on one machine** (issue #1059) — one
 checkout per repository, one daemon. Give it the extra checkouts at registration
 with `--extra-checkout <path>` (repeatable, on `workers register` and
@@ -1305,8 +1334,9 @@ places (`src/lib/build-identity.ts`):
   applies, so a developer checkout is still marked as not a clean release.
 - **The published image, or a packaged install** with no checkout of its own reads
   `build-info.json` beside its `package.json` — the version and commit stamped at
-  build time by `bin/write-build-info.js` (CI passes the commit). A stamped build is
-  never dirty. An install with neither declares no build. A machine whose build is not the control
+  build time by `bin/write-build-info.js` (CI passes the commit); the packaged
+  worker runtime ([The worker](#the-worker)) carries one the same way. A stamped
+  build is never dirty. An install with neither declares no build. A machine whose build is not the control
 plane's carries an `OUTDATED` badge, on its detail view and beside its name in the
 roster, so "which workers are behind?" is one glance rather than a question per
 machine. The badge says the builds *differ*, not that the machine is behind: the

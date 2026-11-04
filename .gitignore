@@ -50,6 +50,10 @@ swarm.config.json
 # install root with no checkout of its own; a clone reads git instead.
 build-info.json
 
+# The packaged worker runtime and its staged tree (bin/build-worker-runtime.js,
+# issue #1279) — a build output, never committed.
+worker-runtime/
+
 # TypeScript
 *.tsbuildinfo
 dist/

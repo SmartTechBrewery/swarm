@@ -117,7 +117,7 @@ The **implementer** persona is no longer a project credential (issue #396), and 
 **Image build** — build-time only (`Dockerfile`, `bin/write-build-info.js`), never read by a running process
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `SWARM_BUILD_COMMIT` | _(unset)_ | Docker build arg: the source commit stamped into the image's `build-info.json` beside `package.json`'s version, which is the build identity an install with no `.git` reports (issue #1285; `ai/ARCHITECTURE.md` "Build identity"). CI passes `github.sha`. Unset → nothing is stamped and the control plane declares no build; a non-hex value fails the build. |
+| `SWARM_BUILD_COMMIT` | _(unset)_ | Docker build arg: the source commit stamped into the image's `build-info.json` beside `package.json`'s version, which is the build identity an install with no `.git` reports (issue #1285; `ai/ARCHITECTURE.md` "Build identity"). CI passes `github.sha`. Also read by `npm run build:worker-runtime`, which stamps the packaged worker runtime the same way (issue #1279). Unset → nothing is stamped and the control plane (or the runtime) declares no build; a non-hex value fails the build. |
 
 **Dashboard frontend (Vite)** — only `VITE_`-prefixed vars reach the browser (`dashboard/.env`)
 | Variable | Default | Purpose |

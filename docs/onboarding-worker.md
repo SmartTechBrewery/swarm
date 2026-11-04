@@ -639,6 +639,12 @@ git clone <repo-url> && cd swarm
 npm ci
 ```
 
+(A machine that should not hold a SWARM clone at all can run the packaged worker
+runtime instead — one tarball needing only Node ≥ 22, with this same `.env`
+contract; see "The packaged runtime" under
+[The worker](./MANUAL.md#the-worker) in the manual. Part 1 still needs a clone
+somewhere, for the `swarm` CLI.)
+
 Since issue #800 this same checkout is where Part 1 is run from — `swarm login` and
 `swarm workers register-and-enroll` need only `SWARM_CONTROL_PLANE_URL`, and
 `register-and-enroll --control-plane-url <url>` writes that line into the `.env`
