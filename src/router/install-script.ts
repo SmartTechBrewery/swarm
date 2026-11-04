@@ -1,0 +1,271 @@
+/**
+ * `GET /install.sh` — the one command that sets a worker host up with no SWARM
+ * clone (issue #1312):
+ *
+ *   curl -fsSL https://<installation>/install.sh | sh
+ *   curl -fsSL https://<installation>/install.sh | sh -s -- [<subcommand>] [flags]
+ *
+ * Run in the project checkout the worker is to serve, the script checks for Node
+ * >= 22 and git, downloads the installation's own launcher package
+ * (`./worker-launcher.ts`) and checks its SHA-256 against the manifest, installs it
+ * at `~/.swarm/launcher` with `swarm-worker` linked into `~/.swarm/bin` (and
+ * `~/.local/bin` when that is on `PATH`), and hands over to `swarm-worker setup
+ * --control-plane-url <installation>` — or to the subcommand given after `sh -s --`
+ * — with the remaining flags passed through and the terminal as stdin, since under
+ * `curl | sh` stdin is the script. Nothing is downloaded from GitHub.
+ *
+ * **Re-running it upgrades the launcher in place.** The new package is unpacked to
+ * `~/.swarm/launcher.new` and swapped in, the previous one kept until the swap has
+ * succeeded. A LaunchAgent installed by `swarm-worker setup` names the stable
+ * `~/.swarm/launcher/bin/swarm-worker.js`, so it runs the new launcher on its next
+ * start.
+ *
+ * **Trust:** the launcher is not signed. Installing it trusts the installation over
+ * TLS, exactly as `curl | sh` always does; the runtimes it then installs stay
+ * minisign-verified against the key the package carries (ADR-007).
+ *
+ * The installation's base URL is baked into the script: `WEBHOOK_CALLBACK_BASE_URL`
+ * when set (SWARM's public base URL, authoritative), otherwise the request's own
+ * `Host` and `X-Forwarded-Proto` — the order `./webhook-callback-url.ts` uses, for
+ * the same reason. It is single-quoted, so no value can break out of it.
+ */
+
+import type { Hono } from 'hono';
+
+import { resolveWebhookCallbackBaseUrl } from '../lib/env.js';
+import {
+	WORKER_LAUNCHER_ARTIFACTS_PATH,
+	WORKER_LAUNCHER_MANIFEST_PATH,
+} from '../transport/runtime-manifest.js';
+
+/** The route the installer is served on. */
+export const INSTALL_SCRIPT_PATH = '/install.sh';
+
+/** `value` as one single-quoted POSIX shell word: nothing in it is expanded. */
+export function shellQuote(value: string): string {
+	return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+/**
+ * The installation's base URL as a client reached it: `configured` (the
+ * `WEBHOOK_CALLBACK_BASE_URL` value) when set, otherwise the request's `Host` with
+ * `X-Forwarded-Proto` (else the scheme the request itself arrived on). `undefined`
+ * when there is no usable `Host`.
+ */
+export function resolveInstallationBaseUrl(
+	header: (name: string) => string | undefined,
+	requestUrl: string,
+	configured: string | undefined = resolveWebhookCallbackBaseUrl(),
+): string | undefined {
+	if (configured) return configured;
+	const host = header('host')?.trim();
+	if (!host) return undefined;
+	const forwarded = header('x-forwarded-proto')?.split(',')[0]?.trim().toLowerCase();
+	const scheme =
+		forwarded === 'http' || forwarded === 'https'
+			? forwarded
+			: new URL(requestUrl).protocol.replace(/:$/, '');
+	try {
+		const url = new URL(`${scheme}://${host}`);
+		// A Host that smuggles a path, query or credentials is not a host.
+		if (url.pathname !== '/' || url.search || url.hash || url.username || url.password)
+			return undefined;
+		return url.origin;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * The installer for the installation at `baseUrl`. POSIX `sh`, `set -eu`; the whole
+ * body is a function called on the last line, so a download cut short runs nothing.
+ */
+export function renderInstallScript(baseUrl: string): string {
+	return String.raw`#!/bin/sh
+# Install the SWARM worker launcher from this installation, then run
+# swarm-worker setup (issue #1312). Run it in the project checkout the worker is
+# to serve:
+#
+#   curl -fsSL <installation>/install.sh | sh
+#   curl -fsSL <installation>/install.sh | sh -s -- [<subcommand>] [flags]
+#
+# Needs Node.js >= 22, git, curl and tar. Everything is downloaded from the
+# installation below and checked against its SHA-256; nothing from GitHub.
+set -eu
+
+SWARM_URL=${shellQuote(baseUrl)}
+
+say() {
+	printf '%s\n' "swarm install: $*" >&2
+}
+
+fail() {
+	say "$*"
+	exit 1
+}
+
+require_prerequisites() {
+	command -v node >/dev/null 2>&1 ||
+		fail "Node.js >= 22 is required, and node is not on PATH. Install it (https://nodejs.org) and re-run."
+	node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 22 ? 0 : 1)' ||
+		fail "Node.js >= 22 is required, and node is $(node --version 2>/dev/null || echo 'of an unknown version'). Upgrade it and re-run."
+	command -v git >/dev/null 2>&1 ||
+		fail "git is required, and git is not on PATH. Install it and re-run."
+	command -v curl >/dev/null 2>&1 ||
+		fail "curl is required, and curl is not on PATH. Install it and re-run."
+	command -v tar >/dev/null 2>&1 ||
+		fail "tar is required, and tar is not on PATH. Install it and re-run."
+}
+
+# The launcher manifest on stdin, as "<version> <file> <sha256>", or the reason
+# the installation serves none (on stderr, exit 1).
+read_manifest() {
+	node -e '
+let text = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { text += chunk; });
+process.stdin.on("end", () => {
+	const refuse = (reason) => { console.error("swarm install: " + reason); process.exit(1); };
+	let m;
+	try { m = JSON.parse(text); } catch { refuse("the launcher manifest is not JSON"); }
+	if (!m || m.available !== true)
+		refuse("this installation serves no worker launcher: " + (m && m.reason ? m.reason : "no reason given"));
+	if (!/^[0-9A-Za-z][0-9A-Za-z.+-]{0,99}$/.test(String(m.version)) ||
+		m.file !== "swarm-worker-launcher-" + m.version + ".tar.gz" ||
+		!/^[0-9a-f]{64}$/.test(String(m.sha256)))
+		refuse("the launcher manifest is malformed");
+	process.stdout.write(m.version + " " + m.file + " " + m.sha256 + "\n");
+});'
+}
+
+sha256_of() {
+	if command -v sha256sum >/dev/null 2>&1; then
+		sha256sum "$1" | cut -d ' ' -f 1
+	elif command -v shasum >/dev/null 2>&1; then
+		shasum -a 256 "$1" | cut -d ' ' -f 1
+	else
+		fail "neither sha256sum nor shasum is available to verify the download."
+	fi
+}
+
+link_command() {
+	rm -f "$2"
+	ln -s "$1" "$2"
+}
+
+main() {
+	require_prerequisites
+
+	# A first argument that is not a flag names the subcommand; setup otherwise.
+	subcommand=setup
+	if [ "$#" -gt 0 ]; then
+		case "$1" in
+			-*) ;;
+			*)
+				subcommand=$1
+				shift
+				;;
+		esac
+	fi
+
+	swarm_dir="$HOME/.swarm"
+	launcher_dir="$swarm_dir/launcher"
+	entry="$launcher_dir/bin/swarm-worker.js"
+	mkdir -p "$swarm_dir"
+	# Beside the destination, so the swap below is a rename.
+	work=$(mktemp -d "$swarm_dir/.install.XXXXXX")
+	trap 'rm -rf "$work"' EXIT
+
+	say "reading the worker launcher manifest from $SWARM_URL"
+	curl -fsSL -o "$work/manifest.json" "$SWARM_URL${WORKER_LAUNCHER_MANIFEST_PATH}" ||
+		fail "could not read $SWARM_URL${WORKER_LAUNCHER_MANIFEST_PATH}"
+	fields=$(read_manifest <"$work/manifest.json") || exit 1
+	read -r version file sha256 <<EOF
+$fields
+EOF
+
+	say "downloading swarm-worker $version"
+	curl -fsSL -o "$work/$file" "$SWARM_URL${WORKER_LAUNCHER_ARTIFACTS_PATH}/$file" ||
+		fail "could not download $SWARM_URL${WORKER_LAUNCHER_ARTIFACTS_PATH}/$file"
+	actual=$(sha256_of "$work/$file")
+	[ "$actual" = "$sha256" ] ||
+		fail "$file does not match the installation's SHA-256 (expected $sha256, got $actual). Nothing was installed."
+
+	mkdir "$work/unpack"
+	tar -xzf "$work/$file" -C "$work/unpack" || fail "could not unpack $file. Nothing was installed."
+	unpacked="$work/unpack/swarm-worker-launcher-$version"
+	[ -f "$unpacked/bin/swarm-worker.js" ] ||
+		fail "$file holds no swarm-worker-launcher-$version/bin/swarm-worker.js. Nothing was installed."
+
+	# Swap it in, keeping the previous launcher until the new one is in place.
+	rm -rf "$launcher_dir.new" "$launcher_dir.old"
+	mv "$unpacked" "$launcher_dir.new"
+	if [ -e "$launcher_dir" ] || [ -L "$launcher_dir" ]; then
+		mv "$launcher_dir" "$launcher_dir.old"
+		if ! mv "$launcher_dir.new" "$launcher_dir"; then
+			mv "$launcher_dir.old" "$launcher_dir"
+			fail "could not move the new launcher into $launcher_dir; the previous one is kept."
+		fi
+		rm -rf "$launcher_dir.old"
+	else
+		mv "$launcher_dir.new" "$launcher_dir"
+	fi
+
+	mkdir -p "$swarm_dir/bin"
+	link_command "$entry" "$swarm_dir/bin/swarm-worker"
+	on_path=
+	case ":$PATH:" in
+		*":$swarm_dir/bin:"*) on_path=yes ;;
+	esac
+	case ":$PATH:" in
+		*":$HOME/.local/bin:"*)
+			if [ -L "$HOME/.local/bin/swarm-worker" ] || [ ! -e "$HOME/.local/bin/swarm-worker" ]; then
+				mkdir -p "$HOME/.local/bin"
+				link_command "$entry" "$HOME/.local/bin/swarm-worker"
+				on_path=yes
+			else
+				say "$HOME/.local/bin/swarm-worker exists and is not a link, so it was left as it is."
+			fi
+			;;
+	esac
+	say "installed swarm-worker $version in $launcher_dir"
+	[ -n "$on_path" ] ||
+		say "to run swarm-worker by name, add it to your PATH: export PATH=\"\$HOME/.swarm/bin:\$PATH\""
+
+	rm -rf "$work"
+	trap - EXIT
+	# Under curl | sh, stdin is this script: answer setup's questions from the terminal.
+	if (: </dev/tty) 2>/dev/null; then
+		exec node "$entry" "$subcommand" --control-plane-url "$SWARM_URL" "$@" </dev/tty
+	fi
+	exec node "$entry" "$subcommand" --control-plane-url "$SWARM_URL" "$@"
+}
+
+main "$@"
+`;
+}
+
+/** Mount `GET /install.sh` on the router's `app`. `configuredBaseUrl` is for tests. */
+export function registerInstallScript(
+	app: Hono,
+	options: { configuredBaseUrl?: () => string | undefined } = {},
+): void {
+	const configured = options.configuredBaseUrl ?? (() => resolveWebhookCallbackBaseUrl());
+	app.get(INSTALL_SCRIPT_PATH, (c) => {
+		const baseUrl = resolveInstallationBaseUrl(
+			(name) => c.req.header(name),
+			c.req.url,
+			configured(),
+		);
+		if (!baseUrl)
+			return c.text(
+				"Cannot tell this installation's public URL: the request has no usable Host header and WEBHOOK_CALLBACK_BASE_URL is not set.\n",
+				400,
+				{ 'Cache-Control': 'no-store' },
+			);
+		return c.body(renderInstallScript(baseUrl), 200, {
+			'Content-Type': 'text/x-shellscript; charset=utf-8',
+			'Cache-Control': 'no-store',
+		});
+	});
+}

@@ -120,3 +120,41 @@ export function parseMinisignTrustedComment(
 	}
 	return undefined;
 }
+
+/**
+ * The **launcher manifest** (issue #1312): the clone-free `swarm-worker` launcher
+ * package (`bin/build-worker-launcher.js`, issue #1283) the installation serves to
+ * a new host, beside its runtime. `install.sh` (`../router/install-script.ts`)
+ * reads it, downloads the file and checks its SHA-256 before unpacking anything.
+ *
+ * Both routes are **unauthenticated**: the installer holds no credential yet, and
+ * the package is the public launcher plus the publisher's public key — nothing
+ * secret. Unlike the runtime it is not signed: installing it trusts the
+ * installation over TLS, exactly as `curl … | sh` does; the runtimes it installs
+ * stay minisign-verified against the key it carries (ADR-007).
+ */
+export const WORKER_LAUNCHER_MANIFEST_PATH = '/worker/launcher/manifest';
+
+/** The prefix the launcher artifact route serves `<file>` under. Unauthenticated. */
+export const WORKER_LAUNCHER_ARTIFACTS_PATH = '/worker/launcher/artifacts';
+
+/** The launcher package's file name for `version`, as `bin/build-worker-launcher.js` writes it. */
+export function launcherArtifactName(version: string): string {
+	return `swarm-worker-launcher-${version}.tar.gz`;
+}
+
+/** The launcher is served: its version, file name (under the artifact route), size and SHA-256. */
+export const AvailableWorkerLauncherManifestSchema = z.object({
+	available: z.literal(true),
+	version: z.string().regex(VERSION_GRAMMAR, 'must be a runtime version'),
+	file: z.string().min(1),
+	size: z.number().int().nonnegative(),
+	sha256: z.string().regex(/^[0-9a-f]{64}$/, 'must be a hex SHA-256'),
+});
+export type AvailableWorkerLauncherManifest = z.infer<typeof AvailableWorkerLauncherManifestSchema>;
+
+export const WorkerLauncherManifestSchema = z.discriminatedUnion('available', [
+	AvailableWorkerLauncherManifestSchema,
+	UnavailableWorkerRuntimeManifestSchema,
+]);
+export type WorkerLauncherManifest = z.infer<typeof WorkerLauncherManifestSchema>;
