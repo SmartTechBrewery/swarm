@@ -102,7 +102,15 @@ describe('swarm-worker', () => {
 	});
 
 	it('names only the subcommands that exist', () => {
-		for (const command of ['setup', 'login', 'status', 'migrate', 'run <workerId>', 'runtimes'])
+		for (const command of [
+			'setup',
+			'login',
+			'status',
+			'migrate',
+			'agent <action> --profile <workerId>',
+			'run <workerId>',
+			'runtimes',
+		])
 			expect(USAGE).toContain(`swarm-worker ${command}`);
 		expect(USAGE).not.toMatch(/swarm-worker upgrade\b/);
 	});
@@ -114,6 +122,9 @@ describe('swarm-worker', () => {
 		['status', ['status', 'w-1']],
 		// Issue #1313.
 		['migrate', ['migrate', '/work/api', '--yes']],
+		// Issue #1323.
+		['agent', ['agent', 'status', '--profile', 'w-1']],
+		['serviceRun', ['service-run', 'w-1']],
 	] as const)('hands %s its own arguments, and nothing to the launcher', async (command, argv) => {
 		const launcher = vi.fn();
 		const handler = vi.fn().mockResolvedValue(3);

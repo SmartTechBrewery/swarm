@@ -2964,6 +2964,31 @@ describe('swarm workers', () => {
 			);
 		});
 
+		// Issue #1323: a service manager other than launchd names itself and its command.
+		it('setup --profile names the supervisor and command the service manager reports', async () => {
+			installProfileWorkerAutostart.mockResolvedValue({
+				kind: 'installed',
+				supervisor: 'Task Scheduler',
+				serviceCommand: 'swarm-worker agent',
+			});
+			expect(await run(SETUP)).toBe(0);
+			expect(lines().at(-1)).toContain(
+				`installed under Task Scheduler and starting — check it with: swarm-worker agent status --profile ${WORKER_ID}`,
+			);
+		});
+
+		it('setup --profile names the service manager’s command to retry a failure with', async () => {
+			installProfileWorkerAutostart.mockResolvedValue({
+				kind: 'failed',
+				reason: 'exit 1',
+				serviceCommand: 'swarm-worker agent',
+			});
+			expect(await run(SETUP)).toBe(1);
+			expect(lines().at(-1)).toContain(
+				`retry it with: swarm-worker agent install --profile ${WORKER_ID}`,
+			);
+		});
+
 		it('setup --profile names the launcher where no autostart exists', async () => {
 			installProfileWorkerAutostart.mockResolvedValue({ kind: 'unsupported', platform: 'linux' });
 			expect(await run(SETUP)).toBe(0);

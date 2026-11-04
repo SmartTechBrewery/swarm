@@ -5,10 +5,12 @@
  * For each profile under `~/.swarm/workers/` it reports three views, each from the
  * place that actually knows:
  *
- *   - **the LaunchAgent**, from `swarm-worker-agent status --profile <id>` — the
- *     installer the package ships, so launchd's own answer (loaded, pid, last exit)
- *     is printed rather than re-derived. launchd is macOS-only; elsewhere it says
- *     so and names the foreground command.
+ *   - **the login service**, from the host's service manager
+ *     (`./service-manager.ts`, issue #1323): on macOS `swarm-worker-agent status
+ *     --profile <id>` — the installer the package ships, so launchd's own answer
+ *     (loaded, pid, last exit) is printed rather than re-derived — and on Windows
+ *     the Task Scheduler task's state and its keep-alive loop's pid. Where there is
+ *     no service manager it says so and names the foreground command.
  *   - **the runtime**, from the worker's `state.json`: the version it is selected to
  *     run, whether that is installed, and the one it last started on.
  *   - **the control plane**, from `workers.listMine` when this host holds a live
@@ -20,8 +22,6 @@
  * on it. No `.env` is read: each profile names its own installation.
  */
 
-import { execFile } from 'node:child_process';
-import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { z } from 'zod';
 import { launcherCommand } from '../cli/_shared/installation-command.js';
@@ -32,9 +32,9 @@ import {
 	type OperatorSession,
 } from '../cli/_shared/operator-client.js';
 import * as out from '../cli/_shared/output.js';
-import { REPO_ROOT } from '../cli/_shared/paths.js';
 import { cachedSession, loginCommandFor, operatorClientFor } from './operator-session.js';
 import { installedRuntime } from './runtime-store.js';
+import { resolveServiceManager } from './service-manager.js';
 import {
 	isValidWorkerId,
 	type ListedWorkerProfile,
@@ -47,8 +47,9 @@ export const STATUS_USAGE = `swarm-worker status — report this host's profile 
 Usage:
   swarm-worker status [<workerId>]
 
-For each worker profile on this host (or just <workerId>): its LaunchAgent
-(swarm-worker-agent status --profile <id>), the runtime it is selected to run
+For each worker profile on this host (or just <workerId>): its login service
+(swarm-worker agent status --profile <id> — a LaunchAgent on macOS, a Task
+Scheduler task on Windows), the runtime it is selected to run
 (~/.swarm/workers/<id>/state.json), and — when you are signed in to its
 installation — whether the control plane sees it connected, when it was last
 seen, whether it is drained, and its enrollments. Without a session it shows the
@@ -87,8 +88,10 @@ export async function listOwnWorkers(client: OperatorClient): Promise<OwnWorker[
 	);
 }
 
-/** The LaunchAgent's own report, or `null` where there is no launchd. */
-export type AgentStatusReader = (workerId: string) => Promise<{ output: string } | null>;
+/** The service manager's own report, or `null` where there is none. */
+export type AgentStatusReader = (
+	workerId: string,
+) => Promise<{ supervisor: string; output: string } | null>;
 
 export interface StatusDeps {
 	fetch?: FetchLike;
@@ -98,24 +101,15 @@ export interface StatusDeps {
 	now?: () => number;
 }
 
-/** `swarm-worker-agent status --profile <id>`, captured; `null` off macOS. */
+/** The host's service manager's status for the worker, captured; `null` where there is none. */
 export function defaultAgentStatus(
 	platform: NodeJS.Platform = process.platform,
 ): AgentStatusReader {
-	return (workerId) => {
-		if (platform !== 'darwin') return Promise.resolve(null);
-		const installer = join(REPO_ROOT, 'bin', 'swarm-worker-agent');
-		return new Promise((resolve) => {
-			execFile(
-				installer,
-				['status', '--profile', workerId],
-				{ timeout: 15_000 },
-				(error, stdout, stderr) => {
-					const text = `${stdout}${stderr}`.trim();
-					resolve({ output: text || (error ? error.message : '') });
-				},
-			);
-		});
+	return async (workerId) => {
+		const manager = resolveServiceManager(platform);
+		if (!manager) return null;
+		const { output } = await manager.status(workerId);
+		return { supervisor: manager.name, output };
 	};
 }
 
@@ -219,16 +213,16 @@ function selectProfiles(
 	};
 }
 
-/** Print the LaunchAgent's own report for one worker. */
+/** Print the service manager's own report for one worker. */
 async function reportAgent(workerId: string, agentStatus: AgentStatusReader): Promise<void> {
 	const agent = await agentStatus(workerId);
 	if (agent === null) {
 		out.info(
-			`  LaunchAgent: none (launchd is macOS-only) — run it with: ${launcherCommand()} run ${workerId}`,
+			`  service: none (no supported service manager on ${process.platform}) — run it with: ${launcherCommand()} run ${workerId}`,
 		);
 		return;
 	}
-	out.info('  LaunchAgent:');
+	out.info(`  service (${agent.supervisor}):`);
 	for (const line of agent.output.split('\n')) out.info(`    ${line.trim()}`);
 }
 

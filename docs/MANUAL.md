@@ -324,7 +324,11 @@ The signing key it trusts is `deploy/worker-runtime/minisign.pub` under the
 launcher's own install; without that file it installs nothing new and still starts
 versions already installed. Under launchd, `swarm-worker-agent install --profile <workerId>` runs
 it at login as `<root>/bin/swarm-worker.js run <workerId>` (issue #1297, [`launchd-worker-autostart.md`](./launchd-worker-autostart.md),
-"Profile-based workers").
+"Profile-based workers"). On Windows, `swarm-worker agent install --profile <workerId>`
+registers a per-user Task Scheduler task that runs it at log on through the
+`swarm-worker service-run <workerId>` keep-alive loop, which starts it again whenever
+it exits — including after an update (issue #1323,
+[`swarm-worker agent`](./cli.md#swarm-worker-agent)).
 
 The launcher runs either from a SWARM build (`npm run build`, then
 `bin/swarm-worker.js` or the older `bin/swarm-launcher.js`) or, with **no clone and
@@ -402,7 +406,8 @@ start it with once the old daemon is stopped. See
 curl -fsSL https://swarm.example.com/install.sh | sh   # installs swarm-worker, then runs setup
 # …which is, once swarm-worker is installed:
 swarm-worker setup --control-plane-url https://swarm.example.com
-swarm-worker status            # each profile: LaunchAgent, runtime, connected or not
+swarm-worker status            # each profile: login service, runtime, connected or not
+swarm-worker agent logs --profile <workerId>   # follow its logs (also install|uninstall|status)
 swarm-worker login             # renew the session (URL defaults to the profiles' one)
 ```
 
@@ -415,8 +420,9 @@ token for the project's provider (typed without echo, or `--scm-token-file
 <path|->`; only one of the two files may be `-`). It then registers, enrolls and
 credentials the worker with `swarm workers setup --profile`'s own code, writes the
 profile, installs and verifies the installation's runtime (a verification refusal
-stops it before launchd is touched; an installation serving no runtime yet is only a
-warning), installs the LaunchAgent, and waits up to a minute for the control plane
+stops it before any login service is installed; an installation serving no runtime
+yet is only a warning), installs its login service — a LaunchAgent on macOS, a
+per-user "at log on" Task Scheduler task on Windows — and waits up to a minute for the control plane
 to see the worker connected. Every question has a flag, so with every flag given it
 runs unattended; with no terminal a missing answer fails naming its flag, and
 `--yes` accepts the defaults. The password is never printed, logged or stored, and

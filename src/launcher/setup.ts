@@ -4,7 +4,8 @@
  *
  * It ends with a worker that is registered, enrolled, credentialed, kept in its own
  * profile (`~/.swarm/workers/<id>/profile.json`), on a verified runtime, supervised
- * by launchd, and connected — or it says which of those it could not do and how to
+ * by the host's login service — a LaunchAgent on macOS, a Task Scheduler task on
+ * Windows (`./service-manager.ts`, issue #1323) — and connected — or it says which of those it could not do and how to
  * finish. In order:
  *
  *   1. the control-plane URL (`--control-plane-url`), then the operator session: a
@@ -19,12 +20,14 @@
  *      --profile`'s own code (`executeRegisterAndEnroll`), so the refusals, the
  *      ordering and the recovery hints are that command's;
  *   6. the runtime prefetch: the installation's runtime is downloaded and verified
- *      now, so a verification refusal is reported here rather than in a launchd
- *      log. A refusal stops setup before anything is installed under launchd; a
+ *      now, so a verification refusal is reported here rather than in a service
+ *      log. A refusal stops setup before any login service is installed; a
  *      control plane that names no runtime yet is only a warning, since the
  *      launcher fetches it at start;
- *   7. the LaunchAgent (`swarm-worker-agent install --profile <id>`), then a wait of
- *      up to a minute for the control plane to see the worker connected.
+ *   7. the worker's login service (`swarm-worker agent install --profile <id>`:
+ *      `swarm-worker-agent` under launchd, a per-user "at log on" task under Task
+ *      Scheduler), then a wait of up to a minute for the control plane to see the
+ *      worker connected.
  *
  * Every question has a flag, so it runs unattended; with no terminal a missing
  * answer fails naming its flag (`./operator-prompts.ts`).
@@ -47,7 +50,6 @@
 import { hostname } from 'node:os';
 import { parseArgs } from 'node:util';
 import { z } from 'zod';
-import { workerAgentCommand } from '../cli/_shared/installation-command.js';
 import {
 	OperatorApiError,
 	type OperatorClient,
@@ -89,6 +91,7 @@ import {
 } from './operator-prompts.js';
 import { ensureSession, operatorClientFor } from './operator-session.js';
 import { ensureRuntime, fetchRuntimeManifest } from './runtime-store.js';
+import { serviceCommand } from './service-manager.js';
 import { listOwnWorkers } from './status.js';
 
 export const SETUP_USAGE = `swarm-worker setup — register this checkout's host as a SWARM worker
@@ -101,8 +104,8 @@ Usage:
 Run it in the project checkout the worker is to serve. It signs you in (or reuses
 your live session), lets you pick the project, registers and enrolls the worker,
 stores your source-control token for the project's provider, installs and verifies
-the installation's runtime, installs the LaunchAgent and waits for the worker to
-connect. Its credential is kept in ~/.swarm/workers/<id>/profile.json.
+the installation's runtime, installs its login service (a LaunchAgent on macOS, a
+Task Scheduler task on Windows) and waits for the worker to connect. Its credential is kept in ~/.swarm/workers/<id>/profile.json.
 
   --control-plane-url <url>  The installation's router, e.g. https://swarm.example.com.
   --email <email>            The email you sign in with (alias: --identifier).
@@ -378,7 +381,7 @@ async function planWorker(
 
 /**
  * Prefetch and verify the installation's runtime, reporting the outcome; answers
- * whether setup may go on. A refusal stops it before launchd is touched.
+ * whether setup may go on. A refusal stops it before any login service is installed.
  */
 async function installRuntime(
 	controlPlaneUrl: string,
@@ -401,7 +404,7 @@ async function installRuntime(
 			`swarm-worker setup: the installation's runtime was not installed — ${runtime.error}`,
 		);
 		out.info(
-			`the worker is registered and its profile saved, but nothing was installed under launchd; fix the cause, then run: ${workerAgentCommand()} install --profile ${registered.workerId}`,
+			`the worker is registered and its profile saved, but no login service was installed; fix the cause, then run: ${serviceCommand()} install --profile ${registered.workerId}`,
 		);
 		return false;
 	}
@@ -419,7 +422,7 @@ async function installRuntime(
 }
 
 /**
- * Install the LaunchAgent and wait for the worker to connect — or, with
+ * Install the worker's login service and wait for it to connect — or, with
  * `--no-autostart`, name the command that starts it — as an exit code.
  */
 async function startWorker(
@@ -445,7 +448,7 @@ async function startWorker(
 		`swarm-worker setup: the worker is installed, but the control plane has not seen it connect within ${seconds}s`,
 	);
 	out.info(
-		`  check it with: swarm-worker status ${workerId} (its log: ${workerAgentCommand()} logs --profile ${workerId})`,
+		`  check it with: swarm-worker status ${workerId} (its log: ${serviceCommand()} logs --profile ${workerId})`,
 	);
 	return 1;
 }

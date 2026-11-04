@@ -813,9 +813,10 @@ unchanged.
   one of the two workers run there at a time. A plain `setup` refuses a checkout a
   profile serves for the same installation too. `setup --profile`'s autostart
   (issue #1297) is `swarm-worker-agent install --profile <worker-id>`, whose agent
-  runs `swarm-launcher run <worker-id>`; its check / retry lines name the agent by
-  `--profile <worker-id>`, and `--no-autostart` (or another platform) ends with the
-  `swarm-launcher run` line instead. `register-and-enroll --profile` starts nothing.
+  runs `swarm-launcher run <worker-id>` — and on Windows (issue #1323) a per-user
+  Task Scheduler task, managed with [`swarm-worker agent`](#swarm-worker-agent); its
+  check / retry lines name the agent by `--profile <worker-id>`, and `--no-autostart`
+  (or a platform with neither) ends with the `swarm-launcher run` line instead. `register-and-enroll --profile` starts nothing.
 - **`add-checkout <path>`** — give an **existing** worker another repository
   checkout on this machine (issue #1059), without re-registering it — which would
   issue a new worker and lose its enrollments and stored operator credentials. Run
@@ -1262,6 +1263,7 @@ swarm-worker setup [--control-plane-url <url>] [--email <email>] [--password-fil
                    [--scm-token-file <path|->] [--no-autostart] [--yes]
 swarm-worker login [--control-plane-url <url>] [--email <email>] [--password-file <path|->]
 swarm-worker status [<workerId>]
+swarm-worker agent <install|uninstall|status|logs> --profile <workerId>
 swarm-worker migrate [<checkout>] [--control-plane-url <url>] [--yes]
 swarm-worker run <workerId>
 swarm-worker runtimes
@@ -1272,7 +1274,9 @@ swarm-worker --version
 
 Run in the project checkout the worker is to serve. It ends with a
 **profile-based** worker (`~/.swarm/workers/<id>/profile.json`) that is registered,
-enrolled, credentialed, on a verified runtime, under launchd, and connected:
+enrolled, credentialed, on a verified runtime, under its login service (a
+LaunchAgent on macOS, a Task Scheduler task on Windows — see
+[`swarm-worker agent`](#swarm-worker-agent)), and connected:
 
 1. **Session.** A live cached session for the URL (`~/.swarm/operator-sessions/`,
    as `swarm login` caches it) is reused with no password asked — unless `--email`
@@ -1292,14 +1296,16 @@ enrolled, credentialed, on a verified runtime, under launchd, and connected:
    already has a cached worker, or that a profile already serves for the same
    installation.
 6. **Runtime.** The installation's runtime is downloaded and verified now
-   (`ensureRuntime`). A verification refusal exits 1 before launchd is touched,
-   naming the `swarm-worker-agent install --profile <id>` to retry with; an
+   (`ensureRuntime`). A verification refusal exits 1 before any login service is
+   installed, naming the `swarm-worker-agent install --profile <id>` (on Windows,
+   `swarm-worker agent install --profile <id>`) to retry with; an
    installation that serves no runtime yet, or cannot be reached for it, is a
    warning — the launcher fetches it at start.
-7. **Start.** `swarm-worker-agent install --profile <id>`, then up to 60 s of
+7. **Start.** The worker's login service — `swarm-worker-agent install --profile
+   <id>` on macOS, a Task Scheduler task on Windows — then up to 60 s of
    `workers.listMine` until the worker is `connected` (exit 1 if it never is, naming
-   `swarm-worker status <id>`). Off macOS, or with `--no-autostart`, it prints
-   `swarm-worker run <id>` instead.
+   `swarm-worker status <id>`). On any other platform, or with `--no-autostart`, it
+   prints `swarm-worker run <id>` instead.
 
 Every question has a flag. With no terminal a missing answer fails **naming its
 flag** (CLIs and name default instead); `--yes` accepts every default. Secrets are
@@ -1327,14 +1333,54 @@ serve exactly one; the email to the identifier last signed in there.
 
 ### `swarm-worker status`
 
-For each profile (or just `<workerId>`): its LaunchAgent, as
-`swarm-worker-agent status --profile <id>` reports it (off macOS, the foreground
-command); its runtime, from `state.json` (selected version and whether it is
+For each profile (or just `<workerId>`): its login service, as the host's service
+manager reports it — `swarm-worker-agent status --profile <id>` on macOS, the Task
+Scheduler task's state, last run and keep-alive pid on Windows, the foreground
+command elsewhere; its runtime, from `state.json` (selected version and whether it is
 installed, the version last started, a version on trial); and — when a session for
 its installation is live — the control plane's view from `workers.listMine`:
 connected or not, last seen, drained, and each enrollment's state. Without a live
 session it shows the local view and says to run `swarm-worker login`. Exits 0 only
 when every worker reported is connected.
+
+### `swarm-worker agent`
+
+```bash
+swarm-worker agent install   --profile <workerId>
+swarm-worker agent uninstall --profile <workerId>
+swarm-worker agent status    --profile <workerId>
+swarm-worker agent logs      --profile <workerId>
+```
+
+Manages a profile worker's **login service** — what starts it at login, keeps it
+running, and starts it again after it exits for an update (issue #1323). `setup`
+installs it; this is how to reinstall, inspect, follow or remove it by hand.
+
+- **macOS** — every action is handed verbatim to the package's
+  `swarm-worker-agent … --profile <id>` (a launchd LaunchAgent,
+  [`launchd-worker-autostart.md`](./launchd-worker-autostart.md)), `update` included.
+- **Windows** — a per-user Task Scheduler task named
+  `swarm.worker.<host>.<id>.<hash8>` (the LaunchAgent label's scheme), triggered
+  **at log on**, running in your own session with least privilege — no admin, no
+  stored password. Its action is `conhost.exe --headless "<node>"
+  "<launcher>\bin\swarm-worker.js" service-run <id>` in the profile directory.
+  `swarm-worker service-run <id>` (internal; the task runs it) is the keep-alive
+  loop: it starts `swarm-worker run <id>`, waits for it, and starts it again 30 s
+  later whatever the exit code — Task Scheduler restarts nothing that exits 0, which
+  is how the daemon exits after an update. It records its pid, worker id and start
+  time in `<profileDir>/service.pid` and logs to `<profileDir>/logs/service.log`
+  beside the daemon's `worker.log`. `install` refuses while another live daemon holds
+  one of the profile's checkouts, stops a running loop (`taskkill /T`), creates the
+  task and starts it now. A recorded pid is killed only once PowerShell's
+  `Win32_Process` confirms it is still that loop — its command line ends
+  `service-run <id>` and it started no later than the record says — so a pid Windows
+  has since reused for another program is left alone (only `schtasks /End` runs); `uninstall` stops it and deletes the task (logs are kept), and
+  finds it by name even when the profile is gone; `status` shows the task's state,
+  last run and result and the loop's pid; `logs` prints the last 50 lines of both
+  logs and follows them until Ctrl-C. `update` is refused: a profile worker updates
+  when its installation asks (`swarm workers update`, or the dashboard).
+- **Anywhere else** there is no service manager, and it names
+  `swarm-worker run <id>` to run in the foreground.
 
 ### `swarm-worker migrate`
 

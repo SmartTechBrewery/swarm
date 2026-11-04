@@ -1,6 +1,6 @@
 /**
  * `swarm-worker status` and `swarm-worker login` (issue #1311): real profiles,
- * states and session caches under a temporary home, with the LaunchAgent, the
+ * states and session caches under a temporary home, with the login service, the
  * operator API and the sign-in endpoint faked.
  */
 
@@ -85,7 +85,7 @@ function api(rows: unknown) {
 
 function deps(overrides: Partial<StatusDeps> = {}): StatusDeps {
 	return {
-		agentStatus: async () => ({ output: 'label:    pl.x\nstate = running' }),
+		agentStatus: async () => ({ supervisor: 'launchd', output: 'label:    pl.x\nstate = running' }),
 		homeDir: home,
 		...overrides,
 	};
@@ -191,12 +191,28 @@ describe('swarm-worker status', () => {
 		expect(query).toHaveBeenCalledTimes(1);
 	});
 
-	it('names the foreground command where there is no launchd', async () => {
+	it('names the foreground command where there is no service manager', async () => {
 		profile();
 
 		expect(await runStatus([], deps({ agentStatus: async () => null }))).toBe(1);
 
-		expect(printed()).toMatch(/LaunchAgent: none \(launchd is macOS-only\) — run it with: .* run /);
+		expect(printed()).toMatch(
+			/service: none \(no supported service manager on \w+\) — run it with: .* run /,
+		);
+	});
+
+	// Issue #1323.
+	it('names the supervisor its report comes from', async () => {
+		profile();
+		const agentStatus = async () => ({
+			supervisor: 'Task Scheduler',
+			output: 'task:    swarm.worker.x\nStatus: Running',
+		});
+
+		await runStatus([], deps({ agentStatus }));
+
+		expect(printed()).toContain('  service (Task Scheduler):');
+		expect(printed()).toContain('    Status: Running');
 	});
 
 	it('says so when there is nothing to report', async () => {

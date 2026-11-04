@@ -69,7 +69,7 @@ describe('installProfileWorkerAutostart', () => {
 		});
 	});
 
-	it('runs nothing on a platform with no installer yet', async () => {
+	it('runs nothing on a platform with no service manager', async () => {
 		expect(await installProfileWorkerAutostart('w-1', 'linux')).toEqual({
 			kind: 'unsupported',
 			platform: 'linux',

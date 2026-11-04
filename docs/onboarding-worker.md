@@ -133,7 +133,7 @@ left.
 ### Checking on it
 
 ```bash
-swarm-worker status            # each worker: LaunchAgent, runtime, connected or not
+swarm-worker status            # each worker: login service, runtime, connected or not
 swarm-worker login             # renew the session when it has lapsed
 ```
 
