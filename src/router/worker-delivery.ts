@@ -390,7 +390,10 @@ function defaultDeps(): WorkerDeliveryDeps {
  * resolve, or a stored operator credential the requesting worker lacks
  * ({@link resolvePersonaDelivery}). It is answered rather than thrown so
  * the worker learns *why* its write failed — an escaped throw becomes the app-level
- * `internal error` 500, whose body carries no reason at all.
+ * `internal error` 500, whose body carries no reason at all — except a provider's own
+ * server error (issue #1274), which the app-level handler answers as a `502` flagged
+ * `providerUnavailable` and naming the provider's failure
+ * (`./webhook-receiver.ts`), so the worker defers the phase rather than failing it.
  *
  * `409` is the dispatch fence (issue #1073): the call is for a dispatch this router
  * already settled, so it conflicts with the run's recorded state. It is not a `403`,

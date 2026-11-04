@@ -10,6 +10,7 @@ import {
 	_resetSCMProviderRegistryForTesting,
 	registerSCMProvider,
 } from '@/integrations/scm/registry.js';
+import { ProviderUnavailableError } from '@/lib/provider-errors.js';
 import type { Checkpoint } from '@/pipeline/checkpoint.js';
 import { DependencyBlockedError } from '@/pipeline/dependency-guard.js';
 import { cleanupUnlessPreserved } from '@/pipeline/resume.js';
@@ -730,6 +731,60 @@ describe('runAssignmentDbFree', () => {
 		expect(operator.postComment).toHaveBeenCalledTimes(1);
 	});
 
+	// Issue #1274: the pickup move to "In progress" reached the control plane, whose
+	// provider call behind it answered with a server error — the run's first seconds,
+	// before any agent work. It used to settle `failed` and wait for an operator.
+	it.each([
+		[500, { ok: false, reason: 'internal error' }],
+		[
+			502,
+			{ ok: false, reason: 'Provider unavailable: 502 Bad Gateway', providerUnavailable: true },
+		],
+	])('defers an Implementation whose pickup move answered %i', async (status, body) => {
+		const sink = recordingSink();
+		const fetchImpl = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(status, body));
+		const runPhase = vi.fn(async (inputs: AssignedPhaseInputs) => {
+			await inputs.pm?.moveWorkItem('PVTI_item1', 'inProgress');
+			return { agent: agentResult() };
+		});
+
+		await runAssignmentDbFree(
+			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'implementation' })),
+			sink,
+			{ ...RUN_OPTIONS, deps: depsWith(runPhase, async () => stubDelivery(), fetchImpl) },
+		);
+
+		expect(fetchImpl.mock.calls[0][0]).toBe(`${CONTROL_PLANE}/worker/delivery/pm/move`);
+		const frame = sink.sent.at(-1) as Record<string, unknown>;
+		expect(frame).toMatchObject({
+			status: 'deferred',
+			failureKind: 'provider-unavailable',
+			resumable: false,
+		});
+		expect(frame.retryDelayMs as number).toBeGreaterThanOrEqual(6 * 60 * 1000);
+		expect(frame.reason).toMatch(/provider unavailable/i);
+		expect(frame.reason).toContain('/worker/delivery/pm/move');
+	});
+
+	it('still fails an Implementation whose pickup move the control plane refused', async () => {
+		const sink = recordingSink();
+		const fetchImpl = vi
+			.fn<FetchLike>()
+			.mockResolvedValue(jsonResponse(403, { reason: 'worker is not enrolled' }));
+		const runPhase = vi.fn(async (inputs: AssignedPhaseInputs) => {
+			await inputs.pm?.moveWorkItem('PVTI_item1', 'inProgress');
+			return { agent: agentResult() };
+		});
+
+		await runAssignmentDbFree(
+			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'implementation' })),
+			sink,
+			{ ...RUN_OPTIONS, deps: depsWith(runPhase, async () => stubDelivery(), fetchImpl) },
+		);
+
+		expect(sink.sent.at(-1)).toMatchObject({ status: 'failed' });
+	});
+
 	it('keeps the respond-to-review board report best-effort when the card cannot be resolved', async () => {
 		const sink = recordingSink();
 		// A refused lookup throws inside the phase's own try/catch, which logs and
@@ -1379,6 +1434,43 @@ describe('runAssignmentDbFree', () => {
 		expect(frame.resumable).toBe(false);
 		expect(frame.reason).toContain('Connection refused');
 		expect(frame.reason).not.toContain('invalid reference');
+	});
+
+	// Issue #1274: a provider server error from any call the phase made on this worker.
+	it('classifies a provider server error as provider-unavailable, and a 4xx as terminal', () => {
+		expect(
+			classifyDeferrable(Object.assign(new Error('502 Bad Gateway'), { status: 502 })),
+		).toEqual({ kind: 'provider-unavailable' });
+		expect(classifyDeferrable(new ProviderUnavailableError('GitHub API unavailable'))).toEqual({
+			kind: 'provider-unavailable',
+		});
+		expect(
+			classifyDeferrable(Object.assign(new Error('Not Found'), { status: 404 })),
+		).toBeUndefined();
+		// A typed failure keeps its own rule even when it wraps a 5xx.
+		expect(
+			classifyDeferrable(
+				new DeliveryDeferredError('push failed', {
+					cause: Object.assign(new Error('502'), { status: 502 }),
+				}),
+			),
+		).toEqual({ kind: 'delivery' });
+		expect(classifyDeferrable(new AgentRunError('agent failed', { kind: 'auth' }))).toBeUndefined();
+	});
+
+	it('defers a provider server error with a reason naming the provider', () => {
+		const frame = deferrableOrFailedResult(
+			Object.assign(new Error('Server Error'), { status: 500 }),
+			buildTaskAssignment(createMockTaskAssignmentInput({ phase: 'planning' })),
+		);
+
+		expect(frame).toMatchObject({
+			status: 'deferred',
+			failureKind: 'provider-unavailable',
+			resumable: false,
+			reason: 'Provider unavailable: Server Error',
+		});
+		expect(frame.resumeDelivery).toBeUndefined();
 	});
 
 	// A delivery deferral carries no `AgentFailure` at all — this guards the `in`

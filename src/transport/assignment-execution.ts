@@ -67,6 +67,7 @@ import {
 } from '../integrations/scm/registry.js';
 import { describeError } from '../lib/errors.js';
 import { logger as defaultLogger } from '../lib/logger.js';
+import { describeProviderUnavailable } from '../lib/provider-errors.js';
 import { tryReadCheckpoint } from '../pipeline/checkpoint.js';
 import { DependencyBlockedError } from '../pipeline/dependency-guard.js';
 import type { ScheduleFollowUpReview } from '../pipeline/follow-up-review.js';
@@ -80,6 +81,7 @@ import { createTransportScmDeliveryProvider } from '../scm/transport-delivery.js
 import {
 	type AssignedPhaseInputs,
 	type DeferrableFailure,
+	isProviderUnavailableFailure,
 	type PhaseRunResult,
 	retryDelayForFailure,
 	runAssignedPhase,
@@ -246,7 +248,10 @@ export type DeferrableAssignmentFailure =
  * rate-limit, capacity, aborted, or stalled agent error, a genuinely-interrupted
  * timeout (non-zero/absent exit — a clean SIGTERM exit already cleaned up — or a
  * timeout the CLI imposed on itself, which exits 0 and so is recognised by its own
- * notice instead, issue #1000), or a deterministic-delivery deferral.
+ * notice instead, issue #1000), a deterministic-delivery deferral, or an SCM/PM
+ * provider's server error from any call the phase made (issue #1274) — which on this
+ * worker includes a control-plane delivery call the provider behind it failed
+ * (`postDelivery`, `./delivery-client.ts`).
  *
  * An `auth` failure is deliberately absent (issue #343): the remote CLI is logged
  * out, so it settles terminal-`failed` carrying the already-suffixed
@@ -282,7 +287,17 @@ export function classifyDeferrable(err: unknown): DeferrableAssignmentFailure | 
 			return err.failure;
 		}
 	}
+	if (isProviderUnavailableFailure(err)) return { kind: 'provider-unavailable' };
 	return undefined;
+}
+
+/**
+ * The `reason` a deferred frame carries: the failure's own description, except that a
+ * provider outage is named as one (issue #1274), so the control plane's run row and
+ * Queue entry do not read as its own `internal error`.
+ */
+function deferredReason(failure: DeferrableFailure, err: unknown, error: string): string {
+	return failure.kind === 'provider-unavailable' ? describeProviderUnavailable(err) : error;
 }
 
 /**
@@ -626,7 +641,7 @@ export function deferrableOrFailedResult(
 			resumable,
 			resumeDelivery: failure.kind === 'delivery' || undefined,
 			failureKind: failure.kind,
-			reason: error,
+			reason: deferredReason(failure, err, error),
 			// The control plane decides whether this becomes a checkpoint continuation
 			// (Tier 1 keeps priority, and the continuation budget lives with the dispatch
 			// record); the worker only reports what it can see on its own disk.

@@ -401,6 +401,64 @@ describe('createWebhookApp', () => {
 			expect(logged.stack).toContain('HttpError');
 			errorSpy.mockRestore();
 		});
+
+		// Issue #1274: a worker delivery whose provider call behind it answered with a
+		// server error is the provider's outage, and the worker must be able to tell.
+		describe('a provider server error behind a worker delivery route', () => {
+			/** The webhook app with one delivery route whose provider call throws `err`. */
+			const appThrowing = (path: string, err: unknown) => {
+				const { app } = makeApp();
+				app.post(path, () => {
+					throw err;
+				});
+				return app;
+			};
+			const http502 = () =>
+				Object.assign(new Error('<html><title>502 Bad Gateway</title></html>'), {
+					name: 'HttpError',
+					status: 502,
+				});
+
+			it('answers 502 flagged providerUnavailable, naming the provider failure', async () => {
+				const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+				const app = appThrowing('/worker/delivery/pm/move', http502());
+
+				const res = await app.request('/worker/delivery/pm/move', { method: 'POST' });
+
+				expect(res.status).toBe(502);
+				expect(await res.json()).toEqual({
+					ok: false,
+					reason: 'Provider unavailable: 502 Bad Gateway',
+					providerUnavailable: true,
+				});
+				expect(warnSpy).toHaveBeenCalledWith(
+					'Provider unavailable during worker delivery',
+					expect.objectContaining({ path: '/worker/delivery/pm/move' }),
+				);
+				warnSpy.mockRestore();
+			});
+
+			it('keeps a non-provider throw on a delivery route an internal error', async () => {
+				const errorSpy = vi.spyOn(logger, 'error').mockImplementation(() => {});
+				const app = appThrowing('/worker/delivery/pm/move', new Error('db down'));
+
+				const res = await app.request('/worker/delivery/pm/move', { method: 'POST' });
+
+				expect(res.status).toBe(500);
+				expect(await res.json()).toEqual({ ok: false, reason: 'internal error' });
+				errorSpy.mockRestore();
+			});
+
+			it('keeps a provider 5xx outside the delivery routes an internal error', async () => {
+				const errorSpy = vi.spyOn(logger, 'error').mockImplementation(() => {});
+				const app = appThrowing('/somewhere/else', http502());
+
+				const res = await app.request('/somewhere/else', { method: 'POST' });
+
+				expect(res.status).toBe(500);
+				errorSpy.mockRestore();
+			});
+		});
 	});
 
 	// GitHub delivers `projects_v2_item` to the same URL and secret as its SCM

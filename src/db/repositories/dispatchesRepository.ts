@@ -102,6 +102,12 @@ export type DispatchWaitReason =
 	 */
 	| 'commit-unavailable'
 	/**
+	 * An SCM or PM provider answered a call the phase made with a server error (issue
+	 * #1274) — its own passing outage. A timed wait on the ordinary retry floor and
+	 * budget; nothing promotes it early.
+	 */
+	| 'provider-unavailable'
+	/**
 	 * The attempt's worker lost its transport session and did not return within the
 	 * grace, so the control plane settled the run from that signal (issue #859) and
 	 * retries it automatically after the delay `../../worker/automatic-retry-policy.ts`

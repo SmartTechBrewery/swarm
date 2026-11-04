@@ -3,8 +3,8 @@
  * their own (issue #1075).
  *
  * Kept apart from the long-standing deferrable kinds (`rate-limit`, `capacity`,
- * `aborted`, `timeout`, `stalled`, `commit-unavailable` — `isDeferrable` in
- * `./consumer.ts`) on purpose. Those are transient by nature and share one retry
+ * `aborted`, `timeout`, `stalled`, `commit-unavailable`, and `provider-unavailable`
+ * since issue #1274 — `deferrableFailureOf` in `./consumer.ts`) on purpose. Those are transient by nature and share one retry
  * budget and one delay rule. The kinds listed here used to be **terminal**: the run
  * failed and only an operator's Retry brought it back. Each is admitted into the
  * deferral machinery deliberately, with its own delay, its own bound and its own

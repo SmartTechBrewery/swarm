@@ -1233,6 +1233,22 @@ run a fresh automatic budget. Only once both automatic retries are spent does th
 settle `failed` with the board comment, as it always did. If one machine keeps
 appearing in these, the fleet — not the task — is what needs looking at.
 
+**A GitHub (or other provider) outage defers a run instead of failing it** (issue
+#1274). When the SCM or PM provider answers one of a phase's calls with a server error
+— an HTTP 5xx, or GitHub's GraphQL "Something went wrong while executing your query" —
+anywhere in the phase, not only while it delivers (the pickup move to "In progress",
+Planning's card moves, a read before the agent starts), the run is deferred rather
+than failed. It waits in the Queue as "retrying after the SCM/PM provider was
+unavailable", with a reason starting `Provider unavailable:` and the provider's own
+message, and is retried no sooner than six minutes later on the ordinary deferred-retry
+budget (six attempts). On a federated worker the control plane answers such a delivery
+call with a `502` that says so, and a worker also reads a bare `500`/`502`/`504` from
+the control plane the same way. A refusal from the provider (`401`/`403`/`404`/`422`)
+still fails the run at once, and a provider that stays down through every retry fails
+it with an error ending `— the provider stayed unavailable through N deferred retries;
+retry budget spent`. Deploy the control plane before (or with) the workers: an older
+control plane does not recognise the new deferral and settles it as failed, as before.
+
 **A run that fails holding preserved work gets one more try on its own** (issue
 #1257). When a run stops for good while its work is still preserved — a checkpoint
 whose continuation budget is spent, a delivery or session past its retry cap, an

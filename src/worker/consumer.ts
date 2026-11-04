@@ -129,6 +129,7 @@ import { requireProjectPMAdapter, requireProjectPMProvider } from '../integratio
 import { requireProjectSCMProvider, requireSCMProvider } from '../integrations/scm/registry.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
+import { describeProviderUnavailable, isProviderServerError } from '../lib/provider-errors.js';
 import {
 	type Checkpoint,
 	checkpointAdvanced,
@@ -191,6 +192,7 @@ import { priorityFor } from '../queue/producer.js';
 import type { WorkerUpdatePushResult } from '../router/worker-update-dispatch.js';
 import {
 	DeliveryDeferredError,
+	isUnretryableDeliveryFailure,
 	type ReviewAbsorbed,
 	type ScmDeliveryProvider,
 } from '../scm/delivery.js';
@@ -733,6 +735,9 @@ export function retryDelayForFailure(failure: DeferrableFailure, now: number): n
 		// about the machine that failed, and the point of the retry is to reach a
 		// *different* one — so it takes the same dedup-claim floor an abort does.
 		failure.kind === 'commit-unavailable' ||
+		// A provider outage (issue #1274) names no recovery instant; the floor is the
+		// shortest wait the issue allows, and the retry budget bounds the rest.
+		failure.kind === 'provider-unavailable' ||
 		// A timeout has no "resets at…" hint and needs no long wait — the run
 		// simply ran long; retry after the same dedup-claim floor as an abort.
 		failure.kind === 'timeout'
@@ -760,6 +765,8 @@ function deferredPhaseMessage(failure: DeferrableFailure, phase: TriggerPhase): 
 			return `Phase stopped - ${phaseLabel(phase)} — worktree already exists, deferring retry`;
 		case 'commit-unavailable':
 			return `Phase stopped - ${phaseLabel(phase)} — this worker could not obtain the commit, deferring retry on another worker`;
+		case 'provider-unavailable':
+			return `Phase stopped - ${phaseLabel(phase)} — SCM/PM provider unavailable (server error), deferring retry`;
 		case 'stalled':
 			return `Phase stopped - ${phaseLabel(phase)} — response stalled, deferring resume retry`;
 		case 'timeout':
@@ -1130,6 +1137,36 @@ function isTransientTerminalFailure(err: unknown, isDeferrable: boolean, error: 
 					err instanceof DependencyBlockedError
 				);
 	return unclassified && CONTROL_PLANE_DELIVERY_SERVER_ERROR.test(error);
+}
+
+/**
+ * Whether a phase failure that is not otherwise classified is an SCM/PM provider's
+ * server error (issue #1274, `../lib/provider-errors.ts`) — a 5xx, or a re-typed
+ * GraphQL internal error, from any provider call the phase made, not only from its
+ * delivery. Shared by both phase failure classifiers (`handlePhaseFailure` here and
+ * `classifyDeferrable` in `../transport/assignment-execution.ts`) so the two cannot
+ * drift.
+ *
+ * Every typed failure is left to its own rule, even when it wraps a provider 5xx: an
+ * agent run's own classification, a delivery deferral (which resumes delivery rather
+ * than re-running the phase), a deliberately terminal delivery refusal (issue #839),
+ * a cancellation, a refused recovery, a dependency block, a gate refusal, and a
+ * commit this machine could not obtain.
+ */
+export function isProviderUnavailableFailure(err: unknown): boolean {
+	if (
+		err instanceof AgentRunError ||
+		err instanceof DeliveryDeferredError ||
+		err instanceof RunTerminatedError ||
+		err instanceof BlockedRecoveryError ||
+		err instanceof DependencyBlockedError ||
+		err instanceof WorkerIneligibleError ||
+		err instanceof CommitUnavailableError ||
+		isUnretryableDeliveryFailure(err)
+	) {
+		return false;
+	}
+	return isProviderServerError(err);
 }
 
 /**
@@ -1543,6 +1580,8 @@ function waitReasonForDeferral(kind: DeferrableFailure['kind'] | undefined): Dis
 			return 'worktree-exists';
 		case 'commit-unavailable':
 			return 'commit-unavailable';
+		case 'provider-unavailable':
+			return 'provider-unavailable';
 		default:
 			return 'rate-limit';
 	}
@@ -4976,6 +5015,117 @@ async function tryRecordPassedOverWorker(
 	}
 }
 
+/** The failure kind a phase failure is diagnosed and steered by, when it has one. */
+function phaseFailureKindOf(err: unknown): AgentFailureKind | undefined {
+	if (err instanceof AgentRunError) return err.failure.kind;
+	if (err instanceof BlockedRecoveryError) return 'blocked-recovery';
+	if (err instanceof CommitUnavailableError) return 'commit-unavailable';
+	if (isProviderUnavailableFailure(err)) return 'provider-unavailable';
+	return undefined;
+}
+
+/**
+ * Whether an agent run's own failure is a transient one the run defers on. An `auth`
+ * failure is deliberately absent (issue #343): the CLI is logged out, so retrying burns
+ * the shared retry budget on a run only a human re-`/login` can unblock — it stays
+ * terminal and its `(authentication failed)` headline tells the operator what to do.
+ */
+function isDeferrableAgentRunError(err: AgentRunError): boolean {
+	const { kind } = err.failure;
+	return (
+		kind === 'rate-limit' ||
+		kind === 'capacity' ||
+		kind === 'aborted' ||
+		kind === 'stalled' ||
+		// A commit this machine could not obtain (issue #1018) — the rebuilt federated
+		// twin of the `CommitUnavailableError` branch in {@link deferrableFailureOf},
+		// since a worker reports it as a classified deferral rather than as the error
+		// object.
+		kind === 'commit-unavailable' ||
+		// A provider outage a federated worker classified (issue #1274) — the rebuilt
+		// twin of the `isProviderUnavailableFailure` branch there.
+		kind === 'provider-unavailable' ||
+		// A failure type that used to be terminal and is now retried automatically after
+		// its own delay (issue #1075) — a lost worker transport, today.
+		// `deferAgentRunError` applies its own bound.
+		automaticRetryPolicyFor(kind) !== undefined ||
+		// A timeout resumes only when the run was genuinely interrupted: it carries an
+		// agent result whose exit was non-zero/null (the phase threw and preserved its
+		// worktree). A run that trapped SIGTERM and still exited 0 (issue #165's
+		// clean-exit case) already finished and cleaned up its worktree, so it stays a
+		// terminal failure rather than deferring onto a checkout that's gone — unless the
+		// CLI itself is what ended the turn (issue #1000). That run *is* genuinely
+		// interrupted and its checkout was preserved, but it exits 0 by construction, so
+		// the exit-code proxy alone would misfile it as #165's clean-exit case and
+		// discard a bounded transient failure terminally.
+		(kind === 'timeout' &&
+			(err.failure.cliSelfTimeout !== undefined ||
+				(err.agent !== undefined && err.agent.exitCode !== 0)))
+	);
+}
+
+/**
+ * The deferrable failure a phase failure defers as, or `undefined` for one that is
+ * terminal. A usage/session-limit hit or a worker-shutdown abort is
+ * transient/recoverable: rather than failing the job, it is deferred and re-enqueued
+ * once it is safe to retry, capped so a persistent limit cannot loop forever. A
+ * worktree collision is deliberately NOT deferrable (issue #367): provisioning already
+ * reclaimed the checkout if it was safe, so a surviving collision is a protected
+ * checkout raised as a terminal `BlockedRecoveryError` — re-deferring it would just
+ * loop on the same protected worktree.
+ */
+function deferrableFailureOf(err: unknown): DeferrableFailure | undefined {
+	if (err instanceof AgentRunError) {
+		return isDeferrableAgentRunError(err) ? err.failure : undefined;
+	}
+	if (err instanceof DeliveryDeferredError) return { kind: 'delivery' };
+	// A phase whose checkout must be detached at a commit this worker does not have
+	// (issue #1018). Deferrable — unlike the worktree collision — because it is a
+	// statement about *this machine*, not about the run: the commit is on the remote and
+	// another enrolled worker can serve it, so the retry has somewhere better to go. The
+	// gate is what sends it there; this is only what keeps the run alive long enough to
+	// be sent.
+	if (err instanceof CommitUnavailableError) return { kind: 'commit-unavailable' };
+	// An SCM/PM provider's server error from any call the phase made, not only from its
+	// delivery (issue #1274): the provider's own passing trouble, retried on the ordinary
+	// floor and budget. A 4xx refusal is not one, and stays terminal.
+	if (isProviderUnavailableFailure(err)) return { kind: 'provider-unavailable' };
+	return undefined;
+}
+
+/**
+ * The error a run that is about to settle terminally stopped with: the raw `error`,
+ * unless something more specific ended it — an exhausted Tier 2 continuation budget
+ * (issue #1256), a provider that stayed unavailable through the whole retry budget
+ * (issue #1274), or a pinned wait for a machine that lost its transport whose window
+ * has passed (issue #1141), whose gate text — which still says "waiting" — is replaced
+ * by the hand-off to the operator.
+ */
+function stoppedErrorFor(
+	err: unknown,
+	job: SwarmJob,
+	error: string,
+	deferrable: DeferrableFailure | undefined,
+	budgetExhausted: Extract<CheckpointFallback, { kind: 'exhausted' }> | undefined,
+): string {
+	if (budgetExhausted) return `${error} — ${continuationExhaustedReason(budgetExhausted)}`;
+	if (deferrable?.kind === 'provider-unavailable')
+		return providerUnavailableExhaustedError(err, job);
+	return lostPreservedWorkerExpiredError(err, job) ?? error;
+}
+
+/**
+ * The terminal error of a run whose provider stayed unavailable through every
+ * deferred retry it was allowed (issue #1274): the provider's own error, and that the
+ * budget — the shared `MAX_RATE_LIMIT_RETRIES` bound — was spent, with the count.
+ */
+function providerUnavailableExhaustedError(err: unknown, job: SwarmJob): string {
+	const retries = job.rateLimitRetryAttempt ?? 0;
+	return `${describeProviderUnavailable(err)} — the provider stayed unavailable through ${retries} deferred ${
+		retries === 1 ? 'retry' : 'retries'
+	}; retry budget spent`;
+}
+
 async function handlePhaseFailure(
 	err: unknown,
 	job: SwarmJob,
@@ -5075,66 +5225,15 @@ async function handlePhaseFailure(
 		if (deferred) return deferred;
 	}
 
-	const failureKind =
-		err instanceof AgentRunError
-			? err.failure.kind
-			: err instanceof BlockedRecoveryError
-				? 'blocked-recovery'
-				: err instanceof CommitUnavailableError
-					? ('commit-unavailable' as const)
-					: undefined;
+	const failureKind = phaseFailureKindOf(err);
 
 	// A machine that could not obtain the run's commit (issue #1018), or lost its
 	// transport under it (issue #1075), is recorded so the next attempt's gate can
 	// prefer another one.
 	await tryRecordPassedOverWorker(failureKind, runId);
 
-	// A usage/session-limit hit or a worker-shutdown abort is transient/recoverable:
-	// rather than failing the job, we defer it and let the worker re-enqueue it once
-	// it's safe to retry. Capped so a persistent limit can't loop forever. A worktree
-	// collision is deliberately NOT deferrable (issue #367): provisioning already
-	// reclaimed the checkout if it was safe, so a surviving collision is a protected
-	// checkout raised as a terminal BlockedRecoveryError — re-deferring it would just
-	// loop on the same protected worktree. An `auth` failure is deliberately absent
-	// too (issue #343): the CLI is logged out, so retrying burns the shared retry
-	// budget on a run only a human re-`/login` can unblock — it stays terminal and
-	// its `(authentication failed)` headline tells the operator what to do.
-	const isDeferrable =
-		(err instanceof AgentRunError &&
-			(err.failure.kind === 'rate-limit' ||
-				err.failure.kind === 'capacity' ||
-				err.failure.kind === 'aborted' ||
-				err.failure.kind === 'stalled' ||
-				// A commit this machine could not obtain (issue #1018) — the rebuilt
-				// federated twin of the `CommitUnavailableError` branch below, since a
-				// worker reports it as a classified deferral rather than as the error
-				// object.
-				err.failure.kind === 'commit-unavailable' ||
-				// A failure type that used to be terminal and is now retried
-				// automatically after its own delay (issue #1075) — a lost worker
-				// transport, today. `deferAgentRunError` applies its own bound.
-				automaticRetryPolicyFor(err.failure.kind) !== undefined ||
-				// A timeout resumes only when the run was genuinely interrupted: it
-				// carries an agent result whose exit was non-zero/null (the phase threw
-				// and preserved its worktree). A run that trapped SIGTERM and still
-				// exited 0 (issue #165's clean-exit case) already finished and cleaned up
-				// its worktree, so it stays a terminal failure rather than deferring onto
-				// a checkout that's gone — unless the CLI itself is what ended the turn
-				// (issue #1000). That run *is* genuinely interrupted and its checkout was
-				// preserved above, but it exits 0 by construction, so the exit-code proxy
-				// alone would misfile it as #165's clean-exit case and discard a bounded
-				// transient failure terminally.
-				(err.failure.kind === 'timeout' &&
-					(err.failure.cliSelfTimeout !== undefined ||
-						(err.agent !== undefined && err.agent.exitCode !== 0))))) ||
-		err instanceof DeliveryDeferredError ||
-		// A phase whose checkout must be detached at a commit this worker does not have
-		// (issue #1018). Deferrable — unlike the worktree collision above — because it
-		// is a statement about *this machine*, not about the run: the commit is on the
-		// remote and another enrolled worker can serve it, so the retry has somewhere
-		// better to go. The gate is what sends it there; this is only what keeps the run
-		// alive long enough to be sent.
-		err instanceof CommitUnavailableError;
+	const deferrable = deferrableFailureOf(err);
+	const isDeferrable = deferrable !== undefined;
 	// Tier 2's decision (issue #503) is resolved once and used twice: by the deferral,
 	// which turns it into a `checkpointed` settle, and by the terminal path below, which
 	// reports an exhausted continuation budget as the reason the run stopped for good.
@@ -5144,19 +5243,15 @@ async function handlePhaseFailure(
 	if (checkpointFallback?.kind === 'release') {
 		await tryReleaseCheckpointFallbackCheckout(project, trigger.taskId, runId);
 	}
-	if (isDeferrable) {
-		const failure: DeferrableFailure =
-			err instanceof AgentRunError
-				? err.failure
-				: err instanceof CommitUnavailableError
-					? { kind: 'commit-unavailable' }
-					: { kind: 'delivery' };
+	if (deferrable) {
 		const deferred = deferAgentRunError(
-			failure,
+			deferrable,
 			job,
 			trigger,
 			project.id,
-			error,
+			// Named as the provider's outage, so the Queue and the run row do not read as
+			// SWARM's own fault (a relayed control-plane `internal error`, say).
+			deferrable.kind === 'provider-unavailable' ? describeProviderUnavailable(err) : error,
 			runId,
 			err instanceof AgentRunError ? err.agent : undefined,
 			checkpointFallback,
@@ -5168,12 +5263,7 @@ async function handlePhaseFailure(
 	// ceiling (issue #1256). Say which limit ended it in the run's own `error`, not only in
 	// the diagnosis, so the reason survives wherever the raw message is shown.
 	const budgetExhausted = checkpointFallback?.kind === 'exhausted' ? checkpointFallback : undefined;
-	// A pinned wait for a machine that lost its transport ends here once its window has
-	// passed (issue #1141), and its gate text — which still says "waiting" — is replaced
-	// by the hand-off to the operator.
-	const stoppedError = budgetExhausted
-		? `${error} — ${continuationExhaustedReason(budgetExhausted)}`
-		: (lostPreservedWorkerExpiredError(err, job) ?? error);
+	const stoppedError = stoppedErrorFor(err, job, error, deferrable, budgetExhausted);
 	// A run holding preserved work gets one automatic retry after a cool-down before it
 	// is handed to the operator (issue #1257); once it has had it, its error says so.
 	const preservedWorkRetry = await deferPreservedWorkRetry(

@@ -15,6 +15,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { Octokit } from '@octokit/rest';
 
 import { logger } from '../../../lib/logger.js';
+import { ProviderUnavailableError } from '../../../lib/provider-errors.js';
 import type {
 	PullRequestContext,
 	PullRequestDiscussionEntry,
@@ -44,10 +45,48 @@ export function getScopedClient(): Octokit {
 	return scoped;
 }
 
-/** Run `fn` with an Octokit client authenticated as `token` bound to the async context. */
-export function withGitHubToken<T>(token: string, fn: () => Promise<T>): Promise<T> {
+/**
+ * GitHub's GraphQL internal error (issue #1274): "Something went wrong while executing
+ * your query" arrives on an HTTP **200** with an `errors` array, so it carries no 5xx
+ * status for the provider-neutral rule to see. An entry with a `type` is a typed
+ * refusal (`NOT_FOUND`, `FORBIDDEN`, …) and is never this.
+ */
+function isGraphqlInternalError(err: unknown): boolean {
+	if (!(err instanceof Error) || err.name !== 'GraphqlResponseError') return false;
+	const errors = (err as { errors?: unknown }).errors;
+	return (
+		Array.isArray(errors) &&
+		errors.some(
+			(entry: { type?: unknown; message?: unknown } | null) =>
+				entry?.type === undefined &&
+				typeof entry?.message === 'string' &&
+				/something went wrong while executing your query/i.test(entry.message),
+		)
+	);
+}
+
+/**
+ * Run `fn` with an Octokit client authenticated as `token` bound to the async context.
+ *
+ * Every GitHub SCM and GitHub Projects call runs inside this scope, so it is where
+ * GitHub's GraphQL internal error is re-typed as a {@link ProviderUnavailableError}
+ * on the way out (issue #1274) — the phase failure classifiers then defer it as the
+ * provider's own passing trouble, exactly as they do an HTTP 5xx. Everything else,
+ * and every handler inside `fn`, sees the original error untouched.
+ */
+export async function withGitHubToken<T>(token: string, fn: () => Promise<T>): Promise<T> {
 	const scopedClient = new Octokit({ auth: token });
-	return clientStorage.run(scopedClient, fn);
+	try {
+		return await clientStorage.run(scopedClient, fn);
+	} catch (err) {
+		if (isGraphqlInternalError(err)) {
+			throw new ProviderUnavailableError(
+				`GitHub API unavailable: ${(err as Error).message.replace(/\s+/g, ' ').trim()}`,
+				{ cause: err },
+			);
+		}
+		throw err;
+	}
 }
 
 /**

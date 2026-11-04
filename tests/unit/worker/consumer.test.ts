@@ -15,6 +15,7 @@ import type { WorkerDispatchCandidate } from '@/identity/worker-enrollment-servi
 import { requireGitHubProjectsConfig } from '@/integrations/pm/github-projects/config-schema.js';
 import { describeError } from '@/lib/errors.js';
 import { logger } from '@/lib/logger.js';
+import { ProviderUnavailableError } from '@/lib/provider-errors.js';
 import { DependencyBlockedError } from '@/pipeline/dependency-guard.js';
 import type { ProposedScope } from '@/pipeline/planning.js';
 import { buildPreplanContract, embedPreplanMarker } from '@/pipeline/preplan.js';
@@ -5523,6 +5524,151 @@ describe('processJob', () => {
 			const settle = completeRun.mock.calls.at(-1)?.[1] as { error?: string };
 			expect(settle.error).toContain('Connection refused');
 			expect(settle.error).not.toContain('invalid reference');
+		});
+	});
+
+	// Issue #1274. A provider's server error from any call a phase made — the
+	// Implementation pickup move to "In progress", a Planning card move — used to fail
+	// the run terminally unless it happened inside delivery; it is the provider's own
+	// passing outage, so it now defers on the ordinary schedule and bound.
+	describe('a provider server error outside delivery', () => {
+		const SIX_MINUTES_MS = 6 * 60 * 1000;
+		const IMPLEMENTATION_TRIGGER: TriggerResult = {
+			phase: 'implementation',
+			taskId: '10',
+			workItem: createMockWorkItem(),
+		};
+		const PLANNING_TRIGGER: TriggerResult = {
+			phase: 'planning',
+			taskId: '10',
+			workItem: createMockWorkItem(),
+		};
+		/** The pickup move rejecting the way Octokit does: an `HttpError` with a status. */
+		const pickupMoveFails = (status: number, message: string) => {
+			phaseImpl = async () => {
+				throw Object.assign(new Error(message), { name: 'HttpError', status });
+			};
+		};
+		const lastRetryInput = () =>
+			(scheduleDispatchRetry.mock.calls.at(-1) as [string, Record<string, unknown>])[1];
+
+		beforeEach(() => {
+			getRunByIdFromDb.mockResolvedValue(undefined);
+			scheduleDispatchRetry.mockClear();
+			completeRun.mockClear();
+		});
+
+		it('defers a 5xx on the start-of-phase move, no sooner than six minutes, naming the provider', async () => {
+			pickupMoveFails(502, '502 Bad Gateway');
+
+			const outcome = await processJob(
+				createMockPmWebhookJob({ runId: 'run-1', rateLimitRetryAttempt: 0 }),
+				registryReturning(IMPLEMENTATION_TRIGGER),
+			);
+
+			expect(outcome).toMatchObject({
+				status: 'phase-deferred',
+				failureKind: 'provider-unavailable',
+				resumable: false,
+			});
+			expect((outcome as { retryDelayMs: number }).retryDelayMs).toBeGreaterThanOrEqual(
+				SIX_MINUTES_MS,
+			);
+			expect((outcome as { resumeDelivery?: boolean }).resumeDelivery).toBeUndefined();
+			expect(lastRetryInput().waitReason).toBe('provider-unavailable');
+			const settle = completeRun.mock.calls.at(-1)?.[1] as { error?: string };
+			expect(settle.error).toContain('Provider unavailable: 502 Bad Gateway');
+			// A deferral posts no "failed" comment on the card.
+			expect(addComment).not.toHaveBeenCalled();
+		});
+
+		it("defers GitHub's re-typed GraphQL internal error during a Planning move", async () => {
+			phaseImpl = async () => {
+				throw new ProviderUnavailableError(
+					'GitHub API unavailable: Something went wrong while executing your query.',
+				);
+			};
+
+			const outcome = await processJob(
+				createMockPmWebhookJob({ runId: 'run-1', rateLimitRetryAttempt: 0 }),
+				registryReturning(PLANNING_TRIGGER),
+			);
+
+			expect(outcome).toMatchObject({
+				status: 'phase-deferred',
+				failureKind: 'provider-unavailable',
+				pmPhaseStarted: true,
+			});
+			expect(lastRetryInput().waitReason).toBe('provider-unavailable');
+		});
+
+		it.each([
+			401, 403, 404, 422,
+		])('still fails a %i from the provider terminally', async (status) => {
+			pickupMoveFails(status, `Request failed with status ${status}`);
+
+			const outcome = await processJob(
+				createMockPmWebhookJob({ runId: 'run-1', rateLimitRetryAttempt: 0 }),
+				registryReturning(IMPLEMENTATION_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-failed');
+			expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+		});
+
+		it('fails once the retry bound is spent, naming the provider error and the retries', async () => {
+			pickupMoveFails(502, '502 Bad Gateway');
+
+			const outcome = await processJob(
+				createMockPmWebhookJob({ runId: 'run-1', rateLimitRetryAttempt: 6 }),
+				registryReturning(IMPLEMENTATION_TRIGGER),
+			);
+
+			expect(outcome.status).toBe('phase-failed');
+			expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+			const error = (outcome as { error: string }).error;
+			expect(error).toContain('Provider unavailable: 502 Bad Gateway');
+			expect(error).toContain('through 6 deferred retries; retry budget spent');
+		});
+
+		it("defers a federated worker's classified provider outage the control plane rebuilt", async () => {
+			phaseImpl = async () => {
+				// What `adaptResultToPhaseRun` rebuilds from a `deferred` frame.
+				throw new AgentRunError(
+					'Control-plane delivery /worker/delivery/pm/move failed with status 502: Provider unavailable: 502 Bad Gateway',
+					{ kind: 'provider-unavailable' },
+				);
+			};
+
+			const outcome = await processJob(
+				createMockPmWebhookJob({ runId: 'run-1', rateLimitRetryAttempt: 0 }),
+				registryReturning(IMPLEMENTATION_TRIGGER),
+			);
+
+			expect(outcome).toMatchObject({
+				status: 'phase-deferred',
+				failureKind: 'provider-unavailable',
+			});
+			expect(lastRetryInput().waitReason).toBe('provider-unavailable');
+		});
+
+		it('keeps a delivery deferral that wraps a provider 5xx a delivery deferral', async () => {
+			phaseImpl = async () => {
+				throw new DeliveryDeferredError('Implementation delivery deferred for retry', {
+					cause: Object.assign(new Error('502 Bad Gateway'), { status: 502 }),
+				});
+			};
+
+			const outcome = await processJob(
+				createMockPmWebhookJob({ runId: 'run-1', rateLimitRetryAttempt: 0 }),
+				registryReturning(IMPLEMENTATION_TRIGGER),
+			);
+
+			expect(outcome).toMatchObject({
+				status: 'phase-deferred',
+				failureKind: 'delivery',
+				resumeDelivery: true,
+			});
 		});
 	});
 

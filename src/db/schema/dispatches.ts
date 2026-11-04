@@ -62,7 +62,8 @@ export const dispatches = pgTable(
 		 * `agent-capacity`, `timeout`, `worker-shutdown`, `delivery`,
 		 * `worktree-exists`, `stalled`, `commit-unavailable` (the machine this attempt
 		 * ran on could not obtain the commit its checkout must be detached at — issue
-		 * #1018), `transport-lost` (the attempt's worker lost its transport and did not
+		 * #1018), `provider-unavailable` (an SCM/PM provider answered a call with a
+		 * server error — issue #1274), `transport-lost` (the attempt's worker lost its transport and did not
 		 * return, so the run is retried automatically after its failure type's delay —
 		 * issue #1075), `late-result` (that retry's lost attempt reported a late
 		 * success, which the dispatch now settles the run with — issue #1076),

@@ -66,6 +66,7 @@ import {
 	rerunFailedWorkflowRuns,
 	withGitHubToken,
 } from '@/integrations/scm/github/client.js';
+import { ProviderUnavailableError } from '@/lib/provider-errors.js';
 
 describe('github client', () => {
 	beforeEach(() => {
@@ -115,6 +116,48 @@ describe('github client', () => {
 			]);
 			expect(a).toBe('tok-a');
 			expect(b).toBe('tok-b');
+		});
+
+		// Issue #1274: GitHub's GraphQL internal error arrives on an HTTP 200 with no
+		// status, so the scope re-types it as the provider's own outage.
+		const graphqlError = (errors: Array<{ type?: string; message: string }>) =>
+			Object.assign(
+				new Error(
+					`Request failed due to following response errors:\n - ${errors.map((e) => e.message).join('\n - ')}`,
+				),
+				{ name: 'GraphqlResponseError', errors },
+			);
+
+		it("re-types GitHub's GraphQL internal error as a provider outage, keeping the cause", async () => {
+			const original = graphqlError([
+				{
+					message:
+						'Something went wrong while executing your query. Please include `C3A4:1B2C` when reporting this issue.',
+				},
+			]);
+
+			const rejection = await withGitHubToken('tok', async () => {
+				throw original;
+			}).catch((err: unknown) => err);
+
+			expect(rejection).toBeInstanceOf(ProviderUnavailableError);
+			expect((rejection as Error).message).toMatch(
+				/^GitHub API unavailable: .*Something went wrong while executing your query/,
+			);
+			expect((rejection as Error).cause).toBe(original);
+		});
+
+		it('passes a typed GraphQL refusal and an HTTP 404 through untouched', async () => {
+			const notFound = graphqlError([{ type: 'NOT_FOUND', message: 'Could not resolve' }]);
+			const http404 = Object.assign(new Error('Not Found'), { name: 'HttpError', status: 404 });
+
+			for (const original of [notFound, http404]) {
+				await expect(
+					withGitHubToken('tok', async () => {
+						throw original;
+					}),
+				).rejects.toBe(original);
+			}
 		});
 	});
 
