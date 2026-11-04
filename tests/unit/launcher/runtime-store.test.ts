@@ -385,6 +385,53 @@ describe('fetchRuntimeManifest', () => {
 		expect(await fetchRuntimeManifest(CONTROL_PLANE, { fetch: fetch.fetch })).toEqual(manifest);
 	});
 
+	it('asks for a named release with ?version=, and for its own runtime without one', async () => {
+		const manifest = manifestFor(buildRuntimeTarball(VERSION));
+		const fetch = fakeFetch({
+			[MANIFEST_URL]: { body: JSON.stringify(manifest) },
+			[`${MANIFEST_URL}?version=${VERSION}`]: { body: JSON.stringify(manifest) },
+		});
+
+		expect(
+			await fetchRuntimeManifest(CONTROL_PLANE, { fetch: fetch.fetch, version: VERSION }),
+		).toEqual(manifest);
+		await fetchRuntimeManifest(CONTROL_PLANE, { fetch: fetch.fetch });
+
+		expect(fetch.calls.map((call) => call.url)).toEqual([
+			`${MANIFEST_URL}?version=${VERSION}`,
+			MANIFEST_URL,
+		]);
+	});
+
+	it('sends a bearer only when given one, refusing redirects with it', async () => {
+		const manifest = manifestFor(buildRuntimeTarball(VERSION));
+		const fetch = fakeFetch({
+			[MANIFEST_URL]: { body: JSON.stringify(manifest) },
+			[`${MANIFEST_URL}?version=${VERSION}`]: { body: JSON.stringify(manifest) },
+		});
+
+		await fetchRuntimeManifest(CONTROL_PLANE, {
+			fetch: fetch.fetch,
+			version: VERSION,
+			bearer: 'cred',
+		});
+		await fetchRuntimeManifest(CONTROL_PLANE, { fetch: fetch.fetch });
+
+		expect(fetch.calls[0]).toMatchObject({
+			headers: { authorization: 'Bearer cred' },
+			redirect: 'error',
+		});
+		expect(fetch.calls[1].headers).not.toHaveProperty('authorization');
+		expect(fetch.calls[1].redirect).toBeUndefined();
+	});
+
+	it('says a release lookup needs a credential when the control plane answers 401', async () => {
+		const fetch = fakeFetch({ [`${MANIFEST_URL}?version=9.9.9`]: { status: 401, body: '{}' } });
+		expect(
+			await fetchRuntimeManifest(CONTROL_PLANE, { fetch: fetch.fetch, version: '9.9.9' }),
+		).toEqual({ error: expect.stringMatching(/only for an authenticated caller/) });
+	});
+
 	it('passes an unavailable manifest through with its reason', async () => {
 		const body = { available: false, reason: 'unsigned' };
 		const fetch = fakeFetch({ [MANIFEST_URL]: { body: JSON.stringify(body) } });

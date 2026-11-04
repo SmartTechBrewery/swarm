@@ -9,17 +9,21 @@
  *
  *   - `GET /worker/runtime/manifest` — **unauthenticated**. A first install has no
  *     credential yet and still needs the version, checksum and signature. Nothing
- *     here is secret: a version, a commit, a SHA-256 and a public signature.
+ *     here is secret: a version, a commit, a SHA-256 and a public signature. The
+ *     one exception is a `?version=` the control plane has not located yet: that
+ *     lookup spends its anonymous GitHub API budget, so it needs the artifact
+ *     route's bearer and is answered `401` without one.
  *   - `GET /worker/runtime/artifacts/<name>` — **Bearer**: a worker credential or
  *     an operator session token (`swarm login`). The tarball is the installation's
  *     code, so a private fork's must not be downloadable by anyone who finds the URL.
  *
  * Both outcomes of the manifest are HTTP 200; a 404 means a control plane that
- * predates the route. `version` is the version the installation wants workers on —
- * today always its own, but the shape lets a later issue name another (a staged
- * rollout or a rollback), and `artifact.url` is resolved against the control-plane
- * URL (`new URL(url, controlPlaneUrl)`), so it may be relative (served here) or
- * absolute (served elsewhere).
+ * predates the route. With no `?version=`, `version` is the installation's own and
+ * its `artifact.url` is relative (served here). With `?version=<v>` naming another
+ * release (issue #1282), the control plane *locates* that release on the
+ * publisher's GitHub Release ({@link PUBLISHER_RELEASES_REPOSITORY}) and its
+ * `artifact.url` is absolute (served there). The client resolves it against the
+ * control-plane URL (`new URL(url, controlPlaneUrl)`), so both forms work.
  *
  * The control plane checks the checksum and the signature's trusted comment, not
  * the signature itself: the worker verifies `signature.minisig` against the public
@@ -35,6 +39,25 @@ export const WORKER_RUNTIME_MANIFEST_PATH = '/worker/runtime/manifest';
 
 /** The prefix the artifact route serves `<name>` under. Bearer-authenticated. */
 export const WORKER_RUNTIME_ARTIFACTS_PATH = '/worker/runtime/artifacts';
+
+/**
+ * The GitHub repository whose Releases carry every signed runtime other than the
+ * installation's own. A constant, not a setting: the launcher trusts this
+ * publisher's signing key, so no other source could produce a runtime that
+ * verifies.
+ */
+export const PUBLISHER_RELEASES_REPOSITORY = 'SmartTechBrewery/swarm';
+
+/** A version becomes a path segment on the worker and a URL segment here. */
+const VERSION_GRAMMAR = /^[0-9A-Za-z][0-9A-Za-z.+-]{0,99}$/;
+
+/**
+ * Whether `version` is a runtime version, the one rule the control plane and the
+ * worker's store both apply: it may name nothing but itself (no `/`, no `..` lead).
+ */
+export function isRuntimeVersion(version: string): boolean {
+	return VERSION_GRAMMAR.test(version);
+}
 
 const CommitSchema = z
 	.string()
