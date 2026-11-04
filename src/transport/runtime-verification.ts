@@ -14,6 +14,9 @@
  *   proof the record was waiting for, so it makes the version this daemon was started
  *   on the worker's last known good one and clears the record. Guarded, because
  *   `onSession` fires on every reconnect and only the first one of a process is news.
+ *   The version the worker was moved from is then no longer needed to go back to, so
+ *   every runtime version no worker on this host names any more is removed
+ *   (`pruneRuntimes`, issue #1304) — best effort, off the session's path.
  * - **A handshake the control plane rejects outright** —
  *   {@link returnRuntimeAfterFatalHandshake}. A protocol mismatch, a capability
  *   rejection or a refused credential is this version saying it cannot serve this
@@ -29,10 +32,12 @@
  * back on from the `build` its next handshake declares, exactly as for a clone.
  */
 
+import { pruneRuntimes } from '../launcher/runtime-store.js';
 import {
 	MAX_FAILED_STARTS,
 	type RuntimePendingVerification,
 	readWorkerState,
+	referencedRuntimeVersions,
 	updateWorkerState,
 } from '../launcher/worker-profile.js';
 import { describeError } from '../lib/errors.js';
@@ -70,20 +75,23 @@ function pendingForThisVersion(
  * throws — a promotion that cannot be written is logged, and the launcher then counts
  * on, which is the conservative direction.
  */
-export function createRuntimeHandshakePromotion(options: RuntimeVerificationOptions): () => void {
+export function createRuntimeHandshakePromotion(
+	options: RuntimeVerificationOptions,
+): () => Promise<void> {
 	let promoted = false;
-	return () => {
+	return async () => {
 		if (promoted) return;
 		promoted = true;
 		const logger = options.logger ?? defaultLogger;
 		try {
 			const pending = pendingForThisVersion(options);
 			if (!pending) return;
-			updateWorkerState(
+			const recorded = updateWorkerState(
 				options.workerId,
 				{ lastKnownGoodVersion: pending.version, pendingVerification: null },
 				options.homeDir,
 			);
+			if (!recorded) return;
 			logger.info('runtime version verified — promoting it to last known good', {
 				workerId: options.workerId,
 				version: pending.version,
@@ -94,8 +102,38 @@ export function createRuntimeHandshakePromotion(options: RuntimeVerificationOpti
 				workerId: options.workerId,
 				error: describeError(err),
 			});
+			return;
 		}
+		await pruneAbandonedRuntimes(options, logger);
 	};
+}
+
+/**
+ * Remove the runtime versions no worker on this host names now that the promotion
+ * has let go of the version this worker was moved from (issue #1304). Best effort,
+ * and never throws: the session is unaffected by anything it fails at.
+ */
+async function pruneAbandonedRuntimes(
+	options: RuntimeVerificationOptions,
+	logger: UpdateLogger,
+): Promise<void> {
+	try {
+		const pruned = await pruneRuntimes({
+			homeDir: options.homeDir,
+			keep: () => referencedRuntimeVersions(options.homeDir),
+		});
+		for (const version of pruned.removed)
+			logger.info('removed a runtime version no worker on this host uses any more', {
+				workerId: options.workerId,
+				version,
+			});
+		if (pruned.withheld) logger.warn(pruned.withheld, { workerId: options.workerId });
+	} catch (err) {
+		logger.error('removing unused runtime versions failed', {
+			workerId: options.workerId,
+			error: describeError(err),
+		});
+	}
 }
 
 /**

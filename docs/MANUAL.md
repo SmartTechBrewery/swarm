@@ -324,6 +324,17 @@ when the control plane rejects the daemon's handshake outright — `run` logs an
 selects the version the worker was moved from and starts that instead. If that
 version is no longer installed it exits 1 and keeps the record, so the worker stays
 down and says why rather than crash-looping on the version that never connected.
+**Versions no worker uses are removed** (issue #1304). Every `run`, once it has
+recorded its start, and every daemon, right after its first session promotes a
+version, removes each installed version that no worker's `state.json` under
+`~/.swarm/workers/` names — as its selected, last-run or last known good version, or
+as either side of a pending verification — and `run` logs each removal. A version
+installed within the last hour is kept, so is one being installed right now, and
+nothing at all is removed while any worker's state cannot be read. The removal runs
+under a store-wide lock (`~/.swarm/runtimes/.locks/.store.lock`) that recording a
+selection also takes, so a version cannot be selected while it is being removed. It
+is best effort: a failure is logged and never stops a start. There is no prune
+command and no retention setting; `swarm-launcher runtimes` lists what is left.
 The signing key it trusts is `deploy/worker-runtime/minisign.pub` under the
 launcher's own install; without that file it installs nothing new and still starts
 versions already installed. For now the launcher runs from a SWARM build

@@ -1,6 +1,15 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, realpathSync, rmSync, statSync } from 'node:fs';
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	realpathSync,
+	rmSync,
+	statSync,
+	utimesSync,
+	writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -477,6 +486,73 @@ describe('swarm-launcher', () => {
 			expect(await run(['run', 'worker-one'], deps([V1]))).toBe(0);
 			expect(execs[0].args[1]).toBe(entrypointOf('1.0.0'));
 			expect(pending()).toMatchObject({ failedStarts: 0 });
+		});
+	});
+
+	describe('removing runtime versions no worker uses', () => {
+		const OLD = new Date('2026-11-01T00:00:00.000Z');
+		const versionDir = (version: string) => join(runtimesDir(home), version);
+		/** A third version nobody names, installed long ago. */
+		const plantStale = (version: string) => {
+			const dir = versionDir(version);
+			mkdirSync(join(dir, 'dist/transport'), { recursive: true });
+			writeFileSync(join(dir, RUNTIME_ENTRYPOINT), 'stale');
+			execFileSync('chmod', ['-R', 'a-w', dir]);
+		};
+		const age = (...versions: string[]) => {
+			for (const version of versions) utimesSync(versionDir(version), OLD, OLD);
+		};
+
+		it('removes only the version no profile uses', async () => {
+			profile('worker-one', V1.url);
+			profile('worker-two', V2.url);
+			expect(await run(['run', 'worker-one'], deps([V1]))).toBe(0);
+			expect(await run(['run', 'worker-two'], deps([V2]))).toBe(0);
+			plantStale('0.9.0');
+			age('0.9.0', '1.0.0', '2.0.0');
+			output = [];
+			execs = [];
+
+			expect(await run(['run', 'worker-one'], deps([V1]))).toBe(0);
+			expect(execs).toHaveLength(1);
+			expect(existsSync(versionDir('0.9.0'))).toBe(false);
+			expect(existsSync(versionDir('1.0.0'))).toBe(true);
+			expect(existsSync(versionDir('2.0.0'))).toBe(true);
+			expect(output).toContain(
+				'swarm-launcher: removed v0.9.0, which no worker on this host uses any more',
+			);
+		});
+
+		it('removes nothing while another worker state is unreadable, and still starts', async () => {
+			profile('worker-one', V1.url);
+			expect(await run(['run', 'worker-one'], deps([V1]))).toBe(0);
+			plantStale('0.9.0');
+			age('0.9.0', '1.0.0');
+			mkdirSync(join(home, '.swarm', 'workers', 'worker-two'), { recursive: true });
+			writeFileSync(join(home, '.swarm', 'workers', 'worker-two', 'state.json'), '{ broken');
+			execs = [];
+
+			expect(await run(['run', 'worker-one'], deps([V1]))).toBe(0);
+			expect(execs).toHaveLength(1);
+			expect(existsSync(versionDir('0.9.0'))).toBe(true);
+		});
+
+		it('still starts when the prune cannot run at all', async () => {
+			profile('worker-one', V1.url);
+			expect(await run(['run', 'worker-one'], deps([V1]))).toBe(0);
+			plantStale('0.9.0');
+			age('0.9.0', '1.0.0');
+			// No lock can be taken under a `.locks` that is not a directory.
+			rmSync(join(runtimesDir(home), '.locks'), { recursive: true, force: true });
+			writeFileSync(join(runtimesDir(home), '.locks'), 'not a directory');
+			output = [];
+			execs = [];
+
+			expect(await run(['run', 'worker-one'], deps([V1]))).toBe(0);
+			expect(execs).toHaveLength(1);
+			expect(existsSync(versionDir('0.9.0'))).toBe(true);
+			expect(output.join('\n')).toMatch(/could not remove unused runtime versions/);
+			expect(readWorkerState('worker-one', home)?.lastRuntimeVersion).toBe('1.0.0');
 		});
 	});
 

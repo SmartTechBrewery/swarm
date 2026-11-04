@@ -1,7 +1,8 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { RUNTIME_ENTRYPOINT, runtimesDir, STALE_STAGING_MS } from '@/launcher/runtime-store.js';
 import {
 	MAX_FAILED_STARTS,
 	readWorkerState,
@@ -88,6 +89,36 @@ describe('runtime verification', () => {
 			writeWorkerState(WORKER_ID, other, home);
 			createRuntimeHandshakePromotion(options)();
 			expect(state()).toEqual(other);
+		});
+
+		it('removes the version the worker was moved from once it is promoted away from it', async () => {
+			const old = new Date(Date.now() - STALE_STAGING_MS - 60_000);
+			for (const version of ['1.0.0', '2.0.0']) {
+				const dir = join(runtimesDir(home), version);
+				mkdirSync(join(dir, 'dist/transport'), { recursive: true });
+				writeFileSync(join(dir, RUNTIME_ENTRYPOINT), version);
+				utimesSync(dir, old, old);
+			}
+			writeWorkerState(WORKER_ID, PENDING, home);
+			await createRuntimeHandshakePromotion(options)();
+			expect(existsSync(join(runtimesDir(home), '1.0.0'))).toBe(false);
+			expect(existsSync(join(runtimesDir(home), '2.0.0'))).toBe(true);
+			expect(options.logger?.info).toHaveBeenCalledWith(
+				'removed a runtime version no worker on this host uses any more',
+				{ workerId: WORKER_ID, version: '1.0.0' },
+			);
+		});
+
+		it('removes nothing when there is nothing to promote', async () => {
+			// Named by no worker, so only the absence of a promotion keeps it.
+			const dir = join(runtimesDir(home), '0.5.0');
+			mkdirSync(join(dir, 'dist/transport'), { recursive: true });
+			writeFileSync(join(dir, RUNTIME_ENTRYPOINT), '0.5.0');
+			const old = new Date(Date.now() - STALE_STAGING_MS - 60_000);
+			utimesSync(dir, old, old);
+			writeWorkerState(WORKER_ID, { ...PENDING, lastRuntimeVersion: '1.0.0' }, home);
+			await createRuntimeHandshakePromotion(options)();
+			expect(existsSync(dir)).toBe(true);
 		});
 
 		it('never throws, with no state at all or an invalid worker id', () => {
