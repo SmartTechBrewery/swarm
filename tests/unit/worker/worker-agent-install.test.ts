@@ -236,7 +236,7 @@ describe('swarm-worker-agent install', () => {
 		}
 
 		beforeEach(() => {
-			writeFileSync(join(root, 'bin', 'swarm-launcher.js'), '', 'utf8');
+			writeFileSync(join(root, 'bin', 'swarm-worker.js'), '', 'utf8');
 		});
 
 		it('writes an agent that runs this installation’s launcher from the profile directory', () => {
@@ -251,7 +251,7 @@ describe('swarm-worker-agent install', () => {
 			expect(plist).toContain(`<string>${label}</string>`);
 			expect(plist).toMatch(
 				new RegExp(
-					`<array>\\n\\t\\t<string>[^<]*node</string>\\n\\t\\t<string>${join(root, 'bin', 'swarm-launcher.js')}</string>\\n\\t\\t<string>run</string>\\n\\t\\t<string>w-1</string>\\n\\t</array>`,
+					`<array>\\n\\t\\t<string>[^<]*node</string>\\n\\t\\t<string>${join(root, 'bin', 'swarm-worker.js')}</string>\\n\\t\\t<string>run</string>\\n\\t\\t<string>w-1</string>\\n\\t</array>`,
 				),
 			);
 			expect(plist).toContain(`<key>WorkingDirectory</key>\n\t<string>${dir}</string>`);
@@ -295,6 +295,19 @@ describe('swarm-worker-agent install', () => {
 			const plist = readFileSync(agentPlist(labelOf('w-1', url, 'swarm-example-com')), 'utf8');
 			for (const text of [plist, install.stdout, install.stderr, status.stdout, status.stderr])
 				expect(text).not.toContain(CREDENTIAL);
+		});
+
+		it('refuses an installation with no bin/swarm-worker.js, writing and starting nothing', () => {
+			const url = 'https://swarm.example.com';
+			profile('w-1', url);
+			rmSync(join(root, 'bin', 'swarm-worker.js'));
+
+			const result = runAgent(['install', '--profile', 'w-1']);
+
+			expect(result.status).toBe(1);
+			expect(result.stderr).toContain('no swarm-worker at');
+			expect(existsSync(agentPlist(labelOf('w-1', url, 'swarm-example-com')))).toBe(false);
+			expect(result.launchctl).toEqual([]);
 		});
 
 		it('refuses a missing profile, writing and starting nothing', () => {

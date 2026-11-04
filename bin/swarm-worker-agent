@@ -6,8 +6,10 @@
 # that command with the checkout as its working directory, which is what lets the
 # credential stay in the per-checkout cache instead of being written into a plist.
 # A profile-based worker (`--profile <worker-id>`, issue #1297) is the same idea one
-# step removed: the agent runs `swarm-launcher run <worker-id>`, which reads the
-# credential from the worker's own profile, so it is never written into a plist either.
+# step removed: the agent runs `swarm-worker run <worker-id>` (the launcher), which
+# reads the credential from the worker's own profile, so it is never written into a
+# plist either. This script also ships inside the clone-free launcher package
+# (`bin/build-worker-launcher.js`, issue #1283), where `--profile` is what it is for.
 set -euo pipefail
 
 usage() {
@@ -34,7 +36,7 @@ the machine at once. With no argument it pulls this installation, rebuilds it, a
 restarts every worker agent running it; pass a <checkout> to restart only that one.
 
 --profile <worker-id> is a PROFILE-BASED worker (`swarm workers setup --profile`):
-the agent runs `swarm-launcher run <worker-id>` from ~/.swarm/workers/<worker-id>,
+the agent runs `swarm-worker run <worker-id>` from ~/.swarm/workers/<worker-id>,
 and its label names the host of the installation the profile serves, so workers of
 two installations on one Mac never share one. `update` never restarts such an agent:
 it runs the runtime its control plane names, not this installation's build.
@@ -179,7 +181,7 @@ install_root() {
 # restarted onto a build nobody updated.
 #
 # Clone agents only -- those whose ProgramArguments run `run:worker`. A profile agent
-# (`swarm-launcher run <worker-id>`, issue #1297) also names a launcher under this
+# (`swarm-worker run <worker-id>`, issue #1297) also names a launcher under this
 # installation, but the daemon it starts is the runtime its control plane names, not
 # this checkout's build, so restarting it onto a pull would change nothing; updating
 # those is the launcher's own business (#1282).
@@ -341,15 +343,18 @@ cmd_install() {
 }
 
 # `install --profile <worker-id>` (issue #1297): the same agent, running this
-# installation's `swarm-launcher run <worker-id>` from the profile's own directory --
+# installation's `swarm-worker run <worker-id>` from the profile's own directory --
 # which is where the launcher runs the daemon too. The launcher reads the credential
 # from the profile, so the plist carries none, exactly as a clone agent's does not.
+# `$ROOT` is a clone or the launcher package this script was shipped in (issue
+# #1283); both have `bin/swarm-worker.js`, so the plist points into whichever it is.
+# A plist an older install wrote names `bin/swarm-launcher.js`, which still works.
 install_profile() {
 	local node launcher root
 	node=$(command -v node) || die 'node not found on PATH'
 	# This installation's own launcher, for the reason `install` names its own CLI.
-	launcher="$ROOT/bin/swarm-launcher.js"
-	[ -f "$launcher" ] || die "no swarm-launcher at $launcher -- is $ROOT a SWARM installation?"
+	launcher="$ROOT/bin/swarm-worker.js"
+	[ -f "$launcher" ] || die "no swarm-worker at $launcher -- is $ROOT a SWARM installation or launcher package?"
 
 	# A daemon holds a lock per checkout it serves, so any one of the profile's
 	# checkouts already being served refuses the install.
