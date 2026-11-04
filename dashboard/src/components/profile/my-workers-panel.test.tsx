@@ -352,6 +352,20 @@ describe('MyWorkersPanel query states', () => {
 		expect(screen.queryAllByRole('link')).toHaveLength(0);
 	});
 
+	it('shows a Windows viewer the PowerShell installer (issue #1324)', async () => {
+		listMineQueryFn.mockResolvedValue([]);
+		const platform = vi.spyOn(window.navigator, 'platform', 'get').mockReturnValue('Win32');
+		try {
+			renderPanel(<MyWorkersPanel />);
+
+			expect(await screen.findByText("You don't operate any workers yet.")).toBeDefined();
+			expect(screen.getByText(`irm ${window.location.origin}/install.ps1 | iex`)).toBeDefined();
+			expect(screen.queryByText(/install\.sh/)).toBeNull();
+		} finally {
+			platform.mockRestore();
+		}
+	});
+
 	it('reports loading rather than an empty fleet while the query is in flight', () => {
 		listMineQueryFn.mockReturnValue(new Promise(() => {}));
 

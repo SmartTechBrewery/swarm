@@ -1254,7 +1254,11 @@ a clone after `npm run build`. It needs only Node >= 22, and it reads and writes
 worker profile. A worker host gets it from its installation, with no clone:
 `curl -fsSL https://<installation>/install.sh | sh`, run in the project checkout,
 installs it and runs `setup` (`… | sh -s -- <subcommand> [flags]` runs another
-command, or passes flags to `setup`); see
+command, or passes flags to `setup`). On Windows the same is
+`irm https://<installation>/install.ps1 | iex` in PowerShell, with
+`& ([scriptblock]::Create((irm https://<installation>/install.ps1))) <subcommand> [flags]`
+as the `sh -s --` form, and `swarm-worker` is then a `swarm-worker.cmd` on the user
+`PATH` (issue #1324); see
 [`docs/onboarding-worker.md`](./onboarding-worker.md#the-whole-thing-end-to-end).
 
 ```bash

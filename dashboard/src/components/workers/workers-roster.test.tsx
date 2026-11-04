@@ -240,6 +240,20 @@ describe('WorkersRoster states', () => {
 		expect(screen.queryByText(/swarm workers register/)).toBeNull();
 	});
 
+	it('shows a Windows viewer the PowerShell installer (issue #1324)', async () => {
+		workersListQueryFn.mockResolvedValue([]);
+		const platform = vi.spyOn(window.navigator, 'platform', 'get').mockReturnValue('Win32');
+		try {
+			renderRoster(<WorkersRoster projectId="proj-a" />);
+
+			expect(await screen.findByText('No workers to show.')).toBeDefined();
+			expect(screen.getByText(`irm ${window.location.origin}/install.ps1 | iex`)).toBeDefined();
+			expect(screen.queryByText(/install\.sh/)).toBeNull();
+		} finally {
+			platform.mockRestore();
+		}
+	});
+
 	it('keeps the cross-project wording for the unscoped empty state', async () => {
 		workersListQueryFn.mockResolvedValue([]);
 		renderRoster(<WorkersRoster />);
