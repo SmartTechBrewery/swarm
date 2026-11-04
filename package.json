@@ -6,6 +6,7 @@
 	"main": "dist/index.js",
 	"bin": {
 		"swarm": "./bin/swarm.js",
+		"swarm-launcher": "./bin/swarm-launcher.js",
 		"swarm-worker-agent": "./bin/swarm-worker-agent",
 		"swarm-api-agent": "./bin/swarm-api-agent",
 		"swarm-repo-renamed": "./bin/swarm-repo-renamed"

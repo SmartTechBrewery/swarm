@@ -285,6 +285,38 @@ also serves its own runtime to its workers, so a host can fetch it without GitHu
 (issue #1280) — see
 [Serving the runtime from the installation](#serving-the-runtime-from-the-installation).
 
+**Profile-based workers (launcher)** (issue #1281). A worker can also be started
+with no SWARM clone at all, from a *profile*: `~/.swarm/workers/<workerId>/profile.json`
+records the control-plane URL of the installation it serves, its credential, and its
+checkouts (primary first). The directory is `700` and the file `600`. Then:
+
+```bash
+swarm-launcher run <workerId>    # become that worker's daemon
+swarm-launcher runtimes          # list the runtime versions installed on this host
+```
+
+`run` asks the worker's control plane which runtime it serves
+(`/worker/runtime/manifest`), installs and verifies that exact version under
+`~/.swarm/runtimes/<version>/` when it is missing, records it in `state.json` beside
+the profile, and replaces itself with `node <runtime>/dist/transport/connect-entry.mjs`
+(spawning it as a child where `process.execve` is unavailable, like `swarm
+run:worker`). The daemon gets exactly its usual variables, taken from the profile and
+overriding any already in the environment — `SWARM_CONTROL_PLANE_URL`,
+`SWARM_WORKER_CREDENTIAL`, `SWARM_WORKER_REPO_ROOT` and `SWARM_LOG_FILE`
+(`<profileDir>/logs/worker.log`) — and runs in the profile directory; no `.env` is
+read. The credential is never printed and never passed as an argument. So two
+profiles pointing at two installations on two versions run as two daemons on one
+machine, each on its own runtime. A runtime that fails its size, checksum or
+signature check is never started: the launcher exits 1 naming the check. When the
+control plane cannot be reached (or serves no runtime), the version this worker last
+started on is used if it is still installed; otherwise the launcher exits 1 with the
+reason. The signing key it trusts is `deploy/worker-runtime/minisign.pub` under the
+launcher's own install; without that file it installs nothing new and still starts
+versions already installed. For now the launcher runs from a SWARM build
+(`npm run build`, then `bin/swarm-launcher.js`), and profiles are written by hand or
+by code — writing them from the operator CLI, launchd and a clone-free launcher come
+in later phases. `swarm run:worker` and `npm run dev:worker` are unchanged.
+
 **One worker can serve several repositories on one machine** (issue #1059) — one
 checkout per repository, one daemon. Give it the extra checkouts at registration
 with `--extra-checkout <path>` (repeatable, on `workers register` and
@@ -1096,8 +1128,9 @@ the commit it was built from. The worker launcher's runtime store
 (`src/launcher/runtime-store.ts`, issue #1281) checks both automatically before it
 installs a runtime — the SHA-256, the signature against the key it trusts, and that
 the trusted comment names the version and commit the installation asked for — and
-refuses to install anything when it holds no trusted key. Nothing calls it yet; the
-daemon and the control plane do not check the signature.
+refuses to install anything when it holds no trusted key. `swarm-launcher run`
+calls it (see [The worker](#the-worker), "Profile-based workers"); the daemon and
+the control plane do not check the signature.
 
 #### Serving the runtime from the installation
 
@@ -1151,8 +1184,8 @@ host does that, against the key it trusts. Nothing in the daemon fetches from th
 routes. The launcher's runtime store (issue #1281) does: it reads the manifest,
 downloads the artifact (sending the bearer only when the artifact URL is on the
 control plane's own origin), verifies it, and installs it read-only and atomically
-under `~/.swarm/runtimes/<version>/`, side by side with every other version. The
-launcher that starts a runtime from there is the next phase of that issue.
+under `~/.swarm/runtimes/<version>/`, side by side with every other version, and
+`swarm-launcher run` starts a profile-based worker from there.
 
 #### Rotating the runtime signing key
 

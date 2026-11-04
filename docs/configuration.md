@@ -92,7 +92,7 @@ Read **only** by `npm run serve` / `npm run start:serve`, the one process that s
 | --- | --- | --- |
 | `SWARM_LOG_LEVEL` | `info` | Minimum level emitted: `debug` \| `info` \| `warn` \| `error`. |
 | `SWARM_LOG_FORMAT` | auto | `json` or `pretty`. Auto-selects `pretty` on a TTY, `json` when piped. |
-| `SWARM_LOG_FILE` | `logs/worker.log` (worker) | The worker tees its log lines (always JSON) to this file, in addition to stdout, so an unattended run leaves a greppable record. Set to override the path; relative paths resolve against the repo root (`logs/` is git-ignored). Other processes don't write a log file unless wired to. |
+| `SWARM_LOG_FILE` | `logs/worker.log` (worker) | The worker tees its log lines (always JSON) to this file, in addition to stdout, so an unattended run leaves a greppable record. Set to override the path; relative paths resolve against the repo root (`logs/` is git-ignored). A worker started by `swarm-launcher run` (issue #1281) has it set by the launcher to `~/.swarm/workers/<workerId>/logs/worker.log`, overriding any ambient value. Other processes don't write a log file unless wired to. |
 | `NO_COLOR` | _(unset)_ | Any value disables ANSI colour in `pretty` mode. |
 
 **Host / Docker Compose ports** — `docker-compose.yml`, `.env.docker.example`
