@@ -159,9 +159,11 @@ import { discoverAvailableClis } from '../../transport/cli-discovery.js';
 import { canonicalCheckoutPath } from '../../worktree/checkout-key.js';
 import { ensureControlPlaneUrl } from '../_shared/control-plane-env.js';
 import {
+	isLauncherPackage,
 	launcherCommand,
 	swarmCommand,
 	workerAgentCommand,
+	workerDashboardUrl,
 } from '../_shared/installation-command.js';
 import {
 	createOperatorClient,
@@ -843,7 +845,7 @@ function parseWith<T>(schema: z.ZodType<T>): (value: unknown) => T {
 }
 
 /** The signed-in operator plus a client bound to their session — what every subcommand needs. */
-interface Operator {
+export interface Operator {
 	client: OperatorClient;
 	session: OperatorSession;
 }
@@ -885,7 +887,7 @@ function requireWorkerId(workerId: string): boolean {
  * service re-validates and de-dupes; this just gives the operator a clear message
  * before a write is attempted.
  */
-function parseClis(raw: string) {
+export function parseClis(raw: string): AgentCli[] | undefined {
 	const parts = raw
 		.split(',')
 		.map((part) => part.trim())
@@ -1030,7 +1032,7 @@ function profileServingCheckout(repoRoot: string, controlPlaneUrl: string): stri
  * installation, printing the refusal and the command that starts the existing
  * worker. Answers whether it refused.
  */
-function refuseProfileServingCheckout(
+export function refuseProfileServingCheckout(
 	command: string,
 	repoRoot: string,
 	controlPlaneUrl: string,
@@ -1042,9 +1044,26 @@ function refuseProfileServingCheckout(
 	);
 	out.info(`  start it with: ${launcherCommand()} run ${workerId}`);
 	out.info(
-		`  to replace it, remove it (${swarmCommand()} workers remove ${workerId}) and delete ${workerProfilePath(workerId)}`,
+		`  to replace it, ${recoveryStep(`workers remove ${workerId}`, 'delete it', workerId, controlPlaneUrl)} and delete ${workerProfilePath(workerId)}`,
 	);
 	return true;
+}
+
+/**
+ * One step an operator finishes by hand: `<swarm> <subcommand>`, or — from the
+ * launcher package, which ships no `swarm` CLI (issue #1311) — `<action> on` the
+ * worker's dashboard page, which offers every step these hints name (enroll,
+ * approve, consent, the operator credential, delete).
+ */
+function recoveryStep(
+	subcommand: string,
+	action: string,
+	workerId: string,
+	controlPlaneUrl: string,
+): string {
+	return isLauncherPackage()
+		? `${action} on ${workerDashboardUrl(controlPlaneUrl, workerId)}`
+		: `${swarmCommand()} ${subcommand}`;
 }
 
 /**
@@ -2221,14 +2240,28 @@ function remainingEnrollmentSteps(
 	workerId: string,
 	projectId: string,
 	enrollment: { status: string; sharingConsent: boolean },
+	controlPlaneUrl: string,
 ): string[] {
-	const swarm = swarmCommand();
 	const steps: string[] = [];
 	if (enrollment.status !== 'active') {
-		steps.push(`${swarm} workers approve ${workerId} ${projectId}`);
+		steps.push(
+			recoveryStep(
+				`workers approve ${workerId} ${projectId}`,
+				`approve its enrollment in '${projectId}'`,
+				workerId,
+				controlPlaneUrl,
+			),
+		);
 	}
 	if (!enrollment.sharingConsent) {
-		steps.push(`${swarm} workers consent ${workerId} ${projectId} on`);
+		steps.push(
+			recoveryStep(
+				`workers consent ${workerId} ${projectId} on`,
+				`turn on its sharing consent for '${projectId}'`,
+				workerId,
+				controlPlaneUrl,
+			),
+		);
 	}
 	return steps;
 }
@@ -2238,8 +2271,9 @@ function reportRemainingEnrollmentSteps(
 	workerId: string,
 	projectId: string,
 	enrollment: { status: string; sharingConsent: boolean },
+	controlPlaneUrl: string,
 ): void {
-	const steps = remainingEnrollmentSteps(workerId, projectId, enrollment);
+	const steps = remainingEnrollmentSteps(workerId, projectId, enrollment, controlPlaneUrl);
 	if (steps.length === 0) return;
 	out.info('finish it by hand with:');
 	for (const command of steps) out.info(`  ${command}`);
@@ -2422,13 +2456,18 @@ async function enrollCommand(argv: string[]): Promise<number> {
 	// A refused `--active`/`--consent` left a real enrollment behind, so the way
 	// forward is the one flag that did not land — never this command again.
 	if (outcome.enrollment && outcome.code !== 0) {
-		reportRemainingEnrollmentSteps(worker.workerId, projectId, outcome.enrollment);
+		reportRemainingEnrollmentSteps(
+			worker.workerId,
+			projectId,
+			outcome.enrollment,
+			operator.session.controlPlaneUrl,
+		);
 	}
 	return outcome.code;
 }
 
 /** Everything `register-and-enroll` resolves before it writes anything. */
-interface RegisterAndEnrollPlan {
+export interface RegisterAndEnrollPlan {
 	readonly identifier: string;
 	readonly projectId: string;
 	readonly displayName: string;
@@ -2587,18 +2626,41 @@ function requireProfileOperator(
  * `undefined` (message already printed) for an empty secret; a refusal from the
  * control plane propagates as the `OperatorApiError` it already is.
  */
-async function resolveOperatorCredentialForProject(
+export async function resolveOperatorCredentialForProject(
 	operator: Operator,
 	projectId: string,
 	displayName: string,
+	read: OperatorCredentialReader = readOperatorCredential,
 ): Promise<{ providerId: string; operatorCredential: string } | undefined> {
 	const { providerId } = await operator.client.query(
 		'workers.projectScmProvider',
 		{ projectId },
 		parseWith(ProjectScmProviderSchema),
 	);
-	const operatorCredential = await readOperatorCredential(providerId, displayName);
+	const operatorCredential = await read(providerId, displayName);
 	return operatorCredential ? { providerId, operatorCredential } : undefined;
+}
+
+/**
+ * Where {@link resolveOperatorCredentialForProject} reads the operator's secret
+ * from once the provider is known: {@link readOperatorCredential} by default, or a
+ * caller's own source (`swarm-worker setup --scm-token-file`, issue #1311). It
+ * answers the trimmed secret, or `undefined` with the reason already printed.
+ */
+export type OperatorCredentialReader = (
+	providerId: string,
+	displayName: string,
+) => Promise<string | undefined>;
+
+/**
+ * The prompt the operator's credential for one provider is asked with, naming the
+ * **kind** of secret that provider expects (issue #807) — see
+ * {@link readOperatorCredential}.
+ */
+export function operatorCredentialPrompt(providerId: string, displayName: string): string {
+	const copy = operatorCredentialCopyFor(providerId);
+	const credentialType = copy ? ` (${copy.credentialType})` : '';
+	return `Operator ${providerId} credential${credentialType} for '${displayName}': `;
 }
 
 /**
@@ -2634,12 +2696,8 @@ async function readOperatorCredential(
 	providerId: string,
 	displayName: string,
 ): Promise<string | undefined> {
-	const copy = operatorCredentialCopyFor(providerId);
-	const credentialType = copy ? ` (${copy.credentialType})` : '';
 	const secret = process.stdin.isTTY
-		? await promptHidden(
-				`Operator ${providerId} credential${credentialType} for '${displayName}': `,
-			)
+		? await promptHidden(operatorCredentialPrompt(providerId, displayName))
 		: await readStdin();
 	const credential = secret.trim();
 	if (credential.length === 0) {
@@ -2677,7 +2735,8 @@ async function registerAndEnrollCommand(argv: string[]): Promise<number> {
 	if (!planned.ok) return planned.code;
 	const registered = await executeRegisterAndEnroll(planned.operator, planned.plan);
 	if (!registered.ok) return registered.code;
-	if (planned.plan.profile) return reportProfileStart(registered, undefined);
+	if (planned.plan.profile)
+		return reportProfileStart(registered, undefined, planned.operator.session.controlPlaneUrl);
 
 	// The credential's one and only appearance, on the last line — the "copy the
 	// last line" affordance docs/onboarding-worker.md relies on.
@@ -2701,12 +2760,11 @@ async function registerAndEnrollCommand(argv: string[]): Promise<number> {
  * Azure DevOps PAT) is verified within a repository the worker is enrolled on, so
  * it can only be checked once the enrollment exists.
  */
-async function executeRegisterAndEnroll(
+export async function executeRegisterAndEnroll(
 	operator: Operator,
 	plan: RegisterAndEnrollPlan,
-): Promise<
-	{ ok: true; workerId: string; credential: string; saved: boolean } | { ok: false; code: number }
-> {
+	options: ExecuteRegisterAndEnrollOptions = {},
+): Promise<RegisteredAndEnrolled | { ok: false; code: number }> {
 	const { client } = operator;
 	const {
 		identifier,
@@ -2761,8 +2819,13 @@ async function executeRegisterAndEnroll(
 			);
 		return { ok: false, code: 1 };
 	};
-	const swarm = swarmCommand();
-	const enrollByHand = `${swarm} workers enroll ${worker.id} ${projectId} --cli ${capabilities.join(',')} --active --consent`;
+	const controlPlaneUrl = operator.session.controlPlaneUrl;
+	const enrollByHand = recoveryStep(
+		`workers enroll ${worker.id} ${projectId} --cli ${capabilities.join(',')} --active --consent`,
+		`enroll it in '${projectId}'`,
+		worker.id,
+		controlPlaneUrl,
+	);
 
 	// The same helper `enroll` uses, so the capability, repository-mismatch and
 	// duplicate refusals are surfaced unchanged. Active + consenting with no flag:
@@ -2798,13 +2861,48 @@ async function executeRegisterAndEnroll(
 	if (enrolled.code !== 0) {
 		remaining.push(
 			...(enrolled.enrollment
-				? remainingEnrollmentSteps(worker.id, projectId, enrolled.enrollment)
+				? remainingEnrollmentSteps(worker.id, projectId, enrolled.enrollment, controlPlaneUrl)
 				: [enrollByHand]),
 		);
 	}
-	if (!stored) remaining.push(`${swarm} workers set-scm-credential ${worker.id} ${providerId}`);
+	if (!stored)
+		remaining.push(
+			recoveryStep(
+				`workers set-scm-credential ${worker.id} ${providerId}`,
+				`set its ${providerId} operator credential`,
+				worker.id,
+				controlPlaneUrl,
+			),
+		);
+	// Only an approval left (issue #1311): the enrollment exists and the credential is
+	// stored, so the worker can be started now and takes work once it is approved.
+	if (options.allowPendingApproval && enrolled.code !== 0 && enrolled.enrollment && stored)
+		return { ok: true, workerId: worker.id, credential, saved, pending: remaining };
 	if (enrolled.code !== 0 || !stored) return reportUnfinished(remaining);
-	return { ok: true, workerId: worker.id, credential, saved };
+	return { ok: true, workerId: worker.id, credential, saved, pending: [] };
+}
+
+/** How {@link executeRegisterAndEnroll} treats an enrollment it could create but not finish. */
+export interface ExecuteRegisterAndEnrollOptions {
+	/**
+	 * Succeed when all that is outstanding is the enrollment's approval or consent —
+	 * the row exists and the operator credential is stored — answering those steps
+	 * in `pending` instead of the recovery report. `swarm-worker setup` (issue #1311)
+	 * starts such a worker anyway: it connects, and a project administrator's
+	 * approval is what makes it routable, exactly as it is for any other enrollment.
+	 */
+	allowPendingApproval?: boolean;
+}
+
+/** A worker {@link executeRegisterAndEnroll} registered, enrolled and credentialed. */
+export interface RegisteredAndEnrolled {
+	ok: true;
+	workerId: string;
+	credential: string;
+	/** Whether a profile worker's profile was written (always `true` for a clone worker). */
+	saved: boolean;
+	/** The enrollment steps still outstanding — empty unless `allowPendingApproval` was set. */
+	pending: string[];
 }
 
 /** The one-time worker credential, with the note that it is shown only now. */
@@ -2820,13 +2918,14 @@ function printCredential(credential: string): void {
  * profile that could not be written leaves nothing to start from, so that is a
  * failure — the credential has already been printed.
  */
-function reportProfileStart(
+export function reportProfileStart(
 	registered: { workerId: string; saved: boolean },
 	note: string | undefined,
+	controlPlaneUrl: string,
 ): number {
 	if (!registered.saved) {
 		out.error(
-			`the worker is registered, but its profile could not be written, so swarm-launcher cannot start it — fix the cause, then remove it (${swarmCommand()} workers remove ${registered.workerId}) and register again, or start the daemon by hand with the credential above`,
+			`the worker is registered, but its profile could not be written, so swarm-launcher cannot start it — fix the cause, then ${recoveryStep(`workers remove ${registered.workerId}`, 'delete it', registered.workerId, controlPlaneUrl)} and register again, or start the daemon by hand with the credential above`,
 		);
 		return 1;
 	}
@@ -2956,6 +3055,7 @@ async function setupCommand(argv: string[]): Promise<number> {
 		repoRoot,
 		profile,
 		noAutostart: values['no-autostart'] ?? false,
+		controlPlaneUrl: operator.session.controlPlaneUrl,
 	});
 }
 
@@ -2987,11 +3087,21 @@ async function requireSetupOperator(
  */
 async function startSetUpWorker(
 	registered: { workerId: string; saved: boolean },
-	options: { displayName: string; repoRoot: string; profile: boolean; noAutostart: boolean },
+	options: {
+		displayName: string;
+		repoRoot: string;
+		profile: boolean;
+		noAutostart: boolean;
+		controlPlaneUrl: string;
+	},
 ): Promise<number> {
 	if (options.profile) {
 		if (!registered.saved || options.noAutostart)
-			return reportProfileStart(registered, 'autostart skipped (--no-autostart)');
+			return reportProfileStart(
+				registered,
+				'autostart skipped (--no-autostart)',
+				options.controlPlaneUrl,
+			);
 		return reportAutostart(
 			options.displayName,
 			await installProfileWorkerAutostart(registered.workerId),
@@ -3014,7 +3124,7 @@ async function startSetUpWorker(
  * a `--profile` registration (issue #1296), which would leave two workers
  * contending for one checkout.
  */
-function alreadyRegisteredHere(command: string, repoRoot: string): boolean {
+export function alreadyRegisteredHere(command: string, repoRoot: string): boolean {
 	const cached = readWorkerCredentialCache(repoRoot);
 	if (cached !== null) {
 		out.error(
@@ -3052,7 +3162,7 @@ async function setupCapabilities(cli: string | undefined): Promise<AgentCli[] | 
  * code. `profileWorkerId` names a profile-based worker, whose hints address its
  * agent by `--profile <worker-id>` and its foreground start by `swarm-launcher run`.
  */
-function reportAutostart(
+export function reportAutostart(
 	displayName: string,
 	autostart: WorkerAutostartResult,
 	profileWorkerId?: string,

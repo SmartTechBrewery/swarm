@@ -109,6 +109,10 @@ vi.mock('@/cli/_shared/installation-command.js', () => ({
 	swarmCommand,
 	workerAgentCommand,
 	launcherCommand,
+	// A clone, which ships `swarm` — the launcher package's dashboard hints (issue
+	// #1311) are covered by tests/unit/launcher/setup.test.ts.
+	isLauncherPackage: () => false,
+	workerDashboardUrl: vi.fn(),
 }));
 
 /**

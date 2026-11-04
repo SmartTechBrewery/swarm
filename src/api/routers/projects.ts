@@ -31,7 +31,7 @@ import {
 	ProjectRepositoryConflictError,
 	upsertProjectToDb,
 } from '../../db/repositories/projectsRepository.js';
-import { getMembership, listProjectsForUser } from '../../identity/membership-service.js';
+import { getMembership } from '../../identity/membership-service.js';
 import { githubProjectsBlankPm } from '../../integrations/pm/github-projects/config-schema.js';
 import { getPMProvider } from '../../integrations/pm/registry.js';
 import { getSCMProvider, listInstanceDefaultScmRoles } from '../../integrations/scm/registry.js';
@@ -39,6 +39,7 @@ import { describeError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
 import { repoCoordinatesIssue } from '../../scm/repo-coordinates.js';
 import type { ScmCredentialRole, ScmType } from '../../scm/types.js';
+import { listAccessibleProjectSummaries } from '../accessible-projects.js';
 import {
 	accessibleProjectScope,
 	assertProjectAccess,
@@ -424,46 +425,17 @@ export const projectsRouter = router({
 
 	// The caller's own projects and what they hold on each (issue #661) — the read
 	// model behind the profile's My Projects tab, and the first place the dashboard
-	// exposes a per-project membership role as personal data.
-	//
-	// Visibility is not decided here: it is the same `filterAccessibleProjects` rule
-	// `list` runs on, so a project the caller may not discover is absent for exactly
-	// the reason it is absent there and the two cannot drift apart. A `discoverable`
-	// project they have not joined is therefore not listed — asking to join one stays
-	// `listDiscoverable`/`requestMembership`.
-	//
-	// `role` is the membership row's role, or `null` when there is none. Only an
-	// `instanceAdmin` reaches a project without one, so `null` means precisely
-	// "access comes from the installation role" and is reported as the absence of a
-	// membership rather than as a synthesized `projectAdmin` — inventing one would
-	// misdescribe access that removing an installation role would take away. An
-	// `instanceAdmin` who *is* a member reports that real role.
+	// exposes a per-project membership role as personal data. The read itself is
+	// `listAccessibleProjectSummaries` (`../accessible-projects.ts`), shared with the
+	// operator API's `workers.enrollableProjects` (issue #1311): visibility is
+	// `list`'s own `filterAccessibleProjects` rule, and `role` is `null` for access
+	// that comes from the installation role alone.
 	//
 	// Kept out of `list` rather than folded into it, for `viewerAccess`'s reason:
 	// that query's cache is rewritten by `projects.update`'s result, which carries no
 	// viewer-scoped field, so a `role` riding along there would be dropped by the next
-	// config save. The projection is id + name + role only — the narrowness
-	// `listDiscoverableProjectsFromDb` already applies to a project read that is not
-	// about configuration, so no repo path, board mapping, or credential reference
-	// travels to a personal overview that needs none of them.
-	listMine: authedProcedure.query(async ({ ctx }) => {
-		const accessible = await filterAccessibleProjects(
-			ctx.user,
-			await listAllProjectRecordsFromDb(),
-		);
-		const roleByProjectId = new Map(
-			(await listProjectsForUser(ctx.user.id)).map(
-				(membership) => [membership.projectId, membership.role] as const,
-			),
-		);
-		// `listAllProjectRecordsFromDb` already orders by name, so the order is the server's
-		// and the panel adds no sort of its own.
-		return accessible.map((project) => ({
-			id: project.id,
-			name: project.name,
-			role: roleByProjectId.get(project.id) ?? null,
-		}));
-	}),
+	// config save.
+	listMine: authedProcedure.query(({ ctx }) => listAccessibleProjectSummaries(ctx.user)),
 
 	getById: authedProcedure
 		.input(z.object({ id: z.string().min(1) }))

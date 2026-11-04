@@ -3,9 +3,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+	isLauncherPackage,
 	launcherCommand,
 	swarmCommand,
 	workerAgentCommand,
+	workerDashboardUrl,
 } from '@/cli/_shared/installation-command.js';
 
 /**
@@ -61,6 +63,38 @@ describe('installation command', () => {
 			`node ${join(mine, 'bin', 'swarm-launcher.js')}`,
 		);
 		expect(launcherCommand({ PATH: pathDir }, other)).toBe('swarm-launcher');
+	});
+
+	// Issue #1311: the launcher package ships `swarm-worker` and no `swarm-launcher`,
+	// and its `run <worker-id>` is the same command.
+	it('names swarm-worker for a launcher package, which has no swarm-launcher', () => {
+		const pkg = join(root, 'swarm-worker-launcher');
+		mkdirSync(join(pkg, 'bin'), { recursive: true });
+		writeFileSync(join(pkg, 'bin', 'swarm-worker.js'), '#!/bin/sh\n');
+		chmodSync(join(pkg, 'bin', 'swarm-worker.js'), 0o755);
+		expect(launcherCommand({ PATH: pathDir }, pkg)).toBe(
+			`node ${join(pkg, 'bin', 'swarm-worker.js')}`,
+		);
+		link('swarm-worker', join(pkg, 'bin', 'swarm-worker.js'));
+		expect(launcherCommand({ PATH: pathDir }, pkg)).toBe('swarm-worker');
+	});
+
+	// Issue #1311: the launcher package ships no `bin/swarm.js`, so naming one under
+	// its root would print a command that fails with MODULE_NOT_FOUND.
+	it('never names a bin/swarm.js the launcher package does not ship', () => {
+		const pkg = join(root, 'swarm-worker-launcher');
+		mkdirSync(join(pkg, 'bin'), { recursive: true });
+		writeFileSync(join(pkg, 'bin', 'swarm-worker.js'), '#!/bin/sh\n');
+		expect(isLauncherPackage(pkg)).toBe(true);
+		expect(isLauncherPackage(mine)).toBe(false);
+		expect(swarmCommand({ PATH: pathDir }, pkg)).toBe('swarm');
+		expect(swarmCommand({}, pkg)).not.toContain(join(pkg, 'bin', 'swarm.js'));
+	});
+
+	it("names a worker's page on the installation's dashboard", () => {
+		expect(workerDashboardUrl('https://SWARM.example.com/', 'w 1')).toBe(
+			'https://swarm.example.com/workers/w%201',
+		);
 	});
 
 	it('follows a symlink chain the way npm link leaves one', () => {

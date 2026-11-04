@@ -225,6 +225,15 @@ export interface OwnerWorkerView {
 	 * two reads answered it.
 	 */
 	supervision: WorkerSupervision;
+	/**
+	 * Whether the machine holds a live session right now, and when it was last heard
+	 * from (`null` if never) — the dashboard roster's own two fields, derived the same
+	 * way (issue #1311). `swarm-worker setup` waits on `connection` for the worker it
+	 * just installed, and `swarm-worker status` reports both, so an owner can tell
+	 * "running and connected" from "installed but silent" with no dashboard session.
+	 */
+	connection: WorkerConnectionState;
+	lastSeenAt: Date | null;
 	runState: WorkerRunState;
 	enrollments: OwnerEnrollmentView[];
 }
@@ -432,6 +441,10 @@ export async function listOwnerWorkers(ownerUserId: string): Promise<OwnerWorker
 	for (const worker of workers) {
 		const enrollments = await listEnrollmentsForWorker(worker.id);
 		const runState = await deriveWorkerRunState(worker.id);
+		// The same derivation as the dashboard row (`assembleDashboardWorker`): the
+		// retained session row outlives expiry, so it is an offline worker's last seen.
+		const liveSession = await getLiveSessionForWorker(worker.id);
+		const lastSeenSession = liveSession ?? (await getRetainedSessionForWorker(worker.id));
 		views.push({
 			workerId: worker.id,
 			displayName: worker.displayName,
@@ -440,6 +453,8 @@ export async function listOwnerWorkers(ownerUserId: string): Promise<OwnerWorker
 			rateLimits: rateLimits.get(worker.id) ?? [],
 			update: worker.update,
 			supervision: worker.supervision,
+			connection: liveSession ? 'online' : 'offline',
+			lastSeenAt: lastSeenSession?.lastHeartbeatAt ?? null,
 			runState,
 			enrollments: enrollments.map(assembleOwnerEnrollmentView),
 		});

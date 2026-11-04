@@ -340,7 +340,8 @@ the `build-info.json` stamp (when `SWARM_BUILD_COMMIT` is set), `bin/swarm-worke
 `bin/swarm-worker-agent`, the launcher bundled into `dist/launcher/swarm-worker.js`,
 and the trusted key at `deploy/worker-runtime/minisign.pub` when the checkout it was
 built from has one (the build warns when it does not). It needs only Node >= 22.
-`swarm-worker run` and `runtimes` are exactly the launcher's commands above. The
+`swarm-worker run` and `runtimes` are exactly the launcher's commands above, and
+`swarm-worker setup`, `login` and `status` set a worker up and check on it (below). The
 package's own `bin/swarm-worker-agent install --profile <workerId>` writes an agent
 that runs the package's `bin/swarm-worker.js`, so it never refers back to a clone.
 Its tarball is byte-deterministic for one tree and commit, and every published image
@@ -367,6 +368,37 @@ never held against it).
 `add-checkout` / `remove-checkout` in its primary checkout edit the profile, and
 `swarm run:worker` there exits 1 naming `swarm-launcher run <workerId>`. A worker
 with no profile on the machine is handled exactly as before.
+
+**With no clone at all, the launcher package writes the profile itself** (issue
+#1311). Run in the project checkout the worker is to serve:
+
+```bash
+swarm-worker setup --control-plane-url https://swarm.example.com
+swarm-worker status            # each profile: LaunchAgent, runtime, connected or not
+swarm-worker login             # renew the session (URL defaults to the profiles' one)
+```
+
+`setup` asks for your email and password (typed without echo; or `--email` and
+`--password-file <path|->`) unless a live session for that URL is cached, then for
+the project — a numbered list of the projects you can access, read through the
+operator API's `workers.enrollableProjects`, and picked for you when there is only
+one — the agent CLIs (those on `PATH`), the worker's name, and your source-control
+token for the project's provider (typed without echo, or `--scm-token-file
+<path|->`; only one of the two files may be `-`). It then registers, enrolls and
+credentials the worker with `swarm workers setup --profile`'s own code, writes the
+profile, installs and verifies the installation's runtime (a verification refusal
+stops it before launchd is touched; an installation serving no runtime yet is only a
+warning), installs the LaunchAgent, and waits up to a minute for the control plane
+to see the worker connected. Every question has a flag, so with every flag given it
+runs unattended; with no terminal a missing answer fails naming its flag, and
+`--yes` accepts the defaults. The password is never printed, logged or stored, and
+no `.env` is read or written — only the session token is cached, under
+`~/.swarm/operator-sessions/`. An enrollment into a project you do not administer
+still needs a project administrator's approval: the worker is installed and started
+anyway, connects, and takes work once approved, and `setup` names the step. `status`
+exits 0 only when every worker it reports is connected; without a live session it
+shows the local view and says to run `swarm-worker login`. See
+[`docs/cli.md`](./cli.md#swarm-worker-setup).
 
 **One worker can serve several repositories on one machine** (issue #1059) — one
 checkout per repository, one daemon. Give it the extra checkouts at registration
@@ -1883,6 +1915,9 @@ npm run swarm -- login --logout
 # register it into ~/.swarm/workers/<worker-id>/profile.json, then start it
 npm run swarm -- workers setup --profile --control-plane-url <url>
 swarm-launcher run <worker-id>
+# …or, from the launcher package with no clone at all, in the project checkout:
+swarm-worker setup --control-plane-url <url>
+swarm-worker status
 
 # Read runs over the same session — no DATABASE_URL, no browser
 npm run swarm -- run list --status failed --since 24h

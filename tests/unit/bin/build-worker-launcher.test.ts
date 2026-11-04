@@ -134,6 +134,8 @@ describe('bin/build-worker-launcher.js', () => {
 			).toBe(true);
 	});
 
+	// Issue #1311 bundles `swarm workers`' own code (`src/cli/commands/workers.ts`) for
+	// `setup`, which must still drag in none of the daemon's datastore or transport.
 	it('bundles nothing from the daemon graph and no path into the checkout', () => {
 		const bundle = readFileSync(join(packageRoot, 'dist/launcher/swarm-worker.js'), 'utf8');
 		for (const marker of [
@@ -172,6 +174,29 @@ describe('bin/build-worker-launcher.js', () => {
 
 		const missing = swarmWorker(['run', 'no-such-worker']);
 		expect(missing.status).toBe(1);
+	});
+
+	// Issue #1311: the three commands a clone-free host is set up and checked with.
+	it('runs setup, login and status with nothing but Node, and writes no .env', () => {
+		const setup = swarmWorker(['setup', '--help']);
+		expect(setup.status, setup.stderr).toBe(0);
+		expect(setup.stdout).toContain('swarm-worker setup [--control-plane-url <url>]');
+
+		const login = swarmWorker(['login', '--help']);
+		expect(login.status, login.stderr).toBe(0);
+		expect(login.stdout).toContain('swarm-worker login [--control-plane-url <url>]');
+
+		// No terminal and no flags: refused, naming the flag, with nothing written.
+		const home = tempDir('setup-home');
+		const refused = swarmWorker(['setup'], home);
+		expect(refused.status).toBe(1);
+		expect(refused.stderr).toContain('pass --control-plane-url <url>');
+		expect(readdirSync(home)).toEqual([]);
+		expect(existsSync(join(packageRoot, '.env'))).toBe(false);
+
+		const status = swarmWorker(['status'], home);
+		expect(status.status).toBe(1);
+		expect(status.stderr).toContain('no worker profiles on this host');
 	});
 
 	it('installs a profile agent whose plist points into the package', () => {
