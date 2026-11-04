@@ -1168,6 +1168,7 @@ the same URL as `SWARM_CONTROL_PLANE_URL`:
 | Route | Auth | Answers |
 | --- | --- | --- |
 | `GET /worker/runtime/manifest` | none | The version the installation wants workers on, its commit, and the artifact's name, download `url`, size, SHA-256 and full `.minisig` text. |
+| `GET /worker/runtime/manifest?version=<v>` | none | The same shape for the signed release `v<v>` (`1.2.3` or `v1.2.3`). Its own version answers as above; any other is located on the publisher's GitHub Release, with an absolute `url` there. |
 | `GET /worker/runtime/artifacts/<name>` | `Authorization: Bearer` — a worker credential, or an operator token from `swarm login` | The tarball itself. |
 
 The manifest is open because a first install has no credential yet, and it holds
@@ -1188,12 +1189,37 @@ curl -fO -H "Authorization: Bearer $SWARM_WORKER_CREDENTIAL" \
 ```
 
 `url` is resolved against the control-plane URL, so it is relative when the
-installation serves the file itself; the shape also allows an absolute URL, for an
-installation that later names a version it does not carry. Verify the download
-against the manifest's `sha256` and, with the public key you trust, its `minisig`
-([above](#verifying-the-worker-runtime)).
+installation serves the file itself and absolute for a release it only locates
+(below). Verify the download against the manifest's `sha256` and, with the public
+key you trust, its `minisig` ([above](#verifying-the-worker-runtime)).
 
-**Only the installation's own, signed runtime is served.** The manifest says
+**Another signed release is located, never served (issue #1282).** Asked for
+`?version=<v>` other than its own, the control plane looks up the GitHub Release
+`v<v>` of the publisher, `SmartTechBrewery/swarm` (a constant, not a setting: the
+launcher trusts this publisher's key, so no other source could produce a runtime
+that verifies), and answers that release's `swarm-worker-runtime-<v>.tar.gz`
+download URL and size, the SHA-256 from its `.sha256`, the whole `.minisig`, and
+the commit named in the signature's trusted comment. The control plane fetches only
+those two small files; the worker downloads the tarball from GitHub directly, with
+no credential. `"available": false` names the reason for a version that is not a
+valid version, a release that does not exist, one that predates the published
+runtime, one with no checksum or no signature, or a signature naming another
+version. The artifact route still serves only the installation's own tarball. A
+located release is remembered for the process's life (a published release is
+immutable; up to 32 versions), and a failed lookup is retried on the next request.
+Two limits: the lookup is anonymous, so it shares GitHub's unauthenticated API rate
+limit (60 an hour per control-plane IP, answered as `"available": false` saying
+so), and a private fork's releases cannot be located at all. Trust does not move:
+whatever the manifest names, the worker installs only bytes its own trusted key
+verifies.
+
+```bash
+curl -s 'https://swarm.example.com/worker/runtime/manifest?version=X.Y.Z'
+# {"available":true,"version":"X.Y.Z","commit":"…","artifact":{"name":"swarm-worker-runtime-X.Y.Z.tar.gz",
+#  "url":"https://github.com/SmartTechBrewery/swarm/releases/download/vX.Y.Z/swarm-worker-runtime-X.Y.Z.tar.gz",…},…}
+```
+
+**Only the installation's own, signed runtime is served.** With no `?version=`, the manifest says
 `"available": false` with a `reason`, and the download answers `404` with the same
 reason, unless all of these hold: the installation declares a version and a commit
 (its `build-info.json` stamp or its checkout); the tarball for *that* version is

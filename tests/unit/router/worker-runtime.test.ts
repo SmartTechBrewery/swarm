@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { createReadStream, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -6,12 +7,24 @@ import { Hono } from 'hono';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SwarmUser } from '@/identity/schema.js';
 import type { Worker } from '@/identity/worker.js';
+import { ensureRuntime } from '@/launcher/runtime-store.js';
 import type { WorkerBuild } from '@/lib/build-identity.js';
-import { registerWorkerRuntime, type WorkerRuntimeDeps } from '@/router/worker-runtime.js';
 import {
+	RELEASE_MEMO_LIMIT,
+	registerWorkerRuntime,
+	resolveReleaseRuntime,
+	type WorkerRuntimeDeps,
+} from '@/router/worker-runtime.js';
+import {
+	isRuntimeVersion,
 	parseMinisignTrustedComment,
 	WorkerRuntimeManifestSchema,
 } from '@/transport/runtime-manifest.js';
+import {
+	buildRuntimeTarball,
+	makeMinisignKey,
+	signMinisign,
+} from '../../helpers/runtime-fixtures.js';
 
 vi.mock('node:fs', async (importOriginal) => {
 	const actual = await importOriginal<typeof import('node:fs')>();
@@ -77,8 +90,8 @@ function buildApp(deps: WorkerRuntimeDeps = makeDeps()): Hono {
 	return app;
 }
 
-async function manifest(app: Hono) {
-	const res = await app.request('/worker/runtime/manifest');
+async function manifest(app: Hono, query = '') {
+	const res = await app.request(`/worker/runtime/manifest${query}`);
 	expect(res.status).toBe(200);
 	expect(res.headers.get('Cache-Control')).toBe('private, no-store');
 	return WorkerRuntimeManifestSchema.parse(await res.json());
@@ -284,6 +297,341 @@ describe('GET /worker/runtime/artifacts/:name (issue #1280)', () => {
 		expect(await res.json()).toEqual({
 			reason: `this installation serves only ${NAME} (v${VERSION})`,
 		});
+	});
+});
+
+const OTHER_VERSION = '1.6.0';
+const OTHER_COMMIT = 'c0ffee00112233445566778899aabbccddeeff00';
+const OTHER_NAME = `swarm-worker-runtime-${OTHER_VERSION}.tar.gz`;
+const RELEASE_API = `https://api.github.com/repos/SmartTechBrewery/swarm/releases/tags/v${OTHER_VERSION}`;
+const DOWNLOAD = `https://github.com/SmartTechBrewery/swarm/releases/download/v${OTHER_VERSION}`;
+
+interface Served {
+	status?: number;
+	body?: Buffer | string;
+	throws?: Error;
+}
+
+/** A fake `fetch` answering exact URLs, recording each request. */
+function fakeFetch(routes: Record<string, Served>) {
+	const calls: Array<{ url: string; headers: Record<string, string> }> = [];
+	const fetch = vi.fn(async (input: URL | string, init?: RequestInit) => {
+		const url = input.toString();
+		calls.push({ url, headers: { ...(init?.headers as Record<string, string> | undefined) } });
+		const route = routes[url];
+		if (!route) return new Response('not found', { status: 404 });
+		if (route.throws) throw route.throws;
+		const body = typeof route.body === 'string' ? route.body : new Uint8Array(route.body ?? []);
+		return new Response(body, { status: route.status ?? 200 });
+	}) as unknown as typeof globalThis.fetch;
+	return { fetch, calls };
+}
+
+/** The GitHub API release and its assets for `OTHER_VERSION`, as the publish workflow attaches them. */
+function releaseRoutes(
+	opts: {
+		data?: Buffer;
+		signature?: string | null;
+		checksum?: string | null;
+		tarball?: boolean;
+	} = {},
+): Record<string, Served> {
+	const data = opts.data ?? tarball;
+	const assets = [
+		...(opts.tarball === false
+			? []
+			: [
+					{
+						name: OTHER_NAME,
+						size: data.length,
+						browser_download_url: `${DOWNLOAD}/${OTHER_NAME}`,
+					},
+				]),
+		...(opts.checksum === null
+			? []
+			: [
+					{
+						name: `${OTHER_NAME}.sha256`,
+						size: 100,
+						browser_download_url: `${DOWNLOAD}/${OTHER_NAME}.sha256`,
+					},
+				]),
+		...(opts.signature === null
+			? []
+			: [
+					{
+						name: `${OTHER_NAME}.minisig`,
+						size: 300,
+						browser_download_url: `${DOWNLOAD}/${OTHER_NAME}.minisig`,
+					},
+				]),
+		{ name: 'unrelated.txt', size: 1, browser_download_url: `${DOWNLOAD}/unrelated.txt` },
+	];
+	return {
+		[RELEASE_API]: { body: JSON.stringify({ tag_name: `v${OTHER_VERSION}`, assets }) },
+		[`${DOWNLOAD}/${OTHER_NAME}`]: { body: data },
+		[`${DOWNLOAD}/${OTHER_NAME}.sha256`]: {
+			body: `${opts.checksum ?? createHash('sha256').update(data).digest('hex')}  ${OTHER_NAME}\n`,
+		},
+		[`${DOWNLOAD}/${OTHER_NAME}.minisig`]: {
+			body: opts.signature ?? minisig(`swarm-worker-runtime ${OTHER_VERSION} ${OTHER_COMMIT}`),
+		},
+	};
+}
+
+describe('GET /worker/runtime/manifest?version= (issue #1282)', () => {
+	beforeEach(() => writeRuntime());
+
+	it.each([
+		['its own version', `?version=${VERSION}`],
+		['its own tag', `?version=v${VERSION}`],
+	])('answers the installation’s own runtime for %s, with no GitHub lookup', async (_label, query) => {
+		const github = fakeFetch(releaseRoutes());
+
+		const body = await manifest(buildApp(makeDeps({ fetch: github.fetch })), query);
+
+		expect(body).toMatchObject({
+			available: true,
+			version: VERSION,
+			artifact: { url: `/worker/runtime/artifacts/${NAME}` },
+		});
+		expect(github.calls).toEqual([]);
+	});
+
+	it.each([
+		'',
+		'../x',
+		'v',
+		'1.0/../../etc',
+		'-1.0',
+	])('refuses the invalid version %j without any lookup', async (version) => {
+		const github = fakeFetch(releaseRoutes());
+
+		const body = await manifest(
+			buildApp(makeDeps({ fetch: github.fetch })),
+			`?version=${encodeURIComponent(version)}`,
+		);
+
+		expect(body).toEqual({
+			available: false,
+			reason: `${JSON.stringify(version)} is not a valid runtime version`,
+		});
+		expect(github.calls).toEqual([]);
+	});
+
+	it('locates another signed release on the publisher’s GitHub Release', async () => {
+		const github = fakeFetch(releaseRoutes());
+
+		const body = await manifest(
+			buildApp(makeDeps({ fetch: github.fetch })),
+			`?version=v${OTHER_VERSION}`,
+		);
+
+		expect(body).toEqual({
+			available: true,
+			version: OTHER_VERSION,
+			commit: OTHER_COMMIT,
+			artifact: {
+				name: OTHER_NAME,
+				url: `${DOWNLOAD}/${OTHER_NAME}`,
+				size: tarball.length,
+				sha256: createHash('sha256').update(tarball).digest('hex'),
+			},
+			signature: {
+				format: 'minisign',
+				minisig: minisig(`swarm-worker-runtime ${OTHER_VERSION} ${OTHER_COMMIT}`),
+			},
+		});
+		// The tarball itself is located, never downloaded by the control plane.
+		expect(github.calls.map((call) => call.url)).toEqual([
+			RELEASE_API,
+			`${DOWNLOAD}/${OTHER_NAME}.sha256`,
+			`${DOWNLOAD}/${OTHER_NAME}.minisig`,
+		]);
+		expect(github.calls[0].headers.accept).toBe('application/vnd.github+json');
+		expect(github.calls[0].headers).not.toHaveProperty('authorization');
+	});
+
+	it.each<[string, () => Record<string, Served>, RegExp]>([
+		['no such release', () => ({}), /has no published release v1\.6\.0/],
+		[
+			'the anonymous rate limit',
+			() => ({ [RELEASE_API]: { status: 403 } }),
+			/HTTP 403.*anonymous GitHub API rate limit/,
+		],
+		['a GitHub server error', () => ({ [RELEASE_API]: { status: 502 } }), /answered HTTP 502/],
+		[
+			'a network error',
+			() => ({ [RELEASE_API]: { throws: new Error('ETIMEDOUT') } }),
+			/could not be looked up on GitHub: ETIMEDOUT/,
+		],
+		[
+			'a release with no runtime',
+			() => releaseRoutes({ tarball: false }),
+			/carries no worker runtime swarm-worker-runtime-1\.6\.0\.tar\.gz/,
+		],
+		['a release with no checksum', () => releaseRoutes({ checksum: null }), /has no checksum file/],
+		['an unsigned release', () => releaseRoutes({ signature: null }), /is unsigned/],
+		[
+			'a checksum that names no SHA-256',
+			() => releaseRoutes({ checksum: 'not-a-sha' }),
+			/does not form a valid manifest: artifact\.sha256/,
+		],
+		[
+			'a signature with no trusted comment',
+			() => releaseRoutes({ signature: 'untrusted comment: x\nabc\n' }),
+			/names no version and commit/,
+		],
+		[
+			'a signature for another version',
+			() => releaseRoutes({ signature: minisig(`swarm-worker-runtime 1.5.9 ${OTHER_COMMIT}`) }),
+			/is signed as v1\.5\.9, not v1\.6\.0/,
+		],
+		[
+			'an oversized signature',
+			() => releaseRoutes({ signature: 'x'.repeat(64 * 1024) }),
+			/is larger than/,
+		],
+	])('says so for %s', async (_label, routes, reason) => {
+		const body = await manifest(
+			buildApp(makeDeps({ fetch: fakeFetch(routes()).fetch })),
+			`?version=${OTHER_VERSION}`,
+		);
+
+		expect(body.available).toBe(false);
+		if (body.available) return;
+		expect(body.reason).toMatch(reason);
+	});
+
+	it('still serves only its own artifact', async () => {
+		const app = buildApp(makeDeps({ fetch: fakeFetch(releaseRoutes()).fetch }));
+		await manifest(app, `?version=${OTHER_VERSION}`);
+
+		const res = await download(app, OTHER_NAME, WORKER_CREDENTIAL);
+
+		expect(res.status).toBe(404);
+	});
+
+	it('remembers a located release, but retries one that was not found', async () => {
+		const routes: Record<string, Served> = {};
+		const github = fakeFetch(routes);
+		const app = buildApp(makeDeps({ fetch: github.fetch }));
+
+		expect((await manifest(app, `?version=${OTHER_VERSION}`)).available).toBe(false);
+		Object.assign(routes, releaseRoutes());
+		expect((await manifest(app, `?version=${OTHER_VERSION}`)).available).toBe(true);
+		const lookups = github.calls.length;
+		expect((await manifest(app, `?version=v${OTHER_VERSION}`)).available).toBe(true);
+
+		expect(github.calls.length).toBe(lookups);
+	});
+
+	it(`remembers at most ${RELEASE_MEMO_LIMIT} releases, forgetting the oldest`, async () => {
+		// Every `9.0.<n>` is a signed release, so each lookup is remembered.
+		const looked: string[] = [];
+		const github = vi.fn(async (input: URL | string) => {
+			const url = input.toString();
+			const version = /\/v?(9\.0\.\d+)/.exec(url)?.[1] ?? '';
+			const name = `swarm-worker-runtime-${version}.tar.gz`;
+			const base = `https://example.test/v${version}/${name}`;
+			if (url.startsWith('https://api.github.com/')) {
+				looked.push(version);
+				return Response.json({
+					assets: [
+						{ name, size: 1, browser_download_url: base },
+						{ name: `${name}.sha256`, size: 1, browser_download_url: `${base}.sha256` },
+						{ name: `${name}.minisig`, size: 1, browser_download_url: `${base}.minisig` },
+					],
+				});
+			}
+			if (url.endsWith('.sha256')) return new Response('a'.repeat(64));
+			return new Response(minisig(`swarm-worker-runtime ${version} ${OTHER_COMMIT}`));
+		}) as unknown as typeof globalThis.fetch;
+		const app = buildApp(makeDeps({ fetch: github }));
+
+		for (let i = 0; i <= RELEASE_MEMO_LIMIT; i++)
+			expect((await manifest(app, `?version=9.0.${i}`)).available).toBe(true);
+		await manifest(app, `?version=9.0.${RELEASE_MEMO_LIMIT}`);
+		await manifest(app, '?version=9.0.0');
+
+		expect(looked).toEqual([
+			...Array.from({ length: RELEASE_MEMO_LIMIT + 1 }, (_, i) => `9.0.${i}`),
+			'9.0.0',
+		]);
+	});
+});
+
+describe('resolveReleaseRuntime → ensureRuntime (issue #1282)', () => {
+	it('installs another signed release from its absolute URL, sending no credential', async () => {
+		const key = makeMinisignKey();
+		const data = buildRuntimeTarball(OTHER_VERSION, OTHER_COMMIT);
+		const github = fakeFetch(
+			releaseRoutes({
+				data,
+				signature: signMinisign(key, data, `swarm-worker-runtime ${OTHER_VERSION} ${OTHER_COMMIT}`),
+			}),
+		);
+		const located = await resolveReleaseRuntime(OTHER_VERSION, { fetch: github.fetch });
+		expect(located.available).toBe(true);
+		if (!located.available) return;
+		const home = mkdtempSync(join(tmpdir(), 'swarm-release-install-'));
+		try {
+			const installed = await ensureRuntime({
+				controlPlaneUrl: 'https://swarm.example.com',
+				manifest: located.manifest,
+				bearer: WORKER_CREDENTIAL,
+				trustedPublicKey: key.publicKey,
+				homeDir: home,
+				fetch: github.fetch,
+			});
+
+			expect(installed).toMatchObject({ version: OTHER_VERSION, installed: true });
+			const tarballRequest = github.calls.find((call) => call.url === `${DOWNLOAD}/${OTHER_NAME}`);
+			expect(tarballRequest?.headers).toEqual({});
+		} finally {
+			execFileSync('chmod', ['-R', 'u+w', home]);
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
+	it('is refused by a worker that trusts another key', async () => {
+		const data = buildRuntimeTarball(OTHER_VERSION, OTHER_COMMIT);
+		const github = fakeFetch(
+			releaseRoutes({
+				data,
+				signature: signMinisign(
+					makeMinisignKey(),
+					data,
+					`swarm-worker-runtime ${OTHER_VERSION} ${OTHER_COMMIT}`,
+				),
+			}),
+		);
+		const located = await resolveReleaseRuntime(OTHER_VERSION, { fetch: github.fetch });
+		if (!located.available) throw new Error(located.reason);
+		const home = mkdtempSync(join(tmpdir(), 'swarm-release-install-'));
+		try {
+			expect(
+				await ensureRuntime({
+					controlPlaneUrl: 'https://swarm.example.com',
+					manifest: located.manifest,
+					trustedPublicKey: makeMinisignKey().publicKey,
+					homeDir: home,
+					fetch: github.fetch,
+				}),
+			).toEqual({ error: expect.stringMatching(/signature is refused/) });
+		} finally {
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+});
+
+describe('isRuntimeVersion', () => {
+	it.each(['1.2.3', '1.2.3-rc.1', '1.2.3+build.5'])('accepts %s', (version) => {
+		expect(isRuntimeVersion(version)).toBe(true);
+	});
+
+	it.each(['', '../1', '1/2', '.1', '-1', 'a'.repeat(101)])('refuses %j', (version) => {
+		expect(isRuntimeVersion(version)).toBe(false);
 	});
 });
 

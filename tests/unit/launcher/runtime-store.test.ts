@@ -385,6 +385,24 @@ describe('fetchRuntimeManifest', () => {
 		expect(await fetchRuntimeManifest(CONTROL_PLANE, { fetch: fetch.fetch })).toEqual(manifest);
 	});
 
+	it('asks for a named release with ?version=, and for its own runtime without one', async () => {
+		const manifest = manifestFor(buildRuntimeTarball(VERSION));
+		const fetch = fakeFetch({
+			[MANIFEST_URL]: { body: JSON.stringify(manifest) },
+			[`${MANIFEST_URL}?version=${VERSION}`]: { body: JSON.stringify(manifest) },
+		});
+
+		expect(
+			await fetchRuntimeManifest(CONTROL_PLANE, { fetch: fetch.fetch, version: VERSION }),
+		).toEqual(manifest);
+		await fetchRuntimeManifest(CONTROL_PLANE, { fetch: fetch.fetch });
+
+		expect(fetch.calls.map((call) => call.url)).toEqual([
+			`${MANIFEST_URL}?version=${VERSION}`,
+			MANIFEST_URL,
+		]);
+	});
+
 	it('passes an unavailable manifest through with its reason', async () => {
 		const body = { available: false, reason: 'unsigned' };
 		const fetch = fakeFetch({ [MANIFEST_URL]: { body: JSON.stringify(body) } });

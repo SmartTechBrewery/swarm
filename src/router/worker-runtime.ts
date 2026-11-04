@@ -8,7 +8,7 @@
  * `.minisig`. The wire contract and the access policy are documented on
  * `../transport/runtime-manifest.ts`.
  *
- * **Only the installation's own runtime is served, and only a signed one.** The
+ * **Only the installation's own runtime is *served*, and only a signed one.** The
  * runtime is available when this process declares a version and a commit, the
  * tarball for *that* version is present, its `.sha256` matches its bytes, a
  * `.minisig` is present, and that signature's trusted comment names this version
@@ -22,13 +22,26 @@
  * the files are part of the image, the same reasoning as `resolveOwnBuildIdentity`.
  * A restart picks up changed files.
  *
+ * **Another signed release is only *located* (issue #1282).** A manifest request
+ * naming `?version=<v>` other than the installation's own is answered from the
+ * publisher's GitHub Release `v<v>` (`resolveReleaseRuntime`): an absolute artifact
+ * URL on that release, its size, the SHA-256 from its `.sha256` and the whole
+ * `.minisig`, with the commit read from the signature's trusted comment. Nothing of
+ * that release is downloaded or served here, and the artifact route still serves
+ * only the installation's own tarball. The same plausibility checks apply (a
+ * checksum, a signature, a trusted comment naming the version), and trust stays
+ * with the worker, which installs only bytes its own key verifies. A located
+ * release is memoized per version, since a published release is immutable; a
+ * failure is not, so a release published after the first ask is found on the next.
+ *
  * Both routes send `Cache-Control: private, no-store`. Cloudflare caches `.gz` by
  * extension by default, and a cached copy of the authenticated download would be
  * served without the bearer check, while a cached manifest would outlive a deploy.
  *
  * Mirrors `./operator-session.ts`: the request logic is factored into pure,
- * injectable functions (`resolveOwnRuntime`, `handleRuntimeManifest`,
- * `handleRuntimeArtifact`) so tests drive them with fake deps.
+ * injectable functions (`resolveOwnRuntime`, `resolveReleaseRuntime`,
+ * `handleRuntimeManifest`, `handleRuntimeArtifact`) so tests drive them with fake
+ * deps.
  */
 
 import { createHash } from 'node:crypto';
@@ -37,6 +50,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import type { Hono } from 'hono';
+import { z } from 'zod';
 
 import { resolveSession } from '../identity/auth.js';
 import type { SwarmUser } from '../identity/schema.js';
@@ -50,6 +64,9 @@ import {
 import { logger } from '../lib/logger.js';
 import {
 	type AvailableWorkerRuntimeManifest,
+	AvailableWorkerRuntimeManifestSchema,
+	isRuntimeVersion,
+	PUBLISHER_RELEASES_REPOSITORY,
 	parseMinisignTrustedComment,
 	runtimeArtifactName,
 	WORKER_RUNTIME_ARTIFACTS_PATH,
@@ -64,6 +81,8 @@ export interface WorkerRuntimeDeps {
 	resolveOwnBuild: () => Promise<WorkerBuild | undefined>;
 	resolveWorkerByCredential: (rawCredential: string) => Promise<Worker | undefined>;
 	resolveSession: (rawToken: string) => Promise<SwarmUser | undefined>;
+	/** Reaches the publisher's GitHub Releases for another version's manifest. */
+	fetch?: typeof globalThis.fetch;
 }
 
 function defaultDeps(): WorkerRuntimeDeps {
@@ -177,8 +196,165 @@ export async function resolveOwnRuntime(deps: WorkerRuntimeDeps): Promise<OwnRun
 	}
 }
 
+/** Another signed release, located on the publisher's GitHub Release, or why it is not. */
+export type ReleaseRuntime =
+	| { available: true; manifest: AvailableWorkerRuntimeManifest }
+	| { available: false; reason: string };
+
+/** Bounds every request to GitHub, so a slow one cannot hold a manifest request open. */
+const RELEASE_FETCH_TIMEOUT_MS = 10_000;
+
+/** A `.sha256` or `.minisig` is a line or four; anything bigger is not one. */
+const RELEASE_SIDECAR_MAX_BYTES = 16 * 1024;
+
+const GITHUB_API = 'https://api.github.com';
+
+const ReleaseAssetSchema = z.object({
+	name: z.string(),
+	size: z.number().int().nonnegative(),
+	browser_download_url: z.string().url(),
+});
+const ReleaseSchema = z.object({ assets: z.array(z.unknown()) });
+
+/** A response body's text, refusing one longer than `limit` bytes. */
+async function readTextCapped(response: Response, limit: number): Promise<string | undefined> {
+	const declared = response.headers.get('content-length');
+	if (declared !== null && Number(declared) > limit) return undefined;
+	if (!response.body) return '';
+	const reader = response.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	while (true) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		total += value.byteLength;
+		if (total > limit) {
+			await reader.cancel().catch(() => undefined);
+			return undefined;
+		}
+		chunks.push(value);
+	}
+	return Buffer.concat(chunks).toString('utf8');
+}
+
+type ReleaseAsset = z.infer<typeof ReleaseAssetSchema>;
+type ReleaseGet = (url: string, accept: string) => Promise<Response>;
+
+/** The release `tag`'s assets by name, or why it has none to offer. */
+async function fetchReleaseAssets(
+	tag: string,
+	get: ReleaseGet,
+): Promise<Map<string, ReleaseAsset> | ReleaseRuntime> {
+	const response = await get(
+		`${GITHUB_API}/repos/${PUBLISHER_RELEASES_REPOSITORY}/releases/tags/${encodeURIComponent(tag)}`,
+		'application/vnd.github+json',
+	);
+	if (response.status === 404)
+		return unavailable(`${PUBLISHER_RELEASES_REPOSITORY} has no published release ${tag}`);
+	if (response.status === 403 || response.status === 429)
+		return unavailable(
+			`GitHub refused the lookup of release ${tag} (HTTP ${response.status}); the control plane's anonymous GitHub API rate limit is probably exhausted, so try again later`,
+		);
+	if (!response.ok)
+		return unavailable(`looking up release ${tag} on GitHub answered HTTP ${response.status}`);
+	const release = ReleaseSchema.safeParse(await response.json());
+	if (!release.success)
+		return unavailable(`GitHub answered release ${tag} with an unexpected shape`);
+
+	const assets = new Map<string, ReleaseAsset>();
+	for (const raw of release.data.assets) {
+		const asset = ReleaseAssetSchema.safeParse(raw);
+		if (asset.success) assets.set(asset.data.name, asset.data);
+	}
+	return assets;
+}
+
+/** A small release asset's text (a `.sha256` or a `.minisig`), or why it could not be read. */
+async function readReleaseSidecar(
+	asset: ReleaseAsset,
+	get: ReleaseGet,
+): Promise<{ text: string } | { error: string }> {
+	const response = await get(asset.browser_download_url, 'application/octet-stream');
+	if (!response.ok) return { error: `downloading ${asset.name} answered HTTP ${response.status}` };
+	const text = await readTextCapped(response, RELEASE_SIDECAR_MAX_BYTES);
+	return text === undefined
+		? { error: `${asset.name} is larger than ${RELEASE_SIDECAR_MAX_BYTES} bytes` }
+		: { text };
+}
+
+/**
+ * Locate the signed runtime for `version` on the publisher's GitHub Release
+ * `v<version>`. Never throws: a missing release, a release without a runtime, an
+ * unsigned one, a signature for another version, GitHub's anonymous rate limit
+ * and any network error are each an unavailable runtime naming the reason.
+ */
+export async function resolveReleaseRuntime(
+	version: string,
+	deps: Pick<WorkerRuntimeDeps, 'fetch'>,
+): Promise<ReleaseRuntime> {
+	const fetchImpl = deps.fetch ?? globalThis.fetch;
+	const tag = `v${version}`;
+	const name = runtimeArtifactName(version);
+	const get: ReleaseGet = (url, accept) =>
+		fetchImpl(url, {
+			headers: { accept, 'user-agent': 'swarm-control-plane' },
+			signal: AbortSignal.timeout(RELEASE_FETCH_TIMEOUT_MS),
+		});
+
+	try {
+		const assets = await fetchReleaseAssets(tag, get);
+		if (!(assets instanceof Map)) return assets;
+		const tarball = assets.get(name);
+		if (!tarball)
+			return unavailable(
+				`release ${tag} carries no worker runtime ${name} (it predates the published runtime)`,
+			);
+		const checksumAsset = assets.get(`${name}.sha256`);
+		if (!checksumAsset) return unavailable(`release ${tag}'s worker runtime has no checksum file`);
+		const signatureAsset = assets.get(`${name}.minisig`);
+		if (!signatureAsset)
+			return unavailable(`release ${tag}'s worker runtime is unsigned and is not offered`);
+
+		const checksum = await readReleaseSidecar(checksumAsset, get);
+		if ('error' in checksum) return unavailable(`release ${tag}: ${checksum.error}`);
+		const sha256 = checksum.text.trim().split(/\s+/)[0]?.toLowerCase() ?? '';
+
+		const signature = await readReleaseSidecar(signatureAsset, get);
+		if ('error' in signature) return unavailable(`release ${tag}: ${signature.error}`);
+		const minisig = signature.text;
+		const signed = parseMinisignTrustedComment(minisig);
+		if (!signed)
+			return unavailable(
+				`release ${tag}'s worker runtime signature names no version and commit in its trusted comment`,
+			);
+		if (signed.version !== version)
+			return unavailable(
+				`release ${tag}'s worker runtime is signed as v${signed.version}, not v${version}`,
+			);
+
+		const manifest = AvailableWorkerRuntimeManifestSchema.safeParse({
+			available: true,
+			version,
+			commit: signed.commit,
+			artifact: { name, url: tarball.browser_download_url, size: tarball.size, sha256 },
+			signature: { format: 'minisign', minisig },
+		});
+		if (!manifest.success)
+			return unavailable(
+				`release ${tag}'s worker runtime does not form a valid manifest: ${manifest.error.issues
+					.map((issue) => `${issue.path.join('.')}: ${issue.message}`)
+					.join('; ')}`,
+			);
+		return { available: true, manifest: manifest.data };
+	} catch (err) {
+		return unavailable(
+			`release ${tag} could not be looked up on GitHub: ${err instanceof Error ? err.message : String(err)}`,
+		);
+	}
+}
+
 /** The manifest body for a resolved runtime. Always 200: a 404 means "no such route". */
-export function handleRuntimeManifest(runtime: OwnRuntime): {
+export function handleRuntimeManifest(runtime: OwnRuntime | ReleaseRuntime): {
 	status: 200;
 	json: Record<string, unknown>;
 } {
@@ -228,6 +404,9 @@ export async function handleRuntimeArtifact(
 
 const NO_STORE = { 'Cache-Control': 'private, no-store' } as const;
 
+/** How many located releases one process remembers, so walking versions cannot grow it. */
+export const RELEASE_MEMO_LIMIT = 32;
+
 /**
  * Mount the manifest and artifact routes on the router's `app`. Pass `overrides` to
  * substitute collaborators in tests; omit for production wiring.
@@ -249,8 +428,38 @@ export function registerWorkerRuntime(app: Hono, overrides: Partial<WorkerRuntim
 		return runtime;
 	};
 
+	const releases = new Map<string, Promise<ReleaseRuntime>>();
+	const getRelease = (version: string): Promise<ReleaseRuntime> => {
+		const known = releases.get(version);
+		if (known) return known;
+		const pending = resolveReleaseRuntime(version, deps).then((resolved) => {
+			// A failure is not remembered: the release may be published after this ask.
+			if (!resolved.available && releases.get(version) === pending) releases.delete(version);
+			return resolved;
+		});
+		if (releases.size >= RELEASE_MEMO_LIMIT) {
+			const oldest = releases.keys().next().value;
+			if (oldest !== undefined) releases.delete(oldest);
+		}
+		releases.set(version, pending);
+		return pending;
+	};
+
+	/** The runtime a manifest request names: the installation's own, or another release. */
+	const runtimeFor = async (
+		requested: string | undefined,
+	): Promise<OwnRuntime | ReleaseRuntime> => {
+		if (requested === undefined) return getRuntime();
+		// An operator often types the tag, so one leading `v` is accepted.
+		const version = requested.startsWith('v') ? requested.slice(1) : requested;
+		if (!isRuntimeVersion(version))
+			return unavailable(`${JSON.stringify(requested)} is not a valid runtime version`);
+		if ((await deps.resolveOwnBuild())?.version === version) return getRuntime();
+		return getRelease(version);
+	};
+
 	app.get(WORKER_RUNTIME_MANIFEST_PATH, async (c) => {
-		const result = handleRuntimeManifest(await getRuntime());
+		const result = handleRuntimeManifest(await runtimeFor(c.req.query('version')));
 		return c.json(result.json, result.status, NO_STORE);
 	});
 

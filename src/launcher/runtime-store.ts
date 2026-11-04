@@ -46,6 +46,7 @@ import { join, resolve } from 'node:path';
 import { z } from 'zod';
 import {
 	type AvailableWorkerRuntimeManifest,
+	isRuntimeVersion,
 	parseMinisignTrustedComment,
 	runtimeArtifactName,
 	WORKER_RUNTIME_MANIFEST_PATH,
@@ -64,9 +65,6 @@ const STAGING_DIR = '.staging';
 
 /** A staging entry older than this was left by a killed install. A constant, not a setting. */
 export const STALE_STAGING_MS = 60 * 60 * 1000;
-
-/** A version becomes a path segment, so it may name nothing but itself. */
-const VERSION_GRAMMAR = /^[0-9A-Za-z][0-9A-Za-z.+-]{0,99}$/;
 
 const BuildInfoSchema = z.object({ commit: z.string().min(1).optional() }).passthrough();
 
@@ -106,13 +104,14 @@ function commitsMatch(a: string, b: string): boolean {
 }
 
 /**
- * Fetch and parse an installation's runtime manifest. An `available: false`
- * manifest is returned as it is, with its reason; every failure to get a manifest
- * at all is an `{ error }` saying which one.
+ * Fetch and parse an installation's runtime manifest: for the installation's own
+ * version, or, with `version`, for that signed release (issue #1282). An
+ * `available: false` manifest is returned as it is, with its reason; every failure
+ * to get a manifest at all is an `{ error }` saying which one.
  */
 export async function fetchRuntimeManifest(
 	controlPlaneUrl: string,
-	options: { fetch?: Fetch } = {},
+	options: { fetch?: Fetch; version?: string } = {},
 ): Promise<WorkerRuntimeManifest | StoreError> {
 	const fetchImpl = options.fetch ?? globalThis.fetch;
 	let url: URL;
@@ -121,6 +120,7 @@ export async function fetchRuntimeManifest(
 	} catch {
 		return { error: `the control-plane URL ${controlPlaneUrl} is not a valid URL` };
 	}
+	if (options.version !== undefined) url.searchParams.set('version', options.version);
 	let response: Response;
 	try {
 		response = await fetchImpl(url, { headers: { accept: 'application/json' } });
@@ -151,7 +151,7 @@ export async function fetchRuntimeManifest(
 
 /** An installed version, or `undefined` when `<version>/` holds no runtime entrypoint. */
 export function installedRuntime(version: string, homeDir?: string): InstalledRuntime | undefined {
-	if (!VERSION_GRAMMAR.test(version)) return undefined;
+	if (!isRuntimeVersion(version)) return undefined;
 	const dir = join(runtimesDir(homeDir), version);
 	const entrypoint = join(dir, RUNTIME_ENTRYPOINT);
 	if (!existsSync(entrypoint)) return undefined;
@@ -365,7 +365,7 @@ export async function ensureRuntime(
 ): Promise<EnsuredRuntime | StoreError> {
 	const { manifest, homeDir } = input;
 	const { version } = manifest;
-	if (!VERSION_GRAMMAR.test(version))
+	if (!isRuntimeVersion(version))
 		return {
 			error: `the manifest's runtime version ${JSON.stringify(version)} is not a valid version`,
 		};
