@@ -585,54 +585,81 @@ describe('runReviewPhase', () => {
 		});
 	});
 
-	describe('review report layout (issue #1288)', () => {
-		const POLISH_LAYOUT = '> {pass} · `{verdict}` · commit `{head}`\n\n## Zakres\n\n{summary}';
+	// Issue #1321: the agent writes the report itself, in the project's language;
+	// SWARM posts it only when it agrees with the hand-off on the verdict and on every
+	// blocking finding's id, and posts its own rendering otherwise.
+	describe('the agent-written review report (issue #1321)', () => {
+		const POLISH_REPORT = [
+			'> **Przegląd** · przebieg 1 z 3 · `request-changes` · head `abc`',
+			'',
+			'## Zakres',
+			'',
+			'Dodaje fazę przeglądu.',
+			'',
+			'## F1 · blokujące · correctness — Nieobsłużone odrzucenie',
+		].join('\n');
 
-		it('posts the default report and an unchanged prompt when the project sets no layout', async () => {
+		it('posts the report the agent wrote when it states the verdict and every blocking id', async () => {
 			const deps = makeDeps();
-			writeHandoff(deps.path, handoff({ reportLabels: { review: 'Przegląd' } }));
+			writeHandoff(deps.path, handoff({ report: `\n${POLISH_REPORT}\n` }));
+			await runReviewPhase(deps);
+
+			const submitted = deps.delivery.submitReview.mock.calls[0][0];
+			expect(submitted.verdict).toBe('request-changes');
+			expect(submitted.body).toBe(POLISH_REPORT);
+		});
+
+		it('posts SWARM’s rendered report when the agent’s report omits a blocking finding’s id', async () => {
+			const deps = makeDeps();
+			writeHandoff(deps.path, handoff({ report: POLISH_REPORT.replace('F1', 'Problem') }));
 			await runReviewPhase(deps);
 
 			const { body } = deps.delivery.submitReview.mock.calls[0][0];
 			expect(body.startsWith('> **Review** · pass 1 of 3 · `request-changes`')).toBe(true);
-			expect(body).toContain('## Scope');
-			expect(deps.runAgent.mock.calls[0][0].args?.[0]).not.toContain('REVIEW REPORT');
+			expect(body).toContain('## F1 · blocker · correctness — Unhandled rejection');
 		});
 
-		it("renders the project's layout in the agent's translated wording, keeping the verdict and ids", async () => {
+		it('posts SWARM’s rendered report when the agent’s report states another verdict', async () => {
 			const deps = makeDeps();
-			deps.project = createMockProjectConfig({
-				agents: { review: { reviewReport: POLISH_LAYOUT } },
-			});
 			writeHandoff(
 				deps.path,
-				handoff({
-					summary: 'Dodaje fazę przeglądu.',
-					reportLabels: {
-						review: 'Przegląd',
-						passOf: 'przebieg {ordinal} z {cap}',
-						verdictRequestChanges: 'prośba o zmiany',
-						severityBlocker: 'blokujące',
-					},
+				handoff({ report: POLISH_REPORT.replace('`request-changes`', '`approve`') }),
+			);
+			await runReviewPhase(deps);
+
+			const submitted = deps.delivery.submitReview.mock.calls[0][0];
+			expect(submitted.verdict).toBe('request-changes');
+			expect(submitted.body).toContain('## Scope');
+			expect(submitted.body).not.toContain('Zakres');
+		});
+
+		it('posts SWARM’s rendered report when the agent wrote none', async () => {
+			const deps = makeDeps();
+			writeHandoff(deps.path, handoff());
+			await runReviewPhase(deps);
+
+			const { body } = deps.delivery.submitReview.mock.calls[0][0];
+			expect(body.startsWith('> **Review** · pass 1 of 3 · `request-changes`')).toBe(true);
+		});
+
+		it('tells the agent the pass label SWARM knows and the head it reviews', async () => {
+			const deps = makeDeps();
+			deps.getPriorSubmittedReview = vi.fn(
+				async (): Promise<ReviewVerdictRecord> => ({
+					ordinal: 1,
+					state: 'submitted',
+					verdict: 'request-changes',
+					headSha: 'oldsha0000000000000000000000000000000000',
 				}),
 			);
 			await runReviewPhase(deps);
 
 			const prompt = deps.runAgent.mock.calls[0][0].args?.[0] ?? '';
 			expect(prompt).toContain('--- REVIEW REPORT ---');
-			expect(prompt).toContain(POLISH_LAYOUT);
-
-			const submitted = deps.delivery.submitReview.mock.calls[0][0];
-			// The verdict submitted is SWARM's own value; only its display is translated.
-			expect(submitted.verdict).toBe('request-changes');
-			expect(submitted.body).toContain(
-				`> **Przegląd** · przebieg 1 z 3 · \`prośba o zmiany\` · commit \`${HEAD_SHA}\``,
+			expect(prompt).toContain(
+				`The header's pass label, in English, is: **First re-review** · pass 2 of 3.`,
 			);
-			expect(submitted.body).toContain('## Zakres\n\nDodaje fazę przeglądu.');
-			// Every slot the layout leaves out is appended rather than dropped, so the
-			// blocking finding — and its id — is still there.
-			expect(submitted.body).toContain('## F1 · blokujące · correctness — Unhandled rejection');
-			expect(submitted.body).not.toContain('## Scope');
+			expect(prompt).toContain(`The head commit is \`${HEAD_SHA}\`.`);
 		});
 	});
 });
@@ -662,27 +689,39 @@ describe('buildReviewPrompt', () => {
 		expect(prompt).toContain('`docsChecked`');
 	});
 
-	// Issue #1288: a project's own layout tells the agent the report's language;
-	// SWARM still fills the layout, and the Custom prompt keeps its place after it.
-	it('carries a project review report layout before the project instructions', () => {
-		const layout = '## Zakres\n\n{summary}\n\n{blocking_findings}';
-		const prompt = buildReviewPrompt(context, 'Be terse.', false, layout);
+	// Issue #1321: the report's structure is built in, in English, and its language
+	// — headings included — is whatever the project's instructions, after it, ask for.
+	it('builds in the report structure and takes the language from the project instructions', () => {
+		const prompt = buildReviewPrompt(context, 'Write the review report in Polish.');
 		expect(prompt).toContain('--- REVIEW REPORT ---');
-		expect(prompt).toContain(`Layout:\n${layout}`);
-		expect(prompt).toContain('Write every free-text field of the hand-off in that language');
-		expect(prompt).toContain('"severityBlocker": "blocker"');
-		expect(prompt.indexOf('--- END REVIEW REPORT ---')).toBeLessThan(prompt.indexOf('Be terse.'));
+		for (const heading of ['## Scope', '## Disposition', '## Verification', '## Minor & nits'])
+			expect(prompt).toContain(heading);
+		expect(prompt).toContain(
+			"Write the whole report, headings and labels included, in the language the project's instructions ask for, and in English when they do not.",
+		);
+		expect(prompt.indexOf('--- END REVIEW REPORT ---')).toBeLessThan(
+			prompt.indexOf('Write the review report in Polish.'),
+		);
 	});
 
-	// The prompt specifies content, not layout (issue #470): SWARM renders the body
-	// from the hand-off's fields, so an instruction describing the review's *shape*
-	// is a second source of truth that will drift from the renderer.
-	it('asks for hand-off fields and never for an authored review body', () => {
+	// The two things the report is checked on must survive any language.
+	it('asks for the verdict and every finding id verbatim, and says what happens otherwise', () => {
 		const prompt = buildReviewPrompt(context);
-		expect(prompt).toContain('SWARM renders the review from them');
-		expect(prompt).toContain('anything you format yourself is discarded');
-		expect(prompt).not.toContain('The final review body');
-		expect(prompt).not.toContain('findings [{title,body,fixPlan}]');
+		expect(prompt).toContain(
+			'the verdict, written `approve` or `request-changes` in backticks in the header line',
+		);
+		expect(prompt).toContain('every finding id (`F1`, `F2`, …)');
+		expect(prompt).toContain('Otherwise it posts its own English report rendered from the fields');
+		expect(prompt).toContain('Everything SWARM decides');
+		expect(prompt).not.toContain('anything you format yourself is discarded');
+	});
+
+	// Only where nothing answers an approval's minors does the report say so.
+	it('asks for the unanswered-minors note only when nothing answers them', () => {
+		expect(buildReviewPrompt(context, undefined, false, { minorsAnswered: false })).toContain(
+			'no agent will act on them',
+		);
+		expect(buildReviewPrompt(context)).not.toContain('no agent will act on them');
 	});
 
 	it('states the severity rubric and that the verdict follows from it', () => {
@@ -848,21 +887,10 @@ describe('buildReviewPrompt', () => {
 			...Object.keys(ReviewFindingSchema.shape),
 		].filter((slot) => !DESCRIBED_ELSEWHERE.has(slot));
 
-		// `reportLabels` is asked for only beside a project's own review report layout
-		// (issue #1288), so the audit reads the prompt that carries one — the superset.
-		const CUSTOM_LAYOUT = '## Zakres\n\n{summary}';
-
 		it.each(SLOTS)('states the JSON type of `%s`', (slot) => {
-			expect(
-				statesType(
-					contractRegion(buildReviewPrompt(context, undefined, true, CUSTOM_LAYOUT)),
-					slot,
-				),
-			).toBe(true);
-		});
-
-		it('asks for no `reportLabels` on SWARM’s default layout', () => {
-			expect(buildReviewPrompt(context, undefined, true)).not.toContain('reportLabels');
+			expect(statesType(contractRegion(buildReviewPrompt(context, undefined, true)), slot)).toBe(
+				true,
+			);
 		});
 
 		it('states `severity`’s type in the rubric that actually describes it', () => {
@@ -876,7 +904,7 @@ describe('buildReviewPrompt', () => {
 		// finding's own `id`/`title` bullets: in the re-review prompt above, the
 		// `carried` bullet types those two names as well.
 		it('covers every slot but `carried` on an initial review', () => {
-			const region = contractRegion(buildReviewPrompt(context, undefined, false, CUSTOM_LAYOUT));
+			const region = contractRegion(buildReviewPrompt(context));
 			for (const slot of SLOTS)
 				expect({ slot, typed: statesType(region, slot) }).toEqual({
 					slot,
@@ -925,12 +953,13 @@ describe('buildReviewHandoffRepairPrompt', () => {
 		expect(prompt).not.toContain('as before');
 	});
 
-	// A repair that loses the report's language would post a half-English report.
-	it('carries a project review report layout, and asks for no labels without one', () => {
-		const prompt = buildReviewHandoffRepairPrompt('x', false, '## Zakres\n\n{summary}');
+	// A repair that loses the report, or its language, would post SWARM's English
+	// rendering instead of the report the review wrote (issue #1321).
+	it('keeps the report in its language and carries the structure and the head', () => {
+		const prompt = buildReviewHandoffRepairPrompt('x', false, { headSha: HEAD_SHA });
+		expect(prompt).toContain('Keep its `report` too, in the language it is written in');
 		expect(prompt).toContain('--- REVIEW REPORT ---');
-		expect(prompt).toContain('`reportLabels`: an object whose values are strings');
-		expect(buildReviewHandoffRepairPrompt('x')).not.toContain('reportLabels');
+		expect(prompt).toContain(`The head commit is \`${HEAD_SHA}\`.`);
 	});
 
 	it('asks a re-review to repair its `carried` list too', () => {

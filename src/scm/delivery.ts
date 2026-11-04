@@ -381,11 +381,16 @@ function checkVerdictMatchesSeverities(
 }
 
 /**
- * The Review phase's hand-off (issue #470). The agent fills **fields**, never
- * layout: `src/pipeline/review-body.ts` renders the posted review body from
- * these, so the structure is identical on every model and CLI. That is why there
- * is no `body` here — the previous shape had one, and having the agent author the
- * whole body was exactly what let each harness invent its own format.
+ * The Review phase's hand-off (issue #470). The agent fills **fields**, and
+ * everything SWARM decides — the verdict submitted, the vote, Respond-to-review,
+ * re-reviews, the merge — reads those fields, never prose. Since issue #1321 the
+ * agent also writes the posted report itself (`report`), following the structure
+ * the Review prompt builds in, so a project can have it in its own language
+ * through Custom prompt. That report is checked against these fields before it is
+ * posted, and `src/pipeline/review-body.ts` renders the fallback from them, so a
+ * report that drifted from the hand-off never hides a blocking finding. (The
+ * pre-#470 shape had a free `body` and no fields at all, which is what let each
+ * harness invent its own format *and* its own verdict wording.)
  *
  * `verdict` is deliberately only `approve`/`request-changes`. The old third
  * option, `comment`, mirrored `gh pr review`'s event flags rather than any SWARM
@@ -436,14 +441,19 @@ export const ReviewHandoffSchema = z
 		 */
 		absorbed: z.preprocess(asList, z.array(ReviewAbsorbedSchema)).default([]),
 		/**
-		 * SWARM's own report wording translated into the language of the project's
-		 * review report layout (issue #1288), keyed like
-		 * `ENGLISH_REVIEW_REPORT_VOCABULARY` (`src/pipeline/review-report-vocabulary.ts`).
-		 * Asked for only when the project has its own layout, and read only then.
-		 * Wording, never semantics: a malformed object is dropped rather than failing
-		 * the review, and the renderer keeps English for any entry it cannot use.
+		 * The review report the agent wrote itself (issue #1321), following the
+		 * structure built into the Review prompt, in the language the project's Custom
+		 * prompt asks for. Prose, never semantics: the verdict, the vote and every later
+		 * phase read the fields above, and SWARM posts this text only when it states the
+		 * same verdict and names every blocking finding's id — otherwise it posts the
+		 * report it renders from those fields (`src/pipeline/review-body.ts`). So a
+		 * missing, blank or mis-typed report is dropped rather than failing the review.
 		 */
-		reportLabels: z.record(z.string(), z.unknown()).optional().catch(undefined),
+		report: z
+			.string()
+			.transform((text) => text.trim() || undefined)
+			.optional()
+			.catch(undefined),
 	})
 	.superRefine((handoff, ctx) => {
 		checkFindingTiers(handoff.findings, ctx);
