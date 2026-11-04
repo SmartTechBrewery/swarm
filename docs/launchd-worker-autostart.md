@@ -17,7 +17,9 @@ rather than half-working.
 
 A worker that does not exist yet does not need this command run by hand:
 [`swarm workers setup`](./cli.md#swarm-workers) registers and enrolls it from its
-checkout and ends by running `swarm-worker-agent install` there.
+checkout and ends by running `swarm-worker-agent install` there (`setup --profile`:
+`swarm-worker-agent install --profile <worker-id>`, see
+[Profile-based workers](#profile-based-workers)).
 
 ## Usage
 
@@ -27,6 +29,11 @@ swarm-worker-agent uninstall [<checkout>]   # stop it and remove the agent
 swarm-worker-agent status    [<checkout>]   # loaded? pid? last exit code?
 swarm-worker-agent logs      [<checkout>]   # tail this checkout's stdout + stderr
 swarm-worker-agent update    [<checkout>]   # pull + rebuild this install, restart its agents
+
+swarm-worker-agent install   --profile <worker-id>   # the same for a profile-based worker
+swarm-worker-agent uninstall --profile <worker-id>
+swarm-worker-agent status    --profile <worker-id>
+swarm-worker-agent logs      --profile <worker-id>
 ```
 
 `<checkout>` is the repository checkout the worker was registered for and defaults
@@ -72,6 +79,53 @@ Serving a second installation from one machine is laid out end to end in
 `<hash8>` is the first eight characters of that same sha256, so two checkouts
 sharing a basename (`~/work/api` and `~/oss/api`) still get distinct labels.
 
+## Profile-based workers
+
+A **profile-based** worker (`swarm workers setup --profile`, issue #1296) is started
+by `swarm-launcher run <worker-id>` from its profile, `~/.swarm/workers/<worker-id>/
+profile.json`, rather than by `swarm run:worker` in a checkout
+([`MANUAL.md`](./MANUAL.md), "Profile-based workers"). `--profile <worker-id>`
+installs that under launchd instead (issue #1297), and `setup --profile` ends by
+running it.
+
+| What | Where |
+| --- | --- |
+| Agent | `~/Library/LaunchAgents/pl.smarttechbrewery.swarm.worker.<host>.<worker-id>.<hash8>.plist` |
+| Logs | `~/Library/Logs/<that label>.log` (+ `.error.log`) — launchd's capture of the launcher's own output; the daemon's log is `~/.swarm/workers/<worker-id>/logs/worker.log` |
+| `ProgramArguments` | `<node> <installation>/bin/swarm-launcher.js run <worker-id>` |
+| `WorkingDirectory` | `~/.swarm/workers/<worker-id>` |
+
+- **The label names the installation.** `<host>` is the host (and any port) of the
+  profile's `controlPlaneUrl`, with every character outside `[A-Za-z0-9_-]` turned
+  into `-` (`swarm-example-com`), and `<hash8>` is the first eight characters of the
+  sha256 of the URL and the worker id together. So `launchctl list | grep swarm.worker`
+  shows which installation each agent serves, and two installations' workers never
+  share a label — not even two installations on one host on two ports.
+- **No secret is written into the plist, nor printed.** The script reads only
+  `controlPlaneUrl` and `repoRoots` out of the profile (with `node`); the credential
+  stays in the profile, where the launcher reads it. `PATH`, `LANG`, `KeepAlive` and
+  `ThrottleInterval` are exactly a clone agent's.
+- **It refuses a missing or unreadable profile**, or one naming another worker, and
+  a worker id that is not path-safe — before writing anything.
+- **It refuses while any of the profile's checkouts is already served.** A daemon
+  holds one checkout lock per checkout it serves, so the duplicate-worker guard
+  (below, "One worker per checkout") runs once for each of the profile's
+  `repoRoots`. A launcher-started daemon is the runtime's
+  `dist/transport/connect-entry.mjs`, which the guard recognises as a worker just as
+  it recognises a clone's.
+- **`uninstall` / `status` / `logs --profile <worker-id>`** find the agent through the
+  profile, or — once the profile is gone or unreadable — through the installed plist
+  whose `WorkingDirectory` is that worker's profile directory, so an agent can always
+  be removed.
+- **`update` never restarts a profile agent.** It restarts only agents running
+  `run:worker`: a profile agent's daemon runs the runtime its control plane names,
+  not this installation's build, so restarting it onto a pull would change nothing.
+  `update --profile` is refused. Updating profile workers is #1282's.
+- **It runs this installation's launcher**, for the same reason a clone agent runs
+  this installation's `swarm` — and it needs that installation built
+  (`npm run build`), since `bin/swarm-launcher.js` loads `dist/`. A clone-mode agent
+  and its plist are unchanged.
+
 ## After a `git pull` — the update flow
 
 A worker normally updates because the installation asked it to
@@ -91,8 +145,9 @@ swarm-worker-agent update ~/work/api  # only that checkout's agent
   `PATH`), runs `git pull --ff-only`, `npm ci` and `npm run build` there, and restarts
   the agents afterwards. `<checkout>` narrows *which agents restart*, never which
   installation is pulled: there is one build behind all of them.
-- **Which agents count is read off each plist, not assumed.** Every worker agent whose
-  launcher resolves into this installation is restarted — a plist names
+- **Which agents count is read off each plist, not assumed.** Every worker agent that
+  runs `run:worker` and whose launcher resolves into this installation is restarted
+  (a [profile-based](#profile-based-workers) agent never is) — a plist names
   `<installation>/bin/swarm.js` directly, and one written before issue #1213 names the
   `PATH` symlink, which is followed; a second SWARM clone's agents
   on the same Mac are left alone, because nothing pulled *their* build. A `<checkout>`

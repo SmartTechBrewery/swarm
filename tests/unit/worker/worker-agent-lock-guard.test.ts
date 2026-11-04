@@ -108,6 +108,17 @@ describe('swarm-worker-agent duplicate-worker guard', () => {
 		expect(result.stderr).toContain('a worker (pid 4242) is already running');
 	});
 
+	it('refuses while a launcher-started runtime daemon holds the lock', () => {
+		// A profile worker's daemon is the runtime's bundled `connect-entry.mjs` (issue #1297).
+		const result = runGuard({
+			owner: owner(minutesAgo(2)),
+			psCommand: 'node /Users/ada/.swarm/runtimes/1.2.3/dist/transport/connect-entry.mjs',
+		});
+
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain('a worker (pid 4242) is already running');
+	});
+
 	it('names the holder by worker id once the lock records one', () => {
 		const result = runGuard({
 			owner: owner(minutesAgo(2), 'ada-laptop-api'),

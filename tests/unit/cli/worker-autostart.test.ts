@@ -5,7 +5,10 @@ const { runCommand } = vi.hoisted(() => ({ runCommand: vi.fn() }));
 vi.mock('@/cli/_shared/exec.js', () => ({ runCommand }));
 
 import { REPO_ROOT } from '@/cli/_shared/paths.js';
-import { installWorkerAutostart } from '@/cli/_shared/worker-autostart.js';
+import {
+	installProfileWorkerAutostart,
+	installWorkerAutostart,
+} from '@/cli/_shared/worker-autostart.js';
 
 describe('installWorkerAutostart', () => {
 	beforeEach(() => {
@@ -40,6 +43,36 @@ describe('installWorkerAutostart', () => {
 		expect(await installWorkerAutostart('C:\\work\\api', 'win32')).toEqual({
 			kind: 'unsupported',
 			platform: 'win32',
+		});
+		expect(runCommand).not.toHaveBeenCalled();
+	});
+});
+
+describe('installProfileWorkerAutostart', () => {
+	beforeEach(() => {
+		runCommand.mockReset().mockResolvedValue(0);
+	});
+
+	it('hands the worker id to the packaged installer with --profile on macOS', async () => {
+		expect(await installProfileWorkerAutostart('w-1', 'darwin')).toEqual({ kind: 'installed' });
+		expect(runCommand).toHaveBeenCalledExactlyOnceWith(
+			join(REPO_ROOT, 'bin', 'swarm-worker-agent'),
+			['install', '--profile', 'w-1'],
+		);
+	});
+
+	it('reports a non-zero installer exit as a failure', async () => {
+		runCommand.mockResolvedValue(1);
+		expect(await installProfileWorkerAutostart('w-1', 'darwin')).toEqual({
+			kind: 'failed',
+			reason: 'swarm-worker-agent install exited with code 1',
+		});
+	});
+
+	it('runs nothing on a platform with no installer yet', async () => {
+		expect(await installProfileWorkerAutostart('w-1', 'linux')).toEqual({
+			kind: 'unsupported',
+			platform: 'linux',
 		});
 		expect(runCommand).not.toHaveBeenCalled();
 	});

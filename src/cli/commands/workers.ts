@@ -174,7 +174,11 @@ import {
 import { normalizeControlPlaneUrl } from '../_shared/operator-session-cache.js';
 import * as out from '../_shared/output.js';
 import { promptHidden, readStdin } from '../_shared/secret-input.js';
-import { installWorkerAutostart, type WorkerAutostartResult } from '../_shared/worker-autostart.js';
+import {
+	installProfileWorkerAutostart,
+	installWorkerAutostart,
+	type WorkerAutostartResult,
+} from '../_shared/worker-autostart.js';
 import {
 	readWorkerCredentialCache,
 	updateWorkerCredentialCacheCheckouts,
@@ -232,9 +236,9 @@ Usage:
              that already has a worker registered — it never issues a second one.
              The worker credential is cached for this checkout and not printed.
              With --profile it registers the same way but writes a worker
-             profile instead (see --profile below), and ends by printing the
-             swarm-launcher run <worker-id> that starts it: autostart for a
-             profile worker is not available yet.
+             profile instead (see --profile below), and its autostart is
+             swarm-worker-agent install --profile <worker-id>, whose agent runs
+             swarm-launcher run <worker-id>.
   register   Register a worker for an owner (by login handle) with a display
              name and declared CLIs (--cli, comma-separated, one or more of
              ${AGENT_CLIS.join(' | ')}). Prints a worker credential ONCE — store
@@ -2803,10 +2807,10 @@ function printCredential(credential: string): void {
 
 /**
  * How a registered profile-based worker is started (issue #1296): by
- * `swarm-launcher run <id>`, printed with no credential. Until the launcher gains
- * its own autostart, `setup --profile` ends here as if `--no-autostart` were given
- * (`note` says so). A profile that could not be written leaves nothing to start
- * from, so that is a failure — the credential has already been printed.
+ * `swarm-launcher run <id>`, printed with no credential. `register-and-enroll
+ * --profile` and `setup --profile --no-autostart` end here (`note` says why). A
+ * profile that could not be written leaves nothing to start from, so that is a
+ * failure — the credential has already been printed.
  */
 function reportProfileStart(
 	registered: { workerId: string; saved: boolean },
@@ -2970,19 +2974,20 @@ async function requireSetupOperator(
 /**
  * Start the worker `setup` registered, as an exit code: under the host's process
  * supervisor, or — with `--no-autostart` — not at all, naming the command that
- * would. Autostart for a profile worker is the launcher's and arrives with it;
- * until then `--profile` stops where `--no-autostart` does.
+ * would. A profile worker's autostart (issue #1297) is the same LaunchAgent
+ * installer given `--profile <worker-id>`, whose agent runs `swarm-launcher run`.
  */
 async function startSetUpWorker(
 	registered: { workerId: string; saved: boolean },
 	options: { displayName: string; repoRoot: string; profile: boolean; noAutostart: boolean },
 ): Promise<number> {
 	if (options.profile) {
-		return reportProfileStart(
-			registered,
-			options.noAutostart
-				? 'autostart skipped (--no-autostart)'
-				: 'autostart is not available for a profile-based worker yet',
+		if (!registered.saved || options.noAutostart)
+			return reportProfileStart(registered, 'autostart skipped (--no-autostart)');
+		return reportAutostart(
+			options.displayName,
+			await installProfileWorkerAutostart(registered.workerId),
+			registered.workerId,
 		);
 	}
 	if (options.noAutostart) {
@@ -3034,26 +3039,39 @@ async function setupCapabilities(cli: string | undefined): Promise<AgentCli[] | 
 	return undefined;
 }
 
-/** Say how the worker `setup` registered is (or is not) being started, as an exit code. */
-function reportAutostart(displayName: string, autostart: WorkerAutostartResult): number {
-	const swarm = swarmCommand();
+/**
+ * Say how the worker `setup` registered is (or is not) being started, as an exit
+ * code. `profileWorkerId` names a profile-based worker, whose hints address its
+ * agent by `--profile <worker-id>` and its foreground start by `swarm-launcher run`.
+ */
+function reportAutostart(
+	displayName: string,
+	autostart: WorkerAutostartResult,
+	profileWorkerId?: string,
+): number {
 	const workerAgent = workerAgentCommand();
+	const agentArgs = profileWorkerId ? ` --profile ${profileWorkerId}` : '';
+	const foreground = profileWorkerId
+		? `${launcherCommand()} run ${profileWorkerId}`
+		: `${swarmCommand()} run:worker`;
 	switch (autostart.kind) {
 		case 'installed':
 			out.info(
-				`worker '${displayName}' is installed under launchd and starting — check it with: ${workerAgent} status`,
+				`worker '${displayName}' is installed under launchd and starting — check it with: ${workerAgent} status${agentArgs}`,
 			);
 			return 0;
 		case 'unsupported':
 			out.info(
-				`autostart is not available on ${autostart.platform} yet — start the worker here with: ${swarm} run:worker`,
+				`autostart is not available on ${autostart.platform} yet — start the worker here with: ${foreground}`,
 			);
 			return 0;
 		default:
 			out.error(
 				`workers setup: the worker is registered and enrolled, but autostart failed: ${autostart.reason}`,
 			);
-			out.info(`  retry it with: ${workerAgent} install (or start it with ${swarm} run:worker)`);
+			out.info(
+				`  retry it with: ${workerAgent} install${agentArgs} (or start it with ${foreground})`,
+			);
 			return 1;
 	}
 }

@@ -45,6 +45,11 @@ interface AgentFixture {
 	 * directly, as `install` writes it now.
 	 */
 	launcher?: 'link' | 'direct';
+	/**
+	 * A profile-based agent (issue #1297): `swarm-launcher.js run <worker-id>` from this
+	 * installation, rather than `swarm run:worker`.
+	 */
+	profile?: boolean;
 }
 
 interface UpdateOptions {
@@ -97,13 +102,20 @@ describe('swarm-worker-agent update', () => {
 	 */
 	function plant(agent: AgentFixture): void {
 		const name = agent.installation === 'this' ? 'this' : 'other';
-		const launcher =
-			agent.launcher === 'direct'
+		const launcher = agent.profile
+			? join(home, 'checkouts', name, 'bin', 'swarm-launcher.js')
+			: agent.launcher === 'direct'
 				? join(home, 'checkouts', name, 'bin', 'swarm.js')
 				: join(home, 'prefix', name, 'bin', 'swarm');
+		const args = agent.profile ? ['run', 'w-1'] : ['run:worker'];
 		writeFileSync(
 			join(home, 'Library', 'LaunchAgents', `${agent.label}.plist`),
-			[`ProgramArguments.1=${launcher}`, `WorkingDirectory=${agent.checkout}`].join('\n'),
+			[
+				'ProgramArguments.0=/usr/local/bin/node',
+				`ProgramArguments.1=${launcher}`,
+				...args.map((arg, i) => `ProgramArguments.${i + 2}=${arg}`),
+				`WorkingDirectory=${agent.checkout}`,
+			].join('\n'),
 			'utf8',
 		);
 	}
@@ -231,6 +243,48 @@ describe('swarm-worker-agent update', () => {
 		expect(result.status).toBe(0);
 		expect(result.kickstarted).toHaveLength(1);
 		expect(result.kickstarted[0]).toContain('worker.api.aaaaaaaa');
+	});
+
+	it('leaves a profile-based agent of this installation alone', () => {
+		// Its daemon runs the runtime its control plane names, not this checkout's build,
+		// so restarting it onto the pull would change nothing (#1282 owns its updates).
+		const result = runUpdate({
+			agents: [
+				{
+					label: 'pl.smarttechbrewery.swarm.worker.api.aaaaaaaa',
+					checkout: '/checkouts/api',
+					installation: 'this',
+				},
+				{
+					label: 'pl.smarttechbrewery.swarm.worker.swarm-example-com.w-1.dddddddd',
+					checkout: join(home, '.swarm', 'workers', 'w-1'),
+					installation: 'this',
+					profile: true,
+				},
+			],
+		});
+
+		expect(result.status).toBe(0);
+		expect(result.kickstarted).toHaveLength(1);
+		expect(result.kickstarted[0]).toContain('worker.api.aaaaaaaa');
+		expect(result.stdout).toContain('1 agent(s) restarted');
+	});
+
+	it('refuses when the only agents of this installation are profile-based', () => {
+		const result = runUpdate({
+			agents: [
+				{
+					label: 'pl.smarttechbrewery.swarm.worker.swarm-example-com.w-1.dddddddd',
+					checkout: join(home, '.swarm', 'workers', 'w-1'),
+					installation: 'this',
+					profile: true,
+				},
+			],
+		});
+
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain('no worker agent on this machine runs the SWARM installation');
+		expect(result.kickstarted).toEqual([]);
 	});
 
 	it('restarts nothing when the build fails, leaving every daemon on the old build', () => {

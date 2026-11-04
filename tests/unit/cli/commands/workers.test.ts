@@ -81,13 +81,18 @@ vi.mock('@/cli/_shared/control-plane-env.js', () => ({ ensureControlPlaneUrl }))
 // `setup` discovers CLIs on PATH, asks for the project id on a TTY, and installs a
 // supervisor entry — all three seams mocked so the suite spawns nothing and reads
 // no real terminal.
-const { discoverAvailableClis, installWorkerAutostart, question } = vi.hoisted(() => ({
-	discoverAvailableClis: vi.fn(),
-	installWorkerAutostart: vi.fn(),
-	question: vi.fn(),
-}));
+const { discoverAvailableClis, installProfileWorkerAutostart, installWorkerAutostart, question } =
+	vi.hoisted(() => ({
+		discoverAvailableClis: vi.fn(),
+		installProfileWorkerAutostart: vi.fn(),
+		installWorkerAutostart: vi.fn(),
+		question: vi.fn(),
+	}));
 vi.mock('@/transport/cli-discovery.js', () => ({ discoverAvailableClis }));
-vi.mock('@/cli/_shared/worker-autostart.js', () => ({ installWorkerAutostart }));
+vi.mock('@/cli/_shared/worker-autostart.js', () => ({
+	installProfileWorkerAutostart,
+	installWorkerAutostart,
+}));
 vi.mock('node:readline/promises', () => ({
 	createInterface: () => ({ question, close: () => {} }),
 }));
@@ -361,6 +366,7 @@ describe('swarm workers', () => {
 		answers.set('workers.projectScmProvider', () => ({ providerId: 'github' }));
 		discoverAvailableClis.mockReset().mockResolvedValue(['claude', 'codex']);
 		installWorkerAutostart.mockReset().mockResolvedValue({ kind: 'installed' });
+		installProfileWorkerAutostart.mockReset().mockResolvedValue({ kind: 'installed' });
 		question.mockReset().mockResolvedValue('');
 	});
 
@@ -2926,8 +2932,40 @@ describe('swarm workers', () => {
 			});
 			expect(statSync(workerProfilePath(WORKER_ID)).mode & 0o777).toBe(0o600);
 			expect(statSync(join(home, '.swarm', 'workers', WORKER_ID)).mode & 0o777).toBe(0o700);
-			expect(lines().at(-1)).toContain(`start the worker with: swarm-launcher run ${WORKER_ID}`);
 			expect(printed().some((line) => line.includes('raw-credential-token'))).toBe(false);
+		});
+
+		// Issue #1297: the profile's autostart is the LaunchAgent installer given its id.
+		it('setup --profile installs autostart for the worker by its profile', async () => {
+			expect(await run(SETUP)).toBe(0);
+			expect(installProfileWorkerAutostart).toHaveBeenCalledExactlyOnceWith(WORKER_ID);
+			expect(lines().at(-1)).toContain(
+				`installed under launchd and starting — check it with: swarm-worker-agent status --profile ${WORKER_ID}`,
+			);
+		});
+
+		it('setup --profile --no-autostart prints the launcher command instead', async () => {
+			expect(await run([...SETUP, '--no-autostart'])).toBe(0);
+			expect(installProfileWorkerAutostart).not.toHaveBeenCalled();
+			expect(lines()).toContainEqual('swarm: autostart skipped (--no-autostart)');
+			expect(lines().at(-1)).toContain(`start the worker with: swarm-launcher run ${WORKER_ID}`);
+		});
+
+		it('setup --profile names the profile commands when autostart fails', async () => {
+			installProfileWorkerAutostart.mockResolvedValue({ kind: 'failed', reason: 'exit 1' });
+			expect(await run(SETUP)).toBe(1);
+			expect(errors().at(-1)).toContain('autostart failed: exit 1');
+			expect(lines().at(-1)).toContain(
+				`retry it with: swarm-worker-agent install --profile ${WORKER_ID} (or start it with swarm-launcher run ${WORKER_ID})`,
+			);
+		});
+
+		it('setup --profile names the launcher where no autostart exists', async () => {
+			installProfileWorkerAutostart.mockResolvedValue({ kind: 'unsupported', platform: 'linux' });
+			expect(await run(SETUP)).toBe(0);
+			expect(lines().at(-1)).toContain(
+				`start the worker here with: swarm-launcher run ${WORKER_ID}`,
+			);
 		});
 
 		it('setup --profile hands --control-plane-url to the shared precedence', async () => {
