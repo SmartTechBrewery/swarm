@@ -74,8 +74,8 @@
  */
 
 import { execFile } from 'node:child_process';
-import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdirSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 import { swarmInstallRoot, WorkerUpdateTargetSchema } from '../lib/build-identity.js';
@@ -401,6 +401,23 @@ async function update(ctx: UpdateContext): Promise<UpdateOutcome> {
 		return refuse(
 			`The SWARM install root '${ctx.installRoot}' is not a readable git checkout, so there is ` +
 				'no commit to update from. Updates only apply to an install run from a git clone.',
+		);
+	}
+
+	// `rev-parse HEAD` answers from *any* directory inside a work tree, so on its own it
+	// would let a packaged runtime unpacked under some other clone (the build script's own
+	// `worker-runtime/` staging dir is gitignored inside the SWARM checkout) "update" that
+	// enclosing checkout — one this install root does not own (PR #1291). The install root
+	// must be the work tree's top level, the same rule `resolveBuildIdentity` applies before
+	// it trusts a checkout. Checked once, before the lock: a peer's apply moves HEAD, never
+	// where the work tree's top level is, so there is nothing for a re-read to learn.
+	const toplevel = await gitRead(ctx, ['rev-parse', '--show-toplevel'], GIT_READ_TIMEOUT_MS);
+	if (!toplevel || !isSameDirectory(toplevel, ctx.installRoot)) {
+		return refuse(
+			`The SWARM install root '${ctx.installRoot}' is not the top level of its own git ` +
+				`checkout${toplevel ? ` (it sits inside '${toplevel}')` : ''}, so there is no checkout ` +
+				'here for an update to move. A packaged worker runtime is updated by replacing the ' +
+				'artifact, not through the control plane.',
 		);
 	}
 
@@ -1273,6 +1290,22 @@ function tryWriteState(stateDir: string, state: InstallUpdateState): boolean {
 		});
 		return false;
 	}
+}
+
+/**
+ * Whether two paths name one directory. Through `realpath` because git reports a
+ * resolved top level while the install root may arrive through a symlink (macOS's
+ * `/var` → `/private/var`); a path that cannot be resolved is compared as written.
+ */
+function isSameDirectory(a: string, b: string): boolean {
+	const canonical = (path: string): string => {
+		try {
+			return realpathSync(path);
+		} catch {
+			return resolve(path);
+		}
+	};
+	return canonical(a) === canonical(b);
 }
 
 function git(ctx: InstallContext, args: string[], timeoutMs: number): UpdateCommand {

@@ -71,6 +71,7 @@ function scriptedRunner(
 	const calls: UpdateCommand[] = [];
 	const defaults: Record<string, UpdateCommandResult> = {
 		'git rev-parse HEAD': ok(HEAD),
+		'git rev-parse --show-toplevel': ok(INSTALL_ROOT),
 		'git status --porcelain': ok(''),
 		'git symbolic-ref --quiet HEAD': ok(HEAD_REF),
 		[UPSTREAM_ARGV]: ok(`${REMOTE}\n${HEAD_REF}`),
@@ -349,6 +350,37 @@ describe('applyUpdateTarget — refusals', () => {
 		expect(argv()).toEqual(['git rev-parse HEAD']);
 	});
 
+	it('refuses an install root nested inside another work tree, touching nothing', async () => {
+		// A packaged runtime unpacked in a gitignored directory of some clone: HEAD and a
+		// clean status both answer — for the enclosing checkout, which this install
+		// root does not own (PR #1291).
+		const home = makeHome();
+		const { run, argv } = scriptedRunner({ 'git rev-parse --show-toplevel': ok('/home/op/swarm') });
+
+		const outcome = await apply(home, run, BRANCH, {
+			installRoot: '/home/op/swarm/worker-runtime/swarm-worker-runtime-1.5.4',
+		});
+
+		expect(outcome.status).toBe('refused');
+		if (outcome.status !== 'refused') return;
+		expect(outcome.reason).toContain('not the top level');
+		expect(outcome.reason).toContain("'/home/op/swarm'");
+		expect(outcome.reason).toContain('replacing the artifact');
+		expect(argv()).toEqual(['git rev-parse HEAD', 'git rev-parse --show-toplevel']);
+	});
+
+	it('refuses when git cannot name the work tree top level', async () => {
+		const home = makeHome();
+		const { run, argv } = scriptedRunner({ 'git rev-parse --show-toplevel': fail('') });
+
+		const outcome = await apply(home, run);
+
+		expect(outcome.status).toBe('refused');
+		if (outcome.status !== 'refused') return;
+		expect(outcome.reason).toContain('not the top level');
+		expect(argv()).toEqual(['git rev-parse HEAD', 'git rev-parse --show-toplevel']);
+	});
+
 	it('refuses a dirty install root before fetching or building anything', async () => {
 		const home = makeHome();
 		const { run, argv } = scriptedRunner({
@@ -360,7 +392,11 @@ describe('applyUpdateTarget — refusals', () => {
 		expect(outcome.status).toBe('refused');
 		if (outcome.status !== 'refused') return;
 		expect(outcome.reason).toContain('uncommitted changes');
-		expect(argv()).toEqual(['git rev-parse HEAD', 'git status --porcelain']);
+		expect(argv()).toEqual([
+			'git rev-parse HEAD',
+			'git rev-parse --show-toplevel',
+			'git status --porcelain',
+		]);
 	});
 
 	it('refuses a target that is not reachable from the tracked branch', async () => {
@@ -416,7 +452,11 @@ describe('applyUpdateTarget — refusals', () => {
 		expect(outcome.status).toBe('refused');
 		if (outcome.status !== 'refused') return;
 		expect(outcome.reason).toContain('unreadable');
-		expect(argv()).toEqual(['git rev-parse HEAD', 'git status --porcelain']);
+		expect(argv()).toEqual([
+			'git rev-parse HEAD',
+			'git rev-parse --show-toplevel',
+			'git status --porcelain',
+		]);
 	});
 
 	it('never throws when the runner rejects', async () => {
