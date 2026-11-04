@@ -3,7 +3,14 @@
  * under a temporary home with the child process, the sleep and the signals faked.
  */
 
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import {
+	existsSync,
+	mkdtempSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -11,6 +18,7 @@ import { runService, type ServiceChild, THROTTLE_MS } from '@/launcher/service-r
 import { workerProfileDir } from '@/launcher/worker-profile.js';
 
 const WORKER_ID = 'w-1';
+const NOW = Date.parse('2026-11-04T12:00:00.000Z');
 let home: string;
 
 beforeEach(() => {
@@ -52,6 +60,7 @@ describe('swarm-worker service-run', () => {
 			execPath: '/usr/bin/node',
 			launcherRoot: '/opt/launcher',
 			pid: 4242,
+			now: () => NOW,
 			spawnChild,
 			sleep,
 			onSignal: () => () => {},
@@ -67,7 +76,12 @@ describe('swarm-worker service-run', () => {
 		});
 		expect(sleep).toHaveBeenCalledTimes(2);
 		expect(sleep).toHaveBeenCalledWith(THROTTLE_MS, expect.any(AbortSignal));
-		expect(pidWhileRunning).toBe('4242\n');
+		// A fingerprint, not a bare pid: enough to tell this loop from a later owner of 4242.
+		expect(JSON.parse(pidWhileRunning)).toEqual({
+			pid: 4242,
+			workerId: WORKER_ID,
+			startedAt: new Date(NOW).toISOString(),
+		});
 		expect(existsSync(pidFile())).toBe(false);
 		const log = serviceLog();
 		expect(log).toContain('exited with code 3');
@@ -107,6 +121,27 @@ describe('swarm-worker service-run', () => {
 		expect(unregister).toHaveBeenCalled();
 		expect(existsSync(pidFile())).toBe(false);
 		expect(serviceLog()).toContain('SIGTERM received — stopping');
+	});
+
+	it('leaves a pid file the next loop has since written', async () => {
+		const next = JSON.stringify({ pid: 4242, workerId: WORKER_ID, startedAt: 'later' });
+		const spawnChild = vi.fn(() => {
+			// A reinstall started the next loop, which recycled this one's pid.
+			writeFileSync(pidFile(), `${next}\n`);
+			return { exited: Promise.resolve(0), kill: vi.fn() } satisfies ServiceChild;
+		});
+
+		await runService([WORKER_ID], {
+			homeDir: home,
+			pid: 4242,
+			now: () => NOW,
+			spawnChild,
+			sleep: async () => {},
+			onSignal: () => () => {},
+			maxRuns: 1,
+		});
+
+		expect(readFileSync(pidFile(), 'utf8')).toBe(`${next}\n`);
 	});
 
 	it.each([[[]], [['../evil']], [['w-1', 'extra']]])('refuses %j', async (argv) => {

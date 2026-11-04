@@ -11,9 +11,11 @@
  * **fresh launcher process**, which is what puts the runtime the daemon just
  * selected into service.
  *
- * It records its own pid in `<profileDir>/service.pid` — what `swarm-worker agent
+ * It records itself in `<profileDir>/service.pid` — what `swarm-worker agent
  * uninstall` kills the process tree from, since `schtasks /End` leaves the tree
- * running — and appends the child's output and its own timestamped lines to
+ * running. The record is `{ pid, workerId, startedAt }` rather than a bare pid, so a
+ * reader can tell this loop from a later process Windows handed the same pid to
+ * (`verifiedServicePid` in `./windows-task.ts`). It also appends the child's output and its own timestamped lines to
  * `<profileDir>/logs/service.log` (the daemon keeps writing `worker.log` itself).
  * SIGINT / SIGTERM / SIGBREAK stop the child and then the loop.
  *
@@ -23,18 +25,15 @@
  */
 
 import { spawn } from 'node:child_process';
-import {
-	closeSync,
-	mkdirSync,
-	openSync,
-	readFileSync,
-	rmSync,
-	writeFileSync,
-	writeSync,
-} from 'node:fs';
+import { closeSync, mkdirSync, openSync, rmSync, writeFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { LAUNCHER_INSTALL_ROOT } from './main.js';
-import { SERVICE_LOG_FILE, SERVICE_PID_FILE } from './windows-task.js';
+import {
+	readServiceRecord,
+	SERVICE_LOG_FILE,
+	SERVICE_PID_FILE,
+	type ServiceRecord,
+} from './windows-task.js';
 import { isValidWorkerId, workerProfileDir } from './worker-profile.js';
 
 /** How long the loop waits before starting the worker again — the plist's `ThrottleInterval`. */
@@ -113,19 +112,23 @@ export async function runService(argv: string[], deps: ServiceRunDeps = {}): Pro
 	const logDir = join(dir, 'logs');
 	mkdirSync(logDir, { recursive: true });
 	const pidPath = join(dir, SERVICE_PID_FILE);
-	const pid = String(deps.pid ?? process.pid);
 	const now = deps.now ?? Date.now;
+	const record: ServiceRecord = {
+		pid: deps.pid ?? process.pid,
+		workerId,
+		startedAt: new Date(now()).toISOString(),
+	};
 	const logFd = openSync(join(logDir, SERVICE_LOG_FILE), 'a');
 	const log = (message: string) =>
 		writeSync(logFd, `${new Date(now()).toISOString()} swarm-worker service-run: ${message}\n`);
 
-	writeFileSync(pidPath, `${pid}\n`);
+	writeFileSync(pidPath, `${JSON.stringify(record)}\n`);
 	try {
 		await keepAlive(workerId, dir, logFd, log, deps);
 	} finally {
 		log('stopped');
 		closeSync(logFd);
-		removeOwnPidFile(pidPath, pid);
+		removeOwnPidFile(dir, record);
 	}
 	return 0;
 }
@@ -169,10 +172,8 @@ async function keepAlive(
 }
 
 /** Remove the pid file only while it is still ours: a reinstall may have started the next loop. */
-function removeOwnPidFile(pidPath: string, pid: string): void {
-	try {
-		if (readFileSync(pidPath, 'utf8').trim() === pid) rmSync(pidPath, { force: true });
-	} catch {
-		// Already gone.
-	}
+function removeOwnPidFile(dir: string, own: ServiceRecord): void {
+	const current = readServiceRecord(dir);
+	if (current?.pid === own.pid && current.startedAt === own.startedAt)
+		rmSync(join(dir, SERVICE_PID_FILE), { force: true });
 }

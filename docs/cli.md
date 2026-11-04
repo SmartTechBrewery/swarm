@@ -1367,11 +1367,14 @@ installs it; this is how to reinstall, inspect, follow or remove it by hand.
   `swarm-worker service-run <id>` (internal; the task runs it) is the keep-alive
   loop: it starts `swarm-worker run <id>`, waits for it, and starts it again 30 s
   later whatever the exit code — Task Scheduler restarts nothing that exits 0, which
-  is how the daemon exits after an update. It records its pid in
-  `<profileDir>/service.pid` and logs to `<profileDir>/logs/service.log` beside the
-  daemon's `worker.log`. `install` refuses while another live daemon holds one of the
-  profile's checkouts, stops a running loop (`taskkill /T`), creates the task and
-  starts it now; `uninstall` stops it and deletes the task (logs are kept), and
+  is how the daemon exits after an update. It records its pid, worker id and start
+  time in `<profileDir>/service.pid` and logs to `<profileDir>/logs/service.log`
+  beside the daemon's `worker.log`. `install` refuses while another live daemon holds
+  one of the profile's checkouts, stops a running loop (`taskkill /T`), creates the
+  task and starts it now. A recorded pid is killed only once PowerShell's
+  `Win32_Process` confirms it is still that loop — its command line ends
+  `service-run <id>` and it started no later than the record says — so a pid Windows
+  has since reused for another program is left alone (only `schtasks /End` runs); `uninstall` stops it and deletes the task (logs are kept), and
   finds it by name even when the profile is gone; `status` shows the task's state,
   last run and result and the loop's pid; `logs` prints the last 50 lines of both
   logs and follows them until Ctrl-C. `update` is refused: a profile worker updates

@@ -30,8 +30,14 @@
  *   - **A task whose profile is gone can still be removed**: `uninstall`, `status`
  *     and `logs` fall back to finding the installed task by its `.<id>.<hash>`
  *     suffix, as the script falls back to the plist's `WorkingDirectory`.
- *   - **Every `schtasks` / `taskkill` call is an argument array to an absolute
- *     `%SystemRoot%\System32` path**, with no shell in between.
+ *   - **Every `schtasks` / `taskkill` / `powershell` call is an argument array to an
+ *     absolute `%SystemRoot%\System32` path**, with no shell in between.
+ *   - **A recorded pid is never killed on its liveness alone.** Windows reuses pids,
+ *     and a loop ended without its `finally` (Task Manager, a crash, logoff) leaves
+ *     `service.pid` behind, so `taskkill /T /F` on that pid could take down an
+ *     unrelated process tree. The pid counts as the loop only while its command line
+ *     still ends `service-run <id>` and it started no later than the record says —
+ *     the command-line check `bin/swarm-worker-agent` makes with `ps`.
  */
 
 import { execFile } from 'node:child_process';
@@ -68,8 +74,10 @@ import {
 export const TASK_SCHEDULER = 'Task Scheduler';
 /** How the operator manages the task — `swarm-worker agent <action> --profile <id>`. */
 export const WINDOWS_SERVICE_COMMAND = 'swarm-worker agent';
-/** The keep-alive loop's own pid, beside the profile: what `stop` kills the tree from. */
+/** The keep-alive loop's own record, beside the profile: what `stop` kills the tree from. */
 export const SERVICE_PID_FILE = 'service.pid';
+/** How far a process's creation time may trail the loop's own `startedAt` and still be it. */
+const START_TIME_SLACK_MS = 1000;
 /** The keep-alive loop's log, beside the daemon's `worker.log`. */
 export const SERVICE_LOG_FILE = 'service.log';
 const LOG_TAIL_LINES = 50;
@@ -236,14 +244,62 @@ const LockOwnerSchema = z.object({
 	workerId: z.string().nullable().optional(),
 });
 
-/** The pid `service-run` recorded, or `undefined` when there is none to read. */
-export function readServicePid(profileDir: string): number | undefined {
-	try {
-		const pid = Number.parseInt(readFileSync(join(profileDir, SERVICE_PID_FILE), 'utf8'), 10);
-		return Number.isInteger(pid) && pid > 0 ? pid : undefined;
-	} catch {
-		return undefined;
-	}
+/** What `service-run` records about itself in {@link SERVICE_PID_FILE}. */
+const ServiceRecordSchema = z.object({
+	pid: z.number().int().positive(),
+	workerId: z.string(),
+	startedAt: z.string(),
+});
+export type ServiceRecord = z.infer<typeof ServiceRecordSchema>;
+
+/** The record `service-run` wrote, or `undefined` when there is none to read. */
+export function readServiceRecord(profileDir: string): ServiceRecord | undefined {
+	return readJson(join(profileDir, SERVICE_PID_FILE), ServiceRecordSchema) ?? undefined;
+}
+
+/** What `Win32_Process` says about one pid: its command line and its creation time. */
+const ProcessProbeSchema = z.object({
+	commandLine: z.string().nullable(),
+	createdAt: z.string().nullable(),
+});
+export type ProcessProbe = z.infer<typeof ProcessProbeSchema>;
+
+/** The PowerShell that answers {@link ProcessProbeSchema} for `pid` as one line of JSON. */
+export function processProbeScript(pid: number): string {
+	if (!Number.isInteger(pid) || pid <= 0) throw new Error(`not a pid: ${pid}`);
+	return [
+		`$p = Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}'`,
+		"if ($p) { [pscustomobject]@{ commandLine = $p.CommandLine; createdAt = $(if ($p.CreationDate) { $p.CreationDate.ToUniversalTime().ToString('o') } else { $null }) } | ConvertTo-Json -Compress }",
+	].join('; ');
+}
+
+/** Whether `commandLine` is `service-run <workerId>`'s: those are its last two arguments. */
+export function isServiceRunCommandLine(commandLine: string, workerId: string): boolean {
+	const args = commandLine
+		.trim()
+		.split(/\s+/)
+		.map((arg) => arg.replace(/^"|"$/g, ''));
+	return args.length >= 2 && args.at(-2) === 'service-run' && args.at(-1) === workerId;
+}
+
+/**
+ * Whether the live process `probe` describes is the loop `record` was written by:
+ * its command line is `service-run <id>`, and it was created no later than the loop
+ * recorded starting. A process that reused the pid later fails the second test even
+ * when its command line happens to pass the first (another loop for the same worker).
+ */
+export function isRecordedServiceRun(
+	record: ServiceRecord,
+	probe: ProcessProbe,
+	workerId: string,
+): boolean {
+	if (record.workerId !== workerId) return false;
+	if (!probe.commandLine || !isServiceRunCommandLine(probe.commandLine, workerId)) return false;
+	const created = probe.createdAt ? Date.parse(probe.createdAt) : Number.NaN;
+	const started = Date.parse(record.startedAt);
+	return (
+		Number.isFinite(created) && Number.isFinite(started) && created <= started + START_TIME_SLACK_MS
+	);
 }
 
 /** The Windows manager, as `./service-manager.ts` resolves it on `win32`. */
@@ -253,15 +309,41 @@ export function createWindowsTaskManager(deps: WindowsTaskDeps = {}) {
 	const schtasks = win32.join(system32, 'schtasks.exe');
 	const taskkill = win32.join(system32, 'taskkill.exe');
 	const conhost = win32.join(system32, 'conhost.exe');
+	const powershell = win32.join(system32, 'WindowsPowerShell', 'v1.0', 'powershell.exe');
 	const exec = deps.exec ?? captureCommand;
 	const isLive = deps.isPidLive ?? pidIsLive;
 	const now = deps.now ?? Date.now;
 	const stdout = deps.stdout ?? ((line: string) => console.log(line));
 	const stderr = deps.stderr ?? ((line: string) => console.error(line));
 	const profileDir = (workerId: string) => workerProfileDir(workerId, deps.homeDir);
-	const servicePid = (workerId: string) => {
-		const pid = readServicePid(profileDir(workerId));
-		return pid !== undefined && isLive(pid) ? pid : undefined;
+
+	/** What Windows says about `pid`, or `undefined` when it cannot be asked or answers nothing. */
+	const probeProcess = async (pid: number): Promise<ProcessProbe | undefined> => {
+		const probed = await exec(powershell, [
+			'-NoProfile',
+			'-NonInteractive',
+			'-Command',
+			processProbeScript(pid),
+		]);
+		if (probed.code !== 0 || probed.output === '') return undefined;
+		try {
+			return ProcessProbeSchema.parse(JSON.parse(probed.output));
+		} catch {
+			return undefined;
+		}
+	};
+
+	/**
+	 * The keep-alive loop's pid when the recorded one is verifiably still that loop;
+	 * otherwise `undefined`, with `stale` naming a live pid that is something else now.
+	 */
+	const servicePid = async (workerId: string): Promise<{ pid?: number; stale?: number }> => {
+		const record = readServiceRecord(profileDir(workerId));
+		if (!record || !isLive(record.pid)) return {};
+		const probe = await probeProcess(record.pid);
+		return probe && isRecordedServiceRun(record, probe, workerId)
+			? { pid: record.pid }
+			: { stale: record.pid };
 	};
 
 	/** The profile when it reads; `undefined` when it is absent or unreadable. */
@@ -279,10 +361,17 @@ export function createWindowsTaskManager(deps: WindowsTaskDeps = {}) {
 		return listed.code === 0 ? findWorkerTask(listed.output, workerId) : undefined;
 	};
 
-	/** Kill the keep-alive loop's tree, end the task, and forget the pid. */
+	/**
+	 * Kill the keep-alive loop's tree, end the task, and forget the pid. A recorded pid
+	 * that is not verifiably the loop is left alone — only `schtasks /End` runs.
+	 */
 	const stop = async (name: string, workerId: string) => {
-		const pid = servicePid(workerId);
+		const { pid, stale } = await servicePid(workerId);
 		if (pid !== undefined) await exec(taskkill, ['/PID', String(pid), '/T', '/F']);
+		else if (stale !== undefined)
+			stderr(
+				`swarm-worker agent: ${SERVICE_PID_FILE} names pid ${stale}, which is no longer worker ${workerId}'s service-run loop — leaving it alone`,
+			);
 		// Fails when the task is not running, or not installed yet — both fine.
 		await exec(schtasks, ['/End', '/TN', name]);
 		rmSync(join(profileDir(workerId), SERVICE_PID_FILE), { force: true });
@@ -295,8 +384,8 @@ export function createWindowsTaskManager(deps: WindowsTaskDeps = {}) {
 	 * restarted by the loop forever. This task's own running loop is exempt, since
 	 * install stops it next (the script exempts a running agent the same way).
 	 */
-	const checkoutHeld = (profile: WorkerProfile): string | undefined => {
-		if (servicePid(profile.workerId) !== undefined) return undefined;
+	const checkoutHeld = async (profile: WorkerProfile): Promise<string | undefined> => {
+		if ((await servicePid(profile.workerId)).pid !== undefined) return undefined;
 		for (const root of profile.repoRoots) {
 			const lock = readJson(
 				join(checkoutStateDir('checkout-locks', root, deps.homeDir), 'owner.json'),
@@ -317,7 +406,9 @@ export function createWindowsTaskManager(deps: WindowsTaskDeps = {}) {
 	});
 
 	/** The profile `install` needs, or why it cannot have it. */
-	const installableProfile = (workerId: string): WorkerProfile | { error: string } => {
+	const installableProfile = async (
+		workerId: string,
+	): Promise<WorkerProfile | { error: string }> => {
 		if (!isValidWorkerId(workerId)) return { error: `not a valid worker id: ${workerId}` };
 		const profile = readWorkerProfile(workerId, deps.homeDir);
 		const path = workerProfilePath(workerId, deps.homeDir);
@@ -327,7 +418,7 @@ export function createWindowsTaskManager(deps: WindowsTaskDeps = {}) {
 			};
 		if (profile === undefined)
 			return { error: `the worker profile at ${path} could not be read (or names another worker)` };
-		const held = checkoutHeld(profile);
+		const held = await checkoutHeld(profile);
 		return held ? { error: held } : profile;
 	};
 
@@ -344,7 +435,7 @@ export function createWindowsTaskManager(deps: WindowsTaskDeps = {}) {
 	};
 
 	const install = async (workerId: string): Promise<WorkerAutostartResult> => {
-		const profile = installableProfile(workerId);
+		const profile = await installableProfile(workerId);
 		if ('error' in profile) return failed(profile.error);
 
 		const name = windowsTaskName(profile.controlPlaneUrl, workerId);
@@ -421,7 +512,7 @@ export function createWindowsTaskManager(deps: WindowsTaskDeps = {}) {
 			return { output: `no agent installed for worker ${workerId}`, installed: false };
 		const lines = [`task:    ${name}`, `worker:  ${workerId}`, `profile: ${profileDir(workerId)}`];
 		lines.push(...taskStatusLines(queried.output));
-		const pid = servicePid(workerId);
+		const { pid } = await servicePid(workerId);
 		lines.push(pid === undefined ? 'pid = none (not running)' : `pid = ${pid}`);
 		return { output: lines.join('\n'), installed: true };
 	};

@@ -14,6 +14,9 @@ import {
 	type ExecResult,
 	encodeTaskXml,
 	findWorkerTask,
+	isRecordedServiceRun,
+	isServiceRunCommandLine,
+	processProbeScript,
 	taskStatusLines,
 	type WindowsTaskDeps,
 	windowsTaskName,
@@ -27,7 +30,13 @@ const WORKER_ID = 'w-1';
 const SYSTEM32 = 'C:\\Windows\\System32';
 const SCHTASKS = `${SYSTEM32}\\schtasks.exe`;
 const TASKKILL = `${SYSTEM32}\\taskkill.exe`;
+const POWERSHELL = `${SYSTEM32}\\WindowsPowerShell\\v1.0\\powershell.exe`;
 const NOW = Date.parse('2026-11-04T12:00:00.000Z');
+/** When the recorded loop started, and when Windows says it created the loop's process. */
+const LOOP_STARTED_AT = new Date(NOW - 3_600_000).toISOString();
+const LOOP_CREATED_AT = new Date(NOW - 3_600_000 - 400).toISOString();
+const LOOP_COMMAND_LINE =
+	'"C:\\Program Files\\nodejs\\node.exe" "C:\\Users\\ada\\.swarm\\launcher\\bin\\swarm-worker.js" service-run w-1';
 
 let home: string;
 let checkout: string;
@@ -89,8 +98,29 @@ function manager(overrides: Partial<WindowsTaskDeps> = {}) {
 }
 
 function writeServicePid(pid: number): void {
-	writeFileSync(join(workerProfileDir(WORKER_ID, home), 'service.pid'), `${pid}\n`);
+	mkdirSync(workerProfileDir(WORKER_ID, home), { recursive: true });
+	writeFileSync(
+		join(workerProfileDir(WORKER_ID, home), 'service.pid'),
+		`${JSON.stringify({ pid, workerId: WORKER_ID, startedAt: LOOP_STARTED_AT })}\n`,
+	);
 }
+
+const servicePidPath = () => join(workerProfileDir(WORKER_ID, home), 'service.pid');
+
+/** An `exec` answer for the process probe: what Windows says the recorded pid is. */
+function probeAnswer(commandLine: string | null, createdAt: string | null = LOOP_CREATED_AT) {
+	return (file: string): Partial<ExecResult> =>
+		file === POWERSHELL ? { output: JSON.stringify({ commandLine, createdAt }) } : {};
+}
+
+/** The probe a manager makes before trusting `pid` as the loop. */
+const probeCall = (pid: number) => [
+	POWERSHELL,
+	'-NoProfile',
+	'-NonInteractive',
+	'-Command',
+	processProbeScript(pid),
+];
 
 function writeLock(pid: number, refreshedAt: string, workerId: string | null = 'w-other'): void {
 	const dir = checkoutStateDir('checkout-locks', checkout, home);
@@ -116,6 +146,50 @@ describe('windowsTaskName', () => {
 
 	it('refuses a worker id that is not path-safe', () => {
 		expect(() => windowsTaskName(URL, '../evil')).toThrow(/not a valid worker id/);
+	});
+});
+
+describe('recognising the keep-alive loop', () => {
+	const record = { pid: 4242, workerId: WORKER_ID, startedAt: LOOP_STARTED_AT };
+
+	it('reads service-run <id> as the last two arguments, quoted or not', () => {
+		expect(isServiceRunCommandLine(LOOP_COMMAND_LINE, WORKER_ID)).toBe(true);
+		expect(isServiceRunCommandLine('node swarm-worker.js "service-run" "w-1" ', WORKER_ID)).toBe(
+			true,
+		);
+		expect(isServiceRunCommandLine('node swarm-worker.js service-run w-10', WORKER_ID)).toBe(false);
+		expect(isServiceRunCommandLine('node swarm-worker.js run w-1', WORKER_ID)).toBe(false);
+		expect(isServiceRunCommandLine('C:\\Windows\\explorer.exe', WORKER_ID)).toBe(false);
+	});
+
+	it('trusts a pid only while its command line and creation time match the record', () => {
+		const loop = { commandLine: LOOP_COMMAND_LINE, createdAt: LOOP_CREATED_AT };
+		expect(isRecordedServiceRun(record, loop, WORKER_ID)).toBe(true);
+		// Another process now holds the pid.
+		expect(
+			isRecordedServiceRun(
+				record,
+				{ ...loop, commandLine: 'C:\\Windows\\explorer.exe' },
+				WORKER_ID,
+			),
+		).toBe(false);
+		// Windows hides another account's command line.
+		expect(isRecordedServiceRun(record, { ...loop, commandLine: null }, WORKER_ID)).toBe(false);
+		// The same command line, but a process created after the loop wrote its record.
+		expect(
+			isRecordedServiceRun(
+				record,
+				{ ...loop, createdAt: new Date(NOW - 60_000).toISOString() },
+				WORKER_ID,
+			),
+		).toBe(false);
+		expect(isRecordedServiceRun(record, { ...loop, createdAt: null }, WORKER_ID)).toBe(false);
+		expect(isRecordedServiceRun({ ...record, workerId: 'w-2' }, loop, WORKER_ID)).toBe(false);
+	});
+
+	it('builds a probe only for a real pid', () => {
+		expect(processProbeScript(4242)).toContain("-Filter 'ProcessId=4242'");
+		expect(() => processProbeScript(Number.NaN)).toThrow(/not a pid/);
 	});
 });
 
@@ -180,7 +254,7 @@ describe('the Task Scheduler manager', () => {
 		it('stops the running loop, creates the task from its XML, starts it, and removes the XML', async () => {
 			profile();
 			writeServicePid(4242);
-			const { exec, calls } = fakeExec();
+			const { exec, calls } = fakeExec(probeAnswer(LOOP_COMMAND_LINE));
 			const { manager: windows, out } = manager({ exec, isPidLive: (pid) => pid === 4242 });
 
 			expect(await windows.install(WORKER_ID)).toEqual({
@@ -192,20 +266,66 @@ describe('the Task Scheduler manager', () => {
 			expect(
 				calls.map(({ file, args }) => [file, ...args.filter((a) => !a.endsWith('.xml'))]),
 			).toEqual([
+				// Once for the checkout guard's exemption, once before the kill.
+				probeCall(4242),
+				probeCall(4242),
 				[TASKKILL, '/PID', '4242', '/T', '/F'],
 				[SCHTASKS, '/End', '/TN', taskName()],
 				[SCHTASKS, '/Create', '/XML', '/TN', taskName(), '/F'],
 				[SCHTASKS, '/Run', '/TN', taskName()],
 			]);
-			const created = calls[2];
+			const created = calls[4];
 			expect(created.xml).toContain('service-run w-1');
 			expect(created.xml).toContain(
 				`<WorkingDirectory>${workerProfileDir(WORKER_ID, home)}</WorkingDirectory>`,
 			);
 			// The scratch XML is gone, and the old loop's pid with it.
 			expect(() => readFileSync(created.args[2])).toThrow();
-			expect(() => readFileSync(join(workerProfileDir(WORKER_ID, home), 'service.pid'))).toThrow();
+			expect(() => readFileSync(servicePidPath())).toThrow();
 			expect(out.join('\n')).toContain(`installed ${taskName()}`);
+		});
+
+		it.each([
+			['another program now holds the pid', probeAnswer('C:\\Windows\\explorer.exe')],
+			[
+				'a process created after the loop started holds it',
+				probeAnswer(LOOP_COMMAND_LINE, new Date(NOW - 60_000).toISOString()),
+			],
+			[
+				'the process cannot be probed',
+				(file: string) => (file === POWERSHELL ? { code: 1, output: 'powershell failed' } : {}),
+			],
+		])('does not taskkill a recycled service.pid when %s', async (_case, answer) => {
+			profile();
+			writeServicePid(4242);
+			const { exec, calls } = fakeExec(answer);
+			const { manager: windows, err } = manager({ exec, isPidLive: (pid) => pid === 4242 });
+
+			expect((await windows.install(WORKER_ID)).kind).toBe('installed');
+
+			expect(calls.some(({ file }) => file === TASKKILL)).toBe(false);
+			expect(calls.map(({ args }) => args[0])).toContain('/End');
+			expect(() => readFileSync(servicePidPath())).toThrow();
+			expect(err).toEqual([
+				"swarm-worker agent: service.pid names pid 4242, which is no longer worker w-1's service-run loop — leaving it alone",
+			]);
+		});
+
+		it('does not let a recycled service.pid exempt the checkout-lock guard', async () => {
+			profile();
+			writeLock(777, new Date(NOW - 60_000).toISOString());
+			writeServicePid(4242);
+			const { exec, calls } = fakeExec(probeAnswer('C:\\Windows\\explorer.exe'));
+			const result = await manager({
+				exec,
+				isPidLive: (pid) => pid === 777 || pid === 4242,
+			}).manager.install(WORKER_ID);
+
+			expect(result).toMatchObject({
+				kind: 'failed',
+				reason: `worker w-other (pid 777) is already running for ${checkout} — stop it first, then re-run install`,
+			});
+			expect(calls.map(({ file }) => file)).toEqual([POWERSHELL]);
 		});
 
 		it('refuses a profile that does not exist, naming setup', async () => {
@@ -240,7 +360,7 @@ describe('the Task Scheduler manager', () => {
 			profile();
 			writeLock(777, new Date(NOW - age).toISOString());
 			if (ownPid !== undefined) writeServicePid(ownPid);
-			const { exec } = fakeExec();
+			const { exec } = fakeExec(probeAnswer(LOOP_COMMAND_LINE));
 			const result = await manager({ exec, isPidLive: live }).manager.install(WORKER_ID);
 			expect(result.kind).toBe('installed');
 		});
@@ -273,7 +393,9 @@ describe('the Task Scheduler manager', () => {
 		it('keeps the task’s name, state and last run, plus the loop’s pid', async () => {
 			profile();
 			writeServicePid(4242);
-			const { exec } = fakeExec((_file, args) => (args.includes('/V') ? { output: LIST } : {}));
+			const { exec } = fakeExec((file, args) =>
+				args.includes('/V') ? { output: LIST } : probeAnswer(LOOP_COMMAND_LINE)(file),
+			);
 			const { output, installed } = await manager({
 				exec,
 				isPidLive: (pid) => pid === 4242,
@@ -290,6 +412,18 @@ describe('the Task Scheduler manager', () => {
 				'Last Result: 267009',
 				'pid = 4242',
 			]);
+		});
+
+		it('reports no pid when the recorded one is no longer the loop', async () => {
+			profile();
+			writeServicePid(4242);
+			const { exec } = fakeExec((file, args) =>
+				args.includes('/V') ? { output: LIST } : probeAnswer('C:\\Windows\\explorer.exe')(file),
+			);
+			const { output } = await manager({ exec, isPidLive: (pid) => pid === 4242 }).manager.status(
+				WORKER_ID,
+			);
+			expect(output.split('\n').at(-1)).toBe('pid = none (not running)');
 		});
 
 		it('says no agent is installed when schtasks knows no such task', async () => {
@@ -329,6 +463,23 @@ describe('the Task Scheduler manager', () => {
 				['/Delete', '/TN', taskName(), '/F'],
 			]);
 			expect(out.join('\n')).toContain(`removed ${taskName()} (logs kept at`);
+		});
+
+		it('does not taskkill a recycled service.pid', async () => {
+			profile();
+			writeServicePid(4242);
+			const { exec, calls } = fakeExec(probeAnswer('C:\\Windows\\explorer.exe'));
+			const { manager: windows } = manager({ exec, isPidLive: (pid) => pid === 4242 });
+
+			expect(await windows.uninstall(WORKER_ID)).toBe(0);
+
+			expect(calls.map(({ file, args }) => [file, ...args])).toEqual([
+				[SCHTASKS, '/Query', '/TN', taskName()],
+				probeCall(4242),
+				[SCHTASKS, '/End', '/TN', taskName()],
+				[SCHTASKS, '/Delete', '/TN', taskName(), '/F'],
+			]);
+			expect(() => readFileSync(servicePidPath())).toThrow();
 		});
 
 		it('exits 1 when no task serves the worker', async () => {
