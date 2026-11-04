@@ -570,9 +570,10 @@ export interface DashboardWorkerView {
 	rateLimits: WorkerCliRateLimit[];
 	/**
 	 * The SWARM build the machine's daemon declared it is running (issue #925) — the
-	 * commit its install root is on plus the dirty flag — or `null` when it declared
-	 * none (a machine that never connected, a daemon too old to send the field, or an
-	 * install root that is not a git checkout).
+	 * commit its install root is on (or was stamped with, issue #1285) plus the dirty
+	 * flag — or `null` when it declared none (a machine that never connected, a daemon
+	 * too old to send the field, or an install root with neither a checkout of its
+	 * own nor a stamp).
 	 *
 	 * Not a secret and not one of the machine's `repositories` above: a commit id is public
 	 * coordinates, and one npm-linked SWARM checkout can serve daemons working in
@@ -747,15 +748,18 @@ export interface DashboardWorkerDetailView extends DashboardWorkerView {
  *
  * Three-valued, and the `null`s are the point: an unknown on **either** side is
  * "no answer", never "stale". A worker that declared no build and a control plane
- * with no readable `.git` (the Compose router image has none) must both render no
- * badge, rather than marking an entire fleet outdated because the comparand went
- * missing.
+ * that can resolve none (no checkout of its own and no `build-info.json` stamp —
+ * an image built without `SWARM_BUILD_COMMIT`) must both render no badge, rather
+ * than marking an entire fleet outdated because the comparand went missing.
  *
  * `dirty` on either side is a mismatch even when the commits agree: a dirty
  * checkout is by definition not the commit it names, so the two are not the same
- * build. Commits compare with plain equality — both sides come from `rev-parse
- * HEAD`, so both are full ids — and never by ancestry, which the control plane
- * cannot establish for a commit it may never have fetched.
+ * build. Commits compare by identity — one id prefixing the other, since either
+ * side may come from a stamp (issue #1285) and a stamp may carry an abbreviated
+ * id; `rev-parse HEAD` and CI's `github.sha` are both full ids, so between those
+ * it is plain equality — and never by ancestry, which the control plane cannot
+ * establish for a commit it may never have fetched. The release `version` is
+ * never consulted: it is a label, and two builds between releases share it.
  */
 export function buildMatchesControlPlane(
 	declared: WorkerBuild | null,
@@ -763,7 +767,10 @@ export function buildMatchesControlPlane(
 ): boolean | null {
 	if (!declared || !controlPlane) return null;
 	if (declared.dirty || controlPlane.dirty) return false;
-	return declared.commit === controlPlane.commit;
+	return (
+		declared.commit.startsWith(controlPlane.commit) ||
+		controlPlane.commit.startsWith(declared.commit)
+	);
 }
 
 /**

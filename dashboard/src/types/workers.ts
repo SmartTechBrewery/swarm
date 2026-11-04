@@ -334,7 +334,7 @@ export interface WorkerDetail extends Omit<WorkerRow, 'enrollments'> {
 	 * On the detail view alone: it is one value for the whole installation, so
 	 * repeating it per roster row would say nothing the mark does not.
 	 */
-	controlPlaneBuild: { commit: string; dirty: boolean } | null;
+	controlPlaneBuild: { commit: string; dirty: boolean; version?: string } | null;
 	enrollments: WorkerDetailEnrollment[];
 }
 

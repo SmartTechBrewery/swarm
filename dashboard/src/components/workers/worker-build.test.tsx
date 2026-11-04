@@ -27,6 +27,13 @@ describe('formatWorkerBuild', () => {
 		expect(formatWorkerBuild({ ...COMMIT, dirty: true })).toBe('abc1234+dirty');
 	});
 
+	// Issue #1285: the control plane's own build carries its version inside it (the
+	// image's comes from a build-time stamp), so it reads the same way unprompted.
+	it("uses the build's own version when none is passed", () => {
+		expect(formatWorkerBuild({ ...COMMIT, version: '1.5.4' })).toBe('1.5.4 (abc1234)');
+		expect(formatWorkerBuild({ ...COMMIT, version: '1.5.4' }, '1.6.0')).toBe('1.6.0 (abc1234)');
+	});
+
 	// The bundle compares no versions and parses none: whatever the machine declared is
 	// printed, because a control plane may be newer than this build.
 	it('prints an unexpected version string verbatim', () => {

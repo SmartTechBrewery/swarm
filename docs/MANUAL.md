@@ -990,9 +990,14 @@ recreates the container only when the image changed.
 For a whole server — Postgres, Redis and TLS included — use the ready-made bundle
 in [Running on a VPS behind Caddy](#running-on-a-vps-behind-caddy) instead.
 
-- **Which commit is this?** The image has no `.git`, so the control plane reports
-  no build commit of its own; the image label does:
+- **Which commit is this?** The image has no `.git`, so CI stamps its release
+  version and source commit into `/app/build-info.json` at build time (the
+  `SWARM_BUILD_COMMIT` build arg). The running control plane reports that as its
+  own build — the Workers screen compares every machine against it — and the image
+  label carries the same commit:
   `docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' ghcr.io/smarttechbrewery/swarm:<tag>`.
+  An image you build yourself without `--build-arg SWARM_BUILD_COMMIT=<sha>`
+  declares no build, so the Workers screen shows no `OUTDATED` badges against it.
 - **The first admin** needs no shell: on a database with no users the container
   logs a one-time `/setup?token=…` link (see
   [First-run setup](#quick-start-beyond-the-readme)).
@@ -1286,9 +1291,22 @@ the retry is waiting it forgets the returning worker: neither its output nor its
 result is kept, and the retry runs when due.
 
 **Is this worker running the fix?** The dashboard's **Workers** screen answers it.
-Each machine's daemon declares the SWARM build it is actually running — the commit
-its SWARM install root is on — and the per-worker detail view shows it, beside the
-build the control plane itself is on. A machine whose build is not the control
+Each machine's daemon declares the SWARM build it is actually running and the
+per-worker detail view shows it, beside the build the control plane itself is on.
+
+**What a build's identity is, and where it comes from.** A build is its release
+version plus the source commit it was built from, and a `dirty` flag. Every SWARM
+process — a worker daemon or the control plane — reads its own from one of two
+places (`src/lib/build-identity.ts`):
+
+- **A clone** (its SWARM install root is the top of its own git checkout) reads git:
+  HEAD is the commit, `package.json` the version, and `dirty` is set for
+  uncommitted changes or a `dist/` build older than HEAD. This always wins where it
+  applies, so a developer checkout is still marked as not a clean release.
+- **The published image, or a packaged install** with no checkout of its own reads
+  `build-info.json` beside its `package.json` — the version and commit stamped at
+  build time by `bin/write-build-info.js` (CI passes the commit). A stamped build is
+  never dirty. An install with neither declares no build. A machine whose build is not the control
 plane's carries an `OUTDATED` badge, on its detail view and beside its name in the
 roster, so "which workers are behind?" is one glance rather than a question per
 machine. The badge says the builds *differ*, not that the machine is behind: the
@@ -1311,7 +1329,9 @@ names — the checkout has uncommitted changes, or its `dist/` build predates HE
 so that machine counts as a different build even on the same commit. No badge at
 all means there is nothing to compare: the machine declared no build (it has never
 connected, or its daemon predates the field), or this control plane cannot read its
-own (an install root with no `.git`). An unknown is never reported as stale.
+own (an install root with neither a checkout of its own nor a `build-info.json`
+stamp — an image built without the commit build arg). An unknown is never reported
+as stale.
 
 **Is somebody already fixing it?** That is the second badge (issue #978). A machine
 with an update request still outstanding — asked, and not yet reported — carries

@@ -249,9 +249,11 @@ export type WorkerWorktreeSweepState = z.infer<typeof WorkerWorktreeSweepStateSc
  * `build` is the **fourth** self-declared fact (issue #918), and the second that is
  * not a capability: the commit the daemon's SWARM *install root* is on, plus a flag
  * for a dirty or unbuilt checkout (`WorkerBuildSchema`, `../lib/build-identity.ts`),
- * re-declared on every reconnect. It is what `daemonVersion` cannot answer — that
- * resolves to `package.json`'s `version`, which never moves — so this is the only
- * way to tell from the control plane whether a worker is running a given fix. Note
+ * re-declared on every reconnect. It is what `daemonVersion` cannot answer — a
+ * release version moves only when one is cut, so between releases it is the same
+ * on every machine — so this is the only way to tell from the control plane
+ * whether a worker is running a given fix. A build with no checkout of its own
+ * declares the commit stamped into it at build time (issue #1285). Note
  * that the install root is *not* one of the machine's `repositories` above: one npm-linked
  * SWARM checkout can serve daemons each working in a different project repository.
  * `null` means no declaration: a worker registered but never connected, a daemon too
