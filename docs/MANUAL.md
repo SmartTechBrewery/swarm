@@ -864,7 +864,9 @@ the global setting `workers.followInstallationVersion` on — the default, on th
 Settings screen's **Fleet** tab — a control plane that has been up for two minutes on a
 version its workers are not on starts exactly the staged installation-wide rollout
 **Update all workers** would, to its own commit, recorded under the first instance
-administrator. It does so at most once per version: a restart on the same version
+administrator. It does so at most once per version — counting a rollout you started
+yourself as that version (`v1.6.0` or `1.6.0`) or its full or abbreviated commit; a
+branch or another tag names no build it can check. A restart on the same version
 starts nothing, a rollout in progress is not duplicated, and a **halted one is not
 retried** — the readout above is where it, and every machine that could not take the
 build, is reported. The two minutes are for the fleet to reconnect after the restart;

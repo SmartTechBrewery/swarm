@@ -10,12 +10,12 @@ import {
 	findAnyInProgressOwnerRollout,
 	findInProgressInstallationRollout,
 	findInProgressRolloutForOwner,
-	findInstallationRolloutForTarget,
 	findLatestInstallationRollout,
 	findLatestRolloutForOwner,
 	findRolloutHoldElsewhere,
 	listAdvanceableRollouts,
 	listAdvanceableRolloutsForOwner,
+	listInstallationRollouts,
 } from '../../../src/db/repositories/workerUpdateRolloutsRepository.js';
 import type {
 	WorkerUpdateRolloutMemberState,
@@ -83,11 +83,12 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 			status: WorkerUpdateRolloutStatus,
 			memberStates: WorkerUpdateRolloutMemberState[],
 			scope: WorkerUpdateRolloutScope = 'owner',
+			target = 'main',
 		): Promise<string> {
 			const created = await createRollout({
 				requestedByUserId: ownerUserId,
 				scope,
-				target: 'main',
+				target,
 				waveSize: 1,
 				workerIds: [workerId],
 			});
@@ -399,35 +400,55 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 		});
 
 		/**
-		 * The follow-the-installation guard's read (issue #1284): has the fleet already
-		 * been offered this exact build? Any status counts, which is what keeps a halted
-		 * rollout from being retried automatically.
+		 * The follow-the-installation guard's read (issue #1284): every build the fleet
+		 * was already offered. Any status counts, which is what keeps a halted rollout
+		 * from being retried automatically, and every target spelling is returned as
+		 * stored, because whether one names the build is the caller's decision.
 		 */
-		describe('findInstallationRolloutForTarget', () => {
-			for (const status of ['in_progress', 'halted', 'completed'] as const) {
-				it(`finds a ${status} installation rollout to the target`, async () => {
-					const id = await givenRollout(
-						adaId,
-						graceWorkerId,
-						status,
-						[status === 'in_progress' ? 'draining' : 'failed'],
-						'installation',
-					);
-
-					expect((await findInstallationRolloutForTarget('main'))?.id).toBe(id);
+		describe('listInstallationRollouts', () => {
+			it('returns installation rollouts in every status, with every target spelling, newest first', async () => {
+				const inProgress = await givenRollout(
+					adaId,
+					graceWorkerId,
+					'in_progress',
+					['draining'],
+					'installation',
+					'0a50d89c0a50d89c0a50d89c0a50d89c0a50d89c',
+				);
+				// One installation-wide rollout moves at a time, so the later two are settled.
+				await advanceUnderRolloutLock(inProgress, async (_loaded, write) => {
+					await write.setStatus('completed', null);
 				});
-			}
+				const halted = await givenRollout(
+					adaId,
+					graceWorkerId,
+					'halted',
+					['failed'],
+					'installation',
+					'v1.6.0',
+				);
+				const abbreviated = await givenRollout(
+					adaId,
+					graceWorkerId,
+					'completed',
+					['done'],
+					'installation',
+					'0a50d89',
+				);
 
-			it('ignores an installation rollout to another target', async () => {
-				await givenRollout(adaId, graceWorkerId, 'halted', ['failed'], 'installation');
-
-				expect(await findInstallationRolloutForTarget('v9.9.9')).toBeUndefined();
+				const rollouts = await listInstallationRollouts();
+				expect(ids(rollouts)).toEqual([abbreviated, halted, inProgress]);
+				expect(rollouts.map((rollout) => rollout.target)).toEqual([
+					'0a50d89',
+					'v1.6.0',
+					'0a50d89c0a50d89c0a50d89c0a50d89c0a50d89c',
+				]);
 			});
 
-			it('ignores an owner-scoped rollout to the same target', async () => {
-				await givenRollout(adaId, adaWorkerId, 'halted', ['failed']);
+			it('ignores an owner-scoped rollout', async () => {
+				await givenRollout(adaId, adaWorkerId, 'halted', ['failed'], 'owner', 'v1.6.0');
 
-				expect(await findInstallationRolloutForTarget('main')).toBeUndefined();
+				expect(await listInstallationRollouts()).toEqual([]);
 			});
 		});
 	},

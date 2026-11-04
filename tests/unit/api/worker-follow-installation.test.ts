@@ -28,14 +28,17 @@ vi.mock('@/db/repositories/appSettingsRepository.js', () => ({ getAppSettings })
 const { resolveOwnBuildIdentity } = vi.hoisted(() => ({
 	resolveOwnBuildIdentity: vi.fn<() => Promise<WorkerBuild | undefined>>(),
 }));
-vi.mock('@/lib/build-identity.js', () => ({ resolveOwnBuildIdentity }));
+// `buildIsOnTarget` stays real: it is half of the "already offered" match under test.
+vi.mock('@/lib/build-identity.js', async (importOriginal) => ({
+	...(await importOriginal<typeof import('@/lib/build-identity.js')>()),
+	resolveOwnBuildIdentity,
+}));
 
-const { findInstallationRolloutForTarget } = vi.hoisted(() => ({
-	findInstallationRolloutForTarget:
-		vi.fn<(target: string) => Promise<WorkerUpdateRollout | undefined>>(),
+const { listInstallationRollouts } = vi.hoisted(() => ({
+	listInstallationRollouts: vi.fn<() => Promise<WorkerUpdateRollout[]>>(),
 }));
 vi.mock('@/db/repositories/workerUpdateRolloutsRepository.js', () => ({
-	findInstallationRolloutForTarget,
+	listInstallationRollouts,
 }));
 
 const { listUsers } = vi.hoisted(() => ({ listUsers: vi.fn<() => Promise<SwarmUser[]>>() }));
@@ -90,7 +93,7 @@ beforeEach(() => {
 	vi.clearAllMocks();
 	getAppSettings.mockResolvedValue(settings(true));
 	resolveOwnBuildIdentity.mockResolvedValue({ commit: COMMIT, dirty: false, version: '1.4.0' });
-	findInstallationRolloutForTarget.mockResolvedValue(undefined);
+	listInstallationRollouts.mockResolvedValue([]);
 	// `listUsers` answers by identifier, so the first administrator is the first in it.
 	listUsers.mockResolvedValue([
 		makeUser(USER_ID, 'ada@example.com', false),
@@ -105,7 +108,7 @@ describe('followInstallationVersion', () => {
 		const result = await followInstallationVersion();
 
 		expect(result.outcome).toBe('started');
-		expect(findInstallationRolloutForTarget).toHaveBeenCalledWith(COMMIT);
+		expect(listInstallationRollouts).toHaveBeenCalledTimes(1);
 		expect(startRollout).toHaveBeenCalledTimes(1);
 		expect(startRollout).toHaveBeenCalledWith({
 			ownerUserId: ADMIN_ID,
@@ -134,7 +137,7 @@ describe('followInstallationVersion', () => {
 		resolveOwnBuildIdentity.mockResolvedValue({ commit: COMMIT, dirty: true });
 
 		expect(await followInstallationVersion()).toEqual({ outcome: 'unidentified' });
-		expect(findInstallationRolloutForTarget).not.toHaveBeenCalled();
+		expect(listInstallationRollouts).not.toHaveBeenCalled();
 		expect(startRollout).not.toHaveBeenCalled();
 	});
 
@@ -142,7 +145,7 @@ describe('followInstallationVersion', () => {
 	// rollout), a rollout still moving (not duplicated), and a halted one (not retried).
 	for (const status of ['completed', 'in_progress', 'halted'] as const) {
 		it(`starts nothing once the build was already offered (a ${status} rollout)`, async () => {
-			findInstallationRolloutForTarget.mockResolvedValue(makeRollout({ status }));
+			listInstallationRollouts.mockResolvedValue([makeRollout({ status })]);
 
 			expect(await followInstallationVersion()).toEqual({
 				outcome: 'already-offered',
@@ -151,6 +154,40 @@ describe('followInstallationVersion', () => {
 			expect(startRollout).not.toHaveBeenCalled();
 		});
 	}
+
+	// An administrator's rollout stores its target as typed, so a halt under another
+	// spelling of the same build is still this build's halt — and must not be retried.
+	for (const target of ['v1.4.0', '1.4.0', COMMIT.slice(0, 7), COMMIT.toUpperCase()]) {
+		it(`starts nothing once the build was offered as ${target} and halted`, async () => {
+			listInstallationRollouts.mockResolvedValue([makeRollout({ target, status: 'halted' })]);
+
+			expect(await followInstallationVersion()).toEqual({
+				outcome: 'already-offered',
+				rolloutId: ROLLOUT_ID,
+			});
+			expect(startRollout).not.toHaveBeenCalled();
+		});
+	}
+
+	// A halt on an older build says nothing about this one; neither does a branch, which
+	// the control plane cannot resolve to a commit.
+	for (const target of ['v1.3.0', '1.4.1', 'v1.4.0-rc.1', 'abcdef1', 'main']) {
+		it(`still starts when the only installation rollout was to ${target}`, async () => {
+			listInstallationRollouts.mockResolvedValue([makeRollout({ target, status: 'halted' })]);
+
+			expect((await followInstallationVersion()).outcome).toBe('started');
+			expect(startRollout).toHaveBeenCalledTimes(1);
+		});
+	}
+
+	it('matches a version-shaped target only when the build carries a version', async () => {
+		resolveOwnBuildIdentity.mockResolvedValue({ commit: COMMIT, dirty: false });
+		listInstallationRollouts.mockResolvedValue([
+			makeRollout({ target: 'v1.4.0', status: 'halted' }),
+		]);
+
+		expect((await followInstallationVersion()).outcome).toBe('started');
+	});
 
 	it('starts nothing when the installation has no instance administrator', async () => {
 		listUsers.mockResolvedValue([makeUser(USER_ID, 'ada@example.com', false)]);

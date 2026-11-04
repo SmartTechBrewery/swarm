@@ -79,7 +79,8 @@ export type AppAppearanceSettings = z.infer<typeof AppAppearanceSettingsSchema>;
  * header already states — the blob is extensible, and this is one instant — and
  * it is deliberately **not** surfaced on the settings tRPC router's vocabulary or
  * on the dashboard: editing it would only move a sweep. It rides `settings.update`
- * untouched because both dashboard writers merge onto the settings they loaded.
+ * untouched because every dashboard writer (Agent Defaults, Appearance and, since
+ * issue #1284, Fleet) merges onto the settings it loaded.
  */
 export const AppMaintenanceSettingsSchema = z
 	.object({

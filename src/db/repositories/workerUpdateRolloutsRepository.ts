@@ -291,30 +291,26 @@ export async function findLatestInstallationRollout(): Promise<WorkerUpdateRollo
 }
 
 /**
- * The most recent installation-wide rollout to exactly `target`, **whatever its
- * status**, or `undefined` when the fleet has never been offered that build (issue
- * #1284).
+ * Every installation-wide rollout, **whatever its status**, newest first — or an
+ * empty list when the fleet has never been offered one (issue #1284).
  *
- * Any status on purpose: this is the record that the build was already offered to
+ * Any status on purpose: this is the record of which builds were already offered to
  * the fleet, which is what stops the automatic follow-the-installation rollout
  * (`../../api/worker-follow-installation.ts`) from starting a second one — whether
- * the first is still moving, completed, or halted on a bad build. Matched on the
- * exact target rather than on the latest rollout, so an administrator's later
- * manual rollout to another build does not read as "not yet offered" and get undone.
+ * the first is still moving, completed, or halted on a bad build. It returns them all
+ * rather than matching a target here because a rollout stores its target *as typed*
+ * — a version (`v1.6.0`, `1.6.0`), a tag or an abbreviated commit — so whether one
+ * names a given build is the caller's decision, not a string equality. Unbounded,
+ * and fine to be: there is one row per installation-wide rollout an administrator
+ * or an upgrade started, not per machine.
  */
-export async function findInstallationRolloutForTarget(
-	target: string,
-): Promise<WorkerUpdateRollout | undefined> {
+export async function listInstallationRollouts(): Promise<WorkerUpdateRollout[]> {
 	const rows = await getDb()
 		.select()
 		.from(workerUpdateRollouts)
-		.where(
-			and(eq(workerUpdateRollouts.scope, 'installation'), eq(workerUpdateRollouts.target, target)),
-		)
-		.orderBy(desc(workerUpdateRollouts.createdAt), desc(workerUpdateRollouts.id))
-		.limit(1);
-	const row = rows[0];
-	return row ? rowToRollout(row) : undefined;
+		.where(eq(workerUpdateRollouts.scope, 'installation'))
+		.orderBy(desc(workerUpdateRollouts.createdAt), desc(workerUpdateRollouts.id));
+	return rows.map(rowToRollout);
 }
 
 /**

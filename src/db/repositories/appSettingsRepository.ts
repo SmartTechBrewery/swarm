@@ -85,8 +85,8 @@ export async function getLastFleetWorktreeSweepAt(): Promise<Date | null> {
  * Read-modify-write rather than a column update, because the marker shares one
  * jsonb value with the operator's own settings. The lost-update window that opens
  * is the same one `settings.update` already has with itself, and costs at most one
- * extra fan-out a week later — never a lost setting, since both dashboard writers
- * merge onto the settings they loaded.
+ * extra fan-out a week later — never a lost setting, since every dashboard writer
+ * (Agent Defaults, Appearance and Fleet) merges onto the settings it loaded.
  */
 export async function recordFleetWorktreeSweepAt(at: Date): Promise<void> {
 	const settings = await getAppSettings();

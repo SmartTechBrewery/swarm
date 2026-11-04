@@ -22,12 +22,16 @@
  * refused because another one was moving start once that one has finished.
  *
  * **At most once per build, durably.** Before anything is started the rollout table
- * is asked whether an installation-wide rollout to this exact target exists *in any
- * status* (`findInstallationRolloutForTarget`). That one read is what keeps a restart
- * on the same version from starting anything, keeps an in-progress rollout from being
- * duplicated, and keeps a halted one from being retried automatically — a halt is
- * terminal by design, and the way past it is a fixed build, which is a new version
- * and so a new rollout. An administrator can still restart one by hand.
+ * is asked whether an installation-wide rollout that names this *build* exists *in
+ * any status* (`listInstallationRollouts`, matched by {@link targetNamesBuild}). That
+ * one read is what keeps a restart on the same version from starting anything, keeps
+ * an in-progress rollout from being duplicated, and keeps a halted one from being
+ * retried automatically — a halt is terminal by design, and the way past it is a
+ * fixed build, which is a new version and so a new rollout. An administrator can
+ * still restart one by hand. It matches the build rather than the literal target
+ * because an administrator's rollout stores its target as typed: `swarm workers
+ * update --all v1.6.0` (or an abbreviated commit) that halted is this build's halt
+ * just as much as this module's own full-commit record would be.
  *
  * **Whose name it runs under.** `requested_by_user_id` is required and every
  * per-machine request is recorded under it, and an installation-wide rollout is an
@@ -38,9 +42,13 @@
 
 import { getAppSettings } from '../db/repositories/appSettingsRepository.js';
 import { listUsers } from '../db/repositories/usersRepository.js';
-import { findInstallationRolloutForTarget } from '../db/repositories/workerUpdateRolloutsRepository.js';
+import { listInstallationRollouts } from '../db/repositories/workerUpdateRolloutsRepository.js';
 import { isInstanceAdmin } from '../identity/schema.js';
-import { resolveOwnBuildIdentity } from '../lib/build-identity.js';
+import {
+	buildIsOnTarget,
+	resolveOwnBuildIdentity,
+	type WorkerBuild,
+} from '../lib/build-identity.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { type StartRolloutResult, startRollout } from './worker-update-rollout.js';
@@ -73,6 +81,22 @@ export type FollowInstallationVersionResult =
 	| StartRolloutResult;
 
 /**
+ * Whether a rollout's stored `target` names `build` — the "already offered" test.
+ *
+ * A commit-shaped target names it when one id prefixes the other, exactly as
+ * `buildIsOnTarget` reads a machine against a target (which covers this module's own
+ * full-commit record too); a version-shaped one when it is the build's own version,
+ * with or without the leading `v`. A branch, or a tag that is not the version, is
+ * not resolved: the control plane cannot tell what commit one named without
+ * fetching, so it reads as another build.
+ */
+export function targetNamesBuild(target: string, build: WorkerBuild): boolean {
+	if (buildIsOnTarget(build, target)) return true;
+	const version = build.version?.replace(/^v/, '');
+	return version !== undefined && (target === version || target === `v${version}`);
+}
+
+/**
  * Decide, once, whether to roll the fleet onto the control plane's own build — and
  * do it when the answer is yes. See the module header for every rule applied.
  */
@@ -90,7 +114,9 @@ export async function followInstallationVersion(): Promise<FollowInstallationVer
 	}
 	const target = build.commit;
 
-	const offered = await findInstallationRolloutForTarget(target);
+	const offered = (await listInstallationRollouts()).find((rollout) =>
+		targetNamesBuild(rollout.target, build),
+	);
 	if (offered) return { outcome: 'already-offered', rolloutId: offered.id };
 
 	const administrator = (await listUsers()).find(isInstanceAdmin);
