@@ -16,6 +16,7 @@ import { registerOperatorApi } from './operator-api.js';
 import { registerOperatorSession } from './operator-session.js';
 import { createWebhookApp } from './webhook-receiver.js';
 import { registerWorkerDelivery } from './worker-delivery.js';
+import { registerWorkerRuntime } from './worker-runtime.js';
 import { registerWorkerTransport } from './worker-transport.js';
 
 /** The router's app plus the hook that upgrades the server `serve` creates for it. */
@@ -36,6 +37,9 @@ export function createRouterApp(): RouterApp {
 	// a federated worker POSTs review/comment content here and the router performs
 	// the GitHub write under the per-project reviewer PAT, which never leaves it.
 	registerWorkerDelivery(app);
+	// …and the worker runtime for this installation's own build (issue #1280), so a
+	// worker host updates from the control plane it is registered with, not GitHub.
+	registerWorkerRuntime(app);
 	// …and the operator session API (issue #798): `swarm login` authenticates a human
 	// here because this is the process `SWARM_CONTROL_PLANE_URL` points at, and the
 	// only one an operator off the control-plane host can reach.

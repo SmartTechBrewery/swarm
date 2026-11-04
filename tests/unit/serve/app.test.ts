@@ -55,6 +55,14 @@ describe('createAllInOneApp (issue #1148)', () => {
 		expect(await res.json()).toMatchObject({ authenticated: false });
 	});
 
+	it('serves the worker runtime manifest from the router, not with index.html', async () => {
+		const res = await buildApp().request('/worker/runtime/manifest');
+
+		expect(res.status).toBe(200);
+		expect(res.headers.get('Content-Type')).toContain('json');
+		expect(typeof (await res.json()).available).toBe('boolean');
+	});
+
 	it('serves the API’s auth and tRPC routes', async () => {
 		const app = buildApp();
 

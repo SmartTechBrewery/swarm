@@ -280,7 +280,10 @@ there rather than applied (replace the artifact instead), and `swarm run:worker`
 You need not build it yourself: every release publishes it, signed, as GitHub
 Release assets, and the published image carries the same files under
 `/app/worker-runtime/` (issue #1290) — see
-[Verifying the worker runtime](#verifying-the-worker-runtime).
+[Verifying the worker runtime](#verifying-the-worker-runtime). The installation
+also serves its own runtime to its workers, so a host can fetch it without GitHub
+(issue #1280) — see
+[Serving the runtime from the installation](#serving-the-runtime-from-the-installation).
 
 **One worker can serve several repositories on one machine** (issue #1059) — one
 checkout per repository, one daemon. Give it the extra checkouts at registration
@@ -1091,6 +1094,57 @@ The image holds the same three files for its own version:
 The signature covers the tarball alone; its trusted comment names the version and
 the commit it was built from. Nothing verifies it automatically yet — the daemon
 and the control plane do not check it.
+
+#### Serving the runtime from the installation
+
+A control plane serves the worker runtime for **its own build** — the files its
+image carries under `/app/worker-runtime/` — so a worker host gets it from the
+installation it is registered with: no GitHub account, no GitHub access, and the
+same answer for a private fork or a self-built image (issue #1280). Two routes, on
+the same URL as `SWARM_CONTROL_PLANE_URL`:
+
+| Route | Auth | Answers |
+| --- | --- | --- |
+| `GET /worker/runtime/manifest` | none | The version the installation wants workers on, its commit, and the artifact's name, download `url`, size, SHA-256 and full `.minisig` text. |
+| `GET /worker/runtime/artifacts/<name>` | `Authorization: Bearer` — a worker credential, or an operator token from `swarm login` | The tarball itself. |
+
+The manifest is open because a first install has no credential yet, and it holds
+nothing secret: a version, a commit, a checksum and a public signature. The tarball
+is the installation's code, so it needs a credential — an existing worker uses its
+own, and a new host uses the operator token from `swarm login`, the step before
+registering it. A missing or unknown bearer is a `401`, checked before anything
+else. `SWARM_SINGLE_USER_MODE` does not open it. Both routes send
+`Cache-Control: private, no-store`, so a proxy or Cloudflare never caches either.
+
+```bash
+curl -s https://swarm.example.com/worker/runtime/manifest
+# {"available":true,"version":"X.Y.Z","commit":"…","artifact":{"name":"swarm-worker-runtime-X.Y.Z.tar.gz",
+#  "url":"/worker/runtime/artifacts/swarm-worker-runtime-X.Y.Z.tar.gz","size":…,"sha256":"…"},
+#  "signature":{"format":"minisign","minisig":"untrusted comment: …"}}
+curl -fO -H "Authorization: Bearer $SWARM_WORKER_CREDENTIAL" \
+  https://swarm.example.com/worker/runtime/artifacts/swarm-worker-runtime-X.Y.Z.tar.gz
+```
+
+`url` is resolved against the control-plane URL, so it is relative when the
+installation serves the file itself; the shape also allows an absolute URL, for an
+installation that later names a version it does not carry. Verify the download
+against the manifest's `sha256` and, with the public key you trust, its `minisig`
+([above](#verifying-the-worker-runtime)).
+
+**Only the installation's own, signed runtime is served.** The manifest says
+`"available": false` with a `reason`, and the download answers `404` with the same
+reason, unless all of these hold: the installation declares a version and a commit
+(its `build-info.json` stamp or its checkout); the tarball for *that* version is
+present; its `.sha256` matches its bytes; a `.minisig` is present; and that
+signature's trusted comment names the same version and commit. So an image built
+before #1290, a plain `docker build`, a `main` build signed without the key, or a
+dev checkout's locally built `worker-runtime/` all say so plainly, and a tarball for
+any other version is never served. The answer is read once, on the first request,
+and logged (`Serving the worker runtime …`, or `Not serving a worker runtime` with
+the reason); restart the control plane after changing the files. The control plane
+checks the checksum and the trusted comment but not the signature itself — the worker
+host does that, against the key it trusts. Nothing in the daemon fetches from these
+routes yet; the launcher that will is issue #1281.
 
 #### Rotating the runtime signing key
 

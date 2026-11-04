@@ -274,6 +274,12 @@ named tunnel (Path B/C) is the practical choice here — a Path A quick tunnel's
 URL changes on every restart, so you'd have to re-point every remote worker each
 time, just as with the webhook.
 
+The worker runtime routes, `/worker/runtime/manifest` and
+`/worker/runtime/artifacts/<name>` (issue #1280, [`MANUAL.md`](./MANUAL.md#serving-the-runtime-from-the-installation)),
+sit under the same `^/worker/` prefix, so they need no rule of their own. Both send
+`Cache-Control: private, no-store`, which keeps Cloudflare from caching the
+`.tar.gz` (a file type it caches by default) and serving it past the credential check.
+
 ---
 
 ## The operator CLI (`/operator/*`)
