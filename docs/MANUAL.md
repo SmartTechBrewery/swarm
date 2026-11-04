@@ -1092,8 +1092,12 @@ minisign -Vm "$f" -p minisign.pub     # prints the trusted comment: swarm-worker
 The image holds the same three files for its own version:
 `docker create --name rt ghcr.io/smarttechbrewery/swarm:vX.Y.Z && docker cp rt:/app/worker-runtime . && docker rm rt`.
 The signature covers the tarball alone; its trusted comment names the version and
-the commit it was built from. Nothing verifies it automatically yet — the daemon
-and the control plane do not check it.
+the commit it was built from. The worker launcher's runtime store
+(`src/launcher/runtime-store.ts`, issue #1281) checks both automatically before it
+installs a runtime — the SHA-256, the signature against the key it trusts, and that
+the trusted comment names the version and commit the installation asked for — and
+refuses to install anything when it holds no trusted key. Nothing calls it yet; the
+daemon and the control plane do not check the signature.
 
 #### Serving the runtime from the installation
 
@@ -1144,7 +1148,11 @@ and logged (`Serving the worker runtime …`, or `Not serving a worker runtime` 
 the reason); restart the control plane after changing the files. The control plane
 checks the checksum and the trusted comment but not the signature itself — the worker
 host does that, against the key it trusts. Nothing in the daemon fetches from these
-routes yet; the launcher that will is issue #1281.
+routes. The launcher's runtime store (issue #1281) does: it reads the manifest,
+downloads the artifact (sending the bearer only when the artifact URL is on the
+control plane's own origin), verifies it, and installs it read-only and atomically
+under `~/.swarm/runtimes/<version>/`, side by side with every other version. The
+launcher that starts a runtime from there is the next phase of that issue.
 
 #### Rotating the runtime signing key
 
