@@ -24,6 +24,56 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The packaged worker runtime (issue #1279), built once here so the image and
+      # the GitHub Release carry the same bytes (issue #1290). The staged tree the
+      # build leaves beside the tarball is dropped: worker-runtime/ becomes the
+      # image's named build context below, and holds only what is published.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Build the worker runtime
+        env:
+          SWARM_BUILD_COMMIT: ${{ github.sha }}
+        run: |
+          npm ci --ignore-scripts
+          npm run build:worker-runtime
+          find worker-runtime -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +
+          cd worker-runtime
+          sha256sum swarm-worker-runtime-*.tar.gz > "$(echo swarm-worker-runtime-*.tar.gz).sha256"
+
+      # Signed with the minisign key held only in the SWARM_RUNTIME_SIGNING_KEY
+      # secret, then verified against the committed public key, which catches a
+      # secret that no longer matches it. A v* tag without both fails here, before
+      # anything is pushed; a push to main skips signing with a warning
+      # (docs/MANUAL.md, "Verifying the worker runtime").
+      - name: Sign the worker runtime
+        env:
+          SWARM_RUNTIME_SIGNING_KEY: ${{ secrets.SWARM_RUNTIME_SIGNING_KEY }}
+          PUBLIC_KEY: deploy/worker-runtime/minisign.pub
+          IS_RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          missing=""
+          [ -n "$SWARM_RUNTIME_SIGNING_KEY" ] || missing="the SWARM_RUNTIME_SIGNING_KEY secret"
+          [ -f "$PUBLIC_KEY" ] || missing="${missing:+$missing and }$PUBLIC_KEY"
+          if [ -n "$missing" ]; then
+            if [ "$IS_RELEASE" = true ]; then
+              echo "::error::Cannot sign the worker runtime for $GITHUB_REF_NAME: $missing is missing"
+              exit 1
+            fi
+            echo "::warning::Worker runtime left unsigned: $missing is missing"
+            exit 0
+          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq minisign
+          artifact=$(echo worker-runtime/swarm-worker-runtime-*.tar.gz)
+          version=$(node -p "require('./package.json').version")
+          minisign -S -s <(printf '%s\n' "$SWARM_RUNTIME_SIGNING_KEY") -m "$artifact" \
+            -t "swarm-worker-runtime $version $GITHUB_SHA"
+          minisign -V -m "$artifact" -p "$PUBLIC_KEY"
+
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
@@ -60,5 +110,50 @@ jobs:
           # commit it was built from — the image has no .git (issue #1285).
           build-args: |
             SWARM_BUILD_COMMIT=${{ github.sha }}
+          # Overrides the Dockerfile's empty worker-runtime stage, so the image
+          # ships the files signed above under /app/worker-runtime/.
+          build-contexts: |
+            worker-runtime=./worker-runtime
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # Handed to the release job byte for byte: the files the image just shipped.
+      - if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-runtime
+          path: worker-runtime/swarm-worker-runtime-*.tar.gz*
+          if-no-files-found: error
+
+  # A v* tag gets a GitHub Release carrying the runtime, its .sha256 and its
+  # .minisig. Created here, so a tag pushed by hand gets one too; bin/swarm-release
+  # only checks it. Its own job, so only it holds contents: write.
+  release:
+    name: Publish the GitHub release
+    needs: publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: worker-runtime
+          path: worker-runtime
+
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          assets=(worker-runtime/swarm-worker-runtime-*.tar.gz*)
+          [ "${#assets[@]}" -eq 3 ] || { echo "::error::Expected 3 runtime assets, got: ${assets[*]}"; exit 1; }
+          # A tag with a '-' (v1.2.3-rc.1) is a pre-release, as for :stable above.
+          prerelease=()
+          [[ "$GITHUB_REF_NAME" != *-* ]] || prerelease=(--prerelease)
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --clobber "${assets[@]}"
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" \
+              --generate-notes "${prerelease[@]}" "${assets[@]}"
+          fi

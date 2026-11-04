@@ -222,9 +222,12 @@ npm run release
    compose file, Caddyfile or `.env` may then need the admin.
 4. Bumps `package.json`, commits `chore(release): vX.Y.Z` on `main`, tags it
    `vX.Y.Z` and pushes both. The pre-push hook runs the tests.
-5. Waits for GitHub Actions to build `ghcr.io/smarttechbrewery/swarm:vX.Y.Z` and
-   move `:stable` to it.
-6. Publishes the GitHub release, with notes generated from the merged PRs.
+5. Waits for GitHub Actions to build `ghcr.io/smarttechbrewery/swarm:vX.Y.Z`,
+   move `:stable` to it and publish the GitHub release, with notes generated from
+   the merged PRs.
+6. Checks that the release carries the signed worker runtime: its tarball,
+   `.sha256` and `.minisig` (see "Verifying the worker runtime" in
+   [`docs/MANUAL.md`](docs/MANUAL.md#verifying-the-worker-runtime)).
 7. Deploys to the VPS with `sudo dockerctl deploy app`. Migrations run when the
    app starts.
 8. Checks that `/health` answers and that the dashboard reports the new version.
