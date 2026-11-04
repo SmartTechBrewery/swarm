@@ -159,9 +159,11 @@ import { discoverAvailableClis } from '../../transport/cli-discovery.js';
 import { canonicalCheckoutPath } from '../../worktree/checkout-key.js';
 import { ensureControlPlaneUrl } from '../_shared/control-plane-env.js';
 import {
+	isLauncherPackage,
 	launcherCommand,
 	swarmCommand,
 	workerAgentCommand,
+	workerDashboardUrl,
 } from '../_shared/installation-command.js';
 import {
 	createOperatorClient,
@@ -1042,9 +1044,26 @@ export function refuseProfileServingCheckout(
 	);
 	out.info(`  start it with: ${launcherCommand()} run ${workerId}`);
 	out.info(
-		`  to replace it, remove it (${swarmCommand()} workers remove ${workerId}) and delete ${workerProfilePath(workerId)}`,
+		`  to replace it, ${recoveryStep(`workers remove ${workerId}`, 'delete it', workerId, controlPlaneUrl)} and delete ${workerProfilePath(workerId)}`,
 	);
 	return true;
+}
+
+/**
+ * One step an operator finishes by hand: `<swarm> <subcommand>`, or — from the
+ * launcher package, which ships no `swarm` CLI (issue #1311) — `<action> on` the
+ * worker's dashboard page, which offers every step these hints name (enroll,
+ * approve, consent, the operator credential, delete).
+ */
+function recoveryStep(
+	subcommand: string,
+	action: string,
+	workerId: string,
+	controlPlaneUrl: string,
+): string {
+	return isLauncherPackage()
+		? `${action} on ${workerDashboardUrl(controlPlaneUrl, workerId)}`
+		: `${swarmCommand()} ${subcommand}`;
 }
 
 /**
@@ -2221,14 +2240,28 @@ function remainingEnrollmentSteps(
 	workerId: string,
 	projectId: string,
 	enrollment: { status: string; sharingConsent: boolean },
+	controlPlaneUrl: string,
 ): string[] {
-	const swarm = swarmCommand();
 	const steps: string[] = [];
 	if (enrollment.status !== 'active') {
-		steps.push(`${swarm} workers approve ${workerId} ${projectId}`);
+		steps.push(
+			recoveryStep(
+				`workers approve ${workerId} ${projectId}`,
+				`approve its enrollment in '${projectId}'`,
+				workerId,
+				controlPlaneUrl,
+			),
+		);
 	}
 	if (!enrollment.sharingConsent) {
-		steps.push(`${swarm} workers consent ${workerId} ${projectId} on`);
+		steps.push(
+			recoveryStep(
+				`workers consent ${workerId} ${projectId} on`,
+				`turn on its sharing consent for '${projectId}'`,
+				workerId,
+				controlPlaneUrl,
+			),
+		);
 	}
 	return steps;
 }
@@ -2238,8 +2271,9 @@ function reportRemainingEnrollmentSteps(
 	workerId: string,
 	projectId: string,
 	enrollment: { status: string; sharingConsent: boolean },
+	controlPlaneUrl: string,
 ): void {
-	const steps = remainingEnrollmentSteps(workerId, projectId, enrollment);
+	const steps = remainingEnrollmentSteps(workerId, projectId, enrollment, controlPlaneUrl);
 	if (steps.length === 0) return;
 	out.info('finish it by hand with:');
 	for (const command of steps) out.info(`  ${command}`);
@@ -2422,7 +2456,12 @@ async function enrollCommand(argv: string[]): Promise<number> {
 	// A refused `--active`/`--consent` left a real enrollment behind, so the way
 	// forward is the one flag that did not land — never this command again.
 	if (outcome.enrollment && outcome.code !== 0) {
-		reportRemainingEnrollmentSteps(worker.workerId, projectId, outcome.enrollment);
+		reportRemainingEnrollmentSteps(
+			worker.workerId,
+			projectId,
+			outcome.enrollment,
+			operator.session.controlPlaneUrl,
+		);
 	}
 	return outcome.code;
 }
@@ -2696,7 +2735,8 @@ async function registerAndEnrollCommand(argv: string[]): Promise<number> {
 	if (!planned.ok) return planned.code;
 	const registered = await executeRegisterAndEnroll(planned.operator, planned.plan);
 	if (!registered.ok) return registered.code;
-	if (planned.plan.profile) return reportProfileStart(registered, undefined);
+	if (planned.plan.profile)
+		return reportProfileStart(registered, undefined, planned.operator.session.controlPlaneUrl);
 
 	// The credential's one and only appearance, on the last line — the "copy the
 	// last line" affordance docs/onboarding-worker.md relies on.
@@ -2779,8 +2819,13 @@ export async function executeRegisterAndEnroll(
 			);
 		return { ok: false, code: 1 };
 	};
-	const swarm = swarmCommand();
-	const enrollByHand = `${swarm} workers enroll ${worker.id} ${projectId} --cli ${capabilities.join(',')} --active --consent`;
+	const controlPlaneUrl = operator.session.controlPlaneUrl;
+	const enrollByHand = recoveryStep(
+		`workers enroll ${worker.id} ${projectId} --cli ${capabilities.join(',')} --active --consent`,
+		`enroll it in '${projectId}'`,
+		worker.id,
+		controlPlaneUrl,
+	);
 
 	// The same helper `enroll` uses, so the capability, repository-mismatch and
 	// duplicate refusals are surfaced unchanged. Active + consenting with no flag:
@@ -2816,11 +2861,19 @@ export async function executeRegisterAndEnroll(
 	if (enrolled.code !== 0) {
 		remaining.push(
 			...(enrolled.enrollment
-				? remainingEnrollmentSteps(worker.id, projectId, enrolled.enrollment)
+				? remainingEnrollmentSteps(worker.id, projectId, enrolled.enrollment, controlPlaneUrl)
 				: [enrollByHand]),
 		);
 	}
-	if (!stored) remaining.push(`${swarm} workers set-scm-credential ${worker.id} ${providerId}`);
+	if (!stored)
+		remaining.push(
+			recoveryStep(
+				`workers set-scm-credential ${worker.id} ${providerId}`,
+				`set its ${providerId} operator credential`,
+				worker.id,
+				controlPlaneUrl,
+			),
+		);
 	// Only an approval left (issue #1311): the enrollment exists and the credential is
 	// stored, so the worker can be started now and takes work once it is approved.
 	if (options.allowPendingApproval && enrolled.code !== 0 && enrolled.enrollment && stored)
@@ -2868,10 +2921,11 @@ function printCredential(credential: string): void {
 export function reportProfileStart(
 	registered: { workerId: string; saved: boolean },
 	note: string | undefined,
+	controlPlaneUrl: string,
 ): number {
 	if (!registered.saved) {
 		out.error(
-			`the worker is registered, but its profile could not be written, so swarm-launcher cannot start it — fix the cause, then remove it (${swarmCommand()} workers remove ${registered.workerId}) and register again, or start the daemon by hand with the credential above`,
+			`the worker is registered, but its profile could not be written, so swarm-launcher cannot start it — fix the cause, then ${recoveryStep(`workers remove ${registered.workerId}`, 'delete it', registered.workerId, controlPlaneUrl)} and register again, or start the daemon by hand with the credential above`,
 		);
 		return 1;
 	}
@@ -3001,6 +3055,7 @@ async function setupCommand(argv: string[]): Promise<number> {
 		repoRoot,
 		profile,
 		noAutostart: values['no-autostart'] ?? false,
+		controlPlaneUrl: operator.session.controlPlaneUrl,
 	});
 }
 
@@ -3032,11 +3087,21 @@ async function requireSetupOperator(
  */
 async function startSetUpWorker(
 	registered: { workerId: string; saved: boolean },
-	options: { displayName: string; repoRoot: string; profile: boolean; noAutostart: boolean },
+	options: {
+		displayName: string;
+		repoRoot: string;
+		profile: boolean;
+		noAutostart: boolean;
+		controlPlaneUrl: string;
+	},
 ): Promise<number> {
 	if (options.profile) {
 		if (!registered.saved || options.noAutostart)
-			return reportProfileStart(registered, 'autostart skipped (--no-autostart)');
+			return reportProfileStart(
+				registered,
+				'autostart skipped (--no-autostart)',
+				options.controlPlaneUrl,
+			);
 		return reportAutostart(
 			options.displayName,
 			await installProfileWorkerAutostart(registered.workerId),

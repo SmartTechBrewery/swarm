@@ -242,7 +242,7 @@ async function setUp(values: SetupValues, deps: SetupDeps): Promise<number> {
 	});
 	if (!registered.ok) return registered.code;
 	// No profile, nothing for the launcher to start from — the credential was printed.
-	if (!registered.saved) return reportProfileStart(registered, undefined);
+	if (!registered.saved) return reportProfileStart(registered, undefined, signed.controlPlaneUrl);
 
 	if (!(await installRuntime(signed.controlPlaneUrl, registered, deps))) return 1;
 	const code = await startWorker(signed, planned.displayName, registered, values, deps);
@@ -431,7 +431,7 @@ async function startWorker(
 ): Promise<number> {
 	const { workerId } = registered;
 	if (values['no-autostart'])
-		return reportProfileStart(registered, 'autostart skipped (--no-autostart)');
+		return reportProfileStart(registered, 'autostart skipped (--no-autostart)', controlPlaneUrl);
 	const autostart = await (deps.installAutostart ?? installProfileWorkerAutostart)(workerId);
 	const code = reportAutostart(displayName, autostart, workerId);
 	if (code !== 0 || autostart.kind !== 'installed') return code;
@@ -609,7 +609,7 @@ async function waitForConnection(
 function reportPendingApproval(projectId: string, pending: string[]): void {
 	if (pending.length === 0) return;
 	out.warn(
-		`the worker takes no work in '${projectId}' until its enrollment is finished — approving it is a project administrator's call (the project's Workers tab, or):`,
+		`the worker takes no work in '${projectId}' until its enrollment is finished — approving it is a project administrator's call:`,
 	);
 	for (const step of pending) out.warn(`  ${step}`);
 }

@@ -43,6 +43,14 @@ vi.mock('node:os', async (importOriginal) => ({
 	},
 }));
 
+// This checkout ships `bin/swarm.js`, so the hints name `swarm` unless a test says
+// it runs from the launcher package, which ships none (issue #1311).
+const launcherPackage = vi.hoisted(() => ({ on: false }));
+vi.mock('@/cli/_shared/installation-command.js', async (importOriginal) => ({
+	...(await importOriginal<typeof import('@/cli/_shared/installation-command.js')>()),
+	isLauncherPackage: () => launcherPackage.on,
+}));
+
 const CONTROL_PLANE = 'https://swarm.example.com';
 const PASSWORD = 'correct-horse-battery-staple';
 const SCM_TOKEN = 'ghp_scm-token-value';
@@ -72,6 +80,7 @@ beforeEach(() => {
 
 afterEach(() => {
 	fakeHome.dir = '';
+	launcherPackage.on = false;
 	vi.restoreAllMocks();
 	rmSync(home, { recursive: true, force: true });
 });
@@ -516,6 +525,65 @@ describe('swarm-worker setup', () => {
 		expect(installAutostart).toHaveBeenCalledWith(WORKER_ID);
 		expect(printed()).toMatch(/takes no work in 'api' until its enrollment is finished/);
 		expect(printed()).toMatch(new RegExp(`workers approve ${WORKER_ID} api`));
+	});
+
+	describe('from the launcher package, which ships no swarm CLI', () => {
+		const workerPage = `${CONTROL_PLANE}/workers/${WORKER_ID}`;
+
+		beforeEach(() => {
+			launcherPackage.on = true;
+		});
+
+		it('names the worker page for a pending approval and consent, not a swarm command', async () => {
+			const api = fakeOperatorApi({
+				'workers.enroll': () => ({
+					id: 'enrollment-1',
+					status: 'pending',
+					allowedClis: ['claude'],
+					concurrencyAllocation: 1,
+					sharingConsent: false,
+				}),
+				'workers.approveEnrollment': () => {
+					throw new OperatorApiError('Only a project administrator may approve an enrollment.');
+				},
+				'workers.setConsent': () => {
+					throw new OperatorApiError('Only the owner may grant consent.');
+				},
+			});
+			const { deps: setupDeps } = deps({ createClient: () => api.client });
+
+			expect(await runSetup(fullFlags(), setupDeps)).toBe(0);
+
+			expect(printed()).toContain(`approve its enrollment in 'api' on ${workerPage}`);
+			expect(printed()).toContain(`turn on its sharing consent for 'api' on ${workerPage}`);
+			expect(printed()).not.toMatch(/bin\/swarm\.js|swarm workers/);
+		});
+
+		it('fails on a refused SCM token, naming the worker page to set it on', async () => {
+			const api = fakeOperatorApi({
+				'workers.scmCredentials.set': () => {
+					throw new OperatorApiError('the credential was rejected by github');
+				},
+			});
+			const { deps: setupDeps, installAutostart } = deps({ createClient: () => api.client });
+
+			expect(await runSetup(fullFlags(), setupDeps)).toBe(1);
+
+			expect(installAutostart).not.toHaveBeenCalled();
+			expect(printed()).toContain('the credential was rejected by github');
+			expect(printed()).toContain(`set its github operator credential on ${workerPage}`);
+			expect(printed()).not.toMatch(/bin\/swarm\.js|swarm workers/);
+		});
+
+		it('refuses a re-run for a served checkout, naming the worker page to delete it on', async () => {
+			const { deps: setupDeps } = deps();
+			expect(await runSetup(fullFlags(), setupDeps)).toBe(0);
+
+			expect(await runSetup(fullFlags(), deps().deps)).toBe(1);
+
+			expect(printed()).toContain(`to replace it, delete it on ${workerPage}`);
+			expect(printed()).not.toMatch(/bin\/swarm\.js|swarm workers/);
+		});
 	});
 
 	it('reports a worker that never connects as a failure, naming how to check it', async () => {

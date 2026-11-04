@@ -1303,8 +1303,16 @@ stdin, and only one of them may be `-`. The password is never echoed, printed,
 logged or stored; the SCM token is sent once, to `workers.scmCredentials.set`; the
 worker credential stays in the profile. An enrollment into a project you do not
 administer is created **pending**: setup still installs and starts the worker, and
-names the `swarm workers approve <id> <project>` a project administrator runs (or
-the project's Workers tab).
+says what is still outstanding — the approval a project administrator gives, and
+sharing consent if it is not yet on.
+
+The package ships no `swarm` CLI, so every step setup leaves for you to finish by
+hand names the worker's page on the installation's dashboard,
+`<control-plane-url>/workers/<id>`, rather than a `swarm workers …` command:
+approving and consenting a pending enrollment, setting an operator credential the
+control plane refused (setup then exits 1 before starting the worker — set it there,
+and the profile setup already wrote starts with `swarm-worker run <id>`), and
+deleting the worker that already serves a checkout setup refuses to register again.
 
 ### `swarm-worker login`
 
