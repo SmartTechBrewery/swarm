@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import { ProviderUnavailableError } from '@/lib/provider-errors.js';
 import { deliveryUrl, type FetchLike, postDelivery } from '@/transport/delivery-client.js';
 import { TRANSPORT_PROTOCOL_VERSION } from '@/transport/protocol.js';
 
@@ -195,5 +196,62 @@ describe('postDelivery', () => {
 				},
 			),
 		).rejects.toThrow(/schema mismatch/);
+	});
+
+	// Issue #1274: a control-plane answer that the provider behind it failed is the
+	// provider's passing outage, and must reach the phase classifiers as one.
+	describe('a control plane whose provider call failed', () => {
+		const rejectionFor = (status: number, body: unknown) =>
+			postDelivery(
+				{
+					controlPlaneUrl: CONTROL_PLANE,
+					workerCredential: CREDENTIAL,
+					fetchImpl: vi.fn<FetchLike>().mockResolvedValue(jsonResponse(status, body)),
+				},
+				'/worker/delivery/pm/move',
+				{},
+				identity,
+			).then(
+				(): Error => {
+					throw new Error('expected the delivery to reject');
+				},
+				(err: unknown) => err as Error,
+			);
+
+		it('throws a ProviderUnavailableError for a flagged 502, carrying its reason', async () => {
+			const err = await rejectionFor(502, {
+				ok: false,
+				reason: 'Provider unavailable: 502 Bad Gateway',
+				providerUnavailable: true,
+			});
+
+			expect(err).toBeInstanceOf(ProviderUnavailableError);
+			expect(err.message).toBe(
+				'Control-plane delivery /worker/delivery/pm/move failed with status 502: Provider unavailable: 502 Bad Gateway',
+			);
+		});
+
+		it.each([500, 502, 504])('throws a ProviderUnavailableError for a bare %i', async (status) => {
+			const err = await rejectionFor(status, { ok: false, reason: 'internal error' });
+
+			expect(err).toBeInstanceOf(ProviderUnavailableError);
+			// The wording #1257's control-plane 5xx rule reads is unchanged.
+			expect(err.message).toBe(
+				`Control-plane delivery /worker/delivery/pm/move failed with status ${status}: internal error`,
+			);
+		});
+
+		it("keeps the control plane's own 503 credential refusal a plain error", async () => {
+			const err = await rejectionFor(503, { reason: 'persona credential unavailable' });
+
+			expect(err).not.toBeInstanceOf(ProviderUnavailableError);
+			expect(err.message).toMatch(/status 503: persona credential unavailable/);
+		});
+
+		it('keeps a 4xx refusal a plain error', async () => {
+			const err = await rejectionFor(403, { reason: 'worker is not enrolled' });
+
+			expect(err).not.toBeInstanceOf(ProviderUnavailableError);
+		});
 	});
 });

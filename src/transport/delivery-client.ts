@@ -18,6 +18,7 @@
  * never logged, never in an error message.
  */
 
+import { ProviderUnavailableError } from '../lib/provider-errors.js';
 import { TRANSPORT_PROTOCOL_VERSION } from './protocol.js';
 
 /** The `fetch` surface this module uses — injectable so tests drive it without a network. */
@@ -67,7 +68,7 @@ export function deliveryUrl(base: string, path: string): string {
 async function failureMessage(
 	path: string,
 	response: { status: number; json: () => Promise<unknown> },
-): Promise<string> {
+): Promise<{ message: string; providerUnavailable: boolean }> {
 	const base = `Control-plane delivery ${path} failed with status ${response.status}`;
 	// A 404 on a delivery route is the one failure whose cause is a *deployment*
 	// rather than a request: the route does not exist on that control plane, so this
@@ -78,21 +79,40 @@ async function failureMessage(
 	// release reaches an older control plane as a bare 404, and without naming the
 	// cause an operator sees only a status code for what is a one-line fix.
 	if (response.status === 404) {
-		return (
-			`${base}. This control plane does not serve that route, which means it is ` +
-			'running an older build than this worker — update the control plane, or run a ' +
-			'daemon matching it.'
-		);
+		return {
+			message:
+				`${base}. This control plane does not serve that route, which means it is ` +
+				'running an older build than this worker — update the control plane, or run a ' +
+				'daemon matching it.',
+			providerUnavailable: false,
+		};
 	}
 	try {
 		const body = await response.json();
-		const reason =
-			typeof body === 'object' && body !== null ? (body as { reason?: unknown }).reason : undefined;
-		return typeof reason === 'string' && reason.length > 0 ? `${base}: ${reason}` : base;
+		const fields =
+			typeof body === 'object' && body !== null
+				? (body as { reason?: unknown; providerUnavailable?: unknown })
+				: {};
+		const reason = fields.reason;
+		return {
+			message: typeof reason === 'string' && reason.length > 0 ? `${base}: ${reason}` : base,
+			providerUnavailable: fields.providerUnavailable === true,
+		};
 	} catch {
-		return base;
+		return { message: base, providerUnavailable: false };
 	}
 }
+
+/**
+ * The control-plane statuses a worker reads as the provider's passing trouble even
+ * when the answer does not say so (issue #1274): a bare 500 is what an older control
+ * plane answers for a provider call that threw, and 502/504 are what the tunnel or
+ * proxy in front of it answers. 503 is deliberately absent — it is the control
+ * plane's own refusal for a credential it cannot resolve (`resolvePersonaDelivery`,
+ * `../router/worker-delivery.ts`), which waiting does not fix — unless the answer
+ * flags it as a provider outage.
+ */
+const TRANSIENT_CONTROL_PLANE_STATUSES = new Set([500, 502, 504]);
 
 /**
  * POST a delivery request to the control plane and return its parsed response
@@ -106,6 +126,13 @@ async function failureMessage(
  * ({@link failureMessage}) so the cause reaches the worker's log and the run's
  * failure comment. The server-side writes are marker-idempotent, so a retried call
  * cannot double-post.
+ *
+ * A control-plane answer that the provider behind it failed — one flagged
+ * `providerUnavailable` (the 502 `../router/webhook-receiver.ts` answers for a
+ * provider server error), or a bare 500/502/504 — throws a
+ * {@link ProviderUnavailableError} rather than a plain `Error` (issue #1274), so the
+ * phase defers on the ordinary retry schedule instead of failing terminally. The
+ * message is the same either way.
  */
 export async function postDelivery<T>(
 	options: DeliveryClientOptions,
@@ -128,7 +155,13 @@ export async function postDelivery<T>(
 			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
 		}),
 	});
-	if (!response.ok) throw new Error(await failureMessage(path, response));
+	if (!response.ok) {
+		const failure = await failureMessage(path, response);
+		if (failure.providerUnavailable || TRANSIENT_CONTROL_PLANE_STATUSES.has(response.status)) {
+			throw new ProviderUnavailableError(failure.message);
+		}
+		throw new Error(failure.message);
+	}
 	let payload: unknown;
 	try {
 		payload = await response.json();

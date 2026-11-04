@@ -64,7 +64,16 @@ export type AgentFailureKind =
 	 * on the router (`../router/dispatch-results.ts`). Retried automatically after the
 	 * delay its entry in `../worker/automatic-retry-policy.ts` declares (issue #1075).
 	 */
-	| 'transport-lost';
+	| 'transport-lost'
+	/**
+	 * An SCM or PM provider call answered with a server error — an HTTP 5xx, or a
+	 * re-typed GraphQL internal error — anywhere in the phase (issue #1274,
+	 * `../lib/provider-errors.ts`). The provider's own passing trouble, so the run
+	 * defers on the ordinary retry floor and budget. Never produced by
+	 * {@link classifyAgentFailure}: the phase failure classifiers raise it from the
+	 * provider's error.
+	 */
+	| 'provider-unavailable';
 
 export interface AgentFailure {
 	kind: AgentFailureKind;

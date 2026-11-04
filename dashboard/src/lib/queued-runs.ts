@@ -63,6 +63,9 @@ const QUEUED_WAIT_REASON_LABELS: Record<QueuedWaitReason, string> = {
 	// it is on the remote, and the retry is going to a machine that has it (issue
 	// #1018).
 	'commit-unavailable': 'retrying on a worker that has the commit',
+	// An SCM/PM provider answered with a server error (issue #1274): its outage, not
+	// SWARM's, retried on the ordinary schedule. The row's reason names the provider.
+	'provider-unavailable': 'retrying after the SCM/PM provider was unavailable',
 	// An automatic retry (issue #1075): the run's worker dropped off and never came
 	// back, so it is retried after its failure type's delay, preferably elsewhere.
 	'transport-lost': "retrying after the worker's connection was lost",

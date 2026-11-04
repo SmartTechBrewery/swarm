@@ -122,6 +122,14 @@ describe('queuedWaitReasonLabel', () => {
 		);
 	});
 
+	// Issue #1274: a retry after the SCM/PM provider answered with a server error — the
+	// Queue names the provider's outage so it does not read as SWARM's own fault.
+	it('names the provider outage for a provider-unavailable retry', () => {
+		expect(queuedWaitReasonLabel('provider-unavailable')).toBe(
+			'retrying after the SCM/PM provider was unavailable',
+		);
+	});
+
 	// Issue #1257: the one automatic retry of a run that failed holding preserved work —
 	// a timed wait, distinct from the pinned machine being busy (`preserved-worker`).
 	it('names the one automatic retry of a run that failed holding preserved work', () => {
