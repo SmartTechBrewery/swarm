@@ -49,7 +49,6 @@ vi.mock('@/pipeline/resume.js', async (importOriginal) => ({
 	executeRecoveryGate: executeRecoveryGateMock,
 }));
 
-import { DEFAULT_PULL_REQUEST_DESCRIPTION } from '@/config/pull-request-description.js';
 import type { AgentCliResult, RunAgentCliOptions } from '@/harness/agent-cli.js';
 import { AgentRunError } from '@/harness/agent-failure.js';
 import { logger } from '@/lib/logger.js';
@@ -60,6 +59,7 @@ import {
 	implementationCommentBody,
 	runImplementationPhase,
 } from '@/pipeline/implementation.js';
+import { PULL_REQUEST_DESCRIPTION_STRUCTURE } from '@/pipeline/prompts/implementation.js';
 import type { WorkItemBlocker, WorkItemDependent } from '@/pm/types.js';
 import {
 	commitPreparedTree,
@@ -1105,17 +1105,21 @@ describe('runImplementationPhase — pull request description (issue #1277)', ()
 		);
 	});
 
-	it('hands the agent the project’s own structure in place of the default', async () => {
+	// Issue #1321: the structure is SWARM's own; a project adjusts the description
+	// through its Custom prompt, which follows the structure in the prompt.
+	it('hands the agent the built-in structure, with the Custom prompt after it', async () => {
 		const deps = makeDeps();
-		deps.project = createMockProjectConfig({
-			agents: { implementation: { pullRequestDescription: '## Zmiany\n<co i dlaczego>' } },
+
+		await runImplementationPhase({
+			...deps,
+			customPrompt: 'Write the pull request description in Polish.',
 		});
 
-		await runImplementationPhase(deps);
-
-		const prompt = deps.runAgent.mock.calls[0]?.[0].args?.[0];
-		expect(prompt).toContain('## Zmiany\n<co i dlaczego>');
-		expect(prompt).not.toContain('## Why this way');
+		const prompt = deps.runAgent.mock.calls[0]?.[0].args?.[0] ?? '';
+		expect(prompt).toContain(PULL_REQUEST_DESCRIPTION_STRUCTURE);
+		expect(prompt.indexOf('Write the pull request description in Polish.')).toBeGreaterThan(
+			prompt.indexOf('--- END PULL REQUEST DESCRIPTION ---'),
+		);
 	});
 });
 
@@ -1143,11 +1147,11 @@ describe('buildImplementationPrompt', () => {
 		expect(prompt).toContain('D');
 	});
 
-	// Issue #1277: `summary` is the pull request description, in the project's structure.
-	it('asks for the summary as the default description structure, with every section', () => {
+	// Issue #1277: `summary` is the pull request description, in SWARM's structure.
+	it('asks for the summary as the built-in description structure, with every section', () => {
 		const prompt = buildImplementationPrompt(createMockWorkItem(), context);
 		expect(prompt).toContain('--- PULL REQUEST DESCRIPTION ---');
-		expect(prompt).toContain(DEFAULT_PULL_REQUEST_DESCRIPTION);
+		expect(prompt).toContain(PULL_REQUEST_DESCRIPTION_STRUCTURE);
 		for (const heading of ['## Changes', '## Why this way', '## Verification', '## Out of scope']) {
 			expect(prompt).toContain(heading);
 		}
@@ -1156,15 +1160,18 @@ describe('buildImplementationPrompt', () => {
 		expect(prompt).not.toContain('PR-ready text');
 	});
 
-	it('uses a project’s own structure and keeps the custom prompt as project instructions after it', () => {
-		const structure = '## Podsumowanie\n<jedno zdanie>\n\n## Weryfikacja\n<polecenia>';
+	// Issue #1321: the structure is English, and the language — headings included —
+	// is whatever the project's instructions ask for, which come after it.
+	it('takes the language from the project instructions, which follow the structure', () => {
 		const prompt = buildImplementationPrompt(
 			createMockWorkItem(),
-			{ ...context, pullRequestDescription: structure },
+			context,
 			'Prefer small commits.',
 		);
-		expect(prompt).toContain(structure);
-		expect(prompt).not.toContain('## Why this way');
+		expect(prompt).toContain(
+			"Write the whole description, headings included, in the language the project's\n  instructions ask for, and in English when they do not.",
+		);
+		expect(prompt).not.toContain('Write in the language of the structure');
 		const template = prompt.indexOf('--- PULL REQUEST DESCRIPTION ---');
 		const instructions = prompt.indexOf('--- PROJECT INSTRUCTIONS ---');
 		expect(template).toBeGreaterThan(-1);

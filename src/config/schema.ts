@@ -56,11 +56,6 @@ import {
 	PmProviderCredentialReferencesSchema,
 } from './pm-credentials.js';
 import {
-	normalizePullRequestDescription,
-	PULL_REQUEST_DESCRIPTION_MAX_LENGTH,
-} from './pull-request-description.js';
-import { normalizeReviewReport, REVIEW_REPORT_MAX_LENGTH } from './review-report.js';
-import {
 	adoptLegacyScmCredentials,
 	ScmCredentialReferencesByProviderSchema,
 	ScmProviderCredentialReferencesSchema,
@@ -328,23 +323,11 @@ export const AgentConfigSchema = z
 		 * project without one produces exactly today's prompt.
 		 */
 		prompt: z.string().optional(),
-		/**
-		 * The structure of the pull request description the agent writes (issue
-		 * #1277). Read **only** on `agents.implementation` — the phase that opens the
-		 * pull request. Unset means SWARM's English default
-		 * (`DEFAULT_PULL_REQUEST_DESCRIPTION`); a value equal to the default
-		 * normalizes to unset, so saving it untouched stores nothing. SWARM always
-		 * appends the work-item line itself, outside this structure.
-		 */
-		pullRequestDescription: z.string().optional(),
-		/**
-		 * The layout of the review report the agent's hand-off is rendered into
-		 * (issue #1288): headings and fixed wording in the project's language, plus
-		 * `{slot}` placeholders SWARM fills. Read **only** on `agents.review`. Unset
-		 * means SWARM's English default (`DEFAULT_REVIEW_REPORT`); a value equal to
-		 * the default normalizes to unset, so saving it untouched stores nothing.
-		 */
-		reviewReport: z.string().optional(),
+		// `pullRequestDescription` (issue #1277) and `reviewReport` (issue #1288) were
+		// fields here until issue #1321 built both structures into the phase prompts.
+		// They are deliberately not declared: a configuration that still stores one
+		// keeps parsing, and the value is stripped like any other unknown key, so the
+		// next save drops it. A project adjusts both texts through `prompt`.
 	})
 	.transform((agent, ctx) => {
 		// Whitespace-only is not a meaningful override — normalize it away so it's
@@ -352,8 +335,6 @@ export const AgentConfigSchema = z
 		// spreading a `prompt` key onto the result) so the inferred output keeps
 		// `prompt` optional, matching every other field.
 		agent.prompt = normalizeCustomPrompt(agent.prompt);
-		agent.pullRequestDescription = normalizePullRequestDescription(agent.pullRequestDescription);
-		agent.reviewReport = normalizeReviewReport(agent.reviewReport);
 		if (agent.targets === undefined) {
 			// A config written before `targets` existed (or one the pre-list dashboard
 			// saved): fold its single selection into the list so every reader sees one
@@ -405,19 +386,6 @@ export const AgentConfigSchema = z
 	.refine((agent) => !agent.prompt || agent.prompt.length <= CUSTOM_PROMPT_MAX_LENGTH, {
 		message: `prompt must be at most ${CUSTOM_PROMPT_MAX_LENGTH} characters (issue #135)`,
 		path: ['prompt'],
-	})
-	.refine(
-		(agent) =>
-			!agent.pullRequestDescription ||
-			agent.pullRequestDescription.length <= PULL_REQUEST_DESCRIPTION_MAX_LENGTH,
-		{
-			message: `pullRequestDescription must be at most ${PULL_REQUEST_DESCRIPTION_MAX_LENGTH} characters (issue #1277)`,
-			path: ['pullRequestDescription'],
-		},
-	)
-	.refine((agent) => !agent.reviewReport || agent.reviewReport.length <= REVIEW_REPORT_MAX_LENGTH, {
-		message: `reviewReport must be at most ${REVIEW_REPORT_MAX_LENGTH} characters (issue #1288)`,
-		path: ['reviewReport'],
 	})
 	.refine(
 		// A phase names each CLI at most once — two targets on the same CLI would be

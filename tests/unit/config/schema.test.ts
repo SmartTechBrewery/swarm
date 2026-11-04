@@ -1,10 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import {
-	DEFAULT_PULL_REQUEST_DESCRIPTION,
-	PULL_REQUEST_DESCRIPTION_MAX_LENGTH,
-} from '@/config/pull-request-description.js';
-import { DEFAULT_REVIEW_REPORT, REVIEW_REPORT_MAX_LENGTH } from '@/config/review-report.js';
-import {
 	type AgentConfig,
 	AgentConfigSchema,
 	AgentsConfigSchema,
@@ -1256,53 +1251,28 @@ describe('ProjectRecordSchema', () => {
 		});
 	});
 
-	describe('pull request description (issue #1277)', () => {
-		it('keeps a project’s own structure, trimmed', () => {
-			expect(
-				AgentConfigSchema.parse({ pullRequestDescription: '  ## Zmiany\n<lista>  ' })
-					.pullRequestDescription,
-			).toBe('## Zmiany\n<lista>');
+	// Issue #1321 removed both fields (#1277, #1288): a configuration saved under
+	// v1.6.0 with them set must keep loading, and the values are dropped, not kept.
+	describe('the retired pullRequestDescription and reviewReport fields', () => {
+		it('accepts a phase that still stores them, and drops both', () => {
+			const agent = AgentConfigSchema.parse({
+				prompt: 'Write the review report in Polish.',
+				pullRequestDescription: '## Zmiany\n<lista>',
+				reviewReport: '## Zakres\n\n{summary}',
+			});
+			expect(agent).toEqual({ prompt: 'Write the review report in Polish.' });
 		});
 
-		it('stores nothing for a blank value or the untouched default', () => {
-			expect(AgentConfigSchema.parse({}).pullRequestDescription).toBeUndefined();
-			expect(
-				AgentConfigSchema.parse({ pullRequestDescription: '  ' }).pullRequestDescription,
-			).toBeUndefined();
-			expect(
-				AgentConfigSchema.parse({ pullRequestDescription: DEFAULT_PULL_REQUEST_DESCRIPTION })
-					.pullRequestDescription,
-			).toBeUndefined();
-		});
-
-		it('rejects a structure over the bound', () => {
-			expect(() =>
-				AgentConfigSchema.parse({
-					pullRequestDescription: 'a'.repeat(PULL_REQUEST_DESCRIPTION_MAX_LENGTH + 1),
-				}),
-			).toThrow(/at most/);
-		});
-	});
-
-	describe('review report layout (issue #1288)', () => {
-		it('keeps a project’s own layout, trimmed', () => {
-			expect(
-				AgentConfigSchema.parse({ reviewReport: '  ## Zakres\n\n{summary}  ' }).reviewReport,
-			).toBe('## Zakres\n\n{summary}');
-		});
-
-		it('stores nothing for a blank value or the untouched default', () => {
-			expect(AgentConfigSchema.parse({}).reviewReport).toBeUndefined();
-			expect(AgentConfigSchema.parse({ reviewReport: '  ' }).reviewReport).toBeUndefined();
-			expect(
-				AgentConfigSchema.parse({ reviewReport: DEFAULT_REVIEW_REPORT }).reviewReport,
-			).toBeUndefined();
-		});
-
-		it('rejects a layout over the bound', () => {
-			expect(() =>
-				AgentConfigSchema.parse({ reviewReport: 'a'.repeat(REVIEW_REPORT_MAX_LENGTH + 1) }),
-			).toThrow(/at most/);
+		it('loads a whole v1.6.0 project configuration with both set', () => {
+			const project = ProjectConfigSchema.parse({
+				...createMockProjectConfig(),
+				agents: {
+					implementation: { pullRequestDescription: 'a'.repeat(20_000) },
+					review: { reviewReport: '> {pass} · `{verdict}`', prompt: 'Po polsku.' },
+				},
+			});
+			expect(project.agents?.implementation).not.toHaveProperty('pullRequestDescription');
+			expect(project.agents?.review).toEqual({ prompt: 'Po polsku.' });
 		});
 	});
 

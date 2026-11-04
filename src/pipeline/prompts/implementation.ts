@@ -5,7 +5,6 @@
  * its existing callers.
  */
 
-import { DEFAULT_PULL_REQUEST_DESCRIPTION } from '@/config/pull-request-description.js';
 import { GH_IDENTITY_GUARD } from '@/pipeline/agent-auth.js';
 import { pipelinePhaseGuard } from '@/pipeline/agent-scope.js';
 import {
@@ -65,25 +64,56 @@ function commitNamingFields(taskId: string, naming: CommitSubjectNaming): string
 }
 
 /**
- * The delimited block telling the implementer how to write the pull request
- * description (issue #1277): the project's structure (or SWARM's default) and the
- * rules that come with it. It sits before the project instructions, so a Custom
- * prompt keeps reading as general guidance for the phase.
+ * SWARM's built-in pull request description structure (issue #1277), part of the
+ * Implementation prompt since issue #1321. Every section is mandatory; an empty one
+ * says "None" rather than being dropped. It is written in English and is the only
+ * structure there is: a project adjusts the description — its language, an extra
+ * section — through the phase's Custom prompt, never by replacing this.
+ *
+ * The line naming the work item (`Closes: #<n>` or `Work item: [<key>](<url>)`) is
+ * not part of it: SWARM appends that itself, outside the agent's text
+ * (`src/pipeline/pull-request-description.ts`).
  */
-function pullRequestDescriptionSection(structure: string): readonly string[] {
+export const PULL_REQUEST_DESCRIPTION_STRUCTURE = [
+	"<1–2 sentences: what this pull request delivers, in the reader's terms, not a changelog>",
+	'',
+	'## Changes',
+	'| File / area | What it is |',
+	'| --- | --- |',
+	'',
+	'## Why this way',
+	'<decisions not visible in the diff, rejected alternatives, deliberate deviations from the work item — or "None">',
+	'',
+	'## Verification',
+	'**Checked:** <command → outcome, one per line>',
+	'**Not checked:** <what and why — or "Nothing left unchecked">',
+	'',
+	'## Out of scope',
+	'<what was deliberately left out although it suggested itself — or "None">',
+].join('\n');
+
+/**
+ * The delimited block telling the implementer how to write the pull request
+ * description (issue #1277): SWARM's structure and the rules that come with it. It
+ * sits before the project instructions, which is where a project asks for the
+ * description in its own language or with an extra section (issue #1321).
+ */
+function pullRequestDescriptionSection(): readonly string[] {
 	return [
 		'',
 		'--- PULL REQUEST DESCRIPTION ---',
 		'Write the hand-off `summary` as the pull request description, by filling in the',
 		'structure below as Markdown. Replace every <…> placeholder and keep every heading.',
-		'- Every section is mandatory. When one has nothing to say, write "None" (or the',
-		"  structure's own equivalent) — never drop it.",
+		'- Every section is mandatory. When one has nothing to say, write "None" (or its',
+		'  equivalent in the language you write in) — never drop it.',
 		'- Nothing may be described as checked or verified unless it appears in your',
 		'  `verification` array; say what you did not check and why.',
-		'- Write in the language of the structure.',
+		"- Write the whole description, headings included, in the language the project's",
+		'  instructions ask for, and in English when they do not. Add a section only when',
+		'  they ask for one.',
 		'- Do not add a "Closes"/"Fixes" line or a link to the work item — SWARM appends it.',
 		'',
-		structure,
+		PULL_REQUEST_DESCRIPTION_STRUCTURE,
 		'--- END PULL REQUEST DESCRIPTION ---',
 	];
 }
@@ -132,12 +162,6 @@ export function buildImplementationPrompt(
 		 * size the summary the hand-off asks for. Unset means the defaults.
 		 */
 		commitSubjectNaming?: CommitSubjectNaming;
-		/**
-		 * The structure the pull request description follows (issue #1277) — the
-		 * project's `agents.implementation.pullRequestDescription`, resolved. Unset
-		 * means SWARM's default.
-		 */
-		pullRequestDescription?: string;
 	},
 	customPrompt?: string,
 ): string {
@@ -186,9 +210,7 @@ export function buildImplementationPrompt(
 		'',
 		...(checkpoint ? [...checkpointContinuationSection(checkpoint), ''] : []),
 		'Do not merge the PR. Keep the change scoped to the work item.',
-		...pullRequestDescriptionSection(
-			context.pullRequestDescription ?? DEFAULT_PULL_REQUEST_DESCRIPTION,
-		),
+		...pullRequestDescriptionSection(),
 		...projectInstructionsSection(customPrompt),
 		'',
 		'--- WORK ITEM ---',

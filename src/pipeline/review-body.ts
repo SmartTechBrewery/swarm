@@ -18,27 +18,14 @@
  * schema's refinement guarantees each tier's slots are present, so nothing here
  * has to defend against a missing one.
  *
- * Since issue #1288 the *arrangement* is a project's to choose: each part is
- * rendered into a named slot (`REVIEW_REPORT_SLOTS`, `src/config/review-report.ts`)
- * and the slots are placed by a layout — the project's `agents.review.reviewReport`
- * or SWARM's `DEFAULT_REVIEW_REPORT` — with SWARM's own words taken from the
- * report's vocabulary (`./review-report-vocabulary.ts`). With no layout configured
- * the report is byte-identical to the one this module rendered before. A layout that
- * leaves out a slot with content still gets that content, appended at the end, so a
- * custom layout can never hide a blocking finding.
+ * Since issue #1321 the agent writes the posted report itself, in the project's
+ * language, following the structure the Review prompt builds in — which is this
+ * module's layout, described in English. What is rendered here is the fallback:
+ * SWARM posts it whenever the agent's report is missing, states a different verdict
+ * or leaves out a blocking finding's id (`./review-report.ts`), so the two must keep
+ * describing the same report.
  */
 
-import {
-	DEFAULT_REVIEW_REPORT,
-	REVIEW_REPORT_SLOTS,
-	type ReviewReportSlot,
-} from '@/config/review-report.js';
-import {
-	ENGLISH_REVIEW_REPORT_VOCABULARY,
-	fillLabel,
-	type ReviewReportVocabulary,
-	resolveReviewReportVocabulary,
-} from '@/pipeline/review-report-vocabulary.js';
 import {
 	isBlockingSeverity,
 	type ReviewCarriedFinding,
@@ -72,27 +59,14 @@ export interface ReviewBodyContext {
 	 * the pipeline will pick them up.
 	 */
 	minorsAnswered: boolean;
-	/**
-	 * The project's review report layout (`agents.review.reviewReport`, issue
-	 * #1288), already normalized — `undefined` for SWARM's default. Only a custom
-	 * layout reads the hand-off's `reportLabels`: the default report is English,
-	 * whatever the agent wrote.
-	 */
-	layout?: string;
-}
-
-/** What one rendering needs besides the hand-off: the context plus the words to use. */
-interface RenderContext extends ReviewBodyContext {
-	words: ReviewReportVocabulary;
 }
 
 /**
  * Markdown table cells can carry neither a raw `|` (it opens a new column) nor a
  * newline (it ends the row). Agent-authored text reaches all of them — a
  * verification command, a carried finding's id and title, an absorbed task's
- * reference, URL and evidence, a translated column header — and a piped command
- * like `npx vitest run | tail -20` is ordinary enough to break the table in
- * practice.
+ * reference, URL and evidence — and a piped command like
+ * `npx vitest run | tail -20` is ordinary enough to break the table in practice.
  */
 function cell(text: string): string {
 	return text.replace(/\|/g, '\\|').replace(/\s*\r?\n\s*/g, ' ');
@@ -105,83 +79,62 @@ const SEVERITY_ORDER: Record<ReviewFinding['severity'], number> = {
 	nit: 3,
 };
 
-const SEVERITY_WORDS = {
-	blocker: 'severityBlocker',
-	major: 'severityMajor',
-	minor: 'severityMinor',
-	nit: 'severityNit',
-} as const satisfies Record<ReviewFinding['severity'], keyof ReviewReportVocabulary>;
-
-const CATEGORY_WORDS = {
-	correctness: 'categoryCorrectness',
-	security: 'categorySecurity',
-	contract: 'categoryContract',
-	performance: 'categoryPerformance',
-	'test-coverage': 'categoryTestCoverage',
-	docs: 'categoryDocs',
-	consistency: 'categoryConsistency',
-} as const satisfies Record<ReviewFinding['category'], keyof ReviewReportVocabulary>;
-
-const VERDICT_WORDS = {
-	approve: 'verdictApprove',
-	'request-changes': 'verdictRequestChanges',
-} as const satisfies Record<ReviewHandoff['verdict'], keyof ReviewReportVocabulary>;
-
 /**
  * Ordinal → the name a human uses for that re-review pass. Only the two the
  * default `REVIEW_VERDICT_CAP` permits are named; a raised cap falls back to the
  * numbered form below.
  */
-const RE_REVIEW_NAMES = ['firstReReview', 'secondReReview'] as const;
+const RE_REVIEW_NAMES = ['First re-review', 'Second re-review'] as const;
 
-function passLabel({ ordinal, cap, isReReview, words }: RenderContext): string {
-	if (ordinal === undefined) return `**${isReReview ? words.reReview : words.review}**`;
+/**
+ * The header's pass label — `**First re-review** · pass 2 of 3`. Exported because the
+ * Review prompt hands the same label to the agent writing its own report (issue
+ * #1321): the ordinal is SWARM's to know, never the agent's to count.
+ */
+export function passLabel({
+	ordinal,
+	cap,
+	isReReview,
+}: Pick<ReviewBodyContext, 'ordinal' | 'cap' | 'isReReview'>): string {
+	if (ordinal === undefined) return isReReview ? '**Re-review**' : '**Review**';
 	// `isReReview` — not the ordinal — decides the *name*. A pass after an approval
 	// that didn't merge (a later push re-triggers Review) is a full initial review
 	// sitting at ordinal 2; calling that a re-review would claim it verified
 	// earlier findings it was never shown. The ordinal still names the *slot*.
-	const named = RE_REVIEW_NAMES[ordinal - 2];
-	const name = isReReview
-		? named
-			? words[named]
-			: fillLabel(words.numberedReReview, { n: ordinal - 1 })
-		: words.review;
+	const name = isReReview ? (RE_REVIEW_NAMES[ordinal - 2] ?? `Re-review ${ordinal - 1}`) : 'Review';
 	// Naming the last permitted pass in the line a human reads first: a
 	// cap-reaching `request-changes` stops the automatic cycle, and today that is
 	// visible only in a log field.
-	const final = ordinal >= cap ? ` — ${words.finalPermittedVerdict}` : '';
-	return `**${name}** · ${fillLabel(words.passOf, { ordinal, cap })}${final}`;
+	const final = ordinal >= cap ? ' — final permitted verdict' : '';
+	return `**${name}** · pass ${ordinal} of ${cap}${final}`;
 }
 
 /** `1 blocker · 1 major · 0 minor · 0 nits` — the line a human scans before any prose. */
-function severityHistogram(
-	findings: readonly ReviewFinding[],
-	words: ReviewReportVocabulary,
-): string {
+function severityHistogram(findings: readonly ReviewFinding[]): string {
 	const count = (severity: ReviewFinding['severity']) =>
 		findings.filter((f) => f.severity === severity).length;
 	const nits = count('nit');
 	return [
-		fillLabel(words.countBlocker, { count: count('blocker') }),
-		fillLabel(words.countMajor, { count: count('major') }),
-		fillLabel(words.countMinor, { count: count('minor') }),
-		fillLabel(nits === 1 ? words.countOneNit : words.countManyNits, { count: nits }),
+		`${count('blocker')} blocker`,
+		`${count('major')} major`,
+		`${count('minor')} minor`,
+		`${nits} ${nits === 1 ? 'nit' : 'nits'}`,
 	].join(' · ');
 }
 
-function findingsSummary({ handoff, words }: RenderContext): string {
+function findingsSummary(handoff: ReviewHandoff): string {
 	const { findings } = handoff;
-	if (findings.length === 0) return `**${words.noFindings}**`;
+	if (findings.length === 0) return '**No findings**';
 	const blocking = findings.some((f) => isBlockingSeverity(f.severity));
-	const total = fillLabel(findings.length === 1 ? words.oneFinding : words.manyFindings, {
-		count: findings.length,
-	});
-	const suffix = blocking ? '' : ` · **${words.noneBlocking}**`;
-	return `**${total}** — ${severityHistogram(findings, words)}${suffix}`;
+	const noun = findings.length === 1 ? 'finding' : 'findings';
+	const suffix = blocking ? '' : ' · **none blocking**';
+	return `**${findings.length} ${noun}** — ${severityHistogram(findings)}${suffix}`;
 }
 
-function carriedSummary({ handoff, words }: RenderContext): string {
-	const { carried, findings } = handoff;
+function carriedSummary(
+	carried: readonly ReviewCarriedFinding[],
+	findings: readonly ReviewFinding[],
+): string {
 	const resolved = carried.filter((c) => c.status === 'resolved').length;
 	const outstanding = carried.length - resolved;
 	// The disposition counts answer "was every point addressed", but they say
@@ -189,41 +142,46 @@ function carriedSummary({ handoff, words }: RenderContext): string {
 	// along whenever this pass reported anything.
 	const news =
 		findings.length === 0
-			? `**${words.noNewFindings}**`
-			: `**${fillLabel(words.newFindings, { count: findings.length })}** (${severityHistogram(findings, words)})`;
-	return `**${fillLabel(words.carriedCounts, { resolved, outstanding })}** — ${news}`;
+			? '**0 new findings**'
+			: `**${findings.length} new** (${severityHistogram(findings)})`;
+	return `**Carried: ${resolved} resolved · ${outstanding} outstanding** — ${news}`;
 }
 
-const CARRIED_STATUS_LABELS = {
-	resolved: ['✅', 'carriedResolved'],
-	partial: ['⚠️', 'carriedPartial'],
-	outstanding: ['❌', 'carriedOutstanding'],
-	regressed: ['❌', 'carriedRegressed'],
-} as const satisfies Record<
-	ReviewCarriedFinding['status'],
-	readonly [string, keyof ReviewReportVocabulary]
->;
-
-function carriedStatus(status: ReviewCarriedFinding['status'], words: ReviewReportVocabulary) {
-	const [mark, word] = CARRIED_STATUS_LABELS[status];
-	return `${mark} ${words[word]}`;
+/** The blockquote header: pass, verdict, head, and the counts. */
+function header(context: ReviewBodyContext): string[] {
+	const { handoff, headSha } = context;
+	const counts =
+		handoff.carried.length > 0
+			? carriedSummary(handoff.carried, handoff.findings)
+			: findingsSummary(handoff);
+	return [
+		`> ${passLabel(context)} · \`${handoff.verdict}\` · head \`${headSha}\``,
+		`> ${counts}`,
+		'',
+	];
 }
+
+const CARRIED_STATUS_LABELS: Record<ReviewCarriedFinding['status'], string> = {
+	resolved: '✅ resolved',
+	partial: '⚠️ partially addressed',
+	outstanding: '❌ not addressed',
+	regressed: '❌ regressed',
+};
 
 /** One row per finding an earlier pass raised — "was every point addressed" at a glance. */
-function disposition({ handoff, words }: RenderContext): string[] {
-	const { carried } = handoff;
+function disposition(carried: readonly ReviewCarriedFinding[]): string[] {
 	if (carried.length === 0) return [];
 	return [
-		`## ${words.dispositionHeading}`,
+		'## Disposition',
 		'',
-		`| ${cell(words.columnId)} | ${cell(words.columnFinding)} | ${cell(words.columnStatus)} |`,
+		'| ID | Finding | Status |',
 		'| --- | --- | --- |',
 		...carried.map(
-			(c) => `| ${cell(c.id)} | ${cell(c.title)} | ${carriedStatus(c.status, words)} |`,
+			(c) => `| ${cell(c.id)} | ${cell(c.title)} | ${CARRIED_STATUS_LABELS[c.status]} |`,
 		),
 		'',
 		...carried.flatMap((c) => [
-			`### ${c.id} · ${carriedStatus(c.status, words)}`,
+			`### ${c.id} · ${CARRIED_STATUS_LABELS[c.status]}`,
 			'',
 			c.detail,
 			'',
@@ -231,39 +189,32 @@ function disposition({ handoff, words }: RenderContext): string[] {
 	];
 }
 
-const DOC_STATUS_LABELS = {
-	accurate: ['✅', 'docAccurate'],
-	updated: ['✅', 'docUpdated'],
-	'not-applicable': ['✅', 'docNotApplicable'],
-	stale: ['❌', 'docStale'],
-} as const satisfies Record<
-	ReviewDocCheck['status'],
-	readonly [string, keyof ReviewReportVocabulary]
->;
+const DOC_STATUS_LABELS: Record<ReviewDocCheck['status'], string> = {
+	accurate: '✅ accurate',
+	updated: '✅ updated',
+	'not-applicable': '✅ correctly untouched',
+	stale: '❌ stale',
+};
 
-function verificationTable({ handoff, words }: RenderContext): string[] {
+function verification(handoff: ReviewHandoff): string[] {
+	const docs = handoff.docsChecked
+		.map((d) => `\`${d.path}\` ${DOC_STATUS_LABELS[d.status]}${d.note ? ` (${d.note})` : ''}`)
+		.join(' · ');
 	return [
-		`| ${cell(words.columnCommand)} | ${cell(words.columnResult)} |`,
+		'## Verification',
+		'',
+		'| Command | Result |',
 		'| --- | --- |',
 		...handoff.verification.map(
-			(v) =>
-				`| \`${cell(v.command)}\` | ${v.outcome === 'passed' ? words.outcomePassed : `**${words.outcomeFailed}**`} |`,
+			(v) => `| \`${cell(v.command)}\` | ${v.outcome === 'passed' ? 'passed' : '**failed**'} |`,
 		),
+		'',
+		`**Docs checked** — ${docs}`,
+		...(handoff.preExisting.length === 0
+			? []
+			: ['', `**Pre-existing, not from this PR** — ${handoff.preExisting.join(' · ')}`]),
+		'',
 	];
-}
-
-function docsChecked({ handoff, words }: RenderContext): string {
-	return handoff.docsChecked
-		.map((d) => {
-			const [mark, word] = DOC_STATUS_LABELS[d.status];
-			return `\`${d.path}\` ${mark} ${words[word]}${d.note ? ` (${d.note})` : ''}`;
-		})
-		.join(' · ');
-}
-
-function preExisting({ handoff, words }: RenderContext): string[] {
-	if (handoff.preExisting.length === 0) return [];
-	return [`**${words.preExisting}** — ${handoff.preExisting.join(' · ')}`];
 }
 
 /**
@@ -273,14 +224,16 @@ function preExisting({ handoff, words }: RenderContext): string[] {
  * essentially every review, in which case the body is byte-identical to what it
  * was before this section existed.
  */
-function absorbedSection({ handoff, words }: RenderContext): string[] {
+function absorbedSection(handoff: ReviewHandoff): string[] {
 	if (handoff.absorbed.length === 0) return [];
 	return [
-		`## ${words.absorbedHeading}`,
+		'## Scope absorbed from another task',
 		'',
-		words.absorbedIntro,
+		'The reviewer traced the whole scope of the task(s) below through this diff, so this pull',
+		'request delivers them too. Nothing is closed by this review: the declaration is recorded',
+		'here and on the run, for the merge that settles them.',
 		'',
-		`| ${cell(words.columnTask)} | ${cell(words.columnDelivers)} |`,
+		'| Task | What this PR delivers for it |',
 		'| --- | --- |',
 		// Both cells are agent-authored, and `evidence` in particular is prose that
 		// may carry a `|` or a newline.
@@ -291,33 +244,25 @@ function absorbedSection({ handoff, words }: RenderContext): string[] {
 	];
 }
 
-function findingLabels(finding: ReviewFinding, words: ReviewReportVocabulary) {
-	return {
-		severity: words[SEVERITY_WORDS[finding.severity]],
-		category: words[CATEGORY_WORDS[finding.category]],
-	};
-}
-
 /** The blocking tier: full slots, because a blocker has to be demonstrable to act on. */
-function blockingFinding(finding: ReviewFinding, words: ReviewReportVocabulary): string[] {
-	const { severity, category } = findingLabels(finding, words);
+function blockingFinding(finding: ReviewFinding): string[] {
 	return [
-		`## ${finding.id} · ${severity} · ${category} — ${finding.title}`,
+		`## ${finding.id} · ${finding.severity} · ${finding.category} — ${finding.title}`,
 		'',
-		`**${words.evidence}.** ${finding.evidence}`,
+		`**Evidence.** ${finding.evidence}`,
 		'',
-		`**${words.failureScenario}.** ${finding.failureScenario}`,
+		`**Failure scenario.** ${finding.failureScenario}`,
 		'',
-		`**${words.impact}.** ${finding.impact}`,
+		`**Impact.** ${finding.impact}`,
 		'',
-		`**${words.fixPlan}.**`,
+		'**Fix plan.**',
 		'',
 		// The refinement guarantees all four blocking slots are present; the `??`
 		// is only for the type checker, which cannot see a `superRefine`. The three
 		// string slots above need no equivalent — they interpolate as-is.
 		...(finding.fixPlan ?? []).map((step, index) => `${index + 1}. ${step}`),
 		'',
-		`**${words.tests}.**`,
+		'**Tests.**',
 		'',
 		// Bulleted rather than numbered, unlike the fix plan above: tests to add are
 		// a set, not ordered steps. Same `??` for the same reason.
@@ -327,15 +272,10 @@ function blockingFinding(finding: ReviewFinding, words: ReviewReportVocabulary):
 }
 
 /** The compact tier: one paragraph, with the optional justification for the downgrade. */
-function compactFinding(finding: ReviewFinding, words: ReviewReportVocabulary): string[] {
-	const { severity, category } = findingLabels(finding, words);
-	const head = `**${finding.id}** · ${severity} · ${category} · ${finding.evidence} — ${finding.suggestion}`;
+function compactFinding(finding: ReviewFinding): string[] {
+	const head = `**${finding.id}** · ${finding.severity} · ${finding.category} · ${finding.evidence} — ${finding.suggestion}`;
 	if (!finding.downgradeRationale) return [head, ''];
-	return [
-		head,
-		`*${fillLabel(words.downgradeRationale, { severity })}* ${finding.downgradeRationale}`,
-		'',
-	];
+	return [head, `*Why it is ${finding.severity}, not major:* ${finding.downgradeRationale}`, ''];
 }
 
 /**
@@ -345,108 +285,60 @@ function compactFinding(finding: ReviewFinding, words: ReviewReportVocabulary): 
  * dispatches Respond-to-review, whose prompt addresses every point including
  * minors.
  */
-function unansweredNote(context: RenderContext): string[] {
+function unansweredNote(context: ReviewBodyContext): string[] {
 	if (context.minorsAnswered || context.handoff.verdict !== 'approve') return [];
-	return [context.words.unansweredNote, ''];
+	return [
+		'These are not blocking and **no agent will act on them**: an `approve` review is skipped by',
+		"the Respond-to-review trigger under this project's `pipeline.respondToReview.skipOnMinors`,",
+		'so they are notes for a human.',
+		'',
+	];
 }
 
 /** The compact-tier region, under its own heading depending on whether blockers precede it. */
-function nonBlockingSection(context: RenderContext, findings: ReviewFinding[]): string[] {
-	const { words } = context;
+function nonBlockingSection(context: ReviewBodyContext, findings: ReviewFinding[]): string[] {
 	const minors = findings.filter((f) => f.severity === 'minor');
 	const nits = findings.filter((f) => f.severity === 'nit');
 	const heading =
 		context.handoff.findings.length === findings.length
-			? [`## ${words.findingsHeading}`, '', words.nothingBlocking, '', ...unansweredNote(context)]
-			: [`## ${words.minorAndNitsHeading}`, '', ...unansweredNote(context)];
-	const compact = (list: ReviewFinding[]) => list.flatMap((f) => compactFinding(f, words));
+			? ['## Findings', '', 'Nothing blocking.', '', ...unansweredNote(context)]
+			: ['## Minor & nits', '', ...unansweredNote(context)];
 	return [
 		...heading,
-		...(minors.length > 0 ? [`### ${words.minorHeading}`, '', ...compact(minors)] : []),
-		...(nits.length > 0 ? [`### ${words.nitsHeading}`, '', ...compact(nits)] : []),
+		...(minors.length > 0 ? ['### Minor', '', ...minors.flatMap(compactFinding)] : []),
+		...(nits.length > 0 ? ['### Nits', '', ...nits.flatMap(compactFinding)] : []),
 	];
 }
 
 /**
- * The blocking findings in full and the minors and nits compact. Findings are
- * ordered blocker → major → minor → nit so the reader meets the blocking work
- * first; within one severity the agent's own order is kept. An approval with
- * nothing to report still carries the findings section ("None."), in the
- * non-blocking slot, so every verdict reads as one format.
+ * Render the review body. Findings are ordered blocker → major → minor → nit so
+ * the reader meets the blocking work first; within one severity the agent's own
+ * order is kept.
  */
-function findingSlots(context: RenderContext): { blocking: string[]; other: string[] } {
-	const { handoff, words } = context;
+export function renderReviewBody(context: ReviewBodyContext): string {
+	const { handoff } = context;
 	const ordered = [...handoff.findings].sort(
 		(a, b) => SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity],
 	);
 	const blocking = ordered.filter((f) => isBlockingSeverity(f.severity));
 	const nonBlocking = ordered.filter((f) => !isBlockingSeverity(f.severity));
-	return {
-		blocking:
-			blocking.length > 0 ? ['---', '', ...blocking.flatMap((f) => blockingFinding(f, words))] : [],
-		other:
-			handoff.findings.length === 0
-				? [`## ${words.findingsHeading}`, '', words.noFindingsAtAll]
-				: nonBlocking.length > 0
-					? nonBlockingSection(context, nonBlocking)
-					: [],
-	};
-}
 
-/** A slot's lines as one block, without the trailing blank lines the layout supplies itself. */
-function block(lines: readonly string[]): string {
-	return lines.join('\n').replace(/\n+$/, '');
-}
-
-/** Every slot's content for this review; an empty string is a slot with nothing to say. */
-function renderSlots(context: RenderContext): Record<ReviewReportSlot, string> {
-	const { handoff, headSha, words } = context;
-	const findings = findingSlots(context);
-	return {
-		pass: passLabel(context),
-		verdict: words[VERDICT_WORDS[handoff.verdict]],
-		head: headSha,
-		findings_summary:
-			handoff.carried.length > 0 ? carriedSummary(context) : findingsSummary(context),
-		summary: handoff.summary,
-		disposition: block(disposition(context)),
-		verification: block(verificationTable(context)),
-		docs_checked: docsChecked(context),
-		pre_existing: block(preExisting(context)),
-		absorbed: block(absorbedSection(context)),
-		blocking_findings: block(findings.blocking),
-		other_findings: block(findings.other),
-	};
-}
-
-/**
- * Place the slots into the layout in one pass — so a `{slot}` written inside
- * agent text is never itself substituted — then append, in slot order, every slot
- * with content the layout does not place.
- */
-function fillLayout(layout: string, slots: Record<ReviewReportSlot, string>): string {
-	const isSlot = (name: string): name is ReviewReportSlot => Object.hasOwn(slots, name);
-	const placed = new Set<string>();
-	const filled = layout.replace(/\{(\w+)\}/g, (match, name: string) => {
-		if (!isSlot(name)) return match;
-		placed.add(name);
-		return slots[name];
-	});
-	const missing = REVIEW_REPORT_SLOTS.filter((slot) => !placed.has(slot) && slots[slot] !== '');
-	return [filled, ...missing.map((slot) => slots[slot])].join('\n\n');
-}
-
-/**
- * Render the review body: the project's layout (or SWARM's default) with every slot
- * filled, in the project's wording when the layout is its own.
- */
-export function renderReviewBody(context: ReviewBodyContext): string {
-	const words =
-		context.layout === undefined
-			? ENGLISH_REVIEW_REPORT_VOCABULARY
-			: resolveReviewReportVocabulary(context.handoff.reportLabels);
-	const slots = renderSlots({ ...context, words });
-	return fillLayout(context.layout ?? DEFAULT_REVIEW_REPORT, slots)
+	return [
+		...header(context),
+		'## Scope',
+		'',
+		handoff.summary,
+		'',
+		...disposition(handoff.carried),
+		...verification(handoff),
+		...absorbedSection(handoff),
+		...(blocking.length > 0 ? ['---', '', ...blocking.flatMap(blockingFinding)] : []),
+		...(nonBlocking.length > 0 ? nonBlockingSection(context, nonBlocking) : []),
+		// An approval with nothing to report still carries the section, so every
+		// verdict reads as one format.
+		...(handoff.findings.length === 0 ? ['## Findings', '', 'None.'] : []),
+	]
+		.join('\n')
 		.replace(/\n{3,}/g, '\n\n')
 		.trimEnd();
 }

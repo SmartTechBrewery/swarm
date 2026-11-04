@@ -64,7 +64,6 @@
  */
 
 import { getPersonaToken } from '@/config/provider.js';
-import { normalizeReviewReport } from '@/config/review-report.js';
 import type { ProjectConfig } from '@/config/schema.js';
 import {
 	abandonReviewVerdict as abandonReviewVerdictDefault,
@@ -83,7 +82,11 @@ import { agentRunError, agentRunFailed } from '@/harness/agent-failure.js';
 import type { ReasoningLevel } from '@/harness/models.js';
 import { requireProjectSCMProvider } from '@/integrations/scm/registry.js';
 import { logger } from '@/lib/logger.js';
-import { buildReviewHandoffRepairPrompt, buildReviewPrompt } from '@/pipeline/prompts/review.js';
+import {
+	buildReviewHandoffRepairPrompt,
+	buildReviewPrompt,
+	type ReviewReportFacts,
+} from '@/pipeline/prompts/review.js';
 import {
 	acquireResumableWorktree,
 	cleanupUnlessPreserved,
@@ -91,8 +94,9 @@ import {
 	sessionRunArgs,
 	shouldPreserveForResume,
 } from '@/pipeline/resume.js';
-import { renderReviewBody } from '@/pipeline/review-body.js';
+import { passLabel, renderReviewBody } from '@/pipeline/review-body.js';
 import type { ReviewVerdictLedger } from '@/pipeline/review-ledger.js';
+import { reviewReportProblem } from '@/pipeline/review-report.js';
 import type { RecoveryMode } from '@/queue/jobs.js';
 import {
 	DeliveryDeferredError,
@@ -103,6 +107,7 @@ import {
 	LegacyReviewHandoffSchema,
 	loadDeliveryProgress,
 	type ReviewAbsorbed,
+	type ReviewHandoff,
 	ReviewHandoffSchema,
 	readHandoff,
 	resumedDeliveryAgent,
@@ -458,7 +463,7 @@ async function produceReviewAgentResult(
 				{ repo: repository, prNumber, headSha, baseBranch: context.baseBranch },
 				customPrompt,
 				isReReview,
-				reviewReportLayout(project),
+				reviewReportFacts(project, passOrdinal, isReReview),
 			),
 		],
 		// `gh` reads GH_TOKEN ahead of any ambient `gh auth` login, so every gh
@@ -476,8 +481,8 @@ async function produceReviewAgentResult(
 interface RepairReviewHandoffParams {
 	validationError: string;
 	isReReview: boolean;
-	/** The project's review report layout, so the repair keeps the report's language (issue #1288). */
-	reviewReport?: string;
+	/** What the report's header states that only SWARM knows (issue #1321). */
+	report: ReviewReportFacts;
 	cli: AgentCli;
 	model?: string;
 	reasoning?: ReasoningLevel;
@@ -532,11 +537,7 @@ async function repairReviewHandoff(
 			resumeSessionId: params.resumeSessionId,
 			cwd: params.worktreePath,
 			args: [
-				buildReviewHandoffRepairPrompt(
-					params.validationError,
-					params.isReReview,
-					params.reviewReport,
-				),
+				buildReviewHandoffRepairPrompt(params.validationError, params.isReReview, params.report),
 			],
 			maxOutputBytes: MAX_AGENT_OUTPUT_BYTES,
 			logContext: { taskId, phase: 'review-handoff-repair', prNumber, headSha },
@@ -585,12 +586,29 @@ function minorsAreAnswered(project: ProjectConfig): boolean {
 }
 
 /**
- * The project's own review report layout (issue #1288), or `undefined` for SWARM's
- * default. Normalized again here, not only by the config schema, so a value equal to
- * the default can never switch a review onto the translated-wording path.
+ * An operator-forced re-review (issue #511) runs at an ordinal above the automatic
+ * cap, having been granted exactly one extra slot — so the pass label states the
+ * cap this pass actually ran under ("pass 4 of 4 — final permitted verdict")
+ * rather than the nonsensical "pass 4 of 3". An ordinary pass is at or below the
+ * cap, so this is a no-op for it.
  */
-function reviewReportLayout(project: ProjectConfig): string | undefined {
-	return normalizeReviewReport(project.agents?.review?.reviewReport);
+function effectiveCap(ordinal: number): number {
+	return Math.max(REVIEW_VERDICT_CAP, ordinal);
+}
+
+/**
+ * What the agent-written report's header states that only SWARM knows (issue
+ * #1321) — the same pass label and note the fallback renderer would write.
+ */
+function reviewReportFacts(
+	project: ProjectConfig,
+	ordinal: number,
+	isReReview: boolean,
+): ReviewReportFacts {
+	return {
+		passLabel: passLabel({ ordinal, cap: effectiveCap(ordinal), isReReview }),
+		minorsAnswered: minorsAreAnswered(project),
+	};
 }
 
 /**
@@ -610,8 +628,6 @@ interface ReviewSubmissionContext {
 	ordinal: number;
 	isReReview: boolean;
 	minorsAnswered: boolean;
-	/** The project's review report layout, or `undefined` for SWARM's default (issue #1288). */
-	layout?: string;
 	/** Accept a pre-#470 hand-off — set only when resuming a delivery (see below). */
 	allowLegacy: boolean;
 	/**
@@ -642,7 +658,33 @@ interface ReviewSubmission {
 	absorbed?: ReviewAbsorbed[];
 }
 
-/** Parse the structured hand-off and render the body SWARM will post. Throws if it doesn't validate. */
+/**
+ * The body to post: the report the agent wrote (issue #1321) when it agrees with
+ * the hand-off, and otherwise the one SWARM renders from the hand-off's fields —
+ * the report every review posted before the agent wrote its own, so a report that
+ * drifted from the verdict or left out a blocking finding never reaches the PR.
+ */
+function reviewBody(handoff: ReviewHandoff, context: ReviewSubmissionContext): string {
+	const { report } = handoff;
+	const problem =
+		report === undefined ? 'no report was written' : reviewReportProblem(report, handoff);
+	if (report !== undefined && problem === undefined) return report;
+	logger.warn("Review — posting SWARM's rendered report instead of the agent's", {
+		headSha: context.headSha,
+		cli: context.cli,
+		reason: problem,
+	});
+	return renderReviewBody({
+		handoff,
+		headSha: context.headSha,
+		ordinal: context.ordinal,
+		cap: effectiveCap(context.ordinal),
+		isReReview: context.isReReview,
+		minorsAnswered: context.minorsAnswered,
+	});
+}
+
+/** Parse the structured hand-off and choose the body SWARM will post. Throws if it doesn't validate. */
 function renderSubmission(
 	worktreePath: string,
 	context: ReviewSubmissionContext,
@@ -651,20 +693,7 @@ function renderSubmission(
 	return {
 		verdict: handoff.verdict,
 		absorbed: handoff.absorbed.length > 0 ? handoff.absorbed : undefined,
-		body: renderReviewBody({
-			handoff,
-			headSha: context.headSha,
-			ordinal: context.ordinal,
-			// An operator-forced re-review (issue #511) runs at an ordinal above the
-			// automatic cap, having been granted exactly one extra slot — so the pass
-			// label states the cap this pass actually ran under ("pass 4 of 4 — final
-			// permitted verdict") rather than the nonsensical "pass 4 of 3". An
-			// ordinary pass is at or below the cap, so this is a no-op for it.
-			cap: Math.max(REVIEW_VERDICT_CAP, context.ordinal),
-			isReReview: context.isReReview,
-			minorsAnswered: context.minorsAnswered,
-			layout: context.layout,
-		}),
+		body: reviewBody(handoff, context),
 	};
 }
 
@@ -895,12 +924,11 @@ export async function runReviewPhase(options: RunReviewPhaseOptions): Promise<Re
 			ordinal: passOrdinal,
 			isReReview,
 			minorsAnswered: minorsAreAnswered(project),
-			layout: reviewReportLayout(project),
 			allowLegacy: deliveryResumed,
 			repairResumesSession: repairResumeId !== undefined,
 			repair: reviewRepairStep({
 				isReReview,
-				reviewReport: reviewReportLayout(project),
+				report: { ...reviewReportFacts(project, passOrdinal, isReReview), headSha },
 				cli,
 				model,
 				reasoning,

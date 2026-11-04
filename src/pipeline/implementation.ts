@@ -19,7 +19,7 @@
  * agent performs no git or GitHub write at all: it leaves a prepared tree plus a
  * structured hand-off (`HANDOFF_FILENAMES.implementation`, mirroring how the
  * Planning phase reads `proposed_plan.md`), and *SWARM* commits, pushes and opens
- * the PR through `ScmDeliveryProvider`. The PR body is the project's description
+ * the PR through `ScmDeliveryProvider`. The PR body is SWARM's built-in description
  * structure filled in by the agent (issue #1277), followed by a line SWARM adds
  * itself: `Closes: #<n>` when the PR can close the card's linked issue, otherwise
  * `Work item: [<key>](<url>)` (`./pull-request-description.ts`); the comment this
@@ -64,7 +64,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { getPersonaToken } from '@/config/provider.js';
-import { resolvePullRequestDescription } from '@/config/pull-request-description.js';
 import type { ProjectConfig } from '@/config/schema.js';
 import {
 	type AgentCli,
@@ -717,10 +716,6 @@ export async function runImplementationPhase(
 								// Asked for only while the branch is undecided (issue #1241).
 								branchPattern: decidedBranch ? undefined : branchPattern,
 								commitSubjectNaming: project,
-								// The project's description structure, or SWARM's default (issue #1277).
-								pullRequestDescription: resolvePullRequestDescription(
-									project.agents?.implementation?.pullRequestDescription,
-								),
 							},
 							customPrompt,
 						),
