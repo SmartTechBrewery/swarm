@@ -1,6 +1,6 @@
 /**
- * How to name *this* installation's `swarm` / `swarm-worker-agent` in a command the
- * CLI prints for the operator to run next (issue #1221).
+ * How to name *this* installation's `swarm` / `swarm-worker-agent` / `swarm-launcher`
+ * in a command the CLI prints for the operator to run next (issue #1221).
  *
  * One machine can serve two installations (docs/onboarding-worker.md → "Serving a
  * second installation from the same machine"). Only one of them can be the bare
@@ -27,6 +27,19 @@ export function swarmCommand(
 ): string {
 	const own = join(installRoot, 'bin', 'swarm.js');
 	return resolvesToOwn('swarm', own, env) ? 'swarm' : `node ${shellQuote(own)}`;
+}
+
+/**
+ * `swarm-launcher`, or `node <install-root>/bin/swarm-launcher.js` when `PATH`'s is
+ * another installation's — the command a profile-based worker is started with
+ * (issue #1296), named exactly as {@link swarmCommand} names `swarm`.
+ */
+export function launcherCommand(
+	env: NodeJS.ProcessEnv = process.env,
+	installRoot = REPO_ROOT,
+): string {
+	const own = join(installRoot, 'bin', 'swarm-launcher.js');
+	return resolvesToOwn('swarm-launcher', own, env) ? 'swarm-launcher' : `node ${shellQuote(own)}`;
 }
 
 /** `swarm-worker-agent`, or `<install-root>/bin/swarm-worker-agent` when `PATH`'s is another installation's. */

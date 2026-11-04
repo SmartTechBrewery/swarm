@@ -313,9 +313,26 @@ started on is used if it is still installed; otherwise the launcher exits 1 with
 reason. The signing key it trusts is `deploy/worker-runtime/minisign.pub` under the
 launcher's own install; without that file it installs nothing new and still starts
 versions already installed. For now the launcher runs from a SWARM build
-(`npm run build`, then `bin/swarm-launcher.js`), and profiles are written by hand or
-by code — writing them from the operator CLI, launchd and a clone-free launcher come
-in later phases. `swarm run:worker` and `npm run dev:worker` are unchanged.
+(`npm run build`, then `bin/swarm-launcher.js`); launchd and a clone-free launcher
+come in later phases. `swarm run:worker` and `npm run dev:worker` are unchanged.
+
+The operator CLI writes profiles (issue #1296): `swarm workers setup --profile` and
+`swarm workers register-and-enroll … --profile` register, enroll and credential the
+worker exactly as without the flag, but put its credential, checkouts and
+control-plane URL (from `--control-plane-url`, else the environment, else `.env`) in
+the profile instead of the per-checkout credential cache. They write no `.env` and
+do not refuse one that names another installation, print no worker credential, and
+end with the `swarm-launcher run <workerId>` that starts the worker (no autostart
+yet). They refuse a checkout that already has a cached worker, or that a profile
+already serves for the same installation. From then on every `swarm workers`
+command that takes a `<worker-id>` (`drain`, `undrain`, `update <worker-id>`,
+`set-cli`, `set-scm-credential`, `remove`, `sweep-worktrees`, `enroll`,
+`update-enrollment`, `approve`, `consent`) talks to the installation that worker's
+profile names, using the session `swarm login --control-plane-url <that URL>`
+cached, and refuses an exported `SWARM_CONTROL_PLANE_URL` that names another one.
+`add-checkout` / `remove-checkout` in its primary checkout edit the profile, and
+`swarm run:worker` there exits 1 naming `swarm-launcher run <workerId>`. A worker
+with no profile on the machine is handled exactly as before.
 
 **One worker can serve several repositories on one machine** (issue #1059) — one
 checkout per repository, one daemon. Give it the extra checkouts at registration
@@ -340,7 +357,10 @@ through a clone's `bin/swarm.js`, `run:worker` included, falls back to
 `SWARM_CONTROL_PLANE_URL` in that clone's `.env` when the environment exports none
 (issue #1214's precedence). So the second clone's commands and its LaunchAgent
 reach the second installation with nothing exported and the first clone's `.env`
-untouched, as long as the shell does not export the first installation's URL. See
+untouched, as long as the shell does not export the first installation's URL. A
+profile-based worker (`workers setup --profile`, issue #1296) is the alternative
+that needs no second clone: its profile, not a clone's `.env`, names the
+installation it serves. See
 [`docs/onboarding-worker.md`](./onboarding-worker.md#serving-a-second-installation-from-the-same-machine).
 
 The operator's own source-control credential is **not** among them: it is stored
@@ -1709,6 +1729,11 @@ swarm-worker-agent update
 npm run swarm -- login
 npm run swarm -- login --status
 npm run swarm -- login --logout
+
+# A profile-based worker (no SWARM clone; see "Profile-based workers" above):
+# register it into ~/.swarm/workers/<worker-id>/profile.json, then start it
+npm run swarm -- workers setup --profile --control-plane-url <url>
+swarm-launcher run <worker-id>
 
 # Read runs over the same session — no DATABASE_URL, no browser
 npm run swarm -- run list --status failed --since 24h

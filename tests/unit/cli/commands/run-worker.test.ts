@@ -1,4 +1,5 @@
-import { readFileSync, realpathSync } from 'node:fs';
+import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from 'vitest';
 
@@ -6,6 +7,17 @@ const { runCommand } = vi.hoisted(() => ({ runCommand: vi.fn() }));
 const { readWorkerCredentialCache, workerCredentialCachePath } = vi.hoisted(() => ({
 	readWorkerCredentialCache: vi.fn(),
 	workerCredentialCachePath: vi.fn(),
+}));
+
+// Worker profiles (issue #1296) are read for real from a throwaway home directory;
+// `homedir()` throws outside one, so no test can read the developer's own.
+const { fakeHome } = vi.hoisted(() => ({ fakeHome: { dir: '' } }));
+vi.mock('node:os', async (importOriginal) => ({
+	...(await importOriginal<typeof import('node:os')>()),
+	homedir: () => {
+		if (!fakeHome.dir) throw new Error('no test home directory is set');
+		return fakeHome.dir;
+	},
 }));
 
 vi.mock('@/cli/_shared/exec.js', () => ({ runCommand }));
@@ -16,6 +28,7 @@ vi.mock('@/cli/_shared/worker-credential-cache.js', () => ({
 
 import { REPO_ROOT } from '@/cli/_shared/paths.js';
 import { daemonNodeArgs, run } from '@/cli/commands/run-worker.js';
+import { writeWorkerProfile } from '@/launcher/worker-profile.js';
 
 const WORKER_ID = '11111111-1111-4111-8111-111111111111';
 /** What the command derives from its invocation directory — the same canonicalization the cache keys on. */
@@ -38,6 +51,7 @@ describe('swarm run:worker', () => {
 
 	beforeEach(() => {
 		delete process.env.INIT_CWD;
+		fakeHome.dir = mkdtempSync(join(tmpdir(), 'swarm-run-worker-home-'));
 		// Typed through a loose view of `process`: the real signature returns `never`, which
 		// leaves nothing for `mockImplementation` to accept.
 		execve = vi
@@ -60,6 +74,8 @@ describe('swarm run:worker', () => {
 	});
 
 	afterEach(() => {
+		rmSync(fakeHome.dir, { recursive: true, force: true });
+		fakeHome.dir = '';
 		vi.restoreAllMocks();
 		if (ORIGINAL_INIT_CWD === undefined) delete process.env.INIT_CWD;
 		else process.env.INIT_CWD = ORIGINAL_INIT_CWD;
@@ -195,6 +211,27 @@ describe('swarm run:worker', () => {
 		expect(printed().some((line) => line.includes('npm run dev:worker'))).toBe(true);
 		expect(runCommand).not.toHaveBeenCalled();
 		expect(execve).not.toHaveBeenCalled();
+	});
+
+	// Issue #1296: a profile worker is the launcher's to start, on the installation its
+	// profile names — never this clone's daemon on this clone's `.env`.
+	it('refuses a checkout only a profile serves, naming swarm-launcher run', async () => {
+		readWorkerCredentialCache.mockReturnValue(null);
+		writeWorkerProfile({
+			workerId: WORKER_ID,
+			controlPlaneUrl: 'https://swarm.example.com',
+			credential: 'raw-credential-token',
+			repoRoots: [CWD],
+			homeDir: fakeHome.dir,
+		});
+		expect(await run([])).toBe(1);
+		expect(execve).not.toHaveBeenCalled();
+		expect(runCommand).not.toHaveBeenCalled();
+		expect(printed()).toContainEqual(
+			expect.stringMatching(new RegExp(`swarm-launcher(\\.js)? run ${WORKER_ID}`)),
+		);
+		expect(error).not.toHaveBeenCalledWith(expect.stringContaining('no worker registered'));
+		expect(printed().some((line) => line.includes('raw-credential-token'))).toBe(false);
 	});
 
 	it('reports an unreadable cache entry distinctly, naming the file', async () => {

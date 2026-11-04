@@ -104,10 +104,20 @@
  * project id and the operator credential, and ends by installing the worker under
  * the host's process supervisor instead of printing a start line.
  *
+ * Both of those take `--profile` (issue #1296): the worker is registered exactly
+ * the same way, but its credential, its checkouts and the installation it serves
+ * go into a worker profile (`../../launcher/worker-profile.ts`) that
+ * `swarm-launcher run <worker-id>` starts it from, instead of into this
+ * checkout's credential cache — and this checkout's `.env` is neither written nor
+ * consulted for a conflict, since that daemon reads none. Every subcommand that
+ * acts on one `<worker-id>` then resolves that worker's installation from its
+ * profile when this machine holds one, so a profile worker is managed from any
+ * clone; a worker with no profile here resolves exactly as before.
+ *
  * Subcommands:
- *   swarm workers setup [--project <id>] [--name <displayName>] [--cli <c1,c2,...>] [--control-plane-url <url>] [--no-autostart]
+ *   swarm workers setup [--project <id>] [--name <displayName>] [--cli <c1,c2,...>] [--control-plane-url <url>] [--no-autostart] [--profile]
  *   swarm workers register <owner-identifier> --name <displayName> --cli <c1,c2,...> [--extra-checkout <path>]...
- *   swarm workers register-and-enroll <owner-identifier> <project-id> --name <displayName> --cli <c1,c2,...> [--control-plane-url <url>] [--repo-root <path>] [--extra-checkout <path>]...
+ *   swarm workers register-and-enroll <owner-identifier> <project-id> --name <displayName> --cli <c1,c2,...> [--control-plane-url <url>] [--repo-root <path>] [--extra-checkout <path>]... [--profile]
  *   swarm workers add-checkout <path>
  *   swarm workers remove-checkout <path>
  *   swarm workers list [<owner-identifier>]
@@ -135,6 +145,12 @@ import { createInterface } from 'node:readline/promises';
 import { parseArgs } from 'node:util';
 import { z } from 'zod';
 import { type AgentCli, AgentCliSchema } from '../../harness/agent-cli.js';
+import {
+	listWorkerProfiles,
+	updateWorkerProfileRepoRoots,
+	workerProfilePath,
+	writeWorkerProfile,
+} from '../../launcher/worker-profile.js';
 import { describeError } from '../../lib/errors.js';
 import { operatorCredentialCopyFor } from '../../scm/operator-credential-copy.js';
 import { repoSlugsMatch, resolveDeclarableOriginRepoSlug } from '../../scm/repo-slug.js';
@@ -142,14 +158,20 @@ import { SCM_TYPES } from '../../scm/types.js';
 import { discoverAvailableClis } from '../../transport/cli-discovery.js';
 import { canonicalCheckoutPath } from '../../worktree/checkout-key.js';
 import { ensureControlPlaneUrl } from '../_shared/control-plane-env.js';
-import { swarmCommand, workerAgentCommand } from '../_shared/installation-command.js';
+import {
+	launcherCommand,
+	swarmCommand,
+	workerAgentCommand,
+} from '../_shared/installation-command.js';
 import {
 	createOperatorClient,
 	OperatorApiError,
 	type OperatorClient,
 	type OperatorSession,
+	type RequireOperatorSessionOptions,
 	requireOperatorSession,
 } from '../_shared/operator-client.js';
+import { normalizeControlPlaneUrl } from '../_shared/operator-session-cache.js';
 import * as out from '../_shared/output.js';
 import { promptHidden, readStdin } from '../_shared/secret-input.js';
 import { installWorkerAutostart, type WorkerAutostartResult } from '../_shared/worker-autostart.js';
@@ -174,9 +196,9 @@ const SCM_PROVIDER_IDS = SCM_TYPES;
 const USAGE = `swarm workers — register and manage local workers (identity + declared CLIs)
 
 Usage:
-  swarm workers setup [--project <id>] [--name <displayName>] [--cli <c1,c2,...>] [--control-plane-url <url>] [--no-autostart]
+  swarm workers setup [--project <id>] [--name <displayName>] [--cli <c1,c2,...>] [--control-plane-url <url>] [--no-autostart] [--profile]
   swarm workers register <owner-identifier> --name <displayName> --cli <c1,c2,...> [--extra-checkout <path>]...
-  swarm workers register-and-enroll <owner-identifier> <project-id> --name <displayName> --cli <c1,c2,...> [--control-plane-url <url>] [--repo-root <path>] [--extra-checkout <path>]...
+  swarm workers register-and-enroll <owner-identifier> <project-id> --name <displayName> --cli <c1,c2,...> [--control-plane-url <url>] [--repo-root <path>] [--extra-checkout <path>]... [--profile]
   swarm workers add-checkout <path>
   swarm workers remove-checkout <path>
   swarm workers list [<owner-identifier>]
@@ -209,6 +231,10 @@ Usage:
              and --no-autostart stops short of starting it. Refused in a checkout
              that already has a worker registered — it never issues a second one.
              The worker credential is cached for this checkout and not printed.
+             With --profile it registers the same way but writes a worker
+             profile instead (see --profile below), and ends by printing the
+             swarm-launcher run <worker-id> that starts it: autostart for a
+             profile worker is not available yet.
   register   Register a worker for an owner (by login handle) with a display
              name and declared CLIs (--cli, comma-separated, one or more of
              ${AGENT_CLIS.join(' | ')}). Prints a worker credential ONCE — store
@@ -257,6 +283,25 @@ Usage:
              for that same checkout, exactly as register does. --extra-checkout
              (repeatable) is taken exactly as register takes it, and each one
              follows the primary checkout in the printed SWARM_WORKER_REPO_ROOT.
+             With --profile, see below: nothing is written to .env and the
+             credential is not printed.
+  --profile  (setup, register-and-enroll) Make a PROFILE-BASED worker, which
+             runs without this clone: it is registered exactly as without the
+             flag, but its credential, its checkouts (primary first) and the
+             control-plane URL it was registered on go into
+             ~/.swarm/workers/<worker-id>/profile.json (700/600) instead of this
+             checkout's credential cache, and it is started with
+             swarm-launcher run <worker-id>. The URL is taken from
+             --control-plane-url, else the environment, else .env — and .env is
+             never written, nor refused for naming another installation. The
+             credential is never printed (unless the profile cannot be written,
+             when it is the only copy). Refused in a checkout that already has a
+             worker cached, or that a profile already serves for the same
+             installation; serving another installation from it is allowed, but
+             the checkout lock lets only one of them run there at a time. Every
+             command below that takes a <worker-id> then acts on the
+             installation that worker's profile names, refusing a
+             SWARM_CONTROL_PLANE_URL that names another one.
   add-checkout
              Give the worker registered for the checkout you are standing in (its
              PRIMARY checkout) another repository checkout on this machine, so the
@@ -269,7 +314,9 @@ Usage:
              next handshake. This is how an EXISTING worker gains a repository;
              re-registering would issue a new worker and lose its enrollments and
              operator credentials. Enroll it in that repository's project as
-             usual if it is not already.
+             usual if it is not already. In the primary checkout of a
+             profile-based worker it edits that worker's profile instead, and the
+             restart is swarm-launcher run <worker-id>.
   remove-checkout
              Drop one of the extra checkouts add-checkout or --extra-checkout
              recorded, from the worker's primary checkout. The primary checkout
@@ -453,6 +500,9 @@ Requires SWARM_CONTROL_PLANE_URL (from the environment, or this checkout's .env)
 and a \`swarm login\` session — and no
 DATABASE_URL: every subcommand except add-checkout and remove-checkout calls the
 control plane's operator API, so this runs from the machine being onboarded. A
+command naming a <worker-id> this machine holds a profile for uses the profile's
+control plane instead, and the session \`swarm login --control-plane-url <url>\`
+caches for it. A
 worker is a local execution environment owned by a SWARM user; an enrollment
 offers it to a project, and it is routable
 only while active AND sharing consent is on.`;
@@ -791,9 +841,13 @@ interface Operator {
  * cached `swarm login` session into a client, printing the one actionable line
  * and returning `undefined` when either is missing. Called *after* a subcommand has parsed its arguments, so `--help`
  * and a usage error still answer on a machine that has never logged in.
+ *
+ * A subcommand acting on one worker passes its `workerId` (issue #1296): when this
+ * machine holds that worker's profile, the profile names the installation instead
+ * (`requireOperatorSession`).
  */
-function requireOperator(): Operator | undefined {
-	const resolved = requireOperatorSession();
+function requireOperator(options?: RequireOperatorSessionOptions): Operator | undefined {
+	const resolved = requireOperatorSession(options);
 	if ('error' in resolved) {
 		out.error(resolved.error);
 		return undefined;
@@ -906,6 +960,79 @@ function cacheCredentialForCheckout(
 	} catch (err) {
 		out.warn(`could not cache the credential for ${repoRoot}: ${describeError(err)}`);
 	}
+}
+
+/**
+ * The profile twin of {@link cacheCredentialForCheckout} (issue #1296): write the
+ * freshly issued credential into `~/.swarm/workers/<workerId>/profile.json`
+ * together with the installation it was issued by and the worker's checkouts,
+ * primary first — everything `swarm-launcher run` needs, and no per-checkout cache
+ * entry. Prints the path and the start command, never the value.
+ *
+ * Answers whether the profile was written. Unlike the cache, a profile that could
+ * not be written is the only place the credential was going to be kept, so the
+ * caller prints the credential instead when this answers `false` — registration
+ * must never strand a worker whose credential was never shown.
+ */
+function saveWorkerProfile(
+	workerId: string,
+	credential: string,
+	controlPlaneUrl: string,
+	repoRoots: readonly string[],
+): boolean {
+	try {
+		const path = writeWorkerProfile({
+			workerId,
+			controlPlaneUrl,
+			credential,
+			repoRoots: [...repoRoots],
+		});
+		out.info(
+			`saved a worker profile for ${repoRoots.join(', ')} on ${normalizeControlPlaneUrl(controlPlaneUrl)} (${path})`,
+		);
+		return true;
+	} catch (err) {
+		out.error(`could not write the worker profile for ${workerId}: ${describeError(err)}`);
+		return false;
+	}
+}
+
+/**
+ * The profile-based worker that already serves `repoRoot` for the installation at
+ * `controlPlaneUrl`, if this machine holds one (issue #1296). Only the **same**
+ * installation counts: the profile's whole point is that another installation's
+ * worker is a different worker. A profile that cannot be read is passed over — it
+ * cannot be said to serve anything.
+ */
+function profileServingCheckout(repoRoot: string, controlPlaneUrl: string): string | undefined {
+	const checkout = canonicalCheckoutPath(repoRoot);
+	const installation = normalizeControlPlaneUrl(controlPlaneUrl);
+	return listWorkerProfiles().find(
+		({ profile }) =>
+			profile?.controlPlaneUrl === installation && profile.repoRoots.includes(checkout),
+	)?.workerId;
+}
+
+/**
+ * Refuse to register a worker for a checkout a profile already serves for the same
+ * installation, printing the refusal and the command that starts the existing
+ * worker. Answers whether it refused.
+ */
+function refuseProfileServingCheckout(
+	command: string,
+	repoRoot: string,
+	controlPlaneUrl: string,
+): boolean {
+	const workerId = profileServingCheckout(repoRoot, controlPlaneUrl);
+	if (workerId === undefined) return false;
+	out.error(
+		`workers ${command}: worker ${workerId}'s profile already serves ${canonicalCheckoutPath(repoRoot)} for ${normalizeControlPlaneUrl(controlPlaneUrl)} — it never issues a second worker for one checkout`,
+	);
+	out.info(`  start it with: ${launcherCommand()} run ${workerId}`);
+	out.info(
+		`  to replace it, remove it (${swarmCommand()} workers remove ${workerId}) and delete ${workerProfilePath(workerId)}`,
+	);
+	return true;
 }
 
 /**
@@ -1322,7 +1449,7 @@ async function setCliCommand(argv: string[]): Promise<number> {
 	}
 	if (!requireWorkerId(workerId)) return 1;
 
-	const operator = requireOperator();
+	const operator = requireOperator({ workerId });
 	if (!operator) return 1;
 
 	const updated = await operator.client.mutate(
@@ -1371,7 +1498,7 @@ async function setScmCredentialCommand(argv: string[]): Promise<number> {
 	}
 	if (!requireWorkerId(workerId)) return 1;
 
-	const operator = requireOperator();
+	const operator = requireOperator({ workerId });
 	if (!operator) return 1;
 
 	// Read for the display name the prompt names, so the operator sees which machine
@@ -1406,7 +1533,7 @@ async function removeWorkerCommand(argv: string[]): Promise<number> {
 	}
 	if (!requireWorkerId(workerId)) return 1;
 
-	const operator = requireOperator();
+	const operator = requireOperator({ workerId });
 	if (!operator) return 1;
 
 	await operator.client.mutate('workers.remove', { workerId }, parseWith(RemovedWorkerSchema));
@@ -1437,7 +1564,7 @@ async function drainCommand(argv: string[], draining: boolean): Promise<number> 
 	}
 	if (!requireWorkerId(workerId)) return 1;
 
-	const operator = requireOperator();
+	const operator = requireOperator({ workerId });
 	if (!operator) return 1;
 
 	const state = await operator.client.mutate(
@@ -1516,7 +1643,7 @@ async function updateWorkerCommand(argv: string[]): Promise<number> {
 	}
 	if (!requireWorkerId(workerId)) return 1;
 
-	const operator = requireOperator();
+	const operator = requireOperator({ workerId });
 	if (!operator) return 1;
 
 	const requested = await operator.client.mutate(
@@ -1562,7 +1689,7 @@ async function sweepWorktreesCommand(argv: string[]): Promise<number> {
 	}
 	if (!requireWorkerId(workerId)) return 1;
 
-	const operator = requireOperator();
+	const operator = requireOperator({ workerId });
 	if (!operator) return 1;
 
 	const requested = await operator.client.mutate(
@@ -2260,7 +2387,7 @@ async function enrollCommand(argv: string[]): Promise<number> {
 	if (!concurrency.ok) return 1;
 	if (!requireWorkerId(workerId)) return 1;
 
-	const operator = requireOperator();
+	const operator = requireOperator({ workerId });
 	if (!operator) return 1;
 
 	// Read for the display name the report names, and so an unknown worker is
@@ -2305,6 +2432,11 @@ interface RegisterAndEnrollPlan {
 	readonly repoRoot: string;
 	/** `--extra-checkout`, validated and canonical — the worker's other checkouts (issue #1059). */
 	readonly extraRepoRoots: string[];
+	/**
+	 * `--profile` (issue #1296): keep the credential in a worker profile, with the
+	 * installation it was issued by, instead of this checkout's credential cache.
+	 */
+	readonly profile: boolean;
 }
 
 /**
@@ -2337,6 +2469,7 @@ async function planRegisterAndEnroll(
 			'control-plane-url': { type: 'string' },
 			'repo-root': { type: 'string' },
 			'extra-checkout': { type: 'string', multiple: true },
+			profile: { type: 'boolean' },
 			help: { type: 'boolean', short: 'h' },
 		},
 		allowPositionals: true,
@@ -2361,17 +2494,10 @@ async function planRegisterAndEnroll(
 	const extraRepoRoots = await validateExtraCheckouts(repoRoot, values['extra-checkout'] ?? []);
 	if (!extraRepoRoots) return { ok: false, code: 1 };
 
-	// Before `requireOperator`, which resolves SWARM_CONTROL_PLANE_URL: on a machine
-	// being onboarded for its first worker nothing has ever written it, and the
-	// daemon this command ends by printing a start line for reads it from the same
-	// `.env` — which is why a URL differing from `.env`'s is refused here rather
-	// than used. Idempotent by construction (`../_shared/control-plane-env.ts`), so
-	// a second worker on an onboarded machine passes straight through. It is the one
-	// write that precedes the plan-then-act ordering below, and deliberately: it
-	// touches nothing on the control plane, and every step after it needs the URL.
-	if (!(await ensureControlPlaneUrl(values['control-plane-url']))) return { ok: false, code: 1 };
-
-	const operator = requireOperator();
+	const profile = values.profile ?? false;
+	const operator = profile
+		? requireProfileOperator('register-and-enroll', repoRoot, values['control-plane-url'])
+		: await requireCheckoutOperator(values['control-plane-url']);
 	if (!operator) return { ok: false, code: 1 };
 
 	// The provider is a property of the *project*, resolved server-side through the
@@ -2392,8 +2518,55 @@ async function planRegisterAndEnroll(
 			...secret,
 			repoRoot,
 			extraRepoRoots,
+			profile,
 		},
 	};
+}
+
+/**
+ * The operator session a clone worker is registered with: this checkout's `.env`
+ * bootstrapped first, then the shared precedence.
+ *
+ * `ensureControlPlaneUrl` runs before `requireOperator`, which resolves
+ * SWARM_CONTROL_PLANE_URL: on a machine being onboarded for its first worker
+ * nothing has ever written it, and the daemon this command ends by printing a
+ * start line for reads it from the same `.env` — which is why a URL differing from
+ * `.env`'s is refused here rather than used. Idempotent by construction
+ * (`../_shared/control-plane-env.ts`), so a second worker on an onboarded machine
+ * passes straight through. It is the one write that precedes the plan-then-act
+ * ordering, and deliberately: it touches nothing on the control plane, and every
+ * step after it needs the URL.
+ */
+async function requireCheckoutOperator(
+	controlPlaneUrl: string | undefined,
+): Promise<Operator | undefined> {
+	if (!(await ensureControlPlaneUrl(controlPlaneUrl))) return undefined;
+	return requireOperator();
+}
+
+/**
+ * The operator session a profile-based worker is registered with (issue #1296),
+ * or `undefined` with the refusal printed.
+ *
+ * The URL is resolved by the shared precedence — `--control-plane-url`, the
+ * environment, `.env` — and goes into the profile, so this checkout's `.env` is
+ * neither bootstrapped nor held against it: the daemon `swarm-launcher run` starts
+ * reads no `.env`, so one naming another installation is no conflict. Refused, with
+ * nothing written, in a checkout that already has a clone worker cached, or that a
+ * profile already serves for the same installation — one checkout is served by one
+ * worker per installation.
+ */
+function requireProfileOperator(
+	command: string,
+	repoRoot: string,
+	controlPlaneUrl: string | undefined,
+): Operator | undefined {
+	if (alreadyRegisteredHere(command, repoRoot)) return undefined;
+	const operator = requireOperator({ controlPlaneUrl });
+	if (!operator) return undefined;
+	if (refuseProfileServingCheckout(command, repoRoot, operator.session.controlPlaneUrl))
+		return undefined;
+	return operator;
 }
 
 /**
@@ -2492,6 +2665,7 @@ async function registerAndEnrollCommand(argv: string[]): Promise<number> {
 	if (!planned.ok) return planned.code;
 	const registered = await executeRegisterAndEnroll(planned.operator, planned.plan);
 	if (!registered.ok) return registered.code;
+	if (planned.plan.profile) return reportProfileStart(registered, undefined);
 
 	// The credential's one and only appearance, on the last line — the "copy the
 	// last line" affordance docs/onboarding-worker.md relies on.
@@ -2518,7 +2692,9 @@ async function registerAndEnrollCommand(argv: string[]): Promise<number> {
 async function executeRegisterAndEnroll(
 	operator: Operator,
 	plan: RegisterAndEnrollPlan,
-): Promise<{ ok: true; workerId: string; credential: string } | { ok: false; code: number }> {
+): Promise<
+	{ ok: true; workerId: string; credential: string; saved: boolean } | { ok: false; code: number }
+> {
 	const { client } = operator;
 	const {
 		identifier,
@@ -2529,6 +2705,7 @@ async function executeRegisterAndEnroll(
 		operatorCredential,
 		repoRoot,
 		extraRepoRoots,
+		profile,
 	} = plan;
 
 	const { worker, credential } = await client.mutate(
@@ -2539,12 +2716,25 @@ async function executeRegisterAndEnroll(
 	out.info(
 		`registered worker '${worker.displayName}' for '${identifier}' (id ${worker.id}, CLIs: ${worker.capabilities.join(', ')})`,
 	);
-	cacheCredentialForCheckout(worker.id, credential, repoRoot, extraRepoRoots);
+	// A profile worker's credential is kept in its profile and never printed — unless
+	// the profile could not be written, when printing it now is the only way not to
+	// lose it (issue #1296).
+	let saved = true;
+	if (profile) {
+		saved = saveWorkerProfile(worker.id, credential, operator.session.controlPlaneUrl, [
+			repoRoot,
+			...extraRepoRoots,
+		]);
+		if (!saved) printCredential(credential);
+	} else {
+		cacheCredentialForCheckout(worker.id, credential, repoRoot, extraRepoRoots);
+	}
 
 	// From here the worker row exists and its credential is a one-time value held
 	// only in memory, so a later failure must still hand it over — losing it means
 	// `workers remove` + `workers register` again. Each recovery path names only the
-	// step that did not complete, and prints the credential exactly once, last.
+	// step that did not complete, and prints the credential exactly once, last. A
+	// profile worker's is already safe in its profile (or was just printed).
 	const reportUnfinished = (remaining: string[]): { ok: false; code: number } => {
 		out.info(
 			remaining.length > 0
@@ -2552,8 +2742,11 @@ async function executeRegisterAndEnroll(
 				: 'the worker is registered.',
 		);
 		for (const command of remaining) out.info(`  ${command}`);
-		out.info('worker credential (store it now — it will not be shown again):');
-		out.info(credential);
+		if (!profile) printCredential(credential);
+		else if (saved)
+			out.info(
+				`its credential is in its profile — once finished, start it with: ${launcherCommand()} run ${worker.id}`,
+			);
 		return { ok: false, code: 1 };
 	};
 	const swarm = swarmCommand();
@@ -2599,7 +2792,35 @@ async function executeRegisterAndEnroll(
 	}
 	if (!stored) remaining.push(`${swarm} workers set-scm-credential ${worker.id} ${providerId}`);
 	if (enrolled.code !== 0 || !stored) return reportUnfinished(remaining);
-	return { ok: true, workerId: worker.id, credential };
+	return { ok: true, workerId: worker.id, credential, saved };
+}
+
+/** The one-time worker credential, with the note that it is shown only now. */
+function printCredential(credential: string): void {
+	out.info('worker credential (store it now — it will not be shown again):');
+	out.info(credential);
+}
+
+/**
+ * How a registered profile-based worker is started (issue #1296): by
+ * `swarm-launcher run <id>`, printed with no credential. Until the launcher gains
+ * its own autostart, `setup --profile` ends here as if `--no-autostart` were given
+ * (`note` says so). A profile that could not be written leaves nothing to start
+ * from, so that is a failure — the credential has already been printed.
+ */
+function reportProfileStart(
+	registered: { workerId: string; saved: boolean },
+	note: string | undefined,
+): number {
+	if (!registered.saved) {
+		out.error(
+			`the worker is registered, but its profile could not be written, so swarm-launcher cannot start it — fix the cause, then remove it (${swarmCommand()} workers remove ${registered.workerId}) and register again, or start the daemon by hand with the credential above`,
+		);
+		return 1;
+	}
+	if (note) out.info(note);
+	out.info(`start the worker with: ${launcherCommand()} run ${registered.workerId}`);
+	return 0;
 }
 
 /**
@@ -2663,6 +2884,7 @@ async function setupCommand(argv: string[]): Promise<number> {
 			cli: { type: 'string' },
 			'control-plane-url': { type: 'string' },
 			'no-autostart': { type: 'boolean' },
+			profile: { type: 'boolean' },
 			help: { type: 'boolean', short: 'h' },
 		},
 		allowPositionals: true,
@@ -2678,13 +2900,13 @@ async function setupCommand(argv: string[]): Promise<number> {
 	}
 
 	const repoRoot = canonicalCheckoutPath(invokingCheckout());
-	if (alreadyRegisteredHere(repoRoot)) return 1;
+	if (alreadyRegisteredHere('setup', repoRoot)) return 1;
 
 	const capabilities = await setupCapabilities(values.cli);
 	if (!capabilities) return 1;
 
-	if (!(await ensureControlPlaneUrl(values['control-plane-url']))) return 1;
-	const operator = requireOperator();
+	const profile = values.profile ?? false;
+	const operator = await requireSetupOperator(profile, repoRoot, values['control-plane-url']);
 	if (!operator) return 1;
 	const identifier = operator.session.identifier;
 
@@ -2714,30 +2936,78 @@ async function setupCommand(argv: string[]): Promise<number> {
 		...secret,
 		repoRoot,
 		extraRepoRoots: [],
+		profile,
 	});
 	if (!registered.ok) return registered.code;
+	return await startSetUpWorker(registered, {
+		displayName,
+		repoRoot,
+		profile,
+		noAutostart: values['no-autostart'] ?? false,
+	});
+}
 
-	if (values['no-autostart']) {
+/**
+ * The operator session `setup` registers with — by the profile rules or by the
+ * clone's own (`requireProfileOperator` / `requireCheckoutOperator`) — or
+ * `undefined` with the refusal printed. A clone worker for a checkout a profile
+ * already serves for the same installation would be a second worker contending for
+ * one checkout lock, so that is refused either way (issue #1296).
+ */
+async function requireSetupOperator(
+	profile: boolean,
+	repoRoot: string,
+	controlPlaneUrl: string | undefined,
+): Promise<Operator | undefined> {
+	if (profile) return requireProfileOperator('setup', repoRoot, controlPlaneUrl);
+	const operator = await requireCheckoutOperator(controlPlaneUrl);
+	if (!operator) return undefined;
+	if (refuseProfileServingCheckout('setup', repoRoot, operator.session.controlPlaneUrl))
+		return undefined;
+	return operator;
+}
+
+/**
+ * Start the worker `setup` registered, as an exit code: under the host's process
+ * supervisor, or — with `--no-autostart` — not at all, naming the command that
+ * would. Autostart for a profile worker is the launcher's and arrives with it;
+ * until then `--profile` stops where `--no-autostart` does.
+ */
+async function startSetUpWorker(
+	registered: { workerId: string; saved: boolean },
+	options: { displayName: string; repoRoot: string; profile: boolean; noAutostart: boolean },
+): Promise<number> {
+	if (options.profile) {
+		return reportProfileStart(
+			registered,
+			options.noAutostart
+				? 'autostart skipped (--no-autostart)'
+				: 'autostart is not available for a profile-based worker yet',
+		);
+	}
+	if (options.noAutostart) {
 		out.info(
 			`autostart skipped (--no-autostart) — start the worker here with: ${swarmCommand()} run:worker`,
 		);
 		return 0;
 	}
-	return reportAutostart(displayName, await installWorkerAutostart(repoRoot));
+	return reportAutostart(options.displayName, await installWorkerAutostart(options.repoRoot));
 }
 
 /**
  * Whether this checkout already has a worker cached — printing the refusal when it
  * does. `setup` never registers over one: a second registration would issue a new
- * worker and strand the first one's enrollments and operator credentials.
+ * worker and strand the first one's enrollments and operator credentials. Nor does
+ * a `--profile` registration (issue #1296), which would leave two workers
+ * contending for one checkout.
  */
-function alreadyRegisteredHere(repoRoot: string): boolean {
+function alreadyRegisteredHere(command: string, repoRoot: string): boolean {
 	const cached = readWorkerCredentialCache(repoRoot);
 	if (cached !== null) {
 		out.error(
 			cached === undefined
-				? `workers setup: this checkout already has a worker credential cache entry that could not be read: ${workerCredentialCachePath(repoRoot)}`
-				: `workers setup: a worker (${cached.workerId}) is already registered for this checkout (${repoRoot})`,
+				? `workers ${command}: this checkout already has a worker credential cache entry that could not be read: ${workerCredentialCachePath(repoRoot)}`
+				: `workers ${command}: a worker (${cached.workerId}) is already registered for this checkout (${repoRoot})`,
 		);
 		const swarm = swarmCommand();
 		out.info(`  start it with: ${workerAgentCommand()} install (or ${swarm} run:worker)`);
@@ -2824,18 +3094,48 @@ export function defaultWorkerName(identifier: string, host: string, repoName: st
 		.slice(0, 80);
 }
 
+/** The worker whose checkouts `add-checkout` / `remove-checkout` edit. */
+interface WorkerHere {
+	repoRoot: string;
+	workerId: string;
+	extraRepoRoots: string[];
+	/** Whether its checkouts are recorded in a worker profile rather than this checkout's cache entry (issue #1296). */
+	profile: boolean;
+}
+
 /**
  * The worker cached for the checkout this command runs in — the worker's primary
  * checkout — or `undefined` with the refusal printed (issue #1059). The same two
  * answers `swarm run:worker` gives: no entry is a "register here" problem, an
  * unreadable entry is a different one and names its file.
+ *
+ * A checkout with no cache entry may be the primary checkout of a profile-based
+ * worker instead (issue #1296), whose checkouts its profile records. Two profiles
+ * with the same primary checkout (one per installation) cannot be told apart here,
+ * so that is refused, naming both.
  */
-function cachedWorkerHere(
-	command: string,
-): { repoRoot: string; workerId: string; extraRepoRoots: string[] } | undefined {
+function cachedWorkerHere(command: string): WorkerHere | undefined {
 	const repoRoot = canonicalCheckoutPath(invokingCheckout());
 	const cached = readWorkerCredentialCache(repoRoot);
 	if (cached === null) {
+		const profiles = listWorkerProfiles().flatMap(({ workerId, profile }) =>
+			profile?.repoRoots[0] === repoRoot ? [{ workerId, profile }] : [],
+		);
+		const [only] = profiles;
+		if (only && profiles.length === 1) {
+			return {
+				repoRoot,
+				workerId: only.workerId,
+				extraRepoRoots: only.profile.repoRoots.slice(1),
+				profile: true,
+			};
+		}
+		if (profiles.length > 1) {
+			out.error(
+				`workers ${command}: more than one worker profile has this checkout (${repoRoot}) as its primary checkout — ${profiles.map(({ workerId, profile }) => `${workerId} (${profile.controlPlaneUrl})`).join(', ')} — so which one to change is ambiguous; give each installation its own checkout`,
+			);
+			return undefined;
+		}
 		out.error(
 			`workers ${command}: no worker registered for this checkout (${repoRoot}) — run it in the worker's primary checkout, the one \`swarm run:worker\` starts it from`,
 		);
@@ -2850,38 +3150,63 @@ function cachedWorkerHere(
 		);
 		return undefined;
 	}
-	return { repoRoot, workerId: cached.workerId, extraRepoRoots: cached.extraRepoRoots ?? [] };
+	return {
+		repoRoot,
+		workerId: cached.workerId,
+		extraRepoRoots: cached.extraRepoRoots ?? [],
+		profile: false,
+	};
 }
 
 /** Write a worker's new set of extra checkouts and say what the daemon will now hold. */
-function saveExtraCheckouts(
-	command: string,
-	worker: { repoRoot: string; workerId: string },
-	extraRepoRoots: string[],
-): number {
-	try {
-		const updated = updateWorkerCredentialCacheCheckouts(worker.repoRoot, extraRepoRoots);
-		if (updated === null) {
-			out.error(`workers ${command}: this checkout's worker credential cache entry disappeared`);
-			return 1;
-		}
-		if (updated === undefined) {
-			out.error(
-				`workers ${command}: this checkout's cached worker credential could not be read: ${workerCredentialCachePath(worker.repoRoot)}`,
-			);
-			return 1;
-		}
-	} catch (err) {
-		out.error(`workers ${command}: could not update the credential cache: ${describeError(err)}`);
+function saveExtraCheckouts(command: string, worker: WorkerHere, extraRepoRoots: string[]): number {
+	const refusal = worker.profile
+		? saveProfileCheckouts(worker, extraRepoRoots)
+		: saveCachedCheckouts(worker, extraRepoRoots);
+	if (refusal !== undefined) {
+		out.error(`workers ${command}: ${refusal}`);
 		return 1;
 	}
 	out.info(
 		`worker '${worker.workerId}' now holds: ${[worker.repoRoot, ...extraRepoRoots].join(', ')}`,
 	);
 	out.info(
-		'restart this worker to declare it: swarm run:worker (or swarm-worker-agent install) — it re-declares its repositories at its next handshake',
+		worker.profile
+			? `restart this worker to declare it: ${launcherCommand()} run ${worker.workerId} — it re-declares its repositories at its next handshake`
+			: 'restart this worker to declare it: swarm run:worker (or swarm-worker-agent install) — it re-declares its repositories at its next handshake',
 	);
 	return 0;
+}
+
+/** Rewrite a clone worker's cache entry; the refusal, or `undefined` once written. */
+function saveCachedCheckouts(worker: WorkerHere, extraRepoRoots: string[]): string | undefined {
+	try {
+		const updated = updateWorkerCredentialCacheCheckouts(worker.repoRoot, extraRepoRoots);
+		if (updated === null) return "this checkout's worker credential cache entry disappeared";
+		if (updated === undefined) {
+			return `this checkout's cached worker credential could not be read: ${workerCredentialCachePath(worker.repoRoot)}`;
+		}
+	} catch (err) {
+		return `could not update the credential cache: ${describeError(err)}`;
+	}
+	return undefined;
+}
+
+/** Rewrite a profile worker's `repoRoots`, primary first (issue #1296); the refusal, or `undefined` once written. */
+function saveProfileCheckouts(worker: WorkerHere, extraRepoRoots: string[]): string | undefined {
+	try {
+		const updated = updateWorkerProfileRepoRoots(worker.workerId, [
+			worker.repoRoot,
+			...extraRepoRoots,
+		]);
+		if (updated === null) return `worker ${worker.workerId}'s profile disappeared`;
+		if (updated === undefined) {
+			return `worker ${worker.workerId}'s profile could not be read: ${workerProfilePath(worker.workerId)}`;
+		}
+	} catch (err) {
+		return `could not update worker ${worker.workerId}'s profile: ${describeError(err)}`;
+	}
+	return undefined;
 }
 
 /**
@@ -2999,7 +3324,7 @@ async function updateEnrollmentCommand(argv: string[]): Promise<number> {
 	if (!concurrency.ok) return 1;
 	if (!requireWorkerId(workerId)) return 1;
 
-	const operator = requireOperator();
+	const operator = requireOperator({ workerId });
 	if (!operator) return 1;
 
 	const resolved = await resolveEnrollment(operator.client, workerId, projectId);
@@ -3030,7 +3355,7 @@ async function approveCommand(argv: string[]): Promise<number> {
 	}
 	if (!requireWorkerId(workerId)) return 1;
 
-	const operator = requireOperator();
+	const operator = requireOperator({ workerId });
 	if (!operator) return 1;
 
 	const resolved = await resolveEnrollment(operator.client, workerId, projectId);
@@ -3059,7 +3384,7 @@ async function consentCommand(argv: string[]): Promise<number> {
 	}
 	if (!requireWorkerId(workerId)) return 1;
 
-	const operator = requireOperator();
+	const operator = requireOperator({ workerId });
 	if (!operator) return 1;
 
 	const resolved = await resolveEnrollment(operator.client, workerId, projectId);

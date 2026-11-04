@@ -80,12 +80,19 @@
  * A git *worktree* of a checkout has its own realpath and therefore its own key,
  * so it has no cache entry and gets the "no worker registered for this checkout"
  * message. That is correct: the daemon must run against the main checkout.
+ *
+ * A checkout that only a **profile-based worker** serves (issue #1296,
+ * `swarm workers setup --profile`) has no cache entry either, but it is not
+ * unregistered: it is refused with the `swarm-launcher run <workerId>` that starts
+ * it, since the installation that worker serves is its profile's, not this clone's.
  */
 
 import { delimiter, join } from 'node:path';
 import { parseArgs } from 'node:util';
+import { listWorkerProfiles } from '../../launcher/worker-profile.js';
 import { canonicalCheckoutPath } from '../../worktree/checkout-key.js';
 import { runCommand } from '../_shared/exec.js';
+import { launcherCommand } from '../_shared/installation-command.js';
 import * as out from '../_shared/output.js';
 import { REPO_ROOT } from '../_shared/paths.js';
 import {
@@ -116,7 +123,10 @@ SWARM installation's own .env still supplies SWARM_CONTROL_PLANE_URL.
 For a remote machine, a process supervisor, or any other setup where the machine
 that registered the worker is not the one running it, keep using \`npm run
 dev:worker\` with SWARM_WORKER_CREDENTIAL and SWARM_WORKER_REPO_ROOT set
-explicitly — that path is unchanged.`;
+explicitly — that path is unchanged.
+
+A checkout served only by a profile-based worker (swarm workers setup --profile)
+is refused here, naming the command that starts it: swarm-launcher run <worker-id>.`;
 
 /**
  * The node arguments that *are* `npm run dev:worker`, stated here because the
@@ -168,6 +178,7 @@ export async function run(argv: string[]): Promise<number> {
 	const cached = readWorkerCredentialCache(repoRoot);
 
 	if (cached === null) {
+		if (refuseProfileWorkers(repoRoot)) return 1;
 		out.error(`no worker registered for this checkout (${repoRoot})`);
 		remedies();
 		return 1;
@@ -203,6 +214,29 @@ export async function run(argv: string[]): Promise<number> {
 	// needless extra process is strictly better than one that does not start.
 	out.warn(`${refusal}; starting the daemon as a child process instead`);
 	return runCommand('npm', ['run', 'dev:worker'], { cwd: REPO_ROOT, env });
+}
+
+/**
+ * A checkout served only by a profile-based worker (issue #1296) is started by
+ * `swarm-launcher run <workerId>`, not from here: that worker's installation is the
+ * one its profile names, which need not be the one this clone's `.env` does. So
+ * this names the launcher command and refuses, rather than claiming nothing is
+ * registered. Answers whether it refused.
+ */
+function refuseProfileWorkers(repoRoot: string): boolean {
+	const serving = listWorkerProfiles().filter(({ profile }) =>
+		profile?.repoRoots.includes(repoRoot),
+	);
+	if (serving.length === 0) return false;
+	out.error(
+		`this checkout (${repoRoot}) is served by a profile-based worker, which swarm run:worker does not start`,
+	);
+	for (const { workerId, profile } of serving) {
+		out.info(
+			`  start it with: ${launcherCommand()} run ${workerId} (serves ${profile?.controlPlaneUrl})`,
+		);
+	}
+	return true;
 }
 
 /**
