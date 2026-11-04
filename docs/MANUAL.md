@@ -275,8 +275,12 @@ The env contract is unchanged, since it is the same entrypoint, and
 byte-identical for one tree and commit. Two limits for now: a packaged runtime has no
 git checkout of its own, so an update request from the control plane is **refused**
 there rather than applied (replace the artifact instead), and `swarm run:worker` and
-`swarm-worker-agent` still start a clone — running from a clone is unchanged. Signed
-release assets and a copy in the published image are the follow-up.
+`swarm-worker-agent` still start a clone — running from a clone is unchanged.
+
+You need not build it yourself: every release publishes it, signed, as GitHub
+Release assets, and the published image carries the same files under
+`/app/worker-runtime/` (issue #1290) — see
+[Verifying the worker runtime](#verifying-the-worker-runtime).
 
 **One worker can serve several repositories on one machine** (issue #1059) — one
 checkout per repository, one daemon. Give it the extra checkouts at registration
@@ -1042,7 +1046,8 @@ in [Running on a VPS behind Caddy](#running-on-a-vps-behind-caddy) instead.
   a clean `main`. It shows the current version and asks for the new one (`X.Y.Z`).
   Then it bumps `package.json`, commits `chore(release): vX.Y.Z` to `main` and
   tags it, and pushes both. It waits for the image build, which also moves
-  `stable`, and publishes the GitHub release. Finally it runs
+  `stable` and publishes the GitHub release, and checks that the release carries
+  the signed worker runtime (below). Finally it runs
   `sudo dockerctl deploy app` on the server and checks that the new version is
   live. It warns first when `deploy/vps` changed since the previous tag, because
   the server's files may then need the admin. The server is
@@ -1053,6 +1058,66 @@ in [Running on a VPS behind Caddy](#running-on-a-vps-behind-caddy) instead.
   The package has to be made **public** once by an org admin (GitHub → the org's
   Packages → `swarm` → Package settings → Change visibility → Public); until then
   an anonymous pull fails.
+- **The worker runtime** (issue #1290): the same workflow builds the
+  [packaged runtime](#the-worker) once per run, writes its `.sha256` and signs it
+  with minisign, then ships those three files in the image under
+  `/app/worker-runtime/` and, on a `v*` tag, attaches them to the GitHub Release —
+  one build feeds both, so they are byte-identical. The workflow creates that
+  release itself (with `--generate-notes`; a `-` tag is marked a pre-release), so
+  a tag pushed by hand gets one too, and `npm run release` only checks that it
+  carries all three files. A `v*` tag **fails** when the signing secret or the
+  committed public key is missing; a push to `main` then ships the runtime
+  unsigned, with a warning. A plain `docker build .` ships an empty
+  `/app/worker-runtime`.
+
+#### Verifying the worker runtime
+
+The Release assets for `vX.Y.Z` are `swarm-worker-runtime-X.Y.Z.tar.gz`, its
+`.tar.gz.sha256` (`sha256sum` format) and its `.tar.gz.minisig`, downloadable
+without signing in. The public key is committed at
+`deploy/worker-runtime/minisign.pub`; take it from a checkout you trust rather than from the same download, since a key
+fetched beside the artifact proves nothing about either.
+
+```bash
+base=https://github.com/SmartTechBrewery/swarm/releases/download/vX.Y.Z
+f=swarm-worker-runtime-X.Y.Z.tar.gz
+for x in "$f" "$f.sha256" "$f.minisig"; do curl -fLO "$base/$x"; done
+sha256sum -c "$f.sha256"              # macOS: shasum -a 256 -c "$f.sha256"
+minisign -Vm "$f" -p minisign.pub     # prints the trusted comment: swarm-worker-runtime X.Y.Z <commit>
+```
+
+The image holds the same three files for its own version:
+`docker create --name rt ghcr.io/smarttechbrewery/swarm:vX.Y.Z && docker cp rt:/app/worker-runtime . && docker rm rt`.
+The signature covers the tarball alone; its trusted comment names the version and
+the commit it was built from. Nothing verifies it automatically yet — the daemon
+and the control plane do not check it.
+
+#### Rotating the runtime signing key
+
+The private key exists only as the `SWARM_RUNTIME_SIGNING_KEY` Actions secret,
+unencrypted, because the secret store is its protection; the public half is
+`deploy/worker-runtime/minisign.pub`. Setting them up the first time is the same
+procedure:
+
+1. Generate a new pair on a trusted machine, without a password:
+   `minisign -G -W -p minisign.pub -s minisign.key`.
+2. Replace `deploy/worker-runtime/minisign.pub` with the new `minisign.pub` in a
+   pull request, and merge it.
+3. Store the whole of `minisign.key` as the repository secret:
+   `gh secret set SWARM_RUNTIME_SIGNING_KEY --repo SmartTechBrewery/swarm < minisign.key`.
+   Then delete `minisign.key`; nothing else needs it.
+4. Cut a release. The workflow verifies its signature against the committed public
+   key, so a secret that does not match the key fails the build before anything
+   is published.
+
+Between steps 2 and 3, `main` builds fail at the signing step, since the old
+secret no longer matches the new key — do step 3 as soon as step 2 merges. Older releases stay
+verifiable only against the public key they were signed with, which stays in git
+history (`git show vX.Y.Z:deploy/worker-runtime/minisign.pub`). If the private key
+is **compromised**, delete the secret at once, so nothing more is signed with it,
+then rotate and cut a new release; tell hosts to stop trusting the old key, since
+anything signed with it — old releases included — can no longer be told apart from
+a forgery.
 
 ## Running on a VPS behind Caddy
 

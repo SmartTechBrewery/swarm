@@ -4,9 +4,10 @@
 #
 # Shows the current version, asks for the new one (X.Y.Z), bumps package.json,
 # commits `chore(release): vX.Y.Z` on main, tags it, pushes both, waits for the
-# publish workflow to build the image and move `:stable`, publishes the GitHub
-# release, then runs `dockerctl deploy app` on the server and checks that the
-# new version is live.
+# publish workflow to build the image, move `:stable` and publish the GitHub
+# release, checks that the release carries the signed worker runtime (its
+# tarball, `.sha256` and `.minisig`), then runs `dockerctl deploy app` on the
+# server and checks that the new version is live.
 #
 # Run by a maintainer, by hand: it commits to main directly, which an agent
 # session never does (ai/RULES.md §6).
@@ -78,8 +79,16 @@ gh run watch "$run_id" --repo "$REPO" --exit-status >/dev/null ||
 	die "the image build failed: https://github.com/$REPO/actions/runs/$run_id"
 echo "Image published as :$tag and :stable"
 
-step "Publishing the GitHub release"
-gh release create "$tag" --repo "$REPO" --verify-tag --title "$tag" --generate-notes
+# The workflow creates the release itself (issue #1290), so a tag pushed by hand
+# gets one too; here it is only checked.
+step "Checking the GitHub release"
+assets=$(gh release view "$tag" --repo "$REPO" --json assets -q '.assets[].name') ||
+	die "$WORKFLOW published no GitHub release for $tag"
+runtime="swarm-worker-runtime-$version.tar.gz"
+for asset in "$runtime" "$runtime.sha256" "$runtime.minisig"; do
+	grep -qxF "$asset" <<<"$assets" || die "the $tag release is missing $asset: https://github.com/$REPO/releases/tag/$tag"
+done
+echo "Release $tag carries the signed worker runtime"
 
 step "Deploying to $DEPLOY_SSH"
 ssh "$DEPLOY_SSH" sudo dockerctl deploy app

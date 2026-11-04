@@ -2,6 +2,11 @@
 # the built dashboard on one port. Published to ghcr.io by
 # .github/workflows/publish-image.yml; see docs/MANUAL.md. Dockerfile.router (the
 # router-only image the local Compose stack builds) is separate and unchanged.
+
+# Empty unless the build is given a named context of the same name, which replaces
+# this stage — see the worker runtime block in the production stage.
+FROM scratch AS worker-runtime
+
 FROM node:22-slim AS builder
 WORKDIR /app
 
@@ -40,6 +45,14 @@ COPY --from=builder /app/dashboard/dist ./dashboard/dist
 ARG SWARM_BUILD_COMMIT=""
 COPY bin/write-build-info.js ./bin/write-build-info.js
 RUN node bin/write-build-info.js /app
+
+# The packaged worker runtime (issue #1290) for this image's own version: the
+# tarball, its .sha256 and its .minisig, the same bytes as the GitHub Release
+# assets. CI builds and signs them, then passes the directory as a named context
+# (`--build-context worker-runtime=./worker-runtime`). Without it the stage above
+# is empty, so a plain `docker build .` still works and ships an empty
+# /app/worker-runtime. Like the stamp, it changes with every commit.
+COPY --from=worker-runtime / ./worker-runtime/
 USER node
 ENV PORT=3000
 EXPOSE 3000
