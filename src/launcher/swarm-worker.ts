@@ -10,7 +10,8 @@
  * they behave and print exactly as `swarm-launcher`'s do. `setup`, `login` and
  * `status` (issue #1311) register a profile worker for the checkout it is run in,
  * renew the operator session, and report each profile's LaunchAgent, runtime and
- * connection (`./setup.ts`, `./login.ts`, `./status.ts`).
+ * connection (`./setup.ts`, `./login.ts`, `./status.ts`). `migrate` (issue #1313)
+ * moves a clone-based worker onto the launcher, keeping its id (`./migrate.ts`).
  *
  * Load-bearing rules:
  *
@@ -30,6 +31,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { type LoginDeps, runLogin } from './login.js';
 import { LAUNCHER_INSTALL_ROOT, type LauncherDeps, run as runLauncher } from './main.js';
+import { type MigrateDeps, runMigrate } from './migrate.js';
 import { runSetup, type SetupDeps } from './setup.js';
 import { runStatus, type StatusDeps } from './status.js';
 
@@ -39,6 +41,7 @@ Usage:
   swarm-worker setup [flags]       register this checkout's host as a worker (--help for flags)
   swarm-worker login [flags]       renew your session on the installation
   swarm-worker status [<workerId>] report each worker's LaunchAgent, runtime and connection
+  swarm-worker migrate [<checkout>] move this checkout's clone-based worker onto this launcher
   swarm-worker run <workerId>      become the daemon for ~/.swarm/workers/<workerId>/
   swarm-worker runtimes            list the runtime versions installed on this host
   swarm-worker --version           print this launcher's version
@@ -61,6 +64,7 @@ export interface SwarmWorkerDeps extends LauncherDeps {
 	setup?: (argv: string[], deps?: SetupDeps) => Promise<number>;
 	login?: (argv: string[], deps?: LoginDeps) => Promise<number>;
 	status?: (argv: string[], deps?: StatusDeps) => Promise<number>;
+	migrate?: (argv: string[], deps?: MigrateDeps) => Promise<number>;
 }
 
 /** The launcher's version, from its install root's `package.json`, or `unknown`. */
@@ -86,6 +90,7 @@ export async function run(argv: string[], deps: SwarmWorkerDeps = {}): Promise<n
 				setup: _setup,
 				login: _login,
 				status: _status,
+				migrate: _migrate,
 				...launcherDeps
 			} = deps;
 			return launcher(argv, launcherDeps);
@@ -96,6 +101,8 @@ export async function run(argv: string[], deps: SwarmWorkerDeps = {}): Promise<n
 			return (deps.login ?? runLogin)(argv.slice(1));
 		case 'status':
 			return (deps.status ?? runStatus)(argv.slice(1));
+		case 'migrate':
+			return (deps.migrate ?? runMigrate)(argv.slice(1));
 		case 'version':
 		case '--version':
 		case '-v':

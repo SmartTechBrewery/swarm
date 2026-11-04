@@ -370,6 +370,29 @@ never held against it).
 `swarm run:worker` there exits 1 naming `swarm-launcher run <workerId>`. A worker
 with no profile on the machine is handled exactly as before.
 
+**Migrating a clone-based worker** (issue #1313). A worker set up the older way — a
+SWARM clone's LaunchAgent running `swarm run:worker` in its checkout, credential in
+the per-checkout cache — moves onto the launcher **as the same worker** with
+`curl -fsSL https://<installation>/install.sh | sh -s -- migrate`, run in its
+checkout (or `swarm-worker migrate [<checkout>]` once the launcher is installed).
+It carries the worker id, credential and extra checkouts from the cache, and the
+installation from the clone's LaunchAgent environment or `.env`, into
+`~/.swarm/workers/<id>/profile.json`; registers and enrolls nothing, so the
+enrollments and the stored operator SCM credentials are the ones the worker had;
+installs and verifies the installation's runtime; replaces the clone's agent with a
+profile agent running `~/.swarm/launcher`; and deletes the cache entry, so
+`swarm run:worker` in the checkout cannot start a second copy. It refuses — with
+nothing changed — a checkout with no cached worker, one a profile already serves,
+a `--control-plane-url` that names another installation than the clone's, and a
+credential the control plane does not accept. If the profile agent cannot be
+installed it reinstalls the clone's agent and removes the profile. The restart
+interrupts a run in flight (retried, as on any daemon restart), so drain first if
+that matters; it then says whether anything else still runs the clone, which is
+otherwise no longer needed. A worker run by hand rather than by a LaunchAgent is
+given its profile and runtime, and migrate prints the `swarm-worker run <id>` to
+start it with once the old daemon is stopped. See
+[`swarm-worker migrate`](./cli.md#swarm-worker-migrate).
+
 **With no clone at all, the launcher package writes the profile itself** (issue
 #1311). Run in the project checkout the worker is to serve:
 

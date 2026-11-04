@@ -95,16 +95,16 @@ describe('swarm-worker', () => {
 		const launcher = vi.fn();
 		const io = capture();
 
-		expect(await run(['migrate'], { launcher, stdout: io.stdout, stderr: io.stderr })).toBe(1);
-		expect(io.err).toEqual(['swarm-worker: unknown command: migrate']);
+		expect(await run(['upgrade'], { launcher, stdout: io.stdout, stderr: io.stderr })).toBe(1);
+		expect(io.err).toEqual(['swarm-worker: unknown command: upgrade']);
 		expect(io.out).toEqual([USAGE]);
 		expect(launcher).not.toHaveBeenCalled();
 	});
 
 	it('names only the subcommands that exist', () => {
-		for (const command of ['setup', 'login', 'status', 'run <workerId>', 'runtimes'])
+		for (const command of ['setup', 'login', 'status', 'migrate', 'run <workerId>', 'runtimes'])
 			expect(USAGE).toContain(`swarm-worker ${command}`);
-		expect(USAGE).not.toMatch(/swarm-worker migrate\b/);
+		expect(USAGE).not.toMatch(/swarm-worker upgrade\b/);
 	});
 
 	// Issue #1311.
@@ -112,6 +112,8 @@ describe('swarm-worker', () => {
 		['setup', ['setup', '--control-plane-url', 'https://swarm.example.com']],
 		['login', ['login', '--email', 'ada@example.com']],
 		['status', ['status', 'w-1']],
+		// Issue #1313.
+		['migrate', ['migrate', '/work/api', '--yes']],
 	] as const)('hands %s its own arguments, and nothing to the launcher', async (command, argv) => {
 		const launcher = vi.fn();
 		const handler = vi.fn().mockResolvedValue(3);
