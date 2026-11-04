@@ -226,6 +226,15 @@ export interface WorkItem {
 	 * directly, so every caller applies the same precedence.
 	 */
 	ownTaskRef?: string;
+	/**
+	 * The card's human-readable key as its PM provider shows it — a Jira issue key
+	 * (`VT-1558`), a Linear identifier (`ENG-42`) — for display only (issue #1287):
+	 * it names the card in the work-item line SWARM appends to a pull request
+	 * description. Unset on a provider with no keys (Trello, GitHub Projects). Unlike
+	 * {@link ownTaskRef} it is set on every read, linked or not, and never decides a
+	 * task id.
+	 */
+	key?: string;
 	/** Human-readable Status option name (e.g. `In progress`) when available. */
 	status?: string;
 	/**
