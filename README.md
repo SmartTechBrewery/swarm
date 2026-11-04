@@ -182,6 +182,13 @@ curl -fsSL https://<your-domain>/install.sh | sh
 swarm-worker status
 ```
 
+On Windows, in PowerShell:
+
+```powershell
+irm https://<your-domain>/install.ps1 | iex
+swarm-worker status
+```
+
 Details: [`docs/MANUAL.md`](docs/MANUAL.md#running-on-a-vps-behind-caddy),
 [`docs/onboarding-worker.md`](docs/onboarding-worker.md).
 

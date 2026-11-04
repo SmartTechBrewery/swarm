@@ -196,7 +196,8 @@ itself.
 `swarm run:worker` from the checkout you registered in. `swarm start` and `swarm
 status` warn when this host has no usable credential. Any other machine needs no
 clone at all: in its project checkout, `curl -fsSL https://<installation>/install.sh
-| sh` sets it up as a profile-based worker (below). The full runbook, including
+| sh` — on Windows, `irm https://<installation>/install.ps1 | iex` in PowerShell —
+sets it up as a profile-based worker (below). The full runbook, including
 someone else's machine, is [`docs/onboarding-worker.md`](./onboarding-worker.md);
 on macOS, [`docs/launchd-worker-autostart.md`](./launchd-worker-autostart.md) runs
 it from a launchd agent instead of a terminal tab.
@@ -404,6 +405,7 @@ start it with once the old daemon is stopped. See
 
 ```bash
 curl -fsSL https://swarm.example.com/install.sh | sh   # installs swarm-worker, then runs setup
+# On Windows, in PowerShell: irm https://swarm.example.com/install.ps1 | iex
 # …which is, once swarm-worker is installed:
 swarm-worker setup --control-plane-url https://swarm.example.com
 swarm-worker status            # each profile: login service, runtime, connected or not
@@ -451,7 +453,7 @@ and operator credentials. See
 [`docs/onboarding-worker.md`](./onboarding-worker.md#serving-a-second-repository).
 
 **One machine can serve two installations** (issue #1215). With the launcher it
-needs nothing extra: run the second installation's own `install.sh` in a project
+needs nothing extra: run the second installation's own `install.sh` (or `install.ps1`) in a project
 checkout no other worker holds, and that worker's profile names its installation,
 its LaunchAgent is labelled with that installation's host, and each worker's runtime
 is updated by its own installation alone; the agent-CLI logins and quotas stay
@@ -1432,7 +1434,7 @@ under `~/.swarm/runtimes/<version>/`, side by side with every other version, and
 The installation also serves the **launcher package** for its own build — the
 `swarm-worker-launcher-<version>.tar.gz` and `.sha256` its image carries beside the
 runtime — and an installer for it, so a new host is set up with one command and no
-GitHub access (issue #1312):
+GitHub access (issue #1312; `install.ps1` for Windows since issue #1324, below):
 
 ```bash
 cd ~/code/my-project          # the checkout the worker is to serve
@@ -1444,6 +1446,7 @@ curl -fsSL https://swarm.example.com/install.sh | sh -s -- login                
 | Route | Auth | Answers |
 | --- | --- | --- |
 | `GET /install.sh` | none | A POSIX `sh` script (`text/x-shellscript`) with the installation's base URL baked in. |
+| `GET /install.ps1` | none | The same installer in PowerShell (`text/plain`), for Windows; base URL baked in the same way. |
 | `GET /worker/launcher/manifest` | none | `{"available":true,"version","file","size","sha256"}` for the installation's own package, or `{"available":false,"reason"}`. |
 | `GET /worker/launcher/artifacts/<file>` | none | The package itself; only the exact file the manifest names. |
 
@@ -1464,6 +1467,34 @@ do). Re-running it upgrades the launcher in place, and a LaunchAgent `setup`
 installed keeps working, since its plist names the stable
 `~/.swarm/launcher/bin/swarm-worker.js`.
 
+**On Windows** the installer is `install.ps1`, run in PowerShell (Windows PowerShell
+5.1 or pwsh 7) in the project checkout:
+
+```powershell
+irm https://swarm.example.com/install.ps1 | iex
+& ([scriptblock]::Create((irm https://swarm.example.com/install.ps1))) --email me@example.com --yes   # flags go to setup
+& ([scriptblock]::Create((irm https://swarm.example.com/install.ps1))) login                        # another subcommand
+```
+
+`irm … | iex` takes no arguments, so the scriptblock form is PowerShell's
+`sh -s --`. It takes the same steps with the same messages: it refuses when Node.js >= 22,
+git or tar is missing (`tar.exe` ships with Windows 10 1803 and later and is
+preferred over any other `tar` on `PATH`); downloads with `Invoke-WebRequest` (TLS
+1.2 forced on Windows PowerShell 5.1) and checks the package with `Get-FileHash
+-Algorithm SHA256`, installing nothing on a mismatch; swaps it into
+`%USERPROFILE%\.swarm\launcher` the same way — `%USERPROFILE%`, the home Node's
+`os.homedir()` and so the launcher's profiles use, not Windows PowerShell 5.1's
+`$HOME`, which a redirected home folder moves to another drive; writes
+`%USERPROFILE%\.swarm\bin\swarm-worker.cmd` (`@node
+"%USERPROFILE%\.swarm\launcher\bin\swarm-worker.js" %*`) and adds
+`%USERPROFILE%\.swarm\bin` to the **user** `PATH` when it is missing — terminals opened afterwards run
+`swarm-worker` by name, and the current session's `$env:Path` is updated too; then
+runs `swarm-worker setup --control-plane-url <installation>`. A refusal is a thrown
+`swarm install: …` error rather than an `exit`, which under `irm | iex` would close
+the window, and a subcommand that exits non-zero is reported the same way. A Task
+Scheduler task `setup` installed names the same stable
+`~\.swarm\launcher\bin\swarm-worker.js`, so a re-run upgrades it at its next start.
+
 The base URL in the script is `WEBHOOK_CALLBACK_BASE_URL` when set, otherwise the
 request's `Host` with `X-Forwarded-Proto`. Set it on an installation behind a proxy
 that rewrites `Host`. Every route here is public, because the installer holds no
@@ -1474,9 +1505,9 @@ is not signed**: installing it trusts the installation over TLS, exactly as any
 `curl | sh` does, while every runtime it installs is still minisign-verified against
 the key the package carries
 ([ADR-007](./decisions/ADR-007-runtime-worker-updates.md)). The launcher routes send
-`Cache-Control: private, no-store` and `/install.sh` sends `no-store`. Behind Caddy
-nothing needs configuring; a path-scoped Cloudflare Tunnel needs `^/install\.sh$`
-routed to the router ([`cloudflare-tunnel.md`](./cloudflare-tunnel.md)).
+`Cache-Control: private, no-store` and both installers send `no-store`. Behind Caddy
+nothing needs configuring; a path-scoped Cloudflare Tunnel needs `^/install\.sh$` and
+`^/install\.ps1$` routed to the router ([`cloudflare-tunnel.md`](./cloudflare-tunnel.md)).
 
 #### Rotating the runtime signing key
 
@@ -1616,7 +1647,8 @@ lapsed, `docker compose restart app` logs a fresh one.
   (or, with no shell, add the user under Settings → Users and send them the
   password link it shows; membership can also be granted on the project's Members
   tab). Then, on the worker's machine and in its project checkout, run
-  `curl -fsSL https://<your domain>/install.sh | sh` (onboarding Steps 2–3).
+  `curl -fsSL https://<your domain>/install.sh | sh` — on Windows,
+  `irm https://<your domain>/install.ps1 | iex` in PowerShell (onboarding Steps 2–3).
 
 ### Behind a Cloudflare Tunnel instead of Caddy
 
@@ -2007,6 +2039,7 @@ npm run swarm -- workers setup --profile --control-plane-url <url>
 swarm-launcher run <worker-id>
 # …or, from the launcher package with no clone at all, in the project checkout:
 curl -fsSL <url>/install.sh | sh          # install swarm-worker from the installation, then setup
+irm <url>/install.ps1 | iex               # the same on Windows, in PowerShell
 swarm-worker setup --control-plane-url <url>
 swarm-worker status
 

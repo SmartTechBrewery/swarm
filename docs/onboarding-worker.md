@@ -11,7 +11,8 @@ is.
 
 **There are two ways to set a worker host up.** The default is the installation's
 own installer, `curl -fsSL https://<installation>/install.sh | sh` (issues #1311–
-#1314): it needs no SWARM clone and no GitHub account, installs the `swarm-worker`
+#1314) — on Windows, `irm https://<installation>/install.ps1 | iex` in PowerShell
+([On Windows](#on-windows), issue #1324): it needs no SWARM clone and no GitHub account, installs the `swarm-worker`
 launcher from the installation, and leaves a **profile-based** worker that runs the
 signed runtime its installation serves and is updated by it. The end-to-end example
 below uses it. **SWARM developers** can still run a worker from a SWARM clone —
@@ -112,9 +113,10 @@ order:
 
 It then registers and enrolls the worker (with sharing consent), writes its profile
 to `~/.swarm/workers/<worker-id>/profile.json`, downloads and verifies the
-installation's runtime, installs the LaunchAgent that keeps it running, and waits up
-to a minute for the control plane to see it connected. Off macOS, or with
-`--no-autostart`, it ends by printing the `swarm-worker run <worker-id>` to start it
+installation's runtime, installs the login service that keeps it running — a
+LaunchAgent on macOS, a Task Scheduler task on Windows ([On Windows](#on-windows)) —
+and waits up to a minute for the control plane to see it connected. Off macOS and
+Windows, or with `--no-autostart`, it ends by printing the `swarm-worker run <worker-id>` to start it
 with instead. Nothing is read from or written to a `.env`. Every step it cannot
 finish by itself names the worker's page on the dashboard,
 `https://swarm.example.com/workers/<worker-id>`. See
@@ -183,6 +185,55 @@ so give the two files as paths; `-` (stdin, for only one of them) is for
 `swarm-worker setup` run directly. With no terminal, a missing answer that has no
 default fails naming its flag. (`--control-plane-url` is the script's own; it is
 always passed.)
+
+### On Windows
+
+The installer for Windows is `install.ps1`, the same steps in PowerShell (issue
+#1324). The machine needs Node.js 22 or newer, git, and the agent CLIs it will
+offer, installed and logged in; `tar.exe` ships with Windows 10 1803 and later.
+Then, in PowerShell (Windows PowerShell 5.1 or pwsh 7), as the teammate themselves:
+
+```powershell
+cd ~\code\example-project
+irm https://swarm.example.com/install.ps1 | iex
+```
+
+It checks the package against the installation's SHA-256 exactly as `install.sh`
+does, installs it at `%USERPROFILE%\.swarm\launcher`, writes
+`%USERPROFILE%\.swarm\bin\swarm-worker.cmd`, adds `%USERPROFILE%\.swarm\bin` to your
+**user** `PATH` (no admin), and runs the same `swarm-worker setup`. That is
+`%USERPROFILE%` rather than PowerShell's `$HOME`, which a redirected home folder
+moves to another drive: it is the home the launcher keeps its worker profiles under. That PowerShell window can run `swarm-worker` at once; a terminal that was
+already open before the install cannot until it is reopened, while any terminal
+opened afterwards can. A failure is reported as a `swarm install: …` error, and the
+window stays open.
+
+`irm … | iex` takes no arguments. To pass a subcommand or flags — the equivalent of
+`sh -s --` — run the script as a scriptblock:
+
+```powershell
+& ([scriptblock]::Create((irm https://swarm.example.com/install.ps1))) --email ada@example.com --project example-project --yes
+& ([scriptblock]::Create((irm https://swarm.example.com/install.ps1))) login   # upgrade the launcher, renew the session
+```
+
+**The login service is a Task Scheduler task**, not a LaunchAgent: one per worker,
+per user, triggered **at log on** and running in your own session with least
+privilege — no admin and no stored password, so git's Credential Manager and the
+agent CLIs' own sign-ins work as they do in your terminal. It keeps the worker
+running and starts it again after it exits for an update. Manage it with:
+
+```powershell
+swarm-worker status                                  # each worker: task, runtime, connected or not
+swarm-worker agent status    --profile <worker-id>   # the task's state, last run and result
+swarm-worker agent logs      --profile <worker-id>   # the last 50 lines, then follow (Ctrl-C to stop)
+swarm-worker agent uninstall --profile <worker-id>   # stop it and delete the task (logs are kept)
+swarm-worker agent install   --profile <worker-id>   # put it back
+```
+
+Being per-user and at log on, the worker runs while you are logged in, not before.
+Re-running the installer upgrades the launcher in place; the task names the stable
+`~\.swarm\launcher\bin\swarm-worker.js`, so it runs the new launcher at its next
+start. See [`swarm-worker agent`](./cli.md#swarm-worker-agent).
 
 ### Adding a second worker later
 

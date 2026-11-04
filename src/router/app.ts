@@ -42,8 +42,9 @@ export function createRouterApp(): RouterApp {
 	// …and the worker runtime for this installation's own build (issue #1280), so a
 	// worker host updates from the control plane it is registered with, not GitHub.
 	registerWorkerRuntime(app);
-	// …and the clone-free launcher package plus `/install.sh` (issue #1312), so a new
-	// host installs `swarm-worker` from this installation with one `curl | sh`.
+	// …and the clone-free launcher package plus `/install.sh` (issue #1312) and
+	// `/install.ps1` (issue #1324), so a new host installs `swarm-worker` from this
+	// installation with one `curl | sh`, or one `irm | iex` on Windows.
 	registerWorkerLauncher(app);
 	registerInstallScript(app);
 	// …and the operator session API (issue #798): `swarm login` authenticates a human

@@ -4,7 +4,7 @@ import { Server } from 'lucide-react';
 import { Badge } from '@/components/ui/badge.js';
 import { trpc } from '@/lib/trpc.js';
 import { routabilityBlockers } from '@/lib/worker-enrollment-view.js';
-import { workerInstallCommand } from '@/lib/worker-install-command.js';
+import { viewerWorkerInstallCommand } from '@/lib/worker-install-command.js';
 import { WORKERS_REFETCH_MS } from '@/lib/workers-refresh.js';
 import type { OwnerEnrollment, OwnerWorker } from '@/types/workers.js';
 
@@ -218,11 +218,9 @@ export function MyWorkersPanel() {
 				<p className="text-sm text-zinc-400">You don't operate any workers yet.</p>
 				<p className="text-xs text-zinc-500">
 					To make a machine a worker, run{' '}
-					<span className="font-mono break-all">
-						{workerInstallCommand(window.location.origin)}
-					</span>{' '}
-					in its checkout of the project. It appears here once registered; open it from this tab to
-					manage its enrollments and availability.
+					<span className="font-mono break-all">{viewerWorkerInstallCommand()}</span> in its
+					checkout of the project. It appears here once registered; open it from this tab to manage
+					its enrollments and availability.
 				</p>
 			</div>
 		);

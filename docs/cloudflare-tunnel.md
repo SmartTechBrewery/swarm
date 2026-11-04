@@ -156,7 +156,9 @@ terminal window:
    > that's three prefixes: `^/github/webhook`, `^/worker/`, and **`^/operator/`**
    > (the CLI's `swarm login` + `swarm workers` network path — see below) — plus,
    > since issue #1312, the exact path **`^/install\.sh$`** (the worker installer,
-   > `curl -fsSL https://<tunnel>/install.sh | sh`). Add each as
+   > `curl -fsSL https://<tunnel>/install.sh | sh`) and, since issue #1324, its
+   > Windows twin **`^/install\.ps1$`** (`irm https://<tunnel>/install.ps1 | iex`).
+   > Add each as
    > `service: http://router:3000`, ordered before the catch-all.
 
 3. **Set the token** in `.env` (copy from `.env.docker.example` if you haven't already)
@@ -284,9 +286,10 @@ sit under the same `^/worker/` prefix, so they need no rule of their own. Both s
 So do the launcher routes `/worker/launcher/manifest` and
 `/worker/launcher/artifacts/<file>` (issue #1312,
 [`MANUAL.md`](./MANUAL.md#serving-the-launcher-and-installsh)), which are public, so
-that a cached package cannot outlive a deploy. The installer they serve,
-`/install.sh`, is *not* under `^/worker/`: a catch-all tunnel serves it as is, and a
-path-scoped one needs the `^/install\.sh$` rule above.
+that a cached package cannot outlive a deploy. The installers they serve,
+`/install.sh` and `/install.ps1`, are *not* under `^/worker/`: a catch-all tunnel
+serves them as is, and a path-scoped one needs the `^/install\.sh$` and
+`^/install\.ps1$` rules above.
 
 ---
 
