@@ -28,6 +28,16 @@
  *     `SWARM_RUNTIME_TRUSTED_KEY`, the path the launcher sets to its own
  *     `minisign.pub`, never from a copy inside the running runtime.
  *
+ * **A move is not trusted until it is proved** (issue #1303). The selection is
+ * recorded together with a pending-verification record naming the version moved to
+ * and the one moved from, so the launcher can count every start of the new version
+ * and go back once it has failed `MAX_FAILED_STARTS` starts in a row; the
+ * daemon on the new version clears the record on its first session
+ * (`./runtime-verification.ts`). A runtime whose `build-info.json` does not declare
+ * {@link RUNTIME_LAUNCHER_PROTOCOL} has a daemon that never clears it, and would be
+ * abandoned after that many perfectly healthy starts — so a move to one is refused,
+ * before anything is recorded.
+ *
  * It never throws: every outcome is an {@link UpdateOutcome}, as with
  * `applyUpdateTarget`. A failure leaves the worker's selection untouched, so it goes
  * on running — and restarting into — the version it has.
@@ -38,6 +48,7 @@ import {
 	ensureRuntime,
 	fetchRuntimeManifest,
 	installedRuntime,
+	RUNTIME_LAUNCHER_PROTOCOL,
 } from '../launcher/runtime-store.js';
 import { isValidWorkerId, readWorkerState, updateWorkerState } from '../launcher/worker-profile.js';
 import type { WorkerBuild } from '../lib/build-identity.js';
@@ -197,9 +208,30 @@ async function applyRuntimeUpdateUnguarded(
 	if ('error' in ensured)
 		return failed(`v${manifest.version} was not installed: ${ensured.error}. ${stays}`);
 
+	const protocol = installedRuntime(manifest.version, options.homeDir)?.launcherProtocol;
+	if (protocol === undefined || protocol < RUNTIME_LAUNCHER_PROTOCOL)
+		return {
+			status: 'refused',
+			reason: `v${manifest.version} predates launcher-driven verification, so a launcher would abandon it after a few healthy starts. ${stays}`,
+		};
+
+	const now = options.now ?? Date.now;
 	const recorded = updateWorkerState(
 		options.workerId,
-		{ selectedVersion: manifest.version },
+		(state) => ({
+			selectedVersion: manifest.version,
+			pendingVerification: {
+				version: manifest.version,
+				// The version the launcher started this daemon on, which is the one it goes
+				// back to: a directory it has installed, named as the selection names it.
+				previousVersion: state.lastRuntimeVersion,
+				failedStarts: 0,
+				startedAt: new Date(now()).toISOString(),
+			},
+			// A daemon can only receive an update over a session, so the version it runs
+			// has proved itself; keep an older proof if one is recorded.
+			lastKnownGoodVersion: state.lastKnownGoodVersion ?? state.lastRuntimeVersion,
+		}),
 		options.homeDir,
 	);
 	if (!recorded)

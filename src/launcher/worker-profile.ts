@@ -26,6 +26,16 @@
  * daemon itself when `swarm workers update` moves it to another release. It is
  * optional so a `state.json` written before it existed still parses.
  *
+ * Since issue #1303 the same file carries the worker's **pending-verification
+ * record** — the runtime twin of `../worker/self-update.ts`'s
+ * `PendingVerificationSchema` — and its `lastKnownGoodVersion`. A version the worker
+ * was moved to is not trusted until a daemon running it has established a session:
+ * the launcher counts every start of it *before* handing its process over, and after
+ * {@link MAX_FAILED_STARTS} starts in a row without a session it starts the version
+ * the worker was moved from instead (`./main.ts`). The daemon promotes the version on
+ * its first session (`../transport/runtime-verification.ts`). Both fields are
+ * optional, so a `state.json` written before them reads as "nothing to verify".
+ *
  * Bundle-safe like the rest of `src/launcher/`: nothing from the daemon graph.
  */
 
@@ -54,11 +64,55 @@ export const WorkerProfileSchema = z.object({
 });
 export type WorkerProfile = z.infer<typeof WorkerProfileSchema>;
 
+/**
+ * How many starts in a row may fail on a runtime version being verified before the
+ * launcher gives up on it and starts the version the worker was moved from.
+ *
+ * The same budget, and for the same reasons, as `../worker/self-update.ts`'s
+ * `MAX_FAILED_STARTS` for a clone — a test pins the two together. Defined again here
+ * rather than imported because this module is bundled into the launcher, which must
+ * carry nothing from the daemon's module graph.
+ */
+export const MAX_FAILED_STARTS = 3;
+
+/**
+ * A runtime version this worker was moved to and has not proved yet: the version it
+ * moved to, the version it moved from, and how many starts in a row have failed since
+ * (issue #1303). The shape and the reasoning are `../worker/self-update.ts`'s
+ * `PendingVerificationSchema`, keyed on versions rather than commits.
+ *
+ * It exists because the proof can only come from the *next* process — the daemon
+ * running the new version — and that process may not survive long enough to say
+ * anything. So the question is left on disk, phrased so that a daemon which never
+ * gets a word in still answers it.
+ *
+ * There is no `adoptingPeers`: the record is one worker's, in its own profile
+ * directory, so no other daemon's restarts land on its counter.
+ */
+export const RuntimePendingVerificationSchema = z.object({
+	/** The version that was selected and is being judged. */
+	version: z.string().min(1),
+	/** The version it replaced — the one the launcher starts if this one never handshakes. */
+	previousVersion: z.string().min(1),
+	/**
+	 * Counted by the launcher at start, before the runtime's code runs, rather than on
+	 * a failure, because the failure this guards against can be a runtime that never
+	 * reaches any code of its own.
+	 */
+	failedStarts: z.number().int().min(0),
+	startedAt: z.string().datetime(),
+});
+export type RuntimePendingVerification = z.infer<typeof RuntimePendingVerificationSchema>;
+
 export const WorkerStateSchema = z.object({
 	lastRuntimeVersion: z.string().min(1),
 	startedAt: z.string().datetime(),
 	/** The version the launcher starts this worker on while it is installed (issue #1302). */
 	selectedVersion: z.string().min(1).optional(),
+	/** The last version a daemon of this worker established a session on (issue #1303). */
+	lastKnownGoodVersion: z.string().min(1).optional(),
+	/** The selected version still awaiting its first session; absent or `null` when none is. */
+	pendingVerification: RuntimePendingVerificationSchema.nullable().optional(),
 });
 export type WorkerState = z.infer<typeof WorkerStateSchema>;
 
@@ -194,15 +248,19 @@ export function writeWorkerState(workerId: string, state: WorkerState, homeDir?:
  * as it was. Answers like {@link readWorkerState} when there is no readable state to
  * update, and writes nothing in that case: the launcher writes the state before it
  * starts the daemon, so a daemon finding none was not started by a launcher.
+ *
+ * `patch` may be a function of the state as read, for a field that depends on
+ * another one (`lastKnownGoodVersion ??= …`), so the read and the write are one step.
  */
 export function updateWorkerState(
 	workerId: string,
-	patch: Partial<WorkerState>,
+	patch: Partial<WorkerState> | ((state: WorkerState) => Partial<WorkerState>),
 	homeDir?: string,
 ): WorkerState | null | undefined {
 	const state = readWorkerState(workerId, homeDir);
 	if (!state) return state;
-	const record = WorkerStateSchema.parse({ ...state, ...patch });
+	const changes = typeof patch === 'function' ? patch(state) : patch;
+	const record = WorkerStateSchema.parse({ ...state, ...changes });
 	writeRecord(workerStatePath(workerId, homeDir), record);
 	return record;
 }

@@ -72,7 +72,10 @@
  * owns are the ones that need a live transport — the first session promotes the
  * build, and a handshake the control plane rejects outright puts the install root
  * back on the last known good build and exits for the supervisor to restart it
- * there. Once a bad build has taken the socket, that is the only channel left.
+ * there. Once a bad build has taken the socket, that is the only channel left. A
+ * launcher-run daemon (`SWARM_WORKER_ID` set) does the same for the runtime *version*
+ * its worker was moved to (`./runtime-verification.ts`, issue #1303): its launcher
+ * counts the starts, and these two moments promote the version or spend its budget.
  */
 
 import { readFileSync } from 'node:fs';
@@ -112,6 +115,10 @@ import {
 	type WorkerQuotaReportingHandle,
 } from './quota-reporting.js';
 import { runtimeUpdateApply } from './runtime-update.js';
+import {
+	createRuntimeHandshakePromotion,
+	returnRuntimeAfterFatalHandshake,
+} from './runtime-verification.js';
 import {
 	declaredRepositories,
 	resolveWorkerCheckouts,
@@ -380,7 +387,13 @@ async function main(): Promise<void> {
 	// A session is the proof an applied update was waiting for, so the first one this
 	// process establishes is what makes the build it is running this machine's last
 	// known good one (issue #934). Every reconnect after it is a no-op.
-	const promoteBuild = createHandshakePromotion();
+	// A launcher-run daemon (`SWARM_WORKER_ID` set) proves the runtime *version* its
+	// worker was moved to instead, in its own `state.json` (issue #1303); the install
+	// root it runs from is an immutable runtime with nothing to promote.
+	const runtimeWorkerId = process.env.SWARM_WORKER_ID?.trim() || undefined;
+	const promoteBuild = runtimeWorkerId
+		? createRuntimeHandshakePromotion({ workerId: runtimeWorkerId })
+		: createHandshakePromotion();
 	const client = connectWorkerTransport({
 		controlPlaneUrl,
 		credential,
@@ -534,7 +547,15 @@ async function main(): Promise<void> {
 		// restart and no pushed update can fix, so the machine goes back to its last
 		// known good build by itself and ends here rather than dying on the new one
 		// (issue #934). Anything else is fatal exactly as it was.
-		if (await returnAfterFatalHandshake(err, { shutdown: releaseSessionAndResources })) return;
+		// A launcher-run daemon gives up on its runtime version instead, for its launcher
+		// to start the previous one (issue #1303).
+		const returned = runtimeWorkerId
+			? await returnRuntimeAfterFatalHandshake(err, {
+					workerId: runtimeWorkerId,
+					shutdown: releaseSessionAndResources,
+				})
+			: await returnAfterFatalHandshake(err, { shutdown: releaseSessionAndResources });
+		if (returned) return;
 		throw err;
 	}
 	stopQuotaReporting();

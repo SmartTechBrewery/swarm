@@ -91,7 +91,23 @@ const InstallLockSchema = z.object({
 });
 type InstallLock = z.infer<typeof InstallLockSchema>;
 
-const BuildInfoSchema = z.object({ commit: z.string().min(1).optional() }).passthrough();
+/**
+ * The launcher protocol a runtime declares in its `build-info.json` (issue #1303),
+ * stamped by `bin/build-worker-runtime.js`: `1` is a runtime whose daemon promotes a
+ * version awaiting verification on its first session. A runtime predating it never
+ * clears that record, so the launcher would abandon it after a few perfectly healthy
+ * starts — which is why `../transport/runtime-update.ts` refuses to move a worker to
+ * a runtime that does not declare it.
+ */
+export const RUNTIME_LAUNCHER_PROTOCOL = 1;
+
+const BuildInfoSchema = z
+	.object({
+		commit: z.string().min(1).optional(),
+		// A malformed value reads as none rather than losing the commit beside it.
+		launcherProtocol: z.number().int().positive().optional().catch(undefined),
+	})
+	.passthrough();
 
 type Fetch = typeof globalThis.fetch;
 
@@ -103,6 +119,8 @@ export interface InstalledRuntime {
 	entrypoint: string;
 	/** The commit the runtime's `build-info.json` records, when it has one. */
 	commit?: string;
+	/** The {@link RUNTIME_LAUNCHER_PROTOCOL} its `build-info.json` declares, when it declares one. */
+	launcherProtocol?: number;
 }
 
 export interface EnsuredRuntime {
@@ -193,8 +211,16 @@ export function installedRuntime(version: string, homeDir?: string): InstalledRu
 	const dir = join(runtimesDir(homeDir), version);
 	const entrypoint = join(dir, RUNTIME_ENTRYPOINT);
 	if (!existsSync(entrypoint)) return undefined;
-	const commit = readJson(join(dir, 'build-info.json'), BuildInfoSchema)?.commit;
-	return { version, dir, entrypoint, ...(commit ? { commit } : {}) };
+	const info = readJson(join(dir, 'build-info.json'), BuildInfoSchema);
+	return {
+		version,
+		dir,
+		entrypoint,
+		...(info?.commit ? { commit: info.commit } : {}),
+		...(typeof info?.launcherProtocol === 'number'
+			? { launcherProtocol: info.launcherProtocol }
+			: {}),
+	};
 }
 
 /** Every installed version, sorted. In-flight staging directories are not versions. */

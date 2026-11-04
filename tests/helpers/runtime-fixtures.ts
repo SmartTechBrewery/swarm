@@ -100,8 +100,18 @@ export function buildTar(entries: TarEntry[]): Buffer {
 
 export const TEST_ENTRYPOINT_SOURCE = 'console.log("runtime");\n';
 
+export interface RuntimeFixtureOptions {
+	/** The stamp's `launcherProtocol`; `null` for a runtime predating it. Defaults to 1. */
+	launcherProtocol?: number | null;
+}
+
 /** The entries of a runtime tarball for `version`, as the build script lays them out. */
-export function runtimeEntries(version: string, commit?: string): TarEntry[] {
+export function runtimeEntries(
+	version: string,
+	commit?: string,
+	options: RuntimeFixtureOptions = {},
+): TarEntry[] {
+	const launcherProtocol = options.launcherProtocol === undefined ? 1 : options.launcherProtocol;
 	const top = `swarm-worker-runtime-${version}`;
 	return [
 		{ name: `${top}/` },
@@ -112,12 +122,21 @@ export function runtimeEntries(version: string, commit?: string): TarEntry[] {
 			data: `${JSON.stringify({ name: 'swarm-worker-runtime', version })}\n`,
 		},
 		...(commit
-			? [{ name: `${top}/build-info.json`, data: `${JSON.stringify({ version, commit })}\n` }]
+			? [
+					{
+						name: `${top}/build-info.json`,
+						data: `${JSON.stringify({ version, commit, ...(launcherProtocol === null ? {} : { launcherProtocol }) })}\n`,
+					},
+				]
 			: []),
 		{ name: `${top}/dist/transport/connect-entry.mjs`, data: TEST_ENTRYPOINT_SOURCE },
 	];
 }
 
-export function buildRuntimeTarball(version: string, commit?: string): Buffer {
-	return gzipSync(buildTar(runtimeEntries(version, commit)));
+export function buildRuntimeTarball(
+	version: string,
+	commit?: string,
+	options: RuntimeFixtureOptions = {},
+): Buffer {
+	return gzipSync(buildTar(runtimeEntries(version, commit, options)));
 }

@@ -39,8 +39,9 @@ interface Release {
 function routesFor(
 	release: Release,
 	key: MinisignTestKey = KEY,
+	launcherProtocol?: number | null,
 ): { manifest: WorkerRuntimeManifest; artifact: [string, Buffer] } {
-	const tarball = buildRuntimeTarball(release.version, release.commit);
+	const tarball = buildRuntimeTarball(release.version, release.commit, { launcherProtocol });
 	const name = `swarm-worker-runtime-${release.version}.tar.gz`;
 	return {
 		manifest: {
@@ -72,13 +73,22 @@ interface ControlPlane {
 }
 
 function controlPlane(
-	options: { badSignatureFor?: string; unavailable?: Record<string, string> } = {},
+	options: {
+		badSignatureFor?: string;
+		unavailable?: Record<string, string>;
+		/** A release whose runtime predates `launcherProtocol`. */
+		unstampedFor?: string;
+	} = {},
 ): ControlPlane {
 	const calls: string[] = [];
 	const routes = new Map<string, () => Response>();
 	for (const release of [OWN, OTHER]) {
 		const key = options.badSignatureFor === release.version ? makeMinisignKey() : KEY;
-		const { manifest, artifact } = routesFor(release, key);
+		const { manifest, artifact } = routesFor(
+			release,
+			key,
+			options.unstampedFor === release.version ? null : undefined,
+		);
 		routes.set(`${MANIFEST_URL}?version=${release.version}`, () => Response.json(manifest));
 		if (release === OWN) routes.set(MANIFEST_URL, () => Response.json(manifest));
 		routes.set(artifact[0], () => new Response(new Uint8Array(artifact[1])));
@@ -154,6 +164,50 @@ describe('applyRuntimeUpdate', () => {
 		expect(selected()).toBe('3.0.0');
 		expect(existsSync(join(runtimesDir(home), '3.0.0'))).toBe(true);
 		expect(plane.calls).toContain(`${MANIFEST_URL}?version=3.0.0`);
+	});
+
+	it('records the move as awaiting verification, keeping the version it ran as the one to go back to', async () => {
+		const outcome = await apply('3.0.0', controlPlane(), {
+			now: () => Date.parse('2026-11-04T13:00:00.000Z'),
+		});
+		expect(outcome).toMatchObject({ status: 'applied' });
+		expect(readWorkerState(WORKER_ID, home)).toEqual({
+			lastRuntimeVersion: RUNNING.version,
+			startedAt: '2026-11-04T12:00:00.000Z',
+			selectedVersion: '3.0.0',
+			lastKnownGoodVersion: RUNNING.version,
+			pendingVerification: {
+				version: '3.0.0',
+				previousVersion: RUNNING.version,
+				failedStarts: 0,
+				startedAt: '2026-11-04T13:00:00.000Z',
+			},
+		});
+	});
+
+	it('keeps a last known good version already recorded', async () => {
+		writeWorkerState(
+			WORKER_ID,
+			{
+				lastRuntimeVersion: RUNNING.version,
+				startedAt: '2026-11-04T12:00:00.000Z',
+				selectedVersion: RUNNING.version,
+				lastKnownGoodVersion: '0.9.0',
+			},
+			home,
+		);
+		await apply('3.0.0', controlPlane());
+		expect(readWorkerState(WORKER_ID, home)?.lastKnownGoodVersion).toBe('0.9.0');
+	});
+
+	it('refuses a runtime that predates launcher-driven verification, leaving the state untouched', async () => {
+		const before = readWorkerState(WORKER_ID, home);
+		const outcome = await apply('3.0.0', controlPlane({ unstampedFor: '3.0.0' }));
+		expect(outcome).toMatchObject({ status: 'refused' });
+		expect(outcome.status === 'refused' && outcome.reason).toContain(
+			'v3.0.0 predates launcher-driven verification',
+		);
+		expect(readWorkerState(WORKER_ID, home)).toEqual(before);
 	});
 
 	it("resolves the installation's own commit, abbreviated, to its own release", async () => {
