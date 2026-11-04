@@ -49,8 +49,14 @@ import {
 	fetchRuntimeManifest,
 	installedRuntime,
 	RUNTIME_LAUNCHER_PROTOCOL,
+	withRuntimeStoreLock,
 } from '../launcher/runtime-store.js';
-import { isValidWorkerId, readWorkerState, updateWorkerState } from '../launcher/worker-profile.js';
+import {
+	isValidWorkerId,
+	readWorkerState,
+	updateWorkerState,
+	type WorkerState,
+} from '../launcher/worker-profile.js';
 import type { WorkerBuild } from '../lib/build-identity.js';
 import type { UpdateOutcome } from '../worker/self-update.js';
 import { isRuntimeVersion, type WorkerRuntimeManifest } from './runtime-manifest.js';
@@ -159,6 +165,43 @@ function describeVersion(version: string | undefined, fallback: string): string 
 	return version ? `v${version}` : fallback;
 }
 
+/**
+ * Record `version` as this worker's selection, awaiting verification. Under the store
+ * lock, so a prune cannot remove the version between checking it is installed and the
+ * state naming it (issue #1304). `'removed'` when it is no longer installed; otherwise
+ * as `updateWorkerState` answers.
+ */
+function recordSelection(
+	options: RuntimeUpdateOptions,
+	version: string,
+): Promise<WorkerState | null | undefined | 'removed'> {
+	const now = options.now ?? Date.now;
+	return withRuntimeStoreLock(
+		() => {
+			if (!installedRuntime(version, options.homeDir)) return 'removed' as const;
+			return updateWorkerState(
+				options.workerId,
+				(state) => ({
+					selectedVersion: version,
+					pendingVerification: {
+						version,
+						// The version the launcher started this daemon on, which is the one it goes
+						// back to: a directory it has installed, named as the selection names it.
+						previousVersion: state.lastRuntimeVersion,
+						failedStarts: 0,
+						startedAt: new Date(now()).toISOString(),
+					},
+					// A daemon can only receive an update over a session, so the version it runs
+					// has proved itself; keep an older proof if one is recorded.
+					lastKnownGoodVersion: state.lastKnownGoodVersion ?? state.lastRuntimeVersion,
+				}),
+				options.homeDir,
+			);
+		},
+		{ homeDir: options.homeDir, now: options.now, lockPollMs: options.lockPollMs },
+	);
+}
+
 async function applyRuntimeUpdateUnguarded(
 	options: RuntimeUpdateOptions,
 	previousCommit: string,
@@ -215,25 +258,11 @@ async function applyRuntimeUpdateUnguarded(
 			reason: `v${manifest.version} predates launcher-driven verification, so a launcher would abandon it after a few healthy starts. ${stays}`,
 		};
 
-	const now = options.now ?? Date.now;
-	const recorded = updateWorkerState(
-		options.workerId,
-		(state) => ({
-			selectedVersion: manifest.version,
-			pendingVerification: {
-				version: manifest.version,
-				// The version the launcher started this daemon on, which is the one it goes
-				// back to: a directory it has installed, named as the selection names it.
-				previousVersion: state.lastRuntimeVersion,
-				failedStarts: 0,
-				startedAt: new Date(now()).toISOString(),
-			},
-			// A daemon can only receive an update over a session, so the version it runs
-			// has proved itself; keep an older proof if one is recorded.
-			lastKnownGoodVersion: state.lastKnownGoodVersion ?? state.lastRuntimeVersion,
-		}),
-		options.homeDir,
-	);
+	const recorded = await recordSelection(options, manifest.version);
+	if (recorded === 'removed')
+		return failed(
+			`v${manifest.version} was removed from this host as an unused runtime before it could be selected. ${stays}`,
+		);
 	if (!recorded)
 		return failed(
 			`v${manifest.version} is installed, but this worker's launcher state could not be ${recorded === null ? 'found' : 'read'}, so it was not selected. ${stays}`,

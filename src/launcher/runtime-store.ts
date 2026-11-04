@@ -33,6 +33,13 @@
  *     holder that died (its pid is gone) or a lock older than
  *     {@link STALE_STAGING_MS} is simply reclaimed, and the rare race two
  *     reclaimers can lose costs one duplicate download, never a corrupt install.
+ *   - **A version no worker uses is removed, and only then** (issue #1304):
+ *     {@link pruneRuntimes} deletes an installed version only when no worker's
+ *     `state.json` names it, it has been in place for longer than
+ *     {@link STALE_STAGING_MS}, and no install of it is under way. It runs under the
+ *     store-wide `.locks/.store.lock`, which every write that selects an installed
+ *     version also takes around "is it still installed → record it", so a version
+ *     cannot be selected while it is being removed.
  *   - **Nothing from the daemon graph is imported**: the launcher bundles this
  *     module, and the manifest contract it reads is `node:`-free for that reason.
  */
@@ -54,7 +61,7 @@ import {
 	writeSync,
 } from 'node:fs';
 import { homedir, hostname } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { z } from 'zod';
 import {
 	type AvailableWorkerRuntimeManifest,
@@ -77,6 +84,12 @@ const STAGING_DIR = '.staging';
 
 /** Per-version install locks. Never versions either. */
 const LOCKS_DIR = '.locks';
+
+/**
+ * The store-wide lock (issue #1304), beside the per-version ones. Dot-prefixed so no
+ * version — which starts with a letter or digit — can ever name the same file.
+ */
+const STORE_LOCK = '.store.lock';
 
 /** A staging entry older than this was left by a killed install. A constant, not a setting. */
 export const STALE_STAGING_MS = 60 * 60 * 1000;
@@ -312,19 +325,16 @@ function tryCreateLock(path: string, record: InstallLock): boolean {
 	return true;
 }
 
+function locksDir(homeDir: string | undefined): string {
+	return join(runtimesDir(homeDir), LOCKS_DIR);
+}
+
 /**
- * Take `<runtimes>/.locks/<version>.lock`, waiting while a live holder has it and
- * reclaiming it from a dead or expired one. Resolves to the release function.
+ * Take the lock at `path`, waiting while a live holder has it and reclaiming it from
+ * a dead or expired one. Resolves to the release function.
  */
-async function acquireInstallLock(
-	version: string,
-	homeDir: string | undefined,
-	now: () => number,
-	pollMs: number,
-): Promise<() => void> {
-	const dir = join(runtimesDir(homeDir), LOCKS_DIR);
-	mkdirSync(dir, { recursive: true, mode: 0o700 });
-	const path = join(dir, `${version}.lock`);
+async function acquireLock(path: string, now: () => number, pollMs: number): Promise<() => void> {
+	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
 	while (true) {
 		const record: InstallLock = {
 			pid: process.pid,
@@ -349,6 +359,51 @@ async function acquireInstallLock(
 			continue;
 		}
 		await new Promise((resolvePromise) => setTimeout(resolvePromise, pollMs));
+	}
+}
+
+/** Take `<runtimes>/.locks/<version>.lock`. */
+function acquireInstallLock(
+	version: string,
+	homeDir: string | undefined,
+	now: () => number,
+	pollMs: number,
+): Promise<() => void> {
+	return acquireLock(join(locksDir(homeDir), `${version}.lock`), now, pollMs);
+}
+
+export interface StoreLockOptions {
+	/** Injectable so tests never touch the real home directory or clock. */
+	homeDir?: string;
+	now?: () => number;
+	/** How often to look again while another process holds the lock. */
+	lockPollMs?: number;
+}
+
+/**
+ * Run `fn` holding the store-wide lock (issue #1304). {@link pruneRuntimes} holds it
+ * while it reads every worker's state and removes what none of them names; a caller
+ * recording an installed version as a worker's selection holds it around checking
+ * the version is still installed and writing the state, so the two cannot interleave.
+ * Held briefly, and released however `fn` ends. Throws when the lock cannot be taken.
+ */
+export async function withRuntimeStoreLock<T>(
+	fn: () => T | Promise<T>,
+	options: StoreLockOptions = {},
+): Promise<T> {
+	const release = await acquireLock(
+		join(locksDir(options.homeDir), STORE_LOCK),
+		options.now ?? Date.now,
+		options.lockPollMs ?? INSTALL_LOCK_POLL_MS,
+	);
+	try {
+		return await fn();
+	} finally {
+		try {
+			release();
+		} catch {
+			// A lock left behind is reclaimed once its holder is gone.
+		}
 	}
 }
 
@@ -608,5 +663,75 @@ function installVerified(
 		return { error: `installing v${version} failed: ${errorMessage(err)}` };
 	} finally {
 		if (staging) removeTree(staging);
+	}
+}
+
+export interface PruneRuntimesInput extends StoreLockOptions {
+	/**
+	 * The versions some worker still names, read *under* the store lock — so a state
+	 * written just before this runs is seen, and one written after it waits for it.
+	 * `undefined` when that cannot be told (a worker's state is unreadable), and then
+	 * nothing at all is removed.
+	 */
+	keep: () => ReadonlySet<string> | undefined;
+}
+
+export interface PrunedRuntimes {
+	/** The versions removed, sorted. */
+	removed: string[];
+	/** Why nothing was removed, when nothing could be judged safe to remove. */
+	withheld?: string;
+}
+
+/** Whether a live holder has the lock at `path`. */
+function lockIsHeld(path: string, now: number): boolean {
+	return existsSync(path) && !lockIsStale(path, now);
+}
+
+/**
+ * Remove every installed version that `keep` does not name (issue #1304), under the
+ * store-wide lock. A version is kept, whatever `keep` says, while its directory is
+ * younger than {@link STALE_STAGING_MS} — just installed, and possibly about to be
+ * recorded by a worker this call cannot see yet — or while its install lock is held.
+ * `.staging/` and `.locks/` are never versions and never touched here.
+ *
+ * Best effort per version: one that cannot be removed is left for the next run and
+ * not reported. Throws only when the store lock itself cannot be taken.
+ */
+export async function pruneRuntimes(input: PruneRuntimesInput): Promise<PrunedRuntimes> {
+	const { homeDir } = input;
+	// Nothing to remove, and no reason to create `.locks/` in a store that is not there.
+	if (!existsSync(runtimesDir(homeDir))) return { removed: [] };
+	const now = input.now ?? Date.now;
+	return withRuntimeStoreLock(() => {
+		const keep = input.keep();
+		if (!keep)
+			return {
+				removed: [],
+				withheld: "a worker's launcher state could not be read, so no runtime version is removed",
+			};
+		const at = now();
+		const removed = listInstalledRuntimes(homeDir)
+			.filter((runtime) => !keep.has(runtime.version) && removeUnused(runtime, homeDir, at))
+			.map((runtime) => runtime.version);
+		return { removed };
+	}, input);
+}
+
+/** Remove one unreferenced version unless it is too young or being installed; `true` once it is gone. */
+function removeUnused(
+	runtime: InstalledRuntime,
+	homeDir: string | undefined,
+	now: number,
+): boolean {
+	try {
+		// A clock behind the directory's own mtime reads as young, the safe way.
+		if (now - statSync(runtime.dir).mtimeMs <= STALE_STAGING_MS) return false;
+		if (lockIsHeld(join(locksDir(homeDir), `${runtime.version}.lock`), now)) return false;
+		removeTree(runtime.dir);
+		return !existsSync(runtime.dir);
+	} catch {
+		// Vanished underneath us, or not ours to remove; the next run looks again.
+		return false;
 	}
 }

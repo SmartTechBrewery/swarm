@@ -20,9 +20,11 @@ import {
 	fetchRuntimeManifest,
 	installedRuntime,
 	listInstalledRuntimes,
+	pruneRuntimes,
 	RUNTIME_ENTRYPOINT,
 	runtimesDir,
 	STALE_STAGING_MS,
+	withRuntimeStoreLock,
 } from '@/launcher/runtime-store.js';
 import type { AvailableWorkerRuntimeManifest } from '@/transport/runtime-manifest.js';
 import {
@@ -495,5 +497,124 @@ describe('fetchRuntimeManifest', () => {
 		expect(await fetchRuntimeManifest('not a url', { fetch: fakeFetch({}).fetch })).toEqual({
 			error: expect.stringMatching(/not a valid URL/),
 		});
+	});
+});
+
+describe('pruneRuntimes', () => {
+	let home: string;
+	const NOW = Date.now();
+	const OLD = new Date(NOW - STALE_STAGING_MS - 60_000);
+
+	beforeEach(() => {
+		home = mkdtempSync(join(tmpdir(), 'runtime-prune-'));
+	});
+	afterEach(() => {
+		execFileSync('chmod', ['-R', 'u+w', home]);
+		rmSync(home, { recursive: true, force: true });
+	});
+
+	/** An installed version, read-only as `ensureRuntime` leaves one, put in place at `at`. */
+	const plant = (version: string, at: Date = OLD) => {
+		const dir = join(runtimesDir(home), version);
+		mkdirSync(join(dir, 'dist/transport'), { recursive: true });
+		writeFileSync(join(dir, RUNTIME_ENTRYPOINT), 'planted');
+		writeFileSync(join(dir, 'build-info.json'), JSON.stringify({ version, commit: COMMIT }));
+		execFileSync('chmod', ['-R', 'a-w', dir]);
+		utimesSync(dir, at, at);
+		return dir;
+	};
+	const installed = () => listInstalledRuntimes(home).map((runtime) => runtime.version);
+	const prune = (keep: ReadonlySet<string> | undefined) =>
+		pruneRuntimes({ keep: () => keep, homeDir: home, now: () => NOW, lockPollMs: 5 });
+
+	it('removes old versions nobody names, read-only trees included, and keeps the named ones', async () => {
+		const stale = plant('1.0.0');
+		expect(statSync(join(stale, RUNTIME_ENTRYPOINT)).mode & 0o777).toBe(0o444);
+		expect(statSync(join(stale, 'dist')).mode & 0o777).toBe(0o555);
+		plant('2.0.0');
+		plant('3.0.0');
+		expect(await prune(new Set(['2.0.0', '3.0.0']))).toEqual({ removed: ['1.0.0'] });
+		expect(existsSync(stale)).toBe(false);
+		expect(installed()).toEqual(['2.0.0', '3.0.0']);
+		// The store lock is released, and nothing but the versions was touched.
+		expect(readdirSync(join(runtimesDir(home), '.locks'))).toEqual([]);
+	});
+
+	it('keeps a version installed within the window, even when nobody names it yet', async () => {
+		plant('1.0.0', new Date(NOW - 60_000));
+		expect(await prune(new Set())).toEqual({ removed: [] });
+		expect(installed()).toEqual(['1.0.0']);
+	});
+
+	it('removes nothing when a worker state could not be read', async () => {
+		plant('1.0.0');
+		expect(await prune(undefined)).toEqual({
+			removed: [],
+			withheld: expect.stringMatching(/could not be read/),
+		});
+		expect(installed()).toEqual(['1.0.0']);
+	});
+
+	it('keeps a version whose install lock is held, and removes it once the holder is gone', async () => {
+		plant('1.0.0');
+		const locks = join(runtimesDir(home), '.locks');
+		mkdirSync(locks, { recursive: true });
+		const lock = join(locks, '1.0.0.lock');
+		writeFileSync(
+			lock,
+			JSON.stringify({
+				pid: process.pid,
+				hostname: hostname(),
+				createdAt: new Date(NOW).toISOString(),
+			}),
+		);
+		expect(await prune(new Set())).toEqual({ removed: [] });
+		expect(installed()).toEqual(['1.0.0']);
+
+		const deadPid = spawnSync(process.execPath, ['-e', '']).pid;
+		writeFileSync(
+			lock,
+			JSON.stringify({
+				pid: deadPid,
+				hostname: hostname(),
+				createdAt: new Date(NOW).toISOString(),
+			}),
+		);
+		expect(await prune(new Set())).toEqual({ removed: ['1.0.0'] });
+	});
+
+	it('never touches staging entries or locks', async () => {
+		const staging = join(runtimesDir(home), '.staging', '1.0.0.111.abc');
+		mkdirSync(staging, { recursive: true });
+		utimesSync(staging, OLD, OLD);
+		expect(await prune(new Set())).toEqual({ removed: [] });
+		expect(existsSync(staging)).toBe(true);
+	});
+
+	it('waits for the store lock while another process holds it', async () => {
+		plant('1.0.0');
+		let release!: () => void;
+		const held = withRuntimeStoreLock(
+			() =>
+				new Promise<void>((resolve) => {
+					release = resolve;
+				}),
+			{ homeDir: home, lockPollMs: 5 },
+		);
+		let settled = false;
+		const pruned = prune(new Set()).then((result) => {
+			settled = true;
+			return result;
+		});
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		expect(settled).toBe(false);
+		release();
+		await held;
+		expect(await pruned).toEqual({ removed: ['1.0.0'] });
+	});
+
+	it('does nothing, and creates nothing, when there is no store', async () => {
+		expect(await prune(new Set())).toEqual({ removed: [] });
+		expect(existsSync(runtimesDir(home))).toBe(false);
 	});
 });

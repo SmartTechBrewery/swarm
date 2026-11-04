@@ -54,6 +54,11 @@
  *     that version is not installed the launcher exits 1 and leaves the record, so a
  *     machine that cannot go back stays down and loud rather than crash-looping on the
  *     version that never connected.
+ *   - **Versions no worker uses are removed on the way out** (issue #1304). Once
+ *     this start is recorded — under the store lock, after checking the version is
+ *     still installed — every installed version no worker's `state.json` names is
+ *     removed (`pruneRuntimes`), and each removal is logged. Best effort: nothing it
+ *     fails at stops the start, and an unreadable state means nothing is removed.
  *   - **The credential travels in the daemon's environment only** — never in
  *     `argv`, never printed — exactly as `swarm run:worker` passes it.
  *   - **It hands its own process to the daemon** with `process.execve`, for the
@@ -80,13 +85,17 @@ import {
 	fetchRuntimeManifest,
 	installedRuntime,
 	listInstalledRuntimes,
+	pruneRuntimes,
 	runtimesDir,
+	type StoreLockOptions,
+	withRuntimeStoreLock,
 } from './runtime-store.js';
 import {
 	isValidWorkerId,
 	MAX_FAILED_STARTS,
 	readWorkerProfile,
 	readWorkerState,
+	referencedRuntimeVersions,
 	updateWorkerState,
 	type WorkerProfile,
 	workerProfileDir,
@@ -127,7 +136,8 @@ variables, runs in the profile directory, and logs to <profileDir>/logs/worker.l
 When the control plane cannot be reached, the version this worker last started on
 is used if it is still installed. A runtime that fails a check is never started.
 A version the worker was moved to that has not connected after ${MAX_FAILED_STARTS} starts in a
-row is given up on, and the version it was moved from is started instead.`;
+row is given up on, and the version it was moved from is started instead.
+Runtime versions no worker on this host uses any more are removed as it starts.`;
 
 type Execve = (file: string, args: string[], env: NodeJS.ProcessEnv) => unknown;
 
@@ -152,6 +162,8 @@ export interface LauncherDeps {
 	trustedKeyPath?: string | null;
 	execPath?: string;
 	now?: () => number;
+	/** How often to look again while another process holds a runtime store lock. */
+	lockPollMs?: number;
 	stdout?: (line: string) => void;
 	stderr?: (line: string) => void;
 }
@@ -351,20 +363,42 @@ async function runWorker(workerId: string, deps: LauncherDeps, io: Io): Promise<
 	}
 
 	const now = deps.now ?? Date.now;
-	// Everything else in the state — the pending record and the last known good
-	// version above all — carries over untouched.
-	const state = readWorkerState(workerId, deps.homeDir);
-	const selectedVersion = runtime.select ?? state?.selectedVersion;
-	writeWorkerState(
-		workerId,
-		{
-			...state,
-			lastRuntimeVersion: runtime.version,
-			startedAt: new Date(now()).toISOString(),
-			...(selectedVersion ? { selectedVersion } : {}),
-		},
-		deps.homeDir,
-	);
+	const recordStart = (): boolean => {
+		// A version unreferenced until now may have been removed since it was resolved.
+		if (!installedRuntime(runtime.version, deps.homeDir)) return false;
+		// Everything else in the state — the pending record and the last known good
+		// version above all — carries over untouched.
+		const state = readWorkerState(workerId, deps.homeDir);
+		const selectedVersion = runtime.select ?? state?.selectedVersion;
+		writeWorkerState(
+			workerId,
+			{
+				...state,
+				lastRuntimeVersion: runtime.version,
+				startedAt: new Date(now()).toISOString(),
+				...(selectedVersion ? { selectedVersion } : {}),
+			},
+			deps.homeDir,
+		);
+		return true;
+	};
+	let recorded: boolean;
+	try {
+		recorded = await withRuntimeStoreLock(recordStart, storeLockOptions(deps));
+	} catch (err) {
+		// The lock guards against a concurrent prune, which could not take it either.
+		io.warn(
+			`could not take the runtime store lock (${errorMessage(err)}); recording this start without it`,
+		);
+		recorded = recordStart();
+	}
+	if (!recorded) {
+		io.error(
+			`v${runtime.version} was removed from this host while this worker was starting; start it again`,
+		);
+		return 1;
+	}
+	await pruneUnusedRuntimes(deps, io);
 
 	const profileDir = workerProfileDir(workerId, deps.homeDir);
 	const logsDir = join(profileDir, 'logs');
@@ -387,6 +421,33 @@ async function runWorker(workerId: string, deps: LauncherDeps, io: Io): Promise<
 		`starting worker '${workerId}' on v${runtime.version} for ${profile.repoRoots.join(', ')}…`,
 	);
 	return becomeDaemon(runtime.entrypoint, profileDir, env, deps, io);
+}
+
+function errorMessage(err: unknown): string {
+	return err instanceof Error ? err.message : String(err);
+}
+
+function storeLockOptions(deps: LauncherDeps): StoreLockOptions {
+	return { homeDir: deps.homeDir, now: deps.now, lockPollMs: deps.lockPollMs };
+}
+
+/**
+ * Remove the runtime versions no worker on this host names any more (issue #1304),
+ * now that this worker's own start is recorded. Best effort: a failure is reported
+ * and the start goes on.
+ */
+async function pruneUnusedRuntimes(deps: LauncherDeps, io: Io): Promise<void> {
+	try {
+		const pruned = await pruneRuntimes({
+			...storeLockOptions(deps),
+			keep: () => referencedRuntimeVersions(deps.homeDir),
+		});
+		for (const version of pruned.removed)
+			io.info(`removed v${version}, which no worker on this host uses any more`);
+		if (pruned.withheld) io.warn(pruned.withheld);
+	} catch (err) {
+		io.warn(`could not remove unused runtime versions: ${errorMessage(err)}`);
+	}
 }
 
 /**
@@ -416,7 +477,7 @@ function becomeDaemon(
 			// a second daemon on the strength of an exec that may have half happened.
 			return 0;
 		} catch (err) {
-			refusal = `could not hand this process to the daemon (${err instanceof Error ? err.message : String(err)})`;
+			refusal = `could not hand this process to the daemon (${errorMessage(err)})`;
 		}
 	}
 	io.warn(`${refusal}; starting the daemon as a child process instead`);

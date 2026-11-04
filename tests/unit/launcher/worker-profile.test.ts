@@ -18,6 +18,7 @@ import {
 	MAX_FAILED_STARTS,
 	readWorkerProfile,
 	readWorkerState,
+	referencedRuntimeVersions,
 	updateWorkerProfileRepoRoots,
 	updateWorkerState,
 	workerProfileDir,
@@ -213,5 +214,57 @@ describe('worker profiles', () => {
 
 	it("counts failed starts against the same budget as a clone's build verification", () => {
 		expect(MAX_FAILED_STARTS).toBe(CLONE_MAX_FAILED_STARTS);
+	});
+
+	describe('referencedRuntimeVersions', () => {
+		it('names every version any worker state names, profile or not', () => {
+			writeWorkerState(
+				'worker-one',
+				{
+					lastRuntimeVersion: '2.0.0',
+					startedAt: '2026-11-04T12:00:00.000Z',
+					selectedVersion: '3.0.0',
+					lastKnownGoodVersion: '1.0.0',
+					pendingVerification: {
+						version: '3.0.0',
+						previousVersion: '2.0.0',
+						failedStarts: 1,
+						startedAt: '2026-11-04T12:00:00.000Z',
+					},
+				},
+				home,
+			);
+			// A state with no profile beside it still names what a launcher starts from.
+			const orphan = join(workerProfilesDir(home), 'not.a.worker.id');
+			mkdirSync(orphan, { recursive: true });
+			writeFileSync(
+				join(orphan, 'state.json'),
+				JSON.stringify({ lastRuntimeVersion: '0.9.0', startedAt: '2026-11-04T12:00:00.000Z' }),
+			);
+			// A directory with no state, and a stray file, name nothing.
+			mkdirSync(join(workerProfilesDir(home), 'worker-two'));
+			writeFileSync(join(workerProfilesDir(home), 'README'), 'not a worker');
+			expect([...(referencedRuntimeVersions(home) ?? ['unreadable'])].sort()).toEqual([
+				'0.9.0',
+				'1.0.0',
+				'2.0.0',
+				'3.0.0',
+			]);
+		});
+
+		it('is empty when there are no workers at all', () => {
+			expect(referencedRuntimeVersions(home)).toEqual(new Set());
+		});
+
+		it('cannot tell when any state is unreadable', () => {
+			writeWorkerState(
+				'worker-one',
+				{ lastRuntimeVersion: '2.0.0', startedAt: '2026-11-04T12:00:00.000Z' },
+				home,
+			);
+			mkdirSync(join(workerProfilesDir(home), 'worker-two'));
+			writeFileSync(join(workerProfilesDir(home), 'worker-two', 'state.json'), '{ not json');
+			expect(referencedRuntimeVersions(home)).toBeUndefined();
+		});
 	});
 });

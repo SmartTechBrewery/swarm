@@ -39,7 +39,7 @@
  * Bundle-safe like the rest of `src/launcher/`: nothing from the daemon graph.
  */
 
-import { chmodSync, mkdirSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { z } from 'zod';
@@ -263,6 +263,54 @@ export function updateWorkerState(
 	const record = WorkerStateSchema.parse({ ...state, ...changes });
 	writeRecord(workerStatePath(workerId, homeDir), record);
 	return record;
+}
+
+/**
+ * Every runtime version some worker on this host still names (issue #1304): its
+ * selected version, the one it last ran, its last known good one, and both sides of a
+ * pending verification — the set `pruneRuntimes` must keep.
+ *
+ * Every directory under `~/.swarm/workers/` is read, not only those with a readable
+ * profile or a path-safe name, since a state is what a launcher starts from either
+ * way. `undefined` when any state is present but unreadable, or the directory itself
+ * cannot be listed: a version only that state names cannot be told apart from an
+ * unused one, so the caller then removes nothing.
+ */
+export function referencedRuntimeVersions(homeDir?: string): Set<string> | undefined {
+	const root = workerProfilesDir(homeDir);
+	let names: string[];
+	try {
+		names = readdirSync(root);
+	} catch (err) {
+		return (err as NodeJS.ErrnoException).code === 'ENOENT' ? new Set() : undefined;
+	}
+	const versions = new Set<string>();
+	for (const name of names) {
+		const state = readStateIn(resolve(root, name));
+		if (state === undefined) return undefined;
+		for (const version of state ? stateVersions(state) : []) versions.add(version);
+	}
+	return versions;
+}
+
+/** The state in a directory under `~/.swarm/workers/`: `null` for none (or no directory), `undefined` when unreadable. */
+function readStateIn(dir: string): WorkerState | null | undefined {
+	try {
+		if (!statSync(dir).isDirectory()) return null;
+	} catch {
+		return null;
+	}
+	return readJson(resolve(dir, STATE_FILE), WorkerStateSchema);
+}
+
+function stateVersions(state: WorkerState): string[] {
+	return [
+		state.selectedVersion,
+		state.lastRuntimeVersion,
+		state.lastKnownGoodVersion,
+		state.pendingVerification?.version,
+		state.pendingVerification?.previousVersion,
+	].filter((version): version is string => Boolean(version));
 }
 
 /** Write one record owner-only, atomically, and return the path written. */
