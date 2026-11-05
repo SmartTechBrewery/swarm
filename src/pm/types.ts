@@ -340,7 +340,16 @@ export interface WorkItemBlocker {
 	url: string;
 	/** Title of the blocking issue/item, for human-readable messages. */
 	title: string;
-	/** Whether the blocker is still unfinished — a still-`open` blocker gates dependent work. */
+	/**
+	 * Whether the blocker is still unfinished — a still-`open` blocker gates dependent work.
+	 *
+	 * **Finished means what SWARM itself treats as done** (issue #1327). A provider
+	 * with a configurable `done` mapping reports a blocker sitting in that mapped
+	 * status as finished even when the provider's own model would not call it
+	 * closed (a Jira `done` mapped to an "In progress"-category QA column), as well
+	 * as one in its native closed state. {@link WorkItemDependent.open} follows the
+	 * same rule, so the gate, the cycle backstop and the early wakes agree.
+	 */
 	open: boolean;
 	/**
 	 * How the dependency was found: a `dependency` relationship the provider models
@@ -383,7 +392,10 @@ export interface WorkItemDependent {
 	url: string;
 	/** Title of the dependent issue/item, for human-readable messages. */
 	title: string;
-	/** Whether the dependent is still unfinished. Informational: a cycle is a cycle either way. */
+	/**
+	 * Whether the dependent is still unfinished, by the same rule as
+	 * {@link WorkItemBlocker.open}. Informational: a cycle is a cycle either way.
+	 */
 	open: boolean;
 }
 
@@ -634,20 +646,23 @@ export interface PMProvider {
 	 * Projects reads it off the backing Issue's state — the column write alone
 	 * leaves a done-looking card still gating its dependents, and the state write
 	 * alone leaves the card parked in an active column. A provider whose status
-	 * *is* its open/closed state (a Linear finished-type state, a Jira `done`
-	 * status category, a Trello list) owes exactly the one write, and says so in
-	 * its own module rather than leaving the reader to assume it.
+	 * *is* its open/closed state (a Linear workflow state, a Jira status, a Trello
+	 * list) owes exactly the one write, and says so in its own module rather than
+	 * leaving the reader to assume it.
 	 *
 	 * **The end state is the provider's to verify, not the operator's to get
 	 * right.** Nothing validates a board mapping's `done` against the native
 	 * semantics a provider's own `listBlockers` reads — `statusOptions` holds
 	 * opaque provider ids, and the board-mapping screen accepts any of the board's
-	 * states for the key — so a provider whose settle *depends* on that mapping
-	 * being terminal must check it rather than assume it, and refuse loudly when it
-	 * is not. Refusing is the contract-honest outcome: a settle that returns
-	 * normally while a later `listBlockers` still reports `open: true` would gate
-	 * the item's dependents indefinitely with nothing to point at. Prefer checking
-	 * before any write, so an invalid mapping leaves the board untouched.
+	 * states for the key. A provider whose `open` already counts its mapped `done`
+	 * as finished ({@link WorkItemBlocker.open}, issue #1327) needs no check that
+	 * the mapping is terminal — the one write satisfies the end state for any
+	 * mapping — and refuses only a mapping it cannot settle into at all (a stale
+	 * id). A provider that derives `open` from somewhere else owes the extra write
+	 * above instead. Either way, a settle that returns normally while a later
+	 * `listBlockers` still reports `open: true` would gate the item's dependents
+	 * indefinitely with nothing to point at, so refuse loudly — before any write —
+	 * rather than return.
 	 *
 	 * Idempotent — settling an already-settled item is a no-op rather than an
 	 * error, so a retried delivery can re-assert the end state safely.
