@@ -1977,8 +1977,9 @@ the branch is the repository's branch name pattern filled for `VT-1538` — e.g.
 Development panel to link the commits and the pull request too, set the
 project's commit subject pattern to `{issue_key} {Subject}` (issue #1242; set once
 for every repository on the dashboard's Source control tab, issue #1246):
-every commit SWARM makes for the card, review and CI fixes included, and the
-pull request's title then start with `VT-1538 `. A card **with** a
+every commit SWARM makes for the card, review and CI fixes and Resolve conflicts'
+merge commits included (issue #1332), and the pull request's title then start
+with `VT-1538 `. A card **with** a
 GitHub issue link keeps that issue's number exactly as before, and a card linked
 into a repository the run is not for is still skipped with
 `pm-status: work item has no backing SCM artifact reference` rather than falling
