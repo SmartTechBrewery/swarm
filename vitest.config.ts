@@ -43,6 +43,10 @@ export default defineConfig({
 					name: 'unit',
 					include: ['tests/unit/**/*.test.ts'],
 					pool: 'threads',
+					// The launcher and installer cases spawn sh, node and tar. Alone they
+					// take well under a second, but the full parallel run (the pre-push
+					// hook) pushed some past the 5 s default and blocked a release push.
+					testTimeout: 20_000,
 					...sharedTest,
 				},
 				resolve,
