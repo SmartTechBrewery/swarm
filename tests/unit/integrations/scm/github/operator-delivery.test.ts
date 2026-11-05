@@ -125,6 +125,20 @@ describe('createOperatorDeliveryProvider', () => {
 		expect(withGitHubToken.mock.calls[0][0]).toBe(TOKEN);
 	});
 
+	// Issue #1334: a fresh attempt replaces an abandoned head, and only that head.
+	it('replaces the branch under a lease only when given the head it replaces', async () => {
+		const delivery = await createOperatorDeliveryProvider(REPO, TOKEN);
+		await delivery.pushBranch('/work/tree', 'issue-1', 'sha123', 'old456');
+
+		expect(execFileCalls[0]?.args).toEqual([
+			'push',
+			'--no-verify',
+			'--force-with-lease=refs/heads/issue-1:old456',
+			`https://github.com/${REPO}.git`,
+			'sha123:refs/heads/issue-1',
+		]);
+	});
+
 	it('pushes the branch with the operator token in the auth header', async () => {
 		const delivery = await createOperatorDeliveryProvider(REPO, TOKEN);
 		await delivery.pushBranch('/work/tree', 'issue-1', 'sha123');

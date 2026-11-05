@@ -164,6 +164,16 @@ export interface ProvisionOptions {
 	 * any held lease blocks.
 	 */
 	runId?: string;
+	/**
+	 * Cut `branch` afresh from the base even when a local or remote branch of that
+	 * name already exists (issue #1334) — for an Implementation that starts over after
+	 * its earlier pull request was closed, and must not resume that pull request's
+	 * finished work. The local branch ref is reset to the base (`worktree add -B`);
+	 * when another worktree holds the branch, the base is checked out detached
+	 * instead, which still delivers, since the push names the branch explicitly.
+	 * Ignored with {@link detach} or `createBranch: false`.
+	 */
+	resetBranch?: boolean;
 }
 
 /**
@@ -545,18 +555,11 @@ export class GitWorktreeManager {
 			? baseBranch
 			: (options.branch ?? provisionalTaskBranch(this.project, taskId));
 
-		// Whether a local branch of this name survives into the checkout below. On the
-		// create path the reap already asked git, so its answer is reused rather than
-		// repeating `branch --list`; on the existing-branch path the branch is the
-		// caller's premise, so nothing is asked at all.
-		const localBranchExists =
-			createBranch && !explicitlyDetached ? await this.reapOrphanedBranch(branch) : !createBranch;
-
 		// What `git worktree add` can actually be asked for, which is not always what
 		// the caller asked for (issue #558) — see {@link resolveBranchCheckout}.
 		const checkout = explicitlyDetached
 			? { mode: 'detach' as const, ref: baseRef }
-			: await this.resolveBranchCheckout(branch, createBranch, localBranchExists);
+			: await this.chooseBranchCheckout(branch, baseRef, createBranch, options.resetBranch);
 		const detached = checkout.mode === 'detach';
 
 		const args = ['worktree', 'add'];
@@ -564,6 +567,8 @@ export class GitWorktreeManager {
 			args.push('--detach', path, checkout.ref);
 		} else if (checkout.mode === 'create') {
 			args.push('-b', branch, path, baseRef);
+		} else if (checkout.mode === 'reset') {
+			args.push('-B', branch, path, baseRef);
 		} else {
 			args.push(path, branch);
 		}
@@ -659,6 +664,49 @@ export class GitWorktreeManager {
 			return { mode: 'checkout' };
 		}
 		return { mode: 'create' };
+	}
+
+	/**
+	 * The checkout for a non-detached provision: a reset onto the base for a fresh
+	 * attempt ({@link ProvisionOptions.resetBranch}), otherwise whatever
+	 * {@link resolveBranchCheckout} makes of the branch this repository already holds.
+	 */
+	private async chooseBranchCheckout(
+		branch: string,
+		baseRef: string,
+		createBranch: boolean,
+		resetBranch = false,
+	): Promise<{ mode: 'create' | 'checkout' | 'reset' } | { mode: 'detach'; ref: string }> {
+		if (resetBranch && createBranch) return this.resolveBranchReset(branch, baseRef);
+		// Whether a local branch of this name survives into the checkout. On the create
+		// path the reap already asked git, so its answer is reused rather than repeating
+		// `branch --list`; on the existing-branch path the branch is the caller's premise,
+		// so nothing is asked at all.
+		const localBranchExists = createBranch ? await this.reapOrphanedBranch(branch) : true;
+		return this.resolveBranchCheckout(branch, createBranch, localBranchExists);
+	}
+
+	/**
+	 * How to cut `branch` afresh from `baseRef` when it may already exist
+	 * ({@link ProvisionOptions.resetBranch}, issue #1334): reset the local ref onto the
+	 * base, or — when another worktree holds the branch, which git will not reset under
+	 * it — check the base out detached. Either way the checkout starts at the base and
+	 * not at the branch's previous head.
+	 */
+	private async resolveBranchReset(
+		branch: string,
+		baseRef: string,
+	): Promise<{ mode: 'reset' } | { mode: 'detach'; ref: string }> {
+		const holder = await this.worktreeHoldingBranch(branch);
+		if (holder) {
+			logger.warn(
+				'Task branch is checked out in another worktree — starting the fresh attempt detached at the base',
+				{ branch, holder, baseRef },
+			);
+			return { mode: 'detach', ref: baseRef };
+		}
+		logger.warn('Resetting task branch to the base for a fresh attempt', { branch, baseRef });
+		return { mode: 'reset' };
 	}
 
 	/**

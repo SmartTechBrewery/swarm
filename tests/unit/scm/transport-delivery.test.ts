@@ -233,6 +233,9 @@ describe('createTransportScmDeliveryProvider', () => {
 		expect(local.findPullRequest).toHaveBeenCalledWith('branch');
 		expect(local.createPullRequest).toHaveBeenCalledWith(prInput);
 		expect(local.pushBranch).toHaveBeenCalledWith('/cwd', 'feature', 'sha');
+		// A lease over an abandoned head (issue #1334) is forwarded as given.
+		await provider.pushBranch('/cwd', 'feature', 'sha', 'old');
+		expect(local.pushBranch).toHaveBeenLastCalledWith('/cwd', 'feature', 'sha', 'old');
 		expect(fetchImpl).not.toHaveBeenCalled();
 	});
 });

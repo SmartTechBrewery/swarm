@@ -107,6 +107,11 @@ export interface BuildTaskAssignmentInput {
 	 */
 	commitSubject?: string;
 	/**
+	 * implementation only: the pull request an earlier Implementation run of the task
+	 * delivered (issue #1334), read off the run record by the caller.
+	 */
+	deliveredPullRequestUrl?: string;
+	/**
 	 * The selected worker's own operator SCM credential for this project's provider,
 	 * resolved by the caller from the per-`(worker, provider)` store
 	 * (`requireWorkerScmCredential`, `../identity/worker-scm-credential.ts`).
@@ -173,6 +178,7 @@ export function buildTaskAssignment(input: BuildTaskAssignmentInput): TaskAssign
 		repository: input.repository,
 		taskBranch: input.taskBranch,
 		commitSubject: input.commitSubject,
+		deliveredPullRequestUrl: input.deliveredPullRequestUrl,
 		operatorCredential: input.operatorCredential,
 	};
 	// Validate before returning so a bad assembly fails at the seam, not on the wire.

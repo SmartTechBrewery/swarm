@@ -34,10 +34,13 @@ vi.mock('node:fs', () => ({
 // fixture path, not a checkout, so the commit is stubbed; `implementation-delivery.test.ts`
 // exercises commit/push/PR against real repositories.
 const DELIVERED_SHA = 'c0ffee1234567890c0ffee1234567890c0ffee12';
+// The abandoned branch's head on `origin` (issue #1334), read from the fixture path.
+const ABANDONED_SHA = 'abad0ned00000000000000000000000000000000';
 vi.mock('@/scm/delivery.js', async (importOriginal) => ({
 	...(await importOriginal<typeof import('@/scm/delivery.js')>()),
 	commitPreparedTree: vi.fn(async () => DELIVERED_SHA),
 	renameCheckedOutBranch: vi.fn(async () => {}),
+	resolveCommitSha: vi.fn(async (): Promise<string | undefined> => ABANDONED_SHA),
 }));
 
 // A checkpoint continuation's gate verdict. The gate itself (validation, lease
@@ -56,15 +59,20 @@ import type { Checkpoint } from '@/pipeline/checkpoint.js';
 import {
 	BLOCKED_REASON_FILENAME,
 	buildImplementationPrompt,
+	freshAttemptCommentBody,
+	freshAttemptMarker,
 	implementationCommentBody,
+	implementationDeliveryMarker,
 	runImplementationPhase,
 } from '@/pipeline/implementation.js';
 import { PULL_REQUEST_DESCRIPTION_STRUCTURE } from '@/pipeline/prompts/implementation.js';
 import type { WorkItemBlocker, WorkItemDependent } from '@/pm/types.js';
 import {
 	commitPreparedTree,
+	deliveryIdentity,
 	HANDOFF_FILENAMES,
 	renameCheckedOutBranch,
+	resolveCommitSha,
 	type ScmDeliveryProvider,
 } from '@/scm/delivery.js';
 import { isSwarmGeneratedBody } from '@/scm/swarm-origin.js';
@@ -124,7 +132,9 @@ function makeDelivery() {
 			async (_branch: string) => undefined as { number: number; url: string } | undefined,
 		),
 		createPullRequest: vi.fn(async () => ({ number: 99, url: PR_URL })),
-		pushBranch: vi.fn(async (_cwd: string, _branch: string, _expectedSha: string) => {}),
+		pushBranch: vi.fn(
+			async (_cwd: string, _branch: string, _expectedSha: string, _replacingSha?: string) => {},
+		),
 		submitReview: vi.fn(async () => 0),
 		readPullRequestContext: vi.fn(async () => createMockPullRequestContext()),
 		readReview: vi.fn(async () => createMockPullRequestReview()),
@@ -1030,6 +1040,197 @@ describe('runImplementationPhase — commit subject pattern (issue #1242)', () =
 
 		expect(result.branch).toBe('fix/VT-1538');
 		expect(committedSubject()).toBe('fix: add the starting page of the SWARM test bed');
+	});
+});
+
+describe('runImplementationPhase — fresh attempt after an abandoned pull request (issue #1334)', () => {
+	const OLD_PR_URL = 'https://github.com/SmartTechBrewery/swarm/pull/42';
+
+	beforeEach(() => {
+		handoffFileExists = true;
+		handoffFileContents = JSON.stringify({
+			summary: 'Adds the starting page.',
+			subject: 'add the starting page of the SWARM test bed',
+			workType: 'feat',
+			verification: [{ command: 'npm test', outcome: 'passed' }],
+			limitations: [],
+			readyForDelivery: true,
+		});
+		blockedReasonFileExists = false;
+		checkpointFileExists = false;
+		progressFileContents = undefined;
+		vi.mocked(commitPreparedTree).mockClear();
+		vi.mocked(resolveCommitSha).mockReset().mockResolvedValue(ABANDONED_SHA);
+	});
+
+	function freshDeps() {
+		const deps = makeDeps();
+		return {
+			...deps,
+			project: createMockProjectConfig({ commitSubjectPattern: '{issue_key} {Subject}' }),
+			taskBranch: 'issue-19',
+			commitSubject: '19 Old subject from the abandoned PR',
+			deliveredPullRequestUrl: OLD_PR_URL,
+			onCommitSubjectNamed: vi.fn(async (_subject: string) => {}),
+		};
+	}
+
+	function commentBodies(deps: ReturnType<typeof makeDeps>): string[] {
+		return deps.pm.addComment.mock.calls.map(([, body]) => body);
+	}
+
+	it('resets the branch, re-renders the subject, pushes under a lease and says so on the card', async () => {
+		const deps = freshDeps();
+
+		const result = await runImplementationPhase({ ...deps, resumeExistingBranch: true });
+
+		expect(deps.delivery.findPullRequest).toHaveBeenCalledWith('issue-19');
+		expect(deps.worktrees.reuse).not.toHaveBeenCalled();
+		expect(deps.worktrees.provision).toHaveBeenCalledWith('19', {
+			branch: 'issue-19',
+			runId: undefined,
+			resetBranch: true,
+		});
+		expect(resolveCommitSha).toHaveBeenCalledWith(WORKTREE_PATH, 'refs/remotes/origin/issue-19');
+		expect(deps.runAgent).toHaveBeenCalledTimes(1);
+
+		const subject = '19 Add the starting page of the SWARM test bed';
+		expect(vi.mocked(commitPreparedTree).mock.calls[0]?.[1]).toBe(subject);
+		expect(deps.onCommitSubjectNamed).toHaveBeenCalledExactlyOnceWith(subject);
+		expect(deps.delivery.pushBranch).toHaveBeenCalledWith(
+			WORKTREE_PATH,
+			'issue-19',
+			DELIVERED_SHA,
+			ABANDONED_SHA,
+		);
+		expect(JSON.parse(progressFileContents ?? '{}').replacingSha).toBe(ABANDONED_SHA);
+		expect(deps.delivery.createPullRequest).toHaveBeenCalledTimes(1);
+		expect(result.prUrl).toBe(PR_URL);
+
+		const bodies = commentBodies(deps);
+		expect(bodies).toHaveLength(2);
+		expect(bodies[0]).toContain(OLD_PR_URL);
+		expect(bodies[0]).toContain(ABANDONED_SHA);
+		expect(bodies[0]).toContain(freshAttemptMarker(OLD_PR_URL));
+		expect(isSwarmGeneratedBody(bodies[0] ?? '')).toBe(true);
+		// The new pull request's link is a comment of its own, not the abandoned one's.
+		expect(bodies[1]).toContain(PR_URL);
+		const markers = (deps.pm.findComment.mock.calls as unknown as [string, string][]).map(
+			([, marker]) => marker,
+		);
+		expect(markers).toContain(freshAttemptMarker(OLD_PR_URL));
+		expect(markers).not.toContain(
+			implementationDeliveryMarker(
+				deliveryIdentity(['implementation', deps.project.repo, '19', 'issue-19']),
+			),
+		);
+	});
+
+	it('posts the notice once, however many attempts the fresh start takes', async () => {
+		const deps = freshDeps();
+		deps.pm.findComment.mockImplementation((async (_id: string, marker: string) =>
+			marker === freshAttemptMarker(OLD_PR_URL) ? 'notice-1' : undefined) as never);
+
+		await runImplementationPhase(deps);
+
+		expect(commentBodies(deps).some((body) => body.includes('fresh attempt'))).toBe(false);
+	});
+
+	it('pushes ordinarily and says the branch was gone when origin no longer has it', async () => {
+		vi.mocked(resolveCommitSha).mockResolvedValue(undefined);
+		const deps = freshDeps();
+
+		await runImplementationPhase(deps);
+
+		expect(deps.delivery.pushBranch).toHaveBeenCalledWith(WORKTREE_PATH, 'issue-19', DELIVERED_SHA);
+		expect(commentBodies(deps)[0]).toContain('was absent on origin');
+	});
+
+	it('still runs the attempt when the card refuses the notice', async () => {
+		const deps = freshDeps();
+		deps.pm.addComment.mockRejectedValueOnce(new Error('board unavailable'));
+
+		await expect(runImplementationPhase(deps)).resolves.toMatchObject({ prUrl: PR_URL });
+		expect(deps.runAgent).toHaveBeenCalledTimes(1);
+	});
+
+	it('adopts a delivered pull request that is still open, with no reset and no notice', async () => {
+		const deps = freshDeps();
+		deps.delivery.findPullRequest.mockResolvedValue({ number: 42, url: OLD_PR_URL });
+
+		const result = await runImplementationPhase(deps);
+
+		expect(result.prUrl).toBe(OLD_PR_URL);
+		expect(deps.runAgent).not.toHaveBeenCalled();
+		expect(deps.delivery.findPullRequest).toHaveBeenCalledTimes(1);
+		expect(deps.worktrees.provision).toHaveBeenCalledWith('19', {
+			branch: 'issue-19',
+			runId: undefined,
+		});
+		expect(commentBodies(deps).some((body) => body.includes('fresh attempt'))).toBe(false);
+	});
+
+	it('resumes the branch as before when no pull request was ever delivered', async () => {
+		const deps = freshDeps();
+
+		await runImplementationPhase({
+			...deps,
+			deliveredPullRequestUrl: undefined,
+			resumeExistingBranch: true,
+		});
+
+		expect(deps.worktrees.reuse).toHaveBeenCalledWith('19', 'issue-19', false);
+		expect(deps.worktrees.provision).not.toHaveBeenCalled();
+		expect(resolveCommitSha).not.toHaveBeenCalled();
+		expect(vi.mocked(commitPreparedTree).mock.calls[0]?.[1]).toBe(
+			'19 Old subject from the abandoned PR',
+		);
+		expect(deps.delivery.pushBranch).toHaveBeenCalledWith(WORKTREE_PATH, 'issue-19', DELIVERED_SHA);
+	});
+
+	it('resumes its own deferred delivery in place, under the lease it recorded', async () => {
+		progressFileContents = JSON.stringify({
+			deliveryId: 'placeholder',
+			branch: 'issue-19',
+			commitSubject: '19 Add the starting page of the SWARM test bed',
+			replacingSha: 'recorded0000000000000000000000000000000',
+			commitSha: DELIVERED_SHA,
+			pushed: false,
+			followUpEnqueued: false,
+		});
+		const deps = freshDeps();
+		// The sidecar is keyed by the delivery id; take the phase's own.
+		const progress = JSON.parse(progressFileContents);
+		progress.deliveryId = deliveryIdentity(['implementation', deps.project.repo, '19', 'issue-19']);
+		progressFileContents = JSON.stringify(progress);
+
+		await runImplementationPhase({ ...deps, resumeDelivery: true });
+
+		expect(deps.worktrees.reuse).toHaveBeenCalled();
+		expect(deps.worktrees.provision).not.toHaveBeenCalled();
+		expect(deps.runAgent).not.toHaveBeenCalled();
+		expect(deps.delivery.pushBranch).toHaveBeenCalledWith(
+			WORKTREE_PATH,
+			'issue-19',
+			DELIVERED_SHA,
+			'recorded0000000000000000000000000000000',
+		);
+		expect(commentBodies(deps).some((body) => body.includes('fresh attempt'))).toBe(false);
+	});
+});
+
+describe('freshAttemptCommentBody', () => {
+	it('names the abandoned pull request, the base, the branch and its old head', () => {
+		const body = freshAttemptCommentBody({
+			abandonedPullRequestUrl: 'https://github.com/o/r/pull/7',
+			baseBranch: 'main',
+			branch: 'issue-7',
+			abandonedHead: 'deadbeef',
+		});
+		expect(body).toContain(
+			'The previous pull request (https://github.com/o/r/pull/7) is no longer open, so this is a fresh attempt from `main`. Task branch `issue-7` was reset; its previous head was `deadbeef`.',
+		);
+		expect(body).toContain(freshAttemptMarker('https://github.com/o/r/pull/7'));
 	});
 });
 

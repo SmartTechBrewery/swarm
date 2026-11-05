@@ -332,6 +332,62 @@ describe('GitWorktreeManager', () => {
 			expect(handle).toMatchObject({ branch: 'issue-14', detached: true });
 		});
 
+		// Issue #1334. A fresh attempt after the task's pull request was closed must not
+		// resume that pull request's work, whatever this host or `origin` holds of it.
+		it('resets an existing task branch onto the base for a fresh attempt', async () => {
+			gitHandler = (args) => {
+				if (args[0] === 'symbolic-ref') return { stdout: 'issue-14\n' };
+				if (args[0] === 'branch' && args[1] === '--list') return { stdout: '  issue-14\n' };
+				if (args[0] === 'ls-remote') return { stdout: 'abc123\trefs/heads/issue-14\n' };
+				return { stdout: '' };
+			};
+
+			const handle = await makeManager().provision('14', {
+				branch: 'issue-14',
+				resetBranch: true,
+			});
+
+			// Neither reaped nor checked out as it stands: cut again from the base.
+			expect(gitCalls).not.toContainEqual(['branch', '--list', 'issue-14']);
+			expect(gitCalls.at(-1)).toEqual([
+				'worktree',
+				'add',
+				'-B',
+				'issue-14',
+				WORKTREE_14,
+				'origin/main',
+			]);
+			expect(handle).toEqual({
+				taskId: '14',
+				path: WORKTREE_14,
+				branch: 'issue-14',
+				detached: false,
+			});
+		});
+
+		it('starts a fresh attempt detached at the base when another worktree holds the branch', async () => {
+			gitHandler = (args) => {
+				if (args[0] === 'symbolic-ref') return { stdout: 'issue-14\n' };
+				if (args[0] === 'worktree' && args[1] === 'list')
+					return { stdout: `worktree ${WORKTREE_14}\nbranch refs/heads/issue-14\n` };
+				return { stdout: '' };
+			};
+
+			const handle = await makeManager().provision('99', {
+				branch: 'issue-14',
+				resetBranch: true,
+			});
+
+			expect(gitCalls.at(-1)).toEqual([
+				'worktree',
+				'add',
+				'--detach',
+				`${REPO_ROOT}/.swarm-workspaces/task-99`,
+				'origin/main',
+			]);
+			expect(handle).toMatchObject({ branch: 'issue-14', detached: true });
+		});
+
 		it('detaches at the local branch when origin has no matching ref', async () => {
 			gitHandler = (args) => {
 				if (args[0] === 'symbolic-ref') return { stdout: 'issue-14\n' };

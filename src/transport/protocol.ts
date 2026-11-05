@@ -443,6 +443,14 @@ export const TaskAssignmentSchema = z.object({
 	 */
 	commitSubject: z.string().min(1).optional(),
 	/**
+	 * implementation only: the pull request an earlier Implementation run of this task
+	 * delivered (issue #1334), resolved control-plane side from the run record. The
+	 * phase starts afresh from the base when it is no longer open. Additive in both
+	 * directions like {@link taskBranch}, so the protocol version is not bumped: without
+	 * it the phase resumes the task branch as it always did.
+	 */
+	deliveredPullRequestUrl: z.string().min(1).optional(),
+	/**
 	 * The **worker operator's own** SCM credential for the provider this project runs
 	 * on, resolved control-plane side per `(worker, project.scm)` from the durable
 	 * store (issue #765) — the identity the phase's commits, push, pull request and

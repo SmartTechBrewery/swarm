@@ -9,7 +9,7 @@
 
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import type { ScmDeliveryProvider } from '../../../scm/delivery.js';
+import { pushLeaseArgs, type ScmDeliveryProvider } from '../../../scm/delivery.js';
 import {
 	unsupportedPullRequestContextRead,
 	unsupportedReviewRead,
@@ -43,13 +43,14 @@ export async function createBitbucketOperatorDeliveryProvider(
 		findPullRequest: (branch) =>
 			scoped(() => findOpenBitbucketPullRequest(workspace, slug, branch)),
 		createPullRequest: (input) => scoped(() => createBitbucketPullRequest(workspace, slug, input)),
-		pushBranch: async (cwd, branch, expectedSha) => {
+		pushBranch: async (cwd, branch, expectedSha, replacingSha) => {
 			const authorization = Buffer.from(bitbucketGitBasicCredential(credential)).toString('base64');
 			await promisify(execFile)(
 				'git',
 				[
 					'push',
 					'--no-verify',
+					...pushLeaseArgs(branch, replacingSha),
 					`${BITBUCKET_GIT_ORIGIN}${workspace}/${slug}.git`,
 					`${expectedSha}:refs/heads/${branch}`,
 				],

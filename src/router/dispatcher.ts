@@ -873,6 +873,11 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 		// The task's commit subject (issue #1242) — Implementation's own from the job,
 		// or the one it stored, for the fix commits of the PR-driven phases.
 		commitSubject,
+		// The pull request an earlier run delivered (issue #1334), seeded by `processJob`
+		// from the run record, so the phase can tell an abandoned delivery from an
+		// interrupted one.
+		deliveredPullRequestUrl:
+			trigger.phase === 'implementation' ? job.deliveredPullRequestUrl : undefined,
 		operatorCredential,
 	});
 

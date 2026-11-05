@@ -25,6 +25,7 @@ import {
 	findBoardItemIdForTask,
 	findPullRequestProducerWorkerId,
 	findStoredCommitSubject,
+	findStoredPullRequestUrl,
 	findStoredTaskBranch,
 	findTaskIdForStoredTaskBranch,
 	getLatestCompletedPlanningScope,
@@ -1766,6 +1767,49 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 
 			expect(await findStoredCommitSubject(PROJECT_ID, REPO, 'VT-3')).toBe('VT-3 Second subject');
 			expect(await findStoredCommitSubject(PROJECT_ID, REPO, 'never-ran')).toBeUndefined();
+		});
+	});
+
+	// Issue #1334: whether a pull request was ever delivered for the task.
+	describe('findStoredPullRequestUrl', () => {
+		it('returns the newest delivered pull request of this repository task', async () => {
+			const older = await createRun({
+				projectId: PROJECT_ID,
+				taskId: 'VT-4',
+				phase: 'implementation',
+			});
+			const newest = await createRun({
+				projectId: PROJECT_ID,
+				taskId: 'VT-4',
+				phase: 'implementation',
+			});
+			// A newer run that delivered nothing, and the same task in another repository,
+			// never shadow it.
+			const undelivered = await createRun({
+				projectId: PROJECT_ID,
+				taskId: 'VT-4',
+				phase: 'implementation',
+			});
+			const otherRepository = await createRun({
+				projectId: PROJECT_ID,
+				repository: OTHER_REPO,
+				taskId: 'VT-4',
+				phase: 'implementation',
+			});
+			const set = (id: string, startedAt: string, producedPrUrl?: string) =>
+				getDb()
+					.update(runs)
+					.set({ startedAt: new Date(startedAt), producedPrUrl })
+					.where(eq(runs.id, id));
+			await set(older, '2026-01-01', 'https://github.com/o/r/pull/1');
+			await set(newest, '2026-02-01', 'https://github.com/o/r/pull/2');
+			await set(undelivered, '2026-03-01');
+			await set(otherRepository, '2026-04-01', 'https://github.com/o/other/pull/3');
+
+			expect(await findStoredPullRequestUrl(PROJECT_ID, REPO, 'VT-4')).toBe(
+				'https://github.com/o/r/pull/2',
+			);
+			expect(await findStoredPullRequestUrl(PROJECT_ID, REPO, 'never-ran')).toBeUndefined();
 		});
 	});
 

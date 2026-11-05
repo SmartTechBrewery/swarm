@@ -1481,6 +1481,38 @@ export async function findStoredCommitSubject(
 	return findStoredImplementationValue(projectId, repository, taskId, 'commitSubject');
 }
 
+/**
+ * The pull request Implementation last delivered for this project task (issue #1334)
+ * — the `produced_pr_url` of its newest run recording one. SWARM's own answer to "was
+ * a pull request ever delivered for this task", so a later dispatch can tell a task
+ * whose pull request was closed unmerged (start afresh) from an interrupted run that
+ * never delivered one (resume) without a further SCM read. Repository-scoped like
+ * {@link findStoredTaskBranch} (issue #1108).
+ *
+ * `undefined` when no Implementation run of this task recorded a pull request.
+ */
+export async function findStoredPullRequestUrl(
+	projectId: string,
+	repository: string,
+	taskId: string,
+): Promise<string | undefined> {
+	const rows = await getDb()
+		.select({ url: runs.producedPrUrl })
+		.from(runs)
+		.where(
+			and(
+				eq(runs.projectId, projectId),
+				eq(runs.repository, repository),
+				eq(runs.taskId, taskId),
+				eq(runs.phase, 'implementation'),
+				isNotNull(runs.producedPrUrl),
+			),
+		)
+		.orderBy(desc(runs.startedAt))
+		.limit(1);
+	return rows[0]?.url ?? undefined;
+}
+
 /** The newest value an Implementation run of this task stored under `key` on its job payload. */
 async function findStoredImplementationValue(
 	projectId: string,

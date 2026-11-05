@@ -31,7 +31,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { ProjectConfig } from '../../../config/schema.js';
-import type { ScmDeliveryProvider } from '../../../scm/delivery.js';
+import { pushLeaseArgs, type ScmDeliveryProvider } from '../../../scm/delivery.js';
 import type { ScmEvent } from '../../../scm/events.js';
 import type {
 	MergePullRequestOutcome,
@@ -599,7 +599,7 @@ export class GitLabSCMIntegration implements SCMProvider {
 			commitIdentity: { name: user.username, email },
 			findPullRequest: (branch) => scoped(() => findOpenGitLabMergeRequest(repo, branch)),
 			createPullRequest: (input) => scoped(() => createGitLabMergeRequest(repo, input)),
-			pushBranch: async (cwd, branch, expectedSha) => {
+			pushBranch: async (cwd, branch, expectedSha, replacingSha) => {
 				// The token travels in a git config value, never in argv — an `extraheader`
 				// keeps it out of the process listing and any git error echoing the remote.
 				// The refspec pushes the *exact* commit the caller verified rather than
@@ -610,6 +610,7 @@ export class GitLabSCMIntegration implements SCMProvider {
 					[
 						'push',
 						'--no-verify',
+						...pushLeaseArgs(branch, replacingSha),
 						`${GITLAB_GIT_ORIGIN}${repo}.git`,
 						`${expectedSha}:refs/heads/${branch}`,
 					],

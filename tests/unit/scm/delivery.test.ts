@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
 	advancedBaseHead,
 	assertCheckoutHoldsHead,
@@ -17,6 +17,7 @@ import {
 	isUnretryableDeliveryFailure,
 	loadDeliveryProgress,
 	pushDeliveredBranch,
+	pushLeaseArgs,
 	readHandoff,
 	saveDeliveryProgress,
 	shouldDeferDeliveryFailure,
@@ -416,6 +417,77 @@ describe('pushDeliveredBranch', () => {
 			followUpEnqueued: false,
 		});
 		expect(shouldDeferDeliveryFailure(error, clone)).toBe(true);
+	});
+
+	// Issue #1334: a fresh attempt replaces an abandoned pull request's branch, but only
+	// the head it observed. Pushed to the origin's *path* — a URL remote, as every
+	// provider pushes to — so the lease cannot lean on a remote-tracking ref.
+	describe('with a lease over an abandoned head', () => {
+		function leasePush(origin: string) {
+			return {
+				pushBranch: async (
+					cwd: string,
+					branch: string,
+					expectedSha: string,
+					replacingSha?: string,
+				) => {
+					execFileSync(
+						'git',
+						[
+							'push',
+							...pushLeaseArgs(branch, replacingSha),
+							origin,
+							`${expectedSha}:refs/heads/${branch}`,
+						],
+						{ cwd, env: fixtureGitEnvironment, stdio: 'pipe' },
+					);
+				},
+			};
+		}
+
+		it('replaces the abandoned head it was leased over', async () => {
+			const { origin, clone } = makeRemoteAndClone();
+			const abandoned = pushFromAnotherClone(origin, 'issue-1', 'the abandoned attempt\n');
+			fixtureGit(clone, ['checkout', '-q', 'main']);
+			const fresh = commitOn(clone, 'fresh', 'a fresh attempt from the base\n');
+
+			await pushDeliveredBranch(leasePush(origin), clone, 'issue-1', fresh, abandoned);
+
+			expect(fixtureGit(origin, ['rev-parse', 'refs/heads/issue-1']).trim()).toBe(fresh);
+		});
+
+		it('refuses, terminally, when the branch moved after the head was observed', async () => {
+			const { origin, clone } = makeRemoteAndClone();
+			const abandoned = pushFromAnotherClone(origin, 'issue-1', 'the abandoned attempt\n');
+			// Someone kept working on the old branch after the head was observed.
+			const other = mkdtempSync(join(tmpdir(), 'swarm-push-other-'));
+			roots.push(other);
+			execFileSync('git', ['clone', '-q', '-b', 'issue-1', origin, other], {
+				env: fixtureGitEnvironment,
+			});
+			const theirs = commitOn(other, 'issue-1', 'someone kept working on it\n');
+			fixtureGit(other, ['push', '-q', 'origin', 'issue-1']);
+			fixtureGit(clone, ['checkout', '-q', 'main']);
+			const fresh = commitOn(clone, 'fresh', 'a fresh attempt from the base\n');
+
+			const error = await pushDeliveredBranch(
+				leasePush(origin),
+				clone,
+				'issue-1',
+				fresh,
+				abandoned,
+			).catch((e) => e);
+
+			expect(error).toBeInstanceOf(DeliveryDivergedError);
+			expect(fixtureGit(origin, ['rev-parse', 'refs/heads/issue-1']).trim()).toBe(theirs);
+		});
+
+		it('passes no lease at all to an ordinary push', async () => {
+			const pushBranch = vi.fn(async () => {});
+			await pushDeliveredBranch({ pushBranch }, '/cwd', 'issue-1', 'sha');
+			expect(pushBranch).toHaveBeenCalledExactlyOnceWith('/cwd', 'issue-1', 'sha');
+			expect(pushLeaseArgs('issue-1', undefined)).toEqual([]);
+		});
 	});
 
 	it('rethrows a push failure that is not a rejection at all', async () => {

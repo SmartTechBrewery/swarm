@@ -1704,6 +1704,29 @@ describe('runAssignmentDbFree', () => {
 		);
 	});
 
+	// Issue #1334: the pull request an earlier run delivered reaches the phase, which
+	// tells an abandoned delivery from an interrupted one by it.
+	it('hands the phase the pull request an earlier run delivered', async () => {
+		const sink = recordingSink();
+		let delivered: string | undefined;
+		const runPhase = vi.fn(async (inputs: AssignedPhaseInputs) => {
+			delivered = inputs.deliveredPullRequestUrl;
+			return { agent: agentResult() };
+		});
+		await runAssignmentDbFree(
+			buildTaskAssignment(
+				createMockTaskAssignmentInput({
+					phase: 'implementation',
+					deliveredPullRequestUrl: 'https://github.com/o/r/pull/7',
+				}),
+			),
+			sink,
+			{ ...RUN_OPTIONS, deps: depsWith(runPhase) },
+		);
+
+		expect(delivered).toBe('https://github.com/o/r/pull/7');
+	});
+
 	it('routes a timed-out run through the failure path even when it exited 0', async () => {
 		const sink = recordingSink();
 		const runPhase = vi.fn(async () => ({

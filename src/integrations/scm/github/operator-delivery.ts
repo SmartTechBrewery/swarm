@@ -23,7 +23,7 @@
 
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import type { ScmDeliveryProvider } from '../../../scm/delivery.js';
+import { pushLeaseArgs, type ScmDeliveryProvider } from '../../../scm/delivery.js';
 import {
 	createPullRequest,
 	findOpenPullRequest,
@@ -53,13 +53,14 @@ export async function createOperatorDeliveryProvider(
 		commitIdentity: { name: login, email: `${login}@users.noreply.github.com` },
 		findPullRequest: (branch) => scoped(() => findOpenPullRequest(owner, repoName, branch)),
 		createPullRequest: (input) => scoped(() => createPullRequest(owner, repoName, input)),
-		pushBranch: async (cwd, branch, expectedSha) => {
+		pushBranch: async (cwd, branch, expectedSha, replacingSha) => {
 			const authorization = Buffer.from(`x-access-token:${token}`).toString('base64');
 			await promisify(execFile)(
 				'git',
 				[
 					'push',
 					'--no-verify',
+					...pushLeaseArgs(branch, replacingSha),
 					`https://github.com/${repo}.git`,
 					`${expectedSha}:refs/heads/${branch}`,
 				],

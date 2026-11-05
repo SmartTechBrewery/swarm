@@ -31,7 +31,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { ProjectConfig } from '../../../config/schema.js';
-import type { ScmDeliveryProvider } from '../../../scm/delivery.js';
+import { pushLeaseArgs, type ScmDeliveryProvider } from '../../../scm/delivery.js';
 import type { ScmEvent } from '../../../scm/events.js';
 import type {
 	MergePullRequestOutcome,
@@ -577,7 +577,7 @@ export class BitbucketSCMIntegration implements SCMProvider {
 				scoped(() => findOpenBitbucketPullRequest(workspace, slug, branch)),
 			createPullRequest: (input) =>
 				scoped(() => createBitbucketPullRequest(workspace, slug, input)),
-			pushBranch: async (cwd, branch, expectedSha) => {
+			pushBranch: async (cwd, branch, expectedSha, replacingSha) => {
 				// The credential travels in a git config value, never in argv — an
 				// `extraheader` keeps it out of the process listing and any git error
 				// echoing the remote. The refspec pushes the *exact* commit the caller
@@ -591,6 +591,7 @@ export class BitbucketSCMIntegration implements SCMProvider {
 					[
 						'push',
 						'--no-verify',
+						...pushLeaseArgs(branch, replacingSha),
 						`${BITBUCKET_GIT_ORIGIN}${workspace}/${slug}.git`,
 						`${expectedSha}:refs/heads/${branch}`,
 					],

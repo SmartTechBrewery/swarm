@@ -11,7 +11,7 @@
 
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import type { ScmDeliveryProvider } from '../../../scm/delivery.js';
+import { pushLeaseArgs, type ScmDeliveryProvider } from '../../../scm/delivery.js';
 import {
 	unsupportedPullRequestContextRead,
 	unsupportedReviewRead,
@@ -47,13 +47,14 @@ export async function createGitLabOperatorDeliveryProvider(
 		commitIdentity: { name: user.username, email },
 		findPullRequest: (branch) => scoped(() => findOpenGitLabMergeRequest(repo, branch)),
 		createPullRequest: (input) => scoped(() => createGitLabMergeRequest(repo, input)),
-		pushBranch: async (cwd, branch, expectedSha) => {
+		pushBranch: async (cwd, branch, expectedSha, replacingSha) => {
 			const authorization = Buffer.from(gitlabGitBasicCredential(credential)).toString('base64');
 			await promisify(execFile)(
 				'git',
 				[
 					'push',
 					'--no-verify',
+					...pushLeaseArgs(branch, replacingSha),
 					`${GITLAB_GIT_ORIGIN}${repo}.git`,
 					`${expectedSha}:refs/heads/${branch}`,
 				],

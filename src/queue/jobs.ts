@@ -414,6 +414,15 @@ const jobBase = z.object({
 	 * Implementation attempt from the task's previous runs (`findStoredCommitSubject`).
 	 */
 	commitSubject: z.string().min(1).optional(),
+	/**
+	 * The pull request an earlier Implementation run of this task delivered (issue
+	 * #1334), seeded onto a new Implementation attempt from the task's previous runs
+	 * (`findStoredPullRequestUrl`). Like {@link taskBranch}, a fact about the task and
+	 * not recovery intent: the phase compares it with the task branch's open pull
+	 * request to tell an abandoned delivery (start afresh from the base) from an
+	 * interrupted one (resume).
+	 */
+	deliveredPullRequestUrl: z.string().min(1).optional(),
 	// How this attempt treats a prior one's preserved work — declared once in
 	// {@link RecoveryIntentSchema} and spread here, so the payload and the
 	// transport frame cannot drift apart member by member (issue #591).

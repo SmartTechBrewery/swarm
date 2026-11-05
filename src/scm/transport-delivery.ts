@@ -42,7 +42,7 @@ import {
 	PostCommentDeliveryResponseSchema,
 	SubmitReviewDeliveryResponseSchema,
 } from '../transport/protocol.js';
-import type { ScmDeliveryProvider } from './delivery.js';
+import { leaseArgument, type ScmDeliveryProvider } from './delivery.js';
 
 export type { FetchLike } from '../transport/delivery-client.js';
 
@@ -83,7 +83,8 @@ export function createTransportScmDeliveryProvider(
 		commitIdentity: localDelegate.commitIdentity,
 		findPullRequest: (branch) => localDelegate.findPullRequest(branch),
 		createPullRequest: (input) => localDelegate.createPullRequest(input),
-		pushBranch: (cwd, branch, expectedSha) => localDelegate.pushBranch(cwd, branch, expectedSha),
+		pushBranch: (cwd, branch, expectedSha, replacingSha) =>
+			localDelegate.pushBranch(cwd, branch, expectedSha, ...leaseArgument(replacingSha)),
 		// No persona on the review frame: only the Review phase submits a review,
 		// and it is always the reviewer's.
 		submitReview: (input) =>
