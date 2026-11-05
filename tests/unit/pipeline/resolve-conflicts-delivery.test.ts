@@ -231,6 +231,23 @@ describe('resolve-conflicts production delivery', () => {
 		);
 	});
 
+	it('words the merge commit by the repository’s commit subject pattern (issue #1332)', async () => {
+		const { worktreePath, headSha, baseSha } = makeConflictedCheckout();
+		writeFileSync(join(worktreePath, 'conflict.txt'), 'resolved by hand\n');
+		const options = {
+			...makeOptions(worktreePath, headSha, baseSha),
+			project: createMockProjectConfig({ commitSubjectPattern: '{issue_key} {Subject}' }),
+		};
+
+		const { outcome } = await runResolveConflictsPhase(options);
+
+		expect(outcome.status).toBe('resolved');
+		// The key comes from the pull request's branch, not the phase's own task id.
+		expect(git(worktreePath, 'show', '-s', '--format=%s', 'HEAD').trim()).toBe(
+			`503 Merge main into ${PR_BRANCH}`,
+		);
+	});
+
 	// The residual failure mode, which phase 1/2 settles terminally: a conflict
 	// the agent did not actually resolve. The backstop leaves it unmerged on
 	// purpose rather than committing the markers.
@@ -649,6 +666,22 @@ describe('resolve-conflicts catch-up (merge automation’s worker-side update, i
 		).toEqual([headSha, baseSha]);
 		expect(git(worktreePath, 'show', '-s', '--format=%an', produced).trim()).toBe('implementer');
 		expect(options.cleanup).toHaveBeenCalledTimes(1);
+	});
+
+	it('words the catch-up merge commit by the repository’s commit subject pattern (issue #1332)', async () => {
+		const { worktreePath, headSha, baseSha } = makeStaleCheckout();
+		const options = {
+			...makeCatchUpOptions(worktreePath, headSha, baseSha),
+			project: createMockProjectConfig({ commitSubjectPattern: '{issue_key} {Subject}' }),
+		};
+
+		const { catchUp } = await runResolveConflictsCatchUp(options);
+
+		expect(catchUp.status).toBe('updated');
+		const produced = catchUp.status === 'updated' ? catchUp.headSha : '';
+		expect(git(worktreePath, 'show', '-s', '--format=%s', produced).trim()).toBe(
+			`503 Merge main into ${PR_BRANCH}`,
+		);
 	});
 
 	it("treats an abbreviated (Bitbucket 12-char) approved head as the checkout's own head and merges", async () => {

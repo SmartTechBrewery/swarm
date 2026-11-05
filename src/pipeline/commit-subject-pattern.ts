@@ -301,13 +301,59 @@ export function fixCommitSubject(input: FixCommitSubjectInput): string | undefin
 	if (!agentSubject) return undefined;
 	const pattern = naming.commitSubjectPattern;
 	if (!pattern) return agentSubject;
-	const needsKey = tokenize(pattern).segments.some(
-		(segment) => segment.kind === 'element' && segment.name === 'issue_key',
-	);
-	if (needsKey && !issueKey) return agentSubject;
+	if (patternNeedsIssueKey(pattern) && !issueKey) return agentSubject;
 	return renderCommitSubject(pattern, {
 		issueKey: issueKey ?? '',
 		workType: workTypeFromCommitSubject(agentSubject) ?? FALLBACK_WORK_TYPE,
 		subject: agentSubject,
 	});
+}
+
+/** Whether `pattern` renders the task's key, so cannot be rendered without one. */
+function patternNeedsIssueKey(pattern: string): boolean {
+	return tokenize(pattern).segments.some(
+		(segment) => segment.kind === 'element' && segment.name === 'issue_key',
+	);
+}
+
+/** The work type a merge commit carries: it changes no behaviour of its own. */
+const MERGE_COMMIT_WORK_TYPE: WorkType = 'chore';
+
+/** The inputs {@link mergeCommitSubject} renders from. */
+export interface MergeCommitSubjectInput {
+	/** The branch merged in. */
+	baseBranch: string;
+	/** The pull request's branch the merge commit lands on. */
+	prBranch: string;
+	/** The repository's commit subject naming. */
+	naming: CommitSubjectNaming;
+	/** The task the pull request's branch encodes, when it encodes one. */
+	issueKey?: string;
+}
+
+/**
+ * The subject of the merge commit Resolve-conflicts makes on a task branch (issue #1332):
+ * the repository's own pattern, rendered with `{work_type}` `chore` and `{subject}`
+ * `merge <base> into <branch>`, so a key-linked integration links it like every other
+ * commit of the task. The default pattern renders exactly the subject this commit always
+ * carried (`chore: merge main into issue-42`). Over `commitSubjectMaxLength`, the branch
+ * is left out (`merge <base>`) — the commit already sits on that branch; a subject still
+ * over the limit is committed anyway, as Implementation commits an over-long one. A
+ * pattern needing `{issue_key}` on a branch that encodes no task falls back to the
+ * default pattern rather than rendering an empty key.
+ */
+export function mergeCommitSubject(input: MergeCommitSubjectInput): string {
+	const { baseBranch, prBranch, naming, issueKey } = input;
+	const stated = resolveCommitSubjectPattern(naming);
+	const pattern =
+		patternNeedsIssueKey(stated) && !issueKey ? DEFAULT_COMMIT_SUBJECT_PATTERN : stated;
+	const render = (subject: string): string =>
+		renderCommitSubject(pattern, {
+			issueKey: issueKey ?? '',
+			workType: MERGE_COMMIT_WORK_TYPE,
+			subject,
+		});
+	const full = render(`merge ${baseBranch} into ${prBranch}`);
+	if (full.length <= resolveCommitSubjectMaxLength(naming)) return full;
+	return render(`merge ${baseBranch}`);
 }

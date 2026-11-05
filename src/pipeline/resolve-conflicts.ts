@@ -42,6 +42,7 @@ import {
 import type { WorkerBranchUpdateOutcome } from '../scm/merge.js';
 import { GitWorktreeManager } from '../worker/git-worktree-manager.js';
 import { graftEnvironment } from '../worktree/graft.js';
+import { mergeCommitSubject } from './commit-subject-pattern.js';
 import { settleMergeResolution } from './merge-resolution.js';
 import {
 	buildBaseAdvancedRemergePrompt,
@@ -56,6 +57,7 @@ import {
 	sessionRunArgs,
 	shouldPreserveFailedCheckout,
 } from './resume.js';
+import { taskIdFromTaskBranch } from './task-branch.js';
 
 export const RESOLVE_CONFLICTS_OUTCOME_FILENAME = HANDOFF_FILENAMES.resolveConflicts;
 
@@ -151,6 +153,8 @@ interface GuardMigrationJournalOptions {
 interface MergePassContext extends GuardMigrationJournalOptions {
 	/** The pull request's head branch — the branch a re-merge pass is standing on. */
 	prBranch: string;
+	/** The subject every pass's merge commit carries ({@link taskMergeCommitSubject}). */
+	mergeSubject: string;
 }
 
 /**
@@ -302,9 +306,21 @@ function assertMergeVerified(
 		);
 }
 
-/** The one subject every pass's merge commit carries. */
-function mergeCommitSubject(baseBranch: string, prBranch: string): string {
-	return `chore: merge ${baseBranch} into ${prBranch}`;
+/**
+ * The one subject every pass's merge commit carries, worded by the repository's commit
+ * subject pattern with the key the pull request's branch encodes (issue #1332).
+ */
+function taskMergeCommitSubject(
+	project: ProjectConfig,
+	baseBranch: string,
+	prBranch: string,
+): string {
+	return mergeCommitSubject({
+		baseBranch,
+		prBranch,
+		naming: project,
+		issueKey: taskIdFromTaskBranch(prBranch, project),
+	});
 }
 
 /**
@@ -593,12 +609,9 @@ async function deliverMergeAgainstCurrentBase(
 		resumeSessionId = pass.sessionId ?? resumeSessionId;
 		const passContext = { ...ctx, resumeSessionId };
 		handoff = await gatePreparedMerge(passContext);
-		commitSha = await commitPreparedTree(
-			ctx.worktreePath,
-			mergeCommitSubject(ctx.baseBranch, ctx.prBranch),
-			commitIdentity,
-			{ allowUnchangedMerge: true },
-		);
+		commitSha = await commitPreparedTree(ctx.worktreePath, ctx.mergeSubject, commitIdentity, {
+			allowUnchangedMerge: true,
+		});
 		record.committed(commitSha);
 	}
 }
@@ -709,6 +722,7 @@ export async function runResolveConflictsPhase(
 			taskId,
 			prNumber,
 			prBranch,
+			mergeSubject: taskMergeCommitSubject(project, baseBranch, prBranch),
 			headSha,
 			baseBranch,
 			timeoutMs,
@@ -750,7 +764,7 @@ export async function runResolveConflictsPhase(
 			// unchanged tree, and only the merge commit makes the base an ancestor.
 			progress.commitSha = await commitPreparedTree(
 				handle.path,
-				mergeCommitSubject(baseBranch, prBranch),
+				mergeContext.mergeSubject,
 				delivery.commitIdentity,
 				{ allowUnchangedMerge: true },
 			);
@@ -937,7 +951,7 @@ async function catchUpCheckout(
 	// the head already holds) is still committed: the merge commit is the update.
 	const commitSha = await commitPreparedTree(
 		cwd,
-		mergeCommitSubject(baseBranch, prBranch),
+		taskMergeCommitSubject(project, baseBranch, prBranch),
 		delivery.commitIdentity,
 		{ allowUnchangedMerge: true },
 	);

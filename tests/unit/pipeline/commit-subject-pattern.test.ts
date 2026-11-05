@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
 	DEFAULT_COMMIT_SUBJECT_PATTERN,
 	fixCommitSubject,
+	mergeCommitSubject,
 	normalizeSubject,
 	renderCommitSubject,
 	resolveCommitSubjectMaxLength,
@@ -154,5 +155,62 @@ describe('fixCommitSubject', () => {
 
 	it('has nothing to commit with when neither is there', () => {
 		expect(fixCommitSubject({ naming, issueKey: 'VT-1538' })).toBeUndefined();
+	});
+});
+
+describe('mergeCommitSubject', () => {
+	const branch = 'refactor/VT-1583/stylesheet-color-variables';
+
+	it('renders the subject the merge commit always carried under the default pattern', () => {
+		expect(
+			mergeCommitSubject({
+				baseBranch: 'main',
+				prBranch: 'issue-503',
+				naming: {},
+				issueKey: '503',
+			}),
+		).toBe('chore: merge main into issue-503');
+	});
+
+	it('leads with the task’s key under a key-first pattern', () => {
+		expect(
+			mergeCommitSubject({
+				baseBranch: 'main',
+				prBranch: branch,
+				naming: { commitSubjectPattern: '{issue_key} {Subject}' },
+				issueKey: 'VT-1583',
+			}),
+		).toBe(`VT-1583 Merge main into ${branch}`);
+	});
+
+	it('leaves the branch out when the subject would exceed the length limit', () => {
+		const subject = mergeCommitSubject({
+			baseBranch: 'main',
+			prBranch: branch,
+			naming: { commitSubjectPattern: '{issue_key} {Subject}', commitSubjectMaxLength: 40 },
+			issueKey: 'VT-1583',
+		});
+		expect(subject).toBe('VT-1583 Merge main');
+		expect(subject.length).toBeLessThanOrEqual(40);
+	});
+
+	it('falls back to the default pattern when the pattern needs a key the branch does not carry', () => {
+		expect(
+			mergeCommitSubject({
+				baseBranch: 'main',
+				prBranch: 'some-branch',
+				naming: { commitSubjectPattern: '{issue_key} {Subject}' },
+			}),
+		).toBe('chore: merge main into some-branch');
+	});
+
+	it('renders a keyless pattern without a key', () => {
+		expect(
+			mergeCommitSubject({
+				baseBranch: 'main',
+				prBranch: 'some-branch',
+				naming: { commitSubjectPattern: '[{work_type}] {Subject}' },
+			}),
+		).toBe('[chore] Merge main into some-branch');
 	});
 });
