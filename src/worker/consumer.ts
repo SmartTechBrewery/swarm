@@ -255,6 +255,7 @@ import type { WorkerExecutionIdentity } from './execution-identity.js';
 import {
 	diagnoseFailure,
 	type FailureDiagnosis,
+	isImplementationNothingToDeliverFailure,
 	type KnownFailureCondition,
 } from './failure-diagnosis.js';
 import { notifyBlockingFailure } from './failure-notification.js';
@@ -1118,8 +1119,9 @@ const CONTROL_PLANE_DELIVERY_SERVER_ERROR = /Control-plane delivery \S+ failed w
  * Two deferrable kinds are left out on purpose. A lost transport is bounded by its own
  * registry entry, which already hands the operator a machine that keeps vanishing; and
  * a commit no eligible machine could obtain will not appear by waiting. Everything else
- * — an `auth` failure, a refused recovery, a gate refusal, an ordinary error — is a
- * failure the operator has to act on, and stays theirs.
+ * — an `auth` failure, a refused recovery, a gate refusal, an Implementation with
+ * nothing to deliver, an ordinary error — is a failure the operator has to act on, and
+ * stays theirs.
  */
 function isTransientTerminalFailure(err: unknown, isDeferrable: boolean, error: string): boolean {
 	if (isDeferrable) {
@@ -1137,6 +1139,10 @@ function isTransientTerminalFailure(err: unknown, isDeferrable: boolean, error: 
 					err instanceof WorkerIneligibleError ||
 					err instanceof DependencyBlockedError
 				);
+	// An Implementation that found nothing to deliver (issue #1335) is terminal by
+	// design, and its message may quote a failed card move's control-plane 5xx — which
+	// must not turn it into a retry that would find nothing to change again.
+	if (isImplementationNothingToDeliverFailure(error)) return false;
 	return unclassified && CONTROL_PLANE_DELIVERY_SERVER_ERROR.test(error);
 }
 
@@ -4511,6 +4517,18 @@ async function resolveCompletedNoTriggerOutcome(
 }
 
 /**
+ * The failure comment's generic recovery line, unless the diagnosis makes it
+ * wrong: an Implementation that found nothing to deliver (issue #1335) has moved
+ * its card to Backlog, and re-triggering it would find nothing to change again, so
+ * the diagnosis below carries the advice instead.
+ */
+function recoveryLine(failureDiagnosis: FailureDiagnosis | undefined): string {
+	if (failureDiagnosis?.kind === 'nothing-to-deliver')
+		return "The agent's full output is in the worker logs.";
+	return "This item hasn't moved. Re-trigger the phase once the cause is addressed; the agent's full output is in the worker logs.";
+}
+
+/**
  * The comment SWARM posts on a work item's backing Issue when its phase fails
  * terminally. It names the phase and carries the failure message so a human
  * watching the board sees *why* the item stalled without digging through worker
@@ -4531,7 +4549,7 @@ export function phaseFailureCommentBody(
 		error,
 		'```',
 		'',
-		"This item hasn't moved. Re-trigger the phase once the cause is addressed; the agent's full output is in the worker logs.",
+		recoveryLine(failureDiagnosis),
 	];
 	if (failureDiagnosis) {
 		lines.push(
@@ -4979,6 +4997,9 @@ function knownFailureCondition(
 	// places to go and the diagnosis says what was missing rather than restating git's
 	// `invalid reference`.
 	if (failureKind === 'commit-unavailable') return 'commit-unavailable';
+	// Keyed on the message, not the class (issue #1335): a DB-free worker's failure
+	// arrives here as `AgentRunError{kind:'error'}` carrying the message alone.
+	if (isImplementationNothingToDeliverFailure(error)) return 'nothing-to-deliver';
 	if (isLaunchOrAuthenticationFailure(error)) return 'launch-or-authentication';
 	return undefined;
 }

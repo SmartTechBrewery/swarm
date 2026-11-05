@@ -14,6 +14,7 @@ export const FailureDiagnosisKindSchema = z.enum([
 	'continuation-budget-exhausted',
 	'continuation-no-progress',
 	'commit-unavailable',
+	'nothing-to-deliver',
 	'review-waiting-for-checks',
 	'review-provider-unreachable',
 ]);
@@ -41,6 +42,20 @@ export type KnownFailureCondition = Exclude<
 	| 'review-waiting-for-checks'
 	| 'review-provider-unreachable'
 >;
+
+/**
+ * The opening words of the failure Implementation raises when its agent changed
+ * no repository file (issue #1335, `src/pipeline/implementation.ts`). The
+ * `nothing-to-deliver` diagnosis keys on them rather than on the error class,
+ * because a DB-free worker's failure reaches the control plane as its message
+ * alone.
+ */
+export const IMPLEMENTATION_NOTHING_TO_DELIVER = 'Implementation found nothing to deliver';
+
+/** Whether a failure message is Implementation's nothing-to-deliver failure. */
+export function isImplementationNothingToDeliverFailure(error: string): boolean {
+	return error.includes(IMPLEMENTATION_NOTHING_TO_DELIVER);
+}
 
 export interface DiagnoseFailureInput {
 	failureKind?: AgentFailureKind;
@@ -105,6 +120,13 @@ function knownDiagnosis(condition: KnownFailureCondition): FailureDiagnosis {
 				'Known condition: the commit is not on the worker',
 				"The phase needs a checkout detached at a specific commit, and the worker's clone did not have it — a `git fetch origin` and a direct fetch of the commit both failed to supply it. The run error names both attempts verbatim. This is a fact about that machine's access to the remote, not about the pull request, the branch or the SHA.",
 				"Check that machine's network access and credentials for the remote (`git fetch origin` in its checkout), or enroll a worker that can reach it, then retry the phase.",
+			);
+		case 'nothing-to-deliver':
+			return diagnosis(
+				condition,
+				'Known condition: nothing to deliver',
+				"The implementer agent finished without changing any repository file, so nothing was committed and no pull request was opened. The work is most likely already on the base branch, or the card's acceptance criteria are already met. SWARM moves the card out of In progress to Backlog, where nothing starts it again by itself; the run error says whether that move succeeded.",
+				"Update the card's scope if work remains, or close it if the work is already done. Re-running Implementation on the card as it stands would find nothing to change again.",
 			);
 		case 'continuation-budget-exhausted':
 			return diagnosis(

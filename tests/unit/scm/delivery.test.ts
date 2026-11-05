@@ -17,6 +17,7 @@ import {
 	isUnretryableDeliveryFailure,
 	loadDeliveryProgress,
 	lsRemoteBranchHead,
+	NothingToDeliverError,
 	pushDeliveredBranch,
 	pushLeaseArgs,
 	readHandoff,
@@ -796,7 +797,12 @@ describe('unretryable delivery refusals (issue #839)', () => {
 	// The guard on "a rule the next such refusal falls under": a fifth refusal
 	// added to either function as a plain `Error` fails here.
 	describe('every prepared-tree refusal is terminal', () => {
-		const cases: { name: string; clause: string; prepare: (root: string) => void }[] = [
+		const cases: {
+			name: string;
+			clause: string;
+			remedy?: RegExp;
+			prepare: (root: string) => void;
+		}[] = [
 			{
 				name: 'an unresolved index',
 				clause: 'unresolved conflicts in',
@@ -821,6 +827,9 @@ describe('unretryable delivery refusals (issue #839)', () => {
 			{
 				name: 'a tree holding nothing but hand-off artifacts',
 				clause: 'nothing to deliver',
+				// No "re-run" (issue #1335): the same tree yields the same nothing, so the
+				// caller states what clears it — Implementation does, with the card's fate.
+				remedy: /Nothing was committed or pushed\.$/,
 				prepare: (root) => {
 					fixtureGit(root, ['merge', '--abort']);
 					writeFileSync(join(root, HANDOFF_FILENAMES.implementation), '{}\n');
@@ -828,7 +837,7 @@ describe('unretryable delivery refusals (issue #839)', () => {
 			},
 		];
 
-		for (const { name, clause, prepare } of cases) {
+		for (const { name, clause, remedy = /re-run (this|the) phase\./, prepare } of cases) {
 			it(`refuses ${name}`, async () => {
 				const root = repoWithUnmergedIndex();
 				prepare(root);
@@ -847,10 +856,29 @@ describe('unretryable delivery refusals (issue #839)', () => {
 				expect(error.message).toContain(clause);
 				// Each message says what clears it — it is the whole report the
 				// operator gets, since the error class does not survive the wire.
-				expect(error.message).toMatch(/re-run (this|the) phase\./);
+				expect(error.message).toMatch(remedy);
 				expect(shouldDeferDeliveryFailure(error, withSidecar(root))).toBe(false);
 			});
 		}
+
+		// Its own class, so Implementation can tell "the agent changed nothing" apart
+		// from every other refusal (issue #1335) — still terminal like the rest.
+		it('raises a tree holding nothing but hand-off artifacts as NothingToDeliverError', async () => {
+			const root = repoWithUnmergedIndex();
+			fixtureGit(root, ['merge', '--abort']);
+			writeFileSync(join(root, HANDOFF_FILENAMES.implementation), '{}\n');
+
+			const error = await commitPreparedTree(root, 'feat: deliver', {
+				name: 'swarm-implementer',
+				email: 'swarm-implementer@users.noreply.github.com',
+			}).catch((e) => e);
+
+			expect(error).toBeInstanceOf(NothingToDeliverError);
+			expect(error.name).toBe('NothingToDeliverError');
+			expect(error.message).not.toMatch(/re-run/i);
+			expect(isUnretryableDeliveryFailure(error)).toBe(true);
+			expect(shouldDeferDeliveryFailure(error, withSidecar(root))).toBe(false);
+		});
 	});
 
 	// #558's carve-out is now one member of the rule rather than beside it.
