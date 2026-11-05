@@ -13,9 +13,13 @@
  * provider is read the same way, and an unreadable pull request fails the run
  * before the agent does.
  *
+ * Respond-to-review reuses this module (issue #1240): it also reads the one
+ * submitted review it answers through `ScmDeliveryProvider.readReview` and
+ * renders it into the same file, as a "Review being answered" section ahead of
+ * the discussion, so its agent reads the review through SWARM too.
+ *
  * Plain interfaces rather than Zod schemas, like `PullRequestDetails`
- * (`./types.ts`): nothing here crosses the wire. Respond-to-review reuses this
- * module (issue #1240), so keep its exports stable.
+ * (`./types.ts`): nothing here crosses the wire. Keep the exports stable.
  */
 
 import { writeFileSync } from 'node:fs';
@@ -64,6 +68,22 @@ export interface PullRequestContext {
 	issueReadHint?: string;
 }
 
+/** The one submitted review a Respond-to-review run answers (issue #1240). */
+export interface PullRequestReview {
+	/** The id the run was dispatched with, verbatim (numeric on GitHub, synthetic on Azure DevOps). */
+	id: string;
+	/** The provider's display handle for the reviewer, or `null` when it names none. */
+	author: string | null;
+	/** The `ScmReviewState` spelling where it maps, verbatim otherwise; `null` when unknown. */
+	state: string | null;
+	/** ISO-8601, or `null` when the provider reports no date. */
+	submittedAt: string | null;
+	/** The review's summary body. */
+	body: string;
+	/** The review's file-anchored comments: `review-comment` entries carrying `path`/`line`. */
+	comments: PullRequestDiscussionEntry[];
+}
+
 /**
  * A provider that has no reader for this yet — a declared gap with its own
  * follow-up, reported as the run's failure reason rather than as a missing hand-off.
@@ -86,6 +106,17 @@ export function unsupportedPullRequestContextRead(
 	return async () => {
 		throw new ScmReadUnsupportedError(
 			`reading a pull request's context is not yet supported on ${providerLabel}`,
+		);
+	};
+}
+
+/** The `readReview` a provider without a reader declares; worded like {@link unsupportedPullRequestContextRead}. */
+export function unsupportedReviewRead(
+	providerLabel: string,
+): (prNumber: number, reviewId: string) => Promise<PullRequestReview> {
+	return async () => {
+		throw new ScmReadUnsupportedError(
+			`reading a pull request review is not yet supported on ${providerLabel}`,
 		);
 	};
 }
@@ -125,8 +156,44 @@ function entryHeading(entry: PullRequestDiscussionEntry): string {
 	return `### ${label} by ${entry.author ?? 'unknown'} · ${entry.createdAt ?? 'undated'}`;
 }
 
-/** Render a pull request's context as the Markdown the agent reads. Deterministic. */
-export function renderPullRequestContext(context: PullRequestContext): string {
+/** The "Review being answered" section, ahead of the discussion. */
+function reviewSection(review: PullRequestReview): string[] {
+	const comments = chronological(review.comments);
+	const lines = [
+		'## Review being answered',
+		'',
+		`- Review id: ${review.id}`,
+		`- Author: ${review.author ?? 'unknown'} · State: ${review.state ?? 'unknown'} · Submitted: ${review.submittedAt ?? 'undated'}`,
+		'',
+		review.body.trim() ? review.body : '_(no summary body)_',
+		'',
+		`### Inline comments (${comments.length})`,
+		'',
+	];
+	if (comments.length === 0) lines.push('_(no inline comments)_', '');
+	for (const comment of comments) {
+		const location = comment.path
+			? `${comment.path}${comment.line !== undefined ? `:${comment.line}` : ''}`
+			: 'unanchored';
+		lines.push(
+			`#### ${location} · ${comment.author ?? 'unknown'} · ${comment.createdAt ?? 'undated'}`,
+			'',
+			comment.body.trim() ? comment.body : '_(no text)_',
+			'',
+		);
+	}
+	return lines;
+}
+
+/**
+ * Render a pull request's context as the Markdown the agent reads. Deterministic.
+ * With a `review` (Respond-to-review, issue #1240) the review being answered is
+ * rendered ahead of the discussion; without one the output is unchanged.
+ */
+export function renderPullRequestContext(
+	context: PullRequestContext,
+	review?: PullRequestReview,
+): string {
 	const discussion = chronological(context.discussion);
 	const lines = [
 		`# Pull request #${context.number}: ${context.title}`,
@@ -143,6 +210,7 @@ export function renderPullRequestContext(context: PullRequestContext): string {
 		'',
 	];
 	if (context.issueReadHint) lines.push('## Linked issues', '', context.issueReadHint, '');
+	if (review) lines.push(...reviewSection(review));
 	lines.push(`## Discussion (${discussion.length})`, '');
 	if (discussion.length === 0) lines.push('_(no comments or reviews)_', '');
 	for (const entry of discussion)
@@ -151,8 +219,12 @@ export function renderPullRequestContext(context: PullRequestContext): string {
 }
 
 /** Write {@link renderPullRequestContext}'s output to the worktree root; returns the path written. */
-export function writePullRequestContext(worktreePath: string, context: PullRequestContext): string {
+export function writePullRequestContext(
+	worktreePath: string,
+	context: PullRequestContext,
+	review?: PullRequestReview,
+): string {
 	const path = join(worktreePath, PULL_REQUEST_CONTEXT_FILENAME);
-	writeFileSync(path, renderPullRequestContext(context), 'utf8');
+	writeFileSync(path, renderPullRequestContext(context, review), 'utf8');
 	return path;
 }

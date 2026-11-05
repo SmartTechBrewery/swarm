@@ -118,8 +118,12 @@ const BRANCH_REF_PREFIX = 'refs/heads/';
 /** A pull-request build's `sourceBranch` — the merge ref Azure builds a PR on. */
 const PULL_REQUEST_MERGE_REF = /^refs\/pull\/(\d+)\/merge$/;
 
-/** Stand-in for a missing component of the synthetic review id (see {@link synthesizeReviewId}). */
-const UNKNOWN_ID_PART = 'unknown';
+/**
+ * Stand-in for a missing component of the synthetic review id (see
+ * {@link synthesizeReviewId}). Exported for the review read that parses the id
+ * back (`./pull-requests.ts`, issue #1240).
+ */
+export const UNKNOWN_ID_PART = 'unknown';
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
 	return typeof value === 'object' && value !== null

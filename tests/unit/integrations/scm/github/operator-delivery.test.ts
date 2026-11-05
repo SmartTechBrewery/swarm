@@ -24,6 +24,7 @@ const {
 	createPullRequest,
 	postIdempotentPullRequestComment,
 	readGitHubPullRequestContext,
+	readGitHubPullRequestReview,
 } = vi.hoisted(() => ({
 	withGitHubToken: vi.fn(<T>(_token: string, fn: () => Promise<T>) => fn()),
 	getGitHubUserForToken: vi.fn<(token: string | null) => Promise<string | null>>(
@@ -33,6 +34,7 @@ const {
 	createPullRequest: vi.fn(async () => ({ number: 8, url: 'https://example.com/pr/8' })),
 	postIdempotentPullRequestComment: vi.fn(async () => 4242),
 	readGitHubPullRequestContext: vi.fn(async () => ({ number: 7 })),
+	readGitHubPullRequestReview: vi.fn(async () => ({ id: '4242' })),
 }));
 vi.mock('@/integrations/scm/github/client.js', () => ({
 	withGitHubToken,
@@ -41,6 +43,7 @@ vi.mock('@/integrations/scm/github/client.js', () => ({
 	createPullRequest,
 	postIdempotentPullRequestComment,
 	readGitHubPullRequestContext,
+	readGitHubPullRequestReview,
 }));
 
 import { createOperatorDeliveryProvider } from '@/integrations/scm/github/operator-delivery.js';
@@ -105,6 +108,19 @@ describe('createOperatorDeliveryProvider', () => {
 		const delivery = await createOperatorDeliveryProvider(REPO, TOKEN);
 		await expect(delivery.readPullRequestContext(7)).resolves.toEqual({ number: 7 });
 		expect(readGitHubPullRequestContext).toHaveBeenCalledWith('SmartTechBrewery', 'swarm', 7);
+		expect(withGitHubToken).toHaveBeenCalledTimes(1);
+		expect(withGitHubToken.mock.calls[0][0]).toBe(TOKEN);
+	});
+
+	it('reads the review under the operator token (issue #1240)', async () => {
+		const delivery = await createOperatorDeliveryProvider(REPO, TOKEN);
+		await expect(delivery.readReview(7, '4242')).resolves.toEqual({ id: '4242' });
+		expect(readGitHubPullRequestReview).toHaveBeenCalledWith(
+			'SmartTechBrewery',
+			'swarm',
+			7,
+			'4242',
+		);
 		expect(withGitHubToken).toHaveBeenCalledTimes(1);
 		expect(withGitHubToken.mock.calls[0][0]).toBe(TOKEN);
 	});

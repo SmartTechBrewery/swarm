@@ -30,6 +30,7 @@ import {
 	getGitHubUserForToken,
 	postIdempotentPullRequestComment,
 	readGitHubPullRequestContext,
+	readGitHubPullRequestReview,
 	withGitHubToken,
 } from './client.js';
 
@@ -81,5 +82,7 @@ export async function createOperatorDeliveryProvider(
 		postComment: (input) => scoped(() => postIdempotentPullRequestComment(owner, repoName, input)),
 		readPullRequestContext: (prNumber) =>
 			scoped(() => readGitHubPullRequestContext(owner, repoName, prNumber)),
+		readReview: (prNumber, reviewId) =>
+			scoped(() => readGitHubPullRequestReview(owner, repoName, prNumber, reviewId)),
 	};
 }

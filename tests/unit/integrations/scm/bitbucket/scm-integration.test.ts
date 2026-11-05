@@ -741,11 +741,15 @@ describe('BitbucketSCMIntegration', () => {
 			vi.mocked(getScopedBitbucketUserEmail).mockResolvedValue('impl@example.com');
 		});
 
-		it('declares the pull-request context read not yet supported (issue #1239)', async () => {
+		it('declares the pull-request context and review reads not yet supported (issues #1239, #1240)', async () => {
 			const delivery = await scm.deliveryProvider(project, 'reviewer');
 			await expect(delivery.readPullRequestContext(1)).rejects.toThrow(ScmReadUnsupportedError);
 			await expect(delivery.readPullRequestContext(1)).rejects.toThrow(
 				'not yet supported on Bitbucket Cloud',
+			);
+			await expect(delivery.readReview(1, '1')).rejects.toThrow(ScmReadUnsupportedError);
+			await expect(delivery.readReview(1, '1')).rejects.toThrow(
+				'reading a pull request review is not yet supported on Bitbucket Cloud',
 			);
 		});
 

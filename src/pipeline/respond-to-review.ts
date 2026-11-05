@@ -3,8 +3,14 @@
  *
  * By default, the reviewer persona submits a `changes_requested` review and the
  * worker runs this: provision a worktree on the PR's existing task branch, spin
- * up Claude Code as the implementer to read the batched review, and for each
+ * up Claude Code as the implementer to answer the batched review, and for each
  * point either fix the code (Path A) or push back with a rationale (Path B).
+ * SWARM reads the review, not the agent (issue #1240): before the agent starts,
+ * the phase reads the pull request and the one review it answers through the
+ * delivery seam's provider-neutral `readPullRequestContext` / `readReview` and
+ * writes both to `swarm_pull_request.md` at the worktree root, so every provider
+ * is answered the same way and an unreadable review fails the run before the
+ * agent does.
  * `pipeline.respondToReview.skipOnMinors: false` can opt back into responding
  * to every reviewer verdict. "Wait for the final submitted review, not
  * individual line comments" is still Cascade's rule and still applies here.
@@ -122,6 +128,11 @@ import {
 	saveDeliveryProgress,
 	shouldDeferDeliveryFailure,
 } from '@/scm/delivery.js';
+import {
+	type PullRequestContext,
+	type PullRequestReview,
+	writePullRequestContext,
+} from '@/scm/pull-request-context.js';
 import { GitWorktreeManager } from '@/worker/git-worktree-manager.js';
 import { graftEnvironment } from '@/worktree/graft.js';
 import { isArtifactNumberTaskId, taskIdFromTaskBranch } from './task-branch.js';
@@ -187,9 +198,10 @@ export interface RunRespondToReviewPhaseOptions {
 	 */
 	prBranch: string;
 	/**
-	 * The submitted review's numeric ID (`review.id` from the
-	 * `pull_request_review` webhook) — pins the agent to the one batched review
-	 * it must respond to, rather than whatever `gh pr view` surfaces last.
+	 * The id ingress put on the review event — numeric on GitHub (`review.id`
+	 * from the `pull_request_review` webhook), synthetic on Azure DevOps. Opaque
+	 * here: the delivery seam's `readReview` resolves it to the one batched review
+	 * the agent responds to.
 	 */
 	reviewId: string;
 	/**
@@ -418,6 +430,40 @@ function logAgentFailure(taskId: string, prNumber: string, agent: AgentCliResult
 }
 
 /**
+ * Read the pull request and the review being answered through the delivery seam
+ * and write them where the prompt tells the agent to look (issue #1240) — the
+ * Respond-to-review twin of Review's `stagePullRequestContext`. A read that
+ * fails — including a provider that does not yet support it — becomes the run's
+ * failure reason, naming the review, the pull request, the repository and the
+ * provider. The write sits outside the `try`: a local filesystem error is not
+ * "could not read from the provider".
+ */
+async function stageReviewContext(params: {
+	delivery: ScmDeliveryProvider;
+	project: ProjectConfig;
+	prNumber: string;
+	reviewId: string;
+	worktreePath: string;
+}): Promise<void> {
+	const { delivery, project, reviewId, worktreePath } = params;
+	const prNumber = Number(params.prNumber);
+	let read: [PullRequestContext, PullRequestReview];
+	try {
+		read = await Promise.all([
+			delivery.readPullRequestContext(prNumber),
+			delivery.readReview(prNumber, reviewId),
+		]);
+	} catch (error) {
+		const cause = error instanceof Error ? error.message : String(error);
+		throw new Error(
+			`Respond-to-review could not read review ${reviewId} on pull request #${params.prNumber} in ${project.repo} from SCM provider '${project.scm ?? 'unset'}': ${cause}`,
+			{ cause: error },
+		);
+	}
+	writePullRequestContext(worktreePath, read[0], read[1]);
+}
+
+/**
  * Run the Respond-to-review phase for one submitted review. Provisions a
  * worktree on the PR's existing branch, runs the implementer agent to address
  * the batched review — fixing code or pushing back point by point — and
@@ -510,6 +556,11 @@ export async function runRespondToReviewPhase(
 	let preserveForResume = false;
 	try {
 		graft(project.repoRoot, handle.path);
+		// Resolved before the agent runs: the agent is handed the review read through
+		// it, and the response is delivered through it afterwards.
+		const delivery =
+			options.delivery ??
+			(await requireProjectSCMProvider(project).deliveryProvider(project, 'implementer'));
 
 		// The dispatch was pinned to `headSha`, and the PR-scoped hold that keeps another
 		// phase off this branch can still be outrun — a fail-open hold read, a human
@@ -532,6 +583,13 @@ export async function runRespondToReviewPhase(
 						checkoutHead: held.advancedTo,
 					},
 				);
+			await stageReviewContext({
+				delivery,
+				project,
+				prNumber,
+				reviewId,
+				worktreePath: handle.path,
+			});
 		}
 
 		const agent = deliveryResumed
@@ -590,9 +648,6 @@ export async function runRespondToReviewPhase(
 				'Invalid respond-to-review hand-off: fixed requires commitSubject and verification',
 			);
 		}
-		const delivery =
-			options.delivery ??
-			(await requireProjectSCMProvider(project).deliveryProvider(project, 'implementer'));
 		const deliveryId = deliveryIdentity(['respond-to-review', project.repo, prNumber, reviewId]);
 		const progress = loadDeliveryProgress(handle.path, deliveryId);
 		saveDeliveryProgress(handle.path, progress);

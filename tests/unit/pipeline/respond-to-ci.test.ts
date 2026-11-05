@@ -37,6 +37,7 @@ import {
 	createMockProjectConfig,
 	createMockProjectRepositoryPair,
 	createMockPullRequestContext,
+	createMockPullRequestReview,
 } from '../../helpers/factories.js';
 
 const PR_BRANCH = 'issue-64';
@@ -199,6 +200,7 @@ function makeDeps(project = createMockProjectConfig()) {
 			pushBranch: vi.fn(async (_cwd: string, _branch: string, _expectedSha: string) => {}),
 			submitReview: vi.fn(async () => 0),
 			readPullRequestContext: vi.fn(async () => createMockPullRequestContext()),
+			readReview: vi.fn(async () => createMockPullRequestReview()),
 			postComment: vi.fn(
 				async (_input: { prNumber: number; body: string; deliveryId: string }) => 7,
 			),

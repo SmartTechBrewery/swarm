@@ -20,7 +20,11 @@ import {
 	ScmReadUnsupportedError,
 } from '@/scm/pull-request-context.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
-import { createMockProjectConfig, createMockPullRequestContext } from '../../helpers/factories.js';
+import {
+	createMockProjectConfig,
+	createMockPullRequestContext,
+	createMockPullRequestReview,
+} from '../../helpers/factories.js';
 
 const HEAD_SHA = 'abc1234def5678abc1234def5678abc1234def56';
 
@@ -138,6 +142,7 @@ function makeDeps() {
 				}) => 77,
 			),
 			readPullRequestContext: vi.fn(async () => createMockPullRequestContext()),
+			readReview: vi.fn(async () => createMockPullRequestReview()),
 			postComment: vi.fn(async () => 1),
 		} satisfies ScmDeliveryProvider,
 		// Ledger writers default to a first-verdict reservation so existing tests

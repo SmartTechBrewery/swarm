@@ -7,7 +7,9 @@
  * `listActiveAzureDevOpsPullRequestsForBase`, `findActiveAzureDevOpsPullRequest`,
  * plus the merge path's commit-graph staleness read,
  * `isAzureDevOpsBaseContainedInHead`, and the agent's read of a pull request and
- * its discussion, `readAzureDevOpsPullRequestContext` (issue #1239). The one write here is
+ * its discussion, `readAzureDevOpsPullRequestContext` (issue #1239), and of the
+ * review a Respond-to-review run answers, `readAzureDevOpsPullRequestReview`
+ * (issue #1240). The one write here is
  * `retryFailedAzureDevOpsBuilds` (issue #1133), which shares the aggregate's build
  * scan so it can only ever retry a build that aggregate counts.
  *
@@ -38,6 +40,7 @@ import { logger } from '../../../lib/logger.js';
 import type {
 	PullRequestContext,
 	PullRequestDiscussionEntry,
+	PullRequestReview,
 } from '../../../scm/pull-request-context.js';
 import type {
 	AggregateCheckStatus,
@@ -52,7 +55,8 @@ import {
 	paginateAzureDevOps,
 	repositoryApiPath,
 } from './client.js';
-import { pullRequestWebUrl } from './webhook.js';
+import { isAzureDevOpsRequestChangesMarker } from './review-marker.js';
+import { pullRequestWebUrl, UNKNOWN_ID_PART } from './webhook.js';
 
 /** Prefix a branch ref carries in `sourceRefName` / `targetRefName` / a ref listing. */
 const BRANCH_REF_PREFIX = 'refs/heads/';
@@ -106,6 +110,8 @@ interface AzureDevOpsList<T> {
 /** One pull-request thread, typed to the fields the context read depends on. */
 interface AzureDevOpsDiscussionThread {
 	isDeleted?: boolean;
+	/** `active` | `fixed` | `wontFix` | `closed` | `byDesign` | `pending` | `unknown`. */
+	status?: string;
 	/** Present on a thread anchored to a file; `filePath` carries a leading `/`. */
 	threadContext?: {
 		filePath?: string;
@@ -122,7 +128,7 @@ interface AzureDevOpsDiscussionComment {
 	commentType?: string;
 	isDeleted?: boolean;
 	publishedDate?: string;
-	author?: { displayName?: string; uniqueName?: string } | null;
+	author?: { id?: string; displayName?: string; uniqueName?: string } | null;
 }
 
 /** One ref, as `GET …/refs` lists it. */
@@ -349,6 +355,83 @@ export async function readAzureDevOpsPullRequestContext(
 		headBranch: branchName(pr.sourceRefName),
 		url: pullRequestWebUrl(repo, number),
 		discussion: (threads?.value ?? []).flatMap(discussionEntries),
+	};
+}
+
+/**
+ * SWARM's latest request-changes findings comment by `authorId` (any author when
+ * ingress recorded none). Undated comments lose to dated ones.
+ */
+function latestVerdictComment(
+	threads: AzureDevOpsDiscussionThread[],
+	authorId: string,
+): AzureDevOpsDiscussionComment | undefined {
+	const candidates = threads
+		.flatMap((thread) => thread.comments ?? [])
+		.filter(
+			(comment) =>
+				!comment.isDeleted &&
+				comment.commentType !== 'system' &&
+				isAzureDevOpsRequestChangesMarker(comment.content) &&
+				(authorId === UNKNOWN_ID_PART || comment.author?.id === authorId),
+		);
+	const at = (comment: AzureDevOpsDiscussionComment): number => {
+		const parsed = Date.parse(comment.publishedDate ?? '');
+		return Number.isNaN(parsed) ? Number.NEGATIVE_INFINITY : parsed;
+	};
+	return candidates.reduce<AzureDevOpsDiscussionComment | undefined>(
+		(best, comment) => (!best || at(comment) > at(best) ? comment : best),
+		undefined,
+	);
+}
+
+/**
+ * The review a Respond-to-review run answers (issue #1240). Azure DevOps has no
+ * review object: the verdict is SWARM's findings thread carrying the
+ * request-changes marker (`./review-marker.ts`), and ingress synthesizes the id
+ * as `<prId>:<state>:<authorId>:<headSha>` (`./webhook.ts`). The id is parsed
+ * back, the thread is resolved to the marker comment its author posted (any
+ * author when ingress recorded none), and — since several rounds leave several
+ * marker threads, and each run answers the newest verdict — the latest one wins.
+ * The inline comments are the pull request's active file-anchored threads; the
+ * findings thread is top-level, so it is never among them.
+ */
+export async function readAzureDevOpsPullRequestReview(
+	repo: string,
+	pullRequestId: number,
+	reviewId: string,
+): Promise<PullRequestReview> {
+	const parts = reviewId.split(':');
+	if (parts.length !== 4)
+		throw new Error(`Azure DevOps review id '${reviewId}' is not a SWARM review id`);
+	const [prId, state, authorId] = parts as [string, string, string, string];
+	if (prId !== String(pullRequestId))
+		throw new Error(
+			`Azure DevOps review id '${reviewId}' does not belong to pull request ${pullRequestId}`,
+		);
+	const threads = (
+		(
+			await azureDevOpsRequest<AzureDevOpsList<AzureDevOpsDiscussionThread> | undefined>(
+				'GET',
+				`${pullRequestPath(repo, pullRequestId)}/threads`,
+			)
+		)?.value ?? []
+	).filter((thread) => !thread.isDeleted);
+
+	const verdict = latestVerdictComment(threads, authorId);
+	if (!verdict)
+		throw new Error(
+			`Azure DevOps pull request ${repo}!${pullRequestId} has no SWARM request-changes findings thread for review '${reviewId}'`,
+		);
+	return {
+		id: reviewId,
+		author: verdict.author?.displayName ?? verdict.author?.uniqueName ?? null,
+		state,
+		submittedAt: verdict.publishedDate ?? null,
+		body: verdict.content ?? '',
+		comments: threads
+			.filter((thread) => thread.status === 'active' && thread.threadContext?.filePath)
+			.flatMap(discussionEntries),
 	};
 }
 

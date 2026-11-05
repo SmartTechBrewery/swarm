@@ -11,6 +11,7 @@ import {
 	createMockProjectConfig,
 	createMockProjectRepositoryPair,
 	createMockPullRequestContext,
+	createMockPullRequestReview,
 } from '../../helpers/factories.js';
 
 const roots: string[] = [];
@@ -105,6 +106,7 @@ function deliveryDeps(
 				pushBranch: vi.fn(),
 				submitReview,
 				readPullRequestContext: vi.fn(async () => createMockPullRequestContext()),
+				readReview: vi.fn(async () => createMockPullRequestReview()),
 				postComment: vi.fn(),
 			} as unknown as ScmDeliveryProvider,
 			markReviewVerdictSubmitted: vi.fn(async () => ({ id: 'verdict-1', ordinal: 1 })),
@@ -505,6 +507,7 @@ describe('review production delivery', () => {
 			pushBranch: vi.fn(),
 			submitReview,
 			readPullRequestContext: vi.fn(async () => createMockPullRequestContext()),
+			readReview: vi.fn(async () => createMockPullRequestReview()),
 			postComment: vi.fn(),
 		} as unknown as ScmDeliveryProvider;
 		const markReviewVerdictSubmitted = vi.fn(async () => ({ id: 'verdict-1', ordinal: 1 }));

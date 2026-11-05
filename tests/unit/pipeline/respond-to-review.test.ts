@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -34,10 +34,15 @@ import {
 	type ScmDeliveryProvider,
 	UnretryableDeliveryError,
 } from '@/scm/delivery.js';
+import {
+	PULL_REQUEST_CONTEXT_FILENAME,
+	ScmReadUnsupportedError,
+} from '@/scm/pull-request-context.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
 import {
 	createMockProjectConfig,
 	createMockPullRequestContext,
+	createMockPullRequestReview,
 	createMockWorkItem,
 } from '../../helpers/factories.js';
 
@@ -205,6 +210,7 @@ function makeDeps() {
 			pushBranch: vi.fn(async (_cwd: string, _branch: string, _expectedSha: string) => {}),
 			submitReview: vi.fn(async () => 0),
 			readPullRequestContext: vi.fn(async () => createMockPullRequestContext()),
+			readReview: vi.fn(async () => createMockPullRequestReview()),
 			postComment: vi.fn(
 				async (_input: { prNumber: number; body: string; deliveryId: string }) => 7,
 			),
@@ -239,7 +245,8 @@ describe('runRespondToReviewPhase', () => {
 		const runArgs = deps.runAgent.mock.calls[0][0];
 		expect(runArgs.cli).toBe('claude');
 		expect(runArgs.cwd).toBe(deps.path);
-		expect(runArgs.args?.[0]).toContain('reviews/4242');
+		expect(runArgs.args?.[0]).toContain(PULL_REQUEST_CONTEXT_FILENAME);
+		expect(runArgs.args?.[0]).toContain('review 4242');
 		expect(runArgs.env).toEqual({ GH_TOKEN: 'implementer-token' });
 
 		// Env is grafted into the worktree before the agent runs.
@@ -259,6 +266,48 @@ describe('runRespondToReviewPhase', () => {
 
 		expect(result.outcome).toBe('fixed');
 		expect(result.agent.exitCode).toBe(0);
+	});
+
+	describe('reading the review through SWARM (issue #1240)', () => {
+		it('reads the pull request and the review before the agent runs and writes both for it', async () => {
+			const deps = makeDeps();
+			await runRespondToReviewPhase(deps);
+
+			expect(deps.delivery.readPullRequestContext).toHaveBeenCalledWith(99);
+			expect(deps.delivery.readReview).toHaveBeenCalledWith(99, '4242');
+			const agentAt = deps.runAgent.mock.invocationCallOrder[0];
+			expect(deps.delivery.readPullRequestContext.mock.invocationCallOrder[0]).toBeLessThan(
+				agentAt,
+			);
+			expect(deps.delivery.readReview.mock.invocationCallOrder[0]).toBeLessThan(agentAt);
+
+			const written = readFileSync(join(deps.path, PULL_REQUEST_CONTEXT_FILENAME), 'utf8');
+			expect(written).toContain('# Pull request #99: Add the widget');
+			expect(written).toContain('## Review being answered');
+			expect(written).toContain('- Review id: 4242');
+			expect(written).toContain('#### src/widget.ts:12 · swarm-reviewer');
+		});
+
+		it.each([
+			['a plain read error', new Error('HTTP 404 Not Found')],
+			[
+				'an unsupported provider',
+				new ScmReadUnsupportedError('reading a pull request review is not yet supported on GitLab'),
+			],
+		])('fails the run naming the review, PR, repository and provider on %s', async (_label, error) => {
+			const deps = { ...makeDeps(), project: createMockProjectConfig({ scm: 'gitlab' }) };
+			deps.delivery.readReview.mockRejectedValueOnce(error);
+
+			const run = runRespondToReviewPhase(deps);
+			await expect(run).rejects.toThrow(
+				`Respond-to-review could not read review 4242 on pull request #99 in ${deps.project.repo} from SCM provider 'gitlab': ${error.message}`,
+			);
+			await expect(run).rejects.not.toBeInstanceOf(DeliveryDeferredError);
+			expect(deps.runAgent).not.toHaveBeenCalled();
+			expect(deps.delivery.pushBranch).not.toHaveBeenCalled();
+			expect(deps.delivery.postComment).not.toHaveBeenCalled();
+			expect(deps.worktrees.cleanup).toHaveBeenCalledWith('respond-21');
+		});
 	});
 
 	it('continues from a checkpoint on a fresh session, on a different CLI (issue #502)', async () => {
@@ -623,6 +672,9 @@ describe('runRespondToReviewPhase', () => {
 			expect(result.outcome).toBe('fixed');
 			expect(deps.runAgent).not.toHaveBeenCalled();
 			expect(deps.delivery.pushBranch).toHaveBeenCalledTimes(1);
+			// No agent to hand the review to, so nothing is read.
+			expect(deps.delivery.readPullRequestContext).not.toHaveBeenCalled();
+			expect(deps.delivery.readReview).not.toHaveBeenCalled();
 		});
 
 		// A blip must never fail a response that would otherwise have succeeded —
@@ -842,9 +894,13 @@ describe('buildRespondToReviewPrompt', () => {
 		// Explicit remote/branch on the push — the checkout may have no upstream
 		// configured (e.g. a human-created PR branch), so a bare `git push` could fail.
 		expect(prompt).toContain(`git push origin ${PR_BRANCH}`);
-		expect(prompt).toContain('gh api repos/SmartTechBrewery/swarm/pulls/99/reviews/4242');
-		expect(prompt).toContain('gh api repos/SmartTechBrewery/swarm/pulls/99/reviews/4242/comments');
-		expect(prompt).toContain('gh pr view 99 --repo SmartTechBrewery/swarm --comments');
+		// The review is read through SWARM (issue #1240), never through a provider CLI.
+		expect(prompt).toContain(PULL_REQUEST_CONTEXT_FILENAME);
+		expect(prompt).toContain('Review being answered');
+		expect(prompt).toContain('review 4242');
+		expect(prompt).not.toContain('gh api');
+		expect(prompt).not.toContain('gh pr view');
+		expect(prompt).not.toContain('on GitHub');
 		expect(prompt).toContain('gh pr comment 99 --repo SmartTechBrewery/swarm');
 		expect(prompt).toContain(RESPOND_OUTCOME_FILENAME);
 	});
