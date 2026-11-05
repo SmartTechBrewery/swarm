@@ -149,8 +149,8 @@ const TEAM_STATES_QUERY = /* GraphQL */ `
 `;
 
 /**
- * One workflow state read on its own, for the `type` a mapping cannot be trusted
- * to have picked. `workflowState(id:)` takes a `String!`, like `issue(id:)`.
+ * One workflow state read on its own, to confirm a board mapping's `done` still
+ * resolves in Linear. `workflowState(id:)` takes a `String!`, like `issue(id:)`.
  */
 const WORKFLOW_STATE_QUERY = /* GraphQL */ `
 	query WorkflowState($id: String!) {
@@ -165,8 +165,9 @@ const WORKFLOW_STATE_QUERY = /* GraphQL */ `
  *
  * `identifier` (`SWARM-491`) is Linear's own human-readable reference and the one
  * a person would search for; `number` backs the `#N` form the shared prose
- * heuristic speaks. `state { type }` is the open/closed signal: Linear has no
- * boolean, only the state's category.
+ * heuristic speaks. `state { id type }` is the open/closed signal: Linear has no
+ * boolean, only the state's category — and the state's own id, matched against
+ * the board mapping's `done` ({@link isFinishedState}).
  */
 const BLOCKER_ISSUE_FIELDS = /* GraphQL */ `
 	id
@@ -174,7 +175,7 @@ const BLOCKER_ISSUE_FIELDS = /* GraphQL */ `
 	number
 	title
 	url
-	state { type }
+	state { id type }
 `;
 
 /** One page of an issue's comments — id and body are all a marker scan needs. */
@@ -388,7 +389,7 @@ interface BlockerIssueNode {
 	number?: number;
 	title?: string;
 	url?: string;
-	state?: { type?: string } | null;
+	state?: { id?: string; type?: string } | null;
 }
 
 interface CommentNode {
@@ -487,8 +488,29 @@ const BLOCKS_RELATION_TYPE = 'blocks';
  */
 const CLOSED_STATE_TYPES = new Set(['completed', 'canceled']);
 
+/**
+ * Whether a related issue's workflow state means finished — the one rule behind
+ * both {@link toBlocker}'s and {@link toDependent}'s `open` (issue #1327). The
+ * board mapping's own `done` state counts whatever its type, because it is what
+ * SWARM itself treats as done (a `done` mapped to a `started` "QA" state is a real
+ * configuration); so does any state of a {@link CLOSED_STATE_TYPES} type, so an
+ * issue a person completes or cancels some other way still unblocks.
+ */
+function isFinishedState(
+	state: BlockerIssueNode['state'],
+	config: LinearIntegrationConfig,
+): boolean {
+	const mappedDone = config.statusOptions.done;
+	if (mappedDone !== undefined && state?.id === mappedDone) return true;
+	return CLOSED_STATE_TYPES.has(state?.type ?? '');
+}
+
 /** Map a Linear issue — a native relation's or a resolved mention's — to a provider-neutral blocker. */
-function toBlocker(issue: BlockerIssueNode, source: WorkItemBlocker['source']): WorkItemBlocker {
+function toBlocker(
+	issue: BlockerIssueNode,
+	source: WorkItemBlocker['source'],
+	config: LinearIntegrationConfig,
+): WorkItemBlocker {
 	return {
 		id: issue.id,
 		// Linear's `identifier` is what a person sees and searches for; the `#N` form
@@ -496,7 +518,7 @@ function toBlocker(issue: BlockerIssueNode, source: WorkItemBlocker['source']): 
 		reference: issue.identifier || (issue.number == null ? (issue.url ?? '?') : `#${issue.number}`),
 		url: issue.url ?? '',
 		title: issue.title ?? '',
-		open: !CLOSED_STATE_TYPES.has(issue.state?.type ?? ''),
+		open: !isFinishedState(issue.state, config),
 		source,
 	};
 }
@@ -507,13 +529,13 @@ function toBlocker(issue: BlockerIssueNode, source: WorkItemBlocker['source']): 
  * (`src/pm/types.ts`). `reference`/`url` are derived identically on purpose: they
  * are the identity the shared cycle check matches a blocker against.
  */
-function toDependent(issue: BlockerIssueNode): WorkItemDependent {
+function toDependent(issue: BlockerIssueNode, config: LinearIntegrationConfig): WorkItemDependent {
 	return {
 		id: issue.id,
 		reference: issue.identifier || (issue.number == null ? (issue.url ?? '?') : `#${issue.number}`),
 		url: issue.url ?? '',
 		title: issue.title ?? '',
-		open: !CLOSED_STATE_TYPES.has(issue.state?.type ?? ''),
+		open: !isFinishedState(issue.state, config),
 	};
 }
 
@@ -884,24 +906,16 @@ export class LinearPMProvider implements PMProvider {
 	 * One *board* write is the whole settle here, unlike GitHub Projects' two: a
 	 * Linear issue carries no closed flag beside its workflow state, so that state
 	 * is both what the board shows and what this provider derives a blocker's
-	 * `open` from ({@link CLOSED_STATE_TYPES}). Move the issue into a finished-type
-	 * state and both halves of the contract's end state (`src/pm/types.ts`) hold at
-	 * once, with nothing left for a second write to set.
+	 * `open` from. Move the issue into the mapped `done` state and both halves of
+	 * the contract's end state (`src/pm/types.ts`) hold at once, with nothing left
+	 * for a second write to set — whatever that state's type, because
+	 * {@link isFinishedState} counts the mapped `done` as finished by construction
+	 * (issue #1327).
 	 *
-	 * That equivalence holds only while the mapping's `done` actually names such a
-	 * state, and nothing else in SWARM makes it: `statusOptions` stores opaque state
-	 * UUIDs, and the board-mapping screen accepts any of the team's states for the
-	 * key. So the state's own `type` is read and checked **before** the move — a
-	 * `done` mapped to an `unstarted`/`started` state fails loudly and writes
-	 * nothing, rather than reporting a settle that silently leaves the item gating
-	 * its dependents forever. The check is against {@link CLOSED_STATE_TYPES} rather
-	 * than `completed` alone on purpose: that set is the very thing `listBlockers`
-	 * reads, so the invariant is verified against its own reader and cannot drift
-	 * from it.
-	 *
-	 * One extra read per settle, on a call made once per landed run — the cheapest
-	 * place to catch a misconfiguration whose only other symptom is dependent work
-	 * that never ungates.
+	 * The state is still read **before** the move, for the one mapping that
+	 * genuinely cannot be settled into: a stale one, whose UUID no longer resolves
+	 * in Linear. That fails loudly and writes nothing — one extra read per settle,
+	 * on a call made once per landed run.
 	 */
 	async closeWorkItem(id: string): Promise<void> {
 		const stateId = requireStateIdForStatusKey(this.config, 'done');
@@ -914,14 +928,6 @@ export class LinearPMProvider implements PMProvider {
 				throw new Error(
 					`Cannot close item '${id}': the board mapping's 'done' workflow state (${stateId}) does not resolve in Linear. ` +
 						'Re-run board discovery and remap statusOptions.done.',
-				);
-			}
-			if (!CLOSED_STATE_TYPES.has(state.type ?? '')) {
-				throw new Error(
-					`Cannot close item '${id}': the board mapping's 'done' workflow state '${state.name ?? '<unnamed>'}' (${stateId}) is of type ` +
-						`'${state.type ?? '<unknown>'}', which Linear does not count as finished. ` +
-						'Settling into it would leave the item reported as still open and gating its dependents — ' +
-						`remap statusOptions.done to a state of type ${[...CLOSED_STATE_TYPES].join(' or ')}.`,
 				);
 			}
 		});
@@ -1078,7 +1084,7 @@ export class LinearPMProvider implements PMProvider {
 					(relation): relation is RelationNode & { relatedIssue: BlockerIssueNode } =>
 						relation.type === BLOCKS_RELATION_TYPE && Boolean(relation.relatedIssue?.id),
 				)
-				.map((relation) => toDependent(relation.relatedIssue));
+				.map((relation) => toDependent(relation.relatedIssue, this.config));
 		});
 	}
 
@@ -1136,7 +1142,7 @@ export class LinearPMProvider implements PMProvider {
 				(relation): relation is RelationNode & { issue: BlockerIssueNode } =>
 					relation.type === BLOCKS_RELATION_TYPE && Boolean(relation.issue?.id),
 			)
-			.map((relation) => toBlocker(relation.issue, 'dependency'));
+			.map((relation) => toBlocker(relation.issue, 'dependency', this.config));
 	}
 
 	/**
@@ -1192,7 +1198,7 @@ export class LinearPMProvider implements PMProvider {
 			filter: this.issueFilter({ number }),
 		});
 		const issue = (data.issues?.nodes ?? []).find((node) => node?.id);
-		return issue ? toBlocker(issue, 'mention') : undefined;
+		return issue ? toBlocker(issue, 'mention', this.config) : undefined;
 	}
 
 	/**

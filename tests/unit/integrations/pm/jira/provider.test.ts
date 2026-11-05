@@ -968,23 +968,24 @@ describe('JiraPMProvider', () => {
 			expect(fetchMock).toHaveBeenCalledTimes(2);
 		});
 
-		it("refuses, without transitioning, when the mapped 'done' status is not in the done category", async () => {
+		it("settles into a mapped 'done' status outside the done category", async () => {
 			mockJira({
 				[`status/${CONFIG.statusOptions.done}`]: {
 					...doneStatus('indeterminate'),
-					name: 'Ready for QA',
+					name: 'Testy',
 				},
 				'issue/SWARM-42': { fields: { status: { id: '3', name: 'In Progress' } } },
 				'issue/SWARM-42/transitions': {
-					transitions: [{ id: '51', name: 'Done', to: { id: CONFIG.statusOptions.done } }],
+					transitions: [{ id: '51', name: 'Testy', to: { id: CONFIG.statusOptions.done } }],
 				},
 			});
 
-			// An `indeterminate` status would return normally while `listBlockers` kept
-			// reporting `open: true`, gating the item's dependents forever — so the
-			// mapping is checked first and the workflow is never touched.
-			await expect(provider.closeWorkItem('SWARM-42')).rejects.toThrow(/'indeterminate'/);
-			expect(requestsTo('issue/SWARM-42/transitions', 'POST')).toEqual([]);
+			// `listBlockers` counts the mapped `done` as finished whatever its category
+			// (issue #1327), so the one transition settles both halves here too.
+			await provider.closeWorkItem('SWARM-42');
+			expect(writeTo('issue/SWARM-42/transitions', 'POST').body).toEqual({
+				transition: { id: '51' },
+			});
 		});
 
 		it("refuses in SWARM's own terms when the mapped 'done' status 404s", async () => {
@@ -1230,8 +1231,11 @@ describe('JiraPMProvider', () => {
 			outward: 'relates to',
 		};
 
-		function linkedIssue(key: string, summary: string, statusCategory: string) {
-			return { key, fields: { summary, status: { statusCategory: { key: statusCategory } } } };
+		function linkedIssue(key: string, summary: string, statusCategory: string, statusId?: string) {
+			return {
+				key,
+				fields: { summary, status: { id: statusId, statusCategory: { key: statusCategory } } },
+			};
 		}
 
 		/** Both directions of the Blocks type plus an unrelated one — only one gates. */
@@ -1317,6 +1321,64 @@ describe('JiraPMProvider', () => {
 				]);
 			});
 
+			// Issue #1327: what SWARM itself treats as done unblocks, not only Jira's
+			// done category.
+			it("counts the mapped 'done' status as finished, whatever its category", async () => {
+				mockJira({
+					'issue/SWARM-42': (url) =>
+						url.searchParams.get('fields') === 'issuelinks'
+							? {
+									key: 'SWARM-42',
+									fields: {
+										issuelinks: [
+											// Mapped `done` in the In progress category ("Testy").
+											{
+												type: BLOCKS_TYPE,
+												inwardIssue: linkedIssue(
+													'SWARM-1',
+													'Merged, in Testy',
+													'indeterminate',
+													CONFIG.statusOptions.done,
+												),
+											},
+											// Done category, not the mapped `done` ("WON'T").
+											{
+												type: BLOCKS_TYPE,
+												inwardIssue: linkedIssue('SWARM-2', 'Closed as WONT', 'done', '10555'),
+											},
+											// Neither: still in review.
+											{
+												type: BLOCKS_TYPE,
+												inwardIssue: linkedIssue(
+													'SWARM-3',
+													'In code review',
+													'indeterminate',
+													CONFIG.statusOptions.inReview,
+												),
+											},
+										],
+									},
+								}
+							: { key: 'SWARM-42', fields: { description: adfText('Depends on #4.') } },
+					'issue/SWARM-42/comment': { startAt: 0, total: 0, comments: [] },
+					// The mention path resolves its blocker by the same rule.
+					'issue/SWARM-4': linkedIssue(
+						'SWARM-4',
+						'Prose prerequisite in Testy',
+						'indeterminate',
+						CONFIG.statusOptions.done,
+					),
+				});
+
+				const blockers = await provider.listBlockers('SWARM-42');
+				expect(blockers.map(({ reference, open }) => ({ reference, open }))).toEqual([
+					{ reference: 'SWARM-1', open: false },
+					{ reference: 'SWARM-2', open: false },
+					{ reference: 'SWARM-3', open: true },
+					{ reference: 'SWARM-4', open: false },
+				]);
+			});
+
 			it('reports nothing for a card with neither a link nor a prose prerequisite', async () => {
 				mockJira({
 					'issue/SWARM-42': { key: 'SWARM-42', fields: { issuelinks: [], description: null } },
@@ -1345,6 +1407,31 @@ describe('JiraPMProvider', () => {
 						title: 'Register the manifest',
 						open: true,
 					},
+				]);
+			});
+
+			it("reports a dependent in the mapped 'done' status as finished (issue #1327)", async () => {
+				mockJira({
+					'issue/SWARM-42': {
+						key: 'SWARM-42',
+						fields: {
+							issuelinks: [
+								{
+									type: BLOCKS_TYPE,
+									outwardIssue: linkedIssue(
+										'SWARM-8',
+										'Register the manifest',
+										'indeterminate',
+										CONFIG.statusOptions.done,
+									),
+								},
+							],
+						},
+					},
+				});
+
+				await expect(provider.listDependents('SWARM-42')).resolves.toEqual([
+					expect.objectContaining({ reference: 'SWARM-8', open: false }),
 				]);
 			});
 

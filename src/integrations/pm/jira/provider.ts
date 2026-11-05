@@ -123,7 +123,7 @@ const DONE_STATUS_CATEGORY = 'done';
  */
 const PREFERRED_ISSUE_TYPE = 'task';
 
-/** The fields a blocker is mapped from — its title and the status category behind `open`. */
+/** The fields a blocker is mapped from — its title and the status (id and category) behind `open`. */
 const BLOCKER_FIELDS = 'summary,status';
 
 /** One transition Jira offers out of an issue's *current* workflow status. */
@@ -136,9 +136,9 @@ interface JiraTransition {
 }
 
 /**
- * `GET /rest/api/3/status/{id}` — one status on its own, read for the
- * {@link DONE_STATUS_CATEGORY} membership a board mapping cannot be trusted to have
- * picked. The issue reads elsewhere carry the same nesting under `fields.status`.
+ * `GET /rest/api/3/status/{id}` — one status on its own, read to confirm a board
+ * mapping's `done` still resolves to a status on an active workflow. The issue
+ * reads elsewhere carry the same nesting under `fields.status`.
  */
 interface JiraStatusDetail {
 	id?: string;
@@ -204,7 +204,7 @@ interface JiraLinkedIssue {
 	key?: string;
 	fields?: {
 		summary?: string | null;
-		status?: { statusCategory?: { key?: string } | null } | null;
+		status?: { id?: string; statusCategory?: { key?: string } | null } | null;
 	} | null;
 }
 
@@ -537,13 +537,32 @@ function isBlockedByLinkType(type: JiraLinkType | null | undefined): boolean {
 }
 
 /**
+ * Whether a linked issue's status means finished — the one rule behind both
+ * {@link toBlocker}'s and {@link toDependent}'s `open` (issue #1327).
+ *
+ * Jira has no finished flag, so two things count. The board mapping's own `done`
+ * status does, whatever its category: it is what SWARM itself treats as done, and
+ * where a board puts a merged card (a `done` mapped to an `indeterminate` "Testy"
+ * column is a real configuration). Any status in Jira's `done` **category** does
+ * too, so a card a person closes some other way ("WON'T", "Gotowe") still
+ * unblocks. Everything else — To Do, In Progress, Code review — still gates.
+ */
+function isFinishedStatus(
+	status: { id?: string; statusCategory?: { key?: string } | null } | null | undefined,
+	config: JiraIntegrationConfig,
+): boolean {
+	const mappedDone = config.statusOptions.done;
+	if (mappedDone !== undefined && status?.id === mappedDone) return true;
+	return status?.statusCategory?.key === DONE_STATUS_CATEGORY;
+}
+
+/**
  * Map one linked/referenced issue onto a `WorkItemBlocker`.
  *
  * `reference` is the issue **key** (`SWARM-123`) rather than a number, because that
  * is what a person searches Jira for and what the deferral comment has to name.
- * `open` comes from the status **category**: Jira has no finished flag, and only
- * the `done` category means finished, so a workflow status of any name outside it
- * still gates dependent work.
+ * `open` is {@link isFinishedStatus}'s negation: the mapped `done` status or any
+ * status in the `done` category is finished, any other status gates dependent work.
  */
 function toBlocker(
 	issue: JiraLinkedIssue & { key: string },
@@ -555,7 +574,7 @@ function toBlocker(
 		reference: issue.key,
 		url: `${siteUrl(config)}/browse/${issue.key}`,
 		title: issue.fields?.summary ?? '',
-		open: issue.fields?.status?.statusCategory?.key !== DONE_STATUS_CATEGORY,
+		open: !isFinishedStatus(issue.fields?.status, config),
 		source,
 	};
 }
@@ -575,7 +594,7 @@ function toDependent(
 		reference: issue.key,
 		url: `${siteUrl(config)}/browse/${issue.key}`,
 		title: issue.fields?.summary ?? '',
-		open: issue.fields?.status?.statusCategory?.key !== DONE_STATUS_CATEGORY,
+		open: !isFinishedStatus(issue.fields?.status, config),
 	};
 }
 
@@ -913,19 +932,16 @@ export class JiraPMProvider implements PMProvider {
 	 * One *board* write is the whole settle here, unlike GitHub Projects' two: a Jira
 	 * issue carries no closed flag beside its status, so the status is both what the
 	 * board shows and what this provider derives a blocker's `open` from. Transition
-	 * the issue into a {@link DONE_STATUS_CATEGORY} status and both halves of the
-	 * contract's end state (`src/pm/types.ts`) hold at once, with nothing left for a
-	 * second write to set.
+	 * the issue into the mapped `done` status and both halves of the contract's end
+	 * state (`src/pm/types.ts`) hold at once, with nothing left for a second write to
+	 * set — whatever category that status sits in, because {@link isFinishedStatus}
+	 * counts the mapped `done` as finished by construction (issue #1327). A `done`
+	 * mapped to an `indeterminate` "Testy" column is as valid here as it is for the
+	 * board mapping and for merge.
 	 *
-	 * That equivalence holds only while the mapping's `done` actually names such a
-	 * status, and nothing else in SWARM makes it: `statusOptions` stores opaque
-	 * status ids, and the board-mapping screen accepts any of the project's statuses
-	 * for the key. So the target status's own category is read and checked **before**
-	 * the transition — a `done` mapped to a `new`/`indeterminate` status fails loudly
-	 * and writes nothing, rather than reporting a settle that silently leaves the
-	 * item gating its dependents forever. The check is against the same constant
-	 * {@link toBlocker} reads, so the invariant is verified against its own reader
-	 * and cannot drift from it.
+	 * The target status is still read **before** the transition, for the one
+	 * mapping that genuinely cannot be settled into: a stale one, whose status no
+	 * longer exists on an active workflow. That fails loudly and writes nothing.
 	 *
 	 * The rest is `moveWorkItem`'s workflow negotiation, which is the part that is
 	 * genuinely Jira's: an issue already in the `done` status is a no-op, and one
@@ -936,7 +952,7 @@ export class JiraPMProvider implements PMProvider {
 		const targetStatusId = requireStatusIdForStatusKey(this.config, 'done');
 		await this.run(async () => {
 			// `GET status/{id}` rather than the issue's transitions: the already-in-done
-			// case has no transition to read a category off, and this one is answered
+			// case has no transition to read the status off, and this one is answered
 			// under the same *Browse projects* permission the rest of the provider
 			// needs (`statuses?id=` would demand a project admin).
 			const status = await jiraRequest<JiraStatusDetail | undefined>(
@@ -952,15 +968,6 @@ export class JiraPMProvider implements PMProvider {
 				throw new Error(
 					`Cannot close item '${id}': the board mapping's 'done' status (id ${targetStatusId}) does not resolve to a status on an active Jira workflow. ` +
 						'Re-run board discovery and remap statusOptions.done.',
-				);
-			}
-			const category = status.statusCategory?.key;
-			if (category !== DONE_STATUS_CATEGORY) {
-				throw new Error(
-					`Cannot close item '${id}': the board mapping's 'done' status ${describeStatus(status)} belongs to the ` +
-						`'${category ?? '<unknown>'}' category, not '${DONE_STATUS_CATEGORY}'. ` +
-						'Settling into it would leave the item reported as still open and gating its dependents — ' +
-						`remap statusOptions.done to a status in the '${DONE_STATUS_CATEGORY}' category.`,
 				);
 			}
 		});

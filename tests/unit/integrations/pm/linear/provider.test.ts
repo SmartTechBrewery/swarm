@@ -122,14 +122,14 @@ function labelsPage(nodes: unknown[], endCursor: string | null = null) {
 }
 
 /** A blocking-issue fixture in the shape `BLOCKER_ISSUE_FIELDS` selects. */
-function blockerIssue(number: number, stateType = 'started') {
+function blockerIssue(number: number, stateType = 'started', stateId?: string) {
 	return {
 		id: `issue-${number}`,
 		identifier: `ENG-${number}`,
 		number,
 		title: `Prerequisite ${number}`,
 		url: `https://linear.app/acme/issue/ENG-${number}/prerequisite-${number}`,
-		state: { type: stateType },
+		state: { id: stateId, type: stateType },
 	};
 }
 
@@ -735,7 +735,7 @@ describe('LinearPMProvider', () => {
 			]);
 		});
 
-		it("refuses, without writing, when the mapped 'done' state is not a finished one", async () => {
+		it("settles into a mapped 'done' state that is not a finished-type one", async () => {
 			mockGraphQL({
 				WorkflowState: {
 					workflowState: { id: CONFIG.statusOptions.done, name: 'QA', type: 'started' },
@@ -743,11 +743,12 @@ describe('LinearPMProvider', () => {
 				UpdateIssue: { issueUpdate: { success: true } },
 			});
 
-			// Settling into a `started` state would return normally while `listBlockers`
-			// kept reporting `open: true`, gating the item's dependents forever — so the
-			// mapping is checked first and the board is left untouched.
-			await expect(provider.closeWorkItem(ISSUE_NODE.id)).rejects.toThrow(/'started'/);
-			expect(variablesSentTo('UpdateIssue')).toEqual([]);
+			// `listBlockers` counts the mapped `done` as finished whatever its type
+			// (issue #1327), so the one write settles both halves here too.
+			await provider.closeWorkItem(ISSUE_NODE.id);
+			expect(variablesSentTo('UpdateIssue')).toEqual([
+				{ id: ISSUE_NODE.id, input: { stateId: CONFIG.statusOptions.done } },
+			]);
 		});
 
 		it("refuses when the mapped 'done' state does not resolve at all", async () => {
@@ -1083,6 +1084,29 @@ describe('LinearPMProvider', () => {
 			await expect(provider.listBlockers(ISSUE_NODE.id)).resolves.toMatchObject([{ open: false }]);
 		});
 
+		// Issue #1327: what SWARM itself treats as done unblocks, not only Linear's
+		// finished state types.
+		it("counts the mapped 'done' state as finished, whatever its type", async () => {
+			mockGraphQL({
+				IssueBlockingRelations: relationsPage([
+					// Mapped `done`, but a `started` "QA" state.
+					{ type: 'blocks', issue: blockerIssue(7, 'started', CONFIG.statusOptions.done) },
+					// Completed, not the mapped `done`.
+					{ type: 'blocks', issue: blockerIssue(8, 'completed', 'some-other-state') },
+					// Neither: still in review.
+					{ type: 'blocks', issue: blockerIssue(9, 'started', CONFIG.statusOptions.inReview) },
+				]),
+				IssueDependencyProse: { issue: { number: 42, description: '', comments: { nodes: [] } } },
+			});
+
+			await expect(provider.listBlockers(ISSUE_NODE.id)).resolves.toMatchObject([
+				{ id: 'issue-7', open: false },
+				{ id: 'issue-8', open: false },
+				{ id: 'issue-9', open: true },
+			]);
+			expect(documentSentTo('IssueBlockingRelations')).toContain('state { id type }');
+		});
+
 		it('returns [] for an item with neither a relation nor a prose prerequisite', async () => {
 			mockGraphQL({
 				IssueBlockingRelations: relationsPage([]),
@@ -1122,6 +1146,22 @@ describe('LinearPMProvider', () => {
 			expect(documentSentTo('IssueDependentRelations')).toMatch(/\brelations\(/);
 			expect(documentSentTo('IssueDependentRelations')).not.toContain('inverseRelations(');
 			expect(documentSentTo('IssueDependentRelations')).toContain('relatedIssue {');
+		});
+
+		it("reports a dependent in the mapped 'done' state as finished (issue #1327)", async () => {
+			mockGraphQL({
+				IssueDependentRelations: dependentRelationsPage([
+					{
+						type: 'blocks',
+						issue: blockerIssue(42),
+						relatedIssue: blockerIssue(7, 'started', CONFIG.statusOptions.done),
+					},
+				]),
+			});
+
+			await expect(provider.listDependents(ISSUE_NODE.id)).resolves.toMatchObject([
+				{ id: 'issue-7', open: false },
+			]);
 		});
 
 		it('returns [] for an issue that blocks nothing', async () => {
