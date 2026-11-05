@@ -1743,6 +1743,20 @@ provider-oriented diagnosis. Quota, model-capacity, launch/authentication,
 worker-shutdown, and user-termination conditions take precedence and retain
 their specific recovery guidance in both the board comment and run detail.
 
+**An Implementation that found nothing to change says so, and leaves In progress**
+(issue #1335). When the implementer agent finishes without changing any repository
+file — every change in its worktree is a SWARM hand-off artifact — the run fails at
+once with an error starting `Implementation found nothing to deliver`, is not
+retried, and SWARM moves the card to **Backlog**, where nothing starts it again by
+itself. The board comment carries the **nothing to deliver** diagnosis: the work is
+most likely already on the base branch (a re-queued card whose pull request was
+merged, or whose change landed some other way), or the card's acceptance criteria
+are already met. Update the card's scope if work remains, or close it; re-running it
+as it stands finds nothing to change again. If the move to Backlog itself failed,
+the error says so, and the card has to be moved out of In progress by hand. Its
+repository's WIP slot is freed by the periodic slot sweep within about five minutes
+of the card reaching Backlog.
+
 **A run whose worker's connection was lost retries itself** (issue #1075). When a
 worker drops off the network mid-phase and does not come back within the grace, the
 run is not failed for you any more: it shows as **Deferred — automatic retry

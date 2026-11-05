@@ -4,6 +4,8 @@ import type { ProposedScope } from '@/pipeline/planning.js';
 import {
 	abandonedReviewDiagnosis,
 	diagnoseFailure,
+	IMPLEMENTATION_NOTHING_TO_DELIVER,
+	isImplementationNothingToDeliverFailure,
 	MIN_SCOPE_STALL_DURATION_MS,
 } from '@/worker/failure-diagnosis.js';
 
@@ -108,6 +110,7 @@ describe('diagnoseFailure (issue #269)', () => {
 		['user-terminated', 'Known condition: user termination'],
 		['continuation-budget-exhausted', 'Known condition: continuation ceiling reached'],
 		['continuation-no-progress', 'Known condition: checkpoint continuations made no progress'],
+		['nothing-to-deliver', 'Known condition: nothing to deliver'],
 	] as const)('%s takes precedence over scope-looking evidence', (knownCondition, title) => {
 		const diagnosis = diagnoseFailure({
 			knownCondition,
@@ -128,6 +131,32 @@ describe('diagnoseFailure (issue #269)', () => {
 
 		expect(diagnosis?.message).toContain(setting);
 		expect(diagnosis?.recovery).toContain(setting);
+	});
+});
+
+// Issue #1335: re-running a card the agent found nothing to change in finds the
+// same nothing, so the recovery is to update or close the card instead.
+describe('the nothing-to-deliver diagnosis', () => {
+	it('advises updating or closing the card, not re-running it', () => {
+		const diagnosis = diagnoseFailure({ knownCondition: 'nothing-to-deliver' });
+
+		expect(diagnosis?.message).toContain('already on the base branch');
+		expect(diagnosis?.recovery).toContain("Update the card's scope");
+		expect(diagnosis?.recovery).toContain('close it');
+		expect(diagnosis?.recovery).not.toMatch(/retry the phase/i);
+	});
+
+	it('recognises the Implementation failure by its opening words', () => {
+		expect(
+			isImplementationNothingToDeliverFailure(
+				`${IMPLEMENTATION_NOTHING_TO_DELIVER} for task '7': the agent finished without changing any repository file.`,
+			),
+		).toBe(true);
+		expect(
+			isImplementationNothingToDeliverFailure(
+				'Unsafe delivery: every change in the working tree is a SWARM hand-off artifact, so there is nothing to deliver. Nothing was committed or pushed.',
+			),
+		).toBe(false);
 	});
 });
 

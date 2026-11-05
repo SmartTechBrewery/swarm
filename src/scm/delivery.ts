@@ -678,7 +678,7 @@ export class DeliveryDeferredError extends Error {
  *
  * This is a **rule, not a list**: every refusal {@link validatePreparedTree} and
  * {@link commitPreparedTree} can raise is thrown as one of these (see
- * `refuseDelivery`), so the next refusal added there is terminal without anyone
+ * `refuseDelivery`, and {@link NothingToDeliverError}, its one subclass), so the next refusal added there is terminal without anyone
  * remembering to classify it. Because the error *class* does not survive the
  * federated wire (the dispatcher rebuilds a remote worker's terminal failure as
  * `AgentRunError{kind:'error'}`), the message is the whole report the operator
@@ -710,9 +710,34 @@ export class DeliveryDivergedError extends UnretryableDeliveryError {
 }
 
 /**
+ * The prepared tree holds nothing but SWARM's own hand-off artifacts, so there is
+ * nothing to commit (issue #1335). A member of the {@link UnretryableDeliveryError}
+ * rule like every other prepared-tree refusal — a retry resumes without re-running
+ * the agent, so it would stage the same empty tree — but its own class, because the
+ * remedy depends on the phase: Implementation, whose agent was asked to change the
+ * repository and changed none of it, catches it to say why and to take the card out
+ * of "In progress" (`src/pipeline/implementation.ts`), while every other caller lets
+ * it fail as it always did.
+ *
+ * The default message deliberately names no "re-run the phase": a re-run of the
+ * same work item usually finds the same nothing to change, and the caller is the
+ * one that knows what does clear it.
+ */
+export class NothingToDeliverError extends UnretryableDeliveryError {
+	constructor(
+		message = 'Unsafe delivery: every change in the working tree is a SWARM hand-off artifact, so there is nothing to deliver. Nothing was committed or pushed.',
+		options?: ErrorOptions,
+	) {
+		super(message, options);
+		this.name = 'NothingToDeliverError';
+	}
+}
+
+/**
  * Refuse to deliver this tree, terminally. Every refusal
  * {@link validatePreparedTree} and {@link commitPreparedTree} can raise goes
- * through here — that funnel is what makes the classification a rule rather than
+ * through here, bar {@link NothingToDeliverError}, which is the same class one
+ * level down — that funnel is what makes the classification a rule rather than
  * a second hard-coded class beside {@link DeliveryDivergedError}: a new refusal
  * added to either function cannot be a plain `Error` without going out of its
  * way to be one.
@@ -895,11 +920,7 @@ export async function commitPreparedTree(
 	// is an exclude pathspec. Unstage hand-off files after adding instead.
 	await git(cwd, ['reset', '--quiet', '--', ...SCRATCH_PATHSPECS]);
 	const staged = await git(cwd, ['diff', '--cached', '--name-only']);
-	if (!staged && !(await unchangedMergeAllowed(cwd, options)))
-		refuseDelivery(
-			'every change in the working tree is a SWARM hand-off artifact, so there is nothing to deliver',
-			'Nothing was committed or pushed; re-run the phase.',
-		);
+	if (!staged && !(await unchangedMergeAllowed(cwd, options))) throw new NothingToDeliverError();
 	await git(cwd, [
 		'-c',
 		`user.name=${identity.name}`,
