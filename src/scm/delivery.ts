@@ -570,6 +570,14 @@ export const DeliveryProgressSchema = z.object({
 	 * once decided (issue #1242) — recorded beside {@link branch} for the same reason.
 	 */
 	commitSubject: z.string().optional(),
+	/**
+	 * The head of an abandoned pull request's branch this delivery replaces (issue
+	 * #1334): an Implementation that starts afresh after its earlier pull request was
+	 * closed reuses the branch name, so its push has to replace that head — and only
+	 * that head ({@link pushLeaseArgs}). Recorded beside {@link branch} so a resumed
+	 * delivery pushes under the same lease.
+	 */
+	replacingSha: z.string().optional(),
 	commitSha: z.string().optional(),
 	pushed: z.boolean().default(false),
 	pullRequestNumber: z.number().int().positive().optional(),
@@ -599,7 +607,17 @@ export interface ScmDeliveryProvider {
 	commitIdentity: { name: string; email: string };
 	findPullRequest(branch: string): Promise<{ number: number; url: string } | undefined>;
 	createPullRequest(input: CreatePullRequestInput): Promise<{ number: number; url: string }>;
-	pushBranch(cwd: string, branch: string, expectedSha: string): Promise<void>;
+	/**
+	 * Push exactly `expectedSha` to `branch`. With `replacingSha` (issue #1334) the
+	 * push may replace the remote branch, but only while it is still at that commit —
+	 * a lease ({@link pushLeaseArgs}), never a blind force.
+	 */
+	pushBranch(
+		cwd: string,
+		branch: string,
+		expectedSha: string,
+		replacingSha?: string,
+	): Promise<void>;
 	submitReview(input: {
 		prNumber: number;
 		verdict: z.infer<typeof ReviewHandoffSchema>['verdict'];
@@ -952,6 +970,24 @@ export async function resolveCommitSha(cwd: string, ref: string): Promise<string
 export async function remoteBranchHead(cwd: string, branch: string): Promise<string> {
 	await git(cwd, ['fetch', 'origin', branch]);
 	return git(cwd, ['rev-parse', `origin/${branch}`]);
+}
+
+/**
+ * The branch's head on `origin` as the remote holds it right now, or `null` when
+ * `origin` has no such branch (issue #1334). Asked with `ls-remote` rather than read
+ * off `refs/remotes/origin/<branch>`, which a fetch without `--prune` keeps pointing
+ * at a branch's last head after the branch itself was deleted. Throws when git could
+ * not ask the remote at all.
+ */
+export async function lsRemoteBranchHead(cwd: string, branch: string): Promise<string | null> {
+	const ref = `refs/heads/${branch}`;
+	const output = await git(cwd, ['ls-remote', 'origin', ref]);
+	// `ls-remote` matches a pattern against the ref name's tail, so keep the exact ref.
+	for (const line of output.split('\n')) {
+		const [sha, name] = line.split('\t');
+		if (sha && name === ref) return sha;
+	}
+	return null;
 }
 
 export async function assertRemoteHead(
@@ -1326,6 +1362,23 @@ export async function renameCheckedOutBranch(cwd: string, branch: string): Promi
 }
 
 /**
+ * The `git push` arguments that let a push replace `branch` on the remote, but only
+ * while it is still at `replacingSha` (issue #1334) — empty without one, so an
+ * ordinary push stays fast-forward-only. The expected value is explicit because every
+ * provider pushes to a URL rather than a named remote, which has no remote-tracking
+ * ref for git to infer a lease from. A branch moved since it was observed is refused
+ * like any other rejected push, so someone else's work on it is never overwritten.
+ */
+export function pushLeaseArgs(branch: string, replacingSha: string | undefined): string[] {
+	return replacingSha ? [`--force-with-lease=refs/heads/${branch}:${replacingSha}`] : [];
+}
+
+/** `replacingSha` as a trailing `pushBranch` argument, or none at all without one. */
+export function leaseArgument(replacingSha: string | undefined): [] | [string] {
+	return replacingSha === undefined ? [] : [replacingSha];
+}
+
+/**
  * Push a delivered commit, turning an unwinnable push into a terminal
  * {@link DeliveryDivergedError} instead of a retry (issue #558).
  *
@@ -1341,11 +1394,28 @@ export async function pushDeliveredBranch(
 	cwd: string,
 	branch: string,
 	expectedSha: string,
+	replacingSha?: string,
 ): Promise<void> {
 	try {
-		await delivery.pushBranch(cwd, branch, expectedSha);
+		// The lease is passed only when there is one, so an ordinary push reaches the
+		// provider exactly as it always did.
+		await delivery.pushBranch(cwd, branch, expectedSha, ...leaseArgument(replacingSha));
 	} catch (error) {
 		if (!looksLikePushRejection(error)) throw error;
+		// A refused lease (issue #1334) means the branch is no longer at the head it was
+		// observed at — deleted since, or moved. Push once more without it: a plain push
+		// only fast-forwards, so it recreates a deleted branch, advances one that moved to
+		// an ancestor of this commit, and is refused for one carrying someone else's work,
+		// which the classification below then reports as the divergence it is. Retrying
+		// the lease instead would repeat the identical refusal on every attempt.
+		if (replacingSha !== undefined) {
+			logger.warn('Leased push refused — retrying as an ordinary fast-forward push', {
+				branch,
+				expectedSha,
+				replacingSha,
+			});
+			return pushDeliveredBranch(delivery, cwd, branch, expectedSha);
+		}
 		const remote = await divergedRemoteHead(cwd, branch, expectedSha);
 		if (!remote) throw error;
 		throw new DeliveryDivergedError(

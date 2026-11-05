@@ -12,7 +12,7 @@
 
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import type { ScmDeliveryProvider } from '../../../scm/delivery.js';
+import { pushLeaseArgs, type ScmDeliveryProvider } from '../../../scm/delivery.js';
 import {
 	AZURE_DEVOPS_API_BASE,
 	type AzureDevOpsScopedUser,
@@ -64,7 +64,8 @@ function azureDevOpsGitRemote(repo: string): string {
 }
 
 /**
- * Push exactly `expectedSha` to `branch`. The PAT travels in a git config value,
+ * Push exactly `expectedSha` to `branch` — replacing the remote branch only while it
+ * is still at `replacingSha` when one is given (issue #1334). The PAT travels in a git config value,
  * never in argv — an `extraheader` keeps it out of the process listing and any git
  * error echoing the remote — as the same `Basic base64(':' + pat)` header the REST
  * client sends. The refspec pushes the *exact* commit the caller verified rather
@@ -76,11 +77,18 @@ async function pushAzureDevOpsBranch(
 	cwd: string,
 	branch: string,
 	expectedSha: string,
+	replacingSha?: string,
 ): Promise<void> {
 	const authorization = Buffer.from(`:${pat}`).toString('base64');
 	await promisify(execFile)(
 		'git',
-		['push', '--no-verify', azureDevOpsGitRemote(repo), `${expectedSha}:refs/heads/${branch}`],
+		[
+			'push',
+			'--no-verify',
+			...pushLeaseArgs(branch, replacingSha),
+			azureDevOpsGitRemote(repo),
+			`${expectedSha}:refs/heads/${branch}`,
+		],
 		{
 			cwd,
 			env: {
@@ -113,8 +121,8 @@ export async function createAzureDevOpsDeliveryProvider(
 		commitIdentity: azureDevOpsCommitIdentity(user),
 		findPullRequest: (branch) => scoped(() => findActiveAzureDevOpsPullRequest(repo, branch)),
 		createPullRequest: (input) => scoped(() => createAzureDevOpsPullRequest(repo, input)),
-		pushBranch: (cwd, branch, expectedSha) =>
-			pushAzureDevOpsBranch(repo, pat, cwd, branch, expectedSha),
+		pushBranch: (cwd, branch, expectedSha, replacingSha) =>
+			pushAzureDevOpsBranch(repo, pat, cwd, branch, expectedSha, replacingSha),
 		submitReview: (input) => {
 			if (!options.reviews) {
 				throw new Error(

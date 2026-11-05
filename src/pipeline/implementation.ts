@@ -118,10 +118,12 @@ import {
 	type ImplementationHandoff,
 	ImplementationHandoffSchema,
 	loadDeliveryProgress,
+	lsRemoteBranchHead,
 	NothingToDeliverError,
 	pushDeliveredBranch,
 	readHandoff,
 	renameCheckedOutBranch,
+	resolveCommitSha,
 	resumedDeliveryAgent,
 	type ScmDeliveryProvider,
 	saveDeliveryProgress,
@@ -275,6 +277,11 @@ interface DeliveryNamingInput {
 	branchPattern: string;
 	decidedBranch?: string;
 	storedCommitSubject?: string;
+	/**
+	 * An abandoned delivery's attempt (issue #1334): its subject is decided again, from
+	 * the repository's current pattern rather than the one the old pull request used.
+	 */
+	abandoned?: boolean;
 }
 
 /**
@@ -301,7 +308,7 @@ function decideDeliveryNaming(input: DeliveryNamingInput): {
 		});
 	const commitSubject =
 		progress.commitSubject ??
-		input.storedCommitSubject ??
+		(input.abandoned ? undefined : input.storedCommitSubject) ??
 		renderCommitSubject(resolveCommitSubjectPattern(project), {
 			issueKey: taskId,
 			workType,
@@ -398,6 +405,16 @@ export interface RunImplementationPhaseOptions {
 	 * {@link commitSubject} was handed in: that subject is already stored.
 	 */
 	onCommitSubjectNamed?: (commitSubject: string) => Promise<void>;
+	/**
+	 * The pull request an earlier Implementation run of this task delivered (issue
+	 * #1334), read back off the run record. When the task branch has no open pull
+	 * request any more — it was closed unmerged, or merged — an attempt that is not
+	 * continuing its own work starts afresh: the branch is reset to the base, the
+	 * commit subject is decided again from the repository's current pattern, the push
+	 * replaces the abandoned head under a lease, and the card says so. Unset, or with
+	 * the pull request still open, the attempt resumes or adopts exactly as before.
+	 */
+	deliveredPullRequestUrl?: string;
 	/** Kill the agent run after this many ms. Omit for no timeout. */
 	timeoutMs?: number;
 	/** External cancellation — aborting kills the agent run. */
@@ -492,6 +509,189 @@ async function postImplementationComment(
 }
 
 /**
+ * Idempotency marker on the fresh-attempt notice (issue #1334), keyed by the
+ * abandoned pull request it replaces — one notice per abandoned pull request,
+ * however many attempts the fresh start takes.
+ */
+export function freshAttemptMarker(abandonedPullRequestUrl: string): string {
+	return swarmMarker(
+		'implementation-fresh-attempt',
+		deliveryIdentity(['implementation-fresh-attempt', abandonedPullRequestUrl]),
+	);
+}
+
+/** What the fresh-attempt notice names (issue #1334). */
+export interface FreshAttemptNotice {
+	abandonedPullRequestUrl: string;
+	baseBranch: string;
+	branch: string;
+	/** The abandoned branch's head on `origin`, or `undefined` when the branch was gone. */
+	abandonedHead?: string;
+}
+
+/**
+ * The card comment that makes a fresh attempt visible (issue #1334): which pull
+ * request was abandoned, which base the attempt starts from, and what the task
+ * branch's head was before it was replaced.
+ */
+export function freshAttemptCommentBody(notice: FreshAttemptNotice): string {
+	const head = notice.abandonedHead
+		? `its previous head was \`${notice.abandonedHead}\``
+		: 'it was absent on origin';
+	return [
+		'## 🔁 Starting a fresh implementation',
+		'',
+		`The previous pull request (${notice.abandonedPullRequestUrl.trim()}) is no longer open, so this is a fresh attempt from \`${notice.baseBranch}\`. Task branch \`${notice.branch}\` was reset; ${head}.`,
+		'',
+		'---',
+		`${SWARM_GENERATED_SIGNATURE} (Implementation phase)._`,
+		'',
+		freshAttemptMarker(notice.abandonedPullRequestUrl),
+	].join('\n');
+}
+
+/**
+ * Post the fresh-attempt notice at most once per abandoned pull request. Best-effort
+ * like the phase-failure comments: a board that refuses the comment must not stop
+ * the attempt it announces, so a failure is logged and swallowed.
+ */
+async function postFreshAttemptNotice(
+	pm: PMProvider,
+	workItemId: string,
+	notice: FreshAttemptNotice,
+): Promise<void> {
+	try {
+		const marker = freshAttemptMarker(notice.abandonedPullRequestUrl);
+		if (await pm.findComment(workItemId, marker)) return;
+		await pm.addComment(workItemId, freshAttemptCommentBody(notice));
+	} catch (error) {
+		logger.warn('Could not post the fresh-attempt notice on the card — continuing', {
+			workItemId,
+			abandonedPullRequestUrl: notice.abandonedPullRequestUrl,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+}
+
+/**
+ * Whether the task's earlier delivery was abandoned (issue #1334): an earlier run
+ * delivered a pull request, and `branch` has none open any more. A fresh attempt is
+ * an abandoned delivery's attempt that is not `continuingOwnWork` — not a resumed
+ * session, a checkpoint continuation or a resumed delivery, each of which carries
+ * the fresh attempt itself on. `openPullRequest` is the probe's answer, reused by
+ * the already-delivered probe so the SCM is asked once.
+ */
+async function probeAbandonedDelivery(
+	delivery: ScmDeliveryProvider,
+	branch: string,
+	deliveredPullRequestUrl: string | undefined,
+	continuingOwnWork: boolean,
+): Promise<AbandonedDeliveryProbe> {
+	if (!deliveredPullRequestUrl)
+		return {
+			abandoned: false,
+			freshAttempt: false,
+			findOpenPullRequest: (handleBranch) => delivery.findPullRequest(handleBranch),
+		};
+	const openPullRequest = await delivery.findPullRequest(branch);
+	const findOpenPullRequest = async () => openPullRequest;
+	if (openPullRequest || continuingOwnWork)
+		return { abandoned: !openPullRequest, freshAttempt: false, findOpenPullRequest };
+	return {
+		abandoned: true,
+		freshAttempt: true,
+		abandonedPullRequestUrl: deliveredPullRequestUrl,
+		findOpenPullRequest,
+	};
+}
+
+/** What {@link probeAbandonedDelivery} found. */
+type AbandonedDeliveryProbe = {
+	/** An earlier run delivered a pull request, and the task branch has none open. */
+	abandoned: boolean;
+	/** The task branch's open pull request — the probe's own answer when it asked. */
+	findOpenPullRequest(branch: string): Promise<{ number: number; url: string } | undefined>;
+} & (
+	| { freshAttempt: false }
+	/** An abandoned delivery's attempt that starts afresh from the base. */
+	| { freshAttempt: true; abandonedPullRequestUrl: string }
+);
+
+/**
+ * The abandoned branch's head on `origin` (issue #1334), or `undefined` for a delivery
+ * that abandoned nothing. Asked of the remote itself: the remote-tracking ref outlives
+ * a branch deleted with its pull request, since no fetch here prunes, and a lease over
+ * that stale head would be refused on every push. Only when the remote cannot be
+ * asked does this fall back to the tracking ref — a lease that turns out stale is
+ * still recovered from by `pushDeliveredBranch`'s plain fast-forward retry.
+ */
+async function readAbandonedHead(
+	handle: WorktreeHandle,
+	abandoned: boolean,
+): Promise<{ branch: string; sha?: string } | undefined> {
+	if (!abandoned) return undefined;
+	try {
+		const sha = await lsRemoteBranchHead(handle.path, handle.branch);
+		return { branch: handle.branch, sha: sha ?? undefined };
+	} catch (error) {
+		logger.warn('Could not ask origin for the abandoned head — using the remote-tracking ref', {
+			branch: handle.branch,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return {
+			branch: handle.branch,
+			sha: await resolveCommitSha(handle.path, `refs/remotes/origin/${handle.branch}`),
+		};
+	}
+}
+
+/**
+ * Record the abandoned head this delivery replaces (issue #1334) — once, before the
+ * push, so a resumed delivery pushes under the same lease; and only for the branch
+ * that head was read from, since a branch decided under another name replaces nothing.
+ */
+function recordReplacedHead(
+	progress: DeliveryProgress,
+	branch: string,
+	abandonedHead: { branch: string; sha?: string } | undefined,
+): void {
+	if (progress.pushed || progress.replacingSha !== undefined) return;
+	if (abandonedHead?.sha && abandonedHead.branch === branch)
+		progress.replacingSha = abandonedHead.sha;
+}
+
+/**
+ * The PR-link comment's idempotency key: the delivery's own, unless the pull request
+ * it links replaces the one an earlier run delivered (issue #1334) — that delivery's
+ * comment already carries the base key, and linking the new pull request needs a
+ * comment of its own.
+ */
+function prLinkDeliveryId(
+	deliveryParts: readonly string[],
+	prUrl: string,
+	deliveredPullRequestUrl: string | undefined,
+): string {
+	return deliveredPullRequestUrl !== undefined && prUrl !== deliveredPullRequestUrl
+		? deliveryIdentity([...deliveryParts, deliveredPullRequestUrl])
+		: deliveryIdentity(deliveryParts);
+}
+
+/** Log and post the fresh-attempt notice (issue #1334) before the agent starts over. */
+async function announceFreshAttempt(
+	pm: PMProvider,
+	workItemId: string,
+	notice: FreshAttemptNotice,
+	context: { taskId: string; runId?: string },
+): Promise<void> {
+	logger.warn('Earlier pull request is no longer open — starting a fresh attempt from the base', {
+		...context,
+		workItemId,
+		...notice,
+	});
+	await postFreshAttemptNotice(pm, workItemId, notice);
+}
+
+/**
  * Log a failed implementation run's captured output before the phase throws, so
  * the worker (SWARM-17) that marks the job failed has the agent's own
  * stdout/stderr to diagnose *why* — the thrown Error carries only a message.
@@ -561,6 +761,7 @@ async function acquireImplementationWorktree(
 	resumeDelivery: boolean,
 	recoveryMode?: RecoveryMode,
 	runId?: string,
+	freshAttempt = false,
 ): Promise<{
 	handle: WorktreeHandle;
 	resumed: boolean;
@@ -589,7 +790,10 @@ async function acquireImplementationWorktree(
 	// when it survived a failed/manual retry so a fresh agent session does not
 	// collide with `task-<id>` or discard partial, unpushed work. A session is only
 	// resumed when an actual resume id is present.
-	if (resumeSessionId || resumeExistingBranch || resumeDelivery) {
+	//
+	// Never for a fresh attempt (issue #1334): the branch's existing work is the
+	// abandoned pull request's, which is exactly what that attempt must not resume.
+	if (!freshAttempt && (resumeSessionId || resumeExistingBranch || resumeDelivery)) {
 		const handle = resumeDelivery
 			? await worktrees.reuse(taskId, branch, false, hasDeliveryProgress)
 			: await worktrees.reuse(taskId, branch, false);
@@ -606,9 +810,14 @@ async function acquireImplementationWorktree(
 	// (issue #591). Warn, then provision as before — an unrequested start-over is
 	// legal, it just must never be silent.
 	warnStartingOverOnPreservedWork(worktrees, taskId, 'implementation', runId);
-	const handle = resumeExistingBranch
-		? await worktrees.provision(taskId, { createBranch: false, branch, runId })
-		: await worktrees.provision(taskId, { branch, runId });
+	// A fresh attempt cuts the branch from the base whatever this host or `origin`
+	// still holds of it — including on its own retry, whose `resumeExistingBranch`
+	// would otherwise check out the abandoned remote head again.
+	const handle = freshAttempt
+		? await worktrees.provision(taskId, { branch, runId, resetBranch: true })
+		: resumeExistingBranch
+			? await worktrees.provision(taskId, { createBranch: false, branch, runId })
+			: await worktrees.provision(taskId, { branch, runId });
 	return { handle, resumed: false, deliveryResumed: false };
 }
 
@@ -635,6 +844,7 @@ export async function runImplementationPhase(
 		onBranchNamed,
 		commitSubject: storedCommitSubject,
 		onCommitSubjectNamed,
+		deliveredPullRequestUrl,
 		timeoutMs,
 		signal,
 		runAgent = runAgentCli,
@@ -693,17 +903,41 @@ export async function runImplementationPhase(
 		storedTaskBranch ??
 		(branchPatternNeedsImplementer(branchPattern) ? undefined : provisionalBranch);
 
+	// Deterministic delivery is resolved *before* the agent, not after: the
+	// already-delivered probe below has to ask the SCM about this task's branch
+	// while there is still an agent run to skip. Before the worktree, too — the
+	// abandoned-delivery probe decides how that worktree is provisioned, and a
+	// failure here then leaves no checkout to clean up.
+	const delivery =
+		options.delivery ??
+		(await requireProjectSCMProvider(project).deliveryProvider(project, 'implementer'));
+
+	// An abandoned delivery (issue #1334): an earlier run delivered a pull request for
+	// this task, and its branch has none open any more — closed unmerged, or merged.
+	// Resuming the branch would start the agent on that pull request's finished work.
+	// A run continuing its *own* work (a resumed session, a checkpoint continuation, a
+	// resumed delivery) is the fresh attempt itself being carried on, so it keeps its
+	// checkout; any other attempt starts afresh from the base.
+	const probedBranch = decidedBranch ?? provisionalBranch;
+	const probe = await probeAbandonedDelivery(
+		delivery,
+		probedBranch,
+		deliveredPullRequestUrl,
+		Boolean(resumeSessionId || resumeDelivery || recoveryMode),
+	);
+
 	// Task-branch checkout (createBranch defaults to true): the agent commits and
 	// pushes here, so — unlike Planning — this is not a detached, throwaway HEAD.
 	const { handle, resumed, deliveryResumed, checkpoint } = await acquireImplementationWorktree(
 		worktrees,
 		taskId,
-		decidedBranch ?? provisionalBranch,
+		probedBranch,
 		resumeSessionId,
 		resumeExistingBranch,
 		resumeDelivery,
 		recoveryMode,
 		runId,
+		probe.freshAttempt,
 	);
 	await onBranchProvisioned?.();
 	if (decidedBranch && !storedTaskBranch) await onBranchNamed?.(decidedBranch);
@@ -711,22 +945,18 @@ export async function runImplementationPhase(
 	try {
 		graft(project.repoRoot, handle.path);
 
-		// Deterministic delivery is resolved *before* the agent, not after: the
-		// already-delivered probe below has to ask the SCM about this task's branch
-		// while there is still an agent run to skip.
-		const delivery =
-			options.delivery ??
-			(await requireProjectSCMProvider(project).deliveryProvider(project, 'implementer'));
+		// The abandoned head this delivery replaces, as `origin` holds it now — for a
+		// fresh attempt and a continuation alike. It is the lease the push is made under,
+		// so a push someone made to the old branch since is refused rather than
+		// overwritten. Absent when the branch was deleted with its pull request: the push
+		// is then ordinary.
+		const abandonedHead = await readAbandonedHead(handle, probe.abandoned);
 		// Keyed on the provisional name rather than the checkout's, which a decided
 		// pattern name replaces between attempts — the progress sidecar and the PR-link
 		// comment marker must stay this task's across that rename. For a pattern with no
 		// implementer-chosen part the two are the same name, as they always were.
-		const deliveryId = deliveryIdentity([
-			'implementation',
-			project.repo,
-			taskId,
-			provisionalBranch,
-		]);
+		const deliveryParts = ['implementation', project.repo, taskId, provisionalBranch];
+		const deliveryId = deliveryIdentity(deliveryParts);
 
 		// Already delivered by an earlier attempt (issue #558). An interruption after
 		// the push — a control-plane restart, a worker shutdown, a lost socket — puts
@@ -739,8 +969,11 @@ export async function runImplementationPhase(
 		// could never be pushed. Skipped when the checkout's own progress file already
 		// claimed this delivery (`deliveryResumed`) — that resume is strictly better
 		// informed, and it still short-circuits the agent.
-		if (!deliveryResumed) {
-			const delivered = await delivery.findPullRequest(handle.branch);
+		//
+		// A fresh attempt skips it: the abandoned-delivery probe above already found no
+		// open pull request, and that probe's answer is reused when it ran.
+		if (!deliveryResumed && !probe.freshAttempt) {
+			const delivered = await probe.findOpenPullRequest(handle.branch);
 			if (delivered) {
 				logger.info('Implementation already delivered — adopting the open PR, skipping the agent', {
 					taskId,
@@ -753,7 +986,7 @@ export async function runImplementationPhase(
 					workItem.id,
 					delivered.url,
 					reviewEnabled,
-					deliveryId,
+					prLinkDeliveryId(deliveryParts, delivered.url, deliveredPullRequestUrl),
 				);
 				if (reviewEnabled) await pm.moveWorkItem(workItem.id, NEXT_STATUS);
 				return {
@@ -765,6 +998,19 @@ export async function runImplementationPhase(
 				};
 			}
 		}
+
+		if (probe.freshAttempt)
+			await announceFreshAttempt(
+				pm,
+				workItem.id,
+				{
+					abandonedPullRequestUrl: probe.abandonedPullRequestUrl,
+					baseBranch: project.baseBranch,
+					branch: handle.branch,
+					abandonedHead: abandonedHead?.sha,
+				},
+				{ taskId, runId },
+			);
 
 		const agent = deliveryResumed
 			? resumedDeliveryAgent(cli)
@@ -849,9 +1095,11 @@ export async function runImplementationPhase(
 			branchPattern,
 			decidedBranch,
 			storedCommitSubject,
+			abandoned: probe.abandoned,
 		});
 		progress.branch = branch;
 		progress.commitSubject = commitSubject;
+		recordReplacedHead(progress, branch, abandonedHead);
 		saveDeliveryProgress(handle.path, progress);
 		if (!handle.detached) await renameCheckedOutBranch(handle.path, branch);
 		// A name decided before the agent ran was already stored, or reported at provisioning.
@@ -867,7 +1115,13 @@ export async function runImplementationPhase(
 			saveDeliveryProgress(handle.path, progress);
 		}
 		if (!progress.pushed) {
-			await pushDeliveredBranch(delivery, handle.path, branch, progress.commitSha);
+			await pushDeliveredBranch(
+				delivery,
+				handle.path,
+				branch,
+				progress.commitSha,
+				progress.replacingSha,
+			);
 			progress.pushed = true;
 			saveDeliveryProgress(handle.path, progress);
 		}
@@ -895,7 +1149,7 @@ export async function runImplementationPhase(
 			workItem.id,
 			prUrl,
 			reviewEnabled,
-			deliveryId,
+			prLinkDeliveryId(deliveryParts, prUrl, deliveredPullRequestUrl),
 		);
 		if (reviewEnabled) {
 			await pm.moveWorkItem(workItem.id, NEXT_STATUS);

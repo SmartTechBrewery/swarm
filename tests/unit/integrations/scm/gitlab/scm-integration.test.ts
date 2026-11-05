@@ -880,6 +880,21 @@ describe('GitLabSCMIntegration', () => {
 			expect(vi.mocked(withGitLabToken)).toHaveBeenCalledTimes(4);
 		});
 
+		// Issue #1334: a fresh attempt replaces an abandoned head, and only that head.
+		it('replaces the branch under a lease when given the head it replaces', async () => {
+			const delivery = await scm.deliveryProvider(project, 'implementer');
+
+			await delivery.pushBranch('/worktree', 'issue-485', 'abc1234', 'old4567');
+
+			expect(execFileCalls[0]?.args).toEqual([
+				'push',
+				'--no-verify',
+				'--force-with-lease=refs/heads/issue-485:old4567',
+				'https://gitlab.com/SmartTechBrewery/swarm.git',
+				'abc1234:refs/heads/issue-485',
+			]);
+		});
+
 		it('pushes the exact expected commit to GitLab with the token out of argv', async () => {
 			const delivery = await scm.deliveryProvider(project, 'implementer');
 

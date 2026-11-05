@@ -116,6 +116,20 @@ describe('createGitLabOperatorDeliveryProvider', () => {
 		expect(withGitLabToken).toHaveBeenCalledTimes(4);
 	});
 
+	// Issue #1334: a fresh attempt replaces an abandoned head, and only that head.
+	it('replaces the branch under a lease only when given the head it replaces', async () => {
+		const delivery = await createGitLabOperatorDeliveryProvider(REPO, CREDENTIAL);
+		await delivery.pushBranch('/work/tree', 'issue-1', 'sha123', 'old456');
+
+		expect(execFileCalls[0]?.args).toEqual([
+			'push',
+			'--no-verify',
+			'--force-with-lease=refs/heads/issue-1:old456',
+			'https://gitlab.com/SmartTechBrewery/swarm.git',
+			'sha123:refs/heads/issue-1',
+		]);
+	});
+
 	it('pushes the expected commit with the token out of argv', async () => {
 		const delivery = await createGitLabOperatorDeliveryProvider(REPO, CREDENTIAL);
 		await delivery.pushBranch('/work/tree', 'issue-1', 'sha123');

@@ -1034,6 +1034,9 @@ function buildDbFreePhaseInputs({
 				commitSubject,
 			});
 		},
+		// The pull request an earlier run delivered (issue #1334), resolved control-plane
+		// side — this worker has no run record to read it from.
+		deliveredPullRequestUrl: assignment.deliveredPullRequestUrl,
 		prNumber: assignment.prNumber,
 		prBranch: assignment.prBranch,
 		headSha: assignment.headSha,

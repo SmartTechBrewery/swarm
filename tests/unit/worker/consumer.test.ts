@@ -517,6 +517,10 @@ const findStoredTaskBranch = vi.fn<
 const findStoredCommitSubject = vi.fn<
 	(projectId: string, repository: string, taskId: string) => Promise<string | undefined>
 >(async () => undefined);
+/** Issue #1334 — the pull request an earlier Implementation run delivered, seeded the same way. */
+const findStoredPullRequestUrl = vi.fn<
+	(projectId: string, repository: string, taskId: string) => Promise<string | undefined>
+>(async () => undefined);
 const getLatestCompletedPlanningScope = vi.fn<
 	(projectId: string, repository: string, taskId: string) => Promise<ProposedScope | undefined>
 >(async (_projectId: string, _repository: string, _taskId: string) => undefined);
@@ -603,6 +607,8 @@ vi.mock('@/db/repositories/runsRepository.js', () => ({
 		findStoredTaskBranch(projectId, repository, taskId),
 	findStoredCommitSubject: (projectId: string, repository: string, taskId: string) =>
 		findStoredCommitSubject(projectId, repository, taskId),
+	findStoredPullRequestUrl: (projectId: string, repository: string, taskId: string) =>
+		findStoredPullRequestUrl(projectId, repository, taskId),
 	// No recorded task branch (issue #1247): the automation-label gate decodes the PR branch.
 	findTaskIdForStoredTaskBranch: async () => undefined,
 	hasCompletedRunForTask: (projectId: string, taskId: string, phase: string) =>
@@ -1077,6 +1083,7 @@ describe('processJob', () => {
 		phaseImpl = async () => ({ agent: agentResult() });
 		findStoredTaskBranch.mockReset().mockResolvedValue(undefined);
 		findStoredCommitSubject.mockReset().mockResolvedValue(undefined);
+		findStoredPullRequestUrl.mockReset().mockResolvedValue(undefined);
 		addComment.mockClear();
 		addComment.mockResolvedValue('comment-1');
 		findWorkItemForArtifact.mockClear();
@@ -2219,6 +2226,32 @@ describe('processJob', () => {
 
 		expect(phaseCalls).toHaveLength(1);
 		expect(phaseCalls[0].context.job.commitSubject).toBeUndefined();
+	});
+
+	// Issue #1334: the pull request an earlier run delivered rides on the job too, so
+	// the phase can tell an abandoned delivery from an interrupted one.
+	it('seeds an implementation dispatch with the pull request an earlier run delivered', async () => {
+		const prUrl = 'https://github.com/acme/widgets/pull/7';
+		findStoredPullRequestUrl.mockResolvedValue(prUrl);
+		const workItem = createMockWorkItem({ statusId: '47fc9ee4' });
+		const trigger: TriggerResult = { phase: 'implementation', taskId: 'VT-1538', workItem };
+
+		await processJob(createMockPmWebhookJob(), registryReturning(trigger));
+
+		expect(findStoredPullRequestUrl).toHaveBeenCalledWith(PROJECT.id, PROJECT.repo, 'VT-1538');
+		expect(resolvedTarget().jobPayload).toMatchObject({ deliveredPullRequestUrl: prUrl });
+		expect(phaseCalls[0].context.job.deliveredPullRequestUrl).toBe(prUrl);
+	});
+
+	it('leaves the delivered pull request unset when its read fails', async () => {
+		findStoredPullRequestUrl.mockRejectedValue(new Error('connection reset'));
+		const workItem = createMockWorkItem({ statusId: '47fc9ee4' });
+		const trigger: TriggerResult = { phase: 'implementation', taskId: 'VT-1538', workItem };
+
+		await processJob(createMockPmWebhookJob(), registryReturning(trigger));
+
+		expect(phaseCalls).toHaveLength(1);
+		expect(phaseCalls[0].context.job.deliveredPullRequestUrl).toBeUndefined();
 	});
 
 	it('does not treat PM resume dispatch intent as proof that a branch exists', async () => {

@@ -1098,6 +1098,28 @@ describe('GitHubSCMIntegration', () => {
 			expect(vi.mocked(withGitHubToken).mock.calls.at(-1)?.[0]).toBe('tok-implementer');
 		});
 
+		// Issue #1334: a fresh attempt replaces an abandoned head, and only that head.
+		it('replaces the branch under a lease when given the head it replaces', async () => {
+			vi.mocked(getPersonaToken).mockResolvedValue('tok-impl');
+			vi.mocked(getGitHubUserForToken).mockResolvedValue('swarm-implementer');
+			const delivery = await scm.deliveryProvider(project, 'implementer');
+
+			await delivery.pushBranch('/worktree', 'issue-241', 'abc1234', 'old4567');
+
+			expect(mockExecFile).toHaveBeenCalledWith(
+				'git',
+				[
+					'push',
+					'--no-verify',
+					'--force-with-lease=refs/heads/issue-241:old4567',
+					'https://github.com/SmartTechBrewery/swarm.git',
+					'abc1234:refs/heads/issue-241',
+				],
+				expect.objectContaining({ cwd: '/worktree' }),
+				expect.any(Function),
+			);
+		});
+
 		it('bypasses interactive git hooks when pushing a worker-owned delivery', async () => {
 			vi.mocked(getPersonaToken).mockResolvedValue('tok-impl');
 			vi.mocked(getGitHubUserForToken).mockResolvedValue('swarm-implementer');

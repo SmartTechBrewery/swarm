@@ -830,6 +830,21 @@ describe('BitbucketSCMIntegration', () => {
 			expect(vi.mocked(withBitbucketCredential)).toHaveBeenCalledTimes(4);
 		});
 
+		// Issue #1334: a fresh attempt replaces an abandoned head, and only that head.
+		it('replaces the branch under a lease when given the head it replaces', async () => {
+			const delivery = await scm.deliveryProvider(project, 'implementer');
+
+			await delivery.pushBranch('/worktree', 'issue-457', 'abc1234', 'old4567');
+
+			expect(execFileCalls[0]?.args).toEqual([
+				'push',
+				'--no-verify',
+				'--force-with-lease=refs/heads/issue-457:old4567',
+				'https://bitbucket.org/SmartTechBrewery/swarm.git',
+				'abc1234:refs/heads/issue-457',
+			]);
+		});
+
 		it('pushes the exact expected commit to Bitbucket with the credential out of argv', async () => {
 			const delivery = await scm.deliveryProvider(project, 'implementer');
 

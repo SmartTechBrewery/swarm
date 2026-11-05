@@ -26,7 +26,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { getPersonaToken, getPersonaTokenOrNull } from '../../../config/provider.js';
 import type { ProjectConfig } from '../../../config/schema.js';
-import type { ScmDeliveryProvider } from '../../../scm/delivery.js';
+import { pushLeaseArgs, type ScmDeliveryProvider } from '../../../scm/delivery.js';
 import type { ScmEvent } from '../../../scm/events.js';
 import type {
 	MergePullRequestOutcome,
@@ -706,13 +706,14 @@ export class GitHubSCMIntegration implements SCMProvider {
 			commitIdentity: { name: login, email: `${login}@users.noreply.github.com` },
 			findPullRequest: (branch) => scoped(() => findOpenPullRequest(owner, repo, branch)),
 			createPullRequest: (input) => scoped(() => createPullRequest(owner, repo, input)),
-			pushBranch: async (cwd, branch, expectedSha) => {
+			pushBranch: async (cwd, branch, expectedSha, replacingSha) => {
 				const authorization = Buffer.from(`x-access-token:${token}`).toString('base64');
 				await promisify(execFile)(
 					'git',
 					[
 						'push',
 						'--no-verify',
+						...pushLeaseArgs(branch, replacingSha),
 						`https://github.com/${project.repo}.git`,
 						`${expectedSha}:refs/heads/${branch}`,
 					],

@@ -60,6 +60,7 @@ import {
 	createRun,
 	failRunFromStatus,
 	findStoredCommitSubject,
+	findStoredPullRequestUrl,
 	findStoredTaskBranch,
 	getLatestCompletedPlanningScope,
 	getLatestRunForTask,
@@ -3072,6 +3073,12 @@ export interface AssignedPhaseInputs {
 	commitSubject?: string;
 	/** implementation: called with the commit subject once the phase decides it (issue #1242). */
 	onCommitSubjectNamed?: (commitSubject: string) => Promise<void>;
+	/**
+	 * implementation: the pull request an earlier Implementation run of the task
+	 * delivered (issue #1334), resolved control-plane side from the run record — a
+	 * delivered pull request no longer open makes this attempt start afresh.
+	 */
+	deliveredPullRequestUrl?: string;
 	/** PR-driven phases (review / respond-to-* / resolve-conflicts). */
 	prNumber?: string;
 	prBranch?: string;
@@ -3225,6 +3232,7 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 				onBranchNamed: inputs.onBranchNamed,
 				commitSubject: inputs.commitSubject,
 				onCommitSubjectNamed: inputs.onCommitSubjectNamed,
+				deliveredPullRequestUrl: inputs.deliveredPullRequestUrl,
 				// Identifies this attempt to the provision-time collision gate, so a
 				// lease left behind by a crashed run is recognised as an orphan instead
 				// of wedging this one as `live-leased` (issue #427). Every phase below
@@ -3746,6 +3754,18 @@ async function tryFindStoredCommitSubject(
 	taskId: string,
 ): Promise<string | undefined> {
 	return tryFindStored('commit subject', findStoredCommitSubject, project, taskId);
+}
+
+/**
+ * The pull request an earlier Implementation run of this task delivered (issue
+ * #1334), best-effort in the same way: a failed read leaves the attempt to resume
+ * the task branch exactly as it did before.
+ */
+async function tryFindStoredPullRequestUrl(
+	project: ProjectConfig,
+	taskId: string,
+): Promise<string | undefined> {
+	return tryFindStored('delivered pull request', findStoredPullRequestUrl, project, taskId);
 }
 
 async function tryFindStored(
@@ -6470,6 +6490,13 @@ async function processClaimedDispatch(
 		if (trigger.phase === 'implementation' && !job.commitSubject) {
 			const commitSubject = await tryFindStoredCommitSubject(project, trigger.taskId);
 			if (commitSubject) job.commitSubject = commitSubject;
+		}
+		// And the pull request an earlier run delivered (issue #1334), so the phase can
+		// tell a task whose pull request was closed unmerged — a fresh attempt from the
+		// base — from an interrupted run that never delivered one, which resumes.
+		if (trigger.phase === 'implementation' && !job.deliveredPullRequestUrl) {
+			const deliveredPullRequestUrl = await tryFindStoredPullRequestUrl(project, trigger.taskId);
+			if (deliveredPullRequestUrl) job.deliveredPullRequestUrl = deliveredPullRequestUrl;
 		}
 
 		// Record a run-history row for this agent-CLI invocation. Everything here is
