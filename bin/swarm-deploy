@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# `swarm-deploy <target> [X.Y.Z]` — deploy a released SWARM version to one
+# installation and check that it is live (docs/MANUAL.md, "The published image").
+#
+# A release (`npm run release`) is one image for every installation; a deploy is
+# per installation. Targets are named by the maintainer and never committed: for
+# a target `foo`, set in the environment or in this checkout's gitignored .env
+#
+#   SWARM_DEPLOY_FOO_SSH      user@host to SSH to
+#   SWARM_DEPLOY_FOO_URL      the installation's base URL
+#   SWARM_DEPLOY_FOO_COMMAND  what pulls and restarts the app there
+#
+# The version to check for defaults to this checkout's package.json.
+# `swarm-deploy --check <target>` only checks that the target is configured.
+set -euo pipefail
+
+die() {
+	echo "swarm-deploy: $*" >&2
+	exit 1
+}
+step() { printf '\n==> %s\n' "$*"; }
+
+cd "$(dirname "$0")/.."
+
+# A value from the environment wins; otherwise the last line in .env, if any.
+setting() {
+	local name=$1
+	if [ -n "${!name:-}" ]; then
+		printf '%s' "${!name}"
+		return
+	fi
+	[ -f .env ] || return 0
+	sed -n "s/^$name=//p" .env | tail -1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"
+}
+
+# The target names .env and the environment configure, lower-cased.
+configured_targets() {
+	{
+		[ ! -f .env ] || sed -n 's/^SWARM_DEPLOY_\([A-Z0-9_]*\)_SSH=.*/\1/p' .env
+		env | sed -n 's/^SWARM_DEPLOY_\([A-Z0-9_]*\)_SSH=.*/\1/p'
+	} | tr '[:upper:]' '[:lower:]' | sort -u | paste -sd ' ' -
+}
+
+usage() {
+	local known
+	known=$(configured_targets)
+	echo "usage: npm run deploy -- <target> [X.Y.Z]" >&2
+	echo "configured targets: ${known:-none (set SWARM_DEPLOY_<TARGET>_SSH, _URL and _COMMAND in .env)}" >&2
+	exit 1
+}
+
+check_only=""
+if [ "${1:-}" = --check ]; then
+	check_only=yes
+	shift
+fi
+[ $# -ge 1 ] && [ $# -le 2 ] || usage
+target=$1
+[[ "$target" =~ ^[A-Za-z0-9_]+$ ]] || die "'$target' is not a target name"
+key=$(printf '%s' "$target" | tr '[:lower:]' '[:upper:]')
+version=${2:-$(node -p "require('./package.json').version")}
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "'$version' is not X.Y.Z"
+
+ssh_to=$(setting "SWARM_DEPLOY_${key}_SSH")
+url=$(setting "SWARM_DEPLOY_${key}_URL")
+command=$(setting "SWARM_DEPLOY_${key}_COMMAND")
+url=${url%/}
+if [ -z "$ssh_to" ] || [ -z "$url" ] || [ -z "$command" ]; then
+	echo "swarm-deploy: target '$target' needs SWARM_DEPLOY_${key}_SSH, _URL and _COMMAND" >&2
+	usage
+fi
+[ -z "$check_only" ] || exit 0
+
+step "Deploying v$version to $target"
+# shellcheck disable=SC2029 # the command is meant to expand here and run there
+ssh "$ssh_to" "$command"
+
+step "Checking $target"
+for _ in $(seq 1 24); do
+	if curl -fsS "$url/health" >/dev/null 2>&1; then
+		live=""
+		for js in $(curl -fsS "$url/" | grep -oE '/assets/[^"]+\.js'); do
+			# Read the bundle whole: piped into `grep -q`, curl dies writing to the
+			# closed pipe on the first match, and pipefail turns that into a miss.
+			bundle=$(curl -fsS "$url$js") || continue
+			[[ "$bundle" == *"\"$version\""* ]] && live=yes && break
+		done
+		if [ -n "$live" ]; then
+			echo "v$version is live on $target"
+			exit 0
+		fi
+	fi
+	sleep 5
+done
+die "$target did not report v$version within 2 minutes; check the app's logs there"

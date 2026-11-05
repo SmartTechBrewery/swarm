@@ -3,7 +3,7 @@
  * start an installation-wide rollout to the build the control plane itself runs,
  * with nobody asking for it.
  *
- * Upgrading an installation (`bin/swarm-release` → `dockerctl deploy app`) moves
+ * Upgrading an installation (`npm run release`, then `npm run deploy`) moves
  * the control plane and nothing else, so until this module the fleet stayed on the
  * previous build until an administrator ran `swarm workers update --all <ref>` —
  * ADR-006's drift by default, moved from the host to the operator. With

@@ -15,7 +15,7 @@
  * - `runs`, **read-only** (issue #1182) — exactly `list`, `getById`, `getLogs`
  *   and `getOutput`, what `swarm run list|show|logs` needs. On an installation
  *   with no shell on the host (the VPS behind Caddy, issue #1153, reachable only
- *   through a restricted `dockerctl` wrapper) Postgres is unreachable and `docker
+ *   through a restricted SSH wrapper) Postgres is unreachable and `docker
  *   logs` holds a few hundred lines, so diagnosing a failed run required a
  *   signed-in browser: it could not be scripted, done from a terminal, or done by
  *   an assistant session.

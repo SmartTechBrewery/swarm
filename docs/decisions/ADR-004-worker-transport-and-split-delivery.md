@@ -19,7 +19,7 @@
 ## Context
 
 SWARM is moving from a single-machine MVP toward a hosted instance
-(`swarm.smarttechbrewery.pl`) where trusted users — created by the instance
+where trusted users — created by the instance
 admin — run their own workers against shared projects, starting with SWARM
 itself. ADR-001 already models the *policy* layer for this (users, workers,
 enrollments, memberships, sharing consent, discoverable projects, assignee
