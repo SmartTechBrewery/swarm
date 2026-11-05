@@ -231,6 +231,8 @@ SWARM_DEPLOY_<TARGET>_URL=https://<your-domain>
 SWARM_DEPLOY_<TARGET>_COMMAND="cd ~/swarm && docker compose pull app && docker compose up -d app"
 ```
 
+`{version}` in the command becomes `X.Y.Z`, for a server that pins its image tag.
+
 Details: [`bin/swarm-release`](bin/swarm-release), [`bin/swarm-deploy`](bin/swarm-deploy),
 [`docs/MANUAL.md`](docs/MANUAL.md#the-published-image).
 

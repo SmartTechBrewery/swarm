@@ -8,7 +8,8 @@
 #
 #   SWARM_DEPLOY_FOO_SSH      user@host to SSH to
 #   SWARM_DEPLOY_FOO_URL      the installation's base URL
-#   SWARM_DEPLOY_FOO_COMMAND  what pulls and restarts the app there
+#   SWARM_DEPLOY_FOO_COMMAND  what pulls and restarts the app there; `{version}`
+#                             in it becomes X.Y.Z, for a server that pins its tag
 #
 # The version to check for defaults to this checkout's package.json.
 # `swarm-deploy --check <target>` only checks that the target is configured.
@@ -70,6 +71,7 @@ if [ -z "$ssh_to" ] || [ -z "$url" ] || [ -z "$command" ]; then
 	usage
 fi
 [ -z "$check_only" ] || exit 0
+command=${command//\{version\}/$version}
 
 step "Deploying v$version to $target"
 # shellcheck disable=SC2029 # the command is meant to expand here and run there
