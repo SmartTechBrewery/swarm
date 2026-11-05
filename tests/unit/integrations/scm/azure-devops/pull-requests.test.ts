@@ -16,8 +16,10 @@ import {
 	listActiveAzureDevOpsPullRequestsForBase,
 	listAzureDevOpsPullRequestsForCommit,
 	readAzureDevOpsPullRequestContext,
+	readAzureDevOpsPullRequestReview,
 	retryFailedAzureDevOpsBuilds,
 } from '@/integrations/scm/azure-devops/pull-requests.js';
+import { azureDevOpsRequestChangesMarker } from '@/integrations/scm/azure-devops/review-marker.js';
 import { logger } from '@/lib/logger.js';
 import { decideAggregateCheckOutcome } from '@/triggers/handlers/aggregate-check-decision.js';
 
@@ -237,6 +239,121 @@ describe('azure devops pull-request reads', () => {
 			await expect(
 				scoped(() => readAzureDevOpsPullRequestContext(REPO, 17)),
 			).rejects.toBeInstanceOf(AzureDevOpsApiError);
+		});
+	});
+
+	describe('readAzureDevOpsPullRequestReview (issue #1240)', () => {
+		const REVIEWER_ID = 'aaaa-reviewer';
+		const REVIEW_ID = `17:changes-requested:${REVIEWER_ID}:${HEAD_SHA}`;
+		const findings = (id: number, body: string, at: string, authorId = REVIEWER_ID) => ({
+			id,
+			status: 'active',
+			comments: [
+				{
+					content: `${body}\n\n${azureDevOpsRequestChangesMarker(`delivery-${id}`)}`,
+					commentType: 'text',
+					publishedDate: at,
+					author: { id: authorId, displayName: 'SWARM Reviewer' },
+				},
+			],
+		});
+		const anchored = (id: number, status: string, body: string, extra = {}) => ({
+			id,
+			status,
+			threadContext: { filePath: '/src/a.ts', rightFileStart: { line: id } },
+			comments: [
+				{
+					content: body,
+					commentType: 'text',
+					publishedDate: `2026-10-21T0${id}:00:00.000Z`,
+					author: { id: REVIEWER_ID, displayName: 'SWARM Reviewer' },
+				},
+			],
+			...extra,
+		});
+
+		it('resolves the latest marker thread by author and the active file-anchored threads', async () => {
+			routeFetch(fetchMock, [
+				[
+					'/pullrequests/17/threads',
+					{
+						value: [
+							findings(1, 'F1: round one', '2026-10-21T01:00:00.000Z'),
+							findings(2, 'F1: round two', '2026-10-21T05:00:00.000Z'),
+							findings(3, 'Someone else', '2026-10-21T09:00:00.000Z', 'other-id'),
+							anchored(4, 'active', 'Off by one here.'),
+							anchored(5, 'fixed', 'Already fixed.'),
+							anchored(6, 'active', 'Deleted thread.', { isDeleted: true }),
+							{
+								id: 7,
+								status: 'active',
+								comments: [{ content: 'Top level', commentType: 'text' }],
+							},
+						],
+					},
+				],
+			]);
+
+			await expect(
+				scoped(() => readAzureDevOpsPullRequestReview(REPO, 17, REVIEW_ID)),
+			).resolves.toEqual({
+				id: REVIEW_ID,
+				author: 'SWARM Reviewer',
+				state: 'changes-requested',
+				submittedAt: '2026-10-21T05:00:00.000Z',
+				body: `F1: round two\n\n${azureDevOpsRequestChangesMarker('delivery-2')}`,
+				comments: [
+					{
+						kind: 'review-comment',
+						path: 'src/a.ts',
+						line: 4,
+						author: 'SWARM Reviewer',
+						createdAt: '2026-10-21T04:00:00.000Z',
+						body: 'Off by one here.',
+					},
+				],
+			});
+			expect(requestedUrls(fetchMock).map((url) => url.pathname)).toEqual([
+				`${REPO_API}/pullrequests/17/threads`,
+			]);
+		});
+
+		it('matches any author when ingress recorded none', async () => {
+			routeFetch(fetchMock, [
+				[
+					'/pullrequests/17/threads',
+					{ value: [findings(3, 'Someone else', '2026-10-21T09:00:00.000Z', 'other-id')] },
+				],
+			]);
+			const review = await scoped(() =>
+				readAzureDevOpsPullRequestReview(REPO, 17, `17:changes-requested:unknown:${HEAD_SHA}`),
+			);
+			expect(review.body).toContain('Someone else');
+		});
+
+		it.each([
+			['a malformed id', 'not-an-id', /is not a SWARM review id/],
+			[
+				'another pull request',
+				`18:changes-requested:${REVIEWER_ID}:${HEAD_SHA}`,
+				/does not belong to pull request 17/,
+			],
+		])('rejects %s before any request', async (_label, reviewId, message) => {
+			await expect(
+				scoped(() => readAzureDevOpsPullRequestReview(REPO, 17, reviewId)),
+			).rejects.toThrow(message);
+			expect(fetchMock).not.toHaveBeenCalled();
+		});
+
+		it('throws naming the review when no findings thread matches', async () => {
+			routeFetch(fetchMock, [
+				['/pullrequests/17/threads', { value: [anchored(4, 'active', 'Off by one here.')] }],
+			]);
+			await expect(
+				scoped(() => readAzureDevOpsPullRequestReview(REPO, 17, REVIEW_ID)),
+			).rejects.toThrow(
+				`Azure DevOps pull request ${REPO}!17 has no SWARM request-changes findings thread for review '${REVIEW_ID}'`,
+			);
 		});
 	});
 

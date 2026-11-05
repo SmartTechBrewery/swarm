@@ -38,6 +38,7 @@ import { CommitUnavailableError } from '@/worktree/commit-availability.js';
 import { BlockedRecoveryError } from '@/worktree/reclaim.js';
 import {
 	createMockPullRequestContext,
+	createMockPullRequestReview,
 	createMockTaskAssignmentInput,
 	createMockWorkItem,
 } from '../../helpers/factories.js';
@@ -97,6 +98,7 @@ function stubDelivery(): ScmDeliveryProvider {
 		pushBranch: vi.fn(async () => {}),
 		submitReview: vi.fn(async () => 1),
 		readPullRequestContext: vi.fn(async () => createMockPullRequestContext()),
+		readReview: vi.fn(async () => createMockPullRequestReview()),
 		postComment: vi.fn(async () => 1),
 	};
 }

@@ -62,6 +62,7 @@ import {
 	postIdempotentPullRequestComment,
 	postIssueComment,
 	readGitHubPullRequestContext,
+	readGitHubPullRequestReview,
 	rerunFailedWorkflowRuns,
 	submitPullRequestReview,
 	updatePullRequestBranchDirect,
@@ -730,6 +731,8 @@ export class GitHubSCMIntegration implements SCMProvider {
 			postComment: (input) => scoped(() => postIdempotentPullRequestComment(owner, repo, input)),
 			readPullRequestContext: (prNumber) =>
 				scoped(() => readGitHubPullRequestContext(owner, repo, prNumber)),
+			readReview: (prNumber, reviewId) =>
+				scoped(() => readGitHubPullRequestReview(owner, repo, prNumber, reviewId)),
 		};
 	}
 

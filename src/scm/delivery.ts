@@ -6,7 +6,11 @@ import { promisify } from 'node:util';
 import { z } from 'zod';
 import type { AgentCli, AgentCliResult } from '../harness/agent-cli.js';
 import { logger } from '../lib/logger.js';
-import { PULL_REQUEST_CONTEXT_FILENAME, type PullRequestContext } from './pull-request-context.js';
+import {
+	PULL_REQUEST_CONTEXT_FILENAME,
+	type PullRequestContext,
+	type PullRequestReview,
+} from './pull-request-context.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -612,6 +616,15 @@ export interface ScmDeliveryProvider {
 	 * reader yet.
 	 */
 	readPullRequestContext(prNumber: number): Promise<PullRequestContext>;
+	/**
+	 * Read the one submitted review a Respond-to-review run answers (issue #1240):
+	 * author, state, summary body and its file-anchored comments. `reviewId` is the
+	 * neutral id ingress put on the event — opaque here, interpreted only by the
+	 * provider. A read under the provider's own credential. Rejects with
+	 * `ScmReadUnsupportedError` on a provider without a reader, and with a plain
+	 * error when the id does not resolve to a review on this pull request.
+	 */
+	readReview(prNumber: number, reviewId: string): Promise<PullRequestReview>;
 }
 
 export const HANDOFF_FILENAMES = {

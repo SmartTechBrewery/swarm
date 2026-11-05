@@ -32,6 +32,7 @@ vi.mock('@/integrations/scm/github/client.js', () => ({
 	isContainedInBranch: vi.fn(),
 	mergePullRequestDirect: vi.fn(),
 	readGitHubPullRequestContext: vi.fn(),
+	readGitHubPullRequestReview: vi.fn(),
 	rerunFailedWorkflowRuns: vi.fn(),
 	updatePullRequestBranchDirect: vi.fn(),
 }));
@@ -49,6 +50,7 @@ import {
 	isContainedInBranch,
 	mergePullRequestDirect,
 	readGitHubPullRequestContext,
+	readGitHubPullRequestReview,
 	rerunFailedWorkflowRuns,
 	updatePullRequestBranchDirect,
 	withGitHubToken,
@@ -1075,6 +1077,25 @@ describe('GitHubSCMIntegration', () => {
 
 			expect(readGitHubPullRequestContext).toHaveBeenCalledWith('SmartTechBrewery', 'swarm', 7);
 			expect(vi.mocked(withGitHubToken).mock.calls.at(-1)?.[0]).toBe('tok-reviewer');
+		});
+
+		it('reads the review under the persona token (issue #1240)', async () => {
+			vi.mocked(getPersonaToken).mockResolvedValue('tok-implementer');
+			vi.mocked(getGitHubUserForToken).mockResolvedValue('swarm-implementer');
+			vi.mocked(readGitHubPullRequestReview).mockResolvedValue({
+				id: '4242',
+			} as Awaited<ReturnType<typeof readGitHubPullRequestReview>>);
+			const delivery = await scm.deliveryProvider(project, 'implementer');
+
+			await expect(delivery.readReview(7, '4242')).resolves.toEqual({ id: '4242' });
+
+			expect(readGitHubPullRequestReview).toHaveBeenCalledWith(
+				'SmartTechBrewery',
+				'swarm',
+				7,
+				'4242',
+			);
+			expect(vi.mocked(withGitHubToken).mock.calls.at(-1)?.[0]).toBe('tok-implementer');
 		});
 
 		it('bypasses interactive git hooks when pushing a worker-owned delivery', async () => {

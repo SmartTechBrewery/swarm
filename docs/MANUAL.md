@@ -1916,6 +1916,16 @@ the agent. On Bitbucket Cloud and gitlab.com the read is not yet supported, so
 Review fails there with this message, ending `not yet supported on …`, until their
 readers land.
 
+**"Respond-to-review could not read review … on pull request #… from SCM provider
+'…'" is the same kind of cause** (issue #1240). Respond-to-review reads the pull
+request and the one review it answers — its summary body and inline comments —
+through SWARM before the agent starts, and hands both to the agent in
+`swarm_pull_request.md`. When either read fails, the run fails with this message
+and the provider's own error after the colon, and no agent ran. On Bitbucket Cloud
+and gitlab.com it ends `not yet supported on …`; on Azure DevOps a message saying
+the pull request has no SWARM request-changes findings thread means the verdict
+thread the review id names was deleted or resolved away.
+
 **A renamed repository produces no failure at all.** Cards stop dispatching and
 nothing is marked failed: the router logs `pm-status: work item has no backing SCM
 artifact reference` and completes the job as a no-op, because the card's repository

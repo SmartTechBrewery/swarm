@@ -12,6 +12,7 @@ import type { AssignmentSink } from '@/transport/worker-client.js';
 import {
 	createMockProjectConfig,
 	createMockPullRequestContext,
+	createMockPullRequestReview,
 	createMockTaskAssignmentInput,
 	createMockWorkItem,
 } from '../../helpers/factories.js';
@@ -47,6 +48,7 @@ function delivery(): ScmDeliveryProvider {
 		pushBranch: vi.fn(async () => {}),
 		submitReview: vi.fn(async () => 1),
 		readPullRequestContext: vi.fn(async () => createMockPullRequestContext()),
+		readReview: vi.fn(async () => createMockPullRequestReview()),
 		postComment: vi.fn(async () => 1),
 	};
 }

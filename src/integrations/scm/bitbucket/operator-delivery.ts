@@ -10,7 +10,10 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { ScmDeliveryProvider } from '../../../scm/delivery.js';
-import { unsupportedPullRequestContextRead } from '../../../scm/pull-request-context.js';
+import {
+	unsupportedPullRequestContextRead,
+	unsupportedReviewRead,
+} from '../../../scm/pull-request-context.js';
 import {
 	bitbucketGitBasicCredential,
 	getBitbucketUserForCredential,
@@ -70,5 +73,6 @@ export async function createBitbucketOperatorDeliveryProvider(
 			scoped(() => postIdempotentBitbucketPullRequestComment(workspace, slug, input)),
 		// A declared gap with its own follow-up, not a stub (issue #1239).
 		readPullRequestContext: unsupportedPullRequestContextRead('Bitbucket Cloud'),
+		readReview: unsupportedReviewRead('Bitbucket Cloud'),
 	};
 }

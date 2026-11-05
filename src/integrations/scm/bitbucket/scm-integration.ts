@@ -37,7 +37,10 @@ import type {
 	MergePullRequestOutcome,
 	UpdatePullRequestBranchOutcome,
 } from '../../../scm/merge.js';
-import { unsupportedPullRequestContextRead } from '../../../scm/pull-request-context.js';
+import {
+	unsupportedPullRequestContextRead,
+	unsupportedReviewRead,
+} from '../../../scm/pull-request-context.js';
 import type {
 	AggregateCheckStatus,
 	CommitPullRequest,
@@ -607,6 +610,7 @@ export class BitbucketSCMIntegration implements SCMProvider {
 				scoped(() => postIdempotentBitbucketPullRequestComment(workspace, slug, input)),
 			// A declared gap with its own follow-up, not a stub (issue #1239).
 			readPullRequestContext: unsupportedPullRequestContextRead('Bitbucket Cloud'),
+			readReview: unsupportedReviewRead('Bitbucket Cloud'),
 		};
 	}
 

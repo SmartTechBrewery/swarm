@@ -14,6 +14,7 @@ import {
 } from '@/pipeline/prompts/checkpoint.js';
 import { projectInstructionsSection } from '@/pipeline/prompts/custom-prompt.js';
 import { HANDOFF_FILENAMES } from '@/scm/delivery.js';
+import { PULL_REQUEST_CONTEXT_FILENAME } from '@/scm/pull-request-context.js';
 
 /** The hand-off file the respond agent writes with its outcome (the phase's delivery contract). */
 const RESPOND_OUTCOME_FILENAME = HANDOFF_FILENAMES.respondToReview;
@@ -21,8 +22,8 @@ const RESPOND_OUTCOME_FILENAME = HANDOFF_FILENAMES.respondToReview;
 /**
  * Build the prompt handed to the respond agent. It's told it authored the PR
  * and is answering its reviewer: sync the branch first, read the pinned review
- * (summary body plus its batched line comments — the review API, not the issue
- * comment stream), address every point — including minor/nit suggestions, not
+ * (summary body plus its batched line comments — the review SWARM rendered into
+ * the pull-request context file before the run, issue #1240), address every point — including minor/nit suggestions, not
  * just blocking ones — as either a fix or a reasoned push-back, verify fixes
  * before pushing, ALWAYS reply on the PR, and record which outcome applied to
  * the hand-off file so this phase can validate the hand-off.
@@ -51,13 +52,13 @@ export function buildRespondToReviewPrompt(
 		...GH_IDENTITY_GUARD,
 		'',
 		`This worktree has branch "${prBranch}" checked out — the head branch of PR`,
-		`#${prNumber} in ${repo} on GitHub. A reviewer has submitted a review — it may`,
+		`#${prNumber} in ${repo}. A reviewer has submitted a review — it may`,
 		'request changes, just comment, or approve with suggestions attached. Respond to it',
 		'regardless of verdict: an approval is not a reason to stay silent.',
 		'',
 		'Do all of the following, in order:',
 		`1. Sync the branch with what the reviewer saw: \`git pull --ff-only origin ${prBranch}\`. If this fails for any reason (diverged branch, deleted remote branch, network error), stop and exit non-zero rather than responding against stale code.`,
-		`2. Read the submitted review you are responding to: \`gh api repos/${repo}/pulls/${prNumber}/reviews/${reviewId}\` for its summary body, and \`gh api repos/${repo}/pulls/${prNumber}/reviews/${reviewId}/comments\` for its line comments. Read the PR discussion for context too: \`gh pr view ${prNumber} --repo ${repo} --comments\`.`,
+		`2. Read "${PULL_REQUEST_CONTEXT_FILENAME}" at the root of this worktree. SWARM wrote it from the source-control provider just before this run started. Its "Review being answered" section is the submitted review you are responding to (review ${reviewId}): its summary body and its inline comments. Its Discussion section is the rest of the pull request's conversation, for context. Do not try to read the review through any provider CLI.`,
 		'3. Address EVERY point the review raises — including minor/nit suggestions, not',
 		'   just blocking "changes requested" items; a valid nit is worth fixing even on an',
 		'   approval. For each point, either:',

@@ -21,6 +21,7 @@ const {
 	postIdempotentAzureDevOpsPullRequestThread,
 	submitAzureDevOpsReview,
 	readAzureDevOpsPullRequestContext,
+	readAzureDevOpsPullRequestReview,
 } = vi.hoisted(() => ({
 	withAzureDevOpsToken: vi.fn(<T>(_token: string, fn: () => Promise<T>) => fn()),
 	getScopedAzureDevOpsUser:
@@ -36,6 +37,7 @@ const {
 	postIdempotentAzureDevOpsPullRequestThread: vi.fn(async () => 4242),
 	submitAzureDevOpsReview: vi.fn(async () => 99),
 	readAzureDevOpsPullRequestContext: vi.fn(async () => ({ number: 7 })),
+	readAzureDevOpsPullRequestReview: vi.fn(async () => ({ id: '7:changes-requested:a:b' })),
 }));
 
 vi.mock('@/integrations/scm/azure-devops/client.js', async (importOriginal) => ({
@@ -46,6 +48,7 @@ vi.mock('@/integrations/scm/azure-devops/client.js', async (importOriginal) => (
 vi.mock('@/integrations/scm/azure-devops/pull-requests.js', () => ({
 	findActiveAzureDevOpsPullRequest,
 	readAzureDevOpsPullRequestContext,
+	readAzureDevOpsPullRequestReview,
 }));
 vi.mock('@/integrations/scm/azure-devops/writes.js', () => ({
 	createAzureDevOpsPullRequest,
@@ -179,10 +182,19 @@ describe('azure devops delivery providers', () => {
 			() => createAzureDevOpsDeliveryProvider(REPO, 'reviewer-pat', { reviews: true }),
 			'reviewer-pat',
 		],
-	])('reads the pull request context under %s’s PAT', async (_label, build, pat) => {
+	])('reads the pull request context and the review under %s’s PAT', async (_label, build, pat) => {
 		const delivery = await build();
 		await expect(delivery.readPullRequestContext(7)).resolves.toEqual({ number: 7 });
 		expect(readAzureDevOpsPullRequestContext).toHaveBeenLastCalledWith(REPO, 7);
+		expect(withAzureDevOpsToken.mock.calls.at(-1)?.[0]).toBe(pat);
+		await expect(delivery.readReview(7, '7:changes-requested:a:b')).resolves.toEqual({
+			id: '7:changes-requested:a:b',
+		});
+		expect(readAzureDevOpsPullRequestReview).toHaveBeenLastCalledWith(
+			REPO,
+			7,
+			'7:changes-requested:a:b',
+		);
 		expect(withAzureDevOpsToken.mock.calls.at(-1)?.[0]).toBe(pat);
 	});
 });

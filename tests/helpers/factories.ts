@@ -46,7 +46,7 @@ import {
 	ScmWebhookJobSchema,
 } from '@/queue/jobs.js';
 import { type ScmEvent, ScmEventSchema } from '@/scm/events.js';
-import type { PullRequestContext } from '@/scm/pull-request-context.js';
+import type { PullRequestContext, PullRequestReview } from '@/scm/pull-request-context.js';
 import type { SCMProvider } from '@/scm/types.js';
 import type { BuildTaskAssignmentInput } from '@/transport/assignment.js';
 import type { TriggerContext } from '@/triggers/types.js';
@@ -955,6 +955,33 @@ export function createMockPullRequestContext(
 				createdAt: '2026-08-04T11:00:00.000Z',
 				body: 'F1: missing test',
 				reviewState: 'changes-requested',
+			},
+		],
+		...overrides,
+	};
+}
+
+/**
+ * The one submitted review a Respond-to-review run answers (issue #1240) — what a
+ * delivery provider's `readReview` answers.
+ */
+export function createMockPullRequestReview(
+	overrides: Partial<PullRequestReview> = {},
+): PullRequestReview {
+	return {
+		id: '4242',
+		author: 'swarm-reviewer',
+		state: 'changes-requested',
+		submittedAt: '2026-08-04T11:00:00.000Z',
+		body: 'F1: missing test',
+		comments: [
+			{
+				kind: 'review-comment',
+				author: 'swarm-reviewer',
+				createdAt: '2026-08-04T11:00:00.000Z',
+				body: 'Cover the empty case.',
+				path: 'src/widget.ts',
+				line: 12,
 			},
 		],
 		...overrides,

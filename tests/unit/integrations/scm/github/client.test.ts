@@ -21,6 +21,8 @@ const reposGetCommit = vi.fn();
 const compareCommitsWithBasehead = vi.fn();
 const listReviews = vi.fn();
 const listReviewComments = vi.fn();
+const getReview = vi.fn();
+const listCommentsForReview = vi.fn();
 const listIssueComments = vi.fn();
 const paginate = vi.fn();
 const graphql = vi.fn();
@@ -30,7 +32,14 @@ vi.mock('@octokit/rest', () => ({
 		auth: unknown;
 		users = { getAuthenticated };
 		actions = { listWorkflowRunsForRepo, listJobsForWorkflowRun, reRunWorkflowFailedJobs };
-		pulls = { get: pullsGet, merge: pullsMerge, listReviews, listReviewComments };
+		pulls = {
+			get: pullsGet,
+			merge: pullsMerge,
+			listReviews,
+			listReviewComments,
+			getReview,
+			listCommentsForReview,
+		};
 		issues = { listComments: listIssueComments };
 		repos = {
 			listPullRequestsAssociatedWithCommit,
@@ -63,6 +72,7 @@ import {
 	listPullRequestsForCommit,
 	mergePullRequestDirect,
 	readGitHubPullRequestContext,
+	readGitHubPullRequestReview,
 	rerunFailedWorkflowRuns,
 	withGitHubToken,
 } from '@/integrations/scm/github/client.js';
@@ -81,6 +91,7 @@ describe('github client', () => {
 		reposGetCommit.mockReset();
 		compareCommitsWithBasehead.mockReset();
 		pullsMerge.mockReset();
+		getReview.mockReset();
 		paginate.mockReset();
 		graphql.mockReset();
 	});
@@ -826,6 +837,86 @@ describe('github client', () => {
 				readGitHubPullRequestContext('jkwiecien', 'swarm', 42),
 			);
 			expect(issueReadHint).toContain('gh issue view <number> --repo jkwiecien/swarm --comments');
+		});
+	});
+
+	describe('readGitHubPullRequestReview (issue #1240)', () => {
+		it('maps the review and the comments submitted with it', async () => {
+			getReview.mockResolvedValue({
+				data: {
+					user: { login: 'swarm-reviewer' },
+					state: 'CHANGES_REQUESTED',
+					submitted_at: '2026-01-02T00:00:00Z',
+					body: 'F1: fix it',
+				},
+			});
+			paginate.mockImplementation(async (endpoint: unknown) => {
+				if (endpoint === listCommentsForReview)
+					return [
+						{
+							user: { login: 'swarm-reviewer' },
+							created_at: '2026-01-02T00:00:00Z',
+							body: 'here',
+							path: 'src/a.ts',
+							line: null,
+							original_line: 7,
+						},
+					];
+				throw new Error('unexpected endpoint');
+			});
+
+			const review = await withGitHubToken('tok', () =>
+				readGitHubPullRequestReview('jkwiecien', 'swarm', 42, '4242'),
+			);
+
+			expect(review).toEqual({
+				id: '4242',
+				author: 'swarm-reviewer',
+				state: 'changes-requested',
+				submittedAt: '2026-01-02T00:00:00Z',
+				body: 'F1: fix it',
+				comments: [
+					{
+						kind: 'review-comment',
+						author: 'swarm-reviewer',
+						createdAt: '2026-01-02T00:00:00Z',
+						body: 'here',
+						path: 'src/a.ts',
+						line: 7,
+					},
+				],
+			});
+			expect(getReview).toHaveBeenCalledWith({
+				owner: 'jkwiecien',
+				repo: 'swarm',
+				pull_number: 42,
+				review_id: 4242,
+			});
+			expect(paginate).toHaveBeenCalledWith(listCommentsForReview, {
+				owner: 'jkwiecien',
+				repo: 'swarm',
+				pull_number: 42,
+				review_id: 4242,
+				per_page: 100,
+			});
+		});
+
+		it('rejects a non-numeric id without any request', async () => {
+			await expect(
+				withGitHubToken('tok', () =>
+					readGitHubPullRequestReview('jkwiecien', 'swarm', 42, '42:changes-requested:a:b'),
+				),
+			).rejects.toThrow("GitHub review id '42:changes-requested:a:b' is not numeric");
+			expect(getReview).not.toHaveBeenCalled();
+			expect(paginate).not.toHaveBeenCalled();
+		});
+
+		it('propagates a missing review rather than reading it as empty', async () => {
+			getReview.mockRejectedValue(Object.assign(new Error('Not Found'), { status: 404 }));
+			paginate.mockResolvedValue([]);
+			await expect(
+				withGitHubToken('tok', () => readGitHubPullRequestReview('jkwiecien', 'swarm', 42, '4242')),
+			).rejects.toThrow('Not Found');
 		});
 	});
 });

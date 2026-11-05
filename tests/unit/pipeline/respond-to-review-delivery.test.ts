@@ -12,6 +12,8 @@ import { readDeliveryId } from '../../helpers/delivery-sidecar.js';
 import {
 	createMockProjectConfig,
 	createMockProjectRepositoryPair,
+	createMockPullRequestContext,
+	createMockPullRequestReview,
 } from '../../helpers/factories.js';
 
 const roots: string[] = [];
@@ -120,6 +122,8 @@ function makeOptions(path: string, handle: WorktreeHandle, project = createMockP
 		pushBranch,
 		submitReview: vi.fn(),
 		postComment,
+		readPullRequestContext: vi.fn(async () => createMockPullRequestContext()),
+		readReview: vi.fn(async () => createMockPullRequestReview()),
 	} as unknown as ScmDeliveryProvider;
 	const scheduleFollowUpReview = vi.fn<(input: FollowUpReviewInput) => Promise<void>>(
 		async () => undefined,

@@ -30,6 +30,7 @@ import {
 	createMockPhaseRecovery,
 	createMockProjectConfig,
 	createMockPullRequestContext,
+	createMockPullRequestReview,
 } from '../../helpers/factories.js';
 
 function agentResult(): AgentCliResult {
@@ -54,6 +55,7 @@ function stubDelivery(): ScmDeliveryProvider {
 		pushBranch: async () => {},
 		submitReview: async () => 1,
 		readPullRequestContext: async () => createMockPullRequestContext(),
+		readReview: async () => createMockPullRequestReview(),
 		postComment: async () => 1,
 	};
 }

@@ -42,6 +42,7 @@ import {
 	createMockProjectConfig,
 	createMockProjectRecord,
 	createMockPullRequestContext,
+	createMockPullRequestReview,
 	createMockWorkItem,
 	toProjectRecord,
 } from '../../helpers/factories.js';
@@ -88,6 +89,7 @@ function makeDelivery(overrides: Partial<ScmDeliveryProvider> = {}): ScmDelivery
 		pushBranch: vi.fn(),
 		submitReview: vi.fn().mockResolvedValue(77),
 		readPullRequestContext: vi.fn(async () => createMockPullRequestContext()),
+		readReview: vi.fn(async () => createMockPullRequestReview()),
 		postComment: vi.fn().mockResolvedValue(88),
 		...overrides,
 	};

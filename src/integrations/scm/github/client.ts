@@ -19,6 +19,7 @@ import { ProviderUnavailableError } from '../../../lib/provider-errors.js';
 import type {
 	PullRequestContext,
 	PullRequestDiscussionEntry,
+	PullRequestReview,
 } from '../../../scm/pull-request-context.js';
 import { deliveryMarker } from '../../../scm/swarm-origin.js';
 import type {
@@ -837,5 +838,51 @@ export async function readGitHubPullRequestContext(
 		url: pull.html_url,
 		discussion,
 		issueReadHint: `Issues this pull request references are GitHub issues in \`${owner}/${repo}\`: read one, including any plan posted on it, with \`gh issue view <number> --repo ${owner}/${repo} --comments\`.`,
+	};
+}
+
+/**
+ * The one submitted review a Respond-to-review run answers (issue #1240): the
+ * review itself and the file-anchored comments submitted with it. `reviewId` is
+ * the numeric id the `pull_request_review` webhook carried; anything else is
+ * rejected before a request is made. A missing review (404) propagates — a failed
+ * read, not an empty review.
+ */
+export async function readGitHubPullRequestReview(
+	owner: string,
+	repo: string,
+	prNumber: number,
+	reviewId: string,
+): Promise<PullRequestReview> {
+	const id = Number(reviewId);
+	if (!Number.isSafeInteger(id) || id <= 0)
+		throw new Error(`GitHub review id '${reviewId}' is not numeric`);
+	const client = getScopedClient();
+	const [{ data: review }, comments] = await Promise.all([
+		client.pulls.getReview({ owner, repo, pull_number: prNumber, review_id: id }),
+		client.paginate(client.pulls.listCommentsForReview, {
+			owner,
+			repo,
+			pull_number: prNumber,
+			review_id: id,
+			per_page: 100,
+		}),
+	]);
+	return {
+		id: reviewId,
+		author: review.user?.login ?? null,
+		state: neutralReviewState(review.state),
+		submittedAt: review.submitted_at ?? null,
+		body: review.body ?? '',
+		comments: comments.map(
+			(comment): PullRequestDiscussionEntry => ({
+				kind: 'review-comment',
+				author: comment.user?.login ?? null,
+				createdAt: comment.created_at ?? null,
+				body: comment.body ?? '',
+				path: comment.path,
+				line: comment.line ?? comment.original_line ?? undefined,
+			}),
+		),
 	};
 }

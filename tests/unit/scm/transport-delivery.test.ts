@@ -2,7 +2,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CreatePullRequestInput, ScmDeliveryProvider } from '@/scm/delivery.js';
 import { createTransportScmDeliveryProvider, type FetchLike } from '@/scm/transport-delivery.js';
 import { TRANSPORT_PROTOCOL_VERSION } from '@/transport/protocol.js';
-import { createMockPullRequestContext } from '../../helpers/factories.js';
+import {
+	createMockPullRequestContext,
+	createMockPullRequestReview,
+} from '../../helpers/factories.js';
 
 const CONTROL_PLANE = 'https://swarm.example';
 const CREDENTIAL = 'raw-worker-credential-secret';
@@ -19,6 +22,7 @@ function makeLocalDelegate(overrides: Partial<ScmDeliveryProvider> = {}): ScmDel
 		pushBranch: vi.fn().mockResolvedValue(undefined),
 		submitReview: vi.fn(),
 		readPullRequestContext: vi.fn(async () => createMockPullRequestContext()),
+		readReview: vi.fn(async () => createMockPullRequestReview()),
 		postComment: vi.fn(),
 		...overrides,
 	};
@@ -48,6 +52,24 @@ describe('createTransportScmDeliveryProvider', () => {
 			createMockPullRequestContext(),
 		);
 		expect(localDelegate.readPullRequestContext).toHaveBeenCalledWith(42);
+		expect(fetchImpl).not.toHaveBeenCalled();
+	});
+
+	it('reads the review on the local delegate, never over the transport (issue #1240)', async () => {
+		const fetchImpl = vi.fn<FetchLike>();
+		const localDelegate = makeLocalDelegate();
+		const provider = createTransportScmDeliveryProvider({
+			controlPlaneUrl: CONTROL_PLANE,
+			workerCredential: CREDENTIAL,
+			projectId: PROJECT_ID,
+			repository: REPOSITORY,
+			persona: 'implementer',
+			localDelegate,
+			fetchImpl,
+		});
+
+		await expect(provider.readReview(42, '4242')).resolves.toEqual(createMockPullRequestReview());
+		expect(localDelegate.readReview).toHaveBeenCalledWith(42, '4242');
 		expect(fetchImpl).not.toHaveBeenCalled();
 	});
 

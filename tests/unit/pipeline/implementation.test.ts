@@ -72,6 +72,7 @@ import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-m
 import {
 	createMockProjectConfig,
 	createMockPullRequestContext,
+	createMockPullRequestReview,
 	createMockWorkItem,
 } from '../../helpers/factories.js';
 
@@ -126,6 +127,7 @@ function makeDelivery() {
 		pushBranch: vi.fn(async (_cwd: string, _branch: string, _expectedSha: string) => {}),
 		submitReview: vi.fn(async () => 0),
 		readPullRequestContext: vi.fn(async () => createMockPullRequestContext()),
+		readReview: vi.fn(async () => createMockPullRequestReview()),
 		postComment: vi.fn(async () => 0),
 	} satisfies ScmDeliveryProvider;
 }

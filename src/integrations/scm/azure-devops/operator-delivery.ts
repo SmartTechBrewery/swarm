@@ -23,6 +23,7 @@ import {
 import {
 	findActiveAzureDevOpsPullRequest,
 	readAzureDevOpsPullRequestContext,
+	readAzureDevOpsPullRequestReview,
 } from './pull-requests.js';
 import {
 	createAzureDevOpsPullRequest,
@@ -138,9 +139,11 @@ export async function createAzureDevOpsDeliveryProvider(
 					deliveryId: input.deliveryId,
 				}),
 			),
-		// A read, so — like `postComment` — not gated on `reviews`.
+		// Reads, so — like `postComment` — not gated on `reviews`.
 		readPullRequestContext: (prNumber) =>
 			scoped(() => readAzureDevOpsPullRequestContext(repo, prNumber)),
+		readReview: (prNumber, reviewId) =>
+			scoped(() => readAzureDevOpsPullRequestReview(repo, prNumber, reviewId)),
 	};
 }
 
