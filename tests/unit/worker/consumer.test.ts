@@ -851,6 +851,7 @@ import {
 	reportInterruptedJobToBoard,
 	runAssignedPhase,
 } from '@/worker/consumer.js';
+import { IMPLEMENTATION_NOTHING_TO_DELIVER } from '@/worker/failure-diagnosis.js';
 import { RunTerminatedError } from '@/worker/run-cancellation.js';
 
 type ProcessJobArgs = Parameters<typeof processJobWithDeps>;
@@ -3105,6 +3106,35 @@ describe('processJob', () => {
 		expect(body).toContain('**implementation**');
 		expect(body).toContain("exited with code 1 for task '100'");
 		expect(body).not.toContain('splitting the issue');
+	});
+
+	// Issue #1335: an Implementation that found nothing to deliver already moved its
+	// card to Backlog, and a re-trigger would find nothing again — so the comment must
+	// not tell the operator the item hasn't moved, or to re-trigger it. Keyed on the
+	// message, so a DB-free worker's rebuilt `AgentRunError{kind:'error'}` diagnoses too.
+	it('diagnoses an Implementation with nothing to deliver without advising a re-trigger', async () => {
+		const workItem = createMockWorkItem({ statusId: '61e4505c' });
+		phaseImpl = async () => {
+			throw new AgentRunError(
+				`${IMPLEMENTATION_NOTHING_TO_DELIVER} for task '100': the agent finished without changing any repository file. The card was moved to Backlog.`,
+				{ kind: 'error' },
+			);
+		};
+
+		const outcome = await processJob(
+			createMockPmWebhookJob(),
+			registryReturning({ phase: 'implementation', taskId: '100', workItem }),
+		);
+
+		expect(outcome).toMatchObject({
+			status: 'phase-failed',
+			failureDiagnosis: { kind: 'nothing-to-deliver' },
+		});
+		expect(addComment).toHaveBeenCalledTimes(1);
+		const [, body] = addComment.mock.calls[0];
+		expect(body).toContain(IMPLEMENTATION_NOTHING_TO_DELIVER);
+		expect(body).toContain('Known condition: nothing to deliver');
+		expect(body).not.toMatch(/re-trigger|hasn't moved/i);
 	});
 
 	it('reports an early provider stall rather than claiming an unproven scope problem', async () => {

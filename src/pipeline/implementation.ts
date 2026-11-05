@@ -118,6 +118,7 @@ import {
 	type ImplementationHandoff,
 	ImplementationHandoffSchema,
 	loadDeliveryProgress,
+	NothingToDeliverError,
 	pushDeliveredBranch,
 	readHandoff,
 	renameCheckedOutBranch,
@@ -127,6 +128,7 @@ import {
 	shouldDeferDeliveryFailure,
 } from '@/scm/delivery.js';
 import { SWARM_GENERATED_SIGNATURE, swarmMarker } from '@/scm/swarm-origin.js';
+import { IMPLEMENTATION_NOTHING_TO_DELIVER } from '@/worker/failure-diagnosis.js';
 import { GitWorktreeManager, type WorktreeHandle } from '@/worker/git-worktree-manager.js';
 import { graftEnvironment } from '@/worktree/graft.js';
 
@@ -154,6 +156,82 @@ const START_STATUS: PmStatusKey = 'inProgress';
  * (`src/pm/pipeline.ts`), so moving here can't loop back into implementation.
  */
 const NEXT_STATUS: PmStatusKey = 'inReview';
+
+/**
+ * Where a card goes when its Implementation finds nothing to deliver (issue
+ * #1335): out of "In progress", which would otherwise show a pickup with no run
+ * behind it, and onto a status that starts nothing by itself (`src/pm/pipeline.ts`),
+ * so the card waits for a human to update its scope or close it.
+ */
+const NOTHING_TO_DELIVER_STATUS: PmStatusKey = 'backlog';
+
+/**
+ * The operator's whole report of an Implementation that found nothing to deliver:
+ * what happened, the likely causes, where the card is now, and what clears it.
+ * It says not to re-run on purpose, because the same card meets the same base
+ * branch and the agent again finds nothing to change.
+ */
+function nothingToDeliverFailure(
+	taskId: string,
+	baseBranch: string,
+	cardMove: { moved: true } | { moved: false; error: string },
+): NothingToDeliverError {
+	const card = cardMove.moved
+		? 'The card was moved to Backlog.'
+		: `SWARM could not move the card to Backlog (${cardMove.error}), so move it out of In progress yourself.`;
+	return new NothingToDeliverError(
+		`${IMPLEMENTATION_NOTHING_TO_DELIVER} for task '${taskId}': the agent finished without changing any repository file (every change in its working tree is a SWARM hand-off artifact), so nothing was committed or pushed and no pull request was opened. This usually means the work is already on '${baseBranch}', or the card's acceptance criteria are already met. ${card} Update the card's scope if work remains, or close it if the work is already on '${baseBranch}'. Re-running Implementation on the card as it stands would find nothing to change again.`,
+	);
+}
+
+/**
+ * Take the card out of "In progress" for an Implementation that found nothing to
+ * deliver, then build the failure the run settles with. Best-effort: a failed move
+ * is logged and named in the message, never thrown in place of the delivery
+ * failure it accompanies. Made here in the phase, through the injected `pm`, so
+ * the same-host worker and the DB-free worker (whose `pm` proxies `moveWorkItem`
+ * through the control plane) do the same thing.
+ */
+async function settleNothingToDeliver(
+	pm: PMProvider,
+	workItem: WorkItem,
+	taskId: string,
+	baseBranch: string,
+): Promise<NothingToDeliverError> {
+	try {
+		await pm.moveWorkItem(workItem.id, NOTHING_TO_DELIVER_STATUS);
+		return nothingToDeliverFailure(taskId, baseBranch, { moved: true });
+	} catch (moveError) {
+		const error = moveError instanceof Error ? moveError.message : String(moveError);
+		logger.warn('Implementation found nothing to deliver, and moving the card to Backlog failed', {
+			taskId,
+			workItemId: workItem.id,
+			error,
+		});
+		return nothingToDeliverFailure(taskId, baseBranch, { moved: false, error });
+	}
+}
+
+/**
+ * Commit the prepared tree, settling an agent that changed nothing (issue #1335):
+ * terminal like every prepared-tree refusal, but the card must not stay "In
+ * progress" with no run behind it, and the operator must not be told to re-run
+ * what would find nothing again.
+ */
+async function commitImplementation(
+	cwd: string,
+	subject: string,
+	identity: { name: string; email: string },
+	card: { pm: PMProvider; workItem: WorkItem; taskId: string; baseBranch: string },
+): Promise<string> {
+	try {
+		return await commitPreparedTree(cwd, subject, identity);
+	} catch (error) {
+		if (error instanceof NothingToDeliverError)
+			throw await settleNothingToDeliver(card.pm, card.workItem, card.taskId, card.baseBranch);
+		throw error;
+	}
+}
 
 /**
  * The `{friendly_name}` of last resort (issue #1241), for a task whose hand-off names
@@ -780,10 +858,11 @@ export async function runImplementationPhase(
 		if (branch !== decidedBranch) await onBranchNamed?.(branch);
 		if (commitSubject !== storedCommitSubject) await onCommitSubjectNamed?.(commitSubject);
 		if (!progress.commitSha) {
-			progress.commitSha = await commitPreparedTree(
+			progress.commitSha = await commitImplementation(
 				handle.path,
 				commitSubject,
 				delivery.commitIdentity,
+				{ pm, workItem, taskId, baseBranch: project.baseBranch },
 			);
 			saveDeliveryProgress(handle.path, progress);
 		}

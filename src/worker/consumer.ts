@@ -254,6 +254,7 @@ import type { WorkerExecutionIdentity } from './execution-identity.js';
 import {
 	diagnoseFailure,
 	type FailureDiagnosis,
+	isImplementationNothingToDeliverFailure,
 	type KnownFailureCondition,
 } from './failure-diagnosis.js';
 import { notifyBlockingFailure } from './failure-notification.js';
@@ -4491,6 +4492,18 @@ async function resolveCompletedNoTriggerOutcome(
 }
 
 /**
+ * The failure comment's generic recovery line, unless the diagnosis makes it
+ * wrong: an Implementation that found nothing to deliver (issue #1335) has moved
+ * its card to Backlog, and re-triggering it would find nothing to change again, so
+ * the diagnosis below carries the advice instead.
+ */
+function recoveryLine(failureDiagnosis: FailureDiagnosis | undefined): string {
+	if (failureDiagnosis?.kind === 'nothing-to-deliver')
+		return "The agent's full output is in the worker logs.";
+	return "This item hasn't moved. Re-trigger the phase once the cause is addressed; the agent's full output is in the worker logs.";
+}
+
+/**
  * The comment SWARM posts on a work item's backing Issue when its phase fails
  * terminally. It names the phase and carries the failure message so a human
  * watching the board sees *why* the item stalled without digging through worker
@@ -4511,7 +4524,7 @@ export function phaseFailureCommentBody(
 		error,
 		'```',
 		'',
-		"This item hasn't moved. Re-trigger the phase once the cause is addressed; the agent's full output is in the worker logs.",
+		recoveryLine(failureDiagnosis),
 	];
 	if (failureDiagnosis) {
 		lines.push(
@@ -4959,6 +4972,9 @@ function knownFailureCondition(
 	// places to go and the diagnosis says what was missing rather than restating git's
 	// `invalid reference`.
 	if (failureKind === 'commit-unavailable') return 'commit-unavailable';
+	// Keyed on the message, not the class (issue #1335): a DB-free worker's failure
+	// arrives here as `AgentRunError{kind:'error'}` carrying the message alone.
+	if (isImplementationNothingToDeliverFailure(error)) return 'nothing-to-deliver';
 	if (isLaunchOrAuthenticationFailure(error)) return 'launch-or-authentication';
 	return undefined;
 }

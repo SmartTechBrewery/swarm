@@ -19,8 +19,11 @@ import type { WorkItemBlocker, WorkItemDependent } from '@/pm/types.js';
 import {
 	DeliveryDivergedError,
 	deliveryIdentity,
+	NothingToDeliverError,
 	type ScmDeliveryProvider,
+	shouldDeferDeliveryFailure,
 } from '@/scm/delivery.js';
+import { isImplementationNothingToDeliverFailure } from '@/worker/failure-diagnosis.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
 import { readDeliveryId } from '../../helpers/delivery-sidecar.js';
 import {
@@ -320,6 +323,69 @@ describe('implementation delivery resumption (issue #558)', () => {
 		expect(error.name).not.toBe('DeliveryDeferredError');
 		expect(options.worktrees.cleanup).toHaveBeenCalledWith('544');
 		expect(options.runAgent).not.toHaveBeenCalled();
+	});
+});
+
+/**
+ * An Implementation whose agent changed nothing (issue #1335) — every change in the
+ * tree is a SWARM hand-off artifact, as when a re-queued card's work is already on
+ * the base branch. The run must settle terminally, take the card out of "In
+ * progress", and say what to do instead of re-running.
+ */
+describe('implementation with nothing to deliver (issue #1335)', () => {
+	function optionsWritingOnlyTheHandoff() {
+		const origin = makeOrigin();
+		const branch = 'issue-544';
+		const fixture = makeDelivery();
+		const worker = makeWorkerCheckout(origin, branch);
+		const options = makeOptions(worker, branch, fixture.delivery);
+		options.runAgent.mockImplementation(async () => {
+			writeAgentOutput(worker, 'nothing');
+			rmSync(join(worker, 'feature.txt'));
+			return agentResult();
+		});
+		return { ...fixture, origin, branch, worker, options };
+	}
+
+	it('fails terminally, moves the card to Backlog, and pushes nothing', async () => {
+		const { options, origin, branch, worker, pushBranch, createPullRequest } =
+			optionsWritingOnlyTheHandoff();
+
+		const error = await runImplementationPhase(options).catch((e) => e);
+
+		expect(error).toBeInstanceOf(NothingToDeliverError);
+		expect(error.name).not.toBe('DeliveryDeferredError');
+		// Terminal by class, even though delivery progress was recorded before the commit.
+		expect(shouldDeferDeliveryFailure(error, worker)).toBe(false);
+		expect(isImplementationNothingToDeliverFailure(error.message)).toBe(true);
+		expect(error.message).toContain("task '544'");
+		expect(error.message).toContain("already on 'main'");
+		expect(error.message).toContain('The card was moved to Backlog.');
+		expect(error.message).toContain("Update the card's scope");
+		expect(error.message).not.toMatch(/re-run (this|the) phase|re-trigger/i);
+
+		expect(options.pm.moveWorkItem).toHaveBeenLastCalledWith('PVTI_item544', 'backlog');
+		expect(options.pm.moveWorkItem).not.toHaveBeenCalledWith('PVTI_item544', 'inReview');
+		expect(options.pm.addComment).not.toHaveBeenCalled();
+		expect(pushBranch).not.toHaveBeenCalled();
+		expect(createPullRequest).not.toHaveBeenCalled();
+		expect(() => git(origin, ['rev-parse', '--verify', '--quiet', branch])).toThrow();
+		expect(options.worktrees.cleanup).toHaveBeenCalledWith('544');
+	});
+
+	it('still fails with the delivery error when the card move fails, naming the move', async () => {
+		const { options, pushBranch } = optionsWritingOnlyTheHandoff();
+		options.pm.moveWorkItem.mockImplementation(async (_id, status) => {
+			if (status === 'backlog') throw new Error('board write failed');
+		});
+
+		const error = await runImplementationPhase(options).catch((e) => e);
+
+		expect(error).toBeInstanceOf(NothingToDeliverError);
+		expect(isImplementationNothingToDeliverFailure(error.message)).toBe(true);
+		expect(error.message).toContain('could not move the card to Backlog (board write failed)');
+		expect(error.message).not.toContain('The card was moved to Backlog.');
+		expect(pushBranch).not.toHaveBeenCalled();
 	});
 });
 

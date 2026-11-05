@@ -64,6 +64,7 @@ export const failureDiagnosisSchema = z.object({
 		'continuation-budget-exhausted',
 		'continuation-no-progress',
 		'commit-unavailable',
+		'nothing-to-deliver',
 		'review-waiting-for-checks',
 		'review-provider-unreachable',
 	]),
