@@ -1287,11 +1287,16 @@ in [Running on a VPS behind Caddy](#running-on-a-vps-behind-caddy) instead.
   Then it bumps `package.json`, commits `chore(release): vX.Y.Z` to `main` and
   tags it, and pushes both. It waits for the image build, which also moves
   `stable` and publishes the GitHub release, and checks that the release carries
-  the signed worker runtime (below). Finally, when
-  `SWARM_DEPLOY_SSH`, `SWARM_DEPLOY_URL` and `SWARM_DEPLOY_COMMAND` are set (in
-  the environment or the checkout's gitignored `.env`), it runs the command on the
-  server over SSH and checks that the new version is live. Without them it stops
-  after the release. It warns first when `deploy/vps` changed since the previous
+  the signed worker runtime (below). A release is one image for every
+  installation; deploying it is per installation, with
+  `npm run deploy -- <target>` (`bin/swarm-deploy`), or by naming the targets on
+  the release (`npm run release -- <target>...`). A target is a name the
+  maintainer picks and defines as `SWARM_DEPLOY_<TARGET>_SSH`, `_URL` and
+  `_COMMAND` in the environment or the checkout's gitignored `.env`, never in the
+  repository; the deploy runs the command on the server over SSH, with
+  `{version}` in it replaced by `X.Y.Z` for a server that pins its image tag, and
+  checks that the new version is live. The release checks every target it names is defined
+  before it pushes anything. It warns first when `deploy/vps` changed since the previous
   tag, because the server's files may then need updating. A tag pushed by hand (`git tag vX.Y.Z && git push origin vX.Y.Z`) builds
   and moves `stable` the same way, but deploys nothing. A `vX.Y.Z-rc.N`
   pre-release does not move `stable`.

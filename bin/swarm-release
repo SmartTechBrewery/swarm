@@ -1,30 +1,18 @@
 #!/usr/bin/env bash
-# `swarm-release` — cut a SWARM release from the current `origin/main` and deploy it
-# to the VPS (docs/MANUAL.md, "The published image").
+# `swarm-release [target...]` — cut a SWARM release from the current `origin/main`
+# (docs/MANUAL.md, "The published image"), then deploy it to each target named.
 #
 # Shows the current version, asks for the new one (X.Y.Z), bumps package.json,
 # commits `chore(release): vX.Y.Z` on main, tags it, pushes both, waits for the
 # publish workflow to build the image, move `:stable` and publish the GitHub
 # release, and checks that the release carries the signed worker runtime (its
-# tarball, `.sha256` and `.minisig`). When a deploy target is configured, it then
-# runs $SWARM_DEPLOY_COMMAND on the server over SSH and checks that the new
-# version is live.
+# tarball, `.sha256` and `.minisig`). Each target is then deployed with
+# `bin/swarm-deploy`, which reads its settings from this checkout's gitignored
+# .env; with no target the release stops there.
 #
 # Run by a maintainer, by hand: it commits to main directly, which an agent
 # session never does (ai/RULES.md §6).
-#
-# The deploy target is installation-specific, so it is never committed: set
-# SWARM_DEPLOY_SSH (user@host), SWARM_DEPLOY_URL (the installation's base URL)
-# and SWARM_DEPLOY_COMMAND (what pulls and restarts the app there) in the
-# environment or in this checkout's gitignored .env. Without them the release is
-# cut and the deploy is skipped.
 set -euo pipefail
-
-# A value from the environment wins; otherwise the line in .env, if any.
-from_env_file() {
-	[ -f .env ] || return 0
-	sed -n "s/^$1=//p" .env | tail -1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"
-}
 
 REPO="SmartTechBrewery/swarm"
 WORKFLOW="publish-image.yml"
@@ -37,9 +25,10 @@ step() { printf '\n==> %s\n' "$*"; }
 
 cd "$(dirname "$0")/.."
 
-DEPLOY_SSH="${SWARM_DEPLOY_SSH:-$(from_env_file SWARM_DEPLOY_SSH)}"
-DEPLOY_URL="${SWARM_DEPLOY_URL:-$(from_env_file SWARM_DEPLOY_URL)}"
-DEPLOY_COMMAND="${SWARM_DEPLOY_COMMAND:-$(from_env_file SWARM_DEPLOY_COMMAND)}"
+# Every target must be configured before anything is pushed.
+for target in "$@"; do
+	bin/swarm-deploy --check "$target" || exit 1
+done
 
 command -v gh >/dev/null || die "gh is not on PATH"
 gh auth status >/dev/null 2>&1 || die "gh is not signed in"
@@ -103,31 +92,12 @@ for asset in "$runtime" "$runtime.sha256" "$runtime.minisig"; do
 done
 echo "Release $tag carries the signed worker runtime"
 
-if [ -z "$DEPLOY_SSH" ] || [ -z "$DEPLOY_URL" ] || [ -z "$DEPLOY_COMMAND" ]; then
-	echo
-	echo "Released $tag. No deploy: set SWARM_DEPLOY_SSH, SWARM_DEPLOY_URL and SWARM_DEPLOY_COMMAND to deploy."
+echo
+echo "Released $tag."
+if [ $# -eq 0 ]; then
+	echo "Deploy it with: npm run deploy -- <target>"
 	exit 0
 fi
-
-step "Deploying to $DEPLOY_SSH"
-# shellcheck disable=SC2029 # the command is meant to expand here and run there
-ssh "$DEPLOY_SSH" "$DEPLOY_COMMAND"
-
-step "Checking $DEPLOY_URL"
-for _ in $(seq 1 24); do
-	if curl -fsS "$DEPLOY_URL/health" >/dev/null 2>&1; then
-		live=""
-		for js in $(curl -fsS "$DEPLOY_URL/" | grep -oE '/assets/[^"]+\.js'); do
-			# Read the bundle whole: piped into `grep -q`, curl dies writing to the
-			# closed pipe on the first match, and pipefail turns that into a miss.
-			bundle=$(curl -fsS "$DEPLOY_URL$js") || continue
-			[[ "$bundle" == *"\"$version\""* ]] && live=yes && break
-		done
-		if [ -n "$live" ]; then
-			echo "$tag is live at $DEPLOY_URL"
-			exit 0
-		fi
-	fi
-	sleep 5
+for target in "$@"; do
+	bin/swarm-deploy "$target" "$version"
 done
-die "$DEPLOY_URL did not report $version within 2 minutes; check the app's logs on $DEPLOY_SSH"

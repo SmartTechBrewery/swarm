@@ -218,19 +218,22 @@ Single-user by default, no login. Details: [`docs/MANUAL.md`](docs/MANUAL.md).
 ## Releasing
 
 ```bash
-npm run release          # asks for X.Y.Z, tags, builds, publishes, deploys
+npm run release                 # asks for X.Y.Z, tags, builds, publishes
+npm run release -- <target>...  # same, then deploys to each target
+npm run deploy -- <target>      # deploys this checkout's version to one target
 ```
 
-Deploy target, in the environment or the checkout's `.env` (none set: release
-only):
+A target is a name you pick. Define it in the gitignored `.env`:
 
 ```bash
-SWARM_DEPLOY_SSH=user@host
-SWARM_DEPLOY_URL=https://<your-domain>
-SWARM_DEPLOY_COMMAND="cd ~/swarm && docker compose pull app && docker compose up -d app"
+SWARM_DEPLOY_<TARGET>_SSH=user@host
+SWARM_DEPLOY_<TARGET>_URL=https://<your-domain>
+SWARM_DEPLOY_<TARGET>_COMMAND="cd ~/swarm && docker compose pull app && docker compose up -d app"
 ```
 
-Details: [`bin/swarm-release`](bin/swarm-release),
+`{version}` in the command becomes `X.Y.Z`, for a server that pins its image tag.
+
+Details: [`bin/swarm-release`](bin/swarm-release), [`bin/swarm-deploy`](bin/swarm-deploy),
 [`docs/MANUAL.md`](docs/MANUAL.md#the-published-image).
 
 ## Documentation
