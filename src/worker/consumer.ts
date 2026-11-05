@@ -1118,8 +1118,9 @@ const CONTROL_PLANE_DELIVERY_SERVER_ERROR = /Control-plane delivery \S+ failed w
  * Two deferrable kinds are left out on purpose. A lost transport is bounded by its own
  * registry entry, which already hands the operator a machine that keeps vanishing; and
  * a commit no eligible machine could obtain will not appear by waiting. Everything else
- * — an `auth` failure, a refused recovery, a gate refusal, an ordinary error — is a
- * failure the operator has to act on, and stays theirs.
+ * — an `auth` failure, a refused recovery, a gate refusal, an Implementation with
+ * nothing to deliver, an ordinary error — is a failure the operator has to act on, and
+ * stays theirs.
  */
 function isTransientTerminalFailure(err: unknown, isDeferrable: boolean, error: string): boolean {
 	if (isDeferrable) {
@@ -1137,6 +1138,10 @@ function isTransientTerminalFailure(err: unknown, isDeferrable: boolean, error: 
 					err instanceof WorkerIneligibleError ||
 					err instanceof DependencyBlockedError
 				);
+	// An Implementation that found nothing to deliver (issue #1335) is terminal by
+	// design, and its message may quote a failed card move's control-plane 5xx — which
+	// must not turn it into a retry that would find nothing to change again.
+	if (isImplementationNothingToDeliverFailure(error)) return false;
 	return unclassified && CONTROL_PLANE_DELIVERY_SERVER_ERROR.test(error);
 }
 

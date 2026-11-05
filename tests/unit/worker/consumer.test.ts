@@ -10347,6 +10347,29 @@ describe('processJob', () => {
 			expect(recordRunBranchHolder).toHaveBeenCalledWith('run-1');
 		});
 
+		// Issue #1335: a nothing-to-deliver failure quotes the failed card move verbatim,
+		// and that move's control-plane 5xx must not make the terminal failure a retry.
+		it('fails an Implementation with nothing to deliver even when its card move hit a server error', async () => {
+			getRunByIdFromDb.mockResolvedValue({ jobPayload: { implementationBranchProvisioned: true } });
+			phaseImpl = async () => {
+				throw new AgentRunError(
+					`${IMPLEMENTATION_NOTHING_TO_DELIVER} for task '100': the agent finished without changing any repository file. SWARM could not move the card to Backlog (Control-plane delivery /worker/delivery/pm/move failed with status 503: persona credential unavailable), so move it out of In progress yourself.`,
+					{ kind: 'error' },
+				);
+			};
+
+			const outcome = await processJob(
+				createMockPmWebhookJob({ runId: 'run-1' }),
+				registryReturning(IMPLEMENTATION_TRIGGER),
+			);
+
+			expect(outcome).toMatchObject({
+				status: 'phase-failed',
+				failureDiagnosis: { kind: 'nothing-to-deliver' },
+			});
+			expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+		});
+
 		it('leaves a control-plane refusal for the operator', async () => {
 			getRunByIdFromDb.mockResolvedValue({ jobPayload: { implementationBranchProvisioned: true } });
 			phaseImpl = async () => {
