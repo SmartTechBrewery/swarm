@@ -16,6 +16,7 @@ import {
 	ImplementationHandoffSchema,
 	isUnretryableDeliveryFailure,
 	loadDeliveryProgress,
+	lsRemoteBranchHead,
 	pushDeliveredBranch,
 	pushLeaseArgs,
 	readHandoff,
@@ -482,6 +483,30 @@ describe('pushDeliveredBranch', () => {
 			expect(fixtureGit(origin, ['rev-parse', 'refs/heads/issue-1']).trim()).toBe(theirs);
 		});
 
+		// The pull request was merged or closed with its branch deleted, and no fetch
+		// pruned the clone's remote-tracking ref, so a lease taken from it is stale. Git
+		// refuses that lease (`stale info`); the plain retry recreates the branch.
+		it('still delivers when the abandoned branch was deleted after its head was observed', async () => {
+			const { origin, clone } = makeRemoteAndClone();
+			const abandoned = pushFromAnotherClone(origin, 'issue-1', 'the abandoned attempt\n');
+			fixtureGit(clone, ['fetch', '-q', 'origin']);
+			fixtureGit(origin, ['update-ref', '-d', 'refs/heads/issue-1']);
+			fixtureGit(clone, ['fetch', '-q', 'origin']);
+			expect(fixtureGit(clone, ['rev-parse', 'refs/remotes/origin/issue-1']).trim()).toBe(
+				abandoned,
+			);
+			fixtureGit(clone, ['checkout', '-q', 'main']);
+			const fresh = commitOn(clone, 'fresh', 'a fresh attempt from the base\n');
+			const push = leasePush(origin);
+			const pushBranch = vi.fn(push.pushBranch);
+
+			await pushDeliveredBranch({ pushBranch }, clone, 'issue-1', fresh, abandoned);
+
+			expect(fixtureGit(origin, ['rev-parse', 'refs/heads/issue-1']).trim()).toBe(fresh);
+			expect(pushBranch).toHaveBeenCalledTimes(2);
+			expect(pushBranch).toHaveBeenLastCalledWith(clone, 'issue-1', fresh);
+		});
+
 		it('passes no lease at all to an ordinary push', async () => {
 			const pushBranch = vi.fn(async () => {});
 			await pushDeliveredBranch({ pushBranch }, '/cwd', 'issue-1', 'sha');
@@ -501,6 +526,32 @@ describe('pushDeliveredBranch', () => {
 		await expect(pushDeliveredBranch(failing, clone, 'issue-1', 'deadbeef')).rejects.toThrow(
 			'could not read from remote repository',
 		);
+	});
+});
+
+describe('lsRemoteBranchHead', () => {
+	it('reads the head origin holds, and null once origin deleted the branch', async () => {
+		const { origin, clone } = makeRemoteAndClone();
+		const head = pushFromAnotherClone(origin, 'issue-1', 'the abandoned attempt\n');
+		// A branch whose name merely ends the same way is not the branch asked for.
+		pushFromAnotherClone(origin, 'feature/issue-1', 'unrelated\n');
+
+		await expect(lsRemoteBranchHead(clone, 'issue-1')).resolves.toBe(head);
+
+		fixtureGit(clone, ['fetch', '-q', 'origin']);
+		fixtureGit(origin, ['update-ref', '-d', 'refs/heads/issue-1']);
+		fixtureGit(clone, ['fetch', '-q', 'origin']);
+
+		// The tracking ref outlives the branch; the remote does not.
+		expect(fixtureGit(clone, ['rev-parse', 'refs/remotes/origin/issue-1']).trim()).toBe(head);
+		await expect(lsRemoteBranchHead(clone, 'issue-1')).resolves.toBeNull();
+	});
+
+	it('throws when origin cannot be asked', async () => {
+		const { clone } = makeRemoteAndClone();
+		fixtureGit(clone, ['remote', 'set-url', 'origin', join(clone, 'no-such-remote')]);
+
+		await expect(lsRemoteBranchHead(clone, 'issue-1')).rejects.toThrow();
 	});
 });
 

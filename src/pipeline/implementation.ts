@@ -118,6 +118,7 @@ import {
 	type ImplementationHandoff,
 	ImplementationHandoffSchema,
 	loadDeliveryProgress,
+	lsRemoteBranchHead,
 	pushDeliveredBranch,
 	readHandoff,
 	renameCheckedOutBranch,
@@ -539,18 +540,31 @@ type AbandonedDeliveryProbe = {
 );
 
 /**
- * The abandoned branch's head on `origin`, as the provisioning fetch left it (issue
- * #1334), or `undefined` for a delivery that abandoned nothing.
+ * The abandoned branch's head on `origin` (issue #1334), or `undefined` for a delivery
+ * that abandoned nothing. Asked of the remote itself: the remote-tracking ref outlives
+ * a branch deleted with its pull request, since no fetch here prunes, and a lease over
+ * that stale head would be refused on every push. Only when the remote cannot be
+ * asked does this fall back to the tracking ref — a lease that turns out stale is
+ * still recovered from by `pushDeliveredBranch`'s plain fast-forward retry.
  */
 async function readAbandonedHead(
 	handle: WorktreeHandle,
 	abandoned: boolean,
 ): Promise<{ branch: string; sha?: string } | undefined> {
 	if (!abandoned) return undefined;
-	return {
-		branch: handle.branch,
-		sha: await resolveCommitSha(handle.path, `refs/remotes/origin/${handle.branch}`),
-	};
+	try {
+		const sha = await lsRemoteBranchHead(handle.path, handle.branch);
+		return { branch: handle.branch, sha: sha ?? undefined };
+	} catch (error) {
+		logger.warn('Could not ask origin for the abandoned head — using the remote-tracking ref', {
+			branch: handle.branch,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return {
+			branch: handle.branch,
+			sha: await resolveCommitSha(handle.path, `refs/remotes/origin/${handle.branch}`),
+		};
+	}
 }
 
 /**
@@ -853,11 +867,11 @@ export async function runImplementationPhase(
 	try {
 		graft(project.repoRoot, handle.path);
 
-		// The abandoned head this delivery replaces, read from the remote-tracking ref —
-		// for a fresh attempt the one its provisioning just fetched; a continuation reads
-		// what the last fetch left. It is the lease the push is made under, so a push
-		// someone made to the old branch since is refused rather than overwritten. Absent
-		// when the branch was deleted with its pull request: the push is then ordinary.
+		// The abandoned head this delivery replaces, as `origin` holds it now — for a
+		// fresh attempt and a continuation alike. It is the lease the push is made under,
+		// so a push someone made to the old branch since is refused rather than
+		// overwritten. Absent when the branch was deleted with its pull request: the push
+		// is then ordinary.
 		const abandonedHead = await readAbandonedHead(handle, probe.abandoned);
 		// Keyed on the provisional name rather than the checkout's, which a decided
 		// pattern name replaces between attempts — the progress sidecar and the PR-link

@@ -951,6 +951,24 @@ export async function remoteBranchHead(cwd: string, branch: string): Promise<str
 	return git(cwd, ['rev-parse', `origin/${branch}`]);
 }
 
+/**
+ * The branch's head on `origin` as the remote holds it right now, or `null` when
+ * `origin` has no such branch (issue #1334). Asked with `ls-remote` rather than read
+ * off `refs/remotes/origin/<branch>`, which a fetch without `--prune` keeps pointing
+ * at a branch's last head after the branch itself was deleted. Throws when git could
+ * not ask the remote at all.
+ */
+export async function lsRemoteBranchHead(cwd: string, branch: string): Promise<string | null> {
+	const ref = `refs/heads/${branch}`;
+	const output = await git(cwd, ['ls-remote', 'origin', ref]);
+	// `ls-remote` matches a pattern against the ref name's tail, so keep the exact ref.
+	for (const line of output.split('\n')) {
+		const [sha, name] = line.split('\t');
+		if (sha && name === ref) return sha;
+	}
+	return null;
+}
+
 export async function assertRemoteHead(
 	cwd: string,
 	branch: string,
@@ -1363,6 +1381,20 @@ export async function pushDeliveredBranch(
 		await delivery.pushBranch(cwd, branch, expectedSha, ...leaseArgument(replacingSha));
 	} catch (error) {
 		if (!looksLikePushRejection(error)) throw error;
+		// A refused lease (issue #1334) means the branch is no longer at the head it was
+		// observed at — deleted since, or moved. Push once more without it: a plain push
+		// only fast-forwards, so it recreates a deleted branch, advances one that moved to
+		// an ancestor of this commit, and is refused for one carrying someone else's work,
+		// which the classification below then reports as the divergence it is. Retrying
+		// the lease instead would repeat the identical refusal on every attempt.
+		if (replacingSha !== undefined) {
+			logger.warn('Leased push refused — retrying as an ordinary fast-forward push', {
+				branch,
+				expectedSha,
+				replacingSha,
+			});
+			return pushDeliveredBranch(delivery, cwd, branch, expectedSha);
+		}
 		const remote = await divergedRemoteHead(cwd, branch, expectedSha);
 		if (!remote) throw error;
 		throw new DeliveryDivergedError(

@@ -34,13 +34,16 @@ vi.mock('node:fs', () => ({
 // fixture path, not a checkout, so the commit is stubbed; `implementation-delivery.test.ts`
 // exercises commit/push/PR against real repositories.
 const DELIVERED_SHA = 'c0ffee1234567890c0ffee1234567890c0ffee12';
-// The abandoned branch's head on `origin` (issue #1334), read from the fixture path.
+// The abandoned branch's head on `origin` (issue #1334), asked of the remote.
 const ABANDONED_SHA = 'abad0ned00000000000000000000000000000000';
+// What a remote-tracking ref that outlived the branch's deletion still reads.
+const STALE_TRACKING_SHA = '57a1e000000000000000000000000000000000000';
 vi.mock('@/scm/delivery.js', async (importOriginal) => ({
 	...(await importOriginal<typeof import('@/scm/delivery.js')>()),
 	commitPreparedTree: vi.fn(async () => DELIVERED_SHA),
 	renameCheckedOutBranch: vi.fn(async () => {}),
-	resolveCommitSha: vi.fn(async (): Promise<string | undefined> => ABANDONED_SHA),
+	lsRemoteBranchHead: vi.fn(async (): Promise<string | null> => ABANDONED_SHA),
+	resolveCommitSha: vi.fn(async (): Promise<string | undefined> => STALE_TRACKING_SHA),
 }));
 
 // A checkpoint continuation's gate verdict. The gate itself (validation, lease
@@ -71,6 +74,7 @@ import {
 	commitPreparedTree,
 	deliveryIdentity,
 	HANDOFF_FILENAMES,
+	lsRemoteBranchHead,
 	renameCheckedOutBranch,
 	resolveCommitSha,
 	type ScmDeliveryProvider,
@@ -1060,7 +1064,8 @@ describe('runImplementationPhase — fresh attempt after an abandoned pull reque
 		checkpointFileExists = false;
 		progressFileContents = undefined;
 		vi.mocked(commitPreparedTree).mockClear();
-		vi.mocked(resolveCommitSha).mockReset().mockResolvedValue(ABANDONED_SHA);
+		vi.mocked(lsRemoteBranchHead).mockReset().mockResolvedValue(ABANDONED_SHA);
+		vi.mocked(resolveCommitSha).mockReset().mockResolvedValue(STALE_TRACKING_SHA);
 	});
 
 	function freshDeps() {
@@ -1091,7 +1096,8 @@ describe('runImplementationPhase — fresh attempt after an abandoned pull reque
 			runId: undefined,
 			resetBranch: true,
 		});
-		expect(resolveCommitSha).toHaveBeenCalledWith(WORKTREE_PATH, 'refs/remotes/origin/issue-19');
+		expect(lsRemoteBranchHead).toHaveBeenCalledWith(WORKTREE_PATH, 'issue-19');
+		expect(resolveCommitSha).not.toHaveBeenCalled();
 		expect(deps.runAgent).toHaveBeenCalledTimes(1);
 
 		const subject = '19 Add the starting page of the SWARM test bed';
@@ -1136,14 +1142,33 @@ describe('runImplementationPhase — fresh attempt after an abandoned pull reque
 		expect(commentBodies(deps).some((body) => body.includes('fresh attempt'))).toBe(false);
 	});
 
+	// The remote-tracking ref still reads the deleted branch's last head, since no
+	// fetch prunes it; only the remote itself knows the branch is gone.
 	it('pushes ordinarily and says the branch was gone when origin no longer has it', async () => {
-		vi.mocked(resolveCommitSha).mockResolvedValue(undefined);
+		vi.mocked(lsRemoteBranchHead).mockResolvedValue(null);
 		const deps = freshDeps();
 
 		await runImplementationPhase(deps);
 
 		expect(deps.delivery.pushBranch).toHaveBeenCalledWith(WORKTREE_PATH, 'issue-19', DELIVERED_SHA);
+		expect(JSON.parse(progressFileContents ?? '{}').replacingSha).toBeUndefined();
 		expect(commentBodies(deps)[0]).toContain('was absent on origin');
+		expect(commentBodies(deps)[0]).not.toContain(STALE_TRACKING_SHA);
+	});
+
+	it('falls back to the remote-tracking ref when origin cannot be asked', async () => {
+		vi.mocked(lsRemoteBranchHead).mockRejectedValue(new Error('could not read from remote'));
+		const deps = freshDeps();
+
+		await runImplementationPhase(deps);
+
+		expect(resolveCommitSha).toHaveBeenCalledWith(WORKTREE_PATH, 'refs/remotes/origin/issue-19');
+		expect(deps.delivery.pushBranch).toHaveBeenCalledWith(
+			WORKTREE_PATH,
+			'issue-19',
+			DELIVERED_SHA,
+			STALE_TRACKING_SHA,
+		);
 	});
 
 	it('still runs the attempt when the card refuses the notice', async () => {
@@ -1181,6 +1206,7 @@ describe('runImplementationPhase — fresh attempt after an abandoned pull reque
 
 		expect(deps.worktrees.reuse).toHaveBeenCalledWith('19', 'issue-19', false);
 		expect(deps.worktrees.provision).not.toHaveBeenCalled();
+		expect(lsRemoteBranchHead).not.toHaveBeenCalled();
 		expect(resolveCommitSha).not.toHaveBeenCalled();
 		expect(vi.mocked(commitPreparedTree).mock.calls[0]?.[1]).toBe(
 			'19 Old subject from the abandoned PR',
