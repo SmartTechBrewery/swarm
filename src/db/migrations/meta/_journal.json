@@ -624,6 +624,13 @@
       "when": 1793949982799,
       "tag": "0088_operator_actions",
       "breakpoints": true
+    },
+    {
+      "idx": 89,
+      "version": "7",
+      "when": 1793952998867,
+      "tag": "0089_operator_action_detail",
+      "breakpoints": true
     }
   ]
 }

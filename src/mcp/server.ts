@@ -17,6 +17,7 @@ import type { SwarmUser } from '../identity/schema.js';
 import { registerConsistencyTools } from './tools/consistency.js';
 import { registerDependencyWaitTools } from './tools/dependency-waits.js';
 import { registerLogTools } from './tools/logs.js';
+import { registerPhaseAgentTools } from './tools/phase-agents.js';
 import { registerPipelineTools } from './tools/pipeline.js';
 import { registerProjectConfigTools } from './tools/project-config.js';
 import { registerPullRequestTools } from './tools/pull-requests.js';
@@ -47,5 +48,6 @@ export function createSwarmMcpServer(user: SwarmUser): McpServer {
 	registerConsistencyTools(server, user);
 	registerRunActionTools(server, user);
 	registerDependencyWaitTools(server, user);
+	registerPhaseAgentTools(server, user);
 	return server;
 }

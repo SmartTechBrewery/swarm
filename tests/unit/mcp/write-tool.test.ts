@@ -45,7 +45,7 @@ function definition(): WriteToolDefinition<typeof shape> {
 		destructive: true,
 		targetOf: (input) => input.runId,
 		preview: (input, caller) => preview(input, caller),
-		apply: (input, caller) => apply(input, caller),
+		apply: (input, caller, previewed) => apply(input, caller, previewed),
 	};
 }
 
@@ -95,6 +95,27 @@ describe('runWriteTool', () => {
 			outcome: 'succeeded',
 			error: null,
 			projectId: 'proj-a',
+		});
+	});
+
+	// Issue #1349: what a preview records (the order a reorder replaced) lands on the
+	// row, and the write is handed that same preview so it writes what was recorded.
+	it("records the preview's detail on the row and hands the preview to the write", async () => {
+		const previewed = {
+			projectId: 'proj-a',
+			plan: { before: ['codex'], after: ['claude'] },
+			detail: { previous: ['codex'], next: ['claude'] },
+		};
+		preview.mockResolvedValue(previewed);
+
+		await runWriteTool(definition(), USER, { runId: 'run-1', reason: 'reorder', dryRun: false });
+
+		expect(apply).toHaveBeenCalledWith({ runId: 'run-1' }, expect.anything(), previewed);
+		expect(settleOperatorAction).toHaveBeenCalledWith('audit-1', {
+			outcome: 'succeeded',
+			error: null,
+			projectId: 'proj-a',
+			detail: { previous: ['codex'], next: ['claude'] },
 		});
 	});
 

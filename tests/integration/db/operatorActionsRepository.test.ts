@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { getDb } from '../../../src/db/client.js';
 import {
+	findLatestOperatorAction,
 	recordOperatorAction,
 	settleOperatorAction,
 } from '../../../src/db/repositories/operatorActionsRepository.js';
@@ -61,5 +62,51 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('operatorActionsRepository
 
 		const [row] = await getDb().select().from(operatorActions);
 		expect(row).toMatchObject({ projectId: 'proj-a', outcome: 'succeeded' });
+	});
+
+	// issue #1349 — `phase_agents_restore` reads back what the latest real, successful
+	// reorder of one project's phase recorded; nothing else may answer.
+	it('finds the latest succeeded real call of a tool on a target, with its recorded detail', async () => {
+		const REORDER = {
+			...CALL,
+			tool: 'phase_agents_reorder',
+			projectId: 'proj-a',
+			target: 'proj-a/review',
+			input: { projectId: 'proj-a', phase: 'review', order: ['claude'] },
+		};
+		const settled = async (
+			call: typeof REORDER,
+			outcome: 'succeeded' | 'refused',
+			detail: unknown,
+		) => {
+			const id = await recordOperatorAction(call);
+			await settleOperatorAction(id, { outcome, error: null, projectId: call.projectId, detail });
+			return id;
+		};
+
+		const older = await settled(REORDER, 'succeeded', { previous: ['older'] });
+		const latest = await settled(REORDER, 'succeeded', { previous: ['latest'] });
+		await settled({ ...REORDER, dryRun: true }, 'succeeded', { previous: ['dry'] });
+		await settled(REORDER, 'refused', { previous: ['refused'] });
+		await settled({ ...REORDER, target: 'proj-a/planning' }, 'succeeded', { previous: ['x'] });
+		await settled({ ...REORDER, projectId: 'proj-b' }, 'succeeded', { previous: ['y'] });
+		await settled({ ...REORDER, tool: 'phase_agents_restore' }, 'succeeded', { previous: ['z'] });
+
+		const found = await findLatestOperatorAction({
+			tool: 'phase_agents_reorder',
+			projectId: 'proj-a',
+			target: 'proj-a/review',
+		});
+
+		expect(found?.id).toBe(latest);
+		expect(found?.id).not.toBe(older);
+		expect(found?.detail).toEqual({ previous: ['latest'] });
+		expect(
+			await findLatestOperatorAction({
+				tool: 'phase_agents_reorder',
+				projectId: 'proj-a',
+				target: 'proj-a/implementation',
+			}),
+		).toBeUndefined();
 	});
 });

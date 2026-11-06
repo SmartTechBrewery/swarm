@@ -25,6 +25,11 @@
  *    which the write may have half-happened). A row that
  *    cannot be settled is logged and the call's real result is still returned: the
  *    write happened, and reporting it as failed would invite a second one.
+ *  - **An optional recorded `detail`.** A `preview` may return a `detail` the row
+ *    keeps when the call settles (issue #1349) — what the change replaced, say, so a
+ *    later tool can undo it (`phase_agents_restore` reads the `{ previous, next }`
+ *    order `phase_agents_reorder` records). `apply` is handed the very preview it was
+ *    authorized by, so what it writes is what the row says it wrote.
  *
  * Results are `{ dryRun: true, auditId, preview }` or `{ dryRun: false, auditId,
  * result }`; refusals and failures are `isError` results worded as {@link runTool}
@@ -71,9 +76,17 @@ export const WRITE_TOOL_INPUT = {
 export interface WriteToolPreview {
 	projectId: string;
 	plan: unknown;
+	/**
+	 * What the audit row records about this change when the call settles (its
+	 * `detail` column); omitted, the column stays `null`.
+	 */
+	detail?: unknown;
 }
 
-export interface WriteToolDefinition<Shape extends z.ZodRawShape> {
+export interface WriteToolDefinition<
+	Shape extends z.ZodRawShape,
+	Preview extends WriteToolPreview = WriteToolPreview,
+> {
 	name: string;
 	title: string;
 	description: string;
@@ -90,9 +103,16 @@ export interface WriteToolDefinition<Shape extends z.ZodRawShape> {
 	preview: (
 		input: z.objectOutputType<Shape, z.ZodTypeAny>,
 		caller: SwarmCaller,
-	) => Promise<WriteToolPreview>;
-	/** The write itself — the dashboard procedure the tool wraps. */
-	apply: (input: z.objectOutputType<Shape, z.ZodTypeAny>, caller: SwarmCaller) => Promise<unknown>;
+	) => Promise<Preview>;
+	/**
+	 * The write itself — the dashboard procedure the tool wraps. Handed the preview
+	 * this call was authorized by, so it can write exactly what that preview recorded.
+	 */
+	apply: (
+		input: z.objectOutputType<Shape, z.ZodTypeAny>,
+		caller: SwarmCaller,
+		preview: Preview,
+	) => Promise<unknown>;
 }
 
 type WriteToolArgs<Shape extends z.ZodRawShape> = z.objectOutputType<Shape, z.ZodTypeAny> & {
@@ -101,11 +121,10 @@ type WriteToolArgs<Shape extends z.ZodRawShape> = z.objectOutputType<Shape, z.Zo
 };
 
 /** Register one write tool on `server`, authorizing and auditing every call as `user`. */
-export function registerWriteTool<Shape extends z.ZodRawShape>(
-	server: McpServer,
-	user: SwarmUser,
-	definition: WriteToolDefinition<Shape>,
-): void {
+export function registerWriteTool<
+	Shape extends z.ZodRawShape,
+	Preview extends WriteToolPreview = WriteToolPreview,
+>(server: McpServer, user: SwarmUser, definition: WriteToolDefinition<Shape, Preview>): void {
 	// Widened to a plain shape: the SDK cannot resolve its callback type over a generic one.
 	const inputSchema: z.ZodRawShape = { ...definition.inputSchema, ...WRITE_TOOL_INPUT };
 	server.registerTool(
@@ -126,8 +145,11 @@ export function registerWriteTool<Shape extends z.ZodRawShape>(
 }
 
 /** One write-tool call, start to settle. Exported for the framework's own tests. */
-export async function runWriteTool<Shape extends z.ZodRawShape>(
-	definition: WriteToolDefinition<Shape>,
+export async function runWriteTool<
+	Shape extends z.ZodRawShape,
+	Preview extends WriteToolPreview = WriteToolPreview,
+>(
+	definition: WriteToolDefinition<Shape, Preview>,
 	user: SwarmUser,
 	args: WriteToolArgs<Shape>,
 ): Promise<CallToolResult> {
@@ -158,9 +180,15 @@ export async function runWriteTool<Shape extends z.ZodRawShape>(
 	}
 
 	let projectId: string | null = null;
+	let detail: unknown;
 	const settle = async (outcome: 'succeeded' | 'refused' | 'failed', error: string | null) => {
 		try {
-			await settleOperatorAction(auditId, { outcome, error, projectId });
+			await settleOperatorAction(auditId, {
+				outcome,
+				error,
+				projectId,
+				...(detail !== undefined ? { detail } : {}),
+			});
 		} catch (settleError) {
 			logger.error('operator MCP write tool: could not settle its audit record', {
 				tool: definition.name,
@@ -181,11 +209,12 @@ export async function runWriteTool<Shape extends z.ZodRawShape>(
 		const caller = callerFor(user);
 		const preview = await definition.preview(input, caller);
 		projectId = preview.projectId;
+		detail = preview.detail;
 		if (dryRun) {
 			await settle('succeeded', null);
 			return jsonResult({ dryRun: true, auditId, preview: preview.plan });
 		}
-		const result = await definition.apply(input, caller);
+		const result = await definition.apply(input, caller, preview);
 		await settle('succeeded', null);
 		return jsonResult({ dryRun: false, auditId, result });
 	} catch (error) {

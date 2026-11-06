@@ -98,7 +98,8 @@ client using it.
 
 Treat the token like a password: it reads everything your account can read in the
 dashboard, including run logs and agent output, and it can reset and re-dispatch
-runs, and wake dependency waits, in every project where you hold `member`.
+runs, and wake dependency waits, in every project where you hold `member`, and
+reorder phase agents in every project you administer.
 
 ## Tools
 
@@ -195,7 +196,9 @@ the same way:
   writes one row to the `operator_actions` table: who (`user_id`,
   `user_identifier`), which `tool`, `project_id`, `target`, `reason`, `dry_run`,
   the `input` arguments, `outcome` (`succeeded`, `refused`, `failed`, or
-  `pending` while the call runs), `error`, and `started_at`/`completed_at`.
+  `pending` while the call runs), `error`, `detail` (what a tool recorded about
+  the change it previewed, such as the order `phase_agents_reorder` replaced;
+  empty for most tools) and `started_at`/`completed_at`.
   `refused` means the wrapped procedure declined to act (`NOT_FOUND`,
   `FORBIDDEN`, `PRECONDITION_FAILED`, `CONFLICT`, `BAD_REQUEST`, …), so nothing
   changed. `failed` means an internal error, including one the procedure reported
@@ -204,13 +207,17 @@ the same way:
   does nothing and says so. The table has no foreign keys, so a row survives the
   deletion of the user or project it names. `project_id` is empty only when the
   call ended before its target resolved to a project, for example an
-  unknown run. No tool reads the audit table yet; query Postgres directly.
+  unknown run, or a call its preview refused. The only tool that reads the audit
+  table is `phase_agents_restore`, which reads back the latest reorder of its own
+  project's phase; otherwise query Postgres directly.
 
 | Tool | What it does | Arguments |
 | --- | --- | --- |
 | `run_reset` | **Destructive.** Resets a wedged run and restarts its phase from scratch, as the dashboard's **Reset & restart** and `swarm run reset` do (`runs.reset`). It stops the run's live agent, cancels its active dispatch (even one a worker has claimed), clears its cancellation flag, tears down its checkout and discards uncommitted and unpushed work, and clears its recovery record. Then it re-dispatches the phase as a fresh first attempt. A run with no stored payload, or whose project is gone, is settled `failed` instead (`outcome: 'terminated'`). Refused only for an unknown run, a machine-maintenance run, or a reset already under way | `runId`, `reason`, `dryRun` (default `false`) |
 | `dispatch_redispatch_now` | Re-dispatches a `deferred`, `checkpointed` or `failed` run immediately, as the dashboard's **Retry now** does (`runs.retryNow`). It re-opens the run's waiting dispatch for an immediate attempt, superseding a scheduled automatic retry. A dispatch whose worker lease has lapsed is taken back first. A run with no dispatch gets a fresh one built from its stored payload. Retry budgets start again from zero. Refused for any other status, for a run a worker is executing, and for a run with neither a dispatch nor a stored payload | `runId`, `reason`, `dryRun` (default `false`) |
 | `dependency_waits_wake` | Wakes every dispatch in the project waiting on the dependency gate now, instead of at its next re-check (`SWARM_DEPENDENCY_RECHECK_MS`) — the same wake a merge or a board card reaching Done triggers on its own (`runs.wakeDependencyWaits`, logged with cause `operator`). The gate re-reads the blockers, so a dependent still blocked simply waits again, and the wake spends no attempt its re-check would not have. Returns `{ projectId, woken, dispatches }`, each dispatch with `dispatchId`, `phase`, `repository`, `taskId`, `prNumber`, `runId`, `attempt` and `availableAt`. A dispatch it could not wake is logged, left on its re-check, and not listed. The dry run (`runs.previewDependencyWake`) returns `{ projectId, wouldWake, dispatches }`: the waits it would wake, in the same shape | `projectId`, `reason`, `dryRun` (default `false`) |
+| `phase_agents_reorder` | Changes the priority order of one phase's agent `targets` — which CLI/model a worker tries first — and nothing else: no target is added, removed or edited, and the phase's `timeoutMs` and `prompt` are kept. `order` lists every current target exactly once, each as `<cli>/<model>` (`claude/opus`; `default/<model>` for a target naming no CLI) or by its CLI alone (`claude`); anything that is not a permutation of the current targets (an unknown name, a repeat, a target left out) is refused as `BAD_REQUEST` naming the current targets, and a phase with no configured targets as `PRECONDITION_FAILED`. Saves through the project configuration (`projects.update`), which re-validates it as any save is and rewrites the `cli`/`model`/`reasoning` mirror from the new first target. Returns `{ projectId, phase, before, after }` (target names); the dry run (`projects.agentsForUpdate`) returns the same `before`/`after`. The order it replaced is recorded on its audit row (`detail: { previous, next }`) | `projectId`, `phase` (as for `phase_agents_get`), `order`, `reason`, `dryRun` (default `false`) |
+| `phase_agents_restore` | Puts back the order the latest successful, real (not dry-run) `phase_agents_reorder` of this project's phase replaced, read from that call's audit row, and saves it the same way. Refused as `PRECONDITION_FAILED` when the phase was never reordered, or when its targets were edited since — a CLI, model or reasoning level changed, or a target added or removed — so the recorded order is no longer a permutation of them: re-applying it would undo that edit. Reorder by hand with `phase_agents_reorder` then. A dashboard reorder of the same targets made since is not an edit, and is overwritten. Returns `{ projectId, phase, before, after }`; the dry run adds `restoring: { auditId, reorderedAt }`, naming the reorder it would undo | `projectId`, `phase`, `reason`, `dryRun` (default `false`) |
 
 `run_reset` and `dispatch_redispatch_now` need `member` on the run's project, the role that drives runs in the
 dashboard. A contributor can read the run but gets `FORBIDDEN`. Anyone else gets
@@ -221,6 +228,28 @@ dashboard. A contributor can read the run but gets `FORBIDDEN`. Anyone else gets
 board dispatch waiting on its dependencies, is not something it can re-dispatch;
 `dependency_waits_wake` wakes those. It needs `member` on the project it names,
 and so does its dry run; a contributor gets `FORBIDDEN`, anyone else `NOT_FOUND`.
+
+`phase_agents_reorder` and `phase_agents_restore` change the project's
+configuration, so they need `projectAdmin`, exactly as the dashboard's Agents tab
+does; a `member` or contributor gets `FORBIDDEN`, anyone else `NOT_FOUND`. Their dry
+run, `projects.agentsForUpdate`, is gated at `projectAdmin` too, and
+`phase_agents_restore` reads the audit table only after it has passed.
+
+For example, while Codex is rate-limited, put Claude first for resolving
+conflicts, then put the order back once the limit resets:
+
+```text
+phase_agents_reorder { projectId: "acme", phase: "resolveConflicts",
+  order: ["claude", "codex"], reason: "Codex rate-limited until 18:00", dryRun: true }
+  → preview: { before: ["codex/gpt-5.6-sol", "claude/opus"],
+               after:  ["claude/opus", "codex/gpt-5.6-sol"] }
+phase_agents_reorder { …the same…, dryRun: false }
+…later…
+phase_agents_restore { projectId: "acme", phase: "resolveConflicts",
+  reason: "Codex limit has reset" }
+```
+
+Nothing restores the order on its own when the limit resets; that is your call.
 
 ## For developers
 
@@ -242,5 +271,9 @@ gated exactly like the write, which runs first on every call and answers the dry
 run, and an `apply`, which is the dashboard mutation. The framework adds `reason`
 and `dryRun` and writes the `operator_actions` row
 (`src/db/repositories/operatorActionsRepository.ts`). The run tools live in
-`src/mcp/tools/run-actions.ts`, and `dependency_waits_wake` in
-`src/mcp/tools/dependency-waits.ts`.
+`src/mcp/tools/run-actions.ts`, `dependency_waits_wake` in
+`src/mcp/tools/dependency-waits.ts`, and the phase-agent order tools in
+`src/mcp/tools/phase-agents.ts` (their pure permutation rules in
+`src/mcp/agent-order.ts`). A `preview` may return a `detail`, which the framework
+records on the row when the call settles, and `apply` is handed the preview it
+was authorized by, so it writes exactly what the row records.

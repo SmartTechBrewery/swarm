@@ -45,6 +45,13 @@ export const operatorActions = pgTable(
 		outcome: text('outcome').notNull(),
 		/** The refusal or failure text, as the tool reported it; `null` on success. */
 		error: text('error'),
+		/**
+		 * What the tool recorded about the change it previewed, written when the call
+		 * settles (issue #1349) — e.g. `phase_agents_reorder`'s `{ previous, next }`
+		 * target order, which `phase_agents_restore` reads back. `null` for a tool that
+		 * records nothing, or a call that ended before its preview resolved.
+		 */
+		detail: jsonb('detail'),
 		startedAt: timestamp('started_at').defaultNow().notNull(),
 		completedAt: timestamp('completed_at'),
 	},

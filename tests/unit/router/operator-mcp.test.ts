@@ -59,9 +59,10 @@ vi.mock('@/db/repositories/reviewVerdictsRepository.js', async () => ({
 	)),
 	listActiveReviewSlotsForPullRequest,
 }));
-const { findProjectRecordByIdFromDb, getProjectByIdFromDb } = vi.hoisted(() => ({
+const { findProjectRecordByIdFromDb, getProjectByIdFromDb, upsertProjectToDb } = vi.hoisted(() => ({
 	findProjectRecordByIdFromDb: vi.fn(),
 	getProjectByIdFromDb: vi.fn(),
+	upsertProjectToDb: vi.fn(),
 }));
 vi.mock('@/db/repositories/projectsRepository.js', async () => ({
 	...(await vi.importActual<typeof import('@/db/repositories/projectsRepository.js')>(
@@ -69,6 +70,7 @@ vi.mock('@/db/repositories/projectsRepository.js', async () => ({
 	)),
 	findProjectRecordByIdFromDb,
 	getProjectByIdFromDb,
+	upsertProjectToDb,
 }));
 // The consistency check behind `consistency_check` (issue #1344) has its own suite;
 // here it is only the seam the procedure hands the project and its board to.
@@ -126,13 +128,15 @@ vi.mock('@/db/repositories/dispatchesRepository.js', async () => ({
 // The write tools (issue #1346): the audit trail they record into, and the
 // side-effecting seams behind `runs.reset` / `runs.retryNow`, whose own suites
 // cover them — here only *whether* each is reached and as whom.
-const { recordOperatorAction, settleOperatorAction } = vi.hoisted(() => ({
+const { recordOperatorAction, settleOperatorAction, findLatestOperatorAction } = vi.hoisted(() => ({
 	recordOperatorAction: vi.fn(),
 	settleOperatorAction: vi.fn(),
+	findLatestOperatorAction: vi.fn(),
 }));
 vi.mock('@/db/repositories/operatorActionsRepository.js', () => ({
 	recordOperatorAction,
 	settleOperatorAction,
+	findLatestOperatorAction,
 }));
 const { resetRun } = vi.hoisted(() => ({ resetRun: vi.fn() }));
 vi.mock('@/dispatch/run-reset.js', async () => ({
@@ -350,8 +354,10 @@ beforeEach(() => {
 	countMergedPullRequestsByRepository.mockReset().mockResolvedValue({});
 	listActiveReviewSlotsForPullRequest.mockReset().mockResolvedValue([]);
 	findProjectRecordByIdFromDb.mockReset().mockResolvedValue(undefined);
+	upsertProjectToDb.mockReset().mockResolvedValue(undefined);
 	recordOperatorAction.mockReset().mockResolvedValue('audit-1');
 	settleOperatorAction.mockReset().mockResolvedValue(undefined);
+	findLatestOperatorAction.mockReset().mockResolvedValue(undefined);
 	resetRun.mockReset();
 	reopenDispatchForManualRetry.mockReset();
 	listDependencyWaits.mockReset().mockResolvedValue([]);
@@ -430,7 +436,13 @@ describe('operator MCP — the handshake', () => {
 			};
 		};
 		const tools = listBody.result.tools;
-		const WRITE_TOOLS = ['dependency_waits_wake', 'dispatch_redispatch_now', 'run_reset'];
+		const WRITE_TOOLS = [
+			'dependency_waits_wake',
+			'dispatch_redispatch_now',
+			'phase_agents_reorder',
+			'phase_agents_restore',
+			'run_reset',
+		];
 
 		expect(tools.map((tool) => tool.name).sort()).toEqual([
 			'cli_rate_limits',
@@ -440,6 +452,8 @@ describe('operator MCP — the handshake', () => {
 			'dispatch_history',
 			'dispatch_redispatch_now',
 			'phase_agents_get',
+			'phase_agents_reorder',
+			'phase_agents_restore',
 			'pipeline_snapshot',
 			'pipeline_stats',
 			'pr_status',
@@ -1538,5 +1552,289 @@ describe('operator MCP — dependency_waits_wake', () => {
 			projectId: null,
 			outcome: 'refused',
 		});
+	});
+});
+
+describe('operator MCP — phase_agents_reorder and phase_agents_restore', () => {
+	const CODEX = { cli: 'codex' as const, model: 'gpt-5.6-sol', reasoning: 'high' as const };
+	const CLAUDE = { cli: 'claude' as const, model: 'opus' };
+	const OTHER_PHASES = {
+		defaults: { claude: 'sonnet' },
+		// As stored: normalised, with the `targets[0]` mirror.
+		review: { targets: [CLAUDE], cli: 'claude' as const, model: 'opus', timeoutMs: 20 * 60 * 1000 },
+	};
+
+	/** The stored project, re-read on every call so a test can save and read back. */
+	let stored: ReturnType<typeof createMockProjectRecord>;
+
+	function storeTargets(targets: Array<typeof CODEX | typeof CLAUDE>) {
+		stored = createMockProjectRecord({
+			id: 'proj-a',
+			agents: {
+				...OTHER_PHASES,
+				resolveConflicts: { targets, prompt: 'Keep both sides.' },
+			},
+		});
+	}
+
+	beforeEach(() => {
+		storeTargets([CODEX, CLAUDE]);
+		findProjectRecordByIdFromDb.mockImplementation(async (id: string) =>
+			id === 'proj-a' ? stored : undefined,
+		);
+		upsertProjectToDb.mockImplementation(async (config: typeof stored) => {
+			stored = config;
+		});
+	});
+
+	function savedPhase() {
+		expect(upsertProjectToDb).toHaveBeenCalledTimes(1);
+		return upsertProjectToDb.mock.calls[0]?.[0].agents;
+	}
+
+	function lastSettle() {
+		return settleOperatorAction.mock.calls.at(-1)?.[1];
+	}
+
+	it('lets a project admin put claude first, persisting only the permuted targets', async () => {
+		const result = await callTool(
+			'phase_agents_reorder',
+			{
+				projectId: 'proj-a',
+				phase: 'resolveConflicts',
+				order: ['claude', 'codex/gpt-5.6-sol'],
+				reason: 'codex is rate-limited until tomorrow',
+			},
+			'admin-token',
+		);
+
+		expect(result.isError).toBeUndefined();
+		expect(result.structuredContent).toEqual({
+			dryRun: false,
+			auditId: 'audit-1',
+			result: {
+				projectId: 'proj-a',
+				phase: 'resolveConflicts',
+				before: ['codex/gpt-5.6-sol', 'claude/opus'],
+				after: ['claude/opus', 'codex/gpt-5.6-sol'],
+			},
+		});
+		// The phase's targets permuted, its mirror following `targets[0]`, its prompt and
+		// every other phase untouched.
+		expect(savedPhase()).toEqual({
+			...OTHER_PHASES,
+			resolveConflicts: {
+				targets: [CLAUDE, CODEX],
+				cli: 'claude',
+				model: 'opus',
+				prompt: 'Keep both sides.',
+			},
+		});
+		expect(recordOperatorAction).toHaveBeenCalledWith(
+			expect.objectContaining({
+				tool: 'phase_agents_reorder',
+				target: 'proj-a/resolveConflicts',
+				dryRun: false,
+			}),
+		);
+		expect(lastSettle()).toEqual({
+			outcome: 'succeeded',
+			error: null,
+			projectId: 'proj-a',
+			detail: { previous: [CODEX, CLAUDE], next: [CLAUDE, CODEX] },
+		});
+	});
+
+	it('answers a dry run with the order before and after, saving nothing', async () => {
+		const result = await callTool(
+			'phase_agents_reorder',
+			{
+				projectId: 'proj-a',
+				phase: 'resolveConflicts',
+				order: ['claude', 'codex'],
+				reason: 'checking',
+				dryRun: true,
+			},
+			'admin-token',
+		);
+
+		expect(result.structuredContent).toEqual({
+			dryRun: true,
+			auditId: 'audit-1',
+			preview: {
+				projectId: 'proj-a',
+				phase: 'resolveConflicts',
+				before: ['codex/gpt-5.6-sol', 'claude/opus'],
+				after: ['claude/opus', 'codex/gpt-5.6-sol'],
+			},
+		});
+		expect(upsertProjectToDb).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		['driver-token', /^FORBIDDEN: /],
+		['member-token', /^FORBIDDEN: /],
+		['stranger-token', /^NOT_FOUND: /],
+	])('refuses %s — it is projectAdmin-only — reading and saving nothing', async (token, error) => {
+		const result = await callTool(
+			'phase_agents_reorder',
+			{
+				projectId: 'proj-a',
+				phase: 'resolveConflicts',
+				order: ['claude', 'codex'],
+				reason: 'trying',
+			},
+			token,
+		);
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toMatch(error);
+		expect(findProjectRecordByIdFromDb).not.toHaveBeenCalled();
+		expect(upsertProjectToDb).not.toHaveBeenCalled();
+		expect(lastSettle()).toMatchObject({ outcome: 'refused', projectId: null });
+	});
+
+	it('refuses an order that is not a permutation of the current targets', async () => {
+		const result = await callTool(
+			'phase_agents_reorder',
+			{
+				projectId: 'proj-a',
+				phase: 'resolveConflicts',
+				order: ['claude', 'antigravity'],
+				reason: 'trying',
+			},
+			'admin-token',
+		);
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toMatch(/^BAD_REQUEST: "antigravity" names none/);
+		expect(upsertProjectToDb).not.toHaveBeenCalled();
+		expect(lastSettle()).toMatchObject({ outcome: 'refused', projectId: null });
+	});
+
+	it('refuses a phase that has no targets configured', async () => {
+		const result = await callTool(
+			'phase_agents_reorder',
+			{ projectId: 'proj-a', phase: 'planning', order: ['claude'], reason: 'trying' },
+			'admin-token',
+		);
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toMatch(/^PRECONDITION_FAILED: .*no configured targets/);
+		expect(upsertProjectToDb).not.toHaveBeenCalled();
+	});
+
+	it('restores the order the latest real reorder replaced — a round trip', async () => {
+		await callTool(
+			'phase_agents_reorder',
+			{
+				projectId: 'proj-a',
+				phase: 'resolveConflicts',
+				order: ['claude', 'codex'],
+				reason: 'codex is rate-limited',
+			},
+			'admin-token',
+		);
+		const recorded = lastSettle()?.detail;
+		findLatestOperatorAction.mockResolvedValue({
+			id: 'audit-reorder',
+			detail: recorded,
+			startedAt: new Date('2026-11-06T10:00:00Z'),
+		});
+		upsertProjectToDb.mockClear();
+
+		const result = await callTool(
+			'phase_agents_restore',
+			{ projectId: 'proj-a', phase: 'resolveConflicts', reason: 'codex has reset' },
+			'admin-token',
+		);
+
+		expect(result.isError).toBeUndefined();
+		expect(findLatestOperatorAction).toHaveBeenCalledExactlyOnceWith({
+			tool: 'phase_agents_reorder',
+			projectId: 'proj-a',
+			target: 'proj-a/resolveConflicts',
+		});
+		expect(result.structuredContent?.result).toEqual({
+			projectId: 'proj-a',
+			phase: 'resolveConflicts',
+			before: ['claude/opus', 'codex/gpt-5.6-sol'],
+			after: ['codex/gpt-5.6-sol', 'claude/opus'],
+		});
+		expect(savedPhase().resolveConflicts).toEqual({
+			targets: [CODEX, CLAUDE],
+			cli: 'codex',
+			model: 'gpt-5.6-sol',
+			reasoning: 'high',
+			prompt: 'Keep both sides.',
+		});
+	});
+
+	it('names the reorder it would restore on a dry run, saving nothing', async () => {
+		storeTargets([CLAUDE, CODEX]);
+		findLatestOperatorAction.mockResolvedValue({
+			id: 'audit-reorder',
+			detail: { previous: [CODEX, CLAUDE], next: [CLAUDE, CODEX] },
+			startedAt: new Date('2026-11-06T10:00:00Z'),
+		});
+
+		const result = await callTool(
+			'phase_agents_restore',
+			{ projectId: 'proj-a', phase: 'resolveConflicts', reason: 'checking', dryRun: true },
+			'admin-token',
+		);
+
+		expect(result.structuredContent?.preview).toEqual({
+			projectId: 'proj-a',
+			phase: 'resolveConflicts',
+			restoring: { auditId: 'audit-reorder', reorderedAt: '2026-11-06T10:00:00.000Z' },
+			before: ['claude/opus', 'codex/gpt-5.6-sol'],
+			after: ['codex/gpt-5.6-sol', 'claude/opus'],
+		});
+		expect(upsertProjectToDb).not.toHaveBeenCalled();
+	});
+
+	it('refuses to restore once the targets were edited by hand since the reorder', async () => {
+		storeTargets([CLAUDE, { ...CODEX, model: 'gpt-5.6-terra' }]);
+		findLatestOperatorAction.mockResolvedValue({
+			id: 'audit-reorder',
+			detail: { previous: [CODEX, CLAUDE], next: [CLAUDE, CODEX] },
+			startedAt: new Date('2026-11-06T10:00:00Z'),
+		});
+
+		const result = await callTool(
+			'phase_agents_restore',
+			{ projectId: 'proj-a', phase: 'resolveConflicts', reason: 'codex has reset' },
+			'admin-token',
+		);
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toMatch(/^PRECONDITION_FAILED: .*no longer a permutation/);
+		expect(upsertProjectToDb).not.toHaveBeenCalled();
+		expect(lastSettle()).toMatchObject({ outcome: 'refused', projectId: null });
+	});
+
+	it('refuses to restore when the phase was never reordered', async () => {
+		const result = await callTool(
+			'phase_agents_restore',
+			{ projectId: 'proj-a', phase: 'resolveConflicts', reason: 'codex has reset' },
+			'admin-token',
+		);
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toMatch(/^PRECONDITION_FAILED: .*no successful/);
+		expect(upsertProjectToDb).not.toHaveBeenCalled();
+	});
+
+	it('refuses a non-admin restore before reading the audit trail', async () => {
+		const result = await callTool(
+			'phase_agents_restore',
+			{ projectId: 'proj-a', phase: 'resolveConflicts', reason: 'trying' },
+			'driver-token',
+		);
+
+		expect(result.content[0]?.text).toMatch(/^FORBIDDEN: /);
+		expect(findLatestOperatorAction).not.toHaveBeenCalled();
+		expect(upsertProjectToDb).not.toHaveBeenCalled();
 	});
 });
