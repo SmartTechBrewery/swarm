@@ -14,6 +14,7 @@ import type { Hono } from 'hono';
 
 import { registerInstallScript } from './install-script.js';
 import { registerOperatorApi } from './operator-api.js';
+import { registerOperatorMcp } from './operator-mcp.js';
 import { registerOperatorSession } from './operator-session.js';
 import { createWebhookApp } from './webhook-receiver.js';
 import { registerWorkerDelivery } from './worker-delivery.js';
@@ -55,5 +56,8 @@ export function createRouterApp(): RouterApp {
 	// operations at `/operator/trpc/*`, a strict subset of the dashboard's router —
 	// the `workers` namespace alone, since this process is the internet-exposed one.
 	registerOperatorApi(app);
+	// …and the operator MCP server the same token buys (issue #1338): MCP tools at
+	// `/operator/mcp` that call the dashboard's own procedures as that user.
+	registerOperatorMcp(app);
 	return { app, injectWebSocket };
 }

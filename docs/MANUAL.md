@@ -2105,6 +2105,12 @@ browser. They are the run-diagnosis path on a host with no shell (see
 [Running on a VPS behind Caddy](#running-on-a-vps-behind-caddy)); `--json` makes
 any of them scriptable. Details: [`docs/cli.md`](./cli.md#swarm-run).
 
+The same session also connects an **MCP client** — Claude Code, for one — to the
+control plane: the router serves an MCP server at `/operator/mcp` whose tools call
+the dashboard's own procedures as you, so an assistant session can read runs,
+their failure causes and their agent output with exactly your dashboard access.
+How to connect one, and the tool catalogue: [`docs/mcp.md`](./mcp.md).
+
 ## Configuration
 
 Configuration has three layers:
@@ -2133,6 +2139,8 @@ The complete option catalogue, defaults, and source-of-truth schemas are in
   operator CLI command and `npm run` script, with descriptions
 - [`docs/operations.md`](./operations.md) — setup, run modes, ports,
   health checks, operator CLI, migrations, queues, worktrees, and webhooks
+- [`docs/mcp.md`](./mcp.md) — the operator MCP server at `/operator/mcp`:
+  connecting an MCP client to a hosted control plane, and its tools
 - [`docs/configuration.md`](./configuration.md) — complete environment,
   project, and global-settings reference
 - [`docs/pipeline.md`](./pipeline.md) — phases, triggers, security, and
