@@ -75,11 +75,14 @@ import {
 	cancelDispatchAndWake,
 	createAndPublishDispatch,
 	publishDispatchWakeUp,
+	scheduleCoalescedDispatch,
 } from '../../dispatch/dispatcher.js';
 import {
 	ForceReReviewError,
 	type ForceReReviewRefusal,
+	type ForceReReviewVerdict,
 	forceReReview,
+	previewForceReReview,
 } from '../../dispatch/force-re-review.js';
 import {
 	ITEM_ACTIVITY_LOOKBACK_MS,
@@ -125,6 +128,7 @@ import {
 	normalizeStoredJobPayload,
 	type RecoveryMode,
 	repositoryForJob,
+	type ScmWebhookJob,
 	type SwarmJob,
 	SwarmJobSchema,
 } from '../../queue/jobs.js';
@@ -137,7 +141,11 @@ import {
 	toQueuedRuns,
 } from '../../queue/queued-runs.js';
 import { toWipUsage, type WipUsageEntry } from '../../queue/wip-usage.js';
-import type { SCMProvider } from '../../scm/types.js';
+import type { PullRequestDetails, SCMProvider } from '../../scm/types.js';
+import {
+	buildConflictCheckJob,
+	conflictCheckCoalesceKey,
+} from '../../triggers/handlers/resolve-conflicts.js';
 import type { TriggerPhase } from '../../triggers/types.js';
 import { GitWorktreeManager } from '../../worker/git-worktree-manager.js';
 import { reconcileTerminatedWorktree } from '../../worktree/termination-cleanup.js';
@@ -1060,6 +1068,198 @@ async function previewRunAction(
 	return { ...base, ...verdict };
 }
 
+/**
+ * What `runs.forceReReview` would do for one run, without doing it (issue #1348) —
+ * the dry run of the operator MCP server's `pr_force_re_review` tool. The review-cap
+ * state is `runs.getById`'s own three cap fields, read from the same ledger read;
+ * the rest is the force service's own guard sequence run without its writes
+ * ({@link previewForceReReview}), so `wouldRefuse` is the real call's refusal in its
+ * own code and wording.
+ */
+export interface ForceReReviewPreview
+	extends Omit<ForceReReviewVerdict, 'refusal'>,
+		Pick<RunActionVerdict, 'wouldRefuse' | 'intendedChanges'> {
+	run: {
+		id: string;
+		projectId: string;
+		phase: string;
+		status: string;
+		repository: string | null;
+		prNumber: string | null;
+		reviewVerdict: string | null;
+	};
+	/** As on `runs.getById`: which bound stopped this run's pull request, or `null`. */
+	reviewCapStop: ReviewCapBound | null;
+	/** As on `runs.getById`: whether this run's verdict spent the allowance. */
+	reviewCapSpent: boolean | null;
+	/** As on `runs.getById`: whether an operator's grant is recorded and unspent. */
+	reviewCapOverrideOutstanding: boolean | null;
+}
+
+/** The changes a forced continuation makes, in the order the service makes them. */
+function forceReReviewChanges(verdict: ForceReReviewVerdict): string[] {
+	const pr = verdict.prNumber ? `PR #${verdict.prNumber}` : 'the pull request';
+	const grant = `Grant ${pr} one review past the review cap (a grant already recorded is reused).`;
+	const dispatch =
+		verdict.continuation === 'respond-to-review'
+			? `Dispatch Respond-to-review answering the capped review of ${verdict.reviewedHeadSha}; the Review that follows it spends the grant.`
+			: `Dispatch one Review of ${pr}'s current head ${verdict.currentHeadSha}, which spends the grant.`;
+	return [
+		grant,
+		`${dispatch} A forced dispatch already live for the same head is reported, not duplicated.`,
+	];
+}
+
+async function previewForceReReviewForRun(run: RunRow): Promise<ForceReReviewPreview> {
+	const slots = await readReviewCapSlots(run);
+	const base = {
+		run: {
+			id: run.id,
+			projectId: run.projectId,
+			phase: run.phase,
+			status: run.status,
+			repository: run.repository,
+			prNumber: run.prNumber,
+			reviewVerdict: run.reviewVerdict,
+		},
+		reviewCapStop: resolveReviewCapStop(run, slots),
+		reviewCapSpent: resolveReviewCapSpent(run, slots),
+		reviewCapOverrideOutstanding: resolveReviewCapOverrideOutstanding(run, slots),
+	};
+	const notPipeline = refusalOf(() => requirePipelineRun(run, run.id));
+	if (notPipeline) {
+		return {
+			...base,
+			continuation: null,
+			prNumber: run.prNumber,
+			reviewedHeadSha: null,
+			currentHeadSha: null,
+			pullRequestState: null,
+			headMoved: null,
+			wouldRefuse: notPipeline,
+			intendedChanges: [],
+		};
+	}
+	let verdict: ForceReReviewVerdict;
+	try {
+		verdict = await previewForceReReview(run.id);
+	} catch (error) {
+		throw new TRPCError({
+			code: 'INTERNAL_SERVER_ERROR',
+			message: `Failed to preview a forced re-review for run "${run.id}": ${describeError(error)}`,
+		});
+	}
+	const { refusal, ...facts } = verdict;
+	return {
+		...base,
+		...facts,
+		wouldRefuse: refusal
+			? { code: FORCE_RE_REVIEW_REFUSAL_CODES[refusal.reason], message: refusal.message }
+			: null,
+		intendedChanges: refusal ? [] : forceReReviewChanges(verdict),
+	};
+}
+
+/**
+ * The conflict check `runs.recheckMergeability` schedules, and the pull request's
+ * live state it is decided from (issue #1348) — also the dry run of the operator MCP
+ * server's `pr_recheck_mergeability` tool.
+ */
+export interface MergeabilityRecheckPlan {
+	projectId: string;
+	repository: string;
+	prNumber: number;
+	/** The pull request as its provider reports it now; `mergeable` is `null` while it computes. */
+	pullRequest: Pick<
+		PullRequestDetails,
+		'state' | 'headSha' | 'headBranch' | 'baseBranch' | 'mergeable'
+	>;
+	/** The base the check is keyed on: the pull request's own. */
+	baseBranch: string;
+	/** The coalesce key a pending check for this pull request and base is superseded under. */
+	coalesceKey: string;
+	/** The per-PR conflict-check job, exactly as the resolve-conflicts fan-out schedules it. */
+	job: ScmWebhookJob;
+	wouldRefuse: { code: TRPCError['code']; message: string } | null;
+	intendedChanges: string[];
+}
+
+/** What `runs.recheckMergeability` returns once the check is scheduled. */
+export interface MergeabilityRecheckResult {
+	projectId: string;
+	repository: string;
+	prNumber: number;
+	baseBranch: string;
+	coalesceKey: string;
+	scheduled: true;
+}
+
+/**
+ * Resolve the project scoped to `repository` and read the pull request from the
+ * project's own provider. A repository the project does not own reads as not found;
+ * a provider read that fails is an internal failure, since nothing can be keyed on a
+ * base it never learnt.
+ */
+async function planMergeabilityRecheck(
+	input: MergeabilityRecheckInput,
+): Promise<MergeabilityRecheckPlan> {
+	const record = await findProjectRecordByIdFromDb(input.projectId);
+	if (!record || !findProjectRepository(record, input.repository)) {
+		throw new TRPCError({
+			code: 'NOT_FOUND',
+			message: `Project "${input.projectId}" has no repository "${input.repository}".`,
+		});
+	}
+	const project = scopeProjectToRepository(record, input.repository);
+	const provider = requireProjectSCMProvider(project);
+	let details: PullRequestDetails;
+	try {
+		details = await provider.getPullRequest(project, input.prNumber);
+	} catch (error) {
+		throw new TRPCError({
+			code: 'INTERNAL_SERVER_ERROR',
+			message: `Could not read pull request #${input.prNumber} in ${input.repository} from its provider: ${describeError(error)}`,
+		});
+	}
+	const prNumber = String(input.prNumber);
+	const coalesceKey = conflictCheckCoalesceKey(project.repo, prNumber, details.baseBranch);
+	const wouldRefuse =
+		details.state === 'open'
+			? null
+			: {
+					code: 'PRECONDITION_FAILED' as const,
+					message: `Pull request #${input.prNumber} in ${input.repository} is closed, so there is no conflict to check.`,
+				};
+	return {
+		projectId: project.id,
+		repository: project.repo,
+		prNumber: input.prNumber,
+		pullRequest: {
+			state: details.state,
+			headSha: details.headSha,
+			headBranch: details.headBranch,
+			baseBranch: details.baseBranch,
+			mergeable: details.mergeable,
+		},
+		baseBranch: details.baseBranch,
+		coalesceKey,
+		job: buildConflictCheckJob({
+			providerId: provider.type,
+			projectId: project.id,
+			repo: project.repo,
+			prNumber,
+			baseBranch: details.baseBranch,
+		}),
+		wouldRefuse,
+		intendedChanges: wouldRefuse
+			? []
+			: [
+					`Supersede any conflict check still pending for #${input.prNumber} against ${details.baseBranch} (coalesce key ${coalesceKey}).`,
+					`Schedule one conflict check for #${input.prNumber} against ${details.baseBranch}, due now — the check a merged sibling's fan-out schedules; it dispatches Resolve-conflicts when the pull request genuinely conflicts.`,
+				],
+	};
+}
+
 async function resolveRunAttribution(run: {
 	workerId: string | null;
 	workerUserId: string | null;
@@ -1553,6 +1753,13 @@ export const PullRequestStatusInputSchema = z.object({
 	repository: z.string().min(1),
 	prNumber: z.number().int().positive(),
 });
+
+/**
+ * `runs.recheckMergeability`'s input — one pull request of one project, exactly as
+ * `runs.prStatus` names it.
+ */
+export const MergeabilityRecheckInputSchema = PullRequestStatusInputSchema;
+export type MergeabilityRecheckInput = z.infer<typeof MergeabilityRecheckInputSchema>;
 
 /** `runs.consistencyCheck`'s input: one project, and how far back to look (issue #1344). */
 export const ConsistencyCheckInputSchema = z.object({
@@ -2665,6 +2872,77 @@ export const runsRouter = router({
 					message: `Failed to force a re-review for run "${input.runId}": ${describeError(error)}`,
 				});
 			}
+		}),
+
+	// What `forceReReview` would do for one run, without doing it (issue #1348) — the
+	// dry run of the operator MCP server's `pr_force_re_review` tool
+	// (`src/mcp/tools/pr-actions.ts`): the run's review-cap state, whether the pull
+	// request's head moved past the reviewed one, and the service's own refusal.
+	//
+	// Read-only (its one provider read included), but gated exactly as the mutation
+	// it describes — `member`, with the same existence-hiding `NOT_FOUND` — like
+	// `previewAction`. Deliberately not in `runReadProcedures`.
+	previewForceReReview: authedProcedure
+		.input(z.object({ runId: z.string().min(1) }))
+		.query(async ({ ctx, input }): Promise<ForceReReviewPreview> => {
+			const run = await getRunByIdFromDb(input.runId);
+			if (!run) {
+				throw new TRPCError({
+					code: 'NOT_FOUND',
+					message: `Run with ID "${input.runId}" not found`,
+				});
+			}
+			await assertProjectAccess(
+				ctx.user,
+				run.projectId,
+				'member',
+				`Run with ID "${input.runId}" not found`,
+			);
+			return previewForceReReviewForRun(run);
+		}),
+
+	// Schedule the per-PR conflict check a merged sibling's resolve-conflicts fan-out
+	// would have (issue #1348) — the operator MCP server's `pr_recheck_mergeability`
+	// tool, for a pull request the fan-out skipped. The job is the fan-out's own
+	// (`buildConflictCheckJob`), under its coalesce key and through the producer merge
+	// automation's hand-off uses (`scheduleCoalescedDispatch`), so a pending check for
+	// the same pull request and base is superseded rather than queued beside, and the
+	// per-PR path decides — with all of its own gates — whether Resolve-conflicts runs.
+	// The fan-out itself is unchanged.
+	//
+	// `member`, this router's gate for every mutation. A closed pull request is
+	// refused; its base comes from the provider's read of the pull request.
+	recheckMergeability: authedProcedure
+		.input(MergeabilityRecheckInputSchema)
+		.mutation(async ({ ctx, input }): Promise<MergeabilityRecheckResult> => {
+			await assertProjectAccess(ctx.user, input.projectId, 'member');
+			const plan = await planMergeabilityRecheck(input);
+			if (plan.wouldRefuse) throw new TRPCError(plan.wouldRefuse);
+			await scheduleCoalescedDispatch(plan.job, plan.coalesceKey, 0, null);
+			logger.info('runs.recheckMergeability: scheduled a conflict check', {
+				projectId: plan.projectId,
+				repository: plan.repository,
+				prNumber: plan.prNumber,
+				baseBranch: plan.baseBranch,
+				userId: ctx.user.id,
+			});
+			return {
+				projectId: plan.projectId,
+				repository: plan.repository,
+				prNumber: plan.prNumber,
+				baseBranch: plan.baseBranch,
+				coalesceKey: plan.coalesceKey,
+				scheduled: true,
+			};
+		}),
+
+	// The dry run of `recheckMergeability`: the job it would schedule and the pull
+	// request's live mergeability, gated exactly as the mutation is.
+	previewMergeabilityRecheck: authedProcedure
+		.input(MergeabilityRecheckInputSchema)
+		.query(async ({ ctx, input }): Promise<MergeabilityRecheckPlan> => {
+			await assertProjectAccess(ctx.user, input.projectId, 'member');
+			return planMergeabilityRecheck(input);
 		}),
 
 	// Put back action for queued work items (issues #251, #284).

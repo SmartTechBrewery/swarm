@@ -112,10 +112,12 @@ import {
 	type RunRow,
 } from '../db/repositories/runsRepository.js';
 import { requireProjectSCMProvider } from '../integrations/scm/registry.js';
+import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { normalizeStoredJobPayload, type SwarmJob } from '../queue/jobs.js';
 import { deliveryIdentity } from '../scm/delivery.js';
 import type { ScmEvent } from '../scm/events.js';
+import type { PullRequestDetails } from '../scm/types.js';
 import { isDeadDispatch } from './dead-dispatch.js';
 import { createAndPublishDispatch, deliveryDedupKey } from './dispatcher.js';
 
@@ -385,14 +387,20 @@ function classifyForcedContinuation(
 }
 
 /**
- * Continue the corrective cycle for one capped `request-changes` Review run —
- * issue #511's original sequence, unchanged in guard order, messages, dedup key
- * and result.
+ * Every guard of {@link continueCorrectiveCycle}, in its order, with no write — so
+ * {@link previewForceReReview} refuses with exactly the real call's reason and
+ * wording (issue #1348).
  */
-async function continueCorrectiveCycle(
+async function checkCorrectiveCycle(
 	run: PipelineRunRow,
 	project: ProjectConfig,
-): Promise<ForceReReviewResult> {
+): Promise<{
+	prNumber: string;
+	headSha: string;
+	prBranch: string;
+	reviewId: string;
+	reviewOrdinal: number;
+}> {
 	const runId = run.id;
 	if (project.pipeline?.respondToReview?.enabled === false) {
 		throw new ForceReReviewError(
@@ -423,6 +431,23 @@ async function continueCorrectiveCycle(
 			`Run "${runId}" reports a capped review, but its ledger slot (ordinal ${slot.ordinal}) is not at the cap — refresh to see the PR's current review state.`,
 		);
 	}
+	return { prNumber, headSha, prBranch, reviewId: slot.reviewId, reviewOrdinal: slot.ordinal };
+}
+
+/**
+ * Continue the corrective cycle for one capped `request-changes` Review run —
+ * issue #511's original sequence, unchanged in guard order, messages, dedup key
+ * and result.
+ */
+async function continueCorrectiveCycle(
+	run: PipelineRunRow,
+	project: ProjectConfig,
+): Promise<ForceReReviewResult> {
+	const { prNumber, headSha, prBranch, reviewId, reviewOrdinal } = await checkCorrectiveCycle(
+		run,
+		project,
+	);
+	const runId = run.id;
 
 	const capOverride = await grantReviewCapOverride({
 		projectId: project.id,
@@ -445,7 +470,7 @@ async function continueCorrectiveCycle(
 		workItemId: prNumber,
 		isCommentEvent: false,
 		reviewState: 'changes-requested',
-		reviewId: slot.reviewId,
+		reviewId,
 		headSha,
 		prBranch,
 	};
@@ -464,7 +489,7 @@ async function continueCorrectiveCycle(
 		projectId: project.id,
 		prNumber,
 		headSha,
-		reviewOrdinal: slot.ordinal,
+		reviewOrdinal,
 		capOverride,
 		dispatchId: published.dispatch.id,
 		created: published.created,
@@ -482,36 +507,27 @@ async function continueCorrectiveCycle(
 	};
 }
 
+/** The one provider read {@link checkSupersededHead} makes, injectable so a preview can see it. */
+type PullRequestReader = (project: ProjectConfig, prNumber: string) => Promise<PullRequestDetails>;
+
+const readPullRequestFromProvider: PullRequestReader = (project, prNumber) =>
+	requireProjectSCMProvider(project).getPullRequest(project, Number(prNumber));
+
 /**
- * Force one Review of the pull request's current head for a cap-spent approval
- * merge automation refused (issue #1040).
- *
- * Same shape as the branch above and the same invariant — every guard, including
- * the provider read, runs before the grant — but a different continuation: the
- * approval answered a commit a later push superseded, so what is missing is a
- * verdict on the head that is actually there, not a response to a request that
- * was never made.
- *
- * The grant is recorded on the *approving* slot, which is legitimate because
- * `reserveReviewVerdict` looks for any unconsumed grant among the pull request's
- * active slots — so it licenses the review of the new head without the ledger
- * needing a concept of "granted for head X".
- *
- * **Both bounds, and a pull request this no longer has to rescue (issue #1079).**
- * `hasSubmittedEveryPermittedVerdict` now answers for the superseded bound too,
- * so an approval stopped by `REVIEW_SUPERSEDED_CAP` is just as forceable as one
- * stopped by `REVIEW_VERDICT_CAP` — this action needed no change to cover it.
- * The common case moves the other way: merge automation stamps a head-moved
- * refusal superseded, which frees that slot's allowance, so the predicate
- * answers `false` and this refuses with `not-capped`. That refusal is the
- * correct answer — automation has the pull request, and the operator is told so
- * rather than being handed a button that would spend a grant on work already
- * scheduled.
+ * Every guard of {@link forceReviewOfSupersededHead}, in its order, with no write —
+ * shared with {@link previewForceReReview} (issue #1348) so a dry run refuses with
+ * the real call's reason and wording, the provider read included.
  */
-async function forceReviewOfSupersededHead(
+async function checkSupersededHead(
 	run: PipelineRunRow,
 	project: ProjectConfig,
-): Promise<ForceReReviewResult> {
+	readPullRequest: PullRequestReader,
+): Promise<{
+	prNumber: string;
+	headSha: string;
+	reviewOrdinal: number;
+	details: PullRequestDetails;
+}> {
 	const runId = run.id;
 	// This continuation *is* a Review, so it is `review` that gates it — the
 	// `respondToReview` switch the other branch reads has no say here.
@@ -563,10 +579,7 @@ async function forceReviewOfSupersededHead(
 	// The one provider read: the current head is in no row SWARM holds, and it is
 	// what both remaining refusals are decided against. A read that throws is an
 	// internal failure, not a refusal the operator is asked to resolve.
-	const details = await requireProjectSCMProvider(project).getPullRequest(
-		project,
-		Number(prNumber),
-	);
+	const details = await readPullRequest(project, prNumber);
 	if (details.state !== 'open') {
 		throw new ForceReReviewError(
 			'pull-request-closed',
@@ -579,6 +592,45 @@ async function forceReviewOfSupersededHead(
 			`Cannot force a review for run "${runId}" — PR #${prNumber} is still at ${headSha}, the commit this run approved. Nothing superseded the approval, so the merge was refused for another reason; see this run's merge result for the provider's own message.`,
 		);
 	}
+	return { prNumber, headSha, reviewOrdinal: slot.ordinal, details };
+}
+
+/**
+ * Force one Review of the pull request's current head for a cap-spent approval
+ * merge automation refused (issue #1040).
+ *
+ * Same shape as the branch above and the same invariant — every guard, including
+ * the provider read, runs before the grant — but a different continuation: the
+ * approval answered a commit a later push superseded, so what is missing is a
+ * verdict on the head that is actually there, not a response to a request that
+ * was never made.
+ *
+ * The grant is recorded on the *approving* slot, which is legitimate because
+ * `reserveReviewVerdict` looks for any unconsumed grant among the pull request's
+ * active slots — so it licenses the review of the new head without the ledger
+ * needing a concept of "granted for head X".
+ *
+ * **Both bounds, and a pull request this no longer has to rescue (issue #1079).**
+ * `hasSubmittedEveryPermittedVerdict` now answers for the superseded bound too,
+ * so an approval stopped by `REVIEW_SUPERSEDED_CAP` is just as forceable as one
+ * stopped by `REVIEW_VERDICT_CAP` — this action needed no change to cover it.
+ * The common case moves the other way: merge automation stamps a head-moved
+ * refusal superseded, which frees that slot's allowance, so the predicate
+ * answers `false` and this refuses with `not-capped`. That refusal is the
+ * correct answer — automation has the pull request, and the operator is told so
+ * rather than being handed a button that would spend a grant on work already
+ * scheduled.
+ */
+async function forceReviewOfSupersededHead(
+	run: PipelineRunRow,
+	project: ProjectConfig,
+): Promise<ForceReReviewResult> {
+	const runId = run.id;
+	const { prNumber, headSha, reviewOrdinal, details } = await checkSupersededHead(
+		run,
+		project,
+		readPullRequestFromProvider,
+	);
 
 	const capOverride = await grantReviewCapOverride({
 		projectId: project.id,
@@ -623,7 +675,7 @@ async function forceReviewOfSupersededHead(
 		prNumber,
 		reviewedHeadSha: headSha,
 		currentHeadSha: details.headSha,
-		reviewOrdinal: slot.ordinal,
+		reviewOrdinal,
 		capOverride,
 		dispatchId: published.dispatch.id,
 		created: published.created,
@@ -642,13 +694,15 @@ async function forceReviewOfSupersededHead(
 	};
 }
 
-/**
- * Continue past the review cap for one stopped Review run, in whichever of the
- * two ways its shape allows. Throws {@link ForceReReviewError} for every refusal
- * the caller is expected to surface; anything else propagates as an internal
- * failure.
- */
-export async function forceReReview(runId: string): Promise<ForceReReviewResult> {
+/** A run {@link forceReReview} may act on, with the project scoped to its repository. */
+interface ForceTarget {
+	run: PipelineRunRow;
+	project: ProjectConfig;
+	shape: 'request-changes-capped' | 'cap-spent-approval';
+}
+
+/** The run-level guards both continuations share, before either branch's own. */
+async function resolveForceTarget(runId: string): Promise<ForceTarget> {
 	const run = await getRunByIdFromDb(runId);
 	if (!run) {
 		throw new ForceReReviewError('run-not-found', `Run with ID "${runId}" not found`);
@@ -678,7 +732,128 @@ export async function forceReReview(runId: string): Promise<ForceReReviewResult>
 			`Cannot force a re-review for run "${runId}" — its project "${run.projectId}" no longer exists.`,
 		);
 	}
+	return { run, project, shape };
+}
+
+/**
+ * Continue past the review cap for one stopped Review run, in whichever of the
+ * two ways its shape allows. Throws {@link ForceReReviewError} for every refusal
+ * the caller is expected to surface; anything else propagates as an internal
+ * failure.
+ */
+export async function forceReReview(runId: string): Promise<ForceReReviewResult> {
+	const { run, project, shape } = await resolveForceTarget(runId);
 	return shape === 'request-changes-capped'
 		? continueCorrectiveCycle(run, project)
 		: forceReviewOfSupersededHead(run, project);
+}
+
+/**
+ * What {@link forceReReview} would do for one run, without doing it (issue #1348) —
+ * the dry run of the operator MCP server's `pr_force_re_review` tool.
+ */
+export interface ForceReReviewVerdict {
+	/** The continuation the real call would start; `null` when the run admits neither. */
+	continuation: ForceReReviewResult['continuation'] | null;
+	prNumber: string | null;
+	/** The head the run's verdict covered, from its stored payload. */
+	reviewedHeadSha: string | null;
+	/** The pull request's head as its provider reports it now; `null` when it was not read. */
+	currentHeadSha: string | null;
+	pullRequestState: PullRequestDetails['state'] | null;
+	/** Whether a push moved the head past the reviewed one; `null` when either is unknown. */
+	headMoved: boolean | null;
+	/** The refusal the real call would answer with, reason and wording, or `null`. */
+	refusal: { reason: ForceReReviewRefusal; message: string } | null;
+}
+
+/**
+ * Run every guard {@link forceReReview} runs, in its order, and none of its writes.
+ *
+ * The pull request is read from its provider even where the real call would not
+ * (a `request-changes` continuation, or a refusal reached before the read), so the
+ * dry run can say whether the head moved — best-effort there, because the real call
+ * would not fail on it. Where the real call's own guard makes the read, a read that
+ * throws fails the preview exactly as it would fail the call.
+ */
+export async function previewForceReReview(runId: string): Promise<ForceReReviewVerdict> {
+	const observed: { attempted: boolean; details: PullRequestDetails | null } = {
+		attempted: false,
+		details: null,
+	};
+	const observingReader: PullRequestReader = async (project, prNumber) => {
+		observed.attempted = true;
+		observed.details = await readPullRequestFromProvider(project, prNumber);
+		return observed.details;
+	};
+
+	const { target, refusal } = await runForceGuards(runId, observingReader);
+	const coordinates = target ? reviewCoordinatesOrNull(target.run) : null;
+	if (target && coordinates && !observed.attempted) {
+		await readHeadBestEffort(runId, () => observingReader(target.project, coordinates.prNumber));
+	}
+
+	const details = observed.details;
+	return {
+		continuation: target ? CONTINUATION_FOR_SHAPE[target.shape] : null,
+		prNumber: coordinates?.prNumber ?? null,
+		reviewedHeadSha: coordinates?.headSha ?? null,
+		currentHeadSha: details?.headSha ?? null,
+		pullRequestState: details?.state ?? null,
+		headMoved: details && coordinates ? details.headSha !== coordinates.headSha : null,
+		refusal,
+	};
+}
+
+const CONTINUATION_FOR_SHAPE: Record<ForceTarget['shape'], ForceReReviewResult['continuation']> = {
+	'request-changes-capped': 'respond-to-review',
+	'cap-spent-approval': 'review',
+};
+
+/**
+ * {@link forceReReview}'s guards up to its first write, with a refusal captured
+ * rather than thrown. `target` is set once the run-level guards pass.
+ */
+async function runForceGuards(
+	runId: string,
+	readPullRequest: PullRequestReader,
+): Promise<{ target: ForceTarget | null; refusal: ForceReReviewVerdict['refusal'] }> {
+	let target: ForceTarget | null = null;
+	try {
+		target = await resolveForceTarget(runId);
+		if (target.shape === 'request-changes-capped') {
+			await checkCorrectiveCycle(target.run, target.project);
+		} else {
+			await checkSupersededHead(target.run, target.project, readPullRequest);
+		}
+		return { target, refusal: null };
+	} catch (error) {
+		if (!(error instanceof ForceReReviewError)) throw error;
+		return { target, refusal: { reason: error.reason, message: error.message } };
+	}
+}
+
+/** A head read the real call would not make, so its failure only leaves the head unknown. */
+async function readHeadBestEffort(runId: string, read: () => Promise<unknown>): Promise<void> {
+	try {
+		await read();
+	} catch (error) {
+		logger.warn('force re-review preview: could not read the pull request head', {
+			runId,
+			error: describeError(error),
+		});
+	}
+}
+
+/** {@link reviewCoordinates}, or `null` where the stored payload no longer names them. */
+function reviewCoordinatesOrNull(
+	run: PipelineRunRow,
+): { prNumber: string; headSha: string } | null {
+	try {
+		const { prNumber, headSha } = reviewCoordinates(run);
+		return { prNumber, headSha };
+	} catch (error) {
+		if (error instanceof ForceReReviewError) return null;
+		throw error;
+	}
 }

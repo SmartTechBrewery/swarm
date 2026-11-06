@@ -49,7 +49,11 @@ import {
 import { getRunByIdFromDb } from '@/db/repositories/runsRepository.js';
 import type { runs } from '@/db/schema/runs.js';
 import { createAndPublishDispatch } from '@/dispatch/dispatcher.js';
-import { ForceReReviewError, forceReReview } from '@/dispatch/force-re-review.js';
+import {
+	ForceReReviewError,
+	forceReReview,
+	previewForceReReview,
+} from '@/dispatch/force-re-review.js';
 import type { SwarmJob } from '@/queue/jobs.js';
 import {
 	createMockProjectConfig,
@@ -933,5 +937,118 @@ describe('forceReReview (issue #511)', () => {
 				event: { repoFullName: 'SmartTechBrewery/second' },
 			});
 		});
+	});
+});
+
+// Issue #1348 — the dry run of the operator MCP server's `pr_force_re_review`: the
+// same guards, in the same order, and none of the writes.
+describe('previewForceReReview (issue #1348)', () => {
+	const openAt = (headSha: string) => ({
+		number: 508,
+		headBranch: 'issue-508',
+		headSha,
+		baseBranch: 'main',
+		baseSha: 'base',
+		mergeable: true,
+		authorLogin: 'someone',
+		state: 'open' as const,
+	});
+
+	beforeEach(() => {
+		vi.clearAllMocks();
+		vi.mocked(getRunByIdFromDb).mockResolvedValue(makeCapSpentApprovalRun());
+		vi.mocked(getProjectByIdFromDb).mockResolvedValue(PROJECT);
+		vi.mocked(getSubmittedReviewSlot).mockResolvedValue(approvingSlot);
+		vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(spentLedger());
+		getPullRequest.mockResolvedValue(openAt(CURRENT_HEAD_SHA));
+	});
+
+	function expectNothingWritten() {
+		expect(grantReviewCapOverride).not.toHaveBeenCalled();
+		expect(createAndPublishDispatch).not.toHaveBeenCalled();
+	}
+
+	it('reports a forceable approval whose head moved, writing nothing', async () => {
+		await expect(previewForceReReview('run-1')).resolves.toEqual({
+			continuation: 'review',
+			prNumber: '508',
+			reviewedHeadSha: HEAD_SHA,
+			currentHeadSha: CURRENT_HEAD_SHA,
+			pullRequestState: 'open',
+			headMoved: true,
+			refusal: null,
+		});
+		expect(getPullRequest).toHaveBeenCalledTimes(1);
+		expectNothingWritten();
+	});
+
+	it("reports the service's own head-unchanged refusal, verbatim", async () => {
+		getPullRequest.mockResolvedValue(openAt(HEAD_SHA));
+
+		const preview = await previewForceReReview('run-1');
+
+		const real = await forceReReview('run-1').catch((error: unknown) => error);
+		expect(real).toBeInstanceOf(ForceReReviewError);
+		expect(preview).toMatchObject({ headMoved: false, currentHeadSha: HEAD_SHA });
+		expect(preview.refusal).toEqual({
+			reason: 'head-unchanged',
+			message: (real as ForceReReviewError).message,
+		});
+		expect(getPullRequest).toHaveBeenCalledTimes(2);
+		expectNothingWritten();
+	});
+
+	it('still reads the head when a guard before the read refuses', async () => {
+		vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(submittedSlots(1));
+
+		const preview = await previewForceReReview('run-1');
+
+		expect(preview.refusal?.reason).toBe('not-capped');
+		expect(preview).toMatchObject({ headMoved: true, currentHeadSha: CURRENT_HEAD_SHA });
+	});
+
+	it('reports the corrective cycle for a capped request-changes run', async () => {
+		vi.mocked(getRunByIdFromDb).mockResolvedValue(makeCappedReviewRun());
+		vi.mocked(getSubmittedReviewSlot).mockResolvedValue(cappedSlot);
+
+		await expect(previewForceReReview('run-1')).resolves.toMatchObject({
+			continuation: 'respond-to-review',
+			reviewedHeadSha: HEAD_SHA,
+			headMoved: true,
+			refusal: null,
+		});
+		expectNothingWritten();
+	});
+
+	it('leaves the head unknown when a read the real call would not make fails', async () => {
+		vi.mocked(getRunByIdFromDb).mockResolvedValue(makeCappedReviewRun());
+		vi.mocked(getSubmittedReviewSlot).mockResolvedValue(cappedSlot);
+		getPullRequest.mockRejectedValue(new Error('provider down'));
+
+		await expect(previewForceReReview('run-1')).resolves.toMatchObject({
+			continuation: 'respond-to-review',
+			currentHeadSha: null,
+			headMoved: null,
+			refusal: null,
+		});
+	});
+
+	it('fails when the read the real call makes fails, as the real call would', async () => {
+		getPullRequest.mockRejectedValue(new Error('provider down'));
+
+		await expect(previewForceReReview('run-1')).rejects.toThrow('provider down');
+	});
+
+	it('reports a run no continuation applies to as not-capped', async () => {
+		vi.mocked(getRunByIdFromDb).mockResolvedValue(
+			makeCappedReviewRun({ phase: 'implementation', reviewVerdict: null }),
+		);
+
+		await expect(previewForceReReview('run-1')).resolves.toMatchObject({
+			continuation: null,
+			headMoved: null,
+			refusal: { reason: 'not-capped' },
+		});
+		expect(getPullRequest).not.toHaveBeenCalled();
 	});
 });
