@@ -62,4 +62,28 @@ describe('runTool', () => {
 			error: 'Failed query ← connection reset',
 		});
 	});
+
+	// tRPC wraps a procedure's plain throw as INTERNAL_SERVER_ERROR: same wording as a
+	// refusal, but logged as the failure it is.
+	it('reports an INTERNAL_SERVER_ERROR verbatim and logs it with its cause', async () => {
+		const result = await runTool('run_reset', async () => {
+			throw new TRPCError({
+				code: 'INTERNAL_SERVER_ERROR',
+				message: 'Failed to reset run "r1": connection reset',
+				cause: new Error('connection reset'),
+			});
+		});
+
+		expect(result).toEqual({
+			isError: true,
+			content: [
+				{ type: 'text', text: 'INTERNAL_SERVER_ERROR: Failed to reset run "r1": connection reset' },
+			],
+		});
+		expect(warn).toHaveBeenCalledWith('operator MCP tool failed', {
+			tool: 'run_reset',
+			error: 'INTERNAL_SERVER_ERROR: Failed to reset run "r1": connection reset',
+			cause: 'connection reset',
+		});
+	});
 });

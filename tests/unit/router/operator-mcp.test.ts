@@ -99,12 +99,17 @@ vi.mock('@/identity/membership-service.js', async () => ({
 	getMembership,
 	listAccessibleProjectIds,
 }));
-const { getActiveDispatchByRunId, listOpenDispatchesForProject, listDispatchesForTask } =
-	vi.hoisted(() => ({
-		getActiveDispatchByRunId: vi.fn(),
-		listOpenDispatchesForProject: vi.fn(),
-		listDispatchesForTask: vi.fn(),
-	}));
+const {
+	getActiveDispatchByRunId,
+	listOpenDispatchesForProject,
+	listDispatchesForTask,
+	reopenDispatchForManualRetry,
+} = vi.hoisted(() => ({
+	getActiveDispatchByRunId: vi.fn(),
+	listOpenDispatchesForProject: vi.fn(),
+	listDispatchesForTask: vi.fn(),
+	reopenDispatchForManualRetry: vi.fn(),
+}));
 vi.mock('@/db/repositories/dispatchesRepository.js', async () => ({
 	...(await vi.importActual<typeof import('@/db/repositories/dispatchesRepository.js')>(
 		'@/db/repositories/dispatchesRepository.js',
@@ -112,6 +117,34 @@ vi.mock('@/db/repositories/dispatchesRepository.js', async () => ({
 	getActiveDispatchByRunId,
 	listOpenDispatchesForProject,
 	listDispatchesForTask,
+	reopenDispatchForManualRetry,
+}));
+
+// The write tools (issue #1346): the audit trail they record into, and the
+// side-effecting seams behind `runs.reset` / `runs.retryNow`, whose own suites
+// cover them — here only *whether* each is reached and as whom.
+const { recordOperatorAction, settleOperatorAction } = vi.hoisted(() => ({
+	recordOperatorAction: vi.fn(),
+	settleOperatorAction: vi.fn(),
+}));
+vi.mock('@/db/repositories/operatorActionsRepository.js', () => ({
+	recordOperatorAction,
+	settleOperatorAction,
+}));
+const { resetRun } = vi.hoisted(() => ({ resetRun: vi.fn() }));
+vi.mock('@/dispatch/run-reset.js', async () => ({
+	...(await vi.importActual<typeof import('@/dispatch/run-reset.js')>('@/dispatch/run-reset.js')),
+	resetRun,
+}));
+const { publishDispatchWakeUp } = vi.hoisted(() => ({ publishDispatchWakeUp: vi.fn() }));
+vi.mock('@/dispatch/dispatcher.js', async () => ({
+	...(await vi.importActual<typeof import('@/dispatch/dispatcher.js')>('@/dispatch/dispatcher.js')),
+	publishDispatchWakeUp,
+}));
+const { clearRunCancellation } = vi.hoisted(() => ({ clearRunCancellation: vi.fn() }));
+vi.mock('@/queue/cancellation.js', async () => ({
+	...(await vi.importActual<typeof import('@/queue/cancellation.js')>('@/queue/cancellation.js')),
+	clearRunCancellation,
 }));
 
 const { listDashboardWorkers, listProjectWorkerIdsInOrder, listWorkerProjectCapacity } = vi.hoisted(
@@ -138,7 +171,11 @@ import {
 	registerOperatorMcp,
 	serveOperatorMcpRequest,
 } from '@/router/operator-mcp.js';
-import { createMockProjectConfig, createMockProjectRecord } from '../../helpers/factories.js';
+import {
+	createMockPmWebhookJob,
+	createMockProjectConfig,
+	createMockProjectRecord,
+} from '../../helpers/factories.js';
 
 function user(id: string, identifier: string, instanceAdmin: boolean): SwarmUser {
 	return {
@@ -154,10 +191,13 @@ function user(id: string, identifier: string, instanceAdmin: boolean): SwarmUser
 const ADMIN = user('11111111-1111-4111-8111-111111111111', 'admin@example.com', true);
 const MEMBER = user('22222222-2222-4222-8222-222222222222', 'member@example.com', false);
 const STRANGER = user('33333333-3333-4333-8333-333333333333', 'stranger@example.com', false);
+/** Holds `member` on `proj-a` — the role that may drive its runs. (`MEMBER` is a contributor.) */
+const DRIVER = user('66666666-6666-4666-8666-666666666666', 'driver@example.com', false);
 const TOKENS: Record<string, SwarmUser> = {
 	'admin-token': ADMIN,
 	'member-token': MEMBER,
 	'stranger-token': STRANGER,
+	'driver-token': DRIVER,
 };
 
 const RUN_ID = '44444444-4444-4444-8444-444444444444';
@@ -308,13 +348,19 @@ beforeEach(() => {
 	getMembership
 		.mockReset()
 		.mockImplementation(async (userId: string, projectId: string) =>
-			userId === MEMBER.id && projectId === 'proj-a'
-				? { id: 'm1', userId, projectId, role: 'contributor', createdAt: new Date(0) }
-				: undefined,
+			projectId !== 'proj-a'
+				? undefined
+				: userId === MEMBER.id
+					? { id: 'm1', userId, projectId, role: 'contributor', createdAt: new Date(0) }
+					: userId === DRIVER.id
+						? { id: 'm2', userId, projectId, role: 'member', createdAt: new Date(0) }
+						: undefined,
 		);
 	listAccessibleProjectIds
 		.mockReset()
-		.mockImplementation(async (userId: string) => (userId === MEMBER.id ? ['proj-a'] : []));
+		.mockImplementation(async (userId: string) =>
+			userId === MEMBER.id || userId === DRIVER.id ? ['proj-a'] : [],
+		);
 	listDashboardWorkers.mockReset().mockResolvedValue([workerRow(WORKER_ID, 'idle-box', [])]);
 	listProjectWorkerIdsInOrder.mockReset().mockResolvedValue([]);
 	listWorkerProjectCapacity.mockReset().mockResolvedValue(CAPACITY);
@@ -323,6 +369,12 @@ beforeEach(() => {
 	countMergedPullRequestsByRepository.mockReset().mockResolvedValue({});
 	listActiveReviewSlotsForPullRequest.mockReset().mockResolvedValue([]);
 	findProjectRecordByIdFromDb.mockReset().mockResolvedValue(undefined);
+	recordOperatorAction.mockReset().mockResolvedValue('audit-1');
+	settleOperatorAction.mockReset().mockResolvedValue(undefined);
+	resetRun.mockReset();
+	reopenDispatchForManualRetry.mockReset();
+	publishDispatchWakeUp.mockReset().mockResolvedValue(undefined);
+	clearRunCancellation.mockReset().mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -409,7 +461,7 @@ describe('operator MCP — the bearer gate', () => {
 });
 
 describe('operator MCP — the handshake', () => {
-	it('initializes as the swarm server and lists exactly the read tools', async () => {
+	it('initializes as the swarm server and lists the read tools and the audited write tools', async () => {
 		const init = await rpc(
 			'initialize',
 			{
@@ -426,24 +478,43 @@ describe('operator MCP — the handshake', () => {
 
 		const list = await rpc('tools/list', {}, 'admin-token');
 		const listBody = (await list.json()) as {
-			result: { tools: Array<{ name: string; annotations?: { readOnlyHint?: boolean } }> };
+			result: {
+				tools: Array<{
+					name: string;
+					annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean };
+					inputSchema: { required?: string[] };
+				}>;
+			};
 		};
 		const tools = listBody.result.tools;
+		const WRITE_TOOLS = ['dispatch_redispatch_now', 'run_reset'];
 
 		expect(tools.map((tool) => tool.name).sort()).toEqual([
 			'cli_rate_limits',
 			'consistency_check',
 			'control_plane_logs',
 			'dispatch_history',
+			'dispatch_redispatch_now',
 			'phase_agents_get',
 			'pipeline_snapshot',
 			'pipeline_stats',
 			'pr_status',
 			'run_get',
+			'run_reset',
 			'runs_list',
 			'workers_state',
 		]);
-		for (const tool of tools) expect(tool.annotations?.readOnlyHint).toBe(true);
+		for (const tool of tools) {
+			if (WRITE_TOOLS.includes(tool.name)) {
+				expect(tool.annotations?.readOnlyHint).toBe(false);
+				expect(tool.inputSchema.required).toContain('reason');
+			} else {
+				expect(tool.annotations?.readOnlyHint).toBe(true);
+			}
+		}
+		expect(tools.find((tool) => tool.name === 'run_reset')?.annotations?.destructiveHint).toBe(
+			true,
+		);
 	});
 });
 
@@ -1185,5 +1256,232 @@ describe('operator MCP — consistency_check', () => {
 
 		expect(result.isError).toBe(true);
 		expect(runConsistencyCheck).not.toHaveBeenCalled();
+	});
+});
+
+describe('operator MCP — run_reset and dispatch_redispatch_now', () => {
+	const PROJECT = createMockProjectConfig({ id: 'proj-a', repo: 'acme/widgets' });
+	const PAYLOAD = createMockPmWebhookJob();
+	const RESET_RESULT = {
+		outcome: 'restarted',
+		runId: RUN_ID,
+		agentStop: 'not-running',
+		dispatch: 'none',
+		cancellationCleared: true,
+		worktree: null,
+		worktreeError: null,
+		recoveryCleared: true,
+		abandonedPreservedWorkerId: null,
+		dispatchId: 'dispatch-2',
+	};
+
+	beforeEach(() => {
+		getProjectByIdFromDb.mockReset().mockResolvedValue(PROJECT);
+		getRunByIdFromDb.mockImplementation(async (id: string) =>
+			id === RUN_ID ? { ...failedRun(), jobPayload: PAYLOAD } : undefined,
+		);
+		resetRun.mockResolvedValue(RESET_RESULT);
+	});
+
+	/** The audit row the call settled, merged with the one it inserted. */
+	function auditRow() {
+		expect(recordOperatorAction).toHaveBeenCalledTimes(1);
+		expect(settleOperatorAction).toHaveBeenCalledTimes(1);
+		return {
+			...recordOperatorAction.mock.calls[0]?.[0],
+			...settleOperatorAction.mock.calls[0]?.[1],
+		};
+	}
+
+	it('resets the run for a project member and audits the call', async () => {
+		const result = await callTool(
+			'run_reset',
+			{ runId: RUN_ID, reason: 'wedged on a stale lease' },
+			'driver-token',
+		);
+
+		expect(result.isError).toBeUndefined();
+		expect(result.structuredContent).toEqual({
+			dryRun: false,
+			auditId: 'audit-1',
+			result: RESET_RESULT,
+		});
+		expect(resetRun).toHaveBeenCalledWith(RUN_ID);
+		expect(auditRow()).toEqual({
+			userId: DRIVER.id,
+			userIdentifier: DRIVER.identifier,
+			tool: 'run_reset',
+			projectId: 'proj-a',
+			target: RUN_ID,
+			reason: 'wedged on a stale lease',
+			dryRun: false,
+			input: { runId: RUN_ID },
+			outcome: 'succeeded',
+			error: null,
+		});
+	});
+
+	it('answers a dry run with the preview and does not reset', async () => {
+		const result = await callTool(
+			'run_reset',
+			{ runId: RUN_ID, reason: 'checking', dryRun: true },
+			'driver-token',
+		);
+
+		expect(result.isError).toBeUndefined();
+		expect(result.structuredContent).toMatchObject({
+			dryRun: true,
+			preview: {
+				action: 'reset',
+				run: { id: RUN_ID, projectId: 'proj-a', status: 'failed' },
+				wouldRefuse: null,
+				expectedOutcome: 'restarted',
+			},
+		});
+		expect(resetRun).not.toHaveBeenCalled();
+		expect(auditRow()).toMatchObject({ dryRun: true, outcome: 'succeeded', projectId: 'proj-a' });
+	});
+
+	// `contributor` is the read-only role: it reads the run, but may not drive it —
+	// and a dry run must not get further than the real call would.
+	it.each([
+		[false],
+		[true],
+	])('refuses a contributor with FORBIDDEN (dryRun %s) and audits the refusal', async (dryRun) => {
+		const result = await callTool(
+			'run_reset',
+			{ runId: RUN_ID, reason: 'trying', dryRun },
+			'member-token',
+		);
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toMatch(/^FORBIDDEN: /);
+		expect(resetRun).not.toHaveBeenCalled();
+		expect(getActiveDispatchByRunId).not.toHaveBeenCalled();
+		expect(auditRow()).toMatchObject({
+			userId: MEMBER.id,
+			tool: 'run_reset',
+			target: RUN_ID,
+			projectId: null,
+			dryRun,
+			outcome: 'refused',
+			error: expect.stringMatching(/^FORBIDDEN: /),
+		});
+	});
+
+	it('hides a run in a project the caller is not a member of', async () => {
+		const result = await callTool(
+			'run_reset',
+			{ runId: RUN_ID, reason: 'trying' },
+			'stranger-token',
+		);
+
+		expect(result.content[0]?.text).toBe(`NOT_FOUND: Run with ID "${RUN_ID}" not found`);
+		expect(resetRun).not.toHaveBeenCalled();
+		expect(auditRow()).toMatchObject({ outcome: 'refused', projectId: null });
+	});
+
+	// A reset that broke part-way may already have stopped the agent and torn down the
+	// checkout: the audit row must say `failed`, never `refused` (nothing changed).
+	it('audits a reset that broke as failed, through the real caller', async () => {
+		resetRun.mockRejectedValue(new Error('connection reset'));
+
+		const result = await callTool('run_reset', { runId: RUN_ID, reason: 'wedged' }, 'driver-token');
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toBe(
+			`INTERNAL_SERVER_ERROR: Failed to reset run "${RUN_ID}": connection reset`,
+		);
+		expect(auditRow()).toMatchObject({
+			projectId: 'proj-a',
+			outcome: 'failed',
+			error: `INTERNAL_SERVER_ERROR: Failed to reset run "${RUN_ID}": connection reset`,
+		});
+	});
+
+	it('rejects a call with no reason before anything runs', async () => {
+		const result = await callTool('run_reset', { runId: RUN_ID }, 'driver-token');
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toMatch(/reason/);
+		expect(resetRun).not.toHaveBeenCalled();
+	});
+
+	it("re-opens the run's waiting dispatch for a project member", async () => {
+		const waiting = {
+			id: 'dispatch-1',
+			state: 'retry-scheduled',
+			waitReason: 'rate-limit',
+			availableAt: new Date('2026-11-06T12:00:00Z'),
+			leaseExpiresAt: null,
+			jobPayload: PAYLOAD,
+			wakeSeq: 1,
+		};
+		getActiveDispatchByRunId.mockResolvedValue(waiting);
+		reopenDispatchForManualRetry.mockResolvedValue({ ...waiting, state: 'pending', wakeSeq: 2 });
+
+		const result = await callTool(
+			'dispatch_redispatch_now',
+			{ runId: RUN_ID, reason: 'the rate limit has reset' },
+			'driver-token',
+		);
+
+		expect(result.isError).toBeUndefined();
+		expect(result.structuredContent).toMatchObject({
+			dryRun: false,
+			result: { runId: RUN_ID, status: 'retrying' },
+		});
+		expect(reopenDispatchForManualRetry).toHaveBeenCalledWith('dispatch-1', expect.any(Object));
+		expect(publishDispatchWakeUp).toHaveBeenCalledTimes(1);
+		expect(auditRow()).toMatchObject({
+			tool: 'dispatch_redispatch_now',
+			projectId: 'proj-a',
+			outcome: 'succeeded',
+		});
+	});
+
+	it('previews a re-dispatch without re-opening anything', async () => {
+		getActiveDispatchByRunId.mockResolvedValue({
+			id: 'dispatch-1',
+			state: 'retry-scheduled',
+			waitReason: 'rate-limit',
+			availableAt: new Date('2026-11-06T12:00:00Z'),
+			leaseExpiresAt: null,
+			jobPayload: PAYLOAD,
+		});
+
+		const result = await callTool(
+			'dispatch_redispatch_now',
+			{ runId: RUN_ID, reason: 'checking', dryRun: true },
+			'driver-token',
+		);
+
+		expect(result.structuredContent).toMatchObject({
+			dryRun: true,
+			preview: {
+				action: 'retryNow',
+				activeDispatch: { id: 'dispatch-1', state: 'retry-scheduled', claim: 'waiting' },
+				wouldRefuse: null,
+				expectedOutcome: 'retrying',
+			},
+		});
+		expect(reopenDispatchForManualRetry).not.toHaveBeenCalled();
+		expect(publishDispatchWakeUp).not.toHaveBeenCalled();
+		expect(clearRunCancellation).not.toHaveBeenCalled();
+	});
+
+	it("audits retryNow's own refusal of a completed run", async () => {
+		getRunByIdFromDb.mockResolvedValue({ ...failedRun(), status: 'completed' });
+
+		const result = await callTool(
+			'dispatch_redispatch_now',
+			{ runId: RUN_ID, reason: 'again' },
+			'driver-token',
+		);
+
+		expect(result.content[0]?.text).toBe(
+			`PRECONDITION_FAILED: Only a deferred, checkpointed, or failed run can be retried; run "${RUN_ID}" is completed.`,
+		);
+		expect(auditRow()).toMatchObject({ outcome: 'refused', projectId: 'proj-a' });
 	});
 });

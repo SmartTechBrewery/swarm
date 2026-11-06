@@ -4,7 +4,8 @@ A SWARM control plane serves an [MCP](https://modelcontextprotocol.io) server at
 **`/operator/mcp`**. An assistant session such as Claude Code connects to it and
 reads the pipeline the way you do in the dashboard: which runs failed, why, and
 what the agent printed. It is the same data `swarm run list|show|logs` reads, as
-tools a model can call.
+tools a model can call. A few [write tools](#write-tools) act on the pipeline too,
+each with a mandatory reason, a dry run and an audit record.
 
 **The server is open to installation administrators only, for now.** Any other
 user is refused with `403`, whichever credential they present. Opening it to other
@@ -122,7 +123,8 @@ the same way.
 update the client's header.
 
 Treat the token like a password: it reads everything your account can read in the
-dashboard, including run logs and agent output.
+dashboard, including run logs and agent output, and it can reset and re-dispatch
+runs in every project where you hold `member`.
 
 ### Using the `swarm login` session instead
 
@@ -142,8 +144,9 @@ CLI sign-in, and you can revoke it on its own.
 
 ## Tools
 
-Every tool is read-only unless its description says otherwise, and declares that
-with MCP's `readOnlyHint`. A refusal (`NOT_FOUND`, `FORBIDDEN`, an invalid
+Every tool in the table below is read-only and declares that with MCP's
+`readOnlyHint`. The tools that change something are listed separately under
+[Write tools](#write-tools). A refusal (`NOT_FOUND`, `FORBIDDEN`, an invalid
 argument) comes back as a tool error naming the procedure's own reason, the same
 wording the dashboard shows.
 
@@ -208,6 +211,55 @@ time (never a whole-board read), and never asks the source-control provider.
 | `merged-pr-open-work-item` | Merge automation merged the pull request (its Review run completed inside the window), but the work item it implements is still open on the board — its card is in any status but Done. SWARM does not close a card on merge itself; the provider's own link (a `Closes #N`) does, so a missed close leaves the card, and every item waiting on it, where it is. The card is found from the task the pull request's branch names, then from the pull request itself; a pull request with no card behind it is not reported | Close the work item and move it to Done on the board (`work_item_close`, once the server offers it). Its dependents wake when it is done |
 | `dependency-wait-blockers-done` | A Planning or Implementation dispatch is waiting on the dependency gate, but the gate, asked now, would no longer hold it: no recorded blocker is still open. It would otherwise sit until its next re-check (`SWARM_DEPENDENCY_RECHECK_MS`). "Finished" is the gate's own rule — an open prose-only prerequisite does not count, and neither does a blocker the item itself blocks. Not checked for a provider without dependencies (Trello), which never gates | Wake the project's dependency waits (`dependency_waits_wake`, once the server offers it), or **Retry now** on the Queue screen |
 
+## Write tools
+
+A write tool changes the pipeline. It declares `readOnlyHint: false`, and a tool
+that discards state also declares `destructiveHint: true`. Every write tool works
+the same way:
+
+- **`reason` is mandatory.** Say in a sentence why you are doing this. A call
+  without a reason is rejected as an invalid argument, and a blank one is refused
+  as `BAD_REQUEST`.
+- **`dryRun: true` changes nothing.** It returns
+  `{ dryRun: true, auditId, preview }`, where `preview` says what the call would
+  do: the target's current state, `wouldRefuse` (the refusal the real call would
+  answer with, in its own code and wording, or `null`), `expectedOutcome` and
+  `intendedChanges`. `wouldRefuse: null` is not a promise. The real call checks
+  everything again, and something can change in between. A real call returns
+  `{ dryRun: false, auditId, result }`, where `result` is the dashboard
+  procedure's own answer.
+- **Authorization is the dashboard's, and it comes first.** A dry run needs the
+  same role as the real call. Someone who may not make the change gets the same
+  `FORBIDDEN` or `NOT_FOUND` from a dry run, and learns nothing more about the
+  target.
+- **Every call is audited.** Dry or real, succeeded, refused or failed, each call
+  writes one row to the `operator_actions` table: who (`user_id`,
+  `user_identifier`), which `tool`, `project_id`, `target`, `reason`, `dry_run`,
+  the `input` arguments, `outcome` (`succeeded`, `refused`, `failed`, or
+  `pending` while the call runs), `error`, and `started_at`/`completed_at`.
+  `refused` means the wrapped procedure declined to act (`NOT_FOUND`,
+  `FORBIDDEN`, `PRECONDITION_FAILED`, `CONFLICT`, `BAD_REQUEST`, …), so nothing
+  changed. `failed` means an internal error, including one the procedure reported
+  as `INTERNAL_SERVER_ERROR`; a real call that failed may have half-happened. The
+  row is written before the tool does anything. If it cannot be written, the call
+  does nothing and says so. The table has no foreign keys, so a row survives the
+  deletion of the user or project it names. `project_id` is empty only when the
+  call ended before its target resolved to a project, for example an
+  unknown run. No tool reads the audit table yet; query Postgres directly.
+
+| Tool | What it does | Arguments |
+| --- | --- | --- |
+| `run_reset` | **Destructive.** Resets a wedged run and restarts its phase from scratch, as the dashboard's **Reset & restart** and `swarm run reset` do (`runs.reset`). It stops the run's live agent, cancels its active dispatch (even one a worker has claimed), clears its cancellation flag, tears down its checkout and discards uncommitted and unpushed work, and clears its recovery record. Then it re-dispatches the phase as a fresh first attempt. A run with no stored payload, or whose project is gone, is settled `failed` instead (`outcome: 'terminated'`). Refused only for an unknown run, a machine-maintenance run, or a reset already under way | `runId`, `reason`, `dryRun` (default `false`) |
+| `dispatch_redispatch_now` | Re-dispatches a `deferred`, `checkpointed` or `failed` run immediately, as the dashboard's **Retry now** does (`runs.retryNow`). It re-opens the run's waiting dispatch for an immediate attempt, superseding a scheduled automatic retry. A dispatch whose worker lease has lapsed is taken back first. A run with no dispatch gets a fresh one built from its stored payload. Retry budgets start again from zero. Refused for any other status, for a run a worker is executing, and for a run with neither a dispatch nor a stored payload | `runId`, `reason`, `dryRun` (default `false`) |
+
+Both need `member` on the run's project, the role that drives runs in the
+dashboard. A contributor can read the run but gets `FORBIDDEN`. Anyone else gets
+`NOT_FOUND`. Their dry run is the `runs.previewAction` procedure, which is gated at
+`member` too.
+
+`dispatch_redispatch_now` takes a run. A dispatch with no run yet, such as a
+board dispatch waiting on its dependencies, is not something it can re-dispatch.
+
 ## For developers
 
 The mount is `src/router/operator-mcp.ts`. It resolves the bearer as a session,
@@ -227,3 +279,11 @@ memory does not hold the router's buffer, so there is no procedure to call, and 
 tool calls the same `src/api/authz.ts` helpers a procedure would. Adding a tool publishes that procedure on the
 internet-exposed router. Treat it like widening `src/api/operator-router.ts`: give
 it its own reasoning, and add it to the table above.
+
+A tool that writes registers through `registerWriteTool` (`src/mcp/write-tool.ts`),
+never `server.registerTool` directly. Give it a `preview`, a read-only procedure
+gated exactly like the write, which runs first on every call and answers the dry
+run, and an `apply`, which is the dashboard mutation. The framework adds `reason`
+and `dryRun` and writes the `operator_actions` row
+(`src/db/repositories/operatorActionsRepository.ts`). The run tools live in
+`src/mcp/tools/run-actions.ts`.
