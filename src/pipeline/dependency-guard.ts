@@ -113,15 +113,15 @@ async function surfaceProseAdvisory(
  */
 async function withoutCyclicBlockers(
 	pm: PMProvider,
-	workItem: WorkItem,
+	workItemId: string,
 	gating: WorkItemBlocker[],
 ): Promise<WorkItemBlocker[]> {
 	let dependents: WorkItemDependent[];
 	try {
-		dependents = await pm.listDependents(workItem.id);
+		dependents = await pm.listDependents(workItemId);
 	} catch (err) {
 		logger.warn('Dependency gate: could not read dependents; keeping the blockers as they are', {
-			workItemId: workItem.id,
+			workItemId,
 			error: err instanceof Error ? err.message : String(err),
 		});
 		return gating;
@@ -131,7 +131,7 @@ async function withoutCyclicBlockers(
 		logger.warn(
 			'Dependency gate: blocker is itself natively blocked by this item; gating on it could never resolve',
 			{
-				workItemId: workItem.id,
+				workItemId,
 				reference: blocker.reference,
 				source: blocker.source,
 			},
@@ -168,9 +168,9 @@ export async function findGatingBlockers(
 	workItem: WorkItem,
 ): Promise<WorkItemBlocker[]> {
 	if (!pm.supportsDependencies) return [];
-	let open: WorkItemBlocker[];
+	let classified: ClassifiedBlockers;
 	try {
-		open = openBlockers(await pm.listBlockers(workItem.id));
+		classified = await classifyOpenBlockers(pm, workItem.id);
 	} catch (err) {
 		logger.warn('Dependency gate: could not read blockers; proceeding without gating', {
 			workItemId: workItem.id,
@@ -178,12 +178,39 @@ export async function findGatingBlockers(
 		});
 		return [];
 	}
-	const { gating, advisory } = partitionBlockersBySource(open);
-	if (advisory.length > 0) await surfaceProseAdvisory(pm, workItem, advisory);
-	// Only worth a reverse read when something would otherwise gate: with nothing to
-	// suppress, the check could only cost a board call per dispatch.
-	if (gating.length === 0) return gating;
-	return withoutCyclicBlockers(pm, workItem, gating);
+	if (classified.advisory.length > 0) await surfaceProseAdvisory(pm, workItem, classified.advisory);
+	return classified.gating;
+}
+
+/** A work item's still-open blockers, split the way the gate treats them. */
+export interface ClassifiedBlockers {
+	/** The open blockers that defer a gated run — what {@link findGatingBlockers} returns. */
+	gating: WorkItemBlocker[];
+	/** Open prose-only prerequisites, surfaced for a human and never gating. */
+	advisory: WorkItemBlocker[];
+}
+
+/**
+ * The gate's own classification of `workItemId`'s blockers, **with no side
+ * effect**: the open ones split by source, minus any the item natively blocks.
+ * {@link findGatingBlockers} is this plus the prose notice and its fail-open
+ * swallow; a read-only caller (the operator consistency check, issue #1344) uses it
+ * directly so "would the gate still defer this?" has exactly one answer.
+ *
+ * The caller owns the `supportsDependencies` check, and a failed blocker read
+ * **throws** — only the gate decides that a failure means "proceed". The reverse
+ * read behind the cycle check stays conservative ({@link withoutCyclicBlockers}),
+ * and is paid only when something would otherwise gate.
+ */
+export async function classifyOpenBlockers(
+	pm: PMProvider,
+	workItemId: string,
+): Promise<ClassifiedBlockers> {
+	const { gating, advisory } = partitionBlockersBySource(
+		openBlockers(await pm.listBlockers(workItemId)),
+	);
+	if (gating.length === 0) return { gating, advisory };
+	return { gating: await withoutCyclicBlockers(pm, workItemId, gating), advisory };
 }
 
 /**

@@ -113,6 +113,7 @@ wording the dashboard shows.
 | `cli_rate_limits` | The workers cooling on an agent CLI's usage limit, as `{ workers }`, each with its active limits (from `workers.list`): `cli`, `expiresAt` (when SWARM routes that CLI to the machine again), `observedAt`, and `resetHint` — the reset text the CLI itself printed, or `null` when it printed none. A worker with no active limit is left out unless named by `workerId` | `projectId?`, `workerId?` |
 | `pr_status` | One pull request's automation state as SWARM recorded it (`runs.prStatus`): its latest completed Review run (`lastReviewRunId`, `lastReviewVerdict`), the head of its latest submitted verdict (`lastReviewedHeadSha`), the merge-automation outcome recorded on that run (`mergeOutcome` — `merged`, `not-ready`, `not-eligible`, `policy-blocked`, `unsupported`, `provider-error`, `retry-exhausted`, `provider-error-exhausted`, or `null` — with `mergeOutcomeMessage`), the review-verdict ledger (`verdictCount` of `verdictCap`, `supersededCount` of `supersededCap`), whether a bound is reached (`capReached`, and which in `capBound`: `verdict-cap`, `superseded-bound` or `null`), and whether an operator's Force re-review grant is still unspent (`overrideOutstanding`). It does not ask the source-control provider anything, so it is not a live mergeability read | `projectId`, `repository` (as the project configures it), `prNumber` |
 | `phase_agents_get` | One phase's agent configuration for a project (from `projects.getById`), as stored after normalisation: `targets` (CLI/model/reasoning in priority order), `timeoutMs`, the custom `prompt`, and `cli`/`model`/`reasoning` mirroring `targets[0]`, with `configured: false` for a phase running on its coded defaults. Nothing else of the project is returned — no repositories, board mapping or credential references | `projectId`, `phase` (`planning`, `implementation`, `implementationUnplanned`, `review`, `respondToReview`, `respondToCi`, `resolveConflicts`) |
+| `consistency_check` | Stuck states SWARM will not leave by itself (`runs.consistencyCheck`), as `{ windowHours, since, findings, unchecked, truncated }`. Each finding has a `kind`, `repository`, `prNumber` (merged pull requests), `taskId`, `dispatchId` (dependency waits), `workItemId`, `workItemUrl`, `detail` and `suggestedAction` — see the kinds below. A candidate whose board read failed is listed in `unchecked` with its `reason` instead of being guessed at, and `truncated` is `true` when a per-call cap (50 merged pull requests, 50 dependency waits) left some unread. Fixes nothing | `projectId`, `windowHours` (how far back to look for merged pull requests, default 24, at most 720) |
 
 Page through a long agent output by passing the `output.nextCursor` of one call as
 `outputAfter` of the next while `output.hasMore` is `true`.
@@ -137,8 +138,18 @@ worker on the installation, which only an instance administrator may do; anyone
 else gets `FORBIDDEN` and has to name a project. A `workerId` outside the scope
 reads as *not found*, exactly as an unknown one.
 
-`pr_status` and `phase_agents_get` need you to be a contributor of the project you
-name; for anyone else the project reads as *not found*.
+`pr_status`, `phase_agents_get` and `consistency_check` need you to be a contributor
+of the project you name; for anyone else the project reads as *not found*.
+
+### What `consistency_check` reports
+
+The check reads the board only through the project's PM provider, one card at a
+time (never a whole-board read), and never asks the source-control provider.
+
+| Finding `kind` | What it means | What to do |
+| --- | --- | --- |
+| `merged-pr-open-work-item` | Merge automation merged the pull request (its Review run completed inside the window), but the work item it implements is still open on the board — its card is in any status but Done. SWARM does not close a card on merge itself; the provider's own link (a `Closes #N`) does, so a missed close leaves the card, and every item waiting on it, where it is. The card is found from the task the pull request's branch names, then from the pull request itself; a pull request with no card behind it is not reported | Close the work item and move it to Done on the board (`work_item_close`, once the server offers it). Its dependents wake when it is done |
+| `dependency-wait-blockers-done` | A Planning or Implementation dispatch is waiting on the dependency gate, but the gate, asked now, would no longer hold it: no recorded blocker is still open. It would otherwise sit until its next re-check (`SWARM_DEPENDENCY_RECHECK_MS`). "Finished" is the gate's own rule — an open prose-only prerequisite does not count, and neither does a blocker the item itself blocks. Not checked for a provider without dependencies (Trello), which never gates | Wake the project's dependency waits (`dependency_waits_wake`, once the server offers it), or **Retry now** on the Queue screen |
 
 ## For developers
 

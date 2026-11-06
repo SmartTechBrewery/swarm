@@ -53,14 +53,34 @@ vi.mock('@/db/repositories/reviewVerdictsRepository.js', async () => ({
 	)),
 	listActiveReviewSlotsForPullRequest,
 }));
-const { findProjectRecordByIdFromDb } = vi.hoisted(() => ({
+const { findProjectRecordByIdFromDb, getProjectByIdFromDb } = vi.hoisted(() => ({
 	findProjectRecordByIdFromDb: vi.fn(),
+	getProjectByIdFromDb: vi.fn(),
 }));
 vi.mock('@/db/repositories/projectsRepository.js', async () => ({
 	...(await vi.importActual<typeof import('@/db/repositories/projectsRepository.js')>(
 		'@/db/repositories/projectsRepository.js',
 	)),
 	findProjectRecordByIdFromDb,
+	getProjectByIdFromDb,
+}));
+// The consistency check behind `consistency_check` (issue #1344) has its own suite;
+// here it is only the seam the procedure hands the project and its board to.
+const { runConsistencyCheck, requireProjectPMProvider } = vi.hoisted(() => ({
+	runConsistencyCheck: vi.fn(),
+	requireProjectPMProvider: vi.fn(),
+}));
+vi.mock('@/dispatch/consistency-check.js', async () => ({
+	...(await vi.importActual<typeof import('@/dispatch/consistency-check.js')>(
+		'@/dispatch/consistency-check.js',
+	)),
+	runConsistencyCheck,
+}));
+vi.mock('@/integrations/pm/registry.js', async () => ({
+	...(await vi.importActual<typeof import('@/integrations/pm/registry.js')>(
+		'@/integrations/pm/registry.js',
+	)),
+	requireProjectPMProvider,
 }));
 const { getMembership, listAccessibleProjectIds } = vi.hoisted(() => ({
 	getMembership: vi.fn(),
@@ -106,7 +126,7 @@ vi.mock('@/identity/worker-enrollment-service.js', async () => ({
 
 import type { SwarmUser } from '@/identity/schema.js';
 import { type OperatorMcpDeps, registerOperatorMcp } from '@/router/operator-mcp.js';
-import { createMockProjectRecord } from '../../helpers/factories.js';
+import { createMockProjectConfig, createMockProjectRecord } from '../../helpers/factories.js';
 
 function user(id: string, identifier: string, instanceAdmin: boolean): SwarmUser {
 	return {
@@ -337,6 +357,7 @@ describe('operator MCP — the handshake', () => {
 
 		expect(tools.map((tool) => tool.name).sort()).toEqual([
 			'cli_rate_limits',
+			'consistency_check',
 			'dispatch_history',
 			'phase_agents_get',
 			'pipeline_snapshot',
@@ -880,5 +901,75 @@ describe('operator MCP — phase_agents_get', () => {
 
 		expect(result.isError).toBe(true);
 		expect(findProjectRecordByIdFromDb).not.toHaveBeenCalled();
+	});
+});
+
+describe('operator MCP — consistency_check', () => {
+	const PROJECT = createMockProjectConfig({ id: 'proj-a', repo: 'acme/app' });
+	const BOARD = { type: 'github-projects' };
+	const RESULT = {
+		windowHours: 48,
+		since: '2026-11-04T12:00:00.000Z',
+		findings: [
+			{
+				kind: 'merged-pr-open-work-item',
+				repository: 'acme/app',
+				prNumber: 42,
+				taskId: '17',
+				workItemId: 'PVTI_17',
+				workItemUrl: 'https://example.test/issues/17',
+				detail: 'Pull request #42 was merged, but its work item is still open.',
+				suggestedAction: 'Close the work item.',
+			},
+		],
+		unchecked: [],
+		truncated: false,
+	};
+
+	beforeEach(() => {
+		getProjectByIdFromDb
+			.mockReset()
+			.mockImplementation(async (id: string) => (id === 'proj-a' ? PROJECT : undefined));
+		requireProjectPMProvider.mockReset().mockReturnValue(BOARD);
+		runConsistencyCheck.mockReset().mockResolvedValue(RESULT);
+	});
+
+	it("runs the check against the project's own board for a contributor", async () => {
+		const result = await callTool(
+			'consistency_check',
+			{ projectId: 'proj-a', windowHours: 48 },
+			'member-token',
+		);
+
+		expect(result.isError).toBeUndefined();
+		expect(result.structuredContent).toEqual(RESULT);
+		expect(requireProjectPMProvider).toHaveBeenCalledWith(PROJECT);
+		expect(runConsistencyCheck).toHaveBeenCalledWith(PROJECT, BOARD, 48);
+	});
+
+	it('looks back 24 hours by default', async () => {
+		await callTool('consistency_check', { projectId: 'proj-a' }, 'member-token');
+
+		expect(runConsistencyCheck).toHaveBeenCalledWith(PROJECT, BOARD, 24);
+	});
+
+	it('hides a project the caller is not a member of, reading nothing', async () => {
+		const result = await callTool('consistency_check', { projectId: 'proj-a' }, 'stranger-token');
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toMatch(/^NOT_FOUND: /);
+		expect(getProjectByIdFromDb).not.toHaveBeenCalled();
+		expect(runConsistencyCheck).not.toHaveBeenCalled();
+	});
+
+	it('rejects a window longer than thirty days', async () => {
+		const result = await callTool(
+			'consistency_check',
+			{ projectId: 'proj-a', windowHours: 721 },
+			'member-token',
+		);
+
+		expect(result.isError).toBe(true);
+		expect(runConsistencyCheck).not.toHaveBeenCalled();
 	});
 });
