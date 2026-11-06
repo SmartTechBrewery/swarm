@@ -355,3 +355,131 @@ describe('configureLogger base context', () => {
 		expect(JSON.parse(infoSpy.mock.calls[0][0] as string).component).toBe('worker');
 	});
 });
+
+// Issue #1343 — the in-memory window the operator MCP server's
+// `control_plane_logs` tool reads.
+describe('log ring buffer', () => {
+	beforeEach(() => {
+		vi.resetModules();
+	});
+
+	async function freshLogger() {
+		return import('@/lib/logger.js');
+	}
+
+	it('is off by default: nothing is buffered until a process enables it', async () => {
+		const { logger: log, queryLogRingBuffer } = await freshLogger();
+
+		log.info('not kept', { projectId: 'p1' });
+
+		expect(queryLogRingBuffer()).toEqual({ entries: [], capacity: 0, size: 0, oldestTime: null });
+	});
+
+	it('keeps the json object as time, level, msg and merged context, newest first', async () => {
+		const {
+			configureLogger: cfg,
+			enableLogRingBuffer,
+			logger: log,
+			queryLogRingBuffer,
+		} = await freshLogger();
+		cfg({ component: 'router' });
+		enableLogRingBuffer(10);
+
+		log.info('first', { projectId: 'p1', taskId: '7' });
+		log.warn('second');
+
+		const { entries, capacity, size, oldestTime } = queryLogRingBuffer();
+		expect(entries.map((entry) => entry.msg)).toEqual(['second', 'first']);
+		expect(entries[1]).toEqual({
+			time: oldestTime,
+			level: 'info',
+			msg: 'first',
+			context: { component: 'router', projectId: 'p1', taskId: '7' },
+		});
+		expect({ capacity, size }).toEqual({ capacity: 10, size: 2 });
+	});
+
+	it('evicts the oldest line once full', async () => {
+		const { enableLogRingBuffer, logger: log, queryLogRingBuffer } = await freshLogger();
+		enableLogRingBuffer(3);
+
+		for (const msg of ['a', 'b', 'c', 'd', 'e']) log.info(msg);
+
+		const result = queryLogRingBuffer();
+		expect(result.entries.map((entry) => entry.msg)).toEqual(['e', 'd', 'c']);
+		expect(result.size).toBe(3);
+	});
+
+	it('filters on the correlation keys, comparing numbers and strings alike', async () => {
+		const { enableLogRingBuffer, logger: log, queryLogRingBuffer } = await freshLogger();
+		enableLogRingBuffer(10);
+
+		log.info('a', { projectId: 'p1', taskId: '7', prNumber: 12, dispatchId: 'd1' });
+		log.info('b', { projectId: 'p1', taskId: 7, prNumber: '13' });
+		log.info('c', { projectId: 'p2', taskId: '7' });
+		log.info('d');
+
+		const msgs = (filter: Parameters<typeof queryLogRingBuffer>[0]) =>
+			queryLogRingBuffer(filter).entries.map((entry) => entry.msg);
+		expect(msgs({ projectId: 'p1' })).toEqual(['b', 'a']);
+		expect(msgs({ taskId: '7' })).toEqual(['c', 'b', 'a']);
+		expect(msgs({ projectId: 'p1', prNumber: 13 })).toEqual(['b']);
+		expect(msgs({ dispatchId: 'd1' })).toEqual(['a']);
+		expect(msgs({ projectId: 'p1', limit: 1 })).toEqual(['b']);
+	});
+
+	it('applies a minimum level and a since/until window', async () => {
+		vi.useFakeTimers();
+		try {
+			const { enableLogRingBuffer, logger: log, queryLogRingBuffer } = await freshLogger();
+			enableLogRingBuffer(10);
+			vi.setSystemTime(new Date('2026-11-06T10:00:00Z'));
+			log.debug('early debug');
+			vi.setSystemTime(new Date('2026-11-06T11:00:00Z'));
+			log.warn('mid warn');
+			vi.setSystemTime(new Date('2026-11-06T12:00:00Z'));
+			log.error('late error');
+
+			const msgs = (filter: Parameters<typeof queryLogRingBuffer>[0]) =>
+				queryLogRingBuffer(filter).entries.map((entry) => entry.msg);
+			expect(msgs({ level: 'warn' })).toEqual(['late error', 'mid warn']);
+			expect(
+				msgs({ since: new Date('2026-11-06T11:00:00Z'), until: new Date('2026-11-06T12:00:00Z') }),
+			).toEqual(['mid warn']);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it('records only what passes SWARM_LOG_LEVEL', async () => {
+		vi.stubEnv('SWARM_LOG_LEVEL', 'warn');
+		const { enableLogRingBuffer, logger: log, queryLogRingBuffer } = await freshLogger();
+		enableLogRingBuffer(10);
+
+		log.info('dropped');
+		log.warn('kept');
+
+		expect(queryLogRingBuffer().entries.map((entry) => entry.msg)).toEqual(['kept']);
+	});
+
+	it('keeps an oversized line as its message head and correlation keys', async () => {
+		const { enableLogRingBuffer, logger: log, queryLogRingBuffer } = await freshLogger();
+		enableLogRingBuffer(10);
+
+		log.error('huge', { projectId: 'p1', payload: 'x'.repeat(50_000) });
+
+		const [entry] = queryLogRingBuffer({ projectId: 'p1' }).entries;
+		expect(entry).toMatchObject({ msg: 'huge', context: { projectId: 'p1', _truncated: true } });
+		expect(entry?.context).not.toHaveProperty('payload');
+	});
+
+	it('never throws into the caller over an unserializable context', async () => {
+		const { enableLogRingBuffer, logger: log, queryLogRingBuffer } = await freshLogger();
+		enableLogRingBuffer(10);
+		const circular: Record<string, unknown> = {};
+		circular.self = circular;
+
+		expect(() => log.info('circular', { projectId: 'p1', circular })).not.toThrow();
+		expect(queryLogRingBuffer({ projectId: 'p1' }).entries[0]?.msg).toBe('circular');
+	});
+});

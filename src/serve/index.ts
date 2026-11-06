@@ -30,8 +30,9 @@ import { runMigrations } from '../db/migrate.js';
 import { announceFirstRunSetup } from '../identity/first-run-setup.js';
 import { resolveWebhookCallbackBaseUrl } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
-import { configureLogger, logger } from '../lib/logger.js';
+import { configureLogger, enableLogRingBuffer, logger } from '../lib/logger.js';
 import { closeQueue } from '../queue/producer.js';
+import { CONTROL_PLANE_LOG_BUFFER_CAPACITY } from '../router/control-plane-logs.js';
 import type { DispatchConsumerHandle } from '../router/dispatcher.js';
 import { startRolloutAdvanceTicker } from '../router/worker-rollout-advance.js';
 import { subscribeWorktreeSweepDispatch } from '../router/worktree-sweep-dispatch.js';
@@ -45,6 +46,9 @@ import {
 } from './settings.js';
 
 configureLogger({ component: 'control-plane' });
+// This process serves `/operator/mcp` too, so it keeps the same buffer the
+// router does for `control_plane_logs` (issue #1343).
+enableLogRingBuffer(CONTROL_PLANE_LOG_BUFFER_CAPACITY);
 
 let listen: ServeListen;
 try {

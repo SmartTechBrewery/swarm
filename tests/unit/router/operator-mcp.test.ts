@@ -131,6 +131,7 @@ vi.mock('@/identity/worker-enrollment-service.js', async () => ({
 }));
 
 import type { SwarmUser } from '@/identity/schema.js';
+import { enableLogRingBuffer, logger } from '@/lib/logger.js';
 import { type OperatorMcpDeps, registerOperatorMcp } from '@/router/operator-mcp.js';
 import { createMockProjectConfig, createMockProjectRecord } from '../../helpers/factories.js';
 
@@ -366,6 +367,7 @@ describe('operator MCP — the handshake', () => {
 		expect(tools.map((tool) => tool.name).sort()).toEqual([
 			'cli_rate_limits',
 			'consistency_check',
+			'control_plane_logs',
 			'dispatch_history',
 			'phase_agents_get',
 			'pipeline_snapshot',
@@ -767,6 +769,103 @@ describe('operator MCP — cli_rate_limits', () => {
 		expect(result.structuredContent).toMatchObject({
 			workers: [{ workerId: COOLING_WORKER_ID }],
 		});
+	});
+});
+
+// Issue #1343 — the router's own recent log lines, read from the logger's ring buffer.
+describe('operator MCP — control_plane_logs', () => {
+	beforeEach(() => {
+		vi.spyOn(console, 'info').mockImplementation(() => {});
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+		vi.spyOn(console, 'error').mockImplementation(() => {});
+		vi.stubEnv('SWARM_LOG_LEVEL', 'info');
+		enableLogRingBuffer(100);
+		logger.info('dispatched', { projectId: 'proj-a', taskId: '7', dispatchId: 'd-1' });
+		logger.warn('other project', { projectId: 'proj-b', taskId: '7' });
+		logger.error('no project at all');
+		logger.error('proj-a failed', { projectId: 'proj-a', prNumber: 12 });
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+		enableLogRingBuffer(0);
+	});
+
+	const messages = (result: ToolResult) =>
+		(result.structuredContent?.entries as Array<{ msg: string }>).map((entry) => entry.msg);
+
+	it("reads a contributor's project lines only, newest first, with the buffer's extent", async () => {
+		const result = await callTool('control_plane_logs', { projectId: 'proj-a' }, 'member-token');
+
+		expect(result.isError).toBeUndefined();
+		expect(messages(result)).toEqual(['proj-a failed', 'dispatched']);
+		expect(result.structuredContent).toMatchObject({
+			entries: [
+				{ level: 'error', msg: 'proj-a failed', context: { projectId: 'proj-a', prNumber: 12 } },
+				{ level: 'info', context: { taskId: '7', dispatchId: 'd-1' } },
+			],
+			buffer: { capacity: 100, size: 4 },
+		});
+	});
+
+	it('passes the filters through', async () => {
+		const byLevel = await callTool(
+			'control_plane_logs',
+			{ projectId: 'proj-a', level: 'error' },
+			'member-token',
+		);
+		const byPr = await callTool(
+			'control_plane_logs',
+			{ projectId: 'proj-a', prNumber: 12, since: '2000-01-01T00:00:00Z' },
+			'member-token',
+		);
+		const byDispatch = await callTool(
+			'control_plane_logs',
+			{ projectId: 'proj-a', dispatchId: 'd-1', until: '2000-01-01T00:00:00Z' },
+			'member-token',
+		);
+
+		expect(messages(byLevel)).toEqual(['proj-a failed']);
+		expect(messages(byPr)).toEqual(['proj-a failed']);
+		expect(messages(byDispatch)).toEqual([]);
+	});
+
+	it('hides a project the caller is not a member of', async () => {
+		const result = await callTool('control_plane_logs', { projectId: 'proj-a' }, 'stranger-token');
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toBe('NOT_FOUND: Project with ID "proj-a" not found');
+	});
+
+	it('refuses a non-admin who names no project', async () => {
+		const result = await callTool('control_plane_logs', { taskId: '7' }, 'member-token');
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toMatch(/^FORBIDDEN: /);
+	});
+
+	it('reads every line, including those naming no project, for an instance admin', async () => {
+		const result = await callTool('control_plane_logs', { limit: 3 }, 'admin-token');
+
+		expect(messages(result)).toEqual(['proj-a failed', 'no project at all', 'other project']);
+	});
+
+	it('cuts an overlong message', async () => {
+		logger.info('x'.repeat(5000), { projectId: 'proj-a' });
+
+		const result = await callTool(
+			'control_plane_logs',
+			{ projectId: 'proj-a', limit: 1 },
+			'member-token',
+		);
+
+		expect(messages(result)[0]).toBe(`${'x'.repeat(4000)}… [1000 more characters]`);
+	});
+
+	it('rejects a limit above 1000', async () => {
+		const result = await callTool('control_plane_logs', { limit: 1001 }, 'admin-token');
+
+		expect(result.isError).toBe(true);
 	});
 });
 
