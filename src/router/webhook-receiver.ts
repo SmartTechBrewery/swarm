@@ -15,11 +15,12 @@
  * A repo event names its project in the payload, so the SCM path parses, matches
  * the repo, then authenticates — and, for a CI event whose provider names no pull
  * request, completes it afterwards through the contract's commit→PR read
- * ({@link resolveChecksPullRequest}, issue #618). A board event carries no repo,
- * so the PM path parses, resolves the project **through the provider's own
- * `PMRouterAdapter.resolveProject`** (each provider knows which of its config keys
- * names the container — the receiver holds no board lookup of its own, issue #529),
- * then authenticates against that project's secret, then filters and
+ * ({@link resolveChecksPullRequest}, issue #618) — or, for one that names its pull
+ * request but no head, through the pull-request read (issue #1374). A board event
+ * carries no repo, so the PM path parses, resolves the project **through the
+ * provider's own `PMRouterAdapter.resolveProject`** (each provider knows which of
+ * its config keys names the container — the receiver holds no board lookup of its
+ * own, issue #529), then authenticates against that project's secret, then filters and
  * loop-prevents. In both cases nothing but the project match happens before
  * authentication, and no payload is trusted until it is authenticated.
  *
@@ -89,7 +90,12 @@ import { resolveCardRepository } from '../pm/repository-routing.js';
 import type { ItemRepositoryRoute, PMProvider, PMType } from '../pm/types.js';
 import { surfaceUnroutedCard } from '../pm/unrouted-card-notice.js';
 import type { ScmEvent } from '../scm/events.js';
-import type { CommitPullRequest, ScmType, ScmWebhookRequest } from '../scm/types.js';
+import type {
+	CommitPullRequest,
+	PullRequestDetails,
+	ScmType,
+	ScmWebhookRequest,
+} from '../scm/types.js';
 import { enqueuePmEvent, enqueueScmEvent } from './enqueue.js';
 import { resolveWebhookCallbackUrl } from './webhook-callback-url.js';
 
@@ -335,13 +341,20 @@ async function authenticatePmWebhook(
  * would instead need an operator to hand-replay the delivery, since GitHub,
  * Bitbucket and GitLab do not redeliver a failed webhook on their own, and Azure
  * DevOps' retries end by putting a failing subscription on probation.
+ *
+ * The twin case — a `checks` event that names its pull request but **no head** —
+ * is completed by {@link completeChecksHead} (issue #1374).
  */
 async function resolveChecksPullRequest(
 	manifest: SCMProviderManifest,
 	project: ProjectConfig,
 	event: ScmEvent,
 ): Promise<ScmEvent> {
-	if (event.kind !== 'checks' || event.workItemId !== undefined || !event.headSha) return event;
+	if (event.kind !== 'checks') return event;
+	if (event.workItemId !== undefined && !event.headSha) {
+		return completeChecksHead(manifest, project, event, event.workItemId);
+	}
+	if (event.workItemId !== undefined || !event.headSha) return event;
 
 	const logContext = { providerId: manifest.id, projectId: project.id, headSha: event.headSha };
 	let pulls: CommitPullRequest[];
@@ -365,6 +378,53 @@ async function resolveChecksPullRequest(
 	}
 
 	return { ...event, workItemId: String(open.number), prBranch: open.headBranch };
+}
+
+/**
+ * Complete a `checks` event that names its pull request but not its head, from
+ * the pull request's own source-branch head (issue #1374).
+ *
+ * A provider may know which pull request a build belongs to without knowing the
+ * head it built: an Azure DevOps merge-ref build (`refs/pull/{n}/merge`) whose
+ * delivery carries no `triggerInfo` reports only the merge commit, which is never
+ * the head — reviewing it would bypass the PR + head Review dedup and record a
+ * merge commit as the reviewed head. So the head comes from the contract's own
+ * {@link SCMProvider.getPullRequest}: the pull request's *current* head, which may
+ * be newer than the built commit if the branch moved, and that newer head's own
+ * build delivers too.
+ *
+ * Same rules as the commit→PR completion above: only an **open** pull request is
+ * adopted, and a failed read **fails open** — the event is enqueued without a
+ * head, where the Review trigger skips it, which is the safe direction (a missed
+ * wake is retried by the next build, a wrong head re-reviews).
+ */
+async function completeChecksHead(
+	manifest: SCMProviderManifest,
+	project: ProjectConfig,
+	event: ScmEvent,
+	workItemId: string,
+): Promise<ScmEvent> {
+	const prNumber = Number(workItemId);
+	if (!Number.isInteger(prNumber)) return event;
+
+	const logContext = { providerId: manifest.id, projectId: project.id, workItemId };
+	let pr: PullRequestDetails;
+	try {
+		pr = await manifest.provider.getPullRequest(project, prNumber);
+	} catch (error) {
+		logger.warn('Could not resolve the head of the pull request a CI event belongs to', {
+			...logContext,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return event;
+	}
+
+	if (pr.state !== 'open') {
+		logger.debug('CI event names a pull request that is no longer open', logContext);
+		return event;
+	}
+
+	return { ...event, headSha: pr.headSha, prBranch: event.prBranch ?? pr.headBranch };
 }
 
 /** Handle a repo-scoped SCM event (a pull request, a review, a comment, checks, …). */
@@ -416,7 +476,7 @@ async function handleScmEvent(
 	}
 
 	// After loop prevention, so a dropped event never pays for the credential-scoped
-	// commit→PR read.
+	// commit→PR (or PR→head) read.
 	const resolved = await resolveChecksPullRequest(manifest, project, event);
 
 	await deps.enqueue(manifest.id, resolved, project, request.deliveryId);
