@@ -125,6 +125,7 @@ import {
 	listProjectDispatchCandidates,
 	listProjectRoster,
 	listProjectWorkerIdsInOrder,
+	listWorkerProjectCapacity,
 	moveProjectWorkerOrder,
 	setSharingConsent,
 	suspendEnrollmentsForMismatchedRepository,
@@ -277,6 +278,51 @@ describe('deriveWorkerRunState (busy/current-run from run lifecycle)', () => {
 		getLiveSessionForWorker.mockResolvedValue({ currentRunId: RUN_ID });
 		getRunByIdFromDb.mockResolvedValue(undefined);
 		expect(await deriveWorkerRunState(WORKER_ID)).toEqual({ busy: false, currentRunId: null });
+	});
+});
+
+describe('listWorkerProjectCapacity (issue #1341)', () => {
+	beforeEach(() => {
+		listEnrollmentsForWorker.mockResolvedValue([
+			makeEnrollment({ projectId: 'proj-a', concurrencyAllocation: 2 }),
+			makeEnrollment({ id: 'e2', projectId: 'proj-b', status: 'suspended' }),
+		]);
+		getWorkerDispatchClaimState.mockImplementation(async (_workerId: string, projectId: string) =>
+			projectId === 'proj-a'
+				? { activeRuns: 1, currentRunId: RUN_ID }
+				: { activeRuns: 3, currentRunId: null },
+		);
+	});
+
+	it('reports each visible enrollment’s allocation against its in-flight claims', async () => {
+		const capacity = await listWorkerProjectCapacity(WORKER_ID, null);
+
+		expect(capacity).toEqual([
+			{
+				projectId: 'proj-a',
+				status: 'active',
+				isRoutable: true,
+				concurrencyAllocation: 2,
+				activeRuns: 1,
+			},
+			{
+				projectId: 'proj-b',
+				status: 'suspended',
+				isRoutable: false,
+				concurrencyAllocation: 1,
+				activeRuns: 3,
+			},
+		]);
+		expect(getWorkerDispatchClaimState).toHaveBeenCalledWith(WORKER_ID, 'proj-a');
+	});
+
+	// A contributor of one project must learn nothing about the machine's others —
+	// neither that the enrollment exists nor what it is running there.
+	it('leaves out an enrollment outside the scope without reading its claims', async () => {
+		const capacity = await listWorkerProjectCapacity(WORKER_ID, ['proj-a']);
+
+		expect(capacity.map((entry) => entry.projectId)).toEqual(['proj-a']);
+		expect(getWorkerDispatchClaimState).not.toHaveBeenCalledWith(WORKER_ID, 'proj-b');
 	});
 });
 
