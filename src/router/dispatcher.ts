@@ -42,7 +42,10 @@
 
 import { Worker } from 'bullmq';
 import { failStaleRunningRuns, updateRunJobPayload } from '../db/repositories/runsRepository.js';
-import { recordWorkerCliRateLimit } from '../db/repositories/workerCliRateLimitsRepository.js';
+import {
+	MAX_CLI_COOLDOWN_MS,
+	recordWorkerCliRateLimit,
+} from '../db/repositories/workerCliRateLimitsRepository.js';
 import {
 	BASE_BRANCH_HEALTH_SWEEP_INTERVAL_MS,
 	sweepBaseBranchHealth,
@@ -155,14 +158,6 @@ const DEFAULT_PHASE_TIMEOUT_MS = resolveAgentTimeoutMs();
 
 /** Grace past the largest configured timeout before a `running` run row is judged stale. */
 const STALE_RUN_MARGIN_MS = 10 * 60 * 1000;
-
-/**
- * The longest a reported reset may hold a `(worker, CLI)` out of routing — the
- * bound on a mis-parsed reset for the cooldown alone, where the run's own retry is
- * bounded by `MAX_RETRY_DELAY_MS` (issue #1265). A little over a week, so a weekly
- * allowance is honoured in full.
- */
-const MAX_CLI_COOLDOWN_MS = 8 * 24 * 60 * 60 * 1000;
 
 /**
  * How many dispatch wake-ups the consumer pulls off the queue at once. Not a

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const {
 	AllowedClisNotCapableError,
@@ -132,6 +132,12 @@ const { findProjectByIdFromDb, listAllProjectRecordsFromDb } = vi.hoisted(() => 
 const { requireProjectSCMProviderId } = vi.hoisted(() => ({
 	requireProjectSCMProviderId: vi.fn(),
 }));
+// Issue #1350 — the operator-set cool-down's live read and its extend-only write;
+// the upsert's own `WHERE` is pinned by the repository's integration suite.
+const { extendWorkerCliRateLimits, listActiveCliRateLimitsForWorkers } = vi.hoisted(() => ({
+	extendWorkerCliRateLimits: vi.fn(),
+	listActiveCliRateLimitsForWorkers: vi.fn(),
+}));
 
 vi.mock('@/identity/worker-enrollment-service.js', async () => ({
 	AllowedClisNotCapableError,
@@ -197,6 +203,13 @@ vi.mock('@/db/repositories/projectsRepository.js', async () => ({
 	)),
 	findProjectByIdFromDb,
 	listAllProjectRecordsFromDb,
+}));
+vi.mock('@/db/repositories/workerCliRateLimitsRepository.js', async () => ({
+	...(await vi.importActual<typeof import('@/db/repositories/workerCliRateLimitsRepository.js')>(
+		'@/db/repositories/workerCliRateLimitsRepository.js',
+	)),
+	extendWorkerCliRateLimits,
+	listActiveCliRateLimitsForWorkers,
 }));
 vi.mock('@/integrations/scm/registry.js', async () => ({
 	...(await vi.importActual<typeof import('@/integrations/scm/registry.js')>(
@@ -335,6 +348,8 @@ beforeEach(() => {
 		findProjectByIdFromDb,
 		requireProjectSCMProviderId,
 		resolveOwnBuildIdentity,
+		extendWorkerCliRateLimits,
+		listActiveCliRateLimitsForWorkers,
 	]) {
 		m.mockReset();
 	}
@@ -1773,6 +1788,178 @@ describe('workers.setDraining (owner-only, no instanceAdmin override, issue #919
 		await expect(owner.setDraining({ workerId: WORKER_ID, draining: true })).rejects.toThrowError(
 			expect.objectContaining({ code: 'NOT_FOUND' }),
 		);
+	});
+});
+
+// Issue #1350 — an operator-set cool-down: the machine owner's or an
+// instanceAdmin's call, extend-only, and bounded by the observed-reset ceiling.
+describe('workers.previewCliRateLimit / setCliRateLimit (owner or instanceAdmin, issue #1350)', () => {
+	const NOW = new Date('2026-11-06T12:00:00.000Z');
+	const IN_TWO_HOURS = '2026-11-06T14:00:00.000Z';
+	const IN_FIVE_HOURS = '2026-11-06T17:00:00.000Z';
+	const SECOND_WORKER_ID = '22222222-2222-4222-8222-222222222222';
+	const base = { workerId: WORKER_ID, cli: 'claude' as const, until: IN_TWO_HOURS };
+
+	function liveLimit(workerId: string, expiresAt: string, cli = 'claude') {
+		return { workerId, cli, expiresAt: new Date(expiresAt), observedAt: NOW, resetHint: null };
+	}
+
+	beforeEach(() => {
+		vi.useFakeTimers({ now: NOW, toFake: ['Date'] });
+		listActiveCliRateLimitsForWorkers.mockResolvedValue(new Map());
+		extendWorkerCliRateLimits.mockImplementation(async ({ workerIds }) => workerIds);
+	});
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	it.each([
+		['an unknown worker', undefined],
+		['a worker owned by someone else', makeWorker({ ownerUserId: OTHER_ID })],
+	])('is NOT_FOUND for %s, writing nothing', async (_label, worker) => {
+		getWorker.mockResolvedValue(worker);
+
+		await expect(owner.setCliRateLimit(base)).rejects.toThrowError(
+			expect.objectContaining({ code: 'NOT_FOUND' }),
+		);
+		await expect(owner.previewCliRateLimit(base)).rejects.toThrowError(
+			expect.objectContaining({ code: 'NOT_FOUND' }),
+		);
+		expect(extendWorkerCliRateLimits).not.toHaveBeenCalled();
+		expect(listActiveCliRateLimitsForWorkers).not.toHaveBeenCalled();
+	});
+
+	it("lets an instanceAdmin block another owner's machine", async () => {
+		const admin = workersRouter.createCaller({ user: ADMIN_USER });
+		getWorker.mockResolvedValue(makeWorker({ ownerUserId: OWNER_ID }));
+
+		const result = await admin.setCliRateLimit(base);
+
+		expect(result.workers).toEqual([
+			{
+				workerId: WORKER_ID,
+				displayName: 'ada-laptop',
+				currentExpiresAt: null,
+				newExpiresAt: IN_TWO_HOURS,
+				change: 'create',
+			},
+		]);
+		expect(extendWorkerCliRateLimits).toHaveBeenCalledWith({
+			workerIds: [WORKER_ID],
+			cli: 'claude',
+			expiresAt: new Date(IN_TWO_HOURS),
+			observedAt: NOW,
+			resetHint: null,
+		});
+	});
+
+	it('previews current vs new expiry per machine without writing', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		listActiveCliRateLimitsForWorkers.mockResolvedValue(
+			new Map([[WORKER_ID, [liveLimit(WORKER_ID, '2026-11-06T13:00:00.000Z')]]]),
+		);
+
+		const preview = await owner.previewCliRateLimit({ ...base, resetHint: 'weekly limit' });
+
+		expect(preview).toEqual({
+			cli: 'claude',
+			scope: 'worker',
+			requestedExpiresAt: IN_TWO_HOURS,
+			resetHint: 'weekly limit',
+			workers: [
+				{
+					workerId: WORKER_ID,
+					displayName: 'ada-laptop',
+					currentExpiresAt: '2026-11-06T13:00:00.000Z',
+					newExpiresAt: IN_TWO_HOURS,
+					change: 'extend',
+				},
+			],
+		});
+		expect(listActiveCliRateLimitsForWorkers).toHaveBeenCalledWith([WORKER_ID], NOW);
+		expect(extendWorkerCliRateLimits).not.toHaveBeenCalled();
+	});
+
+	// Extend only: a later cool-down — on the CLI asked about, not another one — is
+	// kept, and the write's own answer decides what the result reports.
+	it('never shortens a later cool-down and reports it unchanged', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		listActiveCliRateLimitsForWorkers.mockResolvedValue(
+			new Map([
+				[
+					WORKER_ID,
+					[liveLimit(WORKER_ID, IN_FIVE_HOURS), liveLimit(WORKER_ID, NOW.toISOString(), 'codex')],
+				],
+			]),
+		);
+		extendWorkerCliRateLimits.mockResolvedValue([]);
+
+		const preview = await owner.previewCliRateLimit(base);
+		const result = await owner.setCliRateLimit(base);
+
+		for (const answer of [preview, result]) {
+			expect(answer.workers).toEqual([
+				expect.objectContaining({
+					currentExpiresAt: IN_FIVE_HOURS,
+					newExpiresAt: IN_FIVE_HOURS,
+					change: 'unchanged',
+				}),
+			]);
+		}
+	});
+
+	it("blocks every machine the worker's owner operates with scope 'owner'", async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		listWorkersForOwner.mockResolvedValue([
+			makeWorker(),
+			makeWorker({ id: SECOND_WORKER_ID, displayName: 'ada-mini' }),
+		]);
+		listActiveCliRateLimitsForWorkers.mockResolvedValue(
+			new Map([[SECOND_WORKER_ID, [liveLimit(SECOND_WORKER_ID, IN_FIVE_HOURS)]]]),
+		);
+		extendWorkerCliRateLimits.mockResolvedValue([WORKER_ID]);
+
+		const result = await owner.setCliRateLimit({
+			...base,
+			scope: 'owner',
+			durationMinutes: 120,
+			until: undefined,
+		});
+
+		expect(listWorkersForOwner).toHaveBeenCalledWith(OWNER_ID);
+		expect(extendWorkerCliRateLimits).toHaveBeenCalledWith(
+			expect.objectContaining({ workerIds: [WORKER_ID, SECOND_WORKER_ID] }),
+		);
+		expect(result.workers.map((line) => [line.workerId, line.change, line.newExpiresAt])).toEqual([
+			[WORKER_ID, 'create', IN_TWO_HOURS],
+			[SECOND_WORKER_ID, 'unchanged', IN_FIVE_HOURS],
+		]);
+	});
+
+	it.each([
+		['neither `until` nor `durationMinutes`', { until: undefined }, /exactly one/],
+		['both `until` and `durationMinutes`', { durationMinutes: 60 }, /exactly one/],
+		['an expiry in the past', { until: '2026-11-06T11:00:00.000Z' }, /in the future/],
+		[
+			'an expiry past the eight-day ceiling',
+			{ until: '2026-11-14T12:00:01.000Z' },
+			/at most 8 days/,
+		],
+	])('refuses %s with BAD_REQUEST, writing nothing', async (_label, overrides, message) => {
+		getWorker.mockResolvedValue(makeWorker());
+
+		await expect(owner.setCliRateLimit({ ...base, ...overrides })).rejects.toThrowError(
+			expect.objectContaining({ code: 'BAD_REQUEST', message: expect.stringMatching(message) }),
+		);
+		expect(extendWorkerCliRateLimits).not.toHaveBeenCalled();
+	});
+
+	it('accepts an expiry exactly at the ceiling', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+
+		await expect(
+			owner.setCliRateLimit({ ...base, until: '2026-11-14T12:00:00.000Z' }),
+		).resolves.toMatchObject({ requestedExpiresAt: '2026-11-14T12:00:00.000Z' });
 	});
 });
 

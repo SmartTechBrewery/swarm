@@ -170,6 +170,32 @@ vi.mock('@/identity/worker-enrollment-service.js', async () => ({
 	listWorkerProjectCapacity,
 }));
 
+// Issue #1350 — `cli_rate_limit_set` resolves its worker and its owner's machines
+// through the worker service, and reads and extends cool-downs through the
+// repository; the extend-only upsert itself is pinned by its integration suite.
+const { getWorker, listWorkersForOwner } = vi.hoisted(() => ({
+	getWorker: vi.fn(),
+	listWorkersForOwner: vi.fn(),
+}));
+vi.mock('@/identity/worker-service.js', async () => ({
+	...(await vi.importActual<typeof import('@/identity/worker-service.js')>(
+		'@/identity/worker-service.js',
+	)),
+	getWorker,
+	listWorkersForOwner,
+}));
+const { extendWorkerCliRateLimits, listActiveCliRateLimitsForWorkers } = vi.hoisted(() => ({
+	extendWorkerCliRateLimits: vi.fn(),
+	listActiveCliRateLimitsForWorkers: vi.fn(),
+}));
+vi.mock('@/db/repositories/workerCliRateLimitsRepository.js', async () => ({
+	...(await vi.importActual<typeof import('@/db/repositories/workerCliRateLimitsRepository.js')>(
+		'@/db/repositories/workerCliRateLimitsRepository.js',
+	)),
+	extendWorkerCliRateLimits,
+	listActiveCliRateLimitsForWorkers,
+}));
+
 import type { SwarmUser } from '@/identity/schema.js';
 import { enableLogRingBuffer, logger } from '@/lib/logger.js';
 import {
@@ -384,6 +410,10 @@ beforeEach(() => {
 	promoteDependencyWaits.mockReset().mockResolvedValue([]);
 	publishDispatchWakeUp.mockReset().mockResolvedValue(undefined);
 	clearRunCancellation.mockReset().mockResolvedValue(undefined);
+	getWorker.mockReset().mockResolvedValue(undefined);
+	listWorkersForOwner.mockReset().mockResolvedValue([]);
+	extendWorkerCliRateLimits.mockReset().mockResolvedValue([]);
+	listActiveCliRateLimitsForWorkers.mockReset().mockResolvedValue(new Map());
 });
 
 afterEach(() => {
@@ -496,9 +526,15 @@ describe('operator MCP — the handshake', () => {
 			};
 		};
 		const tools = listBody.result.tools;
-		const WRITE_TOOLS = ['dependency_waits_wake', 'dispatch_redispatch_now', 'run_reset'];
+		const WRITE_TOOLS = [
+			'cli_rate_limit_set',
+			'dependency_waits_wake',
+			'dispatch_redispatch_now',
+			'run_reset',
+		];
 
 		expect(tools.map((tool) => tool.name).sort()).toEqual([
+			'cli_rate_limit_set',
 			'cli_rate_limits',
 			'consistency_check',
 			'control_plane_logs',
@@ -1604,5 +1640,160 @@ describe('operator MCP — dependency_waits_wake', () => {
 			projectId: null,
 			outcome: 'refused',
 		});
+	});
+});
+
+describe('operator MCP — cli_rate_limit_set', () => {
+	const NOW = new Date('2026-11-06T12:00:00.000Z');
+	const UNTIL = '2026-11-06T18:00:00.000Z';
+	const OTHER_WORKER_ID = '99999999-9999-4999-8999-999999999999';
+	/** A worker as the service returns it, reduced to what the procedure reads. */
+	function machine(id: string, displayName: string, ownerUserId = MEMBER.id) {
+		return { id, displayName, ownerUserId };
+	}
+
+	beforeEach(() => {
+		vi.useFakeTimers({ now: NOW, toFake: ['Date'] });
+		getWorker.mockImplementation(async (id: string) =>
+			id === WORKER_ID ? machine(WORKER_ID, 'idle-box') : undefined,
+		);
+		listWorkersForOwner.mockResolvedValue([
+			machine(WORKER_ID, 'idle-box'),
+			machine(OTHER_WORKER_ID, 'second-box'),
+		]);
+		listActiveCliRateLimitsForWorkers.mockResolvedValue(
+			new Map([
+				[
+					OTHER_WORKER_ID,
+					[
+						{
+							...COOL_DOWN,
+							workerId: OTHER_WORKER_ID,
+							expiresAt: new Date('2026-11-06T15:00:00Z'),
+						},
+					],
+				],
+			]),
+		);
+		extendWorkerCliRateLimits.mockImplementation(async ({ workerIds }) => workerIds);
+	});
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	function auditRow() {
+		expect(recordOperatorAction).toHaveBeenCalledTimes(1);
+		expect(settleOperatorAction).toHaveBeenCalledTimes(1);
+		return {
+			...recordOperatorAction.mock.calls[0]?.[0],
+			...settleOperatorAction.mock.calls[0]?.[1],
+		};
+	}
+
+	it("answers a dry run with every owner machine's current and new expiry, writing nothing", async () => {
+		const result = await callTool(
+			'cli_rate_limit_set',
+			{
+				workerId: WORKER_ID,
+				cli: 'claude',
+				until: UNTIL,
+				scope: 'owner',
+				reason: 'the Claude subscription is spent until tonight',
+				dryRun: true,
+			},
+			'member-token',
+		);
+
+		expect(result.isError).toBeUndefined();
+		expect(result.structuredContent).toEqual({
+			dryRun: true,
+			auditId: 'audit-1',
+			preview: {
+				cli: 'claude',
+				scope: 'owner',
+				requestedExpiresAt: UNTIL,
+				resetHint: null,
+				workers: [
+					{
+						workerId: WORKER_ID,
+						displayName: 'idle-box',
+						currentExpiresAt: null,
+						newExpiresAt: UNTIL,
+						change: 'create',
+					},
+					{
+						workerId: OTHER_WORKER_ID,
+						displayName: 'second-box',
+						currentExpiresAt: '2026-11-06T15:00:00.000Z',
+						newExpiresAt: UNTIL,
+						change: 'extend',
+					},
+				],
+			},
+		});
+		expect(listWorkersForOwner).toHaveBeenCalledWith(MEMBER.id);
+		expect(extendWorkerCliRateLimits).not.toHaveBeenCalled();
+		expect(auditRow()).toMatchObject({
+			tool: 'cli_rate_limit_set',
+			target: `${WORKER_ID}:claude`,
+			projectId: null,
+			dryRun: true,
+			outcome: 'succeeded',
+		});
+	});
+
+	it("blocks the owner's own machine and audits the call", async () => {
+		const result = await callTool(
+			'cli_rate_limit_set',
+			{
+				workerId: WORKER_ID,
+				cli: 'claude',
+				durationMinutes: 360,
+				resetHint: 'weekly limit',
+				reason: 'spent from another tool',
+			},
+			'member-token',
+		);
+
+		expect(result.isError).toBeUndefined();
+		expect(result.structuredContent).toMatchObject({
+			dryRun: false,
+			result: {
+				scope: 'worker',
+				requestedExpiresAt: UNTIL,
+				workers: [{ workerId: WORKER_ID, change: 'create', newExpiresAt: UNTIL }],
+			},
+		});
+		expect(extendWorkerCliRateLimits).toHaveBeenCalledWith({
+			workerIds: [WORKER_ID],
+			cli: 'claude',
+			expiresAt: new Date(UNTIL),
+			observedAt: NOW,
+			resetHint: 'weekly limit',
+		});
+		expect(auditRow()).toMatchObject({
+			userId: MEMBER.id,
+			projectId: null,
+			dryRun: false,
+			outcome: 'succeeded',
+			error: null,
+		});
+	});
+
+	it.each([
+		[false],
+		[true],
+	])("hides another owner's worker from a non-admin (dryRun %s) and audits the refusal", async (dryRun) => {
+		const result = await callTool(
+			'cli_rate_limit_set',
+			{ workerId: WORKER_ID, cli: 'claude', until: UNTIL, reason: 'trying', dryRun },
+			'stranger-token',
+		);
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toBe(`NOT_FOUND: Worker with ID "${WORKER_ID}" not found`);
+		expect(listActiveCliRateLimitsForWorkers).not.toHaveBeenCalled();
+		expect(extendWorkerCliRateLimits).not.toHaveBeenCalled();
+		expect(auditRow()).toMatchObject({ outcome: 'refused', projectId: null, dryRun });
 	});
 });

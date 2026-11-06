@@ -244,15 +244,17 @@ the same way:
   as `INTERNAL_SERVER_ERROR`; a real call that failed may have half-happened. The
   row is written before the tool does anything. If it cannot be written, the call
   does nothing and says so. The table has no foreign keys, so a row survives the
-  deletion of the user or project it names. `project_id` is empty only when the
+  deletion of the user or project it names. `project_id` is empty when the
   call ended before its target resolved to a project, for example an
-  unknown run. No tool reads the audit table yet; query Postgres directly.
+  unknown run, and for a tool whose target belongs to no project
+  (`cli_rate_limit_set`, which acts on a worker). No tool reads the audit table yet; query Postgres directly.
 
 | Tool | What it does | Arguments |
 | --- | --- | --- |
 | `run_reset` | **Destructive.** Resets a wedged run and restarts its phase from scratch, as the dashboard's **Reset & restart** and `swarm run reset` do (`runs.reset`). It stops the run's live agent, cancels its active dispatch (even one a worker has claimed), clears its cancellation flag, tears down its checkout and discards uncommitted and unpushed work, and clears its recovery record. Then it re-dispatches the phase as a fresh first attempt. A run with no stored payload, or whose project is gone, is settled `failed` instead (`outcome: 'terminated'`). Refused only for an unknown run, a machine-maintenance run, or a reset already under way | `runId`, `reason`, `dryRun` (default `false`) |
 | `dispatch_redispatch_now` | Re-dispatches a `deferred`, `checkpointed` or `failed` run immediately, as the dashboard's **Retry now** does (`runs.retryNow`). It re-opens the run's waiting dispatch for an immediate attempt, superseding a scheduled automatic retry. A dispatch whose worker lease has lapsed is taken back first. A run with no dispatch gets a fresh one built from its stored payload. Retry budgets start again from zero. Refused for any other status, for a run a worker is executing, and for a run with neither a dispatch nor a stored payload | `runId`, `reason`, `dryRun` (default `false`) |
 | `dependency_waits_wake` | Wakes every dispatch in the project waiting on the dependency gate now, instead of at its next re-check (`SWARM_DEPENDENCY_RECHECK_MS`) — the same wake a merge or a board card reaching Done triggers on its own (`runs.wakeDependencyWaits`, logged with cause `operator`). The gate re-reads the blockers, so a dependent still blocked simply waits again, and the wake spends no attempt its re-check would not have. Returns `{ projectId, woken, dispatches }`, each dispatch with `dispatchId`, `phase`, `repository`, `taskId`, `prNumber`, `runId`, `attempt` and `availableAt`. A dispatch it could not wake is logged, left on its re-check, and not listed. The dry run (`runs.previewDependencyWake`) returns `{ projectId, wouldWake, dispatches }`: the waits it would wake, in the same shape | `projectId`, `reason`, `dryRun` (default `false`) |
+| `cli_rate_limit_set` | Keeps one agent CLI off a worker until `until` or for `durationMinutes` (`workers.setCliRateLimit`): the same `worker_cli_rate_limits` cool-down SWARM records when a run reports a spent allowance, so routing, the Workers screen and `cli_rate_limits` treat it exactly like an observed one, and it lapses by itself at its expiry. `scope: 'owner'` applies it to every worker the named worker's owner operates: SWARM records no CLI-account identity, so one user's machines stand in for "the same CLI account" (a subscription is usually signed in on all of them). **Extend only**: a machine whose live cool-down on that CLI already lasts at least as long is left `unchanged`, so nothing a real run recorded is ever shortened, and nothing is cleared early. Refused with `BAD_REQUEST` unless exactly one of `until`/`durationMinutes` is given, in the future, and at most eight days ahead (`MAX_CLI_COOLDOWN_MS`, the ceiling an observed reset has). Returns `{ cli, scope, requestedExpiresAt, resetHint, workers }`, each worker with `workerId`, `displayName`, `currentExpiresAt`, `newExpiresAt` and `change` (`create`, `extend` or `unchanged`). The dry run (`workers.previewCliRateLimit`) returns the same shape without writing | `workerId`, `cli`, `until?`, `durationMinutes?`, `resetHint?`, `scope` (`worker` or `owner`, default `worker`), `reason`, `dryRun` (default `false`) |
 
 `run_reset` and `dispatch_redispatch_now` need `member` on the run's project, the role that drives runs in the
 dashboard. A contributor can read the run but gets `FORBIDDEN`. Anyone else gets
@@ -263,6 +265,11 @@ dashboard. A contributor can read the run but gets `FORBIDDEN`. Anyone else gets
 board dispatch waiting on its dependencies, is not something it can re-dispatch;
 `dependency_waits_wake` wakes those. It needs `member` on the project it names,
 and so does its dry run; a contributor gets `FORBIDDEN`, anyone else `NOT_FOUND`.
+
+`cli_rate_limit_set` acts on a machine rather than a project, so it is gated like
+the dashboard's machine-owner actions: the worker's owner or an instance
+administrator may call it, and anyone else gets `NOT_FOUND`, dry run included. Its
+audit row names no project.
 
 ## For developers
 
@@ -290,5 +297,6 @@ gated exactly like the write, which runs first on every call and answers the dry
 run, and an `apply`, which is the dashboard mutation. The framework adds `reason`
 and `dryRun` and writes the `operator_actions` row
 (`src/db/repositories/operatorActionsRepository.ts`). The run tools live in
-`src/mcp/tools/run-actions.ts`, and `dependency_waits_wake` in
-`src/mcp/tools/dependency-waits.ts`.
+`src/mcp/tools/run-actions.ts`, `dependency_waits_wake` in
+`src/mcp/tools/dependency-waits.ts`, and `cli_rate_limit_set` in
+`src/mcp/tools/cli-rate-limit-set.ts`.

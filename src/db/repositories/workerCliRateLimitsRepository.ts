@@ -1,8 +1,18 @@
-import { and, asc, gt, inArray } from 'drizzle-orm';
+import { and, asc, gt, inArray, sql } from 'drizzle-orm';
 
 import type { AgentCli } from '../../harness/agent-cli.js';
 import { getDb } from '../client.js';
 import { workerCliRateLimits } from '../schema/workerCliRateLimits.js';
+
+/**
+ * The longest any cool-down may hold a `(worker, CLI)` out of routing — a little
+ * over a week, so a weekly allowance is honoured in full (issue #1265). It bounds
+ * both writers: the settle that records a reported reset
+ * (`recordReportedRateLimit`, `src/router/dispatcher.ts`), so no mis-parsed reset
+ * can hold a machine back indefinitely, and the operator's own block
+ * (`workers.setCliRateLimit`, issue #1350), which refuses an expiry past it.
+ */
+export const MAX_CLI_COOLDOWN_MS = 8 * 24 * 60 * 60 * 1000;
 
 /** One machine's cool-down on one CLI, as stored (issue #981). */
 export interface WorkerCliRateLimit {
@@ -54,6 +64,57 @@ export async function recordWorkerCliRateLimit(input: {
 				updatedAt: new Date(),
 			},
 		});
+}
+
+/**
+ * Record an operator's cool-down for one CLI on each of `workerIds` — **extend
+ * only** (issue #1350), the opposite rule to {@link recordWorkerCliRateLimit}.
+ *
+ * An observed deferral is the newest evidence about the machine's allowance, so it
+ * replaces whatever was there. An operator's block is not evidence about the
+ * allowance at all — it is "keep this CLI off these machines until at least then" —
+ * so it must never cut short a cool-down a real run recorded: a row is written only
+ * where none exists or the existing expiry is earlier than `expiresAt` (an expired
+ * row always is, since the caller asks for a future instant). Decided by the upsert's
+ * own `WHERE`, so a concurrent observation landing a later expiry is kept rather
+ * than overwritten by a read-then-write race.
+ *
+ * Returns the ids of the workers whose row was written; a worker missing from the
+ * answer already held a cool-down lasting at least as long and was left alone.
+ */
+export async function extendWorkerCliRateLimits(input: {
+	workerIds: string[];
+	cli: AgentCli;
+	expiresAt: Date;
+	observedAt: Date;
+	resetHint: string | null;
+}): Promise<string[]> {
+	if (input.workerIds.length === 0) return [];
+	const now = new Date();
+	const rows = await getDb()
+		.insert(workerCliRateLimits)
+		.values(
+			input.workerIds.map((workerId) => ({
+				workerId,
+				cli: input.cli,
+				expiresAt: input.expiresAt,
+				observedAt: input.observedAt,
+				resetHint: input.resetHint,
+				updatedAt: now,
+			})),
+		)
+		.onConflictDoUpdate({
+			target: [workerCliRateLimits.workerId, workerCliRateLimits.cli],
+			set: {
+				expiresAt: input.expiresAt,
+				observedAt: input.observedAt,
+				resetHint: input.resetHint,
+				updatedAt: now,
+			},
+			setWhere: sql`${workerCliRateLimits.expiresAt} < excluded.expires_at`,
+		})
+		.returning({ workerId: workerCliRateLimits.workerId });
+	return rows.map((row) => row.workerId);
 }
 
 /**
