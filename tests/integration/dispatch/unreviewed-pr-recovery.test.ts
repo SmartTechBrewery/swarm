@@ -55,6 +55,7 @@ function candidate(overrides: Partial<PullRequestDetails> = {}): PullRequestDeta
 		mergeable: true,
 		authorLogin: 'operator',
 		state: 'open',
+		merged: false,
 		...overrides,
 	};
 }
