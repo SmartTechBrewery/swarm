@@ -32,8 +32,10 @@ import {
 	listAvailabilityWaitsForWorker,
 	listDeferredRunsWithoutActiveDispatch,
 	listDependencyWaits,
+	listDispatchesForTask,
 	listMergeChecksWaits,
 	listMergeQueueWaits,
+	listOpenDispatchesForProject,
 	listPullRequestInFlightWaits,
 	listRepositoriesWithWipWaits,
 	listRunnableDispatchesForPool,
@@ -2436,6 +2438,90 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 
 			expect(await listActiveDispatchTaskRefs([])).toEqual([]);
 			expect(await listActiveDispatchTaskRefs()).toHaveLength(1);
+		});
+	});
+
+	describe('pipeline snapshot reads (issue #1340)', () => {
+		const PR = { repository: REPO, prNumber: '501' };
+
+		it('lists every open state of the project, executing attempts included', async () => {
+			await seedDispatchInState('92', 'pending', undefined);
+			await seedDispatchInState('93', 'leased', undefined);
+			await seedDispatchInState('94', 'running', undefined);
+			await seedDispatchInState('95', 'retry-scheduled', undefined);
+			await seedDispatchInState('96', 'completed', undefined);
+			await seedDispatchInState('97', 'cancelled', undefined);
+			await seedProject({ id: 'proj-other-dispatches', repo: 'jkwiecien/other-repo' });
+			await createDispatch({
+				projectId: 'proj-other-dispatches',
+				jobPayload: job({ projectId: 'proj-other-dispatches' }),
+				source: 'manual',
+				taskId: '99',
+			});
+
+			const open = await listOpenDispatchesForProject(PROJECT_ID, 10);
+
+			expect(open.map((row) => row.taskId).sort()).toEqual(['92', '93', '94', '95']);
+		});
+
+		it('bounds the open read', async () => {
+			for (const taskId of ['1', '2', '3']) await seedDispatchInState(taskId, 'pending', undefined);
+
+			expect(await listOpenDispatchesForProject(PROJECT_ID, 2)).toHaveLength(2);
+		});
+
+		it("lists a task's dispatches oldest first, terminal ones included", async () => {
+			const first = await seedDispatchInState('120', 'completed', undefined, 'implementation');
+			const second = await seedDispatchInState('120', 'failed', undefined, 'review', PR);
+			const third = await seedDispatchInState('120', 'pending', undefined, 'review', PR);
+			await seedDispatchInState('121', 'pending', undefined);
+
+			const history = await listDispatchesForTask(PROJECT_ID, { taskId: '120' }, 10);
+
+			expect(history.map((row) => row.id)).toEqual([first, second, third]);
+		});
+
+		it('matches a pull request, and either identity when both are named', async () => {
+			const board = await seedDispatchInState('130', 'completed', undefined, 'implementation');
+			const review = await seedDispatchInState('131', 'pending', undefined, 'review', PR);
+
+			expect(
+				(await listDispatchesForTask(PROJECT_ID, { prNumber: '501' }, 10)).map((row) => row.id),
+			).toEqual([review]);
+			expect(
+				(await listDispatchesForTask(PROJECT_ID, { taskId: '130', prNumber: '501' }, 10)).map(
+					(row) => row.id,
+				),
+			).toEqual([board, review]);
+		});
+
+		it('narrows to a repository when one is named', async () => {
+			await seedDispatchInState('140', 'pending', undefined, 'review', PR);
+
+			expect(
+				await listDispatchesForTask(PROJECT_ID, { prNumber: '501', repository: 'other/repo' }, 10),
+			).toEqual([]);
+			expect(
+				await listDispatchesForTask(PROJECT_ID, { prNumber: '501', repository: REPO }, 10),
+			).toHaveLength(1);
+		});
+
+		it('keeps the newest rows when the bound bites, still oldest first', async () => {
+			await seedDispatchInState('150', 'completed', undefined);
+			const second = await seedDispatchInState('150', 'completed', undefined);
+			const third = await seedDispatchInState('150', 'pending', undefined);
+
+			const history = await listDispatchesForTask(PROJECT_ID, { taskId: '150' }, 2);
+
+			expect(history.map((row) => row.id)).toEqual([second, third]);
+		});
+
+		// A filter naming no task and no pull request must never become the whole project.
+		it('answers a filter naming neither identity with no rows', async () => {
+			await seedDispatchInState('160', 'pending', undefined);
+
+			expect(await listDispatchesForTask(PROJECT_ID, {}, 10)).toEqual([]);
+			expect(await listDispatchesForTask(PROJECT_ID, { repository: REPO }, 10)).toEqual([]);
 		});
 	});
 

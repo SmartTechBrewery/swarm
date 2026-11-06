@@ -137,6 +137,14 @@ import type { TriggerPhase } from '../../triggers/types.js';
 import { GitWorktreeManager } from '../../worker/git-worktree-manager.js';
 import { reconcileTerminatedWorktree } from '../../worktree/termination-cleanup.js';
 import { accessibleProjectScope, assertInstanceAdmin, assertProjectAccess } from '../authz.js';
+import {
+	DEFAULT_SNAPSHOT_WINDOW_HOURS,
+	type DispatchHistory,
+	loadDispatchHistory,
+	loadPipelineSnapshot,
+	MAX_SNAPSHOT_WINDOW_HOURS,
+	type PipelineSnapshot,
+} from '../pipeline-snapshot.js';
 import { authedProcedure, router } from '../trpc.js';
 
 const QUEUED_WORK_ITEM_CACHE_TTL_MS = 30_000;
@@ -427,6 +435,33 @@ export const ListRunsInputSchema = z.object({
 	sort: z.enum(['startedAt', 'completedAt'] satisfies [ListRunsSort, ...ListRunsSort[]]).optional(),
 	order: z.enum(['asc', 'desc']).optional(),
 });
+
+/** `runs.pipelineSnapshot`'s input (issue #1340). */
+export const PipelineSnapshotInputSchema = z.object({
+	projectId: z.string().min(1),
+	windowHours: z
+		.number()
+		.positive()
+		.max(MAX_SNAPSHOT_WINDOW_HOURS)
+		.default(DEFAULT_SNAPSHOT_WINDOW_HOURS),
+});
+
+/**
+ * `runs.dispatchHistory`'s input fields (issue #1340), held unrefined so the MCP
+ * tool can re-use the shape; the procedure adds the "name a task or a pull request"
+ * rule on top ({@link DispatchHistoryInputSchema}).
+ */
+export const DispatchHistoryInputFields = z.object({
+	projectId: z.string().min(1),
+	repository: z.string().min(1).optional(),
+	taskId: z.string().min(1).optional(),
+	prNumber: z.string().min(1).optional(),
+});
+
+const DispatchHistoryInputSchema = DispatchHistoryInputFields.refine(
+	(input) => input.taskId !== undefined || input.prNumber !== undefined,
+	{ message: 'Name a taskId or a prNumber.' },
+);
 
 type ListRunsInput = z.infer<typeof ListRunsInputSchema>;
 
@@ -1855,6 +1890,35 @@ export const runsRouter = router({
 			}
 			assertInstanceAdmin(ctx.user, 'WIP usage');
 			return loadWipUsage(await listAllProjectRecordsFromDb());
+		}),
+
+	// One project's whole pipeline state in one call (issue #1340): its unsettled
+	// runs and the runs that failed in the window, every open dispatch, and how many
+	// runs settled in the window by status — `./pipeline-snapshot.ts`. The read behind
+	// the operator MCP server's `pipeline_snapshot` tool, meant to be cheap enough
+	// for a periodic guard. Postgres only, every list bounded.
+	//
+	// Authorization is `runs.list`'s with a `projectId`: contributor access to the
+	// one project, a non-member reading it as not found. There is deliberately no
+	// installation-wide form. Not part of `runReadProcedures`, so the operator tRPC
+	// surface does not gain it.
+	pipelineSnapshot: authedProcedure
+		.input(PipelineSnapshotInputSchema)
+		.query(async ({ ctx, input }): Promise<PipelineSnapshot> => {
+			await assertProjectAccess(ctx.user, input.projectId, 'contributor');
+			return loadPipelineSnapshot(input.projectId, input.windowHours);
+		}),
+
+	// Every dispatch of one task or pull request, oldest first, with its state,
+	// phase, attempts, outcome, wait reason, last error and the run it executed
+	// against (issue #1340) — the read behind the MCP `dispatch_history` tool.
+	// Authorization is `pipelineSnapshot`'s.
+	dispatchHistory: authedProcedure
+		.input(DispatchHistoryInputSchema)
+		.query(async ({ ctx, input }): Promise<DispatchHistory> => {
+			const { projectId, ...filter } = input;
+			await assertProjectAccess(ctx.user, projectId, 'contributor');
+			return loadDispatchHistory(projectId, filter);
 		}),
 
 	// Fire a run's retry immediately ("Retry now", issues #136, #284).

@@ -2427,6 +2427,60 @@ export async function listTaskActivitySince(input: {
 	);
 }
 
+/**
+ * The run half of one project's pipeline snapshot (issue #1340): every run still
+ * moving — `running`, `deferred`, `checkpointed` ({@link UNSETTLED_RUN_STATUSES}) —
+ * plus every run that settled as `failed` at or after `failedSince`, newest start
+ * first. A run that settled `completed` in the window is not listed; the snapshot
+ * reports those as a count ({@link countRunsSettledSinceByStatus}).
+ *
+ * Unlike {@link listRunsFromDb} a retry-pending run is listed even while a waiting
+ * dispatch backs it: the snapshot reports runs and dispatches side by side, linked
+ * by the dispatch's `run_id`, rather than splitting them between two screens.
+ *
+ * Bounded by `limit` because the snapshot is meant as a cheap, periodic call; a
+ * caller wanting to know whether the bound bit asks for one row more than it shows.
+ */
+export async function listSnapshotRunsForProject(
+	projectId: string,
+	failedSince: Date,
+	limit: number,
+): Promise<RunRow[]> {
+	return getDb()
+		.select()
+		.from(runs)
+		.where(
+			and(
+				eq(runs.projectId, projectId),
+				or(
+					inArray(runs.status, [...UNSETTLED_RUN_STATUSES]),
+					and(eq(runs.status, 'failed'), gte(runs.completedAt, failedSince)),
+				),
+			),
+		)
+		.orderBy(desc(runs.startedAt), desc(runs.id))
+		.limit(limit);
+}
+
+/**
+ * How many of one project's runs settled at or after `since`, by the status they
+ * settled in (issue #1340) — keyed on `completed_at`, which every settle writes
+ * (`completed`, `failed`, and the retry-pending `deferred`/`checkpointed` alike) and
+ * a retry clears, so a run is counted once, at its latest settle. A status no run
+ * settled in is absent rather than zero.
+ */
+export async function countRunsSettledSinceByStatus(
+	projectId: string,
+	since: Date,
+): Promise<Record<string, number>> {
+	const rows = await getDb()
+		.select({ status: runs.status, total: count() })
+		.from(runs)
+		.where(and(eq(runs.projectId, projectId), gte(runs.completedAt, since)))
+		.groupBy(runs.status);
+	return Object.fromEntries(rows.map((row) => [row.status, row.total]));
+}
+
 /** Resolve a single run by its id. Returns `undefined` when unknown. */
 export async function getRunByIdFromDb(id: string): Promise<RunRow | undefined> {
 	const rows = await getDb().select().from(runs).where(eq(runs.id, id)).limit(1);

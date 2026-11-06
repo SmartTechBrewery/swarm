@@ -18,12 +18,16 @@ const {
 	getRunByIdFromDb,
 	getRunLogsFromDb,
 	getRunOutputEvents,
+	listSnapshotRunsForProject,
+	countRunsSettledSinceByStatus,
 	getLatestCompletedReviewRunForPullRequest,
 } = vi.hoisted(() => ({
 	listRunsFromDb: vi.fn(),
 	getRunByIdFromDb: vi.fn(),
 	getRunLogsFromDb: vi.fn(),
 	getRunOutputEvents: vi.fn(),
+	listSnapshotRunsForProject: vi.fn(),
+	countRunsSettledSinceByStatus: vi.fn(),
 	getLatestCompletedReviewRunForPullRequest: vi.fn(),
 }));
 vi.mock('@/db/repositories/runsRepository.js', async () => ({
@@ -34,6 +38,8 @@ vi.mock('@/db/repositories/runsRepository.js', async () => ({
 	getRunByIdFromDb,
 	getRunLogsFromDb,
 	getRunOutputEvents,
+	listSnapshotRunsForProject,
+	countRunsSettledSinceByStatus,
 	getLatestCompletedReviewRunForPullRequest,
 }));
 // The review-verdict ledger read and the project record read behind `pr_status` and
@@ -87,12 +93,19 @@ vi.mock('@/identity/membership-service.js', async () => ({
 	getMembership,
 	listAccessibleProjectIds,
 }));
-const { getActiveDispatchByRunId } = vi.hoisted(() => ({ getActiveDispatchByRunId: vi.fn() }));
+const { getActiveDispatchByRunId, listOpenDispatchesForProject, listDispatchesForTask } =
+	vi.hoisted(() => ({
+		getActiveDispatchByRunId: vi.fn(),
+		listOpenDispatchesForProject: vi.fn(),
+		listDispatchesForTask: vi.fn(),
+	}));
 vi.mock('@/db/repositories/dispatchesRepository.js', async () => ({
 	...(await vi.importActual<typeof import('@/db/repositories/dispatchesRepository.js')>(
 		'@/db/repositories/dispatchesRepository.js',
 	)),
 	getActiveDispatchByRunId,
+	listOpenDispatchesForProject,
+	listDispatchesForTask,
 }));
 
 const { listDashboardWorkers, listProjectWorkerIdsInOrder, listWorkerProjectCapacity } = vi.hoisted(
@@ -255,6 +268,10 @@ beforeEach(() => {
 	getRunLogsFromDb.mockReset().mockResolvedValue(LOGS);
 	getRunOutputEvents.mockReset().mockResolvedValue(OUTPUT_PAGE);
 	getActiveDispatchByRunId.mockReset().mockResolvedValue(undefined);
+	listSnapshotRunsForProject.mockReset().mockResolvedValue([]);
+	countRunsSettledSinceByStatus.mockReset().mockResolvedValue({});
+	listOpenDispatchesForProject.mockReset().mockResolvedValue([]);
+	listDispatchesForTask.mockReset().mockResolvedValue([]);
 	getMembership
 		.mockReset()
 		.mockImplementation(async (userId: string, projectId: string) =>
@@ -341,7 +358,9 @@ describe('operator MCP — the handshake', () => {
 		expect(tools.map((tool) => tool.name).sort()).toEqual([
 			'cli_rate_limits',
 			'consistency_check',
+			'dispatch_history',
 			'phase_agents_get',
+			'pipeline_snapshot',
 			'pr_status',
 			'run_get',
 			'runs_list',
@@ -511,6 +530,112 @@ describe('operator MCP — run_get', () => {
 		expect(unknown.content[0]?.text).toBe(`NOT_FOUND: Run with ID "${unknownId}" not found`);
 		expect(getRunOutputEvents).not.toHaveBeenCalled();
 		expect(getRunLogsFromDb).not.toHaveBeenCalled();
+	});
+});
+
+describe('operator MCP — pipeline_snapshot', () => {
+	it("reads a member's project in one call", async () => {
+		listSnapshotRunsForProject.mockResolvedValue([
+			{
+				...failedRun(),
+				prTitle: null,
+				nextRetryAt: null,
+				continuationCount: 0,
+			},
+		]);
+		countRunsSettledSinceByStatus.mockResolvedValue({ completed: 3, failed: 1 });
+
+		const result = await callTool('pipeline_snapshot', { projectId: 'proj-a' }, 'member-token');
+
+		expect(result.isError).toBeUndefined();
+		expect(result.structuredContent).toMatchObject({
+			projectId: 'proj-a',
+			windowHours: 12,
+			runs: [{ id: RUN_ID, status: 'failed', error: 'Agent exited 1' }],
+			dispatches: [],
+			completedCounts: { byStatus: { completed: 3, failed: 1 } },
+			truncated: { runs: false, dispatches: false },
+		});
+		expect(listSnapshotRunsForProject).toHaveBeenCalledWith(
+			'proj-a',
+			expect.any(Date),
+			expect.any(Number),
+		);
+	});
+
+	it("reports the procedure's refusal of a project the caller cannot read", async () => {
+		const result = await callTool('pipeline_snapshot', { projectId: 'proj-a' }, 'stranger-token');
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toMatch(/^NOT_FOUND: /);
+		expect(listSnapshotRunsForProject).not.toHaveBeenCalled();
+	});
+});
+
+describe('operator MCP — dispatch_history', () => {
+	it("reads a task's dispatches in a member's project", async () => {
+		listDispatchesForTask.mockResolvedValue([
+			{
+				id: 'dispatch-1',
+				projectId: 'proj-a',
+				taskId: '7',
+				phase: 'implementation',
+				repository: 'acme/widgets',
+				prNumber: null,
+				state: 'failed',
+				waitReason: null,
+				outcome: null,
+				attempt: 2,
+				priority: 0,
+				availableAt: new Date('2026-10-28T10:00:00Z'),
+				jobPayload: {},
+				runId: RUN_ID,
+				selectedWorkerId: null,
+				lastError: 'Agent exited 1',
+				source: 'webhook',
+				createdAt: new Date('2026-10-28T09:59:00Z'),
+				completedAt: new Date('2026-10-28T10:05:00Z'),
+			},
+		]);
+
+		const result = await callTool(
+			'dispatch_history',
+			{ projectId: 'proj-a', taskId: '7' },
+			'member-token',
+		);
+
+		expect(result.isError).toBeUndefined();
+		expect(listDispatchesForTask).toHaveBeenCalledWith(
+			'proj-a',
+			{ taskId: '7' },
+			expect.any(Number),
+		);
+		expect(result.structuredContent).toMatchObject({
+			dispatches: [
+				{ id: 'dispatch-1', state: 'failed', runId: RUN_ID, lastError: 'Agent exited 1' },
+			],
+			truncated: false,
+		});
+	});
+
+	it('refuses a history naming neither a task nor a pull request', async () => {
+		const result = await callTool('dispatch_history', { projectId: 'proj-a' }, 'member-token');
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toMatch(/^BAD_REQUEST: /);
+		expect(listDispatchesForTask).not.toHaveBeenCalled();
+	});
+
+	it("reports the procedure's refusal of a project the caller cannot read", async () => {
+		const result = await callTool(
+			'dispatch_history',
+			{ projectId: 'proj-a', prNumber: '42' },
+			'stranger-token',
+		);
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toMatch(/^NOT_FOUND: /);
+		expect(listDispatchesForTask).not.toHaveBeenCalled();
 	});
 });
 
