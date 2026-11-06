@@ -1654,6 +1654,37 @@ export async function getLatestCompletedReviewRunForPullRequest(
 }
 
 /**
+ * The project's Review runs whose merge automation recorded `merged`, completed at
+ * or after `since`, newest first and at most `limit` of them — the merged pull
+ * requests the operator consistency check (`src/dispatch/consistency-check.ts`,
+ * issue #1344) looks behind. The window is the Review run's own completion: the
+ * runs table records no merge instant, and the merge dispatch follows its approval
+ * closely. Narrowed to {@link PipelineRunRow}, whose coordinates name the pull
+ * request.
+ */
+export async function listMergedReviewRunsSince(
+	projectId: string,
+	since: Date,
+	limit: number,
+): Promise<PipelineRunRow[]> {
+	const rows = await getDb()
+		.select()
+		.from(runs)
+		.where(
+			and(
+				eq(runs.kind, PIPELINE_RUN_KIND),
+				eq(runs.projectId, projectId),
+				eq(runs.phase, 'review'),
+				eq(runs.reviewMergeOutcome, 'merged'),
+				gte(runs.completedAt, since),
+			),
+		)
+		.orderBy(desc(runs.completedAt))
+		.limit(limit);
+	return rows.filter(isPipelineRun);
+}
+
+/**
  * Whether this project's task has a *completed* run for the given phase — a
  * failed or deferred attempt does not count (issue #247). Implementation's
  * planned/unplanned config selection uses this so a merely-attempted Planning
