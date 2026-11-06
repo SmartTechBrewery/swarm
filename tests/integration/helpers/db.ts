@@ -104,6 +104,7 @@ export async function truncateAll(): Promise<void> {
 			user_identities,
 			user_sessions,
 			user_password_tokens,
+			agent_access_tokens,
 			workers,
 			users
 		CASCADE

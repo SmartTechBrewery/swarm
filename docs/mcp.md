@@ -6,12 +6,18 @@ reads the pipeline the way you do in the dashboard: which runs failed, why, and
 what the agent printed. It is the same data `swarm run list|show|logs` reads, as
 tools a model can call.
 
+**The server is open to installation administrators only, for now.** Any other
+user is refused with `403`, whichever credential they present. Opening it to other
+users is a separate, later decision that needs an authorization review of every
+tool.
+
 Every tool is the dashboard's own tRPC procedure, called as you. The tools
 therefore see exactly what you see in the dashboard: an instance administrator
-sees the whole installation, anyone else sees the projects they are a member of,
-and a run in any other project reads as *not found*, exactly as in the browser. The one
-tool with no dashboard procedure behind it, `control_plane_logs`, applies the same
-project rules itself.
+sees the whole installation. The tools still apply the dashboard's project rules
+for every caller (a non-admin would see only the projects they are a member of,
+and a run in any other project would read as *not found*), so they are ready for
+that later decision. The one tool with no dashboard procedure behind it,
+`control_plane_logs`, applies the same project rules itself.
 
 ## Where it is served
 
@@ -35,68 +41,104 @@ loses nothing.
 
 ## Authentication
 
-The bearer token `swarm login` mints, sent as `Authorization: Bearer <token>`,
-exactly as the operator API takes it. A request with no token, or with an unknown,
-expired or revoked one, gets `401` before any tool runs.
+Send a bearer token as `Authorization: Bearer <token>`. Two credentials are
+accepted:
+
+- an **agent access token**, issued from your profile's **MCP** tab (below). This
+  is the credential meant for an agent. It is accepted here and nowhere else;
+- the `swarm login` session token, exactly as the operator API takes it.
+
+A request with no token, or with an unknown, expired or revoked one, gets `401`
+before any tool runs. A valid token whose holder is not an installation
+administrator gets `403`.
 
 `SWARM_SINGLE_USER_MODE` is **not** honoured here, for the same reason it is not
 honoured by `swarm login`: the router is the internet-reachable process. On a
 single-user installation, run `swarm users set-password localhost-admin` once and
 sign in like anyone else.
 
+### Agent access tokens
+
+An agent access token belongs to the administrator who issued it and acts as
+them, with exactly their access. It differs from a login session in three ways:
+
+- **It has a name**, so you can tell your tokens apart, and you can list and
+  revoke each one on its own.
+- **It expires 30 days after it is issued.** Using it does not extend it. The
+  30 days are fixed in the code and are not a setting.
+- **The installation keeps only its SHA-256.** The token itself is shown once,
+  when you issue it, and cannot be shown again. If you lose it, issue a new one
+  and revoke the old one.
+
+The list shows when each token was issued, when it expires (or that it has
+expired), and when it last opened the MCP server. The last use is recorded at
+most once a minute. Revoking a token takes effect on the next request. Expired
+tokens are deleted lazily, so an expired one can stay on the list for a while,
+marked **Expired**.
+
+Only installation administrators can issue, list or revoke tokens. Nobody else
+sees the MCP tab.
+
 ## Connecting a client
 
-1. Sign in to the installation from the machine the client runs on:
+1. In the dashboard, open your **Profile** and the **MCP** tab.
+2. Enter a token name (for example `office laptop`) and click **Issue token**.
+3. The dialog shows the token and a ready command for Claude Code, already built
+   with this installation's address. Copy what you need before you click
+   **Close**. The token is not shown again.
+4. Run the command on the machine the client runs on. It has this shape:
 
-   ```bash
-   npm run swarm -- login --control-plane-url https://swarm.example.com
-   ```
+```bash
+claude mcp add --transport http swarm https://swarm.example.com/operator/mcp \
+  --header "Authorization: Bearer <token>"
+```
 
-   The token is cached in
-   `~/.swarm/operator-sessions/<sha256(control-plane URL)>/session.json` (mode
-   `600`). It is never printed.
+The address in the command is the dashboard's own origin plus `/operator/mcp`. On
+an all-in-one installation, and on the VPS behind Caddy, that is the router. If
+you serve the dashboard from a different origin than the router, for example
+`npm run dev:dashboard` on `localhost:5173`, replace the address with the router's
+(see [Where it is served](#where-it-is-served)).
 
-2. Read the token from that file into the environment. Select the session by
-   control-plane URL if you are signed in to more than one installation:
+To keep the token out of the client's stored configuration, put it in an
+environment variable and use a project's `.mcp.json`, which expands the variable
+when the client starts:
 
-   ```bash
-   export SWARM_OPERATOR_TOKEN="$(jq -r 'select(.controlPlaneUrl == "https://swarm.example.com") | .token' \
-     ~/.swarm/operator-sessions/*/session.json)"
-   ```
+```json
+{
+  "mcpServers": {
+    "swarm": {
+      "type": "http",
+      "url": "https://swarm.example.com/operator/mcp",
+      "headers": { "Authorization": "Bearer ${SWARM_MCP_TOKEN}" }
+    }
+  }
+}
+```
 
-3. Register the server with your client. For Claude Code:
+Any other client that speaks Streamable HTTP and can send a fixed header connects
+the same way.
 
-   ```bash
-   claude mcp add --transport http swarm https://swarm.example.com/operator/mcp \
-     --header "Authorization: Bearer $SWARM_OPERATOR_TOKEN"
-   ```
-
-   Or, to keep the token out of the stored configuration, in a project's
-   `.mcp.json`, which expands the variable when the client starts:
-
-   ```json
-   {
-     "mcpServers": {
-       "swarm": {
-         "type": "http",
-         "url": "https://swarm.example.com/operator/mcp",
-         "headers": { "Authorization": "Bearer ${SWARM_OPERATOR_TOKEN}" }
-       }
-     }
-   }
-   ```
-
-   Any other client that speaks Streamable HTTP and can send a fixed header
-   connects the same way.
-
-**The token expires.** It is an ordinary session, valid for
-`SWARM_SESSION_TTL_HOURS` (`docs/configuration.md`). When the tools start
-answering `401`, run `swarm login` again, re-read the token, and restart the
-client or update its header. `swarm login --logout` revokes the token for every
-client using it.
+**When the token expires**, the tools start answering `401`. Issue a new token and
+update the client's header.
 
 Treat the token like a password: it reads everything your account can read in the
 dashboard, including run logs and agent output.
+
+### Using the `swarm login` session instead
+
+The session that `swarm login` caches also works as the bearer. It is valid for
+`SWARM_SESSION_TTL_HOURS` (`docs/configuration.md`) and `swarm login --logout`
+revokes it. To use it, read it from the CLI's cache, which is
+`~/.swarm/operator-sessions/<sha256(control-plane URL)>/session.json` (mode
+`600`):
+
+```bash
+export SWARM_MCP_TOKEN="$(jq -r 'select(.controlPlaneUrl == "https://swarm.example.com") | .token' \
+  ~/.swarm/operator-sessions/*/session.json)"
+```
+
+An agent access token is the better choice for an agent: it is not tied to your
+CLI sign-in, and you can revoke it on its own.
 
 ## Tools
 
@@ -168,7 +210,13 @@ time (never a whole-board read), and never asks the source-control provider.
 
 ## For developers
 
-The mount is `src/router/operator-mcp.ts`. The server is built per request in
+The mount is `src/router/operator-mcp.ts`. It resolves the bearer as a session,
+then as an agent access token (`src/identity/agent-access-token-service.ts`), and
+refuses a non-admin through `MAY_USE_OPERATOR_MCP` before any MCP message is read.
+The tokens themselves are managed through the dashboard's `agentAccessTokens` tRPC
+router (`src/api/routers/agentAccessTokens.ts`), which is not mounted on the
+operator API. The tab's command is built by `dashboard/src/lib/agent-access.ts`, and
+a test keeps it identical to the command in this document. The server is built per request in
 `src/mcp/server.ts`, and each tool family registers itself there from
 `src/mcp/tools/`. `src/mcp/tool-helpers.ts` provides the tRPC caller (`callerFor`)
 and the result mapping (`runTool`). A tool calls a dashboard procedure through
