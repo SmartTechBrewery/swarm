@@ -1,4 +1,5 @@
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import { TRPCError } from '@trpc/server';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
@@ -103,7 +104,12 @@ describe('project_create', () => {
 		});
 
 		expect(result.isError).toBeUndefined();
-		expect(caller.projects.previewCreate).toHaveBeenCalledWith(input);
+		// The dry run gets only the token's presence; the write gets the token.
+		const { reviewerToken: _token, ...withoutToken } = input;
+		expect(caller.projects.previewCreate).toHaveBeenCalledWith({
+			...withoutToken,
+			hasReviewerToken: true,
+		});
 		expect(caller.projects.create).toHaveBeenCalledWith(input);
 		expect(auditInput()).toEqual({ ...input, reviewerToken: '[redacted]' });
 		expect(JSON.stringify(recordOperatorAction.mock.calls)).not.toContain('ghp_very_secret');
@@ -146,6 +152,27 @@ describe('project_update and pm_board_set', () => {
 
 		expect(caller.projects.previewUpdate).toHaveBeenCalledWith({ id: 'p1', agents });
 		expect(caller.projects.update).toHaveBeenCalledWith({ id: 'p1', agents });
+	});
+
+	// A merged pipeline the schema rejects is an operator mistake, not a broken procedure.
+	it('settles a BAD_REQUEST from the write as refused, not failed', async () => {
+		caller.projects.previewUpdate.mockResolvedValue({ wouldRefuse: null });
+		const message = 'Respond-to-review cannot be enabled when Review is disabled';
+		caller.projects.update.mockRejectedValue(new TRPCError({ code: 'BAD_REQUEST', message }));
+
+		const result = await call('project_update', {
+			projectId: 'p1',
+			pipeline: { review: { enabled: false } },
+			reason: 'turn review off',
+			dryRun: false,
+		});
+
+		expect(result.isError).toBe(true);
+		expect(settleOperatorAction).toHaveBeenCalledWith('audit-1', {
+			outcome: 'refused',
+			error: expect.stringContaining(message),
+			projectId: 'p1',
+		});
 	});
 
 	it('saves a board mapping as the pm member of an update', async () => {

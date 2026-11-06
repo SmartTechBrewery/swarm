@@ -893,16 +893,33 @@ describe('projectsRouter', () => {
 			expect(plan.wouldRefuse?.code).toBe('BAD_REQUEST');
 		});
 
-		it('names a supplied reviewer token as the seeded credential without returning it', async () => {
+		it('names a supplied reviewer token as the seeded credential from its presence alone', async () => {
 			_resetSCMProviderRegistryForTesting();
 			registerSCMProvider(githubScmManifest);
+			vi.mocked(resolveInstanceScmCredential).mockResolvedValue(null);
 
-			const plan = await caller.previewCreate({ ...input, reviewerToken: 'ghp_secret' });
+			const plan = await caller.previewCreate({ ...input, hasReviewerToken: true });
 
 			expect(plan.wouldRefuse).toBeNull();
 			expect(plan.seededCredentials).toEqual([
 				{ providerId: 'github', role: 'reviewer', source: 'request' },
 			]);
+			expect(resolveInstanceScmCredential).not.toHaveBeenCalled();
+		});
+
+		// A query travels as a GET with its input in the URL, so the dry run takes no secret.
+		it('does not accept a reviewer token value', async () => {
+			_resetSCMProviderRegistryForTesting();
+			registerSCMProvider(githubScmManifest);
+			vi.mocked(resolveInstanceScmCredential).mockResolvedValue(null);
+
+			const plan = await caller.previewCreate({
+				...input,
+				reviewerToken: 'ghp_secret',
+			} as unknown as Parameters<typeof caller.previewCreate>[0]);
+
+			// The unknown key is stripped, so no token was given and none is stored.
+			expect(plan.wouldRefuse?.code).toBe('PRECONDITION_FAILED');
 			expect(JSON.stringify(plan)).not.toContain('ghp_secret');
 		});
 	});
@@ -1118,6 +1135,36 @@ describe('projectsRouter', () => {
 			expect(result.pipeline?.planning?.autoAdvance).toBe(true);
 			expect(result.pipeline?.respondToReview?.enabled).toBe(false);
 			expect(result.pipeline?.respondToReview?.skipOnMinors).toBe(true);
+		});
+
+		// The patch schema extends the unrefined base, so a patch only the *merged* pipeline
+		// breaks used to escape as a raw ZodError — a 500 to the client, while
+		// `previewUpdate` called it BAD_REQUEST. Both now answer in the same code and words.
+		it('refuses a patch the merged pipeline breaks as BAD_REQUEST, as previewUpdate does', async () => {
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(
+				createMockProjectRecord({ id: 'p1', pipeline: {} }),
+			);
+			const input = { id: 'p1', pipeline: { review: { enabled: false } } };
+
+			const refusal = await caller.update(input).then(
+				() => {
+					throw new Error('update should have been refused');
+				},
+				(error: unknown) => error,
+			);
+			const plan = await caller.previewUpdate(input);
+
+			expect(refusal).toMatchObject({
+				code: 'BAD_REQUEST',
+				message: expect.stringContaining(
+					'Respond-to-review cannot be enabled when Review is disabled',
+				),
+			});
+			expect(upsertProjectToDb).not.toHaveBeenCalled();
+			expect(plan.wouldRefuse).toEqual({
+				code: 'BAD_REQUEST',
+				message: (refusal as Error).message,
+			});
 		});
 
 		describe('checkpoint-continuation budget (issue #1259)', () => {

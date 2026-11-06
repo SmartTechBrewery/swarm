@@ -304,8 +304,12 @@ export function registerProjectSetupTools(server: McpServer, user: SwarmUser): v
 		destructive: false,
 		secretInputs: ['reviewerToken'],
 		targetOf: (input) => input.id,
-		preview: async (input, caller) => {
-			const plan = await caller.projects.previewCreate(input);
+		preview: async ({ reviewerToken, ...input }, caller) => {
+			// Only the token's presence: the dry run reports its source, never its value.
+			const plan = await caller.projects.previewCreate({
+				...input,
+				hasReviewerToken: reviewerToken !== undefined,
+			});
 			return { projectId: plan.wouldRefuse ? null : input.id, plan };
 		},
 		apply: (input, caller) => caller.projects.create(input),

@@ -262,6 +262,23 @@ export const ProjectCreateInputSchema = ProjectWriteInputSchema.omit({ pm: true 
 });
 
 /**
+ * What `previewCreate` accepts: `create`'s input with the reviewer token's *presence*
+ * in place of its value, as `credentials.previewSet` takes no value. A query travels as
+ * a GET with its input in the URL, so a secret here could land in a browser history or
+ * an access log — and the dry run only reports the token's source, never the token.
+ */
+const ProjectCreatePreviewInputSchema = ProjectWriteInputSchema.omit({ pm: true }).extend({
+	hasReviewerToken: z.boolean().optional(),
+});
+
+/**
+ * Stands in for a supplied reviewer token when `previewCreate` plans: planning only
+ * needs to know one was given (the `request` source), and a preview writes and returns
+ * no secret, so this value never leaves the procedure.
+ */
+const PREVIEW_REVIEWER_TOKEN_PLACEHOLDER = '[preview]';
+
+/**
  * The `pipeline` patch `update` accepts: the stored shape, except that
  * `maxContinuations: null` *clears* the budget back to its coded default (issue
  * #1259). The wire is plain JSON, so an `undefined` key never arrives — without an
@@ -469,16 +486,14 @@ export interface PreviewRefusal {
 }
 
 /**
- * A planning step's throw as a preview's `wouldRefuse`: a client-class `TRPCError` (and a
- * schema refusal of the merged pipeline) is the refusal the real write would answer with;
- * anything else is a real failure and propagates.
+ * A planning step's throw as a preview's `wouldRefuse`: a client-class `TRPCError` is the
+ * refusal the real write would answer with; anything else is a real failure and
+ * propagates. The plan functions turn every validation failure into a `TRPCError`
+ * themselves, so the write and its preview answer in the same code and words.
  */
 function previewRefusalOf(error: unknown): PreviewRefusal {
 	if (error instanceof TRPCError && error.code !== 'INTERNAL_SERVER_ERROR') {
 		return { code: error.code, message: error.message };
-	}
-	if (error instanceof z.ZodError) {
-		return { code: 'BAD_REQUEST', message: error.issues.map((issue) => issue.message).join('; ') };
 	}
 	throw error;
 }
@@ -557,9 +572,19 @@ function planProjectUpdate(existing: ProjectRecord, input: ProjectUpdateInput): 
 		assertRepositoryCoordinates(config.scm, config.repositories);
 	}
 	if (pipelinePatch) {
-		config.pipeline = PipelineConfigSchema.parse(
+		// The input schema cannot catch a patch the *merged* pipeline breaks (the patch
+		// schema extends the unrefined base, e.g. Review disabled while Respond-to-review
+		// is not): a client refusal, not a raw ZodError tRPC would answer as a 500.
+		const parsed = PipelineConfigSchema.safeParse(
 			mergePipelineConfig(existing.pipeline, pipelinePatch),
 		);
+		if (!parsed.success) {
+			throw new TRPCError({
+				code: 'BAD_REQUEST',
+				message: parsed.error.issues.map((issue) => issue.message).join('; '),
+			});
+		}
+		config.pipeline = parsed.data;
 	}
 	return config;
 }
@@ -707,38 +732,47 @@ export const projectsRouter = router({
 	// the same validation, the same instance-credential requirement and the same
 	// id/repository conflict check, with nothing written. Gated as `create` is — any
 	// authenticated user — and a refusal is reported as `wouldRefuse` in the code and
-	// words `create` would answer with. No secret is returned: the credentials `create`
-	// would seed are named by provider, role and source only.
-	previewCreate: authedProcedure.input(ProjectCreateInputSchema).query(async ({ ctx, input }) => {
-		let project: ProjectRecord | null = null;
-		let seededCredentials: Array<{ providerId: ScmType; role: ScmCredentialRole; source: string }> =
-			[];
-		let wouldRefuse: PreviewRefusal | null = null;
-		try {
-			const plan = await planProjectCreate(input);
-			project = plan.config;
-			seededCredentials = plan.instanceDefaults.map((seed) => ({
-				providerId: plan.scm,
-				role: seed.role,
-				source: seed.source,
-			}));
-			if (await findProjectRecordByIdFromDb(plan.config.id)) {
-				throw duplicateProjectIdError(plan.config.id);
+	// words `create` would answer with. No secret goes in or comes out: it takes only
+	// whether a reviewer token was given (`hasReviewerToken`), and the credentials
+	// `create` would seed are named by provider, role and source only.
+	previewCreate: authedProcedure
+		.input(ProjectCreatePreviewInputSchema)
+		.query(async ({ ctx, input: { hasReviewerToken, ...input } }) => {
+			let project: ProjectRecord | null = null;
+			let seededCredentials: Array<{
+				providerId: ScmType;
+				role: ScmCredentialRole;
+				source: string;
+			}> = [];
+			let wouldRefuse: PreviewRefusal | null = null;
+			try {
+				const plan = await planProjectCreate({
+					...input,
+					reviewerToken: hasReviewerToken ? PREVIEW_REVIEWER_TOKEN_PLACEHOLDER : undefined,
+				});
+				project = plan.config;
+				seededCredentials = plan.instanceDefaults.map((seed) => ({
+					providerId: plan.scm,
+					role: seed.role,
+					source: seed.source,
+				}));
+				if (await findProjectRecordByIdFromDb(plan.config.id)) {
+					throw duplicateProjectIdError(plan.config.id);
+				}
+				await assertRepositoriesAvailable(plan.config);
+			} catch (error) {
+				wouldRefuse = previewRefusalOf(error);
 			}
-			await assertRepositoriesAvailable(plan.config);
-		} catch (error) {
-			wouldRefuse = previewRefusalOf(error);
-		}
-		return {
-			project,
-			creator: { userId: ctx.user.id, identifier: ctx.user.identifier, role: 'projectAdmin' },
-			seededCredentials,
-			// A new project always starts on the placeholder board mapping; `pm_board_set` /
-			// the Project Management tab replaces it.
-			pmPlaceholder: true,
-			wouldRefuse,
-		};
-	}),
+			return {
+				project,
+				creator: { userId: ctx.user.id, identifier: ctx.user.identifier, role: 'projectAdmin' },
+				seededCredentials,
+				// A new project always starts on the placeholder board mapping; `pm_board_set` /
+				// the Project Management tab replaces it.
+				pmPlaceholder: true,
+				wouldRefuse,
+			};
+		}),
 
 	// The dry run of `update` (issue #1359, the operator MCP server's `project_update` and
 	// `pm_board_set`): the merged record `update` would write and which top-level fields it
