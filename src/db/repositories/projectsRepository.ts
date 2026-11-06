@@ -136,9 +136,11 @@ export class ProjectRepositoryConflictError extends Error {
  * never resolves arbitrarily even if a duplicate did land.
  *
  * Runs on `tx` when given, so the create-with-member transaction checks and inserts
- * under the same snapshot.
+ * under the same snapshot. Exported for the projects API's dry runs (`previewCreate`,
+ * `previewUpdate`, issue #1359), which report the conflict a write would hit without
+ * writing.
  */
-async function assertRepositoriesUnclaimed(
+export async function assertRepositoriesUnclaimed(
 	record: ProjectRecord,
 	tx: Pick<ReturnType<typeof getDb>, 'select'> = getDb(),
 ): Promise<void> {

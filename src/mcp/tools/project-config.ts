@@ -22,7 +22,7 @@ import { callerFor, runTool } from '../tool-helpers.js';
  * The phases `agents` configures — every key of {@link AgentsConfigSchema} but
  * `defaults`, which is a per-CLI model map rather than a phase.
  */
-const AgentPhaseSchema = AgentsConfigSchema.keyof().exclude(['defaults']);
+export const AgentPhaseSchema = AgentsConfigSchema.keyof().exclude(['defaults']);
 
 const phaseAgentsGetInput = {
 	projectId: z.string().min(1).describe('The project id.'),

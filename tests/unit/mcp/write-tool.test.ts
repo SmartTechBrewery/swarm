@@ -45,7 +45,7 @@ function definition(): WriteToolDefinition<typeof shape> {
 		destructive: true,
 		targetOf: (input) => input.runId,
 		preview: (input, caller) => preview(input, caller),
-		apply: (input, caller) => apply(input, caller),
+		apply: (input, caller, previewed) => apply(input, caller, previewed),
 	};
 }
 
@@ -96,6 +96,54 @@ describe('runWriteTool', () => {
 			error: null,
 			projectId: 'proj-a',
 		});
+	});
+
+	// Issue #1349: what a preview records (the order a reorder replaced) lands on the
+	// row, and the write is handed that same preview so it writes what was recorded.
+	it("records the preview's detail on the row and hands the preview to the write", async () => {
+		const previewed = {
+			projectId: 'proj-a',
+			plan: { before: ['codex'], after: ['claude'] },
+			detail: { previous: ['codex'], next: ['claude'] },
+		};
+		preview.mockResolvedValue(previewed);
+
+		await runWriteTool(definition(), USER, { runId: 'run-1', reason: 'reorder', dryRun: false });
+
+		expect(apply).toHaveBeenCalledWith({ runId: 'run-1' }, expect.anything(), previewed);
+		expect(settleOperatorAction).toHaveBeenCalledWith('audit-1', {
+			outcome: 'succeeded',
+			error: null,
+			projectId: 'proj-a',
+			detail: { previous: ['codex'], next: ['claude'] },
+		});
+	});
+
+	// Issue #1359: a tool accepting a secret names it, and the audit row never holds it.
+	it('records a secret input as [redacted] while the tool itself still receives it', async () => {
+		const secretShape = { runId: z.string(), token: z.string().optional() };
+		const withSecret: WriteToolDefinition<typeof secretShape> = {
+			...(definition() as unknown as WriteToolDefinition<typeof secretShape>),
+			inputSchema: secretShape,
+			secretInputs: ['token'],
+		};
+
+		await runWriteTool(withSecret, USER, {
+			runId: 'run-1',
+			token: 'hunter2',
+			reason: 'rotate',
+			dryRun: false,
+		});
+
+		expect(recordOperatorAction).toHaveBeenCalledWith(
+			expect.objectContaining({ input: { runId: 'run-1', token: '[redacted]' } }),
+		);
+		expect(JSON.stringify(recordOperatorAction.mock.calls)).not.toContain('hunter2');
+		expect(apply).toHaveBeenCalledWith(
+			{ runId: 'run-1', token: 'hunter2' },
+			expect.anything(),
+			expect.anything(),
+		);
 	});
 
 	it('answers a dry run from the preview alone and never calls the write', async () => {

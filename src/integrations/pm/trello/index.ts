@@ -44,6 +44,7 @@ export const trelloManifest: PMProviderManifest = {
 	// out of the `pm` member, and an incoming Trello board is discoverable with nothing
 	// configured but the pair.
 	blankPm: trelloBlankPm,
+	boardContainerId: (pm) => (pm.type === 'trello' && pm.boardId ? pm.boardId : undefined),
 	routerAdapter: new TrelloRouterAdapter(),
 	// Three roles — Trello authenticates with a **key/token pair** passed as query
 	// parameters, and signs its deliveries with a third secret — and **none**

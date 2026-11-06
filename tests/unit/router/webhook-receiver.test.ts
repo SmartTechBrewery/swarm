@@ -144,6 +144,7 @@ function fakePmManifest(
 		// Declared only because the manifest requires it; the receiver reads no `pm`
 		// member — it resolves the project the delivery names.
 		blankPm: { type: 'github-projects', projectId: '', statusFieldId: '', statusOptions: {} },
+		boardContainerId: () => undefined,
 		discovery: [],
 	};
 }

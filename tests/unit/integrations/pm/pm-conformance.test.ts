@@ -131,6 +131,20 @@ const PROJECT_FIXTURES: Partial<Record<PMType, () => ProjectConfig>> = {
 	trello: () => createMockTrelloProjectConfig(),
 };
 
+/**
+ * The `project.pm` key that names each provider's board — the id its own
+ * `discover('states', { containerId })` is addressed with: a GitHub Projects v2 node
+ * (`projectId`), a Linear team (`teamId`), a Jira project (`project/<key>/statuses`) and
+ * a Trello board (`boards/<id>/lists`). Written out per provider, not read off the
+ * manifest, so a `boardContainerId` that returns the wrong key fails below (issue #1359).
+ */
+const BOARD_CONTAINER_KEYS: Partial<Record<PMType, string>> = {
+	'github-projects': 'projectId',
+	linear: 'teamId',
+	jira: 'projectKey',
+	trello: 'boardId',
+};
+
 function projectFor(manifest: PMProviderManifest): ProjectConfig {
 	const fixture = PROJECT_FIXTURES[manifest.id];
 	if (!fixture) {
@@ -262,6 +276,33 @@ describe('PM provider conformance', () => {
 						).toHaveLength(0);
 					}
 				}
+			});
+
+			// The project readiness check (`src/api/project-readiness.ts`, issue #1359) reports
+			// a placeholder project as "No board is selected" only if the blank member names no
+			// board, and probes the board's states with whatever a configured member names — so
+			// both halves are held to the provider's own declaration here.
+			it('names no board for its blank member and none for another provider’s', () => {
+				expect(manifest.boardContainerId(manifest.blankPm), `${manifest.id} blankPm`).toBe(
+					undefined,
+				);
+				for (const other of manifests) {
+					if (other.id === manifest.id) continue;
+					expect(
+						manifest.boardContainerId(projectFor(other).pm),
+						`${manifest.id} reading a ${other.id} member`,
+					).toBe(undefined);
+				}
+			});
+
+			it('names the board its states discovery is addressed with for a configured member', () => {
+				const key = BOARD_CONTAINER_KEYS[manifest.id];
+				expect(key, `no BOARD_CONTAINER_KEYS entry for '${manifest.id}'`).toBeDefined();
+				const pm = projectFor(manifest).pm as unknown as Record<string, unknown>;
+				const expected = pm[key as string];
+				expect(expected, `${manifest.id} fixture's ${key}`).toEqual(expect.any(String));
+				expect(expected).not.toBe('');
+				expect(manifest.boardContainerId(projectFor(manifest).pm)).toBe(expected);
 			});
 
 			// The refusal copy is returned verbatim as a `PRECONDITION_FAILED` message

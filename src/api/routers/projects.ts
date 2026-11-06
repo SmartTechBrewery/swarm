@@ -23,6 +23,7 @@ import {
 	rejectMembershipRequestInDb,
 } from '../../db/repositories/projectMembershipRequestsRepository.js';
 import {
+	assertRepositoriesUnclaimed,
 	createProjectWithMemberInDb,
 	deleteIdleProjectFromDb,
 	findProjectRecordByIdFromDb,
@@ -46,6 +47,7 @@ import {
 	filterAccessibleProjects,
 	mayAccessProject,
 } from '../authz.js';
+import { checkProjectReadiness } from '../project-readiness.js';
 import { authedProcedure, router } from '../trpc.js';
 import { credentialsRouter } from './credentials.js';
 
@@ -122,6 +124,8 @@ interface ResolvedInstanceScmDefault {
 	readonly role: ScmCredentialRole;
 	readonly envVarKey: string;
 	readonly secret: string;
+	/** Where the secret came from: the creator's own `reviewerToken`, or the instance default. */
+	readonly source: 'request' | 'instanceDefault';
 }
 
 /**
@@ -184,10 +188,10 @@ async function requireInstanceScmDefaults(
 		});
 	}
 	for (const eligible of eligibleRoles) {
-		const secret =
-			eligible.role === 'reviewer' && reviewerToken !== undefined
-				? reviewerToken
-				: await resolveInstanceScmCredential(scm, eligible.role);
+		const fromRequest = eligible.role === 'reviewer' && reviewerToken !== undefined;
+		const secret = fromRequest
+			? reviewerToken
+			: await resolveInstanceScmCredential(scm, eligible.role);
 		if (secret === null) {
 			throw new TRPCError({
 				code: 'PRECONDITION_FAILED',
@@ -199,7 +203,12 @@ async function requireInstanceScmDefaults(
 					`(${eligible.envVarKey}).`,
 			});
 		}
-		resolved.push({ role: eligible.role, envVarKey: eligible.envVarKey, secret });
+		resolved.push({
+			role: eligible.role,
+			envVarKey: eligible.envVarKey,
+			secret,
+			source: fromRequest ? 'request' : 'instanceDefault',
+		});
 	}
 	return resolved;
 }
@@ -246,9 +255,28 @@ const ProjectWriteInputSchema = ProjectRecordBaseSchema.omit({ credentials: true
 // project always starts on `DEFAULT_PM_CONFIG`'s placeholder mapping.
 // `reviewerToken` is a secret, not config: `create` strips it before the record is
 // assembled and only ever writes it, encrypted, to the project's credential row.
-const ProjectCreateInputSchema = ProjectWriteInputSchema.omit({ pm: true }).extend({
+// Exported for the operator MCP server's `project_create` (`src/mcp/tools/project-setup.ts`),
+// which takes exactly this input so the two surfaces cannot validate differently.
+export const ProjectCreateInputSchema = ProjectWriteInputSchema.omit({ pm: true }).extend({
 	reviewerToken: z.string().trim().min(1).optional(),
 });
+
+/**
+ * What `previewCreate` accepts: `create`'s input with the reviewer token's *presence*
+ * in place of its value, as `credentials.previewSet` takes no value. A query travels as
+ * a GET with its input in the URL, so a secret here could land in a browser history or
+ * an access log — and the dry run only reports the token's source, never the token.
+ */
+const ProjectCreatePreviewInputSchema = ProjectWriteInputSchema.omit({ pm: true }).extend({
+	hasReviewerToken: z.boolean().optional(),
+});
+
+/**
+ * Stands in for a supplied reviewer token when `previewCreate` plans: planning only
+ * needs to know one was given (the `request` source), and a preview writes and returns
+ * no secret, so this value never leaves the procedure.
+ */
+const PREVIEW_REVIEWER_TOKEN_PLACEHOLDER = '[preview]';
 
 /**
  * The `pipeline` patch `update` accepts: the stored shape, except that
@@ -260,6 +288,18 @@ const PipelinePatchSchema = PipelineBaseSchema.extend({
 	maxContinuations: z.number().int().positive().nullable().optional(),
 });
 type PipelinePatch = z.infer<typeof PipelinePatchSchema>;
+
+/**
+ * What `update` accepts: any subset of the record's writable fields, merged over the
+ * stored one, with `pipeline` as the patch above. Exported for the operator MCP
+ * server's `project_update` and `pm_board_set` (`src/mcp/tools/project-setup.ts`).
+ */
+export const ProjectUpdateInputSchema = ProjectWriteInputSchema.partial().extend({
+	id: z.string().min(1),
+	pipeline: PipelinePatchSchema.optional(),
+});
+type ProjectUpdateInput = z.infer<typeof ProjectUpdateInputSchema>;
+type ProjectCreateInput = z.infer<typeof ProjectCreateInputSchema>;
 
 function mergePipelineConfig(
 	existing: PipelineConfig | undefined,
@@ -416,6 +456,163 @@ function isProjectConflict(error: unknown): boolean {
 	return error instanceof ProjectRepositoryConflictError || isUniqueViolation(error);
 }
 
+/**
+ * The `CONFLICT` a colliding project write answers with, naming which half collided
+ * (issue #1359): a repository another project owns, or — on `create`, the only write
+ * that can collide on it — the project id. The owning project is deliberately not
+ * named: the caller may not be allowed to see it. A unique violation on `update` stays
+ * the generic wording, since nothing tells which constraint it was.
+ */
+function projectConflictError(error: unknown, createdId?: string): TRPCError {
+	if (error instanceof ProjectRepositoryConflictError) {
+		return new TRPCError({
+			code: 'CONFLICT',
+			message: `Repository '${error.repo}' already belongs to another project.`,
+		});
+	}
+	if (createdId !== undefined) return duplicateProjectIdError(createdId);
+	return new TRPCError({ code: 'CONFLICT', message: 'Project ID or repository already exists' });
+}
+
+/** The `CONFLICT` a create answers with for an id another project already has. */
+function duplicateProjectIdError(id: string): TRPCError {
+	return new TRPCError({ code: 'CONFLICT', message: `A project with ID "${id}" already exists.` });
+}
+
+/** A refusal a preview reports instead of throwing, in the procedure's own code and words. */
+export interface PreviewRefusal {
+	code: TRPCError['code'];
+	message: string;
+}
+
+/**
+ * A planning step's throw as a preview's `wouldRefuse`: a client-class `TRPCError` is the
+ * refusal the real write would answer with; anything else is a real failure and
+ * propagates. The plan functions turn every validation failure into a `TRPCError`
+ * themselves, so the write and its preview answer in the same code and words.
+ */
+function previewRefusalOf(error: unknown): PreviewRefusal {
+	if (error instanceof TRPCError && error.code !== 'INTERNAL_SERVER_ERROR') {
+		return { code: error.code, message: error.message };
+	}
+	throw error;
+}
+
+/** The project record `id` names, or the same `NOT_FOUND` every project procedure answers. */
+async function requireProjectRecord(id: string): Promise<ProjectRecord> {
+	const project = await findProjectRecordByIdFromDb(id);
+	if (!project) {
+		throw new TRPCError({
+			code: 'NOT_FOUND',
+			message: `Project with ID "${id}" not found`,
+		});
+	}
+	return project;
+}
+
+/** Everything `create` decided before writing: the record and the credentials to seed into it. */
+interface PlannedProjectCreate {
+	config: ProjectRecord;
+	scm: ScmType;
+	instanceDefaults: readonly ResolvedInstanceScmDefault[];
+}
+
+/**
+ * Validate a create request and assemble the record it would write — `create`'s whole
+ * decision, shared with `previewCreate` so the dry run and the write cannot disagree.
+ * Writes nothing; throws the refusal `create` answers with.
+ */
+async function planProjectCreate(raw: ProjectCreateInput): Promise<PlannedProjectCreate> {
+	const { reviewerToken, ...input } = raw;
+	const pmReferences = defaultPmCredentialReferences(DEFAULT_PM_CONFIG);
+	// This is a creation-time default, not a config-schema fallback: the dashboard
+	// always submits its explicit picker value, while non-dashboard callers remain
+	// routable instead of creating a project with no SCM provider.
+	const scm: ScmType = input.scm ?? 'github';
+	// First of all, for the same reason as the instance-default check below: a refused
+	// creation does no work at all.
+	assertRepositoryCoordinates(scm, input.repositories);
+	// Issue #778: the instance reviewer credential is an installation-wide requirement,
+	// so a provider declaring an `instanceDefault`-eligible role with nothing stored
+	// refuses creation here — before any row is written, and before the config below is
+	// even assembled, so a refused creation does no work at all. A request that would
+	// both be refused and conflict on id therefore reports the refusal, the more
+	// actionable of the two; the operator meets the conflict on the retry.
+	const instanceDefaults = await requireInstanceScmDefaults(scm, reviewerToken);
+	const scmReferences = defaultScmCredentialReferences(scm);
+	const config: ProjectRecord = {
+		...input,
+		scm,
+		pm: DEFAULT_PM_CONFIG,
+		credentials: {
+			scm: scmReferences,
+			...(pmReferences ? { pm: pmReferences } : {}),
+		},
+	};
+	return { config, scm, instanceDefaults };
+}
+
+/**
+ * Validate an update request against the stored record and assemble the record it
+ * would write — `update`'s whole decision, shared with `previewUpdate`. Writes nothing;
+ * throws the refusal `update` answers with.
+ */
+function planProjectUpdate(existing: ProjectRecord, input: ProjectUpdateInput): ProjectRecord {
+	const { id: _id, pipeline: pipelinePatch, ...updates } = input;
+	// Before the merge, so a refused switch leaves nothing written at all.
+	if (updates.pm) assertPmProviderSwitchable(existing, updates.pm);
+	const config: ProjectRecord = {
+		...existing,
+		...updates,
+	};
+	// Only on a change to either side, as the PM switch check: an ordinary edit is
+	// unaffected, while a three-segment repository on GitHub — or a switch to Azure
+	// DevOps with two-segment repositories still stored — is refused unwritten.
+	if (updates.repositories || updates.scm) {
+		assertRepositoryCoordinates(config.scm, config.repositories);
+	}
+	if (pipelinePatch) {
+		// The input schema cannot catch a patch the *merged* pipeline breaks (the patch
+		// schema extends the unrefined base, e.g. Review disabled while Respond-to-review
+		// is not): a client refusal, not a raw ZodError tRPC would answer as a 500.
+		const parsed = PipelineConfigSchema.safeParse(
+			mergePipelineConfig(existing.pipeline, pipelinePatch),
+		);
+		if (!parsed.success) {
+			throw new TRPCError({
+				code: 'BAD_REQUEST',
+				message: parsed.error.issues.map((issue) => issue.message).join('; '),
+			});
+		}
+		config.pipeline = parsed.data;
+	}
+	return config;
+}
+
+/**
+ * The repository-ownership half of a write's conflict check, run without writing — the
+ * same guard `createProjectWithMemberInDb` / `upsertProjectToDb` apply — mapped to the
+ * `CONFLICT` the write would answer with.
+ */
+async function assertRepositoriesAvailable(config: ProjectRecord): Promise<void> {
+	try {
+		await assertRepositoriesUnclaimed(config);
+	} catch (error) {
+		if (error instanceof ProjectRepositoryConflictError) throw projectConflictError(error);
+		throw error;
+	}
+}
+
+/** The top-level record fields whose value an update would change. */
+function changedProjectFields(before: ProjectRecord, after: ProjectRecord): string[] {
+	const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
+	return [...keys].filter(
+		(key) =>
+			JSON.stringify(before[key as keyof ProjectRecord]) !==
+			JSON.stringify(after[key as keyof ProjectRecord]),
+	);
+}
+
 export const projectsRouter = router({
 	// Only the caller's accessible projects: their membership set, or every
 	// project for an `instanceAdmin` (`filterAccessibleProjects`, #281 task 4).
@@ -479,6 +676,27 @@ export const projectsRouter = router({
 			};
 		}),
 
+	// The project's whole `agents` block, read at `projectAdmin` (issue #1349) — what
+	// `update` would replace when given an `agents` change, and the dry run and
+	// pre-write authorization of the operator MCP server's `phase_agents_reorder` and
+	// `phase_agents_restore` (`src/mcp/tools/phase-agents.ts`), which persist through
+	// `update`. Gated exactly as that mutation, so a dry run never describes a change
+	// the real call would refuse: a `member`/`contributor` gets FORBIDDEN, a
+	// non-member the existence-hiding NOT_FOUND.
+	agentsForUpdate: authedProcedure
+		.input(z.object({ id: z.string().min(1) }))
+		.query(async ({ ctx, input }) => {
+			await assertProjectAccess(ctx.user, input.id, 'projectAdmin');
+			const project = await findProjectRecordByIdFromDb(input.id);
+			if (!project) {
+				throw new TRPCError({
+					code: 'NOT_FOUND',
+					message: `Project with ID "${input.id}" not found`,
+				});
+			}
+			return { agents: project.agents };
+		}),
+
 	// Any authenticated user may create a project and becomes its `projectAdmin`
 	// (#281 task 4): the creator gets a membership row in the same call, so they
 	// can immediately administer what they just created without an operator
@@ -486,33 +704,8 @@ export const projectsRouter = router({
 	// the row is still written so the creator keeps access if their installation
 	// role is later removed. Creation and membership insertion are performed
 	// atomically in one transaction so a partial failure never leaves an unowned project.
-	create: authedProcedure.input(ProjectCreateInputSchema).mutation(async ({ ctx, input: raw }) => {
-		const { reviewerToken, ...input } = raw;
-		const pmReferences = defaultPmCredentialReferences(DEFAULT_PM_CONFIG);
-		// This is a creation-time default, not a config-schema fallback: the dashboard
-		// always submits its explicit picker value, while non-dashboard callers remain
-		// routable instead of creating a project with no SCM provider.
-		const scm: ScmType = input.scm ?? 'github';
-		// First of all, for the same reason as the instance-default check below: a refused
-		// creation does no work at all.
-		assertRepositoryCoordinates(scm, input.repositories);
-		// Issue #778: the instance reviewer credential is an installation-wide requirement,
-		// so a provider declaring an `instanceDefault`-eligible role with nothing stored
-		// refuses creation here — before any row is written, and before the config below is
-		// even assembled, so a refused creation does no work at all. A request that would
-		// both be refused and conflict on id therefore reports the refusal, the more
-		// actionable of the two; the operator meets the conflict on the retry.
-		const instanceDefaults = await requireInstanceScmDefaults(scm, reviewerToken);
-		const scmReferences = defaultScmCredentialReferences(scm);
-		const config = {
-			...input,
-			scm,
-			pm: DEFAULT_PM_CONFIG,
-			credentials: {
-				scm: scmReferences,
-				...(pmReferences ? { pm: pmReferences } : {}),
-			},
-		};
+	create: authedProcedure.input(ProjectCreateInputSchema).mutation(async ({ ctx, input }) => {
+		const { config, scm, instanceDefaults } = await planProjectCreate(input);
 		try {
 			await createProjectWithMemberInDb(config, {
 				projectId: config.id,
@@ -520,12 +713,7 @@ export const projectsRouter = router({
 				role: 'projectAdmin',
 			});
 		} catch (error) {
-			if (isProjectConflict(error)) {
-				throw new TRPCError({
-					code: 'CONFLICT',
-					message: 'Project ID or repository already exists',
-				});
-			}
+			if (isProjectConflict(error)) throw projectConflictError(error, config.id);
 			throw error;
 		}
 		// The *write* half stays best-effort, and outside the transaction above on purpose:
@@ -546,54 +734,104 @@ export const projectsRouter = router({
 		return config;
 	}),
 
-	update: authedProcedure
-		.input(
-			ProjectWriteInputSchema.partial().extend({
-				id: z.string().min(1),
-				pipeline: PipelinePatchSchema.optional(),
-			}),
-		)
-		.mutation(async ({ ctx, input }) => {
-			// Config changes are a `projectAdmin`-only action; a `member`/`contributor`
-			// gets FORBIDDEN, a non-member NOT_FOUND.
-			await assertProjectAccess(ctx.user, input.id, 'projectAdmin');
-			const existing = await findProjectRecordByIdFromDb(input.id);
-			if (!existing) {
-				throw new TRPCError({
-					code: 'NOT_FOUND',
-					message: `Project with ID "${input.id}" not found`,
-				});
-			}
-			const { id, pipeline: pipelinePatch, ...updates } = input;
-			// Before the merge, so a refused switch leaves nothing written at all.
-			if (updates.pm) assertPmProviderSwitchable(existing, updates.pm);
-			const config = {
-				...existing,
-				...updates,
-			};
-			// Only on a change to either side, as the PM switch check: an ordinary edit is
-			// unaffected, while a three-segment repository on GitHub — or a switch to Azure
-			// DevOps with two-segment repositories still stored — is refused unwritten.
-			if (updates.repositories || updates.scm) {
-				assertRepositoryCoordinates(config.scm, config.repositories);
-			}
-			if (pipelinePatch) {
-				config.pipeline = PipelineConfigSchema.parse(
-					mergePipelineConfig(existing.pipeline, pipelinePatch),
-				);
-			}
+	update: authedProcedure.input(ProjectUpdateInputSchema).mutation(async ({ ctx, input }) => {
+		// Config changes are a `projectAdmin`-only action; a `member`/`contributor`
+		// gets FORBIDDEN, a non-member NOT_FOUND.
+		await assertProjectAccess(ctx.user, input.id, 'projectAdmin');
+		const existing = await requireProjectRecord(input.id);
+		const config = planProjectUpdate(existing, input);
+		try {
+			await upsertProjectToDb(config);
+			return config;
+		} catch (error) {
+			if (isProjectConflict(error)) throw projectConflictError(error);
+			throw error;
+		}
+	}),
+
+	// The dry run of `create` (issue #1359, the operator MCP server's `project_create`):
+	// the same validation, the same instance-credential requirement and the same
+	// id/repository conflict check, with nothing written. Gated as `create` is — any
+	// authenticated user — and a refusal is reported as `wouldRefuse` in the code and
+	// words `create` would answer with. No secret goes in or comes out: it takes only
+	// whether a reviewer token was given (`hasReviewerToken`), and the credentials
+	// `create` would seed are named by provider, role and source only.
+	previewCreate: authedProcedure
+		.input(ProjectCreatePreviewInputSchema)
+		.query(async ({ ctx, input: { hasReviewerToken, ...input } }) => {
+			let project: ProjectRecord | null = null;
+			let seededCredentials: Array<{
+				providerId: ScmType;
+				role: ScmCredentialRole;
+				source: string;
+			}> = [];
+			let wouldRefuse: PreviewRefusal | null = null;
 			try {
-				await upsertProjectToDb(config);
-				return config;
-			} catch (error) {
-				if (isProjectConflict(error)) {
-					throw new TRPCError({
-						code: 'CONFLICT',
-						message: 'Project ID or repository already exists',
-					});
+				const plan = await planProjectCreate({
+					...input,
+					reviewerToken: hasReviewerToken ? PREVIEW_REVIEWER_TOKEN_PLACEHOLDER : undefined,
+				});
+				project = plan.config;
+				seededCredentials = plan.instanceDefaults.map((seed) => ({
+					providerId: plan.scm,
+					role: seed.role,
+					source: seed.source,
+				}));
+				if (await findProjectRecordByIdFromDb(plan.config.id)) {
+					throw duplicateProjectIdError(plan.config.id);
 				}
-				throw error;
+				await assertRepositoriesAvailable(plan.config);
+			} catch (error) {
+				wouldRefuse = previewRefusalOf(error);
 			}
+			return {
+				project,
+				creator: { userId: ctx.user.id, identifier: ctx.user.identifier, role: 'projectAdmin' },
+				seededCredentials,
+				// A new project always starts on the placeholder board mapping; `pm_board_set` /
+				// the Project Management tab replaces it.
+				pmPlaceholder: true,
+				wouldRefuse,
+			};
+		}),
+
+	// The dry run of `update` (issue #1359, the operator MCP server's `project_update` and
+	// `pm_board_set`): the merged record `update` would write and which top-level fields it
+	// changes, or the refusal it would answer with — including a repository another project
+	// owns. Gated exactly as `update` (`projectAdmin`), so a caller who may not change the
+	// project learns nothing more from the dry run.
+	previewUpdate: authedProcedure.input(ProjectUpdateInputSchema).query(async ({ ctx, input }) => {
+		await assertProjectAccess(ctx.user, input.id, 'projectAdmin');
+		const existing = await requireProjectRecord(input.id);
+		try {
+			const after = planProjectUpdate(existing, input);
+			await assertRepositoriesAvailable(after);
+			return {
+				before: existing,
+				after,
+				changedFields: changedProjectFields(existing, after),
+				wouldRefuse: null,
+			};
+		} catch (error) {
+			return {
+				before: existing,
+				after: null,
+				changedFields: [],
+				wouldRefuse: previewRefusalOf(error),
+			};
+		}
+	}),
+
+	// Whether the project can run, item by item, and what is missing (issue #1359) — the
+	// operator MCP server's `project_readiness`. `projectAdmin`, like board discovery: it
+	// exercises the project's own SCM and PM credentials against their providers, and the
+	// role it reports to is the one that can fix what it finds. See
+	// `../project-readiness.ts` for what each item checks.
+	readiness: authedProcedure
+		.input(z.object({ projectId: z.string().min(1) }))
+		.query(async ({ ctx, input }) => {
+			await assertProjectAccess(ctx.user, input.projectId, 'projectAdmin');
+			return checkProjectReadiness(await requireProjectRecord(input.projectId));
 		}),
 
 	// Removing a project for good — reachable from the dashboard's Settings tab since
