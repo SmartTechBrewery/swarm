@@ -39,6 +39,7 @@ import {
 	hasLiveRunForTask,
 	hasResumableDeferredRun,
 	hasRunForTask,
+	type ListRunsFilter,
 	listRunPassedOverWorkerIds,
 	listRunsFromDb,
 	listTaskActivitySince,
@@ -2126,17 +2127,37 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			status?: string;
 			phase?: string;
 			startedAt: Date;
-		}): Promise<void> {
-			await getDb()
+			repository?: string;
+			taskId?: string;
+			prNumber?: string;
+			workerId?: string;
+			engine?: string;
+			completedAt?: Date;
+			durationMs?: number;
+			error?: string;
+			continuationCount?: number;
+			jobPayload?: SwarmJob;
+		}): Promise<string> {
+			const [row] = await getDb()
 				.insert(runs)
 				.values({
 					projectId: overrides.projectId ?? PROJECT_ID,
-					repository: REPO,
-					taskId: 't',
+					repository: overrides.repository ?? REPO,
+					taskId: overrides.taskId ?? 't',
+					prNumber: overrides.prNumber,
+					workerId: overrides.workerId,
+					engine: overrides.engine,
 					phase: overrides.phase ?? 'review',
 					status: overrides.status ?? 'running',
 					startedAt: overrides.startedAt,
-				});
+					completedAt: overrides.completedAt,
+					durationMs: overrides.durationMs,
+					error: overrides.error,
+					continuationCount: overrides.continuationCount,
+					jobPayload: overrides.jobPayload,
+				})
+				.returning({ id: runs.id });
+			return row.id;
 		}
 
 		it('filters by project, status, and phase, and counts the filtered set', async () => {
@@ -2216,6 +2237,161 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			expect(page3.total).toBe(5);
 			expect(page3.data).toHaveLength(1);
 			expect(page3.data[0].startedAt.getTime()).toBe(new Date(2026, 0, 1).getTime());
+		});
+
+		// Issue #1339 — the operator MCP server's `runs_list` filters.
+		it('filters by repository, task, pull request, worker and CLI, counting each set', async () => {
+			const { worker } = await seedWorker('list');
+			const mobile = await seedRun({
+				repository: OTHER_REPO,
+				startedAt: new Date('2026-01-01'),
+			});
+			const task = await seedRun({ taskId: '42', startedAt: new Date('2026-01-02') });
+			const pr = await seedRun({ prNumber: '77', startedAt: new Date('2026-01-03') });
+			const onWorker = await seedRun({ workerId: worker.id, startedAt: new Date('2026-01-04') });
+			const onCodex = await seedRun({ engine: 'codex', startedAt: new Date('2026-01-05') });
+
+			const page = (filter: Partial<ListRunsFilter>) =>
+				listRunsFromDb({ ...filter, limit: 50, offset: 0 });
+
+			await expect(page({ repository: OTHER_REPO })).resolves.toMatchObject({
+				total: 1,
+				data: [{ id: mobile }],
+			});
+			await expect(page({ taskId: '42' })).resolves.toMatchObject({
+				total: 1,
+				data: [{ id: task }],
+			});
+			await expect(page({ prNumber: '77' })).resolves.toMatchObject({
+				total: 1,
+				data: [{ id: pr }],
+			});
+			await expect(page({ workerId: worker.id })).resolves.toMatchObject({
+				total: 1,
+				data: [{ id: onWorker }],
+			});
+			await expect(page({ cli: 'codex' })).resolves.toMatchObject({
+				total: 1,
+				data: [{ id: onCodex }],
+			});
+			expect((await page({})).total).toBe(5);
+		});
+
+		it('accepts several statuses at once', async () => {
+			await seedRun({ status: 'failed', startedAt: new Date('2026-01-01') });
+			await seedRun({ status: 'completed', startedAt: new Date('2026-01-02') });
+			await seedRun({ status: 'running', startedAt: new Date('2026-01-03') });
+
+			const result = await listRunsFromDb({
+				status: ['failed', 'completed'],
+				limit: 50,
+				offset: 0,
+			});
+
+			expect(result.total).toBe(2);
+			expect(result.data.map((run) => run.status)).toEqual(['completed', 'failed']);
+		});
+
+		it('bounds the started and completed ranges, excluding unfinished runs from the latter', async () => {
+			const early = await seedRun({
+				status: 'completed',
+				startedAt: new Date('2026-01-01'),
+				completedAt: new Date('2026-01-02'),
+			});
+			const late = await seedRun({
+				status: 'completed',
+				startedAt: new Date('2026-02-01'),
+				completedAt: new Date('2026-02-02'),
+			});
+			const running = await seedRun({ startedAt: new Date('2026-03-01') });
+
+			const startedWindow = await listRunsFromDb({
+				startedSince: new Date('2026-01-15'),
+				startedBefore: new Date('2026-03-01'),
+				limit: 50,
+				offset: 0,
+			});
+			expect(startedWindow.data.map((run) => run.id)).toEqual([late]);
+			expect(startedWindow.total).toBe(1);
+
+			const completedWindow = await listRunsFromDb({
+				completedSince: new Date('2026-01-01'),
+				limit: 50,
+				offset: 0,
+			});
+			expect(completedWindow.data.map((run) => run.id)).toEqual([late, early]);
+			expect(completedWindow.data.map((run) => run.id)).not.toContain(running);
+
+			const completedBefore = await listRunsFromDb({
+				completedBefore: new Date('2026-02-02'),
+				limit: 50,
+				offset: 0,
+			});
+			expect(completedBefore.data.map((run) => run.id)).toEqual([early]);
+			expect(completedBefore.total).toBe(1);
+		});
+
+		it('sorts by either timestamp in either direction, unfinished runs last by completion', async () => {
+			// Started a → b → c, completed b → a, c still running.
+			const a = await seedRun({
+				status: 'completed',
+				startedAt: new Date('2026-01-01'),
+				completedAt: new Date('2026-01-10'),
+			});
+			const b = await seedRun({
+				status: 'completed',
+				startedAt: new Date('2026-01-02'),
+				completedAt: new Date('2026-01-05'),
+			});
+			const c = await seedRun({ startedAt: new Date('2026-01-03') });
+
+			const ids = async (filter: Partial<ListRunsFilter>) =>
+				(await listRunsFromDb({ ...filter, limit: 50, offset: 0 })).data.map((run) => run.id);
+
+			expect(await ids({})).toEqual([c, b, a]);
+			expect(await ids({ order: 'asc' })).toEqual([a, b, c]);
+			expect(await ids({ sort: 'completedAt' })).toEqual([a, b, c]);
+			expect(await ids({ sort: 'completedAt', order: 'asc' })).toEqual([b, a, c]);
+		});
+
+		it('carries each row’s duration, retry count, continuation count and error summary', async () => {
+			const stored = await seedRun({
+				status: 'failed',
+				startedAt: new Date('2026-01-01T00:00:00Z'),
+				completedAt: new Date('2026-01-01T00:10:00Z'),
+				durationMs: 1234,
+				error: '\n  Agent exited with code 1\n  at a very long stack trace',
+				continuationCount: 2,
+				jobPayload: {
+					...createMockScmWebhookJob(),
+					rateLimitRetryAttempt: 2,
+					automaticRetryAttempt: 1,
+					dependencyRecheckAttempt: 5,
+				} as SwarmJob,
+			});
+			const derived = await seedRun({
+				status: 'completed',
+				startedAt: new Date('2026-01-02T00:00:00Z'),
+				completedAt: new Date('2026-01-02T00:01:00Z'),
+			});
+			const running = await seedRun({ startedAt: new Date('2026-01-03T00:00:00Z') });
+
+			const { data } = await listRunsFromDb({ limit: 50, offset: 0 });
+			const byId = new Map(data.map((run) => [run.id, run]));
+
+			expect(byId.get(stored)).toMatchObject({
+				durationMs: 1234,
+				retryCount: 3,
+				continuationCount: 2,
+				errorSummary: 'Agent exited with code 1',
+			});
+			expect(byId.get(derived)).toMatchObject({
+				durationMs: 60_000,
+				retryCount: 0,
+				continuationCount: 0,
+				errorSummary: null,
+			});
+			expect(byId.get(running)).toMatchObject({ durationMs: null, errorSummary: null });
 		});
 
 		it('returns an empty page and zero total when nothing matches', async () => {
