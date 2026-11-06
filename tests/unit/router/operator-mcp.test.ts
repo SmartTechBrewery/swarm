@@ -13,14 +13,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
  * read models the `workers` procedures assemble their rows from (issue #1341), whose
  * own suites live beside the service.
  */
-const { listRunsFromDb, getRunByIdFromDb, getRunLogsFromDb, getRunOutputEvents } = vi.hoisted(
-	() => ({
-		listRunsFromDb: vi.fn(),
-		getRunByIdFromDb: vi.fn(),
-		getRunLogsFromDb: vi.fn(),
-		getRunOutputEvents: vi.fn(),
-	}),
-);
+const {
+	listRunsFromDb,
+	getRunByIdFromDb,
+	getRunLogsFromDb,
+	getRunOutputEvents,
+	getLatestCompletedReviewRunForPullRequest,
+} = vi.hoisted(() => ({
+	listRunsFromDb: vi.fn(),
+	getRunByIdFromDb: vi.fn(),
+	getRunLogsFromDb: vi.fn(),
+	getRunOutputEvents: vi.fn(),
+	getLatestCompletedReviewRunForPullRequest: vi.fn(),
+}));
 vi.mock('@/db/repositories/runsRepository.js', async () => ({
 	...(await vi.importActual<typeof import('@/db/repositories/runsRepository.js')>(
 		'@/db/repositories/runsRepository.js',
@@ -29,6 +34,27 @@ vi.mock('@/db/repositories/runsRepository.js', async () => ({
 	getRunByIdFromDb,
 	getRunLogsFromDb,
 	getRunOutputEvents,
+	getLatestCompletedReviewRunForPullRequest,
+}));
+// The review-verdict ledger read and the project record read behind `pr_status` and
+// `phase_agents_get` (issue #1342); the ledger's pure cap predicates stay real.
+const { listActiveReviewSlotsForPullRequest } = vi.hoisted(() => ({
+	listActiveReviewSlotsForPullRequest: vi.fn(),
+}));
+vi.mock('@/db/repositories/reviewVerdictsRepository.js', async () => ({
+	...(await vi.importActual<typeof import('@/db/repositories/reviewVerdictsRepository.js')>(
+		'@/db/repositories/reviewVerdictsRepository.js',
+	)),
+	listActiveReviewSlotsForPullRequest,
+}));
+const { findProjectRecordByIdFromDb } = vi.hoisted(() => ({
+	findProjectRecordByIdFromDb: vi.fn(),
+}));
+vi.mock('@/db/repositories/projectsRepository.js', async () => ({
+	...(await vi.importActual<typeof import('@/db/repositories/projectsRepository.js')>(
+		'@/db/repositories/projectsRepository.js',
+	)),
+	findProjectRecordByIdFromDb,
 }));
 const { getMembership, listAccessibleProjectIds } = vi.hoisted(() => ({
 	getMembership: vi.fn(),
@@ -67,6 +93,7 @@ vi.mock('@/identity/worker-enrollment-service.js', async () => ({
 
 import type { SwarmUser } from '@/identity/schema.js';
 import { type OperatorMcpDeps, registerOperatorMcp } from '@/router/operator-mcp.js';
+import { createMockProjectRecord } from '../../helpers/factories.js';
 
 function user(id: string, identifier: string, instanceAdmin: boolean): SwarmUser {
 	return {
@@ -221,6 +248,9 @@ beforeEach(() => {
 	listDashboardWorkers.mockReset().mockResolvedValue([workerRow(WORKER_ID, 'idle-box', [])]);
 	listProjectWorkerIdsInOrder.mockReset().mockResolvedValue([]);
 	listWorkerProjectCapacity.mockReset().mockResolvedValue(CAPACITY);
+	getLatestCompletedReviewRunForPullRequest.mockReset().mockResolvedValue(undefined);
+	listActiveReviewSlotsForPullRequest.mockReset().mockResolvedValue([]);
+	findProjectRecordByIdFromDb.mockReset().mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -290,6 +320,8 @@ describe('operator MCP — the handshake', () => {
 
 		expect(tools.map((tool) => tool.name).sort()).toEqual([
 			'cli_rate_limits',
+			'phase_agents_get',
+			'pr_status',
 			'run_get',
 			'runs_list',
 			'workers_state',
@@ -580,5 +612,148 @@ describe('operator MCP — cli_rate_limits', () => {
 		expect(result.structuredContent).toMatchObject({
 			workers: [{ workerId: COOLING_WORKER_ID }],
 		});
+	});
+});
+
+describe('operator MCP — pr_status', () => {
+	const PR = { projectId: 'proj-a', repository: 'acme/app', prNumber: 42 };
+
+	function submitted(ordinal: number, overrides: Record<string, unknown> = {}) {
+		return {
+			ordinal,
+			state: 'submitted',
+			headSha: `head-${ordinal}`,
+			capOverrideGrantedAt: null,
+			capOverrideConsumedAt: null,
+			dispatchActive: false,
+			superseded: false,
+			...overrides,
+		};
+	}
+
+	it("reads a capped pull request's merge outcome, verdict count and outstanding grant", async () => {
+		getLatestCompletedReviewRunForPullRequest.mockResolvedValue({
+			...failedRun(),
+			phase: 'review',
+			status: 'completed',
+			reviewVerdict: 'request-changes',
+			reviewMergeOutcome: null,
+			reviewMergeMessage: null,
+		});
+		listActiveReviewSlotsForPullRequest.mockResolvedValue([
+			submitted(1),
+			submitted(2),
+			submitted(3, { capOverrideGrantedAt: new Date('2026-11-06T09:00:00Z') }),
+		]);
+
+		const result = await callTool('pr_status', PR, 'member-token');
+
+		expect(result.isError).toBeUndefined();
+		expect(result.structuredContent).toEqual({
+			lastReviewRunId: RUN_ID,
+			lastReviewVerdict: 'request-changes',
+			lastReviewedHeadSha: 'head-3',
+			mergeOutcome: null,
+			mergeOutcomeMessage: null,
+			verdictCount: 3,
+			verdictCap: 3,
+			supersededCount: 0,
+			supersededCap: 5,
+			capReached: true,
+			capBound: 'verdict-cap',
+			overrideOutstanding: true,
+		});
+		expect(listActiveReviewSlotsForPullRequest).toHaveBeenCalledWith('proj-a', 'acme/app', '42');
+	});
+
+	it('hides a project the caller is not a member of, reading nothing', async () => {
+		const result = await callTool('pr_status', PR, 'stranger-token');
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toMatch(/^NOT_FOUND: /);
+		expect(getLatestCompletedReviewRunForPullRequest).not.toHaveBeenCalled();
+		expect(listActiveReviewSlotsForPullRequest).not.toHaveBeenCalled();
+	});
+});
+
+describe('operator MCP — phase_agents_get', () => {
+	const REVIEW_AGENT = {
+		targets: [
+			{ cli: 'codex' as const, model: 'gpt-5.6-sol', reasoning: 'high' as const },
+			{ cli: 'claude' as const, model: 'opus' },
+		],
+		timeoutMs: 20 * 60 * 1000,
+		prompt: 'Check the migrations.',
+	};
+
+	beforeEach(() => {
+		findProjectRecordByIdFromDb.mockImplementation(async (id: string) =>
+			id === 'proj-a'
+				? createMockProjectRecord({
+						id: 'proj-a',
+						agents: { defaults: { claude: 'sonnet' }, review: REVIEW_AGENT },
+					})
+				: undefined,
+		);
+	});
+
+	it("returns only the phase's normalised agent configuration, nothing else of the project", async () => {
+		const result = await callTool(
+			'phase_agents_get',
+			{ projectId: 'proj-a', phase: 'review' },
+			'member-token',
+		);
+
+		expect(result.isError).toBeUndefined();
+		// Exactly the phase — no repositories, board mapping, credentials, or other
+		// phases — with the `targets[0]` mirror the schema normalises in.
+		expect(result.structuredContent).toEqual({
+			projectId: 'proj-a',
+			phase: 'review',
+			configured: true,
+			targets: REVIEW_AGENT.targets,
+			cli: 'codex',
+			model: 'gpt-5.6-sol',
+			reasoning: 'high',
+			timeoutMs: REVIEW_AGENT.timeoutMs,
+			prompt: REVIEW_AGENT.prompt,
+		});
+	});
+
+	it('reports a phase with no override as running on its coded defaults', async () => {
+		const result = await callTool(
+			'phase_agents_get',
+			{ projectId: 'proj-a', phase: 'respondToCi' },
+			'member-token',
+		);
+
+		expect(result.structuredContent).toEqual({
+			projectId: 'proj-a',
+			phase: 'respondToCi',
+			configured: false,
+		});
+	});
+
+	it('hides a project the caller is not a member of, reading nothing', async () => {
+		const result = await callTool(
+			'phase_agents_get',
+			{ projectId: 'proj-a', phase: 'review' },
+			'stranger-token',
+		);
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toMatch(/^NOT_FOUND: /);
+		expect(findProjectRecordByIdFromDb).not.toHaveBeenCalled();
+	});
+
+	it('rejects a key that is not a phase', async () => {
+		const result = await callTool(
+			'phase_agents_get',
+			{ projectId: 'proj-a', phase: 'defaults' },
+			'member-token',
+		);
+
+		expect(result.isError).toBe(true);
+		expect(findProjectRecordByIdFromDb).not.toHaveBeenCalled();
 	});
 });

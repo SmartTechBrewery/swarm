@@ -31,11 +31,14 @@ import {
 	isReviewAllowanceSpent,
 	listActiveReviewSlotsForPullRequest,
 	type PullRequestReviewSlot,
+	REVIEW_SUPERSEDED_CAP,
+	REVIEW_VERDICT_CAP,
 	type ReviewCapBound,
 	reviewCapBoundReached,
 } from '../../db/repositories/reviewVerdictsRepository.js';
 import {
 	cancelDeferredRunInDb,
+	getLatestCompletedReviewRunForPullRequest,
 	getRunByIdFromDb,
 	getRunLogsFromDb,
 	getRunOutputEvents,
@@ -1255,6 +1258,94 @@ function resolveReviewCapStop(
 	return reviewCapBoundReached(slots);
 }
 
+/** `runs.prStatus`'s input: one pull request of one project (issue #1342). */
+export const PullRequestStatusInputSchema = z.object({
+	projectId: z.string().min(1),
+	repository: z.string().min(1),
+	prNumber: z.number().int().positive(),
+});
+
+/**
+ * One pull request's automation state as SWARM's own records hold it (issue
+ * #1342) — the merge-automation outcome on its latest completed Review run and
+ * its review-verdict ledger, with no provider call.
+ */
+export interface PullRequestStatus {
+	/** The latest completed Review run of this pull request, or `null` when it has none. */
+	lastReviewRunId: string | null;
+	/** That run's verdict (`approve`/`request-changes`/…), or `null`. */
+	lastReviewVerdict: string | null;
+	/** The head SHA of the pull request's latest submitted verdict in the ledger, or `null`. */
+	lastReviewedHeadSha: string | null;
+	/**
+	 * The merge-automation outcome recorded on that run (`runs.review_merge_outcome`):
+	 * `merged`, `not-ready`, `not-eligible`, `policy-blocked`, `unsupported`,
+	 * `provider-error`, `retry-exhausted` or `provider-error-exhausted` — `null` when
+	 * the run did not approve or merge automation is off.
+	 */
+	mergeOutcome: string | null;
+	/** The human-readable detail written with {@link mergeOutcome}. */
+	mergeOutcomeMessage: string | null;
+	/** Submitted verdicts counted toward {@link verdictCap} (superseded ones excluded). */
+	verdictCount: number;
+	verdictCap: number;
+	/** Submitted approvals superseded by a head change, counted toward {@link supersededCap}. */
+	supersededCount: number;
+	supersededCap: number;
+	/** Whether either bound is reached, whatever an operator has since granted. */
+	capReached: boolean;
+	/** Which bound is reached — `verdict-cap` first when both are — or `null`. */
+	capBound: ReviewCapBound | null;
+	/** Whether an operator's Force re-review grant is recorded and not yet spent. */
+	overrideOutstanding: boolean;
+}
+
+/**
+ * The head SHA of a ledger's latest submitted verdict. A superseded slot frees its
+ * ordinal (issue #1079), so the replacement that reused it ties with it: the one
+ * that is *not* superseded is the later review.
+ */
+function latestSubmittedHeadSha(slots: readonly PullRequestReviewSlot[]): string | null {
+	let latest: PullRequestReviewSlot | null = null;
+	for (const slot of slots) {
+		if (slot.state !== 'submitted') continue;
+		if (
+			!latest ||
+			slot.ordinal > latest.ordinal ||
+			(slot.ordinal === latest.ordinal && latest.superseded && !slot.superseded)
+		) {
+			latest = slot;
+		}
+	}
+	return latest?.headSha ?? null;
+}
+
+/**
+ * Assemble {@link PullRequestStatus} from the two reads it is made of. The cap facts
+ * come from the ledger module's own predicates, never re-derived here, so this
+ * answer cannot drift from the reservation that enforces them.
+ */
+function toPullRequestStatus(
+	run: RunRow | undefined,
+	slots: readonly PullRequestReviewSlot[],
+): PullRequestStatus {
+	const submitted = slots.filter((slot) => slot.state === 'submitted');
+	return {
+		lastReviewRunId: run?.id ?? null,
+		lastReviewVerdict: run?.reviewVerdict ?? null,
+		lastReviewedHeadSha: latestSubmittedHeadSha(slots),
+		mergeOutcome: run?.reviewMergeOutcome ?? null,
+		mergeOutcomeMessage: run?.reviewMergeMessage ?? null,
+		verdictCount: submitted.filter((slot) => !slot.superseded).length,
+		verdictCap: REVIEW_VERDICT_CAP,
+		supersededCount: submitted.filter((slot) => slot.superseded).length,
+		supersededCap: REVIEW_SUPERSEDED_CAP,
+		capReached: hasSubmittedEveryPermittedVerdict(slots),
+		capBound: reviewCapBoundReached(slots),
+		overrideOutstanding: hasOutstandingCapOverride(slots),
+	};
+}
+
 /**
  * The two project policies the liveness classification consults, read exactly as
  * the pipeline itself reads them (issue #840): Planning's `autoAdvance` is off
@@ -1594,6 +1685,29 @@ export const runsReadRouter = router(runReadProcedures);
 
 export const runsRouter = router({
 	...runReadProcedures,
+
+	// One pull request's automation state (issue #1342) — the operator MCP server's
+	// `pr_status` tool (`src/mcp/tools/pull-requests.ts`). Answered from SWARM's own
+	// records alone: the merge-automation outcome on the pull request's latest
+	// completed Review run, and its review-verdict ledger read through the same
+	// predicates `getById`'s cap fields use. No provider call, so it says what SWARM
+	// recorded, never the pull request's live mergeability.
+	//
+	// Gated like every project-scoped run read: a non-member gets the same
+	// existence-hiding `NOT_FOUND` an unknown project does, before anything is read.
+	// Deliberately not in `runReadProcedures`, so the operator API's tRPC surface
+	// does not grow with it.
+	prStatus: authedProcedure
+		.input(PullRequestStatusInputSchema)
+		.query(async ({ ctx, input }): Promise<PullRequestStatus> => {
+			await assertProjectAccess(ctx.user, input.projectId, 'contributor');
+			const prNumber = String(input.prNumber);
+			const [run, slots] = await Promise.all([
+				getLatestCompletedReviewRunForPullRequest(input.projectId, input.repository, prNumber),
+				listActiveReviewSlotsForPullRequest(input.projectId, input.repository, prNumber),
+			]);
+			return toPullRequestStatus(run, slots);
+		}),
 
 	// Every canonical waiting dispatch (pending / event-blocked /
 	// retry-scheduled) — the durable queue read model (issues #234, #284), never
