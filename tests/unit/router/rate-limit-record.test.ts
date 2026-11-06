@@ -16,7 +16,10 @@ const recordWorkerCliRateLimit = vi.fn<
 		resetHint?: string;
 	}) => Promise<void>
 >(async () => {});
-vi.mock('@/db/repositories/workerCliRateLimitsRepository.js', () => ({
+vi.mock('@/db/repositories/workerCliRateLimitsRepository.js', async () => ({
+	...(await vi.importActual<typeof import('@/db/repositories/workerCliRateLimitsRepository.js')>(
+		'@/db/repositories/workerCliRateLimitsRepository.js',
+	)),
 	recordWorkerCliRateLimit: (input: Parameters<typeof recordWorkerCliRateLimit>[0]) =>
 		recordWorkerCliRateLimit(input),
 }));
