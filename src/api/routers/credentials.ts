@@ -321,6 +321,31 @@ async function updatePmReferences(
 	});
 }
 
+/**
+ * What a credential write would do, as its dry run reports it: the provider, role and
+ * store key it lands on, and whether a usable secret is already stored there (`replace`)
+ * or not (`set`). Never the secret, nor any part of it.
+ */
+function credentialWritePlan(
+	side: 'scm' | 'pm',
+	providerId: string,
+	role: string,
+	label: string,
+	referenceKey: string,
+	resolved: Record<string, string>,
+) {
+	const isConfigured = isUsableSecret(resolved[referenceKey]);
+	return {
+		side,
+		providerId,
+		role,
+		label,
+		referenceKey,
+		isConfigured,
+		change: isConfigured ? ('replace' as const) : ('set' as const),
+	};
+}
+
 export const credentialsRouter = router({
 	/**
 	 * One SCM provider's credential state for this project — the data the Source
@@ -457,6 +482,31 @@ export const credentialsRouter = router({
 		}),
 
 	/**
+	 * The dry run of {@link setPm} (issue #1359, the operator MCP server's
+	 * `project_credential_set`): which provider, role and store key the write would land
+	 * on, and whether it would set a new secret or replace a stored one. Gated and
+	 * validated exactly as `setPm` — `projectAdmin`, a registered provider, a declared
+	 * role that is not the Source Control tab's — and it takes no value, so no secret
+	 * reaches it or leaves it.
+	 */
+	previewSetPm: authedProcedure
+		.input(
+			z.object({
+				projectId: z.string().min(1),
+				providerId: PmProviderIdSchema.optional(),
+				role: z.string().min(1),
+			}),
+		)
+		.query(async ({ ctx, input }) => {
+			await assertProjectAccess(ctx.user, input.projectId, 'projectAdmin');
+			const project = await requireProject(input.projectId);
+			const { providerId, spec } = requirePmRoleSpec(project, input.role, input.providerId);
+			const referenceKey = pmReferenceKeyFor(project, providerId, spec);
+			const resolved = await resolveAllProjectCredentials(input.projectId);
+			return credentialWritePlan('pm', providerId, spec.role, spec.label, referenceKey, resolved);
+		}),
+
+	/**
 	 * Clear one PM role: delete the stored secret *and* drop its
 	 * `credentials.pm[providerId]` reference, leaving every other provider's block in
 	 * place. Dropping the reference is the point — a role with no reference reads
@@ -517,6 +567,27 @@ export const credentialsRouter = router({
 				...(project.credentials.scm?.[providerId] ?? {}),
 				[spec.role]: referenceKey,
 			});
+		}),
+
+	/**
+	 * The dry run of {@link set} (issue #1359), the SCM twin of {@link previewSetPm}: gated
+	 * and validated exactly as `set`, and taking no value.
+	 */
+	previewSet: authedProcedure
+		.input(
+			z.object({
+				projectId: z.string().min(1),
+				providerId: z.string().min(1),
+				role: z.string().min(1),
+			}),
+		)
+		.query(async ({ ctx, input }) => {
+			await assertProjectAccess(ctx.user, input.projectId, 'projectAdmin');
+			const project = await requireProject(input.projectId);
+			const { providerId, spec } = requireScmRoleSpec(input.providerId, input.role);
+			const referenceKey = scmReferenceKeyFor(project, providerId, spec);
+			const resolved = await resolveAllProjectCredentials(input.projectId);
+			return credentialWritePlan('scm', providerId, spec.role, spec.role, referenceKey, resolved);
 		}),
 
 	/**

@@ -22,6 +22,7 @@ import { registerPhaseAgentTools } from './tools/phase-agents.js';
 import { registerPipelineTools } from './tools/pipeline.js';
 import { registerPullRequestActionTools } from './tools/pr-actions.js';
 import { registerProjectConfigTools } from './tools/project-config.js';
+import { registerProjectSetupTools } from './tools/project-setup.js';
 import { registerPullRequestTools } from './tools/pull-requests.js';
 import { registerRunActionTools } from './tools/run-actions.js';
 import { registerRunTools } from './tools/runs.js';
@@ -55,5 +56,6 @@ export function createSwarmMcpServer(user: SwarmUser): McpServer {
 	registerPhaseAgentTools(server, user);
 	registerWorkItemTools(server, user);
 	registerCliRateLimitSetTools(server, user);
+	registerProjectSetupTools(server, user);
 	return server;
 }

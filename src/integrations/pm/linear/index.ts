@@ -40,6 +40,7 @@ export const linearManifest: PMProviderManifest = {
 	// out of the `pm` member, and an incoming Linear board is discoverable with nothing
 	// configured but the key.
 	blankPm: linearBlankPm,
+	boardContainerId: (pm) => (pm.type === 'linear' && pm.teamId ? pm.teamId : undefined),
 	routerAdapter: new LinearRouterAdapter(),
 	// Two roles, and **neither** inherits a shared SCM credential — the rule
 	// `PmCredentialRoleSpec.inheritsSharedCredential` states for exactly this

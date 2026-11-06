@@ -119,6 +119,33 @@ describe('runWriteTool', () => {
 		});
 	});
 
+	// Issue #1359: a tool accepting a secret names it, and the audit row never holds it.
+	it('records a secret input as [redacted] while the tool itself still receives it', async () => {
+		const secretShape = { runId: z.string(), token: z.string().optional() };
+		const withSecret: WriteToolDefinition<typeof secretShape> = {
+			...(definition() as unknown as WriteToolDefinition<typeof secretShape>),
+			inputSchema: secretShape,
+			secretInputs: ['token'],
+		};
+
+		await runWriteTool(withSecret, USER, {
+			runId: 'run-1',
+			token: 'hunter2',
+			reason: 'rotate',
+			dryRun: false,
+		});
+
+		expect(recordOperatorAction).toHaveBeenCalledWith(
+			expect.objectContaining({ input: { runId: 'run-1', token: '[redacted]' } }),
+		);
+		expect(JSON.stringify(recordOperatorAction.mock.calls)).not.toContain('hunter2');
+		expect(apply).toHaveBeenCalledWith(
+			{ runId: 'run-1', token: 'hunter2' },
+			expect.anything(),
+			expect.anything(),
+		);
+	});
+
 	it('answers a dry run from the preview alone and never calls the write', async () => {
 		const result = await runWriteTool(definition(), USER, {
 			runId: 'run-1',
