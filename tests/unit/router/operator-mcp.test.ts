@@ -9,7 +9,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
  *
  * Mocked at the same boundaries `./operator-api-runs.test.ts` uses — the run
  * repository reads, the membership service the authz helpers consult, and the one
- * dispatch read `getById`'s enrichment makes for a settled run.
+ * dispatch read `getById`'s enrichment makes for a settled run — plus the worker
+ * read models the `workers` procedures assemble their rows from (issue #1341), whose
+ * own suites live beside the service.
  */
 const { listRunsFromDb, getRunByIdFromDb, getRunLogsFromDb, getRunOutputEvents } = vi.hoisted(
 	() => ({
@@ -45,6 +47,22 @@ vi.mock('@/db/repositories/dispatchesRepository.js', async () => ({
 		'@/db/repositories/dispatchesRepository.js',
 	)),
 	getActiveDispatchByRunId,
+}));
+
+const { listDashboardWorkers, listProjectWorkerIdsInOrder, listWorkerProjectCapacity } = vi.hoisted(
+	() => ({
+		listDashboardWorkers: vi.fn(),
+		listProjectWorkerIdsInOrder: vi.fn(),
+		listWorkerProjectCapacity: vi.fn(),
+	}),
+);
+vi.mock('@/identity/worker-enrollment-service.js', async () => ({
+	...(await vi.importActual<typeof import('@/identity/worker-enrollment-service.js')>(
+		'@/identity/worker-enrollment-service.js',
+	)),
+	listDashboardWorkers,
+	listProjectWorkerIdsInOrder,
+	listWorkerProjectCapacity,
 }));
 
 import type { SwarmUser } from '@/identity/schema.js';
@@ -107,6 +125,40 @@ const OUTPUT_PAGE = {
 	retentionBytes: 1_000_000,
 };
 
+const WORKER_ID = '77777777-7777-4777-8777-777777777777';
+const COOLING_WORKER_ID = '88888888-8888-4888-8888-888888888888';
+const CAPACITY = [
+	{
+		projectId: 'proj-a',
+		status: 'active',
+		isRoutable: true,
+		concurrencyAllocation: 2,
+		activeRuns: 1,
+	},
+];
+const COOL_DOWN = {
+	cli: 'claude',
+	workerId: COOLING_WORKER_ID,
+	expiresAt: new Date('2026-11-06T18:00:00Z'),
+	observedAt: new Date('2026-11-06T10:00:00Z'),
+	resetHint: 'resets 6pm (UTC)',
+};
+
+/** A roster row as `listDashboardWorkers` assembles it, reduced to what the tools read. */
+function workerRow(workerId: string, displayName: string, rateLimits: (typeof COOL_DOWN)[]) {
+	return {
+		workerId,
+		displayName,
+		owner: null,
+		connection: 'online',
+		lastSeenAt: new Date('2026-11-06T10:30:00Z'),
+		drainingSince: null,
+		currentRun: null,
+		rateLimits,
+		update: null,
+	};
+}
+
 let resolveSession: ReturnType<typeof vi.fn<OperatorMcpDeps['resolveSession']>>;
 
 function appWith(): Hono {
@@ -166,6 +218,9 @@ beforeEach(() => {
 	listAccessibleProjectIds
 		.mockReset()
 		.mockImplementation(async (userId: string) => (userId === MEMBER.id ? ['proj-a'] : []));
+	listDashboardWorkers.mockReset().mockResolvedValue([workerRow(WORKER_ID, 'idle-box', [])]);
+	listProjectWorkerIdsInOrder.mockReset().mockResolvedValue([]);
+	listWorkerProjectCapacity.mockReset().mockResolvedValue(CAPACITY);
 });
 
 afterEach(() => {
@@ -212,7 +267,7 @@ describe('operator MCP — the bearer gate', () => {
 });
 
 describe('operator MCP — the handshake', () => {
-	it('initializes as the swarm server and lists exactly the run read tools', async () => {
+	it('initializes as the swarm server and lists exactly the read tools', async () => {
 		const init = await rpc(
 			'initialize',
 			{
@@ -233,7 +288,12 @@ describe('operator MCP — the handshake', () => {
 		};
 		const tools = listBody.result.tools;
 
-		expect(tools.map((tool) => tool.name).sort()).toEqual(['run_get', 'runs_list']);
+		expect(tools.map((tool) => tool.name).sort()).toEqual([
+			'cli_rate_limits',
+			'run_get',
+			'runs_list',
+			'workers_state',
+		]);
 		for (const tool of tools) expect(tool.annotations?.readOnlyHint).toBe(true);
 	});
 });
@@ -398,5 +458,127 @@ describe('operator MCP — run_get', () => {
 		expect(unknown.content[0]?.text).toBe(`NOT_FOUND: Run with ID "${unknownId}" not found`);
 		expect(getRunOutputEvents).not.toHaveBeenCalled();
 		expect(getRunLogsFromDb).not.toHaveBeenCalled();
+	});
+});
+
+describe('operator MCP — workers_state', () => {
+	it("reads a contributor's project workers with their capacity in use", async () => {
+		const result = await callTool('workers_state', { projectId: 'proj-a' }, 'member-token');
+
+		expect(result.isError).toBeUndefined();
+		expect(listDashboardWorkers).toHaveBeenCalledWith(['proj-a']);
+		expect(listWorkerProjectCapacity).toHaveBeenCalledWith(WORKER_ID, ['proj-a']);
+		expect(result.structuredContent).toEqual({
+			workers: [
+				{
+					workerId: WORKER_ID,
+					displayName: 'idle-box',
+					owner: null,
+					connection: 'online',
+					lastSeenAt: '2026-11-06T10:30:00.000Z',
+					draining: false,
+					drainingSince: null,
+					currentRun: null,
+					enrollments: CAPACITY,
+				},
+			],
+		});
+	});
+
+	it('refuses a non-admin who names no project, reading nothing', async () => {
+		const result = await callTool('workers_state', {}, 'member-token');
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toMatch(/^FORBIDDEN: /);
+		expect(listDashboardWorkers).not.toHaveBeenCalled();
+	});
+
+	it('hides a project the caller is not a member of', async () => {
+		const result = await callTool('workers_state', { projectId: 'proj-a' }, 'stranger-token');
+
+		expect(result.content[0]?.text).toBe('NOT_FOUND: Project with ID "proj-a" not found');
+		expect(listDashboardWorkers).not.toHaveBeenCalled();
+	});
+
+	it('reads the whole installation for an instance admin', async () => {
+		const result = await callTool('workers_state', {}, 'admin-token');
+
+		expect(result.isError).toBeUndefined();
+		expect(listDashboardWorkers).toHaveBeenCalledWith(null);
+		expect(listWorkerProjectCapacity).toHaveBeenCalledWith(WORKER_ID, null);
+	});
+});
+
+describe('operator MCP — cli_rate_limits', () => {
+	beforeEach(() => {
+		listDashboardWorkers.mockResolvedValue([
+			workerRow(WORKER_ID, 'idle-box', []),
+			workerRow(COOLING_WORKER_ID, 'cooling-box', [COOL_DOWN]),
+		]);
+	});
+
+	it("lists only the project's cooling workers, with each limit's reset hint", async () => {
+		const result = await callTool('cli_rate_limits', { projectId: 'proj-a' }, 'member-token');
+
+		expect(result.isError).toBeUndefined();
+		expect(listDashboardWorkers).toHaveBeenCalledWith(['proj-a']);
+		expect(result.structuredContent).toEqual({
+			workers: [
+				{
+					workerId: COOLING_WORKER_ID,
+					displayName: 'cooling-box',
+					rateLimits: [
+						{
+							cli: 'claude',
+							expiresAt: '2026-11-06T18:00:00.000Z',
+							observedAt: '2026-11-06T10:00:00.000Z',
+							resetHint: 'resets 6pm (UTC)',
+						},
+					],
+				},
+			],
+		});
+	});
+
+	it('returns a named worker even when it is cooling on nothing', async () => {
+		const result = await callTool(
+			'cli_rate_limits',
+			{ projectId: 'proj-a', workerId: WORKER_ID },
+			'member-token',
+		);
+
+		expect(result.structuredContent).toEqual({
+			workers: [{ workerId: WORKER_ID, displayName: 'idle-box', rateLimits: [] }],
+		});
+	});
+
+	it('reports a worker outside the scope exactly as an unknown one', async () => {
+		const unknownId = '99999999-9999-4999-8999-999999999999';
+		const result = await callTool(
+			'cli_rate_limits',
+			{ projectId: 'proj-a', workerId: unknownId },
+			'member-token',
+		);
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toBe(`NOT_FOUND: Worker with ID "${unknownId}" not found`);
+	});
+
+	it('refuses a non-admin who names no project, and a stranger naming one', async () => {
+		const unscoped = await callTool('cli_rate_limits', {}, 'member-token');
+		const stranger = await callTool('cli_rate_limits', { projectId: 'proj-a' }, 'stranger-token');
+
+		expect(unscoped.content[0]?.text).toMatch(/^FORBIDDEN: /);
+		expect(stranger.content[0]?.text).toMatch(/^NOT_FOUND: /);
+		expect(listDashboardWorkers).not.toHaveBeenCalled();
+	});
+
+	it('reads the whole installation for an instance admin', async () => {
+		const result = await callTool('cli_rate_limits', {}, 'admin-token');
+
+		expect(listDashboardWorkers).toHaveBeenCalledWith(null);
+		expect(result.structuredContent).toMatchObject({
+			workers: [{ workerId: COOLING_WORKER_ID }],
+		});
 	});
 });

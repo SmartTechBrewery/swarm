@@ -850,6 +850,49 @@ export async function listDashboardWorkers(
 }
 
 /**
+ * One enrollment's share of a worker's capacity (issue #1341) — what the dispatch
+ * gate weighs for that `(worker, project)` pair: the enrollment's
+ * `concurrencyAllocation` against the `activeRuns` it is executing there now, the
+ * same claim count `evaluateWorkerEligibility` reads (`getWorkerDispatchClaimState`),
+ * so `activeRuns >= concurrencyAllocation` is exactly "at capacity". Secret-free by
+ * construction, like every other view here.
+ */
+export interface WorkerProjectCapacity {
+	projectId: string;
+	status: EnrollmentStatus;
+	isRoutable: boolean;
+	concurrencyAllocation: number;
+	activeRuns: number;
+}
+
+/**
+ * A worker's enrollments within `projectScope`, each with its capacity in use
+ * (issue #1341). An enrollment in a project outside the scope is left out
+ * entirely — its project id and its in-flight count alike — so a contributor
+ * reading one project learns nothing about the machine's other projects. One claim
+ * read per visible enrollment, which is the same cost the detail view pays.
+ */
+export async function listWorkerProjectCapacity(
+	workerId: string,
+	projectScope: DashboardProjectScope,
+): Promise<WorkerProjectCapacity[]> {
+	const accessible = projectScope === null ? null : new Set(projectScope);
+	const enrollments = await listEnrollmentsForWorker(workerId);
+	const visible = accessible
+		? enrollments.filter((enrollment) => accessible.has(enrollment.projectId))
+		: enrollments;
+	return Promise.all(
+		visible.map(async (enrollment) => ({
+			projectId: enrollment.projectId,
+			status: enrollment.status,
+			isRoutable: isRoutable(enrollment),
+			concurrencyAllocation: enrollment.concurrencyAllocation,
+			activeRuns: (await getWorkerDispatchClaimState(workerId, enrollment.projectId)).activeRuns,
+		})),
+	);
+}
+
+/**
  * One worker's detail view (issue #477), or `null` when the viewer may not see
  * it. An administrator (`projectScope === null`) sees any registered worker,
  * including an un-enrolled one. A restricted viewer sees only a worker enrolled
