@@ -112,6 +112,8 @@ wording the dashboard shows.
 | `workers_state` | Each worker's dispatch state (`workers.state`), as `{ workers }`: `connection` (`online`/`offline`), `lastSeenAt`, `draining`/`drainingSince`, the run it is executing, and its enrolled projects, each with `status`, `isRoutable` and its capacity in use — `activeRuns` of `concurrencyAllocation`, the two numbers the dispatch gate compares | `projectId?` |
 | `cli_rate_limits` | The workers cooling on an agent CLI's usage limit, as `{ workers }`, each with its active limits (from `workers.list`): `cli`, `expiresAt` (when SWARM routes that CLI to the machine again), `observedAt`, and `resetHint` — the reset text the CLI itself printed, or `null` when it printed none. A worker with no active limit is left out unless named by `workerId` | `projectId?`, `workerId?` |
 | `control_plane_logs` | The control plane's own recent log lines, newest first, as `{ entries, buffer }`. Each entry is `{ time, level, msg, context }` — the object the logger's `json` format emits, with `msg` cut at 4000 characters. `buffer` is the window they come from: `capacity` (20 000 lines), `size`, and `oldestTime`, the time of the oldest line it still holds | `projectId?`, `taskId?`, `prNumber?`, `dispatchId?` (each matching the line's context key of that name), `level?` (a minimum: `debug`, `info`, `warn`, `error`), `since?`/`until?` (ISO 8601; `since` inclusive, `until` exclusive), `limit` (≤ 1000, default 100) |
+| `pr_status` | One pull request's automation state as SWARM recorded it (`runs.prStatus`): its latest completed Review run (`lastReviewRunId`, `lastReviewVerdict`), the head of its latest submitted verdict (`lastReviewedHeadSha`), the merge-automation outcome recorded on that run (`mergeOutcome` — `merged`, `not-ready`, `not-eligible`, `policy-blocked`, `unsupported`, `provider-error`, `retry-exhausted`, `provider-error-exhausted`, or `null` — with `mergeOutcomeMessage`), the review-verdict ledger (`verdictCount` of `verdictCap`, `supersededCount` of `supersededCap`), whether a bound is reached (`capReached`, and which in `capBound`: `verdict-cap`, `superseded-bound` or `null`), and whether an operator's Force re-review grant is still unspent (`overrideOutstanding`). It does not ask the source-control provider anything, so it is not a live mergeability read | `projectId`, `repository` (as the project configures it), `prNumber` |
+| `phase_agents_get` | One phase's agent configuration for a project (from `projects.getById`), as stored after normalisation: `targets` (CLI/model/reasoning in priority order), `timeoutMs`, the custom `prompt`, and `cli`/`model`/`reasoning` mirroring `targets[0]`, with `configured: false` for a phase running on its coded defaults. Nothing else of the project is returned — no repositories, board mapping or credential references | `projectId`, `phase` (`planning`, `implementation`, `implementationUnplanned`, `review`, `respondToReview`, `respondToCi`, `resolveConflicts`) |
 
 Page through a long agent output by passing the `output.nextCursor` of one call as
 `outputAfter` of the next while `output.hasMore` is `true`.
@@ -133,6 +135,9 @@ API server's output where its process runs. With a `projectId`, a contributor of
 project reads the lines carrying it. Without one, it reads every line — including
 those naming no project — which only an instance administrator may do; anyone else
 gets `FORBIDDEN`.
+
+`pr_status` and `phase_agents_get` need you to be a contributor of the project you
+name; for anyone else the project reads as *not found*.
 
 ## For developers
 

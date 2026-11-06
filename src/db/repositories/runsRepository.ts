@@ -1622,6 +1622,38 @@ export async function getReviewAbsorbedForPullRequest(
 }
 
 /**
+ * The most recent *completed* Review run of one pull request — the row its
+ * merge-automation outcome is recorded on (`reviewMergeOutcome`), read by the
+ * operator MCP server's `pr_status` tool through `runs.prStatus` (issue #1342).
+ * Completed only, because a Review run that is still running, deferred or failed
+ * has no verdict and so no merge outcome to report. Keyed on
+ * `(project, repository, pull request)` like
+ * {@link getReviewAbsorbedForPullRequest}, for the same multi-repository reason.
+ */
+export async function getLatestCompletedReviewRunForPullRequest(
+	projectId: string,
+	repository: string,
+	prNumber: string,
+): Promise<RunRow | undefined> {
+	const rows = await getDb()
+		.select()
+		.from(runs)
+		.where(
+			and(
+				eq(runs.kind, PIPELINE_RUN_KIND),
+				eq(runs.projectId, projectId),
+				eq(runs.repository, repository),
+				eq(runs.prNumber, prNumber),
+				eq(runs.phase, 'review'),
+				eq(runs.status, 'completed'),
+			),
+		)
+		.orderBy(desc(runs.completedAt), desc(runs.startedAt))
+		.limit(1);
+	return rows[0];
+}
+
+/**
  * Whether this project's task has a *completed* run for the given phase — a
  * failed or deferred attempt does not count (issue #247). Implementation's
  * planned/unplanned config selection uses this so a merely-attempted Planning

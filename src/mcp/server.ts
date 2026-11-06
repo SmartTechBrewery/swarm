@@ -14,6 +14,8 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
 import type { SwarmUser } from '../identity/schema.js';
 import { registerLogTools } from './tools/logs.js';
+import { registerProjectConfigTools } from './tools/project-config.js';
+import { registerPullRequestTools } from './tools/pull-requests.js';
 import { registerRunTools } from './tools/runs.js';
 import { registerWorkerTools } from './tools/workers.js';
 
@@ -32,5 +34,7 @@ export function createSwarmMcpServer(user: SwarmUser): McpServer {
 	registerRunTools(server, user);
 	registerWorkerTools(server, user);
 	registerLogTools(server, user);
+	registerPullRequestTools(server, user);
+	registerProjectConfigTools(server, user);
 	return server;
 }
