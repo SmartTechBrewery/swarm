@@ -2108,8 +2108,9 @@ any of them scriptable. Details: [`docs/cli.md`](./cli.md#swarm-run).
 The same session also connects an **MCP client** — Claude Code, for one — to the
 control plane: the router serves an MCP server at `/operator/mcp` whose tools call
 the dashboard's own procedures as you, so an assistant session can read runs,
-their failure causes and their agent output, and which workers are connected,
-busy, draining or cooling on a CLI's usage limit, where a pull request stands on
+their failure causes and their agent output, a project's whole pipeline state in
+one call, a task's dispatch history, and which workers are connected, busy,
+draining or cooling on a CLI's usage limit, where a pull request stands on
 merge automation and the review-verdict cap, and how a phase's agents are
 configured, with exactly your dashboard access.
 How to connect one, and the tool catalogue: [`docs/mcp.md`](./mcp.md).
