@@ -88,7 +88,7 @@ const createAndPublishDispatch = vi.fn(async (_input: unknown) => ({
 }));
 const publishDispatchWakeUp = vi.fn(async (_dispatch: unknown) => {});
 const promoteMergeQueueWaits = vi.fn(async (_projectId: string, _repo: string) => false);
-const promoteDependencyWaits = vi.fn(async (_projectId: string, _cause: string) => 0);
+const promoteDependencyWaits = vi.fn(async (_projectId: string, _cause: string) => []);
 // The per-PR conflict check a conflicting approved head is handed to (issue #1264).
 const scheduleCoalescedDispatch = vi.fn(
 	async (_job: unknown, _key: string, _delayMs: number, _waitReason: unknown) => {},

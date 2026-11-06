@@ -124,7 +124,7 @@ update the client's header.
 
 Treat the token like a password: it reads everything your account can read in the
 dashboard, including run logs and agent output, and it can reset and re-dispatch
-runs in every project where you hold `member`.
+runs, and wake dependency waits, in every project where you hold `member`.
 
 ### Using the `swarm login` session instead
 
@@ -209,7 +209,7 @@ time (never a whole-board read), and never asks the source-control provider.
 | Finding `kind` | What it means | What to do |
 | --- | --- | --- |
 | `merged-pr-open-work-item` | Merge automation merged the pull request (its Review run completed inside the window), but the work item it implements is still open on the board — its card is in any status but Done. SWARM does not close a card on merge itself; the provider's own link (a `Closes #N`) does, so a missed close leaves the card, and every item waiting on it, where it is. The card is found from the task the pull request's branch names, then from the pull request itself; a pull request with no card behind it is not reported | Close the work item and move it to Done on the board (`work_item_close`, once the server offers it). Its dependents wake when it is done |
-| `dependency-wait-blockers-done` | A Planning or Implementation dispatch is waiting on the dependency gate, but the gate, asked now, would no longer hold it: no recorded blocker is still open. It would otherwise sit until its next re-check (`SWARM_DEPENDENCY_RECHECK_MS`). "Finished" is the gate's own rule — an open prose-only prerequisite does not count, and neither does a blocker the item itself blocks. Not checked for a provider without dependencies (Trello), which never gates | Wake the project's dependency waits (`dependency_waits_wake`, once the server offers it), or **Retry now** on the Queue screen |
+| `dependency-wait-blockers-done` | A Planning or Implementation dispatch is waiting on the dependency gate, but the gate, asked now, would no longer hold it: no recorded blocker is still open. It would otherwise sit until its next re-check (`SWARM_DEPENDENCY_RECHECK_MS`). "Finished" is the gate's own rule — an open prose-only prerequisite does not count, and neither does a blocker the item itself blocks. Not checked for a provider without dependencies (Trello), which never gates | Wake the project's dependency waits (`dependency_waits_wake`), or **Retry now** on the Queue screen |
 
 ## Write tools
 
@@ -222,9 +222,10 @@ the same way:
   as `BAD_REQUEST`.
 - **`dryRun: true` changes nothing.** It returns
   `{ dryRun: true, auditId, preview }`, where `preview` says what the call would
-  do: the target's current state, `wouldRefuse` (the refusal the real call would
-  answer with, in its own code and wording, or `null`), `expectedOutcome` and
-  `intendedChanges`. `wouldRefuse: null` is not a promise. The real call checks
+  do. For the run tools that is the target's current state, `wouldRefuse` (the
+  refusal the real call would answer with, in its own code and wording, or
+  `null`), `expectedOutcome` and `intendedChanges`; each tool's row below says
+  what its own preview holds. `wouldRefuse: null` is not a promise. The real call checks
   everything again, and something can change in between. A real call returns
   `{ dryRun: false, auditId, result }`, where `result` is the dashboard
   procedure's own answer.
@@ -251,14 +252,17 @@ the same way:
 | --- | --- | --- |
 | `run_reset` | **Destructive.** Resets a wedged run and restarts its phase from scratch, as the dashboard's **Reset & restart** and `swarm run reset` do (`runs.reset`). It stops the run's live agent, cancels its active dispatch (even one a worker has claimed), clears its cancellation flag, tears down its checkout and discards uncommitted and unpushed work, and clears its recovery record. Then it re-dispatches the phase as a fresh first attempt. A run with no stored payload, or whose project is gone, is settled `failed` instead (`outcome: 'terminated'`). Refused only for an unknown run, a machine-maintenance run, or a reset already under way | `runId`, `reason`, `dryRun` (default `false`) |
 | `dispatch_redispatch_now` | Re-dispatches a `deferred`, `checkpointed` or `failed` run immediately, as the dashboard's **Retry now** does (`runs.retryNow`). It re-opens the run's waiting dispatch for an immediate attempt, superseding a scheduled automatic retry. A dispatch whose worker lease has lapsed is taken back first. A run with no dispatch gets a fresh one built from its stored payload. Retry budgets start again from zero. Refused for any other status, for a run a worker is executing, and for a run with neither a dispatch nor a stored payload | `runId`, `reason`, `dryRun` (default `false`) |
+| `dependency_waits_wake` | Wakes every dispatch in the project waiting on the dependency gate now, instead of at its next re-check (`SWARM_DEPENDENCY_RECHECK_MS`) — the same wake a merge or a board card reaching Done triggers on its own (`runs.wakeDependencyWaits`, logged with cause `operator`). The gate re-reads the blockers, so a dependent still blocked simply waits again, and the wake spends no attempt its re-check would not have. Returns `{ projectId, woken, dispatches }`, each dispatch with `dispatchId`, `phase`, `repository`, `taskId`, `prNumber`, `runId`, `attempt` and `availableAt`. A dispatch it could not wake is logged, left on its re-check, and not listed. The dry run (`runs.previewDependencyWake`) returns `{ projectId, wouldWake, dispatches }`: the waits it would wake, in the same shape | `projectId`, `reason`, `dryRun` (default `false`) |
 
-Both need `member` on the run's project, the role that drives runs in the
+`run_reset` and `dispatch_redispatch_now` need `member` on the run's project, the role that drives runs in the
 dashboard. A contributor can read the run but gets `FORBIDDEN`. Anyone else gets
 `NOT_FOUND`. Their dry run is the `runs.previewAction` procedure, which is gated at
 `member` too.
 
 `dispatch_redispatch_now` takes a run. A dispatch with no run yet, such as a
-board dispatch waiting on its dependencies, is not something it can re-dispatch.
+board dispatch waiting on its dependencies, is not something it can re-dispatch;
+`dependency_waits_wake` wakes those. It needs `member` on the project it names,
+and so does its dry run; a contributor gets `FORBIDDEN`, anyone else `NOT_FOUND`.
 
 ## For developers
 
@@ -286,4 +290,5 @@ gated exactly like the write, which runs first on every call and answers the dry
 run, and an `apply`, which is the dashboard mutation. The framework adds `reason`
 and `dryRun` and writes the `operator_actions` row
 (`src/db/repositories/operatorActionsRepository.ts`). The run tools live in
-`src/mcp/tools/run-actions.ts`.
+`src/mcp/tools/run-actions.ts`, and `dependency_waits_wake` in
+`src/mcp/tools/dependency-waits.ts`.
