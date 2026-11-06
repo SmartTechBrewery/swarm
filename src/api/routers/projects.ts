@@ -676,6 +676,27 @@ export const projectsRouter = router({
 			};
 		}),
 
+	// The project's whole `agents` block, read at `projectAdmin` (issue #1349) — what
+	// `update` would replace when given an `agents` change, and the dry run and
+	// pre-write authorization of the operator MCP server's `phase_agents_reorder` and
+	// `phase_agents_restore` (`src/mcp/tools/phase-agents.ts`), which persist through
+	// `update`. Gated exactly as that mutation, so a dry run never describes a change
+	// the real call would refuse: a `member`/`contributor` gets FORBIDDEN, a
+	// non-member the existence-hiding NOT_FOUND.
+	agentsForUpdate: authedProcedure
+		.input(z.object({ id: z.string().min(1) }))
+		.query(async ({ ctx, input }) => {
+			await assertProjectAccess(ctx.user, input.id, 'projectAdmin');
+			const project = await findProjectRecordByIdFromDb(input.id);
+			if (!project) {
+				throw new TRPCError({
+					code: 'NOT_FOUND',
+					message: `Project with ID "${input.id}" not found`,
+				});
+			}
+			return { agents: project.agents };
+		}),
+
 	// Any authenticated user may create a project and becomes its `projectAdmin`
 	// (#281 task 4): the creator gets a membership row in the same call, so they
 	// can immediately administer what they just created without an operator

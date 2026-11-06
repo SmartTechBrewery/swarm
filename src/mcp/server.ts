@@ -18,6 +18,7 @@ import { registerCliRateLimitSetTools } from './tools/cli-rate-limit-set.js';
 import { registerConsistencyTools } from './tools/consistency.js';
 import { registerDependencyWaitTools } from './tools/dependency-waits.js';
 import { registerLogTools } from './tools/logs.js';
+import { registerPhaseAgentTools } from './tools/phase-agents.js';
 import { registerPipelineTools } from './tools/pipeline.js';
 import { registerPullRequestActionTools } from './tools/pr-actions.js';
 import { registerProjectConfigTools } from './tools/project-config.js';
@@ -52,6 +53,7 @@ export function createSwarmMcpServer(user: SwarmUser): McpServer {
 	registerRunActionTools(server, user);
 	registerPullRequestActionTools(server, user);
 	registerDependencyWaitTools(server, user);
+	registerPhaseAgentTools(server, user);
 	registerWorkItemTools(server, user);
 	registerCliRateLimitSetTools(server, user);
 	registerProjectSetupTools(server, user);

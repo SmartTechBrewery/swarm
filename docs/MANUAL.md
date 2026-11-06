@@ -2136,12 +2136,13 @@ configured, with exactly your dashboard access — plus the control plane's own
 recent log lines. It can also act: reset a wedged run, re-dispatch a run's
 waiting dispatch now, wake a project's dependency-waiting dispatches, force a
 re-review past the review-verdict cap, re-check a pull request's mergeability
-so Resolve-conflicts runs where a merge's fan-out skipped it, or close the work
-item behind a merged pull request whose closing reference the board missed. It
-can set up a project too: create one, store its credentials, connect and map its
-board, change its repositories, agents and pipeline options, and ask what is
-still missing before the first card is picked up. Every such write
-tool takes a mandatory `reason` and a
+so Resolve-conflicts runs where a merge's fan-out skipped it, close the work
+item behind a merged pull request whose closing reference the board missed, or
+reorder a phase's agent targets (say, Claude first while Codex is rate-limited)
+and later restore the previous order. It can set up a project too: create one,
+store its credentials, connect and map its board, change its repositories,
+agents and pipeline options, and ask what is still missing before the first
+card is picked up. Every such write tool takes a mandatory `reason` and a
 `dryRun`, and every call is recorded in the `operator_actions` audit table.
 How to connect one, and the tool catalogue: [`docs/mcp.md`](./mcp.md).
 
