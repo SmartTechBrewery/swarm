@@ -216,7 +216,7 @@ const PULL_REQUEST_PHASES = new Set([
 ]);
 
 /** Phases whose dispatch is always about a board card. */
-const BOARD_PHASES = new Set(['planning', 'implementation']);
+export const BOARD_PHASES: ReadonlySet<string> = new Set(['planning', 'implementation']);
 
 /** Not a byte a project id, repository slug, or task id can contain. */
 const KEY_SEPARATOR = '\u0000';

@@ -33,10 +33,14 @@
  *    it by itself, so it falls through to the rules below — `waiting-on-pipeline`
  *    (`waiting-for-checks`) inside the liveness grace window, `stalled` after it.
  *    That rests on the recorded kind, never on parsing the run's `error`. A run a
- *    user terminated (`failure_diagnosis.kind = 'user-terminated'`) reads as
- *    `terminated` rather than `failed` (issue #1361), so the badge can name the
- *    action that restarts it: moving the card into its start column again, which
- *    starts a new run rather than reusing the terminated one.
+ *    user terminated (`failure_diagnosis.kind = 'user-terminated'`) in a
+ *    board-driven phase (Planning or Implementation) reads as `terminated` rather
+ *    than `failed` (issue #1361), so the badge can name the action that restarts
+ *    it: moving the card out of its start column and back, which starts a new run
+ *    rather than reusing the terminated one. A terminated pull request-driven run
+ *    (Review, Respond-to-review, Respond-to-CI, Resolve-conflicts) stays `failed`:
+ *    a board move dispatches only the column's own board phase, so it would not
+ *    restart that run.
  * 5. Liveness `awaiting-human` → `waiting-on-operator`, naming which recorded
  *    hand-off (`awaitingHumanCause`: review cap reached, plan awaiting greenlight,
  *    approved and awaiting merge).
@@ -55,6 +59,7 @@ import type { WipSlotRow } from '../db/repositories/wipSlotsRepository.js';
 import {
 	AwaitingHumanCauseSchema,
 	awaitingHumanCause,
+	BOARD_PHASES,
 	classifyItemLiveness,
 	dispatchKey,
 	foldLivenessUnits,
@@ -155,7 +160,10 @@ const KEY_SEPARATOR = '\u0000';
 /** The diagnosis an abandoned Review records when the head's checks were still running. */
 const WAITING_FOR_CHECKS_KIND: FailureDiagnosisKind = 'review-waiting-for-checks';
 
-/** The diagnosis a run terminated by a user records (`runs.terminate`). */
+/**
+ * The diagnosis a run terminated by a user records (`runs.terminate`). Read as
+ * `terminated` only for a board-driven phase, the one a board move restarts.
+ */
 const TERMINATED_KIND: FailureDiagnosisKind = 'user-terminated';
 
 const DEFAULT_POLICY: ItemLivenessPolicy = {
@@ -172,6 +180,17 @@ interface HolderVerdict {
 	operatorReason?: WipOperatorReason;
 	pipelineReason?: WipPipelineReason;
 	decidingUnit?: ItemLivenessUnit;
+}
+
+/**
+ * Why a failed latest run waits on the operator (rule 4): `terminated` only for a
+ * board-driven run a user terminated, the one a board move restarts; `failed`
+ * otherwise.
+ */
+function failedRunReason(latest: ItemLivenessUnit['latest']): WipOperatorReason {
+	return latest.failureDiagnosisKind === TERMINATED_KIND && BOARD_PHASES.has(latest.phase)
+		? 'terminated'
+		: 'failed';
 }
 
 /**
@@ -204,9 +223,11 @@ function classifyHolder(
 		decidingUnit.latest.status === 'failed' &&
 		decidingUnit.latest.failureDiagnosisKind === WAITING_FOR_CHECKS_KIND;
 	if (decidingUnit.latest.status === 'failed' && !waitingForChecks) {
-		const operatorReason =
-			decidingUnit.latest.failureDiagnosisKind === TERMINATED_KIND ? 'terminated' : 'failed';
-		return { state: 'waiting-on-operator', operatorReason, decidingUnit };
+		return {
+			state: 'waiting-on-operator',
+			operatorReason: failedRunReason(decidingUnit.latest),
+			decidingUnit,
+		};
 	}
 	const liveness = classifyItemLiveness(decidingUnit, policy, now);
 	if (liveness === 'awaiting-human') {

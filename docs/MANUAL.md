@@ -1153,9 +1153,11 @@ slot — its card, its pull request once it has one, how long it has been in fli
 what it is doing. A ticket the pipeline cannot move on its own carries a **Waiting on you** badge
 with the reason: its plan is waiting for your greenlight (move the card to Ready), its
 pull request is approved and waiting for you to merge, it reached the review cap, it
-stalled, its latest run failed and nothing will retry it, or its latest run was
-terminated — move the card out of its start column and back, which starts a new run
-(issue #1361). A Review abandoned while
+stalled, its latest run failed and nothing will retry it, or its latest Planning or
+Implementation run was terminated — move the card out of its start column and back,
+which starts a new run (issue #1361). A terminated pull request-driven run (Review,
+Respond-to-review, Respond-to-CI, Resolve-conflicts) reads as failed instead, since a
+board move does not restart it. A Review abandoned while
 the head's CI was still running is not one of these (issue #1203): the completed-checks
 event starts Review by itself, so the ticket shows as waiting on the pipeline —
 "Waiting for CI — Review starts when the checks finish" — and reads as stalled only if
