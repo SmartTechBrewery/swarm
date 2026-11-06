@@ -17,6 +17,13 @@ vi.mock('@/db/repositories/projectsRepository.js', async () => ({
 	upsertProjectToDb: vi.fn(),
 	deleteProjectFromDb: vi.fn(),
 	deleteIdleProjectFromDb: vi.fn(),
+	assertRepositoriesUnclaimed: vi.fn(),
+}));
+
+// The readiness check has its own suite (`../project-readiness.test.ts`); here only the
+// procedure's gate and hand-off are under test.
+vi.mock('@/api/project-readiness.js', () => ({
+	checkProjectReadiness: vi.fn(),
 }));
 
 vi.mock('@/db/repositories/projectMembersRepository.js', () => ({
@@ -54,6 +61,7 @@ vi.mock('@/identity/membership-service.js', () => ({
 	listProjectsForUser: vi.fn(),
 }));
 
+import { checkProjectReadiness } from '@/api/project-readiness.js';
 import { DEFAULT_PM_CONFIG, projectsRouter } from '@/api/routers/projects.js';
 import { writeProjectCredential } from '@/db/repositories/credentialsRepository.js';
 import { resolveInstanceScmCredential } from '@/db/repositories/instanceCredentialsRepository.js';
@@ -67,6 +75,7 @@ import {
 } from '@/db/repositories/projectMembershipRequestsRepository.js';
 import { addMember } from '@/db/repositories/projectMembersRepository.js';
 import {
+	assertRepositoriesUnclaimed,
 	createProjectInDb,
 	createProjectWithMemberInDb,
 	deleteIdleProjectFromDb,
@@ -168,6 +177,9 @@ describe('projectsRouter', () => {
 		vi.mocked(createProjectInDb).mockReset();
 		vi.mocked(createProjectWithMemberInDb).mockReset();
 		vi.mocked(upsertProjectToDb).mockReset();
+		vi.mocked(assertRepositoriesUnclaimed).mockReset();
+		vi.mocked(assertRepositoriesUnclaimed).mockResolvedValue(undefined);
+		vi.mocked(checkProjectReadiness).mockReset();
 		vi.mocked(deleteProjectFromDb).mockReset();
 		// Idle by default, so every suite but `delete`'s own reaches the row delete.
 		vi.mocked(deleteIdleProjectFromDb).mockReset();
@@ -527,7 +539,7 @@ describe('projectsRouter', () => {
 			await expect(caller.create(validProjectInput)).rejects.toThrowError(
 				expect.objectContaining({
 					code: 'CONFLICT',
-					message: 'Project ID or repository already exists',
+					message: 'A project with ID "new-proj" already exists.',
 				}),
 			);
 		});
@@ -546,7 +558,7 @@ describe('projectsRouter', () => {
 			await expect(caller.create(validProjectInput)).rejects.toThrowError(
 				expect.objectContaining({
 					code: 'CONFLICT',
-					message: 'Project ID or repository already exists',
+					message: 'A project with ID "new-proj" already exists.',
 				}),
 			);
 		});
@@ -798,6 +810,162 @@ describe('projectsRouter', () => {
 					id: 'new-proj',
 				});
 			});
+		});
+	});
+
+	// Issue #1359: the dry runs behind the operator MCP server's `project_create`,
+	// `project_update` and `pm_board_set`. Each reuses its write's own planning, so what is
+	// asserted is that nothing is written and that a refusal comes back as `wouldRefuse`
+	// in the write's own code and words.
+	describe('previewCreate', () => {
+		const input = {
+			id: 'new-proj',
+			name: 'New Project',
+			repositories: [{ repo: 'jkwiecien/new-proj' }],
+			repoRoot: '/Users/dev/new-proj',
+		};
+
+		beforeEach(() => {
+			_resetSCMProviderRegistryForTesting();
+			registerSCMProvider({
+				id: 'github',
+				label: 'Stub',
+				category: 'scm',
+				webhookRoute: '/stub/webhook',
+				credentialRoles: [
+					{ role: 'reviewer', envVarKey: 'SCM_STUB_TOKEN_REVIEWER' },
+					{ role: 'webhookSecret', envVarKey: 'SCM_STUB_WEBHOOK_SECRET' },
+				],
+			} as unknown as SCMProviderManifest);
+		});
+
+		it('returns the record create would write, the creator as projectAdmin, and writes nothing', async () => {
+			const plan = await caller.previewCreate(input);
+
+			expect(plan.wouldRefuse).toBeNull();
+			expect(plan.project).toMatchObject({ id: 'new-proj', scm: 'github', pm: DEFAULT_PM_CONFIG });
+			expect(plan.creator).toEqual({
+				userId: AUTHED_USER.id,
+				identifier: AUTHED_USER.identifier,
+				role: 'projectAdmin',
+			});
+			expect(plan.pmPlaceholder).toBe(true);
+			expect(assertRepositoriesUnclaimed).toHaveBeenCalledWith(plan.project);
+			expect(createProjectWithMemberInDb).not.toHaveBeenCalled();
+			expect(writeProjectCredential).not.toHaveBeenCalled();
+		});
+
+		it('reports a duplicate project id as the CONFLICT create would answer with', async () => {
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(
+				createMockProjectRecord({ id: 'new-proj' }),
+			);
+
+			const plan = await caller.previewCreate(input);
+
+			expect(plan.wouldRefuse).toEqual({
+				code: 'CONFLICT',
+				message: 'A project with ID "new-proj" already exists.',
+			});
+		});
+
+		it('reports a repository another project owns without naming that project', async () => {
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(undefined);
+			vi.mocked(assertRepositoriesUnclaimed).mockRejectedValue(
+				new ProjectRepositoryConflictError('jkwiecien/new-proj', 'secret-project'),
+			);
+
+			const plan = await caller.previewCreate(input);
+
+			expect(plan.wouldRefuse).toEqual({
+				code: 'CONFLICT',
+				message: "Repository 'jkwiecien/new-proj' already belongs to another project.",
+			});
+			expect(JSON.stringify(plan)).not.toContain('secret-project');
+		});
+
+		it('reports a repository with the wrong coordinate count for its provider as BAD_REQUEST', async () => {
+			const plan = await caller.previewCreate({
+				...input,
+				repositories: [{ repo: 'org/project/repo' }],
+			});
+
+			expect(plan.project).toBeNull();
+			expect(plan.wouldRefuse?.code).toBe('BAD_REQUEST');
+		});
+
+		it('names a supplied reviewer token as the seeded credential without returning it', async () => {
+			_resetSCMProviderRegistryForTesting();
+			registerSCMProvider(githubScmManifest);
+
+			const plan = await caller.previewCreate({ ...input, reviewerToken: 'ghp_secret' });
+
+			expect(plan.wouldRefuse).toBeNull();
+			expect(plan.seededCredentials).toEqual([
+				{ providerId: 'github', role: 'reviewer', source: 'request' },
+			]);
+			expect(JSON.stringify(plan)).not.toContain('ghp_secret');
+		});
+	});
+
+	describe('previewUpdate', () => {
+		const existing = createMockProjectRecord({ id: 'p1', name: 'Before' });
+
+		it('returns the merged record and the changed fields, writing nothing', async () => {
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
+
+			const plan = await caller.previewUpdate({ id: 'p1', name: 'After' });
+
+			expect(plan.wouldRefuse).toBeNull();
+			expect(plan.after).toMatchObject({ id: 'p1', name: 'After' });
+			expect(plan.changedFields).toEqual(['name']);
+			expect(upsertProjectToDb).not.toHaveBeenCalled();
+		});
+
+		it('reports the refusal update would answer with', async () => {
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
+			vi.mocked(assertRepositoriesUnclaimed).mockRejectedValue(
+				new ProjectRepositoryConflictError('acme/taken', 'other'),
+			);
+
+			const plan = await caller.previewUpdate({ id: 'p1', repositories: [{ repo: 'acme/taken' }] });
+
+			expect(plan.after).toBeNull();
+			expect(plan.wouldRefuse).toEqual({
+				code: 'CONFLICT',
+				message: "Repository 'acme/taken' already belongs to another project.",
+			});
+		});
+
+		it('is gated at projectAdmin like update', async () => {
+			const memberCaller = projectsRouter.createCaller({ user: ORDINARY_USER });
+			vi.mocked(getMembership).mockResolvedValue(membershipFor('member'));
+
+			await expect(memberCaller.previewUpdate({ id: 'p1', name: 'x' })).rejects.toMatchObject({
+				code: 'FORBIDDEN',
+			});
+			expect(findProjectRecordByIdFromDb).not.toHaveBeenCalled();
+		});
+	});
+
+	describe('readiness', () => {
+		it('checks the stored record for a projectAdmin', async () => {
+			const record = createMockProjectRecord({ id: 'p1' });
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(record);
+			const report = { projectId: 'p1', ready: false, checkedAt: 'now', items: [] };
+			vi.mocked(checkProjectReadiness).mockResolvedValue(report);
+
+			await expect(caller.readiness({ projectId: 'p1' })).resolves.toEqual(report);
+			expect(checkProjectReadiness).toHaveBeenCalledWith(record);
+		});
+
+		it('refuses a contributor before checking anything', async () => {
+			const contributorCaller = projectsRouter.createCaller({ user: ORDINARY_USER });
+			vi.mocked(getMembership).mockResolvedValue(membershipFor('contributor'));
+
+			await expect(contributorCaller.readiness({ projectId: 'p1' })).rejects.toMatchObject({
+				code: 'FORBIDDEN',
+			});
+			expect(checkProjectReadiness).not.toHaveBeenCalled();
 		});
 	});
 
@@ -1081,7 +1249,8 @@ describe('projectsRouter', () => {
 			).rejects.toThrowError(
 				expect.objectContaining({
 					code: 'CONFLICT',
-					message: 'Project ID or repository already exists',
+					// Names the repository, not the project that owns it (issue #1359).
+					message: "Repository 'jkwiecien/original' already belongs to another project.",
 				}),
 			);
 		});

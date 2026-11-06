@@ -125,7 +125,8 @@ update the client's header.
 Treat the token like a password: it reads everything your account can read in the
 dashboard, including run logs and agent output, and it can reset and re-dispatch
 runs, force re-reviews, schedule conflict checks and wake dependency waits in
-every project where you hold `member`.
+every project where you hold `member`. It can also create projects, and change the
+configuration and credentials of every project you administer.
 
 ### Using the `swarm login` session instead
 
@@ -164,6 +165,9 @@ wording the dashboard shows.
 | `pipeline_stats` | One project's counts for a period (`runs.stats`), as `{ runsByStatus, runsByPhase, mergedPrsByRepository, since, until }`: the pipeline runs **started** in the period by the status each is in now and by phase (maintenance runs are left out), and how many distinct pull requests SWARM's merge automation merged, per repository. A merge has no recorded instant of its own, so it is counted in the period its approving Review run completed in. A pull request merged by hand is not counted. A status, phase or repository with nothing to count is absent rather than zero, and `until` is echoed back so you see the period actually counted | `projectId`, `since` (ISO 8601, inclusive), `until?` (ISO 8601, exclusive; defaults to now, and must not be earlier than `since`) |
 | `phase_agents_get` | One phase's agent configuration for a project (from `projects.getById`), as stored after normalisation: `targets` (CLI/model/reasoning in priority order), `timeoutMs`, the custom `prompt`, and `cli`/`model`/`reasoning` mirroring `targets[0]`, with `configured: false` for a phase running on its coded defaults. Nothing else of the project is returned — no repositories, board mapping or credential references | `projectId`, `phase` (`planning`, `implementation`, `implementationUnplanned`, `review`, `respondToReview`, `respondToCi`, `resolveConflicts`) |
 | `consistency_check` | Stuck states SWARM will not leave by itself (`runs.consistencyCheck`), as `{ windowHours, since, findings, unchecked, truncated }`. Each finding has a `kind`, `repository`, `prNumber` (merged pull requests), `taskId`, `dispatchId` (dependency waits), `workItemId`, `workItemUrl`, `detail` and `suggestedAction` — see the kinds below. A candidate whose board read failed is listed in `unchecked` with its `reason` instead of being guessed at, and `truncated` is `true` when a per-call cap (50 merged pull requests, 50 dependency waits) left some unread. Fixes nothing | `projectId`, `windowHours` (how far back to look for merged pull requests, default 24, at most 720) |
+| `project_get` | One project's whole configuration (`projects.getById`) plus, under `credentials`, each SCM and PM credential role with whether it is configured (`projects.credentials.list` and `listPm`), as `{ project, credentials: { scm, pm } }`. The record holds credential *references* (store key names), never values, and the credential lists say only `isConfigured` and a fixed `****` / `not set` marker | `projectId` |
+| `pm_board_discover` | The Project Management tab's board discovery (`pm.discoverContainers` / `pm.discoverStates`), run on the server with the project's own board credential. Without `containerId`: `{ providers, containers }`, the registered PM providers and the boards the credential can see. With one: `{ containerId, states, providerContext, statusKeys }`, that board's states (each `{ id, name }`), the provider's extra mapping scope (GitHub Projects returns `{ statusFieldId }`) and SWARM's six status keys to map them to | `projectId`, `providerId?` (defaults to the project's provider), `containerId?`, `discoveryDraft?` (Jira: `{ "baseUrl": "https://<site>.atlassian.net" }`) |
+| `project_readiness` | Whether the project can run, and what is missing (`projects.readiness`), as `{ projectId, ready, checkedAt, items }` — see [What `project_readiness` checks](#what-project_readiness-checks) | `projectId` |
 
 Page through a long agent output by passing the `output.nextCursor` of one call as
 `outputAfter` of the next while `output.hasMore` is `true`.
@@ -199,8 +203,11 @@ project reads the lines carrying it. Without one, it reads every line — includ
 those naming no project — which only an instance administrator may do; anyone else
 gets `FORBIDDEN`.
 
-`pr_status`, `pipeline_stats`, `phase_agents_get` and `consistency_check` need you to be
-a contributor of the project you name; for anyone else the project reads as *not found*.
+`pr_status`, `pipeline_stats`, `phase_agents_get`, `consistency_check` and `project_get`
+need you to be a contributor of the project you name; for anyone else the project reads
+as *not found*. `pm_board_discover` and `project_readiness` need `projectAdmin`, like the
+Project Management tab's discovery: both call the project's providers with its own
+credentials. A contributor or member gets `FORBIDDEN`.
 
 ### What `consistency_check` reports
 
@@ -237,7 +244,8 @@ the same way:
 - **Every call is audited.** Dry or real, succeeded, refused or failed, each call
   writes one row to the `operator_actions` table: who (`user_id`,
   `user_identifier`), which `tool`, `project_id`, `target`, `reason`, `dry_run`,
-  the `input` arguments, `outcome` (`succeeded`, `refused`, `failed`, or
+  the `input` arguments (a secret argument, such as `project_credential_set`'s
+  `value`, is recorded as `[redacted]`), `outcome` (`succeeded`, `refused`, `failed`, or
   `pending` while the call runs), `error`, and `started_at`/`completed_at`.
   `refused` means the wrapped procedure declined to act (`NOT_FOUND`,
   `FORBIDDEN`, `PRECONDITION_FAILED`, `CONFLICT`, `BAD_REQUEST`, …), so nothing
@@ -248,7 +256,8 @@ the same way:
   deletion of the user or project it names. `project_id` is empty when the
   call ended before its target resolved to a project, for example an
   unknown run, and for a tool whose target belongs to no project
-  (`cli_rate_limit_set`, which acts on a worker). No tool reads the audit table yet; query Postgres directly.
+  (`cli_rate_limit_set`, which acts on a worker), as well as for a `project_create`
+  whose dry run reports it would be refused. No tool reads the audit table yet; query Postgres directly.
 
 | Tool | What it does | Arguments |
 | --- | --- | --- |
@@ -258,6 +267,10 @@ the same way:
 | `pr_recheck_mergeability` | Schedules the per-PR conflict check that the resolve-conflicts fan-out schedules for each open pull request when a sibling merges (`runs.recheckMergeability`). Use it when that fan-out skipped this pull request. The check is keyed on the pull request's own base, read from its provider, and is due now. A check already pending for the same pull request and base is superseded rather than duplicated. The check reads mergeability and dispatches Resolve-conflicts only when the pull request genuinely conflicts, with all of that phase's own gates. Refused for a closed pull request and for a repository the project does not configure. The dry run (`runs.previewMergeabilityRecheck`) reports the pull request's current `state`, `headSha`, `baseBranch` and `mergeable` (`null` while the provider is still computing it), the `coalesceKey` and the `job` it would schedule, and `wouldRefuse` | `projectId`, `repository` (as the project configures it), `prNumber`, `reason`, `dryRun` (default `false`) |
 | `dependency_waits_wake` | Wakes every dispatch in the project waiting on the dependency gate now, instead of at its next re-check (`SWARM_DEPENDENCY_RECHECK_MS`) — the same wake a merge or a board card reaching Done triggers on its own (`runs.wakeDependencyWaits`, logged with cause `operator`). The gate re-reads the blockers, so a dependent still blocked simply waits again, and the wake spends no attempt its re-check would not have. Returns `{ projectId, woken, dispatches }`, each dispatch with `dispatchId`, `phase`, `repository`, `taskId`, `prNumber`, `runId`, `attempt` and `availableAt`. A dispatch it could not wake is logged, left on its re-check, and not listed. The dry run (`runs.previewDependencyWake`) returns `{ projectId, wouldWake, dispatches }`: the waits it would wake, in the same shape | `projectId`, `reason`, `dryRun` (default `false`) |
 | `cli_rate_limit_set` | Keeps one agent CLI off a worker until `until` or for `durationMinutes` (`workers.setCliRateLimit`): the same `worker_cli_rate_limits` cool-down SWARM records when a run reports a spent allowance, so routing, the Workers screen and `cli_rate_limits` treat it exactly like an observed one, and it lapses by itself at its expiry. `scope: 'owner'` applies it to every worker the named worker's owner operates: SWARM records no CLI-account identity, so one user's machines stand in for "the same CLI account" (a subscription is usually signed in on all of them). **Extend only**: a machine whose live cool-down on that CLI already lasts at least as long is left `unchanged`, so nothing a real run recorded is ever shortened, and nothing is cleared early. Refused with `BAD_REQUEST` unless exactly one of `until`/`durationMinutes` is given, in the future, and at most eight days ahead (`MAX_CLI_COOLDOWN_MS`, the ceiling an observed reset has). Returns `{ cli, scope, requestedExpiresAt, resetHint, workers }`, each worker with `workerId`, `displayName`, `currentExpiresAt`, `newExpiresAt` and `change` (`create`, `extend` or `unchanged`). The dry run (`workers.previewCliRateLimit`) returns the same shape without writing | `workerId`, `cli`, `until?`, `durationMinutes?`, `resetHint?`, `scope` (`worker` or `owner`, default `worker`), `reason`, `dryRun` (default `false`) |
+| `project_create` | Creates a project as the New Project dialog does (`projects.create`), with the same validation: each repository's coordinates are checked against the SCM provider (two segments, three on Azure DevOps), a reviewer credential is required — the `reviewerToken` given, or the installation's default from General Settings → Credentials — and a duplicate project id or a repository another project owns is refused with `CONFLICT` (`A project with ID "<id>" already exists.` / `Repository '<repo>' already belongs to another project.`; the owning project is not named). You become the project's `projectAdmin`. The board starts on a placeholder mapping, so the project cannot run until `pm_board_set`. Returns the created record. The dry run (`projects.previewCreate`) returns `{ project, creator, seededCredentials, pmPlaceholder, wouldRefuse }`: the record it would write, you as `projectAdmin`, which credentials it would seed (`providerId`, `role`, and `source`: `request` or `instanceDefault`, never the value), and the refusal it would answer with | `id`, `name`, `repositories`, `repoRoot`, `scm?` (default `github`), `visibility?` (default `private`), `worktreeRoot?`, `agents?`, `pipeline?`, `worktreeRetention?`, `reviewerToken?` (**secret**), `reason`, `dryRun` (default `false`) |
+| `project_update` | Changes a project's configuration as the Repositories, Agents and Pipeline tabs do (`projects.update`), through the same rules. Each field you give replaces the stored one — `repositories` and `agents` are whole lists, so read them with `project_get` first — except `pipeline`, which is merged as a patch (`maxContinuations: null` clears the budget). Repository coordinates are checked against the SCM provider, and a repository another project owns is refused with `CONFLICT`. Returns the updated record. The dry run (`projects.previewUpdate`) returns `{ before, after, changedFields, wouldRefuse }` | `projectId`, `name?`, `repositories?`, `scm?`, `repoRoot?`, `worktreeRoot?`, `visibility?`, `agents?`, `pipeline?`, `worktreeRetention?`, `reason`, `dryRun` (default `false`) |
+| `pm_board_set` | Saves the project's board and status mapping as the Project Management tab's Save does (`projects.update` with `pm`), replacing the placeholder. `pm` is one whole member: `github-projects` `{ projectId, statusFieldId, statusOptions }`, `linear` `{ teamId, statusOptions }`, `jira` `{ baseUrl, projectKey, statusOptions, repositoryField? }` or `trello` `{ boardId, statusOptions }`, with ids from `pm_board_discover`. `statusOptions` maps `backlog`, `planning`, `todo` (Ready), `inProgress`, `inReview` and `done` to state ids; the schema needs one, `project_readiness` wants all six. Moving to another PM provider is refused with `BAD_REQUEST` until that provider's required credentials are stored. The dry run is `projects.previewUpdate`, as above | `projectId`, `pm`, `reason`, `dryRun` (default `false`) |
+| `project_credential_set` | **Destructive** (it replaces a stored secret). Stores one credential as the Source Control and Project Management tabs do: `side: 'scm'` (`projects.credentials.set`) for `reviewer` or `webhookSecret`, `side: 'pm'` (`projects.credentials.setPm`) for a role the PM provider declares — `apiToken` for GitHub Projects, `apiKey`/`webhookSecret` for Linear, `email`/`apiToken`/`webhookSecret` for Jira, `apiKey`/`token`/`webhookSecret` for Trello. The value is stored encrypted, is never returned by any tool, and is audited as `[redacted]`. GitHub Projects' `webhookSecret` is the repository's webhook secret, so it is refused on side `pm`: set it on side `scm`. Returns `{ projectId, side, role, stored: true }`. The dry run (`projects.credentials.previewSet` / `previewSetPm`) returns `{ side, providerId, role, label, referenceKey, isConfigured, change }`, where `change` is `set` or `replace` | `projectId`, `side` (`scm` or `pm`), `providerId?` (defaults to the project's provider; name another to enter its credentials before switching to it), `role`, `value` (**secret**), `reason`, `dryRun` (default `false`) |
 
 `run_reset`, `dispatch_redispatch_now`, `pr_force_re_review` and
 `pr_recheck_mergeability` need `member` on the project, the role that drives runs in the
@@ -284,6 +297,119 @@ and so does its dry run; a contributor gets `FORBIDDEN`, anyone else `NOT_FOUND`
 the dashboard's machine-owner actions: the worker's owner or an instance
 administrator may call it, and anyone else gets `NOT_FOUND`, dry run included. Its
 audit row names no project.
+
+`project_create` is open to any signed-in user, as the New Project dialog is.
+`project_update`, `pm_board_set` and `project_credential_set` need `projectAdmin`,
+the role that edits configuration and credentials in the dashboard, and so do their
+dry runs. A member or contributor gets `FORBIDDEN`, anyone else `NOT_FOUND`.
+
+## Setting up a project
+
+The project tools take a project from nothing to a state where the pipeline can
+run, in the order the dashboard's tabs walk it. `project_readiness` tells you at
+any point what is still missing.
+
+### What `project_readiness` checks
+
+Each item has an `area`, the `item` checked, a `status` and a `detail` naming the
+fix. `missing` blocks the pipeline; `unverified` means SWARM cannot read the thing
+back, so check it yourself. `ready` is `true` when no item is `missing`.
+
+| Area | Item | `ok` when |
+| --- | --- | --- |
+| `scm` | `provider` | The project names a runtime-ready SCM provider |
+| `scm` | `repository <repo>` | The project's reviewer credential is stored and can read the repository (its default branch is read). The implementer side is each worker operator's own credential, so it is not checked here |
+| `pm` | `provider` | The PM provider is registered |
+| `pm` | `credential <role>` | Each required board credential is stored |
+| `pm` | `board mapping` | A board is selected (not the creation-time placeholder), the mapping passes the provider's schema, and all six status keys are mapped |
+| `pm` | `board reachable` | The board's states can be discovered with the board credential, and every mapped state id is still one of them |
+| `webhooks` | `<provider> webhook` | Never `ok`: `missing` when the webhook secret the route verifies deliveries with is not stored, otherwise `unverified`, with the URL to register (`WEBHOOK_CALLBACK_BASE_URL` plus the route). Registration happens in the provider's own UI (`swarm pm webhook create` for Trello), which SWARM cannot read |
+| `workers` | `enrollment` / `phase <phase>` | For each enabled phase and each repository, at least one enrolled worker that is connected and that the dispatch gate would accept for one of the phase's targets: approved, sharing consent given, not draining, holding the repository, declaring and allowed the phase and the CLI. Capacity and CLI cool-downs are ignored, since a busy worker can still serve the phase later. A `missing` item lists why each worker was refused |
+| `members` | `roles` | The project has at least one `projectAdmin`, and lists every member with their role |
+
+### Example: a GitHub repository with a GitHub Projects board
+
+An agent sets up `acme/web` with the org board `acme` project 4. Every write takes
+a `reason`; run each with `dryRun: true` first when you want to see the plan.
+
+1. **Create the project.** You become its `projectAdmin`.
+
+   ```json
+   project_create {
+     "id": "acme-web",
+     "name": "Acme Web",
+     "scm": "github",
+     "repositories": [{ "repo": "acme/web", "baseBranch": "main" }],
+     "repoRoot": "/Users/dev/acme-web",
+     "agents": {
+       "implementation": { "targets": [{ "cli": "claude" }, { "cli": "codex" }] }
+     },
+     "pipeline": { "planning": { "autoAdvance": false } },
+     "reviewerToken": "<reviewer PAT>",
+     "reason": "Onboard acme/web"
+   }
+   ```
+
+2. **Store the credentials.** The webhook secret is the one the repository
+   webhook signs with; the board token needs `repo`, `project` and `read:org`.
+
+   ```json
+   project_credential_set { "projectId": "acme-web", "side": "scm", "role": "webhookSecret", "value": "<secret>", "reason": "Repository webhook" }
+   project_credential_set { "projectId": "acme-web", "side": "pm", "role": "apiToken", "value": "<board token>", "reason": "Board access" }
+   ```
+
+3. **Find the board and its statuses.**
+
+   ```json
+   pm_board_discover { "projectId": "acme-web" }
+   → { "containers": [{ "id": "PVT_kwDOA…", "name": "Acme roadmap", "url": "https://github.com/orgs/acme/projects/4" }], … }
+
+   pm_board_discover { "projectId": "acme-web", "containerId": "PVT_kwDOA…" }
+   → { "states": [{ "id": "f75ad846", "name": "Backlog" }, …],
+       "providerContext": { "statusFieldId": "PVTSSF_…" },
+       "statusKeys": ["backlog", "planning", "todo", "inProgress", "inReview", "done"] }
+   ```
+
+4. **Save the mapping**, one state id per status key.
+
+   ```json
+   pm_board_set {
+     "projectId": "acme-web",
+     "pm": {
+       "type": "github-projects",
+       "projectId": "PVT_kwDOA…",
+       "statusFieldId": "PVTSSF_…",
+       "statusOptions": {
+         "backlog": "f75ad846", "planning": "3fe662f4", "todo": "61e4505c",
+         "inProgress": "47fc9ee4", "inReview": "df73e18b", "done": "98236657"
+       }
+     },
+     "reason": "Map the Acme roadmap board"
+   }
+   ```
+
+5. **Ask what is left.**
+
+   ```json
+   project_readiness { "projectId": "acme-web" }
+   → { "ready": false, "items": [
+         { "area": "webhooks", "item": "github webhook", "status": "unverified",
+           "detail": "The webhook secret is stored. Register a GitHub webhook for each repository at https://swarm.example.com/github/webhook with that secret …" },
+         { "area": "workers", "item": "enrollment", "status": "missing",
+           "detail": "No worker is enrolled in this project. …" }, … ] }
+   ```
+
+   Register the webhook on the repository (and, for the board's events, on the
+   organization — [`docs/github-projects-v2-api.md` §5](./github-projects-v2-api.md#5-the-projects_v2_item-webhook)), enroll and approve a
+   worker, and call `project_readiness` again until `ready` is `true`. Workers are
+   enrolled from the worker's machine (`swarm workers register-and-enroll`), not
+   through MCP.
+
+Change anything later with `project_update`, for example the phase targets:
+
+```json
+project_update { "projectId": "acme-web", "agents": { "review": { "targets": [{ "cli": "codex" }] } }, "reason": "Review on Codex" }
+```
 
 ## For developers
 
@@ -313,5 +439,8 @@ and `dryRun` and writes the `operator_actions` row
 (`src/db/repositories/operatorActionsRepository.ts`). The run tools live in
 `src/mcp/tools/run-actions.ts`, the pull-request tools in
 `src/mcp/tools/pr-actions.ts`, `dependency_waits_wake` in
-`src/mcp/tools/dependency-waits.ts`, and `cli_rate_limit_set` in
-`src/mcp/tools/cli-rate-limit-set.ts`.
+`src/mcp/tools/dependency-waits.ts`, `cli_rate_limit_set` in
+`src/mcp/tools/cli-rate-limit-set.ts`, and the project set-up tools in
+`src/mcp/tools/project-setup.ts`. A write tool that accepts a secret names that
+argument in `secretInputs`, and the framework records it as `[redacted]`. The
+readiness check is `src/api/project-readiness.ts`.

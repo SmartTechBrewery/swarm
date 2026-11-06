@@ -25,6 +25,8 @@
  *    which the write may have half-happened). A row that
  *    cannot be settled is logged and the call's real result is still returned: the
  *    write happened, and reporting it as failed would invite a second one.
+ *  - **No secret in the audit trail.** A tool that accepts a secret names the field in
+ *    `secretInputs`, and the row records it as `[redacted]` (issue #1359).
  *
  * Results are `{ dryRun: true, auditId, preview }` or `{ dryRun: false, auditId,
  * result }`; refusals and failures are `isError` results worded as {@link runTool}
@@ -85,6 +87,13 @@ export interface WriteToolDefinition<Shape extends z.ZodRawShape> {
 	inputSchema: Shape;
 	/** Whether the write discards state (MCP's `destructiveHint`). */
 	destructive: boolean;
+	/**
+	 * Input fields that carry a **secret** (issue #1359: a credential value, a reviewer
+	 * token). The audit row records each present one as {@link REDACTED} instead of its
+	 * value, so a secret accepted as input is never written to `operator_actions`. Keep
+	 * secrets out of {@link targetOf} and every result as well; nothing here can.
+	 */
+	secretInputs?: readonly (keyof Shape & string)[];
 	/** What the call acts on, recorded as the audit row's `target`. */
 	targetOf: (input: z.objectOutputType<Shape, z.ZodTypeAny>) => string;
 	/**
@@ -97,6 +106,18 @@ export interface WriteToolDefinition<Shape extends z.ZodRawShape> {
 	) => Promise<WriteToolPreview>;
 	/** The write itself — the dashboard procedure the tool wraps. */
 	apply: (input: z.objectOutputType<Shape, z.ZodTypeAny>, caller: SwarmCaller) => Promise<unknown>;
+}
+
+/** What the audit row records in place of a {@link WriteToolDefinition.secretInputs} value. */
+export const REDACTED = '[redacted]';
+
+/** `input` with every present secret field replaced by {@link REDACTED}. */
+function auditableInput(input: Record<string, unknown>, secretInputs: readonly string[] = []) {
+	const recorded = { ...input };
+	for (const key of secretInputs) {
+		if (recorded[key] !== undefined) recorded[key] = REDACTED;
+	}
+	return recorded;
 }
 
 type WriteToolArgs<Shape extends z.ZodRawShape> = z.objectOutputType<Shape, z.ZodTypeAny> & {
@@ -148,7 +169,7 @@ export async function runWriteTool<Shape extends z.ZodRawShape>(
 			target: definition.targetOf(input),
 			reason,
 			dryRun,
-			input,
+			input: auditableInput(input, definition.secretInputs),
 		});
 	} catch (error) {
 		const message = describeError(error);

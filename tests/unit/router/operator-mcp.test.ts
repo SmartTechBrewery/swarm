@@ -563,6 +563,10 @@ describe('operator MCP — the handshake', () => {
 			'pr_force_re_review',
 			'pr_recheck_mergeability',
 			'run_reset',
+			'project_create',
+			'project_update',
+			'pm_board_set',
+			'project_credential_set',
 		];
 
 		expect(tools.map((tool) => tool.name).sort()).toEqual([
@@ -576,9 +580,16 @@ describe('operator MCP — the handshake', () => {
 			'phase_agents_get',
 			'pipeline_snapshot',
 			'pipeline_stats',
+			'pm_board_discover',
+			'pm_board_set',
 			'pr_force_re_review',
 			'pr_recheck_mergeability',
 			'pr_status',
+			'project_create',
+			'project_credential_set',
+			'project_get',
+			'project_readiness',
+			'project_update',
 			'run_get',
 			'run_reset',
 			'runs_list',

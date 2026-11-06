@@ -36,6 +36,7 @@ export const jiraManifest: PMProviderManifest = {
 	createProvider: createJiraProvider,
 	configSchema: jiraConfigSchema,
 	blankPm: jiraBlankPm,
+	boardContainerId: (pm) => (pm.type === 'jira' && pm.projectKey ? pm.projectKey : undefined),
 	// The one provider that declares a blocker (issue #641). Every Jira REST call is
 	// addressed to `baseUrl`, so discovery against the blank member above could only
 	// fail on an unresolvable URL — and the value is board *identity* set in

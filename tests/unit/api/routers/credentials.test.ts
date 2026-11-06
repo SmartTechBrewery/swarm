@@ -401,6 +401,84 @@ describe('credentialsRouter', () => {
 		});
 	});
 
+	// Issue #1359: the dry runs behind the operator MCP server's `project_credential_set`.
+	// Gated and validated as the writes are, taking no value and returning none.
+	describe('previewSet / previewSetPm', () => {
+		const project = createMockProjectRecord({
+			id: 'p1',
+			scm: 'github',
+			credentials: {
+				scm: { github: { reviewer: 'SCM_TOKEN_REVIEWER' } },
+				pm: { 'github-projects': { apiToken: 'PM_GITHUB_PROJECTS_TOKEN' } },
+			},
+		});
+
+		it('reports a replace for a stored SCM secret, without the secret or a write', async () => {
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(project);
+			vi.mocked(resolveAllProjectCredentials).mockResolvedValue({
+				SCM_TOKEN_REVIEWER: 'stored-secret-value',
+			});
+
+			const plan = await caller.previewSet({
+				projectId: 'p1',
+				providerId: 'github',
+				role: 'reviewer',
+			});
+
+			expect(plan).toEqual({
+				side: 'scm',
+				providerId: 'github',
+				role: 'reviewer',
+				label: 'reviewer',
+				referenceKey: 'SCM_TOKEN_REVIEWER',
+				isConfigured: true,
+				change: 'replace',
+			});
+			expect(JSON.stringify(plan)).not.toContain('stored-secret-value');
+			expect(writeProjectCredential).not.toHaveBeenCalled();
+			expect(upsertProjectToDb).not.toHaveBeenCalled();
+		});
+
+		it('reports a set for an unconfigured PM role under its conventional key', async () => {
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(
+				createMockProjectRecord({ id: 'p1', scm: 'github' }),
+			);
+			vi.mocked(resolveAllProjectCredentials).mockResolvedValue({});
+
+			const plan = await caller.previewSetPm({ projectId: 'p1', role: 'apiToken' });
+
+			expect(plan).toMatchObject({
+				side: 'pm',
+				providerId: 'github-projects',
+				role: 'apiToken',
+				isConfigured: false,
+				change: 'set',
+			});
+		});
+
+		it('refuses the shared webhook secret on the PM side, exactly as setPm does', async () => {
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(project);
+			vi.mocked(resolveAllProjectCredentials).mockResolvedValue({});
+
+			await expect(
+				caller.previewSetPm({ projectId: 'p1', role: 'webhookSecret' }),
+			).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+		});
+
+		it('refuses a member below projectAdmin before reading anything', async () => {
+			const memberCaller = credentialsRouter.createCaller({ user: ORDINARY_USER });
+			vi.mocked(getMembership).mockResolvedValue(membershipFor('member'));
+
+			await expect(
+				memberCaller.previewSet({ projectId: 'p1', providerId: 'github', role: 'reviewer' }),
+			).rejects.toMatchObject({ code: 'FORBIDDEN' });
+			await expect(
+				memberCaller.previewSetPm({ projectId: 'p1', role: 'apiToken' }),
+			).rejects.toMatchObject({ code: 'FORBIDDEN' });
+			expect(findProjectRecordByIdFromDb).not.toHaveBeenCalled();
+		});
+	});
+
 	describe('delete', () => {
 		it('clears only the named provider’s row and reference', async () => {
 			const project = createMockProjectRecord({
