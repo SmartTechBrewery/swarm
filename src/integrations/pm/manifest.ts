@@ -237,6 +237,20 @@ export interface PMProviderManifest {
 	readonly blankPmDiscoveryBlocker?: string;
 
 	/**
+	 * The board (container) a persisted `project.pm` member of this provider names — the
+	 * same opaque id {@link PMProvider.discover}'s `containers` capability returns and its
+	 * `states` capability takes — or `undefined` when the member names none (the blank
+	 * placeholder, or another provider's member).
+	 *
+	 * Declared as data for the same reason as {@link blankPm}: the project readiness check
+	 * (`src/api/project-readiness.ts`, issue #1359) re-discovers the mapped board's states to
+	 * confirm the board is reachable and every mapped id still exists, and the key a member
+	 * names its board with is the provider's own (`projectId`, `teamId`, `projectKey`,
+	 * `boardId`). Reading it here keeps that check free of a `pm.type` branch.
+	 */
+	readonly boardContainerId: (pm: ProjectPm) => string | undefined;
+
+	/**
 	 * Optional provider-owned setup needed to discover an incoming provider before its
 	 * complete mapping is persisted. The dashboard receives only {@link fields}; the
 	 * API validates the draft with {@link schema} and projects it through {@link buildPm}.

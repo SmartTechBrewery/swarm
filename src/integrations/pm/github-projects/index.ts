@@ -31,6 +31,8 @@ export const githubProjectsManifest: PMProviderManifest = {
 	// anything out of the `pm` member, and an incoming GitHub Projects board is
 	// discoverable with nothing configured but the token.
 	blankPm: githubProjectsBlankPm,
+	boardContainerId: (pm) =>
+		pm.type === 'github-projects' && pm.projectId ? pm.projectId : undefined,
 	routerAdapter: new GitHubProjectsRouterAdapter(),
 	// Two roles, and they are credentials of two different kinds.
 	//
