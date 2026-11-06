@@ -135,6 +135,32 @@ describe('WipUsageSection', () => {
 		expect(screen.getByText('(1 waiting on you)')).toBeDefined();
 	});
 
+	it('names the board move that restarts a terminated run (issue #1361)', () => {
+		renderSection(
+			<WipUsageSection
+				entries={[
+					makeEntry({
+						tickets: [
+							makeTicket({
+								state: 'waiting-on-operator',
+								operatorReason: 'terminated',
+								phase: 'implementation',
+							}),
+						],
+					}),
+				]}
+			/>,
+		);
+
+		const ticket = screen.getByTestId('wip-ticket');
+		expect(within(ticket).getByText('Waiting on you')).toBeDefined();
+		expect(
+			within(ticket).getByText(
+				'run terminated — move the card out of its start column and back to start a new run',
+			),
+		).toBeDefined();
+	});
+
 	it('gives a running holder or one waiting on the pipeline no badge', () => {
 		renderSection(
 			<WipUsageSection

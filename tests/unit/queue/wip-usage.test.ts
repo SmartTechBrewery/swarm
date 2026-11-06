@@ -243,6 +243,19 @@ describe('toWipUsage', () => {
 		expect(ticket).toMatchObject({ state: 'waiting-on-operator', operatorReason: 'failed' });
 	});
 
+	it('reads a run a user terminated as waiting on the operator to restart it (issue #1361)', () => {
+		const ticket = holder({
+			activity: [
+				makeActivity({
+					status: 'failed',
+					failureDiagnosisKind: 'user-terminated',
+					lastActivityAt: RECENTLY,
+				}),
+			],
+		});
+		expect(ticket).toMatchObject({ state: 'waiting-on-operator', operatorReason: 'terminated' });
+	});
+
 	it('reads a failed run with its retry queued as waiting on the pipeline', () => {
 		const ticket = holder({
 			activity: [makeActivity({ status: 'failed' })],
