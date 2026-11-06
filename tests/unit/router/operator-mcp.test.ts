@@ -116,11 +116,13 @@ vi.mock('@/identity/membership-service.js', async () => ({
 }));
 const {
 	getActiveDispatchByRunId,
+	listDependencyWaits,
 	listOpenDispatchesForProject,
 	listDispatchesForTask,
 	reopenDispatchForManualRetry,
 } = vi.hoisted(() => ({
 	getActiveDispatchByRunId: vi.fn(),
+	listDependencyWaits: vi.fn(),
 	listOpenDispatchesForProject: vi.fn(),
 	listDispatchesForTask: vi.fn(),
 	reopenDispatchForManualRetry: vi.fn(),
@@ -130,6 +132,7 @@ vi.mock('@/db/repositories/dispatchesRepository.js', async () => ({
 		'@/db/repositories/dispatchesRepository.js',
 	)),
 	getActiveDispatchByRunId,
+	listDependencyWaits,
 	listOpenDispatchesForProject,
 	listDispatchesForTask,
 	reopenDispatchForManualRetry,
@@ -151,15 +154,20 @@ vi.mock('@/dispatch/run-reset.js', async () => ({
 	...(await vi.importActual<typeof import('@/dispatch/run-reset.js')>('@/dispatch/run-reset.js')),
 	resetRun,
 }));
-const { publishDispatchWakeUp, createAndPublishDispatch, scheduleCoalescedDispatch } = vi.hoisted(
-	() => ({
-		publishDispatchWakeUp: vi.fn(),
-		createAndPublishDispatch: vi.fn(),
-		scheduleCoalescedDispatch: vi.fn(),
-	}),
-);
+const {
+	promoteDependencyWaits,
+	publishDispatchWakeUp,
+	createAndPublishDispatch,
+	scheduleCoalescedDispatch,
+} = vi.hoisted(() => ({
+	promoteDependencyWaits: vi.fn(),
+	publishDispatchWakeUp: vi.fn(),
+	createAndPublishDispatch: vi.fn(),
+	scheduleCoalescedDispatch: vi.fn(),
+}));
 vi.mock('@/dispatch/dispatcher.js', async () => ({
 	...(await vi.importActual<typeof import('@/dispatch/dispatcher.js')>('@/dispatch/dispatcher.js')),
+	promoteDependencyWaits,
 	publishDispatchWakeUp,
 	createAndPublishDispatch,
 	scheduleCoalescedDispatch,
@@ -371,6 +379,8 @@ beforeEach(() => {
 	settleOperatorAction.mockReset().mockResolvedValue(undefined);
 	resetRun.mockReset();
 	reopenDispatchForManualRetry.mockReset();
+	listDependencyWaits.mockReset().mockResolvedValue([]);
+	promoteDependencyWaits.mockReset().mockResolvedValue([]);
 	publishDispatchWakeUp.mockReset().mockResolvedValue(undefined);
 	clearRunCancellation.mockReset().mockResolvedValue(undefined);
 	getSubmittedReviewSlot.mockReset();
@@ -451,6 +461,7 @@ describe('operator MCP — the handshake', () => {
 		};
 		const tools = listBody.result.tools;
 		const WRITE_TOOLS = [
+			'dependency_waits_wake',
 			'dispatch_redispatch_now',
 			'pr_force_re_review',
 			'pr_recheck_mergeability',
@@ -461,6 +472,7 @@ describe('operator MCP — the handshake', () => {
 			'cli_rate_limits',
 			'consistency_check',
 			'control_plane_logs',
+			'dependency_waits_wake',
 			'dispatch_history',
 			'dispatch_redispatch_now',
 			'phase_agents_get',
@@ -1680,5 +1692,116 @@ describe('operator MCP — pr_force_re_review and pr_recheck_mergeability', () =
 		expect(result.content[0]?.text).toMatch(/^FORBIDDEN: /);
 		expect(scheduleCoalescedDispatch).not.toHaveBeenCalled();
 		expect(auditRow()).toMatchObject({ outcome: 'refused', target: 'acme/widgets#508' });
+	});
+});
+
+describe('operator MCP — dependency_waits_wake', () => {
+	const PROJECT = createMockProjectConfig({ id: 'proj-a', repo: 'acme/widgets' });
+	const WAIT = {
+		id: 'dispatch-9',
+		phase: 'implementation',
+		repository: 'acme/widgets',
+		taskId: '17',
+		prNumber: null,
+		runId: null,
+		attempt: 2,
+		availableAt: new Date('2026-11-06T12:00:00Z'),
+	};
+	const SUMMARY = {
+		dispatchId: 'dispatch-9',
+		phase: 'implementation',
+		repository: 'acme/widgets',
+		taskId: '17',
+		prNumber: null,
+		runId: null,
+		attempt: 2,
+		availableAt: '2026-11-06T12:00:00.000Z',
+	};
+
+	beforeEach(() => {
+		getProjectByIdFromDb
+			.mockReset()
+			.mockImplementation(async (id: string) => (id === 'proj-a' ? PROJECT : undefined));
+		listDependencyWaits.mockResolvedValue([WAIT]);
+		promoteDependencyWaits.mockResolvedValue([
+			{ ...WAIT, availableAt: new Date(WAIT.availableAt) },
+		]);
+	});
+
+	function auditRow() {
+		expect(recordOperatorAction).toHaveBeenCalledTimes(1);
+		expect(settleOperatorAction).toHaveBeenCalledTimes(1);
+		return {
+			...recordOperatorAction.mock.calls[0]?.[0],
+			...settleOperatorAction.mock.calls[0]?.[1],
+		};
+	}
+
+	it("wakes the project's dependency waits for a member and audits the call", async () => {
+		const result = await callTool(
+			'dependency_waits_wake',
+			{ projectId: 'proj-a', reason: 'the blocker was closed by hand' },
+			'driver-token',
+		);
+
+		expect(result.isError).toBeUndefined();
+		expect(result.structuredContent).toEqual({
+			dryRun: false,
+			auditId: 'audit-1',
+			result: { projectId: 'proj-a', woken: 1, dispatches: [SUMMARY] },
+		});
+		expect(promoteDependencyWaits).toHaveBeenCalledExactlyOnceWith('proj-a', 'operator');
+		expect(auditRow()).toEqual({
+			userId: DRIVER.id,
+			userIdentifier: DRIVER.identifier,
+			tool: 'dependency_waits_wake',
+			projectId: 'proj-a',
+			target: 'proj-a',
+			reason: 'the blocker was closed by hand',
+			dryRun: false,
+			input: { projectId: 'proj-a' },
+			outcome: 'succeeded',
+			error: null,
+		});
+	});
+
+	it('answers a dry run with the waits it would wake, waking none', async () => {
+		const result = await callTool(
+			'dependency_waits_wake',
+			{ projectId: 'proj-a', reason: 'checking', dryRun: true },
+			'driver-token',
+		);
+
+		expect(result.isError).toBeUndefined();
+		expect(result.structuredContent).toEqual({
+			dryRun: true,
+			auditId: 'audit-1',
+			preview: { projectId: 'proj-a', wouldWake: 1, dispatches: [SUMMARY] },
+		});
+		expect(listDependencyWaits).toHaveBeenCalledWith('proj-a');
+		expect(promoteDependencyWaits).not.toHaveBeenCalled();
+		expect(auditRow()).toMatchObject({ dryRun: true, outcome: 'succeeded', projectId: 'proj-a' });
+	});
+
+	it.each([
+		['member-token', /^FORBIDDEN: /],
+		['stranger-token', /^NOT_FOUND: /],
+	])('refuses %s without reading or waking, and audits the refusal', async (token, error) => {
+		const result = await callTool(
+			'dependency_waits_wake',
+			{ projectId: 'proj-a', reason: 'trying' },
+			token,
+		);
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toMatch(error);
+		expect(listDependencyWaits).not.toHaveBeenCalled();
+		expect(promoteDependencyWaits).not.toHaveBeenCalled();
+		expect(auditRow()).toMatchObject({
+			tool: 'dependency_waits_wake',
+			target: 'proj-a',
+			projectId: null,
+			outcome: 'refused',
+		});
 	});
 });

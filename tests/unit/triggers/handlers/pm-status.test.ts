@@ -45,7 +45,7 @@ beforeEach(() => {
 	vi.mocked(retireSupersededBoardPhases).mockReset();
 	vi.mocked(retireSupersededBoardPhases).mockResolvedValue(0);
 	vi.mocked(promoteDependencyWaits).mockReset();
-	vi.mocked(promoteDependencyWaits).mockResolvedValue(0);
+	vi.mocked(promoteDependencyWaits).mockResolvedValue([]);
 	vi.mocked(releaseTicketSlot).mockReset();
 	vi.mocked(releaseTicketSlot).mockResolvedValue(true);
 });

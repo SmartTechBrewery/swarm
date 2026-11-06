@@ -83,6 +83,7 @@ vi.mock('@/db/repositories/dispatchesRepository.js', async (importOriginal) => (
 	getDispatchById: vi.fn(),
 	hasActiveDispatchForCoalesceKeys: vi.fn(),
 	listActiveDispatchTaskRefs: vi.fn(),
+	listDependencyWaits: vi.fn(),
 	listWaitingDispatches: vi.fn(),
 	reopenDispatchForManualRetry: vi.fn(),
 	takeOverStaleDispatchForManualRetry: vi.fn(),
@@ -115,6 +116,7 @@ vi.mock('@/dispatch/dispatcher.js', () => ({
 	cancelDispatchAndWake: vi.fn(),
 	cancelDispatchForRun: vi.fn(),
 	createAndPublishDispatch: vi.fn(),
+	promoteDependencyWaits: vi.fn(),
 	publishDispatchWakeUp: vi.fn(),
 	scheduleCoalescedDispatch: vi.fn(),
 }));
@@ -201,6 +203,7 @@ import {
 	getDispatchById,
 	hasActiveDispatchForCoalesceKeys,
 	listActiveDispatchTaskRefs,
+	listDependencyWaits,
 	listWaitingDispatches,
 	reopenDispatchForManualRetry,
 	takeOverStaleDispatchForManualRetry,
@@ -244,6 +247,7 @@ import {
 	cancelDispatchAndWake,
 	cancelDispatchForRun,
 	createAndPublishDispatch,
+	promoteDependencyWaits,
 	publishDispatchWakeUp,
 	scheduleCoalescedDispatch,
 } from '@/dispatch/dispatcher.js';
@@ -4174,6 +4178,84 @@ describe('runsRouter', () => {
 			await expect(
 				ordinary.previewAction({ runId: 'run-1', action: 'retryNow' }),
 			).resolves.toMatchObject({ wouldRefuse: null });
+		});
+	});
+
+	// Issue #1347 — the MCP `dependency_waits_wake` tool and its dry run.
+	describe('wakeDependencyWaits / previewDependencyWake', () => {
+		const WAIT = makeDispatch({
+			id: 'dispatch-7',
+			taskId: '17',
+			waitReason: 'dependency',
+			attempt: 3,
+			availableAt: new Date('2026-07-10T00:35:00Z'),
+			runId: null,
+		});
+		const SUMMARY = {
+			dispatchId: 'dispatch-7',
+			phase: 'implementation',
+			repository: null,
+			taskId: '17',
+			prNumber: null,
+			runId: null,
+			attempt: 3,
+			availableAt: '2026-07-10T00:35:00.000Z',
+		};
+
+		beforeEach(() => {
+			vi.mocked(getProjectByIdFromDb).mockResolvedValue(createMockProjectConfig({ id: 'p1' }));
+			vi.mocked(listDependencyWaits).mockReset().mockResolvedValue([WAIT]);
+			vi.mocked(promoteDependencyWaits).mockReset().mockResolvedValue([WAIT]);
+		});
+
+		it('wakes the waits with the operator cause and reports which', async () => {
+			await expect(caller.wakeDependencyWaits({ projectId: 'p1' })).resolves.toEqual({
+				projectId: 'p1',
+				woken: 1,
+				dispatches: [SUMMARY],
+			});
+			expect(promoteDependencyWaits).toHaveBeenCalledExactlyOnceWith('p1', 'operator');
+		});
+
+		it('previews the waits it would wake, waking none', async () => {
+			await expect(caller.previewDependencyWake({ projectId: 'p1' })).resolves.toEqual([SUMMARY]);
+			expect(listDependencyWaits).toHaveBeenCalledExactlyOnceWith('p1');
+			expect(promoteDependencyWaits).not.toHaveBeenCalled();
+		});
+
+		it('reports an unknown project as not found', async () => {
+			vi.mocked(getProjectByIdFromDb).mockResolvedValue(undefined);
+
+			await expect(caller.wakeDependencyWaits({ projectId: 'nope' })).rejects.toThrowError(
+				expect.objectContaining({ code: 'NOT_FOUND' }),
+			);
+			expect(promoteDependencyWaits).not.toHaveBeenCalled();
+		});
+
+		it.each([
+			['contributor', 'FORBIDDEN'],
+			[undefined, 'NOT_FOUND'],
+		] as const)('refuses a %s caller with %s, touching no wait', async (role, code) => {
+			const ordinary = runsRouter.createCaller({ user: ORDINARY_USER });
+			vi.mocked(getMembership).mockResolvedValue(role ? membershipFor(role) : undefined);
+
+			await expect(ordinary.wakeDependencyWaits({ projectId: 'p1' })).rejects.toThrowError(
+				expect.objectContaining({ code }),
+			);
+			await expect(ordinary.previewDependencyWake({ projectId: 'p1' })).rejects.toThrowError(
+				expect.objectContaining({ code }),
+			);
+			expect(promoteDependencyWaits).not.toHaveBeenCalled();
+			expect(listDependencyWaits).not.toHaveBeenCalled();
+		});
+
+		it('wakes for a project member', async () => {
+			const ordinary = runsRouter.createCaller({ user: ORDINARY_USER });
+			vi.mocked(getMembership).mockResolvedValue(membershipFor('member'));
+
+			await expect(ordinary.wakeDependencyWaits({ projectId: 'p1' })).resolves.toMatchObject({
+				woken: 1,
+			});
 		});
 	});
 

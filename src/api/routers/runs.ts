@@ -13,6 +13,7 @@ import {
 	getActiveDispatchByRunId,
 	getDispatchById,
 	listActiveDispatchTaskRefs,
+	listDependencyWaits,
 	listWaitingDispatches,
 	reopenDispatchForManualRetry,
 	takeOverStaleDispatchForManualRetry,
@@ -74,6 +75,7 @@ import {
 import {
 	cancelDispatchAndWake,
 	createAndPublishDispatch,
+	promoteDependencyWaits,
 	publishDispatchWakeUp,
 	scheduleCoalescedDispatch,
 } from '../../dispatch/dispatcher.js';
@@ -104,6 +106,7 @@ import { RunResetError, type RunResetRefusal, resetRun } from '../../dispatch/ru
 import { releasePutBackTicketSlot } from '../../dispatch/wip-limit.js';
 import { AgentCliSchema } from '../../harness/agent-cli.js';
 import { ReasoningLevelSchema } from '../../harness/models.js';
+import type { SwarmUser } from '../../identity/schema.js';
 import { getWorker, getWorkers } from '../../identity/worker-service.js';
 import { getPMProvider, requireProjectPMProvider } from '../../integrations/pm/registry.js';
 import { requireProjectSCMProvider } from '../../integrations/scm/registry.js';
@@ -1772,6 +1775,61 @@ export const ConsistencyCheckInputSchema = z.object({
 		.default(DEFAULT_CONSISTENCY_WINDOW_HOURS),
 });
 
+/** `runs.wakeDependencyWaits`' and its preview's input: one project (issue #1347). */
+export const DependencyWaitsInputSchema = z.object({ projectId: z.string().min(1) });
+
+/**
+ * One dispatch waiting on the dependency gate (issue #1347), as
+ * `runs.previewDependencyWake` lists it and `runs.wakeDependencyWaits` reports it
+ * woken — the row's identity and wait, never its job payload.
+ */
+export interface DependencyWaitSummary {
+	dispatchId: string;
+	phase: string | null;
+	repository: string | null;
+	taskId: string | null;
+	prNumber: string | null;
+	/** The run its attempts execute against, once one exists. */
+	runId: string | null;
+	/** Deferred-retry attempts so far. */
+	attempt: number;
+	/** When its delayed re-check is due — or, once woken, now. */
+	availableAt: string;
+}
+
+function toDependencyWaitSummary(row: DispatchRow): DependencyWaitSummary {
+	return {
+		dispatchId: row.id,
+		phase: row.phase,
+		repository: row.repository,
+		taskId: row.taskId,
+		prNumber: row.prNumber,
+		runId: row.runId,
+		attempt: row.attempt,
+		availableAt: row.availableAt.toISOString(),
+	};
+}
+
+/** What waking a project's dependency waits did (issue #1347). */
+export interface DependencyWakeResult {
+	projectId: string;
+	woken: number;
+	dispatches: DependencyWaitSummary[];
+}
+
+/**
+ * The project a dependency-wait procedure names, `member`-gated (issue #1347):
+ * waking dispatches drives runs, and the existence check keeps an instance
+ * administrator's typo from reading as "nothing to wake".
+ */
+async function requireWakeableProject(user: SwarmUser, projectId: string): Promise<void> {
+	await assertProjectAccess(user, projectId, 'member');
+	const project = await getProjectByIdFromDb(projectId);
+	if (!project) {
+		throw new TRPCError({ code: 'NOT_FOUND', message: 'Project not found.' });
+	}
+}
+
 /**
  * One pull request's automation state as SWARM's own records hold it (issue
  * #1342) — the merge-automation outcome on its latest completed Review run and
@@ -2813,6 +2871,39 @@ export const runsRouter = router({
 				`Run with ID "${input.runId}" not found`,
 			);
 			return previewRunAction(input.action, run);
+		}),
+
+	// Wake every dispatch of one project waiting on the dependency gate now (issue
+	// #1347) — the operator MCP server's `dependency_waits_wake` tool. The same
+	// promotion a merge or a board card reaching done triggers
+	// (`promoteDependencyWaits`), with cause `operator`: the gate re-reads the
+	// blockers, so a dependent that is still blocked simply re-defers, and the wake
+	// spends nothing the re-check timer would not have. A dispatch it could not wake
+	// is logged and left on its timer, and is absent from `dispatches`.
+	//
+	// Driving the queue is `member`+ on the project, like `retryNow`.
+	wakeDependencyWaits: authedProcedure
+		.input(DependencyWaitsInputSchema)
+		.mutation(async ({ ctx, input }): Promise<DependencyWakeResult> => {
+			await requireWakeableProject(ctx.user, input.projectId);
+			const woken = await promoteDependencyWaits(input.projectId, 'operator');
+			return {
+				projectId: input.projectId,
+				woken: woken.length,
+				dispatches: woken.map(toDependencyWaitSummary),
+			};
+		}),
+
+	// The dispatches `wakeDependencyWaits` would wake, without waking them (issue
+	// #1347) — the dry run of `dependency_waits_wake`. Read-only, but gated exactly
+	// as the mutation, so a dry run never lists what the real call may not touch.
+	// Deliberately not in `runReadProcedures`.
+	previewDependencyWake: authedProcedure
+		.input(DependencyWaitsInputSchema)
+		.query(async ({ ctx, input }): Promise<DependencyWaitSummary[]> => {
+			await requireWakeableProject(ctx.user, input.projectId);
+			const waiting = await listDependencyWaits(input.projectId);
+			return waiting.map(toDependencyWaitSummary);
 		}),
 
 	// Force a continuation past the review-verdict safety cap ("Force re-review",
