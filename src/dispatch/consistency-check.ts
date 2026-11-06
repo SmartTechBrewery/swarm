@@ -184,7 +184,7 @@ async function checkMergedPullRequests(
 					`${statusLabel(item)} on the board.`,
 				suggestedAction:
 					'Close the work item and move it to Done on the board ' +
-					'(`work_item_close`, where this server offers it). Its dependents wake once it is done.',
+					'(`work_item_close`). Its dependents wake once it is done.',
 			});
 		} catch (error) {
 			const reason = describeError(error);

@@ -67,6 +67,13 @@ import {
 	type DispatchClaimLiveness,
 } from '../../dispatch/claim-liveness.js';
 import {
+	applyCloseMergedWorkItem,
+	type CloseMergedWorkItemPlan,
+	type CloseMergedWorkItemRefusalReason,
+	type CloseMergedWorkItemResult,
+	planCloseMergedWorkItem,
+} from '../../dispatch/close-merged-work-item.js';
+import {
 	type ConsistencyCheckResult,
 	DEFAULT_CONSISTENCY_WINDOW_HOURS,
 	MAX_CONSISTENCY_WINDOW_HOURS,
@@ -119,6 +126,7 @@ import {
 } from '../../pipeline/checkpoint.js';
 import { taskIdForRepository } from '../../pipeline/task-identity.js';
 import { resolvePipelinePhaseForStatusKey } from '../../pm/pipeline.js';
+import type { PMProvider } from '../../pm/types.js';
 import {
 	type CancellationOrigin,
 	clearRunCancellation,
@@ -1263,6 +1271,66 @@ async function planMergeabilityRecheck(
 	};
 }
 
+/**
+ * What `runs.closeMergedWorkItem` would do for one pull request (issue #1351) — the
+ * dry run of the operator MCP server's `work_item_close` tool: the pull request's
+ * state, the work item behind it and its current status, and the refusal the real
+ * call would answer with, in its own code and wording.
+ */
+export interface CloseMergedWorkItemPreview extends Omit<CloseMergedWorkItemPlan, 'refusal'> {
+	wouldRefuse: { code: TRPCError['code']; message: string } | null;
+}
+
+const CLOSE_MERGED_WORK_ITEM_REFUSAL_CODES: Record<
+	CloseMergedWorkItemRefusalReason,
+	TRPCError['code']
+> = {
+	'not-merged': 'PRECONDITION_FAILED',
+	'already-done': 'PRECONDITION_FAILED',
+	'no-work-item': 'NOT_FOUND',
+};
+
+/**
+ * Resolve the project scoped to `repository` and plan the close against its own PM
+ * and SCM providers. A repository the project does not own reads as not found; a
+ * provider read that fails is an internal failure, since "not merged" or "no work
+ * item" must never be inferred from a read that did not happen.
+ */
+async function planWorkItemClose(
+	input: CloseMergedWorkItemInput,
+): Promise<{ preview: CloseMergedWorkItemPreview; plan: CloseMergedWorkItemPlan; pm: PMProvider }> {
+	const record = await findProjectRecordByIdFromDb(input.projectId);
+	if (!record || !findProjectRepository(record, input.repository)) {
+		throw new TRPCError({
+			code: 'NOT_FOUND',
+			message: `Project "${input.projectId}" has no repository "${input.repository}".`,
+		});
+	}
+	const project = scopeProjectToRepository(record, input.repository);
+	const pm = requireProjectPMProvider(project);
+	const scm = requireProjectSCMProvider(project);
+	let plan: CloseMergedWorkItemPlan;
+	try {
+		plan = await planCloseMergedWorkItem({ project, pm, scm, prNumber: input.prNumber });
+	} catch (error) {
+		throw new TRPCError({
+			code: 'INTERNAL_SERVER_ERROR',
+			message: `Could not read pull request #${input.prNumber} in ${input.repository}, or the work item behind it: ${describeError(error)}`,
+		});
+	}
+	const { refusal, ...facts } = plan;
+	return {
+		plan,
+		pm,
+		preview: {
+			...facts,
+			wouldRefuse: refusal
+				? { code: CLOSE_MERGED_WORK_ITEM_REFUSAL_CODES[refusal.reason], message: refusal.message }
+				: null,
+		},
+	};
+}
+
 async function resolveRunAttribution(run: {
 	workerId: string | null;
 	workerUserId: string | null;
@@ -1763,6 +1831,10 @@ export const PullRequestStatusInputSchema = z.object({
  */
 export const MergeabilityRecheckInputSchema = PullRequestStatusInputSchema;
 export type MergeabilityRecheckInput = z.infer<typeof MergeabilityRecheckInputSchema>;
+
+/** `runs.closeMergedWorkItem`'s input — one pull request of one project (issue #1351). */
+export const CloseMergedWorkItemInputSchema = PullRequestStatusInputSchema;
+export type CloseMergedWorkItemInput = z.infer<typeof CloseMergedWorkItemInputSchema>;
 
 /** `runs.consistencyCheck`'s input: one project, and how far back to look (issue #1344). */
 export const ConsistencyCheckInputSchema = z.object({
@@ -3034,6 +3106,61 @@ export const runsRouter = router({
 		.query(async ({ ctx, input }): Promise<MergeabilityRecheckPlan> => {
 			await assertProjectAccess(ctx.user, input.projectId, 'member');
 			return planMergeabilityRecheck(input);
+		}),
+
+	// Close the work item behind a merged pull request and move its card to Done
+	// (issue #1351) — the operator MCP server's `work_item_close` tool, the fix for
+	// the consistency check's `merged-pr-open-work-item` finding. Refused unless the
+	// pull request is merged (the project's own SCM provider read) and its work item
+	// is not already done; both are read fresh here, never trusted from the preview.
+	// The write is the provider-agnostic `closeWorkItem` + `moveWorkItem('done')`
+	// (`src/dispatch/close-merged-work-item.ts`), then the project's dependency waits
+	// are woken with cause `operator` so dependents start now.
+	//
+	// `member`, this router's gate for every mutation that drives the pipeline.
+	closeMergedWorkItem: authedProcedure
+		.input(CloseMergedWorkItemInputSchema)
+		.mutation(async ({ ctx, input }): Promise<CloseMergedWorkItemResult> => {
+			await assertProjectAccess(ctx.user, input.projectId, 'member');
+			const { plan, pm, preview } = await planWorkItemClose(input);
+			if (preview.wouldRefuse) throw new TRPCError(preview.wouldRefuse);
+			const { workItem } = plan;
+			if (!workItem) {
+				// A plan with no work item always carries a refusal; this only narrows.
+				throw new TRPCError({
+					code: 'NOT_FOUND',
+					message: 'No work item backs this pull request.',
+				});
+			}
+			let result: CloseMergedWorkItemResult;
+			try {
+				result = await applyCloseMergedWorkItem({ ...plan, workItem }, pm);
+			} catch (error) {
+				throw new TRPCError({
+					code: 'INTERNAL_SERVER_ERROR',
+					message: `Could not close work item "${workItem.title}" (${workItem.id}) behind pull request #${input.prNumber} in ${input.repository}: ${describeError(error)}`,
+				});
+			}
+			logger.info('runs.closeMergedWorkItem: closed the work item behind a merged pull request', {
+				projectId: result.projectId,
+				repository: result.repository,
+				prNumber: result.prNumber,
+				workItemId: result.workItem.id,
+				woken: result.woken,
+				userId: ctx.user.id,
+			});
+			return result;
+		}),
+
+	// The dry run of `closeMergedWorkItem`: the pull request's state, the work item
+	// behind it and its current status, and the refusal the real call would answer
+	// with. Read-only, but gated exactly as the mutation, so a dry run never reports
+	// on what the real call may not touch. Deliberately not in `runReadProcedures`.
+	previewCloseMergedWorkItem: authedProcedure
+		.input(CloseMergedWorkItemInputSchema)
+		.query(async ({ ctx, input }): Promise<CloseMergedWorkItemPreview> => {
+			await assertProjectAccess(ctx.user, input.projectId, 'member');
+			return (await planWorkItemClose(input)).preview;
 		}),
 
 	// Put back action for queued work items (issues #251, #284).

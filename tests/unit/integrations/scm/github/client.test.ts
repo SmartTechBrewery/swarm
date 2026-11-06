@@ -416,6 +416,7 @@ describe('github client', () => {
 		const pullData = (overrides: Record<string, unknown> = {}) => ({
 			number: 42,
 			state: 'open',
+			merged: false,
 			mergeable: true,
 			head: { ref: 'issue-42', sha: 'head-sha' },
 			base: { ref: 'main', sha: 'base-sha' },
@@ -437,6 +438,7 @@ describe('github client', () => {
 				mergeable: true,
 				authorLogin: 'operator-human',
 				state: 'open',
+				merged: false,
 			});
 			expect(pullsGet).toHaveBeenCalledWith({ owner: 'jkwiecien', repo: 'swarm', pull_number: 42 });
 		});
@@ -444,11 +446,22 @@ describe('github client', () => {
 		// A merged PR is `closed` with a permanently unknown `mergeable`, which is
 		// exactly the pair the mergeability recheck reads to stop polling (issue #772).
 		it('reports a merged pull request as closed rather than open', async () => {
-			pullsGet.mockResolvedValue({ data: pullData({ state: 'closed', mergeable: null }) });
+			pullsGet.mockResolvedValue({
+				data: pullData({ state: 'closed', merged: true, mergeable: null }),
+			});
 
 			await expect(
 				withGitHubToken('tok', () => getPullRequest('jkwiecien', 'swarm', 42)),
-			).resolves.toMatchObject({ state: 'closed', mergeable: null });
+			).resolves.toMatchObject({ state: 'closed', merged: true, mergeable: null });
+		});
+
+		// A pull request closed without merging is the case `work_item_close` refuses (issue #1351).
+		it('reports a pull request closed without merging as not merged', async () => {
+			pullsGet.mockResolvedValue({ data: pullData({ state: 'closed', merged: false }) });
+
+			await expect(
+				withGitHubToken('tok', () => getPullRequest('jkwiecien', 'swarm', 42)),
+			).resolves.toMatchObject({ state: 'closed', merged: false });
 		});
 	});
 

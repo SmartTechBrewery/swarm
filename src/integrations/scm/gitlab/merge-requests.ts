@@ -288,6 +288,7 @@ function toPullRequestDetails(mr: GitLabMergeRequest): PullRequestDetails {
 		// `opened` | `closed` | `locked` | `merged` collapsed onto the contract's
 		// neutral pair, the same mapping `getGitLabMergeRequestMergeState` applies.
 		state: mr.state === 'opened' ? ('open' as const) : ('closed' as const),
+		merged: mr.state === 'merged',
 	};
 }
 
