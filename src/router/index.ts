@@ -23,9 +23,10 @@ import { serve } from '@hono/node-server';
 import { noticeRetiredOperatorTokens } from '../config/retired-operator-tokens.js';
 import { runMigrations } from '../db/migrate.js';
 import { describeError } from '../lib/errors.js';
-import { configureLogger, logger } from '../lib/logger.js';
+import { configureLogger, enableLogRingBuffer, logger } from '../lib/logger.js';
 import { closeQueue } from '../queue/producer.js';
 import { createRouterApp } from './app.js';
+import { CONTROL_PLANE_LOG_BUFFER_CAPACITY } from './control-plane-logs.js';
 import type { DispatchConsumerHandle } from './dispatcher.js';
 import { startRolloutAdvanceTicker } from './worker-rollout-advance.js';
 import { subscribeWorktreeSweepDispatch } from './worktree-sweep-dispatch.js';
@@ -33,6 +34,9 @@ import { subscribeWorktreeSweepDispatch } from './worktree-sweep-dispatch.js';
 // Tag every line this process emits so router and worker logs stay
 // distinguishable in a shared stream (ai/ARCHITECTURE.md "Observability").
 configureLogger({ component: 'router' });
+// Keep the recent lines queryable for the operator MCP server's
+// `control_plane_logs` tool (issue #1343) — enabled before anything else logs.
+enableLogRingBuffer(CONTROL_PLANE_LOG_BUFFER_CAPACITY);
 
 const port = Number(process.env.PORT ?? 3000);
 

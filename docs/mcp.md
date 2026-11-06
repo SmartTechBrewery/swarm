@@ -4,12 +4,15 @@ A SWARM control plane serves an [MCP](https://modelcontextprotocol.io) server at
 **`/operator/mcp`**. An assistant session such as Claude Code connects to it and
 reads the pipeline the way you do in the dashboard: which runs failed, why, and
 what the agent printed. It is the same data `swarm run list|show|logs` reads, as
-tools a model can call.
+tools a model can call. A few [write tools](#write-tools) act on the pipeline too,
+each with a mandatory reason, a dry run and an audit record.
 
 Every tool is the dashboard's own tRPC procedure, called as you. The tools
 therefore see exactly what you see in the dashboard: an instance administrator
 sees the whole installation, anyone else sees the projects they are a member of,
-and a run in any other project reads as *not found*, exactly as in the browser.
+and a run in any other project reads as *not found*, exactly as in the browser. The one
+tool with no dashboard procedure behind it, `control_plane_logs`, applies the same
+project rules itself.
 
 ## Where it is served
 
@@ -94,12 +97,14 @@ client or update its header. `swarm login --logout` revokes the token for every
 client using it.
 
 Treat the token like a password: it reads everything your account can read in the
-dashboard, including run logs and agent output.
+dashboard, including run logs and agent output, and it can reset and re-dispatch
+runs in every project where you hold `member`.
 
 ## Tools
 
-Every tool is read-only unless its description says otherwise, and declares that
-with MCP's `readOnlyHint`. A refusal (`NOT_FOUND`, `FORBIDDEN`, an invalid
+Every tool in the table below is read-only and declares that with MCP's
+`readOnlyHint`. The tools that change something are listed separately under
+[Write tools](#write-tools). A refusal (`NOT_FOUND`, `FORBIDDEN`, an invalid
 argument) comes back as a tool error naming the procedure's own reason, the same
 wording the dashboard shows.
 
@@ -111,6 +116,7 @@ wording the dashboard shows.
 | `dispatch_history` | Every dispatch of one task or pull request, oldest first (`runs.dispatchHistory`), as `{ dispatches, truncated }`: state, phase, attempts, outcome, wait reason, `availableAt`, last error and the `runId` it executed against. Capped at the newest 200 | `projectId`, `taskId` and/or `prNumber` (at least one), `repository?` |
 | `workers_state` | Each worker's dispatch state (`workers.state`), as `{ workers }`: `connection` (`online`/`offline`), `lastSeenAt`, `draining`/`drainingSince`, the run it is executing, and its enrolled projects, each with `status`, `isRoutable` and its capacity in use — `activeRuns` of `concurrencyAllocation`, the two numbers the dispatch gate compares | `projectId?` |
 | `cli_rate_limits` | The workers cooling on an agent CLI's usage limit, as `{ workers }`, each with its active limits (from `workers.list`): `cli`, `expiresAt` (when SWARM routes that CLI to the machine again), `observedAt`, and `resetHint` — the reset text the CLI itself printed, or `null` when it printed none. A worker with no active limit is left out unless named by `workerId` | `projectId?`, `workerId?` |
+| `control_plane_logs` | The control plane's own recent log lines, newest first, as `{ entries, buffer }`. Each entry is `{ time, level, msg, context }` — the object the logger's `json` format emits, with `msg` cut at 4000 characters. `buffer` is the window they come from: `capacity` (20 000 lines), `size`, and `oldestTime`, the time of the oldest line it still holds | `projectId?`, `taskId?`, `prNumber?`, `dispatchId?` (each matching the line's context key of that name), `level?` (a minimum: `debug`, `info`, `warn`, `error`), `since?`/`until?` (ISO 8601; `since` inclusive, `until` exclusive), `limit` (≤ 1000, default 100) |
 | `pr_status` | One pull request's automation state as SWARM recorded it (`runs.prStatus`): its latest completed Review run (`lastReviewRunId`, `lastReviewVerdict`), the head of its latest submitted verdict (`lastReviewedHeadSha`), the merge-automation outcome recorded on that run (`mergeOutcome` — `merged`, `not-ready`, `not-eligible`, `policy-blocked`, `unsupported`, `provider-error`, `retry-exhausted`, `provider-error-exhausted`, or `null` — with `mergeOutcomeMessage`), the review-verdict ledger (`verdictCount` of `verdictCap`, `supersededCount` of `supersededCap`), whether a bound is reached (`capReached`, and which in `capBound`: `verdict-cap`, `superseded-bound` or `null`), and whether an operator's Force re-review grant is still unspent (`overrideOutstanding`). It does not ask the source-control provider anything, so it is not a live mergeability read | `projectId`, `repository` (as the project configures it), `prNumber` |
 | `pipeline_stats` | One project's counts for a period (`runs.stats`), as `{ runsByStatus, runsByPhase, mergedPrsByRepository, since, until }`: the pipeline runs **started** in the period by the status each is in now and by phase (maintenance runs are left out), and how many distinct pull requests SWARM's merge automation merged, per repository. A merge has no recorded instant of its own, so it is counted in the period its approving Review run completed in. A pull request merged by hand is not counted. A status, phase or repository with nothing to count is absent rather than zero, and `until` is echoed back so you see the period actually counted | `projectId`, `since` (ISO 8601, inclusive), `until?` (ISO 8601, exclusive; defaults to now, and must not be earlier than `since`) |
 | `phase_agents_get` | One phase's agent configuration for a project (from `projects.getById`), as stored after normalisation: `targets` (CLI/model/reasoning in priority order), `timeoutMs`, the custom `prompt`, and `cli`/`model`/`reasoning` mirroring `targets[0]`, with `configured: false` for a phase running on its coded defaults. Nothing else of the project is returned — no repositories, board mapping or credential references | `projectId`, `phase` (`planning`, `implementation`, `implementationUnplanned`, `review`, `respondToReview`, `respondToCi`, `resolveConflicts`) |
@@ -139,6 +145,17 @@ worker on the installation, which only an instance administrator may do; anyone
 else gets `FORBIDDEN` and has to name a project. A `workerId` outside the scope
 reads as *not found*, exactly as an unknown one.
 
+`control_plane_logs` reads an **in-memory buffer** of the lines the process serving
+`/operator/mcp` — the router, or the all-in-one control plane — logged **since it last
+started**, up to its last 20 000 lines. It is not a log store: a restart empties it,
+older lines are evicted as new ones arrive (`buffer.oldestTime` says how far back it
+reaches), and lines below `SWARM_LOG_LEVEL` were never recorded. The API server's
+and the workers' logs are not in it; read a worker's own `logs/worker.log`, and the
+API server's output where its process runs. With a `projectId`, a contributor of that
+project reads the lines carrying it. Without one, it reads every line — including
+those naming no project — which only an instance administrator may do; anyone else
+gets `FORBIDDEN`.
+
 `pr_status`, `pipeline_stats`, `phase_agents_get` and `consistency_check` need you to be
 a contributor of the project you name; for anyone else the project reads as *not found*.
 
@@ -152,6 +169,55 @@ time (never a whole-board read), and never asks the source-control provider.
 | `merged-pr-open-work-item` | Merge automation merged the pull request (its Review run completed inside the window), but the work item it implements is still open on the board — its card is in any status but Done. SWARM does not close a card on merge itself; the provider's own link (a `Closes #N`) does, so a missed close leaves the card, and every item waiting on it, where it is. The card is found from the task the pull request's branch names, then from the pull request itself; a pull request with no card behind it is not reported | Close the work item and move it to Done on the board (`work_item_close`, once the server offers it). Its dependents wake when it is done |
 | `dependency-wait-blockers-done` | A Planning or Implementation dispatch is waiting on the dependency gate, but the gate, asked now, would no longer hold it: no recorded blocker is still open. It would otherwise sit until its next re-check (`SWARM_DEPENDENCY_RECHECK_MS`). "Finished" is the gate's own rule — an open prose-only prerequisite does not count, and neither does a blocker the item itself blocks. Not checked for a provider without dependencies (Trello), which never gates | Wake the project's dependency waits (`dependency_waits_wake`, once the server offers it), or **Retry now** on the Queue screen |
 
+## Write tools
+
+A write tool changes the pipeline. It declares `readOnlyHint: false`, and a tool
+that discards state also declares `destructiveHint: true`. Every write tool works
+the same way:
+
+- **`reason` is mandatory.** Say in a sentence why you are doing this. A call
+  without a reason is rejected as an invalid argument, and a blank one is refused
+  as `BAD_REQUEST`.
+- **`dryRun: true` changes nothing.** It returns
+  `{ dryRun: true, auditId, preview }`, where `preview` says what the call would
+  do: the target's current state, `wouldRefuse` (the refusal the real call would
+  answer with, in its own code and wording, or `null`), `expectedOutcome` and
+  `intendedChanges`. `wouldRefuse: null` is not a promise. The real call checks
+  everything again, and something can change in between. A real call returns
+  `{ dryRun: false, auditId, result }`, where `result` is the dashboard
+  procedure's own answer.
+- **Authorization is the dashboard's, and it comes first.** A dry run needs the
+  same role as the real call. Someone who may not make the change gets the same
+  `FORBIDDEN` or `NOT_FOUND` from a dry run, and learns nothing more about the
+  target.
+- **Every call is audited.** Dry or real, succeeded, refused or failed, each call
+  writes one row to the `operator_actions` table: who (`user_id`,
+  `user_identifier`), which `tool`, `project_id`, `target`, `reason`, `dry_run`,
+  the `input` arguments, `outcome` (`succeeded`, `refused`, `failed`, or
+  `pending` while the call runs), `error`, and `started_at`/`completed_at`.
+  `refused` means the wrapped procedure declined to act (`NOT_FOUND`,
+  `FORBIDDEN`, `PRECONDITION_FAILED`, `CONFLICT`, `BAD_REQUEST`, …), so nothing
+  changed. `failed` means an internal error, including one the procedure reported
+  as `INTERNAL_SERVER_ERROR`; a real call that failed may have half-happened. The
+  row is written before the tool does anything. If it cannot be written, the call
+  does nothing and says so. The table has no foreign keys, so a row survives the
+  deletion of the user or project it names. `project_id` is empty only when the
+  call ended before its target resolved to a project, for example an
+  unknown run. No tool reads the audit table yet; query Postgres directly.
+
+| Tool | What it does | Arguments |
+| --- | --- | --- |
+| `run_reset` | **Destructive.** Resets a wedged run and restarts its phase from scratch, as the dashboard's **Reset & restart** and `swarm run reset` do (`runs.reset`). It stops the run's live agent, cancels its active dispatch (even one a worker has claimed), clears its cancellation flag, tears down its checkout and discards uncommitted and unpushed work, and clears its recovery record. Then it re-dispatches the phase as a fresh first attempt. A run with no stored payload, or whose project is gone, is settled `failed` instead (`outcome: 'terminated'`). Refused only for an unknown run, a machine-maintenance run, or a reset already under way | `runId`, `reason`, `dryRun` (default `false`) |
+| `dispatch_redispatch_now` | Re-dispatches a `deferred`, `checkpointed` or `failed` run immediately, as the dashboard's **Retry now** does (`runs.retryNow`). It re-opens the run's waiting dispatch for an immediate attempt, superseding a scheduled automatic retry. A dispatch whose worker lease has lapsed is taken back first. A run with no dispatch gets a fresh one built from its stored payload. Retry budgets start again from zero. Refused for any other status, for a run a worker is executing, and for a run with neither a dispatch nor a stored payload | `runId`, `reason`, `dryRun` (default `false`) |
+
+Both need `member` on the run's project, the role that drives runs in the
+dashboard. A contributor can read the run but gets `FORBIDDEN`. Anyone else gets
+`NOT_FOUND`. Their dry run is the `runs.previewAction` procedure, which is gated at
+`member` too.
+
+`dispatch_redispatch_now` takes a run. A dispatch with no run yet, such as a
+board dispatch waiting on its dependencies, is not something it can re-dispatch.
+
 ## For developers
 
 The mount is `src/router/operator-mcp.ts`. The server is built per request in
@@ -159,6 +225,17 @@ The mount is `src/router/operator-mcp.ts`. The server is built per request in
 `src/mcp/tools/`. `src/mcp/tool-helpers.ts` provides the tRPC caller (`callerFor`)
 and the result mapping (`runTool`). A tool calls a dashboard procedure through
 `callerFor(user)` and never reads a repository directly, so its authorization
-cannot drift from the dashboard's. Adding a tool publishes that procedure on the
+cannot drift from the dashboard's. The one exception is `control_plane_logs`
+(`src/mcp/tools/logs.ts`): the dashboard's procedures run in the API server, whose
+memory does not hold the router's buffer, so there is no procedure to call, and the
+tool calls the same `src/api/authz.ts` helpers a procedure would. Adding a tool publishes that procedure on the
 internet-exposed router. Treat it like widening `src/api/operator-router.ts`: give
 it its own reasoning, and add it to the table above.
+
+A tool that writes registers through `registerWriteTool` (`src/mcp/write-tool.ts`),
+never `server.registerTool` directly. Give it a `preview`, a read-only procedure
+gated exactly like the write, which runs first on every call and answers the dry
+run, and an `apply`, which is the dashboard mutation. The framework adds `reason`
+and `dryRun` and writes the `operator_actions` row
+(`src/db/repositories/operatorActionsRepository.ts`). The run tools live in
+`src/mcp/tools/run-actions.ts`.

@@ -1739,6 +1739,14 @@ kept out of the default set by a profile, so it neither starts nor binds a port.
 
 ## Failure diagnosis
 
+**The control plane's own recent logs are readable without `docker logs`** (issue
+#1343). An MCP client connected to `/operator/mcp` can call `control_plane_logs`,
+filtering by project, task, pull request, dispatch, minimum level and time window,
+to see what the router (or the all-in-one control plane) logged about a dispatch
+that never reached a worker, a webhook that was dropped, or a merge that did not
+happen. It covers only an in-memory window of that process's last 20 000 lines since
+it last restarted; see [`docs/mcp.md`](./mcp.md#tools).
+
 For a terminal recognised response stall, SWARM labels a task as **likely scope
 exceeded** only when it also observed substantial progress and the most recent
 successful Planning run recorded multiple independent concerns. A timeout alone
@@ -2121,7 +2129,10 @@ their failure causes and their agent output, a project's whole pipeline state in
 one call, a task's dispatch history, and which workers are connected, busy,
 draining or cooling on a CLI's usage limit, where a pull request stands on
 merge automation and the review-verdict cap, and how a phase's agents are
-configured, with exactly your dashboard access.
+configured, with exactly your dashboard access — plus the control plane's own
+recent log lines. It can also act: reset a wedged run, or re-dispatch a run's
+waiting dispatch now. Every such write tool takes a mandatory `reason` and a
+`dryRun`, and every call is recorded in the `operator_actions` audit table.
 How to connect one, and the tool catalogue: [`docs/mcp.md`](./mcp.md).
 
 ## Configuration

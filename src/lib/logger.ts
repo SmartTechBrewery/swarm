@@ -23,12 +23,20 @@
  * terminal. The file always gets the `json` form regardless of the console
  * format, since a file is read back by tools/aggregators (and by an agent
  * grepping it later), not watched live.
+ *
+ * An optional in-memory **ring buffer** (`enableLogRingBuffer`) keeps the most
+ * recent emitted lines queryable from inside the process (`queryLogRingBuffer`)
+ * — the router enables it so the operator MCP server's `control_plane_logs` tool
+ * can read the control plane's own recent logs without `docker logs` (issue
+ * #1343). It holds the same object the `json` format emits, is bounded by a
+ * fixed entry count, and starts empty on every restart: it is a window onto
+ * recent activity, not a log store.
  */
 
 import { createWriteStream, mkdirSync, type WriteStream } from 'node:fs';
 import { dirname, isAbsolute, resolve } from 'node:path';
 
-type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 type LogContext = Record<string, unknown>;
 
 // Numeric ordering mirrors Cascade's LOG_LEVELS: a call is emitted only when its
@@ -84,6 +92,171 @@ export function addFileSink(filePath: string): void {
 	} catch {
 		fileSinkFailed = true;
 	}
+}
+
+/** One buffered line: the `json` format's object, split into its four parts. */
+export interface LogRingEntry {
+	time: string;
+	level: LogLevel;
+	msg: string;
+	context: LogContext;
+}
+
+/**
+ * What {@link queryLogRingBuffer} matches on. Every given field must match;
+ * `level` is a minimum, `since` is inclusive and `until` exclusive. `taskId`,
+ * `prNumber` and `dispatchId` match the line's own context keys of those names
+ * and `projectId` its `projectId` — the keys SWARM's log call sites use — compared
+ * as strings, since a call site may log a number where another logs a string.
+ */
+export interface LogRingFilter {
+	projectId?: string;
+	taskId?: string;
+	prNumber?: number | string;
+	dispatchId?: string;
+	level?: LogLevel;
+	since?: Date;
+	until?: Date;
+	/** Newest-first cap on the returned entries; defaults to every match. */
+	limit?: number;
+}
+
+export interface LogRingQueryResult {
+	/** Matching entries, newest first. */
+	entries: LogRingEntry[];
+	/** The buffer's capacity in entries — `0` when this process never enabled it. */
+	capacity: number;
+	/** How many entries it holds right now. */
+	size: number;
+	/** The time of the oldest entry it still holds, or `null` when empty. */
+	oldestTime: string | null;
+}
+
+// A line too large to keep whole (an error carrying a huge payload) is kept as
+// its level, time, message and correlation keys, so it still turns up under the
+// filters without letting one line pin megabytes for the life of the process.
+const MAX_BUFFERED_LINE_CHARS = 16_384;
+const RING_FILTER_KEYS = ['projectId', 'taskId', 'prNumber', 'dispatchId'] as const;
+type RingFilterKey = (typeof RING_FILTER_KEYS)[number];
+
+// Stored as the serialized line rather than the caller's context object: the
+// snapshot cannot be mutated afterwards, holds no reference to anything the
+// caller keeps alive, and is parsed only when a query actually returns it. The
+// filter keys are pulled out beside it so a query never parses a non-match.
+interface BufferedLine {
+	timeMs: number;
+	time: string;
+	level: LogLevel;
+	keys: Partial<Record<RingFilterKey, string>>;
+	line: string;
+}
+
+let ring: (BufferedLine | undefined)[] = [];
+let ringNext = 0; // the slot the next line is written to
+let ringSize = 0;
+
+/**
+ * Keep the most recent `capacity` emitted lines in memory, for
+ * {@link queryLogRingBuffer}. Off unless a process calls this (only the router
+ * does). Each call starts a fresh, empty buffer of the given capacity; a
+ * non-positive capacity turns it off. It records exactly what passes
+ * `SWARM_LOG_LEVEL`, like the file sink.
+ */
+export function enableLogRingBuffer(capacity: number): void {
+	const size = Number.isFinite(capacity) ? Math.max(0, Math.floor(capacity)) : 0;
+	ring = new Array<BufferedLine | undefined>(size);
+	ringNext = 0;
+	ringSize = 0;
+}
+
+function asFilterValue(value: unknown): string | undefined {
+	if (typeof value === 'string') return value;
+	if (typeof value === 'number' || typeof value === 'bigint') return String(value);
+	return undefined;
+}
+
+function recordInRing(level: LogLevel, message: string, context: LogContext, time: string): void {
+	if (ring.length === 0) return;
+	try {
+		const keys: BufferedLine['keys'] = {};
+		for (const key of RING_FILTER_KEYS) {
+			const value = asFilterValue(context[key]);
+			if (value !== undefined) keys[key] = value;
+		}
+		let line = formatJson(level, message, context, time);
+		if (line.length > MAX_BUFFERED_LINE_CHARS) {
+			line = safeStringify({
+				level,
+				time,
+				msg: message.slice(0, MAX_BUFFERED_LINE_CHARS / 2),
+				...keys,
+				_truncated: true,
+			});
+		}
+		ring[ringNext] = { timeMs: Date.parse(time), time, level, keys, line };
+		ringNext = (ringNext + 1) % ring.length;
+		ringSize = Math.min(ringSize + 1, ring.length);
+	} catch {
+		// Best-effort, like every other sink: a line that cannot be buffered is
+		// simply not buffered.
+	}
+}
+
+function toRingEntry(buffered: BufferedLine): LogRingEntry {
+	try {
+		const {
+			level: _level,
+			time: _time,
+			msg,
+			...context
+		} = JSON.parse(buffered.line) as {
+			msg?: unknown;
+		} & LogContext;
+		return {
+			time: buffered.time,
+			level: buffered.level,
+			msg: typeof msg === 'string' ? msg : String(msg),
+			context,
+		};
+	} catch {
+		return { time: buffered.time, level: buffered.level, msg: '', context: { ...buffered.keys } };
+	}
+}
+
+function matchesRingFilter(buffered: BufferedLine, filter: LogRingFilter): boolean {
+	for (const key of RING_FILTER_KEYS) {
+		const wanted = filter[key];
+		if (wanted !== undefined && buffered.keys[key] !== String(wanted)) return false;
+	}
+	if (filter.level && LEVEL_WEIGHT[buffered.level] < LEVEL_WEIGHT[filter.level]) return false;
+	if (filter.since && buffered.timeMs < filter.since.getTime()) return false;
+	if (filter.until && buffered.timeMs >= filter.until.getTime()) return false;
+	return true;
+}
+
+/**
+ * The buffered lines matching `filter`, newest first, plus the buffer's own
+ * extent so a reader can tell "nothing happened" from "that is older than the
+ * buffer". Returns no entries (and `capacity: 0`) in a process that never
+ * enabled it. Never throws.
+ */
+export function queryLogRingBuffer(filter: LogRingFilter = {}): LogRingQueryResult {
+	const capacity = ring.length;
+	const entries: LogRingEntry[] = [];
+	const slot = (offset: number) => ring[(ringNext - offset + capacity) % capacity];
+	const oldestTime = ringSize > 0 ? (slot(ringSize)?.time ?? null) : null;
+	try {
+		const limit = filter.limit ?? Number.POSITIVE_INFINITY;
+		for (let offset = 1; offset <= ringSize && entries.length < limit; offset += 1) {
+			const buffered = slot(offset);
+			if (buffered && matchesRingFilter(buffered, filter)) {
+				entries.push(toRingEntry(buffered));
+			}
+		}
+	} catch {
+		// Fall through with whatever was collected.
+	}
+	return { entries, capacity, size: ringSize, oldestTime };
 }
 
 function resolveMinLevel(): number {
@@ -211,6 +384,7 @@ function emit(level: LogLevel, message: string, context?: LogContext): void {
 			fileSinkFailed = true;
 		}
 	}
+	recordInRing(level, message, merged, time);
 }
 
 export const logger = {
