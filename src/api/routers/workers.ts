@@ -9,7 +9,12 @@ import {
 	getUserById,
 	listUsers,
 } from '../../db/repositories/usersRepository.js';
-import type { WorkerCliRateLimit } from '../../db/repositories/workerCliRateLimitsRepository.js';
+import {
+	extendWorkerCliRateLimits,
+	listActiveCliRateLimitsForWorkers,
+	MAX_CLI_COOLDOWN_MS,
+	type WorkerCliRateLimit,
+} from '../../db/repositories/workerCliRateLimitsRepository.js';
 import { removeWorker } from '../../db/repositories/workersRepository.js';
 import { AgentCliSchema } from '../../harness/agent-cli.js';
 import { isInstanceAdmin, type SwarmUser } from '../../identity/schema.js';
@@ -574,6 +579,109 @@ function previousSweepView(sweep: Worker['worktreeSweep']): {
 	};
 }
 
+/**
+ * The input of an operator-set CLI cool-down (issue #1350) — `workers.previewCliRateLimit`
+ * and `workers.setCliRateLimit`, and the MCP tool `cli_rate_limit_set` that wraps
+ * them. A plain object rather than a refined one so the tool can reuse its shape:
+ * "exactly one of `until` and `durationMinutes`" is checked by
+ * {@link requestedCliRateLimitExpiry} instead, as a `BAD_REQUEST`.
+ */
+export const CliRateLimitInputSchema = z.object({
+	workerId: z.string().uuid(),
+	cli: AgentCliSchema,
+	until: z.string().datetime({ offset: true }).optional(),
+	durationMinutes: z.number().int().positive().optional(),
+	resetHint: z.string().trim().min(1).max(500).optional(),
+	scope: z.enum(['worker', 'owner']).default('worker'),
+});
+type CliRateLimitInput = z.infer<typeof CliRateLimitInputSchema>;
+
+/**
+ * The instant an operator asked a cool-down to last until: `until`, or `now` plus
+ * `durationMinutes` — exactly one of them, in the future, and no further out than
+ * {@link MAX_CLI_COOLDOWN_MS}, the same ceiling an observed reset is bounded by.
+ * Refused rather than clamped, so a block never silently lasts less than was asked.
+ */
+function requestedCliRateLimitExpiry(input: CliRateLimitInput, now: Date): Date {
+	const hasUntil = input.until !== undefined;
+	const hasDuration = input.durationMinutes !== undefined;
+	if (hasUntil === hasDuration) {
+		throw new TRPCError({
+			code: 'BAD_REQUEST',
+			message: 'Give exactly one of `until` and `durationMinutes`.',
+		});
+	}
+	const expiresAt =
+		input.until !== undefined
+			? new Date(input.until)
+			: new Date(now.getTime() + (input.durationMinutes ?? 0) * 60_000);
+	if (expiresAt.getTime() <= now.getTime()) {
+		throw new TRPCError({
+			code: 'BAD_REQUEST',
+			message: `A CLI cool-down must end in the future; ${expiresAt.toISOString()} has passed.`,
+		});
+	}
+	if (expiresAt.getTime() - now.getTime() > MAX_CLI_COOLDOWN_MS) {
+		const limit = new Date(now.getTime() + MAX_CLI_COOLDOWN_MS);
+		throw new TRPCError({
+			code: 'BAD_REQUEST',
+			message: `A CLI cool-down may last at most ${MAX_CLI_COOLDOWN_MS / 86_400_000} days (until ${limit.toISOString()}); ${expiresAt.toISOString()} is past that.`,
+		});
+	}
+	return expiresAt;
+}
+
+/** What setting a cool-down does to one machine: write a new row, push one later, or leave it. */
+type CliRateLimitChange = 'create' | 'extend' | 'unchanged';
+
+/**
+ * Authorize and plan one operator-set cool-down (issue #1350) — the shared first
+ * half of `previewCliRateLimit` and `setCliRateLimit`, so the dry run answers for
+ * exactly the machines, and under exactly the gate, the write acts on.
+ *
+ * The gate is {@link resolveOwnedWorker}: the machine's owner or an
+ * `instanceAdmin`, and the same `NOT_FOUND` for anybody else. `scope: 'owner'`
+ * widens the set to every machine **the named worker's owner** operates. SWARM
+ * records no CLI-account identity, so a user's machines are the documented proxy
+ * for "the same CLI account": a subscription is usually signed in on all of them.
+ *
+ * Each machine's `currentExpiresAt` is its **live** cool-down on that CLI, read as
+ * the dispatch gate reads it; an expired row counts as none.
+ */
+async function planCliRateLimit(user: SwarmUser, input: CliRateLimitInput, now: Date) {
+	const worker = await resolveOwnedWorker(user, input.workerId);
+	const expiresAt = requestedCliRateLimitExpiry(input, now);
+	const targets =
+		input.scope === 'owner' ? await listWorkersForOwner(worker.ownerUserId) : [worker];
+	// The named machine is always in the set, even if the owner read raced its removal.
+	if (!targets.some((target) => target.id === worker.id)) targets.unshift(worker);
+	const live = await listActiveCliRateLimitsForWorkers(
+		targets.map((target) => target.id),
+		now,
+	);
+	const machines = targets.map((target) => {
+		const current = live.get(target.id)?.find((limit) => limit.cli === input.cli)?.expiresAt;
+		return { workerId: target.id, displayName: target.displayName, current: current ?? null };
+	});
+	return { cli: input.cli, scope: input.scope, expiresAt, machines };
+}
+
+/** The wire form of one machine's line in a cool-down plan or result. */
+function cliRateLimitLine(
+	machine: { workerId: string; displayName: string; current: Date | null },
+	change: CliRateLimitChange,
+	expiresAt: Date,
+) {
+	return {
+		workerId: machine.workerId,
+		displayName: machine.displayName,
+		currentExpiresAt: machine.current?.toISOString() ?? null,
+		newExpiresAt:
+			change === 'unchanged' ? (machine.current?.toISOString() ?? null) : expiresAt.toISOString(),
+		change,
+	};
+}
+
 export const workersRouter = router({
 	// The worker owner's own operator SCM credential per provider (issue #766),
 	// nested here the way `credentialsRouter` nests under `projectsRouter`: it is
@@ -940,6 +1048,88 @@ export const workersRouter = router({
 				drainingSince: updated.drainingSince?.toISOString() ?? null,
 				busy: runState.busy,
 				currentRunId: runState.currentRunId,
+			};
+		}),
+
+	// Keep one agent CLI off a machine — or off every machine its owner operates —
+	// until a given instant (issue #1350): what the dispatcher records on its own when
+	// a run reports a spent allowance, set by hand for a limit SWARM has not observed
+	// yet (a subscription spent from another tool, a weekly window known to be gone).
+	// The block is an ordinary `worker_cli_rate_limits` row, so the dispatch gate,
+	// the Workers screen and `cli_rate_limits` all treat it exactly as an observed one,
+	// and it releases itself at its expiry.
+	//
+	// The machine's owner or an `instanceAdmin` (`resolveOwnedWorker`), and the same
+	// NOT_FOUND for anybody else. **Extend only**: a machine whose live cool-down on
+	// that CLI already lasts at least as long is left alone, so this can never cut
+	// short a limit a real run recorded — clearing a block early is deliberately not
+	// offered. Bounded by `MAX_CLI_COOLDOWN_MS`, the ceiling an observed reset has.
+	//
+	// `previewCliRateLimit` is the same authorization and plan with no write: each
+	// machine's current and resulting expiry and whether it would be created, extended
+	// or left unchanged. It is the operator MCP tool's dry run.
+	previewCliRateLimit: authedProcedure
+		.input(CliRateLimitInputSchema)
+		.query(async ({ ctx, input }) => {
+			const plan = await planCliRateLimit(ctx.user, input, new Date());
+			return {
+				cli: plan.cli,
+				scope: plan.scope,
+				requestedExpiresAt: plan.expiresAt.toISOString(),
+				resetHint: input.resetHint ?? null,
+				workers: plan.machines.map((machine) =>
+					cliRateLimitLine(
+						machine,
+						machine.current === null
+							? 'create'
+							: machine.current < plan.expiresAt
+								? 'extend'
+								: 'unchanged',
+						plan.expiresAt,
+					),
+				),
+			};
+		}),
+
+	setCliRateLimit: authedProcedure
+		.input(CliRateLimitInputSchema)
+		.mutation(async ({ ctx, input }) => {
+			const now = new Date();
+			const plan = await planCliRateLimit(ctx.user, input, now);
+			const written = new Set(
+				await extendWorkerCliRateLimits({
+					workerIds: plan.machines.map((machine) => machine.workerId),
+					cli: plan.cli,
+					expiresAt: plan.expiresAt,
+					observedAt: now,
+					resetHint: input.resetHint ?? null,
+				}),
+			);
+			const workers = plan.machines.map((machine) =>
+				cliRateLimitLine(
+					machine,
+					!written.has(machine.workerId)
+						? 'unchanged'
+						: machine.current === null
+							? 'create'
+							: 'extend',
+					plan.expiresAt,
+				),
+			);
+			logger.info('Operator set a CLI cool-down', {
+				userId: ctx.user.id,
+				workerId: input.workerId,
+				cli: plan.cli,
+				scope: plan.scope,
+				expiresAt: plan.expiresAt.toISOString(),
+				written: [...written],
+			});
+			return {
+				cli: plan.cli,
+				scope: plan.scope,
+				requestedExpiresAt: plan.expiresAt.toISOString(),
+				resetHint: input.resetHint ?? null,
+				workers,
 			};
 		}),
 

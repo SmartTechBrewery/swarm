@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 
 import { createUser } from '../../../src/db/repositories/usersRepository.js';
 import {
+	extendWorkerCliRateLimits,
 	listActiveCliRateLimitsForWorker,
 	listActiveCliRateLimitsForWorkers,
 	listActiveWorkerCliRateLimits,
@@ -212,6 +213,87 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 				);
 				expect(byWorker.get(otherWorkerId)).toBeUndefined();
 				expect(await listActiveCliRateLimitsForWorkers([], NOW)).toEqual(new Map());
+			});
+		});
+
+		// Issue #1350 — an operator's block extends a cool-down and never shortens one,
+		// decided by the upsert's own `WHERE` rather than a read-then-write.
+		describe('extendWorkerCliRateLimits (extend only)', () => {
+			it('creates a missing row, extends an earlier one, and keeps a later one', async () => {
+				await recordWorkerCliRateLimit({
+					workerId,
+					cli: 'claude',
+					expiresAt: IN_AN_HOUR,
+					observedAt: AN_HOUR_AGO,
+					resetHint: 'resets at 1pm',
+				});
+				const written = await extendWorkerCliRateLimits({
+					workerIds: [workerId, otherWorkerId],
+					cli: 'claude',
+					expiresAt: IN_TWO_HOURS,
+					observedAt: NOW,
+					resetHint: null,
+				});
+				expect(written.sort()).toEqual([workerId, otherWorkerId].sort());
+				const after = await listActiveWorkerCliRateLimits([workerId, otherWorkerId], NOW);
+				expect(after.get(workerId)?.get('claude')).toEqual(IN_TWO_HOURS);
+				expect(after.get(otherWorkerId)?.get('claude')).toEqual(IN_TWO_HOURS);
+
+				const shorter = await extendWorkerCliRateLimits({
+					workerIds: [workerId],
+					cli: 'claude',
+					expiresAt: IN_AN_HOUR,
+					observedAt: NOW,
+					resetHint: 'shorter',
+				});
+				expect(shorter).toEqual([]);
+				const [kept] = await listActiveCliRateLimitsForWorker(workerId, NOW);
+				expect(kept).toMatchObject({ expiresAt: IN_TWO_HOURS, resetHint: null });
+			});
+
+			it('replaces an expired row and leaves other CLIs alone', async () => {
+				await recordWorkerCliRateLimit({
+					workerId,
+					cli: 'claude',
+					expiresAt: AN_HOUR_AGO,
+					observedAt: AN_HOUR_AGO,
+				});
+				await recordWorkerCliRateLimit({
+					workerId,
+					cli: 'codex',
+					expiresAt: IN_AN_HOUR,
+					observedAt: NOW,
+				});
+
+				expect(
+					await extendWorkerCliRateLimits({
+						workerIds: [workerId],
+						cli: 'claude',
+						expiresAt: IN_AN_HOUR,
+						observedAt: NOW,
+						resetHint: 'operator block',
+					}),
+				).toEqual([workerId]);
+				expect(await listActiveWorkerCliRateLimits([workerId], NOW)).toEqual(
+					new Map([
+						[
+							workerId,
+							new Map([
+								['claude', IN_AN_HOUR],
+								['codex', IN_AN_HOUR],
+							]),
+						],
+					]),
+				);
+				expect(
+					await extendWorkerCliRateLimits({
+						workerIds: [],
+						cli: 'claude',
+						expiresAt: IN_AN_HOUR,
+						observedAt: NOW,
+						resetHint: null,
+					}),
+				).toEqual([]);
 			});
 		});
 

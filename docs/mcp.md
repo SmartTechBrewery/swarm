@@ -246,9 +246,10 @@ the same way:
   as `INTERNAL_SERVER_ERROR`; a real call that failed may have half-happened. The
   row is written before the tool does anything. If it cannot be written, the call
   does nothing and says so. The table has no foreign keys, so a row survives the
-  deletion of the user or project it names. `project_id` is empty only when the
+  deletion of the user or project it names. `project_id` is empty when the
   call ended before its target resolved to a project, for example an
-  unknown run. No tool reads the audit table yet; query Postgres directly.
+  unknown run, and for a tool whose target belongs to no project
+  (`cli_rate_limit_set`, which acts on a worker). No tool reads the audit table yet; query Postgres directly.
 
 | Tool | What it does | Arguments |
 | --- | --- | --- |
@@ -258,6 +259,7 @@ the same way:
 | `pr_recheck_mergeability` | Schedules the per-PR conflict check that the resolve-conflicts fan-out schedules for each open pull request when a sibling merges (`runs.recheckMergeability`). Use it when that fan-out skipped this pull request. The check is keyed on the pull request's own base, read from its provider, and is due now. A check already pending for the same pull request and base is superseded rather than duplicated. The check reads mergeability and dispatches Resolve-conflicts only when the pull request genuinely conflicts, with all of that phase's own gates. Refused for a closed pull request and for a repository the project does not configure. The dry run (`runs.previewMergeabilityRecheck`) reports the pull request's current `state`, `headSha`, `baseBranch` and `mergeable` (`null` while the provider is still computing it), the `coalesceKey` and the `job` it would schedule, and `wouldRefuse` | `projectId`, `repository` (as the project configures it), `prNumber`, `reason`, `dryRun` (default `false`) |
 | `dependency_waits_wake` | Wakes every dispatch in the project waiting on the dependency gate now, instead of at its next re-check (`SWARM_DEPENDENCY_RECHECK_MS`) — the same wake a merge or a board card reaching Done triggers on its own (`runs.wakeDependencyWaits`, logged with cause `operator`). The gate re-reads the blockers, so a dependent still blocked simply waits again, and the wake spends no attempt its re-check would not have. Returns `{ projectId, woken, dispatches }`, each dispatch with `dispatchId`, `phase`, `repository`, `taskId`, `prNumber`, `runId`, `attempt` and `availableAt`. A dispatch it could not wake is logged, left on its re-check, and not listed. The dry run (`runs.previewDependencyWake`) returns `{ projectId, wouldWake, dispatches }`: the waits it would wake, in the same shape | `projectId`, `reason`, `dryRun` (default `false`) |
 | `work_item_close` | Closes the work item a merged pull request implements and moves its card to Done on the project's board (`runs.closeMergedWorkItem`), then wakes the project's dependency-waiting dispatches with cause `operator`, as `dependency_waits_wake` does, so its dependents start now. This is the fix for a `merged-pr-open-work-item` finding: the pull request merged, but the provider missed its closing reference (a `Closes #N`), so the card stayed open and everything waiting on it stayed parked. The work item is found the way `consistency_check` finds it: the card SWARM recorded on the pull request's latest completed Review run, else the issue the pull request's task branch names, else the pull request itself, each a one-card board lookup. The write goes through the board provider's own close and its move to the canonical `done` status, so it works the same on every board provider. Refused with `PRECONDITION_FAILED` when the pull request is not merged (still open, or closed without merging, as its source-control provider reports it) and when the work item is already in Done, and with `NOT_FOUND` when no work item backs the pull request or the project does not configure the repository. Returns `{ projectId, repository, prNumber, workItem, closed, woken, wokenDispatchIds }`. The dry run (`runs.previewCloseMergedWorkItem`) reports the pull request's `state` and `merged`, the resolved `workItem` with its `id`, `title`, `url`, current `status` and `statusKey` and how it was found (`resolvedVia`: `run-link`, `task-issue` or `pull-request`), `wouldRefuse` and `intendedChanges` | `projectId`, `repository` (as the project configures it), `prNumber`, `reason`, `dryRun` (default `false`) |
+| `cli_rate_limit_set` | Keeps one agent CLI off a worker until `until` or for `durationMinutes` (`workers.setCliRateLimit`): the same `worker_cli_rate_limits` cool-down SWARM records when a run reports a spent allowance, so routing, the Workers screen and `cli_rate_limits` treat it exactly like an observed one, and it lapses by itself at its expiry. `scope: 'owner'` applies it to every worker the named worker's owner operates: SWARM records no CLI-account identity, so one user's machines stand in for "the same CLI account" (a subscription is usually signed in on all of them). **Extend only**: a machine whose live cool-down on that CLI already lasts at least as long is left `unchanged`, so nothing a real run recorded is ever shortened, and nothing is cleared early. Refused with `BAD_REQUEST` unless exactly one of `until`/`durationMinutes` is given, in the future, and at most eight days ahead (`MAX_CLI_COOLDOWN_MS`, the ceiling an observed reset has). Returns `{ cli, scope, requestedExpiresAt, resetHint, workers }`, each worker with `workerId`, `displayName`, `currentExpiresAt`, `newExpiresAt` and `change` (`create`, `extend` or `unchanged`). The dry run (`workers.previewCliRateLimit`) returns the same shape without writing | `workerId`, `cli`, `until?`, `durationMinutes?`, `resetHint?`, `scope` (`worker` or `owner`, default `worker`), `reason`, `dryRun` (default `false`) |
 
 `run_reset`, `dispatch_redispatch_now`, `pr_force_re_review` and
 `pr_recheck_mergeability` need `member` on the project, the role that drives runs in the
@@ -285,6 +287,11 @@ asks both providers on every call, dry run included: the source-control provider
 for the pull request and the board for the work item. A read that fails is reported
 as `INTERNAL_SERVER_ERROR` and audited `failed`, never as "not merged" or "no work
 item". It never closes a work item without a merged pull request behind it.
+
+`cli_rate_limit_set` acts on a machine rather than a project, so it is gated like
+the dashboard's machine-owner actions: the worker's owner or an instance
+administrator may call it, and anyone else gets `NOT_FOUND`, dry run included. Its
+audit row names no project.
 
 ## For developers
 
@@ -314,5 +321,6 @@ and `dryRun` and writes the `operator_actions` row
 (`src/db/repositories/operatorActionsRepository.ts`). The run tools live in
 `src/mcp/tools/run-actions.ts`, the pull-request tools in
 `src/mcp/tools/pr-actions.ts`, `dependency_waits_wake` in
-`src/mcp/tools/dependency-waits.ts`, and `work_item_close` in
-`src/mcp/tools/work-items.ts`.
+`src/mcp/tools/dependency-waits.ts`, `work_item_close` in
+`src/mcp/tools/work-items.ts`, and `cli_rate_limit_set` in
+`src/mcp/tools/cli-rate-limit-set.ts`.

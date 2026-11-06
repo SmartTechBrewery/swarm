@@ -13,6 +13,10 @@ import { workers } from './workers.js';
  * back. It records a **fact a real run produced** — the machine's own CLI said its
  * allowance was spent — which is precisely what makes it safe to route on.
  *
+ * The one other writer is an operator's own block (`workers.setCliRateLimit`, issue
+ * #1350), for a spent allowance SWARM has not observed. It only ever *extends* a
+ * row (`extendWorkerCliRateLimits`), so it can never cut short a recorded fact.
+ *
  * **Not `cli_quotas`.** The two differ in provenance and in lifecycle: `cli_quotas`
  * is a probe-derived *display* snapshot refreshed on a schedule, and
  * `src/worker/target-selection.ts` warns explicitly against routing on those rows.
