@@ -295,6 +295,7 @@ export const wipOperatorReasonSchema = z.enum([
 	'approved-awaiting-merge',
 	'stalled',
 	'failed',
+	'terminated',
 ]);
 export type WipOperatorReason = z.infer<typeof wipOperatorReasonSchema>;
 

@@ -35,6 +35,7 @@ const OPERATOR_REASON_LABELS: Record<WipOperatorReason, string> = {
 	'review-cap-reached': 'review cap reached — needs a person',
 	stalled: 'stalled — nothing is due',
 	failed: 'latest run failed and nothing will retry it',
+	terminated: 'run terminated — move the card out of its start column and back to start a new run',
 };
 
 export function wipOperatorReasonLabel(reason: WipOperatorReason): string {
