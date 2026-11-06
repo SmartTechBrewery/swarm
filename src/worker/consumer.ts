@@ -3529,6 +3529,27 @@ async function tryReuseLatestRun(
 	const prior = await getLatestRunForTask(project.id, project.repo, trigger.taskId, trigger.phase);
 	if (!prior || (!isRetryPendingStatus(prior.status) && prior.status !== 'failed'))
 		return undefined;
+	// Terminating a run cancels *that* run only (issue #1361). A row a user
+	// terminated — recorded as such, or still carrying its cancellation marker (a
+	// deferred run terminated from the dashboard keeps it, see `runs.terminate`) —
+	// is never taken over by a new request: reusing its id would inherit the
+	// cancellation, and the #912 start check would refuse the operator's fresh
+	// board move. This attempt is recorded on a fresh row instead. A job that
+	// *carries* the run id (its own queued retry) goes through `tryResetCarriedRun`
+	// and is still refused, as #912 requires.
+	if (
+		prior.failureDiagnosis?.kind === 'user-terminated' ||
+		(await isRunCancellationRequested(prior.id))
+	) {
+		logger.info('Latest run row was terminated by a user — recording this request on a fresh row', {
+			projectId: project.id,
+			phase: trigger.phase,
+			taskId: trigger.taskId,
+			runId: prior.id,
+			dispatchId,
+		});
+		return undefined;
+	}
 	// Take the row over before writing anything to it (issue #1102). A retry-pending
 	// row can still be owned by another active dispatch — an earlier review's
 	// `retry-scheduled` Respond-to-review, say — and resetting it first would write
@@ -3675,7 +3696,8 @@ async function tryFetchPrTitle(
  * Reuse an existing `runs` row for this job rather than inserting a new one:
  * the carried row when the job names one (a re-enqueued deferral or manual
  * retry — issue #136), otherwise the latest terminal row for the task in this
- * repository (issue #1108) that no other active dispatch owns (issue #1102).
+ * repository (issue #1108) that no other active dispatch owns (issue #1102) and
+ * no user terminated (issue #1361).
  * Returns the reused row's id, or `undefined` when there's nothing to reuse (the caller
  * then creates a fresh row). Restores a resumable Claude session id from the
  * carried row onto the job before resetting it, so a resumed retry threads the

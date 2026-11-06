@@ -8680,6 +8680,77 @@ describe('processJob', () => {
 			expect(createRun).toHaveBeenCalledOnce();
 		});
 
+		// Issue #1361: VT-1568's deferred Implementation was terminated from the dashboard,
+		// and a later board move into the start column was attached to that run id and
+		// refused by the #912 start check, because the cancellation stayed recorded on it.
+		describe('a latest row a user terminated', () => {
+			const boardMove = () =>
+				processJob(
+					createMockPmWebhookJob(),
+					registryReturning({
+						phase: 'implementation',
+						taskId: '100',
+						workItem: createMockWorkItem(),
+					}),
+				);
+
+			const expectFreshRunStarted = (outcome: Awaited<ReturnType<typeof processJob>>) => {
+				expect(bindDispatchToRun).not.toHaveBeenCalledWith(expect.anything(), 'run-terminated');
+				expect(resetRunToRunning).not.toHaveBeenCalled();
+				expect(createRun).toHaveBeenCalledExactlyOnceWith(
+					expect.objectContaining({
+						jobPayload: expect.not.objectContaining({ runId: 'run-terminated' }),
+					}),
+				);
+				expect(phaseCalls).not.toEqual([]);
+				expect(outcome).toMatchObject({ status: 'phase-succeeded' });
+				expect(outcome).not.toMatchObject({ cancelled: true });
+				expect(completeRun).toHaveBeenCalledWith(
+					'run-1',
+					expect.objectContaining({ status: 'completed' }),
+				);
+			};
+
+			it('starts a new run instead of reusing a row recorded as user-terminated', async () => {
+				getLatestRunForTask.mockResolvedValueOnce({
+					id: 'run-terminated',
+					status: 'failed',
+					failureDiagnosis: { kind: 'user-terminated' },
+				} as never);
+
+				expectFreshRunStarted(await boardMove());
+			});
+
+			it('starts a new run instead of reusing a row still carrying its cancellation marker', async () => {
+				// The issue's exact state: the terminated run's marker is still recorded,
+				// so reusing its id would trip the #912 start check.
+				getLatestRunForTask.mockResolvedValueOnce({
+					id: 'run-terminated',
+					status: 'failed',
+				} as never);
+				isRunCancellationRequested.mockImplementation(async (runId) => runId === 'run-terminated');
+
+				expectFreshRunStarted(await boardMove());
+			});
+
+			it('still refuses a dispatch that carries the terminated run id (issue #912)', async () => {
+				isRunCancellationRequested.mockImplementation(async (runId) => runId === 'run-terminated');
+
+				const outcome = await processJob(
+					createMockScmWebhookJob({ runId: 'run-terminated' }),
+					registryReturning(REVIEW_TRIGGER),
+				);
+
+				expect(phaseCalls).toEqual([]);
+				expect(outcome).toMatchObject({
+					status: 'phase-failed',
+					failureDiagnosis: { kind: 'user-terminated' },
+					cancelled: true,
+				});
+				expect(createRun).not.toHaveBeenCalled();
+			});
+		});
+
 		it('creates a fresh row when another retry wins the terminal-row claim', async () => {
 			getLatestRunForTask.mockResolvedValueOnce({ id: 'run-failed', status: 'failed' } as never);
 			resetRunToRunning.mockResolvedValueOnce(false);
