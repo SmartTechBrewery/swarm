@@ -740,10 +740,16 @@ export function createMockAzureDevOpsCommentPayload(
  * A raw Azure DevOps `build.complete` body (`resourceVersion` 2.0 build shape). The
  * default is a **pull-request** build — `sourceBranch` is the merge ref and
  * `triggerInfo` names the pull request's own head; pass `branchBuild: true` for a
- * branch build, which carries neither.
+ * branch build, which carries neither, or `withoutTriggerInfo: true` for a
+ * pull-request build delivered with no `triggerInfo` at all (issue #1374).
  */
 export function createMockAzureDevOpsBuildPayload(
-	overrides: { id?: string; branchBuild?: boolean; build?: Record<string, unknown> } = {},
+	overrides: {
+		id?: string;
+		branchBuild?: boolean;
+		withoutTriggerInfo?: boolean;
+		build?: Record<string, unknown>;
+	} = {},
 ): Record<string, unknown> {
 	const pullRequestSource = {
 		sourceBranch: 'refs/pull/17/merge',
@@ -773,6 +779,7 @@ export function createMockAzureDevOpsBuildPayload(
 				definition: { id: 5, name: 'Web CI' },
 				project: { id: 'd3d3d3d3-eeee-ffff-aaaa-b4b4b4b4b4b4', name: 'Fiber' },
 				...(overrides.branchBuild ? branchSource : pullRequestSource),
+				...(overrides.withoutTriggerInfo ? { triggerInfo: undefined } : {}),
 				repository: {
 					id: 'c2c2c2c2-dddd-eeee-ffff-a3a3a3a3a3a3',
 					type: 'TfsGit',
