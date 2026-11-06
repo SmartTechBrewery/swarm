@@ -13,6 +13,8 @@ vi.mock('@/db/repositories/runsRepository.js', async (importOriginal) => ({
 	countMergedPullRequestsByRepository: vi.fn(),
 	// `prStatus`'s Review-run read (issue #1342).
 	getLatestCompletedReviewRunForPullRequest: vi.fn(),
+	// `closeMergedWorkItem`'s recorded-branch lookup (issue #1351); `undefined` decodes the branch.
+	findTaskIdForStoredTaskBranch: vi.fn(),
 	getRunLogsFromDb: vi.fn(),
 	getRunOutputEvents: vi.fn(),
 	markRunUserTerminated: vi.fn(),
@@ -123,6 +125,7 @@ vi.mock('@/dispatch/dispatcher.js', () => ({
 
 vi.mock('@/integrations/pm/registry.js', () => ({
 	getPMProvider: vi.fn(),
+	requireProjectPMProvider: vi.fn(),
 }));
 
 // Put back's WIP-slot release (issue #1185) has its own coverage in
@@ -265,7 +268,7 @@ import { getMembership, listAccessibleProjectIds } from '@/identity/membership-s
 import type { SwarmUser } from '@/identity/schema.js';
 import { DEFAULT_WORKER_SUPPORTED_PHASES } from '@/identity/worker.js';
 import { getWorker, getWorkers } from '@/identity/worker-service.js';
-import { getPMProvider } from '@/integrations/pm/registry.js';
+import { getPMProvider, requireProjectPMProvider } from '@/integrations/pm/registry.js';
 import { requireProjectSCMProvider } from '@/integrations/scm/registry.js';
 import {
 	type Checkpoint,
@@ -4589,6 +4592,191 @@ describe('runsRouter', () => {
 				scheduled: true,
 			});
 			expect(scheduleCoalescedDispatch).toHaveBeenCalledTimes(1);
+		});
+	});
+
+	// Issue #1351 — closing the work item behind a merged pull request.
+	describe('closeMergedWorkItem and previewCloseMergedWorkItem', () => {
+		const REPO = 'SmartTechBrewery/swarm';
+		const INPUT = { projectId: 'p1', repository: REPO, prNumber: 42 };
+		const getPullRequest = vi.fn();
+		const findWorkItemForArtifact = vi.fn();
+		const closeWorkItem = vi.fn();
+		const moveWorkItem = vi.fn();
+		const pullRequest = (overrides: Record<string, unknown> = {}) => ({
+			number: 42,
+			headBranch: 'issue-17',
+			headSha: 'abc123',
+			baseBranch: 'main',
+			baseSha: 'base',
+			mergeable: null,
+			authorLogin: 'someone',
+			state: 'closed',
+			merged: true,
+			...overrides,
+		});
+		const card = (overrides: Record<string, unknown> = {}) =>
+			createMockWorkItem({
+				id: 'card-17',
+				title: 'Ship it',
+				status: 'In review',
+				statusKey: 'inReview',
+				...overrides,
+			});
+
+		beforeEach(() => {
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(
+				createMockProjectRecord({ id: 'p1' }),
+			);
+			vi.mocked(getLatestCompletedReviewRunForPullRequest).mockReset().mockResolvedValue(undefined);
+			getPullRequest.mockReset().mockResolvedValue(pullRequest());
+			findWorkItemForArtifact
+				.mockReset()
+				.mockImplementation(async (artifact: { kind: string }) =>
+					artifact.kind === 'issue' ? card() : undefined,
+				);
+			closeWorkItem.mockReset().mockResolvedValue(undefined);
+			moveWorkItem.mockReset().mockResolvedValue(undefined);
+			vi.mocked(requireProjectSCMProvider).mockReturnValue({
+				type: 'github',
+				getPullRequest,
+			} as unknown as ReturnType<typeof requireProjectSCMProvider>);
+			vi.mocked(requireProjectPMProvider).mockReturnValue({
+				type: 'github-projects',
+				findWorkItemForArtifact,
+				closeWorkItem,
+				moveWorkItem,
+			} as unknown as ReturnType<typeof requireProjectPMProvider>);
+			vi.mocked(promoteDependencyWaits)
+				.mockReset()
+				.mockResolvedValue([
+					{ id: 'dispatch-1' } as Awaited<ReturnType<typeof promoteDependencyWaits>>[number],
+				]);
+		});
+
+		it('closes the open work item, moves it to done, and wakes the dependency waits', async () => {
+			const result = await caller.closeMergedWorkItem(INPUT);
+
+			expect(closeWorkItem).toHaveBeenCalledWith('card-17');
+			expect(moveWorkItem).toHaveBeenCalledWith('card-17', 'done');
+			expect(promoteDependencyWaits).toHaveBeenCalledWith('p1', 'operator');
+			expect(result).toMatchObject({
+				projectId: 'p1',
+				repository: REPO,
+				prNumber: 42,
+				workItem: { id: 'card-17', resolvedVia: 'task-issue' },
+				closed: true,
+				woken: 1,
+				wokenDispatchIds: ['dispatch-1'],
+			});
+			expect(getPullRequest).toHaveBeenCalledWith(expect.objectContaining({ repo: REPO }), 42);
+		});
+
+		it('previews the work item and its current status, changing nothing', async () => {
+			const preview = await caller.previewCloseMergedWorkItem(INPUT);
+
+			expect(preview).toMatchObject({
+				pullRequest: { state: 'closed', merged: true },
+				workItem: { id: 'card-17', status: 'In review', statusKey: 'inReview' },
+				wouldRefuse: null,
+			});
+			expect(preview.intendedChanges).toHaveLength(3);
+			expect(closeWorkItem).not.toHaveBeenCalled();
+			expect(moveWorkItem).not.toHaveBeenCalled();
+			expect(promoteDependencyWaits).not.toHaveBeenCalled();
+		});
+
+		it.each([
+			['an open pull request', { state: 'open', merged: false }],
+			['a pull request closed without merging', { state: 'closed', merged: false }],
+		])('refuses %s, in the preview and the real call alike', async (_label, prState) => {
+			getPullRequest.mockResolvedValue(pullRequest(prState));
+
+			const preview = await caller.previewCloseMergedWorkItem(INPUT);
+			expect(preview.wouldRefuse).toMatchObject({ code: 'PRECONDITION_FAILED' });
+			await expect(caller.closeMergedWorkItem(INPUT)).rejects.toThrowError(
+				expect.objectContaining(preview.wouldRefuse),
+			);
+			expect(closeWorkItem).not.toHaveBeenCalled();
+			expect(promoteDependencyWaits).not.toHaveBeenCalled();
+		});
+
+		it('refuses a work item that is already done', async () => {
+			findWorkItemForArtifact.mockResolvedValue(card({ status: 'Done', statusKey: 'done' }));
+
+			await expect(caller.closeMergedWorkItem(INPUT)).rejects.toThrowError(
+				expect.objectContaining({
+					code: 'PRECONDITION_FAILED',
+					message: expect.stringMatching(/already done/),
+				}),
+			);
+			expect(closeWorkItem).not.toHaveBeenCalled();
+			expect(moveWorkItem).not.toHaveBeenCalled();
+			expect(promoteDependencyWaits).not.toHaveBeenCalled();
+		});
+
+		it('refuses a merged pull request no work item backs as not found', async () => {
+			findWorkItemForArtifact.mockResolvedValue(undefined);
+
+			await expect(caller.closeMergedWorkItem(INPUT)).rejects.toThrowError(
+				expect.objectContaining({ code: 'NOT_FOUND' }),
+			);
+			expect(closeWorkItem).not.toHaveBeenCalled();
+		});
+
+		it('reads a repository the project does not own as not found, asking no provider', async () => {
+			await expect(
+				caller.closeMergedWorkItem({ ...INPUT, repository: 'acme/elsewhere' }),
+			).rejects.toThrowError(expect.objectContaining({ code: 'NOT_FOUND' }));
+			expect(getPullRequest).not.toHaveBeenCalled();
+			expect(closeWorkItem).not.toHaveBeenCalled();
+		});
+
+		it('fails, closing nothing, when the provider read fails', async () => {
+			getPullRequest.mockRejectedValue(new Error('rate limited'));
+
+			await expect(caller.closeMergedWorkItem(INPUT)).rejects.toThrowError(
+				expect.objectContaining({ code: 'INTERNAL_SERVER_ERROR' }),
+			);
+			expect(closeWorkItem).not.toHaveBeenCalled();
+		});
+
+		it('reports a failed board write as an internal failure', async () => {
+			closeWorkItem.mockRejectedValue(new Error('board refused'));
+
+			await expect(caller.closeMergedWorkItem(INPUT)).rejects.toThrowError(
+				expect.objectContaining({
+					code: 'INTERNAL_SERVER_ERROR',
+					message: expect.stringMatching(/board refused/),
+				}),
+			);
+			expect(promoteDependencyWaits).not.toHaveBeenCalled();
+		});
+
+		it.each([
+			['contributor', 'FORBIDDEN'],
+			[undefined, 'NOT_FOUND'],
+		] as const)('refuses a %s caller with %s before any read', async (role, code) => {
+			const ordinary = runsRouter.createCaller({ user: ORDINARY_USER });
+			vi.mocked(findProjectRecordByIdFromDb).mockClear();
+			vi.mocked(getMembership).mockResolvedValue(role ? membershipFor(role) : undefined);
+
+			await expect(ordinary.closeMergedWorkItem(INPUT)).rejects.toThrowError(
+				expect.objectContaining({ code }),
+			);
+			await expect(ordinary.previewCloseMergedWorkItem(INPUT)).rejects.toThrowError(
+				expect.objectContaining({ code }),
+			);
+			expect(findProjectRecordByIdFromDb).not.toHaveBeenCalled();
+			expect(closeWorkItem).not.toHaveBeenCalled();
+		});
+
+		it('closes for a project member', async () => {
+			const ordinary = runsRouter.createCaller({ user: ORDINARY_USER });
+			vi.mocked(getMembership).mockResolvedValue(membershipFor('member'));
+
+			await expect(ordinary.closeMergedWorkItem(INPUT)).resolves.toMatchObject({ closed: true });
+			expect(closeWorkItem).toHaveBeenCalledTimes(1);
 		});
 	});
 

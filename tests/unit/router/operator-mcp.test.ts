@@ -23,6 +23,7 @@ const {
 	getLatestCompletedReviewRunForPullRequest,
 	countRunsByStatusAndPhase,
 	countMergedPullRequestsByRepository,
+	findTaskIdForStoredTaskBranch,
 } = vi.hoisted(() => ({
 	listRunsFromDb: vi.fn(),
 	getRunByIdFromDb: vi.fn(),
@@ -33,6 +34,8 @@ const {
 	getLatestCompletedReviewRunForPullRequest: vi.fn(),
 	countRunsByStatusAndPhase: vi.fn(),
 	countMergedPullRequestsByRepository: vi.fn(),
+	// The recorded-branch lookup behind `work_item_close` (issue #1351).
+	findTaskIdForStoredTaskBranch: vi.fn(),
 }));
 vi.mock('@/db/repositories/runsRepository.js', async () => ({
 	...(await vi.importActual<typeof import('@/db/repositories/runsRepository.js')>(
@@ -47,6 +50,7 @@ vi.mock('@/db/repositories/runsRepository.js', async () => ({
 	getLatestCompletedReviewRunForPullRequest,
 	countRunsByStatusAndPhase,
 	countMergedPullRequestsByRepository,
+	findTaskIdForStoredTaskBranch,
 }));
 // The review-verdict ledger read and the project record read behind `pr_status` and
 // `phase_agents_get` (issue #1342); the ledger's pure cap predicates stay real.
@@ -237,6 +241,7 @@ import {
 	createMockPmWebhookJob,
 	createMockProjectConfig,
 	createMockProjectRecord,
+	createMockWorkItem,
 } from '../../helpers/factories.js';
 
 function user(id: string, identifier: string, instanceAdmin: boolean): SwarmUser {
@@ -450,6 +455,8 @@ beforeEach(() => {
 	requireProjectSCMProvider.mockReset();
 	createAndPublishDispatch.mockReset();
 	scheduleCoalescedDispatch.mockReset().mockResolvedValue(undefined);
+	findTaskIdForStoredTaskBranch.mockReset().mockResolvedValue(undefined);
+	requireProjectPMProvider.mockReset();
 });
 
 afterEach(() => {
@@ -571,6 +578,7 @@ describe('operator MCP — the handshake', () => {
 			'pr_force_re_review',
 			'pr_recheck_mergeability',
 			'run_reset',
+			'work_item_close',
 		];
 
 		expect(tools.map((tool) => tool.name).sort()).toEqual([
@@ -592,6 +600,7 @@ describe('operator MCP — the handshake', () => {
 			'run_get',
 			'run_reset',
 			'runs_list',
+			'work_item_close',
 			'workers_state',
 		]);
 		for (const tool of tools) {
@@ -2350,5 +2359,140 @@ describe('operator MCP — cli_rate_limit_set', () => {
 		expect(listActiveCliRateLimitsForWorkers).not.toHaveBeenCalled();
 		expect(extendWorkerCliRateLimits).not.toHaveBeenCalled();
 		expect(auditRow()).toMatchObject({ outcome: 'refused', projectId: null, dryRun });
+	});
+});
+
+describe('operator MCP — work_item_close', () => {
+	const ARGS = { projectId: 'proj-a', repository: 'acme/widgets', prNumber: 508 };
+	const getPullRequest = vi.fn();
+	const findWorkItemForArtifact = vi.fn();
+	const closeWorkItem = vi.fn();
+	const moveWorkItem = vi.fn();
+
+	function pullRequest(overrides: Record<string, unknown> = {}) {
+		return {
+			number: 508,
+			headBranch: 'issue-17',
+			headSha: 'head',
+			baseBranch: 'main',
+			baseSha: 'base',
+			mergeable: null,
+			authorLogin: 'someone',
+			state: 'closed',
+			merged: true,
+			...overrides,
+		};
+	}
+
+	beforeEach(() => {
+		findProjectRecordByIdFromDb.mockResolvedValue(
+			createMockProjectRecord({ id: 'proj-a', repositories: [{ repo: 'acme/widgets' }] }),
+		);
+		getPullRequest.mockReset().mockResolvedValue(pullRequest());
+		findWorkItemForArtifact.mockReset().mockImplementation(async (artifact: { kind: string }) =>
+			artifact.kind === 'issue'
+				? createMockWorkItem({
+						id: 'card-17',
+						title: 'Ship it',
+						status: 'In review',
+						statusKey: 'inReview',
+					})
+				: undefined,
+		);
+		closeWorkItem.mockReset().mockResolvedValue(undefined);
+		moveWorkItem.mockReset().mockResolvedValue(undefined);
+		requireProjectSCMProvider.mockReturnValue({ type: 'github', getPullRequest });
+		requireProjectPMProvider.mockReturnValue({
+			type: 'github-projects',
+			findWorkItemForArtifact,
+			closeWorkItem,
+			moveWorkItem,
+		});
+		promoteDependencyWaits.mockResolvedValue([{ id: 'dispatch-9' }]);
+	});
+
+	function auditRow() {
+		expect(recordOperatorAction).toHaveBeenCalledTimes(1);
+		expect(settleOperatorAction).toHaveBeenCalledTimes(1);
+		return {
+			...recordOperatorAction.mock.calls[0]?.[0],
+			...settleOperatorAction.mock.calls[0]?.[1],
+		};
+	}
+
+	it('answers a dry run with the resolved work item and its current status, closing nothing', async () => {
+		const result = await callTool(
+			'work_item_close',
+			{ ...ARGS, reason: 'checking', dryRun: true },
+			'driver-token',
+		);
+
+		expect(result.isError).toBeUndefined();
+		expect(result.structuredContent).toMatchObject({
+			dryRun: true,
+			preview: {
+				pullRequest: { state: 'closed', merged: true },
+				workItem: {
+					id: 'card-17',
+					title: 'Ship it',
+					status: 'In review',
+					statusKey: 'inReview',
+					resolvedVia: 'task-issue',
+				},
+				wouldRefuse: null,
+			},
+		});
+		expect(closeWorkItem).not.toHaveBeenCalled();
+		expect(moveWorkItem).not.toHaveBeenCalled();
+		expect(promoteDependencyWaits).not.toHaveBeenCalled();
+		expect(auditRow()).toMatchObject({
+			tool: 'work_item_close',
+			target: 'acme/widgets#508',
+			dryRun: true,
+			outcome: 'succeeded',
+			projectId: 'proj-a',
+		});
+	});
+
+	it('closes the work item, moves it to done and wakes the dependency waits for a member', async () => {
+		const result = await callTool(
+			'work_item_close',
+			{ ...ARGS, reason: 'the Closes reference was missed' },
+			'driver-token',
+		);
+
+		expect(result.isError).toBeUndefined();
+		expect(result.structuredContent).toMatchObject({
+			dryRun: false,
+			result: { workItem: { id: 'card-17' }, closed: true, woken: 1 },
+		});
+		expect(closeWorkItem).toHaveBeenCalledExactlyOnceWith('card-17');
+		expect(moveWorkItem).toHaveBeenCalledExactlyOnceWith('card-17', 'done');
+		expect(promoteDependencyWaits).toHaveBeenCalledExactlyOnceWith('proj-a', 'operator');
+		expect(auditRow()).toMatchObject({ dryRun: false, outcome: 'succeeded' });
+	});
+
+	it('refuses a pull request that is not merged, and audits the refusal', async () => {
+		getPullRequest.mockResolvedValue(pullRequest({ state: 'closed', merged: false }));
+
+		const result = await callTool('work_item_close', { ...ARGS, reason: 'trying' }, 'driver-token');
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toMatch(/^PRECONDITION_FAILED: .*without being merged/);
+		expect(closeWorkItem).not.toHaveBeenCalled();
+		expect(auditRow()).toMatchObject({ outcome: 'refused' });
+	});
+
+	it('refuses a contributor with FORBIDDEN before reading either provider', async () => {
+		const result = await callTool(
+			'work_item_close',
+			{ ...ARGS, reason: 'trying', dryRun: true },
+			'member-token',
+		);
+
+		expect(result.content[0]?.text).toMatch(/^FORBIDDEN: /);
+		expect(getPullRequest).not.toHaveBeenCalled();
+		expect(findWorkItemForArtifact).not.toHaveBeenCalled();
+		expect(auditRow()).toMatchObject({ outcome: 'refused', projectId: null });
 	});
 });

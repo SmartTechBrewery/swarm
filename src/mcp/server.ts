@@ -26,6 +26,7 @@ import { registerPullRequestTools } from './tools/pull-requests.js';
 import { registerRunActionTools } from './tools/run-actions.js';
 import { registerRunTools } from './tools/runs.js';
 import { registerStatsTools } from './tools/stats.js';
+import { registerWorkItemTools } from './tools/work-items.js';
 import { registerWorkerTools } from './tools/workers.js';
 
 /** The name an MCP client lists this server's tools under. */
@@ -52,6 +53,7 @@ export function createSwarmMcpServer(user: SwarmUser): McpServer {
 	registerPullRequestActionTools(server, user);
 	registerDependencyWaitTools(server, user);
 	registerPhaseAgentTools(server, user);
+	registerWorkItemTools(server, user);
 	registerCliRateLimitSetTools(server, user);
 	return server;
 }
