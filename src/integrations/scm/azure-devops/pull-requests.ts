@@ -274,6 +274,7 @@ function toPullRequestDetails(pr: AzureDevOpsPullRequest): PullRequestDetails {
 		// The identity GUID — the namespace `./personas.ts` resolves personas in.
 		authorLogin: pr.createdBy?.id ?? null,
 		state,
+		merged: pr.status === 'completed',
 	};
 }
 

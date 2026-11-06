@@ -116,6 +116,14 @@ export interface PullRequestDetails {
 	 * something that is already done (issue #772).
 	 */
 	state: 'open' | 'closed';
+	/**
+	 * Whether the pull request was merged — the half of a `closed` state that `state`
+	 * deliberately collapses away. Only ever `true` alongside `state: 'closed'`.
+	 * Read by the operator's `work_item_close` (issue #1351), which closes a work
+	 * item only behind a pull request that actually landed, never one declined or
+	 * abandoned.
+	 */
+	merged: boolean;
 }
 
 /** One CI check on a commit. */

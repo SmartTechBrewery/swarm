@@ -100,6 +100,7 @@ describe('azure devops pull-request reads', () => {
 				mergeable: true,
 				authorLogin: '11bb11bb-cc22-dd33-ee44-55ff55ff55ff',
 				state: 'open',
+				merged: false,
 			});
 			expect(requestedUrl(fetchMock).pathname).toBe(`${REPO_API}/pullrequests/17`);
 		});
@@ -118,11 +119,12 @@ describe('azure devops pull-request reads', () => {
 		});
 
 		it.each([
-			['completed', 'closed'],
-			['abandoned', 'closed'],
-		])('maps status %s to %s, with no mergeability once inactive', async (status, state) => {
+			['completed', 'closed', true],
+			['abandoned', 'closed', false],
+		])('maps status %s to %s (merged %s), with no mergeability once inactive', async (status, state, merged) => {
 			await expect(read({ status, mergeStatus: 'conflicts' })).resolves.toMatchObject({
 				state,
+				merged,
 				mergeable: null,
 			});
 		});

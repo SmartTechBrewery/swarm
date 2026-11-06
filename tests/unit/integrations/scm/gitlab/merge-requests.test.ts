@@ -86,6 +86,7 @@ describe('gitlab merge-request reads', () => {
 				mergeable: true,
 				authorLogin: 'human-dev',
 				state: 'open',
+				merged: false,
 			});
 			expect(requestedUrl(fetchMock)).toBe(`${GITLAB_API_BASE}${PROJECT_PATH}/merge_requests/17`);
 		});
@@ -93,14 +94,15 @@ describe('gitlab merge-request reads', () => {
 		// The contract's neutral pair, so a mergeability recheck can see that the merge
 		// request it is polling is already done (issue #772).
 		it.each([
-			'merged',
-			'closed',
-			'locked',
-		])('reports a %s merge request as closed', async (state) => {
+			['merged', true],
+			['closed', false],
+			['locked', false],
+		])('reports a %s merge request as closed, merged %s', async (state, merged) => {
 			fetchMock.mockResolvedValue(jsonResponse(createMockGitLabMergeRequestResponse({ state })));
 
 			await expect(scoped(() => getGitLabMergeRequest(REPO, 17))).resolves.toMatchObject({
 				state: 'closed',
+				merged,
 			});
 		});
 
@@ -568,6 +570,7 @@ describe('gitlab merge-request reads', () => {
 						mergeable: false,
 						authorLogin: 'human-dev',
 						state: 'open',
+						merged: false,
 					},
 				],
 			);

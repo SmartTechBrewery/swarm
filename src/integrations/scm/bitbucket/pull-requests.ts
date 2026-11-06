@@ -199,6 +199,7 @@ function toPullRequestDetails(pr: BitbucketPullRequest): PullRequestDetails {
 		// `OPEN` | `MERGED` | `DECLINED` | `SUPERSEDED` collapsed onto the contract's
 		// neutral pair, the same mapping `getBitbucketPullRequestMergeState` applies.
 		state: pr.state === 'OPEN' ? ('open' as const) : ('closed' as const),
+		merged: pr.state === 'MERGED',
 	};
 }
 
