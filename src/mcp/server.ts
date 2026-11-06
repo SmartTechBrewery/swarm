@@ -1,7 +1,8 @@
 /**
  * The operator MCP server (issue #1338) — what an MCP client connected to
  * `/operator/mcp` (`../router/operator-mcp.ts`) sees: a named server whose tools
- * read and, in later phases, act on the pipeline as the signed-in operator.
+ * read and act on the pipeline as the signed-in operator (every write through the
+ * audited framework in `./write-tool.ts`).
  *
  * One server is built per HTTP request, bound to the user that request's bearer
  * resolved to, so a tool never needs to look its caller up and two requests never
@@ -18,6 +19,7 @@ import { registerLogTools } from './tools/logs.js';
 import { registerPipelineTools } from './tools/pipeline.js';
 import { registerProjectConfigTools } from './tools/project-config.js';
 import { registerPullRequestTools } from './tools/pull-requests.js';
+import { registerRunActionTools } from './tools/run-actions.js';
 import { registerRunTools } from './tools/runs.js';
 import { registerStatsTools } from './tools/stats.js';
 import { registerWorkerTools } from './tools/workers.js';
@@ -42,5 +44,6 @@ export function createSwarmMcpServer(user: SwarmUser): McpServer {
 	registerProjectConfigTools(server, user);
 	registerStatsTools(server, user);
 	registerConsistencyTools(server, user);
+	registerRunActionTools(server, user);
 	return server;
 }
