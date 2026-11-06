@@ -243,6 +243,37 @@ describe('toWipUsage', () => {
 		expect(ticket).toMatchObject({ state: 'waiting-on-operator', operatorReason: 'failed' });
 	});
 
+	it('reads a board-driven run a user terminated as waiting on the operator to restart it (issue #1361)', () => {
+		const ticket = holder({
+			activity: [
+				makeActivity({
+					phase: 'implementation',
+					status: 'failed',
+					failureDiagnosisKind: 'user-terminated',
+					lastActivityAt: RECENTLY,
+				}),
+			],
+		});
+		expect(ticket).toMatchObject({ state: 'waiting-on-operator', operatorReason: 'terminated' });
+	});
+
+	it('reads a terminated pull request-driven run as failed, since a board move does not restart it', () => {
+		const ticket = holder({
+			slots: [makeSlot({ prNumber: '120' })],
+			activity: [
+				makeActivity({
+					taskId: '120',
+					prNumber: '120',
+					phase: 'review',
+					status: 'failed',
+					failureDiagnosisKind: 'user-terminated',
+					lastActivityAt: RECENTLY,
+				}),
+			],
+		});
+		expect(ticket).toMatchObject({ state: 'waiting-on-operator', operatorReason: 'failed' });
+	});
+
 	it('reads a failed run with its retry queued as waiting on the pipeline', () => {
 		const ticket = holder({
 			activity: [makeActivity({ status: 'failed' })],
