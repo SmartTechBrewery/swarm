@@ -109,6 +109,7 @@ vi.mock('@/dispatch/run-reset.js', async (importOriginal) => ({
 vi.mock('@/dispatch/force-re-review.js', async (importOriginal) => ({
 	...(await importOriginal<typeof import('@/dispatch/force-re-review.js')>()),
 	forceReReview: vi.fn(),
+	previewForceReReview: vi.fn(),
 }));
 
 vi.mock('@/dispatch/dispatcher.js', () => ({
@@ -117,6 +118,7 @@ vi.mock('@/dispatch/dispatcher.js', () => ({
 	createAndPublishDispatch: vi.fn(),
 	promoteDependencyWaits: vi.fn(),
 	publishDispatchWakeUp: vi.fn(),
+	scheduleCoalescedDispatch: vi.fn(),
 }));
 
 vi.mock('@/integrations/pm/registry.js', () => ({
@@ -247,8 +249,13 @@ import {
 	createAndPublishDispatch,
 	promoteDependencyWaits,
 	publishDispatchWakeUp,
+	scheduleCoalescedDispatch,
 } from '@/dispatch/dispatcher.js';
-import { ForceReReviewError, forceReReview } from '@/dispatch/force-re-review.js';
+import {
+	ForceReReviewError,
+	forceReReview,
+	previewForceReReview,
+} from '@/dispatch/force-re-review.js';
 import { ITEM_ACTIVITY_LOOKBACK_MS, ITEM_STALL_AFTER_MS } from '@/dispatch/item-liveness.js';
 import { jobContinuesPreservedCheckout } from '@/dispatch/preserved-worker.js';
 import { RunResetError, resetRun } from '@/dispatch/run-reset.js';
@@ -274,6 +281,10 @@ import {
 } from '@/queue/cancellation.js';
 import type { SwarmJob } from '@/queue/jobs.js';
 import { type QueuedRun, toQueuedRuns } from '@/queue/queued-runs.js';
+import {
+	buildConflictCheckJob,
+	conflictCheckCoalesceKey,
+} from '@/triggers/handlers/resolve-conflicts.js';
 import { reconcileTerminatedWorktree } from '@/worktree/termination-cleanup.js';
 import {
 	createMockPmEvent,
@@ -497,6 +508,8 @@ describe('runsRouter', () => {
 		vi.mocked(publishDispatchWakeUp).mockReset();
 		vi.mocked(resetRun).mockReset();
 		vi.mocked(forceReReview).mockReset();
+		vi.mocked(previewForceReReview).mockReset();
+		vi.mocked(scheduleCoalescedDispatch).mockReset();
 		vi.mocked(getWorker).mockReset();
 		vi.mocked(getWorkers).mockReset();
 		vi.mocked(getWorkers).mockResolvedValue([]);
@@ -4353,6 +4366,229 @@ describe('runsRouter', () => {
 			await expect(caller.forceReReview({ runId: 'run-1' })).rejects.toThrowError(
 				expect.objectContaining({ code: 'INTERNAL_SERVER_ERROR' }),
 			);
+		});
+	});
+
+	// Issue #1348 — the dry run of the operator MCP server's `pr_force_re_review`.
+	describe('previewForceReReview', () => {
+		const approvalRun = () =>
+			makeRun({
+				id: 'run-1',
+				status: 'completed',
+				phase: 'review',
+				prNumber: '508',
+				reviewOrdinal: 1,
+				reviewVerdict: 'approve',
+				reviewMergeOutcome: 'not-eligible',
+			});
+		const VERDICT = {
+			continuation: 'review' as const,
+			prNumber: '508',
+			reviewedHeadSha: 'cafebabe',
+			currentHeadSha: 'cafebabe',
+			pullRequestState: 'open' as const,
+			headMoved: false,
+			refusal: {
+				reason: 'head-unchanged' as const,
+				message: 'Cannot force a review for run "run-1" — PR #508 is still at cafebabe.',
+			},
+		};
+
+		it("reports the cap state, the head and the service's refusal as the real call's code", async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(approvalRun());
+			vi.mocked(previewForceReReview).mockResolvedValue(VERDICT);
+
+			const preview = await caller.previewForceReReview({ runId: 'run-1' });
+
+			expect(preview).toMatchObject({
+				run: { id: 'run-1', projectId: 'p1', phase: 'review', reviewVerdict: 'approve' },
+				continuation: 'review',
+				reviewedHeadSha: 'cafebabe',
+				currentHeadSha: 'cafebabe',
+				headMoved: false,
+				wouldRefuse: { code: 'PRECONDITION_FAILED', message: VERDICT.refusal.message },
+				intendedChanges: [],
+			});
+			expect(preview).toHaveProperty('reviewCapStop');
+			expect(preview).toHaveProperty('reviewCapSpent');
+			expect(preview).not.toHaveProperty('refusal');
+			expect(previewForceReReview).toHaveBeenCalledWith('run-1');
+			expect(forceReReview).not.toHaveBeenCalled();
+		});
+
+		it('lists the grant and the dispatch when nothing refuses', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(approvalRun());
+			vi.mocked(previewForceReReview).mockResolvedValue({
+				...VERDICT,
+				currentHeadSha: 'deadbeef',
+				headMoved: true,
+				refusal: null,
+			});
+
+			const preview = await caller.previewForceReReview({ runId: 'run-1' });
+
+			expect(preview.wouldRefuse).toBeNull();
+			expect(preview.intendedChanges[0]).toMatch(/^Grant PR #508 one review past the review cap/);
+			expect(preview.intendedChanges[1]).toMatch(/one Review of PR #508's current head deadbeef/);
+		});
+
+		it('reports a maintenance run as the refusal the real call gives, asking no service', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(
+				makeRun({ id: 'run-1', kind: 'worker-update', repository: null, taskId: null }),
+			);
+
+			const preview = await caller.previewForceReReview({ runId: 'run-1' });
+
+			expect(preview.wouldRefuse?.message).toMatch(/machine maintenance/);
+			expect(previewForceReReview).not.toHaveBeenCalled();
+		});
+
+		it('surfaces a service failure as INTERNAL_SERVER_ERROR', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(approvalRun());
+			vi.mocked(previewForceReReview).mockRejectedValue(new Error('provider down'));
+
+			await expect(caller.previewForceReReview({ runId: 'run-1' })).rejects.toThrowError(
+				expect.objectContaining({ code: 'INTERNAL_SERVER_ERROR' }),
+			);
+		});
+
+		it.each([
+			['contributor', 'FORBIDDEN'],
+			[undefined, 'NOT_FOUND'],
+		] as const)('refuses a %s caller with %s, asking no service', async (role, code) => {
+			const ordinary = runsRouter.createCaller({ user: ORDINARY_USER });
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(approvalRun());
+			vi.mocked(getMembership).mockResolvedValue(role ? membershipFor(role) : undefined);
+
+			await expect(ordinary.previewForceReReview({ runId: 'run-1' })).rejects.toThrowError(
+				expect.objectContaining({ code }),
+			);
+			expect(previewForceReReview).not.toHaveBeenCalled();
+			expect(listActiveReviewSlotsForPullRequest).not.toHaveBeenCalled();
+		});
+	});
+
+	// Issue #1348 — the conflict check a merged sibling's fan-out would have scheduled.
+	describe('recheckMergeability and previewMergeabilityRecheck', () => {
+		const REPO = 'SmartTechBrewery/swarm';
+		const INPUT = { projectId: 'p1', repository: REPO, prNumber: 42 };
+		const getPullRequest = vi.fn();
+		const pullRequest = (overrides: Record<string, unknown> = {}) => ({
+			number: 42,
+			headBranch: 'issue-42',
+			headSha: 'abc123',
+			baseBranch: 'develop',
+			baseSha: 'base',
+			mergeable: false,
+			authorLogin: 'someone',
+			state: 'open',
+			...overrides,
+		});
+
+		beforeEach(() => {
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(
+				createMockProjectRecord({ id: 'p1' }),
+			);
+			getPullRequest.mockReset().mockResolvedValue(pullRequest());
+			vi.mocked(requireProjectSCMProvider).mockReturnValue({
+				type: 'github',
+				getPullRequest,
+			} as unknown as ReturnType<typeof requireProjectSCMProvider>);
+			vi.mocked(scheduleCoalescedDispatch).mockResolvedValue(undefined);
+		});
+
+		const EXPECTED_JOB = buildConflictCheckJob({
+			providerId: 'github',
+			projectId: 'p1',
+			repo: REPO,
+			prNumber: '42',
+			baseBranch: 'develop',
+		});
+		const EXPECTED_KEY = conflictCheckCoalesceKey(REPO, '42', 'develop');
+
+		it("schedules exactly one fan-out conflict check under its coalesce key, on the PR's own base", async () => {
+			const result = await caller.recheckMergeability(INPUT);
+
+			expect(scheduleCoalescedDispatch).toHaveBeenCalledTimes(1);
+			expect(scheduleCoalescedDispatch).toHaveBeenCalledWith(EXPECTED_JOB, EXPECTED_KEY, 0, null);
+			expect(EXPECTED_KEY).toBe(`resolve-conflicts:${REPO}:42:develop`);
+			expect(result).toEqual({
+				projectId: 'p1',
+				repository: REPO,
+				prNumber: 42,
+				baseBranch: 'develop',
+				coalesceKey: EXPECTED_KEY,
+				scheduled: true,
+			});
+			expect(getPullRequest).toHaveBeenCalledWith(expect.objectContaining({ repo: REPO }), 42);
+		});
+
+		it('previews the job and the live mergeability, scheduling nothing', async () => {
+			const plan = await caller.previewMergeabilityRecheck(INPUT);
+
+			expect(plan).toMatchObject({
+				pullRequest: { state: 'open', mergeable: false, baseBranch: 'develop', headSha: 'abc123' },
+				coalesceKey: EXPECTED_KEY,
+				job: EXPECTED_JOB,
+				wouldRefuse: null,
+			});
+			expect(plan.intendedChanges).toHaveLength(2);
+			expect(scheduleCoalescedDispatch).not.toHaveBeenCalled();
+		});
+
+		it('refuses a closed pull request, in the preview and the real call alike', async () => {
+			getPullRequest.mockResolvedValue(pullRequest({ state: 'closed' }));
+
+			const plan = await caller.previewMergeabilityRecheck(INPUT);
+			expect(plan.wouldRefuse).toMatchObject({ code: 'PRECONDITION_FAILED' });
+			await expect(caller.recheckMergeability(INPUT)).rejects.toThrowError(
+				expect.objectContaining(plan.wouldRefuse),
+			);
+			expect(scheduleCoalescedDispatch).not.toHaveBeenCalled();
+		});
+
+		it('reads a repository the project does not own as not found, asking no provider', async () => {
+			await expect(
+				caller.recheckMergeability({ ...INPUT, repository: 'acme/elsewhere' }),
+			).rejects.toThrowError(expect.objectContaining({ code: 'NOT_FOUND' }));
+			expect(getPullRequest).not.toHaveBeenCalled();
+			expect(scheduleCoalescedDispatch).not.toHaveBeenCalled();
+		});
+
+		it('fails, scheduling nothing, when the provider read fails', async () => {
+			getPullRequest.mockRejectedValue(new Error('rate limited'));
+
+			await expect(caller.recheckMergeability(INPUT)).rejects.toThrowError(
+				expect.objectContaining({ code: 'INTERNAL_SERVER_ERROR' }),
+			);
+			expect(scheduleCoalescedDispatch).not.toHaveBeenCalled();
+		});
+
+		it.each([
+			['contributor', 'FORBIDDEN'],
+			[undefined, 'NOT_FOUND'],
+		] as const)('refuses a %s caller with %s before any read', async (role, code) => {
+			const ordinary = runsRouter.createCaller({ user: ORDINARY_USER });
+			vi.mocked(getMembership).mockResolvedValue(role ? membershipFor(role) : undefined);
+
+			await expect(ordinary.recheckMergeability(INPUT)).rejects.toThrowError(
+				expect.objectContaining({ code }),
+			);
+			await expect(ordinary.previewMergeabilityRecheck(INPUT)).rejects.toThrowError(
+				expect.objectContaining({ code }),
+			);
+			expect(findProjectRecordByIdFromDb).not.toHaveBeenCalled();
+			expect(scheduleCoalescedDispatch).not.toHaveBeenCalled();
+		});
+
+		it('schedules for a project member', async () => {
+			const ordinary = runsRouter.createCaller({ user: ORDINARY_USER });
+			vi.mocked(getMembership).mockResolvedValue(membershipFor('member'));
+
+			await expect(ordinary.recheckMergeability(INPUT)).resolves.toMatchObject({
+				scheduled: true,
+			});
+			expect(scheduleCoalescedDispatch).toHaveBeenCalledTimes(1);
 		});
 	});
 

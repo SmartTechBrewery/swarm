@@ -124,7 +124,8 @@ update the client's header.
 
 Treat the token like a password: it reads everything your account can read in the
 dashboard, including run logs and agent output, and it can reset and re-dispatch
-runs, and wake dependency waits, in every project where you hold `member`.
+runs, force re-reviews, schedule conflict checks and wake dependency waits in
+every project where you hold `member`.
 
 ### Using the `swarm login` session instead
 
@@ -253,13 +254,26 @@ the same way:
 | --- | --- | --- |
 | `run_reset` | **Destructive.** Resets a wedged run and restarts its phase from scratch, as the dashboard's **Reset & restart** and `swarm run reset` do (`runs.reset`). It stops the run's live agent, cancels its active dispatch (even one a worker has claimed), clears its cancellation flag, tears down its checkout and discards uncommitted and unpushed work, and clears its recovery record. Then it re-dispatches the phase as a fresh first attempt. A run with no stored payload, or whose project is gone, is settled `failed` instead (`outcome: 'terminated'`). Refused only for an unknown run, a machine-maintenance run, or a reset already under way | `runId`, `reason`, `dryRun` (default `false`) |
 | `dispatch_redispatch_now` | Re-dispatches a `deferred`, `checkpointed` or `failed` run immediately, as the dashboard's **Retry now** does (`runs.retryNow`). It re-opens the run's waiting dispatch for an immediate attempt, superseding a scheduled automatic retry. A dispatch whose worker lease has lapsed is taken back first. A run with no dispatch gets a fresh one built from its stored payload. Retry budgets start again from zero. Refused for any other status, for a run a worker is executing, and for a run with neither a dispatch nor a stored payload | `runId`, `reason`, `dryRun` (default `false`) |
+| `pr_force_re_review` | Continues a pull request the review-verdict cap stopped, as the run page's **Force re-review** does (`runs.forceReReview`). For a Review run whose last permitted verdict requested changes, it grants the pull request one review past the cap and dispatches Respond-to-review for that review; the follow-up Review spends the grant. For a completed Review run that **approved** when the allowance was spent, and whose merge automation refused because a later push moved the head, it grants one review and dispatches a Review of the current head. A forced dispatch already live for the same head is reported, not duplicated. Refused with `PRECONDITION_FAILED` when the head has not moved since that approval (`head-unchanged`: the merge was refused for another reason, which the run's merge result names), for a closed pull request, for a run the cap did not stop, and when the phase it would dispatch is disabled for the project. The dry run (`runs.previewForceReReview`) reports the run's cap state as `run_get` shows it (`reviewCapStop`, `reviewCapSpent`, `reviewCapOverrideOutstanding`), the `continuation` it would start, `reviewedHeadSha` and the pull request's `currentHeadSha` and `pullRequestState` read from its provider, `headMoved`, and `wouldRefuse` | `runId`, `reason`, `dryRun` (default `false`) |
+| `pr_recheck_mergeability` | Schedules the per-PR conflict check that the resolve-conflicts fan-out schedules for each open pull request when a sibling merges (`runs.recheckMergeability`). Use it when that fan-out skipped this pull request. The check is keyed on the pull request's own base, read from its provider, and is due now. A check already pending for the same pull request and base is superseded rather than duplicated. The check reads mergeability and dispatches Resolve-conflicts only when the pull request genuinely conflicts, with all of that phase's own gates. Refused for a closed pull request and for a repository the project does not configure. The dry run (`runs.previewMergeabilityRecheck`) reports the pull request's current `state`, `headSha`, `baseBranch` and `mergeable` (`null` while the provider is still computing it), the `coalesceKey` and the `job` it would schedule, and `wouldRefuse` | `projectId`, `repository` (as the project configures it), `prNumber`, `reason`, `dryRun` (default `false`) |
 | `dependency_waits_wake` | Wakes every dispatch in the project waiting on the dependency gate now, instead of at its next re-check (`SWARM_DEPENDENCY_RECHECK_MS`) — the same wake a merge or a board card reaching Done triggers on its own (`runs.wakeDependencyWaits`, logged with cause `operator`). The gate re-reads the blockers, so a dependent still blocked simply waits again, and the wake spends no attempt its re-check would not have. Returns `{ projectId, woken, dispatches }`, each dispatch with `dispatchId`, `phase`, `repository`, `taskId`, `prNumber`, `runId`, `attempt` and `availableAt`. A dispatch it could not wake is logged, left on its re-check, and not listed. The dry run (`runs.previewDependencyWake`) returns `{ projectId, wouldWake, dispatches }`: the waits it would wake, in the same shape | `projectId`, `reason`, `dryRun` (default `false`) |
 | `cli_rate_limit_set` | Keeps one agent CLI off a worker until `until` or for `durationMinutes` (`workers.setCliRateLimit`): the same `worker_cli_rate_limits` cool-down SWARM records when a run reports a spent allowance, so routing, the Workers screen and `cli_rate_limits` treat it exactly like an observed one, and it lapses by itself at its expiry. `scope: 'owner'` applies it to every worker the named worker's owner operates: SWARM records no CLI-account identity, so one user's machines stand in for "the same CLI account" (a subscription is usually signed in on all of them). **Extend only**: a machine whose live cool-down on that CLI already lasts at least as long is left `unchanged`, so nothing a real run recorded is ever shortened, and nothing is cleared early. Refused with `BAD_REQUEST` unless exactly one of `until`/`durationMinutes` is given, in the future, and at most eight days ahead (`MAX_CLI_COOLDOWN_MS`, the ceiling an observed reset has). Returns `{ cli, scope, requestedExpiresAt, resetHint, workers }`, each worker with `workerId`, `displayName`, `currentExpiresAt`, `newExpiresAt` and `change` (`create`, `extend` or `unchanged`). The dry run (`workers.previewCliRateLimit`) returns the same shape without writing | `workerId`, `cli`, `until?`, `durationMinutes?`, `resetHint?`, `scope` (`worker` or `owner`, default `worker`), `reason`, `dryRun` (default `false`) |
 
-`run_reset` and `dispatch_redispatch_now` need `member` on the run's project, the role that drives runs in the
+`run_reset`, `dispatch_redispatch_now`, `pr_force_re_review` and
+`pr_recheck_mergeability` need `member` on the project, the role that drives runs in the
 dashboard. A contributor can read the run but gets `FORBIDDEN`. Anyone else gets
-`NOT_FOUND`. Their dry run is the `runs.previewAction` procedure, which is gated at
-`member` too.
+`NOT_FOUND`. Each dry run is gated at `member` too: `runs.previewAction` for
+`run_reset` and `dispatch_redispatch_now`, `runs.previewForceReReview` and
+`runs.previewMergeabilityRecheck` for the two pull-request tools. Both
+pull-request tools ask the source-control provider for the pull request, dry run
+included; a provider read that fails is reported as `INTERNAL_SERVER_ERROR` and
+audited `failed`. `pr_force_re_review`'s dry run reads the head even where the real
+call would not need it, and leaves `currentHeadSha` and `headMoved` `null` when
+that extra read fails.
+
+`pr_force_re_review` and `pr_recheck_mergeability` replace the local
+`force-re-review` and `recheck-conflicts` operator scripts, with a reason, a dry
+run and an audit record.
 
 `dispatch_redispatch_now` takes a run. A dispatch with no run yet, such as a
 board dispatch waiting on its dependencies, is not something it can re-dispatch;
@@ -297,6 +311,7 @@ gated exactly like the write, which runs first on every call and answers the dry
 run, and an `apply`, which is the dashboard mutation. The framework adds `reason`
 and `dryRun` and writes the `operator_actions` row
 (`src/db/repositories/operatorActionsRepository.ts`). The run tools live in
-`src/mcp/tools/run-actions.ts`, `dependency_waits_wake` in
+`src/mcp/tools/run-actions.ts`, the pull-request tools in
+`src/mcp/tools/pr-actions.ts`, `dependency_waits_wake` in
 `src/mcp/tools/dependency-waits.ts`, and `cli_rate_limit_set` in
 `src/mcp/tools/cli-rate-limit-set.ts`.

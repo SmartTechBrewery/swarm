@@ -2134,7 +2134,10 @@ draining or cooling on a CLI's usage limit, where a pull request stands on
 merge automation and the review-verdict cap, and how a phase's agents are
 configured, with exactly your dashboard access — plus the control plane's own
 recent log lines. It can also act: reset a wedged run, re-dispatch a run's
-waiting dispatch now, or wake a project's dependency-waiting dispatches. Every such write tool takes a mandatory `reason` and a
+waiting dispatch now, wake a project's dependency-waiting dispatches, force a
+re-review past the review-verdict cap, or re-check a pull request's mergeability
+so Resolve-conflicts runs where a merge's fan-out skipped it. Every such write
+tool takes a mandatory `reason` and a
 `dryRun`, and every call is recorded in the `operator_actions` audit table.
 How to connect one, and the tool catalogue: [`docs/mcp.md`](./mcp.md).
 
