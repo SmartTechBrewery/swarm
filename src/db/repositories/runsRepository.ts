@@ -19,6 +19,7 @@ import {
 	and,
 	asc,
 	count,
+	countDistinct,
 	desc,
 	eq,
 	gt,
@@ -2479,6 +2480,92 @@ export async function countRunsSettledSinceByStatus(
 		.where(and(eq(runs.projectId, projectId), gte(runs.completedAt, since)))
 		.groupBy(runs.status);
 	return Object.fromEntries(rows.map((row) => [row.status, row.total]));
+}
+
+/**
+ * The period {@link countRunsByStatusAndPhase} and
+ * {@link countMergedPullRequestsByRepository} count over (issue #1345): `since`
+ * inclusive, `until` exclusive, the same half-open bounds `runs.list`'s time filters use.
+ */
+export interface RunStatsRange {
+	since: Date;
+	until: Date;
+}
+
+/** How many of one project's runs a period holds, by status and by phase (issue #1345). */
+export interface RunStatusAndPhaseCounts {
+	byStatus: Record<string, number>;
+	byPhase: Record<string, number>;
+}
+
+/**
+ * How many of one project's pipeline runs **started** in `range`, by the status
+ * each is in now and by its phase (issue #1345) — the operator MCP server's
+ * `pipeline_stats` tool, through `runs.stats`. One grouped query over
+ * `(status, phase)`, folded into the two tallies here, so both always count the
+ * same rows. Keyed on `started_at` because every run has one and a retry never
+ * moves it, so a run lands in exactly one period however often it settles.
+ * Maintenance runs (`kind <> 'pipeline'`, issue #971) are not pipeline work and are
+ * left out. A status or phase no run had is absent rather than zero.
+ */
+export async function countRunsByStatusAndPhase(
+	projectId: string,
+	range: RunStatsRange,
+): Promise<RunStatusAndPhaseCounts> {
+	const rows = await getDb()
+		.select({ status: runs.status, phase: runs.phase, total: count() })
+		.from(runs)
+		.where(
+			and(
+				eq(runs.kind, PIPELINE_RUN_KIND),
+				eq(runs.projectId, projectId),
+				gte(runs.startedAt, range.since),
+				lt(runs.startedAt, range.until),
+			),
+		)
+		.groupBy(runs.status, runs.phase);
+	const byStatus: Record<string, number> = {};
+	const byPhase: Record<string, number> = {};
+	for (const row of rows) {
+		byStatus[row.status] = (byStatus[row.status] ?? 0) + row.total;
+		byPhase[row.phase] = (byPhase[row.phase] ?? 0) + row.total;
+	}
+	return { byStatus, byPhase };
+}
+
+/**
+ * How many distinct pull requests of one project SWARM's merge automation merged
+ * in `range`, per repository (issue #1345). "Merged" is the outcome the durable
+ * merge dispatch records on the approving Review run (`review_merge_outcome =
+ * 'merged'`), so a pull request a human merged is not counted. The row records no
+ * merge instant, so the period is keyed on that Review run's `completed_at` — the
+ * approval the merge followed. A pull request is counted once per repository
+ * however many of its Review runs carry the outcome. A repository with no merge is
+ * absent rather than zero.
+ */
+export async function countMergedPullRequestsByRepository(
+	projectId: string,
+	range: RunStatsRange,
+): Promise<Record<string, number>> {
+	const rows = await getDb()
+		.select({ repository: runs.repository, total: countDistinct(runs.prNumber) })
+		.from(runs)
+		.where(
+			and(
+				eq(runs.kind, PIPELINE_RUN_KIND),
+				eq(runs.projectId, projectId),
+				eq(runs.phase, 'review'),
+				eq(runs.reviewMergeOutcome, 'merged'),
+				isNotNull(runs.repository),
+				isNotNull(runs.prNumber),
+				gte(runs.completedAt, range.since),
+				lt(runs.completedAt, range.until),
+			),
+		)
+		.groupBy(runs.repository);
+	return Object.fromEntries(
+		rows.flatMap((row) => (row.repository === null ? [] : [[row.repository, row.total]])),
+	);
 }
 
 /** Resolve a single run by its id. Returns `undefined` when unknown. */

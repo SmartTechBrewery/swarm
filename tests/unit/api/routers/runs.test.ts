@@ -8,6 +8,9 @@ vi.mock('@/db/repositories/runsRepository.js', async (importOriginal) => ({
 	listRunsFromDb: vi.fn(),
 	listTaskActivitySince: vi.fn(),
 	getRunByIdFromDb: vi.fn(),
+	// `stats`'s two grouped counts (issue #1345).
+	countRunsByStatusAndPhase: vi.fn(),
+	countMergedPullRequestsByRepository: vi.fn(),
 	// `prStatus`'s Review-run read (issue #1342).
 	getLatestCompletedReviewRunForPullRequest: vi.fn(),
 	getRunLogsFromDb: vi.fn(),
@@ -214,6 +217,8 @@ import {
 } from '@/db/repositories/reviewVerdictsRepository.js';
 import {
 	cancelDeferredRunInDb,
+	countMergedPullRequestsByRepository,
+	countRunsByStatusAndPhase,
 	getLatestCompletedReviewRunForPullRequest,
 	getRunByIdFromDb,
 	getRunLogsFromDb,
@@ -2783,6 +2788,72 @@ describe('runsRouter', () => {
 			);
 			expect(getLatestCompletedReviewRunForPullRequest).not.toHaveBeenCalled();
 			expect(listActiveReviewSlotsForPullRequest).not.toHaveBeenCalled();
+		});
+	});
+
+	describe('stats (issue #1345)', () => {
+		const SINCE = '2026-11-01T00:00:00.000Z';
+		const UNTIL = '2026-11-06T00:00:00.000Z';
+
+		beforeEach(() => {
+			vi.mocked(countRunsByStatusAndPhase)
+				.mockReset()
+				.mockResolvedValue({
+					byStatus: { completed: 4, failed: 1 },
+					byPhase: { implementation: 2, review: 3 },
+				});
+			vi.mocked(countMergedPullRequestsByRepository)
+				.mockReset()
+				.mockResolvedValue({ 'SmartTechBrewery/swarm': 2 });
+		});
+
+		it('returns both tallies and the period counted', async () => {
+			await expect(caller.stats({ projectId: 'p1', since: SINCE, until: UNTIL })).resolves.toEqual({
+				runsByStatus: { completed: 4, failed: 1 },
+				runsByPhase: { implementation: 2, review: 3 },
+				mergedPrsByRepository: { 'SmartTechBrewery/swarm': 2 },
+				since: SINCE,
+				until: UNTIL,
+			});
+			const range = { since: new Date(SINCE), until: new Date(UNTIL) };
+			expect(countRunsByStatusAndPhase).toHaveBeenCalledWith('p1', range);
+			expect(countMergedPullRequestsByRepository).toHaveBeenCalledWith('p1', range);
+		});
+
+		it('ends the period now when `until` is omitted', async () => {
+			const before = Date.now();
+			const result = await caller.stats({ projectId: 'p1', since: SINCE });
+			const until = Date.parse(result.until);
+			expect(until).toBeGreaterThanOrEqual(before);
+			expect(until).toBeLessThanOrEqual(Date.now());
+		});
+
+		it('refuses a period that ends before it starts, reading nothing', async () => {
+			await expect(
+				caller.stats({ projectId: 'p1', since: UNTIL, until: SINCE }),
+			).rejects.toThrowError(expect.objectContaining({ code: 'BAD_REQUEST' }));
+			expect(countRunsByStatusAndPhase).not.toHaveBeenCalled();
+		});
+
+		it('lets a contributor of the project read it', async () => {
+			vi.mocked(getMembership).mockResolvedValue(membershipFor('contributor'));
+			const contributor = runsRouter.createCaller({ user: ORDINARY_USER });
+
+			await expect(contributor.stats({ projectId: 'p1', since: SINCE })).resolves.toMatchObject({
+				runsByStatus: { completed: 4, failed: 1 },
+			});
+			expect(getMembership).toHaveBeenCalledWith(ORDINARY_USER.id, 'p1');
+		});
+
+		it('denies a non-member with NOT_FOUND before counting anything', async () => {
+			vi.mocked(getMembership).mockResolvedValue(undefined);
+			const ordinary = runsRouter.createCaller({ user: ORDINARY_USER });
+
+			await expect(ordinary.stats({ projectId: 'p1', since: SINCE })).rejects.toThrowError(
+				expect.objectContaining({ code: 'NOT_FOUND' }),
+			);
+			expect(countRunsByStatusAndPhase).not.toHaveBeenCalled();
+			expect(countMergedPullRequestsByRepository).not.toHaveBeenCalled();
 		});
 	});
 

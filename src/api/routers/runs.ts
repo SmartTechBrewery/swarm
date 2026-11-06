@@ -38,6 +38,8 @@ import {
 } from '../../db/repositories/reviewVerdictsRepository.js';
 import {
 	cancelDeferredRunInDb,
+	countMergedPullRequestsByRepository,
+	countRunsByStatusAndPhase,
 	getLatestCompletedReviewRunForPullRequest,
 	getRunByIdFromDb,
 	getRunLogsFromDb,
@@ -465,6 +467,39 @@ const DispatchHistoryInputSchema = DispatchHistoryInputFields.refine(
 	(input) => input.taskId !== undefined || input.prNumber !== undefined,
 	{ message: 'Name a taskId or a prNumber.' },
 );
+
+/**
+ * `runs.stats`'s input fields (issue #1345), held unrefined so the MCP
+ * `pipeline_stats` tool can re-use the shape; the procedure adds the "the period
+ * must not end before it starts" rule on top ({@link PipelineStatsInputSchema}).
+ * `until` defaults to the moment the procedure runs.
+ */
+export const PipelineStatsInputFields = z.object({
+	projectId: z.string().min(1),
+	since: IsoInstant,
+	until: IsoInstant.optional(),
+});
+
+const PipelineStatsInputSchema = PipelineStatsInputFields.refine(
+	(input) => input.until === undefined || Date.parse(input.until) >= Date.parse(input.since),
+	{ message: '`until` must not be earlier than `since`.', path: ['until'] },
+);
+
+/**
+ * One project's run and merge counts for a period (issue #1345) — `runs.stats`,
+ * the operator MCP server's `pipeline_stats`. Every key absent from a tally had
+ * nothing to count. `since`/`until` are the period actually counted, as ISO 8601.
+ */
+export interface PipelineStats {
+	/** Pipeline runs started in the period, by the status each is in now. */
+	runsByStatus: Record<string, number>;
+	/** The same runs, by phase. */
+	runsByPhase: Record<string, number>;
+	/** Distinct pull requests merge automation merged in the period, per repository. */
+	mergedPrsByRepository: Record<string, number>;
+	since: string;
+	until: string;
+}
 
 type ListRunsInput = z.infer<typeof ListRunsInputSchema>;
 
@@ -2105,6 +2140,37 @@ export const runsRouter = router({
 		.query(async ({ ctx, input }): Promise<PipelineSnapshot> => {
 			await assertProjectAccess(ctx.user, input.projectId, 'contributor');
 			return loadPipelineSnapshot(input.projectId, input.windowHours);
+		}),
+
+	// One project's run and merge counts for a period (issue #1345) — the read
+	// behind the operator MCP server's `pipeline_stats` tool. Two grouped counts in
+	// the runs repository, Postgres only: runs started in `[since, until)` by status
+	// and by phase, and distinct pull requests merge automation merged in it per
+	// repository. `until` defaults to now and is echoed back, so the caller sees the
+	// period actually counted.
+	//
+	// Authorization is `pipelineSnapshot`'s: contributor access to the one project,
+	// a non-member reading it as not found, and no installation-wide form. Not part
+	// of `runReadProcedures`, so the operator tRPC surface does not gain it.
+	stats: authedProcedure
+		.input(PipelineStatsInputSchema)
+		.query(async ({ ctx, input }): Promise<PipelineStats> => {
+			await assertProjectAccess(ctx.user, input.projectId, 'contributor');
+			const range = {
+				since: new Date(input.since),
+				until: input.until === undefined ? new Date() : new Date(input.until),
+			};
+			const [runCounts, mergedPrsByRepository] = await Promise.all([
+				countRunsByStatusAndPhase(input.projectId, range),
+				countMergedPullRequestsByRepository(input.projectId, range),
+			]);
+			return {
+				runsByStatus: runCounts.byStatus,
+				runsByPhase: runCounts.byPhase,
+				mergedPrsByRepository,
+				since: range.since.toISOString(),
+				until: range.until.toISOString(),
+			};
 		}),
 
 	// Every dispatch of one task or pull request, oldest first, with its state,

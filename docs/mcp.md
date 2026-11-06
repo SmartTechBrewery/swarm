@@ -10,7 +10,9 @@ each with a mandatory reason, a dry run and an audit record.
 Every tool is the dashboard's own tRPC procedure, called as you. The tools
 therefore see exactly what you see in the dashboard: an instance administrator
 sees the whole installation, anyone else sees the projects they are a member of,
-and a run in any other project reads as *not found*, exactly as in the browser.
+and a run in any other project reads as *not found*, exactly as in the browser. The one
+tool with no dashboard procedure behind it, `control_plane_logs`, applies the same
+project rules itself.
 
 ## Where it is served
 
@@ -114,7 +116,9 @@ wording the dashboard shows.
 | `dispatch_history` | Every dispatch of one task or pull request, oldest first (`runs.dispatchHistory`), as `{ dispatches, truncated }`: state, phase, attempts, outcome, wait reason, `availableAt`, last error and the `runId` it executed against. Capped at the newest 200 | `projectId`, `taskId` and/or `prNumber` (at least one), `repository?` |
 | `workers_state` | Each worker's dispatch state (`workers.state`), as `{ workers }`: `connection` (`online`/`offline`), `lastSeenAt`, `draining`/`drainingSince`, the run it is executing, and its enrolled projects, each with `status`, `isRoutable` and its capacity in use — `activeRuns` of `concurrencyAllocation`, the two numbers the dispatch gate compares | `projectId?` |
 | `cli_rate_limits` | The workers cooling on an agent CLI's usage limit, as `{ workers }`, each with its active limits (from `workers.list`): `cli`, `expiresAt` (when SWARM routes that CLI to the machine again), `observedAt`, and `resetHint` — the reset text the CLI itself printed, or `null` when it printed none. A worker with no active limit is left out unless named by `workerId` | `projectId?`, `workerId?` |
+| `control_plane_logs` | The control plane's own recent log lines, newest first, as `{ entries, buffer }`. Each entry is `{ time, level, msg, context }` — the object the logger's `json` format emits, with `msg` cut at 4000 characters. `buffer` is the window they come from: `capacity` (20 000 lines), `size`, and `oldestTime`, the time of the oldest line it still holds | `projectId?`, `taskId?`, `prNumber?`, `dispatchId?` (each matching the line's context key of that name), `level?` (a minimum: `debug`, `info`, `warn`, `error`), `since?`/`until?` (ISO 8601; `since` inclusive, `until` exclusive), `limit` (≤ 1000, default 100) |
 | `pr_status` | One pull request's automation state as SWARM recorded it (`runs.prStatus`): its latest completed Review run (`lastReviewRunId`, `lastReviewVerdict`), the head of its latest submitted verdict (`lastReviewedHeadSha`), the merge-automation outcome recorded on that run (`mergeOutcome` — `merged`, `not-ready`, `not-eligible`, `policy-blocked`, `unsupported`, `provider-error`, `retry-exhausted`, `provider-error-exhausted`, or `null` — with `mergeOutcomeMessage`), the review-verdict ledger (`verdictCount` of `verdictCap`, `supersededCount` of `supersededCap`), whether a bound is reached (`capReached`, and which in `capBound`: `verdict-cap`, `superseded-bound` or `null`), and whether an operator's Force re-review grant is still unspent (`overrideOutstanding`). It does not ask the source-control provider anything, so it is not a live mergeability read | `projectId`, `repository` (as the project configures it), `prNumber` |
+| `pipeline_stats` | One project's counts for a period (`runs.stats`), as `{ runsByStatus, runsByPhase, mergedPrsByRepository, since, until }`: the pipeline runs **started** in the period by the status each is in now and by phase (maintenance runs are left out), and how many distinct pull requests SWARM's merge automation merged, per repository. A merge has no recorded instant of its own, so it is counted in the period its approving Review run completed in. A pull request merged by hand is not counted. A status, phase or repository with nothing to count is absent rather than zero, and `until` is echoed back so you see the period actually counted | `projectId`, `since` (ISO 8601, inclusive), `until?` (ISO 8601, exclusive; defaults to now, and must not be earlier than `since`) |
 | `phase_agents_get` | One phase's agent configuration for a project (from `projects.getById`), as stored after normalisation: `targets` (CLI/model/reasoning in priority order), `timeoutMs`, the custom `prompt`, and `cli`/`model`/`reasoning` mirroring `targets[0]`, with `configured: false` for a phase running on its coded defaults. Nothing else of the project is returned — no repositories, board mapping or credential references | `projectId`, `phase` (`planning`, `implementation`, `implementationUnplanned`, `review`, `respondToReview`, `respondToCi`, `resolveConflicts`) |
 | `consistency_check` | Stuck states SWARM will not leave by itself (`runs.consistencyCheck`), as `{ windowHours, since, findings, unchecked, truncated }`. Each finding has a `kind`, `repository`, `prNumber` (merged pull requests), `taskId`, `dispatchId` (dependency waits), `workItemId`, `workItemUrl`, `detail` and `suggestedAction` — see the kinds below. A candidate whose board read failed is listed in `unchecked` with its `reason` instead of being guessed at, and `truncated` is `true` when a per-call cap (50 merged pull requests, 50 dependency waits) left some unread. Fixes nothing | `projectId`, `windowHours` (how far back to look for merged pull requests, default 24, at most 720) |
 
@@ -141,8 +145,19 @@ worker on the installation, which only an instance administrator may do; anyone
 else gets `FORBIDDEN` and has to name a project. A `workerId` outside the scope
 reads as *not found*, exactly as an unknown one.
 
-`pr_status`, `phase_agents_get` and `consistency_check` need you to be a contributor
-of the project you name; for anyone else the project reads as *not found*.
+`control_plane_logs` reads an **in-memory buffer** of the lines the process serving
+`/operator/mcp` — the router, or the all-in-one control plane — logged **since it last
+started**, up to its last 20 000 lines. It is not a log store: a restart empties it,
+older lines are evicted as new ones arrive (`buffer.oldestTime` says how far back it
+reaches), and lines below `SWARM_LOG_LEVEL` were never recorded. The API server's
+and the workers' logs are not in it; read a worker's own `logs/worker.log`, and the
+API server's output where its process runs. With a `projectId`, a contributor of that
+project reads the lines carrying it. Without one, it reads every line — including
+those naming no project — which only an instance administrator may do; anyone else
+gets `FORBIDDEN`.
+
+`pr_status`, `pipeline_stats`, `phase_agents_get` and `consistency_check` need you to be
+a contributor of the project you name; for anyone else the project reads as *not found*.
 
 ### What `consistency_check` reports
 
@@ -206,7 +221,10 @@ The mount is `src/router/operator-mcp.ts`. The server is built per request in
 `src/mcp/tools/`. `src/mcp/tool-helpers.ts` provides the tRPC caller (`callerFor`)
 and the result mapping (`runTool`). A tool calls a dashboard procedure through
 `callerFor(user)` and never reads a repository directly, so its authorization
-cannot drift from the dashboard's. Adding a tool publishes that procedure on the
+cannot drift from the dashboard's. The one exception is `control_plane_logs`
+(`src/mcp/tools/logs.ts`): the dashboard's procedures run in the API server, whose
+memory does not hold the router's buffer, so there is no procedure to call, and the
+tool calls the same `src/api/authz.ts` helpers a procedure would. Adding a tool publishes that procedure on the
 internet-exposed router. Treat it like widening `src/api/operator-router.ts`: give
 it its own reasoning, and add it to the table above.
 

@@ -15,11 +15,13 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
 import type { SwarmUser } from '../identity/schema.js';
 import { registerConsistencyTools } from './tools/consistency.js';
+import { registerLogTools } from './tools/logs.js';
 import { registerPipelineTools } from './tools/pipeline.js';
 import { registerProjectConfigTools } from './tools/project-config.js';
 import { registerPullRequestTools } from './tools/pull-requests.js';
 import { registerRunActionTools } from './tools/run-actions.js';
 import { registerRunTools } from './tools/runs.js';
+import { registerStatsTools } from './tools/stats.js';
 import { registerWorkerTools } from './tools/workers.js';
 
 /** The name an MCP client lists this server's tools under. */
@@ -37,8 +39,10 @@ export function createSwarmMcpServer(user: SwarmUser): McpServer {
 	registerRunTools(server, user);
 	registerPipelineTools(server, user);
 	registerWorkerTools(server, user);
+	registerLogTools(server, user);
 	registerPullRequestTools(server, user);
 	registerProjectConfigTools(server, user);
+	registerStatsTools(server, user);
 	registerConsistencyTools(server, user);
 	registerRunActionTools(server, user);
 	return server;
