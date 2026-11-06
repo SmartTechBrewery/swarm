@@ -57,6 +57,12 @@
  *
  * Widening this router is a deliberate act: adding a namespace here publishes it,
  * so it wants its own issue and its own reasoning, not a convenience import.
+ *
+ * The sibling MCP mount on the same process (`/operator/mcp`,
+ * `../router/operator-mcp.ts`, issue #1338) does not go through this router: its
+ * tools call `appRouter`'s procedures directly as the bearer's user
+ * (`../mcp/tool-helpers.ts`), so what it publishes is bounded by the tools it
+ * registers rather than by this namespace list.
  */
 
 // Side-effect import: registers every PM and SCM provider manifest, exactly as

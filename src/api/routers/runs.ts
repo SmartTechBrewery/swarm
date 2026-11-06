@@ -383,7 +383,7 @@ const RunPhaseEnum = z.enum([
 	WORKER_UPDATE_RUN_PHASE,
 ]);
 
-const ListRunsInputSchema = z.object({
+export const ListRunsInputSchema = z.object({
 	projectId: z.string().min(1).optional(),
 	status: RunStatusEnum.optional(),
 	phase: RunPhaseEnum.optional(),

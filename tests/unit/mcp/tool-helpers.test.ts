@@ -1,0 +1,65 @@
+import { TRPCError } from '@trpc/server';
+import { describe, expect, it, vi } from 'vitest';
+
+const { warn } = vi.hoisted(() => ({ warn: vi.fn() }));
+vi.mock('@/lib/logger.js', async () => ({
+	...(await vi.importActual<typeof import('@/lib/logger.js')>('@/lib/logger.js')),
+	logger: { info: vi.fn(), warn, error: vi.fn(), debug: vi.fn() },
+}));
+
+import { jsonResult, runTool } from '@/mcp/tool-helpers.js';
+
+describe('jsonResult', () => {
+	it('returns an object as JSON text and as the same structured content', () => {
+		const result = jsonResult({ at: new Date('2026-10-28T10:00:00Z'), n: 1 });
+
+		expect(result.structuredContent).toEqual({ at: '2026-10-28T10:00:00.000Z', n: 1 });
+		expect(JSON.parse(result.content[0]?.type === 'text' ? result.content[0].text : '')).toEqual(
+			result.structuredContent,
+		);
+	});
+
+	// The MCP schema requires `structuredContent` to be an object.
+	it.each([[[1, 2]], [null], ['text']])('carries %j as text only', (value) => {
+		const result = jsonResult(value);
+
+		expect(result.structuredContent).toBeUndefined();
+		expect(result.content).toEqual([{ type: 'text', text: JSON.stringify(value, null, 2) }]);
+	});
+});
+
+describe('runTool', () => {
+	it("passes a tool body's result through", async () => {
+		const result = await runTool('t', async () => ({ ok: true }));
+
+		expect(result.isError).toBeUndefined();
+		expect(result.structuredContent).toEqual({ ok: true });
+	});
+
+	it("reports a procedure's refusal verbatim as an error result", async () => {
+		const result = await runTool('t', async () => {
+			throw new TRPCError({ code: 'FORBIDDEN', message: 'Not a member of this project' });
+		});
+
+		expect(result).toEqual({
+			isError: true,
+			content: [{ type: 'text', text: 'FORBIDDEN: Not a member of this project' }],
+		});
+		expect(warn).not.toHaveBeenCalled();
+	});
+
+	it('reports and logs an unexpected failure with its cause', async () => {
+		const result = await runTool('runs_list', async () => {
+			throw new Error('Failed query', { cause: new Error('connection reset') });
+		});
+
+		expect(result.isError).toBe(true);
+		expect(result.content).toEqual([
+			{ type: 'text', text: 'Tool "runs_list" failed: Failed query ← connection reset' },
+		]);
+		expect(warn).toHaveBeenCalledWith('operator MCP tool failed', {
+			tool: 'runs_list',
+			error: 'Failed query ← connection reset',
+		});
+	});
+});
