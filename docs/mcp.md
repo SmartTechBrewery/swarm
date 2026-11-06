@@ -124,8 +124,9 @@ update the client's header.
 
 Treat the token like a password: it reads everything your account can read in the
 dashboard, including run logs and agent output, and it can reset and re-dispatch
-runs, and wake dependency waits, in every project where you hold `member`, and
-reorder phase agents in every project you administer.
+runs, force re-reviews, schedule conflict checks and wake dependency waits in
+every project where you hold `member`, and reorder phase agents in every project
+you administer.
 
 ### Using the `swarm login` session instead
 
@@ -257,14 +258,27 @@ the same way:
 | --- | --- | --- |
 | `run_reset` | **Destructive.** Resets a wedged run and restarts its phase from scratch, as the dashboard's **Reset & restart** and `swarm run reset` do (`runs.reset`). It stops the run's live agent, cancels its active dispatch (even one a worker has claimed), clears its cancellation flag, tears down its checkout and discards uncommitted and unpushed work, and clears its recovery record. Then it re-dispatches the phase as a fresh first attempt. A run with no stored payload, or whose project is gone, is settled `failed` instead (`outcome: 'terminated'`). Refused only for an unknown run, a machine-maintenance run, or a reset already under way | `runId`, `reason`, `dryRun` (default `false`) |
 | `dispatch_redispatch_now` | Re-dispatches a `deferred`, `checkpointed` or `failed` run immediately, as the dashboard's **Retry now** does (`runs.retryNow`). It re-opens the run's waiting dispatch for an immediate attempt, superseding a scheduled automatic retry. A dispatch whose worker lease has lapsed is taken back first. A run with no dispatch gets a fresh one built from its stored payload. Retry budgets start again from zero. Refused for any other status, for a run a worker is executing, and for a run with neither a dispatch nor a stored payload | `runId`, `reason`, `dryRun` (default `false`) |
+| `pr_force_re_review` | Continues a pull request the review-verdict cap stopped, as the run page's **Force re-review** does (`runs.forceReReview`). For a Review run whose last permitted verdict requested changes, it grants the pull request one review past the cap and dispatches Respond-to-review for that review; the follow-up Review spends the grant. For a completed Review run that **approved** when the allowance was spent, and whose merge automation refused because a later push moved the head, it grants one review and dispatches a Review of the current head. A forced dispatch already live for the same head is reported, not duplicated. Refused with `PRECONDITION_FAILED` when the head has not moved since that approval (`head-unchanged`: the merge was refused for another reason, which the run's merge result names), for a closed pull request, for a run the cap did not stop, and when the phase it would dispatch is disabled for the project. The dry run (`runs.previewForceReReview`) reports the run's cap state as `run_get` shows it (`reviewCapStop`, `reviewCapSpent`, `reviewCapOverrideOutstanding`), the `continuation` it would start, `reviewedHeadSha` and the pull request's `currentHeadSha` and `pullRequestState` read from its provider, `headMoved`, and `wouldRefuse` | `runId`, `reason`, `dryRun` (default `false`) |
+| `pr_recheck_mergeability` | Schedules the per-PR conflict check that the resolve-conflicts fan-out schedules for each open pull request when a sibling merges (`runs.recheckMergeability`). Use it when that fan-out skipped this pull request. The check is keyed on the pull request's own base, read from its provider, and is due now. A check already pending for the same pull request and base is superseded rather than duplicated. The check reads mergeability and dispatches Resolve-conflicts only when the pull request genuinely conflicts, with all of that phase's own gates. Refused for a closed pull request and for a repository the project does not configure. The dry run (`runs.previewMergeabilityRecheck`) reports the pull request's current `state`, `headSha`, `baseBranch` and `mergeable` (`null` while the provider is still computing it), the `coalesceKey` and the `job` it would schedule, and `wouldRefuse` | `projectId`, `repository` (as the project configures it), `prNumber`, `reason`, `dryRun` (default `false`) |
 | `dependency_waits_wake` | Wakes every dispatch in the project waiting on the dependency gate now, instead of at its next re-check (`SWARM_DEPENDENCY_RECHECK_MS`) — the same wake a merge or a board card reaching Done triggers on its own (`runs.wakeDependencyWaits`, logged with cause `operator`). The gate re-reads the blockers, so a dependent still blocked simply waits again, and the wake spends no attempt its re-check would not have. Returns `{ projectId, woken, dispatches }`, each dispatch with `dispatchId`, `phase`, `repository`, `taskId`, `prNumber`, `runId`, `attempt` and `availableAt`. A dispatch it could not wake is logged, left on its re-check, and not listed. The dry run (`runs.previewDependencyWake`) returns `{ projectId, wouldWake, dispatches }`: the waits it would wake, in the same shape | `projectId`, `reason`, `dryRun` (default `false`) |
 | `phase_agents_reorder` | Changes the priority order of one phase's agent `targets` — which CLI/model a worker tries first — and nothing else: no target is added, removed or edited, and the phase's `timeoutMs` and `prompt` are kept. `order` lists every current target exactly once, each as `<cli>/<model>` (`claude/opus`; `default/<model>` for a target naming no CLI) or by its CLI alone (`claude`); anything that is not a permutation of the current targets (an unknown name, a repeat, a target left out) is refused as `BAD_REQUEST` naming the current targets, and a phase with no configured targets as `PRECONDITION_FAILED`. Saves through the project configuration (`projects.update`), which re-validates it as any save is and rewrites the `cli`/`model`/`reasoning` mirror from the new first target. Returns `{ projectId, phase, before, after }` (target names); the dry run (`projects.agentsForUpdate`) returns the same `before`/`after`. The order it replaced is recorded on its audit row (`detail: { previous, next }`) | `projectId`, `phase` (as for `phase_agents_get`), `order`, `reason`, `dryRun` (default `false`) |
 | `phase_agents_restore` | Puts back the order the latest successful, real (not dry-run) `phase_agents_reorder` of this project's phase replaced, read from that call's audit row, and saves it the same way. Refused as `PRECONDITION_FAILED` when the phase was never reordered, or when its targets were edited since — a CLI, model or reasoning level changed, or a target added or removed — so the recorded order is no longer a permutation of them: re-applying it would undo that edit. Reorder by hand with `phase_agents_reorder` then. A dashboard reorder of the same targets made since is not an edit, and is overwritten. Returns `{ projectId, phase, before, after }`; the dry run adds `restoring: { auditId, reorderedAt }`, naming the reorder it would undo | `projectId`, `phase`, `reason`, `dryRun` (default `false`) |
 
-`run_reset` and `dispatch_redispatch_now` need `member` on the run's project, the role that drives runs in the
+`run_reset`, `dispatch_redispatch_now`, `pr_force_re_review` and
+`pr_recheck_mergeability` need `member` on the project, the role that drives runs in the
 dashboard. A contributor can read the run but gets `FORBIDDEN`. Anyone else gets
-`NOT_FOUND`. Their dry run is the `runs.previewAction` procedure, which is gated at
-`member` too.
+`NOT_FOUND`. Each dry run is gated at `member` too: `runs.previewAction` for
+`run_reset` and `dispatch_redispatch_now`, `runs.previewForceReReview` and
+`runs.previewMergeabilityRecheck` for the two pull-request tools. Both
+pull-request tools ask the source-control provider for the pull request, dry run
+included; a provider read that fails is reported as `INTERNAL_SERVER_ERROR` and
+audited `failed`. `pr_force_re_review`'s dry run reads the head even where the real
+call would not need it, and leaves `currentHeadSha` and `headMoved` `null` when
+that extra read fails.
+
+`pr_force_re_review` and `pr_recheck_mergeability` replace the local
+`force-re-review` and `recheck-conflicts` operator scripts, with a reason, a dry
+run and an audit record.
 
 `dispatch_redispatch_now` takes a run. A dispatch with no run yet, such as a
 board dispatch waiting on its dependencies, is not something it can re-dispatch;
@@ -319,7 +333,8 @@ gated exactly like the write, which runs first on every call and answers the dry
 run, and an `apply`, which is the dashboard mutation. The framework adds `reason`
 and `dryRun` and writes the `operator_actions` row
 (`src/db/repositories/operatorActionsRepository.ts`). The run tools live in
-`src/mcp/tools/run-actions.ts`, `dependency_waits_wake` in
+`src/mcp/tools/run-actions.ts`, the pull-request tools in
+`src/mcp/tools/pr-actions.ts`, `dependency_waits_wake` in
 `src/mcp/tools/dependency-waits.ts`, and the phase-agent order tools in
 `src/mcp/tools/phase-agents.ts` (their pure permutation rules in
 `src/mcp/agent-order.ts`). A `preview` may return a `detail`, which the framework

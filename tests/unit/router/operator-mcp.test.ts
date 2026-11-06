@@ -50,14 +50,29 @@ vi.mock('@/db/repositories/runsRepository.js', async () => ({
 }));
 // The review-verdict ledger read and the project record read behind `pr_status` and
 // `phase_agents_get` (issue #1342); the ledger's pure cap predicates stay real.
-const { listActiveReviewSlotsForPullRequest } = vi.hoisted(() => ({
-	listActiveReviewSlotsForPullRequest: vi.fn(),
-}));
+const { listActiveReviewSlotsForPullRequest, getSubmittedReviewSlot, grantReviewCapOverride } =
+	vi.hoisted(() => ({
+		listActiveReviewSlotsForPullRequest: vi.fn(),
+		// The force re-review service's ledger read and grant (issue #1348).
+		getSubmittedReviewSlot: vi.fn(),
+		grantReviewCapOverride: vi.fn(),
+	}));
 vi.mock('@/db/repositories/reviewVerdictsRepository.js', async () => ({
 	...(await vi.importActual<typeof import('@/db/repositories/reviewVerdictsRepository.js')>(
 		'@/db/repositories/reviewVerdictsRepository.js',
 	)),
 	listActiveReviewSlotsForPullRequest,
+	getSubmittedReviewSlot,
+	grantReviewCapOverride,
+}));
+// The pull request reads behind `pr_force_re_review` and `pr_recheck_mergeability`
+// (issue #1348); the rest of the registry stays real for the config schema.
+const { requireProjectSCMProvider } = vi.hoisted(() => ({ requireProjectSCMProvider: vi.fn() }));
+vi.mock('@/integrations/scm/registry.js', async () => ({
+	...(await vi.importActual<typeof import('@/integrations/scm/registry.js')>(
+		'@/integrations/scm/registry.js',
+	)),
+	requireProjectSCMProvider,
 }));
 const { findProjectRecordByIdFromDb, getProjectByIdFromDb, upsertProjectToDb } = vi.hoisted(() => ({
 	findProjectRecordByIdFromDb: vi.fn(),
@@ -143,14 +158,23 @@ vi.mock('@/dispatch/run-reset.js', async () => ({
 	...(await vi.importActual<typeof import('@/dispatch/run-reset.js')>('@/dispatch/run-reset.js')),
 	resetRun,
 }));
-const { promoteDependencyWaits, publishDispatchWakeUp } = vi.hoisted(() => ({
+const {
+	promoteDependencyWaits,
+	publishDispatchWakeUp,
+	createAndPublishDispatch,
+	scheduleCoalescedDispatch,
+} = vi.hoisted(() => ({
 	promoteDependencyWaits: vi.fn(),
 	publishDispatchWakeUp: vi.fn(),
+	createAndPublishDispatch: vi.fn(),
+	scheduleCoalescedDispatch: vi.fn(),
 }));
 vi.mock('@/dispatch/dispatcher.js', async () => ({
 	...(await vi.importActual<typeof import('@/dispatch/dispatcher.js')>('@/dispatch/dispatcher.js')),
 	promoteDependencyWaits,
 	publishDispatchWakeUp,
+	createAndPublishDispatch,
+	scheduleCoalescedDispatch,
 }));
 const { clearRunCancellation } = vi.hoisted(() => ({ clearRunCancellation: vi.fn() }));
 vi.mock('@/queue/cancellation.js', async () => ({
@@ -174,6 +198,7 @@ vi.mock('@/identity/worker-enrollment-service.js', async () => ({
 	listWorkerProjectCapacity,
 }));
 
+import { REVIEW_VERDICT_CAP } from '@/db/repositories/reviewVerdictsRepository.js';
 import type { SwarmUser } from '@/identity/schema.js';
 import { enableLogRingBuffer, logger } from '@/lib/logger.js';
 import {
@@ -390,6 +415,11 @@ beforeEach(() => {
 	promoteDependencyWaits.mockReset().mockResolvedValue([]);
 	publishDispatchWakeUp.mockReset().mockResolvedValue(undefined);
 	clearRunCancellation.mockReset().mockResolvedValue(undefined);
+	getSubmittedReviewSlot.mockReset();
+	grantReviewCapOverride.mockReset();
+	requireProjectSCMProvider.mockReset();
+	createAndPublishDispatch.mockReset();
+	scheduleCoalescedDispatch.mockReset().mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -507,6 +537,8 @@ describe('operator MCP — the handshake', () => {
 			'dispatch_redispatch_now',
 			'phase_agents_reorder',
 			'phase_agents_restore',
+			'pr_force_re_review',
+			'pr_recheck_mergeability',
 			'run_reset',
 		];
 
@@ -522,6 +554,8 @@ describe('operator MCP — the handshake', () => {
 			'phase_agents_restore',
 			'pipeline_snapshot',
 			'pipeline_stats',
+			'pr_force_re_review',
+			'pr_recheck_mergeability',
 			'pr_status',
 			'run_get',
 			'run_reset',
@@ -1507,6 +1541,233 @@ describe('operator MCP — run_reset and dispatch_redispatch_now', () => {
 			`PRECONDITION_FAILED: Only a deferred, checkpointed, or failed run can be retried; run "${RUN_ID}" is completed.`,
 		);
 		expect(auditRow()).toMatchObject({ outcome: 'refused', projectId: 'proj-a' });
+	});
+});
+
+describe('operator MCP — pr_force_re_review and pr_recheck_mergeability', () => {
+	const PROJECT = createMockProjectConfig({ id: 'proj-a', repo: 'acme/widgets' });
+	const REVIEWED_HEAD = 'cafebabe0000cafebabe0000cafebabe0000cafe';
+	const getPullRequest = vi.fn();
+
+	/** A completed Review run whose approval spent the allowance — issue #1040's shape. */
+	function capSpentApprovalRun() {
+		return {
+			...failedRun(),
+			phase: 'review',
+			status: 'completed',
+			prNumber: '508',
+			reviewOrdinal: REVIEW_VERDICT_CAP,
+			reviewVerdict: 'approve',
+			reviewAutomationOutcome: null,
+			reviewMergeOutcome: 'not-eligible',
+			jobPayload: {
+				type: 'scm',
+				providerId: 'github',
+				projectId: 'proj-a',
+				event: {
+					kind: 'checks',
+					action: 'completed',
+					repoFullName: 'acme/widgets',
+					workItemId: '508',
+					isCommentEvent: false,
+					headSha: REVIEWED_HEAD,
+					prBranch: 'issue-508',
+				},
+			},
+		};
+	}
+
+	function pullRequestAt(headSha: string, state = 'open') {
+		return {
+			number: 508,
+			headBranch: 'issue-508',
+			headSha,
+			baseBranch: 'main',
+			baseSha: 'base',
+			mergeable: false,
+			authorLogin: 'someone',
+			state,
+		};
+	}
+
+	beforeEach(() => {
+		getProjectByIdFromDb.mockReset().mockResolvedValue(PROJECT);
+		findProjectRecordByIdFromDb.mockResolvedValue(
+			createMockProjectRecord({ id: 'proj-a', repositories: [{ repo: 'acme/widgets' }] }),
+		);
+		getRunByIdFromDb.mockImplementation(async (id: string) =>
+			id === RUN_ID ? capSpentApprovalRun() : undefined,
+		);
+		listActiveReviewSlotsForPullRequest.mockResolvedValue(
+			Array.from({ length: REVIEW_VERDICT_CAP }, (_unused, index) => ({
+				ordinal: index + 1,
+				state: 'submitted',
+				headSha: index + 1 === REVIEW_VERDICT_CAP ? REVIEWED_HEAD : `older-${index}`,
+				capOverrideGrantedAt: null,
+				capOverrideConsumedAt: null,
+				dispatchActive: false,
+				superseded: false,
+			})),
+		);
+		getSubmittedReviewSlot.mockResolvedValue({
+			ordinal: REVIEW_VERDICT_CAP,
+			verdict: 'approve',
+			reviewId: '900456',
+			capOverrideGrantedAt: null,
+			capOverrideConsumedAt: null,
+		});
+		getPullRequest.mockReset().mockResolvedValue(pullRequestAt(REVIEWED_HEAD));
+		requireProjectSCMProvider.mockReturnValue({ type: 'github', getPullRequest });
+	});
+
+	function auditRow() {
+		expect(recordOperatorAction).toHaveBeenCalledTimes(1);
+		expect(settleOperatorAction).toHaveBeenCalledTimes(1);
+		return {
+			...recordOperatorAction.mock.calls[0]?.[0],
+			...settleOperatorAction.mock.calls[0]?.[1],
+		};
+	}
+
+	it("surfaces the service's head-unchanged refusal as a tool error and audits it", async () => {
+		const result = await callTool(
+			'pr_force_re_review',
+			{ runId: RUN_ID, reason: 'merge refused after the cap' },
+			'driver-token',
+		);
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toBe(
+			`PRECONDITION_FAILED: Cannot force a review for run "${RUN_ID}" — PR #508 is still at ${REVIEWED_HEAD}, the commit this run approved. Nothing superseded the approval, so the merge was refused for another reason; see this run's merge result for the provider's own message.`,
+		);
+		expect(grantReviewCapOverride).not.toHaveBeenCalled();
+		expect(createAndPublishDispatch).not.toHaveBeenCalled();
+		expect(auditRow()).toMatchObject({
+			userId: DRIVER.id,
+			tool: 'pr_force_re_review',
+			projectId: 'proj-a',
+			target: RUN_ID,
+			reason: 'merge refused after the cap',
+			dryRun: false,
+			outcome: 'refused',
+			error: expect.stringMatching(/^PRECONDITION_FAILED: .*is still at/),
+		});
+	});
+
+	it('answers a dry run with the cap state and whether the head moved, writing nothing', async () => {
+		const result = await callTool(
+			'pr_force_re_review',
+			{ runId: RUN_ID, reason: 'checking', dryRun: true },
+			'driver-token',
+		);
+
+		expect(result.isError).toBeUndefined();
+		expect(result.structuredContent).toMatchObject({
+			dryRun: true,
+			auditId: 'audit-1',
+			preview: {
+				run: { id: RUN_ID, projectId: 'proj-a' },
+				reviewCapStop: 'verdict-cap',
+				reviewCapSpent: true,
+				continuation: 'review',
+				reviewedHeadSha: REVIEWED_HEAD,
+				currentHeadSha: REVIEWED_HEAD,
+				headMoved: false,
+				wouldRefuse: { code: 'PRECONDITION_FAILED' },
+			},
+		});
+		expect(grantReviewCapOverride).not.toHaveBeenCalled();
+		expect(createAndPublishDispatch).not.toHaveBeenCalled();
+		expect(auditRow()).toMatchObject({ dryRun: true, outcome: 'succeeded', projectId: 'proj-a' });
+	});
+
+	it('refuses a contributor with FORBIDDEN before reading the pull request', async () => {
+		const result = await callTool(
+			'pr_force_re_review',
+			{ runId: RUN_ID, reason: 'trying', dryRun: true },
+			'member-token',
+		);
+
+		expect(result.content[0]?.text).toMatch(/^FORBIDDEN: /);
+		expect(getPullRequest).not.toHaveBeenCalled();
+		expect(auditRow()).toMatchObject({ outcome: 'refused', projectId: null });
+	});
+
+	it('schedules one coalesced conflict check for a project member and audits it', async () => {
+		const result = await callTool(
+			'pr_recheck_mergeability',
+			{
+				projectId: 'proj-a',
+				repository: 'acme/widgets',
+				prNumber: 508,
+				reason: 'fan-out skipped it',
+			},
+			'driver-token',
+		);
+
+		expect(result.isError).toBeUndefined();
+		expect(result.structuredContent).toMatchObject({
+			dryRun: false,
+			result: {
+				prNumber: 508,
+				baseBranch: 'main',
+				coalesceKey: 'resolve-conflicts:acme/widgets:508:main',
+				scheduled: true,
+			},
+		});
+		expect(scheduleCoalescedDispatch).toHaveBeenCalledTimes(1);
+		expect(scheduleCoalescedDispatch).toHaveBeenCalledWith(
+			expect.objectContaining({
+				type: 'scm',
+				projectId: 'proj-a',
+				event: expect.objectContaining({ conflictPrNumber: '508', baseBranch: 'main' }),
+			}),
+			'resolve-conflicts:acme/widgets:508:main',
+			0,
+			null,
+		);
+		expect(auditRow()).toMatchObject({
+			tool: 'pr_recheck_mergeability',
+			projectId: 'proj-a',
+			target: 'acme/widgets#508',
+			outcome: 'succeeded',
+		});
+	});
+
+	it("previews the job and the pull request's current mergeability, scheduling nothing", async () => {
+		const result = await callTool(
+			'pr_recheck_mergeability',
+			{
+				projectId: 'proj-a',
+				repository: 'acme/widgets',
+				prNumber: 508,
+				reason: 'checking',
+				dryRun: true,
+			},
+			'driver-token',
+		);
+
+		expect(result.structuredContent).toMatchObject({
+			dryRun: true,
+			preview: {
+				pullRequest: { state: 'open', mergeable: false, baseBranch: 'main' },
+				coalesceKey: 'resolve-conflicts:acme/widgets:508:main',
+				wouldRefuse: null,
+			},
+		});
+		expect(scheduleCoalescedDispatch).not.toHaveBeenCalled();
+	});
+
+	it('refuses a contributor with FORBIDDEN and schedules nothing', async () => {
+		const result = await callTool(
+			'pr_recheck_mergeability',
+			{ projectId: 'proj-a', repository: 'acme/widgets', prNumber: 508, reason: 'trying' },
+			'member-token',
+		);
+
+		expect(result.content[0]?.text).toMatch(/^FORBIDDEN: /);
+		expect(scheduleCoalescedDispatch).not.toHaveBeenCalled();
+		expect(auditRow()).toMatchObject({ outcome: 'refused', target: 'acme/widgets#508' });
 	});
 });
 
