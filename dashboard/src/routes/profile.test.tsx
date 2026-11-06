@@ -13,9 +13,12 @@ describe('PROFILE_TAB_ITEMS', () => {
 	});
 });
 
+const MEMBER = { instanceAdmin: false };
+const ADMIN = { instanceAdmin: true };
+
 describe('ProfileTabBar', () => {
 	it('renders only the tabs whose content is delivered', () => {
-		render(<ProfileTabBar activeTab="account" onSelect={vi.fn()} />);
+		render(<ProfileTabBar activeTab="account" viewer={MEMBER} onSelect={vi.fn()} />);
 
 		expect(screen.getAllByRole('button').map((button) => button.textContent)).toEqual([
 			'Account',
@@ -25,9 +28,18 @@ describe('ProfileTabBar', () => {
 		]);
 	});
 
+	it('adds the MCP tab for an installation administrator only (issue #1362)', () => {
+		const onSelect = vi.fn();
+		render(<ProfileTabBar activeTab="account" viewer={ADMIN} onSelect={onSelect} />);
+
+		fireEvent.click(screen.getByRole('button', { name: 'MCP' }));
+
+		expect(onSelect).toHaveBeenCalledWith('mcp');
+	});
+
 	it('reports the tab that was clicked', () => {
 		const onSelect = vi.fn();
-		render(<ProfileTabBar activeTab="account" onSelect={onSelect} />);
+		render(<ProfileTabBar activeTab="account" viewer={MEMBER} onSelect={onSelect} />);
 
 		fireEvent.click(screen.getByRole('button', { name: 'Account' }));
 
@@ -36,7 +48,7 @@ describe('ProfileTabBar', () => {
 
 	it('reports the My Workers tab that was clicked', () => {
 		const onSelect = vi.fn();
-		render(<ProfileTabBar activeTab="account" onSelect={onSelect} />);
+		render(<ProfileTabBar activeTab="account" viewer={MEMBER} onSelect={onSelect} />);
 
 		fireEvent.click(screen.getByRole('button', { name: 'My Workers' }));
 
@@ -45,7 +57,7 @@ describe('ProfileTabBar', () => {
 
 	it('reports the My Projects tab that was clicked', () => {
 		const onSelect = vi.fn();
-		render(<ProfileTabBar activeTab="account" onSelect={onSelect} />);
+		render(<ProfileTabBar activeTab="account" viewer={MEMBER} onSelect={onSelect} />);
 
 		fireEvent.click(screen.getByRole('button', { name: 'My Projects' }));
 
@@ -54,7 +66,7 @@ describe('ProfileTabBar', () => {
 
 	it('reports the Security tab that was clicked', () => {
 		const onSelect = vi.fn();
-		render(<ProfileTabBar activeTab="account" onSelect={onSelect} />);
+		render(<ProfileTabBar activeTab="account" viewer={MEMBER} onSelect={onSelect} />);
 
 		fireEvent.click(screen.getByRole('button', { name: 'Security' }));
 
@@ -62,7 +74,7 @@ describe('ProfileTabBar', () => {
 	});
 
 	it('marks the active tab with the underline recipe', () => {
-		render(<ProfileTabBar activeTab="account" onSelect={vi.fn()} />);
+		render(<ProfileTabBar activeTab="account" viewer={MEMBER} onSelect={vi.fn()} />);
 
 		expect(screen.getByRole('button', { name: 'Account' }).className).toContain(
 			'border-violet-500',

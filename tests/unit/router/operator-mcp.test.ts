@@ -197,7 +197,12 @@ vi.mock('@/identity/worker-enrollment-service.js', async () => ({
 import { REVIEW_VERDICT_CAP } from '@/db/repositories/reviewVerdictsRepository.js';
 import type { SwarmUser } from '@/identity/schema.js';
 import { enableLogRingBuffer, logger } from '@/lib/logger.js';
-import { type OperatorMcpDeps, registerOperatorMcp } from '@/router/operator-mcp.js';
+import {
+	MAY_USE_OPERATOR_MCP,
+	type OperatorMcpDeps,
+	registerOperatorMcp,
+	serveOperatorMcpRequest,
+} from '@/router/operator-mcp.js';
 import {
 	createMockPmWebhookJob,
 	createMockProjectConfig,
@@ -298,17 +303,23 @@ function workerRow(workerId: string, displayName: string, rateLimits: (typeof CO
 	};
 }
 
+/** Agent access tokens (issue #1362), resolved by the second credential lookup. */
+const AGENT_TOKENS: Record<string, SwarmUser> = {
+	'admin-agent-token': ADMIN,
+	'member-agent-token': MEMBER,
+};
+
 let resolveSession: ReturnType<typeof vi.fn<OperatorMcpDeps['resolveSession']>>;
+let resolveAgentAccessToken: ReturnType<typeof vi.fn<OperatorMcpDeps['resolveAgentAccessToken']>>;
 
 function appWith(): Hono {
 	const app = new Hono();
-	registerOperatorMcp(app, { resolveSession });
+	registerOperatorMcp(app, { resolveSession, resolveAgentAccessToken });
 	return app;
 }
 
-/** One JSON-RPC request over Streamable HTTP, as an MCP client sends it. */
-function rpc(method: string, params: Record<string, unknown>, token?: string) {
-	return appWith().request('/operator/mcp', {
+function rpcRequest(method: string, params: Record<string, unknown>, token?: string): Request {
+	return new Request('http://localhost/operator/mcp', {
 		method: 'POST',
 		headers: {
 			'content-type': 'application/json',
@@ -319,21 +330,36 @@ function rpc(method: string, params: Record<string, unknown>, token?: string) {
 	});
 }
 
+/** One JSON-RPC request over Streamable HTTP to the real mount, as an MCP client sends it. */
+async function rpc(method: string, params: Record<string, unknown>, token?: string) {
+	return appWith().fetch(rpcRequest(method, params, token));
+}
+
+/**
+ * A tool call made **behind** the endpoint's admin-only gate, as the token's user.
+ * The gate refuses non-admins today (issue #1362), but each tool's own per-user
+ * authorization is what a later decision to open MCP rests on, so it stays
+ * exercised for members and strangers here.
+ */
+async function callTool(name: string, args: Record<string, unknown>, token: string) {
+	const response = await serveOperatorMcpRequest(
+		TOKENS[token],
+		rpcRequest('tools/call', { name, arguments: args }, token),
+	);
+	expect(response.status).toBe(200);
+	const body = (await response.json()) as { result: ToolResult };
+	return body.result;
+}
+
 interface ToolResult {
 	isError?: boolean;
 	content: Array<{ type: string; text: string }>;
 	structuredContent?: Record<string, unknown>;
 }
 
-async function callTool(name: string, args: Record<string, unknown>, token: string) {
-	const response = await rpc('tools/call', { name, arguments: args }, token);
-	expect(response.status).toBe(200);
-	const body = (await response.json()) as { result: ToolResult };
-	return body.result;
-}
-
 beforeEach(() => {
 	resolveSession = vi.fn(async (token: string) => TOKENS[token]);
+	resolveAgentAccessToken = vi.fn(async (token: string) => AGENT_TOKENS[token]);
 	listRunsFromDb.mockReset().mockResolvedValue({ data: [], total: 0 });
 	getRunByIdFromDb
 		.mockReset()
@@ -403,12 +429,52 @@ describe('operator MCP — the bearer gate', () => {
 		expect(resolveSession).not.toHaveBeenCalled();
 	});
 
-	it('refuses a token the session service rejects', async () => {
+	it('refuses a token neither credential resolves', async () => {
 		const response = await rpc('tools/call', { name: 'runs_list', arguments: {} }, 'revoked');
 
 		expect(response.status).toBe(401);
 		expect(resolveSession).toHaveBeenCalledWith('revoked');
+		expect(resolveAgentAccessToken).toHaveBeenCalledWith('revoked');
 		expect(listRunsFromDb).not.toHaveBeenCalled();
+	});
+
+	it("accepts an instance admin's agent access token, acting as its holder", async () => {
+		const response = await rpc(
+			'tools/call',
+			{ name: 'runs_list', arguments: {} },
+			'admin-agent-token',
+		);
+
+		expect(response.status).toBe(200);
+		expect(resolveAgentAccessToken).toHaveBeenCalledWith('admin-agent-token');
+		// The admin reads the whole installation: no membership scope is consulted.
+		expect(listAccessibleProjectIds).not.toHaveBeenCalled();
+		expect(listRunsFromDb).toHaveBeenCalled();
+	});
+
+	it('does not consult agent access tokens when the session resolves', async () => {
+		const response = await rpc('tools/list', {}, 'admin-token');
+
+		expect(response.status).toBe(200);
+		expect(resolveAgentAccessToken).not.toHaveBeenCalled();
+	});
+
+	// Issue #1362: MCP is admin-only for now, whatever the credential — opening it to
+	// other users needs an authorization review of every tool first.
+	it.each([
+		['a `swarm login` session', 'member-token'],
+		['an agent access token', 'member-agent-token'],
+		['a stranger session', 'stranger-token'],
+	])('refuses a non-admin presenting %s with 403, before any MCP handling', async (_, token) => {
+		const response = await rpc('tools/call', { name: 'runs_list', arguments: {} }, token);
+
+		expect(response.status).toBe(403);
+		expect(listRunsFromDb).not.toHaveBeenCalled();
+		expect(listAccessibleProjectIds).not.toHaveBeenCalled();
+	});
+
+	it('decides MCP access per installation role, admins only', () => {
+		expect(MAY_USE_OPERATOR_MCP).toEqual({ instanceAdmin: true, user: false });
 	});
 
 	// Same reasoning as `/operator/trpc`: the branch that is safe on the loopback API
@@ -425,7 +491,7 @@ describe('operator MCP — the bearer gate', () => {
 	it.each(['GET', 'DELETE'])('answers %s with 405: the server is stateless', async (method) => {
 		const response = await appWith().request('/operator/mcp', {
 			method,
-			headers: { authorization: 'Bearer member-token', accept: 'text/event-stream' },
+			headers: { authorization: 'Bearer admin-token', accept: 'text/event-stream' },
 		});
 
 		expect(response.status).toBe(405);
@@ -442,14 +508,14 @@ describe('operator MCP — the handshake', () => {
 				capabilities: {},
 				clientInfo: { name: 'test', version: '0' },
 			},
-			'member-token',
+			'admin-token',
 		);
 		expect(init.status).toBe(200);
 		expect(init.headers.get('mcp-session-id')).toBeNull();
 		const initBody = (await init.json()) as { result: { serverInfo: { name: string } } };
 		expect(initBody.result.serverInfo.name).toBe('swarm');
 
-		const list = await rpc('tools/list', {}, 'member-token');
+		const list = await rpc('tools/list', {}, 'admin-token');
 		const listBody = (await list.json()) as {
 			result: {
 				tools: Array<{

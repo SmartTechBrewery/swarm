@@ -1,12 +1,14 @@
 import { createRoute, useNavigate } from '@tanstack/react-router';
-import { FolderGit2, type LucideIcon, Server, ShieldCheck, UserRound } from 'lucide-react';
+import { Bot, FolderGit2, type LucideIcon, Server, ShieldCheck, UserRound } from 'lucide-react';
 import { AccountPanel } from '@/components/profile/account-panel.js';
+import { McpPanel } from '@/components/profile/mcp-panel.js';
 import { MyProjectsPanel } from '@/components/profile/my-projects-panel.js';
 import { MyWorkersPanel } from '@/components/profile/my-workers-panel.js';
 import { SecurityPanel } from '@/components/profile/security-panel.js';
 import {
-	isProfileTabAvailable,
+	isProfileTabVisibleTo,
 	type ProfileTab,
+	type ProfileViewer,
 	profileSearchSchema,
 	profileTabSearch,
 	resolveActiveProfileTab,
@@ -26,12 +28,12 @@ import { rootRoute } from './__root.js';
  * requested and a direct link resolves only to a tab. An admin-facing view of
  * *another* user is deliberately not this screen.
  *
- * Only tabs with a panel behind them are rendered ({@link ProfileTabBar} filters
- * on `isProfileTabAvailable`), and a deep link to a declared-but-undelivered one
- * degrades to Account — so the navigation structure is stated once in
+ * Only tabs with a panel behind them, and shown to this viewer, are rendered
+ * ({@link ProfileTabBar} filters on `isProfileTabVisibleTo`), and a deep link to
+ * any other degrades to Account — so the navigation structure is stated once in
  * `lib/profile-nav.ts` while each follow-up ships its own tab. **Account**, **My
- * Workers** (issue #660), **My Projects** (issue #661), and **Security** (issue #662)
- * are all delivered.
+ * Workers** (issue #660), **My Projects** (issue #661), **Security** (issue #662)
+ * and, for installation administrators only, **MCP** (issue #1362) are delivered.
  *
  * Each panel resolves its own subject from the session — either by fetching
  * (`My Workers`) or by taking the already-fetched `auth.me` user, which is the
@@ -55,19 +57,22 @@ export const PROFILE_TAB_ITEMS: ReadonlyArray<{
 	{ tab: 'workers', label: 'My Workers', icon: Server },
 	{ tab: 'projects', label: 'My Projects', icon: FolderGit2 },
 	{ tab: 'security', label: 'Security', icon: ShieldCheck },
+	{ tab: 'mcp', label: 'MCP', icon: Bot },
 ];
 
-/** The horizontal tab bar, rendered from the available {@link PROFILE_TAB_ITEMS}. */
+/** The horizontal tab bar, rendered from the {@link PROFILE_TAB_ITEMS} this viewer sees. */
 export function ProfileTabBar({
 	activeTab,
+	viewer,
 	onSelect,
 }: {
 	activeTab: ProfileTab;
+	viewer: ProfileViewer;
 	onSelect: (tab: ProfileTab) => void;
 }) {
 	return (
 		<div className="flex border-b border-zinc-800">
-			{PROFILE_TAB_ITEMS.filter(({ tab }) => isProfileTabAvailable(tab)).map(
+			{PROFILE_TAB_ITEMS.filter(({ tab }) => isProfileTabVisibleTo(tab, viewer)).map(
 				({ tab, label, icon: Icon }) => (
 					<button
 						key={tab}
@@ -91,7 +96,6 @@ export function ProfileTabBar({
 function ProfileRouteComponent() {
 	const search = profileRoute.useSearch();
 	const navigate = useNavigate();
-	const activeTab = resolveActiveProfileTab(search);
 	// The tab lives in the URL, so each switch is a real browser-history entry and
 	// a reload lands on the same panel (the rule `lib/profile-nav.ts` documents).
 	const goToTab = (tab: ProfileTab) => {
@@ -116,6 +120,8 @@ function ProfileRouteComponent() {
 		return <div className="text-sm text-zinc-400">Loading profile…</div>;
 	}
 
+	const activeTab = resolveActiveProfileTab(search, currentUser.data);
+
 	return (
 		<div className="space-y-6">
 			<div>
@@ -123,12 +129,13 @@ function ProfileRouteComponent() {
 				<p className="text-xs text-zinc-500 mt-1">Your SWARM account on this installation.</p>
 			</div>
 
-			<ProfileTabBar activeTab={activeTab} onSelect={goToTab} />
+			<ProfileTabBar activeTab={activeTab} viewer={currentUser.data} onSelect={goToTab} />
 
 			{activeTab === 'account' && <AccountPanel user={currentUser.data} />}
 			{activeTab === 'workers' && <MyWorkersPanel />}
 			{activeTab === 'projects' && <MyProjectsPanel />}
 			{activeTab === 'security' && <SecurityPanel user={currentUser.data} />}
+			{activeTab === 'mcp' && <McpPanel />}
 		</div>
 	);
 }
