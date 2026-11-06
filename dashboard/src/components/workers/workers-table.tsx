@@ -5,11 +5,12 @@ import {
 	useQuery,
 	useQueryClient,
 } from '@tanstack/react-query';
-import { ChevronDown, ChevronUp } from 'lucide-react';
+import { ChevronDown, ChevronUp, FolderGit2, Monitor } from 'lucide-react';
 import { useState } from 'react';
 import { WorkItemCell } from '@/components/runs/work-item-cell.js';
 import { Badge } from '@/components/ui/badge.js';
 import { buttonClass } from '@/components/ui/button.js';
+import { LightIconLine } from '@/components/ui/light-icon-line.js';
 import { Modal, ModalFooter } from '@/components/ui/modal.js';
 import { ToggleSwitch } from '@/components/ui/toggle-switch.js';
 import { WorkerBuildBadge, WorkerUpdatingBadge } from '@/components/workers/worker-build.js';
@@ -190,28 +191,58 @@ function enrollmentKey(workerId: string, projectId: string): string {
 }
 
 /**
- * The repositories the machine holds a checkout of (issue #1228), one line each under
- * its name, in the order the daemon declared them, so the primary checkout comes
- * first. This is what tells two workers on one machine apart without opening either.
- * Styled like the machine line under a run's phase on `/runs` (`run-worker-name`),
- * because the name above it is styled like that phase. A machine that declared none
- * (it never connected, its daemon predates the field, or its checkout has no readable
- * `origin`) gets no line at all, never a placeholder.
+ * What the machine is, one secondary line each under its name (issues #1228, #1365):
+ * first the host it runs on, then the repositories it holds a checkout of, in the
+ * order the daemon declared them, so the primary checkout comes first. The hostname
+ * is what tells several workers on one machine — and so on one CLI account's
+ * allowance — apart from the list; the repositories tell apart workers serving
+ * different code. Each line leads with its own icon, because a hostname and an
+ * `owner/repo` slug are otherwise both short grey monospaced strings.
+ *
+ * The hostname is the daemon's self-reported `os.hostname()`, shown exactly as
+ * reported (as the detail page and CLI Quotas do) and for display only. A fact the
+ * machine never declared — no hostname yet, no readable `origin` — gets no line at
+ * all, never a placeholder. Every line stays on one line inside the Machine column's
+ * width budget, truncated, with the full value on hover.
  */
-function MachineRepositories({ repositories }: { repositories: string[] }) {
-	if (repositories.length === 0) return null;
+function MachineLines({
+	hostname,
+	repositories,
+}: {
+	hostname: string | null;
+	repositories: string[];
+}) {
 	return (
-		<div data-testid="worker-repositories">
-			{repositories.map((repository) => (
-				<span
-					key={repository}
-					className="mt-0.5 block truncate font-mono text-xs font-normal text-zinc-500"
-					title={repository}
+		<>
+			{hostname ? (
+				<LightIconLine
+					as="span"
+					icon={Monitor}
+					title={hostname}
+					truncate
+					data-testid="worker-hostname"
+					className="mt-0.5 font-mono"
 				>
-					{repository}
-				</span>
-			))}
-		</div>
+					{hostname}
+				</LightIconLine>
+			) : null}
+			{repositories.length > 0 ? (
+				<div data-testid="worker-repositories">
+					{repositories.map((repository) => (
+						<LightIconLine
+							key={repository}
+							as="span"
+							icon={FolderGit2}
+							title={repository}
+							truncate
+							className="mt-0.5 font-mono"
+						>
+							{repository}
+						</LightIconLine>
+					))}
+				</div>
+			) : null}
+		</>
 	);
 }
 
@@ -1158,7 +1189,7 @@ export function WorkersTable({
 									<WorkerUpdatingBadge update={worker.update} />
 									<WorkerBuildBadge buildIsCurrent={worker.buildIsCurrent} />
 								</div>
-								<MachineRepositories repositories={worker.repositories} />
+								<MachineLines hostname={worker.hostname} repositories={worker.repositories} />
 							</td>
 							<td className="px-3 py-3 align-top text-sm text-zinc-300 break-words">
 								{worker.owner ? (

@@ -375,6 +375,88 @@ describe('WorkersTable row content', () => {
 	});
 });
 
+// Issue #1365 — which machine a worker runs on, read off the roster, ahead of the
+// checkouts it holds, each line led by its own decorative icon.
+describe('WorkersTable machine and checkout lines (issue #1365)', () => {
+	/** The Machine cell of the one rendered row. */
+	function machineCell(): HTMLElement {
+		const cell = screen.getAllByRole('row')[1].querySelector('td');
+		if (!cell) throw new Error('no Machine cell');
+		return cell;
+	}
+
+	it('shows the hostname under the name, before the checkout lines', () => {
+		renderTable(
+			<WorkersTable
+				workers={[
+					makeWorker({
+						hostname: 'ada-mbp.local',
+						repositories: ['acme/frontend', 'acme/backend'],
+					}),
+				]}
+				onSelectWorker={vi.fn()}
+			/>,
+		);
+
+		const host = screen.getByTestId('worker-hostname');
+		expect(host.textContent).toBe('ada-mbp.local');
+		expect(host.getAttribute('title')).toBe('ada-mbp.local');
+		expect(host.className).toContain('font-mono');
+		expect(host.closest('td')).toBe(machineCell());
+		const name = screen.getByRole('button', { name: 'Open ada-laptop details' });
+		expect(host.previousElementSibling?.contains(name)).toBe(true);
+		// Machine line first, then one line per checkout, primary first.
+		const repositories = screen.getByTestId('worker-repositories');
+		expect(host.nextElementSibling).toBe(repositories);
+		expect([...repositories.children].map((line) => line.textContent)).toEqual([
+			'acme/frontend',
+			'acme/backend',
+		]);
+	});
+
+	it('leads every line with a decorative icon, leaving the text as the accessible content', () => {
+		renderTable(
+			<WorkersTable
+				workers={[makeWorker({ hostname: 'ada-mbp.local', repositories: ['acme/frontend'] })]}
+			/>,
+		);
+
+		const lines = [
+			screen.getByTestId('worker-hostname'),
+			...screen.getByTestId('worker-repositories').children,
+		];
+		expect(lines).toHaveLength(2);
+		for (const line of lines) {
+			const icon = line.querySelector('svg');
+			expect(icon?.getAttribute('aria-hidden')).toBe('true');
+			expect(line.firstElementChild).toBe(icon);
+		}
+		// Distinct icons: a machine is not a checkout.
+		expect(lines[0].querySelector('svg')?.getAttribute('class')).not.toBe(
+			lines[1].querySelector('svg')?.getAttribute('class'),
+		);
+	});
+
+	it('shows no machine line, never a placeholder, for a worker with no hostname', () => {
+		renderTable(
+			<WorkersTable workers={[makeWorker({ hostname: null, repositories: ['acme/frontend'] })]} />,
+		);
+
+		expect(screen.queryByTestId('worker-hostname')).toBeNull();
+		expect(machineCell().textContent).toBe('ada-laptopacme/frontend');
+	});
+
+	it('shows only the machine line for a worker with a hostname and no checkout', () => {
+		renderTable(
+			<WorkersTable workers={[makeWorker({ hostname: 'ada-mbp.local', repositories: [] })]} />,
+		);
+
+		expect(screen.getByTestId('worker-hostname').textContent).toBe('ada-mbp.local');
+		expect(screen.queryByTestId('worker-repositories')).toBeNull();
+		expect(machineCell().textContent).toBe('ada-laptopada-mbp.local');
+	});
+});
+
 // Issue #1228 — which repository a worker serves, readable off the roster rather than
 // by opening each machine.
 describe('WorkersTable checkout repositories (issue #1228)', () => {
