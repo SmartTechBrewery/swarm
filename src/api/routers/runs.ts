@@ -59,7 +59,10 @@ import {
 } from '../../db/repositories/stalledDismissalsRepository.js';
 import { getUserById } from '../../db/repositories/usersRepository.js';
 import { listWipSlots } from '../../db/repositories/wipSlotsRepository.js';
-import { classifyDispatchClaim } from '../../dispatch/claim-liveness.js';
+import {
+	classifyDispatchClaim,
+	type DispatchClaimLiveness,
+} from '../../dispatch/claim-liveness.js';
 import {
 	type ConsistencyCheckResult,
 	DEFAULT_CONSISTENCY_WINDOW_HOURS,
@@ -810,6 +813,201 @@ function requirePipelineRun(run: RunRow, runId: string): asserts run is Pipeline
 			`reset, or terminated from here. Ask the machine again with ` +
 			`\`swarm workers update <worker-id> <ref>\`.`,
 	});
+}
+
+/**
+ * The status gate of `retryNow`, shared with {@link previewRunAction} so a dry run
+ * refuses with exactly the real call's wording.
+ */
+function requireRetryableStatus(run: RunRow, runId: string): void {
+	if (run.status === 'deferred' || run.status === 'failed' || run.status === 'checkpointed') {
+		return;
+	}
+	throw new TRPCError({
+		code: 'PRECONDITION_FAILED',
+		message: `Only a deferred, checkpointed, or failed run can be retried; run "${runId}" is ${run.status}.`,
+	});
+}
+
+/** The run mutations {@link previewRunAction} can describe without performing. */
+export const PreviewableRunActionSchema = z.enum(['reset', 'retryNow']);
+export type PreviewableRunAction = z.infer<typeof PreviewableRunActionSchema>;
+
+/**
+ * What `runs.reset` or `runs.retryNow` would do to one run, without doing it (issue
+ * #1346) — the dry run of the operator MCP server's `run_reset` and
+ * `dispatch_redispatch_now` tools.
+ *
+ * `wouldRefuse` is the refusal the real call would answer with, in its own code and
+ * wording, for every precondition that can be read without acting: a maintenance
+ * run, a status `retryNow` does not accept, a dispatch a worker is executing, a
+ * missing payload. It is `null` when none applies — which is not a promise: the real
+ * call re-reads everything, and a race (or a precondition only the write itself
+ * reaches, such as an unplaceable continuation) can still refuse it.
+ */
+export interface RunActionPreview {
+	action: PreviewableRunAction;
+	run: {
+		id: string;
+		projectId: string;
+		kind: string;
+		phase: string;
+		status: string;
+		repository: string | null;
+		taskId: string | null;
+		prNumber: string | null;
+	};
+	activeDispatch: {
+		id: string;
+		state: string;
+		waitReason: string | null;
+		availableAt: string;
+		/** `waiting`, `executing` (a worker holds a live lease) or `stale` (the lease lapsed). */
+		claim: string;
+	} | null;
+	wouldRefuse: { code: TRPCError['code']; message: string } | null;
+	/** `reset`: `restarted` or `terminated`; `retryNow`: `retrying`. `null` when refused. */
+	expectedOutcome: 'restarted' | 'terminated' | 'retrying' | null;
+	/** The changes the real call would make, in order, in the operator's terms. */
+	intendedChanges: string[];
+}
+
+/** Run a throwing guard and capture its refusal instead. */
+function refusalOf(guard: () => void): RunActionPreview['wouldRefuse'] {
+	try {
+		guard();
+		return null;
+	} catch (error) {
+		if (error instanceof TRPCError) return { code: error.code, message: error.message };
+		throw error;
+	}
+}
+
+type RunActionVerdict = Pick<
+	RunActionPreview,
+	'wouldRefuse' | 'expectedOutcome' | 'intendedChanges'
+>;
+
+function refusedVerdict(
+	wouldRefuse: NonNullable<RunActionPreview['wouldRefuse']>,
+): RunActionVerdict {
+	return { wouldRefuse, expectedOutcome: null, intendedChanges: [] };
+}
+
+/** `retryNow`'s readable preconditions, in the order the mutation checks them. */
+function previewRetryNow(
+	run: RunRow,
+	active: DispatchRow | undefined,
+	claim: DispatchClaimLiveness | null,
+): RunActionVerdict {
+	const badStatus = refusalOf(() => requireRetryableStatus(run, run.id));
+	if (badStatus) return refusedVerdict(badStatus);
+	const budgets = 'Reset its automatic and rate-limit retry budgets to zero.';
+	if (active) {
+		if (claim === 'executing') {
+			const error = workerRunningPhase();
+			return refusedVerdict({ code: error.code, message: error.message });
+		}
+		return {
+			wouldRefuse: null,
+			expectedOutcome: 'retrying',
+			intendedChanges: [
+				claim === 'stale'
+					? `Take back dispatch ${active.id}, whose worker's lease has lapsed, and re-open it for an immediate attempt.`
+					: `Re-open dispatch ${active.id} (${active.state}) for an immediate attempt.`,
+				budgets,
+			],
+		};
+	}
+	if (!run.jobPayload) {
+		return refusedVerdict({
+			code: 'PRECONDITION_FAILED',
+			message: `Cannot retry run "${run.id}" — it was created without a job payload.`,
+		});
+	}
+	return {
+		wouldRefuse: null,
+		expectedOutcome: 'retrying',
+		intendedChanges: [
+			'Create a fresh manual-retry dispatch from the run’s stored job payload.',
+			budgets,
+		],
+	};
+}
+
+/** What `resetRun` would do — it never refuses a pipeline run (issue #744), so this lists what it discards. */
+async function previewReset(
+	run: RunRow,
+	active: DispatchRow | undefined,
+): Promise<RunActionVerdict> {
+	const project = await getProjectByIdFromDb(run.projectId, run.repository ?? undefined);
+	const intendedChanges: string[] = [];
+	if (run.status === 'running') {
+		intendedChanges.push('Stop the run’s live agent and wait (up to 15s) for it to stop.');
+	}
+	if (active) {
+		intendedChanges.push(
+			`Cancel its active dispatch ${active.id} (${active.state}), even if a worker claimed it.`,
+		);
+	}
+	const preservedWorkerId = run.recovery?.preservedWorkerId;
+	intendedChanges.push(
+		'Clear its cancellation flag.',
+		'Tear down its checkout and worktree lease, discarding uncommitted and unpushed work.',
+		preservedWorkerId
+			? `Clear its recovery record, abandoning the checkout preserved on worker ${preservedWorkerId}.`
+			: 'Clear its recovery record and captured agent session.',
+	);
+	let terminalReason: string | null = null;
+	if (run.jobPayload === null) {
+		terminalReason = 'Settle the run as failed: it has no job payload to re-dispatch.';
+	} else if (!project) {
+		terminalReason = `Settle the run as failed: its project "${run.projectId}" no longer exists.`;
+	}
+	intendedChanges.push(
+		terminalReason ?? 'Re-dispatch its phase from the stored payload as a fresh first attempt.',
+	);
+	return {
+		wouldRefuse: null,
+		expectedOutcome: terminalReason ? 'terminated' : 'restarted',
+		intendedChanges,
+	};
+}
+
+async function previewRunAction(
+	action: PreviewableRunAction,
+	run: RunRow,
+): Promise<RunActionPreview> {
+	const active = await getActiveDispatchByRunId(run.id);
+	const claim = active ? classifyDispatchClaim(active) : null;
+	const base = {
+		action,
+		run: {
+			id: run.id,
+			projectId: run.projectId,
+			kind: run.kind,
+			phase: run.phase,
+			status: run.status,
+			repository: run.repository,
+			taskId: run.taskId,
+			prNumber: run.prNumber,
+		},
+		activeDispatch:
+			active && claim
+				? {
+						id: active.id,
+						state: active.state,
+						waitReason: active.waitReason,
+						availableAt: active.availableAt.toISOString(),
+						claim,
+					}
+				: null,
+	};
+	const notPipeline = refusalOf(() => requirePipelineRun(run, run.id));
+	if (notPipeline) return { ...base, ...refusedVerdict(notPipeline) };
+	const verdict =
+		action === 'retryNow' ? previewRetryNow(run, active, claim) : await previewReset(run, active);
+	return { ...base, ...verdict };
 }
 
 async function resolveRunAttribution(run: {
@@ -1993,12 +2191,7 @@ export const runsRouter = router({
 				`Run with ID "${input.runId}" not found`,
 			);
 			requirePipelineRun(run, input.runId);
-			if (run.status !== 'deferred' && run.status !== 'failed' && run.status !== 'checkpointed') {
-				throw new TRPCError({
-					code: 'PRECONDITION_FAILED',
-					message: `Only a deferred, checkpointed, or failed run can be retried; run "${input.runId}" is ${run.status}.`,
-				});
-			}
+			requireRetryableStatus(run, input.runId);
 
 			// Clear any stale user-termination flag before re-running this row: a run
 			// terminated while deferred keeps its cancellation entry (issue #166), and
@@ -2310,6 +2503,33 @@ export const runsRouter = router({
 					message: `Failed to reset run "${input.runId}": ${describeError(error)}`,
 				});
 			}
+		}),
+
+	// What `reset` or `retryNow` would do to one run, without doing it (issue #1346)
+	// — the dry run of the operator MCP server's `run_reset` and
+	// `dispatch_redispatch_now` tools (`src/mcp/tools/run-actions.ts`).
+	//
+	// Read-only, but authorized exactly as the mutations it describes — `member` on
+	// the run's project, with the same existence-hiding `NOT_FOUND` — so a dry run
+	// can never tell a caller about a run the real call would refuse to let them act
+	// on. Deliberately not in `runReadProcedures`.
+	previewAction: authedProcedure
+		.input(z.object({ runId: z.string().min(1), action: PreviewableRunActionSchema }))
+		.query(async ({ ctx, input }): Promise<RunActionPreview> => {
+			const run = await getRunByIdFromDb(input.runId);
+			if (!run) {
+				throw new TRPCError({
+					code: 'NOT_FOUND',
+					message: `Run with ID "${input.runId}" not found`,
+				});
+			}
+			await assertProjectAccess(
+				ctx.user,
+				run.projectId,
+				'member',
+				`Run with ID "${input.runId}" not found`,
+			);
+			return previewRunAction(input.action, run);
 		}),
 
 	// Force a continuation past the review-verdict safety cap ("Force re-review",

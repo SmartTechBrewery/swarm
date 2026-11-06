@@ -79,11 +79,25 @@ export async function runTool(tool: string, body: () => Promise<unknown>): Promi
 	try {
 		return jsonResult(await body());
 	} catch (error) {
-		if (error instanceof TRPCError) {
-			return errorResult(`${error.code}: ${error.message}`);
-		}
-		const message = describeError(error);
-		logger.warn('operator MCP tool failed', { tool, error: message });
-		return errorResult(`Tool "${tool}" failed: ${message}`);
+		return errorResult(describeToolFailure(tool, error).message);
 	}
+}
+
+/**
+ * How a tool body's throw reads: a `TRPCError` is the procedure's own **refusal**,
+ * reported as `<code>: <message>`; anything else is an unexpected **failure**, logged
+ * with the tool's name and reported as its described error. {@link runTool}'s
+ * mapping, exposed so the write-tool framework (`./write-tool.ts`) can audit which
+ * of the two a call ended in.
+ */
+export function describeToolFailure(
+	tool: string,
+	error: unknown,
+): { outcome: 'refused' | 'failed'; message: string } {
+	if (error instanceof TRPCError) {
+		return { outcome: 'refused', message: `${error.code}: ${error.message}` };
+	}
+	const message = describeError(error);
+	logger.warn('operator MCP tool failed', { tool, error: message });
+	return { outcome: 'failed', message: `Tool "${tool}" failed: ${message}` };
 }

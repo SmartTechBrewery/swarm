@@ -3927,6 +3927,153 @@ describe('runsRouter', () => {
 		});
 	});
 
+	// Issue #1346 — the dry run of the MCP `run_reset` / `dispatch_redispatch_now` tools.
+	describe('previewAction', () => {
+		const PROJECT = createMockProjectConfig({ id: 'p1' });
+
+		beforeEach(() => {
+			vi.mocked(getProjectByIdFromDb).mockResolvedValue(PROJECT);
+			vi.mocked(getActiveDispatchByRunId).mockResolvedValue(undefined);
+		});
+
+		/** No mutation may be reached from a preview. */
+		function expectNothingWritten() {
+			expect(resetRun).not.toHaveBeenCalled();
+			expect(reopenDispatchForManualRetry).not.toHaveBeenCalled();
+			expect(takeOverStaleDispatchForManualRetry).not.toHaveBeenCalled();
+			expect(createAndPublishDispatch).not.toHaveBeenCalled();
+			expect(publishDispatchWakeUp).not.toHaveBeenCalled();
+			expect(clearRunCancellation).not.toHaveBeenCalled();
+			expect(requestRunCancellation).not.toHaveBeenCalled();
+		}
+
+		it('describes the reset of a running run with a claimed dispatch, writing nothing', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(
+				makeRun({ id: 'run-1', status: 'running', jobPayload: SCM_PAYLOAD }),
+			);
+			vi.mocked(getActiveDispatchByRunId).mockResolvedValue(makeDispatch({ state: 'running' }));
+			vi.mocked(classifyDispatchClaim).mockReturnValue('executing');
+
+			const preview = await caller.previewAction({ runId: 'run-1', action: 'reset' });
+
+			expect(preview).toMatchObject({
+				action: 'reset',
+				run: { id: 'run-1', projectId: 'p1', status: 'running' },
+				activeDispatch: { id: 'dispatch-1', state: 'running', claim: 'executing' },
+				wouldRefuse: null,
+				expectedOutcome: 'restarted',
+			});
+			expect(preview.intendedChanges[0]).toMatch(/Stop the run’s live agent/);
+			expect(preview.intendedChanges[1]).toMatch(/Cancel its active dispatch dispatch-1/);
+			expectNothingWritten();
+		});
+
+		it('says a reset of a run with no payload would settle it failed', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(
+				makeRun({ id: 'run-1', status: 'failed', jobPayload: null }),
+			);
+
+			const preview = await caller.previewAction({ runId: 'run-1', action: 'reset' });
+
+			expect(preview.expectedOutcome).toBe('terminated');
+			expect(preview.intendedChanges.at(-1)).toMatch(/no job payload/);
+		});
+
+		it('reports a maintenance run as the refusal the real call gives', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(
+				makeRun({ id: 'run-1', kind: 'worker-update', repository: null, taskId: null }),
+			);
+
+			const preview = await caller.previewAction({ runId: 'run-1', action: 'reset' });
+
+			expect(preview.wouldRefuse).toMatchObject({ code: 'PRECONDITION_FAILED' });
+			expect(preview.wouldRefuse?.message).toMatch(/machine maintenance/);
+			expect(preview.expectedOutcome).toBeNull();
+		});
+
+		it("reports retryNow's own status refusal, verbatim", async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', status: 'completed' }));
+
+			const preview = await caller.previewAction({ runId: 'run-1', action: 'retryNow' });
+
+			expect(preview.wouldRefuse).toEqual({
+				code: 'PRECONDITION_FAILED',
+				message:
+					'Only a deferred, checkpointed, or failed run can be retried; run "run-1" is completed.',
+			});
+			await expect(caller.retryNow({ runId: 'run-1' })).rejects.toThrowError(
+				expect.objectContaining(preview.wouldRefuse),
+			);
+		});
+
+		it('describes re-opening a waiting dispatch, writing nothing', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', status: 'deferred' }));
+			vi.mocked(getActiveDispatchByRunId).mockResolvedValue(makeDispatch());
+
+			const preview = await caller.previewAction({ runId: 'run-1', action: 'retryNow' });
+
+			expect(preview).toMatchObject({
+				wouldRefuse: null,
+				expectedOutcome: 'retrying',
+				activeDispatch: { id: 'dispatch-1', state: 'retry-scheduled', claim: 'waiting' },
+			});
+			expect(preview.intendedChanges[0]).toBe(
+				'Re-open dispatch dispatch-1 (retry-scheduled) for an immediate attempt.',
+			);
+			expectNothingWritten();
+		});
+
+		it('refuses retryNow for a dispatch a worker is executing', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', status: 'deferred' }));
+			vi.mocked(getActiveDispatchByRunId).mockResolvedValue(makeDispatch({ state: 'running' }));
+			vi.mocked(classifyDispatchClaim).mockReturnValue('executing');
+
+			const preview = await caller.previewAction({ runId: 'run-1', action: 'retryNow' });
+
+			expect(preview.wouldRefuse).toMatchObject({ code: 'CONFLICT' });
+		});
+
+		it('refuses retryNow for a run with neither a dispatch nor a payload', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(
+				makeRun({ id: 'run-1', status: 'failed', jobPayload: null }),
+			);
+
+			const preview = await caller.previewAction({ runId: 'run-1', action: 'retryNow' });
+
+			expect(preview.wouldRefuse).toEqual({
+				code: 'PRECONDITION_FAILED',
+				message: 'Cannot retry run "run-1" — it was created without a job payload.',
+			});
+		});
+
+		// Authorized exactly as the mutations it describes, not as the read it resembles.
+		it.each([
+			['contributor', 'FORBIDDEN'],
+			[undefined, 'NOT_FOUND'],
+		] as const)('refuses a %s caller with %s, reading no dispatch', async (role, code) => {
+			const ordinary = runsRouter.createCaller({ user: ORDINARY_USER });
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', status: 'failed' }));
+			vi.mocked(getMembership).mockResolvedValue(role ? membershipFor(role) : undefined);
+
+			await expect(
+				ordinary.previewAction({ runId: 'run-1', action: 'reset' }),
+			).rejects.toThrowError(expect.objectContaining({ code }));
+			expect(getActiveDispatchByRunId).not.toHaveBeenCalled();
+		});
+
+		it('answers a project member', async () => {
+			const ordinary = runsRouter.createCaller({ user: ORDINARY_USER });
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(
+				makeRun({ id: 'run-1', status: 'failed', jobPayload: SCM_PAYLOAD }),
+			);
+			vi.mocked(getMembership).mockResolvedValue(membershipFor('member'));
+
+			await expect(
+				ordinary.previewAction({ runId: 'run-1', action: 'retryNow' }),
+			).resolves.toMatchObject({ wouldRefuse: null });
+		});
+	});
+
 	// Issue #511 — the recovery action for a Review run the verdict cap stopped.
 	describe('forceReReview', () => {
 		const FORCE_RESULT = {
