@@ -15,7 +15,9 @@ import {
 	cancelDeferredRunInDb,
 	clearRunRecovery,
 	completeRun,
+	countMergedPullRequestsByRepository,
 	countRunningRunsForProject,
+	countRunsByStatusAndPhase,
 	countRunsSettledSinceByStatus,
 	createFailedRun,
 	createRun as createRunRow,
@@ -2598,6 +2600,95 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 				completed: 2,
 				failed: 1,
 				deferred: 1,
+			});
+		});
+	});
+
+	describe('period statistics (issue #1345)', () => {
+		const RANGE = {
+			since: new Date('2026-06-01T00:00:00Z'),
+			until: new Date('2026-06-02T00:00:00Z'),
+		};
+		const INSIDE = new Date('2026-06-01T12:00:00Z');
+		const BEFORE = new Date('2026-05-31T23:59:59Z');
+
+		async function seedRun(values: {
+			projectId?: string;
+			kind?: string;
+			repository?: string | null;
+			phase?: string;
+			status?: string;
+			prNumber?: string;
+			startedAt?: Date;
+			completedAt?: Date | null;
+			reviewMergeOutcome?: string;
+		}): Promise<void> {
+			await getDb()
+				.insert(runs)
+				.values({
+					projectId: values.projectId ?? PROJECT_ID,
+					kind: values.kind ?? 'pipeline',
+					repository: values.repository === undefined ? REPO : values.repository,
+					taskId: values.kind === undefined || values.kind === 'pipeline' ? 't' : null,
+					phase: values.phase ?? 'implementation',
+					status: values.status ?? 'completed',
+					prNumber: values.prNumber,
+					startedAt: values.startedAt ?? INSIDE,
+					completedAt: values.completedAt ?? null,
+					reviewMergeOutcome: values.reviewMergeOutcome,
+				});
+		}
+
+		it('counts the runs started in the period by status and by phase, for one project', async () => {
+			await seedProject({ id: 'proj-other', repo: 'jkwiecien/other-repo' });
+			await seedRun({ phase: 'planning', status: 'completed' });
+			await seedRun({ phase: 'implementation', status: 'completed' });
+			await seedRun({ phase: 'implementation', status: 'failed' });
+			await seedRun({ phase: 'review', status: 'running' });
+			// The bounds are half-open: `since` is in, `until` is out.
+			await seedRun({ phase: 'review', status: 'deferred', startedAt: RANGE.since });
+			await seedRun({ phase: 'review', status: 'completed', startedAt: RANGE.until });
+			await seedRun({ phase: 'review', status: 'completed', startedAt: BEFORE });
+			await seedRun({
+				kind: WORKER_UPDATE_RUN_KIND,
+				repository: null,
+				phase: WORKER_UPDATE_RUN_PHASE,
+				status: 'completed',
+			});
+			await seedRun({ projectId: 'proj-other', status: 'completed' });
+
+			expect(await countRunsByStatusAndPhase(PROJECT_ID, RANGE)).toEqual({
+				byStatus: { completed: 2, failed: 1, running: 1, deferred: 1 },
+				byPhase: { planning: 1, implementation: 2, review: 2 },
+			});
+		});
+
+		it('answers an empty period with empty tallies', async () => {
+			expect(await countRunsByStatusAndPhase(PROJECT_ID, RANGE)).toEqual({
+				byStatus: {},
+				byPhase: {},
+			});
+			expect(await countMergedPullRequestsByRepository(PROJECT_ID, RANGE)).toEqual({});
+		});
+
+		it('counts distinct merged pull requests per repository by the approving Review run', async () => {
+			await seedProject({ id: 'proj-other', repo: 'jkwiecien/other-repo' });
+			const merged = { phase: 'review', reviewMergeOutcome: 'merged', completedAt: INSIDE };
+			await seedRun({ ...merged, prNumber: '1' });
+			// A second Review run of the same pull request counts it once.
+			await seedRun({ ...merged, prNumber: '1' });
+			await seedRun({ ...merged, prNumber: '2' });
+			await seedRun({ ...merged, prNumber: '1', repository: OTHER_REPO });
+			// Not merged, merged outside the period, not a Review run, another project.
+			await seedRun({ ...merged, prNumber: '3', reviewMergeOutcome: 'not-ready' });
+			await seedRun({ ...merged, prNumber: '4', completedAt: BEFORE });
+			await seedRun({ ...merged, prNumber: '5', completedAt: RANGE.until });
+			await seedRun({ ...merged, prNumber: '6', phase: 'implementation' });
+			await seedRun({ ...merged, prNumber: '7', projectId: 'proj-other' });
+
+			expect(await countMergedPullRequestsByRepository(PROJECT_ID, RANGE)).toEqual({
+				[REPO]: 2,
+				[OTHER_REPO]: 1,
 			});
 		});
 	});

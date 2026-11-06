@@ -18,6 +18,7 @@ import { registerPipelineTools } from './tools/pipeline.js';
 import { registerProjectConfigTools } from './tools/project-config.js';
 import { registerPullRequestTools } from './tools/pull-requests.js';
 import { registerRunTools } from './tools/runs.js';
+import { registerStatsTools } from './tools/stats.js';
 import { registerWorkerTools } from './tools/workers.js';
 
 /** The name an MCP client lists this server's tools under. */
@@ -37,6 +38,7 @@ export function createSwarmMcpServer(user: SwarmUser): McpServer {
 	registerWorkerTools(server, user);
 	registerPullRequestTools(server, user);
 	registerProjectConfigTools(server, user);
+	registerStatsTools(server, user);
 	registerConsistencyTools(server, user);
 	return server;
 }
