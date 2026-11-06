@@ -218,6 +218,7 @@ import {
 	getRunByIdFromDb,
 	getRunLogsFromDb,
 	getRunOutputEvents,
+	type ListedRunRow,
 	listRunsFromDb,
 	listTaskActivitySince,
 	markRunUserTerminated,
@@ -277,6 +278,15 @@ type RunRow = typeof runs.$inferSelect;
 
 // Small local builder — no `createMockRun` factory exists and only these run
 // tests need one, so it stays inline rather than expanding tests/helpers.
+/** A `listRunsFromDb` row: the stored run plus its list-only facts (issue #1339). */
+function toListed(run: RunRow): ListedRunRow {
+	return { ...run, retryCount: 0, errorSummary: null };
+}
+
+function makeListedRun(overrides: Partial<RunRow> = {}): ListedRunRow {
+	return toListed(makeRun(overrides));
+}
+
 function makeRun(overrides: Partial<RunRow> = {}): RunRow {
 	return {
 		id: 'run-1',
@@ -492,13 +502,13 @@ describe('runsRouter', () => {
 		it('returns whatever listRunsFromDb resolves and applies default pagination', async () => {
 			const nextRetryAt = new Date('2026-07-10T00:30:00Z');
 			const data = [
-				makeRun({
+				makeListedRun({
 					id: 'run-1',
 					nextRetryAt,
 					workItemTitle: 'Fix the widget',
 					workItemUrl: 'https://github.com/acme/widgets/issues/103',
 				}),
-				makeRun({ id: 'run-2' }),
+				makeListedRun({ id: 'run-2' }),
 			];
 			vi.mocked(listRunsFromDb).mockResolvedValue({ data, total: 2 });
 
@@ -517,9 +527,9 @@ describe('runsRouter', () => {
 		// list resolves the recorded worker id into a display name server-side.
 		it('names the worker machine that executed each run, in one batched lookup', async () => {
 			const data = [
-				makeRun({ id: 'run-1', workerId: 'worker-a' }),
-				makeRun({ id: 'run-2', workerId: 'worker-a' }),
-				makeRun({ id: 'run-3', workerId: null }),
+				makeListedRun({ id: 'run-1', workerId: 'worker-a' }),
+				makeListedRun({ id: 'run-2', workerId: 'worker-a' }),
+				makeListedRun({ id: 'run-3', workerId: null }),
 			];
 			vi.mocked(listRunsFromDb).mockResolvedValue({ data, total: 3 });
 			vi.mocked(getWorkers).mockResolvedValue([
@@ -553,7 +563,10 @@ describe('runsRouter', () => {
 		});
 
 		it('skips the lookup entirely when no listed run recorded a worker', async () => {
-			vi.mocked(listRunsFromDb).mockResolvedValue({ data: [makeRun({ id: 'run-1' })], total: 1 });
+			vi.mocked(listRunsFromDb).mockResolvedValue({
+				data: [makeListedRun({ id: 'run-1' })],
+				total: 1,
+			});
 
 			const result = await caller.list({});
 
@@ -563,7 +576,7 @@ describe('runsRouter', () => {
 
 		it('reports a run whose recorded worker no longer resolves without a machine name', async () => {
 			vi.mocked(listRunsFromDb).mockResolvedValue({
-				data: [makeRun({ id: 'run-1', workerId: 'worker-gone' })],
+				data: [makeListedRun({ id: 'run-1', workerId: 'worker-gone' })],
 				total: 1,
 			});
 			vi.mocked(getWorkers).mockResolvedValue([]);
@@ -589,6 +602,69 @@ describe('runsRouter', () => {
 			});
 		});
 
+		// Issue #1339 — the operator MCP server's `runs_list` filters and ordering.
+		it("converts issue #1339's filters into the repository filter", async () => {
+			vi.mocked(listRunsFromDb).mockResolvedValue({ data: [], total: 0 });
+
+			await caller.list({
+				status: ['failed', 'checkpointed'],
+				repository: 'acme/widgets',
+				taskId: '103',
+				prNumber: 77,
+				workerId: '11111111-1111-4111-8111-111111111111',
+				cli: 'claude',
+				startedSince: '2026-07-01T00:00:00Z',
+				startedBefore: '2026-07-02T00:00:00Z',
+				completedSince: '2026-07-03T00:00:00Z',
+				completedBefore: '2026-07-04T00:00:00Z',
+				sort: 'completedAt',
+				order: 'asc',
+			});
+
+			expect(listRunsFromDb).toHaveBeenCalledWith({
+				status: ['failed', 'checkpointed'],
+				repository: 'acme/widgets',
+				taskId: '103',
+				prNumber: '77',
+				workerId: '11111111-1111-4111-8111-111111111111',
+				cli: 'claude',
+				startedSince: new Date('2026-07-01T00:00:00Z'),
+				startedBefore: new Date('2026-07-02T00:00:00Z'),
+				completedSince: new Date('2026-07-03T00:00:00Z'),
+				completedBefore: new Date('2026-07-04T00:00:00Z'),
+				sort: 'completedAt',
+				order: 'asc',
+				limit: 50,
+				offset: 0,
+			});
+		});
+
+		it('keeps the later of since and startedSince when both are sent', async () => {
+			vi.mocked(listRunsFromDb).mockResolvedValue({ data: [], total: 0 });
+
+			await caller.list({ since: '2026-07-05T00:00:00Z', startedSince: '2026-07-01T00:00:00Z' });
+
+			expect(listRunsFromDb).toHaveBeenCalledWith({
+				limit: 50,
+				offset: 0,
+				startedSince: new Date('2026-07-05T00:00:00Z'),
+			});
+		});
+
+		it.each([
+			['an empty status array', { status: [] }],
+			['a worker id that is not a uuid', { workerId: 'studio-mac' }],
+			['an unknown CLI', { cli: 'gemini' }],
+			['a non-positive pull request number', { prNumber: 0 }],
+			['an unknown sort column', { sort: 'durationMs' }],
+			['a completedBefore that is not ISO 8601', { completedBefore: 'tomorrow' }],
+		])('refuses %s at the boundary, without querying', async (_label, input) => {
+			await expect(caller.list(input as never)).rejects.toThrowError(
+				expect.objectContaining({ code: 'BAD_REQUEST' }),
+			);
+			expect(listRunsFromDb).not.toHaveBeenCalled();
+		});
+
 		it('refuses a since that is not an ISO 8601 timestamp, without querying', async () => {
 			await expect(caller.list({ since: 'yesterday' })).rejects.toThrowError(
 				expect.objectContaining({ code: 'BAD_REQUEST' }),
@@ -602,7 +678,7 @@ describe('runsRouter', () => {
 		it('names a retired machine from the maintenance run itself', async () => {
 			vi.mocked(listRunsFromDb).mockResolvedValue({
 				data: [
-					makeRun({
+					makeListedRun({
 						id: 'run-update',
 						kind: 'worker-update',
 						phase: 'worker-update',
@@ -612,7 +688,7 @@ describe('runsRouter', () => {
 						maintenanceMachine: 'studio-mac',
 						maintenanceTarget: 'main',
 					}),
-					makeRun({ id: 'run-pipeline', workerId: 'worker-gone' }),
+					makeListedRun({ id: 'run-pipeline', workerId: 'worker-gone' }),
 				],
 				total: 2,
 			});
@@ -625,7 +701,7 @@ describe('runsRouter', () => {
 
 		it('degrades to unnamed machines when the lookup itself fails', async () => {
 			vi.mocked(listRunsFromDb).mockResolvedValue({
-				data: [makeRun({ id: 'run-1', workerId: 'worker-a' })],
+				data: [makeListedRun({ id: 'run-1', workerId: 'worker-a' })],
 				total: 1,
 			});
 			vi.mocked(getWorkers).mockRejectedValue(new Error('workers table unavailable'));
@@ -637,7 +713,12 @@ describe('runsRouter', () => {
 
 		it('exposes a completed Review run’s verdict in the list data shape (issue #218)', async () => {
 			const data = [
-				makeRun({ id: 'run-1', phase: 'review', status: 'completed', reviewVerdict: 'approve' }),
+				makeListedRun({
+					id: 'run-1',
+					phase: 'review',
+					status: 'completed',
+					reviewVerdict: 'approve',
+				}),
 			];
 			vi.mocked(listRunsFromDb).mockResolvedValue({ data, total: 1 });
 
@@ -4008,7 +4089,7 @@ describe('runsRouter', () => {
 		});
 
 		it('is listed, and can be isolated by its phase', async () => {
-			vi.mocked(listRunsFromDb).mockResolvedValue({ data: [maintenanceRun()], total: 1 });
+			vi.mocked(listRunsFromDb).mockResolvedValue({ data: [toListed(maintenanceRun())], total: 1 });
 
 			const page = await caller.list({ phase: 'worker-update' });
 
@@ -4633,6 +4714,31 @@ describe('runsRouter', () => {
 					limit: 50,
 					offset: 0,
 					startedSince: new Date(since),
+					projectIds: ['p1'],
+				});
+			});
+
+			// Issue #1339 — the operator MCP filters narrow within the scope, never past it.
+			it("carries issue #1339's filters and ordering alongside the membership scope", async () => {
+				vi.mocked(listAccessibleProjectIds).mockResolvedValue(['p1']);
+				vi.mocked(listRunsFromDb).mockResolvedValue({ data: [], total: 0 });
+
+				await ordinary.list({
+					status: ['failed', 'deferred'],
+					repository: 'acme/widgets',
+					cli: 'codex',
+					sort: 'completedAt',
+					order: 'asc',
+				});
+
+				expect(listRunsFromDb).toHaveBeenCalledWith({
+					status: ['failed', 'deferred'],
+					repository: 'acme/widgets',
+					cli: 'codex',
+					sort: 'completedAt',
+					order: 'asc',
+					limit: 50,
+					offset: 0,
 					projectIds: ['p1'],
 				});
 			});

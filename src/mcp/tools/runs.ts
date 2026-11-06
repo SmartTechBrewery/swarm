@@ -20,17 +20,43 @@ import { callerFor, runTool } from '../tool-helpers.js';
  * never accept a filter the procedure would reject (or miss one it gains), each
  * given the description a calling model reads.
  */
+const listShape = ListRunsInputSchema.shape;
 const runsListInput = {
-	projectId: ListRunsInputSchema.shape.projectId.describe(
+	projectId: listShape.projectId.describe(
 		'Only runs of this project id. Omit to list every project you can read.',
 	),
-	status: ListRunsInputSchema.shape.status.describe('Only runs in this status.'),
-	phase: ListRunsInputSchema.shape.phase.describe('Only runs of this pipeline phase.'),
-	since: ListRunsInputSchema.shape.since.describe(
+	repository: listShape.repository.describe(
+		'Only runs against this repository, exactly as the project names it (e.g. `owner/repo`).',
+	),
+	taskId: listShape.taskId.describe(
+		'Only runs of this task id (the issue/card the worktree and branch are named after).',
+	),
+	prNumber: listShape.prNumber.describe('Only runs that acted on this pull request number.'),
+	status: listShape.status.describe(
+		'Only runs in this status, or in any of an array of statuses (e.g. `["failed", "deferred"]`).',
+	),
+	phase: listShape.phase.describe('Only runs of this pipeline phase.'),
+	workerId: listShape.workerId.describe('Only runs executed by this worker id.'),
+	cli: listShape.cli.describe('Only runs executed on this agent CLI.'),
+	startedSince: listShape.startedSince.describe(
 		'ISO 8601 timestamp; only runs started at or after it.',
 	),
-	limit: ListRunsInputSchema.shape.limit.describe('Page size (1–200, default 50).'),
-	offset: ListRunsInputSchema.shape.offset.describe('Rows to skip, for paging (default 0).'),
+	startedBefore: listShape.startedBefore.describe(
+		'ISO 8601 timestamp; only runs started before it.',
+	),
+	since: listShape.since.describe('Alias of `startedSince`.'),
+	completedSince: listShape.completedSince.describe(
+		'ISO 8601 timestamp; only runs completed at or after it (excludes unfinished runs).',
+	),
+	completedBefore: listShape.completedBefore.describe(
+		'ISO 8601 timestamp; only runs completed before it (excludes unfinished runs).',
+	),
+	sort: listShape.sort.describe(
+		'Order by `startedAt` (default) or `completedAt`; unfinished runs sort last by `completedAt`.',
+	),
+	order: listShape.order.describe('`desc` (default, newest first) or `asc`.'),
+	limit: listShape.limit.describe('Page size (1–200, default 50).'),
+	offset: listShape.offset.describe('Rows to skip, for paging (default 0).'),
 };
 
 const runGetInput = {
@@ -60,9 +86,13 @@ export function registerRunTools(server: McpServer, user: SwarmUser): void {
 		{
 			title: 'List runs',
 			description:
-				'Read-only. Lists pipeline runs, newest first, with their phase, status, task, ' +
-				'worker and timing, as `{ data, total }`. Covers every project you are a member of ' +
-				'(every project for an instance administrator); pass `projectId` to read one project.',
+				'Read-only. Lists pipeline runs, newest started first unless `sort`/`order` say ' +
+				'otherwise, as `{ data, total }` — `total` counts every run matching the filters. ' +
+				'Each row carries its phase, status, task and pull request, worker (`workerId`, ' +
+				'`workerName`), CLI (`engine`) and model, `startedAt`/`completedAt`, `durationMs`, ' +
+				'`retryCount`, `continuationCount` and a one-line `errorSummary`. Covers every ' +
+				'project you are a member of (every project for an instance administrator); pass ' +
+				'`projectId` to read one project.',
 			inputSchema: runsListInput,
 			annotations: { readOnlyHint: true, openWorldHint: false },
 		},

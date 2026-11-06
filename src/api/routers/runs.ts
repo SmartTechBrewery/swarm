@@ -45,6 +45,7 @@ import {
 	isPipelineRun,
 	isRetryPendingStatus,
 	type ListRunsFilter,
+	type ListRunsSort,
 	listRunsFromDb,
 	listTaskActivitySince,
 	type PipelineRunRow,
@@ -386,16 +387,67 @@ const RunPhaseEnum = z.enum([
 	WORKER_UPDATE_RUN_PHASE,
 ]);
 
+// Every time bound is an ISO 8601 string, not a coerced Date — no transformer is
+// configured, so the wire is JSON.
+const IsoInstant = z.string().datetime({ offset: true });
+
+/**
+ * `runs.list`'s input. Every filter past the original four (issue #1339 — the
+ * operator MCP server's `runs_list`) is optional and has no default, so the
+ * dashboard's and the CLI's existing calls send, and the repository receives,
+ * exactly what they did before.
+ */
 export const ListRunsInputSchema = z.object({
 	projectId: z.string().min(1).optional(),
-	status: RunStatusEnum.optional(),
+	/** One status, or any of several (issue #1339). */
+	status: z.union([RunStatusEnum, z.array(RunStatusEnum).min(1)]).optional(),
 	phase: RunPhaseEnum.optional(),
+	repository: z.string().min(1).optional(),
+	taskId: z.string().min(1).optional(),
+	prNumber: z.number().int().positive().optional(),
+	// `worker_id` is a uuid column: a malformed id is refused here rather than as a
+	// Postgres cast error.
+	workerId: z.string().uuid().optional(),
+	cli: AgentCliSchema.optional(),
 	limit: z.number().int().positive().max(200).default(50),
 	offset: z.number().int().nonnegative().default(0),
-	// The list's time window (issue #1182): ISO 8601, runs started at or after it.
-	// A string, not a coerced Date — no transformer is configured, so the wire is JSON.
-	since: z.string().datetime({ offset: true }).optional(),
+	// The list's time window (issue #1182): runs started at or after it. Kept as the
+	// alias of `startedSince` that `swarm run list --since` sends.
+	since: IsoInstant.optional(),
+	startedSince: IsoInstant.optional(),
+	startedBefore: IsoInstant.optional(),
+	completedSince: IsoInstant.optional(),
+	completedBefore: IsoInstant.optional(),
+	sort: z.enum(['startedAt', 'completedAt'] satisfies [ListRunsSort, ...ListRunsSort[]]).optional(),
+	order: z.enum(['asc', 'desc']).optional(),
 });
+
+type ListRunsInput = z.infer<typeof ListRunsInputSchema>;
+
+/**
+ * Turn `runs.list`'s wire input into the repository filter: the ISO bounds become
+ * instants and the PR number the `pr_number` text it is stored as. `since` and
+ * `startedSince` are both lower bounds on the same column, so when both are sent
+ * the later one is the one the pair means.
+ */
+function toListRunsFilter(input: ListRunsInput): ListRunsFilter {
+	const { since, startedSince, startedBefore, completedSince, completedBefore, prNumber, ...rest } =
+		input;
+	const lowerBounds = [since, startedSince]
+		.filter((value) => value !== undefined)
+		.map((value) => new Date(value));
+	const latestLowerBound = lowerBounds.length
+		? new Date(Math.max(...lowerBounds.map((date) => date.getTime())))
+		: undefined;
+	return {
+		...rest,
+		...(prNumber !== undefined ? { prNumber: String(prNumber) } : {}),
+		...(latestLowerBound ? { startedSince: latestLowerBound } : {}),
+		...(startedBefore ? { startedBefore: new Date(startedBefore) } : {}),
+		...(completedSince ? { completedSince: new Date(completedSince) } : {}),
+		...(completedBefore ? { completedBefore: new Date(completedBefore) } : {}),
+	};
+}
 
 function wakeJobId(dispatch: { id: string; wakeSeq: number }): string {
 	return `dispatch_${dispatch.id}_w${dispatch.wakeSeq}`;
@@ -1514,11 +1566,10 @@ const runReadProcedures = {
 	// the projects they are a member of. A user who belongs to no project gets an
 	// empty page rather than a denial — an empty scope would otherwise widen the
 	// query back to every project, so it short-circuits without querying at all.
-	// The optional `since` window (issue #1182) narrows the set within that scope;
-	// it never widens it.
+	// The optional `since` window (issue #1182) and the filters and ordering issue
+	// #1339 added narrow or order the set within that scope; none of them widens it.
 	list: authedProcedure.input(ListRunsInputSchema).query(async ({ ctx, input }) => {
-		const { since, ...rest } = input;
-		const filter = since ? { ...rest, startedSince: new Date(since) } : rest;
+		const filter = toListRunsFilter(input);
 		if (filter.projectId) {
 			await assertProjectAccess(ctx.user, filter.projectId, 'contributor');
 			return await listRunsWithWorkerNames(filter);

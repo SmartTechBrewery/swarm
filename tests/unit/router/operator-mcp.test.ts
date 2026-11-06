@@ -367,6 +367,53 @@ describe('operator MCP — runs_list', () => {
 		});
 	});
 
+	// Issue #1339 — the widened filters, including a status array.
+	it('accepts several statuses and the widened filters and ordering', async () => {
+		listRunsFromDb.mockResolvedValue({ data: [], total: 0 });
+
+		const result = await callTool(
+			'runs_list',
+			{
+				projectId: 'proj-a',
+				status: ['failed', 'deferred'],
+				taskId: '42',
+				prNumber: 7,
+				cli: 'codex',
+				completedSince: '2026-10-01T00:00:00Z',
+				sort: 'completedAt',
+				order: 'asc',
+			},
+			'member-token',
+		);
+
+		expect(result.isError).toBeUndefined();
+		expect(listRunsFromDb).toHaveBeenCalledWith({
+			projectId: 'proj-a',
+			status: ['failed', 'deferred'],
+			taskId: '42',
+			prNumber: '7',
+			cli: 'codex',
+			completedSince: new Date('2026-10-01T00:00:00Z'),
+			sort: 'completedAt',
+			order: 'asc',
+			limit: 50,
+			offset: 0,
+		});
+	});
+
+	it('returns the list-only row facts the repository computes', async () => {
+		listRunsFromDb.mockResolvedValue({
+			data: [{ ...failedRun(), retryCount: 2, errorSummary: 'Agent exited with code 1' }],
+			total: 1,
+		});
+
+		const result = await callTool('runs_list', {}, 'member-token');
+
+		expect(result.structuredContent).toMatchObject({
+			data: [{ id: RUN_ID, retryCount: 2, errorSummary: 'Agent exited with code 1' }],
+		});
+	});
+
 	it('lists the whole installation for an instance admin', async () => {
 		await callTool('runs_list', {}, 'admin-token');
 
