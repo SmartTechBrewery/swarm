@@ -8,6 +8,8 @@ vi.mock('@/db/repositories/runsRepository.js', async (importOriginal) => ({
 	listRunsFromDb: vi.fn(),
 	listTaskActivitySince: vi.fn(),
 	getRunByIdFromDb: vi.fn(),
+	// `prStatus`'s Review-run read (issue #1342).
+	getLatestCompletedReviewRunForPullRequest: vi.fn(),
 	getRunLogsFromDb: vi.fn(),
 	getRunOutputEvents: vi.fn(),
 	markRunUserTerminated: vi.fn(),
@@ -212,6 +214,7 @@ import {
 } from '@/db/repositories/reviewVerdictsRepository.js';
 import {
 	cancelDeferredRunInDb,
+	getLatestCompletedReviewRunForPullRequest,
 	getRunByIdFromDb,
 	getRunLogsFromDb,
 	getRunOutputEvents,
@@ -2566,6 +2569,139 @@ describe('runsRouter', () => {
 					});
 				});
 			});
+		});
+	});
+
+	describe('prStatus (issue #1342)', () => {
+		const PR = { projectId: 'p1', repository: 'SmartTechBrewery/swarm', prNumber: 262 };
+
+		function slot(overrides: Partial<PullRequestReviewSlot> = {}): PullRequestReviewSlot {
+			return {
+				ordinal: 1,
+				state: 'submitted',
+				headSha: 'head-1',
+				capOverrideGrantedAt: null,
+				capOverrideConsumedAt: null,
+				dispatchActive: false,
+				superseded: false,
+				...overrides,
+			};
+		}
+
+		/** One submitted slot per permitted verdict — the verdict cap reached. */
+		function cappedSlots(): PullRequestReviewSlot[] {
+			return Array.from({ length: REVIEW_VERDICT_CAP }, (_, i) =>
+				slot({ ordinal: i + 1, headSha: `head-${i + 1}` }),
+			);
+		}
+
+		beforeEach(() => {
+			vi.mocked(getLatestCompletedReviewRunForPullRequest).mockReset().mockResolvedValue(undefined);
+		});
+
+		it('reports the merge outcome of the latest Review run and a ledger short of the cap', async () => {
+			vi.mocked(getLatestCompletedReviewRunForPullRequest).mockResolvedValue(
+				makeRun({
+					id: 'review-2',
+					phase: 'review',
+					prNumber: '262',
+					reviewVerdict: 'approve',
+					reviewMergeOutcome: 'retry-exhausted',
+					reviewMergeMessage: 'checks still pending',
+				}),
+			);
+			vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue([
+				slot({ ordinal: 1, headSha: 'head-1' }),
+				slot({ ordinal: 2, headSha: 'head-2' }),
+			]);
+
+			await expect(caller.prStatus(PR)).resolves.toEqual({
+				lastReviewRunId: 'review-2',
+				lastReviewVerdict: 'approve',
+				lastReviewedHeadSha: 'head-2',
+				mergeOutcome: 'retry-exhausted',
+				mergeOutcomeMessage: 'checks still pending',
+				verdictCount: 2,
+				verdictCap: REVIEW_VERDICT_CAP,
+				supersededCount: 0,
+				supersededCap: REVIEW_SUPERSEDED_CAP,
+				capReached: false,
+				capBound: null,
+				overrideOutstanding: false,
+			});
+			// Keyed on the pull request's own repository, with the number as stored.
+			expect(getLatestCompletedReviewRunForPullRequest).toHaveBeenCalledWith(
+				'p1',
+				'SmartTechBrewery/swarm',
+				'262',
+			);
+			expect(listActiveReviewSlotsForPullRequest).toHaveBeenCalledWith(
+				'p1',
+				'SmartTechBrewery/swarm',
+				'262',
+			);
+		});
+
+		it('reports the verdict cap reached, with no grant outstanding', async () => {
+			vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(cappedSlots());
+
+			await expect(caller.prStatus(PR)).resolves.toMatchObject({
+				verdictCount: REVIEW_VERDICT_CAP,
+				capReached: true,
+				capBound: 'verdict-cap',
+				overrideOutstanding: false,
+				lastReviewedHeadSha: `head-${REVIEW_VERDICT_CAP}`,
+			});
+		});
+
+		it('reports an outstanding operator grant on a capped pull request', async () => {
+			const slots = cappedSlots();
+			slots[slots.length - 1] = {
+				...slots[slots.length - 1],
+				capOverrideGrantedAt: new Date('2026-11-06T09:00:00Z'),
+			};
+			vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(slots);
+
+			await expect(caller.prStatus(PR)).resolves.toMatchObject({
+				capReached: true,
+				capBound: 'verdict-cap',
+				overrideOutstanding: true,
+			});
+		});
+
+		it('counts a superseded approval apart and names the replacement head as the latest', async () => {
+			vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue([
+				slot({ ordinal: 1, headSha: 'head-old', superseded: true }),
+				slot({ ordinal: 1, headSha: 'head-new' }),
+			]);
+
+			await expect(caller.prStatus(PR)).resolves.toMatchObject({
+				verdictCount: 1,
+				supersededCount: 1,
+				capReached: false,
+				lastReviewedHeadSha: 'head-new',
+			});
+		});
+
+		it('answers a pull request SWARM never reviewed with empty fields, not an error', async () => {
+			await expect(caller.prStatus(PR)).resolves.toMatchObject({
+				lastReviewRunId: null,
+				lastReviewedHeadSha: null,
+				mergeOutcome: null,
+				verdictCount: 0,
+				capReached: false,
+			});
+		});
+
+		it('denies a non-member with NOT_FOUND before reading anything', async () => {
+			vi.mocked(getMembership).mockResolvedValue(undefined);
+			const ordinary = runsRouter.createCaller({ user: ORDINARY_USER });
+
+			await expect(ordinary.prStatus(PR)).rejects.toThrowError(
+				expect.objectContaining({ code: 'NOT_FOUND' }),
+			);
+			expect(getLatestCompletedReviewRunForPullRequest).not.toHaveBeenCalled();
+			expect(listActiveReviewSlotsForPullRequest).not.toHaveBeenCalled();
 		});
 	});
 
