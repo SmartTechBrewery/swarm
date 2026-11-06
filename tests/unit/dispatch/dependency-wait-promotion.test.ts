@@ -101,11 +101,12 @@ describe('promoteDependencyWaits', () => {
 		const first = row();
 		const second = row({ id: 'dispatch-2', taskId: '102', phase: 'planning', wakeSeq: 1 });
 		listDependencyWaits.mockResolvedValue([first, second]);
+		const [firstWoken, secondWoken] = [redated(first), redated(second)];
 		promoteDispatchToImmediateWake
-			.mockResolvedValueOnce(redated(first))
-			.mockResolvedValueOnce(redated(second));
+			.mockResolvedValueOnce(firstWoken)
+			.mockResolvedValueOnce(secondWoken);
 
-		expect(await promoteDependencyWaits('proj-1', 'merged')).toBe(2);
+		expect(await promoteDependencyWaits('proj-1', 'merged')).toEqual([firstWoken, secondWoken]);
 
 		expect(listDependencyWaits).toHaveBeenCalledExactlyOnceWith('proj-1');
 		expect(promoteDispatchToImmediateWake.mock.calls).toEqual([
@@ -140,12 +141,24 @@ describe('promoteDependencyWaits', () => {
 	});
 
 	it('is a no-op when nothing in the project waits on a dependency', async () => {
-		expect(await promoteDependencyWaits('proj-1', 'board-done')).toBe(0);
+		expect(await promoteDependencyWaits('proj-1', 'board-done')).toEqual([]);
 
 		expect(promoteDispatchToImmediateWake).not.toHaveBeenCalled();
 		expect(enqueueDispatchWakeUp).not.toHaveBeenCalled();
 		expect(removePendingJobById).not.toHaveBeenCalled();
 		expect(info).not.toHaveBeenCalled();
+	});
+
+	// Issue #1347: an operator's wake is not a blocker becoming done, and says so.
+	it("names an operator's wake as such in its log line", async () => {
+		listDependencyWaits.mockResolvedValue([row()]);
+
+		await promoteDependencyWaits('proj-1', 'operator');
+
+		expect(info).toHaveBeenCalledWith(
+			'dispatch: an operator woke the dependency-waiting dispatches',
+			expect.objectContaining({ projectId: 'proj-1', cause: 'operator', promoted: 1 }),
+		);
 	});
 
 	// Claimed by its own timer, cancelled, or re-deferred in between.
@@ -155,7 +168,9 @@ describe('promoteDependencyWaits', () => {
 		listDependencyWaits.mockResolvedValue([movedOn, waiting]);
 		promoteDispatchToImmediateWake.mockResolvedValueOnce(null);
 
-		expect(await promoteDependencyWaits('proj-1', 'board-done')).toBe(1);
+		expect((await promoteDependencyWaits('proj-1', 'board-done')).map((r) => r.id)).toEqual([
+			waiting.id,
+		]);
 
 		expect(enqueueDispatchWakeUp).toHaveBeenCalledOnce();
 		expect(removePendingJobById).toHaveBeenCalledExactlyOnceWith(wakeJobId(waiting));
@@ -167,7 +182,9 @@ describe('promoteDependencyWaits', () => {
 		listDependencyWaits.mockResolvedValue([first, second]);
 		enqueueDispatchWakeUp.mockRejectedValueOnce(new Error('redis is down'));
 
-		expect(await promoteDependencyWaits('proj-1', 'merged')).toBe(1);
+		expect((await promoteDependencyWaits('proj-1', 'merged')).map((r) => r.id)).toEqual([
+			second.id,
+		]);
 
 		expect(removePendingJobById).toHaveBeenCalledExactlyOnceWith(wakeJobId(second));
 		expect(warn).toHaveBeenCalledWith(
@@ -181,7 +198,7 @@ describe('promoteDependencyWaits', () => {
 	it('swallows a read failure', async () => {
 		listDependencyWaits.mockRejectedValue(new Error('database is down'));
 
-		await expect(promoteDependencyWaits('proj-1', 'merged')).resolves.toBe(0);
+		await expect(promoteDependencyWaits('proj-1', 'merged')).resolves.toEqual([]);
 
 		expect(warn).toHaveBeenCalledWith(
 			'dispatch: dependency-wait promotion failed',
