@@ -15,6 +15,7 @@
 
 import { randomUUID } from 'node:crypto';
 import {
+	type AnyColumn,
 	and,
 	asc,
 	count,
@@ -25,6 +26,7 @@ import {
 	inArray,
 	isNotNull,
 	isNull,
+	lt,
 	ne,
 	notExists,
 	notInArray,
@@ -2006,25 +2008,147 @@ export interface ListRunsFilter {
 	 * without querying).
 	 */
 	projectIds?: readonly string[];
-	status?: RunStatus;
+	/** One status, or any of several (issue #1339); an empty array means no restriction. */
+	status?: RunStatus | readonly RunStatus[];
 	/**
 	 * Widened past `TriggerPhase` (issue #971) so the list's existing phase filter can
 	 * isolate maintenance runs, whose `phase` is the maintenance kind's own name.
 	 */
 	phase?: TriggerPhase | typeof WORKER_UPDATE_RUN_PHASE;
+	/** The run's own `repository`, exact match (issue #1339). */
+	repository?: string;
+	/** The run's own `task_id`, exact match (issue #1339). */
+	taskId?: string;
+	/** The pull request the run acted on (`pr_number`), exact match (issue #1339). */
+	prNumber?: string;
+	/** The worker the run's latest attempt was bound to (issue #1339). */
+	workerId?: string;
+	/** The agent CLI the run's latest attempt ran on — the `engine` column (issue #1339). */
+	cli?: AgentCli;
 	/** Only runs started at or after this instant — the list's time window (issue #1182). */
 	startedSince?: Date;
+	/** Only runs started strictly before this instant (issue #1339). */
+	startedBefore?: Date;
+	/** Only runs completed at or after this instant; excludes unfinished runs (issue #1339). */
+	completedSince?: Date;
+	/** Only runs completed strictly before this instant; excludes unfinished runs (issue #1339). */
+	completedBefore?: Date;
+	/** The timestamp the page is ordered by (issue #1339); `startedAt` when omitted. */
+	sort?: ListRunsSort;
+	/** The direction of {@link sort} (issue #1339); `desc` (newest first) when omitted. */
+	order?: 'asc' | 'desc';
 	limit: number;
 	offset: number;
 }
 
+/** The columns {@link listRunsFromDb} can order by (issue #1339). */
+export type ListRunsSort = 'startedAt' | 'completedAt';
+
+/** The longest {@link ListedRunRow.errorSummary} the list carries, ellipsis included. */
+export const RUN_ERROR_SUMMARY_MAX_LENGTH = 200;
+
 /**
- * Paginated, filtered list of runs ordered by `startedAt` desc. `total` is the
- * count of the *filtered* set (not the page), so a UI can render page counts;
- * it runs as a separate query against the same conditions. Sort order is fixed
- * (`startedAt desc`). A lower bound on `startedAt` (`startedSince`, issue #1182)
- * narrows the set `total` counts too; sortable columns and an upper bound remain
- * out of scope.
+ * One row of {@link listRunsFromDb}: the stored run plus three list-only facts
+ * (issue #1339), each additive so every existing reader of the row keeps working.
+ */
+export type ListedRunRow = RunRow & {
+	/**
+	 * The stored `duration_ms`, or — for a settled run that recorded none — the
+	 * wall-clock span from `started_at` to `completed_at`. Null while the run has
+	 * not finished.
+	 */
+	durationMs: number | null;
+	/**
+	 * How many automatic retries the run's current job has spent: the deferred-retry,
+	 * automatic-retry and preserved-work-retry counters on its persisted payload
+	 * (`src/queue/jobs.ts`). Dependency and worker-eligibility re-checks are waits,
+	 * not retries, so they are not counted; a manual Retry now or Reset zeroes them.
+	 */
+	retryCount: number;
+	/**
+	 * The first non-blank line of the stored `error`, capped at
+	 * {@link RUN_ERROR_SUMMARY_MAX_LENGTH} characters — enough to tell failures apart
+	 * in a list without shipping whole logs. Null when the run recorded no error.
+	 */
+	errorSummary: string | null;
+};
+
+/** {@link ListedRunRow.errorSummary} for a stored `error`. */
+export function summarizeRunError(error: string | null): string | null {
+	if (error === null) return null;
+	const line = error
+		.split(/\r?\n/)
+		.map((part) => part.trim())
+		.find((part) => part.length > 0);
+	if (line === undefined) return null;
+	return line.length <= RUN_ERROR_SUMMARY_MAX_LENGTH
+		? line
+		: `${line.slice(0, RUN_ERROR_SUMMARY_MAX_LENGTH - 1)}…`;
+}
+
+/** {@link ListedRunRow.retryCount} for a run's persisted job payload. */
+export function runRetryCount(job: SwarmJob | null): number {
+	if (!job) return 0;
+	return (
+		(job.rateLimitRetryAttempt ?? 0) +
+		(job.automaticRetryAttempt ?? 0) +
+		(job.preservedWorkRetryAttempt ?? 0)
+	);
+}
+
+function toListedRunRow(row: RunRow): ListedRunRow {
+	const durationMs =
+		row.durationMs ??
+		(row.completedAt ? Math.max(0, row.completedAt.getTime() - row.startedAt.getTime()) : null);
+	return {
+		...row,
+		durationMs,
+		retryCount: runRetryCount(row.jobPayload),
+		errorSummary: summarizeRunError(row.error),
+	};
+}
+
+/** The conditions each set field of `filter` adds to {@link listRunsFromDb}'s query. */
+function listRunsFilterConditions(filter: ListRunsFilter): SQL[] {
+	const statuses = typeof filter.status === 'string' ? [filter.status] : (filter.status ?? []);
+	const exact: [AnyColumn, string | undefined][] = [
+		[runs.projectId, filter.projectId],
+		[runs.phase, filter.phase],
+		[runs.repository, filter.repository],
+		[runs.taskId, filter.taskId],
+		[runs.prNumber, filter.prNumber],
+		[runs.workerId, filter.workerId],
+		[runs.engine, filter.cli],
+	];
+	// A lower bound is inclusive and an upper bound exclusive, so adjacent windows
+	// never count a run twice. A NULL `completed_at` satisfies neither completion bound.
+	const bounds: [AnyColumn, typeof gte, Date | undefined][] = [
+		[runs.startedAt, gte, filter.startedSince],
+		[runs.startedAt, lt, filter.startedBefore],
+		[runs.completedAt, gte, filter.completedSince],
+		[runs.completedAt, lt, filter.completedBefore],
+	];
+	const conditions: SQL[] = [];
+	if (filter.projectIds && filter.projectIds.length > 0) {
+		conditions.push(inArray(runs.projectId, [...filter.projectIds]));
+	}
+	if (statuses.length > 0) conditions.push(inArray(runs.status, [...statuses]));
+	for (const [column, value] of exact) {
+		if (value) conditions.push(eq(column, value));
+	}
+	for (const [column, compare, value] of bounds) {
+		if (value) conditions.push(compare(column, value));
+	}
+	return conditions;
+}
+
+/**
+ * Paginated, filtered list of runs, newest-started first unless `sort`/`order` say
+ * otherwise (issue #1339). `total` is the count of the *filtered* set (not the
+ * page), so a UI can render page counts; it runs as a separate query against the
+ * same conditions. Every filter narrows the set `total` counts too. Ordering by
+ * `completedAt` puts unfinished runs last in either direction, and every order is
+ * tie-broken on `id` so a page boundary is stable between two reads.
  *
  * Queue and Runs are complementary read models (issues #279/#316): Queue is
  * the canonical list for waiting dispatches, so Runs hides only a retry-pending
@@ -2038,7 +2162,7 @@ export interface ListRunsFilter {
  */
 export async function listRunsFromDb(
 	filter: ListRunsFilter,
-): Promise<{ data: RunRow[]; total: number }> {
+): Promise<{ data: ListedRunRow[]; total: number }> {
 	const db = getDb();
 	const hasWaitingDispatch = db
 		.select({ id: dispatches.id })
@@ -2052,25 +2176,27 @@ export async function listRunsFromDb(
 			notExists(hasWaitingDispatch),
 		) as SQL,
 	];
-	if (filter.projectId) conditions.push(eq(runs.projectId, filter.projectId));
-	if (filter.projectIds && filter.projectIds.length > 0) {
-		conditions.push(inArray(runs.projectId, [...filter.projectIds]));
-	}
-	if (filter.status) conditions.push(eq(runs.status, filter.status));
-	if (filter.phase) conditions.push(eq(runs.phase, filter.phase));
-	if (filter.startedSince) conditions.push(gte(runs.startedAt, filter.startedSince));
+	conditions.push(...listRunsFilterConditions(filter));
 
 	const where = and(...conditions);
+	const direction = filter.order === 'asc' ? asc : desc;
+	// `nulls last` in either direction: a run that has not completed has no place in
+	// a completion order. `started_at` is NOT NULL, so its plain order is kept — that
+	// is the one `idx_runs_started_at` serves.
+	const primary =
+		filter.sort === 'completedAt'
+			? sql`${runs.completedAt} ${filter.order === 'asc' ? sql`asc` : sql`desc`} nulls last`
+			: direction(runs.startedAt);
 
-	const data = await db
+	const rows = await db
 		.select()
 		.from(runs)
 		.where(where)
-		.orderBy(desc(runs.startedAt))
+		.orderBy(primary, direction(runs.id))
 		.limit(filter.limit)
 		.offset(filter.offset);
 	const totalRows = await db.select({ total: count() }).from(runs).where(where);
-	return { data, total: totalRows[0].total };
+	return { data: rows.map(toListedRunRow), total: totalRows[0].total };
 }
 
 /**
