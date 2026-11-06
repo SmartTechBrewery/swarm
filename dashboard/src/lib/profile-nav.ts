@@ -1,11 +1,14 @@
 import { z } from 'zod';
+import { mayUseAgentAccessTokens } from '../../../src/identity/agent-access-token.js';
+import type { SwarmUser } from '../../../src/identity/schema.js';
 
 /**
  * The tabs on the user-profile screen, in display order — the profile's whole
  * user-facing navigation structure (issue #659), not only the part built today.
- * `workers` (issue #660), `projects` (issue #661), and `security` (issue #662) have all arrived.
+ * `workers` (issue #660), `projects` (issue #661), `security` (issue #662) and
+ * `mcp` (issue #1362) have all arrived.
  */
-export const PROFILE_TABS = ['account', 'workers', 'projects', 'security'] as const;
+export const PROFILE_TABS = ['account', 'workers', 'projects', 'security', 'mcp'] as const;
 
 export type ProfileTab = (typeof PROFILE_TABS)[number];
 
@@ -20,11 +23,26 @@ export const AVAILABLE_PROFILE_TABS: ReadonlySet<ProfileTab> = new Set<ProfileTa
 	'workers',
 	'projects',
 	'security',
+	'mcp',
 ]);
 
 /** Whether a declared tab has a panel to render yet. */
 export function isProfileTabAvailable(tab: ProfileTab): boolean {
 	return AVAILABLE_PROFILE_TABS.has(tab);
+}
+
+/** The profile fields a tab's visibility is decided from — the `auth.me` read model. */
+export type ProfileViewer = Pick<SwarmUser, 'instanceAdmin'>;
+
+/**
+ * Whether `viewer` sees a tab at all. **MCP** (issue #1362) exists only for those
+ * who may hold agent access tokens — the same `MAY_USE_AGENT_ACCESS_TOKENS`
+ * decision the token API enforces — so for anyone else there is no tab, and a
+ * deep link to it degrades to Account like an undelivered one.
+ */
+export function isProfileTabVisibleTo(tab: ProfileTab, viewer: ProfileViewer): boolean {
+	if (!isProfileTabAvailable(tab)) return false;
+	return tab === 'mcp' ? mayUseAgentAccessTokens(viewer) : true;
 }
 
 /**
@@ -47,10 +65,11 @@ export type ProfileSearch = z.infer<typeof profileSearchSchema>;
 
 /**
  * The tab to render for a given search state — Account is the default, and also
- * the fallback for a tab that is declared but not yet delivered.
+ * the fallback for a tab that is declared but not yet delivered, or not shown to
+ * this viewer.
  */
-export function resolveActiveProfileTab(search: ProfileSearch): ProfileTab {
-	return search.tab && isProfileTabAvailable(search.tab) ? search.tab : 'account';
+export function resolveActiveProfileTab(search: ProfileSearch, viewer: ProfileViewer): ProfileTab {
+	return search.tab && isProfileTabVisibleTo(search.tab, viewer) ? search.tab : 'account';
 }
 
 /** Search state for switching to a tab. */

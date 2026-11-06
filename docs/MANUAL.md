@@ -2122,8 +2122,11 @@ browser. They are the run-diagnosis path on a host with no shell (see
 [Running on a VPS behind Caddy](#running-on-a-vps-behind-caddy)); `--json` makes
 any of them scriptable. Details: [`docs/cli.md`](./cli.md#swarm-run).
 
-The same session also connects an **MCP client** — Claude Code, for one — to the
-control plane: the router serves an MCP server at `/operator/mcp` whose tools call
+An **MCP client** — Claude Code, for one — connects to the control plane too: the
+router serves an MCP server at `/operator/mcp`, open to installation
+administrators only for now. Connect it with an agent access token issued from
+your profile's **MCP** tab, which also gives you the ready `claude mcp add`
+command (the `swarm login` session works as well). Its tools call
 the dashboard's own procedures as you, so an assistant session can read runs,
 their failure causes and their agent output, a project's whole pipeline state in
 one call, a task's dispatch history, and which workers are connected, busy,
