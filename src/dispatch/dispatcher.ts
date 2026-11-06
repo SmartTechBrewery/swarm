@@ -423,7 +423,12 @@ export type DependencyWakeCause =
 	/** Merge automation merged a pull request. */
 	| 'merged'
 	/** The `pm-status-changed` trigger re-read a board card in `done`. */
-	| 'board-done';
+	| 'board-done'
+	/**
+	 * An operator asked for it — `runs.wakeDependencyWaits`, the operator MCP
+	 * server's `dependency_waits_wake` tool (issue #1347).
+	 */
+	| 'operator';
 
 /**
  * After a work item in this project becomes done, wake every dispatch waiting on
@@ -436,12 +441,14 @@ export type DependencyWakeCause =
  * Waking spends nothing extra — the woken attempt is the one its timer would have
  * spent. Best-effort and fully swallowed — it runs off a settled merge and inside
  * trigger evaluation, neither of which a datastore hiccup may fail, and the timer
- * stays as the fallback. Returns how many were woken.
+ * stays as the fallback. Returns the dispatches it woke (as re-dated), so an
+ * operator's wake (issue #1347) can name them; a dispatch it could not wake, and a
+ * failed candidate read, are logged and left out.
  */
 export async function promoteDependencyWaits(
 	projectId: string,
 	cause: DependencyWakeCause,
-): Promise<number> {
+): Promise<DispatchRow[]> {
 	try {
 		const waiting = await listDependencyWaits(projectId);
 		const woken: DispatchRow[] = [];
@@ -457,22 +464,27 @@ export async function promoteDependencyWaits(
 			}
 		}
 		if (woken.length > 0) {
-			logger.info('dispatch: a blocker is done — woke the dependency-waiting dispatches', {
-				projectId,
-				cause,
-				promoted: woken.length,
-				taskIds: woken.map((row) => row.taskId),
-				phases: woken.map((row) => row.phase),
-			});
+			logger.info(
+				cause === 'operator'
+					? 'dispatch: an operator woke the dependency-waiting dispatches'
+					: 'dispatch: a blocker is done — woke the dependency-waiting dispatches',
+				{
+					projectId,
+					cause,
+					promoted: woken.length,
+					taskIds: woken.map((row) => row.taskId),
+					phases: woken.map((row) => row.phase),
+				},
+			);
 		}
-		return woken.length;
+		return woken;
 	} catch (err) {
 		logger.warn('dispatch: dependency-wait promotion failed', {
 			projectId,
 			cause,
 			error: describeError(err),
 		});
-		return 0;
+		return [];
 	}
 }
 

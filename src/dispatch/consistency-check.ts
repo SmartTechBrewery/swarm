@@ -294,8 +294,8 @@ async function checkDependencyWaits(
 					', but none of its recorded blockers is still open. It re-checks only at ' +
 					`${dispatch.availableAt.toISOString()}.`,
 				suggestedAction:
-					"Wake the project's dependency waits now (`dependency_waits_wake`, where this " +
-					'server offers it), or use Retry now on the Queue screen.',
+					"Wake the project's dependency waits now (`dependency_waits_wake`), or use " +
+					'Retry now on the Queue screen.',
 			});
 		} catch (error) {
 			const reason = describeError(error);
