@@ -18,8 +18,11 @@
  *    re-authorizes: nothing here relaxes or re-implements its access check.
  *  - **A durable audit row for every call** (`operator_actions`): inserted as
  *    `pending` *before* the tool does anything — so a call whose row cannot be
- *    written does nothing at all — and settled as `succeeded`, `refused` (the
- *    procedure's own `TRPCError`) or `failed` (anything else) afterwards. A row that
+ *    written does nothing at all — and settled afterwards as `succeeded`, `refused`
+ *    (the wrapped procedure declined to act: a client-class `TRPCError` such as
+ *    `NOT_FOUND`, `FORBIDDEN` or `PRECONDITION_FAILED`) or `failed` (an internal
+ *    error, including one the procedure reported as `INTERNAL_SERVER_ERROR`, after
+ *    which the write may have half-happened). A row that
  *    cannot be settled is logged and the call's real result is still returned: the
  *    write happened, and reporting it as failed would invite a second one.
  *

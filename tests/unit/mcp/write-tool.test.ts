@@ -197,6 +197,72 @@ describe('runWriteTool', () => {
 		});
 	});
 
+	// tRPC wraps every non-`TRPCError` a procedure throws as `INTERNAL_SERVER_ERROR`, and
+	// `runs.reset` rethrows its own unexpected failures that way, so the class alone
+	// cannot tell a refusal from a failure: the code does.
+	it('audits an INTERNAL_SERVER_ERROR from the write as failed', async () => {
+		apply.mockRejectedValue(
+			new TRPCError({
+				code: 'INTERNAL_SERVER_ERROR',
+				message: 'Failed to reset run "run-1": connection reset',
+			}),
+		);
+
+		const result = await runWriteTool(definition(), USER, {
+			runId: 'run-1',
+			reason: 'r',
+			dryRun: false,
+		});
+
+		expect(result.isError).toBe(true);
+		expect(text(result)).toBe(
+			'INTERNAL_SERVER_ERROR: Failed to reset run "run-1": connection reset',
+		);
+		expect(settleOperatorAction).toHaveBeenCalledWith('audit-1', {
+			outcome: 'failed',
+			error: 'INTERNAL_SERVER_ERROR: Failed to reset run "run-1": connection reset',
+			projectId: 'proj-a',
+		});
+	});
+
+	it('audits a preview that broke, wrapped by tRPC, as failed rather than refused', async () => {
+		preview.mockRejectedValue(
+			new TRPCError({
+				code: 'INTERNAL_SERVER_ERROR',
+				message: 'db down',
+				cause: new Error('db down'),
+			}),
+		);
+
+		const result = await runWriteTool(definition(), USER, {
+			runId: 'run-1',
+			reason: 'r',
+			dryRun: true,
+		});
+
+		expect(text(result)).toBe('INTERNAL_SERVER_ERROR: db down');
+		expect(apply).not.toHaveBeenCalled();
+		expect(settleOperatorAction).toHaveBeenCalledWith('audit-1', {
+			outcome: 'failed',
+			error: 'INTERNAL_SERVER_ERROR: db down',
+			projectId: null,
+		});
+	});
+
+	it("audits the write's PRECONDITION_FAILED as refused", async () => {
+		apply.mockRejectedValue(
+			new TRPCError({ code: 'PRECONDITION_FAILED', message: 'Not retryable.' }),
+		);
+
+		await runWriteTool(definition(), USER, { runId: 'run-1', reason: 'r', dryRun: false });
+
+		expect(settleOperatorAction).toHaveBeenCalledWith('audit-1', {
+			outcome: 'refused',
+			error: 'PRECONDITION_FAILED: Not retryable.',
+			projectId: 'proj-a',
+		});
+	});
+
 	it('does nothing at all when the audit row cannot be written', async () => {
 		recordOperatorAction.mockRejectedValue(new Error('db down'));
 

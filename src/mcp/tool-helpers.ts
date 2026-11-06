@@ -69,11 +69,13 @@ export function errorResult(message: string): CallToolResult {
 }
 
 /**
- * Run a tool body and map its outcome to an MCP result. A `TRPCError` is the
- * procedure's own refusal (`NOT_FOUND`, `FORBIDDEN`, `PRECONDITION_FAILED`, …) and is
- * reported verbatim as `<code>: <message>`, which is the same wording the dashboard
- * shows. Anything else is unexpected: it is logged with the tool's name — never the
- * request's bearer, which nothing here holds — and reported as its described error.
+ * Run a tool body and map its outcome to an MCP result. A `TRPCError` is reported
+ * verbatim as `<code>: <message>`, which is the same wording the dashboard shows —
+ * whether it is the procedure's own refusal (`NOT_FOUND`, `FORBIDDEN`,
+ * `PRECONDITION_FAILED`, …) or an internal error (`INTERNAL_SERVER_ERROR`, …), which
+ * is also logged. Anything else is unexpected: it is logged with the tool's name —
+ * never the request's bearer, which nothing here holds — and reported as its
+ * described error.
  */
 export async function runTool(tool: string, body: () => Promise<unknown>): Promise<CallToolResult> {
 	try {
@@ -84,9 +86,29 @@ export async function runTool(tool: string, body: () => Promise<unknown>): Promi
 }
 
 /**
- * How a tool body's throw reads: a `TRPCError` is the procedure's own **refusal**,
- * reported as `<code>: <message>`; anything else is an unexpected **failure**, logged
- * with the tool's name and reported as its described error. {@link runTool}'s
+ * The `TRPCError` codes that mean the procedure **broke**, not that it declined: the
+ * server-class codes, plus `TIMEOUT`, after which a write may have half-happened.
+ * tRPC wraps every non-`TRPCError` a procedure throws as `INTERNAL_SERVER_ERROR`, and
+ * procedures such as `runs.reset` rethrow their own unexpected failures that way too,
+ * so the error's class alone cannot tell a refusal from a failure.
+ */
+const FAILURE_CODES: ReadonlySet<TRPCError['code']> = new Set<TRPCError['code']>([
+	'INTERNAL_SERVER_ERROR',
+	'NOT_IMPLEMENTED',
+	'BAD_GATEWAY',
+	'SERVICE_UNAVAILABLE',
+	'GATEWAY_TIMEOUT',
+	'TIMEOUT',
+]);
+
+/**
+ * How a tool body's throw reads: a `TRPCError` with a client-class code
+ * (`NOT_FOUND`, `FORBIDDEN`, `PRECONDITION_FAILED`, `CONFLICT`, `BAD_REQUEST`, …) is
+ * the procedure's own **refusal**, reported as `<code>: <message>`. Anything else is
+ * an unexpected **failure**, logged with the tool's name: a `TRPCError` with a
+ * {@link FAILURE_CODES} code — an internal error, including one tRPC or the
+ * procedure wrapped as `INTERNAL_SERVER_ERROR` — keeps the same `<code>: <message>`
+ * wording, and any other throw is reported as its described error. {@link runTool}'s
  * mapping, exposed so the write-tool framework (`./write-tool.ts`) can audit which
  * of the two a call ended in.
  */
@@ -95,7 +117,14 @@ export function describeToolFailure(
 	error: unknown,
 ): { outcome: 'refused' | 'failed'; message: string } {
 	if (error instanceof TRPCError) {
-		return { outcome: 'refused', message: `${error.code}: ${error.message}` };
+		const message = `${error.code}: ${error.message}`;
+		if (!FAILURE_CODES.has(error.code)) return { outcome: 'refused', message };
+		logger.warn('operator MCP tool failed', {
+			tool,
+			error: message,
+			...(error.cause ? { cause: describeError(error.cause) } : {}),
+		});
+		return { outcome: 'failed', message };
 	}
 	const message = describeError(error);
 	logger.warn('operator MCP tool failed', { tool, error: message });

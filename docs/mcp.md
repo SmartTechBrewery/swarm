@@ -194,11 +194,15 @@ the same way:
   writes one row to the `operator_actions` table: who (`user_id`,
   `user_identifier`), which `tool`, `project_id`, `target`, `reason`, `dry_run`,
   the `input` arguments, `outcome` (`succeeded`, `refused`, `failed`, or
-  `pending` while the call runs), `error`, and `started_at`/`completed_at`. The
+  `pending` while the call runs), `error`, and `started_at`/`completed_at`.
+  `refused` means the wrapped procedure declined to act (`NOT_FOUND`,
+  `FORBIDDEN`, `PRECONDITION_FAILED`, `CONFLICT`, `BAD_REQUEST`, …), so nothing
+  changed. `failed` means an internal error, including one the procedure reported
+  as `INTERNAL_SERVER_ERROR`; a real call that failed may have half-happened. The
   row is written before the tool does anything. If it cannot be written, the call
   does nothing and says so. The table has no foreign keys, so a row survives the
   deletion of the user or project it names. `project_id` is empty only when the
-  call was refused before its target resolved to a project, for example an
+  call ended before its target resolved to a project, for example an
   unknown run. No tool reads the audit table yet; query Postgres directly.
 
 | Tool | What it does | Arguments |

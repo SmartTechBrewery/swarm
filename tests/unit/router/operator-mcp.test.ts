@@ -1315,6 +1315,24 @@ describe('operator MCP — run_reset and dispatch_redispatch_now', () => {
 		expect(auditRow()).toMatchObject({ outcome: 'refused', projectId: null });
 	});
 
+	// A reset that broke part-way may already have stopped the agent and torn down the
+	// checkout: the audit row must say `failed`, never `refused` (nothing changed).
+	it('audits a reset that broke as failed, through the real caller', async () => {
+		resetRun.mockRejectedValue(new Error('connection reset'));
+
+		const result = await callTool('run_reset', { runId: RUN_ID, reason: 'wedged' }, 'driver-token');
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toBe(
+			`INTERNAL_SERVER_ERROR: Failed to reset run "${RUN_ID}": connection reset`,
+		);
+		expect(auditRow()).toMatchObject({
+			projectId: 'proj-a',
+			outcome: 'failed',
+			error: `INTERNAL_SERVER_ERROR: Failed to reset run "${RUN_ID}": connection reset`,
+		});
+	});
+
 	it('rejects a call with no reason before anything runs', async () => {
 		const result = await callTool('run_reset', { runId: RUN_ID }, 'driver-token');
 
@@ -1363,6 +1381,7 @@ describe('operator MCP — run_reset and dispatch_redispatch_now', () => {
 			waitReason: 'rate-limit',
 			availableAt: new Date('2026-11-06T12:00:00Z'),
 			leaseExpiresAt: null,
+			jobPayload: PAYLOAD,
 		});
 
 		const result = await callTool(

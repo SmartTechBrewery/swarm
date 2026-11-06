@@ -14,7 +14,7 @@ import { boolean, index, jsonb, pgTable, text, timestamp, uuid } from 'drizzle-o
  * that acted and the project it acted on, and a `set null` on either would erase
  * exactly the fact the row exists to keep. `user_id` is the acting account's id and
  * `user_identifier` its sign-in identifier at the time, so a deleted account still
- * reads. `project_id` is `null` only when the call was refused before its target
+ * reads. `project_id` is `null` only when the call ended before its target
  * resolved to a project (an unknown run, say) — the `target` still names what was
  * asked for.
  *
@@ -37,7 +37,11 @@ export const operatorActions = pgTable(
 		dryRun: boolean('dry_run').notNull(),
 		/** The tool's arguments, verbatim. */
 		input: jsonb('input').notNull(),
-		/** `pending` until settled, then `succeeded`, `refused` or `failed`. */
+		/**
+		 * `pending` until settled, then `succeeded`, `refused` (the wrapped procedure
+		 * declined to act) or `failed` (an internal error — the write may have
+		 * half-happened).
+		 */
 		outcome: text('outcome').notNull(),
 		/** The refusal or failure text, as the tool reported it; `null` on success. */
 		error: text('error'),

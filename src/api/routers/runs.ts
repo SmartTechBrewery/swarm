@@ -691,6 +691,17 @@ function placeableRetryJob(
 }
 
 /**
+ * `retryNow`'s refusal for an active dispatch whose stored payload no longer parses
+ * as a `SwarmJob` — shared with `previewAction` so a dry run reports it verbatim.
+ */
+function staleDispatchPayload(runId: string): TRPCError {
+	return new TRPCError({
+		code: 'PRECONDITION_FAILED',
+		message: `Cannot retry run "${runId}" — its dispatch payload no longer validates.`,
+	});
+}
+
+/**
  * A worker holds an unexpired claim on this run's dispatch (issue #1017), so the
  * phase may genuinely be executing there — or be one round trip from reporting its
  * result — whether or not its transport is currently up, since a phase outlives the
@@ -939,6 +950,10 @@ function previewRetryNow(
 	if (badStatus) return refusedVerdict(badStatus);
 	const budgets = 'Reset its automatic and rate-limit retry budgets to zero.';
 	if (active) {
+		if (!SwarmJobSchema.safeParse(active.jobPayload).success) {
+			const error = staleDispatchPayload(run.id);
+			return refusedVerdict({ code: error.code, message: error.message });
+		}
 		if (claim === 'executing') {
 			const error = workerRunningPhase();
 			return refusedVerdict({ code: error.code, message: error.message });
@@ -2294,12 +2309,7 @@ export const runsRouter = router({
 				// Fold the overrides into the dispatch's stored payload (authoritative
 				// at claim time) and re-open it for an immediate attempt.
 				const stored = SwarmJobSchema.safeParse(active.jobPayload);
-				if (!stored.success) {
-					throw new TRPCError({
-						code: 'PRECONDITION_FAILED',
-						message: `Cannot retry run "${input.runId}" — its dispatch payload no longer validates.`,
-					});
-				}
+				if (!stored.success) throw staleDispatchPayload(input.runId);
 				const continuesSession = failedRunContinuesPreservedSession(
 					run,
 					stored.data,

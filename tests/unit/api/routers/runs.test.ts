@@ -4104,6 +4104,25 @@ describe('runsRouter', () => {
 			expect(preview.wouldRefuse).toMatchObject({ code: 'CONFLICT' });
 		});
 
+		it("reports retryNow's stale-dispatch-payload refusal, verbatim", async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', status: 'deferred' }));
+			vi.mocked(getActiveDispatchByRunId).mockResolvedValue(
+				makeDispatch({ jobPayload: { type: 'not-a-job' } as unknown as DispatchRow['jobPayload'] }),
+			);
+
+			const preview = await caller.previewAction({ runId: 'run-1', action: 'retryNow' });
+
+			expect(preview.wouldRefuse).toEqual({
+				code: 'PRECONDITION_FAILED',
+				message: 'Cannot retry run "run-1" — its dispatch payload no longer validates.',
+			});
+			expect(preview.expectedOutcome).toBeNull();
+			expectNothingWritten();
+			await expect(caller.retryNow({ runId: 'run-1' })).rejects.toThrowError(
+				expect.objectContaining(preview.wouldRefuse),
+			);
+		});
+
 		it('refuses retryNow for a run with neither a dispatch nor a payload', async () => {
 			vi.mocked(getRunByIdFromDb).mockResolvedValue(
 				makeRun({ id: 'run-1', status: 'failed', jobPayload: null }),
