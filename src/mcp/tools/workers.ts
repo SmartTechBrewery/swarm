@@ -7,8 +7,8 @@
  * `contributor` of that project reads its enrolled workers (anyone else gets the
  * same `NOT_FOUND` an unknown project does); without one, the installation-wide
  * view is an instance administrator's alone and anyone else is refused with
- * `FORBIDDEN`. Neither writes anything — setting or extending a cool-down is a
- * separate, later tool.
+ * `FORBIDDEN`. Neither writes anything — setting or extending a cool-down is the
+ * audited write tool `cli_rate_limit_set` (`./cli-rate-limit-set.ts`).
  */
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';

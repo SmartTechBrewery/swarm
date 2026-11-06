@@ -75,6 +75,8 @@ const RecordedOrderSchema = z.object({
  * writes.
  */
 interface OrderPreview extends WriteToolPreview {
+	/** Always a project: a phase's agents belong to one, unlike a worker-scoped tool's target. */
+	projectId: string;
 	plan: { projectId: string; phase: AgentPhase; before: string[]; after: string[] };
 	detail: { previous: AgentTarget[]; next: AgentTarget[] };
 	write: { phase: AgentPhase; agents: AgentsConfig };

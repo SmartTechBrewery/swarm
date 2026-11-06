@@ -248,11 +248,12 @@ the same way:
   as `INTERNAL_SERVER_ERROR`; a real call that failed may have half-happened. The
   row is written before the tool does anything. If it cannot be written, the call
   does nothing and says so. The table has no foreign keys, so a row survives the
-  deletion of the user or project it names. `project_id` is empty only when the
+  deletion of the user or project it names. `project_id` is empty when the
   call ended before its target resolved to a project, for example an
-  unknown run, or a call its preview refused. The only tool that reads the audit
-  table is `phase_agents_restore`, which reads back the latest reorder of its own
-  project's phase; otherwise query Postgres directly.
+  unknown run, a call its preview refused, or a tool whose target belongs to no
+  project (`cli_rate_limit_set`, which acts on a worker). The only tool that reads
+  the audit table is `phase_agents_restore`, which reads back the latest reorder of
+  its own project's phase; otherwise query Postgres directly.
 
 | Tool | What it does | Arguments |
 | --- | --- | --- |
@@ -263,6 +264,7 @@ the same way:
 | `dependency_waits_wake` | Wakes every dispatch in the project waiting on the dependency gate now, instead of at its next re-check (`SWARM_DEPENDENCY_RECHECK_MS`) — the same wake a merge or a board card reaching Done triggers on its own (`runs.wakeDependencyWaits`, logged with cause `operator`). The gate re-reads the blockers, so a dependent still blocked simply waits again, and the wake spends no attempt its re-check would not have. Returns `{ projectId, woken, dispatches }`, each dispatch with `dispatchId`, `phase`, `repository`, `taskId`, `prNumber`, `runId`, `attempt` and `availableAt`. A dispatch it could not wake is logged, left on its re-check, and not listed. The dry run (`runs.previewDependencyWake`) returns `{ projectId, wouldWake, dispatches }`: the waits it would wake, in the same shape | `projectId`, `reason`, `dryRun` (default `false`) |
 | `phase_agents_reorder` | Changes the priority order of one phase's agent `targets` — which CLI/model a worker tries first — and nothing else: no target is added, removed or edited, and the phase's `timeoutMs` and `prompt` are kept. `order` lists every current target exactly once, each as `<cli>/<model>` (`claude/opus`; `default/<model>` for a target naming no CLI) or by its CLI alone (`claude`); anything that is not a permutation of the current targets (an unknown name, a repeat, a target left out) is refused as `BAD_REQUEST` naming the current targets, and a phase with no configured targets as `PRECONDITION_FAILED`. Saves through the project configuration (`projects.update`), which re-validates it as any save is and rewrites the `cli`/`model`/`reasoning` mirror from the new first target. Returns `{ projectId, phase, before, after }` (target names); the dry run (`projects.agentsForUpdate`) returns the same `before`/`after`. The order it replaced is recorded on its audit row (`detail: { previous, next }`) | `projectId`, `phase` (as for `phase_agents_get`), `order`, `reason`, `dryRun` (default `false`) |
 | `phase_agents_restore` | Puts back the order the latest successful, real (not dry-run) `phase_agents_reorder` of this project's phase replaced, read from that call's audit row, and saves it the same way. Refused as `PRECONDITION_FAILED` when the phase was never reordered, or when its targets were edited since — a CLI, model or reasoning level changed, or a target added or removed — so the recorded order is no longer a permutation of them: re-applying it would undo that edit. Reorder by hand with `phase_agents_reorder` then. A dashboard reorder of the same targets made since is not an edit, and is overwritten. Returns `{ projectId, phase, before, after }`; the dry run adds `restoring: { auditId, reorderedAt }`, naming the reorder it would undo | `projectId`, `phase`, `reason`, `dryRun` (default `false`) |
+| `cli_rate_limit_set` | Keeps one agent CLI off a worker until `until` or for `durationMinutes` (`workers.setCliRateLimit`): the same `worker_cli_rate_limits` cool-down SWARM records when a run reports a spent allowance, so routing, the Workers screen and `cli_rate_limits` treat it exactly like an observed one, and it lapses by itself at its expiry. `scope: 'owner'` applies it to every worker the named worker's owner operates: SWARM records no CLI-account identity, so one user's machines stand in for "the same CLI account" (a subscription is usually signed in on all of them). **Extend only**: a machine whose live cool-down on that CLI already lasts at least as long is left `unchanged`, so nothing a real run recorded is ever shortened, and nothing is cleared early. Refused with `BAD_REQUEST` unless exactly one of `until`/`durationMinutes` is given, in the future, and at most eight days ahead (`MAX_CLI_COOLDOWN_MS`, the ceiling an observed reset has). Returns `{ cli, scope, requestedExpiresAt, resetHint, workers }`, each worker with `workerId`, `displayName`, `currentExpiresAt`, `newExpiresAt` and `change` (`create`, `extend` or `unchanged`). The dry run (`workers.previewCliRateLimit`) returns the same shape without writing | `workerId`, `cli`, `until?`, `durationMinutes?`, `resetHint?`, `scope` (`worker` or `owner`, default `worker`), `reason`, `dryRun` (default `false`) |
 
 `run_reset`, `dispatch_redispatch_now`, `pr_force_re_review` and
 `pr_recheck_mergeability` need `member` on the project, the role that drives runs in the
@@ -307,6 +309,11 @@ phase_agents_restore { projectId: "acme", phase: "resolveConflicts",
 
 Nothing restores the order on its own when the limit resets; that is your call.
 
+`cli_rate_limit_set` acts on a machine rather than a project, so it is gated like
+the dashboard's machine-owner actions: the worker's owner or an instance
+administrator may call it, and anyone else gets `NOT_FOUND`, dry run included. Its
+audit row names no project.
+
 ## For developers
 
 The mount is `src/router/operator-mcp.ts`. It resolves the bearer as a session,
@@ -335,7 +342,8 @@ and `dryRun` and writes the `operator_actions` row
 (`src/db/repositories/operatorActionsRepository.ts`). The run tools live in
 `src/mcp/tools/run-actions.ts`, the pull-request tools in
 `src/mcp/tools/pr-actions.ts`, `dependency_waits_wake` in
-`src/mcp/tools/dependency-waits.ts`, and the phase-agent order tools in
+`src/mcp/tools/dependency-waits.ts`, `cli_rate_limit_set` in
+`src/mcp/tools/cli-rate-limit-set.ts`, and the phase-agent order tools in
 `src/mcp/tools/phase-agents.ts` (their pure permutation rules in
 `src/mcp/agent-order.ts`). A `preview` may return a `detail`, which the framework
 records on the row when the call settles, and `apply` is handed the preview it

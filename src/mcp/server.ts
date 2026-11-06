@@ -14,6 +14,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
 import type { SwarmUser } from '../identity/schema.js';
+import { registerCliRateLimitSetTools } from './tools/cli-rate-limit-set.js';
 import { registerConsistencyTools } from './tools/consistency.js';
 import { registerDependencyWaitTools } from './tools/dependency-waits.js';
 import { registerLogTools } from './tools/logs.js';
@@ -51,5 +52,6 @@ export function createSwarmMcpServer(user: SwarmUser): McpServer {
 	registerPullRequestActionTools(server, user);
 	registerDependencyWaitTools(server, user);
 	registerPhaseAgentTools(server, user);
+	registerCliRateLimitSetTools(server, user);
 	return server;
 }

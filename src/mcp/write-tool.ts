@@ -72,9 +72,13 @@ export const WRITE_TOOL_INPUT = {
 		),
 };
 
-/** What a write tool's `preview` resolves: the target's project and the dry-run report. */
+/**
+ * What a write tool's `preview` resolves: the target's project and the dry-run
+ * report. `projectId` is `null` for a target that belongs to no project — a worker
+ * machine (issue #1350) — so its audit row names none.
+ */
 export interface WriteToolPreview {
-	projectId: string;
+	projectId: string | null;
 	plan: unknown;
 	/**
 	 * What the audit row records about this change when the call settles (its
