@@ -16,6 +16,7 @@ import {
 	type AnyColumn,
 	and,
 	asc,
+	desc,
 	eq,
 	gt,
 	inArray,
@@ -1969,6 +1970,76 @@ export async function listWaitingDispatches(projectId?: string): Promise<Dispatc
 		.from(dispatches)
 		.where(where)
 		.orderBy(asc(dispatches.priority), asc(dispatches.availableAt), asc(dispatches.createdAt));
+}
+
+/**
+ * Every open dispatch of one project — all of {@link ACTIVE_DISPATCH_STATES}, so
+ * an executing attempt is listed beside the waiting ones — in
+ * {@link listWaitingDispatches}' dispatch-intent order. The dispatch half of the
+ * pipeline snapshot (issue #1340).
+ *
+ * Bounded by `limit` because the snapshot is meant as a cheap, periodic call; a
+ * caller wanting to know whether the bound bit asks for one row more than it shows.
+ */
+export async function listOpenDispatchesForProject(
+	projectId: string,
+	limit: number,
+): Promise<DispatchRow[]> {
+	return getDb()
+		.select()
+		.from(dispatches)
+		.where(
+			and(
+				eq(dispatches.projectId, projectId),
+				inArray(dispatches.state, [...ACTIVE_DISPATCH_STATES]),
+			),
+		)
+		.orderBy(asc(dispatches.priority), asc(dispatches.availableAt), asc(dispatches.createdAt))
+		.limit(limit);
+}
+
+/** Which task's or pull request's dispatches {@link listDispatchesForTask} reads. */
+export interface DispatchHistoryFilter {
+	/** Only dispatches resolved against this repository (`owner/repo`). */
+	repository?: string;
+	taskId?: string;
+	prNumber?: string;
+}
+
+/**
+ * Every dispatch — open and terminal — of one task or pull request in a project,
+ * **oldest first** (issue #1340's dispatch history). With both `taskId` and
+ * `prNumber` a row matching either is returned, since a task's board phases carry
+ * no pull request and its pull request's phases carry the task id.
+ *
+ * Matched on the resolved `task_id`/`pr_number` columns only, so a dispatch never
+ * claimed (the trigger never resolved it) is not found: reading its identity out of
+ * `job_payload` would mean a provider-shaped id (ai/RULES.md §2).
+ *
+ * Bounded by `limit`, keeping the **newest** rows when the bound bites — a task that
+ * has looped through hundreds of rechecks is diagnosed from its recent ones. A
+ * filter naming neither a task nor a pull request is answered without a query, so it
+ * can never widen into the whole project's history.
+ */
+export async function listDispatchesForTask(
+	projectId: string,
+	filter: DispatchHistoryFilter,
+	limit: number,
+): Promise<DispatchRow[]> {
+	const identity: SQL[] = [];
+	if (filter.taskId) identity.push(eq(dispatches.taskId, filter.taskId));
+	if (filter.prNumber) identity.push(eq(dispatches.prNumber, filter.prNumber));
+	if (identity.length === 0) return [];
+
+	const conditions: SQL[] = [eq(dispatches.projectId, projectId), or(...identity) as SQL];
+	if (filter.repository) conditions.push(eq(dispatches.repository, filter.repository));
+	const newestFirst = await getDb()
+		.select()
+		.from(dispatches)
+		.where(and(...conditions))
+		.orderBy(desc(dispatches.createdAt), desc(dispatches.id))
+		.limit(limit);
+	return newestFirst.reverse();
 }
 
 /**

@@ -16,6 +16,7 @@ import {
 	clearRunRecovery,
 	completeRun,
 	countRunningRunsForProject,
+	countRunsSettledSinceByStatus,
 	createFailedRun,
 	createRun as createRunRow,
 	createWorkerUpdateRun,
@@ -41,6 +42,7 @@ import {
 	hasRunForTask,
 	listRunPassedOverWorkerIds,
 	listRunsFromDb,
+	listSnapshotRunsForProject,
 	listTaskActivitySince,
 	MAX_RUN_OUTPUT_BYTES,
 	markReviewRunSuperseded,
@@ -2336,6 +2338,91 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			);
 			expect(queued.map((dispatch) => dispatch.id)).toContain(fresh.dispatch.id);
 			expect(queued.map((dispatch) => dispatch.runId)).not.toContain(settledRunId);
+		});
+	});
+
+	describe('pipeline snapshot reads (issue #1340)', () => {
+		const CUTOFF = new Date('2026-06-01T12:00:00Z');
+		const BEFORE = new Date('2026-06-01T11:00:00Z');
+		const AFTER = new Date('2026-06-01T13:00:00Z');
+
+		async function seedRun(values: {
+			projectId?: string;
+			status: string;
+			startedAt?: Date;
+			completedAt?: Date | null;
+		}): Promise<string> {
+			const rows = await getDb()
+				.insert(runs)
+				.values({
+					projectId: values.projectId ?? PROJECT_ID,
+					repository: REPO,
+					taskId: 't',
+					phase: 'review',
+					status: values.status,
+					startedAt: values.startedAt ?? BEFORE,
+					completedAt: values.completedAt ?? null,
+				})
+				.returning({ id: runs.id });
+			return rows[0].id;
+		}
+
+		it('lists every unsettled run and the runs that failed in the window, newest first', async () => {
+			await seedProject({ id: 'proj-other', repo: 'jkwiecien/other-repo' });
+			const running = await seedRun({
+				status: 'running',
+				startedAt: new Date('2026-06-01T10:00:00Z'),
+			});
+			const deferred = await seedRun({
+				status: 'deferred',
+				startedAt: new Date('2026-05-01T00:00:00Z'),
+				completedAt: BEFORE,
+			});
+			const checkpointed = await seedRun({
+				status: 'checkpointed',
+				startedAt: new Date('2026-06-01T09:00:00Z'),
+				completedAt: AFTER,
+			});
+			const failedInWindow = await seedRun({
+				status: 'failed',
+				startedAt: new Date('2026-06-01T11:30:00Z'),
+				completedAt: AFTER,
+			});
+			await seedRun({ status: 'failed', completedAt: BEFORE });
+			await seedRun({ status: 'completed', completedAt: AFTER });
+			await seedRun({ projectId: 'proj-other', status: 'running' });
+
+			const listed = await listSnapshotRunsForProject(PROJECT_ID, CUTOFF, 10);
+
+			expect(listed.map((run) => run.id)).toEqual([
+				failedInWindow,
+				running,
+				checkpointed,
+				deferred,
+			]);
+		});
+
+		it('bounds the run read', async () => {
+			for (let i = 0; i < 3; i++) await seedRun({ status: 'running' });
+
+			expect(await listSnapshotRunsForProject(PROJECT_ID, CUTOFF, 2)).toHaveLength(2);
+		});
+
+		it('counts the runs that settled in the window by status, for one project', async () => {
+			await seedProject({ id: 'proj-other', repo: 'jkwiecien/other-repo' });
+			await seedRun({ status: 'completed', completedAt: AFTER });
+			await seedRun({ status: 'completed', completedAt: AFTER });
+			await seedRun({ status: 'failed', completedAt: AFTER });
+			await seedRun({ status: 'deferred', completedAt: AFTER });
+			await seedRun({ status: 'completed', completedAt: BEFORE });
+			await seedRun({ status: 'running' });
+			await seedRun({ projectId: 'proj-other', status: 'completed', completedAt: AFTER });
+
+			expect(await countRunsSettledSinceByStatus(PROJECT_ID, CUTOFF)).toEqual({
+				completed: 2,
+				failed: 1,
+				deferred: 1,
+			});
 		});
 	});
 

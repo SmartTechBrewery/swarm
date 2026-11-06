@@ -11,14 +11,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
  * repository reads, the membership service the authz helpers consult, and the one
  * dispatch read `getById`'s enrichment makes for a settled run.
  */
-const { listRunsFromDb, getRunByIdFromDb, getRunLogsFromDb, getRunOutputEvents } = vi.hoisted(
-	() => ({
-		listRunsFromDb: vi.fn(),
-		getRunByIdFromDb: vi.fn(),
-		getRunLogsFromDb: vi.fn(),
-		getRunOutputEvents: vi.fn(),
-	}),
-);
+const {
+	listRunsFromDb,
+	getRunByIdFromDb,
+	getRunLogsFromDb,
+	getRunOutputEvents,
+	listSnapshotRunsForProject,
+	countRunsSettledSinceByStatus,
+} = vi.hoisted(() => ({
+	listRunsFromDb: vi.fn(),
+	getRunByIdFromDb: vi.fn(),
+	getRunLogsFromDb: vi.fn(),
+	getRunOutputEvents: vi.fn(),
+	listSnapshotRunsForProject: vi.fn(),
+	countRunsSettledSinceByStatus: vi.fn(),
+}));
 vi.mock('@/db/repositories/runsRepository.js', async () => ({
 	...(await vi.importActual<typeof import('@/db/repositories/runsRepository.js')>(
 		'@/db/repositories/runsRepository.js',
@@ -27,6 +34,8 @@ vi.mock('@/db/repositories/runsRepository.js', async () => ({
 	getRunByIdFromDb,
 	getRunLogsFromDb,
 	getRunOutputEvents,
+	listSnapshotRunsForProject,
+	countRunsSettledSinceByStatus,
 }));
 const { getMembership, listAccessibleProjectIds } = vi.hoisted(() => ({
 	getMembership: vi.fn(),
@@ -39,12 +48,19 @@ vi.mock('@/identity/membership-service.js', async () => ({
 	getMembership,
 	listAccessibleProjectIds,
 }));
-const { getActiveDispatchByRunId } = vi.hoisted(() => ({ getActiveDispatchByRunId: vi.fn() }));
+const { getActiveDispatchByRunId, listOpenDispatchesForProject, listDispatchesForTask } =
+	vi.hoisted(() => ({
+		getActiveDispatchByRunId: vi.fn(),
+		listOpenDispatchesForProject: vi.fn(),
+		listDispatchesForTask: vi.fn(),
+	}));
 vi.mock('@/db/repositories/dispatchesRepository.js', async () => ({
 	...(await vi.importActual<typeof import('@/db/repositories/dispatchesRepository.js')>(
 		'@/db/repositories/dispatchesRepository.js',
 	)),
 	getActiveDispatchByRunId,
+	listOpenDispatchesForProject,
+	listDispatchesForTask,
 }));
 
 import type { SwarmUser } from '@/identity/schema.js';
@@ -156,6 +172,10 @@ beforeEach(() => {
 	getRunLogsFromDb.mockReset().mockResolvedValue(LOGS);
 	getRunOutputEvents.mockReset().mockResolvedValue(OUTPUT_PAGE);
 	getActiveDispatchByRunId.mockReset().mockResolvedValue(undefined);
+	listSnapshotRunsForProject.mockReset().mockResolvedValue([]);
+	countRunsSettledSinceByStatus.mockReset().mockResolvedValue({});
+	listOpenDispatchesForProject.mockReset().mockResolvedValue([]);
+	listDispatchesForTask.mockReset().mockResolvedValue([]);
 	getMembership
 		.mockReset()
 		.mockImplementation(async (userId: string, projectId: string) =>
@@ -212,7 +232,7 @@ describe('operator MCP — the bearer gate', () => {
 });
 
 describe('operator MCP — the handshake', () => {
-	it('initializes as the swarm server and lists exactly the run read tools', async () => {
+	it('initializes as the swarm server and lists exactly the read tools', async () => {
 		const init = await rpc(
 			'initialize',
 			{
@@ -233,7 +253,12 @@ describe('operator MCP — the handshake', () => {
 		};
 		const tools = listBody.result.tools;
 
-		expect(tools.map((tool) => tool.name).sort()).toEqual(['run_get', 'runs_list']);
+		expect(tools.map((tool) => tool.name).sort()).toEqual([
+			'dispatch_history',
+			'pipeline_snapshot',
+			'run_get',
+			'runs_list',
+		]);
 		for (const tool of tools) expect(tool.annotations?.readOnlyHint).toBe(true);
 	});
 });
@@ -351,5 +376,111 @@ describe('operator MCP — run_get', () => {
 		expect(unknown.content[0]?.text).toBe(`NOT_FOUND: Run with ID "${unknownId}" not found`);
 		expect(getRunOutputEvents).not.toHaveBeenCalled();
 		expect(getRunLogsFromDb).not.toHaveBeenCalled();
+	});
+});
+
+describe('operator MCP — pipeline_snapshot', () => {
+	it("reads a member's project in one call", async () => {
+		listSnapshotRunsForProject.mockResolvedValue([
+			{
+				...failedRun(),
+				prTitle: null,
+				nextRetryAt: null,
+				continuationCount: 0,
+			},
+		]);
+		countRunsSettledSinceByStatus.mockResolvedValue({ completed: 3, failed: 1 });
+
+		const result = await callTool('pipeline_snapshot', { projectId: 'proj-a' }, 'member-token');
+
+		expect(result.isError).toBeUndefined();
+		expect(result.structuredContent).toMatchObject({
+			projectId: 'proj-a',
+			windowHours: 12,
+			runs: [{ id: RUN_ID, status: 'failed', error: 'Agent exited 1' }],
+			dispatches: [],
+			completedCounts: { byStatus: { completed: 3, failed: 1 } },
+			truncated: { runs: false, dispatches: false },
+		});
+		expect(listSnapshotRunsForProject).toHaveBeenCalledWith(
+			'proj-a',
+			expect.any(Date),
+			expect.any(Number),
+		);
+	});
+
+	it("reports the procedure's refusal of a project the caller cannot read", async () => {
+		const result = await callTool('pipeline_snapshot', { projectId: 'proj-a' }, 'stranger-token');
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toMatch(/^NOT_FOUND: /);
+		expect(listSnapshotRunsForProject).not.toHaveBeenCalled();
+	});
+});
+
+describe('operator MCP — dispatch_history', () => {
+	it("reads a task's dispatches in a member's project", async () => {
+		listDispatchesForTask.mockResolvedValue([
+			{
+				id: 'dispatch-1',
+				projectId: 'proj-a',
+				taskId: '7',
+				phase: 'implementation',
+				repository: 'acme/widgets',
+				prNumber: null,
+				state: 'failed',
+				waitReason: null,
+				outcome: null,
+				attempt: 2,
+				priority: 0,
+				availableAt: new Date('2026-10-28T10:00:00Z'),
+				jobPayload: {},
+				runId: RUN_ID,
+				selectedWorkerId: null,
+				lastError: 'Agent exited 1',
+				source: 'webhook',
+				createdAt: new Date('2026-10-28T09:59:00Z'),
+				completedAt: new Date('2026-10-28T10:05:00Z'),
+			},
+		]);
+
+		const result = await callTool(
+			'dispatch_history',
+			{ projectId: 'proj-a', taskId: '7' },
+			'member-token',
+		);
+
+		expect(result.isError).toBeUndefined();
+		expect(listDispatchesForTask).toHaveBeenCalledWith(
+			'proj-a',
+			{ taskId: '7' },
+			expect.any(Number),
+		);
+		expect(result.structuredContent).toMatchObject({
+			dispatches: [
+				{ id: 'dispatch-1', state: 'failed', runId: RUN_ID, lastError: 'Agent exited 1' },
+			],
+			truncated: false,
+		});
+	});
+
+	it('refuses a history naming neither a task nor a pull request', async () => {
+		const result = await callTool('dispatch_history', { projectId: 'proj-a' }, 'member-token');
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toMatch(/^BAD_REQUEST: /);
+		expect(listDispatchesForTask).not.toHaveBeenCalled();
+	});
+
+	it("reports the procedure's refusal of a project the caller cannot read", async () => {
+		const result = await callTool(
+			'dispatch_history',
+			{ projectId: 'proj-a', prNumber: '42' },
+			'stranger-token',
+		);
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toMatch(/^NOT_FOUND: /);
+		expect(listDispatchesForTask).not.toHaveBeenCalled();
 	});
 });

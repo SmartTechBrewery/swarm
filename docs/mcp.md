@@ -107,9 +107,24 @@ wording the dashboard shows.
 | --- | --- | --- |
 | `runs_list` | Runs, newest first, as `{ data, total }` — the dashboard's run list (`runs.list`), with each run's worker name | `projectId?`, `status?` (`running`, `completed`, `failed`, `deferred`, `checkpointed`), `phase?`, `since?` (ISO 8601), `limit` (≤ 200, default 50), `offset` (default 0) |
 | `run_get` | One run in full — the run detail page (`runs.getById`) — plus its captured agent output (`runs.getOutput`) and, on request, its stored stdout/stderr (`runs.getLogs`), as `{ run, output?, logs? }` | `runId`, `includeOutput` (default `true`), `outputAfter` (output cursor, default 0), `includeLogs` (default `false`) |
+| `pipeline_snapshot` | One project's pipeline state in one call (`runs.pipelineSnapshot`), as `{ runs, dispatches, completedCounts: { since, byStatus }, truncated, generatedAt }`: every run still in progress (`running`, `deferred`, `checkpointed`) plus every run that failed in the window, each with status, phase, task, repository, worker, age, continuation count, error and next retry; every open dispatch (waiting or executing) with state, phase, task/PR, wait reason, `availableAt`, attempts and last error; and how many runs settled in the window, by status. Each list is capped at 100 rows and `truncated` says when the cap was reached | `projectId`, `windowHours` (default 12, at most 168) |
+| `dispatch_history` | Every dispatch of one task or pull request, oldest first (`runs.dispatchHistory`), as `{ dispatches, truncated }`: state, phase, attempts, outcome, wait reason, `availableAt`, last error and the `runId` it executed against. Capped at the newest 200 | `projectId`, `taskId` and/or `prNumber` (at least one), `repository?` |
 
 Page through a long agent output by passing the `output.nextCursor` of one call as
 `outputAfter` of the next while `output.hasMore` is `true`.
+
+`pipeline_snapshot` is the cheap call to make periodically, for example from a
+guard that watches a project. It reads Postgres only and makes no board or
+source-control request, and every list in it is capped, so one call costs about the
+same however large the backlog is. Completed runs are only counted. To read one,
+use `runs_list`. To see why a task keeps waiting, pass its id to
+`dispatch_history` and its runs to `run_get`.
+
+Both tools need contributor access to the project they name, exactly like the
+dashboard's Runs page scoped to that project. Neither has an installation-wide
+form. `dispatch_history` finds only dispatches a worker has already resolved to
+the task or pull request. A dispatch still waiting for its first claim shows up in
+the snapshot, but not in the history.
 
 ## For developers
 
