@@ -63,6 +63,12 @@ import { getUserById } from '../../db/repositories/usersRepository.js';
 import { listWipSlots } from '../../db/repositories/wipSlotsRepository.js';
 import { classifyDispatchClaim } from '../../dispatch/claim-liveness.js';
 import {
+	type ConsistencyCheckResult,
+	DEFAULT_CONSISTENCY_WINDOW_HOURS,
+	MAX_CONSISTENCY_WINDOW_HOURS,
+	runConsistencyCheck,
+} from '../../dispatch/consistency-check.js';
+import {
 	cancelDispatchAndWake,
 	createAndPublishDispatch,
 	publishDispatchWakeUp,
@@ -93,7 +99,7 @@ import { releasePutBackTicketSlot } from '../../dispatch/wip-limit.js';
 import { AgentCliSchema } from '../../harness/agent-cli.js';
 import { ReasoningLevelSchema } from '../../harness/models.js';
 import { getWorker, getWorkers } from '../../identity/worker-service.js';
-import { getPMProvider } from '../../integrations/pm/registry.js';
+import { getPMProvider, requireProjectPMProvider } from '../../integrations/pm/registry.js';
 import { requireProjectSCMProvider } from '../../integrations/scm/registry.js';
 import { describeError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
@@ -1335,6 +1341,17 @@ export const PullRequestStatusInputSchema = z.object({
 	prNumber: z.number().int().positive(),
 });
 
+/** `runs.consistencyCheck`'s input: one project, and how far back to look (issue #1344). */
+export const ConsistencyCheckInputSchema = z.object({
+	projectId: z.string().min(1),
+	windowHours: z
+		.number()
+		.int()
+		.positive()
+		.max(MAX_CONSISTENCY_WINDOW_HOURS)
+		.default(DEFAULT_CONSISTENCY_WINDOW_HOURS),
+});
+
 /**
  * One pull request's automation state as SWARM's own records hold it (issue
  * #1342) — the merge-automation outcome on its latest completed Review run and
@@ -1777,6 +1794,24 @@ export const runsRouter = router({
 				listActiveReviewSlotsForPullRequest(input.projectId, input.repository, prNumber),
 			]);
 			return toPullRequestStatus(run, slots);
+		}),
+
+	// The stuck states SWARM will not leave by itself (issue #1344) — the operator
+	// MCP server's `consistency_check` tool (`src/mcp/tools/consistency.ts`): pull
+	// requests merge automation merged whose work item is still open, and dependency
+	// waits whose blockers are all done. Read-only; the board is asked only through
+	// the project's `PMProvider`, one card at a time (`src/dispatch/consistency-check.ts`).
+	//
+	// Gated like `prStatus`, and like it deliberately not in `runReadProcedures`.
+	consistencyCheck: authedProcedure
+		.input(ConsistencyCheckInputSchema)
+		.query(async ({ ctx, input }): Promise<ConsistencyCheckResult> => {
+			await assertProjectAccess(ctx.user, input.projectId, 'contributor');
+			const project = await getProjectByIdFromDb(input.projectId);
+			if (!project) {
+				throw new TRPCError({ code: 'NOT_FOUND', message: 'Project not found.' });
+			}
+			return runConsistencyCheck(project, requireProjectPMProvider(project), input.windowHours);
 		}),
 
 	// Every canonical waiting dispatch (pending / event-blocked /

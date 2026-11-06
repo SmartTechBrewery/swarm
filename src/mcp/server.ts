@@ -13,6 +13,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
 import type { SwarmUser } from '../identity/schema.js';
+import { registerConsistencyTools } from './tools/consistency.js';
 import { registerPipelineTools } from './tools/pipeline.js';
 import { registerProjectConfigTools } from './tools/project-config.js';
 import { registerPullRequestTools } from './tools/pull-requests.js';
@@ -38,5 +39,6 @@ export function createSwarmMcpServer(user: SwarmUser): McpServer {
 	registerPullRequestTools(server, user);
 	registerProjectConfigTools(server, user);
 	registerStatsTools(server, user);
+	registerConsistencyTools(server, user);
 	return server;
 }
