@@ -15,6 +15,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { SwarmUser } from '../identity/schema.js';
 import { registerPipelineTools } from './tools/pipeline.js';
 import { registerRunTools } from './tools/runs.js';
+import { registerWorkerTools } from './tools/workers.js';
 
 /** The name an MCP client lists this server's tools under. */
 export const SWARM_MCP_SERVER_NAME = 'swarm';
@@ -30,5 +31,6 @@ export function createSwarmMcpServer(user: SwarmUser): McpServer {
 	const server = new McpServer({ name: SWARM_MCP_SERVER_NAME, version: SWARM_MCP_SERVER_VERSION });
 	registerRunTools(server, user);
 	registerPipelineTools(server, user);
+	registerWorkerTools(server, user);
 	return server;
 }

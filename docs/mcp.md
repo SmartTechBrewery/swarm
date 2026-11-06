@@ -109,6 +109,8 @@ wording the dashboard shows.
 | `run_get` | One run in full — the run detail page (`runs.getById`) — plus its captured agent output (`runs.getOutput`) and, on request, its stored stdout/stderr (`runs.getLogs`), as `{ run, output?, logs? }` | `runId`, `includeOutput` (default `true`), `outputAfter` (output cursor, default 0), `includeLogs` (default `false`) |
 | `pipeline_snapshot` | One project's pipeline state in one call (`runs.pipelineSnapshot`), as `{ runs, dispatches, completedCounts: { since, byStatus }, truncated, generatedAt }`: every run still in progress (`running`, `deferred`, `checkpointed`) plus every run that failed in the window, each with status, phase, task, repository, worker, age, continuation count, error and next retry; every open dispatch (waiting or executing) with state, phase, task/PR, wait reason, `availableAt`, attempts and last error; and how many runs settled in the window, by status. Each list is capped at 100 rows and `truncated` says when the cap was reached | `projectId`, `windowHours` (default 12, at most 168) |
 | `dispatch_history` | Every dispatch of one task or pull request, oldest first (`runs.dispatchHistory`), as `{ dispatches, truncated }`: state, phase, attempts, outcome, wait reason, `availableAt`, last error and the `runId` it executed against. Capped at the newest 200 | `projectId`, `taskId` and/or `prNumber` (at least one), `repository?` |
+| `workers_state` | Each worker's dispatch state (`workers.state`), as `{ workers }`: `connection` (`online`/`offline`), `lastSeenAt`, `draining`/`drainingSince`, the run it is executing, and its enrolled projects, each with `status`, `isRoutable` and its capacity in use — `activeRuns` of `concurrencyAllocation`, the two numbers the dispatch gate compares | `projectId?` |
+| `cli_rate_limits` | The workers cooling on an agent CLI's usage limit, as `{ workers }`, each with its active limits (from `workers.list`): `cli`, `expiresAt` (when SWARM routes that CLI to the machine again), `observedAt`, and `resetHint` — the reset text the CLI itself printed, or `null` when it printed none. A worker with no active limit is left out unless named by `workerId` | `projectId?`, `workerId?` |
 
 Page through a long agent output by passing the `output.nextCursor` of one call as
 `outputAfter` of the next while `output.hasMore` is `true`.
@@ -120,11 +122,18 @@ same however large the backlog is. Completed runs are only counted. To read one,
 use `runs_list`. To see why a task keeps waiting, pass its id to
 `dispatch_history` and its runs to `run_get`.
 
-Both tools need contributor access to the project they name, exactly like the
-dashboard's Runs page scoped to that project. Neither has an installation-wide
-form. `dispatch_history` finds only dispatches a worker has already resolved to
+`pipeline_snapshot` and `dispatch_history` need contributor access to the project
+they name, exactly like the dashboard's Runs page scoped to that project. Neither
+has an installation-wide form. `dispatch_history` finds only dispatches a worker has already resolved to
 the task or pull request. A dispatch still waiting for its first claim shows up in
 the snapshot, but not in the history.
+
+The two worker tools are scoped like the Workers screens. With a `projectId`, a
+contributor of that project reads the workers enrolled in it, and each worker's
+enrollments in any *other* project are left out. Without one, they read every
+worker on the installation, which only an instance administrator may do; anyone
+else gets `FORBIDDEN` and has to name a project. A `workerId` outside the scope
+reads as *not found*, exactly as an unknown one.
 
 ## For developers
 

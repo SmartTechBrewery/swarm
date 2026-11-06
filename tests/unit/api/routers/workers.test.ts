@@ -12,6 +12,7 @@ const {
 	listOwnerWorkers,
 	listProjectRoster,
 	listProjectWorkerIdsInOrder,
+	listWorkerProjectCapacity,
 	moveProjectWorkerOrder,
 	setEnrollmentStatus,
 	setSharingConsent,
@@ -48,6 +49,8 @@ const {
 		listOwnerWorkers: vi.fn(),
 		listProjectRoster: vi.fn(),
 		listProjectWorkerIdsInOrder: vi.fn(),
+		// Issue #1341 — `workers.state`'s per-enrollment capacity read.
+		listWorkerProjectCapacity: vi.fn(),
 		moveProjectWorkerOrder: vi.fn(),
 		setEnrollmentStatus: vi.fn(),
 		setSharingConsent: vi.fn(),
@@ -142,6 +145,7 @@ vi.mock('@/identity/worker-enrollment-service.js', async () => ({
 	listOwnerWorkers,
 	listProjectRoster,
 	listProjectWorkerIdsInOrder,
+	listWorkerProjectCapacity,
 	moveProjectWorkerOrder,
 	setEnrollmentStatus,
 	setSharingConsent,
@@ -299,6 +303,7 @@ beforeEach(() => {
 		listOwnerWorkers,
 		listProjectRoster,
 		listProjectWorkerIdsInOrder,
+		listWorkerProjectCapacity,
 		moveProjectWorkerOrder,
 		setEnrollmentStatus,
 		setSharingConsent,
@@ -639,6 +644,88 @@ describe('workers.list scoped to one project (issue #574)', () => {
 
 		expect(listDashboardWorkers).toHaveBeenCalledWith(['p1']);
 		expect(listDashboardWorkers).not.toHaveBeenCalledWith(null);
+	});
+});
+
+describe('workers.state (dispatch state per worker, issue #1341)', () => {
+	const CAPACITY = [
+		{
+			projectId: 'p1',
+			status: 'approved',
+			isRoutable: true,
+			concurrencyAllocation: 2,
+			activeRuns: 1,
+		},
+	];
+
+	beforeEach(() => {
+		listWorkerProjectCapacity.mockResolvedValue(CAPACITY);
+	});
+
+	it('serves a contributor their project’s workers, with capacity read in that scope alone', async () => {
+		getMembership.mockResolvedValue(membershipFor('contributor'));
+		listDashboardWorkers.mockResolvedValue([
+			{
+				...rosterRow(WORKER_ID, OTHER_ID, { name: 'ada-laptop' }),
+				connection: 'online',
+				lastSeenAt: new Date('2026-07-01T12:00:00.000Z'),
+				drainingSince: new Date('2026-07-01T11:00:00.000Z'),
+				currentRun: null,
+				build: { commit: 'b'.repeat(40), dirty: false },
+			},
+		]);
+
+		const rows = await owner.state({ projectId: 'p1' });
+
+		expect(listDashboardWorkers).toHaveBeenCalledWith(['p1']);
+		expect(listWorkerProjectCapacity).toHaveBeenCalledWith(WORKER_ID, ['p1']);
+		// Narrowed to the dispatch-state fields — nothing else the roster row carries.
+		expect(rows).toEqual([
+			{
+				workerId: WORKER_ID,
+				displayName: 'ada-laptop',
+				owner: {
+					userId: OTHER_ID,
+					identifier: `${OTHER_ID}@example.com`,
+					displayName: OTHER_ID,
+				},
+				connection: 'online',
+				lastSeenAt: '2026-07-01T12:00:00.000Z',
+				draining: true,
+				drainingSince: '2026-07-01T11:00:00.000Z',
+				currentRun: null,
+				enrollments: CAPACITY,
+			},
+		]);
+	});
+
+	it('denies a non-member with NOT_FOUND, reading nothing', async () => {
+		getMembership.mockResolvedValue(undefined);
+
+		await expect(owner.state({ projectId: 'p1' })).rejects.toThrowError(
+			expect.objectContaining({ code: 'NOT_FOUND', message: 'Project with ID "p1" not found' }),
+		);
+		expect(listDashboardWorkers).not.toHaveBeenCalled();
+		expect(listWorkerProjectCapacity).not.toHaveBeenCalled();
+	});
+
+	it('denies the installation-wide state to an ordinary user', async () => {
+		await expect(owner.state()).rejects.toThrowError(
+			expect.objectContaining({ code: 'FORBIDDEN' }),
+		);
+		expect(listDashboardWorkers).not.toHaveBeenCalled();
+	});
+
+	it('serves an instanceAdmin the whole installation, unscoped', async () => {
+		const admin = workersRouter.createCaller({ user: ADMIN_USER });
+		listDashboardWorkers.mockResolvedValue([rosterRow(WORKER_ID, OTHER_ID)]);
+
+		const [row] = await admin.state();
+
+		expect(listDashboardWorkers).toHaveBeenCalledWith(null);
+		expect(listWorkerProjectCapacity).toHaveBeenCalledWith(WORKER_ID, null);
+		expect(row.draining).toBe(false);
+		expect(row.drainingSince).toBeNull();
 	});
 });
 

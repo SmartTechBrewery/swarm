@@ -36,6 +36,7 @@ import {
 	listOwnerWorkers,
 	listProjectRoster,
 	listProjectWorkerIdsInOrder,
+	listWorkerProjectCapacity,
 	moveProjectWorkerOrder,
 	type RosterOwner,
 	setEnrollmentStatus,
@@ -389,6 +390,25 @@ function inProjectOrder(
 }
 
 /**
+ * The roster read `list` and `state` share: {@link resolveRosterScope} decides what
+ * is visible, then the list is put in the order that scope reads in — the
+ * project's configured order for one project, the viewer's machines first and the
+ * rest grouped by owner for the installation. The scope is returned too, for a
+ * caller that reads more per row and must stay inside the same projects.
+ */
+async function listVisibleWorkersInOrder(
+	user: SwarmUser,
+	projectId: string | undefined,
+): Promise<{ scope: DashboardProjectScope; workers: DashboardWorkerView[] }> {
+	const scope = await resolveRosterScope(user, projectId);
+	const visible = await listDashboardWorkers(scope);
+	const workers = projectId
+		? inProjectOrder(visible, await listProjectWorkerIdsInOrder(projectId))
+		: viewerWorkersFirstThenGroupedByOwner(visible, user.id);
+	return { scope, workers };
+}
+
+/**
  * The wire form of a worker's self-update state (issue #933) — the same explicit
  * ISO-timestamp treatment `lastSeenAt` and `drainingSince` get above, applied to
  * the two instants nested inside it, so a browser reads strings rather than
@@ -580,12 +600,7 @@ export const workersRouter = router({
 	list: authedProcedure
 		.input(z.object({ projectId: z.string().min(1) }).optional())
 		.query(async ({ ctx, input }) => {
-			const scope = await resolveRosterScope(ctx.user, input?.projectId);
-			const visible = await listDashboardWorkers(scope);
-			const projectId = input?.projectId;
-			const workers = projectId
-				? inProjectOrder(visible, await listProjectWorkerIdsInOrder(projectId))
-				: viewerWorkersFirstThenGroupedByOwner(visible, ctx.user.id);
+			const { workers } = await listVisibleWorkersInOrder(ctx.user, input?.projectId);
 			// The service already assembled a secret-free view; the only wire-shape
 			// concern here is giving the browser an explicit ISO timestamp.
 			return workers.map((worker) => ({
@@ -595,6 +610,39 @@ export const workersRouter = router({
 				rateLimits: serializeWorkerRateLimits(worker.rateLimits),
 				update: serializeWorkerUpdate(worker.update),
 			}));
+		}),
+
+	// Each visible worker's **dispatch state** (issue #1341) — connected, draining,
+	// what it is running, and its capacity in use per enrolled project — the read the
+	// operator MCP server's `workers_state` tool serves (`src/mcp/tools/workers.ts`).
+	// Its own procedure because neither roster read answers it: `list` carries
+	// connection and drain but no capacity, `roster` the allocation but only a
+	// boolean `busy`, and the in-flight count per project the capacity gate compares
+	// against that allocation lives on `getById` alone, one worker at a time.
+	//
+	// Scoped exactly like `list`, through the same `resolveRosterScope`: with a
+	// `projectId` a `contributor` reads that project's enrolled workers (a non-member
+	// gets `NOT_FOUND`), and without one only an `instanceAdmin` may read the whole
+	// installation. Each worker's enrollments are cut to that same scope, so a
+	// project's contributor sees neither the machine's other projects nor what it is
+	// running for them. Read-only, and as secret-free as the views it narrows.
+	state: authedProcedure
+		.input(z.object({ projectId: z.string().min(1) }).optional())
+		.query(async ({ ctx, input }) => {
+			const { scope, workers } = await listVisibleWorkersInOrder(ctx.user, input?.projectId);
+			return Promise.all(
+				workers.map(async (worker) => ({
+					workerId: worker.workerId,
+					displayName: worker.displayName,
+					owner: worker.owner,
+					connection: worker.connection,
+					lastSeenAt: worker.lastSeenAt?.toISOString() ?? null,
+					draining: Boolean(worker.drainingSince),
+					drainingSince: worker.drainingSince?.toISOString() ?? null,
+					currentRun: worker.currentRun,
+					enrollments: await listWorkerProjectCapacity(worker.workerId, scope),
+				})),
+			);
 		}),
 
 	// One worker in detail (#477) — the same row `list` returns, widened with the
