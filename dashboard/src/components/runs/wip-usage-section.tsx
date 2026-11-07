@@ -1,10 +1,12 @@
 import { useQuery } from '@tanstack/react-query';
+import { Link } from '@tanstack/react-router';
 import { ChevronDown, ChevronRight, ExternalLink, Gauge } from 'lucide-react';
 import { useState } from 'react';
 import { Badge } from '@/components/ui/badge.js';
 import { formatRelativeTime } from '@/lib/format.js';
 import { trpc } from '@/lib/trpc.js';
 import {
+	WIP_ACTION_RUN_LABEL,
 	WIP_SECTION_EXPLANATION,
 	WIP_SECTION_TITLE,
 	wipInFlightLabel,
@@ -54,6 +56,15 @@ function WipTicketRow({ ticket, repository }: { ticket: WipTicket; repository: s
 				</div>
 				{waitingOnOperator && ticket.operatorReason && (
 					<span className="text-amber-200/80">{wipOperatorReasonLabel(ticket.operatorReason)}</span>
+				)}
+				{waitingOnOperator && ticket.actionRunId && (
+					<Link
+						to="/runs/$runId"
+						params={{ runId: ticket.actionRunId }}
+						className="text-violet-400 hover:text-violet-300 hover:underline"
+					>
+						{WIP_ACTION_RUN_LABEL}
+					</Link>
 				)}
 				{ticket.state === 'waiting-on-pipeline' && ticket.pipelineReason && (
 					<span className="text-zinc-400">{wipPipelineReasonLabel(ticket.pipelineReason)}</span>

@@ -327,6 +327,8 @@ export const wipUsageEntrySchema = z.object({
 			state: wipTicketStateSchema,
 			operatorReason: wipOperatorReasonSchema.optional(),
 			pipelineReason: wipPipelineReasonSchema.optional(),
+			/** `waiting-on-operator` only: the run hosting the action that moves it (issue #1379). */
+			actionRunId: z.string().optional(),
 			phase: z.string().optional(),
 			prNumber: z.string().optional(),
 			prUrl: z.string().optional(),

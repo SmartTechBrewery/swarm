@@ -1566,6 +1566,23 @@ until issue #1204; `dashboard/src/components/runs/wip-usage-section.tsx`); a Que
   will retry it; and operator dismissals are not folded in, since a dismissed unit still
   holding a slot still blocks its repository. The ticket's own `wip-limit` wait is not
   counted as an active dispatch (`ActiveDispatchTaskRef.waitReason`).
+- **A review-cap stop on an approval is read off the pull request's ledger (issue
+  #1379).** The cap that stops a refused approval — usually `REVIEW_SUPERSEDED_CAP`, a head
+  superseded too many times — fires on a webhook (the `pr-review` trigger's cap gate skips)
+  and records no run, so the holder's latest run is typically a later, completed Resolve
+  conflicts or Respond-to-CI and liveness alone reads it as the pipeline's. `runs.wip`
+  therefore makes one `listActiveReviewSlotsForPullRequest` read per distinct pull request
+  held in a slot and, for a spent allowance with no review in flight above the last
+  verdict, loads that verdict's completed Review run (`getCompletedReviewRunForOrdinal`,
+  newest first because a superseded slot and its replacement share an ordinal). An
+  `approve` with merge outcome `not-eligible` that `resolveReviewCapSpent` calls spent —
+  the fact the run-detail page's `isCapSpentApproval` reads — makes the holder
+  `waiting-on-operator` (`review-cap-reached`) with `actionRunId`, that run's id, which the
+  panel links to as the run hosting Force re-review. The rule sits after `running` and an
+  active dispatch, so a forced review reads as the pipeline's at once; an outstanding grant
+  ends it as well. A failed ledger read logs and leaves that ticket uncapped. The
+  `request-changes` cap stop is unchanged: it is recorded on the run and read by
+  `awaitingHumanCause`.
 - **How a slot learns its pull request.** `wip_slots.pr_number` is written by
   `recordTicketPullRequest` (`src/dispatch/wip-limit.ts`) from `processJob`, right after
   `recordDispatchResolution`, for every pull request-driven trigger: the ticket is the task

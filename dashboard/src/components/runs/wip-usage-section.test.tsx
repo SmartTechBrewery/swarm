@@ -2,9 +2,34 @@
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen, within } from '@testing-library/react';
-import type { ReactElement } from 'react';
+import type { AnchorHTMLAttributes, ReactElement, ReactNode } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import type { WipTicket, WipUsageEntry } from '@/types/runs.js';
+
+// A `Link` renders as a plain anchor with its route params substituted in, so the
+// destination is assertable without standing up a real router.
+vi.mock('@tanstack/react-router', () => ({
+	Link: ({
+		to,
+		params,
+		children,
+		...rest
+	}: {
+		to: string;
+		params?: Record<string, string>;
+		children: ReactNode;
+	} & AnchorHTMLAttributes<HTMLAnchorElement>) => (
+		<a
+			href={Object.entries(params ?? {}).reduce(
+				(path, [key, value]) => path.replace(`$${key}`, value),
+				to,
+			)}
+			{...rest}
+		>
+			{children}
+		</a>
+	),
+}));
 
 vi.mock('@/lib/trpc.js', () => ({
 	trpc: {
@@ -133,6 +158,46 @@ describe('WipUsageSection', () => {
 				.getAttribute('href'),
 		).toBe('https://gitlab.com/acme/widgets/-/merge_requests/120');
 		expect(screen.getByText('(1 waiting on you)')).toBeDefined();
+	});
+
+	// Issue #1379: a review-cap stop records no run, so the ticket links to the capped
+	// Review run that hosts Force re-review, whatever ran since.
+	it('links a review-cap stop to the Review run that carries Force re-review', () => {
+		renderSection(
+			<WipUsageSection
+				entries={[
+					makeEntry({
+						inFlight: 2,
+						tickets: [
+							makeTicket({
+								state: 'waiting-on-operator',
+								operatorReason: 'review-cap-reached',
+								actionRunId: 'run-review',
+								phase: 'resolve-conflicts',
+								prNumber: '120',
+							}),
+							makeTicket({
+								taskId: '104',
+								state: 'waiting-on-operator',
+								operatorReason: 'stalled',
+							}),
+						],
+					}),
+				]}
+			/>,
+		);
+
+		const [capped, stalled] = screen.getAllByTestId('wip-ticket');
+		if (!capped || !stalled) throw new Error('unreachable');
+		expect(within(capped).getByText('Waiting on you')).toBeDefined();
+		expect(within(capped).getByText('review cap reached — needs a person')).toBeDefined();
+		expect(within(capped).getByText('Stopped after Review')).toBeDefined();
+		expect(
+			within(capped)
+				.getByRole('link', { name: 'Open review run to Force re-review' })
+				.getAttribute('href'),
+		).toBe('/runs/run-review');
+		expect(within(stalled).queryByRole('link', { name: /Force re-review/ })).toBeNull();
 	});
 
 	it('names the board move that restarts a terminated run (issue #1361)', () => {

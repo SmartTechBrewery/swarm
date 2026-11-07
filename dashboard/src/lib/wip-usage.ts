@@ -51,8 +51,21 @@ export function wipPipelineReasonLabel(reason: WipPipelineReason): string {
 	return PIPELINE_REASON_LABELS[reason] ?? reason;
 }
 
-/** What a holder is doing, as one line: the phase it is in and whether it moves. */
+/**
+ * The link to a waiting holder's `actionRunId` (issue #1379): the capped Review run
+ * whose detail page carries Force re-review.
+ */
+export const WIP_ACTION_RUN_LABEL = 'Open review run to Force re-review';
+
+/**
+ * What a holder is doing, as one line: the phase it is in and whether it moves. A
+ * holder carrying `actionRunId` is stopped after the Review that run is, whatever ran
+ * since (a review-cap stop records no run of its own, issue #1379).
+ */
 export function wipTicketActivityLabel(ticket: WipTicket): string {
+	if (ticket.state === 'waiting-on-operator' && ticket.actionRunId) {
+		return `Stopped after ${stalledPhaseLabel('review')}`;
+	}
 	const phase = ticket.phase ? stalledPhaseLabel(ticket.phase) : undefined;
 	switch (ticket.state) {
 		case 'running':

@@ -41,6 +41,7 @@ import {
 	cancelDeferredRunInDb,
 	countMergedPullRequestsByRepository,
 	countRunsByStatusAndPhase,
+	getCompletedReviewRunForOrdinal,
 	getLatestCompletedReviewRunForPullRequest,
 	getRunByIdFromDb,
 	getRunLogsFromDb,
@@ -61,7 +62,7 @@ import {
 	recordStalledDismissal,
 } from '../../db/repositories/stalledDismissalsRepository.js';
 import { getUserById } from '../../db/repositories/usersRepository.js';
-import { listWipSlots } from '../../db/repositories/wipSlotsRepository.js';
+import { listWipSlots, type WipSlotRow } from '../../db/repositories/wipSlotsRepository.js';
 import {
 	classifyDispatchClaim,
 	type DispatchClaimLiveness,
@@ -151,7 +152,11 @@ import {
 	type QueuedRun,
 	toQueuedRuns,
 } from '../../queue/queued-runs.js';
-import { toWipUsage, type WipUsageEntry } from '../../queue/wip-usage.js';
+import {
+	toWipUsage,
+	type WipCappedPullRequest,
+	type WipUsageEntry,
+} from '../../queue/wip-usage.js';
 import type { PullRequestDetails, SCMProvider } from '../../scm/types.js';
 import {
 	buildConflictCheckJob,
@@ -2179,6 +2184,80 @@ function wipLimitFrom(records: Map<string, ProjectRecord>) {
 }
 
 /**
+ * The holders' pull requests the review cap stopped on a refused approval (issue
+ * #1379) — rule 2b of `src/queue/wip-usage.ts`. That stop fires on a webhook and
+ * records no run, so it is read off each pull request's review ledger: the highest
+ * submitted slot's completed Review run must be the one {@link resolveReviewCapSpent}
+ * calls cap-spent, and an approval merge automation refused (`not-eligible`) — the
+ * same fact the run-detail page's `isCapSpentApproval` reads, so the two agree. An
+ * outstanding grant or a review in flight above that verdict means an operator has
+ * acted, and the ticket is the pipeline's again.
+ *
+ * One ledger read per distinct pull request held in a slot (bounded by the sum of
+ * the WIP limits), plus one run read only for a spent allowance. Best-effort per
+ * pull request: a failed read logs and leaves that ticket uncapped rather than
+ * failing the view.
+ */
+async function loadWipCappedPullRequests(
+	slots: readonly WipSlotRow[],
+): Promise<WipCappedPullRequest[]> {
+	const pullRequests = new Map<
+		string,
+		{ projectId: string; repository: string; prNumber: string }
+	>();
+	for (const slot of slots) {
+		if (!slot.prNumber) continue;
+		pullRequests.set([slot.projectId, slot.repository, slot.prNumber].join('\u0000'), {
+			projectId: slot.projectId,
+			repository: slot.repository,
+			prNumber: slot.prNumber,
+		});
+	}
+	const resolved = await Promise.all(
+		[...pullRequests.values()].map(async (pr): Promise<WipCappedPullRequest | null> => {
+			try {
+				const slotsOfPr = await listActiveReviewSlotsForPullRequest(
+					pr.projectId,
+					pr.repository,
+					pr.prNumber,
+				);
+				if (!isReviewAllowanceSpent(slotsOfPr)) return null;
+				const submitted = slotsOfPr.filter((slot) => slot.state === 'submitted');
+				if (submitted.length === 0) return null;
+				const lastOrdinal = Math.max(...submitted.map((slot) => slot.ordinal));
+				if (hasReviewInFlightAbove(slotsOfPr, lastOrdinal)) return null;
+				const run = await getCompletedReviewRunForOrdinal(
+					pr.projectId,
+					pr.repository,
+					pr.prNumber,
+					lastOrdinal,
+				);
+				if (
+					!run ||
+					run.status !== 'completed' ||
+					run.phase !== 'review' ||
+					run.reviewVerdict !== 'approve' ||
+					run.reviewMergeOutcome !== 'not-eligible' ||
+					resolveReviewCapSpent(run, slotsOfPr) !== true
+				) {
+					return null;
+				}
+				return { ...pr, runId: run.id };
+			} catch (error) {
+				logger.warn('runs.wip: review-ledger lookup failed; reporting the pull request uncapped', {
+					projectId: pr.projectId,
+					repository: pr.repository,
+					prNumber: pr.prNumber,
+					error: describeError(error),
+				});
+				return null;
+			}
+		}),
+	);
+	return resolved.filter((pr): pr is WipCappedPullRequest => pr !== null);
+}
+
+/**
  * Assemble the `runs.wip` read model (issue #1192) for `projectIds` (every project
  * when absent) from its four bounded reads, and link each holder's pull request in
  * its project's own provider grammar. Postgres only, like `runs.stalled`.
@@ -2193,12 +2272,13 @@ async function loadWipUsage(
 		countWipLimitWaitsByRepository(projectIds),
 	]);
 	if (slots.length === 0 && waiters.length === 0) return [];
-	const [activity, activeDispatches] = slots.length
+	const [activity, activeDispatches, cappedPullRequests] = slots.length
 		? await Promise.all([
 				listTaskActivitySince({ since, projectIds }),
 				listActiveDispatchTaskRefs(projectIds),
+				loadWipCappedPullRequests(slots),
 			])
-		: [[], []];
+		: [[], [], []];
 	const recordsById = new Map(records.map((record) => [record.id, record]));
 	const entries = toWipUsage({
 		slots,
@@ -2206,6 +2286,7 @@ async function loadWipUsage(
 		limitFor: wipLimitFrom(recordsById),
 		activity,
 		activeDispatches,
+		cappedPullRequests,
 		policies: Object.fromEntries(
 			records.map((record) => [record.id, itemLivenessPolicyFor(record)]),
 		),

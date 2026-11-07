@@ -31,6 +31,7 @@ import {
 	findStoredPullRequestUrl,
 	findStoredTaskBranch,
 	findTaskIdForStoredTaskBranch,
+	getCompletedReviewRunForOrdinal,
 	getLatestCompletedPlanningScope,
 	getLatestRunForTask,
 	getPendingReviewMergeFollowUps,
@@ -2004,6 +2005,58 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			await completeRun(id, { status: 'completed' });
 
 			expect(await getReviewAbsorbedForPullRequest(PROJECT_ID, REPO, '44')).toEqual([]);
+		});
+	});
+
+	describe('getCompletedReviewRunForOrdinal (issue #1379)', () => {
+		/** A completed (or failed) Review run of `prNumber` holding slot `ordinal`. */
+		async function reviewRun(
+			prNumber: string,
+			ordinal: number,
+			overrides: {
+				repository?: string;
+				status?: 'completed' | 'failed';
+				completedAt?: string;
+			} = {},
+		): Promise<string> {
+			const id = await createRun({
+				projectId: PROJECT_ID,
+				repository: overrides.repository ?? REPO,
+				taskId: 'capped',
+				phase: 'review',
+				prNumber,
+			});
+			await completeRun(id, {
+				status: overrides.status ?? 'completed',
+				reviewVerdict: 'approve',
+				reviewOrdinal: ordinal,
+			});
+			if (overrides.completedAt) {
+				await getDb()
+					.update(runs)
+					.set({ completedAt: new Date(overrides.completedAt) })
+					.where(eq(runs.id, id));
+			}
+			return id;
+		}
+
+		it('returns the newest completed Review run holding the ordinal', async () => {
+			// A superseded slot and the replacement that reused its ordinal both have a run.
+			await reviewRun('42', 1, { completedAt: '2026-01-01T00:00:00.000Z' });
+			const replacement = await reviewRun('42', 1, { completedAt: '2026-01-02T00:00:00.000Z' });
+
+			expect((await getCompletedReviewRunForOrdinal(PROJECT_ID, REPO, '42', 1))?.id).toBe(
+				replacement,
+			);
+		});
+
+		it('ignores other ordinals, non-completed, other-PR and other-repository rows', async () => {
+			await reviewRun('42', 2);
+			await reviewRun('42', 1, { status: 'failed' });
+			await reviewRun('43', 1);
+			await reviewRun('42', 1, { repository: OTHER_REPO });
+
+			expect(await getCompletedReviewRunForOrdinal(PROJECT_ID, REPO, '42', 1)).toBeUndefined();
 		});
 	});
 
