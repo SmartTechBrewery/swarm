@@ -614,8 +614,10 @@ export interface RunRow {
 	 * allowance is spent, no operator grant is outstanding, and this run holds the
 	 * highest submitted slot. Resolved server-side (`runs.getById`) because the
 	 * ledger and `REVIEW_VERDICT_CAP` live in a DB-bound module this bundle cannot
-	 * import. Null for every run the question does not apply to, and absent on the
-	 * list read model, which resolves no ledger read per row.
+	 * import. Null for every run the question does not apply to. `runs.list`
+	 * resolves it too, for completed approving Review rows whose merge was refused
+	 * (`not-eligible`, issue #1378) — one ledger read per pull request per page —
+	 * and leaves it absent on every other list row.
 	 */
 	reviewCapSpent?: boolean | null;
 	/**
@@ -623,8 +625,8 @@ export interface RunRow {
 	 * and nothing has spent it yet (issue #1040) — the window between "Force
 	 * re-review" recording the grant and the review it pays for starting. The
 	 * complement of `reviewCapSpent`, which goes false the instant a grant exists;
-	 * resolved from the same server-side ledger read, null and absent on the same
-	 * terms.
+	 * resolved from the same server-side ledger read and null on the same terms, but
+	 * absent on the list read model.
 	 */
 	reviewCapOverrideOutstanding?: boolean | null;
 	/**
@@ -634,7 +636,8 @@ export interface RunRow {
 	 * Resolved server-side from the same ledger read as `reviewCapSpent`, because
 	 * `REVIEW_VERDICT_CAP` and `REVIEW_SUPERSEDED_CAP` live in a DB-bound module this
 	 * bundle cannot import. Null while the pull request is not stopped as seen from
-	 * this run, and absent on the list read model.
+	 * this run. Resolved by `runs.list` for the same rows as `reviewCapSpent`
+	 * (issue #1378), and absent on every other list row.
 	 */
 	reviewCapStop?: 'verdict-cap' | 'superseded-bound' | null;
 	exitCode: number | null;

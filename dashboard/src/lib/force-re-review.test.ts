@@ -7,8 +7,10 @@ import {
 	forceReReviewButtonLabel,
 	forceReReviewConfirmMessage,
 	forceReviewOfSupersededHeadConfirmMessage,
+	isCappedRequestChanges,
 	isCapSpentApproval,
 	isForcedReviewPending,
+	isManualActionRequired,
 	showsCapSpentApprovalCallout,
 } from './force-re-review.js';
 
@@ -105,6 +107,37 @@ describe('isCapSpentApproval (issue #1038)', () => {
 	// Mutually exclusive by verdict: the two callouts can never render together.
 	it('never fires for the request-changes cap stop', () => {
 		expect(isCapSpentApproval(CAPPED)).toBe(false);
+	});
+});
+
+describe('isManualActionRequired (issue #1378)', () => {
+	it('covers the capped request-changes stop, whatever the pipeline settings', () => {
+		expect(isCappedRequestChanges(CAPPED)).toBe(true);
+		expect(isManualActionRequired(CAPPED)).toBe(true);
+	});
+
+	it.each([
+		['verdict-cap', 'verdict-cap'],
+		['superseded-bound', 'superseded-bound'],
+		['no named bound', null],
+	] as const)('covers the cap-spent approval stopped by %s', (_label, reviewCapStop) => {
+		expect(isManualActionRequired({ ...CAP_SPENT_APPROVAL, reviewCapStop })).toBe(true);
+	});
+
+	it.each([
+		['the window after Force re-review', FORCED_REVIEW_PENDING],
+		['an approval with allowance left', { ...CAP_SPENT_APPROVAL, reviewCapSpent: false }],
+		['a list row with no ledger fact', { ...CAP_SPENT_APPROVAL, reviewCapSpent: undefined }],
+		[
+			'a superseded approval with no ledger fact',
+			{ ...CAP_SPENT_APPROVAL, reviewCapSpent: null, reviewCapStop: null },
+		],
+		['a plain approval', { status: 'completed', phase: 'review', reviewVerdict: 'approve' }],
+		['an uncapped changes-requested verdict', { ...CAPPED, reviewAutomationOutcome: null }],
+		['a run still in progress', { ...CAP_SPENT_APPROVAL, status: 'running' }],
+		['a non-Review phase', { ...CAPPED, phase: 'respond-to-review' }],
+	])('is false for %s', (_label, run) => {
+		expect(isManualActionRequired(run)).toBe(false);
 	});
 });
 

@@ -96,6 +96,9 @@ export function RunsTable({
 									reviewVerdict={run.reviewVerdict}
 									reviewAutomationOutcome={run.reviewAutomationOutcome}
 									reviewSupersededAt={run.reviewSupersededAt}
+									reviewMergeOutcome={run.reviewMergeOutcome}
+									reviewCapSpent={run.reviewCapSpent}
+									reviewCapStop={run.reviewCapStop}
 									className="shrink-0"
 								/>
 							</div>
@@ -235,6 +238,9 @@ export function RunsTable({
 										reviewVerdict={run.reviewVerdict}
 										reviewAutomationOutcome={run.reviewAutomationOutcome}
 										reviewSupersededAt={run.reviewSupersededAt}
+										reviewMergeOutcome={run.reviewMergeOutcome}
+										reviewCapSpent={run.reviewCapSpent}
+										reviewCapStop={run.reviewCapStop}
 									/>
 								</td>
 								<td className="px-2 py-3 text-sm text-zinc-400">

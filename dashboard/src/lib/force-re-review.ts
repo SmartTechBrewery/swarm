@@ -43,7 +43,10 @@ export interface ForceReReviewRunState {
 	reviewAutomationOutcome?: string | null;
 	/** Read by {@link isCapSpentApproval} alone (issue #1038); optional, so #511's callers are unaffected. */
 	reviewMergeOutcome?: string | null;
-	/** Likewise — the server-resolved ledger fact, absent on the list read model. */
+	/**
+	 * Likewise — the server-resolved ledger fact. `runs.list` resolves it too, for
+	 * the rows {@link isCapSpentApproval} can be true for (issue #1378).
+	 */
 	reviewCapSpent?: boolean | null;
 	/**
 	 * The second server-resolved ledger fact (issue #1040): an operator's extra
@@ -81,12 +84,21 @@ export function canForceReReview(
 	run: ForceReReviewRunState,
 	pipeline?: ForceReReviewPipeline,
 ): boolean {
+	return isCappedRequestChanges(run) && pipeline?.respondToReview?.enabled !== false;
+}
+
+/**
+ * The capped `request-changes` stop itself (issues #242/#511): a completed Review
+ * run whose `request-changes` verdict was the last the review safety cap allows.
+ * Independent of project pipeline settings — {@link canForceReReview} adds the
+ * gate on whether the lever is offered.
+ */
+export function isCappedRequestChanges(run: ForceReReviewRunState): boolean {
 	return (
 		run.status === 'completed' &&
 		run.phase === 'review' &&
 		run.reviewVerdict === 'request-changes' &&
-		run.reviewAutomationOutcome === 'manual-intervention-required' &&
-		pipeline?.respondToReview?.enabled !== false
+		run.reviewAutomationOutcome === 'manual-intervention-required'
 	);
 }
 
@@ -116,6 +128,19 @@ export function isCapSpentApproval(run: ForceReReviewRunState): boolean {
 		run.reviewMergeOutcome === 'not-eligible' &&
 		run.reviewCapSpent === true
 	);
+}
+
+/**
+ * Whether the run is in a state the run-detail view renders as "Manual action
+ * required" (issue #1378): the capped `request-changes` stop or the cap-spent
+ * approval, whichever bound made the latter. The runs-list badge, the run-detail
+ * header badge and the detail callouts all read this, so they cannot disagree.
+ *
+ * {@link isForcedReviewPending} is deliberately not part of it: the detail page
+ * titles that window "Forced review pending", and an operator has already acted.
+ */
+export function isManualActionRequired(run: ForceReReviewRunState): boolean {
+	return isCappedRequestChanges(run) || isCapSpentApproval(run);
 }
 
 /**

@@ -1280,6 +1280,23 @@ superseded bound when that is the stop, and keep the verdict-cap wording
 otherwise. Force re-review's *availability* is unchanged, because one grant
 licenses one review past either bound.
 
+**The list badge names the cap-spent approval stop too (issue #1378).** A
+superseded approval that is *also* the pull request's cap-spent stop — the
+superseded bound reached, or the verdict cap — would otherwise read as
+**Approved · superseded** in the list while its detail page says "Manual action
+required". So `runs.list` resolves `reviewCapSpent` and `reviewCapStop` for the
+rows that can be that stop (completed approving Review runs whose merge was
+refused `not-eligible`), through the same `readReviewCapSlots` /
+`resolveReviewCapSpent` / `resolveReviewCapStop` as `runs.getById`, with one
+ledger read per pull request per page and none for any other row; and
+`RunStatusBadge` decides "Manual action required" with the dashboard's shared
+`isManualActionRequired` (`dashboard/src/lib/force-re-review.ts`) — the capped
+`request-changes` stop or `isCapSpentApproval` — checked before the superseded
+label, so the list, the detail header badge and the detail callout cannot
+disagree. After a Force re-review `reviewCapSpent` goes false and the badge
+reverts. Like the callout, the badge still shows the stop for a pull request a
+person merged or closed outside SWARM, since the ledger records nothing then.
+
 **A `merged` outcome also settles the split siblings this pull request absorbed
 (issue #959),** which is where the Review phase's fold-in declaration above is
 finally acted on. Right after `completeDispatch(…, 'merged')` — never before, and
