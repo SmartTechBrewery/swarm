@@ -181,7 +181,8 @@ export type TaskPhase = z.infer<typeof TaskPhaseSchema>;
  *
  * `supervision` is whether a process supervisor will start this daemon again after
  * it exits (issue #997) — `INVOCATION_ID` for systemd, a real `XPC_SERVICE_NAME`
- * beside ppid 1 for launchd, neither for a daemon run by hand in a terminal
+ * beside ppid 1 (or a SWARM worker agent's own label, issue #1376) for launchd,
+ * neither for a daemon run by hand in a terminal
  * (`WorkerSupervisionSchema`, `../lib/worker-supervision.js` — again the shared
  * definition rather than a re-declaration). It is the fifth self-declared fact, and
  * the one nothing else on this frame implies: the other four read identically on a

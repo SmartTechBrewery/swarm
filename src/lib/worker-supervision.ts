@@ -29,36 +29,47 @@
  * today, which is what makes them acceptable: the failure this closes is the
  * *silent* one, a machine claiming nothing while exiting for nobody.
  *
- * **The launchd arm reads `supervised` only for launchd's *direct* child, and that
- * is narrower than "started by a LaunchAgent".** It used to be narrower than SWARM's
- * own installer too: the worker plists ran `swarm run:worker`, which spawned `npm
- * run dev:worker`, which spawned the daemon — so the daemon's parent was `npm`, only
- * the launcher three levels up had ppid 1, and every machine `bin/swarm-worker-agent`
- * installed declared `unsupervised` although launchd would in fact restart it. The
- * warning below came true exactly as written: issue #1024's installation-wide fleet
- * update shipped, and on 2026-09-18 all twelve machines on this installation were
- * refused by it. The fix was to stop lying to this read rather than to loosen it —
- * `swarm run:worker` now replaces its own process with the daemon
- * (`process.execve`, `../cli/commands/run-worker.ts`), so the job launchd started
- * *is* the daemon and `ppid === 1` holds. A machine on a build predating that, or on
- * a runtime without `execve`, still takes the old spawn and still reads
- * `unsupervised` — correctly, as far as this read can tell.
+ * **The launchd arm accepts two shapes, and refuses everything else.** The first is
+ * launchd's *direct* child: `XPC_SERVICE_NAME` set to a real label **and**
+ * `ppid === 1`. That used to be the only one, and it was narrower than SWARM's own
+ * installer: the worker plists ran `swarm run:worker`, which spawned `npm run
+ * dev:worker`, which spawned the daemon — so every machine `bin/swarm-worker-agent`
+ * installed declared `unsupervised` although launchd would in fact restart it, and
+ * on 2026-09-18 issue #1024's fleet update refused all twelve machines on this
+ * installation. `swarm run:worker` and the launcher now replace their own process
+ * with the daemon (`process.execve`, `../cli/commands/run-worker.ts`), so the job
+ * launchd started *is* the daemon and `ppid === 1` holds.
  *
- * That conjunct is kept anyway, because dropping it is worse and nothing cheaper
- * replaces it: `XPC_SERVICE_NAME` is inherited by *every* descendant of *any*
- * launchd job — a Terminal window, an ssh session — so the variable alone would
- * read a hand-run daemon as supervised, and no in-process read distinguishes "my
- * own LaunchAgent started me" from "I descend from somebody else's job" without
- * either carrying the supervisor's job label or planting a SWARM-owned marker in
- * the plist, both of which issue #997 puts out of scope. So the error is left
- * pointing the **safe** way: this never claims `supervised` for a machine that
- * would not come back, only `unsupervised` for one that would. A consumer that
- * refuses on `unsupervised` must still reckon with that — the residual error is
- * unchanged for anything this installer did not start, and a false `unsupervised`
- * costs that machine every update it would otherwise have been asked for.
+ * The second is **a job carrying a SWARM worker LaunchAgent label**
+ * ({@link WORKER_LAUNCH_AGENT_LABEL_PREFIX}), whatever the parent (issue #1376). A
+ * host may run its worker agent under an operator-supplied wrapper program
+ * (`~/.swarm/launchd-wrapper`, written into the plist by `bin/swarm-worker-agent`)
+ * which starts the usual command as its *child* — so the daemon's parent is the
+ * wrapper, never pid 1, and the first shape alone would read every such machine
+ * `unsupervised` and have fleet updates refuse it all over again. The same holds
+ * for a launcher that had to fall back to spawning the daemon. The label is what
+ * tells these apart from a hand-run daemon: `XPC_SERVICE_NAME` is inherited by every
+ * descendant of any launchd job, but a Terminal window or an ssh session inherits
+ * *its own* job's label, not one SWARM's installer wrote.
+ *
+ * **What that second shape cannot prove, accepted deliberately.** A process started
+ * from *inside* a SWARM worker agent's tree — an agent CLI's shell, say — inherits
+ * that agent's label, so a daemon started by hand from there would read
+ * `supervised`. Nothing SWARM runs does that, and an operator who does it has gone
+ * out of their way to; whereas refusing the label would refuse every wrapped
+ * machine, which is the failure that took the fleet out once already. Any other
+ * label — and launchd's `0` sentinel, and no variable at all — still needs
+ * `ppid === 1`, so a daemon run by hand from a terminal still reads `unsupervised`.
  */
 
 import { z } from 'zod';
+
+/**
+ * The label prefix of every SWARM worker LaunchAgent — clone and profile agents alike
+ * (`bin/swarm-worker-agent`'s `resolve`/`resolve_profile`, and
+ * `../launcher/clone-agent.ts`, which reads them back).
+ */
+export const WORKER_LAUNCH_AGENT_LABEL_PREFIX = 'pl.smarttechbrewery.swarm.worker.';
 
 /**
  * How a daemon is supervised, in the one vocabulary the handshake declares in, the
@@ -96,8 +107,11 @@ function declared(value: string | undefined): boolean {
  *    unsupervised.
  * 2. **launchd** sets `XPC_SERVICE_NAME` — but to the literal `0` for a process
  *    that is not an XPC service, which is not a label — and reparents its jobs to
- *    pid 1. Both halves are required: `ppid === 1` alone is also what an *orphaned*
- *    hand-run daemon reports, and the variable alone is inherited by children.
+ *    pid 1. Both halves are required for an arbitrary label: `ppid === 1` alone is
+ *    also what an *orphaned* hand-run daemon reports, and the variable alone is
+ *    inherited by children. A SWARM worker LaunchAgent label is enough on its own,
+ *    so a daemon under an operator's wrapper program still reads `supervised` (see
+ *    the module comment for the trade-off).
  * 3. **A platform these reads answer for** (`darwin`, `linux`) with neither marker
  *    is `unsupervised`. That is the machine this whole declaration exists for.
  * 4. **Anything else** is `unknown` — never `supervised`, and never `unsupervised`
@@ -110,9 +124,21 @@ export function detectWorkerSupervision(
 ): WorkerSupervision {
 	if (declared(env.INVOCATION_ID)) return 'supervised';
 	const xpcServiceName = env.XPC_SERVICE_NAME?.trim();
-	if (declared(xpcServiceName) && xpcServiceName !== '0' && ppid === 1) return 'supervised';
+	if (declared(xpcServiceName) && xpcServiceName !== '0') {
+		if (ppid === 1) return 'supervised';
+		if (isWorkerLaunchAgentLabel(xpcServiceName)) return 'supervised';
+	}
 	if (platform === 'darwin' || platform === 'linux') return 'unsupervised';
 	return 'unknown';
+}
+
+/** Whether a launchd job label is one `bin/swarm-worker-agent` writes. */
+function isWorkerLaunchAgentLabel(label: string | undefined): boolean {
+	return (
+		typeof label === 'string' &&
+		label.startsWith(WORKER_LAUNCH_AGENT_LABEL_PREFIX) &&
+		label.length > WORKER_LAUNCH_AGENT_LABEL_PREFIX.length
+	);
 }
 
 /**
