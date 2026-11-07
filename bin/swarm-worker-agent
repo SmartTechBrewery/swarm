@@ -189,20 +189,27 @@ agents_of_install_root() {
 	local plist launcher checkout
 	for plist in "$HOME"/Library/LaunchAgents/pl.smarttechbrewery.swarm.worker.*.plist; do
 		[ -f "$plist" ] || continue
-		runs_clone_worker "$plist" || continue
-		launcher=$(plutil -extract ProgramArguments.1 raw "$plist" 2>/dev/null) || continue
+		launcher=$(clone_launcher "$plist") || continue
 		case "$(resolve_symlink "$launcher")" in "$ROOT"/*) ;; *) continue ;; esac
 		checkout=$(plutil -extract WorkingDirectory raw "$plist" 2>/dev/null) || continue
 		printf '%s\t%s\n' "$(basename "$plist" .plist)" "$checkout"
 	done
 }
 
-# Whether a plist's ProgramArguments include `run:worker`, i.e. it is a clone agent.
-runs_clone_worker() {
-	local i arg
+# A clone agent's launcher: the ProgramArguments entry right before `run:worker`, or a
+# non-zero exit for a plist that runs no `run:worker` (a profile agent). Found by that
+# neighbour rather than as `ProgramArguments.1`, because a host's launchd wrapper
+# (`launchd_wrapper`) is prepended to every agent's arguments.
+clone_launcher() {
+	local i arg previous=''
 	for ((i = 0; ; i++)); do
 		arg=$(plutil -extract "ProgramArguments.$i" raw "$1" 2>/dev/null) || return 1
-		[ "$arg" != 'run:worker' ] || return 0
+		if [ "$arg" = 'run:worker' ]; then
+			[ -n "$previous" ] || return 1
+			printf '%s' "$previous"
+			return 0
+		fi
+		previous=$arg
 	done
 }
 
@@ -368,10 +375,45 @@ install_profile() {
 		"$LABEL" "$WORKER_ID" "$PROFILE_DIR" "$LOG"
 }
 
+# The host's launchd wrapper (issue #1376): the absolute path of an executable named
+# on the first line of `~/.swarm/launchd-wrapper`, printed for `write_plist` to run
+# in front of the agent's command -- or nothing, which leaves the plist exactly as it
+# would be without the file. macOS attributes every privacy prompt the worker and its
+# children raise to the agent's first program, so a host may name a stable, signed
+# one there instead of `node`. The wrapper receives the whole command as its
+# arguments and must run it as a child, forward signals to it and exit with its
+# status (docs/configuration.md). A file naming anything but an executable file is
+# warned about and ignored, never written into a plist.
+launchd_wrapper() {
+	local file="$HOME/.swarm/launchd-wrapper" line='' wrapper
+	[ -f "$file" ] || return 0
+	IFS= read -r line <"$file" || true
+	wrapper=${line#"${line%%[![:space:]]*}"}
+	wrapper=${wrapper%"${wrapper##*[![:space:]]}"}
+	[ -n "$wrapper" ] || return 0
+	case "$wrapper" in
+		/*) ;;
+		*)
+			printf 'swarm-worker-agent: warning: ignoring %s -- %s is not an absolute path\n' "$file" "$wrapper" >&2
+			return 0
+			;;
+	esac
+	if [ ! -f "$wrapper" ] || [ ! -x "$wrapper" ]; then
+		printf 'swarm-worker-agent: warning: ignoring %s -- %s is not an executable file\n' "$file" "$wrapper" >&2
+		return 0
+	fi
+	printf '%s' "$wrapper"
+}
+
 # The agent's plist: `$LABEL`, running the given program arguments in `$CHECKOUT`
 # (a clone worker's checkout, or a profile worker's directory) and logging to `$LOG`.
+# The host's launchd wrapper, when it names one, goes in front of them -- for clone
+# and profile agents alike, so every path that rewrites a plist (`install`, the
+# installer `swarm workers setup` runs, the clone -> profile migration) keeps it.
 write_plist() {
-	local arg args=''
+	local arg args='' wrapper
+	wrapper=$(launchd_wrapper)
+	[ -z "$wrapper" ] || set -- "$wrapper" "$@"
 	for arg in "$@"; do args="$args		<string>$arg</string>
 "; done
 	mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"

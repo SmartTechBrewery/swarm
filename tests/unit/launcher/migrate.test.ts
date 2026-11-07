@@ -456,4 +456,24 @@ describe('clone agents', () => {
 		expect(cloneAgentControlPlaneUrl(agents[0])).toBe('https://plist.example.com');
 		expect(cloneAgentControlPlaneUrl({ ...agents[0], environment: {} })).toBe(`${CONTROL_PLANE}/`);
 	});
+
+	it('finds the clone of an agent running under a host launchd wrapper (issue #1376)', async () => {
+		const plist = cloneAgentPlist(checkout);
+		writePlist(LABEL, {
+			...plist,
+			ProgramArguments: [
+				'/Applications/Wrapper.app/Contents/MacOS/wrapper',
+				...plist.ProgramArguments,
+			],
+		});
+
+		const agents = await listCloneAgents({
+			homeDir: home,
+			readPlist: async (path) => plists.get(path),
+		});
+
+		expect(agents.map((agent) => [agent.label, agent.checkout, agent.cloneRoot])).toEqual([
+			[LABEL, checkout, clone],
+		]);
+	});
 });

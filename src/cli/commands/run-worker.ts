@@ -15,10 +15,12 @@
  * *replaces itself* with the daemon, so the process a supervisor started keeps its
  * pid and its parent and simply becomes the worker. That is not a micro-
  * optimisation, it is the whole point: `detectWorkerSupervision`
- * (`../../lib/worker-supervision.ts`) reads `supervised` on macOS only for
- * launchd's **direct** child (`XPC_SERVICE_NAME` is inherited by every descendant
- * of any launchd job, so the variable alone proves nothing and `ppid === 1` is the
- * half that does). The old shape — plist → `swarm run:worker` → `npm run
+ * (`../../lib/worker-supervision.ts`) reads `supervised` on macOS for launchd's
+ * **direct** child (`XPC_SERVICE_NAME` is inherited by every descendant of any
+ * launchd job, so an arbitrary label alone proves nothing and `ppid === 1` is the
+ * half that does) — or, since issue #1376, for a job carrying a SWARM worker
+ * agent's own label, which is what keeps a host's launchd wrapper from reading
+ * `unsupervised`. The old shape — plist → `swarm run:worker` → `npm run
  * dev:worker` → daemon — put two processes between launchd and the daemon, so
  * every machine installed by `bin/swarm-worker-agent` declared `unsupervised`
  * although launchd would in fact restart it. A consumer that refuses on
@@ -41,8 +43,8 @@
  *
  * `process.execve` is POSIX-only and recent (Node 24+), so its absence or failure
  * falls back to the previous spawn. A machine that takes the fallback keeps
- * working exactly as it did and keeps declaring `unsupervised`, which is the
- * honest answer there: nothing about that shape changed.
+ * working exactly as it did; under a SWARM worker agent its label still reads
+ * `supervised` (issue #1376), and anywhere else it declares `unsupervised`.
  *
  * `npm run dev:worker` with explicit env vars stays exactly as it was, and is
  * still the path for a remote machine, a process supervisor, or anything else that

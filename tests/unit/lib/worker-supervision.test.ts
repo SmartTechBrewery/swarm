@@ -9,12 +9,16 @@ import { describe, expect, it } from 'vitest';
 import {
 	detectWorkerSupervision,
 	resolveOwnSupervision,
+	WORKER_LAUNCH_AGENT_LABEL_PREFIX,
 	WORKER_SUPERVISION_STATES,
 	WorkerSupervisionSchema,
 } from '@/lib/worker-supervision.js';
 
 /** The value a real launchd job on this fleet reports, verified live on the issue. */
 const LAUNCHD_LABEL = 'pl.smarttechbrewery.swarm.worker.tb-rover.e19f1081';
+
+/** A launchd job SWARM's installer did not write. */
+const FOREIGN_LABEL = 'com.example.my-own-agent';
 
 describe('detectWorkerSupervision', () => {
 	describe('systemd', () => {
@@ -34,20 +38,55 @@ describe('detectWorkerSupervision', () => {
 			);
 		});
 
-		it('refuses the variable alone — it is inherited by any child', () => {
-			expect(detectWorkerSupervision({ XPC_SERVICE_NAME: LAUNCHD_LABEL }, 4711, 'darwin')).toBe(
+		it('refuses a foreign label alone — it is inherited by any child', () => {
+			expect(detectWorkerSupervision({ XPC_SERVICE_NAME: FOREIGN_LABEL }, 4711, 'darwin')).toBe(
 				'unsupervised',
 			);
 		});
 
-		// Pinned deliberately rather than discovered later: the worker plists on this
-		// installation run `swarm run:worker` → `npm run dev:worker` → the daemon, so a
-		// genuinely launchd-restarted daemon's parent is `npm` and it declares
-		// `unsupervised`. The module header says why that error is left pointing this
-		// way, and phase 2/2 has to reckon with it before it refuses on this value.
-		it('reads a daemon launchd started through a launcher as unsupervised', () => {
+		// Issue #1376: a host may run its worker agent under a wrapper program that
+		// starts the usual command as its child, so the daemon's parent is the wrapper,
+		// never pid 1. The SWARM worker label is what says launchd runs this job.
+		it('reads a SWARM worker label as supervised whatever the parent', () => {
 			expect(detectWorkerSupervision({ XPC_SERVICE_NAME: LAUNCHD_LABEL }, 23110, 'darwin')).toBe(
-				'unsupervised',
+				'supervised',
+			);
+			expect(
+				detectWorkerSupervision(
+					{ XPC_SERVICE_NAME: 'pl.smarttechbrewery.swarm.worker.swarm-example-com.w-1.0a1b2c3d' },
+					4711,
+					'darwin',
+				),
+			).toBe('supervised');
+		});
+
+		it('still refuses a hand-run daemon under any other job, or the bare prefix', () => {
+			expect(
+				detectWorkerSupervision(
+					{ XPC_SERVICE_NAME: 'application.com.apple.Terminal.1234' },
+					23110,
+					'darwin',
+				),
+			).toBe('unsupervised');
+			expect(
+				detectWorkerSupervision(
+					{ XPC_SERVICE_NAME: 'pl.smarttechbrewery.swarm.api.swarm.abcd1234' },
+					23110,
+					'darwin',
+				),
+			).toBe('unsupervised');
+			expect(
+				detectWorkerSupervision(
+					{ XPC_SERVICE_NAME: WORKER_LAUNCH_AGENT_LABEL_PREFIX },
+					23110,
+					'darwin',
+				),
+			).toBe('unsupervised');
+		});
+
+		it('reads a foreign label beside ppid 1 as supervised, as before', () => {
+			expect(detectWorkerSupervision({ XPC_SERVICE_NAME: FOREIGN_LABEL }, 1, 'darwin')).toBe(
+				'supervised',
 			);
 		});
 
