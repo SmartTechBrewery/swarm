@@ -1,4 +1,9 @@
 import type { ComponentProps } from 'react';
+import {
+	type ForceReReviewRunState,
+	isCappedRequestChanges,
+	isManualActionRequired,
+} from '@/lib/force-re-review.js';
 
 type RunStatus = 'running' | 'completed' | 'failed' | 'deferred' | 'checkpointed' | 'queued';
 
@@ -43,6 +48,17 @@ interface RunStatusBadgeProps extends ComponentProps<'span'> {
 	 * review cap; null/absent keeps the plain verdict badge.
 	 */
 	reviewSupersededAt?: string | null;
+	/**
+	 * This Review run's merge-automation outcome. Read together with
+	 * {@link reviewCapSpent} by the shared `isManualActionRequired` predicate: an
+	 * approval whose merge was refused (`not-eligible`) on a pull request whose
+	 * review allowance is spent is the cap-spent approval stop (issue #1378).
+	 */
+	reviewMergeOutcome?: string | null;
+	/** The server-resolved ledger fact `isCapSpentApproval` reads (issue #1038). */
+	reviewCapSpent?: boolean | null;
+	/** Which bound made the cap-spent approval stop (issue #1080) — selects the tooltip only. */
+	reviewCapStop?: ForceReReviewRunState['reviewCapStop'];
 }
 
 interface BadgeConfig {
@@ -185,6 +201,29 @@ const MANUAL_INTERVENTION_CONFIG: BadgeConfig = {
 };
 
 /**
+ * The *other* review-cap stop (issues #1038, #1378): an approval merge automation
+ * refused, on a pull request whose review allowance is spent — nothing will
+ * dispatch another review, so it needs a person exactly as the capped
+ * `request-changes` verdict does. Same text and hue as
+ * {@link MANUAL_INTERVENTION_CONFIG}, so the runs list reads it as the stop the
+ * run-detail callout describes rather than as "Approved · superseded"; only the
+ * `title` differs, naming the bound that made the stop. Like the callout's copy,
+ * neither title names the cap's numeric value.
+ */
+const CAP_SPENT_APPROVAL_CONFIGS: Record<'verdict-cap' | 'superseded-bound', BadgeConfig> = {
+	'verdict-cap': {
+		...MANUAL_INTERVENTION_CONFIG,
+		title:
+			'Approved, but merge automation refused it and the review allowance is spent — open the run to Force re-review.',
+	},
+	'superseded-bound': {
+		...MANUAL_INTERVENTION_CONFIG,
+		title:
+			"Approved, but the pull request's head moved out from under too many approvals — SWARM stopped reviewing it; open the run to Force re-review.",
+	},
+};
+
+/**
  * An approval superseded by a head change (issue #1080): the review happened and
  * passed, but the pull request's head moved before it could merge — usually
  * SWARM's own conflict resolution — so it spent no review-cap slot and SWARM
@@ -218,14 +257,42 @@ function verdictFallbackConfig(verdict: string): BadgeConfig {
 	};
 }
 
-function resolveBadgeConfig(
-	status: RunStatus,
-	timedOut: boolean,
-	phase: string | undefined,
-	reviewVerdict: string | null | undefined,
-	reviewAutomationOutcome: string | null | undefined,
-	reviewSupersededAt: string | null | undefined,
+/** Everything {@link resolveBadgeConfig} reads — the badge's own props, minus presentation. */
+type BadgeInput = Pick<
+	RunStatusBadgeProps,
+	| 'status'
+	| 'phase'
+	| 'reviewVerdict'
+	| 'reviewAutomationOutcome'
+	| 'reviewSupersededAt'
+	| 'reviewMergeOutcome'
+	| 'reviewCapSpent'
+	| 'reviewCapStop'
+> & { timedOut: boolean };
+
+/**
+ * A completed Review run's verdict badge. Both review-cap stops read "Manual
+ * action required" — the capped changes-requested verdict (issue #242) and the
+ * cap-spent approval (issue #1378) — decided by the very predicate the run-detail
+ * view uses, and checked before "superseded" because a superseded-bound stop is
+ * both.
+ */
+function reviewVerdictConfig(
+	input: BadgeInput & { phase: string; reviewVerdict: string },
 ): BadgeConfig {
+	if (isManualActionRequired(input)) {
+		return isCappedRequestChanges(input)
+			? MANUAL_INTERVENTION_CONFIG
+			: CAP_SPENT_APPROVAL_CONFIGS[input.reviewCapStop ?? 'verdict-cap'];
+	}
+	if (input.reviewVerdict === 'approve' && input.reviewSupersededAt) {
+		return SUPERSEDED_APPROVAL_CONFIG;
+	}
+	return REVIEW_VERDICT_CONFIGS[input.reviewVerdict] ?? verdictFallbackConfig(input.reviewVerdict);
+}
+
+function resolveBadgeConfig(input: BadgeInput): BadgeConfig {
+	const { status, timedOut, phase, reviewVerdict } = input;
 	if (status === 'failed' && timedOut) return TIMED_OUT_CONFIG;
 	// A resumable wall-clock kill settles deferred/checkpointed, so the timeout
 	// has to be legible on those rows too — as their own hue, re-labelled.
@@ -236,16 +303,7 @@ function resolveBadgeConfig(
 	// A completed Review run shows its verdict rather than "Completed"; anything
 	// non-completed (or a review row missing its verdict) keeps lifecycle status.
 	if (status === 'completed' && phase === 'review' && reviewVerdict) {
-		// The cap-stopping second changes-requested verdict gets its own distinct
-		// treatment instead of the ordinary "Changes requested" badge (issue #242).
-		if (
-			reviewVerdict === 'request-changes' &&
-			reviewAutomationOutcome === 'manual-intervention-required'
-		) {
-			return MANUAL_INTERVENTION_CONFIG;
-		}
-		if (reviewVerdict === 'approve' && reviewSupersededAt) return SUPERSEDED_APPROVAL_CONFIG;
-		return REVIEW_VERDICT_CONFIGS[reviewVerdict] ?? verdictFallbackConfig(reviewVerdict);
+		return reviewVerdictConfig({ ...input, phase, reviewVerdict });
 	}
 	return (
 		STATUS_CONFIGS[status] ?? {
@@ -263,17 +321,23 @@ export function RunStatusBadge({
 	reviewVerdict,
 	reviewAutomationOutcome,
 	reviewSupersededAt,
+	reviewMergeOutcome,
+	reviewCapSpent,
+	reviewCapStop,
 	className = '',
 	...props
 }: RunStatusBadgeProps) {
-	const config = resolveBadgeConfig(
+	const config = resolveBadgeConfig({
 		status,
 		timedOut,
 		phase,
 		reviewVerdict,
 		reviewAutomationOutcome,
 		reviewSupersededAt,
-	);
+		reviewMergeOutcome,
+		reviewCapSpent,
+		reviewCapStop,
+	});
 
 	return (
 		<span

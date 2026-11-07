@@ -2338,6 +2338,9 @@ export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
 						reviewVerdict={run.reviewVerdict}
 						reviewAutomationOutcome={run.reviewAutomationOutcome}
 						reviewSupersededAt={run.reviewSupersededAt}
+						reviewMergeOutcome={run.reviewMergeOutcome}
+						reviewCapSpent={run.reviewCapSpent}
+						reviewCapStop={run.reviewCapStop}
 						className="text-sm px-3 py-1"
 					/>
 				</div>
@@ -2611,6 +2614,9 @@ function RunOverview({ run, project }: RunOverviewProps) {
 								reviewVerdict={run.reviewVerdict}
 								reviewAutomationOutcome={run.reviewAutomationOutcome}
 								reviewSupersededAt={run.reviewSupersededAt}
+								reviewMergeOutcome={run.reviewMergeOutcome}
+								reviewCapSpent={run.reviewCapSpent}
+								reviewCapStop={run.reviewCapStop}
 							/>
 						</span>
 					</div>

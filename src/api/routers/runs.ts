@@ -1524,10 +1524,80 @@ async function withWorkerNames<
 	}));
 }
 
-/** {@link listRunsFromDb}, with each row's executing machine named (issue #523). */
+/**
+ * {@link listRunsFromDb}, with each row's executing machine named (issue #523) and
+ * the review-cap facts resolved for the rows that can be a cap-spent approval stop
+ * (issue #1378).
+ */
 async function listRunsWithWorkerNames(filter: ListRunsFilter) {
 	const { data, total } = await listRunsFromDb(filter);
-	return { data: await withWorkerNames(data), total };
+	return { data: await withReviewCapFacts(await withWorkerNames(data)), total };
+}
+
+/**
+ * Whether a listed row could be the cap-spent approval stop the run-detail view
+ * renders as "Manual action required" (issue #1038): a completed Review that
+ * approved, whose merge automation then refused it. Exactly the rows the
+ * dashboard's `isCapSpentApproval` can answer true for once `reviewCapSpent` is
+ * known — every other row needs no ledger fact for its badge.
+ */
+function isCapSpentApprovalCandidate(run: {
+	status: string;
+	phase: string;
+	reviewVerdict: string | null;
+	reviewMergeOutcome: string | null;
+	repository: string | null;
+	prNumber: string | null;
+	reviewOrdinal: number | null;
+}): boolean {
+	return (
+		run.status === 'completed' &&
+		run.phase === 'review' &&
+		run.reviewVerdict === 'approve' &&
+		run.reviewMergeOutcome === 'not-eligible' &&
+		run.repository !== null &&
+		run.prNumber !== null &&
+		run.reviewOrdinal !== null
+	);
+}
+
+/**
+ * Resolves `reviewCapSpent` and `reviewCapStop` for the list rows that can be the
+ * cap-spent approval stop (issue #1378), so the runs-list badge decides "Manual
+ * action required" from the same two facts `runs.getById` hands the detail page —
+ * computed by the same functions — and the two pages cannot disagree.
+ *
+ * Only {@link isCapSpentApprovalCandidate} rows are read, and only once per pull
+ * request on the page: two runs of one pull request share the read. Every other
+ * row is returned unchanged, with no new field. A failed read reports `null` for
+ * both facts (the plain verdict badge), the same posture as the detail page.
+ */
+async function withReviewCapFacts<
+	T extends Parameters<typeof readReviewCapSlots>[0] & {
+		reviewVerdict: string | null;
+		reviewMergeOutcome: string | null;
+	},
+>(
+	rows: T[],
+): Promise<(T & { reviewCapSpent?: boolean | null; reviewCapStop?: ReviewCapBound | null })[]> {
+	const reads = new Map<string, Promise<PullRequestReviewSlot[] | null>>();
+	return await Promise.all(
+		rows.map(async (row) => {
+			if (!isCapSpentApprovalCandidate(row)) return row;
+			const key = JSON.stringify([row.projectId, row.repository, row.prNumber]);
+			let read = reads.get(key);
+			if (!read) {
+				read = readReviewCapSlots(row, 'runs.list');
+				reads.set(key, read);
+			}
+			const slots = await read;
+			return {
+				...row,
+				reviewCapSpent: resolveReviewCapSpent(row, slots),
+				reviewCapStop: resolveReviewCapStop(row, slots),
+			};
+		}),
+	);
 }
 
 /**
@@ -1737,21 +1807,24 @@ function resolveReviewCapSpent(
  * the read fails, so a detail page shows one callout fewer instead of failing to
  * load.
  */
-async function readReviewCapSlots(run: {
-	id: string;
-	projectId: string;
-	repository: string | null;
-	prNumber: string | null;
-	status: string;
-	phase: string;
-	reviewOrdinal: number | null;
-}): Promise<PullRequestReviewSlot[] | null> {
+async function readReviewCapSlots(
+	run: {
+		id: string;
+		projectId: string;
+		repository: string | null;
+		prNumber: string | null;
+		status: string;
+		phase: string;
+		reviewOrdinal: number | null;
+	},
+	source = 'runs.getById',
+): Promise<PullRequestReviewSlot[] | null> {
 	if (run.status !== 'completed' || run.phase !== 'review') return null;
 	if (!run.repository || !run.prNumber || run.reviewOrdinal === null) return null;
 	try {
 		return await listActiveReviewSlotsForPullRequest(run.projectId, run.repository, run.prNumber);
 	} catch (error) {
-		logger.warn('runs.getById: review-ledger lookup failed; reporting no verdict', {
+		logger.warn(`${source}: review-ledger lookup failed; reporting no verdict`, {
 			runId: run.id,
 			error: describeError(error),
 		});
@@ -2191,9 +2264,11 @@ async function withQueuedWipUsage(
 const runReadProcedures = {
 	// Paginated, filtered list; returns { data, total } from the repo, each row
 	// widened with the additive, server-resolved `workerName` naming the machine
-	// that executed it (issue #523 — see `withWorkerNames`). The name is resolved
-	// only after the access check below, so a non-member never triggers an
-	// identity read.
+	// that executed it (issue #523 — see `withWorkerNames`), and — on the rows that
+	// can be a cap-spent approval stop only — `reviewCapSpent`/`reviewCapStop` from
+	// the pull request's review ledger (issue #1378 — see `withReviewCapFacts`).
+	// Both are resolved only after the access check below, so a non-member never
+	// triggers an identity or ledger read.
 	// Project-scoped (#281 task 4): an explicit `projectId` filter requires read
 	// access to that project, so a non-member never sees another project's runs.
 	// Without one this is the cross-project list behind the global /runs screen,

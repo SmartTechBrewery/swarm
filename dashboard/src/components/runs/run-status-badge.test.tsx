@@ -2,6 +2,7 @@
 
 import { render, screen } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
+import { type ForceReReviewRunState, isManualActionRequired } from '@/lib/force-re-review.js';
 import { RunStatusBadge } from './run-status-badge.js';
 
 describe('RunStatusBadge', () => {
@@ -126,6 +127,86 @@ describe('RunStatusBadge', () => {
 				/>,
 			);
 			expect(screen.getByText('Running')).not.toBeNull();
+		});
+	});
+
+	// Issue #1378: the cap-spent approval stop reads as the stop the run-detail
+	// callout describes, not as "Approved · superseded".
+	describe('the cap-spent approval stop (issue #1378)', () => {
+		const CAP_SPENT = {
+			status: 'completed',
+			phase: 'review',
+			reviewVerdict: 'approve',
+			reviewMergeOutcome: 'not-eligible',
+			reviewSupersededAt: '2026-01-01T00:10:00.000Z',
+			reviewCapSpent: true,
+		} as const;
+
+		it('renders a superseded-bound stop as "Manual action required", naming the bound', () => {
+			render(<RunStatusBadge {...CAP_SPENT} reviewCapStop="superseded-bound" />);
+			const badge = screen.getByText('Manual action required');
+			expect(badge.className).toContain('text-red-400');
+			expect(badge.getAttribute('title')).toMatch(/head moved out from under too many approvals/);
+			expect(badge.getAttribute('title')).toMatch(/Force re-review/);
+			expect(screen.queryByText('Approved · superseded')).toBeNull();
+		});
+
+		it('renders a verdict-cap stop as "Manual action required", naming the spent allowance', () => {
+			render(<RunStatusBadge {...CAP_SPENT} reviewCapStop="verdict-cap" />);
+			const badge = screen.getByText('Manual action required');
+			expect(badge.getAttribute('title')).toMatch(/review allowance is spent/);
+		});
+
+		it('reverts to "Approved · superseded" once the allowance is no longer spent (after Force re-review)', () => {
+			const { rerender } = render(
+				<RunStatusBadge {...CAP_SPENT} reviewCapSpent={false} reviewCapStop="superseded-bound" />,
+			);
+			expect(screen.getByText('Approved · superseded')).not.toBeNull();
+			rerender(<RunStatusBadge {...CAP_SPENT} reviewCapSpent={undefined} />);
+			expect(screen.getByText('Approved · superseded')).not.toBeNull();
+			expect(screen.queryByText('Manual action required')).toBeNull();
+		});
+
+		it('reads "Manual action required" exactly when the run-detail predicate does', () => {
+			const fixtures: ForceReReviewRunState[] = [
+				{ ...CAP_SPENT, reviewCapStop: 'superseded-bound' },
+				{ ...CAP_SPENT, reviewCapStop: 'verdict-cap' },
+				{ ...CAP_SPENT, reviewCapStop: null },
+				{ ...CAP_SPENT, reviewCapSpent: false },
+				{ ...CAP_SPENT, reviewCapSpent: null },
+				{ ...CAP_SPENT, reviewMergeOutcome: 'merged' },
+				{ ...CAP_SPENT, status: 'running' },
+				{ ...CAP_SPENT, reviewCapSpent: false, reviewCapOverrideOutstanding: true },
+				{
+					status: 'completed',
+					phase: 'review',
+					reviewVerdict: 'request-changes',
+					reviewAutomationOutcome: 'manual-intervention-required',
+				},
+				{ status: 'completed', phase: 'review', reviewVerdict: 'request-changes' },
+				{ status: 'completed', phase: 'review', reviewVerdict: 'approve' },
+				{ status: 'completed', phase: 'implementation', reviewVerdict: 'approve' },
+			];
+			for (const fixture of fixtures) {
+				const { unmount } = render(
+					<RunStatusBadge
+						status={fixture.status as 'completed' | 'running'}
+						phase={fixture.phase}
+						reviewVerdict={fixture.reviewVerdict}
+						reviewAutomationOutcome={fixture.reviewAutomationOutcome}
+						reviewMergeOutcome={fixture.reviewMergeOutcome}
+						reviewCapSpent={fixture.reviewCapSpent}
+						reviewCapStop={fixture.reviewCapStop}
+						reviewSupersededAt={
+							'reviewSupersededAt' in fixture ? CAP_SPENT.reviewSupersededAt : null
+						}
+					/>,
+				);
+				expect(screen.queryByText('Manual action required') !== null, JSON.stringify(fixture)).toBe(
+					isManualActionRequired(fixture),
+				);
+				unmount();
+			}
 		});
 	});
 
