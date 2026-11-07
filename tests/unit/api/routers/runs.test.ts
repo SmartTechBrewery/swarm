@@ -792,6 +792,132 @@ describe('runsRouter', () => {
 			await expect(caller.list({ phase: 'deploy' as never })).rejects.toThrow();
 			expect(listRunsFromDb).not.toHaveBeenCalled();
 		});
+
+		// Issue #1378: the runs-list badge decides "Manual action required" from the
+		// same two ledger facts `getById` hands the detail page, so the list resolves
+		// them for the rows that can be the cap-spent approval stop — and only those.
+		describe('review-cap facts', () => {
+			function slot(overrides: Partial<PullRequestReviewSlot> = {}): PullRequestReviewSlot {
+				return {
+					ordinal: 1,
+					state: 'submitted',
+					headSha: 'head-1',
+					capOverrideGrantedAt: null,
+					capOverrideConsumedAt: null,
+					dispatchActive: false,
+					superseded: false,
+					...overrides,
+				};
+			}
+
+			/** A pull request stopped by superseded approvals alone. */
+			function supersededSlots(): PullRequestReviewSlot[] {
+				return Array.from({ length: REVIEW_SUPERSEDED_CAP }, (_, i) =>
+					slot({ ordinal: 1, headSha: `head-${i}`, superseded: true }),
+				);
+			}
+
+			const CAP_SPENT_ROW = {
+				status: 'completed',
+				phase: 'review',
+				prNumber: '262',
+				reviewVerdict: 'approve',
+				reviewMergeOutcome: 'not-eligible',
+				reviewSupersededAt: new Date('2026-07-10T00:00:30Z'),
+				reviewOrdinal: 1,
+			} as const;
+
+			it('resolves the cap-spent approval stop and the bound that made it', async () => {
+				vi.mocked(listRunsFromDb).mockResolvedValue({
+					data: [makeListedRun({ id: 'run-1', ...CAP_SPENT_ROW })],
+					total: 1,
+				});
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(supersededSlots());
+
+				const result = await caller.list({});
+
+				expect(result.data[0]).toMatchObject({
+					reviewCapSpent: true,
+					reviewCapStop: 'superseded-bound',
+				});
+				expect(listActiveReviewSlotsForPullRequest).toHaveBeenCalledExactlyOnceWith(
+					'p1',
+					'SmartTechBrewery/swarm',
+					'262',
+				);
+			});
+
+			it('reads the ledger once per pull request on the page', async () => {
+				vi.mocked(listRunsFromDb).mockResolvedValue({
+					data: [
+						makeListedRun({ id: 'run-1', ...CAP_SPENT_ROW }),
+						makeListedRun({ id: 'run-2', ...CAP_SPENT_ROW }),
+					],
+					total: 2,
+				});
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(supersededSlots());
+
+				const result = await caller.list({});
+
+				expect(result.data.map((run) => run.reviewCapSpent)).toEqual([true, true]);
+				expect(listActiveReviewSlotsForPullRequest).toHaveBeenCalledTimes(1);
+			});
+
+			it('makes no ledger read, and adds no field, for any other row', async () => {
+				vi.mocked(listRunsFromDb).mockResolvedValue({
+					data: [
+						makeListedRun({
+							id: 'changes',
+							...CAP_SPENT_ROW,
+							reviewVerdict: 'request-changes',
+							reviewMergeOutcome: null,
+							reviewAutomationOutcome: 'manual-intervention-required',
+						}),
+						makeListedRun({ id: 'running', ...CAP_SPENT_ROW, status: 'running' }),
+						makeListedRun({ id: 'merged', ...CAP_SPENT_ROW, reviewMergeOutcome: 'merged' }),
+						makeListedRun({ id: 'impl', phase: 'implementation' }),
+					],
+					total: 4,
+				});
+
+				const result = await caller.list({});
+
+				for (const run of result.data) {
+					expect(run).not.toHaveProperty('reviewCapSpent');
+					expect(run).not.toHaveProperty('reviewCapStop');
+				}
+				expect(listActiveReviewSlotsForPullRequest).not.toHaveBeenCalled();
+			});
+
+			it('reports no facts, rather than failing the list, when the ledger read fails', async () => {
+				vi.mocked(listRunsFromDb).mockResolvedValue({
+					data: [makeListedRun({ id: 'run-1', ...CAP_SPENT_ROW })],
+					total: 1,
+				});
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockRejectedValue(new Error('db down'));
+
+				const result = await caller.list({});
+
+				expect(result.data[0]).toMatchObject({ reviewCapSpent: null, reviewCapStop: null });
+			});
+
+			it('reports the allowance as no longer spent once Force re-review has granted a slot', async () => {
+				const slots = supersededSlots();
+				slots[REVIEW_SUPERSEDED_CAP - 1] = {
+					...slots[REVIEW_SUPERSEDED_CAP - 1],
+					capOverrideGrantedAt: new Date(),
+				};
+				vi.mocked(listRunsFromDb).mockResolvedValue({
+					data: [makeListedRun({ id: 'run-1', ...CAP_SPENT_ROW })],
+					total: 1,
+				});
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(slots);
+
+				const result = await caller.list({});
+
+				expect(result.data[0].reviewCapSpent).toBe(false);
+			});
+		});
 	});
 
 	// issue #840 — the item-centric liveness read model. The pure classifier

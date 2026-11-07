@@ -32,7 +32,7 @@ import type { ItemRepositoryRoute, PMProvider, PMType } from '@/pm/types.js';
 import { unroutedCardCommentBody } from '@/pm/unrouted-card-notice.js';
 import { createWebhookApp, type WebhookReceiverDeps } from '@/router/webhook-receiver.js';
 import type { ScmEvent } from '@/scm/events.js';
-import type { SCMProvider } from '@/scm/types.js';
+import type { PullRequestDetails, SCMProvider } from '@/scm/types.js';
 import {
 	createFakeScmProvider,
 	createMockAzureDevOpsBuildPayload,
@@ -1685,15 +1685,17 @@ describe('createWebhookApp', () => {
 		// path avoids a second API call. Branch and default-branch checks remain unresolved.
 		it('never reads when the provider already resolved the event', async () => {
 			const listPullRequestsForCommit = vi.fn<SCMProvider['listPullRequestsForCommit']>();
+			const getPullRequest = vi.fn<SCMProvider['getPullRequest']>();
 			const resolved = { ...checksEvent, workItemId: '5', prBranch: 'issue-5' };
 			const { app, enqueue } = makeApp(
 				{},
-				{ parseWebhookEvent: () => resolved, listPullRequestsForCommit },
+				{ parseWebhookEvent: () => resolved, listPullRequestsForCommit, getPullRequest },
 			);
 
 			await post(app, VALID_BODY);
 
 			expect(listPullRequestsForCommit).not.toHaveBeenCalled();
+			expect(getPullRequest).not.toHaveBeenCalled();
 			expect(enqueue).toHaveBeenCalledWith('github', resolved, project, 'delivery-1');
 		});
 
@@ -1739,6 +1741,100 @@ describe('createWebhookApp', () => {
 
 			expect(res.status).toBe(202);
 			expect(listPullRequestsForCommit).not.toHaveBeenCalled();
+			expect(enqueue).not.toHaveBeenCalled();
+		});
+	});
+
+	// The twin case (issue #1374): a CI event that names its pull request but no head —
+	// an Azure DevOps merge-ref build delivered without `triggerInfo` — takes the head
+	// from the pull request itself, never from the merge commit the build ran on.
+	describe("PR→head completion for a 'checks' event", () => {
+		const headlessEvent: ScmEvent = {
+			kind: 'checks',
+			action: 'completed',
+			repoFullName: 'SmartTechBrewery/swarm',
+			isCommentEvent: false,
+			workItemId: '42',
+			checkConclusion: 'success',
+		};
+
+		function pullRequest(overrides: Partial<PullRequestDetails> = {}): PullRequestDetails {
+			return {
+				number: 42,
+				headBranch: 'issue-42',
+				headSha: 'b1a5c0ffee42',
+				baseBranch: 'main',
+				baseSha: 'ba5e0000',
+				mergeable: true,
+				authorLogin: 'swarm-implementer',
+				state: 'open',
+				merged: false,
+				...overrides,
+			};
+		}
+
+		function makeHeadlessApp(overrides: Partial<SCMProvider> = {}) {
+			return makeApp({}, { parseWebhookEvent: () => headlessEvent, ...overrides });
+		}
+
+		it('fills headSha and prBranch from the open pull request the event names', async () => {
+			const getPullRequest = vi
+				.fn<SCMProvider['getPullRequest']>()
+				.mockResolvedValue(pullRequest());
+			const listPullRequestsForCommit = vi.fn<SCMProvider['listPullRequestsForCommit']>();
+			const { app, enqueue } = makeHeadlessApp({ getPullRequest, listPullRequestsForCommit });
+
+			const res = await post(app, VALID_BODY);
+
+			expect(res.status).toBe(202);
+			expect(getPullRequest).toHaveBeenCalledWith(project, 42);
+			expect(listPullRequestsForCommit).not.toHaveBeenCalled();
+			expect(enqueue).toHaveBeenCalledWith(
+				'github',
+				{ ...headlessEvent, headSha: 'b1a5c0ffee42', prBranch: 'issue-42' },
+				project,
+				'delivery-1',
+			);
+		});
+
+		it('leaves the event without a head when the pull request is no longer open', async () => {
+			const { app, enqueue } = makeHeadlessApp({
+				getPullRequest: vi
+					.fn<SCMProvider['getPullRequest']>()
+					.mockResolvedValue(pullRequest({ state: 'closed', merged: true })),
+			});
+
+			const res = await post(app, VALID_BODY);
+
+			expect(res.status).toBe(202);
+			expect(enqueue).toHaveBeenCalledWith('github', headlessEvent, project, 'delivery-1');
+		});
+
+		// Fails open: a headless event matches no Review, and the next build retries.
+		it('enqueues the event without a head when the read fails', async () => {
+			const { app, enqueue } = makeHeadlessApp({
+				getPullRequest: vi
+					.fn<SCMProvider['getPullRequest']>()
+					.mockRejectedValue(new Error('azure 503')),
+			});
+
+			const res = await post(app, VALID_BODY);
+
+			expect(res.status).toBe(202);
+			expect(enqueue).toHaveBeenCalledWith('github', headlessEvent, project, 'delivery-1');
+		});
+
+		it('does not read for an event loop prevention drops', async () => {
+			const getPullRequest = vi.fn<SCMProvider['getPullRequest']>();
+			const { app, enqueue } = makeHeadlessApp({
+				isSwarmGeneratedEvent: async () => true,
+				getPullRequest,
+			});
+
+			const res = await post(app, VALID_BODY);
+
+			expect(res.status).toBe(202);
+			expect(getPullRequest).not.toHaveBeenCalled();
 			expect(enqueue).not.toHaveBeenCalled();
 		});
 	});
@@ -2076,6 +2172,51 @@ describe('createWebhookApp', () => {
 				'event-guid-ado-2',
 			);
 			listPullRequestsForCommit.mockRestore();
+		});
+
+		// Issue #1374: a merge-ref build delivered without `triggerInfo` must carry the
+		// pull request's own source-branch head — the head already reviewed — and never
+		// the merge commit `sourceVersion` names, which would dispatch a second Review.
+		it('takes a merge-ref build’s head from the pull request when triggerInfo is absent', async () => {
+			const getPullRequest = vi
+				.spyOn(azureDevOpsScmManifest.provider, 'getPullRequest')
+				.mockResolvedValue({
+					number: 17,
+					headBranch: 'swarm/issue-17',
+					headSha,
+					baseBranch: 'main',
+					baseSha: 'ba5e0000',
+					mergeable: true,
+					authorLogin: null,
+					state: 'open',
+					merged: false,
+				});
+			const { app, enqueue } = realAzureApp();
+
+			const res = await postAzure(
+				app,
+				JSON.stringify(
+					createMockAzureDevOpsBuildPayload({ id: 'event-guid-ado-3', withoutTriggerInfo: true }),
+				),
+			);
+
+			expect(res.status).toBe(202);
+			expect(getPullRequest).toHaveBeenCalledWith(azureProject, 17);
+			expect(enqueue).toHaveBeenCalledWith(
+				'azure-devops',
+				expect.objectContaining({
+					kind: 'checks',
+					workItemId: '17',
+					headSha,
+					prBranch: 'swarm/issue-17',
+				}),
+				azureProject,
+				'event-guid-ado-3',
+			);
+			expect(enqueue.mock.calls[0]?.[1].headSha).not.toBe(
+				'feedfacefeedfacefeedfacefeedfacefeedface',
+			);
+			getPullRequest.mockRestore();
 		});
 	});
 });

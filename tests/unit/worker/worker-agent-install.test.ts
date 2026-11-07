@@ -379,6 +379,100 @@ describe('swarm-worker-agent install', () => {
 			expect(result.launchctl.join('\n')).toContain('bootout');
 		});
 
+		describe('a host launchd wrapper (issue #1376)', () => {
+			function wrapperFile(contents: string): void {
+				mkdirSync(join(home, '.swarm'), { recursive: true });
+				writeFileSync(join(home, '.swarm', 'launchd-wrapper'), contents, 'utf8');
+			}
+
+			function executable(name: string): string {
+				const path = join(home, name);
+				writeFileSync(path, '#!/bin/sh\nexec "$@"\n', { encoding: 'utf8', mode: 0o755 });
+				return path;
+			}
+
+			function programArguments(plist: string): string[] {
+				const array = plist.match(
+					/<key>ProgramArguments<\/key>\n\t<array>\n([\s\S]*?)\t<\/array>/,
+				)?.[1];
+				return [...(array ?? '').matchAll(/<string>([^<]*)<\/string>/g)].map((m) => m[1] ?? '');
+			}
+
+			it('runs a profile agent under the wrapper the host names', () => {
+				const url = 'https://swarm.example.com';
+				profile('w-1', url);
+				const wrapper = executable('wrapper');
+				wrapperFile(`  ${wrapper}  \n`);
+
+				const result = runAgent(['install', '--profile', 'w-1']);
+
+				expect(result.status, result.stderr).toBe(0);
+				expect(result.stderr).not.toContain('warning');
+				const args = programArguments(
+					readFileSync(agentPlist(labelOf('w-1', url, 'swarm-example-com')), 'utf8'),
+				);
+				expect(args).toHaveLength(5);
+				expect(args[0]).toBe(wrapper);
+				expect(args[1]).toMatch(/node$/);
+				expect(args.slice(2)).toEqual([join(root, 'bin', 'swarm-worker.js'), 'run', 'w-1']);
+			});
+
+			it('runs a clone agent under it too', () => {
+				const wrapper = executable('wrapper');
+				wrapperFile(wrapper);
+
+				expect(runInstall(join(root, 'bin', 'swarm-worker-agent')).status).toBe(0);
+
+				const args = programArguments(readFileSync(plistPath(), 'utf8'));
+				expect(args[0]).toBe(wrapper);
+				expect(args.slice(2)).toEqual([join(root, 'bin', 'swarm.js'), 'run:worker']);
+			});
+
+			it.each([
+				['a missing file', () => join(home, 'nowhere'), 'is not an executable file'],
+				[
+					'a file that is not executable',
+					() => {
+						const path = join(home, 'plain');
+						writeFileSync(path, '', { encoding: 'utf8', mode: 0o644 });
+						return path;
+					},
+					'is not an executable file',
+				],
+				['a directory', () => home, 'is not an executable file'],
+				['a relative path', () => 'bin/wrapper', 'is not an absolute path'],
+			])('warns about and ignores %s', (_case, target, warning) => {
+				const url = 'https://swarm.example.com';
+				profile('w-1', url);
+				wrapperFile(`${target()}\n`);
+
+				const result = runAgent(['install', '--profile', 'w-1']);
+
+				expect(result.status, result.stderr).toBe(0);
+				expect(result.stderr).toContain(warning);
+				const args = programArguments(
+					readFileSync(agentPlist(labelOf('w-1', url, 'swarm-example-com')), 'utf8'),
+				);
+				expect(args).toHaveLength(4);
+				expect(args[0]).toMatch(/node$/);
+			});
+
+			it('ignores an empty file without a warning', () => {
+				const url = 'https://swarm.example.com';
+				profile('w-1', url);
+				wrapperFile('\n');
+
+				const result = runAgent(['install', '--profile', 'w-1']);
+
+				expect(result.status, result.stderr).toBe(0);
+				expect(result.stderr).toBe('');
+				const args = programArguments(
+					readFileSync(agentPlist(labelOf('w-1', url, 'swarm-example-com')), 'utf8'),
+				);
+				expect(args).toHaveLength(4);
+			});
+		});
+
 		it('leaves the clone-mode plist exactly as it was', () => {
 			// The clone agent's plist, as `install [<checkout>]` wrote it before profiles.
 			expect(runInstall(join(root, 'bin', 'swarm-worker-agent')).status).toBe(0);

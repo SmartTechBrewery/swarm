@@ -766,6 +766,18 @@ then restart the agent). And a daemon started some other way — `npm run dev:wo
 in a terminal, or a LaunchAgent of your own that runs something other than
 `swarm run:worker` — still reads *Not supervised*, correctly.
 
+A host may also run its worker agents under a **wrapper program** of its own —
+`~/.swarm/launchd-wrapper`, which `swarm-worker-agent install` writes in front of the
+usual command so macOS attributes its privacy prompts to a stable, signed program
+rather than to `node` (issue #1376,
+[`docs/launchd-worker-autostart.md`](./launchd-worker-autostart.md#running-the-agent-under-a-wrapper-program),
+contract in [`docs/configuration.md`](./configuration.md)). The wrapper starts the
+daemon as its child, so the daemon's parent is never launchd; it still reads
+*Supervised*, because the launchd reading also accepts a job whose `XPC_SERVICE_NAME`
+is a SWARM worker agent's own label (`pl.smarttechbrewery.swarm.worker.…`). A Terminal
+window or an ssh session carries its own job's label, never one of those, so a daemon
+run by hand there still reads *Not supervised*.
+
 **The machine must be under a process supervisor** (issue #997, phase 2/2). The
 daemon applies an update by *exiting*, so a machine that declared `unsupervised` would
 be gone until somebody started it by hand rather than restarted onto the new build —

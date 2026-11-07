@@ -381,16 +381,28 @@ function commentFields(resource: Record<string, unknown>): LifecycleFields {
 }
 
 /**
- * A build's fields. A pull-request build runs on Azure's merge commit, so
- * `sourceVersion` is *that* commit and the pull request's real head is
- * `triggerInfo['pr.sourceSha']`; a branch build has no `triggerInfo` and its
- * `sourceVersion` is the head.
+ * A build's fields. The head follows one of three cases:
+ *
+ * - A **pull-request** build runs on Azure's merge commit (`sourceBranch` is
+ *   `refs/pull/{n}/merge`), so `sourceVersion` is *that* commit and the pull
+ *   request's real head is `triggerInfo['pr.sourceSha']`.
+ * - A pull-request build whose delivery carries **no** `pr.sourceSha` leaves the
+ *   head unset — never the merge commit, which would read as a new head to the
+ *   Review dispatch dedup and be recorded as the reviewed head. The receiver's
+ *   `resolveChecksPullRequest` completes it from the pull request's own
+ *   source-branch head (`getPullRequest`). Such deliveries — no `triggerInfo` at
+ *   all — were observed live (issue #1374); a build-validation policy is the
+ *   suspected source, but that is unconfirmed.
+ * - A **branch** build has no `triggerInfo` and its `sourceVersion` is the head.
  */
 function buildFields(resource: Record<string, unknown>): LifecycleFields {
 	const triggerInfo = asRecord(resource.triggerInfo);
+	const isMergeRefBuild = PULL_REQUEST_MERGE_REF.test(str(resource.sourceBranch) ?? '');
 	const result = str(resource.result);
 	return {
-		headSha: str(triggerInfo?.['pr.sourceSha']) ?? str(resource.sourceVersion),
+		headSha:
+			str(triggerInfo?.['pr.sourceSha']) ??
+			(isMergeRefBuild ? undefined : str(resource.sourceVersion)),
 		// Present for a pull-request build only. A branch build's pull request — and
 		// its branch — is completed by the receiver's commit→pull-request lookup.
 		prBranch: branchOf(triggerInfo?.['pr.sourceBranch']),
@@ -426,7 +438,9 @@ function extractLifecycleFields(
  * The pull request number an event belongs to. A build names it only through its
  * merge ref (`refs/pull/{n}/merge`); a branch build leaves it unset, so the
  * receiver's `resolveChecksPullRequest` completes it through
- * `listPullRequestsForCommit` (phase 4/6).
+ * `listPullRequestsForCommit` (phase 4/6). A merge-ref build without
+ * `pr.sourceSha` names the pull request but no head, which the same receiver step
+ * completes through `getPullRequest` (issue #1374).
  */
 function workItemIdOf(
 	eventType: ProcessableEventType,

@@ -455,6 +455,36 @@ describe('RunsTable', () => {
 			expect(within(supersededCard).getByText('Approved · superseded')).not.toBeNull();
 			expect(within(countedCard).getByText('Approved')).not.toBeNull();
 		});
+
+		// Issue #1378 — the cap-spent approval stop the run-detail page renders as
+		// "Manual action required" must not read as "Approved · superseded" here.
+		it('shows a cap-spent superseded approval as "Manual action required", on desktop and mobile', () => {
+			const { container } = renderTable(
+				<RunsTable
+					runs={[
+						{
+							...approval,
+							id: 'run-capped',
+							reviewSupersededAt: '2026-01-01T00:10:00.000Z',
+							reviewMergeOutcome: 'not-eligible',
+							reviewCapSpent: true,
+							reviewCapStop: 'superseded-bound',
+						},
+					]}
+					totalCount={1}
+					currentPage={1}
+					pageSize={25}
+					onPageChange={vi.fn()}
+				/>,
+			);
+
+			const table = container.querySelector('table') as HTMLElement;
+			expect(within(table).getByText('Manual action required')).not.toBeNull();
+			expect(within(table).queryByText('Approved · superseded')).toBeNull();
+
+			const [card] = screen.getAllByTestId('run-card');
+			expect(within(card).getByText('Manual action required')).not.toBeNull();
+		});
 	});
 
 	// Issue #971 — a worker-update run has no work item and no PR to reference, so the

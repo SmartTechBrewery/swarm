@@ -50,6 +50,8 @@ interface AgentFixture {
 	 * installation, rather than `swarm run:worker`.
 	 */
 	profile?: boolean;
+	/** A host launchd wrapper prepended to the plist's ProgramArguments (issue #1376). */
+	wrapper?: string;
 }
 
 interface UpdateOptions {
@@ -111,9 +113,12 @@ describe('swarm-worker-agent update', () => {
 		writeFileSync(
 			join(home, 'Library', 'LaunchAgents', `${agent.label}.plist`),
 			[
-				'ProgramArguments.0=/usr/local/bin/node',
-				`ProgramArguments.1=${launcher}`,
-				...args.map((arg, i) => `ProgramArguments.${i + 2}=${arg}`),
+				...[
+					...(agent.wrapper ? [agent.wrapper] : []),
+					'/usr/local/bin/node',
+					launcher,
+					...args,
+				].map((arg, i) => `ProgramArguments.${i}=${arg}`),
 				`WorkingDirectory=${agent.checkout}`,
 			].join('\n'),
 			'utf8',
@@ -241,6 +246,40 @@ describe('swarm-worker-agent update', () => {
 		});
 
 		expect(result.status).toBe(0);
+		expect(result.kickstarted).toHaveLength(1);
+		expect(result.kickstarted[0]).toContain('worker.api.aaaaaaaa');
+	});
+
+	it('finds the launcher of an agent running under a host launchd wrapper', () => {
+		// Issue #1376: the wrapper shifts the launcher off ProgramArguments.1, so it is
+		// read as the argument before `run:worker` — and another clone's wrapped agent is
+		// still told apart by where that launcher resolves.
+		const result = runUpdate({
+			agents: [
+				{
+					label: 'pl.smarttechbrewery.swarm.worker.api.aaaaaaaa',
+					checkout: '/checkouts/api',
+					installation: 'this',
+					wrapper: '/Applications/Wrapper.app/Contents/MacOS/wrapper',
+				},
+				{
+					label: 'pl.smarttechbrewery.swarm.worker.spare.cccccccc',
+					checkout: '/checkouts/spare',
+					installation: 'other',
+					launcher: 'direct',
+					wrapper: '/Applications/Wrapper.app/Contents/MacOS/wrapper',
+				},
+				{
+					label: 'pl.smarttechbrewery.swarm.worker.swarm-example-com.w-1.dddddddd',
+					checkout: join(home, '.swarm', 'workers', 'w-1'),
+					installation: 'this',
+					profile: true,
+					wrapper: '/Applications/Wrapper.app/Contents/MacOS/wrapper',
+				},
+			],
+		});
+
+		expect(result.status, result.stderr).toBe(0);
 		expect(result.kickstarted).toHaveLength(1);
 		expect(result.kickstarted[0]).toContain('worker.api.aaaaaaaa');
 	});

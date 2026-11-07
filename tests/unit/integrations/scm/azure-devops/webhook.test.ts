@@ -22,6 +22,8 @@ const project = createMockProjectConfig({
 
 const HEAD_SHA = 'da1560886d4f094c3e6c9ef40349f7d38b5d27d7';
 const PULL_REQUEST_URL = 'https://dev.azure.com/Fabrikam/Fiber/_git/Web/pullrequest/17';
+/** A pull-request build's `sourceVersion`: Azure's merge commit, never the head. */
+const MERGE_COMMIT_SHA = 'feedfacefeedfacefeedfacefeedfacefeedface';
 const HUMAN_ID = '11bb11bb-cc22-dd33-ee44-55ff55ff55ff';
 const REVIEWER_ID = '22cc22cc-dd33-ee44-ff55-66aa66aa66aa';
 
@@ -311,6 +313,30 @@ describe('Azure DevOps webhook ingress', () => {
 				prBranch: 'swarm/issue-17',
 				checkConclusion: 'success',
 			});
+		});
+
+		it('never takes the merge commit as the head of a pull-request build without triggerInfo', () => {
+			// Observed live (issue #1374): `sourceVersion` is the merge commit, so the head
+			// is left for the receiver to read off the pull request itself.
+			const event = parse(createMockAzureDevOpsBuildPayload({ withoutTriggerInfo: true }));
+			expect(event).toMatchObject({
+				kind: 'checks',
+				action: 'completed',
+				workItemId: '17',
+				workItemUrl: PULL_REQUEST_URL,
+				checkConclusion: 'success',
+			});
+			expect(event.headSha).toBeUndefined();
+			expect(event.headSha).not.toBe(MERGE_COMMIT_SHA);
+			expect(event.prBranch).toBeUndefined();
+		});
+
+		it('leaves the head unset when a pull-request build’s triggerInfo lacks pr.sourceSha', () => {
+			const event = parse(
+				createMockAzureDevOpsBuildPayload({ build: { triggerInfo: { 'pr.number': '17' } } }),
+			);
+			expect(event.workItemId).toBe('17');
+			expect(event.headSha).toBeUndefined();
 		});
 
 		it('leaves a branch build’s pull request for the receiver’s commit lookup', () => {

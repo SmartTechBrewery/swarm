@@ -617,7 +617,8 @@ Manage the agent with that clone's installer too:
 - The agent's log (`~/code/swarm-two/bin/swarm-worker-agent logs ~/code/two-project`)
   shows `worker transport client starting` with
   `controlPlaneUrl` = `https://swarm-two.example.com`.
-- `plutil -extract ProgramArguments.1 raw <the agent's plist>` names
+- `plutil -extract ProgramArguments.1 raw <the agent's plist>` (`.2` under a
+  [launchd wrapper](./launchd-worker-autostart.md#running-the-agent-under-a-wrapper-program)) names
   `~/code/swarm-two/bin/swarm.js`
   ([where the plist lives](./launchd-worker-autostart.md)).
 - `node ~/code/swarm-two/bin/swarm.js workers list ada@example.com` lists the new

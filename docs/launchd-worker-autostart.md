@@ -100,7 +100,7 @@ running it.
 | --- | --- |
 | Agent | `~/Library/LaunchAgents/pl.smarttechbrewery.swarm.worker.<host>.<worker-id>.<hash8>.plist` |
 | Logs | `~/Library/Logs/<that label>.log` (+ `.error.log`) — launchd's capture of the launcher's own output; the daemon's log is `~/.swarm/workers/<worker-id>/logs/worker.log` |
-| `ProgramArguments` | `<node> <installation>/bin/swarm-worker.js run <worker-id>` (an agent installed before issue #1283 names `bin/swarm-launcher.js`, which still works) |
+| `ProgramArguments` | `<node> <installation>/bin/swarm-worker.js run <worker-id>` (an agent installed before issue #1283 names `bin/swarm-launcher.js`, which still works), preceded by the host's [wrapper program](#running-the-agent-under-a-wrapper-program) when it names one |
 | `WorkingDirectory` | `~/.swarm/workers/<worker-id>` |
 
 - **The label names the installation.** `<host>` is the host (and any port) of the
@@ -158,7 +158,9 @@ swarm-worker-agent update ~/work/api  # only that checkout's agent
   the agents afterwards. `<checkout>` narrows *which agents restart*, never which
   installation is pulled: there is one build behind all of them.
 - **Which agents count is read off each plist, not assumed.** Every worker agent that
-  runs `run:worker` and whose launcher resolves into this installation is restarted
+  runs `run:worker` and whose launcher (the argument right before `run:worker`, so a
+  [wrapper program](#running-the-agent-under-a-wrapper-program) in front changes
+  nothing) resolves into this installation is restarted
   (a [profile-based](#profile-based-workers) agent never is) — a plist names
   `<installation>/bin/swarm.js` directly, and one written before issue #1213 names the
   `PATH` symlink, which is followed; a second SWARM clone's agents
@@ -203,6 +205,41 @@ swarm-worker-agent update ~/work/api  # only that checkout's agent
   (`node --env-file-if-exists=.env` supplies it to the daemon).
 - **`KeepAlive` with `ThrottleInterval 30`** restarts a daemon that dies, without
   turning a genuine failure into a hot loop.
+
+## Running the agent under a wrapper program
+
+macOS attributes every privacy (TCC) prompt the worker raises — and every one raised
+by what it spawns: `git`, the agent CLIs — to the agent's first program, so by default
+the operator is asked to grant access to `node`, and asked again whenever an upgrade
+gives `node` a new code signature. A host can put a stable, signed program of its own
+in front instead (issue #1376): write its absolute path, on one line, to
+`~/.swarm/launchd-wrapper`, then re-run `install` for each agent.
+
+```bash
+echo /path/to/your/wrapper > ~/.swarm/launchd-wrapper
+swarm-worker-agent install --profile <worker-id>    # or: install <checkout>
+```
+
+Every plist the installer writes from then on — clone and profile agents alike, and
+whatever path writes it (`swarm workers setup`, `swarm-worker agent install`, the
+clone → profile migration) — runs `<wrapper> <the usual command…>`, for example
+`<wrapper> <node> <installation>/bin/swarm-worker.js run <worker-id>`. With no file, or
+an empty one, the plist is exactly what it was without the feature; a path that is
+relative or names anything but an executable file is warned about and ignored.
+
+The wrapper receives the whole command as its arguments and must:
+
+- start it as a **child process**, not `exec` it (which would put `node` back as the
+  program macOS attributes prompts to);
+- forward the signals it receives — launchd's `SIGTERM` above all — to that child;
+- exit with the child's exit status, or re-raise the signal that killed it, so
+  `KeepAlive` reads the job exactly as it would without a wrapper;
+- leave the child's environment alone: the daemon reads `XPC_SERVICE_NAME`, which
+  carries the agent's `pl.smarttechbrewery.swarm.worker.…` label, to declare itself
+  *Supervised* even though its parent is the wrapper rather than launchd.
+
+See [`configuration.md`](./configuration.md) (`~/.swarm/launchd-wrapper`) for the
+setting's catalogue entry.
 
 ## Gotchas
 
@@ -252,7 +289,9 @@ swarm-worker-agent update ~/work/api  # only that checkout's agent
 - **A plist written before issue #1213 may run another clone.** It still names
   whatever `swarm` was on `PATH` at install time, which on a Mac with two SWARM
   clones may be the one whose `.env` points at a different control plane. Check it
-  with `plutil -extract ProgramArguments.1 raw <plist>`, and re-run the intended
+  with `plutil -extract ProgramArguments.1 raw <plist>` (`.2` on a host running its
+  agents under a [wrapper program](#running-the-agent-under-a-wrapper-program)), and
+  re-run the intended
   clone's `install` to repoint it.
 - **Enrollment is not connection.** A connected daemon still needs an `active`
   enrollment with sharing consent before anything is dispatched to it, and an

@@ -5,11 +5,15 @@
  * directory (issue #1313). `swarm-worker migrate` reads them to find which clone a
  * worker runs from and which installation it connects to.
  *
- * This is `bin/swarm-worker-agent`'s own reading — `runs_clone_worker` and
+ * This is `bin/swarm-worker-agent`'s own reading — `clone_launcher` and
  * `agents_of_install_root` — in TypeScript: the same label glob, the same
- * `run:worker` test, and the launcher (`ProgramArguments.1`) resolved through every
- * symlink to the installation it belongs to, since an older plist names it by its
- * PATH symlink. A profile agent (`swarm-worker run <id>`) is never one of them.
+ * `run:worker` test, and the launcher (the argument right before `run:worker`)
+ * resolved through every symlink to the installation it belongs to, since an older
+ * plist names it by its PATH symlink. The launcher is found by that neighbour rather
+ * than by position because a host's launchd wrapper (`~/.swarm/launchd-wrapper`,
+ * issue #1376) is prepended to every agent's ProgramArguments, which shifts
+ * `ProgramArguments.1` onto `node`. A profile agent (`swarm-worker run <id>`) is
+ * never one of them.
  *
  * Plists are read with `plutil -convert json`, macOS's own parser, so a hand-edited
  * binary plist reads too. A plist that cannot be read or is not an agent's shape is
@@ -24,10 +28,8 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { parseEnv } from 'node:util';
 import { z } from 'zod';
+import { WORKER_LAUNCH_AGENT_LABEL_PREFIX } from '../lib/worker-supervision.js';
 import { canonicalCheckoutPath } from '../worktree/checkout-key.js';
-
-/** Every SWARM worker agent's label starts with this (`bin/swarm-worker-agent`). */
-const WORKER_AGENT_LABEL_PREFIX = 'pl.smarttechbrewery.swarm.worker.';
 
 /** The variable a clone's daemon reads its installation from. */
 const CONTROL_PLANE_ENV = 'SWARM_CONTROL_PLANE_URL';
@@ -96,7 +98,7 @@ export async function listCloneAgents(options: ListCloneAgentsOptions = {}): Pro
 	}
 	const agents: CloneAgent[] = [];
 	for (const name of names.sort()) {
-		if (!name.startsWith(WORKER_AGENT_LABEL_PREFIX) || !name.endsWith('.plist')) continue;
+		if (!name.startsWith(WORKER_LAUNCH_AGENT_LABEL_PREFIX) || !name.endsWith('.plist')) continue;
 		const plistPath = join(dir, name);
 		let raw: unknown;
 		try {
@@ -107,12 +109,13 @@ export async function listCloneAgents(options: ListCloneAgentsOptions = {}): Pro
 		const parsed = AgentPlistSchema.safeParse(raw);
 		if (!parsed.success) continue;
 		const { ProgramArguments: args, WorkingDirectory, EnvironmentVariables } = parsed.data;
-		if (!args.includes('run:worker') || !args[1]) continue;
+		const launcher = args[args.indexOf('run:worker') - 1];
+		if (!launcher) continue;
 		agents.push({
 			label: name.slice(0, -'.plist'.length),
 			plistPath,
 			checkout: canonicalCheckoutPath(WorkingDirectory),
-			cloneRoot: installRootOf(args[1]),
+			cloneRoot: installRootOf(launcher),
 			environment: Object.fromEntries(
 				Object.entries(EnvironmentVariables ?? {}).filter(
 					(entry): entry is [string, string] => typeof entry[1] === 'string',
