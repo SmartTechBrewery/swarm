@@ -1655,6 +1655,41 @@ export async function getLatestCompletedReviewRunForPullRequest(
 }
 
 /**
+ * The *completed* Review run of one pull request that holds review-verdict slot
+ * `ordinal` — the run carrying a capped pull request's last verdict, which is the
+ * one whose detail page hosts Force re-review (read by `runs.wip`, issue #1379).
+ * Newest `completedAt` first, because since issue #1079 a superseded slot and the
+ * replacement that reused its ordinal both have a run; the later one is the
+ * verdict the pull request is stopped on. Keyed on
+ * `(project, repository, pull request)` like
+ * {@link getLatestCompletedReviewRunForPullRequest}.
+ */
+export async function getCompletedReviewRunForOrdinal(
+	projectId: string,
+	repository: string,
+	prNumber: string,
+	ordinal: number,
+): Promise<RunRow | undefined> {
+	const rows = await getDb()
+		.select()
+		.from(runs)
+		.where(
+			and(
+				eq(runs.kind, PIPELINE_RUN_KIND),
+				eq(runs.projectId, projectId),
+				eq(runs.repository, repository),
+				eq(runs.prNumber, prNumber),
+				eq(runs.phase, 'review'),
+				eq(runs.status, 'completed'),
+				eq(runs.reviewOrdinal, ordinal),
+			),
+		)
+		.orderBy(desc(runs.completedAt), desc(runs.startedAt))
+		.limit(1);
+	return rows[0];
+}
+
+/**
  * The project's Review runs whose merge automation recorded `merged`, completed at
  * or after `since`, newest first and at most `limit` of them — the merged pull
  * requests the operator consistency check (`src/dispatch/consistency-check.ts`,

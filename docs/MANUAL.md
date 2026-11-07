@@ -1157,7 +1157,12 @@ stalled, its latest run failed and nothing will retry it, or its latest Planning
 Implementation run was terminated — move the card out of its start column and back,
 which starts a new run (issue #1361). A terminated pull request-driven run (Review,
 Respond-to-review, Respond-to-CI, Resolve-conflicts) reads as failed instead, since a
-board move does not restart it. A Review abandoned while
+board move does not restart it. The review cap includes an approval SWARM could not
+merge on a pull request whose head was superseded too many times (issue #1379): the
+ticket reads as waiting on you even when a later run, such as Resolve conflicts, is its
+latest, and links to the Review run whose page carries **Force re-review**. It goes
+back to the pipeline as soon as you force the re-review, and leaves the section when
+the pull request is merged or closed. A Review abandoned while
 the head's CI was still running is not one of these (issue #1203): the completed-checks
 event starts Review by itself, so the ticket shows as waiting on the pipeline —
 "Waiting for CI — Review starts when the checks finish" — and reads as stalled only if

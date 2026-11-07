@@ -61,6 +61,7 @@ function usage(overrides: Partial<WipUsageInput> = {}) {
 		activity: [],
 		activeDispatches: [],
 		policies: { p1: NO_AUTOMATION },
+		cappedPullRequests: [],
 		now: NOW,
 		...overrides,
 	});
@@ -217,6 +218,96 @@ describe('toWipUsage', () => {
 		expect(ticket).toMatchObject({
 			state: 'waiting-on-operator',
 			operatorReason: 'review-cap-reached',
+		});
+	});
+
+	// Issue #1379: the approval the cap stopped fires on a webhook and records no run,
+	// so the pull request's ledger (resolved by the API layer) decides it — even when
+	// a later run moved the head and completed.
+	describe('a pull request the review cap stopped on a refused approval', () => {
+		const CAPPED = { projectId: 'p1', repository: REPO, prNumber: '120', runId: 'run-review' };
+		const reviewRun = makeActivity({
+			taskId: '120',
+			prNumber: '120',
+			runId: 'run-review',
+			phase: 'review',
+			reviewVerdict: 'approve',
+			reviewMergeOutcome: 'not-eligible',
+			lastActivityAt: LONG_AGO,
+		});
+		const resolveConflictsRun = makeActivity({
+			taskId: '120',
+			prNumber: '120',
+			runId: 'run-resolve',
+			phase: 'resolve-conflicts',
+			lastActivityAt: RECENTLY,
+		});
+
+		it('waits on the operator, linked to the capped Review run, when a later Resolve conflicts run is the latest', () => {
+			// Without the ledger fact the same activity reads as the pipeline's.
+			expect(
+				holder({
+					slots: [makeSlot({ prNumber: '120' })],
+					activity: [resolveConflictsRun],
+				}).state,
+			).toBe('waiting-on-pipeline');
+
+			expect(
+				holder({
+					slots: [makeSlot({ prNumber: '120' })],
+					activity: [resolveConflictsRun],
+					cappedPullRequests: [CAPPED],
+				}),
+			).toMatchObject({
+				state: 'waiting-on-operator',
+				operatorReason: 'review-cap-reached',
+				actionRunId: 'run-review',
+				phase: 'resolve-conflicts',
+			});
+		});
+
+		it('waits on the operator when the Review itself is the latest run', () => {
+			expect(
+				holder({
+					slots: [makeSlot({ prNumber: '120' })],
+					activity: [{ ...reviewRun, lastActivityAt: RECENTLY }],
+					cappedPullRequests: [CAPPED],
+				}),
+			).toMatchObject({
+				state: 'waiting-on-operator',
+				operatorReason: 'review-cap-reached',
+				actionRunId: 'run-review',
+				phase: 'review',
+			});
+		});
+
+		it('is still running while a run is live, and the pipeline’s while a dispatch is due', () => {
+			expect(
+				holder({
+					slots: [makeSlot({ prNumber: '120' })],
+					activity: [{ ...resolveConflictsRun, status: 'running', liveRunCount: 1 }],
+					cappedPullRequests: [CAPPED],
+				}),
+			).toMatchObject({ state: 'running' });
+
+			const forcedReview = holder({
+				slots: [makeSlot({ prNumber: '120' })],
+				activity: [resolveConflictsRun],
+				activeDispatches: [{ projectId: 'p1', taskId: '120', phase: 'review' }],
+				cappedPullRequests: [CAPPED],
+			});
+			expect(forcedReview.state).toBe('waiting-on-pipeline');
+			expect(forcedReview.actionRunId).toBeUndefined();
+		});
+
+		it('applies only to the pull request it names', () => {
+			const ticket = holder({
+				slots: [makeSlot({ prNumber: '120' })],
+				activity: [resolveConflictsRun],
+				cappedPullRequests: [{ ...CAPPED, repository: 'acme/other' }],
+			});
+			expect(ticket.state).toBe('waiting-on-pipeline');
+			expect(ticket.actionRunId).toBeUndefined();
 		});
 	});
 

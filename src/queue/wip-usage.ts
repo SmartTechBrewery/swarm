@@ -22,7 +22,22 @@
  *    keys, not through a folded unit, so a ticket whose first dispatch is still
  *    waiting for a worker — no run row yet — reads as queued, not stalled. The
  *    ticket's own `wip-limit` wait is excluded: that is the wait this panel
- *    explains, not movement.
+ *    explains, not movement. A forced review's dispatch counts here too, so a
+ *    Force re-review reads as the pipeline's again straight away.
+ * 2b. The holder's pull request is stopped by the review cap on an approval merge
+ *    automation refused (`cappedPullRequests`, issue #1379) → `waiting-on-operator`
+ *    (`review-cap-reached`), carrying `actionRunId` — the capped Review run whose
+ *    detail page hosts Force re-review. Read from the **pull request's** review
+ *    ledger rather than from its latest run, because that cap fires on a webhook
+ *    (the `pr-review` trigger's cap gate skips) and records no run: the latest run
+ *    is usually a later Resolve conflicts or Respond-to-CI that moved the head and
+ *    completed, which rule 7 would read as the pipeline's. The API layer resolves
+ *    the fact on exactly the terms the run-detail callout (`isCapSpentApproval`)
+ *    is shown on — allowance spent, no outstanding grant, no review in flight
+ *    above the last verdict, and that verdict an `approve` with merge outcome
+ *    `not-eligible` — so this panel and the detail page cannot disagree. The
+ *    `request-changes` cap stop is not this rule's: it is recorded on the run
+ *    itself and stays rule 5's.
  * 3. The unit that moved last (the pull request on a tie) decides the rest. No run
  *    and no dispatch inside the lookback reads as liveness would read silence: `settling`
  *    for {@link ITEM_STALL_AFTER_MS} after the slot opened, `stalled` after.
@@ -106,6 +121,12 @@ export const WipTicketSchema = z.object({
 	operatorReason: WipOperatorReasonSchema.optional(),
 	/** `waiting-on-pipeline` only. */
 	pipelineReason: WipPipelineReasonSchema.optional(),
+	/**
+	 * `waiting-on-operator` only: the run whose detail page carries the action that
+	 * moves the ticket again — today the capped Review run hosting Force re-review
+	 * (rule 2b, issue #1379).
+	 */
+	actionRunId: z.string().optional(),
 	/** The phase of the latest run in the deciding unit, when there is one. */
 	phase: z.string().optional(),
 	/** The ticket's pull request, once a pull request-driven phase recorded one. */
@@ -142,6 +163,18 @@ export interface WipWaiterCount {
 	count: number;
 }
 
+/**
+ * A pull request the review cap stopped on a refused approval (rule 2b, issue
+ * #1379), resolved by the API layer from the pull request's review ledger.
+ */
+export interface WipCappedPullRequest {
+	projectId: string;
+	repository: string;
+	prNumber: string;
+	/** The completed Review run holding the last verdict — where Force re-review lives. */
+	runId: string;
+}
+
 export interface WipUsageInput {
 	slots: readonly WipSlotRow[];
 	waiters: readonly WipWaiterCount[];
@@ -151,6 +184,12 @@ export interface WipUsageInput {
 	activeDispatches: readonly ActiveDispatchTaskRef[];
 	/** Keyed by project id; a missing project gets the pipeline's own defaults. */
 	policies: Readonly<Record<string, ItemLivenessPolicy>>;
+	/**
+	 * Pull requests stopped by the review cap on a refused approval (rule 2b).
+	 * Required, so a call site that forgets the ledger fails to compile rather than
+	 * silently reading every such ticket as the pipeline's.
+	 */
+	cappedPullRequests: readonly WipCappedPullRequest[];
 	now?: Date;
 }
 
@@ -179,6 +218,7 @@ interface HolderVerdict {
 	state: WipTicketState;
 	operatorReason?: WipOperatorReason;
 	pipelineReason?: WipPipelineReason;
+	actionRunId?: string;
 	decidingUnit?: ItemLivenessUnit;
 }
 
@@ -197,12 +237,13 @@ function failedRunReason(latest: ItemLivenessUnit['latest']): WipOperatorReason 
  * The holder's state from its folded units — the rule list in this module's header.
  * `hasActiveDispatch` is matched on the holder's own keys rather than read off its
  * units: a unit exists only once a run does, and a first dispatch can wait for a
- * worker long before that.
+ * worker long before that. `capped` is rule 2b's fact for the holder's pull request.
  */
 function classifyHolder(
 	slot: WipSlotRow,
 	units: readonly ItemLivenessUnit[],
 	hasActiveDispatch: boolean,
+	capped: WipCappedPullRequest | undefined,
 	policy: ItemLivenessPolicy,
 	now: Date,
 ): HolderVerdict {
@@ -214,6 +255,14 @@ function classifyHolder(
 
 	if (units.some((unit) => unit.liveRunCount > 0)) return { state: 'running', decidingUnit };
 	if (hasActiveDispatch) return { state: 'waiting-on-pipeline', decidingUnit };
+	if (capped) {
+		return {
+			state: 'waiting-on-operator',
+			operatorReason: 'review-cap-reached',
+			actionRunId: capped.runId,
+			decidingUnit,
+		};
+	}
 	if (!decidingUnit) {
 		return now.getTime() - slot.openedAt.getTime() < ITEM_STALL_AFTER_MS
 			? { state: 'waiting-on-pipeline' }
@@ -262,6 +311,7 @@ function toTicket(slot: WipSlotRow, verdict: HolderVerdict): WipTicket {
 		state: verdict.state,
 		...(verdict.operatorReason ? { operatorReason: verdict.operatorReason } : {}),
 		...(verdict.pipelineReason ? { pipelineReason: verdict.pipelineReason } : {}),
+		...(verdict.actionRunId ? { actionRunId: verdict.actionRunId } : {}),
 		...(latest ? { phase: latest.phase } : {}),
 		...(slot.prNumber ? { prNumber: slot.prNumber } : {}),
 		...(verdict.decidingUnit
@@ -285,6 +335,10 @@ export function toWipUsage(input: WipUsageInput): WipUsageEntry[] {
 	for (const unit of foldLivenessUnits(input.activity, activeDispatches, [])) {
 		units.set(key(unit.projectId, unit.repository, unit.unit, unit.reference), unit);
 	}
+
+	const capped = new Map(
+		input.cappedPullRequests.map((pr) => [key(pr.projectId, pr.repository, pr.prNumber), pr]),
+	);
 
 	const entries = new Map<string, WipUsageEntry>();
 	const entryFor = (projectId: string, repository: string): WipUsageEntry => {
@@ -321,8 +375,14 @@ export function toWipUsage(input: WipUsageInput): WipUsageEntry[] {
 				activeDispatchKeys.has(dispatchKey(slot.projectId, 'pull-request', slot.prNumber)));
 		const policy = input.policies[slot.projectId] ?? DEFAULT_POLICY;
 		entry.inFlight += 1;
+		const cappedPullRequest = slot.prNumber
+			? capped.get(key(slot.projectId, slot.repository, slot.prNumber))
+			: undefined;
 		entry.tickets.push(
-			toTicket(slot, classifyHolder(slot, holderUnits, hasActiveDispatch, policy, now)),
+			toTicket(
+				slot,
+				classifyHolder(slot, holderUnits, hasActiveDispatch, cappedPullRequest, policy, now),
+			),
 		);
 	}
 	for (const waiter of input.waiters) {

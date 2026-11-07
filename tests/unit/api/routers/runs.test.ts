@@ -13,6 +13,8 @@ vi.mock('@/db/repositories/runsRepository.js', async (importOriginal) => ({
 	countMergedPullRequestsByRepository: vi.fn(),
 	// `prStatus`'s Review-run read (issue #1342).
 	getLatestCompletedReviewRunForPullRequest: vi.fn(),
+	// `wip`'s capped-Review-run read (issue #1379).
+	getCompletedReviewRunForOrdinal: vi.fn(),
 	// `closeMergedWorkItem`'s recorded-branch lookup (issue #1351); `undefined` decodes the branch.
 	findTaskIdForStoredTaskBranch: vi.fn(),
 	getRunLogsFromDb: vi.fn(),
@@ -227,6 +229,7 @@ import {
 	cancelDeferredRunInDb,
 	countMergedPullRequestsByRepository,
 	countRunsByStatusAndPhase,
+	getCompletedReviewRunForOrdinal,
 	getLatestCompletedReviewRunForPullRequest,
 	getRunByIdFromDb,
 	getRunLogsFromDb,
@@ -521,6 +524,8 @@ describe('runsRouter', () => {
 		// Review skips this read entirely, and the ones below state their own slots.
 		vi.mocked(listActiveReviewSlotsForPullRequest).mockReset();
 		vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue([]);
+		vi.mocked(getCompletedReviewRunForOrdinal).mockReset();
+		vi.mocked(getCompletedReviewRunForOrdinal).mockResolvedValue(undefined);
 	});
 
 	describe('list', () => {
@@ -1172,6 +1177,151 @@ describe('runsRouter', () => {
 			const [entry] = await caller.wip({});
 
 			expect(entry?.tickets[0]?.prUrl).toBe('https://gitlab.com/acme/widgets/-/merge_requests/120');
+		});
+
+		// Issue #1379: a pull request the review cap stopped on a refused approval reads
+		// off its ledger, because that stop records no run.
+		describe('review-cap stop', () => {
+			function ledgerSlot(overrides: Partial<PullRequestReviewSlot> = {}): PullRequestReviewSlot {
+				return {
+					ordinal: 1,
+					state: 'submitted',
+					headSha: 'head-1',
+					capOverrideGrantedAt: null,
+					capOverrideConsumedAt: null,
+					dispatchActive: false,
+					superseded: false,
+					...overrides,
+				};
+			}
+
+			/** The superseded bound: every approval invalidated by the head moving. */
+			function supersededSlots(): PullRequestReviewSlot[] {
+				return Array.from({ length: REVIEW_SUPERSEDED_CAP }, (_, i) =>
+					ledgerSlot({ headSha: `head-${i}`, superseded: true }),
+				);
+			}
+
+			const CAPPED_REVIEW = makeRun({
+				id: 'run-review',
+				phase: 'review',
+				status: 'completed',
+				prNumber: '120',
+				repository: 'acme/widgets',
+				reviewVerdict: 'approve',
+				reviewMergeOutcome: 'not-eligible',
+				reviewOrdinal: 1,
+			});
+
+			/** The latest run is a later, completed Resolve conflicts — the reported case. */
+			const RESOLVE_CONFLICTS: TaskActivityRow = {
+				projectId: 'p1',
+				repository: 'acme/widgets',
+				taskId: '120',
+				runId: 'run-resolve',
+				phase: 'resolve-conflicts',
+				status: 'completed',
+				prNumber: '120',
+				prTitle: null,
+				workItemId: null,
+				workItemTitle: null,
+				workItemUrl: null,
+				producedPrUrl: null,
+				reviewVerdict: null,
+				reviewAutomationOutcome: null,
+				reviewMergeOutcome: null,
+				failureDiagnosisKind: null,
+				lastActivityAt: new Date(Date.now() - 60_000),
+				liveRunCount: 0,
+				mergedRunCount: 0,
+			};
+
+			beforeEach(() => {
+				vi.mocked(listAllProjectRecordsFromDb).mockResolvedValue([
+					createMockProjectRecord({ id: 'p1' }),
+				]);
+				vi.mocked(listWipSlots).mockResolvedValue([
+					slotRow({ prNumber: '120' }),
+					// A second slot on the same pull request is still one ledger read.
+					slotRow({ taskId: '104', prNumber: '120' }),
+				]);
+				vi.mocked(listTaskActivitySince).mockResolvedValue([RESOLVE_CONFLICTS]);
+				vi.mocked(getCompletedReviewRunForOrdinal).mockResolvedValue(CAPPED_REVIEW);
+			});
+
+			it('reads a capped approval as waiting on you, linked to its Review run', async () => {
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(supersededSlots());
+
+				const [entry] = await caller.wip({});
+
+				expect(entry?.tickets[0]).toMatchObject({
+					state: 'waiting-on-operator',
+					operatorReason: 'review-cap-reached',
+					actionRunId: 'run-review',
+				});
+				expect(listActiveReviewSlotsForPullRequest).toHaveBeenCalledExactlyOnceWith(
+					'p1',
+					'acme/widgets',
+					'120',
+				);
+				expect(getCompletedReviewRunForOrdinal).toHaveBeenCalledExactlyOnceWith(
+					'p1',
+					'acme/widgets',
+					'120',
+					1,
+				);
+			});
+
+			it('is not capped once an operator granted a review past the cap', async () => {
+				const slots = supersededSlots();
+				slots[0] = { ...ledgerSlot(slots[0]), capOverrideGrantedAt: new Date() };
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(slots);
+
+				const [entry] = await caller.wip({});
+
+				expect(entry?.tickets[0]?.state).toBe('waiting-on-pipeline');
+				expect(entry?.tickets[0]?.actionRunId).toBeUndefined();
+				expect(getCompletedReviewRunForOrdinal).not.toHaveBeenCalled();
+			});
+
+			it('is the pipeline’s once the forced review holds a slot above the verdict and is dispatched', async () => {
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue([
+					...supersededSlots(),
+					ledgerSlot({ ordinal: 2, state: 'pending', dispatchActive: true }),
+				]);
+				vi.mocked(listActiveDispatchTaskRefs).mockResolvedValue([
+					{ projectId: 'p1', taskId: '120', phase: 'review' },
+				]);
+
+				const [entry] = await caller.wip({});
+
+				expect(entry?.tickets[0]?.state).toBe('waiting-on-pipeline');
+				expect(entry?.tickets[0]?.actionRunId).toBeUndefined();
+				// The review in flight above the verdict settles it before any run read.
+				expect(getCompletedReviewRunForOrdinal).not.toHaveBeenCalled();
+			});
+
+			it('is not capped for a Review run that did not approve into a refused merge', async () => {
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(supersededSlots());
+				vi.mocked(getCompletedReviewRunForOrdinal).mockResolvedValue({
+					...CAPPED_REVIEW,
+					reviewMergeOutcome: 'merged',
+				});
+
+				const [entry] = await caller.wip({});
+
+				expect(entry?.tickets[0]?.actionRunId).toBeUndefined();
+			});
+
+			it('reports the pull request uncapped, without failing the view, when the ledger read fails', async () => {
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockRejectedValue(new Error('db down'));
+
+				const [entry] = await caller.wip({});
+
+				expect(entry?.tickets).toHaveLength(2);
+				expect(entry?.tickets[0]?.state).toBe('waiting-on-pipeline');
+				expect(entry?.tickets[0]?.actionRunId).toBeUndefined();
+			});
 		});
 
 		it('scopes every read to a chosen project', async () => {
