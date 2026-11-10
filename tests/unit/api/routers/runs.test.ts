@@ -29,6 +29,7 @@ vi.mock('@/db/repositories/runsRepository.js', async (importOriginal) => ({
 vi.mock('@/db/repositories/runAttemptsRepository.js', () => ({
 	listRunAttempts: vi.fn(),
 	recordNextAttemptTrigger: vi.fn(),
+	clearNextAttemptTrigger: vi.fn(),
 }));
 
 vi.mock('@/db/repositories/projectsRepository.js', () => ({
@@ -233,6 +234,7 @@ import {
 	REVIEW_VERDICT_CAP,
 } from '@/db/repositories/reviewVerdictsRepository.js';
 import {
+	clearNextAttemptTrigger,
 	listRunAttempts,
 	recordNextAttemptTrigger,
 } from '@/db/repositories/runAttemptsRepository.js';
@@ -470,6 +472,8 @@ function membershipFor(role: ProjectRole, projectId = 'p1'): ProjectMembership {
 
 const ATTEMPT_1 = '11111111-aaaa-4aaa-8aaa-000000000001';
 const ATTEMPT_2 = '11111111-aaaa-4aaa-8aaa-000000000002';
+/** When the Retry now marker under test was recorded (issue #1400). */
+const RETRY_REQUESTED_AT = new Date('2026-11-10T10:00:00.000Z');
 
 describe('runsRouter', () => {
 	// The base suite runs as an instanceAdmin (authorization bypassed); the
@@ -486,7 +490,9 @@ describe('runsRouter', () => {
 		vi.mocked(getRunOutputEvents).mockReset();
 		vi.mocked(listRunAttempts).mockReset();
 		vi.mocked(recordNextAttemptTrigger).mockReset();
-		vi.mocked(recordNextAttemptTrigger).mockResolvedValue(undefined);
+		vi.mocked(recordNextAttemptTrigger).mockResolvedValue(RETRY_REQUESTED_AT);
+		vi.mocked(clearNextAttemptTrigger).mockReset();
+		vi.mocked(clearNextAttemptTrigger).mockResolvedValue(undefined);
 		vi.mocked(cancelDeferredRunInDb).mockReset();
 		vi.mocked(recordRunCleanupBlocked).mockReset();
 		vi.mocked(reconcileTerminatedWorktree).mockReset();
@@ -3373,6 +3379,7 @@ describe('runsRouter', () => {
 			expect(vi.mocked(recordNextAttemptTrigger).mock.invocationCallOrder[0]).toBeLessThan(
 				vi.mocked(reopenDispatchForManualRetry).mock.invocationCallOrder[0] ?? 0,
 			);
+			expect(clearNextAttemptTrigger).not.toHaveBeenCalled();
 			// The run row is NOT flipped here — it becomes `running` only when the
 			// worker actually claims the dispatch (issue #284's false-running guard).
 			expect(markRunUserTerminated).not.toHaveBeenCalled();
@@ -3776,6 +3783,9 @@ describe('runsRouter', () => {
 			expect(reopenDispatchForManualRetry).not.toHaveBeenCalled();
 			expect(takeOverStaleDispatchForManualRetry).not.toHaveBeenCalled();
 			expect(publishDispatchWakeUp).not.toHaveBeenCalled();
+			// …and the refused retry takes back its attempt-history marker, so the
+			// worker's automatic attempt is not credited to the operator (issue #1400).
+			expect(clearNextAttemptTrigger).toHaveBeenCalledWith('run-1', 'retry', RETRY_REQUESTED_AT);
 		});
 
 		it('reports the lost race, not "a worker is running it", when the take-over CAS fails', async () => {
@@ -3802,6 +3812,7 @@ describe('runsRouter', () => {
 				expect.objectContaining({ code: 'CONFLICT' }),
 			);
 			expect(publishDispatchWakeUp).not.toHaveBeenCalled();
+			expect(clearNextAttemptTrigger).toHaveBeenCalledWith('run-1', 'retry', RETRY_REQUESTED_AT);
 		});
 
 		it('rejects with CONFLICT when a concurrent retry already created the run’s dispatch', async () => {
@@ -3816,6 +3827,8 @@ describe('runsRouter', () => {
 			await expect(caller.retryNow({ runId: 'run-1' })).rejects.toThrowError(
 				expect.objectContaining({ code: 'CONFLICT' }),
 			);
+			// The concurrent retry that won keeps its own marker; only this one's goes.
+			expect(clearNextAttemptTrigger).toHaveBeenCalledWith('run-1', 'retry', RETRY_REQUESTED_AT);
 		});
 
 		it('still reports retrying when the wake-up publish fails (reconciler repairs it)', async () => {

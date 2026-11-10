@@ -4,9 +4,11 @@ import { beforeEach, describe, expect, it } from 'vitest';
 
 import { getDb } from '../../../src/db/client.js';
 import {
+	clearNextAttemptTrigger,
 	listRunAttempts,
 	openRunAttempt,
 	recordNextAttemptTrigger,
+	reopenAdoptedRunAttempt,
 } from '../../../src/db/repositories/runAttemptsRepository.js';
 import {
 	appendRunOutputEvents,
@@ -145,6 +147,83 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runAttemptsRepository (in
 
 		const { attempts } = await listRunAttempts(runId);
 		expect(attempts[0]).toMatchObject({ outcome: 'deferred', error: 'rate-limited' });
+	});
+
+	// An adopted late result (issue #1076) executes nothing, so it opens no attempt; the
+	// lost attempt its reap closed as deferred is reopened and gets the real outcome.
+	it('settles the lost attempt with an adopted late result’s outcome', async () => {
+		const worker = await seedWorker('returning');
+		const dispatchId = randomUUID();
+		const runId = await createRun({
+			projectId: PROJECT_ID,
+			repository: REPO,
+			taskId: '568',
+			phase: 'planning',
+			workerId: worker,
+		});
+		const lost = await openRunAttempt(runId, dispatchId);
+		await completeRun(runId, { status: 'deferred', error: 'transport lost' });
+		expect((await listRunAttempts(runId)).attempts[0]).toMatchObject({ outcome: 'deferred' });
+
+		await resetRunToRunning(
+			runId,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			worker,
+		);
+		expect(await reopenAdoptedRunAttempt(runId, dispatchId, worker)).toBe(lost);
+		await completeRun(runId, { status: 'completed' });
+
+		const { attempts } = await listRunAttempts(runId);
+		expect(attempts).toHaveLength(1);
+		expect(attempts[0]).toMatchObject({ id: lost, outcome: 'completed', error: null });
+		expect(attempts[0].endedAt).toBeInstanceOf(Date);
+	});
+
+	it('reopens nothing when the latest attempt is not the adopted dispatch’s', async () => {
+		const worker = await seedWorker('other');
+		const runId = await createRun({
+			projectId: PROJECT_ID,
+			repository: REPO,
+			taskId: '569',
+			phase: 'planning',
+			workerId: worker,
+		});
+		await openRunAttempt(runId, randomUUID());
+		await completeRun(runId, { status: 'deferred', error: 'transport lost' });
+
+		expect(await reopenAdoptedRunAttempt(runId, randomUUID(), worker)).toBeUndefined();
+		expect((await listRunAttempts(runId)).attempts[0]).toMatchObject({
+			outcome: 'deferred',
+			error: 'transport lost',
+		});
+	});
+
+	it('clears a refused operator marker only while it is still that request’s', async () => {
+		const runId = await createRun({
+			projectId: PROJECT_ID,
+			repository: REPO,
+			taskId: '570',
+			phase: 'review',
+		});
+		const refused = await recordNextAttemptTrigger(runId, 'retry');
+		await new Promise((resolve) => setTimeout(resolve, 5));
+		const won = await recordNextAttemptTrigger(runId, 'retry');
+
+		// A concurrent request that succeeded replaced the refused one's marker: kept.
+		await clearNextAttemptTrigger(runId, 'retry', refused);
+		expect((await getRunByIdFromDb(runId))?.nextAttemptRequestedAt).toEqual(won);
+
+		await clearNextAttemptTrigger(runId, 'retry', won);
+		const run = await getRunByIdFromDb(runId);
+		expect(run?.nextAttemptTrigger).toBeNull();
+		expect(run?.nextAttemptRequestedAt).toBeNull();
 	});
 
 	it('closes attempts a sweep fails and attempts a re-claim supersedes', async () => {

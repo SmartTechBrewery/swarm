@@ -600,9 +600,15 @@ const recordRunTransportLostWorker = vi.fn(async (_runId: string) => {});
 const openRunAttempt = vi.fn(
 	async (_runId: string, _dispatchId: string | undefined) => 'attempt-1',
 );
+const reopenAdoptedRunAttempt = vi.fn(
+	async (_runId: string, _dispatchId: string, _workerId: string): Promise<string | undefined> =>
+		'attempt-1',
+);
 vi.mock('@/db/repositories/runAttemptsRepository.js', () => ({
 	openRunAttempt: (runId: string, dispatchId: string | undefined) =>
 		openRunAttempt(runId, dispatchId),
+	reopenAdoptedRunAttempt: (runId: string, dispatchId: string, workerId: string) =>
+		reopenAdoptedRunAttempt(runId, dispatchId, workerId),
 }));
 vi.mock('@/db/repositories/runsRepository.js', () => ({
 	createRun: (input: unknown) => createRun(input),
@@ -1159,6 +1165,8 @@ describe('processJob', () => {
 		createRun.mockResolvedValue('run-1');
 		openRunAttempt.mockClear();
 		openRunAttempt.mockResolvedValue('attempt-1');
+		reopenAdoptedRunAttempt.mockClear();
+		reopenAdoptedRunAttempt.mockResolvedValue('attempt-1');
 		completeRun.mockClear();
 		completeRun.mockResolvedValue(undefined);
 		failRunFromStatus.mockClear();
@@ -2395,6 +2403,7 @@ describe('processJob', () => {
 		expect(phaseCalls).toHaveLength(1);
 		// The phase executed, so it is recorded as an attempt of its run (issue #1400).
 		expect(openRunAttempt).toHaveBeenCalledWith('run-1', expect.any(String));
+		expect(reopenAdoptedRunAttempt).not.toHaveBeenCalled();
 		expect(phaseCalls[0].phase).toBe('review');
 		expect(phaseCalls[0].context.project).toBe(PROJECT);
 		expect(phaseCalls[0].context.trigger).toMatchObject({
@@ -6098,9 +6107,15 @@ describe('processJob', () => {
 			});
 			// No gate, no bind, no slot: the phase already ran on the lost machine.
 			expect(listProjectDispatchCandidates).not.toHaveBeenCalled();
-			// Nothing executes here either, so no new attempt: the one it settles is the
-			// lost attempt already recorded (issue #1400).
+			// Nothing executes here either, so no new attempt: the lost attempt its reap
+			// closed as deferred is reopened, so the settle records the real outcome on
+			// it (issue #1400).
 			expect(openRunAttempt).not.toHaveBeenCalled();
+			expect(reopenAdoptedRunAttempt).toHaveBeenCalledWith(
+				'run-568',
+				'dispatch-1',
+				'worker-karolina',
+			);
 			expect(claimWorkerForDispatch).not.toHaveBeenCalled();
 			// …and no repository WIP admission either (issue #1185).
 			expect(reserveWipSlot).not.toHaveBeenCalled();

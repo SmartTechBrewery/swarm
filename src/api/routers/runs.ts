@@ -38,6 +38,7 @@ import {
 	reviewCapBoundReached,
 } from '../../db/repositories/reviewVerdictsRepository.js';
 import {
+	clearNextAttemptTrigger,
 	listRunAttempts,
 	type RunAttemptOutcome,
 	type RunAttemptSummary,
@@ -630,12 +631,33 @@ async function reopenActiveDispatchForRetry(
 /**
  * Mark the attempt a "Retry now" starts as the operator's (issue #1400), before its
  * dispatch can be claimed. Best-effort: losing the label must never refuse a retry.
+ * Returns the moment recorded, for {@link unmarkRefusedRetry}; `undefined` when
+ * nothing was recorded.
  */
-async function markNextAttemptAsRetry(runId: string): Promise<void> {
+async function markNextAttemptAsRetry(runId: string): Promise<Date | undefined> {
 	try {
-		await recordNextAttemptTrigger(runId, 'retry');
+		return await recordNextAttemptTrigger(runId, 'retry');
 	} catch (err) {
 		logger.warn('retryNow: could not record the retry in the run’s attempt history', {
+			runId,
+			error: describeError(err),
+		});
+		return undefined;
+	}
+}
+
+/**
+ * Take back the "Retry now" marker of a retry that was refused or failed, so the next
+ * automatic attempt is not credited to an action SWARM did not take. Only this call's
+ * own marker is cleared, never a concurrent retry's. Best-effort, like the mark: the
+ * refusal the operator is about to see must not be replaced by a bookkeeping error.
+ */
+async function unmarkRefusedRetry(runId: string, requestedAt: Date | undefined): Promise<void> {
+	if (!requestedAt) return;
+	try {
+		await clearNextAttemptTrigger(runId, 'retry', requestedAt);
+	} catch (err) {
+		logger.warn('retryNow: could not take back the refused retry’s attempt-history marker', {
 			runId,
 			error: describeError(err),
 		});
@@ -2943,9 +2965,18 @@ export const runsRouter = router({
 					run,
 					startFresh,
 				);
-				await markNextAttemptAsRetry(run.id);
-				const reopened = await reopenActiveDispatchForRetry(active, job);
-				if (!reopened) throw alreadyRetrying();
+				const markedAt = await markNextAttemptAsRetry(run.id);
+				let reopened: Awaited<ReturnType<typeof reopenActiveDispatchForRetry>>;
+				try {
+					reopened = await reopenActiveDispatchForRetry(active, job);
+				} catch (err) {
+					await unmarkRefusedRetry(run.id, markedAt);
+					throw err;
+				}
+				if (!reopened) {
+					await unmarkRefusedRetry(run.id, markedAt);
+					throw alreadyRetrying();
+				}
 				try {
 					await publishDispatchWakeUp(reopened);
 				} catch (err) {
@@ -2985,7 +3016,7 @@ export const runsRouter = router({
 				run,
 				startFresh,
 			);
-			await markNextAttemptAsRetry(run.id);
+			const markedAt = await markNextAttemptAsRetry(run.id);
 			try {
 				await createAndPublishDispatch({
 					projectId: run.projectId,
@@ -2998,6 +3029,7 @@ export const runsRouter = router({
 					phase: run.phase as TriggerPhase,
 				});
 			} catch (err) {
+				await unmarkRefusedRetry(run.id, markedAt);
 				const message = describeError(err);
 				// The one-active-dispatch-per-run unique index: a concurrent retry won.
 				if (message.includes('uq_dispatches_active_run') || message.includes('duplicate key')) {

@@ -143,17 +143,108 @@ export async function openRunAttempt(
 }
 
 /**
+ * Reopen the attempt an adopted late result (issue #1076) settles, so the run's real
+ * outcome lands on it rather than on nothing.
+ *
+ * The lost worker's attempt was closed — normally `deferred`, transport lost — by the
+ * reap that orphaned it, and an adopted result executes nothing, so no attempt opens
+ * for it. Without this, the run would complete while its only attempt still reads as
+ * the deferred failure. Only the run's **latest** attempt is reopened, and only when it
+ * is the one `dispatchId` ran on `workerId`: the adoption is taken over by the retry
+ * before any later attempt can open, so anything else means this result is not the
+ * latest attempt's and nothing is rewritten.
+ *
+ * Call once the run row is back to `running` for the adopted settle. Should the run
+ * have been settled again in between, the reopened attempt is closed from it at once,
+ * so it is never left open under a run that is not running.
+ *
+ * Returns the reopened attempt's id, or `undefined` when nothing matched.
+ */
+export async function reopenAdoptedRunAttempt(
+	runId: string,
+	dispatchId: string,
+	workerId: string,
+): Promise<string | undefined> {
+	return await getDb().transaction(async (tx) => {
+		const [run] = await tx
+			.select({ id: runs.id })
+			.from(runs)
+			.where(eq(runs.id, runId))
+			.for('update')
+			.limit(1);
+		if (!run) return undefined;
+		const [latest] = await tx
+			.select({
+				id: runAttempts.id,
+				dispatchId: runAttempts.dispatchId,
+				workerId: runAttempts.workerId,
+				endedAt: runAttempts.endedAt,
+			})
+			.from(runAttempts)
+			.where(eq(runAttempts.runId, runId))
+			.orderBy(desc(runAttempts.seq))
+			.limit(1);
+		if (!latest || latest.dispatchId !== dispatchId || latest.workerId !== workerId) {
+			return undefined;
+		}
+		if (latest.endedAt) {
+			await tx
+				.update(runAttempts)
+				.set({
+					endedAt: null,
+					outcome: null,
+					error: null,
+					failureDiagnosis: null,
+					nextRetryAt: null,
+					exitCode: null,
+				})
+				.where(eq(runAttempts.id, latest.id));
+		}
+		await closeSettledRunAttempts(tx, [runId]);
+		return latest.id;
+	});
+}
+
+/**
  * Record that an operator asked for the run's next attempt, so that attempt is shown
  * as theirs. A later request replaces an earlier one that no attempt executed yet.
+ *
+ * Returns the moment recorded, which {@link clearNextAttemptTrigger} takes to undo
+ * exactly this request when the action it marked is refused.
  */
 export async function recordNextAttemptTrigger(
 	runId: string,
 	trigger: RunAttemptOperatorTrigger,
+): Promise<Date> {
+	const requestedAt = new Date();
+	await getDb()
+		.update(runs)
+		.set({ nextAttemptTrigger: trigger, nextAttemptRequestedAt: requestedAt })
+		.where(eq(runs.id, runId));
+	return requestedAt;
+}
+
+/**
+ * Undo {@link recordNextAttemptTrigger} for an operator action that was refused or
+ * failed, so no later automatic attempt is credited to it. Clears the marker only
+ * while it is still this request's — same trigger, same `requestedAt` — so a
+ * concurrent request that succeeded keeps its own.
+ */
+export async function clearNextAttemptTrigger(
+	runId: string,
+	trigger: RunAttemptOperatorTrigger,
+	requestedAt: Date,
 ): Promise<void> {
 	await getDb()
 		.update(runs)
-		.set({ nextAttemptTrigger: trigger, nextAttemptRequestedAt: new Date() })
-		.where(eq(runs.id, runId));
+		.set({ nextAttemptTrigger: null, nextAttemptRequestedAt: null })
+		.where(
+			and(
+				eq(runs.id, runId),
+				eq(runs.nextAttemptTrigger, trigger),
+				eq(runs.nextAttemptRequestedAt, requestedAt),
+			),
+		);
 }
 
 /** Who streamed a batch of output, as the transport authorized it. */
