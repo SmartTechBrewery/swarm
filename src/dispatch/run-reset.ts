@@ -100,6 +100,7 @@ import {
 	getActiveDispatchByRunId,
 } from '../db/repositories/dispatchesRepository.js';
 import { getProjectByIdFromDb } from '../db/repositories/projectsRepository.js';
+import { recordNextAttemptTrigger } from '../db/repositories/runAttemptsRepository.js';
 import {
 	clearRunRecovery,
 	failRunFromStatus,
@@ -343,6 +344,23 @@ async function sanitizeStoredJobPayload(runId: string, job: SwarmJob): Promise<v
 }
 
 /**
+ * Mark the attempt this reset starts as the operator's (issue #1400), before the
+ * replacement dispatch exists so no worker can claim it first. Best-effort for the
+ * same reason as {@link sanitizeStoredJobPayload}: losing the label must never turn
+ * a reset into a refusal.
+ */
+async function markNextAttemptAsReset(runId: string): Promise<void> {
+	try {
+		await recordNextAttemptTrigger(runId, 'reset');
+	} catch (err) {
+		logger.warn('run reset: could not record the restart in the run’s attempt history', {
+			runId,
+			error: describeError(err),
+		});
+	}
+}
+
+/**
  * Settle the run's checkout and worktree lease **on this host**, discarding
  * whatever protection it holds. Never throws (issue #744): the checkout the
  * restart actually has to clear may live on another worker, which honours the
@@ -540,6 +558,7 @@ async function performReset(run: ResetTargetRun, progress: ResetRunSteps): Promi
 	// did not exist.
 	const job = reconstructResetJob(jobPayload, run.id, run.phase, 'discard');
 	await sanitizeStoredJobPayload(run.id, job);
+	await markNextAttemptAsReset(run.id);
 	const dispatchId = await createReplacementDispatch(run, job);
 
 	logger.info('run reset complete', {

@@ -24,6 +24,13 @@ vi.mock('@/db/repositories/runsRepository.js', async (importOriginal) => ({
 	recordRunCleanupBlocked: vi.fn(),
 }));
 
+// The attempt history (issue #1400): what `getAttempts` reads and what Retry now
+// marks before its dispatch can be claimed.
+vi.mock('@/db/repositories/runAttemptsRepository.js', () => ({
+	listRunAttempts: vi.fn(),
+	recordNextAttemptTrigger: vi.fn(),
+}));
+
 vi.mock('@/db/repositories/projectsRepository.js', () => ({
 	findProjectRecordByIdFromDb: vi.fn(),
 	getProjectByIdFromDb: vi.fn(),
@@ -226,6 +233,10 @@ import {
 	REVIEW_VERDICT_CAP,
 } from '@/db/repositories/reviewVerdictsRepository.js';
 import {
+	listRunAttempts,
+	recordNextAttemptTrigger,
+} from '@/db/repositories/runAttemptsRepository.js';
+import {
 	cancelDeferredRunInDb,
 	countMergedPullRequestsByRepository,
 	countRunsByStatusAndPhase,
@@ -363,6 +374,8 @@ function makeRun(overrides: Partial<RunRow> = {}): RunRow {
 		recovery: null,
 		cancellation: null,
 		resetStartedAt: null,
+		nextAttemptTrigger: null,
+		nextAttemptRequestedAt: null,
 		checkpoint: null,
 		continuationCount: 0,
 		continuationProgressCount: 0,
@@ -455,6 +468,9 @@ function membershipFor(role: ProjectRole, projectId = 'p1'): ProjectMembership {
 	};
 }
 
+const ATTEMPT_1 = '11111111-aaaa-4aaa-8aaa-000000000001';
+const ATTEMPT_2 = '11111111-aaaa-4aaa-8aaa-000000000002';
+
 describe('runsRouter', () => {
 	// The base suite runs as an instanceAdmin (authorization bypassed); the
 	// project-scoped authorization suite below exercises the ordinary-user paths.
@@ -468,6 +484,9 @@ describe('runsRouter', () => {
 		vi.mocked(getRunByIdFromDb).mockReset();
 		vi.mocked(getRunLogsFromDb).mockReset();
 		vi.mocked(getRunOutputEvents).mockReset();
+		vi.mocked(listRunAttempts).mockReset();
+		vi.mocked(recordNextAttemptTrigger).mockReset();
+		vi.mocked(recordNextAttemptTrigger).mockResolvedValue(undefined);
 		vi.mocked(cancelDeferredRunInDb).mockReset();
 		vi.mocked(recordRunCleanupBlocked).mockReset();
 		vi.mocked(reconcileTerminatedWorktree).mockReset();
@@ -3186,7 +3205,15 @@ describe('runsRouter', () => {
 		it('passes the cursor through and returns the incremental page', async () => {
 			vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1' }));
 			const page = {
-				events: [{ id: 8, stream: 'stderr' as const, content: 'warning\n', emittedAt: new Date() }],
+				events: [
+					{
+						id: 8,
+						attemptId: null,
+						stream: 'stderr' as const,
+						content: 'warning\n',
+						emittedAt: new Date(),
+					},
+				],
 				nextCursor: 8,
 				hasMore: false,
 				truncated: false,
@@ -3195,7 +3222,126 @@ describe('runsRouter', () => {
 			vi.mocked(getRunOutputEvents).mockResolvedValue(page);
 
 			await expect(caller.getOutput({ runId: 'run-1', after: 7 })).resolves.toEqual(page);
-			expect(getRunOutputEvents).toHaveBeenCalledWith('run-1', 7);
+			expect(getRunOutputEvents).toHaveBeenCalledWith('run-1', 7, undefined);
+		});
+
+		it('narrows the page to one attempt when asked (issue #1400)', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1' }));
+			vi.mocked(getRunOutputEvents).mockResolvedValue({
+				events: [],
+				nextCursor: 0,
+				hasMore: false,
+				truncated: false,
+				retentionBytes: 5_000_000,
+			});
+
+			await caller.getOutput({ runId: 'run-1', after: 0, attemptId: ATTEMPT_2 });
+			expect(getRunOutputEvents).toHaveBeenCalledWith('run-1', 0, ATTEMPT_2);
+		});
+	});
+
+	// Issue #1400: the run row describes only its latest attempt, so the run page and
+	// `run_get` read every attempt's own outcome and error from here.
+	describe('getAttempts', () => {
+		const started = new Date('2026-11-09T06:56:00Z');
+		function attempt(overrides: Record<string, unknown>) {
+			return {
+				id: ATTEMPT_1,
+				runId: 'run-1',
+				seq: 1,
+				dispatchId: 'dispatch-1',
+				trigger: 'automatic' as const,
+				requestedAt: null,
+				workerId: 'worker-a',
+				engine: 'codex',
+				model: 'gpt-5.1-codex',
+				startedAt: started,
+				endedAt: new Date('2026-11-09T07:10:00Z'),
+				outcome: 'deferred',
+				error: 'Codex usage limit reached',
+				failureDiagnosis: null,
+				nextRetryAt: new Date('2026-11-09T10:50:00Z'),
+				exitCode: 1,
+				outputBytes: 540_000,
+				outputTruncated: false,
+				outputEventCount: 1200,
+				...overrides,
+			};
+		}
+
+		it('lists every attempt in order with its worker name, outcome and error', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', status: 'failed' }));
+			vi.mocked(listRunAttempts).mockResolvedValue({
+				attempts: [
+					attempt({}),
+					attempt({
+						id: ATTEMPT_2,
+						seq: 2,
+						trigger: 'reset',
+						requestedAt: new Date('2026-11-09T09:08:48Z'),
+						workerId: 'worker-b',
+						engine: 'claude',
+						model: null,
+						outcome: 'failed',
+						error: 'git worktree add failed: fatal: invalid reference: issue-2113',
+						nextRetryAt: null,
+						outputEventCount: 0,
+					}),
+				],
+				unattributedOutputEventCount: 0,
+			});
+			vi.mocked(getWorkers).mockResolvedValue([
+				{ id: 'worker-a', displayName: 'jacek_uc_platform' },
+				{ id: 'worker-b', displayName: 'karolina_uc_platform' },
+			] as never);
+
+			const result = await caller.getAttempts({ runId: 'run-1' });
+
+			expect(getWorkers).toHaveBeenCalledWith(['worker-a', 'worker-b']);
+			expect(result.unattributedOutputEventCount).toBe(0);
+			expect(result.attempts).toEqual([
+				expect.objectContaining({
+					seq: 1,
+					trigger: 'automatic',
+					workerName: 'jacek_uc_platform',
+					engine: 'codex',
+					outcome: 'deferred',
+					error: 'Codex usage limit reached',
+					outputEventCount: 1200,
+				}),
+				expect.objectContaining({
+					seq: 2,
+					trigger: 'reset',
+					workerName: 'karolina_uc_platform',
+					engine: 'claude',
+					outcome: 'failed',
+					error: 'git worktree add failed: fatal: invalid reference: issue-2113',
+					outputEventCount: 0,
+				}),
+			]);
+		});
+
+		it('still answers with worker ids when the worker lookup fails', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1' }));
+			vi.mocked(listRunAttempts).mockResolvedValue({
+				attempts: [attempt({})],
+				unattributedOutputEventCount: 3,
+			});
+			vi.mocked(getWorkers).mockRejectedValue(new Error('db down'));
+
+			const result = await caller.getAttempts({ runId: 'run-1' });
+
+			expect(result.attempts[0]).toMatchObject({ workerId: 'worker-a', workerName: null });
+			expect(result.unattributedOutputEventCount).toBe(3);
+		});
+
+		it('throws NOT_FOUND for an unknown run without reading attempts', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(undefined);
+
+			await expect(caller.getAttempts({ runId: 'missing' })).rejects.toThrowError(
+				expect.objectContaining({ code: 'NOT_FOUND' }),
+			);
+			expect(listRunAttempts).not.toHaveBeenCalled();
 		});
 	});
 
@@ -3221,9 +3367,28 @@ describe('runsRouter', () => {
 				expect.objectContaining({ runId: 'run-1', rateLimitRetryAttempt: 0 }),
 			);
 			expect(publishDispatchWakeUp).toHaveBeenCalledWith(reopened);
+			// The attempt this starts is shown as the operator's (issue #1400), marked
+			// before the dispatch is reopened so no worker can claim it unmarked.
+			expect(recordNextAttemptTrigger).toHaveBeenCalledWith('run-1', 'retry');
+			expect(vi.mocked(recordNextAttemptTrigger).mock.invocationCallOrder[0]).toBeLessThan(
+				vi.mocked(reopenDispatchForManualRetry).mock.invocationCallOrder[0] ?? 0,
+			);
 			// The run row is NOT flipped here — it becomes `running` only when the
 			// worker actually claims the dispatch (issue #284's false-running guard).
 			expect(markRunUserTerminated).not.toHaveBeenCalled();
+		});
+
+		it('still retries when the attempt history cannot record the request (issue #1400)', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', status: 'deferred' }));
+			vi.mocked(getActiveDispatchByRunId).mockResolvedValue(makeDispatch());
+			vi.mocked(reopenDispatchForManualRetry).mockResolvedValue(makeDispatch());
+			vi.mocked(recordNextAttemptTrigger).mockRejectedValue(new Error('db down'));
+
+			await expect(caller.retryNow({ runId: 'run-1' })).resolves.toEqual({
+				runId: 'run-1',
+				status: 'retrying',
+			});
+			expect(reopenDispatchForManualRetry).toHaveBeenCalled();
 		});
 
 		// Issue #1075: Retry now on a run awaiting its automatic transport-loss retry

@@ -61,7 +61,8 @@ import {
  */
 
 const { persistControlPlaneNote } = vi.hoisted(() => ({
-	persistControlPlaneNote: vi.fn<(runId: string | undefined, content: string) => void>(),
+	persistControlPlaneNote:
+		vi.fn<(runId: string | undefined, content: string, source?: unknown) => void>(),
 }));
 vi.mock('@/router/stream-log-persistence.js', async (importOriginal) => ({
 	...(await importOriginal<typeof import('@/router/stream-log-persistence.js')>()),
@@ -349,7 +350,10 @@ describe('a phase reaped on transport loss that finishes on its reconnected work
 		);
 
 		// The run says so, in its output and on its row.
-		expect(persistControlPlaneNote).toHaveBeenCalledWith(RUN_ID, LATE_RESULT_ACCEPTED_NOTE);
+		expect(persistControlPlaneNote).toHaveBeenCalledWith(RUN_ID, LATE_RESULT_ACCEPTED_NOTE, {
+			dispatchId: DISPATCH_ID,
+			workerId: WORKER_ID,
+		});
 		expect(recordRunLateResultAccepted).toHaveBeenCalledWith(RUN_ID, WORKER_ID);
 
 		// The result was the late phase's last word: nothing is left to stop or fence,
@@ -455,7 +459,11 @@ describe('a phase reaped on transport loss that finishes on its reconnected work
 		expect(adoptLateResultIntoScheduledRetry).not.toHaveBeenCalled();
 		expect(publishDispatchWakeUp).not.toHaveBeenCalled();
 		expect(recordRunLateResultAccepted).not.toHaveBeenCalled();
-		expect(persistControlPlaneNote).not.toHaveBeenCalledWith(RUN_ID, LATE_RESULT_ACCEPTED_NOTE);
+		expect(persistControlPlaneNote).not.toHaveBeenCalledWith(
+			RUN_ID,
+			LATE_RESULT_ACCEPTED_NOTE,
+			expect.anything(),
+		);
 	});
 
 	it('drops a late success that loses the compare-and-set race', async () => {

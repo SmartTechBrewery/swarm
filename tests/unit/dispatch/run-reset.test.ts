@@ -17,6 +17,10 @@ vi.mock('@/db/repositories/projectsRepository.js', () => ({
 	getProjectByIdFromDb: vi.fn(),
 }));
 
+vi.mock('@/db/repositories/runAttemptsRepository.js', () => ({
+	recordNextAttemptTrigger: vi.fn(),
+}));
+
 vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
 	getActiveDispatchByRunId: vi.fn(),
 	cancelClaimedDispatch: vi.fn(),
@@ -62,6 +66,7 @@ import {
 	getActiveDispatchByRunId,
 } from '@/db/repositories/dispatchesRepository.js';
 import { getProjectByIdFromDb } from '@/db/repositories/projectsRepository.js';
+import { recordNextAttemptTrigger } from '@/db/repositories/runAttemptsRepository.js';
 import {
 	clearRunRecovery,
 	failRunFromStatus,
@@ -149,6 +154,8 @@ function makeRun(overrides: Partial<RunRow> = {}): RunRow {
 		recovery: { state: 'blocked', blockedReason: 'live-leased' },
 		cancellation: null,
 		resetStartedAt: null,
+		nextAttemptTrigger: null,
+		nextAttemptRequestedAt: null,
 		checkpoint: null,
 		continuationCount: 0,
 		continuationProgressCount: 0,
@@ -221,6 +228,7 @@ describe('resetRun', () => {
 		vi.mocked(hasLiveRunForTask).mockReset().mockResolvedValue(false);
 		vi.mocked(markRunResetStarted).mockReset().mockResolvedValue(undefined);
 		vi.mocked(updateRunJobPayload).mockReset().mockResolvedValue(undefined);
+		vi.mocked(recordNextAttemptTrigger).mockReset().mockResolvedValue(undefined);
 		vi.mocked(removePendingJobById).mockClear();
 		vi.mocked(reconcileTerminatedWorktree).mockReset().mockResolvedValue({ outcome: 'removed' });
 		vi.mocked(createAndPublishDispatch)
@@ -269,6 +277,27 @@ describe('resetRun', () => {
 			worktreeError: null,
 			recoveryCleared: true,
 			abandonedPreservedWorkerId: null,
+			dispatchId: 'dispatch-2',
+		});
+	});
+
+	// Issue #1400: the attempt the reset starts shows in the run's attempt history as
+	// the operator's, marked before the replacement dispatch exists so no worker can
+	// claim it first.
+	it('marks the next attempt as an operator Reset & restart before re-dispatching', async () => {
+		await resetRun('run-1');
+
+		expect(recordNextAttemptTrigger).toHaveBeenCalledWith('run-1', 'reset');
+		expect(vi.mocked(recordNextAttemptTrigger).mock.invocationCallOrder[0]).toBeLessThan(
+			vi.mocked(createAndPublishDispatch).mock.invocationCallOrder[0],
+		);
+	});
+
+	it('still restarts when the attempt history cannot record the reset', async () => {
+		vi.mocked(recordNextAttemptTrigger).mockRejectedValue(new Error('db down'));
+
+		await expect(resetRun('run-1')).resolves.toMatchObject({
+			outcome: 'restarted',
 			dispatchId: 'dispatch-2',
 		});
 	});

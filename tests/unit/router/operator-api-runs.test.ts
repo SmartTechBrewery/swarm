@@ -193,7 +193,7 @@ describe('operator API runs — a project member', () => {
 		expect(logs.status).toBe(200);
 		expect(await logs.json()).toEqual({ result: { data: LOGS } });
 		expect(output.status).toBe(200);
-		expect(getRunOutputEvents).toHaveBeenCalledWith(RUN_ID, 0);
+		expect(getRunOutputEvents).toHaveBeenCalledWith(RUN_ID, 0, undefined);
 	});
 
 	it('lists only the runs of the projects they belong to', async () => {

@@ -940,6 +940,8 @@ describe('handleWorkerStreamFrame', () => {
 				lines: [{ stream: 'stdout', content: 'hi\n', emittedAt: '2026-07-24T00:00:00Z' }],
 			},
 			RUN_ID,
+			// The worker the frame arrived from, which ties the lines to its attempt.
+			WORKER_ID,
 		);
 		expect(deps.deliverDispatchResult).not.toHaveBeenCalled();
 		expect(deps.deliverDispatchProgress).not.toHaveBeenCalled();
@@ -983,7 +985,7 @@ describe('handleWorkerStreamFrame', () => {
 			streamLogFrame('cccccccc-cccc-4ccc-8ccc-cccccccccccc'),
 		);
 
-		expect(deps.persistStreamLog).toHaveBeenCalledWith(expect.anything(), RUN_ID);
+		expect(deps.persistStreamLog).toHaveBeenCalledWith(expect.anything(), RUN_ID, WORKER_ID);
 	});
 
 	it('drops a stream-log whose dispatch was pushed to a different worker', async () => {
@@ -1009,7 +1011,7 @@ describe('handleWorkerStreamFrame', () => {
 			streamLogFrame('cccccccc-cccc-4ccc-8ccc-cccccccccccc'),
 		);
 
-		expect(deps.persistStreamLog).toHaveBeenCalledWith(expect.anything(), RUN_ID);
+		expect(deps.persistStreamLog).toHaveBeenCalledWith(expect.anything(), RUN_ID, WORKER_ID);
 	});
 
 	/**
@@ -1050,7 +1052,7 @@ describe('handleWorkerStreamFrame', () => {
 				streamLogFrame('cccccccc-cccc-4ccc-8ccc-cccccccccccc'),
 			);
 
-			expect(deps.persistStreamLog).toHaveBeenCalledWith(expect.anything(), RUN_ID);
+			expect(deps.persistStreamLog).toHaveBeenCalledWith(expect.anything(), RUN_ID, WORKER_ID);
 		});
 
 		it('drops its output once the retry is claimed', async () => {

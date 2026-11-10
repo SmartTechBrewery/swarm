@@ -592,6 +592,14 @@ const recordRunCommitUnavailableWorker = vi.fn(async (_runId: string) => {});
 const listRunPassedOverWorkerIds = vi.fn(async (_runId: string): Promise<string[]> => []);
 // Issue #1075 — the run's record of which machines lost their transport under it.
 const recordRunTransportLostWorker = vi.fn(async (_runId: string) => {});
+// Issue #1400 — the attempt record the consumer opens once a phase actually executes.
+const openRunAttempt = vi.fn(
+	async (_runId: string, _dispatchId: string | undefined) => 'attempt-1',
+);
+vi.mock('@/db/repositories/runAttemptsRepository.js', () => ({
+	openRunAttempt: (runId: string, dispatchId: string | undefined) =>
+		openRunAttempt(runId, dispatchId),
+}));
 vi.mock('@/db/repositories/runsRepository.js', () => ({
 	createRun: (input: unknown) => createRun(input),
 	completeRun: (id: string, input: unknown) => completeRun(id, input),
@@ -1145,6 +1153,8 @@ describe('processJob', () => {
 		releaseReviewDispatchHeldBy.mockResolvedValue(undefined);
 		createRun.mockClear();
 		createRun.mockResolvedValue('run-1');
+		openRunAttempt.mockClear();
+		openRunAttempt.mockResolvedValue('attempt-1');
 		completeRun.mockClear();
 		completeRun.mockResolvedValue(undefined);
 		failRunFromStatus.mockClear();
@@ -1272,6 +1282,8 @@ describe('processJob', () => {
 			// Observable: a `deferred` run row is created now instead of the Review being
 			// invisible until it is woken.
 			expect(createRun).toHaveBeenCalledTimes(1);
+			// …but a pre-run wait executed nothing, so it is no attempt (issue #1400).
+			expect(openRunAttempt).not.toHaveBeenCalled();
 			// The PR+SHA claim is refreshed (held open) past the wait so no sibling event
 			// steals it while the continuation waits.
 			expect(refreshReviewDispatchClaim).toHaveBeenCalledWith(
@@ -2377,6 +2389,8 @@ describe('processJob', () => {
 		const outcome = await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
 
 		expect(phaseCalls).toHaveLength(1);
+		// The phase executed, so it is recorded as an attempt of its run (issue #1400).
+		expect(openRunAttempt).toHaveBeenCalledWith('run-1', expect.any(String));
 		expect(phaseCalls[0].phase).toBe('review');
 		expect(phaseCalls[0].context.project).toBe(PROJECT);
 		expect(phaseCalls[0].context.trigger).toMatchObject({
@@ -6007,6 +6021,9 @@ describe('processJob', () => {
 			});
 			// No gate, no bind, no slot: the phase already ran on the lost machine.
 			expect(listProjectDispatchCandidates).not.toHaveBeenCalled();
+			// Nothing executes here either, so no new attempt: the one it settles is the
+			// lost attempt already recorded (issue #1400).
+			expect(openRunAttempt).not.toHaveBeenCalled();
 			expect(claimWorkerForDispatch).not.toHaveBeenCalled();
 			// …and no repository WIP admission either (issue #1185).
 			expect(reserveWipSlot).not.toHaveBeenCalled();

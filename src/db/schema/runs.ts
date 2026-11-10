@@ -436,6 +436,16 @@ export const runs = pgTable(
 		 * out of that window. Never cleared: it only ever matters while it is fresh.
 		 */
 		resetStartedAt: timestamp('reset_started_at'),
+		/**
+		 * What an operator asked for that the run's **next** attempt will execute
+		 * (issue #1400) — `'reset'` for Reset & restart, `'retry'` for Retry now —
+		 * and when they asked. Written by those two actions and consumed (cleared) by
+		 * the attempt that runs it ({@link runAttempts}), so the attempt history says
+		 * which attempt an operator started and the run row never carries the marker
+		 * past it. Null when nothing is pending.
+		 */
+		nextAttemptTrigger: text('next_attempt_trigger').$type<RunAttemptOperatorTrigger>(),
+		nextAttemptRequestedAt: timestamp('next_attempt_requested_at'),
 	},
 	(table) => [
 		index('idx_runs_project_id').on(table.projectId),
@@ -460,6 +470,67 @@ export const runLogs = pgTable('run_logs', {
 	stderr: text('stderr'),
 });
 
+/** How an attempt came to run: the pipeline on its own, or an operator's action. */
+export type RunAttemptTrigger = 'automatic' | RunAttemptOperatorTrigger;
+export type RunAttemptOperatorTrigger = 'reset' | 'retry';
+
+/**
+ * One execution attempt of a run (issue #1400): each time a dispatch of the run is
+ * bound to a worker and its phase is started, whether it is the first attempt, an
+ * automatic retry, a Reset & restart or a Retry now.
+ *
+ * Append-only history, because the `runs` row is not one: a retry resets it
+ * ({@link resetRunToRunning}), overwriting the worker, CLI, start time and error the
+ * previous attempt recorded, and `dispatches` rows are reopened and re-claimed
+ * across attempts, so neither can say afterwards which attempt failed how. An
+ * attempt is opened when a worker is bound and the run is set running for it, and
+ * closed with a copy of the run's outcome columns the moment the run leaves
+ * `running`; a pre-run wait (a dispatch deferred before any worker was selected) is
+ * not an attempt and records none.
+ *
+ * `dispatch_id` deliberately has no foreign key: the history must outlive a pruned
+ * dispatch row, exactly as the attempt's own output does.
+ */
+export const runAttempts = pgTable(
+	'run_attempts',
+	{
+		id: uuid('id').primaryKey().defaultRandom(),
+		runId: uuid('run_id')
+			.notNull()
+			.references(() => runs.id, { onDelete: 'cascade' }),
+		/** 1-based position of this attempt within its run. */
+		seq: integer('seq').notNull(),
+		dispatchId: uuid('dispatch_id'),
+		trigger: text('trigger').$type<RunAttemptTrigger>().notNull().default('automatic'),
+		/** When the operator asked for this attempt; null for an automatic one. */
+		requestedAt: timestamp('requested_at'),
+		workerId: uuid('worker_id').references(() => workers.id, { onDelete: 'set null' }),
+		engine: text('engine'),
+		model: text('model'),
+		startedAt: timestamp('started_at').defaultNow().notNull(),
+		/** Null while the attempt is executing. */
+		endedAt: timestamp('ended_at'),
+		/**
+		 * The run status this attempt ended in (`completed`, `failed`, `deferred`,
+		 * `checkpointed`), or `superseded` when a later attempt started before this
+		 * one recorded any outcome. Null while executing.
+		 */
+		outcome: text('outcome'),
+		error: text('error'),
+		failureDiagnosis: jsonb('failure_diagnosis').$type<FailureDiagnosis>(),
+		/** The retry a deferred attempt was scheduled for. */
+		nextRetryAt: timestamp('next_retry_at'),
+		exitCode: integer('exit_code'),
+		/**
+		 * This attempt's share of the output it streamed. The retention cap applies per
+		 * attempt, so an attempt that floods it cannot silence the next one.
+		 */
+		outputBytes: integer('output_bytes').notNull().default(0),
+		outputTruncated: boolean('output_truncated').notNull().default(false),
+	},
+	(table) => [uniqueIndex('uq_run_attempts_run_seq').on(table.runId, table.seq)],
+);
+
 export const runOutputEvents = pgTable(
 	'run_output_events',
 	{
@@ -467,9 +538,17 @@ export const runOutputEvents = pgTable(
 		runId: uuid('run_id')
 			.notNull()
 			.references(() => runs.id, { onDelete: 'cascade' }),
+		/**
+		 * The attempt that produced this line (issue #1400). Null for a line written
+		 * before attempts were recorded, or one no attempt could be matched to.
+		 */
+		attemptId: uuid('attempt_id').references(() => runAttempts.id, { onDelete: 'set null' }),
 		stream: text('stream').$type<'stdout' | 'stderr'>().notNull(),
 		content: text('content').notNull(),
 		emittedAt: timestamp('emitted_at').defaultNow().notNull(),
 	},
-	(table) => [index('idx_run_output_events_cursor').on(table.runId, table.id)],
+	(table) => [
+		index('idx_run_output_events_cursor').on(table.runId, table.id),
+		index('idx_run_output_events_attempt').on(table.runId, table.attemptId, table.id),
+	],
 );
