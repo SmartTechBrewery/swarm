@@ -405,15 +405,48 @@ launchd_wrapper() {
 	printf '%s' "$wrapper"
 }
 
+# The bundle a launchd wrapper is the executable of (issue #1409): the
+# `CFBundleIdentifier` of `<Something>.app` when the wrapper is
+# `<Something>.app/Contents/MacOS/<exe>`, printed for `write_plist` to name in
+# `AssociatedBundleIdentifiers` -- or nothing. Without that key, Login Items lists
+# the agent under the developer name from the wrapper's code signature rather than
+# under the app, and Background Task Management keeps the parent it assigned at
+# first registration, so the key has to be in the plist before its first bootstrap.
+# A wrapper outside a bundle, or a bundle with no readable identifier, silently gets
+# no key: the wrapper itself still works, only the Login Items label differs.
+wrapper_bundle_id() {
+	local wrapper=$1 macos contents app id
+	macos=$(dirname "$wrapper")
+	contents=$(dirname "$macos")
+	app=$(dirname "$contents")
+	[ "$(basename "$macos")" = MacOS ] && [ "$(basename "$contents")" = Contents ] || return 0
+	case "$app" in *.app) ;; *) return 0 ;; esac
+	id=$(plutil -extract CFBundleIdentifier raw "$contents/Info.plist" 2>/dev/null) || return 0
+	# A bundle identifier is alphanumerics, hyphens and periods; anything else is
+	# not one, and would not be safe to write into the plist's XML either.
+	case "$id" in '' | *[!A-Za-z0-9.-]*) return 0 ;; esac
+	printf '%s' "$id"
+}
+
 # The agent's plist: `$LABEL`, running the given program arguments in `$CHECKOUT`
 # (a clone worker's checkout, or a profile worker's directory) and logging to `$LOG`.
 # The host's launchd wrapper, when it names one, goes in front of them -- for clone
 # and profile agents alike, so every path that rewrites a plist (`install`, the
-# installer `swarm workers setup` runs, the clone -> profile migration) keeps it.
+# installer `swarm workers setup` runs, the clone -> profile migration) keeps it,
+# along with the `AssociatedBundleIdentifiers` naming the wrapper's app bundle.
 write_plist() {
-	local arg args='' wrapper
+	local arg args='' wrapper bundle_id associated=''
 	wrapper=$(launchd_wrapper)
-	[ -z "$wrapper" ] || set -- "$wrapper" "$@"
+	if [ -n "$wrapper" ]; then
+		set -- "$wrapper" "$@"
+		bundle_id=$(wrapper_bundle_id "$wrapper")
+		[ -z "$bundle_id" ] || associated="
+	<key>AssociatedBundleIdentifiers</key>
+	<array>
+		<string>$bundle_id</string>
+	</array>
+"
+	fi
 	for arg in "$@"; do args="$args		<string>$arg</string>
 "; done
 	mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
@@ -428,7 +461,7 @@ write_plist() {
 	<key>ProgramArguments</key>
 	<array>
 $args	</array>
-
+$associated
 	<key>WorkingDirectory</key>
 	<string>$CHECKOUT</string>
 
