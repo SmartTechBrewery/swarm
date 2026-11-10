@@ -26,6 +26,7 @@ import { describeError } from '../lib/errors.js';
 import { configureLogger, enableLogRingBuffer, logger } from '../lib/logger.js';
 import { closeQueue } from '../queue/producer.js';
 import { createRouterApp } from './app.js';
+import { subscribeCheckoutDiscardDispatch } from './checkout-discard-dispatch.js';
 import { CONTROL_PLANE_LOG_BUFFER_CAPACITY } from './control-plane-logs.js';
 import type { DispatchConsumerHandle } from './dispatcher.js';
 import { startRolloutAdvanceTicker } from './worker-rollout-advance.js';
@@ -58,6 +59,10 @@ injectWebSocket(server);
 // of work, so its push is driven by the dispatch consumer below — which runs in this
 // same process — and there is nothing to subscribe here.
 const worktreeSweeps = subscribeWorktreeSweepDispatch();
+// The same bridge for a reset's checkout discards (issue #1402): the API server
+// records the request when a reset abandons a preserved worker, and the push to that
+// worker happens here, where its socket is.
+const checkoutDiscards = subscribeCheckoutDiscardDispatch();
 
 // Keep a staged fleet update moving with nobody watching (issue #941). The report
 // route and the socket-open hook cover every move a machine announces; this timer
@@ -117,6 +122,11 @@ for (const signal of ['SIGTERM', 'SIGINT'] as const) {
 					await worktreeSweeps.close();
 				} catch (err) {
 					logger.error('Worktree-sweep subscriber close failed', { error: describeError(err) });
+				}
+				try {
+					await checkoutDiscards.close();
+				} catch (err) {
+					logger.error('Checkout-discard subscriber close failed', { error: describeError(err) });
 				}
 				try {
 					await closeQueue();
