@@ -277,7 +277,11 @@ setting's catalogue entry.
   reclaims on). And reinstalling over this checkout's *own*
   running agent is not refused either, since `install` boots that job out before
   bootstrapping the new one, which is what makes reinstalling over a live agent the
-  routine way a plist is changed. A fleet-wide restart therefore needs no particular order between
+  routine way a plist is changed. Because `bootout` returns before launchd has
+  finished tearing a running job down, `install` waits (up to ~15 s) for the old
+  job to disappear before bootstrapping, and retries a failed bootstrap a few times
+  (issue #1410); if every attempt fails it says the agent is now **not loaded** and
+  prints the `launchctl bootstrap …` command to load it by hand. A fleet-wide restart therefore needs no particular order between
   checkouts. Starting and stopping the daemon otherwise stays the operator's own
   call.
 - **A running daemon keeps the credential it started with.** It is read once, at

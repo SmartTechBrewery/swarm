@@ -492,9 +492,43 @@ EOF
 	plutil -lint "$PLIST" >/dev/null || die "generated plist is invalid: $PLIST"
 }
 
+# Load `$PLIST`, replacing whatever job already holds `$LABEL` (issue #1410).
+#
+# `bootout` returns before launchd has finished tearing a *running* job down, and a
+# `bootstrap` issued into that window fails with `5: Input/output error` -- after the
+# old job is already gone, so the worker silently drops out of the fleet. Hence the
+# two bounds: wait for `launchctl print` to stop finding the job (up to
+# BOOTOUT_WAIT_POLLS x BOOTOUT_POLL_SECONDS, ~15s) and bootstrap anyway on timeout,
+# then retry a failed bootstrap a few times before giving up. A first install has
+# nothing to boot out, so the first poll already finds nothing and nothing waits.
+BOOTOUT_WAIT_POLLS=30
+BOOTOUT_POLL_SECONDS=0.5
+BOOTSTRAP_ATTEMPTS=3
+BOOTSTRAP_RETRY_SECONDS=2
+
 bootstrap_agent() {
+	local domain polls=$BOOTOUT_WAIT_POLLS attempt=1
+	domain="gui/$(id -u)"
 	launchctl bootout "$TARGET" 2>/dev/null || true
-	launchctl bootstrap "gui/$(id -u)" "$PLIST"
+	while launchctl print "$TARGET" >/dev/null 2>&1; do
+		if [ "$polls" -le 0 ]; then
+			printf 'swarm-worker-agent: warning: %s is still loaded after bootout; bootstrapping anyway\n' "$LABEL" >&2
+			break
+		fi
+		polls=$((polls - 1))
+		sleep "$BOOTOUT_POLL_SECONDS"
+	done
+	until launchctl bootstrap "$domain" "$PLIST"; do
+		if [ "$attempt" -ge "$BOOTSTRAP_ATTEMPTS" ]; then
+			die "launchctl bootstrap failed $attempt times -- the agent $LABEL is now NOT loaded, so this worker is not running
+  load it again with:
+    launchctl bootstrap $domain \"$PLIST\""
+		fi
+		printf 'swarm-worker-agent: launchctl bootstrap failed (attempt %s of %s); retrying in %ss\n' \
+			"$attempt" "$BOOTSTRAP_ATTEMPTS" "$BOOTSTRAP_RETRY_SECONDS" >&2
+		attempt=$((attempt + 1))
+		sleep "$BOOTSTRAP_RETRY_SECONDS"
+	done
 }
 
 cmd_uninstall() {
