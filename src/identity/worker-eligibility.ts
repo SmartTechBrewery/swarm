@@ -38,7 +38,7 @@
 
 import { z } from 'zod';
 import type { AgentTarget } from '../config/schema.js';
-import type { AgentCli } from '../harness/agent-cli.js';
+import { type AgentCli, cliSupportsMcpServer } from '../harness/agent-cli.js';
 import { repoSlugsMatch } from '../scm/repo-slug.js';
 import type { TriggerPhase } from '../triggers/types.js';
 import type { Worker } from './worker.js';
@@ -91,7 +91,8 @@ import { permitsPhase, type WorkerEnrollment } from './worker-enrollment.js';
  *   capable daemon being connected.
  * - `missing-cli-capability` — the candidate target's effective CLI is not among
  *   the worker's declared capabilities, or the enrollment does not allow it on
- *   this project.
+ *   this project — or, for Resolve problem, it is a CLI that cannot attach the
+ *   SWARM operator MCP server the phase works through (issue #1395).
  * - `cli-rate-limited` — this machine's own CLI reported a usage limit on a real
  *   run, recorded per `(worker, CLI)` with the instant it is expected back (issue
  *   #981), and that instant has not passed. Distinct from `missing-cli-capability`
@@ -277,6 +278,13 @@ export function evaluateWorkerEligibility(input: WorkerEligibilityInput): Eligib
 	// enrollment must permit it on *this* project (`allowedClis` is a subset of the
 	// capabilities, so a project may narrow what an otherwise capable worker runs).
 	if (!worker.capabilities.includes(cli) || !enrollment.allowedClis.includes(cli)) {
+		return { eligible: false, reason: 'missing-cli-capability' };
+	}
+	// Resolve problem works only through the SWARM operator MCP server attached to the
+	// run (issue #1395), so a CLI that cannot attach one — Antigravity, today — cannot
+	// run it on any machine (`cliSupportsMcpServer`, issue #1394). The gate walks on
+	// to the phase's next target rather than launching a run without its tools.
+	if (phase === 'resolve-problem' && !cliSupportsMcpServer(cli)) {
 		return { eligible: false, reason: 'missing-cli-capability' };
 	}
 	// The machine has the CLI and is allowed it — but its own allowance on that CLI

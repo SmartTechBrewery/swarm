@@ -7,15 +7,15 @@ import { z } from 'zod';
  * dry run that never reaches the write, authorization (the preview) before anything,
  * and exactly one audit row — inserted before acting, settled after — for every call.
  */
-const { recordOperatorAction, settleOperatorAction, countAgentTokenActions } = vi.hoisted(() => ({
+const { recordOperatorAction, settleOperatorAction, countRunBoundActions } = vi.hoisted(() => ({
 	recordOperatorAction: vi.fn(),
 	settleOperatorAction: vi.fn(),
-	countAgentTokenActions: vi.fn(),
+	countRunBoundActions: vi.fn(),
 }));
 vi.mock('@/db/repositories/operatorActionsRepository.js', () => ({
 	recordOperatorAction,
 	settleOperatorAction,
-	countAgentTokenActions,
+	countRunBoundActions,
 }));
 vi.mock('@/lib/logger.js', async () => ({
 	...(await vi.importActual<typeof import('@/lib/logger.js')>('@/lib/logger.js')),
@@ -68,7 +68,7 @@ function text(result: { content: Array<{ type: string; text?: string }> }): stri
 beforeEach(() => {
 	recordOperatorAction.mockReset().mockResolvedValue('audit-1');
 	settleOperatorAction.mockReset().mockResolvedValue(undefined);
-	countAgentTokenActions.mockReset().mockResolvedValue(0);
+	countRunBoundActions.mockReset().mockResolvedValue(0);
 	preview = vi.fn().mockResolvedValue({ projectId: 'proj-a', plan: { wouldRefuse: null } });
 	apply = vi.fn().mockResolvedValue({ outcome: 'done' });
 });
@@ -98,6 +98,7 @@ describe('runWriteTool', () => {
 			input: { runId: 'run-1' },
 			credentialKind: 'user',
 			agentTokenId: null,
+			runId: null,
 		});
 		expect(recordOperatorAction.mock.invocationCallOrder[0]).toBeLessThan(
 			preview.mock.invocationCallOrder[0] ?? 0,
@@ -259,6 +260,7 @@ describe('runWriteTool', () => {
 				userId: USER.id,
 				credentialKind: 'scoped-agent-token',
 				agentTokenId: TOKEN_ID,
+				runId: null,
 			}),
 		);
 	});
@@ -462,12 +464,10 @@ describe('runWriteTool', () => {
 
 		/** Answer each guardrail read: real calls spent, succeeded dry runs, prior applies. */
 		function counts(answer: { spent?: number; dryRuns?: number; applied?: number }) {
-			countAgentTokenActions.mockImplementation(
-				async (query: { dryRun: boolean; tool?: string }) => {
-					if (query.dryRun) return answer.dryRuns ?? 1;
-					return query.tool === undefined ? (answer.spent ?? 0) : (answer.applied ?? 0);
-				},
-			);
+			countRunBoundActions.mockImplementation(async (query: { dryRun: boolean; tool?: string }) => {
+				if (query.dryRun) return answer.dryRuns ?? 1;
+				return query.tool === undefined ? (answer.spent ?? 0) : (answer.applied ?? 0);
+			});
 		}
 
 		function expectRefused(result: Awaited<ReturnType<typeof runWriteTool>>, message: string) {
@@ -492,21 +492,51 @@ describe('runWriteTool', () => {
 
 			expect(result.isError).toBeUndefined();
 			expect(apply).toHaveBeenCalledTimes(1);
-			expect(countAgentTokenActions).toHaveBeenCalledWith({
-				agentTokenId: TOKEN_ID,
+			expect(countRunBoundActions).toHaveBeenCalledWith({
+				runId: RUN_ID,
 				dryRun: true,
 				outcomes: ['succeeded'],
 				tool: 'run_reset',
 				target: 'run-1',
 			});
-			expect(countAgentTokenActions).toHaveBeenCalledWith({
-				agentTokenId: TOKEN_ID,
+			expect(countRunBoundActions).toHaveBeenCalledWith({
+				runId: RUN_ID,
 				dryRun: false,
 				outcomes: ['pending', 'succeeded', 'failed'],
 				tool: 'run_reset',
 				target: 'run-1',
 				excludeId: 'audit-1',
 			});
+		});
+
+		// Review of #1405 (F1): a deferred run is retried under a freshly minted token, and
+		// the earlier token is deleted — the ledger must follow the run, not the token.
+		it('records the bound run on the audit row and shares one ledger across its tokens', async () => {
+			counts({ applied: 1 });
+			const retryToken = {
+				...scopedAgentPrincipal(USER, '55555555-5555-4555-8555-555555555555', ['proj-a'], {
+					runId: RUN_ID,
+					maxWriteActions: 3,
+				}),
+				ceiling: 'member' as const,
+			};
+			const result = await runWriteTool(resetTool(), retryToken, {
+				runId: 'run-1',
+				reason: 'r',
+				dryRun: false,
+			});
+
+			expect(recordOperatorAction).toHaveBeenCalledWith(
+				expect.objectContaining({
+					agentTokenId: '55555555-5555-4555-8555-555555555555',
+					runId: RUN_ID,
+				}),
+			);
+			for (const [query] of countRunBoundActions.mock.calls) {
+				expect(query).toMatchObject({ runId: RUN_ID });
+				expect(query).not.toHaveProperty('agentTokenId');
+			}
+			expectRefused(result, 'run_reset was already applied to run-1 in this run');
 		});
 
 		it('refuses a real call once the cap is spent, counting failed calls but not refused ones', async () => {
@@ -518,8 +548,8 @@ describe('runWriteTool', () => {
 			});
 
 			expectRefused(result, 'write-action cap of 2 reached for this run');
-			expect(countAgentTokenActions).toHaveBeenCalledWith({
-				agentTokenId: TOKEN_ID,
+			expect(countRunBoundActions).toHaveBeenCalledWith({
+				runId: RUN_ID,
 				dryRun: false,
 				outcomes: ['pending', 'succeeded', 'failed'],
 				excludeId: 'audit-1',
@@ -551,7 +581,7 @@ describe('runWriteTool', () => {
 		it('refuses a real call while the same tool on the same target is still pending', async () => {
 			// Only another call's in-flight row is on the table: the asking call's own
 			// row is excluded, and nothing has settled yet.
-			countAgentTokenActions.mockImplementation(
+			countRunBoundActions.mockImplementation(
 				async (query: {
 					dryRun: boolean;
 					tool?: string;
@@ -573,7 +603,7 @@ describe('runWriteTool', () => {
 		});
 
 		it('refuses, rather than fails, when the guardrails cannot be read', async () => {
-			countAgentTokenActions.mockRejectedValue(new Error('connection reset'));
+			countRunBoundActions.mockRejectedValue(new Error('connection reset'));
 			const result = await runWriteTool(resetTool(), runBound(3), {
 				runId: 'run-1',
 				reason: 'r',
@@ -592,7 +622,7 @@ describe('runWriteTool', () => {
 			});
 
 			expect(result.isError).toBeUndefined();
-			expect(countAgentTokenActions).not.toHaveBeenCalled();
+			expect(countRunBoundActions).not.toHaveBeenCalled();
 			expect(preview).toHaveBeenCalledTimes(1);
 			expect(settleOperatorAction).toHaveBeenCalledWith('audit-1', {
 				outcome: 'succeeded',
@@ -615,7 +645,7 @@ describe('runWriteTool', () => {
 				});
 				expect(result.isError).toBeUndefined();
 			}
-			expect(countAgentTokenActions).not.toHaveBeenCalled();
+			expect(countRunBoundActions).not.toHaveBeenCalled();
 			expect(apply).toHaveBeenCalledTimes(2);
 		});
 	});

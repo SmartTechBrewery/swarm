@@ -119,8 +119,16 @@ export interface BuildTaskAssignmentInput {
 	 * **Required**, unlike every other addition to this input: a frame built without
 	 * one describes a run that cannot commit or push, and making that a compile error
 	 * here is what keeps the resolution from being forgotten at a new call site.
+	 * `undefined` must be stated, and is stated by one phase alone: Resolve problem
+	 * (issue #1395) commits, pushes and comments nothing.
 	 */
-	operatorCredential: string;
+	operatorCredential: string | undefined;
+	/**
+	 * resolve-problem only (issue #1395): the operator MCP endpoint and the run-bound
+	 * token minted for this run — see `TaskAssignment.swarmMcp` for why this one
+	 * per-run credential may reach a worker.
+	 */
+	swarmMcp?: { url?: string; token: string };
 }
 
 /** Map a PM `WorkItem` to the transport's serialization subset (`AssignedWorkItem`). */
@@ -180,6 +188,7 @@ export function buildTaskAssignment(input: BuildTaskAssignmentInput): TaskAssign
 		commitSubject: input.commitSubject,
 		deliveredPullRequestUrl: input.deliveredPullRequestUrl,
 		operatorCredential: input.operatorCredential,
+		swarmMcp: input.swarmMcp,
 	};
 	// Validate before returning so a bad assembly fails at the seam, not on the wire.
 	return TaskAssignmentSchema.parse(assignment);

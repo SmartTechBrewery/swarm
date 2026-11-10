@@ -39,6 +39,7 @@ import {
 	resolvePmCredential,
 	resolveScmCredentialOrNull,
 } from '../config/provider.js';
+import { isResolveProblemEnabled } from '../config/resolve-problem.js';
 import type { ProjectConfig, ProjectRecord } from '../config/schema.js';
 import { listMembersWithUsers } from '../identity/membership-service.js';
 import { evaluateWorkerEligibility } from '../identity/worker-eligibility.js';
@@ -411,9 +412,10 @@ async function checkWebhooks(
 }
 
 /**
- * The phases a project runs: Planning, Implementation and Resolve-conflicts always, and
+ * The phases a project runs: Planning, Implementation and Resolve-conflicts always,
  * the three review-loop phases unless `pipeline` turns them off — the same
- * `enabled === false` reads their trigger handlers make.
+ * `enabled === false` reads their trigger handlers make — and Resolve problem only
+ * when the project turned it on (`isResolveProblemEnabled`, off by default).
  */
 export function enabledPhases(project: Pick<ProjectRecord, 'pipeline'>): TriggerPhase[] {
 	const pipeline = project.pipeline;
@@ -424,6 +426,7 @@ export function enabledPhases(project: Pick<ProjectRecord, 'pipeline'>): Trigger
 		...(pipeline?.respondToReview?.enabled === false ? [] : (['respond-to-review'] as const)),
 		...(pipeline?.respondToCi?.enabled === false ? [] : (['respond-to-ci'] as const)),
 		'resolve-conflicts',
+		...(isResolveProblemEnabled(pipeline) ? (['resolve-problem'] as const) : []),
 	];
 }
 

@@ -275,6 +275,65 @@ describe('runAssignmentDbFree', () => {
 		);
 	});
 
+	// Issue #1395: Resolve problem delivers nothing, so it runs with no operator SCM
+	// credential (and resolves no delivery provider) — but never without the run-bound
+	// MCP credential it works through.
+	describe('a Resolve problem assignment', () => {
+		function resolveProblemAssignment(swarmMcp?: { url?: string; token: string }) {
+			return buildTaskAssignment(
+				createMockTaskAssignmentInput({
+					phase: 'resolve-problem',
+					workItem: undefined,
+					systemPrompt: 'Resolve run failed-run.',
+					operatorCredential: undefined,
+					swarmMcp,
+				}),
+			);
+		}
+
+		it('runs with the composed prompt and the MCP credential, and needs no operator credential', async () => {
+			const sink = recordingSink();
+			const buildDelivery = vi.fn(async () => stubDelivery());
+			const report = { outcome: 'resolved' as const, bugReportId: 'r', actions: [], summary: 's' };
+			const runPhase = vi.fn(async (_inputs: AssignedPhaseInputs) => ({
+				agent: agentResult(),
+				resolveProblem: report,
+			}));
+
+			await runAssignmentDbFree(resolveProblemAssignment({ token: 'run-bound' }), sink, {
+				...RUN_OPTIONS,
+				deps: depsWith(runPhase, buildDelivery),
+			});
+
+			expect(buildDelivery).not.toHaveBeenCalled();
+			const inputs = runPhase.mock.calls[0][0];
+			expect(inputs.systemPrompt).toBe('Resolve run failed-run.');
+			// No URL on the frame: the endpoint is addressed on this worker's own control plane.
+			expect(inputs.swarmMcp).toEqual({
+				url: `${CONTROL_PLANE.replace(/\/+$/, '')}/operator/mcp`,
+				token: 'run-bound',
+			});
+			expect(inputs.delivery).toBeUndefined();
+			expect(sink.sent.at(-1)).toMatchObject({ status: 'succeeded', resolveProblem: report });
+		});
+
+		it('settles failed, running nothing, without the MCP credential', async () => {
+			const sink = recordingSink();
+			const runPhase = vi.fn(async () => ({ agent: agentResult() }));
+
+			await runAssignmentDbFree(resolveProblemAssignment(), sink, {
+				...RUN_OPTIONS,
+				deps: depsWith(runPhase),
+			});
+
+			expect(runPhase).not.toHaveBeenCalled();
+			expect(sink.sent.at(-1)).toMatchObject({ status: 'failed' });
+			expect(String((sink.sent.at(-1) as Record<string, unknown>).error)).toMatch(
+				/no SWARM operator MCP credential/,
+			);
+		});
+	});
+
 	// The *invalid* half of the same criterion: a stored credential that no longer
 	// authenticates. The provider's own message names neither the machine nor the
 	// provider ("Could not resolve GitHub identity for the operator token"), so the

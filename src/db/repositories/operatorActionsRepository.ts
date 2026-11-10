@@ -8,7 +8,7 @@
  * owns the outcome. One read, {@link findLatestOperatorAction} (issue #1349), lets a
  * tool act on what an earlier call recorded — `phase_agents_restore` re-applying the
  * order the latest `phase_agents_reorder` replaced. Another,
- * {@link countAgentTokenActions} (issue #1393), backs a run-bound agent
+ * {@link countRunBoundActions} (issues #1393, #1395), backs a run-bound agent
  * credential's guardrails.
  */
 
@@ -41,6 +41,8 @@ export interface RecordOperatorActionInput {
 	credentialKind?: OperatorActionCredentialKind;
 	/** The scoped agent credential's token id; `null` for any other credential. */
 	agentTokenId?: string | null;
+	/** The run a run-bound scoped agent credential is bound to; `null` for any other credential. */
+	runId?: string | null;
 }
 
 /** Insert one call's audit row as `pending`; returns its id for {@link settleOperatorAction}. */
@@ -107,13 +109,16 @@ export async function findLatestOperatorAction(query: {
 }
 
 /**
- * How many calls one agent access token made (issue #1393) — the read behind a
- * run-bound credential's guardrails (`src/mcp/write-tool.ts`). Keyed on the token,
- * dry or real, and the outcomes that count; `tool` and `target` narrow it to one
- * tool on one target, and `excludeId` leaves out the asking call's own row.
+ * How many calls the run-bound agent credentials of one run made (issues #1393,
+ * #1395) — the read behind a run-bound credential's guardrails
+ * (`src/mcp/write-tool.ts`). Keyed on the **run**, not the token: a deferred run is
+ * retried under a freshly minted token while the earlier one is deleted, and its cap
+ * and no-repeat ledger must carry over. Dry or real, and the outcomes that count;
+ * `tool` and `target` narrow it to one tool on one target, and `excludeId` leaves
+ * out the asking call's own row.
  */
-export async function countAgentTokenActions(query: {
-	agentTokenId: string;
+export async function countRunBoundActions(query: {
+	runId: string;
 	dryRun: boolean;
 	outcomes: readonly OperatorActionOutcome[];
 	tool?: string;
@@ -125,7 +130,7 @@ export async function countAgentTokenActions(query: {
 		.from(operatorActions)
 		.where(
 			and(
-				eq(operatorActions.agentTokenId, query.agentTokenId),
+				eq(operatorActions.runId, query.runId),
 				eq(operatorActions.dryRun, query.dryRun),
 				inArray(operatorActions.outcome, [...query.outcomes]),
 				...(query.tool !== undefined ? [eq(operatorActions.tool, query.tool)] : []),

@@ -52,6 +52,7 @@ import {
 	RecoverRunButton,
 	RecoveryCallout,
 	ResetRunButton,
+	ResolveProblemLinks,
 	ReviewCapCallout,
 	ReviewMergeCallout,
 	RunAttributionFields,
@@ -625,6 +626,55 @@ describe('LateResultAcceptedNote (issue #1076)', () => {
 			/>,
 		);
 		expect(screen.getByText(/Settled with the late result of w-1/)).toBeTruthy();
+	});
+});
+
+describe('ResolveProblemLinks (issue #1395)', () => {
+	it('renders nothing for a run that is neither an attempt nor resolved by one', () => {
+		const { container } = render(<ResolveProblemLinks run={makeReviewRun()} />);
+		expect(container.firstChild).toBeNull();
+	});
+
+	it('links a Resolve problem run to the failed run it is resolving', () => {
+		render(
+			<ResolveProblemLinks
+				run={makeReviewRun({ phase: 'resolve-problem', resolvesRunId: 'failed-run-1' })}
+			/>,
+		);
+		expect(screen.getByTestId('resolve-problem-links').textContent).toContain(
+			'Resolving run failed-run-1',
+		);
+		expect(screen.getByText('failed-run-1').closest('a')).toBeTruthy();
+	});
+
+	it("lists a failed run's Resolve problem attempts with their outcomes", () => {
+		render(
+			<ResolveProblemLinks
+				run={makeReviewRun({
+					status: 'failed',
+					resolveProblemAttempts: [
+						{
+							id: 'attempt-2',
+							status: 'running',
+							error: null,
+							startedAt: '2026-11-10T09:00:00Z',
+							completedAt: null,
+						},
+						{
+							id: 'attempt-1',
+							status: 'failed',
+							error: 'could not resolve',
+							startedAt: '2026-11-10T08:00:00Z',
+							completedAt: '2026-11-10T08:10:00Z',
+						},
+					],
+				})}
+			/>,
+		);
+		const panel = screen.getByTestId('resolve-problem-links');
+		expect(panel.textContent).toContain('Resolve problem attempts');
+		const items = Array.from(panel.querySelectorAll('li')).map((li) => li.textContent);
+		expect(items).toEqual(['attempt-2 — running', 'attempt-1 — failed']);
 	});
 });
 

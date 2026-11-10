@@ -37,6 +37,7 @@ const QUEUED_PHASE_LABELS: Record<QueuedPhaseHint, string> = {
 	'respond-to-review': 'Respond to review',
 	'respond-to-ci': 'Respond to CI',
 	'resolve-conflicts': 'Resolve conflicts',
+	'resolve-problem': 'Resolve problem',
 	'merge-automation': 'Merge automation',
 	'worker-update': 'Worker update',
 	unknown: 'Unknown',

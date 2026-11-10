@@ -509,7 +509,13 @@ export async function claimDispatch(
  * columns they normalize cannot drift apart.
  */
 export interface DispatchResolution {
-	taskId: string;
+	/**
+	 * The task the dispatch works on — `null` for a Resolve problem dispatch (issue
+	 * #1395), which is deliberately never task-keyed: it holds no checkout and is not
+	 * work on its failed run's task, so no task-keyed guard (the in-flight hold, the
+	 * worktree lease gate, item liveness) may see it as that task's attempt.
+	 */
+	taskId: string | null;
 	phase: TriggerPhase;
 	/**
 	 * The pull request this phase acts on, keyed as the PR-scoped hold reads it

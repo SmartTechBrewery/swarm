@@ -65,13 +65,22 @@ export const operatorActions = pgTable(
 		 * here: the row must outlive a revoked or expired token.
 		 */
 		agentTokenId: uuid('agent_token_id'),
+		/**
+		 * The run a run-bound scoped agent credential (issue #1393) was minted for,
+		 * otherwise `null`. A run's guardrails count its calls by this column, not by
+		 * `agent_token_id`, because a deferred run is retried under a freshly minted
+		 * token while its earlier token is deleted (issue #1395). No foreign key, like
+		 * every column here.
+		 */
+		runId: uuid('run_id'),
 		startedAt: timestamp('started_at').defaultNow().notNull(),
 		completedAt: timestamp('completed_at'),
 	},
 	(table) => [
 		index('idx_operator_actions_project_started').on(table.projectId, table.startedAt),
 		index('idx_operator_actions_user_started').on(table.userId, table.startedAt),
-		// The run-bound credential's guardrails (issue #1393) read one token's calls.
 		index('idx_operator_actions_agent_token_tool').on(table.agentTokenId, table.tool, table.target),
+		// The run-bound credential's guardrails (issues #1393, #1395) read one run's calls.
+		index('idx_operator_actions_run_tool').on(table.runId, table.tool, table.target),
 	],
 );

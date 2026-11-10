@@ -115,6 +115,12 @@ export type RunKind = typeof PIPELINE_RUN_KIND | typeof WORKER_UPDATE_RUN_KIND;
 export const WORKER_UPDATE_RUN_PHASE = 'worker-update';
 
 /**
+ * The phase a Resolve problem run records (issue #1395) — a pipeline run, but not
+ * ticket work, so the task-level read models below leave it out by name.
+ */
+export const RESOLVE_PROBLEM_PHASE = 'resolve-problem' satisfies TriggerPhase;
+
+/**
  * How long a worker-update run may stay `running` before the periodic stale sweep
  * ({@link failStaleRunningRuns}) settles it. Written into `timeout_ms` so the
  * settle-of-last-resort that already exists covers this run too, rather than a
@@ -177,6 +183,11 @@ export interface CreateRunInput {
 	reasoning?: string;
 	timeoutMs?: number;
 	jobPayload?: SwarmJob;
+	/**
+	 * The failed run a Resolve problem run is an attempt for (issue #1395) —
+	 * `runs.resolves_run_id`. Set only for that phase.
+	 */
+	resolvesRunId?: string;
 }
 
 /** Insert a `running` row (the default status); returns the new row's id. */
@@ -204,6 +215,7 @@ export async function createRun(input: CreateRunInput): Promise<string> {
 			timeoutMs: input.timeoutMs,
 			jobPayload: input.jobPayload,
 			agentSessionId: id,
+			resolvesRunId: input.resolvesRunId,
 		})
 		.returning({ id: runs.id });
 	return rows[0].id;
@@ -2379,7 +2391,16 @@ export async function listTaskActivitySince(input: {
 	// named by. A maintenance run belongs to no `(repository, task_id)` unit and would
 	// otherwise group under a pair of nulls and be reported as stalled work nobody can
 	// act on.
-	const conditions: SQL[] = [eq(runs.kind, PIPELINE_RUN_KIND), gte(runs.startedAt, input.since)];
+	//
+	// Nor is a Resolve problem run ticket work (issue #1395): it shares the failed
+	// run's `task_id` but neither picks the task up nor stalls it, so counting it
+	// would report a live attempt as the task running, or a failed one as the task
+	// stalled.
+	const conditions: SQL[] = [
+		eq(runs.kind, PIPELINE_RUN_KIND),
+		ne(runs.phase, RESOLVE_PROBLEM_PHASE),
+		gte(runs.startedAt, input.since),
+	];
 	if (input.projectIds) {
 		conditions.push(inArray(runs.projectId, [...input.projectIds]));
 	}
@@ -2622,4 +2643,33 @@ export async function getRunLogsFromDb(
 		.where(eq(runLogs.runId, runId))
 		.limit(1);
 	return rows[0];
+}
+
+/** One Resolve problem attempt on a failed run, as that run's detail lists it. */
+export interface ResolveProblemAttempt {
+	id: string;
+	status: string;
+	error: string | null;
+	startedAt: Date;
+	completedAt: Date | null;
+}
+
+/**
+ * The Resolve problem attempts made on `failedRunId` (`runs.resolves_run_id`, issue
+ * #1395), newest first — what the failed run's detail lists.
+ */
+export async function listResolveProblemAttempts(
+	failedRunId: string,
+): Promise<ResolveProblemAttempt[]> {
+	return getDb()
+		.select({
+			id: runs.id,
+			status: runs.status,
+			error: runs.error,
+			startedAt: runs.startedAt,
+			completedAt: runs.completedAt,
+		})
+		.from(runs)
+		.where(eq(runs.resolvesRunId, failedRunId))
+		.orderBy(desc(runs.startedAt));
 }

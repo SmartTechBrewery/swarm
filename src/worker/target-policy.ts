@@ -23,6 +23,7 @@ import { isReasoningLevel, type ReasoningLevel } from '../harness/models.js';
 import { DEFAULT_IMPLEMENTATION_CLI } from '../pipeline/implementation.js';
 import { DEFAULT_PLANNING_CLI } from '../pipeline/planning.js';
 import { DEFAULT_RESOLVE_CONFLICTS_CLI } from '../pipeline/resolve-conflicts.js';
+import { DEFAULT_RESOLVE_PROBLEM_CLI } from '../pipeline/resolve-problem.js';
 import { DEFAULT_RESPOND_CI_CLI } from '../pipeline/respond-to-ci.js';
 import { DEFAULT_RESPOND_CLI } from '../pipeline/respond-to-review.js';
 import { DEFAULT_REVIEW_CLI } from '../pipeline/review.js';
@@ -42,6 +43,7 @@ export const PHASE_DEFAULT_CLI: Record<TriggerPhase, AgentCli> = {
 	'respond-to-review': DEFAULT_RESPOND_CLI,
 	'respond-to-ci': DEFAULT_RESPOND_CI_CLI,
 	'resolve-conflicts': DEFAULT_RESOLVE_CONFLICTS_CLI,
+	'resolve-problem': DEFAULT_RESOLVE_PROBLEM_CLI,
 };
 
 /**
@@ -69,6 +71,8 @@ export function phaseAgentConfig(
 			return project.agents?.respondToCi ?? {};
 		case 'resolve-conflicts':
 			return project.agents?.resolveConflicts ?? {};
+		case 'resolve-problem':
+			return project.agents?.resolveProblem ?? {};
 	}
 }
 

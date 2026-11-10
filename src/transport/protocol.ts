@@ -107,8 +107,9 @@ export type TaskPhase = z.infer<typeof TaskPhaseSchema>;
  * `supportedPhases` is the second capability axis (issue #467): *which pipeline
  * phases* this daemon can actually execute, not just which CLIs it has. Every
  * daemon runs the same program now (`./connect-entry.ts`, issue #551) and declares
- * `SUPPORTED_DB_FREE_PHASES` (`./assignment-execution.ts`), which since issue #536
- * is all six — but a daemon's *version* is what decides that, and daemons are
+ * `SUPPORTED_DB_FREE_PHASES` (`./assignment-execution.ts`), which is every phase
+ * (the six since issue #536, Resolve problem since issue #1395) — but a daemon's
+ * *version* is what decides that, and daemons are
  * upgraded independently of the control plane, so an older one still declares
  * fewer. Without this the eligibility gate could select a worker for a phase it
  * refuses, failing the dispatch terminally instead of routing it to a capable
@@ -473,6 +474,33 @@ export const TaskAssignmentSchema = z.object({
 	 * own `.env`. The rollout order that follows is in `docs/onboarding-worker.md`.
 	 */
 	operatorCredential: z.string().min(1).optional(),
+	/**
+	 * resolve-problem only (issue #1395): the SWARM operator MCP endpoint and the
+	 * **run-bound** scoped agent token the control plane minted for this run
+	 * (`mintRunBoundAgentToken`, `../identity/agent-access-token-service.ts`).
+	 *
+	 * This is the one per-run credential that reaches a worker, and it is carried
+	 * only for this phase, because the phase's whole job is to call SWARM's own
+	 * recovery tools and the agent runs on the worker. It is safe to carry for the
+	 * same reasons a session cookie is not: it is short-lived (the phase timeout
+	 * plus ten minutes), bound to this one run and its project, capped in how many
+	 * real writes it may make, recovery-only (it opens `/operator/mcp` and nothing
+	 * else), and revoked the moment the run settles. It never reaches argv or a log
+	 * on the worker (`../harness/agent-cli.ts` hands it to the CLI through a 0600
+	 * file or a child-only env var).
+	 *
+	 * `url` is absent when the control plane has no public base URL configured; the
+	 * worker then addresses the endpoint on its own `SWARM_CONTROL_PLANE_URL`, which
+	 * by construction reaches the same control plane. Optional and additive, so the
+	 * protocol version is not bumped: an older worker does not run this phase at all
+	 * (it is not in its declared `supportedPhases`).
+	 */
+	swarmMcp: z
+		.object({
+			url: z.string().url().optional(),
+			token: z.string().min(1),
+		})
+		.optional(),
 });
 export type TaskAssignment = z.infer<typeof TaskAssignmentSchema>;
 
@@ -969,6 +997,19 @@ export const TaskExecutionResultSchema = z.object({
 			z.object({ status: z.literal('head-moved'), message: z.string() }),
 			z.object({ status: z.literal('conflict'), message: z.string() }),
 		])
+		.optional(),
+	// `succeeded` — the report a Resolve problem run's agent handed back (issue
+	// #1395): whether it got the pipeline moving, the bug report it filed and every
+	// real write it made. The control plane — the side with the database — checks it
+	// against the bug report and settles the run on it (`../dispatch/resolve-problem.ts`).
+	// Declared here rather than imported, like `mergeCatchUp`. Optional and additive.
+	resolveProblem: z
+		.object({
+			outcome: z.enum(['resolved', 'unresolved']),
+			bugReportId: z.string().min(1),
+			actions: z.array(z.object({ tool: z.string(), target: z.string(), result: z.string() })),
+			summary: z.string(),
+		})
 		.optional(),
 });
 export type TaskExecutionResult = z.infer<typeof TaskExecutionResultSchema>;

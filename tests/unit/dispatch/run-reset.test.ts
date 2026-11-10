@@ -159,6 +159,7 @@ function makeRun(overrides: Partial<RunRow> = {}): RunRow {
 		recovery: { state: 'blocked', blockedReason: 'live-leased' },
 		cancellation: null,
 		resetStartedAt: null,
+		resolvesRunId: null,
 		checkpoint: null,
 		continuationCount: 0,
 		continuationProgressCount: 0,

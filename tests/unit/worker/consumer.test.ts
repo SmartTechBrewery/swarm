@@ -643,6 +643,20 @@ vi.mock('@/db/repositories/runsRepository.js', () => ({
 		run.kind === 'pipeline' && run.repository !== null && run.taskId !== null,
 }));
 
+// Issue #1395 — the Resolve problem settle's two database reads, mocked at the module
+// boundary: the occurrence its run must have filed, and the run-bound token revoke.
+const findOccurrenceFiledByRun = vi.fn(
+	async (_runId: string): Promise<{ id: string; reportId: string } | undefined> => undefined,
+);
+vi.mock('@/db/repositories/bugReportsRepository.js', () => ({
+	findOccurrenceFiledByRun: (runId: string) => findOccurrenceFiledByRun(runId),
+}));
+const revokeRunBoundAgentTokens = vi.fn(async (_runId: string) => 1);
+vi.mock('@/identity/agent-access-token-service.js', () => ({
+	mintRunBoundAgentToken: async () => ({ token: 'minted' }),
+	revokeRunBoundAgentTokens: (runId: string) => revokeRunBoundAgentTokens(runId),
+}));
+
 // Issue #1257 — the operator notice a blocking terminal failure sends, mocked at the
 // module boundary; what it sends is covered by `failure-notification.test.ts`.
 const notifyBlockingFailure = vi.fn(async (_failure: unknown) => {});
@@ -10567,6 +10581,167 @@ describe('processJob', () => {
 
 			expect(outcome.status).toBe('phase-failed');
 			expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+		});
+	});
+
+	describe('a Resolve problem dispatch (issue #1395)', () => {
+		const FAILED_RUN_ID = '33333333-3333-4333-8333-333333333333';
+		const RESOLVE_PROJECT = createMockProjectConfig({
+			scm: 'github',
+			pipeline: { resolveProblem: { enabled: true } },
+		});
+		const RESOLVE_JOB = {
+			type: 'resolve-problem' as const,
+			projectId: RESOLVE_PROJECT.id,
+			failedRunId: FAILED_RUN_ID,
+		};
+		const REPORT = {
+			outcome: 'resolved' as const,
+			bugReportId: 'report-1',
+			actions: [{ tool: 'run_reset', target: FAILED_RUN_ID, result: 'restarted' }],
+			summary: 'A reset restarted the phase.',
+		};
+
+		beforeEach(() => {
+			projectLookup = () => RESOLVE_PROJECT;
+			getRunByIdFromDb.mockImplementation(async (id: string) =>
+				id === FAILED_RUN_ID
+					? ({
+							id: FAILED_RUN_ID,
+							projectId: RESOLVE_PROJECT.id,
+							phase: 'implementation',
+							status: 'failed',
+							taskId: '17',
+							prNumber: null,
+							workItemId: 'PVTI_card',
+							error: 'boom',
+							failureDiagnosis: null,
+						} as never)
+					: undefined,
+			);
+			findOccurrenceFiledByRun.mockReset().mockResolvedValue({ id: 'occ-1', reportId: 'report-1' });
+			revokeRunBoundAgentTokens.mockClear();
+			phaseImpl = async () => ({ agent: agentResult(), resolveProblem: REPORT });
+		});
+
+		afterEach(() => {
+			getRunByIdFromDb.mockReset().mockResolvedValue(undefined);
+			// `holdTaskOnce` below is never consumed — that is the point — so drop it.
+			findExecutingDispatchForTask.mockReset().mockResolvedValue(undefined);
+		});
+
+		it('runs as a separate run linked to the failed run, taking no WIP slot and no task claim', async () => {
+			// Another phase of the same task is executing: a task-keyed dispatch would wait.
+			holdTaskOnce();
+
+			const outcome = await processJob(RESOLVE_JOB, registryReturning(null));
+
+			expect(outcome).toMatchObject({ status: 'phase-succeeded', phase: 'resolve-problem' });
+			expect(phaseCalls.map((call) => call.phase)).toEqual(['resolve-problem']);
+			expect(reserveWipSlot).not.toHaveBeenCalled();
+			expect(resolvedTarget()).toMatchObject({
+				phase: 'resolve-problem',
+				taskId: '17',
+				resolvesRunId: FAILED_RUN_ID,
+				workItemId: 'PVTI_card',
+				prNumber: undefined,
+			});
+			// Never task-keyed: the dispatch records no task for the task-level guards.
+			expect(markDispatchRunning.mock.calls.at(-1)?.[3]).toMatchObject({
+				taskId: null,
+				phase: 'resolve-problem',
+			});
+			expect(promoteTaskInFlightWaits).not.toHaveBeenCalled();
+			expect(revokeRunBoundAgentTokens).toHaveBeenCalledWith('run-1');
+			expect(completeDispatch).toHaveBeenCalledWith('dispatch-1', 'phase-succeeded');
+		});
+
+		it('fails an unresolved attempt with its summary, comments on the card and revokes the token', async () => {
+			phaseImpl = async () => ({
+				agent: agentResult(),
+				resolveProblem: { ...REPORT, outcome: 'unresolved', summary: 'The review cap stopped it.' },
+			});
+
+			const outcome = await processJob(RESOLVE_JOB, registryReturning(null));
+
+			expect(outcome).toMatchObject({ status: 'phase-failed', phase: 'resolve-problem' });
+			if (outcome.status !== 'phase-failed') throw new Error('expected failed');
+			expect(outcome.error).toContain('The review cap stopped it.');
+			expect(outcome.error).toContain('run_reset on');
+			expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+			expect(addComment).toHaveBeenCalledWith(
+				'PVTI_card',
+				expect.stringContaining('Resolve problem'),
+			);
+			expect(revokeRunBoundAgentTokens).toHaveBeenCalledWith('run-1');
+		});
+
+		it('fails an attempt that filed no bug report', async () => {
+			findOccurrenceFiledByRun.mockResolvedValue(undefined);
+
+			const outcome = await processJob(RESOLVE_JOB, registryReturning(null));
+
+			expect(outcome).toMatchObject({ status: 'phase-failed' });
+			if (outcome.status !== 'phase-failed') throw new Error('expected failed');
+			expect(outcome.error).toContain('filed no bug report');
+			expect(revokeRunBoundAgentTokens).toHaveBeenCalledWith('run-1');
+		});
+
+		it('fails terminally, revoking the token, when the worker reports an unreachable MCP server', async () => {
+			phaseImpl = async () => {
+				throw new AgentRunError('SWARM operator MCP unreachable: HTTP 401', { kind: 'error' });
+			};
+
+			const outcome = await processJob(RESOLVE_JOB, registryReturning(null));
+
+			expect(outcome).toMatchObject({ status: 'phase-failed' });
+			if (outcome.status !== 'phase-failed') throw new Error('expected failed');
+			expect(outcome.error).toContain('SWARM operator MCP unreachable: HTTP 401');
+			expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+			expect(revokeRunBoundAgentTokens).toHaveBeenCalledWith('run-1');
+		});
+
+		// Review of #1405 (F2): the attempt keeps no session and no checkout, so a deferred
+		// retry must not be pinned to the machine it timed out on.
+		it('defers a timed-out attempt as a fresh, unpinned retry and revokes the token', async () => {
+			phaseImpl = async () => {
+				throw new AgentRunError(
+					'Resolve problem agent (claude) exited with code 143 (timed out)',
+					{ kind: 'timeout' },
+					agentResult({ exitCode: 143, timedOut: true, sessionId: 'sess-resolve' }),
+				);
+			};
+
+			const outcome = await processJob({ ...RESOLVE_JOB, runId: 'run-1' }, registryReturning(null));
+
+			expect(outcome).toMatchObject({
+				status: 'phase-deferred',
+				phase: 'resolve-problem',
+				resumable: false,
+			});
+			if (outcome.status !== 'phase-deferred') throw new Error('expected phase-deferred');
+			expect(outcome.resumeSessionId).toBeUndefined();
+			expect(recordRunPreservedWorker).not.toHaveBeenCalled();
+			const [, input] = scheduleDispatchRetry.mock.calls[0] as [string, Record<string, unknown>];
+			expect(input.jobPayload).toMatchObject({ type: 'resolve-problem', runId: 'run-1' });
+			expect((input.jobPayload as { resumeSession?: boolean }).resumeSession).toBeFalsy();
+			expect(revokeRunBoundAgentTokens).toHaveBeenCalledWith('run-1');
+		});
+
+		it('skips, running nothing, when the failed run is no longer failed', async () => {
+			getRunByIdFromDb.mockResolvedValue({
+				id: FAILED_RUN_ID,
+				projectId: RESOLVE_PROJECT.id,
+				phase: 'implementation',
+				status: 'running',
+				taskId: '17',
+			} as never);
+
+			const outcome = await processJob(RESOLVE_JOB, registryReturning(null));
+
+			expect(outcome).toMatchObject({ status: 'skipped-not-eligible', phase: 'resolve-problem' });
+			expect(phaseCalls).toEqual([]);
+			expect(completeDispatch).toHaveBeenCalledWith('dispatch-1', 'skipped-not-eligible');
 		});
 	});
 });
