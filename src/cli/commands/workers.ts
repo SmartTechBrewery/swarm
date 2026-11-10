@@ -20,8 +20,9 @@
  *
  * That re-pointing **narrows four things deliberately**, because the tRPC layer
  * enforces ownership the direct-DB CLI never did (see `docs/cli.md`):
- * `set-scm-credential` and `remove` are strictly owner-only — so sign in as the
- * worker's owner — `remove` refuses a machine that is running a job, `list`
+ * `set-scm-credential` is strictly owner-only — so sign in as the worker's owner —
+ * `remove` is the owner's or an installation admin's (issue #1413) and refuses a
+ * machine that is running a job, `list`
  * is an installation-wide read unless it names the signed-in operator's own
  * handle, which is served by `workers.listMine` instead, and `consent` and
  * `update-enrollment` are strictly the machine owner's too (sharing consent and
@@ -353,8 +354,9 @@ Usage:
              the account it resolved to is named back. Takes effect on the next
              dispatch — no worker restart. The machine's owner alone may do it,
              so sign in as them.
-  remove     Deregister a worker by worker id. The machine's owner alone may do
-             it, and it is refused while that machine is running a job.
+  remove     Deregister a worker by worker id. The machine's owner or an
+             installation administrator may do it, and it is refused while that
+             machine is running a job.
   drain      Take a machine OUT of the dispatch pool so it can be restarted: it
              is given no new work from the next dispatch on, while whatever it is
              already running is left alone. Work that would have gone there is
