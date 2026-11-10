@@ -5,7 +5,8 @@ A SWARM control plane serves an [MCP](https://modelcontextprotocol.io) server at
 reads the pipeline the way you do in the dashboard: which runs failed, why, and
 what the agent printed. It is the same data `swarm run list|show|logs` reads, as
 tools a model can call. A few [write tools](#write-tools) act on the pipeline too,
-each with a mandatory reason, a dry run and an audit record.
+each with a mandatory reason, a dry run and an audit record. The [bug-report
+tools](#bug-reports) keep SWARM's own record of problems seen in SWARM itself.
 
 **Any signed-in user can connect.** Which tools you are shown, and may call,
 depends on your highest role: see [Who may use each tool](#who-may-use-each-tool).
@@ -96,7 +97,8 @@ access. A request made with it acts as you, limited in three ways:
   administrator. A cross-project read such as `runs_list` without a `projectId`
   covers its projects only. The installation-wide forms of `workers_state`,
   `cli_rate_limits` and `control_plane_logs` (no `projectId`) are `FORBIDDEN`.
-- **It sees and calls only the read tools and five recovery tools.** `tools/list`
+- **It sees and calls only the read tools, five recovery tools and two
+  bug-report tools.** `tools/list`
   shows nothing else, and a call to any other tool is refused with `FORBIDDEN:
   Tool "<name>" is not available to a scoped agent credential.` A refused write
   tool still writes its `operator_actions` row, with outcome `refused`.
@@ -106,9 +108,10 @@ access. A request made with it acts as you, limited in three ways:
 
 | Tools | Available to a scoped agent credential |
 | --- | --- |
-| Every read tool: `runs_list`, `run_get`, `pipeline_snapshot`, `dispatch_history`, `pr_status`, `pipeline_stats`, `phase_agents_get`, `consistency_check`, `project_get`, `workers_state`, `cli_rate_limits`, `control_plane_logs`, `pm_board_discover`, `project_readiness` | Yes, for its projects only |
+| Every read tool: `runs_list`, `run_get`, `pipeline_snapshot`, `dispatch_history`, `pr_status`, `pipeline_stats`, `phase_agents_get`, `consistency_check`, `project_get`, `workers_state`, `cli_rate_limits`, `control_plane_logs`, `pm_board_discover`, `project_readiness`, `bug_reports_list`, `bug_report_get` | Yes, for its projects only |
 | `run_reset`, `dispatch_redispatch_now`, `pr_force_re_review`, `pr_recheck_mergeability`, `dependency_waits_wake` | Yes, for its projects only: each recovers a stuck run or pull request and changes no configuration |
-| `project_create`, `project_update`, `pm_board_set`, `project_credential_set`, `work_item_close`, `phase_agents_reorder`, `phase_agents_restore`, `cli_rate_limit_set` | No |
+| `bug_report_create`, `bug_report_add_occurrence` | Yes, for its projects only: an agent records every problem it diagnoses. Installation-wide reports stay out of its reach |
+| `project_create`, `project_update`, `pm_board_set`, `project_credential_set`, `work_item_close`, `phase_agents_reorder`, `phase_agents_restore`, `cli_rate_limit_set`, `bug_report_set_status` | No |
 
 Inside its projects, the credential has the role you hold there: an installation
 administrator's credential acts as `projectAdmin` of each of them. A role you hold
@@ -147,7 +150,7 @@ token's `projectIds`.
 **Revoke** on the token's row (the one with its **Scoped:** badge) and confirm
 with **Revoke token**, or call `agentAccessTokens.revoke`. Revoking it leaves your
 other tokens working. It expires 30 days after it is issued. Neither its projects nor its tools are settings: the
-recovery tools are the `SCOPED_AGENT_RECOVERY_TOOLS` constant
+recovery and bug-report write tools are the `SCOPED_AGENT_RECOVERY_TOOLS` constant
 (`src/identity/agent-access-token.ts`).
 
 ## Connecting a client
@@ -203,11 +206,12 @@ dashboard, including run logs and agent output, and it can reset and re-dispatch
 runs, force re-reviews, schedule conflict checks, wake dependency waits and close
 the work item behind a merged pull request in every project where you hold
 `member`, and reorder phase agents in every project you administer. It can also
-create projects, and change the configuration and credentials of every project
-you administer. A [scoped agent credential](#scoped-agent-credentials) can do
-less: it reads its own projects, including their run logs and agent output, and
-can reset and re-dispatch runs, force re-reviews, schedule conflict checks and
-wake dependency waits there, and nothing else. Treat it like a password too.
+file and triage bug reports, create projects, and change the configuration and
+credentials of every project you administer. A [scoped agent
+credential](#scoped-agent-credentials) can do less: it reads its own projects,
+including their run logs, agent output and bug reports, and can reset and
+re-dispatch runs, force re-reviews, schedule conflict checks, wake dependency
+waits and file bug reports there, and nothing else. Treat it like a password too.
 
 ### Using the `swarm login` session instead
 
@@ -258,11 +262,13 @@ reads as *not found*. Scope means what a call can reach:
 
 | Tool | Required role | Scope |
 | --- | --- | --- |
-| `runs_list` | `contributor` | Your projects |
+| `runs_list`, `bug_reports_list` | `contributor` | Your projects (plus installation-wide bug reports, for an instance administrator) |
+| `bug_report_get` | `contributor` | One project, or an installation-wide report (instance administrators only) |
 | `run_get`, `pipeline_snapshot`, `dispatch_history`, `pr_status`, `pipeline_stats`, `phase_agents_get`, `consistency_check`, `project_get` | `contributor` | One project |
 | `workers_state`, `cli_rate_limits`, `control_plane_logs` | `contributor` | One project, or the installation |
 | `pm_board_discover`, `project_readiness` | `projectAdmin` | One project |
 | `run_reset`, `dispatch_redispatch_now`, `pr_force_re_review`, `pr_recheck_mergeability`, `dependency_waits_wake`, `work_item_close` | `member` | One project |
+| `bug_report_create`, `bug_report_add_occurrence`, `bug_report_set_status` | `member` | One project, or the installation |
 | `phase_agents_reorder`, `phase_agents_restore`, `project_update`, `pm_board_set`, `project_credential_set` | `projectAdmin` | One project |
 | `cli_rate_limit_set` | signed in | The worker's owner |
 | `project_create` | signed in | None: like the New Project dialog, it is open to every signed-in user, and you become the new project's `projectAdmin` |
@@ -298,6 +304,8 @@ wording the dashboard shows.
 | `project_get` | One project's whole configuration (`projects.getById`) plus, under `credentials`, each SCM and PM credential role with whether it is configured (`projects.credentials.list` and `listPm`), as `{ project, credentials: { scm, pm } }`. The record holds credential *references* (store key names), never values, and the credential lists say only `isConfigured` and a fixed `****` / `not set` marker | `projectId` |
 | `pm_board_discover` | The Project Management tab's board discovery (`pm.discoverContainers` / `pm.discoverStates`), run on the server with the project's own board credential. Without `containerId`: `{ providers, containers }`, the registered PM providers and the boards the credential can see. With one: `{ containerId, states, providerContext, statusKeys }`, that board's states (each `{ id, name }`), the provider's extra mapping scope (GitHub Projects returns `{ statusFieldId }`) and SWARM's six status keys to map them to | `projectId`, `providerId?` (defaults to the project's provider), `containerId?`, `discoveryDraft?` (Jira: `{ "baseUrl": "https://<site>.atlassian.net" }`) |
 | `project_readiness` | Whether the project can run, and what is missing (`projects.readiness`), as `{ projectId, ready, checkedAt, items }` — see [What `project_readiness` checks](#what-project_readiness-checks) | `projectId` |
+| `bug_reports_list` | [Bug reports](#bug-reports), most recently seen first (`bugReports.list`), as `{ data, total }`. Each row carries `id`, `title`, `description`, `status`, `projectId` (`null` for an installation-wide report), `duplicateOfId`, `githubIssueUrl`, `occurrenceCount`, `firstSeenAt`/`lastSeenAt`, `statusChangedAt`, and who filed it (`filedByUserId`, `filedByUserIdentifier`, `filedByRunId`). Covers every project you can read, plus installation-wide reports for an instance administrator | `projectId?`, `status?` — one status or an array, default the open ones (`new`, `confirmed`, `environmental`, `ticketed`), `query?` (case-insensitive text in the title or description), `limit` (≤ 200, default 50), `offset` (default 0) |
+| `bug_report_get` | One bug report with its newest occurrences (`bugReports.get`), as `{ report, occurrences, duplicateOf }`. Each occurrence has `runId`, `dispatchId`, `prNumber`, `taskId`, `repository`, `note`, who recorded it and `observedAt`. `duplicateOf` is `{ id, title, status }` of the report a `duplicate` points at, or `null` when there is none or you cannot read it | `reportId`, `occurrenceLimit` (≤ 200, default 50) |
 
 Page through a long agent output by passing the `output.nextCursor` of one call as
 `outputAfter` of the next while `output.hasMore` is `true`.
@@ -410,6 +418,9 @@ the same way:
 | `project_create` | Creates a project as the New Project dialog does (`projects.create`), with the same validation: each repository's coordinates are checked against the SCM provider (two segments, three on Azure DevOps), a reviewer credential is required — the `reviewerToken` given, or the installation's default from General Settings → Credentials — and a duplicate project id or a repository another project owns is refused with `CONFLICT` (`A project with ID "<id>" already exists.` / `Repository '<repo>' already belongs to another project.`; the owning project is not named). You become the project's `projectAdmin`. The board starts on a placeholder mapping, so the project cannot run until `pm_board_set`. Returns the created record. The dry run (`projects.previewCreate`, which receives only whether a `reviewerToken` was given, never its value) returns `{ project, creator, seededCredentials, pmPlaceholder, wouldRefuse }`: the record it would write, you as `projectAdmin`, which credentials it would seed (`providerId`, `role`, and `source`: `request` or `instanceDefault`, never the value), and the refusal it would answer with | `id`, `name`, `repositories`, `repoRoot`, `scm?` (default `github`), `visibility?` (default `private`), `worktreeRoot?`, `agents?`, `pipeline?`, `worktreeRetention?`, `reviewerToken?` (**secret**), `reason`, `dryRun` (default `false`) |
 | `project_update` | Changes a project's configuration as the Repositories, Agents and Pipeline tabs do (`projects.update`), through the same rules. Each field you give replaces the stored one — `repositories` and `agents` are whole lists, so read them with `project_get` first — except `pipeline`, which is merged as a patch (`maxContinuations: null` clears the budget). Repository coordinates are checked against the SCM provider, and a repository another project owns is refused with `CONFLICT`. Returns the updated record. The dry run (`projects.previewUpdate`) returns `{ before, after, changedFields, wouldRefuse }` | `projectId`, `name?`, `repositories?`, `scm?`, `repoRoot?`, `worktreeRoot?`, `visibility?`, `agents?`, `pipeline?`, `worktreeRetention?`, `reason`, `dryRun` (default `false`) |
 | `pm_board_set` | Saves the project's board and status mapping as the Project Management tab's Save does (`projects.update` with `pm`), replacing the placeholder. `pm` is one whole member: `github-projects` `{ projectId, statusFieldId, statusOptions }`, `linear` `{ teamId, statusOptions }`, `jira` `{ baseUrl, projectKey, statusOptions, repositoryField? }` or `trello` `{ boardId, statusOptions }`, with ids from `pm_board_discover`. `statusOptions` maps `backlog`, `planning`, `todo` (Ready), `inProgress`, `inReview` and `done` to state ids; the schema needs one, `project_readiness` wants all six. Moving to another PM provider is refused with `BAD_REQUEST` until that provider's required credentials are stored. The dry run is `projects.previewUpdate`, as above | `projectId`, `pm`, `reason`, `dryRun` (default `false`) |
+| `bug_report_create` | Files a [bug report](#bug-reports) with its first occurrence (`bugReports.create`). Search with `bug_reports_list` first, and add an occurrence to an existing report rather than filing a duplicate. The report belongs to `projectId`; without it, to `runId`'s project; with neither, it is installation-wide, which only an instance administrator may file (`FORBIDDEN` otherwise). A `runId` from another project than `projectId` is refused as `BAD_REQUEST`. A `runId` or `filedByRunId` you cannot read is `NOT_FOUND`. You are recorded as the filer. Returns `{ report, occurrence }`. The dry run (`bugReports.previewCreate`) returns `{ projectId, report, occurrence }`: the rows it would write | `title`, `description`, `projectId?`, `status?` (`new`, the default, `confirmed` or `environmental`), `runId?`, `dispatchId?`, `prNumber?`, `taskId?`, `repository?`, `note?`, `filedByRunId?` (the agent run filing it), `reason`, `dryRun` (default `false`) |
+| `bug_report_add_occurrence` | Records that a reported problem was seen again (`bugReports.addOccurrence`): one occurrence row, and the report's `occurrenceCount` and `lastSeenAt` move with it in the same transaction. A `runId` must be a run of the report's own project (`BAD_REQUEST` otherwise); an installation-wide report takes any run you can read. A closed or `duplicate` report still accepts it. Returns `{ report, occurrence }`. The dry run (`bugReports.previewAddOccurrence`) returns `{ projectId, report: { id, title, status }, occurrenceCount: { from, to }, occurrence }`, plus `warning: 'report is <status>'` for a closed report and, for a duplicate, its `duplicateOfId`, so you can add to the original instead. Nothing is rerouted for you | `reportId`, `runId?`, `dispatchId?`, `prNumber?`, `taskId?`, `repository?`, `note?`, `filedByRunId?`, `reason`, `dryRun` (default `false`) |
+| `bug_report_set_status` | Triages a bug report (`bugReports.setStatus`): sets its status, the report it duplicates and its issue link, by the [status rules](#bug-reports). Returns the updated report. The dry run (`bugReports.previewSetStatus`) returns `{ projectId, change: { from, to }, githubIssueUrl: { from, to }, duplicateOfId: { from, to } }` | `reportId`, `status`, `duplicateOfId?`, `githubIssueUrl?` (https), `reason`, `dryRun` (default `false`) |
 | `project_credential_set` | **Destructive** (it replaces a stored secret). Stores one credential as the Source Control and Project Management tabs do: `side: 'scm'` (`projects.credentials.set`) for `reviewer` or `webhookSecret`, `side: 'pm'` (`projects.credentials.setPm`) for a role the PM provider declares — `apiToken` for GitHub Projects, `apiKey`/`webhookSecret` for Linear, `email`/`apiToken`/`webhookSecret` for Jira, `apiKey`/`token`/`webhookSecret` for Trello. The value is stored encrypted, is never returned by any tool, and is audited as `[redacted]`. GitHub Projects' `webhookSecret` is the repository's webhook secret, so it is refused on side `pm`: set it on side `scm`. Returns `{ projectId, side, role, stored: true }`. The dry run (`projects.credentials.previewSet` / `previewSetPm`) returns `{ side, providerId, role, label, referenceKey, isConfigured, change }`, where `change` is `set` or `replace` | `projectId`, `side` (`scm` or `pm`), `providerId?` (defaults to the project's provider; name another to enter its credentials before switching to it), `role`, `value` (**secret**), `reason`, `dryRun` (default `false`) |
 
 `run_reset`, `dispatch_redispatch_now`, `pr_force_re_review` and
@@ -470,6 +481,65 @@ audit row names no project.
 `project_update`, `pm_board_set` and `project_credential_set` need `projectAdmin`,
 the role that edits configuration and credentials in the dashboard, and so do their
 dry runs. A member or contributor gets `FORBIDDEN`, anyone else `NOT_FOUND`.
+
+## Bug reports
+
+SWARM keeps its own record of problems seen in SWARM, or in what it runs on: the
+`bug_reports` and `bug_report_occurrences` tables, read and written through the
+`bugReports` tRPC procedures and the five `bug_report*` tools. A **report** has a
+title, a description, the project it was observed in (none for an
+installation-wide report), a status, the report it duplicates, the link to the
+issue it became, and who filed it: the user, and the agent run when an agent
+filed it. Each **occurrence** is one time the problem was observed: the run,
+dispatch, pull request, task and repository it was seen on, a note, who recorded
+it and when. Filing a report records its first occurrence, so `occurrenceCount`
+always equals the occurrence rows, and `firstSeenAt`/`lastSeenAt` are the first
+and latest of them.
+
+| Status | Meaning | Open |
+| --- | --- | --- |
+| `new` | Filed, not yet looked at | Yes |
+| `confirmed` | Reproduced or otherwise confirmed as a defect in SWARM | Yes |
+| `environmental` | The cause lies outside SWARM (network, CLI quota, Docker, a machine); potentially not actionable | Yes |
+| `ticketed` | Turned into a GitHub issue, linked by `githubIssueUrl` | Yes |
+| `duplicate` | The same problem as another report, named by `duplicateOfId` | No |
+| `resolved` | Fixed | No |
+| `dismissed` | Not a defect, or not worth acting on | No |
+
+A report is filed as `new`, `confirmed` or `environmental`. The rest are reached
+with `bug_report_set_status`, which applies these rules and refuses anything else
+as `BAD_REQUEST`:
+
+- `duplicate` needs `duplicateOfId`: another report, not this one, that you can
+  read (`NOT_FOUND` otherwise). Any other status clears it, and naming one with
+  any other status is refused.
+- `ticketed` needs `githubIssueUrl`, an `https:` link, unless the report already
+  has one. A link given with any other status is stored too, and a stored link is
+  kept through `resolved`.
+- Setting the status a report already has, with nothing else changed, is refused,
+  so the audit trail never records a change that changed nothing.
+
+**Search before you file.** Call `bug_reports_list` with a `query` first. When the
+problem is already reported, call `bug_report_add_occurrence` on that report
+instead of filing a second one. SWARM does not de-duplicate on its own.
+
+**Ticketing happens outside SWARM.** SWARM does not open issues from reports.
+File the issue yourself, or have an agent file it, then record it:
+
+```text
+bug_report_set_status { reportId: "…", status: "ticketed",
+  githubIssueUrl: "https://github.com/acme/swarm/issues/1400", reason: "Filed upstream" }
+```
+
+**Who may do what.** A report with a project is that project's: a `contributor`
+reads it, and a `member` files, adds occurrences and triages, as for the run
+write tools. Anyone else reads it as `NOT_FOUND`. An installation-wide report is
+an instance administrator's alone, and reads as `NOT_FOUND` to everyone else. A
+[scoped agent credential](#scoped-agent-credentials) may list and read reports,
+file them and add occurrences in its own projects, but not triage them, and never
+reaches an installation-wide report. Every write is audited in `operator_actions`
+like any other write tool. Reports and occurrences cannot be edited or deleted
+through MCP.
 
 ## Setting up a project
 
@@ -631,8 +701,12 @@ and `dryRun` and writes the `operator_actions` row
 `src/mcp/tools/work-items.ts`, `cli_rate_limit_set` in
 `src/mcp/tools/cli-rate-limit-set.ts`, the phase-agent order tools in
 `src/mcp/tools/phase-agents.ts` (their pure permutation rules in
-`src/mcp/agent-order.ts`), and the project set-up tools in
-`src/mcp/tools/project-setup.ts`. A `preview` may return a `detail`, which the
+`src/mcp/agent-order.ts`), the project set-up tools in
+`src/mcp/tools/project-setup.ts`, and the bug-report tools in
+`src/mcp/tools/bug-reports.ts` (the `bugReports` router in
+`src/api/routers/bugReports.ts`, its statuses, input schemas and status rules in
+`src/api/bug-reports.ts`, and the store in
+`src/db/repositories/bugReportsRepository.ts`). A `preview` may return a `detail`, which the
 framework records on the row when the call settles, and `apply` is handed the
 preview it was authorized by, so it writes exactly what the row records. A write
 tool that accepts a secret names that argument in `secretInputs`, and the

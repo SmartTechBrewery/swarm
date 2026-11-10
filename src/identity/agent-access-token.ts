@@ -92,9 +92,10 @@ export type IssueAgentAccessTokenInput = z.infer<typeof IssueAgentAccessTokenInp
 
 /**
  * The **write tools** a scoped agent credential may call (issue #1385) — on top of
- * every read tool, and nothing else. Each one recovers a stuck pipeline inside a
- * project the credential is limited to, is audited, and changes no configuration,
- * credential, board or work item:
+ * every read tool, and nothing else. Each one acts only inside a project the
+ * credential is limited to, is audited, and changes no configuration, credential,
+ * board or work item. Five recover a stuck pipeline, and two record what the agent
+ * found:
  *
  *  - `run_reset` — resets a wedged run and re-dispatches its phase from scratch,
  *    as the dashboard's "Reset & restart" does; it touches that run alone.
@@ -106,12 +107,17 @@ export type IssueAgentAccessTokenInput = z.infer<typeof IssueAgentAccessTokenInp
  *    resolve-conflicts fan-out would have scheduled.
  *  - `dependency_waits_wake` — re-checks the dependency gate now; a dependent still
  *    blocked simply waits again.
+ *  - `bug_report_create` and `bug_report_add_occurrence` (issue #1383) — file a bug
+ *    report about SWARM, or record that a reported one happened again. An agent
+ *    diagnosing a stuck pipeline (the planned *Resolve problem* phase, #1384) files
+ *    one for every diagnosis it makes; it touches nothing but the report store, and
+ *    an installation-wide report stays out of a scoped credential's reach.
  *
  * Everything else that writes — project creation and configuration, credentials,
  * the board mapping, closing a work item, the phase agents, a worker's CLI rate
- * limit — stays the holder's own, through their own session. A constant, like
- * {@link AGENT_ACCESS_TOKEN_VALIDITY_DAYS}; `src/mcp/tool-access.ts` marks the same
- * five `agentScoped`, and its test keeps the two in step.
+ * limit, triaging a bug report — stays the holder's own, through their own session.
+ * A constant, like {@link AGENT_ACCESS_TOKEN_VALIDITY_DAYS}; `src/mcp/tool-access.ts`
+ * marks the same seven `agentScoped`, and its test keeps the two in step.
  */
 export const SCOPED_AGENT_RECOVERY_TOOLS = [
 	'run_reset',
@@ -119,6 +125,8 @@ export const SCOPED_AGENT_RECOVERY_TOOLS = [
 	'pr_force_re_review',
 	'pr_recheck_mergeability',
 	'dependency_waits_wake',
+	'bug_report_create',
+	'bug_report_add_occurrence',
 ] as const;
 
 /**

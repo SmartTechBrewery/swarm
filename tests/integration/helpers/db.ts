@@ -94,6 +94,8 @@ export async function truncateAll(): Promise<void> {
 			review_verdicts,
 			stalled_dismissals,
 			operator_actions,
+			bug_report_occurrences,
+			bug_reports,
 			wip_slots,
 			project_membership_requests,
 			project_members,

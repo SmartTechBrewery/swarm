@@ -612,6 +612,9 @@ describe('operator MCP — the handshake', () => {
 		};
 		const tools = listBody.result.tools;
 		const WRITE_TOOLS = [
+			'bug_report_add_occurrence',
+			'bug_report_create',
+			'bug_report_set_status',
 			'cli_rate_limit_set',
 			'dependency_waits_wake',
 			'dispatch_redispatch_now',
@@ -628,6 +631,11 @@ describe('operator MCP — the handshake', () => {
 		];
 
 		expect(tools.map((tool) => tool.name).sort()).toEqual([
+			'bug_report_add_occurrence',
+			'bug_report_create',
+			'bug_report_get',
+			'bug_report_set_status',
+			'bug_reports_list',
 			'cli_rate_limit_set',
 			'cli_rate_limits',
 			'consistency_check',
@@ -680,6 +688,8 @@ async function listedTools(token: string): Promise<string[]> {
 
 const ALL_TOOLS = Object.keys(TOOL_ACCESS).sort();
 const CONTRIBUTOR_TOOLS = [
+	'bug_report_get',
+	'bug_reports_list',
 	'cli_rate_limit_set',
 	'cli_rate_limits',
 	'consistency_check',
@@ -697,6 +707,9 @@ const CONTRIBUTOR_TOOLS = [
 ];
 const MEMBER_TOOLS = [
 	...CONTRIBUTOR_TOOLS,
+	'bug_report_add_occurrence',
+	'bug_report_create',
+	'bug_report_set_status',
 	'dependency_waits_wake',
 	'dispatch_redispatch_now',
 	'pr_force_re_review',
@@ -752,6 +765,10 @@ describe('operator MCP — per-tool roles (issue #1382)', () => {
 
 /** Every tool a scoped agent credential is shown: the read tools plus the recovery allowlist. */
 const SCOPED_AGENT_TOOLS = [
+	'bug_report_add_occurrence',
+	'bug_report_create',
+	'bug_report_get',
+	'bug_reports_list',
 	'cli_rate_limits',
 	'consistency_check',
 	'control_plane_logs',
@@ -774,7 +791,7 @@ const SCOPED_AGENT_TOOLS = [
 ];
 
 describe('operator MCP — a scoped agent credential (issue #1385)', () => {
-	it('is shown exactly the read tools and the five recovery tools', async () => {
+	it('is shown exactly the read tools and the seven allowlisted write tools', async () => {
 		expect(await listedTools('scoped-agent-token')).toEqual(SCOPED_AGENT_TOOLS);
 	});
 
