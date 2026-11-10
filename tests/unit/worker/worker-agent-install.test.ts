@@ -457,6 +457,112 @@ describe('swarm-worker-agent install', () => {
 				expect(args[0]).toMatch(/node$/);
 			});
 
+			describe('the Login Items association with its app bundle (issue #1409)', () => {
+				const url = 'https://swarm.example.com';
+
+				/** `<home>/<app>/Contents/MacOS/<exe>`, with `infoPlist` as its `Info.plist`. */
+				function bundledExecutable(app: string, infoPlist?: string): string {
+					const contents = join(home, app, 'Contents');
+					mkdirSync(join(contents, 'MacOS'), { recursive: true });
+					if (infoPlist !== undefined) {
+						writeFileSync(join(contents, 'Info.plist'), infoPlist, 'utf8');
+					}
+					const path = join(contents, 'MacOS', 'wrapper');
+					writeFileSync(path, '#!/bin/sh\nexec "$@"\n', { encoding: 'utf8', mode: 0o755 });
+					return path;
+				}
+
+				function infoPlist(bundleId: string): string {
+					return [
+						'<?xml version="1.0" encoding="UTF-8"?>',
+						'<plist version="1.0">',
+						'<dict>',
+						'\t<key>CFBundleIdentifier</key>',
+						`\t<string>${bundleId}</string>`,
+						'</dict>',
+						'</plist>',
+					].join('\n');
+				}
+
+				function associatedBundleIds(plist: string): string[] | undefined {
+					const array = plist.match(
+						/<key>AssociatedBundleIdentifiers<\/key>\n\t<array>\n([\s\S]*?)\t<\/array>/,
+					)?.[1];
+					if (array === undefined) return undefined;
+					return [...array.matchAll(/<string>([^<]*)<\/string>/g)].map((m) => m[1] ?? '');
+				}
+
+				function installProfile(): { result: ReturnType<typeof runAgent>; plist: string } {
+					profile('w-1', url);
+					const result = runAgent(['install', '--profile', 'w-1']);
+					const plist = readFileSync(agentPlist(labelOf('w-1', url, 'swarm-example-com')), 'utf8');
+					return { result, plist };
+				}
+
+				it('names the bundle whose executable the wrapper is, before bootstrapping it', () => {
+					const wrapper = bundledExecutable('Swarm Host.app', infoPlist('com.example.swarm-host'));
+					wrapperFile(wrapper);
+
+					const { result, plist } = installProfile();
+
+					expect(result.status, result.stderr).toBe(0);
+					expect(result.stderr).toBe('');
+					expect(associatedBundleIds(plist)).toEqual(['com.example.swarm-host']);
+					expect(programArguments(plist)[0]).toBe(wrapper);
+					// The plist was complete when launchd first saw it: install bootstraps
+					// once, and only after `write_plist` returned.
+					expect(result.launchctl.filter((call) => call.startsWith('bootstrap'))).toHaveLength(1);
+				});
+
+				it('names it for a clone agent too', () => {
+					wrapperFile(bundledExecutable('Host.app', infoPlist('com.example.host')));
+
+					const result = runAgent(['install', checkout]);
+
+					expect(result.status, result.stderr).toBe(0);
+
+					expect(associatedBundleIds(readFileSync(plistPath(), 'utf8'))).toEqual([
+						'com.example.host',
+					]);
+				});
+
+				it.each([
+					['a wrapper outside any bundle', () => executable('wrapper')],
+					['a bundle with no Info.plist', () => bundledExecutable('Host.app')],
+					[
+						'a bundle whose Info.plist has no CFBundleIdentifier',
+						() =>
+							bundledExecutable(
+								'Host.app',
+								'<plist version="1.0">\n<dict>\n\t<key>CFBundleName</key>\n\t<string>Host</string>\n</dict>\n</plist>',
+							),
+					],
+					[
+						'an identifier that is not a bundle identifier',
+						() => bundledExecutable('Host.app', infoPlist('com.example.&amp;host')),
+					],
+					[
+						'a Contents/MacOS layout outside a .app',
+						() => bundledExecutable('Host.bundle', infoPlist('com.example.host')),
+					],
+				])('writes no association for %s, and no warning', (_case, wrapper) => {
+					wrapperFile(wrapper());
+
+					const { result, plist } = installProfile();
+
+					expect(result.status, result.stderr).toBe(0);
+					expect(result.stderr).toBe('');
+					expect(plist).not.toContain('AssociatedBundleIdentifiers');
+					expect(programArguments(plist)).toHaveLength(5);
+				});
+
+				it('writes no association without a wrapper', () => {
+					const { plist } = installProfile();
+
+					expect(plist).not.toContain('AssociatedBundleIdentifiers');
+				});
+			});
+
 			it('ignores an empty file without a warning', () => {
 				const url = 'https://swarm.example.com';
 				profile('w-1', url);
