@@ -180,16 +180,21 @@ the server enforces on its write tools.
 - **Guardrails.** A real call (`dryRun: false`) to a write tool is refused with
   `FORBIDDEN`, and the refusal is audited with outcome `refused`, before the tool
   does anything, when:
-  1. the token has already made its cap of real calls: `FORBIDDEN: write-action
+  1. the run has already made its cap of real calls: `FORBIDDEN: write-action
      cap of <N> reached for this run`. Every real call that was not refused
      counts, a failed one included;
-  2. the token has no earlier **succeeded** dry run of the same tool on the same
+  2. the run has no earlier **succeeded** dry run of the same tool on the same
      target: `FORBIDDEN: dry run <tool> on <target> first`;
-  3. the token already applied the same tool to the same target, whether that
+  3. the run already applied the same tool to the same target, whether that
      call succeeded, failed or is still in progress: `FORBIDDEN: <tool> was already
      applied to <target> in this run`. A retry or parallel call sent while the
      first is still running is refused too; when two such calls race, both may be
      refused.
+
+  All three count the calls of **every** token minted for the run, not only the
+  current one (`operator_actions.run_id`): a deferred run is retried under a
+  freshly minted token, and its cap, dry runs and applied actions carry over to
+  the retry.
 
   Dry runs are never capped. The target is the one the tool records on its audit
   row, for example the run id for `run_reset`. Ordinary tokens and scoped

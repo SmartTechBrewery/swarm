@@ -10624,6 +10624,33 @@ describe('processJob', () => {
 			expect(revokeRunBoundAgentTokens).toHaveBeenCalledWith('run-1');
 		});
 
+		// Review of #1405 (F2): the attempt keeps no session and no checkout, so a deferred
+		// retry must not be pinned to the machine it timed out on.
+		it('defers a timed-out attempt as a fresh, unpinned retry and revokes the token', async () => {
+			phaseImpl = async () => {
+				throw new AgentRunError(
+					'Resolve problem agent (claude) exited with code 143 (timed out)',
+					{ kind: 'timeout' },
+					agentResult({ exitCode: 143, timedOut: true, sessionId: 'sess-resolve' }),
+				);
+			};
+
+			const outcome = await processJob({ ...RESOLVE_JOB, runId: 'run-1' }, registryReturning(null));
+
+			expect(outcome).toMatchObject({
+				status: 'phase-deferred',
+				phase: 'resolve-problem',
+				resumable: false,
+			});
+			if (outcome.status !== 'phase-deferred') throw new Error('expected phase-deferred');
+			expect(outcome.resumeSessionId).toBeUndefined();
+			expect(recordRunPreservedWorker).not.toHaveBeenCalled();
+			const [, input] = scheduleDispatchRetry.mock.calls[0] as [string, Record<string, unknown>];
+			expect(input.jobPayload).toMatchObject({ type: 'resolve-problem', runId: 'run-1' });
+			expect((input.jobPayload as { resumeSession?: boolean }).resumeSession).toBeFalsy();
+			expect(revokeRunBoundAgentTokens).toHaveBeenCalledWith('run-1');
+		});
+
 		it('skips, running nothing, when the failed run is no longer failed', async () => {
 			getRunByIdFromDb.mockResolvedValue({
 				id: FAILED_RUN_ID,

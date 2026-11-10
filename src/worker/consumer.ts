@@ -1053,8 +1053,13 @@ function deferAgentRunError(
 
 	const retryDelayMs = retryDelayForFailure(failure, Date.now());
 	const carriedContinuation = carriedContinuationFor(failure, job);
+	// A Resolve problem run keeps nothing to resume (issue #1395): it passes no session id
+	// to the CLI and deletes its scratch directory on the way out. Calling it resumable
+	// would pin its retry to this machine (`recordPreservedWorker`) to protect state that
+	// does not exist, and wait for that machine with no budget.
 	const resumable =
 		checkpointFallback === undefined &&
+		trigger.phase !== 'resolve-problem' &&
 		(failure.kind === 'rate-limit' || failure.kind === 'timeout' || failure.kind === 'stalled') &&
 		canResumeSessionOnRetry(agent);
 	logger.warn(deferredPhaseMessage(failure, trigger.phase), {
@@ -1220,6 +1225,9 @@ async function preservedWorkOf(
 	checkpointFallback: CheckpointFallback | undefined,
 	runId: string | undefined,
 ): Promise<PreservedContinuationKind | undefined> {
+	// Resolve problem (issue #1395) has no checkout and resumes no session, so its
+	// agent's own session id preserves nothing a pinned retry could pick up.
+	if (trigger.phase === 'resolve-problem') return undefined;
 	if (checkpointFallback?.kind === 'release') return undefined;
 	if (checkpointFallback) return 'checkpoint';
 	if (err instanceof DeliveryDeferredError) return 'delivery';

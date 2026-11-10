@@ -61,7 +61,7 @@ import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 
 import {
-	countAgentTokenActions,
+	countRunBoundActions,
 	recordOperatorAction,
 	settleOperatorAction,
 } from '../db/repositories/operatorActionsRepository.js';
@@ -215,6 +215,7 @@ export async function runWriteTool<
 			input: auditableInput(input, definition.secretInputs),
 			credentialKind: credential.kind,
 			agentTokenId: credential.kind === 'scoped-agent-token' ? credential.tokenId : null,
+			runId: credential.kind === 'scoped-agent-token' ? (credential.runId ?? null) : null,
 		});
 	} catch (error) {
 		const message = describeError(error);
@@ -279,10 +280,15 @@ export async function runWriteTool<
 /**
  * Throw `FORBIDDEN` when a **real** call made with a run-bound scoped agent
  * credential (issue #1393) breaks one of its run's guardrails, in this order: the
- * token has used up its write cap, it never dry-ran this tool on this target
+ * run has used up its write cap, it never dry-ran this tool on this target
  * successfully, or it already applied this tool to this target. Any other
  * credential passes untouched. `auditId` is the asking call's own, still-pending
  * row, which neither the cap nor the no-repeat read may count.
+ *
+ * Every read is keyed on the credential's **run**, never its token (issue #1395):
+ * a deferred run is retried under a freshly minted token while the earlier one is
+ * deleted, so a per-token count would hand each retry a fresh cap and a clean
+ * no-repeat ledger.
  *
  * Both of those count `pending` real rows as well as settled ones, so a call that
  * races another in flight — an MCP client retrying after its own timeout, two
@@ -299,7 +305,7 @@ async function assertRunGuardrails(
 	auditId: string,
 ): Promise<void> {
 	if (credential.kind !== 'scoped-agent-token' || credential.runId === undefined) return;
-	const agentTokenId = credential.tokenId;
+	const runId = credential.runId;
 	const cap = credential.maxWriteActions ?? 0;
 
 	let spent: number;
@@ -307,21 +313,21 @@ async function assertRunGuardrails(
 	let applied: number;
 	try {
 		[spent, dryRunsSucceeded, applied] = await Promise.all([
-			countAgentTokenActions({
-				agentTokenId,
+			countRunBoundActions({
+				runId,
 				dryRun: false,
 				outcomes: ['pending', 'succeeded', 'failed'],
 				excludeId: auditId,
 			}),
-			countAgentTokenActions({
-				agentTokenId,
+			countRunBoundActions({
+				runId,
 				dryRun: true,
 				outcomes: ['succeeded'],
 				tool,
 				target,
 			}),
-			countAgentTokenActions({
-				agentTokenId,
+			countRunBoundActions({
+				runId,
 				dryRun: false,
 				outcomes: ['pending', 'succeeded', 'failed'],
 				tool,
