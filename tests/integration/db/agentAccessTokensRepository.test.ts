@@ -4,7 +4,7 @@ import { getDb } from '../../../src/db/client.js';
 import {
 	deleteAgentAccessToken,
 	deleteExpiredAgentAccessTokens,
-	findUserByLiveAgentAccessToken,
+	findLiveAgentAccessToken,
 	insertAgentAccessToken,
 	listAgentAccessTokensOfUser,
 	recordAgentAccessTokenUse,
@@ -59,17 +59,39 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 				expiresAt: new Date(NOW.getTime() - 1),
 			});
 
-			expect(await findUserByLiveAgentAccessToken('hash-live', NOW)).toMatchObject({
-				id: user.id,
-				instanceAdmin: true,
-			});
-			expect(await findUserByLiveAgentAccessToken('hash-expired', NOW)).toBeUndefined();
-			expect(await findUserByLiveAgentAccessToken('hash-unknown', NOW)).toBeUndefined();
+			const live = await findLiveAgentAccessToken('hash-live', NOW);
+			expect(live?.user).toMatchObject({ id: user.id, instanceAdmin: true });
+			// An ordinary token carries no project scope.
+			expect(live).not.toHaveProperty('projectIds');
+			expect(await findLiveAgentAccessToken('hash-expired', NOW)).toBeUndefined();
+			expect(await findLiveAgentAccessToken('hash-unknown', NOW)).toBeUndefined();
 			// The expired row is still listed (and flagged by the screen) until swept.
 			expect(await listAgentAccessTokensOfUser(user.id)).toHaveLength(2);
 
 			expect(await deleteExpiredAgentAccessTokens(NOW)).toBe(1);
 			expect(await listAgentAccessTokensOfUser(user.id)).toHaveLength(1);
+		});
+
+		it('stores, lists and resolves the projects of a scoped credential (issue #1385)', async () => {
+			const { user } = await adminWithToken();
+			const scoped = await insertAgentAccessToken({
+				userId: user.id,
+				name: 'agent',
+				tokenHash: 'hash-scoped',
+				expiresAt: new Date(NOW.getTime() + 60_000),
+				projectIds: ['proj-a', 'proj-b'],
+			});
+
+			expect(scoped.projectIds).toEqual(['proj-a', 'proj-b']);
+			expect(await findLiveAgentAccessToken('hash-scoped', NOW)).toMatchObject({
+				tokenId: scoped.id,
+				projectIds: ['proj-a', 'proj-b'],
+			});
+			const listed = await listAgentAccessTokensOfUser(user.id);
+			expect(listed.find((token) => token.id === scoped.id)?.projectIds).toEqual([
+				'proj-a',
+				'proj-b',
+			]);
 		});
 
 		it('stamps the last use at most once per throttle window', async () => {
@@ -96,7 +118,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 			expect(await rows()).toHaveLength(1);
 			expect(await deleteAgentAccessToken(token.id, user.id)).toBe(true);
 			expect(await deleteAgentAccessToken(token.id, user.id)).toBe(false);
-			expect(await findUserByLiveAgentAccessToken('hash-a', NOW)).toBeUndefined();
+			expect(await findLiveAgentAccessToken('hash-a', NOW)).toBeUndefined();
 		});
 	},
 );

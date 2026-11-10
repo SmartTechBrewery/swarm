@@ -37,6 +37,13 @@ export const agentAccessTokens = pgTable(
 		createdAt: timestamp('created_at').notNull().defaultNow(),
 		/** The last time a live token opened `/operator/mcp`, throttled to a minute. */
 		lastUsedAt: timestamp('last_used_at'),
+		/**
+		 * The projects a **scoped agent credential** is limited to (issue #1385): a
+		 * request made with it reaches these projects alone, and only the read tools
+		 * plus the recovery allowlist (`SCOPED_AGENT_RECOVERY_TOOLS`). `NULL` is an
+		 * ordinary token acting with its holder's full access; never an empty array.
+		 */
+		projectIds: text('project_ids').array(),
 	},
 	// Resolving looks a row up by hash (the unique constraint indexes it); this
 	// index serves the holder's own list, the revoke and the cascade.

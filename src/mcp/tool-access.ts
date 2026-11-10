@@ -19,9 +19,17 @@
  *    caller is not a member of reads as `NOT_FOUND`. `scope` records which kind of
  *    per-call check that is; it is documentation, never enforcement.
  *
+ * **A scoped agent credential sees a fixed subset** (issue #1385). A request made
+ * with an agent access token limited to some projects is shown, and may call, only
+ * the tools marked `agentScoped` — every read tool plus the recovery writes in
+ * `SCOPED_AGENT_RECOVERY_TOOLS` (`../identity/agent-access-token.ts`) — and only
+ * those its ceiling, computed from the holder's roles on the scoped projects
+ * alone, reaches. Any other tool is refused `FORBIDDEN` (audited, for a write
+ * tool), whatever the holder's own role.
+ *
  * **Default-deny.** A tool with no entry is shown to, and callable by,
- * installation administrators only, so a tool registered without deciding its
- * role cannot reach anyone else. `tests/unit/mcp/tool-access.test.ts` fails on a
+ * installation administrators only — never by a scoped agent credential — so a
+ * tool registered without deciding its role cannot reach anyone else. `tests/unit/mcp/tool-access.test.ts` fails on a
  * registered tool with no entry, and on an entry naming no registered tool.
  */
 
@@ -29,7 +37,12 @@ import { TRPCError } from '@trpc/server';
 
 import { type ProjectRole, projectRoleRank } from '../identity/membership.js';
 import { listProjectsForUser } from '../identity/membership-service.js';
-import { isInstanceAdmin, type SwarmUser } from '../identity/schema.js';
+import {
+	agentScopeOf,
+	isInstanceAdmin,
+	type SwarmUser,
+	scopeUserToProjects,
+} from '../identity/schema.js';
 
 /**
  * The most a caller may do on the MCP server: `instanceAdmin` for an installation
@@ -64,53 +77,71 @@ export type ToolScope =
 export interface ToolAccess {
 	minRole: ToolMinRole;
 	scope: ToolScope;
+	/**
+	 * Whether a scoped agent credential (issue #1385) may list and call the tool:
+	 * `true` for every read tool and the five recovery writes in
+	 * `SCOPED_AGENT_RECOVERY_TOOLS`, `false` for every other tool.
+	 */
+	agentScoped: boolean;
 }
 
-/** What a tool with no {@link TOOL_ACCESS} entry gets: instance administrators only. */
-export const DEFAULT_TOOL_ACCESS: ToolAccess = { minRole: 'instanceAdmin', scope: 'none' };
+/**
+ * What a tool with no {@link TOOL_ACCESS} entry gets: instance administrators
+ * only, and never a scoped agent credential.
+ */
+export const DEFAULT_TOOL_ACCESS: ToolAccess = {
+	minRole: 'instanceAdmin',
+	scope: 'none',
+	agentScoped: false,
+};
 
 /**
  * Every operator MCP tool's required role and scope — the role is the one its
  * dashboard procedure already enforces (`../api/authz.ts`), never a new decision
- * about the procedure itself. Keep `docs/mcp.md` "Who may use each tool" in step.
+ * about the procedure itself — and whether a scoped agent credential may use it.
+ * Keep `docs/mcp.md` "Who may use each tool" and "Scoped agent credentials" in step.
  */
 export const TOOL_ACCESS: Readonly<Record<string, ToolAccess>> = {
 	// Reads of a project and its runs — `canReadProject`, the contributor floor.
-	runs_list: { minRole: 'contributor', scope: 'accessible-projects' },
-	run_get: { minRole: 'contributor', scope: 'project' },
-	pipeline_snapshot: { minRole: 'contributor', scope: 'project' },
-	dispatch_history: { minRole: 'contributor', scope: 'project' },
-	pr_status: { minRole: 'contributor', scope: 'project' },
-	pipeline_stats: { minRole: 'contributor', scope: 'project' },
-	phase_agents_get: { minRole: 'contributor', scope: 'project' },
-	consistency_check: { minRole: 'contributor', scope: 'project' },
-	project_get: { minRole: 'contributor', scope: 'project' },
+	runs_list: { minRole: 'contributor', scope: 'accessible-projects', agentScoped: true },
+	run_get: { minRole: 'contributor', scope: 'project', agentScoped: true },
+	pipeline_snapshot: { minRole: 'contributor', scope: 'project', agentScoped: true },
+	dispatch_history: { minRole: 'contributor', scope: 'project', agentScoped: true },
+	pr_status: { minRole: 'contributor', scope: 'project', agentScoped: true },
+	pipeline_stats: { minRole: 'contributor', scope: 'project', agentScoped: true },
+	phase_agents_get: { minRole: 'contributor', scope: 'project', agentScoped: true },
+	consistency_check: { minRole: 'contributor', scope: 'project', agentScoped: true },
+	project_get: { minRole: 'contributor', scope: 'project', agentScoped: true },
 	// A project's workers and log lines for a contributor; the unscoped,
 	// installation-wide view stays `assertInstanceAdmin`'s.
-	workers_state: { minRole: 'contributor', scope: 'project-or-installation' },
-	cli_rate_limits: { minRole: 'contributor', scope: 'project-or-installation' },
-	control_plane_logs: { minRole: 'contributor', scope: 'project-or-installation' },
+	workers_state: { minRole: 'contributor', scope: 'project-or-installation', agentScoped: true },
+	cli_rate_limits: { minRole: 'contributor', scope: 'project-or-installation', agentScoped: true },
+	control_plane_logs: {
+		minRole: 'contributor',
+		scope: 'project-or-installation',
+		agentScoped: true,
+	},
 	// Reads behind the project's admin-only setup screens (board mapping, readiness).
-	pm_board_discover: { minRole: 'projectAdmin', scope: 'project' },
-	project_readiness: { minRole: 'projectAdmin', scope: 'project' },
+	pm_board_discover: { minRole: 'projectAdmin', scope: 'project', agentScoped: true },
+	project_readiness: { minRole: 'projectAdmin', scope: 'project', agentScoped: true },
 	// Driving a project's runs — `canWriteProject`, the member floor.
-	run_reset: { minRole: 'member', scope: 'project' },
-	dispatch_redispatch_now: { minRole: 'member', scope: 'project' },
-	pr_force_re_review: { minRole: 'member', scope: 'project' },
-	pr_recheck_mergeability: { minRole: 'member', scope: 'project' },
-	dependency_waits_wake: { minRole: 'member', scope: 'project' },
-	work_item_close: { minRole: 'member', scope: 'project' },
+	run_reset: { minRole: 'member', scope: 'project', agentScoped: true },
+	dispatch_redispatch_now: { minRole: 'member', scope: 'project', agentScoped: true },
+	pr_force_re_review: { minRole: 'member', scope: 'project', agentScoped: true },
+	pr_recheck_mergeability: { minRole: 'member', scope: 'project', agentScoped: true },
+	dependency_waits_wake: { minRole: 'member', scope: 'project', agentScoped: true },
+	work_item_close: { minRole: 'member', scope: 'project', agentScoped: false },
 	// Administering a project's configuration and credentials — `canAdministerProject`.
-	phase_agents_reorder: { minRole: 'projectAdmin', scope: 'project' },
-	phase_agents_restore: { minRole: 'projectAdmin', scope: 'project' },
-	project_update: { minRole: 'projectAdmin', scope: 'project' },
-	pm_board_set: { minRole: 'projectAdmin', scope: 'project' },
-	project_credential_set: { minRole: 'projectAdmin', scope: 'project' },
+	phase_agents_reorder: { minRole: 'projectAdmin', scope: 'project', agentScoped: false },
+	phase_agents_restore: { minRole: 'projectAdmin', scope: 'project', agentScoped: false },
+	project_update: { minRole: 'projectAdmin', scope: 'project', agentScoped: false },
+	pm_board_set: { minRole: 'projectAdmin', scope: 'project', agentScoped: false },
+	project_credential_set: { minRole: 'projectAdmin', scope: 'project', agentScoped: false },
 	// A worker's own owner may block its CLI, as on the Workers screen: a resource
 	// gate, not a project role.
-	cli_rate_limit_set: { minRole: 'signedIn', scope: 'worker-owner' },
+	cli_rate_limit_set: { minRole: 'signedIn', scope: 'worker-owner', agentScoped: false },
 	// The New Project dialog is open to any signed-in user; the creator becomes its admin.
-	project_create: { minRole: 'signedIn', scope: 'none' },
+	project_create: { minRole: 'signedIn', scope: 'none', agentScoped: false },
 };
 
 /** `name`'s entry in {@link TOOL_ACCESS}, or {@link DEFAULT_TOOL_ACCESS} when it has none. */
@@ -134,11 +165,19 @@ export function ceilingReaches(ceiling: McpCeiling, minRole: ToolMinRole): boole
  * `user`'s {@link McpCeiling}: `instanceAdmin` for an installation administrator
  * (no membership read), otherwise their highest role across every project
  * membership, or `signedIn` when they hold none. Read once per MCP request.
+ *
+ * A scoped agent credential's user (issue #1385) never reaches `instanceAdmin`:
+ * its ceiling is `projectAdmin` for an administrator holder — what they hold on
+ * every project in the scope — and otherwise the holder's highest role on the
+ * scoped projects alone, so a role held elsewhere lifts nothing.
  */
 export async function mcpCeilingFor(user: SwarmUser): Promise<McpCeiling> {
-	if (isInstanceAdmin(user)) return 'instanceAdmin';
+	const scope = agentScopeOf(user);
+	if (scope?.holderInstanceAdmin) return 'projectAdmin';
+	if (!scope && isInstanceAdmin(user)) return 'instanceAdmin';
 	let ceiling: McpCeiling = 'signedIn';
-	for (const { role } of await listProjectsForUser(user.id)) {
+	for (const { projectId, role } of await listProjectsForUser(user.id)) {
+		if (scope && !scope.projectIds.includes(projectId)) continue;
 		if (ceilingRank(role) > ceilingRank(ceiling)) ceiling = role;
 	}
 	return ceiling;
@@ -154,24 +193,89 @@ const ROLE_WORDING: Record<ToolMinRole, string> = {
 };
 
 /**
- * Throw `FORBIDDEN` unless a caller at `ceiling` may call tool `name`. The refusal
- * names the role the tool needs and nothing about any project, so it reveals
- * nothing the caller could not read from this table.
+ * Which credential an MCP request was made with (issue #1385): `user` for a
+ * `swarm login` session or an ordinary agent access token — both act with the
+ * account's full access — and `scoped-agent-token` for an agent access token
+ * limited to `projectIds`. Recorded on every write tool's audit row.
  */
-export function assertToolAccess(name: string, ceiling: McpCeiling): void {
-	const { minRole } = toolAccessFor(name);
-	if (ceilingReaches(ceiling, minRole)) return;
+export type McpCredential =
+	| { kind: 'user' }
+	| { kind: 'scoped-agent-token'; tokenId: string; projectIds: readonly string[] };
+
+/** Who an MCP request acts as, and with which credential. */
+export interface McpPrincipal {
+	/**
+	 * The user every tool authorizes as — for a scoped agent credential, the holder
+	 * limited to its projects (`scopeUserToProjects`, `../identity/schema.ts`).
+	 */
+	user: SwarmUser;
+	credential: McpCredential;
+}
+
+/** The principal of a session or an ordinary agent access token: the user, unlimited. */
+export function userPrincipal(user: SwarmUser): McpPrincipal {
+	return { user, credential: { kind: 'user' } };
+}
+
+/**
+ * The principal of a scoped agent credential: `holder` limited to `projectIds`,
+ * with the token's id kept for the audit trail. The one place both halves are
+ * built, so the user's project limit and the credential it came from cannot drift.
+ */
+export function scopedAgentPrincipal(
+	holder: SwarmUser,
+	tokenId: string,
+	projectIds: readonly string[],
+): McpPrincipal {
+	return {
+		user: scopeUserToProjects(holder, projectIds),
+		credential: { kind: 'scoped-agent-token', tokenId, projectIds: [...projectIds] },
+	};
+}
+
+/**
+ * What every tool is registered with for one MCP request: the principal its bearer
+ * resolved to, and that user's {@link McpCeiling}, read once for the request.
+ */
+export interface ToolContext extends McpPrincipal {
+	ceiling: McpCeiling;
+}
+
+/**
+ * Whether `context` is a scoped agent credential's — read from the credential and,
+ * failing closed, from a project limit on the user as well.
+ */
+function isScopedAgent(context: Pick<ToolContext, 'user' | 'credential'>): boolean {
+	return (
+		context.credential.kind === 'scoped-agent-token' || agentScopeOf(context.user) !== undefined
+	);
+}
+
+/** Whether `tools/list` shows tool `name` to `context` (`./server.ts`). */
+export function toolListedFor(name: string, context: ToolContext): boolean {
+	const access = toolAccessFor(name);
+	if (isScopedAgent(context) && !access.agentScoped) return false;
+	return ceilingReaches(context.ceiling, access.minRole);
+}
+
+/**
+ * Throw `FORBIDDEN` unless `context` may call tool `name`: a scoped agent
+ * credential only an `agentScoped` tool, and anyone only a tool their ceiling
+ * reaches. The refusal names the credential or the role the tool needs and nothing
+ * about any project, so it reveals nothing the caller could not read from this
+ * table.
+ */
+export function assertToolAccess(name: string, context: ToolContext): void {
+	const { minRole, agentScoped } = toolAccessFor(name);
+	if (isScopedAgent(context) && !agentScoped) {
+		throw new TRPCError({
+			code: 'FORBIDDEN',
+			message: `Tool "${name}" is not available to a scoped agent credential.`,
+		});
+	}
+	if (ceilingReaches(context.ceiling, minRole)) return;
 	throw new TRPCError({
 		code: 'FORBIDDEN',
 		message: `Tool "${name}" needs ${ROLE_WORDING[minRole]}, which you do not hold.`,
 	});
-}
-
-/**
- * What every tool is registered with for one MCP request: the user its bearer
- * resolved to, and that user's {@link McpCeiling}, read once for the request.
- */
-export interface ToolContext {
-	user: SwarmUser;
-	ceiling: McpCeiling;
 }

@@ -23,6 +23,19 @@ export interface NewAgentAccessTokenValues {
 	name: string;
 	tokenHash: string;
 	expiresAt: Date;
+	/** The projects a scoped agent credential is limited to; omitted for an ordinary token. */
+	projectIds?: string[];
+}
+
+/**
+ * A live token's holder, the token's id, and — for a scoped agent credential
+ * (issue #1385) — the projects it is limited to; `projectIds` is absent for an
+ * ordinary token.
+ */
+export interface LiveAgentAccessToken {
+	user: SwarmUser;
+	tokenId: string;
+	projectIds?: string[];
 }
 
 type AgentAccessTokenRow = typeof agentAccessTokens.$inferSelect;
@@ -38,6 +51,7 @@ function toAgentAccessToken(row: AgentAccessTokenRow): AgentAccessToken {
 		createdAt: row.createdAt.toISOString(),
 		expiresAt: row.expiresAt.toISOString(),
 		...(row.lastUsedAt ? { lastUsedAt: row.lastUsedAt.toISOString() } : {}),
+		...(row.projectIds ? { projectIds: row.projectIds } : {}),
 	};
 }
 
@@ -72,22 +86,31 @@ export async function deleteAgentAccessToken(id: string, userId: string): Promis
 }
 
 /**
- * The holder of a live token by its hash, or `undefined` when none matches — a
- * not-found lookup, not an error. Expiry stands **in the query**, so an expired
- * row never resolves even before it is swept.
+ * The live token matching a hash — its holder, id and project scope — or
+ * `undefined` when none matches: a not-found lookup, not an error. Expiry stands
+ * **in the query**, so an expired row never resolves even before it is swept.
  */
-export async function findUserByLiveAgentAccessToken(
+export async function findLiveAgentAccessToken(
 	tokenHash: string,
 	now: Date,
-): Promise<SwarmUser | undefined> {
+): Promise<LiveAgentAccessToken | undefined> {
 	const rows = await getDb()
-		.select({ user: users })
+		.select({
+			user: users,
+			tokenId: agentAccessTokens.id,
+			projectIds: agentAccessTokens.projectIds,
+		})
 		.from(agentAccessTokens)
 		.innerJoin(users, eq(agentAccessTokens.userId, users.id))
 		.where(and(eq(agentAccessTokens.tokenHash, tokenHash), gt(agentAccessTokens.expiresAt, now)))
 		.limit(1);
 	const row = rows[0];
-	return row ? rowToSwarmUser(row.user) : undefined;
+	if (!row) return undefined;
+	return {
+		user: rowToSwarmUser(row.user),
+		tokenId: row.tokenId,
+		...(row.projectIds && row.projectIds.length > 0 ? { projectIds: row.projectIds } : {}),
+	};
 }
 
 /**

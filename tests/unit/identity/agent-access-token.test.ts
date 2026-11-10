@@ -5,7 +5,7 @@ vi.mock('@/db/repositories/agentAccessTokensRepository.js', () => ({
 	insertAgentAccessToken: vi.fn(),
 	listAgentAccessTokensOfUser: vi.fn(),
 	deleteAgentAccessToken: vi.fn(),
-	findUserByLiveAgentAccessToken: vi.fn(),
+	findLiveAgentAccessToken: vi.fn(),
 	recordAgentAccessTokenUse: vi.fn(),
 	deleteExpiredAgentAccessTokens: vi.fn(),
 }));
@@ -13,7 +13,7 @@ vi.mock('@/db/repositories/agentAccessTokensRepository.js', () => ({
 import {
 	deleteAgentAccessToken,
 	deleteExpiredAgentAccessTokens,
-	findUserByLiveAgentAccessToken,
+	findLiveAgentAccessToken,
 	insertAgentAccessToken,
 	listAgentAccessTokensOfUser,
 	recordAgentAccessTokenUse,
@@ -27,6 +27,7 @@ import {
 	IssueAgentAccessTokenInputSchema,
 	MAY_USE_AGENT_ACCESS_TOKENS,
 	mayUseAgentAccessTokens,
+	SCOPED_AGENT_TOKEN_MAX_PROJECTS,
 } from '@/identity/agent-access-token.js';
 import {
 	issueAgentAccessToken,
@@ -60,13 +61,17 @@ const STORED = {
 	expiresAt: agentAccessTokenExpiry(NOW).toISOString(),
 };
 
+/** The live token a resolve finds: an unscoped one held by `ADMIN`. */
+const LIVE = { user: ADMIN, tokenId: TOKEN_ID };
+const allowEveryProject = async () => true;
+
 const sha256hex = (value: string) => createHash('sha256').update(value).digest('hex');
 
 beforeEach(() => {
 	vi.mocked(insertAgentAccessToken).mockReset().mockResolvedValue(STORED);
 	vi.mocked(listAgentAccessTokensOfUser).mockReset().mockResolvedValue([STORED]);
 	vi.mocked(deleteAgentAccessToken).mockReset().mockResolvedValue(true);
-	vi.mocked(findUserByLiveAgentAccessToken).mockReset().mockResolvedValue(undefined);
+	vi.mocked(findLiveAgentAccessToken).mockReset().mockResolvedValue(undefined);
 	vi.mocked(recordAgentAccessTokenUse).mockReset().mockResolvedValue(undefined);
 	vi.mocked(deleteExpiredAgentAccessTokens).mockReset().mockResolvedValue(0);
 });
@@ -95,6 +100,29 @@ describe('agent access token rules (issue #1362)', () => {
 		).toBe(false);
 	});
 
+	// Issue #1385: a scoped agent credential names its projects at issuing.
+	it('takes 1–50 project ids for a scoped credential, collapsing repeats', () => {
+		expect(
+			IssueAgentAccessTokenInputSchema.parse({
+				name: 'agent',
+				projectIds: ['proj-a', 'proj-b', 'proj-a'],
+			}),
+		).toEqual({ name: 'agent', projectIds: ['proj-a', 'proj-b'] });
+
+		const empty = IssueAgentAccessTokenInputSchema.safeParse({ name: 'agent', projectIds: [] });
+		expect(empty.success).toBe(false);
+		expect(empty.error?.issues[0]?.message).toBe(
+			'A scoped agent credential needs at least one project.',
+		);
+		expect(
+			IssueAgentAccessTokenInputSchema.safeParse({ name: 'agent', projectIds: [''] }).success,
+		).toBe(false);
+		const tooMany = Array.from({ length: SCOPED_AGENT_TOKEN_MAX_PROJECTS + 1 }, (_, i) => `p${i}`);
+		expect(
+			IssueAgentAccessTokenInputSchema.safeParse({ name: 'agent', projectIds: tooMany }).success,
+		).toBe(false);
+	});
+
 	it('has no token-value field on the list shape', () => {
 		expect(Object.keys(AgentAccessTokenSchema.shape)).not.toContain('token');
 		expect(AgentAccessTokenSchema.strict().safeParse({ ...STORED, token: 'raw' }).success).toBe(
@@ -114,6 +142,7 @@ describe('issueAgentAccessToken', () => {
 			actor: ADMIN,
 			token: { name: 'office laptop' },
 			now: NOW,
+			mayScopeTo: allowEveryProject,
 		});
 
 		if (result.outcome !== 'issued') throw new Error('expected an issued token');
@@ -128,9 +157,48 @@ describe('issueAgentAccessToken', () => {
 	});
 
 	it('refuses a non-admin before any query', async () => {
-		const result = await issueAgentAccessToken({ actor: MEMBER, token: { name: 'x' }, now: NOW });
+		const mayScopeTo = vi.fn(allowEveryProject);
+		const result = await issueAgentAccessToken({
+			actor: MEMBER,
+			token: { name: 'x', projectIds: ['proj-a'] },
+			now: NOW,
+			mayScopeTo,
+		});
 
 		expect(result).toEqual({ outcome: 'forbidden' });
+		expect(mayScopeTo).not.toHaveBeenCalled();
+		expect(insertAgentAccessToken).not.toHaveBeenCalled();
+	});
+
+	it('stores the projects of a scoped credential once every one of them is allowed', async () => {
+		const scoped = { ...STORED, projectIds: ['proj-a', 'proj-b'] };
+		vi.mocked(insertAgentAccessToken).mockResolvedValue(scoped);
+		const mayScopeTo = vi.fn(allowEveryProject);
+
+		const result = await issueAgentAccessToken({
+			actor: ADMIN,
+			token: { name: 'agent', projectIds: ['proj-a', 'proj-b'] },
+			now: NOW,
+			mayScopeTo,
+		});
+
+		if (result.outcome !== 'issued') throw new Error('expected an issued token');
+		expect(result.issued.projectIds).toEqual(['proj-a', 'proj-b']);
+		expect(mayScopeTo.mock.calls).toEqual([['proj-a'], ['proj-b']]);
+		expect(insertAgentAccessToken).toHaveBeenCalledWith(
+			expect.objectContaining({ projectIds: ['proj-a', 'proj-b'] }),
+		);
+	});
+
+	it('refuses the whole credential as unknown-project when any project is not allowed', async () => {
+		const result = await issueAgentAccessToken({
+			actor: ADMIN,
+			token: { name: 'agent', projectIds: ['proj-a', 'proj-missing'] },
+			now: NOW,
+			mayScopeTo: async (projectId) => projectId === 'proj-a',
+		});
+
+		expect(result).toEqual({ outcome: 'unknown-project' });
 		expect(insertAgentAccessToken).not.toHaveBeenCalled();
 	});
 });
@@ -159,10 +227,10 @@ describe('listAgentAccessTokens / revokeAgentAccessToken', () => {
 
 describe('resolveAgentAccessToken', () => {
 	it('resolves a live token by its hash and stamps its use, throttled to a minute', async () => {
-		vi.mocked(findUserByLiveAgentAccessToken).mockResolvedValue(ADMIN);
+		vi.mocked(findLiveAgentAccessToken).mockResolvedValue(LIVE);
 
-		expect(await resolveAgentAccessToken('raw-token', NOW)).toBe(ADMIN);
-		expect(findUserByLiveAgentAccessToken).toHaveBeenCalledWith(sha256hex('raw-token'), NOW);
+		expect(await resolveAgentAccessToken('raw-token', NOW)).toBe(LIVE);
+		expect(findLiveAgentAccessToken).toHaveBeenCalledWith(sha256hex('raw-token'), NOW);
 		expect(recordAgentAccessTokenUse).toHaveBeenCalledWith(
 			sha256hex('raw-token'),
 			NOW,
@@ -178,15 +246,26 @@ describe('resolveAgentAccessToken', () => {
 	});
 
 	it('never lets a failed stamp or sweep block a live token', async () => {
-		vi.mocked(findUserByLiveAgentAccessToken).mockResolvedValue(ADMIN);
+		vi.mocked(findLiveAgentAccessToken).mockResolvedValue(LIVE);
 		vi.mocked(recordAgentAccessTokenUse).mockRejectedValue(new Error('db down'));
 		vi.mocked(deleteExpiredAgentAccessTokens).mockRejectedValue(new Error('db down'));
 
-		expect(await resolveAgentAccessToken('raw-token', NOW)).toBe(ADMIN);
+		expect(await resolveAgentAccessToken('raw-token', NOW)).toBe(LIVE);
+	});
+
+	it("returns a scoped credential's projects with its holder and id (issue #1385)", async () => {
+		const scoped = { ...LIVE, projectIds: ['proj-a'] };
+		vi.mocked(findLiveAgentAccessToken).mockResolvedValue(scoped);
+
+		expect(await resolveAgentAccessToken('raw-token', NOW)).toEqual({
+			user: ADMIN,
+			tokenId: TOKEN_ID,
+			projectIds: ['proj-a'],
+		});
 	});
 
 	it('resolves an empty token to nothing without a query', async () => {
 		expect(await resolveAgentAccessToken('', NOW)).toBeUndefined();
-		expect(findUserByLiveAgentAccessToken).not.toHaveBeenCalled();
+		expect(findLiveAgentAccessToken).not.toHaveBeenCalled();
 	});
 });

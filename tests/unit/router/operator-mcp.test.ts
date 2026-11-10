@@ -232,6 +232,7 @@ vi.mock('@/db/repositories/workerCliRateLimitsRepository.js', async () => ({
 }));
 
 import { REVIEW_VERDICT_CAP } from '@/db/repositories/reviewVerdictsRepository.js';
+import type { LiveAgentAccessToken } from '@/identity/agent-access-token-service.js';
 import type { ProjectRole } from '@/identity/membership.js';
 import type { SwarmUser } from '@/identity/schema.js';
 import { enableLogRingBuffer, logger } from '@/lib/logger.js';
@@ -369,10 +370,19 @@ function workerRow(workerId: string, displayName: string, rateLimits: (typeof CO
 	};
 }
 
-/** Agent access tokens (issue #1362), resolved by the second credential lookup. */
-const AGENT_TOKENS: Record<string, SwarmUser> = {
-	'admin-agent-token': ADMIN,
-	'member-agent-token': MEMBER,
+const ADMIN_AGENT_TOKEN_ID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+/** The scoped agent credential's token id (issue #1385). */
+const SCOPED_TOKEN_ID = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+
+/**
+ * Agent access tokens (issue #1362), resolved by the second credential lookup —
+ * and, since issue #1385, `scoped-agent-token`: the instance admin's credential
+ * limited to `proj-a`.
+ */
+const AGENT_TOKENS: Record<string, LiveAgentAccessToken> = {
+	'admin-agent-token': { user: ADMIN, tokenId: ADMIN_AGENT_TOKEN_ID },
+	'member-agent-token': { user: MEMBER, tokenId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd' },
+	'scoped-agent-token': { user: ADMIN, tokenId: SCOPED_TOKEN_ID, projectIds: ['proj-a'] },
 };
 
 let resolveSession: ReturnType<typeof vi.fn<OperatorMcpDeps['resolveSession']>>;
@@ -737,6 +747,132 @@ describe('operator MCP — per-tool roles (issue #1382)', () => {
 		expect(result.isError).toBe(true);
 		expect(result.content[0]?.text).toMatch(/^FORBIDDEN: Tool "run_get" needs /);
 		expect(getRunByIdFromDb).not.toHaveBeenCalled();
+	});
+});
+
+/** Every tool a scoped agent credential is shown: the read tools plus the recovery allowlist. */
+const SCOPED_AGENT_TOOLS = [
+	'cli_rate_limits',
+	'consistency_check',
+	'control_plane_logs',
+	'dependency_waits_wake',
+	'dispatch_history',
+	'dispatch_redispatch_now',
+	'phase_agents_get',
+	'pipeline_snapshot',
+	'pipeline_stats',
+	'pm_board_discover',
+	'pr_force_re_review',
+	'pr_recheck_mergeability',
+	'pr_status',
+	'project_get',
+	'project_readiness',
+	'run_get',
+	'run_reset',
+	'runs_list',
+	'workers_state',
+];
+
+describe('operator MCP — a scoped agent credential (issue #1385)', () => {
+	it('is shown exactly the read tools and the five recovery tools', async () => {
+		expect(await listedTools('scoped-agent-token')).toEqual(SCOPED_AGENT_TOOLS);
+	});
+
+	it('still shows an unscoped admin token every tool', async () => {
+		expect(await listedTools('admin-agent-token')).toEqual(ALL_TOOLS);
+	});
+
+	it('lists runs of its own projects only when no project is named', async () => {
+		const result = await callTool('runs_list', {}, 'scoped-agent-token');
+
+		expect(result.isError).toBeUndefined();
+		expect(listRunsFromDb).toHaveBeenCalledWith(
+			expect.objectContaining({ projectIds: ['proj-a'] }),
+		);
+	});
+
+	it('reads a run of another project exactly as an unknown run', async () => {
+		const result = await callTool('run_get', { runId: OTHER_PROJECT_RUN_ID }, 'scoped-agent-token');
+
+		expect(result.content[0]?.text).toBe(
+			`NOT_FOUND: Run with ID "${OTHER_PROJECT_RUN_ID}" not found`,
+		);
+		expect(getRunOutputEvents).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		['workers_state', {}],
+		['cli_rate_limits', {}],
+		['control_plane_logs', {}],
+	])('is refused the installation-wide form of %s', async (tool, args) => {
+		const result = await callTool(tool, args, 'scoped-agent-token');
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toMatch(/^FORBIDDEN: The installation-wide /);
+		expect(listDashboardWorkers).not.toHaveBeenCalled();
+	});
+
+	it('reads the workers of a project in its scope', async () => {
+		const result = await callTool('workers_state', { projectId: 'proj-a' }, 'scoped-agent-token');
+
+		expect(result.isError).toBeUndefined();
+		expect(listDashboardWorkers).toHaveBeenCalledWith(['proj-a']);
+	});
+
+	it.each([
+		[
+			'project_credential_set',
+			{ projectId: 'proj-a', side: 'scm', role: 'reviewer', value: 'secret-value' },
+		],
+		['project_update', { projectId: 'proj-a', name: 'Renamed' }],
+		[
+			'project_create',
+			{ id: 'new-proj', name: 'New', repositories: [{ repo: 'acme/new' }], repoRoot: '/src/new' },
+		],
+		[
+			'pm_board_set',
+			{
+				projectId: 'proj-a',
+				pm: {
+					type: 'github-projects',
+					projectId: 'PVT_1',
+					statusFieldId: 'F_1',
+					statusOptions: { backlog: 'a' },
+				},
+			},
+		],
+		['work_item_close', { projectId: 'proj-a', repository: 'acme/widgets', prNumber: 7 }],
+		['phase_agents_reorder', { projectId: 'proj-a', phase: 'review', order: ['claude'] }],
+		['cli_rate_limit_set', { workerId: WORKER_ID, cli: 'claude', until: '2026-12-01T00:00:00Z' }],
+	])('is refused %s with FORBIDDEN, audited as refused', async (tool, args) => {
+		const result = await callTool(tool, { ...args, reason: 'trying' }, 'scoped-agent-token');
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toBe(
+			`FORBIDDEN: Tool "${tool}" is not available to a scoped agent credential.`,
+		);
+		expect(recordOperatorAction).toHaveBeenCalledWith(
+			expect.objectContaining({
+				tool,
+				userId: ADMIN.id,
+				credentialKind: 'scoped-agent-token',
+				agentTokenId: SCOPED_TOKEN_ID,
+			}),
+		);
+		expect(settleOperatorAction).toHaveBeenCalledWith('audit-1', {
+			outcome: 'refused',
+			error: `FORBIDDEN: Tool "${tool}" is not available to a scoped agent credential.`,
+			projectId: null,
+		});
+		expect(upsertProjectToDb).not.toHaveBeenCalled();
+	});
+
+	it("records an unscoped admin token's write as the account's own", async () => {
+		await callTool('run_reset', { runId: RUN_ID, reason: 'r', dryRun: true }, 'admin-agent-token');
+
+		expect(recordOperatorAction).toHaveBeenCalledWith(
+			expect.objectContaining({ credentialKind: 'user', agentTokenId: null }),
+		);
 	});
 });
 
@@ -1538,8 +1674,56 @@ describe('operator MCP — run_reset and dispatch_redispatch_now', () => {
 			reason: 'wedged on a stale lease',
 			dryRun: false,
 			input: { runId: RUN_ID },
+			// A `swarm login` session is the account's own credential (issue #1385).
+			credentialKind: 'user',
+			agentTokenId: null,
 			outcome: 'succeeded',
 			error: null,
+		});
+	});
+
+	// Issue #1385: a scoped agent credential drives the runs of its own projects,
+	// audited apart from its holder's own calls, and reaches no other project's.
+	it('resets an in-scope run for a scoped agent credential, audited as that credential', async () => {
+		const result = await callTool(
+			'run_reset',
+			{ runId: RUN_ID, reason: 'resolve-problem agent: wedged run' },
+			'scoped-agent-token',
+		);
+
+		expect(result.isError).toBeUndefined();
+		expect(resetRun).toHaveBeenCalledWith(RUN_ID);
+		expect(auditRow()).toMatchObject({
+			userId: ADMIN.id,
+			tool: 'run_reset',
+			projectId: 'proj-a',
+			credentialKind: 'scoped-agent-token',
+			agentTokenId: SCOPED_TOKEN_ID,
+			outcome: 'succeeded',
+		});
+	});
+
+	it("hides another project's run from a scoped agent credential held by an admin", async () => {
+		getRunByIdFromDb.mockImplementation(async (id: string) =>
+			id === OTHER_PROJECT_RUN_ID
+				? { ...failedRun(OTHER_PROJECT_RUN_ID, 'proj-b'), jobPayload: PAYLOAD }
+				: undefined,
+		);
+
+		const result = await callTool(
+			'run_reset',
+			{ runId: OTHER_PROJECT_RUN_ID, reason: 'trying' },
+			'scoped-agent-token',
+		);
+
+		expect(result.content[0]?.text).toBe(
+			`NOT_FOUND: Run with ID "${OTHER_PROJECT_RUN_ID}" not found`,
+		);
+		expect(resetRun).not.toHaveBeenCalled();
+		expect(auditRow()).toMatchObject({
+			credentialKind: 'scoped-agent-token',
+			agentTokenId: SCOPED_TOKEN_ID,
+			outcome: 'refused',
 		});
 	});
 
@@ -2000,6 +2184,8 @@ describe('operator MCP — dependency_waits_wake', () => {
 			reason: 'the blocker was closed by hand',
 			dryRun: false,
 			input: { projectId: 'proj-a' },
+			credentialKind: 'user',
+			agentTokenId: null,
 			outcome: 'succeeded',
 			error: null,
 		});

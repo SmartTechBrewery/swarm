@@ -78,6 +78,62 @@ Only installation administrators can issue, list or revoke tokens. Nobody else
 sees the MCP tab, so anyone else connects with their [`swarm login`
 session](#using-the-swarm-login-session-instead).
 
+An administrator can also issue a token limited to some projects and to a fixed
+set of tools, for an autonomous agent: see [Scoped agent
+credentials](#scoped-agent-credentials).
+
+### Scoped agent credentials
+
+A **scoped agent credential** is an agent access token issued for one or more
+projects. It is meant for an autonomous agent that unblocks the pipeline in those
+projects, such as a planned *Resolve problem* phase, without holding your full
+access. A request made with it acts as you, limited in three ways:
+
+- **It reaches only its projects.** Every other project reads as `NOT_FOUND`,
+  exactly like a project that does not exist, even though you are an installation
+  administrator. A cross-project read such as `runs_list` without a `projectId`
+  covers its projects only. The installation-wide forms of `workers_state`,
+  `cli_rate_limits` and `control_plane_logs` (no `projectId`) are `FORBIDDEN`.
+- **It sees and calls only the read tools and five recovery tools.** `tools/list`
+  shows nothing else, and a call to any other tool is refused with `FORBIDDEN:
+  Tool "<name>" is not available to a scoped agent credential.` A refused write
+  tool still writes its `operator_actions` row, with outcome `refused`.
+- **Its calls are marked as its own.** Each write-tool row records
+  `credential_kind = 'scoped-agent-token'` and the token's id in `agent_token_id`,
+  so the agent's calls read apart from your own.
+
+| Tools | Available to a scoped agent credential |
+| --- | --- |
+| Every read tool: `runs_list`, `run_get`, `pipeline_snapshot`, `dispatch_history`, `pr_status`, `pipeline_stats`, `phase_agents_get`, `consistency_check`, `project_get`, `workers_state`, `cli_rate_limits`, `control_plane_logs`, `pm_board_discover`, `project_readiness` | Yes, for its projects only |
+| `run_reset`, `dispatch_redispatch_now`, `pr_force_re_review`, `pr_recheck_mergeability`, `dependency_waits_wake` | Yes, for its projects only: each recovers a stuck run or pull request and changes no configuration |
+| `project_create`, `project_update`, `pm_board_set`, `project_credential_set`, `work_item_close`, `phase_agents_reorder`, `phase_agents_restore`, `cli_rate_limit_set` | No |
+
+Inside its projects, the credential has the role you hold there: an installation
+administrator's credential acts as `projectAdmin` of each of them. A role you hold
+on a project outside the credential's list lifts nothing.
+
+**Issuing one.** There is no dashboard control yet. Call the dashboard's
+`agentAccessTokens.issue` tRPC procedure, signed in as yourself, with the projects
+the credential is for:
+
+```json
+{ "name": "resolve-problem agent", "projectIds": ["proj-a", "proj-b"] }
+```
+
+`projectIds` takes 1 to 50 project ids; repeated ids are collapsed and an empty
+list is refused. Each project must exist and be one you may drive (`member` or
+above, which an installation administrator always is). Otherwise the whole call
+is refused as `NOT_FOUND`, without saying which project was the problem. Without
+`projectIds` the call issues an ordinary token. The answer carries the token,
+once, exactly as for an ordinary token, and `agentAccessTokens.list` shows each
+token's `projectIds`.
+
+**Revoking and expiry** are an ordinary token's: revoke it with
+`agentAccessTokens.revoke` (or the **MCP** tab's revoke button), and it expires 30
+days after it is issued. Neither its projects nor its tools are settings: the
+recovery tools are the `SCOPED_AGENT_RECOVERY_TOOLS` constant
+(`src/identity/agent-access-token.ts`).
+
 ## Connecting a client
 
 1. In the dashboard, open your **Profile** and the **MCP** tab.
@@ -126,7 +182,10 @@ runs, force re-reviews, schedule conflict checks, wake dependency waits and clos
 the work item behind a merged pull request in every project where you hold
 `member`, and reorder phase agents in every project you administer. It can also
 create projects, and change the configuration and credentials of every project
-you administer.
+you administer. A [scoped agent credential](#scoped-agent-credentials) can do
+less: it reads its own projects, including their run logs and agent output, and
+can reset and re-dispatch runs, force re-reviews, schedule conflict checks and
+wake dependency waits there, and nothing else. Treat it like a password too.
 
 ### Using the `swarm login` session instead
 
@@ -189,7 +248,9 @@ reads as *not found*. Scope means what a call can reach:
 Each required role is the one the tool's dashboard procedure already enforces; this
 table decides nothing new about the dashboard. **A tool missing from the table is
 default-denied**: it is shown to, and callable by, installation administrators
-only.
+only, and never by a scoped agent credential. A [scoped agent
+credential](#scoped-agent-credentials) is narrowed further, to its own tools and
+projects.
 
 ## Tools
 
@@ -290,7 +351,10 @@ the same way:
   target.
 - **Every call is audited.** Dry or real, succeeded, refused or failed, each call
   writes one row to the `operator_actions` table: who (`user_id`,
-  `user_identifier`), which `tool`, `project_id`, `target`, `reason`, `dry_run`,
+  `user_identifier`), with which credential (`credential_kind`: `user` for a
+  `swarm login` session or an ordinary agent access token, `scoped-agent-token`
+  for a [scoped agent credential](#scoped-agent-credentials), whose token id is in
+  `agent_token_id`), which `tool`, `project_id`, `target`, `reason`, `dry_run`,
   the `input` arguments (a secret argument, such as `project_credential_set`'s
   `value`, is recorded as `[redacted]`), `outcome` (`succeeded`, `refused`, `failed`, or
   `pending` while the call runs), `error`, `detail` (what a tool recorded about
@@ -508,6 +572,13 @@ SDK refuses a disabled tool's call before the tool runs, and so before a write
 tool's audit row. `runTool` and the write-tool framework refuse a call below the
 tool's role with `FORBIDDEN`; the write-tool framework does it after the audit row
 is written.
+A scoped agent credential resolves to a `scoped-agent-token` principal
+(`scopedAgentPrincipal`, `src/mcp/tool-access.ts`): its user is the holder with
+`instanceAdmin` cleared and the project list attached (`scopeUserToProjects`,
+`src/identity/schema.ts`), which the `src/api/authz.ts` helpers read to answer
+`NOT_FOUND` outside the scope and `FORBIDDEN` for every installation-wide view.
+`TOOL_ACCESS`'s `agentScoped` flag is its tool allowlist, and the write-tool
+framework records the credential on the audit row.
 The tokens themselves are managed through the dashboard's `agentAccessTokens` tRPC
 router (`src/api/routers/agentAccessTokens.ts`), which is not mounted on the
 operator API. The tab's command is built by `dashboard/src/lib/agent-access.ts`, and

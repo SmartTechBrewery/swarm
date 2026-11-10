@@ -1,6 +1,6 @@
 import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
-
+import { findProjectRecordByIdFromDb } from '../../db/repositories/projectsRepository.js';
 import {
 	AGENT_ACCESS_TOKEN_VALIDITY_DAYS,
 	IssueAgentAccessTokenInputSchema,
@@ -10,6 +10,7 @@ import {
 	listAgentAccessTokens,
 	revokeAgentAccessToken,
 } from '../../identity/agent-access-token-service.js';
+import { mayAccessProject } from '../authz.js';
 import { authedProcedure, router } from '../trpc.js';
 
 /**
@@ -17,9 +18,17 @@ import { authedProcedure, router } from '../trpc.js';
  * the profile's MCP tab. A token is what an MCP client sends to `/operator/mcp`
  * as `Authorization: Bearer`; this router only manages them and accepts none.
  *
- * **The subject is always `ctx.user`.** Issuing takes a name and nothing else,
- * list and revoke see only the caller's own tokens, and no procedure takes a user
- * id — so no request here can reach another account's tokens.
+ * **The subject is always `ctx.user`.** Issuing takes a name (and, for a scoped
+ * agent credential, its projects), list and revoke see only the caller's own
+ * tokens, and no procedure takes a user id — so no request here can reach another
+ * account's tokens.
+ *
+ * **A scoped agent credential** (issue #1385) is issued with `projectIds`: a
+ * request made with it reaches only those projects and only the read tools plus
+ * `SCOPED_AGENT_RECOVERY_TOOLS` (`docs/mcp.md` "Scoped agent credentials"). Each
+ * named project must exist and be one the caller may drive (`member`); otherwise
+ * the issuing is `NOT_FOUND`, worded like a missing project so it reveals no
+ * project's existence.
  *
  * **Installation administrators only** (`MAY_USE_AGENT_ACCESS_TOKENS`): any other
  * caller gets `FORBIDDEN` from all three before any query, so the refusal says
@@ -54,9 +63,21 @@ export const agentAccessTokensRouter = router({
 				actor: ctx.user,
 				token: input,
 				now: new Date(),
+				mayScopeTo: async (projectId) =>
+					(await findProjectRecordByIdFromDb(projectId)) !== undefined &&
+					(await mayAccessProject(ctx.user, projectId, 'member')),
 			});
-			if (issued.outcome === 'forbidden') throw forbidden();
-			return issued.issued;
+			switch (issued.outcome) {
+				case 'issued':
+					return issued.issued;
+				case 'forbidden':
+					throw forbidden();
+				default:
+					throw new TRPCError({
+						code: 'NOT_FOUND',
+						message: 'One of the named projects was not found.',
+					});
+			}
 		}),
 
 	revoke: authedProcedure

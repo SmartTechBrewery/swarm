@@ -40,12 +40,22 @@
  * a live investigation. It does that by calling {@link mayAccessProject} rather
  * than {@link assertProjectAccess}; don't route it back through this helper, and
  * don't generalise the exemption to any other project-keyed procedure.
+ *
+ * **A scoped agent credential narrows every helper here** (issue #1385). Its
+ * request acts as the holder with an `AgentProjectScope` attached
+ * (`scopeUserToProjects`, `../identity/schema.ts`): a project outside the scope is
+ * `NOT_FOUND` — before, and regardless of, the administrator bypass — a project
+ * inside it gets the holder's own rule (an administrator holder passing), the
+ * cross-project scope is the credential's projects the holder may read, and
+ * {@link assertInstanceAdmin} always refuses, since an installation-wide view is
+ * never inside a project scope. The scoped user's own `instanceAdmin` is `false`,
+ * so a procedure that reads the flag directly fails closed too.
  */
 
 import { TRPCError } from '@trpc/server';
 import { type ProjectRole, roleAtLeast } from '../identity/membership.js';
 import { getMembership, listAccessibleProjectIds } from '../identity/membership-service.js';
-import { isInstanceAdmin, type SwarmUser } from '../identity/schema.js';
+import { agentScopeOf, isInstanceAdmin, type SwarmUser } from '../identity/schema.js';
 
 /**
  * The `NOT_FOUND` a non-member (or anyone querying an unknown id) receives — the
@@ -85,11 +95,30 @@ function projectNotFound(projectId: string, notFoundMessage?: string): TRPCError
  * {@link assertProjectAccess}.
  */
 export function assertInstanceAdmin(user: SwarmUser, view: string): void {
-	if (isInstanceAdmin(user)) return;
+	if (agentScopeOf(user) === undefined && isInstanceAdmin(user)) return;
 	throw new TRPCError({
 		code: 'FORBIDDEN',
 		message: `The installation-wide ${view} view is available to instance administrators only. Open a project you are enrolled in to see its ${view}.`,
 	});
+}
+
+/**
+ * The project decision a user's installation role (and, for a scoped agent
+ * credential, its scope) settles on its own: `outside-scope` when the credential
+ * does not reach `projectId`, `admin` when an administrator — or an administrator
+ * holder inside their credential's scope — passes outright, and `membership` when
+ * the project membership decides.
+ */
+function scopedAdminAccess(
+	user: SwarmUser,
+	projectId: string,
+): 'outside-scope' | 'admin' | 'membership' {
+	const scope = agentScopeOf(user);
+	if (scope) {
+		if (!scope.projectIds.includes(projectId)) return 'outside-scope';
+		return scope.holderInstanceAdmin ? 'admin' : 'membership';
+	}
+	return isInstanceAdmin(user) ? 'admin' : 'membership';
 }
 
 /**
@@ -107,7 +136,12 @@ export async function assertProjectAccess(
 	minRole: ProjectRole,
 	notFoundMessage?: string,
 ): Promise<void> {
-	if (isInstanceAdmin(user)) return;
+	switch (scopedAdminAccess(user, projectId)) {
+		case 'outside-scope':
+			throw projectNotFound(projectId, notFoundMessage);
+		case 'admin':
+			return;
+	}
 
 	const membership = await getMembership(user.id, projectId);
 	if (!membership) {
@@ -139,7 +173,12 @@ export async function mayAccessProject(
 	projectId: string,
 	minRole: ProjectRole,
 ): Promise<boolean> {
-	if (isInstanceAdmin(user)) return true;
+	switch (scopedAdminAccess(user, projectId)) {
+		case 'outside-scope':
+			return false;
+		case 'admin':
+			return true;
+	}
 	const membership = await getMembership(user.id, projectId);
 	return membership !== undefined && roleAtLeast(membership.role, minRole);
 }
@@ -152,6 +191,14 @@ export async function mayAccessProject(
  * cross-project list/queued scoping.
  */
 export async function accessibleProjectScope(user: SwarmUser): Promise<string[] | null> {
+	const scope = agentScopeOf(user);
+	if (scope) {
+		// A scoped agent credential: its projects, narrowed to those the holder may
+		// read — all of them for an administrator holder.
+		if (scope.holderInstanceAdmin) return [...scope.projectIds].sort();
+		const accessible = new Set(await listAccessibleProjectIds(user.id));
+		return scope.projectIds.filter((projectId) => accessible.has(projectId)).sort();
+	}
 	if (isInstanceAdmin(user)) return null;
 	return listAccessibleProjectIds(user.id);
 }

@@ -7,6 +7,11 @@ vi.mock('@/identity/agent-access-token-service.js', () => ({
 	revokeAgentAccessToken: vi.fn(),
 }));
 
+const { findProjectRecordByIdFromDb } = vi.hoisted(() => ({
+	findProjectRecordByIdFromDb: vi.fn(),
+}));
+vi.mock('@/db/repositories/projectsRepository.js', () => ({ findProjectRecordByIdFromDb }));
+
 import { agentAccessTokensRouter } from '@/api/routers/agentAccessTokens.js';
 import {
 	issueAgentAccessToken,
@@ -44,6 +49,9 @@ describe('agentAccessTokensRouter (issue #1362)', () => {
 		vi.mocked(issueAgentAccessToken).mockReset();
 		vi.mocked(listAgentAccessTokens).mockReset();
 		vi.mocked(revokeAgentAccessToken).mockReset();
+		findProjectRecordByIdFromDb
+			.mockReset()
+			.mockImplementation(async (id: string) => (id === 'proj-a' ? { id } : undefined));
 	});
 
 	it('requires a signed-in caller', async () => {
@@ -68,6 +76,35 @@ describe('agentAccessTokensRouter (issue #1362)', () => {
 			caller.issue({ name: 'x', userId: ADMIN.id } as unknown as { name: string }),
 			'BAD_REQUEST',
 		);
+		expect(issueAgentAccessToken).not.toHaveBeenCalled();
+	});
+
+	// Issue #1385: a scoped agent credential.
+	it('issues a scoped credential, letting it name only projects that exist', async () => {
+		vi.mocked(issueAgentAccessToken).mockResolvedValue({
+			outcome: 'issued',
+			issued: { ...TOKEN, projectIds: ['proj-a'], token: 'raw' },
+		});
+
+		expect(await caller.issue({ name: 'agent', projectIds: ['proj-a', 'proj-a'] })).toEqual({
+			...TOKEN,
+			projectIds: ['proj-a'],
+			token: 'raw',
+		});
+		const { token, mayScopeTo } = vi.mocked(issueAgentAccessToken).mock.calls[0][0];
+		expect(token).toEqual({ name: 'agent', projectIds: ['proj-a'] });
+		expect(await mayScopeTo('proj-a')).toBe(true);
+		expect(await mayScopeTo('proj-missing')).toBe(false);
+	});
+
+	it('answers a scoped issuing naming an unknown or inaccessible project with NOT_FOUND', async () => {
+		vi.mocked(issueAgentAccessToken).mockResolvedValue({ outcome: 'unknown-project' });
+
+		await expectCode(caller.issue({ name: 'agent', projectIds: ['proj-missing'] }), 'NOT_FOUND');
+	});
+
+	it('refuses a scoped issuing with an empty project list, before the service', async () => {
+		await expectCode(caller.issue({ name: 'agent', projectIds: [] }), 'BAD_REQUEST');
 		expect(issueAgentAccessToken).not.toHaveBeenCalled();
 	});
 

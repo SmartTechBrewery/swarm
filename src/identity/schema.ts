@@ -70,3 +70,44 @@ export function isInstanceAdmin(user: Pick<SwarmUser, 'instanceAdmin'>): boolean
 export function installationRoleFor(user: Pick<SwarmUser, 'instanceAdmin'>): InstallationRole {
 	return isInstanceAdmin(user) ? 'instanceAdmin' : 'user';
 }
+
+/**
+ * The project limit a **scoped agent credential** (issue #1385) puts on the user a
+ * request acts as. Runtime only — never persisted, never on the wire: the operator
+ * MCP endpoint (`src/router/operator-mcp.ts`) attaches it to the holder's user
+ * through {@link scopeUserToProjects}, and the authorization helpers
+ * (`src/api/authz.ts`) read it through {@link agentScopeOf}.
+ */
+export interface AgentProjectScope {
+	/** The projects the credential reaches; every other project reads as absent. */
+	readonly projectIds: readonly string[];
+	/**
+	 * Whether the holder is an installation administrator. The scoped user's own
+	 * `instanceAdmin` is `false` (see {@link scopeUserToProjects}), so the holder's
+	 * administrator access *inside* the scope is carried here, for the authz helpers.
+	 */
+	readonly holderInstanceAdmin: boolean;
+}
+
+type ScopedSwarmUser = SwarmUser & { readonly agentScope?: AgentProjectScope };
+
+/**
+ * `user` limited to `projectIds`, as a scoped agent credential's request acts:
+ * the same account (id and identifier, so every audit row names the holder), with
+ * `instanceAdmin` **cleared** — so any check that reads the flag directly, rather
+ * than through a scope-aware authz helper, fails closed — and the holder's own
+ * flag kept on the {@link AgentProjectScope}.
+ */
+export function scopeUserToProjects(user: SwarmUser, projectIds: readonly string[]): SwarmUser {
+	const scoped: ScopedSwarmUser = {
+		...user,
+		instanceAdmin: false,
+		agentScope: { projectIds: [...projectIds], holderInstanceAdmin: user.instanceAdmin },
+	};
+	return scoped;
+}
+
+/** The project limit on `user`, or `undefined` for an unscoped user (session or ordinary token). */
+export function agentScopeOf(user: SwarmUser): AgentProjectScope | undefined {
+	return (user as ScopedSwarmUser).agentScope;
+}

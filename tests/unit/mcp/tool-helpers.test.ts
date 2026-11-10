@@ -20,7 +20,7 @@ const USER: SwarmUser = {
 	updatedAt: new Date('2026-01-01T00:00:00Z'),
 };
 /** A ceiling every tool, listed or not, is open to. */
-const ADMIN: ToolContext = { user: USER, ceiling: 'instanceAdmin' };
+const ADMIN: ToolContext = { user: USER, credential: { kind: 'user' }, ceiling: 'instanceAdmin' };
 
 describe('jsonResult', () => {
 	it('returns an object as JSON text and as the same structured content', () => {
@@ -56,7 +56,7 @@ describe('runTool', () => {
 	] as const)('refuses a %s calling %s with FORBIDDEN, never running the body', async (ceiling, tool) => {
 		const body = vi.fn(async () => ({ ok: true }));
 
-		const result = await runTool({ user: USER, ceiling }, tool, body);
+		const result = await runTool({ user: USER, credential: { kind: 'user' }, ceiling }, tool, body);
 
 		expect(result.isError).toBe(true);
 		expect(result.content).toEqual([

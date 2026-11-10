@@ -18,6 +18,12 @@ import { operatorActions } from '../schema/operatorActions.js';
 /** How a write-tool call ended. `pending` is the state of a row whose call has not settled. */
 export type OperatorActionOutcome = 'pending' | 'succeeded' | 'refused' | 'failed';
 
+/**
+ * Which credential an audited call was made with: the account's own (`user` — a
+ * session or an ordinary agent access token) or a project-scoped agent credential.
+ */
+export type OperatorActionCredentialKind = 'user' | 'scoped-agent-token';
+
 export type OperatorActionRow = typeof operatorActions.$inferSelect;
 
 export interface RecordOperatorActionInput {
@@ -29,6 +35,10 @@ export interface RecordOperatorActionInput {
 	reason: string;
 	dryRun: boolean;
 	input: unknown;
+	/** Which credential made the call (issue #1385); the column defaults to `user`. */
+	credentialKind?: OperatorActionCredentialKind;
+	/** The scoped agent credential's token id; `null` for any other credential. */
+	agentTokenId?: string | null;
 }
 
 /** Insert one call's audit row as `pending`; returns its id for {@link settleOperatorAction}. */

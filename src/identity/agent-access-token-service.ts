@@ -19,8 +19,9 @@ import { createHash, randomBytes } from 'node:crypto';
 import {
 	deleteAgentAccessToken,
 	deleteExpiredAgentAccessTokens,
-	findUserByLiveAgentAccessToken,
+	findLiveAgentAccessToken,
 	insertAgentAccessToken,
+	type LiveAgentAccessToken,
 	listAgentAccessTokensOfUser,
 	recordAgentAccessTokenUse,
 } from '../db/repositories/agentAccessTokensRepository.js';
@@ -34,11 +35,19 @@ import {
 } from './agent-access-token.js';
 import type { SwarmUser } from './schema.js';
 
+export type { LiveAgentAccessToken } from '../db/repositories/agentAccessTokensRepository.js';
+
 const AGENT_ACCESS_TOKEN_BYTES = 32;
 
+/**
+ * `unknown-project` is a scoped issuing's alone: one of the named projects does
+ * not exist **or** the actor may not drive it. The two are one answer, so the
+ * refusal never tells the asker which project ids are real.
+ */
 export type IssueAgentAccessTokenOutcome =
 	| { outcome: 'issued'; issued: IssuedAgentAccessToken }
-	| { outcome: 'forbidden' };
+	| { outcome: 'forbidden' }
+	| { outcome: 'unknown-project' };
 
 export type ListAgentAccessTokensOutcome =
 	| { outcome: 'listed'; tokens: AgentAccessToken[] }
@@ -61,15 +70,30 @@ function hashAgentAccessToken(rawToken: string): string {
 
 /**
  * Issue a token for the caller themselves: the raw value goes back, only its
- * hash to the database. The input is the name alone — the account is `actor`,
- * resolved from the session — so no request can issue one for somebody else.
+ * hash to the database. The input is the name — plus, for a **scoped agent
+ * credential** (issue #1385), the projects it is limited to — and the account is
+ * `actor`, resolved from the session, so no request can issue one for somebody
+ * else.
+ *
+ * A scoped issuing asks `mayScopeTo` about every named project before anything is
+ * stored — whether it exists and the actor may drive its runs (`member`), which is
+ * the API's rule (`src/api/routers/agentAccessTokens.ts`), not this module's — and
+ * any "no" refuses the whole token as `unknown-project`.
  */
 export async function issueAgentAccessToken(input: {
 	actor: SwarmUser;
 	token: IssueAgentAccessTokenInput;
 	now: Date;
+	mayScopeTo: (projectId: string) => Promise<boolean>;
 }): Promise<IssueAgentAccessTokenOutcome> {
 	if (!mayUseAgentAccessTokens(input.actor)) return { outcome: 'forbidden' };
+
+	const { projectIds } = input.token;
+	if (projectIds) {
+		for (const projectId of projectIds) {
+			if (!(await input.mayScopeTo(projectId))) return { outcome: 'unknown-project' };
+		}
+	}
 
 	const token = randomBytes(AGENT_ACCESS_TOKEN_BYTES).toString('base64url');
 	const stored = await insertAgentAccessToken({
@@ -77,6 +101,7 @@ export async function issueAgentAccessToken(input: {
 		name: input.token.name,
 		tokenHash: hashAgentAccessToken(token),
 		expiresAt: agentAccessTokenExpiry(input.now),
+		...(projectIds ? { projectIds } : {}),
 	});
 	return { outcome: 'issued', issued: { ...stored, token } };
 }
@@ -101,7 +126,8 @@ export async function revokeAgentAccessToken(
 }
 
 /**
- * Resolve a raw token to its holder, or `undefined` when no live token matches —
+ * Resolve a raw token to its holder, its id and — for a scoped agent credential —
+ * the projects it is limited to, or `undefined` when no live token matches —
  * the twin of `resolveSession`. A token never issued, an expired one and a
  * revoked one are **one** `undefined`, so the caller's single refusal tells the
  * asker nothing about which tokens exist.
@@ -120,13 +146,13 @@ export async function revokeAgentAccessToken(
 export async function resolveAgentAccessToken(
 	rawToken: string,
 	now: Date = new Date(),
-): Promise<SwarmUser | undefined> {
+): Promise<LiveAgentAccessToken | undefined> {
 	if (!rawToken) return undefined;
 
 	const tokenHash = hashAgentAccessToken(rawToken);
-	const user = await findUserByLiveAgentAccessToken(tokenHash, now);
+	const live = await findLiveAgentAccessToken(tokenHash, now);
 
-	if (user) {
+	if (live) {
 		await recordAgentAccessTokenUse(
 			tokenHash,
 			now,
@@ -136,5 +162,5 @@ export async function resolveAgentAccessToken(
 
 	void deleteExpiredAgentAccessTokens(now).catch(() => {});
 
-	return user;
+	return live;
 }

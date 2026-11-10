@@ -52,6 +52,19 @@ export const operatorActions = pgTable(
 		 * records nothing, or a call that ended before its preview resolved.
 		 */
 		detail: jsonb('detail'),
+		/**
+		 * Which credential made the call (issue #1385): `user` — the account's own
+		 * `swarm login` session or an ordinary agent access token — or
+		 * `scoped-agent-token`, a project-scoped agent credential, so an agent's calls
+		 * read apart from the account holder's own. `text`, like `tool`.
+		 */
+		credentialKind: text('credential_kind').notNull().default('user'),
+		/**
+		 * The scoped agent credential's token id when `credential_kind` is
+		 * `scoped-agent-token`, otherwise `null`. No foreign key, like every column
+		 * here: the row must outlive a revoked or expired token.
+		 */
+		agentTokenId: uuid('agent_token_id'),
 		startedAt: timestamp('started_at').defaultNow().notNull(),
 		completedAt: timestamp('completed_at'),
 	},
