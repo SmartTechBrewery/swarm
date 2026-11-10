@@ -2143,7 +2143,8 @@ An **MCP client** — Claude Code, for one — connects to the control plane too
 router serves an MCP server at `/operator/mcp`, open to every signed-in user,
 each tool to the role its dashboard procedure needs. An installation
 administrator connects it with an agent access token issued from their profile's
-**MCP** tab, which also gives them the ready `claude mcp add` command; anyone
+**MCP** tab, which also gives them the ready `claude mcp add` command and can
+limit the token to some projects (a scoped agent credential); anyone
 else connects with their `swarm login` session. Its tools call
 the dashboard's own procedures as you, so an assistant session can read runs,
 their failure causes and their agent output, a project's whole pipeline state in

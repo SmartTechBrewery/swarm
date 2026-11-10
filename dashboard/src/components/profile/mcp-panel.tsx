@@ -8,6 +8,7 @@ import { trpc, trpcClient } from '@/lib/trpc.js';
 import {
 	type AgentAccessToken,
 	hasAgentAccessTokenExpired,
+	type IssueAgentAccessTokenInput,
 	IssueAgentAccessTokenInputSchema,
 	type IssuedAgentAccessToken,
 } from '../../../../src/identity/agent-access-token.js';
@@ -27,6 +28,12 @@ import {
  * the reveal is open: Close clears that state and resets the issuing mutation,
  * whose `gcTime: 0` then drops it from the mutation cache as well. The list never
  * carries it — its shape has no such field.
+ *
+ * **Scoped agent credentials** (issue #1386): the form's optional project picker
+ * limits a token to the checked projects by sending `projectIds`; with none checked
+ * the field is omitted and the token keeps its holder's full access. Every token's
+ * scope is stated on its row and in the reveal, so a scoped one is told apart — and
+ * revoked — on its own. A scope cannot be edited: issue a new token, revoke the old.
  */
 
 const CARD_CLASS = 'border border-zinc-800 rounded-lg bg-panel/40 p-6 shadow-sm';
@@ -43,6 +50,11 @@ function formatDate(iso: string): string {
 
 function formatDateTime(iso: string): string {
 	return new Date(iso).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+}
+
+/** A token's scope as a label: its project ids, or every project its holder reaches. */
+function scopeLabel(projectIds: string[] | undefined): string {
+	return projectIds === undefined ? 'All projects' : `Scoped: ${projectIds.join(', ')}`;
 }
 
 /**
@@ -140,6 +152,15 @@ function IssuedTokenDialog({
 				</button>
 			</div>
 
+			<div className="space-y-1.5">
+				<p className={LABEL_CLASS}>Scope</p>
+				<p id="mcp-issued-scope" className="text-xs text-zinc-300">
+					{issued.projectIds === undefined
+						? 'All projects — the token acts with your full access.'
+						: `Limited to ${issued.projectIds.join(', ')} — the token reaches only these projects, with the read tools and the recovery tools alone.`}
+				</p>
+			</div>
+
 			<p className="text-xs text-zinc-500">
 				The token works only on the installation that issued it.
 			</p>
@@ -226,6 +247,7 @@ function TokenRow({
 			<div className="min-w-0 space-y-1">
 				<div className="flex flex-wrap items-center gap-2">
 					<p className="text-sm font-semibold text-zinc-200 break-words">{token.name}</p>
+					<Badge>{scopeLabel(token.projectIds)}</Badge>
 					{expired && <Badge tone="negative">Expired</Badge>}
 				</div>
 				<p className="text-xs text-zinc-500">
@@ -249,6 +271,77 @@ function TokenRow({
 	);
 }
 
+const CHECKBOX_CLASS =
+	'h-4 w-4 rounded border-zinc-700 bg-zinc-900 text-violet-600 focus:ring-1 focus:ring-violet-500 disabled:opacity-50 disabled:cursor-not-allowed';
+
+/**
+ * The issue form's optional project picker: the projects the viewer can see
+ * (`projects.list`), any of which limits the token to them. Its loading and
+ * failure say what an issue made meanwhile gets — a full-access token — rather
+ * than blocking the form, since no project is needed to issue one.
+ */
+function ProjectScopePicker({
+	projects,
+	loading,
+	loadError,
+	selected,
+	disabled,
+	onChange,
+}: {
+	projects: { id: string; name: string }[];
+	loading: boolean;
+	loadError: string | null;
+	selected: string[];
+	disabled: boolean;
+	onChange: (projectIds: string[]) => void;
+}) {
+	const toggle = (projectId: string) =>
+		onChange(
+			selected.includes(projectId)
+				? selected.filter((id) => id !== projectId)
+				: projects.map((p) => p.id).filter((id) => id === projectId || selected.includes(id)),
+		);
+
+	return (
+		<fieldset className="mt-4" aria-describedby="mcp-scope-help">
+			<legend className={LABEL_CLASS}>Limit to projects (optional)</legend>
+			<p id="mcp-scope-help" className="text-xs text-zinc-500 mb-2">
+				Leave every project unchecked for a token with your full access. Check some to issue a
+				scoped agent credential: it reaches only those projects, with the read tools and the
+				recovery tools alone.
+			</p>
+			{loading ? (
+				<p className="text-xs text-zinc-500">Loading projects…</p>
+			) : loadError !== null ? (
+				<p className={ERROR_CLASS}>
+					Projects could not be loaded ({loadError}). A token issued now has your full access.
+				</p>
+			) : projects.length === 0 ? (
+				<p className="text-xs text-zinc-500">There is no project to limit a token to.</p>
+			) : (
+				<div className="flex flex-wrap gap-x-4 gap-y-2">
+					{projects.map((project) => (
+						<label
+							key={project.id}
+							className="inline-flex items-center gap-2 text-sm text-zinc-300"
+						>
+							<input
+								type="checkbox"
+								checked={selected.includes(project.id)}
+								disabled={disabled}
+								onChange={() => toggle(project.id)}
+								className={CHECKBOX_CLASS}
+							/>
+							<span>{project.name}</span>
+							<span className="font-mono text-xs text-zinc-500">{project.id}</span>
+						</label>
+					))}
+				</div>
+			)}
+		</fieldset>
+	);
+}
+
 function LoadingSkeleton() {
 	return (
 		<div data-testid="mcp-skeleton" aria-busy="true" className="space-y-3 animate-pulse">
@@ -264,11 +357,13 @@ export function McpPanel() {
 	const queryClient = useQueryClient();
 	const listQueryOptions = trpc.agentAccessTokens.list.queryOptions();
 	const read = useQuery(listQueryOptions);
+	const projectsQuery = useQuery(trpc.projects.list.queryOptions());
 	const invalidateList = () =>
 		queryClient.invalidateQueries({ queryKey: listQueryOptions.queryKey });
 
 	const issue = useMutation({
-		mutationFn: (input: { name: string }) => trpcClient.agentAccessTokens.issue.mutate(input),
+		mutationFn: (input: IssueAgentAccessTokenInput) =>
+			trpcClient.agentAccessTokens.issue.mutate(input),
 		// The answer carries the raw token: once the reveal is closed and the
 		// mutation reset, nothing may keep it in the cache.
 		gcTime: 0,
@@ -280,6 +375,7 @@ export function McpPanel() {
 	});
 
 	const [name, setName] = useState('');
+	const [scopeProjectIds, setScopeProjectIds] = useState<string[]>([]);
 	const [issueError, setIssueError] = useState<string | null>(null);
 	const [issued, setIssued] = useState<IssuedAgentAccessToken | null>(null);
 	const [revoking, setRevoking] = useState<AgentAccessToken | null>(null);
@@ -313,7 +409,11 @@ export function McpPanel() {
 		event.preventDefault();
 		if (issue.isPending) return;
 
-		const parsed = IssueAgentAccessTokenInputSchema.safeParse({ name });
+		// No project checked omits `projectIds`, which is what keeps the token full-access:
+		// the schema refuses an empty list rather than reading it as either.
+		const parsed = IssueAgentAccessTokenInputSchema.safeParse(
+			scopeProjectIds.length === 0 ? { name } : { name, projectIds: scopeProjectIds },
+		);
 		if (!parsed.success) {
 			setIssueError(parsed.error.issues[0]?.message ?? 'A token name is required.');
 			return;
@@ -323,6 +423,7 @@ export function McpPanel() {
 		issue.mutate(parsed.data, {
 			onSuccess: (token) => {
 				setName('');
+				setScopeProjectIds([]);
 				setIssued(token);
 			},
 			onError: (error) => setIssueError(error.message),
@@ -381,6 +482,14 @@ export function McpPanel() {
 						{issue.isPending ? 'Issuing…' : 'Issue token'}
 					</button>
 				</div>
+				<ProjectScopePicker
+					projects={projectsQuery.data ?? []}
+					loading={projectsQuery.isPending}
+					loadError={projectsQuery.error?.message ?? null}
+					selected={scopeProjectIds}
+					disabled={issue.isPending}
+					onChange={setScopeProjectIds}
+				/>
 				<div role="status" className="empty:hidden mt-3">
 					{issueError !== null && (
 						<p id="mcp-issue-error" className={ERROR_CLASS}>
