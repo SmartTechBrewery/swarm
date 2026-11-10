@@ -227,6 +227,15 @@ clone → profile migration) — runs `<wrapper> <the usual command…>`, for ex
 an empty one, the plist is exactly what it was without the feature; a path that is
 relative or names anything but an executable file is warned about and ignored.
 
+When the wrapper is an app bundle's executable (`<Something>.app/Contents/MacOS/<exe>`),
+the plist also names that bundle in `AssociatedBundleIdentifiers`, taken from the
+bundle's own `CFBundleIdentifier` (issue #1409), so **Login Items → Allow in the
+Background** lists the agent as the app rather than under the developer name in the
+wrapper's signature. macOS fixes that entry's parent at the agent's first
+registration, which is why the key is written before the first `bootstrap`; an agent
+registered once without it may stay filed under the developer until it is removed and
+registered again.
+
 The wrapper receives the whole command as its arguments and must:
 
 - start it as a **child process**, not `exec` it (which would put `node` back as the
