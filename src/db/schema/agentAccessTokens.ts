@@ -1,4 +1,5 @@
-import { index, pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core';
+import { index, integer, pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core';
+import { runs } from './runs.js';
 import { users } from './users.js';
 
 /**
@@ -44,8 +45,25 @@ export const agentAccessTokens = pgTable(
 		 * ordinary token acting with its holder's full access; never an empty array.
 		 */
 		projectIds: text('project_ids').array(),
+		/**
+		 * The run a **run-bound** scoped agent credential belongs to (issue #1393): the
+		 * control plane mints one for a single run with a lifetime it chooses, and
+		 * revokes it when the run settles. `NULL` for every token a holder issues. A
+		 * run-bound token is a system credential, so it never appears on the holder's
+		 * list; `cascade` drops it with its run.
+		 */
+		runId: uuid('run_id').references(() => runs.id, { onDelete: 'cascade' }),
+		/**
+		 * How many real (not dry-run) write-tool calls a run-bound token may make
+		 * (issue #1393), enforced by the write-tool framework (`src/mcp/write-tool.ts`).
+		 * `NULL` when `run_id` is.
+		 */
+		maxWriteActions: integer('max_write_actions'),
 	},
-	// Resolving looks a row up by hash (the unique constraint indexes it); this
-	// index serves the holder's own list, the revoke and the cascade.
-	(table) => [index('idx_agent_access_tokens_user_id').on(table.userId)],
+	// Resolving looks a row up by hash (the unique constraint indexes it); these
+	// indexes serve the holder's own list, the revoke and the two cascades.
+	(table) => [
+		index('idx_agent_access_tokens_user_id').on(table.userId),
+		index('idx_agent_access_tokens_run_id').on(table.runId),
+	],
 );

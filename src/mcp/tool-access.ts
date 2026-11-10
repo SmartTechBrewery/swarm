@@ -213,10 +213,27 @@ const ROLE_WORDING: Record<ToolMinRole, string> = {
  * `swarm login` session or an ordinary agent access token — both act with the
  * account's full access — and `scoped-agent-token` for an agent access token
  * limited to `projectIds`. Recorded on every write tool's audit row.
+ *
+ * A **run-bound** scoped credential (issue #1393) also carries the `runId` it was
+ * minted for and its `maxWriteActions` cap; with them, the write-tool framework
+ * enforces the per-run guardrails (`./write-tool.ts`). Both are absent for a
+ * scoped credential a holder issued.
  */
 export type McpCredential =
 	| { kind: 'user' }
-	| { kind: 'scoped-agent-token'; tokenId: string; projectIds: readonly string[] };
+	| {
+			kind: 'scoped-agent-token';
+			tokenId: string;
+			projectIds: readonly string[];
+			runId?: string;
+			maxWriteActions?: number;
+	  };
+
+/** What binds a scoped agent credential to one run (issue #1393). */
+export interface RunBinding {
+	runId: string;
+	maxWriteActions: number;
+}
 
 /** Who an MCP request acts as, and with which credential. */
 export interface McpPrincipal {
@@ -235,17 +252,24 @@ export function userPrincipal(user: SwarmUser): McpPrincipal {
 
 /**
  * The principal of a scoped agent credential: `holder` limited to `projectIds`,
- * with the token's id kept for the audit trail. The one place both halves are
- * built, so the user's project limit and the credential it came from cannot drift.
+ * with the token's id kept for the audit trail — and, for a run-bound credential,
+ * its {@link RunBinding}. The one place both halves are built, so the user's
+ * project limit and the credential it came from cannot drift.
  */
 export function scopedAgentPrincipal(
 	holder: SwarmUser,
 	tokenId: string,
 	projectIds: readonly string[],
+	run?: RunBinding,
 ): McpPrincipal {
 	return {
 		user: scopeUserToProjects(holder, projectIds),
-		credential: { kind: 'scoped-agent-token', tokenId, projectIds: [...projectIds] },
+		credential: {
+			kind: 'scoped-agent-token',
+			tokenId,
+			projectIds: [...projectIds],
+			...(run ? { runId: run.runId, maxWriteActions: run.maxWriteActions } : {}),
+		},
 	};
 }
 

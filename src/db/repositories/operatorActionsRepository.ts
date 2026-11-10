@@ -7,10 +7,12 @@
  * records how it ended. Nothing here decides anything; the write-tool framework
  * owns the outcome. One read, {@link findLatestOperatorAction} (issue #1349), lets a
  * tool act on what an earlier call recorded — `phase_agents_restore` re-applying the
- * order the latest `phase_agents_reorder` replaced.
+ * order the latest `phase_agents_reorder` replaced. Another,
+ * {@link countAgentTokenActions} (issue #1393), backs a run-bound agent
+ * credential's guardrails.
  */
 
-import { and, desc, eq } from 'drizzle-orm';
+import { and, count, desc, eq, inArray, ne } from 'drizzle-orm';
 
 import { getDb } from '../client.js';
 import { operatorActions } from '../schema/operatorActions.js';
@@ -102,4 +104,34 @@ export async function findLatestOperatorAction(query: {
 		.orderBy(desc(operatorActions.startedAt))
 		.limit(1);
 	return row;
+}
+
+/**
+ * How many calls one agent access token made (issue #1393) — the read behind a
+ * run-bound credential's guardrails (`src/mcp/write-tool.ts`). Keyed on the token,
+ * dry or real, and the outcomes that count; `tool` and `target` narrow it to one
+ * tool on one target, and `excludeId` leaves out the asking call's own row.
+ */
+export async function countAgentTokenActions(query: {
+	agentTokenId: string;
+	dryRun: boolean;
+	outcomes: readonly OperatorActionOutcome[];
+	tool?: string;
+	target?: string;
+	excludeId?: string;
+}): Promise<number> {
+	const [row] = await getDb()
+		.select({ n: count() })
+		.from(operatorActions)
+		.where(
+			and(
+				eq(operatorActions.agentTokenId, query.agentTokenId),
+				eq(operatorActions.dryRun, query.dryRun),
+				inArray(operatorActions.outcome, [...query.outcomes]),
+				...(query.tool !== undefined ? [eq(operatorActions.tool, query.tool)] : []),
+				...(query.target !== undefined ? [eq(operatorActions.target, query.target)] : []),
+				...(query.excludeId !== undefined ? [ne(operatorActions.id, query.excludeId)] : []),
+			),
+		);
+	return row?.n ?? 0;
 }

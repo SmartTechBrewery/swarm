@@ -18,6 +18,7 @@ import { createHash, randomBytes } from 'node:crypto';
 
 import {
 	deleteAgentAccessToken,
+	deleteAgentAccessTokensOfRun,
 	deleteExpiredAgentAccessTokens,
 	findLiveAgentAccessToken,
 	insertAgentAccessToken,
@@ -104,6 +105,54 @@ export async function issueAgentAccessToken(input: {
 		...(projectIds ? { projectIds } : {}),
 	});
 	return { outcome: 'issued', issued: { ...stored, token } };
+}
+
+/**
+ * Mint a **run-bound** scoped agent credential (issue #1393) — the control plane's,
+ * not a holder's: a token acting as `holderUserId` limited to `projectId`, bound
+ * to `runId`, allowed at most `maxWriteActions` real write-tool calls (the
+ * guardrails `src/mcp/write-tool.ts` enforces), and expiring `ttlMs` after `now` —
+ * the caller's lifetime, not {@link agentAccessTokenExpiry}'s 30 days. As with
+ * {@link issueAgentAccessToken}, the raw value is returned here once and only its
+ * hash is stored.
+ *
+ * No role is checked: this is a system verb, and who holds the token is the
+ * caller's decision. The token never appears on the holder's list, and
+ * {@link revokeRunBoundAgentTokens} (or the run's deletion) removes it.
+ */
+export async function mintRunBoundAgentToken(input: {
+	holderUserId: string;
+	projectId: string;
+	runId: string;
+	maxWriteActions: number;
+	ttlMs: number;
+	now?: Date;
+}): Promise<IssuedAgentAccessToken> {
+	if (!Number.isInteger(input.maxWriteActions) || input.maxWriteActions < 0) {
+		throw new Error(
+			`maxWriteActions must be a non-negative integer, got ${String(input.maxWriteActions)}`,
+		);
+	}
+	if (!Number.isFinite(input.ttlMs) || input.ttlMs <= 0) {
+		throw new Error(`ttlMs must be a positive number of milliseconds, got ${String(input.ttlMs)}`);
+	}
+	const now = input.now ?? new Date();
+	const token = randomBytes(AGENT_ACCESS_TOKEN_BYTES).toString('base64url');
+	const stored = await insertAgentAccessToken({
+		userId: input.holderUserId,
+		name: `run ${input.runId}`,
+		tokenHash: hashAgentAccessToken(token),
+		expiresAt: new Date(now.getTime() + input.ttlMs),
+		projectIds: [input.projectId],
+		runId: input.runId,
+		maxWriteActions: input.maxWriteActions,
+	});
+	return { ...stored, token };
+}
+
+/** Revoke every token bound to `runId` — called when the run settles. Returns their count. */
+export async function revokeRunBoundAgentTokens(runId: string): Promise<number> {
+	return deleteAgentAccessTokensOfRun(runId);
 }
 
 /** The caller's **own** tokens, the freshest first — never a raw value. */

@@ -38,6 +38,14 @@
  *  - **Which credential acted.** The row records the request's credential kind —
  *    `user`, or `scoped-agent-token` with the token's id (issue #1385) — so an
  *    agent's calls read apart from its holder's own.
+ *  - **A run-bound credential's guardrails** (issue #1393). A *real* call made with
+ *    a scoped agent credential minted for one run is refused with `FORBIDDEN`
+ *    (audited `refused`, before `preview`) when the token has already made its
+ *    `maxWriteActions` real calls — every audited real call that was not refused
+ *    counts, failed ones included — when no earlier dry run of the same tool on the
+ *    same target *succeeded* with it, or when it already applied the same tool to
+ *    the same target (a `succeeded` or `failed` real call). Dry runs are never
+ *    capped, and no other credential is affected.
  *  - **No secret in the audit trail.** A tool that accepts a secret names the field in
  *    `secretInputs`, and the row records it as `[redacted]` (issue #1359).
  *
@@ -52,12 +60,13 @@ import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 
 import {
+	countAgentTokenActions,
 	recordOperatorAction,
 	settleOperatorAction,
 } from '../db/repositories/operatorActionsRepository.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
-import { assertToolAccess, type ToolContext } from './tool-access.js';
+import { assertToolAccess, type McpCredential, type ToolContext } from './tool-access.js';
 import {
 	callerFor,
 	describeToolFailure,
@@ -191,13 +200,15 @@ export async function runWriteTool<
 	const input = rest as unknown as z.objectOutputType<Shape, z.ZodTypeAny>;
 
 	let auditId: string;
+	let target: string;
 	try {
+		target = definition.targetOf(input);
 		auditId = await recordOperatorAction({
 			userId: user.id,
 			userIdentifier: user.identifier,
 			tool: definition.name,
 			projectId: null,
-			target: definition.targetOf(input),
+			target,
 			reason,
 			dryRun,
 			input: auditableInput(input, definition.secretInputs),
@@ -245,6 +256,7 @@ export async function runWriteTool<
 				message: 'A write tool needs a non-empty `reason`.',
 			});
 		}
+		if (!dryRun) await assertRunGuardrails(definition.name, target, credential, auditId);
 		const caller = callerFor(user);
 		const preview = await definition.preview(input, caller);
 		projectId = preview.projectId;
@@ -260,5 +272,76 @@ export async function runWriteTool<
 		const failure = describeToolFailure(definition.name, error);
 		await settle(failure.outcome, failure.message);
 		return errorResult(failure.message);
+	}
+}
+
+/**
+ * Throw `FORBIDDEN` when a **real** call made with a run-bound scoped agent
+ * credential (issue #1393) breaks one of its run's guardrails, in this order: the
+ * token has used up its write cap, it never dry-ran this tool on this target
+ * successfully, or it already applied this tool to this target. Any other
+ * credential passes untouched. `auditId` is the asking call's own, still-pending
+ * row, which the cap must not count.
+ *
+ * A guardrail that cannot be read refuses the call too — nothing has been written
+ * yet, and a `failed` row would spend the run's cap and block the target for good.
+ */
+async function assertRunGuardrails(
+	tool: string,
+	target: string,
+	credential: McpCredential,
+	auditId: string,
+): Promise<void> {
+	if (credential.kind !== 'scoped-agent-token' || credential.runId === undefined) return;
+	const agentTokenId = credential.tokenId;
+	const cap = credential.maxWriteActions ?? 0;
+
+	let spent: number;
+	let dryRunsSucceeded: number;
+	let applied: number;
+	try {
+		[spent, dryRunsSucceeded, applied] = await Promise.all([
+			countAgentTokenActions({
+				agentTokenId,
+				dryRun: false,
+				outcomes: ['pending', 'succeeded', 'failed'],
+				excludeId: auditId,
+			}),
+			countAgentTokenActions({
+				agentTokenId,
+				dryRun: true,
+				outcomes: ['succeeded'],
+				tool,
+				target,
+			}),
+			countAgentTokenActions({
+				agentTokenId,
+				dryRun: false,
+				outcomes: ['succeeded', 'failed'],
+				tool,
+				target,
+			}),
+		]);
+	} catch (error) {
+		throw new TRPCError({
+			code: 'FORBIDDEN',
+			message: `This run's write guardrails could not be checked (${describeError(error)}).`,
+		});
+	}
+
+	if (spent >= cap) {
+		throw new TRPCError({
+			code: 'FORBIDDEN',
+			message: `write-action cap of ${cap} reached for this run`,
+		});
+	}
+	if (dryRunsSucceeded === 0) {
+		throw new TRPCError({ code: 'FORBIDDEN', message: `dry run ${tool} on ${target} first` });
+	}
+	if (applied > 0) {
+		throw new TRPCError({
+			code: 'FORBIDDEN',
+			message: `${tool} was already applied to ${target} in this run`,
+		});
 	}
 }

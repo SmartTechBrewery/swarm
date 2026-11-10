@@ -153,6 +153,38 @@ other tokens working. It expires 30 days after it is issued. Neither its project
 recovery and bug-report write tools are the `SCOPED_AGENT_RECOVERY_TOOLS` constant
 (`src/identity/agent-access-token.ts`).
 
+#### Run-bound agent credentials
+
+A **run-bound agent credential** is a scoped agent credential the control plane
+mints for **one run**, not one you issue. It is limited to that run's project and
+carries the same tool allowlist as any scoped credential, plus per-run guardrails
+the server enforces on its write tools.
+
+- **Lifetime.** It is minted by `mintRunBoundAgentToken`
+  (`src/identity/agent-access-token-service.ts`) with a lifetime the caller
+  chooses, not the 30 days of a token you issue. `revokeRunBoundAgentTokens`
+  deletes every token of the run when the run settles, and deleting the run
+  deletes them too. Like every agent access token, only its hash is stored.
+- **Holder.** It acts as the account it is minted for, limited to the run's
+  project, and is audited as `scoped-agent-token` with its own id. It is a system
+  credential: it never appears on that account's **MCP** tab or in
+  `agentAccessTokens.list`.
+- **Guardrails.** A real call (`dryRun: false`) to a write tool is refused with
+  `FORBIDDEN`, and the refusal is audited with outcome `refused`, before the tool
+  does anything, when:
+  1. the token has already made its cap of real calls: `FORBIDDEN: write-action
+     cap of <N> reached for this run`. Every real call that was not refused
+     counts, a failed one included;
+  2. the token has no earlier **succeeded** dry run of the same tool on the same
+     target: `FORBIDDEN: dry run <tool> on <target> first`;
+  3. the token already applied the same tool to the same target, whether that
+     call succeeded or failed: `FORBIDDEN: <tool> was already applied to <target>
+     in this run`.
+
+  Dry runs are never capped. The target is the one the tool records on its audit
+  row, for example the run id for `run_reset`. Ordinary tokens and scoped
+  credentials you issue have none of these guardrails.
+
 ## Connecting a client
 
 1. In the dashboard, open your **Profile** and the **MCP** tab.

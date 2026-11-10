@@ -34,7 +34,9 @@
  * reads as `NOT_FOUND`, an installation-wide view is `FORBIDDEN`
  * (`../api/authz.ts`), and only the read tools plus the recovery allowlist are
  * listed or callable (`agentScoped`, `../mcp/tool-access.ts`). Its write-tool
- * calls are audited as `scoped-agent-token` with the token's id.
+ * calls are audited as `scoped-agent-token` with the token's id. A **run-bound**
+ * one (issue #1393) also carries its run and write cap into the principal, and
+ * the write-tool framework enforces its per-run guardrails (`../mcp/write-tool.ts`).
  * **`SWARM_SINGLE_USER_MODE` is deliberately not honoured**, for the reason
  * `./operator-api.ts` gives: on an internet-reachable process it would make anyone
  * who found the URL an installation admin. Nothing in this module reads that
@@ -119,9 +121,14 @@ async function resolveBearerPrincipal(
 	if (session) return userPrincipal(session);
 	const agentToken = await deps.resolveAgentAccessToken(token);
 	if (!agentToken) return undefined;
-	return agentToken.projectIds && agentToken.projectIds.length > 0
-		? scopedAgentPrincipal(agentToken.user, agentToken.tokenId, agentToken.projectIds)
-		: userPrincipal(agentToken.user);
+	if (!agentToken.projectIds || agentToken.projectIds.length === 0) {
+		return userPrincipal(agentToken.user);
+	}
+	// A run-bound credential (issue #1393) with no stored cap gets none: zero real writes.
+	const run = agentToken.runId
+		? { runId: agentToken.runId, maxWriteActions: agentToken.maxWriteActions ?? 0 }
+		: undefined;
+	return scopedAgentPrincipal(agentToken.user, agentToken.tokenId, agentToken.projectIds, run);
 }
 
 /**
