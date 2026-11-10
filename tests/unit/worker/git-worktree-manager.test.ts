@@ -97,7 +97,7 @@ vi.mock('node:fs', () => ({
 
 import { logger } from '@/lib/logger.js';
 import { GitWorktreeManager } from '@/worker/git-worktree-manager.js';
-import { CommitUnavailableError } from '@/worktree/commit-availability.js';
+import { BranchUnavailableError, CommitUnavailableError } from '@/worktree/commit-availability.js';
 import { BlockedRecoveryError } from '@/worktree/reclaim.js';
 import { storeBackedWorktreeRuntime, type WorktreeRuntime } from '@/worktree/worktree-runtime.js';
 
@@ -603,6 +603,80 @@ describe('GitWorktreeManager', () => {
 			await expect(makeManager().provision('14')).rejects.toThrow(
 				/Could not resolve host: github.com/,
 			);
+		});
+
+		// Issue #1401, shape 1: Resolve-conflicts on a worker whose fetch timed out. The
+		// PR branch is on origin, but this clone has never seen it, so the checkout
+		// fails on git's `invalid reference` — a fact about the machine, not the run.
+		it('raises a branch-unavailable failure when an existing branch cannot be checked out after a failed fetch', async () => {
+			// Neither `refs/heads/issue-14` nor `refs/remotes/origin/issue-14` exists here.
+			const failures: Record<string, string> = {
+				fetch: 'ssh: connect to host github.com port 22: Operation timed out',
+				'rev-parse refs/heads/issue-14': 'fatal: Needed a single revision',
+				'rev-parse refs/remotes/origin/issue-14': 'fatal: Needed a single revision',
+				'worktree add': 'fatal: invalid reference: issue-14',
+			};
+			gitHandler = (args) => {
+				const failure =
+					failures[args[0]] ??
+					failures[`${args[0]} ${args[1]}`] ??
+					failures[`${args[0]} ${args[3]}`];
+				if (failure) throw new Error(failure);
+				if (args[0] === 'symbolic-ref') return { stdout: 'issue-14\n' };
+				return { stdout: '' };
+			};
+
+			const err = await makeManager()
+				.provision('14', { createBranch: false, branch: 'issue-14' })
+				.catch((e: unknown) => e);
+
+			expect(err).toBeInstanceOf(BranchUnavailableError);
+			// The subclass is what routes it through #1018's deferral and re-routing.
+			expect(err).toBeInstanceOf(CommitUnavailableError);
+			const message = (err as Error).message;
+			expect(message).toContain("Branch 'issue-14'");
+			expect(message).toContain('port 22: Operation timed out');
+			expect(message).toContain('invalid reference: issue-14');
+			expect(message).toContain(REPO_ROOT);
+			expect(message).toContain('another enrolled worker');
+			expect(releaseWorktreeLeaseMock).toHaveBeenCalled();
+		});
+
+		it('keeps a plain error when the existing branch is in this clone and the checkout fails anyway', async () => {
+			gitHandler = (args) => {
+				if (args[0] === 'fetch') throw new Error('Could not resolve host: github.com');
+				if (args[0] === 'symbolic-ref') return { stdout: 'issue-14\n' };
+				if (args[0] === 'worktree' && args[1] === 'add') {
+					throw new Error('fatal: could not create work tree dir');
+				}
+				return { stdout: '' };
+			};
+
+			const err = await makeManager()
+				.provision('14', { createBranch: false, branch: 'issue-14' })
+				.catch((e: unknown) => e);
+
+			expect(err).toBeInstanceOf(Error);
+			expect(err).not.toBeInstanceOf(CommitUnavailableError);
+			expect((err as Error).message).toMatch(/Could not resolve host: github.com/);
+		});
+
+		it('exposes the failed provision fetch to the phase, and clears it after a fetch that succeeds', async () => {
+			let fetchFails = true;
+			gitHandler = (args) => {
+				if (args[0] === 'fetch' && fetchFails) throw new Error('Could not resolve hostname');
+				if (args[0] === 'symbolic-ref') return { stdout: 'issue-14\n' };
+				return { stdout: '' };
+			};
+			const manager = makeManager();
+			expect(manager.provisionFetchError).toBeUndefined();
+
+			await manager.provision('14', { createBranch: false, branch: 'issue-14' });
+			expect(manager.provisionFetchError).toMatch(/Could not resolve hostname/);
+
+			fetchFails = false;
+			await manager.provision('15', { createBranch: false, branch: 'issue-15' });
+			expect(manager.provisionFetchError).toBeUndefined();
 		});
 
 		it('skips the fetch when fetch is false', async () => {

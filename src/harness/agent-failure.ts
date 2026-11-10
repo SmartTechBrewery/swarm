@@ -50,10 +50,12 @@ export type AgentFailureKind =
 	/**
 	 * This machine could not obtain the commit the phase's checkout has to be
 	 * detached at (issue #1018, `CommitUnavailableError` in
-	 * `../worktree/commit-availability.ts`). A statement about the *worker*, not about
-	 * the run: the commit is typically on the remote and another enrolled machine
-	 * holds it, so the run defers and the next attempt prefers a machine that has not
-	 * already failed to get it (`../worker/eligibility-gate.ts`).
+	 * `../worktree/commit-availability.ts`), or the pull request branch a branch phase
+	 * works on (issue #1401, its `BranchUnavailableError` / `BranchSyncUnavailableError`
+	 * subclasses). A statement about the *worker*, not about the run: the commit or
+	 * branch is typically on the remote and another enrolled machine can get it, so
+	 * the run defers and the next attempt prefers a machine that has not already
+	 * failed to get it (`../worker/eligibility-gate.ts`).
 	 */
 	| 'commit-unavailable'
 	| 'blocked-recovery'

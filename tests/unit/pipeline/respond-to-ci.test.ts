@@ -32,6 +32,10 @@ import {
 	UnretryableDeliveryError,
 } from '@/scm/delivery.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
+import {
+	BranchSyncUnavailableError,
+	CommitUnavailableError,
+} from '@/worktree/commit-availability.js';
 import { readDeliveryId } from '../../helpers/delivery-sidecar.js';
 import {
 	createMockProjectConfig,
@@ -404,6 +408,25 @@ describe('runRespondToCiPhase', () => {
 		);
 		expect(deps.delivery.pushBranch).not.toHaveBeenCalled();
 		expect(deps.delivery.postComment).not.toHaveBeenCalled();
+		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('respond-ci-64');
+	});
+
+	// Issue #1401, shape 2: the agent stopped at its mandated `git pull` because this
+	// worker could not reach origin — the provision fetch had failed first.
+	it('reports a missing hand-off after a failed provision fetch as this worker failing to reach origin', async () => {
+		const deps = makeDeps();
+		rmSync(join(deps.path, RESPOND_CI_OUTCOME_FILENAME));
+		Object.assign(deps.worktrees, {
+			provisionFetchError: 'ssh: connect to host github.com port 22: Operation timed out',
+		});
+
+		const err = await runRespondToCiPhase(deps).catch((e: unknown) => e);
+
+		expect(err).toBeInstanceOf(BranchSyncUnavailableError);
+		expect(err).toBeInstanceOf(CommitUnavailableError);
+		expect((err as Error).message).toContain('port 22: Operation timed out');
+		expect((err as Error).message).toContain(`branch '${PR_BRANCH}'`);
+		expect(deps.delivery.pushBranch).not.toHaveBeenCalled();
 		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('respond-ci-64');
 	});
 

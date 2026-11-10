@@ -34,7 +34,11 @@ import type { AssignmentSink } from '@/transport/worker-client.js';
 import { ALL_TRIGGER_PHASES } from '@/triggers/types.js';
 import type { AssignedPhaseInputs, PhaseRunResult } from '@/worker/consumer.js';
 import type { GitWorktreeManager } from '@/worker/git-worktree-manager.js';
-import { CommitUnavailableError } from '@/worktree/commit-availability.js';
+import {
+	BranchSyncUnavailableError,
+	BranchUnavailableError,
+	CommitUnavailableError,
+} from '@/worktree/commit-availability.js';
 import { BlockedRecoveryError } from '@/worktree/reclaim.js';
 import {
 	createMockPullRequestContext,
@@ -1495,6 +1499,37 @@ describe('runAssignmentDbFree', () => {
 		expect(frame.resumable).toBe(false);
 		expect(frame.reason).toContain('Connection refused');
 		expect(frame.reason).not.toContain('invalid reference');
+	});
+
+	// Issue #1401: a branch phase on a federated worker that cannot reach origin defers
+	// exactly as a missing commit does, so the control plane routes the retry elsewhere.
+	it.each([
+		[
+			'resolve-conflicts' as const,
+			new BranchUnavailableError('issue-2113', {
+				repoRoot: '/Users/dev/uc/platform',
+				taskId: '2119-conflicts',
+				fetchError: 'ssh: connect to host github.com port 22: Operation timed out',
+				checkoutError: 'fatal: invalid reference: issue-2113',
+			}),
+		],
+		[
+			'respond-to-review' as const,
+			new BranchSyncUnavailableError('issue-1393', {
+				repoRoot: '/Users/dev/swarm/swarm',
+				taskId: '1398',
+				fetchError: 'ssh: connect to host github.com port 22: Operation timed out',
+				handoffFilename: 'respond_to_review_handoff.json',
+			}),
+		],
+	])('defers a %s run whose PR branch this machine could not get from origin', (phase, error) => {
+		const frame = deferrableOrFailedResult(
+			error,
+			buildTaskAssignment(createMockTaskAssignmentInput({ phase })),
+		);
+
+		expect(frame).toMatchObject({ status: 'deferred', failureKind: 'commit-unavailable' });
+		expect(frame.reason).toContain('port 22: Operation timed out');
 	});
 
 	// Issue #1274: a provider server error from any call the phase made on this worker.
