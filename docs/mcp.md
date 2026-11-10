@@ -178,8 +178,10 @@ the server enforces on its write tools.
   2. the token has no earlier **succeeded** dry run of the same tool on the same
      target: `FORBIDDEN: dry run <tool> on <target> first`;
   3. the token already applied the same tool to the same target, whether that
-     call succeeded or failed: `FORBIDDEN: <tool> was already applied to <target>
-     in this run`.
+     call succeeded, failed or is still in progress: `FORBIDDEN: <tool> was already
+     applied to <target> in this run`. A retry or parallel call sent while the
+     first is still running is refused too; when two such calls race, both may be
+     refused.
 
   Dry runs are never capped. The target is the one the tool records on its audit
   row, for example the run id for `run_reset`. Ordinary tokens and scoped

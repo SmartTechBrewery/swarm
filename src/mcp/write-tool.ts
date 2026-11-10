@@ -44,8 +44,9 @@
  *    `maxWriteActions` real calls — every audited real call that was not refused
  *    counts, failed ones included — when no earlier dry run of the same tool on the
  *    same target *succeeded* with it, or when it already applied the same tool to
- *    the same target (a `succeeded` or `failed` real call). Dry runs are never
- *    capped, and no other credential is affected.
+ *    the same target (a `succeeded` or `failed` real call, or one still `pending` —
+ *    so a retry or parallel call racing an in-flight apply is refused too). Dry
+ *    runs are never capped, and no other credential is affected.
  *  - **No secret in the audit trail.** A tool that accepts a secret names the field in
  *    `secretInputs`, and the row records it as `[redacted]` (issue #1359).
  *
@@ -281,7 +282,12 @@ export async function runWriteTool<
  * token has used up its write cap, it never dry-ran this tool on this target
  * successfully, or it already applied this tool to this target. Any other
  * credential passes untouched. `auditId` is the asking call's own, still-pending
- * row, which the cap must not count.
+ * row, which neither the cap nor the no-repeat read may count.
+ *
+ * Both of those count `pending` real rows as well as settled ones, so a call that
+ * races another in flight — an MCP client retrying after its own timeout, two
+ * parallel tool calls — sees it. Two racing calls on the same tool and target
+ * each see the other's row and are both refused, which fails closed.
  *
  * A guardrail that cannot be read refuses the call too — nothing has been written
  * yet, and a `failed` row would spend the run's cap and block the target for good.
@@ -317,9 +323,10 @@ async function assertRunGuardrails(
 			countAgentTokenActions({
 				agentTokenId,
 				dryRun: false,
-				outcomes: ['succeeded', 'failed'],
+				outcomes: ['pending', 'succeeded', 'failed'],
 				tool,
 				target,
+				excludeId: auditId,
 			}),
 		]);
 	} catch (error) {

@@ -502,9 +502,10 @@ describe('runWriteTool', () => {
 			expect(countAgentTokenActions).toHaveBeenCalledWith({
 				agentTokenId: TOKEN_ID,
 				dryRun: false,
-				outcomes: ['succeeded', 'failed'],
+				outcomes: ['pending', 'succeeded', 'failed'],
 				tool: 'run_reset',
 				target: 'run-1',
+				excludeId: 'audit-1',
 			});
 		});
 
@@ -538,6 +539,30 @@ describe('runWriteTool', () => {
 
 		it('refuses a real call that repeats the same tool on the same target', async () => {
 			counts({ applied: 1 });
+			const result = await runWriteTool(resetTool(), runBound(3), {
+				runId: 'run-1',
+				reason: 'r',
+				dryRun: false,
+			});
+
+			expectRefused(result, 'run_reset was already applied to run-1 in this run');
+		});
+
+		it('refuses a real call while the same tool on the same target is still pending', async () => {
+			// Only another call's in-flight row is on the table: the asking call's own
+			// row is excluded, and nothing has settled yet.
+			countAgentTokenActions.mockImplementation(
+				async (query: {
+					dryRun: boolean;
+					tool?: string;
+					outcomes: string[];
+					excludeId?: string;
+				}) => {
+					if (query.dryRun) return 1;
+					if (query.tool === undefined) return 1;
+					return query.outcomes.includes('pending') && query.excludeId === 'audit-1' ? 1 : 0;
+				},
+			);
 			const result = await runWriteTool(resetTool(), runBound(3), {
 				runId: 'run-1',
 				reason: 'r',

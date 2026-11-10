@@ -190,4 +190,31 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('operatorActionsRepository
 			}),
 		).toBe(1);
 	});
+
+	// Issue #1393 review: the no-repeat read sees another call still in flight on the
+	// same tool and target, but never the asking call's own pending row.
+	it('counts an in-flight real call on the same tool and target, leaving out the excluded row', async () => {
+		const TOKEN = '33333333-3333-4333-8333-333333333333';
+		const pending = () =>
+			recordOperatorAction({
+				...CALL,
+				credentialKind: 'scoped-agent-token',
+				agentTokenId: TOKEN,
+			});
+		const inFlight = await pending();
+		const asking = await pending();
+		const query = {
+			agentTokenId: TOKEN,
+			dryRun: false,
+			outcomes: ['pending', 'succeeded', 'failed'] as const,
+			tool: 'run_reset',
+			target: 'run-1',
+		};
+
+		expect(await countAgentTokenActions(query)).toBe(2);
+		expect(await countAgentTokenActions({ ...query, excludeId: asking })).toBe(1);
+		expect(await countAgentTokenActions({ ...query, excludeId: inFlight })).toBe(1);
+		await settleOperatorAction(inFlight, { outcome: 'refused', error: null });
+		expect(await countAgentTokenActions({ ...query, excludeId: asking })).toBe(0);
+	});
 });
