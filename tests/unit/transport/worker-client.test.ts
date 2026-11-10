@@ -1423,6 +1423,32 @@ describe('connectWorkerTransport (reconnect loop)', () => {
 		await client.stop();
 	});
 
+	// Issue #1402: a reset's discard for the machine it moved a run away from.
+	it('hands a checkout-discard frame to the registered onCheckoutDiscard handler', async () => {
+		fetch.mockResolvedValueOnce(jsonResponse(200, handshakeResponseBody(4)));
+		const onCheckoutDiscard = vi.fn();
+		const client = connectWorkerTransport(
+			{ ...options, capabilities: ['claude'], onCheckoutDiscard },
+			overrides(),
+		);
+		await flush();
+		sockets[0].emitOpen();
+
+		const frame = {
+			type: 'checkout-discard',
+			requestId: SWEEP_REQUEST_ID,
+			runId: '22222222-2222-4222-8222-222222222222',
+			projectId: 'swarm',
+			repository: 'SmartTechBrewery/swarm',
+			taskId: '2119-conflicts',
+			worktreeRoot: '.swarm-workspaces',
+		};
+		sockets[0].emitMessage(frame);
+
+		expect(onCheckoutDiscard).toHaveBeenCalledWith(frame);
+		await client.stop();
+	});
+
 	it('ignores a worktree-sweep when no handler is registered, keeping the session live', async () => {
 		fetch.mockResolvedValueOnce(jsonResponse(200, handshakeResponseBody(4)));
 		const client = connectWorkerTransport({ ...options, capabilities: ['claude'] }, overrides());

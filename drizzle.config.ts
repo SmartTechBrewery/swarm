@@ -27,6 +27,7 @@ export default defineConfig({
 		'./src/db/schema/workerCliRateLimits.ts',
 		'./src/db/schema/workerScmCredentials.ts',
 		'./src/db/schema/workerUpdateRollouts.ts',
+		'./src/db/schema/checkoutDiscards.ts',
 	],
 	out: './src/db/migrations',
 	dialect: 'postgresql',

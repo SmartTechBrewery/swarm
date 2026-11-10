@@ -170,6 +170,23 @@ function describeWorktreeOutcome(worktree: TerminationCleanupResult): string {
  * operator can tell a reset that actually freed the checkout from one that
  * restarted the run but left protected work behind.
  */
+/**
+ * Where the abandoned preserved worker's checkout stands (issue #1402): the restart
+ * may run on another machine, so that worker is asked to discard it directly — or it
+ * could not be, and the line says why.
+ */
+function reportAbandonedCheckout(result: ResetRunResult, workerId: string): void {
+	if (result.abandonedCheckout === 'discard-requested') {
+		out.step(
+			`preserved checkout: pending removal on worker ${workerId} — it discards the checkout now if connected, or when it next reconnects`,
+		);
+	} else if (result.abandonedCheckout === 'not-requested') {
+		out.warn(
+			`preserved checkout: still on worker ${workerId} — its discard could not be requested (${result.abandonedCheckoutError ?? 'unknown reason'}); the retention sweep removes it later`,
+		);
+	}
+}
+
 function reportReset(result: ResetRunResult): void {
 	// The reset's first step (issue #745). A run that had no agent to stop says
 	// nothing, the same way a step the service did not perform is not claimed below.
@@ -207,7 +224,13 @@ function reportReset(result: ResetRunResult): void {
 	}
 
 	if (result.worktree) {
-		out.step(describeWorktreeOutcome(result.worktree));
+		// "None on this host" is only half the answer when a preserved worker held the
+		// checkout (issue #1402); the abandoned-checkout line below gives the other half.
+		out.step(
+			result.worktree.outcome === 'absent' && result.abandonedCheckout !== 'none'
+				? 'checkout: none on this host; any leftover lease marker here was dropped'
+				: describeWorktreeOutcome(result.worktree),
+		);
 	}
 	// A local teardown throw no longer stops the reset (issue #744) — it is reported
 	// so the operator knows this host's checkout still needs a look, while the
@@ -222,7 +245,7 @@ function reportReset(result: ResetRunResult): void {
 	// reset, so the line is only true for the restarted ending.
 	if (result.outcome === 'restarted') {
 		out.step(
-			'restart intent: the worker holding the checkout discards it — dirty and unpushed work included — before provisioning',
+			'restart intent: the worker that runs the restart discards any checkout of this task it holds — dirty and unpushed work included — before provisioning',
 		);
 	}
 
@@ -237,6 +260,7 @@ function reportReset(result: ResetRunResult): void {
 		out.warn(
 			`preserved work: discarded — this run is no longer pinned to worker ${result.abandonedPreservedWorkerId}, and that attempt's progress is not carried over`,
 		);
+		reportAbandonedCheckout(result, result.abandonedPreservedWorkerId);
 	}
 
 	// A stated terminal ending is a *reported outcome*, not a failure (issue #744):

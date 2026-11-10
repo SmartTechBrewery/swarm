@@ -767,7 +767,7 @@ function deferredPhaseMessage(failure: DeferrableFailure, phase: TriggerPhase): 
 		case 'worktree-exists':
 			return `Phase stopped - ${phaseLabel(phase)} — worktree already exists, deferring retry`;
 		case 'commit-unavailable':
-			return `Phase stopped - ${phaseLabel(phase)} — this worker could not obtain the commit, deferring retry on another worker`;
+			return `Phase stopped - ${phaseLabel(phase)} — this worker could not obtain the commit or branch from origin, deferring retry on another worker`;
 		case 'provider-unavailable':
 			return `Phase stopped - ${phaseLabel(phase)} — SCM/PM provider unavailable (server error), deferring retry`;
 		case 'stalled':

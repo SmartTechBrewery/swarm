@@ -123,6 +123,7 @@ function makeDeps(overrides: Partial<WorkerTransportDeps> = {}): WorkerTransport
 		stopOrphanedDispatches: vi.fn(),
 		resendPendingWorkerUpdate: vi.fn(),
 		resendPendingWorktreeSweep: vi.fn(),
+		resendPendingCheckoutDiscards: vi.fn(),
 		advanceWorkerRollout: vi.fn(),
 		...overrides,
 	};
@@ -1686,6 +1687,7 @@ describe('GET /worker/stream cancellation re-push on reconnect', () => {
 		expect(deps.resendRunCancellations).not.toHaveBeenCalled();
 		expect(deps.resendPendingWorkerUpdate).not.toHaveBeenCalled();
 		expect(deps.resendPendingWorktreeSweep).not.toHaveBeenCalled();
+		expect(deps.resendPendingCheckoutDiscards).not.toHaveBeenCalled();
 		expect(deps.advanceWorkerRollout).not.toHaveBeenCalled();
 	});
 
@@ -1710,6 +1712,17 @@ describe('GET /worker/stream cancellation re-push on reconnect', () => {
 		const { handlers, ws } = await connect(deps);
 
 		expect(deps.resendPendingWorktreeSweep).toHaveBeenCalledWith(WORKER_ID);
+		await handlers.onClose?.({}, ws);
+	});
+
+	// Issue #1402 — a reset that abandons an offline preserved worker owes it a discard
+	// it can only receive here.
+	it('re-states pending checkout discards when the worker reconnects', async () => {
+		const deps = makeDeps();
+
+		const { handlers, ws } = await connect(deps);
+
+		expect(deps.resendPendingCheckoutDiscards).toHaveBeenCalledWith(WORKER_ID);
 		await handlers.onClose?.({}, ws);
 	});
 

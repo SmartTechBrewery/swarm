@@ -32,6 +32,7 @@ import { resolveWebhookCallbackBaseUrl } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { configureLogger, enableLogRingBuffer, logger } from '../lib/logger.js';
 import { closeQueue } from '../queue/producer.js';
+import { subscribeCheckoutDiscardDispatch } from '../router/checkout-discard-dispatch.js';
 import { CONTROL_PLANE_LOG_BUFFER_CAPACITY } from '../router/control-plane-logs.js';
 import type { DispatchConsumerHandle } from '../router/dispatcher.js';
 import { startRolloutAdvanceTicker } from '../router/worker-rollout-advance.js';
@@ -90,6 +91,10 @@ void announceFirstRunSetup({ baseUrl: resolveWebhookCallbackBaseUrl() });
 // half — is now this process too; the subscriber uses its own Redis connection,
 // so the hand-off works unchanged within one process.
 const worktreeSweeps = subscribeWorktreeSweepDispatch();
+// The same bridge for a reset's checkout discards (issue #1402): the API server
+// records the request when a reset abandons a preserved worker, and the push to that
+// worker happens here, where its socket is.
+const checkoutDiscards = subscribeCheckoutDiscardDispatch();
 const rolloutAdvance = startRolloutAdvanceTicker();
 
 const dispatchShutdown = new AbortController();
@@ -129,6 +134,11 @@ for (const signal of ['SIGTERM', 'SIGINT'] as const) {
 					await worktreeSweeps.close();
 				} catch (err) {
 					logger.error('Worktree-sweep subscriber close failed', { error: describeError(err) });
+				}
+				try {
+					await checkoutDiscards.close();
+				} catch (err) {
+					logger.error('Checkout-discard subscriber close failed', { error: describeError(err) });
 				}
 				try {
 					await closeQueue();

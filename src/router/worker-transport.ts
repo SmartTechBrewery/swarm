@@ -82,6 +82,7 @@ import {
 	WS_CLOSE,
 } from '../transport/protocol.js';
 import type { TriggerPhase } from '../triggers/types.js';
+import { resendPendingCheckoutDiscardsToWorker } from './checkout-discard-dispatch.js';
 import { resendRunCancellationsToWorker } from './dispatch-cancellation.js';
 import {
 	type DispatchStreamTarget,
@@ -288,6 +289,13 @@ export interface WorkerTransportDeps {
 	 */
 	resendPendingWorktreeSweep: (workerId: string) => void;
 	/**
+	 * And the same for the checkout discards a reset asked of this machine while it was
+	 * away (issue #1402): a reset that abandons an offline preserved worker is exactly
+	 * when the holder cannot be reached, so its discard is applied here or not at all.
+	 * Fire-and-forget by contract, like the hooks above.
+	 */
+	resendPendingCheckoutDiscards: (workerId: string) => void;
+	/**
 	 * A machine coming back is the event a fleet rollout's come-back verdict waits for
 	 * (issue #941, `./worker-rollout-advance.ts`): by the time this fires the daemon
 	 * has already taken its fenced lease and declared the build it is running, which
@@ -344,6 +352,7 @@ function defaultDeps(): WorkerTransportDeps {
 		stopOrphanedDispatches: stopOrphanedDispatchesOnReturn,
 		resendPendingWorkerUpdate: resendPendingWorkerUpdateToWorker,
 		resendPendingWorktreeSweep: resendPendingWorktreeSweepToWorker,
+		resendPendingCheckoutDiscards: resendPendingCheckoutDiscardsToWorker,
 		advanceWorkerRollout,
 	};
 }
@@ -929,6 +938,12 @@ export function handleWorkerStreamOpen(
 		're-pushing a worktree sweep recorded while the worker was away',
 		workerId,
 		() => deps.resendPendingWorktreeSweep(workerId),
+	);
+	// And the discards a reset asked of this machine while it was offline (issue #1402).
+	runConnectionHook(
+		're-pushing checkout discards recorded while the worker was away',
+		workerId,
+		() => deps.resendPendingCheckoutDiscards(workerId),
 	);
 	// A machine that applied an update comes back through exactly this handshake, so
 	// this is where a fleet rollout waiting on it learns that it did (issue #941).

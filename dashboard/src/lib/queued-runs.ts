@@ -59,10 +59,10 @@ const QUEUED_WAIT_REASON_LABELS: Record<QueuedWaitReason, string> = {
 	delivery: 'retrying result delivery',
 	'worktree-exists': 'retrying after a worktree collision',
 	stalled: 'retrying after a stalled response',
-	// Names the machine's clone rather than the commit, because the commit is fine —
-	// it is on the remote, and the retry is going to a machine that has it (issue
-	// #1018).
-	'commit-unavailable': 'retrying on a worker that has the commit',
+	// Names the machine rather than the commit or branch, because those are fine —
+	// they are on the remote, and the retry is going to a machine that can get them
+	// (issues #1018, #1401).
+	'commit-unavailable': 'retrying on a worker that can reach the commit or branch',
 	// An SCM/PM provider answered with a server error (issue #1274): its outage, not
 	// SWARM's, retried on the ordinary schedule. The row's reason names the provider.
 	'provider-unavailable': 'retrying after the SCM/PM provider was unavailable',

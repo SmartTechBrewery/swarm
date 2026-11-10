@@ -40,6 +40,10 @@ import {
 } from '@/scm/pull-request-context.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
 import {
+	BranchSyncUnavailableError,
+	CommitUnavailableError,
+} from '@/worktree/commit-availability.js';
+import {
 	createMockProjectConfig,
 	createMockPullRequestContext,
 	createMockPullRequestReview,
@@ -459,6 +463,35 @@ describe('runRespondToReviewPhase', () => {
 		expect(deps.delivery.pushBranch).not.toHaveBeenCalled();
 		expect(deps.delivery.postComment).not.toHaveBeenCalled();
 		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('respond-21');
+	});
+
+	// Issue #1401, shape 2: the worker's provisioning fetch failed, the checkout came
+	// from stale local refs, and the agent stopped at its mandated `git pull` without
+	// writing a hand-off. That is this machine failing to reach origin.
+	it('reports a missing hand-off after a failed provision fetch as this worker failing to reach origin', async () => {
+		const deps = makeDeps();
+		rmSync(join(deps.path, RESPOND_OUTCOME_FILENAME));
+		const fetchError =
+			'ssh: Could not resolve hostname github-personal: nodename nor servname provided, or not known';
+		Object.assign(deps.worktrees, { provisionFetchError: fetchError });
+
+		const err = await runRespondToReviewPhase(deps).catch((e: unknown) => e);
+
+		expect(err).toBeInstanceOf(BranchSyncUnavailableError);
+		expect(err).toBeInstanceOf(CommitUnavailableError);
+		const message = (err as Error).message;
+		expect(message).toContain(fetchError);
+		expect(message).toContain(`branch '${PR_BRANCH}'`);
+		expect(message).toContain(RESPOND_OUTCOME_FILENAME);
+		expect(message).not.toContain('did not write required hand-off');
+		expect(deps.delivery.pushBranch).not.toHaveBeenCalled();
+		expect(deps.worktrees.cleanup).toHaveBeenCalledWith('respond-21');
+	});
+
+	it('still reads a written hand-off when the provision fetch had failed', async () => {
+		const deps = makeDeps();
+		Object.assign(deps.worktrees, { provisionFetchError: 'Could not resolve host' });
+		await expect(runRespondToReviewPhase(deps)).resolves.toMatchObject({ outcome: 'fixed' });
 	});
 
 	it('throws and cleans up when the hand-off is not valid JSON', async () => {

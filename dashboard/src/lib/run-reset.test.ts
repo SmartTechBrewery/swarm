@@ -156,7 +156,7 @@ describe('describeResetResult', () => {
 			'Dispatch: the active dispatch was cancelled.',
 			'Cancellation flag: cleared, so the fresh attempt is not killed at startup.',
 			'Checkout: removed and its lease released.',
-			'Restart intent: the worker holding the checkout discards it — dirty and unpushed work included — before provisioning.',
+			'Restart intent: the worker that runs the restart discards any checkout of this task it holds — dirty and unpushed work included — before provisioning.',
 			'Recovery record: cleared.',
 			'Restarted: re-dispatched from scratch as dispatch dispatch-9.',
 		]);
@@ -166,6 +166,42 @@ describe('describeResetResult', () => {
 		const lines = describeResetResult(makeReport({ abandonedPreservedWorkerId: 'w-preserved' }));
 
 		expect(lines.some((line) => line.startsWith('Preserved work: discarded'))).toBe(true);
+	});
+
+	// Issue #1402: a preserved checkout lives on the abandoned machine, not this host,
+	// so "absent" here must not read as the whole answer.
+	it('reports a preserved checkout elsewhere as pending removal, not as absent', () => {
+		const lines = describeResetResult(
+			makeReport({
+				worktree: { outcome: 'absent' },
+				abandonedPreservedWorkerId: 'w-preserved',
+				abandonedCheckout: 'discard-requested',
+				abandonedCheckoutError: null,
+			}),
+		);
+
+		expect(lines).toContain('Checkout: none on this host.');
+		expect(lines).toContain(
+			'Preserved checkout: pending removal on that machine — it discards the checkout now if it is connected, or as soon as it reconnects.',
+		);
+	});
+
+	it('says a preserved checkout is still there when its discard could not be requested', () => {
+		const lines = describeResetResult(
+			makeReport({
+				abandonedPreservedWorkerId: 'w-preserved',
+				abandonedCheckout: 'not-requested',
+				abandonedCheckoutError: 'db down',
+			}),
+		);
+
+		expect(
+			lines.some((line) =>
+				line.startsWith(
+					'Preserved checkout: still on that machine — its discard could not be requested (db down)',
+				),
+			),
+		).toBe(true);
 	});
 
 	it('reports that no dispatch was active', () => {
@@ -246,7 +282,7 @@ describe('describeResetResult', () => {
 	it('names the delegated discard intent every restart carries (issue #592)', () => {
 		const lines = describeResetResult(makeReport({ worktree: { outcome: 'absent' } }));
 		expect(lines).toContain(
-			'Restart intent: the worker holding the checkout discards it — dirty and unpushed work included — before provisioning.',
+			'Restart intent: the worker that runs the restart discards any checkout of this task it holds — dirty and unpushed work included — before provisioning.',
 		);
 	});
 

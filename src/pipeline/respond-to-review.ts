@@ -134,6 +134,7 @@ import {
 	writePullRequestContext,
 } from '@/scm/pull-request-context.js';
 import { GitWorktreeManager } from '@/worker/git-worktree-manager.js';
+import { assertBranchSyncReachedOrigin } from '@/worktree/commit-availability.js';
 import { graftEnvironment } from '@/worktree/graft.js';
 import { isArtifactNumberTaskId, taskIdFromTaskBranch } from './task-branch.js';
 
@@ -634,6 +635,18 @@ export async function runRespondToReviewPhase(
 			throw error;
 		}
 
+		// A worker that cannot reach origin checks the branch out from stale local refs,
+		// and the agent then stops at its mandated `git pull` without a hand-off (issue
+		// #1401): report that as this machine's access to the remote — deferred and
+		// re-routed — not as a missing hand-off.
+		assertBranchSyncReachedOrigin({
+			worktreePath: handle.path,
+			handoffFilename: RESPOND_OUTCOME_FILENAME,
+			branch: prBranch,
+			taskId,
+			repoRoot: project.repoRoot,
+			fetchError: worktrees.provisionFetchError,
+		});
 		const handoff = readHandoff(handle.path, RESPOND_OUTCOME_FILENAME, ReviewResponseHandoffSchema);
 		// One subject for every commit of the task (issue #1242): the stored one when
 		// there is one, otherwise the agent's own, through the repository's pattern.
