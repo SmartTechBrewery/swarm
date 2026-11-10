@@ -55,6 +55,7 @@ import {
 	PmCredentialReferencesByProviderSchema,
 	PmProviderCredentialReferencesSchema,
 } from './pm-credentials.js';
+import { RESOLVE_PROBLEM_MAX_WRITE_ACTIONS_LIMIT } from './resolve-problem.js';
 import {
 	adoptLegacyScmCredentials,
 	ScmCredentialReferencesByProviderSchema,
@@ -449,6 +450,11 @@ export const AgentDefaultsSchema = z
  * there is no prior *completed* Planning run for the same work item — a
  * failed or deferred attempt does not count (issue #247). It falls back to
  * `implementation` when omitted; it is not a pipeline phase.
+ *
+ * `resolveProblem` is the optional Resolve problem phase (issue #1384): the
+ * agent that tries to unblock a failed run that did not recover by itself. It
+ * takes the same ordered CLI/model targets, `timeoutMs` and `prompt` as every
+ * other phase; whether the phase runs at all is `pipeline.resolveProblem`.
  */
 export const AgentsConfigSchema = z
 	.object({
@@ -460,6 +466,7 @@ export const AgentsConfigSchema = z
 		respondToReview: AgentConfigSchema.optional(),
 		respondToCi: AgentConfigSchema.optional(),
 		resolveConflicts: AgentConfigSchema.optional(),
+		resolveProblem: AgentConfigSchema.optional(),
 	})
 	.describe('Per-phase agent CLI/model overrides — omit any phase to keep its coded default');
 
@@ -533,6 +540,25 @@ export const PipelineBaseSchema = z.object({
 		})
 		.optional(),
 	respondToCi: z.object({ enabled: z.boolean().optional() }).optional(),
+	/**
+	 * The optional Resolve problem phase (issue #1384). Unlike the other phase
+	 * toggles it is **off** unless `enabled: true` (`isResolveProblemEnabled`,
+	 * `src/config/resolve-problem.ts`). `maxWriteActions` is the most real
+	 * (non-dry-run) MCP write calls one run may make; unset defaults to
+	 * `DEFAULT_RESOLVE_PROBLEM_MAX_WRITE_ACTIONS` (5), and at most 50 may be set.
+	 * Nothing reads either setting until the phase itself ships.
+	 */
+	resolveProblem: z
+		.object({
+			enabled: z.boolean().optional(),
+			maxWriteActions: z
+				.number()
+				.int()
+				.positive()
+				.max(RESOLVE_PROBLEM_MAX_WRITE_ACTIONS_LIMIT)
+				.optional(),
+		})
+		.optional(),
 	/**
 	 * The hard ceiling on how many times one run may be continued from its Tier 2
 	 * checkpoint (`docs/CHECKPOINTS.md`), progress or not. Reaching it fails the run

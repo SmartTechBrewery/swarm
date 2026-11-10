@@ -1066,7 +1066,12 @@ describe('useToggleAutoSave hook', () => {
 		mockMutateFn.mockClear();
 		mockSetQueryDataFn.mockClear();
 
-		const pipelineEnabled = { review: true, respondToReview: true, respondToCi: true };
+		const pipelineEnabled = {
+			review: true,
+			respondToReview: true,
+			respondToCi: true,
+			resolveProblem: false,
+		};
 		const setPipelineEnabled = vi.fn();
 		const pipelineAutoAdvance = { planning: false };
 		const setPipelineAutoAdvance = vi.fn();
@@ -1103,6 +1108,7 @@ describe('useToggleAutoSave hook', () => {
 			review: false,
 			respondToReview: false,
 			respondToCi: true,
+			resolveProblem: false,
 		});
 
 		expect(mockSetQueryDataFn).toHaveBeenCalledWith(['projects', 'getById', { id: 'p1' }], {
@@ -1124,7 +1130,12 @@ describe('useToggleAutoSave hook', () => {
 		mockMutateFn.mockClear();
 		mockSetQueryDataFn.mockClear();
 
-		const pipelineEnabled = { review: true, respondToReview: true, respondToCi: true };
+		const pipelineEnabled = {
+			review: true,
+			respondToReview: true,
+			respondToCi: true,
+			resolveProblem: false,
+		};
 		const setPipelineEnabled = vi.fn();
 		const pipelineAutoAdvance = { planning: false };
 		const setPipelineAutoAdvance = vi.fn();
@@ -1176,7 +1187,12 @@ describe('useToggleAutoSave hook', () => {
 		const { result } = renderHook(() =>
 			useToggleAutoSave({
 				projectId: 'p1',
-				pipelineEnabled: { review: true, respondToReview: true, respondToCi: true },
+				pipelineEnabled: {
+					review: true,
+					respondToReview: true,
+					respondToCi: true,
+					resolveProblem: false,
+				},
 				setPipelineEnabled: vi.fn(),
 				pipelineAutoAdvance: { planning: true },
 				setPipelineAutoAdvance: vi.fn(),
@@ -1209,7 +1225,12 @@ describe('useToggleAutoSave hook', () => {
 		const { result } = renderHook(() =>
 			useToggleAutoSave({
 				projectId: 'p1',
-				pipelineEnabled: { review: true, respondToReview: true, respondToCi: true },
+				pipelineEnabled: {
+					review: true,
+					respondToReview: true,
+					respondToCi: true,
+					resolveProblem: false,
+				},
 				setPipelineEnabled: vi.fn(),
 				pipelineAutoAdvance: { planning: false },
 				setPipelineAutoAdvance: vi.fn(),
@@ -1237,7 +1258,12 @@ describe('useToggleAutoSave hook', () => {
 		const { result } = renderHook(() =>
 			useToggleAutoSave({
 				projectId: 'p1',
-				pipelineEnabled: { review: true, respondToReview: true, respondToCi: true },
+				pipelineEnabled: {
+					review: true,
+					respondToReview: true,
+					respondToCi: true,
+					resolveProblem: false,
+				},
 				setPipelineEnabled,
 				pipelineAutoAdvance: { planning: false },
 				setPipelineAutoAdvance,
@@ -1264,6 +1290,43 @@ describe('useToggleAutoSave hook', () => {
 		expect(setPipelineAutoAdvance).not.toHaveBeenCalled();
 	});
 
+	it('sends only the Resolve problem enabled flag, so a stored write cap survives (issue #1384)', async () => {
+		mockMutateFn.mockResolvedValue({
+			id: 'p1',
+			pipeline: { resolveProblem: { enabled: true, maxWriteActions: 8 } },
+		});
+		mockMutateFn.mockClear();
+
+		const setPipelineEnabled = vi.fn();
+		const { result } = renderHook(() =>
+			useToggleAutoSave({
+				projectId: 'p1',
+				pipelineEnabled: toPipelineEnabledForm(undefined),
+				setPipelineEnabled,
+				pipelineAutoAdvance: { planning: false },
+				setPipelineAutoAdvance: vi.fn(),
+				verifyPlan: false,
+				setVerifyPlan: vi.fn(),
+				blocked: false,
+			}),
+		);
+
+		await act(async () => {
+			result.current.handleEnabledChange('resolveProblem', true);
+		});
+
+		expect(mockMutateFn).toHaveBeenCalledWith({
+			id: 'p1',
+			pipeline: { resolveProblem: { enabled: true } },
+		});
+		expect(setPipelineEnabled).toHaveBeenCalledWith({
+			review: true,
+			respondToReview: true,
+			respondToCi: true,
+			resolveProblem: true,
+		});
+	});
+
 	it('serializes overlapping toggle saves: a second flip is ignored until the first resolves, and Review stays disabled', async () => {
 		mockMutateFn.mockClear();
 		mockSetQueryDataFn.mockClear();
@@ -1284,7 +1347,12 @@ describe('useToggleAutoSave hook', () => {
 		const { result } = renderHook(() =>
 			useToggleAutoSave({
 				projectId: 'p1',
-				pipelineEnabled: { review: true, respondToReview: true, respondToCi: true },
+				pipelineEnabled: {
+					review: true,
+					respondToReview: true,
+					respondToCi: true,
+					resolveProblem: false,
+				},
 				setPipelineEnabled,
 				pipelineAutoAdvance: { planning: false },
 				setPipelineAutoAdvance: vi.fn(),
@@ -1684,6 +1752,7 @@ describe('AgentConfigurationForm — Save/Reset scoping', () => {
 		const onSelectPhase = vi.fn();
 		const handleEnabledChange = vi.fn();
 		const handleAutoAdvanceChange = vi.fn();
+		const handleMaxWriteActionsChange = vi.fn();
 		render(
 			<AgentConfigurationForm
 				agents={{}}
@@ -1696,6 +1765,8 @@ describe('AgentConfigurationForm — Save/Reset scoping', () => {
 				handleEnabledChange={handleEnabledChange}
 				handleAutoAdvanceChange={handleAutoAdvanceChange}
 				handleVerifyPlanChange={() => {}}
+				maxWriteActionsInput=""
+				handleMaxWriteActionsChange={handleMaxWriteActionsChange}
 				handleTargetChange={() => {}}
 				handleAddTarget={() => {}}
 				handleRemoveTarget={() => {}}
@@ -1719,6 +1790,7 @@ describe('AgentConfigurationForm — Save/Reset scoping', () => {
 			onSelectPhase,
 			handleEnabledChange,
 			handleAutoAdvanceChange,
+			handleMaxWriteActionsChange,
 		};
 	}
 
@@ -1775,5 +1847,34 @@ describe('AgentConfigurationForm — Save/Reset scoping', () => {
 		renderForm({ selectedPhase: undefined, isDirty: false, dirtyPhases: [] });
 
 		expect(screen.queryByText(/Unsaved changes are waiting on/)).toBeNull();
+	});
+
+	it('lists Resolve problem with its toggle off by default, and flips it on (issue #1384)', () => {
+		const { handleEnabledChange } = renderForm({ selectedPhase: undefined });
+
+		expect(screen.getByText('Resolve problem')).toBeDefined();
+		const toggle = screen.getByLabelText('Resolve problem enabled') as HTMLButtonElement;
+		expect(toggle.getAttribute('aria-checked')).toBe('false');
+		fireEvent.click(toggle);
+		expect(handleEnabledChange).toHaveBeenCalledWith('resolveProblem', true);
+	});
+
+	it("shows the write cap on Resolve problem's screen only, with the default as placeholder", () => {
+		const { handleMaxWriteActionsChange } = renderForm({ selectedPhase: 'resolveProblem' });
+
+		const field = screen.getByLabelText('Write actions per run') as HTMLInputElement;
+		expect(field.placeholder).toBe('5 (default)');
+		fireEvent.change(field, { target: { value: '8' } });
+		expect(handleMaxWriteActionsChange).toHaveBeenCalledWith('8');
+
+		cleanup();
+		renderForm({ selectedPhase: 'planning' });
+		expect(screen.queryByLabelText('Write actions per run')).toBeNull();
+	});
+
+	it('flags an out-of-range write cap', () => {
+		renderForm({ selectedPhase: 'resolveProblem', maxWriteActionsInput: '51' });
+
+		expect(screen.getByText(/whole number from 1 to 50/)).toBeDefined();
 	});
 });

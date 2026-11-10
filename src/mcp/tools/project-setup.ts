@@ -65,12 +65,13 @@ const projectCreateInput = {
 	agents: create.agents.describe(
 		"Optional per-phase agent configuration, as `swarm.config.json`'s `agents`: each phase " +
 			'(`planning`, `implementation`, `implementationUnplanned`, `review`, `respondToReview`, ' +
-			'`respondToCi`, `resolveConflicts`) takes `targets` — `{ cli, model?, reasoning? }` in ' +
+			'`respondToCi`, `resolveConflicts`, `resolveProblem`) takes `targets` — `{ cli, model?, reasoning? }` in ' +
 			'priority order — plus `timeoutMs` and `prompt`. Omitted phases run on coded defaults.',
 	),
 	pipeline: create.pipeline.describe(
 		"Optional pipeline options, as `swarm.config.json`'s `pipeline` (planning, review, " +
-			'respondToReview, respondToCi, continuation budgets, …).',
+			'respondToReview, respondToCi, continuation budgets, `resolveProblem.enabled` — off unless ' +
+			'`true` — and `resolveProblem.maxWriteActions`, default 5, max 50, …).',
 	),
 	worktreeRetention: create.worktreeRetention,
 	reviewerToken: create.reviewerToken.describe(
@@ -97,7 +98,10 @@ const projectUpdateInput = {
 	),
 	pipeline: update.pipeline.describe(
 		'A pipeline **patch**, merged over the stored options section by section; ' +
-			'`maxContinuations: null` clears the budget back to its default.',
+			'`maxContinuations: null` clears the budget back to its default. ' +
+			'`resolveProblem: { enabled, maxWriteActions }` turns the optional Resolve problem phase ' +
+			'on (it is off unless `enabled: true`) and caps its real MCP writes per run (default 5, ' +
+			'max 50; `maxWriteActions: null` clears it back to the default).',
 	),
 	worktreeRetention: update.worktreeRetention,
 };

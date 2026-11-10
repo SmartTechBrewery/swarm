@@ -1233,6 +1233,52 @@ describe('projectsRouter', () => {
 			});
 		});
 
+		describe('Resolve problem settings (issue #1384)', () => {
+			const withResolveProblem = () =>
+				createMockProjectRecord({
+					id: 'p1',
+					pipeline: { resolveProblem: { enabled: false, maxWriteActions: 8 } },
+				});
+
+			it('keeps the stored write cap when a toggle patch names only enabled', async () => {
+				vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(withResolveProblem());
+				vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
+
+				const result = await caller.update({
+					id: 'p1',
+					pipeline: { resolveProblem: { enabled: true } },
+				});
+
+				expect(result.pipeline?.resolveProblem).toEqual({ enabled: true, maxWriteActions: 8 });
+			});
+
+			it('keeps enabled when a patch names only the cap, and clears the cap on null', async () => {
+				vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(withResolveProblem());
+				vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);
+
+				const set = await caller.update({
+					id: 'p1',
+					pipeline: { resolveProblem: { maxWriteActions: 3 } },
+				});
+				expect(set.pipeline?.resolveProblem).toEqual({ enabled: false, maxWriteActions: 3 });
+
+				const cleared = await caller.update({
+					id: 'p1',
+					pipeline: { resolveProblem: { maxWriteActions: null } },
+				});
+				expect(cleared.pipeline?.resolveProblem).toEqual({ enabled: false });
+			});
+
+			it('rejects a cap above 50', async () => {
+				vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(withResolveProblem());
+
+				await expect(
+					caller.update({ id: 'p1', pipeline: { resolveProblem: { maxWriteActions: 51 } } }),
+				).rejects.toThrow();
+				expect(upsertProjectToDb).not.toHaveBeenCalled();
+			});
+		});
+
 		it('accepts a per-phase timeout up to 90 minutes and rejects one above it (issue #1259)', async () => {
 			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(existing);
 			vi.mocked(upsertProjectToDb).mockResolvedValue(undefined);

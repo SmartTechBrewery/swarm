@@ -55,7 +55,7 @@ describe('auto-advance form mapping', () => {
 			respondToCi: {},
 		};
 		const enabled = buildPipelineEnabledUpdate(
-			{ review: false, respondToReview: true, respondToCi: false },
+			{ review: false, respondToReview: true, respondToCi: false, resolveProblem: false },
 			existing,
 		);
 
@@ -64,6 +64,7 @@ describe('auto-advance form mapping', () => {
 			review: { enabled: false },
 			respondToReview: { enabled: false, skipOnMinors: false },
 			respondToCi: { enabled: false },
+			resolveProblem: { enabled: false },
 		});
 	});
 });
@@ -109,6 +110,7 @@ describe('toPipelineEnabledForm', () => {
 			review: true,
 			respondToReview: true,
 			respondToCi: true,
+			resolveProblem: false,
 		});
 	});
 
@@ -118,6 +120,7 @@ describe('toPipelineEnabledForm', () => {
 			review: true,
 			respondToReview: true,
 			respondToCi: true,
+			resolveProblem: false,
 		});
 	});
 
@@ -131,18 +134,46 @@ describe('toPipelineEnabledForm', () => {
 			review: false,
 			respondToReview: false,
 			respondToCi: false,
+			resolveProblem: false,
 		});
 	});
 });
 
+describe('toPipelineEnabledForm — Resolve problem (issue #1384)', () => {
+	it('projects Resolve problem off when unset and on only when stored true', () => {
+		expect(toPipelineEnabledForm(undefined).resolveProblem).toBe(false);
+		expect(toPipelineEnabledForm({ resolveProblem: {} }).resolveProblem).toBe(false);
+		expect(toPipelineEnabledForm({ resolveProblem: { enabled: false } }).resolveProblem).toBe(
+			false,
+		);
+		expect(toPipelineEnabledForm({ resolveProblem: { enabled: true } }).resolveProblem).toBe(true);
+	});
+
+	it('reports a Resolve problem flip as dirty', () => {
+		const form = toPipelineEnabledForm(undefined);
+		expect(isPipelineEnabledDirty(form, undefined)).toBe(false);
+		expect(isPipelineEnabledDirty({ ...form, resolveProblem: true }, undefined)).toBe(true);
+	});
+
+	it('keeps a stored write cap when the toggles are written back', () => {
+		const existing: PipelineConfig = { resolveProblem: { maxWriteActions: 8 } };
+		const result = buildPipelineEnabledUpdate(
+			{ ...toPipelineEnabledForm(existing), resolveProblem: true },
+			existing,
+		);
+		expect(result.resolveProblem).toEqual({ enabled: true, maxWriteActions: 8 });
+	});
+});
+
 describe('setPhaseEnabled', () => {
-	const allOn = { review: true, respondToReview: true, respondToCi: true };
+	const allOn = { review: true, respondToReview: true, respondToCi: true, resolveProblem: false };
 
 	it('toggles the named phase without touching the others', () => {
 		expect(setPhaseEnabled(allOn, 'respondToCi', false)).toEqual({
 			review: true,
 			respondToReview: true,
 			respondToCi: false,
+			resolveProblem: false,
 		});
 	});
 
@@ -151,15 +182,22 @@ describe('setPhaseEnabled', () => {
 			review: false,
 			respondToReview: false,
 			respondToCi: true,
+			resolveProblem: false,
 		});
 	});
 
 	it('leaves respond-to-review untouched when review is turned on', () => {
-		const reviewOff = { review: false, respondToReview: false, respondToCi: true };
+		const reviewOff = {
+			review: false,
+			respondToReview: false,
+			respondToCi: true,
+			resolveProblem: false,
+		};
 		expect(setPhaseEnabled(reviewOff, 'review', true)).toEqual({
 			review: true,
 			respondToReview: false,
 			respondToCi: true,
+			resolveProblem: false,
 		});
 	});
 
@@ -173,13 +211,23 @@ describe('setPhaseEnabled', () => {
 describe('isRespondToReviewLocked', () => {
 	it('locks respond-to-review when review is off', () => {
 		expect(
-			isRespondToReviewLocked({ review: false, respondToReview: false, respondToCi: true }),
+			isRespondToReviewLocked({
+				review: false,
+				respondToReview: false,
+				respondToCi: true,
+				resolveProblem: false,
+			}),
 		).toBe(true);
 	});
 
 	it('unlocks respond-to-review when review is on', () => {
 		expect(
-			isRespondToReviewLocked({ review: true, respondToReview: true, respondToCi: true }),
+			isRespondToReviewLocked({
+				review: true,
+				respondToReview: true,
+				respondToCi: true,
+				resolveProblem: false,
+			}),
 		).toBe(false);
 	});
 });
@@ -187,7 +235,7 @@ describe('isRespondToReviewLocked', () => {
 describe('buildPipelineEnabledUpdate', () => {
 	it('writes explicit enabled flags for all three phases', () => {
 		const result = buildPipelineEnabledUpdate(
-			{ review: true, respondToReview: false, respondToCi: true },
+			{ review: true, respondToReview: false, respondToCi: true, resolveProblem: false },
 			undefined,
 		);
 		expect(result.review?.enabled).toBe(true);
@@ -201,7 +249,7 @@ describe('buildPipelineEnabledUpdate', () => {
 			respondToReview: { skipOnMinors: false },
 		};
 		const result = buildPipelineEnabledUpdate(
-			{ review: true, respondToReview: true, respondToCi: true },
+			{ review: true, respondToReview: true, respondToCi: true, resolveProblem: false },
 			existing,
 		);
 		expect(result.planning).toEqual({ autoAdvance: true, autoSplit: false });
@@ -211,7 +259,7 @@ describe('buildPipelineEnabledUpdate', () => {
 
 	it('forces respond-to-review off when review is off (satisfies the server refinement)', () => {
 		const result = buildPipelineEnabledUpdate(
-			{ review: false, respondToReview: true, respondToCi: true },
+			{ review: false, respondToReview: true, respondToCi: true, resolveProblem: false },
 			{ respondToReview: { skipOnMinors: true } },
 		);
 		expect(result.review?.enabled).toBe(false);
@@ -224,7 +272,7 @@ describe('buildPipelineEnabledUpdate', () => {
 describe('buildPipelineToggleUpdate', () => {
 	it('carries the enabled flags, Planning auto-advance and Verify plan in one payload', () => {
 		const result = buildPipelineToggleUpdate(
-			{ review: true, respondToReview: false, respondToCi: true },
+			{ review: true, respondToReview: false, respondToCi: true, resolveProblem: false },
 			{ planning: true },
 			true,
 			undefined,
@@ -244,7 +292,7 @@ describe('buildPipelineToggleUpdate', () => {
 			respondToReview: { skipOnMinors: false },
 		};
 		const result = buildPipelineToggleUpdate(
-			{ review: true, respondToReview: true, respondToCi: true },
+			{ review: true, respondToReview: true, respondToCi: true, resolveProblem: false },
 			{ planning: true },
 			false,
 			existing,
@@ -256,7 +304,7 @@ describe('buildPipelineToggleUpdate', () => {
 
 	it('applies the Review→Respond dependency (respond forced off while review is off)', () => {
 		const result = buildPipelineToggleUpdate(
-			{ review: false, respondToReview: true, respondToCi: true },
+			{ review: false, respondToReview: true, respondToCi: true, resolveProblem: false },
 			{ planning: false },
 			false,
 			undefined,
@@ -277,14 +325,17 @@ describe('isPipelineEnabledDirty', () => {
 
 	it('is clean against undefined config when everything is on', () => {
 		expect(
-			isPipelineEnabledDirty({ review: true, respondToReview: true, respondToCi: true }, undefined),
+			isPipelineEnabledDirty(
+				{ review: true, respondToReview: true, respondToCi: true, resolveProblem: false },
+				undefined,
+			),
 		).toBe(false);
 	});
 
 	it('is dirty when a phase differs from the stored config', () => {
 		expect(
 			isPipelineEnabledDirty(
-				{ review: true, respondToReview: true, respondToCi: false },
+				{ review: true, respondToReview: true, respondToCi: false, resolveProblem: false },
 				undefined,
 			),
 		).toBe(true);

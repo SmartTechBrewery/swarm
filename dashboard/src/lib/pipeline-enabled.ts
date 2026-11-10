@@ -1,11 +1,19 @@
+import { isResolveProblemEnabled } from '../../../src/config/resolve-problem.js';
 import type { PipelineConfig } from '../../../src/config/schema.js';
 
 /**
- * The three optional, SCM-event-driven pipeline phases a project can turn off
- * (`pipeline.<phase>.enabled`, added in #118). Planning and Implementation are
- * mandatory and carry no toggle; Resolve-conflicts has no `enabled` flag either.
+ * The optional pipeline phases a project can switch (`pipeline.<phase>.enabled`):
+ * the three SCM-event-driven ones added in #118, which run unless turned off, and
+ * Resolve problem (issue #1384), which is **off** unless turned on. Planning and
+ * Implementation are mandatory and carry no toggle; Resolve-conflicts has no
+ * `enabled` flag either.
  */
-export const PIPELINE_TOGGLE_PHASES = ['review', 'respondToReview', 'respondToCi'] as const;
+export const PIPELINE_TOGGLE_PHASES = [
+	'review',
+	'respondToReview',
+	'respondToCi',
+	'resolveProblem',
+] as const;
 
 export type PipelineTogglePhase = (typeof PIPELINE_TOGGLE_PHASES)[number];
 
@@ -70,14 +78,17 @@ export function buildVerifyPlanUpdate(
 
 /**
  * Project the stored pipeline config onto the flat form state. An unset `enabled`
- * defaults to `true` (the phase runs unless explicitly disabled — matching the
- * trigger handlers, which only skip on `enabled === false`).
+ * defaults to `true` for the SCM-driven phases (the phase runs unless explicitly
+ * disabled — matching the trigger handlers, which only skip on `enabled === false`)
+ * and to `false` for Resolve problem, which runs only when enabled
+ * (`isResolveProblemEnabled`).
  */
 export function toPipelineEnabledForm(pipeline: PipelineConfig | undefined): PipelineEnabledForm {
 	return {
 		review: pipeline?.review?.enabled !== false,
 		respondToReview: pipeline?.respondToReview?.enabled !== false,
 		respondToCi: pipeline?.respondToCi?.enabled !== false,
+		resolveProblem: isResolveProblemEnabled(pipeline),
 	};
 }
 
@@ -126,6 +137,7 @@ export function buildPipelineEnabledUpdate(
 			enabled: form.review ? form.respondToReview : false,
 		},
 		respondToCi: { ...existing?.respondToCi, enabled: form.respondToCi },
+		resolveProblem: { ...existing?.resolveProblem, enabled: form.resolveProblem },
 	};
 }
 
