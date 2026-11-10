@@ -71,5 +71,7 @@ export const operatorActions = pgTable(
 	(table) => [
 		index('idx_operator_actions_project_started').on(table.projectId, table.startedAt),
 		index('idx_operator_actions_user_started').on(table.userId, table.startedAt),
+		// The run-bound credential's guardrails (issue #1393) read one token's calls.
+		index('idx_operator_actions_agent_token_tool').on(table.agentTokenId, table.tool, table.target),
 	],
 );

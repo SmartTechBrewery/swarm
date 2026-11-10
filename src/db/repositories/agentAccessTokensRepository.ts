@@ -25,17 +25,24 @@ export interface NewAgentAccessTokenValues {
 	expiresAt: Date;
 	/** The projects a scoped agent credential is limited to; omitted for an ordinary token. */
 	projectIds?: string[];
+	/** The run a run-bound credential belongs to (issue #1393); omitted for any other token. */
+	runId?: string;
+	/** A run-bound credential's cap on real write-tool calls; omitted with `runId`. */
+	maxWriteActions?: number;
 }
 
 /**
  * A live token's holder, the token's id, and — for a scoped agent credential
  * (issue #1385) — the projects it is limited to; `projectIds` is absent for an
- * ordinary token.
+ * ordinary token. A **run-bound** credential (issue #1393) also carries its run
+ * and its cap on real write-tool calls; both are absent for any other token.
  */
 export interface LiveAgentAccessToken {
 	user: SwarmUser;
 	tokenId: string;
 	projectIds?: string[];
+	runId?: string;
+	maxWriteActions?: number;
 }
 
 type AgentAccessTokenRow = typeof agentAccessTokens.$inferSelect;
@@ -62,12 +69,16 @@ export async function insertAgentAccessToken(
 	return toAgentAccessToken(row);
 }
 
-/** One account's tokens, the freshest first. There is no read of anybody else's. */
+/**
+ * One account's tokens, the freshest first. There is no read of anybody else's.
+ * A run-bound credential (issue #1393) is left out: it is a system credential the
+ * control plane mints and revokes, not one the holder manages.
+ */
 export async function listAgentAccessTokensOfUser(userId: string): Promise<AgentAccessToken[]> {
 	const rows = await getDb()
 		.select()
 		.from(agentAccessTokens)
-		.where(eq(agentAccessTokens.userId, userId))
+		.where(and(eq(agentAccessTokens.userId, userId), isNull(agentAccessTokens.runId)))
 		.orderBy(desc(agentAccessTokens.createdAt));
 	return rows.map(toAgentAccessToken);
 }
@@ -99,6 +110,8 @@ export async function findLiveAgentAccessToken(
 			user: users,
 			tokenId: agentAccessTokens.id,
 			projectIds: agentAccessTokens.projectIds,
+			runId: agentAccessTokens.runId,
+			maxWriteActions: agentAccessTokens.maxWriteActions,
 		})
 		.from(agentAccessTokens)
 		.innerJoin(users, eq(agentAccessTokens.userId, users.id))
@@ -110,7 +123,18 @@ export async function findLiveAgentAccessToken(
 		user: rowToSwarmUser(row.user),
 		tokenId: row.tokenId,
 		...(row.projectIds && row.projectIds.length > 0 ? { projectIds: row.projectIds } : {}),
+		...(row.runId ? { runId: row.runId } : {}),
+		...(row.maxWriteActions !== null ? { maxWriteActions: row.maxWriteActions } : {}),
 	};
+}
+
+/** Remove every token bound to `runId` (issue #1393) and return their count. */
+export async function deleteAgentAccessTokensOfRun(runId: string): Promise<number> {
+	const deleted = await getDb()
+		.delete(agentAccessTokens)
+		.where(eq(agentAccessTokens.runId, runId))
+		.returning({ id: agentAccessTokens.id });
+	return deleted.length;
 }
 
 /**

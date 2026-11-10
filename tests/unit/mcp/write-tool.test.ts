@@ -7,13 +7,15 @@ import { z } from 'zod';
  * dry run that never reaches the write, authorization (the preview) before anything,
  * and exactly one audit row — inserted before acting, settled after — for every call.
  */
-const { recordOperatorAction, settleOperatorAction } = vi.hoisted(() => ({
+const { recordOperatorAction, settleOperatorAction, countAgentTokenActions } = vi.hoisted(() => ({
 	recordOperatorAction: vi.fn(),
 	settleOperatorAction: vi.fn(),
+	countAgentTokenActions: vi.fn(),
 }));
 vi.mock('@/db/repositories/operatorActionsRepository.js', () => ({
 	recordOperatorAction,
 	settleOperatorAction,
+	countAgentTokenActions,
 }));
 vi.mock('@/lib/logger.js', async () => ({
 	...(await vi.importActual<typeof import('@/lib/logger.js')>('@/lib/logger.js')),
@@ -66,6 +68,7 @@ function text(result: { content: Array<{ type: string; text?: string }> }): stri
 beforeEach(() => {
 	recordOperatorAction.mockReset().mockResolvedValue('audit-1');
 	settleOperatorAction.mockReset().mockResolvedValue(undefined);
+	countAgentTokenActions.mockReset().mockResolvedValue(0);
 	preview = vi.fn().mockResolvedValue({ projectId: 'proj-a', plan: { wouldRefuse: null } });
 	apply = vi.fn().mockResolvedValue({ outcome: 'done' });
 });
@@ -445,5 +448,175 @@ describe('runWriteTool', () => {
 
 		expect(result.isError).toBeUndefined();
 		expect(apply).toHaveBeenCalledTimes(1);
+	});
+
+	// Issue #1393: a run-bound scoped credential's real writes are capped, must follow
+	// a succeeded dry run of the same tool on the same target, and never repeat one.
+	describe('run-bound credential guardrails', () => {
+		const RUN_ID = '44444444-4444-4444-8444-444444444444';
+		const runBound = (maxWriteActions: number): ToolContext => ({
+			...scopedAgentPrincipal(USER, TOKEN_ID, ['proj-a'], { runId: RUN_ID, maxWriteActions }),
+			ceiling: 'member',
+		});
+		const resetTool = () => ({ ...definition(), name: 'run_reset' });
+
+		/** Answer each guardrail read: real calls spent, succeeded dry runs, prior applies. */
+		function counts(answer: { spent?: number; dryRuns?: number; applied?: number }) {
+			countAgentTokenActions.mockImplementation(
+				async (query: { dryRun: boolean; tool?: string }) => {
+					if (query.dryRun) return answer.dryRuns ?? 1;
+					return query.tool === undefined ? (answer.spent ?? 0) : (answer.applied ?? 0);
+				},
+			);
+		}
+
+		function expectRefused(result: Awaited<ReturnType<typeof runWriteTool>>, message: string) {
+			expect(result.isError).toBe(true);
+			expect(text(result)).toBe(`FORBIDDEN: ${message}`);
+			expect(preview).not.toHaveBeenCalled();
+			expect(apply).not.toHaveBeenCalled();
+			expect(settleOperatorAction).toHaveBeenCalledWith('audit-1', {
+				outcome: 'refused',
+				error: `FORBIDDEN: ${message}`,
+				projectId: null,
+			});
+		}
+
+		it('runs a real call within the cap that follows a succeeded dry run', async () => {
+			counts({ spent: 1, dryRuns: 1, applied: 0 });
+			const result = await runWriteTool(resetTool(), runBound(2), {
+				runId: 'run-1',
+				reason: 'r',
+				dryRun: false,
+			});
+
+			expect(result.isError).toBeUndefined();
+			expect(apply).toHaveBeenCalledTimes(1);
+			expect(countAgentTokenActions).toHaveBeenCalledWith({
+				agentTokenId: TOKEN_ID,
+				dryRun: true,
+				outcomes: ['succeeded'],
+				tool: 'run_reset',
+				target: 'run-1',
+			});
+			expect(countAgentTokenActions).toHaveBeenCalledWith({
+				agentTokenId: TOKEN_ID,
+				dryRun: false,
+				outcomes: ['pending', 'succeeded', 'failed'],
+				tool: 'run_reset',
+				target: 'run-1',
+				excludeId: 'audit-1',
+			});
+		});
+
+		it('refuses a real call once the cap is spent, counting failed calls but not refused ones', async () => {
+			counts({ spent: 2 });
+			const result = await runWriteTool(resetTool(), runBound(2), {
+				runId: 'run-1',
+				reason: 'r',
+				dryRun: false,
+			});
+
+			expectRefused(result, 'write-action cap of 2 reached for this run');
+			expect(countAgentTokenActions).toHaveBeenCalledWith({
+				agentTokenId: TOKEN_ID,
+				dryRun: false,
+				outcomes: ['pending', 'succeeded', 'failed'],
+				excludeId: 'audit-1',
+			});
+		});
+
+		it('refuses a real call with no succeeded dry run of the same tool and target', async () => {
+			counts({ dryRuns: 0 });
+			const result = await runWriteTool(resetTool(), runBound(3), {
+				runId: 'run-1',
+				reason: 'r',
+				dryRun: false,
+			});
+
+			expectRefused(result, 'dry run run_reset on run-1 first');
+		});
+
+		it('refuses a real call that repeats the same tool on the same target', async () => {
+			counts({ applied: 1 });
+			const result = await runWriteTool(resetTool(), runBound(3), {
+				runId: 'run-1',
+				reason: 'r',
+				dryRun: false,
+			});
+
+			expectRefused(result, 'run_reset was already applied to run-1 in this run');
+		});
+
+		it('refuses a real call while the same tool on the same target is still pending', async () => {
+			// Only another call's in-flight row is on the table: the asking call's own
+			// row is excluded, and nothing has settled yet.
+			countAgentTokenActions.mockImplementation(
+				async (query: {
+					dryRun: boolean;
+					tool?: string;
+					outcomes: string[];
+					excludeId?: string;
+				}) => {
+					if (query.dryRun) return 1;
+					if (query.tool === undefined) return 1;
+					return query.outcomes.includes('pending') && query.excludeId === 'audit-1' ? 1 : 0;
+				},
+			);
+			const result = await runWriteTool(resetTool(), runBound(3), {
+				runId: 'run-1',
+				reason: 'r',
+				dryRun: false,
+			});
+
+			expectRefused(result, 'run_reset was already applied to run-1 in this run');
+		});
+
+		it('refuses, rather than fails, when the guardrails cannot be read', async () => {
+			countAgentTokenActions.mockRejectedValue(new Error('connection reset'));
+			const result = await runWriteTool(resetTool(), runBound(3), {
+				runId: 'run-1',
+				reason: 'r',
+				dryRun: false,
+			});
+
+			expectRefused(result, "This run's write guardrails could not be checked (connection reset).");
+		});
+
+		it('never caps a dry run', async () => {
+			counts({ spent: 5, dryRuns: 0, applied: 1 });
+			const result = await runWriteTool(resetTool(), runBound(0), {
+				runId: 'run-1',
+				reason: 'r',
+				dryRun: true,
+			});
+
+			expect(result.isError).toBeUndefined();
+			expect(countAgentTokenActions).not.toHaveBeenCalled();
+			expect(preview).toHaveBeenCalledTimes(1);
+			expect(settleOperatorAction).toHaveBeenCalledWith('audit-1', {
+				outcome: 'succeeded',
+				error: null,
+				projectId: 'proj-a',
+			});
+		});
+
+		it('leaves an ordinary token and a scoped token without a run unaffected', async () => {
+			counts({ spent: 5, dryRuns: 0, applied: 1 });
+			const scoped = scopedAgentPrincipal(USER, TOKEN_ID, ['proj-a']);
+			for (const context of [
+				{ ...scoped, ceiling: 'member' as const },
+				{ ...CONTEXT, ceiling: 'member' as const },
+			]) {
+				const result = await runWriteTool(resetTool(), context, {
+					runId: 'run-1',
+					reason: 'r',
+					dryRun: false,
+				});
+				expect(result.isError).toBeUndefined();
+			}
+			expect(countAgentTokenActions).not.toHaveBeenCalled();
+			expect(apply).toHaveBeenCalledTimes(2);
+		});
 	});
 });

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { getDb } from '../../../src/db/client.js';
 import {
+	countAgentTokenActions,
 	findLatestOperatorAction,
 	recordOperatorAction,
 	settleOperatorAction,
@@ -125,5 +126,95 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('operatorActionsRepository
 				target: 'proj-a/implementation',
 			}),
 		).toBeUndefined();
+	});
+
+	// Issue #1393: the read behind a run-bound credential's guardrails.
+	it("counts one agent token's calls by dry/real, outcome, tool and target", async () => {
+		const TOKEN = '33333333-3333-4333-8333-333333333333';
+		const call = async (
+			over: Partial<typeof CALL>,
+			outcome: 'succeeded' | 'refused' | 'failed' | 'pending',
+			agentTokenId: string | null = TOKEN,
+		) => {
+			const id = await recordOperatorAction({
+				...CALL,
+				...over,
+				credentialKind: agentTokenId ? 'scoped-agent-token' : 'user',
+				agentTokenId,
+			});
+			if (outcome !== 'pending') await settleOperatorAction(id, { outcome, error: null });
+			return id;
+		};
+		await call({ dryRun: true }, 'succeeded');
+		await call({ dryRun: true, target: 'run-2' }, 'refused');
+		await call({}, 'failed');
+		await call({ target: 'run-2' }, 'refused');
+		const asking = await call({ target: 'run-3' }, 'pending');
+		await call({}, 'succeeded', null);
+
+		const real = { agentTokenId: TOKEN, dryRun: false };
+		expect(
+			await countAgentTokenActions({ ...real, outcomes: ['pending', 'succeeded', 'failed'] }),
+		).toBe(2);
+		expect(
+			await countAgentTokenActions({
+				...real,
+				outcomes: ['pending', 'succeeded', 'failed'],
+				excludeId: asking,
+			}),
+		).toBe(1);
+		expect(
+			await countAgentTokenActions({
+				...real,
+				outcomes: ['succeeded', 'failed'],
+				tool: 'run_reset',
+				target: 'run-1',
+			}),
+		).toBe(1);
+		expect(
+			await countAgentTokenActions({
+				agentTokenId: TOKEN,
+				dryRun: true,
+				outcomes: ['succeeded'],
+				tool: 'run_reset',
+				target: 'run-2',
+			}),
+		).toBe(0);
+		expect(
+			await countAgentTokenActions({
+				agentTokenId: TOKEN,
+				dryRun: true,
+				outcomes: ['succeeded'],
+				tool: 'run_reset',
+				target: 'run-1',
+			}),
+		).toBe(1);
+	});
+
+	// Issue #1393 review: the no-repeat read sees another call still in flight on the
+	// same tool and target, but never the asking call's own pending row.
+	it('counts an in-flight real call on the same tool and target, leaving out the excluded row', async () => {
+		const TOKEN = '33333333-3333-4333-8333-333333333333';
+		const pending = () =>
+			recordOperatorAction({
+				...CALL,
+				credentialKind: 'scoped-agent-token',
+				agentTokenId: TOKEN,
+			});
+		const inFlight = await pending();
+		const asking = await pending();
+		const query = {
+			agentTokenId: TOKEN,
+			dryRun: false,
+			outcomes: ['pending', 'succeeded', 'failed'] as const,
+			tool: 'run_reset',
+			target: 'run-1',
+		};
+
+		expect(await countAgentTokenActions(query)).toBe(2);
+		expect(await countAgentTokenActions({ ...query, excludeId: asking })).toBe(1);
+		expect(await countAgentTokenActions({ ...query, excludeId: inFlight })).toBe(1);
+		await settleOperatorAction(inFlight, { outcome: 'refused', error: null });
+		expect(await countAgentTokenActions({ ...query, excludeId: asking })).toBe(0);
 	});
 });

@@ -150,15 +150,22 @@ vi.mock('@/db/repositories/dispatchesRepository.js', async () => ({
 // The write tools (issue #1346): the audit trail they record into, and the
 // side-effecting seams behind `runs.reset` / `runs.retryNow`, whose own suites
 // cover them — here only *whether* each is reached and as whom.
-const { recordOperatorAction, settleOperatorAction, findLatestOperatorAction } = vi.hoisted(() => ({
+const {
+	recordOperatorAction,
+	settleOperatorAction,
+	findLatestOperatorAction,
+	countAgentTokenActions,
+} = vi.hoisted(() => ({
 	recordOperatorAction: vi.fn(),
 	settleOperatorAction: vi.fn(),
 	findLatestOperatorAction: vi.fn(),
+	countAgentTokenActions: vi.fn(),
 }));
 vi.mock('@/db/repositories/operatorActionsRepository.js', () => ({
 	recordOperatorAction,
 	settleOperatorAction,
 	findLatestOperatorAction,
+	countAgentTokenActions,
 }));
 const { resetRun } = vi.hoisted(() => ({ resetRun: vi.fn() }));
 vi.mock('@/dispatch/run-reset.js', async () => ({
@@ -373,6 +380,8 @@ function workerRow(workerId: string, displayName: string, rateLimits: (typeof CO
 const ADMIN_AGENT_TOKEN_ID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 /** The scoped agent credential's token id (issue #1385). */
 const SCOPED_TOKEN_ID = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+/** The run-bound scoped agent credential's token id (issue #1393). */
+const RUN_BOUND_TOKEN_ID = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
 
 /**
  * Agent access tokens (issue #1362), resolved by the second credential lookup —
@@ -383,6 +392,14 @@ const AGENT_TOKENS: Record<string, LiveAgentAccessToken> = {
 	'admin-agent-token': { user: ADMIN, tokenId: ADMIN_AGENT_TOKEN_ID },
 	'member-agent-token': { user: MEMBER, tokenId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd' },
 	'scoped-agent-token': { user: ADMIN, tokenId: SCOPED_TOKEN_ID, projectIds: ['proj-a'] },
+	// Issue #1393: minted for one run, with a cap of two real writes.
+	'run-bound-agent-token': {
+		user: ADMIN,
+		tokenId: RUN_BOUND_TOKEN_ID,
+		projectIds: ['proj-a'],
+		runId: '99999999-9999-4999-8999-999999999999',
+		maxWriteActions: 2,
+	},
 };
 
 let resolveSession: ReturnType<typeof vi.fn<OperatorMcpDeps['resolveSession']>>;
@@ -474,6 +491,7 @@ beforeEach(() => {
 	recordOperatorAction.mockReset().mockResolvedValue('audit-1');
 	settleOperatorAction.mockReset().mockResolvedValue(undefined);
 	findLatestOperatorAction.mockReset().mockResolvedValue(undefined);
+	countAgentTokenActions.mockReset().mockResolvedValue(0);
 	resetRun.mockReset();
 	reopenDispatchForManualRetry.mockReset();
 	listDependencyWaits.mockReset().mockResolvedValue([]);
@@ -1717,6 +1735,28 @@ describe('operator MCP — run_reset and dispatch_redispatch_now', () => {
 			credentialKind: 'scoped-agent-token',
 			agentTokenId: SCOPED_TOKEN_ID,
 			outcome: 'succeeded',
+		});
+	});
+
+	// Issue #1393: a run-bound token resolves to a principal carrying its run, so its
+	// real writes go through the run's guardrails — here, the dry run it skipped.
+	it("holds a run-bound credential's real write to its run's guardrails", async () => {
+		const result = await callTool(
+			'run_reset',
+			{ runId: RUN_ID, reason: 'resolve-problem agent: wedged run' },
+			'run-bound-agent-token',
+		);
+
+		expect(result.content[0]?.text).toBe(`FORBIDDEN: dry run run_reset on ${RUN_ID} first`);
+		expect(resetRun).not.toHaveBeenCalled();
+		expect(countAgentTokenActions).toHaveBeenCalledWith(
+			expect.objectContaining({ agentTokenId: RUN_BOUND_TOKEN_ID, dryRun: false }),
+		);
+		expect(auditRow()).toMatchObject({
+			tool: 'run_reset',
+			credentialKind: 'scoped-agent-token',
+			agentTokenId: RUN_BOUND_TOKEN_ID,
+			outcome: 'refused',
 		});
 	});
 
