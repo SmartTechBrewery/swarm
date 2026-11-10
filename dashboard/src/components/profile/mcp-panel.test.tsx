@@ -4,8 +4,9 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { listQuery, issueMutate, revokeMutate } = vi.hoisted(() => ({
+const { listQuery, projectsQuery, issueMutate, revokeMutate } = vi.hoisted(() => ({
 	listQuery: vi.fn(),
+	projectsQuery: vi.fn(),
 	issueMutate: vi.fn(),
 	revokeMutate: vi.fn(),
 }));
@@ -15,6 +16,11 @@ vi.mock('@/lib/trpc.js', () => ({
 		agentAccessTokens: {
 			list: {
 				queryOptions: () => ({ queryKey: ['agentAccessTokens.list'], queryFn: listQuery }),
+			},
+		},
+		projects: {
+			list: {
+				queryOptions: () => ({ queryKey: ['projects.list'], queryFn: projectsQuery }),
 			},
 		},
 	},
@@ -42,6 +48,18 @@ const EXPIRED = {
 	createdAt: new Date(Date.now() - 40 * DAY).toISOString(),
 	expiresAt: new Date(Date.now() - 10 * DAY).toISOString(),
 };
+const SCOPED = {
+	id: '55555555-5555-4555-8555-555555555555',
+	name: 'resolve-problem agent',
+	createdAt: new Date(Date.now() - DAY).toISOString(),
+	expiresAt: new Date(Date.now() + 29 * DAY).toISOString(),
+	projectIds: ['proj-a', 'proj-b'],
+};
+const PROJECTS = [
+	{ id: 'proj-a', name: 'Alpha' },
+	{ id: 'proj-b', name: 'Beta' },
+	{ id: 'proj-c', name: 'Gamma' },
+];
 const RAW_TOKEN = 'raw-token-value-0123456789';
 
 let queryClient: QueryClient;
@@ -65,6 +83,7 @@ async function issueToken(name = 'ci runner') {
 
 beforeEach(() => {
 	listQuery.mockReset().mockResolvedValue([LIVE, EXPIRED]);
+	projectsQuery.mockReset().mockResolvedValue(PROJECTS);
 	issueMutate.mockReset().mockResolvedValue({ ...LIVE, name: 'ci runner', token: RAW_TOKEN });
 	revokeMutate.mockReset().mockResolvedValue({ ok: true });
 });
@@ -109,6 +128,20 @@ describe('McpPanel — states', () => {
 		expect(expired.textContent).toMatch(/Expired .* · Not used yet/);
 		expect(within(expired).getByText('Expired')).toBeDefined();
 	});
+
+	it("states each token's project scope", async () => {
+		listQuery.mockResolvedValue([LIVE, SCOPED]);
+		renderPanel();
+
+		const live = (await screen.findByText('office laptop')).closest('li') as HTMLElement;
+		expect(within(live).getByText('All projects')).toBeDefined();
+
+		const scoped = screen.getByText('resolve-problem agent').closest('li') as HTMLElement;
+		expect(within(scoped).getByText('Scoped: proj-a, proj-b')).toBeDefined();
+		expect(
+			within(scoped).getByRole('button', { name: 'Revoke token resolve-problem agent' }),
+		).toBeDefined();
+	});
 });
 
 describe('McpPanel — issuing', () => {
@@ -141,7 +174,11 @@ describe('McpPanel — issuing', () => {
 		const dialog = await issueToken('  ci runner ');
 
 		expect(issueMutate).toHaveBeenCalledWith({ name: 'ci runner' });
+		expect(issueMutate.mock.calls[0]?.[0]).not.toHaveProperty('projectIds');
 		expect(within(dialog).getByText(RAW_TOKEN)).toBeDefined();
+		expect(dialog.querySelector('#mcp-issued-scope')?.textContent).toMatch(
+			/^All projects — the token acts with your full access\.$/,
+		);
 		expect(dialog.querySelector('pre')?.textContent).toBe(
 			`claude mcp add --transport http swarm ${window.location.origin}/operator/mcp \\\n` +
 				`  --header "Authorization: Bearer ${RAW_TOKEN}"`,
@@ -149,6 +186,37 @@ describe('McpPanel — issuing', () => {
 		expect(within(dialog).getByText(/only time this token is shown/)).toBeDefined();
 		expect(within(dialog).getByText(/works only on the installation that issued it/)).toBeDefined();
 		expect(within(dialog).getByRole('status')).toBeDefined();
+	});
+
+	it('limits the token to the checked projects and states the scope in the reveal', async () => {
+		issueMutate.mockResolvedValue({ ...SCOPED, token: RAW_TOKEN });
+		renderPanel();
+
+		fireEvent.click(await screen.findByRole('checkbox', { name: /Gamma/ }));
+		fireEvent.click(screen.getByRole('checkbox', { name: /Alpha/ }));
+		fireEvent.click(screen.getByRole('checkbox', { name: /Gamma/ }));
+		fireEvent.click(screen.getByRole('checkbox', { name: /Beta/ }));
+		const dialog = await issueToken('resolve-problem agent');
+
+		expect(issueMutate).toHaveBeenCalledWith({
+			name: 'resolve-problem agent',
+			projectIds: ['proj-a', 'proj-b'],
+		});
+		expect(dialog.querySelector('#mcp-issued-scope')?.textContent).toMatch(
+			/^Limited to proj-a, proj-b — /,
+		);
+		for (const box of screen.getAllByRole('checkbox')) {
+			expect((box as HTMLInputElement).checked).toBe(false);
+		}
+	});
+
+	it('still issues a full-access token when the projects cannot be loaded', async () => {
+		projectsQuery.mockRejectedValue(new Error('projects down'));
+		renderPanel();
+
+		expect(await screen.findByText(/Projects could not be loaded \(projects down\)/)).toBeDefined();
+		await issueToken();
+		expect(issueMutate).toHaveBeenCalledWith({ name: 'ci runner' });
 	});
 
 	it('copies the token and the command, reporting each', async () => {

@@ -68,8 +68,10 @@ them, with exactly their access. It differs from a login session in three ways:
   when you issue it, and cannot be shown again. If you lose it, issue a new one
   and revoke the old one.
 
-The list shows when each token was issued, when it expires (or that it has
-expired), and when it last opened the MCP server. The last use is recorded at
+The list shows each token's scope (**All projects**, or **Scoped:** and the
+project ids of a [scoped agent credential](#scoped-agent-credentials)), when it
+was issued, when it expires (or that it has expired), and when it last opened the
+MCP server. The last use is recorded at
 most once a minute. Revoking a token takes effect on the next request. Expired
 tokens are deleted lazily, so an expired one can stay on the list for a while,
 marked **Expired**.
@@ -112,9 +114,22 @@ Inside its projects, the credential has the role you hold there: an installation
 administrator's credential acts as `projectAdmin` of each of them. A role you hold
 on a project outside the credential's list lifts nothing.
 
-**Issuing one.** There is no dashboard control yet. Call the dashboard's
-`agentAccessTokens.issue` tRPC procedure, signed in as yourself, with the projects
-the credential is for:
+**Issuing one.** In the dashboard, open your **Profile** and the **MCP** tab:
+
+1. Enter a token name (for example `resolve-problem agent`).
+2. Under **Limit to projects (optional)**, check each project the credential is
+   for. The list shows the projects you can see; leave every box unchecked for an
+   ordinary token with your full access.
+3. Click **Issue token**. The dialog shows the token, the Claude Code command,
+   and the **Scope**: the project ids it is limited to. Copy what you need before
+   you click **Close**.
+
+On the list, the token carries a **Scoped:** badge naming its project ids, so it
+reads apart from your full-access tokens. A token's projects cannot be changed
+after it is issued: to change them, issue a new token and revoke the old one.
+
+Without the dashboard, call its `agentAccessTokens.issue` tRPC procedure, signed
+in as yourself, with the projects the credential is for:
 
 ```json
 { "name": "resolve-problem agent", "projectIds": ["proj-a", "proj-b"] }
@@ -128,19 +143,23 @@ is refused as `NOT_FOUND`, without saying which project was the problem. Without
 once, exactly as for an ordinary token, and `agentAccessTokens.list` shows each
 token's `projectIds`.
 
-**Revoking and expiry** are an ordinary token's: revoke it with
-`agentAccessTokens.revoke` (or the **MCP** tab's revoke button), and it expires 30
-days after it is issued. Neither its projects nor its tools are settings: the
+**Revoking and expiry** are an ordinary token's: on the **MCP** tab, click
+**Revoke** on the token's row (the one with its **Scoped:** badge) and confirm
+with **Revoke token**, or call `agentAccessTokens.revoke`. Revoking it leaves your
+other tokens working. It expires 30 days after it is issued. Neither its projects nor its tools are settings: the
 recovery tools are the `SCOPED_AGENT_RECOVERY_TOOLS` constant
 (`src/identity/agent-access-token.ts`).
 
 ## Connecting a client
 
 1. In the dashboard, open your **Profile** and the **MCP** tab.
-2. Enter a token name (for example `office laptop`) and click **Issue token**.
-3. The dialog shows the token and a ready command for Claude Code, already built
-   with this installation's address. Copy what you need before you click
-   **Close**. The token is not shown again.
+2. Enter a token name (for example `office laptop`). To limit the token to some
+   projects, check them under **Limit to projects (optional)** (see [Scoped agent
+   credentials](#scoped-agent-credentials)); leave them all unchecked for a token
+   with your full access. Click **Issue token**.
+3. The dialog shows the token, a ready command for Claude Code, already built
+   with this installation's address, and the token's scope. Copy what you need
+   before you click **Close**. The token is not shown again.
 4. Run the command on the machine the client runs on. It has this shape:
 
 ```bash
@@ -175,6 +194,9 @@ the same way.
 
 **When the token expires**, the tools start answering `401`. Issue a new token and
 update the client's header.
+
+**To revoke a token**, click **Revoke** on its row in the **MCP** tab and confirm.
+The client's next request is refused.
 
 Treat the token like a password: it reads everything your account can read in the
 dashboard, including run logs and agent output, and it can reset and re-dispatch
