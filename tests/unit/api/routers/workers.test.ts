@@ -3468,7 +3468,7 @@ describe('workers.rename (owner-only, no instanceAdmin override)', () => {
 	});
 });
 
-describe('workers.remove (owner-only deregistration, issue #789)', () => {
+describe('workers.remove (owner or instanceAdmin deregistration, issues #789/#1413)', () => {
 	it('is NOT_FOUND for an unknown worker', async () => {
 		getWorker.mockResolvedValue(undefined);
 
@@ -3487,12 +3487,23 @@ describe('workers.remove (owner-only deregistration, issue #789)', () => {
 		expect(removeWorker).not.toHaveBeenCalled();
 	});
 
-	it('hides another owner’s worker from an instanceAdmin too — no override', async () => {
+	it('lets an instanceAdmin remove another user’s worker', async () => {
 		const admin = workersRouter.createCaller({ user: ADMIN_USER });
 		getWorker.mockResolvedValue(makeWorker({ ownerUserId: OWNER_ID }));
 
+		const result = await admin.remove({ workerId: WORKER_ID });
+
+		expect(result).toEqual({ workerId: WORKER_ID });
+		expect(removeWorker).toHaveBeenCalledWith(WORKER_ID);
+	});
+
+	it('refuses an instanceAdmin while the machine is busy (CONFLICT), without deleting', async () => {
+		const admin = workersRouter.createCaller({ user: ADMIN_USER });
+		getWorker.mockResolvedValue(makeWorker({ ownerUserId: OWNER_ID }));
+		deriveWorkerRunState.mockResolvedValue({ busy: true, currentRunId: 'run-1' });
+
 		await expect(admin.remove({ workerId: WORKER_ID })).rejects.toThrowError(
-			expect.objectContaining({ code: 'NOT_FOUND' }),
+			expect.objectContaining({ code: 'CONFLICT' }),
 		);
 		expect(removeWorker).not.toHaveBeenCalled();
 	});
@@ -3545,5 +3556,51 @@ describe('workers.remove (owner-only deregistration, issue #789)', () => {
 		await expect(owner.remove({ workerId: WORKER_ID })).rejects.toThrowError(
 			expect.objectContaining({ code: 'NOT_FOUND' }),
 		);
+	});
+});
+
+describe('workers.previewRemove (the worker_remove dry run, issue #1413)', () => {
+	it('plans the owner’s removal of an idle machine without deleting', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		deriveWorkerRunState.mockResolvedValue({ busy: false, currentRunId: null });
+
+		const plan = await owner.previewRemove({ workerId: WORKER_ID });
+
+		expect(plan).toMatchObject({
+			workerId: WORKER_ID,
+			ownerUserId: OWNER_ID,
+			busy: false,
+			currentRunId: null,
+			change: 'remove',
+		});
+		expect(removeWorker).not.toHaveBeenCalled();
+	});
+
+	it('plans an instanceAdmin’s removal of another user’s worker', async () => {
+		const admin = workersRouter.createCaller({ user: ADMIN_USER });
+		getWorker.mockResolvedValue(makeWorker({ ownerUserId: OWNER_ID }));
+
+		const plan = await admin.previewRemove({ workerId: WORKER_ID });
+
+		expect(plan).toMatchObject({ workerId: WORKER_ID, change: 'remove' });
+		expect(removeWorker).not.toHaveBeenCalled();
+	});
+
+	it('hides a worker the caller does not own (NOT_FOUND)', async () => {
+		getWorker.mockResolvedValue(makeWorker({ ownerUserId: OTHER_ID }));
+
+		await expect(owner.previewRemove({ workerId: WORKER_ID })).rejects.toThrowError(
+			expect.objectContaining({ code: 'NOT_FOUND' }),
+		);
+	});
+
+	it('reports a busy machine as refused-busy rather than throwing', async () => {
+		getWorker.mockResolvedValue(makeWorker());
+		deriveWorkerRunState.mockResolvedValue({ busy: true, currentRunId: 'run-1' });
+
+		const plan = await owner.previewRemove({ workerId: WORKER_ID });
+
+		expect(plan).toMatchObject({ busy: true, currentRunId: 'run-1', change: 'refused-busy' });
+		expect(removeWorker).not.toHaveBeenCalled();
 	});
 });

@@ -609,8 +609,12 @@ tRPC layer enforces ownership the direct-DB CLI never did. All four are intended
    That secret is also **verified against the provider before it is stored** now,
    and the account it resolved to is named back — a value that resolves to no
    account is refused with nothing written.
-2. **`remove` is owner-only and refuses a busy worker.** `workers.remove` blocks
-   while the machine is executing a run, and its `CONFLICT` message is surfaced
+2. **`remove` is the owner's or an installation administrator's, and refuses a busy
+   worker.** It was strictly owner-only until issue #1413 let an `instanceAdmin`
+   retire somebody else's machine (one that is gone, with its owner not around to
+   clean up); anyone else still gets `Worker with ID "…" not found`.
+   `workers.remove` blocks while the machine is executing a run — on the
+   administrator's path as on the owner's — and its `CONFLICT` message is surfaced
    as-is. The unconditional delete this command used to be — documented as the
    escape hatch for a stuck machine — is gone; stop the run first.
 3. **`list` is an installation-admin read unless it names your own handle.** With
@@ -878,9 +882,11 @@ unchanged.
   produced with it (issue #1249). It replaces the retired `SWARM_OPERATOR_GH_TOKEN`,
   which nothing reads any more. Owner-only
   (narrowing 1).
-- **`remove`** — deregister a worker by worker id. Owner-only, and refused while the
-  machine is executing a run (narrowing 2) — the same rule its dashboard equivalent
-  at `/workers/<worker-id>` → **Delete worker** applies since issue #789. The removal
+- **`remove`** — deregister a worker by worker id. The machine's owner or an
+  installation administrator may do it (issue #1413), and it is refused while the
+  machine is executing a run (narrowing 2) — the same procedure its dashboard
+  equivalent at `/workers/<worker-id>` → **Delete worker** (issue #789, offered to the
+  owner only) and the operator MCP tool `worker_remove` call. The removal
   cascades to the worker's enrollments, its operator SCM credentials and its session,
   while runs it produced stay in history.
 - **`drain` / `undrain`** — take a machine **out of the dispatch pool** so it can be
@@ -1042,8 +1048,9 @@ unchanged.
 - **`request-update <ref>`** — ask **every machine on the installation**, other
   people's included, to move to `<ref>`, with one line per machine saying what became
   of it (issue #922). An **installation administrator's** command — the one write in
-  this group that is, where `set-scm-credential`, `remove`, `consent` and
-  `update-enrollment` are strictly the machine owner's (issue #800) and the unfiltered
+  this group that is, where `set-scm-credential`, `consent` and `update-enrollment`
+  are strictly the machine owner's (issue #800), `remove` is the owner's or an
+  administrator's (issue #1413), and the unfiltered
   roster read is an administrator's (issue #647). A caller who is not one is refused
   outright and shown nothing; it never narrows to their own machines, which would read
   as the whole installation.

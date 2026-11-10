@@ -44,6 +44,7 @@ import { registerRunActionTools } from './tools/run-actions.js';
 import { registerRunTools } from './tools/runs.js';
 import { registerStatsTools } from './tools/stats.js';
 import { registerWorkItemTools } from './tools/work-items.js';
+import { registerWorkerRemoveTools } from './tools/worker-remove.js';
 import { registerWorkerTools } from './tools/workers.js';
 
 /** The name an MCP client lists this server's tools under. */
@@ -75,6 +76,7 @@ export function createSwarmMcpServer(context: ToolContext): McpServer {
 	registerPhaseAgentTools(server, context);
 	registerWorkItemTools(server, context);
 	registerCliRateLimitSetTools(server, context);
+	registerWorkerRemoveTools(server, context);
 	registerProjectSetupTools(server, context);
 	registerBugReportTools(server, context);
 	listOnlyReachableTools(server, context);

@@ -111,7 +111,7 @@ access. A request made with it acts as you, limited in three ways:
 | Every read tool: `runs_list`, `run_get`, `pipeline_snapshot`, `dispatch_history`, `pr_status`, `pipeline_stats`, `phase_agents_get`, `consistency_check`, `project_get`, `workers_state`, `cli_rate_limits`, `control_plane_logs`, `pm_board_discover`, `project_readiness`, `bug_reports_list`, `bug_report_get` | Yes, for its projects only |
 | `run_reset`, `dispatch_redispatch_now`, `pr_force_re_review`, `pr_recheck_mergeability`, `dependency_waits_wake` | Yes, for its projects only: each recovers a stuck run or pull request and changes no configuration |
 | `bug_report_create`, `bug_report_add_occurrence` | Yes, for its projects only: an agent records every problem it diagnoses. Installation-wide reports stay out of its reach |
-| `project_create`, `project_update`, `pm_board_set`, `project_credential_set`, `work_item_close`, `phase_agents_reorder`, `phase_agents_restore`, `cli_rate_limit_set`, `bug_report_set_status` | No |
+| `project_create`, `project_update`, `pm_board_set`, `project_credential_set`, `work_item_close`, `phase_agents_reorder`, `phase_agents_restore`, `cli_rate_limit_set`, `worker_remove`, `bug_report_set_status` | No |
 
 Inside its projects, the credential has the role you hold there: an installation
 administrator's credential acts as `projectAdmin` of each of them. A role you hold
@@ -317,7 +317,7 @@ reads as *not found*. Scope means what a call can reach:
 | `run_reset`, `dispatch_redispatch_now`, `pr_force_re_review`, `pr_recheck_mergeability`, `dependency_waits_wake`, `work_item_close` | `member` | One project |
 | `bug_report_create`, `bug_report_add_occurrence`, `bug_report_set_status` | `member` | One project, or the installation |
 | `phase_agents_reorder`, `phase_agents_restore`, `project_update`, `pm_board_set`, `project_credential_set` | `projectAdmin` | One project |
-| `cli_rate_limit_set` | signed in | The worker's owner |
+| `cli_rate_limit_set`, `worker_remove` | signed in | The worker's owner |
 | `project_create` | signed in | None: like the New Project dialog, it is open to every signed-in user, and you become the new project's `projectAdmin` |
 
 Each required role is the one the tool's dashboard procedure already enforces; this
@@ -447,7 +447,7 @@ the same way:
   call ended before its target resolved to a project, for example an
   unknown run, a call its preview refused (including a `project_create` whose dry
   run reports it would be refused), or a tool whose target belongs to no project
-  (`cli_rate_limit_set`, which acts on a worker). The only tool that reads the
+  (`cli_rate_limit_set` and `worker_remove`, which act on a worker). The only tool that reads the
   audit table is `phase_agents_restore`, which reads back the latest reorder of
   its own project's phase; otherwise query Postgres directly.
 
@@ -462,6 +462,7 @@ the same way:
 | `phase_agents_reorder` | Changes the priority order of one phase's agent `targets` — which CLI/model a worker tries first — and nothing else: no target is added, removed or edited, and the phase's `timeoutMs` and `prompt` are kept. `order` lists every current target exactly once, each as `<cli>/<model>` (`claude/opus`; `default/<model>` for a target naming no CLI) or by its CLI alone (`claude`); anything that is not a permutation of the current targets (an unknown name, a repeat, a target left out) is refused as `BAD_REQUEST` naming the current targets, and a phase with no configured targets as `PRECONDITION_FAILED`. Saves through the project configuration (`projects.update`), which re-validates it as any save is and rewrites the `cli`/`model`/`reasoning` mirror from the new first target. Returns `{ projectId, phase, before, after }` (target names); the dry run (`projects.agentsForUpdate`) returns the same `before`/`after`. The order it replaced is recorded on its audit row (`detail: { previous, next }`) | `projectId`, `phase` (as for `phase_agents_get`), `order`, `reason`, `dryRun` (default `false`) |
 | `phase_agents_restore` | Puts back the order the latest successful, real (not dry-run) `phase_agents_reorder` of this project's phase replaced, read from that call's audit row, and saves it the same way. Refused as `PRECONDITION_FAILED` when the phase was never reordered, or when its targets were edited since — a CLI, model or reasoning level changed, or a target added or removed — so the recorded order is no longer a permutation of them: re-applying it would undo that edit. Reorder by hand with `phase_agents_reorder` then. A dashboard reorder of the same targets made since is not an edit, and is overwritten. Returns `{ projectId, phase, before, after }`; the dry run adds `restoring: { auditId, reorderedAt }`, naming the reorder it would undo | `projectId`, `phase`, `reason`, `dryRun` (default `false`) |
 | `cli_rate_limit_set` | Keeps one agent CLI off a worker until `until` or for `durationMinutes` (`workers.setCliRateLimit`): the same `worker_cli_rate_limits` cool-down SWARM records when a run reports a spent allowance, so routing, the Workers screen and `cli_rate_limits` treat it exactly like an observed one, and it lapses by itself at its expiry. `scope: 'owner'` applies it to every worker the named worker's owner operates: SWARM records no CLI-account identity, so one user's machines stand in for "the same CLI account" (a subscription is usually signed in on all of them). **Extend only**: a machine whose live cool-down on that CLI already lasts at least as long is left `unchanged`, so nothing a real run recorded is ever shortened, and nothing is cleared early. Refused with `BAD_REQUEST` unless exactly one of `until`/`durationMinutes` is given, in the future, and at most eight days ahead (`MAX_CLI_COOLDOWN_MS`, the ceiling an observed reset has). Returns `{ cli, scope, requestedExpiresAt, resetHint, workers }`, each worker with `workerId`, `displayName`, `currentExpiresAt`, `newExpiresAt` and `change` (`create`, `extend` or `unchanged`). The dry run (`workers.previewCliRateLimit`) returns the same shape without writing | `workerId`, `cli`, `until?`, `durationMinutes?`, `resetHint?`, `scope` (`worker` or `owner`, default `worker`), `reason`, `dryRun` (default `false`) |
+| `worker_remove` | **Destructive.** Deregisters a worker machine, as `swarm workers remove` and the dashboard's **Delete worker** do (`workers.remove`) — the way to retire a machine that is gone, including one whose owner is not around to do it (issue #1413). Its enrollments, operator SCM credentials and session are deleted with it; its runs and dispatches stay in history with their attribution kept. Refused with `CONFLICT` while the worker is executing a run, for an instance administrator as for the owner. Returns `{ workerId }`. The dry run (`workers.previewRemove`) returns `{ workerId, displayName, ownerUserId, busy, currentRunId, change }`, where `change` is `remove` or `refused-busy` | `workerId`, `reason`, `dryRun` (default `false`) |
 | `project_create` | Creates a project as the New Project dialog does (`projects.create`), with the same validation: each repository's coordinates are checked against the SCM provider (two segments, three on Azure DevOps), a reviewer credential is required — the `reviewerToken` given, or the installation's default from Settings → Credentials — and a duplicate project id or a repository another project owns is refused with `CONFLICT` (`A project with ID "<id>" already exists.` / `Repository '<repo>' already belongs to another project.`; the owning project is not named). You become the project's `projectAdmin`. The board starts on a placeholder mapping, so the project cannot run until `pm_board_set`. Returns the created record. The dry run (`projects.previewCreate`, which receives only whether a `reviewerToken` was given, never its value) returns `{ project, creator, seededCredentials, pmPlaceholder, wouldRefuse }`: the record it would write, you as `projectAdmin`, which credentials it would seed (`providerId`, `role`, and `source`: `request` or `instanceDefault`, never the value), and the refusal it would answer with | `id`, `name`, `repositories`, `repoRoot`, `scm?` (default `github`), `visibility?` (default `private`), `worktreeRoot?`, `agents?`, `pipeline?`, `worktreeRetention?`, `reviewerToken?` (**secret**), `reason`, `dryRun` (default `false`) |
 | `project_update` | Changes a project's configuration as the Repositories, Agents and Pipeline tabs do (`projects.update`), through the same rules. Each field you give replaces the stored one — `repositories` and `agents` are whole lists, so read them with `project_get` first — except `pipeline`, which is merged as a patch (`maxContinuations: null` clears the budget). Repository coordinates are checked against the SCM provider, and a repository another project owns is refused with `CONFLICT`. Returns the updated record. The dry run (`projects.previewUpdate`) returns `{ before, after, changedFields, wouldRefuse }` | `projectId`, `name?`, `repositories?`, `scm?`, `repoRoot?`, `worktreeRoot?`, `visibility?`, `agents?`, `pipeline?`, `worktreeRetention?`, `reason`, `dryRun` (default `false`) |
 | `pm_board_set` | Saves the project's board and status mapping as the Project Management tab's Save does (`projects.update` with `pm`), replacing the placeholder. `pm` is one whole member: `github-projects` `{ projectId, statusFieldId, statusOptions }`, `linear` `{ teamId, statusOptions }`, `jira` `{ baseUrl, projectKey, statusOptions, repositoryField? }` or `trello` `{ boardId, statusOptions }`, with ids from `pm_board_discover`. `statusOptions` maps `backlog`, `planning`, `todo` (Ready), `inProgress`, `inReview` and `done` to state ids; the schema needs one, `project_readiness` wants all six. Moving to another PM provider is refused with `BAD_REQUEST` until that provider's required credentials are stored. The dry run is `projects.previewUpdate`, as above | `projectId`, `pm`, `reason`, `dryRun` (default `false`) |
@@ -519,10 +520,10 @@ phase_agents_restore { projectId: "acme", phase: "resolveConflicts",
 
 Nothing restores the order on its own when the limit resets; that is your call.
 
-`cli_rate_limit_set` acts on a machine rather than a project, so it is gated like
-the dashboard's machine-owner actions: the worker's owner or an instance
-administrator may call it, and anyone else gets `NOT_FOUND`, dry run included. Its
-audit row names no project.
+`cli_rate_limit_set` and `worker_remove` act on a machine rather than a project, so
+they are gated like the dashboard's machine-owner actions: the worker's owner or an
+instance administrator may call them, and anyone else gets `NOT_FOUND`, dry run
+included. Their audit rows name no project.
 
 `project_create` is open to any signed-in user, as the New Project dialog is.
 `project_update`, `pm_board_set` and `project_credential_set` need `projectAdmin`,
@@ -751,7 +752,8 @@ and `dryRun` and writes the `operator_actions` row
 `src/mcp/tools/pr-actions.ts`, `dependency_waits_wake` in
 `src/mcp/tools/dependency-waits.ts`, `work_item_close` in
 `src/mcp/tools/work-items.ts`, `cli_rate_limit_set` in
-`src/mcp/tools/cli-rate-limit-set.ts`, the phase-agent order tools in
+`src/mcp/tools/cli-rate-limit-set.ts`, `worker_remove` in
+`src/mcp/tools/worker-remove.ts`, the phase-agent order tools in
 `src/mcp/tools/phase-agents.ts` (their pure permutation rules in
 `src/mcp/agent-order.ts`), the project set-up tools in
 `src/mcp/tools/project-setup.ts`, and the bug-report tools in

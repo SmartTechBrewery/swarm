@@ -140,6 +140,8 @@ export const TOOL_ACCESS: Readonly<Record<string, ToolAccess>> = {
 	// A worker's own owner may block its CLI, as on the Workers screen: a resource
 	// gate, not a project role.
 	cli_rate_limit_set: { minRole: 'signedIn', scope: 'worker-owner', agentScoped: false },
+	// A worker's owner, or an instance admin, may retire it (issue #1413).
+	worker_remove: { minRole: 'signedIn', scope: 'worker-owner', agentScoped: false },
 	// The New Project dialog is open to any signed-in user; the creator becomes its admin.
 	project_create: { minRole: 'signedIn', scope: 'none', agentScoped: false },
 	// SWARM's own bug reports (issue #1383): read at `contributor`, written at `member`

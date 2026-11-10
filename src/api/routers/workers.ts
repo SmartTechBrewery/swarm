@@ -155,7 +155,8 @@ import { workerScmCredentialsRouter } from './workerScmCredentials.js';
  *   run (`setDeclaredCapabilities`, issue #787 — the durable declaration issue
  *   #783 made survive a reconnect, cleared by passing `capabilities: null`),
  *   retires one for good (`remove`, issue #789 — the dashboard-reachable twin of
- *   `swarm workers remove`), takes a machine out of the dispatch pool so it can be
+ *   `swarm workers remove`, with `previewRemove` its read-only dry run, issue
+ *   #1413), takes a machine out of the dispatch pool so it can be
  *   restarted and puts it back (`setDraining`, issue #919 — reversible, sticky
  *   across the machine's reconnect, and answering with the machine's derived run
  *   state so the caller can tell when restarting is safe), asks a *drained*
@@ -174,10 +175,12 @@ import { workerScmCredentialsRouter } from './workerScmCredentials.js';
  *   and controls the
  *   revocable sharing consent
  *   (`setConsent`) and execution constraints (`updateConstraints`). Ownership is
- *   checked per call. `enroll` alone lets an `instanceAdmin` act on any worker
- *   (layer-1 override, `resolveOwnedWorker`) — offering a worker to a project
- *   reads as administering the project side of that offer; `rename`,
- *   `setDeclaredCapabilities`, `remove`, `setDraining`, `requestUpdate`,
+ *   checked per call. `enroll` and `remove`/`previewRemove` let an
+ *   `instanceAdmin` act on any worker (layer-1 override, `resolveOwnedWorker`) —
+ *   offering a worker to a project reads as administering the project side of
+ *   that offer, and retiring a machine whose owner is gone is administering the
+ *   installation (issue #1413); `rename`,
+ *   `setDeclaredCapabilities`, `setDraining`, `requestUpdate`,
  *   `requestUpdateForMine`, `startFleetUpdate`, `fleetUpdateStatus`,
  *   `requestWorktreeSweep`, `setConsent`,
  *   and `updateConstraints`
@@ -232,8 +235,10 @@ function enrollmentNotFound(enrollmentId: string): TRPCError {
 
 /**
  * Resolve a worker the caller may act on as its owner. An `instanceAdmin` may
- * act on any worker (layer-1 override) for this one act — offering a worker to
- * a project is closer to project administration than to owning the machine.
+ * act on any worker (layer-1 override) for the few acts that read as
+ * administration rather than as owning the machine: offering a worker to a
+ * project (`enroll`), an operator-set CLI cool-down (issue #1350), and retiring
+ * a machine whose owner is not around to do it (`remove`, issue #1413).
  * A missing worker and a worker owned by someone else both surface the same
  * `NOT_FOUND`, so ownership never leaks which worker ids are real.
  */
@@ -682,6 +687,21 @@ function cliRateLimitLine(
 	};
 }
 
+/** The input of `workers.remove` / `workers.previewRemove` and the `worker_remove` MCP tool. */
+export const WorkerRemoveInputSchema = z.object({ workerId: z.string().uuid() });
+
+/**
+ * Authorize one worker removal and read whether the machine is busy — the shared
+ * first half of `previewRemove` and `remove` (issue #1413), so the dry run answers
+ * under exactly the gate the write acts under: the machine's owner or an
+ * `instanceAdmin` ({@link resolveOwnedWorker}), `NOT_FOUND` for anybody else.
+ */
+async function planWorkerRemoval(user: SwarmUser, workerId: string) {
+	const worker = await resolveOwnedWorker(user, workerId);
+	const runState = await deriveWorkerRunState(workerId);
+	return { worker, runState };
+}
+
 export const workersRouter = router({
 	// The worker owner's own operator SCM credential per provider (issue #766),
 	// nested here the way `credentialsRouter` nests under `projectsRouter`: it is
@@ -938,19 +958,21 @@ export const workersRouter = router({
 			}
 		}),
 
-	// Deregister one of the caller's own workers — the dashboard-reachable twin of
-	// `swarm workers remove`, and the retirement half of "a worker is paired with one
-	// repository, for life" (issue #789). Gated by strict ownership exactly like
-	// `rename`: the machine is the owner's, so an `instanceAdmin` gets the same
-	// NOT_FOUND a stranger does and their path to someone else's machine stays the CLI.
+	// Deregister a worker — the dashboard-reachable twin of `swarm workers remove`
+	// (which calls this very procedure over the operator API) and of the operator
+	// MCP's `worker_remove`, and the retirement half of "a worker is paired with one
+	// repository, for life" (issue #789). The machine's owner or an `instanceAdmin`
+	// may do it (`resolveOwnedWorker`, issue #1413): a machine that is gone, with its
+	// owner not around to clean up, otherwise stays registered with no way to retire
+	// it short of the database. Anybody else gets the same NOT_FOUND an unknown id does.
 	//
-	// Refused while the machine is executing a run: `runs.worker_id` is
+	// Refused while the machine is executing a run, on the admin's path as on the
+	// owner's: `runs.worker_id` is
 	// ON DELETE SET NULL, so deleting mid-run would silently detach a live run from the
 	// machine still running it. Merely being connected is fine — `worker_sessions`
 	// cascades, and the daemon's next reconnect fails on a credential that no longer
 	// resolves, which is what retiring a machine means. The check is advisory, not a
-	// lock: a dispatch claimed between it and the delete still slips through, and the
-	// CLI's own `workers remove` keeps its unconditional behaviour as the escape hatch.
+	// lock: a dispatch claimed between it and the delete still slips through.
 	//
 	// Everything else the worker carries goes with it through existing FK constraints —
 	// its enrollments, its operator SCM credentials, and its session — while its runs
@@ -958,22 +980,36 @@ export const workersRouter = router({
 	// maintenance run (issue #971) additionally keeping the `maintenance_machine` name
 	// it recorded: a run whose whole subject is a machine has to go on naming it once
 	// that machine is retired, which is exactly when it gets read.
-	remove: authedProcedure
-		.input(z.object({ workerId: z.string().uuid() }))
-		.mutation(async ({ ctx, input }) => {
-			await resolveStrictlyOwnedWorker(ctx.user, input.workerId);
-			const runState = await deriveWorkerRunState(input.workerId);
-			if (runState.busy) {
-				throw new TRPCError({
-					code: 'CONFLICT',
-					message:
-						'This worker is running a job right now. Wait for it to finish, or stop the run, before deleting the worker.',
-				});
-			}
-			const removed = await removeWorker(input.workerId);
-			if (!removed) throw workerNotFound(input.workerId);
-			return { workerId: input.workerId };
-		}),
+	//
+	// `previewRemove` is the same gate with no write: which machine would go, and
+	// whether it is busy right now (`change: 'refused-busy'`) — reported rather than
+	// thrown, so a dry run states the verdict the real call would reach. It is the
+	// operator MCP tool's dry run.
+	previewRemove: authedProcedure.input(WorkerRemoveInputSchema).query(async ({ ctx, input }) => {
+		const { worker, runState } = await planWorkerRemoval(ctx.user, input.workerId);
+		return {
+			workerId: worker.id,
+			displayName: worker.displayName,
+			ownerUserId: worker.ownerUserId,
+			busy: runState.busy,
+			currentRunId: runState.currentRunId,
+			change: runState.busy ? ('refused-busy' as const) : ('remove' as const),
+		};
+	}),
+
+	remove: authedProcedure.input(WorkerRemoveInputSchema).mutation(async ({ ctx, input }) => {
+		const { runState } = await planWorkerRemoval(ctx.user, input.workerId);
+		if (runState.busy) {
+			throw new TRPCError({
+				code: 'CONFLICT',
+				message:
+					'This worker is running a job right now. Wait for it to finish, or stop the run, before deleting the worker.',
+			});
+		}
+		const removed = await removeWorker(input.workerId);
+		if (!removed) throw workerNotFound(input.workerId);
+		return { workerId: input.workerId };
+	}),
 
 	// State (or clear) the owner's durable declaration of which agent CLIs this
 	// machine should run (issue #787, over issue #783's service seam). The

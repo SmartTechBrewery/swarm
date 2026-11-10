@@ -206,13 +206,17 @@ vi.mock('@/queue/cancellation.js', async () => ({
 	clearRunCancellation,
 }));
 
-const { listDashboardWorkers, listProjectWorkerIdsInOrder, listWorkerProjectCapacity } = vi.hoisted(
-	() => ({
-		listDashboardWorkers: vi.fn(),
-		listProjectWorkerIdsInOrder: vi.fn(),
-		listWorkerProjectCapacity: vi.fn(),
-	}),
-);
+const {
+	listDashboardWorkers,
+	listProjectWorkerIdsInOrder,
+	listWorkerProjectCapacity,
+	deriveWorkerRunState,
+} = vi.hoisted(() => ({
+	listDashboardWorkers: vi.fn(),
+	listProjectWorkerIdsInOrder: vi.fn(),
+	listWorkerProjectCapacity: vi.fn(),
+	deriveWorkerRunState: vi.fn(),
+}));
 vi.mock('@/identity/worker-enrollment-service.js', async () => ({
 	...(await vi.importActual<typeof import('@/identity/worker-enrollment-service.js')>(
 		'@/identity/worker-enrollment-service.js',
@@ -220,6 +224,17 @@ vi.mock('@/identity/worker-enrollment-service.js', async () => ({
 	listDashboardWorkers,
 	listProjectWorkerIdsInOrder,
 	listWorkerProjectCapacity,
+	deriveWorkerRunState,
+}));
+
+// Issue #1413 — `worker_remove` deletes through the repository; the FK cascade
+// itself is the schema's, pinned by its own integration suite.
+const { removeWorker } = vi.hoisted(() => ({ removeWorker: vi.fn() }));
+vi.mock('@/db/repositories/workersRepository.js', async () => ({
+	...(await vi.importActual<typeof import('@/db/repositories/workersRepository.js')>(
+		'@/db/repositories/workersRepository.js',
+	)),
+	removeWorker,
 }));
 
 // Issue #1350 — `cli_rate_limit_set` resolves its worker and its owner's machines
@@ -510,6 +525,8 @@ beforeEach(() => {
 	publishDispatchWakeUp.mockReset().mockResolvedValue(undefined);
 	clearRunCancellation.mockReset().mockResolvedValue(undefined);
 	getWorker.mockReset().mockResolvedValue(undefined);
+	deriveWorkerRunState.mockReset().mockResolvedValue({ busy: false, currentRunId: null });
+	removeWorker.mockReset().mockResolvedValue(true);
 	listWorkersForOwner.mockReset().mockResolvedValue([]);
 	extendWorkerCliRateLimits.mockReset().mockResolvedValue([]);
 	listActiveCliRateLimitsForWorkers.mockReset().mockResolvedValue(new Map());
@@ -657,6 +674,7 @@ describe('operator MCP — the handshake', () => {
 			'pm_board_set',
 			'project_credential_set',
 			'work_item_close',
+			'worker_remove',
 		];
 
 		expect(tools.map((tool) => tool.name).sort()).toEqual([
@@ -691,6 +709,7 @@ describe('operator MCP — the handshake', () => {
 			'run_reset',
 			'runs_list',
 			'work_item_close',
+			'worker_remove',
 			'workers_state',
 		]);
 		for (const tool of tools) {
@@ -702,6 +721,9 @@ describe('operator MCP — the handshake', () => {
 			}
 		}
 		expect(tools.find((tool) => tool.name === 'run_reset')?.annotations?.destructiveHint).toBe(
+			true,
+		);
+		expect(tools.find((tool) => tool.name === 'worker_remove')?.annotations?.destructiveHint).toBe(
 			true,
 		);
 	});
@@ -732,6 +754,7 @@ const CONTRIBUTOR_TOOLS = [
 	'project_get',
 	'run_get',
 	'runs_list',
+	'worker_remove',
 	'workers_state',
 ];
 const MEMBER_TOOLS = [
@@ -753,7 +776,11 @@ describe('operator MCP — per-tool roles (issue #1382)', () => {
 		['a projectAdmin', 'project-admin-token', ALL_TOOLS],
 		['a member', 'driver-token', MEMBER_TOOLS],
 		['a contributor', 'member-token', CONTRIBUTOR_TOOLS],
-		['a user with no membership', 'nobody-token', ['cli_rate_limit_set', 'project_create']],
+		[
+			'a user with no membership',
+			'nobody-token',
+			['cli_rate_limit_set', 'project_create', 'worker_remove'],
+		],
 	])('lists to %s only the tools their highest role reaches', async (_, token, expected) => {
 		expect(await listedTools(token)).toEqual(expected);
 	});
@@ -890,6 +917,7 @@ describe('operator MCP — a scoped agent credential (issue #1385)', () => {
 		['work_item_close', { projectId: 'proj-a', repository: 'acme/widgets', prNumber: 7 }],
 		['phase_agents_reorder', { projectId: 'proj-a', phase: 'review', order: ['claude'] }],
 		['cli_rate_limit_set', { workerId: WORKER_ID, cli: 'claude', until: '2026-12-01T00:00:00Z' }],
+		['worker_remove', { workerId: WORKER_ID }],
 	])('is refused %s with FORBIDDEN, audited as refused', async (tool, args) => {
 		const result = await callTool(tool, { ...args, reason: 'trying' }, 'scoped-agent-token');
 
@@ -2788,6 +2816,120 @@ describe('operator MCP — cli_rate_limit_set', () => {
 		expect(listActiveCliRateLimitsForWorkers).not.toHaveBeenCalled();
 		expect(extendWorkerCliRateLimits).not.toHaveBeenCalled();
 		expect(auditRow()).toMatchObject({ outcome: 'refused', projectId: null, dryRun });
+	});
+});
+
+describe('operator MCP — worker_remove (issue #1413)', () => {
+	/** A worker as the service returns it, reduced to what the procedure reads. */
+	function machine(ownerUserId: string) {
+		return { id: WORKER_ID, displayName: 'gone-box', ownerUserId };
+	}
+
+	function auditRow() {
+		expect(recordOperatorAction).toHaveBeenCalledTimes(1);
+		expect(settleOperatorAction).toHaveBeenCalledTimes(1);
+		return {
+			...recordOperatorAction.mock.calls[0]?.[0],
+			...settleOperatorAction.mock.calls[0]?.[1],
+		};
+	}
+
+	it('lets the owner remove their own worker and audits the call', async () => {
+		getWorker.mockResolvedValue(machine(MEMBER.id));
+
+		const result = await callTool(
+			'worker_remove',
+			{ workerId: WORKER_ID, reason: 'machine retired' },
+			'member-token',
+		);
+
+		expect(result.isError).toBeUndefined();
+		expect(result.structuredContent).toMatchObject({
+			dryRun: false,
+			result: { workerId: WORKER_ID },
+		});
+		expect(removeWorker).toHaveBeenCalledWith(WORKER_ID);
+		expect(auditRow()).toMatchObject({
+			tool: 'worker_remove',
+			target: WORKER_ID,
+			userId: MEMBER.id,
+			projectId: null,
+			dryRun: false,
+			outcome: 'succeeded',
+		});
+	});
+
+	it("lets an instance admin remove another user's worker", async () => {
+		getWorker.mockResolvedValue(machine(MEMBER.id));
+
+		const result = await callTool(
+			'worker_remove',
+			{ workerId: WORKER_ID, reason: 'uninstalled on its owner’s machine' },
+			'admin-token',
+		);
+
+		expect(result.isError).toBeUndefined();
+		expect(removeWorker).toHaveBeenCalledWith(WORKER_ID);
+		expect(auditRow()).toMatchObject({ userId: ADMIN.id, outcome: 'succeeded' });
+	});
+
+	it.each([
+		[false],
+		[true],
+	])("hides another owner's worker from a non-admin (dryRun %s) and audits the refusal", async (dryRun) => {
+		getWorker.mockResolvedValue(machine(MEMBER.id));
+
+		const result = await callTool(
+			'worker_remove',
+			{ workerId: WORKER_ID, reason: 'trying', dryRun },
+			'stranger-token',
+		);
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toBe(`NOT_FOUND: Worker with ID "${WORKER_ID}" not found`);
+		expect(removeWorker).not.toHaveBeenCalled();
+		expect(auditRow()).toMatchObject({ outcome: 'refused', projectId: null, dryRun });
+	});
+
+	it('answers a dry run with the worker and its busy verdict, removing nothing', async () => {
+		getWorker.mockResolvedValue(machine(MEMBER.id));
+		deriveWorkerRunState.mockResolvedValue({ busy: true, currentRunId: RUN_ID });
+
+		const result = await callTool(
+			'worker_remove',
+			{ workerId: WORKER_ID, reason: 'checking', dryRun: true },
+			'admin-token',
+		);
+
+		expect(result.isError).toBeUndefined();
+		expect(result.structuredContent).toEqual({
+			dryRun: true,
+			auditId: 'audit-1',
+			preview: {
+				workerId: WORKER_ID,
+				displayName: 'gone-box',
+				ownerUserId: MEMBER.id,
+				busy: true,
+				currentRunId: RUN_ID,
+				change: 'refused-busy',
+			},
+		});
+		expect(removeWorker).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		['the owner', 'member-token'],
+		['an instance admin', 'admin-token'],
+	])('refuses %s a busy worker with CONFLICT, audited as refused', async (_, token) => {
+		getWorker.mockResolvedValue(machine(MEMBER.id));
+		deriveWorkerRunState.mockResolvedValue({ busy: true, currentRunId: RUN_ID });
+
+		const result = await callTool('worker_remove', { workerId: WORKER_ID, reason: 'r' }, token);
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toMatch(/^CONFLICT: /);
+		expect(removeWorker).not.toHaveBeenCalled();
+		expect(auditRow()).toMatchObject({ outcome: 'refused', dryRun: false });
 	});
 });
 
