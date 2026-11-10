@@ -12,7 +12,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
 import { ListRunsInputSchema } from '../../api/routers/runs.js';
-import type { SwarmUser } from '../../identity/schema.js';
+import type { ToolContext } from '../tool-access.js';
 import { callerFor, runTool } from '../tool-helpers.js';
 
 /**
@@ -79,8 +79,8 @@ const runGetInput = {
 		.describe("Include the run's stored stdout/stderr logs (default false; they can be large)."),
 };
 
-/** Register the run read tools on `server`, authorizing every call as `user`. */
-export function registerRunTools(server: McpServer, user: SwarmUser): void {
+/** Register the run read tools on `server`, authorizing every call as `context`'s user. */
+export function registerRunTools(server: McpServer, context: ToolContext): void {
 	server.registerTool(
 		'runs_list',
 		{
@@ -96,7 +96,7 @@ export function registerRunTools(server: McpServer, user: SwarmUser): void {
 			inputSchema: runsListInput,
 			annotations: { readOnlyHint: true, openWorldHint: false },
 		},
-		(input) => runTool('runs_list', () => callerFor(user).runs.list(input)),
+		(input) => runTool(context, 'runs_list', () => callerFor(context.user).runs.list(input)),
 	);
 
 	server.registerTool(
@@ -111,8 +111,8 @@ export function registerRunTools(server: McpServer, user: SwarmUser): void {
 			annotations: { readOnlyHint: true, openWorldHint: false },
 		},
 		({ runId, includeOutput, outputAfter, includeLogs }) =>
-			runTool('run_get', async () => {
-				const caller = callerFor(user);
+			runTool(context, 'run_get', async () => {
+				const caller = callerFor(context.user);
 				// The run read goes first: it is the authorization check, so neither
 				// optional read is attempted for a run the caller cannot see.
 				const run = await caller.runs.getById({ id: runId });

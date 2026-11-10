@@ -15,7 +15,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
 import { AgentsConfigSchema } from '../../config/schema.js';
-import type { SwarmUser } from '../../identity/schema.js';
+import type { ToolContext } from '../tool-access.js';
 import { callerFor, runTool } from '../tool-helpers.js';
 
 /**
@@ -32,8 +32,8 @@ const phaseAgentsGetInput = {
 	),
 };
 
-/** Register the project-configuration read tools on `server`, authorizing every call as `user`. */
-export function registerProjectConfigTools(server: McpServer, user: SwarmUser): void {
+/** Register the project-configuration read tools on `server`, authorizing every call as `context`'s user. */
+export function registerProjectConfigTools(server: McpServer, context: ToolContext): void {
 	server.registerTool(
 		'phase_agents_get',
 		{
@@ -48,8 +48,8 @@ export function registerProjectConfigTools(server: McpServer, user: SwarmUser): 
 			annotations: { readOnlyHint: true, openWorldHint: false },
 		},
 		({ projectId, phase }) =>
-			runTool('phase_agents_get', async () => {
-				const project = await callerFor(user).projects.getById({ id: projectId });
+			runTool(context, 'phase_agents_get', async () => {
+				const project = await callerFor(context.user).projects.getById({ id: projectId });
 				const agent = project.agents?.[phase];
 				return { projectId, phase, configured: agent !== undefined, ...agent };
 			}),

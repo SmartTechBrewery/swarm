@@ -8,12 +8,26 @@
  * resolved to, so a tool never needs to look its caller up and two requests never
  * share state. Each tool family registers itself with one `register…Tools` call
  * here; adding one publishes its tools on the internet-exposed router, so it wants
- * the same deliberate reasoning as widening `../api/operator-router.ts`.
+ * the same deliberate reasoning as widening `../api/operator-router.ts` — and a
+ * `TOOL_ACCESS` entry (`./tool-access.ts`) naming who may use it, without which it
+ * is served to installation administrators only.
+ *
+ * **Every tool is registered for every caller; `tools/list` shows only the ones
+ * their role ceiling reaches** (issue #1382). A hidden tool stays registered so a
+ * direct call to it reaches the tool's own `FORBIDDEN` refusal — audited, for a
+ * write tool — rather than the SDK's "tool not found". The SDK's per-tool
+ * `disable()` is not used for the same reason: a disabled tool's call is refused
+ * before the tool, and so before its audit row.
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import {
+	type ListToolsRequest,
+	ListToolsRequestSchema,
+	type ListToolsResult,
+} from '@modelcontextprotocol/sdk/types.js';
 
-import type { SwarmUser } from '../identity/schema.js';
+import { ceilingReaches, type ToolContext, toolAccessFor } from './tool-access.js';
 import { registerCliRateLimitSetTools } from './tools/cli-rate-limit-set.js';
 import { registerConsistencyTools } from './tools/consistency.js';
 import { registerDependencyWaitTools } from './tools/dependency-waits.js';
@@ -39,23 +53,57 @@ export const SWARM_MCP_SERVER_NAME = 'swarm';
  */
 export const SWARM_MCP_SERVER_VERSION = '1.0.0';
 
-/** Build the MCP server for one request, with every tool authorizing as `user`. */
-export function createSwarmMcpServer(user: SwarmUser): McpServer {
+/**
+ * Build the MCP server for one request, with every tool authorizing as
+ * `context.user` and `tools/list` showing only the tools `context.ceiling` reaches.
+ */
+export function createSwarmMcpServer(context: ToolContext): McpServer {
 	const server = new McpServer({ name: SWARM_MCP_SERVER_NAME, version: SWARM_MCP_SERVER_VERSION });
-	registerRunTools(server, user);
-	registerPipelineTools(server, user);
-	registerWorkerTools(server, user);
-	registerLogTools(server, user);
-	registerPullRequestTools(server, user);
-	registerProjectConfigTools(server, user);
-	registerStatsTools(server, user);
-	registerConsistencyTools(server, user);
-	registerRunActionTools(server, user);
-	registerPullRequestActionTools(server, user);
-	registerDependencyWaitTools(server, user);
-	registerPhaseAgentTools(server, user);
-	registerWorkItemTools(server, user);
-	registerCliRateLimitSetTools(server, user);
-	registerProjectSetupTools(server, user);
+	registerRunTools(server, context);
+	registerPipelineTools(server, context);
+	registerWorkerTools(server, context);
+	registerLogTools(server, context);
+	registerPullRequestTools(server, context);
+	registerProjectConfigTools(server, context);
+	registerStatsTools(server, context);
+	registerConsistencyTools(server, context);
+	registerRunActionTools(server, context);
+	registerPullRequestActionTools(server, context);
+	registerDependencyWaitTools(server, context);
+	registerPhaseAgentTools(server, context);
+	registerWorkItemTools(server, context);
+	registerCliRateLimitSetTools(server, context);
+	registerProjectSetupTools(server, context);
+	listOnlyReachableTools(server, context);
 	return server;
+}
+
+/** The SDK's own request-handler map, which holds the `tools/list` handler it installed. */
+type RequestHandlers = Map<
+	string,
+	(request: ListToolsRequest, extra: unknown) => Promise<ListToolsResult>
+>;
+
+/**
+ * Narrow `server`'s `tools/list` answer to the tools `context.ceiling` reaches.
+ * `McpServer` builds that answer from its private tool registry, so this wraps the
+ * handler the SDK installed (read from the low-level server's private handler map)
+ * rather than re-implementing the schema conversion it does. That is SDK
+ * internals: `tests/unit/router/operator-mcp.test.ts` lists the tools for every
+ * ceiling, so an SDK change that breaks this fails there, not in production.
+ */
+function listOnlyReachableTools(server: McpServer, context: ToolContext): void {
+	const handlers = (server.server as unknown as { _requestHandlers: RequestHandlers })
+		._requestHandlers;
+	const listAll = handlers.get(ListToolsRequestSchema.shape.method.value);
+	if (!listAll) throw new Error('operator MCP: the SDK installed no tools/list handler');
+	server.server.setRequestHandler(ListToolsRequestSchema, async (request, extra) => {
+		const result = await listAll(request, extra);
+		return {
+			...result,
+			tools: result.tools.filter((tool) =>
+				ceilingReaches(context.ceiling, toolAccessFor(tool.name).minRole),
+			),
+		};
+	});
 }

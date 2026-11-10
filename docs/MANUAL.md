@@ -2140,10 +2140,11 @@ browser. They are the run-diagnosis path on a host with no shell (see
 any of them scriptable. Details: [`docs/cli.md`](./cli.md#swarm-run).
 
 An **MCP client** — Claude Code, for one — connects to the control plane too: the
-router serves an MCP server at `/operator/mcp`, open to installation
-administrators only for now. Connect it with an agent access token issued from
-your profile's **MCP** tab, which also gives you the ready `claude mcp add`
-command (the `swarm login` session works as well). Its tools call
+router serves an MCP server at `/operator/mcp`, open to every signed-in user,
+each tool to the role its dashboard procedure needs. An installation
+administrator connects it with an agent access token issued from their profile's
+**MCP** tab, which also gives them the ready `claude mcp add` command; anyone
+else connects with their `swarm login` session. Its tools call
 the dashboard's own procedures as you, so an assistant session can read runs,
 their failure causes and their agent output, a project's whole pipeline state in
 one call, a task's dispatch history, and which workers are connected, busy,

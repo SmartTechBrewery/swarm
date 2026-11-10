@@ -17,7 +17,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
 import type { PreviewableRunAction } from '../../api/routers/runs.js';
-import type { SwarmUser } from '../../identity/schema.js';
+import type { ToolContext } from '../tool-access.js';
 import type { SwarmCaller } from '../tool-helpers.js';
 import { registerWriteTool } from '../write-tool.js';
 
@@ -34,9 +34,9 @@ async function previewFor(
 	return { projectId: plan.run.projectId, plan };
 }
 
-/** Register the run write tools on `server`, authorizing and auditing every call as `user`. */
-export function registerRunActionTools(server: McpServer, user: SwarmUser): void {
-	registerWriteTool(server, user, {
+/** Register the run write tools on `server`, authorizing and auditing every call as `context`'s user. */
+export function registerRunActionTools(server: McpServer, context: ToolContext): void {
+	registerWriteTool(server, context, {
 		name: 'run_reset',
 		title: 'Reset & restart a run',
 		description:
@@ -54,7 +54,7 @@ export function registerRunActionTools(server: McpServer, user: SwarmUser): void
 		apply: (input, caller) => caller.runs.reset({ runId: input.runId }),
 	});
 
-	registerWriteTool(server, user, {
+	registerWriteTool(server, context, {
 		name: 'dispatch_redispatch_now',
 		title: "Re-dispatch a run's waiting dispatch now",
 		description:

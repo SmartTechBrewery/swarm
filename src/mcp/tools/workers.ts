@@ -15,7 +15,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
 import { workerNotFound } from '../../api/worker-access.js';
-import type { SwarmUser } from '../../identity/schema.js';
+import type { ToolContext } from '../tool-access.js';
 import { callerFor, runTool } from '../tool-helpers.js';
 
 const projectIdInput = z
@@ -41,8 +41,8 @@ const cliRateLimitsInput = {
 		),
 };
 
-/** Register the worker read tools on `server`, authorizing every call as `user`. */
-export function registerWorkerTools(server: McpServer, user: SwarmUser): void {
+/** Register the worker read tools on `server`, authorizing every call as `context`'s user. */
+export function registerWorkerTools(server: McpServer, context: ToolContext): void {
 	server.registerTool(
 		'workers_state',
 		{
@@ -56,8 +56,8 @@ export function registerWorkerTools(server: McpServer, user: SwarmUser): void {
 			annotations: { readOnlyHint: true, openWorldHint: false },
 		},
 		({ projectId }) =>
-			runTool('workers_state', async () => ({
-				workers: await callerFor(user).workers.state(projectId ? { projectId } : undefined),
+			runTool(context, 'workers_state', async () => ({
+				workers: await callerFor(context.user).workers.state(projectId ? { projectId } : undefined),
 			})),
 	);
 
@@ -74,10 +74,12 @@ export function registerWorkerTools(server: McpServer, user: SwarmUser): void {
 			annotations: { readOnlyHint: true, openWorldHint: false },
 		},
 		({ projectId, workerId }) =>
-			runTool('cli_rate_limits', async () => {
+			runTool(context, 'cli_rate_limits', async () => {
 				// `workers.list` already carries each row's live cool-downs, read in one
 				// batched query for the whole roster, under the roster's own scope.
-				const roster = await callerFor(user).workers.list(projectId ? { projectId } : undefined);
+				const roster = await callerFor(context.user).workers.list(
+					projectId ? { projectId } : undefined,
+				);
 				const rows = workerId ? roster.filter((worker) => worker.workerId === workerId) : roster;
 				if (workerId && rows.length === 0) {
 					// The same refusal `workers.getById` gives a worker outside the

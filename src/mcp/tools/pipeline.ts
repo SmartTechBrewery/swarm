@@ -12,7 +12,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
 import { MAX_SNAPSHOT_WINDOW_HOURS } from '../../api/pipeline-snapshot.js';
 import { DispatchHistoryInputFields, PipelineSnapshotInputSchema } from '../../api/routers/runs.js';
-import type { SwarmUser } from '../../identity/schema.js';
+import type { ToolContext } from '../tool-access.js';
 import { callerFor, runTool } from '../tool-helpers.js';
 
 /** The procedures' own input fields, re-used so a tool never accepts what they reject. */
@@ -36,8 +36,8 @@ const dispatchHistoryInput = {
 	),
 };
 
-/** Register the pipeline read tools on `server`, authorizing every call as `user`. */
-export function registerPipelineTools(server: McpServer, user: SwarmUser): void {
+/** Register the pipeline read tools on `server`, authorizing every call as `context`'s user. */
+export function registerPipelineTools(server: McpServer, context: ToolContext): void {
 	server.registerTool(
 		'pipeline_snapshot',
 		{
@@ -52,7 +52,10 @@ export function registerPipelineTools(server: McpServer, user: SwarmUser): void 
 			inputSchema: pipelineSnapshotInput,
 			annotations: { readOnlyHint: true, openWorldHint: false },
 		},
-		(input) => runTool('pipeline_snapshot', () => callerFor(user).runs.pipelineSnapshot(input)),
+		(input) =>
+			runTool(context, 'pipeline_snapshot', () =>
+				callerFor(context.user).runs.pipelineSnapshot(input),
+			),
 	);
 
 	server.registerTool(
@@ -67,6 +70,9 @@ export function registerPipelineTools(server: McpServer, user: SwarmUser): void 
 			inputSchema: dispatchHistoryInput,
 			annotations: { readOnlyHint: true, openWorldHint: false },
 		},
-		(input) => runTool('dispatch_history', () => callerFor(user).runs.dispatchHistory(input)),
+		(input) =>
+			runTool(context, 'dispatch_history', () =>
+				callerFor(context.user).runs.dispatchHistory(input),
+			),
 	);
 }

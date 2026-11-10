@@ -7,18 +7,15 @@ what the agent printed. It is the same data `swarm run list|show|logs` reads, as
 tools a model can call. A few [write tools](#write-tools) act on the pipeline too,
 each with a mandatory reason, a dry run and an audit record.
 
-**The server is open to installation administrators only, for now.** Any other
-user is refused with `403`, whichever credential they present. Opening it to other
-users is a separate, later decision that needs an authorization review of every
-tool.
+**Any signed-in user can connect.** Which tools you are shown, and may call,
+depends on your highest role: see [Who may use each tool](#who-may-use-each-tool).
 
 Every tool is the dashboard's own tRPC procedure, called as you. The tools
 therefore see exactly what you see in the dashboard: an instance administrator
-sees the whole installation. The tools still apply the dashboard's project rules
-for every caller (a non-admin would see only the projects they are a member of,
-and a run in any other project would read as *not found*), so they are ready for
-that later decision. The one tool with no dashboard procedure behind it,
-`control_plane_logs`, applies the same project rules itself.
+sees the whole installation, and anyone else sees only the projects they are a
+member of. A run, dispatch or pull request in any other project reads as *not
+found*. The one tool with no dashboard procedure behind it, `control_plane_logs`,
+applies the same project rules itself.
 
 ## Where it is served
 
@@ -50,8 +47,8 @@ accepted:
 - the `swarm login` session token, exactly as the operator API takes it.
 
 A request with no token, or with an unknown, expired or revoked one, gets `401`
-before any tool runs. A valid token whose holder is not an installation
-administrator gets `403`.
+before any tool runs. Any valid token is let in, whoever holds it; what it may do
+from there is decided per tool and per project (below).
 
 `SWARM_SINGLE_USER_MODE` is **not** honoured here, for the same reason it is not
 honoured by `swarm login`: the router is the internet-reachable process. On a
@@ -78,7 +75,8 @@ tokens are deleted lazily, so an expired one can stay on the list for a while,
 marked **Expired**.
 
 Only installation administrators can issue, list or revoke tokens. Nobody else
-sees the MCP tab.
+sees the MCP tab, so anyone else connects with their [`swarm login`
+session](#using-the-swarm-login-session-instead).
 
 ## Connecting a client
 
@@ -145,6 +143,53 @@ export SWARM_MCP_TOKEN="$(jq -r 'select(.controlPlaneUrl == "https://swarm.examp
 
 An agent access token is the better choice for an agent: it is not tied to your
 CLI sign-in, and you can revoke it on its own.
+
+## Who may use each tool
+
+Every tool has a required role. Your **highest role** decides which tools you get:
+
+- **`instanceAdmin`** if you are an installation administrator;
+- otherwise your highest project role across every project you are a member of
+  (`projectAdmin` > `member` > `contributor`);
+- otherwise, with no membership at all, **signed in**.
+
+`tools/list` shows only the tools your highest role reaches. A tool that is not
+shown can still be called by name, but the call is refused with `FORBIDDEN` before
+it does anything (`Tool "run_reset" needs at least the member role on some
+project, which you do not hold.`). A refused write tool still writes its
+`operator_actions` row, with outcome `refused`.
+
+Reaching a tool's role does not open every project to you. Each call is still
+authorized per project, exactly as the dashboard authorizes it: you may hold
+`projectAdmin` on one project and nothing on another, and then the other project
+reads as *not found*. Scope means what a call can reach:
+
+- **Your projects**: the results cover every project you are a member of, and
+  every project for an instance administrator.
+- **One project**: the call names a project, directly or through a run. A project
+  you are not a member of reads as `NOT_FOUND`, and a role below the one the
+  procedure needs there gets `FORBIDDEN`.
+- **One project, or the installation**: as *one project* when you name one. With
+  no `projectId`, the tool reads the whole installation, which only an instance
+  administrator may do; anyone else gets `FORBIDDEN`.
+- **The worker's owner**: the target is a worker machine. Only its owner or an
+  instance administrator may act on it; anyone else gets `NOT_FOUND`.
+
+| Tool | Required role | Scope |
+| --- | --- | --- |
+| `runs_list` | `contributor` | Your projects |
+| `run_get`, `pipeline_snapshot`, `dispatch_history`, `pr_status`, `pipeline_stats`, `phase_agents_get`, `consistency_check`, `project_get` | `contributor` | One project |
+| `workers_state`, `cli_rate_limits`, `control_plane_logs` | `contributor` | One project, or the installation |
+| `pm_board_discover`, `project_readiness` | `projectAdmin` | One project |
+| `run_reset`, `dispatch_redispatch_now`, `pr_force_re_review`, `pr_recheck_mergeability`, `dependency_waits_wake`, `work_item_close` | `member` | One project |
+| `phase_agents_reorder`, `phase_agents_restore`, `project_update`, `pm_board_set`, `project_credential_set` | `projectAdmin` | One project |
+| `cli_rate_limit_set` | signed in | The worker's owner |
+| `project_create` | signed in | None: like the New Project dialog, it is open to every signed-in user, and you become the new project's `projectAdmin` |
+
+Each required role is the one the tool's dashboard procedure already enforces; this
+table decides nothing new about the dashboard. **A tool missing from the table is
+default-denied**: it is shown to, and callable by, installation administrators
+only.
 
 ## Tools
 
@@ -451,8 +496,18 @@ project_update { "projectId": "acme-web", "agents": { "review": { "targets": [{ 
 ## For developers
 
 The mount is `src/router/operator-mcp.ts`. It resolves the bearer as a session,
-then as an agent access token (`src/identity/agent-access-token-service.ts`), and
-refuses a non-admin through `MAY_USE_OPERATOR_MCP` before any MCP message is read.
+then as an agent access token (`src/identity/agent-access-token-service.ts`), checks
+the holder's installation role against `MAY_USE_OPERATOR_MCP` (every role is
+admitted today; the map stays total so a new role has to decide), and reads the
+caller's highest role once per request (`mcpCeilingFor`). Who may use each tool is
+the `TOOL_ACCESS` table in `src/mcp/tool-access.ts`, which the table in
+[Who may use each tool](#who-may-use-each-tool) mirrors. `src/mcp/server.ts`
+registers every tool for every caller, then narrows `tools/list` to the tools the
+caller's role reaches. It does not use the SDK's per-tool `disable()`, because the
+SDK refuses a disabled tool's call before the tool runs, and so before a write
+tool's audit row. `runTool` and the write-tool framework refuse a call below the
+tool's role with `FORBIDDEN`; the write-tool framework does it after the audit row
+is written.
 The tokens themselves are managed through the dashboard's `agentAccessTokens` tRPC
 router (`src/api/routers/agentAccessTokens.ts`), which is not mounted on the
 operator API. The tab's command is built by `dashboard/src/lib/agent-access.ts`, and
@@ -466,7 +521,10 @@ cannot drift from the dashboard's. The one exception is `control_plane_logs`
 memory does not hold the router's buffer, so there is no procedure to call, and the
 tool calls the same `src/api/authz.ts` helpers a procedure would. Adding a tool publishes that procedure on the
 internet-exposed router. Treat it like widening `src/api/operator-router.ts`: give
-it its own reasoning, and add it to the table above.
+it its own reasoning, add it to the table above, and give it a `TOOL_ACCESS` entry
+with the role its procedure enforces. Without an entry it is served to installation
+administrators only, and `tests/unit/mcp/tool-access.test.ts` fails until the table
+and the registered tools match.
 
 A tool that writes registers through `registerWriteTool` (`src/mcp/write-tool.ts`),
 never `server.registerTool` directly. Give it a `preview`, a read-only procedure

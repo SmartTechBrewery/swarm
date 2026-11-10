@@ -10,6 +10,10 @@
  *  - **`dryRun`.** `true` reports what the call would change — the precondition
  *    verdict and the intended changes — and changes nothing: only the tool's
  *    `preview` runs, never its `apply`.
+ *  - **The tool's role, then the procedure's.** A caller below the tool's
+ *    `TOOL_ACCESS` role (`./tool-access.ts`, issue #1382) is refused with
+ *    `FORBIDDEN` right after the audit row is written, so the refusal is audited
+ *    and neither `preview` nor `apply` runs.
  *  - **Authorization before anything, dry run included.** `preview` is a dashboard
  *    procedure gated exactly as the write it describes, and it runs first on *every*
  *    call. A dry run therefore cannot tell a caller about state the real call would
@@ -47,9 +51,9 @@ import {
 	recordOperatorAction,
 	settleOperatorAction,
 } from '../db/repositories/operatorActionsRepository.js';
-import type { SwarmUser } from '../identity/schema.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
+import { assertToolAccess, type ToolContext } from './tool-access.js';
 import {
 	callerFor,
 	describeToolFailure,
@@ -145,11 +149,11 @@ type WriteToolArgs<Shape extends z.ZodRawShape> = z.objectOutputType<Shape, z.Zo
 	dryRun: boolean;
 };
 
-/** Register one write tool on `server`, authorizing and auditing every call as `user`. */
+/** Register one write tool on `server`, authorizing and auditing every call as `context`'s user. */
 export function registerWriteTool<
 	Shape extends z.ZodRawShape,
 	Preview extends WriteToolPreview = WriteToolPreview,
->(server: McpServer, user: SwarmUser, definition: WriteToolDefinition<Shape, Preview>): void {
+>(server: McpServer, context: ToolContext, definition: WriteToolDefinition<Shape, Preview>): void {
 	// Widened to a plain shape: the SDK cannot resolve its callback type over a generic one.
 	const inputSchema: z.ZodRawShape = { ...definition.inputSchema, ...WRITE_TOOL_INPUT };
 	server.registerTool(
@@ -165,7 +169,7 @@ export function registerWriteTool<
 				openWorldHint: false,
 			},
 		},
-		(args) => runWriteTool(definition, user, args as unknown as WriteToolArgs<Shape>),
+		(args) => runWriteTool(definition, context, args as unknown as WriteToolArgs<Shape>),
 	);
 }
 
@@ -175,9 +179,10 @@ export async function runWriteTool<
 	Preview extends WriteToolPreview = WriteToolPreview,
 >(
 	definition: WriteToolDefinition<Shape, Preview>,
-	user: SwarmUser,
+	context: ToolContext,
 	args: WriteToolArgs<Shape>,
 ): Promise<CallToolResult> {
+	const { user, ceiling } = context;
 	const { reason, dryRun, ...rest } = args;
 	const input = rest as unknown as z.objectOutputType<Shape, z.ZodTypeAny>;
 
@@ -225,6 +230,9 @@ export async function runWriteTool<
 	};
 
 	try {
+		// After the row is written, so a caller below the tool's role is audited as
+		// refused — and before anything else, so they learn nothing more.
+		assertToolAccess(definition.name, ceiling);
 		if (reason.trim().length === 0) {
 			throw new TRPCError({
 				code: 'BAD_REQUEST',

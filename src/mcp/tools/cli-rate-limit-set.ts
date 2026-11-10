@@ -15,7 +15,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
 import { CliRateLimitInputSchema } from '../../api/routers/workers.js';
-import type { SwarmUser } from '../../identity/schema.js';
+import type { ToolContext } from '../tool-access.js';
 import { registerWriteTool } from '../write-tool.js';
 
 const shape = CliRateLimitInputSchema.shape;
@@ -41,9 +41,9 @@ const cliRateLimitSetInput = {
 	),
 };
 
-/** Register the CLI cool-down write tool on `server`, authorizing and auditing every call as `user`. */
-export function registerCliRateLimitSetTools(server: McpServer, user: SwarmUser): void {
-	registerWriteTool(server, user, {
+/** Register the CLI cool-down write tool on `server`, authorizing and auditing every call as `context`'s user. */
+export function registerCliRateLimitSetTools(server: McpServer, context: ToolContext): void {
+	registerWriteTool(server, context, {
 		name: 'cli_rate_limit_set',
 		title: 'Set or extend a CLI cool-down',
 		description:

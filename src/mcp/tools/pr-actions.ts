@@ -16,7 +16,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
-import type { SwarmUser } from '../../identity/schema.js';
+import type { ToolContext } from '../tool-access.js';
 import { registerWriteTool } from '../write-tool.js';
 
 const forceReReviewInput = {
@@ -35,9 +35,9 @@ const recheckInput = {
 	prNumber: z.number().int().positive().describe('The pull request number.'),
 };
 
-/** Register the pull-request write tools on `server`, authorizing and auditing every call as `user`. */
-export function registerPullRequestActionTools(server: McpServer, user: SwarmUser): void {
-	registerWriteTool(server, user, {
+/** Register the pull-request write tools on `server`, authorizing and auditing every call as `context`'s user. */
+export function registerPullRequestActionTools(server: McpServer, context: ToolContext): void {
+	registerWriteTool(server, context, {
 		name: 'pr_force_re_review',
 		title: 'Force a re-review past the review cap',
 		description:
@@ -59,7 +59,7 @@ export function registerPullRequestActionTools(server: McpServer, user: SwarmUse
 		apply: (input, caller) => caller.runs.forceReReview({ runId: input.runId }),
 	});
 
-	registerWriteTool(server, user, {
+	registerWriteTool(server, context, {
 		name: 'pr_recheck_mergeability',
 		title: "Re-check a pull request's mergeability",
 		description:
