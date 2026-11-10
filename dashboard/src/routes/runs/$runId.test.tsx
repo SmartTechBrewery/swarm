@@ -1527,6 +1527,8 @@ describe('ResetRunButton (issue #428)', () => {
 			worktreeError: null,
 			recoveryCleared: true,
 			abandonedPreservedWorkerId: null,
+			abandonedCheckout: 'none' as const,
+			abandonedCheckoutError: null,
 			dispatchId: 'dispatch-9',
 		});
 		openConfirm();
@@ -1591,6 +1593,8 @@ describe('ResetRunButton (issue #428)', () => {
 			worktreeError: null,
 			recoveryCleared: true,
 			abandonedPreservedWorkerId: null,
+			abandonedCheckout: 'none' as const,
+			abandonedCheckoutError: null,
 			dispatchId: 'dispatch-9',
 		});
 		openConfirm();
@@ -1631,6 +1635,8 @@ describe('ResetRunButton (issue #428)', () => {
 			worktreeError: null,
 			recoveryCleared: true,
 			abandonedPreservedWorkerId: null,
+			abandonedCheckout: 'none' as const,
+			abandonedCheckoutError: null,
 			dispatchId: 'dispatch-9',
 		});
 
@@ -1903,6 +1909,8 @@ describe('RecoverRunButton (issue #593)', () => {
 		worktreeError: null,
 		recoveryCleared: true,
 		abandonedPreservedWorkerId: null,
+		abandonedCheckout: 'none' as const,
+		abandonedCheckoutError: null,
 		dispatchId: 'dispatch-9',
 	};
 
