@@ -26,7 +26,11 @@ import { phaseRecoveryFromAssignment, type SwarmJob } from '@/queue/jobs.js';
 import { TRANSPORT_LOST_ORPHAN_REASON } from '@/router/transport-loss-reaper.js';
 import { DeliveryDeferredError, HANDOFF_FILENAMES, validatePreparedTree } from '@/scm/delivery.js';
 import { GitWorktreeManager } from '@/worker/git-worktree-manager.js';
-import { CommitUnavailableError } from '@/worktree/commit-availability.js';
+import {
+	BranchSyncUnavailableError,
+	BranchUnavailableError,
+	CommitUnavailableError,
+} from '@/worktree/commit-availability.js';
 import {
 	createMockPhaseRecovery,
 	createMockPmWebhookJob,
@@ -5587,6 +5591,79 @@ describe('processJob', () => {
 			const settle = completeRun.mock.calls.at(-1)?.[1] as { error?: string };
 			expect(settle.error).toContain('Connection refused');
 			expect(settle.error).not.toContain('invalid reference');
+		});
+	});
+
+	// Issue #1401. The branch phases fail on the same broken fetch in two shapes: the
+	// checkout cannot resolve the PR branch at all (Resolve-conflicts on
+	// `under-control-platform`), or the agent's own sync with origin fails and it stops
+	// without a hand-off (Respond-to-review on `swarm`). Both must take #1018's route —
+	// deferred, with the machine recorded so the next dispatch (Retry now included)
+	// passes it over — rather than settling terminally on the same worker.
+	describe('a PR branch this worker could not get from origin', () => {
+		const FETCH_ERROR = 'ssh: connect to host github.com port 22: Operation timed out';
+		const cases: Array<[string, TriggerResult, () => Error]> = [
+			[
+				'Resolve-conflicts, provisioning could not resolve the branch',
+				RESOLVE_CONFLICTS_TRIGGER,
+				() =>
+					new BranchUnavailableError('issue-2113', {
+						repoRoot: '/Users/dev/uc/platform',
+						taskId: '2119-conflicts',
+						fetchError: FETCH_ERROR,
+						checkoutError: 'fatal: invalid reference: issue-2113',
+					}),
+			],
+			[
+				"Respond-to-review, the agent's branch sync failed",
+				RESPOND_TO_REVIEW_TRIGGER,
+				() =>
+					new BranchSyncUnavailableError('issue-1393', {
+						repoRoot: '/Users/dev/swarm/swarm',
+						taskId: '1398',
+						fetchError: FETCH_ERROR,
+						handoffFilename: 'respond_to_review_handoff.json',
+					}),
+			],
+			[
+				'Respond-to-CI, provisioning could not resolve the branch',
+				RESPOND_TO_CI_TRIGGER,
+				() =>
+					new BranchUnavailableError('issue-64', {
+						repoRoot: '/Users/dev/swarm/swarm',
+						taskId: '64',
+						fetchError: FETCH_ERROR,
+						checkoutError: 'fatal: invalid reference: issue-64',
+					}),
+			],
+		];
+
+		it.each(
+			cases,
+		)('%s: defers on another worker and names the fetch', async (_label, trigger, error) => {
+			phaseImpl = async () => {
+				throw error();
+			};
+			recordRunCommitUnavailableWorker.mockClear();
+			scheduleDispatchRetry.mockClear();
+			commentOnPullRequest.mockClear();
+
+			const outcome = await processJob(
+				createMockScmWebhookJob({ rateLimitRetryAttempt: 0 }),
+				registryReturning(trigger),
+			);
+
+			expect(outcome.status).toBe('phase-deferred');
+			expect(recordRunCommitUnavailableWorker).toHaveBeenCalledWith('run-1');
+			const [, input] = scheduleDispatchRetry.mock.calls.at(-1) as [
+				string,
+				Record<string, unknown>,
+			];
+			expect(input.waitReason).toBe('commit-unavailable');
+			const settle = completeRun.mock.calls.at(-1)?.[1] as { error?: string };
+			expect(settle.error).toContain(FETCH_ERROR);
+			expect(settle.error).not.toContain('did not write required hand-off');
+			expect(commentOnPullRequest).not.toHaveBeenCalled();
 		});
 	});
 
