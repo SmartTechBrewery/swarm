@@ -1480,6 +1480,29 @@ describe('AgentsConfigSchema', () => {
 		).toBe(true);
 	});
 
+	it('accepts a resolveProblem phase with targets, timeoutMs and prompt (issue #1384)', () => {
+		const parsed = AgentsConfigSchema.parse({
+			resolveProblem: {
+				targets: [{ cli: 'claude', model: 'opus' }, { cli: 'codex' }],
+				timeoutMs: 20 * 60 * 1000,
+				prompt: 'Prefer a retry over a reset.',
+			},
+		});
+		expect(parsed.resolveProblem).toMatchObject({
+			timeoutMs: 20 * 60 * 1000,
+			prompt: 'Prefer a retry over a reset.',
+		});
+		expect(parsed.resolveProblem?.targets).toHaveLength(2);
+	});
+
+	it('rejects a resolveProblem phase naming one CLI twice', () => {
+		expect(
+			AgentsConfigSchema.safeParse({
+				resolveProblem: { targets: [{ cli: 'claude' }, { cli: 'claude', model: 'opus' }] },
+			}).success,
+		).toBe(false);
+	});
+
 	it('rejects invalid defaults block model names', () => {
 		expect(
 			AgentsConfigSchema.safeParse({
@@ -1585,6 +1608,24 @@ describe('PipelineConfigSchema', () => {
 		expect(PipelineConfigSchema.parse({ automationLabel: '' })).toMatchObject({
 			automationLabel: '',
 		});
+	});
+
+	// Issue #1384 — off by default, so absent stays absent (read through the resolvers).
+	it('accepts resolveProblem enabled and a write cap from 1 to 50', () => {
+		expect(PipelineConfigSchema.parse({ resolveProblem: { enabled: true } })).toMatchObject({
+			resolveProblem: { enabled: true },
+		});
+		for (const maxWriteActions of [1, 50])
+			expect(PipelineConfigSchema.safeParse({ resolveProblem: { maxWriteActions } }).success).toBe(
+				true,
+			);
+	});
+
+	it('rejects a resolveProblem write cap of 0, 51 or a fraction', () => {
+		for (const maxWriteActions of [0, 51, 2.5])
+			expect(PipelineConfigSchema.safeParse({ resolveProblem: { maxWriteActions } }).success).toBe(
+				false,
+			);
 	});
 
 	// Issue #1165 — opt-in, so absent stays absent (read as `false` in code).

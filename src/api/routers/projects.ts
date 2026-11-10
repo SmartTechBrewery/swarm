@@ -1,6 +1,6 @@
 import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
-
+import { RESOLVE_PROBLEM_MAX_WRITE_ACTIONS_LIMIT } from '../../config/resolve-problem.js';
 import {
 	PipelineBaseSchema,
 	type PipelineConfig,
@@ -281,11 +281,24 @@ const PREVIEW_REVIEWER_TOKEN_PLACEHOLDER = '[preview]';
 /**
  * The `pipeline` patch `update` accepts: the stored shape, except that
  * `maxContinuations: null` *clears* the budget back to its coded default (issue
- * #1259). The wire is plain JSON, so an `undefined` key never arrives — without an
+ * #1259), and `resolveProblem.maxWriteActions: null` clears that phase's write cap
+ * the same way (issue #1384). The wire is plain JSON, so an `undefined` key never arrives — without an
  * explicit `null` the Pipeline tab could set the budget but never unset it.
  */
 const PipelinePatchSchema = PipelineBaseSchema.extend({
 	maxContinuations: z.number().int().positive().nullable().optional(),
+	resolveProblem: z
+		.object({
+			enabled: z.boolean().optional(),
+			maxWriteActions: z
+				.number()
+				.int()
+				.positive()
+				.max(RESOLVE_PROBLEM_MAX_WRITE_ACTIONS_LIMIT)
+				.nullable()
+				.optional(),
+		})
+		.optional(),
 });
 type PipelinePatch = z.infer<typeof PipelinePatchSchema>;
 
@@ -306,10 +319,17 @@ function mergePipelineConfig(
 	patch: PipelinePatch | undefined,
 ): PipelineConfig {
 	if (!patch) return existing ?? {};
-	const { maxContinuations, ...rest } = patch;
+	const { maxContinuations, resolveProblem, ...rest } = patch;
 	const merged = mergePipelineSections(existing, rest);
 	if (maxContinuations === null) delete merged.maxContinuations;
 	else if (maxContinuations !== undefined) merged.maxContinuations = maxContinuations;
+	if (resolveProblem) {
+		const { maxWriteActions, ...flags } = resolveProblem;
+		const section = { ...existing?.resolveProblem, ...flags };
+		if (maxWriteActions === null) delete section.maxWriteActions;
+		else if (maxWriteActions !== undefined) section.maxWriteActions = maxWriteActions;
+		merged.resolveProblem = section;
+	}
 	return merged;
 }
 

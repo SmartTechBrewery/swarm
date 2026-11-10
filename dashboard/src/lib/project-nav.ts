@@ -14,6 +14,7 @@ export const PROJECT_PHASES = [
 	'respondToReview',
 	'respondToCi',
 	'resolveConflicts',
+	'resolveProblem',
 ] as const;
 
 export type ProjectPhase = (typeof PROJECT_PHASES)[number];
