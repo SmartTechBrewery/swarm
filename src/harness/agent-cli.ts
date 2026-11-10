@@ -14,6 +14,9 @@
  */
 
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { rm, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import { z } from 'zod';
 
 import { logger } from '@/lib/logger.js';
@@ -196,6 +199,165 @@ const PRINT_TIMEOUT_MARGIN_MS = 60_000;
  */
 const goDuration = (ms: number): string => `${ms}ms`;
 
+/**
+ * One HTTP MCP server to attach to a run, authenticated with a bearer token
+ * (issue #1394). The harness is generic: it knows nothing about *which* server
+ * this is, only how each CLI is told about one.
+ *
+ * `requiredTools` is not read by the attachment itself — it is what
+ * `./mcp-probe.ts`'s `probeMcpServer` checks for, carried here so a caller
+ * states the server once and probes and attaches the same thing.
+ */
+export interface AgentMcpServer {
+	/** The key the CLI lists the server under — `[A-Za-z0-9_-]+`, since codex embeds it in a TOML dotted path. */
+	name: string;
+	/** The server's Streamable HTTP endpoint. */
+	url: string;
+	/** Sent as `Authorization: Bearer <token>`. Never placed in argv or logged. */
+	bearerToken: string;
+	/** Tools the caller needs the server to expose (see `probeMcpServer`). */
+	requiredTools: string[];
+}
+
+/**
+ * The server name has to be a TOML bare key for codex's `-c mcp_servers.<name>.…`
+ * dotted path — a `.` would silently address a different table — so the set is
+ * restricted to the characters every CLI accepts as-is.
+ */
+const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * The child-only env var codex reads the bearer token from (its
+ * `bearer_token_env_var`). Fixed rather than derived from the server name:
+ * a run attaches at most one server, and a fixed name cannot collide with an
+ * operator variable shaped like a server name.
+ */
+export const MCP_BEARER_TOKEN_ENV_VAR = 'SWARM_MCP_BEARER_TOKEN';
+
+/**
+ * Whether this CLI can be handed an extra MCP server for one run — the single
+ * place the capability is declared (issue #1394). Each answer was checked
+ * against the CLI's own `--help`, never inferred from another CLI's shape
+ * (ai/RULES.md §6):
+ *
+ *  - **claude** (2.1.322): `--mcp-config <configs...>  Load MCP servers from JSON
+ *    files or strings`. SWARM passes a file path, never the JSON string, so the
+ *    token stays out of argv. `--strict-mcp-config` is deliberately *not* passed:
+ *    the operator's own MCP servers stay available alongside the attached one.
+ *  - **codex** (0.167.0): `-c, --config <key=value>` overrides any config key;
+ *    `codex mcp add --url <URL> --bearer-token-env-var <ENV_VAR>` writes exactly
+ *    `mcp_servers.<name>.url` and `mcp_servers.<name>.bearer_token_env_var`, and
+ *    `codex mcp get <name> --json -c mcp_servers.<name>.url=… -c
+ *    mcp_servers.<name>.bearer_token_env_var=…` resolves those overrides to a
+ *    `streamable_http` transport — so the token travels by env var name only.
+ *    `codex exec resume --help` accepts the same `-c`.
+ *  - **antigravity**: `agy --help` (1.1.5, 1.1.10) declares no flag that loads an
+ *    MCP server for a run, so the capability is refused rather than launching
+ *    agy without the server the caller asked for.
+ */
+export function cliSupportsMcpServer(cli: AgentCli): boolean {
+	return cli === 'claude' || cli === 'codex';
+}
+
+/** A TOML basic string — codex parses a `-c` value as TOML. */
+const tomlString = (value: string): string => JSON.stringify(value);
+
+/**
+ * The per-run wiring for an attached MCP server: the argv to add, the env to set
+ * on the child alone, and what to undo once the run settles.
+ */
+interface McpAttachment {
+	args: string[];
+	env: Record<string, string>;
+	cleanup(): Promise<void>;
+}
+
+/**
+ * Wire `server` into a run of `cli` without the token ever reaching argv:
+ *
+ *  - claude gets `--mcp-config <file>`, where the file — mode 0600, in the run's
+ *    `cwd`, named per run so concurrent runs never share one — is
+ *    `{ mcpServers: { <name>: { type: 'http', url, headers: { Authorization } } } }`
+ *    and is removed by `cleanup`;
+ *  - codex gets `-c mcp_servers.<name>.url=…` plus a `bearer_token_env_var` naming
+ *    {@link MCP_BEARER_TOKEN_ENV_VAR}, which only the child's env carries.
+ */
+async function prepareMcpAttachment(
+	cli: AgentCli,
+	server: AgentMcpServer,
+	cwd: string,
+): Promise<McpAttachment> {
+	if (cli === 'claude') {
+		const file = path.join(cwd, `.swarm-mcp-${randomUUID()}.json`);
+		const config = {
+			mcpServers: {
+				[server.name]: {
+					type: 'http',
+					url: server.url,
+					headers: { Authorization: `Bearer ${server.bearerToken}` },
+				},
+			},
+		};
+		// `wx` refuses to follow or overwrite anything already at the path, and the
+		// mode is applied at creation, so the token is never readable by others —
+		// not even for the instant a create-then-chmod would leave open.
+		await writeFile(file, JSON.stringify(config), { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+		return {
+			args: ['--mcp-config', file],
+			env: {},
+			// Never throws: a failed removal must not replace the run's own outcome,
+			// but a token file left in a worktree is worth a loud line (path only).
+			cleanup: async () => {
+				try {
+					await rm(file, { force: true });
+				} catch (err) {
+					logger.warn('could not remove the MCP config file after an agent run', {
+						file,
+						error: err instanceof Error ? err.message : String(err),
+					});
+				}
+			},
+		};
+	}
+	const key = `mcp_servers.${server.name}`;
+	return {
+		args: [
+			'-c',
+			`${key}.url=${tomlString(server.url)}`,
+			'-c',
+			`${key}.bearer_token_env_var=${tomlString(MCP_BEARER_TOKEN_ENV_VAR)}`,
+		],
+		env: { [MCP_BEARER_TOKEN_ENV_VAR]: server.bearerToken },
+		cleanup: async () => {},
+	};
+}
+
+/**
+ * The child's env: the parent's, with the caller's extras and the attachment's
+ * token var (codex) merged over it. That var is set on this child alone, never
+ * on `process.env`, so no other run and not SWARM's own process can see it. A
+ * run with neither keeps the parent env object itself.
+ */
+function childEnv(
+	extra: Record<string, string> | undefined,
+	mcpEnv: Record<string, string>,
+): NodeJS.ProcessEnv {
+	if (!extra && Object.keys(mcpEnv).length === 0) return process.env;
+	return { ...process.env, ...extra, ...mcpEnv };
+}
+
+/**
+ * Refuse an MCP attachment the run could not honour, before anything is spawned:
+ * a CLI that cannot attach one (never launched without it), or a server name
+ * that is not a safe config key.
+ */
+function assertMcpServerAttachable(cli: AgentCli, server: AgentMcpServer): void {
+	if (!cliSupportsMcpServer(cli)) throw new Error(`${cli} cannot attach an MCP server`);
+	if (!MCP_SERVER_NAME_RE.test(server.name)) {
+		throw new Error(`MCP server name "${server.name}" must match ${MCP_SERVER_NAME_RE}`);
+	}
+}
+
 export interface RunAgentCliOptions {
 	/** Which agent CLI to launch. */
 	cli: AgentCli;
@@ -248,6 +410,15 @@ export interface RunAgentCliOptions {
 	containment?: AgentContainment;
 	/** Extra env vars, merged over (and overriding) the parent process env. */
 	env?: Record<string, string>;
+	/**
+	 * One HTTP MCP server to attach to this run (issue #1394). Only CLIs for
+	 * which {@link cliSupportsMcpServer} answers `true` can take one; asking any
+	 * other CLI rejects with "<cli> cannot attach an MCP server" before anything
+	 * is spawned. The bearer token reaches the CLI through a 0600 file or a
+	 * child-only env var, never argv. Run `probeMcpServer` (`./mcp-probe.ts`)
+	 * first to fail fast on an unreachable server or a bad credential.
+	 */
+	mcpServer?: AgentMcpServer;
 	/** Override the binary to launch — mainly for tests/deployment. Defaults per `cli`. */
 	command?: string;
 	/**
@@ -680,7 +851,33 @@ export async function runAgentCli(options: RunAgentCliOptions): Promise<AgentCli
 	return runAgentCliOnce({ ...options, resumeSessionId: undefined });
 }
 
+/** The attachment of a run that asked for no MCP server. */
+const NO_MCP_ATTACHMENT: McpAttachment = { args: [], env: {}, cleanup: async () => {} };
+
+/**
+ * One run, with its MCP server attached when it asked for one (issue #1394). A
+ * CLI that cannot take the server is refused here, before any capability probe
+ * or spawn — it must never run without it — and the attachment (claude's token
+ * file) is undone however the run settles: a finished run, a failed one, or a
+ * launch that never started. A run that asked for none goes straight to
+ * {@link spawnAgentCli}, so it still reaches `spawn` synchronously.
+ */
 async function runAgentCliOnce(options: RunAgentCliOptions): Promise<AgentCliResult> {
+	if (!options.mcpServer) return spawnAgentCli(options, NO_MCP_ATTACHMENT);
+	const cli = AgentCliSchema.parse(options.cli);
+	assertMcpServerAttachable(cli, options.mcpServer);
+	const mcp = await prepareMcpAttachment(cli, options.mcpServer, options.cwd);
+	try {
+		return await spawnAgentCli(options, mcp);
+	} finally {
+		await mcp.cleanup();
+	}
+}
+
+async function spawnAgentCli(
+	options: RunAgentCliOptions,
+	mcp: McpAttachment,
+): Promise<AgentCliResult> {
 	const cli = AgentCliSchema.parse(options.cli);
 	const command = options.command ?? DEFAULT_COMMAND[cli];
 	// Resolve the logical (model, reasoning) into the concrete `--model` value and
@@ -750,6 +947,11 @@ async function runAgentCliOnce(options: RunAgentCliOptions): Promise<AgentCliRes
 		...modelArgs,
 		...launch.providerArgs,
 		...(options.providerArgs ?? []),
+		// claude's `--mcp-config` is variadic (`<configs...>`), so it must be
+		// followed by another flag — `outputFormatArgs` below is never empty for
+		// claude — rather than by the prompt, which it would swallow as a second
+		// config. Never between `-p` and the prompt either (PRINT_FLAG above).
+		...mcp.args,
 		...outputFormatArgs,
 		...sessionArgs,
 		...(printFlag ? [printFlag] : []),
@@ -774,7 +976,7 @@ async function runAgentCliOnce(options: RunAgentCliOptions): Promise<AgentCliRes
 	return new Promise<AgentCliResult>((resolve, reject) => {
 		const child = spawn(command, args, {
 			cwd: options.cwd,
-			env: options.env ? { ...process.env, ...options.env } : process.env,
+			env: childEnv(options.env, mcp.env),
 			stdio: ['ignore', 'pipe', 'pipe'],
 		});
 
