@@ -20,6 +20,7 @@ import {
 import { useEffect, useRef, useState } from 'react';
 import { type LiveOutputEvent, LiveOutputViewer } from '@/components/runs/live-output-viewer.js';
 import { LogViewer } from '@/components/runs/log-viewer.js';
+import { type RunAttempt, RunAttemptsTimeline } from '@/components/runs/run-attempts.js';
 import { RunStatusBadge } from '@/components/runs/run-status-badge.js';
 import { buttonClass } from '@/components/ui/button.js';
 import { Modal, ModalFooter } from '@/components/ui/modal.js';
@@ -2826,6 +2827,20 @@ function RunDetailRouteComponent() {
 		},
 	});
 
+	// The attempt history (issue #1400), polled on the same terms as the run itself: a
+	// retry or reset opens a new attempt with no operator action on this page.
+	const attemptsQuery = useQuery({
+		...trpc.runs.getAttempts.queryOptions({ runId }),
+		refetchInterval: () => {
+			const run = runQuery.data;
+			if (!run) return false;
+			return run.status === 'running' || isRetryPending(run.status) || run.pendingRequest
+				? 2000
+				: false;
+		},
+	});
+	const attempts: RunAttempt[] = attemptsQuery.data?.attempts ?? [];
+
 	const outputQuery = useQuery({
 		...trpc.runs.getOutput.queryOptions({ runId, after: outputCursor }),
 		refetchInterval: (query) =>
@@ -2923,14 +2938,18 @@ function RunDetailRouteComponent() {
 
 			{/* Active Tab Content */}
 			{activeTab === 'live' ? (
-				<LiveOutputViewer
-					events={outputEvents}
-					isRunning={run.status === 'running'}
-					isLoading={outputQuery.isLoading}
-					retentionBytes={outputQuery.data?.retentionBytes ?? 5_000_000}
-					serverTruncated={outputQuery.data?.truncated ?? false}
-					uiTruncated={uiOutputTruncated}
-				/>
+				<div className="space-y-6">
+					<RunAttemptsTimeline attempts={attempts} />
+					<LiveOutputViewer
+						events={outputEvents}
+						isRunning={run.status === 'running'}
+						isLoading={outputQuery.isLoading}
+						retentionBytes={outputQuery.data?.retentionBytes ?? 5_000_000}
+						serverTruncated={outputQuery.data?.truncated ?? false}
+						uiTruncated={uiOutputTruncated}
+						attempts={attempts}
+					/>
+				</div>
 			) : activeTab === 'overview' ? (
 				<RunOverview run={run as unknown as RunRow} project={project} />
 			) : (

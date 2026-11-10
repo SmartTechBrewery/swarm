@@ -24,7 +24,8 @@ import { deregisterConnection, registerConnection } from '@/router/worker-connec
 // (`dispatch-results`, `worker-connections`) are real — this test is about how they
 // compose, exactly as the sibling cancellation test drives them.
 const { persistControlPlaneNote } = vi.hoisted(() => ({
-	persistControlPlaneNote: vi.fn<(runId: string | undefined, content: string) => void>(),
+	persistControlPlaneNote:
+		vi.fn<(runId: string | undefined, content: string, source?: unknown) => void>(),
 }));
 vi.mock('@/router/stream-log-persistence.js', async (importOriginal) => ({
 	...(await importOriginal<typeof import('@/router/stream-log-persistence.js')>()),
@@ -112,7 +113,10 @@ describe('reapDispatchesIfTransportStaysLost (issue #859)', () => {
 			reason: TRANSPORT_LOST_ORPHAN_REASON,
 			failureKind: 'transport-lost',
 		});
-		expect(persistControlPlaneNote).toHaveBeenCalledWith(RUN_ID, TRANSPORT_LOST_ORPHAN_NOTE);
+		expect(persistControlPlaneNote).toHaveBeenCalledWith(RUN_ID, TRANSPORT_LOST_ORPHAN_NOTE, {
+			dispatchId: DISPATCH_ID,
+			workerId: WORKER_ID,
+		});
 	});
 
 	it('bounds the settle by worker liveness, not by the phase — nothing fires early', async () => {
@@ -177,7 +181,10 @@ describe('reapDispatchesIfTransportStaysLost (issue #859)', () => {
 			failureKind: 'transport-lost',
 			reason: TRANSPORT_LOST_ORPHAN_REASON,
 		});
-		expect(persistControlPlaneNote).toHaveBeenCalledWith(RUN_ID, TRANSPORT_LOST_ORPHAN_NOTE);
+		expect(persistControlPlaneNote).toHaveBeenCalledWith(RUN_ID, TRANSPORT_LOST_ORPHAN_NOTE, {
+			dispatchId: DISPATCH_ID,
+			workerId: WORKER_ID,
+		});
 	});
 
 	it('leaves a re-dropped dispatch alone when the worker is back by the later grace', async () => {
@@ -219,7 +226,11 @@ describe('reapDispatchesIfTransportStaysLost (issue #859)', () => {
 		expect(await stillPending(orphan.result)).toBe(false);
 		expect(await stillPending(elsewhere.result)).toBe(true);
 		expect(persistControlPlaneNote).toHaveBeenCalledTimes(1);
-		expect(persistControlPlaneNote).not.toHaveBeenCalledWith(OTHER_RUN_ID, expect.anything());
+		expect(persistControlPlaneNote).not.toHaveBeenCalledWith(
+			OTHER_RUN_ID,
+			expect.anything(),
+			expect.anything(),
+		);
 		elsewhere.dispose();
 	});
 
@@ -321,6 +332,7 @@ describe('stopOrphanedDispatchesOnReturn (issue #1073)', () => {
 		expect(persistControlPlaneNote).not.toHaveBeenCalledWith(
 			RUN_ID,
 			TRANSPORT_RETURNED_AFTER_ORPHAN_NOTE,
+			expect.anything(),
 		);
 		deregisterConnection(WORKER_ID, returned);
 	});
@@ -361,6 +373,7 @@ describe('stopOrphanedDispatchesOnReturn (issue #1073)', () => {
 		expect(persistControlPlaneNote).toHaveBeenCalledWith(
 			RUN_ID,
 			TRANSPORT_RETURNED_AFTER_ORPHAN_NOTE,
+			{ dispatchId: DISPATCH_ID, workerId: WORKER_ID },
 		);
 
 		// Once the worker has answered, there is nothing left to stop on a later return.
@@ -499,7 +512,10 @@ describe('stopOrphanedDispatchesOnReturn (issue #1073)', () => {
 
 		// Nothing to push to, and nothing else happens: one settle, one note.
 		expect(persistControlPlaneNote).toHaveBeenCalledTimes(1);
-		expect(persistControlPlaneNote).toHaveBeenCalledWith(RUN_ID, TRANSPORT_LOST_ORPHAN_NOTE);
+		expect(persistControlPlaneNote).toHaveBeenCalledWith(RUN_ID, TRANSPORT_LOST_ORPHAN_NOTE, {
+			dispatchId: DISPATCH_ID,
+			workerId: WORKER_ID,
+		});
 		expect(listOrphanedDispatchesForWorker(WORKER_ID)).toHaveLength(1);
 
 		await vi.advanceTimersByTimeAsync(ORPHANED_DISPATCH_RETENTION_MS);

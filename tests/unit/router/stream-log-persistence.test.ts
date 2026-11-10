@@ -8,10 +8,12 @@ const appendRunOutputEvents =
 		(
 			runId: string,
 			events: Array<{ stream: string; content: string; emittedAt: Date }>,
+			source?: { dispatchId?: string; workerId?: string },
 		) => Promise<void>
 	>();
 vi.mock('@/db/repositories/runsRepository.js', () => ({
-	appendRunOutputEvents: (runId: string, events: never) => appendRunOutputEvents(runId, events),
+	appendRunOutputEvents: (runId: string, events: never, source?: never) =>
+		appendRunOutputEvents(runId, events, source),
 	MAX_RUN_OUTPUT_BYTES: 5_000_000,
 }));
 
@@ -19,6 +21,7 @@ const { persistControlPlaneNote, persistStreamLog, TRANSPORT_LOST_NOTE, TRANSPOR
 	await import('@/router/stream-log-persistence.js');
 
 const DISPATCH = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const WORKER = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 
 let runSeq = 0;
 /** A fresh run id per test, so no test inherits another's append chain. */
@@ -54,18 +57,35 @@ describe('persistStreamLog', () => {
 		persistStreamLog(frame(runId, 'Tool started: Bash', 'Tool completed: Bash'), runId);
 		await settle();
 
-		expect(appendRunOutputEvents).toHaveBeenCalledWith(runId, [
-			{
-				stream: 'stdout',
-				content: 'Tool started: Bash\n',
-				emittedAt: new Date('2026-07-24T10:00:00.000Z'),
-			},
-			{
-				stream: 'stdout',
-				content: 'Tool completed: Bash\n',
-				emittedAt: new Date('2026-07-24T10:00:00.000Z'),
-			},
-		]);
+		expect(appendRunOutputEvents).toHaveBeenCalledWith(
+			runId,
+			[
+				{
+					stream: 'stdout',
+					content: 'Tool started: Bash\n',
+					emittedAt: new Date('2026-07-24T10:00:00.000Z'),
+				},
+				{
+					stream: 'stdout',
+					content: 'Tool completed: Bash\n',
+					emittedAt: new Date('2026-07-24T10:00:00.000Z'),
+				},
+			],
+			expect.anything(),
+		);
+	});
+
+	// Issue #1400: the dispatch and worker that streamed the batch are what tie its
+	// lines to the attempt that produced them.
+	it('names the dispatch and worker the batch came from, so it lands on its attempt', async () => {
+		const runId = nextRunId();
+		persistStreamLog(frame(runId, 'line'), runId, WORKER);
+		await settle();
+
+		expect(appendRunOutputEvents).toHaveBeenCalledWith(runId, expect.any(Array), {
+			dispatchId: DISPATCH,
+			workerId: WORKER,
+		});
 	});
 
 	it('serializes two batches for one run, so their rows cannot interleave', async () => {
@@ -193,6 +213,18 @@ describe('persistControlPlaneNote', () => {
 			'still working\n',
 			`${TRANSPORT_LOST_NOTE}\n`,
 		]);
+	});
+
+	it('passes the dispatch and worker it is about, so the note joins that attempt', async () => {
+		const runId = nextRunId();
+
+		persistControlPlaneNote(runId, TRANSPORT_LOST_NOTE, { dispatchId: DISPATCH, workerId: WORKER });
+		await settle();
+
+		expect(appendRunOutputEvents).toHaveBeenCalledWith(runId, expect.any(Array), {
+			dispatchId: DISPATCH,
+			workerId: WORKER,
+		});
 	});
 
 	it('is a no-op for a dispatch with no run row', async () => {

@@ -55,6 +55,10 @@ import {
 	isCapReachingRequestChanges,
 } from '../db/repositories/reviewVerdictsRepository.js';
 import {
+	openRunAttempt,
+	reopenAdoptedRunAttempt,
+} from '../db/repositories/runAttemptsRepository.js';
+import {
 	type CompleteRunInput,
 	completeRun,
 	createRun,
@@ -3949,6 +3953,53 @@ async function tryCreateRun(
 }
 
 /**
+ * Best-effort opening of the run's attempt record (issue #1400). Like the rest of run
+ * tracking a DB hiccup here must never fail the phase; the attempt's output is then
+ * kept unattributed.
+ */
+async function tryOpenRunAttempt(runId: string, dispatchId: string): Promise<void> {
+	try {
+		await openRunAttempt(runId, dispatchId);
+	} catch (err) {
+		logger.error('Failed to record the run attempt (continuing)', {
+			runId,
+			dispatchId,
+			error: describeError(err),
+		});
+	}
+}
+
+/**
+ * Best-effort reopening of the lost attempt an adopted late result settles (issues
+ * #1076, #1400), so the run's real outcome is recorded on it instead of the deferral
+ * its reap closed it with. Like {@link tryOpenRunAttempt}, a DB hiccup here must never
+ * fail the phase.
+ */
+async function tryReopenAdoptedRunAttempt(
+	runId: string,
+	dispatchId: string,
+	workerId: string,
+): Promise<void> {
+	try {
+		const reopened = await reopenAdoptedRunAttempt(runId, dispatchId, workerId);
+		if (!reopened) {
+			logger.warn('No recorded attempt matches the adopted late result (history unchanged)', {
+				runId,
+				dispatchId,
+				workerId,
+			});
+		}
+	} catch (err) {
+		logger.error('Failed to reopen the adopted run attempt (continuing)', {
+			runId,
+			dispatchId,
+			workerId,
+			error: describeError(err),
+		});
+	}
+}
+
+/**
  * Best-effort finalization of a run-history row: set its terminal columns and,
  * when the run produced captured output, store its stdout/stderr. No-ops when
  * `runId` is undefined (creation failed) and swallows+logs any DB error, so the
@@ -6689,6 +6740,15 @@ async function processClaimedDispatch(
 			dispatch.id,
 			implementationUnplanned,
 		);
+		// This is an execution attempt of the run (issue #1400) — unlike the pre-run
+		// waits, which create or reset the same row without a worker. An adopted late
+		// result runs nothing, so it opens no attempt: it reopens the lost one its reap
+		// closed as deferred, and the settle below closes that with the real outcome.
+		if (runId && adoptedSelection) {
+			await tryReopenAdoptedRunAttempt(runId, dispatch.id, adoptedSelection.workerId);
+		} else if (runId) {
+			await tryOpenRunAttempt(runId, dispatch.id);
+		}
 
 		// The dispatch is now `running` against its run row; renew the lease to
 		// cover this phase's own wall-clock timeout so a live run is never

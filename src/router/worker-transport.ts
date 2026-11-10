@@ -206,7 +206,7 @@ export interface WorkerTransportDeps {
 	 * worker — a federated one has no database to make it itself. Fire-and-forget
 	 * by contract: it returns `void` so the frame handler never blocks on Postgres.
 	 */
-	persistStreamLog: (frame: StreamLog, runId: string | undefined) => void;
+	persistStreamLog: (frame: StreamLog, runId: string | undefined, workerId?: string) => void;
 	/**
 	 * The worker and run this router recorded when it pushed a dispatch
 	 * (`./dispatch-results.ts`). `undefined` for a dispatch not awaited here. It is
@@ -333,13 +333,19 @@ function defaultDeps(): WorkerTransportDeps {
 		onWorkerTransportLost: (workerId) => {
 			const interrupted = noteWorkerTransportLost(workerId);
 			for (const dispatch of interrupted) {
-				persistControlPlaneNote(dispatch.runId, TRANSPORT_LOST_NOTE);
+				persistControlPlaneNote(dispatch.runId, TRANSPORT_LOST_NOTE, {
+					dispatchId: dispatch.dispatchId,
+					workerId,
+				});
 			}
 			reapDispatchesIfTransportStaysLost(workerId, interrupted);
 		},
 		onWorkerTransportRestored: (workerId) => {
 			for (const dispatch of noteWorkerTransportRestored(workerId)) {
-				persistControlPlaneNote(dispatch.runId, TRANSPORT_RESTORED_NOTE);
+				persistControlPlaneNote(dispatch.runId, TRANSPORT_RESTORED_NOTE, {
+					dispatchId: dispatch.dispatchId,
+					workerId,
+				});
 			}
 		},
 		resendRunCancellations: resendRunCancellationsToWorker,
@@ -794,7 +800,7 @@ export async function handleWorkerStreamFrame(
 			});
 			return { action: 'ignore' };
 		}
-		deps.persistStreamLog(frame, target.runId);
+		deps.persistStreamLog(frame, target.runId, ctx.workerId);
 		return { action: 'ignore' };
 	}
 	if (frame.fencingToken !== ctx.fencingToken) {

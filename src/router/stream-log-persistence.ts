@@ -59,6 +59,7 @@
  * interrupts.
  */
 
+import type { RunOutputSource } from '../db/repositories/runAttemptsRepository.js';
 import {
 	appendRunOutputEvents,
 	type RunOutputEventInput,
@@ -90,9 +91,13 @@ function parseEmittedAt(value: string): Date {
  * definition of "on the run's chain", so a control-plane note and a streamed batch
  * cannot interleave — they are the same kind of write to the same reader.
  */
-function appendOnRunChain(runId: string, events: RunOutputEventInput[]): void {
+function appendOnRunChain(
+	runId: string,
+	events: RunOutputEventInput[],
+	source: RunOutputSource | undefined,
+): void {
 	const next: Promise<void> = (chains.get(runId) ?? Promise.resolve())
-		.then(() => appendRunOutputEvents(runId, events))
+		.then(() => appendRunOutputEvents(runId, events, source))
 		.catch((err) => {
 			logger.error('Failed to persist streamed run output (continuing)', {
 				runId,
@@ -110,8 +115,14 @@ function appendOnRunChain(runId: string, events: RunOutputEventInput[]): void {
  * Append one `stream-log` frame's lines to its run's output stream. Returns
  * immediately — the write runs on the run's chain. A frame with no `runId` (a
  * dispatch with no run row) is skipped: there is nothing to attach the rows to.
+ * `workerId` is the worker the frame arrived from, which with the frame's dispatch
+ * ties the lines to the attempt that produced them (issue #1400).
  */
-export function persistStreamLog(frame: StreamLog, runId: string | undefined): void {
+export function persistStreamLog(
+	frame: StreamLog,
+	runId: string | undefined,
+	workerId?: string,
+): void {
 	if (!runId) {
 		logger.debug('dispatch has no run row — dropping its streamed output', {
 			dispatchId: frame.dispatchId,
@@ -125,6 +136,7 @@ export function persistStreamLog(frame: StreamLog, runId: string | undefined): v
 			content: line.content,
 			emittedAt: parseEmittedAt(line.emittedAt),
 		})),
+		{ dispatchId: frame.dispatchId, workerId },
 	);
 }
 
@@ -170,7 +182,15 @@ export const LATE_RESULT_ACCEPTED_NOTE =
  * run row has nothing to annotate, and a failed write is swallowed — a missing note
  * must not take the socket down.
  */
-export function persistControlPlaneNote(runId: string | undefined, content: string): void {
+export function persistControlPlaneNote(
+	runId: string | undefined,
+	content: string,
+	source?: RunOutputSource,
+): void {
 	if (!runId) return;
-	appendOnRunChain(runId, [{ stream: 'stderr', content: `${content}\n`, emittedAt: new Date() }]);
+	appendOnRunChain(
+		runId,
+		[{ stream: 'stderr', content: `${content}\n`, emittedAt: new Date() }],
+		source,
+	);
 }

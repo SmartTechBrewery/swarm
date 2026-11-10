@@ -110,6 +110,10 @@ import {
 } from '../db/repositories/dispatchesRepository.js';
 import { getProjectByIdFromDb } from '../db/repositories/projectsRepository.js';
 import {
+	clearNextAttemptTrigger,
+	recordNextAttemptTrigger,
+} from '../db/repositories/runAttemptsRepository.js';
+import {
 	clearRunRecovery,
 	failRunFromStatus,
 	getRunByIdFromDb,
@@ -366,6 +370,42 @@ async function sanitizeStoredJobPayload(runId: string, job: SwarmJob): Promise<v
 		await updateRunJobPayload(runId, job);
 	} catch (err) {
 		logger.warn('run reset: could not sanitise the run row’s stored payload', {
+			runId,
+			error: describeError(err),
+		});
+	}
+}
+
+/**
+ * Mark the attempt this reset starts as the operator's (issue #1400), before the
+ * replacement dispatch exists so no worker can claim it first. Best-effort for the
+ * same reason as {@link sanitizeStoredJobPayload}: losing the label must never turn
+ * a reset into a refusal.
+ */
+async function markNextAttemptAsReset(runId: string): Promise<Date | undefined> {
+	try {
+		return await recordNextAttemptTrigger(runId, 'reset');
+	} catch (err) {
+		logger.warn('run reset: could not record the restart in the run’s attempt history', {
+			runId,
+			error: describeError(err),
+		});
+		return undefined;
+	}
+}
+
+/**
+ * Take back the reset's marker when no replacement dispatch was created, so the next
+ * automatic attempt is not shown as a restart SWARM never made. Only this reset's own
+ * marker is cleared, never a concurrent one's. Best-effort: the reset's own failure is
+ * what the operator must see.
+ */
+async function unmarkFailedReset(runId: string, requestedAt: Date | undefined): Promise<void> {
+	if (!requestedAt) return;
+	try {
+		await clearNextAttemptTrigger(runId, 'reset', requestedAt);
+	} catch (err) {
+		logger.warn('run reset: could not take back the restart’s attempt-history marker', {
 			runId,
 			error: describeError(err),
 		});
@@ -638,7 +678,14 @@ async function performReset(run: ResetTargetRun, progress: ResetRunSteps): Promi
 	// did not exist.
 	const job = reconstructResetJob(jobPayload, run.id, run.phase, 'discard');
 	await sanitizeStoredJobPayload(run.id, job);
-	const dispatchId = await createReplacementDispatch(run, job);
+	const markedAt = await markNextAttemptAsReset(run.id);
+	let dispatchId: string;
+	try {
+		dispatchId = await createReplacementDispatch(run, job);
+	} catch (err) {
+		await unmarkFailedReset(run.id, markedAt);
+		throw err;
+	}
 
 	logger.info('run reset complete', {
 		runId: run.id,
